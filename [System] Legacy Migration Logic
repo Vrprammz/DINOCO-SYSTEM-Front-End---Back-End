@@ -1,0 +1,896 @@
+// -----------------------------------------------------------------------------------------
+// Title: System Legacy Migration (v4.18 Ultimate Cache-Proof via Admin AJAX)
+// Description: ใช้ admin-ajax.php เต็มรูปแบบเพื่อทะลุ Cache, ระบบ Dynamic Token, แก้ไข JSON Undefined
+// Version: 4.18 (Production Ready)
+// Author: DINOCO Dev Team
+// -----------------------------------------------------------------------------------------
+
+// [PART 1] REGISTER HOOKS
+// ใช้ admin-ajax.php เท่านั้น เพื่อเลี่ยงปัญหา Page Cache ของ WP Fastest Cache / Redis
+add_action('wp_ajax_dinoco_get_token_v418', 'dinoco_legacy_api_get_token_v418');
+add_action('wp_ajax_nopriv_dinoco_get_token_v418', 'dinoco_legacy_api_get_token_v418'); // เปิดให้ guest ขอ token ได้ (แล้วค่อยเช็ค login ตอน submit)
+
+add_action('wp_ajax_dinoco_submit_v418', 'dinoco_legacy_api_submit_v418');
+add_action('wp_ajax_nopriv_dinoco_submit_v418', 'dinoco_legacy_api_submit_v418'); // เปิดให้ guest ยิงมาได้ เพื่อ return json error สวยๆ
+
+// Shortcode แสดงผล
+add_shortcode('dinoco_legacy_migration', 'dinoco_legacy_ui_v418');
+
+
+// -------------------------------------------------------------------------------------
+// [PART 2] TOKEN PROVIDER (API 1: ขอกุญแจ)
+// -------------------------------------------------------------------------------------
+function dinoco_legacy_api_get_token_v418() {
+    // ล้างขยะใน Buffer ป้องกัน JSON พัง
+    while (ob_get_level()) { @ob_end_clean(); }
+    header('Content-Type: application/json; charset=utf-8');
+    
+    // ตรวจสอบ Login
+    if (!is_user_logged_in()) {
+        echo json_encode(array('success' => false, 'msg' => 'logged_out'));
+    } else {
+        // สร้าง Token ใหม่สดๆ
+        $token = wp_create_nonce('dinoco_legacy_nonce');
+        echo json_encode(array('success' => true, 'token' => $token));
+    }
+    wp_die(); // สำคัญมากสำหรับ admin-ajax
+}
+
+// -------------------------------------------------------------------------------------
+// [PART 3] SUBMIT HANDLER (API 2: ส่งข้อมูล)
+// -------------------------------------------------------------------------------------
+function dinoco_legacy_api_submit_v418() {
+    // ปิด Error กัน JSON พัง
+    error_reporting(0);
+    @ini_set('display_errors', 0);
+    
+    // เตรียม Response
+    $response = array();
+
+    try {
+        // ล้าง Buffer ขั้นสุด
+        while (ob_get_level()) { @ob_end_clean(); }
+        header('Content-Type: application/json; charset=utf-8');
+        nocache_headers();
+
+        // 1. SECURITY CHECKS
+        if (!is_user_logged_in()) {
+            throw new Exception('Session หมดอายุ หรือไม่ได้เข้าสู่ระบบ (กรุณารีเฟรชหน้าจอ)');
+        }
+
+        // ตรวจสอบ Token (ที่ JS ส่งมา)
+        if (!isset($_POST['security']) || !wp_verify_nonce($_POST['security'], 'dinoco_legacy_nonce')) {
+            throw new Exception('Security Token หมดอายุ (กรุณารีเฟรชหน้าจอแล้วลองใหม่)');
+        }
+
+        $current_user_id = get_current_user_id();
+
+        // Rate Limiting (กันยิงรัว)
+        $last_submit = get_user_meta($current_user_id, '_dnc_legacy_last_submit', true);
+        if ($last_submit && (time() - $last_submit < 10)) { 
+             throw new Exception('ระบบกำลังประมวลผล กรุณารอสักครู่...');
+        }
+        update_user_meta($current_user_id, '_dnc_legacy_last_submit', time());
+
+        // 2. CREATE POST
+        $post_data = array(
+            'post_title'    => 'DINOCO_REQ_' . time(), 
+            'post_type'     => 'legacy_request',
+            'post_status'   => 'private',
+            'post_author'   => $current_user_id
+        );
+        
+        $post_id = wp_insert_post($post_data);
+
+        if (!$post_id || is_wp_error($post_id)) {
+            throw new Exception('Database Error: Unable to create ticket.');
+        }
+
+        // Update Title
+        $ticket_id = sprintf('%07d', $post_id);
+        $new_title = "LMD_QRWRT_{$ticket_id}_" . date('d_m_Y');
+        wp_update_post(array('ID' => $post_id, 'post_title' => $new_title));
+
+        // Helper Functions
+        $save_meta = function($key, $value) use ($post_id) {
+            $clean = is_array($value) ? $value : sanitize_text_field($value);
+            if (function_exists('update_field')) update_field($key, $clean, $post_id);
+            else update_post_meta($post_id, $key, $clean);
+        };
+
+        $process_img = function($base64, $prefix) use ($post_id) {
+            if (empty($base64) || strlen($base64) > 10500000) return ''; 
+            if (preg_match('/^data:image\/(\w+);base64,/', $base64, $type)) {
+                $data = base64_decode(substr($base64, strpos($base64, ',') + 1));
+                if ($data === false) return '';
+                $ext = strtolower($type[1]);
+                $fname = $prefix . '_' . time() . '_' . uniqid() . '.' . $ext;
+                $upload = wp_upload_dir();
+                if (!empty($upload['error'])) return '';
+                $fpath = $upload['path'] . '/' . $fname;
+                file_put_contents($fpath, $data);
+                
+                $ftype = wp_check_filetype($fname, null);
+                $att_id = wp_insert_attachment(array(
+                    'post_mime_type' => $ftype['type'],
+                    'post_title' => sanitize_file_name($fname),
+                    'post_content' => '',
+                    'post_status' => 'inherit'
+                ), $fpath, $post_id);
+                
+                if (!is_wp_error($att_id)) {
+                    require_once(ABSPATH . 'wp-admin/includes/image.php');
+                    wp_update_attachment_metadata($att_id, wp_generate_attachment_metadata($att_id, $fpath));
+                    return $att_id;
+                }
+            }
+            return '';
+        };
+
+        // 3. SAVE DATA
+        if (isset($_POST['dnc_code'])) $save_meta('dnc_old_code', $_POST['dnc_code']);
+        if (isset($_POST['address'])) $save_meta('customer_address_snap', sanitize_textarea_field($_POST['address']));
+        $save_meta('request_status', 'Pending');
+        if (isset($_POST['customer_type'])) $save_meta('customer_type', $_POST['customer_type']);
+
+        if (!empty($_POST['img_dnc_card'])) {
+            $id = $process_img($_POST['img_dnc_card'], 'dnc_card');
+            if ($id) $save_meta('dnc_card_image', $id);
+        }
+
+        if (isset($_POST['items']) && is_array($_POST['items'])) {
+            $rows = array();
+            foreach ($_POST['items'] as $i => $item) {
+                $r = array(
+                    'item_model' => isset($item['model']) ? sanitize_text_field($item['model']) : '',
+                    'item_install_date' => isset($item['date']) ? sanitize_text_field($item['date']) : '',
+                    'item_image_1' => '', 'item_image_2' => '', 'item_proof_image' => ''
+                );
+                if (!empty($item['img1'])) $r['item_image_1'] = $process_img($item['img1'], 'i'.$i.'_1');
+                if (!empty($item['img2'])) $r['item_image_2'] = $process_img($item['img2'], 'i'.$i.'_2');
+                if (!empty($item['img_proof'])) $r['item_proof_image'] = $process_img($item['img_proof'], 'i'.$i.'_p');
+                $rows[] = $r;
+            }
+            update_post_meta($post_id, 'legacy_items_json', json_encode($rows, JSON_UNESCAPED_UNICODE));
+            if (function_exists('update_field')) update_field('legacy_items', $rows, $post_id);
+        }
+
+        $response = array('success' => true, 'msg' => 'บันทึกข้อมูลเรียบร้อยแล้ว (Saved Successfully)');
+
+    } catch (Throwable $e) {
+        $response = array('success' => false, 'msg' => 'Error: ' . $e->getMessage());
+    }
+
+    echo json_encode($response, JSON_UNESCAPED_UNICODE);
+    wp_die(); // จบการทำงาน AJAX อย่างสมบูรณ์
+}
+
+// -------------------------------------------------------------------------------------
+// [PART 4] UI RENDERER (ส่วนแสดงผล)
+// -------------------------------------------------------------------------------------
+function dinoco_legacy_ui_v418() {
+    
+    if (!defined('DONOTCACHEPAGE')) define('DONOTCACHEPAGE', true);
+
+    ob_start();
+
+    // Data Mapping
+    $raw_db_data = get_option('dinoco_product_catalog');
+    if (is_string($raw_db_data)) $raw_db_data = maybe_unserialize($raw_db_data);
+    if (is_string($raw_db_data)) $raw_db_data = maybe_unserialize($raw_db_data);
+    $product_master_list = (is_array($raw_db_data) && !empty($raw_db_data)) ? $raw_db_data : array();
+    
+    // Sets Config
+    $sets_map = array(
+        'NX500' => array('DNCGND45L002', 'DNCGNDPROT500', 'DNCCB500XGD', 'DNCSETNX500X001H'),
+        'XL750_OLD' => array('DNCPATXL75001H', 'DNCGND45L002'),
+        'XL750_NEW' => array('DNCPATXL75001H', 'DNCGND45L002', 'DNCSETXL7500X001H', 'DNCGNDPROS750', 'DNCGND37LS', 'DNCXL750GD')
+    );
+    $edition_sets_config = array();
+    foreach ($sets_map as $set_key => $skus) {
+        $edition_sets_config[$set_key] = array();
+        foreach ($skus as $sku) {
+            $item_data = array('sku' => $sku, 'name' => 'Unknown Item (' . $sku . ')', 'img' => '');
+            if (isset($product_master_list[$sku])) {
+                $m = $product_master_list[$sku];
+                if (isset($m['name'])) $item_data['name'] = $m['name'];
+                if (isset($m['img'])) $item_data['img'] = $m['img']; elseif (isset($m['image'])) $item_data['img'] = $m['image'];
+            }
+            $edition_sets_config[$set_key][] = $item_data;
+        }
+    }
+    
+    // Login Check
+    if (!is_user_logged_in()) {
+        global $wp;
+        $current_url = home_url( add_query_arg( array(), $wp->request ) );
+        echo '<div style="text-align:center; padding:50px;"><h3>กรุณาเข้าสู่ระบบ</h3><p>Please Login to access this page</p></div>' . do_shortcode('[dinoco_login_button redirect="' . esc_url($current_url) . '"]');
+        return ob_get_clean();
+    }
+
+    $current_user = wp_get_current_user();
+    $u_meta = get_user_meta($current_user->ID);
+    $addr_text = isset($u_meta['first_name'][0]) ? $u_meta['first_name'][0] : '';
+    $addr_text .= " " . (isset($u_meta['last_name'][0]) ? $u_meta['last_name'][0] : '') . "\n";
+    $addr_text .= (isset($u_meta['addr_house_no'][0]) ? $u_meta['addr_house_no'][0] : '') . " " . (isset($u_meta['addr_soi'][0]) ? "ซ.".$u_meta['addr_soi'][0] : '') . "\n";
+    $addr_text .= (isset($u_meta['addr_district'][0]) ? "เขต/อำเภอ ".$u_meta['addr_district'][0] : '') . " " . (isset($u_meta['addr_subdistrict'][0]) ? "แขวง/ตำบล ".$u_meta['addr_subdistrict'][0] : '') . "\n";
+    $addr_text .= (isset($u_meta['addr_province'][0]) ? $u_meta['addr_province'][0] : '') . " " . (isset($u_meta['addr_zip'][0]) ? $u_meta['addr_zip'][0] : '') . "\n";
+    $addr_text .= "เบอร์โทร: " . (isset($u_meta['phone_number'][0]) ? $u_meta['phone_number'][0] : '');
+
+    ?>
+    <!-- Dependencies -->
+    <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;600&family=Noto+Sans+Thai:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" />
+    <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+
+    <style>
+        #wpadminbar { display: none !important; }
+        html, body { margin-top: 0 !important; padding-top: 0 !important; background-color: #f9f9f9; }
+        .legacy-wrapper { font-family: 'Noto Sans Thai', sans-serif; max-width: 600px; margin: 0 auto; color: #333; padding-bottom: 80px; position: relative; background: #fff; min-height: 100vh; }
+        .legacy-wrapper * { box-sizing: border-box; }
+
+        /* [CSS from v4.4] */
+        .legacy-header-wrap { padding: 20px 15px; background: #fff; margin-bottom: 0; }
+        .legacy-header { text-align: center; aspect-ratio: 1.586 / 1; max-width: 450px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 20px; background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%); border: 1px solid #b8860b; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); position: relative; overflow: hidden; color: #fff; }
+        .legacy-header::after { content: ''; position: absolute; top: 6px; left: 6px; right: 6px; bottom: 6px; border: 1px solid rgba(184, 134, 11, 0.3); border-radius: 12px; pointer-events: none; }
+        .royal-icon-container { display: flex; justify-content: center; align-items: center; gap: 15px; margin-bottom: 10px; position: relative; z-index: 2; }
+        .royal-icon-box { display: flex; flex-direction: column; align-items: center; color: rgba(255,255,255,0.6); transition: 0.3s; }
+        .royal-icon-circle { width: 45px; height: 45px; border-radius: 50%; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 18px; margin-bottom: 5px; }
+        .royal-icon-text { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; font-family: 'Kanit', sans-serif; }
+        .royal-icon-box.active .royal-icon-circle { background: linear-gradient(135deg, #c0a062 0%, #eec974 100%); color: #0f172a; border: none; box-shadow: 0 0 15px rgba(192, 160, 98, 0.6); transform: scale(1.1); }
+        .royal-icon-box.active .royal-icon-text { color: #eec974; font-weight: 600; text-shadow: 0 0 10px rgba(192, 160, 98, 0.3); }
+        .royal-arrow { color: #eec974; font-size: 14px; opacity: 0.8; animation: pulseArrow 1.5s infinite; }
+        @keyframes pulseArrow { 0% { opacity: 0.4; transform: translateX(0); } 50% { opacity: 1; transform: translateX(5px); } 100% { opacity: 0.4; transform: translateX(0); } }
+        .royal-logo-container { display: flex; justify-content: center; margin-bottom: 12px; position: relative; z-index: 2; }
+        .royal-logo { width: 110px; height: auto; object-fit: contain; filter: drop-shadow(0 0 5px rgba(192, 160, 98, 0.5)); }
+        .blink-animation { animation: royalPulse 2s infinite ease-in-out; }
+        @keyframes royalPulse { 0% { opacity: 0.8; transform: scale(1); } 50% { opacity: 1; transform: scale(1.05); filter: drop-shadow(0 0 12px rgba(192, 160, 98, 0.8)); } 100% { opacity: 0.8; transform: scale(1); } }
+        .legacy-title { font-family: 'Kanit', sans-serif; font-size: 16px; font-weight: 700; margin: 0 0 5px 0; text-transform: uppercase; letter-spacing: 0.5px; background: -webkit-linear-gradient(#fff, #eec974); -webkit-background-clip: text; -webkit-text-fill-color: transparent; position: relative; z-index: 2; }
+        .legacy-desc { font-size: 11px; color: #ccc; line-height: 1.4; font-weight: 300; position: relative; z-index: 2; }
+        
+        /* BENEFITS */
+        .benefits-section { background: #fffdf5; margin: 0 20px 20px; padding: 15px; border-radius: 12px; border: 1px dashed #c0a062; position: relative; }
+        .benefits-title { font-family: 'Kanit', sans-serif; font-size: 15px; font-weight: 600; color: #9a7b4f; margin-top: 0; margin-bottom: 12px; text-align: center; text-transform: uppercase; letter-spacing: 0.5px; }
+        .benefits-grid { display: grid; grid-template-columns: 1fr; gap: 8px; }
+        @media (min-width: 350px) { .benefits-grid { grid-template-columns: 1fr 1fr; } }
+        .benefit-item { font-size: 11px; color: #555; display: flex; align-items: center; gap: 6px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        @media (max-width: 360px) { .benefit-item { font-size: 10px; } }
+        .benefit-item i { color: #b8860b; flex-shrink: 0; font-size: 12px; }
+
+        /* CHOICE CARDS */
+        .choice-section { padding: 0 20px 20px; text-align: center; }
+        .choice-label { font-size: 14px; font-weight: bold; color: #333; margin-bottom: 15px; }
+        .choice-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        .choice-card { background: #fff; border: 2px solid #eee; border-radius: 12px; padding: 20px 10px; cursor: pointer; transition: 0.2s; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 140px; position: relative; overflow: hidden; }
+        .choice-card:hover, .choice-card.active { border-color: #c0a062; background: #fffdf5; box-shadow: 0 4px 15px rgba(192, 160, 98, 0.2); }
+        .choice-icon { font-size: 32px; color: #000; margin-bottom: 10px; } 
+        .choice-logo { width: 50px; height: 50px; object-fit: contain; margin-bottom: 10px; }
+        .choice-text { font-size: 12px; font-weight: bold; color: #333; line-height: 1.3; }
+        .choice-subtext { font-size: 10px; color: #888; margin-top: 4px; }
+
+        /* FLOW CONTAINERS */
+        #general_flow, #edition_flow, #edition_model_selector, #general_summary_view { display: none; opacity: 0; transition: opacity 0.5s ease; }
+        #general_flow.active, #edition_flow.active, #edition_model_selector.active, #general_summary_view.active { display: block; opacity: 1; }
+
+        /* SUMMARY / FIXED LIST STYLES */
+        .fixed-product-list { margin-bottom: 20px; border: 1px solid #e0e0e0; border-radius: 12px; overflow: hidden; margin-top: 15px; }
+        .fixed-product-header { background: #f9f9f9; padding: 10px 15px; font-size: 13px; font-weight: bold; color: #555; border-bottom: 1px solid #e0e0e0; }
+        .fixed-item { display: flex; align-items: center; padding: 12px 15px; border-bottom: 1px solid #eee; background: #fff; }
+        .fixed-item:last-child { border-bottom: none; }
+        .fixed-item-img { width: 50px; height: 50px; border-radius: 6px; object-fit: cover; margin-right: 12px; border: 1px solid #eee; }
+        .fixed-item-info { flex: 1; }
+        .fixed-item-name { font-size: 12px; font-weight: 600; color: #333; margin-bottom: 2px; }
+        .fixed-item-sku { font-size: 10px; color: #888; }
+        
+        /* MODEL & PRODUCT STYLES */
+        .model-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 20px; }
+        @media (min-width: 600px) { .model-grid { gap: 15px; } }
+        .model-card { border: 2px solid #eee; border-radius: 12px; overflow: hidden; cursor: pointer; transition: 0.2s; background: #fff; height: 100%; display: flex; flex-direction: column; }
+        .model-card:hover, .model-card.active { border-color: #c0a062; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        .model-img { width: 100%; height: 80px; object-fit: cover; background: #f0f0f0; } 
+        @media (min-width: 600px) { .model-img { height: 120px; } }
+        .model-info { padding: 8px; text-align: center; flex: 1; display: flex; flex-direction: column; justify-content: center; }
+        .model-name { font-size: 9px; font-weight: bold; color: #333; line-height: 1.3; word-wrap: break-word; }
+        @media (min-width: 600px) { .model-name { font-size: 11px; } }
+
+        /* COMMON */
+        .form-section { background: #fff; padding: 20px 25px; border-bottom: 1px solid #f0f0f0; margin-bottom: 0; }
+        .section-title { font-size: 16px; font-weight: bold; color: #333; margin-bottom: 15px; display: flex; align-items: center; gap: 10px; }
+        .section-title i { color: #c0a062; }
+        .dinoco-input, .dinoco-select, .dinoco-textarea { width: 100% !important; padding: 12px 15px !important; border: 1px solid #e0e0e0 !important; border-radius: 10px !important; background: #ffffff !important; font-size: 16px !important; height: 60px !important; min-height: 60px !important; margin-bottom: 15px !important; outline: none; transition: 0.2s; font-family: 'Noto Sans Thai', sans-serif; display: block; box-sizing: border-box; }
+        input[type="date"].dinoco-input, input[type="text"].dinoco-input { height: 60px !important; line-height: normal !important; padding-top: 0 !important; padding-bottom: 0 !important; display: flex; align-items: center; min-width: 0 !important; width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; -webkit-appearance: none; appearance: none; }
+        .dinoco-textarea { height: 100px !important; resize: vertical; }
+        .dinoco-input:focus, .dinoco-select:focus, .dinoco-textarea:focus { border-color: #c0a062 !important; background: #fff !important; box-shadow: 0 0 0 2px rgba(192, 160, 98, 0.1); }
+        .dinoco-label { font-size: 13px; font-weight: 600; color: #555; margin-bottom: 6px; display: block; }
+        
+        /* ERROR STYLES */
+        .input-error { border: 2px solid #ef4444 !important; background-color: #fef2f2 !important; animation: shake 0.4s ease-in-out; }
+        .select2-container .select2-selection.input-error { border: 2px solid #ef4444 !important; background-color: #fef2f2 !important; }
+        .upload-box.input-error { border: 2px dashed #ef4444 !important; background-color: #fef2f2 !important; }
+        @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+
+        /* SELECT2 */
+        .select2-container { width: 100% !important; margin-bottom: 15px; }
+        .select2-container--default .select2-selection--single { background-color: #fff !important; background-image: none !important; border: 1px solid #e0e0e0 !important; border-radius: 10px !important; height: 60px !important; outline: none !important; box-shadow: none !important; }
+        .select2-container--default .select2-selection--single .select2-selection__arrow { height: 58px !important; top: 1px !important; right: 5px !important; }
+        .select2-container--default .select2-selection--single .select2-selection__rendered { font-family: 'Noto Sans Thai', sans-serif !important; color: #333 !important; font-size: 16px !important; line-height: 60px !important; display: block !important; height: 100% !important; width: 100%; padding-left: 15px !important; padding-right: 30px !important; overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important; background: transparent !important; }
+        .select2-dropdown { border: 1px solid #e0e0e0 !important; border-radius: 10px !important; box-shadow: 0 10px 30px rgba(0,0,0,0.1) !important; z-index: 99999 !important; overflow: hidden; background: #ffffff !important; }
+        .select2-search--dropdown { padding: 10px !important; }
+        .select2-search__field { border: 1px solid #ddd !important; border-radius: 6px !important; padding: 10px !important; font-family: 'Noto Sans Thai' !important; font-size: 16px !important; background: #fff !important; }
+        .select2-results__option { padding: 10px 15px !important; border-bottom: 1px solid #f5f5f5; }
+        .select2-results__option:last-child { border-bottom: none; }
+
+        .upload-box { border: 2px dashed #ddd; border-radius: 12px; padding: 15px; text-align: center; cursor: pointer; transition: 0.2s; background: #fafafa; position: relative; margin-bottom: 15px; min-height: 90px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .upload-box:hover { border-color: #c0a062; background: #fffdf5; }
+        .upload-box.uploaded { border: 2px solid #06C755; background: #f0fdf4; }
+        .upload-content-default { display: flex; flex-direction: column; align-items: center; }
+        .upload-content-success { display: none; flex-direction: column; align-items: center; color: #06C755; }
+        .upload-icon { font-size: 24px; color: #94a3b8; margin-bottom: 5px; }
+        .upload-text { font-size: 11px; color: #64748b; }
+        .item-row { background: #fff; border: 1px solid #eee; border-radius: 12px; padding: 20px; margin-bottom: 20px; position: relative; box-shadow: 0 4px 12px rgba(0,0,0,0.03); }
+        .remove-item-btn { position: absolute; top: -12px; right: -10px; background-color: #ef4444 !important; color: white !important; border: 2px solid #fff !important; border-radius: 50% !important; width: 28px !important; height: 28px !important; min-width: 28px !important; padding: 0 !important; font-size: 14px; display: flex; align-items: center; justify-content: center; z-index: 10; cursor: pointer; }
+        .add-btn { background: #eff6ff; color: #2563eb; border: 1px dashed #bfdbfe; width: 100%; padding: 15px; border-radius: 10px; font-weight: bold; cursor: pointer; margin-bottom: 15px; transition: 0.2s; }
+        .add-btn:hover { background: #dbeafe; }
+        .submit-btn { background: linear-gradient(135deg, #c0a062 0%, #b48e43 100%); color: white; border: none; width: 100%; padding: 15px; border-radius: 10px; font-size: 18px; font-weight: bold; cursor: pointer; box-shadow: 0 4px 15px rgba(192, 160, 98, 0.4); transition: 0.2s; margin-top: 20px; }
+        .submit-btn:disabled { background: #cbd5e1; cursor: not-allowed; box-shadow: none; }
+        .note-box { background: #fff7ed; border: 1px solid #ffedd5; color: #9a3412; padding: 15px; border-radius: 10px; font-size: 12px; margin: 20px 25px; line-height: 1.5; }
+        
+        .selected-product-card { background: #fff; border: 2px solid #c0a062; border-radius: 10px; padding: 15px; margin-bottom: 15px; display: none; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 4px 15px rgba(192, 160, 98, 0.15); }
+        .selected-product-img { width: 150px; height: 150px; object-fit: contain; margin-bottom: 10px; }
+        .selected-product-name { font-weight: bold; font-size: 16px; color: #333; }
+        .selected-product-sku { color: #888; font-size: 13px; margin-top: 5px; }
+        .selected-product-price { font-size: 14px; color: #06C755; font-weight: bold; margin-top: 5px; }
+        .back-btn { background: #fff; color: #64748b; border: 2px solid #e2e8f0; width: 100%; padding: 12px; border-radius: 10px; font-weight: 600; cursor: pointer; margin-bottom: 15px; transition: 0.2s; font-size: 14px; display: flex; align-items: center; justify-content: center; gap: 5px; }
+        .back-btn:hover { background: #f8fafc; border-color: #cbd5e1; color: #475569; }
+        #edition_selected_car_display { background: #fff; border: 2px solid #c0a062; border-radius: 12px; padding: 20px; margin-bottom: 25px; display: none; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 4px 15px rgba(192, 160, 98, 0.1); }
+        #edition_car_img { width: 100%; max-width: 320px; height: auto; object-fit: contain; border-radius: 8px; margin-bottom: 15px; }
+        #edition_car_name { font-family: 'Kanit', sans-serif; font-size: 18px; font-weight: bold; color: #333; text-transform: uppercase; }
+        
+        /* [UI FIX] Center Spinner (Force !important) */
+        #loading-overlay { 
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
+            background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); 
+            z-index: 999999; 
+            display: none; 
+            justify-content: center; align-items: center; text-align: center; 
+        }
+        .loading-content { 
+            background: #fff; padding: 30px; border-radius: 16px; box-shadow: 0 20px 50px rgba(0,0,0,0.3); 
+            display: flex; flex-direction: column; align-items: center; justify-content: center; 
+            width: 85%; max-width: 360px; text-align: center; 
+        }
+        .loading-logo { width: 100px; margin-bottom: 25px; display: block; filter: drop-shadow(0 0 10px rgba(192, 160, 98, 0.4)); margin-left: auto; margin-right: auto; }
+        .spinner { 
+            border: 5px solid #f3f3f3; border-top: 5px solid #06C755; border-radius: 50%; width: 60px; height: 60px; 
+            animation: spin 1s linear infinite; margin-bottom: 25px; 
+            display: block; margin-left: auto !important; margin-right: auto !important; 
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .loading-text { font-size: 16px; color: #555; margin-bottom: 10px; font-weight: 500; width: 100%; text-align: center; }
+        .loading-subtext { font-size: 13px; color: #888; width: 100%; text-align: center; }
+        .warning-text { color: #ef4444; font-size: 13px; font-weight: bold; margin-top: 15px; background: #fef2f2; padding: 10px 15px; border-radius: 50px; border: 1px solid #fee2e2; width: 100%; text-align: center; }
+        #loading-success-state { display: none; flex-direction: column; align-items: center; justify-content: center; width: 100%; text-align: center; }
+        #loading-success-state i { margin-left: auto; margin-right: auto; display: block; }
+        
+        .dinoco-pulse-logo { width: 100px; height: 100px; object-fit: contain; margin: 0 auto; display: block; animation: pulseFade 1.5s infinite ease-in-out; }
+        @keyframes pulseFade { 0% { opacity: 0.3; transform: scale(0.95); } 50% { opacity: 1; transform: scale(1.05); } 100% { opacity: 0.3; transform: scale(0.95); } }
+        .delete-item-btn-large { width: 100%; background-color: #ef4444; color: #fff; border: none; padding: 12px; border-radius: 10px; font-weight: bold; cursor: pointer; margin-top: 15px; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 14px; box-shadow: 0 4px 6px rgba(239, 68, 68, 0.2); }
+        .delete-item-btn-large:hover { background-color: #dc2626; transform: translateY(-1px); }
+        @media (min-width: 992px) {
+            .legacy-wrapper { max-width: 1100px; display: grid; grid-template-columns: 400px 1fr; gap: 30px; align-items: start; padding: 40px 20px; }
+            .legacy-header-wrap, .benefits-section { grid-column: 1; width: 100%; }
+            .legacy-header-wrap { margin-bottom: 20px; padding: 0; background: transparent; }
+            .benefits-section { margin: 0; }
+            #legacyForm { grid-column: 2; grid-row: 1 / span 10; background: #fff; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); border: 1px solid #eee; padding: 20px 0; height: auto; }
+            .form-section { padding: 25px 40px; }
+            .submit-btn { font-size: 20px; padding: 18px; }
+        }
+    </style>
+
+    <!-- LOADING OVERLAY -->
+    <div id="loading-overlay">
+        <div class="loading-content">
+            <div id="loading-spinner-state">
+                <img src="https://www.dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-pxou1gkonhphkw4peesozhjgbqhvyueyia1k904zxk.png" class="loading-logo blink-animation">
+                <div class="spinner"></div>
+                <div class="loading-text">กำลังอัพโหลดข้อมูลและแจ้งเรื่องของท่าน</div>
+                <div class="warning-text">⚠️ อย่าเปลี่ยนหน้าหรือปิดหน้านี้จนกว่าขบวนการจะเสร็จสิ้น</div>
+            </div>
+            <div id="loading-success-state">
+                <i class="fa-solid fa-circle-check" style="font-size: 80px; color: #06C755; margin-bottom: 20px; margin-left: auto; margin-right: auto; display: block;"></i>
+                <div class="loading-text" style="font-size: 24px; color: #333; font-weight:bold; margin-bottom: 10px;">บันทึกข้อมูลสำเร็จ</div>
+                <div class="loading-subtext">กำลังนำท่านไปสู่หน้า Member Dashboard...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MAIN UI UNCHANGED -->
+    <div id="dinoco-loader" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 99999; justify-content: center; align-items: center; flex-direction: column;">
+        <img src="https://www.dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-pxou1gkonhphkw4peesozhjgbqhvyueyia1k904zxk.png" class="dinoco-pulse-logo">
+    </div>
+
+    <div class="legacy-wrapper">
+        <div class="legacy-header-wrap">
+            <div class="legacy-header">
+                <div class="royal-logo-container">
+                    <img src="https://www.dinoco.in.th/wp-content/uploads/2026/01/sss.png" class="royal-logo blink-animation" alt="Dinoco Logo">
+                </div>
+                <div class="royal-icon-container">
+                    <div class="royal-icon-box"><div class="royal-icon-circle"><i class="fa-regular fa-id-card"></i></div><div class="royal-icon-text">Old Card</div></div>
+                    <div class="royal-arrow"><i class="fa-solid fa-angles-right"></i></div>
+                    <div class="royal-icon-box active"><div class="royal-icon-circle"><i class="fa-solid fa-shield-halved"></i></div><div class="royal-icon-text">Digital</div></div>
+                </div>
+                <h1 class="legacy-title">Royal Warranty Upgrade</h1>
+                <div class="legacy-desc">เปลี่ยนจากบัตรสู่ระบบดิจิตอลเต็มรูปแบบ</div>
+            </div>
+        </div>
+        <div class="benefits-section">
+            <h3 class="benefits-title"><i class="fa-solid fa-crown" style="margin-right:5px;"></i> สิทธิพิเศษระบบ Digital Member</h3>
+            <div class="benefits-grid">
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> ตรวจสอบสถานะประกัน Real-time</div>
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> โอนสิทธิ์สินค้าให้เจ้าของใหม่ได้</div>
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> ติดตามสถานะการซ่อม/เคลมได้</div>
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> บันทึกประวัติ Service ตลอดอายุ</div>
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> ระบบเบิกอะไหล่ตรงรุ่น (Auto)</div>
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> แจ้งเคลมสินค้าผ่านระบบได้ทันที</div>
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> ข้อมูลปลอดภัย ไม่สูญหาย</div>
+                <div class="benefit-item"><i class="fa-solid fa-circle-check"></i> สิทธิ์เข้าร่วมกิจกรรม/ส่วนลดพิเศษ</div>
+            </div>
+        </div>
+
+        <form id="legacyForm">
+            <!-- IMPORTANT: Dynamic Token Field - populated by JS -->
+            <input type="hidden" name="security" id="dynamic_security" value="">
+            
+            <!-- [CHANGED] No 'dinoco_action' here. We use 'action' param in JS for admin-ajax -->
+            <input type="hidden" name="customer_type" id="input_customer_type" value="general">
+
+            <!-- STEP 0 -->
+            <div id="selection_stage" class="choice-section">
+                <div class="choice-label">คุณซื้อสินค้ามาจากที่ไหน *</div>
+                <div class="choice-grid">
+                    <div class="choice-card" onclick="window.selectFlow('general')">
+                        <i class="fa-solid fa-users choice-icon" style="color:#000;"></i>
+                        <div class="choice-text">ซื้อจากร้านตัวแทนจำหน่าย</div>
+                        <div class="choice-subtext">ร้านค้าตัวแทน/ออนไลน์</div>
+                    </div>
+                    <div class="choice-card" onclick="window.selectFlow('edition')">
+                        <img src="https://www.thaihonda.co.th/hondabigbike/asset/frontend/images/logo.png" class="choice-logo">
+                        <div class="choice-text">HONDA DINOCO EDITION</div>
+                        <div class="choice-subtext">ชุดแต่งจาก Honda Bigwing</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- FLOW 1 -->
+            <div id="general_flow">
+                <button type="button" class="back-btn" onclick="window.resetFlow()" style="margin: 0 20px 15px 20px; width: calc(100% - 40px);">&larr; ย้อนกลับ / เปลี่ยนประเภทลูกค้า</button>
+                <div class="form-section">
+                    <div class="section-title"><i class="fa-solid fa-id-card"></i> 1. ยืนยันบัตรเดิม</div>
+                    <label class="dinoco-label">รหัสบัตรรับประกันของท่าน</label>
+                    <input type="text" name="dnc_code" id="gen_dnc_code" class="dinoco-input" placeholder="ระบุเลขบัตร เช่น DNC001234">
+                    <label class="dinoco-label">ถ่ายรูปบัตรรับประกันใบเดิม *</label>
+                    <div class="upload-box" id="box_dnc" onclick="document.getElementById('file_dnc').click()">
+                        <div class="upload-content-default"><i class="fa-solid fa-camera upload-icon"></i><div class="upload-text">คลิกเพื่อถ่ายรูป/เลือกรูปบัตร</div></div>
+                        <div class="upload-content-success"><i class="fa-solid fa-circle-check" style="font-size:30px; margin-bottom:5px;"></i><div style="font-weight:bold;">อัพโหลดแล้ว</div></div>
+                        <input type="hidden" name="img_dnc_card" id="base64_dnc">
+                    </div>
+                    <input type="file" id="file_dnc" accept="image/*" style="display:none" onchange="window.processImage(this, 'box_dnc', 'base64_dnc')">
+                </div>
+                <div class="form-section" style="padding-bottom:10px;">
+                    <div class="section-title"><i class="fa-solid fa-motorcycle"></i> 2. ข้อมูลสินค้าที่ติดตั้ง</div>
+                    <p style="font-size:12px; color:#666; margin-bottom:15px;">กดปุ่ม "เพิ่มรายการสินค้า" เพื่อระบุสินค้าทีละชิ้นตามจริง</p>
+                    <div id="items_container"></div>
+                    <button type="button" class="add-btn" onclick="window.addItemRow()">+ เพิ่มรายการสินค้า</button>
+                    <div id="general_live_summary_container" class="fixed-product-list" style="display:none; border:2px solid #c0a062;">
+                        <div class="fixed-product-header" style="background:#fffdf5; color:#9a7b4f;">สรุปรายการสินค้าที่เลือก</div>
+                        <div id="general_live_summary_content"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- FLOW 2 -->
+            <div id="edition_model_selector" class="choice-section" style="padding-top:20px;">
+                <div class="choice-label">เลือกรถจักรยานยนต์ Honda BigWing ที่ท่านครอบครอง*</div>
+                <div class="model-grid">
+                    <div class="model-card" onclick="window.selectEditionModel('NX500')">
+                        <img src="https://www.dinoco.in.th/wp-content/uploads/2026/01/500s.png" class="model-img">
+                        <div class="model-info"><div class="model-name">HONDA NX500<br>DINOCO EDITION</div></div>
+                    </div>
+                    <div class="model-card" onclick="window.selectEditionModel('XL750_OLD')">
+                        <img src="https://www.dinoco.in.th/wp-content/uploads/2026/01/oldxlNew.png" class="model-img">
+                        <div class="model-info"><div class="model-name">HONDA XL750 x DINOCO<br>(2024)*<br><span style="font-size:9px; color:#666; font-weight:normal;">กล่องหลังอย่างเดียว</span></div></div>
+                    </div>
+                    <div class="model-card" onclick="window.selectEditionModel('XL750_NEW')">
+                        <img src="https://www.dinoco.in.th/wp-content/uploads/2026/01/500s.jpg" class="model-img">
+                        <div class="model-info"><div class="model-name">New HONDA XL750<br>DINOCO EDITION (2025+)</div></div>
+                    </div>
+                </div>
+                <button type="button" onclick="window.resetFlow()" class="back-btn">&larr; ย้อนกลับไปเลือกประเภทลูกค้า</button>
+            </div>
+
+            <div id="edition_flow">
+                <button type="button" class="back-btn" onclick="window.resetFlow()" style="margin: 0 20px 15px 20px; width: calc(100% - 40px);">&larr; ย้อนกลับ / เปลี่ยนประเภทลูกค้า</button>
+                <div id="edition_selected_car_display" class="selected-product-card" style="display:none; margin-bottom: 20px;">
+                    <img id="edition_car_img" src="" class="selected-product-img" style="width: 100%; max-width: 300px; height: auto; border-radius: 8px;">
+                    <div id="edition_car_name" class="selected-product-name" style="font-size: 18px; margin-top: 10px;"></div>
+                </div>
+                <div class="form-section">
+                    <div class="section-title"><i class="fa-solid fa-id-card"></i> 1. ยืนยันบัตรเดิม</div>
+                    <label class="dinoco-label">รหัสบัตรรับประกัน</label>
+                    <input type="text" name="dnc_code_edition" class="dinoco-input" placeholder="ระบุเลขบัตร">
+                    <label class="dinoco-label">ถ่ายรูปบัตรรับประกันใบเดิม *</label>
+                    <div class="upload-box" id="box_dnc_edition" onclick="document.getElementById('file_dnc_edition').click()">
+                        <div class="upload-content-default"><i class="fa-solid fa-camera upload-icon"></i><div class="upload-text">คลิกเพื่อถ่ายรูป/เลือกรูปบัตร</div></div>
+                        <div class="upload-content-success"><i class="fa-solid fa-circle-check" style="font-size:30px; margin-bottom:5px;"></i><div style="font-weight:bold;">อัพโหลดแล้ว</div></div>
+                        <input type="hidden" name="img_dnc_card_edition" id="base64_dnc_edition">
+                    </div>
+                    <input type="file" id="file_dnc_edition" accept="image/*" style="display:none" onchange="window.processImage(this, 'box_dnc_edition', 'base64_dnc_edition')">
+                </div>
+                <div class="form-section">
+                    <div class="section-title"><i class="fa-solid fa-list-check"></i> 2. รายการสินค้า (Set)</div>
+                    <div id="edition_product_display_container" class="fixed-product-list"></div>
+                </div>
+                <div class="form-section">
+                    <div class="section-title"><i class="fa-solid fa-file-invoice"></i> 3. หลักฐานการสั่งซื้อรถ/ติดตั้ง *</div>
+                    <label class="dinoco-label">วันที่ซื้อ/ติดตั้งโดยประมาณ *</label>
+                    <input type="text" name="edition_date" class="dinoco-input" placeholder="เลือกวันที่" onfocus="(this.type='date')" onblur="if(!this.value)this.type='text'">
+                    <label class="dinoco-label">รูปใบเสร็จ หรือ แชทการสั่งซื้อ (สำหรับทั้งคัน) *</label>
+                    <div class="upload-box" id="box_proof_edition" onclick="document.getElementById('file_proof_edition').click()">
+                        <div class="upload-content-default"><i class="fa-solid fa-file-arrow-up upload-icon"></i><div class="upload-text">อัพโหลดหลักฐาน</div></div>
+                        <div class="upload-content-success"><i class="fa-solid fa-circle-check" style="font-size:30px; margin-bottom:5px;"></i><div style="font-weight:bold;">เรียบร้อย</div></div>
+                        <input type="hidden" name="img_proof_edition" id="base64_proof_edition">
+                    </div>
+                    <input type="file" id="file_proof_edition" accept="image/*" style="display:none" onchange="window.processImage(this, 'box_proof_edition', 'base64_proof_edition')">
+                </div>
+            </div>
+
+            <!-- SHARED -->
+            <div id="shared_footer" style="display:none;">
+                <div class="form-section">
+                    <div class="section-title"><i class="fa-solid fa-map-location-dot"></i> <span id="step_addr_num">3</span>. ที่อยู่จัดส่ง DINOCO QR WARRANTY</div>
+                    <p style="font-size:12px; color:#666;">เราจะจัดส่ง DINOCO QR WARRANTY ใหม่ไปให้ตามที่อยู่นี้</p>
+                    <textarea name="address" class="dinoco-textarea"><?php echo esc_textarea($addr_text); ?></textarea>
+                </div>
+                <div class="note-box">
+                    <strong>⚠️ หมายเหตุ:</strong><br>
+                    - ระบบประกันใหม่จะเริ่มนับประวัติการซ่อมบำรุงตั้งแต่วันที่ท่านได้รับ DINOCO QR WARRANTY ใหม่<br>
+                    - ประวัติการซ่อมในอดีต (ระบบบัตรกระดาษ) จะไม่ถูกนำเข้าสู่ระบบ Digital เนื่องจากข้อจำกัดทางเทคนิค<br>
+                    - เมื่อได้รับ DINOCO QR WARRANTY แล้ว กรุณาแปะที่สินค้าและสแกนเข้าระบบทันทีเพื่อเปิดใช้งานประกันรูปแบบใหม่<br>
+                    - ใช้เวลาดำเนินการจัดทำและจัดส่งนานมากกว่า 30-45 วัน
+                </div>
+                <div style="padding: 0 25px;">
+                    <button type="button" class="submit-btn" onclick="window.validateAndSubmit()">ยืนยันและส่งข้อมูล</button>
+                </div>
+            </div>
+        </form>
+    </div>
+
+    <!-- Template -->
+    <template id="item_template">
+        <div class="item-row" id="row_{ID}">
+            <div class="selected-product-card" id="card_preview_{ID}">
+                <img src="" class="selected-product-img" id="img_preview_{ID}">
+                <div class="selected-product-name" id="name_preview_{ID}"></div>
+                <div class="selected-product-sku" id="sku_preview_{ID}"></div>
+                <div class="selected-product-price" id="price_preview_{ID}"></div>
+            </div>
+            <label class="dinoco-label">เลือกรุ่นสินค้าหรือค้นหาสินค้าของท่าน *</label>
+            <select name="items[{ID}][model]" class="dinoco-select product-select" style="width:100%;" onchange="window.updateGeneralSummary()">
+                <option value="">-- กรุณาเลือก --</option>
+                <?php foreach($product_master_list as $key => $item): 
+                    $sku = isset($item['sku']) ? $item['sku'] : $key;
+                    $name = isset($item['name']) ? $item['name'] : 'Unknown Name';
+                    $label = isset($item['label']) ? $item['label'] : ($sku . ' - ' . $name); 
+                    $image = isset($item['image']) ? $item['image'] : (isset($item['img']) ? $item['img'] : ''); 
+                    $price = isset($item['price']) ? $item['price'] : '';
+                ?>
+                <option value="<?php echo esc_attr($sku); ?>" data-sku="<?php echo esc_attr($sku); ?>" data-name="<?php echo esc_attr($name); ?>" data-image="<?php echo esc_url($image); ?>" data-price="<?php echo esc_attr($price); ?>"><?php echo esc_html($label); ?></option>
+                <?php endforeach; ?>
+            </select>
+            <label class="dinoco-label" style="margin-top:10px;">วันที่ซื้อสินค้า (โดยประมาณ) *</label>
+            <input type="text" name="items[{ID}][date]" class="dinoco-input item-date-input" placeholder="เลือกวันที่ซื้อสินค้า" onfocus="(this.type='date')" onblur="if(!this.value)this.type='text'" onchange="window.updateGeneralSummary()">
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:15px;">
+                <div><label class="dinoco-label">รูปถ่ายสินค้าจริง (รูป 1) *</label><div class="upload-box" id="box_item_{ID}_1" style="padding:10px;" onclick="document.getElementById('file_item_{ID}_1').click()"><div class="upload-content-default"><i class="fa-solid fa-camera upload-icon" style="font-size:20px;"></i><div class="upload-text">เลือกรูป</div></div><div class="upload-content-success"><i class="fa-solid fa-check" style="font-size:20px;"></i></div><input type="hidden" name="items[{ID}][img1]" id="base64_item_{ID}_1"></div><input type="file" id="file_item_{ID}_1" accept="image/*" style="display:none" onchange="window.processImage(this, 'box_item_{ID}_1', 'base64_item_{ID}_1')"></div>
+                <div><label class="dinoco-label">รูปถ่ายสินค้าจริง (รูป 2)</label><div class="upload-box" id="box_item_{ID}_2" style="padding:10px;" onclick="document.getElementById('file_item_{ID}_2').click()"><div class="upload-content-default"><i class="fa-solid fa-camera upload-icon" style="font-size:20px;"></i><div class="upload-text">เลือกรูป</div></div><div class="upload-content-success"><i class="fa-solid fa-check" style="font-size:20px;"></i></div><input type="hidden" name="items[{ID}][img2]" id="base64_item_{ID}_2"></div><input type="file" id="file_item_{ID}_2" accept="image/*" style="display:none" onchange="window.processImage(this, 'box_item_{ID}_2', 'base64_item_{ID}_2')"></div>
+            </div>
+            <label class="dinoco-label" style="border-top:1px dashed #eee; padding-top:10px; margin-top:5px;">หลักฐานการสั่งซื้อ/ติดตั้ง ของชิ้นนี้ (แชท/ใบเสร็จ) *</label>
+            <div class="upload-box" id="box_item_{ID}_proof" style="padding:10px; min-height:80px;" onclick="document.getElementById('file_item_{ID}_proof').click()"><div class="upload-content-default"><i class="fa-solid fa-file-invoice upload-icon" style="font-size:24px;"></i><div class="upload-text">อัพโหลดหลักฐาน</div></div><div class="upload-content-success"><i class="fa-solid fa-circle-check" style="font-size:24px;"></i><span style="font-size:12px;">เรียบร้อย</span></div><input type="hidden" name="items[{ID}][img_proof]" id="base64_item_{ID}_proof"></div><input type="file" id="file_item_{ID}_proof" accept="image/*" style="display:none" onchange="window.processImage(this, 'box_item_{ID}_proof', 'base64_item_{ID}_proof')">
+        </div>
+    </template>
+
+    <script>
+    jQuery(function($) {
+        // [V4.18] Define Admin AJAX URL
+        const ajaxUrl = '<?php echo admin_url("admin-ajax.php"); ?>';
+        
+        // [1] FETCH FRESH TOKEN ON LOAD
+        console.log("🚀 System v4.18 Initialized (Ultimate Cache-Proof Mode)");
+        $.post(ajaxUrl, { action: 'dinoco_get_token_v418' }, function(res) {
+            if(res.success) {
+                $('#dynamic_security').val(res.token);
+                console.log("✅ Token Acquired via AJAX: " + res.token.substring(0, 5) + "...");
+            } else {
+                console.warn("⚠️ Token Fetch Failed: " + res.msg);
+            }
+        });
+
+        // Data Definitions (Generated from PHP)
+        const editionSets = <?php echo json_encode($edition_sets_config); ?>;
+        const carModels = {
+            'NX500': { name: 'HONDA NX500 DINOCO EDITION', img: 'https://www.dinoco.in.th/wp-content/uploads/2026/01/500s.png' },
+            'XL750_OLD': { name: 'HONDA XL750 x DINOCO (2024)*', img: 'https://www.dinoco.in.th/wp-content/uploads/2026/01/oldxlNew.png' },
+            'XL750_NEW': { name: 'New HONDA XL750 DINOCO EDITION (2025+)', img: 'https://www.dinoco.in.th/wp-content/uploads/2026/01/500s.jpg' }
+        };
+
+        window.itemCount = 0;
+        window.currentFlow = ''; 
+        window.selectedEditionModel = '';
+
+        window.selectFlow = function(type) {
+            window.currentFlow = type;
+            $('#input_customer_type').val(type);
+            $('#selection_stage').hide();
+            if (type === 'general') {
+                $('#general_flow').addClass('active');
+                $('#shared_footer').show(); 
+                $('#step_addr_num').text('3');
+                window.addItemRow(); 
+            } else {
+                $('#edition_model_selector').addClass('active');
+                $('#shared_footer').hide();
+            }
+        };
+
+        window.selectEditionModel = function(model) {
+            window.selectedEditionModel = model;
+            const carData = carModels[model];
+            if(carData) {
+                $('#edition_car_img').attr('src', carData.img);
+                $('#edition_car_name').text(carData.name);
+                $('#edition_selected_car_display').css('display', 'flex');
+            }
+            $('#edition_model_selector').hide();
+            $('#edition_flow').addClass('active');
+            $('#shared_footer').show();
+            $('#step_addr_num').text('4'); 
+            window.renderEditionProducts(model);
+        };
+
+        window.resetFlow = function() {
+            $('#dinoco-loader').css('display', 'flex');
+            setTimeout(function() { window.location.reload(); }, 1500); 
+        };
+
+        window.updateGeneralSummary = function() {
+            const container = $('#general_live_summary_container');
+            const content = $('#general_live_summary_content');
+            let html = '';
+            let hasItems = false;
+            for(let i=0; i<window.itemCount; i++) {
+                if(!document.getElementById('row_' + i)) continue;
+                const selectEl = $('#row_' + i + ' .product-select');
+                if(selectEl.length) {
+                    const data = selectEl.select2('data')[0];
+                    if(data && data.id) {
+                        hasItems = true;
+                        const name = data.element.dataset.name || data.text;
+                        const sku = data.element.dataset.sku || data.id;
+                        const img = data.element.dataset.image || 'https://via.placeholder.com/50';
+                        html += `<div class="fixed-item"><img src="${img}" class="fixed-item-img"><div class="fixed-item-info"><div class="fixed-item-name">${name}</div><div class="fixed-item-sku">SKU: ${sku}</div></div><div style="color:#06C755;"><i class="fa-solid fa-circle-check"></i></div></div>`;
+                    }
+                }
+            }
+            content.html(html);
+            if(hasItems) container.show(); else container.hide();
+        };
+
+        window.renderEditionProducts = function(model) {
+            const container = $('#edition_product_display_container');
+            const items = editionSets[model];
+            let html = `<div class="fixed-product-header">รายการสินค้าในชุด ${model.replace('_OLD', '').replace('_NEW', '')}</div>`;
+            items.forEach(item => {
+                html += `<div class="fixed-item"><img src="${item.img}" class="fixed-item-img"><div class="fixed-item-info"><div class="fixed-item-name">${item.name}</div><div class="fixed-item-sku">SKU: ${item.sku}</div></div><div style="color:#06C755;"><i class="fa-solid fa-circle-check"></i></div></div>`;
+            });
+            container.html(html);
+        };
+
+        window.processImage = function(input, boxId, hiddenId) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                const box = $('#' + boxId);
+                const originalText = box.find('.upload-text').text();
+                box.find('.upload-text').text('กำลังย่อรูป...');
+
+                reader.onload = function(e) {
+                    const img = new Image(); 
+                    img.src = e.target.result;
+                    img.onload = function() {
+                        const canvas = document.createElement('canvas'); 
+                        const ctx = canvas.getContext('2d');
+                        const MAX_WIDTH = 1000; 
+                        let width = img.width; 
+                        let height = img.height;
+                        if (width > MAX_WIDTH) { height *= MAX_WIDTH / width; width = MAX_WIDTH; }
+                        canvas.width = width; 
+                        canvas.height = height; 
+                        ctx.drawImage(img, 0, 0, width, height);
+                        let quality = 0.9;
+                        let dataUrl = canvas.toDataURL('image/jpeg', quality);
+                        const getBase64SizeKB = (str) => { return (str.length * 0.75) / 1024; };
+                        while (getBase64SizeKB(dataUrl) > 300 && quality > 0.1) {
+                            quality -= 0.1;
+                            dataUrl = canvas.toDataURL('image/jpeg', quality);
+                        }
+                        $('#' + hiddenId).val(dataUrl);
+                        box.addClass('uploaded').removeClass('input-error'); 
+                        box.find('.upload-content-default').hide();
+                        box.find('.upload-content-success').css('display', 'flex');
+                        box.find('.upload-text').text(originalText); 
+                        if(window.currentFlow === 'general') window.updateGeneralSummary();
+                    }
+                }
+                reader.readAsDataURL(file);
+            }
+        };
+
+        window.formatProductState = function(state) {
+            if (!state.id) return state.text;
+            var el = $(state.element); 
+            var name = el.data('name') || state.text; 
+            var sku = el.data('sku') || state.id; 
+            var image = el.data('image');
+            var price = el.data('price');
+            var imgHtml = image ? '<img src="' + image + '" style="width:45px; height:45px; object-fit:cover; border-radius:6px; margin-right:12px; flex-shrink:0;">' : '';
+            var priceHtml = price ? '<span style="font-size:12px; color:#06C755; display:block; margin-top:2px; font-weight:600;">ราคาจำหน่าย : ' + price + ' บาท (ราคาขาย)</span>' : '';
+            return $('<div style="display:flex; align-items:center; width:100%;">' + imgHtml + '<div style="display:flex; flex-direction:column; justify-content:center; line-height:1.4; overflow:hidden;"><span style="font-weight:bold; color:#333; font-size:14px; white-space:normal;">' + name + '</span><span style="font-size:12px; color:#888;">SKU: ' + sku + '</span>' + priceHtml + '</div></div>');
+        };
+        window.formatProductSelection = function(state) { if (!state.id) return state.text; return $(state.element).data('name') || state.text; };
+
+        window.addItemRow = function() {
+            const tpl = $('#item_template').html().replace(/{ID}/g, window.itemCount);
+            const div = $('<div>').html(tpl);
+            if (window.itemCount > 0) { 
+                const deleteBtn = `<button type="button" class="delete-item-btn-large" onclick="window.removeItemRow(${window.itemCount})"><i class="fa-solid fa-trash-can"></i> ลบรายการสินค้านี้</button>`;
+                div.children().first().append(deleteBtn);
+            }
+            $('#items_container').append(div.children().first());
+            const rowId = '#row_' + window.itemCount;
+            $(rowId + ' .product-select').select2({ placeholder: "เลือกรุ่นสินค้าหรือค้นหาสินค้าของท่าน", allowClear: false, width: '100%', templateResult: window.formatProductState, templateSelection: window.formatProductSelection });
+            $(rowId + ' .product-select').on('select2:select', function(e) {
+                var el = $(e.params.data.element); var rId = $(this).closest('.item-row').attr('id').replace('row_', '');
+                if(el.data('image')) { 
+                    $('#img_preview_' + rId).attr('src', el.data('image')); 
+                    $('#name_preview_' + rId).text(el.data('name')); 
+                    $('#sku_preview_' + rId).text('SKU: ' + el.data('sku'));
+                    if(el.data('price')) $('#price_preview_' + rId).text('ราคาจำหน่าย : ' + el.data('price') + ' บาท (ราคาขาย)');
+                    $('#card_preview_' + rId).css('display', 'flex'); 
+                } else { $('#card_preview_' + rId).hide(); }
+                $(this).next('.select2-container').find('.select2-selection').removeClass('input-error');
+                window.updateGeneralSummary();
+            });
+            $(rowId + ' .product-select').on('select2:open', function(e) { document.querySelector('.select2-search__field').placeholder = 'พิมพ์ค้นหาสินค้าของท่าน'; });
+            $(rowId + ' .item-date-input').on('input', function() { $(this).removeClass('input-error'); });
+            window.itemCount++;
+        };
+        
+        window.removeItemRow = function(id) { $('#row_' + id).find('.product-select').select2('destroy'); $('#row_' + id).remove(); window.updateGeneralSummary(); };
+
+        // [CORE FUNCTION] Validate & Submit
+        window.validateAndSubmit = function() {
+            try {
+                // 1. Reset Errors
+                $('.input-error').removeClass('input-error');
+                let valid = true;
+                let firstError = null;
+                const checkVal = (el) => { if(!el || el.length === 0) return false; const val = el.val(); return (typeof val === 'string') && val.trim() !== ''; };
+                const setError = (el) => { const $el = $(el); if($el.length) { $el.addClass('input-error'); if(!firstError) firstError = $el[0]; valid = false; } };
+
+                // 2. Flow Check
+                if(!window.currentFlow) { alert('กรุณาเลือกประเภทลูกค้าก่อน'); return; }
+
+                // 3. Shared Check
+                const address = $('textarea[name="address"]');
+                if(!checkVal(address)) setError(address);
+
+                // 4. Specific Checks
+                if (window.currentFlow === 'general') {
+                    if(window.itemCount === 0) { alert('กรุณาเพิ่มรายการสินค้าอย่างน้อย 1 รายการ'); return; }
+                    const oldCardCode = $('#gen_dnc_code'); if(!checkVal(oldCardCode)) setError(oldCardCode);
+                    const oldCardImg = $('#base64_dnc'); if(!checkVal(oldCardImg)) setError($('#box_dnc'));
+                    for(let i=0; i<window.itemCount; i++) {
+                        if(!document.getElementById('row_' + i)) continue;
+                        const selectEl = $('#row_' + i + ' .product-select');
+                        if(!checkVal(selectEl)) setError($('#row_' + i).find('.select2-selection'));
+                        const dateInput = $('#row_' + i + ' .item-date-input');
+                        if(!checkVal(dateInput)) setError(dateInput);
+                        const img1Val = $('#base64_item_' + i + '_1');
+                        if(!checkVal(img1Val)) setError($('#box_item_' + i + '_1'));
+                        const proofVal = $('#base64_item_' + i + '_proof');
+                        if(!checkVal(proofVal)) setError($('#box_item_' + i + '_proof'));
+                    }
+                } else if (window.currentFlow === 'edition') {
+                      const codeEd = $('input[name="dnc_code_edition"]'); if(!checkVal(codeEd)) setError(codeEd);
+                      const oldCardImgEd = $('#base64_dnc_edition'); if(!checkVal(oldCardImgEd)) setError($('#box_dnc_edition'));
+                      const dateEd = $('input[name="edition_date"]'); if(!checkVal(dateEd)) setError(dateEd);
+                      const proofEd = $('#base64_proof_edition'); if(!checkVal(proofEd)) setError($('#box_proof_edition'));
+                }
+
+                if(!valid) {
+                    if(firstError) { firstError.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+                    alert('กรุณากรอกข้อมูลในช่องกรอบสีแดงให้ครบถ้วน');
+                    return;
+                }
+
+                if(!confirm('ยืนยันการส่งข้อมูล? \nกรุณาตรวจสอบความถูกต้องก่อนส่ง')) return;
+
+                const submitBtn = $('.submit-btn');
+                submitBtn.prop('disabled', true);
+                
+                // [UI FIX] Use .css('display', 'flex') directly to force center alignment
+                $('#loading-overlay').css('display', 'flex');
+                
+                const form = $('#legacyForm');
+                
+                if (window.currentFlow === 'edition') {
+                    const items = editionSets[window.selectedEditionModel];
+                    const date = $('input[name="edition_date"]').val();
+                    const proof = $('#base64_proof_edition').val();
+                    items.forEach((item, index) => {
+                        form.append(`<input type="hidden" name="items[${index}][model]" value="${item.sku}"><input type="hidden" name="items[${index}][date]" value="${date}"><input type="hidden" name="items[${index}][img_proof]" value="${proof}">`); 
+                    });
+                    const dncCode = $('input[name="dnc_code_edition"]').val();
+                    const dncImg = $('#base64_dnc_edition').val();
+                    if(dncCode) $('input[name="dnc_code"]').val(dncCode); 
+                    if(dncImg) $('#base64_dnc').val(dncImg);
+                }
+                
+                const formData = new FormData(document.getElementById('legacyForm'));
+                
+                // [2] USE ADMIN AJAX FOR SUBMISSION
+                formData.append('action', 'dinoco_submit_v418'); // Matches registered wp_ajax_ hook
+                
+                $.ajax({
+                    url: ajaxUrl, // Use global admin-ajax.php URL
+                    type: 'POST',
+                    data: formData,
+                    processData: false,
+                    contentType: false,
+                    dataType: 'json', 
+                    success: function(data) {
+                        if(data.success) {
+                            $('#loading-spinner-state').hide();
+                            $('#loading-success-state').css('display', 'flex');
+                            setTimeout(function() { window.location.href = '/member-dashboard'; }, 2000);
+                        } else {
+                            // SHOW ALERT BEFORE HIDING OVERLAY
+                            alert('❌ เกิดข้อผิดพลาด: ' + (data.msg || 'Unknown Error'));
+                            $('#loading-overlay').hide();
+                            submitBtn.prop('disabled', false);
+                        }
+                    },
+                    error: function(jqXHR, textStatus, errorThrown) {
+                        console.error("AJAX Error:", textStatus, errorThrown);
+                        alert('❌ การเชื่อมต่อขัดข้อง: ' + textStatus + ' (กรุณาลองใหม่อีกครั้ง)');
+                        $('#loading-overlay').hide();
+                        submitBtn.prop('disabled', false);
+                    }
+                });
+
+            } catch(e) { 
+                console.error(e); 
+                alert('System Error: ' + e.message); 
+                $('.submit-btn').prop('disabled', false);
+                $('#loading-overlay').hide();
+            }
+        };
+
+    }); // End jQuery Ready
+    </script>
+
+    <?php 
+    return ob_get_clean();
+}
