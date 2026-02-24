@@ -1,0 +1,2086 @@
+/*
+ * Template Name: [Admin System] DINOCO Legacy Migration Requests (CLOUD FIX v4 - Isolation Mode)
+ * Shortcode: [dinoco_admin_legacy]
+ * Version: 3.34.0 (Duplicate Detection Intelligence)
+ * Description: 
+ * 1. Isolation: เปลี่ยนชื่อตัวแปร POST เป็น 'dinoco_legacy_action' เพื่อไม่ให้ตีกับ Inventory System
+ * 2. Query: ปรับ post_status เป็น 'any' เพื่อให้มองเห็น Private Post แน่นอน 100%
+ * 3. Database: รองรับ wp_options ('dinoco_sku_relations') เพื่อแตกสินค้าแม่-ลูก
+ * 4. Job Sheet: แก้ไขการตัดหน้ากระดาษ (Pagination) ของ Delivery Note และ Job Order
+ * 5. Intelligence: เพิ่มระบบตรวจสอบการเบิกซ้ำ 2 ระดับ (รหัสบัตรชนกัน / ลูกค้าคนเดิมเบิกซ้ำ)
+ * Author: DINOCO Senior Architect
+ */
+
+// =========================================================================================
+// PART 1: BACKEND HANDLER
+// =========================================================================================
+add_action('init', function() {
+    
+    // [FIX] เปลี่ยนชื่อตัวแปรดักจับเป็น 'dinoco_legacy_action' เพื่อแยกออกจาก Inventory System
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['dinoco_legacy_action'])) {
+        
+        // 1. CLEAN BUFFER
+        if (ob_get_length()) { 
+            ob_clean(); 
+        }
+        
+        // 2. SUPPRESS ERRORS
+        error_reporting(0);
+        
+        // 3. SET HEADER
+        header('Content-Type: application/json; charset=utf-8');
+
+        // 4. SECURITY CHECK
+        if (!current_user_can('manage_options')) {
+            echo json_encode(['success' => false, 'message' => 'Unauthorized Access']);
+            exit;
+        }
+
+        $action = sanitize_text_field($_POST['dinoco_legacy_action']);
+
+        try {
+            // -----------------------------------------------------------------
+            // ACTION: Get Legacy List (MAIN DATA)
+            // -----------------------------------------------------------------
+            if ($action === 'get_legacy_list') {
+                
+                /* Query Arguments */
+                $args = array(
+                    'post_type'      => 'legacy_request',
+                    'posts_per_page' => -1, // ดึงทั้งหมด
+                    'post_status'    => 'any', // [FIX] ใช้ 'any' เพื่อให้ Admin เห็น Private/Draft ชัวร์ๆ
+                    'orderby'        => 'date',
+                    'order'          => 'DESC'
+                );
+                
+                $query = new WP_Query($args);
+                $list  = array();
+                
+                /* Debug Info */
+                $debug_info = array(
+                    'found' => $query->found_posts,
+                    'sql'   => $query->request
+                );
+
+                if ($query->have_posts()) {
+                    while ($query->have_posts()) {
+                        $query->the_post();
+                        $pid = get_the_ID();
+                        $current_author_id = get_post_field('post_author', $pid);
+
+                        /* --- Status Logic --- */
+                        $status_acf  = get_field('request_status');
+                        $status_meta = get_post_meta($pid, 'request_status', true);
+                        $final_status = !empty($status_acf) ? $status_acf : ($status_meta ? $status_meta : 'Pending');
+
+                        if (empty($final_status) || $final_status == 'Pending') {
+                            $final_status = 'Submission Received';
+                        }
+
+                        /* --- User Info --- */
+                        $uinfo = get_userdata($current_author_id);
+                        $user_display_name = $uinfo ? $uinfo->display_name : 'Guest/Unknown';
+                        $user_phone = get_user_meta($current_author_id, 'phone_number', true);
+                        
+                        /* --- Ticket Number --- */
+                        $date_part = get_the_date('d_m_Y'); 
+                        $ticket_no = sprintf('LMD_QRWRT_%07d_%s', $pid, $date_part);
+
+                        /* --- Image Helper --- */
+                        $get_img = function($field) {
+                            $url = '';
+                            if (is_array($field) && isset($field['url'])) $url = $field['url'];
+                            elseif (is_numeric($field)) $url = wp_get_attachment_url($field);
+                            elseif (is_string($field)) $url = $field;
+                            
+                            if (empty($url) || strpos($url, 'http') === false) return '';
+                            return $url;
+                        };
+
+                        $card_url = $get_img(get_field('dnc_card_image'));
+                        $global_proof_url = $get_img(get_field('proof_purchase_image'));
+
+                        /* --- Items --- */
+                        $items = get_field('legacy_items');
+                        $items_data = array();
+                        $current_skus = array(); 
+                        
+                        if ($items) {
+                            foreach ($items as $ri) {
+                                $img1 = isset($ri['item_image_1']) ? $get_img($ri['item_image_1']) : '';
+                                $img2 = isset($ri['item_image_2']) ? $get_img($ri['item_image_2']) : '';
+                                $proof = isset($ri['item_proof_image']) ? $get_img($ri['item_proof_image']) : '';
+                                
+                                if (empty($proof) && !empty($global_proof_url)) {
+                                    $proof = $global_proof_url;
+                                }
+
+                                $date = isset($ri['item_install_date']) ? $ri['item_install_date'] : '-';
+                                $sku  = isset($ri['item_model']) ? trim($ri['item_model']) : '';
+
+                                $items_data[] = array(
+                                    'item_model'   => $sku,
+                                    'install_date' => $date,
+                                    'imgs'         => array($img1, $img2, $proof)
+                                );
+
+                                if (!empty($sku)) $current_skus[] = $sku;
+                            }
+                        }
+
+                        /* --- [UPGRADE] Intelligent Duplicate Check --- */
+                        $old_code = get_field('dnc_old_code');
+                        $warnings = array();
+                        
+                        if (!empty($current_skus)) {
+                            
+                            // 1. Prepare Arguments: Find duplicates by Old Code OR by Author
+                            // Note: We run a query to look for collisions.
+                            
+                            $meta_query = array('relation' => 'OR');
+                            
+                            // Logic A: Check Collision by Old Card Code (Strongest)
+                            if (!empty($old_code)) {
+                                $meta_query[] = array(
+                                    'key' => 'dnc_old_code', 
+                                    'value' => $old_code, 
+                                    'compare' => '='
+                                );
+                            }
+
+                            $dup_args = array(
+                                'post_type' => 'legacy_request', 
+                                'post_status' => 'any', 
+                                'posts_per_page' => -1,
+                                'post__not_in' => array($pid),
+                                'meta_query' => (count($meta_query) > 1) ? $meta_query : '', // Use meta query only if old_code exists
+                                'fields' => 'ids'
+                            );
+
+                            // Logic B: If no old code, or additionally, we check by Author ID
+                            // Since we can't OR a meta_query with 'author' param easily in one simple array,
+                            // We fetch duplicates by Old Code first, then duplicates by Author, then merge.
+                            
+                            $candidate_ids = array();
+
+                            // Query 1: By Old Code
+                            if (!empty($old_code)) {
+                                $q1 = get_posts($dup_args);
+                                if($q1) $candidate_ids = array_merge($candidate_ids, $q1);
+                            }
+
+                            // Query 2: By Author (User ID) -> To catch same user requesting same SKU
+                            if ($current_author_id > 0) {
+                                $dup_args_author = array(
+                                    'post_type' => 'legacy_request', 
+                                    'post_status' => 'any', 
+                                    'posts_per_page' => -1,
+                                    'post__not_in' => array($pid),
+                                    'author' => $current_author_id,
+                                    'fields' => 'ids'
+                                );
+                                $q2 = get_posts($dup_args_author);
+                                if($q2) $candidate_ids = array_merge($candidate_ids, $q2);
+                            }
+
+                            // Remove duplicate IDs from the merge
+                            $candidate_ids = array_unique($candidate_ids);
+
+                            // Analyze Candidates
+                            if (!empty($candidate_ids)) {
+                                foreach ($candidate_ids as $dup_id) {
+                                    $dup_items = get_field('legacy_items', $dup_id);
+                                    $dup_old_code = get_field('dnc_old_code', $dup_id);
+                                    $dup_author = get_post_field('post_author', $dup_id);
+                                    
+                                    if ($dup_items) {
+                                        foreach ($dup_items as $di) {
+                                            $dup_sku = trim($di['item_model']);
+                                            
+                                            if (in_array($dup_sku, $current_skus)) {
+                                                // FOUND DUPLICATE SKU! Now determine reason.
+                                                
+                                                $d_status = get_post_meta($dup_id, 'request_status', true) ?: 'Pending';
+                                                $d_tick = sprintf('LMD_QRWRT_%07d_%s', $dup_id, get_the_date('d_m_Y', $dup_id));
+                                                
+                                                $reason = "";
+                                                if (!empty($old_code) && $dup_old_code === $old_code) {
+                                                    $reason = "🔴 รหัสบัตรซ้ำ";
+                                                } elseif ($dup_author == $current_author_id) {
+                                                    $reason = "🟠 ลูกค้าคนเดิม";
+                                                } else {
+                                                    $reason = "⚠️ พบ SKU นี้ในระบบ";
+                                                }
+
+                                                $warnings[] = "{$reason} (SKU: <strong>{$dup_sku}</strong>) - Ref: {$d_tick} [{$d_status}]";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        $warnings = array_unique($warnings);
+
+                        $list[] = array(
+                            'id'          => $pid,
+                            'ticket_no'   => $ticket_no,
+                            'date'        => get_the_date('d/m/Y'),
+                            'user'        => $user_display_name,
+                            'phone'       => $user_phone,
+                            'old'         => $old_code,
+                            'status'      => $final_status,
+                            'card'        => $card_url,
+                            'items'       => $items_data,
+                            'address'     => get_field('customer_address_snap'),
+                            'tracking'    => get_field('tracking_qr_to_customer'),
+                            'log_sns'     => get_field('logs_sn'),
+                            'warnings'    => $warnings
+                        );
+                    }
+                    wp_reset_postdata();
+                }
+                
+                echo json_encode(['success' => true, 'data' => $list, 'debug' => $debug_info]);
+                exit;
+            }
+
+            // -----------------------------------------------------------------
+            // ACTION: Update Status
+            // -----------------------------------------------------------------
+            if ($action === 'update_legacy_status') {
+                $req_id     = intval($_POST['req_id']); 
+                $new_status = sanitize_text_field($_POST['new_status']);
+                update_field('request_status', $new_status, $req_id);
+                echo json_encode(['success' => true]);
+                exit;
+            }
+
+            // -----------------------------------------------------------------
+            // ACTION: Save Shipping
+            // -----------------------------------------------------------------
+            if ($action === 'save_shipping_only') {
+                $req_id = intval($_POST['req_id']);
+                if (isset($_POST['tracking'])) {
+                    update_field('tracking_qr_to_customer', sanitize_text_field($_POST['tracking']), $req_id);
+                }
+                update_field('request_status', 'Shipped', $req_id);
+                echo json_encode(['success' => true]);
+                exit;
+            }
+
+            // -----------------------------------------------------------------
+            // ACTION: Save SN
+            // -----------------------------------------------------------------
+            if ($action === 'save_sn_complete') {
+                $req_id   = intval($_POST['req_id']);
+                $sent_sns = isset($_POST['sent_sns']) ? $_POST['sent_sns'] : array();
+                update_field('logs_sn', $sent_sns, $req_id);
+                update_field('request_status', 'Completed', $req_id);
+                echo json_encode(['success' => true]);
+                exit;
+            }
+
+            // -----------------------------------------------------------------
+            // ACTION: Delete
+            // -----------------------------------------------------------------
+            if ($action === 'delete_legacy_case') {
+                $req_id = intval($_POST['req_id']);
+                if (current_user_can('delete_posts')) {
+                    // Delete Attachments logic (same as before)
+                    $card_img = get_field('dnc_card_image', $req_id);
+                    if(is_numeric($card_img)) wp_delete_attachment($card_img, true);
+                    elseif(is_array($card_img)) wp_delete_attachment($card_img['ID'], true);
+
+                    $items = get_field('legacy_items', $req_id);
+                    if($items) {
+                        foreach($items as $i) {
+                            if(is_numeric($i['item_image_1'])) wp_delete_attachment($i['item_image_1'], true);
+                            if(is_numeric($i['item_image_2'])) wp_delete_attachment($i['item_image_2'], true);
+                            if(is_numeric($i['item_proof_image'])) wp_delete_attachment($i['item_proof_image'], true);
+                        }
+                    }
+                    
+                    $global_proof = get_field('proof_purchase_image', $req_id);
+                    if (is_numeric($global_proof) ) wp_delete_attachment($global_proof, true);
+                    elseif (is_array($global_proof) && isset($global_proof['ID'])) wp_delete_attachment($global_proof['ID'], true);
+
+                    $deleted = wp_delete_post($req_id, true); 
+                    echo json_encode(['success' => !!$deleted]);
+                } else {
+                    echo json_encode(['success' => false, 'message' => 'Permission denied']);
+                }
+                exit;
+            }
+        } catch (Exception $e) {
+            echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+            exit;
+        }
+    }
+});
+
+
+// =========================================================================
+// PART 2: UI RENDERER (Shortcode - ORIGINAL LEGACY UI)
+// =========================================================================
+add_shortcode('dinoco_admin_legacy', 'dinoco_render_legacy_ui');
+
+function dinoco_render_legacy_ui() {
+    
+    /* UI Security Check */
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return '<div style="text-align:center; padding:50px; color:red;"><h3>⛔ Access Denied</h3><p>Admin Only</p></div>';
+    }
+
+    /* 1. Retrieve Product Catalog (Master Data) */
+    $product_catalog = get_option( 'dinoco_product_catalog', array() );
+
+    /* 2. Retrieve SKU Relations (Parent-Child Logic) */
+    $sku_relations = get_option( 'dinoco_sku_relations', array() );
+    
+    ob_start();
+    ?>
+    
+    <style>
+        /* Scoped Styles for Legacy UI */
+        #tab-legacy {
+            font-family: 'Sarabun', sans-serif;
+            color: #374151;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        
+        /* Header */
+        #tab-legacy .lg-header {
+            background-color: #ffffff;
+            padding: 20px 25px;
+            border-radius: 12px;
+            border: 1px solid #e5e7eb;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+            flex-wrap: wrap; 
+            gap: 15px;
+        }
+        
+        #tab-legacy .lg-header-title h2 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 700;
+            color: #111827;
+        }
+        
+        /* Search Box in Header */
+        #tab-legacy .lg-search-box {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        #tab-legacy .search-input {
+            padding: 10px 15px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 14px;
+            width: 280px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        #tab-legacy .search-input:focus {
+            border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+        
+        #tab-legacy .btn-reload {
+            background-color: #f3f4f6;
+            border: 1px solid #d1d5db;
+            color: #374151;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            transition: 0.2s;
+            white-space: nowrap;
+        }
+        #tab-legacy .btn-reload:hover {
+            background-color: #e5e7eb;
+        }
+
+        /* Dashboard Grid */
+        #tab-legacy .dash-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        #tab-legacy .dash-card {
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #e5e7eb;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+            transition: transform 0.2s ease;
+        }
+        #tab-legacy .dash-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1);
+        }
+        #tab-legacy .dash-card.active {
+            border-color: #2563eb;
+            background-color: #eff6ff;
+        }
+        
+        #tab-legacy .dash-label {
+            font-size: 13px;
+            color: #6b7280;
+            font-weight: 600;
+            display: block;
+            margin-bottom: 8px;
+        }
+        #tab-legacy .dash-count {
+            font-size: 32px;
+            font-weight: 800;
+            color: #111827;
+        }
+        #tab-legacy .dash-bar {
+            height: 4px;
+            width: 100%;
+            position: absolute;
+            bottom: 0;
+            left: 0;
+        }
+
+        #tab-legacy .card-1 .dash-bar { background-color: #3b82f6; }
+        #tab-legacy .card-2 .dash-bar { background-color: #f59e0b; }
+        #tab-legacy .card-3 .dash-bar { background-color: #8b5cf6; }
+        #tab-legacy .card-4 .dash-bar { background-color: #10b981; }
+        #tab-legacy .card-5 .dash-bar { background-color: #ec4899; }
+        #tab-legacy .card-6 .dash-bar { background-color: #1f2937; }
+
+        /* Table */
+        #tab-legacy .table-wrap {
+            background-color: #ffffff;
+            border-radius: 12px;
+            border: 1px solid #e5e7eb;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            overflow: hidden;
+        }
+        #tab-legacy table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: #ffffff;
+        }
+        #tab-legacy th {
+            text-align: left;
+            padding: 18px 24px;
+            background-color: #f9fafb;
+            border-bottom: 1px solid #e5e7eb;
+            font-size: 12px;
+            font-weight: 700;
+            color: #6b7280;
+            text-transform: uppercase;
+        }
+        #tab-legacy td {
+            padding: 18px 24px;
+            border-bottom: 1px solid #f3f4f6;
+            font-size: 14px;
+            vertical-align: middle;
+            color: #374151;
+        }
+        #tab-legacy tr:hover td {
+            background-color: #f8fafc;
+        }
+
+        /* Badges & Buttons */
+        #tab-legacy .lg-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 11px;
+            font-weight: 700;
+            line-height: 1;
+        }
+        #tab-legacy .lg-badge.blue { background-color: #dbeafe; color: #1e40af; }
+        #tab-legacy .lg-badge.yellow { background-color: #fef3c7; color: #92400e; }
+        #tab-legacy .lg-badge.green { background-color: #dcfce7; color: #166534; }
+        #tab-legacy .lg-badge.red { background-color: #fee2e2; color: #991b1b; }
+
+        #tab-legacy .btn-edit {
+            background-color: #fff;
+            border: 1px solid #d1d5db;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            color: #374151;
+            font-size: 12px;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            width: 100%;
+            justify-content: center;
+        }
+        #tab-legacy .btn-edit:hover {
+            border-color: #2563eb;
+            color: #2563eb;
+        }
+
+        /* Delete Button in Table */
+        #tab-legacy .btn-delete-row {
+            background-color: #fee2e2;
+            border: 1px solid #ef4444;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            color: #991b1b;
+            font-size: 12px;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            width: 100%;
+            justify-content: center;
+            margin-top: 5px;
+        }
+        #tab-legacy .btn-delete-row:hover {
+            background-color: #fecaca;
+        }
+
+        /* --- MODAL OVERLAY (GLOBAL SCOPE) --- */
+        #dinoco-modal-overlay {
+            display: none;
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            background-color: rgba(20, 20, 25, 0.9) !important;
+            z-index: 2147483647 !important;
+            justify-content: center;
+            align-items: center;
+            backdrop-filter: blur(5px);
+            padding: 20px;
+            box-sizing: border-box;
+            font-family: 'Sarabun', sans-serif;
+        }
+        
+        #dinoco-modal-overlay .modal-box {
+            background-color: #ffffff;
+            width: 95%;
+            max-width: 1400px;
+            height: 92vh;
+            border-radius: 12px;
+            box-shadow: 0 50px 100px -20px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+
+        #dinoco-modal-overlay .modal-header {
+            padding: 20px 30px;
+            border-bottom: 1px solid #e5e7eb;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background-color: #fff;
+        }
+        #dinoco-modal-overlay .modal-header h3 {
+            margin: 0;
+            font-size: 22px;
+            font-weight: 700;
+            color: #111827;
+        }
+        
+        #dinoco-modal-overlay .modal-body {
+            padding: 30px;
+            overflow-y: auto;
+            flex: 1;
+            background-color: #f3f4f6;
+        }
+        
+        /* Modal Grid */
+        #dinoco-modal-overlay .detail-grid {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 30px;
+            height: 100%;
+        }
+        
+        /* --- TIMELINE REDESIGN --- */
+        #dinoco-modal-overlay .timeline-wrap {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 40px;
+            position: relative;
+            padding: 0 20px;
+        }
+        #dinoco-modal-overlay .timeline-wrap::before {
+            content: '';
+            position: absolute;
+            top: 12px;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background-color: #e5e7eb;
+            z-index: 0;
+        }
+        #dinoco-modal-overlay .t-step {
+            position: relative;
+            z-index: 1;
+            text-align: center;
+            width: 100px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        #dinoco-modal-overlay .t-dot {
+            width: 24px;
+            height: 24px;
+            background-color: #fff;
+            border: 3px solid #e5e7eb;
+            border-radius: 50%;
+            margin-bottom: 8px;
+            transition: 0.3s;
+        }
+        #dinoco-modal-overlay .t-label {
+            font-size: 11px;
+            color: #9ca3af;
+            font-weight: 600;
+        }
+        
+        /* Active/Done States */
+        #dinoco-modal-overlay .t-step.active .t-dot {
+            border-color: #2563eb;
+            background-color: #eff6ff;
+            transform: scale(1.2);
+        }
+        #dinoco-modal-overlay .t-step.active .t-label {
+            color: #2563eb;
+            font-weight: 700;
+        }
+        
+        #dinoco-modal-overlay .t-step.done .t-dot {
+            border-color: #10b981;
+            background-color: #10b981;
+        }
+        #dinoco-modal-overlay .t-step.done .t-label {
+            color: #10b981;
+        }
+
+        /* --- CARD & ITEM DESIGN (STRICT GRID) --- */
+        #dinoco-modal-overlay .section-box {
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid #e5e7eb;
+            margin-bottom: 20px;
+        }
+        #dinoco-modal-overlay .section-head {
+            font-size: 16px;
+            font-weight: 700;
+            color: #1f2937;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #f3f4f6;
+            padding-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        /* Old Card */
+        #dinoco-modal-overlay .old-card-wrapper {
+            background-color: #f9fafb;
+            border: 1px dashed #d1d5db;
+            border-radius: 8px;
+            padding: 10px;
+            text-align: center;
+            height: 300px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: visible;
+            position: relative;
+            z-index: 1;
+        }
+        #dinoco-modal-overlay .old-card-wrapper img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: 6px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            width: auto;
+            height: auto;
+            transition: transform 0.2s ease;
+            cursor: zoom-in;
+            position: relative;
+        }
+        #dinoco-modal-overlay .old-card-wrapper img:hover {
+            transform: scale(1.05);
+        }
+
+        /* Items Grid */
+        #dinoco-modal-overlay .items-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+        }
+        #dinoco-modal-overlay .item-card {
+            background-color: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            overflow: visible;
+            transition: 0.2s;
+            position: relative;
+            z-index: 1;
+        }
+        #dinoco-modal-overlay .item-card:hover {
+            border-color: #2563eb;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            z-index: 10;
+        }
+        
+        #dinoco-modal-overlay .item-info {
+            padding: 12px;
+            background: #f9fafb;
+            border-bottom: 1px solid #eee;
+            border-radius: 8px 8px 0 0;
+        }
+        #dinoco-modal-overlay .item-model {
+            font-weight: 700;
+            color: #111;
+            font-size: 14px;
+        }
+        #dinoco-modal-overlay .item-date {
+            font-size: 12px;
+            color: #666;
+            margin-top: 2px;
+        }
+        
+        /* --- STRICT GRID FOR ITEM IMAGES --- */
+        #dinoco-modal-overlay .item-imgs {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+            padding: 10px;
+            position: relative;
+        }
+        
+        #dinoco-modal-overlay .item-img-col {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        #dinoco-modal-overlay .item-img-box {
+            width: 100%;
+            height: 120px;
+            background: #000;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid #ddd;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        #dinoco-modal-overlay .item-img-box img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            cursor: zoom-in;
+            transition: transform 0.3s ease;
+        }
+        #dinoco-modal-overlay .item-img-box:hover img {
+            transform: scale(1.1);
+            opacity: 0.9;
+        }
+
+        #dinoco-modal-overlay .img-label {
+            font-size: 9px;
+            text-align: center;
+            color: #888;
+            margin-top: 3px;
+        }
+
+        /* Right Sidebar Tools */
+        #dinoco-modal-overlay .tool-card {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        #dinoco-modal-overlay .tool-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: #111827;
+            text-transform: uppercase;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #f3f4f6;
+            padding-bottom: 10px;
+        }
+
+        /* Duplicate Warning Alert */
+        #dinoco-modal-overlay .alert-duplicate {
+            background-color: #fee2e2;
+            border: 1px solid #ef4444;
+            color: #991b1b;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        #dinoco-modal-overlay .alert-duplicate h4 {
+            margin: 0 0 5px 0;
+            font-size: 16px;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        #dinoco-modal-overlay .status-display {
+            background-color: #f0f9ff;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #bae6fd;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+        #dinoco-modal-overlay .status-display h4 {
+            margin: 0;
+            color: #0369a1;
+            font-size: 16px;
+        }
+
+        /* Inputs & Buttons */
+        #dinoco-modal-overlay .lg-input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            margin-top: 5px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        #dinoco-modal-overlay .btn-close {
+            background: none;
+            border: none;
+            font-size: 32px;
+            color: #9ca3af;
+            cursor: pointer;
+            padding: 0;
+            line-height: 1;
+        }
+        #dinoco-modal-overlay .btn-close:hover {
+            color: #1f2937;
+        }
+        
+        #dinoco-modal-overlay .btn-modern {
+            background-color: #2563eb;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: 14px;
+            width: 100%;
+            margin-top: 10px;
+            transition: 0.2s;
+        }
+        #dinoco-modal-overlay .btn-modern:hover {
+            background-color: #1d4ed8;
+        }
+        
+        #dinoco-modal-overlay .btn-danger {
+            background-color: #ef4444;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            width: 100%;
+            cursor: pointer;
+            margin-top: 8px;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        #dinoco-modal-overlay .btn-danger:hover {
+            background-color: #dc2626;
+        }
+        
+        #dinoco-modal-overlay .btn-warning {
+            background-color: #f59e0b;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            width: 100%;
+            cursor: pointer;
+            margin-top: 8px;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        #dinoco-modal-overlay .btn-warning:hover {
+            background-color: #d97706;
+        }
+        
+        #dinoco-modal-overlay .btn-success {
+            background-color: #10b981;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            width: 100%;
+            cursor: pointer;
+        }
+        #dinoco-modal-overlay .btn-outline {
+            background-color: #fff;
+            border: 1px solid #d1d5db;
+            color: #374151;
+            padding: 10px 20px;
+            border-radius: 6px;
+            width: 100%;
+            cursor: pointer;
+        }
+        #dinoco-modal-overlay .btn-delete {
+            background-color: #991b1b;
+            color: #fff;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            width: 100%;
+            cursor: pointer;
+            margin-top: 20px;
+            font-weight: 700;
+            font-size: 14px;
+            text-transform: uppercase;
+        }
+        #dinoco-modal-overlay .btn-delete:hover {
+            background-color: #7f1d1d;
+        }
+
+        /* Status Radio */
+        #dinoco-modal-overlay .status-radio-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        #dinoco-modal-overlay .status-radio-item {
+            display: flex;
+            align-items: center;
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid #f3f4f6;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        #dinoco-modal-overlay .status-radio-item:hover {
+            background-color: #f9fafb;
+            border-color: #d1d5db;
+        }
+        #dinoco-modal-overlay .status-radio-item input {
+            margin-right: 10px;
+        }
+        #dinoco-modal-overlay .status-radio-item.active {
+            border-color: #2563eb;
+            background-color: #eff6ff;
+            color: #2563eb;
+            font-weight: 600;
+        }
+
+        /* --- LIGHTBOX STYLES --- */
+        #lg-lightbox {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.9);
+            z-index: 2147483648 !important; /* Higher than modal */
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+        }
+        #lg-lightbox img {
+            max-width: 90vw;
+            max-height: 90vh;
+            border-radius: 4px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            animation: zoomIn 0.2s ease;
+        }
+        #lg-lightbox .close-lb {
+            position: absolute;
+            top: 20px;
+            right: 30px;
+            color: #fff;
+            font-size: 40px;
+            cursor: pointer;
+            z-index: 2147483649;
+        }
+        @keyframes zoomIn {
+            from { transform: scale(0.9); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
+    </style>
+
+    <!-- WRAPPER START -->
+    <div id="tab-legacy">
+        
+        <!-- HEADER -->
+        <div class="lg-header">
+            <div class="lg-header-title">
+                <h2>Legacy Requests <span class="version-tag" style="background:#e0e7ff; color:#3730a3; padding:2px 8px; border-radius:4px; font-size:12px;">v3.34.0 (Dup-Check Intelligence)</span></h2>
+                <p style="margin: 5px 0 0 0; color: #6b7280; font-size: 14px;">Manage system migration requests (Admin View).</p>
+            </div>
+            
+            <!-- SEARCH BOX & REFRESH -->
+            <div class="lg-search-box">
+                <input type="text" id="lg-search" class="search-input" placeholder="ค้นหา Ticket / เบอร์โทร / ชื่อลูกค้า...">
+                <button class="btn-reload" onclick="loadAllData()">
+                    <span class="dashicons dashicons-update"></span> Refresh Data
+                </button>
+            </div>
+        </div>
+
+        <!-- DASHBOARD COUNTERS -->
+        <div class="dash-grid">
+            <div class="dash-card card-1 active" onclick="applyFilter('Submission Received', this)">
+                <span class="dash-label">1. ส่งเรื่องเข้าระบบ</span>
+                <span class="dash-count" id="c-1">-</span>
+                <div class="dash-bar"></div>
+            </div>
+            <div class="dash-card card-2" onclick="applyFilter('Verification Passed', this)">
+                <span class="dash-label">2. ตรวจผ่าน/รอใบงาน</span>
+                <span class="dash-count" id="c-2">-</span>
+                <div class="dash-bar"></div>
+            </div>
+            <div class="dash-card card-3" onclick="applyFilter('Work Order Created', this)">
+                <span class="dash-label">3. รอจัดส่งสินค้า</span>
+                <span class="dash-count" id="c-3">-</span>
+                <div class="dash-bar"></div>
+            </div>
+            <div class="dash-card card-4" onclick="applyFilter('Shipped', this)">
+                <span class="dash-label">4. ส่งแล้ว (รอ SN)</span>
+                <span class="dash-count" id="c-4">-</span>
+                <div class="dash-bar"></div>
+            </div>
+            <div class="dash-card card-5" onclick="applyFilter('Pending Serial Number', this)">
+                <span class="dash-label">5. คีย์ SN ย้อนหลัง</span>
+                <span class="dash-count" id="c-5">-</span>
+                <div class="dash-bar"></div>
+            </div>
+            <div class="dash-card card-6" onclick="applyFilter('Completed', this)">
+                <span class="dash-label">6. สำเร็จ</span>
+                <span class="dash-count" id="c-6">-</span>
+                <div class="dash-bar"></div>
+            </div>
+        </div>
+
+        <!-- MAIN TABLE -->
+        <div class="table-wrap">
+            <table class="lg-tbl">
+                <thead>
+                    <tr>
+                        <th width="80">ID</th>
+                        <th width="120">วันที่</th>
+                        <th>ลูกค้า / เบอร์โทร</th>
+                        <th>รหัสบัตรเดิม</th>
+                        <th>สถานะ</th>
+                        <th style="text-align:center; width: 120px;">จัดการ</th>
+                    </tr>
+                </thead>
+                <tbody id="legacy-body">
+                    <tr>
+                        <td colspan="6" style="text-align:center; padding:40px; color:#9ca3af;">
+                            Loading System Data...
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- MODAL DETAIL -->
+        <div id="dinoco-modal-overlay" class="modal-overlay">
+            <div class="modal-box">
+                <div class="modal-header">
+                    <h3><span id="modal-title-id">#ID</span> : รายละเอียดคำขอ</h3>
+                    <button onclick="closeModal()" class="btn-close">&times;</button>
+                </div>
+                
+                <div id="legacy-modal-content" class="modal-body">
+                    <!-- Dynamic Content -->
+                </div>
+            </div>
+        </div>
+
+        <!-- LIGHTBOX ELEMENT -->
+        <div id="lg-lightbox" onclick="closeLightbox()">
+            <span class="close-lb">&times;</span>
+            <img id="lg-lightbox-img" src="">
+        </div>
+
+    </div>
+    <!-- WRAPPER END -->
+
+    <script>
+    jQuery(document).ready(function($) {
+        
+        /* Safety Check */
+        if ( $('#tab-legacy').length === 0 ) {
+            return;
+        }
+
+        window.legacyData = [];
+        window.currentTab = 'Submission Received';
+
+        /* Thai Status Mapping */
+        const statusMap = {
+            'Submission Received': 'ส่งเรื่องเข้าระบบ',
+            'Verification Passed': 'ตรวจสอบแล้วผ่าน',
+            'Verification Failed': 'ตรวจสอบแล้วไม่ผ่าน',
+            'Additional Documents Required': 'ขอเอกสารเพิ่ม',
+            'Work Order Created': 'ออกใบงานแล้ว',
+            'Pending Serial Number': 'รอคีย์ SN',
+            'Shipped': 'จัดส่งแล้ว',
+            'Completed': 'สำเร็จ'
+        };
+
+        /* [DATABASE INJECTION] Initialize Dynamic Catalog & Relations from PHP */
+        let productDB = <?php echo !empty($product_catalog) ? json_encode($product_catalog) : '{}'; ?>;
+        let skuRelations = <?php echo !empty($sku_relations) ? json_encode($sku_relations) : '{}'; ?>;
+
+        /* Helper to get Full Name */
+        function getProductInfo(sku) {
+            sku = sku ? sku.trim() : '';
+            if (productDB[sku]) {
+                return productDB[sku];
+            }
+            return { name: sku, sub_skus: [] };
+        }
+
+        /* [CRITICAL LOGIC FIX] Expand SKU using 'dinoco_sku_relations' from wp_options */
+        function expandSKUWithParent(sku) {
+            sku = sku ? sku.trim() : '';
+            
+            // Check Database Relations first (Source of Truth)
+            if (skuRelations[sku] && Array.isArray(skuRelations[sku]) && skuRelations[sku].length > 0) {
+                // It's a set! Map children
+                let parentInfo = getProductInfo(sku);
+                let children = skuRelations[sku].map(subSku => {
+                    let subInfo = getProductInfo(subSku);
+                    return { sku: subSku, name: subInfo.name || subSku };
+                });
+                return { is_set: true, parent_sku: sku, parent_name: parentInfo.name || sku, children: children };
+            } 
+            else {
+                // Single Item
+                let info = getProductInfo(sku);
+                return { is_set: false, sku: sku, name: info.name };
+            }
+        }
+
+        /* --------------------------------------------------------------------- */
+        /* 2. LOAD DATA FUNCTION */
+        /* --------------------------------------------------------------------- */
+        window.loadAllData = function() {
+            /* Loading State */
+            $('#legacy-body').html('<tr><td colspan="6" style="text-align:center; padding:40px; color:#9ca3af;">Fetching Data...</td></tr>');
+            
+            /* Reset Counts */
+            for ( let i = 1; i <= 6; i++ ) { 
+                $( `#c-${i}` ).text( '-' ); 
+            }
+
+            /* Cache Busting & AJAX Call */
+            let ajaxUrl = window.location.href.split('#')[0];
+            ajaxUrl += (ajaxUrl.indexOf('?') !== -1 ? '&' : '?') + 'no_cache=' + new Date().getTime();
+
+            /* [FIX] Use unique action key 'dinoco_legacy_action' */
+            $.post(ajaxUrl, { dinoco_legacy_action: 'get_legacy_list' }, function(res) {
+                
+                /* Debug Log */
+                if(res.debug) console.log('DEBUG:', res.debug);
+
+                if ( res.success ) {
+                    window.legacyData = res.data || [];
+                    
+                    /* Count Logic */
+                    let counts = { 
+                        'Submission Received': 0, 
+                        'Verification Passed': 0, 
+                        'Work Order Created': 0, 
+                        'Shipped': 0, 
+                        'Pending Serial Number': 0, 
+                        'Completed': 0 
+                    };
+                    
+                    window.legacyData.forEach( function( item ) {
+                        if ( counts[item.status] !== undefined ) {
+                            counts[item.status]++;
+                        }
+                    });
+
+                    /* Update UI Counts */
+                    $('#c-1').text( counts['Submission Received'] );
+                    $('#c-2').text( counts['Verification Passed'] );
+                    $('#c-3').text( counts['Work Order Created'] );
+                    $('#c-4').text( counts['Shipped'] );
+                    $('#c-5').text( counts['Pending Serial Number'] );
+                    $('#c-6').text( counts['Completed'] );
+
+                    renderTable();
+                } else {
+                    $('#legacy-body').html('<tr><td colspan="6" style="text-align:center; color:red;">Connection Error / Empty Data</td></tr>');
+                    console.error('AJAX Error:', res);
+                }
+            }).fail(function(xhr, status, error) {
+                console.error("AJAX Fail:", xhr.responseText);
+                $('#legacy-body').html('<tr><td colspan="6" style="text-align:center; color:red;">AJAX Failed (Check Console)</td></tr>');
+            });
+        };
+
+        /* --------------------------------------------------------------------- */
+        /* 3. RENDER TABLE FUNCTION */
+        /* --------------------------------------------------------------------- */
+        window.applyFilter = function( filterName, cardElem ) {
+            window.currentTab = filterName;
+            if ( cardElem ) {
+                $('.dash-card').removeClass( 'active' );
+                $( cardElem ).addClass( 'active' );
+            }
+            renderTable();
+        };
+        
+        /* --- SEARCH INPUT EVENT LISTENER --- */
+        $('#lg-search').on('keyup', function() {
+            renderTable();
+        });
+
+        function renderTable() {
+            let html = '';
+            let count = 0;
+            let searchText = $('#lg-search').val().toLowerCase().trim();
+            
+            window.legacyData.forEach( function( item ) {
+                
+                /* 1. Check Search Match FIRST (Global Search) */
+                let isSearchActive = (searchText !== '');
+                let matchSearch = true;
+                
+                if (isSearchActive) {
+                    matchSearch = (
+                        item.ticket_no.toLowerCase().includes(searchText) || 
+                        item.phone.includes(searchText) || 
+                        item.user.toLowerCase().includes(searchText) ||
+                        item.id.toString().includes(searchText)
+                    );
+                }
+
+                /* 2. Check Tab Filter (Only if NOT searching) */
+                let matchTab = ( window.currentTab === 'ALL' ) ? true : ( item.status === window.currentTab );
+                
+                /* Final Show Condition */
+                let show = isSearchActive ? matchSearch : matchTab;
+
+                if ( show ) {
+                    count++;
+                    
+                    /* Warning Logic */
+                    let warn = item.warnings.length > 0 ? `<span class="lg-badge Risk" style="background:#fee2e2; color:#991b1b; margin-left:5px; font-size:10px;" title="Duplicate">!</span>` : '';
+                    
+                    /* Badge Color Logic */
+                    let badgeColor = 'blue';
+                    if ( item.status === 'Verification Passed' ) badgeColor = 'yellow';
+                    if ( item.status === 'Completed' ) badgeColor = 'green';
+                    
+                    let statusThai = statusMap[item.status] || item.status;
+
+                    /* --- SMART ACTION BUTTONS LOGIC --- */
+                    let actionHtml = '';
+                    
+                    if (item.status === 'Submission Received') {
+                        actionHtml = `<button class="btn-edit" style="background:#dbeafe; color:#1e40af; border-color:#93c5fd;" onclick="openDetail(${item.id})">🔍 ตรวจสอบ</button>`;
+                    } else if (item.status === 'Verification Passed') {
+                        actionHtml = `
+                            <button class="btn-edit" style="background:#dcfce7; color:#166534; border-color:#86efac; margin-bottom:5px;" onclick="printJob(${item.id})">🖨️ พิมพ์ใบงาน</button>
+                            <button class="btn-edit" onclick="openDetail(${item.id})">แก้ไข</button>
+                        `;
+                    } else if (item.status === 'Work Order Created') {
+                        actionHtml = `<button class="btn-edit" style="background:#fef3c7; color:#92400e; border-color:#fcd34d;" onclick="openDetail(${item.id})">📦 กรอกเลขพัสดุ</button>`;
+                    } else if (item.status === 'Shipped' || item.status === 'Pending Serial Number') {
+                        actionHtml = `<button class="btn-edit" style="background:#f3e8ff; color:#6b21a8; border-color:#d8b4fe;" onclick="openDetail(${item.id})">🔢 กรอก SN</button>`;
+                    } else {
+                        actionHtml = `<button class="btn-edit" onclick="openDetail(${item.id})">ดูรายละเอียด</button>`;
+                    }
+
+                    /* Delete Button */
+                    let deleteBtn = `<button class="btn-delete-row" onclick="deleteCase(${item.id})"><span class="dashicons dashicons-trash"></span> ลบ</button>`;
+
+                    html += `
+                        <tr>
+                            <td style="font-family:monospace; color:#6b7280; font-size:11px;">${item.ticket_no}</td>
+                            <td>${item.date}</td>
+                            <td>
+                                <div style="font-weight:600; color:#111827;">${item.user}</div>
+                                <div style="font-size:12px; color:#6b7280;">${item.phone}</div>
+                            </td>
+                            <td>
+                                <code style="background:#f3f4f6; padding:2px 5px; border-radius:4px;">${item.old}</code>
+                            </td>
+                            <td>
+                                <span class="lg-badge ${badgeColor}">${statusThai}</span>${warn}
+                            </td>
+                            <td style="text-align:center;">
+                                <div style="display:flex; flex-direction:column; gap:5px;">
+                                    ${actionHtml}
+                                    ${deleteBtn}
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                }
+            });
+
+            if ( count === 0 ) {
+                html = '<tr><td colspan="6" style="text-align:center; padding:40px; color:#9ca3af;">ไม่พบข้อมูล</td></tr>';
+            }
+            $('#legacy-body').html( html );
+        }
+
+        /* --------------------------------------------------------------------- */
+        /* 4. OPEN DETAIL MODAL */
+        /* --------------------------------------------------------------------- */
+        window.openDetail = function( id ) {
+            let item = window.legacyData.find( i => i.id == id );
+            if ( ! item ) return;
+
+            $('#modal-title-id').text(item.ticket_no);
+
+            /* --- 4.1 TIMELINE --- */
+            let steps = [
+                {id: 'Submission Received', label: 'ส่งเรื่อง'}, 
+                {id: 'Verification Passed', label: 'ตรวจผ่าน'}, 
+                {id: 'Work Order Created', label: 'ออกใบงาน'}, 
+                {id: 'Shipped', label: 'ส่งของแล้ว'}, 
+                {id: 'Pending Serial Number', label: 'คีย์ SN'}, 
+                {id: 'Completed', label: 'สำเร็จ'}
+            ];
+            
+            let currentStepIdx = steps.findIndex(s => s.id === item.status);
+            if ( currentStepIdx === -1 ) currentStepIdx = 0; 
+
+            let timelineHtml = `<div class="timeline-wrap">`;
+            steps.forEach( function( step, idx ) {
+                let statusClass = '';
+                if ( idx < currentStepIdx ) statusClass = 'done';
+                if ( idx === currentStepIdx ) statusClass = 'active';
+                
+                timelineHtml += `
+                    <div class="t-step ${statusClass}">
+                        <div class="t-dot"></div>
+                        <div class="t-label">${step.label}</div>
+                    </div>
+                `;
+            });
+            timelineHtml += `</div>`;
+
+            /* --- 4.2 IMAGES --- */
+            let itemsHtml = '';
+            if ( item.items && item.items.length > 0 ) {
+                item.items.forEach( (sub, idx) => {
+                    /* Safe Image URL & Error Handler */
+                    let onErrorStr = `onerror="this.src='https://placehold.co/100x100?text=No+Image'; this.onclick=null; this.style.cursor='default';"`;
+                    
+                    let img1 = sub.imgs[0] ? `<img src="${sub.imgs[0]}" onclick="openLightbox('${sub.imgs[0]}')" ${onErrorStr}>` : '<div style="background:#eee; height:100%; display:flex; align-items:center; justify-content:center; color:#ccc;">No Image</div>';
+                    let img2 = sub.imgs[1] ? `<img src="${sub.imgs[1]}" onclick="openLightbox('${sub.imgs[1]}')" ${onErrorStr}>` : '<div style="background:#eee; height:100%; display:flex; align-items:center; justify-content:center; color:#ccc;">No Image</div>';
+                    let proof = sub.imgs[2] ? `<img src="${sub.imgs[2]}" onclick="openLightbox('${sub.imgs[2]}')" ${onErrorStr}>` : '<div style="background:#eee; height:100%; display:flex; align-items:center; justify-content:center; color:#ccc;">No Image</div>';
+                    
+                    let prodInfo = getProductInfo(sub.item_model);
+
+                    itemsHtml += `
+                        <div class="item-card">
+                            <div class="item-info">
+                                <div class="item-model">${prodInfo.name}</div>
+                                <div style="font-size:12px; color:#999;">SKU: ${sub.item_model}</div>
+                                <div class="item-date">ติดตั้ง: ${sub.install_date}</div>
+                            </div>
+                            <div class="item-imgs">
+                                <div class="item-img-col">
+                                    <div class="item-img-box">${img1}</div>
+                                    <div class="img-label">สินค้า 1</div>
+                                </div>
+                                <div class="item-img-col">
+                                    <div class="item-img-box">${img2}</div>
+                                    <div class="img-label">สินค้า 2</div>
+                                </div>
+                                <div class="item-img-col">
+                                    <div class="item-img-box">${proof}</div>
+                                    <div class="img-label">ใบเสร็จ</div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+            } else {
+                itemsHtml = '<div style="padding:20px; color:#999; text-align:center;">No Items Data</div>';
+            }
+
+            /* Radio Status List */
+            let statusRadio = '';
+            for (const [key, val] of Object.entries(statusMap)) {
+                let checked = (key === item.status) ? 'checked' : '';
+                let activeClass = (key === item.status) ? 'active' : '';
+                statusRadio += `<label class="status-radio-item ${activeClass}"><input type="radio" name="new_status_select" value="${key}" ${checked}> ${val}</label>`;
+            }
+
+            /* --- 4.3 ACTION BUTTONS --- */
+            let actionButtons = '';
+            if(item.status === 'Submission Received') {
+                actionButtons = `
+                    <div style="font-weight:600; color:#1f2937; margin-bottom:10px;">ดำเนินการ:</div>
+                    <button class="btn-modern" style="background:#10b981; margin-bottom:8px;" onclick="upd(${item.id},'Verification Passed')">✅ อนุมัติ (ผ่านเกณฑ์)</button>
+                    <!-- Stacked Buttons -->
+                    <button class="btn-warning" onclick="upd(${item.id},'Additional Documents Required')">ขอเอกสารเพิ่ม</button>
+                    <button class="btn-danger" onclick="upd(${item.id},'Verification Failed')">ไม่อนุมัติ</button>
+                `;
+            } else if (item.status === 'Verification Passed') {
+                actionButtons = `
+                    <div style="font-weight:600; color:#1f2937; margin-bottom:10px;">ขั้นตอนต่อไป: ออกใบงาน</div>
+                    <button class="btn-outline" onclick="printJob(${item.id})">🖨️ พิมพ์ใบงาน (Print)</button>
+                    <button class="btn-modern" onclick="upd(${item.id},'Work Order Created')">ยืนยันออกใบงานแล้ว &rarr;</button>
+                `;
+            } else if (item.status === 'Work Order Created') {
+                actionButtons = `
+                    <div style="font-weight:600; color:#1f2937; margin-bottom:10px;">ขั้นตอนต่อไป: จัดส่งสินค้า</div>
+                    <input type="text" id="qt_tracking" class="lg-input" placeholder="Tracking No." value="${item.tracking||''}">
+                    <button class="btn-modern" onclick="quickShip(${item.id})">💾 บันทึกการส่งของ (Shipped)</button>
+                `;
+            } else if (item.status === 'Shipped') {
+                actionButtons = `
+                    <div style="font-weight:600; color:#1f2937; margin-bottom:10px;">สถานะ: ส่งของแล้ว</div>
+                    <button class="btn-modern" style="background:#8b5cf6;" onclick="upd(${item.id},'Pending Serial Number')">📝 กรอก SN ย้อนหลัง &rarr;</button>
+                `;
+            } else if (item.status === 'Pending Serial Number') {
+                 actionButtons = `
+                    <div style="font-weight:600; color:#1f2937; margin-bottom:10px;">ขั้นตอนสุดท้าย: บันทึก SN</div>
+                    <p style="font-size:12px; color:#666;">กรุณากรอก SN ในช่องด้านซ้ายให้ครบถ้วน</p>
+                    <button class="btn-success" onclick="saveComplete(${item.id})">✅ บันทึก SN & จบงาน</button>
+                 `;
+            } else if (item.status === 'Completed') {
+                actionButtons = `<div style="text-align:center; padding:15px; background:#dcfce7; color:#166534; border-radius:6px; font-weight:bold; font-size:16px;">✓ งานเสร็จสมบูรณ์</div>`;
+            }
+
+            /* SN Input Generation (Using new Relation Logic) */
+            let snInputSection = '';
+            if ( item.status === 'Pending Serial Number' || item.status === 'Completed' ) {
+                 let snInputs = '';
+                 let flattenedItems = [];
+                 
+                 item.items.forEach(sub => {
+                     let expanded = expandSKUWithParent(sub.item_model);
+                     if (expanded.is_set) {
+                         // [FIX] Iterate children for SN entry
+                         expanded.children.forEach(child => {
+                             flattenedItems.push({
+                                 sku: child.sku,
+                                 name: child.name,
+                                 from_set: expanded.parent_sku + ' (' + expanded.parent_name + ')'
+                             });
+                         });
+                     } else {
+                         // Single item
+                         flattenedItems.push({
+                             sku: expanded.sku,
+                             name: expanded.name,
+                             from_set: null
+                         });
+                     }
+                 });
+
+                 flattenedItems.forEach((flatItem, idx) => {
+                     let rawVal = (item.log_sns && item.log_sns[idx]) ? item.log_sns[idx] : '';
+                     let val = rawVal;
+                     if(rawVal.includes(' : ')) {
+                         let parts = rawVal.split(' : ');
+                         if(parts.length > 1) val = parts[1];
+                     }
+                     
+                     let readonly = (item.status === 'Completed') ? 'readonly' : '';
+                     let label = flatItem.name;
+                     let helperText = '';
+
+                     if(flatItem.from_set) {
+                        // [FIX] Show parent context clearer
+                        helperText = `<div style="font-size:10px; color:#666; margin-bottom:2px;">↳ ในชุด: ${flatItem.from_set}</div>`;
+                     }
+                     
+                     snInputs += `
+                        <div style="margin-bottom:12px; padding-bottom:8px; border-bottom:1px dashed #eee;">
+                            <label style="font-size:12px; font-weight:700; display:block;">${label}</label>
+                            ${helperText}
+                            <input type="text" class="lg-input lg-sn-input" data-sku="${flatItem.sku}" value="${val}" ${readonly} placeholder="Serial Number ของลูก (${flatItem.sku})...">
+                        </div>
+                     `;
+                 });
+                 snInputSection = `<div class="section-box" style="border-left:4px solid #8b5cf6;"><div class="section-head">บันทึก Serial Number (แยกตามชิ้นส่วน)</div>${snInputs}</div>`;
+            }
+            
+            /* Old Card Fallback */
+            let onErrorCard = `onerror="this.src='https://placehold.co/300x200?text=No+Card'; this.onclick=null; this.style.cursor='default';"`;
+            /* Check if card url is valid */
+            let cardImgTag = (item.card && item.card.indexOf('http') !== -1) 
+                ? `<img src="${item.card}" onclick="openLightbox('${item.card}')" ${onErrorCard}>` 
+                : '<span style="color:#999;">No Card Image</span>';
+
+            /* --- CONSTRUCT MODAL BODY --- */
+            let body = `
+                <div class="detail-grid">
+                    <!-- LEFT COLUMN: CONTENT -->
+                    <div class="modal-left">
+                        
+                         <!-- DUPLICATE WARNING ALERT -->
+                        ${ item.warnings && item.warnings.length > 0 ? 
+                            `<div class="alert-duplicate">
+                                <h4>⚠️ คำเตือน: พบประวัติการเบิกซ้ำ!</h4>
+                                <ul>${item.warnings.map(w => `<li>${w}</li>`).join('')}</ul>
+                            </div>` 
+                        : '' }
+
+                        <!-- 1. Timeline -->
+                        ${timelineHtml}
+
+                        <!-- 2. Old Card (Big Display) -->
+                        <div class="section-box">
+                            <div class="section-head">
+                                <span>ภาพบัตรเดิม (Old Card)</span>
+                                <span style="font-size:12px; font-weight:400; color:#666;">รหัส: ${item.old}</span>
+                            </div>
+                            <div class="old-card-wrapper">
+                                ${ cardImgTag }
+                            </div>
+                        </div>
+
+                        <!-- 3. Items List (Grid) -->
+                        <div class="section-box">
+                             <div class="section-head">รายการสินค้าที่ลงทะเบียน (${item.items.length})</div>
+                             <div class="items-container">
+                                ${itemsHtml}
+                             </div>
+                        </div>
+
+                        <!-- 4. SN Inputs (Conditional) -->
+                        ${snInputSection}
+
+                    </div>
+
+                    <!-- RIGHT COLUMN: TOOLS & ACTIONS -->
+                    <div class="modal-right">
+                        
+                        <!-- ACTION CARD (PRIORITY) -->
+                        <div class="tool-card" style="border-left:4px solid #2563eb;">
+                            <div class="tool-title">การจัดการ (Actions)</div>
+                            ${actionButtons}
+                        </div>
+
+                        <div class="tool-card">
+                            <div class="tool-title">ข้อมูลลูกค้า</div>
+                            <p style="margin:5px 0;"><strong>ชื่อ:</strong> ${item.user}</p>
+                            <p style="margin:5px 0;"><strong>เบอร์:</strong> ${item.phone}</p>
+                            <hr style="border:0; border-top:1px solid #eee; margin:10px 0;">
+                            <p style="margin:5px 0; font-size:13px;"><strong>ที่อยู่:</strong><br>${item.address||'-'}</p>
+                        </div>
+
+                        <!-- MANUAL OVERRIDE -->
+                        <div class="tool-card" style="opacity:0.9;">
+                            <div class="tool-title" style="color:#666;">เปลี่ยนสถานะ (Manual)</div>
+                            <div class="status-display">
+                                <h4>${statusMap[item.status]}</h4>
+                            </div>
+                            <div class="status-radio-group">${statusRadio}</div>
+                            <button class="btn-outline" style="margin-top:10px; font-size:12px;" onclick="manualUpdate(${item.id})">บันทึกการแก้ไข</button>
+                        </div>
+
+                    </div>
+                </div>
+            `;
+            
+            $('#legacy-modal-content').html( body );
+
+            /* MOVE TO BODY + SHOW */
+            $('#dinoco-modal-overlay').appendTo('body').fadeIn(100).css( 'display', 'flex' );
+
+            /* Radio Click Event */
+            $('input[name="new_status_select"]').on('change', function() {
+                $('.status-radio-item').removeClass('active');
+                $(this).closest('.status-radio-item').addClass('active');
+            });
+        };
+
+        /* --------------------------------------------------------------------- */
+        /* 5. ACTIONS */
+        /* --------------------------------------------------------------------- */
+        window.closeModal = function() {
+            $('#dinoco-modal-overlay').fadeOut(100, function() {
+                $(this).appendTo('#tab-legacy');
+            });
+        };
+
+        window.manualUpdate = function(id) {
+            let st = $('input[name="new_status_select"]:checked').val();
+            if(confirm('ยืนยันเปลี่ยนสถานะ?')) {
+                /* [FIX] Update action name here too */
+                $.post('',{dinoco_legacy_action:'update_legacy_status', req_id:id, new_status:st}, ()=>{ closeModal(); loadAllData(); });
+            }
+        };
+        
+        window.upd = function( id, st ) {
+            if ( confirm( 'ยืนยันดำเนินการ?' ) ) {
+                /* [FIX] Update action name here too */
+                $.post( '', { dinoco_legacy_action: 'update_legacy_status', req_id: id, new_status: st }, function( res ) {
+                    if ( res.success ) { closeModal(); loadAllData(); }
+                });
+            }
+        };
+
+        window.quickShip = function(id) {
+            let trk = $('#qt_tracking').val();
+            if(confirm('บันทึกการส่ง?')) {
+                /* [FIX] Update action name here too */
+                $.post('',{dinoco_legacy_action:'save_shipping_only', req_id:id, tracking:trk}, ()=>{ closeModal(); loadAllData(); });
+            }
+        };
+        
+        /* Updated saveComplete: Formats as "SKU : SN" */
+        window.saveComplete = function( id ) { 
+            let sns = []; 
+            $('.lg-sn-input').each( function() { 
+                let sn = $(this).val().trim();
+                let sku = $(this).data('sku'); /* Get SKU from data attribute */
+                if(sn) {
+                    /* Save in format: "SKU : SN" */
+                    sns.push( sku + ' : ' + sn ); 
+                } else {
+                    sns.push(''); /* Keep empty index if skipped */
+                }
+            }); 
+            
+            if ( confirm( 'บันทึกและจบงาน?' ) ) { 
+                /* [FIX] Update action name here too */
+                $.post( '', { dinoco_legacy_action: 'save_sn_complete', req_id: id, sent_sns: sns }, function( res ) { 
+                    if ( res.success ) { closeModal(); loadAllData(); } 
+                }); 
+            } 
+        };
+        
+        window.deleteCase = function( id ) {
+            if ( confirm( '⚠️ คำเตือน: คุณต้องการลบเคสนี้อย่างถาวรใช่หรือไม่?\n\n- ข้อมูลทั้งหมดจะหายไป\n- รูปภาพที่ลูกค้าอัปโหลดจะถูกลบออกจาก Server\n\nยืนยันการลบ?' ) ) {
+                /* [FIX] Update action name here too */
+                $.post( '', { 
+                    dinoco_legacy_action: 'delete_legacy_case', 
+                    req_id: id 
+                }, function( res ) {
+                    if ( res.success ) {
+                        alert('ลบข้อมูลเรียบร้อยแล้ว');
+                        /* Close modal if open */
+                        $('#dinoco-modal-overlay').fadeOut(100, function() {
+                            $(this).appendTo('#tab-legacy');
+                        });
+                        loadAllData();
+                    } else {
+                        alert('เกิดข้อผิดพลาด: ' + (res.message || 'Unknown error'));
+                    }
+                });
+            }
+        };
+
+        /* --- NEW PRINT JOB (MULTI-PAGE A4 + PARENT/CHILD LOGIC) --- */
+        window.printJob = function( id ) {
+            let item = window.legacyData.find(x => x.id == id);
+            if (!item) return;
+
+            /* Update status [FIX] Update action name here too */
+            $.post('', { dinoco_legacy_action: 'update_legacy_status', req_id: id, new_status: 'Work Order Created' }, () => { loadAllData(); });
+
+            let w = window.open('', '_blank', 'width=900,height=1000');
+            
+            /* ----------------------------------------------------------- */
+            /* 1. DATA PREPARATION (EXPAND SETS) */
+            /* ----------------------------------------------------------- */
+            /* Structure needed: List of { display_name, qty, is_child, parent_name } */
+            let printRows = [];
+            
+            /* Add Manual/QR always first */
+            printRows.push({ display_name: 'คู่มือการใช้งาน / QR Warranty Card', qty: 1, is_child: false });
+            
+            if (item.items) {
+                item.items.forEach(sub => {
+                    let expanded = expandSKUWithParent(sub.item_model);
+                    
+                    if (expanded.is_set) {
+                        /* Add Parent Header row */
+                        printRows.push({ 
+                            display_name: `<strong>[SET] ${expanded.parent_name}</strong> <br><span style="font-size:12px; color:#666;">(${expanded.parent_sku})</span>`, 
+                            qty: 1, 
+                            is_child: false,
+                            is_parent_header: true // New Flag
+                        });
+                        
+                        /* Add Children rows [FIX] Logic: Children get the SN lines */
+                        expanded.children.forEach(child => {
+                            printRows.push({ 
+                                display_name: `&nbsp;&nbsp;&nbsp;&nbsp;↳ Warranty Plate: ${child.name} <span style="font-size:10px;">(${child.sku})</span>`, 
+                                qty: 1, 
+                                is_child: true,
+                                real_sku: child.sku /* For job order matching */
+                            });
+                        });
+                    } else {
+                        /* Single Item */
+                        printRows.push({ 
+                            display_name: `Warranty Plate: ${expanded.name} <span style="font-size:12px; color:#666;">(${expanded.sku})</span>`, 
+                            qty: 1, 
+                            is_child: false,
+                            real_sku: expanded.sku
+                        });
+                    }
+                });
+            }
+
+            /* ----------------------------------------------------------- */
+            /* 2. DELIVERY NOTE PAGINATION LOGIC (PAGE 1 + EXTENSIONS) */
+            /* ----------------------------------------------------------- */
+            /* Define limits */
+            const DN_PAGE1_LIMIT = 9;  /* Max items on Page 1 Half Bottom */
+            const DN_FULL_LIMIT = 20; /* Max items on Page 2+ Full A4 */
+
+            let dnPages = [];
+            let remainingRows = [...printRows];
+
+            /* Page 1: Top Half + Bottom Half (limited) */
+            let page1Rows = remainingRows.splice(0, DN_PAGE1_LIMIT);
+            dnPages.push({ type: 'half', rows: page1Rows, hasMore: remainingRows.length > 0 });
+
+            /* Subsequent Pages: Full A4 */
+            while (remainingRows.length > 0) {
+                let pageRows = remainingRows.splice(0, DN_FULL_LIMIT);
+                dnPages.push({ type: 'full', rows: pageRows });
+            }
+
+            /* GENERATE HTML FOR PAGE 1 (Standard Layout) */
+            let p1RowsHtml = '';
+            dnPages[0].rows.forEach((row, idx) => {
+                p1RowsHtml += `
+                    <tr>
+                        <td style="text-align:center;">${idx+1}</td>
+                        <td>${row.display_name}</td>
+                        <td style="text-align:center;">${row.qty}</td>
+                    </tr>
+                `;
+            });
+            
+            let p1FooterMsg = dnPages[0].hasMore 
+                ? '<strong>... มีต่อหน้าถัดไป / Continued on next page ...</strong>' 
+                : 'หากสินค้าไม่ครบหรือเสียหาย กรุณาติดต่อกลับภายใน 7 วัน';
+
+            /* GENERATE HTML FOR EXTENSION PAGES (Delivery Note Continued) */
+            let dnExtensionPagesHtml = '';
+            for (let i = 1; i < dnPages.length; i++) {
+                let pageRowsHtml = '';
+                /* Calculate running index base: (DN_PAGE1_LIMIT) + (previous full pages * DN_FULL_LIMIT) */
+                let startIdx = DN_PAGE1_LIMIT + ((i-1) * DN_FULL_LIMIT);
+
+                dnPages[i].rows.forEach((row, idx) => {
+                    pageRowsHtml += `
+                        <tr>
+                            <td style="text-align:center;">${startIdx + idx + 1}</td>
+                            <td>${row.display_name}</td>
+                            <td style="text-align:center;">${row.qty}</td>
+                        </tr>
+                    `;
+                });
+
+                dnExtensionPagesHtml += `
+                    <div class="a4-page page-break">
+                         <div class="dn-header">
+                            <div>
+                                <div style="font-size:20px; font-weight:bold;">ใบส่งสินค้า / DELIVERY NOTE (ต่อ/Cont.)</div>
+                                <div style="font-size:14px; color:#666;">(สำหรับลูกค้า / For Customer) - Page ${i+1}/${dnPages.length}</div>
+                            </div>
+                            <div style="font-size:18px; font-weight:bold;">REF: ${item.ticket_no}</div>
+                        </div>
+                        <table class="dn-table">
+                            <thead>
+                                <tr>
+                                    <th width="50">No.</th>
+                                    <th>Description (รายการสินค้า)</th>
+                                    <th width="60">Qty</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${pageRowsHtml}
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+            }
+
+            /* ----------------------------------------------------------- */
+            /* 3. JOB ORDER PAGINATION (EXISTING LOGIC) */
+            /* ----------------------------------------------------------- */
+            /* Filter: Manual, Singles, or Children. Exclude Parent Headers for SN filing */
+            let allJobItems = printRows.filter(r => r.display_name.indexOf('คู่มือ') !== -1 || r.real_sku); 
+            
+            /* Pagination */
+            const ITEMS_PER_PAGE = 12; /* Adjust for space */
+            let jobPages = [];
+            for (let i = 0; i < allJobItems.length; i += ITEMS_PER_PAGE) {
+                jobPages.push(allJobItems.slice(i, i + ITEMS_PER_PAGE));
+            }
+
+            let jobPagesHtml = '';
+            jobPages.forEach((pageItems, pageIndex) => {
+                let rows = '';
+                pageItems.forEach(jobItem => {
+                    let nameStr = jobItem.display_name.replace(/&nbsp;/g, '').replace('↳ ', ''); /* Clean up for staff view */
+                    
+                    if(jobItem.display_name.indexOf('คู่มือ') !== -1) {
+                        /* Manual row - no SN needed usually, just check */
+                         rows += `
+                            <div class="job-row">
+                                <div class="chk-box">◻</div>
+                                <div class="job-detail">
+                                    <div class="job-name">${nameStr}</div>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        /* [FIX] Real Item row (Child or Single) - Needs SN line */
+                        rows += `
+                            <div class="job-row">
+                                <div class="chk-box">◻</div>
+                                <div class="job-detail">
+                                    <div class="job-name">${nameStr}</div>
+                                    <div class="job-fill">
+                                        <span>SN: ........................................................................</span>
+                                        <span>Note: .........................</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }
+                });
+
+                jobPagesHtml += `
+                    <div class="a4-page page-break">
+                        <div class="job-header-section">
+                            <div class="job-title-big">ใบสั่งงาน / Job Order (Page ${pageIndex + 1}/${jobPages.length})</div>
+                            <div class="job-meta">
+                                <div><strong>REF: ${item.ticket_no}</strong></div>
+                                <div><strong>Customer:</strong> ${item.user}</div>
+                                <div><strong>Tracking No:</strong> ............................................................</div>
+                            </div>
+                        </div>
+                        <div class="job-content-list">
+                            ${rows}
+                        </div>
+                        <div class="job-footer">
+                            <div>ผู้จัดเตรียม: ...........................</div>
+                            <div>ผู้ตรวจสอบ: ...........................</div>
+                            <div>วันที่: ____/____/______</div>
+                        </div>
+                    </div>
+                `;
+            });
+
+            let logoUrl = 'https://www.dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-pxou1gkonhphkw4peesozhjgbqhvyueyia1k904zxk.png';
+
+            let html = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <!-- [FIX] Set File Name to Ticket No -->
+                    <title>${item.ticket_no}</title>
+                    <style>
+                        @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap');
+                        @page { size: A4; margin: 0; }
+                        body { margin: 0; padding: 0; font-family: 'Sarabun', sans-serif; -webkit-print-color-adjust: exact; color:#000; background: #eee; }
+                        
+                        .a4-page { 
+                            width: 210mm; height: 296mm; 
+                            position: relative; background: white; margin: 0 auto; 
+                            box-sizing: border-box; padding: 10mm;
+                            margin-bottom: 10mm; /* Space between pages in preview */
+                        }
+                        
+                        @media print {
+                            body { background: white; }
+                            .a4-page { margin-bottom: 0; }
+                            .page-break { page-break-before: always; }
+                        }
+
+                        /* --- PAGE 1: ADDRESS & PACKING --- */
+                        .half-top { 
+                            height: 138mm; 
+                            border: 1px solid #333; /* Outer Frame */
+                            padding: 30px; 
+                            box-sizing: border-box; 
+                            position: relative;
+                            margin-bottom: 10px;
+                            display: flex;
+                            flex-direction: column;
+                        }
+                        
+                        .header-row { display: flex; gap: 20px; margin-bottom: 40px; }
+                        .logo-box { width: 80px; flex-shrink: 0; }
+                        .logo-box img { width: 100%; }
+                        
+                        .sender-info { font-size: 14px; color: #333; line-height: 1.4; }
+                        .sender-title { font-weight: bold; font-size: 16px; margin-bottom: 5px; }
+                        
+                        /* Receiver: Flow normally but pushed right/down */
+                        .receiver-box { 
+                            margin-left: 35%; /* Push to right side */
+                            width: 60%;
+                            padding: 20px; 
+                            border-radius: 10px; 
+                            font-size: 18px; 
+                            line-height: 1.5;
+                        }
+                        .rec-label { font-size: 16px; color: #000; font-weight: bold; text-transform: uppercase; margin-bottom: 10px; text-decoration: underline; }
+                        .rec-name { font-size: 26px; font-weight: bold; margin-bottom: 10px; }
+
+                        /* Bottom Half: Packing List */
+                        .half-bottom { 
+                            height: 130mm;
+                            border: 1px dashed #ccc;
+                            padding: 20px; 
+                            box-sizing: border-box; 
+                        }
+                        .dn-header { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 20px; }
+                        .dn-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+                        .dn-table th, .dn-table td { border: 1px solid #000; padding: 8px; font-size: 14px; }
+                        .dn-table th { background-color: #f0f0f0; }
+
+                        /* --- PAGE 2+: JOB ORDER --- */
+                        .job-header-section { border-bottom: 2px solid #000; padding-bottom: 20px; margin-bottom: 20px; }
+                        .job-title-big { font-size: 24px; font-weight: bold; margin-bottom: 10px; }
+                        .job-meta { display: flex; justify-content: space-between; font-size: 14px; }
+                        
+                        .job-row { display: flex; gap: 15px; margin-bottom: 15px; border-bottom: 1px dotted #ddd; padding-bottom: 15px; }
+                        .chk-box { width: 30px; font-size: 24px; display: flex; align-items: center; justify-content: center; border: 1px solid #ccc; height: 30px; }
+                        .job-detail { flex: 1; }
+                        .job-name { font-weight: bold; font-size: 16px; margin-bottom: 5px; }
+                        .job-fill { display: flex; justify-content: space-between; font-size: 14px; color: #555; }
+                        
+                        .job-footer { margin-top: 50px; display: flex; justify-content: space-between; border-top: 1px solid #000; padding-top: 20px; }
+                        
+                    </style>
+                </head>
+                <body>
+                    
+                    <!-- PAGE 1: ADDRESS & CUSTOMER LIST (HALF & HALF) -->
+                    <div class="a4-page">
+                        
+                        <!-- Top Half: Shipping Label -->
+                        <div class="half-top">
+                            <div class="header-row">
+                                <div class="logo-box">
+                                    <img src="${logoUrl}">
+                                </div>
+                                <div class="sender-info">
+                                    <div class="sender-title">ผู้ส่ง (Sender)</div>
+                                    DINOCO แผนกซ่อมบำรุงสินค้า (บริษัท พีพีทีกรุ๊ป คอร์ปอเรชั่น จำกัด)<br>
+                                    21/106 ซอยลาดพร้าว 15 แขวงจอมพล เขตจตุจักร กรุงเทพมหานคร 10900<br>
+                                    <strong>Tel: 061-639-9994</strong>
+                                </div>
+                            </div>
+                            
+                            <div class="receiver-box">
+                                <div class="rec-label">ผู้รับ (Receiver)</div>
+                                <div class="rec-name">${item.user}</div>
+                                <div>${item.address}</div>
+                                <div style="margin-top:10px;"><strong>Tel:</strong> ${item.phone}</div>
+                            </div>
+                        </div>
+
+                        <!-- Bottom Half: Customer Packing List (LIMITED ROWS) -->
+                        <div class="half-bottom">
+                            <div class="dn-header">
+                                <div>
+                                    <div style="font-size:20px; font-weight:bold;">ใบส่งสินค้า / DELIVERY NOTE</div>
+                                    <div style="font-size:14px; color:#666;">(สำหรับลูกค้า / For Customer)</div>
+                                </div>
+                                <div style="font-size:18px; font-weight:bold;">REF: ${item.ticket_no}</div>
+                            </div>
+                            
+                            <table class="dn-table">
+                                <thead>
+                                    <tr>
+                                        <th width="50">No.</th>
+                                        <th>Description (รายการสินค้า)</th>
+                                        <th width="60">Qty</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${p1RowsHtml}
+                                </tbody>
+                            </table>
+                            
+                            <div style="text-align:center; margin-top:30px; font-size:12px; font-weight:bold;">
+                                ${p1FooterMsg}
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- DELIVERY NOTE EXTENSIONS (IF ANY) -->
+                    ${dnExtensionPagesHtml}
+
+                    <!-- JOB ORDER PAGES -->
+                    ${jobPagesHtml}
+
+                    <script>
+                        setTimeout(() => { window.print(); window.close(); }, 1000);
+                    <\/script>
+                </body>
+                </html>
+            `;
+
+            w.document.open();
+            w.document.write(html);
+            w.document.close();
+        };
+
+        /* --- 5. LIGHTBOX FUNCTION --- */
+        window.openLightbox = function(url) {
+            if(!url) return;
+            $('#lg-lightbox-img').attr('src', url);
+            $('#lg-lightbox').css('display', 'flex').hide().fadeIn(200);
+            $('#lg-lightbox').appendTo('body');
+        };
+
+        window.closeLightbox = function() {
+            $('#lg-lightbox').fadeOut(200);
+        };
+
+        /* Init */
+        loadAllData();
+    });
+    </script>
+    <?php 
+    return ob_get_clean();
+}
