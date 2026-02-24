@@ -1,0 +1,1817 @@
+/*
+ * Template Name: DINOCO Claim System (V.Secure 63.15 - Fix Page 4 Address Source)
+ * Description: แก้ไขการดึงค่าที่อยู่สำหรับ PDF ให้ใช้ที่อยู่จริง (Original) ในหน้าขาไป (Page 4) เสมอ ไม่ใช้ค่าจาก Input ที่อาจถูกเปลี่ยน
+ *
+ * Updated Ticket Status List (Reference):
+ * - Registered in System : แจ้งเข้าระบบ
+ * - Awaiting Customer Shipment : รอลูกค้าส่งสินค้า (Start for Repair)
+ * - In Transit to Company : สินค้ากำลังจัดส่งมาบริษัท
+ * - Received at Company : บริษัทรับสินค้า
+ * - Under Maintenance : กำลังซ่อมบำรุง
+ * - Maintenance Completed : ซ่อมบำรุงสำเร็จ
+ * - Repaired Item Dispatched : ส่งสินค้าซ่อมบำรุงคืนให้ขนส่ง
+ * - Pending Issue Verification : รอตรวจสอบปัญหา (Start for Parts)
+ * - Replacement Approved : อนุมัติสินค้าทดแทนให้ลูกค้า
+ * - Replacement Shipped : ส่งพัสดุสินค้าทดแทนแล้ว
+ * - Replacement Rejected by Company : บริษัทไม่อนุมัติสินค้าทดแทน
+ */
+
+// ==========================================================================
+// 1. PHP SERVER SIDE PROCESS
+// ==========================================================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['dinoco_action']) && $_POST['dinoco_action'] === 'submit_claim') {
+    
+    // ----------------------------------------------------------------------
+    // System Configuration & Error Handling
+    // ----------------------------------------------------------------------
+    @ini_set('memory_limit', '256M'); 
+    @set_time_limit(300);
+    error_reporting(0);
+    @ini_set('display_errors', 0);
+    
+    // Clear Buffer to ensure JSON response is clean
+    while (ob_get_level()) { 
+        ob_end_clean(); 
+    }
+    
+    ob_start();
+
+    // ----------------------------------------------------------------------
+    // [SECURITY PATCH] 0. Honeypot Check (Bot Protection)
+    // ----------------------------------------------------------------------
+    if (!empty($_POST['dinoco_honey'])) {
+        ob_clean();
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'data' => ['message' => 'Error: Spam Detected.']]);
+        exit;
+    }
+
+    // ----------------------------------------------------------------------
+    // 1. Security & Nonce Check
+    // ----------------------------------------------------------------------
+    if (!isset($_POST['dinoco_nonce']) || !wp_verify_nonce($_POST['dinoco_nonce'], 'dinoco_claim_submit')) {
+        ob_clean();
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => false, 
+            'data' => [
+                'message' => 'Security Check Failed: Invalid Nonce'
+            ]
+        ]);
+        exit;
+    }
+
+    $uid = get_current_user_id();
+
+    // ----------------------------------------------------------------------
+    // 2. Anti-Spam System (Transient Lock)
+    // ----------------------------------------------------------------------
+    $spam_key = 'dinoco_spam_lock_' . $uid;
+    if (get_transient($spam_key)) {
+        ob_clean();
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => false, 
+            'data' => [
+                'message' => 'ใจเย็นๆ... ระบบกำลังประมวลผล กรุณารอสักครู่ (Anti-Spam Protection)'
+            ]
+        ]);
+        exit;
+    }
+    // Set lock for 5 seconds
+    set_transient($spam_key, true, 5);
+
+    // ----------------------------------------------------------------------
+    // 3. Data Retrieval & Sanitization
+    // ----------------------------------------------------------------------
+    $prod_id      = intval($_POST['product_id']); 
+    $prob_type    = sanitize_text_field($_POST['problem_type']); 
+    $sender_type  = sanitize_text_field($_POST['sender_type']); 
+    $dealer_name  = isset($_POST['dealer_name']) ? sanitize_text_field($_POST['dealer_name']) : ''; 
+    $return_to    = isset($_POST['return_to']) ? sanitize_text_field($_POST['return_to']) : 'customer'; 
+    
+    // Text Inputs
+    $addr_snap_text = sanitize_textarea_field($_POST['addr_full']);
+    $note_repair    = sanitize_textarea_field($_POST['cust_note']);        
+    $note_parts     = sanitize_textarea_field($_POST['cust_note_parts']); 
+
+    // Validate Product ID Basic
+    if ($prod_id === 0) {
+        ob_clean();
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'data' => ['message' => 'Error: Product ID Not Found (0)']]);
+        exit;
+    }
+
+    // ----------------------------------------------------------------------
+    // [SECURITY PATCH] 3.1 Ownership Verification (IDOR Protection)
+    // ----------------------------------------------------------------------
+    $curr_user_obj_check = wp_get_current_user();
+    $owner_val = get_field('owner_product', $prod_id);
+    
+    $is_owner = false;
+    if (is_object($owner_val) && isset($owner_val->ID)) {
+        if ($owner_val->ID == $uid) $is_owner = true;
+    } elseif (is_numeric($owner_val)) {
+        if ($owner_val == $uid) $is_owner = true;
+    } elseif (is_string($owner_val)) {
+        if ($owner_val == $curr_user_obj_check->user_login) $is_owner = true;
+    }
+
+    if (!$is_owner) {
+        ob_clean();
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => false, 
+            'data' => [
+                'message' => 'Security Error: คุณไม่ใช่เจ้าของสินค้ารายการนี้ (Ownership Verification Failed)'
+            ]
+        ]);
+        exit;
+    }
+
+    // ----------------------------------------------------------------------
+    // [SECURITY PATCH] 3.2 File Validation (Server Side - 300KB Strict & Anti-Malware)
+    // ----------------------------------------------------------------------
+    $map_imgs = ['img_front', 'img_back', 'img_left', 'img_right', 'img_defect'];
+    $allowed_mimes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp']; 
+    $max_file_size = 300 * 1024; // 300KB Limit (Strict)
+
+    foreach ($map_imgs as $input_name) {
+        if (!empty($_FILES[$input_name]['name'])) {
+            // Check Error
+            if ($_FILES[$input_name]['error'] !== UPLOAD_ERR_OK) {
+                continue; 
+            }
+            // Check Size
+            if ($_FILES[$input_name]['size'] > $max_file_size) {
+                ob_clean();
+                header('Content-Type: application/json');
+                echo json_encode(['success' => false, 'data' => ['message' => "Error: ไฟล์รูปภาพใหญ่เกินไป (ต้องไม่เกิน 300KB) : $input_name"]]);
+                exit;
+            }
+            // [SEC] Check MIME Type (Content Sniffing)
+            $finfo = finfo_open(FILEINFO_MIME_TYPE);
+            $mime = finfo_file($finfo, $_FILES[$input_name]['tmp_name']);
+            finfo_close($finfo);
+
+            if (!in_array($mime, $allowed_mimes)) {
+                ob_clean();
+                header('Content-Type: application/json');
+                echo json_encode(['success' => false, 'data' => ['message' => "Error: ประเภทไฟล์ไม่ถูกต้อง (อนุญาตเฉพาะรูปภาพ .jpg, .png) หากเป็นไฟล์ iPhone กรุณาลองใหม่"]]);
+                exit;
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // 4. PREPARE PRODUCT SNAPSHOT
+    // ----------------------------------------------------------------------
+    clean_post_cache($prod_id);
+
+    $source_sn_code = get_field('serial_code', $prod_id); 
+    $source_model   = get_field('product_model', $prod_id);
+    $source_sku     = get_field('product_sku', $prod_id);
+    
+    // --- [V.62 LOGIC: ROBUST W_STATUS RETRIEVAL] ---
+    $source_w_status = '';
+    $raw_val = get_post_meta($prod_id, 'w_status', true);
+    $mapped_label = '';
+    if ($raw_val !== '' && $raw_val !== false) {
+        $field_obj = get_field_object('w_status', $prod_id);
+        if ($field_obj && isset($field_obj['choices']) && is_array($field_obj['choices'])) {
+            if (isset($field_obj['choices'][$raw_val])) {
+                $mapped_label = $field_obj['choices'][$raw_val];
+            }
+        }
+    }
+    if (!empty($mapped_label)) {
+        $source_w_status = $mapped_label; 
+    } elseif ($raw_val !== '' && $raw_val !== false) {
+        $source_w_status = $raw_val; 
+    } else {
+        $source_w_status = 'N/A'; 
+    }
+    
+    if(empty($source_sn_code)) {
+        $prod_post = get_post($prod_id);
+        $source_sn_code = $prod_post ? $prod_post->post_title : 'N/A';
+    }
+
+    // ----------------------------------------------------------------------
+    // 5. PREPARE SHIPPING SNAPSHOT
+    // ----------------------------------------------------------------------
+    $curr_user_obj = wp_get_current_user();
+    
+    $shipping_snap_data = [
+        'name'                              => $curr_user_obj->display_name,
+        'snapshot_phone_number'             => get_user_meta($uid, 'phone_number', true),
+        'snapshot_addr_house_no'            => get_user_meta($uid, 'addr_house_no', true),
+        'snapshot_addr_soi'                 => get_user_meta($uid, 'addr_soi', true),
+        'snapshot_addr_subdistrict' => get_user_meta($uid, 'addr_subdistrict', true),
+        'snapshot_addr_district'    => get_user_meta($uid, 'addr_district', true),
+        'snapshot_addr_province'    => get_user_meta($uid, 'addr_province', true),
+        'snapshot_addr_zip'         => get_user_meta($uid, 'addr_zip', true),
+        'snapshot_w_status'         => $source_w_status
+    ];
+
+    // ----------------------------------------------------------------------
+    // 6. LOGIC: DETERMINE CONDITION, PREFIX, STATUS
+    // ----------------------------------------------------------------------
+    $is_parts_req = in_array($prob_type, ['5', '6', '7']);
+    
+    $log_timestamp_display = wp_date('d/m/Y H:i'); 
+    $sla_timestamp_mysql   = current_time('mysql'); 
+
+    if ($is_parts_req) {
+        $prefix_code       = 'PCLM-';
+        $condition_val     = 'send_part';
+        $status_val        = 'Pending Issue Verification'; 
+        $final_sender_type = 'request_parts';
+        $log_status_label  = 'Pending Issue Verification : รอตรวจสอบปัญหา';
+    } else {
+        $prefix_code       = 'CLM-';
+        $condition_val     = 'send_repair';
+        $status_val        = 'Awaiting Customer Shipment';
+        $final_sender_type = $sender_type;
+        $log_status_label  = 'Awaiting Customer Shipment : รอลูกค้าส่งสินค้า';
+    }
+
+    $ticket_code = $prefix_code . date('Ymd-Hi') . '-' . rand(1000, 9999);
+
+    // ----------------------------------------------------------------------
+    // 7. Create Ticket Post (CPT: claim_ticket)
+    // ----------------------------------------------------------------------
+    $post_id = wp_insert_post([
+        'post_title'    => $ticket_code . ' - ' . $source_sn_code . ' (' . $curr_user_obj->display_name . ')',
+        'post_type'     => 'claim_ticket',
+        'post_status'   => 'private', 
+        'post_author'   => $uid
+    ]);
+
+    if ($post_id) {
+        
+        // ------------------------------------------------------------------
+        // 7.1 Save Core Data
+        // ------------------------------------------------------------------
+        update_field('ref_product_id', $prod_id, $post_id);
+        update_field('ref_user_id', $uid, $post_id);
+        update_field('ticket_code', $ticket_code, $post_id);        
+        update_field('ticket_sn_text', $ticket_code, $post_id);     
+        
+        update_field('snapshot_serial_code', $source_sn_code, $post_id);
+        update_field('snapshot_product_model', $source_model, $post_id);
+        update_field('snapshot_product_sku', $source_sku, $post_id);
+        
+        update_field('serial_code', $source_sn_code, $post_id); 
+        update_field('ref_serial_text', $source_sn_code, $post_id); 
+
+        // ------------------------------------------------------------------
+        // 7.3 Save Problem, Condition, Status, Sender
+        // ------------------------------------------------------------------
+        update_field('problem_type', $prob_type, $post_id);
+        update_field('claim_condition', $condition_val, $post_id);
+        update_field('ticket_status', $status_val, $post_id);
+        update_field('sender_type', $final_sender_type, $post_id);
+        
+        // Save Dealer Data
+        if(!empty($dealer_name)) {
+            update_field('selected_dealer', $dealer_name, $post_id);
+        }
+        // Save Return Destination preference
+        update_field('return_destination', $return_to, $post_id);
+
+        // ------------------------------------------------------------------
+        // 7.4 Save Shipping Snapshot & SLA
+        // ------------------------------------------------------------------
+        update_field('shipping_snap', $shipping_snap_data, $post_id);
+        update_field('status_last_updated', $sla_timestamp_mysql, $post_id);
+
+        // ------------------------------------------------------------------
+        // 7.5 Process Notes
+        // ------------------------------------------------------------------
+        $cust_detail_note = ""; 
+        
+        if ($is_parts_req) {
+            update_field('parts_request_details', $note_parts, $post_id);
+            update_field('customer_note', $note_parts, $post_id);
+            $cust_detail_note = "Type: อะไหล่ (send_part)\nรายละเอียด: " . $note_parts;
+        } else {
+            update_field('customer_note', $note_repair, $post_id);
+            update_field('parts_request_details', '-', $post_id);
+            $cust_detail_note = "Type: ส่งซ่อม (send_repair)\nNote: " . $note_repair;
+        }
+
+        // Append Dealer info to internal note
+        if(!empty($dealer_name)) {
+            $cust_detail_note .= "\n(ฝากตัวแทนส่ง: " . $dealer_name . ")";
+            $cust_detail_note .= "\n(ส่งคืนที่: " . ($return_to == 'dealer' ? 'ร้านตัวแทน' : 'บ้านลูกค้า') . ")";
+        }
+        
+        $system_log_header = "📅 [{$log_timestamp_display}] System : Ticket Created by Customer (Status: {$log_status_label})";
+        
+        $final_internal_note = $system_log_header . "\n" . 
+                               "--------------------------------------------------\n" .
+                               "สถานะประกันเดิม (Snapshot in Group): " . $source_w_status . "\n" . 
+                               "--------------------------------------------------\n" .
+                               "ที่อยู่ (Snapshot จากฟอร์ม):\n" . $addr_snap_text . "\n\n" . 
+                               $cust_detail_note;
+
+        update_field('admin_internal_note', $final_internal_note, $post_id);
+
+        // ------------------------------------------------------------------
+        // 7.6 Image Handling
+        // ------------------------------------------------------------------
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        require_once(ABSPATH . 'wp-admin/includes/media.php');
+
+        $uploaded_urls = []; 
+        $evidence_group_data = [];
+
+        foreach ($map_imgs as $input_name) {
+            if (!empty($_FILES[$input_name]['name'])) {
+                $attach_id = media_handle_upload($input_name, $post_id);
+                if (!is_wp_error($attach_id)) {
+                    $evidence_group_data[$input_name] = $attach_id;
+                    update_field($input_name, $attach_id, $post_id);
+                    $uploaded_urls[$input_name] = wp_get_attachment_url($attach_id);
+                }
+            }
+        }
+        
+        if (!empty($evidence_group_data)) {
+            update_field('evidence_images', $evidence_group_data, $post_id);
+        }
+        
+        // ------------------------------------------------------------------
+        // 7.7 Update Original Product Status
+        // ------------------------------------------------------------------
+        update_field('w_status', 'claim_process', $prod_id);
+        update_field('repair_status', 'claim_process', $prod_id);
+
+        // ------------------------------------------------------------------
+        // 8. Return Success JSON
+        // ------------------------------------------------------------------
+        ob_clean();
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'success' => true,
+            'data' => [
+                'ticket_code' => $ticket_code,
+                'type'        => $is_parts_req ? 'parts' : 'repair',
+                'images'      => $uploaded_urls,
+                'sender_type' => $final_sender_type,
+                'dealer_name' => $dealer_name,
+                'return_to'   => $return_to
+            ]
+        ]);
+        exit;
+
+    } else {
+        ob_clean();
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'data' => ['message' => 'Error: Ticket Create Failed']]);
+        exit;
+    }
+}
+
+// ==========================================================================
+// 2. UI PART (Shortcode Render)
+// ==========================================================================
+add_shortcode('dinoco_claim_page', 'dnc_claim_ui_render_v63_15');
+
+function dnc_claim_ui_render_v63_15() {
+    // Check Login
+    if (!is_user_logged_in()) {
+        return '<div style="text-align:center;padding:50px; font-family:\'Kanit\';">กรุณาเข้าสู่ระบบ</div>';
+    }
+    
+    $curr_user = wp_get_current_user();
+
+    // ----------------------------------------------------------------------
+    // DEALER DATA MAPPING (For UI)
+    // ----------------------------------------------------------------------
+    $dealers_db = [
+        'ภาคกลาง' => [
+            ['name' => 'Fox Rider Shop (บางเขน)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/327339648_1859362641080186_6919308462818691555_n.png.webp'],
+            ['name' => 'TOUGH Design Scooter (นนทบุรี)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/307927415_5372608956153883_4124621016173040677_n.jpg.webp'],
+            ['name' => 'Garaji Service (ยานาวา)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/366711216_6522668954447576_8953061360947174181_n.jpg.webp'],
+            ['name' => 'ClubMoto (นนทบุรี)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/326574866_1377579816405381_4739273778208435264_n.jpg.webp'],
+            ['name' => 'ป้ายยา Racing (สมุทรปราการ)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/327446668_656372462845640_8937118385922377295_n.jpg.webp'],
+            ['name' => 'ไอซ์เซอร์วิส (ตลิ่งชัน)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/343099089_1312775815940964_615952551642355826_n.jpg.webp'],
+        ],
+        'ภาคเหนือ' => [
+            ['name' => 'CNX Motogear (เชียงใหม่)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/375450781_680489620782867_1437677059527923236_n.jpg.webp'],
+        ],
+        'ภาคตะวันออก/ตะวันออกเฉียงเหนือ' => [
+            ['name' => 'DC MOTO KORAT (นครราชสีมา)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/249394248_1357446134658788_816501298046566736_n.jpg.webp'],
+            ['name' => 'Touring Rider Shop (พัทยา)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/414694443_346467488213761_8008088486914506190_n.jpg.webp'],
+        ],
+        'ภาคอีสาน' => [
+            ['name' => 'Multiply Bigbike Shop (อุดรธานี)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/327310484_1890019748000519_361064934240625688_n.jpg.webp'],
+            ['name' => 'X2Shop NongKhai (หนองคาย)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/248362680_1569261046741266_5829130902102114811_n.jpg.webp'],
+            ['name' => 'Bie-Touring Buffet (อุบลฯ)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/356371562_6479454858780195_3373959969840268629_n.jpg.webp'],
+            ['name' => '89 Garage Bike (อุบลฯ)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/421190194_1916267428790082_4855748874451747008_n.jpg.webp'],
+            ['name' => 'D Touring (ขอนแก่น)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2026/02/304979668-443655187784533-4188330189274603658-n.jpg.webp'],
+        ],
+        'ภาคใต้' => [
+            ['name' => 'Zaam Bigbike Shop (สงขลา)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/435688762_3554421148158915_8760583627210274061_n.jpg.webp'],
+            ['name' => 'ศ.แมงกะไซค์ Rider Shop (สตูล)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/305413338_566615261924098_7527472303642609727_n.jpg.webp'],
+            ['name' => 'Prasut Bigbike (ภูเก็ต)', 'img' => 'https://dinoco.in.th/wp-content/uploads/2024/05/411889291_840201911448739_4241241457483879710_n.jpg.webp'],
+        ]
+    ];
+    
+    // ----------------------------------------------------------------------
+    // REPRINT LOGIC (For PDF Reprinting)
+    // ----------------------------------------------------------------------
+    $reprint_data = null;
+    if (isset($_GET['reprint_id'])) {
+        $ticket_id = intval($_GET['reprint_id']);
+        $ticket_post = get_post($ticket_id);
+        
+        if ($ticket_post && ($ticket_post->post_author == $curr_user->ID || current_user_can('manage_options'))) {
+            $prod_id = get_field('ref_product_id', $ticket_id);
+            $imgs = get_field('evidence_images', $ticket_id);
+            $dealer_sel = get_field('selected_dealer', $ticket_id);
+            $return_dst = get_field('return_destination', $ticket_id);
+            
+            $shipping_snap = get_field('shipping_snap', $ticket_id);
+            
+            if ($shipping_snap && !empty($shipping_snap['name'])) {
+                $addr_val = $shipping_snap['snapshot_addr_house_no'] . ' ' . $shipping_snap['snapshot_addr_soi'] . ' ' .
+                            $shipping_snap['snapshot_addr_subdistrict'] . ' ' . $shipping_snap['snapshot_addr_district'] . ' ' .
+                            $shipping_snap['snapshot_addr_province'] . ' ' . $shipping_snap['snapshot_addr_zip'];
+                $cust_name  = $shipping_snap['name'];
+                $cust_phone = $shipping_snap['snapshot_phone_number'];
+            } else {
+                $cust_name  = get_the_author_meta('display_name', $ticket_post->post_author);
+                $cust_phone = get_user_meta($ticket_post->post_author, 'phone_number', true);
+                $addr_val = ''; 
+            }
+            
+            $p_model_show = get_field('snapshot_product_model', $ticket_id) ?: get_field('product_model', $prod_id);
+            $p_sku_show   = get_field('snapshot_product_sku', $ticket_id)   ?: get_field('product_sku', $prod_id);
+            $p_sn_show    = get_field('snapshot_serial_code', $ticket_id)   ?: get_field('serial_code', $prod_id);
+
+            $note_show = get_field('customer_note', $ticket_id); 
+            if(!$note_show) $note_show = get_field('parts_request_details', $ticket_id); 
+
+            $reprint_data = [
+                'ticket_code' => get_field('ticket_code', $ticket_id) ?: get_field('ticket_sn_text', $ticket_id),
+                'cust_name'   => $cust_name,
+                'cust_phone'  => $cust_phone, 
+                'cust_addr'   => $addr_val,
+                'sender_type' => get_field('sender_type', $ticket_id), 
+                'dealer_name' => $dealer_sel,
+                'return_to'   => $return_dst,
+                'p_model'     => $p_model_show,
+                'p_sku'       => $p_sku_show,
+                'p_sn'        => $p_sn_show,
+                'prob'        => 'Reprint',
+                'note'        => $note_show,
+                'imgs'        => [
+                    'img_defect' => isset($imgs['img_defect']) ? wp_get_attachment_url($imgs['img_defect']) : '',
+                    'img_front'  => isset($imgs['img_front'])  ? wp_get_attachment_url($imgs['img_front']) : '',
+                    'img_back'   => isset($imgs['img_back'])   ? wp_get_attachment_url($imgs['img_back']) : '',
+                    'img_left'   => isset($imgs['img_left'])   ? wp_get_attachment_url($imgs['img_left']) : '',
+                    'img_right'  => isset($imgs['img_right'])  ? wp_get_attachment_url($imgs['img_right']) : '',
+                ]
+            ];
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // QUERY AVAILABLE PRODUCTS
+    // ----------------------------------------------------------------------
+    $products = new WP_Query([
+        'post_type'      => 'serial_number',
+        'posts_per_page' => -1,
+        'post_status'    => 'publish',
+        'meta_query'     => [
+            'relation' => 'AND',
+            [
+                'relation' => 'OR',
+                ['key' => 'owner_product', 'value' => $curr_user->ID, 'compare' => '='],            
+                ['key' => 'owner_product', 'value' => $curr_user->user_login, 'compare' => '=']      
+            ],
+            [
+                'relation' => 'OR', 
+                ['key' => 'w_status', 'value' => 'claim_process', 'compare' => '!='],
+                ['key' => 'w_status', 'compare' => 'NOT EXISTS']
+            ]
+        ]
+    ]);
+
+    // Pre-fill User Address String
+    $addr_str = get_user_meta($curr_user->ID, 'addr_house_no', true).' '.
+                get_user_meta($curr_user->ID, 'addr_soi', true).' '.
+                get_user_meta($curr_user->ID, 'addr_subdistrict', true).' '.
+                get_user_meta($curr_user->ID, 'addr_district', true).' '.
+                get_user_meta($curr_user->ID, 'addr_province', true).' '.
+                get_user_meta($curr_user->ID, 'addr_zip', true);
+    
+    $phone = get_user_meta($curr_user->ID, 'phone_number', true);
+
+    ob_start();
+    ?>
+    <!-- ==================================================================== -->
+    <!-- FRONTEND ASSETS & STYLES -->
+    <!-- ==================================================================== -->
+    <link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+39+Text&family=Kanit:wght@300;400;500;600;700&family=Dancing+Script:wght@700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    
+    <style>
+        .d-claim-app, .d-claim-app * { font-family: 'Kanit', sans-serif !important; }
+        .d-claim-app i, .d-claim-app .fa-solid { font-family: "Font Awesome 6 Free" !important; font-weight: 900 !important; }
+        :root { --primary: #06C755; --text-dark: #1a1a1a; --text-gray: #64748b; --bg-gray: #f8fafc; --white: #ffffff; --border: #e2e8f0; }
+        .d-claim-app { max-width: 550px; margin: 0 auto; background: #ffffff; min-height: 80vh; padding-bottom: 50px; color: #333; overflow: hidden; }
+        
+        /* NEW PREMIUM HEADER (Hero Style) */
+        .d-premium-header {
+            background: linear-gradient(135deg, #06C755 0%, #047857 100%);
+            padding: 30px 20px 40px 20px;
+            color: #fff;
+            border-radius: 0 0 30px 30px;
+            box-shadow: 0 10px 30px rgba(6, 199, 85, 0.2);
+            text-align: center;
+            position: relative;
+            margin-bottom: 30px;
+        }
+        .d-premium-header-title { font-size: 28px; font-weight: 800; margin-bottom: 5px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; gap: 10px; }
+        .d-premium-header-sub { font-size: 14px; opacity: 0.9; font-weight: 400; letter-spacing: 0.5px; }
+        .d-premium-tagline { 
+            position: absolute; bottom: -15px; left: 50%; transform: translateX(-50%);
+            background: #fff; color: #06C755;
+            padding: 8px 20px; border-radius: 50px;
+            font-size: 12px; font-weight: 700;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            white-space: nowrap;
+        }
+
+        /* UI Elements */
+        .d-progress-track { display: flex; justify-content: space-between; padding: 10px 40px; background: transparent; margin-bottom: 25px; position: relative; margin-top: 10px; }
+        .d-step-dot { width: 36px; height: 36px; border-radius: 50%; background: #f1f5f9; color: #cbd5e1; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; position: relative; z-index: 2; transition: all 0.3s; border: 2px solid #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+        .d-step-dot.active { background: #06C755; color: #fff; border-color: #d1fae5; transform: scale(1.1); box-shadow: 0 4px 10px rgba(6,199,85,0.3); }
+        .d-step-dot.completed { background: #06C755; color: #fff; border-color: #fff; }
+        
+        .d-track-line { position: absolute; top: 28px; left: 60px; right: 60px; height: 0; border-top: 3px dotted #cbd5e1; z-index: 1; }
+        
+        .d-step-content { display: none; padding: 0 25px; animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+        .d-step-content.active { display: block; }
+        @keyframes slideUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+        
+        h3.d-title { margin: 0 0 25px 0; color: #1e293b; font-size: 22px; font-weight: 700; letter-spacing: -0.5px; border-left: 4px solid #06C755; padding-left: 15px; }
+        .d-label { font-size: 16px; font-weight: 600; color: #334155; margin-bottom: 12px; display: block; }
+        .d-card-select, .d-input-area { width: 100%; padding: 16px; border: 1px solid #e2e8f0; border-radius: 16px; background: #fff; font-size: 16px; color: #1e293b; outline: none; margin-bottom: 25px; transition: 0.3s; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
+        .d-input-area:focus { border-color: #06C755; box-shadow: 0 0 0 4px rgba(6,199,85,0.1); }
+        
+        /* Grid Layout Premium */
+        .d-product-selector-area { margin-bottom: 30px; }
+        .d-prod-group-label { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 15px; margin-top: 30px; display: flex; align-items: center; gap: 10px; padding-bottom: 8px; border-bottom: 1px solid #f1f5f9; }
+        .d-prod-group-label i { color: #06C755; }
+        
+        .d-grid-layout { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; }
+        
+        .d-item-card { 
+            position: relative; background: #fff; 
+            border: 1px solid #f1f5f9; border-radius: 16px; 
+            overflow: hidden; cursor: pointer; 
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); 
+            display: flex; flex-direction: column; height: 100%; 
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+        }
+        .d-item-card:hover { transform: translateY(-5px); box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04); border-color: #cbd5e1; }
+        
+        .d-item-card.active { 
+            border: 2px solid #06C755; 
+            background: #f0fdf4; 
+            box-shadow: 0 0 0 4px rgba(6,199,85,0.15); 
+        }
+        
+        .d-item-img { width: 100%; height: 140px; object-fit: contain; background: #fff; border-bottom: 1px solid #f8fafc; padding: 15px; transition: transform 0.3s; }
+        .d-item-card:hover .d-item-img { transform: scale(1.05); }
+        
+        .d-item-info { padding: 15px; flex-grow: 1; display: flex; flex-direction: column; text-align: left; }
+        .d-item-name { font-size: 14px; font-weight: 600; color: #1e293b; line-height: 1.4; margin-bottom: 6px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .d-item-sn { font-size: 12px; color: #64748b; margin-top: auto; font-family: monospace; letter-spacing: 0.5px; }
+        
+        .d-item-check { position: absolute; top: 10px; right: 10px; background: #06C755; color: #fff; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; opacity: 0; transform: scale(0.5); transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); box-shadow: 0 4px 6px rgba(6,199,85,0.4); }
+        .d-item-card.active .d-item-check { opacity: 1; transform: scale(1); }
+
+        /* FIXED: Radio Buttons as Cards */
+        .d-radio-group { display: flex; flex-direction: column; gap: 10px; margin-bottom: 25px; }
+        .d-radio-card { 
+            display: flex; align-items: center; gap: 15px;
+            padding: 15px 20px;
+            background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
+            cursor: pointer; transition: all 0.2s;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        }
+        .d-radio-card:hover { border-color: #cbd5e1; transform: translateX(5px); }
+        .d-radio-card.active { 
+            border: 2px solid #06C755; background: #f0fdf4; 
+            box-shadow: 0 4px 10px rgba(6,199,85,0.1);
+        }
+        .d-radio-icon { 
+            width: 24px; height: 24px; border-radius: 50%; border: 2px solid #cbd5e1;
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0; transition: all 0.2s;
+        }
+        .d-radio-card.active .d-radio-icon { border-color: #06C755; background: #06C755; }
+        .d-radio-icon::after { content: ''; width: 10px; height: 10px; background: #fff; border-radius: 50%; display: none; }
+        .d-radio-card.active .d-radio-icon::after { display: block; }
+        .d-radio-text { font-size: 16px; font-weight: 500; color: #334155; }
+        .d-radio-card.active .d-radio-text { color: #06C755; font-weight: 700; }
+
+        /* Dealer Grid Styles */
+        .d-dealer-section { margin-top: 15px; display: none; animation: slideUp 0.3s ease-out; }
+        .d-dealer-region-title { font-size: 15px; font-weight: 700; color: #475569; margin-bottom: 10px; margin-top: 15px; border-left: 3px solid #cbd5e1; padding-left: 10px; }
+        .d-dealer-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .d-dealer-card { 
+            background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; 
+            overflow: hidden; cursor: pointer; transition: all 0.2s;
+            display: flex; flex-direction: column; align-items: center;
+            position: relative;
+        }
+        .d-dealer-card:hover { transform: translateY(-3px); box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
+        .d-dealer-card.active { border: 2px solid #06C755; background: #f0fdf4; }
+        .d-dealer-img { width: 100%; height: 80px; object-fit: cover; background: #f8fafc; }
+        .d-dealer-name { padding: 8px; font-size: 12px; font-weight: 600; text-align: center; color: #334155; line-height: 1.3; }
+        .d-dealer-check { position: absolute; top: 5px; right: 5px; background: #06C755; color: white; width: 20px; height: 20px; border-radius: 50%; font-size: 10px; display: flex; align-items: center; justify-content: center; opacity: 0; transform: scale(0); transition: 0.2s; }
+        .d-dealer-card.active .d-dealer-check { opacity: 1; transform: scale(1); }
+        
+        /* Mobile Responsive for Dealer Grid - 3 cols fixed */
+        @media (max-width: 480px) {
+            .d-dealer-grid { grid-template-columns: repeat(3, 1fr) !important; gap: 8px; }
+            .d-dealer-img { height: 50px; }
+            .d-dealer-name { font-size: 9px; padding: 4px; line-height: 1.2; }
+        }
+
+        /* Other UI */
+        .d-prob-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 25px; }
+        .d-prob-item { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 25px 15px; text-align: center; cursor: pointer; min-height: 130px; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: all 0.2s; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
+        .d-prob-item:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); }
+        .d-prob-item.selected { background: #f0fdf4; border: 2px solid #06C755; box-shadow: 0 0 0 4px rgba(6,199,85,0.1); }
+        .d-prob-item i { font-size: 32px; color: #94a3b8; margin-bottom: 12px; transition: 0.2s; }
+        .d-prob-item.selected i { color: #06C755; transform: scale(1.1); }
+        .d-prob-item span { font-size: 14px; font-weight: 500; line-height: 1.4; color: #334155; }
+        
+        .d-upload-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr); /* Force 2 columns */
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .d-upload-box { position: relative; height: 160px; border: 2px dashed #cbd5e1; border-radius: 16px; background: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; overflow: hidden; text-align:center; padding:10px; transition: 0.2s; }
+        .d-upload-box:hover { border-color: #94a3b8; background: #f8fafc; }
+        .d-upload-box.has-file { border-style: solid; border-color: #06C755; background: #f0fdf4; }
+
+        /* FIXED: Force hidden file input */
+        .d-upload-box input[type="file"] {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            opacity: 0 !important;
+            font-size: 0 !important; /* Hide 'Choose File' text */
+            cursor: pointer !important;
+            z-index: 10 !important;
+            display: block !important;
+        }
+        
+        .d-btn-group { display: flex; gap: 15px; margin-top: 40px; }
+        .d-btn { flex: 1; padding: 18px; border-radius: 14px; border: none; font-size: 16px; font-weight: 600; cursor: pointer; text-align: center; text-decoration: none; transition: 0.2s; letter-spacing: 0.5px; }
+        .d-btn-primary { background: #06C755; color: #fff; box-shadow: 0 10px 15px -3px rgba(6,199,85,0.3); }
+        .d-btn-primary:hover { background: #059669; transform: translateY(-2px); box-shadow: 0 20px 25px -5px rgba(6,199,85,0.4); }
+        .d-btn-secondary { background: #fff; color: #475569; border: 1px solid #e2e8f0; }
+        .d-btn-secondary:hover { background: #f1f5f9; border-color: #cbd5e1; }
+
+        .d-prod-preview-box { display: none; } /* Hide Legacy */
+
+        /* Reveal Animation Classes */
+        .d-reveal-section {
+            display: none; /* Hidden initially */
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.5s ease-out;
+        }
+        .d-reveal-section.visible {
+            display: block;
+            animation: fadeInUp 0.5s forwards;
+        }
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* POPUP & SUCCESS VIEW */
+        #loading-overlay { 
+            display: none; 
+            position: fixed; z-index: 100000; left: 0; top: 0; width: 100%; height: 100%; 
+            background-color: rgba(255,255,255,0.9); backdrop-filter: blur(5px); 
+            align-items: center; justify-content: center;
+        }
+        .d-spinner-box { 
+            background: white; color: #333; padding: 40px; border-radius: 20px; 
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.1); max-width: 400px; width: 90%; text-align: center; border: 1px solid #f1f5f9;
+        }
+        .d-spinner { border: 4px solid #f1f5f9; border-top: 4px solid #06C755; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 0 auto 20px auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        #success-view { 
+            display: none; 
+            text-align: center; padding: 50px 20px; 
+            animation: slideUp 0.5s ease-out; 
+            background: #fff; border-radius: 24px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.05), 0 10px 10px -5px rgba(0, 0, 0, 0.01); border: 1px solid #f1f5f9;
+            margin-top: 20px;
+        }
+
+        /* --- FINAL PRINT STYLES --- */
+        #print-area { display: none; }
+        @media print {
+            body { 
+                visibility: hidden !important; 
+                background: white !important; 
+                margin: 0 !important; 
+                padding: 0 !important;
+            }
+            body * { visibility: hidden !important; }
+            #print-area { 
+                display: block !important; 
+                visibility: visible !important; 
+                position: absolute !important; 
+                left: 0 !important; 
+                top: 0 !important; 
+                width: 100% !important; 
+                margin: 0 !important;
+                padding: 0 !important;
+                z-index: 999999 !important;
+                background: white !important;
+            }
+            #print-area * { visibility: visible !important; }
+            @page { size: A4 portrait; margin: 0; }
+            .a4-page { 
+                width: 210mm; height: 270mm; background: white; position: relative; overflow: hidden; 
+                page-break-after: always; page-break-inside: avoid; font-family: 'Kanit', sans-serif; 
+                color: #000; display: block; margin: 0 auto; padding-top: 10mm; box-sizing: border-box;
+            }
+            .a4-page:last-child { page-break-after: auto; }
+            .safe-area { width: 190mm; height: 100%; position: relative; display: block; margin: 0 auto; }
+            .p-header-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 2px; }
+            .p-logo { height: 32px; width: auto; }
+            .p-company { text-align: right; font-size: 9px; line-height: 1.2; }
+            .p-divider { border-bottom: 2px solid #000; margin-bottom: 3px; }
+            .p-doc-info { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 3px; font-size: 10px; font-weight: bold; }
+            .p-title-center { flex: 1; text-align: center; font-size: 16px; font-weight: 800; transform: translateY(2px); }
+            .p-info-grid { display: flex; gap: 4px; margin-bottom: 4px; }
+            .p-info-box { border: 1px solid #000; flex: 1; border-radius: 2px; overflow: hidden; position: relative; }
+            .p-info-header { background: #eee; font-size: 9px; font-weight: bold; padding: 1px 4px; border-bottom: 1px solid #000; }
+            .p-info-content { padding: 3px; font-size: 9px; line-height: 1.2; position: relative; }
+            .p-problem-box { border: 1px solid #000; border-radius: 2px; overflow: hidden; margin-bottom: 4px; }
+            .p-problem-content { padding: 3px; font-size: 10px; min-height: 40px; line-height: 1.4; vertical-align: top; }
+            .p-problem-header-inline { font-weight: bold; background: #eee; padding: 2px 4px; border-bottom: 1px solid #000; display: block; font-size: 9px; }
+            .sn-qr { position: absolute; top: 2px; right: 2px; width: 36px; height: 36px; object-fit: contain; }
+            .p-img-container { display: flex; height: 330px; border: 1px solid #000; padding: 4px; gap: 4px; margin-bottom: 4px; box-sizing: border-box; }
+            .p-img-container.p-page2 { height: 330px; } 
+            .p-img-left { flex: 45%; border: 1px solid #ccc; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; background:#fff; }
+            .p-img-right { flex: 55%; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 4px; }
+            .p-img-sub { border: 1px solid #ccc; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; background:#fff; }
+            .p-img-obj { max-width: 100%; max-height: 100%; object-fit: contain; display:block; }
+            .p-img-label { position: absolute; bottom: 0; width: 100%; background: rgba(255,255,255,0.9); text-align: center; font-size: 9px; font-weight: bold; padding: 1px 0; border-top: 1px solid #ddd; }
+            .p-warning { text-align: center; font-size: 10px; font-weight: bold; border: 1px solid #000; padding: 4px; margin-bottom: 5px; margin-top: 5px; background: #fff; }
+            .p-signatures { display: flex; justify-content: space-between; margin-top: 0; }
+            .p-sign-col { width: 40%; text-align: center; border-top: 1px dotted #000; padding-top: 3px; }
+            .p-sign-auto { font-family: 'Dancing Script', cursive; font-size: 14px; display: block; margin-bottom: 2px; height: 20px; }
+            .p-sign-lbl { font-size: 8px; line-height: 1.2; }
+            .st-box-wrap { border: 1px solid #000; padding: 2px; margin-bottom: 2px; font-size: 9px; }
+            .st-header { font-weight: bold; margin-bottom: 1px; border-bottom: 1px solid #ccc; padding-bottom: 1px; font-size: 9px; background:#f9f9f9; }
+            .st-row { display: flex; }
+            .st-col { flex: 1; padding-right: 2px; }
+            .st-chk-row { display: flex; align-items: center; margin-bottom: 0px; white-space: nowrap; line-height: 1.1; }
+            .st-chk-box { width: 8px; height: 8px; border: 1px solid #000; display: inline-block; margin-right: 3px; }
+            .st-grid-table { width: 100%; border-collapse: collapse; font-size: 9px; }
+            .st-grid-table td { padding: 1px; vertical-align: top; border: none; line-height: 1.1; }
+            .bill-table { width: 100%; border-collapse: collapse; font-size: 9px; margin-bottom: 10px; }
+            .bill-table th, .bill-table td { border: 1px solid #000; padding: 4px; }
+            .bill-table th { background: #f0f0f0; text-align: center; font-weight:bold; }
+            .bill-table td { text-align: center; height: 18px; }
+            .qc-table { width: 100%; border-collapse: collapse; font-size: 10px; margin-bottom: 10px; }
+            .qc-table th, .qc-table td { border: 1px solid #000; padding: 5px; text-align: left; }
+            .page-3-footer { margin-top: auto; padding-bottom: 20px; }
+            .page-landscape-wrapper { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+            .label-border { 
+                width: 270mm; height: 170mm; transform: rotate(90deg); border: 4px solid #000; border-radius: 15px; 
+                padding: 25px; display: flex; flex-direction: column; justify-content: space-between; box-sizing: border-box; background: white; position: relative; 
+            }
+            .lbl-header { display: flex; justify-content: space-between; align-items: flex-start; }
+            .lbl-logo { height: 40px; }
+            .lbl-from-title { font-size: 20px; font-weight: bold; color: #888; }
+            .lbl-from-box { font-size: 16px; line-height: 1.3; margin-top: 5px; }
+            .lbl-to-group { display: flex; flex-direction: column; align-items: flex-end; margin-top: auto; margin-bottom: auto; padding-right: 60px; }
+            .lbl-logo-big { height: 70px; margin-bottom: 20px; }
+            .lbl-to-section { text-align: right; }
+            .lbl-to-title { font-size: 40px; font-weight: 900; color: #ccc; text-transform: uppercase; line-height: 0.8; }
+            .lbl-to-name { font-size: 32px; font-weight: bold; margin-top: 5px; }
+            .lbl-to-addr { font-size: 22px; width: 100%; max-width: 600px; margin-top: 10px; line-height: 1.2; margin-left: auto; }
+            .lbl-to-tel { font-size: 28px; font-weight: bold; margin-top: 10px; }
+            .lbl-footer { border-top: 2px dashed #888; margin-top: auto; padding-top: 10px; font-size: 14px; color: #555; display: flex; justify-content: space-between; align-items: flex-end; }
+            .lbl-id { font-size: 16px; font-weight: bold; }
+            .lbl-red-vertical-right {
+                position: absolute; right: -25px; top: 50%; transform: translateY(-50%) rotate(180deg); writing-mode: vertical-rl;
+                text-orientation: mixed; border: 4px solid red; color: red; font-size: 24px; font-weight: bold; padding: 30px 10px;
+                white-space: nowrap; background: #fff; z-index: 10;
+            }
+        }
+    </style>
+
+    <!-- ==================================================================== -->
+    <!-- FRONTEND STRUCTURE (HTML) -->
+    <!-- ==================================================================== -->
+    <div class="d-claim-app">
+        <!-- NEW HERO HEADER -->
+        <div class="d-premium-header">
+            <div class="d-premium-header-title">
+                <i class="fa-solid fa-screwdriver-wrench"></i> DINOCO CARE+
+            </div>
+            <div class="d-premium-header-sub">ระบบแจ้งเคลมและติดตามสถานะงานซ่อม</div>
+            <div class="d-premium-tagline">#ดีกว่าเมื่อเดินทาง</div>
+        </div>
+
+        <!-- SUCCESS SCREEN -->
+        <div id="success-view">
+            <i class="fa-solid fa-circle-check" style="font-size:80px; color:#06C755; margin-bottom:20px;"></i>
+            <h2 style="margin-bottom:10px; color:#333;">บันทึกข้อมูลสำเร็จ!</h2>
+            <p style="margin-bottom:10px; color:#666; font-size:18px;">รหัสใบงานของคุณคือ:<br><span id="succ-code" style="font-weight:bold; color:#06C755; font-size:28px;"></span></p>
+            
+            <div id="print-section">
+                <p id="text-print-warning" style="margin-bottom:25px; color:#d32f2f; font-weight:bold; font-size:16px;">
+                    กรุณาพิมพ์หรือดาวน์โหลด PDF นี้ไว้ <br>ท่านจะไม่สามารถกลับมา Download ได้อีกครั้งแล้ว สำคัญ!
+                </p>
+                <p style="margin-bottom:30px; color:#64748b; font-size:14px;">
+                    สามารถกรอกเลขพัสดุจัดส่งสินค้าและ<br>ติดตามสถานนะการซ่อมบำรุงได้ที่หน้าหลักของระบบ
+                </p>
+                <button id="btn-print-pdf" type="button" class="d-btn d-btn-secondary" onclick="window.print()" style="background:#3b82f6; color:#fff; width:100%; margin-bottom:15px;">
+                    <i class="fa-solid fa-print"></i> พิมพ์ / ดาวน์โหลด PDF
+                </button>
+            </div>
+            
+            <a href="/member-dashboard" class="d-btn d-btn-primary" style="text-decoration:none; display:inline-block; width:100%; padding:15px; border-radius:12px; box-sizing:border-box;">
+                กลับสู่หน้าหลัก
+            </a>
+        </div>
+
+        <!-- FORM CONTAINER -->
+        <div id="form-container">
+            <!-- PROGRESS BAR (Premium Dashed) -->
+            <div class="d-progress-track">
+                <div class="d-track-line"></div>
+                <div class="d-step-dot active" id="dot1">1</div>
+                <div class="d-step-dot" id="dot2">2</div>
+                <div class="d-step-dot" id="dot3">3</div>
+            </div>
+
+            <form id="claimForm" enctype="multipart/form-data">
+                <!-- Honeypot Field (Security) -->
+                <input type="text" name="dinoco_honey" style="display:none !important;" tabindex="-1" autocomplete="off">
+                <!-- NEW: Dealer Name Input -->
+                <input type="hidden" name="dealer_name" id="dealer_name" value="">
+                <!-- NEW: Return Destination Input -->
+                <input type="hidden" name="return_to" id="return_to" value="customer">
+                <!-- NEW: Backup Original Address -->
+                <input type="hidden" id="original_addr" value="<?php echo esc_attr($addr_str); ?>">
+
+                <?php if ($reprint_data): ?>
+                    <!-- REPRINT MODE -->
+                    <div style="text-align:center; padding:50px;">
+                        <h2><i class="fa-solid fa-print"></i> กำลังเตรียมเอกสาร...</h2>
+                    </div>
+                <?php else: ?>
+                    <!-- STEP 1: SELECT PRODUCT & PROBLEM -->
+                    <div id="step1" class="d-step-content active">
+                        
+                        <!-- HIDDEN INPUTS TO STORE SELECTION -->
+                        <input type="hidden" id="pid" name="product_id" value="">
+                        
+                        <div id="sec-product">
+                            <h3 class="d-title">เลือกทรัพย์สินที่ต้องการแจ้งซ่อม</h3>
+                            
+                            <div class="d-product-selector-area">
+                                <?php 
+                                // Logic: Fetch and Group Products
+                                $singles_list = [];
+                                $bundles_list = [];
+                                $catalog = get_option('dinoco_product_catalog', []);
+
+                                if ($products->have_posts()) {
+                                    while ($products->have_posts()) {
+                                        $products->the_post();
+                                        $pid = get_the_ID();
+                                        
+                                        $p_img_raw = get_field('pic_product');
+                                        $p_model   = get_field('product_model');
+                                        $p_sku     = get_field('product_sku');
+                                        $p_sn      = get_field('serial_code');
+                                        $p_img_url = (is_array($p_img_raw)) ? $p_img_raw['url'] : (is_numeric($p_img_raw) ? wp_get_attachment_image_url($p_img_raw, 'medium') : $p_img_raw);
+                                        if(!$p_img_url) $p_img_url = 'https://placehold.co/150x150?text=No+Image';
+
+                                        $bundle_id = get_post_meta($pid, 'current_bundle_id', true);
+                                        
+                                        $item_data = [
+                                            'id'    => $pid,
+                                            'img'   => $p_img_url,
+                                            'model' => $p_model, 
+                                            'sku'   => $p_sku,
+                                            'sn'    => $p_sn
+                                        ];
+
+                                        if ($bundle_id && get_post_status($bundle_id)) {
+                                            if (!isset($bundles_list[$bundle_id])) {
+                                                // [UPDATE] Bundle Name Logic: Try Catalog Name first, fallback to Post Title
+                                                $b_sku = get_post_meta($bundle_id, 'bundle_sku', true);
+                                                $b_real_name = isset($catalog[$b_sku]['name']) ? $catalog[$b_sku]['name'] : get_the_title($bundle_id);
+
+                                                $bundles_list[$bundle_id] = [
+                                                    'name'  => $b_real_name,
+                                                    'items' => []
+                                                ];
+                                            }
+                                            $bundles_list[$bundle_id]['items'][] = $item_data;
+                                        } else {
+                                            $singles_list[] = $item_data;
+                                        }
+                                    }
+                                    wp_reset_postdata();
+                                }
+                                ?>
+
+                                <?php if(empty($bundles_list) && empty($singles_list)): ?>
+                                    <div style="text-align:center; padding:30px; border:2px dashed #cbd5e1; border-radius:12px; color:#64748b;">
+                                        <i class="fa-solid fa-box-open" style="font-size:40px; margin-bottom:10px;"></i><br>
+                                        ไม่พบรายการสินค้า
+                                    </div>
+                                <?php endif; ?>
+
+                                <!-- 1. Bundles Render -->
+                                <?php foreach ($bundles_list as $bid => $b_info): ?>
+                                    <div class="d-prod-group-label"><i class="fa-solid fa-cubes"></i> <?php echo esc_html($b_info['name']); ?></div>
+                                    <div class="d-grid-layout">
+                                        <?php foreach ($b_info['items'] as $item): ?>
+                                            <div class="d-item-card" onclick="dnc_select_card(this, '<?php echo $item['id']; ?>', '<?php echo esc_js($item['img']); ?>', '<?php echo esc_js($item['model']); ?>', '<?php echo esc_js($item['sn']); ?>')">
+                                                <div class="d-item-check"><i class="fa-solid fa-check"></i></div>
+                                                <img src="<?php echo esc_url($item['img']); ?>" class="d-item-img">
+                                                <div class="d-item-info">
+                                                    <div class="d-item-name"><?php echo esc_html($item['model']); ?></div>
+                                                    <div class="d-item-sn">SN: <?php echo esc_html($item['sn']); ?></div>
+                                                </div>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                <?php endforeach; ?>
+
+                                <!-- 2. Singles Render -->
+                                <?php if (!empty($singles_list)): ?>
+                                    <div class="d-prod-group-label"><i class="fa-solid fa-box"></i> สินค้าเดี่ยว (Single Items)</div>
+                                    <div class="d-grid-layout">
+                                        <?php foreach ($singles_list as $item): ?>
+                                            <div class="d-item-card" onclick="dnc_select_card(this, '<?php echo $item['id']; ?>', '<?php echo esc_js($item['img']); ?>', '<?php echo esc_js($item['model']); ?>', '<?php echo esc_js($item['sn']); ?>')">
+                                                <div class="d-item-check"><i class="fa-solid fa-check"></i></div>
+                                                <img src="<?php echo esc_url($item['img']); ?>" class="d-item-img">
+                                                <div class="d-item-info">
+                                                    <div class="d-item-name"><?php echo esc_html($item['model']); ?></div>
+                                                    <div class="d-item-sn">SN: <?php echo esc_html($item['sn']); ?></div>
+                                                </div>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                            
+                            <!-- Hidden Detail Box for JS Reference (Optional but used by legacy logic) -->
+                            <div id="product-detail-box" style="display:none;">
+                                <img id="view-img" src="">
+                                <div id="view-model"></div>
+                                <div id="view-sn"></div>
+                            </div>
+                        </div>
+
+                        <div id="sec-problem" class="d-reveal-section">
+                            <h3 class="d-title" style="margin-top:30px; border-color:#f59e0b;">เลือกปัญหาที่พบ</h3>
+                            <input type="hidden" id="prob" name="problem_type">
+                            <div class="d-prob-grid">
+                                <div class="d-prob-item" onclick="dnc_select_problem(this, '1')"><i class="fa-solid fa-paintbrush"></i> <span>ซ่อมสีกันล้ม</span></div>
+                                <div class="d-prob-item" onclick="dnc_select_problem(this, '2')"><i class="fa-solid fa-gears"></i> <span>ซ่อมโครงสร้าง</span></div>
+                                <div class="d-prob-item" onclick="dnc_select_problem(this, '3')"><i class="fa-solid fa-box-open"></i> <span>เปลี่ยนอะไหล่กล่อง</span></div>
+                                <div class="d-prob-item" onclick="dnc_select_problem(this, '4')"><i class="fa-solid fa-hammer"></i> <span>ซ่อมโครงสร้างกล่อง</span></div>
+                                <div class="d-prob-item" onclick="dnc_select_problem(this, '5')"><i class="fa-solid fa-puzzle-piece"></i> <span>เคลมประกับข้าง (อะไหล่)</span></div>
+                                <div class="d-prob-item" onclick="dnc_select_problem(this, '6')"><i class="fa-solid fa-note-sticky"></i> <span>เคลมสติ้กเกอร์ (อะไหล่)</span></div>
+                                <div class="d-prob-item" onclick="dnc_select_problem(this, '7')"><i class="fa-solid fa-screwdriver-wrench"></i> <span>เบิกอะไหล่ต่างๆ (อะไหล่)</span></div>
+                            </div>
+                        </div>
+
+                        <div id="sec-shipping" class="d-reveal-section">
+                            
+                            <div id="opt-repair" style="display:none;">
+                                <h3 class="d-title" style="margin-top:30px; border-color:#3b82f6;">ข้อมูลการจัดส่ง</h3>
+                                <label class="d-label">เลือกวิธีการส่งสินค้ามายังบริษัท</label>
+                                <div class="d-radio-group">
+                                    <div class="d-radio-card active" onclick="dnc_set_sender('user', this)">
+                                        <div class="d-radio-icon"></div>
+                                        <div class="d-radio-text">ลูกค้าจัดส่งมายังบริษัทด้วยตนเอง</div>
+                                    </div>
+                                    <div class="d-radio-card" onclick="dnc_set_sender('dealer', this)">
+                                        <div class="d-radio-icon"></div>
+                                        <div class="d-radio-text">ฝากตัวแทนจำหน่ายจัดส่งให้</div>
+                                    </div>
+                                </div>
+                                
+                                <!-- DEALER SELECTION GRID -->
+                                <div id="opt-dealer-select" style="display:none;">
+                                    <div class="d-alert d-alert-warning" style="margin-bottom:15px; font-size:14px;">
+                                        <i class="fa-solid fa-circle-info"></i> กรุณาติดต่อตัวแทนจำหน่ายที่ท่านทำการซื้อสินค้าเพื่อประสานงานและสอบถามคิวการซ่อมบำรุงก่อนทำรายการในระบบ เพื่อความรวดเร็วในการให้บริการ
+                                    </div>
+                                    <label class="d-label">เลือกตัวแทนจำหน่ายที่ท่านติดต่อไว้</label>
+                                    
+                                    <?php foreach($dealers_db as $region => $list): ?>
+                                        <div class="d-dealer-region-title"><?php echo $region; ?></div>
+                                        <div class="d-dealer-grid">
+                                            <?php foreach($list as $d): ?>
+                                                <div class="d-dealer-card" onclick="dnc_select_dealer(this, '<?php echo esc_js($d['name']); ?>')">
+                                                    <div class="d-dealer-check"><i class="fa-solid fa-check"></i></div>
+                                                    <img src="<?php echo esc_url($d['img']); ?>" class="d-dealer-img">
+                                                    <div class="d-dealer-name"><?php echo esc_html($d['name']); ?></div>
+                                                </div>
+                                            <?php endforeach; ?>
+                                        </div>
+                                    <?php endforeach; ?>
+
+                                    <!-- NEW: Return Destination Option (Only shows when dealer selected) -->
+                                    <div id="opt-return-dest" style="display:none; margin-top:20px; border-top:1px dashed #cbd5e1; padding-top:15px;">
+                                        <label class="d-label">ต้องการให้บริษัทจัดส่งสินค้าคืนที่ไหน?</label>
+                                        <div class="d-radio-group">
+                                            <div class="d-radio-card active" onclick="dnc_set_return('customer', this)">
+                                                <div class="d-radio-icon"></div>
+                                                <div class="d-radio-text">ส่งกลับบ้านลูกค้า</div>
+                                            </div>
+                                            <div class="d-radio-card" onclick="dnc_set_return('dealer', this)">
+                                                <div class="d-radio-icon"></div>
+                                                <div class="d-radio-text">ส่งกลับร้านตัวแทนจำหน่าย</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <input type="hidden" name="sender_type" id="sender_type" value="user">
+                                <label class="d-label" style="margin-top:25px;">แจ้งอาการปัญหาที่พบหรือจุดที่อยากให้ซ่อมบำรุง (จำเป็น)</label>
+                                <textarea name="cust_note" class="d-input-area" rows="3" placeholder="เช่น อาการเพิ่มเติม หรือจุดที่ต้องการเน้นย้ำ..."></textarea>
+                            </div>
+
+                            <div id="opt-parts" style="display:none; background:#f0fdf4; padding:25px; border-radius:20px; border:2px dashed #06C755; margin-top:30px; margin-bottom:25px;">
+                                <h3 class="d-title" style="border:none; margin-bottom:15px; color:#065f46;"><i class="fa-solid fa-box"></i> รายละเอียดการเบิกอะไหล่</h3>
+                                <label class="d-label" style="color:#047857; margin-bottom:5px;">ระบุชิ้นส่วนหรืออะไหล่ที่ต้องการ:</label>
+                                <div style="font-size:14px; color:#059669; margin-bottom:15px;">กรุณาระบุให้ชัดเจน เช่น "สติ๊กเกอร์ติดปี๊บสีดำ 1 ชุด" หรือ "น็อตยึดแร็ค 4 ตัว"</div>
+                                <textarea name="cust_note_parts" id="cust_note_parts" class="d-input-area" rows="4" placeholder="พิมพ์รายละเอียดที่นี่..." style="border-color:#06C755;"></textarea>
+                            </div>
+                            
+                            <div class="d-btn-group">
+                                <button type="button" class="d-btn d-btn-primary" onclick="dnc_go_step(2)">ถัดไป <i class="fa-solid fa-arrow-right"></i></button>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- STEP 2: UPLOAD IMAGES -->
+                    <div id="step2" class="d-step-content">
+                        <h3 class="d-title">📷 ถ่ายรูปสินค้าเพื่อยืนยันสภาพ</h3>
+                        <div class="d-alert d-alert-warning" style="margin-bottom:20px;">กรุณาถ่ายให้เห็นชัดเจน เพื่อความรวดเร็วในการประเมิน</div>
+                        <div class="d-upload-grid">
+                            <label class="d-upload-box">
+                                <input type="file" name="img_front" accept="image/*" required onchange="dnc_file_check(this)">
+                                <i class="fa-solid fa-camera"></i> <span><span style="color:red">*</span> ด้านหน้ารถ</span>
+                            </label>
+                            <label class="d-upload-box">
+                                <input type="file" name="img_back" accept="image/*" required onchange="dnc_file_check(this)">
+                                <i class="fa-solid fa-camera"></i> <span><span style="color:red">*</span> ด้านหลังรถ</span>
+                            </label>
+                            <label class="d-upload-box">
+                                <input type="file" name="img_left" accept="image/*" required onchange="dnc_file_check(this)">
+                                <i class="fa-solid fa-camera"></i> <span><span style="color:red">*</span> ด้านข้างซ้าย</span>
+                            </label>
+                            <label class="d-upload-box">
+                                <input type="file" name="img_right" accept="image/*" required onchange="dnc_file_check(this)">
+                                <i class="fa-solid fa-camera"></i> <span><span style="color:red">*</span> ด้านข้างขวา</span>
+                            </label>
+                        </div>
+                        <div style="font-size:13px; color:#64748b; margin-bottom:20px; text-align:center; font-style:italic;">
+                            *หมายเหตุ: เพื่อยืนยันความเป็นเจ้าของรถและสภาพสินค้าในปัจจุบัน
+                        </div>
+                        <label class="d-label" style="margin-top:20px;">ภาพจุดที่มีปัญหา (สำคัญมาก)</label>
+                        <div class="d-upload-grid" style="grid-template-columns: 1fr;">
+                            <label class="d-upload-box" style="border-color:#f59e0b; background:#fffbeb;">
+                                <input type="file" name="img_defect" id="img_defect_input" accept="image/*" required onchange="dnc_file_check(this); dnc_preview_defect(this);">
+                                <i class="fa-solid fa-circle-exclamation" style="color:#f59e0b;"></i> <span style="color:#b45309; font-weight:bold;"><span style="color:red">*</span> ภาพจุดที่เสียหาย/ชำรุด</span>
+                            </label>
+                        </div>
+                        <div class="d-btn-group">
+                            <button type="button" class="d-btn d-btn-secondary" onclick="dnc_go_step(1)">กลับ</button>
+                            <button type="button" class="d-btn d-btn-primary" onclick="dnc_validate_images_next()">ถัดไป <i class="fa-solid fa-arrow-right"></i></button>
+                        </div>
+                    </div>
+
+                    <!-- STEP 3: CONFIRM & SUBMIT -->
+                    <div id="step3" class="d-step-content">
+                        <h3 class="d-title">📝 ตรวจสอบและยืนยันข้อมูล</h3>
+                        <div class="d-summary-card">
+                            <div class="d-summary-row"><span>ชื่อผู้แจ้ง:</span><span style="font-weight:bold;"><?php echo esc_html($curr_user->display_name); ?></span></div>
+                            <div class="d-summary-row"><span>เบอร์โทรศัพท์:</span><span style="font-weight:bold;"><?php echo esc_html($phone); ?></span></div>
+                            <div class="d-summary-row" style="flex-direction:column; gap:10px;">
+                                <span>ที่อยู่สำหรับจัดส่งคืน:</span>
+                                <textarea id="uaddr_edit" name="addr_full" class="d-card-select" rows="3" style="background:#f8fafc;"><?php echo esc_textarea($addr_str); ?></textarea>
+                            </div>
+                        </div>
+                        <input type="hidden" id="uname" value="<?php echo esc_attr($curr_user->display_name); ?>">
+                        <input type="hidden" id="uphone" value="<?php echo esc_attr($phone); ?>">
+                        <input type="hidden" id="temp_defect_img_url">
+                        <div class="d-btn-group" style="flex-direction:column; gap:10px;">
+                            <button type="button" id="finalSubBtn" class="d-btn d-btn-primary" onclick="dnc_submit_claim_form()">ยืนยันการแจ้งเคลม</button>
+                            <button type="button" class="d-btn d-btn-secondary" onclick="dnc_go_step(2)" style="background:transparent; border:none; color:#64748b; text-decoration:underline;">กลับไปแก้ไข</button>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </form>
+        </div>
+    </div>
+
+    <!-- LOADING OVERLAY -->
+    <div id="loading-overlay" style="display:none; flex-direction:column;">
+        <div class="d-spinner-box">
+            <div class="d-spinner"></div>
+            <h3>กำลังบันทึกข้อมูล...</h3>
+            <p>ระบบกำลังอัปโหลดรูปภาพและสร้างใบเคลม<br>
+            <span style="color:#d32f2f; font-weight:bold; font-size:16px;">กรุณารอสักครู่ (ห้ามปิดหน้านี้)</span></p>
+        </div>
+    </div>
+    
+    <!-- PRINT AREA CONTAINER -->
+    <div id="print-area"></div>
+
+    <!-- ==================================================================== -->
+    <!-- JAVASCRIPT LOGIC -->
+    <!-- ==================================================================== -->
+    <script>
+    let isSubmitting = false;
+    
+    // [SECURITY PATCH] Helper to Prevent XSS in Template Strings
+    function escapeHtml(text) {
+        if (!text) return '';
+        return text
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    <?php if ($reprint_data): ?>
+    // Auto-Print Trigger for Reprint Mode
+    jQuery(document).ready(function(){
+        document.title = "DINOCO_CLAIM_<?php echo $reprint_data['ticket_code']; ?>";
+        var reprintImgs = <?php echo json_encode($reprint_data['imgs']); ?>;
+        var finalHTML = dnc_claim_gen_doc_reprint(
+            "<?php echo $reprint_data['ticket_code']; ?>", 
+            reprintImgs,
+            <?php echo json_encode($reprint_data); ?>
+        );
+        jQuery('#print-area').html(finalHTML);
+        setTimeout(() => { window.print(); }, 1500);
+    });
+    <?php endif; ?>
+
+    // ----------------------------------------------------------------------
+    // UI Interaction Functions (RENAMED TO dnc_*)
+    // ----------------------------------------------------------------------
+    
+    // New Function: Select Card Logic
+    function dnc_select_card(element, id, imgUrl, model, sn) {
+        // Remove active class from all
+        document.querySelectorAll('.d-item-card').forEach(el => el.classList.remove('active'));
+        
+        // Add active class to clicked
+        element.classList.add('active');
+        
+        // Update Hidden Input
+        document.getElementById('pid').value = id;
+        
+        // Legacy Support: Update the hidden detail box if needed by other scripts
+        var viewImg = document.getElementById('view-img');
+        if(viewImg) viewImg.src = imgUrl;
+        
+        var viewModel = document.getElementById('view-model');
+        if(viewModel) viewModel.innerText = model;
+        
+        var viewSn = document.getElementById('view-sn');
+        if(viewSn) viewSn.innerText = sn;
+        
+        // Trigger Reveal Animation & Auto-Scroll
+        var nextSec = document.getElementById('sec-problem');
+        nextSec.classList.add('visible');
+        
+        // [SMART UX] Scroll to next section smoothly
+        setTimeout(() => {
+            nextSec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 300);
+    }
+
+    function dnc_select_problem(el, val) { 
+        document.querySelectorAll('.d-prob-item').forEach(i=>i.classList.remove('selected')); 
+        el.classList.add('selected'); 
+        document.getElementById('prob').value=val; 
+        
+        var isPartsRequest = ['5','6','7'].includes(val);
+        var isRepair = !isPartsRequest; 
+        
+        document.getElementById('opt-repair').style.display = isRepair ? 'block' : 'none'; 
+        document.getElementById('opt-parts').style.display = isPartsRequest ? 'block' : 'none'; 
+        
+        var nextSec = document.getElementById('sec-shipping');
+        nextSec.classList.add('visible');
+        
+        // [SMART UX] Scroll to next section
+        setTimeout(() => {
+            nextSec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 300);
+    }
+
+    function dnc_set_sender(val, el) { 
+        // Remove active class from all cards
+        document.querySelectorAll('.d-radio-card').forEach(i => i.classList.remove('active')); 
+        // Add active to clicked card
+        el.classList.add('active'); 
+        // Set Value
+        document.getElementById('sender_type').value = val; 
+        
+        // Show Dealer Select if Dealer
+        if(val === 'dealer') {
+            document.getElementById('opt-dealer-select').style.display = 'block';
+            setTimeout(() => {
+                document.getElementById('opt-dealer-select').scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 200);
+        } else {
+            document.getElementById('opt-dealer-select').style.display = 'none';
+            document.getElementById('dealer_name').value = ''; // Reset
+            document.querySelectorAll('.d-dealer-card').forEach(c => c.classList.remove('active'));
+            // Reset return to customer default
+            dnc_set_return('customer', document.querySelector('#opt-return-dest .d-radio-card:first-child'));
+        }
+    }
+    
+    function dnc_select_dealer(el, name) {
+        document.querySelectorAll('.d-dealer-card').forEach(c => c.classList.remove('active'));
+        el.classList.add('active');
+        document.getElementById('dealer_name').value = name;
+
+        // Show Return Destination Option
+        var returnOpt = document.getElementById('opt-return-dest');
+        if(returnOpt) {
+             returnOpt.style.display = 'block'; // Make sure it's visible
+             setTimeout(() => {
+                returnOpt.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }, 300);
+        }
+    }
+    
+    function dnc_set_return(val, el) {
+        var group = el.closest('.d-radio-group');
+        group.querySelectorAll('.d-radio-card').forEach(c => c.classList.remove('active'));
+        el.classList.add('active');
+        document.getElementById('return_to').value = val;
+    }
+    
+    function dnc_file_check(input) { 
+        if(input.files && input.files[0]){
+            input.parentElement.classList.add('has-file'); 
+            var icon = input.parentElement.querySelector('i');
+            if(icon) {
+                icon.className = 'fa-solid fa-circle-check'; 
+                icon.style.color = '#06C755';
+            }
+        }
+    }
+    
+    function dnc_preview_defect(input) { 
+        if(input.files && input.files[0]){
+            dnc_file_check(input);
+            var reader=new FileReader(); 
+            reader.onload=function(e){document.getElementById('temp_defect_img_url').value=e.target.result;}; 
+            reader.readAsDataURL(input.files[0]);
+        } 
+    }
+    
+    function dnc_go_step(n) { 
+        if(n==3) {
+            // [LOGIC] Update Address based on Return To selection before showing Step 3
+            var returnTo = document.getElementById('return_to').value;
+            var dealerName = document.getElementById('dealer_name').value;
+            var addrField = document.getElementById('uaddr_edit');
+            var originalAddr = document.getElementById('original_addr').value;
+
+            if (returnTo === 'dealer' && dealerName) {
+                addrField.value = "จัดส่งคืนที่: ร้าน " + dealerName + "\n(ที่อยู่ตามฐานข้อมูลตัวแทนจำหน่าย)";
+                addrField.readOnly = true;
+                addrField.style.backgroundColor = "#f0fdf4";
+                addrField.style.color = "#065f46";
+                addrField.style.fontWeight = "bold";
+            } else {
+                // Restore original customer address
+                addrField.value = originalAddr;
+                addrField.readOnly = false;
+                addrField.style.backgroundColor = "#f8fafc";
+                addrField.style.color = "#333";
+                addrField.style.fontWeight = "normal";
+            }
+        }
+
+        if(n==2){
+            if(!jQuery('#pid').val()){alert('กรุณาเลือกทรัพย์สินที่ต้องการแจ้งซ่อม'); return;} 
+            if(!jQuery('#prob').val()){alert('กรุณาระบุปัญหาที่พบ'); return;}
+            
+            var probVal = jQuery('#prob').val();
+            if(['5','6','7'].includes(probVal)) {
+                if(!jQuery('#cust_note_parts').val().trim()) {
+                    alert('กรุณาระบุรายละเอียดชิ้นส่วนหรือสติ๊กเกอร์ที่ต้องการ');
+                    return;
+                }
+            } else {
+                // Validate Dealer Selection
+                var sender = jQuery('#sender_type').val();
+                if(sender === 'dealer' && !jQuery('#dealer_name').val()) {
+                    alert('กรุณาเลือกตัวแทนจำหน่ายที่ท่านฝากส่งสินค้า');
+                    return;
+                }
+            }
+        } 
+        document.querySelectorAll('.d-step-dot').forEach((d,i)=>{d.className = i<n-1?'d-step-dot completed':(i==n-1?'d-step-dot active':'d-step-dot');}); 
+        document.querySelectorAll('.d-step-content').forEach(c=>c.classList.remove('active')); 
+        document.getElementById('step'+n).classList.add('active'); 
+        window.scrollTo(0,0); 
+    }
+
+    function dnc_validate_images_next() {
+        const requiredFiles = ['img_front', 'img_back', 'img_left', 'img_right', 'img_defect'];
+        let missing = [];
+        requiredFiles.forEach(name => {
+            let input = document.querySelector(`input[name="${name}"]`);
+            if(!input || !input.files || !input.files[0]) missing.push(name);
+        });
+
+        if(missing.length > 0) {
+            alert('กรุณาอัปโหลดรูปภาพให้ครบทั้ง 5 รูป (ที่มีเครื่องหมาย *) เพื่อการประเมินที่แม่นยำ');
+            return;
+        }
+        dnc_go_step(3);
+    }
+
+    // ----------------------------------------------------------------------
+    // CLIENT SIDE COMPRESSION
+    // ----------------------------------------------------------------------
+    async function dnc_compress_img(file) {
+        return new Promise((resolve) => {
+            const maxWidth = 1000; // Reduced for <300KB Target
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = (event) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    let width = img.width;
+                    let height = img.height;
+                    
+                    if (width > maxWidth) {
+                        height *= maxWidth / width;
+                        width = maxWidth;
+                    }
+                    
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+                    
+                    canvas.toBlob((blob) => {
+                        resolve({ blob: blob, name: file.name });
+                    }, 'image/jpeg', 0.6); // Reduced Quality for <300KB
+                };
+                img.onerror = () => {
+                    alert('❌ ไฟล์รูปภาพเสียหายหรือไม่รองรับ (โปรดใช้ .jpg หรือ .png)');
+                    resolve({ blob: null, name: file.name, error: true }); // Handle error downstream
+                };
+                img.src = event.target.result;
+            };
+        });
+    }
+
+    // ----------------------------------------------------------------------
+    // SUBMIT HANDLER
+    // ----------------------------------------------------------------------
+    async function dnc_submit_claim_form() {
+        if(isSubmitting) return; 
+        if(!confirm('ยืนยันข้อมูลการแจ้งเคลม?')) return;
+        
+        isSubmitting = true; 
+        jQuery('#finalSubBtn').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> กำลังประมวลผล...');
+        jQuery('#loading-overlay').css('display', 'flex').hide().fadeIn();
+
+        var fd = new FormData();
+        var form = document.getElementById('claimForm');
+        
+        fd.append('dinoco_action', 'submit_claim');
+        fd.append('dinoco_nonce', '<?php echo wp_create_nonce("dinoco_claim_submit"); ?>');
+        fd.append('product_id', jQuery('#pid').val());
+        fd.append('problem_type', jQuery('#prob').val());
+        fd.append('sender_type', jQuery('#sender_type').val());
+        fd.append('dealer_name', jQuery('#dealer_name').val()); // Pass Dealer
+        fd.append('return_to', jQuery('#return_to').val()); // Pass Return Choice
+        fd.append('addr_full', jQuery('#uaddr_edit').val());
+        fd.append('cust_note', jQuery('textarea[name="cust_note"]').val());
+        fd.append('cust_note_parts', jQuery('#cust_note_parts').val()); // Capture Parts Note
+        
+        // Add Honeypot value (Should be empty for real users)
+        fd.append('dinoco_honey', jQuery('input[name="dinoco_honey"]').val());
+
+        const fileInputs = ['img_front', 'img_back', 'img_left', 'img_right', 'img_defect'];
+        
+        try {
+            for (const inputName of fileInputs) {
+                const input = document.querySelector(`input[name="${inputName}"]`);
+                if (input && input.files && input.files[0]) {
+                    const compressed = await dnc_compress_img(input.files[0]);
+                    fd.append(inputName, compressed.blob, compressed.name);
+                }
+            }
+            
+            const response = await fetch(window.location.href, { method: 'POST', body: fd });
+            const d = await response.json();
+            
+            if(d.success) {
+                document.title = "DINOCO_CLAIM_" + d.data.ticket_code;
+                jQuery('#loading-overlay').hide();
+                jQuery('#form-container').hide();
+                jQuery('#succ-code').text(d.data.ticket_code);
+                jQuery('#success-view').show();
+                
+                // --- Check Type for PDF Generation ---
+                if (d.data.type === 'parts') {
+                    // Parts -> NO PDF, NO PRINT
+                    jQuery('#print-section').hide();
+                    jQuery('#btn-print-pdf').hide();
+                    jQuery('#text-print-warning').hide();
+                    jQuery('#print-area').empty();
+                } else {
+                    // Repair -> Generate PDF
+                    jQuery('#print-section').show(); 
+                    
+                    var finalHTML = dnc_claim_gen_doc_html(d.data.ticket_code, d.data.images, d.data.sender_type, d.data.dealer_name, d.data.return_to);
+                    jQuery('#print-area').html(finalHTML);
+                    window.scrollTo(0,0);
+                    setTimeout(() => { window.print(); }, 1500);
+                }
+                
+            } else {
+                throw new Error(d.data.message || 'Unknown Error');
+            }
+            
+        } catch (e) {
+            jQuery('#loading-overlay').hide();
+            alert('Error: ' + e.message);
+            jQuery('#finalSubBtn').prop('disabled',false).html('ยืนยันแจ้งเรื่อง');
+            isSubmitting = false;
+        }
+    }
+    
+    // ----------------------------------------------------------------------
+    // PDF GENERATOR FUNCTIONS (Secured with escapeHtml)
+    // ----------------------------------------------------------------------
+    function dnc_claim_gen_doc_html(code, images, senderType, dealerName, returnTo) {
+        // Determine note to show based on visible textarea
+        var activeNote = '';
+        if(jQuery('#opt-parts').is(':visible')) {
+            activeNote = jQuery('#cust_note_parts').val();
+        } else {
+            activeNote = jQuery('textarea[name="cust_note"]').val();
+        }
+        
+        // IMPORTANT FIX: Get original address to ensure Page 4 is correct, regardless of what UI shows in Step 3
+        var rawAddr = jQuery('#original_addr').val();
+        if(!rawAddr) rawAddr = jQuery('#uaddr_edit').val(); // Fallback if backup fails
+
+        var data = {
+            u_name: jQuery('#uname').val(),
+            u_phone: jQuery('#uphone').val(),
+            u_addr: rawAddr, // Use RAW address for PDF generation logic (to handle Page 4 vs Page 5 difference)
+            cust_note: activeNote || '-',
+            // Read from hidden fields populated by card select
+            p_model: document.getElementById('view-model') ? document.getElementById('view-model').innerText : '-',
+            p_sn: document.getElementById('view-sn') ? document.getElementById('view-sn').innerText : '-',
+            p_sku: '-', 
+            prob: jQuery('.d-prob-item.selected span').text().replace(/\n/g, ' '),
+            sender_type: senderType || jQuery('#sender_type').val(),
+            dealer_name: dealerName || jQuery('#dealer_name').val(),
+            return_to: returnTo || jQuery('#return_to').val()
+        };
+        
+        return dnc_claim_gen_full_html(code, images, data);
+    }
+    
+    function dnc_claim_gen_doc_reprint(code, images, data) {
+        var stdData = {
+            u_name: data.cust_name,
+            u_phone: data.cust_phone,
+            u_addr: data.cust_addr,
+            cust_note: data.note,
+            p_model: data.p_model,
+            p_sn: data.p_sn,
+            p_sku: data.p_sku,
+            prob: data.prob,
+            sender_type: data.sender_type,
+            dealer_name: data.dealer_name,
+            return_to: data.return_to
+        };
+        return dnc_claim_gen_full_html(code, images, stdData);
+    }
+
+    function dnc_claim_gen_full_html(code, images, d) {
+        var date = new Date().toLocaleDateString('th-TH');
+        var logoUrl = "https://www.dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-pxou1gkonhphkw4peesozhjgbqhvyueyia1k904zxk.png";
+        var companyAddr = "<strong>บริษัท พีพีที กรุ๊ป คอร์ปอเรชั่น จํากัด</strong><br>21/106 ซอยลาดพร้าว 15 แขวงจอมพล เขตจตุจักร<br>กรุงเทพมหานคร 10900 (Tel. 061-639-9994)";
+        var companyFullAddr = "DINOCO SERVICE CENTER<br>บริษัท พีพีที กรุ๊ป คอร์ปอเรชั่น จํากัด<br>21/106 ซอยลาดพร้าว 15 เขตจตุจักร กทม. 10900<br>Tel. 061-639-9994";
+        
+        var imgDefect = images.img_defect || (document.getElementById('temp_defect_img_url') ? document.getElementById('temp_defect_img_url').value : '');
+        var imgFront = images.img_front || ''; 
+        var imgBack = images.img_back || ''; 
+        var imgLeft = images.img_left || ''; 
+        var imgRight = images.img_right || '';
+        
+        // Escape Data before injecting into HTML
+        var safeCode = escapeHtml(code);
+        var safeName = escapeHtml(d.u_name);
+        var safePhone = escapeHtml(d.u_phone);
+        var safeAddr = escapeHtml(d.u_addr);
+        var safeNote = escapeHtml(d.cust_note);
+        var safeModel = escapeHtml(d.p_model);
+        var safeSku = escapeHtml(d.p_sku);
+        var safeSn = escapeHtml(d.p_sn);
+        var safeProb = escapeHtml(d.prob);
+        var safeDealer = escapeHtml(d.dealer_name);
+        var returnTo = d.return_to; // 'customer' or 'dealer'
+
+        var qrCodeImg = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${safeSn}`;
+        
+        // Logic for Sender Name on Label (Page 4 - Send TO Company)
+        var senderLabelName = safeName;
+        var senderLabelNote = "";
+        if(d.sender_type === 'dealer' && safeDealer) {
+            senderLabelName = safeDealer; // Show Dealer Name as Sender
+            senderLabelNote = "(ส่งแทนลูกค้า: " + safeName + ")";
+        }
+
+        // Logic for Receiver Name on Label (Page 5 - Return FROM Company)
+        var receiverLabelName = safeName;
+        var receiverLabelAddr = safeAddr;
+        var receiverLabelTel = safePhone;
+        var p5_FooterRight = ""; // Initialize footer variable
+
+        if(returnTo === 'dealer' && safeDealer) {
+            receiverLabelName = "ตัวแทนจำหน่าย: " + safeDealer;
+            // Create dotted lines for address
+            receiverLabelAddr = '<div style="border:2px dashed #ccc; height:100px; margin-top:10px; display:flex; align-items:center; justify-content:center; color:#ccc;">(พื้นที่สำหรับติดที่อยู่ตัวแทนจำหน่าย)</div>'; 
+            receiverLabelTel = ""; // Hide Customer Tel on main area as per request "ซ่อนเบอร์ลูกค้า"
+            
+            p5_FooterRight = "ลูกค้าเจ้าของสินค้า: " + safeName; // Set Footer
+        } else {
+            // Customer Return
+            // Keep default values
+            p5_FooterRight = ""; // Clear for customer return
+        }
+
+        var header = (t) => `
+            <div class="p-header-top">
+                <img src="${logoUrl}" class="p-logo">
+                <div class="p-company">${companyAddr}</div>
+            </div>
+            <div class="p-divider"></div>
+            <div class="p-doc-info">
+                <div style="width:200px;">วันที่: ${date}</div>
+                <div class="p-title-center">${t}</div>
+                <div style="width:200px; text-align:right;">เลขที่: ${safeCode}</div>
+            </div>
+        `;
+        
+        var info = `
+            <div class="p-info-grid">
+                <div class="p-info-box">
+                    <div class="p-info-header">ข้อมูลลูกค้า</div>
+                    <div class="p-info-content">
+                        <b>ชื่อ:</b> ${safeName}<br>
+                        <b>โทร:</b> ${safePhone}<br>
+                        <b>ที่อยู่:</b> ${safeAddr}
+                    </div>
+                </div>
+                <div class="p-info-box">
+                    <div class="p-info-header">ข้อมูลสินค้า</div>
+                    <div class="p-info-content">
+                        <b>รุ่น:</b> ${safeModel}<br>
+                        <b>SKU:</b> ${safeSku}<br>
+                        <b>S/N:</b> ${safeSn}
+                        <img src="${qrCodeImg}" class="sn-qr">
+                    </div>
+                </div>
+            </div>
+            <div class="p-problem-box">
+                 <div class="p-problem-header-inline">อาการ: ${safeProb} | เพิ่มเติม:</div>
+                 <div class="p-problem-content">${safeNote} ${safeDealer ? '<br><b>[ฝากตัวแทนส่ง: '+safeDealer+']</b>' : ''} ${returnTo === 'dealer' ? '<br><b>[ส่งคืนที่: ร้านตัวแทนจำหน่าย]</b>' : ''}</div>
+            </div>
+        `;
+
+        var buildGrid = (cls) => `
+            <div class="p-img-container ${cls}">
+                <div class="p-img-left">
+                    ${imgDefect ? `<img src="${imgDefect}" class="p-img-obj">`:''}
+                    <div class="p-img-label">จุดที่ชำรุด</div>
+                </div>
+                <div class="p-img-right">
+                    <div class="p-img-sub">
+                        ${imgFront ? `<img src="${imgFront}" class="p-img-obj">`:''}
+                        <div class="p-img-label">หน้า</div>
+                    </div>
+                    <div class="p-img-sub">
+                        ${imgBack ? `<img src="${imgBack}" class="p-img-obj">`:''}
+                        <div class="p-img-label">หลัง</div>
+                    </div>
+                    <div class="p-img-sub">
+                        ${imgLeft ? `<img src="${imgLeft}" class="p-img-obj">`:''}
+                        <div class="p-img-label">ซ้าย</div>
+                    </div>
+                    <div class="p-img-sub">
+                        ${imgRight ? `<img src="${imgRight}" class="p-img-obj">`:''}
+                        <div class="p-img-label">ขวา</div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        // Function to create Page 1 (To reuse for Dealer Copy)
+        var createPage1 = (titleText) => `
+        <div class="a4-page"><div class="safe-area">${header(titleText)}${info}${buildGrid('')}
+            <div class="p-warning">* ระยะเวลาซ่อม 45-60 วัน ติดตามสถานะซ่อมในระบบ หากเสร็จเร็วกว่าบริษัทจะดำเนินการจัดส่งกลับทันที *</div>
+            <div class="p-signatures">
+                <div class="p-sign-col">
+                    <span class="p-sign-auto" style="font-size:18px;">${safeName}</span>
+                    <div class="p-sign-lbl">ลงชื่อลูกค้า<br>วันที่ ${date} (Auto Signed)</div>
+                </div>
+                <div class="p-sign-col">
+                    <span class="p-sign-auto" style="font-size:18px;">DINOCO THAILAND</span>
+                    <div class="p-sign-lbl">ลงชื่อเจ้าหน้าที่<br>วันที่ ${date} (Auto Signed)</div>
+                </div>
+            </div>
+        </div></div>`;
+
+        // Start HTML Construction
+        var html = createPage1('ใบแจ้งซ่อมบำรุงสินค้า (ส่วนลูกค้า)');
+
+        // ** LOGIC: If Dealer Shipping -> Add Extra Page **
+        if(d.sender_type === 'dealer') {
+            html += createPage1('ใบแจ้งซ่อมบำรุงสินค้า (ส่วนสำหรับตัวแทนจำหน่าย)');
+        }
+        
+        // PAGE 2: Staff Copy 1 (Fixed Layout)
+        html += `<div class="a4-page"><div class="safe-area">${header('ใบสำหรับเจ้าหน้าที่บริษัท (1/2)')}${info}${buildGrid('p-page2')}
+            <div class="st-box-wrap">
+                <div class="st-header">2. การจำแนกประเภทงานซ่อม (Classification)</div>
+                <div class="st-content">
+                    <div class="st-row">
+                        <div style="width:50%;">
+                             <b>สาเหตุการส่งซ่อม (Root Cause):</b><br>
+                             <span class="st-chk-box"></span> ความบกพร่องจากสินค้า (Manufacturing Defect) [ฟรี/เปลี่ยนใหม่]<br>
+                             <span class="st-chk-box"></span> อุบัติเหตุ/การใช้งาน (Accident/User Fault) [มีค่าใช้จ่าย]
+                        </div>
+                        <div style="width:50%;">
+                             <b>ลักษณะสินค้า:</b><br>
+                             <span class="st-chk-box"></span> กันล้ม/แคชบาร์<br>
+                             <span class="st-chk-box"></span> กล่องอลูมิเนียม<br>
+                             <span class="st-chk-box"></span> แร็ค/ถาด
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="st-box-wrap">
+                <div class="st-header">3. ตรวจสอบสภาพรับเข้า (Inspection Checklist)</div>
+                <div class="st-content">
+                    <table class="st-grid-table">
+                        <tr>
+                            <td><b>โครงสร้าง:</b><br><span class="st-chk-box"></span> บิด/เบี้ยว<br><span class="st-chk-box"></span> บุบ/ยุบ<br><span class="st-chk-box"></span> หูยึดขาด</td>
+                            <td><b>ระบบล็อค:</b><br><span class="st-chk-box"></span> กุญแจไขไม่ได้<br><span class="st-chk-box"></span> ตัวล็อคหัก</td>
+                            <td><b>การกันน้ำ:</b><br><span class="st-chk-box"></span> น้ำเข้า<br><span class="st-chk-box"></span> ซีลเสื่อม</td>
+                            <td><b>ความสวยงาม:</b><br><span class="st-chk-box"></span> ถลอก<br><span class="st-chk-box"></span> สนิม</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+            <div class="st-box-wrap">
+                <div class="st-header">4. การดำเนินการซ่อม (Action Plan)</div>
+                <div class="st-content">
+                    <table class="st-grid-table">
+                        <tr>
+                            <td><b>งานโครงสร้าง:</b><br><span class="st-chk-box"></span> ดัดจัดทรง<br><span class="st-chk-box"></span> เคาะขึ้นรูป</td>
+                            <td><b>งานสี/ผิว:</b><br><span class="st-chk-box"></span> ทำความสะอาด<br><span class="st-chk-box"></span> ทำสีใหม่</td>
+                            <td><b>อะไหล่/ซีล:</b><br><span class="st-chk-box"></span> ยาแนวซิลิโคน<br><span class="st-chk-box"></span> เปลี่ยนมุม<br><span class="st-chk-box"></span> เปลี่ยนกุญแจ</td>
+                            <td><b>ตัดสินใจ:</b><br><span class="st-chk-box"></span> ซ่อมแซม<br><span class="st-chk-box"></span> เปลี่ยนตัวใหม่</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </div></div>`;
+        
+        // PAGE 3: Staff Copy 2 (Bill/QC) - 10 Lines
+        html += `<div class="a4-page"><div class="safe-area">${header('ใบสำหรับเจ้าหน้าที่บริษัท (2/2)')}
+            <div class="st-box-wrap" style="margin-top:5px;"><div class="st-header">5. รายการอะไหล่และค่าบริการ (Parts & Service Bill)</div>
+                <table class="bill-table">
+                    <tr><th width="10%">#</th><th width="40%">รายการ (Description)</th><th width="10%">จำนวน</th><th width="15%">ราคา/หน่วย</th><th width="25%">ส่วนลด (Warranty)</th></tr>
+                    ${[1,2,3,4,5,6,7,8,9,10].map(i=>`<tr><td style="text-align:center;">${i}</td><td></td><td></td><td></td><td></td></tr>`).join('')}
+                    <tr><td colspan="3" style="text-align:right;"><strong>รวมเงิน (Total)</strong></td><td></td><td></td></tr>
+                </table>
+            </div>
+            <div class="st-box-wrap"><div class="st-header">6. การตรวจสอบคุณภาพก่อนส่งคืน (QC Checklist)</div>
+                <table class="qc-table"><tr><th width="50%">รายการทดสอบ</th><th width="50%">ผลการทดสอบ (Result)</th></tr><tr><td>Leak Test (ทดสอบการกันน้ำ)</td><td>[ ] ปกติ / ไม่พบน้ำซึม</td></tr><tr><td>Fitting Test (ทดสอบการติดตั้ง)</td><td>[ ] จุดยึดตรง / ใส่ได้ปกติ</td></tr><tr><td>Locking Test (กุญแจ/ตัวล็อค)</td><td>[ ] ล็อคแน่น / ไขคล่อง</td></tr><tr><td>Visual Check (ความเรียบร้อย)</td><td>[ ] สะอาด / เรียบร้อย</td></tr></table>
+            </div>
+            <div class="st-box-wrap"><div class="st-header">7. การส่งคืน (Delivery)</div>
+                <div class="st-chk-row" style="padding:10px;"><span class="st-chk-box"></span> ลูกค้ามารับเอง (Pick up)</div>
+                <div class="st-chk-row" style="padding:10px;"><span class="st-chk-box"></span> จัดส่งพัสดุ (Shipping) ระบุขนส่ง/Tracking: ...........................................</div>
+            </div>
+            <div class="page-3-footer">
+                <div class="p-signatures">
+                    <div class="p-sign-col">
+                        <div class="p-sign-manual-line"></div>
+                        <div class="p-sign-lbl">ลงชื่อช่างซ่อม (Technician)</div>
+                    </div>
+                    <div class="p-sign-col">
+                        <div class="p-sign-manual-line"></div>
+                        <div class="p-sign-lbl">ลงชื่อ QC / แอดมิน</div>
+                    </div>
+                </div>
+            </div>
+        </div></div>`;
+        
+        // PAGE 4: Label 1 (Customer/Dealer -> Company)
+        html += `<div class="a4-page"><div class="page-landscape-wrapper"><div class="label-border">
+            <div class="lbl-header">
+                <div>
+                    <div class="lbl-from-title">ผู้ส่ง (FROM):</div>
+                    <div class="lbl-from-box"><b>${senderLabelName}</b><br>${senderLabelNote}<br>${safeAddr}<br>Tel: ${safePhone}</div>
+                </div>
+                <img src="${logoUrl}" class="lbl-logo">
+            </div>
+            <div class="lbl-to-section">
+                <div class="lbl-to-title">ผู้รับ (TO)</div>
+                <div class="lbl-to-name">แผนกเคลมสินค้า DINOCO</div>
+                <div class="lbl-to-addr">บริษัท พีพีที กรุ๊ป คอร์ปอเรชั่น จํากัด<br>21/106 ซอยลาดพร้าว 15 แขวงจอมพล เขตจตุจักร กรุงเทพมหานคร 10900</div>
+                <div class="lbl-to-tel">Tel. 061-639-9994</div>
+            </div>
+            <div class="lbl-footer">
+                <div class="lbl-id">Ticket ID: ${safeCode} | อาการ: ${safeProb}</div>
+                <div>(เอกสารสำหรับปะหน้ากล่องส่งซ่อม)</div>
+            </div>
+        </div></div></div>`;
+
+        // PAGE 5: Label 2 (Company -> Customer/Dealer)
+        html += `<div class="a4-page"><div class="page-landscape-wrapper"><div class="label-border">
+            <div class="lbl-header">
+                <div>
+                    <div class="lbl-from-title">ผู้ส่ง (FROM):</div>
+                    <div class="lbl-from-box"><b>DINOCO SERVICE CENTER</b><br>บริษัท พีพีที กรุ๊ป คอร์ปอเรชั่น จํากัด<br>21/106 ซอยลาดพร้าว 15 เขตจตุจักร กทม. 10900<br>Tel. 061-639-9994</div>
+                </div>
+            </div>
+            
+            <div class="lbl-to-group">
+                <img src="${logoUrl}" class="lbl-logo-big">
+                <div class="lbl-to-section">
+                    <div class="lbl-to-title">ผู้รับ (TO)</div>
+                    <div class="lbl-to-name">${receiverLabelName}</div>
+                    <div class="lbl-to-addr">${receiverLabelAddr}</div>
+                    <div class="lbl-to-tel">${receiverLabelTel}</div>
+                </div>
+            </div>
+
+            <div class="lbl-red-vertical-right"><div class="lbl-red-box-text">สำหรับเจ้าหน้าที่ส่งคืน (แนบไปกับสินค้า)</div></div>
+            <div class="lbl-footer">
+                <div class="lbl-id">Ticket ID: ${safeCode}</div>
+                <div style="font-weight:bold; font-size:16px;">${p5_FooterRight}</div>
+            </div>
+        </div></div></div>`;
+
+        return html;
+    }
+    </script>
+    <?php
+    return ob_get_clean();
+}
