@@ -1,0 +1,3136 @@
+/*
+ * Plugin Name: [Module] DINOCO Service Center & Claims (Super Force UI - CLOUD FIX)
+ * Description: ระบบบริหารจัดการงานเคลม (Updated: Version 11.33 - Cloud Cache Fix & Init Priority)
+ * Version: 11.33
+ * Author: DINOCO Senior Architect
+ */
+
+// ==============================================================================
+// 0. AUTO-CLOSE LOGIC (Runs on Admin Init)
+// ==============================================================================
+add_action('admin_init', 'dinoco_daily_auto_close_tickets');
+
+function dinoco_daily_auto_close_tickets() {
+    
+    // Check tickets that are 'Shipped' for more than 30 days
+    // Only PCLM (Replacement Shipped) is processed here.
+    
+    $target_statuses = [
+        'Replacement Shipped'        // PCLM Only
+    ];
+    
+    $args = [
+        'post_type'      => 'claim_ticket',
+        'posts_per_page' => 50, // Process 50 items per load to avoid timeout
+        'post_status'    => ['publish', 'private'], // [PATCH] Include Private posts
+        'meta_query'     => [
+            [
+                'key'     => 'ticket_status',
+                'value'   => $target_statuses,
+                'compare' => 'IN'
+            ],
+            [
+                'key'     => 'status_last_updated',
+                'value'   => date('Y-m-d H:i:s', strtotime('-30 days')),
+                'compare' => '<', // Older than 30 days
+                'type'    => 'DATETIME'
+            ]
+        ]
+    ];
+
+    $query = new WP_Query($args);
+
+    if ($query->have_posts()) {
+        while ($query->have_posts()) {
+            $query->the_post();
+            $pid = get_the_ID();
+            
+            // --- LOGIC FOR PCLM AUTO CLOSE ---
+            // Revert w_status for Serial Number if it's PCLM
+            $condition = get_field('claim_condition', $pid);
+            if ($condition === 'send_part') {
+                $sn_code = get_field('snapshot_serial_code', $pid);
+                $snap_group = get_field('shipping_snap', $pid);
+                // Retrieve original w_status from snapshot
+                $original_w_status = isset($snap_group['snapshot_w_status']) ? $snap_group['snapshot_w_status'] : '';
+                
+                // [FIX] Map Thai Label back to English Key
+                $w_map_reverse = [
+                    'สามารถลงทะเบียนรับประกันได้'            => 'warranty_available',
+                    'รอตรวจสอบประกัน ติดต่อแอดมิน'          => 'warranty_pending',
+                    'ระบบประกันเก่าไม่สามารถเช็คการซ่อมได้' => 'old_warranty',
+                    'รับประกันสินค้าสินค้าใหม่สภาพสมบูรณ์'  => 'warranty_on',
+                    'ผ่านการซ่อมบำรุง'                       => 'repaired',
+                    'สภาพพร้อมใช้งาน'                        => 'refurbished',
+                    'ดัดแปลงสภาพ'                            => 'modified',
+                    'อยู่ระหว่างดำเนินการซ่อมบำรุง'          => 'claim_process'
+                ];
+                
+                $target_w_status = isset($w_map_reverse[$original_w_status]) ? $w_map_reverse[$original_w_status] : $original_w_status;
+                
+                if ($sn_code && $target_w_status) {
+                    // Find SN Post
+                    $sn_posts = get_posts([
+                        'post_type' => 'serial_number',
+                        'meta_key'  => 'serial_code',
+                        'meta_value'=> $sn_code,
+                        'posts_per_page' => 1,
+                        'fields' => 'ids'
+                    ]);
+                    
+                    if (!empty($sn_posts)) {
+                        // Revert Status with CORRECT KEY
+                        update_field('w_status', $target_w_status, $sn_posts[0]);
+                    }
+                }
+            }
+
+            // Auto Update to 'Maintenance Completed'
+            update_field('ticket_status', 'Maintenance Completed', $pid);
+            
+            // Add Log
+            $current_note = get_field('admin_internal_note', $pid);
+            $log          = "📅 [" . current_time('d/m/Y H:i') . "] System: Auto-closed after 30 days (PCLM).";
+            
+            update_field('admin_internal_note', $log . "\n" . $current_note, $pid);
+            
+            // Update Timestamp
+            update_field('status_last_updated', current_time('Y-m-d H:i:s'), $pid);
+        }
+        wp_reset_postdata();
+    }
+}
+
+// ==============================================================================
+// 1. BACKEND HOOKS & LOGIC
+// ==============================================================================
+
+/**
+ * Hook: Auto-log status changes & Update Timestamp
+ * Trigger: whenever 'ticket_status' ACF field is updated
+ */
+add_filter('acf/update_value/name=ticket_status', 'dinoco_handle_status_change_hook', 20, 3);
+
+function dinoco_handle_status_change_hook($new_value, $post_id, $field) {
+    
+    // 1. Get the previous value from Database before it's overwritten
+    $old_value = get_field('ticket_status', $post_id);
+
+    // Only proceed if the status implies a real change
+    if ($old_value !== $new_value && !empty($old_value)) {
+        
+        // --- LOGGING LOGIC ---
+        $timestamp = current_time('d/m/Y H:i');
+        $log_entry = "📅 [{$timestamp}] Status: {$old_value} -> {$new_value}";
+
+        // Get current note content
+        $current_note = get_field('admin_internal_note', $post_id);
+        
+        // Prepend log (New Log + New Line + Old Content)
+        $updated_note = $log_entry . "\n" . $current_note;
+
+        // Update the Note Field
+        update_field('admin_internal_note', $updated_note, $post_id);
+
+        // --- TIMESTAMP LOGIC ---
+        // Programmatically update 'status_last_updated' with current MySQL time
+        $current_datetime = current_time('Y-m-d H:i:s');
+        update_field('status_last_updated', $current_datetime, $post_id);
+    }
+
+    // Return new value to continue standard saving process
+    return $new_value;
+}
+
+// ==============================================================================
+// 2. AJAX HANDLER (CLOUD FIX APPLIED)
+// ==============================================================================
+/* [FIX] Add Priority 20 to Init Hook */
+add_action('init', function() {
+    
+    // Check if we are handling our specific module action
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['dinoco_claims_module_action'])) {
+        
+        // Clean buffer to ensure valid JSON
+        if (ob_get_length()) {
+            ob_clean();
+        }
+        
+        error_reporting(0);
+        
+        /* [FIX] Add No-Cache Headers */
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+            header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+            header("Cache-Control: post-check=0, pre-check=0", false);
+            header("Pragma: no-cache");
+            header("Expires: Sat, 26 Jul 1997 05:00:00 GMT"); 
+        }
+        
+        $action = $_POST['dinoco_claims_module_action'];
+
+        // --- CONFIGURATION: MAPPINGS ---
+        $PROBLEM_MAP = [
+            '1' => 'ซ่อมสีกันล้ม',
+            '2' => 'ซ่อมโครงสร้าง',
+            '3' => 'เปลี่ยนอะไหล่กล่อง',
+            '4' => 'ซ่อมโครงสร้างกล่อง',
+            '5' => 'เคลมประกับข้าง (อะไหล่)',
+            '6' => 'เคลมสติ้กเกอร์ (อะไหล่)'
+        ];
+
+        // 2. Status Configuration (Backend Badges)
+        $STATUS_CONFIG = [
+            'Registered in System' => [
+                'label' => 'แจ้งเข้าระบบ', 
+                'class' => 'bg-gray-100 text-gray-600 border-gray-200'
+            ],
+            'Awaiting Customer Shipment' => [
+                'label' => 'ลูกค้าส่งของ', 
+                'class' => 'bg-yellow-50 text-yellow-700 border-yellow-200'
+            ], 
+            'In Transit to Company' => [
+                'label' => 'รอรับของ', 
+                'class' => 'bg-blue-50 text-blue-700 border-blue-200'
+            ], 
+            'Received at Company' => [
+                'label' => 'รับของแล้ว', 
+                'class' => 'bg-indigo-50 text-indigo-700 border-indigo-200'
+            ], 
+            'Under Maintenance' => [
+                'label' => 'กำลังซ่อม', 
+                'class' => 'bg-purple-50 text-purple-700 border-purple-200'
+            ], 
+            'Maintenance Completed' => [
+                'label' => 'สำเร็จ', 
+                'class' => 'bg-green-50 text-green-700 border-green-200'
+            ], 
+            'Repaired Item Dispatched' => [
+                'label' => 'ส่งสินค้าซ่อมบำรุงคืนให้ขนส่ง', 
+                'class' => 'bg-orange-50 text-orange-700 border-orange-200'
+            ],
+            'Pending Issue Verification' => [
+                'label' => 'รอตรวจสอบปัญหา', 
+                'class' => 'bg-orange-50 text-orange-700 border-orange-200'
+            ],
+            'Replacement Approved' => [
+                'label' => 'อนุมัติสินค้าทดแทนให้ลูกค้า', 
+                'class' => 'bg-blue-50 text-blue-700 border-blue-200'
+            ],
+            'Replacement Shipped' => [
+                'label' => 'ส่งพัสดุสินค้าทดแทนแล้ว', 
+                'class' => 'bg-green-50 text-green-700 border-green-200'
+            ],
+            'Replacement Rejected by Company' => [
+                'label' => 'บริษัทไม่อนุมัติสินค้าทดแทน', 
+                'class' => 'bg-red-50 text-red-700 border-red-200'
+            ]
+        ];
+
+        // --- HELPER: PRODUCT LOOKUP ---
+        $get_product_info = function($claim_id) {
+            $info = [
+                'name' => get_field('snapshot_product_model', $claim_id) ?: 'Unknown Model', 
+                'sku'  => get_field('snapshot_product_sku', $claim_id) ?: '-', 
+                'sn'   => get_field('snapshot_serial_code', $claim_id) ?: '-'
+            ];
+            return $info;
+        };
+
+        // --- [NEW FEATURE] ACTION 0: REFRESH DASHBOARD UI ---
+        // This returns the HTML for the top 2 columns (PCLM & CLM)
+        if ($action === 'refresh_dashboard_ui') {
+            header('Content-Type: text/html; charset=utf-8');
+            echo render_dinoco_command_center();
+            exit;
+        }
+
+        // --- ACTION 1: GET LIST ---
+        if ($action === 'get_claims_list') {
+            
+            $args = [
+                'post_type'           => 'claim_ticket',
+                'posts_per_page'      => -1, // [PATCH] Set to -1 to get ALL items
+                'post_status'         => ['publish', 'private'], // [PATCH] Include Private posts
+                'orderby'             => 'modified',
+                'order'               => 'DESC',
+                'ignore_sticky_posts' => true
+            ];
+
+            // [NEW] Search Functionality
+            if (!empty($_POST['search_kw'])) {
+                $kw = sanitize_text_field($_POST['search_kw']);
+                $args['meta_query'][] = [
+                    'relation' => 'OR',
+                    [
+                        'key'     => 'ticket_sn_text', 
+                        'value'   => $kw, 
+                        'compare' => 'LIKE'
+                    ],
+                    [
+                        'key'     => 'snapshot_serial_code', 
+                        'value'   => $kw, 
+                        'compare' => 'LIKE'
+                    ],
+                    [
+                        'key'     => 'snapshot_product_model', 
+                        'value'   => $kw, 
+                        'compare' => 'LIKE'
+                    ]
+                ];
+            }
+
+            $status_filter = isset($_POST['status_filter']) ? sanitize_text_field($_POST['status_filter']) : 'all';
+            
+            // Updated Filter Logic
+            if ($status_filter === 'action_required') {
+                $args['meta_query'][] = [
+                    'key'     => 'ticket_status', 
+                    'value'   => ['Registered in System', 'In Transit to Company', 'Received at Company', 'Pending Issue Verification', 'Under Maintenance'], 
+                    'compare' => 'IN'
+                ];
+            } elseif ($status_filter === 'completed') {
+                $args['meta_query'][] = [
+                    'key'     => 'ticket_status', 
+                    'value'   => ['Maintenance Completed', 'Replacement Shipped', 'Replacement Rejected by Company', 'Repaired Item Dispatched'], 
+                    'compare' => 'IN'
+                ];
+            } elseif ($status_filter !== 'all') {
+                if ($status_filter === 'incoming') {
+                    $args['meta_query'][] = [
+                        'key'     => 'ticket_status', 
+                        'value'   => ['Registered in System', 'Awaiting Customer Shipment', 'In Transit to Company'], 
+                        'compare' => 'IN'
+                    ];
+                } elseif ($status_filter === 'processing') {
+                    $args['meta_query'][] = [
+                        'key'     => 'ticket_status', 
+                        'value'   => ['Received at Company', 'Under Maintenance', 'Pending Issue Verification', 'Repaired Item Dispatched'], 
+                        'compare' => 'IN'
+                    ];
+                }
+            }
+
+            $query = new WP_Query($args);
+            $list_data = [];
+            $counts = ['action' => 0, 'total' => 0];
+
+            if ($query->have_posts()) {
+                while ($query->have_posts()) {
+                    $query->the_post();
+                    $tid = get_the_ID();
+                    
+                    $status_key = get_field('ticket_status');
+                    $condition  = get_field('claim_condition');
+                    $prob_key   = get_field('problem_type');
+                    $prod_info  = $get_product_info($tid);
+
+                    if (in_array($status_key, ['In Transit to Company', 'Received at Company', 'Pending Issue Verification', 'Under Maintenance'])) {
+                        $counts['action']++;
+                    }
+
+                    $t_code = get_field('ticket_sn_text');
+                    $display_code = $t_code ? $t_code : '#'.$tid;
+
+                    // [PATCH] Customer Name Logic
+                    $customer_name_display = '-';
+                    $snap_group = get_field('shipping_snap', $tid);
+
+                    if ($snap_group && is_array($snap_group)) {
+                        if (!empty($snap_group['name'])) {
+                            $customer_name_display = $snap_group['name'];
+                        } elseif (!empty($snap_group['snapshot_name'])) {
+                            $customer_name_display = $snap_group['snapshot_name'];
+                        }
+                    }
+
+                    if ($customer_name_display === '-' || empty($customer_name_display)) {
+                        $user_obj = get_field('ref_user_id');
+                        if($user_obj) {
+                            $u = is_object($user_obj) ? $user_obj : get_userdata($user_obj);
+                            if($u) {
+                                $customer_name_display = $u->display_name;
+                            }
+                        }
+                    }
+                    
+                    // [PATCH] Get Tracking Inbound for Display
+                    $track_in = get_field('tracking_inbound', $tid);
+
+                    $list_data[] = [
+                        'id'          => $tid,
+                        'code'        => $display_code,
+                        'date'        => get_the_date('d/m/Y'),
+                        'product'     => $prod_info['name'],
+                        'sku'         => $prod_info['sku'], 
+                        'sn'          => $prod_info['sn'],
+                        'status_key'  => $status_key,
+                        'status_info' => $STATUS_CONFIG[$status_key] ?? ['label'=>$status_key, 'class'=>'bg-gray-100 text-gray-500'],
+                        'condition'   => $condition,
+                        'problem'     => $PROBLEM_MAP[$prob_key] ?? '-',
+                        'user'        => $customer_name_display,
+                        'track_in'    => $track_in 
+                    ];
+                }
+                wp_reset_postdata();
+            }
+            
+            // [PATCH] Calculate Total from actual Data Array
+            $counts['total'] = count($list_data);
+            
+            echo json_encode([
+                'success' => true, 
+                'data'    => $list_data, 
+                'stats'   => $counts
+            ]);
+            exit;
+        }
+
+        // --- [FEATURE] ACTION 1.5: GET PARTS CHOICES FROM ACF (parts_selected) ---
+        if ($action === 'get_parts_choices') {
+            
+            $choices = [];
+            
+            // 1. Try to get real choices from ACF
+            if (function_exists('acf_get_field')) {
+                // IMPORTANT: Ensure you pass the correct FIELD NAME 'parts_selected'
+                $field = acf_get_field('admin_parts_selected');
+                
+                if ($field && isset($field['choices'])) {
+                    $choices = $field['choices'];
+                }
+            } 
+            
+            // 2. Fallback Choices if ACF is empty or not found (Safety Net)
+            if (empty($choices)) {
+                $choices = [
+                    'sticker_45l_1'  => '1. สติกเกอร์แถบข้าง 45L 1 ชุด (2แผ่น)',
+                    'sticker_38l_1'  => '2. สติกเกอร์แถบข้าง 38L 1 ชุด (2แผ่น)',
+                    'sticker_38l_2'  => '3. สติกเกอร์แถบข้าง 38L 1 ชุด (4แผ่น)',
+                    'sticker_hand'    => '4. สติกเกอร์การ์ดแฮนด์ 1 ชุด (2แผ่น)',
+                    'plate_nx500'     => '5. ประกับหน้า NX500 แบบเว้า 1 ชิ้น',
+                    'plate_dinoco_1'  => '6. ประกับ DINOCO 1 ชิ้น',
+                    'plate_dinoco_2'  => '7. ประกับ DINOCO 2 ชิ้น',
+                    'plate_dinoco_4'  => '8. ประกับ DINOCO 4 ชิ้น',
+                    'plate_dinoco_3'  => '9. ประกับ DINOCO 3 ชิ้น',
+                    'plate_dinoco_5'  => '10. ประกับ DINOCO 5 ชิ้น'
+                ];
+            }
+            
+            echo json_encode(['success' => true, 'choices' => $choices]);
+            exit;
+        }
+
+        // --- [FEATURE] ACTION 1.6: ADD CUSTOM PART TO ACF CHOICES PERMANENTLY ---
+        if ($action === 'add_custom_part_choice') {
+            
+            // Check permissions
+            if (!current_user_can('edit_posts')) {
+                echo json_encode(['success' => false, 'message' => 'Permission Denied']);
+                exit;
+            }
+
+            // [FIXED] Receive separate SKU and Name
+            $sku_input = isset($_POST['sku']) ? sanitize_text_field($_POST['sku']) : '';
+            $name_input = isset($_POST['name']) ? sanitize_text_field($_POST['name']) : '';
+            
+            if (empty($sku_input) || empty($name_input)) {
+                echo json_encode(['success' => false, 'message' => 'Missing SKU or Product Name']);
+                exit;
+            }
+
+            // Logic to parse "SKU : Name"
+            // Use SKU as KEY (Value), Use Name as LABEL
+            $value = sanitize_key($sku_input); // Ensure SKU is safe key
+            $label = $name_input;
+
+            // Update ACF Field Settings (Persistent Storage)
+            if (function_exists('acf_get_field') && function_exists('acf_update_field')) {
+                // Get the field object by name
+                $field = acf_get_field('admin_parts_selected');
+                
+                if ($field) {
+                    // Check if value already exists
+                    if (!isset($field['choices'][$value])) {
+                        // Append new choice
+                        $field['choices'][$value] = $label;
+                        
+                        // Save back to DB
+                        acf_update_field($field); 
+                        
+                        echo json_encode(['success' => true, 'value' => $value, 'label' => $label]);
+                    } else {
+                        // If key exists, maybe update label? For now, assume success if key exists.
+                        // Or return duplicate error
+                        echo json_encode(['success' => true, 'value' => $value, 'label' => $field['choices'][$value], 'message' => 'Item exists, used existing']);
+                    }
+                } else {
+                    echo json_encode(['success' => false, 'message' => 'ACF Field "admin_parts_selected" Not Found']);
+                }
+            } else {
+                echo json_encode(['success' => false, 'message' => 'ACF Functions Missing']);
+            }
+            exit;
+        }
+
+        // --- ACTION 2: GET DETAIL ---
+        if ($action === 'get_claim_detail') {
+            
+            $tid = intval($_POST['tid']);
+            
+            if (!$tid) { 
+                echo json_encode(['success' => false]); 
+                exit; 
+            }
+
+            $t_code = get_field('ticket_sn_text', $tid);
+            $display_code = $t_code ? $t_code : '#'.$tid;
+            
+            $status     = get_field('ticket_status', $tid);
+            $condition  = get_field('claim_condition', $tid);
+            $prob_key   = get_field('problem_type', $tid);
+            $prod_info  = $get_product_info($tid);
+
+            $customer_note = get_field('customer_note', $tid);
+            $parts_request = get_field('parts_request_details', $tid);
+
+            // [PATCH] Detail Customer Name
+            $customer_name_display = 'Guest';
+            $snap_group = get_field('shipping_snap', $tid);
+            
+            if ($snap_group && is_array($snap_group)) {
+                if (!empty($snap_group['name'])) {
+                    $customer_name_display = $snap_group['name'];
+                } elseif (!empty($snap_group['snapshot_name'])) {
+                    $customer_name_display = $snap_group['snapshot_name'];
+                }
+            }
+            if ($customer_name_display === 'Guest' || empty($customer_name_display)) {
+                $user_obj = get_field('ref_user_id', $tid);
+                if($user_obj) {
+                    $u = is_object($user_obj) ? $user_obj : get_userdata($user_obj);
+                    if($u) {
+                        $customer_name_display = $u->display_name;
+                    }
+                }
+            }
+
+            $ev_group = get_field('evidence_images', $tid);
+            $images = [];
+            if ($ev_group && is_array($ev_group)) {
+                $get_url = function($f) { 
+                    return is_array($f) ? $f['url'] : ($f ? wp_get_attachment_url($f) : ''); 
+                };
+                $images['main']   = $get_url($ev_group['img_defect']) ?: ($get_url($ev_group['img_front']) ?: '');
+                $images['defect'] = $get_url($ev_group['img_defect']);
+                $images['front']  = $get_url($ev_group['img_front']);
+                $images['back']   = $get_url($ev_group['img_back']);
+                $images['left']   = $get_url($ev_group['img_left']);
+                $images['right']  = $get_url($ev_group['img_right']);
+            }
+
+            $customer_info_snap = null;
+            if ($snap_group && is_array($snap_group)) {
+                $addr_parts = [];
+                if(!empty($snap_group['snapshot_addr_house_no'])) $addr_parts[] = $snap_group['snapshot_addr_house_no'];
+                if(!empty($snap_group['snapshot_addr_soi'])) $addr_parts[] = "ซ." . $snap_group['snapshot_addr_soi'];
+                if(!empty($snap_group['snapshot_addr_subdistrict'])) $addr_parts[] = "ต." . $snap_group['snapshot_addr_subdistrict'];
+                if(!empty($snap_group['snapshot_addr_district'])) $addr_parts[] = "อ." . $snap_group['snapshot_addr_district'];
+                if(!empty($snap_group['snapshot_addr_zip'])) $addr_parts[] = $snap_group['snapshot_addr_zip'];
+
+                $name_val = !empty($snap_group['name']) ? $snap_group['name'] : ($snap_group['snapshot_name'] ?: '-');
+
+                $customer_info_snap = [
+                    'name'    => $name_val,
+                    'phone'   => $snap_group['snapshot_phone_number'] ?: '-',
+                    'address' => !empty($addr_parts) ? implode(' ', $addr_parts) : '-'
+                ];
+            }
+
+            $data = [
+                'id'                  => $tid,
+                'code'                => $display_code,
+                'sn'                  => $prod_info['sn'],
+                'sku'                 => $prod_info['sku'],
+                'status'              => $status,
+                'status_label'        => $STATUS_CONFIG[$status]['label'] ?? $status,
+                'condition'           => $condition,
+                'product_name'        => $prod_info['name'],
+                'customer_name'       => $customer_name_display,
+                'customer_note'       => $customer_note,
+                'parts_request_details' => $parts_request,
+                'problem_text'        => $PROBLEM_MAP[$prob_key] ?? '-',
+                'images'              => $images,
+                'customer_info_snap'  => $customer_info_snap,
+                'track_in'            => get_field('tracking_inbound', $tid),
+                'track_out'           => get_field('tracking_outbound', $tid),
+                'courier'             => get_field('courier_name', $tid),
+                'note'                => get_field('admin_internal_note', $tid),
+                // [FEATURE] Return Approved Parts (Using correct key 'admin_parts_selected')
+                'approved_parts'      => get_field('admin_parts_selected', $tid)
+            ];
+            echo json_encode(['success' => true, 'data' => $data]);
+            exit;
+        }
+
+        // --- ACTION 3: UPDATE STATUS ---
+        if ($action === 'update_claim_status') {
+            
+            $tid = intval($_POST['tid']);
+            
+            if(isset($_POST['admin_note'])) {
+                update_field('admin_internal_note', sanitize_textarea_field($_POST['admin_note']), $tid);
+            }
+
+            if(!empty($_POST['status'])) {
+                $new_status = sanitize_text_field($_POST['status']);
+                update_field('ticket_status', $new_status, $tid);
+
+                // [UPDATE] Check if Completed AND check for special update parameters (w_status, repair_logs)
+                if ($new_status === 'Maintenance Completed') {
+                    $condition = get_field('claim_condition', $tid);
+                    $sn_code   = get_field('snapshot_serial_code', $tid);
+                    $sn_post_id = 0;
+
+                    // Find SN Post ID if needed
+                    if ($sn_code) {
+                        $sn_posts = get_posts([
+                            'post_type' => 'serial_number',
+                            'meta_key'  => 'serial_code',
+                            'meta_value'=> $sn_code,
+                            'posts_per_page' => 1,
+                            'fields' => 'ids'
+                        ]);
+                        if (!empty($sn_posts)) {
+                            $sn_post_id = $sn_posts[0];
+                        }
+                    }
+
+                    if ($sn_post_id) {
+                        // CASE 1: PCLM (Revert Status)
+                        if ($condition === 'send_part') {
+                            $snap_group = get_field('shipping_snap', $tid);
+                            $original_w = isset($snap_group['snapshot_w_status']) ? $snap_group['snapshot_w_status'] : '';
+                            
+                            // [FIX] Map Thai Label back to English Key for PCLM Revert
+                            $w_map_reverse = [
+                                'สามารถลงทะเบียนรับประกันได้'            => 'warranty_available',
+                                'รอตรวจสอบประกัน ติดต่อแอดมิน'          => 'warranty_pending',
+                                'ระบบประกันเก่าไม่สามารถเช็คการซ่อมได้' => 'old_warranty',
+                                'รับประกันสินค้าสินค้าใหม่สภาพสมบูรณ์'  => 'warranty_on',
+                                'ผ่านการซ่อมบำรุง'                       => 'repaired',
+                                'สภาพพร้อมใช้งาน'                        => 'refurbished',
+                                'ดัดแปลงสภาพ'                            => 'modified',
+                                'อยู่ระหว่างดำเนินการซ่อมบำรุง'          => 'claim_process'
+                            ];
+                            
+                            $target_w = isset($w_map_reverse[$original_w]) ? $w_map_reverse[$original_w] : $original_w;
+
+                            if ($target_w) {
+                                update_field('w_status', $target_w, $sn_post_id);
+                            }
+                        }
+                        // CASE 2: CLM (Update from Input)
+                        elseif ($condition === 'send_repair') {
+                            // Check if inputs provided via AJAX
+                            if (isset($_POST['w_status_update'])) {
+                                update_field('w_status', sanitize_text_field($_POST['w_status_update']), $sn_post_id);
+                            }
+                            if (isset($_POST['repair_logs_update']) && is_array($_POST['repair_logs_update'])) {
+                                // [UPDATE] Format logs as requested: D/M/Y : xxxxx
+                                // Remove Job Header
+                                
+                                $formatted_logs = [];
+                                $current_date_str = date('d/m/Y');
+                                
+                                foreach ($_POST['repair_logs_update'] as $log_item) {
+                                    $formatted_logs[] = "{$current_date_str} : {$log_item}";
+                                }
+                                
+                                // Join with newlines
+                                $logs_str = implode("\n", $formatted_logs); 
+                                
+                                // Append to existing log (New on top)
+                                $old_logs = get_field('repair_logs', $sn_post_id);
+                                
+                                // Construct final log without header line
+                                if (!empty($old_logs)) {
+                                    $final_log = $logs_str . "\n" . $old_logs;
+                                } else {
+                                    $final_log = $logs_str;
+                                }
+                                
+                                update_field('repair_logs', $final_log, $sn_post_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if(isset($_POST['track_in'])) {
+                update_field('tracking_inbound', sanitize_text_field($_POST['track_in']), $tid);
+            }
+            if(isset($_POST['track_out'])) {
+                update_field('tracking_outbound', sanitize_text_field($_POST['track_out']), $tid);
+            }
+            if(!empty($_POST['courier'])) {
+                update_field('courier_name', sanitize_text_field($_POST['courier']), $tid);
+            }
+            
+            // [FEATURE] Save Parts Selection when updating status
+            if(isset($_POST['parts'])) {
+                $parts_data = $_POST['parts'];
+                update_field('admin_parts_selected', $parts_data, $tid);
+            }
+            
+            echo json_encode(['success' => true]);
+            exit;
+        }
+
+        // --- ACTION 4: DELETE TICKET ---
+        if ($action === 'delete_claim_ticket') {
+            
+            $tid = intval($_POST['tid']);
+            
+            if (!$tid) { 
+                echo json_encode(['success' => false, 'message' => 'Invalid ID']); 
+                exit; 
+            }
+
+            // A. Revert Warranty Status
+            $sn_code = get_field('snapshot_serial_code', $tid);
+            $snap_group = get_field('shipping_snap', $tid);
+            $old_status = isset($snap_group['snapshot_w_status']) ? $snap_group['snapshot_w_status'] : '';
+            
+            if ($sn_code && $old_status) {
+                // [FIX] Map Thai Label back to English Key for Delete Revert (Just in case)
+                $w_map_reverse = [
+                    'สามารถลงทะเบียนรับประกันได้'            => 'warranty_available',
+                    'รอตรวจสอบประกัน ติดต่อแอดมิน'          => 'warranty_pending',
+                    'ระบบประกันเก่าไม่สามารถเช็คการซ่อมได้' => 'old_warranty',
+                    'รับประกันสินค้าสินค้าใหม่สภาพสมบูรณ์'  => 'warranty_on',
+                    'ผ่านการซ่อมบำรุง'                       => 'repaired',
+                    'สภาพพร้อมใช้งาน'                        => 'refurbished',
+                    'ดัดแปลงสภาพ'                            => 'modified',
+                    'อยู่ระหว่างดำเนินการซ่อมบำรุง'          => 'claim_process'
+                ];
+                $target_w = isset($w_map_reverse[$old_status]) ? $w_map_reverse[$old_status] : $old_status;
+
+                $found_posts = get_posts([
+                    'post_type'  => 'serial_number',
+                    'meta_query' => [
+                        [
+                            'key'     => 'serial_code',
+                            'value'   => $sn_code,
+                            'compare' => '='
+                        ]
+                    ],
+                    'posts_per_page' => 1,
+                    'fields'         => 'ids'
+                ]);
+
+                if (!empty($found_posts)) {
+                    $serial_post_id = $found_posts[0];
+                    update_field('w_status', $target_w, $serial_post_id);
+                }
+            }
+
+            // B. Delete Uploaded Images
+            $ev_images = get_field('evidence_images', $tid);
+            if ($ev_images && is_array($ev_images)) {
+                $img_keys = ['img_front', 'img_back', 'img_left', 'img_right', 'img_defect'];
+                foreach ($img_keys as $key) {
+                    if (!empty($ev_images[$key])) {
+                        $attachment_id = 0;
+                        if (is_array($ev_images[$key]) && isset($ev_images[$key]['ID'])) {
+                            $attachment_id = $ev_images[$key]['ID'];
+                        } elseif (is_numeric($ev_images[$key])) {
+                            $attachment_id = $ev_images[$key];
+                        }
+
+                        if ($attachment_id > 0) {
+                            wp_delete_attachment($attachment_id, true);
+                        }
+                    }
+                }
+            }
+
+            // C. Delete the Ticket Post
+            $deleted = wp_delete_post($tid, true);
+
+            if ($deleted) {
+                echo json_encode(['success' => true]);
+            } else {
+                echo json_encode(['success' => false, 'message' => 'Delete Failed']);
+            }
+            exit;
+        }
+    }
+}, 20); // Priority 20 to ensure it runs late
+
+// ==============================================================================
+// 3. COMMAND CENTER UI (The "Pipeline Dashboard")
+// ==============================================================================
+function render_dinoco_command_center() {
+    ob_start();
+    
+    // --- STATUS MAPPING CONFIG ---
+    $STATUS_MAP = [
+        'Registered in System'          => 'แจ้งเข้าระบบ',
+        'Awaiting Customer Shipment'    => 'ลูกค้าส่งของ',
+        'In Transit to Company'         => 'รอรับของ', 
+        'Received at Company'           => 'รับของแล้ว', 
+        'Under Maintenance'             => 'กำลังซ่อม', 
+        'Maintenance Completed'         => 'สำเร็จ', 
+        'Repaired Item Dispatched'      => 'ส่งสินค้าซ่อมบำรุงคืนให้ขนส่ง',
+        'Pending Issue Verification'    => 'รอตรวจสอบปัญหา',
+        'Replacement Approved'          => 'อนุมัติสินค้าทดแทนให้ลูกค้า',
+        'Replacement Shipped'           => 'ส่งพัสดุสินค้าทดแทนแล้ว',
+        'Replacement Rejected by Company' => 'บริษัทไม่อนุมัติสินค้าทดแทน'
+    ];
+
+    // --- HELPER: Get Date String ---
+    $get_status_date_str = function($post_id) {
+        $last_update_str = get_field('status_last_updated', $post_id);
+        if (empty($last_update_str)) {
+            $last_update_str = get_the_modified_date('Y-m-d H:i:s', $post_id);
+        }
+        return date_i18n('d/m/Y', strtotime($last_update_str));
+    };
+
+    // --- HELPER: Get Date Diff ---
+    $get_days_in_status = function($post_id) {
+        $last_update_str = get_field('status_last_updated', $post_id);
+        if (empty($last_update_str)) {
+            $last_update_str = get_the_modified_date('Y-m-d H:i:s', $post_id);
+        }
+        $start_date = new DateTime($last_update_str);
+        $current_date = new DateTime(current_time('Y-m-d H:i:s'));
+        $diff = $start_date->diff($current_date);
+        return $diff->days;
+    };
+
+    // --- HELPER: Get Customer Name ---
+    $get_customer_name = function($post_id) {
+        $snap_group = get_field('shipping_snap', $post_id);
+        if ($snap_group && is_array($snap_group)) {
+            if (!empty($snap_group['name'])) return $snap_group['name'];
+            if (!empty($snap_group['snapshot_name'])) return $snap_group['snapshot_name'];
+        }
+        // Fallback
+        $u_obj = get_field('ref_user_id', $post_id);
+        $cust_name = 'Guest';
+        if($u_obj) {
+            $u = is_object($u_obj) ? $u_obj : get_userdata($u_obj);
+            if($u) {
+                $cust_name = $u->display_name;
+            }
+        }
+        return $cust_name;
+    };
+    
+    // [PATCH] Helper to get SN (Previously SKU)
+    $get_sn = function($post_id) {
+        return get_field('snapshot_serial_code', $post_id);
+    };
+    
+    // [PATCH] Helper to get Tracking for CLM
+    $get_tracking_in = function($post_id) {
+        return get_field('tracking_inbound', $post_id);
+    };
+
+    // --- 1. PCLM (Parts Claim) Data Processing ---
+    $args_pclm = [
+        'post_type'      => 'claim_ticket', 
+        'posts_per_page' => -1,
+        'post_status'    => ['publish', 'private'], // [PATCH] Include Private posts
+        'meta_query'     => [['key' => 'claim_condition', 'value' => 'send_part']]
+    ];
+    $q_pclm = new WP_Query($args_pclm);
+    
+    // [UPDATED] Include all statuses
+    $pclm_stats = [
+        'Registered in System'       => 0,
+        'Pending Issue Verification' => 0, 
+        'Replacement Approved'       => 0,
+        'Replacement Shipped'        => 0,
+        'Maintenance Completed'      => 0
+    ];
+    $pclm_alerts = [];
+    $pclm_list = [];
+
+    if($q_pclm->have_posts()) {
+        while($q_pclm->have_posts()) {
+            $q_pclm->the_post();
+            $id = get_the_ID();
+            $st = get_field('ticket_status');
+            $days = $get_days_in_status($id);
+            $date_str = $get_status_date_str($id); 
+            $code = get_field('ticket_sn_text') ?: '#'.$id;
+            $model = get_field('snapshot_product_model');
+            $cust_name = $get_customer_name($id); 
+            $sn = $get_sn($id); 
+            
+            $st_label = $STATUS_MAP[$st] ?? $st;
+
+            if(isset($pclm_stats[$st])) $pclm_stats[$st]++;
+
+            $is_alert = false;
+            if ($st == 'Pending Issue Verification') {
+                if ($days > 2) {
+                    $pclm_alerts[] = ['id'=>$id, 'code'=>$code, 'msg'=>"Wait Check {$days} days", 'level'=>'red'];
+                    $is_alert = true;
+                }
+            } elseif ($st == 'Replacement Approved') { 
+                if ($days > 3) {
+                    $pclm_alerts[] = ['id'=>$id, 'code'=>$code, 'msg'=>"Late Ship {$days} days", 'level'=>'red'];
+                    $is_alert = true;
+                }
+            }
+
+            // [PATCH] Color Logic & Text for Days
+            $days_class = 'text-slate-400'; 
+            if ($days >= 45) {
+                $days_class = 'text-red-600 font-bold'; // 45+ = Red
+            } elseif ($days >= 31) {
+                $days_class = 'text-orange-500 font-bold'; // 31-44 = Orange
+            } elseif ($days <= 30) {
+                $days_class = 'text-green-600 font-bold'; // 0-30 = Green
+            }
+
+            if ($st != 'Replacement Rejected by Company') { 
+                $pclm_list[] = [
+                    'id'             => $id, 
+                    'code'           => $code, 
+                    'cust_name'      => $cust_name, 
+                    'model'          => $model, 
+                    'sn'             => $sn, 
+                    'status'         => $st_label, 
+                    'days'           => $days,
+                    'days_text'      => $days . ' Days', // Text with "Days"
+                    'days_class'     => $days_class,     // Class for color
+                    'date'           => $date_str, 
+                    'is_alert'       => $is_alert, 
+                    'raw_status'     => $st
+                ];
+            }
+        }
+        wp_reset_postdata();
+    }
+
+    // --- 2. CLM (Repair Claim) Data Processing ---
+    $args_clm = [
+        'post_type'      => 'claim_ticket', 
+        'posts_per_page' => -1,
+        'post_status'    => ['publish', 'private'], // [PATCH] Include Private posts
+        'meta_query'     => [['key' => 'claim_condition', 'value' => 'send_repair']]
+    ];
+    $q_clm = new WP_Query($args_clm);
+
+    // [UPDATED] Include all statuses
+    $clm_stats = [
+        'Registered in System'       => 0,
+        'Awaiting Customer Shipment' => 0, 
+        'In Transit to Company'      => 0,
+        'Received at Company'        => 0,
+        'Under Maintenance'          => 0,
+        'Repaired Item Dispatched'   => 0,
+        'Maintenance Completed'      => 0
+    ];
+    $clm_alerts = [];
+    $clm_list = [];
+
+    if($q_clm->have_posts()) {
+        while($q_clm->have_posts()) {
+            $q_clm->the_post();
+            $id = get_the_ID();
+            $st = get_field('ticket_status');
+            $days = $get_days_in_status($id);
+            $date_str = $get_status_date_str($id);
+            $code = get_field('ticket_sn_text') ?: '#'.$id;
+            $model = get_field('snapshot_product_model');
+            $cust_name = $get_customer_name($id); 
+            $sn = $get_sn($id); 
+            $track_in = $get_tracking_in($id); 
+            
+            $st_label = $STATUS_MAP[$st] ?? $st;
+
+            if(isset($clm_stats[$st])) $clm_stats[$st]++;
+
+            $is_alert = false;
+            if ($st == 'Received at Company' && $days > 2) {
+                $clm_alerts[] = ['id'=>$id, 'code'=>$code, 'msg'=>"Stuck in Office {$days} days", 'level'=>'red'];
+                $is_alert = true;
+            } elseif ($st == 'Under Maintenance') {
+                if ($days > 40) { 
+                    $clm_alerts[] = ['id'=>$id, 'code'=>$code, 'msg'=>"FACTORY DELAY {$days} days", 'level'=>'red']; 
+                    $is_alert = true; 
+                }
+                elseif ($days > 30) { 
+                    $clm_alerts[] = ['id'=>$id, 'code'=>$code, 'msg'=>"Factory Critical {$days} days", 'level'=>'orange']; 
+                    $is_alert = true; 
+                }
+                elseif ($days > 20) { 
+                    $clm_alerts[] = ['id'=>$id, 'code'=>$code, 'msg'=>"Factory Warning {$days} days", 'level'=>'yellow']; 
+                    $is_alert = true; 
+                }
+            }
+
+            // [PATCH] Color Logic & Text for Days
+            $days_class = 'text-slate-400'; 
+            if ($days >= 45) {
+                $days_class = 'text-red-600 font-bold'; // 45+ = Red
+            } elseif ($days >= 31) {
+                $days_class = 'text-orange-500 font-bold'; // 31-44 = Orange
+            } elseif ($days <= 30) {
+                $days_class = 'text-green-600 font-bold'; // 0-30 = Green
+            }
+
+            // [FIXED] Include all items
+            $clm_list[] = [
+                'id'         => $id, 
+                'code'       => $code, 
+                'cust_name'  => $cust_name, 
+                'model'      => $model, 
+                'sn'         => $sn, 
+                'status'     => $st_label, 
+                'days'       => $days,
+                'days_text'  => $days . ' Days', // Text with "Days"
+                'days_class' => $days_class,     // Class for color
+                'date'       => $date_str, 
+                'is_alert'   => $is_alert, 
+                'raw_status' => $st,
+                'track_in'   => $track_in 
+            ];
+        }
+        wp_reset_postdata();
+    }
+
+    ?>
+    <style>
+        /* === STRICTLY EXPANDED CSS === */
+        
+        .pipeline-grid { 
+            display: grid; 
+            grid-template-columns: 1fr 1fr; 
+            gap: 20px; 
+            font-family: 'Noto Sans Thai', sans-serif; 
+            margin-bottom: 30px; 
+            position: relative;
+        }
+        
+        .pipeline-col { 
+            background: #fff; 
+            border-radius: 16px; 
+            overflow: hidden; 
+            border: 1px solid #e2e8f0; 
+            display: flex; 
+            flex-direction: column; 
+            height: 600px; 
+            transition: all 0.3s ease;
+        } 
+        
+        /* [PATCH] Fullscreen Mode CSS */
+        .pipeline-col.fullscreen {
+            position: fixed !important;
+            top: 0; 
+            left: 0;
+            width: 100vw !important;
+            height: 100vh !important;
+            z-index: 50000;
+            border-radius: 0 !important;
+            border: none;
+        }
+        
+        body.has-fullscreen-col {
+            overflow: hidden;
+        }
+        
+        .col-expand-btn i {
+            transition: transform 0.3s;
+        }
+        /* End Fullscreen CSS */
+
+        .col-header { 
+            padding: 15px 20px; 
+            font-weight: 800; 
+            font-size: 16px; 
+            text-transform: uppercase; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            border-bottom: 1px solid #f1f5f9; 
+        }
+        
+        .theme-pclm .col-header { 
+            background: #fff7ed; 
+            color: #9a3412; 
+            border-bottom-color: #fed7aa; 
+        }
+        
+        .theme-clm .col-header { 
+            background: #eff6ff; 
+            color: #1e40af; 
+            border-bottom-color: #bfdbfe; 
+        }
+        
+        /* --- STATS DASHBOARD & INTERACTION --- */
+        .stats-row { 
+            padding: 12px; 
+            display: grid; 
+            grid-template-columns: 1fr 1fr; 
+            gap: 8px; 
+            background: #fff; 
+            border-bottom: 1px solid #f1f5f9; 
+        }
+        
+        .stat-card { 
+            display: flex; 
+            align-items: center; 
+            justify-content: space-between; 
+            border: 1px solid #e2e8f0; 
+            border-radius: 10px; 
+            padding: 8px 12px; 
+            background: #f8fafc; 
+            transition: all 0.2s; 
+            cursor: pointer; 
+            min-height: 44px;
+        }
+        
+        .stat-card:hover { 
+            border-color: #94a3b8; 
+            background: #f1f5f9;
+            transform: translateY(-1px); 
+        }
+        
+        .stat-label { 
+            font-size: 11px; 
+            color: #475569; 
+            font-weight: 600; 
+            line-height: 1.3; 
+            text-align: left;
+            margin-right: 8px;
+            word-break: break-word; 
+        }
+        
+        .stat-val { 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            font-size: 13px; 
+            font-weight: 800; 
+            color: #0f172a; 
+            background: rgba(255,255,255,0.8);
+            border: 1px solid rgba(0,0,0,0.05);
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        /* Active Filter State - PCLM */
+        .theme-pclm .stat-card.active-filter {
+            background: #ea580c !important; /* Orange-600 */
+            border-color: #c2410c !important;
+            color: white !important;
+            box-shadow: 0 4px 6px -1px rgba(234, 88, 12, 0.3);
+        }
+        
+        .theme-pclm .stat-card.active-filter .stat-label { 
+            color: white !important; 
+        }
+        
+        .theme-pclm .stat-card.active-filter .stat-val {
+            background: white !important;
+            color: #ea580c !important; 
+        }
+
+        /* Active Filter State - CLM */
+        .theme-clm .stat-card.active-filter {
+            background: #2563eb !important; /* Blue-600 */
+            border-color: #1d4ed8 !important;
+            color: white !important;
+            box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.3);
+        }
+        
+        .theme-clm .stat-card.active-filter .stat-label { 
+            color: white !important; 
+        }
+        
+        .theme-clm .stat-card.active-filter .stat-val {
+            background: white !important;
+            color: #2563eb !important;
+        }
+
+        .stat-card.zero { 
+            opacity: 0.6; 
+            background: #fcfcfc;
+            border-style: dashed;
+            cursor: default; 
+        }
+        
+        .alert-zone { 
+            padding: 0 15px; 
+            margin-top: 15px; 
+            display: flex; 
+            flex-direction: column; 
+            gap: 8px; 
+        }
+        
+        .alert-box { 
+            padding: 10px 12px; 
+            border-radius: 8px; 
+            font-size: 12px; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            font-weight: 600; 
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05); 
+            animation: pulseAlert 2s infinite; 
+        }
+        
+        .alert-box.level-red { 
+            background: #fef2f2; 
+            border: 1px solid #fecaca; 
+            color: #b91c1c; 
+        }
+        
+        .alert-box.level-orange { 
+            background: #fff7ed; 
+            border: 1px solid #ffedd5; 
+            color: #c2410c; 
+        }
+        
+        .alert-box.level-yellow { 
+            background: #fefce8; 
+            border: 1px solid #fef08a; 
+            color: #854d0e; 
+        }
+        
+        @keyframes pulseAlert { 
+            0% { opacity: 1; } 
+            50% { opacity: 0.8; } 
+            100% { opacity: 1; } 
+        }
+
+        .task-list-container { 
+            flex: 1; 
+            overflow-y: auto; 
+            padding: 15px; 
+            padding-bottom: 20px; 
+            display: flex; 
+            flex-direction: column; 
+            gap: 10px; 
+            background: #f8fafc; 
+        }
+        
+        .task-card { 
+            background: #fff; 
+            border: 1px solid #e2e8f0; 
+            border-radius: 10px; 
+            padding: 12px; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            transition: transform 0.1s, box-shadow 0.1s; 
+        }
+        
+        .task-card:hover { 
+            transform: translateY(-1px); 
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); 
+            border-color: #cbd5e1; 
+        }
+        
+        .hidden-task { 
+            display: none !important; 
+        }
+        
+        .task-info { 
+            flex: 1; 
+            min-width: 0; 
+            margin-right: 15px; 
+        }
+        
+        .task-code { 
+            font-size: 13px; 
+            font-weight: 700; 
+            color: #334155; 
+            margin-bottom: 2px; 
+        }
+        
+        .task-model { 
+            font-size: 12px; 
+            color: #64748b; 
+            white-space: normal; 
+            overflow-wrap: anywhere; 
+            word-break: break-word; 
+            margin-bottom: 4px; 
+        }
+        
+        .task-sn { 
+            font-size: 10px; 
+            color: #94a3b8; 
+            font-family: monospace; 
+            display: block; 
+            margin-bottom: 2px; 
+        }
+        
+        .task-meta { 
+            display: flex; 
+            gap: 8px; 
+            align-items: center; 
+        }
+        
+        .task-pill { 
+            font-size: 9px; 
+            padding: 2px 6px; 
+            border-radius: 4px; 
+            background: #f1f5f9; 
+            color: #475569; 
+            font-weight: 600; 
+            text-transform: uppercase; 
+        }
+        
+        .task-date { 
+            font-size: 10px; 
+            color: #94a3b8; 
+            margin-top: 4px; 
+            display: flex; 
+            align-items: center; 
+            gap: 4px; 
+        }
+        
+        .task-actions { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 4px; 
+            align-items: flex-end; 
+        }
+        
+        .btn-manage-sm { 
+            background: #fff; 
+            border: 1px solid #e2e8f0; 
+            color: #475569; 
+            font-size: 11px; 
+            font-weight: 700; 
+            padding: 6px 12px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            transition: all 0.2s; 
+            white-space: nowrap; 
+            width: 100%; 
+            text-align: center; 
+        }
+        
+        .btn-manage-sm:hover { 
+            background: #f8fafc; 
+            color: #2563eb; 
+            border-color: #bfdbfe; 
+        }
+        
+        .btn-action-primary { 
+            background: #16a34a; 
+            border: 1px solid #15803d; 
+            color: #fff; 
+            font-size: 10px; 
+            font-weight: 700; 
+            padding: 6px 12px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            transition: all 0.2s; 
+            white-space: nowrap; 
+            width: 100%; 
+            text-align: center; 
+            display: block; 
+            margin-bottom: 4px; 
+        }
+        
+        .btn-action-primary:hover { 
+            background: #15803d; 
+        }
+        
+        .btn-action-info { 
+            background: #3b82f6; 
+            border: 1px solid #2563eb; 
+            color: #fff; 
+            font-size: 10px; 
+            font-weight: 700; 
+            padding: 6px 12px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            transition: all 0.2s; 
+            white-space: nowrap; 
+            width: 100%; 
+            text-align: center; 
+            display: block; 
+            margin-bottom: 4px; 
+        }
+        
+        .btn-action-info:hover { 
+            background: #2563eb; 
+        }
+
+        .btn-delete-sm { 
+            background: #fff; 
+            border: 1px solid #fecaca; 
+            color: #dc2626; 
+            font-size: 11px; 
+            font-weight: 700; 
+            padding: 6px 12px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            transition: all 0.2s; 
+            white-space: nowrap; 
+            margin-top: 4px; 
+            display: flex; /* PATCHED: Use Flex to center icon */
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            width: 100%; 
+            text-align: center; 
+        }
+        
+        .btn-delete-sm:hover { 
+            background: #fef2f2; 
+            color: #b91c1c; 
+            border-color: #fca5a5; 
+        }
+        
+        .filter-reset { 
+            text-align: center; 
+            font-size: 10px; 
+            color: #94a3b8; 
+            cursor: pointer; 
+            margin-top: -10px; 
+            margin-bottom: 5px; 
+            display: none; 
+        }
+        
+        .filter-reset:hover { 
+            color: #64748b; 
+            text-decoration: underline; 
+        }
+        
+        .track-badge { 
+            display: inline-block; 
+            background: #eff6ff; 
+            color: #1d4ed8; 
+            font-size: 9px; 
+            padding: 2px 4px; 
+            border-radius: 4px; 
+            margin-top: 4px; 
+            border: 1px solid #dbeafe; 
+            font-family: monospace; 
+        }
+        
+        /* Search Box */
+        .search-box { 
+            width: 100%; 
+            padding: 10px; 
+            margin-top: 4px; 
+            border: 1px solid #e2e8f0; 
+            border-radius: 8px; 
+            font-size: 14px; 
+            outline: none; 
+        }
+        
+        .search-box:focus { 
+            border-color: #3b82f6; 
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1); 
+        }
+
+        /* [NEW FEATURE] Refresh Button Style */
+        .refresh-dashboard-btn {
+            position: absolute;
+            top: -15px; /* FIXED: Moved down from -45px to -15px */
+            right: 0;
+            background-color: #fff;
+            color: #64748b;
+            border: 1px solid #cbd5e1;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .refresh-dashboard-btn:hover {
+            background-color: #f8fafc;
+            color: #2563eb;
+            border-color: #93c5fd;
+        }
+    </style>
+
+    <div class="pipeline-grid">
+        
+        <!-- [NEW FEATURE] Global Dashboard Refresh Button -->
+        <button onclick="DINOCO.refreshDashboard()" class="refresh-dashboard-btn" title="Refresh Pipeline Data">
+            <i class="fa-solid fa-arrows-rotate"></i> Refresh Dashboard
+        </button>
+
+        <!-- === PCLM COLUMN (ORANGE) === -->
+        <div id="col-pclm" class="pipeline-col theme-pclm">
+            <div class="col-header">
+                <span><i class="fa-solid fa-gear mr-2"></i> รายการเคสเคลมอะไหล่ (PCLM)</span>
+                <div class="flex gap-2">
+                    <!-- Expand Button -->
+                    <button onclick="DINOCO.toggleExpand('pclm', this)" class="text-xs bg-white/50 hover:bg-white p-1 rounded transition text-orange-600 border border-transparent hover:border-orange-200 col-expand-btn" title="ขยายเต็มหน้าจอ">
+                        <i class="fa-solid fa-expand"></i>
+                    </button>
+                    <!-- Refresh Button -->
+                    <button onclick="DINOCO.filterPipeline(this, null, 'pclm')" class="text-xs bg-white/50 hover:bg-white p-1 rounded transition text-orange-600 border border-transparent hover:border-orange-200" title="แสดงทั้งหมด">
+                        <i class="fa-solid fa-rotate"></i>
+                    </button>
+                </div>
+            </div>
+            
+            <!-- 1. Pipeline Micro-Stats -->
+            <div class="stats-row">
+                <?php 
+                $stages = [
+                    'Registered in System'       => 'แจ้งเข้าระบบ', 
+                    'Pending Issue Verification' => 'รอตรวจสอบปัญหา',
+                    'Replacement Approved'       => 'อนุมัติสินค้าทดแทนให้ลูกค้า', 
+                    'Replacement Shipped'        => 'ส่งพัสดุสินค้าทดแทนแล้ว',
+                    'Maintenance Completed'      => 'ซ่อมบำรุงสำเร็จ'
+                ];
+                foreach($stages as $key => $label) {
+                    $count = $pclm_stats[$key] ?? 0;
+                    $cls = $count > 0 ? 'active' : 'zero';
+                    // Pass 'pclm' as columnId
+                    $onclick = $count > 0 ? "onclick=\"DINOCO.filterPipeline(this, '$key', 'pclm')\"" : "";
+                    
+                    echo "<div class='stat-card $cls' $onclick>
+                            <span class='stat-label'>$label</span>
+                            <span class='stat-val'>$count</span>
+                          </div>";
+                }
+                ?>
+            </div>
+
+            <!-- 2. Red Zone Alerts -->
+            <?php if(!empty($pclm_alerts)): ?>
+                <div class="alert-zone">
+                    <?php foreach($pclm_alerts as $alert): ?>
+                        <div class="alert-box level-<?php echo $alert['level']; ?>" onclick="DINOCO.openManage(<?php echo $alert['id']; ?>)" style="cursor:pointer">
+                            <span><i class="fa-solid fa-circle-exclamation mr-1"></i> <?php echo $alert['code']; ?>: <?php echo $alert['msg']; ?></span>
+                            <i class="fa-solid fa-chevron-right text-[10px] opacity-50"></i>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+
+            <!-- 3. Task List -->
+            <div class="task-list-container custom-scrollbar">
+                <?php if(!empty($pclm_list)): foreach($pclm_list as $task): 
+                    $st = $task['raw_status'];
+                ?>
+                    <div class="task-card" data-status="<?php echo $st; ?>">
+                        <div class="task-info">
+                            <div class="task-code"><?php echo $task['code']; ?></div>
+                            <div class="text-[10px] text-slate-500 font-bold mb-1"><?php echo $task['cust_name']; ?></div>
+                            <div class="task-model"><?php echo $task['model']; ?></div>
+                            <div class="task-sn"><i class="fa-solid fa-barcode"></i> SN: <?php echo $task['sn']; ?></div>
+                            <div class="task-meta">
+                                <span class="task-pill"><?php echo $task['status']; ?></span>
+                                <!-- [PATCH] Updated Days Style -->
+                                <span class="task-pill <?php echo $task['days_class']; ?>"><?php echo $task['days_text']; ?></span>
+                            </div>
+                            <div class="task-date"><i class="fa-regular fa-clock"></i> Since: <?php echo $task['date']; ?></div>
+                        </div>
+                        <div class="task-actions w-24">
+                            <!-- PCLM Specific Buttons -->
+                            <?php if ($st === 'Replacement Approved'): ?>
+                                <!-- Changed from showReturnForm to openShip (calls modal first) -->
+                                <button onclick="DINOCO.openShip(<?php echo $task['id']; ?>, 'Replacement Shipped')" class="btn-action-primary"><i class="fa-solid fa-truck-fast"></i> จัดส่ง</button>
+                                
+                                <!-- [FEATURE] ADDED QUICK PRINT BUTTON IN CARD -->
+                                <button onclick="DINOCO.quickPrint(<?php echo $task['id']; ?>)" class="btn-manage-sm mt-1 text-blue-600 border-blue-200 hover:bg-blue-50"><i class="fa-solid fa-print"></i> ใบงาน</button>
+                                
+                            <?php else: ?>
+                                <button onclick="DINOCO.openManage(<?php echo $task['id']; ?>)" class="btn-manage-sm">ตรวจสอบ</button>
+                            <?php endif; ?>
+                            
+                            <!-- [PATCH] Added Icon to Delete Button -->
+                            <button onclick="DINOCO.deleteTicket(<?php echo $task['id']; ?>)" class="btn-delete-sm"><i class="fa-solid fa-trash-can"></i> ลบ</button>
+                        </div>
+                    </div>
+                <?php endforeach; else: echo '<div class="text-center text-slate-300 text-xs mt-10">No active tasks</div>'; endif; ?>
+            </div>
+        </div>
+
+        <!-- === CLM COLUMN (BLUE) === -->
+        <div id="col-clm" class="pipeline-col theme-clm">
+            <div class="col-header">
+                <span><i class="fa-solid fa-wrench mr-2"></i> รายการเคสซ่อมบำรุงสินค้า (CLM)</span>
+                <div class="flex gap-2">
+                    <!-- Expand Button -->
+                    <button onclick="DINOCO.toggleExpand('clm', this)" class="text-xs bg-white/50 hover:bg-white p-1 rounded transition text-blue-600 border border-transparent hover:border-blue-200 col-expand-btn" title="ขยายเต็มหน้าจอ">
+                        <i class="fa-solid fa-expand"></i>
+                    </button>
+                    <!-- Refresh Button -->
+                    <button onclick="DINOCO.filterPipeline(this, null, 'clm')" class="text-xs bg-white/50 hover:bg-white p-1 rounded transition text-blue-600 border border-transparent hover:border-blue-200" title="แสดงทั้งหมด">
+                        <i class="fa-solid fa-rotate"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 1. Pipeline Micro-Stats -->
+            <div class="stats-row">
+                <?php 
+                $stages_clm = [
+                    'Registered in System'       => 'แจ้งเข้าระบบ', 
+                    'Awaiting Customer Shipment' => 'รอลูกค้าส่งสินค้า', 
+                    'In Transit to Company'      => 'สินค้ากำลังจัดส่งมาบริษัท',
+                    'Received at Company'        => 'บริษัทรับสินค้า',
+                    'Under Maintenance'          => 'กำลังซ่อมบำรุง',
+                    'Repaired Item Dispatched'   => 'ส่งสินค้าซ่อมบำรุงคืนให้ขนส่ง', 
+                    'Maintenance Completed'      => 'ซ่อมบำรุงสำเร็จ'
+                ];
+                foreach($stages_clm as $key => $label) {
+                    $count = $clm_stats[$key] ?? 0;
+                    $cls = $count > 0 ? 'active' : 'zero';
+                    // Pass 'clm' as columnId
+                    $onclick = $count > 0 ? "onclick=\"DINOCO.filterPipeline(this, '$key', 'clm')\"" : "";
+                    
+                    echo "<div class='stat-card $cls' $onclick>
+                            <span class='stat-label'>$label</span>
+                            <span class='stat-val'>$count</span>
+                          </div>";
+                }
+                ?>
+            </div>
+
+            <!-- 2. Red Zone Alerts -->
+            <?php if(!empty($clm_alerts)): ?>
+                <div class="alert-zone">
+                    <?php foreach($clm_alerts as $alert): ?>
+                        <div class="alert-box level-<?php echo $alert['level']; ?>" onclick="DINOCO.openManage(<?php echo $alert['id']; ?>)" style="cursor:pointer">
+                            <span><i class="fa-solid fa-triangle-exclamation mr-1"></i> <?php echo $alert['code']; ?>: <?php echo $alert['msg']; ?></span>
+                            <i class="fa-solid fa-chevron-right text-[10px] opacity-50"></i>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+
+            <!-- 3. Task List -->
+            <div class="task-list-container custom-scrollbar">
+                <?php if(!empty($clm_list)): foreach($clm_list as $task): 
+                    $st = $task['raw_status'];
+                ?>
+                    <div class="task-card" data-status="<?php echo $st; ?>">
+                        <div class="task-info">
+                            <div class="task-code"><?php echo $task['code']; ?></div>
+                            <div class="text-[10px] text-slate-500 font-bold mb-1"><?php echo $task['cust_name']; ?></div>
+                            <div class="task-model"><?php echo $task['model']; ?></div>
+                            <div class="task-sn"><i class="fa-solid fa-barcode"></i> SN: <?php echo $task['sn']; ?></div> 
+                            
+                            <!-- Inline Tracking Info for 'In Transit' -->
+                            <?php if($st === 'In Transit to Company' && !empty($task['track_in'])): ?>
+                                <div class="track-badge"><i class="fa-solid fa-truck-fast"></i> <?php echo $task['track_in']; ?></div>
+                            <?php endif; ?>
+
+                            <div class="task-meta mt-1">
+                                <span class="task-pill"><?php echo $task['status']; ?></span>
+                                <!-- [PATCH] Updated Days Style -->
+                                <span class="task-pill <?php echo $task['days_class']; ?>"><?php echo $task['days_text']; ?></span>
+                            </div>
+                            <div class="task-date"><i class="fa-regular fa-clock"></i> Since: <?php echo $task['date']; ?></div>
+                        </div>
+                        <div class="task-actions w-28">
+                            <!-- CLM Quick Actions on Card -->
+                            <?php if ($st === 'Awaiting Customer Shipment'): ?>
+                                <button onclick="DINOCO.openManage(<?php echo $task['id']; ?>)" class="btn-manage-sm">แก้ไข</button>
+                            <?php elseif ($st === 'In Transit to Company'): ?>
+                                <button onclick="DINOCO.updateInline(<?php echo $task['id']; ?>, 'Received at Company')" class="btn-action-primary"><i class="fa-solid fa-box-open"></i> กดรับสินค้า</button>
+                            <?php elseif ($st === 'Received at Company'): ?>
+                                <button onclick="DINOCO.updateInline(<?php echo $task['id']; ?>, 'Under Maintenance')" class="btn-action-info"><i class="fa-solid fa-screwdriver-wrench"></i> ส่งซ่อมบำรุง</button>
+                            <?php elseif ($st === 'Under Maintenance'): ?>
+                                <button onclick="DINOCO.openManage(<?php echo $task['id']; ?>)" class="btn-action-primary"><i class="fa-solid fa-truck-fast"></i> ซ่อมเสร็จ & ส่งคืน</button>
+                            <?php else: ?>
+                                <button onclick="DINOCO.openManage(<?php echo $task['id']; ?>)" class="btn-manage-sm">แก้ไข</button>
+                            <?php endif; ?>
+                            
+                            <!-- [PATCH] Added Icon to Delete Button -->
+                            <button onclick="DINOCO.deleteTicket(<?php echo $task['id']; ?>)" class="btn-delete-sm"><i class="fa-solid fa-trash-can"></i> ลบ</button>
+                        </div>
+                    </div>
+                <?php endforeach; else: echo '<div class="text-center text-slate-300 text-xs mt-10">No active tasks</div>'; endif; ?>
+            </div>
+        </div>
+
+    </div>
+    <?php
+    return ob_get_clean();
+}
+
+// ==============================================================================
+// 4. MAIN SHORTCODE RENDER
+// ==============================================================================
+add_shortcode('dinoco_admin_claims', 'dinoco_render_claims_ui');
+
+function dinoco_render_claims_ui() {
+    ob_start();
+    ?>
+    <!-- IMPORT FONT & ICONS -->
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <style>
+        /* Modern Scrollbar */
+        #tab-claims .custom-scrollbar::-webkit-scrollbar { 
+            width: 6px; 
+        }
+        
+        #tab-claims .custom-scrollbar::-webkit-scrollbar-track { 
+            background: #f8fafc; 
+        }
+        
+        #tab-claims .custom-scrollbar::-webkit-scrollbar-thumb { 
+            background: #cbd5e1; 
+            border-radius: 10px; 
+        }
+        
+        #tab-claims .custom-scrollbar::-webkit-scrollbar-thumb:hover { 
+            background: #94a3b8; 
+        }
+        
+        .fade-in { 
+            animation: fadeIn 0.2s ease-in-out; 
+        }
+        
+        @keyframes fadeIn { 
+            from { opacity: 0; transform: translateY(5px); } 
+            to { opacity: 1; transform: translateY(0); } 
+        }
+        
+        .modal-overlay { 
+            background-color: rgba(15, 23, 42, 0.6); 
+            backdrop-filter: blur(8px); 
+            z-index: 100000 !important; 
+        }
+        
+        .modal-overlay.active-flex { 
+            display: flex !important; 
+        }
+
+        /* [FIXED] REFRESH DASHBOARD BUTTON POSITION */
+        /* ปรับตำแหน่งลงมาเพื่อหนีกรอบ UI หลักที่บังอยู่ (จาก -45px เป็น -15px) */
+        .refresh-dashboard-btn {
+            top: -15px !important; 
+        }
+        
+        /* ----------------------------------------------------- */
+        /* FORCE FONT: Noto Sans Thai (FIXED SELECTORS)          */
+        /* ----------------------------------------------------- */
+        
+        /* Apply Noto Sans Thai ONLY to specific text tags inside the container */
+        #tab-claims h1, #tab-claims h2, #tab-claims h3, #tab-claims h4, #tab-claims h5, #tab-claims h6,
+        #tab-claims p, #tab-claims span, #tab-claims div, #tab-claims label, #tab-claims input, 
+        #tab-claims textarea, #tab-claims select, #tab-claims button, #tab-claims td, #tab-claims th,
+        .modal-overlay h1, .modal-overlay h2, .modal-overlay h3, .modal-overlay h4, .modal-overlay h5, 
+        .modal-overlay h6, .modal-overlay p, .modal-overlay span, .modal-overlay div, .modal-overlay label, 
+        .modal-overlay input, .modal-overlay textarea, .modal-overlay select, .modal-overlay button {
+            font-family: 'Noto Sans Thai', sans-serif !important;
+        }
+        
+        /* STRICTLY FORCE FontAwesome Family for Icon Classes */
+        .fa, .fas, .fa-solid, .fab, .far {
+            font-family: "Font Awesome 6 Free" !important;
+            font-weight: 900 !important; /* Solid icons need weight 900 */
+        }
+        .far {
+            font-weight: 400 !important; /* Regular icons need weight 400 */
+        }
+
+        /* ----------------------------------------------------- */
+        /* SUPER FORCE CSS: บังคับทุกอย่างด้วย !important          */
+        /* ----------------------------------------------------- */
+
+        /* 1. Status Buttons (Inactive) */
+        .status-option-btn { 
+            @apply w-full text-center flex flex-col items-center justify-center h-full min-h-[50px] shadow-sm;
+            border-radius: 16px !important; /* Rounded-2xl */
+            background-color: #f3f4f6 !important; 
+            color: #6b7280 !important;
+            border: 1px solid #e5e7eb !important;
+            padding: 12px !important;
+            font-size: 0.75rem !important;
+            font-weight: 600 !important;
+        }
+        
+        .status-option-btn:hover {
+            background-color: #e5e7eb !important;
+        }
+        
+        /* 2. Active Status */
+        .status-option-btn.selected-ui { 
+            @apply transform scale-[1.02] z-10 shadow-lg;
+            background-color: #1e293b !important; /* Dark Navy */
+            color: #ffffff !important;
+            border-color: #0f172a !important;
+            box-shadow: 0 0 0 2px #22c55e !important; /* Green Ring */
+        }
+
+        /* 3. Hero Action Buttons (Primary Green) */
+        .btn-hero-green {
+            @apply w-full font-bold shadow-md transition-all transform hover:-translate-y-0.5 active:scale-95 flex items-center justify-center gap-2;
+            background-color: #16a34a !important; 
+            color: white !important;
+            border-radius: 16px !important; 
+            padding-top: 8px !important;     
+            padding-bottom: 8px !important; 
+            font-size: 0.875rem !important;
+        }
+        
+        .btn-hero-green:hover { 
+            background-color: #15803d !important; 
+        }
+
+        /* 4. Hero Action Buttons (Danger Red) */
+        .btn-hero-red {
+            @apply w-full font-bold shadow-md transition-all transform hover:-translate-y-0.5 active:scale-95 flex items-center justify-center gap-2;
+            background-color: #dc2626 !important; 
+            color: white !important;
+            border-radius: 16px !important;
+            padding-top: 8px !important;
+            padding-bottom: 8px !important;
+            font-size: 0.875rem !important;
+        }
+        
+        .btn-hero-red:hover { 
+            background-color: #b91c1c !important; 
+        }
+
+        /* 5. Hero Action Buttons (Navy) */
+        .btn-hero-navy {
+            @apply w-full font-bold shadow-md transition-all transform hover:-translate-y-0.5 active:scale-95 flex items-center justify-center gap-2;
+            background-color: #1e293b !important;
+            color: white !important;
+            border-radius: 16px !important;
+            padding-top: 8px !important;
+            padding-bottom: 8px !important;
+            font-size: 0.875rem !important;
+        }
+
+        /* Display Box */
+        .status-display-box { 
+            @apply flex items-center justify-center gap-2 shadow-sm;
+            border-radius: 16px !important;
+            padding: 16px !important;
+            text-align: center !important;
+            font-size: 1.8rem !important; 
+            font-weight: 700 !important;
+            background-color: #1e293b !important;
+            color: white !important;
+            border: 1px solid #334155 !important;
+        }
+
+        /* Input Fields */
+        .clean-input {
+            @apply w-full font-mono outline-none transition-all shadow-sm;
+            background-color: #ffffff !important;
+            border: 1px solid #cbd5e1 !important;
+            color: #1e293b !important;
+            border-radius: 8px !important;
+            padding: 14px !important; 
+            font-size: 1rem !important;
+        }
+        
+        .clean-input:focus {
+            border-color: #3b82f6 !important;
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2) !important;
+        }
+        
+        /* Save Button - Centered Content & Pill Shape - FIX SPACING */
+        .btn-action-save {
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+            gap: 0.5rem !important;
+            
+            @apply font-bold shadow-md hover:shadow-lg transition-all active:scale-95;
+            background-color: #2563eb !important;
+            color: white !important;
+            border-radius: 9999px !important; /* Rounded-Full Forced */
+            padding-top: 12px !important;
+            padding-bottom: 12px !important;
+            padding-left: 3rem !important;
+            padding-right: 3rem !important;
+            width: 80% !important;
+            font-size: 0.875rem !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+            /* Explicit margin top */
+            margin-top: 25px !important; 
+        }
+
+        /* Image Zoom Container */
+        .js-zoom-container {
+            overflow: hidden !important;
+            position: relative !important;
+            cursor: crosshair;
+        }
+        
+        #insp-hero-img {
+            transition: transform 0.1s ease-out; /* Fast transition for smooth tracking */
+            transform-origin: center center;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        
+        /* Zoom Effect on Hover */
+        .js-zoom-container:hover #insp-hero-img {
+            transform: scale(2.5); /* Zoom Level 2.5x */
+        }
+        
+        /* [PATCH] Print Styling - A5 Split Layout */
+        @media print {
+            @page {
+                size: A4;
+                margin: 0;
+            }
+            body * {
+                visibility: hidden;
+            }
+            #print-area, #print-area * {
+                visibility: visible;
+            }
+            #print-area {
+                position: fixed;
+                left: 0;
+                top: 0;
+                width: 210mm;
+                height: 296mm; /* Full A4 Height */
+                z-index: 999999;
+                background: white;
+                display: block !important; /* Use block to allow flow */
+            }
+            
+            /* Each A5 Half */
+            .half-page {
+                width: 100%;
+                height: 148mm; /* Approx Half A4 */
+                box-sizing: border-box;
+                padding: 15mm 20mm; /* Standard Print Padding */
+                position: relative;
+                border-bottom: 1px dashed #ccc; /* Dotted Line Separator */
+            }
+            
+            /* Remove border for the last one */
+            .half-page:last-child {
+                border-bottom: none;
+            }
+            
+            /* Hide URL/Headers if possible */
+            a[href]:after {
+                content: none !important;
+            }
+        }
+    </style>
+
+    <div id="tab-claims" class="section-view font-sans text-slate-800">
+        
+        <!-- NEW: Command Center / HUD Section (Wrapped for AJAX Refresh) -->
+        <div id="dinoco-dashboard-container">
+            <?php echo render_dinoco_command_center(); ?>
+        </div>
+
+        <div class="flex justify-between items-center mb-6 border-b border-slate-100 pb-4">
+            <div>
+                <h2 class="text-2xl font-bold text-slate-800 tracking-tight">รายการงานทั้งหมด (All Tickets)</h2>
+                <p class="text-sm text-slate-500">จัดการงานซ่อมและส่งอะไหล่</p>
+                <!-- Search Box -->
+                <input type="text" id="claims-search-input" class="search-box max-w-md mt-2" placeholder="ค้นหา Ticket No., Serial Number, Model..." onkeyup="if(event.key === 'Enter') DINOCO.loadList(null)">
+            </div>
+            <!-- Main List Refresh Button -->
+            <button onclick="DINOCO.loadList('all')" class="bg-white border border-slate-200 text-slate-600 px-4 py-2 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition flex items-center gap-2 shadow-sm text-sm font-medium">
+                <i class="fa-solid fa-rotate"></i> Refresh List
+            </button>
+        </div>
+
+        <div class="grid grid-cols-4 gap-4 mb-6">
+            <!-- Existing Filters -->
+            <div onclick="DINOCO.filter('all', this)" class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm hover:shadow-md cursor-pointer transition active-tab ring-2 ring-blue-500 ring-offset-2 group relative overflow-hidden">
+                <div class="absolute right-0 top-0 p-4 opacity-5 group-hover:opacity-10 transition"><i class="fa-solid fa-folder-open text-5xl"></i></div>
+                <div class="text-xs font-bold text-slate-400 uppercase tracking-wide">All Jobs</div>
+                <div class="text-3xl font-bold text-slate-800 mt-1" id="stat-total">-</div>
+            </div>
+            <div onclick="DINOCO.filter('action_required', this)" class="bg-white p-5 rounded-xl border border-red-100 shadow-sm hover:shadow-md cursor-pointer transition group relative overflow-hidden ring-1 ring-red-50 hover:ring-red-200">
+                <div class="absolute right-0 top-0 p-4 opacity-5 group-hover:opacity-10 transition"><i class="fa-solid fa-bell text-red-500 text-5xl"></i></div>
+                <div class="flex justify-between items-center"><span class="text-red-600 text-xs font-bold uppercase tracking-wide">Action Required</span><span class="flex h-2 w-2 relative"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span></span></div>
+                <div class="text-3xl font-bold text-red-700 mt-1" id="stat-action">-</div>
+            </div>
+            <div onclick="DINOCO.filter('processing', this)" class="bg-white p-5 rounded-xl border border-blue-100 shadow-sm hover:shadow-md cursor-pointer transition group relative overflow-hidden ring-1 ring-blue-50 hover:ring-blue-200">
+                <div class="absolute right-0 top-0 p-4 opacity-5 group-hover:opacity-10 transition"><i class="fa-solid fa-microchip text-blue-500 text-5xl"></i></div>
+                <div class="text-xs font-bold text-blue-600 uppercase tracking-wide">Processing</div>
+                <div class="text-3xl font-bold text-blue-700 mt-1">Status</div>
+            </div>
+            <div onclick="DINOCO.filter('completed', this)" class="bg-white p-5 rounded-xl border border-green-100 shadow-sm hover:shadow-md cursor-pointer transition group relative overflow-hidden ring-1 ring-green-50 hover:ring-green-200">
+                <div class="absolute right-0 top-0 p-4 opacity-5 group-hover:opacity-10 transition"><i class="fa-solid fa-check-circle text-green-500 text-5xl"></i></div>
+                <div class="text-xs font-bold text-green-600 uppercase tracking-wide">Completed</div>
+                <div class="text-3xl font-bold text-green-700 mt-1">History</div>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            <table class="w-full text-left border-collapse">
+                <thead class="bg-slate-50 text-slate-500 uppercase text-xs font-bold border-b border-slate-100">
+                    <tr>
+                        <th class="p-4">Ticket ID</th>
+                        <!-- REMOVED CUSTOMER COLUMN -->
+                        <th class="p-4">Product Info</th>
+                        <th class="p-4">Condition & Problem</th>
+                        <th class="p-4">Status</th>
+                        <th class="p-4 text-center">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="claims-table-body" class="text-sm text-slate-700 divide-y divide-slate-50">
+                    <tr><td colspan="6" class="p-8 text-center text-slate-400">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- HIDDEN PRINT AREA -->
+        <div id="print-area" style="display:none;"></div>
+    </div>
+
+    <!-- MODAL -->
+    <div id="manage-modal" class="modal-overlay hidden">
+        <input type="hidden" id="modal-tid">
+        <input type="hidden" id="modal-status">
+        <input type="hidden" id="modal-condition">
+        <input type="hidden" id="ctrl-selected-status-val">
+        
+        <!-- Store data for Print -->
+        <div id="data-store-print" class="hidden"></div>
+
+        <div class="bg-white w-full max-w-[95vw] h-[92vh] rounded-2xl shadow-2xl flex overflow-hidden fade-in relative border border-slate-200">
+            
+            <!-- Left Panel -->
+            <div class="w-5/12 bg-slate-50 border-r border-slate-200 flex flex-col h-full">
+                <div class="p-5 border-b border-slate-200 bg-white flex justify-between items-center shadow-[0_1px_2px_rgba(0,0,0,0.05)] z-10 flex-none">
+                    <h3 class="font-bold text-slate-800 flex items-center gap-2 text-lg"><i class="fa-solid fa-magnifying-glass text-blue-500"></i> DINOCO Inspector</h3>
+                    <span id="insp-condition-badge" class="text-[10px] px-2.5 py-1 rounded-md bg-slate-100 text-slate-600 font-bold uppercase border border-slate-200">-</span>
+                </div>
+                <div class="flex-1 overflow-y-auto p-6 custom-scrollbar space-y-6">
+                    <div>
+                        <div class="flex justify-between items-end mb-2"><span class="text-xs font-bold text-red-500 uppercase flex items-center gap-1"><i class="fa-solid fa-circle-exclamation"></i> Defect Point</span></div>
+                        <div class="bg-slate-900 rounded-xl h-72 flex items-center justify-center border border-slate-300 shadow-sm js-zoom-container relative">
+                            <img id="insp-hero-img" src="" class="max-h-full max-w-full" onclick="window.open(this.src)">
+                        </div>
+                        <div class="grid grid-cols-5 gap-2 mt-2" id="insp-thumbs-grid"></div>
+                    </div>
+                    
+                    <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm flex gap-4 items-start">
+                        <div class="flex-shrink-0 w-12 h-12 bg-blue-50 rounded-lg flex items-center justify-center border border-blue-100 text-blue-600 shadow-sm"><i class="fa-solid fa-box-open text-xl"></i></div>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-xs text-slate-400 uppercase font-bold mb-1">Product Model</div>
+                            <div id="insp-product-name" class="text-slate-800 font-bold text-base leading-tight break-words">-</div>
+                            <div class="mt-2 flex gap-2">
+                                <span class="bg-slate-50 text-slate-500 text-[10px] px-2 py-1 rounded font-mono border border-slate-200">SN: <span id="insp-sn" class="font-bold text-slate-700">-</span></span>
+                                <span class="bg-slate-50 text-slate-500 text-[10px] px-2 py-1 rounded font-mono border border-slate-200">SKU: <span id="insp-sku" class="font-bold text-slate-700">-</span></span>
+                            </div>
+                             <div class="mt-2">
+                                <span class="bg-red-50 text-red-600 text-[10px] px-2 py-1 rounded font-bold border border-red-100 inline-block" id="insp-problem">-</span>
+                             </div>
+                        </div>
+                    </div>
+
+                    <div id="ctrl-customer-note-area" class="hidden"></div>
+
+                    <div id="insp-shipping-snap-section" class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm flex gap-4 items-start">
+                        <div class="flex-shrink-0 w-12 h-12 bg-pink-50 rounded-lg flex items-center justify-center border border-pink-100 text-pink-500 shadow-sm"><i class="fa-solid fa-address-card text-xl"></i></div>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-xs text-slate-400 uppercase font-bold mb-1">ข้อมูลลูกค้าเจ้าของสินค้า</div>
+                            <div id="insp-cust-info-container">
+                                <div class="font-bold text-slate-800 text-base" id="insp-cust-name">-</div>
+                                <div class="text-slate-600 font-mono text-xs mb-1 mt-1"><i class="fa-solid fa-phone mr-1"></i> <span id="insp-cust-phone">-</span></div>
+                                <div class="text-slate-500 text-xs leading-relaxed mt-1" id="insp-cust-addr">-</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="insp-inbound-section" class="hidden">
+                        <div class="bg-indigo-50 p-5 rounded-xl border border-indigo-100 flex gap-4 items-center">
+                            <img id="insp-ship-img" src="" class="w-16 h-16 rounded object-cover border bg-white flex-shrink-0 shadow-sm">
+                            <div>
+                                <div class="text-xs text-indigo-500 uppercase font-bold mb-1">Inbound Package</div>
+                                <div id="insp-track-in" class="text-xl font-mono font-bold text-indigo-800 tracking-wide">-</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel -->
+            <div class="w-7/12 bg-white flex flex-col relative h-full">
+                <button type="button" class="js-close-modal absolute top-4 right-4 text-slate-400 hover:text-red-500 transition z-50 p-2 bg-white rounded-full shadow-sm hover:shadow-md cursor-pointer border border-transparent hover:border-slate-100"><i class="fa-solid fa-xmark text-xl"></i></button>
+                
+                <div class="px-8 py-6 border-b border-slate-100 flex-none bg-white z-20">
+                    <div class="flex items-center gap-3 mb-1">
+                        <h2 id="ctrl-ticket-code" class="text-3xl font-bold text-blue-600 font-mono tracking-tight">#...</h2>
+                        <span id="ctrl-status-badge" class="px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-slate-100 text-slate-500 border border-slate-200">Loading...</span>
+                    </div>
+                    <div class="text-sm text-slate-500 flex items-center gap-2">
+                        <i class="fa-solid fa-user-circle text-slate-400"></i> Customer: <span id="ctrl-customer" class="font-semibold text-slate-700">...</span>
+                    </div>
+                </div>
+
+                <div class="px-8 py-4 border-b border-slate-100 bg-slate-50/80 backdrop-blur-sm flex-none z-10 shadow-sm">
+                    <div id="ctrl-timeline" class="flex justify-between items-center relative w-full"></div>
+                </div>
+                
+                <div class="flex-1 overflow-y-auto p-8 custom-scrollbar bg-slate-50/30">
+                    <div id="hero-action-container" class="mb-8 w-full animate-fade-in"></div>
+
+                    <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm mb-8">
+                        <h4 class="text-xs font-bold text-slate-400 uppercase mb-4 flex items-center gap-2">
+                            <span class="bg-slate-100 p-1.5 rounded text-slate-500"><i class="fa-solid fa-sliders"></i></span> 
+                            เปลี่ยนสถานะ (Status Manager)
+                        </h4>
+                        <div class="mb-4 bg-slate-50 p-4 rounded-xl border border-slate-100">
+                            <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 text-center">สถานะปัจจุบัน (Current Status)</label>
+                            <div id="ctrl-status-display-static" class="status-display-box">-</div>
+                        </div>
+                        <div id="ctrl-status-options-list" class="grid grid-cols-2 gap-3 mb-6"></div>
+                        <button onclick="DINOCO.saveStatusChange()" class="btn-action-save"><i class="fa-solid fa-floppy-disk"></i> บันทึกการเปลี่ยนแปลง (Save Status)</button>
+                    </div>
+
+                    <!-- PATCH: Add Dropdown & Inputs -->
+                    <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm mb-8">
+                        <h4 class="text-xs font-bold text-slate-400 uppercase mb-4 flex items-center gap-2">
+                            <span class="bg-slate-100 p-1.5 rounded text-slate-500"><i class="fa-solid fa-truck-fast"></i></span> 
+                            แก้ไขการจัดส่ง (Manual Tracking Edit)
+                        </h4>
+                        <div class="grid grid-cols-1 gap-5">
+                            <div>
+                                <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">Inbound Tracking (ลูกค้าส่งมา)</label>
+                                <div class="flex gap-2">
+                                    <select id="ctrl-track-in-courier" class="clean-input w-1/3"></select>
+                                    <input type="text" id="ctrl-track-in-code" class="clean-input uppercase w-2/3" placeholder="Tracking Number">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1.5">Outbound Tracking (ส่งกลับลูกค้า)</label>
+                                <div class="flex gap-2">
+                                    <select id="ctrl-track-out-courier" class="clean-input w-1/3"></select>
+                                    <input type="text" id="ctrl-track-out-code" class="clean-input uppercase w-2/3" placeholder="Tracking Number">
+                                </div>
+                            </div>
+                        </div>
+                        <button onclick="DINOCO.saveTracking()" class="mt-5 btn-action-save"><i class="fa-solid fa-check"></i> บันทึกเฉพาะเลขพัสดุ (Save Tracking Only)</button>
+                    </div>
+
+                    <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm mb-8">
+                        <h4 class="text-xs font-bold text-slate-400 uppercase mb-4 flex items-center gap-2">
+                            <span class="bg-slate-100 p-1.5 rounded text-slate-500"><i class="fa-solid fa-note-sticky"></i></span> 
+                            Admin Internal Note
+                        </h4>
+                        <div class="flex gap-3 items-start">
+                            <textarea id="ctrl-note" class="w-full text-sm p-3 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-100 outline-none h-32 resize-none transition bg-slate-50 focus:bg-white placeholder:text-slate-300" placeholder="Add internal note..."></textarea>
+                            <button onclick="DINOCO.saveNote()" class="bg-slate-600 text-white px-6 py-3 rounded-lg text-xs font-bold hover:bg-slate-700 transition shadow-sm whitespace-nowrap h-fit">Save Note</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- SCRIPT -->
+    <script>
+    var DINOCO = (function($){
+        
+        // [FIX] USE DYNAMIC AJAX URL FOR CACHE BUSTING
+        const getAjaxUrl = () => {
+            let url = window.location.href.split('#')[0];
+            return url + (url.indexOf('?') !== -1 ? '&' : '?') + 'no_cache=' + new Date().getTime();
+        };
+
+        // API constant is now replaced by getAjaxUrl() calls
+        // const API = window.location.href; 
+        
+        let _pendingShipStatus = null; // Global flag for pending ship action
+
+        // [NEW] Mapping data for Repair Logs (Checkboxes) - PLACED AT TOP
+        const REPAIR_ACTIONS_MAP = {
+            'fg_10': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 10%',
+            'fg_l_10': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 10%',
+            'fg_r_10': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 10%',
+            'fg_20': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 20%',
+            'fg_l_20': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 20%',
+            'fg_r_20': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 20%',
+            'fg_30': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 30%',
+            'fg_l_30': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 30%',
+            'fg_r_30': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 30%',
+            'fg_40': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 40%',
+            'fg_l_40': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 40%',
+            'fg_r_40': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 40%',
+            'fg_50': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 50%',
+            'fg_l_50': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 50%',
+            'fg_r_50': 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 50%',
+            'eg_10': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 10%',
+            'eg_l_10': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 10%',
+            'eg_r_10': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 10%',
+            'eg_20': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 20%',
+            'eg_l_20': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 20%',
+            'eg_r_20': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 20%',
+            'eg_30': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 30%',
+            'eg_l_30': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 30%',
+            'eg_r_30': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 30%',
+            'eg_40': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 40%',
+            'eg_l_40': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 40%',
+            'eg_r_40': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 40%',
+            'eg_50': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 50%',
+            'eg_l_50': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 50%',
+            'eg_r_50': 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 50%',
+            'tr_10': 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 10%',
+            'tr_20': 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 20%',
+            'tr_30': 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 30%',
+            'tr_40': 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 40%',
+            'tr_50': 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 50%',
+            'sr_10': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 10%',
+            'sr_l_10': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 10%',
+            'sr_r_10': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 10%',
+            'sr_20': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 20%',
+            'sr_l_20': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 20%',
+            'sr_r_20': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 20%',
+            'sr_30': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 30%',
+            'sr_l_30': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 30%',
+            'sr_r_30': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 30%',
+            'sr_40': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 40%',
+            'sr_l_40': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 40%',
+            'sr_r_40': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 40%',
+            'sr_50': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 50%',
+            'sr_l_50': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 50%',
+            'sr_r_50': 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 50%',
+            'repaint_minor': 'ซ่อมบำรุงกันล้มทำสีเล็กน้อย',
+            'align_minor': 'ซ่อมบำรุงปรับองศาซ้าย-ขวา เล็กน้อย',
+            'align_medium': 'ซ่อมบำรุงปรับองศาซ้าย-ขวา ปานกลาง',
+            'rep_plastic': 'ซ่อมบำรุงเปลี่ยนมุมพลาติก',
+            'rep_plastic_l': 'ซ่อมบำรุงเปลี่ยนมุมพลาสติก ด้านซ้าย',
+            'rep_plastic_r': 'ซ่อมบำรุงเปลี่ยนมุมพลาสติก ด้านขวา',
+            'rep_key': 'ซ่อมบำรุงเปลี่ยนชุดกุญแจ',
+            'rep_mount': 'ซ่อมบำรุงเปลี่ยนชุดยึดถาดกล่อง(ที่ตัวกล่อง)',
+            'rep_tray': 'ซ่อมบำรุงเปลี่ยนชุดถาดกล่อง',
+            'rep_seal': 'ซ่อมบำรุงซีลกันน้ำใหม่ทั้งใบ',
+            'original': 'Original : สภาพสมบูรณ์',
+            'repaired': 'Repainted : เก็บงานสี',
+            'minor_fix': 'Minor Fix : ดัดจัดทรง',
+            'welded': 'Welded : ซ่อมดัดปรับจุดยึด',
+            'modified': 'Modified : ดัดแปลง/ซ่อมหนัก'
+        };
+
+        const THAI_COURIERS = [
+            'Kerry Express', 
+            'Flash Express', 
+            'J&T Express', 
+            'Thailand Post', 
+            'DHL', 
+            'Best Express', 
+            'Ninja Van', 
+            'Inter Express', 
+            'Nim Express', 
+            'Other'
+        ];
+        
+        // Status Keys Configuration
+        const STATUS_OPTIONS_REPAIR = [
+            { key: 'Registered in System', label: 'แจ้งเข้าระบบ' },
+            { key: 'Awaiting Customer Shipment', label: 'ลูกค้าส่งของ' },
+            { key: 'In Transit to Company', label: 'รอรับของ' },
+            { key: 'Received at Company', label: 'รับของแล้ว' },
+            { key: 'Under Maintenance', label: 'กำลังซ่อม' },
+            { key: 'Maintenance Completed', label: 'สำเร็จ' },
+            { key: 'Repaired Item Dispatched', label: 'ส่งสินค้าซ่อมบำรุงคืนให้ขนส่ง' }
+        ];
+        
+        const STATUS_OPTIONS_PART = [
+            { key: 'Registered in System', label: 'แจ้งเข้าระบบ' },
+            { key: 'Pending Issue Verification', label: 'รอตรวจสอบปัญหา' },
+            { key: 'Replacement Approved', label: 'อนุมัติสินค้าทดแทนให้ลูกค้า' },
+            { key: 'Replacement Shipped', label: 'ส่งพัสดุสินค้าทดแทนแล้ว' },
+            { key: 'Maintenance Completed', label: 'สำเร็จ' },
+            { key: 'Replacement Rejected by Company', label: 'บริษัทไม่อนุมัติสินค้าทดแทน' }
+        ];
+
+        $(document).on('mousemove', '.js-zoom-container', function(e){
+            const { left, top, width, height } = this.getBoundingClientRect();
+            const x = (e.clientX - left) / width * 100;
+            const y = (e.clientY - top) / height * 100;
+            $(this).find('img').css('transform-origin', `${x}% ${y}%`);
+        });
+
+        // [FEATURE] New Function to Refresh Dashboard (PCLM & CLM Columns) without reload
+        function refreshDashboard() {
+            // Add a subtle loading effect
+            $('#dinoco-dashboard-container').addClass('opacity-50 pointer-events-none');
+            
+            $.post(getAjaxUrl(), { dinoco_claims_module_action: 'refresh_dashboard_ui' }, function(html){
+                $('#dinoco-dashboard-container').removeClass('opacity-50 pointer-events-none').html(html);
+            }).fail(function() {
+                // If fail, just remove opacity
+                $('#dinoco-dashboard-container').removeClass('opacity-50 pointer-events-none');
+                console.error("Failed to refresh dashboard");
+            });
+        }
+
+        function loadList(filter) {
+            var search = $('#claims-search-input').val();
+            
+            $('#claims-table-body').html('<tr><td colspan="6" class="p-12 text-center text-slate-400"><i class="fa-solid fa-circle-notch fa-spin text-2xl text-blue-400 mb-2"></i><div class="text-xs">Loading Data...</div></td></tr>');
+            $('.tab-card').removeClass('ring-2 ring-blue-500 ring-offset-2');
+            
+            // Handle clicking 'All Jobs' or other tabs
+            if(!filter) filter = 'all';
+            
+            if(typeof filter === 'object') { 
+                $(filter).addClass('ring-2 ring-blue-500 ring-offset-2'); 
+                filter = $(filter).attr('onclick').match(/'([^']+)'/)[1]; 
+            }
+            
+            $.post(getAjaxUrl(), { dinoco_claims_module_action: 'get_claims_list', status_filter: filter, search_kw: search }, function(res){
+                if(res.success) { 
+                    renderTable(res.data); 
+                    if(res.stats) { 
+                        $('#stat-total').text(res.stats.total); 
+                        $('#stat-action').text(res.stats.action); 
+                    } 
+                } else { 
+                    $('#claims-table-body').html('<tr><td colspan="6" class="p-12 text-center text-red-400"><i class="fa-solid fa-triangle-exclamation text-2xl mb-2"></i><br>Error Loading Data</td></tr>'); 
+                }
+            });
+        }
+
+        // [PATCH] Filter Pipeline Tasks [UPDATED LOGIC with Column Scoping]
+        function filterPipeline(el, statusKey, columnId) {
+            
+            // Define Container based on ID
+            let container = $('#col-' + columnId);
+
+            // Check if clicking same filter to toggle off
+            if ($(el).hasClass('active-filter')) {
+                container.find('.stat-card').removeClass('active-filter');
+                container.find('.task-card').removeClass('hidden-task');
+                return;
+            }
+
+            // Reset UI for THIS column only
+            container.find('.stat-card').removeClass('active-filter');
+            container.find('.task-card').removeClass('hidden-task');
+
+            // If statusKey is null (Refresh button), we trigger Global Refresh instead of just filter reset
+            if (!statusKey) {
+                // [Logic Update] The refresh button in header now triggers AJAX refresh
+                refreshDashboard();
+                return;
+            }
+
+            // Highlight selected card
+            $(el).addClass('active-filter');
+
+            // Hide non-matching tasks in this container
+            container.find('.task-card').each(function() {
+                var s = $(this).data('status');
+                // Trim logic to be safe
+                if (s && s.trim() !== statusKey.trim()) {
+                    $(this).addClass('hidden-task');
+                }
+            });
+        }
+
+        // [PATCH] Fullscreen Toggle
+        function toggleExpand(colId, btn) {
+            let col = $('#col-' + colId);
+            let body = $('body');
+            let icon = $(btn).find('i');
+
+            if (col.hasClass('fullscreen')) {
+                // Collapse
+                col.removeClass('fullscreen');
+                body.removeClass('has-fullscreen-col');
+                icon.removeClass('fa-compress').addClass('fa-expand');
+            } else {
+                // Expand
+                col.addClass('fullscreen');
+                body.addClass('has-fullscreen-col');
+                icon.removeClass('fa-expand').addClass('fa-compress');
+            }
+        }
+
+        function renderTable(list) {
+            
+            if(!list.length) { 
+                $('#claims-table-body').html('<tr><td colspan="6" class="p-12 text-center text-slate-400 bg-slate-50/50 italic">No data found in this category.</td></tr>'); 
+                return; 
+            }
+            
+            let html = '';
+            
+            list.forEach(i => {
+                let badge = i.condition === 'send_repair' 
+                    ? '<span class="bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded text-[10px] font-bold uppercase border border-indigo-100 tracking-wide"><i class="fa-solid fa-wrench mr-1"></i>Repair</span>' 
+                    : '<span class="bg-orange-50 text-orange-600 px-2 py-0.5 rounded text-[10px] font-bold uppercase border border-orange-100 tracking-wide"><i class="fa-solid fa-gear mr-1"></i>Part</span>';
+                
+                // Removed Second Column (Customer)
+                html += `
+                <tr class="hover:bg-blue-50/30 transition border-b border-slate-50 group js-manage-trigger cursor-pointer" data-id="${i.id}">
+                    <td class="p-4">
+                        <div class="font-bold text-blue-600 group-hover:text-blue-700 transition font-mono">${i.code}</div>
+                        <!-- Spot 1: Under Ticket ID -->
+                        <div class="text-[10px] text-slate-500 font-bold mt-1">${i.user}</div>
+                        <div class="text-[9px] text-slate-400 mt-0.5">${i.date}</div>
+                    </td>
+                    <td class="p-4 max-w-[250px]">
+                        <div class="font-medium text-slate-700 text-sm whitespace-normal overflow-wrap-anywhere word-break-break-word" style="overflow-wrap: anywhere; word-break: break-word;">${i.product}</div>
+                        <div class="text-xs text-slate-500 mt-1">
+                            <span class="bg-slate-100 px-1.5 rounded border border-slate-200 font-mono"><i class="fa-solid fa-barcode"></i> SN: ${i.sn || '-'}</span>
+                        </div>
+                    </td>
+                    <td class="p-4">
+                        <div class="mb-1.5">${badge}</div>
+                        <div class="text-xs text-slate-500 truncate w-36">${i.problem}</div>
+                    </td>
+                    <td class="p-4">
+                        <span class="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold shadow-sm whitespace-nowrap ${i.status_info.class}">
+                            ${i.status_info.label}
+                        </span>
+                    </td>
+                    <td class="p-4 text-center">
+                        <div class="flex flex-col gap-1 items-center justify-center">
+                            <button type="button" class="text-slate-500 hover:text-blue-600 bg-white border border-slate-200 hover:border-blue-300 px-4 py-1 rounded-lg shadow-sm text-xs font-bold js-manage-trigger transition-all active:scale-95 w-20" data-id="${i.id}">
+                                แก้ไข
+                            </button>
+                            <button type="button" class="text-red-500 hover:text-red-600 bg-white border border-red-200 hover:border-red-300 px-4 py-1 rounded-lg shadow-sm text-xs font-bold transition-all active:scale-95 w-20 flex items-center justify-center gap-1" onclick="DINOCO.deleteTicket(${i.id}); event.stopPropagation();">
+                                <i class="fa-solid fa-trash-can"></i> ลบ
+                            </button>
+                        </div>
+                    </td>
+                </tr>`;
+            });
+            $('#claims-table-body').html(html);
+        }
+
+        function openManage(tid) { 
+            $('#manage-modal').appendTo('body').removeClass('hidden').addClass('active-flex'); 
+            $.post(getAjaxUrl(), { dinoco_claims_module_action: 'get_claim_detail', tid: tid }, function(res){ 
+                if(res.success) {
+                    populateModal(res.data);
+                }
+            }); 
+        }
+
+        // [PATCH] New Function to handle opening Modal AND showing Ship form
+        function openShip(tid, status) {
+            _pendingShipStatus = status; // Set global flag
+            openManage(tid); // Open the modal as usual
+        }
+        
+        // [FEATURE] Quick Print function to fetch data then print immediately
+        function quickPrint(tid) {
+            $.post(getAjaxUrl(), { dinoco_claims_module_action: 'get_claim_detail', tid: tid }, function(res){ 
+                if(res.success) {
+                    // Populate datastore only, no need to show full modal if just printing
+                    // But our print function relies on data-store-print div
+                    $('#data-store-print').data('ticket', res.data);
+                    printTicket();
+                }
+            }); 
+        }
+        
+        // Populate Dropdown
+        function populateCourierDropdowns(inCourier, outCourier) {
+            let opts = THAI_COURIERS.map(c => `<option value="${c}">${c}</option>`).join('');
+            $('#ctrl-track-in-courier').html(opts); 
+            $('#ctrl-track-out-courier').html(opts);
+            
+            if(inCourier) $('#ctrl-track-in-courier').val(inCourier); 
+            if(outCourier) $('#ctrl-track-out-courier').val(outCourier);
+        }
+
+        function parseTrackingData(raw) {
+            if(!raw || raw === '-') return { courier: 'Kerry Express', code: '' };
+            let parts = raw.split(':');
+            if(parts.length > 1) { 
+                let cName = parts[0].trim(); 
+                if(!THAI_COURIERS.includes(cName)) cName = 'Other'; 
+                return { courier: cName, code: parts.slice(1).join(':').trim() }; 
+            }
+            return { courier: 'Other', code: raw };
+        }
+
+        function populateModal(d) {
+            $('#modal-tid').val(d.id); 
+            $('#modal-status').val(d.status); 
+            $('#modal-condition').val(d.condition); 
+            $('#ctrl-selected-status-val').val(d.status);
+            
+            // Store Data for Print
+            $('#data-store-print').data('ticket', d);
+            
+            $('#insp-condition-badge').html(d.condition === 'send_repair' 
+                ? '<i class="fa-solid fa-wrench mr-1"></i>SEND REPAIR' 
+                : '<i class="fa-solid fa-gear mr-1"></i>SEND PART'
+            );
+            
+            $('#insp-product-name').text(d.product_name); 
+            $('#insp-sn').text(d.sn || '-'); 
+            $('#insp-sku').text(d.sku || '-'); 
+            $('#insp-problem').text(d.problem_text);
+            $('#insp-hero-img').attr('src', d.images.main || 'https://via.placeholder.com/400x300?text=No+Evidence');
+            
+            let thumbs = ''; 
+            ['defect','front','back','left','right'].forEach(k => { 
+                if(d.images[k]) {
+                    thumbs += `<div class="h-12 rounded-lg border border-slate-200 cursor-pointer hover:ring-2 ring-blue-400 overflow-hidden opacity-70 hover:opacity-100 transition" onclick="$('#insp-hero-img').attr('src','${d.images[k]}')"><img src="${d.images[k]}" class="w-full h-full object-cover"></div>`;
+                }
+            }); 
+            $('#insp-thumbs-grid').html(thumbs);
+            
+            if(d.customer_info_snap) { 
+                $('#insp-shipping-snap-section').removeClass('hidden'); 
+                $('#insp-cust-name').text(d.customer_info_snap.name); 
+                $('#insp-cust-phone').text(d.customer_info_snap.phone); 
+                $('#insp-cust-addr').text(d.customer_info_snap.address); 
+            } else { 
+                $('#insp-shipping-snap-section').removeClass('hidden'); 
+                $('#insp-cust-name').text('-'); 
+                $('#insp-cust-phone').text('-'); 
+                $('#insp-cust-addr').text('-'); 
+            }
+            
+            if(d.condition === 'send_repair' && d.track_in) { 
+                $('#insp-inbound-section').removeClass('hidden'); 
+                $('#insp-track-in').text(d.track_in); 
+            } else { 
+                $('#insp-inbound-section').addClass('hidden'); 
+            }
+            
+            $('#ctrl-ticket-code').text(d.code); 
+            $('#ctrl-status-badge').text(d.status_label || d.status); 
+            $('#ctrl-customer').text(d.customer_name); 
+            $('#ctrl-note').val(d.note);
+            
+            // PATCH: Call Logic
+            let inData = parseTrackingData(d.track_in); 
+            let outData = parseTrackingData(d.track_out);
+            populateCourierDropdowns(inData.courier, outData.courier); 
+            $('#ctrl-track-in-code').val(inData.code); 
+            $('#ctrl-track-out-code').val(outData.code);
+            
+            let noteArea = $('#ctrl-customer-note-area'); 
+            let contentToShow = d.customer_note || d.parts_request_details; 
+            if (contentToShow && contentToShow !== '-') { 
+                let noteHtml = `<div class="bg-blue-50 p-5 rounded-2xl border border-blue-100 text-sm text-blue-900 mb-6 shadow-sm"><span class="block text-xs font-bold text-blue-600 uppercase mb-2 flex items-center gap-2"><i class="fa-solid fa-message"></i> ข้อมูลที่ลูกค้าแจ้งเข้ามาในระบบ</span><div class="whitespace-pre-wrap leading-relaxed">${contentToShow}</div></div>`; 
+                noteArea.html(noteHtml).removeClass('hidden'); 
+            } else { 
+                noteArea.addClass('hidden').html(''); 
+            }
+            
+            renderTimeline(d.status, d.condition); 
+            renderStatusManager(d.status, d.condition); 
+            renderHeroAction(d); 
+
+            // [PATCH] Check if there is a pending Ship Action from card click
+            if (_pendingShipStatus) {
+                showReturnForm(_pendingShipStatus);
+                _pendingShipStatus = null; // Reset
+            }
+        }
+
+        function renderStatusManager(currentStatus, condition) {
+            let options = condition === 'send_repair' ? STATUS_OPTIONS_REPAIR : STATUS_OPTIONS_PART; 
+            let listHtml = ''; 
+            let currentLabel = options.find(o => o.key === currentStatus)?.label || currentStatus;
+            
+            $('#ctrl-status-display-static').text(currentLabel);
+            
+            options.forEach(opt => { 
+                let isCurrentDb = (opt.key === currentStatus); 
+                let btnClass = isCurrentDb ? 'selected-ui' : ''; 
+                let icon = isCurrentDb ? '<i class="fa-solid fa-circle-check text-green-400 mb-1"></i>' : ''; 
+                listHtml += `<button type="button" onclick="DINOCO.selectStatus('${opt.key}', '${opt.label}', this)" class="status-option-btn ${btnClass}">${icon}<span>${opt.label}</span></button>`; 
+            });
+            
+            $('#ctrl-status-options-list').html(listHtml);
+        }
+
+        function selectStatus(key, label, btn) { 
+            $('#ctrl-selected-status-val').val(key); 
+            $('.status-option-btn').removeClass('selected-ui').find('i').remove(); 
+            $(btn).addClass('selected-ui').prepend('<i class="fa-solid fa-circle-check text-green-400 mb-1"></i> '); 
+        }
+        
+        function saveStatusChange() { 
+            let newStatus = $('#ctrl-selected-status-val').val(); 
+            update(newStatus); 
+        }
+
+        function renderTimeline(st, cond) {
+            let steps = []; 
+            let stepLabels = [];
+            
+            if (cond === 'send_repair') { 
+                steps = ['Registered in System','Awaiting Customer Shipment','In Transit to Company','Received at Company','Under Maintenance','Returned to Courier','Maintenance Completed']; 
+                stepLabels = ['แจ้งเข้าระบบ', 'ลูกค้าส่งของ', 'รอรับของ', 'รับของแล้ว', 'กำลังซ่อม', 'ส่งสินค้าคืนให้ขนส่ง', 'สำเร็จ']; 
+            } else { 
+                steps = ['Registered in System','Pending Issue Verification','Replacement Shipped', 'Maintenance Completed']; 
+                stepLabels = ['แจ้งเข้าระบบ', 'รอตรวจสอบปัญหา', 'ส่งสินค้าทดแทนแล้ว', 'สำเร็จ']; 
+            }
+            
+            let idx = steps.indexOf(st); 
+            let isRejected = false; 
+            if (idx === -1 && st === 'Replacement Rejected by Company') { 
+                idx = 2; 
+                isRejected = true; 
+                stepLabels[2] = 'บริษัทไม่อนุมัติสินค้าทดแทน'; 
+            }
+            
+            let html = '<div class="absolute top-3 left-0 w-full h-0.5 bg-slate-200 -z-0 rounded-full"></div>';
+            
+            steps.forEach((s, i) => { 
+                let active = (i <= idx); 
+                let curr = (i === idx); 
+                let labelText = stepLabels[i] || 'Step ' + (i+1); 
+                let cls = active ? 'bg-blue-600 border-blue-600 text-white shadow-md' : 'bg-white border-slate-300 text-slate-300'; 
+                let labelCls = active ? 'text-blue-700 font-bold' : 'text-slate-400 font-medium'; 
+                
+                if (curr && isRejected) { 
+                    cls = 'bg-red-600 border-red-600 text-white shadow-lg ring-4 ring-red-100 scale-110'; 
+                    labelCls = 'text-red-600 font-bold'; 
+                } else if (curr) { 
+                    cls += ' ring-4 ring-blue-100 scale-110'; 
+                } 
+                
+                html += `<div class="relative z-10 flex flex-col items-center flex-1"><div class="w-6 h-6 rounded-full border-2 text-[10px] font-bold flex items-center justify-center transition-all ${cls}">${active && !isRejected ? '<i class="fa-solid fa-check"></i>' : (isRejected && curr ? '<i class="fa-solid fa-xmark"></i>' : (i+1))}</div><span class="text-[9px] uppercase mt-2 ${labelCls} text-center w-20 leading-tight">${labelText}</span></div>`; 
+            });
+            
+            $('#ctrl-timeline').html(html);
+        }
+
+        // --- RENDER HERO ACTIONS ---
+        function renderHeroAction(d) {
+            let s = d.status; 
+            let c = d.condition; 
+            let html = '';
+            
+            // Helper for action buttons
+            const btnGreen = "btn-hero-green";
+            const btnNavy = "btn-hero-navy";
+            
+            if (c === 'send_repair') {
+                // CLM FLOW
+                if(s === 'Registered in System') {
+                    html = cardBase('New Repair', 'ลูกค้าแจ้งซ่อม', `<button onclick="DINOCO.update('Awaiting Customer Shipment')" class="${btnGreen}"><i class="fa-solid fa-check"></i> รับเรื่อง & รอลูกค้าส่งของ</button>`);
+                }
+                else if(s === 'Awaiting Customer Shipment') {
+                    html = `<div class="w-full bg-yellow-50 border border-yellow-200 p-5 rounded-2xl shadow-sm"><label class="block font-bold text-yellow-800 mb-2">บันทึกเลขพัสดุขาเข้า (ถ้ามี)</label><div class="flex gap-2"><input id="inp-track-in" class="clean-input text-center text-lg uppercase flex-1" placeholder="Tracking Number"><button onclick="DINOCO.update('In Transit to Company', {track_in: $('#inp-track-in').val()})" class="${btnGreen} flex-shrink-0 px-6 rounded-2xl">บันทึก & รอรับของ</button></div></div>`;
+                }
+                else if(s === 'In Transit to Company') {
+                    html = cardBase('ของกำลังมาถึง', `Tracking: ${d.track_in || '-'}`, `<button onclick="DINOCO.update('Received at Company')" class="${btnGreen}"><i class="fa-solid fa-box-open"></i> กดรับสินค้า</button>`);
+                }
+                else if(s === 'Received at Company') {
+                    html = cardBase('สินค้าอยู่ที่บริษัท', 'ตรวจสอบเบื้องต้นเรียบร้อย', `<button onclick="DINOCO.update('Under Maintenance')" class="${btnNavy}"><i class="fa-solid fa-screwdriver-wrench"></i> ส่งซ่อมบำรุง</button>`);
+                }
+                else if(s === 'Under Maintenance') {
+                    html = cardBase('กำลังซ่อมบำรุง', 'เมื่อซ่อมเสร็จแล้ว กรุณากรอกข้อมูลจัดส่งคืน', `<button onclick="DINOCO.showReturnForm()" class="${btnGreen}"><i class="fa-solid fa-truck-fast"></i> ซ่อมเสร็จ & ส่งคืนลูกค้า</button>`);
+                }
+                else if(s === 'Repaired Item Dispatched') {
+                    // [UPDATED] Use showCloseJobForm instead of direct update for Manual Close
+                    html = `<div class="bg-green-50 p-6 rounded-2xl border border-green-200 w-full text-center mb-4"><i class="fa-solid fa-truck-fast text-5xl text-green-600 mb-3"></i><h3 class="text-xl font-bold text-green-800">ส่งคืนแล้ว</h3><div class="bg-white p-4 rounded-xl mt-4 text-left shadow-sm border border-green-100"><div class="text-xs text-slate-400 uppercase font-bold">Courier</div><div class="font-bold text-slate-700">${d.courier || '-'}</div><div class="text-xs text-slate-400 mt-2 uppercase font-bold">Tracking</div><div class="font-mono text-lg text-blue-600 font-bold">${d.track_out || '-'}</div></div></div><button onclick="DINOCO.showCloseJobForm()" class="${btnNavy}">ปิดงานทันที (Complete)</button>`;
+                }
+                else if(s === 'Maintenance Completed') {
+                    html = `<div class="bg-green-50 p-8 rounded-2xl border border-green-200 w-full text-center"><i class="fa-solid fa-check-circle text-6xl text-green-500 mb-3 block"></i><h3 class="text-xl font-bold text-green-800">Job Closed</h3><div class="text-sm text-green-600 mt-2">จบงานสมบูรณ์</div></div>`;
+                }
+            } else {
+                // PCLM FLOW
+                if(s === 'Registered in System') {
+                    html = cardBase('New Part Claim', 'ลูกค้าขอเคลมอะไหล่', `<button onclick="DINOCO.update('Pending Issue Verification')" class="${btnNavy}"><i class="fa-solid fa-magnifying-glass"></i> ตรวจสอบปัญหา (Verify)</button>`);
+                }
+                else if(s === 'Pending Issue Verification') {
+                    // [PATCH] Change Approve button to show Approval Form
+                    html = `<div class="w-full bg-slate-50 p-5 rounded-2xl border border-slate-200"><h3 class="font-bold text-slate-700 mb-4 text-center">ผลการตรวจสอบ</h3><div class="grid grid-cols-2 gap-3"><button onclick="DINOCO.showApprovalForm()" class="btn-hero-green flex flex-col items-center gap-1 h-auto py-4"><i class="fa-solid fa-check-circle text-2xl"></i>อนุมัติ (Approve)</button><button onclick="DINOCO.update('Replacement Rejected by Company')" class="btn-hero-red flex flex-col items-center gap-1 h-auto py-4"><i class="fa-solid fa-circle-xmark text-2xl"></i>ไม่อนุมัติ (Reject)</button></div></div>`;
+                }
+                else if(s === 'Replacement Approved') {
+                    // [FEATURE] Add Print Button
+                    html = `<div class="bg-blue-50 p-6 rounded-2xl border border-blue-200 w-full text-center mb-4"><i class="fa-solid fa-box-open text-5xl text-blue-600 mb-3"></i><h3 class="text-xl font-bold text-blue-800">อนุมัติแล้ว รอจัดส่ง</h3><p class="text-sm text-blue-600 mb-4">เตรียมสินค้าและจัดส่งให้ลูกค้า</p><div class="flex flex-col gap-2"><button onclick="DINOCO.showReturnForm('Replacement Shipped')" class="${btnGreen}">กรอกเลขพัสดุ & ส่งของ</button><button onclick="DINOCO.printTicket()" class="bg-white border border-slate-300 text-slate-600 font-bold py-2 px-4 rounded-xl shadow-sm hover:bg-slate-50 flex items-center justify-center gap-2"><i class="fa-solid fa-print"></i> พิมพ์ใบส่งของ (A4)</button></div></div>`;
+                }
+                else if(s === 'Replacement Shipped') {
+                    // [FEATURE] Add Print Button & Use showCloseJobForm
+                    html = `<div class="bg-green-50 p-6 rounded-2xl border border-green-200 w-full text-center mb-4"><i class="fa-solid fa-truck-fast text-5xl text-green-600 mb-3"></i><h3 class="text-xl font-bold text-green-800">ส่งอะไหล่แล้ว</h3><div class="bg-white p-4 rounded-xl mt-4 text-left shadow-sm border border-green-100"><div class="text-xs text-slate-400 uppercase font-bold">Courier</div><div class="font-bold text-slate-700">${d.courier || '-'}</div><div class="text-xs text-slate-400 mt-2 uppercase font-bold">Tracking</div><div class="font-mono text-lg text-blue-600 font-bold">${d.track_out || '-'}</div></div><div class="text-xs text-green-600 mt-3"><i class="fa-solid fa-clock"></i> ระบบจะปิดงานอัตโนมัติใน 30 วัน</div></div><div class="flex flex-col gap-2"><button onclick="DINOCO.showCloseJobForm()" class="${btnNavy}">ปิดงานทันที (Complete)</button><button onclick="DINOCO.printTicket()" class="bg-white border border-slate-300 text-slate-600 font-bold py-2 px-4 rounded-xl shadow-sm hover:bg-slate-50 flex items-center justify-center gap-2"><i class="fa-solid fa-print"></i> พิมพ์ใบส่งของ (A4)</button></div>`;
+                }
+                else if(s === 'Maintenance Completed') {
+                    html = `<div class="bg-green-50 p-8 rounded-2xl border border-green-200 w-full text-center"><i class="fa-solid fa-check-circle text-6xl text-green-500 mb-3 block"></i><h3 class="text-xl font-bold text-green-800">Job Closed</h3><div class="text-sm text-green-600 mt-2">จบงานสมบูรณ์</div></div>`;
+                }
+                else if(s === 'Replacement Rejected by Company') {
+                    html = `<div class="bg-red-50 p-8 rounded-2xl border border-red-200 text-red-700 font-bold text-xl w-full text-center"><i class="fa-solid fa-ban text-5xl mb-3 block"></i>CLAIM REJECTED</div>`;
+                }
+            }
+            
+            $('#hero-action-container').html(html).removeClass('hidden');
+        }
+
+        function cardBase(t, s, b) { 
+            return `<div class="bg-white p-6 rounded-2xl border border-slate-200 w-full shadow-sm"><h3 class="text-lg font-bold text-slate-700 mb-1">${t}</h3><p class="text-sm text-slate-500 mb-5">${s}</p>${b}</div>`; 
+        }
+        
+        function showReturnForm(targetStatus = 'Repaired Item Dispatched') {
+            let opts = THAI_COURIERS.map(c => `<option value="${c}">${c}</option>`).join('');
+            let btnText = 'ยืนยันการจัดส่ง';
+            // [PATCH] Update Cancel button style to secondary style (Gray)
+            let form = `<div class="text-left w-full bg-white p-6 rounded-2xl border border-slate-200 shadow-sm"><h3 class="font-bold text-slate-700 mb-4 flex items-center gap-2"><i class="fa-solid fa-box"></i> ข้อมูลการจัดส่งคืน</h3><label class="text-xs font-bold text-slate-400 uppercase mb-1.5 block">เลือกขนส่ง (Courier)</label><select id="inp-courier" class="clean-input mb-4">${opts}</select><label class="text-xs font-bold text-slate-400 uppercase mb-1.5 block">เลขพัสดุ (Tracking No.)</label><input id="inp-track-out" class="clean-input text-lg uppercase mb-5" placeholder="TRACKING ID"><button onclick="DINOCO.submitReturn('${targetStatus}')" class="btn-hero-green w-full">${btnText}</button><button onclick="DINOCO.openManage($('#modal-tid').val())" class="mt-3 bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-700 w-full py-2.5 rounded-2xl font-bold text-xs transition">ยกเลิก</button></div>`;
+            $('#hero-action-container').html(form);
+        }
+        
+        function submitReturn(st) { 
+            let c = $('#inp-courier').val(); 
+            let t = $('#inp-track-out').val(); 
+            if(!c || !t) { 
+                alert('กรุณาเลือกขนส่งและกรอกเลขพัสดุ'); 
+                return; 
+            } 
+            // [PATCH] Combine Courier and TrackingID
+            let finalTrackOut = `${c} : ${t}`;
+            // Pass finalTrackOut as track_out, and pass c as courier just in case (though format is combined)
+            update(st, { courier: c, track_out: finalTrackOut }); 
+        }
+        
+        // [FEATURE] Show Close Job Form logic
+        function showCloseJobForm() {
+            let cond = $('#modal-condition').val();
+            
+            // PCLM: Just confirm (Backend handles revert logic automatically)
+            if (cond !== 'send_repair') {
+                if(confirm('ยืนยันการปิดงานซ่อม? สถานะประกันจะถูกคืนค่าเดิมจาก Snapshot')) {
+                    update('Maintenance Completed');
+                }
+                return;
+            }
+            
+            // CLM: Show Full Form
+            let html = `<div class="text-left w-full bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+                <h3 class="font-bold text-slate-700 mb-4 flex items-center gap-2"><i class="fa-solid fa-clipboard-check text-green-500"></i> บันทึกผลการซ่อม (Repair Log)</h3>
+                
+                <label class="text-xs font-bold text-slate-400 uppercase mb-1.5 block">เลือกสถานะประกันหลังซ่อม (Warranty Status)</label>
+                <select id="inp-close-wstatus" class="clean-input mb-4 text-sm font-bold text-blue-900">
+                    <option value="">-- กรุณาเลือก --</option>
+                    <option value="warranty_available">สามารถลงทะเบียนรับประกันได้</option>
+                    <option value="warranty_pending">รอตรวจสอบประกัน ติดต่อแอดมิน</option>
+                    <option value="old_warranty">ระบบประกันเก่าไม่สามารถเช็คการซ่อมได้</option>
+                    <option value="warranty_on">รับประกันสินค้าสินค้าใหม่สภาพสมบูรณ์</option>
+                    <option value="repaired">ผ่านการซ่อมบำรุง</option>
+                    <option value="refurbished">สภาพพร้อมใช้งาน</option>
+                    <option value="modified">ดัดแปลงสภาพ</option>
+                    <option value="claim_process">อยู่ระหว่างดำเนินการซ่อมบำรุง</option>
+                </select>
+                
+                <label class="text-xs font-bold text-slate-400 uppercase mb-1.5 block">รายการที่ซ่อม (Repair Action Logs)</label>
+                <div class="h-64 overflow-y-auto custom-scrollbar border border-slate-200 rounded-lg p-3 bg-slate-50 mb-5">
+            `;
+            
+            // Render Repair Logs Checkboxes
+            $.each(REPAIR_ACTIONS_MAP, function(key, label) {
+                html += `<label class="flex items-start gap-3 p-2 hover:bg-white rounded cursor-pointer border-b border-slate-100 last:border-0">
+                    <input type="checkbox" name="repair_logs_cb[]" value="${key}" class="w-4 h-4 mt-0.5 text-blue-600 rounded focus:ring-blue-500 border-gray-300">
+                    <span class="text-xs text-slate-700 leading-tight">${label}</span>
+                </label>`;
+            });
+            
+            html += `</div>
+                <button onclick="DINOCO.submitCloseJob()" class="btn-hero-green w-full">บันทึกและปิดงาน (Save & Complete)</button>
+                <button onclick="DINOCO.openManage($('#modal-tid').val())" class="mt-3 bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-700 w-full py-2.5 rounded-2xl font-bold text-xs transition">ยกเลิก</button>
+            </div>`;
+            
+            $('#hero-action-container').html(html);
+        }
+        
+        function submitCloseJob() {
+            let w_status = $('#inp-close-wstatus').val();
+            
+            if(!w_status) {
+                alert('กรุณาเลือกสถานะประกันหลังซ่อม');
+                return;
+            }
+            
+            let logs = [];
+            $('input[name="repair_logs_cb[]"]:checked').each(function(){
+                logs.push($(this).val());
+            });
+            
+            if(logs.length === 0) {
+                if(!confirm('คุณไม่ได้เลือกรายการซ่อมเลย ยืนยันที่จะปิดงานหรือไม่?')) return;
+            }
+            
+            // Call update with special parameters
+            var d = {
+                dinoco_claims_module_action: 'update_claim_status',
+                tid: $('#modal-tid').val(),
+                status: 'Maintenance Completed',
+                w_status_update: w_status,
+                repair_logs_update: logs,
+                admin_note: $('#ctrl-note').val()
+            };
+            
+            // Show loading
+            $('#hero-action-container').html('<div class="py-12 text-center"><i class="fa-solid fa-spinner fa-spin text-3xl text-blue-500 mb-3"></i><div class="text-sm text-slate-400">Processing...</div></div>');
+            
+            $.post(getAjaxUrl(), d, function(res){
+                if(res.success) {
+                    $('#manage-modal').removeClass('active-flex').addClass('hidden');
+                    refreshDashboard();
+                    loadList();
+                } else {
+                    alert('Error closing job');
+                    DINOCO.openManage($('#modal-tid').val());
+                }
+            });
+        }
+        
+        // [FEATURE] New Approval Form Logic (Show Parts Checkbox)
+        function showApprovalForm() {
+            $('#hero-action-container').html('<div class="py-12 text-center"><i class="fa-solid fa-circle-notch fa-spin text-3xl text-blue-500 mb-3"></i><div class="text-sm text-slate-400">Loading Parts List...</div></div>');
+            
+            // Get choices via AJAX
+            $.post(getAjaxUrl(), { dinoco_claims_module_action: 'get_parts_choices' }, function(res){
+                if(res.success) {
+                    let html = `<div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm w-full">
+                        <h3 class="font-bold text-slate-700 mb-4 flex items-center gap-2"><i class="fa-solid fa-list-check text-blue-500"></i> เลือกอะไหล่ที่อนุมัติ (Approved Parts)</h3>
+                        <div class="max-h-60 overflow-y-auto custom-scrollbar border border-slate-100 rounded-lg p-3 bg-slate-50 mb-4" id="parts-checkbox-list">`;
+                    
+                    // Render Choices
+                    if (Array.isArray(res.choices) || typeof res.choices === 'object') {
+                        $.each(res.choices, function(key, label) {
+                            html += `<label class="flex items-center gap-3 p-2 hover:bg-white rounded cursor-pointer border-b border-slate-100 last:border-0">
+                                <input type="checkbox" name="parts_selected[]" value="${label}" class="w-4 h-4 text-blue-600 rounded focus:ring-blue-500 border-gray-300">
+                                <span class="text-sm text-slate-700">${label}</span>
+                            </label>`;
+                        });
+                    }
+                    
+                    // [UPDATED] Two inputs for custom part
+                    html += `</div>
+                        <div class="mb-4">
+                            <label class="text-xs font-bold text-slate-400 uppercase mb-1.5 block">เพิ่มสินค้าอื่นๆ (Add Custom Part)</label>
+                            <div class="flex gap-2">
+                                <input type="text" id="inp-custom-sku" class="clean-input text-sm w-1/3" placeholder="SKU (รหัส)" onkeyup="if(event.key === 'Enter') $('#inp-custom-name').focus()">
+                                <input type="text" id="inp-custom-name" class="clean-input text-sm w-2/3" placeholder="ชื่อสินค้า..." onkeyup="if(event.key === 'Enter') DINOCO.addCustomPart()">
+                                <button onclick="DINOCO.addCustomPart()" class="bg-slate-200 text-slate-600 px-4 rounded-lg font-bold hover:bg-slate-300 transition"><i class="fa-solid fa-plus"></i></button>
+                            </div>
+                        </div>
+                        <div class="flex gap-2">
+                            <button onclick="DINOCO.saveApproval()" class="btn-hero-green w-full">บันทึกและอนุมัติ (Save & Approve)</button>
+                            <button onclick="DINOCO.openManage($('#modal-tid').val())" class="bg-white border border-slate-200 text-slate-500 px-4 rounded-2xl font-bold hover:bg-slate-50 transition">ยกเลิก</button>
+                        </div>
+                    </div>`;
+                    
+                    $('#hero-action-container').html(html);
+                } else {
+                    alert('Error loading parts list.');
+                    DINOCO.openManage($('#modal-tid').val());
+                }
+            });
+        }
+        
+        // [FEATURE] Add Custom Part (AJAX Update ACF)
+        function addCustomPart() {
+            let sku = $('#inp-custom-sku').val().trim();
+            let name = $('#inp-custom-name').val().trim();
+            
+            if(!sku || !name) {
+                alert('กรุณาระบุทั้ง SKU และชื่อสินค้า');
+                return;
+            }
+            
+            // Call AJAX to add part permanently to ACF choices
+            $.post(getAjaxUrl(), { dinoco_claims_module_action: 'add_custom_part_choice', sku: sku, name: name }, function(res){
+                if(res.success) {
+                    let html = `<label class="flex items-center gap-3 p-2 hover:bg-white rounded cursor-pointer border-b border-slate-100 last:border-0 bg-blue-50/50 animate-pulse">
+                        <input type="checkbox" name="parts_selected[]" value="${res.label}" class="w-4 h-4 text-blue-600 rounded focus:ring-blue-500 border-gray-300" checked>
+                        <span class="text-sm text-slate-700 font-bold">${res.label} <span class="text-[10px] text-blue-500">(New)</span></span>
+                    </label>`;
+                    
+                    $('#parts-checkbox-list').append(html);
+                    $('#parts-checkbox-list').scrollTop($('#parts-checkbox-list')[0].scrollHeight);
+                    
+                    // Clear inputs
+                    $('#inp-custom-sku').val('');
+                    $('#inp-custom-name').val('');
+                    $('#inp-custom-sku').focus();
+                } else {
+                    alert('Error adding part: ' + (res.message || 'Unknown'));
+                }
+            });
+        }
+        
+        // [FEATURE] Save Logic for Approval
+        function saveApproval() {
+            let selected = [];
+            $('input[name="parts_selected[]"]:checked').each(function() {
+                selected.push($(this).val());
+            });
+            
+            if(selected.length === 0) {
+                if(!confirm('คุณไม่ได้เลือกอะไหล่เลย ยืนยันที่จะอนุมัติโดยไม่มีรายการสินค้าหรือไม่?')) return;
+            }
+            
+            update('Replacement Approved', { parts: selected });
+        }
+
+        function saveTracking() {
+            let inCourier = $('#ctrl-track-in-courier').val(); 
+            let inCode = $('#ctrl-track-in-code').val(); 
+            let finalIn = inCode ? `${inCourier}: ${inCode}` : '';
+            
+            let outCourier = $('#ctrl-track-out-courier').val(); 
+            let outCode = $('#ctrl-track-out-code').val(); 
+            let finalOut = outCode ? `${outCourier}: ${outCode}` : '';
+            
+            update($('#modal-status').val(), { track_in: finalIn, track_out: finalOut });
+        }
+
+        // [PATCH] Update Status Inline (Direct Action)
+        // [UPDATED LOGIC] Use AJAX Refresh instead of Reload
+        function updateInline(tid, st) {
+            if (!confirm('ยืนยันการเปลี่ยนสถานะ?')) return;
+            var d = { dinoco_claims_module_action: 'update_claim_status', tid: tid, status: st };
+            $.post(getAjaxUrl(), d, function(res){ 
+                if(res.success) { 
+                    // NO RELOAD - JUST REFRESH UI
+                    refreshDashboard(); // Refresh top columns
+                    loadList(); // Refresh bottom list
+                } 
+            });
+        }
+
+        // [UPDATED LOGIC] Main Update Function - No Reload
+        function update(st, ex={}) {
+            let tid = $('#modal-tid').val(); 
+            let d = { dinoco_claims_module_action: 'update_claim_status', tid: tid, status: st, admin_note: $('#ctrl-note').val() };
+            
+            if(ex.track_in !== undefined) d.track_in = ex.track_in; 
+            if(ex.track_out !== undefined) d.track_out = ex.track_out; 
+            if(ex.courier) d.courier = ex.courier;
+            // Add parts if exists
+            if(ex.parts !== undefined) d.parts = ex.parts;
+            
+            if(!$('#hero-action-container').hasClass('hidden')) { 
+                $('#hero-action-container').html('<div class="py-12 text-center"><i class="fa-solid fa-spinner fa-spin text-3xl text-blue-500 mb-3"></i><div class="text-sm text-slate-400">Updating...</div></div>'); 
+            }
+            
+            $.post(getAjaxUrl(), d, function(res){ 
+                if(res.success) { 
+                    // Close Modal
+                    $('#manage-modal').removeClass('active-flex').addClass('hidden');
+                    
+                    // Refresh UIs
+                    refreshDashboard();
+                    loadList();
+                } 
+            });
+        }
+        
+        // [FEATURE] Print Function (A5 Split with Expanded Layout) - UPDATED LAYOUT
+        function printTicket() {
+            let d = $('#data-store-print').data('ticket');
+            if(!d) return;
+            
+            // Set Filename for PDF Save
+            document.title = d.code + '_DINOCO';
+            
+            // Build Parts List HTML
+            let partsList = '';
+            if(d.approved_parts && d.approved_parts.length > 0) {
+                d.approved_parts.forEach((p, i) => {
+                    partsList += `<tr><td style="border:1px solid #000; padding:8px; text-align:center;">${i+1}</td><td style="border:1px solid #000; padding:8px;">${p}</td><td style="border:1px solid #000; padding:8px; text-align:center;">1</td></tr>`;
+                });
+            } else {
+                partsList = `<tr><td colspan="3" style="border:1px solid #000; padding:15px; text-align:center;">- No Parts Listed -</td></tr>`;
+            }
+            
+            // --- 1. Top Half: Shipping Label (ใบปะหน้า) ---
+            const generateShippingLabel = () => `
+                <div class="half-page" style="font-family: 'Sarabun', 'Noto Sans Thai', sans-serif; position:relative; padding:15mm;">
+                    <div style="border: 2px solid #000; height: 100%; padding: 20px; position: relative; border-radius: 8px;">
+                        <div style="position: absolute; top: 15px; right: 15px; font-weight: bold; font-size: 16px;">${d.code}</div>
+                        
+                        <!-- [MODIFIED] Changed alignment to left and reduced logo height (60px -> 50px) -->
+                        <div style="text-align: left; margin-bottom: 15px;">
+                            <img src="https://www.dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-pxou1gkonhphkw4peesozhjgbqhvyueyia1k904zxk.png" style="height: 50px; display:inline-block;">
+                        </div>
+
+                        <div style="font-size: 14px; font-weight: bold; text-decoration: underline; margin-bottom: 10px;">ผู้ส่ง (Sender)</div>
+                        <div style="font-size: 12px; margin-bottom: 25px; line-height: 1.4;">
+                            <strong>DINOCO แผนกซ่อมบำรุงสินค้า (บริษัท พีพีที กรุ๊ป คอร์ปอเรชั่น จำกัด)</strong><br>
+                            21/106 ซอยลาดพร้าว 15 แขวงจอมพล เขตจตุจักร กรุงเทพมหานคร 10900<br>
+                            Tel: 061-639-9994
+                        </div>
+                        
+                        <div style="border-top: 1px dashed #000; margin: 10px 0;"></div>
+                        
+                        <div class="receiver-box" style="text-align: right;">
+                            <div style="font-size: 18px; font-weight: bold; text-decoration: underline; margin-top: 15px; margin-bottom: 10px;">ผู้รับ (Receiver)</div>
+                            <div style="font-size: 22px; font-weight: bold; line-height: 1.3;">
+                                ${d.customer_info_snap ? d.customer_info_snap.name : '-'}
+                            </div>
+                            <div style="font-size: 18px; margin-top: 5px; line-height: 1.4;">
+                                ${d.customer_info_snap ? d.customer_info_snap.address : '-'}
+                            </div>
+                            <div style="font-size: 18px; font-weight: bold; margin-top: 10px;">
+                                Tel: ${d.customer_info_snap ? d.customer_info_snap.phone : '-'}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // --- 2. Bottom Half: Delivery Note (ใบส่งสินค้า) ---
+            const generateDeliveryNote = () => `
+                <div class="half-page" style="font-family: 'Sarabun', 'Noto Sans Thai', sans-serif; position:relative; padding:15mm;">
+                    
+                    <div style="margin-bottom: 20px;">
+                        <!-- [MODIFIED] Changed alignment to left and reduced logo height (50px -> 42px) -->
+                        <div style="text-align: left; margin-bottom: 10px;">
+                            <img src="https://www.dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-pxou1gkonhphkw4peesozhjgbqhvyueyia1k904zxk.png" style="height: 42px; display:inline-block;">
+                        </div>
+                        <div style="display:flex; justify-content:space-between; align-items:flex-end;">
+                            <div>
+                                <h1 style="font-size:20px; font-weight:bold; margin:0;">ใบส่งสินค้า / DELIVERY NOTE</h1>
+                                <div style="font-size:12px; font-weight:bold; color:#666;">(เอกสารแนบในกล่อง)</div>
+                            </div>
+                            <div style="text-align:right;">
+                                <div style="font-size:16px; font-weight:bold;">${d.code}</div>
+                                <div style="font-size:12px;">Date: ${new Date().toLocaleDateString('th-TH')}</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="border:1px solid #ccc; padding:10px; font-size:12px; margin-bottom:10px; display:flex;">
+                        <div style="width:50%; border-right:1px solid #eee; padding-right:10px;">
+                            <strong>ผู้ส่ง:</strong> DINOCO Service Center<br>
+                            Tel: 0616399994
+                        </div>
+                        <div style="width:50%; padding-left:10px;">
+                            <strong>ผู้รับ:</strong> ${d.customer_info_snap ? d.customer_info_snap.name : '-'}<br>
+                            Tel: ${d.customer_info_snap ? d.customer_info_snap.phone : '-'}
+                        </div>
+                    </div>
+                    
+                    <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                        <thead>
+                            <tr style="background:#eee;">
+                                <th style="border:1px solid #000; width:10%; padding:5px;">No.</th>
+                                <th style="border:1px solid #000; text-align:left; padding:5px;">Description</th>
+                                <th style="border:1px solid #000; width:15%; padding:5px;">Qty</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${partsList}
+                        </tbody>
+                    </table>
+                    
+                    <div style="margin-top:auto; padding-top:5px; border-top:1px solid #eee; font-size:10px; text-align:center;">
+                        หากสินค้าไม่ครบหรือเสียหาย กรุณาติดต่อกลับภายใน 7 วัน
+                    </div>
+                </div>
+            `;
+            
+            // Combine A4
+            let fullHtml = generateShippingLabel() + 
+                           '<div style="border-bottom:1px dashed #999; margin:0; width:100%;"></div>' + 
+                           generateDeliveryNote();
+            
+            let $printArea = $('#print-area');
+            $printArea.html(fullHtml);
+
+            // [FIX] Wait for images to load before printing
+            let images = $printArea.find('img');
+            let promises = [];
+
+            images.each(function() {
+                if (!this.complete) {
+                    let p = new Promise(resolve => {
+                        $(this).on('load error', resolve);
+                    });
+                    promises.push(p);
+                }
+            });
+
+            if (promises.length > 0) {
+                Promise.all(promises).then(() => {
+                    setTimeout(() => window.print(), 500); // Wait a bit after load
+                });
+            } else {
+                setTimeout(() => window.print(), 500);
+            }
+        }
+        
+        // [PATCH] Delete Function [UPDATED LOGIC - No Reload]
+        function deleteTicket(id) {
+            if (!confirm('ยืนยันการลบ? ข้อมูลจะหายถาวรและสถานะประกันจะถูกคืนค่าเดิม')) return;
+            
+            $.post(getAjaxUrl(), { dinoco_claims_module_action: 'delete_claim_ticket', tid: id }, function(res){
+                if(res.success) {
+                    alert('ลบข้อมูลเรียบร้อยแล้ว');
+                    // NO RELOAD - JUST REFRESH UI
+                    refreshDashboard();
+                    loadList();
+                } else {
+                    alert('เกิดข้อผิดพลาดในการลบ: ' + (res.message || 'Unknown Error'));
+                }
+            });
+        }
+
+        function saveNote() { 
+            update($('#modal-status').val()); 
+        }
+        
+        $(document).ready(function() { 
+            loadList('all'); 
+            $(document).on('click', '.js-manage-trigger', function(e) { 
+                e.preventDefault(); 
+                e.stopPropagation(); 
+                DINOCO.openManage($(this).data('id')); 
+            }); 
+            $(document).on('click', '.js-close-modal', function() { 
+                $('#manage-modal').removeClass('active-flex').addClass('hidden'); 
+            }); 
+        });
+        
+        return {
+            loadList, 
+            filter: loadList, 
+            filterPipeline, 
+            openManage, 
+            openShip,
+            quickPrint,
+            update, 
+            updateInline, 
+            saveNote, 
+            saveTracking, 
+            selectStatus, 
+            saveStatusChange, 
+            submitReturn, 
+            showReturnForm, 
+            deleteTicket, 
+            toggleExpand, 
+            showApprovalForm, 
+            addCustomPart, 
+            saveApproval, 
+            printTicket,
+            refreshDashboard, // Exported
+            // ADDED MISSING EXPORTS
+            showCloseJobForm,
+            submitCloseJob
+        };
+    })(jQuery);
+    
+    window.loadClaims = DINOCO.loadList;
+    </script>
+    <?php 
+    return ob_get_clean();
+}
