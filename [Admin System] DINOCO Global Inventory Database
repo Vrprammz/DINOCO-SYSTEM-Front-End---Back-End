@@ -1,0 +1,1267 @@
+/*
+ * Template Name: [Admin System] Inventory Command Center (CLOUD FIX v2 - Anti-Collision)
+ * Shortcode: [dinoco_admin_inventory]
+ * Version: 9.9.29 (Fix: Redeclare Error & Inactive Issue)
+ * Author: DINOCO Senior Architect
+ */
+
+// =========================================================================================
+// [PART 1] BACKEND LOGIC
+// =========================================================================================
+
+/* [FIX] Use Anonymous Function to prevent Handler Name Collision */
+add_action('init', function() {
+    
+    /* [FIX] Changed Key to 'dinoco_inventory_action' to isolate from other systems */
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['dinoco_inventory_action'])) {
+        
+        /* [FIX] Clean Buffer & Add No-Cache Headers */
+        if (ob_get_length()) { ob_clean(); } 
+        error_reporting(0);
+        
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+            header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+            header("Cache-Control: post-check=0, pre-check=0", false);
+            header("Pragma: no-cache");
+            header("Expires: Sat, 26 Jul 1997 05:00:00 GMT"); 
+        }
+
+        global $wpdb;
+        $act = sanitize_text_field($_POST['dinoco_inventory_action']);
+
+        // Local helper for status label inside the closure to avoid global conflict
+        $fn_status_label = function($key) {
+            $map = [
+                'warranty_available' => 'สามารถลงทะเบียนรับประกันได้', 
+                'warranty_pending' => 'รอตรวจสอบประกัน ติดต่อแอดมิน',
+                'old_warranty' => 'ระบบประกันเก่าไม่สามารถเช็คการซ่อมได้', 
+                'warranty_on' => 'รับประกันสินค้าสินค้าใหม่สภาพสมบูรณ์',
+                'repaired' => 'ผ่านการซ่อมบำรุง', 
+                'refurbished' => 'สภาพพร้อมใช้งาน', 
+                'modified' => 'ดัดแปลงสภาพ',
+                'claim_process' => 'อยู่ระหว่างดำเนินการซ่อมบำรุง', 
+                'stolen' => 'สินค้าถูกขโมยระงับสิทธิ์',
+        		'void' => 'ตัดประกัน (Void)'
+            ];
+            return isset($map[$key]) ? $map[$key] : $key;
+        };
+
+        try {
+            // --- 1. CATALOG & RELATIONS ---
+            if ($act === 'get_catalog') {
+                $catalog = dinoco_get_current_catalog();
+                $relations = dinoco_get_current_sku_relations();
+                foreach ($catalog as $sku => &$item) {
+                    $item['is_set'] = isset($relations[$sku]);
+                    $item['child_count'] = isset($relations[$sku]) ? count($relations[$sku]) : 0;
+                    $item['children'] = isset($relations[$sku]) ? $relations[$sku] : []; 
+                }
+                echo json_encode(['success' => true, 'data' => $catalog]); exit;
+            }
+            if ($act === 'get_sku_relations') {
+                echo json_encode(['success' => true, 'data' => dinoco_get_current_sku_relations()]); exit;
+            }
+
+            // --- 2. MANAGE RELATIONS ---
+            if ($act === 'save_sku_relation') {
+                $parent = sanitize_text_field($_POST['parent_sku']);
+                $children = isset($_POST['child_skus']) ? array_map('sanitize_text_field', $_POST['child_skus']) : [];
+                if (!$parent) { echo json_encode(['success' => false]); exit; }
+                $relations = dinoco_get_current_sku_relations();
+                $children = array_filter($children);
+                if (empty($children)) unset($relations[$parent]); else $relations[$parent] = array_values($children);
+                update_option('dinoco_sku_relations', $relations);
+                echo json_encode(['success' => true]); exit;
+            }
+
+            // --- 3. SAVE/DELETE PRODUCT ---
+            if ($act === 'save_product') {
+                $sku = sanitize_text_field($_POST['sku']);
+                if (!$sku) { echo json_encode(['success' => false]); exit; }
+                $catalog = dinoco_get_current_catalog();
+                $catalog[$sku] = [
+                    'name' => sanitize_text_field($_POST['name']), 'sub' => sanitize_text_field($_POST['sub'])?:'-',
+                    'img' => sanitize_text_field($_POST['img']), 'price' => sanitize_text_field($_POST['price']),
+                    'years' => intval($_POST['years'])
+                ];
+                update_option('dinoco_product_catalog', $catalog);
+                echo json_encode(['success' => true]); exit;
+            }
+            if ($act === 'delete_product') {
+                 $sku = sanitize_text_field($_POST['sku']);
+                 $catalog = dinoco_get_current_catalog();
+                 if (isset($catalog[$sku])) { unset($catalog[$sku]); update_option('dinoco_product_catalog', $catalog); }
+                 echo json_encode(['success' => true]); exit;
+            }
+
+            // --- 4. DASHBOARD & TOP PRODUCTS ---
+            if ($act === 'get_dashboard_stats') {
+                $total = (int) $wpdb->get_var("SELECT COUNT(ID) FROM {$wpdb->posts} WHERE post_type = 'serial_number' AND post_status = 'publish'");
+                $sql_status = "SELECT pm.meta_value, COUNT(p.ID) as count FROM {$wpdb->posts} p LEFT JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'w_status' WHERE p.post_type = 'serial_number' AND p.post_status = 'publish' GROUP BY pm.meta_value";
+                $res_status = $wpdb->get_results($sql_status, OBJECT_K);
+                
+                $active = 0; $stock = 0; $claim = 0;
+                $active_statuses = dinoco_get_active_statuses_list();
+                
+                if ($res_status) {
+                    foreach ($res_status as $k => $v) {
+                        if (in_array($k, $active_statuses)) $active += $v->count;
+                        elseif ($k === 'warranty_available' || empty($k)) $stock += $v->count;
+                        if ($k === 'claim_process') $claim += $v->count;
+                    }
+                }
+                
+                $today = date('Ymd'); $next30 = date('Ymd', strtotime('+30 days'));
+                $expiring = (int) $wpdb->get_var("SELECT COUNT(post_id) FROM {$wpdb->postmeta} WHERE meta_key = 'warranty_expiry' AND meta_value BETWEEN '$today' AND '$next30'");
+
+                // SQL: Top Active Products
+                $active_statuses_str = "'" . implode("','", $active_statuses) . "'";
+                $sql_top = "
+                    SELECT pm.meta_value as sku, COUNT(p.ID) as count 
+                    FROM {$wpdb->posts} p 
+                    JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'product_sku'
+                    JOIN {$wpdb->postmeta} pm_st ON p.ID = pm_st.post_id AND pm_st.meta_key = 'w_status'
+                    WHERE p.post_type = 'serial_number' 
+                    AND p.post_status = 'publish' 
+                    AND pm_st.meta_value IN ($active_statuses_str)
+                    GROUP BY pm.meta_value 
+                    ORDER BY count DESC 
+                    LIMIT 10
+                ";
+                $top_skus = $wpdb->get_results($sql_top);
+                
+                $catalog = dinoco_get_current_catalog();
+                $enriched_top = [];
+                foreach ($top_skus as $item) {
+                    $sku = $item->sku;
+                    $cat_info = isset($catalog[$sku]) ? $catalog[$sku] : ['name' => 'Unknown Product', 'img' => ''];
+                    $enriched_top[] = [
+                        'sku' => $sku,
+                        'count' => $item->count,
+                        'name' => $cat_info['name'],
+                        'img' => $cat_info['img']
+                    ];
+                }
+
+                echo json_encode([
+                    'success' => true, 
+                    'data' => [
+                        'total' => $total, 'active' => $active, 'stock' => $stock, 'claim' => $claim, 'expiring' => $expiring, 
+                        'top_products' => $enriched_top
+                    ]
+                ]); 
+                exit;
+            }
+
+            // --- 5. SEARCH INVENTORY ---
+            if ($act === 'search_inv') {
+                $kw = trim(sanitize_text_field($_POST['kw']));
+                $filter_status = sanitize_text_field($_POST['filter_status']);
+                $is_god_mode = isset($_POST['is_god_mode']) && $_POST['is_god_mode'] === 'true'; // Check Flag from Frontend
+                
+                // Rule 1: Not God Mode -> Cannot search empty
+                if (!$is_god_mode && empty($kw)) {
+                    echo json_encode(['success' => false, 'msg' => 'Please enter keyword.']); exit;
+                }
+
+                // Get Catalog for Image Lookup
+                $catalog = dinoco_get_current_catalog();
+
+                $args = ['post_type' => 'serial_number', 'posts_per_page' => 50, 'post_status' => 'publish', 'orderby' => 'date', 'order' => 'DESC', 'meta_query' => ['relation' => 'AND']];
+                
+                if (!empty($kw)) {
+                    if ($is_god_mode) {
+                        // GOD MODE: Broad Search (LIKE %...%)
+                        $args['meta_query'][] = [
+                            'relation' => 'OR', 
+                            ['key' => 'serial_code', 'value' => $kw, 'compare' => 'LIKE'],
+                            ['key' => 'product_sku', 'value' => $kw, 'compare' => 'LIKE'],
+                            ['key' => 'product_model', 'value' => $kw, 'compare' => 'LIKE'],
+                            ['key' => 'owner_product', 'value' => $kw, 'compare' => 'LIKE']
+                        ];
+                    } else {
+                        // NORMAL MODE: Strict Search (Equal =) 
+                        $args['meta_query'][] = [
+                            'relation' => 'OR', 
+                            ['key' => 'serial_code', 'value' => $kw, 'compare' => '='],
+                            ['key' => 'product_sku', 'value' => $kw, 'compare' => '='],
+                            ['key' => 'product_model', 'value' => $kw, 'compare' => '='],
+                            ['key' => 'owner_product', 'value' => $kw, 'compare' => '=']
+                        ];
+                    }
+                }
+                
+                if ($filter_status && $filter_status !== 'all') {
+                    if ($filter_status === 'group_active') {
+                        $args['meta_query'][] = ['key' => 'w_status', 'value' => dinoco_get_active_statuses_list(), 'compare' => 'IN'];
+                    } elseif ($filter_status === 'group_stock') {
+                        $args['meta_query'][] = ['relation' => 'OR', ['key' => 'w_status', 'value' => 'warranty_available'], ['key' => 'w_status', 'compare' => 'NOT EXISTS']];
+                    } elseif ($filter_status === 'group_repair') {
+                        $args['meta_query'][] = ['key' => 'w_status', 'value' => 'claim_process'];
+                    } else {
+                        $args['meta_query'][] = ['key' => 'w_status', 'value' => $filter_status];
+                    }
+                }
+                
+                $q = new WP_Query($args);
+                $data = [];
+                while ($q->have_posts()) {
+                    $q->the_post(); $pid = get_the_ID();
+                    $sn = get_field('serial_code') ?: get_the_title();
+                    $sku = get_field('product_sku') ?: '-';
+                    
+                    // [UPDATED] Product Name Logic: Check Meta first, then Catalog Fallback
+                    $model_meta = get_field('product_model');
+                    if (empty($model_meta) || $model_meta === '-') {
+                        if (isset($catalog[$sku]) && !empty($catalog[$sku]['name'])) {
+                            $model = $catalog[$sku]['name'];
+                        } else {
+                            $model = '-';
+                        }
+                    } else {
+                        $model = $model_meta;
+                    }
+
+                    $st_raw = get_field('w_status');
+                    $st_key = (is_array($st_raw) ? $st_raw['value'] : $st_raw) ?: 'unknown';
+                    $reg_date = get_field('warranty_register_date') ?: '-';
+                    $expiry = get_field('warranty_expiry') ?: '-';
+                    $owner_seq = get_field('owner_sequence') ?: '1';
+                    $owner_val = get_field('owner_product');
+                    
+                    // Count Repair Logs
+                    $logs_raw = get_field('repair_logs');
+                    $repair_count = 0;
+                    if(!empty($logs_raw)) {
+                        $repair_count = count(array_filter(explode("\n", $logs_raw)));
+                    }
+                    
+                    // Usage Age
+                    $usage_age = dinoco_calculate_duration_thai($reg_date);
+
+                    $data[] = [
+                        'id' => $pid, 'sn' => $sn, 'model' => $model, 'sku' => $sku,
+                        'reg_date' => $reg_date, 'expiry' => $expiry,
+                        'status_label' => $fn_status_label($st_key), 'status_key' => $st_key,
+                        'seq' => $owner_seq,
+                        'repair_count' => $repair_count,
+                        'usage_age' => $usage_age
+                    ];
+                }
+                echo json_encode(['success' => true, 'data' => $data]); exit;
+            }
+
+            // --- 6. GET DETAIL (MODAL) ---
+            if ($act === 'get_inv_det') {
+                $pid = intval($_POST['pid']);
+                // Use catalog image here too if desired
+                $pic_url = '';
+                $sku = get_field('product_sku', $pid);
+                $catalog = dinoco_get_current_catalog();
+                if (isset($catalog[$sku]) && !empty($catalog[$sku]['img'])) {
+                    $pic_url = $catalog[$sku]['img'];
+                }
+                
+                // [UPDATED] Product Name Logic in Modal
+                $model_meta = get_field('product_model', $pid);
+                if (empty($model_meta) || $model_meta === '-') {
+                    if (isset($catalog[$sku]) && !empty($catalog[$sku]['name'])) {
+                        $model = $catalog[$sku]['name'];
+                    } else {
+                        $model = '-';
+                    }
+                } else {
+                    $model = $model_meta;
+                }
+
+                $st_raw = get_field('w_status', $pid);
+                $st_val = is_array($st_raw) ? $st_raw['value'] : $st_raw;
+                
+                $relations = dinoco_get_current_sku_relations();
+                $child_skus = isset($relations[$sku]) ? $relations[$sku] : [];
+
+                $raw_logs = get_field('repair_logs', $pid);
+                // [MODIFIED] Auto-Translate Logs (Code -> Thai) for Display Only
+                $repair_map = dinoco_get_repair_map();
+                $log_lines = explode("\n", $raw_logs);
+                $processed_lines = [];
+                foreach ($log_lines as $line) {
+                    $parts = explode(' : ', $line);
+                    if (count($parts) >= 2) {
+                        $date = $parts[0];
+                        $code = trim($parts[1]);
+                        // If code exists in map, swap to Thai, otherwise keep original
+                        $text = isset($repair_map[$code]) ? $repair_map[$code] : $code; 
+                        $processed_lines[] = "$date : $text";
+                    } else {
+                        $processed_lines[] = $line;
+                    }
+                }
+                $display_logs = implode("\n", $processed_lines);
+                
+                echo json_encode(['success' => true, 'data' => [
+                    'id' => $pid, 'sn' => get_field('serial_code', $pid) ?: get_the_title($pid),
+                    'sku' => $sku, 'model' => $model,
+                    'pic_url' => $pic_url, 'w_status' => $st_val,
+                    'status_label' => $fn_status_label($st_val),
+                    'warranty_expiry' => get_field('warranty_expiry', $pid),
+                    'repair_logs' => $display_logs, // Return translated logs
+                    'transfer_logs' => get_field('transfer_logs', $pid),
+                    'warranty_duration_years' => get_field('warranty_duration_years', $pid),
+                    'owner_product' => get_field('owner_product', $pid),
+                    'warranty_register_date' => get_field('warranty_register_date', $pid),
+                    'child_skus' => $child_skus
+                ]]); exit;
+            }
+
+            // --- 7. UPDATE INVENTORY ---
+            if ($act === 'upd_inv') {
+                $pid = intval($_POST['pid']);
+                update_field('w_status', sanitize_text_field($_POST['status']), $pid);
+                update_field('warranty_expiry', sanitize_text_field($_POST['expiry']), $pid);
+                update_field('warranty_duration_years', sanitize_text_field($_POST['duration']), $pid);
+                // Note: Saving the textarea as-is. If it contains translated text, it saves as text.
+                // If it contains new code (from Append button), it saves as code.
+                update_field('repair_logs', $_POST['repair_logs'], $pid); 
+                update_field('product_model', sanitize_text_field($_POST['model']), $pid);
+                update_field('owner_product', sanitize_text_field($_POST['owner']), $pid);
+                echo json_encode(['success' => true]); exit;
+            }
+
+            // --- 8. GEN BATCH ---
+            if ($act === 'gen_batch') {
+                $sku = sanitize_text_field($_POST['sku']);
+                $qty = intval($_POST['qty']); $model = sanitize_text_field($_POST['model']);
+                $years = intval($_POST['years']);
+                $catalog = dinoco_get_current_catalog();
+                $catalog_item = isset($catalog[$sku]) ? $catalog[$sku] : null;
+                $img_url = $catalog_item ? $catalog_item['img'] : '';
+                if (!$sku || $qty <= 0) { echo json_encode(['success'=>false, 'msg'=>'Invalid']); exit; }
+                $samples = []; $csv_data = []; $date_prefix = 'WRTDNC' . date('ymd');
+                for($i=0; $i<$qty; $i++) {
+                    $sn = $date_prefix . strtoupper(substr(md5(uniqid(rand(), true)), 0, 5));
+                    $pid = wp_insert_post(['post_title'=>$sn, 'post_type'=>'serial_number', 'post_status'=>'publish']);
+                    if($pid) {
+                        update_field('serial_code', $sn, $pid); update_field('product_sku', $sku, $pid);
+                        update_field('product_model', $model, $pid); update_field('w_status', 'warranty_available', $pid);
+                        update_field('warranty_duration_years', $years, $pid);
+                        if ($img_url) update_field('pic_product_url_ref', $img_url, $pid); 
+                        $samples[] = $sn; $csv_data[] = ['sn'=>$sn, 'sku'=>$sku, 'model'=>$model, 'years'=>$years];
+                    }
+                }
+                echo json_encode(['success'=>true, 'samples'=>$samples, 'csv_data'=>$csv_data]); exit;
+            }
+        } catch (Exception $e) { echo json_encode(['success' => false, 'msg' => $e->getMessage()]); exit; }
+    }
+}); // Priority 10 Default
+
+/* [FIX] Wrap Helper Functions to avoid Redeclaration Error */
+if (!function_exists('dinoco_get_current_catalog')) {
+    function dinoco_get_current_catalog() {
+        $db_catalog = get_option('dinoco_product_catalog', []);
+        return is_array($db_catalog) ? $db_catalog : [];
+    }
+}
+
+if (!function_exists('dinoco_get_current_sku_relations')) {
+    function dinoco_get_current_sku_relations() {
+        $db_relations = get_option('dinoco_sku_relations', []);
+        return is_array($db_relations) ? $db_relations : [];
+    }
+}
+
+if (!function_exists('dinoco_get_active_statuses_list')) {
+    function dinoco_get_active_statuses_list() {
+        return [
+            'warranty_pending', 
+            'old_warranty', 
+            'warranty_on', 
+            'repaired', 
+            'refurbished', 
+            'modified', 
+            'claim_process', 
+            'warranty_expiry'
+        ];
+    }
+}
+
+if (!function_exists('dinoco_get_repair_map')) {
+    function dinoco_get_repair_map() {
+        return [
+            // --- Fairing Guard ---
+            'fg_10'   => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 10%',
+            'fg_l_10' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 10%',
+            'fg_r_10' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 10%',
+            'fg_20'   => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 20%',
+            'fg_l_20' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 20%',
+            'fg_r_20' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 20%',
+            'fg_30'   => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 30%',
+            'fg_l_30' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 30%',
+            'fg_r_30' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 30%',
+            'fg_40'   => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 40%',
+            'fg_l_40' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 40%',
+            'fg_r_40' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 40%',
+            'fg_50'   => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) 50%',
+            'fg_l_50' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างซ้าย 50%',
+            'fg_r_50' => 'ซ่อมบำรุงโครงสร้างกันล้มบน (Fairing Guard) ข้างขวา 50%',
+
+            // --- Engine Guard ---
+            'eg_10'   => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 10%',
+            'eg_l_10' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 10%',
+            'eg_r_10' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 10%',
+            'eg_20'   => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 20%',
+            'eg_l_20' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 20%',
+            'eg_r_20' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 20%',
+            'eg_30'   => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 30%',
+            'eg_l_30' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 30%',
+            'eg_r_30' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 30%',
+            'eg_40'   => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 40%',
+            'eg_l_40' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 40%',
+            'eg_r_40' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 40%',
+            'eg_50'   => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) 50%',
+            'eg_l_50' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างซ้าย 50%',
+            'eg_r_50' => 'ซ่อมบำรุงโครงสร้างกันล้มล่าง (Engine Guard) ข้างขวา 50%',
+
+            // --- Racks ---
+            'tr_10'   => 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 10%',
+            'tr_20'   => 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 20%',
+            'tr_30'   => 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 30%',
+            'tr_40'   => 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 40%',
+            'tr_50'   => 'ซ่อมบำรุงโครงสร้างแร็คหลัง (TopRack) 50%',
+            'sr_10'   => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 10%',
+            'sr_l_10' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 10%',
+            'sr_r_10' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 10%',
+            'sr_20'   => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 20%',
+            'sr_l_20' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 20%',
+            'sr_r_20' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 20%',
+            'sr_30'   => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 30%',
+            'sr_l_30' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 30%',
+            'sr_r_30' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 30%',
+            'sr_40'   => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 40%',
+            'sr_l_40' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 40%',
+            'sr_r_40' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 40%',
+            'sr_50'   => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) 50%',
+            'sr_l_50' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างซ้าย 50%',
+            'sr_r_50' => 'ซ่อมบำรุงโครงสร้างแร็คข้าง (SideRack) ข้างขวา 50%',
+
+            // --- Misc ---
+            'repaint_minor' => 'ซ่อมบำรุงกันล้มทำสีเล็กน้อย',
+            'align_minor'   => 'ซ่อมบำรุงปรับองศาซ้าย-ขวา เล็กน้อย',
+            'align_medium'  => 'ซ่อมบำรุงปรับองศาซ้าย-ขวา ปานกลาง',
+            'rep_plastic'   => 'ซ่อมบำรุงเปลี่ยนมุมพลาติก',
+            'rep_plastic_l' => 'ซ่อมบำรุงเปลี่ยนมุมพลาสติก ด้านซ้าย',
+            'rep_plastic_r' => 'ซ่อมบำรุงเปลี่ยนมุมพลาสติก ด้านขวา',
+            'rep_key'   => 'ซ่อมบำรุงเปลี่ยนชุดกุญแจ',
+            'rep_mount' => 'ซ่อมบำรุงเปลี่ยนชุดยึดถาดกล่อง(ที่ตัวกล่อง)',
+            'rep_tray'  => 'ซ่อมบำรุงเปลี่ยนชุดถาดกล่อง',
+            'rep_seal'  => 'ซ่อมบำรุงซีลกันน้ำใหม่ทั้งใบ',
+            'original'  => 'Original : สภาพสมบูรณ์',
+            'repaired'  => 'Repainted : เก็บงานสี',
+            'minor_fix' => 'Minor Fix : ดัดจัดทรง',
+            'welded'    => 'Welded : ซ่อมดัดปรับจุดยึด',
+            'modified'  => 'Modified : ดัดแปลง/ซ่อมหนัก',
+            
+            // --- Spares ---
+            'sticker_45l_1'   => 'สติกเกอร์แถบข้าง 45L 1 ชุด (2แผ่น)',
+            'sticker_38l_1'   => 'สติกเกอร์แถบข้าง 38L 1 ชุด (2แผ่น)',
+            'sticker_38l_2'   => 'สติกเกอร์แถบข้าง 38L 1 ชุด (4แผ่น)',
+            'sticker_hand'    => 'สติกเกอร์การ์ดแฮนด์ 1 ชุด (2แผ่น)',
+            'plate_nx500'     => 'ประกับหน้า NX500 แบบเว้า 1 ชิ้น',
+            'plate_dinoco_1'  => 'ประกับ DINOCO 1 ชิ้น',
+            'plate_dinoco_2'  => 'ประกับ DINOCO 2 ชิ้น',
+            'plate_dinoco_3'  => 'ประกับ DINOCO 3 ชิ้น',
+            'plate_dinoco_4'  => 'ประกับ DINOCO 4 ชิ้น',
+            'plate_dinoco_5'  => 'ประกับ DINOCO 5 ชิ้น',
+        ];
+    }
+}
+
+if (!function_exists('dinoco_get_user_display_info')) {
+    function dinoco_get_user_display_info($owner_id) {
+        if (empty($owner_id)) return '';
+        $user = get_user_by('login', $owner_id);
+        if (!$user) {
+            $users = get_users(['meta_key' => 'owner_line_id', 'meta_value' => $owner_id, 'number' => 1]);
+            if (!empty($users)) $user = $users[0];
+        }
+        if ($user) {
+            $name = $user->display_name;
+            // Fix: Removed <img> tag, showing only name and ID
+            return "<div class='flex flex-col justify-center'><div class='font-bold text-slate-700 text-xs'>{$name}</div><div class='text-[10px] text-slate-400 leading-none'>{$owner_id}</div></div>";
+        }
+        return "<div class='text-slate-500 font-mono text-xs'>{$owner_id}</div>";
+    }
+}
+
+if (!function_exists('dinoco_calculate_duration_thai')) {
+    function dinoco_calculate_duration_thai($reg_date) {
+        if (empty($reg_date) || $reg_date === '-') return '-';
+        // Support formats: Y-m-d, d/m/Y
+        $date = str_replace('/', '-', $reg_date);
+        $ts = strtotime($date);
+        if (!$ts) return '-';
+        
+        $now = time();
+        $diff = $now - $ts;
+        
+        if ($diff < 0) return '0 วัน';
+        
+        $years = floor($diff / (365*60*60*24));
+        $months = floor(($diff - $years * 365*60*60*24) / (30*60*60*24));
+        $days = floor(($diff - $years * 365*60*60*24 - $months*30*60*60*24)/ (60*60*24));
+        
+        $parts = [];
+        if ($years > 0) $parts[] = $years . " ปี";
+        if ($months > 0) $parts[] = $months . " เดือน";
+        if ($years == 0 && $months == 0 && $days >= 0) $parts[] = $days . " วัน";
+        
+        return implode(" ", $parts);
+    }
+}
+
+// =========================================================================================
+// [PART 2] FRONTEND INTERFACE
+// =========================================================================================
+add_shortcode('dinoco_admin_inventory', 'dinoco_render_ui_v99');
+
+function dinoco_render_ui_v99() {
+    ob_start();
+    ?>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+
+    <style>
+        .dinoco-wrapper, .swal2-popup { font-family: 'Noto Sans Thai', sans-serif !important; }
+        .dinoco-wrapper { background: transparent; padding: 0; }
+        
+        /* Search Box & Filter Hidden by Default */
+        .global-search-box { background: white; padding: 20px; border-radius: 12px; border: 1px solid #e2e8f0; display: flex; gap: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); margin-bottom: 25px; align-items: center; }
+        .global-input { flex-grow: 1; padding: 12px 20px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 1rem; outline: none; transition: all 0.2s; background: #f8fafc; }
+        .global-input:focus { border-color: #3b82f6; background: #fff; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+        .filter-select { padding: 12px 15px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 0.9rem; background-color: #f8fafc; color: #475569; outline: none; }
+        
+        #inv-filter { display: none; } 
+        body.god-mode #inv-filter { display: block; animation: fadeIn 0.3s; }
+        
+        .version-badge { cursor: help; user-select: none; transition: 0.2s; }
+        .version-badge:active { transform: scale(0.9); background-color: #e2e8f0; }
+
+        .main-tabs { display: flex; gap: 8px; margin-bottom: 25px; border-bottom: 1px solid #e2e8f0; overflow-x: auto; user-select: none; }
+        .main-tab { padding: 12px 20px; font-weight: 600; color: #64748b; cursor: pointer; border-bottom: 3px solid transparent; transition: 0.2s; display: flex; align-items: center; gap: 8px; white-space: nowrap; font-size: 0.95rem; }
+        .main-tab:hover { color: #334155; background: rgba(255,255,255,0.5); border-radius: 8px 8px 0 0; }
+        .main-tab.active { color: #1e293b; border-bottom-color: #1e293b; background: transparent; }
+        .view-section { display: none !important; }
+        .view-section.active { display: block !important; animation: fadeIn 0.3s; }
+
+        .content-box { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 20px; }
+        .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 20px; }
+        .kpi-card { background: white; padding: 25px; border-radius: 12px; border: 1px solid #e2e8f0; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.02); cursor: pointer; transition: 0.2s; }
+        .kpi-card:hover { transform: translateY(-3px); border-color: #3b82f6; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); }
+        .kpi-val { font-size: 2.2rem; font-weight: 800; color: #0f172a; margin: 5px 0; line-height: 1.2; }
+        .kpi-label { font-size: 0.8rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }
+        
+        .bg-blue-soft { background: #dbeafe; color: #1e40af; padding: 4px 10px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; display: inline-block; margin-top: 5px; }
+        .bg-green-soft { background: #dcfce7; color: #166534; padding: 4px 10px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; display: inline-block; margin-top: 5px; }
+        .bg-orange-soft { background: #ffedd5; color: #9a3412; padding: 4px 10px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; display: inline-block; margin-top: 5px; }
+        .bg-red-soft { background: #fee2e2; color: #991b1b; padding: 4px 10px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; display: inline-block; margin-top: 5px; }
+
+        .inv-table { width: 100%; border-collapse: separate; border-spacing: 0; background: white; font-size: 0.85rem; }
+        .inv-table th { background: #f8fafc; color: #475569; font-weight: 700; padding: 12px 10px; text-align: left; border-bottom: 2px solid #e2e8f0; text-transform: uppercase; font-size: 0.8rem; white-space: nowrap; }
+        .inv-table td { padding: 12px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; color: #334155; }
+        .inv-table tr:hover { background: #f8fafc; }
+        .st-badge { padding: 4px 10px; border-radius: 20px; font-size: 0.7rem; font-weight: 600; display: inline-flex; align-items: center; white-space: nowrap; }
+        .st-green { background: #dcfce7; color: #166534; }
+        .st-blue { background: #dbeafe; color: #1e40af; }
+        .st-red { background: #fee2e2; color: #991b1b; }
+        .st-orange { background: #ffedd5; color: #9a3412; }
+        .st-gray { background: #f1f5f9; color: #475569; }
+
+        .catalog-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
+        .catalog-item { background: white; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; transition: 0.2s; cursor: pointer; display: flex; flex-direction: column; position: relative; }
+        .catalog-item:hover { transform: translateY(-3px); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-color: #3b82f6; }
+        .catalog-img-wrap { height: 160px; background: #ffffff; display: flex; align-items: center; justify-content: center; padding: 10px; border-bottom: 1px solid #e2e8f0; position: relative; }
+        .catalog-img { max-height: 100%; max-width: 100%; object-fit: contain; }
+        .catalog-body { padding: 15px; flex-grow: 1; display: flex; flex-direction: column; }
+        .catalog-title { font-weight: 700; color: #334155; font-size: 0.9rem; margin-bottom: 5px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; height: 40px; }
+        .catalog-sku { font-family: monospace; color: #64748b; font-size: 0.75rem; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; display: inline-block; margin-bottom: 8px; width: fit-content; }
+        .catalog-price { margin-top: auto; font-weight: 800; color: #0f172a; font-size: 1.1rem; text-align: right; }
+        
+        .no-pic-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: #f1f5f9; color: #94a3b8; font-weight: 700; font-size: 0.8rem; border: 2px dashed #cbd5e1; border-radius: 8px; }
+        .set-badge { position: absolute; top: 10px; left: 10px; background: linear-gradient(135deg, #a855f7, #7c3aed); color: white; padding: 3px 10px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; box-shadow: 0 4px 6px rgba(124, 58, 237, 0.2); z-index: 5; letter-spacing: 0.5px; border: 1px solid rgba(255,255,255,0.2); }
+
+        .btn-delete-cat, .btn-edit-cat { display: none; } 
+        body.god-mode .btn-delete-cat { display: flex !important; position: absolute; bottom: 8px; left: 8px; background: white; width: 32px; height: 32px; border-radius: 50%; align-items: center; justify-content: center; color: #ef4444; border: 1px solid #fee2e2; box-shadow: 0 2px 6px rgba(0,0,0,0.1); z-index: 10; transition: transform 0.2s; }
+        body.god-mode .btn-delete-cat:hover { transform: scale(1.1); background: #fef2f2; }
+        body.god-mode .btn-edit-cat { display: flex !important; position: absolute; top: 8px; right: 8px; background: white; width: 32px; height: 32px; border-radius: 50%; align-items: center; justify-content: center; color: #3b82f6; border: 1px solid #dbeafe; box-shadow: 0 2px 6px rgba(0,0,0,0.1); z-index: 10; transition: transform 0.2s; }
+        body.god-mode .btn-edit-cat:hover { transform: scale(1.1); background: #eff6ff; }
+        body.god-mode .catalog-item { border-color: #93c5fd !important; background: #f8fafc; }
+
+        .btn { padding: 8px 20px; border-radius: 8px; font-weight: 600; transition: 0.2s; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; font-size: 0.95rem; }
+        .btn-primary { background: #1e293b; color: white; border: 1px solid #1e293b; }
+        .btn-primary:hover { background: #0f172a; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+        .btn-gen { background: #10b981; color: white; border: 1px solid #10b981; }
+        .btn-gen:hover { background: #059669; }
+        .btn-sm { padding: 6px 14px; font-size: 0.8rem; }
+        .btn-outline { background: white; border: 1px solid #e2e8f0; color: #64748b; }
+        .btn-outline:hover { background: #f1f5f9; color: #334155; }
+        
+        .top-table { width: 100%; text-align: left; border-collapse: separate; border-spacing: 0 4px; border: none; }
+        .top-table th { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; font-weight: 700; padding: 10px 10px; border: none; }
+        .top-table tr { background: white; border-radius: 8px; transition: 0.2s; border: none; }
+        .top-table tr:hover { background: #f8fafc; }
+        .top-table td { padding: 12px 10px; border: none; vertical-align: middle; }
+        
+        .rank-badge { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1rem; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .rank-1 { background: linear-gradient(135deg, #fef9c3, #facc15); color: #b45309; font-size: 1.2rem; border: 2px solid #fff; box-shadow: 0 4px 6px rgba(250, 204, 21, 0.2); }
+        .rank-2 { background: linear-gradient(135deg, #f1f5f9, #cbd5e1); color: #475569; font-size: 1.2rem; border: 2px solid #fff; box-shadow: 0 4px 6px rgba(148, 163, 184, 0.2); }
+        .rank-3 { background: linear-gradient(135deg, #ffedd5, #fdba74); color: #9a3412; font-size: 1.2rem; border: 2px solid #fff; box-shadow: 0 4px 6px rgba(251, 146, 60, 0.2); }
+        .rank-n { background: transparent; color: #64748b; font-size: 0.9rem; box-shadow: none; font-weight: 700; }
+
+        .top-thumb { width: 40px; height: 40px; border-radius: 8px; border: 1px solid #e2e8f0; object-fit: cover; }
+        .top-name { font-weight: 700; font-size: 0.85rem; color: #334155; line-height: 1.2; }
+        .top-sku { font-size: 0.7rem; font-family: monospace; color: #94a3b8; background: #f8fafc; padding: 1px 4px; border-radius: 4px; display: inline-block; margin-top: 2px; }
+        .top-count { background: #eff6ff; color: #2563eb; font-weight: 700; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; }
+
+        .modal-tabs { display: flex; border-bottom: 1px solid #e2e8f0; margin-bottom: 20px; gap: 2px; }
+        .modal-tab { padding: 12px 24px; cursor: pointer; border-bottom: 3px solid transparent; font-weight: 600; color: #64748b; transition: 0.2s; border-radius: 8px 8px 0 0; }
+        .modal-tab:hover { background: #f8fafc; color: #334155; }
+        .modal-tab.active { color: #0f172a; border-bottom-color: #0f172a; background: white; }
+
+        /* Repair Logs UI */
+        .repair-cat-btn { text-align:left; font-size:0.85rem; padding:8px 12px; border-radius:6px; background:#f8fafc; color:#475569; border:1px solid #e2e8f0; transition:0.2s; width:100%; margin-bottom:4px; display:flex; align-items:center; justify-content:space-between; }
+        .repair-cat-btn:hover { background:#eff6ff; border-color:#bfdbfe; color:#1e40af; }
+        .repair-section-title { font-size:0.75rem; font-weight:700; color:#94a3b8; text-transform:uppercase; margin-bottom:8px; margin-top:12px; border-bottom:1px solid #f1f5f9; padding-bottom:4px; }
+
+        /* Status Buttons in Modal */
+        .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .status-btn { padding: 10px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 0.8rem; text-align: center; cursor: pointer; transition: 0.2s; background: white; color: #64748b; display:flex; align-items:center; justify-content:center; min-height:50px; }
+        .status-btn:hover { border-color: #94a3b8; background: #f8fafc; }
+        .status-btn.active-blue { border-color: #3b82f6; background: #eff6ff; color: #1e40af; font-weight: 700; box-shadow: 0 0 0 1px #3b82f6; }
+        .status-btn.active-green { border-color: #22c55e; background: #dcfce7; color: #15803d; font-weight: 700; box-shadow: 0 0 0 1px #22c55e; }
+
+        /* Custom Scrollbar for Repair List */
+        .custom-scroll::-webkit-scrollbar { width: 6px; }
+        .custom-scroll::-webkit-scrollbar-track { background: #f1f5f9; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        .custom-scroll::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        /* Reset SweetAlert2 Padding for Full Custom Modal (Transparent Background to hide white corners) */
+        .swal2-popup.swal-full-modal {
+            padding: 0 !important;
+            border: none !important;
+            border-radius: 16px !important;
+            max-width: 1200px !important; /* Constraint width here */
+            width: 95% !important; /* Use almost full width on mobile */
+            background: transparent !important; /* FIXED: Transparent background to avoid white corners */
+        }
+        .swal2-popup.swal-full-modal .swal2-html-container {
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow: hidden !important;
+        }
+        #edit-modal-content { 
+            max-height: 90vh; 
+            display: flex; 
+            flex-direction: column; 
+            border-radius: 16px; /* Ensure content is rounded */
+            overflow: hidden; /* Cut off anything outside rounded corners */
+        }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    </style>
+
+    <div class="dinoco-wrapper">
+        <div class="flex items-center gap-3 mb-6">
+            <h1 class="text-3xl font-bold text-slate-800"><i class="fa-solid fa-cube text-slate-400"></i> Inventory Command Center</h1>
+            <!-- NEW GOD MODE TRIGGER: Version Badge -->
+            <span id="version-badge" class="bg-slate-200 text-slate-600 text-xs px-2 py-1 rounded font-mono version-badge" onmousedown="startGodTimer()" onmouseup="clearGodTimer()" ontouchstart="startGodTimer()" ontouchend="clearGodTimer()">v9.9.29</span>
+        </div>
+
+        <div class="global-search-box">
+            <div class="text-slate-400 pl-2"><i class="fa-solid fa-magnifying-glass text-xl"></i></div>
+            <input type="text" id="global-search" class="global-input" placeholder="ค้นหา Serial Number, SKU, Model หรือ ชื่อลูกค้า..." onkeypress="if(event.key==='Enter'){ executeGlobalSearch(); event.preventDefault(); }">
+            <div class="hidden md:block h-8 w-px bg-slate-200 mx-2"></div>
+            <!-- Filter Dropdown Hidden by Default -->
+            <select id="inv-filter" class="filter-select hidden md:block">
+                <option value="all">สถานะทั้งหมด (All)</option>
+                <option value="group_active">✅ ใช้งานอยู่</option>
+                <option value="group_stock">📦 รอจำหน่าย</option>
+                <option value="group_repair">🛠️ กำลังซ่อม</option>
+            </select>
+            <button type="button" class="btn btn-primary whitespace-nowrap" onclick="executeGlobalSearch()">ค้นหา</button>
+        </div>
+
+        <div class="main-tabs">
+            <div class="main-tab active" onclick="switchMainTab('dash')"><i class="fa-solid fa-chart-pie"></i> Analytics Dashboard</div>
+            <div class="main-tab" onclick="switchMainTab('list')"><i class="fa-solid fa-boxes-stacked"></i> Inventory Manager</div>
+            <div class="main-tab" id="tab-catalog" onclick="switchMainTab('catalog')"><i class="fa-solid fa-book-open"></i> Product Catalog</div>
+            <div class="main-tab" onclick="switchMainTab('generate')"><i class="fa-solid fa-industry"></i> Production (Gen SN)</div>
+        </div>
+
+        <!-- 1. DASHBOARD -->
+        <div id="view-dash" class="view-section active">
+            <div class="kpi-grid">
+                <div class="kpi-card" onclick="goToInventory('all')"><div class="kpi-label">สินค้าทั้งหมด</div><div class="kpi-val" id="kpi-total">...</div><span class="bg-blue-soft">TOTAL ASSETS</span></div>
+                <div class="kpi-card" onclick="goToInventory('group_active')"><div class="kpi-label">สินค้าที่ใช้งานอยู่ (Active)</div><div class="kpi-val" id="kpi-active">...</div><span class="bg-green-soft">ACTIVE PRODUCT</span></div>
+                <div class="kpi-card" onclick="goToInventory('group_stock')"><div class="kpi-label">สินค้ารอลงทะเบียน (Pending)</div><div class="kpi-val" id="kpi-stock">...</div><span class="bg-orange-soft">PENDING REGISTRATION</span></div>
+                <div class="kpi-card" onclick="goToInventory('group_repair')"><div class="kpi-label">กำลังซ่อมบำรุง</div><div class="kpi-val" id="kpi-claim">...</div><span class="bg-red-soft">CLAIM PROCESS</span></div>
+            </div>
+            
+            <div class="flex flex-col md:flex-row gap-6 mb-6 items-start">
+                <!-- Expiring Alert -->
+                <div class="content-box flex-1 flex items-center gap-5 border-l-4 border-l-red-400">
+                    <div class="bg-red-50 p-3 rounded-full text-red-500 text-xl"><i class="fa-solid fa-clock-rotate-left"></i></div>
+                    <div><div class="text-sm font-bold text-slate-800 uppercase tracking-wider mb-1">Expiring Soon (30 Days)</div><div class="text-xs text-slate-500">สินค้า <span id="kpi-expiring" class="font-bold text-red-600 text-lg">...</span> ชิ้น กำลังจะหมดอายุประกัน</div></div>
+                </div>
+                
+                <!-- Top 10 Active Products (Removed Refresh Button) -->
+                <div class="content-box flex-[2] relative overflow-hidden">
+                    <div class="flex justify-between items-center mb-4 border-b border-slate-100 pb-3">
+                        <div class="font-bold text-slate-800 text-lg flex items-center gap-2"><i class="fa-solid fa-trophy text-yellow-500"></i> Top 10 Most Active Products (สินค้าที่มีผู้ใช้งานสูงสุด)</div>
+                        <!-- Removed Refresh Button -->
+                    </div>
+                    <div id="top-products-list" class="max-h-[400px] overflow-y-auto pr-2">
+                        <div class="text-center py-10 text-slate-400">Loading...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 2. INVENTORY LIST -->
+        <div id="view-list" class="view-section">
+            <div class="content-box p-0 overflow-hidden">
+                <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                    <h3 class="font-bold text-slate-700">รายการสินค้า (Inventory List)</h3>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="inv-table">
+                        <thead>
+                            <tr>
+                                <th width="25%">ชื่อสินค้า</th>
+                                <th width="12%">S/N</th>
+                                <th width="10%">วันที่ลงทะเบียน</th>
+                                <th width="8%">อายุการใช้งาน</th>
+                                <th width="10%">วันหมดอายุ</th>
+                                <th width="12%">สถานะ</th>
+                                <th width="5%" class="text-center">ลำดับ</th>
+                                <th width="5%" class="text-center">ซ่อม</th>
+                                <th width="5%" class="text-center">แก้ไข</th>
+                            </tr>
+                        </thead>
+                        <tbody id="inv-body">
+                            <tr><td colspan="9" class="text-center py-16 text-slate-400"><i class="fa-solid fa-magnifying-glass mb-3 text-3xl opacity-20"></i><br>กรุณาพิมพ์คำค้นหาหรือกดปุ่มค้นหา</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- 3. CATALOG -->
+        <div id="view-catalog" class="view-section">
+            <div class="mb-6 flex justify-between items-center">
+                <h3 class="text-xl font-bold text-slate-700">รายการสินค้า (Product Catalog)</h3>
+                <div id="god-mode-toolbar" class="hidden gap-2">
+                    <!-- FIXED: Corrected function call to openEditCatalogModal() -->
+                    <button class="btn btn-primary btn-sm rounded-lg" onclick="openEditCatalogModal()"><i class="fa-solid fa-plus"></i> เพิ่มสินค้าใหม่</button>
+                </div>
+            </div>
+            <div id="catalog-container" class="catalog-grid"><div class="text-center col-span-full py-20 text-slate-400"><i class="fa-solid fa-spinner fa-spin text-3xl"></i><br>Loading Catalog...</div></div>
+        </div>
+
+        <!-- 4. PRODUCTION -->
+        <div id="view-generate" class="view-section">
+             <div class="content-box max-w-4xl mx-auto p-0 overflow-hidden shadow-lg border-0">
+                <div class="bg-slate-800 p-6 text-white"><h3 class="font-bold text-xl flex items-center gap-2"><i class="fa-solid fa-industry"></i> Production : Generate S/N</h3><p class="text-slate-400 text-sm mt-1">ระบบสร้าง Serial Number สำหรับส่งโรงงานผลิต (Factory Mode)</p></div>
+                <div id="pin-lock-screen" class="p-12 text-center">
+                    <div class="mb-6"><i class="fa-solid fa-lock text-6xl text-slate-300"></i></div><h4 class="text-xl font-bold text-slate-700 mb-2">Restricted Access</h4><p class="text-slate-500 mb-6">กรุณาระบุ PIN Code เพื่อเข้าสู่โหมดผลิตสินค้า</p>
+                    <form onsubmit="event.preventDefault(); verifyPin();" class="flex justify-center gap-2 max-w-xs mx-auto">
+                        <input type="password" id="auth-pin" class="border border-slate-300 rounded-full px-4 py-2 w-full text-center tracking-widest text-lg outline-none focus:border-blue-500" placeholder="PIN" maxlength="4">
+                        <button type="submit" class="bg-slate-800 text-white px-4 py-2 rounded-full hover:bg-slate-700"><i class="fa-solid fa-arrow-right"></i></button>
+                    </form>
+                </div>
+                <div id="generator-interface" class="p-8 hidden">
+                    <div class="mb-6 p-5 bg-blue-50 border border-blue-100 rounded-xl"><label class="block text-sm font-bold text-blue-700 uppercase mb-3">1. เลือกสินค้าที่จะผลิต (Select SKU)</label><select id="gen-catalog-select" class="w-full border border-blue-300 p-3 rounded-lg text-base shadow-sm focus:ring-2 focus:ring-blue-500 outline-none" onchange="fillGenData()"><option value="">-- กรุณาเลือกสินค้าจาก Catalog --</option></select></div>
+                    <div class="grid grid-cols-2 gap-6 mb-4"><div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Product Model</label><input id="gen-model" class="w-full border p-3 rounded-lg bg-slate-50 text-slate-600" readonly></div><div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">SKU</label><input id="gen-sku" class="w-full border p-3 rounded-lg bg-slate-50 text-slate-600 font-mono font-bold" readonly></div></div>
+                    <div class="grid grid-cols-2 gap-6 mb-6"><div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Qty (จำนวน)</label><input type="number" id="gen-qty" class="w-full border p-3 rounded-lg font-bold text-lg text-blue-600" value="100"></div><div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Warranty (Years)</label><input type="number" id="gen-years" class="w-full border p-3 rounded-lg bg-slate-50" readonly></div></div>
+                    <button class="w-full bg-green-600 text-white font-bold py-4 rounded-xl hover:bg-green-700 shadow-lg text-lg transition transform hover:scale-[1.01]" onclick="runGen()"><i class="fa-solid fa-gears"></i> สร้าง S/N (Generate Serial Numbers)</button>
+                    <div id="gen-result-area" class="mt-8 hidden"><div class="flex justify-between items-center mb-2"><label class="font-bold text-slate-700">ผลลัพธ์ (Generated List)</label><button class="btn btn-outline btn-sm text-blue-600 border-blue-200 hover:bg-blue-50" onclick="exportToCSV()"><i class="fa-solid fa-file-csv"></i> Download CSV</button></div><textarea id="gen-output" class="w-full bg-slate-900 text-green-400 font-mono text-xs p-4 rounded-lg mb-4 h-48" readonly></textarea></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    <div id="modal-inv" class="fixed inset-0 bg-slate-900 bg-opacity-80 flex items-center justify-center z-[9999]" style="display:none;"></div>
+    
+    <!-- Unified Catalog Editor Modal -->
+    <div id="modal-catalog-editor" class="fixed inset-0 bg-slate-900 bg-opacity-90 flex items-center justify-center z-[9999]" style="display:none;">
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden animate-[fadeIn_0.2s] max-h-[90vh] flex flex-col">
+            <div class="bg-slate-800 p-5 flex justify-between items-center text-white shrink-0">
+                <h3 class="font-bold text-lg" id="cat-modal-title">Edit Product Details</h3>
+                <span class="cursor-pointer hover:text-red-400 bg-slate-700 w-8 h-8 flex items-center justify-center rounded-full transition" onclick="jQuery('#modal-catalog-editor').fadeOut()">x</span>
+            </div>
+            <div class="p-6 overflow-y-auto flex-grow">
+                <!-- Tabs UI Fixed -->
+                <div class="modal-tabs">
+                    <div class="modal-tab active" onclick="jQuery('.cat-tab').hide();jQuery('#cat-tab-1').fadeIn();jQuery(this).addClass('active').siblings().removeClass('active');">General Info</div>
+                    <div class="modal-tab" onclick="jQuery('.cat-tab').hide();jQuery('#cat-tab-2').fadeIn();jQuery(this).addClass('active').siblings().removeClass('active');">Set Components (ลูก)</div>
+                </div>
+
+                <div id="cat-tab-1" class="cat-tab">
+                    <div class="mb-4"><label class="block text-xs font-bold text-slate-500 uppercase mb-1">SKU (Unique ID)</label><input id="cat-sku" class="w-full border p-3 rounded-lg bg-slate-50" readonly placeholder="Ex. DNC-NEW-001"></div>
+                    <div class="mb-4"><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Product Name</label><input id="cat-name" class="w-full border p-3 rounded-lg" placeholder="Product Full Name"></div>
+                    <div class="mb-4"><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Image URL</label><input id="cat-img" class="w-full border p-3 rounded-lg" placeholder="https://..."></div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Price</label><input id="cat-price" class="w-full border p-3 rounded-lg" placeholder="1,000"></div>
+                        <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Warranty Years</label><input type="number" id="cat-years" class="w-full border p-3 rounded-lg" value="1"></div>
+                    </div>
+                </div>
+
+                <div id="cat-tab-2" class="cat-tab" style="display:none;">
+                    <div class="bg-blue-50 border border-blue-100 p-4 rounded-xl mb-4 text-sm text-blue-700"><i class="fa-solid fa-info-circle mr-1"></i> Add Child SKUs here if this product is a Set/Bundle.</div>
+                    <div id="cat-children-list" class="space-y-2 mb-4"></div>
+                    <div class="flex gap-2 pt-2 border-t"><select id="cat-new-child" class="flex-grow border p-2 rounded-lg text-sm"><option value="">-- Add Child Component --</option></select><button class="btn btn-primary btn-sm rounded-lg" onclick="addChildToCat()">Add</button></div>
+                </div>
+            </div>
+            <div class="p-4 border-t bg-slate-50 flex justify-end gap-2 shrink-0">
+                <button class="btn btn-outline rounded-lg" onclick="jQuery('#modal-catalog-editor').fadeOut()">Cancel</button>
+                <button class="btn btn-primary rounded-lg shadow-lg" onclick="saveCatalogItem()">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    jQuery(document).ready(function($) {
+        let catalogData = {}; let skuRelations = {}; let godModeTimer; const _p = "MjQ5OQ=="; /* 2499 Base64 */
+        function checkPin(input) { return btoa(input) === _p; }
+        
+        /* Pass Repair Map to JS */
+        const REPAIR_MAP = <?php echo json_encode(dinoco_get_repair_map()); ?>;
+
+        /* --- Core: UI Switching --- */
+        window.switchMainTab = function(t) {
+            $('.main-tab').removeClass('active'); $('.view-section').hide().removeClass('active'); 
+            if(t==='dash') { $('#view-dash').show().addClass('active'); $('.main-tab:eq(0)').addClass('active'); } 
+            if(t==='list') { $('#view-list').show().addClass('active'); $('.main-tab:eq(1)').addClass('active'); } 
+            if(t==='catalog') { $('#view-catalog').show().addClass('active'); $('.main-tab:eq(2)').addClass('active'); loadCatalog(); } 
+            if(t==='generate') { $('#view-generate').show().addClass('active'); $('.main-tab:eq(3)').addClass('active'); if(Object.keys(catalogData).length===0) loadCatalogDataForSelect(); } 
+        };
+
+        window.goToInventory = function(filter) { switchMainTab('list'); $('#inv-filter').val(filter); executeGlobalSearch(); };
+        
+        /* --- GOD MODE (Long Press Logic on Version Badge) --- */
+        window.startGodTimer = function() {
+            godModeTimer = setTimeout(() => {
+                Swal.fire({ 
+                    title: 'GOD MODE ACCESS', 
+                    text: 'Enter Security PIN (4 Digits)',
+                    input: 'password', 
+                    showCancelButton: true, 
+                    confirmButtonColor:'#1e293b', 
+                    background: '#0f172a', 
+                    color: '#fff',
+                    preConfirm: (pin) => { 
+                        if (checkPin(pin)) return true; 
+                        Swal.showValidationMessage('Invalid PIN'); 
+                    } 
+                }).then((result) => {
+                    if (result.isConfirmed) { 
+                        $('body').addClass('god-mode'); 
+                        $('#god-mode-toolbar').css('display','flex'); 
+                        /* Show Filter */
+                        $('#inv-filter').show().addClass('active');
+                        Swal.fire({ icon: 'success', title: 'God Mode: Active', text: 'Advanced Search Unlocked', timer: 1500, showConfirmButton: false }); 
+                    }
+                });
+            }, 10000); /* 10 Seconds */
+        };
+        
+        window.clearGodTimer = function() { clearTimeout(godModeTimer); };
+        window.verifyPin = function() { let pin = $('#auth-pin').val(); if (checkPin(pin)) { $('#pin-lock-screen').fadeOut(200, function() { $('#generator-interface').fadeIn(); }); } else { Swal.fire('Error', 'PIN Incorrect', 'error'); $('#auth-pin').val(''); } };
+
+        /* --- CATALOG & SET EDITOR (UNIFIED) --- */
+        window.openEditCatalogModal = function(sku = null) {
+            /* [FIX] Use unique action key */
+            $.post('', { dinoco_inventory_action: 'get_sku_relations' }, function(res) {
+                skuRelations = res.success ? res.data : {};
+                $('#cat-new-child').html('<option value="">-- Add Child Component --</option>');
+                Object.keys(catalogData).forEach(k => { $('#cat-new-child').append(`<option value="${k}">[${k}] ${catalogData[k].name}</option>`); });
+
+                if (sku) {
+                    let item = catalogData[sku];
+                    $('#cat-modal-title').text('แก้ไขข้อมูลสินค้า (Edit Product)');
+                    $('#cat-sku').val(sku).prop('readonly', true);
+                    $('#cat-name').val(item.name); $('#cat-img').val(item.img); $('#cat-price').val(item.price); $('#cat-years').val(item.years);
+                    renderCatChildren(sku);
+                } else {
+                    $('#cat-modal-title').text('เพิ่มสินค้าใหม่ (Add New Product)');
+                    $('#cat-sku').val('').prop('readonly', false);
+                    $('#cat-name').val(''); $('#cat-img').val(''); $('#cat-price').val(''); $('#cat-years').val(5);
+                    $('#cat-children-list').html('<div class="text-center text-slate-400 text-xs py-4">Save product first to add components</div>');
+                }
+                $('#modal-catalog-editor').fadeIn().css('display','flex');
+            });
+        };
+
+        function renderCatChildren(parentSku) {
+            let children = skuRelations[parentSku] || [];
+            let html = '';
+            children.forEach((child, index) => {
+                let childName = catalogData[child] ? catalogData[child].name : child;
+                let childImg = catalogData[child] ? catalogData[child].img : '';
+                let imgHtml = childImg ? `<img src="${childImg}" class="w-8 h-8 rounded border border-slate-200 mr-2 object-contain">` : `<div class="w-8 h-8 bg-slate-100 rounded border flex items-center justify-center text-[8px] text-slate-400 mr-2">NO PIC</div>`;
+                
+                html += `<div class="flex items-center justify-between bg-slate-50 p-2 rounded mb-1 border border-slate-100">
+                    <div class="flex items-center overflow-hidden mr-2">
+                        ${imgHtml}
+                        <span class="text-xs text-slate-600 truncate flex-grow" title="${childName}"><b class="mr-1">${child}</b> ${childName}</span>
+                    </div>
+                    <i class="fa-solid fa-trash text-red-400 cursor-pointer hover:text-red-600 px-2" onclick="removeCatChild('${parentSku}', ${index})"></i>
+                </div>`;
+            });
+            $('#cat-children-list').html(html || '<div class="text-center text-slate-400 text-xs py-4">No components in this set.</div>');
+        }
+
+        window.addChildToCat = function() {
+            let parent = $('#cat-sku').val(); let child = $('#cat-new-child').val(); if(!parent || !child) return;
+            if(!skuRelations[parent]) skuRelations[parent] = []; skuRelations[parent].push(child); renderCatChildren(parent);
+        };
+        window.removeCatChild = function(parent, index) { skuRelations[parent].splice(index, 1); renderCatChildren(parent); };
+
+        window.saveCatalogItem = function() {
+            let sku = $('#cat-sku').val(); if(!sku) return Swal.fire('Error', 'SKU Required', 'error');
+            /* [FIX] Use unique action key */
+            let d = { dinoco_inventory_action: 'save_product', sku: sku, name: $('#cat-name').val(), img: $('#cat-img').val(), price: $('#cat-price').val(), years: $('#cat-years').val() };
+            let children = skuRelations[sku] || [];
+            /* [FIX] Use unique action key */
+            $.when( $.post('', d), $.post('', { dinoco_inventory_action: 'save_sku_relation', parent_sku: sku, child_skus: children }) ).done(function() {
+                Swal.fire({icon:'success', title:'Saved', timer:1000, showConfirmButton:false}); $('#modal-catalog-editor').fadeOut(); loadCatalog();
+            });
+        };
+
+        window.deleteProduct = function(sku) {
+            Swal.fire({ title: 'Delete?', icon: 'warning', showCancelButton: true }).then((r) => {
+                /* [FIX] Use unique action key */
+                if(r.isConfirmed) $.post('', { dinoco_inventory_action: 'delete_product', sku: sku }, function() { loadCatalog(); });
+            });
+        };
+
+        /* --- Catalog Filter Logic --- */
+        window.filterCatalog = function(type) {
+            $('.catalog-filter-btn').removeClass('active');
+            event.target.classList.add('active');
+            let items = $('.catalog-item');
+            if(type === 'all') items.show();
+            else if(type === 'set') { items.hide(); items.has('.set-badge').show(); }
+            else if(type === 'single') { items.show(); items.has('.set-badge').hide(); }
+        }
+
+        /* --- Render Helpers --- */
+        function renderImageOrPlaceholder(url) {
+            if(!url || url.length < 5) return `<div class="no-pic-placeholder">NO PIC</div>`;
+            return `<img src="${url}" class="catalog-img" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'"> <div class="no-pic-placeholder" style="display:none;">NO PIC</div>`;
+        }
+        function renderThumb(url) {
+            if(!url || url.includes('placeholder') || url.length < 5) return `<div class="w-12 h-12 bg-slate-100 rounded-lg border border-slate-200 flex items-center justify-center text-[10px] text-slate-400 font-bold">NO PIC</div>`;
+            return `<img src="${url}" class="thumb-img" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'"> <div class="w-12 h-12 bg-slate-100 rounded-lg border border-slate-200 flex items-center justify-center text-[10px] text-slate-400 font-bold" style="display:none;">NO PIC</div>`;
+        }
+
+        window.loadCatalog = function() {
+            /* [FIX] Use unique action key */
+            $.post('', { dinoco_inventory_action: 'get_catalog' }, function(res) {
+                if(res.success) {
+                    catalogData = res.data;
+                    let html = '';
+                    Object.keys(catalogData).forEach(sku => {
+                        let item = catalogData[sku];
+                        let deleteBtn = `<div class="btn-delete-cat" onclick="deleteProduct('${sku}'); event.stopPropagation();"><i class="fa-solid fa-trash"></i></div>`;
+                        let editBtn = `<div class="btn-edit-cat" onclick="openEditCatalogModal('${sku}'); event.stopPropagation();"><i class="fa-solid fa-pen"></i></div>`;
+                        let imgHtml = renderImageOrPlaceholder(item.img);
+                        let badge = item.is_set ? '<span class="set-badge">SET</span>' : '';
+                        html += `<div class="catalog-item" onclick="searchCatalogItem('${sku}')">${deleteBtn}${editBtn}${badge}<div class="catalog-img-wrap">${imgHtml}</div><div class="catalog-body"><span class="catalog-sku">${sku}</span><div class="catalog-title">${item.name}</div><div class="text-xs text-slate-400 mb-2">Warranty: ${item.years} Years</div><div class="catalog-price">${item.price} ฿</div></div></div>`;
+                    });
+                    $('#catalog-container').html(html);
+                    populateGenSelect(); 
+                }
+            });
+        };
+
+        window.searchCatalogItem = function(sku) { $('#global-search').val(sku); executeGlobalSearch(); };
+        function populateGenSelect() { let opts = '<option value="">-- Select Product --</option>'; Object.keys(catalogData).forEach(sku => { opts += `<option value="${sku}">[${sku}] ${catalogData[sku].name}</option>`; }); $('#gen-catalog-select').html(opts); }
+        /* [FIX] Use unique action key */
+        function loadCatalogDataForSelect() { $.post('', { dinoco_inventory_action: 'get_catalog' }, function(res) { if(res.success) { catalogData = res.data; populateGenSelect(); } }); }
+        window.fillGenData = function() { let sku = $('#gen-catalog-select').val(); if(sku && catalogData[sku]) { $('#gen-model').val(catalogData[sku].name); $('#gen-sku').val(sku); $('#gen-years').val(catalogData[sku].years || 1); } };
+
+        window.executeGlobalSearch = function() {
+            let kw = $('#global-search').val();
+            let flt = $('#inv-filter').val();
+            let isGod = $('body').hasClass('god-mode'); /* Check if God Mode is active */
+
+            /* Rule: Normal Admin cannot search empty (Must provide exact match) */
+            if (!isGod && kw.trim() === '') {
+                Swal.fire({
+                    icon: 'warning',
+                    title: 'ระบุข้อมูลค้นหา',
+                    text: 'กรุณากรอก Serial Number หรือข้อมูลที่ต้องการค้นหา (ค้นหาตรงตัว 100%)',
+                    confirmButtonColor: '#1e293b'
+                });
+                return;
+            }
+
+            switchMainTab('list');
+            $('#inv-body').html('<tr><td colspan="9" class="text-center py-10 text-slate-400"><i class="fa-solid fa-spinner fa-spin text-2xl"></i> Loading...</td></tr>');
+            
+            /* [FIX] Cache Busting URL */
+            let ajaxUrl = window.location.href.split('#')[0];
+            ajaxUrl += (ajaxUrl.indexOf('?') !== -1 ? '&' : '?') + 'no_cache=' + new Date().getTime();
+
+            /* [FIX] Use unique action key */
+            $.post(ajaxUrl, { 
+                dinoco_inventory_action: 'search_inv', 
+                kw: kw, 
+                filter_status: flt,
+                is_god_mode: isGod 
+            }, function(res) {
+                if(res.success && res.data.length > 0) {
+                    let html = res.data.map(i => {
+                        let stClass = (i.status_key === 'warranty_on') ? 'st-green' : ((i.status_key === 'warranty_available') ? 'st-blue' : 'st-gray');
+                        return `<tr class="border-b hover:bg-slate-50">
+                            <td class="px-3 py-3 max-w-xs">
+                                <div class="font-bold text-slate-700 text-xs line-clamp-2">${i.model}</div>
+                                <div class="text-[10px] text-slate-400 font-mono mt-1">${i.sku}</div>
+                            </td>
+                            <td class="font-mono font-bold text-slate-600 px-3 py-3 text-xs">${i.sn}</td>
+                            <td class="text-xs px-3 py-3 text-slate-500">${i.reg_date}</td>
+                            <td class="text-xs px-3 py-3 text-slate-500">${i.usage_age}</td>
+                            <td class="text-xs px-3 py-3 text-slate-500 font-mono">${i.expiry}</td>
+                            <td class="px-3 py-3"><span class="st-badge ${stClass}">${i.status_label}</span></td>
+                            <td class="text-center text-xs px-3 py-3 font-bold text-slate-400">${i.seq}</td>
+                            <td class="text-center text-xs px-3 py-3 font-bold text-slate-400">${i.repair_count}</td>
+                            <td class="text-center px-3 py-3"><button class="bg-slate-800 text-white w-8 h-8 rounded flex items-center justify-center hover:bg-slate-900 transition" onclick="openDinocoEditModal_v9927('${i.id}')"><i class="fa-solid fa-pen"></i></button></td>
+                        </tr>`;
+                    }).join('');
+                    $('#inv-body').html(html);
+                } else { 
+                    $('#inv-body').html('<tr><td colspan="9" class="text-center py-12 text-red-400">ไม่พบข้อมูลสินค้า (ตรวจสอบความถูกต้องตัวสะกด)</td></tr>'); 
+                }
+            });
+        };
+
+        /* Render Repair Options (Grouping Logic) */
+        window.renderRepairOptions = function() {
+            let cats = { 'fg_':'Fairing Guard', 'eg_':'Engine Guard', 'tr_':'Rack (Top)', 'sr_':'Rack (Side)', 'rep_':'Parts/Plastic', 'original':'Condition', 'sticker_':'Spares', 'plate_':'Spares' };
+            let html = '';
+            /* Group by prefix */
+            let groups = {};
+            for(let key in REPAIR_MAP) {
+                let cat = 'Other';
+                for(let prefix in cats) { if(key.startsWith(prefix)) { cat = cats[prefix]; break; } }
+                if(key.includes('minor') || key.includes('align') || key.includes('weld')) cat = 'Maintenance';
+                if(!groups[cat]) groups[cat] = [];
+                groups[cat].push({k:key, v:REPAIR_MAP[key]});
+            }
+            
+            for(let cat in groups) {
+                html += `<div class="repair-section-title">${cat}</div>`;
+                groups[cat].forEach(item => {
+                    /* [FIXED] Pass Code (item.k) to appendRepairLog for Raw Data storage */
+                    html += `<button class="repair-cat-btn" onclick="appendRepairLog('${item.k}')"><span>${item.v}</span> <i class="fa-solid fa-plus-circle"></i></button>`;
+                });
+            }
+            return html;
+        };
+
+        window.appendRepairLog = function(text) {
+            let d = new Date();
+            let dateStr = ("0" + d.getDate()).slice(-2) + "/" + ("0"+(d.getMonth()+1)).slice(-2) + "/" + d.getFullYear();
+            let current = $('#repair-logs-area').val();
+            let newLine = dateStr + " : " + text;
+            $('#repair-logs-area').val(current ? current + "\n" + newLine : newLine);
+        };
+
+        /* RENAME FUNCTION TO BYPASS CACHE AGAIN (v9927) */
+        window.openDinocoEditModal_v9927 = function(id) {
+            Swal.fire({ title: 'Loading...', didOpen: () => Swal.showLoading() });
+            /* [FIX] Use unique action key */
+            $.post('', { dinoco_inventory_action: 'get_inv_det', pid: id }, function(res) {
+                Swal.close();
+                if ( res.success ) {
+                    let d = res.data;
+                    const statusOptions = [
+                        {val:'warranty_available', label:'สามารถลงทะเบียนรับประกันได้'},
+                        {val:'warranty_pending', label:'รอตรวจสอบประกัน ติดต่อแอดมิน'},
+                        {val:'old_warranty', label:'ระบบประกันเก่าไม่สามารถเช็คการซ่อมได้'},
+                        {val:'warranty_on', label:'รับประกันสินค้าสินค้าใหม่สภาพสมบูรณ์'},
+                        {val:'repaired', label:'ผ่านการซ่อมบำรุง'},
+                        {val:'refurbished', label:'สภาพพร้อมใช้งาน'},
+                        {val:'modified', label:'ดัดแปลงสภาพ'},
+                        {val:'claim_process', label:'อยู่ระหว่างดำเนินการซ่อมบำรุง'},
+                        {val:'warranty_expiry', label:'หมดอายุการรับประกัน'},
+                        {val:'void', label:'ตัดประกัน (Void)'}
+                    ];
+                    
+                    let statusBtnsHtml = '<div class="status-grid">';
+                    statusOptions.forEach( opt => { 
+                        let activeClass = (d.w_status === opt.val) ? 'active-green' : ''; 
+                        statusBtnsHtml += `<div class="status-btn ${activeClass}" onclick="selectStatus(this, '${opt.val}')">${opt.label}</div>`; 
+                    });
+                    statusBtnsHtml += '</div><input type="hidden" id="edit-status" value="' + d.w_status + '">';
+
+                    let repairOpts = renderRepairOptions();
+
+                    /* Split Layout: Left (60% col-span-7) = Info + Logs, Right (40% col-span-5) = Actions */
+                    let html = `<div id="edit-modal-content" class="bg-white w-full text-left font-sans text-sm relative" style="display: flex; flex-direction: column;">
+                        <div class="bg-slate-800 p-4 flex justify-between items-center text-white"><h3 class="font-bold text-white">แก้ไขสินค้า (Inventory Edit)</h3><span class="cursor-pointer hover:text-red-400" onclick="Swal.close()">x</span></div>
+                        <div class="p-6 grid grid-cols-12 gap-6" style="max-height:80vh; overflow-y:auto;">
+                            
+                            <!-- Left Column (60%): Basic Info + Logs -->
+                            <div class="col-span-12 md:col-span-7 space-y-4 border-r pr-6">
+                                <h4 class="font-bold text-slate-700 border-b pb-2 mb-2"><i class="fa-solid fa-lock"></i> ตรวจสอบข้อมูล (READ ONLY)</h4>
+                                
+                                <div class="flex items-start gap-4 mb-4">
+                                    <div class="w-32 h-32 flex-shrink-0 bg-white border rounded-lg p-2 flex items-center justify-center">${renderThumb(d.pic_url)}</div>
+                                    <div class="flex-grow space-y-2">
+                                        <div><label class="text-[10px] text-slate-400 font-bold uppercase">Serial Number</label><div class="font-mono font-bold text-slate-700 bg-slate-50 p-2 rounded border">${d.sn}</div></div>
+                                        <div><label class="text-[10px] text-slate-400 font-bold uppercase">Model / SKU</label><div class="text-xs text-slate-600 bg-slate-50 p-2 rounded border">${d.model}<br><span class="text-[10px] text-slate-400">${d.sku}</span></div></div>
+                                    </div>
+                                </div>
+                                
+                                <div class="grid grid-cols-2 gap-4">
+                                    <div><label class="text-[10px] text-slate-400 font-bold uppercase">Owner</label><div class="bg-slate-50 p-2 rounded border text-xs text-slate-600 truncate">${d.owner_product || '-'}</div></div>
+                                    <div><label class="text-[10px] text-slate-400 font-bold uppercase">Register Date</label><div class="bg-slate-50 p-2 rounded border text-xs text-slate-600">${d.warranty_register_date}</div></div>
+                                </div>
+
+                                <div class="mt-4">
+                                    <label class="block text-xs font-bold text-slate-700 uppercase mb-2">Repair Logs (ประวัติซ่อม - ภาษาไทย)</label>
+                                    <textarea id="repair-logs-area" class="w-full border p-4 rounded-lg bg-slate-50 text-slate-600 font-mono text-sm h-64 focus:ring-2 focus:ring-blue-500 transition shadow-inner leading-relaxed" placeholder="ยังไม่มีรายการซ่อม...">${d.repair_logs || ''}</textarea>
+                                    <div class="text-[10px] text-slate-400 mt-1 text-right">* แสดงผลเป็นภาษาไทย (Auto-Translated)</div>
+                                </div>
+                            </div>
+
+                            <!-- Right Column (40%): Actions & Repair Selector -->
+                            <div class="col-span-12 md:col-span-5 space-y-6 pl-2">
+                                <h4 class="font-bold text-blue-600 border-b pb-2 mb-2"><i class="fa-solid fa-pen"></i> แก้ไขข้อมูล (EDIT)</h4>
+                                
+                                <div class="mb-4">
+                                    <label class="block text-xs font-bold text-slate-500 uppercase mb-1">สถานะเดิม (Current)</label>
+                                    <div class="bg-slate-800 text-white p-3 rounded-lg text-center font-bold">${d.status_label}</div>
+                                </div>
+
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-500 uppercase mb-2">เลือกสถานะใหม่ (Status Selection)</label>
+                                    ${statusBtnsHtml}
+                                </div>
+                                
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-500 uppercase mb-1">วันหมดอายุ (Expiry)</label>
+                                    <input id="edit-expiry" class="w-full border p-3 rounded text-center font-bold text-slate-700 text-lg" value="${d.warranty_expiry}">
+                                </div>
+                                
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-500 uppercase mb-1">ระยะเวลา (ปี)</label>
+                                    <input id="edit-duration" type="number" class="w-full border p-3 rounded text-lg" value="${d.warranty_duration_years}">
+                                </div>
+
+                                <div class="bg-blue-50 p-4 rounded-xl border border-blue-100">
+                                    <label class="block text-xs font-bold text-blue-700 uppercase mb-3 flex items-center gap-2"><i class="fa-solid fa-screwdriver-wrench"></i> บันทึกรายการซ่อม (Add Repair Log)</label>
+                                    <div class="overflow-y-auto h-[250px] pr-2 custom-scroll bg-white rounded border border-slate-200 p-2 shadow-inner">${repairOpts}</div>
+                                </div>
+                            </div>
+
+                        </div>
+                        <div class="p-4 border-t bg-slate-50 flex justify-end gap-3 sticky bottom-0 bg-white">
+                            <button class="bg-white border border-slate-300 text-slate-600 px-6 py-2 rounded hover:bg-slate-50 font-bold" onclick="Swal.close()">ยกเลิก (Cancel)</button>
+                            <button class="bg-slate-900 hover:bg-black text-white px-8 py-2 rounded shadow-lg font-bold" onclick="confirmSaveInv('${d.id}')"><i class="fa-solid fa-save"></i> บันทึกข้อมูล (Save Changes)</button>
+                        </div>
+                    </div>`;
+                    
+                    /* FIXED: Full Modal Configuration */
+                    Swal.fire({ 
+                        title: null, 
+                        html: html, 
+                        showConfirmButton: false, 
+                        width: '90%',
+                        padding: 0,
+                        customClass: { popup: 'swal-full-modal' } 
+                    });
+                }
+            });
+        };
+
+        window.selectStatus = function(btn, val) { $('.status-btn').removeClass('active-green active-blue'); $(btn).addClass('active-blue'); $('#edit-status').val(val); };
+        
+        window.confirmSaveInv = function(id) { 
+            let data = { 
+                pid: id, 
+                status: $('#edit-status').val(), 
+                owner: $('#edit-owner').val(), 
+                expiry: $('#edit-expiry').val(),
+                duration: $('#edit-duration').val(),
+                repair_logs: $('#repair-logs-area').val() /* Save raw text from textarea */
+            }; 
+            /* [FIX] Use unique action key */
+            $.post('', { dinoco_inventory_action: 'upd_inv', ...data }, function() { 
+                Swal.fire({icon:'success', title:'Saved', timer:1000, showConfirmButton:false}); 
+                executeGlobalSearch(); 
+            }); 
+        };
+        
+        window.runGen = function() { 
+            /* [FIX] Use unique action key */
+            let d = { dinoco_inventory_action: 'gen_batch', model:$('#gen-model').val(), sku:$('#gen-sku').val(), prefix:'WRTDNC'+new Date().toISOString().slice(2,10).replace(/-/g,""), qty:$('#gen-qty').val(), years:$('#gen-years').val() }; 
+            if(!d.sku) return; 
+            Swal.fire({ title:'Generating...', didOpen:()=>Swal.showLoading() }); 
+            $.post('', d, function(res) { Swal.close(); if(res.success) { currentCsvData = res.csv_data; $('#gen-output').val('Generated').slideDown(); $('#gen-result-area').show(); } else Swal.fire('Error',res.msg,'error'); }); 
+        };
+        window.exportToCSV = function() { if(currentCsvData.length===0) return; let csv = "SN,SKU\n"+currentCsvData.map(r=>`${r.sn},${r.sku}`).join("\n"); let link = document.createElement("a"); link.href = encodeURI("data:text/csv;charset=utf-8,"+csv); link.download = "sn.csv"; link.click(); };
+        
+        window.loadAnalytics = function() { 
+            /* [FIX] Cache Busting URL */
+            let ajaxUrl = window.location.href.split('#')[0];
+            ajaxUrl += (ajaxUrl.indexOf('?') !== -1 ? '&' : '?') + 'no_cache=' + new Date().getTime();
+
+            /* [FIX] Use unique action key */
+            $.post(ajaxUrl, { dinoco_inventory_action: 'get_dashboard_stats' }, function(res) { 
+                if(res.success) { 
+                    let d = res.data; 
+                    $('#kpi-total').text(d.total.toLocaleString()); 
+                    $('#kpi-active').text(d.active.toLocaleString()); 
+                    $('#kpi-stock').text(d.stock.toLocaleString()); 
+                    $('#kpi-claim').text(d.claim.toLocaleString()); 
+                    $('#kpi-expiring').text(d.expiring.toLocaleString()); 
+                    
+                    let html = '<table class="top-table"><thead><tr><th>Rank</th><th>Product</th><th class="text-right">Owners</th></tr></thead><tbody>';
+                    if(d.top_products.length > 0) {
+                        d.top_products.forEach((p, index) => {
+                            let rank = index + 1;
+                            let rankHtml = `<span class="rank-badge rank-n">${rank}</span>`;
+                            if(rank===1) rankHtml = `<span class="rank-badge rank-1"><i class="fa-solid fa-trophy"></i></span>`;
+                            if(rank===2) rankHtml = `<span class="rank-badge rank-2"><i class="fa-solid fa-medal"></i></span>`;
+                            if(rank===3) rankHtml = `<span class="rank-badge rank-3"><i class="fa-solid fa-medal"></i></span>`;
+                            let imgHtml = renderThumb(p.img);
+                            
+                            html += `<tr>
+                                <td class="w-12 text-center py-2 pl-4">${rankHtml}</td>
+                                <td class="py-2"><div class="flex items-center gap-3"><img src="${p.img || ''}" class="top-thumb" onerror="this.style.display='none'"> <div><div class="top-name text-xs line-clamp-1">${p.name}</div><div class="top-sku">${p.sku}</div></div></div></td>
+                                <td class="text-right pr-4"><span class="top-count">${p.count}</span></td>
+                            </tr>`;
+                        });
+                        html += '</tbody></table>';
+                    } else {
+                        html = '<div class="text-center text-slate-400 py-10">No Data Available</div>';
+                    }
+                    $('#top-products-list').html(html);
+                } 
+            }); 
+        };
+        
+        loadAnalytics(); loadCatalogDataForSelect();
+    });
+    </script>
+    <?php 
+    return ob_get_clean();
+}
