@@ -1,0 +1,3143 @@
+/*
+ * Plugin Name: [Admin System] AI Command Center (Dinoco Enterprise)
+ * Plugin URI: https://www.facebook.com/
+ * Description: ระบบควบคุม AI สำหรับ DINOCO THAILAND (v22.0 Function Calling) - ข้อมูลมาจาก code ไม่ใช่ AI คิดเอง
+ * Version: 22.0.0
+ * Author: DINOCO Dev Team
+ * License: GPLv2 or later
+ *
+ * ===== CHANGELOG v22.0.0 (Function Calling Architecture) =====
+ * [ARCH] เปลี่ยนจาก "dump all into prompt" → Gemini Function Calling
+ *   AI เรียก tool functions เพื่อดึงข้อมูล → PHP return ข้อมูลจริง → AI ตอบ
+ *   - get_product(model, category, variant) → 1 สินค้า + 1 รูป ผิดไม่ได้
+ *   - get_dealer(location) → ร้านจริงจาก KB มโนไม่ได้
+ *   - get_kb_answer(question) → ข้อมูลจาก KB จริง
+ *   - escalate_to_admin(reason) → ส่งคนจริงตอบ
+ * [PROMPT] ลดจาก 18 กฎ → 8 กฎ | 4,000 คำ → 800 คำ
+ * [ZERO-HALLUCINATION] ข้อมูลร้าน/สินค้า/ราคา มาจาก function return ทั้งหมด
+ *
+ * ===== CHANGELOG v20.1.0 =====
+ * [SMART] เพิ่ม Smart Claim Tracker — AI รู้ว่าลูกค้าให้ข้อมูลอะไรมาแล้ว ไม่ถามซ้ำ
+ * [SMART] Prompt ฉลาดขึ้น — กฎ anti-repetition เข้มงวด + ตัวอย่างเฉพาะสถานการณ์
+ * [QUEUE] เพิ่มกฎข้อ 10: ถ้าลูกค้าส่งหลายข้อความ ให้อ่านรวมกัน
+ *
+ * ===== CHANGELOG v20.0.0 =====
+ * [CRITICAL] สร้าง generate_smart_prompt() ที่หายไปจาก v19 (Fatal Error ทุกครั้งที่แชท)
+ * [CRITICAL] เรียกใช้ Knowledge Base + Inventory ใน prompt (v19 ไม่เคยเรียกเลย)
+ * [CRITICAL] แก้ webhook ให้ใช้ logic เดียวกับ plugin (v19 duplicate logic + มี bug แยก)
+ * [ARCH]     Prompt ใหม่ทั้งหมด — modular, ไม่ขัดกัน, ไม่ inject ซ้ำซ้อน
+ * [ARCH]     เพิ่ม public methods: get_ai_response(), build_conversation_turns() สำหรับ webhook
+ * [TUNE]     Temperature 0.1→0.35, maxOutputTokens 800→2048
+ * [FIX]      History merge + validate_turns() ป้องกัน consecutive same-role
+ * [FIX]      ลบ turn-level injection 500+ tokens ที่ซ้ำซ้อนทุกข้อความ
+ * [NEW]      Error handling + retry + debug log + graceful degradation
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+class Dinoco_AI_Brain_v22 {
+
+    private $config_file;
+    private $log_file;
+    private $debug_log_file;
+
+    // === AI Configuration Constants ===
+    const AI_TEMPERATURE    = 0.35;
+    const AI_MAX_TOKENS     = 2048;
+    const AI_HISTORY_LIMIT  = 12;
+    const AI_KB_MAX_ENTRIES = 5;
+    const AI_TIMEOUT        = 30;     // v22: เพิ่มจาก 20 → 30 (function calling ต้องรอ multi-turn)
+    const AI_MODEL_PRIMARY  = 'gemini-2.0-flash';
+    const AI_MODEL_FALLBACK = 'gemini-1.5-flash-latest';
+    const AI_FC_MAX_LOOPS   = 4;      // v22: function calling max iterations
+
+    /** @var string FC status for last request */
+    private $last_fc_status = 'unknown';
+
+    // =========================================================================
+    // CONSTRUCTOR
+    // =========================================================================
+    public function __construct() {
+        $upload_dir            = wp_upload_dir();
+        $this->config_file     = $upload_dir['basedir'] . '/dinoco_ai_config_v9.json';
+        $this->log_file        = $upload_dir['basedir'] . '/dinoco_chat_logs_v9.json';
+        $this->debug_log_file  = $upload_dir['basedir'] . '/dinoco_ai_debug.log';
+
+        add_action( 'acf/init', [ $this, 'register_acf_options_page' ] );
+        add_action( 'init', [ $this, 'handle_api_requests' ] );
+        add_shortcode( 'dinoco_admin_ai_control', [ $this, 'render_ui' ] );
+    }
+
+    public function register_acf_options_page() {
+        if ( function_exists( 'acf_add_options_page' ) ) {
+            acf_add_options_page( [
+                'page_title' => 'AI Core Settings (สมอง AI)',
+                'menu_title' => 'AI Core Settings',
+                'menu_slug'  => 'dinoco-ai-core-settings',
+                'capability' => 'manage_options',
+                'redirect'   => false,
+                'icon_url'   => 'dashicons-admin-network',
+                'position'   => 30,
+            ] );
+        }
+    }
+
+    // =========================================================================
+    // [SECTION 1] AI CORE — PERSONA, KB, INVENTORY, PROMPT
+    // =========================================================================
+
+    /**
+     * ดึง persona/rules จาก ACF Options หรือ fallback จาก wp_options
+     * v20: ลบ sections 6/7/8 ที่ขัดกัน → ย้ายเป็น rules ใน generate_smart_prompt()
+     */
+    private function get_core_persona_data() {
+        $prompt = "";
+
+        if ( function_exists( 'get_field' ) ) {
+            // ดึงข้อมูลจาก ACF fields
+            $fields = [
+                'ai_persona'           => '[1. บทบาทและหน้าที่]',
+                'ai_tone_of_voice'     => '[2. น้ำเสียงการตอบ]',
+                'negative_prompts'     => '[3. ข้อห้ามเด็ดขาด]',
+                'human_handoff_script' => '[4. สคริปต์โอนแอดมิน]',
+            ];
+
+            foreach ( $fields as $key => $label ) {
+                $val = get_field( $key, 'option' );
+                if ( ! empty( $val ) ) {
+                    $prompt .= "{$label}\n{$val}\n\n";
+                }
+            }
+
+            // SOP Flow (ถ้ามี)
+            $flow_name = get_field( 'flow_name', 'option' );
+            if ( ! empty( $flow_name ) ) {
+                $prompt .= "[5. SOP: {$flow_name}]\n";
+                $s1 = get_field( 'step_1_ask', 'option' );
+                $s2 = get_field( 'step_2_ask', 'option' );
+                $sm = get_field( 'success_message', 'option' );
+                if ( ! empty( $s1 ) ) $prompt .= "ขั้นตอน 1: {$s1}\n";
+                if ( ! empty( $s2 ) ) $prompt .= "ขั้นตอน 2: {$s2}\n";
+                if ( ! empty( $sm ) ) $prompt .= "เมื่อสำเร็จ: {$sm}\n";
+                $prompt .= "\n";
+            }
+        }
+
+        // Fallback: ถ้า ACF ว่าง → ดึงจาก wp_options
+        if ( empty( trim( $prompt ) ) ) {
+            $config = get_option( 'dinoco_ai_config_v9', [] );
+            if ( ! empty( $config['core_prompt'] ) ) {
+                $prompt = $config['core_prompt'];
+            } else {
+                $prompt = "คุณคือ AI Admin ของ DINOCO THAILAND\n";
+                $prompt .= "หน้าที่: ให้ข้อมูลสินค้า (กล่องอลูมิเนียม, แคชบาร์, แร็ค) และบริการหลังการขาย\n";
+                $prompt .= "ตอบกระชับ สุภาพ เป็นภาษาไทย ลงท้ายด้วย 'ค่ะ'\n";
+            }
+        }
+
+        return $prompt;
+    }
+
+    /**
+     * ดึง Knowledge Base ทั้งหมดจาก CPT 'ai_knowledge' + wp_options
+     */
+    private function get_knowledge_base() {
+        $kb = [];
+
+        // ดึงจาก CPT
+        $posts = get_posts( [
+            'post_type'      => 'ai_knowledge',
+            'posts_per_page' => -1,
+            'post_status'    => [ 'publish', 'private' ],
+        ] );
+
+        foreach ( $posts as $post ) {
+            $intent = get_post_meta( $post->ID, 'training_phrases', true );
+            if ( ! empty( $intent ) ) {
+                $kb[] = [
+                    'q'      => $intent,
+                    'f'      => get_post_meta( $post->ID, 'core_facts', true ),
+                    'a'      => get_post_meta( $post->ID, 'ai_action', true ),
+                    'legacy' => get_post_meta( $post->ID, 'exact_response', true ),
+                ];
+            }
+        }
+
+        // ดึงจาก wp_options (Manual KB)
+        $config = get_option( 'dinoco_ai_config_v9', [] );
+        if ( ! empty( $config['knowledge'] ) && is_array( $config['knowledge'] ) ) {
+            $kb = array_merge( $kb, $config['knowledge'] );
+        }
+
+        return $kb;
+    }
+
+    /**
+     * ★ KB MATCHING — หา KB entries ที่เกี่ยวข้องกับคำถามของลูกค้า
+     * v19: ไม่มี method นี้เลย (KB ถูกดึงมาแต่ไม่เคยใช้)
+     * v20: ใช้ scoring algorithm — keyword match + phrase match
+     * v20.1: เพิ่ม Thai synonym expansion + multi-column search + compound word split
+     */
+    private function find_relevant_kb( $user_msg, $history_ctx = '' ) {
+        $all_kb = $this->get_knowledge_base();
+        if ( empty( $all_kb ) ) return [];
+
+        // === Thai Synonym Map — ลูกค้าพิมพ์ต่าง แต่หมายความเดียวกัน ===
+        $synonym_map = [
+            // กล่อง/ปี๊บ
+            'ปิ๊ป'     => 'ปี๊บ', 'ปิ้บ' => 'ปี๊บ', 'ปิ๊บ' => 'ปี๊บ',
+            'เคส'      => 'กล่อง', 'case' => 'กล่อง',
+            'ท็อปเคส'  => 'กล่องหลัง', 'topcase' => 'กล่องหลัง',
+            'ไซด์เคส'  => 'กล่องข้าง', 'sidecase' => 'กล่องข้าง',
+            // รุ่นรถ (ภาษาไทย → keyword ใน KB)
+            'ฟอร์ซ่า'  => 'forza', 'ฟอซ่า' => 'forza', 'ฟอร์ซา' => 'forza',
+            'เอ็นเอ็ก' => 'nx500', 'เอ็นเอ็กซ์' => 'nx500',
+            'ซีบี'     => 'cb500', 'ซีบีห้าร้อย' => 'cb500x',
+            'ทรานซัลป์'=> 'transalp', 'ทรานซาลป์' => 'transalp',
+            'เอดีวี'   => 'adv', 'แอดวี' => 'adv',
+            'เอ็กแม็ก' => 'xmax', 'เอ็กแม็กซ์' => 'xmax',
+            'เอ็นแม็ก' => 'nmax', 'เอ็นแม็กซ์' => 'nmax',
+            'พีซีเอ็ก' => 'pcx', 'พีซีเอ็กซ์' => 'pcx',
+            // สินค้า
+            'แคชบาร์'  => 'กันล้ม', 'แครชบาร์' => 'กันล้ม', 'เหล็กกัน' => 'กันล้ม',
+            'crashbar'  => 'กันล้ม', 'crash bar' => 'กันล้ม',
+            'แร็ก'     => 'แร็ค', 'แร๊ก' => 'แร็ค', 'แร๊ค' => 'แร็ค',
+            'ตะแกรง'   => 'แร็ค',
+            // ตัวแทน/สถานที่
+            'สาขา'     => 'ตัวแทน', 'ร้าน' => 'ตัวแทน', 'ศูนย์' => 'ตัวแทน',
+            'ดีลเลอร์' => 'ตัวแทน', 'dealer' => 'ตัวแทน', 'ซื้อที่ไหน' => 'ตัวแทน',
+            'ที่ไหน'   => 'ตัวแทน',
+            // พื้นที่ กทม → trigger dealer KB
+            'รามอินทรา' => 'ตัวแทน กทม ร้านแถวรามอินทรา',
+            'ลาดพร้าว'  => 'ตัวแทน กทม ร้านแถวลาดพร้าว',
+            'บางเขน'    => 'ตัวแทน กทม',
+            'ดอนเมือง'  => 'ตัวแทน กทม',
+            'มีนบุรี'   => 'ตัวแทน กทม',
+            'ฝั่งธน'    => 'ตัวแทน กทม',
+            'ยานนาวา'   => 'ตัวแทน กทม',
+            'ตลิ่งชัน'  => 'ตัวแทน กทม',
+            'บางนา'     => 'ตัวแทน สมุทรปราการ',
+            'ปากน้ำ'    => 'ตัวแทน สมุทรปราการ',
+            'รังสิต'    => 'ตัวแทน นนทบุรี ปทุมธานี',
+            'นนทบุรี'   => 'ตัวแทน นนทบุรี',
+            // ภาคอื่นๆ
+            'เชียงใหม่' => 'ตัวแทน ภาคเหนือ',
+            'โคราช'     => 'ตัวแทน ภาคอีสาน',
+            'อุดร'      => 'ตัวแทน ภาคอีสาน',
+            'ขอนแก่น'   => 'ตัวแทน ภาคอีสาน',
+            'ภูเก็ต'    => 'ตัวแทน ภาคใต้',
+            'หาดใหญ่'   => 'ตัวแทน ภาคใต้',
+            'ชลบุรี'    => 'ตัวแทน ภาคตะวันออก',
+            'ระยอง'     => 'ตัวแทน ภาคตะวันออก',
+            'พัทยา'     => 'ตัวแทน ภาคตะวันออก',
+            // ★ v21: จังหวัดที่ไม่มีตัวแทน → expand เพื่อ match E80-E83
+            'สุพรรณบุรี' => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'นครปฐม'     => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'อยุธยา'     => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'กาญจนบุรี'  => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'สระบุรี'    => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'ลพบุรี'     => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'เพชรบุรี'   => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'หัวหิน'     => 'ตัวแทน ภาคกลาง ไม่มีตัวแทน',
+            'พิษณุโลก'   => 'ตัวแทน ภาคเหนือ ไม่มีตัวแทน',
+            'น่าน'       => 'ตัวแทน ภาคเหนือ ไม่มีตัวแทน',
+            'ตาก'        => 'ตัวแทน ภาคเหนือ ไม่มีตัวแทน',
+            'เพชรบูรณ์'  => 'ตัวแทน ภาคเหนือ ไม่มีตัวแทน',
+            'บุรีรัมย์'  => 'ตัวแทน ภาคอีสาน ไม่มีตัวแทน',
+            'สุรินทร์'   => 'ตัวแทน ภาคอีสาน ไม่มีตัวแทน',
+            'ชัยภูมิ'    => 'ตัวแทน ภาคอีสาน ไม่มีตัวแทน',
+            'ร้อยเอ็ด'   => 'ตัวแทน ภาคอีสาน ไม่มีตัวแทน',
+            'สกลนคร'     => 'ตัวแทน ภาคอีสาน ไม่มีตัวแทน',
+            'ศรีสะเกษ'   => 'ตัวแทน ภาคอีสาน ไม่มีตัวแทน',
+            'กระบี่'     => 'ตัวแทน ภาคใต้ ไม่มีตัวแทน',
+            'ตรัง'       => 'ตัวแทน ภาคใต้ ไม่มีตัวแทน',
+            'ชุมพร'      => 'ตัวแทน ภาคใต้ ไม่มีตัวแทน',
+            'ยะลา'       => 'ตัวแทน ภาคใต้ ไม่มีตัวแทน',
+            'นครศรี'     => 'ตัวแทน ภาคใต้ นครศรีธรรมราช ไม่มีตัวแทน',
+            // แบรนด์
+            'จีน'      => 'ประเทศ', 'นำเข้า' => 'ประเทศ', 'ของแท้' => 'ประเทศ',
+            'ของจีน'   => 'ของจีนไหม',
+            // เคลม/ประกัน
+            'ลอก'      => 'หลุด', 'หลุดลอก' => 'โลโก้ลอก',
+            'ซ่อม'     => 'เคลม', 'เปลี่ยน' => 'เคลม',
+            // การชำระเงิน
+            'รูดบัตร'  => 'บัตรเครดิต', 'ผ่อน' => 'ผ่อนได้ไหม',
+            'โปร'      => 'ส่วนลด', 'ลดราคา' => 'ส่วนลด',
+            'ต่อรอง'   => 'ลดราคา ส่วนลด ต่อรองราคา',
+            'ต่อราคา'  => 'ลดราคา ส่วนลด ต่อรองราคา',
+            'คูปอง'    => 'ลดราคา ส่วนลด โค้ดลด',
+            'โค้ดลด'   => 'ลดราคา ส่วนลด',
+            // อื่นๆ
+            'ซักซับใน' => 'ซักอินเนอร์', 'ล้างซับใน' => 'ซักอินเนอร์',
+            'กว้างไหม' => 'ขนาดกล่อง', 'ใส่หมวกได้ไหม' => 'ใส่หมวก',
+            // ยี่ห้อ/รุ่นที่ไม่มีของ
+            'ยามาฮ่า'  => 'nmax xmax aerox', 'yamaha' => 'nmax xmax aerox',
+            'เวสป้า'   => 'lambretta', 'vespa' => 'lambretta',
+            'จีพีเอ็ก' => 'gpx', 'โดรน' => 'drone',
+            'บีเอ็ม'   => 'bmw', 'ไทรอัมพ์' => 'triumph',
+            // เคลม — compound words ที่ลูกค้ามักพิมพ์ติดกัน
+            'สติ๊กเกอร์ลอก' => 'สติ๊กเกอร์หลุด โลโก้ลอก',
+            'ประกันลอก'     => 'สติ๊กเกอร์หลุด โลโก้ลอก',
+            'สติกเกอร์'     => 'สติ๊กเกอร์',
+            'มุมแตก'        => 'มุมกล่องแตก มุมพลาสติกแตก',
+            'กุญแจหาย'      => 'กุญแจหาย ทำกุญแจหาย',
+        ];
+
+        // === เตรียม search context ===
+        $raw_search = mb_strtolower( $user_msg . ' ' . $history_ctx, 'UTF-8' );
+        $raw_search = preg_replace( '/\s+/', ' ', trim( $raw_search ) );
+
+        // ★ v20.1: ตัด compound Thai words ที่ไม่มี space ออกเป็นคำย่อย
+        // เช่น "สติ๊กเกอร์มันลอกอ่ะ" → เพิ่ม "สติ๊กเกอร์" + "ลอก" เข้าไปใน search
+        $thai_splitters = [
+            'สติ๊กเกอร์', 'โลโก้', 'กุญแจ', 'ประกัน', 'อะไหล่', 'กันล้ม',
+            'แคชบาร์', 'กล่อง', 'แร็ค', 'ปี๊บ', 'เคลม', 'อินเนอร์',
+            'การ์ดแฮนด์', 'เบสเพลท', 'ถาดรอง',
+        ];
+        $extra_parts = '';
+        foreach ( $thai_splitters as $ts ) {
+            if ( mb_strpos( $raw_search, $ts ) !== false ) {
+                $extra_parts .= ' ' . $ts;
+                // ดึงส่วนที่เหลือหลัง keyword ออกมาด้วย
+                $parts = explode( $ts, $raw_search );
+                foreach ( $parts as $part ) {
+                    $part = trim( $part );
+                    if ( mb_strlen( $part, 'UTF-8' ) >= 2 ) {
+                        $extra_parts .= ' ' . $part;
+                    }
+                }
+            }
+        }
+        $raw_search .= $extra_parts;
+
+        // Expand synonyms ใน search string
+        $expanded_search = $raw_search;
+        foreach ( $synonym_map as $slang => $standard ) {
+            if ( mb_strpos( $expanded_search, mb_strtolower( $slang, 'UTF-8' ) ) !== false ) {
+                $expanded_search .= ' ' . mb_strtolower( $standard, 'UTF-8' );
+            }
+        }
+
+        // ลบอักขระพิเศษ (เก็บภาษาไทย+อังกฤษ+ตัวเลข)
+        $clean_search = preg_replace( '/[^\p{Thai}\p{L}\p{N}\s]/u', ' ', $expanded_search );
+        $clean_search = preg_replace( '/\s+/', ' ', trim( $clean_search ) );
+
+        $scored = [];
+
+        foreach ( $all_kb as $entry ) {
+            $score   = 0;
+            $matched = 0;
+
+            // ★ v20.1: ค้นหาทั้ง 3 คอลัมน์ (ไม่ใช่แค่ training_phrases)
+            $intent = mb_strtolower( isset( $entry['q'] ) ? $entry['q'] : '', 'UTF-8' );
+            $facts  = mb_strtolower( isset( $entry['f'] ) ? $entry['f'] : '', 'UTF-8' );
+            $action = mb_strtolower( isset( $entry['a'] ) ? $entry['a'] : '', 'UTF-8' );
+
+            // ★ ลบ quotes และอักขระพิเศษออกจาก KB text ก่อน matching
+            $intent_clean = preg_replace( '/["\'""\(\)]/u', ' ', $intent );
+            $intent_clean = preg_replace( '/\s+/', ' ', trim( $intent_clean ) );
+
+            // รวมทุก column เป็น searchable text
+            $kb_text = $intent_clean . ' ' . $facts . ' ' . $action;
+
+            // 1) Keyword matching จาก intent (primary — คะแนนสูง)
+            $keywords = array_filter(
+                preg_split( '/[\s,]+/u', $intent_clean ),
+                function( $w ) { return mb_strlen( $w, 'UTF-8' ) >= 2; }
+            );
+
+            foreach ( $keywords as $kw ) {
+                $kw = trim( $kw );
+                if ( empty( $kw ) ) continue;
+                if ( mb_strpos( $clean_search, $kw ) !== false ) {
+                    $matched++;
+                    $score += ( mb_strlen( $kw, 'UTF-8' ) >= 4 ) ? 15 : 8;
+                }
+            }
+
+            // 2) ★ Compound word matching — ค้นหาทั้ง "สติ๊กเกอร์ลอก" เป็นวลีเดียว
+            $user_words = preg_split( '/\s+/u', $raw_search );
+            foreach ( $user_words as $uw ) {
+                if ( mb_strlen( $uw, 'UTF-8' ) >= 6 ) {
+                    // คำยาว → ลองตัดย่อยแล้วเทียบกับ intent
+                    foreach ( $keywords as $kw ) {
+                        $kw = trim( $kw );
+                        if ( mb_strlen( $kw, 'UTF-8' ) >= 3 && mb_strpos( $uw, $kw ) !== false ) {
+                            if ( mb_strpos( $clean_search, $kw ) === false ) {
+                                // keyword อยู่ใน compound word แต่ไม่ match จากขั้นตอน 1
+                                $matched++;
+                                $score += 12;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2b) ★ Reverse substring matching — เช็คว่า search words อยู่ใน KB keywords ไหม
+            // เช่น KB keyword = "สติ๊กเกอร์หลุด" → search มี "สติ๊กเกอร์" + "หลุด" แยกกัน
+            $search_words = array_filter(
+                preg_split( '/\s+/u', $clean_search ),
+                function( $w ) { return mb_strlen( $w, 'UTF-8' ) >= 3; }
+            );
+            foreach ( $keywords as $kw ) {
+                $kw = trim( $kw );
+                if ( mb_strlen( $kw, 'UTF-8' ) < 6 ) continue; // เฉพาะ compound keyword ยาว
+                $sub_hits = 0;
+                foreach ( $search_words as $sw ) {
+                    $sw = trim( $sw );
+                    if ( mb_strlen( $sw, 'UTF-8' ) >= 3 && mb_strpos( $kw, $sw ) !== false ) {
+                        $sub_hits++;
+                    }
+                }
+                if ( $sub_hits >= 2 ) {
+                    // search words หลายตัวอยู่ใน KB keyword เดียว → compound match
+                    $matched += $sub_hits;
+                    $score += 20;
+                }
+            }
+
+            // 3) Phrase matching — เช็ควลียาว
+            $phrases = preg_split( '/\s{2,}|\n/', $intent );
+            foreach ( $phrases as $phrase ) {
+                $phrase = trim( $phrase );
+                if ( mb_strlen( $phrase, 'UTF-8' ) >= 4 && mb_strpos( $clean_search, $phrase ) !== false ) {
+                    $score += 30;
+                }
+            }
+
+            // 4) ★ Facts/Action column matching (secondary — คะแนนต่ำกว่า)
+            if ( $score < 15 && $matched < 1 ) {
+                $fact_keywords = array_filter(
+                    preg_split( '/[\s,]+/u', $facts . ' ' . $action ),
+                    function( $w ) { return mb_strlen( $w, 'UTF-8' ) >= 4; }
+                );
+
+                $fact_matched = 0;
+                foreach ( $fact_keywords as $fk ) {
+                    $fk = trim( $fk );
+                    if ( ! empty( $fk ) && mb_strpos( $clean_search, $fk ) !== false ) {
+                        $fact_matched++;
+                        $score += 5; // คะแนนต่ำกว่า intent
+                    }
+                }
+                $matched += $fact_matched;
+            }
+
+            // Threshold
+            if ( $score >= 12 && $matched >= 1 ) {
+                $scored[] = [ 'score' => $score, 'entry' => $entry ];
+            }
+        }
+
+        // Sort by score descending
+        usort( $scored, function( $a, $b ) { return $b['score'] <=> $a['score']; } );
+
+        // Return top N entries
+        $results = [];
+        foreach ( $scored as $i => $s ) {
+            if ( $i >= self::AI_KB_MAX_ENTRIES ) break;
+            $results[] = $s['entry'];
+        }
+
+        return $results;
+    }
+
+    /**
+     * ★ v21: DEALER MATCHING — ค้นหาตัวแทนจำหน่ายแยกจาก KB ปกติ
+     * เพื่อแก้ปัญหา: ลูกค้าพิมพ์ชื่อจังหวัด → KB ปกติให้คะแนน product entries สูงกว่า
+     * → entry ตัวแทนหลุดจาก top 5 → AI มโนชื่อร้านขึ้นมา
+     *
+     * วิธีแก้: ดึง dealer entry แยก แล้ว force-inject เข้า prompt เสมอ
+     */
+    private function find_dealer_kb( $user_msg, $history_ctx = '' ) {
+        $all_kb = $this->get_knowledge_base();
+        if ( empty( $all_kb ) ) return null;
+
+        $ctx = mb_strtolower( $user_msg . ' ' . $history_ctx, 'UTF-8' );
+
+        // === จังหวัด/โซน ที่ต้อง trigger dealer search ===
+        $location_map = [
+            // กทม
+            'กทม'         => 67, 'กรุงเทพ'     => 67, 'บางเขน'      => 67,
+            'รามอินทรา'   => 67, 'ลาดพร้าว'    => 67, 'ดอนเมือง'    => 67,
+            'มีนบุรี'     => 67, 'ฝั่งธน'       => 67, 'ยานนาวา'     => 67,
+            'ตลิ่งชัน'    => 67, 'พระราม'       => 67, 'จตุจักร'     => 67,
+            'บางกะปิ'     => 67, 'สะพานควาย'    => 67, 'อารีย์'      => 67,
+            'สาทร'        => 67, 'สีลม'         => 67, 'บางซื่อ'     => 67,
+            'ห้วยขวาง'    => 67, 'สุขุมวิท'     => 67, 'อ่อนนุช'     => 67,
+            'บางแค'       => 67, 'พุทธมณฑล'     => 67,
+            // นนทบุรี/ปทุมธานี
+            'นนทบุรี'     => 68, 'นนท์'         => 68, 'ปทุมธานี'    => 68,
+            'ปทุม'        => 68, 'รังสิต'       => 68,
+            // สมุทรปราการ
+            'สมุทรปราการ' => 69, 'บางนา'        => 69, 'ปากน้ำ'      => 69,
+            'บางพลี'      => 69, 'ศรีนครินทร์'  => 69,
+            // ภาคเหนือ
+            'เชียงใหม่'   => 70, 'เชียงราย'     => 70, 'ลำปาง'       => 70,
+            'ลำพูน'       => 70, 'พะเยา'        => 70,
+            // ภาคอีสาน
+            'โคราช'       => 71, 'นครราชสีมา'   => 71, 'อุดร'        => 71,
+            'อุดรธานี'    => 71, 'หนองคาย'      => 71, 'ขอนแก่น'     => 71,
+            'อุบล'        => 71, 'อุบลราชธานี'  => 71,
+            // ภาคใต้
+            'ภูเก็ต'      => 54, 'สงขลา'        => 54, 'หาดใหญ่'     => 54,
+            'สตูล'        => 54, 'สุราษฎร์'     => 54,
+            // ภาคตะวันออก
+            'ชลบุรี'      => 53, 'ระยอง'        => 53, 'พัทยา'       => 53,
+
+            // ★ v21: จังหวัดที่ไม่มีตัวแทน → แนะนำร้านใกล้สุด
+            // ภาคกลาง/ตะวันตก/ตะวันออก (E80)
+            'สุพรรณบุรี'  => 80, 'นครปฐม'       => 80, 'อยุธยา'      => 80,
+            'กาญจนบุรี'   => 80, 'สมุทรสาคร'    => 80, 'สมุทรสงคราม' => 80,
+            'อ่างทอง'     => 80, 'สิงห์บุรี'    => 80, 'ลพบุรี'      => 80,
+            'สระบุรี'     => 80, 'นครนายก'      => 80, 'ราชบุรี'     => 80,
+            'เพชรบุรี'    => 80, 'ประจวบ'       => 80, 'หัวหิน'      => 80,
+            'ชัยนาท'      => 80, 'อุทัยธานี'    => 80, 'ฉะเชิงเทรา' => 80,
+            'ปราจีนบุรี'  => 80, 'สระแก้ว'      => 80, 'ตราด'        => 80,
+            'จันทบุรี'    => 80, 'นครสวรรค์'    => 80,
+            // ภาคเหนือตอนล่าง (E81)
+            'พิษณุโลก'    => 81, 'ตาก'          => 81, 'สุโขทัย'     => 81,
+            'น่าน'        => 81, 'แพร่'         => 81, 'อุตรดิตถ์'   => 81,
+            'กำแพงเพชร'   => 81, 'พิจิตร'       => 81, 'เพชรบูรณ์'   => 81,
+            'แม่ฮ่องสอน'  => 81,
+            // อีสาน ไม่มีตัวแทนเฉพาะ (E82)
+            'ร้อยเอ็ด'    => 82, 'มหาสารคาม'    => 82, 'กาฬสินธุ์'   => 82,
+            'สกลนคร'      => 82, 'นครพนม'       => 82, 'มุกดาหาร'    => 82,
+            'ยโสธร'       => 82, 'อำนาจเจริญ'   => 82, 'ศรีสะเกษ'    => 82,
+            'สุรินทร์'    => 82, 'บุรีรัมย์'    => 82, 'ชัยภูมิ'     => 82,
+            'เลย'         => 82, 'หนองบัวลำภู'  => 82,
+            // ภาคใต้ ไม่มีตัวแทนเฉพาะ (E83)
+            'นครศรีธรรมราช' => 83, 'กระบี่'      => 83, 'ตรัง'        => 83,
+            'พังงา'       => 83, 'ชุมพร'        => 83, 'ระนอง'       => 83,
+            'ยะลา'        => 83, 'ปัตตานี'      => 83, 'นราธิวาส'    => 83,
+            'พัทลุง'      => 83, 'สุราษฎร์ธานี' => 83, 'สมุย'        => 83,
+        ];
+
+        // ค้นหาจังหวัด/โซนในข้อความ
+        foreach ( $location_map as $location => $entry_num ) {
+            if ( mb_strpos( $ctx, $location ) !== false ) {
+                // entry_num เป็น 1-based (ตรงกับ entry number) → index = entry_num - 1
+                $idx = $entry_num - 1;
+                if ( isset( $all_kb[ $idx ] ) ) {
+                    return $all_kb[ $idx ];
+                }
+            }
+        }
+
+        // ถ้าไม่เจอจังหวัด → ลองเช็คว่ามี keyword ตัวแทน/ร้าน/ซื้อที่ไหน
+        $dealer_triggers = [ 'ตัวแทน', 'ซื้อที่ไหน', 'ร้านใกล้', 'จังหวัด', 'อยู่แถว', 'ร้านแถว', 'ดีลเลอร์' ];
+        foreach ( $dealer_triggers as $dt ) {
+            if ( mb_strpos( $ctx, $dt ) !== false ) {
+                // ต้องการข้อมูลตัวแทนแต่ไม่ระบุจังหวัด → return null (AI จะถามจังหวัด)
+                return 'ASK_PROVINCE';
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * ★ INVENTORY MATCHING — ดึงสินค้าจาก wp_options: dinoco_product_catalog
+     * ข้อมูลนี้คือ "แคตาล็อกสินค้า" (ชื่อ, ราคา, รูป) ที่ AI จะเสนอให้ลูกค้าดู
+     * จากนั้นแนะนำไปซื้อกับตัวแทนจำหน่าย
+     *
+     * v19: method มีอยู่แต่ไม่เคยถูกเรียกใช้! AI จึงไม่รู้ราคาหรือรูปสินค้าเลย
+     * v20: เรียกใช้ใน generate_smart_prompt() — AI เห็นสินค้าตรงรุ่นทุกครั้ง
+     */
+    private function get_relevant_inventory( $user_context ) {
+        $catalog = get_option( 'dinoco_product_catalog', [] );
+        if ( empty( $catalog ) || ! is_array( $catalog ) ) {
+            return "";
+        }
+
+        $ctx = mb_strtolower( $user_context, 'UTF-8' );
+
+        // === ตรวจจับรุ่นรถจากบริบท ===
+        $model_map = [
+            'nx500'    => [ 'nx500', 'nx 500', 'เอ็นเอ็ก' ],
+            'cb500x'   => [ 'cb500x', 'cb500', 'cb 500', 'ซีบี' ],
+            'adv350'   => [ 'adv350', 'adv 350' ],
+            'forza350' => [ 'forza350', 'forza 350', 'forza', 'ฟอร์ซ่า' ],
+            'forza750' => [ 'forza750', 'forza 750' ],
+            'xl750'    => [ 'xl750', 'transalp', 'ทรานซัลป์' ],
+            'xadv750'  => [ 'xadv', 'x-adv', 'xadv750' ],
+            'nmax'     => [ 'nmax', 'เอ็นแม็ก' ],
+            'xmax'     => [ 'xmax', 'เอ็กแม็ก' ],
+            'pcx'      => [ 'pcx' ],
+            'ct125'    => [ 'ct125', 'ct 125' ],
+        ];
+
+        $detected_models = [];
+        foreach ( $model_map as $mk => $aliases ) {
+            foreach ( $aliases as $alias ) {
+                if ( mb_strpos( $ctx, $alias ) !== false ) {
+                    $detected_models[ $mk ] = true;
+                    break;
+                }
+            }
+        }
+
+        // Fix: "adv" alone → adv350 (ไม่ใช่ xadv)
+        if ( ! isset( $detected_models['adv350'] ) && preg_match( '/\badv\b/iu', $ctx ) && ! isset( $detected_models['xadv750'] ) ) {
+            $detected_models['adv350'] = true;
+        }
+
+        // Fix: "forza" alone → forza350 (ไม่ใช่ 750 ถ้าไม่ได้ระบุ)
+        if ( isset( $detected_models['forza350'] ) && isset( $detected_models['forza750'] ) ) {
+            // ถ้ามี 750 explicit ให้ลบ forza350 ออก
+            unset( $detected_models['forza350'] );
+        }
+
+        // === ตรวจจับประเภทสินค้า ===
+        $type_keywords = [
+            'side_box' => [ 'กล่องข้าง', 'ปี๊บข้าง', 'sidebox', 'side box', 'side case' ],
+            'top_box'  => [ 'กล่องหลัง', 'กล่องท้าย', 'ปี๊บหลัง', 'ปี๊บท้าย', 'topbox', 'top box', 'top case' ],
+            'rack'     => [ 'แร็ค', 'ตะแกรง', 'rack' ],
+            'guard'    => [ 'กันล้ม', 'แคชบาร์', 'crash bar', 'crashbar', 'แครชบาร์' ],
+            'bag'      => [ 'กระเป๋า', 'bag', 'dry bag' ],
+            'acc'      => [ 'เบาะ', 'อินเนอร์', 'ซับใน', 'ถาด', 'plate', 'อะไหล่' ],
+            'general'  => [ 'กล่อง', 'ปี๊บ', 'box', 'เท่าไหร่', 'ราคา', 'สนใจ' ],
+        ];
+
+        $detected_types = [];
+        foreach ( $type_keywords as $tk => $kws ) {
+            foreach ( $kws as $kw ) {
+                if ( mb_strpos( $ctx, $kw ) !== false ) {
+                    $detected_types[ $tk ] = true;
+                    break;
+                }
+            }
+        }
+
+        $has_model = ! empty( $detected_models );
+        $has_type  = ! empty( $detected_types );
+
+        // ถ้าไม่มีทั้งรุ่นรถและประเภทสินค้า → ไม่ต้อง inject
+        if ( ! $has_model && ! $has_type ) {
+            return "";
+        }
+
+        // ถ้ามีประเภทสินค้าแต่ไม่มีรุ่นรถ → บอก AI ให้ถามรุ่นรถก่อน
+        if ( ! $has_model && $has_type ) {
+            return "[📦 คลังสินค้า] ⚠️ ลูกค้าถามหาสินค้าแต่ยังไม่ระบุรุ่นรถ\n"
+                 . "คำสั่ง: ห้ามเสนอสินค้าใดๆ ห้ามเดารุ่น ให้ถามรุ่นรถก่อน เช่น 'ลูกค้าใช้รถรุ่นไหนคะ?'";
+        }
+
+        // ถ้ามีรุ่นรถแต่ไม่มีประเภท → บอก AI ให้ถามประเภท
+        if ( $has_model && ! $has_type ) {
+            return "[📦 คลังสินค้า] ⚠️ ลูกค้าระบุรุ่นรถแล้ว แต่ยังไม่ระบุประเภทสินค้า\n"
+                 . "คำสั่ง: ห้ามร่ายรายการทั้งหมด ให้ถามว่า 'สนใจเป็นกล่องท้าย กล่องข้าง แร็ค หรือกันล้มดีคะ?'";
+        }
+
+        // === ทั้งรุ่นรถ + ประเภทมีครบ → ค้นหาจาก catalog ===
+        $hits = [];
+
+        foreach ( $catalog as $sku => $item ) {
+            if ( ! is_array( $item ) || empty( $item['name'] ) ) continue;
+            $name_lower = mb_strtolower( $item['name'], 'UTF-8' );
+            $score = 0;
+            $model_matched = false;
+
+            // 1) เช็ครุ่นรถตรง
+            foreach ( $detected_models as $mk => $_ ) {
+                $aliases = isset( $model_map[ $mk ] ) ? $model_map[ $mk ] : [];
+                foreach ( $aliases as $alias ) {
+                    if ( mb_strpos( $name_lower, $alias ) !== false ) {
+                        $score += 100;
+                        $model_matched = true;
+                        break 2;
+                    }
+                }
+            }
+
+            // 2) เช็คว่าเป็นสินค้า Universal (ไม่มีชื่อรุ่นรถในชื่อ + ไม่ใช่ rack/guard)
+            if ( ! $model_matched ) {
+                $is_universal = true;
+
+                // ถ้ามีชื่อรุ่นรถในชื่อสินค้า → ไม่ใช่ Universal
+                foreach ( $model_map as $aliases ) {
+                    foreach ( $aliases as $alias ) {
+                        if ( mb_strpos( $name_lower, $alias ) !== false ) {
+                            $is_universal = false;
+                            break 2;
+                        }
+                    }
+                }
+
+                // Rack และ Guard เป็นตรงรุ่นเสมอ
+                if ( preg_match( '/(rack|guard|crash|กันล้ม|แร็ค|แคชบาร์)/i', $name_lower ) ) {
+                    $is_universal = false;
+                }
+
+                if ( $is_universal ) {
+                    $score += 60;
+                    $model_matched = true;
+                }
+            }
+
+            // ถ้ามีรุ่นรถ detected แต่สินค้านี้ไม่ match → ข้ามไป
+            if ( $has_model && ! $model_matched ) {
+                continue;
+            }
+
+            // 3) เช็คประเภทสินค้า
+            foreach ( $detected_types as $tk => $_ ) {
+                $type_kws = isset( $type_keywords[ $tk ] ) ? $type_keywords[ $tk ] : [];
+                foreach ( $type_kws as $tkw ) {
+                    if ( mb_strpos( $name_lower, $tkw ) !== false ) {
+                        $score += 50;
+                        break;
+                    }
+                }
+            }
+
+            // Threshold — ถ้าระบุทั้งรุ่นรถ+ประเภท ต้อง match ทั้งสองอย่าง
+            if ( $has_model && $has_type ) {
+                // ต้องได้ทั้ง model (100) + type (50) = 150+
+                if ( $score >= 150 ) {
+                    $item['sku']   = $sku;
+                    $item['score'] = $score;
+                    $hits[]        = $item;
+                }
+            } else {
+                // ระบุอย่างเดียว — threshold เดิม
+                if ( $score >= 50 ) {
+                    $item['sku']   = $sku;
+                    $item['score'] = $score;
+                    $hits[]        = $item;
+                }
+            }
+        }
+
+        if ( empty( $hits ) ) {
+            // Fallback: ถ้า strict match ไม่เจอ → ลอง model-only (score >= 100)
+            foreach ( $catalog as $sku => $item ) {
+                if ( ! is_array( $item ) || empty( $item['name'] ) ) continue;
+                $name_lower = mb_strtolower( $item['name'], 'UTF-8' );
+                $fb_score = 0;
+                $fb_model = false;
+                foreach ( $detected_models as $mk => $_ ) {
+                    $aliases = isset( $model_map[ $mk ] ) ? $model_map[ $mk ] : [];
+                    foreach ( $aliases as $alias ) {
+                        if ( mb_strpos( $name_lower, $alias ) !== false ) {
+                            $fb_score += 100;
+                            $fb_model = true;
+                            break 2;
+                        }
+                    }
+                }
+                if ( $fb_model ) {
+                    $item['sku']   = $sku;
+                    $item['score'] = $fb_score;
+                    $hits[]        = $item;
+                }
+            }
+        }
+
+        if ( empty( $hits ) ) {
+            return "[📦 คลังสินค้า] ❌ ไม่พบสินค้าตรงรุ่นในฐานข้อมูล\n"
+                 . "คำสั่ง: แจ้งลูกค้าว่า 'ขออภัยค่ะ ทางเรายังไม่มีสินค้าประเภทนี้ตรงรุ่นค่ะ'";
+        }
+
+        // Sort by score → take top 6
+        usort( $hits, function( $a, $b ) { return $b['score'] <=> $a['score']; } );
+        $hits = array_slice( $hits, 0, 6 );
+
+        // ★ v21: Detect category per item and group output
+        $category_map = [
+            'กันล้ม'   => '🛡️ กันล้ม',
+            'crash'    => '🛡️ กันล้ม',
+            'กล่องข้าง' => '📦 กล่องข้าง',
+            'side'     => '📦 กล่องข้าง',
+            'กล่องหลัง' => '📦 กล่องหลัง',
+            'กล่องท้าย' => '📦 กล่องหลัง',
+            'top box'  => '📦 กล่องหลัง',
+            'top case' => '📦 กล่องหลัง',
+            'แร็ค'     => '🔩 แร็ค',
+            'rack'     => '🔩 แร็ค',
+            'กระเป๋า'  => '🎒 กระเป๋า',
+            'bag'      => '🎒 กระเป๋า',
+            'dry'      => '🎒 กระเป๋า',
+            'handguard' => '🖐️ การ์ดแฮนด์',
+            'การ์ด'    => '🖐️ การ์ดแฮนด์',
+        ];
+
+        // Assign category to each hit
+        foreach ( $hits as &$h ) {
+            $name_lower = mb_strtolower( isset( $h['name'] ) ? $h['name'] : '', 'UTF-8' );
+            $h['category'] = '📋 อื่นๆ';
+            foreach ( $category_map as $kw => $cat ) {
+                if ( mb_strpos( $name_lower, $kw ) !== false ) {
+                    $h['category'] = $cat;
+                    break;
+                }
+            }
+        }
+        unset( $h );
+
+        // Group by category
+        $groups = [];
+        foreach ( $hits as $h ) {
+            $groups[ $h['category'] ][] = $h;
+        }
+
+        // Format output grouped by category
+        $out = "[📦 คลังสินค้า] ✅ พบสินค้าตรงรุ่น:\n";
+        foreach ( $groups as $cat => $items ) {
+            $out .= "\n--- {$cat} ---\n";
+            foreach ( $items as $h ) {
+                $name    = isset( $h['name'] ) ? $h['name'] : '?';
+                $price   = isset( $h['price'] ) ? $h['price'] : '-';
+                $sku_val = isset( $h['sku'] ) ? $h['sku'] : '-';
+                $years   = isset( $h['years'] ) ? $h['years'] : '-';
+                $img     = ! empty( $h['img'] ) ? $h['img'] : '';
+                $out .= "• {$name} | ราคา: {$price} บาท | SKU: {$sku_val}";
+                if ( $years && $years !== '-' && $years !== '0' ) {
+                    $out .= " | ประกัน: {$years} ปี";
+                }
+                if ( ! empty( $img ) ) {
+                    $out .= "\n  👆 รูปของสินค้านี้: {$img}";
+                }
+                $out .= "\n";
+            }
+        }
+        $out .= "\n⚠️ กฎสำคัญในการใช้คลังสินค้า:\n";
+        $out .= "1. ต้องใช้ชื่อสินค้าเต็มจากรายการด้านบนเท่านั้น ห้ามย่อ ห้ามเปลี่ยนชื่อเอง\n";
+        $out .= "2. **ต้องส่งรูปสินค้าทุกครั้ง** — พิมพ์ [IMG:url] โดยเอา url จาก '👆 รูปของสินค้านี้:' ที่อยู่ใต้ชื่อสินค้าตัวนั้น\n";
+        $out .= "3. ⛔ **ห้ามใช้รูปข้ามหมวด** เช่น พูดเรื่องกันล้ม ห้ามเอารูปจากหมวดกล่อง / พูดเรื่องกล่อง ห้ามเอารูปจากหมวดกันล้ม — ดูจาก --- หมวด --- ที่แบ่งไว้ด้านบน\n";
+        $out .= "4. ถ้าสินค้าที่ลูกค้าถามไม่มีรูป ห้ามส่งรูปอื่นแทน ให้บอกว่า 'ขออภัยค่ะ ยังไม่มีรูปสินค้านี้ค่ะ'\n";
+        $out .= "5. แจ้งราคาและรูปที่ตรงกับสินค้า แล้วถามจังหวัดเพื่อแนะนำตัวแทนจำหน่าย\n";
+
+        return $out;
+    }
+
+    /**
+     * ★ analyze_claim_status() ★
+     * วิเคราะห์ประวัติแชทเพื่อตรวจสอบว่าลูกค้าให้ข้อมูลเคลมอะไรมาแล้วบ้าง
+     * inject ผลลัพธ์ลง prompt → AI จะรู้ว่าต้องถามอะไรเพิ่ม
+     *
+     * v20.1: NEW — แก้ปัญหา AI ถามข้อมูลซ้ำที่ลูกค้าให้ไปแล้ว
+     */
+    private function analyze_claim_status( $history_raw ) {
+        $has_photo   = false;
+        $has_address = false;
+        $has_phone   = false;
+        $is_claim    = false;
+        $photo_count = 0;
+        $address_text = '';
+        $phone_text   = '';
+
+        // คำที่บ่งบอกว่าเป็นเรื่องเคลม
+        $claim_keywords = [ 'เคลม', 'หลุด', 'ลอก', 'แตก', 'หัก', 'พัง', 'ชำรุด', 'เสียหาย',
+                            'สติ๊กเกอร์', 'โลโก้', 'กาว', 'น็อต', 'มุม', 'ร้าว', 'บุบ', 'งอ',
+                            'ประกัน', 'ซ่อม', 'เปลี่ยน', 'เบิก', 'ปัญหา', 'มีปัญหา', 'สนิม',
+                            'น้ำเข้า', 'รั่ว', 'กุญแจหาย' ];
+
+        // Address patterns
+        $address_keywords = [ 'จังหวัด', 'อำเภอ', 'ตำบล', 'แขวง', 'เขต', 'ซอย', 'ถนน',
+                              'หมู่', 'บ้านเลขที่', 'ไปรษณีย์', 'รหัสไปรษณีย์',
+                              'กรุงเทพ', 'นนทบุรี', 'ปทุมธานี', 'สมุทรปราการ',
+                              'บริษัท', 'จำกัด', 'คอร์ปอเรชั่น' ];
+
+        // Phone patterns
+        $phone_pattern = '/0[0-9]{1,2}[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{3,4}/u';
+
+        foreach ( $history_raw as $h ) {
+            $text = isset( $h['text'] ) ? $h['text'] : '';
+            $role = isset( $h['role'] ) ? $h['role'] : '';
+            $text_lower = mb_strtolower( $text, 'UTF-8' );
+
+            // ตรวจจับว่าเป็นเรื่องเคลมหรือไม่
+            if ( $role === 'user' || $role === 'ai' || $role === 'model' ) {
+                foreach ( $claim_keywords as $kw ) {
+                    if ( mb_strpos( $text_lower, $kw ) !== false ) {
+                        $is_claim = true;
+                        break;
+                    }
+                }
+            }
+
+            // ตรวจข้อมูลจากฝั่ง user เท่านั้น
+            if ( $role !== 'user' ) continue;
+
+            // 1) รูปภาพ — เช็คทุกวิธี
+            if ( ! empty( $h['image'] ) ) {
+                $has_photo = true;
+                $photo_count++;
+            }
+            // ★ v20.1.1: เช็คทุก marker ที่เป็นไปได้
+            if ( mb_strpos( $text, '[แนบรูปภาพ' ) !== false ) {
+                $has_photo = true;
+                // ดึงจำนวนรูปจาก marker "[แนบรูปภาพ 3 รูป]"
+                if ( preg_match( '/\[แนบรูปภาพ\s*(\d+)\s*รูป\]/', $text, $pm ) ) {
+                    $photo_count += intval( $pm[1] );
+                } else {
+                    $photo_count++;
+                }
+            }
+            if ( mb_strpos( $text, '[ลูกค้ารายนี้เพิ่งส่งรูปภาพ' ) !== false ) {
+                $has_photo = true;
+                $photo_count++;
+            }
+
+            // 2) ที่อยู่ — ตรวจจากคำที่บ่งบอกที่อยู่ หรือข้อความยาว > 30 ตัวอักษรที่มีตัวเลข
+            foreach ( $address_keywords as $akw ) {
+                if ( mb_strpos( $text_lower, $akw ) !== false ) {
+                    $has_address = true;
+                    $address_text = mb_substr( $text, 0, 80, 'UTF-8' );
+                    break;
+                }
+            }
+            // ตรวจจับรหัสไปรษณีย์ 5 หลัก
+            if ( ! $has_address && preg_match( '/\d{5}/', $text ) && mb_strlen( $text, 'UTF-8' ) > 20 ) {
+                $has_address = true;
+                $address_text = mb_substr( $text, 0, 80, 'UTF-8' );
+            }
+            // ★ ตรวจจับที่อยู่แบบยาว (>40 ตัวอักษร + มีเลข) แม้ไม่มี keyword
+            if ( ! $has_address && mb_strlen( $text, 'UTF-8' ) > 40 && preg_match( '/\d/', $text ) && preg_match( '/[\/\-]/', $text ) ) {
+                $has_address = true;
+                $address_text = mb_substr( $text, 0, 80, 'UTF-8' );
+            }
+
+            // 3) เบอร์โทร
+            if ( preg_match( $phone_pattern, $text, $m ) ) {
+                $has_phone = true;
+                $phone_text = $m[0];
+            }
+        }
+
+        // ไม่ใช่เรื่องเคลม → ไม่ต้อง inject
+        if ( ! $is_claim ) {
+            return '';
+        }
+
+        // สร้าง status report สำหรับ inject ลง prompt
+        $collected = [];
+        $missing   = [];
+
+        if ( $has_photo )   { $collected[] = "✅ รูปภาพ (ได้รับแล้ว {$photo_count} รูป)"; }
+        else                { $missing[]   = "❌ รูปภาพ/วีดีโอ (ยังไม่ได้)"; }
+
+        if ( $has_address ) { $collected[] = "✅ ที่อยู่ (ได้รับแล้ว: '{$address_text}...')"; }
+        else                { $missing[]   = "❌ ชื่อ-ที่อยู่จัดส่ง (ยังไม่ได้)"; }
+
+        if ( $has_phone )   { $collected[] = "✅ เบอร์โทร (ได้รับแล้ว: {$phone_text})"; }
+        else                { $missing[]   = "❌ เบอร์โทรศัพท์ (ยังไม่ได้)"; }
+
+        $report = "# 🔎 สถานะข้อมูลเคลม (ระบบตรวจจับอัตโนมัติ)\n";
+        $report .= "ข้อมูลที่ได้รับแล้ว:\n" . implode( "\n", $collected ) . "\n";
+
+        if ( ! empty( $missing ) ) {
+            $report .= "\nข้อมูลที่ยังขาด:\n" . implode( "\n", $missing ) . "\n";
+            $report .= "\n⚡ คำสั่งสำคัญ:\n";
+            $report .= "- ห้ามถามข้อมูลที่ ✅ ได้รับแล้ว ซ้ำเด็ดขาด!\n";
+            $report .= "- ขอบคุณลูกค้าสำหรับข้อมูลที่เพิ่งส่งมา\n";
+            $report .= "- ถามเฉพาะข้อมูลที่ ❌ ยังขาด เท่านั้น ด้วยประโยคธรรมชาติ\n";
+            $report .= "- ห้ามพิมพ์ฟอร์ม (ชื่อ: / ที่อยู่: / เบอร์:) ถ้ามีบางข้อมูลแล้ว\n";
+
+            if ( $has_address && ! $has_phone ) {
+                $report .= "- ตัวอย่าง: 'ขอบคุณสำหรับที่อยู่ค่ะ รบกวนขอเบอร์โทรศัพท์เพิ่มเติมด้วยนะคะ'\n";
+            }
+            if ( $has_photo && ! $has_address && ! $has_phone ) {
+                $report .= "- ตัวอย่าง: 'ได้รับรูปภาพเรียบร้อยค่ะ รบกวนขอชื่อ-ที่อยู่จัดส่งด้วยนะคะ'\n";
+            }
+            if ( $has_photo && $has_address && ! $has_phone ) {
+                $report .= "- ตัวอย่าง: 'เหลือแค่เบอร์โทรศัพท์ค่ะ รบกวนพิมพ์มาให้แอดมินด้วยนะคะ'\n";
+            }
+        } else {
+            $report .= "\n🎉 ข้อมูลครบทั้ง 3 รายการแล้ว!\n";
+            $report .= "คำสั่ง: พิมพ์ [ACTION: OPEN_CLAIM] ต่อท้ายข้อความเสมอ! ห้ามลืมเด็ดขาด!\n";
+            $report .= "สรุปข้อมูลให้ลูกค้าตรวจสอบ แล้ว **ต้อง** ปิดท้ายด้วย [ACTION: OPEN_CLAIM]\n";
+        }
+
+        return $report;
+    }
+
+    // =========================================================================
+    // [SECTION 1b] v22: FUNCTION CALLING TOOLS
+    // =========================================================================
+
+    /**
+     * ★ v22: Tool declarations สำหรับ Gemini Function Calling API
+     * AI จะเห็น functions เหล่านี้และเรียกใช้เมื่อต้องการข้อมูล
+     */
+    private function get_tool_declarations() {
+        return [
+            [
+                'name'        => 'get_product',
+                'description' => 'ค้นหาสินค้า DINOCO ตามรุ่นรถ ประเภทสินค้า และ/หรือตัวเลือก (สี/วัสดุ) — ใช้เมื่อต้องการข้อมูลสินค้า ราคา หรือรูปภาพ',
+                'parameters'  => [
+                    'type'       => 'OBJECT',
+                    'properties' => [
+                        'model' => [
+                            'type'        => 'STRING',
+                            'description' => 'รุ่นรถ เช่น NX500, CB500X, ADV350, Forza350, XL750',
+                        ],
+                        'category' => [
+                            'type'        => 'STRING',
+                            'description' => 'ประเภทสินค้า เช่น กันล้ม, กล่องข้าง, กล่องหลัง, แร็ค, กระเป๋า, การ์ดแฮนด์',
+                        ],
+                        'variant' => [
+                            'type'        => 'STRING',
+                            'description' => 'ตัวเลือกย่อย เช่น สแตนเลสดำ, เหล็กทาสีดำ, PRO, STD (ถ้ามี)',
+                        ],
+                    ],
+                    'required' => [ 'model' ],
+                ],
+            ],
+            [
+                'name'        => 'get_dealer',
+                'description' => 'ค้นหาร้านตัวแทนจำหน่าย DINOCO ตามจังหวัดหรือพื้นที่ — ใช้เมื่อลูกค้าถามว่าซื้อที่ไหน หรือบอกจังหวัด/โซนที่อาศัย',
+                'parameters'  => [
+                    'type'       => 'OBJECT',
+                    'properties' => [
+                        'location' => [
+                            'type'        => 'STRING',
+                            'description' => 'จังหวัด โซน หรือพื้นที่ เช่น ลาดพร้าว, เชียงใหม่, สุพรรณบุรี, กทม',
+                        ],
+                    ],
+                    'required' => [ 'location' ],
+                ],
+            ],
+            [
+                'name'        => 'get_kb_answer',
+                'description' => 'ค้นหาข้อมูลจากคลังความรู้ DINOCO — ใช้เมื่อลูกค้าถามเรื่องทั่วไป เช่น ประกัน เคลม วัสดุ ขนาด วิธีดูแล PRO vs STD Edition vs Standard XL750 กระเป๋ากันน้ำ การ์ดแฮนด์ One Price',
+                'parameters'  => [
+                    'type'       => 'OBJECT',
+                    'properties' => [
+                        'question' => [
+                            'type'        => 'STRING',
+                            'description' => 'คำถามหรือหัวข้อที่ต้องการค้นหา เช่น "PRO กับ STD ต่างกันยังไง", "ประกันครอบคลุมอะไร", "ลดราคาได้ไหม"',
+                        ],
+                    ],
+                    'required' => [ 'question' ],
+                ],
+            ],
+            [
+                'name'        => 'escalate_to_admin',
+                'description' => 'ส่งเรื่องให้แอดมินจริง (คน) มาตอบแทน — ใช้เมื่อ: ลูกค้าหงุดหงิด, ต้องการคุยกับคน, คำถามเทคนิคเฉพาะทางที่ไม่พบคำตอบใน tools อื่น',
+                'parameters'  => [
+                    'type'       => 'OBJECT',
+                    'properties' => [
+                        'reason' => [
+                            'type'        => 'STRING',
+                            'description' => 'เหตุผลสั้นๆ ที่ต้องส่งให้แอดมิน เช่น "ลูกค้าต้องการคุยกับคน", "คำถามเทคนิคที่ไม่มีในระบบ"',
+                        ],
+                    ],
+                    'required' => [ 'reason' ],
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * ★ v22: TOOL — get_product()
+     * ค้นหาสินค้าจาก inventory ให้ตรงที่สุด 1 ชิ้น
+     * return: ชื่อเต็ม + ราคา + รูป + ประกัน
+     */
+    private function tool_get_product( $args ) {
+        $model    = isset( $args['model'] ) ? $args['model'] : '';
+        $category = isset( $args['category'] ) ? $args['category'] : '';
+        $variant  = isset( $args['variant'] ) ? $args['variant'] : '';
+
+        $catalog = get_option( 'dinoco_product_catalog', [] );
+        if ( empty( $catalog ) || ! is_array( $catalog ) ) {
+            return [ 'found' => false, 'message' => 'ไม่มีข้อมูลสินค้าในระบบ' ];
+        }
+
+        $search = mb_strtolower( $model . ' ' . $category . ' ' . $variant, 'UTF-8' );
+
+        // Model mapping
+        $model_aliases = [
+            'nx500' => [ 'nx500', 'nx 500' ], 'cb500x' => [ 'cb500x', 'cb500', 'cb 500' ],
+            'adv350' => [ 'adv350', 'adv 350', 'adv' ], 'forza350' => [ 'forza350', 'forza 350', 'forza' ],
+            'xl750' => [ 'xl750', 'transalp' ], 'xadv750' => [ 'xadv', 'x-adv' ],
+        ];
+        $model_key = '';
+        foreach ( $model_aliases as $mk => $aliases ) {
+            foreach ( $aliases as $a ) {
+                if ( mb_strpos( $search, $a ) !== false ) { $model_key = $mk; break 2; }
+            }
+        }
+
+        // Category mapping
+        $cat_map = [
+            'กันล้ม' => [ 'กันล้ม', 'crash', 'crashbar' ],
+            'กล่องข้าง' => [ 'กล่องข้าง', 'side box', 'sidebox', 'side case' ],
+            'กล่องหลัง' => [ 'กล่องหลัง', 'กล่องท้าย', 'top box', 'topbox', 'top case' ],
+            'แร็ค' => [ 'แร็ค', 'rack', 'ตะแกรง' ],
+            'กระเป๋า' => [ 'กระเป๋า', 'bag', 'dry bag' ],
+        ];
+        $cat_key = '';
+        foreach ( $cat_map as $ck => $kws ) {
+            foreach ( $kws as $kw ) {
+                if ( mb_strpos( $search, $kw ) !== false ) { $cat_key = $ck; break 2; }
+            }
+        }
+
+        // Score items
+        $best_score = 0;
+        $best_item  = null;
+        $all_matches = [];
+
+        foreach ( $catalog as $sku => $item ) {
+            $name_lower = mb_strtolower( isset( $item['name'] ) ? $item['name'] : '', 'UTF-8' );
+            $score = 0;
+
+            // Model match
+            if ( $model_key ) {
+                $model_kws = isset( $model_aliases[ $model_key ] ) ? $model_aliases[ $model_key ] : [];
+                foreach ( $model_kws as $mk ) {
+                    if ( mb_strpos( $name_lower, $mk ) !== false ) { $score += 100; break; }
+                }
+            }
+
+            // Category match
+            if ( $cat_key ) {
+                $cat_kws = isset( $cat_map[ $cat_key ] ) ? $cat_map[ $cat_key ] : [];
+                foreach ( $cat_kws as $ck ) {
+                    if ( mb_strpos( $name_lower, $ck ) !== false ) { $score += 50; break; }
+                }
+            }
+
+            // Variant match
+            if ( $variant ) {
+                $variant_lower = mb_strtolower( $variant, 'UTF-8' );
+                $variant_terms = preg_split( '/[\s,]+/u', $variant_lower );
+                foreach ( $variant_terms as $vt ) {
+                    if ( mb_strlen( $vt, 'UTF-8' ) >= 2 && mb_strpos( $name_lower, $vt ) !== false ) {
+                        $score += 30;
+                    }
+                }
+            }
+
+            if ( $score >= 100 ) {
+                $all_matches[] = [
+                    'name'     => isset( $item['name'] ) ? $item['name'] : $sku,
+                    'price'    => isset( $item['price'] ) ? $item['price'] : '-',
+                    'image'    => isset( $item['img'] ) ? $item['img'] : '',
+                    'warranty' => isset( $item['years'] ) ? $item['years'] . ' ปี' : '-',
+                    'sku'      => $sku,
+                    'score'    => $score,
+                ];
+            }
+        }
+
+        if ( empty( $all_matches ) ) {
+            return [ 'found' => false, 'message' => "ไม่พบสินค้า {$model} {$category} {$variant} ในคลังสินค้า" ];
+        }
+
+        // Sort by score
+        usort( $all_matches, function( $a, $b ) { return $b['score'] <=> $a['score']; } );
+
+        // ถ้ามี variant → return 1 ชิ้น (best match)
+        // ถ้าไม่มี variant → return top 3 ให้เลือก
+        if ( ! empty( $variant ) ) {
+            $best = $all_matches[0];
+            return [
+                'found'    => true,
+                'count'    => 1,
+                'product'  => [
+                    'name'     => $best['name'],
+                    'price'    => $best['price'],
+                    'image'    => $best['image'],
+                    'warranty' => $best['warranty'],
+                ],
+                'instruction' => 'ตอบชื่อสินค้าเต็ม + ราคา + ส่งรูปด้วย [IMG:url] ที่ให้มา ห้ามใช้รูปอื่น',
+            ];
+        } else {
+            $top3 = array_slice( $all_matches, 0, 3 );
+            $products = [];
+            foreach ( $top3 as $m ) {
+                $products[] = [
+                    'name'     => $m['name'],
+                    'price'    => $m['price'],
+                    'image'    => $m['image'],
+                    'warranty' => $m['warranty'],
+                ];
+            }
+            return [
+                'found'       => true,
+                'count'       => count( $products ),
+                'products'    => $products,
+                'instruction' => 'แสดงตัวเลือกให้ลูกค้า ถ้าลูกค้าเลือกแล้ว ต้องส่งรูปด้วย [IMG:url] ของสินค้าที่เลือก',
+            ];
+        }
+    }
+
+    /**
+     * ★ v22: TOOL — get_dealer()
+     * ค้นหาร้านตัวแทนจำหน่ายจาก KB ตามพื้นที่
+     */
+    private function tool_get_dealer( $args ) {
+        $location = isset( $args['location'] ) ? mb_strtolower( $args['location'], 'UTF-8' ) : '';
+        if ( empty( $location ) ) {
+            return [ 'found' => false, 'message' => 'กรุณาระบุจังหวัดหรือพื้นที่' ];
+        }
+
+        $all_kb = $this->get_knowledge_base();
+        if ( empty( $all_kb ) ) {
+            return [ 'found' => false, 'message' => 'ไม่มีข้อมูลในคลังความรู้' ];
+        }
+
+        // Location → KB entry mapping (same as v21 dealer matcher)
+        $location_map = [
+            'กทม' => 67, 'กรุงเทพ' => 67, 'บางเขน' => 67, 'รามอินทรา' => 67,
+            'ลาดพร้าว' => 67, 'ดอนเมือง' => 67, 'มีนบุรี' => 67, 'ฝั่งธน' => 67,
+            'ยานนาวา' => 67, 'ตลิ่งชัน' => 67, 'พระราม' => 67, 'จตุจักร' => 67,
+            'บางกะปิ' => 67, 'สะพานควาย' => 67, 'อารีย์' => 67, 'สาทร' => 67,
+            'สีลม' => 67, 'บางซื่อ' => 67, 'ห้วยขวาง' => 67, 'สุขุมวิท' => 67,
+            'อ่อนนุช' => 67, 'บางแค' => 67, 'พุทธมณฑล' => 67,
+            'นนทบุรี' => 68, 'นนท์' => 68, 'ปทุมธานี' => 68, 'ปทุม' => 68, 'รังสิต' => 68,
+            'สมุทรปราการ' => 69, 'บางนา' => 69, 'ปากน้ำ' => 69, 'บางพลี' => 69, 'ศรีนครินทร์' => 69,
+            'เชียงใหม่' => 70, 'เชียงราย' => 70, 'ลำปาง' => 70, 'ลำพูน' => 70, 'พะเยา' => 70,
+            'โคราช' => 71, 'นครราชสีมา' => 71, 'อุดร' => 71, 'อุดรธานี' => 71,
+            'หนองคาย' => 71, 'ขอนแก่น' => 71, 'อุบล' => 71, 'อุบลราชธานี' => 71,
+            'ภูเก็ต' => 54, 'สงขลา' => 54, 'หาดใหญ่' => 54, 'สตูล' => 54,
+            'ชลบุรี' => 53, 'ระยอง' => 53, 'พัทยา' => 53,
+            // จังหวัดไม่มีตัวแทน
+            'สุพรรณบุรี' => 80, 'นครปฐม' => 80, 'อยุธยา' => 80, 'กาญจนบุรี' => 80,
+            'สมุทรสาคร' => 80, 'ราชบุรี' => 80, 'เพชรบุรี' => 80, 'ประจวบ' => 80,
+            'หัวหิน' => 80, 'ลพบุรี' => 80, 'สระบุรี' => 80, 'ฉะเชิงเทรา' => 80,
+            'ปราจีนบุรี' => 80, 'ตราด' => 80, 'จันทบุรี' => 80, 'นครสวรรค์' => 80,
+            'พิษณุโลก' => 81, 'ตาก' => 81, 'สุโขทัย' => 81, 'น่าน' => 81,
+            'แพร่' => 81, 'อุตรดิตถ์' => 81, 'เพชรบูรณ์' => 81, 'แม่ฮ่องสอน' => 81,
+            'ร้อยเอ็ด' => 82, 'มหาสารคาม' => 82, 'กาฬสินธุ์' => 82, 'สกลนคร' => 82,
+            'นครพนม' => 82, 'มุกดาหาร' => 82, 'บุรีรัมย์' => 82, 'สุรินทร์' => 82,
+            'ชัยภูมิ' => 82, 'ศรีสะเกษ' => 82, 'เลย' => 82,
+            'นครศรีธรรมราช' => 83, 'กระบี่' => 83, 'ตรัง' => 83, 'พังงา' => 83,
+            'ชุมพร' => 83, 'ระนอง' => 83, 'ยะลา' => 83, 'ปัตตานี' => 83,
+            'นราธิวาส' => 83, 'พัทลุง' => 83, 'สุราษฎร์ธานี' => 83, 'สมุย' => 83,
+        ];
+
+        // ค้นหา location ใน map
+        foreach ( $location_map as $loc_key => $entry_num ) {
+            if ( mb_strpos( $location, $loc_key ) !== false ) {
+                $idx = $entry_num - 1;
+                if ( isset( $all_kb[ $idx ] ) ) {
+                    $kb = $all_kb[ $idx ];
+                    return [
+                        'found'       => true,
+                        'location'    => $location,
+                        'dealers'     => isset( $kb['f'] ) ? $kb['f'] : '',
+                        'how_to_say'  => isset( $kb['a'] ) ? $kb['a'] : '',
+                        'instruction' => 'ใช้เฉพาะข้อมูลร้านจากผลลัพธ์นี้ ห้ามเพิ่มร้าน/เบอร์/URL ที่ไม่มีในข้อมูลนี้',
+                    ];
+                }
+            }
+        }
+
+        return [
+            'found'       => false,
+            'message'     => "ไม่พบข้อมูลตัวแทนในพื้นที่ '{$location}'",
+            'instruction' => "บอกลูกค้าว่า 'ขออภัยค่ะ ยังไม่มีข้อมูลตัวแทนในพื้นที่นี้ค่ะ ขอส่งเรื่องให้ทีมงานช่วยค่ะ' แล้วเรียก escalate_to_admin",
+        ];
+    }
+
+    /**
+     * ★ v22: TOOL — get_kb_answer()
+     * ค้นหาคำตอบจาก KB โดยใช้ keyword matching (reuse find_relevant_kb)
+     */
+    private function tool_get_kb_answer( $args ) {
+        $question = isset( $args['question'] ) ? $args['question'] : '';
+        if ( empty( $question ) ) {
+            return [ 'found' => false, 'message' => 'กรุณาระบุคำถาม' ];
+        }
+
+        $entries = $this->find_relevant_kb( $question, '' );
+        if ( empty( $entries ) ) {
+            return [
+                'found'       => false,
+                'message'     => "ไม่พบข้อมูลเกี่ยวกับ '{$question}' ในคลังความรู้",
+                'instruction' => 'ถ้าตอบไม่ได้จริงๆ ให้เรียก escalate_to_admin',
+            ];
+        }
+
+        $results = [];
+        foreach ( $entries as $kb ) {
+            $results[] = [
+                'topic'     => isset( $kb['q'] ) ? mb_substr( $kb['q'], 0, 100, 'UTF-8' ) : '',
+                'facts'     => isset( $kb['f'] ) ? $kb['f'] : '',
+                'guideline' => isset( $kb['a'] ) ? $kb['a'] : ( isset( $kb['legacy'] ) ? $kb['legacy'] : '' ),
+            ];
+        }
+
+        return [
+            'found'       => true,
+            'count'       => count( $results ),
+            'answers'     => $results,
+            'instruction' => 'ใช้ข้อมูลจากผลลัพธ์นี้ตอบลูกค้า ห้ามแต่งข้อมูลเพิ่มที่ไม่มีในผลลัพธ์',
+        ];
+    }
+
+    /**
+     * ★ v22: TOOL — escalate_to_admin()
+     * ส่งเรื่องให้แอดมินจริง — return action tag
+     */
+    private function tool_escalate_admin( $args ) {
+        $reason = isset( $args['reason'] ) ? $args['reason'] : 'ลูกค้าต้องการความช่วยเหลือ';
+        return [
+            'escalated'   => true,
+            'reason'      => $reason,
+            'instruction' => "ตอบลูกค้าว่า 'ขออภัยค่ะ แอดมินขอส่งเรื่องให้ทีมงานช่วยตอบให้ละเอียดกว่านะคะ รอสักครู่ค่ะ 🙏' แล้วพิมพ์ [ACTION: CALL_ADMIN] ต่อท้าย",
+        ];
+    }
+
+    /**
+     * ★ v22: Process function call from Gemini response
+     */
+    private function process_function_call( $func_name, $func_args ) {
+        switch ( $func_name ) {
+            case 'get_product':
+                return $this->tool_get_product( $func_args );
+            case 'get_dealer':
+                return $this->tool_get_dealer( $func_args );
+            case 'get_kb_answer':
+                return $this->tool_get_kb_answer( $func_args );
+            case 'escalate_to_admin':
+                return $this->tool_escalate_admin( $func_args );
+            default:
+                return [ 'error' => "Unknown function: {$func_name}" ];
+        }
+    }
+
+    /**
+     * ★★★ generate_smart_prompt() — v22 LEAN VERSION ★★★
+     * ไม่ dump KB/Inventory/Dealer ใส่ prompt อีกต่อไป
+     * AI จะเรียก function tools เพื่อดึงข้อมูลเอง
+     *
+     * v20-v21: prompt 4,000+ คำ (persona + 18 กฎ + KB + inventory + dealer)
+     * v22:     prompt ~800 คำ (persona + 8 กฎ + claim tracker)
+     */
+    public function generate_smart_prompt( $user_msg, $history_raw ) {
+
+        $persona = $this->get_core_persona_data();
+
+        $prompt = "";
+
+        // Section 1: บทบาท (จาก ACF)
+        $prompt .= "# บทบาทของคุณ\n";
+        $prompt .= $persona . "\n\n";
+
+        // Section 2: กฎพฤติกรรม (v22.1: บังคับเรียก tool)
+        $prompt .= "# กฎพฤติกรรม\n";
+        $prompt .= "1. ตอบเป็นภาษาไทย ใช้ 'ค่ะ' ลงท้าย อบอุ่น เป็นมิตร มืออาชีพ ตอบกระชับ 2-5 ประโยค\n";
+        $prompt .= "2. **อ่านประวัติแชทก่อนตอบ** — ห้ามถามซ้ำ ห้ามทักทายซ้ำ ถ้าลูกค้าส่งหลายข้อความติดกัน ให้อ่านรวมเป็นบริบทเดียว เช่น 'nx500' + 'กล่องข้างครับ' = ลูกค้าถามกล่องข้าง NX500\n";
+        $prompt .= "3. **ห้ามเสนอสินค้าข้ามรุ่นรถ** — ถ้าลูกค้าใช้ Forza ห้ามเอ่ยสินค้า NX500\n";
+        $prompt .= "4. **XL750 (Transalp)**: Exclusive BigWing → แนะนำติดต่อศูนย์ BigWing โดยตรง\n\n";
+
+        // Section 3: ★★★ MANDATORY TOOL CALLING ★★★
+        $prompt .= "# ★★★ กฎเด็ดขาด: ต้องเรียก TOOL ก่อนตอบเสมอ ★★★\n";
+        $prompt .= "คุณไม่มีความรู้เกี่ยวกับสินค้า DINOCO ในหัว — ข้อมูลทุกอย่างอยู่ใน tools เท่านั้น\n";
+        $prompt .= "ถ้าคุณตอบโดยไม่เรียก tool = คุณกำลังโกหกลูกค้า = ผิดกฎร้ายแรงที่สุด\n\n";
+
+        $prompt .= "## เมื่อไหร่ต้องเรียก tool:\n";
+        $prompt .= "- ลูกค้าพูดถึง **รุ่นรถ** (NX500, CB500X, ADV350, Forza, XL750 ฯลฯ) → เรียก get_product(model) ทันที\n";
+        $prompt .= "- ลูกค้าพูดถึง **สินค้า** (กล่อง, กันล้ม, แร็ค, กระเป๋า ฯลฯ) → เรียก get_product() ทันที\n";
+        $prompt .= "- ลูกค้าถาม **ราคา/วัสดุ/สี/ตัวเลือก** → เรียก get_product() ทันที\n";
+        $prompt .= "- ลูกค้าพูดถึง **จังหวัด/ร้าน/ซื้อที่ไหน** → เรียก get_dealer()\n";
+        $prompt .= "- ลูกค้าถาม **ประกัน/เคลม/นโยบาย/PRO-STD/วิธีดูแล/ติดตั้ง** → เรียก get_kb_answer()\n";
+        $prompt .= "- ลูกค้าถาม **อะไรก็ตามเกี่ยวกับ DINOCO** → เรียก get_kb_answer() ก่อน\n\n";
+
+        $prompt .= "## เมื่อไหร่ที่ไม่ต้องเรียก tool:\n";
+        $prompt .= "- ลูกค้าทักทาย (สวัสดี/ขอบคุณ/ลาก่อน) = ไม่ต้องเรียก tool\n";
+        $prompt .= "- นอกนั้น **ต้องเรียก tool ทุกครั้ง**\n\n";
+
+        $prompt .= "## ตัวอย่างที่ถูก:\n";
+        $prompt .= "ลูกค้า: 'สอบถาม nx500 ครับ' → เรียก get_product(model='NX500') ทันที แล้วตอบจากผลลัพธ์\n";
+        $prompt .= "ลูกค้า: 'ตัวแต่งออกศูนย์ครับ' → เรียก get_product(model='NX500') (จากบริบทก่อนหน้า) ทันที\n";
+        $prompt .= "ลูกค้า: 'กล่องข้างครับ' → เรียก get_product(model='NX500', category='กล่องข้าง') ทันที\n";
+        $prompt .= "ลูกค้า: 'ประกันครอบคลุมอะไร' → เรียก get_kb_answer(question='ประกันครอบคลุม') ทันที\n\n";
+
+        $prompt .= "## ตัวอย่างที่ผิด (ห้ามทำ!):\n";
+        $prompt .= "ลูกค้า: 'สอบถาม nx500' → ❌ ตอบว่า 'สนใจสินค้าตัวไหนคะ กล่องข้าง กล่องหลัง...' (มโน! ยังไม่รู้ว่ามีอะไรบ้าง)\n";
+        $prompt .= "ลูกค้า: 'กล่องข้าง' → ❌ ตอบว่า 'มีอลูมิเนียมกับพลาสติกค่ะ' (มโน! ยังไม่ได้เรียก tool)\n";
+        $prompt .= "ลูกค้า: 'ตัวแต่ง' → ❌ ถามกลับว่า 'สนใจตัวไหนคะ' (ผิด! ต้องเรียก get_product ก่อน แล้วเสนอจากผลลัพธ์)\n\n";
+
+        $prompt .= "## หลังเรียก tool แล้ว:\n";
+        $prompt .= "- ใช้เฉพาะข้อมูลจาก tool result ตอบ — ห้ามเพิ่มข้อมูลที่ไม่มีใน result เด็ดขาด\n";
+        $prompt .= "- รูปภาพ: พิมพ์ [IMG:url] โดยใช้ URL จาก get_product() result เท่านั้น\n";
+        $prompt .= "- หลังบอกราคา → ถามจังหวัด → เรียก get_dealer()\n";
+        $prompt .= "- ถ้า tool return 'ไม่พบ' → เรียก escalate_to_admin()\n\n";
+
+        // Section 4: ระบบเคลม
+        $prompt .= "# ระบบเคลม\n";
+        $prompt .= "เมื่อลูกค้าแจ้งปัญหาสินค้า ต้องเก็บ: (1) รูป/วีดีโอ (2) ชื่อ-ที่อยู่ (3) เบอร์โทร\n";
+        $prompt .= "ดู [🔎 สถานะข้อมูลเคลม] ด้านล่าง — ข้อมูลที่ ✅ ได้แล้ว ห้ามถามซ้ำ!\n";
+        $prompt .= "[แนบรูปภาพ] ในข้อความ = ลูกค้าส่งรูปมาแล้ว ห้ามขอรูปซ้ำ!\n";
+        $prompt .= "เมื่อครบ 3 อย่าง → สรุปทวน + พิมพ์ [ACTION: OPEN_CLAIM] ท้ายข้อความ\n\n";
+
+        // Section 5: สถานะข้อมูลเคลม
+        $claim_status = $this->analyze_claim_status( $history_raw );
+        if ( ! empty( $claim_status ) ) {
+            $prompt .= $claim_status . "\n";
+        }
+
+        return $prompt;
+    }
+
+    /**
+     * ★ build_conversation_turns() ★
+     * สร้าง contents array สำหรับ Gemini API จาก history
+     * รวม auto-merge consecutive same-role + validation
+     *
+     * PUBLIC เพราะ webhook.php ต้องเรียกใช้
+     */
+    public function build_conversation_turns( $history_raw ) {
+        $contents  = [];
+        $last_role = '';
+        $recent    = array_slice( $history_raw, -self::AI_HISTORY_LIMIT );
+
+        foreach ( $recent as $h ) {
+            $role = ( $h['role'] === 'user' ) ? 'user' : 'model';
+            $text = isset( $h['text'] ) ? trim( $h['text'] ) : '';
+
+            // ถ้ามีรูปภาพ → เพิ่ม marker
+            if ( ! empty( $h['image'] ) && mb_strpos( $text, 'รูปภาพ' ) === false ) {
+                $text .= " [แนบรูปภาพ]";
+            }
+
+            $text = trim( $text );
+            if ( empty( $text ) ) continue;
+
+            // Auto-merge consecutive same-role turns (Gemini requirement)
+            if ( $role === $last_role && ! empty( $contents ) ) {
+                $idx = count( $contents ) - 1;
+                $contents[ $idx ]['parts'][0]['text'] .= "\n" . $text;
+            } else {
+                $contents[] = [ 'role' => $role, 'parts' => [ [ 'text' => $text ] ] ];
+                $last_role = $role;
+            }
+        }
+
+        // Gemini ต้องเริ่มด้วย user turn
+        if ( ! empty( $contents ) && $contents[0]['role'] === 'model' ) {
+            array_shift( $contents );
+        }
+
+        // Final validation: alternating roles
+        $contents = $this->validate_turns( $contents );
+
+        return $contents;
+    }
+
+    /**
+     * ★ call_gemini_fc() ★ — v22 Function Calling Loop
+     * เรียก Gemini API พร้อม tools declaration
+     * ถ้า AI เรียก function → execute → ส่งผลกลับ → วนจน AI ตอบ text
+     *
+     * @return string AI reply text
+     */
+    public function call_gemini_fc( $system_instruction, $contents, $force_tools = false ) {
+        $config  = get_option( 'dinoco_ai_config_v9', [] );
+        $api_key = ! empty( $config['api_key'] ) ? $config['api_key'] : ( defined( 'DINOCO_GEMINI_KEY' ) ? DINOCO_GEMINI_KEY : '' );
+
+        if ( empty( $api_key ) ) {
+            $this->debug_log( 'NO API KEY!' );
+            return '';
+        }
+
+        $tools = [ [ 'functionDeclarations' => $this->get_tool_declarations() ] ];
+        $model = self::AI_MODEL_PRIMARY;
+        $url   = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$api_key}";
+
+        // ★ v22.1: force_tools = ANY mode → Gemini ต้องเรียก tool อย่างน้อย 1 ตัว
+        $fc_mode = $force_tools ? 'ANY' : 'AUTO';
+        $this->debug_log( "FC Mode: {$fc_mode} | Force: " . ( $force_tools ? 'YES' : 'NO' ) );
+
+        // Function Calling Loop
+        $tools_called = [];
+        for ( $loop = 0; $loop < self::AI_FC_MAX_LOOPS; $loop++ ) {
+
+            $payload = [
+                'systemInstruction' => [ 'parts' => [ [ 'text' => $system_instruction ] ] ],
+                'contents'          => $contents,
+                'tools'             => $tools,
+                'toolConfig'        => [ 'functionCallingConfig' => [ 'mode' => $fc_mode ] ],
+                'generationConfig'  => [
+                    'temperature'     => self::AI_TEMPERATURE,
+                    'maxOutputTokens' => self::AI_MAX_TOKENS,
+                ],
+            ];
+
+            $this->debug_log( "FC Loop {$loop} | Model: {$model} | Turns: " . count( $contents ) );
+
+            $response = wp_remote_post( $url, [
+                'body'    => json_encode( $payload, JSON_UNESCAPED_UNICODE ),
+                'headers' => [ 'Content-Type' => 'application/json' ],
+                'timeout' => self::AI_TIMEOUT,
+            ] );
+
+            if ( is_wp_error( $response ) ) {
+                $this->debug_log( "WP_Error: " . $response->get_error_message() );
+                break;
+            }
+
+            $code = wp_remote_retrieve_response_code( $response );
+            $body = json_decode( wp_remote_retrieve_body( $response ), true );
+
+            if ( $code !== 200 ) {
+                $err = isset( $body['error']['message'] ) ? $body['error']['message'] : "HTTP {$code}";
+                $this->debug_log( "API Error: {$err}" );
+
+                // Fallback: ถ้า primary model ไม่รองรับ FC → ลอง model เดิมแบบไม่มี tools
+                if ( $loop === 0 ) {
+                    $this->debug_log( "Fallback to non-FC mode" );
+                    $this->last_fc_status = "❌ Model error → Legacy mode (no FC)";
+                    return $this->call_gemini_legacy( $system_instruction, $contents );
+                }
+                break;
+            }
+
+            // Parse response parts
+            $parts = isset( $body['candidates'][0]['content']['parts'] ) ? $body['candidates'][0]['content']['parts'] : [];
+
+            if ( empty( $parts ) ) {
+                $this->debug_log( "Empty parts in response" );
+                break;
+            }
+
+            // Check for function calls
+            $has_fc = false;
+            $model_parts = []; // AI's response parts (may include text + function calls)
+            $fc_response_parts = []; // Our function results
+
+            foreach ( $parts as $part ) {
+                $model_parts[] = $part;
+
+                if ( isset( $part['functionCall'] ) ) {
+                    $has_fc    = true;
+                    $func_name = $part['functionCall']['name'];
+                    $func_args = isset( $part['functionCall']['args'] ) ? $part['functionCall']['args'] : [];
+
+                    $this->debug_log( "FC Call: {$func_name}(" . json_encode( $func_args, JSON_UNESCAPED_UNICODE ) . ")" );
+                    $tools_called[] = $func_name;
+
+                    // Execute function
+                    $result = $this->process_function_call( $func_name, $func_args );
+
+                    $this->debug_log( "FC Result: " . mb_substr( json_encode( $result, JSON_UNESCAPED_UNICODE ), 0, 300 ) );
+
+                    $fc_response_parts[] = [
+                        'functionResponse' => [
+                            'name'     => $func_name,
+                            'response' => $result,
+                        ],
+                    ];
+                }
+            }
+
+            if ( $has_fc ) {
+                // Add AI's response (with function calls) to conversation
+                $contents[] = [ 'role' => 'model', 'parts' => $model_parts ];
+
+                // Add function results as user turn
+                $contents[] = [ 'role' => 'user', 'parts' => $fc_response_parts ];
+
+                // ★ v22.1: หลังเรียก tool แล้ว → เปลี่ยนเป็น AUTO เพื่อให้ AI ตอบ text ได้
+                $fc_mode = 'AUTO';
+
+                // Loop back to let AI respond with the function results
+                continue;
+            }
+
+            // No function call → extract text response
+            $text_parts = [];
+            foreach ( $parts as $part ) {
+                if ( isset( $part['text'] ) ) {
+                    $text_parts[] = $part['text'];
+                }
+            }
+
+            $reply = implode( "\n", $text_parts );
+
+            // Clean internal markers
+            $reply = preg_replace( '/\[แนบรูปภาพ[^\]]*\]/u', '', $reply );
+            $reply = preg_replace( '/\[ลูกค้ารายนี้เพิ่งส่งรูปภาพ[^\]]*\]/u', '', $reply );
+            $reply = trim( $reply );
+
+            $this->debug_log( "FC Complete | Loops: {$loop} | Reply: " . mb_strlen( $reply, 'UTF-8' ) . " chars" );
+            $tc = ! empty( $tools_called ) ? implode( ', ', $tools_called ) : 'none';
+            $mode_label = $force_tools ? 'FORCED' : 'AUTO';
+            $this->last_fc_status = ! empty( $tools_called )
+                ? "✅ FC ({$mode_label}) | Tools: {$tc}"
+                : "⚡ FC ({$mode_label}) | No tools";
+            return $reply;
+        }
+
+        $this->debug_log( "FC Max loops reached or error — falling back" );
+        $this->last_fc_status = "⚠️ FC Failed → Legacy fallback";
+        return $this->call_gemini_legacy( $system_instruction, $contents );
+    }
+
+    /**
+     * ★ call_gemini_legacy() ★ — v21-compatible fallback (no function calling)
+     * ใช้เมื่อ model ไม่รองรับ FC หรือ FC loop ล้มเหลว
+     */
+    private function call_gemini_legacy( $system_instruction, $contents ) {
+        $config  = get_option( 'dinoco_ai_config_v9', [] );
+        $api_key = ! empty( $config['api_key'] ) ? $config['api_key'] : ( defined( 'DINOCO_GEMINI_KEY' ) ? DINOCO_GEMINI_KEY : '' );
+
+        $models = [ self::AI_MODEL_PRIMARY, self::AI_MODEL_FALLBACK ];
+
+        // Filter out any functionCall/functionResponse parts that FC loop may have added
+        $clean_contents = [];
+        foreach ( $contents as $turn ) {
+            $clean_parts = [];
+            foreach ( $turn['parts'] as $p ) {
+                if ( isset( $p['text'] ) ) {
+                    $clean_parts[] = $p;
+                }
+            }
+            if ( ! empty( $clean_parts ) ) {
+                $clean_contents[] = [ 'role' => $turn['role'], 'parts' => $clean_parts ];
+            }
+        }
+        $clean_contents = $this->validate_turns( $clean_contents );
+
+        foreach ( $models as $model ) {
+            $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$api_key}";
+
+            $payload = [
+                'systemInstruction' => [ 'parts' => [ [ 'text' => $system_instruction ] ] ],
+                'contents'          => $clean_contents,
+                'generationConfig'  => [
+                    'temperature'     => self::AI_TEMPERATURE,
+                    'maxOutputTokens' => self::AI_MAX_TOKENS,
+                ],
+            ];
+
+            $response = wp_remote_post( $url, [
+                'body'    => json_encode( $payload, JSON_UNESCAPED_UNICODE ),
+                'headers' => [ 'Content-Type' => 'application/json' ],
+                'timeout' => self::AI_TIMEOUT,
+            ] );
+
+            if ( is_wp_error( $response ) ) continue;
+
+            $code = wp_remote_retrieve_response_code( $response );
+            $body = json_decode( wp_remote_retrieve_body( $response ), true );
+
+            if ( $code === 200 && isset( $body['candidates'][0]['content']['parts'][0]['text'] ) ) {
+                $reply = $body['candidates'][0]['content']['parts'][0]['text'];
+                $reply = preg_replace( '/\[แนบรูปภาพ[^\]]*\]/u', '', $reply );
+                $reply = preg_replace( '/\[ลูกค้ารายนี้เพิ่งส่งรูปภาพ[^\]]*\]/u', '', $reply );
+                $this->debug_log( "Legacy Success ({$model})" );
+                return trim( $reply );
+            }
+        }
+
+        $this->debug_log( "ALL MODELS FAILED (legacy)" );
+        return '';
+    }
+
+    /**
+     * ★ get_ai_response() — v22 ★
+     * One-call method — สร้าง prompt + turns + เรียก FC loop
+     */
+    public function get_ai_response( $user_msg, $history_raw ) {
+        $system_prompt = $this->generate_smart_prompt( $user_msg, $history_raw );
+        $contents      = $this->build_conversation_turns( $history_raw );
+
+        // Safety: ต้องมีอย่างน้อย 1 turn
+        if ( empty( $contents ) ) {
+            $contents = [ [ 'role' => 'user', 'parts' => [ [ 'text' => $user_msg ] ] ] ];
+        }
+
+        // ★ v22.1: Detect if we should force tool calling
+        // ถ้าข้อความไม่ใช่แค่ทักทาย → บังคับ tools
+        $greet_patterns = '/^(สวัสดี|หวัดดี|ดีครับ|ดีค่ะ|hi|hello|ขอบคุณ|ขอบพระคุณ|ไว้จะมา|โอเค|ok|bye|ลาก่อน|แต้งกิ้ว|thx|thank)/iu';
+        $force_tools = ! preg_match( $greet_patterns, trim( $user_msg ) );
+
+        return $this->call_gemini_fc( $system_prompt, $contents, $force_tools );
+    }
+
+    // =========================================================================
+    // [SECTION 2] UTILITY METHODS
+    // =========================================================================
+
+    /**
+     * validate_turns() — ทำให้ turns เป็น alternating user/model
+     * ป้องกัน consecutive same-role ที่ Gemini API ไม่ยอมรับ
+     */
+    private function validate_turns( $contents ) {
+        if ( empty( $contents ) ) return $contents;
+
+        $validated = [];
+        $last_role = '';
+
+        foreach ( $contents as $turn ) {
+            if ( $turn['role'] === $last_role && ! empty( $validated ) ) {
+                // Merge into previous turn
+                $idx = count( $validated ) - 1;
+                $validated[ $idx ]['parts'][0]['text'] .= "\n" . $turn['parts'][0]['text'];
+                continue;
+            }
+            $validated[] = $turn;
+            $last_role   = $turn['role'];
+        }
+
+        // Must start with user
+        if ( ! empty( $validated ) && $validated[0]['role'] !== 'user' ) {
+            array_shift( $validated );
+        }
+
+        return $validated;
+    }
+
+    /**
+     * debug_log() — บันทึก debug log (auto-rotate ที่ 1MB)
+     */
+    private function debug_log( $msg ) {
+        $ts   = date( 'Y-m-d H:i:s' );
+        $line = "[{$ts}] {$msg}\n";
+
+        // Auto-rotate log file ถ้าเกิน 1MB
+        if ( file_exists( $this->debug_log_file ) && filesize( $this->debug_log_file ) > 1048576 ) {
+            file_put_contents( $this->debug_log_file, $line, LOCK_EX );
+        } else {
+            file_put_contents( $this->debug_log_file, $line, FILE_APPEND | LOCK_EX );
+        }
+    }
+
+    // =========================================================================
+    // [SECTION 3] API REQUEST ROUTER
+    // =========================================================================
+    public function handle_api_requests() {
+        if ( $_SERVER['REQUEST_METHOD'] !== 'POST' || ! isset( $_POST['dnc_action_v19'] ) ) {
+            return;
+        }
+
+        // Clean output buffers
+        while ( ob_get_level() ) { ob_end_clean(); }
+        error_reporting( 0 );
+        @ini_set( 'display_errors', 0 );
+
+        if ( ! headers_sent() ) {
+            header( 'Content-Type: application/json; charset=utf-8' );
+            header( 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0' );
+        }
+
+        if ( ! current_user_can( 'manage_options' ) ) {
+            echo json_encode( [ 'success' => false, 'reply' => 'Access Denied' ] );
+            exit;
+        }
+
+        $act = sanitize_text_field( $_POST['dnc_action_v19'] );
+
+        $actions = [
+            'save_config'  => 'save_config',
+            'get_data'     => 'get_data',
+            'test_chat'    => 'process_chat_logic',
+            'get_logs'     => 'get_logs',
+            'add_cpt_kb'   => 'add_cpt_kb',
+            'delete_cpt_kb'=> 'delete_cpt_kb',
+            'import_csv_kb'=> 'import_csv_kb',
+            'update_cpt_kb'=> 'update_cpt_kb',
+            'clear_sandbox'=> 'clear_sandbox',
+            'update_claim' => 'update_claim_status',   // legacy compat
+            'approve_claim'=> 'approve_claim_status',
+            'ship_claim'   => 'ship_claim_status',
+            'reject_claim' => 'reject_claim_status',
+            'admin_reply'  => 'admin_reply_takeover',
+        ];
+
+        if ( isset( $actions[ $act ] ) ) {
+            $method = $actions[ $act ];
+            $this->$method();
+        }
+
+        exit;
+    }
+
+    // =========================================================================
+    // [SECTION 4] CHAT PROCESSING (SANDBOX)
+    // =========================================================================
+    private function process_chat_logic() {
+        $msg = isset( $_POST['message'] ) ? sanitize_text_field( $_POST['message'] ) : '';
+        $sandbox_session = isset( $_POST['sandbox_session'] ) ? sanitize_text_field( $_POST['sandbox_session'] ) : 'default';
+
+        if ( empty( trim( $msg ) ) ) {
+            echo json_encode( [ 'success' => false, 'reply' => 'ข้อความว่าง' ] );
+            exit;
+        }
+
+        $config  = get_option( 'dinoco_ai_config_v9', [] );
+        $api_key = ! empty( $config['api_key'] ) ? $config['api_key'] : ( defined( 'DINOCO_GEMINI_KEY' ) ? DINOCO_GEMINI_KEY : '' );
+
+        if ( empty( $api_key ) ) {
+            echo json_encode( [ 'success' => false, 'reply' => '❌ กรุณาตั้งค่า Gemini API Key ที่เมนู Config หรือ wp-config.php' ] );
+            exit;
+        }
+
+        // Load logs
+        $logs = file_exists( $this->log_file ) ? json_decode( file_get_contents( $this->log_file ), true ) : [];
+        if ( ! is_array( $logs ) ) $logs = [];
+
+        $user = wp_get_current_user();
+        $sid  = 'sandbox_admin_' . $user->ID . '_' . $sandbox_session;
+
+        if ( ! isset( $logs[ $sid ] ) ) {
+            $logs[ $sid ] = [
+                'name'         => '👨‍💻 Admin Sandbox (' . $sandbox_session . ')',
+                'profile_pic'  => '',
+                'messages'     => [],
+                'is_claim'     => false,
+                'claim_status' => 'none',
+                'needs_admin'  => false,
+            ];
+        }
+
+        // บันทึกข้อความ user
+        $logs[ $sid ]['messages'][] = [
+            'role'      => 'user',
+            'text'      => $msg,
+            'timestamp' => time(),
+        ];
+
+        $history_raw = $logs[ $sid ]['messages'];
+
+        // ★ ใช้ public methods ที่ webhook ก็ใช้เหมือนกัน ★
+        $final_reply = $this->get_ai_response( $msg, $history_raw );
+
+        if ( ! empty( $final_reply ) ) {
+            // Parse action tags
+            if ( strpos( $final_reply, '[ACTION: OPEN_CLAIM]' ) !== false ) {
+                $final_reply = str_replace( '[ACTION: OPEN_CLAIM]', '', $final_reply );
+                $logs[ $sid ]['claim_status'] = 'pending';
+                $logs[ $sid ]['is_claim']     = true;
+
+                // ★ v20.2: Extract basic claim_data from sandbox history
+                $sb_photos = []; $sb_phone = ''; $sb_address = '';
+                $phone_pat = '/0[0-9]{1,2}[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{3,4}/u';
+                foreach ( $logs[ $sid ]['messages'] as $sh ) {
+                    if ( ( $sh['role'] ?? '' ) !== 'user' ) continue;
+                    $st = $sh['text'] ?? '';
+                    if ( ! empty( $sh['image'] ) ) $sb_photos[] = $sh['image'];
+                    if ( empty( $sb_phone ) && preg_match( $phone_pat, $st, $spm ) ) $sb_phone = $spm[0];
+                    if ( empty( $sb_address ) && mb_strlen( $st, 'UTF-8' ) > 30 && preg_match( '/\d/', $st ) ) $sb_address = $st;
+                }
+                $logs[ $sid ]['claim_data'] = [
+                    'id'         => 'CLM-' . strtoupper( substr( md5( $sid . time() ), 0, 6 ) ),
+                    'created_at' => date( 'Y-m-d H:i:s' ),
+                    'customer'   => $logs[ $sid ]['name'] ?? 'Sandbox User',
+                    'problem'    => '', 'photos' => $sb_photos,
+                    'address'    => $sb_address, 'phone' => $sb_phone,
+                    'status'     => 'pending', 'tracking' => '', 'admin_note' => '',
+                ];
+            }
+            if ( strpos( $final_reply, '[ACTION: CALL_ADMIN]' ) !== false ) {
+                $logs[ $sid ]['needs_admin'] = true;
+                $final_reply = str_replace( '[ACTION: CALL_ADMIN]', '', $final_reply );
+            }
+
+            $final_reply = trim( $final_reply );
+
+            $logs[ $sid ]['messages'][] = [
+                'role'      => 'ai',
+                'text'      => $final_reply,
+                'timestamp' => time(),
+            ];
+
+            file_put_contents( $this->log_file, json_encode( $logs, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ), LOCK_EX );
+        } else {
+            $final_reply = "ขออภัยค่ะ ระบบขัดข้องชั่วคราว กรุณาลองใหม่ หรือพิมพ์ 'ขอคุยกับแอดมิน' ค่ะ 🙏";
+        }
+
+        echo json_encode( [ 'success' => ! empty( $final_reply ), 'reply' => $final_reply, 'fc_status' => $this->last_fc_status ] );
+        exit;
+    }
+
+    // =========================================================================
+    // [SECTION 5] CLAIM & ADMIN FUNCTIONS
+    // =========================================================================
+
+    // =========================================================================
+    // [SECTION 5] CLAIM SYSTEM — 4-Status Flow + FB Messaging
+    // pending → approved (อนุมัติ, แจ้งลูกค้า)
+    // approved → shipped (กรอกเลขพัสดุ, แจ้งลูกค้า)
+    // pending → rejected (ปฏิเสธ+เหตุผล, แจ้งลูกค้า)
+    // =========================================================================
+
+    /**
+     * ★ send_fb_message() — ส่งข้อความไป Facebook Messenger จริง
+     * ใช้ใน: approve, ship, reject, admin_reply
+     *
+     * @param string $uid  — log key เช่น "fb_123456789"
+     * @param string $text — ข้อความที่จะส่ง
+     * @return bool
+     */
+    private function send_fb_message( $uid, $text ) {
+        if ( strpos( $uid, 'fb_' ) !== 0 ) {
+            return false;
+        }
+        $sender_id = substr( $uid, 3 );
+
+        $page_token = defined( 'DINOCO_PAGE_TOKEN' ) ? DINOCO_PAGE_TOKEN : '';
+        if ( empty( $page_token ) ) {
+            $config = get_option( 'dinoco_ai_config_v9', [] );
+            $page_token = isset( $config['page_token'] ) ? $config['page_token'] : '';
+        }
+
+        $debug = WP_CONTENT_DIR . '/dinoco-fb-send.log';
+
+        if ( empty( $page_token ) ) {
+            @file_put_contents( $debug, date('H:i:s') . " [FAIL] No PAGE_TOKEN! Define DINOCO_PAGE_TOKEN in wp-config.php\n", FILE_APPEND );
+            return false;
+        }
+
+        $url     = 'https://graph.facebook.com/v19.0/me/messages?access_token=' . $page_token;
+        $payload = json_encode( [
+            'recipient' => [ 'id' => $sender_id ],
+            'message'   => [ 'text' => $text ],
+        ] );
+
+        @file_put_contents( $debug, date('H:i:s') . " [SEND] uid={$uid} sender={$sender_id} len=" . strlen($text) . "\n", FILE_APPEND );
+
+        $response = wp_remote_post( $url, [
+            'headers'   => [ 'Content-Type' => 'application/json' ],
+            'body'      => $payload,
+            'timeout'   => 15,
+            'sslverify' => false,
+        ] );
+
+        if ( is_wp_error( $response ) ) {
+            @file_put_contents( $debug, date('H:i:s') . " [WP_ERROR] " . $response->get_error_message() . "\n", FILE_APPEND );
+            return false;
+        }
+
+        $code = wp_remote_retrieve_response_code( $response );
+        $body = wp_remote_retrieve_body( $response );
+
+        @file_put_contents( $debug, date('H:i:s') . " [RESPONSE] HTTP {$code} — " . substr($body, 0, 200) . "\n", FILE_APPEND );
+
+        return ( $code === 200 );
+    }
+
+    /**
+     * Step 1: อนุมัติเคลม (pending → approved)
+     */
+    private function approve_claim_status() {
+        $uid = isset( $_POST['user_id'] ) ? sanitize_text_field( $_POST['user_id'] ) : '';
+
+        $logs = file_exists( $this->log_file ) ? json_decode( file_get_contents( $this->log_file ), true ) : [];
+        if ( isset( $logs[ $uid ] ) ) {
+            $logs[ $uid ]['claim_status'] = 'approved';
+
+            if ( isset( $logs[ $uid ]['claim_data'] ) ) {
+                $logs[ $uid ]['claim_data']['status']      = 'approved';
+                $logs[ $uid ]['claim_data']['approved_at']  = date( 'Y-m-d H:i:s' );
+                $logs[ $uid ]['claim_data']['approved_by']  = wp_get_current_user()->user_login;
+            }
+
+            $msg_text = "✅ แอดมินตรวจสอบเรียบร้อยแล้วค่ะ อนุมัติเคลมให้ลูกค้าเรียบร้อยค่ะ\nทางเรากำลังจัดเตรียมสินค้าให้ลูกค้า รอรับแจ้งเลขพัสดุอีกครั้งนะคะ 🙏";
+
+            $logs[ $uid ]['messages'][] = [
+                'role' => 'admin',
+                'text' => $msg_text,
+                'timestamp' => time(),
+            ];
+            file_put_contents( $this->log_file, json_encode( $logs, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ), LOCK_EX );
+
+            // ★ ส่ง Facebook Messenger จริง
+            $sent = $this->send_fb_message( $uid, $msg_text );
+
+            echo json_encode( [ 'success' => true, 'message' => 'อนุมัติเคลมสำเร็จ' . ( $sent ? ' — แจ้งลูกค้าแล้ว' : ' — ⚠️ ส่ง FB ไม่ได้' ) ] );
+        } else {
+            echo json_encode( [ 'success' => false, 'message' => 'ไม่พบ User' ] );
+        }
+        exit;
+    }
+
+    /**
+     * Step 2: กรอกเลขพัสดุ (approved → shipped)
+     */
+    private function ship_claim_status() {
+        $uid      = isset( $_POST['user_id'] ) ? sanitize_text_field( $_POST['user_id'] ) : '';
+        $tracking = isset( $_POST['tracking'] ) ? sanitize_text_field( $_POST['tracking'] ) : '';
+
+        $logs = file_exists( $this->log_file ) ? json_decode( file_get_contents( $this->log_file ), true ) : [];
+        if ( isset( $logs[ $uid ] ) ) {
+            $logs[ $uid ]['claim_status'] = 'shipped';
+            $logs[ $uid ]['needs_admin']  = false;
+
+            if ( isset( $logs[ $uid ]['claim_data'] ) ) {
+                $logs[ $uid ]['claim_data']['status']     = 'shipped';
+                $logs[ $uid ]['claim_data']['tracking']    = $tracking;
+                $logs[ $uid ]['claim_data']['shipped_at']  = date( 'Y-m-d H:i:s' );
+                $logs[ $uid ]['claim_data']['shipped_by']  = wp_get_current_user()->user_login;
+            }
+
+            $msg_text = "🎉 จัดส่งสินค้าเคลมเรียบร้อยแล้วค่ะ!\n📦 เลขพัสดุ: {$tracking}\nรอรับสินค้าได้เลยนะคะ ขอบคุณที่ไว้วางใจ DINOCO ค่ะ 💙";
+
+            $logs[ $uid ]['messages'][] = [
+                'role' => 'admin',
+                'text' => $msg_text,
+                'timestamp' => time(),
+            ];
+            file_put_contents( $this->log_file, json_encode( $logs, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ), LOCK_EX );
+
+            // ★ ส่ง Facebook Messenger จริง
+            $sent = $this->send_fb_message( $uid, $msg_text );
+
+            echo json_encode( [ 'success' => true, 'message' => 'บันทึกเลขพัสดุสำเร็จ' . ( $sent ? ' — แจ้งลูกค้าแล้ว' : ' — ⚠️ ส่ง FB ไม่ได้' ) ] );
+        } else {
+            echo json_encode( [ 'success' => false, 'message' => 'ไม่พบ User' ] );
+        }
+        exit;
+    }
+
+    /**
+     * Legacy compat
+     */
+    private function update_claim_status() {
+        $this->ship_claim_status();
+    }
+
+    /**
+     * ปฏิเสธเคลม (pending → rejected)
+     */
+    private function reject_claim_status() {
+        $uid    = isset( $_POST['user_id'] ) ? sanitize_text_field( $_POST['user_id'] ) : '';
+        $reason = isset( $_POST['reason'] ) ? sanitize_text_field( $_POST['reason'] ) : '';
+
+        $logs = file_exists( $this->log_file ) ? json_decode( file_get_contents( $this->log_file ), true ) : [];
+        if ( isset( $logs[ $uid ] ) ) {
+            $logs[ $uid ]['claim_status'] = 'rejected';
+            $logs[ $uid ]['needs_admin']  = false;
+
+            if ( isset( $logs[ $uid ]['claim_data'] ) ) {
+                $logs[ $uid ]['claim_data']['status']      = 'rejected';
+                $logs[ $uid ]['claim_data']['admin_note']   = $reason;
+                $logs[ $uid ]['claim_data']['rejected_at']  = date( 'Y-m-d H:i:s' );
+                $logs[ $uid ]['claim_data']['rejected_by']  = wp_get_current_user()->user_login;
+            }
+
+            $msg_text = "ขออภัยด้วยนะคะลูกค้า ทางเราไม่สามารถอนุมัติเคลมได้ในกรณีนี้ค่ะ\n📋 เหตุผล: {$reason}\nหากมีข้อสงสัยเพิ่มเติม สอบถามได้เลยนะคะ 🙏";
+
+            $logs[ $uid ]['messages'][] = [
+                'role' => 'admin',
+                'text' => $msg_text,
+                'timestamp' => time(),
+            ];
+            file_put_contents( $this->log_file, json_encode( $logs, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ), LOCK_EX );
+
+            // ★ ส่ง Facebook Messenger จริง
+            $sent = $this->send_fb_message( $uid, $msg_text );
+
+            echo json_encode( [ 'success' => true, 'message' => 'ปฏิเสธเคลมสำเร็จ' . ( $sent ? ' — แจ้งลูกค้าแล้ว' : ' — ⚠️ ส่ง FB ไม่ได้' ) ] );
+        } else {
+            echo json_encode( [ 'success' => false ] );
+        }
+        exit;
+    }
+
+    private function admin_reply_takeover() {
+        $uid = isset( $_POST['user_id'] ) ? sanitize_text_field( $_POST['user_id'] ) : '';
+        $msg = isset( $_POST['message'] ) ? sanitize_text_field( $_POST['message'] ) : '';
+
+        if ( empty( $uid ) || empty( $msg ) ) {
+            echo json_encode( [ 'success' => false, 'message' => 'Data missing' ] );
+            exit;
+        }
+
+        $logs = file_exists( $this->log_file ) ? json_decode( file_get_contents( $this->log_file ), true ) : [];
+        if ( isset( $logs[ $uid ] ) ) {
+            $logs[ $uid ]['messages'][] = [
+                'role'      => 'admin',
+                'text'      => $msg,
+                'timestamp' => time(),
+            ];
+            $logs[ $uid ]['needs_admin'] = false;
+            file_put_contents( $this->log_file, json_encode( $logs, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ), LOCK_EX );
+
+            // ★ ส่ง Facebook Messenger จริง
+            $sent = $this->send_fb_message( $uid, $msg );
+
+            echo json_encode( [ 'success' => true, 'sent_fb' => $sent ] );
+        } else {
+            echo json_encode( [ 'success' => false ] );
+        }
+        exit;
+    }
+
+    // =========================================================================
+    // [SECTION 6] KNOWLEDGE BASE CRUD + CSV IMPORT
+    // =========================================================================
+    private function add_cpt_kb() {
+        $q      = isset( $_POST['q'] ) ? sanitize_textarea_field( wp_unslash( $_POST['q'] ) ) : '';
+        $facts  = isset( $_POST['f'] ) ? sanitize_textarea_field( wp_unslash( $_POST['f'] ) ) : '';
+        $action = isset( $_POST['a'] ) ? sanitize_textarea_field( wp_unslash( $_POST['a'] ) ) : '';
+
+        if ( empty( $q ) ) {
+            echo json_encode( [ 'success' => false, 'message' => 'Intent ห้ามเว้นว่าง' ] );
+            exit;
+        }
+
+        $title = function_exists( 'mb_substr' ) ? mb_substr( $q, 0, 50, 'UTF-8' ) . '...' : substr( $q, 0, 50 ) . '...';
+
+        $post_id = wp_insert_post( [
+            'post_title'  => wp_slash( $title ),
+            'post_type'   => 'ai_knowledge',
+            'post_status' => 'private',
+        ] );
+
+        if ( $post_id && ! is_wp_error( $post_id ) ) {
+            update_post_meta( $post_id, 'training_phrases', wp_slash( $q ) );
+            update_post_meta( $post_id, 'core_facts', wp_slash( $facts ) );
+            update_post_meta( $post_id, 'ai_action', wp_slash( $action ) );
+            echo json_encode( [ 'success' => true, 'post_id' => $post_id ] );
+        } else {
+            echo json_encode( [ 'success' => false, 'message' => 'ไม่สามารถสร้าง Post ได้' ] );
+        }
+        exit;
+    }
+
+    private function update_cpt_kb() {
+        $post_id = isset( $_POST['post_id'] ) ? intval( $_POST['post_id'] ) : 0;
+        $q = isset( $_POST['q'] ) ? sanitize_textarea_field( wp_unslash( $_POST['q'] ) ) : '';
+        $f = isset( $_POST['f'] ) ? sanitize_textarea_field( wp_unslash( $_POST['f'] ) ) : '';
+        $a = isset( $_POST['a'] ) ? sanitize_textarea_field( wp_unslash( $_POST['a'] ) ) : '';
+
+        if ( $post_id > 0 && ! empty( $q ) ) {
+            $title = function_exists( 'mb_substr' ) ? mb_substr( $q, 0, 50, 'UTF-8' ) . '...' : substr( $q, 0, 50 ) . '...';
+            wp_update_post( [ 'ID' => $post_id, 'post_title' => wp_slash( $title ) ] );
+
+            update_post_meta( $post_id, 'training_phrases', wp_slash( $q ) );
+            update_post_meta( $post_id, 'core_facts', wp_slash( $f ) );
+            update_post_meta( $post_id, 'ai_action', wp_slash( $a ) );
+
+            if ( function_exists( 'update_field' ) ) {
+                update_field( 'training_phrases', wp_slash( $q ), $post_id );
+                update_field( 'core_facts', wp_slash( $f ), $post_id );
+                update_field( 'ai_action', wp_slash( $a ), $post_id );
+            }
+
+            clean_post_cache( $post_id );
+            echo json_encode( [ 'success' => true ] );
+        } else {
+            echo json_encode( [ 'success' => false, 'message' => 'ข้อมูลไม่ครบ' ] );
+        }
+        exit;
+    }
+
+    private function delete_cpt_kb() {
+        $post_id = isset( $_POST['post_id'] ) ? intval( $_POST['post_id'] ) : 0;
+        if ( $post_id > 0 ) {
+            wp_delete_post( $post_id, true );
+            echo json_encode( [ 'success' => true ] );
+        } else {
+            echo json_encode( [ 'success' => false, 'message' => 'ไม่พบ ID' ] );
+        }
+        exit;
+    }
+
+    private function import_csv_kb() {
+        register_shutdown_function( function() {
+            $err = error_get_last();
+            if ( $err && in_array( $err['type'], [ E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR ] ) ) {
+                while ( ob_get_level() ) ob_end_clean();
+                header( 'Content-Type: application/json; charset=utf-8' );
+                echo json_encode( [ 'success' => false, 'message' => 'Server Error: ' . $err['message'] ] );
+                exit;
+            }
+        } );
+
+        ob_start();
+        try {
+            @set_time_limit( 300 );
+            @ini_set( 'memory_limit', '512M' );
+
+            if ( ! isset( $_FILES['csv_file'] ) || $_FILES['csv_file']['error'] !== UPLOAD_ERR_OK ) {
+                throw new Exception( 'ไม่สามารถรับไฟล์ได้' );
+            }
+
+            $file_tmp = $_FILES['csv_file']['tmp_name'];
+            if ( filesize( $file_tmp ) > 2 * 1024 * 1024 ) {
+                throw new Exception( 'ไฟล์ใหญ่เกิน 2MB' );
+            }
+
+            $csv_data = file_get_contents( $file_tmp );
+            if ( empty( $csv_data ) ) throw new Exception( 'ไฟล์ว่างเปล่า' );
+
+            // RTF detection
+            if ( strncmp( $csv_data, "{\\rtf", 5 ) === 0 ) {
+                throw new Exception( 'ไฟล์เป็น RTF ไม่ใช่ CSV กรุณา Save as CSV UTF-8' );
+            }
+
+            // BOM removal
+            if ( strncmp( $csv_data, "\xef\xbb\xbf", 3 ) === 0 ) {
+                $csv_data = substr( $csv_data, 3 );
+            }
+
+            $csv_data = str_replace( [ "\r\n", "\r" ], "\n", $csv_data );
+
+            // ลบ KB เก่าทั้งหมด
+            $old = get_posts( [ 'post_type' => 'ai_knowledge', 'numberposts' => -1, 'post_status' => 'any' ] );
+            foreach ( $old as $p ) { wp_delete_post( $p->ID, true ); }
+
+            // Parse CSV
+            $stream = fopen( 'php://memory', 'r+' );
+            fwrite( $stream, $csv_data );
+            rewind( $stream );
+
+            wp_suspend_cache_addition( true );
+            wp_defer_term_counting( true );
+
+            $count     = 0;
+            $is_header = true;
+
+            while ( ( $row = fgetcsv( $stream, 0, ',', '"' ) ) !== false ) {
+                if ( empty( $row ) || ( count( $row ) === 1 && empty( trim( $row[0] ) ) ) ) continue;
+                if ( $count >= 500 ) break;
+
+                $intent = trim( $row[0] );
+                $facts  = isset( $row[1] ) ? trim( $row[1] ) : '';
+                $action = isset( $row[2] ) ? trim( $row[2] ) : '';
+
+                if ( $is_header ) {
+                    $is_header = false;
+                    if ( stripos( $intent, 'training_phrases' ) !== false || stripos( $intent, 'Intent' ) !== false ) {
+                        continue;
+                    }
+                }
+
+                if ( empty( $intent ) || strlen( $intent ) > 5000 ) continue;
+
+                $facts  = str_replace( [ ' / ', ' /', '/ ' ], "\n", $facts );
+                $action = str_replace( [ ' / ', ' /', '/ ' ], "\n", $action );
+
+                $title = function_exists( 'mb_substr' ) ? mb_substr( $intent, 0, 50, 'UTF-8' ) . '...' : substr( $intent, 0, 50 ) . '...';
+
+                $post_id = wp_insert_post( [
+                    'post_title'  => wp_slash( $title ),
+                    'post_type'   => 'ai_knowledge',
+                    'post_status' => 'private',
+                ] );
+
+                if ( $post_id && ! is_wp_error( $post_id ) ) {
+                    update_post_meta( $post_id, 'training_phrases', wp_slash( $intent ) );
+                    update_post_meta( $post_id, 'core_facts', wp_slash( $facts ) );
+                    update_post_meta( $post_id, 'ai_action', wp_slash( $action ) );
+                    clean_post_cache( $post_id );
+                    $count++;
+                }
+            }
+
+            fclose( $stream );
+            wp_suspend_cache_addition( false );
+            wp_defer_term_counting( false );
+            ob_end_clean();
+
+            echo json_encode( [ 'success' => true, 'count' => $count ] );
+            exit;
+
+        } catch ( Exception $e ) {
+            ob_end_clean();
+            echo json_encode( [ 'success' => false, 'message' => $e->getMessage() ] );
+            exit;
+        }
+    }
+
+    private function clear_sandbox() {
+        $logs = file_exists( $this->log_file ) ? json_decode( file_get_contents( $this->log_file ), true ) : [];
+        $prefix = 'sandbox_admin_' . wp_get_current_user()->ID;
+        $updated = false;
+
+        foreach ( $logs as $key => $_ ) {
+            if ( strpos( $key, $prefix ) === 0 ) {
+                unset( $logs[ $key ] );
+                $updated = true;
+            }
+        }
+
+        if ( $updated ) {
+            file_put_contents( $this->log_file, json_encode( $logs, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ), LOCK_EX );
+        }
+        echo json_encode( [ 'success' => true ] );
+    }
+
+    private function save_config() {
+        $data = [
+            'updated_at'  => date( 'Y-m-d H:i:s' ),
+            'core_prompt' => isset( $_POST['core_prompt'] ) ? wp_unslash( $_POST['core_prompt'] ) : '',
+            'promo'       => isset( $_POST['promo'] ) ? wp_unslash( $_POST['promo'] ) : '',
+            'api_key'     => isset( $_POST['api_key'] ) ? sanitize_text_field( $_POST['api_key'] ) : '',
+            'knowledge'   => isset( $_POST['knowledge'] ) ? json_decode( wp_unslash( $_POST['knowledge'] ), true ) : [],
+        ];
+
+        update_option( 'dinoco_ai_config_v9', $data );
+        file_put_contents( $this->config_file, json_encode( $data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ), LOCK_EX );
+        echo json_encode( [ 'success' => true ] );
+        exit;
+    }
+
+    private function get_data() {
+        $data = get_option( 'dinoco_ai_config_v9', [] );
+        $data['has_wp_config_key'] = defined( 'DINOCO_GEMINI_KEY' ) && ! empty( DINOCO_GEMINI_KEY );
+
+        // ACF Options
+        $data['acf_options'] = [
+            'ai_persona'           => function_exists( 'get_field' ) ? get_field( 'ai_persona', 'option' ) : '',
+            'ai_tone_of_voice'     => function_exists( 'get_field' ) ? get_field( 'ai_tone_of_voice', 'option' ) : '',
+            'negative_prompts'     => function_exists( 'get_field' ) ? get_field( 'negative_prompts', 'option' ) : '',
+            'human_handoff_script' => function_exists( 'get_field' ) ? get_field( 'human_handoff_script', 'option' ) : '',
+            'flow_name'            => function_exists( 'get_field' ) ? get_field( 'flow_name', 'option' ) : '',
+            'step_1_ask'           => function_exists( 'get_field' ) ? get_field( 'step_1_ask', 'option' ) : '',
+            'step_2_ask'           => function_exists( 'get_field' ) ? get_field( 'step_2_ask', 'option' ) : '',
+            'success_message'      => function_exists( 'get_field' ) ? get_field( 'success_message', 'option' ) : '',
+        ];
+
+        // Compiled prompt (for display)
+        $data['core_prompt'] = $this->get_core_persona_data();
+
+        // Knowledge Base
+        if ( ! isset( $data['knowledge'] ) ) $data['knowledge'] = [];
+        $data['acf_knowledge'] = [];
+        $posts = get_posts( [ 'post_type' => 'ai_knowledge', 'posts_per_page' => -1, 'post_status' => [ 'publish', 'private' ] ] );
+        foreach ( $posts as $p ) {
+            $q = get_post_meta( $p->ID, 'training_phrases', true );
+            if ( ! empty( $q ) ) {
+                $data['acf_knowledge'][] = [
+                    'id'     => $p->ID,
+                    'q'      => $q,
+                    'f'      => get_post_meta( $p->ID, 'core_facts', true ),
+                    'a'      => get_post_meta( $p->ID, 'ai_action', true ),
+                    'legacy' => get_post_meta( $p->ID, 'exact_response', true ),
+                ];
+            }
+        }
+
+        // Catalog
+        $catalog = get_option( 'dinoco_product_catalog', [] );
+        $data['catalog'] = is_array( $catalog ) ? $catalog : [];
+
+        echo json_encode( [ 'success' => true, 'data' => $data ] );
+        exit;
+    }
+
+    private function get_logs() {
+        $logs = file_exists( $this->log_file ) ? json_decode( file_get_contents( $this->log_file ), true ) : [];
+        if ( ! is_array( $logs ) ) $logs = [];
+
+        $formatted = [];
+        foreach ( $logs as $uid => $d ) {
+            $hist = isset( $d['messages'] ) ? $d['messages'] : ( isset( $d['history'] ) ? $d['history'] : [] );
+            $last_msg = 'ไม่มีข้อความ';
+            $last_time = '';
+            if ( ! empty( $hist ) ) {
+                $li = end( $hist );
+                if ( isset( $li['text'] ) && ! empty( $li['text'] ) ) {
+                    $last_msg = mb_substr( $li['text'], 0, 30, 'UTF-8' ) . '...';
+                } elseif ( ! empty( $li['image'] ) ) {
+                    $last_msg = '📷 ส่งรูปภาพ';
+                }
+                if ( isset( $li['timestamp'] ) ) {
+                    $last_time = date( 'H:i', $li['timestamp'] );
+                }
+            }
+
+            $name = isset( $d['name'] ) ? $d['name'] : 'User ' . $uid;
+            if ( strpos( $uid, 'sandbox_admin_' ) === 0 ) {
+                $name = '👨‍💻 Admin Sandbox (' . wp_get_current_user()->user_login . ')';
+            }
+
+            $formatted[ $uid ] = [
+                'name'         => $name,
+                'profile_pic'  => isset( $d['profile_pic'] ) ? $d['profile_pic'] : '',
+                'last_msg'     => $last_msg,
+                'last_time'    => $last_time,
+                'time'         => 'ล่าสุด',
+                'claim_status' => isset( $d['claim_status'] ) ? $d['claim_status'] : 'none',
+                'claim_data'   => isset( $d['claim_data'] ) ? $d['claim_data'] : null,
+                'needs_admin'  => isset( $d['needs_admin'] ) ? $d['needs_admin'] : false,
+                'is_claim'     => isset( $d['is_claim'] ) ? $d['is_claim'] : false,
+                'history'      => $hist,
+            ];
+        }
+
+        if ( empty( $formatted ) ) {
+            $formatted['u1'] = [
+                'name' => 'ระบบรอรับข้อความ...', 'profile_pic' => '', 'last_msg' => 'ยังไม่มีแชท',
+                'last_time' => '', 'time' => '-', 'claim_status' => 'none', 'claim_data' => null,
+                'needs_admin' => false, 'is_claim' => false, 'history' => [],
+            ];
+        }
+
+        echo json_encode( [ 'success' => true, 'data' => $formatted ] );
+        exit;
+    }
+
+    // =========================================================================
+    // [SECTION 7] UI RENDERER — Full Dashboard
+    // (CSS, HTML, and JS are identical to v19 UI — only version label changed)
+    // =========================================================================
+    public function render_ui() {
+        ob_start();
+        ?>
+        <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+
+        <style>
+            #wpbody-content { padding-bottom: 0 !important; }
+            .wrap { margin: 0 !important; max-width: 100% !important; padding: 0 !important; }
+            #wpfooter { display: none !important; }
+            #dnc-v19-root {
+                font-family: 'Sarabun', sans-serif; background-color: #f1f5f9; color: #334155;
+                position: relative; width: 100%; height: calc(100vh - 120px); z-index: 10;
+                display: flex; flex-direction: column; overflow: hidden;
+            }
+            #dnc-v19-root * { box-sizing: border-box; }
+            .dnc-head { background:#fff; height:60px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; padding:0 20px; flex-shrink:0; }
+            .dnc-brand { font-size:1.2rem; font-weight:800; color:#1e293b; display:flex; align-items:center; gap:10px; }
+            .dnc-brand i { color:#2563eb; }
+            .dnc-brand small { font-size:0.75rem; font-weight:400; color:#94a3b8; background:#f1f5f9; padding:2px 6px; border-radius:4px; }
+            .dnc-nav { display:flex; gap:5px; background:#f8fafc; padding:4px; border-radius:8px; border:1px solid #e2e8f0; }
+            .dnc-tab { background:transparent; border:none; padding:8px 16px; font-size:0.9rem; font-weight:600; color:#64748b; cursor:pointer; border-radius:6px; transition:0.2s; font-family:inherit; display:flex; align-items:center; gap:8px; }
+            .dnc-tab:hover { background:#fff; color:#1e293b; }
+            .dnc-tab.active { background:#fff; color:#2563eb; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
+            .dnc-body { flex:1; padding:20px; overflow:hidden; display:flex; }
+            .dnc-view { display:none; width:100%; height:100%; }
+            .dnc-view.active { display:block; }
+            .dnc-grid-main { display:grid; grid-template-columns:320px 1fr; gap:20px; height:100%; }
+            .dnc-grid-lab { display:grid; grid-template-columns:1fr 400px; gap:20px; height:100%; }
+            .dnc-grid-claim { display:grid; grid-template-columns:350px 1fr; gap:20px; height:100%; }
+            .dnc-card { background:#fff; border-radius:12px; border:1px solid #e2e8f0; display:flex; flex-direction:column; overflow:hidden; }
+            .dnc-card-h { padding:15px 20px; border-bottom:1px solid #e2e8f0; font-weight:700; color:#334155; font-size:0.95rem; display:flex; justify-content:space-between; align-items:center; }
+            .dnc-card-b { flex:1; overflow-y:auto; padding:20px; position:relative; }
+            .dnc-user-list .item { padding:15px; border-bottom:1px solid #f1f5f9; cursor:pointer; transition:0.1s; }
+            .dnc-user-list .item:hover { background:#f8fafc; }
+            .dnc-user-list .item.active { background:#eff6ff; border-left:4px solid #2563eb; }
+            .dnc-bubble { padding:12px 16px; border-radius:12px; font-size:0.95rem; line-height:1.5; }
+            .dnc-b-user { background:#f1f5f9; color:#334155; border-bottom-left-radius:2px; }
+            .dnc-b-ai { background:#2563eb; color:#fff; border-bottom-right-radius:2px; }
+            .dnc-b-admin { background:#10b981; color:#fff; border-bottom-right-radius:2px; }
+            .dnc-input { width:100%; padding:12px; border:1px solid #cbd5e1; border-radius:8px; font-family:inherit; font-size:0.95rem; background:#fff; margin-bottom:10px; }
+            .dnc-input:focus { border-color:#2563eb; outline:none; box-shadow:0 0 0 2px rgba(37,99,235,0.1); }
+            .dnc-btn { background:#2563eb; color:#fff; border:none; padding:10px 20px; border-radius:8px; cursor:pointer; font-size:0.9rem; font-weight:600; display:inline-flex; align-items:center; gap:8px; transition:0.2s; justify-content:center; }
+            .dnc-btn:hover { background:#1d4ed8; }
+            .dnc-btn.sec { background:#fff; color:#334155; border:1px solid #cbd5e1; }
+            .dnc-btn.sec:hover { background:#f8fafc; }
+            .dnc-btn.green { background:#10b981; } .dnc-btn.green:hover { background:#059669; }
+            .dnc-btn.red { background:#ef4444; } .dnc-btn.red:hover { background:#dc2626; }
+            .dnc-badge { font-size:0.7rem; padding:2px 8px; border-radius:20px; background:#e2e8f0; font-weight:600; color:#475569; }
+            .dnc-badge.warn { background:#fef9c3; color:#854d0e; }
+            .dnc-badge.red { background:#fee2e2; color:#b91c1c; }
+            .dnc-badge.green { background:#d1fae5; color:#065f46; }
+            .dnc-badge.blue { background:#dbeafe; color:#1e40af; }
+            .dnc-claim-filter { transition:0.2s; }
+            .dnc-claim-filter.active { background:#2563eb !important; color:#fff !important; border-color:#2563eb !important; }
+            .claim-data-card { background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:16px; margin-bottom:14px; }
+            .claim-data-card h4 { margin:0 0 10px 0; font-size:0.9rem; color:#475569; display:flex; align-items:center; gap:8px; }
+            .claim-data-card h4 i { color:#2563eb; font-size:0.85rem; }
+            .claim-photo-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:10px; }
+            .claim-photo-grid a { display:block; border-radius:8px; overflow:hidden; border:1px solid #e2e8f0; transition:0.2s; }
+            .claim-photo-grid a:hover { border-color:#2563eb; transform:scale(1.03); }
+            .claim-photo-grid img { width:100%; height:100px; object-fit:cover; display:block; }
+            .claim-status-bar { display:flex; gap:10px; padding:14px 16px; border-radius:10px; margin-bottom:16px; align-items:center; font-weight:600; font-size:0.9rem; }
+            .claim-status-bar.pending { background:#fef3c7; border:1px solid #fbbf24; color:#92400e; }
+            .claim-status-bar.approved { background:#d1fae5; border:1px solid #34d399; color:#065f46; }
+            .claim-status-bar.shipped { background:#dbeafe; border:1px solid #60a5fa; color:#1e40af; }
+            .claim-status-bar.rejected { background:#fee2e2; border:1px solid #f87171; color:#991b1b; }
+            .dnc-pulse-dot { width:8px; height:8px; background:#10b981; border-radius:50%; display:inline-block; animation:dnc-pulse 2s infinite; }
+            @keyframes dnc-pulse { 0%,100%{opacity:1;transform:scale(1);} 50%{opacity:0.4;transform:scale(0.8);} }
+            #dnc-live-indicator.has-new { color:#f59e0b; font-weight:700; }
+            #dnc-live-indicator.has-new .dnc-pulse-dot { background:#f59e0b; animation:dnc-pulse-fast 0.6s infinite; }
+            @keyframes dnc-pulse-fast { 0%,100%{opacity:1;transform:scale(1);} 50%{opacity:0.3;transform:scale(1.3);} }
+            .dnc-inventory-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:15px; margin-top:15px; }
+            .dnc-product-item { background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:10px; text-align:center; }
+            .dnc-product-item img { max-width:100%; height:120px; object-fit:contain; border-radius:6px; margin-bottom:10px; background:#f8fafc; }
+            .dnc-product-item h4 { margin:0 0 5px; font-size:0.9rem; color:#1e293b; }
+            .dnc-product-item p { margin:0; font-weight:bold; color:#10b981; font-size:0.85rem; }
+            .dnc-product-sku { background:#f1f5f9; color:#64748b; font-family:monospace; padding:2px 6px; border-radius:4px; font-size:0.75rem; display:inline-block; margin-bottom:5px; }
+            .acf-map-block { border:1px solid #e2e8f0; border-radius:8px; overflow:hidden; margin-bottom:15px; }
+            .acf-map-header { background:#f8fafc; padding:8px 15px; font-size:0.8rem; font-weight:700; color:#475569; border-bottom:1px solid #e2e8f0; display:flex; align-items:center; gap:8px; }
+            .acf-map-content { padding:12px 15px; font-size:0.9rem; color:#334155; background:#fff; white-space:pre-wrap; line-height:1.5; }
+            .acf-map-content.empty { color:#94a3b8; font-style:italic; }
+            .dnc-modal-overlay { position:fixed!important; top:0!important; left:0!important; width:100vw!important; height:100vh!important; background:rgba(15,23,42,0.85)!important; z-index:999999!important; display:none; justify-content:center; align-items:center; backdrop-filter:blur(4px); }
+            .dnc-modal-overlay.active { display:flex; }
+            .dnc-modal-box { background:#fff; width:95%; max-width:1400px; height:90vh; border-radius:16px; display:flex; flex-direction:column; overflow:hidden; box-shadow:0 25px 50px -12px rgba(0,0,0,0.25); }
+            .dnc-modal-header { padding:20px 25px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; background:#f8fafc; }
+            .dnc-modal-body { flex:1; overflow-y:auto; padding:25px; background:#f1f5f9; }
+            .dnc-kb-row { background:#fff; padding:20px; border-radius:12px; border:1px solid #e2e8f0; margin-bottom:15px; position:relative; }
+            .dnc-kb-edit-form { display:none; margin-top:15px; padding-top:15px; border-top:1px dashed #cbd5e1; }
+            .dnc-kb-row.editing .dnc-kb-display { display:none; }
+            .dnc-kb-row.editing .dnc-kb-edit-form { display:block; }
+        </style>
+        <div id="dnc-v19-root">
+            <div class="dnc-head">
+                <div class="dnc-brand">
+                    <i class="fa-solid fa-robot"></i> DINOCO ENTERPRISE 
+                    <small>v22.0.0 Function Calling Architecture</small>
+                </div>
+                <div class="dnc-nav">
+                    <button class="dnc-tab active" data-t="monitor"><i class="fa-brands fa-facebook-messenger"></i> Live Chat</button>
+                    <button class="dnc-tab" data-t="claims"><i class="fa-solid fa-box-open"></i> Claims</button>
+                    <button class="dnc-tab" data-t="lab"><i class="fa-solid fa-flask"></i> Training Lab</button>
+                    <button class="dnc-tab" data-t="settings"><i class="fa-solid fa-sliders"></i> Config</button>
+                </div>
+                <button class="dnc-btn" id="dnc-save-sys"><i class="fa-solid fa-floppy-disk"></i> Save System</button>
+            </div>
+            <div class="dnc-body">
+                <!-- 1. LIVE CHAT -->
+                <div id="view-monitor" class="dnc-view active">
+                    <div class="dnc-grid-main">
+                        <div class="dnc-card">
+                            <div class="dnc-card-h"><span>Inbox</span><div style="display:flex;align-items:center;gap:8px;"><span id="dnc-live-indicator" style="display:inline-flex;align-items:center;gap:4px;font-size:0.8rem;color:#10b981;"><span class="dnc-pulse-dot"></span> Live</span><button class="dnc-btn sec" style="padding:4px 8px;font-size:0.8rem;" onclick="window.refreshDataAndRender()"><i class="fa-solid fa-rotate"></i></button></div></div>
+                            <div class="dnc-card-b dnc-user-list" id="dnc-users" style="padding:0;"><div style="padding:30px;text-align:center;color:#94a3b8;">Loading...</div></div>
+                        </div>
+                        <div class="dnc-card">
+                            <div class="dnc-card-h"><span>Conversation</span><div style="font-size:0.8rem;color:#10b981;"><span class="dnc-pulse-dot"></span> Auto-refresh 5s</div></div>
+                            <div class="dnc-card-b dnc-chat-box" id="dnc-chat-area"><div style="text-align:center;margin-top:20%;color:#cbd5e1;"><i class="fa-regular fa-comments" style="font-size:4rem;margin-bottom:15px;"></i><br>เลือกแชทเพื่อดูข้อความ</div></div>
+                            <div style="padding:20px;background:#fff;border-top:1px solid #e2e8f0;"><div style="display:flex;gap:10px;"><input type="text" id="dnc-takeover-in" class="dnc-input" placeholder="พิมพ์ข้อความตอบกลับ (Takeover)..." style="margin:0;"><button class="dnc-btn" id="dnc-takeover-send"><i class="fa-solid fa-paper-plane"></i> ตอบแชท</button></div></div>
+                        </div>
+                    </div>
+                </div>
+                <!-- 2. CLAIMS -->
+                <div id="view-claims" class="dnc-view">
+                    <div class="dnc-grid-claim">
+                        <div class="dnc-card">
+                            <div class="dnc-card-h">
+                                <span>Claim Tickets</span>
+                                <div style="display:flex;gap:4px;flex-wrap:wrap;">
+                                    <button class="dnc-btn sec dnc-claim-filter active" data-f="pending" style="padding:4px 8px;font-size:0.75rem;" onclick="filterClaims('pending')">🟡 รอตรวจ</button>
+                                    <button class="dnc-btn sec dnc-claim-filter" data-f="approved" style="padding:4px 8px;font-size:0.75rem;" onclick="filterClaims('approved')">🟢 รอส่ง</button>
+                                    <button class="dnc-btn sec dnc-claim-filter" data-f="all" style="padding:4px 8px;font-size:0.75rem;" onclick="filterClaims('all')">ทั้งหมด</button>
+                                </div>
+                            </div>
+                            <div class="dnc-card-b dnc-user-list" id="dnc-claim-list" style="padding:0;">
+                                <div style="padding:30px;text-align:center;color:#94a3b8;">Loading...</div>
+                            </div>
+                        </div>
+                        <div class="dnc-card" id="dnc-claim-details-panel">
+                            <div class="dnc-card-h"><span id="claim-detail-title">รายละเอียดเคลม</span></div>
+                            <div class="dnc-card-b">
+                                <div style="text-align:center;margin-top:15%;color:#cbd5e1;">
+                                    <i class="fa-solid fa-clipboard-list" style="font-size:4rem;margin-bottom:15px;"></i><br>
+                                    เลือก Ticket ทางซ้ายมือ
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- 3. TRAINING LAB -->
+                <div id="view-lab" class="dnc-view">
+                    <div class="dnc-grid-lab">
+                        <div class="dnc-card">
+                            <div class="dnc-card-h">Sandbox<button class="dnc-btn sec" style="padding:4px 8px;font-size:0.8rem;" onclick="clearSandboxChat()"><i class="fa-solid fa-rotate-right"></i> Clear</button></div>
+                            <div class="dnc-card-b" id="dnc-lab-logs" style="background:#f8fafc;display:flex;flex-direction:column;gap:15px;"><div style="text-align:center;margin-top:50px;color:#94a3b8;"><i class="fa-solid fa-microchip" style="font-size:3rem;opacity:0.3;margin-bottom:15px;"></i><br>ทดลองพิมพ์ถาม-ตอบได้เลย</div></div>
+                            <div style="padding:20px;background:#fff;border-top:1px solid #e2e8f0;"><div style="display:flex;gap:10px;"><input type="text" id="dnc-lab-in" class="dnc-input" placeholder="พิมพ์คำถาม..." style="margin:0;"><button class="dnc-btn" id="dnc-lab-send">Send</button></div></div>
+                        </div>
+                        <div class="dnc-card">
+                            <div class="dnc-card-h">Logic Implant<div><input type="file" id="dnc-csv-file" accept=".csv" style="display:none;"><button class="dnc-btn sec" style="padding:4px 8px;font-size:0.8rem;" onclick="document.getElementById('dnc-csv-file').click()"><i class="fa-solid fa-file-import"></i> Import CSV</button> <button class="dnc-btn sec" style="padding:4px 8px;font-size:0.8rem;" onclick="exportCSV()"><i class="fa-solid fa-file-export"></i> Export</button></div></div>
+                            <div class="dnc-card-b">
+                                <label style="font-weight:bold;font-size:0.9rem;color:#475569;">1. เจตนาลูกค้า (Intent):</label>
+                                <input type="text" id="dnc-fix-intent" class="dnc-input" placeholder="เช่น ลูกค้าถามเรื่องส่วนลด">
+                                <label style="font-weight:bold;font-size:0.9rem;color:#10b981;margin-top:10px;display:block;">2. ข้อเท็จจริง (Facts):</label>
+                                <textarea id="dnc-fix-facts" class="dnc-input" rows="3" placeholder="ข้อมูลที่ AI ต้องรู้"></textarea>
+                                <label style="font-weight:bold;font-size:0.9rem;color:#2563eb;margin-top:10px;display:block;">3. แนวทาง (Action):</label>
+                                <textarea id="dnc-fix-action" class="dnc-input" rows="3" placeholder="สั่ง AI ว่าควรตอบยังไง"></textarea>
+                                <button class="dnc-btn sec" id="dnc-add-kb" style="width:100%;justify-content:center;margin-top:15px;background-color:#1e293b;color:#fff;border:none;"><i class="fa-solid fa-plus"></i> Add Logic</button>
+                                <div id="dnc-kb-list" style="margin-top:25px;border-top:1px solid #e2e8f0;padding-top:20px;text-align:center;"><button type="button" class="dnc-btn" id="dnc-open-memory-btn" style="background:#8b5cf6;padding:15px 30px;font-size:1.1rem;width:100%;justify-content:center;"><i class="fa-solid fa-database"></i> จัดการ Memory (แก้ไข/ลบ)</button></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- 4. CONFIG -->
+                <div id="view-settings" class="dnc-view">
+                    <div class="dnc-grid-main">
+                        <div class="dnc-card">
+                            <div class="dnc-card-h">API & Override</div>
+                            <div class="dnc-card-b">
+                                <label style="font-weight:bold;">Gemini API Key</label>
+                                <input type="password" id="dnc-key" class="dnc-input" placeholder="หากปล่อยว่าง จะอ่านจาก wp-config.php...">
+                                <small id="dnc-key-status" style="display:block;margin-top:-5px;margin-bottom:20px;color:#64748b;"></small>
+                                <div style="border-top:1px dashed #e2e8f0;margin:20px 0;"></div>
+                                <label style="font-weight:bold;display:block;color:#ef4444;"><i class="fa-solid fa-triangle-exclamation"></i> Emergency Override</label>
+                                <small style="color:#64748b;display:block;margin-bottom:10px;">พิมพ์ข้อมูลที่นี่จะหยุดอ่าน ACF ทั้งหมด</small>
+                                <textarea id="dnc-core" class="dnc-input" rows="10" placeholder="ปล่อยว่างเพื่อใช้ ACF ปกติ..."></textarea>
+                            </div>
+                        </div>
+                        <div class="dnc-card">
+                            <div class="dnc-card-h"><span><i class="fa-solid fa-brain"></i> AI Core Memory (ACF Map)</span></div>
+                            <div class="dnc-card-b" id="acf-visual-mapper" style="padding-top:10px;">
+                                <div style="background:#eff6ff;border:1px solid #bfdbfe;padding:15px;border-radius:8px;margin-bottom:15px;font-size:0.85rem;color:#1e40af;"><i class="fa-solid fa-circle-info"></i> <b>Read-only</b> — แก้ไขที่เมนู AI Core Settings ด้านซ้าย</div>
+                                <div style="text-align:center;padding:10px;color:#94a3b8;"><i class="fa-solid fa-spinner fa-spin"></i> กำลังโหลด...</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="dnc-card" style="margin-top:20px;">
+                        <div class="dnc-card-h"><span><i class="fa-solid fa-boxes-stacked"></i> Inventory (wp_options: dinoco_product_catalog)</span><div><span id="inv-status" style="font-size:0.9rem;color:#64748b;">รอตรวจสอบ...</span> <button class="dnc-btn sec" id="dnc-sync" style="margin-left:10px;"><i class="fa-solid fa-rotate"></i> Check DB</button></div></div>
+                        <div class="dnc-card-b"><div id="dnc-inventory-list" class="dnc-inventory-grid"><div style="grid-column:1/-1;text-align:center;color:#94a3b8;padding:20px;">กำลังโหลด...</div></div></div>
+                    </div>
+                </div>
+            </div>
+            <!-- MEMORY MODAL -->
+            <div class="dnc-modal-overlay" id="dnc-memory-modal">
+                <div class="dnc-modal-box">
+                    <div class="dnc-modal-header"><h2 style="margin:0;font-size:1.4rem;color:#1e293b;"><i class="fa-solid fa-database" style="color:#8b5cf6;"></i> คลังความรู้ AI (Memory Database)</h2><button type="button" class="dnc-btn sec" onclick="closeMemoryModal()"><i class="fa-solid fa-xmark"></i> ปิด</button></div>
+                    <div class="dnc-modal-body" id="dnc-memory-modal-body"><div style="text-align:center;padding:50px;color:#94a3b8;"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
+                </div>
+            </div>
+        </div>
+        <script>
+        window.getCacheBustedUrl = function() {
+            var u = window.location.href.split('#')[0];
+            return u + (u.indexOf('?') !== -1 ? '&' : '?') + 'no_cache=' + Date.now();
+        };
+        var globalLogs = {};
+        window.currentChatUid = null;
+        window.currentClaimUid = null;
+        var currentSandboxSession = Date.now();
+
+        window.loadChat = function(uid) {
+            window.currentChatUid = uid;
+            jQuery('#dnc-users .item').removeClass('active');
+            jQuery('#user-item-' + uid).addClass('active');
+            var d = globalLogs[uid];
+            if (!d) return;
+            var html = '<div style="display:flex;flex-direction:column;width:100%;gap:10px;">';
+            if (d.history && d.history.length > 0) {
+                jQuery.each(d.history, function(i, h) {
+                    var isU = (h.role === 'user'), isA = (h.role === 'admin');
+                    var bc = isU ? 'dnc-b-user' : (isA ? 'dnc-b-admin' : 'dnc-b-ai');
+                    var rl = isU ? 'ลูกค้า' : (isA ? 'แอดมิน' : 'AI');
+                    var txt = h.text ? h.text.replace(/\n/g,'<br>') : '';
+                    var av = isU ? (d.profile_pic || 'https://ui-avatars.com/api/?name='+encodeURIComponent(d.name)+'&background=e2e8f0&color=94a3b8') : 'https://ui-avatars.com/api/?name=AI&background=2563eb&color=fff';
+                    if (isA) av = 'https://ui-avatars.com/api/?name=Ad&background=10b981&color=fff';
+                    html += '<div style="display:flex;width:100%;gap:10px;margin-bottom:12px;'+(isU?'justify-content:flex-start;':'justify-content:flex-end;')+'">';
+                    if (isU) html += '<img src="'+av+'" style="width:35px;height:35px;border-radius:50%;object-fit:cover;flex-shrink:0;margin-top:auto;">';
+                    html += '<div class="dnc-bubble '+bc+'" style="margin-bottom:0;max-width:75%;"><strong style="font-size:0.8rem;opacity:0.8;display:block;margin-bottom:4px;">'+rl+'</strong>'+txt;
+                    if (h.image) html += '<br><img src="'+h.image+'" style="max-width:100%;border-radius:8px;margin-top:10px;">';
+                    html += '</div>';
+                    if (!isU) html += '<img src="'+av+'" style="width:35px;height:35px;border-radius:50%;object-fit:cover;flex-shrink:0;margin-top:auto;">';
+                    html += '</div>';
+                });
+            } else { html += '<div style="text-align:center;padding:50px;color:#aaa;">ไม่มีประวัติ</div>'; }
+            html += '</div>';
+            jQuery('#dnc-chat-area').html(html);
+            document.getElementById('dnc-chat-area').scrollTop = 999999;
+        };
+
+        window.currentClaimFilter = 'pending';
+        window.filterClaims = function(f) {
+            window.currentClaimFilter = f;
+            jQuery('.dnc-claim-filter').removeClass('active');
+            jQuery('.dnc-claim-filter[data-f="'+f+'"]').addClass('active');
+            window.renderClaimsList();
+        };
+
+        window.renderClaimsList = function() {
+            var claims='', count=0, f=window.currentClaimFilter;
+            jQuery.each(globalLogs, function(k,v){
+                if(k.indexOf('sandbox')!==-1) return;
+                var cs=v.claim_status||'none';
+                if(cs==='none') return;
+                if(f!=='all' && cs!==f) return;
+                count++;
+                var av=v.profile_pic||'https://ui-avatars.com/api/?name='+encodeURIComponent(v.name)+'&background=e2e8f0&color=94a3b8';
+                var cd=v.claim_data||{};
+                var badge='', borderColor='#e2e8f0';
+                if(cs==='pending')  { badge='<span class="dnc-badge warn">รอตรวจ</span>'; borderColor='#fbbf24'; }
+                else if(cs==='approved') { badge='<span class="dnc-badge green">รอจัดส่ง</span>'; borderColor='#34d399'; }
+                else if(cs==='shipped')  { badge='<span class="dnc-badge blue">จัดส่งแล้ว</span>'; borderColor='#60a5fa'; }
+                else if(cs==='rejected') { badge='<span class="dnc-badge red">ปฏิเสธ</span>'; borderColor='#f87171'; }
+                var tid=cd.id||'';
+                var time=cd.created_at||'';
+                claims+='<div class="item" id="claim-item-'+k+'" onclick="loadClaimDetails(\''+k+'\')" style="display:flex;gap:10px;align-items:center;">';
+                claims+='<img src="'+av+'" style="width:40px;height:40px;border-radius:50%;object-fit:cover;border:2px solid '+borderColor+';flex-shrink:0;">';
+                claims+='<div style="flex:1;min-width:0;"><div style="display:flex;align-items:center;gap:6px;"><strong style="font-size:0.9rem;">'+v.name+'</strong>'+badge+'</div>';
+                claims+='<div style="color:#94a3b8;font-size:0.8rem;">'+(tid?tid+' · ':'')+time+'</div></div></div>';
+            });
+            jQuery('#dnc-claim-list').html(count>0?claims:'<div style="padding:30px;text-align:center;color:#94a3b8;"><i class="fa-solid fa-inbox" style="font-size:2rem;margin-bottom:10px;display:block;opacity:0.3;"></i>ไม่มีเคลม'+(f==='pending'?'ค้าง':'')+'</div>');
+        };
+
+        window.loadClaimDetails = function(uid) {
+            window.currentClaimUid = uid;
+            jQuery('#dnc-claim-list .item').removeClass('active');
+            jQuery('#claim-item-'+uid).addClass('active');
+            var d = globalLogs[uid];
+            if (!d) return;
+
+            var cd = d.claim_data || {};
+            var cs = d.claim_status || 'pending';
+            var html = '';
+
+            // === Status Bar ===
+            var statusIcon, statusText, statusClass;
+            if(cs==='pending')  { statusIcon='fa-clock'; statusText='รอแอดมินตรวจสอบ'; statusClass='pending'; }
+            else if(cs==='approved') { statusIcon='fa-circle-check'; statusText='อนุมัติแล้ว — รอจัดส่งสินค้า'; statusClass='approved'; }
+            else if(cs==='shipped')  { statusIcon='fa-truck'; statusText='จัดส่งแล้ว — '+(cd.tracking||''); statusClass='shipped'; }
+            else if(cs==='rejected') { statusIcon='fa-circle-xmark'; statusText='ปฏิเสธ — '+(cd.admin_note||''); statusClass='rejected'; }
+            html += '<div class="claim-status-bar '+statusClass+'"><i class="fa-solid '+statusIcon+'"></i> '+statusText+'</div>';
+
+            // === Ticket Info ===
+            html += '<div class="claim-data-card"><h4><i class="fa-solid fa-ticket"></i> ข้อมูล Ticket</h4>';
+            html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:0.9rem;">';
+            html += '<div><span style="color:#94a3b8;">ID:</span> <strong>'+(cd.id||'—')+'</strong></div>';
+            html += '<div><span style="color:#94a3b8;">วันที่:</span> '+(cd.created_at||'—')+'</div>';
+            html += '<div><span style="color:#94a3b8;">ลูกค้า:</span> <strong>'+(cd.customer||d.name||'—')+'</strong></div>';
+            html += '<div><span style="color:#94a3b8;">เบอร์:</span> <strong style="color:#2563eb;">'+(cd.phone||'<span style=\"color:#ef4444;\">ไม่มี</span>')+'</strong></div>';
+            html += '</div></div>';
+
+            // === Problem ===
+            if (cd.problem) {
+                html += '<div class="claim-data-card"><h4><i class="fa-solid fa-bug"></i> ปัญหาที่แจ้ง</h4>';
+                html += '<div style="font-size:0.9rem;color:#334155;">'+cd.problem.replace(/\n/g,'<br>')+'</div></div>';
+            }
+
+            // === Photos ===
+            var photos = cd.photos || [];
+            // Also scan history for extra images
+            if (d.history && d.history.length) {
+                jQuery.each(d.history, function(i,h){
+                    if(h.image && h.image.trim()!=='' && h.role==='user'){
+                        var exists=false;
+                        for(var p=0;p<photos.length;p++){if(photos[p]===h.image){exists=true;break;}}
+                        if(!exists) photos.push(h.image);
+                    }
+                });
+            }
+            html += '<div class="claim-data-card"><h4><i class="fa-solid fa-images"></i> รูปภาพหลักฐาน <span class="dnc-badge">'+(photos.length)+' รูป</span></h4>';
+            if (photos.length > 0) {
+                html += '<div class="claim-photo-grid">';
+                jQuery.each(photos, function(i,img){
+                    html += '<a href="'+img+'" target="_blank"><img src="'+img+'" alt="Evidence '+(i+1)+'"></a>';
+                });
+                html += '</div>';
+            } else {
+                html += '<div style="color:#ef4444;font-size:0.9rem;"><i class="fa-solid fa-triangle-exclamation"></i> ไม่พบรูปภาพหลักฐาน</div>';
+            }
+            html += '</div>';
+
+            // === Address ===
+            html += '<div class="claim-data-card"><h4><i class="fa-solid fa-location-dot"></i> ที่อยู่จัดส่ง</h4>';
+            html += '<div style="font-size:0.9rem;">'+(cd.address ? cd.address.replace(/\n/g,'<br>') : '<span style="color:#ef4444;">ไม่มีข้อมูลที่อยู่</span>')+'</div></div>';
+
+            // === Chat Summary (collapsible) ===
+            var ctx = '';
+            if (d.history && d.history.length) {
+                jQuery.each(d.history.slice(-8), function(i,h){
+                    var t=h.text||'';
+                    if(t && t.indexOf('[แนบรูปภาพ')===-1)
+                        ctx += '<div style="margin-bottom:6px;'+(h.role==='user'?'':'color:#2563eb;')+'"><strong>'+(h.role==='user'?'ลูกค้า':'AI')+':</strong> '+t+'</div>';
+                });
+            }
+            html += '<details style="margin-bottom:16px;"><summary style="cursor:pointer;font-weight:600;font-size:0.9rem;color:#64748b;padding:8px 0;"><i class="fa-solid fa-comments"></i> ดูประวัติสนทนา</summary>';
+            html += '<div style="background:#f8fafc;padding:14px;border-radius:8px;border:1px solid #e2e8f0;max-height:200px;overflow-y:auto;font-size:0.85rem;margin-top:8px;">'+(ctx||'ไม่มีข้อความ')+'</div></details>';
+
+            // === Action Buttons — different per status ===
+            if (cs === 'pending') {
+                // Step 1: อนุมัติ or ปฏิเสธ
+                html += '<div style="display:flex;gap:10px;">';
+                html += '<button class="dnc-btn green" onclick="approveClaim()" style="flex:1;padding:14px;font-size:1rem;"><i class="fa-solid fa-check"></i> อนุมัติเคลม</button>';
+                html += '<button class="dnc-btn red" onclick="rejectClaim()" style="flex:1;padding:14px;font-size:1rem;"><i class="fa-solid fa-xmark"></i> ปฏิเสธ</button>';
+                html += '</div>';
+            } else if (cs === 'approved') {
+                // Step 2: กรอกเลขพัสดุ (อนุมัติแล้ว รอจัดส่ง)
+                html += '<div style="background:#f0fdf4;padding:20px;border-radius:12px;border:1px solid #bbf7d0;">';
+                html += '<label style="color:#166534;font-weight:bold;font-size:0.95rem;display:block;margin-bottom:4px;">📦 กรอกเลขพัสดุเพื่อแจ้งลูกค้า</label>';
+                html += '<small style="color:#6b7280;display:block;margin-bottom:12px;">เมื่อจัดส่งสินค้าแล้ว ให้กรอกเลขพัสดุที่นี่ ระบบจะแจ้งลูกค้าอัตโนมัติ</small>';
+                html += '<input type="text" id="track-num" class="dnc-input" placeholder="เช่น KERRY123456, TH1234567890" style="margin:0;">';
+                html += '<button class="dnc-btn green" onclick="shipClaim()" style="width:100%;margin-top:10px;padding:14px;font-size:1rem;"><i class="fa-solid fa-truck"></i> บันทึกเลขพัสดุ & แจ้งลูกค้า</button>';
+                html += '</div>';
+            } else if (cs === 'shipped') {
+                // Done: แสดงเลขพัสดุ (read-only)
+                html += '<div style="background:#dbeafe;padding:18px;border-radius:12px;border:1px solid #93c5fd;">';
+                html += '<div style="font-weight:bold;color:#1e40af;margin-bottom:6px;"><i class="fa-solid fa-truck"></i> จัดส่งแล้ว</div>';
+                html += '<div style="font-size:1.1rem;font-weight:700;color:#1e3a5f;">📦 '+(cd.tracking||'—')+'</div>';
+                if(cd.shipped_at) html += '<div style="color:#6b7280;font-size:0.85rem;margin-top:6px;">ส่งเมื่อ: '+cd.shipped_at+(cd.shipped_by?' โดย '+cd.shipped_by:'')+'</div>';
+                html += '</div>';
+            }
+            // rejected → no buttons, status bar already shows reason
+
+            // Update header
+            var hBadge = cs==='pending'?'warn':cs==='approved'?'green':cs==='shipped'?'blue':'red';
+            var hText  = cs==='pending'?'รอตรวจ':cs==='approved'?'รอจัดส่ง':cs==='shipped'?'จัดส่งแล้ว':'ปฏิเสธ';
+            jQuery('#claim-detail-title').html((cd.id||'Claim')+' <span class="dnc-badge '+hBadge+'">'+hText+'</span>');
+            jQuery('#dnc-claim-details-panel .dnc-card-b').html(html);
+        };
+
+        // ★ v20.2.1: 4-Status Claim Flow
+        window.approveClaim = function() {
+            if(!window.currentClaimUid) return;
+            Swal.fire({
+                title:'อนุมัติเคลม?',
+                text:'ระบบจะแจ้งลูกค้าว่าอนุมัติแล้ว กำลังจัดเตรียมสินค้า',
+                icon:'question',
+                showCancelButton:true,
+                confirmButtonColor:'#10b981',
+                confirmButtonText:'✅ อนุมัติ',
+                cancelButtonText:'ยกเลิก'
+            }).then(function(r){
+                if(r.isConfirmed){
+                    Swal.fire({title:'กำลังอนุมัติ...',allowOutsideClick:false,didOpen:()=>{Swal.showLoading();}});
+                    jQuery.post(window.getCacheBustedUrl(),{dnc_action_v19:'approve_claim',user_id:window.currentClaimUid},function(r){
+                        if(r.success){Swal.fire('อนุมัติสำเร็จ!',r.message,'success');window.refreshDataAndRender();}
+                        else Swal.fire('Error',r.message,'error');
+                    },'json');
+                }
+            });
+        };
+
+        window.shipClaim = function() {
+            var t=jQuery('#track-num').val();
+            if(!t) return Swal.fire('แจ้งเตือน','กรุณากรอกเลขพัสดุ','warning');
+            if(!window.currentClaimUid) return Swal.fire('แจ้งเตือน','เลือกลูกค้าก่อน','warning');
+            Swal.fire({title:'กำลังบันทึก...',allowOutsideClick:false,didOpen:()=>{Swal.showLoading();}});
+            jQuery.post(window.getCacheBustedUrl(),{dnc_action_v19:'ship_claim',user_id:window.currentClaimUid,tracking:t},function(r){
+                if(r.success){Swal.fire('จัดส่งสำเร็จ!',r.message,'success');window.refreshDataAndRender();}
+                else Swal.fire('Error',r.message,'error');
+            },'json');
+        };
+
+        // Legacy compat
+        window.confirmClaim = window.shipClaim;
+
+        window.rejectClaim = function() {
+            if(!window.currentClaimUid) return;
+            Swal.fire({
+                title:'ปฏิเสธเคลม',
+                input:'text',
+                inputPlaceholder:'กรอกเหตุผลสั้นๆ...',
+                icon:'warning',
+                showCancelButton:true,
+                confirmButtonColor:'#ef4444',
+                confirmButtonText:'ปฏิเสธ',
+                cancelButtonText:'ยกเลิก',
+                inputValidator:function(v){if(!v) return 'กรุณากรอกเหตุผล';}
+            }).then(function(r){
+                if(r.isConfirmed){
+                    Swal.fire({title:'กำลังดำเนินการ...',allowOutsideClick:false,didOpen:()=>{Swal.showLoading();}});
+                    jQuery.post(window.getCacheBustedUrl(),{dnc_action_v19:'reject_claim',user_id:window.currentClaimUid,reason:r.value},function(r){
+                        if(r.success){Swal.fire('เสร็จสิ้น',r.message||'ส่งแจ้งปฏิเสธแล้ว','success');window.refreshDataAndRender();}
+                    },'json');
+                }
+            });
+        };
+
+        jQuery(document).ready(function($) {
+            $('#dnc-memory-modal').appendTo('body');
+            var dData = {core:'',kb:[],key:'',acf_knowledge:[],catalog:{},acf_options:{}};
+
+            window.clearSandboxChat = function() {
+                currentSandboxSession = Date.now();
+                window.currentChatUid = null;
+                $('#dnc-lab-logs').html('<div style="text-align:center;margin-top:50px;color:#10b981;"><i class="fa-solid fa-microchip" style="font-size:3rem;margin-bottom:15px;"></i><br>เริ่มใหม่! (Session: '+currentSandboxSession+')</div>');
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'clear_sandbox'},function(){window.refreshDataAndRender();});
+            };
+
+            // ★★★ v20.2.1: SMART AUTO-POLLING SYSTEM ★★★
+            var _lastLogsHash = '';
+            var _pollTimer = null;
+            var _pollInterval = 5000; // 5 วินาที
+            var _isPolling = false;
+            var _unseenCount = 0;
+            var _originalTitle = document.title;
+            var _notifSound = null;
+            try { _notifSound = new Audio('data:audio/wav;base64,UklGRl4AAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YTIAAAB/f39/f39/f4B+gH2BfIF9gXyCfIJ7gnuCe4J7gnuDe4N8g32DfYR9hH6EfoV+'); } catch(e){}
+
+            // Lightweight poll — only get_logs (fast)
+            window.pollLogs = function() {
+                if(_isPolling) return;
+                _isPolling = true;
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'get_logs'},function(res){
+                    _isPolling = false;
+                    if(!res || !res.success || !res.data) return;
+
+                    // Smart diff: hash all last_msg + history lengths
+                    var hash = '';
+                    $.each(res.data, function(k,v){
+                        var hLen = v.history ? v.history.length : 0;
+                        hash += k + ':' + hLen + ':' + (v.claim_status||'') + ':' + (v.needs_admin||'') + '|';
+                    });
+
+                    if(hash === _lastLogsHash) return; // Nothing changed
+
+                    // Detect new messages (count new user messages since last poll)
+                    var newMsgCount = 0;
+                    $.each(res.data, function(k,v){
+                        if(k.indexOf('sandbox')!==-1) return;
+                        var oldUser = globalLogs[k];
+                        var oldLen = (oldUser && oldUser.history) ? oldUser.history.length : 0;
+                        var newLen = v.history ? v.history.length : 0;
+                        if(newLen > oldLen) {
+                            // Check if latest message is from user (not AI/admin)
+                            for(var i=oldLen; i<newLen; i++){
+                                if(v.history[i] && v.history[i].role==='user') newMsgCount++;
+                            }
+                        }
+                    });
+
+                    _lastLogsHash = hash;
+                    globalLogs = res.data;
+
+                    // Re-render inbox
+                    var inbox='';
+                    $.each(res.data,function(k,v){
+                        var sb=(k.indexOf('sandbox')!==-1), bg=sb?'background:#f0fdf4;':'';
+                        var av=v.profile_pic||'https://ui-avatars.com/api/?name='+encodeURIComponent(v.name)+'&background=e2e8f0&color=94a3b8';
+                        if(sb) av='https://ui-avatars.com/api/?name=SB&background=10b981&color=fff';
+                        // Highlight if this user has new unseen messages
+                        var isActive = (k === window.currentChatUid);
+                        inbox+='<div class="item'+(isActive?' active':'')+'" id="user-item-'+k+'" onclick="loadChat(\''+k+'\')" style="'+bg+'display:flex;gap:10px;align-items:center;">';
+                        inbox+='<img src="'+av+'" style="width:40px;height:40px;border-radius:50%;object-fit:cover;border:1px solid #e2e8f0;flex-shrink:0;">';
+                        inbox+='<div style="flex:1;min-width:0;"><div style="display:flex;align-items:center;gap:4px;"><strong style="font-size:0.95rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;">'+v.name+'</strong>';
+                        if(v.needs_admin) inbox+='<span class="dnc-badge red" style="flex-shrink:0;">แอดมิน</span>';
+                        if(v.claim_status==='pending') inbox+='<span class="dnc-badge warn" style="flex-shrink:0;">เคลม</span>';
+                        if(v.last_time) inbox+='<span style="color:#94a3b8;font-size:0.75rem;flex-shrink:0;">'+v.last_time+'</span>';
+                        inbox+='</div><div style="color:#64748b;font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'+v.last_msg+'</div></div></div>';
+                    });
+                    $('#dnc-users').html(inbox);
+                    window.renderClaimsList();
+
+                    // Auto-update current open chat (real-time feel)
+                    if(window.currentChatUid && globalLogs[window.currentChatUid]) {
+                        window.loadChat(window.currentChatUid);
+                    }
+
+                    // Notification for new user messages
+                    if(newMsgCount > 0) {
+                        _unseenCount += newMsgCount;
+                        document.title = '(' + _unseenCount + ') แชทใหม่ — ' + _originalTitle;
+                        // Flash favicon / play sound
+                        try { if(_notifSound) { _notifSound.volume=0.3; _notifSound.play(); } } catch(e){}
+                        // Update live indicator
+                        $('#dnc-live-indicator').addClass('has-new');
+                    }
+                },'json');
+            };
+
+            // Full refresh — get_data + get_logs (heavy, use sparingly)
+            window.refreshDataAndRender = function() {
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'get_data'},function(res){
+                    if(res && res.success){
+                        dData = res.data;
+                        if(dData.core_prompt) $('#dnc-core').val(dData.core_prompt);
+                        $('#dnc-key').val(dData.api_key);
+                        if(!dData.api_key && dData.has_wp_config_key) $('#dnc-key-status').html('<i class="fa-solid fa-circle-check" style="color:#10b981;"></i> ใช้ Key จาก wp-config.php');
+                        else if(!dData.api_key) $('#dnc-key-status').html('<i class="fa-solid fa-circle-xmark" style="color:#ef4444;"></i> ยังไม่มี API Key!');
+                        else $('#dnc-key-status').html('<i class="fa-solid fa-circle-check" style="color:#10b981;"></i> Manual Key');
+                        if(Array.isArray(dData.knowledge)) dData.kb = dData.knowledge;
+                        if(!Array.isArray(dData.acf_knowledge)) dData.acf_knowledge = [];
+                        if(typeof dData.catalog!=='object'||!dData.catalog) dData.catalog = {};
+                        window.renderACFMap();
+                        window.renderCatalog();
+                        if($('#dnc-memory-modal').hasClass('active')) window.renderMemoryModal();
+                    }
+                },'json');
+                // Also poll logs
+                _lastLogsHash = ''; // Force re-render
+                window.pollLogs();
+            };
+
+            // Start/Stop polling based on tab visibility
+            function startPolling() {
+                if(_pollTimer) return;
+                _pollTimer = setInterval(window.pollLogs, _pollInterval);
+            }
+            function stopPolling() {
+                if(_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+            }
+
+            // Visibility API: pause when tab hidden
+            document.addEventListener('visibilitychange', function(){
+                if(document.hidden) {
+                    stopPolling();
+                } else {
+                    // Reset unseen count when user returns
+                    _unseenCount = 0;
+                    document.title = _originalTitle;
+                    $('#dnc-live-indicator').removeClass('has-new');
+                    window.pollLogs(); // immediate poll on return
+                    startPolling();
+                }
+            });
+
+            // Clear unseen when clicking on chat
+            var _origLoadChat = window.loadChat;
+            window.loadChat = function(uid) {
+                _origLoadChat(uid);
+                _unseenCount = 0;
+                document.title = _originalTitle;
+                $('#dnc-live-indicator').removeClass('has-new');
+            };
+
+            window.renderACFMap = function() {
+                var o = dData.acf_options || {};
+                var h = '<div style="background:#eff6ff;border:1px solid #bfdbfe;padding:15px;border-radius:8px;margin-bottom:15px;font-size:0.85rem;color:#1e40af;"><i class="fa-solid fa-circle-info"></i> <b>Read-only</b> — แก้ไขที่เมนู AI Core Settings</div>';
+                var fields = [['fa-user-tie','AI Persona',o.ai_persona],['fa-comment-dots','Tone of Voice',o.ai_tone_of_voice],['fa-ban','Negative Prompts',o.negative_prompts]];
+                fields.forEach(function(f){h+='<div class="acf-map-block"><div class="acf-map-header"><i class="fa-solid '+f[0]+'"></i> '+f[1]+'</div><div class="acf-map-content'+(f[2]?'':' empty')+'">'+(f[2]||'ไม่ได้ตั้งค่า')+'</div></div>';});
+                if(o.flow_name){h+='<div class="acf-map-block"><div class="acf-map-header"><i class="fa-solid fa-route"></i> Workflow</div><div class="acf-map-content" style="background:#f0fdf4;"><b>Flow:</b> '+o.flow_name+'<br><b>Step 1:</b> '+(o.step_1_ask||'-')+'<br><b>Step 2:</b> '+(o.step_2_ask||'-')+'<br><b>สำเร็จ:</b> '+(o.success_message||'-')+'</div></div>';}
+                $('#acf-visual-mapper').html(h);
+            };
+
+            window.openMemoryModal = function(){$('#dnc-memory-modal').addClass('active');window.renderMemoryModal();};
+            window.closeMemoryModal = function(){$('#dnc-memory-modal').removeClass('active');};
+            $('#dnc-open-memory-btn').on('click',window.openMemoryModal);
+
+            window.renderMemoryModal = function() {
+                var h='';
+                if(dData.acf_knowledge && dData.acf_knowledge.length>0){
+                    $.each(dData.acf_knowledge,function(i,item){
+                        var sq=(item.q||'').replace(/"/g,'&quot;'),sf=(item.f||'').replace(/"/g,'&quot;'),sa=(item.a||'').replace(/"/g,'&quot;');
+                        h+='<div class="dnc-kb-row" id="kb-row-'+item.id+'">';
+                        h+='<div class="dnc-kb-display"><div style="position:absolute;right:20px;top:20px;display:flex;gap:8px;"><button type="button" class="dnc-btn sec" style="padding:6px 12px;font-size:0.8rem;" onclick="editRow('+item.id+')"><i class="fa-solid fa-pen"></i></button><button type="button" class="dnc-btn red" style="padding:6px 12px;font-size:0.8rem;" onclick="removeCPT('+item.id+')"><i class="fa-solid fa-trash"></i></button></div>';
+                        h+='<strong>Intent:</strong><div style="margin:5px 0 15px;font-weight:bold;">'+item.q+'</div>';
+                        if(item.f) h+='<strong style="color:#10b981;">Facts:</strong><div style="margin:5px 0 15px;background:#f8fafc;padding:10px;border-radius:6px;border:1px solid #e2e8f0;">'+(item.f||'').replace(/\n/g,'<br>')+'</div>';
+                        if(item.a) h+='<strong style="color:#2563eb;">Action:</strong><div style="margin:5px 0;background:#eff6ff;padding:10px;border-radius:6px;border:1px solid #bfdbfe;">'+(item.a||'').replace(/\n/g,'<br>')+'</div>';
+                        if(!item.f&&!item.a&&item.legacy) h+='<div style="padding:10px;background:#f1f5f9;border-radius:6px;">'+(item.legacy||'').replace(/\n/g,'<br>')+'</div>';
+                        h+='</div>';
+                        h+='<div class="dnc-kb-edit-form"><label style="font-weight:bold;">Intent:</label><input type="text" class="dnc-input edit-q" value="'+sq+'"><label style="font-weight:bold;color:#10b981;">Facts:</label><textarea class="dnc-input edit-f" rows="4">'+sf+'</textarea><label style="font-weight:bold;color:#2563eb;">Action:</label><textarea class="dnc-input edit-a" rows="4">'+sa+'</textarea><div style="display:flex;gap:10px;margin-top:15px;justify-content:flex-end;"><button type="button" class="dnc-btn sec" onclick="cancelEdit('+item.id+')">ยกเลิก</button><button type="button" class="dnc-btn green save-btn" onclick="saveRow('+item.id+')"><i class="fa-solid fa-save"></i> บันทึก</button></div></div>';
+                        h+='</div>';
+                    });
+                }
+                if(h==='') h='<div style="text-align:center;padding:80px;color:#94a3b8;">ยังไม่มีข้อมูลคลังความรู้</div>';
+                $('#dnc-memory-modal-body').html(h);
+            };
+
+            window.editRow = function(id){$('#kb-row-'+id).addClass('editing');};
+            window.cancelEdit = function(id){$('#kb-row-'+id).removeClass('editing');};
+            window.saveRow = function(id){
+                var r=$('#kb-row-'+id),q=r.find('.edit-q').val().trim(),f=r.find('.edit-f').val().trim(),a=r.find('.edit-a').val().trim();
+                if(!q) return Swal.fire('แจ้งเตือน','ระบุ Intent','warning');
+                r.find('.save-btn').html('<i class="fa-solid fa-spinner fa-spin"></i>').prop('disabled',true);
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'update_cpt_kb',post_id:id,q:q,f:f,a:a},function(res){
+                    if(res&&res.success) window.refreshDataAndRender();
+                    else{Swal.fire('Error',res.message||'อัปเดตไม่ได้','error');r.find('.save-btn').html('<i class="fa-solid fa-save"></i> บันทึก').prop('disabled',false);}
+                },'json');
+            };
+            window.removeCPT = function(pid){
+                Swal.fire({title:'ยืนยันลบ?',icon:'warning',showCancelButton:true,confirmButtonColor:'#ef4444',confirmButtonText:'ลบ'}).then(function(r){
+                    if(r.isConfirmed) $.post(window.getCacheBustedUrl(),{dnc_action_v19:'delete_cpt_kb',post_id:pid},function(r){if(r&&r.success) window.refreshDataAndRender();},'json');
+                });
+            };
+
+            window.renderCatalog = function() {
+                var has=false,h='',c=0;
+                if(dData.catalog && typeof dData.catalog==='object'){
+                    $.each(dData.catalog,function(sku,item){
+                        if(!item||typeof item!=='object') return true;
+                        has=true;c++;
+                        h+='<div class="dnc-product-item"><img src="'+(item.img||'https://placehold.co/400x300?text=No+Image')+'" alt=""><h4>'+(item.name||'?')+'</h4><span class="dnc-product-sku">'+sku+'</span><p>฿'+(item.price||'-')+' <span style="font-size:0.7rem;color:#94a3b8;">(ประกัน '+(item.years||'-')+' ปี)</span></p></div>';
+                    });
+                }
+                if(has){$('#dnc-inventory-list').html(h);$('#inv-status').html('<span style="color:green;">✅ เชื่อมต่อแล้ว</span> ('+c+' รายการ)');}
+                else{$('#dnc-inventory-list').html('<div style="grid-column:1/-1;text-align:center;color:#ef4444;padding:20px;">ไม่พบข้อมูลสินค้า — กด Check DB</div>');$('#inv-status').html('<span style="color:#ef4444;">❌ ไม่มีข้อมูล</span>');}
+            };
+
+            $('.dnc-tab').on('click',function(){$('.dnc-tab').removeClass('active');$(this).addClass('active');$('.dnc-view').removeClass('active');$('#view-'+$(this).data('t')).addClass('active');});
+            window.refreshDataAndRender();
+            startPolling(); // ★ Start auto-polling
+
+            function sendTakeover(){
+                var m=$('#dnc-takeover-in').val().trim(),uid=window.currentChatUid;
+                if(!m) return;
+                if(!uid) return Swal.fire('แจ้งเตือน','เลือกลูกค้าก่อน','warning');
+                $('#dnc-chat-area').append('<div style="display:flex;width:100%;gap:10px;margin-bottom:12px;justify-content:flex-end;"><div class="dnc-bubble dnc-b-admin" style="max-width:75%;"><strong style="font-size:0.8rem;opacity:0.8;display:block;margin-bottom:4px;">แอดมิน</strong>'+m+'</div><img src="https://ui-avatars.com/api/?name=Ad&background=10b981&color=fff" style="width:35px;height:35px;border-radius:50%;flex-shrink:0;margin-top:auto;"></div>');
+                $('#dnc-takeover-in').val('');
+                document.getElementById('dnc-chat-area').scrollTop=999999;
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'admin_reply',user_id:uid,message:m},function(r){if(r&&r.success) window.refreshDataAndRender();},'json');
+            }
+            $('#dnc-takeover-send').on('click',sendTakeover);
+            $('#dnc-takeover-in').on('keypress',function(e){if(e.which===13) sendTakeover();});
+
+            function sendLab(){
+                var m=$('#dnc-lab-in').val().trim();
+                if(!m) return;
+                $('#dnc-lab-logs').append('<div style="text-align:right;"><span style="background:#eef2f7;color:#334155;padding:12px 16px;border-radius:12px;border-bottom-right-radius:2px;display:inline-block;margin-bottom:10px;">'+m+'</span></div>');
+                $('#dnc-lab-in').val('');
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'test_chat',message:m,sandbox_session:currentSandboxSession},function(res){
+                    if(res && res.success){
+                        var raw=res.reply,rx=/\[IMG:(.*?)\]/gi,imgs=[],mt;
+                        while((mt=rx.exec(raw))!==null) imgs.push(mt[1]);
+                        var clean=raw.replace(/\[IMG:(.*?)\]/gi,'').trim().replace(/\*\*(.*?)\*\*/g,'<b>$1</b>');
+                        var fcBadge='';
+                        if(res.fc_status){
+                            var isOk=res.fc_status.indexOf('✅')!==-1;
+                            var isWarn=res.fc_status.indexOf('⚠️')!==-1||res.fc_status.indexOf('❌')!==-1;
+                            var bgC=isOk?'#059669':isWarn?'#dc2626':'#6b7280';
+                            fcBadge='<div style="font-size:0.7rem;margin-top:6px;padding:3px 8px;background:'+bgC+';border-radius:4px;opacity:0.85;display:inline-block;">'+res.fc_status+'</div>';
+                        }
+                        if(clean) $('#dnc-lab-logs').append('<div style="text-align:left;"><span style="background:#2563eb;color:#fff;padding:12px 16px;border-radius:12px;border-bottom-left-radius:2px;display:inline-block;margin-bottom:10px;max-width:80%;line-height:1.5;">'+clean.replace(/\n/g,'<br>')+fcBadge+'</span></div>');
+                        imgs.forEach(function(u){$('#dnc-lab-logs').append('<div style="text-align:left;"><img src="'+u.trim()+'" style="max-width:60%;border-radius:12px;margin-bottom:10px;border:1px solid #e2e8f0;"></div>');});
+                        document.getElementById('dnc-lab-logs').scrollTop=999999;
+                        window.refreshDataAndRender();
+                    } else Swal.fire('Error',(res&&res.reply?res.reply:'API Error'),'error');
+                },'json');
+            }
+            $('#dnc-lab-send').on('click',sendLab);
+            $('#dnc-lab-in').on('keypress',function(e){if(e.which===13) sendLab();});
+
+            $('#dnc-add-kb').on('click',function(){
+                var q=$('#dnc-fix-intent').val().trim(),f=$('#dnc-fix-facts').val().trim(),a=$('#dnc-fix-action').val().trim();
+                if(!q) return Swal.fire('ข้อมูลไม่ครบ','ระบุ Intent','warning');
+                if(!f&&!a) return Swal.fire('ข้อมูลไม่ครบ','ระบุ Facts หรือ Action','warning');
+                var btn=$(this),orig=btn.html();
+                btn.html('<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...').prop('disabled',true);
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'add_cpt_kb',q:q,f:f,a:a},function(r){
+                    btn.html(orig).prop('disabled',false);
+                    if(r&&r.success){Swal.fire({icon:'success',title:'บันทึกสำเร็จ',timer:1500,showConfirmButton:false});$('#dnc-fix-intent,#dnc-fix-facts,#dnc-fix-action').val('');window.refreshDataAndRender();}
+                    else Swal.fire('Error',r.message||'ไม่สามารถบันทึกได้','error');
+                },'json');
+            });
+
+            window.exportCSV = function(){
+                if(!dData.acf_knowledge||!dData.acf_knowledge.length) return Swal.fire('ไม่มีข้อมูล','ยังไม่มีข้อมูลให้ Export','warning');
+                var csv="\uFEFF\"training_phrases\",\"core_facts\",\"ai_action\"\n";
+                dData.acf_knowledge.forEach(function(it){
+                    var q=(it.q||'').replace(/"/g,'""'),f='',a='';
+                    if(it.f||it.a){f=(it.f||'').replace(/\n/g,' / ').replace(/"/g,'""');a=(it.a||'').replace(/\n/g,' / ').replace(/"/g,'""');}
+                    else if(it.legacy){var t=it.legacy,fm=t.match(/\[ข้อเท็จจริง\]:([\s\S]*?)(?=\[แนวทางการตอบ\]:|$)/);if(fm)f=fm[1].trim().replace(/\n/g,' / ').replace(/"/g,'""');var am=t.match(/\[แนวทางการตอบ\]:([\s\S]*)$/);if(am)a=am[1].trim().replace(/\n/g,' / ').replace(/"/g,'""');}
+                    csv+='"'+q+'","'+f+'","'+a+'"\n';
+                });
+                var b=new Blob([csv],{type:'text/csv;charset=utf-8;'}),u=URL.createObjectURL(b),l=document.createElement('a');
+                l.href=u;l.download='dinoco_ai_logic_backup.csv';document.body.appendChild(l);l.click();document.body.removeChild(l);
+            };
+
+            $('#dnc-csv-file').on('change',function(e){
+                var f=e.target.files[0];if(!f) return;
+                var fd=new FormData();fd.append('dnc_action_v19','import_csv_kb');fd.append('csv_file',f);
+                Swal.fire({title:'กำลังนำเข้า...',text:'กรุณารอสักครู่',allowOutsideClick:false,didOpen:function(){Swal.showLoading();}});
+                $.ajax({url:window.getCacheBustedUrl(),type:'POST',data:fd,processData:false,contentType:false,dataType:'json',
+                    success:function(r){if(r&&r.success){Swal.fire('สำเร็จ','นำเข้า '+r.count+' รายการ','success');window.refreshDataAndRender();}else Swal.fire('Error',r.message||'นำเข้าไม่ได้','error');},
+                    error:function(x){Swal.fire('ล้มเหลว','Status: '+x.status,'error');},
+                    complete:function(){$('#dnc-csv-file').val('');}
+                });
+            });
+
+            $('#dnc-save-sys').on('click',function(){
+                var btn=$(this),orig=btn.html();
+                btn.html('<i class="fa-solid fa-spinner fa-spin"></i> Saving...').prop('disabled',true);
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'save_config',core_prompt:$('#dnc-core').val(),api_key:$('#dnc-key').val(),knowledge:JSON.stringify(dData.kb)},function(r){
+                    btn.html(orig).prop('disabled',false);
+                    if(r&&r.success) Swal.fire({icon:'success',title:'บันทึกสำเร็จ',timer:1500,showConfirmButton:false});
+                },'json');
+            });
+
+            $('#dnc-sync').on('click',function(){
+                var btn=$(this);btn.prop('disabled',true).html('<i class="fa-solid fa-spinner fa-spin"></i> Checking...');
+                $.post(window.getCacheBustedUrl(),{dnc_action_v19:'get_data'},function(r){
+                    btn.prop('disabled',false).html('<i class="fa-solid fa-rotate"></i> Check DB');
+                    if(r&&r.success){dData.catalog=r.data.catalog;if(typeof dData.catalog!=='object'||!dData.catalog) dData.catalog={};window.renderCatalog();}
+                },'json');
+            });
+        });
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+// === INSTANTIATION ===
+function Dinoco_AI_Brain() {
+    global $dinoco_ai_brain_instance;
+    if (!isset($dinoco_ai_brain_instance)) {
+        $dinoco_ai_brain_instance = new Dinoco_AI_Brain_v22();
+    }
+    return $dinoco_ai_brain_instance;
+}
+Dinoco_AI_Brain();
