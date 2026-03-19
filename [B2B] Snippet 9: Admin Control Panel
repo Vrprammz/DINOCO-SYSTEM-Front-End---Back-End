@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 9: Admin Control Panel                      ║
- * ║  Version: V.25.5 — remove nested frame, match admin design    ║
+ * ║  Version: V.25.2 — fix Fatal Error + JS silent fail          ║
  * ║  Shortcode: [b2b_admin_control]                            ║
  * ╚══════════════════════════════════════════════════════════════╝
  * V.10.0 Changes:
@@ -60,8 +60,8 @@ add_action( 'rest_api_init', function () {
 function b2b_rest_list_distributors( WP_REST_Request $req ) {
     try {
     $posts = get_posts(array('post_type'=>'distributor','posts_per_page'=>-1,'post_status'=>'publish','orderby'=>'title','order'=>'ASC'));
-    if (!empty($posts) && function_exists('update_meta_cache')) {
-        update_meta_cache('post', wp_list_pluck($posts, 'ID'));
+    if (!empty($posts) && function_exists('update_post_meta_cache')) {
+        update_post_meta_cache(wp_list_pluck($posts, 'ID'));
     }
     $list = array();
     foreach ($posts as $p) {
@@ -510,7 +510,7 @@ function b2b_rest_flash_test_run_step( WP_REST_Request $req ) {
             ),200);
 
         case 'download_label':
-            // Just check if label is downloadable
+            // Legacy — kept for backward compat, just check label
             $pnos = get_post_meta($tid, '_flash_tracking_numbers', true) ?: array();
             if (empty($pnos))
                 return new WP_REST_Response(array('success'=>false,'message'=>'No tracking numbers'),200);
@@ -522,6 +522,33 @@ function b2b_rest_flash_test_run_step( WP_REST_Request $req ) {
                 'message'=>!empty($result['ok']) ? 'Label PDF ready ('.strlen($result['pdf']).' bytes)' : ($result['error'] ?? 'Error'),
                 'pno'=>$pnos[0],
             ),200);
+
+        case 'scan_qr':
+            // Simulate QR scan: verify print is done, then auto-trigger ready_to_ship + courier call
+            $packing = get_post_meta($tid, '_flash_packing_status', true);
+            $print_st = get_field('print_status', $tid) ?: 'none';
+            $pnos = get_post_meta($tid, '_flash_tracking_numbers', true) ?: array();
+            if (empty($pnos))
+                return new WP_REST_Response(array('success'=>false,'message'=>'ยังไม่มี tracking — ต้องสร้างพัสดุก่อน'),200);
+            // In test mode, allow even if not print_done (RPi may not have acked)
+            if (!in_array($packing, array('flash_created','print_queued','print_done','notify_error'), true)) {
+                $packing_label = function_exists('b2b_flash_packing_label') ? b2b_flash_packing_label($packing) : $packing;
+                return new WP_REST_Response(array('success'=>false,'message'=>'สถานะ: '.$packing_label.' — ไม่สามารถ scan ได้'),200);
+            }
+            // Mark ready_to_ship
+            update_post_meta($tid, '_flash_packing_status', 'ready_to_ship');
+            // Call courier
+            if (!function_exists('b2b_flash_notify_courier_from_warehouse'))
+                return new WP_REST_Response(array('success'=>true,'message'=>'QR Scan OK — แต่ไม่พบ courier function (S1 not loaded)'),200);
+            $courier = b2b_flash_notify_courier_from_warehouse(count($pnos), 'QR Scan: #'.$tid);
+            if (!empty($courier['ok']) && !empty($courier['data'])) {
+                $cd = $courier['data'];
+                update_post_meta($tid, '_flash_packing_status', 'courier_called');
+                if (!empty($cd['ticketPickupId'])) update_post_meta($tid, '_flash_pickup_id', $cd['ticketPickupId']);
+                return new WP_REST_Response(array('success'=>true,'message'=>'📱 QR Scan → แพ็คเสร็จ → เรียกรถสำเร็จ!','courier'=>$cd),200);
+            }
+            update_post_meta($tid, '_flash_packing_status', 'notify_error');
+            return new WP_REST_Response(array('success'=>false,'message'=>'QR Scan OK แต่เรียกรถไม่สำเร็จ: '.($courier['error']??'Unknown'),'data'=>$courier),200);
 
         case 'ready_to_ship':
             // Mark ready + notify courier
@@ -589,52 +616,56 @@ function b2b_rest_flash_test_simulate_webhook( WP_REST_Request $req ) {
     switch ($type) {
         case 'picked_up': // State 1
             b2b_flash_wh_status($tid, $pno, array('state'=>1, 'message'=>'[TEST] คูเรียร์รับพัสดุแล้ว'));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Picked up (state=1)'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'🟡 รับพัสดุแล้ว','type'=>'picked_up','state'=>1,'pno'=>$pno,'detail'=>'คูเรียร์รับพัสดุจากคลังแล้ว — อยู่ระหว่างนำส่ง Hub','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'in_transit': // State 2
             b2b_flash_wh_status($tid, $pno, array('state'=>2, 'message'=>'[TEST] ระหว่างขนส่ง'));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: In transit (state=2)'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'🔵 ระหว่างขนส่ง','type'=>'in_transit','state'=>2,'pno'=>$pno,'detail'=>'พัสดุอยู่ระหว่างขนส่งไปศูนย์คัดแยก','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'delivering': // State 3
             b2b_flash_wh_status($tid, $pno, array('state'=>3, 'message'=>'[TEST] กำลังนำส่ง'));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Delivering (state=3)'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'🟠 กำลังนำส่ง','type'=>'delivering','state'=>3,'pno'=>$pno,'detail'=>'คูเรียร์กำลังนำส่งถึงผู้รับ','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'delivered': // State 5
             b2b_flash_wh_status($tid, $pno, array('state'=>5, 'message'=>'[TEST] ส่งถึงแล้ว', 'eSignature'=>'', 'photo'=>array('photo1'=>'','photo2'=>''), 'signer'=>'ผู้รับ (TEST)', 'signerTypeText'=>'ผู้รับเอง'));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Delivered (state=5) — order auto-completed'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'🟢 ส่งถึงแล้ว','type'=>'delivered','state'=>5,'pno'=>$pno,'detail'=>'ส่งถึงผู้รับแล้ว — ออเดอร์ auto-complete','signer'=>'ผู้รับ (TEST)','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true),'order_status'=>get_field('order_status',$tid)),200);
 
         case 'problem': // State 6
             b2b_flash_wh_status($tid, $pno, array('state'=>6, 'message'=>'[TEST] มีปัญหาในการจัดส่ง', 'markerCategory'=>'40'));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Problem (state=6) — markerCategory=40 (ลูกค้าไม่อยู่บ้าน)'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'🔴 มีปัญหา','type'=>'problem','state'=>6,'pno'=>$pno,'detail'=>'markerCategory=40 (ลูกค้าไม่อยู่บ้าน)','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'returned': // State 7
             $returned_pno = 'TH-RET-' . $tid . '-' . time();
             b2b_flash_wh_status($tid, $pno, array('state'=>7, 'message'=>'[TEST] ตีกลับ', 'cancelReason'=>'ผู้รับปฏิเสธ', 'returnedPno'=>$returned_pno));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Returned (state=7) — returnedPno=' . $returned_pno),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'↩️ ตีกลับ','type'=>'returned','state'=>7,'pno'=>$pno,'detail'=>'ผู้รับปฏิเสธ — returnedPno: '.$returned_pno,'returned_pno'=>$returned_pno,'flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'detained': // State 4
             b2b_flash_wh_status( $tid, $pno, array( 'state' => '4', 'stateText' => 'Detained', 'message' => '[TEST] คงคลัง — ติดต่อลูกค้าไม่ได้', 'markerCategory' => '40' ) );
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Detained (state=4)'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'⚠️ คงคลัง','type'=>'detained','state'=>4,'pno'=>$pno,'detail'=>'คงคลัง — ติดต่อลูกค้าไม่ได้ (markerCategory=40)','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'closed': // State 8
             b2b_flash_wh_status( $tid, $pno, array( 'state' => '8', 'stateText' => 'Close by exception', 'message' => '[TEST] ปิดงานมีปัญหา' ) );
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Closed (state=8)'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'⛔ ปิดงาน','type'=>'closed','state'=>8,'pno'=>$pno,'detail'=>'Close by exception','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'cancelled': // State 9
             b2b_flash_wh_status( $tid, $pno, array( 'state' => '9', 'stateText' => 'Cancelled', 'message' => '[TEST] เรียกคืนพัสดุแล้ว' ) );
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Cancelled (state=9)'),200);
+            return new WP_REST_Response(array('success'=>true,'message'=>'❌ ยกเลิก','type'=>'cancelled','state'=>9,'pno'=>$pno,'detail'=>'เรียกคืนพัสดุแล้ว','flash_packing'=>get_post_meta($tid,'_flash_packing_status',true)),200);
 
         case 'weight':
-            b2b_flash_wh_weight($tid, $pno, array('weight'=>1500, 'length'=>30, 'width'=>20, 'height'=>15, 'weightTime'=>current_time('mysql')));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Weight update (1500g, 30x20x15cm)'),200);
+            $wdata = array('weight'=>1500, 'length'=>30, 'width'=>20, 'height'=>15, 'weightTime'=>current_time('mysql'));
+            b2b_flash_wh_weight($tid, $pno, $wdata);
+            return new WP_REST_Response(array('success'=>true,'message'=>'⚖️ อัปเดตน้ำหนัก','type'=>'weight','pno'=>$pno,'data'=>$wdata,'detail'=>'1,500g · 30×20×15cm'),200);
 
         case 'price':
-            b2b_flash_wh_price($tid, $pno, array('freightPrice'=>3500, 'codFee'=>0, 'remoteAreaFee'=>0, 'opdInsureFee'=>0, 'packagingFee'=>0, 'settlementType'=>1, 'freightInsurance'=>0));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Price update (freight=35.00 บาท)'),200);
+            $pdata = array('freightPrice'=>3500, 'codFee'=>0, 'remoteAreaFee'=>0, 'opdInsureFee'=>0, 'packagingFee'=>0, 'settlementType'=>1, 'freightInsurance'=>0);
+            b2b_flash_wh_price($tid, $pno, $pdata);
+            $total_cost = ($pdata['freightPrice'] + $pdata['codFee'] + $pdata['remoteAreaFee'] + $pdata['opdInsureFee'] + $pdata['packagingFee']) / 100;
+            return new WP_REST_Response(array('success'=>true,'message'=>'💰 อัปเดตค่าส่ง','type'=>'price','pno'=>$pno,'data'=>$pdata,'detail'=>'ค่าส่ง ฿'.number_format($total_cost, 2).' (freight=฿'.number_format($pdata['freightPrice']/100,2).')'),200);
 
         case 'routes':
-            b2b_flash_wh_routes($tid, $pno, array('routedAction'=>'SHIPPING', 'message'=>'[TEST] Scan by HUB', 'currentProvince'=>'กรุงเทพมหานคร', 'routedAt'=>current_time('mysql')));
-            return new WP_REST_Response(array('success'=>true,'message'=>'Simulated: Route update (SHIPPING)'),200);
+            $rdata = array('routedAction'=>'SHIPPING', 'message'=>'[TEST] Scan by HUB', 'currentProvince'=>'กรุงเทพมหานคร', 'routedAt'=>current_time('mysql'));
+            b2b_flash_wh_routes($tid, $pno, $rdata);
+            return new WP_REST_Response(array('success'=>true,'message'=>'📍 Route Update','type'=>'routes','pno'=>$pno,'data'=>$rdata,'detail'=>'SHIPPING · Scan by HUB · กรุงเทพมหานคร'),200);
 
         default:
             return new WP_REST_Response(array('success'=>false,'message'=>'Unknown type: '.$type),400);
@@ -717,10 +748,13 @@ function b2b_render_admin_control() {
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#f8f9fb;--surface:#fff;--border:#e4e7ec;--border-light:#f2f4f7;--text:#101828;--text-2:#344054;--text-3:#667085;--text-4:#98a2b3;--primary:#2563eb;--primary-hover:#1d4ed8;--primary-bg:#eff6ff;--success:#12b76a;--success-bg:#ecfdf3;--danger:#f04438;--danger-bg:#fef3f2;--warning:#f79009;--warning-bg:#fffaeb;--shadow-sm:0 1px 2px rgba(16,24,40,.05);--shadow-md:0 4px 16px rgba(16,24,40,.1);--shadow-lg:0 12px 40px rgba(16,24,40,.15);--radius:10px;--radius-lg:14px;--font:'Noto Sans Thai',-apple-system,system-ui,sans-serif;--mono:'JetBrains Mono',monospace}
-#b2b-cp{font-family:var(--font);font-size:14px;color:var(--text);width:100%;padding:0}
+#b2b-cp{font-family:var(--font);font-size:14px;color:var(--text);max-width:1440px;margin:0 auto;padding:0}
 #b2b-cp *{box-sizing:border-box;margin:0}
-.cp-hd{display:none}
-.cp-tabs{display:flex;background:var(--surface);border:1px solid var(--border);border-bottom:none;border-radius:var(--radius-lg) var(--radius-lg) 0 0;overflow-x:auto;scrollbar-width:none}.cp-tabs::-webkit-scrollbar{display:none}
+.cp-hd{background:linear-gradient(135deg,#0f2447,#1e3a5f);border-radius:var(--radius-lg) var(--radius-lg) 0 0;padding:28px 32px;display:flex;align-items:center;justify-content:space-between}
+.cp-hd .logo-row{display:flex;align-items:center;gap:12px}.cp-hd .logo-row img{height:28px;border-radius:6px;background:rgba(255,255,255,.15);padding:2px 6px}
+.cp-hd-left h1{font-size:18px;font-weight:700;color:#fff;letter-spacing:-.02em}.cp-hd-left p{font-size:12px;color:var(--text-4);margin-top:2px}
+.cp-hd-badge{background:rgba(255,255,255,.1);color:#fff;font-size:11px;font-weight:600;padding:4px 12px;border-radius:20px;letter-spacing:.02em}
+.cp-tabs{display:flex;background:var(--surface);border-left:1px solid var(--border);border-right:1px solid var(--border);overflow-x:auto;scrollbar-width:none}.cp-tabs::-webkit-scrollbar{display:none}
 .cp-tab{flex:1;min-width:140px;padding:14px 20px;text-align:center;font-size:13px;font-weight:600;color:var(--text-3);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap;position:relative}
 .cp-tab:hover{color:var(--primary);background:var(--primary-bg)}.cp-tab.active{color:var(--primary);border-bottom-color:var(--primary)}
 .cp-tab.active::after{content:'';position:absolute;bottom:-1px;left:20%;right:20%;height:2px;background:var(--primary);border-radius:2px}
@@ -783,11 +817,11 @@ function b2b_render_admin_control() {
 .info-card h4{font-size:13px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:6px}
 .cmd-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-light);font-size:12px}.cmd-row:last-child{border:none}.cmd-key{font-weight:600;color:var(--primary);font-family:var(--mono)}
 .fld-section{font-size:12px;font-weight:700;color:var(--primary);margin:20px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--border-light)}
-@media(max-width:768px){.cp-panel{padding:20px 16px}.cp-bar{gap:8px}.cp-search{width:100%}.fld-row,.fld-row-3{grid-template-columns:1fr}.stats-row{grid-template-columns:1fr 1fr}}
+@media(max-width:768px){.cp-panel{padding:20px 16px}.cp-bar{gap:8px}.cp-search{width:100%}.fld-row,.fld-row-3{grid-template-columns:1fr}.stats-row{grid-template-columns:1fr 1fr}.cp-hd{padding:20px 16px}}
 @media(max-width:480px){.stats-row{grid-template-columns:1fr}.modal-box{width:100%;max-height:100vh;border-radius:0}}
 </style>
 <div id="b2b-cp">
-<div class="cp-hd"><div class="cp-hd-left"><div class="logo-row"><?php if(function_exists('b2b_get_logo_url')):?><img src="<?php echo esc_url(b2b_get_logo_url());?>" alt="DINOCO"><?php endif;?><div><h1>DINOCO B2B — Admin Control Panel</h1><p>จัดการตัวแทน · สินค้า · ระบบ · ตั้งค่า</p></div></div></div><span class="cp-hd-badge">V.25.5</span></div>
+<div class="cp-hd"><div class="cp-hd-left"><div class="logo-row"><?php if(function_exists('b2b_get_logo_url')):?><img src="<?php echo esc_url(b2b_get_logo_url());?>" alt="DINOCO"><?php endif;?><div><h1>DINOCO B2B — Admin Control Panel</h1><p>จัดการตัวแทน · สินค้า · ระบบ · ตั้งค่า</p></div></div></div><span class="cp-hd-badge">V.25.2</span></div>
 <div class="cp-tabs">
   <div class="cp-tab active" data-tab="dist">🏪 ตัวแทนจำหน่าย</div>
   <div class="cp-tab" data-tab="prod">📦 สินค้า B2B</div>
@@ -818,7 +852,7 @@ function b2b_render_admin_control() {
       <select id="testPrintType" style="font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:6px"><option value="label">ใบแปะหน้ากล่อง</option><option value="invoice">Invoice A4</option><option value="picking">Picking List</option></select>
       <button class="btn btn-ghost btn-sm" onclick="sendTestPrint()">🧪 Test Print</button>
     </div>
-    <div style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="ps_autorefresh"><label for="ps_autorefresh" style="font-size:12px;color:var(--text-3);cursor:pointer">Auto-refresh 15s</label></div>
+    <div style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="ps_autorefresh" checked><label for="ps_autorefresh" style="font-size:12px;color:var(--text-3);cursor:pointer">Auto-refresh 15s</label></div>
     <div class="spacer"></div>
     <span id="printLastRefresh" style="font-size:11px;color:var(--text-4)"></span>
   </div>
@@ -950,7 +984,7 @@ function b2b_render_admin_control() {
         <div id="ft_progress_fill" style="position:absolute;top:16px;left:32px;height:3px;background:#3b82f6;z-index:1;width:0%;transition:width 0.5s ease"></div>
         <div class="ft-dot" id="ftd_1" data-label="ที่อยู่" style="z-index:2;text-align:center"><div style="width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:14px;margin:0 auto 4px;transition:all 0.3s">1</div><div style="font-size:10px;color:var(--text-4)">ที่อยู่</div></div>
         <div class="ft-dot" id="ftd_2" data-label="สร้างพัสดุ" style="z-index:2;text-align:center"><div style="width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:14px;margin:0 auto 4px;transition:all 0.3s">2</div><div style="font-size:10px;color:var(--text-4)">สร้างพัสดุ</div></div>
-        <div class="ft-dot" id="ftd_3" data-label="Label" style="z-index:2;text-align:center"><div style="width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:14px;margin:0 auto 4px;transition:all 0.3s">3</div><div style="font-size:10px;color:var(--text-4)">Label</div></div>
+        <div class="ft-dot" id="ftd_3" data-label="แพ็ค+QR" style="z-index:2;text-align:center"><div style="width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:14px;margin:0 auto 4px;transition:all 0.3s">3</div><div style="font-size:10px;color:var(--text-4)">แพ็ค+QR</div></div>
         <div class="ft-dot" id="ftd_4" data-label="เรียกรถ" style="z-index:2;text-align:center"><div style="width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:14px;margin:0 auto 4px;transition:all 0.3s">4</div><div style="font-size:10px;color:var(--text-4)">เรียกรถ</div></div>
         <div class="ft-dot" id="ftd_5" data-label="รับพัสดุ" style="z-index:2;text-align:center"><div style="width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:14px;margin:0 auto 4px;transition:all 0.3s">5</div><div style="font-size:10px;color:var(--text-4)">รับพัสดุ</div></div>
         <div class="ft-dot" id="ftd_6" data-label="ขนส่ง" style="z-index:2;text-align:center"><div style="width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:14px;margin:0 auto 4px;transition:all 0.3s">6</div><div style="font-size:10px;color:var(--text-4)">ขนส่ง</div></div>
@@ -979,11 +1013,11 @@ function b2b_render_admin_control() {
         <div class="ft-result" id="ftr_2" style="font-size:12px;color:var(--text-3);margin-top:8px"></div>
       </div>
 
-      <!-- Step 3: Label -->
+      <!-- Step 3: Pack + Scan QR (replaces download_label — RPi prints label automatically) -->
       <div class="ft-step" id="fts_3" style="border:1px solid #e2e8f0;border-radius:10px;padding:14px 16px;margin-bottom:10px;background:#fff;transition:all 0.3s">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <div style="display:flex;align-items:center;gap:8px"><span class="ft-icon" id="fti_3" style="font-size:18px">⬜</span><div><strong>Step 3:</strong> ดาวน์โหลด Label PDF</div></div>
-          <button class="btn btn-sm btn-primary" id="ftb_3" onclick="ftRun('download_label')">▶ ทดสอบ</button>
+          <div style="display:flex;align-items:center;gap:8px"><span class="ft-icon" id="fti_3" style="font-size:18px">⬜</span><div><strong>Step 3:</strong> แพ็คของ + สแกน QR เรียกรถ<div style="font-size:11px;color:#64748b;margin-top:2px">RPi ปริ้น Label อัตโนมัติแล้ว → แพ็คของ → ยิง QR → ระบบเรียกรถ Flash</div></div></div>
+          <button class="btn btn-sm btn-primary" id="ftb_3" onclick="ftRun('scan_qr')">▶ จำลอง Scan QR</button>
         </div>
         <div class="ft-result" id="ftr_3" style="font-size:12px;color:var(--text-3);margin-top:8px"></div>
       </div>
@@ -995,6 +1029,17 @@ function b2b_render_admin_control() {
           <button class="btn btn-sm btn-primary" id="ftb_4" onclick="ftRun('ready_to_ship')">▶ เรียกรถ</button>
         </div>
         <div class="ft-result" id="ftr_4" style="font-size:12px;color:var(--text-3);margin-top:8px"></div>
+      </div>
+
+      <!-- V.32: Error Recovery Actions -->
+      <div id="ft_recovery" style="display:none;margin:12px 0;padding:12px 16px;background:#fef2f2;border:1px solid #fecaca;border-radius:10px">
+        <div style="font-size:12px;font-weight:700;color:#991b1b;margin-bottom:8px">⚠️ Error Recovery</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          <button class="btn btn-sm" id="ft_retry_courier" style="display:none;background:#f59e0b;color:#fff;border:none;border-radius:8px;padding:8px 14px" onclick="ftRun('ready_to_ship')">🔄 ลองเรียกรถใหม่</button>
+          <button class="btn btn-sm" id="ft_switch_manual" style="display:none;background:#7b1fa2;color:#fff;border:none;border-radius:8px;padding:8px 14px" onclick="ftSwitchManual()">📦 เปลี่ยนเป็นส่งเอง</button>
+          <button class="btn btn-sm" id="ft_cancel_pickup" style="display:none;background:#6b7280;color:#fff;border:none;border-radius:8px;padding:8px 14px" onclick="ftCancelPickup()">🚫 ยกเลิกเรียกรถ</button>
+        </div>
+        <div class="ft-result" id="ftr_recovery" style="font-size:12px;color:var(--text-3);margin-top:8px"></div>
       </div>
 
       <!-- Webhook Simulation Section -->
@@ -1175,7 +1220,7 @@ document.querySelectorAll('.cp-tab').forEach(function(t){t.addEventListener('cli
   document.querySelectorAll('.cp-panel').forEach(function(x){x.classList.remove('active')});
   this.classList.add('active');document.getElementById('panel-'+this.dataset.tab).classList.add('active');
 })});
-function api(m,ep,body,cb){var o={method:m,headers:{'X-WP-Nonce':N}};if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body)}fetch(R+ep,o).then(function(r){if(!r.ok){console.error('[B2B] '+m+' '+ep+' → HTTP '+r.status);return r.text().then(function(t){var msg='HTTP '+r.status;try{var j=JSON.parse(t);msg=j.message||j.code||msg}catch(x){}throw new Error(msg)})}return r.json()}).then(function(d){if(d&&!d.success&&d.message){console.error('[B2B] '+ep+':',d.message);toast(d.message,'e')}if(cb)cb(d)}).catch(function(e){console.error('[B2B] '+ep+' FAILED:',e);toast(ep+': '+e.message,'e')})}
+function api(m,ep,body,cb){var o={method:m,headers:{'X-WP-Nonce':N,'Content-Type':'application/json'}};if(body)o.body=JSON.stringify(body);fetch(R+ep,o).then(function(r){if(!r.ok)return r.text().then(function(t){var msg='HTTP '+r.status;try{var j=JSON.parse(t);msg=j.message||j.code||msg}catch(x){}throw new Error(msg)});return r.json()}).then(function(d){if(d&&!d.success&&d.message)toast(d.message,'e');cb(d)}).catch(function(e){toast(e.message,'e')})}
 function toast(msg,t){var el=document.getElementById('cpToast');el.textContent=(t==='s'?'✓ ':'⚠ ')+msg;el.className='cp-toast '+(t||'s')+' show';setTimeout(function(){el.classList.remove('show')},3000)}
 function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function fmt(n){return Number(n||0).toLocaleString()}
@@ -1211,19 +1256,19 @@ function renderDists(list){
 }
 window.filterDist=function(){var q=document.getElementById('distSearch').value.toLowerCase();renderDists(distData.filter(function(x){return x.shop_name.toLowerCase().indexOf(q)>-1||x.line_group_id.toLowerCase().indexOf(q)>-1}))};
 window.openDistModal=function(data){
-  try{
   var d=data||{};document.getElementById('df_id').value=d.id||0;document.getElementById('df_shop_name').value=d.shop_name||'';
   document.getElementById('df_shop_logo').value=d.shop_logo_url||'';
   document.getElementById('df_group_id').value=d.line_group_id||'';document.getElementById('df_rank').value=d.rank_system||'standard';
   document.getElementById('df_credit_limit').value=d.credit_limit||50000;document.getElementById('df_credit_term').value=d.credit_term_days||30;
   document.getElementById('df_debt').value=d.current_debt||0;document.getElementById('df_hold').value=d.credit_hold?'1':'0';
+  // V.9: Address fields
   document.getElementById('df_phone').value=d.dist_phone||'';document.getElementById('df_address').value=d.dist_address||'';
   document.getElementById('df_district').value=d.dist_district||'';document.getElementById('df_city').value=d.dist_city||'';
   document.getElementById('df_province').value=d.dist_province||'';document.getElementById('df_postcode').value=d.dist_postcode||'';
+  // V.9: Recommended SKUs
   document.getElementById('df_rec_skus').value=d.recommended_skus||'';
   document.getElementById('distModalTitle').textContent=d.id?'แก้ไข: '+d.shop_name:'เพิ่มตัวแทนใหม่';
   openModal('distModal');setTimeout(function(){document.getElementById('df_shop_name').focus()},200);
-  }catch(e){console.error('[B2B] openDistModal error:',e);alert('Modal error: '+e.message)}
 };
 window.editDist=function(id){var x=distData.find(function(v){return v.id===id});if(x)openDistModal(x)};
 window.delDist=function(id,name){showConfirm('ลบตัวแทน','ลบ "'+name+'" (#'+id+')? ข้อมูลจะหายถาวร',function(){api('POST','distributor/delete',{id:id},function(d){toast(d.message,d.success?'s':'e');if(d.success)loadDists()})})};
@@ -1509,41 +1554,19 @@ window.sendRpiCommand=function(cmd){
   api('POST','rpi-command',{command:cmd},function(d){
     if(!d.success){res.textContent='❌ '+d.message;return;}
     res.textContent='✅ '+d.message;
-    // Auto-refresh monitor to pick up result when RPi acks back (respects toggle)
-    if(_psAutoRefreshCb&&_psAutoRefreshCb.checked){setTimeout(loadPrintMonitor,5000);setTimeout(loadPrintMonitor,15000);}
+    // Auto-refresh monitor to pick up result when RPi acks back
+    setTimeout(loadPrintMonitor,5000);
+    setTimeout(loadPrintMonitor,15000);
   });
 };
 loadPrintSettings();loadPrintMonitor();
-// Auto-refresh every 15s — with localStorage toggle (V.25.4)
-var _printRefreshTimer=null;
-var _psAutoRefreshCb=document.getElementById('ps_autorefresh');
-function _startPrintAutoRefresh(){
-  if(_printRefreshTimer)clearInterval(_printRefreshTimer);
-  _printRefreshTimer=setInterval(function(){
+// Auto-refresh every 15s when checkbox is checked and tab is active
+var _printRefreshTimer=setInterval(function(){
+  if(document.getElementById('ps_autorefresh')&&document.getElementById('ps_autorefresh').checked){
     var panel=document.getElementById('panel-print');
     if(panel&&panel.classList.contains('active'))loadPrintMonitor();
-  },15000);
-}
-function _stopPrintAutoRefresh(){
-  if(_printRefreshTimer){clearInterval(_printRefreshTimer);_printRefreshTimer=null;}
-}
-// Restore from global localStorage key (shared with Admin Dashboard toggle)
-// Key: 'dnc_auto_refresh' — 'true'=ON, 'false'=OFF, null(default)=OFF
-function _isDncAutoRefreshOn(){return localStorage.getItem('dnc_auto_refresh')==='true';}
-_psAutoRefreshCb.checked=_isDncAutoRefreshOn();
-if(_psAutoRefreshCb.checked){_startPrintAutoRefresh();}
-_psAutoRefreshCb.addEventListener('change',function(){
-  localStorage.setItem('dnc_auto_refresh',this.checked?'true':'false');
-  if(this.checked){_startPrintAutoRefresh();}else{_stopPrintAutoRefresh();}
-});
-// Cross-tab sync: listen for changes from Admin Dashboard or other tabs
-window.addEventListener('storage',function(e){
-  if(e.key==='dnc_auto_refresh'){
-    var on=(e.newValue==='true');
-    _psAutoRefreshCb.checked=on;
-    if(on){_startPrintAutoRefresh();}else{_stopPrintAutoRefresh();}
   }
-});
+},15000);
 
 /* ═══ V.10: EXPORT CSV (A16) ═══ */
 function downloadCSV(filename,header,rows){
@@ -1599,9 +1622,9 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape'){document.qu
 
 /* ═══ V.25: Flash Test Console — Full Loop with Visual Stepper ═══ */
 var ftOrders=[],ftSelected=null,ftStepState={},ftAutoRunning=false;
-var FT_STEPS=['check_address','flash_create','download_label','ready_to_ship'];
-var FT_STEP_NAMES={check_address:'ตรวจสอบที่อยู่',flash_create:'สร้างพัสดุ Flash',download_label:'Label PDF',ready_to_ship:'เรียกรถ Flash',cancel:'ยกเลิก'};
-var FT_STEP_MAP={check_address:1,flash_create:2,download_label:3,ready_to_ship:4};
+var FT_STEPS=['check_address','flash_create','scan_qr','ready_to_ship'];
+var FT_STEP_NAMES={check_address:'ตรวจสอบที่อยู่',flash_create:'สร้างพัสดุ Flash',scan_qr:'แพ็คของ + Scan QR',ready_to_ship:'เรียกรถ Flash',cancel:'ยกเลิก'};
+var FT_STEP_MAP={check_address:1,flash_create:2,scan_qr:3,ready_to_ship:4};
 var FT_WH_MAP={picked_up:5,in_transit:6,delivering:6,detained:6,delivered:7,problem:6,returned:6,closed:6,cancelled:6};
 
 function ftLog(msg,type){
@@ -1639,13 +1662,18 @@ function ftSetStepCard(n,state){
 function ftUpdateProgress(){
   if(!ftSelected)return;
   var o=ftSelected;
-  // Determine completed steps based on current state
+  // Determine completed steps based on current DB state (not just button clicks)
   var completedSteps=0;
   var fps=o.flash_packing||'none';
-  if(ftStepState.check_address==='done')completedSteps=1;
-  if(fps!=='none'&&o.pnos&&o.pnos.length>0){completedSteps=Math.max(completedSteps,2);ftStepState.flash_create='done';}
-  if(ftStepState.download_label==='done')completedSteps=Math.max(completedSteps,3);
-  if(['courier_called','ready_to_ship','picked_up','in_transit','delivering','delivered'].indexOf(fps)!==-1){completedSteps=Math.max(completedSteps,4);ftStepState.ready_to_ship='done';}
+  var hasPnos=o.pnos&&o.pnos.length>0;
+  // Step 1: address was validated if Flash parcel was created successfully
+  if(ftStepState.check_address==='done'||(fps!=='none'&&hasPnos)){completedSteps=1;ftStepState.check_address='done';}
+  // Step 2: parcel created
+  if(fps!=='none'&&hasPnos){completedSteps=Math.max(completedSteps,2);ftStepState.flash_create='done';}
+  // Step 3: scan QR (pack + call courier) — done if courier was called or beyond
+  if(ftStepState.scan_qr==='done'||['courier_called','ready_to_ship','picked_up','in_transit','delivering','delivered'].indexOf(fps)!==-1){completedSteps=Math.max(completedSteps,3);ftStepState.scan_qr='done';}
+  // Step 4: ready_to_ship / courier called
+  if(['courier_called','picked_up','in_transit','delivering','delivered'].indexOf(fps)!==-1){completedSteps=Math.max(completedSteps,4);ftStepState.ready_to_ship='done';}
   // Webhook states
   var whStep=0;
   if(['picked_up','in_transit','delivering','delivered'].indexOf(fps)!==-1)whStep=5;
@@ -1704,6 +1732,8 @@ function ftSelectOrder(){
   if(!ftSelected)return;
   ftUpdateInfo();
   ftUpdateProgress();
+  ftPopulateResults();
+  ftUpdateRecovery();
   ftUpdateTimeline();
   ftLog('📋 เลือก Order #'+id+' — '+ftSelected.dist+' ('+ftSelected.status+')','ok');
 }
@@ -1788,7 +1818,7 @@ function ftRefresh(){
     ftOrders=d.orders;
     if(ftSelected){
       var updated=ftOrders.find(function(o){return o.id===ftSelected.id});
-      if(updated){ftSelected=updated;ftUpdateInfo();ftUpdateProgress();ftUpdateTimeline();}
+      if(updated){ftSelected=updated;ftUpdateInfo();ftUpdateProgress();ftUpdateRecovery();ftUpdateTimeline();}
     }
   });
 }
@@ -1841,9 +1871,10 @@ function ftRun(step,cb){
       }
     }
 
-    if(step==='download_label'&&ok){
+    if(step==='scan_qr'&&ok){
       rh+='<div style="margin-top:6px;padding:8px;background:#f0fdf4;border-radius:6px;font-size:11px">';
-      rh+='🏷️ Label PDF พร้อมใช้งาน — pno: <code>'+esc(d.pno||'')+'</code>';
+      rh+='📱 QR Scan สำเร็จ — ปริ้นเสร็จ + แพ็คเรียบร้อย → พร้อมเรียกรถ';
+      if(d.courier){rh+='<br>🚛 คูเรียร์: '+esc(d.courier.staffName||'')+'  '+esc(d.courier.staffPhone||'');}
       rh+='</div>';
     }
 
@@ -1884,8 +1915,27 @@ function ftSim(type){
   api('POST','flash-test/simulate-webhook',{ticket_id:ftSelected.id,type:type},function(d){
     var ok=d.success;var icon=ok?'✅':'❌';
     var rh='<div style="color:'+(ok?'#16a34a':'#dc2626')+'">'+icon+' '+esc(d.message)+'</div>';
+    // Rich data display
+    if(ok&&d.detail){
+      rh+='<div style="margin-top:4px;padding:6px 10px;background:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;font-size:11px">';
+      rh+='<div style="color:#334155">'+esc(d.detail)+'</div>';
+      if(d.pno)rh+='<div style="color:#64748b;margin-top:2px">Tracking: <code style="background:#e2e8f0;padding:1px 4px;border-radius:3px">'+esc(d.pno)+'</code></div>';
+      if(d.flash_packing)rh+='<div style="color:#64748b;margin-top:2px">flash_packing → <strong>'+esc(d.flash_packing)+'</strong></div>';
+      if(d.order_status)rh+='<div style="color:#64748b;margin-top:2px">order_status → <strong>'+esc(d.order_status)+'</strong></div>';
+      if(d.returned_pno)rh+='<div style="color:#991b1b;margin-top:2px">Return PNO: <code>'+esc(d.returned_pno)+'</code></div>';
+      if(d.signer)rh+='<div style="color:#64748b;margin-top:2px">ผู้รับ: '+esc(d.signer)+'</div>';
+      if(d.data){
+        var keys=Object.keys(d.data);
+        if(keys.length>0){
+          rh+='<div style="margin-top:4px;font-size:10px;color:#94a3b8">';
+          keys.forEach(function(k){rh+=k+'='+JSON.stringify(d.data[k])+' ';});
+          rh+='</div>';
+        }
+      }
+      rh+='</div>';
+    }
     document.getElementById('ftr_sim').innerHTML=rh;
-    ftLog(icon+' Webhook '+type+': '+d.message,ok?'ok':'err');
+    ftLog(icon+' Webhook '+type+': '+d.message+(d.detail?' — '+d.detail:''),ok?'ok':'err');
     // Update webhook dot
     var whDot=FT_WH_MAP[type];
     if(whDot&&ok)ftSetDot(whDot,'done');
@@ -1909,7 +1959,7 @@ function ftAutoRun(){
     }
     var s=steps[idx];idx++;
     ftRun(s,function(ok){
-      if(!ok&&s!=='download_label'){
+      if(!ok){
         ftAutoRunning=false;btn.disabled=false;btn.textContent='🚀 Auto Run All Steps';
         ftLog('⛔ Auto-run stopped at '+s+' (error)','err');
         return;
@@ -1920,6 +1970,116 @@ function ftAutoRun(){
   next();
 }
 
+// ═══════════════════════════════════════
+// V.32: Pre-populate results from DB state when order is loaded
+// ═══════════════════════════════════════
+function ftPopulateResults(){
+  if(!ftSelected)return;
+  var o=ftSelected,fps=o.flash_packing||'none',hasPnos=o.pnos&&o.pnos.length>0;
+
+  // Step 1: Address — if parcel was created, address was validated
+  if(hasPnos&&fps!=='none'){
+    var rh='<div style="color:#16a34a">✅ ที่อยู่ผ่าน validation แล้ว (สร้างพัสดุสำเร็จ)</div>';
+    if(o.dist)rh+='<div style="margin-top:4px;padding:6px 8px;background:#f0fdf4;border-radius:6px;font-size:11px"><strong>ผู้รับ:</strong> '+esc(o.dist)+' '+esc(o.dist_phone||'')+' · '+esc(o.dist_province||'')+'</div>';
+    document.getElementById('ftr_1').innerHTML=rh;
+  }
+
+  // Step 2: Flash Create — show real tracking data
+  if(hasPnos){
+    var rh='<div style="color:#16a34a">✅ สร้างพัสดุ Flash สำเร็จ</div>';
+    rh+='<div style="margin-top:4px;padding:6px 8px;background:#f0fdf4;border-radius:6px;font-size:11px">';
+    rh+='<strong>📦 Tracking:</strong> ';
+    o.pnos.forEach(function(pno){rh+='<code style="background:#dcfce7;padding:1px 5px;border-radius:3px;margin:1px;display:inline-block;font-size:11px">'+esc(pno)+'</code> ';});
+    rh+='<br><strong>กล่อง:</strong> '+(o.total_boxes||o.pnos.length);
+    if(o.print_status)rh+=' · <strong>ปริ้น:</strong> '+esc(o.print_status);
+    rh+='</div>';
+    document.getElementById('ftr_2').innerHTML=rh;
+  }
+
+  // Step 3: Scan QR — show if courier was called or beyond
+  var courierDone=['courier_called','picked_up','in_transit','delivering','delivered'];
+  if(courierDone.indexOf(fps)!==-1){
+    var rh='<div style="color:#16a34a">✅ QR Scan → แพ็คเสร็จ → เรียกรถสำเร็จ</div>';
+    if(o.courier&&o.courier.staffInfoName){
+      rh+='<div style="margin-top:4px;padding:6px 8px;background:#f0fdf4;border-radius:6px;font-size:11px">';
+      rh+='🚛 <strong>'+esc(o.courier.staffInfoName)+'</strong>';
+      if(o.courier.staffInfoPhone)rh+=' · 📞 '+esc(o.courier.staffInfoPhone);
+      if(o.courier.timeoutAtText)rh+='<br>⏰ เข้ารับ: '+esc(o.courier.timeoutAtText);
+      if(o.pickup_id)rh+='<br>Pickup ID: <code>'+esc(o.pickup_id)+'</code>';
+      rh+='</div>';
+    }
+    document.getElementById('ftr_3').innerHTML=rh;
+  }
+
+  // Step 4: Ready to ship — show courier info if available
+  if(courierDone.indexOf(fps)!==-1&&o.courier&&o.courier.staffInfoName){
+    var rh='<div style="color:#16a34a">✅ เรียกรถสำเร็จ</div>';
+    rh+='<div style="margin-top:4px;padding:6px 8px;background:#f0fdf4;border-radius:6px;font-size:11px">';
+    rh+='🚛 <strong>'+esc(o.courier.staffInfoName)+'</strong> · 📞 '+esc(o.courier.staffInfoPhone||'');
+    if(o.courier.timeoutAtText)rh+='<br>⏰ เข้ารับภายใน: '+esc(o.courier.timeoutAtText);
+    if(o.pickup_id)rh+='<br>Pickup ID: <code>'+esc(o.pickup_id)+'</code>';
+    rh+='</div>';
+    document.getElementById('ftr_4').innerHTML=rh;
+  }
+
+  // Show weight/cost data if available from webhooks
+  var simParts=[];
+  if(o.weight&&o.weight.weight){
+    simParts.push('⚖️ น้ำหนัก: '+o.weight.weight+'g'+(o.weight.length?' ('+o.weight.length+'×'+o.weight.width+'×'+o.weight.height+'cm)':''));
+  }
+  if(o.cost&&o.cost.freightPrice){
+    simParts.push('💰 ค่าส่ง: ฿'+(o.cost.freightPrice/100).toFixed(2));
+  }
+  if(simParts.length){
+    document.getElementById('ftr_sim').innerHTML='<div style="color:#16a34a;font-size:11px">'+simParts.join(' · ')+'</div>';
+  }
+}
+
+// ═══════════════════════════════════════
+// V.32: Show/hide error recovery buttons based on current state
+// ═══════════════════════════════════════
+function ftUpdateRecovery(){
+  if(!ftSelected){document.getElementById('ft_recovery').style.display='none';return;}
+  var fps=ftSelected.flash_packing||'none';
+  var showRetry=(fps==='notify_error');
+  var showSwitch=(fps==='notify_error'||fps==='flash_create_error'||fps==='print_done'||fps==='flash_created');
+  var showCancelPickup=(fps==='courier_called');
+  var showPanel=showRetry||showSwitch||showCancelPickup;
+  document.getElementById('ft_recovery').style.display=showPanel?'':'none';
+  document.getElementById('ft_retry_courier').style.display=showRetry?'':'none';
+  document.getElementById('ft_switch_manual').style.display=showSwitch?'':'none';
+  document.getElementById('ft_cancel_pickup').style.display=showCancelPickup?'':'none';
+  document.getElementById('ftr_recovery').innerHTML='';
+}
+
+function ftSwitchManual(){
+  if(!ftSelected){toast('กรุณาเลือก Order ก่อน','e');return;}
+  if(!confirm('เปลี่ยน #'+ftSelected.id+' เป็นส่งเอง?\n\n• ยกเลิกพัสดุ Flash\n• พิมพ์ใบแปะหน้าธรรมดาอัตโนมัติ\n• แจ้ง LINE ให้กรอกเลข tracking ทีหลัง'))return;
+  var el=document.getElementById('ftr_recovery');
+  el.innerHTML='<div style="color:#3b82f6"><span class="ft-spin">⏳</span> กำลังเปลี่ยน...</div>';
+  ftLog('📦 เปลี่ยนเป็นส่งเอง #'+ftSelected.id+'...','warn');
+  api('POST','flash-switch-manual',{ticket_id:ftSelected.id},function(d){
+    var ok=d.success;
+    el.innerHTML='<div style="color:'+(ok?'#16a34a':'#dc2626')+'">'+(ok?'✅':'❌')+' '+esc(d.message)+'</div>';
+    ftLog((ok?'✅':'❌')+' Switch manual: '+d.message,ok?'ok':'err');
+    ftRefresh();
+  });
+}
+
+function ftCancelPickup(){
+  if(!ftSelected){toast('กรุณาเลือก Order ก่อน','e');return;}
+  if(!confirm('ยกเลิกเรียกรถ #'+ftSelected.id+'?'))return;
+  var el=document.getElementById('ftr_recovery');
+  el.innerHTML='<div style="color:#3b82f6"><span class="ft-spin">⏳</span> กำลังยกเลิก...</div>';
+  ftLog('🚫 ยกเลิกเรียกรถ #'+ftSelected.id+'...','warn');
+  api('POST','flash-cancel-notify',{ticket_id:ftSelected.id},function(d){
+    var ok=d.success;
+    el.innerHTML='<div style="color:'+(ok?'#16a34a':'#dc2626')+'">'+(ok?'✅':'❌')+' '+esc(d.message)+'</div>';
+    ftLog((ok?'✅':'❌')+' Cancel pickup: '+d.message,ok?'ok':'err');
+    ftRefresh();
+  });
+}
+
 // Expose Flash Test functions to global scope (called from HTML onclick/onchange)
 window.ftLoadOrders=ftLoadOrders;
 window.ftSelectOrder=ftSelectOrder;
@@ -1927,6 +2087,8 @@ window.ftRun=ftRun;
 window.ftSim=ftSim;
 window.ftAutoRun=ftAutoRun;
 window.ftRefresh=ftRefresh;
+window.ftSwitchManual=ftSwitchManual;
+window.ftCancelPickup=ftCancelPickup;
 
 // Auto-load on tab click
 document.querySelectorAll('.cp-tab').forEach(function(t){t.addEventListener('click',function(){if(t.dataset.tab==='flashtest'&&!ftOrders.length)ftLoadOrders()})});
