@@ -39,6 +39,14 @@ if (!function_exists('b2b_log')) {
 }
 if (!function_exists('b2b_set_order_status')) {
     function b2b_set_order_status($tid, $st) {
+        $tid = intval($tid);
+        if ($tid <= 0) return false;
+        if (get_post_status($tid) === 'trash') return false;
+        $old = get_field('order_status', $tid) ?: '';
+        $history = get_post_meta($tid, '_b2b_status_history', true);
+        if (!is_array($history)) $history = array();
+        $history[] = array('from'=>$old, 'to'=>$st, 'at'=>current_time('mysql'));
+        update_post_meta($tid, '_b2b_status_history', $history);
         update_field('order_status', $st, $tid);
     }
 }
@@ -145,9 +153,9 @@ function b2b_rest_flash_create( WP_REST_Request $r ) {
     if(!defined('B2B_FLASH_MCH_ID')||!defined('B2B_FLASH_SECRET_KEY')||!defined('B2B_FLASH_API_URL'))
         return new WP_REST_Response(array('success'=>false,'message'=>'Flash ยังไม่ตั้งค่า (MCH_ID/SECRET_KEY/API_URL)'),400);
 
-    // Check order status
+    // Check order status — allow 'packed' as well (admin may have packed before choosing Flash)
     $cur_status = get_field('order_status', $tid);
-    if (!in_array($cur_status, array('paid','pending','checking_stock','backorder','awaiting_confirm'), true))
+    if (!in_array($cur_status, array('paid','packed','pending','checking_stock','backorder','awaiting_confirm'), true))
         return new WP_REST_Response(array('success'=>false,'message'=>'สถานะ '.$cur_status.' ไม่สามารถสร้างพัสดุได้'),400);
 
     // Check not already created — allow retry if previous attempt had errors
@@ -175,10 +183,14 @@ function b2b_rest_flash_create( WP_REST_Request $r ) {
     $result = b2b_flash_create_all_boxes($tid);
 
     if ($result['ok']) {
+        // Don't change order_status here — it stays as 'paid' until courier picks up (webhook state 1 → 'shipped')
+        // Flash packing workflow is tracked separately via _flash_packing_status
         // Auto-queue print job for RPi
         if (function_exists('b2b_enqueue_print_job')) {
             b2b_enqueue_print_job($tid);
             update_post_meta($tid, '_flash_packing_status', 'print_queued');
+        } else {
+            update_post_meta($tid, '_flash_packing_status', 'flash_created');
         }
         b2b_add_audit_log($tid, 'flash_created', 'สร้างพัสดุ Flash ' . $result['total_boxes'] . ' กล่อง: ' . implode(', ', $result['pnos']));
         // ส่ง Flex Card แจ้ง admin (S1 ไม่ส่งเองแล้ว เพื่อประหยัดโควต้า LINE)
@@ -268,25 +280,88 @@ function b2b_rest_flash_ready_to_ship( WP_REST_Request $r ) {
 
     if (empty($notified_tids)) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มี ticket ที่พร้อมส่ง'),400);
 
-    // Call courier for pickup (one call for all parcels)
+    // V.39: Call courier for pickup — with /notifications fallback + persistent retry
     if (!function_exists('b2b_flash_notify_courier_from_warehouse'))
         return new WP_REST_Response(array('success'=>false,'message'=>'ยังไม่มีฟังก์ชัน b2b_flash_notify_courier_from_warehouse'),400);
-    $courier_result = b2b_flash_notify_courier_from_warehouse($total_parcels, 'Orders: '.implode(',', $notified_tids));
+
+    // Check active pickup in transient cache first
+    $active_pickup = get_transient( 'b2b_flash_active_pickup' );
+    $courier_ok = false;
+    $pickup_data = null;
     $courier_info = array();
 
-    if ($courier_result['ok'] && !empty($courier_result['data'])) {
-        $cd = $courier_result['data'];
-        $courier_info = array(
-            'pickup_id'  => isset($cd['ticketPickupId']) ? $cd['ticketPickupId'] : '',
-            'staff_name' => isset($cd['staffInfoName'])  ? $cd['staffInfoName']  : '',
-            'staff_phone'=> isset($cd['staffInfoPhone']) ? $cd['staffInfoPhone'] : '',
-            'timeout'    => isset($cd['timeoutAtText'])  ? $cd['timeoutAtText']  : '',
-        );
+    if ( is_array( $active_pickup ) && ! empty( $active_pickup['pickup_id'] ) ) {
+        // Reuse active pickup
+        $active_pickup['parcel_count'] = intval( $active_pickup['parcel_count'] ?? 0 ) + $total_parcels;
+        foreach ($notified_tids as $tid) {
+            if ( ! in_array( $tid, (array)($active_pickup['ticket_ids'] ?? array()) ) ) $active_pickup['ticket_ids'][] = $tid;
+        }
+        set_transient( 'b2b_flash_active_pickup', $active_pickup, DAY_IN_SECONDS );
         foreach ($notified_tids as $tid) {
             update_post_meta($tid, '_flash_packing_status', 'courier_called');
-            update_post_meta($tid, '_flash_pickup_id', $courier_info['pickup_id']);
+            update_post_meta($tid, '_flash_pickup_id', $active_pickup['pickup_id']);
+            update_post_meta($tid, '_flash_courier_info', array('name' => $active_pickup['staff_name'], 'phone' => $active_pickup['staff_phone']));
             update_post_meta($tid, '_flash_notify_error', '');
+            delete_post_meta($tid, '_flash_courier_retry_count');
         }
+        $courier_info = array('pickup_id'=>$active_pickup['pickup_id'],'staff_name'=>$active_pickup['staff_name'],'staff_phone'=>$active_pickup['staff_phone'],'timeout'=>$active_pickup['timeout_text'] ?? '');
+        $courier_ok = true;
+    } else {
+        // Call Flash /notify
+        $courier_result = b2b_flash_notify_courier_from_warehouse($total_parcels, 'Orders: '.implode(',', $notified_tids));
+
+        if ($courier_result['ok'] && !empty($courier_result['data'])) {
+            $pickup_data = $courier_result['data'];
+            $courier_ok = true;
+        } elseif ( !$courier_result['ok'] && function_exists('b2b_flash_get_notifications') ) {
+            // Fallback: Flash rejected → check /notifications for active pickup
+            b2b_log('[AdminDash] Notify rejected: ' . ($courier_result['error'] ?? '') . ' — checking /notifications');
+            $notif = b2b_flash_get_notifications( date('Y-m-d') );
+            if ( $notif['ok'] && !empty($notif['data']) ) {
+                foreach ( (array) $notif['data'] as $pu ) {
+                    if ( isset($pu['state']) && in_array( intval($pu['state']), array(0, 1), true ) ) {
+                        $pickup_data = $pu;
+                        $courier_ok = true;
+                        b2b_log('[AdminDash] Found active pickup from /notifications: ' . ($pu['ticketPickupId'] ?? ''));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if ($courier_ok && $pickup_data) {
+            $cd = $pickup_data;
+            $courier_info = array(
+                'pickup_id'  => isset($cd['ticketPickupId']) ? $cd['ticketPickupId'] : '',
+                'staff_name' => isset($cd['staffInfoName'])  ? $cd['staffInfoName']  : (isset($cd['staffInfoname']) ? $cd['staffInfoname'] : ''),
+                'staff_phone'=> isset($cd['staffInfoPhone']) ? $cd['staffInfoPhone'] : (isset($cd['staffInfomobile']) ? $cd['staffInfomobile'] : ''),
+                'timeout'    => isset($cd['timeoutAtText'])  ? $cd['timeoutAtText']  : '',
+            );
+            // V.39: Cache as active pickup — merge with existing if same pickup ID
+            $prev_d = get_transient( 'b2b_flash_active_pickup' );
+            $prev_tids_d = array(); $prev_cnt_d = 0;
+            if ( is_array( $prev_d ) && ( $prev_d['pickup_id'] ?? '' ) === $courier_info['pickup_id'] ) {
+                $prev_tids_d = is_array( $prev_d['ticket_ids'] ?? null ) ? $prev_d['ticket_ids'] : array();
+                $prev_cnt_d = intval( $prev_d['parcel_count'] ?? 0 );
+            }
+            $merged_tids = array_values( array_unique( array_merge( $prev_tids_d, $notified_tids ) ) );
+            $new_pickup = array(
+                'pickup_id' => $courier_info['pickup_id'], 'staff_name' => $courier_info['staff_name'],
+                'staff_phone' => $courier_info['staff_phone'], 'timeout_text' => $courier_info['timeout'],
+                'created_at' => time(), 'parcel_count' => $prev_cnt_d + $total_parcels, 'ticket_ids' => $merged_tids,
+            );
+            set_transient( 'b2b_flash_active_pickup', $new_pickup, DAY_IN_SECONDS );
+            foreach ($notified_tids as $tid) {
+                update_post_meta($tid, '_flash_packing_status', 'courier_called');
+                update_post_meta($tid, '_flash_pickup_id', $courier_info['pickup_id']);
+                update_post_meta($tid, '_flash_courier_info', array('name' => $courier_info['staff_name'], 'phone' => $courier_info['staff_phone']));
+                update_post_meta($tid, '_flash_notify_error', '');
+                delete_post_meta($tid, '_flash_courier_retry_count');
+            }
+        }
+    }
+
+    if ($courier_ok) {
         // Admin LINE notification
         $admin_flex = b2b_build_flex_flash_admin($notified_tids[0], 'courier_ok', array(
             'courier_name'  => $courier_info['staff_name'],
@@ -296,14 +371,16 @@ function b2b_rest_flash_ready_to_ship( WP_REST_Request $r ) {
         ));
         b2b_push_raw_to_admin(array($admin_flex));
     } else {
-        // Notify courier failed — but distributor already notified (tracking exists)
+        // V.39: Courier failed — schedule persistent retry for each ticket
         $err = isset($courier_result['error']) ? $courier_result['error'] : 'Unknown';
         foreach ($notified_tids as $tid) {
             update_post_meta($tid, '_flash_packing_status', 'notify_error');
             update_post_meta($tid, '_flash_notify_error', $err);
+            $rc = intval( get_post_meta($tid, '_flash_courier_retry_count', true) );
+            update_post_meta($tid, '_flash_courier_retry_count', $rc + 1);
+            wp_schedule_single_event( time() + 120, 'b2b_flash_courier_retry', array( $tid ) );
+            b2b_log('[AdminDash] Scheduled courier retry for #' . $tid . ' in 120s');
         }
-        $admin_flex = b2b_build_flex_flash_admin($notified_tids[0], 'courier_fail', array('error' => $err));
-        b2b_push_raw_to_admin(array($admin_flex));
     }
 
     return new WP_REST_Response(array(
@@ -699,9 +776,11 @@ function b2b_render_admin_dashboard(){
         $print_ts  = get_field('print_timestamp',$o->ID) ?: '';
         $print_det = get_field('print_details',$o->ID) ?: '';
         $ship_method = get_post_meta($o->ID, '_ship_method', true) ?: '';
+        $pno_sts_raw = get_post_meta($o->ID, '_flash_pno_statuses', true);
+        $pno_sts_json = (is_array($pno_sts_raw) && !empty($pno_sts_raw)) ? wp_json_encode($pno_sts_raw) : '{}';
         $flash_ps = get_post_meta($o->ID, '_flash_packing_status', true) ?: 'none';
         $flash_err = get_post_meta($o->ID, '_flash_create_error', true) ?: '';
-        $od[]=array('id'=>$o->ID,'date'=>b2b_date('d/m/Y H:i',get_post_time('U',true,$o->ID)),'status'=>$s,'total'=>floatval(get_field('total_amount',$o->ID)),'items'=>get_field('order_items',$o->ID)?:'','note'=>get_field('admin_note',$o->ID)?:'','group_id'=>$gid,'claimed_by'=>get_field('claimed_by_admin',$o->ID)?:get_field('stock_checked_by',$o->ID)?:'','tracking'=>get_field('tracking_number',$o->ID)?:'','is_billed'=>(bool)get_field('is_billed',$o->ID),'customer_note'=>$cnote,'sub_label'=>$sublabel,'parent_tid'=>$parent_tid,'audit'=>$audit_json,'shop_name'=>$shop_name,'print_status'=>$print_st,'print_error'=>$print_err,'print_timestamp'=>$print_ts,'print_details'=>$print_det,'ship_method'=>$ship_method,'flash_ps'=>$flash_ps,'flash_err'=>$flash_err);
+        $od[]=array('id'=>$o->ID,'date'=>b2b_date('d/m/Y H:i',get_post_time('U',true,$o->ID)),'status'=>$s,'total'=>floatval(get_field('total_amount',$o->ID)),'items'=>get_field('order_items',$o->ID)?:'','note'=>get_field('admin_note',$o->ID)?:'','group_id'=>$gid,'claimed_by'=>get_field('claimed_by_admin',$o->ID)?:get_field('stock_checked_by',$o->ID)?:'','tracking'=>get_field('tracking_number',$o->ID)?:'','is_billed'=>(bool)get_field('is_billed',$o->ID),'customer_note'=>$cnote,'sub_label'=>$sublabel,'parent_tid'=>$parent_tid,'audit'=>$audit_json,'shop_name'=>$shop_name,'print_status'=>$print_st,'print_error'=>$print_err,'print_timestamp'=>$print_ts,'print_details'=>$print_det,'ship_method'=>$ship_method,'flash_ps'=>$flash_ps,'flash_err'=>$flash_err,'pno_statuses'=>$pno_sts_json);
     }
     ob_start();
 ?>
@@ -843,7 +922,7 @@ function b2b_render_admin_dashboard(){
       <th style="width:40px"></th>
     </tr></thead><tbody>
     <?php foreach($od as $o):$c=$scc[$o['status']]??'#94a3b8';$lb=$sl[$o['status']]??$o['status'];?>
-    <tr class="dr" data-s="<?=esc_attr($o['status'])?>" data-id="<?=$o['id']?>" data-total="<?=$o['total']?>" data-items="<?=esc_attr($o['items'])?>" data-note="<?=esc_attr($o['note'])?>" data-group="<?=esc_attr($o['group_id'])?>" data-claimed="<?=esc_attr($o['claimed_by'])?>" data-tracking="<?=esc_attr($o['tracking'])?>" data-billed="<?=$o['is_billed']?'1':'0'?>" data-cnote="<?=esc_attr($o['customer_note'])?>" data-sublabel="<?=esc_attr($o['sub_label'])?>" data-parent="<?=esc_attr($o['parent_tid'])?>" data-audit="<?=esc_attr($o['audit'])?>" data-shop="<?=esc_attr($o['shop_name'])?>" data-pst="<?=esc_attr($o['print_status'])?>" data-perr="<?=esc_attr($o['print_error'])?>" data-pts="<?=esc_attr($o['print_timestamp'])?>" data-pdet="<?=esc_attr($o['print_details'])?>" data-shipm="<?=esc_attr($o['ship_method'])?>" data-fps="<?=esc_attr($o['flash_ps'])?>" data-ferr="<?=esc_attr($o['flash_err'])?>">
+    <tr class="dr" data-s="<?=esc_attr($o['status'])?>" data-id="<?=$o['id']?>" data-total="<?=$o['total']?>" data-items="<?=esc_attr($o['items'])?>" data-note="<?=esc_attr($o['note'])?>" data-group="<?=esc_attr($o['group_id'])?>" data-claimed="<?=esc_attr($o['claimed_by'])?>" data-tracking="<?=esc_attr($o['tracking'])?>" data-billed="<?=$o['is_billed']?'1':'0'?>" data-cnote="<?=esc_attr($o['customer_note'])?>" data-sublabel="<?=esc_attr($o['sub_label'])?>" data-parent="<?=esc_attr($o['parent_tid'])?>" data-audit="<?=esc_attr($o['audit'])?>" data-shop="<?=esc_attr($o['shop_name'])?>" data-pst="<?=esc_attr($o['print_status'])?>" data-perr="<?=esc_attr($o['print_error'])?>" data-pts="<?=esc_attr($o['print_timestamp'])?>" data-pdet="<?=esc_attr($o['print_details'])?>" data-shipm="<?=esc_attr($o['ship_method'])?>" data-fps="<?=esc_attr($o['flash_ps'])?>" data-ferr="<?=esc_attr($o['flash_err'])?>" data-pno-statuses="<?=esc_attr($o['pno_statuses'])?>">
       <td><input type="checkbox" class="bulk-check row-check" data-id="<?=$o['id']?>"></td>
       <td><span class="tid" data-act="open">#<?=$o['id']?><?php if($o['sub_label']):?><span class="sub-tag"><?=esc_html($o['sub_label'])?></span><?php endif;?></span></td>
       <td class="hide-mobile" style="font-size:12px;color:#999"><?=$o['date']?></td>
@@ -957,6 +1036,7 @@ function b2b_render_admin_dashboard(){
   var R='<?=esc_js($rest)?>',N='<?=esc_js($nonce)?>',cur=null;
   // Helper: reload page with hash preserved so Admin Dashboard restores this tab
   function b2bReload(){if(window.location.hash!=='#b2b_dnc')window.location.hash='b2b_dnc';location.reload();}
+  function escH(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
   // V.10.0 A1: Search + Status filter combined
   var activeFilter='all';
   function filterRows(){
@@ -1024,7 +1104,7 @@ function b2b_render_admin_dashboard(){
       var docs=[
         {key:'invoice',label:'📄 Invoice (A4)',printer:'เครื่อง A4 (Brother)'},
         {key:isFlash?'flash_label':'manual_label',label:isFlash?'🏷️ Flash Label (สติกเกอร์)':'🏷️ ใบแปะหน้า (สติกเกอร์)',printer:'เครื่องสติกเกอร์ (XP-420B)'},
-        {key:'picking_list',label:'📋 ใบหยิบของ (A4)',printer:'เครื่อง A4 (Brother)'}
+        {key:'picking_list',label:'📋 ใบหยิบของ (สติกเกอร์)',printer:'เครื่องสติกเกอร์ (XP-420B)'}
       ];
       var rh='';docs.forEach(function(doc){
         var val=det[doc.key];var hasLabels=(doc.key==='flash_label'||doc.key==='manual_label');
@@ -1034,7 +1114,10 @@ function b2b_render_admin_dashboard(){
         }else if(val===true||val===1){statusHtml='<span class="pr-ok">✅ สำเร็จ</span>';}
         else if(val===false||val===0){statusHtml='<span class="pr-fail">❌ ล้มเหลว</span>';}
         else{statusHtml='<span class="pr-na">— ไม่มีข้อมูล</span>';}
-        rh+='<div class="print-row"><div><div class="pr-doc">'+doc.label+'</div><div class="pr-info">'+doc.printer+'</div></div><div class="pr-status">'+statusHtml+'</div></div>';
+        // Per-component reprint button for failed items
+        var isFailed=(hasLabels&&det.labels_printed!==undefined&&det.labels_printed<det.labels_total)||val===false||val===0;
+        var reprintBtn=isFailed?'<button class="reprint-doc" onclick="reprintComponent('+cur.id+',\''+doc.key+'\')">🖨️ ปริ้นซ้ำ</button>':'';
+        rh+='<div class="print-row"><div><div class="pr-doc">'+doc.label+'</div><div class="pr-info">'+doc.printer+'</div></div><div class="pr-status">'+statusHtml+reprintBtn+'</div></div>';
       });
       prRows.innerHTML=rh;
     }else if(cur.pst==='none'){
@@ -1083,6 +1166,46 @@ function b2b_render_admin_dashboard(){
     var fpsLabels={flash_created:'📦 สร้างแล้ว',print_queued:'🖨️ รอปริ้น',print_done:'🖨️ ปริ้นแล้ว',ready_to_ship:'✅ พร้อมส่ง',courier_called:'🚛 เรียกรถแล้ว',picked_up:'🟡 รอรับ',in_transit:'🔵 ส่งแล้ว',delivering:'🟠 กำลังส่ง',delivered:'🟢 ส่งถึง',detained:'⚠️ คงคลัง',problem:'🔴 มีปัญหา',returned:'🔴 ตีกลับ',closed:'⛔ ปิดงาน',flash_create_error:'❌ สร้างล้มเหลว',notify_error:'❌ เรียกรถล้มเหลว',cancelled:'❌ ยกเลิก'};
     var fi=document.getElementById('mFlashInfo');
     if(fps!=='none'){fi.style.display='';document.getElementById('mFlashStatus').textContent=(fpsLabels[fps]||fps)+(hasTrack?' — '+cur.tracking:'');document.getElementById('mFlashErr').textContent=cur.ferr?'Error: '+cur.ferr:'';}else{fi.style.display='none';}
+    // Per-box management — clear previous boxes first to prevent duplicates
+    var oldBoxes = fi.querySelector('.flash-boxes-section');
+    if (oldBoxes) oldBoxes.remove();
+    var pnoData = {};
+    try { pnoData = JSON.parse(row.dataset.pnoStatuses || '{}'); } catch(e) {}
+    var pnoKeys = Object.keys(pnoData);
+    if (pnoKeys.length > 0) {
+        var boxHtml = '<div class="flash-boxes-section" style="margin-top:10px;border-top:1px solid #eee;padding-top:8px"><div style="font-size:11px;font-weight:700;color:#334155;margin-bottom:6px">\ud83d\udce6 Flash Boxes</div>';
+        pnoKeys.forEach(function(pno) {
+            var info = pnoData[pno];
+            var st = (info && info.status) || 'created';
+            var box = (info && info.box) || '';
+            var name = (info && info.name) || '';
+            var stEmoji = {'created':'\u2705','hold_pending':'\u23f8','cancelled':'\u274c','picked_up':'\ud83d\ude9b','in_transit':'\ud83d\ude9a','delivering':'\ud83c\udfcd','delivered':'\u2705','problem':'\u26a0\ufe0f','returned':'\u21a9\ufe0f'}[st] || '\u2022';
+            boxHtml += '<div style="padding:6px 8px;margin-bottom:4px;background:#f8fafc;border-radius:6px;border-left:3px solid '+(st==='created'?'#16a34a':st==='hold_pending'?'#f59e0b':st==='cancelled'?'#ef4444':'#0ea5e9')+';font-size:11px">';
+            boxHtml += '<div style="display:flex;justify-content:space-between;align-items:center">';
+            boxHtml += '<span><strong>\ud83d\udce6 '+escH(box)+'</strong> '+escH(name)+' <span style="color:#64748b">'+pno.slice(-8)+'</span></span>';
+            boxHtml += '<span>'+stEmoji+' '+st+'</span></div>';
+            // Children
+            if (info && info.children && info.children.length) {
+                info.children.forEach(function(c) {
+                    var cs = typeof c === 'string' ? c : (c.sku || '');
+                    boxHtml += '<div style="font-size:10px;color:#0369a1;padding-left:12px">\u21b3 '+escH(cs)+'</div>';
+                });
+            }
+            // Action buttons (admin)
+            var btns = '';
+            if (st === 'created') {
+                btns += '<button class="btn btn-ghost btn-sm" onclick="boxAct(\'hold_pno\','+row.dataset.id+',\''+pno+'\')" style="font-size:10px">\u23f8 Hold</button>';
+                btns += '<button class="btn btn-ghost btn-sm" onclick="boxAct(\'cancel_pno\','+row.dataset.id+',\''+pno+'\')" style="font-size:10px;color:#ef4444">\u274c</button>';
+            } else if (st === 'hold_pending' || st === 'cancelled') {
+                btns += '<button class="btn btn-ghost btn-sm" onclick="boxAct(\'reship_pno\','+row.dataset.id+',\''+pno+'\')" style="font-size:10px;color:#0369a1">\ud83d\udd04 Reship</button>';
+                if (st === 'hold_pending') btns += '<button class="btn btn-ghost btn-sm" onclick="boxAct(\'cancel_pno\','+row.dataset.id+',\''+pno+'\')" style="font-size:10px;color:#ef4444">\u274c</button>';
+            }
+            if (btns) boxHtml += '<div style="margin-top:4px;display:flex;gap:4px">'+btns+'</div>';
+            boxHtml += '</div>';
+        });
+        boxHtml += '</div>';
+        fi.insertAdjacentHTML('beforeend', boxHtml);
+    }
     // V.9: C1 Audit Log
     renderAuditLog(cur.audit);
     document.getElementById('tModal').classList.add('open')})});
@@ -1139,6 +1262,11 @@ function b2b_render_admin_dashboard(){
     if(!confirm('ปริ้นซ้ำ Ticket #'+cur.id+'?'))return;
     var btn=this,tid=cur.id;btn.disabled=true;btn.textContent='⏳';
     fetch(R+'print-requeue/'+tid,{method:'POST',headers:{'Content-Type':'application/json','X-WP-Nonce':N}}).then(function(r){return r.json()}).then(function(d){if(d.success){toast('🖨️ ส่งปริ้นซ้ำ #'+tid+' แล้ว','ok');setTimeout(function(){b2bReload()},1200)}else toast('❌ '+d.message,'err');btn.disabled=false;btn.textContent='🖨️ ปริ้นซ้ำ'}).catch(function(e){toast('❌ '+e.message,'err');btn.disabled=false;btn.textContent='🖨️ ปริ้นซ้ำ'})});
+  // V.38: Per-component reprint
+  window.reprintComponent=function(tid,component){
+    if(!confirm('ปริ้นซ้ำเฉพาะ '+component+' ของ #'+tid+'?'))return;
+    fetch(R+'print-requeue/'+tid,{method:'POST',headers:{'Content-Type':'application/json','X-WP-Nonce':N},body:JSON.stringify({component:component})}).then(function(r){return r.json()}).then(function(d){if(d.success){toast('🖨️ ส่งปริ้น '+component+' #'+tid+' แล้ว','ok');setTimeout(function(){b2bReload()},1200)}else toast('❌ '+d.message,'err')}).catch(function(e){toast('❌ '+e.message,'err')});
+  };
   // V.9: C1 Recalculate
   document.getElementById('mRecalc').addEventListener('click',function(){if(!cur)return;
     var btn=this,tid=cur.id;btn.disabled=true;btn.textContent='⏳';
@@ -1147,6 +1275,16 @@ function b2b_render_admin_dashboard(){
     if(!confirm('⚠️ ลบ Ticket #'+tid+' ถาวร?\n\n• ลบออเดอร์ออกจากระบบ\n• คืนหนี้อัตโนมัติ (ถ้ามี)\n\nกด OK เพื่อยืนยัน'))return;
     self.disabled=true;self.textContent='⏳';
     api('delete-ticket',{ticket_id:parseInt(tid)},function(d){if(d.success){toast(d.message,'ok');if(row){row.style.opacity='0';setTimeout(function(){row.remove()},300)}}else{toast('❌ '+(d.message||'Error'),'err');self.disabled=false;self.textContent='🗑'}})})});
+  window.boxAct = function(action, tid, pno) {
+    var labels = {'cancel_pno':'\u0e22\u0e01\u0e40\u0e25\u0e34\u0e01\u0e01\u0e25\u0e48\u0e2d\u0e07\u0e19\u0e35\u0e49','hold_pno':'Hold \u0e2a\u0e48\u0e07\u0e17\u0e35\u0e2b\u0e25\u0e31\u0e07','reship_pno':'\u0e2a\u0e23\u0e49\u0e32\u0e07 PNO \u0e43\u0e2b\u0e21\u0e48'};
+    if (!confirm(labels[action] + '?\nPNO: ' + pno)) return;
+    var body = {ticket_id: tid, step: action};
+    body[action === 'cancel_pno' ? 'pno' : 'target_pno'] = pno;
+    api('flash-test/run-step', body, function(d) {
+        toast(d.message || 'done', d.success ? 'ok' : 'err');
+        if (d.success) { closeM(); setTimeout(function(){b2bReload()},1200); }
+    });
+  };
   function api(ep,d,cb){fetch(R+ep,{method:'POST',headers:{'Content-Type':'application/json','X-WP-Nonce':N},body:JSON.stringify(d)}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(cb).catch(function(e){toast('❌ '+e.message,'err')})}
   function toast(m,t){var el=document.getElementById('dToast');el.textContent=m;el.className='toast '+(t||'ok')+' show';setTimeout(function(){el.classList.remove('show')},4000)}
 })();
