@@ -2,7 +2,7 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
- * Version: V.1.7
+ * Version: V.1.8
  * Dependencies: b2b_order CPT, distributor CPT, b2b_product CPT, ACF
  */
 
@@ -692,9 +692,12 @@ function dinoco_inv_rest_get(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
     $row = _dinoco_inv_row($id);
-    $row['items']    = json_decode(get_post_meta($id, '_inv_items', true) ?: '[]', true);
+    $row['items']      = json_decode(get_post_meta($id, '_inv_items', true) ?: '[]', true);
     $row['admin_note'] = get_field('admin_note', $id);
-    $row['due_date']   = get_field('due_date', $id);
+    // due_date is already ISO-normalized in _dinoco_inv_row() — do NOT overwrite with raw ACF value here
+    $row['global_disc_pct'] = floatval(get_post_meta($id, '_inv_global_disc_pct', true));
+    $row['global_disc_val'] = floatval(get_post_meta($id, '_inv_global_disc_val', true));
+    $row['ship_fee']        = floatval(get_post_meta($id, '_inv_ship_fee', true));
     $row['dist_phone']    = get_field('dist_phone', $id);
     $row['dist_address']  = get_field('dist_address', $id);
     $row['dist_district'] = get_field('dist_district', $id);
@@ -803,6 +806,9 @@ function dinoco_inv_rest_create(WP_REST_Request $req) {
     update_field('admin_note', $note, $post_id);
     update_field('is_billed', false, $post_id);
     if ($due_date) update_field('due_date', $due_date, $post_id);
+    update_post_meta($post_id, '_inv_global_disc_pct', $disc_pct);
+    update_post_meta($post_id, '_inv_global_disc_val', $disc_val);
+    update_post_meta($post_id, '_inv_ship_fee', $ship_fee);
     update_field('order_items', dinoco_inv_format_items_text($clean_items), $post_id);
 
     b2b_add_audit_log($post_id, 'created', 'สร้างใบแจ้งหนี้/วางบิล Draft ฿' . number_format($total, 0));
@@ -862,6 +868,9 @@ function dinoco_inv_rest_update(WP_REST_Request $req) {
     update_post_meta($id, '_inv_items', wp_json_encode($clean_items, JSON_UNESCAPED_UNICODE));
     if ($ref) update_post_meta($id, '_inv_reference', $ref);
     if ($inv_date) update_post_meta($id, '_inv_date', $inv_date);
+    update_post_meta($id, '_inv_global_disc_pct', $disc_pct);
+    update_post_meta($id, '_inv_global_disc_val', $disc_val);
+    update_post_meta($id, '_inv_ship_fee', $ship_fee);
     update_field('total_amount', $total, $id);
     update_field('admin_note', $note, $id);
     if ($due_date) update_field('due_date', $due_date, $id);
@@ -1450,9 +1459,14 @@ add_shortcode('dinoco_manual_invoice', function() {
     </div>
 
     <div class="inv-builder-actions">
-        <button class="inv-btn inv-btn-secondary" onclick="invCloseBuilder()">ยกเลิก</button>
+        <button class="inv-btn inv-btn-secondary" onclick="invCloseBuilder()">← กลับ</button>
         <button class="inv-btn inv-btn-outline" onclick="invSave(false)" id="inv-save-draft-btn">บันทึก Draft</button>
         <button class="inv-btn inv-btn-success" onclick="invConfirmIssue()" id="inv-issue-btn">ออกใบแจ้งหนี้/วางบิล</button>
+        <!-- Non-draft action buttons (hidden until non-draft invoice loaded) -->
+        <button class="inv-btn inv-btn-outline" style="display:none" id="inv-resend-btn" onclick="invResendLine()">ส่ง LINE ซ้ำ</button>
+        <button class="inv-btn inv-btn-outline" style="display:none" id="inv-print-btn" onclick="invPrintFromBuilder()">พิมพ์</button>
+        <button class="inv-btn inv-btn-success" style="display:none" id="inv-pay-btn" onclick="invOpenPayModal()">บันทึกรับเงิน</button>
+        <button class="inv-btn inv-btn-danger" style="display:none" id="inv-cancel-btn" onclick="invCancelFromBuilder()">ยกเลิกบิล</button>
     </div>
 </div>
 
@@ -1755,6 +1769,10 @@ window.invOpenBuilder = function(id) {
             document.getElementById('inv-f-note').value = inv.admin_note || '';
             document.getElementById('inv-f-due').value = inv.due_date || '';   // already ISO from API
             document.getElementById('inv-f-date').value = inv.issue_date || '';
+            // Restore global discount and shipping fee
+            var gd = inv.global_disc_pct > 0 ? inv.global_disc_pct + '%' : (inv.global_disc_val > 0 ? String(inv.global_disc_val) : '');
+            document.getElementById('inv-f-global-disc').value = gd;
+            document.getElementById('inv-f-ship').value = inv.ship_fee || 0;
             // Dist select will be set after distributors load
             setTimeout(function(){
                 document.getElementById('inv-f-dist').value = inv.dist_id || '';
@@ -1768,8 +1786,13 @@ window.invOpenBuilder = function(id) {
             invRecalc();
             // Show/hide buttons based on status
             var isEditable = inv.status === 'draft';
+            var isAwaiting = inv.status === 'awaiting_payment' || inv.status === 'overdue';
             document.getElementById('inv-save-draft-btn').style.display = isEditable ? '' : 'none';
-            document.getElementById('inv-issue-btn').style.display = isEditable ? '' : 'none';
+            document.getElementById('inv-issue-btn').style.display     = isEditable ? '' : 'none';
+            document.getElementById('inv-resend-btn').style.display    = isAwaiting ? '' : 'none';
+            document.getElementById('inv-print-btn').style.display     = (isAwaiting || inv.status === 'paid') ? '' : 'none';
+            document.getElementById('inv-pay-btn').style.display       = isAwaiting ? '' : 'none';
+            document.getElementById('inv-cancel-btn').style.display    = isAwaiting ? '' : 'none';
         });
     } else {
         if (heading) heading.textContent = 'สร้างใบแจ้งหนี้/วางบิล';
@@ -1802,12 +1825,44 @@ function invResetBuilder() {
     document.getElementById('inv-f-addr').value = '';
     document.getElementById('inv-save-draft-btn').style.display = '';
     document.getElementById('inv-issue-btn').style.display = '';
+    document.getElementById('inv-resend-btn').style.display = 'none';
+    document.getElementById('inv-print-btn').style.display = 'none';
+    document.getElementById('inv-pay-btn').style.display = 'none';
+    document.getElementById('inv-cancel-btn').style.display = 'none';
 }
 
 // ========= DISTRIBUTORS =========
+// Actions available when viewing a non-draft invoice in builder
+window.invResendLine = function() {
+    var id = document.getElementById('inv-edit-id').value;
+    if (!id) return;
+    invApi('POST', '/invoice/resend-line', {id: id}, function(err, data) {
+        if (err || !data || !data.success) { invToast('error', 'ส่ง LINE ล้มเหลว'); return; }
+        invToast('success', 'ส่ง LINE ซ้ำแล้ว');
+    });
+};
+window.invPrintFromBuilder = function() {
+    var id = document.getElementById('inv-edit-id').value;
+    if (id) invPrint(parseInt(id));
+};
+window.invOpenPayModal = function() {
+    var id = document.getElementById('inv-edit-id').value;
+    if (id) invShowPayModal(parseInt(id));
+};
+window.invCancelFromBuilder = function() {
+    var id = document.getElementById('inv-edit-id').value;
+    if (!id) return;
+    if (!confirm('ยืนยันยกเลิกใบแจ้งหนี้นี้?')) return;
+    invApi('POST', '/invoice/cancel', {id: id}, function(err, data) {
+        if (err || !data || !data.success) { invToast('error', 'ยกเลิกล้มเหลว'); return; }
+        invToast('success', 'ยกเลิกแล้ว');
+        invCloseBuilder();
+    });
+};
+
 function invLoadDistributors() {
     invApi('GET', '/distributors', {}, function(err, data) {
-        if (err || !data.success) return;
+        if (err || !data.success) { invToast('error', 'โหลดรายชื่อตัวแทนล้มเหลว'); return; }
         invDistributors = data.distributors || [];
     });
 }
@@ -1897,7 +1952,7 @@ function invFillDistInfo(distId) {
 // ========= PRODUCTS =========
 function invLoadProducts() {
     invApi('GET', '/products', {}, function(err, data) {
-        if (err || !data.success) return;
+        if (err || !data.success) { invToast('error', 'โหลดรายการสินค้าล้มเหลว'); return; }
         invProducts = data.products || [];
     });
 }
