@@ -1,0 +1,913 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [AdminSystem-System] GitHub Webhook Sync                    ║
+ * ║  Version: V.22.0 — Merge detection + Batched sync               ║
+ * ║  DINOCO Admin & System Snippet Sync                          ║
+ * ╠══════════════════════════════════════════════════════════════╣
+ * ║  Push to GitHub → Webhook → WordPress REST API               ║
+ * ║  → อัพเดท code ใน wp_snippets table อัตโนมัติ                  ║
+ * ╠══════════════════════════════════════════════════════════════╣
+ * ║  Required constants in wp-config.php:                        ║
+ * ║    DINOCO_GITHUB_WEBHOOK_SECRET  — shared secret             ║
+ * ║    DINOCO_GITHUB_TOKEN           — personal access token     ║
+ * ║    DINOCO_GITHUB_REPO            — e.g. Vrprammz/DINOCO-...  ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * V.1.0 Features:
+ * - HMAC-SHA256 signature verification
+ * - Shutdown hook + WP-Cron backup (prevent webhook timeout)
+ * - Execution lock (prevent double-run)
+ * - Commit SHA raw URL (bypass CDN cache)
+ * - Fallback to Contents API
+ * - Verify-after-write with MD5 hash
+ * - wp_cache_flush + opcache_reset after sync
+ * - Manual sync endpoint + sync status endpoint
+ * - Admin dashboard shortcode [dinoco_sync_dashboard]
+ * - Matches both [Admin System] and [System] prefixed snippets
+ */
+
+// ══════════════════════════════════════════════════════════════
+// HELPER: Normalize DB snippet name → GitHub filename
+// ══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'dinoco_normalize_snippet_name' ) ) {
+    function dinoco_normalize_snippet_name( $name ) {
+        return trim( html_entity_decode( $name, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// HELPER: Log for debugging
+// ══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'dinoco_sync_log' ) ) {
+    function dinoco_sync_log( $message ) {
+        if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+            error_log( '[DINOCO-Sync] ' . $message );
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// HELPER: Update snippet code with cache-bust + verify
+// ══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'dinoco_sync_update_snippet' ) ) {
+    function dinoco_sync_update_snippet( $row, $code, $file_name ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'snippets';
+        $new_revision = intval( $row->revision ) + 1;
+
+        // 1. Execute update
+        $result = $wpdb->update(
+            $table,
+            array(
+                'code'     => $code,
+                'modified' => current_time( 'mysql' ),
+                'revision' => $new_revision,
+            ),
+            array( 'id' => $row->id ),
+            array( '%s', '%s', '%d' ),
+            array( '%d' )
+        );
+
+        // 2. Check return value
+        if ( $result === false ) {
+            $err = $wpdb->last_error;
+            dinoco_sync_log( 'DB UPDATE FAILED: ' . $file_name . ' (id=' . $row->id . '): ' . $err );
+            return array( 'ok' => false, 'message' => 'db_update_failed: ' . $err );
+        }
+
+        // 3. Flush WordPress object cache
+        wp_cache_delete( 'alloptions', 'options' );
+
+        // 4. Clear Code Snippets plugin caches
+        delete_transient( 'code_snippets' );
+        delete_transient( 'code_snippets_active' );
+        delete_transient( 'all_snippets' );
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%' AND option_name LIKE '%_transient%'" );
+        wp_cache_delete( $row->id, 'code_snippets' );
+        wp_cache_delete( 'all_snippets', 'code_snippets' );
+
+        // 5. Clear WP Fastest Cache if available
+        if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+            wpfc_clear_all_cache( true );
+        }
+
+        // 6. Verify-after-write
+        $verify_hash = $wpdb->get_var( $wpdb->prepare(
+            "SELECT md5(code) FROM {$table} WHERE id = %d",
+            $row->id
+        ) );
+        $expected_hash = md5( $code );
+
+        if ( $verify_hash !== $expected_hash ) {
+            dinoco_sync_log( 'VERIFY MISMATCH: ' . $file_name . ' expected=' . substr( $expected_hash, 0, 8 ) . ' actual=' . substr( $verify_hash ?: 'null', 0, 8 ) );
+            return array( 'ok' => false, 'message' => 'verify_hash_mismatch' );
+        }
+
+        dinoco_sync_log( 'OK: ' . $file_name . ' (id=' . $row->id . ', rev=' . $new_revision . ', len=' . strlen( $code ) . ')' );
+        return array( 'ok' => true, 'message' => 'updated_and_verified' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// REST API ENDPOINT: /wp-json/dinoco/v1/github-sync
+// ══════════════════════════════════════════════════════════════
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'dinoco/v1', '/github-sync', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_github_sync_handler',
+        'permission_callback' => '__return_true',
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_github_sync_handler' ) ) {
+    function dinoco_github_sync_handler( WP_REST_Request $req ) {
+        // 1. Verify GitHub HMAC-SHA256 Signature
+        $secret = defined( 'DINOCO_GITHUB_WEBHOOK_SECRET' ) ? DINOCO_GITHUB_WEBHOOK_SECRET : '';
+        if ( empty( $secret ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'webhook_secret_not_configured' ), 500 );
+        }
+
+        $signature = $req->get_header( 'X-Hub-Signature-256' );
+        $payload   = $req->get_body();
+
+        if ( empty( $signature ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'missing_signature' ), 403 );
+        }
+
+        $expected = 'sha256=' . hash_hmac( 'sha256', $payload, $secret );
+        if ( ! hash_equals( $expected, $signature ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'invalid_signature' ), 403 );
+        }
+
+        // 2. Parse push event
+        $data = json_decode( $payload, true );
+        if ( empty( $data['commits'] ) || empty( $data['repository'] ) ) {
+            return new WP_REST_Response( array( 'ok' => true, 'message' => 'ping_received' ), 200 );
+        }
+
+        // Only sync from main branch
+        $ref = isset( $data['ref'] ) ? $data['ref'] : '';
+        if ( $ref !== 'refs/heads/main' ) {
+            return new WP_REST_Response( array(
+                'ok'      => true,
+                'message' => 'ignored_non_main_branch',
+                'ref'     => $ref,
+            ), 200 );
+        }
+
+        // 3. Respond 200 immediately, run sync via shutdown hook
+        $GLOBALS['_dinoco_pending_sync'] = $data;
+        add_action( 'shutdown', 'dinoco_sync_on_shutdown', 0 );
+
+        // Backup: WP-Cron (delay 30s)
+        $job_id = 'dinoco_sync_' . substr( md5( $payload ), 0, 12 );
+        set_transient( $job_id, $data, 600 );
+        wp_clear_scheduled_hook( 'dinoco_github_sync_process', array( $job_id ) );
+        wp_schedule_single_event( time() + 30, 'dinoco_github_sync_process', array( $job_id ) );
+        spawn_cron();
+
+        return new WP_REST_Response( array(
+            'ok'      => true,
+            'message' => 'sync_started',
+            'job_id'  => $job_id,
+            'ref'     => $ref,
+        ), 200 );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// SHUTDOWN HOOK — runs after REST response is sent
+// ══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'dinoco_sync_on_shutdown' ) ) {
+    function dinoco_sync_on_shutdown() {
+        if ( empty( $GLOBALS['_dinoco_pending_sync'] ) ) return;
+        $data = $GLOBALS['_dinoco_pending_sync'];
+        unset( $GLOBALS['_dinoco_pending_sync'] );
+
+        if ( function_exists( 'fastcgi_finish_request' ) ) {
+            fastcgi_finish_request();
+        }
+
+        @set_time_limit( 300 );
+        ignore_user_abort( true );
+
+        dinoco_do_full_sync( $data, 'shutdown' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// WP-CRON BACKUP
+// ══════════════════════════════════════════════════════════════
+add_action( 'dinoco_github_sync_process', 'dinoco_github_sync_process_job' );
+if ( ! function_exists( 'dinoco_github_sync_process_job' ) ) {
+    function dinoco_github_sync_process_job( $job_id ) {
+        @set_time_limit( 300 );
+        $data = get_transient( $job_id );
+        if ( ! $data ) return;
+        delete_transient( $job_id );
+        dinoco_do_full_sync( $data, 'cron' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// SHARED SYNC LOGIC
+// Match: [Admin System] * and [System] * prefixed files
+// ══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'dinoco_do_full_sync' ) ) {
+    function dinoco_do_full_sync( $data, $trigger = 'unknown' ) {
+        // Execution lock
+        $lock = get_transient( 'dinoco_sync_running' );
+        if ( $lock ) {
+            update_option( 'dinoco_last_sync_result', array(
+                'time'    => current_time( 'mysql' ),
+                'trigger' => $trigger,
+                'message' => 'skipped_already_running (locked by: ' . $lock . ')',
+            ) );
+            return;
+        }
+        set_transient( 'dinoco_sync_running', $trigger, 300 );
+
+        try {
+            // Collect modified files from commits
+            $modified_files = array();
+            if ( ! empty( $data['commits'] ) ) {
+                foreach ( $data['commits'] as $commit ) {
+                    if ( ! empty( $commit['modified'] ) ) {
+                        $modified_files = array_merge( $modified_files, $commit['modified'] );
+                    }
+                    if ( ! empty( $commit['added'] ) ) {
+                        $modified_files = array_merge( $modified_files, $commit['added'] );
+                    }
+                }
+            }
+            if ( ! empty( $data['head_commit'] ) ) {
+                if ( ! empty( $data['head_commit']['modified'] ) ) {
+                    $modified_files = array_merge( $modified_files, $data['head_commit']['modified'] );
+                }
+                if ( ! empty( $data['head_commit']['added'] ) ) {
+                    $modified_files = array_merge( $modified_files, $data['head_commit']['added'] );
+                }
+            }
+
+            // V.22.0: Detect merge commits — force full sync
+            $head_msg = ! empty( $data['head_commit']['message'] ) ? $data['head_commit']['message'] : '';
+            $is_merge = preg_match( '/^Merge (pull request|branch)\b/', $head_msg );
+            if ( $is_merge ) {
+                dinoco_sync_log( 'Merge commit detected: ' . substr( $head_msg, 0, 80 ) . ' — force full sync' );
+            }
+
+            // Check if any DINOCO snippet files changed
+            $has_snippet = (bool) $is_merge;
+            foreach ( $modified_files as $f ) {
+                if ( strpos( $f, '[Admin System]' ) === 0 || strpos( $f, '[System]' ) === 0 || strpos( $f, '[AdminSystem-System]' ) === 0 || strpos( $f, '[B2B]' ) === 0 ) {
+                    $has_snippet = true;
+                    break;
+                }
+            }
+
+            // Compare API fallback
+            if ( ! $has_snippet && ! empty( $data['before'] ) && ! empty( $data['after'] ) ) {
+                $token = defined( 'DINOCO_GITHUB_TOKEN' ) ? DINOCO_GITHUB_TOKEN : '';
+                if ( ! empty( $token ) ) {
+                    $compare_url = sprintf(
+                        'https://api.github.com/repos/%s/compare/%s...%s',
+                        $data['repository']['full_name'], $data['before'], $data['after']
+                    );
+                    $cmp_resp = wp_remote_get( $compare_url, array(
+                        'headers' => array(
+                            'Accept'        => 'application/vnd.github.v3+json',
+                            'Authorization' => 'Bearer ' . $token,
+                            'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                        ),
+                        'timeout' => 15,
+                    ) );
+                    if ( ! is_wp_error( $cmp_resp ) && wp_remote_retrieve_response_code( $cmp_resp ) === 200 ) {
+                        $cmp_data = json_decode( wp_remote_retrieve_body( $cmp_resp ), true );
+                        if ( ! empty( $cmp_data['files'] ) ) {
+                            foreach ( $cmp_data['files'] as $cf ) {
+                                if ( ! empty( $cf['filename'] ) && ( strpos( $cf['filename'], '[Admin System]' ) === 0 || strpos( $cf['filename'], '[System]' ) === 0 || strpos( $cf['filename'], '[AdminSystem-System]' ) === 0 || strpos( $cf['filename'], '[B2B]' ) === 0 ) ) {
+                                    $has_snippet = true;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        // V.22.0: Compare API failed — fallback to full sync instead of silently skipping
+                        $cmp_err = is_wp_error( $cmp_resp ) ? $cmp_resp->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $cmp_resp );
+                        dinoco_sync_log( 'Compare API failed: ' . $cmp_err . ' — fallback to full sync' );
+                        $has_snippet = true;
+                    }
+                }
+            }
+
+            if ( ! $has_snippet ) {
+                delete_transient( 'dinoco_sync_running' );
+                update_option( 'dinoco_last_sync_result', array(
+                    'time'    => current_time( 'mysql' ),
+                    'trigger' => $trigger,
+                    'message' => 'no_snippet_files_changed',
+                    'files'   => array_values( array_unique( $modified_files ) ),
+                ) );
+                return;
+            }
+
+            // Sync snippets using commit SHA (bypass CDN cache)
+            $repo       = $data['repository']['full_name'];
+            $branch     = str_replace( 'refs/heads/', '', $data['ref'] );
+            $commit_sha = ! empty( $data['after'] ) ? $data['after'] : $branch;
+            $token      = defined( 'DINOCO_GITHUB_TOKEN' ) ? DINOCO_GITHUB_TOKEN : '';
+
+            if ( empty( $token ) ) {
+                delete_transient( 'dinoco_sync_running' );
+                update_option( 'dinoco_last_sync_result', array(
+                    'time'    => current_time( 'mysql' ),
+                    'trigger' => $trigger,
+                    'error'   => 'github_token_not_configured',
+                ) );
+                return;
+            }
+
+            global $wpdb;
+            $table   = $wpdb->prefix . 'snippets';
+            $updated = array();
+            $errors  = array();
+
+            // Load active DB rows matching [Admin System] or [System] or [AdminSystem-System] prefix
+            $all_db_rows = $wpdb->get_results(
+                "SELECT id, name, active, revision FROM {$table} WHERE active = 1 AND (name LIKE '[Admin System]%' OR name LIKE '[System]%' OR name LIKE '[AdminSystem-System]%' OR name LIKE '[B2B]%') ORDER BY id ASC"
+            );
+
+            $db_by_name = array();
+            foreach ( $all_db_rows as $dbr ) {
+                $normalized = dinoco_normalize_snippet_name( $dbr->name );
+                if ( ! isset( $db_by_name[ $normalized ] ) ) {
+                    $db_by_name[ $normalized ] = $dbr;
+                }
+            }
+
+            // Build file list from commits + DB
+            $snippet_files = array();
+            foreach ( $modified_files as $f ) {
+                if ( strpos( $f, '[Admin System]' ) === 0 || strpos( $f, '[System]' ) === 0 || strpos( $f, '[AdminSystem-System]' ) === 0 || strpos( $f, '[B2B]' ) === 0 ) {
+                    $snippet_files[ $f ] = $f;
+                }
+            }
+
+            // Full sync: add DB snippets not in commits
+            foreach ( $db_by_name as $name => $dbr ) {
+                if ( ! isset( $snippet_files[ $name ] ) ) {
+                    $snippet_files[ $name ] = $name;
+                }
+            }
+
+            // V.22.0: Batched sync — process 5 snippets at a time with 1s pause
+            // Prevents server overload when syncing 30+ snippets simultaneously
+            $batch_count = 0;
+            $batch_size  = 5;
+            $mem_limit   = ini_get( 'memory_limit' );
+            $mem_bytes   = wp_convert_hr_to_bytes( $mem_limit );
+
+            foreach ( $snippet_files as $file_name ) {
+                // Memory guard: stop if using >80% of PHP memory limit
+                if ( $mem_bytes > 0 && memory_get_usage( true ) > $mem_bytes * 0.8 ) {
+                    dinoco_sync_log( 'MEMORY GUARD: usage=' . round( memory_get_usage( true ) / 1048576, 1 ) . 'MB limit=' . $mem_limit . ' — stopping batch' );
+                    $errors[] = 'memory_guard_stopped_at_' . $batch_count . '_of_' . count( $snippet_files );
+                    break;
+                }
+
+                // Pause between batches to reduce server load
+                if ( $batch_count > 0 && $batch_count % $batch_size === 0 ) {
+                    sleep( 1 );
+                }
+                $batch_count++;
+
+                // Primary: raw.githubusercontent.com with commit SHA
+                $raw_url = sprintf(
+                    'https://raw.githubusercontent.com/%s/%s/%s',
+                    $repo,
+                    rawurlencode( $commit_sha ),
+                    rawurlencode( $file_name )
+                );
+                $raw_resp = wp_remote_get( $raw_url, array(
+                    'headers' => array(
+                        'Authorization' => 'token ' . $token,
+                        'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                    ),
+                    'timeout' => 30,
+                ) );
+
+                // Fallback: GitHub Contents API
+                if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
+                    $content_url = sprintf(
+                        'https://api.github.com/repos/%s/contents/%s?ref=%s',
+                        $repo,
+                        rawurlencode( $file_name ),
+                        rawurlencode( $commit_sha )
+                    );
+                    $raw_resp = wp_remote_get( $content_url, array(
+                        'headers' => array(
+                            'Accept'        => 'application/vnd.github.v3.raw',
+                            'Authorization' => 'Bearer ' . $token,
+                            'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                        ),
+                        'timeout' => 30,
+                    ) );
+                }
+
+                if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
+                    $err_msg = is_wp_error( $raw_resp ) ? $raw_resp->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $raw_resp );
+                    $errors[] = $file_name . ': ' . $err_msg;
+                    continue;
+                }
+
+                $code = wp_remote_retrieve_body( $raw_resp );
+
+                // V.21: Safety — verify fetched code belongs to this snippet
+                // Prevents code swap when CDN/cache returns wrong file
+                $code_head = substr( $code, 0, 600 );
+                // Extract snippet name from code header (e.g. "Snippet 9:" or "GitHub Webhook Sync")
+                $name_parts = explode( ']', explode( '[', $file_name, 2 )[1] ?? '', 2 );
+                $prefix_tag = isset( $name_parts[0] ) ? '[' . $name_parts[0] . ']' : '';
+                $name_after_prefix = trim( substr( $file_name, strlen( $prefix_tag ) ) );
+                // Check: code header must mention the snippet name (after prefix)
+                if ( ! empty( $name_after_prefix ) && strlen( $code ) > 100 && strpos( $code_head, $name_after_prefix ) === false ) {
+                    dinoco_sync_log( 'CONTENT MISMATCH: file=' . $file_name . ' but code header does not contain "' . $name_after_prefix . '" — SKIPPED to prevent swap' );
+                    $errors[] = $file_name . ': content_mismatch_prevented_swap';
+                    continue;
+                }
+
+                // Match by normalized name
+                $row = isset( $db_by_name[ $file_name ] ) ? $db_by_name[ $file_name ] : null;
+
+                if ( $row ) {
+                    $sync_result = dinoco_sync_update_snippet( $row, $code, $file_name );
+                    if ( $sync_result['ok'] ) {
+                        $updated[] = $file_name . ' (db:' . $row->name . ')';
+                    } else {
+                        $errors[] = $file_name . ': ' . $sync_result['message'];
+                    }
+                } else {
+                    $errors[] = $file_name . ': snippet_not_found_in_db';
+                }
+            }
+
+            // Global cache flush after ALL snippets updated
+            wp_cache_flush();
+            if ( function_exists( 'opcache_reset' ) ) {
+                @opcache_reset();
+            }
+            if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+                wpfc_clear_all_cache( true );
+            }
+
+            $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
+            $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
+
+            // Save result
+            $db_names = array();
+            foreach ( $db_by_name as $name => $dbr ) {
+                $db_names[] = $name;
+            }
+
+            update_option( 'dinoco_last_sync_result', array(
+                'time'           => current_time( 'mysql' ),
+                'trigger'        => $trigger,
+                'branch'         => $branch,
+                'commit_sha'     => $commit_sha,
+                'mode'           => 'full_sync_v22',
+                'files_synced'   => array_values( $snippet_files ),
+                'db_names'       => $db_names,
+                'updated'        => $updated,
+                'errors'         => $errors,
+            ) );
+
+        } finally {
+            delete_transient( 'dinoco_sync_running' );
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// MANUAL SYNC: POST /wp-json/dinoco/v1/github-sync-manual
+// ══════════════════════════════════════════════════════════════
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'dinoco/v1', '/github-sync-manual', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_github_sync_manual',
+        'permission_callback' => function () {
+            return current_user_can( 'manage_options' );
+        },
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_github_sync_manual' ) ) {
+    function dinoco_github_sync_manual( WP_REST_Request $req ) {
+        $token = defined( 'DINOCO_GITHUB_TOKEN' ) ? DINOCO_GITHUB_TOKEN : '';
+        $repo  = defined( 'DINOCO_GITHUB_REPO' )  ? DINOCO_GITHUB_REPO  : '';
+
+        if ( empty( $token ) || empty( $repo ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'missing_config: DINOCO_GITHUB_TOKEN or DINOCO_GITHUB_REPO' ), 500 );
+        }
+
+        $branch = $req->get_param( 'branch' ) ?: 'main';
+
+        global $wpdb;
+        $table   = $wpdb->prefix . 'snippets';
+        $updated = array();
+        $errors  = array();
+
+        // Load active DB rows
+        $all_db_rows = $wpdb->get_results(
+            "SELECT id, name, active, revision FROM {$table} WHERE active = 1 AND (name LIKE '[Admin System]%' OR name LIKE '[System]%' OR name LIKE '[AdminSystem-System]%' OR name LIKE '[B2B]%') ORDER BY id ASC"
+        );
+
+        $db_by_name = array();
+        foreach ( $all_db_rows as $dbr ) {
+            $normalized = dinoco_normalize_snippet_name( $dbr->name );
+            if ( ! isset( $db_by_name[ $normalized ] ) ) {
+                $db_by_name[ $normalized ] = $dbr;
+            }
+        }
+
+        foreach ( $db_by_name as $file_name => $row ) {
+            // Primary: raw.githubusercontent.com
+            $raw_url = sprintf(
+                'https://raw.githubusercontent.com/%s/%s/%s',
+                $repo,
+                rawurlencode( $branch ),
+                rawurlencode( $file_name )
+            );
+            $raw_response = wp_remote_get( $raw_url, array(
+                'headers' => array(
+                    'Authorization' => 'token ' . $token,
+                    'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                ),
+                'timeout' => 30,
+            ) );
+
+            // Fallback: GitHub Contents API
+            if ( is_wp_error( $raw_response ) || wp_remote_retrieve_response_code( $raw_response ) !== 200 ) {
+                $content_url = sprintf(
+                    'https://api.github.com/repos/%s/contents/%s?ref=%s',
+                    $repo,
+                    rawurlencode( $file_name ),
+                    rawurlencode( $branch )
+                );
+                $raw_response = wp_remote_get( $content_url, array(
+                    'headers' => array(
+                        'Accept'        => 'application/vnd.github.v3.raw',
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                    ),
+                    'timeout' => 30,
+                ) );
+            }
+
+            if ( is_wp_error( $raw_response ) || wp_remote_retrieve_response_code( $raw_response ) !== 200 ) {
+                $err_msg = is_wp_error( $raw_response ) ? $raw_response->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $raw_response );
+                $errors[] = $file_name . ': ' . $err_msg;
+                continue;
+            }
+
+            $code = wp_remote_retrieve_body( $raw_response );
+
+            // V.21: Safety — verify fetched code belongs to this snippet
+            $code_head = substr( $code, 0, 600 );
+            $name_parts = explode( ']', explode( '[', $file_name, 2 )[1] ?? '', 2 );
+            $prefix_tag = isset( $name_parts[0] ) ? '[' . $name_parts[0] . ']' : '';
+            $name_after_prefix = trim( substr( $file_name, strlen( $prefix_tag ) ) );
+            if ( ! empty( $name_after_prefix ) && strlen( $code ) > 100 && strpos( $code_head, $name_after_prefix ) === false ) {
+                dinoco_sync_log( 'CONTENT MISMATCH (manual): file=' . $file_name . ' — SKIPPED' );
+                $errors[] = $file_name . ': content_mismatch_prevented_swap';
+                continue;
+            }
+
+            $sync_result = dinoco_sync_update_snippet( $row, $code, $file_name );
+            if ( $sync_result['ok'] ) {
+                $updated[] = $file_name;
+            } else {
+                $errors[] = $file_name . ': ' . $sync_result['message'];
+            }
+        }
+
+        // Global cache flush
+        wp_cache_flush();
+        if ( function_exists( 'opcache_reset' ) ) {
+            @opcache_reset();
+        }
+        if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+            wpfc_clear_all_cache( true );
+        }
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
+
+        return new WP_REST_Response( array(
+            'ok'      => true,
+            'updated' => $updated,
+            'errors'  => $errors,
+            'branch'  => $branch,
+        ), 200 );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// DEBUG: GET /wp-json/dinoco/v1/sync-status
+// ══════════════════════════════════════════════════════════════
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'dinoco/v1', '/sync-status', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_github_sync_status',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_github_sync_status' ) ) {
+    function dinoco_github_sync_status() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'snippets';
+
+        $rows = $wpdb->get_results(
+            "SELECT id, name, active, modified, revision, SUBSTRING(code, 1, 500) AS code_head FROM {$table} WHERE active = 1 AND (name LIKE '[Admin System]%' OR name LIKE '[System]%' OR name LIKE '[AdminSystem-System]%' OR name LIKE '[B2B]%') ORDER BY name"
+        );
+
+        $snippets = array();
+        foreach ( $rows as $r ) {
+            $php_ver = '';
+            if ( ! empty( $r->code_head ) && preg_match( '/Version:\s*(V?\.?[\d]+[\d.]*(?:\s*\(.*?\))?)/', $r->code_head, $vm ) ) {
+                $php_ver = trim( $vm[1] );
+            }
+            $snippets[] = array(
+                'id'       => $r->id,
+                'name'     => dinoco_normalize_snippet_name( $r->name ),
+                'raw_name' => $r->name,
+                'version'  => $php_ver,
+                'modified' => $r->modified,
+                'revision' => $r->revision,
+            );
+        }
+
+        return new WP_REST_Response( array(
+            'last_sync' => get_option( 'dinoco_last_sync_result', null ),
+            'snippets'  => $snippets,
+        ), 200 );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// SHORTCODE: [dinoco_sync_dashboard]
+// Admin-only debug dashboard
+// ══════════════════════════════════════════════════════════════
+add_shortcode( 'dinoco_sync_dashboard', 'dinoco_render_sync_dashboard' );
+
+if ( ! function_exists( 'dinoco_render_sync_dashboard' ) ) {
+function dinoco_render_sync_dashboard() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return '<div style="padding:60px;text-align:center;color:#ef4444;font-size:18px">ไม่มีสิทธิ์เข้าถึง</div>';
+    }
+
+    // Data
+    $last   = get_option( 'dinoco_last_sync_result', array() );
+    $lock   = get_transient( 'dinoco_sync_running' );
+    $nonce  = wp_create_nonce( 'wp_rest' );
+    $rest   = esc_url( rest_url( 'dinoco/v1/' ) );
+    $wh_url = esc_url( rest_url( 'dinoco/v1/github-sync' ) );
+
+    $has_secret = defined( 'DINOCO_GITHUB_WEBHOOK_SECRET' ) && DINOCO_GITHUB_WEBHOOK_SECRET !== '';
+    $has_token  = defined( 'DINOCO_GITHUB_TOKEN' ) && DINOCO_GITHUB_TOKEN !== '';
+    $has_repo   = defined( 'DINOCO_GITHUB_REPO' ) && DINOCO_GITHUB_REPO !== '';
+    $repo_val   = $has_repo ? DINOCO_GITHUB_REPO : '';
+    $token_mask = $has_token ? substr( DINOCO_GITHUB_TOKEN, 0, 4 ) . '****' : '';
+
+    // Relative time
+    $ago = '—';
+    if ( ! empty( $last['time'] ) ) {
+        $diff = time() - strtotime( get_gmt_from_date( $last['time'] ) );
+        if ( $diff < 60 )        $ago = $diff . ' วินาทีที่แล้ว';
+        elseif ( $diff < 3600 )  $ago = floor( $diff / 60 ) . ' นาทีที่แล้ว';
+        elseif ( $diff < 86400 ) $ago = floor( $diff / 3600 ) . ' ชั่วโมงที่แล้ว';
+        else                     $ago = floor( $diff / 86400 ) . ' วันที่แล้ว';
+    }
+
+    $trigger    = ! empty( $last['trigger'] )      ? $last['trigger']      : '—';
+    $branch     = ! empty( $last['branch'] )       ? $last['branch']       : '—';
+    $commit_sha = ! empty( $last['commit_sha'] )   ? $last['commit_sha']   : '';
+    $mode       = ! empty( $last['mode'] )         ? $last['mode']         : '—';
+    $updated    = ! empty( $last['updated'] )      ? $last['updated']      : array();
+    $errors     = ! empty( $last['errors'] )       ? $last['errors']       : array();
+    $synced     = ! empty( $last['files_synced'] ) ? $last['files_synced'] : array();
+    $msg        = ! empty( $last['message'] )      ? $last['message']      : '';
+
+    // Snippets from DB
+    global $wpdb;
+    $table = $wpdb->prefix . 'snippets';
+    $rows  = $wpdb->get_results(
+        "SELECT id, name, active, modified, revision, SUBSTRING(code, 1, 500) AS code_head FROM {$table} WHERE active = 1 AND (name LIKE '[Admin System]%' OR name LIKE '[System]%' OR name LIKE '[AdminSystem-System]%' OR name LIKE '[B2B]%') ORDER BY id ASC"
+    );
+
+    // Dashboard version
+    $dashboard_ver = 'V.20.0';
+    foreach ( $rows as $r ) {
+        if ( strpos( $r->name, 'GitHub Webhook Sync' ) !== false && ! empty( $r->code_head ) && preg_match( '/Version:\s*(V?\.?[\d]+[\d.]*(?:\s*[—\-]+\s*.+?)?)/', $r->code_head, $dvm ) ) {
+            $dashboard_ver = $dvm[1];
+            break;
+        }
+    }
+
+    ob_start();
+?>
+<style>
+.sd{font-family:'Noto Sans Thai',-apple-system,system-ui,sans-serif;font-size:14px;color:#101828;max-width:960px;margin:0 auto}
+.sd *{box-sizing:border-box;margin:0}
+.sd-hd{background:linear-gradient(135deg,#0f2447,#1e3a5f);border-radius:12px 12px 0 0;padding:22px 28px;display:flex;align-items:center;justify-content:space-between}
+.sd-hd h1{font-size:17px;font-weight:700;color:#fff;letter-spacing:-.01em}.sd-hd .ver{background:rgba(255,255,255,.12);color:#94a3b8;font-size:11px;font-weight:600;padding:3px 10px;border-radius:16px}
+.sd-bd{background:#fff;border:1px solid #e4e7ec;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px}
+.sd-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin-bottom:22px}
+.sd-c{background:#f8f9fb;border:1px solid #e4e7ec;border-radius:10px;padding:14px 16px}.sd-c:hover{border-color:#2563eb;box-shadow:0 1px 4px rgba(37,99,235,.08)}
+.sd-cl{font-size:11px;color:#667085;font-weight:500;margin-bottom:4px}.sd-cv{font-size:20px;font-weight:700;letter-spacing:-.02em}
+.sd-cv.ok{color:#12b76a}.sd-cv.err{color:#f04438}.sd-cv.lock{color:#f79009}
+.sd-sec{margin-bottom:22px}.sd-sec h3{font-size:14px;font-weight:700;color:#344054;margin-bottom:10px}
+.sd-cfg{display:grid;gap:8px}.sd-cfg-row{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#f8f9fb;border-radius:8px;font-size:13px}
+.sd-cfg-row .k{font-weight:600;color:#344054;min-width:200px}.sd-cfg-row .v{color:#667085;word-break:break-all}
+.sd-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}.sd-dot-ok{background:#12b76a}.sd-dot-no{background:#f04438}
+.sd-tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.sd-tbl th{text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#667085;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid #e4e7ec;background:#f8f9fb;position:sticky;top:0}
+.sd-tbl td{padding:10px;border-bottom:1px solid #f2f4f7;vertical-align:middle}.sd-tbl tbody tr:last-child td{border-bottom:none}
+.sd-tbl-wrap{border:1px solid #e4e7ec;border-radius:10px;overflow:hidden;max-height:500px;overflow-y:auto}
+.sd-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:16px;font-size:11px;font-weight:600}
+.sd-badge-ok{background:#ecfdf3;color:#027a48}.sd-badge-err{background:#fef3f2;color:#b42318}.sd-badge-neutral{background:#f2f4f7;color:#667085}
+.sd-details{background:#f8f9fb;border:1px solid #e4e7ec;border-radius:10px;padding:14px 18px;font-size:12px;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;word-break:break-all;max-height:260px;overflow-y:auto;color:#344054;line-height:1.6}
+.sd-details a{color:#2563eb;text-decoration:none}.sd-details a:hover{text-decoration:underline}
+.sd-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.sd-btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;border:1px solid #e4e7ec;background:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;color:#344054}
+.sd-btn:hover{background:#f8f9fb}.sd-btn:active{transform:scale(.97)}
+.sd-btn-primary{background:#2563eb;color:#fff;border-color:#2563eb}.sd-btn-primary:hover{background:#1d4ed8}
+.sd-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.sd-copy{font-size:12px;color:#667085;background:#f8f9fb;border:1px solid #e4e7ec;border-radius:8px;padding:6px 12px;cursor:pointer;font-family:'JetBrains Mono',monospace;word-break:break-all;display:flex;align-items:center;gap:8px}
+.sd-copy:hover{border-color:#2563eb;color:#2563eb}
+.sd-msg{margin-top:10px;padding:10px 14px;border-radius:8px;font-size:13px;display:none}
+.sd-msg.ok{display:block;background:#ecfdf3;color:#027a48;border:1px solid #a6f4c5}
+.sd-msg.err{display:block;background:#fef3f2;color:#b42318;border:1px solid #fecdca}
+.sd-spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sd-spin .6s linear infinite}
+@keyframes sd-spin{to{transform:rotate(360deg)}}
+@media(max-width:600px){.sd-bd{padding:16px}.sd-cards{grid-template-columns:1fr 1fr}.sd-cfg-row{flex-direction:column;align-items:flex-start;gap:2px}.sd-cfg-row .k{min-width:0}}
+</style>
+<div class="sd">
+<div class="sd-hd">
+    <h1>DINOCO Sync Dashboard</h1>
+    <span class="ver"><?php echo esc_html( $dashboard_ver ); ?></span>
+</div>
+<div class="sd-bd">
+<!-- Status Cards -->
+<div class="sd-cards">
+    <div class="sd-c"><div class="sd-cl">Last Sync</div><div class="sd-cv"><?php echo esc_html( $ago ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Trigger</div><div class="sd-cv"><?php echo esc_html( $trigger ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Branch</div><div class="sd-cv"><?php echo esc_html( $branch ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Updated</div><div class="sd-cv ok"><?php echo count( $updated ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Errors</div><div class="sd-cv <?php echo count( $errors ) > 0 ? 'err' : 'ok'; ?>"><?php echo count( $errors ); ?></div></div>
+    <?php if ( $lock ) : ?>
+    <div class="sd-c"><div class="sd-cl">Status</div><div class="sd-cv lock">Syncing...</div></div>
+    <?php endif; ?>
+</div>
+<?php if ( $msg ) : ?>
+<div style="margin-bottom:18px;padding:10px 14px;background:#fffaeb;border:1px solid #fedf89;border-radius:8px;font-size:13px;color:#b54708">
+    <?php echo esc_html( $msg ); ?>
+</div>
+<?php endif; ?>
+<!-- Config Check -->
+<div class="sd-sec">
+    <h3>Config</h3>
+    <div class="sd-cfg">
+        <div class="sd-cfg-row">
+            <span class="sd-dot <?php echo $has_secret ? 'sd-dot-ok' : 'sd-dot-no'; ?>"></span>
+            <span class="k">DINOCO_GITHUB_WEBHOOK_SECRET</span>
+            <span class="v"><?php echo $has_secret ? 'Set' : 'Not set'; ?></span>
+        </div>
+        <div class="sd-cfg-row">
+            <span class="sd-dot <?php echo $has_token ? 'sd-dot-ok' : 'sd-dot-no'; ?>"></span>
+            <span class="k">DINOCO_GITHUB_TOKEN</span>
+            <span class="v"><?php echo $has_token ? esc_html( $token_mask ) : 'Not set'; ?></span>
+        </div>
+        <div class="sd-cfg-row">
+            <span class="sd-dot <?php echo $has_repo ? 'sd-dot-ok' : 'sd-dot-no'; ?>"></span>
+            <span class="k">DINOCO_GITHUB_REPO</span>
+            <span class="v"><?php echo $has_repo ? esc_html( $repo_val ) : 'Not set'; ?></span>
+        </div>
+        <div class="sd-cfg-row">
+            <span class="k">Webhook URL</span>
+            <span class="sd-copy" id="sd-wh-url" onclick="navigator.clipboard.writeText('<?php echo esc_js( $wh_url ); ?>').then(function(){document.getElementById('sd-wh-url').querySelector('.cp-txt').textContent='Copied!'})">
+                <?php echo esc_html( $wh_url ); ?> <span class="cp-txt" style="color:#2563eb;white-space:nowrap">Copy</span>
+            </span>
+        </div>
+    </div>
+</div>
+<!-- Snippet Table -->
+<div class="sd-sec">
+    <h3>Snippets (<?php echo count( $rows ); ?> active)</h3>
+    <div class="sd-tbl-wrap">
+        <table class="sd-tbl">
+            <thead><tr><th>Name</th><th>Version</th><th>DB ID</th><th>Rev</th><th>Modified</th><th>Last Sync</th></tr></thead>
+            <tbody>
+            <?php foreach ( $rows as $r ) :
+                $name = dinoco_normalize_snippet_name( $r->name );
+                $php_ver = '—';
+                if ( ! empty( $r->code_head ) && preg_match( '/Version:\s*(V?\.?[\d]+[\d.]*(?:\s*\(.*?\))?)/u', $r->code_head, $vm ) ) {
+                    $php_ver = trim( $vm[1] );
+                }
+                $status_html = '<span class="sd-badge sd-badge-neutral">—</span>';
+                foreach ( $updated as $u ) {
+                    if ( strpos( $u, $name ) !== false ) {
+                        $status_html = '<span class="sd-badge sd-badge-ok">Synced</span>';
+                        break;
+                    }
+                }
+                foreach ( $errors as $e ) {
+                    if ( strpos( $e, $name ) !== false ) {
+                        $status_html = '<span class="sd-badge sd-badge-err">Error</span>';
+                        break;
+                    }
+                }
+            ?>
+            <tr>
+                <td><?php echo esc_html( $name ); ?></td>
+                <td style="font-family:monospace;font-size:11px;font-weight:600;color:#2563eb"><?php echo esc_html( $php_ver ); ?></td>
+                <td style="color:#667085"><?php echo esc_html( $r->id ); ?></td>
+                <td style="font-family:monospace;font-size:12px"><?php echo esc_html( $r->revision ); ?></td>
+                <td style="font-size:12px;color:#667085"><?php echo esc_html( $r->modified ); ?></td>
+                <td><?php echo $status_html; ?></td>
+            </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+<!-- Last Sync Details -->
+<?php if ( $commit_sha || $synced || $errors ) : ?>
+<div class="sd-sec">
+    <h3>Last Sync Details</h3>
+    <div class="sd-details"><?php
+        $lines = array();
+        if ( ! empty( $last['time'] ) ) $lines[] = 'Time:   ' . $last['time'];
+        $lines[] = 'Mode:   ' . $mode;
+        if ( $commit_sha ) {
+            $sha7  = substr( $commit_sha, 0, 7 );
+            $ghurl = $has_repo ? 'https://github.com/' . $repo_val . '/commit/' . $commit_sha : '';
+            $lines[] = 'Commit: ' . ( $ghurl ? '<a href="' . esc_url( $ghurl ) . '" target="_blank">' . esc_html( $sha7 ) . '</a>' : esc_html( $sha7 ) );
+        }
+        if ( $synced ) {
+            $lines[] = "\nFiles Synced (" . count( $synced ) . '):';
+            foreach ( $synced as $i => $f ) $lines[] = '  ' . ( $i + 1 ) . '. ' . esc_html( $f );
+        }
+        if ( $updated ) {
+            $lines[] = "\nUpdated (" . count( $updated ) . '):';
+            foreach ( $updated as $i => $u ) $lines[] = '  ' . ( $i + 1 ) . '. ' . esc_html( $u );
+        }
+        if ( $errors ) {
+            $lines[] = "\nErrors (" . count( $errors ) . '):';
+            foreach ( $errors as $i => $e ) $lines[] = '  ' . ( $i + 1 ) . '. ' . esc_html( $e );
+        }
+        echo implode( "\n", $lines );
+    ?></div>
+</div>
+<?php endif; ?>
+<!-- Actions -->
+<div class="sd-sec">
+    <h3>Actions</h3>
+    <div class="sd-actions">
+        <button class="sd-btn sd-btn-primary" id="sd-sync-btn" onclick="sdDoSync()">Sync Now</button>
+        <button class="sd-btn" onclick="location.reload()">Refresh</button>
+    </div>
+    <div class="sd-msg" id="sd-msg"></div>
+</div>
+</div>
+</div>
+<script>
+function sdDoSync(){
+    var btn=document.getElementById('sd-sync-btn'),msg=document.getElementById('sd-msg');
+    btn.disabled=true;btn.innerHTML='<span class="sd-spin"></span> Syncing...';
+    msg.className='sd-msg';msg.style.display='none';
+    fetch('<?php echo esc_js( $rest ); ?>github-sync-manual',{
+        method:'POST',
+        headers:{'X-WP-Nonce':'<?php echo esc_js( $nonce ); ?>','Content-Type':'application/json'},
+        credentials:'same-origin'
+    })
+    .then(function(r){return r.json().then(function(d){return{ok:r.ok,data:d}})})
+    .then(function(res){
+        btn.disabled=false;btn.textContent='Sync Now';
+        if(res.ok&&res.data.ok){
+            msg.className='sd-msg ok';msg.textContent='Sync complete! Updated: '+(res.data.updated||[]).length+' snippet(s)'+(res.data.errors&&res.data.errors.length?' | Errors: '+res.data.errors.length:'');
+        }else{
+            msg.className='sd-msg err';msg.textContent='Sync failed: '+(res.data.error||res.data.message||'Unknown error');
+        }
+        msg.style.display='block';
+        setTimeout(function(){location.reload()},2000);
+    })
+    .catch(function(e){
+        btn.disabled=false;btn.textContent='Sync Now';
+        msg.className='sd-msg err';msg.textContent='Network error: '+e.message;msg.style.display='block';
+    });
+}
+</script>
+<?php
+    return ob_get_clean();
+}
+} // end function_exists guard
