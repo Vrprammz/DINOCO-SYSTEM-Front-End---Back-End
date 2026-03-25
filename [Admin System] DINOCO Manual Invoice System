@@ -2,7 +2,7 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
- * Version: V.1.3
+ * Version: V.1.4
  * Dependencies: b2b_order CPT, distributor CPT, b2b_product CPT, ACF
  */
 
@@ -117,6 +117,20 @@ function dinoco_inv_generate_number() {
     } while (!empty($collision) && $max_attempts > 0);
 
     return $candidate;
+}
+
+// Safe date → Unix timestamp: handles both Y-m-d (ISO) and d/m/Y (ACF display format)
+function _dinoco_inv_parse_date($date_str) {
+    if (empty($date_str) || $date_str === '0000-00-00') return false;
+    $ts = strtotime($date_str);
+    if ($ts && $ts > 86400) return $ts;
+    // Fallback: d/m/Y format from ACF
+    $parts = explode('/', $date_str);
+    if (count($parts) === 3) {
+        $ts = mktime(0, 0, 0, intval($parts[1]), intval($parts[0]), intval($parts[2]));
+        return ($ts && $ts > 86400) ? $ts : false;
+    }
+    return false;
 }
 
 function dinoco_inv_get_settings() {
@@ -337,7 +351,7 @@ function dinoco_inv_reverse_debt($post_id) {
     if (get_post_meta($post_id, '_order_source', true) !== 'manual_invoice') return;
     if (!get_field('is_billed', $post_id)) return;
     $dist_id = intval(get_post_meta($post_id, '_dist_post_id', true));
-    if (!$dist_id) return;
+    if (!$dist_id || get_post_type($dist_id) !== 'distributor') return;
     $total = floatval(get_field('total_amount', $post_id));
     if ($total <= 0) return;
     if (function_exists('b2b_recalculate_debt')) {
@@ -471,15 +485,16 @@ function _dinoco_inv_query_awaiting() {
 // Build dunning LINE push message
 function _dinoco_inv_build_dunning_message($inv_number, $total, $due_date_str, $days_overdue = 0) {
     $settings = dinoco_inv_get_settings();
+    $due_ts_d = _dinoco_inv_parse_date($due_date_str);
     if ($days_overdue <= 0) {
-        $days_left = max(0, (int)ceil((strtotime($due_date_str) - time()) / 86400));
+        $days_left = $due_ts_d ? max(0, (int)ceil(($due_ts_d - time()) / 86400)) : 0;
         $icon = '📋'; $title = 'เตือนชำระเงิน'; $urgency = "ครบกำหนดใน {$days_left} วัน";
     } elseif ($days_overdue <= 7) {
         $icon = '⚠️'; $title = 'เบิกเลยกำหนด'; $urgency = "เลยกำหนด {$days_overdue} วัน";
     } else {
         $icon = '🔴'; $title = 'ค้างชำระเกิน 7 วัน'; $urgency = "เลยกำหนด {$days_overdue} วัน — กรุณาติดต่อเจ้าหน้าที่";
     }
-    $due_fmt = date('d/m', strtotime($due_date_str)) . '/' . (date('Y', strtotime($due_date_str)) + 543);
+    $due_fmt = $due_ts_d ? date('d/m', $due_ts_d) . '/' . (date('Y', $due_ts_d) + 543) : '-';
     $bank = ($settings['bank_name'] ?? '') . ' ' . ($settings['bank_account'] ?? '');
     $pp   = $settings['promptpay_id'] ?? '';
     $payment_line = trim("โอนผ่าน: {$bank}" . ($pp ? " | พร้อมเพย์ {$pp}" : ''));
@@ -502,8 +517,8 @@ function dinoco_inv_cron_reminder() {
         if ($status !== 'awaiting_payment') continue;
         $due = get_field('due_date', $id);
         if (!$due) continue;
-        $due_ts = strtotime($due);
-        if ($due_ts < $target_lo || $due_ts > $target_hi) continue;
+        $due_ts = _dinoco_inv_parse_date($due);
+        if (!$due_ts || $due_ts < $target_lo || $due_ts > $target_hi) continue;
         // Avoid duplicate send
         if (get_post_meta($id, '_dunning_reminder_3day_sent', true)) continue;
         $dist_id   = intval(get_post_meta($id, '_dist_post_id', true));
@@ -530,8 +545,9 @@ function dinoco_inv_cron_overdue() {
         $status = get_field('order_status', $id);
         if ($status !== 'awaiting_payment') continue;
         $due = get_field('due_date', $id);
-        if (!$due || strtotime($due) >= $now) continue;  // Not yet overdue
-        $days_overdue = (int)ceil(($now - strtotime($due)) / DAY_IN_SECONDS);
+        $due_ts = _dinoco_inv_parse_date($due);
+        if (!$due_ts || $due_ts >= $now) continue;  // Not yet overdue
+        $days_overdue = (int)ceil(($now - $due_ts) / DAY_IN_SECONDS);
         // Escalation tiers: day 1, day 7 — avoid resend within same tier
         $tier = $days_overdue >= 7 ? 'escalated' : 'day1';
         $sent_key = '_overdue_notice_sent_' . $tier;
@@ -577,7 +593,8 @@ function dinoco_inv_rest_send_overdue_notice(WP_REST_Request $req) {
     $dist_id  = intval(get_post_meta($id, '_dist_post_id', true));
     $group    = get_field('line_group_id', $dist_id);
     if (!$group) return new WP_Error('no_line', 'ตัวแทนไม่มี LINE group', ['status' => 422]);
-    $days_ov  = $due ? max(1, (int)ceil((time() - strtotime($due)) / DAY_IN_SECONDS)) : 1;
+    $due_ts   = _dinoco_inv_parse_date($due);
+    $days_ov  = $due_ts ? max(1, (int)ceil((time() - $due_ts) / DAY_IN_SECONDS)) : 1;
     $msgs = _dinoco_inv_build_dunning_message(get_post_meta($id, '_inv_number', true), $total, $due ?: '', $days_ov);
     b2b_line_push_raw($group, $msgs);
     // Reset overdue flags so cron can re-escalate
