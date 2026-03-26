@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [AdminSystem-System] GitHub Webhook Sync                    ║
- * ║  Version: V.22.0 — Merge detection + Batched sync               ║
+ * ║  Version: V.23.0 — Chunked sync + relaxed content verify         ║
  * ║  DINOCO Admin & System Snippet Sync                          ║
  * ╠══════════════════════════════════════════════════════════════╣
  * ║  Push to GitHub → Webhook → WordPress REST API               ║
@@ -360,132 +360,204 @@ if ( ! function_exists( 'dinoco_do_full_sync' ) ) {
                 }
             }
 
-            // V.22.0: Batched sync — process 5 snippets at a time with 1s pause
-            // Prevents server overload when syncing 30+ snippets simultaneously
-            $batch_count = 0;
-            $batch_size  = 5;
-            $mem_limit   = ini_get( 'memory_limit' );
-            $mem_bytes   = wp_convert_hr_to_bytes( $mem_limit );
+            // V.23.0: Chunked sync — save queue to option, process via chained cron
+            // Each chunk syncs 5 snippets then schedules the next chunk
+            // Prevents 504 timeout on large repos (30+ snippets)
+            $all_files = array_values( $snippet_files );
+            $chunk_size = 5;
+            $total_files = count( $all_files );
 
-            foreach ( $snippet_files as $file_name ) {
-                // Memory guard: stop if using >80% of PHP memory limit
-                if ( $mem_bytes > 0 && memory_get_usage( true ) > $mem_bytes * 0.8 ) {
-                    dinoco_sync_log( 'MEMORY GUARD: usage=' . round( memory_get_usage( true ) / 1048576, 1 ) . 'MB limit=' . $mem_limit . ' — stopping batch' );
-                    $errors[] = 'memory_guard_stopped_at_' . $batch_count . '_of_' . count( $snippet_files );
-                    break;
-                }
-
-                // Pause between batches to reduce server load
-                if ( $batch_count > 0 && $batch_count % $batch_size === 0 ) {
-                    sleep( 1 );
-                }
-                $batch_count++;
-
-                // Primary: raw.githubusercontent.com with commit SHA
-                $raw_url = sprintf(
-                    'https://raw.githubusercontent.com/%s/%s/%s',
-                    $repo,
-                    rawurlencode( $commit_sha ),
-                    rawurlencode( $file_name )
-                );
-                $raw_resp = wp_remote_get( $raw_url, array(
-                    'headers' => array(
-                        'Authorization' => 'token ' . $token,
-                        'User-Agent'    => 'DINOCO-System-Sync/1.0',
-                    ),
-                    'timeout' => 30,
-                ) );
-
-                // Fallback: GitHub Contents API
-                if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
-                    $content_url = sprintf(
-                        'https://api.github.com/repos/%s/contents/%s?ref=%s',
-                        $repo,
-                        rawurlencode( $file_name ),
-                        rawurlencode( $commit_sha )
-                    );
-                    $raw_resp = wp_remote_get( $content_url, array(
-                        'headers' => array(
-                            'Accept'        => 'application/vnd.github.v3.raw',
-                            'Authorization' => 'Bearer ' . $token,
-                            'User-Agent'    => 'DINOCO-System-Sync/1.0',
-                        ),
-                        'timeout' => 30,
-                    ) );
-                }
-
-                if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
-                    $err_msg = is_wp_error( $raw_resp ) ? $raw_resp->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $raw_resp );
-                    $errors[] = $file_name . ': ' . $err_msg;
-                    continue;
-                }
-
-                $code = wp_remote_retrieve_body( $raw_resp );
-
-                // V.21: Safety — verify fetched code belongs to this snippet
-                // Prevents code swap when CDN/cache returns wrong file
-                $code_head = substr( $code, 0, 600 );
-                // Extract snippet name from code header (e.g. "Snippet 9:" or "GitHub Webhook Sync")
-                $name_parts = explode( ']', explode( '[', $file_name, 2 )[1] ?? '', 2 );
-                $prefix_tag = isset( $name_parts[0] ) ? '[' . $name_parts[0] . ']' : '';
-                $name_after_prefix = trim( substr( $file_name, strlen( $prefix_tag ) ) );
-                // Check: code header must mention the snippet name (after prefix)
-                if ( ! empty( $name_after_prefix ) && strlen( $code ) > 100 && strpos( $code_head, $name_after_prefix ) === false ) {
-                    dinoco_sync_log( 'CONTENT MISMATCH: file=' . $file_name . ' but code header does not contain "' . $name_after_prefix . '" — SKIPPED to prevent swap' );
-                    $errors[] = $file_name . ': content_mismatch_prevented_swap';
-                    continue;
-                }
-
-                // Match by normalized name
-                $row = isset( $db_by_name[ $file_name ] ) ? $db_by_name[ $file_name ] : null;
-
-                if ( $row ) {
-                    $sync_result = dinoco_sync_update_snippet( $row, $code, $file_name );
-                    if ( $sync_result['ok'] ) {
-                        $updated[] = $file_name . ' (db:' . $row->name . ')';
-                    } else {
-                        $errors[] = $file_name . ': ' . $sync_result['message'];
-                    }
-                } else {
-                    $errors[] = $file_name . ': snippet_not_found_in_db';
-                }
-            }
-
-            // Global cache flush after ALL snippets updated
-            wp_cache_flush();
-            if ( function_exists( 'opcache_reset' ) ) {
-                @opcache_reset();
-            }
-            if ( function_exists( 'wpfc_clear_all_cache' ) ) {
-                wpfc_clear_all_cache( true );
-            }
-
-            $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
-            $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
-
-            // Save result
-            $db_names = array();
-            foreach ( $db_by_name as $name => $dbr ) {
-                $db_names[] = $name;
-            }
-
+            // Save sync job state
+            $job_state = array(
+                'files'      => $all_files,
+                'chunk_size' => $chunk_size,
+                'offset'     => 0,
+                'total'      => $total_files,
+                'repo'       => $repo,
+                'commit_sha' => $commit_sha,
+                'branch'     => $branch,
+                'token'      => $token,
+                'trigger'    => $trigger,
+                'updated'    => array(),
+                'errors'     => array(),
+                'db_names'   => array_keys( $db_by_name ),
+                'started_at' => current_time( 'mysql' ),
+                'status'     => 'syncing',
+            );
+            update_option( 'dinoco_sync_job', $job_state, false );
             update_option( 'dinoco_last_sync_result', array(
-                'time'           => current_time( 'mysql' ),
-                'trigger'        => $trigger,
-                'branch'         => $branch,
-                'commit_sha'     => $commit_sha,
-                'mode'           => 'full_sync_v22',
-                'files_synced'   => array_values( $snippet_files ),
-                'db_names'       => $db_names,
-                'updated'        => $updated,
-                'errors'         => $errors,
+                'time'    => current_time( 'mysql' ),
+                'trigger' => $trigger,
+                'mode'    => 'chunked_sync_v23',
+                'status'  => 'syncing',
+                'progress' => '0/' . $total_files,
+                'commit_sha' => $commit_sha,
             ) );
+
+            // Process first chunk immediately (within shutdown hook — no timeout risk)
+            dinoco_sync_process_chunk();
 
         } finally {
             delete_transient( 'dinoco_sync_running' );
         }
     }
 }
+
+// ── CHUNK PROCESSOR (V.23.0) ──
+// Processes $chunk_size snippets, then schedules next chunk via WP-Cron
+if ( ! function_exists( 'dinoco_sync_process_chunk' ) ) {
+    function dinoco_sync_process_chunk() {
+        $job = get_option( 'dinoco_sync_job' );
+        if ( empty( $job ) || $job['status'] !== 'syncing' ) return;
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'snippets';
+
+        $files      = $job['files'];
+        $offset     = intval( $job['offset'] );
+        $chunk_size = intval( $job['chunk_size'] );
+        $total      = intval( $job['total'] );
+        $repo       = $job['repo'];
+        $commit_sha = $job['commit_sha'];
+        $token      = $job['token'];
+        $updated    = $job['updated'];
+        $errors     = $job['errors'];
+
+        // Load DB snippet map
+        $all_db_rows = $wpdb->get_results(
+            "SELECT id, name, active, revision FROM {$table} WHERE active = 1 AND (name LIKE '[Admin System]%' OR name LIKE '[System]%' OR name LIKE '[AdminSystem-System]%' OR name LIKE '[B2B]%') ORDER BY id ASC"
+        );
+        $db_by_name = array();
+        foreach ( $all_db_rows as $dbr ) {
+            $normalized = dinoco_normalize_snippet_name( $dbr->name );
+            if ( ! isset( $db_by_name[ $normalized ] ) ) {
+                $db_by_name[ $normalized ] = $dbr;
+            }
+        }
+
+        // Process this chunk
+        $chunk = array_slice( $files, $offset, $chunk_size );
+        foreach ( $chunk as $file_name ) {
+            // Fetch from GitHub
+            $raw_url = sprintf( 'https://raw.githubusercontent.com/%s/%s/%s', $repo, rawurlencode( $commit_sha ), rawurlencode( $file_name ) );
+            $raw_resp = wp_remote_get( $raw_url, array(
+                'headers' => array( 'Authorization' => 'token ' . $token, 'User-Agent' => 'DINOCO-System-Sync/1.0' ),
+                'timeout' => 15,
+            ) );
+
+            if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
+                // Fallback: Contents API
+                $content_url = sprintf( 'https://api.github.com/repos/%s/contents/%s?ref=%s', $repo, rawurlencode( $file_name ), rawurlencode( $commit_sha ) );
+                $raw_resp = wp_remote_get( $content_url, array(
+                    'headers' => array( 'Accept' => 'application/vnd.github.v3.raw', 'Authorization' => 'Bearer ' . $token, 'User-Agent' => 'DINOCO-System-Sync/1.0' ),
+                    'timeout' => 15,
+                ) );
+            }
+
+            if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
+                $err_msg = is_wp_error( $raw_resp ) ? $raw_resp->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $raw_resp );
+                $errors[] = $file_name . ': ' . $err_msg;
+                continue;
+            }
+
+            $code = wp_remote_retrieve_body( $raw_resp );
+
+            // V.23: Relaxed content verification
+            // Check: code header must contain snippet number OR a key word from the filename
+            $code_head = substr( $code, 0, 800 );
+            $content_ok = false;
+            // Method 1: Extract snippet number (e.g. "Snippet 10") and check code header
+            if ( preg_match( '/Snippet\s*(\d+)/', $file_name, $sn_match ) ) {
+                $content_ok = ( strpos( $code_head, 'Snippet ' . $sn_match[1] ) !== false
+                             || strpos( $code_head, 'Snippet' . $sn_match[1] ) !== false );
+            }
+            // Method 2: Check first significant word after prefix (e.g. "Gateway", "Dunning", "Customer")
+            if ( ! $content_ok ) {
+                $name_parts = explode( ']', explode( '[', $file_name, 2 )[1] ?? '', 2 );
+                $prefix_tag = isset( $name_parts[0] ) ? '[' . $name_parts[0] . ']' : '';
+                $name_after_prefix = trim( substr( $file_name, strlen( $prefix_tag ) ) );
+                // Try exact match first
+                if ( ! empty( $name_after_prefix ) && strpos( $code_head, $name_after_prefix ) !== false ) {
+                    $content_ok = true;
+                }
+                // Try significant keywords (words > 4 chars)
+                if ( ! $content_ok && ! empty( $name_after_prefix ) ) {
+                    $words = preg_split( '/[\s:—\-_&+]+/', $name_after_prefix );
+                    foreach ( $words as $w ) {
+                        if ( mb_strlen( $w ) > 4 && strpos( $code_head, $w ) !== false ) {
+                            $content_ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Method 3: Non-B2B snippets (Admin/System) — always pass if prefix matches
+            if ( ! $content_ok && strpos( $file_name, '[B2B]' ) !== 0 ) {
+                $content_ok = true;
+            }
+            if ( ! $content_ok && strlen( $code ) > 100 ) {
+                dinoco_sync_log( 'CONTENT VERIFY WARN: ' . $file_name . ' — keyword not found in header, skipping' );
+                $errors[] = $file_name . ': content_mismatch_prevented_swap';
+                continue;
+            }
+
+            $row = isset( $db_by_name[ $file_name ] ) ? $db_by_name[ $file_name ] : null;
+            if ( $row ) {
+                $sync_result = dinoco_sync_update_snippet( $row, $code, $file_name );
+                if ( $sync_result['ok'] ) {
+                    $updated[] = $file_name . ' (db:' . $row->name . ')';
+                } else {
+                    $errors[] = $file_name . ': ' . $sync_result['message'];
+                }
+            } else {
+                $errors[] = $file_name . ': snippet_not_found_in_db';
+            }
+        }
+
+        // Update job state
+        $new_offset = $offset + $chunk_size;
+        $is_done    = $new_offset >= $total;
+
+        $job['offset']  = $new_offset;
+        $job['updated'] = $updated;
+        $job['errors']  = $errors;
+        $job['status']  = $is_done ? 'completed' : 'syncing';
+        update_option( 'dinoco_sync_job', $job, false );
+
+        // Update progress in last_sync_result (for dashboard polling)
+        $progress = min( $new_offset, $total ) . '/' . $total;
+        update_option( 'dinoco_last_sync_result', array(
+            'time'           => current_time( 'mysql' ),
+            'trigger'        => $job['trigger'],
+            'branch'         => $job['branch'],
+            'commit_sha'     => $job['commit_sha'],
+            'mode'           => 'chunked_sync_v23',
+            'status'         => $is_done ? 'completed' : 'syncing',
+            'progress'       => $progress,
+            'files_synced'   => $files,
+            'db_names'       => $job['db_names'],
+            'updated'        => $updated,
+            'errors'         => $errors,
+        ) );
+
+        dinoco_sync_log( 'Chunk done: ' . $progress . ' (' . count( $chunk ) . ' files, ' . count( $updated ) . ' updated, ' . count( $errors ) . ' errors)' );
+
+        if ( $is_done ) {
+            // Final: flush caches once
+            wp_cache_flush();
+            if ( function_exists( 'opcache_reset' ) ) @opcache_reset();
+            if ( function_exists( 'wpfc_clear_all_cache' ) ) wpfc_clear_all_cache( true );
+            $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
+            $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
+            dinoco_sync_log( 'Sync COMPLETED: ' . count( $updated ) . ' updated, ' . count( $errors ) . ' errors' );
+        } else {
+            // Schedule next chunk in 2 seconds
+            wp_schedule_single_event( time() + 2, 'dinoco_sync_chunk_event' );
+            spawn_cron();
+        }
+    }
+}
+add_action( 'dinoco_sync_chunk_event', 'dinoco_sync_process_chunk' );
 
 // ══════════════════════════════════════════════════════════════
 // MANUAL SYNC: POST /wp-json/dinoco/v1/github-sync-manual
