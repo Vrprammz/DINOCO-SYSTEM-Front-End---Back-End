@@ -1,0 +1,996 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2B] Snippet 10: Invoice Image Generator                 ║
+ * ║  Version: V.30.0
+ * ║  Multi-page | Logo | 7-col table | Digital Signature       ║
+ * ║  Font: Sarabun (Google Fonts gstatic CDN)                  ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * V.10.0 Changes:
+ * - BUG-INV: ?format=json → JSON, default → redirect 302 (1 หน้า) หรือ HTML gallery (หลายหน้า)
+ * - Cache: เพิ่ม cache 1 ชม. ไม่ gen ใหม่ทุกครั้ง + ไม่ลบไฟล์เก่าทันที
+ * - B2: Receipt template — ใบเสร็จหลังจ่าย (header เปลี่ยนตาม status)
+ *
+ * V.9.0 Changes:
+ * - C2: Distributor address from ACF fields (dist_address/district/province/postcode)
+ * - F12: Rank-tier price in discount column (rank_system → price lookup)
+ * - N5: customer_note displayed in invoice footer
+ *
+ * V.7.2 (preserved):
+ * - Multi-page pagination
+ * - Logo alpha-aware paste
+ * - 7-column table layout
+ * - Digital signature (DINOCO SYSTEM)
+ * - Thai baht text
+ * - Sarabun font auto-download
+ * - Cleanup cron (30 days)
+ */
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════
+if (!defined('B2B_INV_W')) define('B2B_INV_W', 1240);
+if (!defined('B2B_INV_H')) define('B2B_INV_H', 1754);
+if (!defined('B2B_INV_MX')) define('B2B_INV_MX', 60);
+
+// ════════════════════════════════════════════
+// REST ROUTE
+// ════════════════════════════════════════════
+add_action('rest_api_init', function(){
+    register_rest_route('b2b/v1','/invoice-image', array(
+        'methods'=>'GET','callback'=>'b2b_rest_serve_invoice_image',
+        'permission_callback'=>function( WP_REST_Request $req ) {
+            // Allow with session token OR signed HMAC URL
+            if ( function_exists('b2b_verify_session_token') && b2b_verify_session_token($req) ) return true;
+            $sig = sanitize_text_field($req->get_param('_sig'));
+            $ts  = intval($req->get_param('_ts'));
+            if ( !empty($sig) && $ts > 0 && function_exists('b2b_generate_sig') ) {
+                // Reject signatures older than 4 hours
+                if ( abs(time() - $ts) > 14400 ) return false;
+                $params = array('ticket_id'=>intval($req->get_param('ticket_id')),'_ts'=>$ts,'_sig'=>$sig);
+                unset($params['_sig']); ksort($params);
+                $expected = b2b_generate_sig('invoice-image/', $params);
+                return !empty($expected) && hash_equals($expected, $sig);
+            }
+            return current_user_can('manage_options');
+        },
+    ));
+});
+/**
+ * V.10.0: BUG-INV Fix — ลูกค้าไม่เห็น raw JSON อีกแล้ว
+ * - ?format=json → return JSON (สำหรับ API call)
+ * - default → redirect 302 ไปรูปจริง (1 หน้า) หรือ render HTML gallery (หลายหน้า)
+ * - Cache: ใช้ไฟล์เดิมถ้ายังไม่เกิน 1 ชม.
+ */
+function b2b_rest_serve_invoice_image( WP_REST_Request $r ) {
+    $tid = intval($r->get_param('ticket_id'));
+    if (!$tid) return new WP_REST_Response(array('error'=>'Missing ticket_id'),400);
+    $format = sanitize_text_field($r->get_param('format'));
+
+    // V.10.0: Cache — ดูว่ามีไฟล์เก่าที่ยังไม่เกิน 1 ชม. อยู่ไหม
+    $urls = b2b_get_cached_invoice_pages($tid);
+    if (empty($urls)) {
+        $urls = b2b_generate_invoice_pages($tid);
+    }
+    if (!$urls) return new WP_REST_Response(array('error'=>'Failed'),500);
+
+    // ?format=json → return JSON (สำหรับ programmatic use)
+    if ($format === 'json') {
+        return new WP_REST_Response(array('success'=>true,'pages'=>$urls));
+    }
+
+    // Default: redirect/render HTML
+    if (count($urls) === 1) {
+        // 1 หน้า → redirect 302 ไปรูปจริง
+        header('Location: ' . $urls[0], true, 302);
+        exit;
+    } else {
+        // หลายหน้า → render HTML gallery
+        header('Content-Type: text/html; charset=UTF-8');
+        echo '<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
+        echo '<title>Invoice #'.$tid.'</title>';
+        echo '<style>body{margin:0;padding:16px;background:#f1f5f9;font-family:-apple-system,sans-serif;text-align:center}img{max-width:100%;margin:8px auto;display:block;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1)}h3{color:#1e293b;margin:16px 0 8px}p{color:#64748b;font-size:13px;margin:4px 0}</style>';
+        echo '</head><body><h3>Invoice #'.$tid.'</h3>';
+        foreach ($urls as $i => $url) {
+            echo '<p>หน้า '.($i+1).'/'.count($urls).'</p>';
+            echo '<img src="'.esc_url($url).'" alt="Invoice page '.($i+1).'">';
+        }
+        echo '<p style="margin-top:24px;font-size:11px;color:#94a3b8;">DINOCO B2B Invoice System</p>';
+        echo '</body></html>';
+        exit;
+    }
+}
+
+/**
+ * V.10.0: Cache — ดึงไฟล์ invoice ที่ gen ไว้แล้ว (ไม่เกิน 1 ชม.)
+ */
+function b2b_get_cached_invoice_pages( $ticket_id ) {
+    $upload = wp_upload_dir();
+    $dir = $upload['basedir'].'/b2b-invoices';
+    $url_base = $upload['baseurl'].'/b2b-invoices';
+    $pattern = $dir.'/inv-'.$ticket_id.'-*.png';
+    $files = glob($pattern);
+    if (empty($files)) return array();
+
+    // Check if newest file is less than 1 hour old
+    $newest = 0;
+    foreach ($files as $f) {
+        $mtime = filemtime($f);
+        if ($mtime > $newest) $newest = $mtime;
+    }
+    if ((time() - $newest) > 3600) return array(); // expired
+
+    sort($files);
+    $urls = array();
+    foreach ($files as $f) {
+        $urls[] = $url_base . '/' . basename($f);
+    }
+    return $urls;
+}
+
+// ════════════════════════════════════════════
+// FONT
+// ════════════════════════════════════════════
+function b2b_inv_font_dir() {
+    $d = wp_upload_dir(); $p = $d['basedir'].'/b2b-fonts';
+    if (!file_exists($p)) wp_mkdir_p($p); return $p;
+}
+
+function b2b_inv_get_font( $bold = false ) {
+    $dir = b2b_inv_font_dir();
+    $name = $bold ? 'Sarabun-Bold.ttf' : 'Sarabun-Regular.ttf';
+    $file = $dir.'/'.$name;
+    if (file_exists($file) && filesize($file) > 50000) return $file;
+    $urls = $bold ? array(
+        'https://fonts.gstatic.com/s/sarabun/v15/DtVjJx26TKEr37c9YOZqik4s.ttf',
+        'https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Bold.ttf',
+    ) : array(
+        'https://fonts.gstatic.com/s/sarabun/v15/DtVjJx26TKEr37c9YL5rik4s.ttf',
+        'https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Regular.ttf',
+    );
+    foreach ($urls as $url) {
+        $resp = wp_remote_get($url, array('timeout'=>30,'headers'=>array('User-Agent'=>'Mozilla/5.0')));
+        if (!is_wp_error($resp) && wp_remote_retrieve_response_code($resp)===200) {
+            $body = wp_remote_retrieve_body($resp);
+            if (strlen($body) > 50000 && strpos($body,'<html')===false) {
+                if (file_put_contents($file,$body) === false) { b2b_log('[Font] Write failed: '.$file); continue; }
+                b2b_log('[Font] Downloaded '.$name.' ('.round(strlen($body)/1024).'KB)');
+                return $file;
+            }
+        }
+    }
+    $sys = '/usr/share/fonts/truetype/dejavu/DejaVuSans'.($bold?'-Bold':'').'.ttf';
+    if (file_exists($sys)) return $sys;
+    b2b_log('[Font] ALL sources failed! Upload manually to: '.$dir.'/'.$name);
+    return false;
+}
+
+// ════════════════════════════════════════════
+// LOGO: Download & cache logo image for GD
+// ════════════════════════════════════════════
+function b2b_inv_get_logo_gd() {
+    $url = defined('B2B_LOGO_URL') ? B2B_LOGO_URL : (function_exists('b2b_get_logo_url') ? b2b_get_logo_url() : '');
+    if (empty($url)) return false;
+    $dir = wp_upload_dir();
+    $cache = $dir['basedir'].'/b2b-fonts/logo_cache.png';
+    if (file_exists($cache) && filemtime($cache) > time()-86400 && filesize($cache)>1000) {
+        $src = @imagecreatefrompng($cache);
+        if ($src) { imagealphablending($src, true); imagesavealpha($src, true); return $src; }
+    }
+    $resp = wp_remote_get($url, array('timeout'=>15));
+    if (is_wp_error($resp)) return false;
+    $body = wp_remote_retrieve_body($resp);
+    if (strlen($body) < 500) return false;
+    $src = @imagecreatefromstring($body);
+    if (!$src) return false;
+    imagealphablending($src, true); imagesavealpha($src, true);
+    imagepng($src, $cache, 6);
+    return $src;
+}
+
+// ════════════════════════════════════════════
+// PARSE ORDER ITEMS → with SKU extraction
+// V.9: Rank-tier price in discount column (F12)
+// ════════════════════════════════════════════
+function b2b_inv_parse_items( $raw, $total_amount = 0, $dist_rank = 'standard' ) {
+    $items = array();
+    if (empty($raw)) return $items;
+
+    $clean = preg_replace('/^.*?ขอยืนยัน[^:]*:\s*/u', '', $raw);
+    $clean = preg_replace('/[━─═]+.*$/us', '', $clean);
+    $clean = preg_replace('/💰.*$/us', '', $clean);
+    $clean = preg_replace('/🏷️.*$/us', '', $clean);
+
+    $lines = preg_split('/[\r\n]+/', trim($clean));
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if (empty($line) || mb_strlen($line) < 3) continue;
+        if (preg_match('/^[@🔔📦💰✅❌⏳💲]/', $line)) continue;
+
+        $sku = '';
+        if (preg_match('/\(([A-Z0-9]{5,})\)/u', $line, $skuM)) {
+            $sku = $skuM[1];
+        }
+
+        if (preg_match('/(.+?)\s*x(\d+)\s*=\s*[฿B]?([\d,\.]+)/u', $line, $m)) {
+            $qty = intval($m[2]);
+            $lineTotal = floatval(str_replace(',','',$m[3]));
+            $unitPrice = $qty > 0 ? $lineTotal / $qty : $lineTotal;
+            $items[] = array(
+                'sku'        => $sku,
+                'name'       => trim(preg_replace('/\([A-Z0-9]{5,}\)/u', '', $m[1])),
+                'qty'        => $qty,
+                'unit_price' => $unitPrice,
+                'discount'   => '',
+                'total'      => $lineTotal,
+            );
+        } elseif (!preg_match('/^(?:ยอดประมาณ|ราคาตัวแทนจำหน่าย|มูลค่ารวมสุทธิ)/u', $line)) {
+            $items[] = array('sku'=>$sku,'name'=>$line,'qty'=>1,'unit_price'=>0,'discount'=>'','total'=>0);
+        }
+    }
+
+    if (empty($items) && !empty($raw)) {
+        $items[] = array('sku'=>'','name'=>mb_substr($raw,0,100),'qty'=>1,'unit_price'=>$total_amount,'discount'=>'','total'=>$total_amount);
+    }
+
+    // V.36: Resolve SET children from dinoco_sku_relations
+    $sku_relations = get_option('dinoco_sku_relations', array());
+    $catalog = get_option('dinoco_product_catalog', array());
+    foreach ($items as &$it) {
+        if (!empty($it['sku'])) {
+            $sku_upper = strtoupper(trim($it['sku']));
+            if (isset($sku_relations[$sku_upper]) && is_array($sku_relations[$sku_upper])) {
+                $children = array();
+                foreach ($sku_relations[$sku_upper] as $child_sku) {
+                    $child_name = isset($catalog[$child_sku]['name']) ? $catalog[$child_sku]['name'] : $child_sku;
+                    $children[] = array('sku' => $child_sku, 'name' => $child_name);
+                }
+                $it['children'] = $children;
+            }
+        }
+    }
+    unset($it);
+
+    // V.9: Fill discount + retail from rank-tier pricing (F12)
+    // Priority: rank price field > discount %
+    $rank_price_field = 'price_' . $dist_rank; // e.g. price_gold
+    foreach ($items as &$it) {
+        if (!empty($it['sku']) && function_exists('b2b_find_product_by_sku')) {
+            $sku_upper = strtoupper(trim($it['sku']));
+            $pid = b2b_find_product_by_sku($it['sku']);
+            if ($pid) {
+                $rank_price = floatval(get_field($rank_price_field, $pid));
+                $catalog_price = floatval(get_field('price_standard', $pid));
+                if ($catalog_price <= 0 && isset($catalog[$sku_upper]['price'])) {
+                    $catalog_price = floatval(str_replace(',', '', $catalog[$sku_upper]['price']));
+                }
+                if ($catalog_price > 0) $it['retail'] = $catalog_price;
+                if ($rank_price > 0 && $catalog_price > 0 && $rank_price < $catalog_price) {
+                    $disc_pct = round((1 - $rank_price / $catalog_price) * 100, 1);
+                    $it['discount'] = number_format($disc_pct, 1) . '%';
+                } else {
+                    // Fallback: b2b_discount_percent
+                    $disc = floatval(get_field('b2b_discount_percent', $pid));
+                    if ($disc > 0) $it['discount'] = number_format($disc, 2) . '%';
+                }
+            }
+        }
+        // Final fallback: catalog price without product post
+        if (empty($it['retail']) && !empty($it['sku'])) {
+            $sku_upper = strtoupper(trim($it['sku']));
+            if (isset($catalog[$sku_upper]['price'])) {
+                $cp = floatval(str_replace(',', '', $catalog[$sku_upper]['price']));
+                if ($cp > 0) $it['retail'] = $cp;
+            }
+        }
+    }
+    unset($it);
+
+    return $items;
+}
+
+// ════════════════════════════════════════════
+// THAI BAHT TEXT
+// ════════════════════════════════════════════
+function b2b_baht_text( $amount ) {
+    $amount = round($amount, 2);
+    if ($amount == 0) return 'ศูนย์บาทถ้วน';
+    $t1 = array('','หนึ่ง','สอง','สาม','สี่','ห้า','หก','เจ็ด','แปด','เก้า');
+    $t2 = array('','สิบ','ร้อย','พัน','หมื่น','แสน','ล้าน');
+    $baht = intval($amount); $sat = round(($amount-$baht)*100); $r = '';
+    if ($baht > 0) {
+        $s = strval($baht); $len = strlen($s);
+        for ($i=0;$i<$len;$i++) {
+            $d=intval($s[$i]); $p=$len-$i-1;
+            if ($d==0) continue;
+            if ($p==1 && $d==1) { $r.='สิบ'; continue; }
+            if ($p==1 && $d==2) { $r.='ยี่สิบ'; continue; }
+            if ($p==0 && $d==1 && $len>1) { $r.='เอ็ด'; continue; }
+            $r .= $t1[$d].$t2[$p%7];
+            if ($p>=7 && $p%6==0) $r.='ล้าน';
+        }
+        $r .= 'บาท';
+    }
+    if ($sat > 0) {
+        $s2=str_pad(strval($sat),2,'0',STR_PAD_LEFT); $d1=intval($s2[0]); $d2=intval($s2[1]);
+        if ($d1==1) $r.='สิบ'; elseif ($d1==2) $r.='ยี่สิบ'; elseif ($d1>0) $r.=$t1[$d1].'สิบ';
+        if ($d2==1 && $d1>0) $r.='เอ็ด'; elseif ($d2>0) $r.=$t1[$d2];
+        $r .= 'สตางค์';
+    } else { $r .= 'ถ้วน'; }
+    return $r;
+}
+
+// ════════════════════════════════════════════
+// GD HELPERS
+// ════════════════════════════════════════════
+function b2b_inv_tr( $img, $sz, $font, $txt, $rx, $y, $col ) {
+    $bb = imagettfbbox($sz, 0, $font, $txt);
+    imagettftext($img, $sz, 0, $rx-($bb[2]-$bb[0]), $y, $col, $font, $txt);
+}
+function b2b_inv_wrap( $text, $maxW, $sz, $font ) {
+    $words = preg_split('/([\s]+)/u', $text, -1, PREG_SPLIT_DELIM_CAPTURE);
+    $lines = array(); $cur = '';
+    foreach ($words as $w) {
+        $test = $cur.$w;
+        $bb = imagettfbbox($sz, 0, $font, $test);
+        if (($bb[2]-$bb[0]) > $maxW && !empty(trim($cur))) { $lines[]=trim($cur); $cur=$w; } else { $cur=$test; }
+    }
+    if (!empty(trim($cur))) $lines[]=trim($cur);
+    return $lines;
+}
+
+// ════════════════════════════════════════════
+// DRAW: Header
+// ════════════════════════════════════════════
+// V.10.0: B2 — รองรับ Receipt (doc_type = 'receipt' สำหรับ paid/completed)
+function b2b_inv_draw_header( $img, $font, $fontB, $colors, $pageNum, $totalPages, $inv_no, $doc_type = 'invoice' ) {
+    $W = B2B_INV_W; $mx = B2B_INV_MX; $rgt = $W-$mx;
+    extract($colors);
+    $hH = 90;
+    imagefilledrectangle($img, 0, 0, $W, $hH, $dark);
+    $logo = b2b_inv_get_logo_gd();
+    if ($logo) {
+        $lw = imagesx($logo); $lh = imagesy($logo);
+        $targetH = 55; $targetW = $lh > 0 ? intval($lw * ($targetH / $lh)) : $lw;
+        $logoX = $mx + 10; $logoY = intval(($hH - $targetH) / 2);
+        imagealphablending($img, true);
+        imagecopyresampled($img, $logo, $logoX, $logoY, 0, 0, $targetW, $targetH, $lw, $lh);
+        imagedestroy($logo);
+    } else {
+        $co = defined('B2B_COMPANY_NAME') ? B2B_COMPANY_NAME : 'DINOCO THAILAND';
+        imagettftext($img, 26, 0, $mx+10, intval($hH/2)+10, $white, $fontB, $co);
+    }
+    // V.10.0: B2 — แสดง "ใบเสร็จรับเงิน" ถ้าจ่ายแล้ว
+    $doc_title = ($doc_type === 'receipt') ? 'ใบเสร็จรับเงิน' : 'ใบแจ้งหนี้/วางบิล';
+    b2b_inv_tr($img, 26, $fontB, $doc_title, $rgt-10, 55, $white);
+    if ($totalPages > 1) {
+        $pg = 'หน้า '.$pageNum.'/'.$totalPages;
+        b2b_inv_tr($img, 10, $font, $pg, $rgt-10, 80, $lgray2);
+    }
+    imagefilledrectangle($img, 0, $hH, $W, $hH+5, $green);
+    return $hH + 5;
+}
+
+// ════════════════════════════════════════════
+// DRAW: Customer info section
+// V.9: Rank label displayed (F12)
+// ════════════════════════════════════════════
+function b2b_inv_draw_customer( $img, $y, $font, $fontB, $colors, $data ) {
+    $W = B2B_INV_W; $mx = B2B_INV_MX; $rgt = $W-$mx;
+    extract($colors);
+    $y += 20;
+    imageline($img, $mx, $y, $rgt, $y, $vlgray);
+    $y += 8;
+    $rx = 620;
+    imagettftext($img, 12, 0, $mx+10, $y+20, $gray, $fontB, 'ลูกค้า:');
+    imagettftext($img, 14, 0, $mx+160, $y+20, $dark, $fontB, $data['dist_name']);
+    // V.9: Rank label next to name
+    if (!empty($data['dist_rank']) && $data['dist_rank'] !== 'standard') {
+        $rl = array('silver'=>'🥈 Silver','gold'=>'🥇 Gold','platinum'=>'💎 Platinum','diamond'=>'💠 Diamond');
+        $bb = imagettfbbox(14, 0, $fontB, $data['dist_name']);
+        $rankX = $mx + 160 + ($bb[2] - $bb[0]) + 12;
+        $rlabel = isset($rl[$data['dist_rank']]) ? $rl[$data['dist_rank']] : $data['dist_rank'];
+        imagettftext($img, 10, 0, $rankX, $y+20, $blueAcc, $font, '('.$rlabel.')');
+    }
+    imagettftext($img, 12, 0, $rx, $y+20, $gray, $fontB, 'วันที่:');
+    imagettftext($img, 13, 0, $rx+130, $y+20, $dark, $font, $data['date']);
+
+    $y += 30;
+    if (!empty($data['dist_addr'])) {
+        imagettftext($img, 12, 0, $mx+10, $y+20, $gray, $fontB, 'ที่อยู่:');
+        $addrLines = b2b_inv_wrap($data['dist_addr'], 380, 11, $font);
+        $ay = $y + 20;
+        foreach (array_slice($addrLines, 0, 2) as $al) {
+            imagettftext($img, 11, 0, $mx+160, $ay, $dark, $font, $al);
+            $ay += 18;
+        }
+    }
+    imagettftext($img, 12, 0, $rx, $y+20, $gray, $fontB, 'เลขที่:');
+    imagettftext($img, 14, 0, $rx+130, $y+20, $dark, $fontB, $data['inv_no']);
+
+    $y += 30;
+    imagettftext($img, 12, 0, $rx, $y+20, $gray, $fontB, 'ผู้สร้างรายการ:');
+    $creator = defined('B2B_CREATOR_NAME') ? B2B_CREATOR_NAME : 'DINOCO System';
+    imagettftext($img, 13, 0, $rx+130, $y+20, $dark, $font, $creator);
+
+    $y += 34;
+    imageline($img, $mx, $y+4, $rgt, $y+4, $vlgray);
+    return $y + 14;
+}
+
+// ════════════════════════════════════════════
+// DRAW: Table header row (7 columns)
+// ════════════════════════════════════════════
+function b2b_inv_draw_table_header( $img, $y, $font, $fontB, $colors ) {
+    $W = B2B_INV_W; $mx = B2B_INV_MX; $rgt = $W-$mx;
+    extract($colors);
+    imagettftext($img, 13, 0, $mx, $y, $dark, $fontB, 'รายการสินค้า');
+    $y += 18;
+    $thH = 36;
+    imagefilledrectangle($img, $mx, $y, $rgt, $y+$thH, $dark);
+    imagettftext($img, 10, 0, $mx+10, $y+24, $white, $fontB, '#');
+    imagettftext($img, 10, 0, $mx+40, $y+24, $white, $fontB, 'รหัสสินค้า');
+    imagettftext($img, 10, 0, $mx+180, $y+24, $white, $fontB, 'ชื่อสินค้า');
+    b2b_inv_tr($img, 10, $fontB, 'จำนวน', $mx+670, $y+24, $white);
+    b2b_inv_tr($img, 10, $fontB, 'ราคาจำหน่าย', $mx+820, $y+24, $white);
+    b2b_inv_tr($img, 10, $fontB, 'ส่วนลดตัวแทน(%)', $mx+960, $y+24, $white);
+    b2b_inv_tr($img, 10, $fontB, 'ราคาตัวแทนรวมส่วนลด(฿)', $rgt-8, $y+24, $white);
+    return $y + $thH;
+}
+
+// ════════════════════════════════════════════
+// DRAW: Single table row
+// ════════════════════════════════════════════
+function b2b_inv_draw_row( $img, $y, $idx, $item, $font, $fontB, $colors, $maxNameW ) {
+    $W = B2B_INV_W; $mx = B2B_INV_MX; $rgt = $W-$mx;
+    extract($colors);
+    $nameLines = b2b_inv_wrap($item['name'], $maxNameW, 11, $font);
+    $skuLines  = !empty($item['sku']) ? b2b_inv_wrap($item['sku'], 120, 9, $font) : array();
+    $textH = max(count($nameLines), count($skuLines)) * 18;
+    $rowH  = max(44, $textH + 16);
+    $bgc = ($idx % 2 === 0) ? $white : imagecolorallocate($img, 248, 248, 248);
+    imagefilledrectangle($img, $mx, $y, $rgt, $y+$rowH, $bgc);
+    imageline($img, $mx, $y+$rowH, $rgt, $y+$rowH, $vlgray);
+    $cols = array($mx+35, $mx+165, $mx+560, $mx+680, $mx+830, $mx+970);
+    foreach ($cols as $cx) { imageline($img, $cx, $y, $cx, $y+$rowH, $vlgray); }
+    imagettftext($img, 10, 0, $mx+12, $y+24, $dark, $font, strval($idx));
+    $sy = $y + 22;
+    foreach ($skuLines as $sl) { imagettftext($img, 9, 0, $mx+42, $sy, $gray, $font, $sl); $sy += 16; }
+    $ny = $y + 22;
+    foreach ($nameLines as $nl) { imagettftext($img, 11, 0, $mx+172, $ny, $dark, $font, $nl); $ny += 18; }
+    b2b_inv_tr($img, 11, $font, strval($item['qty']), $mx+670, $y+24, $dark);
+    $up = !empty($item['retail']) ? number_format($item['retail'], 2) : ($item['unit_price'] > 0 ? number_format($item['unit_price'], 2) : '-');
+    b2b_inv_tr($img, 11, $font, $up, $mx+820, $y+24, $dark);
+    $disc = !empty($item['discount']) ? $item['discount'] : '-';
+    b2b_inv_tr($img, 11, $font, $disc, $mx+960, $y+24, $gray);
+    $tot = $item['total'] > 0 ? number_format($item['total'], 2) : '-';
+    b2b_inv_tr($img, 11, $fontB, $tot, $rgt-8, $y+24, $dark);
+    return $rowH;
+}
+
+// ════════════════════════════════════════════
+// DRAW: Totals + Due + Notes
+// V.9: customer_note displayed (N5)
+// ════════════════════════════════════════════
+function b2b_inv_draw_footer_section( $img, $y, $font, $fontB, $colors, $data ) {
+    $W = B2B_INV_W; $mx = B2B_INV_MX; $rgt = $W-$mx;
+    extract($colors);
+
+    $y += 6;
+
+    // 1. ราคาจำหน่าย
+    if (!empty($data['total_retail']) && $data['total_retail'] > 0) {
+        imagettftext($img, 12, 0, $mx+560+10, $y+16, $gray, $font, 'ราคาจำหน่าย');
+        b2b_inv_tr($img, 12, $font, number_format($data['total_retail'],2), $rgt-8, $y+16, $dark);
+        $y += 24;
+    }
+
+    // 2. ส่วนลดตัวแทน (฿ only)
+    if (!empty($data['total_discount']) && $data['total_discount'] > 0) {
+        imagettftext($img, 12, 0, $mx+560+10, $y+16, $green, $font, 'ส่วนลดตัวแทน');
+        b2b_inv_tr($img, 12, $font, '-'.number_format($data['total_discount'],2), $rgt-8, $y+16, $green);
+        $y += 24;
+    }
+
+    // 3. ราคาตัวแทนรวมส่วนลด
+    imagettftext($img, 12, 0, $mx+560+10, $y+16, $gray, $font, 'ราคาตัวแทนรวมส่วนลด');
+    b2b_inv_tr($img, 12, $fontB, number_format($data['subtotal'],2), $rgt-8, $y+16, $dark);
+    $y += 24;
+
+    $y += 4;
+    imageline($img, $mx+560, $y, $rgt, $y, $vlgray);
+    $y += 10;
+
+    // 5. มูลค่ารวมสุทธิ (bold grand total)
+    imagettftext($img, 15, 0, $mx+560+10, $y+22, $dark, $fontB, 'มูลค่ารวมสุทธิ');
+    b2b_inv_tr($img, 22, $fontB, number_format($data['total'],2).' บาท', $rgt-8, $y+24, $green);
+    $y += 36;
+    $btxt = '('.b2b_baht_text($data['total']).')';
+    b2b_inv_tr($img, 10, $font, $btxt, $rgt-8, $y+8, $gray);
+
+    $y += 36;
+
+    imagefilledrectangle($img, $mx, $y, $rgt, $y+44, $pinkBg);
+    imagefilledrectangle($img, $mx, $y, $mx+5, $y+44, $red);
+    imagettftext($img, 13, 0, $mx+22, $y+30, $red, $fontB, 'กำหนดชำระ:  '.$data['due_str'].'  ('.$data['term'].' วัน)');
+    $y += 60;
+
+    // Admin note
+    if (!empty($data['note'])) {
+        imagettftext($img, 11, 0, $mx, $y, $gray, $font, 'หมายเหตุ Admin: '.mb_substr($data['note'],0,80));
+        $y += 20;
+    }
+
+    // V.9: Customer note (N5)
+    if (!empty($data['customer_note'])) {
+        imagettftext($img, 11, 0, $mx, $y, $blueAcc, $font, 'หมายเหตุลูกค้า: '.mb_substr($data['customer_note'],0,80));
+        $y += 20;
+    }
+
+    return $y;
+}
+
+// ════════════════════════════════════════════
+// DRAW: Signatures (4 ช่อง)
+// ════════════════════════════════════════════
+function b2b_inv_draw_signatures( $img, $font, $fontB, $colors ) {
+    $W = B2B_INV_W; $mx = B2B_INV_MX; $rgt = $W-$mx; $cw = $rgt-$mx;
+    extract($colors);
+    $sy = B2B_INV_H - 190;
+    imageline($img, $mx, $sy-15, $rgt, $sy-15, $vlgray);
+    $sigW = intval(($cw - 60) / 4);
+    $sigs = array('ผู้รับสินค้า','ผู้ส่งสินค้า','ผู้รับเงิน','ผู้อนุมัติ');
+    for ($i = 0; $i < 4; $i++) {
+        $sx = $mx + 15 + $i * ($sigW + 20);
+        imagettftext($img, 11, 0, $sx+15, $sy, $dark, $fontB, $sigs[$i]);
+        if ($i === 3) {
+            imagettftext($img, 14, 0, $sx+10, $sy+38, $blueAcc, $fontB, 'DINOCO SYSTEM');
+            imagettftext($img, 9, 0, $sx+10, $sy+55, $lgray, $font, '(Digital Signature)');
+        }
+        for ($dx = 0; $dx < $sigW-20; $dx += 6) {
+            imagesetpixel($img, $sx+10+$dx, $sy+65, $lgray);
+            imagesetpixel($img, $sx+11+$dx, $sy+65, $lgray);
+        }
+        imagettftext($img, 10, 0, $sx+15, $sy+85, $lgray, $font, 'วันที่');
+        if ($i === 3) {
+            imagettftext($img, 10, 0, $sx+55, $sy+85, $dark, $font, b2b_date('d/m/Y'));
+        } else {
+            for ($dx = 0; $dx < $sigW-70; $dx += 6) {
+                imagesetpixel($img, $sx+55+$dx, $sy+85, $lgray);
+                imagesetpixel($img, $sx+56+$dx, $sy+85, $lgray);
+            }
+        }
+    }
+    $fy = B2B_INV_H - 45;
+    imageline($img, $mx, $fy, $rgt, $fy, $vlgray);
+    $co = defined('B2B_COMPANY_NAME') ? B2B_COMPANY_NAME : 'DINOCO THAILAND';
+    imagettftext($img, 9, 0, $mx, $fy+22, $lgray, $font, $co.'  •  Auto-generated  •  '.b2b_date('d/m/Y H:i'));
+    b2b_inv_tr($img, 9, $font, 'dinoco.in.th', $rgt, $fy+22, $lgray);
+}
+
+// ════════════════════════════════════════════
+// COLOR PALETTE
+// ════════════════════════════════════════════
+function b2b_inv_colors( $img ) {
+    return array(
+        'white'=>imagecolorallocate($img,255,255,255),'black'=>imagecolorallocate($img,0,0,0),
+        'dark'=>imagecolorallocate($img,34,34,34),'gray'=>imagecolorallocate($img,100,100,100),
+        'lgray'=>imagecolorallocate($img,170,170,170),'lgray2'=>imagecolorallocate($img,180,180,180),
+        'vlgray'=>imagecolorallocate($img,225,225,225),'green'=>imagecolorallocate($img,22,163,106),
+        'red'=>imagecolorallocate($img,200,30,30),'blueAcc'=>imagecolorallocate($img,0,128,128),
+        'pinkBg'=>imagecolorallocate($img,255,240,240),'bankBg'=>imagecolorallocate($img,245,245,245),
+    );
+}
+
+// ════════════════════════════════════════════
+// MAIN: Generate Invoice Pages
+// V.9: dist_addr + dist_rank + customer_note
+// ════════════════════════════════════════════
+function b2b_generate_invoice_pages( $ticket_id ) {
+    if (!function_exists('imagecreatetruecolor') || !function_exists('imagettftext')) {
+        b2b_log('[InvImg] GD/FreeType not available'); return false;
+    }
+    $font = b2b_inv_get_font(false); $fontB = b2b_inv_get_font(true);
+    if (!$font) return false;
+    if (!$fontB) $fontB = $font;
+
+    $upload = wp_upload_dir();
+    $dir = $upload['basedir'].'/b2b-invoices';
+    if (!file_exists($dir)) wp_mkdir_p($dir);
+    // V.10.0: ไม่ลบไฟล์เก่าทันที — ให้ cache ยังใช้ได้ (cleanup cron จะลบหลัง 30 วัน)
+    // ลบเฉพาะเมื่อ re-generate เท่านั้น
+    $old_files = glob($dir.'/inv-'.$ticket_id.'-*.png');
+    if (!empty($old_files)) array_map('unlink', $old_files);
+
+    // ── Ticket Data ──
+    $total     = floatval(get_field('total_amount',$ticket_id));
+    $items_raw = get_field('order_items',$ticket_id) ?: '';
+    $note      = get_field('admin_note',$ticket_id) ?: '';
+    $gid       = get_field('source_group_id',$ticket_id) ?: '';
+    $due_date  = get_field('due_date',$ticket_id) ?: '';
+    $dist      = $gid ? b2b_get_dist_by_group($gid) : null;
+    $dist_name = $dist ? (get_field('shop_name',$dist->ID) ?: get_the_title($dist->ID)) : 'Customer';
+
+    // V.9: Distributor address from ACF fields (C2)
+    $dist_addr = '';
+    if ($dist) {
+        $parts = array_filter(array(
+            get_field('dist_address', $dist->ID),
+            get_field('dist_district', $dist->ID),
+            get_field('dist_province', $dist->ID),
+            get_field('dist_postcode', $dist->ID),
+        ));
+        $dist_addr = implode(' ', $parts);
+    }
+
+    // V.9: Distributor rank for pricing (F12)
+    $dist_rank = $dist ? (get_field('rank_system', $dist->ID) ?: 'standard') : 'standard';
+
+    $term      = $dist ? (intval(get_field('credit_term_days',$dist->ID)) ?: 30) : 30;
+    $bank      = function_exists('b2b_get_bank_info') ? b2b_get_bank_info() : array('name'=>'-','account'=>'-','holder'=>'-');
+    $items     = b2b_inv_parse_items($items_raw, $total, $dist_rank);
+    $due_str   = !empty($due_date) ? (function_exists('b2b_parse_date') ? b2b_parse_date($due_date) : $due_date) : '-';
+    $inv_no    = 'INV-'.$ticket_id;
+
+    // V.9: Customer note (N5)
+    $customer_note = get_field('customer_note', $ticket_id) ?: '';
+
+    // V.10.0: B2 — Receipt detection (หลังจ่าย = receipt)
+    $ticket_status = get_field('order_status', $ticket_id) ?: 'draft';
+    $doc_type = in_array($ticket_status, array('paid','completed','claim_resolved'), true) ? 'receipt' : 'invoice';
+
+    $maxNameW = 380;
+
+    $pageH = B2B_INV_H;
+    $footerReserve = 250 + 200 + 60;
+    $p1_available  = $pageH - 135 - 120 - 56 - $footerReserve;
+    $pN_available  = $pageH - 135 - 56 - $footerReserve;
+
+    $rowHeights = array();
+    foreach ($items as $it) {
+        $nl = b2b_inv_wrap($it['name'], $maxNameW, 11, $font);
+        $sl = !empty($it['sku']) ? b2b_inv_wrap($it['sku'], 120, 9, $font) : array();
+        $textH = max(count($nl), count($sl)) * 18;
+        $rowHeights[] = max(44, $textH + 16);
+    }
+
+    $pages = array(); $curItems = array(); $curH = 0; $pageIdx = 0;
+    foreach ($items as $i => $item) {
+        $rh = $rowHeights[$i];
+        $avail = ($pageIdx === 0) ? $p1_available : $pN_available;
+        if ($curH + $rh > $avail && !empty($curItems)) {
+            $pages[] = $curItems; $curItems = array(); $curH = 0; $pageIdx++;
+        }
+        $curItems[] = array('item'=>$item, 'height'=>$rh, 'orig_idx'=>$i);
+        $curH += $rh;
+    }
+    if (!empty($curItems)) $pages[] = $curItems;
+    if (empty($pages)) $pages[] = array();
+
+    $totalPages = count($pages);
+    $totalQty = array_sum(array_column($items, 'qty'));
+    $subtotal = array_sum(array_column($items, 'total'));
+    if ($subtotal <= 0) $subtotal = $total;
+
+    // Compute retail/discount for footer (use per-item retail from parse step)
+    $ft_total_retail = 0;
+    foreach ($items as $it) {
+        if (!empty($it['retail'])) {
+            $ft_total_retail += $it['retail'] * $it['qty'];
+        } elseif (!empty($it['sku']) && function_exists('b2b_find_product_by_sku')) {
+            $pid = b2b_find_product_by_sku($it['sku']);
+            if ($pid) {
+                $rp = floatval(get_field('price_standard', $pid));
+                if ($rp > 0) $ft_total_retail += $rp * $it['qty'];
+            }
+        }
+    }
+    $ft_total_discount = $ft_total_retail > 0 ? $ft_total_retail - $total : 0;
+    if ($ft_total_discount < 0) $ft_total_discount = 0;
+
+    $footerData = array(
+        'total_qty'=>$totalQty, 'subtotal'=>$subtotal, 'total'=>$total,
+        'total_retail'=>$ft_total_retail, 'total_discount'=>$ft_total_discount,
+        'due_str'=>$due_str, 'term'=>$term, 'note'=>$note,
+        'customer_note'=>$customer_note, // V.9
+    );
+    $custData = array(
+        'dist_name'=>$dist_name, 'dist_addr'=>$dist_addr,
+        'date'=>b2b_date('d/m/Y',get_post_time('U',true,$ticket_id)), 'inv_no'=>$inv_no,
+        'dist_rank'=>$dist_rank, // V.9
+    );
+
+    $urls = array();
+    foreach ($pages as $pi => $pageItems) {
+        $W = B2B_INV_W; $H = B2B_INV_H;
+        $img = imagecreatetruecolor($W, $H);
+        imagealphablending($img, true);
+        $colors = b2b_inv_colors($img);
+        imagefill($img, 0, 0, $colors['white']);
+
+        $y = b2b_inv_draw_header($img, $font, $fontB, $colors, $pi+1, $totalPages, $inv_no, $doc_type);
+
+        if ($pi === 0) {
+            $y = b2b_inv_draw_customer($img, $y, $font, $fontB, $colors, $custData);
+        } else {
+            $y += 20;
+            imagettftext($img, 11, 0, B2B_INV_MX, $y, $colors['gray'], $font, $inv_no.' — ต่อจากหน้า '.($pi));
+            $y += 20;
+        }
+
+        $y = b2b_inv_draw_table_header($img, $y, $font, $fontB, $colors);
+        $tblTop = $y;
+
+        foreach ($pageItems as $ri) {
+            $rh = b2b_inv_draw_row($img, $y, $ri['orig_idx']+1, $ri['item'], $font, $fontB, $colors, $maxNameW);
+            $y += $rh;
+            // V.36: Draw SET children rows
+            if (!empty($ri['item']['children']) && is_array($ri['item']['children'])) {
+                $childBg = imagecolorallocate($img, 240, 249, 255);
+                $childColor = imagecolorallocate($img, 3, 105, 161);
+                $mx = B2B_INV_MX; $rgt = $W - $mx;
+                foreach ($ri['item']['children'] as $child) {
+                    $chH = 28;
+                    imagefilledrectangle($img, $mx, $y, $rgt, $y + $chH, $childBg);
+                    imageline($img, $mx, $y + $chH, $rgt, $y + $chH, $colors['vlgray']);
+                    $cname = is_array($child) ? ($child['name'] ?? $child['sku'] ?? '') : $child;
+                    $csku = is_array($child) ? ($child['sku'] ?? '') : $child;
+                    imagettftext($img, 8, 0, $mx + 42, $y + 18, $childColor, $font, $csku);
+                    imagettftext($img, 9, 0, $mx + 172, $y + 18, $childColor, $font, '↳ ' . $cname);
+                    $y += $chH;
+                }
+            }
+        }
+
+        imageline($img, B2B_INV_MX, $tblTop, B2B_INV_MX, $y, $colors['vlgray']);
+        imageline($img, $W-B2B_INV_MX, $tblTop, $W-B2B_INV_MX, $y, $colors['vlgray']);
+
+        if ($pi === $totalPages - 1) {
+            b2b_inv_draw_footer_section($img, $y, $font, $fontB, $colors, $footerData);
+            b2b_inv_draw_signatures($img, $font, $fontB, $colors);
+        } else {
+            imagettftext($img, 11, 0, B2B_INV_MX, $y+30, $colors['gray'], $font, '--- ต่อหน้าถัดไป ---');
+            $fy = $H - 45;
+            imageline($img, B2B_INV_MX, $fy, $W-B2B_INV_MX, $fy, $colors['vlgray']);
+            $co = defined('B2B_COMPANY_NAME') ? B2B_COMPANY_NAME : 'DINOCO THAILAND';
+            imagettftext($img, 9, 0, B2B_INV_MX, $fy+22, $colors['lgray'], $font, $co.' • หน้า '.($pi+1).'/'.$totalPages);
+        }
+
+        $fname = 'inv-'.$ticket_id.'-'.($pi+1).'-'.time().'.png';
+        $fpath = $dir.'/'.$fname;
+        imagepng($img, $fpath, 6);
+        imagedestroy($img);
+        $urls[] = $upload['baseurl'].'/b2b-invoices/'.$fname;
+        b2b_log('[InvImg] Page '.($pi+1).': '.$fname.' ('.round(filesize($fpath)/1024).'KB)');
+    }
+
+    return $urls;
+}
+
+// Backward compat
+function b2b_generate_invoice_image( $ticket_id ) {
+    $urls = b2b_generate_invoice_pages($ticket_id);
+    return $urls ? $urls[0] : false;
+}
+
+// ════════════════════════════════════════════
+// PUSH: Send invoice pages via LINE
+// ════════════════════════════════════════════
+function b2b_send_invoice_image( $group_id, $ticket_id ) {
+    if (!$group_id || !$ticket_id) return false;
+    $urls = b2b_generate_invoice_pages($ticket_id);
+    if (!$urls) return false;
+    $msgs = array();
+    foreach ($urls as $url) {
+        $url = str_replace('http://','https://',$url);
+        $msgs[] = array('type'=>'image','originalContentUrl'=>$url,'previewImageUrl'=>$url);
+    }
+    $results = array();
+    foreach (array_chunk($msgs, 5) as $batch) {
+        $results[] = b2b_line_push_raw($group_id, $batch);
+    }
+    b2b_log('[InvImg] Pushed '.count($urls).' pages to '.$group_id);
+    return $results;
+}
+
+// ════════════════════════════════════════════════════
+// V.22.0: COMBINED INVOICE — multiple tickets in one
+// ════════════════════════════════════════════════════
+function b2b_generate_combined_invoice_pages( $ticket_ids ) {
+    if (!function_exists('imagecreatetruecolor') || !function_exists('imagettftext')) {
+        b2b_log('[InvImg] GD/FreeType not available'); return false;
+    }
+    $font = b2b_inv_get_font(false); $fontB = b2b_inv_get_font(true);
+    if (!$font) return false;
+    if (!$fontB) $fontB = $font;
+
+    $upload = wp_upload_dir();
+    $dir = $upload['basedir'].'/b2b-invoices';
+    if (!file_exists($dir)) wp_mkdir_p($dir);
+
+    // Delete old combined files for this set
+    $ids_slug = implode('-', $ticket_ids);
+    $old_files = glob($dir.'/inv-combined-'.$ids_slug.'-*.png');
+    if (!empty($old_files)) array_map('unlink', $old_files);
+
+    // ── Gather data from all tickets ──
+    $first_tid = $ticket_ids[0];
+    $gid = get_field('source_group_id', $first_tid) ?: '';
+    $dist = $gid ? b2b_get_dist_by_group($gid) : null;
+    $dist_name = $dist ? (get_field('shop_name', $dist->ID) ?: get_the_title($dist->ID)) : 'Customer';
+    $dist_addr = '';
+    if ($dist) {
+        $parts = array_filter(array(
+            get_field('dist_address', $dist->ID),
+            get_field('dist_district', $dist->ID),
+            get_field('dist_province', $dist->ID),
+            get_field('dist_postcode', $dist->ID),
+        ));
+        $dist_addr = implode(' ', $parts);
+    }
+    $dist_rank = $dist ? (get_field('rank_system', $dist->ID) ?: 'standard') : 'standard';
+    $term = $dist ? (intval(get_field('credit_term_days', $dist->ID)) ?: 30) : 30;
+
+    // ── Merge items from all tickets, with section dividers ──
+    $all_items = array();
+    $combined_total = 0;
+    $earliest_due = '';
+    foreach ($ticket_ids as $tid) {
+        $tid = intval($tid);
+        $items_raw = get_field('order_items', $tid) ?: '';
+        $ticket_total = floatval(get_field('total_amount', $tid));
+        $due_date = get_field('due_date', $tid) ?: '';
+        $combined_total += $ticket_total;
+
+        if (empty($earliest_due) && !empty($due_date)) $earliest_due = $due_date;
+
+        $ticket_items = b2b_inv_parse_items($items_raw, $ticket_total, $dist_rank);
+
+        // Add section divider
+        $all_items[] = array(
+            'sku' => '', 'name' => '── Ticket #'.$tid.' ──',
+            'qty' => 0, 'unit_price' => 0, 'discount' => '', 'total' => 0,
+            '_divider' => true, '_ticket_id' => $tid, '_ticket_total' => $ticket_total,
+        );
+
+        foreach ($ticket_items as $item) {
+            $all_items[] = $item;
+        }
+    }
+
+    $inv_no = 'INV-COMBINED-' . implode('+', $ticket_ids);
+    $due_str = !empty($earliest_due) ? (function_exists('b2b_parse_date') ? b2b_parse_date($earliest_due) : $earliest_due) : '-';
+
+    $maxNameW = 380;
+    $pageH = B2B_INV_H;
+    $footerReserve = 250 + 200 + 60;
+    $p1_available  = $pageH - 135 - 120 - 56 - $footerReserve;
+    $pN_available  = $pageH - 135 - 56 - $footerReserve;
+
+    $rowHeights = array();
+    foreach ($all_items as $it) {
+        if (!empty($it['_divider'])) {
+            $rowHeights[] = 36; // Section divider row height
+        } else {
+            $nl = b2b_inv_wrap($it['name'], $maxNameW, 11, $font);
+            $sl = !empty($it['sku']) ? b2b_inv_wrap($it['sku'], 120, 9, $font) : array();
+            $textH = max(count($nl), count($sl)) * 18;
+            $rowHeights[] = max(44, $textH + 16);
+        }
+    }
+
+    // Paginate
+    $pages = array(); $curItems = array(); $curH = 0; $pageIdx = 0;
+    foreach ($all_items as $i => $item) {
+        $rh = $rowHeights[$i];
+        $avail = ($pageIdx === 0) ? $p1_available : $pN_available;
+        if ($curH + $rh > $avail && !empty($curItems)) {
+            $pages[] = $curItems; $curItems = array(); $curH = 0; $pageIdx++;
+        }
+        $curItems[] = array('item'=>$item, 'height'=>$rh, 'orig_idx'=>$i);
+        $curH += $rh;
+    }
+    if (!empty($curItems)) $pages[] = $curItems;
+    if (empty($pages)) $pages[] = array();
+
+    $totalPages = count($pages);
+    $totalQty = 0; $subtotal = 0;
+    foreach ($all_items as $it) {
+        if (empty($it['_divider'])) {
+            $totalQty += intval($it['qty']);
+            $subtotal += floatval($it['total']);
+        }
+    }
+    if ($subtotal <= 0) $subtotal = $combined_total;
+
+    $footerData = array(
+        'total_qty'=>$totalQty, 'subtotal'=>$subtotal, 'total'=>$combined_total,
+        'due_str'=>$due_str, 'term'=>$term, 'note'=>'รวมจ่าย '.count($ticket_ids).' บิล: #'.implode(', #', $ticket_ids),
+        'customer_note'=>'',
+    );
+    $custData = array(
+        'dist_name'=>$dist_name, 'dist_addr'=>$dist_addr,
+        'date'=>b2b_date('d/m/Y'), 'inv_no'=>$inv_no,
+        'dist_rank'=>$dist_rank,
+    );
+
+    $urls = array();
+    foreach ($pages as $pi => $pageItems) {
+        $W = B2B_INV_W; $H = B2B_INV_H;
+        $img = imagecreatetruecolor($W, $H);
+        imagealphablending($img, true);
+        $colors = b2b_inv_colors($img);
+        imagefill($img, 0, 0, $colors['white']);
+
+        $y = b2b_inv_draw_header($img, $font, $fontB, $colors, $pi+1, $totalPages, $inv_no, 'invoice');
+
+        if ($pi === 0) {
+            $y = b2b_inv_draw_customer($img, $y, $font, $fontB, $colors, $custData);
+        } else {
+            $y += 20;
+            imagettftext($img, 11, 0, B2B_INV_MX, $y, $colors['gray'], $font, $inv_no.' — ต่อจากหน้า '.($pi));
+            $y += 20;
+        }
+
+        $y = b2b_inv_draw_table_header($img, $y, $font, $fontB, $colors);
+        $tblTop = $y;
+
+        $idx_counter = 0;
+        foreach ($pageItems as $ri) {
+            $item = $ri['item'];
+            if (!empty($item['_divider'])) {
+                // Draw section divider row
+                $mx = B2B_INV_MX;
+                $rgt = $W - $mx;
+                imagefilledrectangle($img, $mx, $y, $rgt, $y + 32, $colors['vlgray']);
+                $label = $item['name'];
+                if ($item['_ticket_total'] > 0) {
+                    $label .= '  ฿'.number_format($item['_ticket_total'], 2);
+                }
+                imagettftext($img, 10, 0, $mx + 12, $y + 22, $colors['gray'], $fontB, $label);
+                $y += 36;
+            } else {
+                $idx_counter++;
+                $rh = b2b_inv_draw_row($img, $y, $idx_counter, $item, $font, $fontB, $colors, $maxNameW);
+                $y += $rh;
+            }
+        }
+
+        imageline($img, B2B_INV_MX, $tblTop, B2B_INV_MX, $y, $colors['vlgray']);
+        imageline($img, $W-B2B_INV_MX, $tblTop, $W-B2B_INV_MX, $y, $colors['vlgray']);
+
+        if ($pi === $totalPages - 1) {
+            b2b_inv_draw_footer_section($img, $y, $font, $fontB, $colors, $footerData);
+            b2b_inv_draw_signatures($img, $font, $fontB, $colors);
+        } else {
+            imagettftext($img, 11, 0, B2B_INV_MX, $y+30, $colors['gray'], $font, '--- ต่อหน้าถัดไป ---');
+            $fy = $H - 45;
+            imageline($img, B2B_INV_MX, $fy, $W-B2B_INV_MX, $fy, $colors['vlgray']);
+            $co = defined('B2B_COMPANY_NAME') ? B2B_COMPANY_NAME : 'DINOCO THAILAND';
+            imagettftext($img, 9, 0, B2B_INV_MX, $fy+22, $colors['lgray'], $font, $co.' • หน้า '.($pi+1).'/'.$totalPages);
+        }
+
+        $fname = 'inv-combined-'.$ids_slug.'-'.($pi+1).'-'.time().'.png';
+        $fpath = $dir.'/'.$fname;
+        imagepng($img, $fpath, 6);
+        imagedestroy($img);
+        $urls[] = $upload['baseurl'].'/b2b-invoices/'.$fname;
+        b2b_log('[InvImg] Combined page '.($pi+1).': '.$fname);
+    }
+
+    return $urls;
+}
+
+// ════════════════════════════════════════════
+// CLEANUP
+// ════════════════════════════════════════════
+add_action('b2b_daily_summary_cron', 'b2b_cleanup_old_invoices');
+function b2b_cleanup_old_invoices() {
+    $d = wp_upload_dir(); $p = $d['basedir'].'/b2b-invoices';
+    if (!is_dir($p)) return; $c = 0;
+    foreach (glob($p.'/inv-*.png') as $f) {
+        if (filemtime($f) < time() - (30 * 86400)) { @unlink($f); $c++; }
+    }
+    if ($c > 0) b2b_log('[InvImg] Cleaned '.$c.' old files');
+}
