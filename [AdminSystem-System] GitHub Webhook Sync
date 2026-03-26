@@ -160,9 +160,26 @@ if ( ! function_exists( 'dinoco_github_sync_handler' ) ) {
         add_action( 'shutdown', 'dinoco_sync_on_shutdown', 0 );
 
         // Backup: WP-Cron (delay 30s)
+        // Cancel ALL previous sync cron jobs to prevent stale pushes from overwriting newer code
+        $prev_jobs = get_option( 'dinoco_sync_pending_jobs', array() );
+        foreach ( $prev_jobs as $old_job_id ) {
+            wp_clear_scheduled_hook( 'dinoco_github_sync_process', array( $old_job_id ) );
+            delete_transient( $old_job_id );
+        }
+
         $job_id = 'dinoco_sync_' . substr( md5( $payload ), 0, 12 );
         set_transient( $job_id, $data, 600 );
-        wp_clear_scheduled_hook( 'dinoco_github_sync_process', array( $job_id ) );
+        update_option( 'dinoco_sync_pending_jobs', array( $job_id ), false );
+
+        // Pass job_id to shutdown hook so it can cancel cron backup after starting
+        $GLOBALS['_dinoco_pending_sync_job_id'] = $job_id;
+
+        // Store the latest commit SHA so cron/sync can verify freshness
+        $latest_sha = ! empty( $data['after'] ) ? $data['after'] : '';
+        if ( $latest_sha ) {
+            update_option( 'dinoco_sync_latest_sha', $latest_sha, false );
+        }
+
         wp_schedule_single_event( time() + 30, 'dinoco_github_sync_process', array( $job_id ) );
         spawn_cron();
 
@@ -191,6 +208,23 @@ if ( ! function_exists( 'dinoco_sync_on_shutdown' ) ) {
         @set_time_limit( 300 );
         ignore_user_abort( true );
 
+        // Cancel the cron backup — shutdown hook is handling this push
+        if ( ! empty( $GLOBALS['_dinoco_pending_sync_job_id'] ) ) {
+            $job_id = $GLOBALS['_dinoco_pending_sync_job_id'];
+            wp_clear_scheduled_hook( 'dinoco_github_sync_process', array( $job_id ) );
+            delete_transient( $job_id );
+            update_option( 'dinoco_sync_pending_jobs', array(), false );
+            dinoco_sync_log( 'Shutdown hook started — cancelled cron backup job: ' . $job_id );
+            unset( $GLOBALS['_dinoco_pending_sync_job_id'] );
+        }
+
+        // Record this push commit+time so cron backup can verify freshness
+        $commit_sha = ! empty( $data['after'] ) ? $data['after'] : '';
+        if ( $commit_sha ) {
+            update_option( 'dinoco_last_processed_commit', $commit_sha, false );
+            update_option( 'dinoco_last_processed_time', time(), false );
+        }
+
         dinoco_do_full_sync( $data, 'shutdown' );
     }
 }
@@ -203,8 +237,30 @@ if ( ! function_exists( 'dinoco_github_sync_process_job' ) ) {
     function dinoco_github_sync_process_job( $job_id ) {
         @set_time_limit( 300 );
         $data = get_transient( $job_id );
-        if ( ! $data ) return;
+        if ( ! $data ) {
+            dinoco_sync_log( 'Cron job skipped: transient ' . $job_id . ' missing (shutdown hook likely cancelled it)' );
+            return;
+        }
         delete_transient( $job_id );
+
+        // Check if this job's commit is still the latest — skip if a newer push has arrived
+        $job_sha    = ! empty( $data['after'] ) ? $data['after'] : '';
+        $latest_sha = get_option( 'dinoco_sync_latest_sha', '' );
+        if ( $job_sha && $latest_sha && $job_sha !== $latest_sha ) {
+            dinoco_sync_log( 'Cron job skipped: commit ' . substr( $job_sha, 0, 7 ) . ' superseded by ' . substr( $latest_sha, 0, 7 ) );
+            return;
+        }
+
+        // Check if the shutdown hook already processed this exact commit
+        $already_processed = get_option( 'dinoco_last_processed_commit', '' );
+        if ( $job_sha && $already_processed === $job_sha ) {
+            dinoco_sync_log( 'Cron job skipped: commit ' . substr( $job_sha, 0, 7 ) . ' already processed by shutdown hook' );
+            return;
+        }
+
+        // Clean up pending jobs list
+        update_option( 'dinoco_sync_pending_jobs', array(), false );
+
         dinoco_do_full_sync( $data, 'cron' );
     }
 }
@@ -215,6 +271,14 @@ if ( ! function_exists( 'dinoco_github_sync_process_job' ) ) {
 // ══════════════════════════════════════════════════════════════
 if ( ! function_exists( 'dinoco_do_full_sync' ) ) {
     function dinoco_do_full_sync( $data, $trigger = 'unknown' ) {
+        // Freshness check — skip if a newer commit has already been registered
+        $sync_sha   = ! empty( $data['after'] ) ? $data['after'] : '';
+        $latest_sha = get_option( 'dinoco_sync_latest_sha', '' );
+        if ( $sync_sha && $latest_sha && $sync_sha !== $latest_sha ) {
+            dinoco_sync_log( 'Sync skipped (' . $trigger . '): commit ' . substr( $sync_sha, 0, 7 ) . ' superseded by ' . substr( $latest_sha, 0, 7 ) );
+            return;
+        }
+
         // Execution lock — if already syncing, queue this push for re-sync after current job finishes
         $lock = get_transient( 'dinoco_sync_running' );
         if ( $lock ) {
@@ -398,9 +462,12 @@ if ( ! function_exists( 'dinoco_do_full_sync' ) ) {
             ) );
 
             // Process first chunk immediately (within shutdown hook — no timeout risk)
+            // NOTE: DO NOT delete lock here — chunks 2-N run via cron and need the lock
+            // Lock is released in dinoco_sync_process_chunk when all chunks are done
             dinoco_sync_process_chunk();
 
-        } finally {
+        } catch ( \Throwable $e ) {
+            dinoco_sync_log( 'SYNC FATAL: ' . $e->getMessage() );
             delete_transient( 'dinoco_sync_running' );
         }
     }
@@ -412,6 +479,38 @@ if ( ! function_exists( 'dinoco_sync_process_chunk' ) ) {
     function dinoco_sync_process_chunk() {
         $job = get_option( 'dinoco_sync_job' );
         if ( empty( $job ) || $job['status'] !== 'syncing' ) return;
+
+        // V.30.1: Stale job detection — abort if a newer push has arrived
+        $job_commit  = isset( $job['commit_sha'] ) ? $job['commit_sha'] : '';
+        $latest_sha  = get_option( 'dinoco_sync_latest_sha', '' );
+        if ( $job_commit && $latest_sha && $job_commit !== $latest_sha ) {
+            dinoco_sync_log( 'STALE JOB ABORTED: job commit ' . substr( $job_commit, 0, 7 ) . ' superseded by ' . substr( $latest_sha, 0, 7 ) . ' — restarting sync' );
+
+            // Mark current job as aborted
+            $job['status'] = 'aborted_stale';
+            update_option( 'dinoco_sync_job', $job, false );
+            update_option( 'dinoco_last_sync_result', array(
+                'time'       => current_time( 'mysql' ),
+                'trigger'    => $job['trigger'],
+                'mode'       => 'chunked_sync_v23',
+                'status'     => 'aborted_stale',
+                'message'    => 'Aborted stale commit ' . substr( $job_commit, 0, 7 ) . ', restarting with ' . substr( $latest_sha, 0, 7 ),
+                'commit_sha' => $job_commit,
+            ) );
+
+            // Release lock and process queued push (which has the latest commit)
+            delete_transient( 'dinoco_sync_running' );
+            $queued = get_option( 'dinoco_sync_queued', null );
+            if ( $queued && ! empty( $queued['after'] ) ) {
+                delete_option( 'dinoco_sync_queued' );
+                dinoco_sync_log( 'Restarting with queued push: commit=' . substr( $queued['after'], 0, 7 ) );
+                dinoco_do_full_sync( $queued, 'stale_restart' );
+            }
+            return;
+        }
+
+        // Extend lock TTL for this chunk (ป้องกัน lock หมดอายุระหว่าง sync)
+        set_transient( 'dinoco_sync_running', $job['trigger'] ?? 'chunk', 300 );
 
         global $wpdb;
         $table = $wpdb->prefix . 'snippets';
@@ -498,8 +597,8 @@ if ( ! function_exists( 'dinoco_sync_process_chunk' ) ) {
             if ( ! $content_ok && strpos( $file_name, '[B2B]' ) !== 0 ) {
                 $content_ok = true;
             }
-            if ( ! $content_ok && strlen( $code ) > 100 ) {
-                dinoco_sync_log( 'CONTENT VERIFY WARN: ' . $file_name . ' — keyword not found in header, skipping' );
+            if ( ! $content_ok ) {
+                dinoco_sync_log( 'CONTENT VERIFY FAIL: ' . $file_name . ' — keyword not found in header (len=' . strlen($code) . '), skipping' );
                 $errors[] = $file_name . ': content_mismatch_prevented_swap';
                 continue;
             }
@@ -553,6 +652,12 @@ if ( ! function_exists( 'dinoco_sync_process_chunk' ) ) {
             $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
             $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
             dinoco_sync_log( 'Sync COMPLETED: ' . count( $updated ) . ' updated, ' . count( $errors ) . ' errors' );
+
+            // Record this commit as fully processed (prevents cron backup from re-running)
+            if ( ! empty( $job['commit_sha'] ) ) {
+                update_option( 'dinoco_last_processed_commit', $job['commit_sha'], false );
+                update_option( 'dinoco_last_processed_time', time(), false );
+            }
 
             // Release lock before checking queue
             delete_transient( 'dinoco_sync_running' );
