@@ -2,7 +2,7 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
- * Version: V.2.5
+ * Version: V.2.6
  * Dependencies: b2b_order CPT, distributor CPT, b2b_product CPT, ACF
  */
 
@@ -584,10 +584,16 @@ add_action('rest_api_init', function() {
         'callback'            => 'dinoco_inv_rest_record_payment',
         'permission_callback' => $perm,
     ]);
-    // Verify slip (Slip2Go)
+    // Verify slip (Slip2Go) — single invoice
     register_rest_route($ns, '/invoice/verify-slip', [
         'methods'             => 'POST',
         'callback'            => 'dinoco_inv_rest_verify_slip',
+        'permission_callback' => $perm,
+    ]);
+    // V.2.6: Combined slip verify — auto-match across multiple invoices
+    register_rest_route($ns, '/invoice/verify-slip-combined', [
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_inv_rest_verify_slip_combined',
         'permission_callback' => $perm,
     ]);
     // Cancel
@@ -1266,6 +1272,160 @@ function dinoco_inv_rest_verify_slip(WP_REST_Request $req) {
     return rest_ensure_response(['success' => false, 'verified' => false, 'reason' => $reason]);
 }
 
+// --- COMBINED SLIP VERIFY (V.2.6) ---
+// Accepts slip_url + dist_id → verifies slip → auto-matches to invoices
+function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
+    $slip_url = esc_url_raw($req->get_param('slip_url') ?? '');
+    $dist_id  = intval($req->get_param('dist_id'));
+    $manual_ids = $req->get_param('invoice_ids'); // optional: admin pre-selects invoices
+    if (!$slip_url) return new WP_Error('invalid', 'กรุณาระบุ URL สลิป', ['status' => 400]);
+
+    // Call Slip2Go
+    $api_url = defined('B2B_SLIP2GO_API_URL') ? B2B_SLIP2GO_API_URL : '';
+    $secret  = defined('B2B_SLIP2GO_SECRET_KEY') ? B2B_SLIP2GO_SECRET_KEY : '';
+    if (!$api_url || !$secret) return new WP_Error('config', 'ยังไม่ได้ตั้งค่า Slip2Go API', ['status' => 500]);
+
+    $resp = wp_remote_post($api_url, [
+        'headers' => ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $secret],
+        'body'    => wp_json_encode(['url' => $slip_url]),
+        'timeout' => 15,
+    ]);
+    if (is_wp_error($resp)) return new WP_Error('api_error', 'ไม่สามารถติดต่อ Slip2Go ได้', ['status' => 502]);
+
+    $body     = json_decode(wp_remote_retrieve_body($resp), true);
+    $code     = wp_remote_retrieve_response_code($resp);
+    $verified = ($code === 200 && !empty($body['success']));
+    if (!$verified) {
+        return rest_ensure_response(['success' => false, 'verified' => false,
+            'reason' => $body['message'] ?? 'Slip2Go ปฏิเสธการตรวจสอบ']);
+    }
+
+    $slip_amount = floatval($body['amount'] ?? 0);
+    $slip_ref    = sanitize_text_field($body['ref'] ?? '');
+    $slip_date   = sanitize_text_field($body['date'] ?? b2b_date('Y-m-d'));
+    if ($slip_amount <= 0) return new WP_Error('invalid', 'ยอดสลิปเป็น 0', ['status' => 400]);
+
+    // Get all pending invoices for this distributor
+    $pending_data = $dist_id ? _dinoco_inv_get_pending_invoices($dist_id) : null;
+    $pending = $pending_data ? $pending_data['invoices'] : [];
+
+    // If admin pre-selected invoices, filter to those
+    if (!empty($manual_ids) && is_array($manual_ids)) {
+        $manual_ids = array_map('intval', $manual_ids);
+        $pending = array_filter($pending, function($inv) use ($manual_ids) {
+            return in_array($inv['post_id'], $manual_ids);
+        });
+        $pending = array_values($pending);
+    }
+
+    if (empty($pending)) {
+        return rest_ensure_response(['success' => true, 'verified' => true, 'slip_amount' => $slip_amount,
+            'slip_ref' => $slip_ref, 'match_type' => 'no_pending', 'matched' => [], 'message' => 'ไม่มีบิลค้างชำระ']);
+    }
+
+    // ── AUTO-MATCH LOGIC ──
+    $match_type = 'no_match';
+    $matched    = [];
+    $tolerance  = 0.02; // 2% tolerance (same as B2B)
+
+    // Strategy 1: Exact match to single invoice (remaining amount)
+    foreach ($pending as $inv) {
+        if (abs($slip_amount - $inv['remaining']) <= $inv['remaining'] * $tolerance + 0.5) {
+            $match_type = 'single';
+            $matched = [$inv];
+            break;
+        }
+    }
+
+    // Strategy 2: Match to combined total of all pending
+    if ($match_type === 'no_match') {
+        $combined_total = array_sum(array_column($pending, 'remaining'));
+        if (abs($slip_amount - $combined_total) <= $combined_total * $tolerance + 0.5) {
+            $match_type = 'combined_all';
+            $matched = $pending;
+        }
+    }
+
+    // Strategy 3: Find subset of invoices that sums to slip amount (greedy: oldest first)
+    if ($match_type === 'no_match') {
+        $running = 0;
+        $subset  = [];
+        foreach ($pending as $inv) {
+            $running += $inv['remaining'];
+            $subset[] = $inv;
+            if (abs($running - $slip_amount) <= $running * $tolerance + 0.5) {
+                $match_type = 'combined_subset';
+                $matched = $subset;
+                break;
+            }
+            if ($running > $slip_amount) break;
+        }
+    }
+
+    // ── Apply payment if matched ──
+    $paid_invoices = [];
+    if (!empty($matched)) {
+        $note = 'Slip2Go ref=' . $slip_ref . ' วันที่=' . $slip_date . ' (combined ' . count($matched) . ' ใบ)';
+        foreach ($matched as $inv) {
+            $pay_amount = min($inv['remaining'], $slip_amount);
+            $slip_amount -= $pay_amount;
+
+            update_post_meta($inv['post_id'], '_inv_slip_ref', $slip_ref);
+            update_post_meta($inv['post_id'], '_inv_slip_verified_at', b2b_date('Y-m-d H:i:s'));
+
+            $fake_req = new WP_REST_Request();
+            $fake_req->set_param('id', $inv['post_id']);
+            $fake_req->set_param('amount', $pay_amount);
+            $fake_req->set_param('note', $note);
+            dinoco_inv_rest_record_payment($fake_req);
+
+            $paid_invoices[] = [
+                'inv_number' => $inv['inv_number'],
+                'amount'     => $pay_amount,
+                'post_id'    => $inv['post_id'],
+            ];
+        }
+    }
+
+    // Build response
+    $result = [
+        'success'     => true,
+        'verified'    => true,
+        'slip_amount' => floatval($body['amount'] ?? 0),
+        'slip_ref'    => $slip_ref,
+        'match_type'  => $match_type,
+        'matched'     => $paid_invoices,
+        'message'     => '',
+    ];
+
+    switch ($match_type) {
+        case 'single':
+            $result['message'] = 'สลิปตรงกับ ' . $paid_invoices[0]['inv_number'] . ' — บันทึกชำระแล้ว';
+            break;
+        case 'combined_all':
+            $result['message'] = 'สลิปตรงกับยอดรวม ' . count($paid_invoices) . ' บิล — บันทึกชำระทั้งหมดแล้ว';
+            break;
+        case 'combined_subset':
+            $result['message'] = 'สลิปตรงกับ ' . count($paid_invoices) . ' บิล (บางส่วน) — บันทึกชำระแล้ว';
+            break;
+        default:
+            $result['message'] = 'ยอดสลิป ฿' . number_format(floatval($body['amount'] ?? 0), 0) .
+                ' ไม่ตรงกับบิลใดๆ — กรุณาเลือกบิลที่ต้องการตัดยอดด้านล่าง';
+            // Return pending invoices for admin to manually allocate
+            $result['pending'] = array_map(function($inv) {
+                return ['post_id' => $inv['post_id'], 'inv_number' => $inv['inv_number'],
+                    'remaining' => $inv['remaining'], 'due_date' => $inv['due_date']];
+            }, $pending);
+            break;
+    }
+
+    b2b_add_audit_log(0, 'combined_slip_verify',
+        'ตรวจสลิปรวม ฿' . number_format(floatval($body['amount'] ?? 0), 0) . ' ref=' . $slip_ref .
+        ' match=' . $match_type . ' (' . count($paid_invoices) . ' ใบ) dist=' . ($pending_data['dist_name'] ?? ''));
+
+    return rest_ensure_response($result);
+}
+
 // --- CANCEL ---
 function dinoco_inv_rest_cancel(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
@@ -1610,6 +1770,9 @@ add_shortcode('dinoco_manual_invoice', function() {
             <p class="inv-page-sub" id="inv-list-summary">กำลังโหลด...</p>
         </div>
         <div class="inv-topbar-right">
+            <button class="inv-btn inv-btn-outline" onclick="invOpenCslipModal()">
+                <i class="fa-solid fa-receipt"></i> ตรวจสลิปรวม
+            </button>
             <button class="inv-btn inv-btn-outline" onclick="invOpenSummaryModal()">
                 <i class="fa-solid fa-paper-plane"></i> ส่งสรุปบิลค้าง
             </button>
@@ -1863,6 +2026,38 @@ add_shortcode('dinoco_manual_invoice', function() {
         <div style="display:flex;gap:8px;justify-content:flex-end;">
             <button class="inv-btn inv-btn-secondary" onclick="document.getElementById('inv-slip-modal').classList.remove('open')">ยกเลิก</button>
             <button class="inv-btn inv-btn-primary" onclick="invDoVerifySlip()">ตรวจสอบ</button>
+        </div>
+    </div>
+</div>
+
+<!-- ========== COMBINED SLIP VERIFY MODAL (V.2.6) ========== -->
+<div id="inv-cslip-modal" style="display:none;position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,0.5);align-items:center;justify-content:center;">
+    <div class="inv-modal-inner" style="width:520px;max-height:80vh;overflow-y:auto;">
+        <h3 style="margin:0 0 8px;"><i class="fa-solid fa-receipt" style="color:#16a34a;margin-right:6px;"></i>ตรวจสลิปรวม</h3>
+        <p style="font-size:0.85rem;color:#64748b;margin:0 0 14px;">ระบบจะ match ยอดสลิปกับบิลค้างอัตโนมัติ</p>
+        <!-- Step 1: Select distributor + enter slip URL -->
+        <div id="inv-cs-step1">
+            <div style="margin-bottom:12px;">
+                <label class="inv-label">ตัวแทนจำหน่าย <span class="req">*</span></label>
+                <div style="position:relative;">
+                    <input type="text" class="inv-input" id="inv-cs-dist-search" placeholder="พิมพ์ชื่อตัวแทน..." oninput="invCsDistSearch()" onfocus="invCsDistSearch()" autocomplete="off">
+                    <input type="hidden" id="inv-cs-dist-id" value="">
+                    <div id="inv-cs-dist-dd" style="display:none;position:absolute;top:calc(100%+4px);left:0;right:0;background:#fff;border:1px solid #e2e8f0;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,0.12);z-index:500;max-height:200px;overflow-y:auto;"></div>
+                </div>
+            </div>
+            <div style="margin-bottom:12px;">
+                <label class="inv-label">URL รูปสลิป <span class="req">*</span></label>
+                <input class="inv-input" id="inv-cs-slip-url" type="url" placeholder="https://...">
+            </div>
+        </div>
+        <!-- Step 2: Result -->
+        <div id="inv-cs-result" style="display:none;"></div>
+        <!-- Actions -->
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+            <button class="inv-btn inv-btn-secondary" onclick="invCloseCslipModal()">ปิด</button>
+            <button class="inv-btn inv-btn-success" id="inv-cs-verify-btn" onclick="invDoCombinedVerify()">
+                <i class="fa-solid fa-magnifying-glass"></i> <span id="inv-cs-verify-label">ตรวจสลิป</span>
+            </button>
         </div>
     </div>
 </div>
@@ -2918,6 +3113,111 @@ window.invPrint = function(id) {
         area.innerHTML = html;
         area.style.display = 'block';
         setTimeout(function(){ window.print(); area.style.display = 'none'; area.innerHTML = ''; }, 200);
+    });
+};
+
+// ========= COMBINED SLIP VERIFY (V.2.6) =========
+window.invOpenCslipModal = function() {
+    document.getElementById('inv-cs-dist-id').value = '';
+    document.getElementById('inv-cs-dist-search').value = '';
+    document.getElementById('inv-cs-slip-url').value = '';
+    document.getElementById('inv-cs-step1').style.display = '';
+    document.getElementById('inv-cs-result').style.display = 'none';
+    document.getElementById('inv-cs-result').innerHTML = '';
+    document.getElementById('inv-cs-verify-btn').disabled = false;
+    document.getElementById('inv-cs-verify-label').textContent = 'ตรวจสลิป';
+    document.getElementById('inv-cslip-modal').style.display = 'flex';
+    if (!invDistributors.length) invLoadDistributors();
+};
+window.invCloseCslipModal = function() {
+    document.getElementById('inv-cslip-modal').style.display = 'none';
+};
+document.getElementById('inv-cslip-modal').addEventListener('click', function(e) { if (e.target === this) invCloseCslipModal(); });
+
+window.invCsDistSearch = function() {
+    var q = (document.getElementById('inv-cs-dist-search').value || '').toLowerCase().trim();
+    var dd = document.getElementById('inv-cs-dist-dd');
+    if (!invDistributors.length) return;
+    var filtered = invDistributors.filter(function(d) {
+        if (!q) return true;
+        return (d.shop_name||d.name||'').toLowerCase().indexOf(q) >= 0;
+    });
+    dd.innerHTML = filtered.slice(0, 15).map(function(d) {
+        return '<div style="padding:10px 14px;cursor:pointer;border-bottom:1px solid #f1f5f9;" onmouseover="this.style.background=\'#f0f9ff\'" onmouseout="this.style.background=\'\'" onclick="invCsSelectDist(' + d.id + ')">' + escH(d.shop_name || d.name) + '</div>';
+    }).join('') || '<div style="padding:12px 16px;color:#94a3b8;">ไม่พบ</div>';
+    dd.style.display = 'block';
+};
+window.invCsSelectDist = function(id) {
+    var d = invDistributors.find(function(x){ return x.id == id; });
+    if (!d) return;
+    document.getElementById('inv-cs-dist-id').value = id;
+    document.getElementById('inv-cs-dist-search').value = d.shop_name || d.name;
+    document.getElementById('inv-cs-dist-dd').style.display = 'none';
+};
+document.addEventListener('click', function(e) {
+    if (!e.target.closest('#inv-cslip-modal [style*="position:relative"]')) {
+        var dd = document.getElementById('inv-cs-dist-dd');
+        if (dd) dd.style.display = 'none';
+    }
+});
+
+window.invDoCombinedVerify = function() {
+    var distId = document.getElementById('inv-cs-dist-id').value;
+    var url    = document.getElementById('inv-cs-slip-url').value.trim();
+    if (!distId) { invToast('error', 'กรุณาเลือกตัวแทน'); return; }
+    if (!url) { invToast('error', 'กรุณาระบุ URL สลิป'); return; }
+
+    var btn = document.getElementById('inv-cs-verify-btn');
+    var label = document.getElementById('inv-cs-verify-label');
+    btn.disabled = true;
+    label.textContent = 'กำลังตรวจ...';
+
+    invApi('POST', '/invoice/verify-slip-combined', { dist_id: distId, slip_url: url }, function(err, data) {
+        btn.disabled = false;
+        label.textContent = 'ตรวจสลิป';
+        if (err || !data) { invToast('error', 'เชื่อมต่อ API ล้มเหลว'); return; }
+        if (!data.verified) { invToast('error', data.reason || 'สลิปไม่ผ่าน'); return; }
+
+        var resultDiv = document.getElementById('inv-cs-result');
+        var html = '';
+
+        if (data.match_type === 'no_match') {
+            // ไม่ match — แสดงบิลให้ admin เลือก allocate
+            html += '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:16px;margin-bottom:12px;">';
+            html += '<div style="font-weight:700;color:#dc2626;margin-bottom:8px;">⚠️ ยอดสลิป ฿' + invFmt(data.slip_amount) + ' ไม่ตรงกับบิลใดๆ</div>';
+            html += '<p style="font-size:0.82rem;color:#64748b;margin:0;">เลือกบิลที่ต้องการตัดยอด แล้วกด "บันทึกรับเงิน" ด้านล่าง</p>';
+            html += '</div>';
+            html += '<div style="max-height:200px;overflow-y:auto;">';
+            (data.pending || []).forEach(function(inv) {
+                html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px;border-bottom:1px solid #f1f5f9;">' +
+                    '<span><strong>' + escH(inv.inv_number) + '</strong> <span style="color:#94a3b8;font-size:0.78rem;">' + escH(inv.due_date) + '</span></span>' +
+                    '<span style="font-weight:600;">฿' + invFmt(inv.remaining) + '</span>' +
+                    '</div>';
+            });
+            html += '</div>';
+            html += '<p style="font-size:0.82rem;color:#f59e0b;margin-top:12px;">💡 กดปิดแล้วเปิดบิลที่ต้องการ → กด "บันทึกรับเงิน" ระบุยอดเอง</p>';
+        } else {
+            // Match สำเร็จ
+            var color = '#16a34a';
+            var icon = '✅';
+            html += '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px;margin-bottom:12px;">';
+            html += '<div style="font-weight:700;color:' + color + ';margin-bottom:8px;">' + icon + ' ' + escH(data.message) + '</div>';
+            html += '<div style="font-size:0.85rem;color:#64748b;">สลิป: ฿' + invFmt(data.slip_amount) + ' (ref: ' + escH(data.slip_ref || '-') + ')</div>';
+            html += '</div>';
+            if (data.matched && data.matched.length) {
+                html += '<div style="margin-top:8px;">';
+                data.matched.forEach(function(m) {
+                    html += '<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f1f5f9;">' +
+                        '<span>' + escH(m.inv_number) + '</span><span style="color:#16a34a;font-weight:600;">฿' + invFmt(m.amount) + ' ✓</span></div>';
+                });
+                html += '</div>';
+            }
+        }
+
+        document.getElementById('inv-cs-step1').style.display = 'none';
+        resultDiv.innerHTML = html;
+        resultDiv.style.display = '';
+        invLoadList(); // refresh list
     });
 };
 
