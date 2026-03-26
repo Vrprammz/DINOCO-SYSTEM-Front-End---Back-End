@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [AdminSystem-System] GitHub Webhook Sync                    ║
- * ║  Version: V.30.1
+ * ║  Version: V.30.2
  * ║  DINOCO Admin & System Snippet Sync                          ║
  * ╠══════════════════════════════════════════════════════════════╣
  * ║  Push to GitHub → Webhook → WordPress REST API               ║
@@ -718,9 +718,27 @@ if ( ! function_exists( 'dinoco_github_sync_status' ) ) {
             );
         }
 
+        $job = get_option( 'dinoco_sync_job', null );
+        $is_syncing = $job && isset( $job['status'] ) && $job['status'] === 'syncing';
+
+        // V.30: If syncing, directly fire next chunk (no WP-Cron dependency)
+        if ( $is_syncing ) {
+            dinoco_sync_process_chunk();
+            $job = get_option( 'dinoco_sync_job', null );
+            $is_syncing = $job && isset( $job['status'] ) && $job['status'] === 'syncing';
+        }
+
         return new WP_REST_Response( array(
-            'last_sync' => get_option( 'dinoco_last_sync_result', null ),
-            'snippets'  => $snippets,
+            'last_sync'  => get_option( 'dinoco_last_sync_result', null ),
+            'snippets'   => $snippets,
+            'is_syncing' => $is_syncing,
+            'progress'   => $is_syncing ? array(
+                'offset' => intval( $job['offset'] ?? 0 ),
+                'total'  => intval( $job['total'] ?? 0 ),
+                'chunk_size' => intval( $job['chunk_size'] ?? 5 ),
+                'updated_so_far' => count( $job['updated'] ?? array() ),
+                'errors_so_far'  => count( $job['errors'] ?? array() ),
+            ) : null,
         ), 200 );
     }
 }
@@ -836,9 +854,17 @@ function dinoco_render_sync_dashboard() {
     <div class="sd-c"><div class="sd-cl">Branch</div><div class="sd-cv"><?php echo esc_html( $branch ); ?></div></div>
     <div class="sd-c"><div class="sd-cl">Updated</div><div class="sd-cv ok"><?php echo count( $updated ); ?></div></div>
     <div class="sd-c"><div class="sd-cl">Errors</div><div class="sd-cv <?php echo count( $errors ) > 0 ? 'err' : 'ok'; ?>"><?php echo count( $errors ); ?></div></div>
-    <?php if ( $lock ) : ?>
-    <div class="sd-c"><div class="sd-cl">Status</div><div class="sd-cv lock">Syncing...</div></div>
-    <?php endif; ?>
+    <div class="sd-c" id="sd-status-card"><div class="sd-cl">Status</div><div class="sd-cv" id="sd-status-text"><?php echo $lock ? '<span class="lock"><span class="sd-spin" style="width:12px;height:12px;border-width:1.5px;vertical-align:middle;margin-right:4px;"></span> Syncing</span>' : '<span class="ok">Ready</span>'; ?></div></div>
+</div>
+<div id="sd-progress-wrap" style="display:none;margin-bottom:18px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <span style="font-size:13px;font-weight:600;color:#344054;" id="sd-progress-label">กำลัง Sync...</span>
+        <span style="font-size:12px;color:#667085;" id="sd-progress-count">0/0</span>
+    </div>
+    <div style="background:#e4e7ec;border-radius:8px;height:12px;overflow:hidden;">
+        <div id="sd-progress-bar" style="background:linear-gradient(90deg,#2563eb,#16a34a);height:100%;border-radius:8px;transition:width 0.5s ease;width:0%;"></div>
+    </div>
+    <div id="sd-progress-items" style="margin-top:8px;font-size:11px;color:#667085;"></div>
 </div>
 <?php if ( $msg ) : ?>
 <div style="margin-bottom:18px;padding:10px 14px;background:#fffaeb;border:1px solid #fedf89;border-radius:8px;font-size:13px;color:#b54708">
@@ -953,30 +979,83 @@ function dinoco_render_sync_dashboard() {
 </div>
 </div>
 <script>
+var sdPollTimer=null;
+var sdRestUrl='<?php echo esc_js( $rest ); ?>';
+var sdNonce='<?php echo esc_js( $nonce ); ?>';
+
 function sdDoSync(){
     var btn=document.getElementById('sd-sync-btn'),msg=document.getElementById('sd-msg');
     btn.disabled=true;btn.innerHTML='<span class="sd-spin"></span> Syncing...';
     msg.className='sd-msg';msg.style.display='none';
-    fetch('<?php echo esc_js( $rest ); ?>github-sync-manual',{
+    fetch(sdRestUrl+'github-sync-manual',{
         method:'POST',
-        headers:{'X-WP-Nonce':'<?php echo esc_js( $nonce ); ?>','Content-Type':'application/json'},
+        headers:{'X-WP-Nonce':sdNonce,'Content-Type':'application/json'},
         credentials:'same-origin'
     })
     .then(function(r){return r.json().then(function(d){return{ok:r.ok,data:d}})})
     .then(function(res){
-        btn.disabled=false;btn.textContent='Sync Now';
         if(res.ok&&res.data.ok){
-            msg.className='sd-msg ok';msg.textContent='Sync complete! Updated: '+(res.data.updated||[]).length+' snippet(s)'+(res.data.errors&&res.data.errors.length?' | Errors: '+res.data.errors.length:'');
+            msg.className='sd-msg ok';msg.textContent='Sync initiated — tracking progress...';msg.style.display='block';
+            sdStartPoll();
         }else{
-            msg.className='sd-msg err';msg.textContent='Sync failed: '+(res.data.error||res.data.message||'Unknown error');
+            btn.disabled=false;btn.textContent='Sync Now';
+            msg.className='sd-msg err';msg.textContent='Sync failed: '+(res.data.error||res.data.message||'Unknown error');msg.style.display='block';
         }
-        msg.style.display='block';
-        setTimeout(function(){location.reload()},2000);
     })
     .catch(function(e){
         btn.disabled=false;btn.textContent='Sync Now';
         msg.className='sd-msg err';msg.textContent='Network error: '+e.message;msg.style.display='block';
     });
+}
+
+function sdStartPoll(){
+    var wrap=document.getElementById('sd-progress-wrap');
+    var bar=document.getElementById('sd-progress-bar');
+    var countEl=document.getElementById('sd-progress-count');
+    var label=document.getElementById('sd-progress-label');
+    var items=document.getElementById('sd-progress-items');
+    var statusText=document.getElementById('sd-status-text');
+    wrap.style.display='block';
+    label.textContent='กำลัง Sync...';
+    bar.style.width='0%';
+    countEl.textContent='0/0';
+    if(statusText) statusText.innerHTML='<span class="lock"><span class="sd-spin" style="width:12px;height:12px;border-width:1.5px;vertical-align:middle;margin-right:4px;"></span> Syncing</span>';
+
+    if(sdPollTimer) clearInterval(sdPollTimer);
+    sdPollTimer=setInterval(function(){
+        fetch(sdRestUrl+'github-sync-status',{
+            headers:{'X-WP-Nonce':sdNonce},
+            credentials:'same-origin'
+        })
+        .then(function(r){return r.json()})
+        .then(function(d){
+            var syncing=d.is_syncing;
+            var prog=d.progress;
+            var last=d.last_sync;
+
+            if(prog&&syncing){
+                var pct=prog.total>0?Math.round((prog.offset/prog.total)*100):0;
+                bar.style.width=pct+'%';
+                countEl.textContent=prog.offset+'/'+prog.total;
+                label.textContent='กำลัง Sync... ('+prog.updated_so_far+' updated, '+prog.errors_so_far+' errors)';
+            }
+
+            if(!syncing){
+                clearInterval(sdPollTimer);
+                sdPollTimer=null;
+                bar.style.width='100%';
+                label.textContent='Sync เสร็จแล้ว!';
+                if(last){
+                    countEl.textContent=(last.updated?last.updated.length:0)+' updated';
+                    if(last.updated&&last.updated.length>0){
+                        items.innerHTML=last.updated.map(function(u,i){return '<div>'+(i+1)+'. '+u+'</div>'}).join('');
+                    }
+                }
+                setTimeout(function(){location.reload()},2000);
+            }
+        })
+        .catch(function(){});
+    },3000);
 }
 </script>
 <?php
