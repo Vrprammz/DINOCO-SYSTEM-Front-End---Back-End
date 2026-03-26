@@ -410,7 +410,7 @@ function b2b_handle_postback( $postback_data, $group_id, $user_id, $reply_token 
     // ── SEC: Customer actions require ticket ownership ──
     $customer_actions = array('confirm_order','cancel_draft','confirm_bill','cancel_request',
         'bo_wait','bo_accept_partial','bo_wait_full','bo_cancel_all','bo_continue','bo_extend',
-        'delivery_ok','delivery_no','change_request','claim_open');
+        'delivery_ok','delivery_no','change_request','claim_open','slip_pay');
     if ( in_array($action, $customer_actions) && $ticket_id ) {
         $source_gid = get_field('source_group_id', $ticket_id);
         if ( $source_gid && $source_gid !== $group_id ) {
@@ -456,6 +456,8 @@ function b2b_handle_postback( $postback_data, $group_id, $user_id, $reply_token 
         // V.37: Per-box pack timeout actions
         case 'ship_packed_only': b2b_action_ship_packed_only($ticket_id, $user_id, $reply_token); break;
         case 'postpone_pack':    b2b_action_postpone_pack($ticket_id, $user_id, $reply_token); break;
+        // V.31: Slip-to-invoice manual matching
+        case 'slip_pay':        b2b_action_slip_pay($ticket_id, $params, $group_id, $user_id, $reply_token); break;
         default: b2b_log("Unknown postback action: {$action}"); break;
     }
 }
@@ -1847,7 +1849,8 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
             $dist_name = get_the_title($dist->ID);
             $credit_limit = floatval(get_field('credit_limit', $dist->ID));
 
-            $paid_tickets = b2b_auto_mark_paid_after_slip($dist->ID, $paid, $group_id);
+            $match_result = b2b_auto_mark_paid_after_slip($dist->ID, $paid, $group_id);
+            $paid_tickets = $match_result['paid_tickets'];
 
             $pending = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>-1,'post_status'=>'publish',
                 'meta_query'=>array(array('key'=>'source_group_id','value'=>$group_id),array('key'=>'order_status','value'=>'awaiting_payment')),'fields'=>'ids'));
@@ -1937,6 +1940,43 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
                 if (function_exists('b2b_push_raw_to_admin')) b2b_push_raw_to_admin(array($flex_admin));
             } else {
                 b2b_push_to_admin("💳 โอน ฿".number_format($paid,2)." (ผู้โอน: ".$sender.")\nร้าน: ".$dist_name."\nหนี้เหลือ: ฿".number_format($new_debt,2));
+            }
+
+            // V.31: Slip-to-invoice manual matching — ถ้ายังมียอดเหลือ
+            if ( $match_result['remaining'] > 0 ) {
+                // รวม B2B orders + manual invoices ที่ยังค้าง (ทั้ง 2 ระบบ)
+                $all_pending = get_posts(array(
+                    'post_type'=>'b2b_order','posts_per_page'=>20,'post_status'=>'publish',
+                    'meta_query'=>array(
+                        array('key'=>'order_status','value'=>'awaiting_payment'),
+                        array('key'=>'source_group_id','value'=>$group_id),
+                    ),
+                    'orderby'=>'date','order'=>'ASC',
+                ));
+                // ลบ tickets ที่ auto-match ไปแล้ว
+                $matched_ids = array_map(function($t){ return $t['id']; }, $match_result['paid_tickets']);
+                $all_unmatched = array();
+                foreach ($all_pending as $ap) {
+                    if (in_array($ap->ID, $matched_ids)) continue;
+                    $all_unmatched[] = array(
+                        'id' => $ap->ID,
+                        'total' => floatval(get_field('total_amount', $ap->ID)),
+                        'inv_number' => get_post_meta($ap->ID, '_inv_number', true) ?: '',
+                        'source' => get_post_meta($ap->ID, '_order_source', true) ?: 'b2b',
+                    );
+                }
+                if (!empty($all_unmatched)) {
+                    $slip_ref = md5($group_id . '_' . ($trans_ref ?: microtime(true)));
+                    set_transient('b2b_slip_' . $slip_ref, array(
+                        'amount'    => $paid,
+                        'remaining' => $match_result['remaining'],
+                        'group_id'  => $group_id,
+                        'dist_id'   => $dist->ID,
+                        'trans_ref' => $trans_ref,
+                        'sender'    => $sender,
+                    ), 1800);
+                    b2b_send_slip_match_question($group_id, $match_result['remaining'], $all_unmatched, $slip_ref);
+                }
             }
         } else {
             b2b_line_reply($reply_token, "✅ สลิปถูกต้อง ฿".number_format($paid,2)."\nแต่ไม่พบร้านค้าในระบบ แอดมินจะตรวจสอบครับ");
@@ -2188,7 +2228,7 @@ function b2b_auto_mark_paid_after_slip( $dist_id, $paid_amount, $group_id ) {
         'orderby'=>'date','order'=>'ASC',
     ));
 
-    if (empty($orders)) return array();
+    if (empty($orders)) return array('paid_tickets' => array(), 'remaining' => $paid_amount, 'unmatched' => array());
 
     $paid = $paid_amount;
     usort($orders, function($a, $b) use ($paid) {
@@ -2200,6 +2240,7 @@ function b2b_auto_mark_paid_after_slip( $dist_id, $paid_amount, $group_id ) {
 
     $remaining = $paid_amount;
     $paid_tickets = array();
+    $matched_ids = array();
 
     foreach ($orders as $o) {
         $total = floatval(get_field('total_amount', $o->ID));
@@ -2209,6 +2250,7 @@ function b2b_auto_mark_paid_after_slip( $dist_id, $paid_amount, $group_id ) {
             update_field('paid_date', b2b_date('Y-m-d H:i:s'), $o->ID);
             // ไม่ schedule SLA / ไม่ส่ง packing alert — สลิปคือจ่ายเงิน ไม่ใช่แพ็คของ
             $remaining -= $total;
+            $matched_ids[] = $o->ID;
 
             $items_raw = get_field('order_items', $o->ID) ?: '';
             $items_preview = trim(mb_substr(preg_replace('/^.*?ขอยืนยัน[^:]*:\s*/u', '', $items_raw), 0, 100));
@@ -2222,14 +2264,175 @@ function b2b_auto_mark_paid_after_slip( $dist_id, $paid_amount, $group_id ) {
 
             // แจ้ง admin แค่ว่าชำระแล้ว (ไม่มีแพ็ค)
             if (function_exists('b2b_push_to_admin')) {
-                b2b_push_to_admin("💳 ชำระ Ticket #" . $o->ID . " ฿" . number_format($total, 0) . " ผ่านสลิป (" . $dist_name . ")");
+                $_dn = get_the_title($dist_id) ?: '#'.$dist_id;
+                b2b_push_to_admin("💳 ชำระ Ticket #" . $o->ID . " ฿" . number_format($total, 0) . " ผ่านสลิป (" . $_dn . ")");
             }
 
             if ($remaining <= 0) break;
         }
     }
 
-    return $paid_tickets;
+    // Build unmatched orders list (orders that weren't auto-paid)
+    $unmatched = array();
+    foreach ($orders as $o) {
+        if (in_array($o->ID, $matched_ids)) continue;
+        $total = floatval(get_field('total_amount', $o->ID));
+        if ($total <= 0) continue;
+        $unmatched[] = array(
+            'id' => $o->ID,
+            'total' => $total,
+            'inv_number' => get_post_meta($o->ID, '_inv_number', true) ?: '#'.$o->ID,
+        );
+    }
+
+    return array('paid_tickets' => $paid_tickets, 'remaining' => round($remaining, 2), 'unmatched' => $unmatched);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.31: SLIP-TO-INVOICE MANUAL MATCHING — QUESTION CARD
+// ═══════════════════════════════════════════════════════════════
+
+function b2b_send_slip_match_question( $group_id, $slip_amount, $unmatched_orders, $slip_ref ) {
+    $logo = function_exists('b2b_get_logo_url') ? b2b_get_logo_url() : 'https://dinoco.in.th/wp-content/uploads/dinoco-logo.png';
+
+    $header = array('type'=>'box','layout'=>'horizontal','backgroundColor'=>'#1e293b','paddingAll'=>'14px','contents'=>array(
+        array('type'=>'image','url'=>$logo,'size'=>'xxs','aspectMode'=>'fit','flex'=>0),
+        array('type'=>'box','layout'=>'vertical','flex'=>1,'margin'=>'md','contents'=>array(
+            array('type'=>'text','text'=>'💳 เลือกบิลที่ต้องการชำระ','color'=>'#ffffff','size'=>'sm','weight'=>'bold'),
+            array('type'=>'text','text'=>'ยอดคงเหลือ ฿'.number_format($slip_amount,2),'color'=>'#94a3b8','size'=>'xxs')))));
+
+    $body_contents = array(
+        array('type'=>'text','text'=>'กรุณาเลือกบิลที่ต้องการใช้สลิปนี้ชำระ','size'=>'xs','color'=>'#64748b','wrap'=>true),
+        array('type'=>'separator','margin'=>'md'),
+    );
+
+    $count = 0;
+    foreach ($unmatched_orders as $order) {
+        if ($count >= 10) break;
+        $inv_no = $order['inv_number'] ?: '#'.$order['id'];
+        $total  = floatval($order['total']);
+        $id     = intval($order['id']);
+        $source = isset($order['source']) && $order['source'] === 'manual_invoice' ? '🧾 ใบแจ้งหนี้' : '📦 B2B';
+
+        // Determine label based on slip vs invoice amount
+        if ($slip_amount >= $total * 0.98) {
+            $label = 'ชำระเต็มจำนวน';
+            $label_color = '#16a34a';
+        } else {
+            $label = 'ชำระบางส่วน';
+            $label_color = '#d97706';
+        }
+
+        $body_contents[] = array('type'=>'box','layout'=>'vertical','margin'=>'md','paddingAll'=>'10px','cornerRadius'=>'8px','backgroundColor'=>'#f8fafc','contents'=>array(
+            array('type'=>'box','layout'=>'horizontal','contents'=>array(
+                array('type'=>'text','text'=>$inv_no,'size'=>'sm','weight'=>'bold','color'=>'#1e293b','flex'=>3),
+                array('type'=>'text','text'=>'฿'.number_format($total,0),'size'=>'sm','weight'=>'bold','color'=>'#1e293b','flex'=>2,'align'=>'end'))),
+            array('type'=>'box','layout'=>'horizontal','margin'=>'xs','contents'=>array(
+                array('type'=>'text','text'=>$source,'size'=>'xxs','color'=>'#64748b','flex'=>3),
+                array('type'=>'text','text'=>$label,'size'=>'xxs','color'=>$label_color,'flex'=>3,'align'=>'end'))),
+            array('type'=>'button','action'=>array(
+                'type'=>'postback',
+                'label'=>'ชำระบิล '.$inv_no,
+                'data'=>'action=slip_pay&ticket_id='.$id.'&slip_ref='.$slip_ref,
+                'displayText'=>'ชำระบิล '.$inv_no,
+            ),'style'=>'primary','color'=>'#2563eb','height'=>'sm','margin'=>'sm'),
+        ));
+
+        $count++;
+    }
+
+    $footer = array('type'=>'box','layout'=>'vertical','paddingAll'=>'10px','contents'=>array(
+        array('type'=>'text','text'=>'⏰ กดเลือกภายใน 30 นาที','size'=>'xxs','color'=>'#94a3b8','align'=>'center')));
+
+    $flex_bubble = array('type'=>'bubble','size'=>'kilo',
+        'header'=>$header,
+        'body'=>array('type'=>'box','layout'=>'vertical','contents'=>$body_contents),
+        'footer'=>$footer);
+
+    b2b_line_push_raw($group_id, array(array('type'=>'flex','altText'=>'💳 เลือกบิลที่ต้องการชำระ','contents'=>$flex_bubble)));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.31: SLIP-TO-INVOICE MANUAL MATCHING — POSTBACK HANDLER
+// ═══════════════════════════════════════════════════════════════
+
+function b2b_action_slip_pay( $ticket_id, $params, $group_id, $user_id, $reply_token ) {
+    $slip_ref = isset($params['slip_ref']) ? sanitize_text_field($params['slip_ref']) : '';
+    if ( empty($slip_ref) ) {
+        b2b_line_reply($reply_token, "❌ ข้อมูลสลิปไม่ถูกต้อง กรุณาส่งสลิปใหม่ครับ");
+        return;
+    }
+
+    $slip_data = get_transient('b2b_slip_' . $slip_ref);
+    if ( !$slip_data ) {
+        b2b_line_reply($reply_token, "⏰ หมดเวลาเลือกบิลแล้ว กรุณาส่งสลิปใหม่ครับ");
+        return;
+    }
+
+    // Validate group ownership
+    if ( $slip_data['group_id'] !== $group_id ) {
+        b2b_line_reply($reply_token, "⛔ สลิปนี้ไม่ใช่ของกลุ่มนี้ครับ");
+        return;
+    }
+
+    // Validate ticket status
+    $status = get_field('order_status', $ticket_id);
+    if ( $status !== 'awaiting_payment' ) {
+        b2b_line_reply($reply_token, "ℹ️ บิล #".$ticket_id." ไม่ได้อยู่ในสถานะรอชำระแล้วครับ");
+        return;
+    }
+
+    // Advisory lock — prevent double-tap
+    $lock_key = 'b2b_lock_slip_' . $ticket_id;
+    if ( get_transient($lock_key) ) {
+        b2b_line_reply($reply_token, "⏳ กำลังดำเนินการอยู่ กรุณารอสักครู่");
+        return;
+    }
+    set_transient($lock_key, 1, 10);
+
+    $ticket_total = floatval(get_field('total_amount', $ticket_id));
+    $slip_remaining = floatval($slip_data['remaining']);
+    $inv_no = get_post_meta($ticket_id, '_inv_number', true) ?: '#'.$ticket_id;
+
+    // Check if slip amount covers the invoice (with 2% tolerance)
+    if ( $slip_remaining < $ticket_total * 0.98 ) {
+        b2b_line_reply($reply_token, "⚠️ ยอดสลิปไม่พอชำระบิลนี้เต็มจำนวน\n\nยอดสลิปคงเหลือ: ฿".number_format($slip_remaining,2)."\nยอดบิล ".$inv_no.": ฿".number_format($ticket_total,2)."\n\nกรุณาส่งสลิปเพิ่มเติมครับ");
+        delete_transient($lock_key);
+        return;
+    }
+
+    // Mark as paid — debt was already deducted when slip was processed, do NOT deduct again
+    b2b_set_order_status($ticket_id, 'paid');
+    update_field('paid_date', b2b_date('Y-m-d H:i:s'), $ticket_id);
+
+    // Send confirmation Flex reply
+    $logo = function_exists('b2b_get_logo_url') ? b2b_get_logo_url() : 'https://dinoco.in.th/wp-content/uploads/dinoco-logo.png';
+    $confirm_flex = array('type'=>'bubble','size'=>'kilo',
+        'header'=>array('type'=>'box','layout'=>'horizontal','backgroundColor'=>'#16a34a','paddingAll'=>'14px','contents'=>array(
+            array('type'=>'image','url'=>$logo,'size'=>'xxs','aspectMode'=>'fit','flex'=>0),
+            array('type'=>'box','layout'=>'vertical','flex'=>1,'margin'=>'md','contents'=>array(
+                array('type'=>'text','text'=>'✅ ชำระบิลสำเร็จ','color'=>'#ffffff','size'=>'sm','weight'=>'bold'),
+                array('type'=>'text','text'=>'Manual Matching','color'=>'#bbf7d0','size'=>'xxs'))))),
+        'body'=>array('type'=>'box','layout'=>'vertical','contents'=>array(
+            array('type'=>'box','layout'=>'horizontal','contents'=>array(
+                array('type'=>'text','text'=>'บิล','size'=>'xs','color'=>'#64748b','flex'=>2),
+                array('type'=>'text','text'=>$inv_no,'size'=>'sm','weight'=>'bold','flex'=>4,'align'=>'end'))),
+            array('type'=>'box','layout'=>'horizontal','margin'=>'sm','contents'=>array(
+                array('type'=>'text','text'=>'ยอดชำระ','size'=>'xs','color'=>'#64748b','flex'=>2),
+                array('type'=>'text','text'=>'฿'.number_format($ticket_total,2),'size'=>'md','weight'=>'bold','color'=>'#16a34a','flex'=>4,'align'=>'end'))),
+            array('type'=>'box','layout'=>'horizontal','margin'=>'sm','contents'=>array(
+                array('type'=>'text','text'=>'Ref','size'=>'xxs','color'=>'#94a3b8','flex'=>2),
+                array('type'=>'text','text'=>$slip_data['trans_ref'] ?: '-','size'=>'xxs','color'=>'#94a3b8','flex'=>4,'align'=>'end'))),
+        )));
+    b2b_line_reply_raw($reply_token, array(array('type'=>'flex','altText'=>'✅ ชำระบิล '.$inv_no.' สำเร็จ','contents'=>$confirm_flex)));
+
+    // Notify admin
+    $dist_name = $slip_data['dist_id'] ? get_the_title($slip_data['dist_id']) : 'ไม่ทราบ';
+    b2b_push_to_admin("💳 ชำระ manual — Ticket #".$ticket_id." (".$inv_no.") ฿".number_format($ticket_total,0)."\nร้าน: ".$dist_name."\nRef: ".($slip_data['trans_ref'] ?: '-'));
+
+    // Clean up transient after use
+    delete_transient('b2b_slip_' . $slip_ref);
+    delete_transient($lock_key);
 }
 
 // ═══════════════════════════════════════════════════════════════
