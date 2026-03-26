@@ -583,93 +583,58 @@ if ( ! function_exists( 'dinoco_github_sync_manual' ) ) {
 
         $branch = $req->get_param( 'branch' ) ?: 'main';
 
+        // V.30: Manual sync also uses chunked approach — set up job, first chunk fires on poll
         global $wpdb;
-        $table   = $wpdb->prefix . 'snippets';
-        $updated = array();
-        $errors  = array();
-
-        // Load active DB rows
+        $table = $wpdb->prefix . 'snippets';
         $all_db_rows = $wpdb->get_results(
             "SELECT id, name, active, revision FROM {$table} WHERE active = 1 AND (name LIKE '[Admin System]%' OR name LIKE '[System]%' OR name LIKE '[AdminSystem-System]%' OR name LIKE '[B2B]%') ORDER BY id ASC"
         );
 
-        $db_by_name = array();
+        $all_files = array();
         foreach ( $all_db_rows as $dbr ) {
             $normalized = dinoco_normalize_snippet_name( $dbr->name );
-            if ( ! isset( $db_by_name[ $normalized ] ) ) {
-                $db_by_name[ $normalized ] = $dbr;
+            if ( ! isset( $all_files[ $normalized ] ) ) {
+                $all_files[] = $normalized;
             }
         }
+        $all_files = array_values( array_unique( $all_files ) );
 
-        foreach ( $db_by_name as $file_name => $row ) {
-            // Primary: raw.githubusercontent.com
-            $raw_url = sprintf(
-                'https://raw.githubusercontent.com/%s/%s/%s',
-                $repo,
-                rawurlencode( $branch ),
-                rawurlencode( $file_name )
-            );
-            $raw_response = wp_remote_get( $raw_url, array(
-                'headers' => array(
-                    'Authorization' => 'token ' . $token,
-                    'User-Agent'    => 'DINOCO-System-Sync/1.0',
-                ),
-                'timeout' => 30,
-            ) );
+        // Create chunked job (same as webhook sync)
+        $job_state = array(
+            'files'      => $all_files,
+            'chunk_size' => 5,
+            'offset'     => 0,
+            'total'      => count( $all_files ),
+            'repo'       => $repo,
+            'commit_sha' => $branch, // manual uses branch name
+            'branch'     => $branch,
+            'token'      => $token,
+            'trigger'    => 'manual',
+            'updated'    => array(),
+            'errors'     => array(),
+            'db_names'   => $all_files,
+            'started_at' => current_time( 'mysql' ),
+            'status'     => 'syncing',
+        );
+        update_option( 'dinoco_sync_job', $job_state, false );
+        update_option( 'dinoco_last_sync_result', array(
+            'time'       => current_time( 'mysql' ),
+            'trigger'    => 'manual',
+            'mode'       => 'chunked_sync_v23',
+            'status'     => 'syncing',
+            'progress'   => '0/' . count( $all_files ),
+            'branch'     => $branch,
+            'commit_sha' => $branch,
+            'files_synced' => $all_files,
+            'updated'    => array(),
+            'errors'     => array(),
+        ) );
 
-            // Fallback: GitHub Contents API
-            if ( is_wp_error( $raw_response ) || wp_remote_retrieve_response_code( $raw_response ) !== 200 ) {
-                $content_url = sprintf(
-                    'https://api.github.com/repos/%s/contents/%s?ref=%s',
-                    $repo,
-                    rawurlencode( $file_name ),
-                    rawurlencode( $branch )
-                );
-                $raw_response = wp_remote_get( $content_url, array(
-                    'headers' => array(
-                        'Accept'        => 'application/vnd.github.v3.raw',
-                        'Authorization' => 'Bearer ' . $token,
-                        'User-Agent'    => 'DINOCO-System-Sync/1.0',
-                    ),
-                    'timeout' => 30,
-                ) );
-            }
-
-            if ( is_wp_error( $raw_response ) || wp_remote_retrieve_response_code( $raw_response ) !== 200 ) {
-                $err_msg = is_wp_error( $raw_response ) ? $raw_response->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $raw_response );
-                $errors[] = $file_name . ': ' . $err_msg;
-                continue;
-            }
-
-            $code = wp_remote_retrieve_body( $raw_response );
-
-            // V.21: Safety — verify fetched code belongs to this snippet
-            $code_head = substr( $code, 0, 600 );
-            $name_parts = explode( ']', explode( '[', $file_name, 2 )[1] ?? '', 2 );
-            $prefix_tag = isset( $name_parts[0] ) ? '[' . $name_parts[0] . ']' : '';
-            $name_after_prefix = trim( substr( $file_name, strlen( $prefix_tag ) ) );
-            if ( ! empty( $name_after_prefix ) && strlen( $code ) > 100 && strpos( $code_head, $name_after_prefix ) === false ) {
-                dinoco_sync_log( 'CONTENT MISMATCH (manual): file=' . $file_name . ' — SKIPPED' );
-                $errors[] = $file_name . ': content_mismatch_prevented_swap';
-                continue;
-            }
-
-            $sync_result = dinoco_sync_update_snippet( $row, $code, $file_name );
-            if ( $sync_result['ok'] ) {
-                $updated[] = $file_name;
-            } else {
-                $errors[] = $file_name . ': ' . $sync_result['message'];
-            }
-        }
-
-        // Global cache flush
-        wp_cache_flush();
-        if ( function_exists( 'opcache_reset' ) ) {
-            @opcache_reset();
-        }
-        if ( function_exists( 'wpfc_clear_all_cache' ) ) {
-            wpfc_clear_all_cache( true );
-        }
+        // Fire first chunk immediately
+        dinoco_sync_process_chunk();
+        $job = get_option( 'dinoco_sync_job' );
+        $updated = $job ? ($job['updated'] ?? array()) : array();
+        $errors  = $job ? ($job['errors'] ?? array()) : array();
         $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
         $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
 
