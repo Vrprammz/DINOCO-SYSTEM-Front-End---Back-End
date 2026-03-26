@@ -818,8 +818,36 @@ def main():
         idle_count = 0
         logger.info(f'Daemon mode — polling every {base_interval}s (adaptive up to {max_interval}s)')
 
+        # Screen sleep schedule (21:00 - 10:00 Bangkok time)
+        screen_sleep_start = config.get('screen_sleep_start', 21)  # 21:00
+        screen_sleep_end = config.get('screen_sleep_end', 10)      # 10:00
+        _screen_is_off = False
+
+        def _check_screen_sleep():
+            nonlocal _screen_is_off
+            bkk = timezone(timedelta(hours=7))
+            hour = datetime.now(bkk).hour
+            # 21:00-23:59 or 00:00-09:59 = sleep
+            should_sleep = hour >= screen_sleep_start or hour < screen_sleep_end
+            if should_sleep and not _screen_is_off:
+                logger.info(f'Screen sleep — turning off display ({hour}:00 Bangkok)')
+                try:
+                    # Try multiple methods for different Pi setups
+                    os.system('vcgencmd display_power 0 2>/dev/null || xset dpms force off 2>/dev/null || wlr-randr --output HDMI-A-1 --off 2>/dev/null')
+                except Exception as e:
+                    logger.debug(f'Screen off error: {e}')
+                _screen_is_off = True
+            elif not should_sleep and _screen_is_off:
+                logger.info(f'Screen wake — turning on display ({hour}:00 Bangkok)')
+                try:
+                    os.system('vcgencmd display_power 1 2>/dev/null || xset dpms force on 2>/dev/null || wlr-randr --output HDMI-A-1 --on 2>/dev/null')
+                except Exception as e:
+                    logger.debug(f'Screen on error: {e}')
+                _screen_is_off = False
+
         last_heartbeat = 0
         while running:
+            _check_screen_sleep()
             try:
                 processed = poll_and_print(config, printer_mgr)
                 if processed and processed > 0:
