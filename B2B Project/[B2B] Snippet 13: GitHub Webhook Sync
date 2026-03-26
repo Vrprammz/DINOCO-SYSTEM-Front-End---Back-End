@@ -1,0 +1,953 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2B] Snippet 13: GitHub Webhook Sync                       ║
+ * ║  Version: V.22.0 — Fix merge commit sync + Compare API fallback ║
+ * ║  DINOCO B2B Smart Order System                               ║
+ * ╠══════════════════════════════════════════════════════════════╣
+ * ║  Push to GitHub → Webhook → WordPress REST API               ║
+ * ║  → อัพเดท code ใน wp_snippets table อัตโนมัติ                  ║
+ * ╠══════════════════════════════════════════════════════════════╣
+ * ║  Required constants in wp-config.php:                        ║
+ * ║    B2B_GITHUB_WEBHOOK_SECRET  — shared secret                ║
+ * ║    B2B_GITHUB_TOKEN           — personal access token        ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * V.22.0 Changes:
+ * - Fix: Merge commits (PR merge) have empty modified/added arrays in webhook payload
+ *   → Detect merge commits by message pattern "Merge pull request" or "Merge branch"
+ *   → Force full sync for merge commits (all 13 snippets, ~2s overhead)
+ *   → No more "no_snippet_files_changed" false negatives on PR merge
+ * - Fix: Compare API fallback could fail silently (timeout, rate limit)
+ *   → Add logging for Compare API failures
+ *   → Fallback to full sync if Compare API fails (instead of skipping)
+ *
+ * V.19.0 Changes:
+ * - Fix: wpdb->update() writes to DB but object cache serves stale snippet code
+ *   → New helper: b2b_sync_update_snippet() with return value check
+ *   → wp_cache_flush() after every DB write
+ *   → Delete Code Snippets transients + WP Fastest Cache clear
+ *   → Verify-after-write: read back + compare MD5 hash
+ *   → Applied to both webhook sync AND manual sync paths
+ *
+ * V.18.0 Changes:
+ * - Add: [b2b_sync_dashboard] shortcode — Admin debug dashboard
+ *   → ดูสถานะ sync, config check, snippet table, manual sync button
+ *   → ใส่ shortcode ในหน้า WP page → เปิดด้วย admin ได้เลย
+ *
+ * V.17.0 Changes:
+ * - Fix: raw.githubusercontent.com CDN cache serving stale content
+ *   → ใช้ commit SHA (data['after']) แทน branch name ใน raw URL
+ *   → Commit SHA URL ไม่มี cache เพราะ immutable
+ *   → Fallback Contents API ก็ใช้ commit SHA เช่นกัน
+ *
+ * V.16.1 Changes:
+ * - Fix: html_entity_decode() on DB snippet names before GitHub URL construction
+ *   → Recreated snippets stored &amp; instead of & → 404 on raw download
+ *   → Affects snippets with & or special chars in name (S1, S2, etc.)
+ *
+ * V.16.0 Changes:
+ * - Fix: api.github.com timeout (cURL error 28) จาก WP hosting
+ *   → ใช้ raw.githubusercontent.com แทน API (เร็วกว่า + reliable กว่า)
+ *   → ตัด directory listing ออก — ใช้ commit data + DB mapping แทน
+ * - Fix: duplicate DB rows ชน regex (1A/1B/1C/1D)
+ *   → regex (?![A-Za-z]) + active=1 filter + first-match wins
+ *
+ * V.15.0: shutdown hook + fastcgi_finish_request() (WP-Cron unreliable)
+ *         + execution lock + refactor b2b_do_full_sync()
+ *
+ * V.5.0: Contents API (fix private repo download)
+ * V.4.1: Match by number + full sync
+ * V.3.0: Compare API always-on
+ * V.2.0: Async processing (fix webhook timeout)
+ * V.1.2: Main-only filter + debug logging
+ */
+
+// ══════════════════════════════════════════════════════════════
+// HELPER: Normalize DB snippet name → GitHub filename
+// WordPress Code Snippets plugin อาจเก็บ &amp; แทน & ใน DB
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_normalize_snippet_name' ) ) {
+    function b2b_normalize_snippet_name( $name ) {
+        return trim( html_entity_decode( $name, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// V.19.0: HELPER — Update snippet code with cache-bust + verify
+// Fix: wpdb->update() alone doesn't flush object cache
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_sync_update_snippet' ) ) {
+    function b2b_sync_update_snippet( $row, $code, $file_name ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'snippets';
+
+        $new_revision = intval( $row->revision ) + 1;
+
+        // ── 1. Execute update ──
+        $result = $wpdb->update(
+            $table,
+            array(
+                'code'     => $code,
+                'modified' => current_time( 'mysql' ),
+                'revision' => $new_revision,
+            ),
+            array( 'id' => $row->id ),
+            array( '%s', '%s', '%d' ),
+            array( '%d' )
+        );
+
+        // ── 2. Check return value ──
+        if ( $result === false ) {
+            $err = $wpdb->last_error;
+            b2b_log( '[Sync] DB UPDATE FAILED: ' . $file_name . ' (id=' . $row->id . '): ' . $err );
+            return array( 'ok' => false, 'message' => 'db_update_failed: ' . $err );
+        }
+
+        // ── 3. Flush WordPress object cache (targeted, not global) ──
+        wp_cache_delete( 'alloptions', 'options' );
+
+        // ── 4. Clear Code Snippets plugin caches ──
+        delete_transient( 'code_snippets' );
+        delete_transient( 'code_snippets_active' );
+        delete_transient( 'all_snippets' );
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%' AND option_name LIKE '%_transient%'" );
+        wp_cache_delete( $row->id, 'code_snippets' );
+        wp_cache_delete( 'all_snippets', 'code_snippets' );
+
+        // ── 5. Clear WP Fastest Cache if available ──
+        if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+            wpfc_clear_all_cache( true );
+        }
+
+        // ── 6. Verify-after-write ──
+        $verify_hash = $wpdb->get_var( $wpdb->prepare(
+            "SELECT md5(code) FROM {$table} WHERE id = %d",
+            $row->id
+        ) );
+        $expected_hash = md5( $code );
+
+        if ( $verify_hash !== $expected_hash ) {
+            b2b_log( '[Sync] VERIFY MISMATCH: ' . $file_name . ' expected=' . substr( $expected_hash, 0, 8 ) . ' actual=' . substr( $verify_hash ?: 'null', 0, 8 ) . ' len=' . strlen( $code ) );
+            return array( 'ok' => false, 'message' => 'verify_hash_mismatch (len=' . strlen( $code ) . ')' );
+        }
+
+        b2b_log( '[Sync] OK: ' . $file_name . ' (id=' . $row->id . ', rev=' . $new_revision . ', len=' . strlen( $code ) . ')' );
+        return array( 'ok' => true, 'message' => 'updated_and_verified' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// REST API ENDPOINT: /wp-json/b2b/v1/github-sync
+// V.15.0: respond 200 → run sync via shutdown hook
+// ══════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'b2b/v1', '/github-sync', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_github_sync_handler',
+        'permission_callback' => '__return_true',
+    ) );
+} );
+
+if ( ! function_exists( 'b2b_github_sync_handler' ) ) {
+    function b2b_github_sync_handler( WP_REST_Request $req ) {
+
+        // ── 1. Verify GitHub HMAC-SHA256 Signature ──
+        $secret = defined( 'B2B_GITHUB_WEBHOOK_SECRET' ) ? B2B_GITHUB_WEBHOOK_SECRET : '';
+        if ( empty( $secret ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'webhook_secret_not_configured' ), 500 );
+        }
+
+        $signature = $req->get_header( 'X-Hub-Signature-256' );
+        $payload   = $req->get_body();
+
+        if ( empty( $signature ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'missing_signature' ), 403 );
+        }
+
+        $expected = 'sha256=' . hash_hmac( 'sha256', $payload, $secret );
+        if ( ! hash_equals( $expected, $signature ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'invalid_signature' ), 403 );
+        }
+
+        // ── 2. Parse push event — quick validation only ──
+        $data = json_decode( $payload, true );
+        if ( empty( $data['commits'] ) || empty( $data['repository'] ) ) {
+            return new WP_REST_Response( array( 'ok' => true, 'message' => 'ping_received' ), 200 );
+        }
+
+        // V.1.2: Only sync from main branch
+        $ref = isset( $data['ref'] ) ? $data['ref'] : '';
+        if ( $ref !== 'refs/heads/main' ) {
+            return new WP_REST_Response( array(
+                'ok'      => true,
+                'message' => 'ignored_non_main_branch',
+                'ref'     => $ref,
+            ), 200 );
+        }
+
+        // ── 3. V.15.0: Primary = shutdown hook (runs after response sent) ──
+        $GLOBALS['_b2b_pending_sync'] = $data;
+        add_action( 'shutdown', 'b2b_sync_on_shutdown', 0 );
+
+        // Backup: WP-Cron (delay 30s — gives shutdown hook time to run first)
+        $job_id = 'b2b_sync_' . substr( md5( $payload ), 0, 12 );
+        set_transient( $job_id, $data, 600 );
+        wp_clear_scheduled_hook( 'b2b_github_sync_process', array( $job_id ) );
+        wp_schedule_single_event( time() + 30, 'b2b_github_sync_process', array( $job_id ) );
+        spawn_cron();
+
+        return new WP_REST_Response( array(
+            'ok'      => true,
+            'message' => 'sync_started',
+            'job_id'  => $job_id,
+            'ref'     => $ref,
+        ), 200 );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// V.15.0: SHUTDOWN HOOK — runs after REST response is sent
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_sync_on_shutdown' ) ) {
+    function b2b_sync_on_shutdown() {
+        if ( empty( $GLOBALS['_b2b_pending_sync'] ) ) return;
+        $data = $GLOBALS['_b2b_pending_sync'];
+        unset( $GLOBALS['_b2b_pending_sync'] );
+
+        // Close connection to client (prevent GitHub timeout)
+        if ( function_exists( 'fastcgi_finish_request' ) ) {
+            fastcgi_finish_request();
+        }
+
+        @set_time_limit( 300 );
+        ignore_user_abort( true );
+
+        b2b_do_full_sync( $data, 'shutdown' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// WP-CRON BACKUP: fires 30s later if shutdown didn't run
+// ══════════════════════════════════════════════════════════════
+
+add_action( 'b2b_github_sync_process', 'b2b_github_sync_process_job' );
+
+if ( ! function_exists( 'b2b_github_sync_process_job' ) ) {
+    function b2b_github_sync_process_job( $job_id ) {
+        @set_time_limit( 300 );
+
+        $data = get_transient( $job_id );
+        if ( ! $data ) return; // Already processed by shutdown hook
+        delete_transient( $job_id );
+
+        b2b_do_full_sync( $data, 'cron' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// V.15.0: SHARED SYNC LOGIC — used by shutdown hook + WP-Cron
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_do_full_sync' ) ) {
+    function b2b_do_full_sync( $data, $trigger = 'unknown' ) {
+
+        // ── Execution lock: prevent double-run ──
+        $lock = get_transient( 'b2b_sync_running' );
+        if ( $lock ) {
+            update_option( 'b2b_last_sync_result', array(
+                'time'    => current_time( 'mysql' ),
+                'trigger' => $trigger,
+                'message' => 'skipped_already_running (locked by: ' . $lock . ')',
+            ) );
+            return;
+        }
+        set_transient( 'b2b_sync_running', $trigger, 300 );
+        try {
+
+        // ── V.22.0: Detect merge commits — force full sync ──
+        // GitHub merge commits have empty modified/added arrays in webhook payload
+        // but may contain snippet changes from the merged branch
+        $is_merge = false;
+        $head_msg = ! empty( $data['head_commit']['message'] ) ? $data['head_commit']['message'] : '';
+        if ( preg_match( '/^Merge (pull request|branch)\b/', $head_msg ) ) {
+            $is_merge = true;
+            b2b_log( '[Sync] Merge commit detected: ' . substr( $head_msg, 0, 80 ) . ' → force full sync' );
+        }
+
+        // ── Quick check: did any snippet files change? ──
+        $modified_files = array();
+        if ( ! empty( $data['commits'] ) ) {
+            foreach ( $data['commits'] as $commit ) {
+                if ( ! empty( $commit['modified'] ) ) {
+                    $modified_files = array_merge( $modified_files, $commit['modified'] );
+                }
+                if ( ! empty( $commit['added'] ) ) {
+                    $modified_files = array_merge( $modified_files, $commit['added'] );
+                }
+            }
+        }
+        if ( ! empty( $data['head_commit'] ) ) {
+            if ( ! empty( $data['head_commit']['modified'] ) ) {
+                $modified_files = array_merge( $modified_files, $data['head_commit']['modified'] );
+            }
+            if ( ! empty( $data['head_commit']['added'] ) ) {
+                $modified_files = array_merge( $modified_files, $data['head_commit']['added'] );
+            }
+        }
+
+        $has_snippet = false;
+        foreach ( $modified_files as $f ) {
+            if ( strpos( $f, '[B2B] Snippet' ) === 0 ) {
+                $has_snippet = true;
+                break;
+            }
+        }
+
+        // V.22.0: Merge commit → always has_snippet (force full sync)
+        if ( $is_merge ) {
+            $has_snippet = true;
+        }
+
+        // Compare API fallback: ถ้า commits ไม่มี snippet + ไม่ใช่ merge → เช็คจาก compare
+        if ( ! $has_snippet && ! empty( $data['before'] ) && ! empty( $data['after'] ) ) {
+            $token = defined( 'B2B_GITHUB_TOKEN' ) ? B2B_GITHUB_TOKEN : '';
+            if ( ! empty( $token ) ) {
+                $compare_url = sprintf(
+                    'https://api.github.com/repos/%s/compare/%s...%s',
+                    $data['repository']['full_name'], $data['before'], $data['after']
+                );
+                $cmp_resp = wp_remote_get( $compare_url, array(
+                    'headers' => array(
+                        'Accept'        => 'application/vnd.github.v3+json',
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent'    => 'DINOCO-B2B-Sync/22.0',
+                    ),
+                    'timeout' => 15,
+                ) );
+                if ( ! is_wp_error( $cmp_resp ) && wp_remote_retrieve_response_code( $cmp_resp ) === 200 ) {
+                    $cmp_data = json_decode( wp_remote_retrieve_body( $cmp_resp ), true );
+                    if ( ! empty( $cmp_data['files'] ) ) {
+                        foreach ( $cmp_data['files'] as $cf ) {
+                            if ( ! empty( $cf['filename'] ) && strpos( $cf['filename'], '[B2B] Snippet' ) === 0 ) {
+                                $has_snippet = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // V.22.0: Compare API failed — log and fallback to full sync
+                    $cmp_err = is_wp_error( $cmp_resp ) ? $cmp_resp->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $cmp_resp );
+                    b2b_log( '[Sync] Compare API failed: ' . $cmp_err . ' → fallback to full sync' );
+                    $has_snippet = true; // Force sync when compare fails
+                }
+            }
+        }
+
+        if ( ! $has_snippet ) {
+            delete_transient( 'b2b_sync_running' );
+            update_option( 'b2b_last_sync_result', array(
+                'time'    => current_time( 'mysql' ),
+                'trigger' => $trigger,
+                'message' => 'no_snippet_files_changed',
+                'files'   => array_values( array_unique( $modified_files ) ),
+            ) );
+            return;
+        }
+
+        // ── V.17.0: Sync snippets — use commit SHA to bypass CDN cache ──
+        $repo       = $data['repository']['full_name'];
+        $branch     = str_replace( 'refs/heads/', '', $data['ref'] );
+        $commit_sha = ! empty( $data['after'] ) ? $data['after'] : $branch; // V.17.0: exact commit → no cache
+        $token      = defined( 'B2B_GITHUB_TOKEN' ) ? B2B_GITHUB_TOKEN : '';
+
+        if ( empty( $token ) ) {
+            delete_transient( 'b2b_sync_running' );
+            update_option( 'b2b_last_sync_result', array(
+                'time'    => current_time( 'mysql' ),
+                'trigger' => $trigger,
+                'error'   => 'github_token_not_configured',
+            ) );
+            return;
+        }
+
+        global $wpdb;
+        $table   = $wpdb->prefix . 'snippets';
+        $updated = array();
+        $errors  = array();
+
+        // V.16.0: Load active DB rows, keyed by snippet number
+        $like_prefix = $wpdb->esc_like( '[B2B] Snippet' ) . '%';
+        $all_db_rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, name, active, revision FROM {$table} WHERE name LIKE %s AND active = 1 ORDER BY id ASC",
+            $like_prefix
+        ) );
+        $db_by_number = array();
+        foreach ( $all_db_rows as $dbr ) {
+            if ( preg_match( '/Snippet\s+(\d+)(?![A-Za-z])/', $dbr->name, $m ) ) {
+                $num = $m[1];
+                if ( ! isset( $db_by_number[ $num ] ) ) {
+                    $db_by_number[ $num ] = $dbr;   // first match wins (lowest id)
+                }
+            }
+        }
+
+        // V.16.0: Build file list from commits + DB — no dir listing needed
+        $snippet_files = array();
+        foreach ( $modified_files as $f ) {
+            if ( preg_match( '/^\[B2B\] Snippet\s+(\d+)(?![A-Za-z])/', $f, $m ) ) {
+                $snippet_files[ $m[1] ] = $f;
+            }
+        }
+        // Full sync: add DB snippets not in commits (derive filename from DB name)
+        foreach ( $db_by_number as $num => $dbr ) {
+            if ( ! isset( $snippet_files[ $num ] ) ) {
+                $snippet_files[ $num ] = b2b_normalize_snippet_name( $dbr->name );
+            }
+        }
+
+        foreach ( $snippet_files as $snippet_num => $file_name ) {
+
+            // V.17.0: Primary = raw.githubusercontent.com with COMMIT SHA (bypass CDN cache)
+            $raw_url = sprintf(
+                'https://raw.githubusercontent.com/%s/%s/%s',
+                $repo,
+                rawurlencode( $commit_sha ),
+                rawurlencode( $file_name )
+            );
+            $raw_resp = wp_remote_get( $raw_url, array(
+                'headers' => array(
+                    'Authorization' => 'token ' . $token,
+                    'User-Agent'    => 'DINOCO-B2B-Sync/17.0',
+                ),
+                'timeout' => 30,
+            ) );
+
+            // Fallback: GitHub Contents API with commit SHA
+            if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
+                $content_url = sprintf(
+                    'https://api.github.com/repos/%s/contents/%s?ref=%s',
+                    $repo,
+                    rawurlencode( $file_name ),
+                    rawurlencode( $commit_sha )
+                );
+                $raw_resp = wp_remote_get( $content_url, array(
+                    'headers' => array(
+                        'Accept'        => 'application/vnd.github.v3.raw',
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent'    => 'DINOCO-B2B-Sync/17.0',
+                    ),
+                    'timeout' => 30,
+                ) );
+            }
+
+            if ( is_wp_error( $raw_resp ) || wp_remote_retrieve_response_code( $raw_resp ) !== 200 ) {
+                $err_msg = is_wp_error( $raw_resp ) ? $raw_resp->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $raw_resp );
+                $errors[] = $file_name . ': ' . $err_msg;
+                continue;
+            }
+
+            $code = wp_remote_retrieve_body( $raw_resp );
+
+            // Match by snippet number
+            $row = isset( $db_by_number[ $snippet_num ] ) ? $db_by_number[ $snippet_num ] : null;
+
+            if ( $row ) {
+                $sync_result = b2b_sync_update_snippet( $row, $code, $file_name );
+                if ( $sync_result['ok'] ) {
+                    $updated[] = $file_name . ' (db:' . $row->name . ')';
+                } else {
+                    $errors[] = $file_name . ': ' . $sync_result['message'];
+                }
+            } else {
+                $errors[] = $file_name . ': snippet_not_found_in_db (num=' . $snippet_num . ')';
+            }
+        }
+
+        // ── V.21.0: Global cache flush after ALL snippets updated ──
+        // Fix: Code Snippets plugin may serve stale code from object cache
+        wp_cache_flush();
+        if ( function_exists( 'opcache_reset' ) ) {
+            @opcache_reset();
+        }
+        if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+            wpfc_clear_all_cache( true );
+        }
+        // Clear Code Snippets plugin transients (global)
+        global $wpdb;
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
+
+        // ── Save result for debugging ──
+        $db_names = array();
+        foreach ( $db_by_number as $num => $dbr ) {
+            $db_names[ 'S' . $num ] = $dbr->name;
+        }
+        update_option( 'b2b_last_sync_result', array(
+            'time'           => current_time( 'mysql' ),
+            'trigger'        => $trigger,
+            'branch'         => $branch,
+            'commit_sha'     => $commit_sha, // V.17.0: track SHA used
+            'mode'           => 'full_sync_v17',
+            'files_synced'   => array_values( $snippet_files ),
+            'db_names'       => $db_names,
+            'updated'        => $updated,
+            'errors'         => $errors,
+        ) );
+        } finally {
+            delete_transient( 'b2b_sync_running' );
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// MANUAL SYNC ENDPOINT: /wp-json/b2b/v1/github-sync-manual
+// สำหรับ sync ด้วยมือ (เรียกจาก browser/Postman ได้)
+// ══════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'b2b/v1', '/github-sync-manual', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_github_sync_manual',
+        'permission_callback' => function () {
+            return current_user_can( 'manage_options' );
+        },
+    ) );
+} );
+
+if ( ! function_exists( 'b2b_github_sync_manual' ) ) {
+    function b2b_github_sync_manual( WP_REST_Request $req ) {
+        $token = defined( 'B2B_GITHUB_TOKEN' ) ? B2B_GITHUB_TOKEN : '';
+        $repo  = defined( 'B2B_GITHUB_REPO' )  ? B2B_GITHUB_REPO  : '';
+
+        if ( empty( $token ) || empty( $repo ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'missing_config: B2B_GITHUB_TOKEN or B2B_GITHUB_REPO' ), 500 );
+        }
+
+        $branch = $req->get_param( 'branch' ) ?: 'main';
+
+        // V.16.0: Load active DB rows, build file list from DB names
+        global $wpdb;
+        $table   = $wpdb->prefix . 'snippets';
+        $updated = array();
+        $errors  = array();
+
+        $like_prefix = $wpdb->esc_like( '[B2B] Snippet' ) . '%';
+        $all_db_rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, name, active, revision FROM {$table} WHERE name LIKE %s AND active = 1 ORDER BY id ASC",
+            $like_prefix
+        ) );
+        $db_by_number = array();
+        foreach ( $all_db_rows as $dbr ) {
+            if ( preg_match( '/Snippet\s+(\d+)(?![A-Za-z])/', $dbr->name, $m ) ) {
+                $num = $m[1];
+                if ( ! isset( $db_by_number[ $num ] ) ) {
+                    $db_by_number[ $num ] = $dbr;
+                }
+            }
+        }
+
+        foreach ( $db_by_number as $snippet_num => $row ) {
+            $file_name = b2b_normalize_snippet_name( $row->name );
+
+            // V.16.0: Primary = raw.githubusercontent.com
+            $raw_url = sprintf(
+                'https://raw.githubusercontent.com/%s/%s/%s',
+                $repo,
+                rawurlencode( $branch ),
+                rawurlencode( $file_name )
+            );
+            $raw_response = wp_remote_get( $raw_url, array(
+                'headers' => array(
+                    'Authorization' => 'token ' . $token,
+                    'User-Agent'    => 'DINOCO-B2B-Sync/16.1',
+                ),
+                'timeout' => 30,
+            ) );
+
+            // Fallback: GitHub Contents API
+            if ( is_wp_error( $raw_response ) || wp_remote_retrieve_response_code( $raw_response ) !== 200 ) {
+                $content_url = sprintf(
+                    'https://api.github.com/repos/%s/contents/%s?ref=%s',
+                    $repo,
+                    rawurlencode( $file_name ),
+                    rawurlencode( $branch )
+                );
+                $raw_response = wp_remote_get( $content_url, array(
+                    'headers' => array(
+                        'Accept'        => 'application/vnd.github.v3.raw',
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent'    => 'DINOCO-B2B-Sync/16.1',
+                    ),
+                    'timeout' => 30,
+                ) );
+            }
+
+            if ( is_wp_error( $raw_response ) || wp_remote_retrieve_response_code( $raw_response ) !== 200 ) {
+                $err_msg = is_wp_error( $raw_response ) ? $raw_response->get_error_message() : 'HTTP ' . wp_remote_retrieve_response_code( $raw_response );
+                $errors[] = $file_name . ': ' . $err_msg;
+                continue;
+            }
+
+            $code = wp_remote_retrieve_body( $raw_response );
+
+            $sync_result = b2b_sync_update_snippet( $row, $code, $file_name );
+            if ( $sync_result['ok'] ) {
+                $updated[] = $file_name;
+            } else {
+                $errors[] = $file_name . ': ' . $sync_result['message'];
+            }
+        }
+
+        // V.21.0: Global cache flush after ALL snippets updated
+        wp_cache_flush();
+        if ( function_exists( 'opcache_reset' ) ) {
+            @opcache_reset();
+        }
+        if ( function_exists( 'wpfc_clear_all_cache' ) ) {
+            wpfc_clear_all_cache( true );
+        }
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%snippet%' AND option_name LIKE '%transient%'" );
+        $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '%code_snippets%'" );
+
+        return new WP_REST_Response( array(
+            'ok'      => true,
+            'updated' => $updated,
+            'errors'  => $errors,
+            'branch'  => $branch,
+        ), 200 );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// DEBUG ENDPOINT: GET /wp-json/b2b/v1/sync-status
+// ดูผลลัพธ์ sync ล่าสุด + ชื่อ snippet ใน DB (เปิด browser ได้เลย)
+// ══════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'b2b/v1', '/sync-status', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2b_github_sync_status',
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ) );
+} );
+
+if ( ! function_exists( 'b2b_github_sync_status' ) ) {
+    function b2b_github_sync_status() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'snippets';
+
+        // V.16.0: Show only active snippets
+        $like_prefix = $wpdb->esc_like( '[B2B] Snippet' ) . '%';
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, name, active, modified, revision, SUBSTRING(code, 1, 500) AS code_head FROM {$table} WHERE name LIKE %s AND active = 1 ORDER BY name",
+            $like_prefix
+        ) );
+
+        $snippets = array();
+        foreach ( $rows as $r ) {
+            $num = '';
+            if ( preg_match( '/Snippet\s+(\d+)(?![A-Za-z])/', $r->name, $m ) ) {
+                $num = $m[1];
+            }
+            $php_ver = '';
+            if ( !empty($r->code_head) && preg_match('/Version:\s*(V\.[\d.]+)/', $r->code_head, $vm) ) {
+                $php_ver = trim($vm[1]);
+            }
+            $snippets[] = array(
+                'id'       => $r->id,
+                'num'      => $num,
+                'name'     => b2b_normalize_snippet_name( $r->name ),
+                'raw_name' => $r->name,
+                'version'  => $php_ver,
+                'modified' => $r->modified,
+                'revision' => $r->revision,
+            );
+        }
+
+        return new WP_REST_Response( array(
+            'last_sync' => get_option( 'b2b_last_sync_result', null ),
+            'snippets'  => $snippets,
+        ), 200 );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// SHORTCODE: [b2b_sync_dashboard]
+// Admin-only debug dashboard — ดูสถานะ sync + กด manual sync
+// ══════════════════════════════════════════════════════════════
+
+add_shortcode( 'b2b_sync_dashboard', 'b2b_render_sync_dashboard' );
+
+if ( ! function_exists( 'b2b_render_sync_dashboard' ) ) {
+function b2b_render_sync_dashboard() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return '<div style="padding:60px;text-align:center;color:#ef4444;font-size:18px">ไม่มีสิทธิ์เข้าถึง</div>';
+    }
+
+    // ── Data ──
+    $last   = get_option( 'b2b_last_sync_result', array() );
+    $lock   = get_transient( 'b2b_sync_running' );
+    $nonce  = wp_create_nonce( 'wp_rest' );
+    $rest   = esc_url( rest_url( 'b2b/v1/' ) );
+    $wh_url = esc_url( rest_url( 'b2b/v1/github-sync' ) );
+
+    $has_secret = defined( 'B2B_GITHUB_WEBHOOK_SECRET' ) && B2B_GITHUB_WEBHOOK_SECRET !== '';
+    $has_token  = defined( 'B2B_GITHUB_TOKEN' ) && B2B_GITHUB_TOKEN !== '';
+    $has_repo   = defined( 'B2B_GITHUB_REPO' ) && B2B_GITHUB_REPO !== '';
+    $repo_val   = $has_repo ? B2B_GITHUB_REPO : '';
+    $token_mask = $has_token ? substr( B2B_GITHUB_TOKEN, 0, 4 ) . '****' : '';
+
+    // Relative time
+    $ago = '—';
+    if ( ! empty( $last['time'] ) ) {
+        $diff = time() - strtotime( get_gmt_from_date( $last['time'] ) );
+        if ( $diff < 60 )        $ago = $diff . ' วินาทีที่แล้ว';
+        elseif ( $diff < 3600 )  $ago = floor( $diff / 60 ) . ' นาทีที่แล้ว';
+        elseif ( $diff < 86400 ) $ago = floor( $diff / 3600 ) . ' ชั่วโมงที่แล้ว';
+        else                     $ago = floor( $diff / 86400 ) . ' วันที่แล้ว';
+    }
+
+    $trigger    = ! empty( $last['trigger'] )      ? $last['trigger']      : '—';
+    $branch     = ! empty( $last['branch'] )       ? $last['branch']       : '—';
+    $commit_sha = ! empty( $last['commit_sha'] )   ? $last['commit_sha']   : '';
+    $mode       = ! empty( $last['mode'] )         ? $last['mode']         : '—';
+    $updated    = ! empty( $last['updated'] )      ? $last['updated']      : array();
+    $errors     = ! empty( $last['errors'] )       ? $last['errors']       : array();
+    $synced     = ! empty( $last['files_synced'] ) ? $last['files_synced'] : array();
+    $msg        = ! empty( $last['message'] )      ? $last['message']      : '';
+
+    // Snippets from DB
+    global $wpdb;
+    $table       = $wpdb->prefix . 'snippets';
+    $like_prefix = $wpdb->esc_like( '[B2B] Snippet' ) . '%';
+    $rows        = $wpdb->get_results( $wpdb->prepare(
+        "SELECT id, name, active, modified, revision, SUBSTRING(code, 1, 500) AS code_head FROM {$table} WHERE name LIKE %s AND active = 1 ORDER BY id ASC",
+        $like_prefix
+    ) );
+
+    // V.21.0: Read dashboard version from Snippet 13 actual DB code (not hardcode)
+    $dashboard_ver = '—';
+    foreach ( $rows as $r ) {
+        if ( preg_match( '/Snippet\s+13(?![A-Za-z])/', $r->name ) && ! empty( $r->code_head ) && preg_match( '/Version:\s*(V\.[\d.]+)/', $r->code_head, $dvm ) ) {
+            $dashboard_ver = $dvm[1];
+            break;
+        }
+    }
+
+    ob_start();
+?>
+<style>
+.sd{font-family:'Noto Sans Thai',-apple-system,system-ui,sans-serif;font-size:14px;color:#101828;max-width:960px;margin:0 auto}
+.sd *{box-sizing:border-box;margin:0}
+.sd-hd{background:linear-gradient(135deg,#0f2447,#1e3a5f);border-radius:12px 12px 0 0;padding:22px 28px;display:flex;align-items:center;justify-content:space-between}
+.sd-hd h1{font-size:17px;font-weight:700;color:#fff;letter-spacing:-.01em}.sd-hd .ver{background:rgba(255,255,255,.12);color:#94a3b8;font-size:11px;font-weight:600;padding:3px 10px;border-radius:16px}
+.sd-bd{background:#fff;border:1px solid #e4e7ec;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px}
+.sd-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin-bottom:22px}
+.sd-c{background:#f8f9fb;border:1px solid #e4e7ec;border-radius:10px;padding:14px 16px}.sd-c:hover{border-color:#2563eb;box-shadow:0 1px 4px rgba(37,99,235,.08)}
+.sd-cl{font-size:11px;color:#667085;font-weight:500;margin-bottom:4px}.sd-cv{font-size:20px;font-weight:700;letter-spacing:-.02em}
+.sd-cv.ok{color:#12b76a}.sd-cv.err{color:#f04438}.sd-cv.lock{color:#f79009}
+.sd-sec{margin-bottom:22px}.sd-sec h3{font-size:14px;font-weight:700;color:#344054;margin-bottom:10px}
+.sd-cfg{display:grid;gap:8px}.sd-cfg-row{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#f8f9fb;border-radius:8px;font-size:13px}
+.sd-cfg-row .k{font-weight:600;color:#344054;min-width:200px}.sd-cfg-row .v{color:#667085;word-break:break-all}
+.sd-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}.sd-dot-ok{background:#12b76a}.sd-dot-no{background:#f04438}
+.sd-tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.sd-tbl th{text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#667085;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid #e4e7ec;background:#f8f9fb;position:sticky;top:0}
+.sd-tbl td{padding:10px;border-bottom:1px solid #f2f4f7;vertical-align:middle}.sd-tbl tbody tr:last-child td{border-bottom:none}
+.sd-tbl-wrap{border:1px solid #e4e7ec;border-radius:10px;overflow:hidden;max-height:400px;overflow-y:auto}
+.sd-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:16px;font-size:11px;font-weight:600}
+.sd-badge-ok{background:#ecfdf3;color:#027a48}.sd-badge-err{background:#fef3f2;color:#b42318}.sd-badge-neutral{background:#f2f4f7;color:#667085}
+.sd-details{background:#f8f9fb;border:1px solid #e4e7ec;border-radius:10px;padding:14px 18px;font-size:12px;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;word-break:break-all;max-height:260px;overflow-y:auto;color:#344054;line-height:1.6}
+.sd-details a{color:#2563eb;text-decoration:none}.sd-details a:hover{text-decoration:underline}
+.sd-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.sd-btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;border:1px solid #e4e7ec;background:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;color:#344054}
+.sd-btn:hover{background:#f8f9fb}.sd-btn:active{transform:scale(.97)}
+.sd-btn-primary{background:#2563eb;color:#fff;border-color:#2563eb}.sd-btn-primary:hover{background:#1d4ed8}
+.sd-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.sd-copy{font-size:12px;color:#667085;background:#f8f9fb;border:1px solid #e4e7ec;border-radius:8px;padding:6px 12px;cursor:pointer;font-family:'JetBrains Mono',monospace;word-break:break-all;display:flex;align-items:center;gap:8px}
+.sd-copy:hover{border-color:#2563eb;color:#2563eb}
+.sd-msg{margin-top:10px;padding:10px 14px;border-radius:8px;font-size:13px;display:none}
+.sd-msg.ok{display:block;background:#ecfdf3;color:#027a48;border:1px solid #a6f4c5}
+.sd-msg.err{display:block;background:#fef3f2;color:#b42318;border:1px solid #fecdca}
+.sd-spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sd-spin .6s linear infinite}
+@keyframes sd-spin{to{transform:rotate(360deg)}}
+@media(max-width:600px){.sd-bd{padding:16px}.sd-cards{grid-template-columns:1fr 1fr}.sd-cfg-row{flex-direction:column;align-items:flex-start;gap:2px}.sd-cfg-row .k{min-width:0}}
+</style>
+
+<div class="sd">
+<div class="sd-hd">
+    <h1>Sync Dashboard</h1>
+    <span class="ver"><?php echo esc_html( $dashboard_ver ); ?></span>
+</div>
+<div class="sd-bd">
+
+<!-- Status Cards -->
+<div class="sd-cards">
+    <div class="sd-c"><div class="sd-cl">Last Sync</div><div class="sd-cv"><?php echo esc_html( $ago ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Trigger</div><div class="sd-cv"><?php echo esc_html( $trigger ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Branch</div><div class="sd-cv"><?php echo esc_html( $branch ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Updated</div><div class="sd-cv ok"><?php echo count( $updated ); ?></div></div>
+    <div class="sd-c"><div class="sd-cl">Errors</div><div class="sd-cv <?php echo count( $errors ) > 0 ? 'err' : 'ok'; ?>"><?php echo count( $errors ); ?></div></div>
+    <?php if ( $lock ) : ?>
+    <div class="sd-c"><div class="sd-cl">Status</div><div class="sd-cv lock">Syncing...</div></div>
+    <?php endif; ?>
+</div>
+
+<?php if ( $msg ) : ?>
+<div style="margin-bottom:18px;padding:10px 14px;background:#fffaeb;border:1px solid #fedf89;border-radius:8px;font-size:13px;color:#b54708">
+    <?php echo esc_html( $msg ); ?>
+</div>
+<?php endif; ?>
+
+<!-- Config Check -->
+<div class="sd-sec">
+    <h3>Config</h3>
+    <div class="sd-cfg">
+        <div class="sd-cfg-row">
+            <span class="sd-dot <?php echo $has_secret ? 'sd-dot-ok' : 'sd-dot-no'; ?>"></span>
+            <span class="k">WEBHOOK_SECRET</span>
+            <span class="v"><?php echo $has_secret ? 'Set' : 'Not set'; ?></span>
+        </div>
+        <div class="sd-cfg-row">
+            <span class="sd-dot <?php echo $has_token ? 'sd-dot-ok' : 'sd-dot-no'; ?>"></span>
+            <span class="k">GITHUB_TOKEN</span>
+            <span class="v"><?php echo $has_token ? esc_html( $token_mask ) : 'Not set'; ?></span>
+        </div>
+        <div class="sd-cfg-row">
+            <span class="sd-dot <?php echo $has_repo ? 'sd-dot-ok' : 'sd-dot-no'; ?>"></span>
+            <span class="k">GITHUB_REPO</span>
+            <span class="v"><?php echo $has_repo ? esc_html( $repo_val ) : 'Not set'; ?></span>
+        </div>
+        <div class="sd-cfg-row">
+            <span class="k">Webhook URL</span>
+            <span class="sd-copy" id="sd-wh-url" onclick="navigator.clipboard.writeText('<?php echo esc_js( $wh_url ); ?>').then(function(){document.getElementById('sd-wh-url').querySelector('.cp-txt').textContent='Copied!'})">
+                <?php echo esc_html( $wh_url ); ?> <span class="cp-txt" style="color:#2563eb;white-space:nowrap">Copy</span>
+            </span>
+        </div>
+    </div>
+</div>
+
+<!-- Snippet Table -->
+<div class="sd-sec">
+    <h3>Snippets (<?php echo count( $rows ); ?> active)</h3>
+    <div class="sd-tbl-wrap">
+        <table class="sd-tbl">
+            <thead><tr><th>#</th><th>Name</th><th>Version</th><th>DB ID</th><th>Rev</th><th>Modified</th><th>Last Sync</th></tr></thead>
+            <tbody>
+            <?php foreach ( $rows as $r ) :
+                $num  = '';
+                $name = b2b_normalize_snippet_name( $r->name );
+                if ( preg_match( '/Snippet\s+(\d+)(?![A-Za-z])/', $r->name, $m ) ) $num = $m[1];
+
+                // V.19.0: Parse version from snippet code header
+                $php_ver = '—';
+                if ( !empty($r->code_head) && preg_match('/Version:\s*(V\.[\d.]+(?:\s*[\x{2014}\-—]+\s*.+?)?)\s*(?:\*|║|\n)/u', $r->code_head, $vm) ) {
+                    $php_ver = trim($vm[1]);
+                }
+
+                $status_html = '<span class="sd-badge sd-badge-neutral">—</span>';
+                foreach ( $updated as $u ) {
+                    if ( strpos( $u, 'Snippet ' . $num ) !== false ) {
+                        $status_html = '<span class="sd-badge sd-badge-ok">Synced</span>';
+                        break;
+                    }
+                }
+                foreach ( $errors as $e ) {
+                    if ( strpos( $e, 'Snippet ' . $num ) !== false ) {
+                        $status_html = '<span class="sd-badge sd-badge-err">Error</span>';
+                        break;
+                    }
+                }
+            ?>
+            <tr>
+                <td style="font-weight:700;color:#667085">S<?php echo esc_html( $num ); ?></td>
+                <td><?php echo esc_html( $name ); ?></td>
+                <td style="font-family:monospace;font-size:11px;font-weight:600;color:#2563eb"><?php echo esc_html( $php_ver ); ?></td>
+                <td style="color:#667085"><?php echo esc_html( $r->id ); ?></td>
+                <td style="font-family:monospace;font-size:12px"><?php echo esc_html( $r->revision ); ?></td>
+                <td style="font-size:12px;color:#667085"><?php echo esc_html( $r->modified ); ?></td>
+                <td><?php echo $status_html; ?></td>
+            </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Last Sync Details -->
+<?php if ( $commit_sha || $synced || $errors ) : ?>
+<div class="sd-sec">
+    <h3>Last Sync Details</h3>
+    <div class="sd-details"><?php
+        $lines = array();
+        if ( ! empty( $last['time'] ) ) $lines[] = 'Time:   ' . $last['time'];
+        $lines[] = 'Mode:   ' . $mode;
+        if ( $commit_sha ) {
+            $sha7  = substr( $commit_sha, 0, 7 );
+            $ghurl = $has_repo ? 'https://github.com/' . $repo_val . '/commit/' . $commit_sha : '';
+            $lines[] = 'Commit: ' . ( $ghurl ? '<a href="' . esc_url( $ghurl ) . '" target="_blank">' . esc_html( $sha7 ) . '</a>' : esc_html( $sha7 ) );
+        }
+        if ( $synced ) {
+            $lines[] = "\nFiles Synced (" . count( $synced ) . '):';
+            foreach ( $synced as $i => $f ) $lines[] = '  ' . ( $i + 1 ) . '. ' . esc_html( $f );
+        }
+        if ( $updated ) {
+            $lines[] = "\nUpdated (" . count( $updated ) . '):';
+            foreach ( $updated as $i => $u ) $lines[] = '  ' . ( $i + 1 ) . '. ' . esc_html( $u );
+        }
+        if ( $errors ) {
+            $lines[] = "\nErrors (" . count( $errors ) . '):';
+            foreach ( $errors as $i => $e ) $lines[] = '  ' . ( $i + 1 ) . '. ' . esc_html( $e );
+        }
+        echo implode( "\n", $lines );
+    ?></div>
+</div>
+<?php endif; ?>
+
+<!-- Actions -->
+<div class="sd-sec">
+    <h3>Actions</h3>
+    <div class="sd-actions">
+        <button class="sd-btn sd-btn-primary" id="sd-sync-btn" onclick="sdDoSync()">Sync Now</button>
+        <button class="sd-btn" onclick="location.reload()">Refresh</button>
+    </div>
+    <div class="sd-msg" id="sd-msg"></div>
+</div>
+
+</div>
+</div>
+
+<script>
+function sdDoSync(){
+    var btn=document.getElementById('sd-sync-btn'),msg=document.getElementById('sd-msg');
+    btn.disabled=true;btn.innerHTML='<span class="sd-spin"></span> Syncing...';
+    msg.className='sd-msg';msg.style.display='none';
+    fetch('<?php echo esc_js( $rest ); ?>github-sync-manual',{
+        method:'POST',
+        headers:{'X-WP-Nonce':'<?php echo esc_js( $nonce ); ?>','Content-Type':'application/json'},
+        credentials:'same-origin'
+    })
+    .then(function(r){return r.json().then(function(d){return{ok:r.ok,data:d}})})
+    .then(function(res){
+        btn.disabled=false;btn.textContent='Sync Now';
+        if(res.ok&&res.data.ok){
+            msg.className='sd-msg ok';msg.textContent='Sync complete! Updated: '+(res.data.updated||[]).length+' snippet(s)'+(res.data.errors&&res.data.errors.length?' | Errors: '+res.data.errors.length:'');
+        }else{
+            msg.className='sd-msg err';msg.textContent='Sync failed: '+(res.data.error||res.data.message||'Unknown error');
+        }
+        msg.style.display='block';
+        setTimeout(function(){location.reload()},2000);
+    })
+    .catch(function(e){
+        btn.disabled=false;btn.textContent='Sync Now';
+        msg.className='sd-msg err';msg.textContent='Network error: '+e.message;msg.style.display='block';
+    });
+}
+</script>
+<?php
+    return ob_get_clean();
+}
+} // end function_exists guard
