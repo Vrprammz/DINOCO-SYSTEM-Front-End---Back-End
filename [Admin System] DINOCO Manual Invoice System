@@ -616,6 +616,12 @@ add_action('rest_api_init', function() {
         'callback'            => 'dinoco_inv_rest_verify_slip_combined',
         'permission_callback' => $perm,
     ]);
+    // V.2.7: Upload slip image (base64) from dashboard
+    register_rest_route($ns, '/invoice/upload-slip', [
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_inv_rest_upload_slip',
+        'permission_callback' => $perm,
+    ]);
     // Cancel
     register_rest_route($ns, '/invoice/cancel', [
         'methods'             => 'POST',
@@ -1489,6 +1495,153 @@ function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
     return rest_ensure_response($result);
 }
 
+// --- UPLOAD SLIP (V.2.7) — base64 image from dashboard ---
+function dinoco_inv_rest_upload_slip(WP_REST_Request $req) {
+    $id    = intval($req->get_param('id'));
+    $image = $req->get_param('image'); // base64 data URI: data:image/...;base64,...
+    if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
+    if (empty($image)) return new WP_Error('invalid', 'กรุณาอัพโหลดรูปสลิป', ['status' => 400]);
+
+    $inv_status = get_field('order_status', $id);
+    if ($inv_status === 'paid') return new WP_Error('already_paid', 'ใบแจ้งหนี้นี้ชำระครบแล้ว', ['status' => 400]);
+    if ($inv_status !== 'awaiting_payment') return new WP_Error('invalid_status', 'ตรวจสลิปได้เฉพาะสถานะรอชำระเงินเท่านั้น', ['status' => 400]);
+
+    // Validate base64 data URI format
+    if (!preg_match('/^data:image\/(jpeg|png|webp|jpg);base64,/', $image)) {
+        return new WP_Error('invalid', 'รูปภาพไม่ถูกต้อง (รองรับ JPEG, PNG, WebP)', ['status' => 400]);
+    }
+
+    $api_url = defined('B2B_SLIP2GO_API_URL')
+        ? B2B_SLIP2GO_API_URL
+        : 'https://connect.slip2go.com/api/verify-slip/qr-base64/info';
+    $secret  = defined('B2B_SLIP2GO_SECRET_KEY') ? B2B_SLIP2GO_SECRET_KEY : '';
+    if (!$secret) return new WP_Error('config', 'ยังไม่ได้ตั้งค่า Slip2Go API', ['status' => 500]);
+
+    // Build request body (same format as B2B Snippet 2)
+    $check_condition = ['checkDuplicate' => true];
+    $bank_info = function_exists('b2b_get_bank_info') ? b2b_get_bank_info() : null;
+    if ($bank_info && !empty($bank_info['account'])) {
+        $account_number = preg_replace('/[^0-9]/', '', $bank_info['account']);
+        $receiver = ['accountNumber' => $account_number];
+        if (!empty($bank_info['bank_code'])) {
+            $receiver['accountType'] = '01' . str_pad($bank_info['bank_code'], 3, '0', STR_PAD_LEFT);
+        }
+        $check_condition['checkReceiver'] = [$receiver];
+    }
+
+    $resp = wp_remote_post($api_url, [
+        'headers' => [
+            'Authorization' => 'Bearer ' . $secret,
+            'Content-Type'  => 'application/json',
+        ],
+        'body' => wp_json_encode([
+            'payload' => [
+                'imageBase64'    => $image,
+                'checkCondition' => $check_condition,
+            ],
+        ]),
+        'timeout' => 45,
+    ]);
+    if (is_wp_error($resp)) return new WP_Error('api_error', 'ไม่สามารถติดต่อ Slip2Go ได้', ['status' => 502]);
+
+    $http_code = wp_remote_retrieve_response_code($resp);
+    $raw_body  = wp_remote_retrieve_body($resp);
+    $slip      = json_decode($raw_body, true);
+
+    if ($http_code !== 200 || !is_array($slip)) {
+        return rest_ensure_response(['success' => false, 'verified' => false, 'reason' => 'Slip2Go ไม่ตอบกลับ (HTTP ' . $http_code . ')']);
+    }
+
+    $slip_code = isset($slip['code']) ? $slip['code'] : '';
+    $data      = isset($slip['data']) && is_array($slip['data']) ? $slip['data'] : [];
+    $amount    = floatval($data['amount'] ?? 0);
+    $sender    = sanitize_text_field($data['sender']['account']['name'] ?? '');
+    $receiver  = sanitize_text_field($data['receiver']['account']['name'] ?? '');
+    $trans_ref = sanitize_text_field($data['transRef'] ?? '');
+    $trans_date = sanitize_text_field($data['transDate'] ?? $data['date'] ?? '');
+
+    // Duplicate slip
+    if ($slip_code === '200501') {
+        return rest_ensure_response([
+            'success' => false, 'verified' => false,
+            'reason'  => 'สลิปนี้เคยใช้แล้ว (TransRef: ' . $trans_ref . ')',
+            'amount'  => $amount, 'sender' => $sender, 'receiver' => $receiver, 'ref' => $trans_ref,
+        ]);
+    }
+
+    // Wrong receiver
+    if ($slip_code === '200401') {
+        return rest_ensure_response([
+            'success' => false, 'verified' => false,
+            'reason'  => 'สลิปโอนไปบัญชีอื่น (ผู้รับ: ' . $receiver . ')',
+            'amount'  => $amount, 'sender' => $sender, 'receiver' => $receiver, 'ref' => $trans_ref,
+        ]);
+    }
+
+    // Slip not found / fake
+    if ($slip_code === '200404') {
+        return rest_ensure_response([
+            'success' => false, 'verified' => false,
+            'reason'  => 'ไม่พบข้อมูลสลิปในระบบธนาคาร (อาจเป็นสลิปปลอม)',
+        ]);
+    }
+
+    // Success codes
+    if ($slip_code === '200000' || $slip_code === '200200') {
+        if (empty($data) || $amount <= 0) {
+            return rest_ensure_response(['success' => false, 'verified' => false, 'reason' => 'ระบบตรวจสลิปไม่พบยอดเงิน']);
+        }
+
+        // Check conditionResult for duplicate/receiver
+        $cond = isset($slip['conditionResult']) ? $slip['conditionResult'] : null;
+        if ($cond && isset($cond['isDuplicate']) && $cond['isDuplicate'] === true) {
+            return rest_ensure_response([
+                'success' => false, 'verified' => false,
+                'reason'  => 'สลิปนี้เคยใช้แล้ว (TransRef: ' . $trans_ref . ')',
+                'amount'  => $amount, 'sender' => $sender, 'receiver' => $receiver, 'ref' => $trans_ref,
+            ]);
+        }
+        if ($cond && isset($cond['isReceiverValid']) && !$cond['isReceiverValid']) {
+            return rest_ensure_response([
+                'success' => false, 'verified' => false,
+                'reason'  => 'สลิปโอนไปบัญชีอื่น (ผู้รับ: ' . $receiver . ')',
+                'amount'  => $amount, 'sender' => $sender, 'receiver' => $receiver, 'ref' => $trans_ref,
+            ]);
+        }
+
+        // Verified — save metadata
+        update_post_meta($id, '_inv_slip_ref', $trans_ref);
+        update_post_meta($id, '_inv_slip_verified_at', b2b_date('Y-m-d H:i:s'));
+        b2b_add_audit_log($id, 'slip_uploaded', 'อัพโหลดสลิปผ่าน ฿' . number_format($amount, 0) . ' ref=' . $trans_ref . ' ผู้โอน=' . $sender);
+
+        // Auto record payment
+        $fake_req = new WP_REST_Request();
+        $fake_req->set_param('id', $id);
+        $fake_req->set_param('amount', $amount);
+        $fake_req->set_param('note', 'อัพโหลดสลิป ref=' . $trans_ref . ' ผู้โอน=' . $sender . ' วันที่=' . $trans_date);
+        $pay_result = dinoco_inv_rest_record_payment($fake_req);
+        $pay_data = $pay_result->get_data();
+
+        return rest_ensure_response([
+            'success'    => true,
+            'verified'   => true,
+            'amount'     => $amount,
+            'sender'     => $sender,
+            'receiver'   => $receiver,
+            'ref'        => $trans_ref,
+            'date'       => $trans_date,
+            'fully_paid' => !empty($pay_data['fully_paid']),
+        ]);
+    }
+
+    // Other error codes
+    return rest_ensure_response([
+        'success' => false, 'verified' => false,
+        'reason'  => 'Slip2Go รหัส ' . $slip_code . ': ' . ($slip['message'] ?? 'ไม่สามารถตรวจสอบได้'),
+        'amount'  => $amount, 'sender' => $sender, 'ref' => $trans_ref,
+    ]);
+}
+
 // --- CANCEL ---
 function dinoco_inv_rest_cancel(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
@@ -2062,6 +2215,23 @@ add_shortcode('dinoco_manual_invoice', function() {
     <div class="inv-modal-inner">
         <h3>บันทึกรับเงิน</h3>
         <input type="hidden" id="inv-pay-id">
+
+        <!-- Slip Upload Section -->
+        <div class="inv-field-row" style="border:1px dashed #cbd5e1;border-radius:8px;padding:12px;margin-bottom:12px;background:#f8fafc;">
+            <label class="inv-label" style="margin-bottom:8px;">อัพโหลดสลิปโอนเงิน</label>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <label for="inv-slip-file" class="inv-btn inv-btn-secondary" style="cursor:pointer;margin:0;font-size:0.85rem;padding:6px 14px;display:inline-flex;align-items:center;gap:4px;">
+                    📎 อัพโหลดสลิป
+                </label>
+                <input type="file" id="inv-slip-file" accept="image/jpeg,image/png,image/webp" style="display:none;" onchange="invHandleSlipFile(this)">
+                <span id="inv-slip-filename" style="font-size:0.8rem;color:#64748b;"></span>
+            </div>
+            <div id="inv-slip-preview" style="display:none;margin-top:10px;text-align:center;">
+                <img id="inv-slip-preview-img" style="max-width:100%;max-height:180px;border-radius:8px;border:1px solid #e2e8f0;">
+            </div>
+            <div id="inv-slip-status" style="display:none;margin-top:10px;padding:8px 12px;border-radius:6px;font-size:0.85rem;font-weight:600;text-align:center;"></div>
+        </div>
+
         <div class="inv-field-row">
             <label class="inv-label">ยอดรับชำระ (฿) <span class="req">*</span></label>
             <input class="inv-input" id="inv-pay-amount" type="number" min="0.01" step="0.01" placeholder="0.00">
@@ -3047,7 +3217,89 @@ window.invOpenPayment = function(id) {
     document.getElementById('inv-pay-id').value = id;
     document.getElementById('inv-pay-amount').value = '';
     document.getElementById('inv-pay-note').value = '';
+    // Reset slip upload UI
+    document.getElementById('inv-slip-file').value = '';
+    document.getElementById('inv-slip-filename').textContent = '';
+    document.getElementById('inv-slip-preview').style.display = 'none';
+    document.getElementById('inv-slip-status').style.display = 'none';
+    document.getElementById('inv-slip-status').textContent = '';
     document.getElementById('inv-payment-modal').classList.add('open');
+};
+
+// ========= SLIP UPLOAD =========
+window.invHandleSlipFile = function(input) {
+    var file = input.files && input.files[0];
+    if (!file) return;
+
+    // Validate file type
+    var allowed = ['image/jpeg', 'image/png', 'image/webp'];
+    if (allowed.indexOf(file.type) === -1) {
+        invToast('error', 'รองรับเฉพาะไฟล์ JPEG, PNG, WebP');
+        input.value = '';
+        return;
+    }
+    // Validate file size (max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+        invToast('error', 'ไฟล์ใหญ่เกินไป (สูงสุด 5MB)');
+        input.value = '';
+        return;
+    }
+
+    document.getElementById('inv-slip-filename').textContent = file.name;
+
+    // Show preview
+    var reader = new FileReader();
+    reader.onload = function(e) {
+        var base64 = e.target.result;
+        document.getElementById('inv-slip-preview-img').src = base64;
+        document.getElementById('inv-slip-preview').style.display = 'block';
+
+        // Show loading status
+        var statusEl = document.getElementById('inv-slip-status');
+        statusEl.style.display = 'block';
+        statusEl.style.background = '#f0f9ff';
+        statusEl.style.color = '#0369a1';
+        statusEl.textContent = '⏳ กำลังตรวจสอบสลิป...';
+
+        // Call upload-slip API
+        var invoiceId = document.getElementById('inv-pay-id').value;
+        invApi('POST', '/invoice/upload-slip', { id: invoiceId, image: base64 }, function(err, data) {
+            if (err || !data) {
+                statusEl.style.background = '#fef2f2';
+                statusEl.style.color = '#dc2626';
+                statusEl.textContent = '❌ เชื่อมต่อ API ล้มเหลว';
+                return;
+            }
+            if (data.verified) {
+                var amt = parseFloat(data.amount) || 0;
+                statusEl.style.background = '#f0fdf4';
+                statusEl.style.color = '#16a34a';
+                statusEl.innerHTML = '✅ สลิปถูกต้อง ฿' + invFmt(amt) +
+                    (data.sender ? '<br><span style="font-weight:400;font-size:0.8rem;">ผู้โอน: ' + escH(data.sender) + '</span>' : '') +
+                    (data.ref ? '<br><span style="font-weight:400;font-size:0.8rem;">Ref: ' + escH(data.ref) + '</span>' : '');
+                // Auto-fill payment amount
+                document.getElementById('inv-pay-amount').value = amt.toFixed(2);
+                // Auto-fill note
+                var noteField = document.getElementById('inv-pay-note');
+                if (!noteField.value) {
+                    noteField.value = 'สลิป ref=' + (data.ref || '') + ' ผู้โอน=' + (data.sender || '');
+                }
+                // If already fully paid by the API, refresh and close
+                if (data.fully_paid) {
+                    invToast('success', 'ชำระครบแล้ว (อัพโหลดสลิป)');
+                    document.getElementById('inv-payment-modal').classList.remove('open');
+                    invLoadList();
+                }
+            } else {
+                statusEl.style.background = '#fef2f2';
+                statusEl.style.color = '#dc2626';
+                statusEl.innerHTML = '❌ สลิปไม่ถูกต้อง' +
+                    (data.reason ? '<br><span style="font-weight:400;font-size:0.8rem;">' + escH(data.reason) + '</span>' : '') +
+                    (data.amount ? '<br><span style="font-weight:400;font-size:0.8rem;">ยอด: ฿' + invFmt(data.amount) + '</span>' : '');
+            }
+        });
+    };
+    reader.readAsDataURL(file);
 };
 
 window.invDoRecordPayment = function() {
