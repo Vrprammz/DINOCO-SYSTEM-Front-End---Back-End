@@ -2228,9 +2228,18 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         if ($dist) {
             $old_debt = floatval(get_field('current_debt', $dist->ID));
             $new_debt = round(max(0, $old_debt - $paid), 2);
+            $overpaid_amount = ($paid > $old_debt && $old_debt > 0) ? round($paid - $old_debt, 2) : 0;
             update_field('current_debt', $new_debt, $dist->ID);
+            if ($paid > $old_debt && $old_debt > 0) {
+                $overpaid = round($paid - $old_debt, 2);
+                b2b_log('[Slip] Overpayment ฿' . $overpaid . ' group=' . $group_id);
+                if (function_exists('b2b_push_to_admin')) {
+                    b2b_push_to_admin("⚠️ โอนเกิน ฿" . number_format($overpaid, 2) . "\nร้าน: " . get_the_title($dist->ID) . "\nRef: " . $trans_ref . "\nโอน: ฿" . number_format($paid, 2) . " / หนี้: ฿" . number_format($old_debt, 2));
+                }
+            }
+            $actual_paid = min($paid, $old_debt > 0 ? $old_debt : $paid);
             $mtd = floatval(get_field('monthly_sales_mtd', $dist->ID));
-            update_field('monthly_sales_mtd', round($mtd + $paid, 2), $dist->ID);
+            update_field('monthly_sales_mtd', round($mtd + $actual_paid, 2), $dist->ID);
             if ($new_debt <= 0) update_field('credit_hold', false, $dist->ID);
 
             $dist_name = get_the_title($dist->ID);
@@ -2238,6 +2247,22 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
 
             $match_result = b2b_auto_mark_paid_after_slip($dist->ID, $paid, $group_id);
             $paid_tickets = $match_result['paid_tickets'];
+
+            // ถ้าหนี้ = 0 แล้ว → mark ทุกบิลที่เหลือเป็น paid (เงินจ่ายครบ ไม่ต้องค้าง)
+            $new_debt = floatval(get_field('current_debt', $dist->ID));
+            if ($new_debt <= 0) {
+                $remaining_orders = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>50,'post_status'=>'publish',
+                    'meta_query'=>array(array('key'=>'source_group_id','value'=>$group_id),array('key'=>'order_status','value'=>'awaiting_payment')),
+                    'orderby'=>'date','order'=>'ASC'));
+                foreach ($remaining_orders as $ro) {
+                    $ro_total = floatval(get_field('total_amount', $ro->ID));
+                    b2b_set_order_status($ro->ID, 'paid');
+                    update_field('paid_date', b2b_date('Y-m-d H:i:s'), $ro->ID);
+                    $ro_inv = get_post_meta($ro->ID, '_inv_number', true) ?: '#'.$ro->ID;
+                    $paid_tickets[] = array('id'=>$ro->ID,'total'=>$ro_total,'items_preview'=>$ro_inv,'due_date'=>'');
+                    b2b_log('[Slip] Auto-clear zero-debt ticket #'.$ro->ID.' ฿'.number_format($ro_total,0));
+                }
+            }
 
             $pending = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>-1,'post_status'=>'publish',
                 'meta_query'=>array(array('key'=>'source_group_id','value'=>$group_id),array('key'=>'order_status','value'=>'awaiting_payment')),'fields'=>'ids'));
@@ -2329,8 +2354,16 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
                 b2b_push_to_admin("💳 โอน ฿".number_format($paid,2)." (ผู้โอน: ".$sender.")\nร้าน: ".$dist_name."\nหนี้เหลือ: ฿".number_format($new_debt,2));
             }
 
+            // FIX Case 4: Overpayment detection — แจ้งแอดมินถ้าลูกค้าโอนเกิน
+            if ($overpaid_amount > 0) {
+                b2b_push_to_admin("⚠️ ลูกค้าโอนเกิน ฿".number_format($overpaid_amount,2)."\nร้าน: ".$dist_name."\nยอดหนี้เดิม: ฿".number_format($old_debt,2)."\nยอดโอน: ฿".number_format($paid,2)."\nRef: ".($trans_ref ?: '-')."\n\nกรุณาตรวจสอบและคืนเงินส่วนเกินครับ");
+                b2b_log('[Slip] Overpayment detected: ฿'.number_format($overpaid_amount,2).' dist='.$dist_name.' ref='.($trans_ref ?: '-'));
+            }
+
             // V.31: Slip-to-invoice manual matching — ถ้ายังมียอดเหลือ
-            if ( $match_result['remaining'] > 0 ) {
+            // FIX Case 1+6: ถ้า debt = 0 → ทุกบิล auto-clear แล้ว ไม่ต้องส่ง question Flex
+            $new_debt_check = floatval(get_field('current_debt', $dist->ID));
+            if ( $match_result['remaining'] > 0 && $new_debt_check > 0 ) {
                 // รวม B2B orders + manual invoices ที่ยังค้าง (ทั้ง 2 ระบบ)
                 $all_pending = get_posts(array(
                     'post_type'=>'b2b_order','posts_per_page'=>20,'post_status'=>'publish',
@@ -2624,14 +2657,7 @@ function b2b_auto_mark_paid_after_slip( $dist_id, $paid_amount, $group_id ) {
 
     if (empty($orders)) return array('paid_tickets' => array(), 'remaining' => $paid_amount, 'unmatched' => array());
 
-    $paid = $paid_amount;
-    usort($orders, function($a, $b) use ($paid) {
-        $da = abs(floatval(get_field('total_amount', $a->ID)) - $paid);
-        $db = abs(floatval(get_field('total_amount', $b->ID)) - $paid);
-        if (abs($da - $db) < 0.01) return strtotime($a->post_date) - strtotime($b->post_date);
-        return $da <=> $db;
-    });
-
+    // FIFO: ใช้ลำดับจาก DB (orderby=>date, order=>ASC) — ตัดบิลเก่าสุดก่อน
     $remaining = $paid_amount;
     $paid_tickets = array();
     $matched_ids = array();
@@ -2645,6 +2671,7 @@ function b2b_auto_mark_paid_after_slip( $dist_id, $paid_amount, $group_id ) {
             // ไม่ schedule SLA / ไม่ส่ง packing alert — สลิปคือจ่ายเงิน ไม่ใช่แพ็คของ
             $remaining -= $total;
             $matched_ids[] = $o->ID;
+            b2b_log('[Slip] Auto-matched #' . $o->ID . ' ฿' . number_format($total, 0) . ' remaining=' . number_format($remaining, 2));
 
             $items_raw = get_field('order_items', $o->ID) ?: '';
             $items_preview = trim(mb_substr(preg_replace('/^.*?ขอยืนยัน[^:]*:\s*/u', '', $items_raw), 0, 100));
@@ -2704,31 +2731,54 @@ function b2b_send_slip_match_question( $group_id, $slip_amount, $unmatched_order
         $id     = intval($order['id']);
         $source = isset($order['source']) && $order['source'] === 'manual_invoice' ? '🧾 ใบแจ้งหนี้' : '📦 B2B';
 
+        // FIX Case 2: ถ้ายอดสลิปเหลือไม่ถึง 50% ของบิล → ไม่แสดงปุ่ม (partial payment ไม่คุ้ม)
+        // เพราะ slip_pay postback จะ reject อยู่ดีถ้ายอดไม่ถึง 98%
+        if ($slip_amount < $total * 0.50) {
+            continue; // ข้ามบิลนี้ — ยอดสลิปน้อยเกินไปสำหรับ partial payment
+        }
+
         // Determine label based on slip vs invoice amount
         if ($slip_amount >= $total * 0.98) {
             $label = 'ชำระเต็มจำนวน';
             $label_color = '#16a34a';
         } else {
-            $label = 'ชำระบางส่วน';
+            $label = 'ยอดไม่ครบ — รอสลิปเพิ่ม';
             $label_color = '#d97706';
         }
 
-        $body_contents[] = array('type'=>'box','layout'=>'vertical','margin'=>'md','paddingAll'=>'10px','cornerRadius'=>'8px','backgroundColor'=>'#f8fafc','contents'=>array(
+        // สร้าง card contents — ถ้ายอดครบ ให้กดชำระได้ / ถ้ายอดไม่ครบ แสดงเฉพาะข้อมูล ไม่มีปุ่ม
+        $card_contents = array(
             array('type'=>'box','layout'=>'horizontal','contents'=>array(
                 array('type'=>'text','text'=>$inv_no,'size'=>'sm','weight'=>'bold','color'=>'#1e293b','flex'=>3),
                 array('type'=>'text','text'=>'฿'.number_format($total,0),'size'=>'sm','weight'=>'bold','color'=>'#1e293b','flex'=>2,'align'=>'end'))),
             array('type'=>'box','layout'=>'horizontal','margin'=>'xs','contents'=>array(
                 array('type'=>'text','text'=>$source,'size'=>'xxs','color'=>'#64748b','flex'=>3),
                 array('type'=>'text','text'=>$label,'size'=>'xxs','color'=>$label_color,'flex'=>3,'align'=>'end'))),
-            array('type'=>'button','action'=>array(
+        );
+
+        // เฉพาะยอดครบ (>= 98%) ถึงให้กดปุ่มชำระได้
+        if ($slip_amount >= $total * 0.98) {
+            $card_contents[] = array('type'=>'button','action'=>array(
                 'type'=>'postback',
                 'label'=>'ชำระบิล '.$inv_no,
                 'data'=>'action=slip_pay&ticket_id='.$id.'&slip_ref='.$slip_ref,
                 'displayText'=>'ชำระบิล '.$inv_no,
-            ),'style'=>'primary','color'=>'#2563eb','height'=>'sm','margin'=>'sm'),
-        ));
+            ),'style'=>'primary','color'=>'#2563eb','height'=>'sm','margin'=>'sm');
+        } else {
+            // ยอดไม่พอ — แสดง info text แทนปุ่ม
+            $card_contents[] = array('type'=>'text','text'=>'ยอดสลิปเหลือ ฿'.number_format($slip_amount,0).' / ฿'.number_format($total,0).' — ส่งสลิปเพิ่มเพื่อชำระ',
+                'size'=>'xxs','color'=>'#94a3b8','wrap'=>true,'margin'=>'sm');
+        }
+
+        $body_contents[] = array('type'=>'box','layout'=>'vertical','margin'=>'md','paddingAll'=>'10px','cornerRadius'=>'8px','backgroundColor'=>'#f8fafc','contents'=>$card_contents);
 
         $count++;
+    }
+
+    // ถ้าทุกบิลถูก filter ออก (ยอดสลิปน้อยเกินไป) → ไม่ส่ง Flex เปล่า, log ไว้แทน
+    if ($count === 0) {
+        b2b_log('[Slip] Question Flex skipped — no eligible tickets for ฿'.number_format($slip_amount,2).' in group '.$group_id);
+        return;
     }
 
     $footer = array('type'=>'box','layout'=>'vertical','paddingAll'=>'10px','contents'=>array(
@@ -2825,8 +2875,14 @@ function b2b_action_slip_pay( $ticket_id, $params, $group_id, $user_id, $reply_t
     $dist_name = $slip_data['dist_id'] ? get_the_title($slip_data['dist_id']) : 'ไม่ทราบ';
     b2b_push_to_admin("💳 ชำระ manual — Ticket #".$ticket_id." (".$inv_no.") ฿".number_format($ticket_total,0)."\nร้าน: ".$dist_name."\nRef: ".($slip_data['trans_ref'] ?: '-'));
 
-    // Clean up transient after use
-    delete_transient('b2b_slip_' . $slip_ref);
+    // Update transient — ลดยอดคงเหลือแทนลบทิ้ง เพื่อให้กดชำระหลายบิลจาก Flex เดียวกันได้
+    $slip_data['remaining'] = round($slip_data['remaining'] - $ticket_total, 2);
+    if ($slip_data['remaining'] <= 0) {
+        delete_transient('b2b_slip_' . $slip_ref);
+    } else {
+        $slip_data['attempts'] = 0; // reset TTL
+        set_transient('b2b_slip_' . $slip_ref, $slip_data, 1800);
+    }
     delete_transient($lock_key);
 }
 
