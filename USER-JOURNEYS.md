@@ -1,0 +1,544 @@
+# DINOCO System -- Complete User Journey Documentation
+
+> Generated: 2026-03-27 | Based on codebase analysis of 34 files (~45,000 lines)
+> Source files referenced are relative to the project root.
+
+---
+
+## Table of Contents
+
+1. [New Member Registration](#1-new-member-registration)
+2. [Product Warranty Registration](#2-product-warranty-registration)
+3. [File Warranty Claim](#3-file-warranty-claim)
+4. [Transfer Warranty](#4-transfer-warranty)
+5. [B2B: Place Order](#5-b2b-place-order)
+6. [B2B: Check Order Status](#6-b2b-check-order-status)
+7. [B2B: Pay with Slip](#7-b2b-pay-with-slip)
+8. [B2B: Receive Delivery](#8-b2b-receive-delivery)
+9. [Admin: Process New Order](#9-admin-process-new-order)
+10. [Admin: Create Manual Invoice](#10-admin-create-manual-invoice)
+11. [Admin: Handle Claim](#11-admin-handle-claim)
+
+---
+
+## 1. New Member Registration
+
+**Who:** New customer (guest)
+**Trigger:** User opens the DINOCO website or scans a product QR code
+**Source files:** `[System] DINOCO Gateway`, `[System] LINE Callback`, `[System] Dashboard - Header & Forms`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 1.1 | Opens `/warranty/` or root login page | Full-screen Gateway card (`[dinoco_login_button]` shortcode) | Displays DINOCO branding, motorcycle hero image, headline "Welcome to our family", green LINE Login button at bottom |
+| 1.2 | Taps "Login / Register" button | Green CTA button (`.dinoco-btn-app.green`) | Browser redirects to `https://access.line.me/oauth2/v2.1/authorize` with `scope=profile openid`, `bot_prompt=aggressive` |
+| 1.3 | Authorizes on LINE consent screen | LINE native OAuth UI | LINE redirects back to `/callback-login?code=...&state=GENERAL_LOGIN` |
+| 1.4 | Waits on loading screen | Instant loading page with pulsing DINOCO logo and "Verifying identity..." text | Frontend fires `fetch()` to the same URL with `dinoco_process=1` parameter (AJAX-based callback to avoid blank page) |
+| 1.5 | (Automatic) System processes OAuth | N/A - backend only | Exchanges `code` for access token via LINE Token API, fetches LINE profile (`userId`, `displayName`, `pictureUrl`). Checks if `line_user_id` exists in user meta. If not found, creates new WordPress user with username `line_XXXXXXXX_timestamp` and random password |
+| 1.6 | (Automatic) Session created | N/A | `wp_set_auth_cookie()` called, user logged in. JSON response returns `{redirect: "/member-dashboard/?welcome=new"}` |
+| 1.7 | Redirected to Member Dashboard | Auto-redirect via `window.location.replace()` | Dashboard loads with welcome popup overlay showing "Registration Complete! Welcome to our family" with "Start using" button |
+| 1.8 | Dismisses welcome popup | "Start using" button | Popup hidden. User sees the PDPA consent overlay (if `dinoco_pdpa_consent` user meta is empty) |
+| 1.9 | Reviews PDPA consent | Full-screen PDPA overlay (`.pdpa-overlay`) with privacy policy sections, radio buttons for each consent group | Must accept required consents to proceed |
+| 1.10 | Accepts PDPA | Green "Confirm" button (`.pdpa-btn-confirm`) | System saves `dinoco_pdpa_consent=accepted`, `dinoco_pdpa_timestamp`, `dinoco_pdpa_version` to user meta. PDPA overlay dismissed |
+| 1.11 | Sees Gateway screen | Full-screen Gateway (`.gateway-wrapper`) with two cards: "Scan QR" and "Legacy Migration" | User must choose how to register their first product. This overlay appears because `addr_house_no` is empty (no address yet) |
+| 1.12 | Fills in personal information | Address form fields, motorcycle brand/model dropdowns | Address saved to user meta (`addr_house_no`, `addr_soi`, `addr_subdistrict`, `addr_district`, `addr_province`, `addr_zip`), motorcycle info saved |
+| 1.13 | Completes onboarding | Dashboard fully loads | Member Dashboard displays profile card with LINE avatar, motorcycle image, journey duration, and product inventory (empty for new users) |
+
+### Decision points
+
+- **Step 1.5 -- Existing user?** If `line_user_id` already exists, the system links to that user and redirects with `welcome=back` instead of `welcome=new`. No welcome popup is shown for returning users.
+- **Step 1.2 -- Already logged in?** If the user is already authenticated, the Gateway shows "Welcome back! [Name]" with profile photo and a dark "Go to Member Page" button instead of the LINE Login button.
+- **Step 1.3 -- User denies LINE authorization?** LINE redirects with `error` parameter. System logs error and redirects to `/warranty/` with no message. **Dead end identified:** user sees no explanation if they deny authorization.
+- **Step 1.4 -- Network failure?** If fetch fails, loading text changes to "Connection failed, retrying..." and auto-redirects to `/warranty/` after 3 seconds.
+
+### Where can the user get stuck
+
+- **LINE app not installed:** The LINE OAuth URL opens in the browser. If the user does not have LINE, they cannot register at all. There is no alternative login method.
+- **PDPA rejection:** If the user does not accept required PDPA consents, they cannot proceed. There is a logout link at the bottom of the PDPA screen.
+- **Address form abandonment:** The gateway/address form has no save-draft mechanism. If the user closes mid-form, they must re-enter everything.
+
+---
+
+## 2. Product Warranty Registration
+
+**Who:** Logged-in member
+**Trigger:** Scans QR code on DINOCO product packaging (or manually enters serial number)
+**Source files:** `[System] LINE Callback` (warranty gateway), `[System] Dashboard - Header & Forms`, `[System] Member Dashboard Main`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 2.1 | Scans QR code on product | Phone camera (outside the app) | QR encodes URL: `https://dinoco.in.th/warranty-register/?serial=DNC-XXXXX` |
+| 2.2 | Opens QR URL | Warranty Gateway page (`[dinoco_gateway]` shortcode) | If not logged in: shows LINE Login with serial badge "Registering: DNC-XXXXX". The `state` parameter carries the serial code through OAuth. If logged in: shows "Welcome back" with serial badge and "Go to Member Page" button linking to `/member-dashboard/?register_serial=DNC-XXXXX` |
+| 2.3 | Logs in (if needed) | LINE Login flow (see Journey 1) | After callback, redirected to `/member-dashboard/?register_serial=DNC-XXXXX` |
+| 2.4 | Dashboard detects serial parameter | Auto-triggered on page load | System queries `serial_number` CPT for matching `serial_code`. Validates: (a) serial exists, (b) `w_status` is `warranty_available`, (c) not already registered to another user |
+| 2.5 | Registration form pre-fills | Modal or inline form | Serial number pre-filled, user confirms personal details (name, phone, address from profile) |
+| 2.6 | Confirms registration | "Register" / "Confirm" button | System updates `serial_number` post: sets `owner_product` to user's LINE ID/username, sets `w_status` to `warranty_on`, sets `warranty_register_date` to today, calculates `warranty_expiry` based on `warranty_duration_years` |
+| 2.7 | Sees success confirmation | Success message with product card | Product appears in the member dashboard asset list with green "Warranty Active" status badge |
+
+### Alternative path -- QR Scanner from Dashboard
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 2.A1 | Taps "Scan" button in bottom nav bar | QR scanner icon (center button) in Global App Menu | QR Scanner modal opens using `html5-qrcode` library |
+| 2.A2 | Grants camera permission | Browser camera permission dialog | Camera feed displayed in scanner modal |
+| 2.A3 | Scans QR code | Camera viewfinder | `html5-qrcode` decodes URL, extracts serial number, triggers registration flow |
+
+### Alternative path -- Legacy Migration
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 2.B1 | Taps "Legacy Migration" card on Gateway | Gold-bordered card (`.gateway-card.legacy`) | Navigates to legacy migration flow for products registered under old system |
+| 2.B2 | Enters old DINOCO code | Legacy form | System looks up `legacy_request` CPT, creates migration request |
+
+### Decision points
+
+- **Serial already registered?** System returns error -- serial belongs to another user. User sees error message.
+- **Serial not found?** System returns error. User is told to check the serial number.
+- **Serial in `warranty_pending` status?** Cannot register -- must contact admin.
+- **User has no address?** The gateway form forces address completion before product registration.
+
+### Where can the user get stuck
+
+- **QR code damaged/unreadable:** No manual serial entry option from the QR scanner modal (user must navigate to a different flow). The Gateway page does offer manual entry.
+- **Bundle registration:** If the product is part of a SET (bundle), the system has a separate `create_bundle` action that requires selecting matching SKU children. This flow is complex and may confuse users.
+
+---
+
+## 3. File Warranty Claim
+
+**Who:** Logged-in member who owns a registered product
+**Trigger:** Taps "Claim" in bottom navigation bar or navigates to `/claim-system/`
+**Source files:** `[System] DINOCO Claim System`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 3.1 | Opens claim page | `/claim-system/` via bottom nav (`.dinoco-nav-item` "Claim") | Page loads `[dinoco_claim_page]` shortcode. Premium green header "DINOCO CARE+" with tagline. Progress track shows 4 steps. Queries all user's products where `w_status != claim_process` |
+| 3.2 | **Step 1: Select Product** | Product grid (`.d-grid-layout`) with product cards showing image, name, serial number | User taps a product card. Card gets green border and checkmark (`.d-item-card.active`). "Next" button becomes enabled |
+| 3.3 | Taps "Next" | Green primary button (`.d-btn-primary`) | Step 2 animates in with slide-up animation. Progress dot 2 becomes active |
+| 3.4 | **Step 2: Describe Problem** | 2-column grid (`.d-prob-grid`) with problem type cards -- each has icon and label. 7 types including structural damage (problems 1-4), paint/cosmetic (5-7 trigger parts request path) | User taps a problem type card. Card highlights with green border |
+| 3.5 | Selects sender type | Radio card group (`.d-radio-group`): "Send myself" or "Send via dealer" | If "dealer" selected, dealer selection section appears with region-grouped dealer cards (3-column grid with dealer logos and names) |
+| 3.6 | (If dealer selected) Picks dealer | Dealer cards organized by region (Central, North, East, South, Isan) | Dealer card highlights. Return destination option appears: "Return to customer" or "Return to dealer shop" |
+| 3.7 | Enters notes | Textarea (`.d-input-area`) for customer notes | Free-text description of the problem. For parts requests: different textarea for parts details |
+| 3.8 | Confirms address | Pre-filled address textarea from user profile | User can edit the pre-filled address text |
+| 3.9 | Taps "Next" | Primary button | Step 3 animates in |
+| 3.10 | **Step 3: Upload Evidence Photos** | 2-column upload grid (`.d-upload-grid`) with 5 upload boxes: Front, Back, Left, Right, Defect spot | Each box shows dashed border with camera icon. User taps to open file picker. After selecting, preview thumbnail shows and box gets green border (`.has-file`) |
+| 3.11 | (Validation) File size check | Client-side check | Each image must be under 300KB. Server also validates MIME type (jpg, png, webp only) and performs content sniffing |
+| 3.12 | Taps "Submit" | Primary button | Loading overlay appears (`.d-spinner-box`) with spinner and "Processing..." text |
+| 3.13 | (System) Creates claim ticket | N/A - POST request | Server: (a) honeypot check, (b) nonce verification, (c) anti-spam transient lock (5 sec), (d) ownership verification (IDOR protection), (e) file validation. Creates `claim_ticket` CPT post. Sets `ticket_status` based on problem type: repair = "Awaiting Customer Shipment", parts = "Pending Issue Verification". Sets product `w_status` to `claim_process`. Uploads images to WordPress media. Generates ticket code `CLM-YYYYMMDD-HHmm-XXXX` or `PCLM-...` for parts |
+| 3.14 | **Step 4: Success Screen** | Success view (`#success-view`) with large green checkmark, ticket code in bold green text | Shows "Data saved successfully!" with ticket code prominently displayed |
+| 3.15 | Prints PDF claim form | "Print / Download PDF" button | `window.print()` triggered. Print stylesheet activates showing 4-page A4 document: Page 1 = claim details + photos, Page 2 = additional photos + condition notes, Page 3 = QC checklist + billing table, Page 4 = shipping label (landscape, large address text, barcode) |
+| 3.16 | Returns to dashboard | "Back to home" link | Navigates to `/member-dashboard/` |
+
+### Decision points
+
+- **Problem types 1-4 (structural):** Creates repair ticket with prefix `CLM-`. Status starts at "Awaiting Customer Shipment". User must physically send the product.
+- **Problem types 5-7 (parts/cosmetic):** Creates parts request with prefix `PCLM-`. Status starts at "Pending Issue Verification". Admin reviews before any shipment.
+- **Sender type "self" vs "dealer":** Affects the shipping label (Page 4 of PDF). Dealer name and return destination recorded in ticket.
+
+### Where can the user get stuck
+
+- **No eligible products:** If all products are already in `claim_process`, the grid will be empty. There is an empty state but no guidance on what to do.
+- **Image too large:** 300KB limit is strict, especially for high-resolution phone cameras. Error message appears but user must manually compress images outside the app. **No client-side image compression.**
+- **PDF printing on mobile:** `window.print()` may not work well on all mobile browsers. The warning text says "You will not be able to download again" which creates urgency but the `reprint_id` parameter does allow reprinting from the claim page URL.
+- **After submission:** The product status changes to `claim_process` system-wide. User cannot file another claim on the same product until the current claim is resolved. No clear indication of this on the dashboard.
+
+---
+
+## 4. Transfer Warranty
+
+**Who:** Logged-in member who owns a registered product
+**Trigger:** Taps "Transfer" in bottom navigation bar or navigates to `/transfer-warranty/`
+**Source files:** `[System] Transfer Warranty Page`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 4.1 | Opens transfer page | `/transfer-warranty/` via bottom nav | Page loads `[dinoco_transfer_v3]` shortcode. Dark header with user profile (avatar, name, phone, LINE ID). Below: grid of all owned assets (bundles + singles) |
+| 4.2 | Browses owned assets | Card grid with product images, names, serial numbers, warranty status badges (color-coded), and status icons | Each card shows: product image, model name, serial number, warranty status strip with color + icon. Bundles show "Bundle Set" badge with child count. Locked items (claim_process, warranty_pending, stolen) show amber/red warning strip |
+| 4.3 | Taps a product card | Product card (`.item-card`) | Passport detail modal opens with: hero section (product image on dark gradient), detailed info (SKU, serial, hand sequence, registration date, expiry date), repair/transfer logs timeline (`.tl-container`). For bundles: expandable child cards showing individual items |
+| 4.4 | Taps "Transfer" button on detail view | Transfer button within passport modal | Transfer flow modal opens |
+| 4.5 | Enters recipient phone number | Phone input field (`.input-check`) + "Search" button (`.btn-check`) | AJAX call to `dinoco_v3_find` action. Searches users by `phone_number` meta |
+| 4.6 | System finds recipient | N/A | Returns recipient's LINE profile picture, display name, full name, phone. Displayed as a recipient preview card |
+| 4.7 | Reviews recipient info | Recipient card with avatar, name, phone | User verifies this is the correct person |
+| 4.8 | Reviews legal disclaimer | Scrollable disclaimer box (`.disclaimer-box`) with transfer terms and conditions | Must scroll through disclaimer text |
+| 4.9 | Checks consent checkboxes | Two checkbox groups (`.chk-group`): (1) "I confirm irreversible transfer", (2) "I understand warranty status transfers as-is" | Both checkboxes must be checked. Custom styled round checkboxes |
+| 4.10 | Taps "Confirm Transfer" button | Primary button | AJAX call to `dinoco_v3_exec`. System: (a) nonce verification, (b) session check, (c) ownership verification (IDOR protection), (d) checks product is not locked (claim_process/warranty_pending/stolen), (e) logs consent with timestamp, IP, and all details to user meta |
+| 4.11 | (System) Executes transfer | N/A | Updates `owner_product` field to recipient's LINE ID. Increments `owner_sequence`. Appends to `transfer_logs`. For bundles: updates `bundle_owner` + transfers ALL children |
+| 4.12 | Sees success message | Success toast/modal | "Transfer successful!" message. Page refreshes to show updated asset list (transferred item gone) |
+
+### Decision points
+
+- **Recipient not found:** Error message "Phone number not found in DINOCO member system". Transfer cannot proceed -- recipient must register first.
+- **Transfer to self:** Error message "Cannot transfer to yourself".
+- **Product locked (claim_process/warranty_pending):** Error message "Cannot transfer -- product is in repair/review status". Red lock icon on card.
+- **Product stolen:** Error message "Product is reported stolen/suspended". Transfer completely blocked.
+- **Bundle transfer with locked child:** If any child in the bundle is locked, entire bundle transfer is blocked with specific error identifying which child and why.
+
+### Where can the user get stuck
+
+- **Recipient has no phone number:** If the target user did not fill in their phone number in their profile, they cannot be found. No alternative search method (e.g., by LINE ID or name).
+- **After transfer:** The product disappears from the sender's inventory immediately. There is no "pending transfer" state or ability to reverse. The consent log is the only record.
+- **Certificate generation:** The detail view includes a "Generate Certificate" button that creates a warranty certificate image using `html2canvas`. This is a separate feature embedded in the transfer page but not part of the transfer flow.
+
+---
+
+## 5. B2B: Place Order
+
+**Who:** Distributor (staff in LINE group)
+**Trigger:** Types "order" in LINE group chat, or opens LIFF catalog link
+**Source files:** `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator`, `[B2B] Snippet 4: LIFF E-Catalog Frontend`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 5.1 | Types "order" (or "สั่งของ") in LINE group | LINE chat text input | Webhook receives text, matches command. Checks: (a) not admin group, (b) group is registered distributor, (c) bot is enabled, (d) distributor not on credit hold |
+| 5.2 | Receives LIFF catalog link | Flex card with "Order Products" button linking to LIFF URL with signed parameters (`_sig`, `_ts`, `gid`) | The Flex card contains a LIFF URL: `/b2b-catalog/?gid=GROUP_ID&_sig=HMAC&_ts=TIMESTAMP` |
+| 5.3 | Opens LIFF link | LINE in-app browser opens LIFF E-Catalog | Loading screen with DINOCO logo + spinner + "Checking permissions..." text |
+| 5.4 | (System) Authenticates | N/A | LIFF SDK initializes, gets user profile. Sends `auth-group` request with `group_id`, `line_user_id`, `id_token`, HMAC signature. Server verifies: (a) HMAC signature valid, (b) timestamp not expired, (c) distributor exists and bot enabled, (d) not on credit hold. Returns session token, distributor info (name, rank, logo), product catalog |
+| 5.5 | Sees catalog | Header with shop name, rank badge, two tabs: "Order" and "Order History" | Product grid (2-column) loads with: product images, names, standard price (strikethrough), dealer price (bold), discount badge, +/- quantity buttons. Recommended products chips shown if configured |
+| 5.6 | Searches/filters products | Search box with magnifying glass, horizontal category filter chips | Products filter in real-time. Empty state "No products found" if no matches |
+| 5.7 | Adds items to cart | Taps "+" button on product cards (`.qty-btn`) | Quantity display increments. Cart bar slides up from bottom (`.cart-bar.visible`) showing item count and total price. Cart persisted to `localStorage` |
+| 5.8 | Reviews cart | Taps "Order" button on cart bar | Cart summary modal slides up (`.cart-modal`) with: itemized list (name, qty, unit price, line total), customer note textarea, grand total |
+| 5.9 | Adds optional note | Textarea in cart modal (`.cart-note-input`) | Free-text note saved with order |
+| 5.10 | Confirms order | "Confirm Order" button (`.cart-confirm-btn`) | Submit overlay appears with spinner + "Sending order... Please don't close this page". AJAX POST to `/b2b/v1/place-order` with cart data, group ID, session token |
+| 5.11 | (System) Creates draft order | N/A | Server creates `b2b_order` CPT post with status `draft`. Saves order items text, total amount, source group ID, orderer info. Returns ticket ID |
+| 5.12 | Sees success | Submit overlay changes to green checkmark + "Order sent! Ticket #XXXX" | Auto-closes LIFF after brief delay |
+| 5.13 | Receives confirmation in LINE | Flex card in LINE group | Draft order Flex card with: order summary, total, two buttons: "Confirm" (postback `action=confirm_order`) and "Cancel" (postback `action=cancel_draft`) |
+| 5.14 | Confirms order | Taps "Confirm" button on Flex card | Postback triggers `b2b_action_confirm_order`. Checks for OOS items. If all in stock: status changes to `checking_stock`. Reply: "Order sent! Team is checking stock, please wait". Admin group receives stock check alert Flex with confirm/OOS/partial buttons. SLA 10-min timer starts |
+
+### Alternative path -- Edit mode
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 5.E1 | During `checking_stock`, admin requests changes | LIFF link with `?edit=TICKET_ID` parameter | Catalog opens in edit mode with yellow banner "Editing order -- modify items and resubmit" |
+| 5.E2 | Modifies cart | Same catalog UI but pre-loaded with existing order items | Cart pre-populated from order |
+| 5.E3 | Resubmits | Same confirm flow | Old order cancelled, new order created |
+
+### Decision points
+
+- **OOS items detected on confirm:** Order goes to `backorder`. Customer receives OOS Flex with options: wait for restock, accept partial, or cancel.
+- **Credit hold:** Auth fails with "Account suspended -- please pay outstanding balance". LIFF shows auth error screen.
+- **Link expired:** If HMAC timestamp is too old, shows "Link expired" page with instructions to re-invoke the bot.
+- **Bot disabled:** Text command is silently ignored. No response in chat.
+
+### Where can the user get stuck
+
+- **LIFF initialization failure:** Shows "Cannot open LIFF" error with instruction to close and reopen.
+- **Network error during submit:** Retry logic with "Retrying..." toast. After 2 retries, shows error.
+- **No cancel after confirm:** Once the user taps "Confirm" on the Flex card and stock check begins, there is no cancel button until the admin processes it. The user must type "cancel #TICKET_ID" in chat.
+
+---
+
+## 6. B2B: Check Order Status
+
+**Who:** Distributor (staff in LINE group)
+**Trigger:** Types status command in LINE group or opens LIFF history tab
+**Source files:** `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator`, `[B2B] Snippet 4: LIFF E-Catalog Frontend`
+
+### Method A -- LINE Chat Command
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 6.A1 | Types "status" (or "สถานะออเดอร์" / "ประวัติ") | LINE chat | Bot sends Flex card with recent order summary: last 5 orders with status badges, totals, and "View details" LIFF buttons |
+| 6.A2 | Types "status #1234" (specific ticket) | LINE chat | Bot sends detailed Flex card for that ticket: status, items, total, tracking info if available, due date, action buttons relevant to current status |
+
+### Method B -- LIFF History Tab
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 6.B1 | Opens LIFF catalog and taps "Order History" tab | Tab button (`.tab-btn`) | History panel slides in. Toolbar with filter chips and refresh button |
+| 6.B2 | Browses orders | History cards (`.history-card`) with: ticket ID, date, status badge (color-coded), itemized list, total, tracking info | Paginated list (configurable page size). Each card has action buttons based on status |
+| 6.B3 | Filters by status | Filter chips (`.filter-chip`): "All", "Pending payment", "Shipped", "Completed", etc. | List filters. Page info updates ("Showing 1-10 of 25") |
+| 6.B4 | Taps "View details" | Detail button (`.history-btn.detail`) | Opens LIFF ticket detail page (`/b2b-ticket/`) with signed URL for full order view |
+| 6.B5 | Refreshes | "Refresh" button | Re-fetches from API with loading indicator |
+
+### Method C -- Debt Check
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 6.C1 | Types "debt" (or "เช็คหนี้" / "ยอดค้าง") | LINE chat | Bot sends Flex card with: current outstanding debt, credit limit, available credit, list of unpaid invoices with due dates |
+
+### Where can the user get stuck
+
+- **No orders yet:** Empty state with package icon and "No order history yet" message.
+- **LIFF link expired for detail view:** Shows expired link page with instructions.
+
+---
+
+## 7. B2B: Pay with Slip
+
+**Who:** Distributor (staff in LINE group)
+**Trigger:** Sends bank transfer slip image in LINE group chat
+**Source files:** `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator`, `SYSTEM-ARCHITECTURE.md` (slip payment flow)
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 7.1 | Makes bank transfer to DINOCO account | Banking app (external) | User transfers money to the configured bank account |
+| 7.2 | Takes screenshot of transfer slip | Phone screenshot | N/A |
+| 7.3 | Sends slip image in LINE group chat | LINE chat image message | Webhook receives image message. Downloads image content via LINE Content API |
+| 7.4 | (System) Verifies slip | N/A | Sends image to Slip2Go API with `x-authorization` header. Slip2Go performs OCR on QR code embedded in Thai bank slips |
+| 7.5a | **Slip valid -- amount matches a single invoice** | N/A | System checks: (a) slip not duplicate (transaction ref + md5 dedup), (b) destination account matches DINOCO bank, (c) amount matches an `awaiting_payment` order within +/-2% tolerance. If auto-match: marks order as `paid`, deducts from `current_debt` |
+| 7.5b | **Slip valid -- amount does not match single invoice** | N/A | System sends Flex card "Select invoice to pay" with list of unpaid invoices and their amounts. Buttons are postback with `action=slip_pay&ticket_id=X` |
+| 7.5c | **Slip duplicate** | N/A | Reply: "This slip has already been used" |
+| 7.5d | **Wrong bank account** | N/A | Reply: "Transferred to wrong account" with correct account info |
+| 7.5e | **Not a slip / unreadable** | N/A | Silent -- no response (may be a regular photo, not a slip) |
+| 7.6 | (If 7.5b) Selects invoice from Flex | Taps invoice button on Flex card | Postback `action=slip_pay` with ticket ID. System matches slip amount to selected invoice. If sufficient: marks as `paid`. If partial: records partial payment |
+| 7.7 | Receives payment confirmation | Flex card in LINE group | Flex card with: green checkmark, "Payment received!", slip amount, matched invoice ticket ID, remaining debt |
+| 7.8 | Admin receives notification | Flex card in admin LINE group | Admin alert with payment details, slip verification status, and action buttons |
+
+### Special case -- Bot disabled (Manual Invoice mode)
+
+When `bot_enabled = '0'` for a distributor:
+- Slip verification still works (always active)
+- Simple Flex response (no LIFF buttons)
+- Text commands are blocked (except "groupid")
+- Postbacks blocked except `slip_pay` and `confirm_received`
+
+### Decision points
+
+- **Amount tolerance:** +/-2% auto-matches. Outside tolerance: manual selection required.
+- **Multiple unpaid invoices:** Flex card shows all. 30-minute timeout on selection -- after that, must resend slip.
+- **Split payment:** System supports partial payments. Records each payment in `_inv_partial_payments` JSON. Order stays in `awaiting_payment` until fully paid.
+
+### Where can the user get stuck
+
+- **Slip QR unreadable:** If the bank slip's QR code is damaged or the photo is blurry, Slip2Go cannot verify. System stays silent, leaving user unsure if payment was received.
+- **30-minute timeout:** If user does not select an invoice within 30 minutes, the slip association expires. Must re-send slip.
+- **Non-Thai bank:** Slip2Go is designed for Thai bank slips only. Foreign transfers cannot be auto-verified.
+
+---
+
+## 8. B2B: Receive Delivery
+
+**Who:** Distributor (staff in LINE group)
+**Trigger:** Receives delivery notification after shipment
+**Source files:** `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator`, `SYSTEM-ARCHITECTURE.md`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 8.1 | (System) Order shipped | N/A | When admin ships order, status changes to `shipped`. System sends Flex card to distributor group with tracking info |
+| 8.2 | Receives shipping notification | Flex card in LINE group | Flex card with: tracking number(s), courier name, shipped date. For Flash Express: tracking link. Buttons: "Confirm received" / "Report problem" |
+| 8.3 | Waits for physical delivery | External -- courier delivers package | Flash Express tracking synced every 2 hours via `b2b_flash_tracking_cron` |
+| 8.4 | (System) Delivery check trigger | N/A | After 1-3 days (configurable), cron `b2b_auto_complete_check` sends delivery confirmation Flex card asking customer to confirm receipt |
+| 8.5 | Taps "Confirm received" | Postback button on Flex card (`action=confirm_received`) | Status changes to `completed`. Distributor sees "Order completed!" confirmation Flex. Admin notified |
+| 8.6 | (Alternative) Taps "Report problem" | Postback button (`action=delivery_no`) | Status stays in `shipped`. Admin alerted. Customer may be asked for details |
+
+### Auto-completion
+
+If the distributor does not confirm within 7 days after shipping, the `b2b_auto_complete_check` cron automatically sets the order to `completed`.
+
+### Decision points
+
+- **Flash Express tracking shows "Delivered" (state=5):** System may auto-trigger delivery confirmation Flex.
+- **Flash Express tracking shows "Problem" (state=6) or "Returned" (state=7):** Admin alerted via separate cron.
+
+### Where can the user get stuck
+
+- **Missed Flex card:** If the confirmation Flex is sent during a busy chat, the distributor may not see it. Auto-completion at 7 days is the safety net.
+- **No tracking for manual shipment:** If admin shipped manually without a tracking number, there is no tracking link. Customer has no visibility into delivery status.
+
+---
+
+## 9. Admin: Process New Order
+
+**Who:** Admin (staff in admin LINE group or web dashboard)
+**Trigger:** Receives stock check alert in admin LINE group
+**Source files:** `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator`, `[B2B] Snippet 5: Admin Dashboard`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 9.1 | Receives stock check alert | Flex card in admin LINE group | Flex card with: ticket ID, distributor name, order items list with quantities, three action buttons: "Stock OK" (`stock_confirm`), "Out of Stock" (`stock_oos`), "Partial" (`stock_partial`) |
+| 9.2a | **All in stock:** Taps "Stock OK" | Postback button | `b2b_action_stock_confirm`: changes status to `awaiting_confirm`. Records admin name as `stock_checked_by`. Sends Flex to customer group with order summary and "Confirm Bill" / "Cancel" buttons. SLA timer restarts. Admin reply: "Stock confirmed (by [name]). Customer notified to confirm bill" |
+| 9.2b | **All out of stock:** Taps "Out of Stock" | Postback button | `b2b_action_stock_oos`: sends ETA selection Flex with buttons for estimated days (3, 7, 14, 30, or "no ETA"). Admin selects ETA |
+| 9.2c | **Partially in stock:** Taps "Partial" | Postback button | `b2b_action_stock_partial`: sends Flex to customer with available/unavailable items breakdown and options |
+| 9.3 | (After 9.2b) Selects ETA | ETA button (e.g., "7 days") | `b2b_action_bo_set_eta`: sets `backorder` status, saves ETA date, marks relevant SKUs as OOS. Customer receives Backorder Flex with options: wait, accept partial, or cancel |
+| 9.4 | (After customer confirms bill) Receives shipping choice Flex | Flex card in admin group | Flex with 4 shipping method buttons: "Flash Express" (`ship_flash`), "Manual shipping" (`ship_manual`), "Rider/Lalamove" (`ship_rider`), "Customer picks up" (`ship_self_pickup`). **Auto-fallback:** if no choice made within 1 hour, system auto-selects Flash + print |
+| 9.5a | **Flash Express:** Taps "Flash Express" | Postback button | `b2b_action_pack_flash`: calls Flash Express API to create shipment, generates tracking numbers (one per box based on `boxes_per_unit`), queues print jobs (invoice + label + picking list) to RPi print server. Status changes to `packed` |
+| 9.5b | **Manual:** Taps "Manual shipping" | Postback button | `b2b_action_pack_done`: status changes to `shipped`. Admin instructed to type tracking number: "เลขพัสดุ [ticket_id] [tracking] [courier]" |
+| 9.5c | **Rider:** Taps "Rider" | Postback button | Status changes to `shipped`. Notification sent to customer |
+| 9.5d | **Customer pickup:** Taps "Customer picks up" | Postback button | Status changes to `completed` immediately |
+| 9.6 | (For Flash) Enters tracking after courier picks up | N/A -- automatic | Flash tracking synced via cron. Status auto-updates. Labels already printed |
+| 9.7 | (For manual) Types tracking number | Text command: "เลขพัสดุ 1234 FL987654321 Flash" | System parses: ticket ID, tracking number, courier name. Saves to `tracking_number` and `shipping_provider`. Status changes to `shipped`. Customer notified with tracking Flex |
+
+### SLA monitoring
+
+- 10-minute SLA timer starts at each status change requiring admin action
+- If timer expires, SLA alert Flex sent to admin group with "snooze" button (30 min increments)
+- `_sla_nag_count` increments with each reminder
+
+### ChatOps commands (admin group)
+
+Admin can also process orders via text commands:
+- `รับงาน #1234` -- Claim/accept a ticket
+- `เลขพัสดุ 1234 FL123 Flash` -- Add tracking number
+- `@admincancel #1234` -- Force cancel
+- `@reprint #1234` -- Requeue print job
+- `สรุปออเดอร์` -- Order summary
+- `รอยืนยัน` -- List pending confirmation orders
+- `หนี้ค้าง` -- Outstanding debts
+
+### Where can the user get stuck
+
+- **Missed SLA alert in busy chat:** Admin may miss the stock check Flex. SLA reminders help but can become noisy.
+- **Flash API failure:** If Flash Express API returns error, `_flash_create_error` is saved. Admin sees error message. `b2b_flash_courier_retry` cron retries on-demand.
+- **RPi print server offline:** `b2b_rpi_heartbeat_check` cron monitors every 5 minutes. If RPi is down, print jobs queue up and are processed when it comes back online.
+
+---
+
+## 10. Admin: Create Manual Invoice
+
+**Who:** Admin (web dashboard)
+**Trigger:** Opens manual invoice dashboard
+**Source files:** `[Admin System] DINOCO Manual Invoice System`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 10.1 | Opens invoice dashboard | `/admin-invoice/` or `[dinoco_manual_invoice]` shortcode page | Dashboard shows: active invoices list, distributor dropdown, create new button. 17 REST API endpoints available under `/invoice/` namespace |
+| 10.2 | Selects distributor | Distributor dropdown/search | Loads distributor info: shop name, address, rank, current debt, credit limit |
+| 10.3 | Adds line items | Product selection + quantity inputs | Each item shows: SKU, product name, rank-based price, quantity, line total. Running total calculated |
+| 10.4 | Sets payment terms | Credit term days field (defaults from distributor's `credit_term_days`) | Due date auto-calculated |
+| 10.5 | Issues invoice | "Create Invoice" button | Creates `b2b_order` CPT with `_order_source = manual_invoice`. Generates invoice number `INV-DNC-XXXXX`. Sets status to `awaiting_payment`. Adds to distributor's `current_debt`. Sends invoice Flex to distributor's LINE group (if bot enabled) + invoice image (GD-generated PNG) |
+| 10.6 | Monitors payment | Invoice list with status badges | Slip payments auto-detected when distributor sends slip in LINE group (even with bot disabled). Manual payment entry also available from dashboard |
+| 10.7 | (Optional) Uploads slip manually | Upload slip button on invoice detail | Admin can upload slip image + enter payment amount. Creates payment record in `_inv_partial_payments` |
+| 10.8 | (Optional) Records manual payment | Manual entry tab in payment modal | Admin enters: amount, date, reference notes. No slip verification |
+
+### Dunning (automated reminders)
+
+- `b2b_dunning_cron_event` runs daily at 09:00
+- Checks all overdue invoices
+- Sends payment reminder Flex cards to distributor groups
+- If debt exceeds credit limit: sets `credit_hold = true`, blocking new orders
+
+### Where can the user get stuck
+
+- **Distributor without LINE group:** Invoice created but no LINE notification sent. Admin must communicate through other channels.
+- **Bot disabled group:** Slip verification still works, but invoice Flex sent as simple format (no LIFF buttons).
+
+---
+
+## 11. Admin: Handle Claim
+
+**Who:** Admin (web dashboard)
+**Trigger:** New claim ticket appears in Service Center dashboard
+**Source files:** `[Admin System] DINOCO Service Center & Claims`, `[System] DINOCO Claim System`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 11.1 | Opens Service Center | `/admin-claims/` or `[dinoco_admin_claims]` shortcode | Dashboard shows: all claim tickets with filters by status, search, sorting. Pipeline view of ticket statuses |
+| 11.2 | Reviews new ticket | Clicks on ticket row | Ticket detail view: ticket code, customer info (name, phone, address snapshot), product info (model, SKU, serial, warranty status at time of claim), problem type, customer notes, evidence images (5 photos: front, back, left, right, defect) |
+| 11.3a | **For repair tickets (CLM-):** Updates status to "Received at Company" | Status dropdown/button | `ticket_status` ACF hook fires: auto-logs status change with timestamp in `admin_internal_note`, updates `status_last_updated` |
+| 11.3b | **For parts tickets (PCLM-):** Reviews issue | Evidence photos + customer description | Admin decides: approve replacement parts or reject |
+| 11.4 | Adds internal notes | Admin notes textarea (`admin_internal_note`) | Notes prepended with timestamp. Visible only to admin |
+| 11.5 | Selects replacement parts (if approved) | Parts selection UI (`admin_parts_selected`) | JSON record of approved parts |
+| 11.6 | Updates status through repair pipeline | Status progression buttons/dropdown | **Repair path:** Registered in System --> Awaiting Customer Shipment --> In Transit to Company --> Received at Company --> Under Maintenance --> Maintenance Completed --> Repaired Item Dispatched |
+| 11.7 | (For parts) Approves or rejects | Approve/Reject buttons | **Parts path:** Pending Issue Verification --> Replacement Approved --> Replacement Shipped. Or: --> Replacement Rejected by Company |
+| 11.8 | Enters outbound tracking | Tracking number field (`tracking_outbound`) + courier dropdown | Saves tracking info for return shipment |
+| 11.9 | Ships repaired item or replacement | Status update to "Repaired Item Dispatched" or "Replacement Shipped" | Product `w_status` reverts from `claim_process` to appropriate status (repaired, refurbished, etc.) |
+| 11.10 | (Auto-close) After 30 days | N/A -- cron | `dinoco_daily_auto_close_tickets` cron: tickets in "Replacement Shipped" status for 30+ days auto-close to "Maintenance Completed". For parts tickets: restores original `w_status` from snapshot |
+
+### Claim ticket status flow
+
+```
+Repair path:
+  Registered in System
+    --> Awaiting Customer Shipment (customer sends product)
+    --> In Transit to Company
+    --> Received at Company
+    --> Under Maintenance
+    --> Maintenance Completed
+    --> Repaired Item Dispatched (shipped back)
+
+Parts request path:
+  Registered in System
+    --> Pending Issue Verification (admin reviews)
+    --> Replacement Approved --> Replacement Shipped
+    OR
+    --> Replacement Rejected by Company
+```
+
+### Decision points
+
+- **Approve vs reject parts:** Admin has full discretion. Rejection sets ticket to "Replacement Rejected by Company" -- no further action.
+- **Product w_status after claim:** When claim is filed, product goes to `claim_process`. When claim resolves: admin can set to `repaired`, `refurbished`, `modified`, etc. via the claim ticket.
+- **Auto-close timing:** 30 days after "Replacement Shipped" status, ticket auto-closes. This handles cases where customers do not confirm receipt.
+
+### Where can the user get stuck
+
+- **Customer has no visibility:** After filing a claim, the member can only see the ticket code. There is no real-time status tracking page for the customer. They must contact admin for updates.
+- **No notification to customer:** Status changes do not trigger LINE push notifications to the member. The member must check the dashboard manually or contact support.
+- **Evidence photo quality:** Admin reviews photos taken by the customer. If photos are insufficient, there is no in-system way to request additional photos -- must communicate outside the system.
+
+---
+
+## Cross-Journey Reference: Status Flows
+
+### B2B Order Status Lifecycle
+
+```
+draft --> checking_stock --> awaiting_confirm --> awaiting_payment --> paid --> packed --> shipped --> completed
+   |           |                    |                   |                                    |
+   v           v                    v                   v                                    v
+cancelled   backorder         cancel_requested     (slip payment)                    claim_opened
+                |                    |                                                    |
+                v                    v                                                    v
+         (customer decides)    cancelled / restored                              claim_resolved
+```
+
+### Warranty Status Lifecycle
+
+```
+warranty_available --> warranty_on --> (normal use)
+        |                |
+        v                v
+warranty_pending    claim_process --> repaired / refurbished / modified / void / stolen
+        |
+        v
+   old_warranty
+```
+
+### Navigation Map (Member-Facing)
+
+Bottom navigation bar (Global App Menu) with 5 items:
+1. **Home** (`/member-dashboard/`) -- Dashboard with profile card + product inventory
+2. **Claim** (`/claim-system/`) -- File warranty claims
+3. **Scan** (QR scanner modal) -- Camera-based QR code scanner
+4. **Transfer** (`/transfer-warranty/`) -- Transfer product ownership
+5. **Profile** (`/edit-profile/`) -- Edit personal information
+
+Pages protected by login check: if not logged in, redirected to `/warranty/`.
+
+---
+
+## Key Files Referenced
+
+| Journey | Primary Source Files |
+|---------|-------------------|
+| 1. New Member Registration | `[System] DINOCO Gateway`, `[System] LINE Callback`, `[System] Dashboard - Header & Forms` |
+| 2. Warranty Registration | `[System] LINE Callback`, `[System] Dashboard - Header & Forms`, `[System] Member Dashboard Main` |
+| 3. File Warranty Claim | `[System] DINOCO Claim System` |
+| 4. Transfer Warranty | `[System] Transfer Warranty Page` |
+| 5. B2B: Place Order | `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator`, `[B2B] Snippet 4: LIFF E-Catalog Frontend` |
+| 6. B2B: Check Order Status | `[B2B] Snippet 2`, `[B2B] Snippet 4` |
+| 7. B2B: Pay with Slip | `[B2B] Snippet 2` |
+| 8. B2B: Receive Delivery | `[B2B] Snippet 2`, `[B2B] Snippet 7: Cron Jobs` |
+| 9. Admin: Process New Order | `[B2B] Snippet 2`, `[B2B] Snippet 5: Admin Dashboard` |
+| 10. Admin: Create Manual Invoice | `[Admin System] DINOCO Manual Invoice System` |
+| 11. Admin: Handle Claim | `[Admin System] DINOCO Service Center & Claims` |
+| Navigation | `[System] DINOCO Global App Menu` |
