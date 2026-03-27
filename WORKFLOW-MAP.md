@@ -589,6 +589,14 @@ Print tab:
 27. **ลูกค้าเห็น Flex card ทุกจุดแล้ว** — claim_exchange, claim_refund, claim_reject, change_approve, change_reject, bo_restock ทั้งหมดเปลี่ยนจาก text → Flex card สวยงาม + push_guaranteed
 28. **ไม่มี text push ถึงลูกค้าเหลืออยู่** — text เหลือเฉพาะ fallback ใน `else` branch กรณี `b2b_flex_header` ไม่มี
 
+### Dunning & Invoice Fixes (commit 0235146–376d5a8)
+29. **Dunning เปลี่ยนจาก text → Flex card** — สีตามความรุนแรง (amber/orange/red) + ปุ่มคัดลอกเลขบัญชี
+30. **รวมหลายบิลเป็น 1 Flex ต่อ 1 ร้าน** — ไม่ส่งแยกรายบิลอีก (ประหยัด LINE credits)
+31. **แสดงยอดค้าง (total - paid)** — ไม่ใช่ยอดเต็ม (กรณี partial payment)
+32. **ไม่ทวงบิลที่เพิ่ง issue วันเดียวกัน** — ต้อง issue มาแล้วอย่างน้อย 24 ชม.
+33. **Schedule dunning ที่ 09:00 ICT** — แก้ bug schedule ผิดเวลา (เคย schedule ตอน snippet load)
+34. **Admin Flex แสดง INV-DNC-XXXXX** — ไม่แสดง Ticket # สำหรับ manual invoices
+
 ### หมายเหตุ
 - **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)
 - **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)
