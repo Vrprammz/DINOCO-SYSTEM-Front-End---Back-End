@@ -28,6 +28,9 @@ login แล้ว:
 
 มี serial param (?serial=XXX):
   [เข้าสู่ระบบ] → LINE OAuth → callback → /member-dashboard/?register_serial=XXX
+
+ปฏิเสธ LINE auth:
+  → redirect /warranty/?login_error=denied → แสดงแถบแดง "ไม่สามารถเข้าสู่ระบบได้"
 ```
 
 ### หน้า Dashboard (`/member-dashboard/` → `[dinoco_dashboard]`)
@@ -85,6 +88,9 @@ Dashboard พร้อมใช้:
   │ 📸 กล้อง (fullscreen)      │
   │ [🔦 Flash] [✕ ปิด]        │
   │ สแกน QR สำเร็จ → ?register_serial=<scanned>
+  │ ──────────────────────────  │
+  │ QR อ่านไม่ได้? พิมพ์รหัสเอง│
+  │ [DNC-XXXXX____] [ยืนยัน]  │ → ?register_serial=<typed>
   └────────────────────────────┘
 ```
 
@@ -165,7 +171,8 @@ Success:
   │ 📦 เลือกสินค้าที่จะโอน    │ (cards — กดเลือก)
   │ ──────────────────────────  │
   │ 🔍 ค้นหาผู้รับ            │
-  │ เบอร์โทร: [____] [ค้นหา]  │ → AJAX dinoco_v3_find
+  │ เบอร์โทร/LINE ID: [____] [ค้นหา] │ → AJAX dinoco_v3_find
+  │ (ค้นเบอร์ก่อน → fallback LINE ID) │
   │ ──────────────────────────  │
   │ 👤 ผู้รับ: [ชื่อ + รูป]    │ (แสดงหลัง search)
   │ ──────────────────────────  │
@@ -542,11 +549,19 @@ Print tab:
 
 ---
 
-## Navigation Gaps พบ
+## Navigation Gaps พบ (อัพเดท 2026-03-27)
 
-1. **Claim System ไม่มีปุ่มกลับ Dashboard** — ต้องกด browser back
-2. **Transfer Warranty ไม่มีปุ่มกลับ** — ต้อง browser back
-3. **Edit Profile ไม่มี link จาก Dashboard** — shortcode อยู่แต่ไม่มีปุ่มไป
-4. **ไม่มีปุ่ม Logout บน Dashboard** — มีแค่บน PDPA form
-5. **B2B: ปิดบอทแล้ว confirm_received ถูก block** — แก้แล้วใน code (whitelist)
-6. **Flash shipped ไม่มี delivery check** — แก้แล้วใน code (schedule 3 วัน)
+> รายการด้านล่างเป็นสถานะล่าสุดหลังแก้ไข commit `a9ffba5`
+
+1. ~~**Claim System ไม่มีปุ่มกลับ Dashboard**~~ — **ไม่เป็นปัญหา** มี Global App Menu (bottom nav) แสดงทุกหน้า
+2. ~~**Transfer Warranty ไม่มีปุ่มกลับ**~~ — **ไม่เป็นปัญหา** มี Global App Menu (bottom nav) แสดงทุกหน้า
+3. ~~**Edit Profile ไม่มี link จาก Dashboard**~~ — **ไม่เป็นปัญหา** Global App Menu มี tab "โปรไฟล์" ลิงก์ไป `/edit-profile/`
+4. ~~**ไม่มีปุ่ม Logout บน Dashboard**~~ — **แก้แล้ว** เพิ่มปุ่ม "ออกจากระบบ" ในหน้า Edit Profile (+ มีที่ Assets List ด้านล่าง)
+5. **B2B: ปิดบอทแล้ว postback ถูก block (ยกเว้น slip_pay)** — **ถูกต้องแล้ว** Manual Invoice mode ไม่มี shipping flow จึงไม่ต้อง whitelist confirm_received
+6. ~~**Flash shipped ไม่มี delivery check**~~ — **แก้แล้ว** มี `b2b_delivery_check_event` schedule 3 วันหลังส่ง
+
+### ปรับปรุงเพิ่มเติม (commit a9ffba5)
+7. **QR Scanner มี Manual Entry แล้ว** — เพิ่มช่องพิมพ์ serial ด้านล่าง QR modal สำหรับกรณี QR อ่านไม่ได้
+8. **Transfer ค้นหาด้วย LINE ID ได้แล้ว** — fallback search ด้วย `owner_line_id` ถ้าเบอร์โทรหาไม่เจอ
+9. **LINE Auth ปฏิเสธมี error message แล้ว** — แสดงแถบแดง "ไม่สามารถเข้าสู่ระบบได้" บน Gateway
+10. **Address Form มี save-draft แล้ว** — localStorage auto-save ข้อมูลฟอร์ม ปิดแล้วเปิดใหม่ข้อมูลยังอยู่

@@ -477,7 +477,7 @@ flowchart TB
     subgraph BOT_OFF["Bot OFF -- Manual Invoice Mode"]
         OFF_TEXT["Text: BLOCKED<br/>(except ขอไอดีกลุ่ม)"]
         OFF_IMAGE["Images: Simple Slip Flex<br/>(no LIFF links)"]
-        OFF_POSTBACK["Postbacks: BLOCKED<br/>(except slip_pay, confirm_received)"]
+        OFF_POSTBACK["Postbacks: BLOCKED<br/>(except slip_pay)"]
         OFF_CRON["Cron notifications: NOT sent<br/>(checks bot_enabled first)"]
     end
 

@@ -423,9 +423,11 @@ current_debt = SUM(total_amount) for all orders WHERE:
   - is_billed = true
   - order_status IN ('awaiting_payment')
 
-The system does NOT have a b2b_recalculate_debt() function defined —
-the function name appears in conditional calls but the implementation
-relies on direct increment/decrement pattern at each mutation point.
+The system has a b2b_recalculate_debt() function in Snippet 1 (Core Utilities)
+that recalculates current_debt by summing all billed + awaiting_payment orders.
+It is called via function_exists() guard from Manual Invoice cancel/payment flows.
+Primary debt tracking still uses direct increment/decrement at each mutation point;
+b2b_recalculate_debt() serves as a reconciliation safety net.
 ```
 
 ### 4.7 Concurrency Protection

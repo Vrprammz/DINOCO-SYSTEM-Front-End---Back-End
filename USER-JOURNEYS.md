@@ -49,7 +49,7 @@
 
 - **Step 1.5 -- Existing user?** If `line_user_id` already exists, the system links to that user and redirects with `welcome=back` instead of `welcome=new`. No welcome popup is shown for returning users.
 - **Step 1.2 -- Already logged in?** If the user is already authenticated, the Gateway shows "Welcome back! [Name]" with profile photo and a dark "Go to Member Page" button instead of the LINE Login button.
-- **Step 1.3 -- User denies LINE authorization?** LINE redirects with `error` parameter. System logs error and redirects to `/warranty/` with no message. **Dead end identified:** user sees no explanation if they deny authorization.
+- **Step 1.3 -- User denies LINE authorization?** LINE redirects with `error` parameter. System logs error and redirects to `/warranty/?login_error=denied`. **Fixed:** Gateway now shows a red error banner "ไม่สามารถเข้าสู่ระบบได้ — กรุณาอนุญาตการเข้าถึง LINE แล้วลองอีกครั้ง".
 - **Step 1.4 -- Network failure?** If fetch fails, loading text changes to "Connection failed, retrying..." and auto-redirects to `/warranty/` after 3 seconds.
 
 ### Where can the user get stuck
@@ -102,7 +102,7 @@
 
 ### Where can the user get stuck
 
-- **QR code damaged/unreadable:** No manual serial entry option from the QR scanner modal (user must navigate to a different flow). The Gateway page does offer manual entry.
+- **QR code damaged/unreadable:** **Fixed.** QR scanner modal now includes a manual serial entry field at the bottom ("QR อ่านไม่ได้? พิมพ์รหัสเอง") with a text input and confirm button.
 - **Bundle registration:** If the product is part of a SET (bundle), the system has a separate `create_bundle` action that requires selecting matching SKU children. This flow is complex and may confuse users.
 
 ---
@@ -143,7 +143,7 @@
 ### Where can the user get stuck
 
 - **No eligible products:** If all products are already in `claim_process`, the grid will be empty. There is an empty state but no guidance on what to do.
-- **Image too large:** 300KB limit is strict, especially for high-resolution phone cameras. Error message appears but user must manually compress images outside the app. **No client-side image compression.**
+- **Image too large:** 300KB server limit. **Mitigated:** client-side compression via canvas.toBlob (quality 0.6, maxWidth 1000px) runs before upload. Server also handles resizing. Most phone photos will pass after compression.
 - **PDF printing on mobile:** `window.print()` may not work well on all mobile browsers. The warning text says "You will not be able to download again" which creates urgency but the `reprint_id` parameter does allow reprinting from the claim page URL.
 - **After submission:** The product status changes to `claim_process` system-wide. User cannot file another claim on the same product until the current claim is resolved. No clear indication of this on the dashboard.
 
@@ -182,7 +182,7 @@
 
 ### Where can the user get stuck
 
-- **Recipient has no phone number:** If the target user did not fill in their phone number in their profile, they cannot be found. No alternative search method (e.g., by LINE ID or name).
+- **Recipient has no phone number:** **Partially fixed.** System now falls back to searching by `owner_line_id` if phone number is not found. Users without both phone and LINE ID still cannot be found.
 - **After transfer:** The product disappears from the sender's inventory immediately. There is no "pending transfer" state or ability to reverse. The consent log is the only record.
 - **Certificate generation:** The detail view includes a "Generate Certificate" button that creates a warranty certificate image using `html2canvas`. This is a separate feature embedded in the transfer page but not part of the transfer flow.
 

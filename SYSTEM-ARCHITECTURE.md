@@ -258,7 +258,7 @@ Slip2Go API ตรวจ QR
 |---|---|---|
 | **Text commands** | ✅ ตอบทุกคำสั่ง | ❌ block (ยกเว้น ขอไอดีกลุ่ม) |
 | **สลิปใน LINE** | ✅ B2B Flex + LIFF buttons | ✅ Simple Flex ไม่มี LIFF |
-| **Postback** | ✅ ทุก action | ❌ block (ยกเว้น slip_pay, confirm_received) |
+| **Postback** | ✅ ทุก action | ❌ block (ยกเว้น slip_pay) |
 | **Invoice Dashboard** | ✅ ทำงาน | ✅ ทำงาน (อิสระ) |
 | **Cron notifications** | ✅ ส่ง LINE | ❌ ไม่ส่ง (เช็ค bot_enabled) |
 
