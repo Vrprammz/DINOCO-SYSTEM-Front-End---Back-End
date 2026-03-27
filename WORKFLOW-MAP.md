@@ -543,7 +543,7 @@ Print tab:
 | `/b2b-account/` | `[b2b_account_page]` | ตัวแทน | ดูบัญชี/หนี้ |
 | `/b2b-ticket/` | — (template_redirect) | ตัวแทน+Admin | รายละเอียด ticket |
 | `/b2b-tracking/` | `[b2b_tracking_entry]` | Admin | กรอกเลข tracking |
-| `/b2b-dashboard/` | `[b2b_admin_liff_dashboard]` | Admin | Dashboard + stock + orders |
+| `/b2b-dashboard/` | `[b2b_dashboard]` | Admin | Dashboard + stock + orders |
 | `/b2b-stock/` | `[b2b_stock_manager]` | Admin | จัดการ OOS/BO |
 | `/b2b-commands/` | `[b2b_commands_page]` | ตัวแทน | Help/คำสั่ง |
 
@@ -565,3 +565,19 @@ Print tab:
 8. **Transfer ค้นหาด้วย LINE ID ได้แล้ว** — fallback search ด้วย `owner_line_id` ถ้าเบอร์โทรหาไม่เจอ
 9. **LINE Auth ปฏิเสธมี error message แล้ว** — แสดงแถบแดง "ไม่สามารถเข้าสู่ระบบได้" บน Gateway
 10. **Address Form มี save-draft แล้ว** — localStorage auto-save ข้อมูลฟอร์ม ปิดแล้วเปิดใหม่ข้อมูลยังอยู่
+
+### UX/UI Audit Fixes (commit ล่าสุด)
+11. **Claim empty state มี guidance แล้ว** — แสดงสาเหตุที่เป็นไปได้ + ลิงก์ไปลงทะเบียนสินค้า
+12. **Claim reprint warning แก้ข้อความแล้ว** — ไม่พูดว่า "ดาวน์โหลดได้ครั้งเดียว" แล้ว (เพราะ reprint ได้จริง)
+13. **html5-qrcode ไม่โหลดซ้ำแล้ว** — ลบออกจาก Dashboard Header, ใช้จาก Global App Menu ตัวเดียว
+14. **Dashboard แสดง claim_process indicator** — badge สีส้ม "กำลังดำเนินการเคลม" เมื่อ w_status = claim_process
+15. **Dashboard แสดง warranty expiry warning** — badge สีส้ม "ประกันเหลือ X วัน!" เมื่อเหลือ ≤30 วัน
+16. **Slip 200404 มี reply แล้ว** — แจ้งลูกค้า "ระบบไม่สามารถอ่านสลิปนี้ได้ กรุณาถ่ายรูปใหม่"
+17. **Claim "ถัดไป" มี disabled state แล้ว** — ปุ่มจะ disabled จนกว่าจะเลือกทั้งสินค้าและปัญหา
+18. **Admin Claims มีปุ่ม PDF เคลม** — ลิงก์ reprint ใน claim card เปิดหน้า claim-system ในแท็บใหม่
+19. **Transfer มี confirmation modal ครบแล้ว** — แสดงสินค้า + ผู้รับ + disclaimer + checkboxes ก่อน execute
+20. **B2B Admin LIFF shortcode ถูกต้อง** — code ใช้ `[b2b_dashboard]` ตรงกับ WP page (doc อัพเดทแล้ว)
+
+### หมายเหตุ
+- **Claim status change ไม่ส่ง LINE notification ถึง member** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel ส่ง push ไม่ได้)
+- **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)

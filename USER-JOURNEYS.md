@@ -142,10 +142,10 @@
 
 ### Where can the user get stuck
 
-- **No eligible products:** If all products are already in `claim_process`, the grid will be empty. There is an empty state but no guidance on what to do.
+- **No eligible products:** If all products are already in `claim_process`, the grid will be empty. **Fixed:** Empty state now shows possible causes (no products registered / all in claim process) with a link to register products.
 - **Image too large:** 300KB server limit. **Mitigated:** client-side compression via canvas.toBlob (quality 0.6, maxWidth 1000px) runs before upload. Server also handles resizing. Most phone photos will pass after compression.
 - **PDF printing on mobile:** `window.print()` may not work well on all mobile browsers. The warning text says "You will not be able to download again" which creates urgency but the `reprint_id` parameter does allow reprinting from the claim page URL.
-- **After submission:** The product status changes to `claim_process` system-wide. User cannot file another claim on the same product until the current claim is resolved. No clear indication of this on the dashboard.
+- **After submission:** The product status changes to `claim_process` system-wide. User cannot file another claim on the same product until the current claim is resolved. **Fixed:** Dashboard now shows orange badge "กำลังดำเนินการเคลม" and status bar "🔧 อยู่ระหว่างเคลม" for products in claim_process.
 
 ---
 
@@ -311,7 +311,7 @@ When `bot_enabled = '0'` for a distributor:
 
 ### Where can the user get stuck
 
-- **Slip QR unreadable:** If the bank slip's QR code is damaged or the photo is blurry, Slip2Go cannot verify. System stays silent, leaving user unsure if payment was received.
+- **Slip QR unreadable:** If the bank slip's QR code is damaged or the photo is blurry, Slip2Go cannot verify. **Fixed:** System now replies "ระบบไม่สามารถอ่านสลิปนี้ได้ กรุณาถ่ายรูปใหม่ให้เห็น QR Code ชัดเจน" instead of staying silent.
 - **30-minute timeout:** If user does not select an invoice within 30 minutes, the slip association expires. Must re-send slip.
 - **Non-Thai bank:** Slip2Go is designed for Thai bank slips only. Foreign transfers cannot be auto-verified.
 
