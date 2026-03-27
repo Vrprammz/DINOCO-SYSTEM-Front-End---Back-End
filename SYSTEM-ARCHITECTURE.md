@@ -1,6 +1,6 @@
 # DINOCO System Architecture — Complete Reference
 
-> Auto-generated: 2026-03-27 | Version: V.30.2 | 34 files, ~45,000 lines
+> Updated: 2026-03-27 | Version: V.31.0 | 38 files, ~50,000 lines
 
 ## Overview
 
@@ -141,8 +141,11 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | **Snippet 10**: Invoice Image | 1,040 | — | GD-based invoice PNG generation |
 | **Snippet 11**: Customer LIFF | 947 | 4 shortcodes | Orders, account, commands LIFF pages |
 | **Snippet 12**: Admin LIFF | 1,988 | 3 shortcodes | Dashboard, stock manager, tracking entry LIFF |
+| **Snippet 13**: Debt Transaction | ~120 | — | Atomic MySQL transactions for debt operations (FOR UPDATE lock) |
+| **Snippet 14**: Order State Machine | ~180 | — | FSM class: validates transitions + actor permissions |
+| **Snippet 15**: Custom Tables & JWT | ~300 | — | Custom `dinoco_products` table + HMAC JWT session tokens |
 
-### Admin System (10 files)
+### Admin System (11 files)
 
 | File | Lines | Shortcode | Purpose |
 |------|-------|-----------|---------|
@@ -156,6 +159,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | User Management | 1,472 | `[dinoco_admin_users]` | User CRM + analytics |
 | KB Trainer | 471 | WP Admin menu | AI knowledge base trainer |
 | GitHub Sync | 1,179 | — | Code deployment from GitHub |
+| AI Provider Abstraction | ~250 | — | Swap Gemini/GPT/Claude via config constant |
 
 ### System / Member-facing (12 files)
 
@@ -178,7 +182,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `print_client.py` | 884 | Print polling daemon |
+| `print_client.py` | 985 | Print daemon (Pusher WebSocket + polling fallback) |
 | `dashboard.py` | 421 | Flask web dashboard |
 | `printer.py` | 375 | CUPS printer wrapper |
 | 6 templates | ~2,600 | Invoice, label, picking list HTML |
@@ -368,7 +372,7 @@ Updated monthly by `b2b_rank_update_event` cron.
 1. **LINE Webhook** — HMAC-SHA256 signature verification
 2. **LIFF Pages** — HMAC-signed URLs with expiry + LINE group membership check
 3. **Admin REST** — WordPress nonce + `manage_options` capability
-4. **Session Token** — `random_bytes(32)` with 1-hour expiry
+4. **Session Token** — HMAC-based JWT with expiry + refresh/revoke (Snippet 15)
 5. **Print API** — Shared API key in header
 6. **Flash Webhook** — Flash Express signature verification
 7. **GitHub Sync** — HMAC-SHA256 webhook signature
