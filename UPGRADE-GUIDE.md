@@ -37,58 +37,23 @@
 
 ---
 
-## 2. ตั้ง Server Cron (Bangmod Cloud)
+## 2. Server Cron (Bangmod Cloud)
 
-### ปัญหาของ WP Pseudo-Cron:
-- WP Cron ต้องรอ page load ถึงจะทำงาน
-- ถ้าไม่มีคนเข้าเว็บ = cron ไม่ทำงาน
+### ✅ มีอยู่แล้ว — ไม่ต้องทำอะไรเพิ่ม
 
-### แก้ไข:
+Bangmod Cloud ตั้ง cron ไว้แล้ว:
+```
+*/5 * * * *  curl -s -o /dev/null "https://dinoco.in.th/wp-cron.php?doing_wp_cron"
+```
 
-**Step 1: ปิด WP Pseudo-Cron**
+ทำงานทุก 5 นาที — เพียงพอสำหรับทุก cron job ในระบบ
 
-เพิ่มใน `wp-config.php`:
+### แนะนำ: เพิ่ม DISABLE_WP_CRON
+
+เพิ่มใน `wp-config.php` เพื่อป้องกัน pseudo-cron ทำงานซ้ำกับ server cron:
 ```php
 define('DISABLE_WP_CRON', true);
 ```
-
-**Step 2: ลง WP-CLI (ถ้ายังไม่มี)**
-
-SSH เข้า server:
-```bash
-curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-chmod +x wp-cli.phar
-sudo mv wp-cli.phar /usr/local/bin/wp
-```
-
-ทดสอบ:
-```bash
-wp --info
-```
-
-**Step 3: ตั้ง Crontab**
-
-```bash
-crontab -e
-```
-
-เพิ่มบรรทัดนี้:
-```cron
-# DINOCO WP-Cron — run every minute (WP จะเช็คเองว่ามี event ที่ต้องทำหรือไม่)
-* * * * * cd /path/to/wordpress && wp cron event run --due-now --quiet > /dev/null 2>&1
-```
-
-> **เปลี่ยน `/path/to/wordpress`** เป็น path จริงของ WordPress บน Bangmod Cloud
-> เช่น `/home/dinoco/public_html` หรือ `/var/www/html`
-
-**Step 4: ทดสอบ**
-
-```bash
-cd /path/to/wordpress
-wp cron event list
-```
-
-จะเห็นรายการ cron events ทั้งหมด (dunning, summary, rank, etc.)
 
 ---
 
@@ -287,8 +252,6 @@ if ($result['success']) {
 - [ ] Deploy Snippet 14 (State Machine) ใน WordPress Code Snippets
 - [ ] Deploy Snippet 15 (Custom Tables + JWT) ใน WordPress Code Snippets
 - [ ] Deploy AI Provider Abstraction ใน WordPress Code Snippets
-- [ ] เพิ่ม `DISABLE_WP_CRON` ใน wp-config.php
-- [ ] ลง WP-CLI บน Bangmod Cloud server
-- [ ] ตั้ง crontab ให้ run `wp cron event run --due-now` ทุกนาที
+- [ ] เพิ่ม `DISABLE_WP_CRON` ใน wp-config.php (Bangmod cron มีอยู่แล้ว ทุก 5 นาที)
 - [ ] (Phase 2) ลง Node.js + Vite + Tailwind บนเครื่อง dev
 - [ ] (Phase 2) ลงทะเบียน Pusher + แก้ RPi client
