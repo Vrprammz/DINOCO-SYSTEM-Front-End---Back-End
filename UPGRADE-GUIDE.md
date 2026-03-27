@@ -248,10 +248,11 @@ if ($result['success']) {
 
 ## Checklist สรุป
 
-- [ ] Deploy Snippet 13 (Debt Transaction) ใน WordPress Code Snippets
-- [ ] Deploy Snippet 14 (State Machine) ใน WordPress Code Snippets
-- [ ] Deploy Snippet 15 (Custom Tables + JWT) ใน WordPress Code Snippets
-- [ ] Deploy AI Provider Abstraction ใน WordPress Code Snippets
-- [ ] เพิ่ม `DISABLE_WP_CRON` ใน wp-config.php (Bangmod cron มีอยู่แล้ว ทุก 5 นาที)
-- [ ] (Phase 2) ลง Node.js + Vite + Tailwind บนเครื่อง dev
-- [ ] (Phase 2) ลงทะเบียน Pusher + แก้ RPi client
+- [x] Deploy Snippet 13 (Debt Transaction) ใน WordPress Code Snippets ✅ 2026-03-27
+- [x] Deploy Snippet 14 (State Machine) ใน WordPress Code Snippets ✅ 2026-03-27
+- [x] Deploy Snippet 15 (Custom Tables + JWT) ใน WordPress Code Snippets ✅ 2026-03-27
+- [x] Deploy AI Provider Abstraction ใน WordPress Code Snippets ✅ 2026-03-27
+- [x] เพิ่ม `DISABLE_WP_CRON` ใน wp-config.php ✅ 2026-03-27
+- [x] Server Cron — Bangmod Cloud มี crontab อยู่แล้ว (ทุก 5 นาที) ✅
+- [x] ลง Node.js + Vite + Tailwind บนเครื่อง dev ✅ 2026-03-27
+- [x] ลงทะเบียน Pusher + แก้ RPi client ✅ 2026-03-27 (WebSocket connected)
