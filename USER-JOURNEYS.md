@@ -311,7 +311,7 @@ When `bot_enabled = '0'` for a distributor:
 
 ### Where can the user get stuck
 
-- **Slip QR unreadable:** If the bank slip's QR code is damaged or the photo is blurry, Slip2Go cannot verify. **Fixed:** System now replies "ระบบไม่สามารถอ่านสลิปนี้ได้ กรุณาถ่ายรูปใหม่ให้เห็น QR Code ชัดเจน" instead of staying silent.
+- **Slip QR unreadable:** If the bank slip's QR code is damaged or the photo is blurry, Slip2Go returns 200404. System stays silent intentionally — because any image in the group could be a product photo, receipt, or other non-slip image. Replying would confuse users who sent non-slip images.
 - **30-minute timeout:** If user does not select an invoice within 30 minutes, the slip association expires. Must re-send slip.
 - **Non-Thai bank:** Slip2Go is designed for Thai bank slips only. Foreign transfers cannot be auto-verified.
 

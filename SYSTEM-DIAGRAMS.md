@@ -194,7 +194,7 @@ flowchart TB
     CODE -->|200501| DUP["Duplicate slip<br/>Reply: already used"]
     CODE -->|200401| WRONG_ACC["Wrong receiver account<br/>Reply: not DINOCO bank"]
     CODE -->|200402| WRONG_AMT["Amount mismatch<br/>Reply: check conditions"]
-    CODE -->|200404| NOT_SLIP["Not a slip / fake<br/>Reply: ถ่ายรูปใหม่ให้เห็น QR"]
+    CODE -->|200404| NOT_SLIP["Not a slip / fake<br/>Silent (no reply — อาจเป็นรูปอื่น)"]
     CODE -->|200000 / 200200| SUCCESS["Valid slip"]
 
     SUCCESS --> DUP_CHECK{conditionResult<br/>isDuplicate?}

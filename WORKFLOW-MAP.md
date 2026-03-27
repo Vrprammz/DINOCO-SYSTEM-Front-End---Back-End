@@ -572,7 +572,7 @@ Print tab:
 13. **html5-qrcode ไม่โหลดซ้ำแล้ว** — ลบออกจาก Dashboard Header, ใช้จาก Global App Menu ตัวเดียว
 14. **Dashboard แสดง claim_process indicator** — badge สีส้ม "กำลังดำเนินการเคลม" เมื่อ w_status = claim_process
 15. **Dashboard แสดง warranty expiry warning** — badge สีส้ม "ประกันเหลือ X วัน!" เมื่อเหลือ ≤30 วัน
-16. **Slip 200404 มี reply แล้ว** — แจ้งลูกค้า "ระบบไม่สามารถอ่านสลิปนี้ได้ กรุณาถ่ายรูปใหม่"
+16. **Slip 200404 ยังคง silent (ถูกต้อง)** — รูปในห้องอาจไม่ใช่สลิป (รูปสินค้า, ใบเสร็จ, etc.) ถ้า reply จะทำให้สับสน
 17. **Claim "ถัดไป" มี disabled state แล้ว** — ปุ่มจะ disabled จนกว่าจะเลือกทั้งสินค้าและปัญหา
 18. **Admin Claims มีปุ่ม PDF เคลม** — ลิงก์ reprint ใน claim card เปิดหน้า claim-system ในแท็บใหม่
 19. **Transfer มี confirmation modal ครบแล้ว** — แสดงสินค้า + ผู้รับ + disclaimer + checkboxes ก่อน execute
