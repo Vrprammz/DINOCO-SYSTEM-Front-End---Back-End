@@ -488,11 +488,12 @@ Print tab:
 
 | Flex Card | ปุ่ม | กดแล้ว → | ผล |
 |-----------|------|---------|-----|
-| **Cancel (Admin)** | ✅ อนุมัติ | postback cancel_approve | → cancelled + คืนหนี้ |
-| | ❌ ปฏิเสธ | postback cancel_reject | กลับสถานะเดิม |
-| **Claim (Admin)** | 🔄 เปลี่ยนสินค้า | postback claim_exchange | ส่งของใหม่ |
-| | 💰 คืนเงิน | postback claim_refund | คืนหนี้ |
-| | ❌ ปฏิเสธ | postback claim_reject | → completed |
+| **Cancel (Admin)** | ✅ อนุมัติ | postback cancel_approve | → cancelled + คืนหนี้ (recalculate) + Flex card ลูกค้า |
+| | ❌ ปฏิเสธ | postback cancel_reject | กลับสถานะเดิม + Flex card ลูกค้า |
+| | 📋 ดูรายละเอียด | URI → LIFF ticket (HMAC signed) | เปิด ticket detail |
+| **Claim (Admin)** | 🔄 เปลี่ยนสินค้า | postback claim_exchange | ส่งของใหม่ + Flex card ลูกค้า + delivery check 3 วัน |
+| | 💰 คืนเงิน | postback claim_refund | คืนหนี้ (recalculate) + Flex card ยอดคืน |
+| | ❌ ปฏิเสธ | postback claim_reject | → completed + Flex card แจ้งลูกค้า |
 | **Claim Options (Customer)** | 💔 สินค้าเสียหาย | postback claim_open | → เปิดเคลม |
 | | 🔄 สินค้าผิดรุ่น | postback claim_open | → เปิดเคลม |
 | | 📦 สินค้าไม่ครบ | postback claim_open | → เปิดเคลม |
@@ -578,6 +579,16 @@ Print tab:
 19. **Transfer มี confirmation modal ครบแล้ว** — แสดงสินค้า + ผู้รับ + disclaimer + checkboxes ก่อน execute
 20. **B2B Admin LIFF shortcode ถูกต้อง** — code ใช้ `[b2b_dashboard]` ตรงกับ WP page (doc อัพเดทแล้ว)
 
+### Flex Card & LIFF Audit Fixes (commit aaa52c8 + e8a5962)
+21. **ship_manual tracking URL แก้แล้ว** — ใช้ `b2b_build_flex_tracking_prompt()` จาก Snippet 1 แทน placeholder URL
+22. **cancel_admin + packing_alert LIFF URL แก้แล้ว** — ใช้ `b2b_liff_url()` พร้อม HMAC signature + `ticket_id` param ถูกต้อง
+23. **receipt "เลือก Ticket" แก้แล้ว** — link ไป Admin Dashboard search ด้วย tracking number
+24. **Advisory lock เพิ่มใน bo_wait, bo_extend, delivery_no, bo_wait_full** — ป้องกัน double-tap
+25. **cancel_approve, bo_cancel_all, claim_refund ใช้ b2b_recalculate_debt()** — ป้องกัน race condition หนี้ drift
+26. **claim_exchange เพิ่ม delivery check 3 วัน** — schedule `b2b_delivery_check_event` หลังส่งสินค้าเปลี่ยน
+27. **ลูกค้าเห็น Flex card ทุกจุดแล้ว** — claim_exchange, claim_refund, claim_reject, change_approve, change_reject, bo_restock ทั้งหมดเปลี่ยนจาก text → Flex card สวยงาม + push_guaranteed
+28. **ไม่มี text push ถึงลูกค้าเหลืออยู่** — text เหลือเฉพาะ fallback ใน `else` branch กรณี `b2b_flex_header` ไม่มี
+
 ### หมายเหตุ
-- **Claim status change ไม่ส่ง LINE notification ถึง member** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel ส่ง push ไม่ได้)
+- **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)
 - **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)

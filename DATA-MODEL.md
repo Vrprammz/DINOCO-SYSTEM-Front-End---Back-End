@@ -291,11 +291,11 @@ Type: float (running balance in Baht)
 | **Manual Invoice: issue** | `+total_amount` | Manual Invoice, line ~1217 |
 | **Slip payment (LINE)** | `-slip_amount` | Snippet 2, line ~2230 |
 | **Manual Invoice: record payment** | `-payment_amount` | Manual Invoice, line ~1290 |
-| **B2B Webhook: cancel approved** | `-total_amount` (if `is_billed`) | Snippet 2, line ~787 |
-| **B2B Webhook: cancel (admin direct)** | `-total_amount` (if `is_billed`) | Snippet 2, line ~3055 |
+| **B2B Webhook: cancel approved** | `b2b_recalculate_debt()` (if `is_billed`) | Snippet 2, line ~787 |
+| **B2B Webhook: cancel (admin direct)** | `b2b_recalculate_debt()` (if `is_billed`) | Snippet 2, line ~3055 |
 | **Manual Invoice: cancel bill** | `-total_amount` (via `b2b_recalculate_debt` or direct) | Manual Invoice, line ~548 |
 | **Manual Invoice: edit issued bill** | `+/- delta` (new_total - old_total) | Manual Invoice, line ~1141 |
-| **B2B Webhook: claim refund** | `-total_amount` | Snippet 2, line ~1652 |
+| **B2B Webhook: claim refund** | `b2b_recalculate_debt()` | Snippet 2, line ~1652 |
 | **Cron: dunning** | Read-only (checks for overdue, sets `credit_hold`) | Snippet 7 |
 | **Cron: daily summary** | Read-only (aggregates outstanding debt) | Snippet 7 |
 

@@ -482,7 +482,7 @@ Parts request path:
 ### Where can the user get stuck
 
 - **Customer has no visibility:** After filing a claim, the member can only see the ticket code. There is no real-time status tracking page for the customer. They must contact admin for updates.
-- **No notification to customer:** Status changes do not trigger LINE push notifications to the member. The member must check the dashboard manually or contact support.
+- **No notification to B2C member:** Claim status changes (B2C) do not trigger LINE push notifications because LINE Login userId ≠ Bot userId (different channels). Members must check dashboard manually. **Note:** B2B claim resolution (exchange/refund/reject) now sends Flex cards to distributor groups.
 - **Evidence photo quality:** Admin reviews photos taken by the customer. If photos are insufficient, there is no in-system way to request additional photos -- must communicate outside the system.
 
 ---
