@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 DINOCO B2B — Print Client Daemon (Raspberry Pi)
-Polls WordPress REST API for print jobs, renders templates, and prints.
+Supports two modes:
+  1. WebSocket (Pusher) — real-time, instant print triggers
+  2. Polling fallback   — if Pusher unavailable, polls every 10s
 
 Usage:
-    python3 print_client.py              # Run once
-    python3 print_client.py --daemon     # Run as polling daemon
+    python3 print_client.py              # Run once (poll)
+    python3 print_client.py --daemon     # WebSocket + polling fallback
+    python3 print_client.py --poll-only  # Force polling mode (no WebSocket)
 
 systemd runs this with --daemon flag.
 """
@@ -793,11 +796,87 @@ def send_heartbeat(config, printer_mgr=None):
         logger.debug(f'Heartbeat failed: {e}')
 
 
+# ── Pusher WebSocket ───────────────────────────────────────────────
+
+def start_pusher_listener(config, printer_mgr):
+    """Start Pusher WebSocket listener for real-time print triggers.
+    Falls back to polling if pysher not installed or connection fails.
+    Returns True if Pusher is running, False if should use polling."""
+
+    pusher_key = config.get('pusher_key', '')
+    pusher_cluster = config.get('pusher_cluster', 'ap1')
+
+    if not pusher_key:
+        logger.info('[Pusher] No pusher_key in config — using polling mode')
+        return False
+
+    try:
+        import pysher
+    except ImportError:
+        logger.warning('[Pusher] pysher not installed — pip install pysher — using polling mode')
+        return False
+
+    pusher_connected = {'value': False}
+
+    def on_connect(data):
+        logger.info('[Pusher] Connected! Subscribing to dinoco-print channel')
+        channel = pusher_client.subscribe('dinoco-print')
+        channel.bind('new-job', on_new_job)
+        channel.bind('test-print', on_test_print)
+        pusher_connected['value'] = True
+
+    def on_disconnect(data):
+        logger.warning('[Pusher] Disconnected — will auto-reconnect')
+        pusher_connected['value'] = False
+
+    def on_error(data):
+        logger.error(f'[Pusher] Error: {data}')
+
+    def on_new_job(data):
+        """Triggered when WordPress queues a new print job."""
+        logger.info(f'[Pusher] New print job received: {data}')
+        try:
+            job_data = json.loads(data) if isinstance(data, str) else data
+            # Immediately poll WordPress for the actual job data
+            poll_and_print(config, printer_mgr)
+        except Exception as e:
+            logger.error(f'[Pusher] Error processing job: {e}')
+
+    def on_test_print(data):
+        """Triggered for test print from admin dashboard."""
+        logger.info(f'[Pusher] Test print triggered: {data}')
+        try:
+            poll_and_print(config, printer_mgr)
+        except Exception as e:
+            logger.error(f'[Pusher] Test print error: {e}')
+
+    try:
+        pusher_client = pysher.Pusher(pusher_key, cluster=pusher_cluster)
+        pusher_client.connection.bind('pusher:connection_established', on_connect)
+        pusher_client.connection.bind('pusher:connection_failed', on_error)
+        pusher_client.connection.bind('pusher:disconnected', on_disconnect)
+        pusher_client.connect()
+        logger.info(f'[Pusher] Connecting to cluster {pusher_cluster}...')
+
+        # Wait up to 10 seconds for connection
+        for _ in range(20):
+            if pusher_connected['value']:
+                return True
+            time.sleep(0.5)
+
+        logger.warning('[Pusher] Connection timeout — falling back to polling')
+        return False
+    except Exception as e:
+        logger.error(f'[Pusher] Failed to start: {e} — falling back to polling')
+        return False
+
+
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description='DINOCO B2B Print Client')
-    parser.add_argument('--daemon', action='store_true', help='Run as polling daemon')
+    parser.add_argument('--daemon', action='store_true', help='Run as daemon (WebSocket + polling fallback)')
+    parser.add_argument('--poll-only', action='store_true', help='Force polling mode (no WebSocket)')
     args = parser.parse_args()
 
     config = load_config()
@@ -812,11 +891,21 @@ def main():
     logger.info(f'Available printers: {printers}')
 
     if args.daemon:
+        # Try Pusher WebSocket first (unless --poll-only)
+        pusher_active = False
+        if not args.poll_only:
+            pusher_active = start_pusher_listener(config, printer_mgr)
+
+        if pusher_active:
+            logger.info('🟢 WebSocket mode — real-time print via Pusher (polling every 30s as safety net)')
+
         base_interval = config.get('poll_interval', 10)
-        max_interval = 30
-        current_interval = base_interval
+        # If Pusher is active, poll less frequently (safety net only)
+        poll_interval = 30 if pusher_active else base_interval
+        max_interval = 60 if pusher_active else 30
+        current_interval = poll_interval
         idle_count = 0
-        logger.info(f'Daemon mode — polling every {base_interval}s (adaptive up to {max_interval}s)')
+        logger.info(f'Daemon mode — polling every {poll_interval}s' + (' (WebSocket primary)' if pusher_active else ' (polling primary)'))
 
         # Screen sleep schedule (21:00 - 10:00 Bangkok time)
         screen_sleep_start = config.get('screen_sleep_start', 21)  # 21:00
@@ -832,7 +921,6 @@ def main():
             if should_sleep and not _screen_is_off:
                 logger.info(f'Screen sleep — turning off display ({hour}:00 Bangkok)')
                 try:
-                    # Try multiple methods for different Pi setups
                     os.system('vcgencmd display_power 0 2>/dev/null || xset dpms force off 2>/dev/null || wlr-randr --output HDMI-A-1 --off 2>/dev/null')
                 except Exception as e:
                     logger.debug(f'Screen off error: {e}')
@@ -852,7 +940,7 @@ def main():
                 processed = poll_and_print(config, printer_mgr)
                 if processed and processed > 0:
                     idle_count = 0
-                    current_interval = base_interval
+                    current_interval = poll_interval
                 else:
                     idle_count += 1
                     if idle_count >= 6:
@@ -860,7 +948,7 @@ def main():
             except Exception as e:
                 logger.error(f'Unexpected error: {e}')
 
-            # Send heartbeat every 25 seconds (time-based, independent of poll interval)
+            # Send heartbeat every 25 seconds
             now_ts = time.time()
             if now_ts - last_heartbeat >= 25:
                 last_heartbeat = now_ts
