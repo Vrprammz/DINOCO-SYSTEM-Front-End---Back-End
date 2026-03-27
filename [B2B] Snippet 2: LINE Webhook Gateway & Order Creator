@@ -45,6 +45,21 @@ add_action( 'rest_api_init', function () {
         'methods'=>'POST','callback'=>'b2b_process_line_webhook','permission_callback'=>'__return_true',
     ));
     // ⚠️ V.8.2-SEC: auth-group ย้ายไป Snippet 3 (มี session token)
+
+    // V.31: Shipment & Delivery REST endpoints (partial shipment support)
+    $perm = function( WP_REST_Request $req ) {
+        return wp_verify_nonce( $req->get_header('X-WP-Nonce'), 'wp_rest' ) && current_user_can('manage_options');
+    };
+    register_rest_route('b2b/v1', '/create-shipment', array(
+        'methods' => 'POST',
+        'callback' => 'b2b_rest_create_shipment',
+        'permission_callback' => $perm,
+    ));
+    register_rest_route('b2b/v1', '/confirm-delivery', array(
+        'methods' => 'POST',
+        'callback' => 'b2b_rest_confirm_delivery',
+        'permission_callback' => $perm,
+    ));
 });
 
 // ════════════════════════════════════════════
@@ -1097,33 +1112,92 @@ function b2b_action_ship_rider( $ticket_id, $user_id, $reply_token ) {
     $admin_name = b2b_get_line_profile_name($user_id);
     $group_id = get_field('source_group_id', $ticket_id);
     $order_text = get_field('order_items', $ticket_id) ?: '';
+    $items_preview = mb_substr(preg_replace('/\s+/u', ' ', $order_text), 0, 120);
+    if (empty($items_preview)) $items_preview = '(ดูรายละเอียดในออเดอร์)';
     $dist_name = '';
     $dist = function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($group_id) : null;
     if ($dist) $dist_name = $dist->post_title;
 
-    // Create shipment
+    // Create shipment record
     if (function_exists('b2b_create_shipment')) {
         b2b_create_shipment($ticket_id, array(
             'method' => 'rider',
             'carrier' => 'Rider/Lalamove',
-            'items' => array(), // Phase 3: item-level tracking
+            'items' => array(),
         ));
     }
 
+    // Update order fields
     b2b_set_order_status($ticket_id, 'shipped');
+    update_post_meta($ticket_id, '_b2b_shipping_method', 'rider');
+    update_field('tracking_number', 'Rider มารับ', $ticket_id);
     update_field('shipped_date', function_exists('b2b_date') ? b2b_date('Y-m-d H:i:s') : current_time('mysql'), $ticket_id);
     b2b_clear_sla_nag($ticket_id);
 
-    b2b_line_reply($reply_token, "🏍️ Rider มารับ #" . $ticket_id . " เรียบร้อย (โดย " . $admin_name . ")");
+    // Reply to admin
+    b2b_line_reply($reply_token, "✅ แจ้งลูกค้าแล้ว — Rider มารับ #" . $ticket_id);
 
-    // Flex to customer — guaranteed delivery
-    if ($group_id && function_exists('b2b_build_flex_shipped')) {
-        $shipment = array('shipment_id'=>'','method'=>'rider','carrier'=>'Rider/Lalamove','tracking_no'=>'','items'=>array());
-        $flex = b2b_build_flex_shipped($ticket_id, $shipment, $dist_name);
+    // Build inline Flex card for customer
+    $flex_body_contents = array(
+        array('type' => 'text', 'text' => '🏍️ จัดส่งโดย Rider/Lalamove', 'size' => 'sm', 'color' => '#555555', 'wrap' => true),
+        array('type' => 'separator', 'margin' => 'lg'),
+        array('type' => 'text', 'text' => $items_preview, 'size' => 'sm', 'color' => '#333333', 'wrap' => true, 'margin' => 'lg'),
+    );
+    if (!empty($dist_name)) {
+        array_unshift($flex_body_contents, array(
+            'type' => 'text', 'text' => '🏪 ' . $dist_name, 'size' => 'md', 'weight' => 'bold', 'color' => '#333333', 'wrap' => true,
+        ));
+    }
+    $rider_flex = array(
+        'type' => 'flex',
+        'altText' => '📦 สินค้าจัดส่งแล้ว (Rider มารับ) #' . $ticket_id,
+        'contents' => array(
+            'type' => 'bubble',
+            'size' => 'kilo',
+            'header' => array(
+                'type' => 'box',
+                'layout' => 'vertical',
+                'contents' => array(
+                    array('type' => 'text', 'text' => '📦 สินค้าจัดส่งแล้ว', 'weight' => 'bold', 'size' => 'lg', 'color' => '#ffffff'),
+                    array('type' => 'text', 'text' => 'Ticket #' . $ticket_id, 'size' => 'sm', 'color' => '#ffffffcc', 'margin' => 'sm'),
+                ),
+                'paddingAll' => 'lg',
+                'backgroundColor' => '#1a1a1a',
+            ),
+            'body' => array(
+                'type' => 'box',
+                'layout' => 'vertical',
+                'spacing' => 'md',
+                'contents' => $flex_body_contents,
+                'paddingAll' => 'lg',
+            ),
+            'footer' => array(
+                'type' => 'box',
+                'layout' => 'vertical',
+                'contents' => array(
+                    array(
+                        'type' => 'button',
+                        'action' => array(
+                            'type' => 'postback',
+                            'label' => '✅ ได้รับสินค้าแล้ว',
+                            'data' => 'action=confirm_received&ticket_id=' . $ticket_id,
+                        ),
+                        'style' => 'primary',
+                        'color' => '#4CAF50',
+                        'height' => 'sm',
+                    ),
+                ),
+                'paddingAll' => 'lg',
+            ),
+        ),
+    );
+
+    // Push to customer group — guaranteed delivery
+    if ($group_id) {
         if (function_exists('b2b_push_guaranteed')) {
-            b2b_push_guaranteed($group_id, array($flex), $ticket_id, 'shipped_rider');
+            b2b_push_guaranteed($group_id, array($rider_flex), $ticket_id, 'shipped_rider');
         } else {
-            b2b_line_push_raw($group_id, array($flex));
+            b2b_line_push_raw($group_id, array($rider_flex));
         }
     }
 
@@ -1137,7 +1211,7 @@ function b2b_action_ship_rider( $ticket_id, $user_id, $reply_token ) {
     delete_transient($lock_key);
 }
 
-// V.38: Self-pickup — customer picks up at shop
+// V.38: Self-pickup — customer picks up at shop (completes immediately)
 function b2b_action_ship_self_pickup( $ticket_id, $user_id, $reply_token ) {
     $lock_key = 'b2b_lock_' . $ticket_id;
     if (get_transient($lock_key)) return;
@@ -1153,27 +1227,73 @@ function b2b_action_ship_self_pickup( $ticket_id, $user_id, $reply_token ) {
     $admin_name = b2b_get_line_profile_name($user_id);
     $group_id = get_field('source_group_id', $ticket_id);
     $order_text = get_field('order_items', $ticket_id) ?: '';
+    $items_preview = mb_substr(preg_replace('/\s+/u', ' ', $order_text), 0, 120);
+    if (empty($items_preview)) $items_preview = '(ดูรายละเอียดในออเดอร์)';
     $dist_name = '';
+    $shop_address = '';
     $dist = function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($group_id) : null;
-    if ($dist) $dist_name = $dist->post_title;
+    if ($dist) {
+        $dist_name = $dist->post_title;
+        $shop_address = get_field('dist_address', $dist->ID) ?: '';
+    }
 
     if (function_exists('b2b_create_shipment')) {
         b2b_create_shipment($ticket_id, array('method' => 'self_pickup'));
     }
 
-    b2b_set_order_status($ticket_id, 'shipped');
+    // Self-pickup = completed immediately (no delivery needed)
+    b2b_set_order_status($ticket_id, 'completed');
+    update_post_meta($ticket_id, '_b2b_shipping_method', 'self_pickup');
     update_field('shipped_date', function_exists('b2b_date') ? b2b_date('Y-m-d H:i:s') : current_time('mysql'), $ticket_id);
     b2b_clear_sla_nag($ticket_id);
 
-    b2b_line_reply($reply_token, "🏪 ลูกค้ามารับเอง #" . $ticket_id . " (โดย " . $admin_name . ")");
+    // Reply to admin
+    b2b_line_reply($reply_token, "✅ แจ้งลูกค้าแล้ว — มารับเอง #" . $ticket_id);
 
-    // Flex to customer
-    if ($group_id && function_exists('b2b_build_flex_ready_pickup')) {
-        $flex = b2b_build_flex_ready_pickup($ticket_id, $dist_name, $order_text);
+    // Build inline Flex card for customer
+    $flex_body_contents = array();
+    if (!empty($dist_name)) {
+        $flex_body_contents[] = array('type' => 'text', 'text' => '🏪 ' . $dist_name, 'size' => 'md', 'weight' => 'bold', 'color' => '#333333', 'wrap' => true);
+    }
+    if (!empty($shop_address)) {
+        $flex_body_contents[] = array('type' => 'text', 'text' => '📍 ' . $shop_address, 'size' => 'sm', 'color' => '#666666', 'wrap' => true, 'margin' => 'sm');
+    }
+    $flex_body_contents[] = array('type' => 'separator', 'margin' => 'lg');
+    $flex_body_contents[] = array('type' => 'text', 'text' => $items_preview, 'size' => 'sm', 'color' => '#333333', 'wrap' => true, 'margin' => 'lg');
+    $flex_body_contents[] = array('type' => 'text', 'text' => 'กรุณามารับสินค้าได้เลยครับ', 'size' => 'sm', 'color' => '#888888', 'wrap' => true, 'margin' => 'lg');
+
+    $pickup_flex = array(
+        'type' => 'flex',
+        'altText' => '🏪 สินค้าพร้อมรับที่ร้าน #' . $ticket_id,
+        'contents' => array(
+            'type' => 'bubble',
+            'size' => 'kilo',
+            'header' => array(
+                'type' => 'box',
+                'layout' => 'vertical',
+                'contents' => array(
+                    array('type' => 'text', 'text' => '🏪 พร้อมรับสินค้า', 'weight' => 'bold', 'size' => 'lg', 'color' => '#ffffff'),
+                    array('type' => 'text', 'text' => 'Ticket #' . $ticket_id, 'size' => 'sm', 'color' => '#ffffffcc', 'margin' => 'sm'),
+                ),
+                'paddingAll' => 'lg',
+                'backgroundColor' => '#1a1a1a',
+            ),
+            'body' => array(
+                'type' => 'box',
+                'layout' => 'vertical',
+                'spacing' => 'md',
+                'contents' => $flex_body_contents,
+                'paddingAll' => 'lg',
+            ),
+        ),
+    );
+
+    // Push to customer group — guaranteed delivery (no delivery check needed)
+    if ($group_id) {
         if (function_exists('b2b_push_guaranteed')) {
-            b2b_push_guaranteed($group_id, array($flex), $ticket_id, 'self_pickup');
+            b2b_push_guaranteed($group_id, array($pickup_flex), $ticket_id, 'self_pickup');
         } else {
-            b2b_line_push_raw($group_id, array($flex));
+            b2b_line_push_raw($group_id, array($pickup_flex));
         }
     }
 
@@ -2894,3 +3014,194 @@ add_action('b2b_deferred_admin_push', function($messages_json) {
     $messages = json_decode($messages_json, true);
     if ($messages) b2b_push_raw_to_admin($messages);
 }, 10, 1);
+
+// ════════════════════════════════════════════════════════════════
+// V.31: REST — Create Shipment (partial shipment support)
+// ════════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_rest_create_shipment' ) ) {
+function b2b_rest_create_shipment( WP_REST_Request $r ) {
+    try {
+        $ticket_id  = intval($r->get_param('ticket_id'));
+        $method     = sanitize_text_field($r->get_param('method') ?: 'self_ship');
+        $carrier    = sanitize_text_field($r->get_param('carrier') ?: '');
+        $tracking   = sanitize_text_field($r->get_param('tracking_no') ?: '');
+        $items      = $r->get_param('items') ?: array(); // array of {sku, qty}
+        $note       = sanitize_text_field($r->get_param('note') ?: '');
+
+        if (!$ticket_id || get_post_type($ticket_id) !== 'b2b_order') {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Ticket ไม่ถูกต้อง'), 400);
+        }
+
+        $status = get_field('order_status', $ticket_id);
+        $shippable = array('paid', 'awaiting_payment', 'packed', 'partial_shipped');
+        if (!in_array($status, $shippable)) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'สถานะไม่อนุญาตให้จัดส่ง (สถานะ: ' . $status . ')'), 400);
+        }
+
+        $allowed_methods = array('flash', 'self_ship', 'rider', 'self_pickup');
+        if (!in_array($method, $allowed_methods)) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'วิธีจัดส่งไม่ถูกต้อง: ' . $method), 400);
+        }
+
+        // Sanitize items array
+        $clean_items = array();
+        if (is_array($items)) {
+            foreach ($items as $item) {
+                if (!empty($item['sku'])) {
+                    $clean_items[] = array(
+                        'sku' => sanitize_text_field($item['sku']),
+                        'qty' => max(1, intval($item['qty'] ?? 1)),
+                    );
+                }
+            }
+        }
+
+        // Create shipment record
+        if (!function_exists('b2b_create_shipment')) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'b2b_create_shipment not available (Snippet 1 not loaded)'), 500);
+        }
+        $shipment = b2b_create_shipment($ticket_id, array(
+            'method'     => $method,
+            'carrier'    => $carrier,
+            'tracking_no'=> $tracking,
+            'items'      => $clean_items,
+            'note'       => $note,
+        ));
+
+        // Determine if partial or full shipment
+        $shipping_status = get_post_meta($ticket_id, '_b2b_shipping_status', true);
+        $new_status = ($shipping_status === 'partial_shipped') ? 'partial_shipped' : 'shipped';
+        b2b_set_order_status($ticket_id, $new_status);
+        update_field('shipped_date', function_exists('b2b_date') ? b2b_date('Y-m-d H:i:s') : current_time('mysql'), $ticket_id);
+        if ($tracking) update_field('tracking_number', $tracking, $ticket_id);
+        if ($carrier) update_field('shipping_provider', $carrier, $ticket_id);
+        b2b_clear_sla_nag($ticket_id);
+
+        // Resolve distributor name
+        $group_id  = get_field('source_group_id', $ticket_id);
+        $dist_name = '';
+        $dist = function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($group_id) : null;
+        if ($dist) $dist_name = $dist->post_title;
+
+        // Send Flex to customer
+        if ($group_id) {
+            $flex = null;
+            if ($method === 'self_pickup' && function_exists('b2b_build_flex_ready_pickup')) {
+                $order_text = get_field('order_items', $ticket_id) ?: '';
+                $flex = b2b_build_flex_ready_pickup($ticket_id, $dist_name, $order_text);
+            } elseif (function_exists('b2b_build_flex_shipped')) {
+                $is_partial = ($new_status === 'partial_shipped');
+                $flex = b2b_build_flex_shipped($ticket_id, $shipment, $dist_name, $is_partial);
+            }
+            if ($flex) {
+                $flex_tag = 'shipped_' . $method . ($new_status === 'partial_shipped' ? '_partial' : '');
+                if (function_exists('b2b_push_guaranteed')) {
+                    b2b_push_guaranteed($group_id, array($flex), $ticket_id, $flex_tag);
+                } else {
+                    b2b_line_push_raw($group_id, array($flex));
+                }
+            }
+        }
+
+        // Schedule delivery check based on method
+        if ($method === 'self_pickup') {
+            // No delivery check needed — customer already has the goods
+        } elseif ($method === 'rider') {
+            // Rider: 1-day delivery check
+            wp_schedule_single_event(time() + DAY_IN_SECONDS, 'b2b_delivery_check_event', array($ticket_id));
+        } else {
+            // self_ship / flash: 3-day delivery check
+            wp_schedule_single_event(time() + (3 * DAY_IN_SECONDS), 'b2b_delivery_check_event', array($ticket_id));
+        }
+
+        // Admin notification
+        $method_labels = array('flash'=>'⚡ Flash','self_ship'=>'📬 ส่งเอง','rider'=>'🏍️ Rider','self_pickup'=>'🏪 มารับเอง');
+        $method_label = $method_labels[$method] ?? $method;
+        $admin_msg = $method_label . ' จัดส่ง #' . $ticket_id . ' (' . $dist_name . ')';
+        if ($tracking) $admin_msg .= ' — ' . $tracking;
+        if (function_exists('b2b_push_to_admin')) {
+            b2b_push_to_admin($admin_msg);
+        }
+
+        if (function_exists('b2b_add_audit_log')) {
+            b2b_add_audit_log($ticket_id, 'create_shipment', $method_label . ($tracking ? ' ' . $tracking : '') . ($note ? ' — ' . $note : ''));
+        }
+
+        return new WP_REST_Response(array(
+            'success'  => true,
+            'message'  => 'สร้างการจัดส่งสำเร็จ',
+            'shipment' => $shipment,
+            'status'   => $new_status,
+        ), 200);
+
+    } catch (Exception $e) {
+        b2b_log('[REST] create-shipment error: ' . $e->getMessage());
+        return new WP_REST_Response(array('success' => false, 'message' => $e->getMessage()), 500);
+    }
+}
+} // end function_exists b2b_rest_create_shipment
+
+// ════════════════════════════════════════════════════════════════
+// V.31: REST — Confirm Delivery
+// ════════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_rest_confirm_delivery' ) ) {
+function b2b_rest_confirm_delivery( WP_REST_Request $r ) {
+    try {
+        $ticket_id   = intval($r->get_param('ticket_id'));
+        $shipment_id = sanitize_text_field($r->get_param('shipment_id') ?: '');
+
+        if (!$ticket_id || get_post_type($ticket_id) !== 'b2b_order') {
+            return new WP_REST_Response(array('success' => false, 'message' => 'Ticket ไม่ถูกต้อง'), 400);
+        }
+
+        $status = get_field('order_status', $ticket_id);
+        if ($status === 'completed') {
+            return new WP_REST_Response(array('success' => true, 'message' => 'ยืนยันรับสินค้าไปแล้ว', 'already' => true), 200);
+        }
+        if (!in_array($status, array('shipped', 'partial_shipped'))) {
+            return new WP_REST_Response(array('success' => false, 'message' => 'สถานะไม่ใช่จัดส่งแล้ว (สถานะ: ' . $status . ')'), 400);
+        }
+
+        // Mark specific shipment as delivered (if shipment_id provided)
+        $all_delivered = true;
+        if ($shipment_id && function_exists('b2b_mark_shipment_delivered')) {
+            $all_delivered = b2b_mark_shipment_delivered($ticket_id, $shipment_id);
+        }
+
+        // Update order status
+        if ($all_delivered) {
+            b2b_set_order_status($ticket_id, 'completed');
+        }
+        b2b_clear_sla_nag($ticket_id);
+
+        // Admin notification
+        $dist_name = get_field('dist_name', $ticket_id) ?: '';
+        if (!$dist_name) {
+            $group_id = get_field('source_group_id', $ticket_id);
+            $dist = function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($group_id) : null;
+            if ($dist) $dist_name = $dist->post_title;
+        }
+        if (function_exists('b2b_push_to_admin')) {
+            $msg = '✅ ยืนยันรับสินค้า #' . $ticket_id . ' (' . $dist_name . ')';
+            if ($shipment_id) $msg .= ' [' . $shipment_id . ']';
+            if (!$all_delivered) $msg .= ' (ยังมีพัสดุอื่นรอส่ง)';
+            b2b_push_to_admin($msg);
+        }
+
+        if (function_exists('b2b_add_audit_log')) {
+            b2b_add_audit_log($ticket_id, 'confirm_delivery', 'ยืนยันรับสินค้า' . ($shipment_id ? ' [' . $shipment_id . ']' : '') . ($all_delivered ? ' — ครบทุกชิ้น' : ' — ยังมีรอส่ง'));
+        }
+
+        return new WP_REST_Response(array(
+            'success'       => true,
+            'message'       => $all_delivered ? 'ยืนยันรับสินค้าครบแล้ว' : 'ยืนยันรับพัสดุนี้แล้ว (ยังมีรายการอื่นรอส่ง)',
+            'all_delivered' => $all_delivered,
+            'status'        => $all_delivered ? 'completed' : $status,
+        ), 200);
+
+    } catch (Exception $e) {
+        b2b_log('[REST] confirm-delivery error: ' . $e->getMessage());
+        return new WP_REST_Response(array('success' => false, 'message' => $e->getMessage()), 500);
+    }
+}
+} // end function_exists b2b_rest_confirm_delivery
