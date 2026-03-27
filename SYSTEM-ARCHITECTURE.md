@@ -123,9 +123,9 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 
 ---
 
-## File Map (34 files)
+## File Map (38 files)
 
-### B2B System (12 files)
+### B2B System (15 files)
 
 | File | Lines | Shortcode | Purpose |
 |------|-------|-----------|---------|
@@ -145,7 +145,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | **Snippet 14**: Order State Machine | ~180 | — | FSM class: validates transitions + actor permissions |
 | **Snippet 15**: Custom Tables & JWT | ~300 | — | Custom `dinoco_products` table + HMAC JWT session tokens |
 
-### Admin System (11 files)
+### Admin System (11 files + 1 abstraction layer)
 
 | File | Lines | Shortcode | Purpose |
 |------|-------|-----------|---------|

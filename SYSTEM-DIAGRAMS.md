@@ -427,7 +427,7 @@ stateDiagram-v2
 
     awaiting_payment --> cancelled : Admin cancels<br/>/invoice/cancel<br/>(reverses debt)
 
-    awaiting_payment --> awaiting_payment : Dunning reminder<br/>Cron: 3 days before due
+    awaiting_payment --> awaiting_payment : Dunning reminder<br/>Cron: 2 days before due
 
     awaiting_payment --> awaiting_payment : Overdue notice<br/>Cron: 1 day + 7 days past due
 
@@ -439,7 +439,7 @@ stateDiagram-v2
 
     note right of awaiting_payment
         Dunning escalation tiers:
-        - 3 days before due: reminder
+        - 2 days before due: reminder (Flex card)
         - 1 day overdue: warning
         - 7+ days overdue: escalated alert
         Each tier sends once (dedup via meta)
@@ -654,7 +654,7 @@ flowchart TB
 flowchart TB
     subgraph DAILY["Daily Jobs"]
         D1["06:00 b2b_oos_expiry_check<br/>Clear expired OOS markers<br/>on b2b_product"]
-        D2["09:00 b2b_dunning_cron_event<br/>Payment reminders (3-day, Flex card)<br/>+ Overdue notices (1d/7d, Flex card)<br/>+ Credit hold escalation<br/>Groups by distributor (1 msg per shop)<br/>Shows remaining amount (total - paid)<br/>Skips invoices issued &lt; 24hrs ago"]
+        D2["09:00 b2b_dunning_cron_event<br/>Payment reminders (2-day before due, Flex card)<br/>+ Overdue notices (1d/7d, Flex card)<br/>+ Credit hold escalation (5d+)<br/>Groups by distributor (1 msg per shop)<br/>Manual Invoice dunning: shows remaining (total - paid)<br/>skips invoices issued &lt; 24hrs ago"]
         D3["10:00 b2b_bo_overdue_check<br/>Backorder overdue alerts"]
         D4["11:00 b2b_auto_complete_check<br/>Auto-complete shipped orders<br/>older than 7 days"]
         D5["15:00 b2b_shipping_overdue_cron<br/>Shipping delay alerts<br/>for paid-but-not-shipped"]

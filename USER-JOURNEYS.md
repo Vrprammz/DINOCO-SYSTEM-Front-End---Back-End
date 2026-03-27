@@ -1,6 +1,6 @@
 # DINOCO System -- Complete User Journey Documentation
 
-> Generated: 2026-03-27 | Based on codebase analysis of 34 files (~45,000 lines)
+> Updated: 2026-03-27 | Based on codebase analysis of 38 files (~50,000 lines)
 > Source files referenced are relative to the project root.
 
 ---
