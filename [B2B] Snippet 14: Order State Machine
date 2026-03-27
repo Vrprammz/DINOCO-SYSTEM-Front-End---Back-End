@@ -1,0 +1,172 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2B] Snippet 14: Order State Machine (FSM)                ║
+ * ║  Version: V.1.0                                             ║
+ * ║  Description: ป้องกัน invalid status transitions             ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * ทุก status transition ต้องผ่าน b2b_transition_order() เท่านั้น
+ * ถ้า transition ไม่ valid → reject + log warning
+ *
+ * ต้องใช้: ไม่ต้องลงปลั๊กอินเพิ่ม
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+if ( ! class_exists( 'B2B_Order_FSM' ) ) {
+
+class B2B_Order_FSM {
+
+    /**
+     * Allowed transitions: from_status => [to_status => required_role]
+     * role: 'customer' | 'admin' | 'system' | 'any'
+     */
+    private static $transitions = array(
+        'draft' => array(
+            'checking_stock'    => 'customer',  // ลูกค้ายืนยันสั่ง
+            'cancelled'         => 'customer',  // ลูกค้ายกเลิก draft
+        ),
+        'checking_stock' => array(
+            'awaiting_confirm'  => 'admin',     // admin ยืนยันสต็อก
+            'backorder'         => 'admin',     // สินค้าหมด
+            'cancel_requested'  => 'customer',  // ลูกค้าขอยกเลิก
+        ),
+        'backorder' => array(
+            'checking_stock'    => 'admin',     // สินค้ากลับมา (restock)
+            'awaiting_confirm'  => 'customer',  // ลูกค้ารับ partial
+            'cancelled'         => 'customer',  // ลูกค้ายกเลิก BO
+        ),
+        'awaiting_confirm' => array(
+            'awaiting_payment'  => 'customer',  // ลูกค้ายืนยันบิล
+            'cancel_requested'  => 'customer',
+            'change_requested'  => 'customer',
+        ),
+        'awaiting_payment' => array(
+            'paid'              => 'system',    // slip match / manual payment
+            'cancel_requested'  => 'customer',
+        ),
+        'paid' => array(
+            'packed'            => 'admin',     // Flash Express
+            'shipped'           => 'admin',     // Manual ship / rider
+            'completed'         => 'admin',     // Self-pickup
+            'claim_opened'      => 'customer',
+        ),
+        'packed' => array(
+            'shipped'           => 'system',    // Flash courier pickup
+        ),
+        'shipped' => array(
+            'completed'         => 'any',       // customer confirm / auto-complete
+            'claim_opened'      => 'customer',
+        ),
+        'cancel_requested' => array(
+            'cancelled'         => 'admin',     // admin approve cancel
+            'awaiting_payment'  => 'admin',     // admin reject cancel (restore)
+            'awaiting_confirm'  => 'admin',     // admin reject cancel (restore)
+            'checking_stock'    => 'admin',     // admin reject cancel (restore)
+        ),
+        'change_requested' => array(
+            'draft'             => 'admin',     // admin approve change → back to draft
+            'awaiting_confirm'  => 'admin',     // admin reject change → restore
+        ),
+        'claim_opened' => array(
+            'claim_resolved'    => 'admin',     // exchange / refund
+            'completed'         => 'admin',     // claim rejected
+            'shipped'           => 'admin',     // claim exchange → ship new
+        ),
+    );
+
+    /**
+     * ทำ status transition พร้อม validation
+     *
+     * @param int    $order_id   b2b_order post ID
+     * @param string $new_status Target status
+     * @param string $actor      'customer' | 'admin' | 'system'
+     * @param string $reason     เหตุผล (สำหรับ log)
+     * @return bool|WP_Error     true ถ้าสำเร็จ, WP_Error ถ้า invalid
+     */
+    public static function transition( $order_id, $new_status, $actor = 'system', $reason = '' ) {
+        $current = get_field( 'order_status', $order_id );
+        if ( empty( $current ) ) $current = get_post_meta( $order_id, 'order_status', true );
+
+        // Check if transition is allowed
+        if ( ! isset( self::$transitions[ $current ] ) ) {
+            b2b_log( "[FSM] Terminal state: {$current} → {$new_status} (order #{$order_id}) BLOCKED" );
+            return new WP_Error( 'terminal_state', "ออเดอร์อยู่ในสถานะ {$current} ไม่สามารถเปลี่ยนได้" );
+        }
+
+        if ( ! isset( self::$transitions[ $current ][ $new_status ] ) ) {
+            b2b_log( "[FSM] Invalid transition: {$current} → {$new_status} (order #{$order_id}) by {$actor}" );
+            return new WP_Error( 'invalid_transition', "ไม่สามารถเปลี่ยนจาก {$current} เป็น {$new_status} ได้" );
+        }
+
+        // Check actor permission
+        $required_role = self::$transitions[ $current ][ $new_status ];
+        if ( $required_role !== 'any' && $required_role !== $actor ) {
+            b2b_log( "[FSM] Permission denied: {$current} → {$new_status} requires {$required_role}, got {$actor}" );
+            return new WP_Error( 'permission_denied', "สิทธิ์ไม่เพียงพอ ({$actor} ≠ {$required_role})" );
+        }
+
+        // Execute transition
+        update_field( 'order_status', $new_status, $order_id );
+
+        // Status history
+        $hist = get_post_meta( $order_id, '_b2b_status_history', true ) ?: array();
+        $hist[] = array(
+            'from'   => $current,
+            'to'     => $new_status,
+            'actor'  => $actor,
+            'reason' => $reason,
+            'at'     => current_time( 'Y-m-d H:i:s' ),
+        );
+        update_post_meta( $order_id, '_b2b_status_history', $hist );
+
+        b2b_log( "[FSM] OK: {$current} → {$new_status} (order #{$order_id}) by {$actor}" . ( $reason ? " reason: {$reason}" : '' ) );
+
+        // Fire action hook for external integrations
+        do_action( 'b2b_order_status_changed', $order_id, $current, $new_status, $actor );
+
+        return true;
+    }
+
+    /**
+     * ตรวจว่า transition นี้ valid ไหม (ไม่ execute)
+     */
+    public static function can_transition( $order_id, $new_status, $actor = 'system' ) {
+        $current = get_field( 'order_status', $order_id );
+        if ( ! isset( self::$transitions[ $current ][ $new_status ] ) ) return false;
+        $required = self::$transitions[ $current ][ $new_status ];
+        return ( $required === 'any' || $required === $actor );
+    }
+
+    /**
+     * ดู transitions ที่เป็นไปได้จาก status ปัจจุบัน
+     */
+    public static function available_transitions( $order_id, $actor = null ) {
+        $current = get_field( 'order_status', $order_id );
+        if ( ! isset( self::$transitions[ $current ] ) ) return array();
+        $all = self::$transitions[ $current ];
+        if ( $actor === null ) return array_keys( $all );
+        return array_keys( array_filter( $all, function( $role ) use ( $actor ) {
+            return $role === 'any' || $role === $actor;
+        } ) );
+    }
+
+    /**
+     * ตรวจว่า status เป็น terminal state หรือไม่
+     */
+    public static function is_terminal( $status ) {
+        return ! isset( self::$transitions[ $status ] );
+    }
+}
+
+} // end class_exists
+
+/**
+ * Wrapper function สำหรับ backward compatibility
+ * ใช้แทน b2b_set_order_status() เดิมได้เลย
+ */
+if ( ! function_exists( 'b2b_transition_order' ) ) {
+    function b2b_transition_order( $order_id, $new_status, $actor = 'system', $reason = '' ) {
+        return B2B_Order_FSM::transition( $order_id, $new_status, $actor, $reason );
+    }
+}

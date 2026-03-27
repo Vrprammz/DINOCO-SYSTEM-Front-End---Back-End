@@ -1,0 +1,266 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.1.0                                             ║
+ * ║  Description: Custom DB tables + JWT-based session tokens   ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * 1. Product Catalog → custom MySQL table (แทน wp_options JSON)
+ * 2. JWT Session → HMAC-based tokens (แทน transient-based tokens)
+ *
+ * ต้องใช้: ไม่ต้องลงปลั๊กอินเพิ่ม (pure PHP + $wpdb)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ════════════════════════════════════════════
+// PART 1: PRODUCT CATALOG CUSTOM TABLE
+// ════════════════════════════════════════════
+
+/**
+ * สร้างตาราง dinoco_products เมื่อ activate
+ * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
+ */
+add_action( 'init', function() {
+    $db_version = '1.0';
+    if ( get_option( '_dinoco_catalog_table_version' ) === $db_version ) return;
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'dinoco_products';
+    $charset = $wpdb->get_charset_collate();
+
+    $sql = "CREATE TABLE IF NOT EXISTS {$table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        sku VARCHAR(50) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        subtitle VARCHAR(255) DEFAULT '',
+        category VARCHAR(100) DEFAULT '',
+        image_url VARCHAR(500) DEFAULT '',
+        base_price DECIMAL(10,2) DEFAULT 0,
+        price_silver DECIMAL(10,2) DEFAULT 0,
+        price_gold DECIMAL(10,2) DEFAULT 0,
+        price_platinum DECIMAL(10,2) DEFAULT 0,
+        price_diamond DECIMAL(10,2) DEFAULT 0,
+        warranty_years INT DEFAULT 2,
+        stock_status ENUM('in_stock','out_of_stock') DEFAULT 'in_stock',
+        b2b_discount_percent DECIMAL(5,2) DEFAULT 0,
+        boxes_per_unit INT DEFAULT 1,
+        min_order_qty INT DEFAULT 1,
+        oos_eta_date DATE DEFAULT NULL,
+        is_active TINYINT(1) DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY idx_sku (sku),
+        KEY idx_category (category),
+        KEY idx_stock (stock_status, is_active)
+    ) {$charset};";
+
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta( $sql );
+    update_option( '_dinoco_catalog_table_version', $db_version );
+    b2b_log( '[DB] Created/updated dinoco_products table v' . $db_version );
+}, 5 );
+
+/**
+ * Product Catalog CRUD functions
+ */
+if ( ! class_exists( 'DINOCO_Catalog' ) ) {
+
+class DINOCO_Catalog {
+
+    private static function table() {
+        global $wpdb;
+        return $wpdb->prefix . 'dinoco_products';
+    }
+
+    public static function get_by_sku( $sku ) {
+        global $wpdb;
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM " . self::table() . " WHERE sku = %s AND is_active = 1", $sku
+        ), ARRAY_A );
+    }
+
+    public static function get_all( $category = null, $in_stock_only = false ) {
+        global $wpdb;
+        $where = "is_active = 1";
+        if ( $category ) $where .= $wpdb->prepare( " AND category = %s", $category );
+        if ( $in_stock_only ) $where .= " AND stock_status = 'in_stock'";
+        return $wpdb->get_results( "SELECT * FROM " . self::table() . " WHERE {$where} ORDER BY category, name", ARRAY_A );
+    }
+
+    public static function get_price_for_rank( $sku, $rank ) {
+        $product = self::get_by_sku( $sku );
+        if ( ! $product ) return 0;
+        $rank_key = 'price_' . strtolower( $rank );
+        if ( isset( $product[ $rank_key ] ) && floatval( $product[ $rank_key ] ) > 0 ) {
+            return floatval( $product[ $rank_key ] );
+        }
+        return floatval( $product['base_price'] );
+    }
+
+    public static function upsert( $data ) {
+        global $wpdb;
+        $sku = $data['sku'] ?? '';
+        if ( empty( $sku ) ) return false;
+
+        $existing = self::get_by_sku( $sku );
+        if ( $existing ) {
+            $wpdb->update( self::table(), $data, array( 'sku' => $sku ) );
+            return $existing['id'];
+        } else {
+            $wpdb->insert( self::table(), $data );
+            return $wpdb->insert_id;
+        }
+    }
+
+    public static function set_stock_status( $sku, $status, $eta = null ) {
+        global $wpdb;
+        $update = array( 'stock_status' => $status );
+        if ( $eta ) $update['oos_eta_date'] = $eta;
+        return $wpdb->update( self::table(), $update, array( 'sku' => $sku ) );
+    }
+
+    public static function search( $query ) {
+        global $wpdb;
+        $like = '%' . $wpdb->esc_like( $query ) . '%';
+        return $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM " . self::table() . " WHERE is_active = 1 AND (sku LIKE %s OR name LIKE %s) ORDER BY name",
+            $like, $like
+        ), ARRAY_A );
+    }
+
+    /**
+     * Migrate จาก wp_options dinoco_product_catalog → custom table
+     * Run ครั้งเดียว
+     */
+    public static function migrate_from_options() {
+        if ( get_option( '_dinoco_catalog_migrated' ) ) return;
+
+        $catalog = get_option( 'dinoco_product_catalog', array() );
+        if ( empty( $catalog ) ) return;
+
+        $count = 0;
+        foreach ( $catalog as $sku => $item ) {
+            self::upsert( array(
+                'sku'            => $sku,
+                'name'           => $item['name'] ?? $sku,
+                'subtitle'       => $item['sub'] ?? '',
+                'image_url'      => $item['img'] ?? '',
+                'base_price'     => floatval( str_replace( ',', '', $item['price'] ?? 0 ) ),
+                'warranty_years' => intval( $item['years'] ?? 2 ),
+            ) );
+            $count++;
+        }
+
+        update_option( '_dinoco_catalog_migrated', 1 );
+        b2b_log( "[DB] Migrated {$count} products from wp_options to custom table" );
+    }
+}
+
+} // end class_exists
+
+// Auto-migrate on first load
+add_action( 'init', array( 'DINOCO_Catalog', 'migrate_from_options' ), 10 );
+
+// ════════════════════════════════════════════
+// PART 2: JWT-LIKE SESSION TOKENS (HMAC-based)
+// ════════════════════════════════════════════
+
+/**
+ * ไม่ต้อง composer / ไม่ต้องลง library
+ * ใช้ HMAC-SHA256 + base64 สร้าง token เอง
+ * Token = base64(payload) . '.' . hmac(payload, secret)
+ */
+if ( ! class_exists( 'DINOCO_JWT' ) ) {
+
+class DINOCO_JWT {
+
+    private static function secret() {
+        return defined( 'B2B_LINE_CHANNEL_SECRET' ) ? B2B_LINE_CHANNEL_SECRET : AUTH_SALT;
+    }
+
+    /**
+     * สร้าง session token
+     *
+     * @param array $payload  Data to encode (e.g. ['dist_id'=>123, 'group_id'=>'Cxxx'])
+     * @param int   $ttl      Time-to-live in seconds (default 1 hour)
+     * @return string          Token string
+     */
+    public static function create( $payload, $ttl = 3600 ) {
+        $payload['iat'] = time();
+        $payload['exp'] = time() + $ttl;
+
+        $json = json_encode( $payload );
+        $b64  = rtrim( base64_encode( $json ), '=' );
+        $sig  = hash_hmac( 'sha256', $b64, self::secret() );
+
+        return $b64 . '.' . $sig;
+    }
+
+    /**
+     * Verify & decode token
+     *
+     * @param string $token    Token string
+     * @return array|false     Payload if valid, false if invalid/expired
+     */
+    public static function verify( $token ) {
+        if ( empty( $token ) || strpos( $token, '.' ) === false ) return false;
+
+        $parts = explode( '.', $token );
+        if ( count( $parts ) !== 2 ) return false;
+
+        list( $b64, $sig ) = $parts;
+        $expected = hash_hmac( 'sha256', $b64, self::secret() );
+
+        if ( ! hash_equals( $expected, $sig ) ) return false;
+
+        // Pad base64
+        $json = base64_decode( $b64 . str_repeat( '=', ( 4 - strlen( $b64 ) % 4 ) % 4 ) );
+        $payload = json_decode( $json, true );
+
+        if ( ! $payload || ! isset( $payload['exp'] ) ) return false;
+        if ( time() > $payload['exp'] ) return false;
+
+        return $payload;
+    }
+
+    /**
+     * สร้าง refresh token (longer TTL, stored in DB for revocation)
+     */
+    public static function create_refresh( $payload, $ttl = 86400 ) {
+        $refresh_id = bin2hex( random_bytes( 16 ) );
+        $payload['refresh_id'] = $refresh_id;
+        $token = self::create( $payload, $ttl );
+
+        // Store in transient for revocation capability
+        set_transient( 'b2b_refresh_' . $refresh_id, $payload, $ttl );
+
+        return array( 'token' => $token, 'refresh_id' => $refresh_id );
+    }
+
+    /**
+     * Revoke a refresh token
+     */
+    public static function revoke( $refresh_id ) {
+        delete_transient( 'b2b_refresh_' . $refresh_id );
+    }
+
+    /**
+     * Refresh: verify refresh token → issue new access token
+     */
+    public static function refresh( $refresh_token, $access_ttl = 3600 ) {
+        $payload = self::verify( $refresh_token );
+        if ( ! $payload || ! isset( $payload['refresh_id'] ) ) return false;
+
+        // Check if revoked
+        $stored = get_transient( 'b2b_refresh_' . $payload['refresh_id'] );
+        if ( ! $stored ) return false;
+
+        // Issue new access token
+        unset( $payload['iat'], $payload['exp'], $payload['refresh_id'] );
+        return self::create( $payload, $access_ttl );
+    }
+}
+
+} // end class_exists

@@ -1,0 +1,294 @@
+# DINOCO System Upgrade Guide
+
+> สิ่งที่ต้องทำบน Server / WordPress เพื่อ activate modules ใหม่
+
+---
+
+## สรุป: อะไรต้องลง อะไรไม่ต้อง
+
+| Module | ต้องลงปลั๊กอิน? | ต้องทำบน Server? | ค่าใช้จ่าย |
+|--------|----------------|-----------------|-----------|
+| Snippet 13: Debt Transaction | ❌ ไม่ต้อง | ❌ ไม่ต้อง | ฟรี |
+| Snippet 14: State Machine | ❌ ไม่ต้อง | ❌ ไม่ต้อง | ฟรี |
+| Snippet 15: Custom Tables + JWT | ❌ ไม่ต้อง | ❌ ไม่ต้อง (auto-migrate) | ฟรี |
+| AI Provider Abstraction | ❌ ไม่ต้อง | ❌ ไม่ต้อง | ฟรี |
+| Cron → WP-CLI | ❌ ไม่ต้อง | ✅ ตั้ง crontab | ฟรี |
+| Frontend → Vite/Tailwind | ✅ ลง Node.js บนเครื่อง dev | ❌ ไม่ต้อง (build แล้ว upload) | ฟรี |
+| Print → WebSocket | ❌ ไม่ต้อง | ✅ ลง Pusher SDK บน RPi | ฟรี (free tier) |
+
+---
+
+## 1. Deploy Snippets ใหม่ (ทำใน WordPress)
+
+### ขั้นตอน:
+1. ไปที่ WordPress Admin → **Code Snippets** → **Add New**
+2. สร้าง snippet ใหม่ 4 ตัว:
+
+| ไฟล์ | ชื่อ Snippet | ลำดับ Priority |
+|------|------------|---------------|
+| `[B2B] Snippet 13: Debt Transaction Manager` | B2B Debt Transaction | **1** (ก่อน Snippet 2) |
+| `[B2B] Snippet 14: Order State Machine` | B2B Order FSM | **1** (ก่อน Snippet 2) |
+| `[B2B] Snippet 15: Custom Tables & JWT Session` | B2B Custom Tables & JWT | **1** (ก่อน Snippet 3) |
+| `[Admin System] AI Provider Abstraction` | AI Provider Layer | **5** (ก่อน AI Control) |
+
+3. Copy code จากแต่ละไฟล์ → paste ใน snippet → **Save & Activate**
+4. ตาราง `dinoco_products` จะถูกสร้างอัตโนมัติเมื่อ activate
+5. ข้อมูลจาก `dinoco_product_catalog` (wp_options) จะถูก migrate อัตโนมัติ
+
+---
+
+## 2. ตั้ง Server Cron (Bangmod Cloud)
+
+### ปัญหาของ WP Pseudo-Cron:
+- WP Cron ต้องรอ page load ถึงจะทำงาน
+- ถ้าไม่มีคนเข้าเว็บ = cron ไม่ทำงาน
+
+### แก้ไข:
+
+**Step 1: ปิด WP Pseudo-Cron**
+
+เพิ่มใน `wp-config.php`:
+```php
+define('DISABLE_WP_CRON', true);
+```
+
+**Step 2: ลง WP-CLI (ถ้ายังไม่มี)**
+
+SSH เข้า server:
+```bash
+curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+chmod +x wp-cli.phar
+sudo mv wp-cli.phar /usr/local/bin/wp
+```
+
+ทดสอบ:
+```bash
+wp --info
+```
+
+**Step 3: ตั้ง Crontab**
+
+```bash
+crontab -e
+```
+
+เพิ่มบรรทัดนี้:
+```cron
+# DINOCO WP-Cron — run every minute (WP จะเช็คเองว่ามี event ที่ต้องทำหรือไม่)
+* * * * * cd /path/to/wordpress && wp cron event run --due-now --quiet > /dev/null 2>&1
+```
+
+> **เปลี่ยน `/path/to/wordpress`** เป็น path จริงของ WordPress บน Bangmod Cloud
+> เช่น `/home/dinoco/public_html` หรือ `/var/www/html`
+
+**Step 4: ทดสอบ**
+
+```bash
+cd /path/to/wordpress
+wp cron event list
+```
+
+จะเห็นรายการ cron events ทั้งหมด (dunning, summary, rank, etc.)
+
+---
+
+## 3. Frontend Build Step (Vite + Tailwind)
+
+### เมื่อไหร่ต้องทำ:
+- ทำเมื่อต้องการ **แยก CSS/JS ออกจาก PHP** (phase 2)
+- ตอนนี้ inline CSS ยังใช้ได้ ไม่ urgent
+
+### ต้องลงบนเครื่อง Dev (ไม่ใช่ Server):
+
+```bash
+# ลง Node.js (ถ้ายังไม่มี)
+# macOS:
+brew install node
+
+# หรือดาวน์โหลดจาก https://nodejs.org/
+
+# ตรวจสอบ
+node -v  # ≥18.0
+npm -v   # ≥9.0
+```
+
+### Setup Project:
+
+```bash
+cd /path/to/dinoco-project
+
+# Init package.json
+npm init -y
+
+# ลง Vite + Tailwind
+npm install -D vite tailwindcss @tailwindcss/vite
+
+# สร้าง vite.config.js
+cat > vite.config.js << 'EOF'
+import { defineConfig } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+  build: {
+    outDir: 'dist',
+    rollupOptions: {
+      input: {
+        main: 'src/css/main.css',
+        b2c: 'src/js/b2c.js',
+        b2b: 'src/js/b2b.js',
+      },
+      output: {
+        entryFileNames: 'js/[name].js',
+        assetFileNames: 'css/[name].[ext]',
+      }
+    }
+  }
+})
+EOF
+
+# สร้าง Tailwind config
+cat > tailwind.config.js << 'EOF'
+export default {
+  content: ['./**/*.php', './src/**/*.js'],
+  theme: {
+    extend: {
+      colors: {
+        'dnc-green': '#06C755',
+        'dnc-gold': '#c0a062',
+        'dnc-dark': '#1a1a1a',
+      },
+      fontFamily: {
+        'thai': ['Noto Sans Thai', 'Prompt', 'sans-serif'],
+      }
+    }
+  }
+}
+EOF
+```
+
+### Workflow:
+```bash
+# Dev mode (hot reload)
+npx vite
+
+# Build for production
+npx vite build
+
+# Upload dist/ folder to server
+```
+
+---
+
+## 4. Print System → WebSocket (Pusher)
+
+### เมื่อไหร่ต้องทำ:
+- ทำเมื่อต้องการ **real-time printing** แทน polling ทุก 10 วินาที
+- ตอนนี้ polling ยังใช้ได้ ไม่ urgent
+
+### ลงทะเบียน Pusher (ฟรี):
+
+1. ไปที่ https://pusher.com → Sign up → Create app
+2. เลือก: **Channels** → cluster: `ap1` (Asia Pacific)
+3. จด credentials:
+   - App ID
+   - Key
+   - Secret
+   - Cluster
+
+### เพิ่มใน wp-config.php:
+```php
+define('DINOCO_PUSHER_APP_ID', 'your_app_id');
+define('DINOCO_PUSHER_KEY', 'your_key');
+define('DINOCO_PUSHER_SECRET', 'your_secret');
+define('DINOCO_PUSHER_CLUSTER', 'ap1');
+```
+
+### แก้ RPi Print Client:
+
+ลง Pusher Python SDK บน Raspberry Pi:
+```bash
+pip install pusher pysher
+```
+
+แก้ `print_client.py` ให้ listen event แทน polling:
+```python
+import pysher
+
+pusher = pysher.Pusher('YOUR_KEY', cluster='ap1')
+
+def connect_handler(data):
+    channel = pusher.subscribe('dinoco-print')
+    channel.bind('new-job', handle_print_job)
+
+pusher.connection.bind('pusher:connection_established', connect_handler)
+pusher.connect()
+```
+
+### แก้ WordPress (Snippet 3):
+
+ตอน queue print job เปลี่ยนจาก save meta → trigger Pusher event:
+```php
+// แทนที่ update_post_meta($id, 'print_status', 'queued')
+// เพิ่ม:
+$pusher_url = 'https://api-' . DINOCO_PUSHER_CLUSTER . '.pusher.com/apps/' . DINOCO_PUSHER_APP_ID . '/events';
+wp_remote_post($pusher_url, [
+    'headers' => ['Content-Type' => 'application/json'],
+    'body' => json_encode([
+        'name' => 'new-job',
+        'channel' => 'dinoco-print',
+        'data' => json_encode(['job_id' => $id, 'type' => 'invoice']),
+    ]),
+]);
+```
+
+---
+
+## 5. AI Provider — เปลี่ยน Model
+
+### เปลี่ยน provider:
+
+เพิ่ม/แก้ใน `wp-config.php`:
+
+```php
+// เลือก 1 ใน 3:
+define('DINOCO_AI_PROVIDER', 'gemini');   // default — ใช้ Gemini อยู่แล้ว
+// define('DINOCO_AI_PROVIDER', 'openai');  // ถ้าจะใช้ GPT-4o
+// define('DINOCO_AI_PROVIDER', 'claude');  // ถ้าจะใช้ Claude
+
+// API keys (ใส่เฉพาะ provider ที่ใช้):
+define('DINOCO_GEMINI_KEY', 'xxx');       // มีอยู่แล้ว
+// define('DINOCO_OPENAI_KEY', 'sk-xxx'); // ถ้าใช้ OpenAI
+// define('DINOCO_CLAUDE_KEY', 'sk-xxx'); // ถ้าใช้ Claude
+```
+
+### การใช้งานใน code:
+
+```php
+// แทนที่ direct Gemini API call ด้วย:
+$result = DINOCO_AI::chat(
+    'คุณคือผู้ช่วย DINOCO...',        // system prompt
+    [['role'=>'user', 'text'=>$msg]], // messages
+    $function_tools,                  // function calling tools
+    ['temperature' => 0.35]           // options
+);
+
+if ($result['success']) {
+    $reply = $result['text'];
+    $tool_calls = $result['tool_calls'];
+}
+```
+
+---
+
+## Checklist สรุป
+
+- [ ] Deploy Snippet 13 (Debt Transaction) ใน WordPress Code Snippets
+- [ ] Deploy Snippet 14 (State Machine) ใน WordPress Code Snippets
+- [ ] Deploy Snippet 15 (Custom Tables + JWT) ใน WordPress Code Snippets
+- [ ] Deploy AI Provider Abstraction ใน WordPress Code Snippets
+- [ ] เพิ่ม `DISABLE_WP_CRON` ใน wp-config.php
+- [ ] ลง WP-CLI บน Bangmod Cloud server
+- [ ] ตั้ง crontab ให้ run `wp cron event run --due-now` ทุกนาที
+- [ ] (Phase 2) ลง Node.js + Vite + Tailwind บนเครื่อง dev
+- [ ] (Phase 2) ลงทะเบียน Pusher + แก้ RPi client

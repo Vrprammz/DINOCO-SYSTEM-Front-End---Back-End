@@ -1,0 +1,144 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2B] Snippet 13: Debt Transaction Manager                 ║
+ * ║  Version: V.1.0                                             ║
+ * ║  Description: Atomic debt operations with MySQL transactions ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * แทนที่ read-modify-write pattern เดิมด้วย MySQL transaction
+ * ป้องกัน race condition เมื่อหลาย action เปลี่ยนหนี้พร้อมกัน
+ *
+ * ต้องใช้: ไม่ต้องลงปลั๊กอินเพิ่ม (ใช้ $wpdb ที่มีอยู่แล้ว)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ════════════════════════════════════════════
+// 1. ATOMIC DEBT OPERATIONS
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_debt_add' ) ) {
+    /**
+     * เพิ่มหนี้แบบ atomic (ใช้ตอน confirm_bill, issue invoice)
+     * @param int    $dist_id   Distributor post ID
+     * @param float  $amount    จำนวนเงินที่เพิ่ม
+     * @param string $reason    เหตุผล (สำหรับ audit log)
+     * @param int    $order_id  Order post ID (optional)
+     * @return float|false      ยอดหนี้ใหม่ หรือ false ถ้า fail
+     */
+    function b2b_debt_add( $dist_id, $amount, $reason = '', $order_id = 0 ) {
+        global $wpdb;
+        $amount = round( floatval( $amount ), 2 );
+        if ( $amount <= 0 || ! $dist_id ) return false;
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            // Lock row to prevent concurrent modification
+            $current = $wpdb->get_var( $wpdb->prepare(
+                "SELECT pm.meta_value FROM {$wpdb->postmeta} pm
+                 JOIN {$wpdb->posts} p ON p.ID = pm.post_id AND p.post_type = 'distributor'
+                 WHERE pm.post_id = %d AND pm.meta_key = 'current_debt'
+                 FOR UPDATE",
+                $dist_id
+            ) );
+
+            $old_debt = floatval( $current );
+            $new_debt = round( $old_debt + $amount, 2 );
+
+            // Credit limit check
+            $credit_limit = floatval( get_post_meta( $dist_id, 'credit_limit', true ) );
+            if ( $credit_limit > 0 && $new_debt > $credit_limit ) {
+                $wpdb->query( 'ROLLBACK' );
+                b2b_log( "[Debt] BLOCKED: dist={$dist_id} new_debt={$new_debt} > limit={$credit_limit}" );
+                return false;
+            }
+
+            update_post_meta( $dist_id, 'current_debt', $new_debt );
+            $wpdb->query( 'COMMIT' );
+
+            // Audit log
+            b2b_debt_audit( $dist_id, 'add', $amount, $old_debt, $new_debt, $reason, $order_id );
+            return $new_debt;
+
+        } catch ( Exception $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            b2b_log( "[Debt] ERROR in b2b_debt_add: " . $e->getMessage() );
+            return false;
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_debt_subtract' ) ) {
+    /**
+     * ลดหนี้แบบ atomic (ใช้ตอน slip payment, cancel, refund)
+     * @param int    $dist_id   Distributor post ID
+     * @param float  $amount    จำนวนเงินที่ลด
+     * @param string $reason    เหตุผล
+     * @param int    $order_id  Order post ID (optional)
+     * @return float|false      ยอดหนี้ใหม่
+     */
+    function b2b_debt_subtract( $dist_id, $amount, $reason = '', $order_id = 0 ) {
+        global $wpdb;
+        $amount = round( floatval( $amount ), 2 );
+        if ( $amount <= 0 || ! $dist_id ) return false;
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $current = $wpdb->get_var( $wpdb->prepare(
+                "SELECT pm.meta_value FROM {$wpdb->postmeta} pm
+                 JOIN {$wpdb->posts} p ON p.ID = pm.post_id AND p.post_type = 'distributor'
+                 WHERE pm.post_id = %d AND pm.meta_key = 'current_debt'
+                 FOR UPDATE",
+                $dist_id
+            ) );
+
+            $old_debt = floatval( $current );
+            $new_debt = round( max( 0, $old_debt - $amount ), 2 );
+
+            update_post_meta( $dist_id, 'current_debt', $new_debt );
+
+            // Auto-clear credit hold when debt is fully paid
+            if ( $new_debt <= 0 ) {
+                update_post_meta( $dist_id, 'credit_hold', '' );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            // Overpayment detection
+            if ( $amount > $old_debt ) {
+                $overpaid = round( $amount - $old_debt, 2 );
+                b2b_log( "[Debt] OVERPAYMENT: dist={$dist_id} overpaid={$overpaid}" );
+            }
+
+            b2b_debt_audit( $dist_id, 'subtract', $amount, $old_debt, $new_debt, $reason, $order_id );
+            return $new_debt;
+
+        } catch ( Exception $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            b2b_log( "[Debt] ERROR in b2b_debt_subtract: " . $e->getMessage() );
+            return false;
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_debt_audit' ) ) {
+    /**
+     * บันทึก audit log สำหรับทุกการเปลี่ยนแปลงหนี้
+     */
+    function b2b_debt_audit( $dist_id, $action, $amount, $old_debt, $new_debt, $reason, $order_id ) {
+        $log = get_post_meta( $dist_id, '_debt_audit_log', true ) ?: array();
+        $log[] = array(
+            'time'      => current_time( 'Y-m-d H:i:s' ),
+            'action'    => $action,
+            'amount'    => $amount,
+            'old_debt'  => $old_debt,
+            'new_debt'  => $new_debt,
+            'reason'    => $reason,
+            'order_id'  => $order_id,
+            'user'      => wp_get_current_user()->user_login ?: 'system',
+        );
+        // Keep last 200 entries
+        if ( count( $log ) > 200 ) $log = array_slice( $log, -200 );
+        update_post_meta( $dist_id, '_debt_audit_log', $log );
+    }
+}
