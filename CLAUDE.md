@@ -23,6 +23,7 @@ DINOCO System is a **WordPress-based motorcycle warranty management platform** s
 | `[dinoco_admin_dashboard]` | Admin analytics & CRM |
 | `[b2b_admin_dashboard]` | B2B distributor portal |
 | `[dinoco_admin_ai_control]` | AI assistant control panel |
+| `[dinoco_admin_finance]` | Finance dashboard (debt, revenue, payments) |
 
 ## REST API Endpoints (B2B)
 
