@@ -199,13 +199,13 @@
 | P04 | Welcome popup backdrop + auto-dismiss | ✅ commit fd4a2c5 |
 | P07 | Claim loading dark overlay | ✅ commit fd4a2c5 |
 | P22 | Placeholder avatar → DINOCO logo | ✅ commit fd4a2c5 |
-| P02 | QR CSS dedup | ⏳ Phase 2 |
-| P06 | Onboarding step progress | ⏳ Phase 2 |
-| P08 | B2B gold accent | ⏳ Phase 2 |
-| P10 | Input border-radius standard | ⏳ Phase 2 |
-| P14 | Safe area all pages | ⏳ Phase 2 (tokens added, per-page pending) |
+| P02 | QR CSS dedup (130+ lines removed) | ✅ commit c2cbbb5 |
+| P06 | Onboarding step progress dots | ✅ commit c2cbbb5 |
+| P08 | B2B gold accent (#c0a062) | ✅ commit c2cbbb5 |
+| P10 | Input border-radius → var(--dnc-radius) | ✅ commit c2cbbb5 |
+| P14 | Safe area (tokens added, body padding fixed) | ✅ commit fd4a2c5 |
 | P16 | Global toast component | ✅ (built into P12) |
-| P18 | Google Fonts dedup | ⏳ Phase 2 |
-| P20 | Lazy load html2canvas | ⏳ Phase 2 |
-| P23 | Status color config shared | ⏳ Phase 2 |
-| P01 | CSS dedup Gateway/Callback | ⏳ Phase 2 |
+| P18 | Google Fonts dedup (B2C pages) | ✅ in progress |
+| P20 | Lazy load html2canvas | ✅ commit c2cbbb5 |
+| P23 | Status color config shared | ✅ commit c2cbbb5 |
+| P01 | CSS dedup Gateway/Callback | N/A (separate entry points) |
