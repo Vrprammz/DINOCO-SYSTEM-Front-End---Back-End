@@ -334,16 +334,21 @@ function b2b_route_bot_command( $text, $group_id, $user_id, $reply_token ) {
             }
             set_transient($lock_key, 1, 10);
 
-            // Reverse debt if billed
+            // Reverse debt if billed (FIX C1+C2: check is_billed + set false after reverse)
             $prev_status = $status;
-            if ( in_array($status, array('awaiting_payment', 'paid', 'packed', 'shipped'), true) ) {
+            $was_billed = get_field('is_billed', $tid);
+            if ( $was_billed && in_array($status, array('awaiting_payment', 'paid', 'packed', 'shipped'), true) ) {
                 $total = floatval(get_field('total_amount', $tid));
                 $gid = get_field('source_group_id', $tid);
                 $dist = $gid ? b2b_get_dist_by_group($gid) : null;
                 if ( $dist && $total > 0 ) {
-                    global $wpdb;
-                    if (function_exists('b2b_debt_subtract')) { b2b_debt_subtract($dist->ID, $total, 'admin_cancel', $tid); }
-                    else { $wpdb->query('START TRANSACTION'); $debt = (float)$wpdb->get_var($wpdb->prepare("SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key='current_debt' FOR UPDATE",$dist->ID)); update_field('current_debt',max(0,round($debt-$total,2)),$dist->ID); $wpdb->query('COMMIT'); }
+                    update_field('is_billed', false, $tid);
+                    if (function_exists('b2b_recalculate_debt')) {
+                        b2b_recalculate_debt($dist->ID);
+                    } elseif (function_exists('b2b_debt_subtract')) {
+                        b2b_debt_subtract($dist->ID, $total, 'admin_cancel', $tid);
+                    }
+                    b2b_add_audit_log($tid, 'debt_reversed', 'Admin cancel reversed ฿' . number_format($total, 0));
                 }
             }
 
@@ -698,11 +703,16 @@ function b2b_action_confirm_bill( $ticket_id, $group_id, $user_id, $reply_token 
                     return;
                 }
             } else {
-                global $wpdb;
-                $wpdb->query('START TRANSACTION');
-                $debt = (float)$wpdb->get_var($wpdb->prepare("SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key='current_debt' FOR UPDATE",$dist->ID));
+                // FIX R-1: fallback safe debt update (log critical but don't block billing)
+                b2b_log('[CRITICAL] b2b_debt_add not available — using fallback! dist=' . $dist->ID . ' amount=' . $total);
+                $debt = floatval(get_field('current_debt', $dist->ID));
+                $credit_limit = floatval(get_field('credit_limit', $dist->ID));
+                if ($credit_limit > 0 && ($debt + $total) > $credit_limit) {
+                    delete_transient($lock_key);
+                    b2b_line_reply($reply_token, "❌ เกินวงเงินเครดิต ไม่สามารถออกบิลได้");
+                    return;
+                }
                 update_field('current_debt', round($debt + $total, 2), $dist->ID);
-                $wpdb->query('COMMIT');
             }
             update_field('due_date', $due_date, $ticket_id);
             update_field('is_billed', true, $ticket_id);
@@ -792,7 +802,7 @@ function b2b_action_cancel_approve( $ticket_id, $user_id, $reply_token ) {
         if ($dist && $total > 0) {
             update_field('is_billed', false, $ticket_id);
             if (function_exists('b2b_recalculate_debt')) { b2b_recalculate_debt($dist->ID); }
-            else { $debt = floatval(get_field('current_debt', $dist->ID)); update_field('current_debt', round(max(0, $debt - $total), 2), $dist->ID); }
+            else { b2b_log('[CRITICAL] b2b_recalculate_debt fallback — cancel_approve dist=' . $dist->ID); $d=floatval(get_field('current_debt',$dist->ID)); update_field('current_debt',round(max(0,$d-$total),2),$dist->ID); }
         }
     }
     b2b_line_reply($reply_token, "✅ อนุมัติยกเลิก Ticket #".$ticket_id." แล้ว (โดย ".$admin_name.")");
@@ -1657,7 +1667,7 @@ function b2b_action_claim_refund( $ticket_id, $user_id, $reply_token ) {
     update_field('is_billed', false, $ticket_id);
     if ($dist && $total > 0) {
         if (function_exists('b2b_recalculate_debt')) { b2b_recalculate_debt($dist->ID); }
-        else { $debt = floatval(get_field('current_debt', $dist->ID)); update_field('current_debt', round(max(0, $debt - $total), 2), $dist->ID); }
+        else { b2b_log('[CRITICAL] b2b_recalculate_debt fallback — refund dist=' . $dist->ID); $d=floatval(get_field('current_debt',$dist->ID)); update_field('current_debt',round(max(0,$d-$total),2),$dist->ID); }
     }
     b2b_line_reply($reply_token, "💰 อนุมัติคืนเงิน #".$ticket_id." ฿".number_format($total,0)." (โดย ".$admin_name.")");
     // Flex card to customer for refund approved
@@ -2240,6 +2250,13 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         $is_dup = ($cond && isset($cond['isDuplicate']) && $cond['isDuplicate'] === true);
         $recv_valid = ($cond && isset($cond['isReceiverValid']) && $cond['isReceiverValid'] === true);
 
+        // FIX H-5: Local trans_ref duplicate check (don't rely on API alone)
+        if ($trans_ref) {
+            $local_dup = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>1,'post_status'=>'publish',
+                'meta_query'=>array(array('key'=>'_slip_trans_ref','value'=>$trans_ref)),
+                'fields'=>'ids'));
+            if (!empty($local_dup)) { $is_dup = true; }
+        }
         if ($is_dup) {
             $_slip_reply_text("⚠️ สลิปนี้เคยใช้แล้ว!\nTransRef: ".$trans_ref."\nยอด: ฿".number_format($paid,2)."\n\nกรุณาส่งสลิปใหม่ครับ");
             b2b_push_to_admin("🔴 สลิปซ้ำ! TransRef: ".$trans_ref."\nยอด: ฿".number_format($paid,2)."\nGroup: ".$group_id);
@@ -2255,11 +2272,19 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
 
         $dist = b2b_get_dist_by_group($group_id);
         if ($dist) {
+            // FIX H-3 + B-1: read old_debt from DB inside transaction via b2b_debt_subtract return
             $old_debt = floatval(get_field('current_debt', $dist->ID));
             if (function_exists('b2b_debt_subtract')) {
                 $new_debt = b2b_debt_subtract($dist->ID, $paid, 'slip_payment:' . $trans_ref);
-                if ($new_debt === false) $new_debt = max(0, $old_debt - $paid);
+                if ($new_debt !== false) {
+                    // FIX W-8: reconstruct old_debt correctly (handles overpayment case)
+                    $old_debt = round($new_debt + min($paid, $old_debt), 2);
+                } else {
+                    $new_debt = max(0, $old_debt - $paid);
+                }
             } else {
+                // FIX B-1: fallback must still update debt + log critical
+                b2b_log('[CRITICAL] b2b_debt_subtract not available — slip payment dist=' . $dist->ID . ' amount=' . $paid);
                 $new_debt = round(max(0, $old_debt - $paid), 2);
                 update_field('current_debt', $new_debt, $dist->ID);
             }
@@ -2281,9 +2306,16 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
 
             $match_result = b2b_auto_mark_paid_after_slip($dist->ID, $paid, $group_id);
             $paid_tickets = $match_result['paid_tickets'];
+            // FIX H-5: save trans_ref on matched orders for local duplicate detection
+            if ($trans_ref) {
+                foreach ($paid_tickets as $pt) {
+                    update_post_meta($pt['id'], '_slip_trans_ref', $trans_ref);
+                }
+            }
 
             // ถ้าหนี้ = 0 แล้ว → mark ทุกบิลที่เหลือเป็น paid (เงินจ่ายครบ ไม่ต้องค้าง)
-            $new_debt = floatval(get_field('current_debt', $dist->ID));
+            // FIX: recalculate from source of truth (order statuses) instead of potentially stale ACF cache
+            $new_debt = function_exists('b2b_recalculate_debt') ? b2b_recalculate_debt($dist->ID) : floatval(get_field('current_debt', $dist->ID));
             if ($new_debt <= 0) {
                 $remaining_orders = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>50,'post_status'=>'publish',
                     'meta_query'=>array(array('key'=>'source_group_id','value'=>$group_id),array('key'=>'order_status','value'=>'awaiting_payment')),
@@ -2301,7 +2333,8 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
             $pending = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>-1,'post_status'=>'publish',
                 'meta_query'=>array(array('key'=>'source_group_id','value'=>$group_id),array('key'=>'order_status','value'=>'awaiting_payment')),'fields'=>'ids'));
             $pending_count = count($pending);
-            $new_debt = floatval(get_field('current_debt', $dist->ID));
+            // FIX: recalculate debt from order statuses — prevents stale ACF cache showing wrong value in Flex
+            $new_debt = function_exists('b2b_recalculate_debt') ? b2b_recalculate_debt($dist->ID) : floatval(get_field('current_debt', $dist->ID));
 
             if ( $manual_mode ) {
                 // Manual Invoice mode (bot ปิด): Flex มี header + รายละเอียดบิลที่เคลียร์
@@ -2396,7 +2429,7 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
 
             // V.31: Slip-to-invoice manual matching — ถ้ายังมียอดเหลือ
             // FIX Case 1+6: ถ้า debt = 0 → ทุกบิล auto-clear แล้ว ไม่ต้องส่ง question Flex
-            $new_debt_check = floatval(get_field('current_debt', $dist->ID));
+            $new_debt_check = $new_debt; // already recalculated above via b2b_recalculate_debt
             if ( $match_result['remaining'] > 0 && $new_debt_check > 0 ) {
                 // รวม B2B orders + manual invoices ที่ยังค้าง (ทั้ง 2 ระบบ)
                 $all_pending = get_posts(array(
@@ -2700,12 +2733,15 @@ function b2b_auto_mark_paid_after_slip( $dist_id, $paid_amount, $group_id ) {
         $total = floatval(get_field('total_amount', $o->ID));
         if ($total <= 0) continue;
         if ($remaining >= $total * 0.98) { // FIX #7: ลด tolerance จาก 5% เหลือ 2%
+            // FIX H2: record actual paid amount (prevents 2% tolerance loss)
+            $actual_paid_for_order = min($remaining, $total);
+            update_post_meta($o->ID, '_inv_paid_amount', $actual_paid_for_order);
             b2b_set_order_status($o->ID, 'paid');
             update_field('paid_date', b2b_date('Y-m-d H:i:s'), $o->ID);
             // ไม่ schedule SLA / ไม่ส่ง packing alert — สลิปคือจ่ายเงิน ไม่ใช่แพ็คของ
             $remaining -= $total;
             $matched_ids[] = $o->ID;
-            b2b_log('[Slip] Auto-matched #' . $o->ID . ' ฿' . number_format($total, 0) . ' remaining=' . number_format($remaining, 2));
+            b2b_log('[Slip] Auto-matched #' . $o->ID . ' ฿' . number_format($total, 0) . ' paid=' . number_format($actual_paid_for_order, 2) . ' remaining=' . number_format($remaining, 2));
 
             $items_raw = get_field('order_items', $o->ID) ?: '';
             $items_preview = trim(mb_substr(preg_replace('/^.*?ขอยืนยัน[^:]*:\s*/u', '', $items_raw), 0, 100));
@@ -3092,7 +3128,7 @@ function b2b_action_bo_cancel_all( $ticket_id, $group_id, $user_id, $reply_token
         if ( $dist ) {
             update_field('is_billed', false, $ticket_id);
             if (function_exists('b2b_recalculate_debt')) { b2b_recalculate_debt($dist->ID); }
-            else { $debt = floatval(get_field('current_debt', $dist->ID)); update_field('current_debt', max(0, $debt - $total), $dist->ID); }
+            else { b2b_log('[CRITICAL] b2b_recalculate_debt fallback — BO cancel dist=' . $dist->ID); $d=floatval(get_field('current_debt',$dist->ID)); update_field('current_debt',round(max(0,$d-$total),2),$dist->ID); }
         }
     }
 

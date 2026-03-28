@@ -519,24 +519,50 @@ function b2b_rest_update_status( WP_REST_Request $r ) {
         return new WP_REST_Response(array('success'=>false,'message'=>'ไม่สามารถเปลี่ยนจาก '.$old_st.' เป็น '.$st.' ได้'),400);
     b2b_set_order_status($tid,$st);
     // V.14.0: Reverse debt when cancelling a billed order
+    // FIX C4: Use atomic debt operations for cancel
     if ($st === 'cancelled' && $old_st !== 'cancelled') {
         $was_billed = get_field('is_billed', $tid);
         if ($was_billed) {
             $total = floatval(get_field('total_amount', $tid));
             $gid = get_field('source_group_id', $tid);
-            if ($total > 0 && $gid && function_exists('b2b_get_dist_by_group')) {
+            $dist_id_cancel = 0;
+            if ($gid && function_exists('b2b_get_dist_by_group')) {
                 $dist = b2b_get_dist_by_group($gid);
-                if ($dist) {
-                    $debt = floatval(get_field('current_debt', $dist->ID));
-                    update_field('current_debt', round(max(0, $debt - $total), 2), $dist->ID);
-                    update_field('is_billed', false, $tid);
-                    b2b_add_audit_log($tid, 'debt_reversed', 'Cancel reversed ฿'.number_format($total,0));
+                if ($dist) $dist_id_cancel = $dist->ID;
+            }
+            // Also check _dist_post_id for manual invoices
+            if (!$dist_id_cancel) $dist_id_cancel = intval(get_post_meta($tid, '_dist_post_id', true));
+            if ($total > 0 && $dist_id_cancel) {
+                update_field('is_billed', false, $tid);
+                if (function_exists('b2b_recalculate_debt')) {
+                    b2b_recalculate_debt($dist_id_cancel);
+                } elseif (function_exists('b2b_debt_subtract')) {
+                    b2b_debt_subtract($dist_id_cancel, $total, 'dashboard_cancel', $tid);
                 }
+                b2b_add_audit_log($tid, 'debt_reversed', 'Cancel reversed ฿'.number_format($total,0));
             }
         }
     }
     // V.11.0: Auto-set due_date when changing to awaiting_payment (if not already set)
+    // FIX H-6: Auto-set is_billed + add debt when status changed to awaiting_payment
     if ($st === 'awaiting_payment') {
+        $was_billed_check = get_field('is_billed', $tid);
+        if (!$was_billed_check) {
+            update_field('is_billed', true, $tid);
+            $total_for_bill = floatval(get_field('total_amount', $tid));
+            $gid_bill = get_field('source_group_id', $tid);
+            $dist_id_bill = 0;
+            if ($gid_bill && function_exists('b2b_get_dist_by_group')) {
+                $dist_b = b2b_get_dist_by_group($gid_bill);
+                if ($dist_b) $dist_id_bill = $dist_b->ID;
+            }
+            if (!$dist_id_bill) $dist_id_bill = intval(get_post_meta($tid, '_dist_post_id', true));
+            if ($total_for_bill > 0 && $dist_id_bill) {
+                if (function_exists('b2b_debt_add')) { b2b_debt_add($dist_id_bill, $total_for_bill, 'dashboard_bill', $tid); }
+                elseif (function_exists('b2b_recalculate_debt')) { b2b_recalculate_debt($dist_id_bill); }
+            }
+            b2b_add_audit_log($tid, 'auto_billed', 'Auto is_billed=true via dashboard status change');
+        }
         $existing_dd = get_field('due_date', $tid);
         if (empty($existing_dd)) {
             $due = b2b_date('Y-m-d', strtotime('+7 days', strtotime(b2b_date('Y-m-d'))));
@@ -559,9 +585,19 @@ function b2b_rest_delete_ticket( WP_REST_Request $r ) {
     $post = get_post($tid);
     if(!$post || $post->post_type !== 'b2b_order')
         return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบ Ticket #'.$tid.' (อาจลบแล้ว)'),400);
+    // FIX C5: set is_billed=false before trash + use recalculate_debt
     $billed=get_field('is_billed',$tid);$total=floatval(get_field('total_amount',$tid));$gid=get_field('source_group_id',$tid);$rev=false;
-    if($billed&&$total>0&&$gid&&function_exists('b2b_get_dist_by_group')){
-        $dist=b2b_get_dist_by_group($gid);if($dist){update_field('current_debt',round(max(0,floatval(get_field('current_debt',$dist->ID))-$total),2),$dist->ID);$rev=true;}
+    $dist_id_del = 0;
+    if ($gid && function_exists('b2b_get_dist_by_group')) {
+        $dist = b2b_get_dist_by_group($gid);
+        if ($dist) $dist_id_del = $dist->ID;
+    }
+    if (!$dist_id_del) $dist_id_del = intval(get_post_meta($tid, '_dist_post_id', true));
+    if ($billed && $total > 0 && $dist_id_del) {
+        update_field('is_billed', false, $tid);
+        if (function_exists('b2b_recalculate_debt')) { b2b_recalculate_debt($dist_id_del); }
+        elseif (function_exists('b2b_debt_subtract')) { b2b_debt_subtract($dist_id_del, $total, 'delete_ticket', $tid); }
+        $rev = true;
     }
     wp_trash_post($tid);
     if(function_exists('b2b_log'))b2b_log('[Trash] #'.$tid.($rev?' reversed ฿'.number_format($total,0):''));

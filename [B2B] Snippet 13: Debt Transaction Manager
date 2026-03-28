@@ -55,14 +55,26 @@ if ( ! function_exists( 'b2b_debt_add' ) ) {
                 return false;
             }
 
-            // Raw SQL update (stays in transaction, no WP cache interference)
-            $wpdb->update( $wpdb->postmeta, array( 'meta_value' => $new_debt ), array( 'post_id' => $dist_id, 'meta_key' => 'current_debt' ) );
-
-            // Audit BEFORE commit (if audit fails, transaction rolls back)
-            b2b_debt_audit( $dist_id, 'add', $amount, $old_debt, $new_debt, $reason, $order_id );
+            // FIX H-1 + B-2: handle missing meta row (new distributor) safely
+            if ( $row === null ) {
+                // Meta row doesn't exist yet — insert with IGNORE to prevent duplicate
+                $wpdb->query( $wpdb->prepare(
+                    "INSERT IGNORE INTO {$wpdb->postmeta} (post_id, meta_key, meta_value) VALUES (%d, 'current_debt', %s)",
+                    $dist_id, $new_debt
+                ) );
+                // If INSERT IGNORE skipped (another thread inserted), update instead
+                $wpdb->update( $wpdb->postmeta, array( 'meta_value' => $new_debt ), array( 'post_id' => $dist_id, 'meta_key' => 'current_debt' ) );
+            } else {
+                $wpdb->update( $wpdb->postmeta, array( 'meta_value' => $new_debt ), array( 'post_id' => $dist_id, 'meta_key' => 'current_debt' ) );
+            }
 
             $wpdb->query( 'COMMIT' );
-            wp_cache_delete( $dist_id, 'post_meta' ); // Clear WP cache after commit
+            // FIX H-2: audit AFTER commit (WP meta functions are not transactional)
+            b2b_debt_audit( $dist_id, 'add', $amount, $old_debt, $new_debt, $reason, $order_id );
+            wp_cache_delete( $dist_id, 'post_meta' );
+            if ( function_exists( 'update_field' ) ) {
+                update_field( 'current_debt', $new_debt, $dist_id );
+            }
             return $new_debt;
 
         } catch ( Exception $e ) {
@@ -114,11 +126,13 @@ if ( ! function_exists( 'b2b_debt_subtract' ) ) {
                 b2b_log( "[Debt] OVERPAYMENT: dist={$dist_id} overpaid={$overpaid}" );
             }
 
-            // Audit BEFORE commit
-            b2b_debt_audit( $dist_id, 'subtract', $amount, $old_debt, $new_debt, $reason, $order_id );
-
             $wpdb->query( 'COMMIT' );
+            // FIX H-2: audit AFTER commit (WP meta functions are not transactional)
+            b2b_debt_audit( $dist_id, 'subtract', $amount, $old_debt, $new_debt, $reason, $order_id );
             wp_cache_delete( $dist_id, 'post_meta' );
+            if ( function_exists( 'update_field' ) ) {
+                update_field( 'current_debt', $new_debt, $dist_id );
+            }
             return $new_debt;
 
         } catch ( Exception $e ) {
@@ -129,9 +143,42 @@ if ( ! function_exists( 'b2b_debt_subtract' ) ) {
     }
 }
 
+// ════════════════════════════════════════════
+// 2. FINANCIAL LOCK (MySQL GET_LOCK)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_financial_lock' ) ) {
+    /**
+     * FIX C-3: MySQL-level lock for financial operations (replaces transient locks)
+     * More reliable than transient: atomic, no object cache dependency, cross-process safe
+     * @param int    $dist_id  Distributor post ID
+     * @param int    $timeout  Lock timeout in seconds (default 5)
+     * @return bool  true if lock acquired
+     */
+    function b2b_financial_lock( $dist_id, $timeout = 5 ) {
+        global $wpdb;
+        $lock_name = 'b2b_fin_' . intval( $dist_id );
+        $result = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, %d)", $lock_name, $timeout ) );
+        return $result == 1;
+    }
+}
+
+if ( ! function_exists( 'b2b_financial_unlock' ) ) {
+    function b2b_financial_unlock( $dist_id ) {
+        global $wpdb;
+        $lock_name = 'b2b_fin_' . intval( $dist_id );
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+    }
+}
+
+// ════════════════════════════════════════════
+// 3. AUDIT LOG
+// ════════════════════════════════════════════
+
 if ( ! function_exists( 'b2b_debt_audit' ) ) {
     /**
      * บันทึก audit log สำหรับทุกการเปลี่ยนแปลงหนี้
+     * FIX H-2: ฟังก์ชันนี้ถูกเรียกจากภายนอก transaction ได้ (หลัง COMMIT)
      */
     function b2b_debt_audit( $dist_id, $action, $amount, $old_debt, $new_debt, $reason, $order_id ) {
         $log = get_post_meta( $dist_id, '_debt_audit_log', true ) ?: array();
