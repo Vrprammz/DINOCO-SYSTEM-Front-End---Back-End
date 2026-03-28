@@ -383,6 +383,10 @@ Updated monthly by `b2b_rank_update_event` cron.
 
 ---
 
+## Gotchas / Dev Notes
+
+1. **Auto-Refresh overrides `setTimeout`** — Admin Dashboard override จับ `setTimeout` ที่ >= 3s ทำให้ toast auto-dismiss ไม่ทำงาน → ใช้ `(window._dncAutoRefresh && window._dncAutoRefresh.origSetTimeout) || setTimeout` แทน (แก้ใน V.33.1)
+
 ---
 
 ## Thai ↔ English Status Mappings
