@@ -629,6 +629,15 @@ Print tab:
 58. **AI dynamic aliases** — AI Control Module ดึง aliases จาก DB แทน hardcode (+ fallback เดิม)
 59. **Universal form handler** — Member Dashboard Main ไม่แยก Honda vs Other อีก ใช้ field เดียว
 
+### Profile Redesign V.33.x (Edit Profile)
+60. **Journey Timeline** — เปลี่ยนจาก "สินค้าของฉัน" (warranty card ใหญ่) → "เส้นทางของเรา" (compact timeline เบาๆ) max 4 items + ดูทั้งหมด expand
+61. **w_status map ครบ 10 สถานะ** — warranty_on, warranty_available, warranty_pending, claim_process, repaired, refurbished, modified, old_warranty, stolen, void
+62. **Moto image จาก catalog** — view mode ข้อมูลรถ + cover photo ดึงรูปจาก MotoDB แทน user_moto_image ที่ว่าง
+63. **Cascading model dropdown** — เลือก brand → dropdown model จาก catalog JSON (client-side) + text fallback
+64. **Avatar กล้องลอย** — ย้าย overflow:hidden จาก wrap → img ให้ปุ่มกล้องไม่ถูก clip
+65. **Fix horizontal scroll** — เพิ่ม overflow-x:hidden ที่ .d-edit-wrap (สาเหตุ: cover negative margin กว้างเกิน viewport)
+66. **Moto Manager ใน Admin Dashboard** — เพิ่ม tab "Moto Catalog" ใน sidebar + command palette
+
 ### หมายเหตุ
 - **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)
 - **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)
