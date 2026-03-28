@@ -34,6 +34,9 @@ All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, 
 - `DINOCO_LINE_REDIRECT_URI` — OAuth callback URL
 - `B2B_LINE_ACCESS_TOKEN` — Bot token for LINE notifications
 - `B2B_ADMIN_GROUP_ID` — Admin LINE group for alerts
+- `DINOCO_GITHUB_TOKEN` — GitHub PAT for sync engine
+- `DINOCO_GITHUB_REPO` — GitHub repo (e.g., `Vrprammz/DINOCO-SYSTEM-Front-End---Back-End`)
+- `DINOCO_GITHUB_WEBHOOK_SECRET` — Webhook signature secret
 
 ## File Organization
 
@@ -43,7 +46,7 @@ Files are named by feature area with bracket prefixes:
 - `[B2B] Snippet N: *` — B2B distributor modules (versioned snippets)
 - `[GitHub] *` — Webhook integration
 
-Each file is a self-contained module with its own version number (e.g., V.20.x, V.21.x, V.22.x).
+Each file is a self-contained module with its own version number (e.g., V.31.x, V.34.x).
 
 ### DB_ID Header (V.32.0)
 
@@ -51,7 +54,8 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 
 ## Development Notes
 
-- **Deployment**: Files are WordPress code snippets — no build pipeline. Deploy by updating snippets in WordPress.
+- **Deployment**: Files are WordPress code snippets deployed via GitHub Webhook Sync (V.34.1). Push to `main` → webhook auto-syncs all snippets using DB_ID matching. Manual sync available via dashboard.
+- **Debt System**: Atomic MySQL transactions (`b2b_debt_add/subtract` in Snippet 13) with `FOR UPDATE` lock. `b2b_recalculate_debt()` is single-SQL source of truth. All debt mutations go through Snippet 13 — direct `update_field('current_debt')` is blocked.
 - **Timezone**: Hardcoded to `Asia/Bangkok` throughout.
 - **Language**: UI text and code comments are primarily in Thai.
 - **Security patterns**: WordPress nonce verification, honeypot fields, rate limiting via transients, `sanitize_text_field`/`esc_html`/`esc_url` for output.

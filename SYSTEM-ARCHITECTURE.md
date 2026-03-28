@@ -1,6 +1,6 @@
 # DINOCO System Architecture — Complete Reference
 
-> Updated: 2026-03-27 | Version: V.31.0 | 38 files, ~50,000 lines
+> Updated: 2026-03-28 | Version: V.34.1 | 38 files, ~50,000 lines
 
 ## Overview
 

@@ -310,6 +310,14 @@ Type: boolean — whether this order's total has been added to distributor debt
 
 This flag is the guard that prevents double-counting debt. Every debt reversal checks `is_billed` before subtracting.
 
+### 3.5 New meta fields (V.31.0)
+
+| Meta Key | On CPT | Purpose |
+|----------|--------|---------|
+| `_slip_trans_ref` | `b2b_order` | Slip transaction reference for local duplicate detection |
+| `_inv_paid_amount` | `b2b_order` | Actual amount paid (tracks 2% FIFO tolerance difference) |
+| `_debt_audit_log` | `distributor` | Array of last 200 debt mutations (action, amount, old/new debt, reason) |
+
 | State | Meaning |
 |-------|---------|
 | `false` (default) | Order total NOT in distributor debt |
@@ -325,12 +333,15 @@ This flag is the guard that prevents double-counting debt. Every debt reversal c
 ```
 Trigger: Admin confirms bill (B2B flow) or issues manual invoice
 Guard:   credit_limit check — reject if (current_debt + total) > credit_limit
+Method:  b2b_debt_add() (Snippet 13) — atomic MySQL transaction with FOR UPDATE lock
 
 Steps:
-  1. Read current_debt from distributor (with FOR UPDATE lock in B2B webhook)
-  2. current_debt += total_amount
-  3. Set is_billed = true on the order
-  4. Set due_date = today + credit_term_days
+  1. START TRANSACTION + SELECT current_debt FOR UPDATE (row lock)
+  2. Credit limit check inside lock (prevents TOCTOU)
+  3. current_debt += total_amount (INSERT IGNORE if new distributor)
+  4. COMMIT + audit log + ACF cache sync
+  5. Set is_billed = true on the order
+  6. Set due_date = today + credit_term_days
   5. Audit log: 'invoice_issued'
 
 Code paths:
