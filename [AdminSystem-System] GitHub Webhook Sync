@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [AdminSystem-System] GitHub Webhook Sync                    ║
- * ║  Version: V.32.1 — Fix CDN cache + DB_ID matching
+ * ║  Version: V.33.0 — Fix manual sync SHA resolution + cache bypass
  * ║  DB_ID: 265
  * ║  DINOCO Admin & System Snippet Sync                          ║
  * ╠══════════════════════════════════════════════════════════════╣
@@ -810,6 +810,36 @@ if ( ! function_exists( 'dinoco_github_sync_manual' ) ) {
 
         $branch = $req->get_param( 'branch' ) ?: 'main';
 
+        // V.33.0: Resolve latest commit SHA for the branch FIRST
+        // Using commit SHA instead of branch name bypasses GitHub CDN caching
+        $commit_sha = '';
+        $ref_url = sprintf( 'https://api.github.com/repos/%s/git/ref/heads/%s', $repo, rawurlencode( $branch ) );
+        $ref_resp = wp_remote_get( $ref_url, array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $token,
+                'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                'Accept'        => 'application/vnd.github.v3+json',
+                'If-None-Match' => '',  // Force bypass any HTTP cache
+            ),
+            'timeout' => 15,
+        ) );
+        if ( ! is_wp_error( $ref_resp ) && wp_remote_retrieve_response_code( $ref_resp ) === 200 ) {
+            $ref_data = json_decode( wp_remote_retrieve_body( $ref_resp ), true );
+            if ( ! empty( $ref_data['object']['sha'] ) ) {
+                $commit_sha = $ref_data['object']['sha'];
+                dinoco_sync_log( 'Manual sync: resolved branch ' . $branch . ' → SHA ' . substr( $commit_sha, 0, 7 ) );
+            }
+        }
+        if ( empty( $commit_sha ) ) {
+            // Fallback: use branch name (may be CDN-cached)
+            $commit_sha = $branch;
+            dinoco_sync_log( 'Manual sync: could not resolve SHA, using branch name: ' . $branch );
+        }
+
+        // Track whether webhook already synced this commit
+        $last_processed = get_option( 'dinoco_last_processed_commit', '' );
+        $webhook_already_synced = ( $commit_sha && $last_processed === $commit_sha );
+
         global $wpdb;
         $table   = $wpdb->prefix . 'snippets';
         $updated = array();
@@ -833,10 +863,14 @@ if ( ! function_exists( 'dinoco_github_sync_manual' ) ) {
         $skipped = array();
         $snippet_details = array();
 
-        // FIX: build repo file list from GitHub tree to resolve name mismatches
-        $tree_url = sprintf( 'https://api.github.com/repos/%s/git/trees/%s', $repo, rawurlencode( $branch ) );
+        // V.33.0: build repo file list from GitHub tree using COMMIT SHA (not branch name)
+        $tree_url = sprintf( 'https://api.github.com/repos/%s/git/trees/%s', $repo, rawurlencode( $commit_sha ) );
         $tree_resp = wp_remote_get( $tree_url, array(
-            'headers' => array( 'Authorization' => 'Bearer ' . $token, 'User-Agent' => 'DINOCO-System-Sync/1.0' ),
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $token,
+                'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                'If-None-Match' => '',
+            ),
             'timeout' => 15,
         ) );
         $repo_files = array(); // normalized → raw filename
@@ -853,28 +887,29 @@ if ( ! function_exists( 'dinoco_github_sync_manual' ) ) {
             // Resolve actual repo filename (may differ from normalized DB name)
             $actual_file = isset( $repo_files[ $file_name ] ) ? $repo_files[ $file_name ] : $file_name;
 
-            // FIX: Use GitHub Contents API as PRIMARY (no CDN cache, always fresh)
+            // V.33.0: Use commit SHA for Contents API (bypass CDN cache completely)
             $content_url = sprintf(
                 'https://api.github.com/repos/%s/contents/%s?ref=%s',
                 $repo,
                 rawurlencode( $actual_file ),
-                rawurlencode( $branch )
+                rawurlencode( $commit_sha )
             );
             $raw_response = wp_remote_get( $content_url, array(
                 'headers' => array(
                     'Accept'        => 'application/vnd.github.v3.raw',
                     'Authorization' => 'Bearer ' . $token,
                     'User-Agent'    => 'DINOCO-System-Sync/1.0',
+                    'If-None-Match' => '',  // Force bypass HTTP cache
                 ),
                 'timeout' => 30,
             ) );
 
-            // Fallback: raw.githubusercontent.com (may be cached but still works)
+            // Fallback: raw.githubusercontent.com using commit SHA (not branch)
             if ( is_wp_error( $raw_response ) || wp_remote_retrieve_response_code( $raw_response ) !== 200 ) {
                 $raw_url = sprintf(
                     'https://raw.githubusercontent.com/%s/%s/%s',
                     $repo,
-                    rawurlencode( $branch ),
+                    rawurlencode( $commit_sha ),
                     rawurlencode( $actual_file )
                 );
                 $raw_response = wp_remote_get( $raw_url, array(
@@ -966,13 +1001,15 @@ if ( ! function_exists( 'dinoco_github_sync_manual' ) ) {
             'time'            => current_time( 'mysql' ),
             'trigger'         => 'manual',
             'branch'          => $branch,
-            'mode'            => 'manual_sync_v32',
+            'commit_sha'      => $commit_sha,
+            'mode'            => 'manual_sync_v33',
             'status'          => 'completed',
             'files_synced'    => array_keys( $db_by_name ),
             'updated'         => $updated,
             'skipped'         => $skipped,
             'errors'          => $errors,
             'snippet_details' => $snippet_details,
+            'webhook_already_synced' => $webhook_already_synced,
         ) );
 
         return new WP_REST_Response( array(
@@ -981,7 +1018,9 @@ if ( ! function_exists( 'dinoco_github_sync_manual' ) ) {
             'skipped' => $skipped,
             'errors'  => $errors,
             'branch'  => $branch,
+            'commit_sha' => $commit_sha,
             'total'   => count( $db_by_name ),
+            'webhook_already_synced' => $webhook_already_synced,
         ), 200 );
     }
 }
@@ -1094,7 +1133,7 @@ function dinoco_render_sync_dashboard() {
     );
 
     // Dashboard version
-    $dashboard_ver = 'V.32.0';
+    $dashboard_ver = 'V.33.0';
 
     // Count stats
     $cnt_total     = count( $rows );
@@ -1193,6 +1232,14 @@ function dinoco_render_sync_dashboard() {
 <?php endif; ?>
 <?php if ( $msg ) : ?>
 <div class="sd-alert sd-alert-warn"><?php echo esc_html( $msg ); ?></div>
+<?php endif; ?>
+<?php
+// V.33.0: Show explanation when manual sync found everything already current (webhook did it)
+$webhook_flag = ! empty( $last['webhook_already_synced'] );
+if ( $webhook_flag && $cnt_synced === 0 && $cnt_unchanged > 0 && $trigger === 'manual' ) : ?>
+<div class="sd-alert sd-alert-sync">Webhook sync ทำงานแล้วก่อน Manual Sync -- โค้ดทั้งหมดตรงกับ GitHub แล้ว (commit <?php echo esc_html( substr( $commit_sha, 0, 7 ) ); ?>)</div>
+<?php elseif ( $cnt_synced === 0 && $cnt_unchanged > 0 && $cnt_failed === 0 && $trigger === 'manual' ) : ?>
+<div class="sd-alert sd-alert-sync">โค้ดบน WordPress ตรงกับ GitHub ทุกไฟล์ -- ไม่มีอะไรต้องอัพเดท</div>
 <?php endif; ?>
 
 <!-- Stat Cards -->
@@ -1382,6 +1429,15 @@ function dinoco_render_sync_dashboard() {
         $lines[] = '';
         $lines[] = 'Results:  ' . $cnt_synced . ' synced, ' . $cnt_unchanged . ' unchanged, ' . $cnt_failed . ' failed (total: ' . $cnt_total . ')';
 
+        // V.33.0: Explain why everything is unchanged
+        if ( $cnt_synced === 0 && $cnt_unchanged > 0 && $cnt_failed === 0 ) {
+            if ( $webhook_flag ) {
+                $lines[] = '          (Webhook sync ทำงานแล้ว -- โค้ดตรงกับ GitHub อยู่แล้ว)';
+            } else {
+                $lines[] = '          (โค้ดบน WordPress ตรงกับ GitHub ทุกไฟล์ ไม่มีความเปลี่ยนแปลง)';
+            }
+        }
+
         if ( $errors ) {
             $lines[] = '';
             $lines[] = 'Errors (' . count( $errors ) . '):';
@@ -1442,7 +1498,14 @@ function dinoco_render_sync_dashboard() {
                 var s = res.data.skipped || [];
                 var e = res.data.errors || [];
                 var t = res.data.total || 0;
-                var detail = 'Sync สำเร็จ!\n' + u.length + ' synced, ' + s.length + ' ไม่เปลี่ยน, ' + e.length + ' ผิดพลาด (จาก ' + t + ' snippets)';
+                var sha = res.data.commit_sha ? res.data.commit_sha.substring(0, 7) : '';
+                var webhookDone = res.data.webhook_already_synced;
+                var detail = 'Sync สำเร็จ!' + (sha ? ' (commit: ' + sha + ')' : '') + '\n' + u.length + ' synced, ' + s.length + ' ไม่เปลี่ยน, ' + e.length + ' ผิดพลาด (จาก ' + t + ' snippets)';
+                if (u.length === 0 && s.length > 0 && webhookDone) {
+                    detail += '\n\nWebhook sync ทำงานแล้วก่อน Manual Sync -- โค้ดตรงกับ GitHub อยู่แล้ว';
+                } else if (u.length === 0 && s.length > 0) {
+                    detail += '\n\nโค้ดบน WordPress ตรงกับ GitHub ทุกไฟล์ ไม่มีความเปลี่ยนแปลง';
+                }
                 if (u.length > 0) detail += '\n\nSynced:\n' + u.map(function(n, i) { return '  ' + (i + 1) + '. ' + n; }).join('\n');
                 if (e.length > 0) detail += '\n\nErrors (' + e.length + '):\n' + e.map(function(n, i) { return '  ' + (i + 1) + '. ' + n; }).join('\n');
                 msg.className = e.length > 0 ? 'sd-msg err' : 'sd-msg ok';
