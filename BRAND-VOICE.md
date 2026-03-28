@@ -2,7 +2,7 @@
 
 **Shortcode:** `[dinoco_brand_voice]`
 **DB_ID:** 1159
-**Version:** V.1.5
+**Version:** V.1.6
 **วันที่สร้าง:** 2026-03-29
 
 ---
@@ -25,6 +25,7 @@
 | V.1.3 | `26627c6` | แก้ PHP syntax error + ลด entries 25→10 + max_tokens fix |
 | V.1.4 | `6d8b0fd` | UI ภาษาไทย + highlight DINOCO + เพิ่ม % เชิงลบ |
 | V.1.5 | `f731d3e` | บังคับ categories จาก list + กราฟ top 8 |
+| V.1.6 | `1030351` | Bookmarklet เก็บเสียงลูกค้าจากโซเชียลได้ทันที |
 
 ---
 
@@ -41,7 +42,7 @@
 
 ---
 
-## โครงสร้าง 3 Tabs
+## โครงสร้าง 4 Tabs
 
 ### Tab 1: Dashboard (default)
 - **แหล่งที่ติดตาม** — แอดมินระบุ Facebook/YouTube/TikTok groups
@@ -61,6 +62,12 @@
 - Form สำหรับกรอกข้อมูลเอง (เสียงลูกค้าจริง)
 - Auto-detect platform จาก URL
 - Batch mode (ค้าง brand/model/platform)
+
+### Tab 4: Bookmarklet
+- ปุ่ม **"+ Brand Voice"** — ลากไปวาง Bookmark Bar
+- วิธีใช้ 4 ขั้นตอน (ลาก → เลือกข้อความ → กด → บันทึก)
+- Auto-detect platform: Facebook, YouTube, TikTok, Instagram, Pantip, LINE
+- เปิด Brand Voice ใน popup พร้อม prefill: content, URL, source name, platform
 
 ---
 
@@ -125,7 +132,7 @@ TikTok: #HondaBigBike
 ## Backlog
 
 ### Phase 2 (ต่อยอด)
-1. **Bookmarklet** — กดปุ่มบน Facebook → ข้อมูลจริงเข้าทันที (พร้อม URL)
+1. ~~**Bookmarklet**~~ — ✅ ทำแล้ว V.1.6
 2. **Browser Extension** — ถ้า Bookmarklet ไม่พอ
 3. **เชื่อม Finance AI** — ใช้ Brand Voice data จริงแทน knowledge
 4. **Sentiment trend chart** — แนวโน้มรายสัปดาห์/เดือน
