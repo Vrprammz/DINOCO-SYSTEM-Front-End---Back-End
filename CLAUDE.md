@@ -45,6 +45,10 @@ Files are named by feature area with bracket prefixes:
 
 Each file is a self-contained module with its own version number (e.g., V.20.x, V.21.x, V.22.x).
 
+### DB_ID Header (V.32.0)
+
+Every snippet file includes a `DB_ID: NNN` header in its comment block (first 1000 chars). This integer maps to the `id` column in the `wp_snippets` table. The GitHub Webhook Sync engine (`dinoco_extract_db_id()`) uses DB_ID as the **primary** matching key when syncing code from GitHub to WordPress. If a file has no DB_ID header, it falls back to normalized filename matching.
+
 ## Development Notes
 
 - **Deployment**: Files are WordPress code snippets — no build pipeline. Deploy by updating snippets in WordPress.
