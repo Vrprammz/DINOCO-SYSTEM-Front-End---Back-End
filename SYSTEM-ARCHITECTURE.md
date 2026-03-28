@@ -143,7 +143,8 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | **Snippet 12**: Admin LIFF | 1,988 | 3 shortcodes | Dashboard, stock manager, tracking entry LIFF |
 | **Snippet 13**: Debt Transaction | ~200 | — | Atomic MySQL transactions for debt (FOR UPDATE lock), `b2b_financial_lock()`, audit log, ACF cache sync |
 | **Snippet 14**: Order State Machine | ~180 | — | FSM class: validates transitions + actor permissions |
-| **Snippet 15**: Custom Tables & JWT | ~300 | — | Custom `dinoco_products` table + HMAC JWT session tokens |
+| **Snippet 15**: Custom Tables & JWT | ~608 | — | Custom `dinoco_products` + `dinoco_moto_brands` + `dinoco_moto_models` tables, HMAC JWT, DINOCO_MotoDB class |
+| **Moto Manager** (Admin) | ~536 | `[dinoco_admin_moto]` | Admin CRUD UI for motorcycle brands/models/images/aliases |
 
 ### Admin System (11 files + 1 abstraction layer)
 

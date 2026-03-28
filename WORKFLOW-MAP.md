@@ -620,6 +620,15 @@ Print tab:
 51. **Avatar circular fix** — force `border-radius: 50% !important` + `overflow: hidden` ที่ parent
 52. **Image compression** — ทั้ง avatar (500x500) และ cover (1200x600) ย่อ client-side ก่อน upload แล้วเซิร์ฟเวอร์ resize อีกรอบ
 
+### Motorcycle Catalog Database (Snippet 15 V.2.0)
+53. **Custom MySQL tables** — `dinoco_moto_brands` + `dinoco_moto_models` แทน hardcode 9 จุดใน 5 ไฟล์
+54. **DINOCO_MotoDB class** — CRUD, fuzzy image lookup, AI aliases, full catalog JSON, wp_cache layer
+55. **Admin Moto Manager** — shortcode `[dinoco_admin_moto]` จัดการ brands/models/images/aliases, SweetAlert2 modals
+56. **Seed migration** — import 13 brands + 19 models + Thai aliases จาก hardcode เดิม (idempotent)
+57. **Cascading dropdown** — Dashboard + Edit Profile เลือก brand → model dropdown จาก catalog JSON (client-side, ไม่ AJAX)
+58. **AI dynamic aliases** — AI Control Module ดึง aliases จาก DB แทน hardcode (+ fallback เดิม)
+59. **Universal form handler** — Member Dashboard Main ไม่แยก Honda vs Other อีก ใช้ field เดียว
+
 ### หมายเหตุ
 - **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)
 - **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)

@@ -326,6 +326,30 @@ This flag is the guard that prevents double-counting debt. Every debt reversal c
 | `user_moto_image` | URL ของรูปรถมอเตอร์ไซค์ |
 | `line_picture_url` | URL ของรูป avatar (จาก LINE หรือ user upload) |
 
+### 3.7 Motorcycle Catalog Tables (V.2.0 — Snippet 15)
+
+**Table: `wp_dinoco_moto_brands`**
+| Column | Type | Purpose |
+|--------|------|---------|
+| `slug` | VARCHAR(50) UNIQUE | Brand identifier (e.g. `honda`) |
+| `name` | VARCHAR(100) | Display name (e.g. `Honda`) |
+| `logo_url` | VARCHAR(500) | Brand logo URL |
+| `sort_order` | INT | Admin-controlled display order |
+| `is_active` | TINYINT | Soft delete flag |
+
+**Table: `wp_dinoco_moto_models`**
+| Column | Type | Purpose |
+|--------|------|---------|
+| `brand_slug` | VARCHAR(50) | FK → brands.slug |
+| `slug` | VARCHAR(100) UNIQUE | Model identifier (e.g. `nx500`) |
+| `name` | VARCHAR(200) | Display name (e.g. `NX500`) |
+| `image_url` | VARCHAR(500) | Model image URL |
+| `aliases` | TEXT (JSON) | Thai/alt names for AI detection |
+| `sort_order` | INT | Display order within brand |
+| `is_active` | TINYINT | Soft delete flag |
+
+**Seeded data:** 13 brands, 16 Honda models, 3 Yamaha models, Thai aliases
+
 | State | Meaning |
 |-------|---------|
 | `false` (default) | Order total NOT in distributor debt |
