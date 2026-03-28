@@ -2,7 +2,7 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
- * Version: V.31.1 — Auto-refresh + Zero-debt Flex
+ * Version: V.32.0 — Distributor Detail View
  * DB_ID: 598
  * Dependencies: b2b_order CPT, distributor CPT, b2b_product CPT, ACF
  */
@@ -718,6 +718,12 @@ add_action('rest_api_init', function() {
     register_rest_route($ns, '/invoice/send-summary', [
         'methods'             => 'POST',
         'callback'            => 'dinoco_inv_rest_send_summary',
+        'permission_callback' => $perm,
+    ]);
+    // V.32.0: Distributor Detail (profile + sales summary + product breakdown + invoice history)
+    register_rest_route($ns, '/invoice/distributor-detail', [
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_inv_rest_distributor_detail',
         'permission_callback' => $perm,
     ]);
 });
@@ -2072,6 +2078,128 @@ function dinoco_inv_rest_send_summary(WP_REST_Request $req) {
     ]);
 }
 
+// --- DISTRIBUTOR DETAIL (V.32.0) ---
+function dinoco_inv_rest_distributor_detail(WP_REST_Request $req) {
+    $dist_id = intval($req->get_param('dist_id'));
+    if (!$dist_id || get_post_type($dist_id) !== 'distributor') {
+        return new WP_Error('invalid', 'Distributor not found', ['status' => 404]);
+    }
+    $page = max(1, intval($req->get_param('page') ?? 1));
+    $per  = 20;
+
+    // --- Profile ---
+    $profile = [
+        'id'               => $dist_id,
+        'shop_name'        => get_field('shop_name', $dist_id) ?: get_the_title($dist_id),
+        'shop_logo_url'    => get_field('shop_logo_url', $dist_id) ?: '',
+        'dist_phone'       => get_field('dist_phone', $dist_id) ?: '',
+        'dist_address'     => get_field('dist_address', $dist_id) ?: '',
+        'dist_district'    => get_field('dist_district', $dist_id) ?: '',
+        'dist_city'        => get_field('dist_city', $dist_id) ?: '',
+        'dist_province'    => get_field('dist_province', $dist_id) ?: '',
+        'dist_postcode'    => get_field('dist_postcode', $dist_id) ?: '',
+        'rank_system'      => get_field('rank_system', $dist_id) ?: 'standard',
+        'credit_limit'     => floatval(get_field('credit_limit', $dist_id)),
+        'credit_term_days' => intval(get_field('credit_term_days', $dist_id) ?: 30),
+        'current_debt'     => function_exists('b2b_recalculate_debt')
+            ? floatval(b2b_recalculate_debt($dist_id))
+            : floatval(get_field('current_debt', $dist_id)),
+    ];
+
+    // --- All non-draft/cancelled invoices for this distributor ---
+    $all_ids = get_posts([
+        'post_type'      => 'b2b_order',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+        'meta_query'     => [
+            ['key' => '_order_source', 'value' => 'manual_invoice'],
+            ['key' => '_dist_post_id', 'value' => $dist_id, 'type' => 'NUMERIC'],
+        ],
+    ]);
+
+    // Warm meta cache
+    if (!empty($all_ids)) update_postmeta_cache($all_ids);
+
+    $tz          = new DateTimeZone('Asia/Bangkok');
+    $now         = new DateTime('now', $tz);
+    $month_start = $now->format('Y-m-01');
+    $year_start  = $now->format('Y-01-01');
+
+    $sales_month = 0;
+    $sales_year  = 0;
+    $outstanding = 0;
+    $product_map = []; // sku => [description, total_qty, total_value]
+    $cutoff_12m  = (clone $now)->modify('-12 months')->format('Y-m-d');
+
+    foreach ($all_ids as $pid) {
+        $status = get_field('order_status', $pid);
+        if (in_array($status, ['draft', 'cancelled'])) continue;
+
+        $total    = floatval(get_field('total_amount', $pid));
+        $inv_date = get_post_meta($pid, '_inv_date', true) ?: get_the_date('Y-m-d', $pid);
+
+        // Sales aggregation
+        if ($inv_date >= $year_start)  $sales_year  += $total;
+        if ($inv_date >= $month_start) $sales_month += $total;
+
+        // Outstanding (awaiting_payment / overdue)
+        if (in_array($status, ['awaiting_payment'])) {
+            $paid = floatval(get_post_meta($pid, '_inv_paid_amount', true));
+            $outstanding += ($total - $paid);
+        }
+
+        // Product breakdown (last 12 months)
+        if ($inv_date >= $cutoff_12m) {
+            $items = json_decode(get_post_meta($pid, '_inv_items', true) ?: '[]', true);
+            foreach ($items as $item) {
+                $sku = $item['sku'] ?? 'N/A';
+                if (!isset($product_map[$sku])) {
+                    $product_map[$sku] = ['sku' => $sku, 'description' => $item['description'] ?? $sku, 'total_qty' => 0, 'total_value' => 0];
+                }
+                $product_map[$sku]['total_qty']   += intval($item['qty'] ?? 1);
+                $product_map[$sku]['total_value']  += floatval($item['line_total'] ?? 0);
+            }
+        }
+    }
+
+    // Sort products by value DESC, top 10
+    $products = array_values($product_map);
+    usort($products, function($a, $b) { return $b['total_value'] <=> $a['total_value']; });
+    $products = array_slice($products, 0, 10);
+
+    // --- Paginated invoice history (all statuses) ---
+    $inv_query = new WP_Query([
+        'post_type'      => 'b2b_order',
+        'post_status'    => 'publish',
+        'posts_per_page' => $per,
+        'paged'          => $page,
+        'orderby'        => 'date',
+        'order'          => 'DESC',
+        'meta_query'     => [
+            ['key' => '_order_source', 'value' => 'manual_invoice'],
+            ['key' => '_dist_post_id', 'value' => $dist_id, 'type' => 'NUMERIC'],
+        ],
+    ]);
+    $invoices = [];
+    foreach ($inv_query->posts as $p) {
+        $invoices[] = _dinoco_inv_row($p->ID);
+    }
+
+    return rest_ensure_response([
+        'success'           => true,
+        'profile'           => $profile,
+        'sales_this_month'  => round($sales_month, 2),
+        'sales_this_year'   => round($sales_year, 2),
+        'outstanding_debt'  => round($outstanding, 2),
+        'product_breakdown' => $products,
+        'invoices'          => $invoices,
+        'invoice_count'     => $inv_query->found_posts,
+        'invoice_pages'     => $inv_query->max_num_pages,
+        'invoice_page'      => $page,
+    ]);
+}
+
 // --- DELETE ---
 function dinoco_inv_rest_delete(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
@@ -2268,6 +2396,44 @@ add_shortcode('dinoco_manual_invoice', function() {
 .inv-toast-item.error { background: #dc2626; }
 .inv-toast-item.info { background: #2563eb; }
 @keyframes invToastIn { from { opacity:0; transform: translateY(-10px); } to { opacity:1; transform: translateY(0); } }
+
+/* ===== Distributor Detail View (V.32.0) ===== */
+#inv-wrap .inv-dist-link { color: #2563eb; font-weight: 500; cursor: pointer; text-decoration: none; }
+#inv-wrap .inv-dist-link:hover { text-decoration: underline; }
+
+#inv-wrap .inv-dist-profile-card { display: flex; justify-content: space-between; align-items: flex-start; background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; margin-bottom: 16px; flex-wrap: wrap; gap: 16px; }
+#inv-wrap .inv-dist-profile-left { display: flex; gap: 16px; align-items: flex-start; }
+#inv-wrap .inv-dist-avatar { width: 64px; height: 64px; border-radius: 12px; background: #f1f5f9; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 1.8rem; }
+#inv-wrap .inv-dist-avatar img { width: 100%; height: 100%; object-fit: cover; }
+#inv-wrap .inv-dist-info h3 { margin: 0 0 4px; font-size: 1.2rem; font-weight: 700; color: #1e293b; }
+#inv-wrap .inv-dist-info p { margin: 2px 0; font-size: 0.85rem; color: #64748b; }
+#inv-wrap .inv-dist-rank-badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; margin-bottom: 6px; }
+#inv-wrap .inv-dist-rank-badge.standard { background: #f1f5f9; color: #64748b; }
+#inv-wrap .inv-dist-rank-badge.silver { background: #e2e8f0; color: #334155; }
+#inv-wrap .inv-dist-rank-badge.gold { background: #fef3c7; color: #92400e; }
+#inv-wrap .inv-dist-rank-badge.platinum { background: #ede9fe; color: #6d28d9; }
+#inv-wrap .inv-dist-rank-badge.diamond { background: #dbeafe; color: #1d4ed8; }
+#inv-wrap .inv-dist-profile-right { text-align: right; }
+#inv-wrap .inv-dist-credit-row { font-size: 0.85rem; color: #475569; margin-bottom: 4px; }
+#inv-wrap .inv-dist-credit-row span:last-child { font-weight: 600; color: #1e293b; }
+
+#inv-wrap .inv-dd-summary-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+@media (max-width: 768px) { #inv-wrap .inv-dd-summary-row { grid-template-columns: 1fr; } }
+#inv-wrap .inv-dd-summary-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px 20px; display: flex; align-items: center; gap: 14px; }
+#inv-wrap .inv-dd-sum-icon { width: 48px; height: 48px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; flex-shrink: 0; }
+#inv-wrap .inv-dd-sum-icon.month { background: #dbeafe; color: #2563eb; }
+#inv-wrap .inv-dd-sum-icon.year { background: #dcfce7; color: #16a34a; }
+#inv-wrap .inv-dd-sum-icon.debt { background: #fee2e2; color: #dc2626; }
+#inv-wrap .inv-dd-sum-label { font-size: 0.78rem; color: #64748b; margin-bottom: 2px; }
+#inv-wrap .inv-dd-sum-value { font-size: 1.3rem; font-weight: 700; color: #1e293b; }
+#inv-wrap .inv-dd-sum-debt .inv-dd-sum-value { color: #dc2626; }
+
+#inv-wrap .inv-dd-bar-wrap { display: flex; align-items: center; gap: 8px; }
+#inv-wrap .inv-dd-bar { height: 8px; border-radius: 4px; background: #2563eb; min-width: 4px; transition: width 0.3s; }
+#inv-wrap .inv-dd-bar-pct { font-size: 0.75rem; color: #94a3b8; white-space: nowrap; min-width: 36px; text-align: right; }
+
+#inv-wrap .inv-dd-two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 900px) { #inv-wrap .inv-dd-two-col { grid-template-columns: 1fr; } }
 </style>
 
 <!-- ========== LIST VIEW ========== -->
@@ -2325,6 +2491,106 @@ add_shortcode('dinoco_manual_invoice', function() {
         </table>
     </div>
     <div id="inv-pagination" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;"></div>
+</div>
+
+<!-- ========== DISTRIBUTOR DETAIL VIEW (V.32.0) ========== -->
+<div id="inv-dist-detail-view" class="inv-view">
+    <div class="inv-builder-header">
+        <button class="inv-back-btn" onclick="invCloseDistDetail()">
+            <i class="fa-solid fa-chevron-left"></i> ใบแจ้งหนี้/วางบิลตัวแทน
+        </button>
+        <h2 class="inv-builder-title" id="inv-dd-heading">รายละเอียดตัวแทน</h2>
+    </div>
+
+    <!-- Profile card -->
+    <div class="inv-dist-profile-card">
+        <div class="inv-dist-profile-left">
+            <div class="inv-dist-avatar" id="inv-dd-avatar"><i class="fa-solid fa-store"></i></div>
+            <div class="inv-dist-info">
+                <h3 id="inv-dd-shop-name">-</h3>
+                <span class="inv-dist-rank-badge standard" id="inv-dd-rank">Standard</span>
+                <p id="inv-dd-phone"><i class="fa-solid fa-phone" style="margin-right:4px;font-size:0.8rem;"></i> -</p>
+                <p id="inv-dd-address"><i class="fa-solid fa-location-dot" style="margin-right:4px;font-size:0.8rem;"></i> -</p>
+            </div>
+        </div>
+        <div class="inv-dist-profile-right">
+            <div class="inv-dist-credit-row"><span>วงเงินเครดิต: </span><span id="inv-dd-credit-limit">-</span></div>
+            <div class="inv-dist-credit-row"><span>เทอมชำระ: </span><span id="inv-dd-term">- วัน</span></div>
+            <div id="inv-dd-credit-banner" class="inv-credit-banner" style="display:none;margin-top:8px;"></div>
+        </div>
+    </div>
+
+    <!-- Summary cards -->
+    <div class="inv-dd-summary-row">
+        <div class="inv-dd-summary-card">
+            <div class="inv-dd-sum-icon month"><i class="fa-solid fa-calendar-day"></i></div>
+            <div>
+                <div class="inv-dd-sum-label">ยอดขายเดือนนี้ (บาท)</div>
+                <div class="inv-dd-sum-value" id="inv-dd-sales-month">-</div>
+            </div>
+        </div>
+        <div class="inv-dd-summary-card">
+            <div class="inv-dd-sum-icon year"><i class="fa-solid fa-calendar"></i></div>
+            <div>
+                <div class="inv-dd-sum-label">ยอดขายปีนี้ (บาท)</div>
+                <div class="inv-dd-sum-value" id="inv-dd-sales-year">-</div>
+            </div>
+        </div>
+        <div class="inv-dd-summary-card inv-dd-sum-debt">
+            <div class="inv-dd-sum-icon debt"><i class="fa-solid fa-coins"></i></div>
+            <div>
+                <div class="inv-dd-sum-label">ยอดค้างชำระ (บาท)</div>
+                <div class="inv-dd-sum-value" id="inv-dd-debt">-</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Two column: product breakdown + invoice history -->
+    <div class="inv-dd-two-col">
+        <!-- Product breakdown -->
+        <div class="inv-card">
+            <p class="inv-card-title"><i class="fa-solid fa-chart-bar"></i> ยอดขาย รายสินค้า</p>
+            <div class="inv-table-wrap">
+                <table class="inv-table" style="font-size:0.84rem;">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>สินค้า</th>
+                            <th style="text-align:right">จำนวน</th>
+                            <th style="text-align:right">มูลค่า</th>
+                            <th style="width:120px"></th>
+                        </tr>
+                    </thead>
+                    <tbody id="inv-dd-product-body">
+                        <tr><td colspan="5" class="inv-empty"><i class="fa-solid fa-spinner fa-spin"></i></td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Invoice history -->
+        <div class="inv-card">
+            <p class="inv-card-title"><i class="fa-solid fa-file-invoice"></i> รายการใบแจ้งหนี้</p>
+            <div class="inv-table-wrap">
+                <table class="inv-table" style="font-size:0.84rem;">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>วันที่</th>
+                            <th>เลขที่</th>
+                            <th style="text-align:right">มูลค่า</th>
+                            <th>สถานะ</th>
+                            <th>การชำระเงิน</th>
+                        </tr>
+                    </thead>
+                    <tbody id="inv-dd-invoice-body">
+                        <tr><td colspan="6" class="inv-empty"><i class="fa-solid fa-spinner fa-spin"></i></td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="inv-dd-pagination" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;"></div>
+        </div>
+    </div>
 </div>
 
 <!-- ========== BUILDER VIEW ========== -->
@@ -2723,8 +2989,11 @@ function invApi(method, path, body, cb) {
 }
 
 // ========= LIST VIEW =========
+var _invReturnTo = null;   // V.32.0: navigation stack for detail→builder→back
+var _invReturnDistId = 0;
+
 function invShow(view) {
-    ['inv-list-view','inv-builder-view'].forEach(function(id){
+    ['inv-list-view','inv-builder-view','inv-dist-detail-view'].forEach(function(id){
         var el = document.getElementById(id);
         if (el) { el.classList.remove('active'); }
     });
@@ -2767,7 +3036,7 @@ window.invLoadList = function(filter, page) {
                 '<td>' + ((invCurrentPage-1)*30 + i + 1) + '</td>' +
                 '<td>' + date + '</td>' +
                 '<td><span class="inv-num" onclick="invViewInvoice(' + inv.id + ')">' + escH(inv.inv_number) + '</span></td>' +
-                '<td>' + escH(inv.dist_name) + '</td>' +
+                '<td>' + (inv.dist_id ? '<a class="inv-dist-link" href="javascript:void(0)" onclick="invOpenDistDetail(' + inv.dist_id + ')">' + escH(inv.dist_name) + '</a>' : escH(inv.dist_name)) + '</td>' +
                 '<td style="text-align:right">' + invFmt(inv.total_amount) + '</td>' +
                 '<td><span class="inv-status ' + statusClass + '">' + statusText + '</span></td>' +
                 '<td><div class="inv-actions">' + invRowActions(inv) + '</div></td>' +
@@ -2893,6 +3162,14 @@ window.invOpenBuilder = function(id) {
 };
 
 window.invCloseBuilder = function() {
+    // V.32.0: Return to detail view if navigated from there
+    if (_invReturnTo === 'inv-dist-detail-view' && _invReturnDistId) {
+        var distId = _invReturnDistId;
+        _invReturnTo = null;
+        _invReturnDistId = 0;
+        invOpenDistDetail(distId);
+        return;
+    }
     invShow('inv-list-view');
     invLoadList();
 };
@@ -4027,6 +4304,149 @@ document.addEventListener('click', function(e) {
         if (dd) dd.style.display = 'none';
     }
 });
+
+// ========= DISTRIBUTOR DETAIL VIEW (V.32.0) =========
+var _invDDCurrentDistId = 0;
+
+window.invOpenDistDetail = function(distId) {
+    _invDDCurrentDistId = distId;
+    invShow('inv-dist-detail-view');
+
+    // Reset
+    document.getElementById('inv-dd-heading').textContent = 'กำลังโหลด...';
+    document.getElementById('inv-dd-shop-name').textContent = '-';
+    document.getElementById('inv-dd-phone').innerHTML = '<i class="fa-solid fa-phone" style="margin-right:4px;font-size:0.8rem;"></i> -';
+    document.getElementById('inv-dd-address').innerHTML = '<i class="fa-solid fa-location-dot" style="margin-right:4px;font-size:0.8rem;"></i> -';
+    document.getElementById('inv-dd-sales-month').textContent = '-';
+    document.getElementById('inv-dd-sales-year').textContent = '-';
+    document.getElementById('inv-dd-debt').textContent = '-';
+    document.getElementById('inv-dd-product-body').innerHTML = '<tr><td colspan="5" class="inv-empty"><i class="fa-solid fa-spinner fa-spin"></i></td></tr>';
+    document.getElementById('inv-dd-invoice-body').innerHTML = '<tr><td colspan="6" class="inv-empty"><i class="fa-solid fa-spinner fa-spin"></i></td></tr>';
+
+    invLoadDistDetail(distId, 1);
+};
+
+window.invCloseDistDetail = function() {
+    _invDDCurrentDistId = 0;
+    invShow('inv-list-view');
+    invLoadList();
+};
+
+function invLoadDistDetail(distId, page) {
+    invApi('GET', '/invoice/distributor-detail', {dist_id: distId, page: page}, function(err, data) {
+        if (err || !data || !data.success) { invToast('error', 'โหลดข้อมูลตัวแทนล้มเหลว'); return; }
+
+        var p = data.profile;
+        var rankLabels = {standard:'Standard',silver:'Silver',gold:'Gold',platinum:'Platinum',diamond:'Diamond'};
+
+        // Heading
+        document.getElementById('inv-dd-heading').textContent = 'รายละเอียดผู้ติดต่อ (รหัส: D' + String(p.id).padStart(4,'0') + ')';
+
+        // Profile
+        document.getElementById('inv-dd-shop-name').textContent = p.shop_name;
+        if (p.shop_logo_url) {
+            document.getElementById('inv-dd-avatar').innerHTML = '<img src="' + escH(p.shop_logo_url) + '" alt="">';
+        } else {
+            document.getElementById('inv-dd-avatar').innerHTML = '<i class="fa-solid fa-store"></i>';
+        }
+        var rankEl = document.getElementById('inv-dd-rank');
+        rankEl.textContent = rankLabels[p.rank_system] || p.rank_system;
+        rankEl.className = 'inv-dist-rank-badge ' + (p.rank_system || 'standard');
+
+        document.getElementById('inv-dd-phone').innerHTML = '<i class="fa-solid fa-phone" style="margin-right:4px;font-size:0.8rem;"></i> ' + escH(p.dist_phone || '-');
+        var addr = [p.dist_address, p.dist_district, p.dist_city, p.dist_province, p.dist_postcode].filter(Boolean).join(', ');
+        document.getElementById('inv-dd-address').innerHTML = '<i class="fa-solid fa-location-dot" style="margin-right:4px;font-size:0.8rem;"></i> ' + escH(addr || '-');
+
+        // Credit info
+        document.getElementById('inv-dd-credit-limit').textContent = '฿' + invFmt(p.credit_limit);
+        document.getElementById('inv-dd-term').textContent = p.credit_term_days + ' วัน';
+
+        var avail = p.credit_limit - p.current_debt;
+        var banner = document.getElementById('inv-dd-credit-banner');
+        var cls = avail > 10000 ? 'inv-credit-ok' : (avail > 0 ? 'inv-credit-warn' : 'inv-credit-danger');
+        banner.className = 'inv-credit-banner ' + cls;
+        banner.innerHTML = '<i class="fa-solid fa-credit-card"></i> เครดิตคงเหลือ ฿' + invFmt(avail) + ' / ฿' + invFmt(p.credit_limit);
+        banner.style.display = '';
+
+        // Summary cards
+        document.getElementById('inv-dd-sales-month').textContent = '฿' + invFmt(data.sales_this_month);
+        document.getElementById('inv-dd-sales-year').textContent = '฿' + invFmt(data.sales_this_year);
+        document.getElementById('inv-dd-debt').textContent = '฿' + invFmt(data.outstanding_debt);
+
+        // Product breakdown
+        invRenderDDProducts(data.product_breakdown);
+
+        // Invoice history
+        invRenderDDInvoices(data.invoices, data.invoice_page, data.invoice_pages);
+    });
+}
+
+function invRenderDDProducts(products) {
+    var tbody = document.getElementById('inv-dd-product-body');
+    if (!products || !products.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="inv-empty"><i class="fa-solid fa-box-open"></i> ยังไม่มีข้อมูลสินค้า</td></tr>';
+        return;
+    }
+    var maxVal = products[0].total_value || 1;
+    var rows = products.map(function(p, i) {
+        var pct = Math.round((p.total_value / maxVal) * 100);
+        return '<tr>' +
+            '<td>' + (i + 1) + '</td>' +
+            '<td><span style="font-size:0.78rem;color:#94a3b8;">' + escH(p.sku) + '</span><br>' + escH(p.description) + '</td>' +
+            '<td style="text-align:right">' + invFmt(p.total_qty) + '</td>' +
+            '<td style="text-align:right;font-weight:600;">฿' + invFmt(p.total_value) + '</td>' +
+            '<td><div class="inv-dd-bar-wrap"><div class="inv-dd-bar" style="width:' + pct + '%"></div><span class="inv-dd-bar-pct">' + pct + '%</span></div></td>' +
+            '</tr>';
+    }).join('');
+    tbody.innerHTML = rows;
+}
+
+function invRenderDDInvoices(invoices, page, pages) {
+    var tbody = document.getElementById('inv-dd-invoice-body');
+    if (!invoices || !invoices.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="inv-empty"><i class="fa-solid fa-file-invoice"></i> ยังไม่มีใบแจ้งหนี้</td></tr>';
+        document.getElementById('inv-dd-pagination').innerHTML = '';
+        return;
+    }
+    var statusLabel = {draft:'Draft', awaiting_payment:'รอชำระ', paid:'ชำระแล้ว', cancelled:'ยกเลิก', overdue:'เกินกำหนด'};
+    var rows = invoices.map(function(inv, i) {
+        var isPaid = inv.paid_amount > 0 && inv.paid_amount < inv.total_amount;
+        var statusClass = isPaid ? 'partial' : inv.status;
+        var statusText  = isPaid ? 'จ่ายบางส่วน' : (statusLabel[inv.status] || inv.status);
+        var date = inv.issue_date ? new Date(inv.issue_date).toLocaleDateString('th-TH', {day:'numeric',month:'short',year:'numeric'}) : '-';
+        var paymentText = inv.status === 'paid' ? 'ชำระครบ' : (inv.paid_amount > 0 ? 'จ่ายบางส่วน' : (inv.status === 'awaiting_payment' || inv.status === 'overdue' ? 'รอชำระ' : '-'));
+        var paymentColor = inv.status === 'paid' ? '#16a34a' : (inv.paid_amount > 0 ? '#92400e' : (inv.status === 'awaiting_payment' || inv.status === 'overdue' ? '#dc2626' : '#94a3b8'));
+        return '<tr>' +
+            '<td>' + ((page - 1) * 20 + i + 1) + '</td>' +
+            '<td>' + date + '</td>' +
+            '<td><span class="inv-num" onclick="invViewFromDetail(' + inv.id + ')">' + escH(inv.inv_number) + '</span></td>' +
+            '<td style="text-align:right">' + invFmt(inv.total_amount) + '</td>' +
+            '<td><span class="inv-status ' + statusClass + '">' + statusText + '</span></td>' +
+            '<td style="color:' + paymentColor + ';font-weight:600;font-size:0.82rem;">' + paymentText + '</td>' +
+            '</tr>';
+    }).join('');
+    tbody.innerHTML = rows;
+
+    // Pagination
+    var pEl = document.getElementById('inv-dd-pagination');
+    if (pages <= 1) { pEl.innerHTML = ''; return; }
+    var html = '';
+    for (var pg = 1; pg <= pages; pg++) {
+        html += '<button class="inv-btn ' + (pg === page ? 'inv-btn-primary' : 'inv-btn-secondary') + '" onclick="invDistDetailPage(' + pg + ')" style="padding:6px 12px;">' + pg + '</button>';
+    }
+    pEl.innerHTML = html;
+}
+
+window.invDistDetailPage = function(page) {
+    if (_invDDCurrentDistId) invLoadDistDetail(_invDDCurrentDistId, page);
+};
+
+// Navigate from detail view → builder, with return navigation
+window.invViewFromDetail = function(invoiceId) {
+    _invReturnTo = 'inv-dist-detail-view';
+    _invReturnDistId = _invDDCurrentDistId;
+    invOpenBuilder(invoiceId);
+};
 
 // ========= UTILS =========
 function invFmt(n) {

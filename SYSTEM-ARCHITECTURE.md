@@ -153,7 +153,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | Admin Dashboard | 4,437 | `[dinoco_admin_dashboard]` | Command center: KPIs, pipeline, AI inbox |
 | Global Inventory | 1,346 | `[dinoco_admin_inventory]` | Product catalog + SKU management |
 | Legacy Migration | 2,102 | `[dinoco_legacy_requests_ui]` | Old system data migration |
-| Manual Invoice | 3,817 | `[dinoco_manual_invoice]` | Invoice creation, slip upload, dunning |
+| Manual Invoice | ~4,400 | `[dinoco_manual_invoice]` | Invoice creation, slip upload, dunning, distributor detail view |
 | Manual Transfer | 236 | `[dinoco_admin_transfer]` | Admin force warranty transfer |
 | Service & Claims | 3,223 | `[dinoco_admin_claims]` | Claim ticket management |
 | User Management | 1,472 | `[dinoco_admin_users]` | User CRM + analytics |
@@ -312,7 +312,7 @@ Slip2Go API ตรวจ QR
 - `POST /github-sync-manual` — Manual sync trigger
 
 ### Invoice System (inside Manual Invoice)
-- 17 endpoints under `/invoice/` namespace
+- 18 endpoints under `/invoice/` namespace (V.32.0: added `/distributor-detail`)
 
 ---
 
