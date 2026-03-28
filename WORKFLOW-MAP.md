@@ -616,6 +616,9 @@ Print tab:
 47. **Product images full display** — เปลี่ยนจาก `object-fit: cover` เป็น `contain` แสดงรูปเต็มไม่ crop
 48. **PDPA ย้ายไปล่างสุด** — ไม่สำคัญเท่าข้อมูลอื่น ย้ายลงมาเป็น section สุดท้ายก่อน logout
 49. **Smart Save button** — ปุ่มบันทึกซ่อนไว้ แสดงเมื่อกดแก้ไข section ใดก็ตาม
+50. **Cover photo upload** — ปุ่ม "เปลี่ยนรูปปก" + client-side compression ≤500KB + ลบรูปเก่าจากเซิร์ฟเวอร์
+51. **Avatar circular fix** — force `border-radius: 50% !important` + `overflow: hidden` ที่ parent
+52. **Image compression** — ทั้ง avatar (500x500) และ cover (1200x600) ย่อ client-side ก่อน upload แล้วเซิร์ฟเวอร์ resize อีกรอบ
 
 ### หมายเหตุ
 - **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)

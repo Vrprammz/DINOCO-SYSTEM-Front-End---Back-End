@@ -318,6 +318,14 @@ This flag is the guard that prevents double-counting debt. Every debt reversal c
 | `_inv_paid_amount` | `b2b_order` | Actual amount paid (tracks 2% FIFO tolerance difference) |
 | `_debt_audit_log` | `distributor` | Array of last 200 debt mutations (action, amount, old/new debt, reason) |
 
+### 3.6 User meta fields (V.32.1 — Edit Profile)
+
+| Meta Key | Purpose |
+|----------|---------|
+| `user_cover_photo` | URL ของรูปปก (cover photo) ที่ user upload เอง |
+| `user_moto_image` | URL ของรูปรถมอเตอร์ไซค์ |
+| `line_picture_url` | URL ของรูป avatar (จาก LINE หรือ user upload) |
+
 | State | Meaning |
 |-------|---------|
 | `false` (default) | Order total NOT in distributor debt |
