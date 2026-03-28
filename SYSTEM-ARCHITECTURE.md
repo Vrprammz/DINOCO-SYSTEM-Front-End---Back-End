@@ -141,7 +141,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | **Snippet 10**: Invoice Image | 1,040 | — | GD-based invoice PNG generation |
 | **Snippet 11**: Customer LIFF | 947 | 4 shortcodes | Orders, account, commands LIFF pages |
 | **Snippet 12**: Admin LIFF | 1,988 | 3 shortcodes | Dashboard, stock manager, tracking entry LIFF |
-| **Snippet 13**: Debt Transaction | ~120 | — | Atomic MySQL transactions for debt operations (FOR UPDATE lock) |
+| **Snippet 13**: Debt Transaction | ~200 | — | Atomic MySQL transactions for debt (FOR UPDATE lock), `b2b_financial_lock()`, audit log, ACF cache sync |
 | **Snippet 14**: Order State Machine | ~180 | — | FSM class: validates transitions + actor permissions |
 | **Snippet 15**: Custom Tables & JWT | ~300 | — | Custom `dinoco_products` table + HMAC JWT session tokens |
 
@@ -171,10 +171,10 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | Dashboard Header | 1,450 | — | Header + registration forms |
 | Dashboard Assets | 2,160 | — | Product inventory list |
 | Claim System | 1,858 | `[dinoco_claim_page]` | Warranty claim submission |
-| Edit Profile | 354 | `[dinoco_edit_profile]` | Profile editing |
+| Edit Profile | 550 | `[dinoco_edit_profile]` | Profile hub: stats, PDPA, product timeline, moto photo, edit form |
 | Transfer Warranty | 2,192 | `[dinoco_transfer_v3]` | Ownership transfer |
 | Legacy Migration | 896 | — | Legacy data processing |
-| Global App Menu | 690 | — | Bottom navigation + QR scanner |
+| Global App Menu | 730 | — | Bottom nav + QR scanner + design tokens + toast/confirm |
 | Custom Header | 10 | — | Header styling |
 | Author Profile | 18 | — | Profile display |
 
@@ -310,6 +310,7 @@ Slip2Go API ตรวจ QR
 ### Admin System (`/wp-json/dinoco/v1/`)
 - `POST /github-sync` — GitHub webhook (HMAC verified)
 - `POST /github-sync-manual` — Manual sync trigger
+- `GET /sync-status` — Live sync progress (is_syncing, progress, current_file)
 
 ### Invoice System (inside Manual Invoice)
 - 18 endpoints under `/invoice/` namespace (V.32.0: added `/distributor-detail`)
@@ -680,7 +681,16 @@ Updated monthly by `b2b_rank_update_event` cron.
 
 ## Deployment
 
-Code lives in GitHub → pushed via webhook → `[AdminSystem-System] GitHub Webhook Sync` pulls to WordPress `wp_snippets` table → Code Snippets plugin executes.
+Code lives in GitHub → pushed via webhook → `[AdminSystem-System] GitHub Webhook Sync` (V.34.1) pulls to WordPress `wp_snippets` table → Code Snippets plugin executes.
+
+**Sync Engine (V.34.1):**
+- Single-pass sync in shutdown hook (no cron dependency)
+- DB_ID matching primary, normalized name fallback
+- Hash comparison (md5) before update — skip if identical
+- Post-verify: read-back hash after write
+- GitHub Contents API primary (no CDN cache)
+- Live progress bar via `/sync-status` polling (3s)
+- Auto-detect webhook-already-synced
 
 **No build step.** No Node.js. No framework. Pure PHP + vanilla JS.
 

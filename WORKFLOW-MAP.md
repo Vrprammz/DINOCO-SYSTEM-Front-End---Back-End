@@ -598,6 +598,17 @@ Print tab:
 33. **Schedule dunning ที่ 09:00 ICT** — แก้ bug schedule ผิดเวลา (เคย schedule ตอน snippet load)
 34. **Admin Flex แสดง INV-DNC-XXXXX** — ไม่แสดง Ticket # สำหรับ manual invoices
 
+### Profile Redesign (commit 841b864–6991790)
+35. **Edit Profile redesign** — premium app-style: dark hero header + avatar + stats grid
+36. **Member Stats** — จำนวนสินค้า, เคลม, โอนสิทธิ์, อายุสมาชิก (query real data)
+37. **PDPA & Consent card** — สถานะ PDPA, timestamp, analytics/marketing consent, segment
+38. **Product Timeline** — ไทม์ไลน์การติดตั้งสินค้า DINOCO เรียงตามวันที่ลงทะเบียน พร้อมรูป + สถานะ
+39. **Moto Photo** — อัพรูปรถ + แสดงในหน้า Profile
+40. **Splash screen logo ขาว** — แก้ทุกหน้า (4 files) ให้ใช้ dark overlay + logofullwhite.webp
+41. **FontAwesome preload** — ย้ายจาก wp_footer ไป wp_head (แก้ icon หาย)
+42. **SCAN icon** — เปลี่ยน fa-expand → fa-qrcode
+43. **Claim System async fix** — เพิ่ม async ให้ dnc_do_submit() (แก้ SyntaxError)
+
 ### หมายเหตุ
 - **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)
 - **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)
