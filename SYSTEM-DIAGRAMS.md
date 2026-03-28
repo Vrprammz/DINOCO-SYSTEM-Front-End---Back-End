@@ -18,6 +18,9 @@
 10. [Data Flow Between Files](#10-data-flow-between-files)
 11. [Cron Job Dependencies](#11-cron-job-dependencies)
 12. [LINE Message Flow](#12-line-message-flow)
+13. [Finance Dashboard Flow](#13-finance-dashboard-flow)
+14. [Brand Voice Pool Flow](#14-brand-voice-pool-flow)
+15. [AI Analysis Flow (Finance)](#15-ai-analysis-flow-finance)
 
 ---
 
@@ -767,6 +770,139 @@ sequenceDiagram
     end
 
     Note over CORE,LP: b2b_push_guaranteed:<br/>If push fails, stores in _pending_flex<br/>Cron retries every 1 minute
+```
+
+---
+
+## 13. Finance Dashboard Flow
+
+```mermaid
+flowchart TB
+    ADMIN["Admin เปิด tab การเงิน"] --> LOAD["PHP render shortcode<br/>[dinoco_admin_finance]"]
+
+    LOAD --> KPI["AJAX: dinoco_finance_data<br/>ดึง KPI 10 กล่อง + charts"]
+    KPI --> RENDER["Render UI:<br/>KPI Cards, Debt Aging,<br/>Revenue Trend, Churn Warning,<br/>Pipeline, Rank Revenue,<br/>ตารางตัวแทน"]
+
+    RENDER --> MAP["SVG Map 77 จังหวัด<br/>+ Region Tabs + Markers"]
+    MAP --> PROVINCE["Province Coverage Grid<br/>+ Recommendations (7 ระดับ)"]
+
+    PROVINCE --> AI_BTN["กดปุ่ม 'วิเคราะห์ AI'"]
+
+    AI_BTN --> CACHE{Cache<br/>dinoco_ai_fin_v316?}
+    CACHE -->|Hit| SHOW_AI["แสดงผล AI จาก cache"]
+    CACHE -->|Miss| CALL_AI["AJAX: dinoco_finance_ai"]
+
+    CALL_AI --> PROMPT["สร้าง prompt กระชับ<br/>(KPI + debt + revenue +<br/>BigWing 22 สาขา + distributors)"]
+    PROMPT --> CLAUDE["DINOCO_AI → Claude Sonnet 4<br/>max_tokens 8192, timeout 90s"]
+    CLAUDE --> JSON["Parse JSON response<br/>6 sections"]
+    JSON --> SAVE["Save cache 1 ชม."]
+    SAVE --> SHOW_AI
+
+    SHOW_AI --> SECTIONS["แสดง 6 sections:<br/>Overview | Expansion | Risks<br/>Strategy | Competitors | Brand Sentiment"]
+
+    subgraph MAP_DETAIL["SVG Map Detail"]
+        M1["Markers: วงกลมเขียว = DINOCO"]
+        M2["Markers: สี่เหลี่ยมน้ำเงิน = BigWing"]
+        M3["Tooltip: จังหวัด + ตัวแทน + ศักยภาพ"]
+        M4["Region Tabs: 7 ภาค + ทั้งประเทศ"]
+        M5["Fullscreen mode"]
+    end
+
+    MAP -.-> MAP_DETAIL
+
+    style CLAUDE fill:#7c3aed,color:#fff
+    style SHOW_AI fill:#16a34a,color:#fff
+    style MAP fill:#2563eb,color:#fff
+```
+
+---
+
+## 14. Brand Voice Pool Flow
+
+```mermaid
+flowchart TB
+    ADMIN["Admin เปิด tab Brand Voice"] --> TABS{เลือก Tab}
+
+    TABS -->|Tab 1: Dashboard| DASH
+    TABS -->|Tab 2: เสียงลูกค้า| LIST
+    TABS -->|Tab 3: เพิ่ม Manual| FORM
+
+    subgraph DASH["Dashboard Tab"]
+        D1["KPI 4 กล่อง:<br/>เสียงทั้งหมด | บวก% | ลบ% | แบรนด์"]
+        D2["ตารางเปรียบเทียบ 6 แบรนด์<br/>(DINOCO highlight สีเขียว)"]
+        D3["Donut: แหล่งที่มา<br/>(Facebook/YouTube/TikTok)"]
+        D4["Bar chart: top 8 หมวด"]
+        D5["แหล่งที่ติดตาม<br/>(bv_tracked_sources)"]
+        D1 --> D2 --> D3 --> D4
+    end
+
+    subgraph LIST["เสียงลูกค้า Tab"]
+        L1["ตาราง entries<br/>วันที่ | แบรนด์ | สรุป | sentiment | platform"]
+        L2["Filter: แบรนด์ / sentiment /<br/>platform / search"]
+        L3["Click expand → ข้อความเต็ม + tags"]
+        L4["Row เชิงลบ = highlight สีแดง"]
+        L1 --> L2 --> L3
+    end
+
+    subgraph FORM["เพิ่ม Manual Tab"]
+        F1["Form: แบรนด์ / รุ่นรถ / platform /<br/>sentiment / categories / ข้อความ"]
+        F2["Auto-detect platform จาก URL"]
+        F3["Batch mode (ค้าง brand/model)"]
+        F1 --> F2 --> F3
+    end
+
+    D5 --> AI_BTN["กดปุ่ม 'AI รวบรวมเสียงลูกค้า'"]
+
+    AI_BTN --> BV_CACHE{Cache<br/>bv_last_ai_collect<br/>6 ชม.?}
+    BV_CACHE -->|Hit| SHOW_CACHED["แสดง entries จาก cache"]
+    BV_CACHE -->|Miss| AI_CALL["เรียก Claude"]
+
+    AI_CALL --> AI_PROMPT["Prompt: tracked sources +<br/>6 แบรนด์ + 9 categories"]
+    AI_PROMPT --> CLAUDE["DINOCO_AI → Claude<br/>สร้าง 10 entries"]
+    CLAUDE --> SAVE_CPT["บันทึก brand_voice CPT<br/>bv_entry_method = 'ai_generated'"]
+    SAVE_CPT --> SAVE_CACHE["Save cache 6 ชม."]
+    SAVE_CACHE --> SHOW_CACHED
+
+    style CLAUDE fill:#7c3aed,color:#fff
+    style DASH fill:#f0fdf4,color:#000
+    style LIST fill:#eff6ff,color:#000
+    style FORM fill:#fefce8,color:#000
+```
+
+---
+
+## 15. AI Analysis Flow (Finance)
+
+```mermaid
+sequenceDiagram
+    participant A as Admin (Browser)
+    participant WP as WordPress (AJAX)
+    participant AI as DINOCO_AI Class
+    participant C as Claude API
+
+    A->>WP: กดปุ่ม "วิเคราะห์ AI"<br/>AJAX: dinoco_finance_ai
+
+    WP->>WP: เช็ค transient cache<br/>(dinoco_ai_fin_v316)
+
+    alt Cache Hit
+        WP-->>A: Return cached JSON
+    else Cache Miss
+        WP->>WP: รวบรวมข้อมูลการเงิน<br/>(KPI, debt aging, revenue,<br/>distributors, BigWing 22 สาขา)
+
+        WP->>AI: DINOCO_AI::chat()<br/>provider: claude
+
+        AI->>C: POST /v1/messages<br/>model: claude-sonnet-4<br/>max_tokens: 8192<br/>temperature: 0.35
+
+        C-->>AI: JSON response<br/>(6 sections)
+
+        AI-->>WP: Parsed JSON
+
+        WP->>WP: Save transient 1 ชม.
+
+        WP-->>A: Return JSON
+    end
+
+    A->>A: Render 6 cards:<br/>Overview | Expansion | Risks<br/>Strategy | Competitors | Brand Sentiment
 ```
 
 ---

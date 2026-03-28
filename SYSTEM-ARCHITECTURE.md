@@ -40,9 +40,9 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
      └───────┬──────┘ └─────┬──────┘ └─────┬──────────┘
              │               │               │
      ┌───────┴──────┐ ┌─────┴──────┐ ┌─────┴──────────┐
-     │ LINE LIFF    │ │ RPi Print  │ │ Google Gemini  │
-     │ (Web Apps)   │ │ Server     │ │ AI (v22)       │
-     └──────────────┘ └────────────┘ └────────────────┘
+     │ LINE LIFF    │ │ RPi Print  │ │ AI Providers     │
+     │ (Web Apps)   │ │ Server     │ │ Gemini/Claude/GPT│
+     └──────────────┘ └────────────┘ └──────────────────┘
 ```
 
 ---
@@ -59,6 +59,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | `distributor` | B2B distributor/shop | `shop_name`, `line_group_id`, `credit_limit`, `current_debt`, `bot_enabled` |
 | `ai_knowledge` | AI knowledge base entries | `training_phrases`, `core_facts`, `ai_action` |
 | `product_bundle` | Product bundle recipes | Bundle children references |
+| `brand_voice` | เสียงลูกค้า (Brand Voice Pool) | `bv_brands`, `bv_content`, `bv_summary`, `bv_sentiment`, `bv_intensity`, `bv_categories`, `bv_platform`, `bv_entry_method` |
 
 ---
 
@@ -103,6 +104,8 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | Constant | Purpose |
 |----------|---------|
 | `DINOCO_GEMINI_KEY` | Google Gemini API key |
+| `DINOCO_ANTHROPIC_KEY` | Anthropic Claude API key (Finance AI, Brand Voice AI) |
+| `DINOCO_OPENAI_KEY` | OpenAI API key (สำรอง) |
 | `DINOCO_GITHUB_WEBHOOK_SECRET` | GitHub sync HMAC secret |
 | `DINOCO_GITHUB_TOKEN` | GitHub API token |
 | `DINOCO_GITHUB_REPO` | Repository path |
@@ -119,6 +122,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | **Flash Express** | Shipping: create, cancel, track | HMAC-SHA256 signature |
 | **Slip2Go** | Bank slip verification (OCR) | Secret key header |
 | **Google Gemini** | AI chatbot with function calling | API key |
+| **Anthropic Claude** | Finance AI analysis + Brand Voice AI Collect | API key (Bearer) |
 | **GitHub API** | Code sync from repository | Personal access token |
 
 ---
@@ -146,12 +150,14 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | **Snippet 15**: Custom Tables & JWT | ~608 | — | Custom `dinoco_products` + `dinoco_moto_brands` + `dinoco_moto_models` tables, HMAC JWT, DINOCO_MotoDB class |
 | **Moto Manager** (Admin) | ~536 | `[dinoco_admin_moto]` | Admin CRUD UI for motorcycle brands/models/images/aliases |
 
-### Admin System (11 files + 1 abstraction layer)
+### Admin System (13 files + 1 abstraction layer)
 
 | File | Lines | Shortcode | Purpose |
 |------|-------|-----------|---------|
 | AI Control Module | 3,157 | `[dinoco_admin_ai_control]` | Gemini v22 AI chatbot with function calling |
 | Admin Dashboard | 4,437 | `[dinoco_admin_dashboard]` | Command center: KPIs, pipeline, AI inbox |
+| **Finance Dashboard** | ~2,500 | `[dinoco_admin_finance]` | KPI 10 กล่อง, Debt Aging, Revenue Trend, SVG Map 77 จังหวัด, AI วิเคราะห์ (Claude), Honda BigWing context (V.3.16) |
+| **Brand Voice Pool** | ~1,200 | `[dinoco_brand_voice]` | เก็บเสียงลูกค้า 6 แบรนด์, AI Collect, sentiment comparison, 3 tabs (V.1.5) |
 | Global Inventory | 1,346 | `[dinoco_admin_inventory]` | Product catalog + SKU management |
 | Legacy Migration | 2,102 | `[dinoco_legacy_requests_ui]` | Old system data migration |
 | Manual Invoice | ~4,400 | `[dinoco_manual_invoice]` | Invoice creation, slip upload, dunning, distributor detail view |
@@ -160,7 +166,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | User Management | 1,472 | `[dinoco_admin_users]` | User CRM + analytics |
 | KB Trainer | 471 | WP Admin menu | AI knowledge base trainer |
 | GitHub Sync | 1,179 | — | Code deployment from GitHub |
-| AI Provider Abstraction | ~250 | — | Swap Gemini/GPT/Claude via config constant |
+| AI Provider Abstraction | ~250 | — | DINOCO_AI class — swap Claude/Gemini/OpenAI via config constant |
 
 ### System / Member-facing (12 files)
 
@@ -381,6 +387,74 @@ Updated monthly by `b2b_rank_update_event` cron.
 8. **Rate Limiting** — Transient-based cooldown on forms
 9. **Slip Dedup** — Transaction ref + md5 key prevents double-use
 10. **Advisory Locks** — Transient locks on all state-changing actions
+
+---
+
+## Finance Dashboard Module (V.3.16)
+
+**Shortcode:** `[dinoco_admin_finance]` | **DB_ID:** 1158
+
+แสดงเป็น tab "การเงิน" ใน Admin Dashboard (sidebar section B2B System)
+
+### AJAX Endpoints
+| Action | Purpose |
+|--------|---------|
+| `dinoco_finance_data` | ดึง KPI ทั้ง 10 กล่อง + chart data + ตารางทั้งหมด |
+| `dinoco_finance_ai` | เรียก Claude วิเคราะห์ 6 sections (cache 1 ชม. via `dinoco_ai_fin_v316` transient) |
+
+### AI Integration
+- ใช้ `DINOCO_AI` class (AI Provider Abstraction, DB_ID: 1040) → Claude Sonnet 4
+- **ไม่โหลดอัตโนมัติ** — กดปุ่มวิเคราะห์เอง (ประหยัด token)
+- Prompt ลด 70% ใน V.3.16 — JSON schema กระชับ, max_tokens 8192, timeout 90s
+- Output 6 sections: Overview, Expansion, Risks, Strategy, Competitors, Brand Sentiment
+
+### SVG Map System
+- `thailand-provinces.svg` — SVG แผนที่ 77 จังหวัดจริง (จาก GeoJSON)
+- Region Tabs — zoom ดูแยก 7 ภาค + ทั้งประเทศ
+- Markers: วงกลมเขียว = DINOCO distributor, สี่เหลี่ยมน้ำเงิน = Honda BigWing
+- Tooltip hover — จังหวัด, ตัวแทน, BigWing, ศักยภาพ BigBike
+- Fullscreen mode
+
+### Honda BigWing Data
+- 22 สาขา ใน 18 จังหวัด (hardcoded จาก thaihonda.co.th)
+- ใช้เป็น context ใน AI prompt + แสดง markers บนแผนที่
+- `dinoco_get_bigwing_data()` function
+
+---
+
+## Brand Voice Pool Module (V.1.5)
+
+**Shortcode:** `[dinoco_brand_voice]` | **DB_ID:** 1159
+
+แสดงเป็น tab "Brand Voice" ใน Admin Dashboard (sidebar section Marketing)
+
+### 3 Tabs
+1. **Dashboard** — KPI 4 กล่อง, เปรียบเทียบ 6 แบรนด์, Donut chart แหล่งที่มา, Bar chart top 8 หมวด
+2. **เสียงลูกค้า** — ตาราง entries + filter (แบรนด์/sentiment/platform/search) + expand detail
+3. **เพิ่ม Manual** — Form กรอกเสียงลูกค้าจริง + auto-detect platform + batch mode
+
+### AI Collect
+- กดปุ่ม → Claude สร้าง 10 entries จาก knowledge
+- Cache 6 ชม. (`bv_last_ai_collect` transient) — กด "รวบรวมใหม่" bypass cache
+- entries มี `bv_entry_method = 'ai_generated'`
+- ใช้กลุ่มที่แอดมินระบุ (`bv_tracked_sources` wp_option) + AI หาเพิ่มเอง
+
+### แบรนด์ 6 ราย
+DINOCO, SRC (Sriracha), F2MOTO, BMMOTO, MOTOSkill, H2C (Honda 2 wheelers Customization)
+
+---
+
+## AI Provider Abstraction (DB_ID: 1040)
+
+`DINOCO_AI` class — wrapper สำหรับสลับ AI provider ได้จาก config constant
+
+| Provider | Model | ใช้ที่ไหน |
+|----------|-------|----------|
+| **Claude** (Anthropic) | claude-sonnet-4-20250514 | Finance Dashboard AI, Brand Voice AI Collect |
+| **Gemini** (Google) | gemini-2.0-flash | AI Control chatbot (function calling) |
+| **OpenAI** (GPT) | gpt-4o | สำรอง (ยังไม่ใช้ production) |
+
+Methods: `chat()`, `stream()` — รับ messages array + options → return response text/JSON
 
 ---
 

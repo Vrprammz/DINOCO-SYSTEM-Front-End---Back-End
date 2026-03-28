@@ -141,7 +141,25 @@ erDiagram
     product_bundle }o--|| wp_users : "owned by bundle_owner"
     wp_options_catalog ||--o{ product_bundle : "sku_relations defines SET recipes"
     legacy_request }o--|| wp_users : "submitted by member"
+    brand_voice {
+        bigint ID PK
+        array bv_brands "แบรนด์ที่พูดถึง (multi)"
+        text bv_content "ข้อความเต็ม"
+        text bv_summary "สรุป 1 บรรทัด"
+        string bv_sentiment "positive|neutral|negative|mixed"
+        int bv_intensity "1-5 ความรุนแรง"
+        array bv_categories "quality|price|design|fitment|service|shipping|warranty|availability|comparison"
+        string bv_platform "facebook_group|youtube|tiktok|other"
+        string bv_source_url "ลิงก์ต้นทาง"
+        string bv_source_name "ชื่อกลุ่ม/ช่อง"
+        date bv_post_date "วันที่โพสต์"
+        array bv_models "รุ่นรถ (CB650R, Rebel 500...)"
+        string bv_entry_method "manual|ai_generated"
+        array bv_tags "tags อิสระ"
+    }
+
     ai_knowledge ||--|| ai_knowledge : "standalone KB entries"
+    brand_voice }o--o{ brand_voice : "compare brands across entries"
 ```
 
 ---
@@ -230,7 +248,18 @@ erDiagram
 | **Read by** | Admin Legacy Migration dashboard, Admin Dashboard (pending count) |
 | **Deletion** | Never deleted |
 
-### 2.8 ai_knowledge (AI Knowledge Base)
+### 2.8 brand_voice (Brand Voice Pool — เสียงลูกค้า)
+
+| Phase | Details |
+|-------|---------|
+| **Created by** | Admin via Brand Voice Pool tab (manual form) หรือ AI Collect (กดปุ่ม "AI รวบรวมเสียงลูกค้า") |
+| **Trigger** | Admin กรอกข้อมูลเสียงลูกค้าจริง หรือ กด AI ให้สร้าง 10 entries จาก knowledge |
+| **Initial state** | `bv_entry_method = 'manual'` (กรอกเอง) หรือ `'ai_generated'` (AI สร้าง) |
+| **Data** | แบรนด์ 6 ราย (DINOCO, SRC, F2MOTO, BMMOTO, MOTOSkill, H2C), sentiment 4 ระดับ, categories 9 หมวด, platform 4 แหล่ง |
+| **Read by** | Brand Voice Dashboard (KPI, เปรียบเทียบแบรนด์, charts), Finance Dashboard AI (Brand Sentiment section) |
+| **Deletion** | Admin สามารถลบ entries ได้ |
+
+### 2.9 ai_knowledge (AI Knowledge Base)
 
 | Phase | Details |
 |-------|---------|
@@ -278,7 +307,31 @@ Format: { "SET-PARENT-SKU": ["CHILD-SKU-1", "CHILD-SKU-2", ...], ... }
 | **Legacy Migration** | Expand SET SKUs during legacy import |
 | **B2B Core Utilities** | `b2b_calculate_total_boxes()` resolves SET -> children for shipping box count |
 
-### 3.3 current_debt (distributor post meta)
+### 3.3 bv_tracked_sources (wp_options — Brand Voice)
+
+```
+wp_options key: 'bv_tracked_sources'
+Format: Text (newline-separated) — แอดมินระบุกลุ่ม/ช่องที่ต้องการติดตาม
+Example:
+  Facebook: Honda CB650R Thailand
+  Facebook: Rebel 500 Club TH
+  YouTube: MotoReview TH
+  TikTok: #HondaBigBike
+```
+
+| Consumer | Usage |
+|----------|-------|
+| **Brand Voice Dashboard** | แสดงรายชื่อแหล่งที่ติดตาม + ให้ edit |
+| **AI Collect** | ส่งให้ Claude เป็น context เพื่อสร้าง entries ที่ตรงกลุ่มเป้าหมาย |
+
+### 3.4 Transients (Cache — Finance + Brand Voice)
+
+| Transient Key | TTL | Purpose |
+|---------------|-----|---------|
+| `dinoco_ai_fin_v316` | 1 ชม. | Cache ผลวิเคราะห์ AI ของ Finance Dashboard (6 sections JSON) |
+| `bv_last_ai_collect` | 6 ชม. | Cache entries ล่าสุดจาก AI Collect ของ Brand Voice |
+
+### 3.5 current_debt (distributor post meta)
 
 ```
 Field: 'current_debt' on distributor CPT
@@ -301,7 +354,7 @@ Type: float (running balance in Baht)
 
 See full trace in Section 4 below.
 
-### 3.4 is_billed (b2b_order post meta)
+### 3.6 is_billed (b2b_order post meta)
 
 ```
 Field: 'is_billed' on b2b_order CPT
@@ -310,7 +363,7 @@ Type: boolean — whether this order's total has been added to distributor debt
 
 This flag is the guard that prevents double-counting debt. Every debt reversal checks `is_billed` before subtracting.
 
-### 3.5 New meta fields (V.31.0)
+### 3.7 New meta fields (V.31.0)
 
 | Meta Key | On CPT | Purpose |
 |----------|--------|---------|
@@ -318,7 +371,7 @@ This flag is the guard that prevents double-counting debt. Every debt reversal c
 | `_inv_paid_amount` | `b2b_order` | Actual amount paid (tracks 2% FIFO tolerance difference) |
 | `_debt_audit_log` | `distributor` | Array of last 200 debt mutations (action, amount, old/new debt, reason) |
 
-### 3.6 User meta fields (V.32.1 — Edit Profile)
+### 3.8 User meta fields (V.32.1 — Edit Profile)
 
 | Meta Key | Purpose |
 |----------|---------|
@@ -326,7 +379,7 @@ This flag is the guard that prevents double-counting debt. Every debt reversal c
 | `user_moto_image` | URL ของรูปรถมอเตอร์ไซค์ |
 | `line_picture_url` | URL ของรูป avatar (จาก LINE หรือ user upload) |
 
-### 3.7 Motorcycle Catalog Tables (V.2.0 — Snippet 15)
+### 3.9 Motorcycle Catalog Tables (V.2.0 — Snippet 15)
 
 **Table: `wp_dinoco_moto_brands`**
 | Column | Type | Purpose |
@@ -350,7 +403,7 @@ This flag is the guard that prevents double-counting debt. Every debt reversal c
 
 **Seeded data:** 13 brands, 16 Honda models, 3 Yamaha models, Thai aliases
 
-### 3.8 Mileage Rank System (V.34.x — Edit Profile)
+### 3.10 Mileage Rank System (V.34.x — Edit Profile)
 
 Rank คำนวณจาก **Total Mileage = Loyalty + Product Bonus** (ไม่มี activity bonus)
 

@@ -18,6 +18,8 @@
 9. [Admin: Process New Order](#9-admin-process-new-order)
 10. [Admin: Create Manual Invoice](#10-admin-create-manual-invoice)
 11. [Admin: Handle Claim](#11-admin-handle-claim)
+12. [Admin: Finance Dashboard + AI วิเคราะห์](#12-admin-finance-dashboard--ai-วิเคราะห์)
+13. [Admin: Brand Voice Pool](#13-admin-brand-voice-pool)
 
 ---
 
@@ -487,6 +489,87 @@ Parts request path:
 
 ---
 
+## 12. Admin: Finance Dashboard + AI วิเคราะห์
+
+**Who:** Admin (ผู้บริหาร / แอดมินบัญชี)
+**Trigger:** เปิด tab "การเงิน" ใน Admin Dashboard
+**Source files:** `[Admin System] DINOCO Admin Finance Dashboard` (DB_ID: 1158), `[Admin System] AI Provider Abstraction` (DB_ID: 1040)
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 12.1 | เปิด Admin Dashboard → กด tab "การเงิน" | Sidebar menu section B2B System → "การเงิน" | Shortcode `[dinoco_admin_finance]` render หน้า Finance Dashboard |
+| 12.2 | (Auto) หน้าโหลด KPI + charts | 10 KPI Cards (หนี้ 5 + รายได้ 5) | AJAX `dinoco_finance_data` ดึงข้อมูลจาก distributor + b2b_order CPT — แสดง Debt Aging, Revenue Trend, Churn Warning, Pipeline, Rank Revenue, ตารางตัวแทน |
+| 12.3 | เลื่อนดู KPI Cards | Row 1: หนี้ค้าง, Overdue, รอชำระ, Credit Hold, อัตราเก็บหนี้% | Row 2: รายได้วันนี้, เดือนนี้ (MoM%), ปีนี้, เก็บเงินได้, AOV |
+| 12.4 | ดู Debt Aging + ตัวแทนหนี้สูงสุด | Bar chart 4 buckets (1-7, 8-30, 31-60, 60+) + ตาราง Top 15 | ตารางแสดง: ชื่อร้าน, Rank, ยอดหนี้, วงเงิน (%), สถานะ |
+| 12.5 | ดู Revenue Trend + การชำระ | Area chart 6 เดือน + ตาราง 10 รายการล่าสุด | แสดงแนวโน้มรายได้ + slip payment ล่าสุด |
+| 12.6 | ดูตัวแทนเงียบ (Churn Warning) | ตาราง distributors ไม่สั่ง > 30 วัน | แสดง: ร้าน, วันที่สั่งล่าสุด, จำนวนวันห่าง |
+| 12.7 | ดูตารางรายได้ตัวแทน (Full Width) | ตาราง + search | แสดง: ร้าน, จังหวัด, Rank, ยอดเดือน, ยอดสะสมปี, หนี้ค้าง, สถานะ |
+| 12.8 | ดูแผนที่เครือข่าย SVG Map | SVG map 77 จังหวัด + Region Tabs | Hover tooltip: จังหวัด, ตัวแทน, BigWing, ศักยภาพ BigBike. Markers: เขียว=DINOCO, น้ำเงิน=BigWing |
+| 12.9 | กดเลือกภาค | Region tab buttons (7 ภาค + ทั้งประเทศ) | Map zoom เข้าภาคที่เลือก + Stats panel แสดงสรุปภาค |
+| 12.10 | กด Fullscreen | ปุ่มขยายเต็มจอ | แผนที่ขยายเต็มหน้าจอ |
+| 12.11 | ดู Province Coverage + คำแนะนำ | Province grid 77 จังหวัด (สีเขียว/แดง) | แสดง 7 ระดับ: critical, underperform, warning, expand, opportunity, star, future — ใช้ข้อมูลจริง (MTD, จำนวนตัวแทน, เกณฑ์ 20K) |
+| 12.12 | กดปุ่ม "วิเคราะห์ AI" | ปุ่ม AI (ไม่โหลดอัตโนมัติ) | เช็ค cache `dinoco_ai_fin_v316` (1 ชม.) — ถ้า hit แสดงจาก cache, ถ้า miss เรียก Claude |
+| 12.13 | (System) AI processing | Loading spinner "กำลังวิเคราะห์..." | AJAX `dinoco_finance_ai` → DINOCO_AI → Claude Sonnet 4 (max_tokens 8192, timeout 90s) → JSON 6 sections |
+| 12.14 | ดูผล AI 6 sections | 6 cards แสดงผล | Overview (Score 0-100), Expansion (จังหวัดควรขยาย + BigWing note), Risks (ตัวแทนเสี่ยง + severity + action), Strategy (short/long-term + ROI), Competitors (SRC, F2MOTO, BMMOTO, MOTOSkill, H2C), Brand Sentiment (อันดับ 6 แบรนด์) |
+
+### Decision points
+
+- **Cache hit:** แสดงผลทันทีจาก transient — ไม่เสีย AI token
+- **Cache miss + AI timeout:** แสดง error "วิเคราะห์ไม่สำเร็จ กรุณาลองใหม่" — timeout 90s
+- **ไม่มี API key:** แสดง warning "ไม่พบ API Key" + debug info
+
+### Where can the user get stuck
+
+- **AI timeout:** Prompt ใหญ่เกินอาจ timeout — V.3.16 ลด prompt 70% แก้ปัญหานี้
+- **ข้อมูล AI = ประมาณการ:** Brand Sentiment section ใช้ AI knowledge ไม่ใช่ข้อมูลจริงจาก Brand Voice (Backlog: เชื่อมข้อมูลจริง)
+- **SVG map ไม่โหลด:** ต้องอัพโหลด `thailand-provinces.svg` ไปที่ server ก่อน
+
+---
+
+## 13. Admin: Brand Voice Pool
+
+**Who:** Admin (ฝ่าย Marketing / ผู้บริหาร)
+**Trigger:** เปิด tab "Brand Voice" ใน Admin Dashboard
+**Source files:** `[Admin System] DINOCO Brand Voice Pool` (DB_ID: 1159), `[Admin System] AI Provider Abstraction` (DB_ID: 1040)
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 13.1 | เปิด Admin Dashboard → กด tab "Brand Voice" | Sidebar menu section Marketing → "Brand Voice" | Shortcode `[dinoco_brand_voice]` render หน้า Brand Voice Pool |
+| 13.2 | (Auto) Dashboard tab โหลด | Tab 1: Dashboard (default) | แสดง KPI 4 กล่อง: เสียงทั้งหมด, เชิงบวก%, เชิงลบ%, แบรนด์ที่ติดตาม |
+| 13.3 | ดูเปรียบเทียบแบรนด์ | ตาราง 6 แบรนด์ + sentiment bar | DINOCO highlight สีเขียว — แสดงจำนวนเสียง + % positive/negative ต่อแบรนด์ |
+| 13.4 | ดู charts | Donut: แหล่งที่มา + Bar: top 8 หมวด | Donut = Facebook/YouTube/TikTok split, Bar = quality/price/design/fitment/etc. |
+| 13.5 | ระบุแหล่งที่ติดตาม | แก้ไขรายชื่อ Facebook/YouTube/TikTok groups | บันทึกลง `bv_tracked_sources` wp_option |
+| 13.6 | กดปุ่ม "AI รวบรวมเสียงลูกค้า" | ปุ่ม AI | เช็ค cache `bv_last_ai_collect` (6 ชม.) — ถ้า hit แสดงจาก cache |
+| 13.7 | (ถ้า cache miss) AI สร้าง entries | Loading "กำลังรวบรวม..." | Claude สร้าง 10 entries จาก knowledge ของ tracked sources + 6 แบรนด์ + 9 categories |
+| 13.8 | entries ถูกบันทึก | ตาราง refresh | บันทึก `brand_voice` CPT 10 โพสต์ — `bv_entry_method = 'ai_generated'` |
+| 13.9 | กด "รวบรวมใหม่" | ปุ่ม bypass cache | ลบ cache เดิม → เรียก AI ใหม่ |
+| 13.10 | เปลี่ยนไป Tab 2: เสียงลูกค้า | Tab button | ตาราง entries: วันที่, แบรนด์, สรุป, ความรู้สึก, แหล่งที่มา |
+| 13.11 | Filter entries | Dropdown: แบรนด์ / sentiment / platform + search box | ตาราง filter real-time |
+| 13.12 | กด expand entry | คลิกแถว | แสดงข้อความเต็ม + tags + source URL + platform |
+| 13.13 | สังเกต row เชิงลบ | Row highlight สีแดง + คำเตือน | entries ที่ `bv_sentiment = 'negative'` แสดงชัดเจน |
+| 13.14 | เปลี่ยนไป Tab 3: เพิ่ม Manual | Tab button | Form สำหรับกรอกเสียงลูกค้าจริง |
+| 13.15 | กรอกข้อมูลเสียงลูกค้าจริง | Form: แบรนด์, รุ่นรถ, platform, URL, sentiment, categories, ข้อความ | Auto-detect platform จาก URL (facebook.com → facebook_group, youtube.com → youtube) |
+| 13.16 | กด submit | ปุ่ม "บันทึก" | สร้าง `brand_voice` CPT — `bv_entry_method = 'manual'` |
+| 13.17 | (Optional) Batch mode | Toggle "เพิ่มหลายรายการ" | ค้าง brand/model/platform ไว้ — กรอกแค่ข้อความ + sentiment ต่อ entry |
+
+### Decision points
+
+- **AI entries vs Manual entries:** AI = ประมาณการจาก knowledge (ไม่มี URL), Manual = ข้อมูลจริง 100% (มี URL)
+- **Cache bypass:** กด "รวบรวมใหม่" จะ bypass cache 6 ชม. — ใช้ token ใหม่
+- **Categories บังคับ:** V.1.5 บังคับเลือกจาก 9 หมวดที่กำหนด (ไม่พิมพ์เอง)
+
+### Where can the user get stuck
+
+- **AI entries ไม่ใช่ข้อมูลจริง:** ต้องเข้าใจว่า AI สร้างจาก knowledge — ยังไม่มี web scraping จริง
+- **ไม่มี Bookmarklet:** ยังไม่สามารถกดปุ่มบน Facebook แล้วเก็บข้อมูลเข้าอัตโนมัติ (Backlog Phase 2)
+- **ข้อมูลน้อย:** ถ้ายังไม่มี manual entries เยอะ สถิติจะ bias จาก AI-generated data
+
+---
+
 ## Cross-Journey Reference: Status Flows
 
 ### B2B Order Status Lifecycle
@@ -541,4 +624,6 @@ Pages protected by login check: if not logged in, redirected to `/warranty/`.
 | 9. Admin: Process New Order | `[B2B] Snippet 2`, `[B2B] Snippet 5: Admin Dashboard` |
 | 10. Admin: Create Manual Invoice | `[Admin System] DINOCO Manual Invoice System` |
 | 11. Admin: Handle Claim | `[Admin System] DINOCO Service Center & Claims` |
+| 12. Admin: Finance Dashboard | `[Admin System] DINOCO Admin Finance Dashboard`, `[Admin System] AI Provider Abstraction` |
+| 13. Admin: Brand Voice Pool | `[Admin System] DINOCO Brand Voice Pool`, `[Admin System] AI Provider Abstraction` |
 | Navigation | `[System] DINOCO Global App Menu` |
