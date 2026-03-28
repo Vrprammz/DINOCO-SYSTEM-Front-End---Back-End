@@ -2,7 +2,7 @@
 
 **Shortcode:** `[dinoco_brand_voice]`
 **DB_ID:** 1159
-**Version:** V.1.6
+**Version:** V.1.7
 **วันที่สร้าง:** 2026-03-29
 
 ---
@@ -26,6 +26,7 @@
 | V.1.4 | `6d8b0fd` | UI ภาษาไทย + highlight DINOCO + เพิ่ม % เชิงลบ |
 | V.1.5 | `f731d3e` | บังคับ categories จาก list + กราฟ top 8 |
 | V.1.6 | `1030351` | Bookmarklet เก็บเสียงลูกค้าจากโซเชียลได้ทันที |
+| V.1.7 | - | แก้ Bookmarklet hash ให้เปิด Brand Voice tab ถูกต้อง |
 
 ---
 
