@@ -638,6 +638,14 @@ Print tab:
 65. **Fix horizontal scroll** — เพิ่ม overflow-x:hidden ที่ .d-edit-wrap (สาเหตุ: cover negative margin กว้างเกิน viewport)
 66. **Moto Manager ใน Admin Dashboard** — เพิ่ม tab "Moto Catalog" ใน sidebar + command palette
 
+### Mileage Rank System V.34.x (Edit Profile)
+67. **Rank V2 — Mileage Scoring** — คำนวณจาก 2 ปัจจัย: ภักดี (วัน x 10 กม.) + สินค้า (count bonus / set bonus)
+68. **6-Tier Ranks** — Starter (0) → Bronze (300) → Silver (1,500) → Gold (4,000) → Platinum (7,000) → Diamond (12,000 กม.)
+69. **SKU Set Completion** — มี SKU ครบตาม `dinoco_sku_relations` = +4,000 กม. (jump ถึง Gold, cap ไม่ให้ข้ามไปสูงกว่า)
+70. **Rank Info Popup** — กด rank card → SweetAlert2 แสดง breakdown (ภักดี + สินค้า) + tier roadmap + tips วิธีเพิ่ม rank
+71. **Stats grid 2 ช่อง** — สินค้า + วันเป็นสมาชิก (ลบเคลม + โอนสิทธิ์ออก ไม่อยากให้ลูกค้าเคลม)
+72. **ลบ Activity bonus** — ไม่ใช้เคลม/โอน คำนวณ rank (เหลือแค่ภักดี + สินค้า)
+
 ### หมายเหตุ
 - **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)
 - **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)

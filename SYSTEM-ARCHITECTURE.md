@@ -172,7 +172,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | Dashboard Header | 1,450 | — | Header + registration forms |
 | Dashboard Assets | 2,160 | — | Product inventory list |
 | Claim System | 1,858 | `[dinoco_claim_page]` | Warranty claim submission |
-| Edit Profile | 1,202 | `[dinoco_edit_profile]` | Facebook-style profile V.33.2: cover photo + avatar, stats, journey timeline, cascading moto dropdown from MotoDB, view/edit toggle, PDPA |
+| Edit Profile | 1,474 | `[dinoco_edit_profile]` | Facebook-style profile V.34.x: cover photo, avatar, 6-tier Mileage Rank System (loyalty+product+SKU set bonus), journey timeline, cascading moto dropdown from MotoDB, rank info popup, view/edit toggle, PDPA |
 | Transfer Warranty | 2,192 | `[dinoco_transfer_v3]` | Ownership transfer |
 | Legacy Migration | 896 | — | Legacy data processing |
 | Global App Menu | 730 | — | Bottom nav + QR scanner + design tokens + toast/confirm |

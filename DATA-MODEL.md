@@ -350,6 +350,30 @@ This flag is the guard that prevents double-counting debt. Every debt reversal c
 
 **Seeded data:** 13 brands, 16 Honda models, 3 Yamaha models, Thai aliases
 
+### 3.8 Mileage Rank System (V.34.x — Edit Profile)
+
+Rank คำนวณจาก **Total Mileage = Loyalty + Product Bonus** (ไม่มี activity bonus)
+
+**Loyalty:** `member_days * 10` กม.
+**Product Bonus:**
+| เงื่อนไข | Bonus |
+|---------|-------|
+| 1 ชิ้น | +500 km |
+| 2 ชิ้น | +1,000 km |
+| 3-4 ชิ้น | +2,000 km |
+| 5+ ชิ้น | +3,000 km |
+| SKU ครบ set (`dinoco_sku_relations`) | +4,000 km (cap, jump ถึง Gold) |
+
+**Rank Tiers:**
+| Rank | Min Mileage | Icon |
+|------|------------|------|
+| Starter | 0 | flag-checkered |
+| Bronze | 300 | shield |
+| Silver | 1,500 | star |
+| Gold | 4,000 | trophy |
+| Platinum | 7,000 | crown |
+| Diamond | 12,000 | gem |
+
 | State | Meaning |
 |-------|---------|
 | `false` (default) | Order total NOT in distributor debt |

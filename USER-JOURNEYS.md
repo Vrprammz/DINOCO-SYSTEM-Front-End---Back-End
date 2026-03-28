@@ -520,7 +520,7 @@ Bottom navigation bar (Global App Menu) with 5 items:
 2. **Claim** (`/claim-system/`) -- File warranty claims
 3. **Scan** (QR scanner modal) -- Camera-based QR code scanner
 4. **Transfer** (`/transfer-warranty/`) -- Transfer product ownership
-5. **Profile** (`/edit-profile/`) -- Facebook-style profile (V.33.2): cover photo (moto image from MotoDB catalog) + overlapping avatar with camera button, member stats grid, "เส้นทางของเรา" journey timeline (compact, max 4 items + expand), personal info / address / motorcycle with cascading dropdown from MotoDB, view/edit toggle, PDPA at bottom.
+5. **Profile** (`/edit-profile/`) -- Facebook-style profile (V.34.x): cover photo (moto image from MotoDB), avatar, **Mileage Rank System** (6-tier: Starter→Diamond, scored by loyalty days + product ownership + SKU set completion, rank info popup with breakdown/tips), stats grid (สินค้า + วัน), "เส้นทางของเรา" journey timeline, cascading moto dropdown from MotoDB, view/edit toggle, PDPA at bottom.
 
 Pages protected by login check: if not logged in, redirected to `/warranty/`.
 
