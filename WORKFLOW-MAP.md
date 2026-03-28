@@ -609,6 +609,14 @@ Print tab:
 42. **SCAN icon** — เปลี่ยน fa-expand → fa-qrcode
 43. **Claim System async fix** — เพิ่ม async ให้ dnc_do_submit() (แก้ SyntaxError)
 
+### Profile Redesign V.32.0 — Facebook Style (commit edd18bc)
+44. **Facebook-style header** — Cover photo (ใช้รูปรถ/สินค้าแรก) + avatar ซ้อนขอบล่าง + ปุ่มกล้องเปลี่ยนรูป
+45. **View/Edit toggle** — ข้อมูลส่วนตัว, ที่อยู่, ข้อมูลรถ แสดงแบบ read-only ก่อน กด "แก้ไข" ถึงเห็น form (คล้าย Facebook profile)
+46. **Motorcycle display card** — แสดงรูปรถ + ยี่ห้อ/รุ่น/ปี ใน view mode พร้อมปุ่มแก้ไข
+47. **Product images full display** — เปลี่ยนจาก `object-fit: cover` เป็น `contain` แสดงรูปเต็มไม่ crop
+48. **PDPA ย้ายไปล่างสุด** — ไม่สำคัญเท่าข้อมูลอื่น ย้ายลงมาเป็น section สุดท้ายก่อน logout
+49. **Smart Save button** — ปุ่มบันทึกซ่อนไว้ แสดงเมื่อกดแก้ไข section ใดก็ตาม
+
 ### หมายเหตุ
 - **Claim status change (B2C member) ไม่ส่ง LINE notification** — เป็น platform limitation (LINE Login userId ≠ Bot userId ต่าง channel push ไม่ได้)
 - **Edit Profile ใช้ full page reload** — ยังใช้ native form POST (ไม่เปลี่ยนเป็น AJAX เพื่อลดความเสี่ยง)

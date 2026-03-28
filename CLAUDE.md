@@ -46,7 +46,7 @@ Files are named by feature area with bracket prefixes:
 - `[B2B] Snippet N: *` — B2B distributor modules (versioned snippets)
 - `[GitHub] *` — Webhook integration
 
-Each file is a self-contained module with its own version number (e.g., V.31.x, V.34.x).
+Each file is a self-contained module with its own version number (e.g., V.32.x, V.34.x).
 
 ### DB_ID Header (V.32.0)
 
@@ -61,3 +61,4 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **Security patterns**: WordPress nonce verification, honeypot fields, rate limiting via transients, `sanitize_text_field`/`esc_html`/`esc_url` for output.
 - **CSS scoping**: Styles are inline within each PHP file. Recent work has focused on scoping CSS to avoid cross-module conflicts.
 - **Modal pattern**: Modals use event delegation for dynamically created elements. Backdrop click-to-close is a common interaction pattern.
+- **View/Edit toggle pattern**: Profile page uses Facebook-style view-mode cards. Info is read-only by default; tap "แก้ไข" to expand the form. Save button only appears when a section is in edit mode.

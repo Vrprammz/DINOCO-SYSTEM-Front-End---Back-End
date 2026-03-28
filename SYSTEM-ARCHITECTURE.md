@@ -171,7 +171,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | Dashboard Header | 1,450 | — | Header + registration forms |
 | Dashboard Assets | 2,160 | — | Product inventory list |
 | Claim System | 1,858 | `[dinoco_claim_page]` | Warranty claim submission |
-| Edit Profile | 550 | `[dinoco_edit_profile]` | Profile hub: stats, PDPA, product timeline, moto photo, edit form |
+| Edit Profile | 1,062 | `[dinoco_edit_profile]` | Facebook-style profile: cover photo + avatar, stats, product timeline, view/edit toggle sections, PDPA |
 | Transfer Warranty | 2,192 | `[dinoco_transfer_v3]` | Ownership transfer |
 | Legacy Migration | 896 | — | Legacy data processing |
 | Global App Menu | 730 | — | Bottom nav + QR scanner + design tokens + toast/confirm |
