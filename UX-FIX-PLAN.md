@@ -181,12 +181,31 @@
 
 ## ลำดับการทำงาน
 
-```
-Day 1: P19 (ลบ Tailwind) + P21 (loading) + P05 (PDPA disabled)
-Day 2: P12 (custom modal/toast) + P11 (empty state)
-Day 3: P24 (LIFF timeout) + P17+P18 (font dedup) + P02 (QR CSS)
-Day 4: P09 (button standard) + P13 (tap target) + P14 (safe area)
-Day 5: P06 (step progress) + P16 (toast component) + Nice to Have
-```
+## Status (2026-03-28)
 
-ทั้งหมด ~5 วัน dev time ถ้าทำต่อเนื่อง
+| # | Issue | Status |
+|---|-------|--------|
+| P19 | Tailwind CDN pinned v3.4.17 (3 files) | ✅ commit 1e6679a |
+| P21 | Edit Profile loading state | ✅ commit fd4a2c5 |
+| P05 | PDPA button disabled until selection | ✅ commit fd4a2c5 |
+| P12 | Custom toast + confirm (Global App Menu) | ✅ commit fd4a2c5 |
+| P11 | Empty state Assets + Transfer | ✅ commit fd4a2c5 |
+| P24 | B2B LIFF init timeout | ✅ commit fd4a2c5 |
+| P09 | Design tokens (:root CSS variables) | ✅ commit fd4a2c5 |
+| P13 | Nav label 9px → 10px | ✅ commit fd4a2c5 |
+| P15 | Body padding safe-area aware | ✅ commit fd4a2c5 |
+| P17 | FontAwesome dedup | ✅ commit fd4a2c5 |
+| P03 | Welcome popup Thai language | ✅ commit fd4a2c5 |
+| P04 | Welcome popup backdrop + auto-dismiss | ✅ commit fd4a2c5 |
+| P07 | Claim loading dark overlay | ✅ commit fd4a2c5 |
+| P22 | Placeholder avatar → DINOCO logo | ✅ commit fd4a2c5 |
+| P02 | QR CSS dedup | ⏳ Phase 2 |
+| P06 | Onboarding step progress | ⏳ Phase 2 |
+| P08 | B2B gold accent | ⏳ Phase 2 |
+| P10 | Input border-radius standard | ⏳ Phase 2 |
+| P14 | Safe area all pages | ⏳ Phase 2 (tokens added, per-page pending) |
+| P16 | Global toast component | ✅ (built into P12) |
+| P18 | Google Fonts dedup | ⏳ Phase 2 |
+| P20 | Lazy load html2canvas | ⏳ Phase 2 |
+| P23 | Status color config shared | ⏳ Phase 2 |
+| P01 | CSS dedup Gateway/Callback | ⏳ Phase 2 |
