@@ -93,107 +93,54 @@ function countVisibleComments() {
 }
 
 // ─── Facebook: Post + Comments ───
+// Strategy: ใช้ raw text จาก dialog/modal เป็นหลัก แล้วให้ AI แยก
+// เพราะ Facebook เปลี่ยน DOM บ่อยมาก selector-based approach ไม่ stable
 function extractFacebookFull(result) {
-  // Main post content
-  const articles = document.querySelectorAll('[role="article"]');
-
-  // Strategy: get all text blocks from the page
-  // FB post = first article, comments = subsequent articles
-
-  // Try to get the main post text
-  const postTextEl = document.querySelector('[data-ad-comet-preview="message"]')
-    || document.querySelector('[data-ad-preview="message"]');
-
-  let postText = '';
-  if (postTextEl) {
-    postText = postTextEl.innerText.trim();
-  }
-
-  // Post author
-  let postAuthor = '';
-  const authorEl = document.querySelector('h2 a strong span, h3 a strong span, [data-ad-rendering-role="profile_name"] a strong span');
-  if (authorEl) postAuthor = authorEl.textContent.trim();
-
-  // If no structured post found, try from title
-  if (!postText) {
-    // Extract from page title pattern "GroupName · PostContent"
-    const title = document.title;
-    const match = title.match(/^(.+?)\s*[·|]\s*(.+?)(?:\s*\|.*)?$/);
-    if (match) {
-      result.sourceName = match[1].trim();
-      postText = match[2].trim();
+  // Focus เฉพาะ dialog (โพสต์ที่เปิดอยู่) ไม่ใช่ทั้ง feed
+  const container = document.querySelector('[role="dialog"]');
+  if (!container) {
+    // ไม่มี dialog เปิด — ใช้ main content แต่ต้องระวัง
+    // อาจดึงจากหลายโพสต์ได้ ให้ใช้ raw text approach
+    const main = document.querySelector('[role="main"]');
+    if (main) {
+      result.rawText = cleanFacebookText(main.innerText);
+      result.extractionMethod = 'raw_fallback';
     }
+    return;
   }
 
-  result.post = {
-    author: postAuthor,
-    text: postText,
-    hasPhoto: !!document.querySelector('[data-visualcompletion="media-vc-image"] img, video'),
-  };
+  // มี dialog เปิด — ดึง text ทั้งหมดจาก dialog นี้เท่านั้น
+  const rawText = container.innerText;
+  const cleaned = cleanFacebookText(rawText);
 
-  // Comments — scrape all visible comment elements
-  // Facebook comments are nested in role="article" elements
-  // Each comment has text content and an author
-  const commentEls = document.querySelectorAll('ul[role="list"] > li, div[role="article"]');
-  const seen = new Set();
+  if (cleaned.length < 20) return;
 
-  commentEls.forEach(el => {
-    // Skip the main post article
-    if (el === articles[0]) return;
+  // ส่ง raw text ให้ AI แยก post + comments ทั้งหมด
+  // AI จะจับ author name + comment text ได้ดีกว่า regex
+  result.rawText = cleaned;
+  result.extractionMethod = 'raw_dialog';
 
-    // Get comment text — look for the actual comment content spans
-    let text = '';
-    const textSpans = el.querySelectorAll('[dir="auto"]:not(h2 *, h3 *, h4 *, a[role="link"] *)');
-    textSpans.forEach(span => {
-      const t = span.innerText.trim();
-      if (t && t.length > 1 && !t.match(/^(ถูกใจ|แชร์|ตอบกลับ|\d+\s*(ชม\.|วัน|นาที|สัปดาห์))$/)) {
-        text += (text ? '\n' : '') + t;
-      }
-    });
+  // พยายามดึง group name จาก page title
+  const title = document.title;
+  const match = title.match(/^(.+?)\s*[·|]/);
+  if (match) result.sourceName = match[1].trim();
+}
 
-    if (!text || text.length < 3) return;
-
-    // Get comment author
-    let author = '';
-    const authorLink = el.querySelector('a[role="link"] span:first-child, a span.x193iq5w');
-    if (authorLink) author = authorLink.textContent.trim();
-
-    // Dedup
-    const key = author + '|' + text.substring(0, 50);
-    if (seen.has(key)) return;
-    seen.add(key);
-
-    // Skip noise (like/share buttons text)
-    if (text.match(/^(ถูกใจ|แชร์|ดู\s*\d+|แสดง|ซ่อน|ดูเพิ่มเติม|ตอบกลับ)$/i)) return;
-
-    result.comments.push({ author, text });
-  });
-
-  // Fallback: if structured extraction failed, send raw text for AI to parse
-  if (result.comments.length === 0 && (!result.post || !result.post.text)) {
-    const container = document.querySelector('[role="dialog"]') || document.querySelector('[role="main"]');
-    if (container) {
-      const rawText = container.innerText;
-      // ส่งเป็น 1 comment ขนาดใหญ่ ให้ AI ฝั่ง server แยก post/comments เอง
-      // ตัด noise พื้นฐานออก แต่ไม่พยายาม parse structure
-      const cleaned = rawText.split('\n')
-        .filter(l => {
-          const t = l.trim();
-          if (t.length < 2) return false;
-          if (t.match(/^(ถูกใจ|แชร์|ตอบกลับ|ดูการตอบกลับ|แสดง|ซ่อน|เกี่ยวข้อง|เพิ่มความคิดเห็น|Like|Share|Reply|Comments?|เขียนความคิดเห็น)$/i)) return false;
-          if (t.match(/^\d+\s*(ชม\.|วัน|นาที|สัปดาห์|ความคิดเห็น|คน|คำตอบ|hr|min|d|w)\.?$/i)) return false;
-          if (t.match(/^·\s*$/)) return false;
-          return true;
-        })
-        .join('\n')
-        .substring(0, 5000); // cap at 5000 chars
-
-      if (cleaned.length > 20) {
-        result.rawText = cleaned;
-        result.extractionMethod = 'raw_fallback';
-      }
-    }
-  }
+function cleanFacebookText(raw) {
+  return raw.split('\n')
+    .filter(l => {
+      const t = l.trim();
+      if (t.length < 2) return false;
+      // ตัด FB UI noise
+      if (t.match(/^(ถูกใจ|แชร์|ตอบกลับ|ดูการตอบกลับ|แสดง|ซ่อน|เกี่ยวข้อง|เพิ่มความคิดเห็น|เขียนความคิดเห็น|Like|Share|Reply|Comments?|ดูเพิ่มเติม|เกี่ยวข้องมากที่สุด|ล่าสุด|ดูความคิดเห็นทั้งหมด|ตอบในชื่อ|ดูคำตอบ|Most relevant|All comments)$/i)) return false;
+      if (t.match(/^\d+\s*(ชม\.|ชั่วโมง|วัน|นาที|สัปดาห์|ความคิดเห็น|คน|คำตอบ|hr|hours?|min|minutes?|d|days?|w|weeks?)\.?$/i)) return false;
+      if (t.match(/^·\s*$/)) return false;
+      if (t.match(/^(ดูการตอบกลับทั้ง|ดูตอบกลับ)\s*\d+/)) return false;
+      if (t.match(/^\d+\s*(ชม|วัน|นาที|สัปดาห์)$/)) return false;
+      return true;
+    })
+    .join('\n')
+    .substring(0, 5000);
 }
 
 // ─── YouTube: Video title + Comments ───
