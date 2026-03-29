@@ -93,67 +93,82 @@ function countVisibleComments() {
 }
 
 // ─── Facebook: Post + Comments ───
-// Strategy: ใช้ raw text จาก dialog/modal เป็นหลัก แล้วให้ AI แยก
-// เพราะ Facebook เปลี่ยน DOM บ่อยมาก selector-based approach ไม่ stable
+// Strategy: DOM extraction ก่อน (scope ถูก container) + raw text เป็น fallback
 function extractFacebookFull(result) {
-  // หา container ที่เป็นโพสต์เดียว — ลองหลายวิธีตาม FB layout
-  let container = null;
-  let method = '';
-
-  // 1. Dialog popup (คลิกโพสต์จาก feed)
-  container = document.querySelector('[role="dialog"]');
-  if (container) {
-    method = 'dialog';
-  }
-
-  // 2. Permalink page (/permalink/, /posts/, ?multi_permalinks=)
-  //    FB แสดงโพสต์เดียวใน main content area
+  // หา container — dialog หรือ permalink page
+  let container = document.querySelector('[role="dialog"]');
   if (!container) {
     const url = window.location.href;
-    const isPermalink = url.includes('/permalink/') || url.includes('/posts/') || url.includes('multi_permalinks=');
-    if (isPermalink) {
-      // หา article แรกใน main (คือโพสต์หลัก + comments)
-      const main = document.querySelector('[role="main"]');
-      if (main) {
-        container = main;
-        method = 'permalink';
-      }
+    if (url.includes('/permalink/') || url.includes('/posts/') || url.includes('multi_permalinks=')) {
+      container = document.querySelector('[role="main"]');
     }
   }
+  if (!container) return;
 
-  // 3. Feed page ทั่วไป — ไม่ดึง เพราะจะได้หลายโพสต์ปน
-  if (!container) {
-    // แจ้งให้ user เปิดโพสต์ก่อน
-    return;
-  }
-
-  const rawText = container.innerText;
-  const cleaned = cleanFacebookText(rawText);
-
-  if (cleaned.length < 20) return;
-
-  result.rawText = cleaned;
-  result.extractionMethod = 'raw_' + method;
-
-  // ดึง group name จาก page title
+  // ดึง group name
   const title = document.title;
   const titleMatch = title.match(/^(.+?)\s*[·|]/);
   if (titleMatch) result.sourceName = titleMatch[1].trim();
+
+  // ── Step 1: DOM extraction — หา [role="article"] ภายใน container ──
+  const articles = container.querySelectorAll('[role="article"]');
+  const seen = new Set();
+
+  if (articles.length > 0) {
+    articles.forEach((el, idx) => {
+      // หา text content ของ article นี้
+      const textEls = el.querySelectorAll('[dir="auto"]');
+      let text = '';
+      textEls.forEach(span => {
+        const t = span.innerText.trim();
+        if (t && t.length > 1 && !isFbNoise(t)) {
+          text += (text ? '\n' : '') + t;
+        }
+      });
+      if (!text || text.length < 2) return;
+
+      // หา author — ลองหลาย selector
+      let author = '';
+      const authorEl = el.querySelector('a[role="link"] > span > span')
+        || el.querySelector('a[role="link"] span:first-child')
+        || el.querySelector('h3 strong a span, h2 strong a span, h4 strong a span');
+      if (authorEl) author = authorEl.textContent.trim();
+
+      // Dedup
+      const key = text.substring(0, 80);
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      // โพสต์แรก = original post, ที่เหลือ = comments
+      if (idx === 0 && !result.post) {
+        result.post = { author, text, hasPhoto: !!el.querySelector('img[src*="scontent"], video') };
+      } else {
+        result.comments.push({ author, text });
+      }
+    });
+  }
+
+  // ── Step 2: Fallback — ถ้า DOM ดึงไม่ได้ ส่ง raw text ──
+  if (!result.post && result.comments.length === 0) {
+    const cleaned = cleanFbText(container.innerText);
+    if (cleaned.length > 30) {
+      result.rawText = cleaned;
+      result.extractionMethod = 'raw_fallback';
+    }
+  }
 }
 
-function cleanFacebookText(raw) {
+function isFbNoise(t) {
+  return /^(ถูกใจ|แชร์|ตอบกลับ|ดูการตอบกลับ|แสดง|ซ่อน|เกี่ยวข้อง|เพิ่มความคิดเห็น|เขียนความคิดเห็น|Like|Share|Reply|Comments?|ดูเพิ่มเติม|เกี่ยวข้องมากที่สุด|ล่าสุด|ดูความคิดเห็นทั้งหมด|ตอบในชื่อ|ดูคำตอบ|Most relevant|All comments|ติดตาม|ความคิดเห็นทั้งหมด|แสดงความคิดเห็น|รักเลย)$/i.test(t.trim())
+    || /^\d+\s*(ชม\.|ชั่วโมง|วัน|นาที|สัปดาห์|ความคิดเห็น|คน|คำตอบ|hr|hours?|min|d|w|สัปดาห์)\.?$/i.test(t.trim())
+    || /^·\s*$/.test(t.trim())
+    || /^\d+\s*(ชม|วัน|นาที|สัปดาห์)$/.test(t.trim())
+    || /^(ดูการตอบกลับทั้ง|ดูตอบกลับ|ดู)\s*\d+/.test(t.trim());
+}
+
+function cleanFbText(raw) {
   return raw.split('\n')
-    .filter(l => {
-      const t = l.trim();
-      if (t.length < 2) return false;
-      // ตัด FB UI noise
-      if (t.match(/^(ถูกใจ|แชร์|ตอบกลับ|ดูการตอบกลับ|แสดง|ซ่อน|เกี่ยวข้อง|เพิ่มความคิดเห็น|เขียนความคิดเห็น|Like|Share|Reply|Comments?|ดูเพิ่มเติม|เกี่ยวข้องมากที่สุด|ล่าสุด|ดูความคิดเห็นทั้งหมด|ตอบในชื่อ|ดูคำตอบ|Most relevant|All comments)$/i)) return false;
-      if (t.match(/^\d+\s*(ชม\.|ชั่วโมง|วัน|นาที|สัปดาห์|ความคิดเห็น|คน|คำตอบ|hr|hours?|min|minutes?|d|days?|w|weeks?)\.?$/i)) return false;
-      if (t.match(/^·\s*$/)) return false;
-      if (t.match(/^(ดูการตอบกลับทั้ง|ดูตอบกลับ)\s*\d+/)) return false;
-      if (t.match(/^\d+\s*(ชม|วัน|นาที|สัปดาห์)$/)) return false;
-      return true;
-    })
+    .filter(l => l.trim().length >= 2 && !isFbNoise(l))
     .join('\n')
     .substring(0, 5000);
 }
