@@ -37,14 +37,20 @@ function extractFullPost() {
     comments: [],
   };
 
-  if (url.includes('facebook.com')) {
-    extractFacebookFull(result);
-  } else if (url.includes('youtube.com')) {
-    extractYouTubeFull(result);
-  } else if (url.includes('tiktok.com')) {
-    extractTikTokFull(result);
-  } else if (url.includes('pantip.com')) {
-    extractPantipFull(result);
+  try {
+    if (url.includes('facebook.com')) {
+      extractFacebookFull(result);
+    } else if (url.includes('youtube.com')) {
+      extractYouTubeFull(result);
+    } else if (url.includes('tiktok.com')) {
+      extractTikTokFull(result);
+    } else if (url.includes('pantip.com')) {
+      extractPantipFull(result);
+    } else if (url.includes('instagram.com')) {
+      extractInstagramFull(result);
+    }
+  } catch (e) {
+    result.error = 'Extraction failed: ' + e.message;
   }
 
   return result;
@@ -264,6 +270,37 @@ function extractPantipFull(result) {
     const userEl = el.querySelector('.display-post-name a');
     const textEl = el.querySelector('.display-post-story');
     if (textEl) {
+      result.comments.push({
+        author: userEl ? userEl.textContent.trim() : '',
+        text: textEl.textContent.trim(),
+      });
+    }
+  });
+}
+
+// ─── Instagram: Post + Comments ───
+function extractInstagramFull(result) {
+  result.post = {
+    author: '',
+    text: '',
+    hasPhoto: true,
+  };
+
+  // IG caption
+  const captionEl = document.querySelector('h1[dir="auto"]')
+    || document.querySelector('span[dir="auto"]');
+  if (captionEl) result.post.text = captionEl.textContent.trim();
+
+  // IG author
+  const authorEl = document.querySelector('header a[href*="/"]');
+  if (authorEl) result.post.author = authorEl.textContent.trim();
+
+  // IG comments
+  const commentEls = document.querySelectorAll('ul > li[role="menuitem"], ul > div > li');
+  commentEls.forEach(el => {
+    const userEl = el.querySelector('a[href*="/"]');
+    const textEl = el.querySelector('span[dir="auto"]');
+    if (textEl && textEl.textContent.trim().length > 2) {
       result.comments.push({
         author: userEl ? userEl.textContent.trim() : '',
         text: textEl.textContent.trim(),

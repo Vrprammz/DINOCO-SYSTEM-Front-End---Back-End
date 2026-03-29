@@ -2,7 +2,7 @@
 
 **Shortcode:** `[dinoco_brand_voice]`
 **DB_ID:** 1159
-**Version:** V.2.1
+**Version:** V.2.2
 **วันที่สร้าง:** 2026-03-29
 
 ---
@@ -28,7 +28,8 @@
 | V.1.6 | `1030351` | Bookmarklet เก็บเสียงลูกค้าจากโซเชียลได้ทันที |
 | V.1.7 | `3ee7e0f` | แก้ Bookmarklet hash ให้เปิด Brand Voice tab ถูกต้อง |
 | V.2.0 | `52152c2` | REST API + Chrome Extension สำหรับเก็บข้อมูลจากโซเชียล |
-| V.2.1 | - | One-click: AI วิเคราะห์ Post+Comments แยก entry อัตโนมัติ |
+| V.2.1 | `52ba15a` | One-click: AI วิเคราะห์ Post+Comments แยก entry อัตโนมัติ |
+| V.2.2 | - | Security fix: batch, sanitize, dedup, AI validation, API key revoke, timeout |
 
 ---
 

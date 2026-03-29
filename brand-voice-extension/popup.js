@@ -119,19 +119,28 @@ async function collectAll() {
   let fullData;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return showError('ไม่พบ tab ที่เปิดอยู่');
     fullData = await chrome.tabs.sendMessage(tab.id, { action: 'getFullPost' });
   } catch (e) {
-    return showError('ไม่สามารถอ่านหน้าเว็บได้: ' + e.message);
+    return showError('ไม่สามารถอ่านหน้าเว็บได้ — ลอง refresh หน้าแล้วกดใหม่');
   }
 
-  if (!fullData || (!fullData.post && fullData.comments.length === 0)) {
+  if (!fullData || (!fullData.post && (!fullData.comments || fullData.comments.length === 0))) {
     return showError('ไม่พบข้อมูล Post หรือ Comments ในหน้านี้');
   }
 
-  const totalItems = (fullData.post ? 1 : 0) + fullData.comments.length;
-  setProgress(30, 'พบ ' + totalItems + ' ข้อความ — กำลังส่ง AI วิเคราะห์...');
+  // Cap comments at 40
+  if (fullData.comments && fullData.comments.length > 40) {
+    fullData.comments = fullData.comments.slice(0, 40);
+  }
 
-  // Step 2: Send to AI bulk endpoint
+  const totalItems = (fullData.post ? 1 : 0) + (fullData.comments ? fullData.comments.length : 0);
+  setProgress(30, 'พบ ' + totalItems + ' ข้อความ — กำลังส่ง AI วิเคราะห์ (รอ 15-30 วินาที)...');
+
+  // Step 2: Send to AI bulk endpoint with timeout
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90000); // 90s timeout
+
   try {
     const resp = await fetch(config.siteUrl + '/wp-json/brand-voice/v1/entries/ai-bulk', {
       method: 'POST',
@@ -146,26 +155,37 @@ async function collectAll() {
         post: fullData.post,
         comments: fullData.comments,
       }),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
 
     setProgress(80, 'AI วิเคราะห์เสร็จ — กำลังบันทึก...');
 
-    const data = await resp.json();
+    let data;
+    try {
+      data = await resp.json();
+    } catch (e) {
+      return showError('Server ตอบกลับไม่ใช่ JSON — อาจ timeout หรือ server error');
+    }
 
     if (!resp.ok || !data.success) {
-      return showError(data.message || 'เกิดข้อผิดพลาด');
+      return showError(data.message || 'เกิดข้อผิดพลาด (HTTP ' + resp.status + ')');
     }
 
     setProgress(100, 'เสร็จ!');
 
-    // Step 3: Show results
     setTimeout(() => {
       progress.classList.remove('active');
       showResults(data, fullData);
     }, 500);
 
   } catch (e) {
-    showError('เชื่อมต่อไม่ได้: ' + e.message);
+    clearTimeout(timeout);
+    if (e.name === 'AbortError') {
+      showError('Timeout — AI ใช้เวลานานเกินไป ลองลด comments แล้วกดใหม่');
+    } else {
+      showError('เชื่อมต่อไม่ได้: ' + e.message);
+    }
   }
 }
 
@@ -176,6 +196,7 @@ function setProgress(pct, text) {
 
 function showError(msg) {
   document.getElementById('progress').classList.remove('active');
+  document.getElementById('progress-bar').style.width = '0%';
   const results = document.getElementById('results');
   results.classList.add('active');
   document.getElementById('result-summary').className = 'result-summary error';
