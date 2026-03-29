@@ -154,6 +154,7 @@ async function collectAll() {
         source_name: fullData.sourceName,
         post: fullData.post,
         comments: fullData.comments,
+        raw_text: fullData.rawText || '',
       }),
       signal: controller.signal,
     });

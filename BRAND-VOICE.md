@@ -29,7 +29,8 @@
 | V.1.7 | `3ee7e0f` | แก้ Bookmarklet hash ให้เปิด Brand Voice tab ถูกต้อง |
 | V.2.0 | `52152c2` | REST API + Chrome Extension สำหรับเก็บข้อมูลจากโซเชียล |
 | V.2.1 | `52ba15a` | One-click: AI วิเคราะห์ Post+Comments แยก entry อัตโนมัติ |
-| V.2.2 | - | Security fix: batch, sanitize, dedup, AI validation, API key revoke, timeout |
+| V.2.2 | `8919e36` | Security fix: batch, sanitize, dedup, AI validation, API key revoke, timeout |
+| V.2.3 | - | AI prompt upgrade + ผู้สนับสนุน + Negative Alert + categories เพิ่ม |
 
 ---
 

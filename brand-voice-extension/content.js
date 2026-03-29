@@ -169,37 +169,29 @@ function extractFacebookFull(result) {
     result.comments.push({ author, text });
   });
 
-  // Fallback: if structured extraction failed, try getting ALL visible text
-  if (result.comments.length === 0) {
-    // Get all text from the modal/dialog or main content area
+  // Fallback: if structured extraction failed, send raw text for AI to parse
+  if (result.comments.length === 0 && !result.post) {
     const container = document.querySelector('[role="dialog"]') || document.querySelector('[role="main"]');
     if (container) {
-      const allText = container.innerText;
-      // Split by common FB comment patterns
-      const lines = allText.split('\n').filter(l => l.trim().length > 2);
-      let currentAuthor = '';
+      const rawText = container.innerText;
+      // ส่งเป็น 1 comment ขนาดใหญ่ ให้ AI ฝั่ง server แยก post/comments เอง
+      // ตัด noise พื้นฐานออก แต่ไม่พยายาม parse structure
+      const cleaned = rawText.split('\n')
+        .filter(l => {
+          const t = l.trim();
+          if (t.length < 2) return false;
+          if (t.match(/^(ถูกใจ|แชร์|ตอบกลับ|ดูการตอบกลับ|แสดง|ซ่อน|เกี่ยวข้อง|เพิ่มความคิดเห็น|Like|Share|Reply|Comments?|เขียนความคิดเห็น)$/i)) return false;
+          if (t.match(/^\d+\s*(ชม\.|วัน|นาที|สัปดาห์|ความคิดเห็น|คน|คำตอบ|hr|min|d|w)\.?$/i)) return false;
+          if (t.match(/^·\s*$/)) return false;
+          return true;
+        })
+        .join('\n')
+        .substring(0, 5000); // cap at 5000 chars
 
-      lines.forEach(line => {
-        const trimmed = line.trim();
-        // Skip noise
-        if (trimmed.match(/^(ถูกใจ|แชร์|ตอบกลับ|ดูการตอบกลับ|แสดง|ซ่อน|เกี่ยวข้อง|เพิ่มความคิดเห็น|\d+\s*(ชม\.|วัน|นาที|สัปดาห์|ความคิดเห็น|คน|คำตอบ))/)) return;
-        if (trimmed.match(/^·\s*$/)) return;
-        if (trimmed.length < 3) return;
-
-        // Lines that look like author names (short, no Thai particles)
-        if (trimmed.length < 40 && !trimmed.includes(' ') && !trimmed.match(/[.!?,]/)) {
-          currentAuthor = trimmed;
-          return;
-        }
-
-        // Actual comment text
-        const key2 = currentAuthor + '|' + trimmed.substring(0, 50);
-        if (!seen.has(key2)) {
-          seen.add(key2);
-          result.comments.push({ author: currentAuthor, text: trimmed });
-          currentAuthor = '';
-        }
-      });
+      if (cleaned.length > 20) {
+        result.rawText = cleaned;
+        result.extractionMethod = 'raw_fallback';
+      }
     }
   }
 }
