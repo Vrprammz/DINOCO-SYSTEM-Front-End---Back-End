@@ -116,26 +116,43 @@ function extractFacebookFull(result) {
 
   if (articles.length > 0) {
     articles.forEach((el, idx) => {
-      // หา text content ของ article นี้
-      const textEls = el.querySelectorAll('[dir="auto"]');
-      let text = '';
-      textEls.forEach(span => {
-        const t = span.innerText.trim();
-        if (t && t.length > 1 && !isFbNoise(t)) {
-          text += (text ? '\n' : '') + t;
-        }
-      });
-      if (!text || text.length < 2) return;
-
-      // หา author — ลองหลาย selector
+      // หา author ก่อน
       let author = '';
       const authorEl = el.querySelector('a[role="link"] > span > span')
         || el.querySelector('a[role="link"] span:first-child')
         || el.querySelector('h3 strong a span, h2 strong a span, h4 strong a span');
       if (authorEl) author = authorEl.textContent.trim();
 
-      // Dedup
-      const key = text.substring(0, 80);
+      // หา text — ใช้ innerText ของ article ทั้งก้อน แล้วตัด noise + author ออก
+      let rawArticle = el.innerText || '';
+      let lines = rawArticle.split('\n')
+        .map(l => l.trim())
+        .filter(l => {
+          if (l.length < 2) return false;
+          if (isFbNoise(l)) return false;
+          // ตัด author name ที่ซ้ำ (FB ใส่ชื่อซ้ำหลายจุด)
+          if (author && l === author) return false;
+          // ตัด timestamp patterns
+          if (/^\d+\s*(ชม\.|ชั่วโมง|วัน|นาที|สัปดาห์|hr|min|d|w|สัปดาห์)/i.test(l)) return false;
+          // ตัดชื่อกลุ่ม/page ที่ซ้ำ
+          if (l === result.sourceName) return false;
+          return true;
+        });
+
+      // ตัด reply-to pattern (ชื่อคนที่ตอบ ที่อยู่ต้นข้อความ)
+      if (lines.length > 0) {
+        // ถ้าบรรทัดแรกเป็นชื่อคนอื่น (tag reply) ตัดออก
+        const firstLine = lines[0];
+        if (firstLine.length < 50 && !firstLine.includes(' ') && firstLine !== author) {
+          // อาจเป็นชื่อคนที่ reply — เก็บไว้ใน text ก็ได้ ไม่ตัด
+        }
+      }
+
+      let text = lines.join('\n').trim();
+      if (!text || text.length < 2) return;
+
+      // Dedup — ใช้ author + text เพื่อไม่ตัดข้อความสั้นที่ต่างคนพูด
+      const key = (author || 'anon') + '|' + text.substring(0, 60);
       if (seen.has(key)) return;
       seen.add(key);
 
