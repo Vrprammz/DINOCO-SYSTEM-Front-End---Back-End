@@ -144,7 +144,7 @@ async function collectAll() {
     return showError('ไม่สามารถอ่านหน้าเว็บได้ — ลอง refresh หน้าแล้วกดใหม่');
   }
 
-  if (!fullData || (!fullData.post && (!fullData.comments || fullData.comments.length === 0))) {
+  if (!fullData || (!fullData.post && (!fullData.comments || fullData.comments.length === 0) && !fullData.rawText)) {
     return showError('ไม่พบข้อมูล Post หรือ Comments ในหน้านี้');
   }
 
@@ -153,8 +153,11 @@ async function collectAll() {
     fullData.comments = fullData.comments.slice(0, 40);
   }
 
-  const totalItems = (fullData.post ? 1 : 0) + (fullData.comments ? fullData.comments.length : 0);
-  setProgress(30, 'พบ ' + totalItems + ' ข้อความ — กำลังส่ง AI วิเคราะห์ (รอ 15-30 วินาที)...');
+  const hasRawText = fullData.rawText && fullData.rawText.length > 20;
+  const totalItems = hasRawText
+    ? 'raw text'
+    : ((fullData.post ? 1 : 0) + (fullData.comments ? fullData.comments.length : 0)) + ' ข้อความ';
+  setProgress(30, 'พบ ' + totalItems + ' — กำลังส่ง AI วิเคราะห์ (รอ 15-30 วินาที)...');
 
   // Step 2: Send to AI bulk endpoint with timeout
   const controller = new AbortController();
