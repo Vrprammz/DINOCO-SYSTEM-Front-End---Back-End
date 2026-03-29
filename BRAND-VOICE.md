@@ -2,7 +2,7 @@
 
 **Shortcode:** `[dinoco_brand_voice]`
 **DB_ID:** 1159
-**Version:** V.1.7
+**Version:** V.2.0
 **วันที่สร้าง:** 2026-03-29
 
 ---
@@ -26,7 +26,8 @@
 | V.1.4 | `6d8b0fd` | UI ภาษาไทย + highlight DINOCO + เพิ่ม % เชิงลบ |
 | V.1.5 | `f731d3e` | บังคับ categories จาก list + กราฟ top 8 |
 | V.1.6 | `1030351` | Bookmarklet เก็บเสียงลูกค้าจากโซเชียลได้ทันที |
-| V.1.7 | - | แก้ Bookmarklet hash ให้เปิด Brand Voice tab ถูกต้อง |
+| V.1.7 | `3ee7e0f` | แก้ Bookmarklet hash ให้เปิด Brand Voice tab ถูกต้อง |
+| V.2.0 | - | REST API + Chrome Extension สำหรับเก็บข้อมูลจากโซเชียล |
 
 ---
 
@@ -40,6 +41,31 @@
 | **BMMOTO** | เน้น Honda CB/Rebel ราคากลาง |
 | **MOTOSkill** | Premium เน้น touring |
 | **H2C** | Honda 2 wheelers Customization — ของ Honda เอง ขายใน BigWing |
+
+---
+
+## REST API (V.2.0)
+
+Base: `/wp-json/brand-voice/v1/`
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/entries` | API Key | สร้าง entry เดียว |
+| POST | `/entries/batch` | API Key | สร้าง entries หลายอัน (max 50) |
+| GET | `/meta` | API Key | ดึง brands/categories/models/platforms |
+| POST | `/api-keys/generate` | WP Admin | สร้าง API Key ใหม่ |
+
+Auth header: `X-BV-API-Key: bvk_...`
+Rate limit: 60 req/min per key
+
+## Chrome Extension (`brand-voice-extension/`)
+
+| File | Description |
+|------|-------------|
+| `manifest.json` | Manifest V3, permissions: activeTab + storage |
+| `content.js` | ดึงข้อมูลจาก Facebook/YouTube/TikTok/Pantip/IG |
+| `popup.html` | UI เลือก brand/sentiment/category |
+| `popup.js` | Logic ส่งข้อมูลผ่าน REST API |
 
 ---
 
@@ -127,6 +153,7 @@ TikTok: #HondaBigBike
 | `[Admin System] DINOCO Brand Voice Pool` (DB_ID: 1159) | Snippet หลัก |
 | `[Admin System] DINOCO Admin Dashboard` (DB_ID: 21) | Parent — tab "Brand Voice" |
 | `[Admin System] AI Provider Abstraction` (DB_ID: 1040) | Claude API wrapper |
+| `brand-voice-extension/` | Chrome Extension (Manifest V3) |
 
 ---
 
@@ -134,7 +161,7 @@ TikTok: #HondaBigBike
 
 ### Phase 2 (ต่อยอด)
 1. ~~**Bookmarklet**~~ — ✅ ทำแล้ว V.1.6
-2. **Browser Extension** — ถ้า Bookmarklet ไม่พอ
+2. ~~**Browser Extension**~~ — ✅ ทำแล้ว V.2.0 (Chrome Extension + REST API)
 3. **เชื่อม Finance AI** — ใช้ Brand Voice data จริงแทน knowledge
 4. **Sentiment trend chart** — แนวโน้มรายสัปดาห์/เดือน
 5. **Word cloud** — คำที่พูดถึงบ่อย

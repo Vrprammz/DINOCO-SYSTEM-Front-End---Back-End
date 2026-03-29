@@ -3,7 +3,7 @@
  * [Admin System] DINOCO Brand Voice Pool
  * Shortcode: [dinoco_brand_voice]
  * Description: เก็บเสียงลูกค้าจากโซเชียล — วิเคราะห์แบรนด์ DINOCO vs คู่แข่ง
- * Version: V.1.7
+ * Version: V.2.0
  * DB_ID: 1159
  * ======================================================================
  */
@@ -236,6 +236,210 @@ function bv_get_ai_summary() {
         'recent_voices'       => implode("\n", $summaries),
     ];
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2b. REST API — External (Extension / Agent)
+// ─────────────────────────────────────────────────────────────────────────────
+
+add_action('rest_api_init', function() {
+
+    // Verify API key from X-BV-API-Key header
+    $verify_key = function() {
+        $key = isset($_SERVER['HTTP_X_BV_API_KEY']) ? sanitize_text_field($_SERVER['HTTP_X_BV_API_KEY']) : '';
+        if (!$key) return false;
+        $stored = get_option('bv_api_keys', []);
+        if (!is_array($stored)) return false;
+        $hash = hash('sha256', $key);
+        foreach ($stored as &$k) {
+            if (isset($k['key_hash']) && hash_equals($k['key_hash'], $hash)) {
+                $k['last_used'] = date('Y-m-d H:i:s');
+                update_option('bv_api_keys', $stored);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Rate limit check (60 req/min per key)
+    $rate_check = function() {
+        $key = sanitize_text_field($_SERVER['HTTP_X_BV_API_KEY'] ?? '');
+        $short = substr(hash('sha256', $key), 0, 12);
+        $tk = 'bv_rate_' . $short . '_' . date('YmdHi');
+        $count = (int) get_transient($tk);
+        if ($count >= 60) return false;
+        set_transient($tk, $count + 1, 120);
+        return true;
+    };
+
+    // POST /wp-json/brand-voice/v1/entries — สร้าง entry
+    register_rest_route('brand-voice/v1', '/entries', [
+        'methods'  => 'POST',
+        'permission_callback' => function() use ($verify_key, $rate_check) {
+            if (!$verify_key()) return new WP_Error('unauthorized', 'Invalid API key', ['status' => 401]);
+            if (!$rate_check()) return new WP_Error('rate_limit', 'Rate limit exceeded', ['status' => 429]);
+            return true;
+        },
+        'callback' => function(WP_REST_Request $req) {
+            $body = $req->get_json_params();
+            if (empty($body)) return new WP_Error('bad_request', 'JSON body required', ['status' => 400]);
+
+            // Duplicate check by source_url
+            $source_url = esc_url_raw($body['source_url'] ?? '');
+            if ($source_url) {
+                $dup = new WP_Query([
+                    'post_type' => 'brand_voice', 'post_status' => 'publish',
+                    'posts_per_page' => 1,
+                    'meta_query' => [['key' => 'bv_source_url', 'value' => $source_url, 'compare' => '=']],
+                ]);
+                if ($dup->found_posts > 0) {
+                    return new WP_REST_Response([
+                        'success' => false, 'code' => 'duplicate',
+                        'message' => 'Entry with same source_url exists',
+                        'existing_id' => $dup->posts[0]->ID,
+                    ], 409);
+                }
+            }
+
+            $valid_brands     = bv_get_brands();
+            $valid_categories = array_keys(bv_get_categories());
+            $valid_platforms  = array_keys(bv_get_platforms());
+            $valid_sentiments = ['positive', 'neutral', 'negative', 'mixed'];
+            $valid_models     = bv_get_models();
+
+            $brands = array_filter(array_map('sanitize_text_field', (array)($body['brands'] ?? [])), function($b) use ($valid_brands) { return in_array($b, $valid_brands); });
+            $cats   = array_filter(array_map('sanitize_text_field', (array)($body['categories'] ?? [])), function($c) use ($valid_categories) { return in_array($c, $valid_categories); });
+            $models = array_filter(array_map('sanitize_text_field', (array)($body['models'] ?? [])), function($m) use ($valid_models) { return in_array($m, $valid_models); });
+
+            $sentiment = in_array($body['sentiment'] ?? '', $valid_sentiments) ? $body['sentiment'] : 'neutral';
+            $platform  = in_array($body['platform'] ?? '', $valid_platforms) ? $body['platform'] : 'other';
+
+            if (empty($body['content']) && empty($body['summary'])) {
+                return new WP_Error('bad_request', 'content or summary required', ['status' => 400]);
+            }
+
+            $data = [
+                'brands'      => array_values($brands),
+                'content'     => sanitize_textarea_field($body['content'] ?? ''),
+                'summary'     => sanitize_text_field(mb_substr($body['summary'] ?? '', 0, 200)),
+                'sentiment'   => $sentiment,
+                'intensity'   => max(1, min(5, intval($body['intensity'] ?? 3))),
+                'categories'  => array_values($cats),
+                'platform'    => $platform,
+                'source_url'  => $source_url,
+                'source_name' => sanitize_text_field($body['source_name'] ?? ''),
+                'post_date'   => sanitize_text_field($body['post_date'] ?? date('Y-m-d')),
+                'product'     => sanitize_text_field($body['product'] ?? ''),
+                'models'      => array_values($models),
+                'author_name' => sanitize_text_field($body['author_name'] ?? ''),
+                'engagement'  => sanitize_text_field($body['engagement'] ?? 'low'),
+                'is_lead'     => !empty($body['is_lead']) ? '1' : '0',
+                'is_complaint'  => !empty($body['is_complaint']) ? '1' : '0',
+                'is_influencer' => !empty($body['is_influencer']) ? '1' : '0',
+                'has_photo'     => !empty($body['has_photo']) ? '1' : '0',
+                'tags'        => sanitize_text_field($body['tags'] ?? ''),
+                'admin_notes' => sanitize_textarea_field($body['admin_notes'] ?? ''),
+            ];
+
+            $post_id = bv_create_entry($data);
+            if (!$post_id) {
+                return new WP_Error('save_failed', 'Failed to save entry', ['status' => 500]);
+            }
+
+            // Agent metadata
+            update_post_meta($post_id, 'bv_entry_method', 'extension');
+            $agent = $body['_agent'] ?? [];
+            if (!empty($agent['agent_id']))       update_post_meta($post_id, 'bv_agent_id', sanitize_text_field($agent['agent_id']));
+            if (isset($agent['confidence_score'])) update_post_meta($post_id, 'bv_agent_confidence', floatval($agent['confidence_score']));
+
+            return new WP_REST_Response(['success' => true, 'entry_id' => $post_id], 201);
+        },
+    ]);
+
+    // POST /wp-json/brand-voice/v1/entries/batch — สร้างหลาย entries
+    register_rest_route('brand-voice/v1', '/entries/batch', [
+        'methods'  => 'POST',
+        'permission_callback' => function() use ($verify_key, $rate_check) {
+            if (!$verify_key()) return new WP_Error('unauthorized', 'Invalid API key', ['status' => 401]);
+            if (!$rate_check()) return new WP_Error('rate_limit', 'Rate limit exceeded', ['status' => 429]);
+            return true;
+        },
+        'callback' => function(WP_REST_Request $req) {
+            $body = $req->get_json_params();
+            $entries = $body['entries'] ?? [];
+            if (!is_array($entries) || empty($entries)) {
+                return new WP_Error('bad_request', 'entries array required', ['status' => 400]);
+            }
+            if (count($entries) > 50) {
+                return new WP_Error('bad_request', 'Max 50 entries per batch', ['status' => 400]);
+            }
+
+            // Reuse single-entry logic
+            $results = [];
+            $created = 0;
+            foreach ($entries as $i => $entry) {
+                $inner_req = new WP_REST_Request('POST', '/brand-voice/v1/entries');
+                $inner_req->set_body(json_encode($entry));
+                $inner_req->set_header('Content-Type', 'application/json');
+                $resp = rest_do_request($inner_req);
+                $data = $resp->get_data();
+
+                if ($resp->get_status() === 201) {
+                    $results[] = ['index' => $i, 'status' => 'created', 'entry_id' => $data['entry_id']];
+                    $created++;
+                } elseif (($data['code'] ?? '') === 'duplicate') {
+                    $results[] = ['index' => $i, 'status' => 'duplicate', 'existing_id' => $data['existing_id'] ?? null];
+                } else {
+                    $results[] = ['index' => $i, 'status' => 'error', 'message' => $data['message'] ?? 'unknown'];
+                }
+            }
+
+            return new WP_REST_Response([
+                'success' => true, 'total' => count($entries),
+                'created' => $created, 'results' => $results,
+            ], 200);
+        },
+    ]);
+
+    // GET /wp-json/brand-voice/v1/meta — ดึง brands/categories/models/platforms (สำหรับ Extension)
+    register_rest_route('brand-voice/v1', '/meta', [
+        'methods'  => 'GET',
+        'permission_callback' => function() use ($verify_key) {
+            return $verify_key();
+        },
+        'callback' => function() {
+            return new WP_REST_Response([
+                'brands'     => bv_get_brands(),
+                'categories' => bv_get_categories(),
+                'models'     => bv_get_models(),
+                'platforms'  => bv_get_platforms(),
+            ], 200);
+        },
+    ]);
+
+    // POST /wp-json/brand-voice/v1/api-keys/generate — Admin สร้าง API key ใหม่
+    register_rest_route('brand-voice/v1', '/api-keys/generate', [
+        'methods'  => 'POST',
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+        'callback' => function(WP_REST_Request $req) {
+            $name = sanitize_text_field($req->get_param('name') ?: 'Extension Key');
+            $raw_key = 'bvk_' . bin2hex(random_bytes(24));
+            $stored = get_option('bv_api_keys', []);
+            if (!is_array($stored)) $stored = [];
+            $stored[] = [
+                'key_hash'   => hash('sha256', $raw_key),
+                'name'       => $name,
+                'created'    => date('Y-m-d H:i:s'),
+                'last_used'  => null,
+            ];
+            update_option('bv_api_keys', $stored);
+            return new WP_REST_Response([
+                'success' => true,
+                'api_key' => $raw_key,
+                'message' => 'เก็บ key นี้ไว้ — จะแสดงครั้งเดียว',
+            ], 201);
+        },
+    ]);
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. AJAX Endpoints
@@ -502,10 +706,10 @@ add_shortcode('dinoco_brand_voice', function() {
     ?>
 
 <!-- ============================================================== -->
-<!-- Brand Voice Pool — V.1.7                                       -->
+<!-- Brand Voice Pool — V.2.0                                       -->
 <!-- ============================================================== -->
 <style>
-/* ── Scoped: .dnc-bv — Light Theme V.1.7 ── */
+/* ── Scoped: .dnc-bv — Light Theme V.2.0 ── */
 .dnc-bv { font-family: 'Noto Sans Thai', sans-serif; color: #334155; }
 .dnc-bv * { box-sizing: border-box; }
 
@@ -1019,6 +1223,39 @@ add_shortcode('dinoco_brand_voice', function() {
             <i class="fa-solid fa-triangle-exclamation" style="margin-right:4px;"></i>
             <strong>หมายเหตุ:</strong> ต้อง Login WordPress เป็น Admin ก่อนใช้งาน Bookmarklet — หากไม่ได้ Login จะไม่สามารถบันทึกได้
         </div>
+
+        <!-- Chrome Extension Section -->
+        <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:12px;padding:16px;margin-top:16px;">
+            <div style="font-size:14px;font-weight:700;color:#166534;margin-bottom:10px;">
+                <i class="fa-brands fa-chrome" style="margin-right:4px;"></i> Chrome Extension (แนะนำ)
+            </div>
+            <p style="font-size:12px;color:#475569;margin-bottom:12px;">
+                ทำงานได้ดีกว่า Bookmarklet — ดึงชื่อผู้โพสต์/กลุ่ม/platform อัตโนมัติ ไม่ต้อง login WordPress
+            </p>
+            <div style="font-size:12px;color:#334155;margin-bottom:8px;"><strong>วิธีติดตั้ง:</strong></div>
+            <ol style="font-size:12px;color:#475569;padding-left:18px;margin-bottom:12px;line-height:1.8;">
+                <li>ดาวน์โหลดโฟลเดอร์ <code>brand-voice-extension</code> จาก GitHub repo</li>
+                <li>เปิด Chrome → <code>chrome://extensions</code> → เปิด Developer Mode</li>
+                <li>กด <strong>"Load unpacked"</strong> → เลือกโฟลเดอร์ <code>brand-voice-extension</code></li>
+                <li>กด icon Extension แล้วใส่ URL + API Key ด้านล่าง</li>
+            </ol>
+
+            <div style="font-size:12px;font-weight:600;color:#334155;margin-bottom:6px;"><i class="fa-solid fa-key" style="color:#d97706;margin-right:4px;"></i> API Key</div>
+            <div style="display:flex;gap:8px;align-items:center;">
+                <button class="bv-btn-ai" onclick="BV.generateApiKey()" style="padding:6px 14px;font-size:12px;" id="bv-gen-key-btn">
+                    <i class="fa-solid fa-plus"></i> สร้าง API Key ใหม่
+                </button>
+            </div>
+            <div id="bv-api-key-result" style="display:none;margin-top:10px;padding:10px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;">
+                <div style="font-size:11px;color:#64748b;margin-bottom:4px;">คัดลอก key นี้ไปใส่ใน Extension (แสดงครั้งเดียว)</div>
+                <code id="bv-api-key-value" style="font-size:13px;color:#1e40af;word-break:break-all;"></code>
+            </div>
+
+            <div style="margin-top:12px;">
+                <div style="font-size:12px;font-weight:600;color:#334155;margin-bottom:4px;"><i class="fa-solid fa-link" style="color:#3b82f6;margin-right:4px;"></i> Site URL</div>
+                <code style="font-size:12px;color:#1e40af;"><?php echo esc_html(home_url()); ?></code>
+            </div>
+        </div>
     </div>
 
 </div>
@@ -1454,6 +1691,36 @@ add_shortcode('dinoco_brand_voice', function() {
         }, 'json').fail(function() {
             $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> AI รวบรวมเสียงลูกค้า');
             $status.html('<span style="color:#ef4444;">เชื่อมต่อไม่สำเร็จ</span>');
+        });
+    };
+
+    // ── Generate API Key (for Extension) ──
+    BV.generateApiKey = function() {
+        var $btn = $('#bv-gen-key-btn');
+        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> กำลังสร้าง...');
+
+        $.ajax({
+            url: '<?php echo esc_url(rest_url('brand-voice/v1/api-keys/generate')); ?>',
+            method: 'POST',
+            beforeSend: function(xhr) {
+                xhr.setRequestHeader('X-WP-Nonce', '<?php echo wp_create_nonce('wp_rest'); ?>');
+            },
+            data: JSON.stringify({ name: 'Extension Key ' + new Date().toISOString().slice(0,10) }),
+            contentType: 'application/json',
+            success: function(res) {
+                if (res.success) {
+                    $('#bv-api-key-value').text(res.api_key);
+                    $('#bv-api-key-result').show();
+                    $btn.html('<i class="fa-solid fa-check"></i> สร้างแล้ว').css('background', '#16a34a');
+                } else {
+                    alert('สร้าง API Key ไม่สำเร็จ');
+                    $btn.prop('disabled', false).html('<i class="fa-solid fa-plus"></i> สร้าง API Key ใหม่');
+                }
+            },
+            error: function() {
+                alert('เชื่อมต่อ REST API ไม่สำเร็จ');
+                $btn.prop('disabled', false).html('<i class="fa-solid fa-plus"></i> สร้าง API Key ใหม่');
+            }
         });
     };
 
