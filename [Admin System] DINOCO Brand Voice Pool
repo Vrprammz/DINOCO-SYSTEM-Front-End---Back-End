@@ -3,7 +3,7 @@
  * [Admin System] DINOCO Brand Voice Pool
  * Shortcode: [dinoco_brand_voice]
  * Description: เก็บเสียงลูกค้าจากโซเชียล — วิเคราะห์แบรนด์ DINOCO vs คู่แข่ง
- * Version: V.2.0
+ * Version: V.2.1
  * DB_ID: 1159
  * ======================================================================
  */
@@ -416,6 +416,173 @@ add_action('rest_api_init', function() {
         },
     ]);
 
+    // POST /wp-json/brand-voice/v1/entries/ai-bulk — รับ post+comments แล้ว AI วิเคราะห์ทีละอัน
+    register_rest_route('brand-voice/v1', '/entries/ai-bulk', [
+        'methods'  => 'POST',
+        'permission_callback' => function() use ($verify_key, $rate_check) {
+            if (!$verify_key()) return new WP_Error('unauthorized', 'Invalid API key', ['status' => 401]);
+            if (!$rate_check()) return new WP_Error('rate_limit', 'Rate limit exceeded', ['status' => 429]);
+            return true;
+        },
+        'callback' => function(WP_REST_Request $req) {
+            $body = $req->get_json_params();
+            $post_data = $body['post'] ?? null;
+            $comments  = $body['comments'] ?? [];
+            $source_url  = esc_url_raw($body['url'] ?? '');
+            $platform    = sanitize_text_field($body['platform'] ?? 'other');
+            $source_name = sanitize_text_field($body['source_name'] ?? '');
+
+            if (!$post_data && empty($comments)) {
+                return new WP_Error('bad_request', 'post or comments required', ['status' => 400]);
+            }
+
+            // Build items to analyze (post + each comment separately)
+            $items = [];
+            if ($post_data && !empty($post_data['text'])) {
+                $items[] = [
+                    'type'   => 'post',
+                    'author' => $post_data['author'] ?? '',
+                    'text'   => $post_data['text'],
+                ];
+            }
+            foreach ($comments as $c) {
+                if (!empty($c['text']) && mb_strlen($c['text']) >= 3) {
+                    $items[] = [
+                        'type'   => 'comment',
+                        'author' => $c['author'] ?? '',
+                        'text'   => $c['text'],
+                    ];
+                }
+            }
+
+            if (empty($items)) {
+                return new WP_Error('bad_request', 'No valid items to analyze', ['status' => 400]);
+            }
+
+            // Check AI available
+            if (!class_exists('DINOCO_AI')) {
+                return new WP_Error('ai_unavailable', 'AI Provider not active', ['status' => 503]);
+            }
+
+            // Build AI prompt — analyze ALL items in one call
+            $valid_brands = implode(',', bv_get_brands());
+            $valid_cats   = implode(',', array_keys(bv_get_categories()));
+            $valid_models = implode(',', bv_get_models());
+
+            $items_json = [];
+            foreach ($items as $i => $item) {
+                $items_json[] = ['i' => $i, 'author' => $item['author'], 'text' => mb_substr($item['text'], 0, 500)];
+            }
+
+            $system_prompt = 'คุณคือนักวิเคราะห์ brand sentiment ตลาดอะไหล่ BigBike ไทย
+วิเคราะห์แต่ละข้อความแยกกัน ตอบ JSON array ตรง ห้าม markdown
+
+brands ต้องเลือกจาก: ' . $valid_brands . ' (เลือกได้หลายอัน หรือ [] ถ้าไม่เกี่ยว)
+sentiment: positive/neutral/negative/mixed
+categories ต้องเลือกจาก: ' . $valid_cats . '
+models ต้องเลือกจาก: ' . $valid_models . ' (เลือกได้หลายอัน หรือ [])
+
+ตอบ JSON array:
+[{"i":0,"brands":["DINOCO"],"sentiment":"positive","categories":["quality"],"models":["CB650R"],"summary":"สรุป1บรรทัด","is_relevant":true}]
+
+is_relevant=false ถ้าข้อความไม่เกี่ยวกับอะไหล่แต่ง/แบรนด์ใดเลย (เช่น แค่ "555" หรือ emoji)
+ข้อความสั้นมากที่ไม่มีเนื้อหา ให้ is_relevant=false';
+
+            $user_msg = "วิเคราะห์ " . count($items_json) . " ข้อความจาก " . $source_name . ":\n" . json_encode($items_json, JSON_UNESCAPED_UNICODE);
+
+            $ai_result = DINOCO_AI::chat(
+                $system_prompt,
+                [['role' => 'user', 'text' => $user_msg]],
+                [],
+                ['temperature' => 0.2, 'max_tokens' => 4096]
+            );
+
+            if (empty($ai_result['success']) || empty($ai_result['text'])) {
+                return new WP_Error('ai_failed', 'AI analysis failed: ' . ($ai_result['text'] ?? 'no response'), ['status' => 502]);
+            }
+
+            // Parse AI response
+            $raw = $ai_result['text'];
+            $json_str = $raw;
+            if (preg_match('/```(?:json)?\s*([\s\S]*?)```/', $raw, $m)) {
+                $json_str = trim($m[1]);
+            }
+            $start = strpos($json_str, '[');
+            $end   = strrpos($json_str, ']');
+            if ($start !== false && $end !== false) {
+                $json_str = substr($json_str, $start, $end - $start + 1);
+            }
+            $analyses = json_decode(trim($json_str), true);
+
+            if (!is_array($analyses)) {
+                return new WP_Error('ai_parse_failed', 'Cannot parse AI response', ['status' => 502]);
+            }
+
+            // Map analyses back to items and save
+            $valid_brands_arr = bv_get_brands();
+            $valid_cats_arr   = array_keys(bv_get_categories());
+            $valid_models_arr = bv_get_models();
+            $valid_sentiments = ['positive', 'neutral', 'negative', 'mixed'];
+
+            $results = [];
+            $saved = 0;
+            $skipped = 0;
+
+            foreach ($analyses as $a) {
+                $idx = $a['i'] ?? -1;
+                if ($idx < 0 || $idx >= count($items)) continue;
+                $item = $items[$idx];
+
+                // Skip irrelevant
+                if (empty($a['is_relevant'])) {
+                    $results[] = ['index' => $idx, 'status' => 'skipped', 'reason' => 'not relevant'];
+                    $skipped++;
+                    continue;
+                }
+
+                $brands = array_values(array_filter((array)($a['brands'] ?? []), function($b) use ($valid_brands_arr) { return in_array($b, $valid_brands_arr); }));
+                $cats   = array_values(array_filter((array)($a['categories'] ?? []), function($c) use ($valid_cats_arr) { return in_array($c, $valid_cats_arr); }));
+                $models = array_values(array_filter((array)($a['models'] ?? []), function($m) use ($valid_models_arr) { return in_array($m, $valid_models_arr); }));
+                $sentiment = in_array($a['sentiment'] ?? '', $valid_sentiments) ? $a['sentiment'] : 'neutral';
+
+                $data = [
+                    'brands'      => $brands,
+                    'content'     => sanitize_textarea_field($item['text']),
+                    'summary'     => sanitize_text_field(mb_substr($a['summary'] ?? $item['text'], 0, 100)),
+                    'sentiment'   => $sentiment,
+                    'intensity'   => 3,
+                    'categories'  => $cats,
+                    'platform'    => $platform,
+                    'source_url'  => $source_url,
+                    'source_name' => $source_name,
+                    'post_date'   => date('Y-m-d'),
+                    'models'      => $models,
+                    'author_name' => sanitize_text_field($item['author']),
+                    'engagement'  => 'medium',
+                    'tags'        => $item['type'] === 'post' ? 'original_post' : 'comment',
+                ];
+
+                $post_id = bv_create_entry($data);
+                if ($post_id) {
+                    update_post_meta($post_id, 'bv_entry_method', 'extension_ai');
+                    update_post_meta($post_id, 'bv_agent_id', 'chrome_extension_v2');
+                    $saved++;
+                    $results[] = ['index' => $idx, 'status' => 'created', 'entry_id' => $post_id, 'sentiment' => $sentiment, 'brands' => $brands];
+                } else {
+                    $results[] = ['index' => $idx, 'status' => 'error'];
+                }
+            }
+
+            return new WP_REST_Response([
+                'success' => true,
+                'total_items'  => count($items),
+                'saved'        => $saved,
+                'skipped'      => $skipped,
+                'results'      => $results,
+            ], 200);
+        },
+    ]);
+
     // POST /wp-json/brand-voice/v1/api-keys/generate — Admin สร้าง API key ใหม่
     register_rest_route('brand-voice/v1', '/api-keys/generate', [
         'methods'  => 'POST',
@@ -706,10 +873,10 @@ add_shortcode('dinoco_brand_voice', function() {
     ?>
 
 <!-- ============================================================== -->
-<!-- Brand Voice Pool — V.2.0                                       -->
+<!-- Brand Voice Pool — V.2.1                                       -->
 <!-- ============================================================== -->
 <style>
-/* ── Scoped: .dnc-bv — Light Theme V.2.0 ── */
+/* ── Scoped: .dnc-bv — Light Theme V.2.1 ── */
 .dnc-bv { font-family: 'Noto Sans Thai', sans-serif; color: #334155; }
 .dnc-bv * { box-sizing: border-box; }
 

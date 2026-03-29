@@ -2,7 +2,7 @@
 
 **Shortcode:** `[dinoco_brand_voice]`
 **DB_ID:** 1159
-**Version:** V.2.0
+**Version:** V.2.1
 **วันที่สร้าง:** 2026-03-29
 
 ---
@@ -27,7 +27,8 @@
 | V.1.5 | `f731d3e` | บังคับ categories จาก list + กราฟ top 8 |
 | V.1.6 | `1030351` | Bookmarklet เก็บเสียงลูกค้าจากโซเชียลได้ทันที |
 | V.1.7 | `3ee7e0f` | แก้ Bookmarklet hash ให้เปิด Brand Voice tab ถูกต้อง |
-| V.2.0 | - | REST API + Chrome Extension สำหรับเก็บข้อมูลจากโซเชียล |
+| V.2.0 | `52152c2` | REST API + Chrome Extension สำหรับเก็บข้อมูลจากโซเชียล |
+| V.2.1 | - | One-click: AI วิเคราะห์ Post+Comments แยก entry อัตโนมัติ |
 
 ---
 
@@ -52,6 +53,7 @@ Base: `/wp-json/brand-voice/v1/`
 |--------|----------|------|-------------|
 | POST | `/entries` | API Key | สร้าง entry เดียว |
 | POST | `/entries/batch` | API Key | สร้าง entries หลายอัน (max 50) |
+| POST | `/entries/ai-bulk` | API Key | รับ post+comments → AI วิเคราะห์แยก entry |
 | GET | `/meta` | API Key | ดึง brands/categories/models/platforms |
 | POST | `/api-keys/generate` | WP Admin | สร้าง API Key ใหม่ |
 
