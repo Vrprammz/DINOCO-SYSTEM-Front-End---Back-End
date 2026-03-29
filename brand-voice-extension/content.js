@@ -96,34 +96,49 @@ function countVisibleComments() {
 // Strategy: ใช้ raw text จาก dialog/modal เป็นหลัก แล้วให้ AI แยก
 // เพราะ Facebook เปลี่ยน DOM บ่อยมาก selector-based approach ไม่ stable
 function extractFacebookFull(result) {
-  // Focus เฉพาะ dialog (โพสต์ที่เปิดอยู่) ไม่ใช่ทั้ง feed
-  const container = document.querySelector('[role="dialog"]');
+  // หา container ที่เป็นโพสต์เดียว — ลองหลายวิธีตาม FB layout
+  let container = null;
+  let method = '';
+
+  // 1. Dialog popup (คลิกโพสต์จาก feed)
+  container = document.querySelector('[role="dialog"]');
+  if (container) {
+    method = 'dialog';
+  }
+
+  // 2. Permalink page (/permalink/, /posts/, ?multi_permalinks=)
+  //    FB แสดงโพสต์เดียวใน main content area
   if (!container) {
-    // ไม่มี dialog เปิด — ใช้ main content แต่ต้องระวัง
-    // อาจดึงจากหลายโพสต์ได้ ให้ใช้ raw text approach
-    const main = document.querySelector('[role="main"]');
-    if (main) {
-      result.rawText = cleanFacebookText(main.innerText);
-      result.extractionMethod = 'raw_fallback';
+    const url = window.location.href;
+    const isPermalink = url.includes('/permalink/') || url.includes('/posts/') || url.includes('multi_permalinks=');
+    if (isPermalink) {
+      // หา article แรกใน main (คือโพสต์หลัก + comments)
+      const main = document.querySelector('[role="main"]');
+      if (main) {
+        container = main;
+        method = 'permalink';
+      }
     }
+  }
+
+  // 3. Feed page ทั่วไป — ไม่ดึง เพราะจะได้หลายโพสต์ปน
+  if (!container) {
+    // แจ้งให้ user เปิดโพสต์ก่อน
     return;
   }
 
-  // มี dialog เปิด — ดึง text ทั้งหมดจาก dialog นี้เท่านั้น
   const rawText = container.innerText;
   const cleaned = cleanFacebookText(rawText);
 
   if (cleaned.length < 20) return;
 
-  // ส่ง raw text ให้ AI แยก post + comments ทั้งหมด
-  // AI จะจับ author name + comment text ได้ดีกว่า regex
   result.rawText = cleaned;
-  result.extractionMethod = 'raw_dialog';
+  result.extractionMethod = 'raw_' + method;
 
-  // พยายามดึง group name จาก page title
+  // ดึง group name จาก page title
   const title = document.title;
-  const match = title.match(/^(.+?)\s*[·|]/);
-  if (match) result.sourceName = match[1].trim();
+  const titleMatch = title.match(/^(.+?)\s*[·|]/);
+  if (titleMatch) result.sourceName = titleMatch[1].trim();
 }
 
 function cleanFacebookText(raw) {

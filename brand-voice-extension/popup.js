@@ -81,11 +81,22 @@ async function showMain() {
   document.getElementById('settings-bar').style.display = 'flex';
   document.getElementById('conn-status').textContent = '● ' + config.siteUrl.replace(/https?:\/\//, '');
 
-  // Get page info from content script
+  // Get page info from content script (inject if needed)
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) return;
-    const resp = await chrome.tabs.sendMessage(tab.id, { action: 'getPageData' });
+
+    let resp;
+    try {
+      resp = await chrome.tabs.sendMessage(tab.id, { action: 'getPageData' });
+    } catch (e) {
+      // Content script ยังไม่ inject (FB SPA navigate / เพิ่งติดตั้ง) — inject ใหม่
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      // รอ script โหลด
+      await new Promise(r => setTimeout(r, 500));
+      resp = await chrome.tabs.sendMessage(tab.id, { action: 'getPageData' });
+    }
+
     if (resp) {
       pageData = resp;
       const icon = PLAT_ICONS[resp.platform] || '🌐';
@@ -120,7 +131,15 @@ async function collectAll() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) return showError('ไม่พบ tab ที่เปิดอยู่');
-    fullData = await chrome.tabs.sendMessage(tab.id, { action: 'getFullPost' });
+
+    try {
+      fullData = await chrome.tabs.sendMessage(tab.id, { action: 'getFullPost' });
+    } catch (e) {
+      // Content script ไม่ตอบ — inject ใหม่แล้วลองอีกครั้ง
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      await new Promise(r => setTimeout(r, 500));
+      fullData = await chrome.tabs.sendMessage(tab.id, { action: 'getFullPost' });
+    }
   } catch (e) {
     return showError('ไม่สามารถอ่านหน้าเว็บได้ — ลอง refresh หน้าแล้วกดใหม่');
   }
