@@ -170,7 +170,7 @@ function extractFacebookFull(result) {
   });
 
   // Fallback: if structured extraction failed, send raw text for AI to parse
-  if (result.comments.length === 0 && !result.post) {
+  if (result.comments.length === 0 && (!result.post || !result.post.text)) {
     const container = document.querySelector('[role="dialog"]') || document.querySelector('[role="main"]');
     if (container) {
       const rawText = container.innerText;
