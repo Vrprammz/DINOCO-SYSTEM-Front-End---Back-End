@@ -1,0 +1,237 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2F] Snippet 6: Order State Machine (FSM)                  ║
+ * ║  Version: V.1.0                                              ║
+ * ║  DB_ID: 2006                                                 ║
+ * ║  Description: ป้องกัน invalid PO status transitions          ║
+ * ║  สำหรับระบบ B2F (Business to Factory)                         ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * ทุก status transition ต้องผ่าน b2f_transition_order() เท่านั้น
+ * ถ้า transition ไม่ valid → reject + log warning
+ *
+ * Reuse pattern จาก [B2B] Snippet 14: Order State Machine
+ * Kill Switch: define('B2F_DISABLED', true)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
+
+if ( ! class_exists( 'B2F_Order_FSM' ) ) {
+
+class B2F_Order_FSM {
+
+    /**
+     * Allowed transitions: from_status => [to_status => required_actor]
+     * actor: 'admin' | 'maker' | 'system' | 'any'
+     */
+    private static $transitions = array(
+        'draft' => array(
+            'submitted'        => 'admin',      // Admin ส่ง PO
+            'cancelled'        => 'admin',      // Admin ยกเลิก draft
+        ),
+        'submitted' => array(
+            'confirmed'        => 'maker',      // Maker ยืนยัน + กรอก ETA
+            'rejected'         => 'maker',      // Maker ปฏิเสธ
+            'amended'          => 'admin',      // Admin แก้ไข PO
+            'cancelled'        => 'admin',      // Admin ยกเลิก
+        ),
+        'confirmed' => array(
+            'delivering'       => 'maker',      // Maker แจ้งส่งของ
+            'amended'          => 'admin',      // Admin แก้ไข PO
+            'cancelled'        => 'admin',      // Admin ยกเลิก
+        ),
+        'amended' => array(
+            'submitted'        => 'system',     // Auto-resubmit ทันที (transient state)
+        ),
+        'rejected' => array(
+            'amended'          => 'admin',      // Admin แก้ไขแล้วส่งใหม่
+            'submitted'        => 'admin',      // Admin ส่งใหม่โดยไม่แก้ไข
+            'cancelled'        => 'admin',      // Admin ยกเลิก
+        ),
+        'delivering' => array(
+            'received'         => 'admin',      // Admin ตรวจรับครบ
+            'partial_received' => 'admin',      // Admin ตรวจรับบางส่วน
+            'confirmed'        => 'admin',      // Admin reject ทั้ง lot → Maker ต้องส่งใหม่
+        ),
+        'partial_received' => array(
+            'delivering'       => 'maker',      // Maker ส่งเพิ่ม
+            'received'         => 'admin',      // Admin ตรวจรับส่วนที่เหลือครบ
+            'cancelled'        => 'admin',      // Admin ยกเลิก (ต้อง rollback inventory + debt)
+        ),
+        'received' => array(
+            'paid'             => 'admin',      // Admin จ่ายเงินครบ
+            'partial_paid'     => 'admin',      // Admin จ่ายบางส่วน
+            'completed'        => 'admin',      // Admin ปิด PO โดยไม่จ่าย (sample/ของฟรี)
+        ),
+        'partial_paid' => array(
+            'paid'             => 'admin',      // Admin จ่ายครบ
+        ),
+        'paid' => array(
+            'completed'        => 'system',     // Auto-complete เมื่อจ่ายครบ
+        ),
+        // Terminal states: completed, cancelled — ไม่มี outbound transitions
+    );
+
+    /**
+     * Status labels ภาษาไทย
+     */
+    private static $labels = array(
+        'draft'            => 'แบบร่าง',
+        'submitted'        => 'ส่งแล้ว',
+        'confirmed'        => 'ยืนยันแล้ว',
+        'amended'          => 'แก้ไขแล้ว',
+        'rejected'         => 'ปฏิเสธ',
+        'delivering'       => 'กำลังส่ง',
+        'received'         => 'รับครบแล้ว',
+        'partial_received' => 'รับบางส่วน',
+        'paid'             => 'จ่ายแล้ว',
+        'partial_paid'     => 'จ่ายบางส่วน',
+        'completed'        => 'เสร็จสิ้น',
+        'cancelled'        => 'ยกเลิก',
+    );
+
+    /**
+     * Status badge CSS classes
+     */
+    private static $badge_classes = array(
+        'draft'            => 'b2f-badge-gray',
+        'submitted'        => 'b2f-badge-blue',
+        'confirmed'        => 'b2f-badge-green',
+        'amended'          => 'b2f-badge-purple',
+        'rejected'         => 'b2f-badge-red',
+        'delivering'       => 'b2f-badge-cyan',
+        'received'         => 'b2f-badge-emerald',
+        'partial_received' => 'b2f-badge-amber',
+        'paid'             => 'b2f-badge-green',
+        'partial_paid'     => 'b2f-badge-amber',
+        'completed'        => 'b2f-badge-slate',
+        'cancelled'        => 'b2f-badge-red',
+    );
+
+    /**
+     * ทำ status transition พร้อม validation
+     *
+     * @param int    $po_id      b2f_order post ID
+     * @param string $new_status Target status
+     * @param string $actor      'admin' | 'maker' | 'system'
+     * @param string $reason     เหตุผล (สำหรับ log)
+     * @return bool|WP_Error     true ถ้าสำเร็จ
+     */
+    public static function transition( $po_id, $new_status, $actor = 'system', $reason = '' ) {
+        $current = get_field( 'po_status', $po_id );
+        if ( empty( $current ) ) $current = get_post_meta( $po_id, 'po_status', true );
+        if ( empty( $current ) ) $current = 'draft';
+
+        // Check if current status has outbound transitions
+        if ( ! isset( self::$transitions[ $current ] ) ) {
+            b2f_log( "[FSM] Terminal: {$current} → {$new_status} (PO #{$po_id}) BLOCKED" );
+            return new WP_Error( 'terminal_state', "PO อยู่ในสถานะ " . self::label( $current ) . " ไม่สามารถเปลี่ยนได้" );
+        }
+
+        // Check if target status is valid from current
+        if ( ! isset( self::$transitions[ $current ][ $new_status ] ) ) {
+            b2f_log( "[FSM] Invalid: {$current} → {$new_status} (PO #{$po_id}) by {$actor}" );
+            return new WP_Error( 'invalid_transition', "ไม่สามารถเปลี่ยนจาก " . self::label( $current ) . " เป็น " . self::label( $new_status ) . " ได้" );
+        }
+
+        // Check actor permission
+        $required = self::$transitions[ $current ][ $new_status ];
+        if ( $required !== 'any' && $required !== $actor ) {
+            b2f_log( "[FSM] Permission denied: {$current} → {$new_status} requires {$required}, got {$actor} (PO #{$po_id})" );
+            return new WP_Error( 'permission_denied', "สิทธิ์ไม่เพียงพอ ({$actor} ≠ {$required})" );
+        }
+
+        // Execute transition
+        update_field( 'po_status', $new_status, $po_id );
+
+        // Status history (stored as post meta)
+        $hist = get_post_meta( $po_id, '_b2f_status_history', true ) ?: array();
+        $hist[] = array(
+            'from'   => $current,
+            'to'     => $new_status,
+            'actor'  => $actor,
+            'reason' => $reason,
+            'at'     => current_time( 'Y-m-d H:i:s' ),
+        );
+        update_post_meta( $po_id, '_b2f_status_history', $hist );
+
+        b2f_log( "[FSM] OK: {$current} → {$new_status} (PO #{$po_id}) by {$actor}" . ( $reason ? " reason: {$reason}" : '' ) );
+
+        // Fire action hook
+        do_action( 'b2f_order_status_changed', $po_id, $current, $new_status, $actor );
+
+        return true;
+    }
+
+    /**
+     * ตรวจว่า transition valid ไหม (ไม่ execute)
+     */
+    public static function can_transition( $po_id, $new_status, $actor = 'system' ) {
+        $current = get_field( 'po_status', $po_id );
+        if ( empty( $current ) ) $current = 'draft';
+        if ( ! isset( self::$transitions[ $current ][ $new_status ] ) ) return false;
+        $required = self::$transitions[ $current ][ $new_status ];
+        return ( $required === 'any' || $required === $actor );
+    }
+
+    /**
+     * ดู transitions ที่เป็นไปได้จาก status ปัจจุบัน
+     */
+    public static function available_transitions( $po_id, $actor = null ) {
+        $current = get_field( 'po_status', $po_id );
+        if ( empty( $current ) ) $current = 'draft';
+        if ( ! isset( self::$transitions[ $current ] ) ) return array();
+        $all = self::$transitions[ $current ];
+        if ( $actor === null ) return array_keys( $all );
+        return array_keys( array_filter( $all, function( $role ) use ( $actor ) {
+            return $role === 'any' || $role === $actor;
+        } ) );
+    }
+
+    /**
+     * ตรวจว่า status เป็น terminal state หรือไม่
+     */
+    public static function is_terminal( $status ) {
+        return ! isset( self::$transitions[ $status ] );
+    }
+
+    /**
+     * ดึง Thai label ของ status
+     */
+    public static function label( $status ) {
+        return self::$labels[ $status ] ?? $status;
+    }
+
+    /**
+     * ดึง CSS badge class ของ status
+     */
+    public static function badge_class( $status ) {
+        return self::$badge_classes[ $status ] ?? 'b2f-badge-gray';
+    }
+
+    /**
+     * ดึงประวัติ status changes ทั้งหมด
+     */
+    public static function get_history( $po_id ) {
+        return get_post_meta( $po_id, '_b2f_status_history', true ) ?: array();
+    }
+
+    /**
+     * ดึง all status labels (for select/filter)
+     */
+    public static function all_labels() {
+        return self::$labels;
+    }
+}
+
+} // end class_exists
+
+/**
+ * Wrapper function
+ */
+if ( ! function_exists( 'b2f_transition_order' ) ) {
+    function b2f_transition_order( $po_id, $new_status, $actor = 'system', $reason = '' ) {
+        return B2F_Order_FSM::transition( $po_id, $new_status, $actor, $reason );
+    }
+}

@@ -1,0 +1,490 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2F] Snippet 3: Webhook Handler & Bot Commands             ║
+ * ║  Version: V.1.0                                              ║
+ * ║  DB_ID: 2003                                                 ║
+ * ║  Description: B2F Bot commands สำหรับ Maker groups            ║
+ * ║  เรียกจาก [B2B] Snippet 2 ผ่าน function_exists() guard       ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * Architecture:
+ * - ไม่มี webhook endpoint ของตัวเอง (ใช้ B2B webhook เดิม)
+ * - B2B Snippet 2 routing: ถ้า group_id match b2f_maker → เรียก b2f_route_maker_command()
+ * - Admin group: B2B Snippet 2 เรียก b2f_route_admin_command() สำหรับ B2F keywords
+ *
+ * Kill Switch: define('B2F_DISABLED', true)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
+
+// ════════════════════════════════════════════
+// 1. MAKER GROUP — Text & Mention Commands
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_route_maker_command' ) ) {
+    /**
+     * Route commands จาก Maker LINE group
+     * เรียกจาก B2B Snippet 2 เมื่อ group_id match b2f_maker
+     *
+     * @param array $event    LINE webhook event
+     * @param array $maker    { id, name, group_id } จาก b2f_get_maker_by_group()
+     */
+    function b2f_route_maker_command( $event, $maker ) {
+        $type = $event['type'] ?? '';
+
+        if ( $type === 'message' && ( $event['message']['type'] ?? '' ) === 'text' ) {
+            b2f_handle_maker_text( $event, $maker );
+        } elseif ( $type === 'postback' ) {
+            b2f_handle_maker_postback( $event, $maker );
+        }
+        // join event → bot ถูก invite เข้ากลุ่มใหม่
+        elseif ( $type === 'join' ) {
+            b2f_handle_join_event( $event );
+        }
+    }
+}
+
+if ( ! function_exists( 'b2f_handle_maker_text' ) ) {
+    function b2f_handle_maker_text( $event, $maker ) {
+        $text = trim( strtolower( $event['message']['text'] ?? '' ) );
+        $reply_token = $event['replyToken'] ?? '';
+        $group_id = $event['source']['groupId'] ?? '';
+
+        // Dedup protection (60s)
+        $msg_id = $event['message']['id'] ?? '';
+        if ( $msg_id && get_transient( 'b2f_dedup_' . $msg_id ) ) return;
+        if ( $msg_id ) set_transient( 'b2f_dedup_' . $msg_id, 1, 60 );
+
+        // Check for mention (@bot)
+        $is_mention = false;
+        if ( isset( $event['message']['mention']['mentionees'] ) ) {
+            foreach ( $event['message']['mention']['mentionees'] as $m ) {
+                if ( isset( $m['isSelf'] ) && $m['isSelf'] ) {
+                    $is_mention = true;
+                    break;
+                }
+            }
+        }
+
+        // Commands
+        if ( $is_mention || $text === '@bot' ) {
+            // แสดง Maker menu
+            if ( function_exists( 'b2f_build_flex_command_menu_maker' ) ) {
+                $flex = b2f_build_flex_command_menu_maker( $maker['id'] );
+                b2f_line_reply_raw( $reply_token, array( $flex ) );
+            }
+            return;
+        }
+
+        // "ส่งของ" / "deliver"
+        if ( in_array( $text, array( 'ส่งของ', 'deliver', 'ส่ง' ) ) ) {
+            b2f_show_deliverable_pos( $reply_token, $maker );
+            return;
+        }
+
+        // "ดูpo" / "po" / "ดูใบสั่งซื้อ"
+        if ( in_array( $text, array( 'ดูpo', 'po', 'ดูใบสั่งซื้อ', 'ใบสั่งซื้อ' ) ) ) {
+            b2f_show_maker_po_list( $reply_token, $maker );
+            return;
+        }
+    }
+}
+
+if ( ! function_exists( 'b2f_handle_maker_postback' ) ) {
+    function b2f_handle_maker_postback( $event, $maker ) {
+        $data = $event['postback']['data'] ?? '';
+        $reply_token = $event['replyToken'] ?? '';
+        parse_str( $data, $params );
+        $action = $params['action'] ?? '';
+        $po_id = intval( $params['po_id'] ?? 0 );
+
+        // Dedup
+        $dedup_key = 'b2f_pb_' . md5( $data . ( $event['source']['userId'] ?? '' ) );
+        if ( get_transient( $dedup_key ) ) return;
+        set_transient( $dedup_key, 1, 10 );
+
+        switch ( $action ) {
+            case 'b2f_maker_deliver':
+                b2f_action_maker_deliver( $reply_token, $po_id, $maker );
+                break;
+
+            case 'b2f_approve_reschedule':
+            case 'b2f_reject_reschedule':
+                // Admin actions — handled ใน admin group (ไม่ใช่ maker group)
+                break;
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 2. ADMIN GROUP — B2F Commands
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_route_admin_command' ) ) {
+    /**
+     * Route B2F commands จาก Admin group
+     * เรียกจาก B2B Snippet 2 สำหรับ B2F-specific keywords
+     *
+     * @param string $text        ข้อความที่พิมพ์
+     * @param string $reply_token LINE reply token
+     * @return bool true ถ้า handled, false ถ้าไม่ใช่ B2F command
+     */
+    function b2f_route_admin_command( $text, $reply_token ) {
+        $text = trim( strtolower( $text ) );
+
+        // "สั่งโรงงาน" / "สั่ง maker"
+        if ( in_array( $text, array( 'สั่งโรงงาน', 'สั่ง maker', 'สั่งซื้อโรงงาน' ) ) ) {
+            $liff_url = function_exists( 'b2f_liff_url' ) ? b2f_liff_url( 'b2f-create-po/' ) : '#';
+            $flex = array(
+                'type' => 'flex',
+                'altText' => '🏭 สร้างใบสั่งซื้อโรงงาน',
+                'contents' => array(
+                    'type' => 'bubble',
+                    'size' => 'kilo',
+                    'body' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'contents' => array(
+                        array( 'type' => 'text', 'text' => '🏭 สร้างใบสั่งซื้อโรงงาน', 'weight' => 'bold', 'size' => 'md' ),
+                        array( 'type' => 'text', 'text' => 'เลือกโรงงาน → เลือก SKU → กรอกจำนวน', 'size' => 'xs', 'color' => '#888888', 'margin' => 'sm' ),
+                    ) ),
+                    'footer' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '12px', 'contents' => array(
+                        array( 'type' => 'button', 'style' => 'primary', 'color' => '#d97706', 'height' => 'sm',
+                            'action' => array( 'type' => 'uri', 'label' => '📝 สร้าง PO', 'uri' => $liff_url ) ),
+                    ) ),
+                ),
+            );
+            b2f_line_reply_raw( $reply_token, array( $flex ) );
+            return true;
+        }
+
+        // "ดูpo" / "po" / "สรุปโรงงาน"
+        if ( in_array( $text, array( 'ดูpo', 'po', 'สรุปโรงงาน' ) ) ) {
+            b2f_show_admin_po_summary( $reply_token );
+            return true;
+        }
+
+        return false; // ไม่ใช่ B2F command
+    }
+}
+
+// ════════════════════════════════════════════
+// 3. ADMIN POSTBACK HANDLER
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_handle_admin_postback' ) ) {
+    /**
+     * Handle B2F postback actions จาก Admin group
+     * เรียกจาก B2B Snippet 2 postback handler
+     *
+     * @param string $action     Action name (starts with 'b2f_')
+     * @param array  $params     Parsed postback data
+     * @param string $reply_token
+     * @return bool true ถ้า handled
+     */
+    function b2f_handle_admin_postback( $action, $params, $reply_token ) {
+        $po_id = intval( $params['po_id'] ?? 0 );
+
+        switch ( $action ) {
+            case 'b2f_approve_reschedule':
+                $new_date = sanitize_text_field( $params['new_date'] ?? '' );
+                if ( $po_id && $new_date ) {
+                    update_field( 'po_expected_date', $new_date, $po_id );
+                    b2f_transition_order( $po_id, 'confirmed', 'admin', 'อนุมัติเลื่อนวันส่ง' );
+
+                    // แจ้ง Maker
+                    $maker_id = get_field( 'po_maker_id', $po_id );
+                    $maker_group = get_field( 'maker_line_group_id', $maker_id );
+                    if ( $maker_group && function_exists( 'b2f_line_push' ) ) {
+                        b2f_line_push( $maker_group, array( array(
+                            'type' => 'text',
+                            'text' => '✅ DINOCO อนุมัติเลื่อนวันส่ง PO ' . get_field( 'po_number', $po_id ) . "\nวันส่งใหม่: " . $new_date,
+                        ) ) );
+                    }
+
+                    b2f_line_reply_raw( $reply_token, array( array(
+                        'type' => 'text',
+                        'text' => '✅ อนุมัติเลื่อนวันส่ง PO ' . get_field( 'po_number', $po_id ) . ' เป็น ' . $new_date,
+                    ) ) );
+                }
+                return true;
+
+            case 'b2f_reject_reschedule':
+                if ( $po_id ) {
+                    $maker_id = get_field( 'po_maker_id', $po_id );
+                    $maker_group = get_field( 'maker_line_group_id', $maker_id );
+                    if ( $maker_group && function_exists( 'b2f_line_push' ) ) {
+                        b2f_line_push( $maker_group, array( array(
+                            'type' => 'text',
+                            'text' => '❌ DINOCO ไม่อนุมัติเลื่อนวันส่ง PO ' . get_field( 'po_number', $po_id ) . "\nกรุณาส่งตามกำหนดเดิม",
+                        ) ) );
+                    }
+
+                    b2f_line_reply_raw( $reply_token, array( array(
+                        'type' => 'text',
+                        'text' => '❌ ไม่อนุมัติเลื่อน — แจ้ง Maker แล้ว',
+                    ) ) );
+                }
+                return true;
+        }
+
+        return false;
+    }
+}
+
+// ════════════════════════════════════════════
+// 4. BOT JOIN EVENT
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_handle_join_event' ) ) {
+    /**
+     * Bot ถูก invite เข้ากลุ่มใหม่ → ตอบ Group ID
+     */
+    function b2f_handle_join_event( $event ) {
+        $reply_token = $event['replyToken'] ?? '';
+        $group_id = $event['source']['groupId'] ?? '';
+
+        if ( $reply_token && $group_id ) {
+            b2f_line_reply_raw( $reply_token, array( array(
+                'type' => 'text',
+                'text' => "สวัสดีครับ DINOCO B2F Bot พร้อมใช้งาน 🏭\n\nGroup ID: {$group_id}\n\nกรุณาแจ้ง Admin เพื่อเชื่อมต่อระบบ\n(นำ Group ID ไปใส่ในหน้าจัดการโรงงาน)",
+            ) ) );
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 5. HELPER: แสดง PO ที่ส่งได้ (สำหรับ Maker)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_show_deliverable_pos' ) ) {
+    function b2f_show_deliverable_pos( $reply_token, $maker ) {
+        $q = new WP_Query( array(
+            'post_type'      => 'b2f_order',
+            'posts_per_page' => 10,
+            'post_status'    => 'publish',
+            'meta_query'     => array(
+                array( 'key' => 'po_maker_id', 'value' => $maker['id'] ),
+                array( 'key' => 'po_status', 'value' => array( 'confirmed', 'partial_received' ), 'compare' => 'IN' ),
+            ),
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+        ) );
+
+        if ( ! $q->have_posts() ) {
+            b2f_line_reply_raw( $reply_token, array( array(
+                'type' => 'text',
+                'text' => '📦 ไม่มี PO ที่รอส่งของตอนนี้',
+            ) ) );
+            return;
+        }
+
+        $bubbles = array();
+        foreach ( $q->posts as $post ) {
+            $po_number = get_field( 'po_number', $post->ID ) ?: '#' . $post->ID;
+            $po_total = floatval( get_field( 'po_total_amount', $post->ID ) ?: 0 );
+            $item_count = intval( get_field( 'po_item_count', $post->ID ) ?: 0 );
+            $status = get_field( 'po_status', $post->ID );
+
+            $bubbles[] = array(
+                'type' => 'bubble',
+                'size' => 'kilo',
+                'body' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '14px', 'spacing' => 'sm', 'contents' => array(
+                    array( 'type' => 'text', 'text' => '📦 ' . $po_number, 'weight' => 'bold', 'size' => 'md' ),
+                    array( 'type' => 'text', 'text' => $item_count . ' รายการ | ฿' . number_format( $po_total, 2 ), 'size' => 'xs', 'color' => '#888888' ),
+                    array( 'type' => 'text', 'text' => 'สถานะ: ' . B2F_Order_FSM::label( $status ), 'size' => 'xs', 'color' => '#d97706', 'margin' => 'sm' ),
+                ) ),
+                'footer' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '10px', 'contents' => array(
+                    array( 'type' => 'button', 'style' => 'primary', 'color' => '#d97706', 'height' => 'sm',
+                        'action' => array( 'type' => 'postback', 'label' => '📦 แจ้งส่งของ', 'data' => 'action=b2f_maker_deliver&po_id=' . $post->ID ) ),
+                ) ),
+            );
+        }
+
+        b2f_line_reply_raw( $reply_token, array( array(
+            'type' => 'flex',
+            'altText' => '📦 PO ที่รอส่งของ (' . count( $bubbles ) . ' รายการ)',
+            'contents' => array( 'type' => 'carousel', 'contents' => array_slice( $bubbles, 0, 10 ) ),
+        ) ) );
+    }
+}
+
+// ════════════════════════════════════════════
+// 6. HELPER: แสดง PO ทั้งหมดของ Maker
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_show_maker_po_list' ) ) {
+    function b2f_show_maker_po_list( $reply_token, $maker ) {
+        $q = new WP_Query( array(
+            'post_type'      => 'b2f_order',
+            'posts_per_page' => 5,
+            'post_status'    => 'publish',
+            'meta_query'     => array(
+                array( 'key' => 'po_maker_id', 'value' => $maker['id'] ),
+                array( 'key' => 'po_status', 'value' => array( 'cancelled', 'completed' ), 'compare' => 'NOT IN' ),
+            ),
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+        ) );
+
+        if ( ! $q->have_posts() ) {
+            b2f_line_reply_raw( $reply_token, array( array(
+                'type' => 'text',
+                'text' => '📋 ไม่มี PO ที่ค้างอยู่ตอนนี้',
+            ) ) );
+            return;
+        }
+
+        $lines = array( '📋 PO ที่ค้างอยู่:', '' );
+        foreach ( $q->posts as $post ) {
+            $po_number = get_field( 'po_number', $post->ID ) ?: '#' . $post->ID;
+            $status = get_field( 'po_status', $post->ID );
+            $eta = get_field( 'po_expected_date', $post->ID );
+            $line = $po_number . ' — ' . B2F_Order_FSM::label( $status );
+            if ( $eta ) $line .= ' (ส่ง: ' . date( 'd/m/Y', strtotime( $eta ) ) . ')';
+            $lines[] = $line;
+        }
+
+        b2f_line_reply_raw( $reply_token, array( array(
+            'type' => 'text',
+            'text' => implode( "\n", $lines ),
+        ) ) );
+    }
+}
+
+// ════════════════════════════════════════════
+// 7. HELPER: Admin PO Summary
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_show_admin_po_summary' ) ) {
+    function b2f_show_admin_po_summary( $reply_token ) {
+        global $wpdb;
+
+        $statuses = array( 'submitted', 'confirmed', 'delivering', 'partial_received', 'received' );
+        $counts = array();
+        foreach ( $statuses as $s ) {
+            $counts[ $s ] = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p
+                 JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'po_status'
+                 WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish' AND pm.meta_value = %s",
+                $s
+            ) );
+        }
+
+        // Overdue count
+        $overdue = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->posts} p
+             JOIN {$wpdb->postmeta} ps ON ps.post_id = p.ID AND ps.meta_key = 'po_status'
+             JOIN {$wpdb->postmeta} pe ON pe.post_id = p.ID AND pe.meta_key = 'po_expected_date'
+             WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+             AND ps.meta_value IN ('confirmed','delivering')
+             AND pe.meta_value < CURDATE()"
+        );
+
+        $lines = array(
+            '🏭 สรุป B2F PO',
+            '',
+            '📝 รอ Maker ยืนยัน: ' . $counts['submitted'],
+            '✅ ยืนยันแล้ว: ' . $counts['confirmed'],
+            '🚚 กำลังส่ง: ' . $counts['delivering'],
+            '📦 รับบางส่วน: ' . $counts['partial_received'],
+            '💰 รอจ่ายเงิน: ' . $counts['received'],
+            '',
+            '⚠️ ล่าช้า: ' . $overdue . ' PO',
+        );
+
+        b2f_line_reply_raw( $reply_token, array( array(
+            'type' => 'text',
+            'text' => implode( "\n", $lines ),
+        ) ) );
+    }
+}
+
+// ════════════════════════════════════════════
+// 8. ACTION: Maker แจ้งส่งของ
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_action_maker_deliver' ) ) {
+    function b2f_action_maker_deliver( $reply_token, $po_id, $maker ) {
+        if ( ! $po_id ) return;
+
+        // Verify PO belongs to this maker
+        $po_maker = get_field( 'po_maker_id', $po_id );
+        if ( intval( $po_maker ) !== intval( $maker['id'] ) ) {
+            b2f_line_reply_raw( $reply_token, array( array(
+                'type' => 'text', 'text' => '❌ PO นี้ไม่ใช่ของโรงงานคุณ',
+            ) ) );
+            return;
+        }
+
+        // Transition to delivering
+        $result = b2f_transition_order( $po_id, 'delivering', 'maker', 'Maker แจ้งส่งของ' );
+        if ( is_wp_error( $result ) ) {
+            b2f_line_reply_raw( $reply_token, array( array(
+                'type' => 'text', 'text' => '❌ ' . $result->get_error_message(),
+            ) ) );
+            return;
+        }
+
+        $po_number = get_field( 'po_number', $po_id );
+        update_field( 'po_actual_date', wp_date( 'Y-m-d' ), $po_id );
+
+        // แจ้ง Admin
+        $admin_group = defined( 'B2B_ADMIN_GROUP_ID' ) ? B2B_ADMIN_GROUP_ID : '';
+        if ( $admin_group && function_exists( 'b2f_build_flex_delivered' ) ) {
+            b2f_line_push( $admin_group, array( b2f_build_flex_delivered( $po_id ) ) );
+        } elseif ( $admin_group ) {
+            b2f_line_push( $admin_group, array( array(
+                'type' => 'text',
+                'text' => "🚚 โรงงาน {$maker['name']} แจ้งส่งของ\nPO: {$po_number}\n\nกรุณาตรวจรับสินค้า",
+            ) ) );
+        }
+
+        b2f_line_reply_raw( $reply_token, array( array(
+            'type' => 'text',
+            'text' => "✅ แจ้งส่งของ {$po_number} เรียบร้อย\nDINOCO จะตรวจรับสินค้าและแจ้งผลในกลุ่มนี้",
+        ) ) );
+    }
+}
+
+// ════════════════════════════════════════════
+// 9. LINE REPLY HELPER (ถ้ายังไม่มีจาก Snippet 1)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_line_reply_raw' ) ) {
+    function b2f_line_reply_raw( $reply_token, $messages ) {
+        if ( empty( $reply_token ) ) return;
+        $token = defined( 'B2B_LINE_ACCESS_TOKEN' ) ? B2B_LINE_ACCESS_TOKEN : '';
+        if ( empty( $token ) ) return;
+
+        wp_remote_post( 'https://api.line.me/v2/bot/message/reply', array(
+            'headers' => array(
+                'Content-Type'  => 'application/json',
+                'Authorization' => 'Bearer ' . $token,
+            ),
+            'body'    => json_encode( array(
+                'replyToken' => $reply_token,
+                'messages'   => array_slice( $messages, 0, 5 ),
+            ) ),
+            'timeout' => 10,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'b2f_line_push' ) ) {
+    function b2f_line_push( $to, $messages ) {
+        if ( empty( $to ) ) return;
+        $token = defined( 'B2B_LINE_ACCESS_TOKEN' ) ? B2B_LINE_ACCESS_TOKEN : '';
+        if ( empty( $token ) ) return;
+
+        wp_remote_post( 'https://api.line.me/v2/bot/message/push', array(
+            'headers' => array(
+                'Content-Type'  => 'application/json',
+                'Authorization' => 'Bearer ' . $token,
+            ),
+            'body'    => json_encode( array(
+                'to'       => $to,
+                'messages' => array_slice( $messages, 0, 5 ),
+            ) ),
+            'timeout' => 10,
+        ) );
+    }
+}

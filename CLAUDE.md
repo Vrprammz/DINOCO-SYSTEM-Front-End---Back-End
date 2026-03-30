@@ -25,10 +25,18 @@ DINOCO System is a **WordPress-based motorcycle warranty management platform** s
 | `[dinoco_admin_ai_control]` | AI assistant control panel |
 | `[dinoco_admin_finance]` | Finance dashboard (debt, revenue, payments) |
 | `[dinoco_brand_voice]` | Brand Voice Pool (social listening, brand sentiment) |
+| `[b2f_maker_liff]` | B2F Maker LIFF pages (confirm PO, reschedule, PO list) |
+| `[b2f_admin_orders_tab]` | B2F Orders tab (embedded in Admin Dashboard) |
+| `[b2f_admin_makers_tab]` | B2F Makers management tab |
+| `[b2f_admin_credit_tab]` | B2F Credit tracking tab |
 
 ## REST API Endpoints (B2B)
 
 All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, `update-status`, `delete-ticket`, `recalculate-total`, `flash-label`, `flash-ready-to-ship`.
+
+## REST API Endpoints (B2F)
+
+All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `approve-reschedule`, `receive-goods`, `record-payment`, `dashboard-stats`, `po-history`.
 
 ## Required WordPress Constants
 
@@ -39,6 +47,8 @@ All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, 
 - `DINOCO_GITHUB_TOKEN` — GitHub PAT for sync engine
 - `DINOCO_GITHUB_REPO` — GitHub repo (e.g., `Vrprammz/DINOCO-SYSTEM-Front-End---Back-End`)
 - `DINOCO_GITHUB_WEBHOOK_SECRET` — Webhook signature secret
+- `B2F_LIFF_ID` — LIFF app ID for B2F Maker pages
+- `B2F_LIFF_URL` — LIFF base URL for B2F
 
 ## File Organization
 
@@ -46,6 +56,7 @@ Files are named by feature area with bracket prefixes:
 - `[System] *` — Member-facing features (dashboard, registration, claims, profile)
 - `[Admin System] *` — Admin/management features (analytics, CRM, AI, knowledge base)
 - `[B2B] Snippet N: *` — B2B distributor modules (versioned snippets)
+- `[B2F] Snippet N: *` — B2F factory purchasing modules (Snippets 0-7)
 - `[GitHub] *` — Webhook integration
 
 Each file is a self-contained module with its own version number (e.g., V.32.x, V.34.x).
@@ -67,3 +78,6 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **View/Edit toggle pattern**: Profile page uses Facebook-style view-mode cards. Info is read-only by default; tap "แก้ไข" to expand the form. Save button only appears when a section is in edit mode.
 - **Motorcycle Catalog**: Brands/models/images/aliases stored in custom MySQL tables (`dinoco_moto_brands` + `dinoco_moto_models`) via `DINOCO_MotoDB` class in Snippet 15. Admin UI via `[dinoco_admin_moto]`. Consumer files use `dinoco_get_brands_list()`, `dinoco_get_model_image()`, `dinoco_get_moto_catalog_json()` with `class_exists` fallback.
 - **Negative margin gotcha**: Elements with negative margin (e.g. cover photo `margin: -20px -20px 0`) cause horizontal scroll. Always add `overflow-x: hidden` on the parent wrapper.
+- **B2F System**: Business to Factory — DINOCO สั่งซื้อสินค้าจากโรงงานผู้ผลิต (Maker). ใช้ LINE Bot เดียวกับ B2B, routing ตาม `group_id` (Distributor→B2B Flex, Maker→B2F Flex, Admin→ทั้งหมด). Kill switch: `define('B2F_DISABLED', true)`. Credit system ทิศทางกลับจาก B2B (DINOCO เป็นหนี้ Maker). Maker LIFF auth ใช้ Signed URL + JWT.
+- **B2F Credit System**: Atomic payable operations via `b2f_payable_add/subtract()` ใน Snippet 7. ใช้ `FOR UPDATE` lock เหมือน B2B Debt System. `b2f_recalculate_payable()` เป็น single-SQL source of truth. Auto credit hold เมื่อเลยวงเงิน (reason=auto), Admin hold เอง (reason=manual) ต้อง Admin unhold เท่านั้น.
+- **B2F FSM**: `B2F_Order_FSM` class ใน Snippet 6. 12 statuses: draft→submitted→confirmed→delivering→received→paid→completed. Terminal: completed, cancelled. ทุก transition ต้องผ่าน `b2f_transition_order()`.

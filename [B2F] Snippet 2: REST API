@@ -1,0 +1,2193 @@
+/**
+ * [B2F] Snippet 2: REST API
+ * Version: V.1.0
+ * DB_ID: 2002
+ * Kill Switch: define('B2F_DISABLED', true)
+ *
+ * REST endpoints สำหรับระบบ B2F (Business to Factory)
+ * Namespace: /wp-json/b2f/v1/
+ *
+ * Dependencies:
+ *   - Snippet 0: CPT & ACF Registration (b2f_validate_group_id, b2f_generate_po_number, b2f_generate_rcv_number, b2f_log)
+ *   - Snippet 6: Order State Machine (B2F_Order_FSM, b2f_transition_order)
+ *   - Snippet 7: Credit Transaction Manager (b2f_check_credit, b2f_payable_add, b2f_payable_subtract)
+ *   - B2B Snippet 15: DINOCO_JWT (encode/verify)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
+
+// ════════════════════════════════════════════
+// 1. ROUTE REGISTRATION
+// ════════════════════════════════════════════
+
+add_action( 'rest_api_init', function () {
+
+    $ns = 'b2f/v1';
+
+    // ── Admin permission check ──
+    $admin_perm = function ( WP_REST_Request $req ) {
+        return wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' )
+            && current_user_can( 'manage_options' );
+    };
+
+    // ── Maker JWT permission (public route, token validated inside callback) ──
+    $maker_perm = function () { return true; };
+
+    // ── Maker CRUD (admin only) ──
+    register_rest_route( $ns, '/makers', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2f_rest_list_makers',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/maker', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_save_maker',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/maker/delete', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_delete_maker',
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ── Maker Product CRUD (admin only) ──
+    register_rest_route( $ns, '/maker-products/(?P<maker_id>\d+)', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2f_rest_list_maker_products',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/maker-product', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_save_maker_product',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/maker-product/delete', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_delete_maker_product',
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ── PO Management (admin only) ──
+    register_rest_route( $ns, '/create-po', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_create_po',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/po-detail/(?P<po_id>\d+)', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2f_rest_po_detail',
+        'permission_callback' => $maker_perm, // admin OR maker JWT — verified inside callback
+    ) );
+    register_rest_route( $ns, '/po-update', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_po_update',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/po-cancel', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_po_cancel',
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ── Maker Actions (JWT auth) ──
+    register_rest_route( $ns, '/maker-confirm', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_maker_confirm',
+        'permission_callback' => $maker_perm,
+    ) );
+    register_rest_route( $ns, '/maker-reject', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_maker_reject',
+        'permission_callback' => $maker_perm,
+    ) );
+    register_rest_route( $ns, '/maker-reschedule', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_maker_reschedule',
+        'permission_callback' => $maker_perm,
+    ) );
+    register_rest_route( $ns, '/maker-po-list', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2f_rest_maker_po_list',
+        'permission_callback' => $maker_perm,
+    ) );
+
+    // ── Admin Actions ──
+    register_rest_route( $ns, '/approve-reschedule', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_approve_reschedule',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/receive-goods', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_receive_goods',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/record-payment', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_record_payment',
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ── Dashboard ──
+    register_rest_route( $ns, '/dashboard-stats', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2f_rest_dashboard_stats',
+        'permission_callback' => $admin_perm,
+    ) );
+    register_rest_route( $ns, '/po-history', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2f_rest_po_history',
+        'permission_callback' => $admin_perm,
+    ) );
+} );
+
+// ════════════════════════════════════════════
+// 2. HELPER: RATE LIMITER
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rate_limit' ) ) {
+    /**
+     * Transient-based rate limiter
+     * @param string $key     Unique key (e.g. 'create_po_<user_id>')
+     * @param int    $max     Max requests
+     * @param int    $window  Window in seconds (default 60)
+     * @return true|WP_Error
+     */
+    function b2f_rate_limit( $key, $max = 10, $window = 60 ) {
+        $tkey  = 'b2f_rl_' . md5( $key );
+        $count = (int) get_transient( $tkey );
+        if ( $count >= $max ) {
+            return new WP_Error( 'rate_limit', 'คำขอมากเกินไป กรุณารอสักครู่', array( 'status' => 429 ) );
+        }
+        set_transient( $tkey, $count + 1, $window );
+        return true;
+    }
+}
+
+// ════════════════════════════════════════════
+// 3. HELPER: JWT AUTH FOR MAKER ENDPOINTS
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_verify_maker_jwt' ) ) {
+    /**
+     * Verify JWT token from Maker LIFF
+     * @param WP_REST_Request $req
+     * @return array|WP_Error  { po_id, maker_id, action } or WP_Error
+     */
+    function b2f_verify_maker_jwt( WP_REST_Request $req ) {
+        $token = sanitize_text_field( $req->get_param( 'token' ) ?: '' );
+        if ( empty( $token ) ) {
+            // Try Authorization header
+            $auth = $req->get_header( 'Authorization' );
+            if ( $auth && stripos( $auth, 'Bearer ' ) === 0 ) {
+                $token = sanitize_text_field( substr( $auth, 7 ) );
+            }
+        }
+
+        if ( empty( $token ) ) {
+            return new WP_Error( 'no_token', 'ไม่พบ token สำหรับยืนยันตัวตน', array( 'status' => 401 ) );
+        }
+
+        if ( ! class_exists( 'DINOCO_JWT' ) ) {
+            return new WP_Error( 'jwt_unavailable', 'ระบบ JWT ไม่พร้อมใช้งาน', array( 'status' => 500 ) );
+        }
+
+        $payload = DINOCO_JWT::verify( $token );
+        if ( ! $payload ) {
+            return new WP_Error( 'invalid_token', 'Token ไม่ถูกต้องหรือหมดอายุ', array( 'status' => 401 ) );
+        }
+
+        // Required fields in payload: po_id, maker_id
+        if ( empty( $payload['po_id'] ) || empty( $payload['maker_id'] ) ) {
+            return new WP_Error( 'invalid_payload', 'Token ไม่มีข้อมูลที่จำเป็น', array( 'status' => 401 ) );
+        }
+
+        return array(
+            'po_id'    => intval( $payload['po_id'] ),
+            'maker_id' => intval( $payload['maker_id'] ),
+            'action'   => sanitize_text_field( $payload['action'] ?? '' ),
+        );
+    }
+}
+
+// ════════════════════════════════════════════
+// 4. HELPER: LINE PUSH (guard wrapper)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_line_push' ) ) {
+    /**
+     * Push Flex message to LINE group
+     * @param string $group_id  LINE group ID
+     * @param array  $flex      Flex message payload
+     * @return bool
+     */
+    function b2f_line_push( $group_id, $flex ) {
+        if ( empty( $group_id ) || empty( $flex ) ) return false;
+
+        $token = defined( 'B2B_LINE_ACCESS_TOKEN' ) ? B2B_LINE_ACCESS_TOKEN : '';
+        if ( empty( $token ) ) {
+            if ( function_exists( 'b2f_log' ) ) b2f_log( 'LINE push failed: no access token' );
+            return false;
+        }
+
+        $body = array(
+            'to'       => $group_id,
+            'messages' => array( $flex ),
+        );
+
+        $resp = wp_remote_post( 'https://api.line.me/v2/bot/message/push', array(
+            'headers' => array(
+                'Content-Type'  => 'application/json',
+                'Authorization' => 'Bearer ' . $token,
+            ),
+            'body'    => wp_json_encode( $body ),
+            'timeout' => 10,
+        ) );
+
+        if ( is_wp_error( $resp ) ) {
+            if ( function_exists( 'b2f_log' ) ) b2f_log( 'LINE push error: ' . $resp->get_error_message() );
+            return false;
+        }
+
+        $code = wp_remote_retrieve_response_code( $resp );
+        if ( $code !== 200 ) {
+            if ( function_exists( 'b2f_log' ) ) b2f_log( 'LINE push HTTP ' . $code . ': ' . wp_remote_retrieve_body( $resp ) );
+            return false;
+        }
+
+        return true;
+    }
+}
+
+// ════════════════════════════════════════════
+// 5. MAKER CRUD ENDPOINTS
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_list_makers' ) ) {
+    /**
+     * GET /makers — list all makers
+     * Params: ?status=active|inactive|all (default: all)
+     */
+    function b2f_rest_list_makers( WP_REST_Request $req ) {
+        $status_filter = sanitize_text_field( $req->get_param( 'status' ) ?: 'all' );
+
+        $args = array(
+            'post_type'      => 'b2f_maker',
+            'posts_per_page' => -1,
+            'post_status'    => 'publish',
+            'orderby'        => 'title',
+            'order'          => 'ASC',
+        );
+
+        if ( $status_filter !== 'all' ) {
+            $args['meta_query'] = array( array(
+                'key'   => 'maker_status',
+                'value' => $status_filter,
+            ) );
+        }
+
+        $q      = new WP_Query( $args );
+        $makers = array();
+
+        foreach ( $q->posts as $p ) {
+            $makers[] = b2f_format_maker( $p->ID );
+        }
+
+        return new WP_REST_Response( array( 'success' => true, 'makers' => $makers ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_format_maker' ) ) {
+    function b2f_format_maker( $maker_id ) {
+        return array(
+            'id'               => $maker_id,
+            'name'             => esc_html( get_field( 'maker_name', $maker_id ) ?: get_the_title( $maker_id ) ),
+            'contact'          => esc_html( get_field( 'maker_contact', $maker_id ) ?: '' ),
+            'phone'            => esc_html( get_field( 'maker_phone', $maker_id ) ?: '' ),
+            'email'            => sanitize_email( get_field( 'maker_email', $maker_id ) ?: '' ),
+            'address'          => esc_html( get_field( 'maker_address', $maker_id ) ?: '' ),
+            'line_group_id'    => esc_html( get_field( 'maker_line_group_id', $maker_id ) ?: '' ),
+            'tax_id'           => esc_html( get_field( 'maker_tax_id', $maker_id ) ?: '' ),
+            'bank_name'        => esc_html( get_field( 'maker_bank_name', $maker_id ) ?: '' ),
+            'bank_account'     => esc_html( get_field( 'maker_bank_account', $maker_id ) ?: '' ),
+            'bank_holder'      => esc_html( get_field( 'maker_bank_holder', $maker_id ) ?: '' ),
+            'status'           => esc_html( get_field( 'maker_status', $maker_id ) ?: 'active' ),
+            'notes'            => esc_html( get_field( 'maker_notes', $maker_id ) ?: '' ),
+            'credit_limit'     => floatval( get_field( 'maker_credit_limit', $maker_id ) ?: 0 ),
+            'current_debt'     => floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 ),
+            'credit_term_days' => intval( get_field( 'maker_credit_term_days', $maker_id ) ?: 30 ),
+            'credit_hold'      => (bool) get_field( 'maker_credit_hold', $maker_id ),
+        );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_save_maker' ) ) {
+    /**
+     * POST /maker — create or update maker
+     * Body: { id?, maker_name, maker_contact, maker_phone, maker_email,
+     *         maker_address, maker_line_group_id, maker_tax_id,
+     *         maker_bank_name, maker_bank_account, maker_bank_holder,
+     *         maker_status, maker_notes, maker_credit_limit, maker_credit_term_days }
+     */
+    function b2f_rest_save_maker( WP_REST_Request $req ) {
+        $id   = intval( $req->get_param( 'id' ) ?: 0 );
+        $name = sanitize_text_field( $req->get_param( 'maker_name' ) ?: '' );
+
+        if ( empty( $name ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณากรอกชื่อโรงงาน', 'code' => 'MISSING_NAME' ), 400 );
+        }
+
+        // Validate group_id uniqueness
+        $group_id = sanitize_text_field( $req->get_param( 'maker_line_group_id' ) ?: '' );
+        if ( ! empty( $group_id ) && function_exists( 'b2f_validate_group_id' ) ) {
+            $valid = b2f_validate_group_id( $group_id, $id );
+            if ( is_wp_error( $valid ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => $valid->get_error_message(), 'code' => 'DUPLICATE_GROUP_ID' ), 400 );
+            }
+        }
+
+        // Check name uniqueness
+        $name_check = new WP_Query( array(
+            'post_type'      => 'b2f_maker',
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'post_status'    => 'publish',
+            'post__not_in'   => $id ? array( $id ) : array(),
+            'meta_query'     => array( array(
+                'key'   => 'maker_name',
+                'value' => $name,
+            ) ),
+        ) );
+        if ( $name_check->found_posts > 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ชื่อโรงงานนี้มีอยู่แล้ว', 'code' => 'DUPLICATE_NAME' ), 400 );
+        }
+
+        // Create or update
+        if ( $id > 0 ) {
+            $post = get_post( $id );
+            if ( ! $post || $post->post_type !== 'b2f_maker' ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบโรงงาน', 'code' => 'NOT_FOUND' ), 404 );
+            }
+            wp_update_post( array( 'ID' => $id, 'post_title' => $name ) );
+        } else {
+            $id = wp_insert_post( array(
+                'post_type'   => 'b2f_maker',
+                'post_title'  => $name,
+                'post_status' => 'publish',
+            ) );
+            if ( is_wp_error( $id ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => 'สร้างโรงงานไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
+            }
+        }
+
+        // Save ACF fields
+        $fields = array(
+            'maker_name', 'maker_contact', 'maker_phone', 'maker_email',
+            'maker_address', 'maker_line_group_id', 'maker_tax_id',
+            'maker_bank_name', 'maker_bank_account', 'maker_bank_holder',
+            'maker_status', 'maker_notes',
+        );
+        foreach ( $fields as $f ) {
+            $val = $req->get_param( $f );
+            if ( $val !== null ) {
+                update_field( $f, sanitize_text_field( $val ), $id );
+            }
+        }
+
+        // Numeric fields
+        $credit_limit = $req->get_param( 'maker_credit_limit' );
+        if ( $credit_limit !== null ) {
+            update_field( 'maker_credit_limit', floatval( $credit_limit ), $id );
+        }
+        $credit_term = $req->get_param( 'maker_credit_term_days' );
+        if ( $credit_term !== null ) {
+            update_field( 'maker_credit_term_days', intval( $credit_term ), $id );
+        }
+
+        // Clear group_id cache
+        if ( ! empty( $group_id ) ) {
+            delete_transient( 'b2f_maker_gid_' . md5( $group_id ) );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Maker saved: #%d %s', $id, $name ) );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'maker'   => b2f_format_maker( $id ),
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_delete_maker' ) ) {
+    /**
+     * POST /maker/delete — soft delete (set inactive)
+     * Body: { id }
+     */
+    function b2f_rest_delete_maker( WP_REST_Request $req ) {
+        $id = intval( $req->get_param( 'id' ) ?: 0 );
+        if ( ! $id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ ID', 'code' => 'MISSING_ID' ), 400 );
+        }
+
+        $post = get_post( $id );
+        if ( ! $post || $post->post_type !== 'b2f_maker' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบโรงงาน', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        update_field( 'maker_status', 'inactive', $id );
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Maker soft deleted: #%d %s', $id, get_the_title( $id ) ) );
+        }
+
+        return new WP_REST_Response( array( 'success' => true ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 6. MAKER PRODUCT CRUD ENDPOINTS
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
+    /**
+     * GET /maker-products/{maker_id} — list SKUs for a maker
+     */
+    function b2f_rest_list_maker_products( WP_REST_Request $req ) {
+        $maker_id = intval( $req->get_param( 'maker_id' ) ?: 0 );
+        if ( ! $maker_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ maker_id', 'code' => 'MISSING_MAKER_ID' ), 400 );
+        }
+
+        $q = new WP_Query( array(
+            'post_type'      => 'b2f_maker_product',
+            'posts_per_page' => -1,
+            'post_status'    => 'publish',
+            'meta_query'     => array( array(
+                'key'   => 'mp_maker_id',
+                'value' => $maker_id,
+                'type'  => 'NUMERIC',
+            ) ),
+            'orderby'        => 'title',
+            'order'          => 'ASC',
+        ) );
+
+        $products = array();
+        foreach ( $q->posts as $p ) {
+            $products[] = b2f_format_maker_product( $p->ID );
+        }
+
+        return new WP_REST_Response( array( 'success' => true, 'products' => $products ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_format_maker_product' ) ) {
+    function b2f_format_maker_product( $mp_id ) {
+        return array(
+            'id'              => $mp_id,
+            'maker_id'        => intval( get_field( 'mp_maker_id', $mp_id ) ?: 0 ),
+            'sku'             => esc_html( get_field( 'mp_product_sku', $mp_id ) ?: '' ),
+            'product_name'    => esc_html( get_field( 'mp_product_name', $mp_id ) ?: '' ),
+            'unit_cost'       => floatval( get_field( 'mp_unit_cost', $mp_id ) ?: 0 ),
+            'moq'             => intval( get_field( 'mp_moq', $mp_id ) ?: 1 ),
+            'lead_time_days'  => intval( get_field( 'mp_lead_time_days', $mp_id ) ?: 7 ),
+            'last_order_date' => esc_html( get_field( 'mp_last_order_date', $mp_id ) ?: '' ),
+            'notes'           => esc_html( get_field( 'mp_notes', $mp_id ) ?: '' ),
+            'status'          => esc_html( get_field( 'mp_status', $mp_id ) ?: 'active' ),
+        );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_save_maker_product' ) ) {
+    /**
+     * POST /maker-product — create or update maker-SKU mapping
+     * Body: { id?, mp_maker_id, mp_product_sku, mp_product_name, mp_unit_cost,
+     *         mp_moq, mp_lead_time_days, mp_notes, mp_status }
+     */
+    function b2f_rest_save_maker_product( WP_REST_Request $req ) {
+        $id       = intval( $req->get_param( 'id' ) ?: 0 );
+        $maker_id = intval( $req->get_param( 'mp_maker_id' ) ?: 0 );
+        $sku      = sanitize_text_field( $req->get_param( 'mp_product_sku' ) ?: '' );
+        $cost     = floatval( $req->get_param( 'mp_unit_cost' ) ?: 0 );
+
+        if ( ! $maker_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาระบุโรงงาน', 'code' => 'MISSING_MAKER' ), 400 );
+        }
+        if ( empty( $sku ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาระบุ SKU', 'code' => 'MISSING_SKU' ), 400 );
+        }
+        if ( $cost <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ราคาทุนต้องมากกว่า 0', 'code' => 'INVALID_COST' ), 400 );
+        }
+
+        // Check maker exists
+        $maker = get_post( $maker_id );
+        if ( ! $maker || $maker->post_type !== 'b2f_maker' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบโรงงาน', 'code' => 'INVALID_MAKER' ), 404 );
+        }
+
+        // Check duplicate SKU for same maker (exclude current)
+        $dup = new WP_Query( array(
+            'post_type'      => 'b2f_maker_product',
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'post_status'    => 'publish',
+            'post__not_in'   => $id ? array( $id ) : array(),
+            'meta_query'     => array(
+                'relation' => 'AND',
+                array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
+                array( 'key' => 'mp_product_sku', 'value' => $sku ),
+            ),
+        ) );
+        if ( $dup->found_posts > 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'SKU นี้มีอยู่แล้วสำหรับโรงงานนี้', 'code' => 'DUPLICATE_SKU' ), 400 );
+        }
+
+        $product_name = sanitize_text_field( $req->get_param( 'mp_product_name' ) ?: $sku );
+
+        // Create or update
+        if ( $id > 0 ) {
+            $post = get_post( $id );
+            if ( ! $post || $post->post_type !== 'b2f_maker_product' ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบรายการ', 'code' => 'NOT_FOUND' ), 404 );
+            }
+            wp_update_post( array( 'ID' => $id, 'post_title' => $sku . ' - ' . $product_name ) );
+        } else {
+            $id = wp_insert_post( array(
+                'post_type'   => 'b2f_maker_product',
+                'post_title'  => $sku . ' - ' . $product_name,
+                'post_status' => 'publish',
+            ) );
+            if ( is_wp_error( $id ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => 'สร้างรายการไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
+            }
+        }
+
+        // Save fields
+        update_field( 'mp_maker_id', $maker_id, $id );
+        update_field( 'mp_product_sku', $sku, $id );
+        update_field( 'mp_product_name', $product_name, $id );
+        update_field( 'mp_unit_cost', $cost, $id );
+        update_field( 'mp_moq', intval( $req->get_param( 'mp_moq' ) ?: 1 ), $id );
+        update_field( 'mp_lead_time_days', intval( $req->get_param( 'mp_lead_time_days' ) ?: 7 ), $id );
+
+        $notes = $req->get_param( 'mp_notes' );
+        if ( $notes !== null ) {
+            update_field( 'mp_notes', sanitize_textarea_field( $notes ), $id );
+        }
+        $mp_status = $req->get_param( 'mp_status' );
+        if ( $mp_status !== null ) {
+            update_field( 'mp_status', sanitize_text_field( $mp_status ), $id );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Maker product saved: #%d SKU=%s Maker=#%d Cost=%.2f', $id, $sku, $maker_id, $cost ) );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'product' => b2f_format_maker_product( $id ),
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_delete_maker_product' ) ) {
+    /**
+     * POST /maker-product/delete — delete mapping
+     * Body: { id }
+     */
+    function b2f_rest_delete_maker_product( WP_REST_Request $req ) {
+        $id = intval( $req->get_param( 'id' ) ?: 0 );
+        if ( ! $id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ ID', 'code' => 'MISSING_ID' ), 400 );
+        }
+
+        $post = get_post( $id );
+        if ( ! $post || $post->post_type !== 'b2f_maker_product' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบรายการ', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        wp_delete_post( $id, true ); // permanent delete
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Maker product deleted: #%d', $id ) );
+        }
+
+        return new WP_REST_Response( array( 'success' => true ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 7. CREATE PO ENDPOINT
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_create_po' ) ) {
+    /**
+     * POST /create-po
+     * Body: { maker_id, items: [{ sku, qty }], requested_date?, note?, force? }
+     *
+     * Response: { success, po_id, po_number, total_amount, items, warnings? }
+     * Error codes: CREDIT_HOLD, DUPLICATE_PO, INVALID_MAKER, INVALID_SKU, MISSING_ITEMS
+     */
+    function b2f_rest_create_po( WP_REST_Request $req ) {
+        // Rate limit: 10 req/min per admin
+        $user_id = get_current_user_id();
+        $rl = b2f_rate_limit( 'create_po_' . $user_id, 10, 60 );
+        if ( is_wp_error( $rl ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => $rl->get_error_message(), 'code' => 'RATE_LIMIT' ), 429 );
+        }
+
+        $maker_id = intval( $req->get_param( 'maker_id' ) ?: 0 );
+        $items    = $req->get_param( 'items' );
+        $note     = sanitize_textarea_field( $req->get_param( 'note' ) ?: '' );
+        $req_date = sanitize_text_field( $req->get_param( 'requested_date' ) ?: '' );
+
+        // ── Validate maker ──
+        if ( ! $maker_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาเลือกโรงงาน', 'code' => 'INVALID_MAKER' ), 400 );
+        }
+        $maker = get_post( $maker_id );
+        if ( ! $maker || $maker->post_type !== 'b2f_maker' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบโรงงาน', 'code' => 'INVALID_MAKER' ), 404 );
+        }
+        $maker_status = get_field( 'maker_status', $maker_id );
+        if ( $maker_status === 'inactive' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'โรงงานนี้ถูกปิดใช้งาน', 'code' => 'INVALID_MAKER' ), 400 );
+        }
+
+        // ── Check credit ──
+        if ( function_exists( 'b2f_check_credit' ) ) {
+            $credit = b2f_check_credit( $maker_id );
+            if ( is_wp_error( $credit ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => $credit->get_error_message(), 'code' => 'CREDIT_HOLD' ), 400 );
+            }
+        }
+
+        // ── Validate items ──
+        if ( empty( $items ) || ! is_array( $items ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาเลือกสินค้าอย่างน้อย 1 รายการ', 'code' => 'MISSING_ITEMS' ), 400 );
+        }
+
+        // Merge duplicate SKUs (auto-merge per spec)
+        $merged = array();
+        foreach ( $items as $item ) {
+            $sku = sanitize_text_field( $item['sku'] ?? '' );
+            $qty = intval( $item['qty'] ?? 0 );
+            if ( empty( $sku ) || $qty <= 0 ) continue;
+            if ( isset( $merged[ $sku ] ) ) {
+                $merged[ $sku ]['qty'] += $qty;
+            } else {
+                $merged[ $sku ] = array( 'sku' => $sku, 'qty' => $qty );
+            }
+        }
+
+        if ( empty( $merged ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาเลือกสินค้าอย่างน้อย 1 รายการ (จำนวนต้องมากกว่า 0)', 'code' => 'MISSING_ITEMS' ), 400 );
+        }
+
+        // ── Snapshot ราคาทุนจาก b2f_maker_product ──
+        $po_items = array();
+        $total    = 0;
+
+        foreach ( $merged as $item ) {
+            $sku = $item['sku'];
+            $qty = $item['qty'];
+
+            $mp = new WP_Query( array(
+                'post_type'      => 'b2f_maker_product',
+                'posts_per_page' => 1,
+                'post_status'    => 'publish',
+                'meta_query'     => array(
+                    'relation' => 'AND',
+                    array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
+                    array( 'key' => 'mp_product_sku', 'value' => $sku ),
+                ),
+            ) );
+
+            if ( ! $mp->have_posts() ) {
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => sprintf( 'ไม่พบ SKU "%s" สำหรับโรงงานนี้', esc_html( $sku ) ),
+                    'code'    => 'INVALID_SKU',
+                ), 400 );
+            }
+
+            $mp_post      = $mp->posts[0];
+            $unit_cost    = floatval( get_field( 'mp_unit_cost', $mp_post->ID ) ?: 0 );
+            $product_name = get_field( 'mp_product_name', $mp_post->ID ) ?: $sku;
+            $subtotal     = round( $unit_cost * $qty, 2 );
+
+            $po_items[] = array(
+                'sku'          => $sku,
+                'product_name' => $product_name,
+                'qty'          => $qty,
+                'unit_cost'    => $unit_cost,
+                'subtotal'     => $subtotal,
+            );
+            $total += $subtotal;
+
+            // Update last order date on maker product
+            update_field( 'mp_last_order_date', wp_date( 'Y-m-d' ), $mp_post->ID );
+        }
+
+        // ── Duplicate check (same maker + SKUs + qty ภายใน 5 นาที) ──
+        $dup_key = 'b2f_dup_' . $maker_id . '_' . md5( wp_json_encode( $merged ) );
+        $dup_existing = get_transient( $dup_key );
+        if ( $dup_existing ) {
+            $force = $req->get_param( 'force' );
+            if ( ! $force ) {
+                return new WP_REST_Response( array(
+                    'success'     => false,
+                    'error'       => 'มี PO ที่เหมือนกันภายใน 5 นาที ยืนยันสร้างใหม่?',
+                    'code'        => 'DUPLICATE_PO',
+                    'existing_po' => $dup_existing,
+                ), 409 );
+            }
+        }
+
+        // ── Create PO CPT ──
+        $po_number = function_exists( 'b2f_generate_po_number' )
+            ? b2f_generate_po_number()
+            : 'PO-DNC-' . wp_date( 'ymd' ) . '-000';
+
+        $po_id = wp_insert_post( array(
+            'post_type'   => 'b2f_order',
+            'post_title'  => $po_number,
+            'post_status' => 'publish',
+        ) );
+
+        if ( is_wp_error( $po_id ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'สร้าง PO ไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
+        }
+
+        // Save ACF fields
+        update_field( 'po_number', $po_number, $po_id );
+        update_field( 'po_maker_id', $maker_id, $po_id );
+        update_field( 'po_status', 'draft', $po_id );
+        update_field( 'po_total_amount', round( $total, 2 ), $po_id );
+        update_field( 'po_admin_note', $note, $po_id );
+        update_field( 'po_created_by', strval( $user_id ), $po_id );
+        update_field( 'po_item_count', count( $po_items ), $po_id );
+        update_field( 'po_version', 1, $po_id );
+        update_field( 'po_amendment_count', 0, $po_id );
+        update_field( 'po_paid_amount', 0, $po_id );
+        update_field( 'po_payment_status', 'unpaid', $po_id );
+
+        if ( ! empty( $req_date ) ) {
+            update_field( 'po_requested_date', $req_date, $po_id );
+        }
+
+        // Save po_items repeater
+        $repeater = array();
+        foreach ( $po_items as $pi ) {
+            $repeater[] = array(
+                'poi_sku'          => $pi['sku'],
+                'poi_product_name' => $pi['product_name'],
+                'poi_qty_ordered'  => $pi['qty'],
+                'poi_unit_cost'    => $pi['unit_cost'],
+                'poi_qty_received' => 0,
+                'poi_qty_rejected' => 0,
+            );
+        }
+        update_field( 'po_items', $repeater, $po_id );
+
+        // ── Transition to 'submitted' via FSM ──
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            $trans = b2f_transition_order( $po_id, 'submitted', 'admin', 'PO created' );
+            if ( is_wp_error( $trans ) ) {
+                update_field( 'po_status', 'submitted', $po_id );
+            }
+        } else {
+            update_field( 'po_status', 'submitted', $po_id );
+        }
+
+        // Set duplicate prevention transient (5 minutes)
+        set_transient( $dup_key, $po_number, 5 * MINUTE_IN_SECONDS );
+
+        // ── Push Flex to Maker group ──
+        $maker_group = get_field( 'maker_line_group_id', $maker_id );
+        $push_maker  = false;
+        $push_admin  = false;
+
+        if ( function_exists( 'b2f_build_flex_new_po' ) ) {
+            $flex_maker = b2f_build_flex_new_po( $po_id );
+            if ( $flex_maker && ! empty( $maker_group ) ) {
+                $push_maker = b2f_line_push( $maker_group, $flex_maker );
+            }
+        }
+
+        // ── Push Flex to Admin group ──
+        if ( function_exists( 'b2f_build_flex_po_created' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            $flex_admin = b2f_build_flex_po_created( $po_id );
+            if ( $flex_admin ) {
+                $push_admin = b2f_line_push( B2B_ADMIN_GROUP_ID, $flex_admin );
+            }
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'PO created: %s (#%d) Maker=#%d Total=%.2f Push:maker=%s,admin=%s',
+                $po_number, $po_id, $maker_id, $total,
+                $push_maker ? 'ok' : 'fail',
+                $push_admin ? 'ok' : 'fail'
+            ) );
+        }
+
+        // ── Response (ตาม spec section 12) ──
+        $response_items = array();
+        foreach ( $po_items as $pi ) {
+            $response_items[] = array(
+                'sku'       => esc_html( $pi['sku'] ),
+                'qty'       => $pi['qty'],
+                'unit_cost' => $pi['unit_cost'],
+                'subtotal'  => $pi['subtotal'],
+            );
+        }
+
+        $resp = array(
+            'success'      => true,
+            'po_id'        => $po_id,
+            'po_number'    => esc_html( $po_number ),
+            'total_amount' => round( $total, 2 ),
+            'items'        => $response_items,
+        );
+
+        // Warnings (non-fatal)
+        $warnings = array();
+        if ( ! $push_maker && ! empty( $maker_group ) ) {
+            $warnings[] = 'ส่งแจ้งเตือนไปโรงงานไม่สำเร็จ';
+        }
+        if ( empty( $maker_group ) ) {
+            $warnings[] = 'โรงงานนี้ยังไม่มี LINE Group — ไม่ได้ส่งแจ้งเตือน';
+        }
+        if ( ! empty( $warnings ) ) {
+            $resp['warnings'] = $warnings;
+        }
+
+        return new WP_REST_Response( $resp, 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 8. PO DETAIL / UPDATE / CANCEL
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_po_detail' ) ) {
+    /**
+     * GET /po-detail/{po_id} — PO detail (admin or maker JWT)
+     */
+    function b2f_rest_po_detail( WP_REST_Request $req ) {
+        $po_id = intval( $req->get_param( 'po_id' ) ?: 0 );
+
+        // Auth: admin session OR maker JWT
+        $is_admin = current_user_can( 'manage_options' );
+        if ( ! $is_admin ) {
+            $jwt = b2f_verify_maker_jwt( $req );
+            if ( is_wp_error( $jwt ) ) {
+                $status = 401;
+                $data = $jwt->get_error_data();
+                if ( is_array( $data ) && isset( $data['status'] ) ) $status = $data['status'];
+                return new WP_REST_Response( array( 'success' => false, 'error' => $jwt->get_error_message(), 'code' => $jwt->get_error_code() ), $status );
+            }
+            // Verify PO belongs to maker
+            if ( $jwt['po_id'] !== $po_id ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีสิทธิ์เข้าถึง PO นี้', 'code' => 'FORBIDDEN' ), 403 );
+            }
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'po'      => b2f_format_po_detail( $po_id, $is_admin ),
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_format_po_detail' ) ) {
+    /**
+     * Format PO data for API response
+     * @param int  $po_id
+     * @param bool $include_sensitive  Include admin-only fields (payment, cancel info)
+     * @return array
+     */
+    function b2f_format_po_detail( $po_id, $include_sensitive = false ) {
+        $maker_id = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        $items    = get_field( 'po_items', $po_id ) ?: array();
+
+        $formatted_items = array();
+        foreach ( $items as $item ) {
+            $fi = array(
+                'sku'          => esc_html( $item['poi_sku'] ?? '' ),
+                'product_name' => esc_html( $item['poi_product_name'] ?? '' ),
+                'qty_ordered'  => intval( $item['poi_qty_ordered'] ?? 0 ),
+                'unit_cost'    => floatval( $item['poi_unit_cost'] ?? 0 ),
+                'qty_received' => intval( $item['poi_qty_received'] ?? 0 ),
+                'qty_rejected' => intval( $item['poi_qty_rejected'] ?? 0 ),
+            );
+            $fi['subtotal'] = round( $fi['unit_cost'] * $fi['qty_ordered'], 2 );
+            $formatted_items[] = $fi;
+        }
+
+        $data = array(
+            'id'              => $po_id,
+            'po_number'       => esc_html( get_field( 'po_number', $po_id ) ?: '' ),
+            'maker_id'        => $maker_id,
+            'maker_name'      => esc_html( get_field( 'maker_name', $maker_id ) ?: get_the_title( $maker_id ) ),
+            'status'          => esc_html( get_field( 'po_status', $po_id ) ?: 'draft' ),
+            'items'           => $formatted_items,
+            'total_amount'    => floatval( get_field( 'po_total_amount', $po_id ) ?: 0 ),
+            'item_count'      => intval( get_field( 'po_item_count', $po_id ) ?: 0 ),
+            'requested_date'  => esc_html( get_field( 'po_requested_date', $po_id ) ?: '' ),
+            'expected_date'   => esc_html( get_field( 'po_expected_date', $po_id ) ?: '' ),
+            'actual_date'     => esc_html( get_field( 'po_actual_date', $po_id ) ?: '' ),
+            'maker_note'      => esc_html( get_field( 'po_maker_note', $po_id ) ?: '' ),
+            'version'         => intval( get_field( 'po_version', $po_id ) ?: 1 ),
+            'amendment_count' => intval( get_field( 'po_amendment_count', $po_id ) ?: 0 ),
+            'created_date'    => get_the_date( 'Y-m-d H:i:s', $po_id ),
+        );
+
+        if ( $include_sensitive ) {
+            $data['admin_note']       = esc_html( get_field( 'po_admin_note', $po_id ) ?: '' );
+            $data['created_by']       = esc_html( get_field( 'po_created_by', $po_id ) ?: '' );
+            $data['paid_amount']      = floatval( get_field( 'po_paid_amount', $po_id ) ?: 0 );
+            $data['payment_status']   = esc_html( get_field( 'po_payment_status', $po_id ) ?: 'unpaid' );
+            $data['cancelled_reason'] = esc_html( get_field( 'po_cancelled_reason', $po_id ) ?: '' );
+            $data['cancelled_by']     = esc_html( get_field( 'po_cancelled_by', $po_id ) ?: '' );
+            $data['cancelled_date']   = esc_html( get_field( 'po_cancelled_date', $po_id ) ?: '' );
+            $data['rejected_reason']  = esc_html( get_field( 'po_rejected_reason', $po_id ) ?: '' );
+        }
+
+        return $data;
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_po_update' ) ) {
+    /**
+     * POST /po-update — แก้ไข PO (admin, ก่อน Maker confirm only)
+     * Body: { po_id, items: [{ sku, qty }], note?, requested_date? }
+     */
+    function b2f_rest_po_update( WP_REST_Request $req ) {
+        $po_id = intval( $req->get_param( 'po_id' ) ?: 0 );
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+
+        // Only allow amend in these statuses
+        $amendable = array( 'submitted', 'confirmed', 'rejected' );
+        if ( ! in_array( $current_status, $amendable, true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่สามารถแก้ไข PO ในสถานะนี้', 'code' => 'NOT_AMENDABLE' ), 400 );
+        }
+
+        $items = $req->get_param( 'items' );
+        if ( empty( $items ) || ! is_array( $items ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาระบุรายการสินค้า', 'code' => 'MISSING_ITEMS' ), 400 );
+        }
+
+        $maker_id = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+
+        // Rebuild items with fresh cost snapshot
+        $po_items = array();
+        $total    = 0;
+
+        foreach ( $items as $item ) {
+            $sku = sanitize_text_field( $item['sku'] ?? '' );
+            $qty = intval( $item['qty'] ?? 0 );
+            if ( empty( $sku ) || $qty <= 0 ) continue;
+
+            $mp = new WP_Query( array(
+                'post_type'      => 'b2f_maker_product',
+                'posts_per_page' => 1,
+                'post_status'    => 'publish',
+                'meta_query'     => array(
+                    'relation' => 'AND',
+                    array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
+                    array( 'key' => 'mp_product_sku', 'value' => $sku ),
+                ),
+            ) );
+
+            if ( ! $mp->have_posts() ) {
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => sprintf( 'ไม่พบ SKU "%s" สำหรับโรงงานนี้', esc_html( $sku ) ),
+                    'code'    => 'INVALID_SKU',
+                ), 400 );
+            }
+
+            $mp_post      = $mp->posts[0];
+            $unit_cost    = floatval( get_field( 'mp_unit_cost', $mp_post->ID ) ?: 0 );
+            $product_name = get_field( 'mp_product_name', $mp_post->ID ) ?: $sku;
+            $subtotal     = round( $unit_cost * $qty, 2 );
+
+            $po_items[] = array(
+                'poi_sku'          => $sku,
+                'poi_product_name' => $product_name,
+                'poi_qty_ordered'  => $qty,
+                'poi_unit_cost'    => $unit_cost,
+                'poi_qty_received' => 0,
+                'poi_qty_rejected' => 0,
+            );
+            $total += $subtotal;
+        }
+
+        if ( empty( $po_items ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีรายการสินค้าที่ถูกต้อง', 'code' => 'MISSING_ITEMS' ), 400 );
+        }
+
+        // Update fields
+        update_field( 'po_items', $po_items, $po_id );
+        update_field( 'po_total_amount', round( $total, 2 ), $po_id );
+        update_field( 'po_item_count', count( $po_items ), $po_id );
+
+        $amend_count = intval( get_field( 'po_amendment_count', $po_id ) ?: 0 ) + 1;
+        $version     = intval( get_field( 'po_version', $po_id ) ?: 1 ) + 1;
+        update_field( 'po_amendment_count', $amend_count, $po_id );
+        update_field( 'po_version', $version, $po_id );
+
+        $note = $req->get_param( 'note' );
+        if ( $note !== null ) {
+            update_field( 'po_admin_note', sanitize_textarea_field( $note ), $po_id );
+        }
+        $req_date = $req->get_param( 'requested_date' );
+        if ( $req_date !== null ) {
+            update_field( 'po_requested_date', sanitize_text_field( $req_date ), $po_id );
+        }
+
+        // Transition: current -> amended -> auto-resubmit
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            b2f_transition_order( $po_id, 'amended', 'admin', 'PO amended (version ' . $version . ')' );
+            b2f_transition_order( $po_id, 'submitted', 'system', 'auto-resubmit after amend' );
+        } else {
+            update_field( 'po_status', 'submitted', $po_id );
+        }
+
+        // Push Flex to Maker
+        $maker_group = get_field( 'maker_line_group_id', $maker_id );
+        if ( function_exists( 'b2f_build_flex_po_amended' ) && ! empty( $maker_group ) ) {
+            $flex = b2f_build_flex_po_amended( $po_id, $amend_count );
+            if ( $flex ) b2f_line_push( $maker_group, $flex );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            $po_number = get_field( 'po_number', $po_id );
+            b2f_log( sprintf( 'PO amended: %s (#%d) version=%d total=%.2f', $po_number, $po_id, $version, $total ) );
+        }
+
+        return new WP_REST_Response( array(
+            'success'      => true,
+            'po_id'        => $po_id,
+            'version'      => $version,
+            'total_amount' => round( $total, 2 ),
+            'status'       => 'submitted',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
+    /**
+     * POST /po-cancel — ยกเลิก PO (admin) + rollback ถ้า partial received
+     * Body: { po_id, reason }
+     */
+    function b2f_rest_po_cancel( WP_REST_Request $req ) {
+        $po_id  = intval( $req->get_param( 'po_id' ) ?: 0 );
+        $reason = sanitize_textarea_field( $req->get_param( 'reason' ) ?: '' );
+
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+        $maker_id       = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+
+        // Check if partial_received -> need rollback
+        $need_rollback = ( $current_status === 'partial_received' );
+
+        // Transition
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            $trans = b2f_transition_order( $po_id, 'cancelled', 'admin', $reason );
+            if ( is_wp_error( $trans ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
+            }
+        } else {
+            update_field( 'po_status', 'cancelled', $po_id );
+        }
+
+        // Save cancel metadata
+        update_field( 'po_cancelled_reason', $reason, $po_id );
+        update_field( 'po_cancelled_by', strval( get_current_user_id() ), $po_id );
+        update_field( 'po_cancelled_date', wp_date( 'Y-m-d' ), $po_id );
+
+        // Rollback if partial received
+        $rollback_info = array();
+        if ( $need_rollback ) {
+            $rcv_q = new WP_Query( array(
+                'post_type'      => 'b2f_receiving',
+                'posts_per_page' => -1,
+                'post_status'    => 'publish',
+                'meta_query'     => array( array(
+                    'key'   => 'rcv_po_id',
+                    'value' => $po_id,
+                    'type'  => 'NUMERIC',
+                ) ),
+            ) );
+
+            // TODO: reverse inventory entries (source='b2f_cancel') when Inventory integration is built
+            $rollback_info['receiving_records'] = $rcv_q->found_posts;
+
+            // Rollback debt
+            $po_total    = floatval( get_field( 'po_total_amount', $po_id ) ?: 0 );
+            $paid        = floatval( get_field( 'po_paid_amount', $po_id ) ?: 0 );
+            $outstanding = round( $po_total - $paid, 2 );
+
+            if ( $outstanding > 0 && function_exists( 'b2f_payable_subtract' ) ) {
+                b2f_payable_subtract( $maker_id, $outstanding, 'PO cancelled - rollback debt', $po_id );
+                $rollback_info['debt_reversed'] = $outstanding;
+            }
+        }
+
+        // Push Flex to Maker
+        $maker_group = get_field( 'maker_line_group_id', $maker_id );
+        if ( function_exists( 'b2f_build_flex_po_cancelled' ) && ! empty( $maker_group ) ) {
+            $flex = b2f_build_flex_po_cancelled( $po_id, $reason );
+            if ( $flex ) b2f_line_push( $maker_group, $flex );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            $po_number = get_field( 'po_number', $po_id );
+            b2f_log( sprintf( 'PO cancelled: %s (#%d) reason=%s rollback=%s',
+                $po_number, $po_id, $reason, wp_json_encode( $rollback_info )
+            ) );
+        }
+
+        $resp = array( 'success' => true, 'po_id' => $po_id, 'status' => 'cancelled' );
+        if ( ! empty( $rollback_info ) ) {
+            $resp['rollback'] = $rollback_info;
+        }
+
+        return new WP_REST_Response( $resp, 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 9. MAKER ACTION ENDPOINTS (JWT AUTH)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_maker_confirm' ) ) {
+    /**
+     * POST /maker-confirm — Maker ยืนยัน PO + ETA
+     * Body: { token, expected_date, note? }
+     * Response: { success, po_id, status: "confirmed" }
+     */
+    function b2f_rest_maker_confirm( WP_REST_Request $req ) {
+        // Rate limit: 5 req/min per token
+        $token_hash = md5( $req->get_param( 'token' ) ?: '' );
+        $rl = b2f_rate_limit( 'maker_confirm_' . $token_hash, 5, 60 );
+        if ( is_wp_error( $rl ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => $rl->get_error_message(), 'code' => 'RATE_LIMIT' ), 429 );
+        }
+
+        // Verify JWT
+        $jwt = b2f_verify_maker_jwt( $req );
+        if ( is_wp_error( $jwt ) ) {
+            $status = 401;
+            $data = $jwt->get_error_data();
+            if ( is_array( $data ) && isset( $data['status'] ) ) $status = $data['status'];
+            return new WP_REST_Response( array( 'success' => false, 'error' => $jwt->get_error_message(), 'code' => $jwt->get_error_code() ), $status );
+        }
+
+        $po_id    = $jwt['po_id'];
+        $maker_id = $jwt['maker_id'];
+
+        // Verify PO exists and belongs to maker
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $po_maker = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        if ( $po_maker !== $maker_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีสิทธิ์เข้าถึง PO นี้', 'code' => 'FORBIDDEN' ), 403 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+        if ( $current_status === 'cancelled' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ใบสั่งซื้อนี้ถูกยกเลิกแล้ว', 'code' => 'PO_CANCELLED' ), 400 );
+        }
+
+        // Validate expected_date
+        $expected_date = sanitize_text_field( $req->get_param( 'expected_date' ) ?: '' );
+        if ( empty( $expected_date ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณากรอกวันที่คาดว่าจะส่ง', 'code' => 'MISSING_DATE' ), 400 );
+        }
+
+        $date_ts  = strtotime( $expected_date );
+        $today_ts = strtotime( wp_date( 'Y-m-d' ) );
+        if ( $date_ts === false || $date_ts <= $today_ts ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'วันส่งต้องเป็นวันในอนาคต', 'code' => 'INVALID_DATE' ), 400 );
+        }
+
+        // Transition
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            $trans = b2f_transition_order( $po_id, 'confirmed', 'maker', 'Maker confirmed with ETA' );
+            if ( is_wp_error( $trans ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
+            }
+        } else {
+            update_field( 'po_status', 'confirmed', $po_id );
+        }
+
+        update_field( 'po_expected_date', $expected_date, $po_id );
+
+        $note = sanitize_textarea_field( $req->get_param( 'note' ) ?: '' );
+        if ( ! empty( $note ) ) {
+            update_field( 'po_maker_note', $note, $po_id );
+        }
+
+        // Push Flex to Admin
+        if ( function_exists( 'b2f_build_flex_maker_confirmed' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            $flex = b2f_build_flex_maker_confirmed( $po_id, $expected_date );
+            if ( $flex ) b2f_line_push( B2B_ADMIN_GROUP_ID, $flex );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            $po_number = get_field( 'po_number', $po_id );
+            b2f_log( sprintf( 'Maker confirmed: %s (#%d) ETA=%s', $po_number, $po_id, $expected_date ) );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'po_id'   => $po_id,
+            'status'  => 'confirmed',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_maker_reject' ) ) {
+    /**
+     * POST /maker-reject — Maker ปฏิเสธ PO
+     * Body: { token, reason }
+     * Response: { success, po_id, status: "rejected" }
+     */
+    function b2f_rest_maker_reject( WP_REST_Request $req ) {
+        $jwt = b2f_verify_maker_jwt( $req );
+        if ( is_wp_error( $jwt ) ) {
+            $status = 401;
+            $data = $jwt->get_error_data();
+            if ( is_array( $data ) && isset( $data['status'] ) ) $status = $data['status'];
+            return new WP_REST_Response( array( 'success' => false, 'error' => $jwt->get_error_message(), 'code' => $jwt->get_error_code() ), $status );
+        }
+
+        $po_id    = $jwt['po_id'];
+        $maker_id = $jwt['maker_id'];
+        $reason   = sanitize_textarea_field( $req->get_param( 'reason' ) ?: '' );
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $po_maker = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        if ( $po_maker !== $maker_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีสิทธิ์เข้าถึง PO นี้', 'code' => 'FORBIDDEN' ), 403 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+        if ( $current_status === 'cancelled' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ใบสั่งซื้อนี้ถูกยกเลิกแล้ว', 'code' => 'PO_CANCELLED' ), 400 );
+        }
+
+        // Transition
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            $trans = b2f_transition_order( $po_id, 'rejected', 'maker', $reason );
+            if ( is_wp_error( $trans ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
+            }
+        } else {
+            update_field( 'po_status', 'rejected', $po_id );
+        }
+
+        update_field( 'po_rejected_reason', $reason, $po_id );
+
+        // Push Flex to Admin
+        if ( function_exists( 'b2f_build_flex_maker_rejected' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            $flex = b2f_build_flex_maker_rejected( $po_id, $reason );
+            if ( $flex ) b2f_line_push( B2B_ADMIN_GROUP_ID, $flex );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            $po_number = get_field( 'po_number', $po_id );
+            b2f_log( sprintf( 'Maker rejected: %s (#%d) reason=%s', $po_number, $po_id, $reason ) );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'po_id'   => $po_id,
+            'status'  => 'rejected',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_maker_reschedule' ) ) {
+    /**
+     * POST /maker-reschedule — Maker ขอเลื่อนวันส่ง
+     * Body: { token, new_date, reason }
+     */
+    function b2f_rest_maker_reschedule( WP_REST_Request $req ) {
+        $jwt = b2f_verify_maker_jwt( $req );
+        if ( is_wp_error( $jwt ) ) {
+            $status = 401;
+            $data = $jwt->get_error_data();
+            if ( is_array( $data ) && isset( $data['status'] ) ) $status = $data['status'];
+            return new WP_REST_Response( array( 'success' => false, 'error' => $jwt->get_error_message(), 'code' => $jwt->get_error_code() ), $status );
+        }
+
+        $po_id    = $jwt['po_id'];
+        $maker_id = $jwt['maker_id'];
+        $new_date = sanitize_text_field( $req->get_param( 'new_date' ) ?: '' );
+        $reason   = sanitize_textarea_field( $req->get_param( 'reason' ) ?: '' );
+
+        if ( empty( $new_date ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณากรอกวันที่ใหม่', 'code' => 'MISSING_DATE' ), 400 );
+        }
+
+        $date_ts  = strtotime( $new_date );
+        $today_ts = strtotime( wp_date( 'Y-m-d' ) );
+        if ( $date_ts === false || $date_ts <= $today_ts ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'วันที่ใหม่ต้องเป็นวันในอนาคต', 'code' => 'INVALID_DATE' ), 400 );
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $po_maker = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        if ( $po_maker !== $maker_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีสิทธิ์เข้าถึง PO นี้', 'code' => 'FORBIDDEN' ), 403 );
+        }
+
+        // Save reschedule request as post meta (pending approval)
+        $reschedule_data = array(
+            'new_date'     => $new_date,
+            'reason'       => $reason,
+            'requested_at' => wp_date( 'Y-m-d H:i:s' ),
+            'status'       => 'pending',
+            'old_date'     => get_field( 'po_expected_date', $po_id ) ?: '',
+        );
+
+        // Append to reschedule history
+        $history = get_post_meta( $po_id, '_b2f_reschedule_history', true ) ?: array();
+        $history[] = $reschedule_data;
+        update_post_meta( $po_id, '_b2f_reschedule_history', $history );
+        update_post_meta( $po_id, '_b2f_pending_reschedule', $reschedule_data );
+
+        // Push Flex to Admin for approval
+        if ( function_exists( 'b2f_build_flex_reschedule_request' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            $flex = b2f_build_flex_reschedule_request( $po_id, $new_date, $reason );
+            if ( $flex ) b2f_line_push( B2B_ADMIN_GROUP_ID, $flex );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            $po_number = get_field( 'po_number', $po_id );
+            b2f_log( sprintf( 'Maker reschedule request: %s (#%d) new_date=%s reason=%s', $po_number, $po_id, $new_date, $reason ) );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'po_id'   => $po_id,
+            'message' => 'ส่งคำขอเลื่อนวันส่งแล้ว รอ Admin อนุมัติ',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_maker_po_list' ) ) {
+    /**
+     * GET /maker-po-list — Maker ดู PO ของตัวเอง (JWT auth)
+     * Params: ?token=<JWT>&status=all|submitted|confirmed|...
+     */
+    function b2f_rest_maker_po_list( WP_REST_Request $req ) {
+        $jwt = b2f_verify_maker_jwt( $req );
+        if ( is_wp_error( $jwt ) ) {
+            $status = 401;
+            $data = $jwt->get_error_data();
+            if ( is_array( $data ) && isset( $data['status'] ) ) $status = $data['status'];
+            return new WP_REST_Response( array( 'success' => false, 'error' => $jwt->get_error_message(), 'code' => $jwt->get_error_code() ), $status );
+        }
+
+        $maker_id      = $jwt['maker_id'];
+        $status_filter = sanitize_text_field( $req->get_param( 'status' ) ?: 'all' );
+
+        $args = array(
+            'post_type'      => 'b2f_order',
+            'posts_per_page' => 50,
+            'post_status'    => 'publish',
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+            'meta_query'     => array( array(
+                'key'   => 'po_maker_id',
+                'value' => $maker_id,
+                'type'  => 'NUMERIC',
+            ) ),
+        );
+
+        if ( $status_filter !== 'all' ) {
+            $args['meta_query'][] = array(
+                'key'   => 'po_status',
+                'value' => $status_filter,
+            );
+        }
+
+        $q       = new WP_Query( $args );
+        $po_list = array();
+
+        foreach ( $q->posts as $p ) {
+            $po_list[] = b2f_format_po_detail( $p->ID, false );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'total'   => $q->found_posts,
+            'orders'  => $po_list,
+        ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 10. ADMIN: APPROVE / REJECT RESCHEDULE
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_approve_reschedule' ) ) {
+    /**
+     * POST /approve-reschedule — Admin approve/reject ETA reschedule
+     * Body: { po_id, approved: true|false, note? }
+     * Response: { success, new_eta?, po_status } or { success, message }
+     */
+    function b2f_rest_approve_reschedule( WP_REST_Request $req ) {
+        $po_id    = intval( $req->get_param( 'po_id' ) ?: 0 );
+        $approved = (bool) $req->get_param( 'approved' );
+        $note     = sanitize_textarea_field( $req->get_param( 'note' ) ?: '' );
+
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $pending = get_post_meta( $po_id, '_b2f_pending_reschedule', true );
+        if ( empty( $pending ) || ( $pending['status'] ?? '' ) !== 'pending' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีคำขอเลื่อนวันส่งที่รอดำเนินการ', 'code' => 'NO_PENDING' ), 400 );
+        }
+
+        $maker_id    = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        $maker_group = get_field( 'maker_line_group_id', $maker_id );
+
+        if ( $approved ) {
+            $new_date = sanitize_text_field( $pending['new_date'] );
+            update_field( 'po_expected_date', $new_date, $po_id );
+
+            $pending['status']      = 'approved';
+            $pending['approved_at'] = wp_date( 'Y-m-d H:i:s' );
+            $pending['admin_note']  = $note;
+            update_post_meta( $po_id, '_b2f_pending_reschedule', $pending );
+
+            // Update history
+            $history = get_post_meta( $po_id, '_b2f_reschedule_history', true ) ?: array();
+            if ( ! empty( $history ) ) {
+                $history[ count( $history ) - 1 ]['status'] = 'approved';
+                update_post_meta( $po_id, '_b2f_reschedule_history', $history );
+            }
+
+            // Notify Maker
+            if ( function_exists( 'b2f_build_flex_reschedule_approved' ) && ! empty( $maker_group ) ) {
+                $flex = b2f_build_flex_reschedule_approved( $po_id, $new_date );
+                if ( $flex ) b2f_line_push( $maker_group, $flex );
+            }
+
+            if ( function_exists( 'b2f_log' ) ) {
+                $po_number = get_field( 'po_number', $po_id );
+                b2f_log( sprintf( 'Reschedule approved: %s (#%d) new_eta=%s', $po_number, $po_id, $new_date ) );
+            }
+
+            return new WP_REST_Response( array(
+                'success'   => true,
+                'new_eta'   => esc_html( $new_date ),
+                'po_status' => esc_html( get_field( 'po_status', $po_id ) ),
+            ), 200 );
+
+        } else {
+            $pending['status']      = 'rejected';
+            $pending['rejected_at'] = wp_date( 'Y-m-d H:i:s' );
+            $pending['admin_note']  = $note;
+            update_post_meta( $po_id, '_b2f_pending_reschedule', $pending );
+
+            $history = get_post_meta( $po_id, '_b2f_reschedule_history', true ) ?: array();
+            if ( ! empty( $history ) ) {
+                $history[ count( $history ) - 1 ]['status'] = 'rejected';
+                update_post_meta( $po_id, '_b2f_reschedule_history', $history );
+            }
+
+            // Notify Maker
+            if ( function_exists( 'b2f_build_flex_reschedule_rejected' ) && ! empty( $maker_group ) ) {
+                $flex = b2f_build_flex_reschedule_rejected( $po_id );
+                if ( $flex ) b2f_line_push( $maker_group, $flex );
+            }
+
+            if ( function_exists( 'b2f_log' ) ) {
+                $po_number = get_field( 'po_number', $po_id );
+                b2f_log( sprintf( 'Reschedule rejected: %s (#%d)', $po_number, $po_id ) );
+            }
+
+            return new WP_REST_Response( array(
+                'success' => true,
+                'message' => 'ปฏิเสธคำขอเลื่อนวันส่ง',
+            ), 200 );
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 11. RECEIVE GOODS ENDPOINT
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
+    /**
+     * POST /receive-goods — ตรวจรับสินค้า (FormData with photo upload)
+     *
+     * FormData fields:
+     *   po_id           (int)
+     *   items           (JSON string) [{ sku, qty_received, qc_status, reject_qty?, reject_reason? }]
+     *   photos_<SKU>[]  (files, max 5 per SKU)
+     *   inspected_by    (string)
+     *   note            (string)
+     *
+     * Response: { success, rcv_id, rcv_number, po_status, inventory_updated, debt_added }
+     */
+    function b2f_rest_receive_goods( WP_REST_Request $req ) {
+        // Rate limit: 5 req/min per admin
+        $rl = b2f_rate_limit( 'receive_' . get_current_user_id(), 5, 60 );
+        if ( is_wp_error( $rl ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => $rl->get_error_message(), 'code' => 'RATE_LIMIT' ), 429 );
+        }
+
+        $po_id = intval( $req->get_param( 'po_id' ) ?: 0 );
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+        }
+
+        // Transient lock: prevent concurrent receiving
+        $lock_key = 'b2f_recv_lock_' . $po_id;
+        if ( get_transient( $lock_key ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'มีคนอื่นกำลังตรวจรับ PO นี้อยู่ กรุณารอสักครู่', 'code' => 'LOCKED' ), 423 );
+        }
+        set_transient( $lock_key, get_current_user_id(), 60 );
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            delete_transient( $lock_key );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+        $receivable = array( 'confirmed', 'delivering', 'partial_received' );
+        if ( ! in_array( $current_status, $receivable, true ) ) {
+            delete_transient( $lock_key );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่สามารถตรวจรับ PO ในสถานะนี้', 'code' => 'NOT_RECEIVABLE' ), 400 );
+        }
+
+        // Parse items (JSON string from FormData)
+        $items_raw = $req->get_param( 'items' );
+        if ( is_string( $items_raw ) ) {
+            $items = json_decode( $items_raw, true );
+        } else {
+            $items = $items_raw;
+        }
+
+        if ( empty( $items ) || ! is_array( $items ) ) {
+            delete_transient( $lock_key );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาระบุรายการที่รับ', 'code' => 'MISSING_ITEMS' ), 400 );
+        }
+
+        $inspected_by = sanitize_text_field( $req->get_param( 'inspected_by' ) ?: '' );
+        $note         = sanitize_textarea_field( $req->get_param( 'note' ) ?: '' );
+        $maker_id     = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+
+        // Build PO items lookup map
+        $po_items = get_field( 'po_items', $po_id ) ?: array();
+        $po_items_map = array();
+        foreach ( $po_items as $idx => $pi ) {
+            $sku = $pi['poi_sku'] ?? '';
+            $po_items_map[ $sku ] = array(
+                'index'    => $idx,
+                'ordered'  => intval( $pi['poi_qty_ordered'] ?? 0 ),
+                'received' => intval( $pi['poi_qty_received'] ?? 0 ),
+                'rejected' => intval( $pi['poi_qty_rejected'] ?? 0 ),
+            );
+        }
+
+        // Process receiving items
+        $rcv_items       = array();
+        $total_rcv_value = 0;
+        $all_complete    = true;
+        $files           = $req->get_file_params();
+
+        foreach ( $items as $item ) {
+            $sku           = sanitize_text_field( $item['sku'] ?? '' );
+            $qty_rcv       = intval( $item['qty_received'] ?? 0 );
+            $qc_status     = sanitize_text_field( $item['qc_status'] ?? 'passed' );
+            $reject_qty    = intval( $item['reject_qty'] ?? 0 );
+            $reject_reason = sanitize_textarea_field( $item['reject_reason'] ?? '' );
+
+            if ( empty( $sku ) || $qty_rcv <= 0 ) continue;
+
+            if ( ! isset( $po_items_map[ $sku ] ) ) {
+                delete_transient( $lock_key );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => sprintf( 'SKU "%s" ไม่อยู่ใน PO นี้', esc_html( $sku ) ),
+                    'code'    => 'INVALID_SKU',
+                ), 400 );
+            }
+
+            $pi_data   = $po_items_map[ $sku ];
+            $remaining = $pi_data['ordered'] - $pi_data['received'];
+
+            if ( $qty_rcv > $remaining ) {
+                delete_transient( $lock_key );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => sprintf( 'จำนวนรับ SKU "%s" (%d) เกินจำนวนที่เหลือ (%d)', esc_html( $sku ), $qty_rcv, $remaining ),
+                    'code'    => 'OVER_RECEIVE',
+                ), 400 );
+            }
+
+            // Handle photo uploads for rejected items
+            $reject_photo_ids = array();
+            if ( ( $qc_status === 'failed' || $reject_qty > 0 ) ) {
+                $file_key = 'photos_' . $sku;
+                if ( ! empty( $files[ $file_key ] ) ) {
+                    require_once ABSPATH . 'wp-admin/includes/image.php';
+                    require_once ABSPATH . 'wp-admin/includes/file.php';
+                    require_once ABSPATH . 'wp-admin/includes/media.php';
+
+                    $uploaded = $files[ $file_key ];
+                    if ( is_array( $uploaded['name'] ) ) {
+                        $count = min( count( $uploaded['name'] ), 5 );
+                        for ( $i = 0; $i < $count; $i++ ) {
+                            $file_arr = array(
+                                'name'     => $uploaded['name'][ $i ],
+                                'type'     => $uploaded['type'][ $i ],
+                                'tmp_name' => $uploaded['tmp_name'][ $i ],
+                                'error'    => $uploaded['error'][ $i ],
+                                'size'     => $uploaded['size'][ $i ],
+                            );
+                            $_FILES['b2f_upload'] = $file_arr;
+                            $att_id = media_handle_upload( 'b2f_upload', 0 );
+                            if ( ! is_wp_error( $att_id ) ) {
+                                $reject_photo_ids[] = $att_id;
+                            }
+                        }
+                    } else {
+                        $_FILES['b2f_upload'] = $uploaded;
+                        $att_id = media_handle_upload( 'b2f_upload', 0 );
+                        if ( ! is_wp_error( $att_id ) ) {
+                            $reject_photo_ids[] = $att_id;
+                        }
+                    }
+                }
+            }
+
+            $rcv_items[] = array(
+                'rcvi_sku'           => $sku,
+                'rcvi_qty_received'  => $qty_rcv,
+                'rcvi_qty_rejected'  => $reject_qty,
+                'rcvi_qc_status'     => $qc_status,
+                'rcvi_reject_reason' => $reject_reason,
+                'rcvi_reject_photos' => $reject_photo_ids,
+            );
+
+            // Update PO item cumulative totals
+            $new_received = $pi_data['received'] + $qty_rcv;
+            $new_rejected = $pi_data['rejected'] + $reject_qty;
+            $po_items[ $pi_data['index'] ]['poi_qty_received'] = $new_received;
+            $po_items[ $pi_data['index'] ]['poi_qty_rejected'] = $new_rejected;
+
+            // Calculate value for debt (only count accepted items)
+            $unit_cost = floatval( $po_items[ $pi_data['index'] ]['poi_unit_cost'] ?? 0 );
+            $accepted  = $qty_rcv - $reject_qty;
+            if ( $accepted > 0 ) {
+                $total_rcv_value += round( $unit_cost * $accepted, 2 );
+            }
+        }
+
+        if ( empty( $rcv_items ) ) {
+            delete_transient( $lock_key );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีรายการที่รับ', 'code' => 'NO_ITEMS' ), 400 );
+        }
+
+        // Check if ALL SKUs in PO are fully received
+        foreach ( $po_items_map as $sku => $pi_data ) {
+            $cur_received = intval( $po_items[ $pi_data['index'] ]['poi_qty_received'] ?? 0 );
+            if ( $cur_received < $pi_data['ordered'] ) {
+                $all_complete = false;
+                break;
+            }
+        }
+
+        // Update PO items
+        update_field( 'po_items', $po_items, $po_id );
+
+        // Create receiving record
+        $rcv_number = function_exists( 'b2f_generate_rcv_number' )
+            ? b2f_generate_rcv_number()
+            : 'RCV-' . wp_date( 'ymd' ) . '-000';
+
+        $rcv_id = wp_insert_post( array(
+            'post_type'   => 'b2f_receiving',
+            'post_title'  => $rcv_number,
+            'post_status' => 'publish',
+        ) );
+
+        if ( is_wp_error( $rcv_id ) ) {
+            delete_transient( $lock_key );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'สร้างใบรับของไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
+        }
+
+        update_field( 'rcv_po_id', $po_id, $rcv_id );
+        update_field( 'rcv_number', $rcv_number, $rcv_id );
+        update_field( 'rcv_date', wp_date( 'Y-m-d' ), $rcv_id );
+        update_field( 'rcv_items', $rcv_items, $rcv_id );
+        update_field( 'rcv_admin_note', $note, $rcv_id );
+        update_field( 'rcv_inspected_by', $inspected_by, $rcv_id );
+
+        // Transition PO status
+        $new_status = $all_complete ? 'received' : 'partial_received';
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            b2f_transition_order( $po_id, $new_status, 'admin', sprintf( 'Receiving %s', $rcv_number ) );
+        } else {
+            update_field( 'po_status', $new_status, $po_id );
+        }
+
+        if ( $all_complete ) {
+            update_field( 'po_actual_date', wp_date( 'Y-m-d' ), $po_id );
+        }
+
+        // Add debt (payable)
+        $debt_added = false;
+        if ( $total_rcv_value > 0 && function_exists( 'b2f_payable_add' ) ) {
+            b2f_payable_add( $maker_id, $total_rcv_value, sprintf( 'รับของ %s', $rcv_number ), $po_id );
+            $debt_added = true;
+        }
+
+        // TODO: Update global inventory (source='b2f') when Inventory integration is built
+
+        // Push Flex to Maker
+        $maker_group = get_field( 'maker_line_group_id', $maker_id );
+        if ( function_exists( 'b2f_build_flex_receiving' ) && ! empty( $maker_group ) ) {
+            $flex = b2f_build_flex_receiving( $po_id, $rcv_id );
+            if ( $flex ) b2f_line_push( $maker_group, $flex );
+        }
+
+        // Push summary to Admin
+        if ( function_exists( 'b2f_build_flex_receiving_summary' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            $flex = b2f_build_flex_receiving_summary( $po_id, $rcv_id );
+            if ( $flex ) b2f_line_push( B2B_ADMIN_GROUP_ID, $flex );
+        }
+
+        delete_transient( $lock_key );
+
+        if ( function_exists( 'b2f_log' ) ) {
+            $po_number = get_field( 'po_number', $po_id );
+            b2f_log( sprintf( 'Goods received: %s (#%d) rcv=%s status=%s debt=%.2f',
+                $po_number, $po_id, $rcv_number, $new_status, $total_rcv_value
+            ) );
+        }
+
+        return new WP_REST_Response( array(
+            'success'           => true,
+            'rcv_id'            => $rcv_id,
+            'rcv_number'        => esc_html( $rcv_number ),
+            'po_status'         => $new_status,
+            'inventory_updated' => false, // TODO: set true when inventory integration is built
+            'debt_added'        => $debt_added ? $total_rcv_value : 0,
+        ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 12. RECORD PAYMENT ENDPOINT
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
+    /**
+     * POST /record-payment — บันทึกจ่ายเงิน Maker (FormData with slip)
+     *
+     * FormData fields:
+     *   po_id       (int)
+     *   amount      (float, > 0)
+     *   date        (Y-m-d)
+     *   method      (transfer|cheque|cash)
+     *   reference   (string)
+     *   slip_image  (file, optional)
+     *   note        (string)
+     *
+     * Response: { success, pmt_id, payment_status, remaining, po_status }
+     * Error codes: OVERPAYMENT, NOT_PAYABLE, INVALID_AMOUNT, INVALID_METHOD
+     */
+    function b2f_rest_record_payment( WP_REST_Request $req ) {
+        $po_id  = intval( $req->get_param( 'po_id' ) ?: 0 );
+        $amount = floatval( $req->get_param( 'amount' ) ?: 0 );
+        $date   = sanitize_text_field( $req->get_param( 'date' ) ?: wp_date( 'Y-m-d' ) );
+        $method = sanitize_text_field( $req->get_param( 'method' ) ?: 'transfer' );
+        $ref    = sanitize_text_field( $req->get_param( 'reference' ) ?: '' );
+        $note   = sanitize_textarea_field( $req->get_param( 'note' ) ?: '' );
+
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+        }
+        if ( $amount <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'จำนวนเงินต้องมากกว่า 0', 'code' => 'INVALID_AMOUNT' ), 400 );
+        }
+        if ( ! in_array( $method, array( 'transfer', 'cheque', 'cash' ), true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'วิธีจ่ายไม่ถูกต้อง', 'code' => 'INVALID_METHOD' ), 400 );
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+        $payable_statuses = array( 'received', 'partial_received', 'partial_paid' );
+        if ( ! in_array( $current_status, $payable_statuses, true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่สามารถบันทึกการจ่ายเงินในสถานะนี้', 'code' => 'NOT_PAYABLE' ), 400 );
+        }
+
+        $po_total    = floatval( get_field( 'po_total_amount', $po_id ) ?: 0 );
+        $paid_so_far = floatval( get_field( 'po_paid_amount', $po_id ) ?: 0 );
+        $remaining   = round( $po_total - $paid_so_far, 2 );
+
+        if ( $amount > $remaining + 0.01 ) {
+            return new WP_REST_Response( array(
+                'success'   => false,
+                'error'     => sprintf( 'จำนวนเงิน (%.2f) เกินยอดค้างจ่าย (%.2f)', $amount, $remaining ),
+                'code'      => 'OVERPAYMENT',
+                'remaining' => $remaining,
+            ), 400 );
+        }
+
+        $maker_id = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+
+        // Handle slip upload
+        $slip_id = 0;
+        $files   = $req->get_file_params();
+        if ( ! empty( $files['slip_image'] ) ) {
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+
+            $_FILES['b2f_slip'] = $files['slip_image'];
+            $att_id = media_handle_upload( 'b2f_slip', 0 );
+            if ( ! is_wp_error( $att_id ) ) {
+                $slip_id = $att_id;
+            }
+        }
+
+        // Create payment record
+        $po_number = get_field( 'po_number', $po_id ) ?: '';
+        $pmt_id = wp_insert_post( array(
+            'post_type'   => 'b2f_payment',
+            'post_title'  => sprintf( 'Payment %s - %s', $po_number, $date ),
+            'post_status' => 'publish',
+        ) );
+
+        if ( is_wp_error( $pmt_id ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'บันทึกการจ่ายเงินไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
+        }
+
+        update_field( 'pmt_po_id', $po_id, $pmt_id );
+        update_field( 'pmt_maker_id', $maker_id, $pmt_id );
+        update_field( 'pmt_amount', $amount, $pmt_id );
+        update_field( 'pmt_date', $date, $pmt_id );
+        update_field( 'pmt_method', $method, $pmt_id );
+        update_field( 'pmt_reference', $ref, $pmt_id );
+        update_field( 'pmt_note', $note, $pmt_id );
+        if ( $slip_id ) {
+            update_field( 'pmt_slip_image', $slip_id, $pmt_id );
+        }
+
+        // Update PO paid amount
+        $new_paid = round( $paid_so_far + $amount, 2 );
+        update_field( 'po_paid_amount', $new_paid, $po_id );
+
+        // Determine payment status
+        $is_fully_paid  = ( abs( $new_paid - $po_total ) < 0.01 );
+        $payment_status = $is_fully_paid ? 'paid' : 'partial_paid';
+        update_field( 'po_payment_status', $payment_status, $po_id );
+
+        // Transition PO status
+        if ( $is_fully_paid ) {
+            if ( function_exists( 'b2f_transition_order' ) ) {
+                b2f_transition_order( $po_id, 'paid', 'admin', sprintf( 'Full payment: %.2f', $amount ) );
+                b2f_transition_order( $po_id, 'completed', 'system', 'Payment completed' );
+            } else {
+                update_field( 'po_status', 'completed', $po_id );
+            }
+        } else {
+            if ( function_exists( 'b2f_transition_order' ) ) {
+                b2f_transition_order( $po_id, 'partial_paid', 'admin', sprintf( 'Partial payment: %.2f', $amount ) );
+            } else {
+                update_field( 'po_status', 'partial_paid', $po_id );
+            }
+        }
+
+        // Subtract debt (payable)
+        if ( function_exists( 'b2f_payable_subtract' ) ) {
+            b2f_payable_subtract( $maker_id, $amount, sprintf( 'จ่ายเงิน PO %s', $po_number ), $po_id );
+        }
+
+        // Push Flex to Maker
+        $maker_group = get_field( 'maker_line_group_id', $maker_id );
+        if ( function_exists( 'b2f_build_flex_payment' ) && ! empty( $maker_group ) ) {
+            $flex = b2f_build_flex_payment( $po_id, $pmt_id );
+            if ( $flex ) b2f_line_push( $maker_group, $flex );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Payment recorded: %s (#%d) amount=%.2f method=%s status=%s',
+                $po_number, $po_id, $amount, $method, $payment_status
+            ) );
+        }
+
+        $new_remaining = round( $po_total - $new_paid, 2 );
+
+        return new WP_REST_Response( array(
+            'success'        => true,
+            'pmt_id'         => $pmt_id,
+            'payment_status' => $payment_status,
+            'remaining'      => $new_remaining,
+            'po_status'      => esc_html( get_field( 'po_status', $po_id ) ),
+        ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 13. DASHBOARD ENDPOINTS
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_dashboard_stats' ) ) {
+    /**
+     * GET /dashboard-stats — KPI stats (ตาม spec section 12)
+     *
+     * Response: {
+     *   pending_confirm, confirmed, overdue,
+     *   total_payable, overdue_payable,
+     *   po_this_month, po_last_month,
+     *   status_breakdown
+     * }
+     */
+    function b2f_rest_dashboard_stats( WP_REST_Request $req ) {
+        global $wpdb;
+
+        // PO counts by status
+        $status_counts = array();
+        $statuses = array(
+            'draft', 'submitted', 'confirmed', 'amended', 'rejected',
+            'delivering', 'partial_received', 'received',
+            'partial_paid', 'paid', 'completed', 'cancelled',
+        );
+
+        foreach ( $statuses as $s ) {
+            $status_counts[ $s ] = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'po_status'
+                 WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish' AND pm.meta_value = %s",
+                $s
+            ) );
+        }
+
+        // Overdue: confirmed/delivering with expected_date < today
+        $today = wp_date( 'Y-m-d' );
+        $overdue = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} ps ON p.ID = ps.post_id AND ps.meta_key = 'po_status'
+             INNER JOIN {$wpdb->postmeta} pe ON p.ID = pe.post_id AND pe.meta_key = 'po_expected_date'
+             WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+             AND ps.meta_value IN ('confirmed','delivering')
+             AND pe.meta_value < %s AND pe.meta_value != ''",
+            $today
+        ) );
+
+        // Total payable (sum of all makers' current_debt)
+        $total_payable = (float) $wpdb->get_var(
+            "SELECT COALESCE(SUM(CAST(pm.meta_value AS DECIMAL(12,2))), 0)
+             FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'maker_current_debt'
+             WHERE p.post_type = 'b2f_maker' AND p.post_status = 'publish'"
+        );
+
+        // PO this month
+        $month_start = wp_date( 'Y-m-01' );
+        $po_this_month = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->posts}
+             WHERE post_type = 'b2f_order' AND post_status = 'publish' AND post_date >= %s",
+            $month_start . ' 00:00:00'
+        ) );
+
+        // PO last month
+        $last_month_start = wp_date( 'Y-m-01', strtotime( '-1 month' ) );
+        $last_month_end   = wp_date( 'Y-m-t', strtotime( '-1 month' ) );
+        $po_last_month = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->posts}
+             WHERE post_type = 'b2f_order' AND post_status = 'publish'
+             AND post_date >= %s AND post_date <= %s",
+            $last_month_start . ' 00:00:00',
+            $last_month_end . ' 23:59:59'
+        ) );
+
+        // Overdue payable: makers with debt past credit term
+        $overdue_payable = 0;
+        $makers_q = new WP_Query( array(
+            'post_type'      => 'b2f_maker',
+            'posts_per_page' => -1,
+            'post_status'    => 'publish',
+            'fields'         => 'ids',
+        ) );
+        foreach ( $makers_q->posts as $mid ) {
+            $debt = floatval( get_field( 'maker_current_debt', $mid ) ?: 0 );
+            if ( $debt <= 0 ) continue;
+
+            $term = intval( get_field( 'maker_credit_term_days', $mid ) ?: 30 );
+
+            // Find oldest unpaid received PO for this maker
+            $oldest = $wpdb->get_var( $wpdb->prepare(
+                "SELECT MIN(pe.meta_value) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} ps ON p.ID = ps.post_id AND ps.meta_key = 'po_status'
+                 INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'po_maker_id'
+                 INNER JOIN {$wpdb->postmeta} pe ON p.ID = pe.post_id AND pe.meta_key = 'po_actual_date'
+                 INNER JOIN {$wpdb->postmeta} pp ON p.ID = pp.post_id AND pp.meta_key = 'po_payment_status'
+                 WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+                 AND pm.meta_value = %s
+                 AND ps.meta_value IN ('received','partial_paid')
+                 AND pp.meta_value != 'paid'
+                 AND pe.meta_value != ''",
+                strval( $mid )
+            ) );
+
+            if ( $oldest && strtotime( $oldest ) < strtotime( "-{$term} days" ) ) {
+                $overdue_payable += $debt;
+            }
+        }
+
+        return new WP_REST_Response( array(
+            'success'          => true,
+            'pending_confirm'  => $status_counts['submitted'] ?? 0,
+            'confirmed'        => ( $status_counts['confirmed'] ?? 0 ) + ( $status_counts['delivering'] ?? 0 ),
+            'overdue'          => $overdue,
+            'total_payable'    => round( $total_payable, 2 ),
+            'overdue_payable'  => round( $overdue_payable, 2 ),
+            'po_this_month'    => $po_this_month,
+            'po_last_month'    => $po_last_month,
+            'status_breakdown' => $status_counts,
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_rest_po_history' ) ) {
+    /**
+     * GET /po-history — PO list with filters and pagination
+     * Params: ?maker_id, ?status, ?date_from, ?date_to, ?page, ?per_page, ?search
+     *
+     * Response: { success, total, page, per_page, total_pages, orders }
+     */
+    function b2f_rest_po_history( WP_REST_Request $req ) {
+        $maker_id  = intval( $req->get_param( 'maker_id' ) ?: 0 );
+        $status    = sanitize_text_field( $req->get_param( 'status' ) ?: '' );
+        $date_from = sanitize_text_field( $req->get_param( 'date_from' ) ?: '' );
+        $date_to   = sanitize_text_field( $req->get_param( 'date_to' ) ?: '' );
+        $page      = max( 1, intval( $req->get_param( 'page' ) ?: 1 ) );
+        $per_page  = min( 100, max( 1, intval( $req->get_param( 'per_page' ) ?: 20 ) ) );
+        $search    = sanitize_text_field( $req->get_param( 'search' ) ?: '' );
+
+        $args = array(
+            'post_type'      => 'b2f_order',
+            'posts_per_page' => $per_page,
+            'paged'          => $page,
+            'post_status'    => 'publish',
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+            'meta_query'     => array(),
+        );
+
+        if ( $maker_id ) {
+            $args['meta_query'][] = array(
+                'key'   => 'po_maker_id',
+                'value' => $maker_id,
+                'type'  => 'NUMERIC',
+            );
+        }
+
+        if ( ! empty( $status ) ) {
+            $args['meta_query'][] = array(
+                'key'   => 'po_status',
+                'value' => $status,
+            );
+        }
+
+        if ( ! empty( $date_from ) ) {
+            $args['date_query'][] = array(
+                'after'     => $date_from,
+                'inclusive' => true,
+            );
+        }
+
+        if ( ! empty( $date_to ) ) {
+            $args['date_query'][] = array(
+                'before'    => $date_to,
+                'inclusive' => true,
+            );
+        }
+
+        if ( ! empty( $search ) ) {
+            $args['meta_query'][] = array(
+                'key'     => 'po_number',
+                'value'   => $search,
+                'compare' => 'LIKE',
+            );
+        }
+
+        $q      = new WP_Query( $args );
+        $orders = array();
+
+        foreach ( $q->posts as $p ) {
+            $orders[] = b2f_format_po_detail( $p->ID, true );
+        }
+
+        return new WP_REST_Response( array(
+            'success'     => true,
+            'total'       => $q->found_posts,
+            'page'        => $page,
+            'per_page'    => $per_page,
+            'total_pages' => $q->max_num_pages,
+            'orders'      => $orders,
+        ), 200 );
+    }
+}

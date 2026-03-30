@@ -1,0 +1,309 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2F] Snippet 7: Credit Transaction Manager                 ║
+ * ║  Version: V.1.0                                              ║
+ * ║  DB_ID: 2007                                                 ║
+ * ║  Description: Atomic payable operations — DINOCO เป็นหนี้ Maker ║
+ * ║  สำหรับระบบ B2F (Business to Factory)                         ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * ทิศทางกลับด้านจาก B2B:
+ * - B2B: ตัวแทนเป็นหนี้ DINOCO (b2b_debt_add = ตัวแทนหนี้เพิ่ม)
+ * - B2F: DINOCO เป็นหนี้ Maker (b2f_payable_add = DINOCO ค้างจ่าย Maker เพิ่ม)
+ *
+ * Reuse pattern จาก [B2B] Snippet 13: Debt Transaction Manager
+ * Kill Switch: define('B2F_DISABLED', true)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
+
+// ════════════════════════════════════════════
+// 1. ATOMIC PAYABLE OPERATIONS
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_payable_add' ) ) {
+    /**
+     * เพิ่มยอดค้างจ่าย Maker แบบ atomic (เรียกเมื่อตรวจรับของเข้า)
+     *
+     * @param int    $maker_id  b2f_maker post ID
+     * @param float  $amount    จำนวนเงินที่เพิ่ม
+     * @param string $reason    เหตุผล (สำหรับ audit log)
+     * @param int    $po_id     PO post ID
+     * @return float|false      ยอดค้างจ่ายใหม่ หรือ false ถ้า fail
+     */
+    function b2f_payable_add( $maker_id, $amount, $reason = '', $po_id = 0 ) {
+        global $wpdb;
+        $amount = round( floatval( $amount ), 2 );
+        if ( $amount <= 0 || ! $maker_id ) return false;
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            // Lock current_debt + credit_limit rows (prevent TOCTOU race)
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT pm1.meta_value AS current_debt,
+                        COALESCE((SELECT pm2.meta_value FROM {$wpdb->postmeta} pm2
+                                  WHERE pm2.post_id = %d AND pm2.meta_key = 'maker_credit_limit'), '0') AS credit_limit
+                 FROM {$wpdb->postmeta} pm1
+                 JOIN {$wpdb->posts} p ON p.ID = pm1.post_id AND p.post_type = 'b2f_maker'
+                 WHERE pm1.post_id = %d AND pm1.meta_key = 'maker_current_debt'
+                 FOR UPDATE",
+                $maker_id, $maker_id
+            ) );
+
+            $old_debt = floatval( $row ? $row->current_debt : 0 );
+            $credit_limit = floatval( $row ? $row->credit_limit : 0 );
+            $new_debt = round( $old_debt + $amount, 2 );
+
+            // Handle missing meta row (new maker)
+            if ( $row === null ) {
+                $wpdb->query( $wpdb->prepare(
+                    "INSERT IGNORE INTO {$wpdb->postmeta} (post_id, meta_key, meta_value) VALUES (%d, 'maker_current_debt', %s)",
+                    $maker_id, $new_debt
+                ) );
+                $wpdb->update( $wpdb->postmeta,
+                    array( 'meta_value' => $new_debt ),
+                    array( 'post_id' => $maker_id, 'meta_key' => 'maker_current_debt' )
+                );
+            } else {
+                $wpdb->update( $wpdb->postmeta,
+                    array( 'meta_value' => $new_debt ),
+                    array( 'post_id' => $maker_id, 'meta_key' => 'maker_current_debt' )
+                );
+            }
+
+            // Auto credit hold เมื่อเลยวงเงิน
+            if ( $credit_limit > 0 && $new_debt >= $credit_limit ) {
+                $wpdb->update( $wpdb->postmeta,
+                    array( 'meta_value' => '1' ),
+                    array( 'post_id' => $maker_id, 'meta_key' => 'maker_credit_hold' )
+                );
+                // Set reason = auto (ระบบ hold เอง)
+                $hold_reason_exists = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = 'maker_credit_hold_reason'",
+                    $maker_id
+                ) );
+                if ( $hold_reason_exists ) {
+                    $wpdb->update( $wpdb->postmeta,
+                        array( 'meta_value' => 'auto' ),
+                        array( 'post_id' => $maker_id, 'meta_key' => 'maker_credit_hold_reason' )
+                    );
+                }
+                b2f_log( "[Credit] AUTO HOLD: maker={$maker_id} debt={$new_debt} >= limit={$credit_limit}" );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            // Audit AFTER commit
+            b2f_payable_audit( $maker_id, 'add', $amount, $old_debt, $new_debt, $reason, $po_id );
+            wp_cache_delete( $maker_id, 'post_meta' );
+            if ( function_exists( 'update_field' ) ) {
+                update_field( 'maker_current_debt', $new_debt, $maker_id );
+            }
+            return $new_debt;
+
+        } catch ( Exception $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            b2f_log( "[Credit] ERROR in b2f_payable_add: " . $e->getMessage() );
+            return false;
+        }
+    }
+}
+
+if ( ! function_exists( 'b2f_payable_subtract' ) ) {
+    /**
+     * ลดยอดค้างจ่าย Maker แบบ atomic (เรียกเมื่อจ่ายเงิน Maker)
+     *
+     * @param int    $maker_id  b2f_maker post ID
+     * @param float  $amount    จำนวนเงินที่จ่าย
+     * @param string $reason    เหตุผล
+     * @param int    $po_id     PO post ID
+     * @return float|false      ยอดค้างจ่ายใหม่
+     */
+    function b2f_payable_subtract( $maker_id, $amount, $reason = '', $po_id = 0 ) {
+        global $wpdb;
+        $amount = round( floatval( $amount ), 2 );
+        if ( $amount <= 0 || ! $maker_id ) return false;
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $current = $wpdb->get_var( $wpdb->prepare(
+                "SELECT pm.meta_value FROM {$wpdb->postmeta} pm
+                 JOIN {$wpdb->posts} p ON p.ID = pm.post_id AND p.post_type = 'b2f_maker'
+                 WHERE pm.post_id = %d AND pm.meta_key = 'maker_current_debt'
+                 FOR UPDATE",
+                $maker_id
+            ) );
+
+            $old_debt = floatval( $current );
+            $new_debt = round( max( 0, $old_debt - $amount ), 2 );
+
+            $wpdb->update( $wpdb->postmeta,
+                array( 'meta_value' => $new_debt ),
+                array( 'post_id' => $maker_id, 'meta_key' => 'maker_current_debt' )
+            );
+
+            // Auto-unhold เฉพาะ reason = 'auto' (ถ้า Admin set manual ไม่ auto-unhold)
+            if ( $new_debt <= 0 || $new_debt < floatval( get_field( 'maker_credit_limit', $maker_id ) ?: 0 ) ) {
+                $hold_reason = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT meta_value FROM {$wpdb->postmeta}
+                     WHERE post_id = %d AND meta_key = 'maker_credit_hold_reason'",
+                    $maker_id
+                ) );
+                if ( $hold_reason === 'auto' ) {
+                    $wpdb->update( $wpdb->postmeta,
+                        array( 'meta_value' => '' ),
+                        array( 'post_id' => $maker_id, 'meta_key' => 'maker_credit_hold' )
+                    );
+                    $wpdb->update( $wpdb->postmeta,
+                        array( 'meta_value' => '' ),
+                        array( 'post_id' => $maker_id, 'meta_key' => 'maker_credit_hold_reason' )
+                    );
+                    b2f_log( "[Credit] AUTO UNHOLD: maker={$maker_id} debt={$new_debt} < limit" );
+                }
+            }
+
+            // Overpayment detection
+            if ( $amount > $old_debt ) {
+                $overpaid = round( $amount - $old_debt, 2 );
+                b2f_log( "[Credit] OVERPAYMENT: maker={$maker_id} overpaid={$overpaid}" );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            b2f_payable_audit( $maker_id, 'subtract', $amount, $old_debt, $new_debt, $reason, $po_id );
+            wp_cache_delete( $maker_id, 'post_meta' );
+            if ( function_exists( 'update_field' ) ) {
+                update_field( 'maker_current_debt', $new_debt, $maker_id );
+            }
+            return $new_debt;
+
+        } catch ( Exception $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            b2f_log( "[Credit] ERROR in b2f_payable_subtract: " . $e->getMessage() );
+            return false;
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 2. RECALCULATE (Source of Truth)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_recalculate_payable' ) ) {
+    /**
+     * คำนวณยอดค้างจ่าย Maker จาก data จริง (single SQL source of truth)
+     * ค้างจ่าย = sum(received * unit_cost) - sum(payments)
+     *
+     * @param int $maker_id
+     * @return float ยอดค้างจ่ายที่คำนวณใหม่
+     */
+    function b2f_recalculate_payable( $maker_id ) {
+        global $wpdb;
+
+        // Sum of received amounts from receiving records linked to this maker's POs
+        $received_total = (float) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COALESCE(SUM(pm_total.meta_value), 0)
+             FROM {$wpdb->posts} po
+             JOIN {$wpdb->postmeta} pm_maker ON pm_maker.post_id = po.ID AND pm_maker.meta_key = 'po_maker_id'
+             JOIN {$wpdb->postmeta} pm_total ON pm_total.post_id = po.ID AND pm_total.meta_key = 'po_total_amount'
+             JOIN {$wpdb->postmeta} pm_status ON pm_status.post_id = po.ID AND pm_status.meta_key = 'po_status'
+             WHERE po.post_type = 'b2f_order'
+             AND po.post_status = 'publish'
+             AND pm_maker.meta_value = %s
+             AND pm_status.meta_value IN ('received','partial_received','paid','partial_paid','completed')",
+            $maker_id
+        ) );
+
+        // Sum of payments
+        $paid_total = (float) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COALESCE(SUM(pm_amt.meta_value), 0)
+             FROM {$wpdb->posts} pmt
+             JOIN {$wpdb->postmeta} pm_maker ON pm_maker.post_id = pmt.ID AND pm_maker.meta_key = 'pmt_maker_id'
+             JOIN {$wpdb->postmeta} pm_amt ON pm_amt.post_id = pmt.ID AND pm_amt.meta_key = 'pmt_amount'
+             WHERE pmt.post_type = 'b2f_payment'
+             AND pmt.post_status = 'publish'
+             AND pm_maker.meta_value = %s",
+            $maker_id
+        ) );
+
+        $debt = round( max( 0, $received_total - $paid_total ), 2 );
+
+        update_field( 'maker_current_debt', $debt, $maker_id );
+        wp_cache_delete( $maker_id, 'post_meta' );
+
+        b2f_log( "[Credit] Recalculated: maker={$maker_id} received={$received_total} paid={$paid_total} debt={$debt}" );
+
+        return $debt;
+    }
+}
+
+// ════════════════════════════════════════════
+// 3. FINANCIAL LOCK (MySQL GET_LOCK)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_financial_lock' ) ) {
+    function b2f_financial_lock( $maker_id, $timeout = 5 ) {
+        global $wpdb;
+        $lock_name = 'b2f_fin_' . intval( $maker_id );
+        $result = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, %d)", $lock_name, $timeout ) );
+        return $result == 1;
+    }
+}
+
+if ( ! function_exists( 'b2f_financial_unlock' ) ) {
+    function b2f_financial_unlock( $maker_id ) {
+        global $wpdb;
+        $lock_name = 'b2f_fin_' . intval( $maker_id );
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+    }
+}
+
+// ════════════════════════════════════════════
+// 4. AUDIT LOG
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_payable_audit' ) ) {
+    function b2f_payable_audit( $maker_id, $action, $amount, $old_debt, $new_debt, $reason, $po_id ) {
+        $log = get_post_meta( $maker_id, '_b2f_payable_audit_log', true ) ?: array();
+        $log[] = array(
+            'time'      => current_time( 'Y-m-d H:i:s' ),
+            'action'    => $action,    // 'add' = DINOCO ค้างจ่ายเพิ่ม, 'subtract' = จ่ายแล้ว
+            'amount'    => $amount,
+            'old_debt'  => $old_debt,
+            'new_debt'  => $new_debt,
+            'reason'    => $reason,
+            'po_id'     => $po_id,
+            'user'      => wp_get_current_user()->user_login ?: 'system',
+        );
+        // Keep last 200 entries
+        if ( count( $log ) > 200 ) $log = array_slice( $log, -200 );
+        update_post_meta( $maker_id, '_b2f_payable_audit_log', $log );
+    }
+}
+
+// ════════════════════════════════════════════
+// 5. CREDIT CHECK HELPER
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_check_credit' ) ) {
+    /**
+     * ตรวจว่า Maker ถูก hold หรือไม่ (ใช้ก่อนสร้าง PO)
+     *
+     * @param int $maker_id
+     * @return true|WP_Error  true ถ้าสั่งได้, WP_Error ถ้า hold
+     */
+    function b2f_check_credit( $maker_id ) {
+        $hold = get_field( 'maker_credit_hold', $maker_id );
+        if ( $hold ) {
+            $reason = get_field( 'maker_credit_hold_reason', $maker_id );
+            $debt = floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 );
+            $limit = floatval( get_field( 'maker_credit_limit', $maker_id ) ?: 0 );
+            $msg = $reason === 'manual'
+                ? 'Maker ถูกระงับเครดิตโดย Admin'
+                : sprintf( 'Maker เลยวงเงินเครดิต (ค้างจ่าย ฿%s / วงเงิน ฿%s)', number_format( $debt, 2 ), number_format( $limit, 2 ) );
+            return new WP_Error( 'credit_hold', $msg );
+        }
+        return true;
+    }
+}
