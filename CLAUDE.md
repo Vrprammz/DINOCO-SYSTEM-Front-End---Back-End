@@ -47,8 +47,7 @@ All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-produc
 - `DINOCO_GITHUB_TOKEN` — GitHub PAT for sync engine
 - `DINOCO_GITHUB_REPO` — GitHub repo (e.g., `Vrprammz/DINOCO-SYSTEM-Front-End---Back-End`)
 - `DINOCO_GITHUB_WEBHOOK_SECRET` — Webhook signature secret
-- `B2F_LIFF_ID` — LIFF app ID for B2F Maker pages
-- `B2F_LIFF_URL` — LIFF base URL for B2F
+- `B2F_LIFF_ID` — ใช้ตัวเดียวกับ `B2B_LIFF_ID` (auto-fallback ไม่ต้องตั้งแยก)
 
 ## File Organization
 
