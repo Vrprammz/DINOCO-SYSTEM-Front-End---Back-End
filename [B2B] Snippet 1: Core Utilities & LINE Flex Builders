@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
- * ║  Version: V.31.4 — Flash error UX: no duplicate push, friendly msg   ║
+ * ║  Version: V.31.5 — Flash API audit fixes (aggregate, retry, params)  ║
  * ║  DB_ID: 72                                                  ║
  * ║  DINOCO B2B Smart Order System                               ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -1043,6 +1043,11 @@ if ( ! function_exists( 'b2b_flash_aggregate_status' ) ) {
         if ( $all_delivered ) return 'delivered';
 
         // Priority: delivering > in_transit > picked_up > created
+        // FIX A-5: Priority problem/returned/detained ก่อน — ถ้ามีกล่องที่มีปัญหาต้องแจ้ง
+        if ( in_array( 'returned', $states, true ) ) return 'returned';
+        if ( in_array( 'problem', $states, true ) ) return 'problem';
+        if ( in_array( 'detained', $states, true ) ) return 'detained';
+
         if ( in_array( 'delivering', $states, true ) ) return 'delivering';
         if ( in_array( 'in_transit', $states, true ) ) return 'in_transit';
         if ( in_array( 'picked_up', $states, true ) ) return 'picked_up';
@@ -3076,15 +3081,26 @@ if ( ! function_exists( 'b2b_flash_request' ) ) {
         // FIX S-3: debug log เพื่อ diagnose signature mismatch (Production vs Training)
         $sk = B2B_FLASH_SECRET_KEY;
         b2b_log( '[Flash] POST ' . $path . ' | URL=' . $url . ' | mchId=' . B2B_FLASH_MCH_ID . ' | key=' . substr($sk,0,4) . '...' . substr($sk,-4) . '(' . strlen($sk) . 'chars)' );
-        $resp = wp_remote_post( $url, array(
+        // FIX A-6: retry 1 ครั้งเมื่อ timeout/connection error
+        $req_args = array(
             'body'    => $params,
             'timeout' => 30,
             'headers' => array( 'Content-Type' => 'application/x-www-form-urlencoded', 'Accept-Language' => 'th' ),
-        ) );
+        );
+        $resp = wp_remote_post( $url, $req_args );
         if ( is_wp_error( $resp ) ) {
             $err = $resp->get_error_message();
-            b2b_log( '[Flash] WP Error: ' . $err );
-            return array( 'ok' => false, 'error' => $err );
+            // Retry once for timeout/connection errors (NOT for validation/auth errors)
+            if ( strpos($err, 'timed out') !== false || strpos($err, 'connect') !== false || strpos($err, 'resolve') !== false ) {
+                b2b_log( '[Flash] Retry 1x after: ' . $err );
+                sleep(2);
+                $resp = wp_remote_post( $url, $req_args );
+            }
+            if ( is_wp_error( $resp ) ) {
+                $err = $resp->get_error_message();
+                b2b_log( '[Flash] WP Error: ' . $err );
+                return array( 'ok' => false, 'error' => $err );
+            }
         }
         $code = wp_remote_retrieve_response_code( $resp );
         $body = wp_remote_retrieve_body( $resp );
@@ -3300,10 +3316,10 @@ if ( ! function_exists( 'b2b_flash_cancel_notify' ) ) {
 }
 
 if ( ! function_exists( 'b2b_flash_get_notifications' ) ) {
+    // FIX A-M1: date เป็น required ตาม docs — default เป็นวันนี้
     function b2b_flash_get_notifications( $date = '' ) {
-        $p = array();
-        if ( $date ) $p['date'] = $date;
-        return b2b_flash_request( 'open/v1/notifications', $p );
+        if ( ! $date ) $date = b2b_date( 'Y-m-d' );
+        return b2b_flash_request( 'open/v1/notifications', array( 'date' => $date ) );
     }
 }
 
@@ -3338,8 +3354,11 @@ if ( ! function_exists( 'b2b_flash_modify_order' ) ) {
 }
 
 if ( ! function_exists( 'b2b_flash_get_order_by_mch_pno' ) ) {
-    function b2b_flash_get_order_by_mch_pno( $out_trade_no ) {
-        return b2b_flash_request( 'open/v3/ordersByMchPno', array( 'outTradeNo' => $out_trade_no ) );
+    // FIX A-3: เพิ่ม mchPno (required ตาม Flash docs) + outTradeNo
+    function b2b_flash_get_order_by_mch_pno( $out_trade_no, $mch_pno = '' ) {
+        $params = array( 'outTradeNo' => $out_trade_no );
+        if ( $mch_pno ) $params['mchPno'] = $mch_pno;
+        return b2b_flash_request( 'open/v3/ordersByMchPno', $params );
     }
 }
 
@@ -3362,8 +3381,9 @@ if ( ! function_exists( 'b2b_flash_get_webhook_info' ) ) {
 }
 
 if ( ! function_exists( 'b2b_flash_address_lookup' ) ) {
-    function b2b_flash_address_lookup( $query ) {
-        return b2b_flash_request( 'gw/fda/open/standard/address_core/url/query', array( 'queryString' => $query ) );
+    // FIX A-8: ลบ queryString — docs ระบุแค่ mchId+nonceStr+sign, return URL ของ master address
+    function b2b_flash_address_lookup() {
+        return b2b_flash_request( 'gw/fda/open/standard/address_core/url/query' );
     }
 }
 
@@ -3772,7 +3792,7 @@ if ( ! function_exists( 'b2b_flash_notify_courier_from_warehouse' ) ) {
             'srcProvinceName'      => ! empty( $wh['wh_province'] ) ? $wh['wh_province'] : '',
             'srcPostalCode'        => ! empty( $wh['wh_postcode'] ) ? $wh['wh_postcode'] : '',
             'estimateParcelNumber' => $parcel_count,
-            'pickupType'           => 1,  // 1=นัดรับที่คลัง
+            // FIX A-8: ลบ pickupType — undocumented param ที่ docs ไม่ระบุ
         );
         if ( $remark ) $params['remark'] = $remark;
         return b2b_flash_notify_courier( $params );

@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
- * ║  Version: V.31.1 — Courier assigned → Flex card notification  ║
+ * ║  Version: V.31.2 — Flash audit fixes (all 10 items)           ║
  * ║  DB_ID: 52                                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
@@ -3066,10 +3066,10 @@ function b2b_rest_flash_webhook( WP_REST_Request $req ) {
 
     b2b_log( '[Flash WH] Received: pno=' . $pno . ' mchId=' . $mch_id );
 
-    // Verify signature (only mchId + nonceStr participate in signing)
+    // FIX A-2: Verify signature — reject เมื่อ fail (ไม่ process ต่อ)
     if ( function_exists( 'b2b_flash_verify_webhook' ) && ! b2b_flash_verify_webhook( $mch_id, $nonce_str, $sign ) ) {
-        b2b_log( '[Flash WH] ⚠ WARN: Signature mismatch — possible key rotation or attack — pno=' . $pno . ' mchId=' . $mch_id );
-        return new WP_REST_Response( array( 'errorCode' => '1', 'state' => 'success' ) );
+        b2b_log( '[Flash WH] 🔴 REJECTED: Signature mismatch — pno=' . $pno . ' mchId=' . $mch_id );
+        return new WP_REST_Response( array( 'errorCode' => '0', 'message' => 'signature_mismatch' ), 403 );
     }
 
     // BUG 5 FIX: Detect webhook type by payload fields (Flash doesn't send 'code')
@@ -3302,6 +3302,9 @@ function b2b_flash_wh_status( $ticket_id, $pno, $data ) {
                 if ( function_exists( 'b2b_set_order_status' ) ) {
                     b2b_set_order_status( $ticket_id, 'shipped' );
                 }
+                // FIX A-1: set shipped_date + schedule delivery_check 3 วัน (เหมือน manual shipping)
+                update_field( 'shipped_date', b2b_date( 'Y-m-d' ), $ticket_id );
+                wp_schedule_single_event( time() + ( 3 * DAY_IN_SECONDS ), 'b2b_delivery_check_event', array( $ticket_id ) );
                 if ( $sgid && function_exists( 'b2b_build_flex_flash_status' ) ) {
                     $msg = $is_multi_box ? 'Flash รับพัสดุแล้ว (' . $active_box_count . ' กล่อง)' : 'Flash รับพัสดุแล้ว';
                     b2b_line_push_raw( $sgid, array( b2b_build_flex_flash_status( $ticket_id, 1, $msg ) ) );
@@ -3349,16 +3352,46 @@ function b2b_flash_wh_status( $ticket_id, $pno, $data ) {
             $pod = array_filter( $pod );
             if ( ! empty( $pod ) ) update_post_meta( $ticket_id, '_flash_pod_data', $pod );
 
-            // V.36: Only complete + notify when ALL active PNOs delivered (or single box)
+            // FIX A-7: ไม่ auto-complete ทันที — ส่ง Flex ให้ลูกค้ายืนยัน + schedule 24hr auto-complete
             if ( ! $is_multi_box || $all_active_reached ) {
-                if ( function_exists( 'b2b_set_order_status' ) ) {
-                    b2b_set_order_status( $ticket_id, 'completed' );
-                }
-                if ( $sgid && function_exists( 'b2b_build_flex_flash_status' ) ) {
+                // ยังไม่เปลี่ยนเป็น completed — รอลูกค้ายืนยัน หรือ 24 ชม.
+                update_post_meta( $ticket_id, '_flash_delivered_at', current_time( 'mysql' ) );
+                // ส่ง Flex แจ้งลูกค้าว่าของถึง + ปุ่มยืนยัน
+                if ( $sgid ) {
                     $msg = $is_multi_box ? 'พัสดุส่งถึงแล้ว (' . $active_box_count . ' กล่อง)' : 'พัสดุส่งถึงแล้ว';
-                    b2b_line_push_raw( $sgid, array( b2b_build_flex_flash_status( $ticket_id, 5, $msg ) ) );
+                    $signer = isset( $pod['signer'] ) ? $pod['signer'] : '';
+                    $signer_type = isset( $pod['signerType'] ) ? $pod['signerType'] : '';
+                    $sign_text = $signer ? 'เซ็นรับโดย: ' . $signer . ( $signer_type ? ' (' . $signer_type . ')' : '' ) : '';
+                    // สร้าง Flex พร้อมปุ่มยืนยันรับของ + ปุ่มแจ้งปัญหา
+                    $body_contents = array(
+                        array( 'type' => 'text', 'text' => '✅ ' . $msg, 'weight' => 'bold', 'size' => 'lg', 'color' => '#16a34a' ),
+                        array( 'type' => 'text', 'text' => '#' . $ticket_id . ' — ' . ( get_field( 'dist_name', $ticket_id ) ?: '' ), 'size' => 'xs', 'color' => '#666' ),
+                    );
+                    if ( $sign_text ) $body_contents[] = array( 'type' => 'text', 'text' => $sign_text, 'size' => 'xs', 'color' => '#333', 'margin' => 'sm' );
+                    $body_contents[] = array( 'type' => 'separator', 'margin' => 'lg' );
+                    $body_contents[] = array( 'type' => 'text', 'text' => 'กรุณายืนยันรับสินค้าภายใน 24 ชม.', 'size' => 'xs', 'color' => '#92400e', 'margin' => 'md', 'wrap' => true );
+                    $body_contents[] = array( 'type' => 'text', 'text' => 'หากไม่ยืนยัน ระบบจะปิดออเดอร์อัตโนมัติ', 'size' => 'xxs', 'color' => '#94a3b8', 'margin' => 'xs', 'wrap' => true );
+                    $logo = function_exists( 'b2b_get_logo_url' ) ? b2b_get_logo_url() : '';
+                    $header = array( 'type' => 'box', 'layout' => 'horizontal', 'backgroundColor' => '#16a34a', 'paddingAll' => '14px', 'contents' => array(
+                        array( 'type' => 'image', 'url' => $logo ?: 'https://dinoco.in.th/wp-content/uploads/dinoco-logo.png', 'size' => 'xxs', 'aspectMode' => 'fit', 'flex' => 0 ),
+                        array( 'type' => 'box', 'layout' => 'vertical', 'flex' => 1, 'margin' => 'md', 'contents' => array(
+                            array( 'type' => 'text', 'text' => '📦 พัสดุส่งถึงแล้ว', 'color' => '#ffffff', 'size' => 'sm', 'weight' => 'bold' ),
+                            array( 'type' => 'text', 'text' => 'Flash Express', 'color' => '#dcfce7', 'size' => 'xxs' )))));
+                    $footer = array( 'type' => 'box', 'layout' => 'vertical', 'spacing' => 'sm', 'paddingAll' => '12px', 'contents' => array(
+                        array( 'type' => 'button', 'style' => 'primary', 'height' => 'sm', 'color' => '#16a34a',
+                            'action' => array( 'type' => 'postback', 'label' => '✅ ยืนยันรับสินค้า', 'data' => 'action=confirm_received&ticket_id=' . $ticket_id ) ),
+                        array( 'type' => 'button', 'style' => 'link', 'height' => 'sm', 'color' => '#dc2626',
+                            'action' => array( 'type' => 'postback', 'label' => '⚠️ สินค้ามีปัญหา', 'data' => 'action=delivery_no&ticket_id=' . $ticket_id ) ),
+                    ));
+                    $bubble = array( 'type' => 'bubble', 'header' => $header,
+                        'body' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body_contents ),
+                        'footer' => $footer );
+                    $flex = array( 'type' => 'flex', 'altText' => '📦 พัสดุส่งถึงแล้ว #' . $ticket_id . ' — กรุณายืนยันรับสินค้า', 'contents' => $bubble );
+                    b2b_line_push_raw( $sgid, array( $flex ) );
                 }
-                b2b_add_audit_log( $ticket_id, 'flash_delivered', 'Flash: ส่งถึง — เซ็นรับ' );
+                // Schedule 24hr auto-complete (ถ้าลูกค้าไม่กดยืนยัน)
+                wp_schedule_single_event( time() + ( 24 * HOUR_IN_SECONDS ), 'b2b_auto_complete_check', array( $ticket_id ) );
+                b2b_add_audit_log( $ticket_id, 'flash_delivered', 'Flash: ส่งถึง — รอยืนยันรับ 24 ชม.' );
             } else {
                 b2b_add_audit_log( $ticket_id, 'flash_delivered_partial', 'Flash: กล่อง ' . $box_label_str . ' ส่งถึง (pno=' . $pno . ')' );
             }
@@ -3386,6 +3419,15 @@ function b2b_flash_wh_status( $ticket_id, $pno, $data ) {
             if ( function_exists( 'b2b_build_flex_flash_admin' ) ) {
                 b2b_push_raw_to_admin( array( b2b_build_flex_flash_admin( $ticket_id, 'returned', array( 'reason' => $reason, 'pno' => $pno, 'box' => $box_label_str ) ) ) );
             }
+            break;
+
+        case 8: // Closed (problem resolved)
+            // FIX A-4: handle state=8 — Flash ปิดงาน(ปัญหา) resolved
+            if ( function_exists( 'b2b_push_to_admin' ) ) {
+                $box_ctx = $is_multi_box ? ' กล่อง ' . $box_label_str : '';
+                b2b_push_to_admin( '🔵 Flash ปิดงาน (ปัญหา resolved) #' . $ticket_id . $box_ctx );
+            }
+            b2b_add_audit_log( $ticket_id, 'flash_closed', 'Flash: ปิดงาน (ปัญหา resolved) pno=' . $pno );
             break;
 
         case 9: // Cancelled
