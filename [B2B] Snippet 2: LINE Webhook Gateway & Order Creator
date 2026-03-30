@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
- * ║  Version: V.31.0 — Debt/Credit System Hardening                   ║
+ * ║  Version: V.31.1 — Slip Pre-Validation (wrong-shop guard)          ║
  * ║  DB_ID: 51                                                  ║
  * ║  DINOCO B2B Smart Order System                              ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -2273,8 +2273,55 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
 
         $dist = b2b_get_dist_by_group($group_id);
         if ($dist) {
-            // FIX H-3 + B-1: read old_debt from DB inside transaction via b2b_debt_subtract return
+            // FIX S-1: Pre-validate — เช็คว่ายอดสลิป match กับบิลค้างชำระของร้านนี้หรือไม่
+            // ป้องกันกรณีเจ้าของหลายร้านส่งสลิปผิดห้อง (เช่น ร้าน A ส่งสลิปของร้าน B)
             $old_debt = floatval(get_field('current_debt', $dist->ID));
+            $pending_orders = get_posts(array(
+                'post_type'=>'b2b_order','posts_per_page'=>50,'post_status'=>'publish',
+                'meta_query'=>array(
+                    array('key'=>'order_status','value'=>'awaiting_payment'),
+                    array('key'=>'source_group_id','value'=>$group_id),
+                ),
+                'orderby'=>'date','order'=>'ASC',
+            ));
+            $total_pending = 0;
+            $has_matching_invoice = false;
+            foreach ($pending_orders as $po) {
+                $po_total = floatval(get_field('total_amount', $po->ID));
+                $total_pending += $po_total;
+                if ($po_total > 0 && $paid >= $po_total * 0.98 && $paid <= $po_total * 1.02) {
+                    $has_matching_invoice = true;
+                }
+            }
+
+            // ถ้าไม่มีบิลค้างชำระเลย หรือยอดสลิปเกินหนี้ค้างมากกว่า 5% → สลิปน่าจะผิดร้าน
+            if ($total_pending <= 0 || ($paid > $total_pending * 1.05 && !$has_matching_invoice)) {
+                $dist_name_warn = get_the_title($dist->ID);
+                $warn_msg = "⚠️ ไม่พบบิลค้างชำระยอด ฿" . number_format($paid, 2) . " สำหรับร้านนี้\n\n";
+                if ($total_pending > 0) {
+                    $warn_msg .= "ร้านนี้มียอดค้างชำระรวม ฿" . number_format($total_pending, 2) . " เท่านั้น\n\n";
+                } else {
+                    $warn_msg .= "ร้านนี้ไม่มียอดค้างชำระ\n\n";
+                }
+                $warn_msg .= "กรุณาตรวจสอบ:\n• ส่งสลิปถูกห้องหรือไม่?\n• หากต้องการชำระบิลร้านอื่น กรุณาส่งสลิปในห้องของร้านนั้นครับ";
+                $_slip_reply_text($warn_msg);
+                // แจ้ง admin พร้อมรายละเอียดเต็ม
+                if (function_exists('b2b_push_to_admin')) {
+                    b2b_push_to_admin("⚠️ สลิปไม่ match กับบิลของร้าน\nร้าน: " . $dist_name_warn . "\nยอดสลิป: ฿" . number_format($paid, 2) . "\nยอดค้างร้านนี้: ฿" . number_format($total_pending, 2) . "\nผู้โอน: " . $sender . "\nRef: " . $trans_ref . "\nGroup: " . $group_id);
+                }
+                b2b_log('[Slip] BLOCKED — amount ฿' . number_format($paid, 2) . ' does not match pending ฿' . number_format($total_pending, 2) . ' for dist=' . $dist->ID . ' group=' . $group_id);
+                delete_transient($lock_key);
+                // ── Process queued slips ──
+                $queue = get_option('b2b_slip_queue_' . $group_id, array());
+                if (!empty($queue)) {
+                    $next = array_shift($queue);
+                    update_option('b2b_slip_queue_' . $group_id, $queue, false);
+                    b2b_handle_slip_image($next['message_id'], $group_id, $next['user_id'], '', $manual_mode);
+                }
+                return;
+            }
+
+            // FIX H-3 + B-1: read old_debt from DB inside transaction via b2b_debt_subtract return
             if (function_exists('b2b_debt_subtract')) {
                 $new_debt = b2b_debt_subtract($dist->ID, $paid, 'slip_payment:' . $trans_ref);
                 if ($new_debt !== false) {
