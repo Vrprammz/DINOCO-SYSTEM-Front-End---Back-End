@@ -529,3 +529,352 @@ function dinoco_mcp_distributor_list( $request ) {
 
     return new WP_REST_Response( array( 'count' => count( $results ), 'distributors' => $results ), 200 );
 }
+
+// =========================================================================
+// 9. B2B ORDER → LEAD LINK — เมื่อตัวแทนสั่งของ แจ้ง OpenClaw ว่า lead convert
+// =========================================================================
+
+// Hook: เมื่อ B2B order ถูกสร้าง → ส่ง webhook ไป OpenClaw
+add_action( 'save_post_b2b_order', 'dinoco_mcp_on_b2b_order_created', 20, 3 );
+
+function dinoco_mcp_on_b2b_order_created( $post_id, $post, $update ) {
+    // เฉพาะ order ใหม่ (ไม่ใช่ update)
+    if ( $update && get_post_meta( $post_id, '_openclaw_notified', true ) ) return;
+
+    $distributor_id = get_post_meta( $post_id, 'distributor_id', true );
+    if ( empty( $distributor_id ) ) return;
+
+    // ส่ง webhook ไป OpenClaw (fire-and-forget)
+    $openclaw_url = get_option( 'dinoco_openclaw_agent_url', '' );
+    $openclaw_key = get_option( 'dinoco_openclaw_api_key', '' );
+    if ( empty( $openclaw_url ) ) return;
+
+    $order_items = get_post_meta( $post_id, 'order_items', true );
+    $total       = get_post_meta( $post_id, 'total_amount', true );
+
+    wp_remote_post( $openclaw_url . '/api/leads/b2b-order-linked', array(
+        'headers' => array(
+            'Content-Type'  => 'application/json',
+            'Authorization' => 'Bearer ' . $openclaw_key,
+        ),
+        'body'    => wp_json_encode( array(
+            'distributor_id' => $distributor_id,
+            'order_id'       => $post_id,
+            'order_items'    => $order_items,
+            'total_amount'   => $total,
+            'created_at'     => get_the_date( 'c', $post ),
+        ) ),
+        'timeout'   => 5,
+        'blocking'  => false, // fire-and-forget
+    ) );
+
+    update_post_meta( $post_id, '_openclaw_notified', '1' );
+}
+
+// =========================================================================
+// 10. MANUAL CLAIM ENDPOINTS — เคลมแมนนวลผ่านแชท
+// =========================================================================
+
+register_rest_route( 'dinoco-mcp/v1', '/claim-manual-create', array(
+    'methods'             => 'POST',
+    'callback'            => 'dinoco_mcp_claim_manual_create',
+    'permission_callback' => 'dinoco_mcp_verify_key',
+) );
+
+register_rest_route( 'dinoco-mcp/v1', '/claim-manual-update', array(
+    'methods'             => 'POST',
+    'callback'            => 'dinoco_mcp_claim_manual_update',
+    'permission_callback' => 'dinoco_mcp_verify_key',
+) );
+
+register_rest_route( 'dinoco-mcp/v1', '/claim-manual-status', array(
+    'methods'             => 'GET',
+    'callback'            => 'dinoco_mcp_claim_manual_status',
+    'permission_callback' => 'dinoco_mcp_verify_key',
+) );
+
+register_rest_route( 'dinoco-mcp/v1', '/claim-manual-list', array(
+    'methods'             => 'GET',
+    'callback'            => 'dinoco_mcp_claim_manual_list',
+    'permission_callback' => 'dinoco_mcp_verify_key',
+) );
+
+// === Claim Manual Create ===
+function dinoco_mcp_claim_manual_create( $request ) {
+    $serial      = sanitize_text_field( $request->get_param( 'serial' ) );
+    $product     = sanitize_text_field( $request->get_param( 'product' ) );
+    $symptoms    = sanitize_text_field( $request->get_param( 'symptoms' ) );
+    $customer    = sanitize_text_field( $request->get_param( 'customer_name' ) );
+    $phone       = sanitize_text_field( $request->get_param( 'phone' ) );
+    $address     = sanitize_textarea_field( $request->get_param( 'customer_address' ) );
+    $photos      = $request->get_param( 'photos' ); // array of URLs
+    $platform    = sanitize_text_field( $request->get_param( 'platform' ) );
+    $source_id   = sanitize_text_field( $request->get_param( 'source_id' ) );
+    $initiated   = sanitize_text_field( $request->get_param( 'initiated_by' ) ); // "customer" | "dealer"
+    $dealer_id   = sanitize_text_field( $request->get_param( 'dealer_id' ) );
+    $ai_analysis = sanitize_textarea_field( $request->get_param( 'ai_analysis' ) );
+
+    if ( empty( $symptoms ) ) {
+        return new WP_REST_Response( array( 'success' => false, 'message' => 'symptoms required' ), 400 );
+    }
+
+    // สร้าง claim ticket
+    $claim_id = wp_insert_post( array(
+        'post_type'   => 'claim_ticket',
+        'post_title'  => 'MC-' . time() . ' ' . $customer,
+        'post_status' => 'publish',
+    ) );
+
+    if ( is_wp_error( $claim_id ) ) {
+        return new WP_REST_Response( array( 'success' => false, 'message' => 'Failed to create claim' ), 500 );
+    }
+
+    // บันทึก meta fields
+    $meta = array(
+        'ticket_sn_text'     => $serial,
+        'claim_product'      => $product,
+        'claim_symptoms'     => $symptoms,
+        'claim_customer'     => $customer,
+        'claim_phone'        => $phone,
+        'claim_address'      => $address,
+        'claim_photos'       => is_array( $photos ) ? wp_json_encode( $photos ) : '',
+        'claim_platform'     => $platform ?: 'facebook',
+        'claim_source_id'    => $source_id,
+        'claim_initiated_by' => $initiated ?: 'customer',
+        'claim_dealer_id'    => $dealer_id,
+        'claim_ai_analysis'  => $ai_analysis,
+        'ticket_status'      => 'info_collected',
+        'claim_method'       => 'manual_chat',
+    );
+
+    foreach ( $meta as $key => $val ) {
+        update_post_meta( $claim_id, $key, $val );
+    }
+
+    $ticket_number = 'MC-' . str_pad( $claim_id, 5, '0', STR_PAD_LEFT );
+    update_post_meta( $claim_id, 'ticket_number', $ticket_number );
+
+    return new WP_REST_Response( array(
+        'success' => true,
+        'claim_id' => $claim_id,
+        'ticket_number' => $ticket_number,
+        'status' => 'info_collected',
+    ), 200 );
+}
+
+// === Claim Manual Update Status ===
+function dinoco_mcp_claim_manual_update( $request ) {
+    $claim_id = (int) $request->get_param( 'claim_id' );
+    $status   = sanitize_text_field( $request->get_param( 'status' ) );
+    $notes    = sanitize_textarea_field( $request->get_param( 'notes' ) );
+    $tracking = sanitize_text_field( $request->get_param( 'tracking_number' ) );
+    $case     = sanitize_text_field( $request->get_param( 'case_type' ) ); // "case_a" | "case_b" | "reject"
+
+    if ( empty( $claim_id ) || empty( $status ) ) {
+        return new WP_REST_Response( array( 'success' => false, 'message' => 'claim_id and status required' ), 400 );
+    }
+
+    $post = get_post( $claim_id );
+    if ( ! $post || $post->post_type !== 'claim_ticket' ) {
+        return new WP_REST_Response( array( 'success' => false, 'message' => 'Claim not found' ), 404 );
+    }
+
+    update_post_meta( $claim_id, 'ticket_status', $status );
+    if ( ! empty( $notes ) )    update_post_meta( $claim_id, 'claim_admin_notes', $notes );
+    if ( ! empty( $tracking ) ) update_post_meta( $claim_id, 'claim_tracking', $tracking );
+    if ( ! empty( $case ) )     update_post_meta( $claim_id, 'claim_case_type', $case );
+
+    // Webhook แจ้ง OpenClaw ว่าสถานะเปลี่ยน
+    $openclaw_url = get_option( 'dinoco_openclaw_agent_url', '' );
+    $openclaw_key = get_option( 'dinoco_openclaw_api_key', '' );
+    if ( ! empty( $openclaw_url ) ) {
+        wp_remote_post( $openclaw_url . '/api/claims/status-changed', array(
+            'headers' => array(
+                'Content-Type'  => 'application/json',
+                'Authorization' => 'Bearer ' . $openclaw_key,
+            ),
+            'body'    => wp_json_encode( array(
+                'claim_id'       => $claim_id,
+                'ticket_number'  => get_post_meta( $claim_id, 'ticket_number', true ),
+                'new_status'     => $status,
+                'case_type'      => $case,
+                'source_id'      => get_post_meta( $claim_id, 'claim_source_id', true ),
+                'platform'       => get_post_meta( $claim_id, 'claim_platform', true ),
+            ) ),
+            'timeout'   => 5,
+            'blocking'  => false,
+        ) );
+    }
+
+    return new WP_REST_Response( array( 'success' => true, 'claim_id' => $claim_id, 'status' => $status ), 200 );
+}
+
+// === Claim Manual Status Check ===
+function dinoco_mcp_claim_manual_status( $request ) {
+    $claim_id = (int) $request->get_param( 'claim_id' );
+    $ticket   = sanitize_text_field( $request->get_param( 'ticket_number' ) );
+
+    if ( empty( $claim_id ) && empty( $ticket ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'claim_id or ticket_number required' ), 400 );
+    }
+
+    if ( ! empty( $ticket ) ) {
+        $posts = get_posts( array(
+            'post_type' => 'claim_ticket', 'posts_per_page' => 1,
+            'meta_query' => array( array( 'key' => 'ticket_number', 'value' => $ticket ) ),
+        ) );
+        $claim_id = ! empty( $posts ) ? $posts[0]->ID : 0;
+    }
+
+    if ( empty( $claim_id ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'Claim not found' ), 200 );
+    }
+
+    return new WP_REST_Response( array(
+        'found'          => true,
+        'claim_id'       => $claim_id,
+        'ticket_number'  => get_post_meta( $claim_id, 'ticket_number', true ),
+        'status'         => get_post_meta( $claim_id, 'ticket_status', true ),
+        'case_type'      => get_post_meta( $claim_id, 'claim_case_type', true ),
+        'symptoms'       => get_post_meta( $claim_id, 'claim_symptoms', true ),
+        'admin_notes'    => get_post_meta( $claim_id, 'claim_admin_notes', true ),
+        'tracking'       => get_post_meta( $claim_id, 'claim_tracking', true ),
+    ), 200 );
+}
+
+// === Claim Manual List (for admin dashboard) ===
+function dinoco_mcp_claim_manual_list( $request ) {
+    $status = sanitize_text_field( $request->get_param( 'status' ) );
+    $limit  = min( (int) ( $request->get_param( 'limit' ) ?: 20 ), 50 );
+
+    $args = array(
+        'post_type'      => 'claim_ticket',
+        'posts_per_page' => $limit,
+        'post_status'    => 'publish',
+        'orderby'        => 'date',
+        'order'          => 'DESC',
+    );
+
+    if ( ! empty( $status ) ) {
+        $args['meta_query'] = array( array( 'key' => 'ticket_status', 'value' => $status ) );
+    }
+
+    // เฉพาะ manual claims (ไม่ใช่ auto claims)
+    $args['meta_query'][] = array( 'key' => 'claim_method', 'value' => 'manual_chat' );
+
+    $posts = get_posts( $args );
+    $claims = array();
+    foreach ( $posts as $p ) {
+        $claims[] = array(
+            'claim_id'       => $p->ID,
+            'ticket_number'  => get_post_meta( $p->ID, 'ticket_number', true ),
+            'status'         => get_post_meta( $p->ID, 'ticket_status', true ),
+            'customer'       => get_post_meta( $p->ID, 'claim_customer', true ),
+            'product'        => get_post_meta( $p->ID, 'claim_product', true ),
+            'symptoms'       => get_post_meta( $p->ID, 'claim_symptoms', true ),
+            'case_type'      => get_post_meta( $p->ID, 'claim_case_type', true ),
+            'platform'       => get_post_meta( $p->ID, 'claim_platform', true ),
+            'initiated_by'   => get_post_meta( $p->ID, 'claim_initiated_by', true ),
+            'created_at'     => get_the_date( 'c', $p ),
+        );
+    }
+
+    return new WP_REST_Response( array( 'count' => count( $claims ), 'claims' => $claims ), 200 );
+}
+
+// =========================================================================
+// 11. KB SUGGEST — คำถามที่ AI ตอบไม่ได้ → suggest ให้ admin สร้าง KB
+// =========================================================================
+
+register_rest_route( 'dinoco-mcp/v1', '/kb-suggest', array(
+    'methods'             => 'POST',
+    'callback'            => 'dinoco_mcp_kb_suggest',
+    'permission_callback' => 'dinoco_mcp_verify_key',
+) );
+
+function dinoco_mcp_kb_suggest( $request ) {
+    $question  = sanitize_text_field( $request->get_param( 'question' ) );
+    $source    = sanitize_text_field( $request->get_param( 'source' ) ); // "fb_chat" | "ig_chat"
+    $frequency = (int) $request->get_param( 'frequency' );
+
+    if ( empty( $question ) ) {
+        return new WP_REST_Response( array( 'success' => false ), 400 );
+    }
+
+    // เก็บใน wp_options (simple queue ไม่ต้อง CPT)
+    $suggestions = get_option( 'dinoco_kb_suggestions', array() );
+
+    // เช็คว่ามี suggestion เดิมไหม → เพิ่ม frequency
+    $found = false;
+    foreach ( $suggestions as &$s ) {
+        if ( mb_strtolower( $s['question'] ) === mb_strtolower( $question ) ) {
+            $s['frequency'] = ( $s['frequency'] ?? 1 ) + 1;
+            $s['last_asked'] = current_time( 'mysql' );
+            $found = true;
+            break;
+        }
+    }
+
+    if ( ! $found ) {
+        $suggestions[] = array(
+            'question'   => $question,
+            'source'     => $source ?: 'unknown',
+            'frequency'  => max( $frequency, 1 ),
+            'first_asked' => current_time( 'mysql' ),
+            'last_asked'  => current_time( 'mysql' ),
+        );
+    }
+
+    // เก็บสูงสุด 100 suggestions
+    usort( $suggestions, function( $a, $b ) { return ( $b['frequency'] ?? 0 ) - ( $a['frequency'] ?? 0 ); } );
+    $suggestions = array_slice( $suggestions, 0, 100 );
+
+    update_option( 'dinoco_kb_suggestions', $suggestions );
+
+    return new WP_REST_Response( array( 'success' => true, 'total_suggestions' => count( $suggestions ) ), 200 );
+}
+
+// =========================================================================
+// 12. BRAND VOICE SUBMIT — FB/IG comments → brand_voice CPT
+// =========================================================================
+
+register_rest_route( 'dinoco-mcp/v1', '/brand-voice-submit', array(
+    'methods'             => 'POST',
+    'callback'            => 'dinoco_mcp_brand_voice_submit',
+    'permission_callback' => 'dinoco_mcp_verify_key',
+) );
+
+function dinoco_mcp_brand_voice_submit( $request ) {
+    $content    = sanitize_textarea_field( $request->get_param( 'content' ) );
+    $sentiment  = sanitize_text_field( $request->get_param( 'sentiment' ) ); // positive/neutral/negative
+    $brands     = $request->get_param( 'brands' ); // array
+    $categories = $request->get_param( 'categories' ); // array
+    $platform   = sanitize_text_field( $request->get_param( 'platform' ) );
+    $source_url = esc_url_raw( $request->get_param( 'source_url' ) );
+    $intensity  = (int) $request->get_param( 'intensity' );
+    $context    = sanitize_textarea_field( $request->get_param( 'post_context' ) );
+
+    if ( empty( $content ) ) {
+        return new WP_REST_Response( array( 'success' => false, 'message' => 'content required' ), 400 );
+    }
+
+    // ใช้ bv_create_entry ถ้ามี (จาก Brand Voice Pool snippet)
+    if ( function_exists( 'bv_create_entry' ) ) {
+        $entry_id = bv_create_entry( array(
+            'bv_content'    => $content,
+            'bv_summary'    => mb_substr( $content, 0, 100 ),
+            'bv_sentiment'  => $sentiment ?: 'neutral',
+            'bv_intensity'  => $intensity ?: 3,
+            'bv_brands'     => is_array( $brands ) ? $brands : array( 'DINOCO' ),
+            'bv_categories' => is_array( $categories ) ? $categories : array(),
+            'bv_platform'   => $platform ?: 'facebook_page',
+            'bv_source_url' => $source_url,
+            'bv_entry_method' => 'ai_import',
+            'bv_admin_notes'  => $context ? "บริบทโพสต์: {$context}" : '',
+        ) );
+
+        return new WP_REST_Response( array( 'success' => (bool) $entry_id, 'id' => $entry_id ), 200 );
+    }
+
+    return new WP_REST_Response( array( 'success' => false, 'message' => 'Brand Voice Pool not active' ), 200 );
+}
