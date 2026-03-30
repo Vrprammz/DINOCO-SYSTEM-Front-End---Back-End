@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono, Sarabun } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import SessionProviderWrapper from "@/components/SessionProviderWrapper";
@@ -17,9 +17,15 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const sarabun = Sarabun({
+  variable: "--font-sarabun",
+  subsets: ["thai", "latin"],
+  weight: ["300", "400", "700"],
+});
+
 export const metadata: Metadata = {
-  title: "OpenClaw Mini CRM — AI Chat Intelligence",
-  description: "ระบบ Mini CRM อัจฉริยะ วิเคราะห์สนทนา LINE / Facebook / Instagram อัตโนมัติ",
+  title: "DINOCO AI — Chat Intelligence Dashboard",
+  description: "ระบบ AI ตอบแชทลูกค้า DINOCO THAILAND — Facebook / Instagram / LINE",
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
@@ -42,7 +48,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="th" className="dark">
-      <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
+      <body className={`${geistSans.variable} ${geistMono.variable} ${sarabun.variable} antialiased`}>
         <SessionProviderWrapper>
           <ThemeProvider>
             <NotificationProvider>
