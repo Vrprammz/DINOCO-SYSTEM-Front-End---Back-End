@@ -1,6 +1,36 @@
 # Feature Spec: B2F (Business to Factory) — ระบบสั่งซื้อจากโรงงานผู้ผลิต
 
-Version: 2.0 | Date: 2026-03-30 | Author: Feature Architect + UX Expert + Deep Review (Frontend/Architect/Fullstack)
+Version: 3.0 | Date: 2026-03-31 | Author: Feature Architect + UX Expert + Deep Review + Implementation
+
+## Implementation Status (Phase 1 MVP)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| CPT & ACF (Snippet 0) | ✅ Done | 5 CPTs + ACF fields + helpers |
+| Core Utilities & Flex (Snippet 1) | ⚠️ Partial | Flex builders มี แต่ `b2f_liff_url()` crash — ใช้ inline Flex ใน Snippet 3 แทน |
+| REST API (Snippet 2) | ✅ Done | 19+ endpoints + debug endpoints (ชั่วคราว) |
+| Webhook Handler (Snippet 3) | ✅ Done | Maker commands + Admin B2F commands + self-contained Flex menu |
+| Maker LIFF (Snippet 4) | ✅ Done | Shortcode `[b2f_maker_liff]` page `/b2f-maker/` |
+| Admin Dashboard Tabs (Snippet 5) | ✅ Done | Orders + Makers + Credit tabs + SKU picker (grid+multi-select) |
+| Order FSM (Snippet 6) | ✅ Done | 12 statuses + transitions + labels + badges |
+| Credit Manager (Snippet 7) | ✅ Done | Atomic payable ops + auto hold/unhold + audit |
+| B2B Snippet 1 (Bubble 3) | ✅ Done | Admin Flex carousel 3 หน้า (ใช้ Dashboard URL แทน LIFF) |
+| B2B Snippet 2 (Routing) | ✅ Done | B2F routing via function_exists guard |
+| Admin Dashboard (Sidebar) | ✅ Done | B2F section + scrollable sidebar |
+| Bot (Maker group) | ✅ Done | @mention + text commands (ส่งของ/ดูPO) |
+| Bot (Admin group) | ✅ Done | B2F commands (สั่งโรงงาน/ดูPO/สรุปโรงงาน) |
+| Sync | ✅ Done | 49 snippets, name LIKE filter includes [B2F] |
+| WordPress Page | ✅ Done | `/b2f-maker/` with `[b2f_maker_liff]` |
+
+### Known Issues (ต้อง fix ก่อน Phase 2)
+
+| Issue | Severity | Description |
+|-------|----------|-------------|
+| `b2f_liff_url()` crash | Medium | Function error ทำให้ Flex ที่เรียกมันพังทั้ง function — ต้อง debug root cause |
+| Debug endpoints ยังเปิดอยู่ | Low | `/debug-maker/`, `/debug-route/` เป็น public — ต้องลบ/ปิดหลัง debug |
+| Maker LIFF ยังไม่ทดสอบ | Medium | Snippet 4 deploy แล้วแต่ยังไม่ได้ทดสอบ confirm PO flow จริง |
+| B2F Orders tab ยังไม่ทดสอบ | Medium | สร้าง PO จาก Admin Dashboard ยังไม่ได้ทดสอบ |
+| `b2f_format_maker()` N+1 query | Low | นับ product_count + po_count ต่อ maker — ช้าเมื่อ makers เยอะ |
 
 > **สำคัญ — Architecture Decisions:**
 > 1. **ใช้ LINE Bot ตัวเดียวกับ B2B** — routing ตาม `group_id` แยก Flex ให้แต่ละ role (Distributor ไม่เห็น B2F, Maker ไม่เห็น B2B)

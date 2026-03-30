@@ -77,6 +77,25 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **View/Edit toggle pattern**: Profile page uses Facebook-style view-mode cards. Info is read-only by default; tap "แก้ไข" to expand the form. Save button only appears when a section is in edit mode.
 - **Motorcycle Catalog**: Brands/models/images/aliases stored in custom MySQL tables (`dinoco_moto_brands` + `dinoco_moto_models`) via `DINOCO_MotoDB` class in Snippet 15. Admin UI via `[dinoco_admin_moto]`. Consumer files use `dinoco_get_brands_list()`, `dinoco_get_model_image()`, `dinoco_get_moto_catalog_json()` with `class_exists` fallback.
 - **Negative margin gotcha**: Elements with negative margin (e.g. cover photo `margin: -20px -20px 0`) cause horizontal scroll. Always add `overflow-x: hidden` on the parent wrapper.
-- **B2F System**: Business to Factory — DINOCO สั่งซื้อสินค้าจากโรงงานผู้ผลิต (Maker). ใช้ LINE Bot เดียวกับ B2B, routing ตาม `group_id` (Distributor→B2B Flex, Maker→B2F Flex, Admin→ทั้งหมด). Kill switch: `define('B2F_DISABLED', true)`. Credit system ทิศทางกลับจาก B2B (DINOCO เป็นหนี้ Maker). Maker LIFF auth ใช้ Signed URL + JWT.
-- **B2F Credit System**: Atomic payable operations via `b2f_payable_add/subtract()` ใน Snippet 7. ใช้ `FOR UPDATE` lock เหมือน B2B Debt System. `b2f_recalculate_payable()` เป็น single-SQL source of truth. Auto credit hold เมื่อเลยวงเงิน (reason=auto), Admin hold เอง (reason=manual) ต้อง Admin unhold เท่านั้น.
+- **B2F System**: Business to Factory — DINOCO สั่งซื้อสินค้าจากโรงงานผู้ผลิต (Maker). ใช้ LINE Bot เดียวกับ B2B + LIFF ID เดียวกัน. Kill switch: `define('B2F_DISABLED', true)`.
+- **B2F Architecture**: Bot เดียว routing ตาม `group_id` — Distributor→B2B Flex, Maker→B2F Flex, Admin→ทั้งหมด (carousel 3 หน้า). B2F routing อยู่ใน B2B Snippet 2 (function_exists guard). B2F functions อยู่ใน Snippet 3.
+- **B2F Credit System**: Atomic payable operations via `b2f_payable_add/subtract()` ใน Snippet 7. ใช้ `FOR UPDATE` lock เหมือน B2B Debt System. `b2f_recalculate_payable()` เป็น single-SQL source of truth. ทิศทางกลับจาก B2B (DINOCO เป็นหนี้ Maker). Auto credit hold เมื่อเลยวงเงิน (reason=auto), Admin hold เอง (reason=manual).
 - **B2F FSM**: `B2F_Order_FSM` class ใน Snippet 6. 12 statuses: draft→submitted→confirmed→delivering→received→paid→completed. Terminal: completed, cancelled. ทุก transition ต้องผ่าน `b2f_transition_order()`.
+- **B2F Snippets** (DB_ID 1160-1167):
+  - Snippet 0 (1160): CPT & ACF Registration — 5 CPTs + helpers + `b2f_get_maker_by_group()` (cached 5min/1hr)
+  - Snippet 1 (1163): Core Utilities & Flex Builders — LINE push + 13 Flex templates (⚠️ `b2f_liff_url()` มีปัญหา ใช้ inline Flex แทน)
+  - Snippet 2 (1165): REST API — 19+ endpoints namespace `/b2f/v1/` + debug endpoints (ชั่วคราว)
+  - Snippet 3 (1164): Webhook Handler & Bot Commands — Maker commands + Admin B2F commands + Flex menu (self-contained)
+  - Snippet 4 (1167): Maker LIFF Pages — shortcode `[b2f_maker_liff]` route `/b2f-maker/`
+  - Snippet 5 (1166): Admin Dashboard Tabs — 3 shortcodes embedded ใน Admin Dashboard
+  - Snippet 6 (1161): Order State Machine — `B2F_Order_FSM` class
+  - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`
+- **B2F Gotchas**:
+  - `b2f_liff_url()` crash ทำให้ Flex ที่เรียกมันพังทั้ง function — ห้ามเรียกใน B2B Admin Flex, ใช้ Dashboard URL แทน
+  - LINE ไม่ส่ง `mention.mentionees[].isSelf` ในบาง group — ตรวจ @mention จาก text pattern `/@DINOCO/i` แทน
+  - Sync Engine ต้อง bump version เพื่อ force sync — ถ้า hash ตรง (Same) จะไม่ update แม้โค้ดจริงต่างกัน (เกิดจากสร้าง snippet ใน WP ก่อน sync)
+  - Cache `b2f_get_maker_by_group()` negative result TTL 5 นาที — ถ้าเพิ่ม group_id ใน Maker แล้ว Bot เงียบ เรียก `/debug-maker/{group_id}` เพื่อ clear cache
+  - Maker group_id ต้อง unique ข้าม distributor — validate ด้วย `b2f_validate_group_id()`
+  - Admin Dashboard sidebar ต้องมี `<div class="sidebar-nav">` wrapper เพื่อ scroll ได้เมื่อเมนูเยอะ
+  - B2F REST API nonce ต้องใช้ `wp_create_nonce('wp_rest')` ไม่ใช่ custom nonce name
+  - B2F API response list ต้องใช้ key `data` ไม่ใช่ `makers`/`products` (frontend อ่าน `res.data`)
