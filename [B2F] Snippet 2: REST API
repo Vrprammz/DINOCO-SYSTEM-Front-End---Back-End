@@ -155,14 +155,39 @@ if ( ! function_exists( 'b2f_rate_limit' ) ) {
      * @return true|WP_Error
      */
     function b2f_rate_limit( $key, $max = 10, $window = 60 ) {
-        $tkey  = 'b2f_rl_' . md5( $key );
-        $count = (int) get_transient( $tkey );
-        if ( $count >= $max ) {
+        global $wpdb;
+        $tkey = '_transient_b2f_rl_' . md5( $key );
+
+        // FIX HIGH-02: Atomic increment ด้วย MySQL ON DUPLICATE KEY UPDATE (ป้องกัน TOCTOU)
+        $wpdb->query( $wpdb->prepare(
+            "INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
+             VALUES (%s, '1', 'no')
+             ON DUPLICATE KEY UPDATE option_value = option_value + 1",
+            $tkey
+        ) );
+
+        $count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $tkey
+        ) );
+
+        // Set expiry transient (separate key for TTL tracking)
+        if ( ! get_transient( 'b2f_rl_exp_' . md5( $key ) ) ) {
+            set_transient( 'b2f_rl_exp_' . md5( $key ), 1, $window );
+            // Reset counter after window expires (via wp_options cleanup)
+            wp_schedule_single_event( time() + $window, 'b2f_rl_cleanup', array( $tkey ) );
+        }
+
+        if ( $count > $max ) {
             return new WP_Error( 'rate_limit', 'คำขอมากเกินไป กรุณารอสักครู่', array( 'status' => 429 ) );
         }
-        set_transient( $tkey, $count + 1, $window );
         return true;
     }
+
+    // Cleanup handler for rate limit keys
+    add_action( 'b2f_rl_cleanup', function( $tkey ) {
+        global $wpdb;
+        $wpdb->delete( $wpdb->options, array( 'option_name' => $tkey ) );
+    } );
 }
 
 // ════════════════════════════════════════════
@@ -1593,12 +1618,13 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
         }
 
-        // Transient lock: prevent concurrent receiving
-        $lock_key = 'b2f_recv_lock_' . $po_id;
-        if ( get_transient( $lock_key ) ) {
+        // FIX HIGH-03: MySQL GET_LOCK แทน transient (atomic, ป้องกัน TOCTOU double receiving)
+        $lock_key = 'b2f_recv_' . intval( $po_id );
+        global $wpdb;
+        $got_lock = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 0)", $lock_key ) );
+        if ( ! $got_lock ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'มีคนอื่นกำลังตรวจรับ PO นี้อยู่ กรุณารอสักครู่', 'code' => 'LOCKED' ), 423 );
         }
-        set_transient( $lock_key, get_current_user_id(), 60 );
 
         $post = get_post( $po_id );
         if ( ! $post || $post->post_type !== 'b2f_order' ) {
@@ -1688,10 +1714,23 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
                     require_once ABSPATH . 'wp-admin/includes/file.php';
                     require_once ABSPATH . 'wp-admin/includes/media.php';
 
+                    // FIX HIGH-01: MIME type + file size validation ก่อน upload
+                    $b2f_allowed_mimes = array( 'image/jpeg', 'image/png', 'image/webp' );
+                    $b2f_max_file_size = 5 * 1024 * 1024; // 5MB
+
+                    // Restrict upload types ผ่าน WP filter
+                    $b2f_mime_filter = function( $mimes ) {
+                        return array( 'jpg|jpeg' => 'image/jpeg', 'png' => 'image/png', 'webp' => 'image/webp' );
+                    };
+                    add_filter( 'upload_mimes', $b2f_mime_filter, 999 );
+
                     $uploaded = $files[ $file_key ];
                     if ( is_array( $uploaded['name'] ) ) {
                         $count = min( count( $uploaded['name'] ), 5 );
                         for ( $i = 0; $i < $count; $i++ ) {
+                            // Validate MIME + size
+                            if ( ! in_array( $uploaded['type'][ $i ], $b2f_allowed_mimes ) ) continue;
+                            if ( $uploaded['size'][ $i ] > $b2f_max_file_size ) continue;
                             $file_arr = array(
                                 'name'     => $uploaded['name'][ $i ],
                                 'type'     => $uploaded['type'][ $i ],
@@ -1706,12 +1745,17 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
                             }
                         }
                     } else {
-                        $_FILES['b2f_upload'] = $uploaded;
-                        $att_id = media_handle_upload( 'b2f_upload', 0 );
-                        if ( ! is_wp_error( $att_id ) ) {
-                            $reject_photo_ids[] = $att_id;
+                        // Validate MIME + size (single file)
+                        if ( in_array( $uploaded['type'], $b2f_allowed_mimes ) && $uploaded['size'] <= $b2f_max_file_size ) {
+                            $_FILES['b2f_upload'] = $uploaded;
+                            $att_id = media_handle_upload( 'b2f_upload', 0 );
+                            if ( ! is_wp_error( $att_id ) ) {
+                                $reject_photo_ids[] = $att_id;
+                            }
                         }
                     }
+                    // Remove MIME filter after upload
+                    remove_filter( 'upload_mimes', $b2f_mime_filter, 999 );
                 }
             }
 
@@ -1829,6 +1873,10 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             'inventory_updated' => false, // TODO: set true when inventory integration is built
             'debt_added'        => $debt_added ? $total_rcv_value : 0,
         ), 200 );
+
+        // FIX HIGH-03: Release MySQL lock
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", 'b2f_recv_' . intval( $po_id ) ) );
+        return $response;
     }
 }
 
