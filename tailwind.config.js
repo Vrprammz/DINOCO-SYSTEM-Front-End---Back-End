@@ -8,8 +8,7 @@ export default {
         'dnc-dark': '#1a1a1a',
       },
       fontFamily: {
-        'thai': ['Noto Sans Thai', 'Prompt', 'sans-serif'],
-      }
+        'thai': ['Noto Sans Thai', 'Prompt', 'sans-serif'],      }
     }
   }
 }
