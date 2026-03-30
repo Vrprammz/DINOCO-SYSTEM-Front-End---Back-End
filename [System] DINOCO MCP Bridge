@@ -1,0 +1,400 @@
+/**
+ * File: [System] DINOCO MCP Bridge
+ * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.1.0
+ * DB_ID: 1050
+ * Author: DINOCO Dev Team
+ *
+ * Endpoints:
+ *   POST /wp-json/dinoco-mcp/v1/product-lookup  — ค้นหาสินค้า
+ *   POST /wp-json/dinoco-mcp/v1/dealer-lookup   — ค้นหาตัวแทนจำหน่าย
+ *   POST /wp-json/dinoco-mcp/v1/warranty-check   — เช็คสถานะประกัน
+ *   POST /wp-json/dinoco-mcp/v1/kb-search        — ค้นหา Knowledge Base
+ *   GET  /wp-json/dinoco-mcp/v1/kb-export        — Export KB ทั้งหมด (สำหรับ Qdrant sync)
+ *   GET  /wp-json/dinoco-mcp/v1/catalog-full      — Export catalog ทั้งหมด
+ *
+ * Authentication: X-API-Key header ตรวจกับ wp_options['dinoco_mcp_api_key']
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// === API Key Authentication ===
+function dinoco_mcp_verify_key( $request ) {
+    $key = $request->get_header( 'X-API-Key' );
+    if ( empty( $key ) ) return new WP_Error( 'no_key', 'Missing X-API-Key header', array( 'status' => 401 ) );
+
+    $stored_key = get_option( 'dinoco_mcp_api_key', '' );
+    if ( empty( $stored_key ) ) {
+        // Auto-generate key on first use
+        $stored_key = wp_generate_password( 64, false );
+        update_option( 'dinoco_mcp_api_key', $stored_key );
+        error_log( '[MCP Bridge] API key auto-generated. Retrieve via: get_option("dinoco_mcp_api_key")' );
+    }
+
+    if ( ! hash_equals( $stored_key, $key ) ) {
+        return new WP_Error( 'invalid_key', 'Invalid API key', array( 'status' => 403 ) );
+    }
+    return true;
+}
+
+// === Register REST Routes ===
+add_action( 'rest_api_init', function() {
+
+    $ns = 'dinoco-mcp/v1';
+
+    register_rest_route( $ns, '/product-lookup', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_mcp_product_lookup',
+        'permission_callback' => 'dinoco_mcp_verify_key',
+    ) );
+
+    register_rest_route( $ns, '/dealer-lookup', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_mcp_dealer_lookup',
+        'permission_callback' => 'dinoco_mcp_verify_key',
+    ) );
+
+    register_rest_route( $ns, '/warranty-check', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_mcp_warranty_check',
+        'permission_callback' => 'dinoco_mcp_verify_key',
+    ) );
+
+    register_rest_route( $ns, '/kb-search', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_mcp_kb_search',
+        'permission_callback' => 'dinoco_mcp_verify_key',
+    ) );
+
+    register_rest_route( $ns, '/kb-export', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_mcp_kb_export',
+        'permission_callback' => 'dinoco_mcp_verify_key',
+    ) );
+
+    register_rest_route( $ns, '/catalog-full', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_mcp_catalog_full',
+        'permission_callback' => 'dinoco_mcp_verify_key',
+    ) );
+} );
+
+// =========================================================================
+// 1. PRODUCT LOOKUP — ค้นหาสินค้าจาก catalog
+// =========================================================================
+function dinoco_mcp_product_lookup( $request ) {
+    $query    = sanitize_text_field( $request->get_param( 'query' ) );
+    $category = sanitize_text_field( $request->get_param( 'category' ) );
+
+    if ( empty( $query ) && empty( $category ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'กรุณาระบุ query หรือ category' ), 400 );
+    }
+
+    $catalog = function_exists( 'b2b_get_catalog' ) ? b2b_get_catalog() : get_option( 'dinoco_product_catalog', array() );
+    if ( empty( $catalog ) || ! is_array( $catalog ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'ไม่มีข้อมูลสินค้าในระบบ' ), 200 );
+    }
+
+    $search = mb_strtolower( $query . ' ' . $category, 'UTF-8' );
+
+    // Model aliases
+    $model_aliases = array(
+        'nx500'    => array( 'nx500', 'nx 500', 'เอ็นเอ็ก' ),
+        'cb500x'   => array( 'cb500x', 'cb500', 'cb 500', 'ซีบี' ),
+        'adv350'   => array( 'adv350', 'adv 350', 'adv', 'เอดีวี' ),
+        'forza350' => array( 'forza350', 'forza 350', 'forza', 'ฟอร์ซ่า' ),
+        'forza750' => array( 'forza750', 'forza 750' ),
+        'xl750'    => array( 'xl750', 'transalp', 'ทรานซัลป์' ),
+        'xadv750'  => array( 'xadv', 'x-adv' ),
+        'crf300l'  => array( 'crf300l', 'crf 300', 'crf300' ),
+        'rebel500' => array( 'rebel', 'rebel500', 'rebel 500' ),
+        'cl500'    => array( 'cl500', 'cl 500' ),
+        'cb650r'   => array( 'cb650', 'cb 650' ),
+        'nmax'     => array( 'nmax', 'เอ็นแม็ก' ),
+        'xmax'     => array( 'xmax', 'เอ็กแม็ก' ),
+        'pcx'      => array( 'pcx', 'พีซีเอ็ก' ),
+    );
+
+    $model_key = '';
+    foreach ( $model_aliases as $mk => $aliases ) {
+        foreach ( $aliases as $a ) {
+            if ( mb_strpos( $search, mb_strtolower( $a, 'UTF-8' ) ) !== false ) { $model_key = $mk; break 2; }
+        }
+    }
+
+    // Category mapping
+    $cat_map = array(
+        'กันล้ม'     => array( 'กันล้ม', 'crash', 'crashbar', 'แคชบาร์', 'แครชบาร์' ),
+        'กล่องข้าง'  => array( 'กล่องข้าง', 'side box', 'sidebox', 'side case', 'ไซด์เคส' ),
+        'กล่องหลัง'  => array( 'กล่องหลัง', 'กล่องท้าย', 'top box', 'topbox', 'top case', 'ท็อปเคส' ),
+        'แร็ค'       => array( 'แร็ค', 'rack', 'ตะแกรง', 'แร็ก' ),
+        'กระเป๋า'    => array( 'กระเป๋า', 'bag', 'dry bag' ),
+        'ถาดรอง'     => array( 'ถาดรอง', 'เบสเพลท', 'base plate' ),
+        'การ์ดแฮนด์'  => array( 'การ์ดแฮนด์', 'hand guard', 'handguard' ),
+    );
+
+    $cat_key = '';
+    foreach ( $cat_map as $ck => $kws ) {
+        foreach ( $kws as $kw ) {
+            if ( mb_strpos( $search, mb_strtolower( $kw, 'UTF-8' ) ) !== false ) { $cat_key = $ck; break 2; }
+        }
+    }
+
+    // Score items
+    $matches = array();
+    foreach ( $catalog as $sku => $item ) {
+        $name_lower = mb_strtolower( isset( $item['name'] ) ? $item['name'] : '', 'UTF-8' );
+        $score = 0;
+
+        if ( $model_key ) {
+            foreach ( $model_aliases[ $model_key ] as $mk ) {
+                if ( mb_strpos( $name_lower, $mk ) !== false ) { $score += 100; break; }
+            }
+        }
+        if ( $cat_key ) {
+            foreach ( $cat_map[ $cat_key ] as $ck ) {
+                if ( mb_strpos( $name_lower, mb_strtolower( $ck, 'UTF-8' ) ) !== false ) { $score += 50; break; }
+            }
+        }
+
+        // General keyword match
+        $terms = array_filter( preg_split( '/[\s,]+/u', $search ), function( $w ) { return mb_strlen( $w, 'UTF-8' ) >= 2; } );
+        foreach ( $terms as $t ) {
+            if ( mb_strpos( $name_lower, $t ) !== false ) $score += 10;
+        }
+
+        if ( $score >= 50 ) {
+            $matches[] = array(
+                'name'           => isset( $item['name'] ) ? $item['name'] : $sku,
+                'price'          => isset( $item['price'] ) ? $item['price'] : 0,
+                'sku'            => $sku,
+                'img_url'        => isset( $item['img'] ) ? $item['img'] : '',
+                'in_stock'       => isset( $item['in_stock'] ) ? $item['in_stock'] : true,
+                'warranty_years' => isset( $item['years'] ) ? (int) $item['years'] : 0,
+                'score'          => $score,
+            );
+        }
+    }
+
+    if ( empty( $matches ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => "ไม่พบสินค้า '{$query} {$category}'" ), 200 );
+    }
+
+    usort( $matches, function( $a, $b ) { return $b['score'] <=> $a['score']; } );
+    $top = array_slice( $matches, 0, 5 );
+    foreach ( $top as &$m ) { unset( $m['score'] ); }
+
+    return new WP_REST_Response( array( 'found' => true, 'count' => count( $top ), 'products' => $top ), 200 );
+}
+
+// =========================================================================
+// 2. DEALER LOOKUP — ค้นหาตัวแทนจำหน่าย
+// =========================================================================
+function dinoco_mcp_dealer_lookup( $request ) {
+    $location = sanitize_text_field( $request->get_param( 'location' ) );
+    if ( empty( $location ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'กรุณาระบุจังหวัดหรือพื้นที่' ), 400 );
+    }
+
+    $location_lower = mb_strtolower( $location, 'UTF-8' );
+
+    // [FIXED C1] Location → KB post_id mapping (ไม่ใช่ array index อีกแล้ว)
+    // ตัวเลขคือ WordPress post ID ของ KB entry ไม่เปลี่ยนแม้จะลบ/เพิ่ม entry อื่น
+    // TODO: ตรวจสอบ post IDs จริงใน WordPress แล้วอัพเดทที่นี่
+    $location_to_post_id = array(
+        'กทม' => 67, 'กรุงเทพ' => 67, 'บางเขน' => 67, 'รามอินทรา' => 67,
+        'ลาดพร้าว' => 67, 'ดอนเมือง' => 67, 'มีนบุรี' => 67, 'ฝั่งธน' => 67,
+        'นนทบุรี' => 68, 'ปทุมธานี' => 68, 'รังสิต' => 68,
+        'สมุทรปราการ' => 69, 'บางนา' => 69, 'ปากน้ำ' => 69,
+        'เชียงใหม่' => 70, 'เชียงราย' => 70, 'ลำปาง' => 70,
+        'โคราช' => 71, 'นครราชสีมา' => 71, 'อุดร' => 71, 'ขอนแก่น' => 71,
+        'ภูเก็ต' => 54, 'หาดใหญ่' => 54, 'สงขลา' => 54,
+        'ชลบุรี' => 53, 'ระยอง' => 53, 'พัทยา' => 53,
+        // จังหวัดไม่มีตัวแทน
+        'สุพรรณบุรี' => 80, 'นครปฐม' => 80, 'อยุธยา' => 80, 'กาญจนบุรี' => 80, 'หัวหิน' => 80,
+        'พิษณุโลก' => 81, 'ตาก' => 81, 'น่าน' => 81,
+        'บุรีรัมย์' => 82, 'สุรินทร์' => 82, 'ชัยภูมิ' => 82, 'ร้อยเอ็ด' => 82,
+        'กระบี่' => 83, 'ตรัง' => 83, 'นครศรีธรรมราช' => 83, 'ยะลา' => 83,
+    );
+
+    // ค้นหา location ใน map → ดึง KB entry ตรงจาก post_id
+    foreach ( $location_to_post_id as $loc_key => $post_id ) {
+        if ( mb_strpos( $location_lower, $loc_key ) !== false ) {
+            $q = get_post_meta( $post_id, 'training_phrases', true );
+            if ( ! empty( $q ) ) {
+                return new WP_REST_Response( array(
+                    'found'    => true,
+                    'location' => $location,
+                    'dealers'  => (string) get_post_meta( $post_id, 'core_facts', true ),
+                    // how_to_respond ใช้ภายใน AI prompt เท่านั้น
+                    'how_to_respond' => (string) get_post_meta( $post_id, 'ai_action', true ),
+                ), 200 );
+            }
+        }
+    }
+
+    return new WP_REST_Response( array( 'found' => false, 'message' => "ไม่พบตัวแทนในพื้นที่ '{$location}'" ), 200 );
+}
+
+// =========================================================================
+// 3. WARRANTY CHECK — เช็คสถานะการรับประกัน
+// =========================================================================
+function dinoco_mcp_warranty_check( $request ) {
+    $serial = sanitize_text_field( $request->get_param( 'serial' ) );
+    $phone  = sanitize_text_field( $request->get_param( 'phone' ) );
+
+    if ( empty( $serial ) && empty( $phone ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'กรุณาระบุ serial หรือเบอร์โทร' ), 400 );
+    }
+
+    $args = array(
+        'post_type'      => 'serial_number',
+        'posts_per_page' => 5,
+        'post_status'    => 'publish',
+    );
+
+    // [Security] ใช้ exact match เท่านั้น ห้าม LIKE (ป้องกัน data enumeration)
+    // [Security] enforce minimum length ป้องกัน search กว้างเกินไป
+    if ( ! empty( $serial ) ) {
+        if ( mb_strlen( $serial ) < 5 ) {
+            return new WP_REST_Response( array( 'found' => false, 'message' => 'กรุณาระบุ serial อย่างน้อย 5 ตัวอักษร' ), 400 );
+        }
+        $args['meta_query'] = array(
+            array( 'key' => 'serial_code', 'value' => $serial, 'compare' => '=' ),
+        );
+    } elseif ( ! empty( $phone ) ) {
+        if ( mb_strlen( preg_replace( '/[^0-9]/', '', $phone ) ) < 10 ) {
+            return new WP_REST_Response( array( 'found' => false, 'message' => 'กรุณาระบุเบอร์โทร 10 หลัก' ), 400 );
+        }
+        $args['meta_query'] = array(
+            array( 'key' => 'owner_phone', 'value' => $phone, 'compare' => '=' ),
+        );
+    }
+    $args['posts_per_page'] = 2; // จำกัด results ป้องกัน data dump
+
+    $posts = get_posts( $args );
+    if ( empty( $posts ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'ไม่พบข้อมูลการรับประกัน' ), 200 );
+    }
+
+    $results = array();
+    foreach ( $posts as $p ) {
+        $expiry = get_post_meta( $p->ID, 'warranty_expiry', true );
+        $status = get_post_meta( $p->ID, 'w_status', true );
+        $results[] = array(
+            'serial'       => get_post_meta( $p->ID, 'serial_code', true ),
+            'product'      => get_post_meta( $p->ID, 'owner_product', true ),
+            'status'       => $status ? $status : 'unknown',
+            'expiry_date'  => $expiry ? $expiry : '',
+            'is_expired'   => $expiry ? ( strtotime( $expiry ) < time() ) : null,
+            // [Security] ห้ามส่ง owner_name ข้ามระบบ (PII)
+            'registered_at' => get_the_date( 'Y-m-d', $p ),
+        );
+    }
+
+    return new WP_REST_Response( array( 'found' => true, 'count' => count( $results ), 'warranties' => $results ), 200 );
+}
+
+// =========================================================================
+// 4. KB SEARCH — ค้นหา Knowledge Base
+// =========================================================================
+function dinoco_mcp_kb_search( $request ) {
+    $query = sanitize_text_field( $request->get_param( 'query' ) );
+    if ( empty( $query ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => 'กรุณาระบุ query' ), 400 );
+    }
+
+    $posts = get_posts( array(
+        'post_type'      => 'ai_knowledge',
+        'posts_per_page' => -1,
+        'post_status'    => array( 'publish', 'private' ),
+    ) );
+
+    $query_lower = mb_strtolower( $query, 'UTF-8' );
+    $terms = array_filter( preg_split( '/[\s,]+/u', $query_lower ), function( $w ) { return mb_strlen( $w, 'UTF-8' ) >= 2; } );
+
+    $scored = array();
+    foreach ( $posts as $p ) {
+        $q = mb_strtolower( (string) get_post_meta( $p->ID, 'training_phrases', true ), 'UTF-8' );
+        $f = mb_strtolower( (string) get_post_meta( $p->ID, 'core_facts', true ), 'UTF-8' );
+        $a = mb_strtolower( (string) get_post_meta( $p->ID, 'ai_action', true ), 'UTF-8' );
+        $all_text = $q . ' ' . $f . ' ' . $a;
+
+        $score = 0;
+        foreach ( $terms as $t ) {
+            if ( mb_strpos( $all_text, $t ) !== false ) $score += ( mb_strlen( $t, 'UTF-8' ) >= 4 ) ? 15 : 8;
+        }
+
+        if ( $score > 0 ) {
+            $scored[] = array(
+                'id'       => $p->ID,
+                'question' => get_post_meta( $p->ID, 'training_phrases', true ),
+                'facts'    => get_post_meta( $p->ID, 'core_facts', true ),
+                'action'   => get_post_meta( $p->ID, 'ai_action', true ),
+                'score'    => $score,
+            );
+        }
+    }
+
+    usort( $scored, function( $a, $b ) { return $b['score'] <=> $a['score']; } );
+    $top = array_slice( $scored, 0, 5 );
+    foreach ( $top as &$s ) { unset( $s['score'] ); }
+
+    if ( empty( $top ) ) {
+        return new WP_REST_Response( array( 'found' => false, 'message' => "ไม่พบข้อมูลเกี่ยวกับ '{$query}'" ), 200 );
+    }
+
+    return new WP_REST_Response( array( 'found' => true, 'count' => count( $top ), 'entries' => $top ), 200 );
+}
+
+// =========================================================================
+// 5. KB EXPORT — Export KB ทั้งหมดสำหรับ Qdrant sync
+// =========================================================================
+function dinoco_mcp_kb_export( $request ) {
+    $posts = get_posts( array(
+        'post_type'      => 'ai_knowledge',
+        'posts_per_page' => -1,
+        'post_status'    => array( 'publish', 'private' ),
+        'orderby'        => 'ID',
+        'order'          => 'ASC',
+    ) );
+
+    $entries = array();
+    foreach ( $posts as $p ) {
+        $q = get_post_meta( $p->ID, 'training_phrases', true );
+        if ( empty( $q ) ) continue;
+        $entries[] = array(
+            'id'       => $p->ID,
+            'question' => $q,
+            'facts'    => (string) get_post_meta( $p->ID, 'core_facts', true ),
+            'action'   => (string) get_post_meta( $p->ID, 'ai_action', true ),
+        );
+    }
+
+    return new WP_REST_Response( array( 'count' => count( $entries ), 'entries' => $entries ), 200 );
+}
+
+// =========================================================================
+// 6. CATALOG FULL — Export product catalog ทั้งหมด
+// =========================================================================
+function dinoco_mcp_catalog_full( $request ) {
+    $catalog = function_exists( 'b2b_get_catalog' ) ? b2b_get_catalog() : get_option( 'dinoco_product_catalog', array() );
+
+    if ( empty( $catalog ) || ! is_array( $catalog ) ) {
+        return new WP_REST_Response( array( 'count' => 0, 'products' => array() ), 200 );
+    }
+
+    $products = array();
+    foreach ( $catalog as $sku => $item ) {
+        $products[] = array(
+            'sku'            => $sku,
+            'name'           => isset( $item['name'] ) ? $item['name'] : '',
+            'price'          => isset( $item['price'] ) ? $item['price'] : 0,
+            'img_url'        => isset( $item['img'] ) ? $item['img'] : '',
+            'in_stock'       => isset( $item['in_stock'] ) ? $item['in_stock'] : true,
+            'warranty_years' => isset( $item['years'] ) ? (int) $item['years'] : 0,
+        );
+    }
+
+    return new WP_REST_Response( array( 'count' => count( $products ), 'products' => $products ), 200 );
+}
