@@ -23,7 +23,7 @@ const { getDB, MESSAGES_COLL, AUDIT_LOG_COLL, KB_COLL, MEMORY_COLL, SKILL_LESSON
   DINOCO_PRIVACY_TEXT, PRIVACY_TEXT, mcpTools, mcpToolHandlers,
   QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, PAYMENT_KEYWORDS,
   KUNG_STAFF, KUNG_TO_FEATURE, KUNG_NAMES, KUNG_ID_TO_NAME,
-  getDynamicKeySync, loadAccountKeys,
+  getDynamicKeySync, loadAccountKeys, seedEnvKeysToMongoDB,
 } = shared;
 
 const auth = require("./middleware/auth");
@@ -1255,7 +1255,8 @@ const PORT = process.env.PORT || 3000;
 getDB().then(async () => {
   await ensureIndexes().catch((e) => console.error("[Index] Error:", e.message));
   await initMCPServers().catch((e) => console.error("[MCP] Init error:", e.message));
-  // Load Dashboard keys from MongoDB (warm cache)
+  // Seed .env keys → MongoDB (ครั้งแรก) แล้ว load cache
+  seedEnvKeysToMongoDB().catch(() => {});
   loadAccountKeys().then((acc) => {
     if (acc) console.log("[Keys] Dashboard settings loaded from MongoDB");
     else console.log("[Keys] No Dashboard settings — using .env");

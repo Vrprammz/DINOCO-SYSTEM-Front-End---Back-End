@@ -73,6 +73,54 @@ async function loadAccountKeys() {
   } catch { return null; }
 }
 
+// === Seed .env keys → MongoDB (ครั้งแรกที่ยังไม่มีใน accounts) ===
+async function seedEnvKeysToMongoDB() {
+  const database = await getDB();
+  if (!database) return;
+
+  const existing = await database.collection("accounts").findOne({}, { sort: { updatedAt: -1 } });
+
+  const envKeys = {
+    "aiKeys.googleKey": process.env.GOOGLE_API_KEY,
+    "aiKeys.anthropicKey": process.env.ANTHROPIC_API_KEY,
+    "aiKeys.openrouterKey": process.env.OPENROUTER_API_KEY,
+    "aiKeys.groqKey": process.env.GROQ_API_KEY,
+    "aiKeys.sambaNovaKey": process.env.SAMBANOVA_API_KEY,
+    "aiKeys.cerebrasKey": process.env.CEREBRAS_API_KEY,
+    "lineConfig.channelAccessToken": process.env.LINE_CHANNEL_ACCESS_TOKEN,
+    "lineConfig.channelSecret": process.env.LINE_CHANNEL_SECRET,
+    "fbConfig.pageAccessToken": process.env.FB_PAGE_ACCESS_TOKEN,
+    "fbConfig.appSecret": process.env.FB_APP_SECRET,
+    "fbConfig.verifyToken": process.env.FB_VERIFY_TOKEN,
+  };
+
+  // เอาเฉพาะ keys ที่มีค่าใน .env + ยังไม่มีใน MongoDB
+  const setFields = {};
+  let count = 0;
+  for (const [path, envVal] of Object.entries(envKeys)) {
+    if (!envVal) continue;
+    // ถ้ามี account อยู่แล้ว → เช็คว่า field นี้ว่างไหม
+    const parts = path.split(".");
+    const existingVal = existing ? parts.reduce((o, k) => o?.[k], existing) : null;
+    if (!existingVal) {
+      setFields[path] = envVal;
+      count++;
+    }
+  }
+
+  if (count === 0) return;
+
+  await database.collection("accounts").updateOne(
+    existing ? { _id: existing._id } : { email: "admin@dinoco.in.th" },
+    {
+      $set: { ...setFields, updatedAt: new Date(), setupComplete: true },
+      $setOnInsert: { email: "admin@dinoco.in.th", name: "DINOCO Admin", createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+  console.log(`[Keys] Synced ${count} keys from .env → MongoDB`);
+}
+
 // อ่าน key จาก MongoDB (Dashboard settings) ก่อน → fallback process.env
 async function getDynamicKey(keyName) {
   const account = await loadAccountKeys();
@@ -320,5 +368,6 @@ module.exports = {
   getDynamicKey,
   getDynamicKeySync,
   loadAccountKeys,
+  seedEnvKeysToMongoDB,
   get _cachedAccountKeys() { return _cachedAccountKeys; },
 };
