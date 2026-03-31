@@ -36,7 +36,7 @@ All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, 
 
 ## REST API Endpoints (B2F)
 
-All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `approve-reschedule`, `receive-goods`, `record-payment`, `dashboard-stats`, `po-history`.
+All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `maker-deliver`, `approve-reschedule`, `receive-goods`, `record-payment`, `reject-lot`, `po-complete`, `dashboard-stats`, `po-history`.
 
 ## REST API Endpoints (MCP Bridge)
 
@@ -98,7 +98,7 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Snippet 4 (1167): Maker LIFF Pages — shortcode `[b2f_maker_liff]` route `/b2f-maker/`
   - Snippet 5 (1166): Admin Dashboard Tabs — 3 shortcodes embedded ใน Admin Dashboard
   - Snippet 6 (1161): Order State Machine — `B2F_Order_FSM` class
-  - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`
+  - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`, credit เกิดตอน receive-goods เท่านั้น (ไม่หักตอน create-po), `b2f_recalculate_payable()` คำนวณจาก `rcv_total_value` ของ receiving records
   - Snippet 8 (1168): Admin LIFF E-Catalog — หน้าสั่งซื้อจาก LINE (LIFF auth V.2.0 ไม่ต้อง WP login)
   - Snippet 9 (1169): PO Ticket View — หน้าดูรายละเอียด PO (status timeline, items, receiving, payment, credit)
   - Snippet 10 (1170): PO Image Generator — สร้างรูปใบสั่งซื้อ A4 ด้วย GD Library + REST `/b2f/v1/po-image`

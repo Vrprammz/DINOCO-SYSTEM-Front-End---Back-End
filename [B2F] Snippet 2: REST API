@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.3.1
+ * Version: V.3.2
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -39,8 +39,24 @@ add_action( 'rest_api_init', function () {
         return false;
     };
 
-    // ── Maker JWT permission (public route, token validated inside callback) ──
-    $maker_perm = function () { return true; };
+    // ── Maker JWT permission (CRIT-06 fix: verify JWT ใน permission_callback) ──
+    $maker_perm = function ( WP_REST_Request $req ) {
+        // Admin session ก็เข้าได้ (เช่น po-detail)
+        if ( wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' ) && current_user_can( 'manage_options' ) ) {
+            return true;
+        }
+        // B2F Admin token (LIFF)
+        if ( function_exists( 'b2f_verify_admin_token' ) ) {
+            $session = b2f_verify_admin_token( $req );
+            if ( $session && ! empty( $session['is_admin'] ) ) return true;
+        }
+        // Maker JWT
+        if ( function_exists( 'b2f_verify_maker_jwt' ) ) {
+            $jwt = b2f_verify_maker_jwt( $req );
+            if ( ! is_wp_error( $jwt ) ) return true;
+        }
+        return new WP_Error( 'rest_forbidden', 'Unauthorized', array( 'status' => 401 ) );
+    };
 
     // ── Maker CRUD (admin only) ──
     register_rest_route( $ns, '/makers', array(
@@ -155,6 +171,19 @@ add_action( 'rest_api_init', function () {
         'permission_callback' => $admin_perm,
     ) );
 
+    // ── GAP-02: Admin reject ทั้ง lot (delivering → confirmed) ──
+    register_rest_route( $ns, '/reject-lot', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_reject_lot',
+        'permission_callback' => $admin_perm,
+    ) );
+    // ── GAP-05: Admin ปิด PO ที่ไม่ต้องจ่ายเงิน (received → completed) ──
+    register_rest_route( $ns, '/po-complete', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_po_complete',
+        'permission_callback' => $admin_perm,
+    ) );
+
     // ── Dashboard ──
     register_rest_route( $ns, '/dashboard-stats', array(
         'methods'             => 'GET',
@@ -183,46 +212,40 @@ add_action( 'rest_api_init', function () {
 
 if ( ! function_exists( 'b2f_rate_limit' ) ) {
     /**
-     * Transient-based rate limiter
+     * Transient-based rate limiter (CRIT-07 fix: ใช้ transient + timestamp ไม่พึ่ง cron)
      * @param string $key     Unique key (e.g. 'create_po_<user_id>')
      * @param int    $max     Max requests
      * @param int    $window  Window in seconds (default 60)
      * @return true|WP_Error
      */
     function b2f_rate_limit( $key, $max = 10, $window = 60 ) {
-        global $wpdb;
-        $tkey = '_transient_b2f_rl_' . md5( $key );
+        $tkey  = 'b2f_rl_' . md5( $key );
+        $data  = get_transient( $tkey );
 
-        // FIX HIGH-02: Atomic increment ด้วย MySQL ON DUPLICATE KEY UPDATE (ป้องกัน TOCTOU)
-        $wpdb->query( $wpdb->prepare(
-            "INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
-             VALUES (%s, '1', 'no')
-             ON DUPLICATE KEY UPDATE option_value = option_value + 1",
-            $tkey
-        ) );
-
-        $count = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $tkey
-        ) );
-
-        // Set expiry transient (separate key for TTL tracking)
-        if ( ! get_transient( 'b2f_rl_exp_' . md5( $key ) ) ) {
-            set_transient( 'b2f_rl_exp_' . md5( $key ), 1, $window );
-            // Reset counter after window expires (via wp_options cleanup)
-            wp_schedule_single_event( time() + $window, 'b2f_rl_cleanup', array( $tkey ) );
+        if ( $data === false ) {
+            // First request — start new window
+            set_transient( $tkey, array( 'count' => 1, 'start' => time() ), $window );
+            return true;
         }
 
-        if ( $count > $max ) {
+        $count = intval( $data['count'] ?? 0 );
+        $start = intval( $data['start'] ?? 0 );
+
+        // Window expired (transient should auto-expire but double check)
+        if ( ( time() - $start ) >= $window ) {
+            set_transient( $tkey, array( 'count' => 1, 'start' => time() ), $window );
+            return true;
+        }
+
+        if ( $count >= $max ) {
             return new WP_Error( 'rate_limit', 'คำขอมากเกินไป กรุณารอสักครู่', array( 'status' => 429 ) );
         }
+
+        // Increment count
+        $data['count'] = $count + 1;
+        set_transient( $tkey, $data, $window - ( time() - $start ) );
         return true;
     }
-
-    // Cleanup handler for rate limit keys
-    add_action( 'b2f_rl_cleanup', function( $tkey ) {
-        global $wpdb;
-        $wpdb->delete( $wpdb->options, array( 'option_name' => $tkey ) );
-    } );
 }
 
 // ════════════════════════════════════════════
@@ -1013,14 +1036,15 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
         }
         update_field( 'po_items', $repeater, $po_id );
 
-        // ── Transition to 'submitted' via FSM ──
+        // ── Transition to 'submitted' via FSM (CRIT-04 fix: ห้าม bypass FSM) ──
         if ( function_exists( 'b2f_transition_order' ) ) {
             $trans = b2f_transition_order( $po_id, 'submitted', 'admin', 'PO created' );
             if ( is_wp_error( $trans ) ) {
-                update_field( 'po_status', 'submitted', $po_id );
+                b2f_log( '[CRITICAL] FSM transition draft→submitted failed for PO #' . $po_id . ': ' . $trans->get_error_message() );
             }
         } else {
             update_field( 'po_status', 'submitted', $po_id );
+            b2f_log( '[WARN] FSM not loaded — fallback update_field for PO #' . $po_id );
         }
 
         // Set duplicate prevention transient (5 minutes)
@@ -1070,13 +1094,9 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             }
         }
 
-        // ── Add payable (credit) to Maker ──
-        if ( function_exists( 'b2f_payable_add' ) && $total > 0 ) {
-            $payable_result = b2f_payable_add( $maker_id, $total, 'PO created: ' . $po_number, $po_id );
-            if ( $payable_result === false && function_exists( 'b2f_log' ) ) {
-                b2f_log( "[Credit] WARN: b2f_payable_add failed for PO={$po_number} maker={$maker_id} amount={$total}" );
-            }
-        }
+        // ── Credit: ไม่หักตอนสร้าง PO — หักตอน receive-goods เท่านั้น (CRIT-01 fix) ──
+        // b2f_payable_add ถูกเรียกใน b2f_rest_receive_goods() เมื่อรับของจริง
+        // b2f_recalculate_payable() เป็น source of truth คำนวณจาก receiving records
 
         if ( function_exists( 'b2f_log' ) ) {
             b2f_log( sprintf( 'PO created: %s (#%d) Maker=#%d Total=%.2f Push:maker=%s,admin=%s',
@@ -1398,9 +1418,6 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         $current_status = get_field( 'po_status', $po_id );
         $maker_id       = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
 
-        // Check if partial_received -> need rollback
-        $need_rollback = ( $current_status === 'partial_received' );
-
         // Transition
         if ( function_exists( 'b2f_transition_order' ) ) {
             $trans = b2f_transition_order( $po_id, 'cancelled', 'admin', $reason );
@@ -1416,31 +1433,17 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         update_field( 'po_cancelled_by', strval( get_current_user_id() ), $po_id );
         update_field( 'po_cancelled_date', wp_date( 'Y-m-d' ), $po_id );
 
-        // Rollback if partial received
+        // Rollback credit — recalculate จาก data จริง (CRIT-02 fix)
+        // ใช้ recalculate แทน manual subtract — ถูกต้องทุก status ไม่ว่า cancel จาก submitted/confirmed/partial_received
         $rollback_info = array();
-        if ( $need_rollback ) {
-            $rcv_q = new WP_Query( array(
-                'post_type'      => 'b2f_receiving',
-                'posts_per_page' => -1,
-                'post_status'    => 'publish',
-                'meta_query'     => array( array(
-                    'key'   => 'rcv_po_id',
-                    'value' => $po_id,
-                    'type'  => 'NUMERIC',
-                ) ),
-            ) );
-
-            // TODO: reverse inventory entries (source='b2f_cancel') when Inventory integration is built
-            $rollback_info['receiving_records'] = $rcv_q->found_posts;
-
-            // Rollback debt
-            $po_total    = floatval( get_field( 'po_total_amount', $po_id ) ?: 0 );
-            $paid        = floatval( get_field( 'po_paid_amount', $po_id ) ?: 0 );
-            $outstanding = round( $po_total - $paid, 2 );
-
-            if ( $outstanding > 0 && function_exists( 'b2f_payable_subtract' ) ) {
-                b2f_payable_subtract( $maker_id, $outstanding, 'PO cancelled - rollback debt', $po_id );
-                $rollback_info['debt_reversed'] = $outstanding;
+        $old_debt = floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 );
+        if ( function_exists( 'b2f_recalculate_payable' ) && $maker_id > 0 ) {
+            $new_debt = b2f_recalculate_payable( $maker_id );
+            $reversed = round( $old_debt - $new_debt, 2 );
+            if ( $reversed > 0 ) {
+                $rollback_info['debt_reversed'] = $reversed;
+                $rollback_info['old_debt']      = $old_debt;
+                $rollback_info['new_debt']      = $new_debt;
             }
         }
 
@@ -1448,7 +1451,19 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         $maker_group = get_field( 'maker_line_group_id', $maker_id );
         if ( function_exists( 'b2f_build_flex_po_cancelled' ) && ! empty( $maker_group ) ) {
             $flex = b2f_build_flex_po_cancelled( $po_id, $reason );
-            if ( $flex ) b2f_line_push( $maker_group, $flex );
+            if ( $flex ) b2f_line_push( $maker_group, array( $flex ) );
+        }
+
+        // GAP-07: Push Flex to Admin group (คนอื่นใน Admin group รู้ว่า PO ถูกยกเลิก)
+        if ( function_exists( 'b2f_build_flex_po_cancelled_admin' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            $cancelled_by = '';
+            $uid = get_current_user_id();
+            if ( $uid ) {
+                $u = get_user_by( 'id', $uid );
+                $cancelled_by = $u ? $u->display_name : 'Admin';
+            }
+            $flex_admin = b2f_build_flex_po_cancelled_admin( $po_id, $reason, $cancelled_by );
+            if ( $flex_admin ) b2f_line_push( B2B_ADMIN_GROUP_ID, array( $flex_admin ) );
         }
 
         if ( function_exists( 'b2f_log' ) ) {
@@ -1784,7 +1799,12 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ระบบไม่พร้อม' ), 500 );
         }
 
-        $result = b2f_transition_order( $po_id, 'delivering', 'maker', 'Maker แจ้งส่งของ (LIFF)' );
+        // GAP-03: รองรับ partial_received → delivering (Maker ส่งของเพิ่ม)
+        $current_status = get_field( 'po_status', $po_id );
+        $is_additional  = ( $current_status === 'partial_received' );
+
+        $note = $is_additional ? 'Maker ส่งของเพิ่ม (LIFF)' : 'Maker แจ้งส่งของ (LIFF)';
+        $result = b2f_transition_order( $po_id, 'delivering', 'maker', $note );
         if ( is_wp_error( $result ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => $result->get_error_message() ), 400 );
         }
@@ -1796,7 +1816,9 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
         $admin_group = defined( 'B2B_ADMIN_GROUP_ID' ) ? B2B_ADMIN_GROUP_ID : '';
         $maker_name  = get_the_title( $maker_id ) ?: 'โรงงาน';
         if ( $admin_group && function_exists( 'b2f_line_push' ) ) {
-            if ( function_exists( 'b2f_build_flex_delivered' ) ) {
+            if ( $is_additional && function_exists( 'b2f_build_flex_additional_delivery' ) ) {
+                b2f_line_push( $admin_group, array( b2f_build_flex_additional_delivery( $po_id ) ) );
+            } elseif ( function_exists( 'b2f_build_flex_delivered' ) ) {
                 b2f_line_push( $admin_group, array( b2f_build_flex_delivered( $po_id ) ) );
             } else {
                 b2f_line_push( $admin_group, array( array(
@@ -2139,6 +2161,7 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
         update_field( 'rcv_number', $rcv_number, $rcv_id );
         update_field( 'rcv_date', wp_date( 'Y-m-d' ), $rcv_id );
         update_field( 'rcv_items', $rcv_items, $rcv_id );
+        update_field( 'rcv_total_value', $total_rcv_value, $rcv_id );
         update_field( 'rcv_admin_note', $note, $rcv_id );
         update_field( 'rcv_inspected_by', $inspected_by, $rcv_id );
 
@@ -2201,6 +2224,9 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             ) );
         }
 
+        // Release MySQL lock ก่อน return (CRIT-05 fix — dead code)
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", 'b2f_recv_' . intval( $po_id ) ) );
+
         return new WP_REST_Response( array(
             'success'           => true,
             'rcv_id'            => $rcv_id,
@@ -2209,10 +2235,6 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             'inventory_updated' => ! empty( $inventory_updated ),
             'debt_added'        => $debt_added ? $total_rcv_value : 0,
         ), 200 );
-
-        // FIX HIGH-03: Release MySQL lock
-        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", 'b2f_recv_' . intval( $po_id ) ) );
-        return $response;
     }
 }
 
@@ -2630,5 +2652,115 @@ if ( ! function_exists( 'b2f_rest_po_history' ) ) {
             'data'        => $orders,
             'counts'      => $counts,
         ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// GAP-02: REJECT LOT (delivering → confirmed)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_reject_lot' ) ) {
+    /**
+     * POST /reject-lot — Admin reject ทั้ง lot ให้ Maker ส่งใหม่
+     */
+    function b2f_rest_reject_lot( WP_REST_Request $req ) {
+        $po_id  = intval( $req->get_param( 'po_id' ) ?: 0 );
+        $reason = sanitize_textarea_field( $req->get_param( 'reason' ) ?: '' );
+
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+        if ( $current_status !== 'delivering' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'PO ไม่อยู่ในสถานะ delivering', 'code' => 'INVALID_STATUS' ), 400 );
+        }
+
+        // Transition delivering → confirmed (FSM allows this)
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            $trans = b2f_transition_order( $po_id, 'confirmed', 'admin', 'Reject lot: ' . $reason );
+            if ( is_wp_error( $trans ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
+            }
+        } else {
+            update_field( 'po_status', 'confirmed', $po_id );
+        }
+
+        update_field( 'po_admin_note', $reason, $po_id );
+
+        // Push Flex to Maker
+        $maker_id    = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        $maker_group = $maker_id ? get_field( 'maker_line_group_id', $maker_id ) : '';
+        if ( function_exists( 'b2f_build_flex_lot_rejected' ) && ! empty( $maker_group ) ) {
+            $flex = b2f_build_flex_lot_rejected( $po_id, $reason );
+            if ( $flex ) b2f_line_push( $maker_group, array( $flex ) );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Reject lot: PO #%d reason=%s', $po_id, $reason ) );
+        }
+
+        return new WP_REST_Response( array( 'success' => true, 'po_id' => $po_id, 'status' => 'confirmed' ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// GAP-05: PO COMPLETE (received → completed, ของฟรี/sample)
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_po_complete' ) ) {
+    /**
+     * POST /po-complete — Admin ปิด PO โดยไม่ต้องจ่ายเงิน (sample, ของฟรี)
+     */
+    function b2f_rest_po_complete( WP_REST_Request $req ) {
+        $po_id = intval( $req->get_param( 'po_id' ) ?: 0 );
+        $note  = sanitize_textarea_field( $req->get_param( 'note' ) ?: 'ปิด PO — ไม่ต้องชำระ' );
+
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+        }
+
+        $post = get_post( $po_id );
+        if ( ! $post || $post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        $current_status = get_field( 'po_status', $po_id );
+        if ( ! in_array( $current_status, array( 'received', 'paid', 'partial_paid' ), true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'PO ไม่อยู่ในสถานะที่ปิดได้', 'code' => 'INVALID_STATUS' ), 400 );
+        }
+
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            $trans = b2f_transition_order( $po_id, 'completed', 'admin', $note );
+            if ( is_wp_error( $trans ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
+            }
+        } else {
+            update_field( 'po_status', 'completed', $po_id );
+        }
+
+        update_field( 'po_admin_note', $note, $po_id );
+
+        // Push Flex completed to both Admin and Maker
+        $maker_id    = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        $maker_group = $maker_id ? get_field( 'maker_line_group_id', $maker_id ) : '';
+        if ( function_exists( 'b2f_build_flex_po_completed' ) ) {
+            $flex = b2f_build_flex_po_completed( $po_id );
+            if ( $flex ) {
+                if ( ! empty( $maker_group ) ) b2f_line_push( $maker_group, array( $flex ) );
+                if ( defined( 'B2B_ADMIN_GROUP_ID' ) ) b2f_line_push( B2B_ADMIN_GROUP_ID, array( $flex ) );
+            }
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'PO completed (manual): #%d note=%s', $po_id, $note ) );
+        }
+
+        return new WP_REST_Response( array( 'success' => true, 'po_id' => $po_id, 'status' => 'completed' ), 200 );
     }
 }
