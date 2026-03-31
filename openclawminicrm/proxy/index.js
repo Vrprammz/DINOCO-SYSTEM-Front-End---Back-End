@@ -5994,6 +5994,49 @@ function isClaimIntent(text) {
   return CLAIM_KEYWORDS.test(text);
 }
 
+// === Vision AI — วิเคราะห์รูปเคลม (V.1.1) ===
+async function analyzeClaimPhoto(imageUrl) {
+  try {
+    const res = await fetch(imageUrl);
+    if (!res.ok) return null;
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const base64 = buffer.toString("base64");
+    const dataUrl = `data:image/jpeg;base64,${base64}`;
+
+    const claimPrompt = `วิเคราะห์รูปสินค้าที่เคลม (อุปกรณ์เสริมมอเตอร์ไซค์ เช่น กล่องอลูมิเนียม แคชบาร์ แร็ค ถาดรอง):
+1. สินค้าคืออะไร? (ถ้าระบุได้)
+2. ความเสียหายที่เห็น (เช่น สติ๊กเกอร์ลอก, มุมแตก, รอยร้าว, ชิ้นส่วนหลุด, กุญแจไม่ทำงาน)
+3. ความรุนแรง: เล็กน้อย / ปานกลาง / รุนแรง
+4. รูปชัดพอสำหรับประเมินไหม? (ชัด / ไม่ชัด-ขอถ่ายใหม่)
+ตอบสั้นกระชับ 2-3 บรรทัด ภาษาไทย`;
+
+    // ใช้ Gemini สำหรับ claim analysis (แม่นยำกว่า free models)
+    const geminiKey = process.env.GOOGLE_API_KEY;
+    if (geminiKey) {
+      const gemRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(30000),
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { text: claimPrompt },
+            { inlineData: { mimeType: "image/jpeg", data: base64 } },
+          ] }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 300 },
+        }),
+      });
+      const gemData = await gemRes.json();
+      const analysis = gemData.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (analysis) { console.log("[ClaimVision] Gemini OK"); return analysis; }
+    }
+
+    // Fallback: ใช้ analyzeImage ทั่วไป
+    return await analyzeImage(buffer);
+  } catch (e) {
+    console.error("[ClaimVision] Error:", e.message);
+    return null;
+  }
+}
+
 // === Get or create claim session for a customer ===
 async function getClaimSession(sourceId) {
   const db = await getDB();
@@ -6022,6 +6065,8 @@ async function startClaimFlow(sourceId, platform, customerName) {
     aiAnalysis: null,
     serial: null,
     product: null,
+    purchaseFrom: null,
+    purchaseDate: null,
     symptoms: null,
     phone: null,
     address: null,
@@ -6037,7 +6082,7 @@ async function startClaimFlow(sourceId, platform, customerName) {
   return claim;
 }
 
-// === Process claim conversation step ===
+// === Process claim conversation step (V.1.1 — Vision AI + conversational) ===
 async function processClaimMessage(sourceId, platform, text, imageUrl, customerName) {
   const db = await getDB();
   if (!db) return null;
@@ -6047,29 +6092,49 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
   // ถ้ายังไม่มี claim → เริ่มใหม่
   if (!claim) {
     claim = await startClaimFlow(sourceId, platform, customerName);
-    return "รับทราบค่ะ ขอรบกวนส่ง 2 รูปให้หน่อยนะคะ:\n1. 📸 รูปสินค้าที่ชำรุด\n2. 📋 รูปบัตรรับประกัน\n\nส่งมาได้เลยค่ะ";
+    return "เสียใจด้วยค่ะ ทีม DINOCO พร้อมช่วยเหลือค่ะ\nส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยได้ไหมคะ? 📸";
   }
 
   switch (claim.status) {
-    case "photo_requested": {
+    case "photo_requested":
+    case "photo_rejected": {
       if (imageUrl) {
-        // เก็บรูป (รับหลายรูปได้)
+        // เก็บรูป
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { updatedAt: new Date() },
           $push: { photos: imageUrl },
         });
 
-        const photoCount = (claim.photos?.length || 0) + 1;
-        if (photoCount < 2) {
-          return `ได้รูปที่ ${photoCount} แล้วค่ะ ส่งรูปเพิ่มได้อีกนะคะ\nพอครบแล้วพิมพ์ "ครบแล้ว" ค่ะ`;
+        // Vision AI วิเคราะห์รูปทันที
+        const analysis = await analyzeClaimPhoto(imageUrl);
+        if (analysis) {
+          // เช็คว่ารูปชัดพอไหม
+          const isBlurry = /ไม่ชัด|ขอถ่ายใหม่|มืด|เบลอ/.test(analysis);
+          if (isBlurry) {
+            await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+              $set: { status: "photo_rejected", aiAnalysis: analysis, updatedAt: new Date() },
+            });
+            return `รูปยังไม่ค่อยชัดค่ะ 😅\nAI วิเคราะห์: ${analysis}\n\nรบกวนถ่ายอีกทีนะคะ ให้เห็นจุดที่ชำรุดชัดๆ ค่ะ 📸`;
+          }
+
+          // รูปชัด → เก็บ analysis + ไป step ถัดไป
+          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+            $set: { status: "photo_received", aiAnalysis: analysis, updatedAt: new Date() },
+          });
+          return `ได้รูปแล้วค่ะ 📸\n\nAI ตรวจเบื้องต้น:\n${analysis}\n\nสินค้ารุ่นอะไรคะ?`;
         }
 
-        // ได้ 2+ รูปแล้ว → ไป step ถัดไป
-        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { status: "photo_received", updatedAt: new Date() },
-        });
-        return "ได้รูปครบแล้วค่ะ ขอบคุณนะคะ 📸\nสินค้ารุ่นอะไรคะ?";
+        // Vision AI ไม่ทำงาน → ไป step ถัดไปเลย
+        const photoCount = (claim.photos?.length || 0) + 1;
+        if (photoCount >= 2) {
+          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+            $set: { status: "photo_received", updatedAt: new Date() },
+          });
+          return "ได้รูปครบแล้วค่ะ ขอบคุณนะคะ 📸\nสินค้ารุ่นอะไรคะ?";
+        }
+        return `ได้รูปที่ ${photoCount} แล้วค่ะ ส่งรูปเพิ่มได้อีกนะคะ (ส่งรูปบัตรรับประกันด้วยยิ่งดีค่ะ)\nพอครบแล้วพิมพ์ "ครบแล้ว" ค่ะ`;
       }
+
       // ลูกค้าพิมพ์ "ครบแล้ว" → ไป step ถัดไป
       if (text && /ครบ|พอ|เสร็จ|หมด/i.test(text) && claim.photos?.length > 0) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
@@ -6077,81 +6142,105 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
         });
         return "ขอบคุณค่ะ 📸\nสินค้ารุ่นอะไรคะ?";
       }
-      return "รบกวนส่งรูปสินค้าที่ชำรุด + รูปบัตรรับประกันให้หน่อยนะคะ 📸";
+      return "ส่งรูปสินค้าที่ชำรุดให้ดูหน่อยนะคะ 📸";
     }
 
     case "photo_received": {
-      // ลูกค้าส่งรูปเพิ่ม → เก็บ
+      // ลูกค้าส่งรูปเพิ่ม → เก็บ + วิเคราะห์
       if (imageUrl) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $push: { photos: imageUrl }, $set: { updatedAt: new Date() },
         });
-        return "ได้รูปเพิ่มแล้วค่ะ สินค้ารุ่นอะไรคะ?";
+        const extraAnalysis = await analyzeClaimPhoto(imageUrl);
+        if (extraAnalysis) {
+          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+            $set: { aiAnalysis: (claim.aiAnalysis || "") + "\n" + extraAnalysis },
+          });
+        }
+        return "ได้รูปเพิ่มแล้วค่ะ\nสินค้ารุ่นอะไรคะ?";
       }
-      // รอชื่อสินค้า
+      // รอชื่อสินค้า (ถามทีละคำถาม)
       if (text && text.length > 1) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { product: text, status: "info_collecting", updatedAt: new Date() },
         });
-        return "ซื้อจากร้านไหนคะ? ประมาณเมื่อไหร่?";
+        return "ซื้อจากร้านไหนคะ?";
       }
       return "สินค้ารุ่นอะไรคะ?";
     }
 
     case "info_collecting": {
-      // Step 1: ร้านที่ซื้อ
-      if (!claim.symptoms && text) {
+      // ถามทีละคำถาม: ร้านที่ซื้อ → อาการ → เบอร์โทร
+
+      // Step 1: ร้านที่ซื้อ (เก็บใน purchaseFrom)
+      if (!claim.purchaseFrom && text) {
+        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+          $set: { purchaseFrom: text, updatedAt: new Date() },
+        });
+        return "ประมาณซื้อเมื่อไหร่คะ?";
+      }
+
+      // Step 2: เมื่อไหร่ (เก็บใน purchaseDate)
+      if (claim.purchaseFrom && !claim.purchaseDate && text) {
+        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+          $set: { purchaseDate: text, updatedAt: new Date() },
+        });
+        return "อาการเป็นยังไงคะ?";
+      }
+
+      // Step 3: อาการ
+      if (claim.purchaseFrom && claim.purchaseDate && !claim.symptoms && text) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { symptoms: text, updatedAt: new Date() },
         });
-        return "อาการเป็นยังไงคะ? (เช่น สติ๊กเกอร์ลอก, มุมแตก, กุญแจหาย)";
+        return "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
       }
 
-      // Step 2: อาการ → ถามเบอร์โทร (ไม่ถาม serial — ดูจากรูปบัตรรับประกันแทน)
+      // Step 4: เบอร์โทร → จบ flow
       if (claim.symptoms && !claim.phone && text) {
-        // เช็คว่าเป็นเบอร์โทรไหม
         const phoneMatch = text.replace(/[^0-9]/g, "");
         if (phoneMatch.length >= 9) {
-          // เป็นเบอร์โทร → จบ flow
           await db.collection("manual_claims").updateOne({ _id: claim._id }, {
             $set: { phone: phoneMatch, serial: "ดูจากรูปบัตรรับประกัน", status: "info_collected", updatedAt: new Date() },
           });
 
-          // สร้าง claim ใน WordPress
+          // สร้าง claim ใน WordPress พร้อม AI analysis
           const wpResult = await callDinocoAPI("/claim-manual-create", {
             serial: "ดูจากรูปบัตรรับประกัน",
             product: claim.product,
-            symptoms: `${claim.symptoms} | อาการ: ${text}`,
+            symptoms: claim.symptoms,
+            purchase_from: claim.purchaseFrom,
+            purchase_date: claim.purchaseDate,
             customer_name: claim.customerName,
             phone: phoneMatch,
             photos: claim.photos,
             platform,
             source_id: sourceId,
             initiated_by: "customer",
-            ai_analysis: "",
+            ai_analysis: claim.aiAnalysis || "",
           });
 
           if (typeof wpResult !== "string" && wpResult?.success) {
             await db.collection("manual_claims").updateOne({ _id: claim._id }, {
               $set: { wpClaimId: wpResult.claim_id, wpTicketNumber: wpResult.ticket_number, updatedAt: new Date() },
             });
-            return `รับเรื่องเคลมแล้วค่ะ ✅\nใบเคลม: ${wpResult.ticket_number}\nทีมงานจะตรวจสอบรูปภาพและติดต่อกลับภายใน 1-2 วันทำการค่ะ`;
+            return `รับเรื่องเคลมแล้วค่ะ ✅\nใบเคลม: ${wpResult.ticket_number}\n\nสรุป:\n• สินค้า: ${claim.product}\n• อาการ: ${claim.symptoms}\n• ร้าน: ${claim.purchaseFrom}\n\nทีมงานจะตรวจสอบและติดต่อกลับภายใน 1-2 วันทำการค่ะ`;
           }
           return "รับเรื่องเคลมแล้วค่ะ ✅ ทีมงานจะตรวจสอบและติดต่อกลับเร็วที่สุดค่ะ";
         }
 
-        // ไม่ใช่เบอร์ → เก็บเป็นอาการเพิ่มเติม
+        // ไม่ใช่เบอร์ → เก็บเป็นข้อมูลเพิ่มเติม
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { symptoms: claim.symptoms + " | " + text, updatedAt: new Date() },
+          $set: { symptoms: (claim.symptoms || "") + " | " + text, updatedAt: new Date() },
         });
-        return "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
+        return "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ (ตัวเลข 10 หลัก)";
       }
 
       return "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
     }
 
     case "info_collected": {
-      return `เรื่องเคลมของพี่อยู่ระหว่างตรวจสอบค่ะ${claim.wpTicketNumber ? " (ใบเคลม: " + claim.wpTicketNumber + ")" : ""}\nทีมงานจะติดต่อกลับเร็วที่สุดค่ะ`;
+      return `เรื่องเคลมของพี่อยู่ระหว่างตรวจสอบค่ะ${claim.wpTicketNumber ? " (ใบเคลม: " + claim.wpTicketNumber + ")" : ""}\nทีมงานจะติดต่อกลับเร็วที่สุดค่ะ\n\nมีอะไรเพิ่มเติมทักมาได้เลยนะคะ`;
     }
 
     default:
