@@ -2977,6 +2977,17 @@ app.post("/webhook/meta", express.raw({ type: "*/*" }), async (req, res) => {
           }, platform)
           console.log(`[Meta/${platform}] ${userName}: [image]`)
 
+          // [DINOCO] ถ้ามี active claim → ส่งรูปเข้า claim flow
+          const imgClaim = await getClaimSession(sourceId).catch(() => null);
+          if (imgClaim && imgClaim.status === "photo_requested") {
+            console.log(`[Claim] Photo received for claim ${imgClaim._id}`);
+            const claimReply = await processClaimMessage(sourceId, platform, "[รูปภาพ]", attUrl, userName);
+            if (claimReply) {
+              await sendMetaMessage(senderId, claimReply);
+              await saveMsg(sourceId, { role: "assistant", userName: DEFAULT_BOT_NAME, content: claimReply, messageType: "text", isAiReply: true }, platform);
+            }
+          }
+
         } else if (att.type === "video") {
           await saveMsg(sourceId, {
             ...baseMsgFields,
@@ -6042,12 +6053,21 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
   switch (claim.status) {
     case "photo_requested": {
       if (imageUrl) {
-        // ได้รูปแล้ว → Vision AI วิเคราะห์
+        // ได้รูปแล้ว → ดาวน์โหลด + Vision AI วิเคราะห์
         let aiDesc = "";
-        if (typeof analyzeImage === "function") {
-          const imgBuffer = imageUrl.startsWith("data:") ? Buffer.from(imageUrl.split(",")[1], "base64") : null;
-          if (imgBuffer) aiDesc = await analyzeImage(imgBuffer).catch(() => "");
-        }
+        try {
+          if (typeof analyzeImage === "function") {
+            let imgBuffer = null;
+            if (imageUrl.startsWith("data:")) {
+              imgBuffer = Buffer.from(imageUrl.split(",")[1], "base64");
+            } else if (imageUrl.startsWith("http")) {
+              // ดาวน์โหลดรูปจาก FB/IG URL
+              const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
+              if (imgRes.ok) imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+            }
+            if (imgBuffer) aiDesc = await analyzeImage(imgBuffer).catch(() => "");
+          }
+        } catch (e) { console.error("[Claim] Vision AI error:", e.message); }
 
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { status: "photo_received", aiAnalysis: aiDesc, updatedAt: new Date() },
