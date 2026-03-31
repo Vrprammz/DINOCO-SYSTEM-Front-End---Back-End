@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.3.0
+ * Version: V.3.1
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -1052,14 +1052,30 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             }
         }
 
-        // ── Push to Admin group ──
+        // ── Push Flex to Admin group ──
         $admin_group = defined( 'B2B_ADMIN_GROUP_ID' ) ? B2B_ADMIN_GROUP_ID : '';
         if ( ! empty( $admin_group ) && function_exists( 'b2f_line_push' ) ) {
-            b2f_line_push( $admin_group, array( array(
-                'type' => 'text',
-                'text' => "📋 สร้าง PO ใหม่\n{$po_number}\nโรงงาน: " . esc_html( get_field( 'maker_name', $maker_id ) ?: '' ) . "\nยอด: ฿" . number_format( $total, 2 ),
-            ) ) );
-            $push_admin = true;
+            $flex_admin = null;
+            if ( function_exists( 'b2f_build_flex_po_created' ) ) {
+                $flex_admin = b2f_build_flex_po_created( $po_id );
+            }
+            if ( ! empty( $flex_admin ) ) {
+                $push_admin = b2f_line_push( $admin_group, array( $flex_admin ) );
+            } else {
+                // Fallback: plain text ถ้า Flex builder ไม่พร้อม
+                $push_admin = b2f_line_push( $admin_group, array( array(
+                    'type' => 'text',
+                    'text' => "\xF0\x9F\x93\x8B \xE0\xB8\xAA\xE0\xB8\xA3\xE0\xB9\x89\xE0\xB8\xB2\xE0\xB8\x87 PO \xE0\xB9\x83\xE0\xB8\xAB\xE0\xB8\xA1\xE0\xB9\x88\n{$po_number}\n\xE0\xB9\x82\xE0\xB8\xA3\xE0\xB8\x87\xE0\xB8\x87\xE0\xB8\xB2\xE0\xB8\x99: " . esc_html( get_field( 'maker_name', $maker_id ) ?: '' ) . "\n\xE0\xB8\xA2\xE0\xB8\xAD\xE0\xB8\x94: \xE0\xB8\xBF" . number_format( $total, 2 ),
+                ) ) );
+            }
+        }
+
+        // ── Add payable (credit) to Maker ──
+        if ( function_exists( 'b2f_payable_add' ) && $total > 0 ) {
+            $payable_result = b2f_payable_add( $maker_id, $total, 'PO created: ' . $po_number, $po_id );
+            if ( $payable_result === false && function_exists( 'b2f_log' ) ) {
+                b2f_log( "[Credit] WARN: b2f_payable_add failed for PO={$po_number} maker={$maker_id} amount={$total}" );
+            }
         }
 
         if ( function_exists( 'b2f_log' ) ) {
@@ -2466,15 +2482,17 @@ if ( ! function_exists( 'b2f_rest_dashboard_stats' ) ) {
         }
 
         return new WP_REST_Response( array(
-            'success'          => true,
-            'pending_confirm'  => $status_counts['submitted'] ?? 0,
-            'confirmed'        => ( $status_counts['confirmed'] ?? 0 ) + ( $status_counts['delivering'] ?? 0 ),
-            'overdue'          => $overdue,
-            'total_payable'    => round( $total_payable, 2 ),
-            'overdue_payable'  => round( $overdue_payable, 2 ),
-            'po_this_month'    => $po_this_month,
-            'po_last_month'    => $po_last_month,
-            'status_breakdown' => $status_counts,
+            'success' => true,
+            'data'    => array(
+                'pending_confirm'  => $status_counts['submitted'] ?? 0,
+                'confirmed'        => ( $status_counts['confirmed'] ?? 0 ) + ( $status_counts['delivering'] ?? 0 ),
+                'overdue'          => $overdue,
+                'total_payable'    => round( $total_payable, 2 ),
+                'overdue_payable'  => round( $overdue_payable, 2 ),
+                'po_this_month'    => $po_this_month,
+                'po_last_month'    => $po_last_month,
+                'status_breakdown' => $status_counts,
+            ),
         ), 200 );
     }
 }
@@ -2487,8 +2505,11 @@ if ( ! function_exists( 'b2f_rest_po_history' ) ) {
      * Response: { success, total, page, per_page, total_pages, orders }
      */
     function b2f_rest_po_history( WP_REST_Request $req ) {
+        global $wpdb;
+
         $maker_id  = intval( $req->get_param( 'maker_id' ) ?: 0 );
         $status    = sanitize_text_field( $req->get_param( 'status' ) ?: '' );
+        $overdue   = intval( $req->get_param( 'overdue' ) ?: 0 );
         $date_from = sanitize_text_field( $req->get_param( 'date_from' ) ?: '' );
         $date_to   = sanitize_text_field( $req->get_param( 'date_to' ) ?: '' );
         $page      = max( 1, intval( $req->get_param( 'page' ) ?: 1 ) );
@@ -2513,10 +2534,41 @@ if ( ! function_exists( 'b2f_rest_po_history' ) ) {
             );
         }
 
+        // Support comma-separated statuses (e.g. "received,partial_received,partial_paid")
         if ( ! empty( $status ) ) {
+            $status_arr = array_map( 'trim', explode( ',', $status ) );
+            if ( count( $status_arr ) === 1 ) {
+                $args['meta_query'][] = array(
+                    'key'   => 'po_status',
+                    'value' => $status_arr[0],
+                );
+            } else {
+                $args['meta_query'][] = array(
+                    'key'     => 'po_status',
+                    'value'   => $status_arr,
+                    'compare' => 'IN',
+                );
+            }
+        }
+
+        // Overdue filter: confirmed/delivering with expected_date < today
+        if ( $overdue ) {
+            $today = wp_date( 'Y-m-d' );
             $args['meta_query'][] = array(
-                'key'   => 'po_status',
-                'value' => $status,
+                'key'     => 'po_status',
+                'value'   => array( 'confirmed', 'delivering' ),
+                'compare' => 'IN',
+            );
+            $args['meta_query'][] = array(
+                'key'     => 'po_expected_date',
+                'value'   => $today,
+                'compare' => '<',
+                'type'    => 'DATE',
+            );
+            $args['meta_query'][] = array(
+                'key'     => 'po_expected_date',
+                'value'   => '',
+                'compare' => '!=',
             );
         }
 
@@ -2549,13 +2601,34 @@ if ( ! function_exists( 'b2f_rest_po_history' ) ) {
             $orders[] = b2f_format_po_detail( $p->ID, true );
         }
 
+        // Build status counts for tab badges
+        $all_statuses = array(
+            'submitted', 'confirmed', 'delivering',
+            'partial_received', 'received', 'partial_paid',
+            'paid', 'completed', 'cancelled', 'rejected', 'draft', 'amended',
+        );
+        $counts = array( 'all' => 0 );
+        foreach ( $all_statuses as $s ) {
+            $cnt = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'po_status'
+                 WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish' AND pm.meta_value = %s",
+                $s
+            ) );
+            $counts[ $s ] = $cnt;
+            $counts['all'] += $cnt;
+        }
+        // Aggregate "unpaid" = received + partial_received + partial_paid
+        $counts['unpaid'] = ( $counts['received'] ?? 0 ) + ( $counts['partial_received'] ?? 0 ) + ( $counts['partial_paid'] ?? 0 );
+
         return new WP_REST_Response( array(
             'success'     => true,
             'total'       => $q->found_posts,
             'page'        => $page,
             'per_page'    => $per_page,
             'total_pages' => $q->max_num_pages,
-            'orders'      => $orders,
+            'data'        => $orders,
+            'counts'      => $counts,
         ), 200 );
     }
 }
