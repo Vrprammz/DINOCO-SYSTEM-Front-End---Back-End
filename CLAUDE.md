@@ -38,6 +38,15 @@ All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, 
 
 All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `approve-reschedule`, `receive-goods`, `record-payment`, `dashboard-stats`, `po-history`.
 
+## REST API Endpoints (MCP Bridge)
+
+All under `/wp-json/dinoco-mcp/v1/` (32 endpoints, V.2.0):
+- **Core**: `product-lookup` (+stock_status), `dealer-lookup`, `warranty-check`, `kb-search`, `kb-export`, `catalog-full`, `distributor-notify`, `distributor-list`, `kb-suggest`, `brand-voice-submit`
+- **Claims**: `claim-manual-create`, `claim-manual-update`, `claim-manual-status`, `claim-manual-list`, `claim-status`
+- **Leads (P1)**: `lead-create`, `lead-update`, `lead-list`, `lead-get/{id}`, `lead-followup-schedule`
+- **Phase 2**: `warranty-registered`, `member-motorcycle`, `member-assets`, `customer-link`, `dealer-sla-report`, `distributor-get/{id}`, `product-compatibility`
+- **Phase 3**: `kb-updated`, `inventory-changed`, `moto-catalog`, `dashboard-inject-metrics`, `lead-attribution`
+
 ## Required WordPress Constants
 
 - `DINOCO_LINE_CHANNEL_ID` — LINE OAuth app ID
