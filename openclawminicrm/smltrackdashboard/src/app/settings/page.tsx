@@ -16,11 +16,13 @@ interface AccountData {
     sambaNovaKey: string;
     cerebrasKey: string;
     googleKey: string;
+    anthropicKey: string;
     openrouterKeyConfigured: boolean;
     groqKeyConfigured: boolean;
     sambaNovaKeyConfigured: boolean;
     cerebrasKeyConfigured: boolean;
     googleKeyConfigured: boolean;
+    anthropicKeyConfigured: boolean;
   };
   lineConfig: {
     channelAccessToken: string;
@@ -371,13 +373,22 @@ export default function SettingsPage() {
                 link: "https://cloud.cerebras.ai/",
               },
               {
-                label: "Google API Key",
+                label: "Google API Key (Gemini Flash)",
                 field: "googleKey" as const,
                 placeholder: "AIza...",
                 configured: account?.aiKeys?.googleKeyConfigured,
                 masked: account?.aiKeys?.googleKey || "",
                 required: false,
                 link: "https://aistudio.google.com/apikey",
+              },
+              {
+                label: "Anthropic API Key (Claude)",
+                field: "anthropicKey" as const,
+                placeholder: "sk-ant-...",
+                configured: account?.aiKeys?.anthropicKeyConfigured,
+                masked: account?.aiKeys?.anthropicKey || "",
+                required: false,
+                link: "https://console.anthropic.com/",
               },
             ].map(({ label, field, placeholder, configured, masked, required, link }) => (
               <div key={field}>

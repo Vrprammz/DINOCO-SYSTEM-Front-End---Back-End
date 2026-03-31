@@ -59,11 +59,13 @@ export async function GET() {
         sambaNovaKey: maskSecret(account.aiKeys?.sambaNovaKey),
         cerebrasKey: maskSecret(account.aiKeys?.cerebrasKey),
         googleKey: maskSecret(account.aiKeys?.googleKey),
+        anthropicKey: maskSecret(account.aiKeys?.anthropicKey),
         openrouterKeyConfigured: !!account.aiKeys?.openrouterKey,
         groqKeyConfigured: !!account.aiKeys?.groqKey,
         sambaNovaKeyConfigured: !!account.aiKeys?.sambaNovaKey,
         cerebrasKeyConfigured: !!account.aiKeys?.cerebrasKey,
         googleKeyConfigured: !!account.aiKeys?.googleKey,
+        anthropicKeyConfigured: !!account.aiKeys?.anthropicKey,
       },
       lineConfig: {
         channelAccessToken: maskSecret(account.lineConfig?.channelAccessToken),
