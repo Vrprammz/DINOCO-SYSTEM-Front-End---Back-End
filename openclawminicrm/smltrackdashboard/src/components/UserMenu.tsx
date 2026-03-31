@@ -22,12 +22,9 @@ export default function UserMenu() {
 
   if (!session) {
     return (
-      <button
-        onClick={() => signIn("google")}
-        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg transition font-medium"
-      >
-        เข้าสู่ระบบ
-      </button>
+      <span className="px-3 py-1.5 text-xs theme-text-secondary">
+        🔒 Admin
+      </span>
     );
   }
 

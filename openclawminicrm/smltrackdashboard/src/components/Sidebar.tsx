@@ -144,13 +144,11 @@ function UserSection({ compact = false }: { compact?: boolean }) {
   }
 
   if (!session) {
+    // Nginx Basic Auth mode — แสดงชื่อ DINOCO Admin แทนปุ่ม login
     return (
-      <button
-        onClick={() => signIn("google")}
-        className="w-full px-4 py-2.5 gradient-bg text-white text-sm rounded-xl transition font-medium text-center hover:opacity-90"
-      >
-        เข้าสู่ระบบ
-      </button>
+      <div className="w-full px-4 py-2.5 text-sm theme-text-secondary text-center">
+        🔒 DINOCO Admin
+      </div>
     );
   }
 
