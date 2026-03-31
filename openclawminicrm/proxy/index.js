@@ -6704,7 +6704,20 @@ async function ensureLeadIndexes() {
     await leads.createIndex({ dealerId: 1, status: 1 });
     await leads.createIndex({ sourceId: 1 });
     await leads.createIndex({ closedAt: 1, status: 1 });
-    console.log("[DB] Lead indexes created");
+    await leads.createIndex({ platform: 1, createdAt: -1 });
+    await leads.createIndex({ windowExpiresAt: 1, closingSoonSent: 1 }); // CLOSING_SOON cron
+    await leads.createIndex({ createdAt: -1 }); // weekly SLA aggregation
+
+    // KB Suggestions
+    const kbSugg = db.collection("kb_suggestions");
+    await kbSugg.createIndex({ normalizedQuestion: 1 }, { unique: true });
+    await kbSugg.createIndex({ frequency: -1, lastAskedAt: -1 });
+    await kbSugg.createIndex({ status: 1, frequency: -1 });
+
+    // Dealer SLA Reports
+    await db.collection("dealer_sla_reports").createIndex({ weekOf: -1 });
+
+    console.log("[DB] Lead + KB + SLA indexes created");
   } catch (e) { console.error("[DB] Lead index error:", e.message); }
 }
 
