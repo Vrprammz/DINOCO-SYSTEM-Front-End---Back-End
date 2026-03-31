@@ -6047,117 +6047,115 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
   // ถ้ายังไม่มี claim → เริ่มใหม่
   if (!claim) {
     claim = await startClaimFlow(sourceId, platform, customerName);
-    return "เสียใจด้วยค่ะ 😔 ส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยได้ไหมคะ?";
+    return "รับทราบค่ะ ขอรบกวนส่ง 2 รูปให้หน่อยนะคะ:\n1. 📸 รูปสินค้าที่ชำรุด\n2. 📋 รูปบัตรรับประกัน\n\nส่งมาได้เลยค่ะ";
   }
 
   switch (claim.status) {
     case "photo_requested": {
       if (imageUrl) {
-        // ได้รูปแล้ว → ดาวน์โหลด + Vision AI วิเคราะห์
-        let aiDesc = "";
-        try {
-          if (typeof analyzeImage === "function") {
-            let imgBuffer = null;
-            if (imageUrl.startsWith("data:")) {
-              imgBuffer = Buffer.from(imageUrl.split(",")[1], "base64");
-            } else if (imageUrl.startsWith("http")) {
-              // ดาวน์โหลดรูปจาก FB/IG URL
-              const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
-              if (imgRes.ok) imgBuffer = Buffer.from(await imgRes.arrayBuffer());
-            }
-            if (imgBuffer) aiDesc = await analyzeImage(imgBuffer).catch(() => "");
-          }
-        } catch (e) { console.error("[Claim] Vision AI error:", e.message); }
-
+        // เก็บรูป (รับหลายรูปได้)
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { status: "photo_received", aiAnalysis: aiDesc, updatedAt: new Date() },
+          $set: { updatedAt: new Date() },
           $push: { photos: imageUrl },
         });
 
-        // ถามข้อมูลเพิ่ม ทีละข้อ (conversational)
-        return `ได้รูปแล้วค่ะ ขอบคุณนะคะ 📸\n${aiDesc ? `ดูเหมือน: ${aiDesc}\n` : ""}สินค้ารุ่นอะไรคะ?`;
+        const photoCount = (claim.photos?.length || 0) + 1;
+        if (photoCount < 2) {
+          return `ได้รูปที่ ${photoCount} แล้วค่ะ ส่งรูปเพิ่มได้อีกนะคะ\nพอครบแล้วพิมพ์ "ครบแล้ว" ค่ะ`;
+        }
+
+        // ได้ 2+ รูปแล้ว → ไป step ถัดไป
+        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+          $set: { status: "photo_received", updatedAt: new Date() },
+        });
+        return "ได้รูปครบแล้วค่ะ ขอบคุณนะคะ 📸\nสินค้ารุ่นอะไรคะ?";
       }
-      return "ช่วยส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยนะคะ 📸";
+      // ลูกค้าพิมพ์ "ครบแล้ว" → ไป step ถัดไป
+      if (text && /ครบ|พอ|เสร็จ|หมด/i.test(text) && claim.photos?.length > 0) {
+        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+          $set: { status: "photo_received", updatedAt: new Date() },
+        });
+        return "ขอบคุณค่ะ 📸\nสินค้ารุ่นอะไรคะ?";
+      }
+      return "รบกวนส่งรูปสินค้าที่ชำรุด + รูปบัตรรับประกันให้หน่อยนะคะ 📸";
     }
 
     case "photo_received": {
+      // ลูกค้าส่งรูปเพิ่ม → เก็บ
+      if (imageUrl) {
+        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+          $push: { photos: imageUrl }, $set: { updatedAt: new Date() },
+        });
+        return "ได้รูปเพิ่มแล้วค่ะ สินค้ารุ่นอะไรคะ?";
+      }
       // รอชื่อสินค้า
       if (text && text.length > 1) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { product: text, status: "info_collecting", updatedAt: new Date() },
         });
-        return "ซื้อจากร้านไหนคะ? เมื่อไหร่?";
+        return "ซื้อจากร้านไหนคะ? ประมาณเมื่อไหร่?";
       }
       return "สินค้ารุ่นอะไรคะ?";
     }
 
     case "info_collecting": {
-      // ถาม serial / อาการ / ร้าน
+      // Step 1: ร้านที่ซื้อ
       if (!claim.symptoms && text) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { symptoms: text, updatedAt: new Date() },
         });
-        return "มี serial number ไหมคะ? (ดูที่ฉลากใต้สินค้า) ถ้าไม่มีพิมพ์ 'ไม่มี' ได้ค่ะ";
+        return "อาการเป็นยังไงคะ? (เช่น สติ๊กเกอร์ลอก, มุมแตก, กุญแจหาย)";
       }
 
-      if (claim.symptoms && !claim.serial && text) {
-        const serial = text === "ไม่มี" ? "N/A" : text;
-        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { serial, updatedAt: new Date() },
-        });
-
-        // เช็คประกัน (ถ้ามี serial)
-        let warrantyInfo = "";
-        if (serial !== "N/A") {
-          const wResult = await callDinocoAPI("/warranty-check", { serial });
-          if (typeof wResult !== "string" && wResult?.found) {
-            const w = wResult.warranties[0];
-            warrantyInfo = w.is_expired ? "\n⚠️ สินค้าหมดประกันแล้วค่ะ" : "\n✅ สินค้ายังอยู่ในประกันค่ะ";
-          }
-        }
-
-        return `ขอเบอร์โทรติดต่อกลับหน่อยนะคะ${warrantyInfo}`;
-      }
-
-      if (claim.symptoms && claim.serial && !claim.phone && text) {
-        const phone = text.replace(/[^0-9]/g, "");
-        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { phone, status: "info_collected", updatedAt: new Date() },
-        });
-
-        // สร้าง claim ใน WordPress
-        const wpResult = await callDinocoAPI("/claim-manual-create", {
-          serial: claim.serial,
-          product: claim.product,
-          symptoms: claim.symptoms,
-          customer_name: claim.customerName,
-          phone,
-          photos: claim.photos,
-          platform,
-          source_id: sourceId,
-          initiated_by: "customer",
-          ai_analysis: claim.aiAnalysis || "",
-        });
-
-        if (typeof wpResult !== "string" && wpResult?.success) {
+      // Step 2: อาการ → ถามเบอร์โทร (ไม่ถาม serial — ดูจากรูปบัตรรับประกันแทน)
+      if (claim.symptoms && !claim.phone && text) {
+        // เช็คว่าเป็นเบอร์โทรไหม
+        const phoneMatch = text.replace(/[^0-9]/g, "");
+        if (phoneMatch.length >= 9) {
+          // เป็นเบอร์โทร → จบ flow
           await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-            $set: { wpClaimId: wpResult.claim_id, wpTicketNumber: wpResult.ticket_number, updatedAt: new Date() },
+            $set: { phone: phoneMatch, serial: "ดูจากรูปบัตรรับประกัน", status: "info_collected", updatedAt: new Date() },
           });
-          return `ส่งเรื่องให้ทีมงานตรวจสอบแล้วค่ะ ✅\nใบเคลม: ${wpResult.ticket_number}\nจะแจ้งผลภายใน 1-2 วันทำการค่ะ 🙏`;
+
+          // สร้าง claim ใน WordPress
+          const wpResult = await callDinocoAPI("/claim-manual-create", {
+            serial: "ดูจากรูปบัตรรับประกัน",
+            product: claim.product,
+            symptoms: `${claim.symptoms} | อาการ: ${text}`,
+            customer_name: claim.customerName,
+            phone: phoneMatch,
+            photos: claim.photos,
+            platform,
+            source_id: sourceId,
+            initiated_by: "customer",
+            ai_analysis: "",
+          });
+
+          if (typeof wpResult !== "string" && wpResult?.success) {
+            await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+              $set: { wpClaimId: wpResult.claim_id, wpTicketNumber: wpResult.ticket_number, updatedAt: new Date() },
+            });
+            return `รับเรื่องเคลมแล้วค่ะ ✅\nใบเคลม: ${wpResult.ticket_number}\nทีมงานจะตรวจสอบรูปภาพและติดต่อกลับภายใน 1-2 วันทำการค่ะ`;
+          }
+          return "รับเรื่องเคลมแล้วค่ะ ✅ ทีมงานจะตรวจสอบและติดต่อกลับเร็วที่สุดค่ะ";
         }
 
-        return "ส่งเรื่องให้ทีมงาน DINOCO ตรวจสอบแล้วค่ะ จะแจ้งผลเร็วที่สุดนะคะ 🙏";
+        // ไม่ใช่เบอร์ → เก็บเป็นอาการเพิ่มเติม
+        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+          $set: { symptoms: claim.symptoms + " | " + text, updatedAt: new Date() },
+        });
+        return "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
       }
 
-      return "ขอข้อมูลเพิ่มหน่อยนะคะ อาการเป็นยังไงคะ?";
+      return "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
     }
 
     case "info_collected": {
-      return `เรื่องของพี่อยู่ระหว่างตรวจสอบค่ะ${claim.wpTicketNumber ? " (ใบเคลม: " + claim.wpTicketNumber + ")" : ""}\nจะแจ้งผลเร็วที่สุดนะคะ 🙏`;
+      return `เรื่องเคลมของพี่อยู่ระหว่างตรวจสอบค่ะ${claim.wpTicketNumber ? " (ใบเคลม: " + claim.wpTicketNumber + ")" : ""}\nทีมงานจะติดต่อกลับเร็วที่สุดค่ะ`;
     }
 
     default:
-      return `เรื่องเคลมของพี่สถานะ: ${claim.status} ค่ะ${claim.wpTicketNumber ? "\nใบเคลม: " + claim.wpTicketNumber : ""}`;
+      return `เรื่องเคลมของพี่สถานะ: ${claim.status} ค่ะ${claim.wpTicketNumber ? "\nใบเคลม: " + claim.wpTicketNumber : ""}\nสอบถามเพิ่มเติมได้ค่ะ`;
   }
 }
 
@@ -6470,6 +6468,142 @@ async function sendDealerContactOptions(recipientId, platform, dealerName) {
         message: { text, quick_replies: quickReplies },
       }),
     }).catch(() => {});
+  }
+}
+
+// =====================================================================
+// [DINOCO] Lead Pipeline Cron Endpoints (V.1.0)
+// OpenClaw jobs.json เรียก endpoints นี้ทุก 30 นาที - 1 สัปดาห์
+// =====================================================================
+
+// POST /api/leads/cron/:type — Trigger specific follow-up type
+app.post("/api/leads/cron/:type", requireAuth, async (req, res) => {
+  const { type } = req.params;
+  const validTypes = ["first-check", "contact-recheck", "delivery-check", "install-check", "30day-check", "dormant-cleanup", "dealer-sla-weekly"];
+  if (!validTypes.includes(type)) return res.status(400).json({ error: "Invalid cron type", valid: validTypes });
+
+  try {
+    const result = await runLeadCronByType(type);
+    res.json({ ok: true, type, ...result });
+  } catch (e) {
+    console.error(`[Mayom Cron] ${type} error:`, e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function runLeadCronByType(type) {
+  const db = await getDB();
+  if (!db) return { processed: 0, message: "DB not available" };
+  const now = new Date();
+
+  switch (type) {
+    case "first-check": {
+      const leads = await db.collection("leads").find({
+        nextFollowUpAt: { $lte: now }, nextFollowUpType: "first_check",
+        closedAt: null, status: { $nin: ["closed_satisfied", "closed_lost", "closed_cancelled", "dormant"] },
+      }).limit(20).toArray();
+      for (const lead of leads) { await processFollowUp(lead).catch(e => console.error(`[Mayom] first-check ${lead._id}:`, e.message)); }
+      return { processed: leads.length, type: "first_check" };
+    }
+
+    case "contact-recheck": {
+      const leads = await db.collection("leads").find({
+        nextFollowUpAt: { $lte: now }, nextFollowUpType: "contact_recheck",
+        closedAt: null, status: { $nin: ["closed_satisfied", "closed_lost", "closed_cancelled", "dormant"] },
+      }).limit(20).toArray();
+      for (const lead of leads) { await processFollowUp(lead).catch(e => console.error(`[Mayom] contact-recheck ${lead._id}:`, e.message)); }
+      return { processed: leads.length, type: "contact_recheck" };
+    }
+
+    case "delivery-check": {
+      const leads = await db.collection("leads").find({
+        nextFollowUpAt: { $lte: now }, nextFollowUpType: "delivery_check",
+        closedAt: null, status: { $nin: ["closed_satisfied", "closed_lost", "closed_cancelled", "dormant"] },
+      }).limit(20).toArray();
+      for (const lead of leads) { await processFollowUp(lead).catch(e => console.error(`[Mayom] delivery-check ${lead._id}:`, e.message)); }
+      return { processed: leads.length, type: "delivery_check" };
+    }
+
+    case "install-check": {
+      const leads = await db.collection("leads").find({
+        nextFollowUpAt: { $lte: now }, nextFollowUpType: "install_check",
+        closedAt: null, status: { $nin: ["closed_satisfied", "closed_lost", "closed_cancelled", "dormant"] },
+      }).limit(20).toArray();
+      for (const lead of leads) { await processFollowUp(lead).catch(e => console.error(`[Mayom] install-check ${lead._id}:`, e.message)); }
+      return { processed: leads.length, type: "install_check" };
+    }
+
+    case "30day-check": {
+      const leads = await db.collection("leads").find({
+        nextFollowUpAt: { $lte: now }, nextFollowUpType: "satisfaction_check",
+        closedAt: null, status: { $nin: ["closed_satisfied", "closed_lost", "closed_cancelled", "dormant"] },
+      }).limit(50).toArray();
+      for (const lead of leads) { await processFollowUp(lead).catch(e => console.error(`[Mayom] 30day-check ${lead._id}:`, e.message)); }
+      return { processed: leads.length, type: "satisfaction_check" };
+    }
+
+    case "dormant-cleanup": {
+      // Leads ที่ไม่มี activity > 14 วัน + ไม่ closed → mark dormant
+      const cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+      const result = await db.collection("leads").updateMany(
+        {
+          closedAt: null,
+          updatedAt: { $lt: cutoff },
+          status: { $nin: ["closed_satisfied", "closed_lost", "closed_cancelled", "dormant", "order_placed", "waiting_delivery", "delivered", "installed"] },
+        },
+        { $set: { status: "dormant", updatedAt: now, dormantReason: "no_activity_14d" } }
+      );
+      // Leads ที่ closed > 90 วัน → ลบ PII (PDPA retention)
+      const retentionCutoff = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+      const purged = await db.collection("leads").updateMany(
+        { closedAt: { $lt: retentionCutoff } },
+        { $set: { customerName: "[ลบแล้ว]", phone: null, lineId: null, otnToken: null, purgedAt: now } }
+      );
+      console.log(`[Mayom] Dormant cleanup: ${result.modifiedCount} dormant, ${purged.modifiedCount} PII purged`);
+      return { dormant: result.modifiedCount, purged: purged.modifiedCount };
+    }
+
+    case "dealer-sla-weekly": {
+      // สรุป SLA ตัวแทน: avg response time, conversion rate, total leads
+      const pipeline = [
+        { $match: { createdAt: { $gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) } } },
+        { $group: {
+          _id: "$dealerId",
+          dealerName: { $first: "$dealerName" },
+          totalLeads: { $sum: 1 },
+          contacted: { $sum: { $cond: [{ $in: ["$status", ["dealer_contacted", "waiting_order", "order_placed", "waiting_delivery", "delivered", "installed", "closed_satisfied"]] }, 1, 0] } },
+          noResponse: { $sum: { $cond: [{ $eq: ["$status", "dealer_no_response"] }, 1, 0] } },
+          closed: { $sum: { $cond: [{ $in: ["$status", ["closed_satisfied", "closed_lost", "closed_cancelled"]] }, 1, 0] } },
+          satisfied: { $sum: { $cond: [{ $eq: ["$status", "closed_satisfied"] }, 1, 0] } },
+        }},
+        { $addFields: {
+          contactRate: { $cond: [{ $gt: ["$totalLeads", 0] }, { $divide: ["$contacted", "$totalLeads"] }, 0] },
+          satisfactionRate: { $cond: [{ $gt: ["$closed", 0] }, { $divide: ["$satisfied", "$closed"] }, 0] },
+        }},
+        { $sort: { contactRate: 1 } }, // worst first
+      ];
+      const slaReport = await db.collection("leads").aggregate(pipeline).toArray();
+
+      // เก็บ report ลง MongoDB
+      await db.collection("dealer_sla_reports").insertOne({
+        weekOf: now, report: slaReport, createdAt: now,
+      });
+
+      // Alert ตัวแทนที่ไม่ติดต่อลูกค้า
+      const badDealers = slaReport.filter(d => d.noResponse > 0);
+      if (badDealers.length > 0) {
+        const alertMsg = `📊 สรุป SLA สัปดาห์นี้\n\n⚠️ ตัวแทนที่ยังไม่ติดต่อลูกค้า:\n${badDealers.map(d => `• ${d.dealerName || d._id}: ${d.noResponse} ราย ไม่ตอบ / ${d.totalLeads} ราย`).join("\n")}`;
+        await db.collection("alerts").insertOne({
+          type: "dealer_sla_weekly", message: alertMsg,
+          level: "yellow", read: false, createdAt: now,
+        });
+      }
+      console.log(`[Mayom] Dealer SLA weekly: ${slaReport.length} dealers analyzed`);
+      return { dealers: slaReport.length, badDealers: badDealers.length, report: slaReport };
+    }
+
+    default:
+      return { processed: 0, message: "Unknown type" };
   }
 }
 
