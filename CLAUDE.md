@@ -81,17 +81,21 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **B2F Architecture**: Bot เดียว routing ตาม `group_id` — Distributor→B2B Flex, Maker→B2F Flex, Admin→ทั้งหมด (carousel 3 หน้า). B2F routing อยู่ใน B2B Snippet 2 (function_exists guard). B2F functions อยู่ใน Snippet 3.
 - **B2F Credit System**: Atomic payable operations via `b2f_payable_add/subtract()` ใน Snippet 7. ใช้ `FOR UPDATE` lock เหมือน B2B Debt System. `b2f_recalculate_payable()` เป็น single-SQL source of truth. ทิศทางกลับจาก B2B (DINOCO เป็นหนี้ Maker). Auto credit hold เมื่อเลยวงเงิน (reason=auto), Admin hold เอง (reason=manual).
 - **B2F FSM**: `B2F_Order_FSM` class ใน Snippet 6. 12 statuses: draft→submitted→confirmed→delivering→received→paid→completed. Terminal: completed, cancelled. ทุก transition ต้องผ่าน `b2f_transition_order()`.
-- **B2F Snippets** (DB_ID 1160-1167):
+- **B2F Snippets** (DB_ID 1160-1171):
   - Snippet 0 (1160): CPT & ACF Registration — 5 CPTs + helpers + `b2f_get_maker_by_group()` (cached 5min/1hr)
-  - Snippet 1 (1163): Core Utilities & Flex Builders — LINE push + 13 Flex templates (⚠️ `b2f_liff_url()` มีปัญหา ใช้ inline Flex แทน)
+  - Snippet 1 (1163): Core Utilities & Flex Builders — LINE push + 13 Flex templates + `b2f_liff_url()` (HMAC sig)
   - Snippet 2 (1165): REST API — 19+ endpoints namespace `/b2f/v1/` + debug endpoints (ชั่วคราว)
   - Snippet 3 (1164): Webhook Handler & Bot Commands — Maker commands + Admin B2F commands + Flex menu (self-contained)
   - Snippet 4 (1167): Maker LIFF Pages — shortcode `[b2f_maker_liff]` route `/b2f-maker/`
   - Snippet 5 (1166): Admin Dashboard Tabs — 3 shortcodes embedded ใน Admin Dashboard
   - Snippet 6 (1161): Order State Machine — `B2F_Order_FSM` class
   - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`
+  - Snippet 8 (1168): Admin LIFF E-Catalog — หน้าสั่งซื้อจาก LINE (เลือก Maker → catalog → ตะกร้า → สั่ง)
+  - Snippet 9 (1169): PO Ticket View — หน้าดูรายละเอียด PO (status timeline, items, receiving, payment, credit)
+  - Snippet 10 (1170): PO Image Generator — สร้างรูปใบสั่งซื้อ A4 ด้วย GD Library + REST `/b2f/v1/po-image`
+  - Snippet 11 (1171): Cron Jobs & Reminders — 7 cron jobs (เตือนจัดส่ง/ล่าช้า/ชำระ/Maker ไม่ตอบ/สรุปวัน/สัปดาห์/เดือน)
 - **B2F Gotchas**:
-  - `b2f_liff_url()` crash ทำให้ Flex ที่เรียกมันพังทั้ง function — ห้ามเรียกใน B2B Admin Flex, ใช้ Dashboard URL แทน
+  - `b2f_liff_url()` แก้แล้ว (V.1.2) ใช้ HMAC sig แทน JWT — B2B Admin Flex Bubble 3 ใช้ `b2b_liff_url()` ชี้ไป Admin Dashboard LIFF tab=b2f_overview
   - LINE ไม่ส่ง `mention.mentionees[].isSelf` ในบาง group — ตรวจ @mention จาก text pattern `/@DINOCO/i` แทน
   - Sync Engine ต้อง bump version เพื่อ force sync — ถ้า hash ตรง (Same) จะไม่ update แม้โค้ดจริงต่างกัน (เกิดจากสร้าง snippet ใน WP ก่อน sync)
   - Cache `b2f_get_maker_by_group()` negative result TTL 5 นาที — ถ้าเพิ่ม group_id ใน Maker แล้ว Bot เงียบ เรียก `/debug-maker/{group_id}` เพื่อ clear cache
