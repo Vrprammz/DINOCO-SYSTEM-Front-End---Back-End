@@ -102,7 +102,7 @@ add_action( 'rest_api_init', function () {
     register_rest_route('b2b/v1','/flash-cancel',         array('methods'=>'POST','callback'=>'b2b_rest_flash_cancel','permission_callback'=>$ap));
     register_rest_route('b2b/v1','/flash-cancel-notify',  array('methods'=>'POST','callback'=>'b2b_rest_flash_cancel_notify','permission_callback'=>$ap));
     register_rest_route('b2b/v1','/flash-switch-manual',  array('methods'=>'POST','callback'=>'b2b_rest_flash_switch_manual','permission_callback'=>$ap));
-    // Debug: Flash tracking (ชั่วคราว — ลบหลัง debug)
+    // Debug: Flash tracking + force update (ชั่วคราว — ลบหลัง debug)
     register_rest_route('b2b/v1','/debug-flash/(?P<ticket_id>\d+)', array('methods'=>'GET','permission_callback'=>'__return_true',
         'callback'=>function( WP_REST_Request $req ) {
             $tid = intval($req->get_param('ticket_id'));
@@ -111,34 +111,57 @@ add_action( 'rest_api_init', function () {
 
             $pno = get_field('tracking_number',$tid) ?: '';
             $result = array(
-                'ticket_id'       => $tid,
-                'order_status'    => get_field('order_status',$tid),
-                'flash_packing'   => get_post_meta($tid,'_flash_packing_status',true),
-                'tracking'        => $pno,
-                'flash_pno'       => get_post_meta($tid,'_flash_pno_statuses',true),
-                'cron_scheduled'  => wp_next_scheduled('b2b_flash_tracking_cron') ? date('Y-m-d H:i:s',wp_next_scheduled('b2b_flash_tracking_cron')) : 'NOT SCHEDULED',
+                'ticket_id'   => $tid,
+                'order_status'=> get_field('order_status',$tid),
+                'flash_packing'=> get_post_meta($tid,'_flash_packing_status',true),
+                'tracking'    => $pno,
             );
 
-            // Force schedule cron ถ้ายังไม่ schedule
-            if (!wp_next_scheduled('b2b_flash_tracking_cron')) {
-                wp_schedule_event(time()+60, 'every_2hr_b2b', 'b2b_flash_tracking_cron');
-                $result['cron_fix'] = 'SCHEDULED NOW (next in 60s)';
-            }
-
-            // ดึง Flash Routes API โดยตรงสำหรับ PNO นี้
+            // ดึง Flash Routes API + UPDATE สถานะจริง
             if ($pno && function_exists('b2b_flash_get_routes')) {
                 $routes = b2b_flash_get_routes($pno);
-                $result['flash_api_routes'] = is_wp_error($routes) ? $routes->get_error_message() : $routes;
-            } elseif ($pno && function_exists('b2b_flash_api_call')) {
-                // Fallback: เรียก routes API ตรง
-                $routes = b2b_flash_api_call('open/v1/routes/'.$pno, 'GET');
-                $result['flash_api_routes'] = is_wp_error($routes) ? $routes->get_error_message() : $routes;
+                if (!is_wp_error($routes) && isset($routes['data']['state'])) {
+                    $flash_state = intval($routes['data']['state']);
+                    $state_map = array(1=>'picked_up',2=>'in_transit',3=>'delivering',4=>'detained',5=>'delivered',6=>'problem',7=>'returned',8=>'cancelled');
+                    $new_packing = isset($state_map[$flash_state]) ? $state_map[$flash_state] : 'unknown_'.$flash_state;
+
+                    // Update meta
+                    update_post_meta($tid, '_flash_packing_status', $new_packing);
+                    update_post_meta($tid, '_flash_status', $new_packing);
+
+                    // Update PNO statuses
+                    $pno_data = get_post_meta($tid, '_flash_pno_statuses', true) ?: array();
+                    if (isset($pno_data[$pno])) {
+                        $pno_data[$pno]['status'] = $new_packing;
+                    }
+                    update_post_meta($tid, '_flash_pno_statuses', $pno_data);
+
+                    // Update order_status ถ้า shipped/completed
+                    $order_status = get_field('order_status', $tid);
+                    if ($flash_state >= 1 && $order_status === 'packed') {
+                        update_field('order_status', 'shipped', $tid);
+                        $result['order_status_updated'] = 'packed → shipped';
+                    }
+                    if ($flash_state === 5 && in_array($order_status, array('packed','shipped'))) {
+                        update_field('order_status', 'completed', $tid);
+                        $result['order_status_updated'] = $order_status.' → completed';
+                    }
+
+                    $result['flash_state'] = $flash_state;
+                    $result['flash_state_text'] = $routes['data']['stateText'] ?? '';
+                    $result['updated_packing'] = $new_packing;
+                    $result['routes_count'] = count($routes['data']['routes'] ?? array());
+                }
+                $result['flash_api'] = 'OK';
             } else {
-                $result['flash_api'] = 'no flash function available';
-                // List available b2b_flash functions
-                $fns = array('b2b_flash_get_routes','b2b_flash_api_call','b2b_flash_create_order','b2b_flash_get_webhook_info','b2b_run_flash_tracking_fallback');
-                foreach ($fns as $fn) $result['fn_'.$fn] = function_exists($fn);
+                $result['flash_api'] = 'function not available or API error';
             }
+
+            // Re-read after update
+            $result['after'] = array(
+                'order_status' => get_field('order_status',$tid),
+                'flash_packing'=> get_post_meta($tid,'_flash_packing_status',true),
+            );
 
             return rest_ensure_response($result);
         }));
