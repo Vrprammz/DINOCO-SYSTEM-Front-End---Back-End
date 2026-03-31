@@ -2928,16 +2928,28 @@ app.post("/webhook/meta", express.raw({ type: "*/*" }), async (req, res) => {
         analyzeChat(sourceId, userName, msgText, senderId, { type: "user" }).catch((e) => console.error("[Meta/Skill] Catch:", e.message))
         learnFromMessage(sourceId, userName, msgText, "text", "user").catch(() => {})
 
-        // น้องกุ้งตอบแทนใน Facebook/Instagram (Send API — ฟรี!)
+        // [DINOCO] เช็ค claim intent ก่อน AI reply
         const metaIsOptedOut = await checkOptedOut(sourceId).catch(() => false);
         if (!metaIsOptedOut) {
-          const metaConfig = await getBotConfig(sourceId)
-          const metaShouldReply = await shouldAiReply(metaConfig, msgText, userName, { type: "user" })
-          if (metaShouldReply) {
-            console.log(`[AI-Reply] น้องกุ้งตอบแทน → ${platform} ${sourceId.substring(0, 12)}`)
-            aiReplyToMeta(senderId, msgText, sourceId, platform).catch((e) =>
-              console.error(`[AI-Reply] ${platform} error:`, e.message)
-            )
+          // เช็คว่ามี active claim session หรือเป็นเรื่องเคลมไหม
+          const activeClaim = await getClaimSession(sourceId).catch(() => null);
+          if (activeClaim || isClaimIntent(msgText)) {
+            console.log(`[Claim] ${activeClaim ? "Continuing" : "New"} claim: ${msgText.substring(0, 50)}`);
+            const claimReply = await processClaimMessage(sourceId, platform, msgText, null, userName);
+            if (claimReply) {
+              await sendMetaMessage(senderId, claimReply);
+              await saveMsg(sourceId, { role: "assistant", userName: DEFAULT_BOT_NAME, content: claimReply, messageType: "text", isAiReply: true }, platform);
+            }
+          } else {
+            // AI ตอบปกติ
+            const metaConfig = await getBotConfig(sourceId)
+            const metaShouldReply = await shouldAiReply(metaConfig, msgText, userName, { type: "user" })
+            if (metaShouldReply) {
+              console.log(`[AI-Reply] DINOCO AI ตอบ → ${platform} ${sourceId.substring(0, 12)}`)
+              aiReplyToMeta(senderId, msgText, sourceId, platform).catch((e) =>
+                console.error(`[AI-Reply] ${platform} error:`, e.message)
+              )
+            }
           }
         }
       }
