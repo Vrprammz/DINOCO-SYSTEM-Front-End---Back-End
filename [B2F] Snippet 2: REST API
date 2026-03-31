@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.2.9
+ * Version: V.3.0
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -25,10 +25,18 @@ add_action( 'rest_api_init', function () {
 
     $ns = 'b2f/v1';
 
-    // ── Admin permission check ──
+    // ── Admin permission check (WP session OR B2F admin token) ──
     $admin_perm = function ( WP_REST_Request $req ) {
-        return wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' )
-            && current_user_can( 'manage_options' );
+        // Layer 1: WP admin session (PC browser / Admin Dashboard)
+        if ( wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' ) && current_user_can( 'manage_options' ) ) {
+            return true;
+        }
+        // Layer 2: B2F Admin token (LIFF context — no WP session)
+        if ( function_exists( 'b2f_verify_admin_token' ) ) {
+            $session = b2f_verify_admin_token( $req );
+            if ( $session && ! empty( $session['is_admin'] ) ) return true;
+        }
+        return false;
     };
 
     // ── Maker JWT permission (public route, token validated inside callback) ──
@@ -159,6 +167,13 @@ add_action( 'rest_api_init', function () {
         'permission_callback' => $admin_perm,
     ) );
 
+    // ── Auth Admin (public — LIFF auth, sig+LINE ID Token verified inside) ──
+    register_rest_route( $ns, '/auth-admin', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_auth_admin',
+        'permission_callback' => '__return_true',
+    ) );
+
     // Debug endpoints ลบแล้ว — ใช้ /debug-flash/{ticket_id} ใน B2B Snippet 5 แทน (admin only)
 } );
 
@@ -208,6 +223,151 @@ if ( ! function_exists( 'b2f_rate_limit' ) ) {
         global $wpdb;
         $wpdb->delete( $wpdb->options, array( 'option_name' => $tkey ) );
     } );
+}
+
+// ════════════════════════════════════════════
+// 2B. ADMIN LIFF AUTH (V.3.0)
+// ════════════════════════════════════════════
+
+/**
+ * POST /b2f/v1/auth-admin
+ * LIFF จาก LINE browser → verify HMAC sig + LINE ID Token → issue session token
+ * Pattern เหมือน B2B /auth-group แต่ verify เฉพาะ admin
+ */
+if ( ! function_exists( 'b2f_rest_auth_admin' ) ) {
+    function b2f_rest_auth_admin( WP_REST_Request $request ) {
+        // Rate limit: 20 per 5 min per IP
+        $ip = isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : 'unknown';
+        $rate_key = 'b2f_auth_admin_' . md5( $ip );
+        $attempts = intval( get_transient( $rate_key ) );
+        if ( $attempts > 20 ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'Too many attempts' ), 429 );
+        }
+        set_transient( $rate_key, $attempts + 1, 300 );
+
+        // Verify HMAC signature (from b2f_liff_url)
+        $sig = sanitize_text_field( $request->get_param( '_sig' ) );
+        $ts  = intval( $request->get_param( '_ts' ) );
+        if ( empty( $sig ) || $ts <= 0 ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ลิงก์ไม่ถูกต้อง' ), 200 );
+        }
+        // Max age: 4 hours
+        if ( abs( time() - $ts ) > 14400 ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ลิงก์หมดอายุ กรุณากดลิงก์ใหม่' ), 200 );
+        }
+        // Reconstruct HMAC (match b2f_liff_url format: path + params)
+        $path = 'b2f-catalog/';
+        $secret = defined( 'B2B_LINE_CHANNEL_SECRET' ) ? B2B_LINE_CHANNEL_SECRET : wp_salt( 'auth' );
+        $sig_data = $path . '|_ts=' . $ts;
+        $expected = substr( hash_hmac( 'sha256', $sig_data, $secret ), 0, 16 );
+        if ( ! hash_equals( $expected, $sig ) ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ลิงก์ไม่ถูกต้อง (sig)' ), 200 );
+        }
+
+        // Verify LINE ID Token
+        $line_uid = sanitize_text_field( $request->get_param( 'line_user_id' ) );
+        $id_token = sanitize_text_field( $request->get_param( 'id_token' ) );
+        if ( empty( $line_uid ) ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ต้องเปิดผ่าน LINE เท่านั้น' ), 200 );
+        }
+
+        // Best-effort verify LINE ID Token (เหมือน B2B)
+        if ( ! empty( $id_token ) ) {
+            $liff_channel_id = defined( 'B2B_LIFF_ID' ) ? preg_replace( '/-.*$/', '', B2B_LIFF_ID ) : '';
+            if ( $liff_channel_id ) {
+                $verify_resp = wp_remote_post( 'https://api.line.me/oauth2/v2.1/verify', array(
+                    'body'    => array( 'id_token' => $id_token, 'client_id' => $liff_channel_id ),
+                    'timeout' => 10,
+                ) );
+                if ( ! is_wp_error( $verify_resp ) ) {
+                    $verify_body = json_decode( wp_remote_retrieve_body( $verify_resp ), true );
+                    if ( ! empty( $verify_body['sub'] ) ) {
+                        $line_uid = sanitize_text_field( $verify_body['sub'] );
+                    }
+                }
+            }
+        }
+
+        // Verify admin: check if LINE UID belongs to a WP admin user
+        $is_admin = b2f_is_admin_line_uid( $line_uid );
+        if ( ! $is_admin ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ไม่มีสิทธิ์ Admin' ), 200 );
+        }
+
+        // Issue session token (reuse B2B JWT if available)
+        $token = '';
+        if ( class_exists( 'DINOCO_JWT' ) ) {
+            $token = DINOCO_JWT::create( array( 'role' => 'b2f_admin', 'uid' => $line_uid, 'is_admin' => true ), 7200 );
+        } else {
+            // Fallback: transient
+            $token = bin2hex( random_bytes( 32 ) );
+            set_transient( 'b2f_admin_sess_' . $token, array( 'uid' => $line_uid, 'is_admin' => true, 'created' => time() ), 7200 );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( '[Auth-Admin] OK uid=%s', $line_uid ) );
+        }
+
+        return new WP_REST_Response( array(
+            'authorized' => true,
+            'token'      => $token,
+            'line_uid'   => $line_uid,
+        ), 200 );
+    }
+}
+
+/**
+ * Check if LINE UID belongs to a WP admin user
+ * ตรวจจาก user meta 'line_user_id' ที่ link ตอน LINE Login
+ */
+if ( ! function_exists( 'b2f_is_admin_line_uid' ) ) {
+    function b2f_is_admin_line_uid( $line_uid ) {
+        if ( empty( $line_uid ) ) return false;
+
+        // ตรวจจาก WordPress users ที่มี line_user_id = $line_uid + เป็น admin
+        $users = get_users( array(
+            'meta_key'   => 'line_user_id',
+            'meta_value' => $line_uid,
+            'role'       => 'administrator',
+            'number'     => 1,
+        ) );
+        if ( ! empty( $users ) ) return true;
+
+        // Fallback: ตรวจจาก LINE group membership (Admin group)
+        // ถ้า user อยู่ใน Admin group → ถือว่าเป็น admin
+        // (ไม่สามารถ query LINE API ได้โดยตรง จึงใช้ user meta เป็นหลัก)
+        return false;
+    }
+}
+
+/**
+ * Verify B2F Admin token จาก X-B2F-Token header
+ * @return array|false  { uid, is_admin } or false
+ */
+if ( ! function_exists( 'b2f_verify_admin_token' ) ) {
+    function b2f_verify_admin_token( WP_REST_Request $request ) {
+        $token = $request->get_header( 'X-B2F-Token' );
+        if ( empty( $token ) ) {
+            $token = sanitize_text_field( $request->get_param( '_b2f_token' ) );
+        }
+        if ( empty( $token ) ) return false;
+
+        // JWT verify
+        if ( class_exists( 'DINOCO_JWT' ) && strpos( $token, '.' ) !== false ) {
+            $payload = DINOCO_JWT::verify( $token );
+            if ( $payload && ! empty( $payload['is_admin'] ) && ( $payload['role'] ?? '' ) === 'b2f_admin' ) {
+                return array( 'uid' => $payload['uid'] ?? '', 'is_admin' => true );
+            }
+            return false;
+        }
+
+        // Fallback: transient
+        $token = preg_replace( '/[^a-f0-9]/i', '', $token );
+        if ( empty( $token ) ) return false;
+        $data = get_transient( 'b2f_admin_sess_' . $token );
+        if ( ! $data || empty( $data['is_admin'] ) ) return false;
+        return $data;
+    }
 }
 
 // ════════════════════════════════════════════

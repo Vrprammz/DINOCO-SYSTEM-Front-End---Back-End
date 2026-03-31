@@ -1,16 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 8: Admin LIFF E-Catalog                     ║
- * ║  Version: V.1.0                                             ║
+ * ║  Version: V.2.0                                             ║
  * ║  DB_ID: 1168                                                ║
  * ║  Route: /b2f-catalog/ (template_redirect, standalone HTML)  ║
- * ║  Auth: WP Admin session (current_user_can manage_options)   ║
+ * ║  Auth: LIFF + LINE UID verify (V.2.0) or WP Admin session   ║
  * ║  API: GET /b2f/v1/makers, GET /b2f/v1/maker-products/{id}, ║
  * ║       POST /b2f/v1/create-po                                ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
  * Admin สั่งซื้อจากโรงงาน (B2F) ผ่าน LINE LIFF หรือ PC browser
- * ไม่ต้อง LIFF token — ใช้ WP nonce + admin session
+ * V.2.0: LIFF auth via /b2f/v1/auth-admin + X-B2F-Token (LIFF context)
+ *         Fallback: WP nonce + admin session (PC browser)
  *
  * Kill Switch: define('B2F_DISABLED', true)
  */
@@ -25,16 +26,16 @@ add_action( 'template_redirect', function () {
         wp_die( 'ระบบปิดปรับปรุงชั่วคราว', 'B2F Disabled', array( 'response' => 503 ) );
     }
 
-    // Admin only
-    if ( ! current_user_can( 'manage_options' ) ) {
-        wp_die( 'สงวนสิทธิ์เฉพาะ Admin', 'Forbidden', array( 'response' => 403 ) );
-    }
-
+    // V.2.0: ไม่ block ที่ PHP — ปล่อยให้ LIFF auth ใน JS ตรวจแทน
+    // ถ้าเปิดจาก PC browser + WP admin session → ใช้ nonce
+    // ถ้าเปิดจาก LIFF → auth ผ่าน /b2f/v1/auth-admin → ใช้ X-B2F-Token
+    $is_wp_admin = current_user_can( 'manage_options' );
     $rest_url  = esc_url( rest_url( 'b2f/v1/' ) );
-    $nonce     = wp_create_nonce( 'wp_rest' );
+    $nonce     = $is_wp_admin ? wp_create_nonce( 'wp_rest' ) : '';
     $liff_id   = defined( 'B2F_LIFF_ID' ) ? B2F_LIFF_ID : ( defined( 'B2B_LIFF_ID' ) ? B2B_LIFF_ID : '' );
     $logo_url  = 'https://dinoco.in.th/wp-content/uploads/2026/02/logodnc.png';
     $dash_url  = esc_url( home_url( '/admin-command-center/#b2f_orders' ) );
+    $is_wp_admin_js = $is_wp_admin ? 'true' : 'false';
 
     header( 'Content-Type: text/html; charset=UTF-8' );
 ?>
@@ -368,6 +369,7 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
 <!-- Toast -->
 <div class="b2f-cat-toast" id="b2fToast"></div>
 
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 <script>
 (function(){
   'use strict';
@@ -375,12 +377,14 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
   var API   = <?php echo json_encode( $rest_url ); ?>;
   var NONCE = <?php echo json_encode( $nonce ); ?>;
   var LIFF_ID = <?php echo json_encode( $liff_id ); ?>;
+  var IS_WP_ADMIN = <?php echo $is_wp_admin_js; ?>;
 
   var makers = [];
   var products = [];
   var cart = {};
   var selectedMaker = null;
   var submitting = false;
+  var B2F_TOKEN = '';
 
   var $makerSelect = document.getElementById('b2fMakerSelect');
   var $searchWrap  = document.getElementById('b2fSearchWrap');
@@ -398,19 +402,63 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
   var $dupMsg      = document.getElementById('b2fDupMsg');
   var $success     = document.getElementById('b2fSuccess');
 
-  if (LIFF_ID) {
-    var s = document.createElement('script');
-    s.src = 'https://static.line-scdn.net/liff/edge/2/sdk.js';
-    s.onload = function() {
-      if (typeof liff !== 'undefined') liff.init({ liffId: LIFF_ID }).catch(function(){});
-    };
-    document.head.appendChild(s);
-  }
-
   function api(method, path, body) {
-    var opts = { method: method, headers: { 'Content-Type': 'application/json', 'X-WP-Nonce': NONCE }, credentials: 'same-origin' };
+    var headers = { 'Content-Type': 'application/json' };
+    var opts = { method: method, headers: headers };
+    // WP admin session → use nonce; LIFF → use B2F token
+    if (IS_WP_ADMIN && NONCE) {
+      headers['X-WP-Nonce'] = NONCE;
+      opts.credentials = 'same-origin';
+    } else if (B2F_TOKEN) {
+      headers['X-B2F-Token'] = B2F_TOKEN;
+    }
     if (body) opts.body = JSON.stringify(body);
     return fetch(API + path, opts).then(function(r) { return r.json(); });
+  }
+
+  // ── LIFF Auth Flow (V.2.0) ──
+  function initAuth() {
+    if (IS_WP_ADMIN) {
+      // PC browser with WP session — load directly
+      loadMakers();
+      return;
+    }
+    // LIFF context — authenticate via LINE
+    $productArea.innerHTML = '<div class="b2f-cat-loading"><div class="b2f-cat-spinner"></div><div style="color:var(--b2f-text-muted);font-size:13px;">กำลังยืนยันตัวตน...</div></div>';
+
+    if (!LIFF_ID) { showAuthError('ระบบยังไม่ถูกตั้งค่า LIFF ID'); return; }
+
+    liff.init({ liffId: LIFF_ID }).then(function() {
+      if (!liff.isLoggedIn()) { liff.login(); return; }
+      return liff.getProfile();
+    }).then(function(profile) {
+      if (!profile) return;
+      var lineUid = profile.userId;
+      var idToken = liff.getIDToken() || '';
+      var params = new URLSearchParams(window.location.search);
+      var sig = params.get('_sig') || '';
+      var ts = params.get('_ts') || '';
+
+      return fetch(API + 'auth-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ line_user_id: lineUid, id_token: idToken, _sig: sig, _ts: parseInt(ts) || 0 })
+      }).then(function(r) { return r.json(); });
+    }).then(function(res) {
+      if (!res) return;
+      if (res.authorized && res.token) {
+        B2F_TOKEN = res.token;
+        loadMakers();
+      } else {
+        showAuthError(res.message || 'ไม่มีสิทธิ์เข้าใช้งาน');
+      }
+    }).catch(function(e) {
+      showAuthError('ไม่สามารถยืนยันตัวตนได้: ' + (e.message || ''));
+    });
+  }
+
+  function showAuthError(msg) {
+    $productArea.innerHTML = '<div class="b2f-cat-empty"><div class="b2f-cat-empty-icon">&#128274;</div><div style="font-size:14px;font-weight:600;margin-bottom:8px;">ไม่สามารถเข้าใช้งานได้</div><div style="font-size:12px;color:var(--b2f-text-muted);">' + esc(msg) + '</div></div>';
   }
 
   function toast(msg, type) {
@@ -621,7 +669,7 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
   document.getElementById('b2fDupConfirm').addEventListener('click', function() { $dupModal.classList.remove('show'); submitOrder(true); });
   document.getElementById('b2fSuccessNew').addEventListener('click', resetCatalog);
 
-  loadMakers();
+  initAuth();
 })();
 </script>
 </body>

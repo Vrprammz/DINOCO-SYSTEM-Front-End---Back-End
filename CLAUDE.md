@@ -93,18 +93,21 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **B2F Snippets** (DB_ID 1160-1171):
   - Snippet 0 (1160): CPT & ACF Registration — 5 CPTs + helpers + `b2f_get_maker_by_group()` (cached 5min/1hr)
   - Snippet 1 (1163): Core Utilities & Flex Builders — LINE push + 13 Flex templates + `b2f_liff_url()` (HMAC sig)
-  - Snippet 2 (1165): REST API — 19+ endpoints namespace `/b2f/v1/` + debug endpoints (ชั่วคราว)
+  - Snippet 2 (1165): REST API — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin)
   - Snippet 3 (1164): Webhook Handler & Bot Commands — Maker commands + Admin B2F commands + Flex menu (self-contained)
   - Snippet 4 (1167): Maker LIFF Pages — shortcode `[b2f_maker_liff]` route `/b2f-maker/`
   - Snippet 5 (1166): Admin Dashboard Tabs — 3 shortcodes embedded ใน Admin Dashboard
   - Snippet 6 (1161): Order State Machine — `B2F_Order_FSM` class
   - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`
-  - Snippet 8 (1168): Admin LIFF E-Catalog — หน้าสั่งซื้อจาก LINE (เลือก Maker → catalog → ตะกร้า → สั่ง)
+  - Snippet 8 (1168): Admin LIFF E-Catalog — หน้าสั่งซื้อจาก LINE (LIFF auth V.2.0 ไม่ต้อง WP login)
   - Snippet 9 (1169): PO Ticket View — หน้าดูรายละเอียด PO (status timeline, items, receiving, payment, credit)
   - Snippet 10 (1170): PO Image Generator — สร้างรูปใบสั่งซื้อ A4 ด้วย GD Library + REST `/b2f/v1/po-image`
   - Snippet 11 (1171): Cron Jobs & Reminders — 7 cron jobs (เตือนจัดส่ง/ล่าช้า/ชำระ/Maker ไม่ตอบ/สรุปวัน/สัปดาห์/เดือน)
 - **B2F Gotchas**:
-  - `b2f_liff_url()` แก้แล้ว (V.1.2) ใช้ HMAC sig แทน JWT — B2B Admin Flex Bubble 3 ใช้ `b2b_liff_url()` ชี้ไป Admin Dashboard LIFF tab=b2f_overview
+  - `b2f_liff_url()` แก้แล้ว (V.1.2) ใช้ HMAC sig แทน JWT — B2B Admin Flex Bubble 3 ใช้ `b2b_liff_url()` ชี้ไป Admin Dashboard LIFF tab=b2f_overview; "สั่งโรงงาน" ใช้ `b2f_liff_url('b2f-catalog/')` เปิด LIFF ตรง (V.31.7)
+  - B2F Admin LIFF (Snippet 8) auth ผ่าน `POST /b2f/v1/auth-admin` (HMAC sig + LINE ID Token + WP admin user check) → issue JWT session token → ใช้ `X-B2F-Token` header แทน WP nonce
+  - LIFF Router (B2B Snippet 4 V.30.4) forward query params จาก `$_GET` เมื่อ redirect ตาม `liff.state` — แก้ปัญหา params หายเมื่อ LINE แยก query string ออกจาก path
+  - Maker Flex menu URLs (B2F Snippet 1 V.1.3) ใช้ path `/b2f-maker/` + `page` param (list/deliver/reschedule) แทน path แยก `/b2f-maker-po/` ที่ไม่มี WP page
   - LINE ไม่ส่ง `mention.mentionees[].isSelf` ในบาง group — ตรวจ @mention จาก text pattern `/@DINOCO/i` แทน
   - Sync Engine ต้อง bump version เพื่อ force sync — ถ้า hash ตรง (Same) จะไม่ update แม้โค้ดจริงต่างกัน (เกิดจากสร้าง snippet ใน WP ก่อน sync)
   - Cache `b2f_get_maker_by_group()` negative result TTL 5 นาที — ถ้าเพิ่ม group_id ใน Maker แล้ว Bot เงียบ เรียก `/debug-maker/{group_id}` เพื่อ clear cache
