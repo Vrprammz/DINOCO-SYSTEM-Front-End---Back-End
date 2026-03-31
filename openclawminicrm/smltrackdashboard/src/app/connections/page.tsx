@@ -71,7 +71,7 @@ export default function ConnectionsPage() {
       {/* Header */}
       <header className="border-b theme-border px-3 md:px-6 py-4 sticky top-0 theme-bg backdrop-blur z-10">
         <div className="flex items-center gap-3">
-          <Link href="/dashboard" className="theme-text-secondary hover:theme-text transition text-sm">&larr; Dashboard</Link>
+          <Link href="/" className="theme-text-secondary hover:theme-text transition text-sm">&larr; Dashboard</Link>
           <div className="w-px h-5 theme-border" />
           <div className="w-7 h-7 bg-gradient-to-br from-indigo-500 to-cyan-500 rounded-lg flex items-center justify-center text-sm">🔗</div>
           <h1 className="text-lg font-bold">เชื่อมต่อช่องทาง</h1>
@@ -147,7 +147,7 @@ export default function ConnectionsPage() {
                   {lineTesting ? "กำลังตรวจสอบ..." : "ตรวจสอบสถานะ"}
                 </button>
                 <Link
-                  href="/dashboard/settings"
+                  href="/settings"
                   className="px-4 py-2 theme-bg-card hover:theme-bg-hover border theme-border rounded-lg text-xs theme-text-secondary hover:theme-text transition"
                 >
                   แก้ไข Token
@@ -177,7 +177,7 @@ export default function ConnectionsPage() {
                 </ol>
               </div>
               <Link
-                href="/dashboard/settings"
+                href="/settings"
                 className="inline-block px-5 py-2.5 bg-green-800 hover:bg-green-700 rounded-xl text-sm font-medium text-white transition"
               >
                 ตั้งค่า LINE OA →
@@ -206,7 +206,7 @@ export default function ConnectionsPage() {
                 <p className="text-xs theme-text-muted mt-1">Page Access Token และ App Secret ถูกตั้งค่าแล้ว</p>
               </div>
               <Link
-                href="/dashboard/settings"
+                href="/settings"
                 className="inline-block px-4 py-2 theme-bg-card hover:theme-bg-hover border theme-border rounded-lg text-xs theme-text-secondary hover:theme-text transition"
               >
                 แก้ไขการตั้งค่า
@@ -216,7 +216,7 @@ export default function ConnectionsPage() {
             <div className="space-y-3">
               <p className="text-sm theme-text-secondary">ยังไม่ได้เชื่อมต่อ Facebook</p>
               <Link
-                href="/dashboard/settings"
+                href="/settings"
                 className="inline-block px-5 py-2.5 bg-blue-800 hover:bg-blue-700 rounded-xl text-sm font-medium text-white transition"
               >
                 ตั้งค่า Facebook →

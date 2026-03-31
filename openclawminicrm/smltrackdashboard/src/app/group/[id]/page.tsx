@@ -75,7 +75,7 @@ export default function GroupPage({ params }: { params: Promise<{ id: string }> 
       <header className="border-b theme-border px-3 md:px-6 py-3 sticky top-0 theme-bg z-10">
         <div className="max-w-3xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <Link href="/dashboard" className="theme-text-secondary hover:theme-text text-xl">
+            <Link href="/" className="theme-text-secondary hover:theme-text text-xl">
               &larr;
             </Link>
             <div>

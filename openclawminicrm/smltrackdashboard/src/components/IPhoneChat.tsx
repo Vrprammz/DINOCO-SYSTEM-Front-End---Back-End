@@ -383,7 +383,7 @@ export default function IPhoneChat({
             ) : templates.length === 0 ? (
               <p className="text-[10px] text-center py-3 theme-text-muted">
                 ยังไม่มี template —{" "}
-                <a href="/dashboard/templates" className="text-blue-400 underline">เพิ่มที่นี่</a>
+                <a href="/templates" className="text-blue-400 underline">เพิ่มที่นี่</a>
               </p>
             ) : (
               <div className="space-y-1.5">

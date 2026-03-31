@@ -700,7 +700,7 @@ export default function InboxPage() {
                 ) : templates.length === 0 ? (
                   <p className="text-xs text-center py-4 theme-text-muted">
                     ยังไม่มี template —{" "}
-                    <a href="/dashboard/templates" className="text-indigo-400 underline">เพิ่มที่นี่</a>
+                    <a href="/templates" className="text-indigo-400 underline">เพิ่มที่นี่</a>
                   </p>
                 ) : (
                   <div className="p-2 space-y-1">
