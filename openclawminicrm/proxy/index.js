@@ -1791,7 +1791,7 @@ async function executeTool(toolName, args, sourceId) {
       );
     }
 
-    return `สร้าง lead สำเร็จ แจ้งตัวแทน ${args.dealer_name} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${args.dealer_name} แล้วค่ะ จะติดต่อพี่กลับเร็วที่สุดนะคะ น้องกุ้งมะยมจะติดตามให้จนจบค่ะ"`;
+    return `สร้าง lead สำเร็จ แจ้งตัวแทน ${args.dealer_name} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${args.dealer_name} แล้วค่ะ จะติดต่อพี่กลับเร็วที่สุดนะคะ ${DEFAULT_BOT_NAME} จะติดตามให้จนจบค่ะ"`;
   }
   // MCP tools
   if (mcpToolHandlers[toolName]) {
@@ -2172,11 +2172,11 @@ async function shouldAiReply(config, text, userName, source) {
   // mode: auto → ตอบทุกข้อความ (ยกเว้นพนักงาน)
   if (mode === "auto") return true;
 
-  // mode: mention → ตอบเมื่อมีคำว่า "น้องกุ้ง" หรือ "น้องกุ้ง" หรือชื่อ bot
+  // mode: mention → ตอบเมื่อมีชื่อ bot หรือ "dinoco"
   if (mode === "mention") {
-    const botName = (config.botName || "น้องกุ้ง").toLowerCase();
+    const botName = (config.botName || DEFAULT_BOT_NAME).toLowerCase();
     const lower = text.toLowerCase();
-    return lower.includes(botName) || lower.includes("น้องกุ้ง") || lower.includes("น้องกุ้ง");
+    return lower.includes(botName) || lower.includes("dinoco") || lower.includes("น้องกุ้ง");
   }
 
   // mode: keyword → ตอบเมื่อมี keyword ที่กำหนด
@@ -6493,13 +6493,13 @@ async function processFollowUp(lead) {
       const method = selectFollowUpMethod(lead);
       if (method === "fb_ig_message" || method === "otn") {
         // ส่งผ่าน FB/IG (ถ้า window ยังเปิด)
-        const msg = `สวัสดีค่ะ 🙏 กุ้งมะยมจาก DINOCO ค่ะ\nตัวแทน ${lead.dealerName || "จำหน่าย"} ติดต่อพี่แล้วหรือยังคะ?`;
+        const msg = `สวัสดีค่ะ 🙏 ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ\nตัวแทน ${lead.dealerName || "จำหน่าย"} ติดต่อพี่แล้วหรือยังคะ?`;
         if (lead.platform === "facebook" || lead.platform === "instagram") {
           await sendMetaMessage(lead.sourceId, msg).catch(() => {});
         }
       } else if (method === "line" && lead.lineId) {
         // ส่งผ่าน LINE
-        const lineMsg = `สวัสดีค่ะ กุ้งมะยมจาก DINOCO ค่ะ\nตัวแทน ${lead.dealerName || ""} ติดต่อพี่แล้วหรือยังคะ?`;
+        const lineMsg = `สวัสดีค่ะ ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ\nตัวแทน ${lead.dealerName || ""} ติดต่อพี่แล้วหรือยังคะ?`;
         await sendLinePush(lead.lineId, [{ type: "text", text: lineMsg }]).catch(() => {});
       }
       // ถามตัวแทนผ่าน LINE push (via WordPress)
@@ -6540,7 +6540,7 @@ async function processFollowUp(lead) {
     case "delivery_check": {
       // ถามลูกค้า: ของมาถึงหรือยัง?
       const method = selectFollowUpMethod(lead);
-      const msg = `สวัสดีค่ะ กุ้งมะยมค่ะ 🙏\nสินค้า ${lead.productInterest || "DINOCO"} มาถึงแล้วหรือยังคะ?`;
+      const msg = `สวัสดีค่ะ ${DEFAULT_BOT_NAME} ค่ะ 🙏\nสินค้า ${lead.productInterest || "DINOCO"} มาถึงแล้วหรือยังคะ?`;
       if (method === "line" && lead.lineId) {
         await sendLinePush(lead.lineId, [{ type: "text", text: msg }]).catch(() => {});
       } else if (lead.phone) {
@@ -6555,7 +6555,7 @@ async function processFollowUp(lead) {
     case "install_check": {
       // ถามลูกค้า: ติดตั้งเป็นไงบ้าง?
       const method = selectFollowUpMethod(lead);
-      const msg = `สวัสดีค่ะ กุ้งมะยมค่ะ 😊\nติดตั้ง ${lead.productInterest || "สินค้า DINOCO"} เรียบร้อยไหมคะ? เป็นยังไงบ้าง?`;
+      const msg = `สวัสดีค่ะ ${DEFAULT_BOT_NAME} ค่ะ 😊\nติดตั้ง ${lead.productInterest || "สินค้า DINOCO"} เรียบร้อยไหมคะ? เป็นยังไงบ้าง?`;
       if (method === "line" && lead.lineId) {
         await sendLinePush(lead.lineId, [{ type: "text", text: msg }]).catch(() => {});
       }
@@ -6567,7 +6567,7 @@ async function processFollowUp(lead) {
     case "satisfaction_check": {
       // T+30 วัน: ถามลูกค้ารอบสุดท้าย
       const method = selectFollowUpMethod(lead);
-      const msg = `สวัสดีค่ะ กุ้งมะยมค่ะ 🙏\nใช้ ${lead.productInterest || "สินค้า DINOCO"} มาได้ 1 เดือนแล้ว เป็นยังไงบ้างคะ? มีปัญหาอะไรไหม?`;
+      const msg = `สวัสดีค่ะ ${DEFAULT_BOT_NAME} ค่ะ 🙏\nใช้ ${lead.productInterest || "สินค้า DINOCO"} มาได้ 1 เดือนแล้ว เป็นยังไงบ้างคะ? มีปัญหาอะไรไหม?`;
       if (method === "line" && lead.lineId) {
         await sendLinePush(lead.lineId, [{ type: "text", text: msg }]).catch(() => {});
       }
@@ -6645,10 +6645,10 @@ async function checkClosingSoonWindows() {
     let msg;
     if (!lead.phone && !lead.lineId) {
       // ยังไม่มี contact info → ขอเบอร์/LINE
-      msg = `พี่คะ กุ้งมะยมจาก DINOCO ค่ะ 🙏\nร้าน ${dealer} พร้อมให้บริการเรื่อง ${product} ค่ะ\n\nรบกวนขอเบอร์โทรหรือ LINE ID พี่ได้ไหมคะ?\nจะได้ให้ทางร้านติดต่อกลับสะดวกค่ะ`;
+      msg = `พี่คะ ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ 🙏\nร้าน ${dealer} พร้อมให้บริการเรื่อง ${product} ค่ะ\n\nรบกวนขอเบอร์โทรหรือ LINE ID พี่ได้ไหมคะ?\nจะได้ให้ทางร้านติดต่อกลับสะดวกค่ะ`;
     } else {
       // มี contact info แล้ว → ส่ง value message
-      msg = `พี่คะ กุ้งมะยมจาก DINOCO ค่ะ 😊\nมีอะไรสงสัยเรื่อง ${product} ทักมาได้เลยนะคะ\nร้าน ${dealer} ยินดีให้บริการค่ะ`;
+      msg = `พี่คะ ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ 😊\nมีอะไรสงสัยเรื่อง ${product} ทักมาได้เลยนะคะ\nร้าน ${dealer} ยินดีให้บริการค่ะ`;
     }
 
     await sendMetaMessage(senderId, msg).catch(() => {});
