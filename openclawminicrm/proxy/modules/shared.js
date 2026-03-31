@@ -1,0 +1,260 @@
+/**
+ * shared.js — Shared state, constants, and DB connection
+ * V.1.0 — Extracted from index.js monolith
+ */
+const { MongoClient } = require("mongodb");
+const crypto = require("crypto");
+
+// === MongoDB ===
+let db = null;
+async function getDB() {
+  if (db) return db;
+  const uri = process.env.MONGODB_URI;
+  if (!uri) return null;
+  try {
+    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 3000 });
+    await client.connect();
+    db = client.db(process.env.MONGODB_DB || "smltrack");
+    console.log("[DB] MongoDB connected");
+    return db;
+  } catch (e) {
+    console.error("[DB] Failed:", e.message);
+    return null;
+  }
+}
+
+// === Collection names ===
+const MESSAGES_COLL = "messages";
+const AUDIT_LOG_COLL = "audit_logs";
+const KB_COLL = "knowledge_base";
+const MEMORY_COLL = "ai_memory";
+const SKILL_LESSONS_COLL = "ai_skill_lessons";
+
+// === Bot Config ===
+const DEFAULT_BOT_NAME = process.env.BOT_NAME || "DINOCO Assistant";
+
+const DEFAULT_PROMPT = `คุณคือ AI ผู้ช่วยของ DINOCO THAILAND — แบรนด์อะไหล่มอเตอร์ไซค์พรีเมียม
+สินค้าหลัก: กล่องอลูมิเนียม, แคชบาร์ (กันล้ม), แร็ค, ถาดรอง, การ์ดแฮนด์, กระเป๋า
+
+บทบาท:
+- ให้ข้อมูลสินค้า ราคา สต็อก อย่างถูกต้อง (ดึงจากระบบจริงเท่านั้น ห้ามเดา)
+- แนะนำตัวแทนจำหน่ายใกล้บ้านลูกค้า
+- ช่วยเรื่องการรับประกัน/เคลม (รับประกัน 3 ปี)
+- จดจำบทสนทนาเก่าเพื่อให้บริการต่อเนื่อง
+- ถ้าไม่แน่ใจข้อมูลใดๆ ให้บอก "ขอเช็คข้อมูลกับทีมงานก่อนนะคะ รอสักครู่ค่ะ"
+
+น้ำเสียง:
+- สุภาพ เป็นกันเอง ลงท้ายด้วย "ค่ะ/นะคะ"
+- ตอบกระชับ 2-3 ประโยค ไม่ยาวเยิ่นเย้อ
+- ใช้ emoji น้อย (1-2 ตัวต่อข้อความ)
+
+ข้อห้ามเด็ดขาด:
+- ห้ามกุข้อมูลสินค้า/ราคา/ตัวแทนจำหน่าย — ใช้เฉพาะข้อมูลจากระบบ
+- ห้ามสัญญาเรื่องราคา/ส่วนลด/โปรโมชั่นที่ไม่มีในระบบ
+- ห้ามพูดถึงคู่แข่งในแง่ลบ
+- ถ้าลูกค้าต้องการคุยกับคนจริง ให้ส่งเรื่องให้แอดมินทันที`;
+
+// === A/B Testing Prompts ===
+const AB_PROMPTS = {
+  A: "ตอบสั้นๆ กระชับ ไม่เกิน 2 ประโยค",
+  B: "ตอบอย่างเป็นมิตร ใส่ emoji ให้รู้สึกอบอุ่น ไม่เกิน 3 ประโยค",
+};
+
+function getABVariant(sourceId) {
+  const hash = sourceId.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  return hash % 2 === 0 ? "A" : "B";
+}
+
+// === AI Cost Tracking Pricing ===
+const AI_PRICING = {
+  "OR-Nemotron": { input: 0, output: 0 },
+  "OR-DeepSeek": { input: 0, output: 0 },
+  "OR-Llama": { input: 0, output: 0 },
+  "OR-Trinity": { input: 0, output: 0 },
+  "OR-StepFlash": { input: 0, output: 0 },
+  "SambaNova": { input: 0, output: 0 },
+  "Groq": { input: 0.059, output: 0.079 },
+  "Cerebras": { input: 0.01, output: 0.01 },
+  "Gemini": { input: 0, output: 0 },
+  "Gemini-Embed": { input: 0, output: 0 },
+  "openrouter": { input: 0.18, output: 0.18 },
+  "OR-Vision": { input: 0, output: 0 },
+  "Groq-Vision": { input: 0.059, output: 0.079 },
+  "Gemini-Vision": { input: 0, output: 0 },
+};
+
+const PAID_AI = process.env.PAID_AI_ENABLED === "true";
+
+// === Audit Log ===
+async function auditLog(action, details = {}) {
+  const db = await getDB();
+  if (!db) return;
+  try {
+    await db.collection(AUDIT_LOG_COLL).insertOne({
+      action,
+      ...details,
+      createdAt: new Date(),
+    });
+  } catch {}
+}
+
+// === AI Cost Tracking ===
+async function trackAICost({ provider, model, feature, inputTokens = 0, outputTokens = 0, sourceId = null, success = true }) {
+  try {
+    const database = await getDB();
+    if (!database) return;
+    const pricing = AI_PRICING[provider] || { input: 0, output: 0 };
+    const totalTokens = inputTokens + outputTokens;
+    const costUsd = (inputTokens * pricing.input + outputTokens * pricing.output) / 1000000;
+    await database.collection("ai_costs").insertOne({
+      provider,
+      model: model || provider,
+      feature,
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      costUsd: Math.round(costUsd * 1000000) / 1000000,
+      sourceId,
+      success,
+      createdAt: new Date(),
+    });
+  } catch (e) {
+    // silent
+  }
+}
+
+// === Bot Config Cache ===
+const botConfigCache = {};
+
+async function getBotConfig(sourceId, sourceMeta) {
+  const cached = botConfigCache[sourceId];
+  if (cached && Date.now() - cached._ts < 60000) return cached;
+  const database = await getDB();
+  if (!database) return { systemPrompt: DEFAULT_PROMPT, botName: DEFAULT_BOT_NAME };
+  try {
+    let config = await database.collection("bot_config").findOne({ sourceId });
+    if (!config) {
+      config = {
+        sourceId,
+        sourceType: sourceMeta?.type || "unknown",
+        groupName: sourceMeta?.groupName || null,
+        botName: DEFAULT_BOT_NAME,
+        systemPrompt: DEFAULT_PROMPT,
+        aiAutoReply: false,
+        aiReplyMode: "off",
+        aiReplyKeywords: [],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      await database.collection("bot_config").insertOne(config);
+      console.log(`[Config] Auto-created config for ${sourceId} (${sourceMeta?.groupName || "unknown"})`);
+    }
+    config._ts = Date.now();
+    botConfigCache[sourceId] = config;
+    return config;
+  } catch (e) {
+    return { systemPrompt: DEFAULT_PROMPT, botName: DEFAULT_BOT_NAME };
+  }
+}
+
+async function setBotConfig(sourceId, updates) {
+  const database = await getDB();
+  if (!database) return;
+  await database.collection("bot_config").updateOne(
+    { sourceId },
+    { $set: { ...updates, sourceId, updatedAt: new Date() } },
+    { upsert: true }
+  );
+  delete botConfigCache[sourceId];
+}
+
+// === Privacy / Opt-out Keywords ===
+const OPT_OUT_KEYWORDS = ["หยุด", "stop", "ยกเลิก", "unsubscribe"];
+const OPT_IN_KEYWORDS = ["เปิด", "start", "subscribe"];
+const DELETE_KEYWORDS = ["ลบข้อมูล", "delete my data", "ลบ"];
+const HANDOFF_REGEX = /คุยกับคน|ขอคุยกับพนักงาน|ต้องการคนจริง|ไม่ใช่ bot|talk to human|real person|agent/;
+
+// === PDPA Notice ===
+const DINOCO_PRIVACY_TEXT = `🔒 แจ้งเตือนจาก DINOCO THAILAND
+
+ระบบนี้ใช้ AI ในการวิเคราะห์และตอบกลับข้อความ ข้อมูลของคุณจะถูกเก็บรักษาตาม พ.ร.บ.คุ้มครองข้อมูลส่วนบุคคล (PDPA)
+
+ผู้ควบคุมข้อมูล: DINOCO THAILAND
+ข้อมูลที่เก็บ: ชื่อ, ข้อความสนทนา, จังหวัด
+ระยะเวลาเก็บ: 90 วันสำหรับ lead, 1 ปีสำหรับเคลม
+
+พิมพ์ "หยุด" เพื่อไม่รับข้อความอัตโนมัติ
+พิมพ์ "ลบข้อมูล" เพื่อขอลบข้อมูลของคุณ`;
+
+const PRIVACY_TEXT = `🔒 แจ้งเตือน: ระบบนี้ใช้ AI ในการวิเคราะห์และตอบกลับข้อความ ข้อมูลของคุณจะถูกเก็บรักษาตาม พ.ร.บ.คุ้มครองข้อมูลส่วนบุคคล (PDPA)\n\nพิมพ์ "หยุด" เพื่อหยุดรับข้อความอัตโนมัติ\nพิมพ์ "ลบข้อมูล" เพื่อขอลบข้อมูลของคุณ`;
+
+// === MCP state ===
+const mcpTools = [];
+const mcpToolHandlers = {};
+
+// === Qdrant Config ===
+const QDRANT_URL = process.env.QDRANT_URL || "";
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY || "";
+const QDRANT_COLLECTION = "knowledge_base";
+
+// === Payment Keywords ===
+const PAYMENT_KEYWORDS = [
+  /โอนแล้ว/, /ส่งสลิป/, /จ่ายแล้ว/, /ชำระแล้ว/, /โอนเงิน/,
+  /ยอดโอน/, /โอนให้แล้ว/, /จ่ายเงินแล้ว/, /แนบสลิป/, /โอนเรียบร้อย/,
+];
+
+// === CEO Plan / Staff ===
+const KUNG_STAFF = [
+  { id: "E01", name: "แก้ว", role: "แก้ปัญหาลูกค้า", feature: "crm-analysis" },
+  { id: "E02", name: "ทองคำ", role: "หาโอกาสขาย", feature: "sales-hunter" },
+  { id: "E03", name: "ครูโค้ช", role: "โค้ชทีมงาน", feature: "team-coaching" },
+  { id: "E04", name: "อาร์ม", role: "วางกลยุทธ์", feature: "weekly-strategy" },
+  { id: "E05", name: "หมอใจ", role: "ดูแลลูกค้า", feature: "health-monitor" },
+  { id: "E06", name: "แบงค์", role: "ตรวจสลิป", feature: "payment-guardian" },
+  { id: "E07", name: "เมฆ", role: "ติดตามส่งของ", feature: "order-tracker" },
+  { id: "E08", name: "ขนุน", role: "ดึงลูกค้ากลับ", feature: "re-engagement" },
+  { id: "E09", name: "แนน", role: "แนะนำสินค้า", feature: "upsell-crosssell" },
+  { id: "E10", name: "บุ๋ม", role: "สรุปรายวัน", feature: "daily-report" },
+  { id: "E11", name: "แต้ม", role: "ให้คะแนน", feature: "lead-scorer" },
+  { id: "E12", name: "นาฬิกา", role: "เตือนนัดหมาย", feature: "appointment-reminder" },
+  { id: "E13", name: "เปรียบ", role: "วิเคราะห์ราคา", feature: "price-watcher" },
+];
+const KUNG_TO_FEATURE = Object.fromEntries(KUNG_STAFF.map(s => [s.name, s.feature]));
+const KUNG_NAMES = KUNG_STAFF.map(s => s.name);
+const KUNG_ID_TO_NAME = Object.fromEntries(KUNG_STAFF.map(s => [s.id, s.name]));
+
+module.exports = {
+  getDB,
+  MESSAGES_COLL,
+  AUDIT_LOG_COLL,
+  KB_COLL,
+  MEMORY_COLL,
+  SKILL_LESSONS_COLL,
+  DEFAULT_BOT_NAME,
+  DEFAULT_PROMPT,
+  AB_PROMPTS,
+  getABVariant,
+  AI_PRICING,
+  PAID_AI,
+  auditLog,
+  trackAICost,
+  botConfigCache,
+  getBotConfig,
+  setBotConfig,
+  OPT_OUT_KEYWORDS,
+  OPT_IN_KEYWORDS,
+  DELETE_KEYWORDS,
+  HANDOFF_REGEX,
+  DINOCO_PRIVACY_TEXT,
+  PRIVACY_TEXT,
+  mcpTools,
+  mcpToolHandlers,
+  QDRANT_URL,
+  QDRANT_API_KEY,
+  QDRANT_COLLECTION,
+  PAYMENT_KEYWORDS,
+  KUNG_STAFF,
+  KUNG_TO_FEATURE,
+  KUNG_NAMES,
+  KUNG_ID_TO_NAME,
+};
