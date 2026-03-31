@@ -26,36 +26,13 @@ const DEMO_USER = {
   image: "",
 };
 
-// Skip auth ถ้าไม่มี NEXTAUTH_SECRET (local dev only)
-const DEV_MODE = !process.env.NEXTAUTH_SECRET;
-
-// สร้าง providers list
+// Google OAuth only — ไม่มี Demo mode
 const providers: any[] = [
-  // Demo login — ทดลองใช้งานโดยไม่ต้อง Google account
-  CredentialsProvider({
-    id: "credentials",
-    name: "Demo",
-    credentials: {
-      email: { label: "Email", type: "text" },
-    },
-    async authorize(credentials) {
-      if (credentials?.email === "demo@smlsoft.com") {
-        return DEMO_USER;
-      }
-      return null;
-    },
+  GoogleProvider({
+    clientId: process.env.GOOGLE_CLIENT_ID!,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
   }),
 ];
-
-// เพิ่ม Google ถ้ามี config
-if (!DEV_MODE) {
-  providers.push(
-    GoogleProvider({
-      clientId: process.env.GOOGLE_CLIENT_ID!,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-    })
-  );
-}
 
 const handler = NextAuth({
   providers,
