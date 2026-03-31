@@ -34,6 +34,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { href: "/", icon: "📊", label: "แดชบอร์ด" },
       { href: "/chat", icon: "💬", label: "แชท FB/IG/LINE" },
+      { href: "/inbox", icon: "📥", label: "กล่องข้อความ" },
       { href: "/analytics", icon: "📈", label: "วิเคราะห์" },
     ],
   },
@@ -43,6 +44,8 @@ const NAV_GROUPS: NavGroup[] = [
       { href: "/leads", icon: "🎯", label: "ติดตาม Leads" },
       { href: "/dealer-sla", icon: "🏪", label: "SLA ตัวแทน" },
       { href: "/crm", icon: "👥", label: "CRM ลูกค้า" },
+      { href: "/scorecard", icon: "🏆", label: "คะแนนลูกค้า" },
+      { href: "/auto-closer", icon: "🤝", label: "ติดตามปิดการขาย" },
     ],
   },
   {
@@ -50,6 +53,13 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { href: "/claims", icon: "📋", label: "ตรวจเคลม" },
       { href: "/km", icon: "📚", label: "คลังความรู้" },
+    ],
+  },
+  {
+    groupLabel: "สื่อสาร",
+    items: [
+      { href: "/broadcast", icon: "📢", label: "ส่งข้อความ" },
+      { href: "/templates", icon: "📝", label: "แม่แบบข้อความ" },
     ],
   },
   {
@@ -65,7 +75,14 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { href: "/connections", icon: "🔗", label: "ช่องทาง" },
       { href: "/bot-config", icon: "🤖", label: "ตั้งค่าบอท" },
+      { href: "/team", icon: "👔", label: "ทีมงาน" },
       { href: "/settings", icon: "⚙️", label: "ตั้งค่าระบบ" },
+    ],
+  },
+  {
+    groupLabel: "ช่วยเหลือ",
+    items: [
+      { href: "/guide", icon: "📖", label: "คู่มือ" },
     ],
   },
 ];
