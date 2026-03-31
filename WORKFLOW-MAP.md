@@ -9,9 +9,11 @@
 1. [B2C Member Flow](#b2c-member-flow) — สมาชิกทั่วไป
 2. [B2B Distributor Flow (LINE)](#b2b-distributor-flow) — ตัวแทนจำหน่าย
 3. [B2B Admin Flow (LINE)](#b2b-admin-flow-line) — แอดมิน B2B ใน LINE
-4. [Admin Dashboard Flow](#admin-dashboard-flow) — แอดมิน Web Dashboard
-5. [Flex Card Button Map](#flex-card-button-map) — ปุ่มทุกปุ่มใน Flex Card
-6. [LIFF Page Map](#liff-page-map) — หน้า LIFF ทั้งหมด
+4. [B2F Maker Flow (LINE)](#b2f-maker-flow-line) — โรงงานผู้ผลิต
+5. [B2F Admin Flow](#b2f-admin-flow) — แอดมิน B2F สั่งซื้อจากโรงงาน
+6. [Admin Dashboard Flow](#admin-dashboard-flow) — แอดมิน Web Dashboard
+7. [Flex Card Button Map](#flex-card-button-map) — ปุ่มทุกปุ่มใน Flex Card
+8. [LIFF Page Map](#liff-page-map) — หน้า LIFF ทั้งหมด
 
 ---
 
@@ -308,6 +310,242 @@ Sub-choice Flex (หลังกด "ส่งเอง"):
   │ + [⏸️ เลื่อน 30 นาที]    │ → sla_snooze → reschedule
   └────────────────────────────┘
 ```
+
+---
+
+## B2F Maker Flow (LINE)
+
+> โรงงานผู้ผลิต (Maker) รับ PO จาก DINOCO ผ่าน LINE Bot เดียวกับ B2B  
+> Routing ตาม group_id — Maker group ได้ B2F Flex, Distributor group ได้ B2B Flex
+
+### Maker ได้ Flex PO ใหม่
+
+```
+Admin สร้าง PO → Bot ส่ง Flex ไป Maker LINE group
+┌────────────────────────────────────────────┐
+│ 📋 DINOCO สั่งซื้อ                         │
+│ PO-DNC-260401-001                          │
+│────────────────────────────────────────────│
+│ สินค้า A (SKU-001)        x10    ฿5,000   │
+│ สินค้า B (SKU-002)        x5     ฿2,500   │
+│────────────────────────────────────────────│
+│ มูลค่ารวมสุทธิ                    ฿7,500   │
+│ 📅 ต้องการรับภายใน: 15/04/2026             │
+│                                            │
+│ [✅ ยืนยัน + เลือกวันส่ง] → datetimepicker │
+│ [❌ ปฏิเสธ]               → postback       │
+│ [📋 ดูรายละเอียด]         → postback       │
+└────────────────────────────────────────────┘
+
+กดยืนยัน → เลือกวัน ETA → status: confirmed
+  → Flex #3 `maker_confirmed` ส่ง Admin group (ETA + ชื่อ Maker)
+  
+กดปฏิเสธ → Bot ถาม "กรุณาพิมพ์เหตุผล" → Maker พิมพ์ → status: rejected
+  → Flex #4 `maker_rejected` ส่ง Admin group (เหตุผล)
+```
+
+### Maker @mention Bot → Menu
+
+```
+Maker พิมพ์ @DINOCO ในห้อง LINE
+  → Bot ตอบ Flex menu:
+    ┌─────────────────────────────────┐
+    │ DINOCO B2F                      │
+    │ PO ที่รอดำเนินการ: 3 ใบ        │
+    │                                 │
+    │ [📋 ดู PO ที่รอ]   → LIFF list  │
+    │ [📦 แจ้งส่งของ]    → LIFF deliver│
+    │ [📅 ขอเลื่อนวันส่ง] → LIFF reschedule│
+    └─────────────────────────────────┘
+```
+
+### Maker Text Commands
+
+```
+"ส่งของ" / "deliver" / "ส่ง"
+  → Flex carousel ของ PO ที่ส่งได้ (confirmed + partial_received)
+  → กดปุ่ม "แจ้งส่งของ" → postback b2f_maker_deliver
+  → status: delivering (หรือ partial_received → delivering)
+  → Flex #7 `delivered` ส่ง Admin (หรือ `additional_delivery` ถ้าส่งเพิ่ม)
+
+"ดูpo" / "po"
+  → text list ของ PO ค้าง (TODO: upgrade เป็น Flex carousel)
+```
+
+### Maker LIFF Pages (`/b2f-maker/`)
+
+```
+page=list       → ดู PO ทั้งหมด, filter ตาม status
+page=deliver    → เลือก PO ที่จะแจ้งส่ง → POST /b2f/v1/maker-deliver
+page=reschedule → เลือก PO + กรอกวันใหม่ + เหตุผล → POST /b2f/v1/maker-reschedule
+page=confirm    → ยืนยัน PO + เลือก ETA (ทางเลือกจาก postback)
+page=reject     → ปฏิเสธ PO + กรอกเหตุผล (ทางเลือกจาก postback)
+```
+
+### Flex ที่ Maker ได้รับ (ครบทั้งหมด)
+
+| # | Flex | เมื่อไหร่ | มีปุ่ม? |
+|---|------|----------|--------|
+| M1 | `new_po_for_maker` | Admin สร้าง PO | ยืนยัน/ปฏิเสธ/ดูรายละเอียด |
+| 5 | `eta_reminder` | Cron D-3, D-1, D-day | - |
+| 6 | `overdue_alert` | Cron D+1, D+3, D+7+ | - |
+| 10 | `po_cancelled` | Admin ยกเลิก PO | - |
+| 11 | `po_amended` | Admin แก้ไข PO | - |
+| 13 | `reschedule_approved` | Admin อนุมัติเลื่อนวันส่ง | - |
+| 14 | `reschedule_rejected` | Admin ไม่อนุมัติเลื่อน | - |
+| 15 | `receiving` | Admin ตรวจรับสินค้า | - |
+| 17 | `payment` | Admin บันทึกจ่ายเงิน | - |
+| 19 | `po_completed` | PO จ่ายครบ/ปิด PO | - |
+| 20 | `lot_rejected` | Admin reject ทั้ง lot → ส่งใหม่ | - |
+| 22 | `po_resubmitted` | Admin ส่ง PO กลับ (rejected→submitted) | ยืนยัน/ปฏิเสธ |
+| 24 | `credit_hold` | ถูกระงับเครดิต (auto/manual) | - |
+| 25 | `credit_released` | ปลดล็อกเครดิต | - |
+
+---
+
+## B2F Admin Flow
+
+> Admin สร้าง/จัดการ PO ผ่าน 2 ช่องทาง: LINE LIFF + Admin Dashboard
+
+### สร้าง PO จาก LINE (LIFF E-Catalog)
+
+```
+Admin พิมพ์ "สั่งโรงงาน" ใน Admin group
+  → Bot ตอบ Flex "เปิดหน้าสั่งสินค้า"
+  → กดปุ่ม → เปิด LIFF (b2f-catalog/)
+  → Auth: HMAC sig + LINE ID Token → POST /b2f/v1/auth-admin → JWT token
+  → เลือก Maker → ดู catalog → เลือก SKU + จำนวน → กดสั่ง
+  → POST /b2f/v1/create-po → draft → submitted
+  → Flex ส่ง Maker group (item rows + ปุ่มยืนยัน/ปฏิเสธ)
+  → Flex ส่ง Admin group (สรุป PO + ปุ่มดูรายละเอียด)
+```
+
+### Flex ที่ Admin ได้รับ
+
+| # | Flex | เมื่อไหร่ | มีปุ่ม? |
+|---|------|----------|--------|
+| 2 | `po_created` | สร้าง PO สำเร็จ | ดูรายละเอียด PO |
+| 3 | `maker_confirmed` | Maker ยืนยัน + ETA | - |
+| 4 | `maker_rejected` | Maker ปฏิเสธ | - |
+| 7 | `delivered` | Maker แจ้งส่งของ | - |
+| 12 | `reschedule_request` | Maker ขอเลื่อนวันส่ง | อนุมัติ/ไม่อนุมัติ |
+| 16 | `receiving_summary` | Admin ตรวจรับ (สรุปส่ง Admin group) | - |
+| 19 | `po_completed` | PO เสร็จสมบูรณ์ | - |
+| 21 | `additional_delivery` | Maker ส่งของเพิ่ม (partial→delivering) | - |
+| 23 | `po_cancelled_admin` | PO ถูกยกเลิก (แจ้งทั้ง group) | - |
+
+### Admin Dashboard B2F Tabs
+
+```
+Admin Dashboard → Sidebar → B2F
+
+Tab: Orders [b2f_admin_orders_tab]
+  → ดู PO ทั้งหมด, filter ตาม status
+  → กด PO → เปิด PO detail modal/page
+  → Actions ตาม status:
+    submitted:         แก้ไข PO, ยกเลิก
+    confirmed:         แก้ไข PO, ยกเลิก
+    delivering:        ตรวจรับสินค้า, reject lot
+    partial_received:  ตรวจรับเพิ่ม, ยกเลิก
+    received:          บันทึกจ่ายเงิน, ปิด PO (ของฟรี)
+    partial_paid:      บันทึกจ่ายเงิน
+
+Tab: Makers [b2f_admin_makers_tab]
+  → CRUD โรงงาน (ชื่อ, contact, group_id, credit limit, etc.)
+  → จัดการสินค้า+ราคาทุน (SKU mapping, MOQ, lead time)
+  → เปิด/ปิด Bot สำหรับ Maker
+
+Tab: Credit [b2f_admin_credit_tab]
+  → ดูยอดค้างจ่ายแต่ละ Maker
+  → Hold/Release credit (manual)
+  → บันทึกจ่ายเงิน
+  → ดูประวัติ transactions
+```
+
+### PO Ticket View (LIFF `/b2f-po-detail/`)
+
+```
+เปิดจาก Flex card ปุ่ม หรือ Dashboard กด detail
+  → Status timeline (visual)
+  → รายการสินค้า (qty ordered, received, rejected)
+  → ประวัติ receiving records
+  → ประวัติ payment records
+  → Credit info (ยอดค้างจ่าย, วงเงิน, hold status)
+```
+
+### FSM Status Flow (12 statuses)
+
+```
+draft → submitted → confirmed → delivering → received → paid → completed
+                  ↘ rejected                ↗ partial_received ↗
+                  ↘ amended (→ auto-resubmit)
+                  ↘ cancelled (terminal)
+
+delivering → confirmed (Admin reject lot — Maker ส่งใหม่)
+partial_received → delivering (Maker ส่งของเพิ่ม)
+received → completed (ของฟรี/sample — ปิดโดยไม่จ่ายเงิน)
+```
+
+### Credit System Flow
+
+```
+สร้าง PO → ยังไม่หัก credit (V.3.3)
+  ↓
+Maker ส่งของ → Admin ตรวจรับ
+  ↓
+receive-goods → b2f_payable_add(received_value) → เพิ่มค้างจ่าย
+  ↓
+ถ้า debt >= credit_limit → auto credit hold → Flex แจ้ง Maker
+  ↓
+Admin จ่ายเงิน → b2f_payable_subtract(amount) → ลดค้างจ่าย
+  ↓
+ถ้า debt < limit && reason='auto' → auto unhold → Flex แจ้ง Maker
+
+Source of truth: b2f_recalculate_payable()
+  = SUM(rcv_total_value จาก b2f_receiving) - SUM(pmt_amount จาก b2f_payment)
+```
+
+### Cron Jobs (Snippet 11)
+
+| Cron | Schedule | ส่งให้ | Format |
+|------|----------|-------|--------|
+| Delivery Reminder (D-3, D-1, D-day) | Daily 08:30 | Maker: Flex / Admin: text | Flex #5 |
+| Overdue Check (D+1, D+3, D+7+) | Daily 09:00 | Maker: Flex / Admin: text | Flex #6 |
+| Maker No-response (24h, 48h) | Daily 09:30 | Maker: text | - |
+| Maker Escalate (72h) | Daily 09:30 | Admin: text | - |
+| Payment Reminder (D-7, D-3, D-day, D+3, D+7) | Daily 10:00 | Admin: text | auto hold D+7 |
+| Daily Summary | Daily 18:00 | Admin: text | - |
+| Weekly Summary | Mon 09:00 | Admin: text | - |
+
+### REST API Endpoints (`/wp-json/b2f/v1/`)
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/makers` | GET | Admin | List Makers |
+| `/maker` | POST | Admin | Create/Update Maker |
+| `/maker/delete` | POST | Admin | Soft delete Maker |
+| `/maker/toggle-bot` | POST | Admin | Toggle Bot for Maker |
+| `/maker-products/{id}` | GET | Admin | List Maker Products |
+| `/maker-product` | POST | Admin | Create/Update Product |
+| `/maker-product/delete` | POST | Admin | Delete Product |
+| `/create-po` | POST | Admin | Create PO → draft→submitted |
+| `/po-detail/{id}` | GET | Admin/Maker JWT | PO detail |
+| `/po-detail/jwt` | GET | Maker JWT | PO detail by JWT |
+| `/po-update` | POST | Admin | Update PO → amended→submitted |
+| `/po-cancel` | POST | Admin | Cancel PO + rollback credit |
+| `/reject-lot` | POST | Admin | Reject lot delivering→confirmed |
+| `/po-complete` | POST | Admin | Close PO received→completed |
+| `/maker-confirm` | POST | Maker JWT | Confirm PO + ETA |
+| `/maker-reject` | POST | Maker JWT | Reject PO + reason |
+| `/maker-reschedule` | POST | Maker JWT | Request reschedule |
+| `/maker-po-list` | GET | Maker JWT | Maker's PO list |
+| `/maker-deliver` | POST | Maker JWT | Deliver (confirmed/partial→delivering) |
+| `/approve-reschedule` | POST | Admin | Approve/reject reschedule |
+| `/receive-goods` | POST | Admin | Receive goods + credit |
+| `/record-payment` | POST | Admin | Record payment + auto-complete |
+| `/dashboard-stats` | GET | Admin | KPI stats |
+| `/po-history` | GET | Admin | PO history with filters |
+| `/auth-admin` | POST | Public | LIFF auth → JWT |
 
 ---
 
