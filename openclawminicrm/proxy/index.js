@@ -1655,6 +1655,25 @@ const AGENT_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "dinoco_create_lead",
+      description: "สร้าง lead อัตโนมัติเมื่อแนะนำตัวแทนจำหน่ายให้ลูกค้าแล้ว + แจ้งตัวแทนผ่าน LINE push ใช้ทุกครั้งที่ลูกค้าสนใจสินค้าและต้องการให้ตัวแทนติดต่อกลับ",
+      parameters: {
+        type: "object",
+        properties: {
+          product_interest: { type: "string", description: "สินค้าที่สนใจ เช่น 'แคชบาร์ ADV 350 PRO'" },
+          province: { type: "string", description: "จังหวัดของลูกค้า เช่น 'เชียงใหม่'" },
+          dealer_name: { type: "string", description: "ชื่อร้านตัวแทนที่แนะนำ" },
+          dealer_id: { type: "string", description: "ID ตัวแทน (จาก dealer-lookup)" },
+          customer_name: { type: "string", description: "ชื่อลูกค้า (ถ้ารู้)" },
+          phone: { type: "string", description: "เบอร์โทรลูกค้า (ถ้าให้มา)" },
+        },
+        required: ["product_interest", "dealer_name"],
+      },
+    },
+  },
 ];
 
 // === Execute Tool ===
@@ -1713,6 +1732,62 @@ async function executeTool(toolName, args, sourceId) {
       });
     }
     return `ส่งเรื่องให้แอดมินแล้ว เหตุผล: ${reason} — ตอบลูกค้าว่า "ขอส่งเรื่องให้ทีมงาน DINOCO ช่วยตอบให้ละเอียดนะคะ รอสักครู่ค่ะ"`;
+  }
+  if (toolName === "dinoco_create_lead") {
+    // Auto-create lead + notify dealer via LINE push
+    const database = await getDB();
+    if (!database) return "ไม่สามารถสร้าง lead ได้ (DB ไม่พร้อม)";
+
+    // ดึง customer info จาก messages/groups_meta
+    const meta = await database.collection("groups_meta").findOne({ sourceId });
+    const platform = sourceId.startsWith("fb_") ? "facebook" : sourceId.startsWith("ig_") ? "instagram" : "line";
+    const customerName = args.customer_name || meta?.groupName || meta?.displayName || "ลูกค้า";
+
+    const leadData = {
+      sourceId,
+      platform,
+      customerName,
+      productInterest: args.product_interest || "",
+      province: args.province || "",
+      phone: args.phone || null,
+      lineId: null,
+      dealerId: args.dealer_id || null,
+      dealerName: args.dealer_name || "",
+      status: "lead_created",
+      nextFollowUpAt: new Date(Date.now() + 4 * 60 * 60 * 1000), // T+4hr
+      nextFollowUpType: "first_check",
+      windowExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // Meta 24hr window
+      otnToken: null,
+      otnTokenUsed: false,
+      closedAt: null,
+      history: [{ status: "lead_created", at: new Date(), by: "ai" }],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await database.collection("leads").insertOne(leadData);
+    console.log(`[Lead] AI auto-created: ${customerName} → ${args.dealer_name} (${args.product_interest})`);
+
+    // แจ้งตัวแทนผ่าน WordPress LINE push
+    if (args.dealer_id || args.dealer_name) {
+      await callDinocoAPI("/distributor-notify", {
+        distributor_id: args.dealer_id,
+        customer_name: customerName,
+        product_interest: args.product_interest,
+        province: args.province || "",
+        lead_id: String(result.insertedId),
+        message: `ลูกค้าสนใจ: ${args.product_interest} จ.${args.province || "ไม่ระบุ"}`,
+        type: "new_lead",
+      }).catch(() => {});
+
+      // อัพเดท status → dealer_notified
+      await database.collection("leads").updateOne(
+        { _id: result.insertedId },
+        { $set: { status: "dealer_notified", updatedAt: new Date() }, $push: { history: { status: "dealer_notified", at: new Date(), by: "ai" } } }
+      );
+    }
+
+    return `สร้าง lead สำเร็จ แจ้งตัวแทน ${args.dealer_name} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${args.dealer_name} แล้วค่ะ จะติดต่อพี่กลับเร็วที่สุดนะคะ น้องกุ้งมะยมจะติดตามให้จนจบค่ะ"`;
   }
   // MCP tools
   if (mcpToolHandlers[toolName]) {
