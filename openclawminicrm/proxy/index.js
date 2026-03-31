@@ -2803,6 +2803,26 @@ async function sendMetaMessage(recipientId, text) {
   }
 }
 
+// === [DINOCO] Send Meta Image Attachment (V.1.0) ===
+async function sendMetaImage(recipientId, imageUrl) {
+  const token = process.env.FB_PAGE_ACCESS_TOKEN;
+  if (!token || !imageUrl) return false;
+  try {
+    const res = await fetch("https://graph.facebook.com/v19.0/me/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        recipient: { id: recipientId },
+        message: { attachment: { type: "image", payload: { url: imageUrl, is_reusable: true } } },
+      }),
+    });
+    return res.ok;
+  } catch (e) {
+    console.error("[Meta] sendMetaImage error:", e.message);
+    return false;
+  }
+}
+
 // === Meta Webhook: Verification (GET) ===
 app.get("/webhook/meta", (req, res) => {
   const mode = req.query["hub.mode"]
@@ -6505,7 +6525,7 @@ async function handleLineUnfollow(sourceId) {
   console.log(`[Unfollow] ${sourceId}`);
 }
 
-// === [DINOCO] Platform-aware product response ===
+// === [DINOCO] Platform-aware product response (V.1.1) ===
 async function sendProductRecommendation(recipientId, platform, products) {
   if (!products || products.length === 0) return;
 
@@ -6526,14 +6546,40 @@ async function sendProductRecommendation(recipientId, platform, products) {
         message: { attachment: { type: "template", payload: { template_type: "generic", elements } } },
       }),
     }).catch(() => {});
+
   } else if (platform === "instagram") {
-    // IG: ส่งรูป + text แยก (ไม่รองรับ template)
+    // IG: ส่ง image attachment จริง + text แยก (ไม่รองรับ template)
     for (const p of products.slice(0, 2)) {
       if (p.img_url) {
-        await sendMetaMessage(recipientId, `📸 ${p.name || "สินค้า DINOCO"}`);
+        await sendMetaImage(recipientId, p.img_url).catch(() => {});
       }
       await sendMetaMessage(recipientId, `${p.name}\nราคา ${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"}\nประกัน ${p.warranty_years || 3} ปี`);
     }
+
+  } else if (platform === "line") {
+    // LINE: Flex Message carousel
+    const bubbles = products.slice(0, 3).map((p) => ({
+      type: "bubble", size: "micro",
+      hero: p.img_url ? { type: "image", url: p.img_url, size: "full", aspectRatio: "4:3", aspectMode: "cover" } : undefined,
+      body: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [
+          { type: "text", text: p.name || "สินค้า DINOCO", weight: "bold", size: "sm", wrap: true },
+          { type: "text", text: `${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"}`, color: "#FF6B00", size: "lg", weight: "bold" },
+          { type: "text", text: `ประกัน ${p.warranty_years || 3} ปี`, size: "xs", color: "#888888" },
+        ],
+      },
+      footer: {
+        type: "box", layout: "vertical",
+        contents: [{ type: "button", action: { type: "uri", label: "ดูรายละเอียด", uri: "https://www.dinoco.co.th" }, style: "primary", color: "#FF6B00", height: "sm" }],
+      },
+    }));
+
+    const flexMsg = {
+      type: "flex", altText: `สินค้า DINOCO ${products.length} รายการ`,
+      contents: bubbles.length === 1 ? bubbles[0] : { type: "carousel", contents: bubbles },
+    };
+    await sendLinePush(recipientId, [flexMsg]).catch(() => {});
   }
 }
 
