@@ -482,13 +482,14 @@ export default function Sidebar() {
           {/* Logo */}
           <div className="px-4 py-4 border-b" style={{ borderColor: "var(--border)" }}>
             <div className="flex items-center gap-3">
-              <div className="w-9 h-9 gradient-bg rounded-xl flex items-center justify-center text-lg shadow-lg shrink-0"
-                style={{ boxShadow: "0 4px 12px rgba(99,102,241,0.3)" }}>
-                💬
-              </div>
+              <img
+                src="https://dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-riocrwy2320s7fp9ckfr60v72hcgkotli7ipsiol48.png"
+                alt="DINOCO"
+                className="w-9 h-9 rounded-xl object-cover shrink-0"
+              />
               <div className="min-w-0">
-                <h1 className="text-sm font-bold leading-tight" style={{ color: "var(--text-primary)" }}>OpenClaw</h1>
-                <p className="text-[10px] leading-tight" style={{ color: "var(--text-muted)" }}>Mini CRM</p>
+                <h1 className="text-sm font-bold leading-tight" style={{ color: "var(--text-primary)" }}>DINOCO AI</h1>
+                <p className="text-[10px] leading-tight" style={{ color: "var(--text-muted)" }}>Chat Intelligence</p>
               </div>
             </div>
           </div>
