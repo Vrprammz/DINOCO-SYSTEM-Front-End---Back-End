@@ -3019,10 +3019,9 @@ app.post("/webhook/meta", express.raw({ type: "*/*" }), async (req, res) => {
 
         console.log(`[Meta/${platform}] ${userName}@${sourceId.substring(0, 12)}: ${msgText.substring(0, 60)}`)
 
-        // === [Privacy] PDPA disabled — จะเปิดเมื่อทำข้อความ DINOCO เสร็จ ===
-        // sendPrivacyNoticeIfNeeded(sourceId, platform, () =>
-        //   sendMetaMessage(senderId, DINOCO_PRIVACY_TEXT)
-        // ).catch(() => {})
+        // === [DINOCO] Meta 24hr Window Tracking (V.1.0) ===
+        // ทุกข้อความลูกค้า → reset window 24hr + อัพเดท lead (ถ้ามี)
+        updateMetaWindow(sourceId, platform).catch(() => {});
 
         analyzeChat(sourceId, userName, msgText, senderId, { type: "user" }).catch((e) => console.error("[Meta/Skill] Catch:", e.message))
         learnFromMessage(sourceId, userName, msgText, "text", "user").catch(() => {})
@@ -6590,6 +6589,87 @@ async function processFollowUp(lead) {
   await db.collection("leads").updateOne({ _id: lead._id }, update);
 }
 
+// =====================================================================
+// [DINOCO] Meta 24hr Window Tracking (V.1.0)
+// ทุกข้อความลูกค้า FB/IG → reset window 24hr
+// CLOSING_SOON (< 2 ชม.) → ส่งข้อความมี value + ขอเบอร์/LINE
+// CLOSED → ไม่ส่ง FB/IG อีก (ใช้ LINE/SMS/admin_manual แทน)
+// =====================================================================
+
+async function updateMetaWindow(sourceId, platform) {
+  const db = await getDB();
+  if (!db) return;
+  if (platform !== "facebook" && platform !== "instagram") return;
+
+  const now = new Date();
+  const windowExpires = new Date(now.getTime() + 24 * 60 * 60 * 1000); // +24hr
+
+  // อัพเดท window ใน groups_meta (ทุกห้อง FB/IG)
+  await db.collection("groups_meta").updateOne(
+    { sourceId },
+    { $set: { windowExpiresAt: windowExpires, lastCustomerMessageAt: now, updatedAt: now } },
+    { upsert: false }
+  );
+
+  // อัพเดท window ใน lead (ถ้ามี active lead)
+  await db.collection("leads").updateMany(
+    { sourceId, closedAt: null },
+    { $set: { windowExpiresAt: windowExpires, updatedAt: now } }
+  );
+}
+
+// === Check CLOSING_SOON windows + send value message (เรียกจาก cron) ===
+async function checkClosingSoonWindows() {
+  const db = await getDB();
+  if (!db) return { processed: 0 };
+
+  const now = new Date();
+  const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+
+  // หา leads ที่ window เหลือ < 2 ชม. + ยังไม่ได้ส่งข้อความ CLOSING_SOON
+  const closingLeads = await db.collection("leads").find({
+    closedAt: null,
+    windowExpiresAt: { $gt: now, $lt: twoHoursLater },
+    closingSoonSent: { $ne: true },
+    platform: { $in: ["facebook", "instagram"] },
+    status: { $nin: ["closed_satisfied", "closed_lost", "closed_cancelled", "dormant"] },
+  }).limit(10).toArray();
+
+  let processed = 0;
+  for (const lead of closingLeads) {
+    const senderId = lead.sourceId.replace(/^(fb_|ig_)/, "");
+    const product = lead.productInterest || "สินค้า DINOCO";
+    const dealer = lead.dealerName || "ตัวแทนจำหน่าย";
+
+    // ส่งข้อความสุดท้ายที่มี VALUE (ไม่ใช่ spam)
+    let msg;
+    if (!lead.phone && !lead.lineId) {
+      // ยังไม่มี contact info → ขอเบอร์/LINE
+      msg = `พี่คะ กุ้งมะยมจาก DINOCO ค่ะ 🙏\nร้าน ${dealer} พร้อมให้บริการเรื่อง ${product} ค่ะ\n\nรบกวนขอเบอร์โทรหรือ LINE ID พี่ได้ไหมคะ?\nจะได้ให้ทางร้านติดต่อกลับสะดวกค่ะ`;
+    } else {
+      // มี contact info แล้ว → ส่ง value message
+      msg = `พี่คะ กุ้งมะยมจาก DINOCO ค่ะ 😊\nมีอะไรสงสัยเรื่อง ${product} ทักมาได้เลยนะคะ\nร้าน ${dealer} ยินดีให้บริการค่ะ`;
+    }
+
+    await sendMetaMessage(senderId, msg).catch(() => {});
+    await db.collection("leads").updateOne(
+      { _id: lead._id },
+      { $set: { closingSoonSent: true, updatedAt: now } }
+    );
+    processed++;
+  }
+  return { processed };
+}
+
+// === Check if Meta window is still open for a sourceId ===
+async function isMetaWindowOpen(sourceId) {
+  const db = await getDB();
+  if (!db) return false;
+  const meta = await db.collection("groups_meta").findOne({ sourceId });
+  if (!meta?.windowExpiresAt) return false;
+  return new Date() < new Date(meta.windowExpiresAt);
+}
+
 // === Follow-Up Method Selection (24hr window aware) ===
 function selectFollowUpMethod(lead) {
   // 1. Window ยังเปิด → FB/IG
@@ -6761,7 +6841,7 @@ async function sendDealerContactOptions(recipientId, platform, dealerName) {
 // POST /api/leads/cron/:type — Trigger specific follow-up type
 app.post("/api/leads/cron/:type", requireAuth, async (req, res) => {
   const { type } = req.params;
-  const validTypes = ["first-check", "contact-recheck", "delivery-check", "install-check", "30day-check", "dormant-cleanup", "dealer-sla-weekly"];
+  const validTypes = ["first-check", "contact-recheck", "delivery-check", "install-check", "30day-check", "dormant-cleanup", "dealer-sla-weekly", "closing-soon"];
   if (!validTypes.includes(type)) return res.status(400).json({ error: "Invalid cron type", valid: validTypes });
 
   try {
@@ -6843,6 +6923,12 @@ async function runLeadCronByType(type) {
       );
       console.log(`[Mayom] Dormant cleanup: ${result.modifiedCount} dormant, ${purged.modifiedCount} PII purged`);
       return { dormant: result.modifiedCount, purged: purged.modifiedCount };
+    }
+
+    case "closing-soon": {
+      // Meta 24hr window เหลือ < 2 ชม. → ส่งข้อความสุดท้ายมี value
+      const closingResult = await checkClosingSoonWindows();
+      return { processed: closingResult.processed, type: "closing_soon" };
     }
 
     case "dealer-sla-weekly": {
