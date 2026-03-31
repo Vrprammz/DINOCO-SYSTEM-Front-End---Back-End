@@ -1719,7 +1719,11 @@ async function executeTool(toolName, args, sourceId) {
   if (toolName === "dinoco_kb_search") {
     const result = await callDinocoAPI("/kb-search", { query: args.question || "" });
     if (typeof result === "string") return result;
-    if (!result.found) return result.message || "ไม่พบข้อมูล";
+    if (!result.found) {
+      // KB self-improvement: เก็บคำถามที่ตอบไม่ได้
+      trackUnansweredQuestion(args.question, sourceId).catch(() => {});
+      return result.message || "ไม่พบข้อมูลในคลังความรู้ — ขอเช็คข้อมูลกับทีมงานก่อนนะคะ";
+    }
     return result.entries.map((e) => `Q: ${e.question}\nA: ${e.facts}\nวิธีตอบ: ${e.action}`).join("\n---\n");
   }
   if (toolName === "dinoco_escalate") {
@@ -6342,6 +6346,74 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
       return `เรื่องเคลมของพี่สถานะ: ${claim.status} ค่ะ${claim.wpTicketNumber ? "\nใบเคลม: " + claim.wpTicketNumber : ""}\nสอบถามเพิ่มเติมได้ค่ะ`;
   }
 }
+
+// =====================================================================
+// [DINOCO] KB Self-Improvement — track unanswered questions (V.1.0)
+// =====================================================================
+
+async function trackUnansweredQuestion(question, sourceId) {
+  const db = await getDB();
+  if (!db || !question) return;
+
+  const normalized = question.trim().toLowerCase().replace(/\s+/g, " ");
+  if (normalized.length < 3) return;
+
+  // Upsert: ถ้าเคยถามแล้ว → เพิ่ม frequency + เก็บ sourceIds
+  const result = await db.collection("kb_suggestions").updateOne(
+    { normalizedQuestion: normalized },
+    {
+      $set: { lastAskedAt: new Date(), updatedAt: new Date() },
+      $inc: { frequency: 1 },
+      $setOnInsert: { question, normalizedQuestion: normalized, status: "pending", createdAt: new Date() },
+      $addToSet: { sourceIds: sourceId },
+    },
+    { upsert: true }
+  );
+
+  // ถ้า frequency ถึง 3 → auto-submit ไป WordPress /kb-suggest
+  if (result.modifiedCount > 0) {
+    const entry = await db.collection("kb_suggestions").findOne({ normalizedQuestion: normalized });
+    if (entry && entry.frequency >= 3 && entry.status === "pending") {
+      await callDinocoAPI("/kb-suggest", {
+        question: entry.question,
+        frequency: entry.frequency,
+        source: "fb_ig_chat",
+        source_ids: (entry.sourceIds || []).slice(0, 5),
+      }).catch(() => {});
+      await db.collection("kb_suggestions").updateOne(
+        { _id: entry._id },
+        { $set: { status: "submitted", submittedAt: new Date() } }
+      );
+      console.log(`[KB] Auto-submitted to WP: "${entry.question}" (asked ${entry.frequency}x)`);
+    }
+  }
+}
+
+// === KB Suggestions API ===
+app.get("/api/kb-suggestions", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ suggestions: [] });
+  try {
+    const filter = {};
+    if (req.query.status) filter.status = req.query.status;
+    const suggestions = await db.collection("kb_suggestions")
+      .find(filter).sort({ frequency: -1, lastAskedAt: -1 }).limit(50).toArray();
+    res.json({ count: suggestions.length, suggestions });
+  } catch { res.status(500).json({ error: "Internal error" }); }
+});
+
+app.post("/api/kb-suggestions/:id/resolve", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB error" });
+  try {
+    const { ObjectId } = require("mongodb");
+    await db.collection("kb_suggestions").updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { status: "resolved", resolvedAt: new Date() } }
+    );
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Internal error" }); }
+});
 
 // === Claim API endpoints ===
 app.get("/api/claims", requireAuth, async (req, res) => {
