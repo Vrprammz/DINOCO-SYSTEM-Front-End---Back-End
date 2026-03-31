@@ -2920,10 +2920,10 @@ app.post("/webhook/meta", express.raw({ type: "*/*" }), async (req, res) => {
 
         console.log(`[Meta/${platform}] ${userName}@${sourceId.substring(0, 12)}: ${msgText.substring(0, 60)}`)
 
-        // === [Privacy] แจ้ง PDPA ข้อความแรก (Meta) ===
-        sendPrivacyNoticeIfNeeded(sourceId, platform, () =>
-          sendMetaMessage(senderId, PRIVACY_TEXT)
-        ).catch(() => {})
+        // === [Privacy] PDPA disabled — จะเปิดเมื่อทำข้อความ DINOCO เสร็จ ===
+        // sendPrivacyNoticeIfNeeded(sourceId, platform, () =>
+        //   sendMetaMessage(senderId, DINOCO_PRIVACY_TEXT)
+        // ).catch(() => {})
 
         analyzeChat(sourceId, userName, msgText, senderId, { type: "user" }).catch((e) => console.error("[Meta/Skill] Catch:", e.message))
         learnFromMessage(sourceId, userName, msgText, "text", "user").catch(() => {})
