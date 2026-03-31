@@ -1,0 +1,396 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2F] Snippet 11: Cron Jobs & Reminders                    ║
+ * ║  Version: V.1.0                                              ║
+ * ║  DB_ID: 1171                                                 ║
+ * ║  Kill Switch: define('B2F_DISABLED', true)                   ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * Cron jobs สำหรับ B2F:
+ * 1. เตือนจัดส่ง (D-3, D-1, D-day, D+1, D+3, D+7+)
+ * 2. เตือน Maker ไม่ตอบ (24h, 48h, escalate 72h)
+ * 3. เตือนชำระเงิน Admin (credit term -7, -3, ครบ, +3, +7 auto hold)
+ * 4. สรุปประจำวัน
+ * 5. สรุปรายสัปดาห์
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
+
+// ════════════════════════════════════════════
+// 1. REGISTER CRON SCHEDULES + EVENTS
+// ════════════════════════════════════════════
+
+add_action( 'init', function () {
+    // ใช้ interval ที่มีอยู่ (จาก WP Fastest Cache หรือ built-in)
+    $avail = wp_get_schedules();
+    $daily = 'daily';
+    $weekly = 'weekly';
+
+    $events = array(
+        'b2f_cron_delivery_reminder'  => array( 'time' => '01:30:00', 'recurrence' => $daily ),  // 08:30 ICT
+        'b2f_cron_overdue_check'      => array( 'time' => '02:00:00', 'recurrence' => $daily ),  // 09:00 ICT
+        'b2f_cron_maker_noresponse'   => array( 'time' => '02:30:00', 'recurrence' => $daily ),  // 09:30 ICT
+        'b2f_cron_payment_reminder'   => array( 'time' => '03:00:00', 'recurrence' => $daily ),  // 10:00 ICT
+        'b2f_cron_daily_summary'      => array( 'time' => '11:00:00', 'recurrence' => $daily ),  // 18:00 ICT
+    );
+
+    foreach ( $events as $hook => $cfg ) {
+        if ( ! wp_next_scheduled( $hook ) ) {
+            $next = strtotime( 'today ' . $cfg['time'] . ' UTC' );
+            if ( $next < time() ) $next = strtotime( 'tomorrow ' . $cfg['time'] . ' UTC' );
+            wp_schedule_event( $next, $cfg['recurrence'], $hook );
+        }
+    }
+
+    // Weekly summary — จันทร์ 09:00 ICT (02:00 UTC)
+    if ( ! wp_next_scheduled( 'b2f_cron_weekly_summary' ) ) {
+        $next_mon = strtotime( 'next monday 02:00:00 UTC' );
+        wp_schedule_event( $next_mon, $weekly, 'b2f_cron_weekly_summary' );
+    }
+} );
+
+// ════════════════════════════════════════════
+// 2. เตือนจัดส่ง (D-3, D-1, D-day)
+// ════════════════════════════════════════════
+
+add_action( 'b2f_cron_delivery_reminder', 'b2f_run_delivery_reminder' );
+
+if ( ! function_exists( 'b2f_run_delivery_reminder' ) ) {
+    function b2f_run_delivery_reminder() {
+        global $wpdb;
+        $today = wp_date( 'Y-m-d' );
+
+        // Query PO ที่ confirmed + มี expected_date
+        $pos = $wpdb->get_results( $wpdb->prepare(
+            "SELECT p.ID FROM {$wpdb->posts} p
+             JOIN {$wpdb->postmeta} ps ON ps.post_id = p.ID AND ps.meta_key = 'po_status'
+             JOIN {$wpdb->postmeta} pe ON pe.post_id = p.ID AND pe.meta_key = 'po_expected_date'
+             WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+             AND ps.meta_value IN ('confirmed', 'delivering')
+             AND pe.meta_value != '' AND pe.meta_value >= %s
+             ORDER BY pe.meta_value ASC",
+            date( 'Y-m-d', strtotime( '-1 day' ) ) // รวม D-day
+        ) );
+
+        if ( empty( $pos ) ) return;
+
+        foreach ( $pos as $po ) {
+            $eta = get_field( 'po_expected_date', $po->ID );
+            if ( empty( $eta ) ) continue;
+
+            $days = (int) round( ( strtotime( $eta ) - strtotime( $today ) ) / 86400 );
+            $last_sent = get_post_meta( $po->ID, '_b2f_last_reminder_date', true );
+            if ( $last_sent === $today ) continue; // ส่งแล้ววันนี้
+
+            $send = false;
+            $emoji = '📦';
+            $msg = '';
+
+            if ( $days === 3 ) {
+                $send = true; $emoji = '📦'; $msg = 'เหลืออีก 3 วัน จะถึงกำหนดส่ง';
+            } elseif ( $days === 1 ) {
+                $send = true; $emoji = '⚠️'; $msg = 'พรุ่งนี้ครบกำหนดส่ง';
+            } elseif ( $days === 0 ) {
+                $send = true; $emoji = '🔴'; $msg = 'วันนี้ครบกำหนดส่ง';
+            }
+
+            if ( $send ) {
+                $po_number = get_field( 'po_number', $po->ID ) ?: '#' . $po->ID;
+                $maker_id = get_field( 'po_maker_id', $po->ID );
+                $maker_group = is_numeric( $maker_id ) ? get_field( 'maker_line_group_id', $maker_id ) : '';
+                $maker_name = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
+                $thai_date = date( 'd/m/Y', strtotime( $eta ) );
+
+                $text = "{$emoji} เตือนจัดส่ง\nPO: {$po_number}\nกำหนดส่ง: {$thai_date}\n{$msg}";
+
+                // ส่ง Maker
+                if ( $maker_group && function_exists( 'b2f_line_push' ) ) {
+                    b2f_line_push( $maker_group, array( array( 'type' => 'text', 'text' => $text ) ) );
+                }
+                // ส่ง Admin (D-1 + D-day)
+                if ( $days <= 1 && defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2f_line_push' ) ) {
+                    b2f_line_push( B2B_ADMIN_GROUP_ID, array( array( 'type' => 'text', 'text' => "{$emoji} B2F เตือนจัดส่ง\n{$po_number} · {$maker_name}\n{$msg}" ) ) );
+                }
+
+                update_post_meta( $po->ID, '_b2f_last_reminder_date', $today );
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 3. เตือนล่าช้า (D+1, D+3, D+7+)
+// ════════════════════════════════════════════
+
+add_action( 'b2f_cron_overdue_check', 'b2f_run_overdue_check' );
+
+if ( ! function_exists( 'b2f_run_overdue_check' ) ) {
+    function b2f_run_overdue_check() {
+        global $wpdb;
+        $today = wp_date( 'Y-m-d' );
+
+        $pos = $wpdb->get_results(
+            "SELECT p.ID FROM {$wpdb->posts} p
+             JOIN {$wpdb->postmeta} ps ON ps.post_id = p.ID AND ps.meta_key = 'po_status'
+             JOIN {$wpdb->postmeta} pe ON pe.post_id = p.ID AND pe.meta_key = 'po_expected_date'
+             WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+             AND ps.meta_value IN ('confirmed', 'delivering')
+             AND pe.meta_value != '' AND pe.meta_value < CURDATE()"
+        );
+
+        foreach ( $pos as $po ) {
+            $eta = get_field( 'po_expected_date', $po->ID );
+            $days_late = (int) floor( ( strtotime( $today ) - strtotime( $eta ) ) / 86400 );
+            $last_sent = get_post_meta( $po->ID, '_b2f_last_overdue_date', true );
+            if ( $last_sent === $today ) continue;
+
+            $send = false;
+            if ( $days_late === 1 || $days_late === 3 || ( $days_late >= 7 && $days_late % 3 === 0 ) ) {
+                $send = true;
+            }
+
+            if ( $send ) {
+                $po_number = get_field( 'po_number', $po->ID ) ?: '#' . $po->ID;
+                $maker_id = get_field( 'po_maker_id', $po->ID );
+                $maker_group = is_numeric( $maker_id ) ? get_field( 'maker_line_group_id', $maker_id ) : '';
+                $maker_name = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
+                $color = $days_late >= 7 ? '🚨' : ( $days_late >= 3 ? '🔴' : '⚠️' );
+
+                // ส่ง Maker
+                if ( $maker_group && function_exists( 'b2f_line_push' ) ) {
+                    b2f_line_push( $maker_group, array( array( 'type' => 'text', 'text' => "{$color} PO ล่าช้า {$days_late} วัน\n{$po_number}\nกรุณาจัดส่งโดยเร็ว" ) ) );
+                }
+                // ส่ง Admin
+                if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2f_line_push' ) ) {
+                    b2f_line_push( B2B_ADMIN_GROUP_ID, array( array( 'type' => 'text', 'text' => "{$color} B2F ล่าช้า {$days_late} วัน\n{$po_number} · {$maker_name}\nกรุณาติดต่อโรงงาน" ) ) );
+                }
+
+                update_post_meta( $po->ID, '_b2f_last_overdue_date', $today );
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 4. เตือน Maker ไม่ตอบ (24h, 48h, escalate 72h)
+// ════════════════════════════════════════════
+
+add_action( 'b2f_cron_maker_noresponse', 'b2f_run_maker_noresponse' );
+
+if ( ! function_exists( 'b2f_run_maker_noresponse' ) ) {
+    function b2f_run_maker_noresponse() {
+        $pos = get_posts( array(
+            'post_type' => 'b2f_order', 'posts_per_page' => -1, 'post_status' => 'publish',
+            'meta_query' => array( array( 'key' => 'po_status', 'value' => 'submitted' ) ),
+        ) );
+
+        foreach ( $pos as $po ) {
+            $created = get_post_time( 'U', true, $po->ID );
+            $hours = ( time() - $created ) / 3600;
+            $last_sent = get_post_meta( $po->ID, '_b2f_noresponse_hours', true );
+
+            $send_at = 0;
+            if ( $hours >= 72 && $last_sent < 72 ) $send_at = 72;
+            elseif ( $hours >= 48 && $last_sent < 48 ) $send_at = 48;
+            elseif ( $hours >= 24 && $last_sent < 24 ) $send_at = 24;
+
+            if ( $send_at > 0 ) {
+                $po_number = get_field( 'po_number', $po->ID ) ?: '#' . $po->ID;
+                $maker_id = get_field( 'po_maker_id', $po->ID );
+                $maker_group = is_numeric( $maker_id ) ? get_field( 'maker_line_group_id', $maker_id ) : '';
+                $maker_name = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
+
+                if ( $send_at < 72 ) {
+                    // เตือน Maker
+                    if ( $maker_group && function_exists( 'b2f_line_push' ) ) {
+                        b2f_line_push( $maker_group, array( array( 'type' => 'text', 'text' => "📋 เตือน: PO {$po_number} รอการยืนยัน\nกรุณายืนยันหรือปฏิเสธใบสั่งซื้อ" ) ) );
+                    }
+                } else {
+                    // Escalate ไป Admin
+                    if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2f_line_push' ) ) {
+                        b2f_line_push( B2B_ADMIN_GROUP_ID, array( array( 'type' => 'text', 'text' => "🚨 Maker ไม่ตอบ 72 ชม.\nPO: {$po_number}\nโรงงาน: {$maker_name}\nกรุณาติดต่อโรงงานโดยตรง" ) ) );
+                    }
+                }
+
+                update_post_meta( $po->ID, '_b2f_noresponse_hours', $send_at );
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 5. เตือนชำระเงิน Admin (credit term)
+// ════════════════════════════════════════════
+
+add_action( 'b2f_cron_payment_reminder', 'b2f_run_payment_reminder' );
+
+if ( ! function_exists( 'b2f_run_payment_reminder' ) ) {
+    function b2f_run_payment_reminder() {
+        // หา PO ที่ received + ยังไม่จ่าย/จ่ายบางส่วน
+        $pos = get_posts( array(
+            'post_type' => 'b2f_order', 'posts_per_page' => -1, 'post_status' => 'publish',
+            'meta_query' => array(
+                array( 'key' => 'po_status', 'value' => array( 'received', 'partial_received', 'partial_paid' ), 'compare' => 'IN' ),
+            ),
+        ) );
+
+        $today = wp_date( 'Y-m-d' );
+
+        foreach ( $pos as $po ) {
+            $maker_id = get_field( 'po_maker_id', $po->ID );
+            $credit_term = is_numeric( $maker_id ) ? intval( get_field( 'maker_credit_term_days', $maker_id ) ?: 30 ) : 30;
+
+            // คำนวณวันครบกำหนดจ่าย = วันที่ตรวจรับ + credit term
+            $received_date = '';
+            // หาวันที่ตรวจรับล่าสุด
+            $rcvs = get_posts( array( 'post_type' => 'b2f_receiving', 'posts_per_page' => 1,
+                'meta_query' => array( array( 'key' => 'rcv_po_id', 'value' => $po->ID ) ),
+                'orderby' => 'date', 'order' => 'DESC' ) );
+            if ( ! empty( $rcvs ) ) {
+                $received_date = get_field( 'rcv_date', $rcvs[0]->ID ) ?: get_the_date( 'Y-m-d', $rcvs[0]->ID );
+            }
+            if ( empty( $received_date ) ) continue;
+
+            $due_date = date( 'Y-m-d', strtotime( $received_date . ' + ' . $credit_term . ' days' ) );
+            $days_to_due = (int) round( ( strtotime( $due_date ) - strtotime( $today ) ) / 86400 );
+
+            $last_sent = get_post_meta( $po->ID, '_b2f_payment_reminder_date', true );
+            if ( $last_sent === $today ) continue;
+
+            $send = false;
+            $msg = '';
+            $emoji = '💰';
+
+            if ( $days_to_due === 7 ) {
+                $send = true; $emoji = '💰'; $msg = 'ใกล้ครบกำหนดจ่ายอีก 7 วัน';
+            } elseif ( $days_to_due === 3 ) {
+                $send = true; $emoji = '⚠️'; $msg = 'ใกล้ครบกำหนดจ่ายอีก 3 วัน';
+            } elseif ( $days_to_due === 0 ) {
+                $send = true; $emoji = '🔴'; $msg = 'วันนี้ครบกำหนดจ่ายเงิน';
+            } elseif ( $days_to_due === -3 ) {
+                $send = true; $emoji = '🚨'; $msg = 'เลยกำหนดจ่าย 3 วัน';
+            } elseif ( $days_to_due === -7 ) {
+                $send = true; $emoji = '🚨'; $msg = 'เลยกำหนดจ่าย 7 วัน — ระงับเครดิตอัตโนมัติ';
+                // Auto credit hold
+                if ( is_numeric( $maker_id ) && function_exists( 'update_field' ) ) {
+                    update_field( 'maker_credit_hold', true, $maker_id );
+                    update_field( 'maker_credit_hold_reason', 'auto', $maker_id );
+                    if ( function_exists( 'b2f_log' ) ) b2f_log( "[Cron] Auto credit hold maker #{$maker_id} — overdue 7 days" );
+                }
+            }
+
+            if ( $send && defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2f_line_push' ) ) {
+                $po_number = get_field( 'po_number', $po->ID ) ?: '#' . $po->ID;
+                $maker_name = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
+                $total = floatval( get_field( 'po_total_amount', $po->ID ) ?: 0 );
+                $paid = floatval( get_field( 'po_paid_amount', $po->ID ) ?: 0 );
+                $remaining = $total - $paid;
+
+                b2f_line_push( B2B_ADMIN_GROUP_ID, array( array( 'type' => 'text',
+                    'text' => "{$emoji} เตือนชำระเงินโรงงาน\nPO: {$po_number}\nโรงงาน: {$maker_name}\nยอดค้าง: ฿" . number_format( $remaining, 2 ) . "\nครบกำหนด: " . date( 'd/m/Y', strtotime( $due_date ) ) . "\n{$msg}",
+                ) ) );
+
+                update_post_meta( $po->ID, '_b2f_payment_reminder_date', $today );
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 6. สรุปประจำวัน (18:00 ICT)
+// ════════════════════════════════════════════
+
+add_action( 'b2f_cron_daily_summary', 'b2f_run_daily_summary' );
+
+if ( ! function_exists( 'b2f_run_daily_summary' ) ) {
+    function b2f_run_daily_summary() {
+        global $wpdb;
+        $counts = array();
+        foreach ( array( 'submitted', 'confirmed', 'delivering', 'partial_received', 'received' ) as $s ) {
+            $counts[ $s ] = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'po_status'
+                 WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish' AND pm.meta_value = %s", $s
+            ) );
+        }
+
+        $overdue = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->posts} p
+             JOIN {$wpdb->postmeta} ps ON ps.post_id = p.ID AND ps.meta_key = 'po_status'
+             JOIN {$wpdb->postmeta} pe ON pe.post_id = p.ID AND pe.meta_key = 'po_expected_date'
+             WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+             AND ps.meta_value IN ('confirmed','delivering') AND pe.meta_value < CURDATE() AND pe.meta_value != ''"
+        );
+
+        $total_payable = (float) $wpdb->get_var(
+            "SELECT COALESCE(SUM(CAST(pm.meta_value AS DECIMAL(12,2))),0)
+             FROM {$wpdb->posts} p JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'maker_current_debt'
+             WHERE p.post_type = 'b2f_maker' AND p.post_status = 'publish'"
+        );
+
+        $total_active = array_sum( $counts );
+        if ( $total_active === 0 && $overdue === 0 ) return; // ไม่มีอะไรแจ้ง
+
+        $lines = array(
+            '🏭 สรุป B2F ประจำวัน',
+            '',
+            '📝 รอ Maker ยืนยัน: ' . $counts['submitted'],
+            '✅ ยืนยันแล้ว: ' . $counts['confirmed'],
+            '🚚 กำลังส่ง: ' . $counts['delivering'],
+            '📦 รับบางส่วน: ' . $counts['partial_received'],
+            '💰 รอจ่ายเงิน: ' . $counts['received'],
+        );
+        if ( $overdue > 0 ) $lines[] = '⚠️ ล่าช้า: ' . $overdue . ' PO';
+        $lines[] = '';
+        $lines[] = '💳 ค้างจ่ายรวม: ฿' . number_format( $total_payable, 2 );
+
+        if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2f_line_push' ) ) {
+            b2f_line_push( B2B_ADMIN_GROUP_ID, array( array( 'type' => 'text', 'text' => implode( "\n", $lines ) ) ) );
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// 7. สรุปรายสัปดาห์ (จันทร์ 09:00 ICT)
+// ════════════════════════════════════════════
+
+add_action( 'b2f_cron_weekly_summary', 'b2f_run_weekly_summary' );
+
+if ( ! function_exists( 'b2f_run_weekly_summary' ) ) {
+    function b2f_run_weekly_summary() {
+        global $wpdb;
+        $week_ago = date( 'Y-m-d', strtotime( '-7 days' ) );
+
+        // PO สร้างสัปดาห์นี้
+        $new_pos = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'b2f_order' AND post_status = 'publish' AND post_date >= %s", $week_ago
+        ) );
+
+        // PO completed สัปดาห์นี้
+        $completed = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->posts} p
+             JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = 'po_status'
+             WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish' AND pm.meta_value = 'completed'
+             AND p.post_modified >= %s", $week_ago
+        ) );
+
+        // ค้างจ่ายรวม
+        $total_payable = (float) $wpdb->get_var(
+            "SELECT COALESCE(SUM(CAST(pm.meta_value AS DECIMAL(12,2))),0)
+             FROM {$wpdb->posts} p JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'maker_current_debt'
+             WHERE p.post_type = 'b2f_maker' AND p.post_status = 'publish'"
+        );
+
+        $lines = array(
+            '📊 สรุป B2F รายสัปดาห์',
+            '',
+            '📋 PO ใหม่: ' . $new_pos . ' ใบ',
+            '✅ PO เสร็จ: ' . $completed . ' ใบ',
+            '💳 ค้างจ่ายรวม: ฿' . number_format( $total_payable, 2 ),
+        );
+
+        if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2f_line_push' ) ) {
+            b2f_line_push( B2B_ADMIN_GROUP_ID, array( array( 'type' => 'text', 'text' => implode( "\n", $lines ) ) ) );
+        }
+    }
+}
