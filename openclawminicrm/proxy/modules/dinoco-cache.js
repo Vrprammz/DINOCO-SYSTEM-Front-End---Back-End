@@ -52,12 +52,41 @@ function invalidateWPCache(key) {
   console.log(`[Cache] Invalidated: ${key}`);
 }
 
+// Circuit breaker state (shared in-process)
+const circuitBreaker = { failures: 0, lastFailure: 0, open: false, threshold: 3, cooldownMs: 5 * 60 * 1000 };
+
+function isCircuitOpen() {
+  if (!circuitBreaker.open) return false;
+  if (Date.now() - circuitBreaker.lastFailure > circuitBreaker.cooldownMs) {
+    circuitBreaker.open = false; circuitBreaker.failures = 0;
+    console.log("[CircuitBreaker] Reset — MCP Bridge retry");
+    return false;
+  }
+  return true;
+}
+
+function recordSuccess() { circuitBreaker.failures = 0; circuitBreaker.open = false; }
+function recordFailure() {
+  circuitBreaker.failures++; circuitBreaker.lastFailure = Date.now();
+  if (circuitBreaker.failures >= circuitBreaker.threshold) {
+    circuitBreaker.open = true;
+    console.error(`[CircuitBreaker] OPEN — MCP Bridge failed ${circuitBreaker.failures}x`);
+  }
+}
+
 async function callDinocoAPI(endpoint, body = null) {
   if (!DINOCO_WP_URL) return "WordPress Bridge ยังไม่ได้ตั้งค่า";
 
   const cacheKey = endpoint === "/catalog-full" ? "catalog" : endpoint === "/kb-export" ? "kb" : null;
   if (cacheKey && !body && wpCache[cacheKey].data && Date.now() < wpCache[cacheKey].expires) {
     return wpCache[cacheKey].data;
+  }
+
+  // Circuit breaker — ถ้า open ใช้ stale cache หรือ fallback
+  if (isCircuitOpen()) {
+    console.warn(`[CircuitBreaker] OPEN — skip ${endpoint}, use fallback`);
+    if (cacheKey && wpCache[cacheKey].stale) return wpCache[cacheKey].stale;
+    return "ขอเช็คข้อมูลกับทีมงานก่อนนะคะ (ระบบกำลังซ่อมบำรุง)";
   }
 
   try {
@@ -73,21 +102,25 @@ async function callDinocoAPI(endpoint, body = null) {
       await new Promise((r) => setTimeout(r, 2000));
       const retry = await fetch(url, opts).catch(() => null);
       if (retry?.ok) {
+        recordSuccess();
         const data = await retry.json();
         if (cacheKey) { wpCache[cacheKey] = { data, expires: Date.now() + (CACHE_TTL[cacheKey] || 900000), stale: data }; }
         return data;
       }
+      recordFailure();
       if (cacheKey && wpCache[cacheKey].stale) {
         console.warn(`[DINOCO API] ${endpoint} failed — using stale cache`);
         return wpCache[cacheKey].stale;
       }
       return `WordPress API error ${res.status}`;
     }
+    recordSuccess();
     const data = await res.json();
     if (cacheKey) { wpCache[cacheKey] = { data, expires: Date.now() + (CACHE_TTL[cacheKey] || 900000), stale: data }; }
     return data;
   } catch (e) {
     console.error("[DINOCO API]", e.message);
+    recordFailure();
     if (cacheKey && wpCache[cacheKey].stale) {
       console.warn(`[DINOCO API] ${endpoint} error — using stale cache`);
       return wpCache[cacheKey].stale;
@@ -101,6 +134,7 @@ module.exports = {
   DINOCO_WP_KEY,
   wpCache,
   CACHE_TTL,
+  circuitBreaker,
   callDinocoAPIRaw,
   preloadWPCache,
   invalidateWPCache,

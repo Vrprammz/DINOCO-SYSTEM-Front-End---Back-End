@@ -1179,7 +1179,22 @@ app.post("/api/advisor/update-pulled", express.json(), async (req, res) => { res
 app.post("/api/advisor/cost", express.json(), async (req, res) => { const db = await getDB(); if (!db) return res.status(500).json({ error: "DB" }); await db.collection("ai_costs").insertOne({ ...req.body, createdAt: new Date() }); res.json({ ok: true }); });
 
 // === Health check + root ===
-app.get("/", (req, res) => { res.json({ status: "ok", service: "OpenClaw Mini CRM AI Agent", version: "2.0-modular" }); });
+app.get("/", (req, res) => { res.json({ status: "ok", service: "DINOCO AI Agent", version: "2.1-hardened" }); });
+
+// === [Production] Health Check (V.1.0) — Uptime Robot ping ===
+const APP_START = Date.now();
+const { circuitBreaker } = require("./modules/dinoco-cache");
+app.get("/health", async (req, res) => {
+  const checks = { db: false, mcp_circuit: circuitBreaker.open ? "OPEN" : "closed", uptime: Math.floor((Date.now() - APP_START) / 1000) };
+  try {
+    const db = await getDB();
+    if (db) { await db.command({ ping: 1 }); checks.db = true; }
+  } catch {}
+  const healthy = checks.db;
+  res.status(healthy ? 200 : 503).json({ status: healthy ? "ok" : "degraded", ...checks, version: "2.1-hardened" });
+});
+
+// Circuit breaker อยู่ใน modules/dinoco-cache.js — ใช้ร่วมกับ callDinocoAPI()
 
 // === Indexes ===
 async function ensureIndexes() {
