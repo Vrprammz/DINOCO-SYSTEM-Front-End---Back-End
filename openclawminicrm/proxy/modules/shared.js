@@ -54,6 +54,66 @@ const DEFAULT_PROMPT = `คุณคือ AI ผู้ช่วยของ DIN
 - ห้ามพูดถึงคู่แข่งในแง่ลบ
 - ถ้าลูกค้าต้องการคุยกับคนจริง ให้ส่งเรื่องให้แอดมินทันที`;
 
+// === [DINOCO] Dynamic Keys — อ่านจาก Dashboard settings (MongoDB) ก่อน fallback .env ===
+let _cachedAccountKeys = null;
+let _cachedAccountKeysAt = 0;
+const ACCOUNT_KEYS_TTL = 60 * 1000; // refresh ทุก 60 วินาที
+
+async function loadAccountKeys() {
+  if (_cachedAccountKeys && Date.now() - _cachedAccountKeysAt < ACCOUNT_KEYS_TTL) return _cachedAccountKeys;
+  try {
+    const database = await getDB();
+    if (!database) return null;
+    const account = await database.collection("accounts").findOne({}, { sort: { updatedAt: -1 } });
+    if (account) {
+      _cachedAccountKeys = account;
+      _cachedAccountKeysAt = Date.now();
+    }
+    return account;
+  } catch { return null; }
+}
+
+// อ่าน key จาก MongoDB (Dashboard settings) ก่อน → fallback process.env
+async function getDynamicKey(keyName) {
+  const account = await loadAccountKeys();
+  const mapping = {
+    GOOGLE_API_KEY: account?.aiKeys?.googleKey,
+    OPENROUTER_API_KEY: account?.aiKeys?.openrouterKey,
+    GROQ_API_KEY: account?.aiKeys?.groqKey,
+    SAMBANOVA_API_KEY: account?.aiKeys?.sambaNovaKey,
+    CEREBRAS_API_KEY: account?.aiKeys?.cerebrasKey,
+    ANTHROPIC_API_KEY: account?.aiKeys?.anthropicKey,
+    LINE_CHANNEL_ACCESS_TOKEN: account?.lineConfig?.channelAccessToken,
+    LINE_CHANNEL_SECRET: account?.lineConfig?.channelSecret,
+    FB_PAGE_ACCESS_TOKEN: account?.fbConfig?.pageAccessToken,
+    FB_APP_SECRET: account?.fbConfig?.appSecret,
+    FB_VERIFY_TOKEN: account?.fbConfig?.verifyToken,
+  };
+  return mapping[keyName] || process.env[keyName] || "";
+}
+
+// Sync: อ่านทันที (ใช้ cached ถ้ามี fallback env)
+function getDynamicKeySync(keyName) {
+  const account = _cachedAccountKeys;
+  if (account) {
+    const mapping = {
+      GOOGLE_API_KEY: account?.aiKeys?.googleKey,
+      OPENROUTER_API_KEY: account?.aiKeys?.openrouterKey,
+      GROQ_API_KEY: account?.aiKeys?.groqKey,
+      SAMBANOVA_API_KEY: account?.aiKeys?.sambaNovaKey,
+      CEREBRAS_API_KEY: account?.aiKeys?.cerebrasKey,
+      ANTHROPIC_API_KEY: account?.aiKeys?.anthropicKey,
+      LINE_CHANNEL_ACCESS_TOKEN: account?.lineConfig?.channelAccessToken,
+      LINE_CHANNEL_SECRET: account?.lineConfig?.channelSecret,
+      FB_PAGE_ACCESS_TOKEN: account?.fbConfig?.pageAccessToken,
+      FB_APP_SECRET: account?.fbConfig?.appSecret,
+      FB_VERIFY_TOKEN: account?.fbConfig?.verifyToken,
+    };
+    if (mapping[keyName]) return mapping[keyName];
+  }
+  return process.env[keyName] || "";
+}
+
 // === A/B Testing Prompts ===
 const AB_PROMPTS = {
   A: "ตอบสั้นๆ กระชับ ไม่เกิน 2 ประโยค",
@@ -257,4 +317,8 @@ module.exports = {
   KUNG_TO_FEATURE,
   KUNG_NAMES,
   KUNG_ID_TO_NAME,
+  getDynamicKey,
+  getDynamicKeySync,
+  loadAccountKeys,
+  get _cachedAccountKeys() { return _cachedAccountKeys; },
 };

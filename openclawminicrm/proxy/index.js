@@ -23,6 +23,7 @@ const { getDB, MESSAGES_COLL, AUDIT_LOG_COLL, KB_COLL, MEMORY_COLL, SKILL_LESSON
   DINOCO_PRIVACY_TEXT, PRIVACY_TEXT, mcpTools, mcpToolHandlers,
   QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, PAYMENT_KEYWORDS,
   KUNG_STAFF, KUNG_TO_FEATURE, KUNG_NAMES, KUNG_ID_TO_NAME,
+  getDynamicKeySync, loadAccountKeys,
 } = shared;
 
 const auth = require("./middleware/auth");
@@ -195,7 +196,7 @@ app.use("/dashboard", (req, res) => {
 
 // === Download image from LINE ===
 async function downloadLineImage(messageId) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
   if (!token) return null;
   try {
     const res = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, { headers: { Authorization: `Bearer ${token}` } });
@@ -206,7 +207,7 @@ async function downloadLineImage(messageId) {
 
 // === Get user profile ===
 async function getUserName(source) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
   if (!token) return "User";
   try {
     let url;
@@ -316,7 +317,7 @@ async function getRecentMessages(sourceId, limit = 10) {
 
 // === Group helpers ===
 async function getGroupName(groupId) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
   if (!token || !groupId) return null;
   try {
     const res = await fetch(`https://api.line.me/v2/bot/group/${groupId}/summary`, { headers: { Authorization: `Bearer ${token}` } });
@@ -742,7 +743,7 @@ async function initMCPServers() {
 // Meta signature verification
 function verifyMetaSignature(rawBody, signature) {
   if (!signature) return false;
-  const secret = process.env.FB_APP_SECRET;
+  const secret = getDynamicKeySync("FB_APP_SECRET");
   if (!secret) return false;
   const digest = "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
   try { return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature)); } catch { return false; }
@@ -754,7 +755,7 @@ const META_PROFILE_TTL = 3600000;
 async function getMetaUserProfile(userId) {
   const cached = metaProfileCache[userId];
   if (cached && Date.now() - cached._ts < META_PROFILE_TTL) return cached;
-  const token = process.env.FB_PAGE_ACCESS_TOKEN;
+  const token = getDynamicKeySync("FB_PAGE_ACCESS_TOKEN");
   if (!token) return { name: userId, profilePic: null };
   try {
     const res = await fetch(`https://graph.facebook.com/v19.0/${userId}?fields=name,profile_pic&access_token=${token}`, { signal: AbortSignal.timeout(5000) });
@@ -769,7 +770,7 @@ async function getMetaUserProfile(userId) {
 // LINE signature verification
 function verifyLineSignature(rawBody, signature) {
   if (!signature) return false;
-  const secret = process.env.LINE_CHANNEL_SECRET || "";
+  const secret = getDynamicKeySync("LINE_CHANNEL_SECRET") || "";
   if (!secret) return false;
   const digest = crypto.createHmac("SHA256", secret).update(rawBody).digest("base64");
   try { return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature)); } catch { return false; }
@@ -808,7 +809,7 @@ async function analyzeChat(sourceId, userName, messageText, lineUserId, source) 
       let lineProfile = {};
       if (lineUserId) {
         try {
-          const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+          const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
           let profileUrl = source?.type === "group" && source?.groupId ? `https://api.line.me/v2/bot/group/${source.groupId}/member/${lineUserId}` : `https://api.line.me/v2/bot/profile/${lineUserId}`;
           const pRes = await fetch(profileUrl, { headers: { Authorization: `Bearer ${token}` } });
           if (pRes.ok) { const p = await pRes.json(); lineProfile = { avatarUrl: p.pictureUrl || "", lineId: lineUserId, statusMessage: p.statusMessage || "" }; }
@@ -955,8 +956,8 @@ app.get("/webhook/meta", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-  if (!process.env.FB_VERIFY_TOKEN) return res.status(503).send("FB_VERIFY_TOKEN not configured");
-  if (mode === "subscribe" && token === process.env.FB_VERIFY_TOKEN) { console.log("[Meta] Webhook verified"); return res.status(200).send(challenge); }
+  if (!getDynamicKeySync("FB_VERIFY_TOKEN")) return res.status(503).send("FB_VERIFY_TOKEN not configured");
+  if (mode === "subscribe" && token === getDynamicKeySync("FB_VERIFY_TOKEN")) { console.log("[Meta] Webhook verified"); return res.status(200).send(challenge); }
   return res.status(403).send("Forbidden");
 });
 
@@ -1194,6 +1195,33 @@ app.get("/health", async (req, res) => {
   res.status(healthy ? 200 : 503).json({ status: healthy ? "ok" : "degraded", ...checks, version: "2.1-hardened" });
 });
 
+// === [DINOCO] Active Keys Status — Dashboard เรียกดูว่า key ไหนใช้งานอยู่ ===
+app.get("/api/keys-status", requireAuth, async (req, res) => {
+  const mask = (v) => v ? v.slice(0, 4) + "••••" + v.slice(-4) : "";
+  const keys = {
+    GOOGLE_API_KEY: { value: mask(getDynamicKeySync("GOOGLE_API_KEY")), source: _getKeySource("GOOGLE_API_KEY") },
+    ANTHROPIC_API_KEY: { value: mask(getDynamicKeySync("ANTHROPIC_API_KEY")), source: _getKeySource("ANTHROPIC_API_KEY") },
+    OPENROUTER_API_KEY: { value: mask(getDynamicKeySync("OPENROUTER_API_KEY")), source: _getKeySource("OPENROUTER_API_KEY") },
+    LINE_CHANNEL_ACCESS_TOKEN: { value: mask(getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN")), source: _getKeySource("LINE_CHANNEL_ACCESS_TOKEN") },
+    FB_PAGE_ACCESS_TOKEN: { value: mask(getDynamicKeySync("FB_PAGE_ACCESS_TOKEN")), source: _getKeySource("FB_PAGE_ACCESS_TOKEN") },
+  };
+  res.json({ keys });
+});
+
+function _getKeySource(keyName) {
+  const account = shared._cachedAccountKeys;
+  const mapping = {
+    GOOGLE_API_KEY: account?.aiKeys?.googleKey,
+    ANTHROPIC_API_KEY: account?.aiKeys?.anthropicKey,
+    OPENROUTER_API_KEY: account?.aiKeys?.openrouterKey,
+    LINE_CHANNEL_ACCESS_TOKEN: account?.lineConfig?.channelAccessToken,
+    FB_PAGE_ACCESS_TOKEN: account?.fbConfig?.pageAccessToken,
+  };
+  if (mapping[keyName]) return "dashboard";
+  if (process.env[keyName]) return "env";
+  return "not_set";
+}
+
 // Circuit breaker อยู่ใน modules/dinoco-cache.js — ใช้ร่วมกับ callDinocoAPI()
 
 // === Indexes ===
@@ -1227,6 +1255,11 @@ const PORT = process.env.PORT || 3000;
 getDB().then(async () => {
   await ensureIndexes().catch((e) => console.error("[Index] Error:", e.message));
   await initMCPServers().catch((e) => console.error("[MCP] Init error:", e.message));
+  // Load Dashboard keys from MongoDB (warm cache)
+  loadAccountKeys().then((acc) => {
+    if (acc) console.log("[Keys] Dashboard settings loaded from MongoDB");
+    else console.log("[Keys] No Dashboard settings — using .env");
+  }).catch(() => {});
   preloadWPCache().catch(() => {});
   startMayomCron();
   ensureLeadIndexes().catch(() => {});

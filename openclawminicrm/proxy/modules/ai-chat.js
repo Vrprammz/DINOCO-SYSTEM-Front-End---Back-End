@@ -2,7 +2,7 @@
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
  * V.1.0 — Extracted from index.js monolith
  */
-const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools } = require("./shared");
+const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
 
 // Forward declarations — set by init()
@@ -38,7 +38,7 @@ let discoveredFreeModels = [];
 let lastDiscovery = 0;
 
 async function discoverFreeModels() {
-  const key = process.env.OPENROUTER_API_KEY;
+  const key = getDynamicKeySync("OPENROUTER_API_KEY");
   if (!key) return;
   try {
     const res = await fetch("https://openrouter.ai/api/v1/models", {
@@ -70,7 +70,7 @@ discoverFreeModels();
 setInterval(discoverFreeModels, 3600000);
 
 function getOpenRouterFreeProviders() {
-  const key = process.env.OPENROUTER_API_KEY;
+  const key = getDynamicKeySync("OPENROUTER_API_KEY");
   if (!key || discoveredFreeModels.length === 0) {
     return [
       { name: "OR-Nemotron", url: "https://openrouter.ai/api/v1/chat/completions", key, model: "nvidia/nemotron-3-super-120b-a12b:free" },
@@ -131,7 +131,7 @@ async function callLightAI(messages, { json = false, maxTokens = 500, timeout = 
   }
 
   // Last resort: Gemini
-  const googleKey = process.env.GOOGLE_API_KEY;
+  const googleKey = getDynamicKeySync("GOOGLE_API_KEY");
   if (googleKey && (!lightAICooldown["Gemini"] || Date.now() >= lightAICooldown["Gemini"])) {
     try {
       const systemMsg = messages.find((m) => m.role === "system");
@@ -226,7 +226,7 @@ function sanitizeAIOutput(text) {
 
 // === Gemini Flash with Function Calling ===
 async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
-  const apiKey = process.env.GOOGLE_API_KEY;
+  const apiKey = getDynamicKeySync("GOOGLE_API_KEY");
   if (!apiKey) return null;
   const functionDeclarations = tools.map((t) => ({
     name: t.function.name, description: t.function.description, parameters: t.function.parameters,
@@ -274,7 +274,7 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
 
 // === Claude Sonnet with Tool Use ===
 async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = getDynamicKeySync("ANTHROPIC_API_KEY");
   if (!apiKey) return null;
   const claudeTools = tools.map((t) => ({
     name: t.function.name, description: t.function.description, input_schema: t.function.parameters,

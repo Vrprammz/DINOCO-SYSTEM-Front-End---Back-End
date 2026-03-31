@@ -2,7 +2,7 @@
  * platform-response.js — Send messages to LINE / Facebook / Instagram
  * V.1.0 — Extracted from index.js monolith
  */
-const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME } = require("./shared");
+const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, getDynamicKeySync } = require("./shared");
 
 // === Reply Token Cache (LINE Reply API) ===
 const replyTokenCache = new Map();
@@ -37,7 +37,7 @@ setInterval(() => {
 
 // === LINE: Reply to message (free API) ===
 async function replyToLine(replyToken, text, quickReplies) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
   if (!token || !replyToken) return false;
   try {
     const message = { type: "text", text };
@@ -63,7 +63,7 @@ async function replyToLine(replyToken, text, quickReplies) {
 
 // === LINE: Push message (paid, with quick reply support) ===
 async function pushToLine(to, text, quickReplies) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
   if (!token || !to) return;
   try {
     const message = { type: "text", text };
@@ -87,7 +87,7 @@ async function pushToLine(to, text, quickReplies) {
 
 // === LINE: Send Push (array of message objects) ===
 async function sendLinePush(to, messages) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
   if (!token) { console.warn("[Inbox] LINE_CHANNEL_ACCESS_TOKEN not set"); return false; }
   if (messages.length === 0) return false;
   try {
@@ -111,7 +111,7 @@ async function sendLinePush(to, messages) {
 
 // === LINE: Send Reply (array of message objects) ===
 async function sendLineReply(replyToken, messages) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
   if (!token || !replyToken) return false;
   try {
     const res = await fetch("https://api.line.me/v2/bot/message/reply", {
@@ -167,7 +167,7 @@ async function sendLineMessage(sourceId, payload) {
 
 // === Meta (Facebook/Instagram): Send text message ===
 async function sendMetaMessage(recipientId, text) {
-  const token = process.env.FB_PAGE_ACCESS_TOKEN;
+  const token = getDynamicKeySync("FB_PAGE_ACCESS_TOKEN");
   if (!token) return false;
   try {
     const res = await fetch("https://graph.facebook.com/v19.0/me/messages", {
@@ -184,7 +184,7 @@ async function sendMetaMessage(recipientId, text) {
 
 // === Meta: Send image attachment ===
 async function sendMetaImage(recipientId, imageUrl) {
-  const token = process.env.FB_PAGE_ACCESS_TOKEN;
+  const token = getDynamicKeySync("FB_PAGE_ACCESS_TOKEN");
   if (!token || !imageUrl) return false;
   try {
     const res = await fetch("https://graph.facebook.com/v19.0/me/messages", {
@@ -212,7 +212,7 @@ async function sendProductRecommendation(recipientId, platform, products) {
       image_url: p.img_url || undefined,
       buttons: [{ type: "web_url", url: "https://www.dinoco.co.th", title: "ดูรายละเอียด" }],
     }));
-    const token = process.env.FB_PAGE_ACCESS_TOKEN;
+    const token = getDynamicKeySync("FB_PAGE_ACCESS_TOKEN");
     if (!token) return;
     await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -261,7 +261,7 @@ async function sendDealerContactOptions(recipientId, platform, dealerName) {
     { content_type: "text", title: "ดูแผนที่ร้าน", payload: "get_dealer_map" },
   ];
   if (platform === "facebook" || platform === "instagram") {
-    const token = process.env.FB_PAGE_ACCESS_TOKEN;
+    const token = getDynamicKeySync("FB_PAGE_ACCESS_TOKEN");
     if (!token) return;
     await fetch(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
