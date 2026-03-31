@@ -73,12 +73,11 @@ async function loadAccountKeys() {
   } catch { return null; }
 }
 
-// === Seed .env keys → MongoDB (ครั้งแรกที่ยังไม่มีใน accounts) ===
+// === Seed .env keys → MongoDB ทุกครั้งที่ Agent start ===
+// ถ้า .env มีค่า + MongoDB ยังว่าง → ใส่ให้ | ถ้า Dashboard ตั้งเอง → ไม่ overwrite
 async function seedEnvKeysToMongoDB() {
   const database = await getDB();
   if (!database) return;
-
-  const existing = await database.collection("accounts").findOne({}, { sort: { updatedAt: -1 } });
 
   const envKeys = {
     "aiKeys.googleKey": process.env.GOOGLE_API_KEY,
@@ -94,31 +93,62 @@ async function seedEnvKeysToMongoDB() {
     "fbConfig.verifyToken": process.env.FB_VERIFY_TOKEN,
   };
 
-  // เอาเฉพาะ keys ที่มีค่าใน .env + ยังไม่มีใน MongoDB
-  const setFields = {};
-  let count = 0;
-  for (const [path, envVal] of Object.entries(envKeys)) {
-    if (!envVal) continue;
-    // ถ้ามี account อยู่แล้ว → เช็คว่า field นี้ว่างไหม
-    const parts = path.split(".");
-    const existingVal = existing ? parts.reduce((o, k) => o?.[k], existing) : null;
-    if (!existingVal) {
-      setFields[path] = envVal;
-      count++;
+  // Sync ลงทุก account document ที่มี
+  const accounts = await database.collection("accounts").find({}).toArray();
+  const targets = accounts.length > 0 ? accounts : [null]; // null = สร้างใหม่
+
+  for (const existing of targets) {
+    const setFields = {};
+    let count = 0;
+    for (const [path, envVal] of Object.entries(envKeys)) {
+      if (!envVal) continue;
+      const parts = path.split(".");
+      const existingVal = existing ? parts.reduce((o, k) => o?.[k], existing) : null;
+      if (!existingVal) { setFields[path] = envVal; count++; }
+    }
+
+    // setupComplete ต้อง true เสมอ (Agent ทำงานได้ = setup เสร็จ)
+    setFields["setupComplete"] = true;
+    setFields["updatedAt"] = new Date();
+
+    if (existing) {
+      if (count > 0) {
+        await database.collection("accounts").updateOne({ _id: existing._id }, { $set: setFields });
+        console.log(`[Keys] Synced ${count} keys from .env → account ${existing.email || existing._id}`);
+      } else {
+        // ไม่มี key ใหม่ แต่ต้องมั่นใจว่า setupComplete = true
+        await database.collection("accounts").updateOne({ _id: existing._id }, { $set: { setupComplete: true } });
+      }
+    } else {
+      // ไม่มี account เลย → สร้างใหม่
+      await database.collection("accounts").insertOne({
+        email: "admin@dinoco.in.th", name: "DINOCO Admin",
+        ...Object.fromEntries(Object.entries(setFields).map(([k, v]) => {
+          const parts = k.split(".");
+          return parts.length === 1 ? [k, v] : [parts[0], { ...(setFields[parts[0]] || {}), [parts[1]]: v }];
+        }).filter(([, v]) => typeof v !== "object")),
+        aiKeys: {
+          googleKey: envKeys["aiKeys.googleKey"] || "",
+          anthropicKey: envKeys["aiKeys.anthropicKey"] || "",
+          openrouterKey: envKeys["aiKeys.openrouterKey"] || "",
+          groqKey: envKeys["aiKeys.groqKey"] || "",
+          sambaNovaKey: envKeys["aiKeys.sambaNovaKey"] || "",
+          cerebrasKey: envKeys["aiKeys.cerebrasKey"] || "",
+        },
+        lineConfig: {
+          channelAccessToken: envKeys["lineConfig.channelAccessToken"] || "",
+          channelSecret: envKeys["lineConfig.channelSecret"] || "",
+        },
+        fbConfig: {
+          pageAccessToken: envKeys["fbConfig.pageAccessToken"] || "",
+          appSecret: envKeys["fbConfig.appSecret"] || "",
+          verifyToken: envKeys["fbConfig.verifyToken"] || "",
+        },
+        setupComplete: true, createdAt: new Date(), updatedAt: new Date(),
+      });
+      console.log(`[Keys] Created new account with ${count} keys from .env`);
     }
   }
-
-  if (count === 0) return;
-
-  await database.collection("accounts").updateOne(
-    existing ? { _id: existing._id } : { email: "admin@dinoco.in.th" },
-    {
-      $set: { ...setFields, updatedAt: new Date(), setupComplete: true },
-      $setOnInsert: { email: "admin@dinoco.in.th", name: "DINOCO Admin", createdAt: new Date() },
-    },
-    { upsert: true }
-  );
-  console.log(`[Keys] Synced ${count} keys from .env → MongoDB`);
 }
 
 // อ่าน key จาก MongoDB (Dashboard settings) ก่อน → fallback process.env
