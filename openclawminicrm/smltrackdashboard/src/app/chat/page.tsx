@@ -907,7 +907,7 @@ export default function ChatPage() {
 
   // Auth guard
   useEffect(() => {
-    if (authStatus === "unauthenticated") router.replace("/dashboard/login");
+    if (authStatus === "unauthenticated") router.replace("/login");
   }, [authStatus, router]);
 
   // Fetch ALL conversations — fast API (1 query, ไม่ดึง messages array)

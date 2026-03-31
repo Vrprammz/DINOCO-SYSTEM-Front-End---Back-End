@@ -88,9 +88,9 @@ export default function Home() {
   // Redirect ถ้ายังไม่ login หรือยังไม่ setup
   useEffect(() => {
     if (authStatus === "unauthenticated") {
-      router.replace("/dashboard/login");
+      router.replace("/login");
     } else if (authStatus === "authenticated" && (session?.user as any)?.setupComplete === false) {
-      router.replace("/dashboard/onboarding");
+      router.replace("/onboarding");
     }
   }, [authStatus, session, router]);
 

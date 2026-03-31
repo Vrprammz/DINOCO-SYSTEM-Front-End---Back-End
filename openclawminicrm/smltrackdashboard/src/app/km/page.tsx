@@ -51,7 +51,7 @@ export default function KMPage() {
   const [deleteId, setDeleteId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (authStatus === "unauthenticated") router.replace("/dashboard/login");
+    if (authStatus === "unauthenticated") router.replace("/login");
   }, [authStatus, router]);
 
   const fetchItems = useCallback(async () => {

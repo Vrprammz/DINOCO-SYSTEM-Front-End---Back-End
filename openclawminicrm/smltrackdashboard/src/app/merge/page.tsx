@@ -94,7 +94,7 @@ export default function MergePage() {
   const [searchedB, setSearchedB] = useState(false);
 
   useEffect(() => {
-    if (authStatus === "unauthenticated") router.replace("/dashboard/login");
+    if (authStatus === "unauthenticated") router.replace("/login");
   }, [authStatus, router]);
 
   const fetchDuplicates = useCallback(async () => {

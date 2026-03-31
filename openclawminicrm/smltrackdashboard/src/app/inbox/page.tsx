@@ -315,7 +315,7 @@ export default function InboxPage() {
   // Auth guard
   useEffect(() => {
     if (authStatus === "unauthenticated") {
-      router.replace("/dashboard/login");
+      router.replace("/login");
     }
   }, [authStatus, router]);
 
