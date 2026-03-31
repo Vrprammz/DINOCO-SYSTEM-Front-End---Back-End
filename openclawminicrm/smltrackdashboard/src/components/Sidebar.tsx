@@ -23,76 +23,49 @@ interface NavGroup {
 const BOTTOM_TABS: NavItem[] = [
   { href: "/", icon: "📊", label: "หน้าหลัก" },
   { href: "/chat", icon: "💬", label: "แชท" },
-  { href: "/crm", icon: "👥", label: "ลูกค้า" },
-  { href: "/catalog", icon: "🏪", label: "สินค้า" },
+  { href: "/leads", icon: "🎯", label: "Leads" },
+  { href: "/claims", icon: "📋", label: "เคลม" },
 ];
 
-// Full navigation groups — จัดเป็นหมวดงาน
+// Full navigation groups — DINOCO Dashboard
 const NAV_GROUPS: NavGroup[] = [
-  {
-    groupLabel: "น้องกุ้ง",
-    items: [
-      { href: "/kung-room", icon: "🦐", label: "ห้องทำงานน้องกุ้ง" },
-    ],
-  },
   {
     groupLabel: "ภาพรวม",
     items: [
       { href: "/", icon: "📊", label: "แดชบอร์ด" },
-      { href: "/revenue", icon: "💰", label: "รายได้" },
+      { href: "/chat", icon: "💬", label: "แชท FB/IG/LINE" },
       { href: "/analytics", icon: "📈", label: "วิเคราะห์" },
     ],
   },
   {
-    groupLabel: "สื่อสาร",
+    groupLabel: "Lead Pipeline",
     items: [
-      { href: "/chat", icon: "💬", label: "แชท" },
-      { href: "/inbox", icon: "📥", label: "กล่องข้อความ" },
-      { href: "/broadcast", icon: "📢", label: "ส่งข้อความ" },
-      { href: "/templates", icon: "📝", label: "แม่แบบข้อความ" },
+      { href: "/leads", icon: "🎯", label: "ติดตาม Leads" },
+      { href: "/dealer-sla", icon: "🏪", label: "SLA ตัวแทน" },
+      { href: "/crm", icon: "👥", label: "CRM ลูกค้า" },
     ],
   },
   {
-    groupLabel: "ลูกค้า",
+    groupLabel: "เคลม & บริการ",
     items: [
-      { href: "/crm", icon: "👥", label: "CRM" },
-      { href: "/scorecard", icon: "🏆", label: "คะแนนลูกค้า" },
-      { href: "/merge", icon: "🔀", label: "รวมลูกค้า" },
-      { href: "/auto-closer", icon: "🤝", label: "ติดตามปิดการขาย" },
+      { href: "/claims", icon: "📋", label: "ตรวจเคลม" },
+      { href: "/km", icon: "📚", label: "คลังความรู้" },
     ],
   },
   {
-    groupLabel: "ขายของ",
+    groupLabel: "AI Agents",
     items: [
-      { href: "/catalog", icon: "🏪", label: "สินค้า/บริการ" },
-      { href: "/payments", icon: "💸", label: "เงินเข้า" },
-      { href: "/documents", icon: "📑", label: "เอกสาร" },
-      { href: "/appointments", icon: "📅", label: "นัดหมาย" },
-    ],
-  },
-  {
-    groupLabel: "รายงาน",
-    items: [
-      { href: "/kpi", icon: "📈", label: "KPI พนักงาน" },
+      { href: "/kung-room", icon: "🦐", label: "ห้องทำงาน AI" },
+      { href: "/advice", icon: "💡", label: "คำแนะนำ AI" },
       { href: "/costs", icon: "💰", label: "ค่าใช้จ่าย AI" },
-      { href: "/advice", icon: "🦐", label: "น้องกุ้ง" },
     ],
   },
   {
     groupLabel: "ตั้งค่า",
     items: [
       { href: "/connections", icon: "🔗", label: "ช่องทาง" },
-      { href: "/bot-config", icon: "🤖", label: "บอท" },
-      { href: "/km", icon: "📚", label: "คลังความรู้" },
-      { href: "/team", icon: "👔", label: "ทีมงาน" },
-      { href: "/tasks", icon: "📋", label: "งาน" },
-      { href: "/settings", icon: "⚙️", label: "ตั้งค่า" },
-    ],
-  },
-  {
-    groupLabel: "ช่วยเหลือ",
-    items: [
-      { href: "/guide", icon: "📖", label: "คู่มือ" },
+      { href: "/bot-config", icon: "🤖", label: "ตั้งค่าบอท" },
+      { href: "/settings", icon: "⚙️", label: "ตั้งค่าระบบ" },
     ],
   },
 ];
