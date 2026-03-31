@@ -26,11 +26,28 @@ const DEMO_USER = {
   image: "",
 };
 
-// Google OAuth only — ไม่มี Demo mode
+// DINOCO Admin — login ด้วย password (Nginx Basic Auth เป็นชั้นแรก)
+const ADMIN_USER = {
+  id: "dinoco-admin",
+  name: "DINOCO Admin",
+  email: "admin@dinoco.in.th",
+  image: "",
+};
+
 const providers: any[] = [
-  GoogleProvider({
-    clientId: process.env.GOOGLE_CLIENT_ID!,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+  CredentialsProvider({
+    id: "credentials",
+    name: "DINOCO Admin",
+    credentials: {
+      password: { label: "Password", type: "password" },
+    },
+    async authorize(credentials) {
+      const adminPass = process.env.DASHBOARD_PASS || "Dnc2026!Admin";
+      if (credentials?.password === adminPass) {
+        return ADMIN_USER;
+      }
+      return null;
+    },
   }),
 ];
 
