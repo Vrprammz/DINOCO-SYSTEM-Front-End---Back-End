@@ -1,6 +1,6 @@
 # DINOCO System Data Model
 
-> Auto-generated: 2026-03-27 | Covers all 8 CPTs, wp_options shared state, and debt lifecycle
+> Updated: 2026-04-01 | Covers all 13 CPTs (8 B2C/B2B + 5 B2F), wp_options shared state, debt + credit lifecycle
 
 ---
 
@@ -619,4 +619,130 @@ ALTER TABLE wp_usermeta ADD INDEX idx_umeta_line (meta_key(20), meta_value(40));
               |
               v
          Flash Express / Shipping / Print
+
+
+    ─── B2F (Business to Factory) ───
+
+         b2f_maker
+         (factory profile + credit)
+              |
+              +--- maker_products (b2f_maker_product)
+              |        (SKU mapping + unit_cost + MOQ)
+              |
+              +--- b2f_order (PO)
+              |        (12 statuses via FSM)
+              |        |
+              |        +--- b2f_receiving (ตรวจรับ)
+              |        |        (rcv_items repeater + rcv_total_value)
+              |        |
+              |        +--- b2f_payment (จ่ายเงิน)
+              |                 (amount + method + slip)
+              |
+              +--- maker_current_debt (ค้างจ่าย)
+                   maker_credit_limit (วงเงิน)
+                   maker_credit_hold (ระงับ)
+```
+
+---
+
+## B2F Data Model (5 CPTs)
+
+### b2f_maker (โรงงานผู้ผลิต)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `maker_name` | text | ชื่อโรงงาน |
+| `maker_contact` | text | ชื่อผู้ติดต่อ |
+| `maker_phone` | text | เบอร์โทร |
+| `maker_email` | email | อีเมล |
+| `maker_address` | textarea | ที่อยู่ |
+| `maker_line_group_id` | text | LINE group ID (unique) |
+| `maker_tax_id` | text | เลขผู้เสียภาษี |
+| `maker_bank_name` | text | ธนาคาร |
+| `maker_bank_account` | text | เลขบัญชี |
+| `maker_bank_holder` | text | ชื่อบัญชี |
+| `maker_status` | select | active / inactive |
+| `maker_credit_limit` | number | วงเงินค้างจ่าย (บาท) |
+| `maker_current_debt` | number | ยอดค้างจ่ายปัจจุบัน |
+| `maker_credit_hold` | boolean | ถูกระงับเครดิต |
+| `maker_credit_hold_reason` | text | auto / manual |
+| `maker_credit_term_days` | number | ระยะเวลาชำระ (วัน, default 30) |
+| `maker_bot_enabled` | boolean | เปิด/ปิด Bot |
+
+### b2f_maker_product (สินค้าที่ผลิต)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mp_maker_id` | post_object | FK → b2f_maker |
+| `mp_sku` | text | รหัสสินค้า |
+| `mp_product_name` | text | ชื่อสินค้า |
+| `mp_unit_cost` | number | ราคาทุนต่อหน่วย |
+| `mp_moq` | number | Minimum Order Quantity |
+| `mp_lead_time_days` | number | ระยะเวลาผลิต (วัน) |
+| `mp_status` | select | active / inactive |
+
+### b2f_order (ใบสั่งซื้อ PO)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `po_number` | text | PO-DNC-YYMMDD-NNN (unique, MySQL locked) |
+| `po_maker_id` | post_object | FK → b2f_maker |
+| `po_status` | select | 12 statuses via B2F_Order_FSM |
+| `po_items` | repeater | poi_sku, poi_product_name, poi_qty_ordered, poi_unit_cost, poi_qty_received, poi_qty_rejected |
+| `po_total_amount` | number | ยอดรวม (บาท) |
+| `po_paid_amount` | number | จ่ายแล้ว |
+| `po_payment_status` | select | unpaid / partial_paid / paid |
+| `po_requested_date` | date | วันที่ต้องการรับ |
+| `po_expected_date` | date | ETA จาก Maker |
+| `po_actual_date` | date | วันที่ส่ง/รับจริง |
+| `po_admin_note` | textarea | หมายเหตุ Admin |
+| `po_maker_note` | textarea | หมายเหตุ Maker |
+| `po_rejected_reason` | text | เหตุผลปฏิเสธ |
+| `po_cancelled_reason` | text | เหตุผลยกเลิก |
+| `po_cancelled_by` | text | User ID ผู้ยกเลิก |
+| `po_cancelled_date` | date | วันที่ยกเลิก |
+| `po_version` | number | version (bump เมื่อ amend) |
+| `po_amendment_count` | number | จำนวนครั้งที่แก้ไข |
+| `po_item_count` | number | จำนวน SKU |
+| `po_created_by` | text | User ID ผู้สร้าง |
+
+### b2f_receiving (ใบรับสินค้า)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `rcv_po_id` | post_object | FK → b2f_order |
+| `rcv_number` | text | RCV-YYMMDD-NNN (unique, MySQL locked) |
+| `rcv_date` | date | วันที่รับ |
+| `rcv_total_value` | number | มูลค่ารับ (accepted_qty × unit_cost) |
+| `rcv_items` | repeater | rcvi_sku, rcvi_qty_received, rcvi_qty_rejected, rcvi_qc_status, rcvi_reject_reason, rcvi_reject_photos |
+| `rcv_admin_note` | textarea | หมายเหตุ |
+| `rcv_inspected_by` | text | ชื่อผู้ตรวจรับ |
+| `rcv_inspected_by_id` | number | User ID ผู้ตรวจ |
+
+### b2f_payment (การจ่ายเงิน)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pmt_po_id` | post_object | FK → b2f_order |
+| `pmt_maker_id` | post_object | FK → b2f_maker |
+| `pmt_amount` | number | จำนวนเงิน |
+| `pmt_date` | date | วันที่จ่าย |
+| `pmt_method` | select | transfer / cash / cheque |
+| `pmt_reference` | text | เลขอ้างอิง |
+| `pmt_note` | textarea | หมายเหตุ |
+| `pmt_slip_image` | image | สลิปโอนเงิน |
+
+### Credit Lifecycle
+
+```
+1. PO submitted   → ยังไม่หัก credit (V.3.3)
+2. receive-goods  → b2f_payable_add(rcv_total_value) → maker_current_debt เพิ่ม
+3. record-payment → b2f_payable_subtract(amount) → maker_current_debt ลด
+4. cancel PO      → b2f_recalculate_payable() → คำนวณจาก receiving - payments ใหม่
+
+Source of truth: b2f_recalculate_payable()
+  debt = SUM(rcv_total_value ที่ PO ไม่ cancelled) - SUM(pmt_amount)
+
+Auto hold: debt >= credit_limit → maker_credit_hold = true, reason = 'auto'
+Auto unhold: debt < credit_limit && reason = 'auto' → clear hold
 ```

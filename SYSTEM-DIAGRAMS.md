@@ -21,6 +21,9 @@
 13. [Finance Dashboard Flow](#13-finance-dashboard-flow)
 14. [Brand Voice Pool Flow](#14-brand-voice-pool-flow)
 15. [AI Analysis Flow (Finance)](#15-ai-analysis-flow-finance)
+16. [B2F Order State Machine](#16-b2f-order-state-machine)
+17. [B2F Credit Flow](#17-b2f-credit-flow)
+18. [B2F LINE Notification Map](#18-b2f-line-notification-map)
 
 ---
 
@@ -930,3 +933,167 @@ sequenceDiagram
 | Flash | ready_to_ship | -- | `#16a34a` |
 | Flash | courier_called | -- | `#f59e0b` |
 | Flash | picked_up | -- | `#f59e0b` |
+| B2F Order | draft | Gray | `#6b7280` |
+| B2F Order | submitted | Amber | `#d97706` |
+| B2F Order | confirmed | Navy | `#1a237e` |
+| B2F Order | amended | Gray | `#6b7280` |
+| B2F Order | rejected | Red | `#dc2626` |
+| B2F Order | delivering | Amber | `#d97706` |
+| B2F Order | received | Green | `#16a34a` |
+| B2F Order | partial_received | Yellow | `#ca8a04` |
+| B2F Order | paid | Green | `#16a34a` |
+| B2F Order | partial_paid | Yellow | `#ca8a04` |
+| B2F Order | completed | Green | `#16a34a` |
+| B2F Order | cancelled | Red | `#dc2626` |
+
+---
+
+## 16. B2F Order State Machine
+
+> `[B2F] Snippet 6: Order State Machine` — `B2F_Order_FSM` class  
+> 12 statuses, actor-based transitions (admin, maker, system)
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft
+    draft --> submitted : Admin สร้าง PO
+    draft --> cancelled : Admin ยกเลิก
+
+    submitted --> confirmed : Maker ยืนยัน + ETA
+    submitted --> rejected : Maker ปฏิเสธ
+    submitted --> amended : Admin แก้ไข
+    submitted --> cancelled : Admin ยกเลิก
+
+    amended --> submitted : auto-resubmit (system)
+
+    rejected --> amended : Admin แก้ไขแล้วส่งใหม่
+    rejected --> submitted : Admin ส่งใหม่ (ไม่แก้)
+    rejected --> cancelled : Admin ยกเลิก
+
+    confirmed --> delivering : Maker แจ้งส่งของ
+    confirmed --> amended : Admin แก้ไข
+    confirmed --> cancelled : Admin ยกเลิก
+
+    delivering --> received : Admin ตรวจรับครบ
+    delivering --> partial_received : Admin ตรวจรับบางส่วน
+    delivering --> confirmed : Admin reject lot
+
+    partial_received --> delivering : Maker ส่งของเพิ่ม
+    partial_received --> received : Admin รับครบ
+    partial_received --> cancelled : Admin ยกเลิก
+
+    received --> paid : Admin จ่ายครบ
+    received --> partial_paid : Admin จ่ายบางส่วน
+    received --> completed : Admin ปิด PO (ของฟรี)
+
+    partial_paid --> paid : Admin จ่ายครบ
+
+    paid --> completed : auto-complete (system)
+
+    completed --> [*]
+    cancelled --> [*]
+```
+
+### Transition Rules
+
+| From → To | Actor | Guard | Side Effects |
+|-----------|-------|-------|-------------|
+| draft → submitted | admin | - | Push Flex PO ใหม่ไป Maker + Admin |
+| submitted → confirmed | maker | ต้องกรอก ETA | Push Flex confirmed ไป Admin |
+| submitted → rejected | maker | ต้องมี reason | Push Flex rejected ไป Admin |
+| confirmed → delivering | maker | - | Push Flex delivered ไป Admin |
+| delivering → received | admin | all items complete | `b2f_payable_add()` + Push Flex receiving |
+| delivering → confirmed | admin | reject reason | Push Flex lot_rejected ไป Maker |
+| partial_received → delivering | maker | - | Push Flex additional_delivery ไป Admin |
+| received → paid | admin | amount = total | `b2f_payable_subtract()` + Push Flex payment |
+| paid → completed | system | auto after full payment | Push Flex po_completed ไป Admin + Maker |
+| any → cancelled | admin | - | `b2f_recalculate_payable()` + Push Flex cancelled |
+
+---
+
+## 17. B2F Credit Flow
+
+> `[B2F] Snippet 7: Credit Transaction Manager V.1.3`  
+> ทิศทางกลับจาก B2B: DINOCO เป็นหนี้ Maker
+
+```mermaid
+flowchart TD
+    A[Admin สร้าง PO] -->|ไม่หัก credit| B[Maker ยืนยัน + ส่งของ]
+    B --> C[Admin ตรวจรับสินค้า]
+    C -->|b2f_payable_add| D{debt >= credit_limit?}
+    D -->|Yes| E[Auto Credit Hold]
+    E -->|Flex credit_hold| F[แจ้ง Maker]
+    D -->|No| G[ปกติ]
+
+    H[Admin จ่ายเงิน] -->|b2f_payable_subtract| I{debt < limit && reason=auto?}
+    I -->|Yes| J[Auto Unhold]
+    J -->|Flex credit_released| K[แจ้ง Maker]
+    I -->|No| L[ยัง hold]
+
+    M[Admin ยกเลิก PO] -->|b2f_recalculate_payable| N[คำนวณจาก receiving records ใหม่]
+```
+
+### Source of Truth
+
+```sql
+-- b2f_recalculate_payable() — single-SQL
+debt = SUM(rcv_total_value จาก b2f_receiving ที่ PO ไม่ cancelled)
+     - SUM(pmt_amount จาก b2f_payment ของ Maker)
+```
+
+---
+
+## 18. B2F LINE Notification Map
+
+> LINE Bot เดียวกับ B2B — routing ตาม group_id
+
+### Flex ที่ส่งไป Maker Group (14 Flex)
+
+```mermaid
+flowchart LR
+    subgraph Maker_Notifications
+        M1[new_po_for_maker] -->|ปุ่ม ยืนยัน/ปฏิเสธ| M1a[Maker action]
+        M2[po_cancelled]
+        M3[po_amended]
+        M4[reschedule_approved]
+        M5[reschedule_rejected]
+        M6[receiving]
+        M7[payment]
+        M8[po_completed]
+        M9[lot_rejected]
+        M10[po_resubmitted] -->|ปุ่ม ยืนยัน/ปฏิเสธ| M10a[Maker action]
+        M11[credit_hold]
+        M12[credit_released]
+        M13[eta_reminder]
+        M14[overdue_alert]
+    end
+```
+
+### Flex ที่ส่งไป Admin Group (9 Flex)
+
+```mermaid
+flowchart LR
+    subgraph Admin_Notifications
+        A1[po_created] -->|ปุ่ม ดูรายละเอียด| A1a[LIFF PO detail]
+        A2[maker_confirmed]
+        A3[maker_rejected]
+        A4[delivered]
+        A5[additional_delivery]
+        A6[reschedule_request] -->|ปุ่ม อนุมัติ/ไม่อนุมัติ| A6a[Admin action]
+        A7[receiving_summary]
+        A8[po_completed]
+        A9[po_cancelled_admin]
+    end
+```
+
+### Cron Notifications (7 jobs)
+
+| Cron | Time | To Maker | To Admin |
+|------|------|----------|----------|
+| Delivery Reminder | 08:30 | Flex (D-3, D-1, D-day) | text (D-1, D-day) |
+| Overdue Check | 09:00 | Flex (D+1, D+3, D+7+) | text |
+| Maker No-response | 09:30 | text (24h, 48h) | text escalate (72h) |
+| Payment Reminder | 10:00 | - | text (D-7 to D+7, auto hold D+7) |
+| Daily Summary | 18:00 | - | text |
+| Weekly Summary | Mon 09:00 | - | text |
+| Monthly Summary | 1st of month | - | text |

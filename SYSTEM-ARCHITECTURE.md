@@ -4,9 +4,10 @@
 
 ## Overview
 
-DINOCO is a **WordPress-based motorcycle warranty + B2B distribution platform** serving:
+DINOCO is a **WordPress-based motorcycle warranty + B2B/B2F distribution platform** serving:
 - **B2C Members** — warranty registration, claims, transfers via LINE Login
 - **B2B Distributors** — ordering, invoicing, payments via LINE Bot + LIFF
+- **B2F Makers** — factory purchasing, PO management, credit tracking via LINE Bot + LIFF
 - **Admin** — command center dashboard with AI assistant
 
 All code runs as **WordPress Code Snippets** (no build step). Frontend is vanilla HTML/CSS/JS inline in PHP. Communication with distributors/members is via **LINE Messaging API**.
@@ -19,10 +20,10 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 ┌─────────────────────────────────────────────────────────┐
 │                    DINOCO WordPress                       │
 │                                                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐ │
-│  │  B2C System   │  │  B2B System   │  │ Admin System  │ │
-│  │  (Members)    │  │ (Distributors)│  │ (Management)  │ │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬────────┘ │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────────┐ │
+│  │ B2C      │ │ B2B      │ │ B2F      │ │ Admin       │ │
+│  │ (Members)│ │(Distrib.)│ │ (Makers) │ │ (Management)│ │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └─────┬───────┘ │
 │         │                  │                  │          │
 │  ┌──────┴──────────────────┴──────────────────┴───────┐ │
 │  │              WordPress REST API + AJAX              │ │
@@ -770,6 +771,53 @@ Code lives in GitHub → pushed via webhook → `[AdminSystem-System] GitHub Web
 - GitHub Contents API primary (no CDN cache)
 - Live progress bar via `/sync-status` polling (3s)
 - Auto-detect webhook-already-synced
+
+---
+
+## B2F System (Business to Factory)
+
+DINOCO สั่งซื้อสินค้าจากโรงงานผู้ผลิต (Maker) — ทิศทางกลับจาก B2B (DINOCO เป็นผู้ซื้อ เป็นหนี้ Maker)
+
+### Architecture
+
+- **12 Snippets** (DB_ID 1160-1171): CPT Registration, Flex Builders, REST API, Webhook Handler, LIFF Pages, Dashboard Tabs, FSM, Credit Manager, E-Catalog LIFF, PO Ticket View, PO Image Generator, Cron Jobs
+- **LINE Bot เดียวกับ B2B** — routing ตาม `group_id` (Maker group → B2F Flex, Distributor group → B2B Flex)
+- **FSM 12 statuses:** draft → submitted → confirmed → delivering → received → paid → completed (+ cancelled, amended, rejected, partial_received, partial_paid)
+- **Credit System:** Atomic `b2f_payable_add/subtract()` ด้วย `FOR UPDATE` lock, `b2f_recalculate_payable()` คำนวณจาก `rcv_total_value` ของ receiving records (single-SQL source of truth)
+- **LIFF Auth:** Admin ใช้ HMAC sig + LINE ID Token → JWT session, Maker ใช้ JWT per-PO
+
+### Snippets
+
+| # | DB_ID | Name | Role |
+|---|-------|------|------|
+| 0 | 1160 | CPT & ACF Registration | 5 CPTs + helpers + PO/RCV number generators (MySQL lock) |
+| 1 | 1163 | Core Utilities & Flex Builders | LINE push + 25 Flex templates + `b2f_liff_url()` (HMAC sig) |
+| 2 | 1165 | REST API V.3.3 | 25 endpoints namespace `/b2f/v1/` |
+| 3 | 1164 | Webhook Handler & Bot Commands | Maker commands + Admin B2F commands + Flex menu |
+| 4 | 1167 | Maker LIFF Pages | shortcode `[b2f_maker_liff]` route `/b2f-maker/` (5 pages) |
+| 5 | 1166 | Admin Dashboard Tabs V.1.2 | 3 shortcodes: Orders, Makers, Credit |
+| 6 | 1161 | Order State Machine | `B2F_Order_FSM` class — 12 statuses, actor-based transitions |
+| 7 | 1162 | Credit Transaction Manager V.1.3 | atomic `b2f_payable_add/subtract()` + auto hold/unhold + Flex notifications |
+| 8 | 1168 | Admin LIFF E-Catalog | LIFF auth V.2.0 → JWT session → สั่งซื้อจาก LINE |
+| 9 | 1169 | PO Ticket View | Status timeline, items, receiving, payment, credit |
+| 10 | 1170 | PO Image Generator | GD Library A4 PNG + REST `/b2f/v1/po-image` |
+| 11 | 1171 | Cron Jobs & Reminders V.1.3 | 7 cron jobs (delivery/overdue/no-response/payment/daily/weekly/monthly) |
+
+### REST API (`/wp-json/b2f/v1/`)
+
+25 endpoints — Admin auth (WP nonce / B2F Admin JWT) + Maker auth (per-PO JWT verified in permission_callback)
+
+### Credit Flow
+
+```
+receive-goods → b2f_payable_add(received_value) → debt increases
+                ↓ if debt >= limit → auto credit hold → Flex แจ้ง Maker
+record-payment → b2f_payable_subtract(amount) → debt decreases
+                ↓ if debt < limit && reason='auto' → auto unhold → Flex แจ้ง Maker
+cancel PO      → b2f_recalculate_payable(maker_id) → recalculate from scratch
+```
+
+---
 
 **No build step.** No Node.js. No framework. Pure PHP + vanilla JS.
 

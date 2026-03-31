@@ -20,6 +20,10 @@
 11. [Admin: Handle Claim](#11-admin-handle-claim)
 12. [Admin: Finance Dashboard + AI วิเคราะห์](#12-admin-finance-dashboard--ai-วิเคราะห์)
 13. [Admin: Brand Voice Pool](#13-admin-brand-voice-pool)
+14. [B2F: Admin Create PO to Maker](#14-b2f-admin-create-po-to-maker)
+15. [B2F: Maker Confirm/Reject PO](#15-b2f-maker-confirmreject-po)
+16. [B2F: Maker Deliver Goods](#16-b2f-maker-deliver-goods)
+17. [B2F: Admin Receive & Pay](#17-b2f-admin-receive--pay)
 
 ---
 
@@ -609,6 +613,107 @@ Pages protected by login check: if not logged in, redirected to `/warranty/`.
 
 ---
 
+---
+
+## 14. B2F: Admin Create PO to Maker
+
+**Who:** DINOCO Admin
+**Trigger:** Admin ต้องการสั่งซื้อสินค้าจากโรงงานผู้ผลิต (Maker)
+**Source files:** `[B2F] Snippet 2: REST API`, `[B2F] Snippet 8: Admin LIFF E-Catalog`, `[B2F] Snippet 1: Core Utilities & Flex Builders`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 14.1 | Admin พิมพ์ "สั่งโรงงาน" ใน LINE Admin group | Text message | Bot ตอบ Flex card พร้อมปุ่ม "เปิดหน้าสั่งสินค้า" |
+| 14.2 | กดปุ่ม "เปิดหน้าสั่งสินค้า" | Flex button → LIFF | เปิด LIFF `/b2f-catalog/` พร้อม HMAC sig |
+| 14.3 | LIFF auth อัตโนมัติ | Loading screen | `POST /b2f/v1/auth-admin` — verify HMAC sig + LINE ID Token + WP admin check → issue JWT session |
+| 14.4 | เลือก Maker จาก dropdown | Maker selector | `GET /b2f/v1/makers` → แสดงรายชื่อโรงงานทั้งหมด |
+| 14.5 | ดู catalog สินค้าของ Maker | Product grid | `GET /b2f/v1/maker-products/{maker_id}` → แสดง SKU, ชื่อ, ราคาทุน, MOQ |
+| 14.6 | เลือก SKU + กรอกจำนวน | Qty input per SKU | คำนวณ line total (qty × unit_cost) real-time |
+| 14.7 | กด "สั่งซื้อ" | Green submit button | `POST /b2f/v1/create-po` → สร้าง PO draft → transition submitted |
+| 14.8 | (อัตโนมัติ) ส่ง Flex ไป Maker group | N/A | Flex `new_po_for_maker` — แสดง item rows (B2B style) + ปุ่ม ยืนยัน/ปฏิเสธ |
+| 14.9 | (อัตโนมัติ) ส่ง Flex ไป Admin group | N/A | Flex `po_created` — สรุปรายการสินค้า + มูลค่ารวม + ปุ่ม "ดูรายละเอียด PO" |
+| 14.10 | เห็นหน้า success | LIFF success page | แสดง PO number + ยอดรวม + สถานะ "ส่งไป Maker แล้ว" |
+
+### Decision points
+- **Credit check:** ถ้า Maker ถูก credit hold → PO สร้างได้แต่มี warning ใน response
+- **Duplicate prevention:** Transient 5 นาที ป้องกันสร้าง PO ซ้ำ (same maker + same items)
+- **ทางเลือก:** สร้าง PO จาก Admin Dashboard Tab Orders ก็ได้ (ไม่ต้องผ่าน LINE)
+
+---
+
+## 15. B2F: Maker Confirm/Reject PO
+
+**Who:** Maker (โรงงานผู้ผลิต)
+**Trigger:** ได้รับ Flex PO ใหม่ใน LINE group
+**Source files:** `[B2F] Snippet 3: Webhook Handler`, `[B2F] Snippet 2: REST API`, `[B2F] Snippet 4: Maker LIFF Pages`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 15.1 | เห็น Flex PO ใหม่ใน LINE group | Flex card `new_po_for_maker` | แสดงรายการสินค้า ยอดรวม + 3 ปุ่ม |
+| 15.2a | กด "✅ ยืนยัน + เลือกวันส่ง" | Datetimepicker action | LINE เปิด date picker (min: พรุ่งนี้, max: +90 วัน) |
+| 15.3a | เลือกวัน ETA | Date picker | Postback `b2f_maker_confirm` → `POST /b2f/v1/maker-confirm` → status: confirmed |
+| 15.4a | (อัตโนมัติ) แจ้ง Admin | N/A | Flex `maker_confirmed` ส่ง Admin group — แสดง ETA + ชื่อ Maker |
+| 15.2b | กด "❌ ปฏิเสธ" | Postback button | Bot ถาม "กรุณาพิมพ์เหตุผลที่ปฏิเสธ" (set transient pending_reject) |
+| 15.3b | Maker พิมพ์เหตุผล | Text message | บันทึกเหตุผล → status: rejected → Flex `maker_rejected` ส่ง Admin group |
+| 15.2c | กด "📋 ดูรายละเอียด" | Postback button | Bot ตอบ text สรุปรายการ items ทั้งหมด |
+
+### Where can the user get stuck
+- **Datetimepicker ไม่ขึ้น:** LINE version เก่าไม่รองรับ — มีทางเลือก LIFF page=confirm
+- **Pending reject transient:** ถ้า Maker กดปฏิเสธแล้วไม่พิมพ์เหตุผลภายใน 5 นาที transient หมดอายุ ต้องกดปฏิเสธใหม่
+
+---
+
+## 16. B2F: Maker Deliver Goods
+
+**Who:** Maker (โรงงานผู้ผลิต)
+**Trigger:** Maker ส่งของมาที่ DINOCO แล้วต้องการแจ้งในระบบ
+**Source files:** `[B2F] Snippet 3: Webhook Handler`, `[B2F] Snippet 2: REST API`, `[B2F] Snippet 4: Maker LIFF Pages`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 16.1 | Maker พิมพ์ "ส่งของ" หรือ @DINOCO → กดเมนู "📦 แจ้งส่งของ" | Text / Flex menu | Bot แสดง Flex carousel ของ PO ที่ส่งได้ (confirmed + partial_received) |
+| 16.2 | กดปุ่ม "แจ้งส่งของ" ที่ PO ที่ต้องการ | Postback `b2f_maker_deliver` | `POST /b2f/v1/maker-deliver` → transition confirmed→delivering (หรือ partial_received→delivering) |
+| 16.3 | (อัตโนมัติ) แจ้ง Admin | N/A | Flex `delivered` ส่ง Admin group (ครั้งแรก) หรือ `additional_delivery` (ส่งเพิ่ม) |
+| 16.4 | Maker เห็น reply "แจ้งส่งของเรียบร้อย" | Text reply | บันทึก `po_actual_date` = วันนี้ |
+
+### Decision points
+- **ส่งครั้งแรก vs ส่งเพิ่ม:** ถ้า PO เป็น `partial_received` = ส่งเพิ่ม → Admin ได้ Flex `additional_delivery` แทน `delivered`
+
+---
+
+## 17. B2F: Admin Receive & Pay
+
+**Who:** DINOCO Admin
+**Trigger:** ของมาถึงแล้ว Admin ต้องตรวจรับ + จ่ายเงิน
+**Source files:** `[B2F] Snippet 2: REST API`, `[B2F] Snippet 5: Admin Dashboard Tabs`, `[B2F] Snippet 7: Credit Transaction Manager`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 17.1 | เปิด Admin Dashboard → B2F → Orders tab | Dashboard sidebar | แสดง PO list filter ตาม status |
+| 17.2 | กด PO ที่ status "delivering" → กด "ตรวจรับสินค้า" | Detail modal / button | เปิด form ตรวจรับ — กรอก qty_received, qty_rejected, QC status ต่อ SKU |
+| 17.3 | กด "บันทึกการรับ" | Submit button | `POST /b2f/v1/receive-goods` → สร้าง `b2f_receiving` + `b2f_payable_add(received_value)` + transition received/partial_received |
+| 17.4 | (อัตโนมัติ) แจ้งทุกฝ่าย | N/A | Flex `receiving` ส่ง Maker + Flex `receiving_summary` ส่ง Admin group |
+| 17.5 | กด "บันทึกจ่ายเงิน" ที่ PO status "received" | Payment button | เปิด form จ่ายเงิน — กรอกจำนวน, วิธีจ่าย, ref, แนบสลิป |
+| 17.6 | กด "บันทึก" | Submit button | `POST /b2f/v1/record-payment` → สร้าง `b2f_payment` + `b2f_payable_subtract(amount)` |
+| 17.7 | (อัตโนมัติ) แจ้ง Maker | N/A | Flex `payment` ส่ง Maker |
+| 17.8 | (ถ้าจ่ายครบ) PO auto-complete | N/A | transition paid→completed → Flex `po_completed` ส่ง Admin + Maker |
+
+### Decision points
+- **Partial receive:** ถ้า qty_received < qty_ordered → status: partial_received → Maker ส่งเพิ่มได้
+- **Reject lot:** ถ้าสินค้าทั้ง lot ไม่ผ่าน QC → `POST /b2f/v1/reject-lot` → status กลับ confirmed → Flex `lot_rejected` ส่ง Maker
+- **ของฟรี/sample:** `POST /b2f/v1/po-complete` → ปิด PO โดยไม่จ่ายเงิน
+- **Credit hold:** ถ้า debt >= credit_limit → auto credit hold → Flex `credit_hold` ส่ง Maker
+
+---
+
 ## Key Files Referenced
 
 | Journey | Primary Source Files |
@@ -626,4 +731,8 @@ Pages protected by login check: if not logged in, redirected to `/warranty/`.
 | 11. Admin: Handle Claim | `[Admin System] DINOCO Service Center & Claims` |
 | 12. Admin: Finance Dashboard | `[Admin System] DINOCO Admin Finance Dashboard`, `[Admin System] AI Provider Abstraction` |
 | 13. Admin: Brand Voice Pool | `[Admin System] DINOCO Brand Voice Pool`, `[Admin System] AI Provider Abstraction` |
+| 14. B2F: Create PO | `[B2F] Snippet 2: REST API`, `[B2F] Snippet 8: Admin LIFF E-Catalog`, `[B2F] Snippet 1: Core Utilities & Flex Builders` |
+| 15. B2F: Maker Confirm/Reject | `[B2F] Snippet 3: Webhook Handler`, `[B2F] Snippet 2: REST API`, `[B2F] Snippet 4: Maker LIFF Pages` |
+| 16. B2F: Maker Deliver | `[B2F] Snippet 3: Webhook Handler`, `[B2F] Snippet 2: REST API` |
+| 17. B2F: Admin Receive & Pay | `[B2F] Snippet 2: REST API`, `[B2F] Snippet 5: Admin Dashboard Tabs`, `[B2F] Snippet 7: Credit Transaction Manager` |
 | Navigation | `[System] DINOCO Global App Menu` |
