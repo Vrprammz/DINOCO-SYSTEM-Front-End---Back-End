@@ -389,7 +389,7 @@ function ChatPanel({
           onClick={async () => {
             if (!confirm("ล้างประวัติแชท + ความจำ AI ของห้องนี้ ยืนยันไหม")) return;
             try {
-              await fetch(`/dashboard/api/chat-list/${conv.sourceId}/clear`, { method: "POST" });
+              await fetch(`/dashboard/api/chat-list/${conv.id}/clear`, { method: "POST" });
               setMessages([]);
             } catch {}
           }}
