@@ -63,7 +63,7 @@ const { LEAD_STATUSES, createLead, updateLeadStatus, notifyDealer,
 dinocoTools.init({ searchMessages, getRecentMessages, callMCPTool });
 aiChat.init({
   searchMessages, getRecentMessages, executeTool, AGENT_TOOLS, saveMsg,
-  buildAIContext, createAiHandoffAlert, replyToLine, sendMetaMessage, sendLinePush,
+  buildAIContext, createAiHandoffAlert, replyToLine, sendMetaMessage, sendMetaImage, sendLinePush,
 });
 claimFlow.init({ analyzeImage });
 leadPipeline.init({ sendLinePush, sendMetaMessage, replyToLine });

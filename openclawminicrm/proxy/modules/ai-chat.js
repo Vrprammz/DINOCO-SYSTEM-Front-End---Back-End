@@ -15,6 +15,7 @@ let buildAIContext = null;
 let createAiHandoffAlert = null;
 let replyToLine = null;
 let sendMetaMessage = null;
+let sendMetaImage = null;
 let sendLinePush = null;
 
 function init(deps) {
@@ -27,6 +28,7 @@ function init(deps) {
   createAiHandoffAlert = deps.createAiHandoffAlert;
   replyToLine = deps.replyToLine;
   sendMetaMessage = deps.sendMetaMessage;
+  sendMetaImage = deps.sendMetaImage;
   sendLinePush = deps.sendLinePush;
 }
 
@@ -406,13 +408,35 @@ Platform: ${platform} — ${platformNote}
   if (/รอทีมงาน|ขอเช็คข้อมูล/.test(reply)) {
     await createAiHandoffAlert(sourceId, senderId, text, platform);
   }
-  const sent = await sendMetaMessage(senderId, reply);
+
+  // ตรวจหา image URL ใน reply → ส่งเป็นรูปจริง แยกจาก text
+  const imgUrlRegex = /(https?:\/\/[^\s\]\)]+\.(?:png|jpg|jpeg|gif|webp))/gi;
+  const imageUrls = reply.match(imgUrlRegex) || [];
+  let cleanReply = reply;
+  for (const url of imageUrls) {
+    // ลบ URL + markdown link syntax ออกจาก text
+    cleanReply = cleanReply.replace(new RegExp(`\\[?[^\\]]*\\]?\\(?${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)?`, 'g'), '').trim();
+    cleanReply = cleanReply.replace(url, '').trim();
+  }
+  // ลบ markdown artifacts ที่เหลือ
+  cleanReply = cleanReply.replace(/\[\]\(\)/g, '').replace(/\n{3,}/g, '\n\n').trim();
+
+  // ส่ง text ก่อน
+  if (cleanReply) {
+    await sendMetaMessage(senderId, cleanReply);
+  }
+  // ส่งรูปจริง (ถ้ามี)
+  for (const imgUrl of imageUrls.slice(0, 3)) {
+    await sendMetaImage(senderId, imgUrl).catch(() => {});
+  }
+
+  const sent = cleanReply || imageUrls.length > 0;
   if (sent) {
     await saveMsg(sourceId, {
       role: "assistant", userName: DEFAULT_BOT_NAME,
-      content: reply, messageType: "text", isAiReply: true, abVariant: variant,
+      content: reply, messageType: imageUrls.length > 0 ? "mixed" : "text", isAiReply: true, abVariant: variant,
     }, platform);
-    console.log(`[AI-Reply] ${platform} replied in ${Date.now() - startTime}ms: ${reply.substring(0, 50)}`);
+    console.log(`[AI-Reply] ${platform} replied in ${Date.now() - startTime}ms (${imageUrls.length} images): ${cleanReply.substring(0, 50)}`);
   }
 }
 
