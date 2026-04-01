@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 
 const AGENT_URL = process.env.AGENT_URL || "http://localhost:3000";
-const AGENT_AUTH = process.env.AGENT_API_KEY || process.env.OPENCLAW_GATEWAY_TOKEN || "";
+const AGENT_AUTH = process.env.API_SECRET_KEY || process.env.AGENT_API_KEY || "";
 
 export async function POST(request: NextRequest) {
   try {
