@@ -1301,114 +1301,116 @@ app.post("/api/kb-quick-add", requireAuth, express.json(), async (req, res) => {
 
 // === [BOSS] AI Boss Command System (V.1.0) ===
 
-// POST /api/boss-command/analyze — Boss AI วิเคราะห์คำสั่ง
+// POST /api/boss-command/analyze — Boss AI วิเคราะห์คำสั่ง (2-step: AI อ่าน → Code แปลง actions)
 app.post("/api/boss-command/analyze", requireAuth, express.json({ limit: "10mb" }), async (req, res) => {
   const { command, imageBase64 } = req.body;
   if (!command && !imageBase64) return res.status(400).json({ error: "command or image required" });
   const db = await getDB();
   if (!db) return res.status(500).json({ error: "DB unavailable" });
-  const currentRules = await db.collection("ai_rules").find({ active: true, deletedAt: null }).toArray();
-  const templates = await db.collection("message_templates").find({ active: true }).toArray();
-  const bossPrompt = `คุณคือ "หัวหน้า AI" ของ DINOCO THAILAND — ผู้ผลิตอะไหล่มอเตอร์ไซค์พรีเมียม (กล่องอลูมิเนียม แคชบาร์ แร็ค)
-DINOCO ไม่ขายปลีก → ขายผ่านตัวแทนจำหน่าย 40+ ร้านทั่วไทย
-AI ตอบแชทลูกค้าใน Facebook/Instagram/LINE แทนทีมงาน
 
-หน้าที่ของคุณ: รับคำสั่งจาก Admin (เจ้าของ DINOCO) แล้ววิเคราะห์เป็นแผนปฏิบัติ
-ถ้า Admin ส่งรูป screenshot มา → วิเคราะห์ว่า AI ทำอะไรผิด แล้วเสนอกฎแก้ไข
+  // Step 1: AI วิเคราะห์คำสั่ง → ตอบเป็นภาษาไทยปกติ (ไม่บังคับ JSON)
+  const bossPrompt = `คุณคือหัวหน้า AI ของ DINOCO THAILAND ผู้ผลิตอะไหล่มอเตอร์ไซค์ (กล่องอลูมิเนียม แคชบาร์ แร็ค)
+DINOCO ไม่ขายปลีก ขายผ่านตัวแทน 40+ ร้าน AI ตอบแชทลูกค้าใน FB/IG/LINE แทนทีมงาน
 
-สิ่งที่คุณทำได้:
-1. สร้างกฎพฤติกรรม AI (ai_rules) — เช่น "ห้ามบอกว่าเป็น AI" "ห้ามใช้ ?" "ห้ามเอ่ยคู่แข่ง"
-2. แก้ข้อความ template — เช่น ข้อความตอนเคลม ข้อความทักทาย
-3. แก้ฐานความรู้ (KB) — เช่น "คำตอบเรื่องค่าส่งผิด"
+Admin สั่งคุณมา — วิเคราะห์แล้วบอกว่า:
+1. Admin ต้องการอะไร (สรุป 1-2 ประโยค)
+2. AI ทำอะไรผิด (ถ้าส่งรูป screenshot มา)
+3. ควรสร้างกฎอะไรบ้าง — แต่ละกฎต้องมี:
+   - ชื่อกฎสั้นๆ
+   - คำอธิบายละเอียดที่ AI ต้องปฏิบัติ
+   - ประเภท: กฎการพูด / กฎเนื้อหา / กฎ workflow / กฎน้ำเสียง
+4. ถ้าคำสั่งไม่ชัด → ถามกลับว่าต้องการอะไร
 
-กฎที่ active อยู่ (${currentRules.length} ข้อ):
-${currentRules.map((r,i) => `${i+1}. [${r.type}] ${r.instruction}`).join("\n") || "(ยังไม่มีกฎเพิ่มเติม)"}
+ตอบภาษาไทย กระชับ ตรงประเด็น ลงท้ายด้วย ค่ะ/นะคะ`;
 
-Message templates (${templates.length} ข้อ):
-${templates.map(t => `- ${t.templateId}: "${t.message}"`).join("\n") || "(ยังไม่มี — ใช้ค่า default ในโค้ด)"}
-
-ตอบเป็น JSON เท่านั้น (ห้ามมี text อื่นนอก JSON):
-{
-  "understanding": "สรุปสั้นๆ ว่า Admin ต้องการอะไร (ภาษาไทย 1-2 ประโยค)",
-  "actions": [
-    {
-      "type": "create_rule",
-      "ruleType": "speech_rule",
-      "title": "ชื่อกฎสั้นๆ ภาษาไทย",
-      "instruction": "คำอธิบายกฎละเอียดที่ AI ต้องปฏิบัติ",
-      "priority": 90
-    }
-  ],
-  "warnings": [],
-  "confirmMessage": "ข้อความสรุปสิ่งที่จะทำให้ Admin ยืนยัน (ภาษาไทย สุภาพ ใช้ ค่ะ/นะคะ)"
-}
-
-ตัวอย่าง:
-- Admin: "ห้ามบอกลูกค้าว่าเป็น AI" → สร้าง speech_rule "ห้ามเอ่ยว่าเป็น AI/บอท ตอบเสมือนทีมงาน DINOCO"
-- Admin: "ห้ามใช้ ?" → สร้าง speech_rule "ห้ามใช้เครื่องหมาย ? ใช้คำว่า คะ แทน"
-- Admin ส่งรูป AI ตอบผิด → วิเคราะห์จากรูปว่าผิดอะไร แล้วสร้างกฎแก้ไข
-- Admin: "แก้ KB เรื่อง X" → type: "update_kb"
-
-ถ้าคำสั่งไม่ชัดเจน → ถามกลับใน confirmMessage ว่าต้องการอะไรเพิ่ม`;
+  const userText = command || "ดูรูปนี้แล้วบอกว่า AI ตอบลูกค้าผิดตรงไหน ควรสร้างกฎอะไรแก้";
 
   const anthropicKey = getDynamicKeySync("ANTHROPIC_API_KEY");
   const googleKey = getDynamicKeySync("GOOGLE_API_KEY");
-  let analysis;
+  let aiResponse = "";
+
   try {
     if (anthropicKey) {
       const content = [];
       if (imageBase64) content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } });
-      content.push({ type: "text", text: command || "วิเคราะห์รูปนี้ แล้วบอกว่า AI ทำอะไรผิด ควรสร้างกฎอะไร" });
+      content.push({ type: "text", text: userText });
       const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2048, temperature: 0.2, system: bossPrompt,
-          messages: [
-            { role: "user", content },
-            { role: "assistant", content: "{" },
-          ]
-        }),
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1024, temperature: 0.3, system: bossPrompt, messages: [{ role: "user", content }] }),
         signal: AbortSignal.timeout(30000),
       });
       const data = await aiRes.json();
-      // Claude prefill เริ่ม "{" → response ไม่มี { นำหน้า ต้องเติมกลับ
-      const rawText = data.content?.[0]?.text || "";
-      analysis = rawText.startsWith("{") ? rawText : "{" + rawText;
+      aiResponse = data.content?.[0]?.text || "";
     } else if (googleKey) {
       const parts = [];
       if (imageBase64) parts.push({ inlineData: { mimeType: "image/jpeg", data: imageBase64 } });
-      parts.push({ text: command || "วิเคราะห์รูปนี้ แล้วบอกว่า AI ทำอะไรผิด ควรสร้างกฎอะไร" });
+      parts.push({ text: userText });
       const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${googleKey}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ system_instruction: { parts: [{ text: bossPrompt }] }, contents: [{ role: "user", parts }], generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: "application/json" } }),
+        body: JSON.stringify({ system_instruction: { parts: [{ text: bossPrompt }] }, contents: [{ role: "user", parts }], generationConfig: { temperature: 0.3, maxOutputTokens: 1024 } }),
         signal: AbortSignal.timeout(30000),
       });
       const data = await aiRes.json();
-      analysis = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     } else {
       return res.status(500).json({ error: "No AI API key configured" });
     }
-    let parsed;
-    try {
-      // หา JSON block จาก response (อาจมี text อื่นล้อมรอบ)
-      const jsonMatch = analysis.match(/\{[\s\S]*\}/);
-      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
-    } catch { parsed = null; }
 
-    // Fallback: ถ้า parse JSON ไม่ได้ → ใช้ raw text เป็น confirmMessage
-    if (!parsed || !parsed.confirmMessage) {
-      parsed = {
-        understanding: command || "วิเคราะห์จากรูปที่ส่ง",
-        actions: [],
-        warnings: [],
-        confirmMessage: analysis || "ไม่สามารถวิเคราะห์ได้ กรุณาลองใหม่ค่ะ",
-      };
+    if (!aiResponse) return res.json({ ok: true, commandId: `cmd_${Date.now()}`, understanding: "AI ไม่ตอบ", actions: [], confirmMessage: "ไม่สามารถวิเคราะห์ได้ค่ะ กรุณาลองใหม่นะคะ", warnings: [] });
+
+    // Step 2: Code แปลง AI response → structured actions
+    const actions = [];
+    const lines = aiResponse.split("\n").filter(l => l.trim());
+
+    // หากฎจากข้อความ AI
+    const rulePatterns = [
+      { pattern: /ห้าม.*(?:บอก|เอ่ย|พูด).*(?:AI|เอไอ|บอท|bot|ระบบอัตโนมัติ)/i, title: "ห้ามบอกว่าเป็น AI", type: "speech_rule", instruction: "ห้ามใช้คำว่า AI, บอท, ระบบอัตโนมัติ, artificial intelligence กับลูกค้า ตอบเสมือนเป็นทีมงาน DINOCO เท่านั้น" },
+      { pattern: /ห้าม.*\?|ห้ามใช้.*เครื่องหมาย/i, title: "ห้ามใช้เครื่องหมาย ?", type: "speech_rule", instruction: "ห้ามใช้เครื่องหมายคำถาม ? ภาษาไทยใช้คำว่า คะ หรือ นะคะ แทน เช่น 'สินค้ารุ่นอะไรคะ' ไม่ใช่ 'สินค้ารุ่นอะไร?'" },
+      { pattern: /ห้าม.*(?:คู่แข่ง|ยี่ห้อ|แบรนด์.*อื่น|SRC|F2MOTO|BMMOTO)/i, title: "ห้ามเอ่ยแบรนด์คู่แข่ง", type: "content_rule", instruction: "ห้ามเอ่ยชื่อแบรนด์คู่แข่ง ห้ามเปรียบเทียบ ถ้าลูกค้าถามเปรียบเทียบ ตอบแค่จุดเด่นของ DINOCO" },
+      { pattern: /ห้าม.*(?:แสดง|บอก).*(?:วิเคราะห์|analysis|ผลตรวจ)/i, title: "ห้ามแสดงผลวิเคราะห์ AI ให้ลูกค้า", type: "content_rule", instruction: "ผล AI วิเคราะห์รูป/ข้อมูล เก็บไว้ภายในส่งให้แอดมินเท่านั้น ห้ามแสดงให้ลูกค้าเห็น" },
+      { pattern: /(?:ลด|น้อย|เลิก).*emoji/i, title: "ลดการใช้ emoji", type: "tone_rule", instruction: "ใช้ emoji น้อยมาก ไม่เกิน 1 ตัวต่อข้อความ หรือไม่ใช้เลยก็ได้" },
+      { pattern: /(?:สุภาพ|เป็นกันเอง|เป็นมิตร)/i, title: "เพิ่มความเป็นมิตร", type: "tone_rule", instruction: "พูดสุภาพ เป็นกันเอง เรียกลูกค้าว่า พี่ ลงท้ายด้วย ค่ะ/นะคะ" },
+      { pattern: /(?:สั้น|กระชับ|ไม่ยาว)/i, title: "ตอบสั้นกระชับ", type: "tone_rule", instruction: "ตอบกระชับ 1-3 ประโยค ไม่ยาวเยิ่นเย้อ ตรงประเด็น" },
+      { pattern: /(?:ถามรุ่นรถ|ถามรถ|รุ่นรถก่อน)/i, title: "ถามรุ่นรถก่อนแนะนำ", type: "workflow_rule", instruction: "เมื่อลูกค้าถามสินค้า ต้องถามรุ่นรถและปีผลิตก่อนแนะนำเสมอ เพื่อให้แนะนำ fitment ที่ถูกต้อง" },
+      { pattern: /(?:ประสาน|ติดต่อ|แจ้ง).*ตัวแทน/i, title: "เสนอประสานตัวแทนให้", type: "workflow_rule", instruction: "เมื่อลูกค้าสนใจสินค้า ให้เสนอประสานตัวแทนจำหน่ายให้ทันที ไม่ต้องรอลูกค้าบอก" },
+      { pattern: /(?:one price|ราคาเดียว|ไม่มีโปร)/i, title: "One Price Policy", type: "content_rule", instruction: "DINOCO เป็นนโยบาย One Price ไม่มีโปรโมชั่น ถ้าลูกค้าถามลดราคา ตอบว่า DINOCO เป็นนโยบาย One Price ค่ะ ซื้อไปมั่นใจได้ว่าจะไม่มีโปรโมชั่นค่ะ" },
+    ];
+
+    const fullText = (command || "") + " " + aiResponse;
+    for (const rp of rulePatterns) {
+      if (rp.pattern.test(fullText)) {
+        // เช็คว่ากฎนี้มีอยู่แล้วหรือยัง
+        const existing = await db.collection("ai_rules").findOne({ title: rp.title, active: true, deletedAt: null });
+        if (!existing) {
+          actions.push({ type: "create_rule", ruleType: rp.type, title: rp.title, instruction: rp.instruction, priority: 90 });
+        }
+      }
     }
 
+    // ถ้า AI วิเคราะห์แล้วไม่ match pattern → extract จาก AI response
+    if (actions.length === 0 && command) {
+      // สร้าง generic rule จากคำสั่ง
+      actions.push({
+        type: "create_rule",
+        ruleType: "speech_rule",
+        title: command.substring(0, 50),
+        instruction: command,
+        priority: 80,
+      });
+    }
+
+    const confirmLines = actions.map((a, i) => `${i + 1}. [${a.ruleType === "speech_rule" ? "กฎการพูด" : a.ruleType === "content_rule" ? "กฎเนื้อหา" : a.ruleType === "workflow_rule" ? "กฎ workflow" : "กฎน้ำเสียง"}] ${a.title}`);
+    const confirmMessage = actions.length > 0
+      ? `วิเคราะห์แล้วค่ะ จะสร้าง ${actions.length} กฎ:\n${confirmLines.join("\n")}\n\nยืนยันไหมคะ`
+      : aiResponse;
+
     const commandId = `cmd_${Date.now()}`;
+    const parsed = { understanding: aiResponse.substring(0, 200), actions, warnings: [], confirmMessage };
     await db.collection("boss_commands").insertOne({ commandId, input: command, hasImage: !!imageBase64, analysis: parsed, status: "pending", createdAt: new Date() });
     res.json({ ok: true, commandId, ...parsed });
   } catch (e) {
+    console.error("[Boss] analyze error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
