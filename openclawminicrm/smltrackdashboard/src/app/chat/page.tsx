@@ -386,6 +386,17 @@ function ChatPanel({
           <p className={`text-[9px] mt-0.5 ${cfg.color} opacity-60`}>{cfg.capabilities}</p>
         </div>
         <button
+          onClick={async () => {
+            if (!confirm("ล้างประวัติแชท + ความจำ AI ของห้องนี้ ยืนยันไหม")) return;
+            try {
+              await fetch(`/dashboard/api/chat-list/${conv.sourceId}/clear`, { method: "POST" });
+              setMessages([]);
+            } catch {}
+          }}
+          className="p-1 rounded hover:bg-yellow-900/40 text-yellow-400 hover:text-yellow-300 transition text-sm shrink-0"
+          title="ล้างความจำ AI"
+        >🧹</button>
+        <button
           onClick={onClose}
           className="p-1 rounded hover:bg-red-900/40 text-red-400 hover:text-red-300 transition text-sm shrink-0"
           title="ปิด"
