@@ -1,9 +1,61 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.1.0 — Extracted from index.js monolith
+ * V.1.1 — Added claim tracking + Admin LINE alert
  */
-const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers } = require("./shared");
+const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
+
+// === Send Claim Alert to Admin LINE Group ===
+async function sendClaimAlertToAdmin(claim, statusTh, sourceId) {
+  const token = getDynamicKeySync("LINE_CHANNEL_ACCESS_TOKEN");
+  const adminGroup = process.env.B2B_ADMIN_GROUP_ID;
+  if (!token || !adminGroup) return;
+
+  const ticketNum = claim.wpTicketNumber || "N/A";
+  const dashboardUrl = process.env.DASHBOARD_URL || "https://ai.dinoco.in.th/dashboard";
+
+  const flex = {
+    type: "flex",
+    altText: `ลูกค้าตามเคลม ${ticketNum}`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical",
+        contents: [
+          { type: "text", text: "ลูกค้าตามงานเคลม", weight: "bold", size: "lg", color: "#FF6B00" },
+        ],
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "md",
+        contents: [
+          { type: "text", text: `ใบเคลม: ${ticketNum}`, size: "md", weight: "bold" },
+          { type: "text", text: `ลูกค้า: ${claim.customerName || "-"}`, size: "sm" },
+          { type: "text", text: `สินค้า: ${claim.product || "-"}`, size: "sm" },
+          { type: "text", text: `อาการ: ${claim.symptoms || "-"}`, size: "sm", wrap: true },
+          { type: "separator" },
+          { type: "text", text: `สถานะ: ${statusTh}`, size: "md", weight: "bold", color: "#1A3A5C" },
+          { type: "text", text: `เบอร์โทร: ${claim.phone || "-"}`, size: "sm" },
+        ],
+      },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [
+          { type: "button", action: { type: "uri", label: "ดูใบเคลมใน Dashboard", uri: `${dashboardUrl}/claims` }, style: "primary", color: "#FF6B00", height: "sm" },
+          ...(claim.phone ? [{ type: "button", action: { type: "uri", label: `โทรลูกค้า ${claim.phone}`, uri: `tel:${claim.phone}` }, style: "secondary", height: "sm" }] : []),
+          { type: "button", action: { type: "postback", label: "อัพเดทสถานะเคลม", data: `claim_update:${ticketNum}` }, style: "secondary", height: "sm" },
+        ],
+      },
+    },
+  };
+
+  await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ to: adminGroup, messages: [flex] }),
+  }).catch(e => console.error("[ClaimAlert] LINE push error:", e.message));
+
+  console.log(`[ClaimAlert] Sent to Admin LINE: ${ticketNum} (${statusTh})`);
+}
 
 // Forward declarations — set by init()
 let searchMessages = null;
@@ -121,6 +173,20 @@ const AGENT_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "dinoco_claim_status",
+      description: "เช็คสถานะเคลม/ใบเคลม ใช้เมื่อลูกค้าถามเรื่องเคลม ตามงานเคลม หรือพูดถึงเลขใบเคลม MC-XXXXX",
+      parameters: {
+        type: "object",
+        properties: {
+          ticket_number: { type: "string", description: "เลขใบเคลม เช่น MC-05901" },
+          phone: { type: "string", description: "เบอร์โทรลูกค้า (ถ้าไม่มีเลขเคลม)" },
+        },
+      },
+    },
+  },
 ];
 
 // === Execute Tool ===
@@ -220,6 +286,57 @@ async function executeTool(toolName, args, sourceId) {
       );
     }
     return `สร้าง lead สำเร็จ แจ้งตัวแทน ${args.dealer_name} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${args.dealer_name} แล้วค่ะ จะติดต่อพี่กลับเร็วที่สุดนะคะ ${DEFAULT_BOT_NAME} จะติดตามให้จนจบค่ะ"`;
+  }
+  if (toolName === "dinoco_claim_status") {
+    const database = await getDB();
+    if (!database) return "ไม่สามารถเช็คสถานะได้";
+
+    const ticket = args.ticket_number || "";
+    const phone = args.phone || "";
+
+    // 1. หาเคลมจาก MongoDB (manual_claims)
+    let claim = null;
+    if (ticket) {
+      claim = await database.collection("manual_claims").findOne({
+        $or: [
+          { wpTicketNumber: ticket },
+          { wpTicketNumber: { $regex: ticket.replace(/[^0-9]/g, ""), $options: "i" } },
+        ],
+      });
+    }
+    if (!claim && phone) {
+      claim = await database.collection("manual_claims").findOne({ phone: { $regex: phone.replace(/[^0-9]/g, "") } });
+    }
+
+    // 2. ถ้าไม่มีใน MongoDB → ถาม WordPress
+    if (!claim && ticket) {
+      const wpResult = await callDinocoAPI("/claim-manual-status", { ticket_number: ticket });
+      if (typeof wpResult !== "string" && wpResult?.found) {
+        claim = wpResult.claim;
+      }
+    }
+
+    if (!claim) {
+      return `ไม่พบใบเคลม ${ticket || phone} — ตอบลูกค้าว่า "ขอเช็คเลขใบเคลมอีกครั้งนะคะ หรือแจ้งเบอร์โทรที่ลงทะเบียนค่ะ"`;
+    }
+
+    // 3. แปลสถานะเป็นภาษาไทย
+    const STATUS_TH = {
+      photo_requested: "รอรูปจากลูกค้า", photo_rejected: "รูปไม่ชัด รอถ่ายใหม่",
+      photo_received: "ได้รูปแล้ว รอข้อมูลเพิ่ม", info_collecting: "กำลังเก็บข้อมูล",
+      info_collected: "ข้อมูลครบ รอทีมตรวจสอบ", admin_reviewed: "ทีมตรวจแล้ว",
+      waiting_return_shipment: "รอลูกค้าส่งสินค้ากลับ", return_shipped: "ลูกค้าส่งกลับแล้ว",
+      received_at_factory: "โรงงานรับสินค้าแล้ว", parts_shipping: "กำลังส่งอะไหล่ทดแทน",
+      return_to_customer: "ส่งสินค้ากลับลูกค้าแล้ว",
+      closed_resolved: "เสร็จสิ้น แก้ไขแล้ว", closed_rejected: "ปฏิเสธ ไม่อยู่ในเงื่อนไข",
+    };
+    const statusTh = STATUS_TH[claim.status] || claim.status;
+    const ticketNum = claim.wpTicketNumber || ticket;
+
+    // 4. ส่ง Flex Message ไปกลุ่ม Admin LINE
+    sendClaimAlertToAdmin(claim, statusTh, sourceId).catch(() => {});
+
+    return `ใบเคลม: ${ticketNum}\nสถานะ: ${statusTh}\nสินค้า: ${claim.product || "-"}\nอาการ: ${claim.symptoms || "-"}\n\nตอบลูกค้าว่า "ใบเคลม ${ticketNum} สถานะ: ${statusTh} ค่ะ ทีมงานกำลังดูแลอยู่นะคะ"`;
   }
   // MCP tools
   if (mcpToolHandlers[toolName]) {
