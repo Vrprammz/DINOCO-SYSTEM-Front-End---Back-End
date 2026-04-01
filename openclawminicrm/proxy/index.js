@@ -1191,6 +1191,113 @@ app.post("/api/advisor/advice", express.json(), async (req, res) => { const db =
 app.post("/api/advisor/update-pulled", express.json(), async (req, res) => { res.json({ ok: true }); });
 app.post("/api/advisor/cost", express.json(), async (req, res) => { const db = await getDB(); if (!db) return res.status(500).json({ error: "DB" }); await db.collection("ai_costs").insertOne({ ...req.body, createdAt: new Date() }); res.json({ ok: true }); });
 
+// === Agent Ask — Admin ถาม Agent ตอบจากข้อมูลจริง (Phase 2) ===
+function classifyQuestion(q) {
+  const lower = q.toLowerCase();
+  if (/sla|ตอบช้า|ตัวแทน.*ไม่ตอบ/.test(lower)) return "sla-monitor";
+  if (/lead|ลูกค้า.*สนใจ|ยอด/.test(lower)) return "lead-scorer";
+  if (/เคลม|ประกัน|ชำรุด/.test(lower)) return "warranty-intelligence";
+  if (/sentiment|ความรู้สึก|พอใจ/.test(lower)) return "sentiment-analyzer";
+  if (/ราคา|price|ขาย/.test(lower)) return "sales-hunter";
+  if (/demand|พยากรณ์|สินค้า.*ขายดี/.test(lower)) return "demand-forecaster";
+  if (/kb|ความรู้|ตอบไม่ได้/.test(lower)) return "knowledge-updater";
+  if (/จัดส่ง|shipping|พัสดุ/.test(lower)) return "order-tracker";
+  if (/ชำระ|โอน|สลิป/.test(lower)) return "payment-guardian";
+  if (/สรุป|รายงาน|วันนี้/.test(lower)) return "daily-report";
+  return "problem-solver";
+}
+
+app.post("/api/agent-ask", requireAuth, express.json(), async (req, res) => {
+  const { question, agentId } = req.body;
+  if (!question) return res.status(400).json({ error: "question required" });
+
+  const db = await getDB();
+  if (!db) return res.json({ answer: "ไม่สามารถเชื่อมต่อฐานข้อมูลได้", agentId: agentId || "problem-solver" });
+
+  const agentType = agentId || classifyQuestion(question);
+
+  // ดึง context: recent advice + relevant KB + stats
+  const recentAdvice = await db.collection("ai_advice")
+    .find({ type: { $regex: agentType, $options: "i" } })
+    .sort({ createdAt: -1 }).limit(5).toArray();
+
+  let kbResults = [];
+  try {
+    kbResults = await db.collection(KB_COLL)
+      .find({ $text: { $search: question } })
+      .limit(5).toArray();
+  } catch { /* text index may not exist */ }
+
+  const stats = {
+    totalLeads: await db.collection("leads").countDocuments({ closedAt: null }).catch(() => 0),
+    totalClaims: await db.collection("manual_claims").countDocuments({ status: { $nin: ["closed_resolved", "closed_rejected"] } }).catch(() => 0),
+    needsAttention: await db.collection("leads").countDocuments({ status: "dealer_no_response" }).catch(() => 0),
+  };
+
+  const systemPrompt = `คุณคือ AI Advisor ของ DINOCO THAILAND (ผู้ผลิตอะไหล่มอเตอร์ไซค์)
+Agent: ${agentType}
+ตอบเป็นภาษาไทย กระชับ ตรงประเด็น ใช้ข้อมูลจริงจากระบบเท่านั้น
+
+ข้อมูลจากระบบ:
+- Leads ที่ยัง active: ${stats.totalLeads}
+- Claims ที่กำลังดำเนินการ: ${stats.totalClaims}
+- Leads ที่ตัวแทนไม่ตอบ: ${stats.needsAttention}
+
+${recentAdvice.length > 0 ? "คำแนะนำล่าสุดจาก Agent:\n" + recentAdvice.map(a => JSON.stringify(a.advice?.[0] || a)).join("\n") : ""}
+${kbResults.length > 0 ? "\nความรู้จาก KB:\n" + kbResults.map(k => k.title + ": " + (k.content || "").substring(0, 200)).join("\n") : ""}`;
+
+  const apiKey = getDynamicKeySync("GOOGLE_API_KEY");
+  if (!apiKey) return res.json({ answer: "ยังไม่ได้ตั้ง AI API Key", agentId: agentType, stats });
+
+  try {
+    const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(30000),
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: "user", parts: [{ text: question }] }],
+        generationConfig: { temperature: 0.3, maxOutputTokens: 1024 },
+      }),
+    });
+    const data = await aiRes.json();
+    const answer = data.candidates?.[0]?.content?.parts?.[0]?.text || "ไม่สามารถตอบได้ ลองถามใหม่ค่ะ";
+
+    if (data.usageMetadata) {
+      trackAICost({ provider: "Gemini", model: "gemini-2.0-flash", feature: "agent-ask",
+        inputTokens: data.usageMetadata.promptTokenCount || 0, outputTokens: data.usageMetadata.candidatesTokenCount || 0 });
+    }
+
+    await db.collection("agent_chats").insertOne({
+      question, answer, agentId: agentType,
+      context: { stats, adviceCount: recentAdvice.length, kbCount: kbResults.length },
+      createdAt: new Date(),
+    });
+
+    res.json({ answer, agentId: agentType, stats });
+  } catch (e) {
+    res.json({ answer: "AI ไม่ตอบ — ลองใหม่ภายหลังค่ะ", agentId: agentType, error: e.message });
+  }
+});
+
+// === KB Quick Add — Admin เพิ่มความรู้ทันทีจาก conversation ===
+app.post("/api/kb-quick-add", requireAuth, express.json(), async (req, res) => {
+  const { title, content, category, source } = req.body;
+  if (!title || !content) return res.status(400).json({ error: "title and content required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB" });
+  const result = await db.collection(KB_COLL).insertOne({
+    title: title.trim(),
+    content: content.trim(),
+    category: category || "general",
+    tags: [],
+    active: true,
+    source: source || "admin_correction",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  res.json({ ok: true, id: result.insertedId });
+});
+
 // === Health check + root ===
 app.get("/", (req, res) => { res.json({ status: "ok", service: "DINOCO AI Agent", version: "2.1-hardened" }); });
 
