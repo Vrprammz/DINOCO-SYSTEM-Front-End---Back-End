@@ -98,12 +98,20 @@ groups_meta     { sourceId, groupName, platform, teamId }
 - **CI/CD:** GitHub Actions → SSH → Hetzner
 - **คู่มือ:** `docs/DEPLOY-HETZNER.md`
 
+## AI Anti-Hallucination (V.1.4)
+- **3 ชั้นป้องกัน**: System prompt rules → Tool result boundary instruction → Output sanitization (regex)
+- **claudeSupervisor**: Claude ตรวจงาน Gemini ทั้ง LINE + FB + IG (เดิมเฉพาะ Meta)
+- **Product restrictions**: ADV350/Forza350 ไม่มีกล่องข้าง/แร็คข้าง — tool return "ไม่มี" + prompt ห้ามแนะนำ
+- **OR fallback**: Product lookup ต้อง match model ก่อน — ห้ามคืนสินค้าข้ามรุ่น
+- **Claim flow**: LINE + Meta ทำงานเหมือนกัน (getClaimSession + isClaimIntent)
+
 ## สิ่งที่ห้ามทำ
 - ห้ามลบ folder/service โดยไม่ถามบอสก่อน
 - ห้ามเปลี่ยน deploy strategy โดยไม่แจ้ง
 - ห้ามแยก MongoDB collection ตามคน/กลุ่ม
 - ห้ามลบ OpenClaw — เป็นแกนหลักของระบบ
 - ห้าม hardcode สี Tailwind ในหน้าใหม่ — ใช้ theme-* classes
+- ห้าม expose API endpoints โดยไม่มี requireAuth (เช่น /api/km, /api/skills/lessons)
 
 ## Skills
 | Skill | File | หน้าที่ |

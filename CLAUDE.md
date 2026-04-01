@@ -133,3 +133,8 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Dealer ต้องมี ACF field `owner_line_uid` บน distributor CPT หรือ WP user meta `linked_distributor_id`
   - CSS prefix `.liff-ai-*` ทุก class (dark theme), scoped ไม่ conflict กับ B2B/B2F
   - Lead statuses ตรงกับ `LEAD_STATUSES` ใน `lead-pipeline.js` (17 statuses)
+- **OpenClaw Mini CRM** (`openclawminicrm/`): Multi-platform AI chatbot (LINE + Facebook + Instagram). ดู `openclawminicrm/CLAUDE.md` สำหรับรายละเอียด.
+  - **Agent** (`proxy/`): Node.js + Express, Gemini Flash + Claude Sonnet (function calling), MongoDB Atlas
+  - **Modules**: `ai-chat.js` (AI providers + supervisor), `dinoco-tools.js` (8 tools), `shared.js` (prompt + config), `claim-flow.js`, `lead-pipeline.js`, `dinoco-cache.js`
+  - **Anti-Hallucination V.1.4**: 3 ชั้นป้องกัน (prompt → tool boundary → output sanitize), claudeSupervisor ตรวจทุก platform, product restrictions per model
+  - **Security**: requireAuth ทุก API endpoint, prompt injection protection 14 patterns, PII masking, rate limiting
