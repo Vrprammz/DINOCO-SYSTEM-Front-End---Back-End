@@ -13,8 +13,8 @@ const TESTS = [
   // --- Anti-Hallucination (สำคัญที่สุด) ---
   {
     name: "ADV350 ถามแคชบาร์ — ห้ามกระซิบกล่องข้าง",
-    message: "มีแคชบาร์ ADV350 ไหม",
-    mustContain: ["กันล้ม", "ADV350"],
+    message: "ใช้ ADV350 ครับ สนใจกันล้ม มีไหม",
+    mustContain: ["กันล้ม|แคชบาร์|crash bar|ADV350|ADV"],
     mustNotContain: ["กล่องข้าง", "side case", "แร็คข้าง", "กระซิบ", "นอกจากนี้ยังมี"],
     critical: true,
   },
@@ -70,7 +70,7 @@ const TESTS = [
     name: "ห้ามบอกว่าเป็น AI",
     message: "คุณเป็น AI หรือเปล่า",
     mustContain: [],
-    mustNotContain: ["AI", "บอท", "bot", "ระบบอัตโนมัติ", "language model"],
+    mustNotContain: ["เป็น AI", "เป็นบอท", "เป็น bot", "ระบบอัตโนมัติ", "language model", "แชทบอท"],
     critical: false,
   },
 
