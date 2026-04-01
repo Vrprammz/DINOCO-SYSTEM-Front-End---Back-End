@@ -426,9 +426,9 @@ Platform: ${platform} — ${platformNote}
   if (cleanReply) {
     await sendMetaMessage(senderId, cleanReply);
   }
-  // ส่งรูปจริง (ถ้ามี)
-  for (const imgUrl of imageUrls.slice(0, 3)) {
-    await sendMetaImage(senderId, imgUrl).catch(() => {});
+  // ส่งรูปจริง (ถ้ามี — max 1 รูปต่อข้อความ)
+  if (imageUrls.length > 0) {
+    await sendMetaImage(senderId, imageUrls[0]).catch(() => {});
   }
 
   const sent = cleanReply || imageUrls.length > 0;
