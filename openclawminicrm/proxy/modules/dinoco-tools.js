@@ -226,7 +226,6 @@ async function executeTool(toolName, args, sourceId) {
         "กล่อง": "case", "กล่องข้าง": "side case", "กล่องหลัง": "top case",
         "กล่องอลูมิเนียม": "case", "กล่องอลู": "case", "กล่องเหล็ก": "case",
         "กล่องข้างรถ": "side case", "กล่องท้าย": "top case", "กล่องท้ายรถ": "top case",
-        "ลัง": "case", "ลังข้าง": "side case", "ลังหลัง": "top case",
         "topcase": "top case", "sidecase": "side case", "pannier": "side case",
         // แร็ค
         "แร็ค": "rack", "แร็คข้าง": "side rack", "แร็คหลัง": "top rack", "แร็คท้าย": "top rack",
