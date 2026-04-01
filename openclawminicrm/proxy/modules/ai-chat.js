@@ -410,6 +410,7 @@ Platform: ${platform} — ${platformNote}
   }
 
   // ตรวจหา image URL ใน reply → ส่งเป็นรูปจริง แยกจาก text
+  console.log(`[AI-Debug] reply length=${reply.length} hasImageUrl=${/https?:\/\/.*\.(png|jpg|jpeg)/i.test(reply)}`);
   const imgUrlRegex = /(https?:\/\/[^\s\]\)]+\.(?:png|jpg|jpeg|gif|webp))/gi;
   const imageUrls = reply.match(imgUrlRegex) || [];
   let cleanReply = reply;
