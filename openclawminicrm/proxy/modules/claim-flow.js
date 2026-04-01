@@ -156,9 +156,11 @@ const CLAIM_STATUSES = [
   "customer_no_response", "reopened",
 ];
 
-const CLAIM_KEYWORDS = /มีปัญหา|แตก|ลอก|เสีย|หลุด|หาย|ชำรุด|พัง|ร้าว|บิ่น|สติ๊กเกอร์|กุญแจ|ซ่อม|เคลม|เปลี่ยน|คืน/;
+const CLAIM_KEYWORDS = /มีปัญหา|แตก|ลอก|เสีย|หลุด|หาย|ชำรุด|พัง|ร้าว|บิ่น|สติ๊กเกอร์|สติกเกอร์|กุญแจ|ซ่อม|เคลม|คืน|น้ำเข้า|เบี้ยว|ขีดข่วน/;
+const NOT_CLAIM_KEYWORDS = /เปลี่ยนรุ่น|เปลี่ยนสี|เปลี่ยนยี่ห้อ|เปลี่ยนแบบ|เปลี่ยนขนาด|เปลี่ยนรถ|ราคา|สั่ง|ซื้อ|อยากได้|สนใจ|มีไหม|กี่บาท/;
 
 function isClaimIntent(text) {
+  if (NOT_CLAIM_KEYWORDS.test(text)) return false;
   return CLAIM_KEYWORDS.test(text);
 }
 
@@ -175,7 +177,7 @@ async function analyzeClaimPhoto(imageUrl) {
 4. รูปชัดพอสำหรับประเมินไหม? (ชัด / ไม่ชัด-ขอถ่ายใหม่)
 ตอบสั้นกระชับ 2-3 บรรทัด ภาษาไทย`;
 
-    const geminiKey = process.env.GOOGLE_API_KEY;
+    const geminiKey = getDynamicKeySync("GOOGLE_API_KEY");
     if (geminiKey) {
       const gemRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -336,32 +338,43 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
     }
 
     case "info_collecting": {
-      // AI เก็บข้อมูลฉลาด — ดูว่าลูกค้าตอบอะไรมา แล้วเก็บให้ถูก field
+      // AI extract หลาย field จากข้อความเดียว
       if (text) {
-        // AI ตรวจว่าข้อมูลใหม่เป็น field ไหน
+        const updateFields = {};
         const lower = text.toLowerCase();
-        if (!claim.purchaseFrom && !claim.purchaseDate && !claim.symptoms) {
-          // ยังไม่มีอะไรเลย → เก็บเป็น purchaseFrom (ร้านที่ซื้อ)
-          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-            $set: { purchaseFrom: text, updatedAt: new Date() },
-          });
-          const smartQ = await aiClaimQuestion({ ...claim, purchaseFrom: text }, text);
-          return smartQ || await getTemplate("claim_ask_date") || "ประมาณซื้อเมื่อไหร่คะ";
+
+        // เช็คเบอร์โทรก่อน (ชัดเจนที่สุด)
+        const phoneMatch = text.replace(/[^0-9]/g, "");
+        if (phoneMatch.length >= 9 && !claim.phone) updateFields.phone = phoneMatch;
+
+        // AI extract: ถ้าข้อความมีหลายข้อมูล เก็บทีเดียว
+        if (!claim.purchaseFrom && /ร้าน|shop|ศูนย์|facebook|เพจ|lazada|shopee/i.test(lower)) updateFields.purchaseFrom = text;
+        if (!claim.purchaseDate && /เมื่อ|ปีที่แล้ว|เดือน|สัปดาห์|วัน|ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.|2024|2025|2026/i.test(lower)) updateFields.purchaseDate = text;
+        if (!claim.symptoms && /ลอก|หลุด|แตก|ร้าว|เบี้ยว|พัง|ชำรุด|เสีย|ชน|น้ำเข้า|หาย|ไม่ทำงาน|ขีดข่วน/i.test(lower)) updateFields.symptoms = text;
+        if (!claim.address && /ส่ง.*ที่|ที่อยู่|จัดส่ง|แขวง|เขต|ตำบล|อำเภอ|จังหวัด|รหัสไปรษณีย์|\d{5}/i.test(lower)) updateFields.address = text;
+
+        // ถ้าไม่ match pattern → เก็บเป็น field ที่ว่างแรก
+        if (Object.keys(updateFields).length === 0) {
+          if (!claim.purchaseFrom) updateFields.purchaseFrom = text;
+          else if (!claim.purchaseDate) updateFields.purchaseDate = text;
+          else if (!claim.symptoms) updateFields.symptoms = text;
         }
-        if (claim.purchaseFrom && !claim.purchaseDate) {
-          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-            $set: { purchaseDate: text, updatedAt: new Date() },
-          });
-          const smartQ = await aiClaimQuestion({ ...claim, purchaseDate: text }, text);
-          return smartQ || await getTemplate("claim_ask_symptoms") || "อาการเป็นยังไงคะ";
+
+        if (Object.keys(updateFields).length > 0) {
+          updateFields.updatedAt = new Date();
+          await db.collection("manual_claims").updateOne({ _id: claim._id }, { $set: updateFields });
         }
-        if (claim.purchaseFrom && claim.purchaseDate && !claim.symptoms) {
-          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-            $set: { symptoms: text, updatedAt: new Date() },
-          });
-          const smartQ = await aiClaimQuestion({ ...claim, symptoms: text }, text);
-          return smartQ || await getTemplate("claim_ask_phone") || "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
-        }
+
+        // เช็คว่าข้อมูลครบหรือยัง
+        const updatedClaim = { ...claim, ...updateFields };
+        const smartQ = await aiClaimQuestion(updatedClaim, text);
+        if (smartQ) return smartQ;
+
+        // Fallback: ถามข้อที่ยังขาด
+        if (!updatedClaim.purchaseFrom) return "ซื้อจากร้านไหนคะ";
+        if (!updatedClaim.purchaseDate) return "ประมาณซื้อเมื่อไหร่คะ";
+        if (!updatedClaim.symptoms) return "อาการเป็นยังไงคะ";
+        if (!updatedClaim.phone) return "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
       }
       if (claim.symptoms && !claim.phone && text) {
         const phoneMatch = text.replace(/[^0-9]/g, "");

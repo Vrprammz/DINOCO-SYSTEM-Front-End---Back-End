@@ -231,7 +231,19 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
   const functionDeclarations = tools.map((t) => ({
     name: t.function.name, description: t.function.description, parameters: t.function.parameters,
   }));
-  const contents = [{ role: "user", parts: [{ text: userMessage }] }];
+
+  // ส่ง conversation history ให้ Gemini จำ context ได้
+  const contents = [];
+  try {
+    const recentMsgs = await getRecentMessages(sourceId, 6);
+    for (const m of recentMsgs.reverse()) {
+      const role = m.role === "assistant" ? "model" : "user";
+      if (m.content && m.content.length > 0 && m.content !== "[รูปภาพ]") {
+        contents.push({ role, parts: [{ text: m.content }] });
+      }
+    }
+  } catch {}
+  contents.push({ role: "user", parts: [{ text: userMessage }] });
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents,
@@ -279,7 +291,19 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId) {
   const claudeTools = tools.map((t) => ({
     name: t.function.name, description: t.function.description, input_schema: t.function.parameters,
   }));
-  const messages = [{ role: "user", content: userMessage }];
+
+  // ส่ง conversation history ให้ Claude จำ context ได้
+  const messages = [];
+  try {
+    const recentMsgs = await getRecentMessages(sourceId, 6);
+    for (const m of recentMsgs.reverse()) {
+      const role = m.role === "assistant" ? "assistant" : "user";
+      if (m.content && m.content.length > 0 && m.content !== "[รูปภาพ]") {
+        messages.push({ role, content: m.content });
+      }
+    }
+  } catch {}
+  messages.push({ role: "user", content: userMessage });
   for (let i = 0; i < 4; i++) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
