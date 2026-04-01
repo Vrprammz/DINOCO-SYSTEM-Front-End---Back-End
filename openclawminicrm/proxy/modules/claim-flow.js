@@ -85,6 +85,64 @@ ${missing.join("\n")}
   return null;
 }
 
+// === ดึง KB เรื่องเคลม → ให้ AI ตอบตาม KB (ไม่ hardcode) ===
+async function getClaimKBResponse(customerText, claim) {
+  const db = await getDB();
+  const apiKey = getDynamicKeySync("GOOGLE_API_KEY");
+  if (!apiKey || !db) return null;
+
+  // ดึง KB ที่เกี่ยวข้องกับเคลม
+  const kbEntries = await db.collection("knowledge_base")
+    .find({ $or: [
+      { category: "warranty" },
+      { tags: { $in: ["เคลม", "ประกัน", "สติ๊กเกอร์", "กุญแจ", "ซ่อม", "กันล้ม", "กล่อง"] } },
+      { trainingPhrases: { $regex: "เคลม|ประกัน|สติ๊กเกอร์|ลอก|หลุด|ชน|เบี้ยว|ซ่อม", $options: "i" } },
+    ] })
+    .limit(10).toArray();
+
+  if (kbEntries.length === 0) return null;
+
+  const kbText = kbEntries.map(k => `[${k.title}]\n${k.content || ""}`).join("\n\n---\n");
+
+  const prompt = `คุณเป็นทีมงาน DINOCO (ห้ามบอกว่าเป็น AI เด็ดขาด)
+ลูกค้าต้องการเคลมสินค้า
+
+ความรู้เรื่องเคลมจากคลัง KB (ใช้เป็นสมองคิด ตอบตาม KB แต่แต่งคำให้เป็นธรรมชาติ):
+${kbText}
+
+ข้อมูลที่รู้แล้ว:
+- สินค้า: ${claim.product || "ยังไม่ทราบ"}
+- อาการ: ${claim.symptoms || "ยังไม่ทราบ"}
+- ข้อความลูกค้า: "${customerText}"
+
+วิธีตอบ:
+1. acknowledge สิ่งที่ลูกค้าบอก (เช่น "เรื่องสติ๊กเกอร์ลอกนะคะ")
+2. ตอบตาม KB — ถ้า KB มีวิธีตอบชัดเจน ให้ใช้ตามนั้น (เช่น ขอรูป + ที่อยู่จัดส่ง)
+3. ถ้า KB บอกว่าต้องขอรูปอะไรบ้าง → ขอตาม KB
+4. ห้ามใช้ ? ใช้ คะ/นะคะ แทน
+5. เรียกลูกค้าว่า "พี่" หรือ "คุณลูกค้า"
+6. ห้ามพูดว่าฟรีตลอดอายุการใช้งาน หรือประกันตลอดชีพ`;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(15000),
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: prompt }] },
+        contents: [{ role: "user", parts: [{ text: customerText }] }],
+        generationConfig: { temperature: 0.3, maxOutputTokens: 400 },
+      }),
+    });
+    const data = await res.json();
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (reply && reply.length > 10) {
+      console.log("[ClaimKB] AI replied from KB");
+      return reply.replace(/\?/g, "").trim();
+    }
+  } catch (e) { console.error("[ClaimKB] Error:", e.message); }
+  return null;
+}
+
 function init(deps) {
   analyzeImage = deps.analyzeImage;
 }
@@ -202,13 +260,11 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
   let claim = await getClaimSession(sourceId);
   if (!claim) {
     claim = await startClaimFlow(sourceId, platform, customerName, text);
-    // ถ้าดึง product/symptoms จาก text ได้แล้ว → ตอบฉลาดขึ้น
-    if (claim.product || claim.symptoms) {
-      const parts = [];
-      if (claim.product) parts.push(`เรื่อง${claim.product}`);
-      if (claim.symptoms) parts.push(`อาการ${claim.symptoms}`);
-      return `รับทราบค่ะ ${parts.join(" ")} นะคะ ทีม DINOCO พร้อมดูแลให้ค่ะ\nรบกวนส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยนะคะ`;
-    }
+
+    // ดึง KB เรื่องเคลมที่ตรงกับสิ่งที่ลูกค้าบอก → ให้ AI ตอบตาม KB
+    const kbReply = await getClaimKBResponse(text, claim);
+    if (kbReply) return kbReply;
+
     return await getTemplate("claim_start") || "รับทราบค่ะ ทีม DINOCO พร้อมดูแลเรื่องเคลมให้ค่ะ\nรบกวนส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยนะคะ";
   }
 
