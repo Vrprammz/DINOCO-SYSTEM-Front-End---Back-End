@@ -209,6 +209,24 @@ async function executeTool(toolName, args, sourceId) {
     return `Sentiment: ${data.sentiment?.score}/100 (${data.sentiment?.level}) — ${data.sentiment?.reason}\nPurchase: ${data.purchaseIntent?.score}/100 (${data.purchaseIntent?.level}) — ${data.purchaseIntent?.reason}`;
   }
   if (toolName === "dinoco_product_lookup") {
+    // ค้นจาก cached catalog ก่อน (เร็ว + ไม่ timeout)
+    const { wpCache } = require("./dinoco-cache");
+    const catalog = wpCache.catalog?.data || wpCache.catalog?.stale;
+    if (catalog?.products && catalog.products.length > 0) {
+      const query = (args.query || "").toLowerCase();
+      const cat = (args.category || "").toLowerCase();
+      const matched = catalog.products.filter(p => {
+        const name = (p.name || "").toLowerCase();
+        const sku = (p.sku || "").toLowerCase();
+        return name.includes(query) || sku.includes(query) || (cat && name.includes(cat));
+      });
+      if (matched.length > 0) {
+        return matched.slice(0, 10).map((p) =>
+          `${p.name} — ราคา ${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"} | SKU: ${p.sku}${p.img_url ? " | รูป: " + p.img_url : ""}${p.warranty_years ? " | ประกัน " + p.warranty_years + " ปี" : ""}`
+        ).join("\n");
+      }
+    }
+    // Fallback: เรียก WordPress API (ถ้า cache ไม่มี)
     const result = await callDinocoAPI("/product-lookup", { query: args.query || "", category: args.category || "" });
     if (typeof result === "string") return result;
     if (!result.found) return result.message || "ไม่พบสินค้า";
