@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.1.2 — Anti-hallucination: boundary instruction in product lookup result
+ * V.1.4 — Anti-hallucination V2: product lookup ห้าม OR fallback ข้ามรุ่น, Scooter side case blocker
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -286,12 +286,40 @@ async function executeTool(toolName, args, sourceId) {
         ) || (cat && name.includes(cat));
       });
 
-      // ถ้า AND ไม่เจอ → ลอง OR (เจออย่างน้อย 1 term)
-      const finalMatched = matched.length > 0 ? matched : catalog.products.filter(p => {
-        const name = (p.name || "").toLowerCase();
-        const sku = (p.sku || "").toLowerCase();
-        return searchTerms.some(term => name.includes(term) || sku.includes(term));
-      });
+      // ★ V.1.4: ถ้า AND ไม่เจอ → ลอง OR แต่ต้องมี model match (ป้องกันข้ามรุ่น)
+      // ตรวจว่า searchTerms มี model keyword ไหม
+      const MODEL_KEYS = ["adv350","adv","forza350","forza","nx500","cb500x","xl750","xadv","forza750"];
+      const hasModelTerm = searchTerms.some(t => MODEL_KEYS.includes(t));
+      let finalMatched = matched;
+      if (matched.length === 0) {
+        if (hasModelTerm) {
+          // มี model → OR fallback ต้อง match model ด้วย (ห้ามข้ามรุ่น)
+          const modelTerms = searchTerms.filter(t => MODEL_KEYS.includes(t));
+          finalMatched = catalog.products.filter(p => {
+            const name = (p.name || "").toLowerCase();
+            return modelTerms.some(mt => name.includes(mt)) &&
+                   searchTerms.some(t => !MODEL_KEYS.includes(t) ? (name.includes(t)) : false);
+          });
+          // ถ้ายังไม่เจอ = สินค้าประเภทนี้ไม่มีสำหรับรุ่นนี้
+          if (finalMatched.length === 0) {
+            const SCOOTER_NO_SIDE = ["adv350","adv","forza350","forza"];
+            const queryCat = searchTerms.join(" ");
+            const isSideQuery = /side|ข้าง|sidebox|sidecase/.test(queryCat);
+            const isScooter = modelTerms.some(m => SCOOTER_NO_SIDE.includes(m));
+            if (isSideQuery && isScooter) {
+              return `ไม่มีกล่องข้าง/แร็คข้างสำหรับรุ่นนี้ค่ะ (ADV350/Forza350 ไม่มีกล่องข้าง เนื่องจากข้อจำกัดด้านบาลานซ์และเฟรมรถ) สินค้าที่มี: แร็คหลัง กันล้ม กล่องหลัง\n\n[คำสั่ง: ห้ามแนะนำกล่องข้าง/แร็คข้างให้รุ่นนี้เด็ดขาด ตอบเฉพาะสินค้าที่มีจริง]`;
+            }
+            return `ไม่พบสินค้าประเภทนี้สำหรับรุ่นนี้ในระบบค่ะ\n\n[คำสั่ง: ถ้าไม่พบ = ไม่มีจริง ห้ามกุสินค้าที่ไม่มีในระบบ]`;
+          }
+        } else {
+          // ไม่มี model → OR fallback ปกติ
+          finalMatched = catalog.products.filter(p => {
+            const name = (p.name || "").toLowerCase();
+            const sku = (p.sku || "").toLowerCase();
+            return searchTerms.some(term => name.includes(term) || sku.includes(term));
+          });
+        }
+      }
 
       if (finalMatched.length > 0) {
         const list = finalMatched.slice(0, 10).map((p) =>

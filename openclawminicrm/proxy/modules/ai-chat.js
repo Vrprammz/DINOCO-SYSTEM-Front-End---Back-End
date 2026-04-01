@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.1.2 — Anti-hallucination: lower temp, sanitize whisper, claudeSupervisor check cross-sell
+ * V.1.4 — Anti-hallucination V2: claudeSupervisor on LINE, expanded sanitize patterns, cross-sell blocker
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -224,11 +224,19 @@ function sanitizeAIOutput(text) {
     .replace(/(สต็อก|stock|คงเหลือ|จำนวน\s*\d+\s*ชิ้น|หมดสต็อก)[^\n]*/gi, "[สอบถามตัวแทนจำหน่ายค่ะ]")
     .replace(/(api[_-]?key|token|secret|password)\s*[:=]\s*\S+/gi, "[REDACTED]")
     .replace(/https?:\/\/(localhost|127\.0\.0\.1|internal|admin)[^\s]*/gi, "[REDACTED]");
-  // Anti-hallucination: ลบประโยค "กระซิบ" ที่ AI มักเติมเอง
+  // ★ V.1.4: Anti-hallucination: ลบ "กระซิบ" + cross-sell patterns ที่ AI มักเติมเอง
   const whisperPattern = /[\n(（]?\s*(?:แอบ)?กระซิบ(?:ว่า)?[^)\n）]*[)\n）]?/gi;
-  if (whisperPattern.test(result)) {
-    console.warn("[AI-Sanitize] Removed whisper/cross-sell hallucination");
-    result = result.replace(whisperPattern, "").trim();
+  // จับ cross-sell ที่ไม่ใช้คำว่า "กระซิบ" เช่น "นอกจากนี้ยังมี..." "มี...ด้วยนะ" "แนะนำเพิ่ม..."
+  const crossSellPattern = /[\n]?\s*(?:นอกจากนี้(?:ยัง)?มี|แถมยังมี|อีกทั้งยังมี|แนะนำเพิ่มว่า|แอดมินแนะนำเพิ่ม)[^\n]*(?:ด้วย(?:นะ)?(?:คะ|ค่ะ)?|นะคะ)/gi;
+  // จับ pattern "มี + สินค้า + ด้วยนะคะ" ที่ AI ชอบเพิ่มเอง
+  const sneakySellPattern = /[\n]?\s*(?:เรายังมี|ทาง DINOCO ยังมี|DINOCO ยังมี)[^\n]*(?:ด้วย(?:นะ)?(?:คะ|ค่ะ)?|นะคะ)/gi;
+  const patternsToCheck = [whisperPattern, crossSellPattern, sneakySellPattern];
+  for (const pat of patternsToCheck) {
+    if (pat.test(result)) {
+      console.warn(`[AI-Sanitize] Removed cross-sell hallucination: ${pat.source.substring(0, 40)}`);
+      pat.lastIndex = 0; // reset regex state
+      result = result.replace(pat, "").trim();
+    }
   }
   return result;
 }
@@ -375,10 +383,12 @@ DINOCO เป็น One Price ไม่มีโปรโมชั่น
 สไตล์: ${abInstruction}
 ประวัติสนทนา:\n${contextStr || "(ไม่มี)"}${rulesPrompt}`;
 
-  const reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId);
+  let reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId);
   if (/รอทีมงาน|ขอเช็คข้อมูล/.test(reply)) {
     await createAiHandoffAlert(sourceId, userName, text);
   }
+  // ★ V.1.4: Claude หัวหน้าตรวจงาน Gemini บน LINE ด้วย (เดิมทำเฉพาะ Meta)
+  reply = await claudeSupervisor(reply, text, sourceId, contextStr);
   const sent = await replyToLine(event.replyToken, reply);
   if (sent) {
     await saveMsg(sourceId, {
