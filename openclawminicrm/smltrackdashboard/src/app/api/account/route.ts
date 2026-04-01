@@ -26,9 +26,7 @@ export async function GET() {
     }
 
     const db = await getDB();
-    console.log("[GET /api/account] user email:", user.email);
     const account = await db.collection("accounts").findOne({ email: user.email });
-    console.log("[GET /api/account] found:", !!account, "hasAiConfig:", !!account?.aiConfig);
 
     if (!account) {
       // ยังไม่มี account doc → return ข้อมูลพื้นฐานจาก session
@@ -101,8 +99,6 @@ export async function PUT(req: NextRequest) {
     const body = await req.json();
     const db = await getDB();
 
-    console.log("[PUT /api/account] user:", user.email, "body keys:", Object.keys(body));
-
     // สร้าง update object — เฉพาะ field ที่ส่งมาและไม่ใช่ masked value
     const setFields: Record<string, unknown> = {};
 
@@ -144,9 +140,7 @@ export async function PUT(req: NextRequest) {
 
     setFields["updatedAt"] = new Date();
 
-    console.log("[PUT /api/account] setFields:", JSON.stringify(Object.keys(setFields)), "filter email:", user.email);
-
-    const updateResult = await db.collection("accounts").updateOne(
+    await db.collection("accounts").updateOne(
       { email: user.email },
       {
         $set: setFields,
@@ -159,8 +153,6 @@ export async function PUT(req: NextRequest) {
       },
       { upsert: true }
     );
-
-    console.log("[PUT /api/account] result:", JSON.stringify({ matched: updateResult.matchedCount, modified: updateResult.modifiedCount, upserted: updateResult.upsertedCount }));
 
     return NextResponse.json({ ok: true });
   } catch (err) {
