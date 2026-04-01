@@ -98,7 +98,7 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
   let claim = await getClaimSession(sourceId);
   if (!claim) {
     claim = await startClaimFlow(sourceId, platform, customerName);
-    return "เสียใจด้วยค่ะ ทีม DINOCO พร้อมช่วยเหลือค่ะ\nส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยได้ไหมคะ? 📸";
+    return "รับทราบค่ะ ทีม DINOCO พร้อมดูแลเรื่องเคลมให้ค่ะ\nรบกวนส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยนะคะ 📸";
   }
 
   switch (claim.status) {
