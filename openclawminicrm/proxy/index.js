@@ -1190,6 +1190,19 @@ app.post("/api/customers/merge/consolidate", requireAuth, express.json(), async 
 app.get("/api/customers/churn-risk", requireAuth, async (req, res) => { res.json({ risks: [], total: 0 }); }); // Simplified
 app.get("/api/ab-results", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("messages").aggregate([{ $match: { abVariant: { $exists: true }, role: "assistant" } }, { $group: { _id: "$abVariant", count: { $sum: 1 } } }]).toArray()); }); // ★ V.1.4: เพิ่ม requireAuth
 app.post("/api/cache/invalidate", requireAuth, express.json(), (req, res) => { invalidateWPCache(req.body.key || "all"); res.json({ status: "ok" }); });
+
+// ★ V.1.4: Test AI endpoint — ทดสอบ AI response โดยไม่ต้องส่งผ่าน LINE/FB
+app.post("/api/test-ai", requireAuth, express.json(), async (req, res) => {
+  const { message, sourceId } = req.body;
+  if (!message) return res.status(400).json({ error: "message required" });
+  const testSourceId = sourceId || "test-" + Date.now();
+  try {
+    const reply = await callDinocoAI(DEFAULT_PROMPT, cleanForAI(message), testSourceId);
+    res.json({ reply, sourceId: testSourceId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.get("/api/free-models", (req, res) => { const now = Date.now(); const cooldowns = {}; for (const [k, v] of Object.entries(aiChat.lightAICooldown)) { if (v > now) cooldowns[k] = { until: new Date(v).toISOString() }; } res.json({ count: aiChat.discoveredFreeModels().length, models: aiChat.discoveredFreeModels(), cooldowns, paidAI: PAID_AI }); });
 
 // === Agent Command Center ===
