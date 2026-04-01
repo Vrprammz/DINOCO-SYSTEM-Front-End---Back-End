@@ -1171,6 +1171,18 @@ app.get("/api/ab-results", async (req, res) => { const db = await getDB(); if (!
 app.post("/api/cache/invalidate", requireAuth, express.json(), (req, res) => { invalidateWPCache(req.body.key || "all"); res.json({ status: "ok" }); });
 app.get("/api/free-models", (req, res) => { const now = Date.now(); const cooldowns = {}; for (const [k, v] of Object.entries(aiChat.lightAICooldown)) { if (v > now) cooldowns[k] = { until: new Date(v).toISOString() }; } res.json({ count: aiChat.discoveredFreeModels().length, models: aiChat.discoveredFreeModels(), cooldowns, paidAI: PAID_AI }); });
 
+// === Agent Command Center ===
+app.get("/api/agent-jobs", requireAuth, async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.json({ jobs: [] });
+    const runs = await db.collection("agent_runs").find({}).sort({ lastRunAt: -1 }).limit(50).toArray();
+    res.json({ jobs: runs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // === Costs / Advisor (simplified) ===
 app.get("/api/costs", async (req, res) => { const db = await getDB(); if (!db) return res.json({}); const todayStart = new Date(); todayStart.setHours(0,0,0,0); const todayResult = await db.collection("ai_costs").aggregate([{ $match: { createdAt: { $gte: todayStart } } }, { $group: { _id: null, totalTokens: { $sum: "$totalTokens" }, totalCost: { $sum: "$costUsd" }, calls: { $sum: 1 } } }]).toArray(); res.json({ today: todayResult[0] || { totalTokens: 0, totalCost: 0, calls: 0 } }); });
 app.get("/advice", async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("ai_advice").find({}).sort({ createdAt: -1 }).limit(5).toArray()); });
