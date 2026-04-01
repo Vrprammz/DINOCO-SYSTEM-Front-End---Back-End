@@ -216,16 +216,37 @@ async function executeTool(toolName, args, sourceId) {
       const rawQuery = (args.query || "").toLowerCase();
       const cat = (args.category || "").toLowerCase();
 
-      // Alias mapping: ภาษาไทย → ภาษาอังกฤษในระบบ
+      // Alias mapping: ภาษาไทย/ทับศัพท์/typo → คำในระบบ
       const ALIASES = {
-        "แคชบาร์": "crash bar", "กันล้ม": "crash bar", "แค๊ชบาร์": "crash bar", "crashbar": "crash bar",
+        // กันล้ม / แคชบาร์
+        "แคชบาร์": "crash bar", "แค๊ชบาร์": "crash bar", "แคสบาร์": "crash bar", "แคสบา": "crash bar",
+        "กันล้ม": "crash bar", "กันล้มรถ": "crash bar", "crashbar": "crash bar", "crash": "crash bar",
+        "บาร์กันล้ม": "crash bar", "เหล็กกันล้ม": "crash bar", "กันชน": "crash bar",
+        // กล่อง
         "กล่อง": "case", "กล่องข้าง": "side case", "กล่องหลัง": "top case",
-        "แร็ค": "rack", "แร็คข้าง": "side rack", "แร็คหลัง": "top rack",
-        "ถาดรอง": "tray", "การ์ดแฮนด์": "hand protector", "กระเป๋า": "bag",
-        "ยกแฮนด์": "handlebar riser", "เบาะพิง": "pad",
-        "adv": "adv350", "adv 350": "adv350", "forza": "forza350", "forza 350": "forza350",
-        "nx500": "nx500", "nx 500": "nx500", "cb500x": "cb500x", "cb500": "cb500x",
-        "xl750": "xl750", "transalp": "xl750",
+        "กล่องอลูมิเนียม": "case", "กล่องอลู": "case", "กล่องเหล็ก": "case",
+        "กล่องข้างรถ": "side case", "กล่องท้าย": "top case", "กล่องท้ายรถ": "top case",
+        "ลัง": "case", "ลังข้าง": "side case", "ลังหลัง": "top case",
+        "topcase": "top case", "sidecase": "side case", "pannier": "side case",
+        // แร็ค
+        "แร็ค": "rack", "แร็คข้าง": "side rack", "แร็คหลัง": "top rack", "แร็คท้าย": "top rack",
+        "แรค": "rack", "rack": "rack", "ตะแกรง": "rack", "ตะแกรงท้าย": "top rack",
+        // อื่นๆ
+        "ถาดรอง": "tray", "ถาด": "tray",
+        "การ์ดแฮนด์": "hand protector", "การ์ด": "hand protector", "handguard": "hand protector",
+        "กระเป๋า": "bag", "กระเป๋ากันน้ำ": "bag", "drybag": "bag",
+        "ยกแฮนด์": "handlebar riser", "riser": "handlebar riser",
+        "เบาะพิง": "pad", "เบาะ": "pad",
+        // รุ่นรถ
+        "adv": "adv350", "adv350": "adv350", "adv 350": "adv350", "แอดวี": "adv350",
+        "forza": "forza350", "forza350": "forza350", "forza 350": "forza350", "ฟอร์ซ่า": "forza350",
+        "nx500": "nx500", "nx 500": "nx500", "เอ็นเอ็ก": "nx500",
+        "cb500x": "cb500x", "cb500": "cb500x", "cb 500": "cb500x", "ซีบี": "cb500x",
+        "xl750": "xl750", "transalp": "xl750", "ทรานซัลป์": "xl750",
+        // วัสดุ
+        "iron": "iron", "เหล็ก": "iron", "สีดำ": "black",
+        "stainless": "stainless", "สแตนเลส": "stainless", "สีเงิน": "silver",
+        "triple black": "triple black",
       };
 
       // แยก query เป็นคำ + แปลง alias
