@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.1.1 — Boss Command: inject dynamic rules into AI prompt
+ * V.1.2 — Anti-hallucination: lower temp, sanitize whisper, claudeSupervisor check cross-sell
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -218,12 +218,19 @@ async function callProvider(messages, tools) {
 // === [DINOCO] Output Sanitization ===
 function sanitizeAIOutput(text) {
   if (!text || typeof text !== "string") return text;
-  return text
+  let result = text
     .replace(/ราคา\s*(ต้นทุน|dealer|ตัวแทน|ทุน|wholesale)[^\n]*/gi, "[สอบถามตัวแทนจำหน่ายค่ะ]")
     .replace(/(ส่วนลด|discount|margin|กำไร|profit)[^\n]*/gi, "[DINOCO เป็นนโยบาย One Price ค่ะ]")
     .replace(/(สต็อก|stock|คงเหลือ|จำนวน\s*\d+\s*ชิ้น|หมดสต็อก)[^\n]*/gi, "[สอบถามตัวแทนจำหน่ายค่ะ]")
     .replace(/(api[_-]?key|token|secret|password)\s*[:=]\s*\S+/gi, "[REDACTED]")
     .replace(/https?:\/\/(localhost|127\.0\.0\.1|internal|admin)[^\s]*/gi, "[REDACTED]");
+  // Anti-hallucination: ลบประโยค "กระซิบ" ที่ AI มักเติมเอง
+  const whisperPattern = /[\n(（]?\s*(?:แอบ)?กระซิบ(?:ว่า)?[^)\n）]*[)\n）]?/gi;
+  if (whisperPattern.test(result)) {
+    console.warn("[AI-Sanitize] Removed whisper/cross-sell hallucination");
+    result = result.replace(whisperPattern, "").trim();
+  }
+  return result;
 }
 
 // === Gemini Flash with Function Calling ===
@@ -250,7 +257,7 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents,
     tools: [{ functionDeclarations }],
-    generationConfig: { temperature: 0.35, maxOutputTokens: 2048 },
+    generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
   };
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
   for (let i = 0; i < 4; i++) {
@@ -312,7 +319,7 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId) {
         method: "POST",
         headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514", max_tokens: 2048, temperature: 0.35,
+          model: "claude-sonnet-4-20250514", max_tokens: 2048, temperature: 0.2,
           system: systemPrompt, tools: claudeTools, messages,
         }),
         signal: AbortSignal.timeout(60000),
@@ -392,7 +399,8 @@ async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr)
     /ไม่เข้าใจ|ไม่ใช่|ผิด/i.test(customerText) || // ลูกค้าบอกผิด
     (contextStr && contextStr.includes(geminiReply.substring(0, 50))) || // ตอบซ้ำกับก่อนหน้า
     /\?/.test(geminiReply) ||                      // มี ? หลุด
-    /AI|บอท|bot|ระบบอัตโนมัติ/i.test(geminiReply); // เผยตัวว่าเป็น AI
+    /AI|บอท|bot|ระบบอัตโนมัติ/i.test(geminiReply) || // เผยตัวว่าเป็น AI
+    /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม/i.test(geminiReply); // cross-sell hallucination
 
   if (!needsReview) return geminiReply;
 
@@ -419,6 +427,7 @@ Gemini ตอบ: "${geminiReply}"
 4. เผยว่าเป็น AI ไหม → ลบออก
 5. กุข้อมูลไหม → ลบออก
 6. ยาวเกินไปไหม → ย่อ
+7. กระซิบ/แนะนำสินค้าที่ไม่ได้อยู่ในคำตอบหลักไหม → ลบออก (เช่น "มีกล่องข้างด้วยนะ" ทั้งที่ลูกค้าถามแคชบาร์ = hallucination)
 
 ถ้าคำตอบ Gemini ดีแล้ว → ตอบ "OK" เท่านั้น
 ถ้าต้องแก้ → ตอบข้อความที่แก้แล้ว (ส่งให้ลูกค้าโดยตรง)`,

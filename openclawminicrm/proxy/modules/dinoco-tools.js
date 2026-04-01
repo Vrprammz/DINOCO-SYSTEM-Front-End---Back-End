@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.1.1 — Added claim tracking + Admin LINE alert
+ * V.1.2 — Anti-hallucination: boundary instruction in product lookup result
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -294,18 +294,20 @@ async function executeTool(toolName, args, sourceId) {
       });
 
       if (finalMatched.length > 0) {
-        return finalMatched.slice(0, 10).map((p) =>
+        const list = finalMatched.slice(0, 10).map((p) =>
           `${p.name} — ราคา ${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"} | SKU: ${p.sku}${p.img_url ? " | รูป: " + p.img_url : ""}${p.warranty_years ? " | ประกัน " + p.warranty_years + " ปี" : ""}`
         ).join("\n");
+        return `${list}\n\n[คำสั่ง: ตอบเฉพาะสินค้าในรายการนี้เท่านั้น ห้ามแนะนำ/กระซิบ/เสริมสินค้าอื่นที่ไม่อยู่ในรายการนี้เด็ดขาด ถ้าสินค้าไม่อยู่ในรายการ = ไม่มีสำหรับรุ่นนี้]`;
       }
     }
     // Fallback: เรียก WordPress API (ถ้า cache ไม่มี)
     const result = await callDinocoAPI("/product-lookup", { query: args.query || "", category: args.category || "" });
     if (typeof result === "string") return result;
     if (!result.found) return result.message || "ไม่พบสินค้า";
-    return result.products.map((p) =>
+    const wpList = result.products.map((p) =>
       `${p.name} — ราคา ${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"} | SKU: ${p.sku}${p.img_url ? " | รูป: " + p.img_url : ""}${p.warranty_years ? " | ประกัน " + p.warranty_years + " ปี" : ""}`
     ).join("\n");
+    return `${wpList}\n\n[คำสั่ง: ตอบเฉพาะสินค้าในรายการนี้เท่านั้น ห้ามแนะนำ/กระซิบ/เสริมสินค้าอื่นที่ไม่อยู่ในรายการนี้เด็ดขาด ถ้าสินค้าไม่อยู่ในรายการ = ไม่มีสำหรับรุ่นนี้]`;
   }
   if (toolName === "dinoco_dealer_lookup") {
     const result = await callDinocoAPI("/dealer-lookup", { location: args.location || "" });
