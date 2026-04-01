@@ -115,19 +115,21 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
             await db.collection("manual_claims").updateOne({ _id: claim._id }, {
               $set: { status: "photo_rejected", aiAnalysis: analysis, updatedAt: new Date() },
             });
-            return `รูปยังไม่ค่อยชัดค่ะ 😅\nAI วิเคราะห์: ${analysis}\n\nรบกวนถ่ายอีกทีนะคะ ให้เห็นจุดที่ชำรุดชัดๆ ค่ะ 📸`;
+            // ไม่บอกลูกค้าว่า AI วิเคราะห์ — แค่บอกว่ารูปไม่ชัด
+            return "รูปยังไม่ค่อยชัดค่ะ รบกวนถ่ายอีกทีนะคะ ให้เห็นจุดที่ชำรุดชัดๆ ค่ะ 📸";
           }
+          // เก็บ AI analysis ภายใน (ส่งให้ Admin ดูเฉยๆ) ไม่แสดงลูกค้า
           await db.collection("manual_claims").updateOne({ _id: claim._id }, {
             $set: { status: "photo_received", aiAnalysis: analysis, updatedAt: new Date() },
           });
-          return `ได้รูปแล้วค่ะ 📸\n\nAI ตรวจเบื้องต้น:\n${analysis}\n\nสินค้ารุ่นอะไรคะ?`;
+          return "ได้รูปแล้วค่ะ ขอบคุณนะคะ 📸\nสินค้ารุ่นอะไรคะ";
         }
         const photoCount = (claim.photos?.length || 0) + 1;
         if (photoCount >= 2) {
           await db.collection("manual_claims").updateOne({ _id: claim._id }, {
             $set: { status: "photo_received", updatedAt: new Date() },
           });
-          return "ได้รูปครบแล้วค่ะ ขอบคุณนะคะ 📸\nสินค้ารุ่นอะไรคะ?";
+          return "ได้รูปครบแล้วค่ะ ขอบคุณนะคะ 📸\nสินค้ารุ่นอะไรคะ";
         }
         return `ได้รูปที่ ${photoCount} แล้วค่ะ ส่งรูปเพิ่มได้อีกนะคะ (ส่งรูปบัตรรับประกันด้วยยิ่งดีค่ะ)\nพอครบแล้วพิมพ์ "ครบแล้ว" ค่ะ`;
       }
@@ -135,7 +137,7 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { status: "photo_received", updatedAt: new Date() },
         });
-        return "ขอบคุณค่ะ 📸\nสินค้ารุ่นอะไรคะ?";
+        return "ขอบคุณค่ะ 📸\nสินค้ารุ่นอะไรคะ";
       }
       return "ส่งรูปสินค้าที่ชำรุดให้ดูหน่อยนะคะ 📸";
     }
@@ -151,15 +153,15 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
             $set: { aiAnalysis: (claim.aiAnalysis || "") + "\n" + extraAnalysis },
           });
         }
-        return "ได้รูปเพิ่มแล้วค่ะ\nสินค้ารุ่นอะไรคะ?";
+        return "ได้รูปเพิ่มแล้วค่ะ\nสินค้ารุ่นอะไรคะ";
       }
       if (text && text.length > 1) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { product: text, status: "info_collecting", updatedAt: new Date() },
         });
-        return "ซื้อจากร้านไหนคะ?";
+        return "ซื้อจากร้านไหนคะ";
       }
-      return "สินค้ารุ่นอะไรคะ?";
+      return "สินค้ารุ่นอะไรคะ";
     }
 
     case "info_collecting": {
@@ -167,13 +169,13 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { purchaseFrom: text, updatedAt: new Date() },
         });
-        return "ประมาณซื้อเมื่อไหร่คะ?";
+        return "ประมาณซื้อเมื่อไหร่คะ";
       }
       if (claim.purchaseFrom && !claim.purchaseDate && text) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { purchaseDate: text, updatedAt: new Date() },
         });
-        return "อาการเป็นยังไงคะ?";
+        return "อาการเป็นยังไงคะ";
       }
       if (claim.purchaseFrom && claim.purchaseDate && !claim.symptoms && text) {
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
