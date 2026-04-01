@@ -27,6 +27,7 @@ async function aiClaimQuestion(claim, newInfo) {
 
   // สร้าง context จากข้อมูลที่เก็บไว้แล้ว
   const collected = [];
+  if (claim.initialMessage) collected.push(`ข้อความแรกของลูกค้า: "${claim.initialMessage}"`);
   if (claim.product) collected.push(`สินค้า: ${claim.product}`);
   if (claim.symptoms) collected.push(`อาการ: ${claim.symptoms}`);
   if (claim.purchaseFrom) collected.push(`ร้าน: ${claim.purchaseFrom}`);
@@ -149,16 +150,43 @@ async function getClaimSession(sourceId) {
   });
 }
 
-async function startClaimFlow(sourceId, platform, customerName) {
+async function startClaimFlow(sourceId, platform, customerName, initialMessage) {
   const db = await getDB();
   if (!db) return null;
   const existing = await getClaimSession(sourceId);
   if (existing) return existing;
+
+  // วิเคราะห์ text แรก — ดึงข้อมูลที่ลูกค้าบอกมาแล้ว
+  let autoProduct = null;
+  let autoSymptoms = null;
+  if (initialMessage) {
+    const msg = initialMessage.toLowerCase();
+    // ดึงสินค้าจาก text
+    if (/สติ๊กเกอร์|สติกเกอร์|sticker/.test(msg)) autoProduct = "สติ๊กเกอร์";
+    else if (/กล่อง/.test(msg)) autoProduct = "กล่องอลูมิเนียม";
+    else if (/แคชบาร์|กันล้ม|crashbar/.test(msg)) autoProduct = "แคชบาร์";
+    else if (/แร็ค|rack/.test(msg)) autoProduct = "แร็ค";
+    else if (/ถาด/.test(msg)) autoProduct = "ถาดรอง";
+    else if (/การ์ดแฮนด์|handguard/.test(msg)) autoProduct = "การ์ดแฮนด์";
+    else if (/กุญแจ|ล็อค|lock/.test(msg)) autoProduct = "กุญแจ/ล็อค";
+
+    // ดึงอาการจาก text
+    if (/ลอก|หลุด/.test(msg)) autoSymptoms = "ลอก/หลุด";
+    else if (/แตก|ร้าว|บิ่น/.test(msg)) autoSymptoms = "แตก/ร้าว";
+    else if (/เสีย|พัง|ชำรุด/.test(msg)) autoSymptoms = "ชำรุด";
+    else if (/หาย|ไม่ทำงาน/.test(msg)) autoSymptoms = "ไม่ทำงาน/หาย";
+    else if (/ชน/.test(msg)) autoSymptoms = "ชนมา/กระแทก";
+  }
+
   const claim = {
     sourceId, platform, customerName,
     status: "photo_requested", photos: [], aiAnalysis: null,
-    serial: null, product: null, purchaseFrom: null, purchaseDate: null,
-    symptoms: null, phone: null, address: null,
+    serial: null,
+    product: autoProduct,
+    purchaseFrom: null, purchaseDate: null,
+    symptoms: autoSymptoms,
+    phone: null, address: null,
+    initialMessage: initialMessage || null,
     wpClaimId: null, wpTicketNumber: null,
     createdAt: new Date(), updatedAt: new Date(),
   };
@@ -173,7 +201,14 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
   if (!db) return null;
   let claim = await getClaimSession(sourceId);
   if (!claim) {
-    claim = await startClaimFlow(sourceId, platform, customerName);
+    claim = await startClaimFlow(sourceId, platform, customerName, text);
+    // ถ้าดึง product/symptoms จาก text ได้แล้ว → ตอบฉลาดขึ้น
+    if (claim.product || claim.symptoms) {
+      const parts = [];
+      if (claim.product) parts.push(`เรื่อง${claim.product}`);
+      if (claim.symptoms) parts.push(`อาการ${claim.symptoms}`);
+      return `รับทราบค่ะ ${parts.join(" ")} นะคะ ทีม DINOCO พร้อมดูแลให้ค่ะ\nรบกวนส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยนะคะ`;
+    }
     return await getTemplate("claim_start") || "รับทราบค่ะ ทีม DINOCO พร้อมดูแลเรื่องเคลมให้ค่ะ\nรบกวนส่งรูปสินค้าที่มีปัญหาให้ดูหน่อยนะคะ";
   }
 
