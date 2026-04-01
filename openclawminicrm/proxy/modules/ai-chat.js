@@ -419,8 +419,22 @@ Platform: ${platform} — ${platformNote}
     cleanReply = cleanReply.replace(new RegExp(`\\[?[^\\]]*\\]?\\(?${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)?`, 'g'), '').trim();
     cleanReply = cleanReply.replace(url, '').trim();
   }
-  // ลบ markdown artifacts ที่เหลือ
-  cleanReply = cleanReply.replace(/\[\]\(\)/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  // ลบ markdown ที่ FB Messenger ไม่รองรับ → plain text
+  cleanReply = cleanReply
+    .replace(/\[\]\(\)/g, '')                    // empty markdown links
+    .replace(/\*\*([^*]+)\*\*/g, '$1')          // **bold** → bold
+    .replace(/\*([^*]+)\*/g, '$1')              // *italic* → italic
+    .replace(/__([^_]+)__/g, '$1')              // __bold__ → bold
+    .replace(/_([^_]+)_/g, '$1')                // _italic_ → italic
+    .replace(/~~([^~]+)~~/g, '$1')              // ~~strike~~ → strike
+    .replace(/^#{1,6}\s+/gm, '')                // # Header → Header
+    .replace(/^[\*\-]\s+/gm, '• ')             // * list → • list
+    .replace(/^\d+\.\s+/gm, (m) => m)          // 1. list → keep
+    .replace(/```[^`]*```/gs, '')               // code blocks → remove
+    .replace(/`([^`]+)`/g, '$1')               // `code` → code
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')   // [text](url) → text
+    .replace(/\n{3,}/g, '\n\n')                 // triple newlines → double
+    .trim();
 
   // ส่ง text ก่อน
   if (cleanReply) {
