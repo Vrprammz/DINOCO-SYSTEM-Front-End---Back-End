@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.3.5
+ * Version: V.3.6
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -1188,6 +1188,7 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
                 'product_name' => esc_html( $item['poi_product_name'] ?? '' ),
                 'qty_ordered'  => intval( $item['poi_qty_ordered'] ?? 0 ),
                 'unit_cost'    => floatval( $item['poi_unit_cost'] ?? 0 ),
+                'qty_shipped'  => intval( $item['poi_qty_shipped'] ?? 0 ),
                 'qty_received' => intval( $item['poi_qty_received'] ?? 0 ),
                 'qty_rejected' => intval( $item['poi_qty_rejected'] ?? 0 ),
             );
@@ -1212,6 +1213,19 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
             'amendment_count' => intval( get_field( 'po_amendment_count', $po_id ) ?: 0 ),
             'created_date'    => get_the_date( 'Y-m-d H:i:s', $po_id ),
         );
+
+        // Delivery records (ทุก role เห็นได้)
+        $deliveries_raw = get_field( 'po_deliveries', $po_id ) ?: array();
+        $data['deliveries'] = array();
+        foreach ( $deliveries_raw as $dlv ) {
+            $data['deliveries'][] = array(
+                'number'      => esc_html( $dlv['dlv_number'] ?? '' ),
+                'date'        => esc_html( $dlv['dlv_date'] ?? '' ),
+                'items'       => json_decode( $dlv['dlv_items'] ?? '[]', true ) ?: array(),
+                'note'        => esc_html( $dlv['dlv_note'] ?? '' ),
+                'is_complete' => ! empty( $dlv['dlv_is_complete'] ),
+            );
+        }
 
         if ( $include_sensitive ) {
             $data['admin_note']       = esc_html( get_field( 'po_admin_note', $po_id ) ?: '' );
@@ -1749,9 +1763,11 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => $jwt->get_error_message() ), $status );
         }
 
-        $maker_id = $jwt['maker_id'];
-        $params   = $req->get_json_params();
-        $po_id    = intval( $params['po_id'] ?? 0 );
+        $maker_id       = $jwt['maker_id'];
+        $params         = $req->get_json_params();
+        $po_id          = intval( $params['po_id'] ?? 0 );
+        $delivery_items = $params['delivery_items'] ?? array(); // [{sku, qty}]
+        $maker_note     = sanitize_textarea_field( $params['note'] ?? '' );
 
         if ( ! $po_id ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO' ), 400 );
@@ -1763,29 +1779,93 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'PO นี้ไม่ใช่ของโรงงานคุณ' ), 403 );
         }
 
-        // Transition to delivering
         if ( ! function_exists( 'b2f_transition_order' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ระบบไม่พร้อม' ), 500 );
         }
 
-        // GAP-03: รองรับ partial_received → delivering (Maker ส่งของเพิ่ม)
         $current_status = get_field( 'po_status', $po_id );
         $is_additional  = ( $current_status === 'partial_received' );
+        $po_items       = get_field( 'po_items', $po_id ) ?: array();
+        $po_number      = get_field( 'po_number', $po_id ) ?: 'PO-' . $po_id;
 
-        $note = $is_additional ? 'Maker ส่งของเพิ่ม (LIFF)' : 'Maker แจ้งส่งของ (LIFF)';
+        // ── Delivery Items Processing (Delivery Form feature) ──
+        $dlv_summary    = array();
+        $is_complete    = true;
+        $has_items      = ! empty( $delivery_items ) && is_array( $delivery_items );
+
+        if ( $has_items ) {
+            // Build SKU → index map
+            $sku_map = array();
+            foreach ( $po_items as $idx => $item ) {
+                $sku_map[ $item['poi_sku'] ] = $idx;
+            }
+
+            // Validate + update qty_shipped
+            $any_qty = false;
+            foreach ( $delivery_items as $di ) {
+                $sku = sanitize_text_field( $di['sku'] ?? '' );
+                $qty = intval( $di['qty'] ?? 0 );
+                if ( ! isset( $sku_map[ $sku ] ) ) continue;
+                if ( $qty <= 0 ) continue;
+
+                $idx          = $sku_map[ $sku ];
+                $ordered      = intval( $po_items[ $idx ]['poi_qty_ordered'] ?? 0 );
+                $received     = intval( $po_items[ $idx ]['poi_qty_received'] ?? 0 );
+                $remaining    = $ordered - $received;
+
+                // Cap qty at remaining
+                if ( $qty > $remaining ) $qty = $remaining;
+                if ( $qty <= 0 ) continue;
+
+                $any_qty = true;
+                $old_shipped = intval( $po_items[ $idx ]['poi_qty_shipped'] ?? 0 );
+                $po_items[ $idx ]['poi_qty_shipped'] = $old_shipped + $qty;
+
+                $dlv_summary[] = array( 'sku' => $sku, 'qty' => $qty, 'name' => $po_items[ $idx ]['poi_product_name'] ?? $sku );
+
+                // ตรวจว่าส่งครบไหม (shipped >= remaining)
+                $new_shipped = $old_shipped + $qty;
+                if ( $new_shipped < $remaining ) $is_complete = false;
+            }
+
+            if ( ! $any_qty ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาระบุจำนวนอย่างน้อย 1 รายการ' ), 400 );
+            }
+
+            // Save updated po_items with qty_shipped
+            update_field( 'po_items', $po_items, $po_id );
+
+            // Save delivery record
+            $deliveries    = get_field( 'po_deliveries', $po_id ) ?: array();
+            $dlv_number    = 'DLV-' . str_pad( count( $deliveries ) + 1, 3, '0', STR_PAD_LEFT );
+            $deliveries[]  = array(
+                'dlv_number'      => $dlv_number,
+                'dlv_date'        => wp_date( 'Y-m-d H:i:s' ),
+                'dlv_items'       => wp_json_encode( $dlv_summary ),
+                'dlv_note'        => $maker_note,
+                'dlv_is_complete' => $is_complete,
+            );
+            update_field( 'po_deliveries', $deliveries, $po_id );
+        }
+
+        // Transition to delivering
+        $note   = $is_additional ? 'Maker ส่งของเพิ่ม (LIFF)' : 'Maker แจ้งส่งของ (LIFF)';
         $result = b2f_transition_order( $po_id, 'delivering', 'maker', $note );
         if ( is_wp_error( $result ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => $result->get_error_message() ), 400 );
         }
 
         update_field( 'po_actual_date', wp_date( 'Y-m-d' ), $po_id );
-        $po_number = get_field( 'po_number', $po_id ) ?: 'PO-' . $po_id;
 
-        // แจ้ง Admin ผ่าน LINE
+        // ── LINE Push Admin ──
         $admin_group = defined( 'B2B_ADMIN_GROUP_ID' ) ? B2B_ADMIN_GROUP_ID : '';
         $maker_name  = get_the_title( $maker_id ) ?: 'โรงงาน';
+
         if ( $admin_group && function_exists( 'b2f_line_push' ) ) {
-            if ( $is_additional && function_exists( 'b2f_build_flex_additional_delivery' ) ) {
+            if ( $has_items && function_exists( 'b2f_build_flex_delivered_detail' ) ) {
+                // Flex ใหม่ — สรุปรายการที่ส่ง
+                b2f_line_push( $admin_group, array( b2f_build_flex_delivered_detail( $po_id, $dlv_summary, $is_complete, $is_additional ) ) );
+            } elseif ( $is_additional && function_exists( 'b2f_build_flex_additional_delivery' ) ) {
                 b2f_line_push( $admin_group, array( b2f_build_flex_additional_delivery( $po_id ) ) );
             } elseif ( function_exists( 'b2f_build_flex_delivered' ) ) {
                 b2f_line_push( $admin_group, array( b2f_build_flex_delivered( $po_id ) ) );
@@ -1797,9 +1877,18 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
             }
         }
 
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Maker deliver: %s (#%d) items=%d complete=%s additional=%s',
+                $po_number, $po_id, count( $dlv_summary ), $is_complete ? 'yes' : 'no', $is_additional ? 'yes' : 'no'
+            ) );
+        }
+
         return new WP_REST_Response( array(
-            'success' => true,
-            'message' => "แจ้งส่งของ {$po_number} เรียบร้อย",
+            'success'         => true,
+            'message'         => "แจ้งส่งของ {$po_number} เรียบร้อย",
+            'delivery_number' => $has_items ? ( $dlv_number ?? '' ) : '',
+            'is_complete'     => $is_complete,
+            'items_count'     => count( $dlv_summary ),
         ), 200 );
     }
 }
