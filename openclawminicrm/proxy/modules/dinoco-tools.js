@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.1.4 — Anti-hallucination V2: product lookup ห้าม OR fallback ข้ามรุ่น, Scooter side case blocker
+ * V.1.5 — KB search + Dealer lookup: MongoDB local first → WP API fallback
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -338,7 +338,30 @@ async function executeTool(toolName, args, sourceId) {
     return `${wpList}\n\n[คำสั่ง: ตอบเฉพาะสินค้าในรายการนี้เท่านั้น ห้ามแนะนำ/กระซิบ/เสริมสินค้าอื่นที่ไม่อยู่ในรายการนี้เด็ดขาด ถ้าสินค้าไม่อยู่ในรายการ = ไม่มีสำหรับรุ่นนี้]`;
   }
   if (toolName === "dinoco_dealer_lookup") {
-    const result = await callDinocoAPI("/dealer-lookup", { location: args.location || "" });
+    const location = args.location || "";
+    // ★ V.1.5: ค้น MongoDB KB ก่อน (มีข้อมูลตัวแทนแต่ละจังหวัด) → fallback WP API
+    const db = await getDB();
+    if (db && location) {
+      try {
+        const locKeywords = location.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim();
+        const locRegex = locKeywords.split(/\s+/).filter(w => w.length >= 2).join("|");
+        if (locRegex) {
+          const dealerKB = await db.collection("knowledge_base").find({
+            active: { $ne: false },
+            $or: [
+              { title: { $regex: `ตัวแทน.*${locRegex}|${locRegex}.*ตัวแทน|ร้าน.*${locRegex}`, $options: "i" } },
+              { content: { $regex: locRegex, $options: "i" }, title: { $regex: /ตัวแทน|ร้าน|dealer|จังหวัด|ภาค/i } },
+            ]
+          }).limit(2).toArray();
+          if (dealerKB.length > 0) {
+            return dealerKB.map(e => `${e.title}\n${e.content}`).join("\n---\n")
+              + "\n\n[คำสั่ง: แนะนำร้านตัวแทนตามข้อมูลข้างบน ห้ามกุชื่อร้านที่ไม่มีในข้อมูล]";
+          }
+        }
+      } catch (e) { console.error("[Dealer-Local]", e.message); }
+    }
+    // Fallback: WordPress API
+    const result = await callDinocoAPI("/dealer-lookup", { location });
     if (typeof result === "string") return result;
     if (!result.found) return result.message || "ไม่พบตัวแทนในพื้นที่นี้";
     return `ตัวแทนจำหน่ายในพื้นที่ ${result.location}:\n${result.dealers}\n\nวิธีตอบ: ${result.how_to_respond || ""}`;
@@ -352,10 +375,34 @@ async function executeTool(toolName, args, sourceId) {
     ).join("\n");
   }
   if (toolName === "dinoco_kb_search") {
-    const result = await callDinocoAPI("/kb-search", { query: args.question || "" });
+    const question = args.question || "";
+    // ★ V.1.5: ค้น MongoDB KB ก่อน (101 entries ที่ import ไว้) → fallback WP API
+    const db = await getDB();
+    if (db && question) {
+      try {
+        const keywords = question.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim();
+        const regexParts = keywords.split(/\s+/).filter(w => w.length >= 2).slice(0, 5).join("|");
+        if (regexParts) {
+          const localResults = await db.collection("knowledge_base").find({
+            active: { $ne: false },
+            $or: [
+              { content: { $regex: regexParts, $options: "i" } },
+              { title: { $regex: regexParts, $options: "i" } },
+              { tags: { $regex: regexParts, $options: "i" } },
+            ]
+          }).limit(3).toArray();
+          if (localResults.length > 0) {
+            return localResults.map(e => `Q: ${e.title}\nA: ${e.content}`).join("\n---\n")
+              + "\n\n[คำสั่ง: ตอบจากข้อมูลข้างบนเท่านั้น ห้ามเพิ่มข้อมูลที่ไม่มี]";
+          }
+        }
+      } catch (e) { console.error("[KB-Local]", e.message); }
+    }
+    // Fallback: WordPress API
+    const result = await callDinocoAPI("/kb-search", { query: question });
     if (typeof result === "string") return result;
     if (!result.found) {
-      trackUnansweredQuestion(args.question, sourceId).catch(() => {});
+      trackUnansweredQuestion(question, sourceId).catch(() => {});
       return result.message || "ไม่พบข้อมูลในคลังความรู้ — ขอเช็คข้อมูลกับทีมงานก่อนนะคะ";
     }
     return result.entries.map((e) => `Q: ${e.question}\nA: ${e.facts}\nวิธีตอบ: ${e.action}`).join("\n---\n");

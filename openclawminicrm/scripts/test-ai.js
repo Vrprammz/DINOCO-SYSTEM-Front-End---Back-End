@@ -28,6 +28,8 @@ const delayArg = args.find(a => a.startsWith("--delay="));
 const DELAY = delayArg ? parseInt(delayArg.split("=")[1]) : 2000;
 
 // === Load test cases from CSV ===
+// CSV format: mustContain ใช้ ";" เป็น AND, "|" เป็น OR ภายในแต่ละ group
+// เช่น "กันล้ม|แคชบาร์;ADV" = (กันล้ม OR แคชบาร์) AND (ADV)
 function loadTestCases() {
   const csvPaths = [
     "/tmp/test-cases.csv",
@@ -55,10 +57,12 @@ function loadTestCases() {
     fields.push(cur.trim());
 
     if (fields.length >= 5) {
+      // mustContain: ";" = AND groups, "|" = OR within group
+      // mustNotContain: "|" = each is checked independently
       tests.push({
         message: fields[0],
-        mustContain: fields[1] ? fields[1].split("|").filter(Boolean) : [],
-        mustNotContain: fields[2] ? fields[2].split("|").filter(Boolean) : [],
+        mustContain: fields[1] ? fields[1].split(";").filter(Boolean) : [],
+        mustNotContain: fields[2] ? fields[2].split(";").filter(Boolean) : [],
         critical: fields[3] === "true",
         name: fields[4],
       });
@@ -85,14 +89,18 @@ async function sendMessage(text) {
 }
 
 // === Check response ===
+// mustContain: ";" = AND groups, "|" = OR within group
+// เช่น "กันล้ม|แคชบาร์;ADV" = (กันล้ม OR แคชบาร์) AND (ADV)
+// mustNotContain: ";" = separate checks, "|" = regex OR
 function checkResponse(reply, test) {
   const errors = [];
-  for (const pattern of test.mustContain) {
-    // mustContain ใช้ | เป็น OR ภายในตัว (เช่น "กันล้ม|แคชบาร์" = เจออันไหนก็ผ่าน)
-    const subPatterns = pattern.split("|").filter(Boolean);
-    const anyMatch = subPatterns.some(sp => new RegExp(sp, "i").test(reply));
+  for (const group of test.mustContain) {
+    const orPatterns = group.split("|").filter(Boolean);
+    const anyMatch = orPatterns.some(sp => {
+      try { return new RegExp(sp, "i").test(reply); } catch { return reply.toLowerCase().includes(sp.toLowerCase()); }
+    });
     if (!anyMatch) {
-      errors.push(`MISSING: "${pattern}" ไม่อยู่ในคำตอบ`);
+      errors.push(`MISSING: "${group}" ไม่อยู่ในคำตอบ`);
     }
   }
   for (const pattern of test.mustNotContain) {
