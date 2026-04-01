@@ -254,8 +254,10 @@ async function executeTool(toolName, args, sourceId) {
         "ยกแฮนด์": "handlebar riser", "riser": "handlebar riser",
         "เบาะพิง": "pad", "เบาะ": "pad", "พนักพิง": "pad",
         // รุ่นรถ (KB #43, #45, #46, #48, #60, #61, #66, #77)
-        "adv": "adv350", "adv350": "adv350", "adv 350": "adv350", "เอดีวี": "adv350", "แอดวี": "adv350",
-        "forza": "forza350", "forza350": "forza350", "forza 350": "forza350", "ฟอร์ซ่า": "forza350",
+        "adv350": "adv350", "adv 350": "adv350", "เอดีวี350": "adv350",
+        "adv": "adv", "เอดีวี": "adv", "แอดวี": "adv",
+        "forza350": "forza350", "forza 350": "forza350", "ฟอร์ซ่า350": "forza350",
+        "forza": "forza", "ฟอร์ซ่า": "forza",
         "forza750": "forza750", "forza 750": "forza750",
         "nx": "nx500", "nx500": "nx500", "nx 500": "nx500", "เอ็นเอ็ก": "nx500",
         "cb": "cb500x", "cb500": "cb500x", "cb500x": "cb500x", "cb 500": "cb500x", "ซีบี": "cb500x",
