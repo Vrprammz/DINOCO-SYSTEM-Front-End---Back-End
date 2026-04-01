@@ -213,15 +213,46 @@ async function executeTool(toolName, args, sourceId) {
     const { wpCache } = require("./dinoco-cache");
     const catalog = wpCache.catalog?.data || wpCache.catalog?.stale;
     if (catalog?.products && catalog.products.length > 0) {
-      const query = (args.query || "").toLowerCase();
+      const rawQuery = (args.query || "").toLowerCase();
       const cat = (args.category || "").toLowerCase();
+
+      // Alias mapping: ภาษาไทย → ภาษาอังกฤษในระบบ
+      const ALIASES = {
+        "แคชบาร์": "crash bar", "กันล้ม": "crash bar", "แค๊ชบาร์": "crash bar", "crashbar": "crash bar",
+        "กล่อง": "case", "กล่องข้าง": "side case", "กล่องหลัง": "top case",
+        "แร็ค": "rack", "แร็คข้าง": "side rack", "แร็คหลัง": "top rack",
+        "ถาดรอง": "tray", "การ์ดแฮนด์": "hand protector", "กระเป๋า": "bag",
+        "ยกแฮนด์": "handlebar riser", "เบาะพิง": "pad",
+        "adv": "adv350", "adv 350": "adv350", "forza": "forza350", "forza 350": "forza350",
+        "nx500": "nx500", "nx 500": "nx500", "cb500x": "cb500x", "cb500": "cb500x",
+        "xl750": "xl750", "transalp": "xl750",
+      };
+
+      // แยก query เป็นคำ + แปลง alias
+      let searchTerms = rawQuery.split(/[\s,+]+/).filter(Boolean);
+      searchTerms = searchTerms.map(t => ALIASES[t] || t);
+      // เพิ่ม alias ของ query ทั้ง string
+      if (ALIASES[rawQuery]) searchTerms.push(ALIASES[rawQuery]);
+
       const matched = catalog.products.filter(p => {
         const name = (p.name || "").toLowerCase();
         const sku = (p.sku || "").toLowerCase();
-        return name.includes(query) || sku.includes(query) || (cat && name.includes(cat));
+        const price = (p.price || "").toString();
+        // ทุก search term ต้อง match (AND logic)
+        return searchTerms.every(term =>
+          name.includes(term) || sku.includes(term) || price.includes(term)
+        ) || (cat && name.includes(cat));
       });
-      if (matched.length > 0) {
-        return matched.slice(0, 10).map((p) =>
+
+      // ถ้า AND ไม่เจอ → ลอง OR (เจออย่างน้อย 1 term)
+      const finalMatched = matched.length > 0 ? matched : catalog.products.filter(p => {
+        const name = (p.name || "").toLowerCase();
+        const sku = (p.sku || "").toLowerCase();
+        return searchTerms.some(term => name.includes(term) || sku.includes(term));
+      });
+
+      if (finalMatched.length > 0) {
+        return finalMatched.slice(0, 10).map((p) =>
           `${p.name} — ราคา ${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"} | SKU: ${p.sku}${p.img_url ? " | รูป: " + p.img_url : ""}${p.warranty_years ? " | ประกัน " + p.warranty_years + " ปี" : ""}`
         ).join("\n");
       }
