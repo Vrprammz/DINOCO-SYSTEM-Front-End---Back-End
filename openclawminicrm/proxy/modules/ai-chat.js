@@ -433,6 +433,7 @@ Platform: ${platform} — ${platformNote}
     .replace(/```[^`]*```/gs, '')               // code blocks → remove
     .replace(/`([^`]+)`/g, '$1')               // `code` → code
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')   // [text](url) → text
+    .replace(/\[Image[^\]]*\]/gi, '')           // [Image of ...] → ลบ (AI กุ image placeholder)
     .replace(/\n{3,}/g, '\n\n')                 // triple newlines → double
     .replace(/\?/g, '')                          // ลบ ? ทุกตัว (ภาษาไทยไม่ใช้)
     .trim();
