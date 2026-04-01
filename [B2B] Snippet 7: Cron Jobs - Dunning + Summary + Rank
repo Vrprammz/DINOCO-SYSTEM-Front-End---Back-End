@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 7: Cron Jobs — Complete System               ║
- * ║  Version: V.30.2 — DB_ID Header                              ║
+ * ║  Version: V.30.3 — Flash 24hr auto-complete + cron fallback   ║
  * ║  DB_ID: 56                                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
@@ -656,6 +656,55 @@ function b2b_run_auto_complete() {
 }
 
 // ════════════════════════════════════════════
+// 6b. V.30.3: FLASH 24HR AUTO-COMPLETE (single event)
+// Scheduled by webhook state 5 — ถ้าลูกค้าไม่กดยืนยัน 24 ชม. → complete อัตโนมัติ
+// ════════════════════════════════════════════
+add_action( 'b2b_flash_24hr_complete', 'b2b_run_flash_24hr_complete' );
+function b2b_run_flash_24hr_complete( $ticket_id ) {
+    try {
+        if ( ! $ticket_id ) return;
+        $cur = get_field( 'order_status', $ticket_id );
+        if ( $cur === 'completed' || $cur === 'cancelled' ) {
+            b2b_log( '[Flash 24hr] #' . $ticket_id . ' already ' . $cur . ' — skip' );
+            return;
+        }
+        $delivered_at = get_post_meta( $ticket_id, '_flash_delivered_at', true );
+        if ( empty( $delivered_at ) ) {
+            b2b_log( '[Flash 24hr] #' . $ticket_id . ' no _flash_delivered_at — skip' );
+            return;
+        }
+        // เช็คว่าผ่าน 24 ชม. จริง (ป้องกัน manual schedule ผิดเวลา)
+        $delivered_ts = strtotime( $delivered_at );
+        if ( $delivered_ts && ( time() - $delivered_ts ) < 23 * HOUR_IN_SECONDS ) {
+            b2b_log( '[Flash 24hr] #' . $ticket_id . ' not yet 24hr — skip' );
+            return;
+        }
+        // Auto-complete
+        if ( function_exists( 'b2b_set_order_status' ) ) {
+            b2b_set_order_status( $ticket_id, 'completed' );
+        } else {
+            update_field( 'order_status', 'completed', $ticket_id );
+        }
+        update_field( 'completed_date', function_exists( 'b2b_date' ) ? b2b_date( 'Y-m-d H:i:s' ) : current_time( 'mysql' ), $ticket_id );
+        update_field( 'completed_by', 'auto_24hr', $ticket_id );
+        b2b_add_audit_log( $ticket_id, 'flash_auto_complete_24hr', 'ปิดอัตโนมัติ 24 ชม. หลังส่งถึง (ลูกค้าไม่กดยืนยัน)' );
+
+        $sgid = get_field( 'source_group_id', $ticket_id );
+        if ( $sgid && function_exists( 'b2b_is_bot_enabled_for_group' ) && b2b_is_bot_enabled_for_group( $sgid ) ) {
+            $msg = "🏁 Ticket #" . $ticket_id . " ปิดอัตโนมัติแล้วครับ (ส่งถึงครบ 24 ชม.)\nหากมีปัญหา พิมพ์ '@เคลม #" . $ticket_id . "' ได้เลย";
+            if ( function_exists( 'b2b_push_guaranteed' ) ) {
+                b2b_push_guaranteed( $sgid, array( array( 'type' => 'text', 'text' => $msg ) ), $ticket_id, 'flash_auto_complete_24hr' );
+            } else {
+                b2b_line_push( $sgid, $msg );
+            }
+        }
+        b2b_log( '[Flash 24hr] #' . $ticket_id . ' auto-completed' );
+    } catch ( Exception $e ) {
+        b2b_log( '[Flash 24hr] FAILED #' . $ticket_id . ': ' . $e->getMessage() );
+    }
+}
+
+// ════════════════════════════════════════════
 // 7. OOS EXPIRY CHECK
 // ════════════════════════════════════════════
 add_action( 'b2b_oos_expiry_check', 'b2b_run_oos_expiry_check' );
@@ -1062,17 +1111,28 @@ function b2b_run_flash_tracking_fallback() {
                 update_post_meta( $tid, '_flash_status', $new_status );
                 update_post_meta( $tid, '_flash_packing_status', $new_status );
 
-                // Auto-complete if delivered (เช็คว่า webhook ทำไปแล้วหรือยัง)
-                if ( $new_status === 'delivered' && function_exists( 'b2b_set_order_status' ) ) {
+                // V.30.3: ถ้า delivered → ส่ง Flex ให้ลูกค้ายืนยัน + schedule 24hr (เหมือน webhook state 5)
+                if ( $new_status === 'delivered' ) {
                     $cur = get_field( 'order_status', $tid );
                     $delivered_at = get_post_meta( $tid, '_flash_delivered_at', true );
                     if ( $cur !== 'completed' && empty( $delivered_at ) ) {
-                        // Webhook ยังไม่ทำ → cron auto-complete + mark delivered_at
+                        // Webhook ยังไม่ทำ → cron fallback: mark delivered + ส่ง Flex + schedule 24hr
                         update_post_meta( $tid, '_flash_delivered_at', current_time( 'mysql' ) );
-                        b2b_set_order_status( $tid, 'completed' );
-                        b2b_add_audit_log( $tid, 'flash_delivered_cron', 'Flash Cron: ส่งถึง (fallback)' );
+                        // ส่ง Flex ให้ตัวแทนยืนยันรับสินค้า (ใช้ generic flash status Flex)
+                        $sgid = get_field( 'source_group_id', $tid );
+                        if ( $sgid && function_exists( 'b2b_build_flex_flash_status' ) ) {
+                            $flex = b2b_build_flex_flash_status( $tid, 5, 'พัสดุส่งถึงแล้ว (ตรวจพบจาก Tracking)' );
+                            if ( function_exists( 'b2b_push_guaranteed' ) ) {
+                                b2b_push_guaranteed( $sgid, array( $flex ), $tid, 'flash_delivered_cron' );
+                            } else {
+                                b2b_line_push_raw( $sgid, array( $flex ) );
+                            }
+                        }
+                        // Schedule 24hr auto-complete แทน complete ทันที
+                        wp_schedule_single_event( time() + ( 24 * HOUR_IN_SECONDS ), 'b2b_flash_24hr_complete', array( $tid ) );
+                        b2b_add_audit_log( $tid, 'flash_delivered_cron', 'Flash Cron: ส่งถึง (fallback) — รอยืนยันรับ 24 ชม.' );
                     }
-                    // ถ้า delivered_at มีอยู่แล้ว = webhook ทำไปแล้ว กำลังรอลูกค้ายืนยัน → ไม่ auto-complete
+                    // ถ้า delivered_at มีอยู่แล้ว = webhook ทำไปแล้ว กำลังรอลูกค้ายืนยัน → ไม่ทำซ้ำ
                 }
             }
             $updated++;
