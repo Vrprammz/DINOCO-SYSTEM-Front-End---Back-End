@@ -1,212 +1,187 @@
 #!/usr/bin/env node
 /**
- * test-ai.js — ทดสอบ AI chatbot อัตโนมัติ
- * รันใน container: docker exec dinoco-agent node /tmp/test-ai.js
+ * test-ai.js — ทดสอบ AI chatbot อัตโนมัติ (V.2 — อ่าน test cases จาก CSV)
+ *
+ * Usage:
+ *   docker cp scripts/test-ai.js smltrack-agent:/tmp/test-ai.js
+ *   docker cp scripts/test-cases.csv smltrack-agent:/tmp/test-cases.csv
+ *   docker exec smltrack-agent node /tmp/test-ai.js
+ *
+ *   Options:
+ *     --critical-only    รันเฉพาะ critical tests
+ *     --quick            รันแค่ 20 ข้อแรก (quick smoke test)
+ *     --delay=5000       เปลี่ยน delay ระหว่าง test (ms)
  */
+
+const fs = require("fs");
+const path = require("path");
 
 const API = "http://localhost:3000";
 const KEY = process.env.API_SECRET_KEY || "dnc-api-2026-supersecret-changethis";
 const SOURCE_ID = "test-bot-" + Date.now();
 
-// === Test Cases ===
-const TESTS = [
-  // --- Anti-Hallucination (สำคัญที่สุด) ---
-  {
-    name: "ADV350 ถามแคชบาร์ — ห้ามกระซิบกล่องข้าง",
-    message: "ใช้ ADV350 ครับ สนใจกันล้ม มีไหม",
-    mustContain: ["กันล้ม|แคชบาร์|crash bar|ADV350|ADV"],
-    mustNotContain: ["กล่องข้าง", "side case", "แร็คข้าง", "กระซิบ", "นอกจากนี้ยังมี"],
-    critical: true,
-  },
-  {
-    name: "ADV350 ถามกล่องข้าง — ต้องปฏิเสธ",
-    message: "ADV350 มีกล่องข้างไหม",
-    mustContain: ["ไม่มี"],
-    mustNotContain: ["กล่องข้าง.*ราคา", "side case.*บาท"],
-    critical: true,
-  },
-  {
-    name: "Forza350 ถามแร็คข้าง — ต้องปฏิเสธ",
-    message: "Forza350 มีแร็คข้างไหมครับ",
-    mustContain: ["ไม่มี"],
-    mustNotContain: ["แร็คข้าง.*ราคา", "side rack.*บาท"],
-    critical: true,
-  },
-  {
-    name: "NX500 ถามกล่องข้าง — ต้องมี (ถามว่า Edition หรือ Standard)",
-    message: "NX500 มีกล่องข้างไหม",
-    mustContain: [],
-    mustNotContain: ["ไม่มีกล่องข้าง"],
-    critical: true,
-  },
+// === Parse args ===
+const args = process.argv.slice(2);
+const criticalOnly = args.includes("--critical-only");
+const quickMode = args.includes("--quick");
+const delayArg = args.find(a => a.startsWith("--delay="));
+const DELAY = delayArg ? parseInt(delayArg.split("=")[1]) : 2000;
 
-  // --- ห้ามกุข้อมูล ---
-  {
-    name: "ห้ามบอกว่าประกันตลอดอายุ",
-    message: "สินค้า DINOCO ประกันกี่ปี",
-    mustContain: ["5 ปี"],
-    mustNotContain: ["ตลอดอายุ", "ตลอดชีพ", "lifetime"],
-    critical: true,
-  },
-  {
-    name: "ห้ามกุว่ากำลังพัฒนา",
-    message: "PCX มีของแต่งไหม",
-    mustContain: ["ไม่มี", "ขออภัย"],
-    mustNotContain: ["กำลังพัฒนา", "เร็วๆ นี้", "อนาคต"],
-    critical: false,
-  },
+// === Load test cases from CSV ===
+function loadTestCases() {
+  const csvPaths = [
+    "/tmp/test-cases.csv",
+    path.resolve(__dirname, "test-cases.csv"),
+  ];
+  let csvText = null;
+  for (const p of csvPaths) {
+    if (fs.existsSync(p)) { csvText = fs.readFileSync(p, "utf-8"); break; }
+  }
+  if (!csvText) { console.error("ไม่พบ test-cases.csv"); process.exit(1); }
 
-  // --- One Price ---
-  {
-    name: "One Price — ห้ามให้ส่วนลด",
-    message: "ลดราคาได้ไหมครับ ขอส่วนลดหน่อย",
-    mustContain: ["One Price"],
-    mustNotContain: ["ส่วนลด.*ได้", "ลดให้", "โปรโมชั่น.*มี"],
-    critical: false,
-  },
+  const lines = csvText.split("\n").filter(l => l.trim());
+  const tests = [];
 
-  // --- ห้ามเผยว่าเป็น AI ---
-  {
-    name: "ห้ามบอกว่าเป็น AI",
-    message: "คุณเป็น AI หรือเปล่า",
-    mustContain: [],
-    mustNotContain: ["เป็น AI", "เป็นบอท", "เป็น bot", "ระบบอัตโนมัติ", "language model", "แชทบอท"],
-    critical: false,
-  },
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const fields = [];
+    let cur = "", inQ = false;
+    for (let j = 0; j < line.length; j++) {
+      const ch = line[j];
+      if (ch === '"' && (j === 0 || line[j-1] !== '\\')) { inQ = !inQ; }
+      else if (ch === "," && !inQ) { fields.push(cur.trim()); cur = ""; }
+      else { cur += ch; }
+    }
+    fields.push(cur.trim());
 
-  // --- ห้ามใช้ ? ---
-  {
-    name: "ห้ามใช้เครื่องหมาย ?",
-    message: "สนใจกล่อง NX500 ครับ",
-    mustContain: [],
-    mustNotContain: ["\\?"],
-    critical: false,
-  },
+    if (fields.length >= 5) {
+      tests.push({
+        message: fields[0],
+        mustContain: fields[1] ? fields[1].split("|").filter(Boolean) : [],
+        mustNotContain: fields[2] ? fields[2].split("|").filter(Boolean) : [],
+        critical: fields[3] === "true",
+        name: fields[4],
+      });
+    }
+  }
+  return tests;
+}
 
-  // --- XL750 Exclusive BigWing ---
-  {
-    name: "XL750 — ต้องแจ้ง BigWing",
-    message: "XL750 มีของแต่งไหม",
-    mustContain: ["BigWing"],
-    mustNotContain: ["ตัวแทน DINOCO", "ร้านตัวแทน"],
-    critical: false,
-  },
-
-  // --- ห้ามพูดถึงแบรนด์คู่แข่ง ---
-  {
-    name: "ห้ามเอ่ยชื่อแบรนด์คู่แข่ง",
-    message: "DINOCO กับ GIVI อันไหนดีกว่า",
-    mustContain: ["DINOCO"],
-    mustNotContain: ["GIVI.*ดี", "GIVI.*เด่น", "SRC", "F2MOTO", "BMMOTO"],
-    critical: false,
-  },
-];
-
-// === Helpers ===
+// === API call ===
 async function sendMessage(text) {
-  // ใช้ internal API — simulate AI reply
-  const res = await fetch(`${API}/api/test-ai`, {
-    method: "POST",
-    headers: { "x-api-key": KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ message: text, sourceId: SOURCE_ID }),
-  });
-  if (res.ok) {
-    const data = await res.json();
-    return data.reply || data.response || "";
-  }
-  // Fallback: ถ้าไม่มี test endpoint → ใช้ KB search + product lookup simulation
-  return null;
-}
-
-// Fallback: เรียก AI ผ่าน module โดยตรง (ถ้ารันใน container)
-async function callAIDirect(text) {
   try {
-    const { callDinocoAI, init } = require("/app/modules/ai-chat");
-    const { DEFAULT_PROMPT, getDB, MESSAGES_COLL } = require("/app/modules/shared");
-    // init ถ้ายังไม่ได้ init
-    return await callDinocoAI(DEFAULT_PROMPT, text, SOURCE_ID);
-  } catch {
-    return null;
+    const res = await fetch(`${API}/api/test-ai`, {
+      method: "POST",
+      headers: { "x-api-key": KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, sourceId: SOURCE_ID }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) return `[ERROR ${res.status}]`;
+    const data = await res.json();
+    return data.reply || "";
+  } catch (e) {
+    return `[ERROR: ${e.message}]`;
   }
 }
 
+// === Check response ===
 function checkResponse(reply, test) {
   const errors = [];
-
   for (const pattern of test.mustContain) {
-    const regex = new RegExp(pattern, "i");
-    if (!regex.test(reply)) {
+    // mustContain ใช้ | เป็น OR ภายในตัว (เช่น "กันล้ม|แคชบาร์" = เจออันไหนก็ผ่าน)
+    const subPatterns = pattern.split("|").filter(Boolean);
+    const anyMatch = subPatterns.some(sp => new RegExp(sp, "i").test(reply));
+    if (!anyMatch) {
       errors.push(`MISSING: "${pattern}" ไม่อยู่ในคำตอบ`);
     }
   }
-
   for (const pattern of test.mustNotContain) {
-    const regex = new RegExp(pattern, "i");
-    if (regex.test(reply)) {
-      const match = reply.match(regex)?.[0] || pattern;
-      errors.push(`FOUND: "${match}" ห้ามอยู่ในคำตอบ`);
-    }
+    try {
+      const regex = new RegExp(pattern, "i");
+      if (regex.test(reply)) {
+        const match = reply.match(regex)?.[0] || pattern;
+        errors.push(`FOUND: "${match}" ห้ามอยู่ในคำตอบ`);
+      }
+    } catch {}
   }
-
   return errors;
 }
 
 // === Main ===
 async function main() {
-  console.log("=== DINOCO AI Chatbot Auto-Test ===\n");
+  let allTests = loadTestCases();
+  if (criticalOnly) allTests = allTests.filter(t => t.critical);
+  if (quickMode) allTests = allTests.slice(0, 20);
+
+  console.log("=== DINOCO AI Chatbot Auto-Test V.2 ===\n");
   console.log(`API: ${API}`);
-  console.log(`Tests: ${TESTS.length}\n`);
+  console.log(`Tests: ${allTests.length}${criticalOnly ? " (critical only)" : ""}${quickMode ? " (quick mode)" : ""}`);
+  console.log(`Delay: ${DELAY}ms between tests\n`);
 
-  let passed = 0, failed = 0, skipped = 0;
-  const results = [];
+  let passed = 0, failed = 0, errors_list = [];
+  const startTime = Date.now();
 
-  for (let i = 0; i < TESTS.length; i++) {
-    const test = TESTS[i];
+  for (let i = 0; i < allTests.length; i++) {
+    const test = allTests[i];
     const tag = test.critical ? "[CRITICAL]" : "[CHECK]";
-    process.stdout.write(`${i+1}/${TESTS.length} ${tag} ${test.name}... `);
+    const num = `${String(i+1).padStart(3)}/${allTests.length}`;
+    process.stdout.write(`${num} ${tag} ${test.name}... `);
 
-    let reply = await sendMessage(test.message);
-    if (!reply) reply = await callAIDirect(test.message);
-    if (!reply) {
-      console.log("SKIP (ไม่มี test endpoint)");
-      skipped++;
-      results.push({ ...test, status: "skip", reply: null, errors: [] });
-      continue;
-    }
+    const reply = await sendMessage(test.message);
 
-    const errors = checkResponse(reply, test);
-    if (errors.length === 0) {
-      console.log("PASS ✅");
-      passed++;
-      results.push({ ...test, status: "pass", reply: reply.substring(0, 100), errors: [] });
-    } else {
-      console.log("FAIL ❌");
-      errors.forEach(e => console.log(`   ${e}`));
-      console.log(`   Reply: ${reply.substring(0, 150)}...`);
+    if (reply.startsWith("[ERROR")) {
+      console.log(`ERROR: ${reply}`);
       failed++;
-      results.push({ ...test, status: "fail", reply: reply.substring(0, 200), errors });
+      errors_list.push({ ...test, status: "error", reply, errors: [reply] });
+    } else {
+      const errs = checkResponse(reply, test);
+      if (errs.length === 0) {
+        console.log("PASS");
+        passed++;
+      } else {
+        console.log("FAIL");
+        errs.forEach(e => console.log(`     ${e}`));
+        console.log(`     Reply: ${reply.substring(0, 120)}...`);
+        failed++;
+        errors_list.push({ ...test, status: "fail", reply: reply.substring(0, 200), errors: errs });
+      }
     }
 
-    // delay ป้องกัน rate limit
-    await new Promise(r => setTimeout(r, 2000));
+    if (i < allTests.length - 1) await new Promise(r => setTimeout(r, DELAY));
   }
 
-  // === Summary ===
-  console.log("\n" + "=".repeat(50));
-  console.log(`RESULTS: ${passed} passed, ${failed} failed, ${skipped} skipped / ${TESTS.length} total`);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-  const criticalFails = results.filter(r => r.critical && r.status === "fail");
+  // === Summary ===
+  console.log("\n" + "=".repeat(60));
+  console.log(`RESULTS: ${passed} passed, ${failed} failed / ${allTests.length} total (${elapsed}s)`);
+
+  const criticalFails = errors_list.filter(r => r.critical);
+  const checkFails = errors_list.filter(r => !r.critical);
+
   if (criticalFails.length > 0) {
-    console.log(`\n🚨 CRITICAL FAILURES (${criticalFails.length}):`);
+    console.log(`\n CRITICAL FAILURES (${criticalFails.length}):`);
     criticalFails.forEach(r => {
       console.log(`   ${r.name}`);
       r.errors.forEach(e => console.log(`     ${e}`));
     });
   }
 
-  if (failed === 0 && skipped === 0) console.log("\n🎉 ALL TESTS PASSED!");
-  else if (criticalFails.length === 0) console.log("\n✅ No critical failures — minor issues only");
-  else console.log("\n❌ CRITICAL ISSUES FOUND — ต้องแก้ก่อน deploy");
+  if (checkFails.length > 0) {
+    console.log(`\n MINOR FAILURES (${checkFails.length}):`);
+    checkFails.forEach(r => {
+      console.log(`   ${r.name}`);
+    });
+  }
+
+  if (failed === 0) console.log("\n ALL TESTS PASSED!");
+  else if (criticalFails.length === 0) console.log(`\n No critical failures — ${checkFails.length} minor issues`);
+  else console.log(`\n ${criticalFails.length} CRITICAL + ${checkFails.length} minor issues`);
+
+  // === Score ===
+  const score = Math.round((passed / allTests.length) * 100);
+  const bar = "#".repeat(Math.round(score / 2)) + "-".repeat(50 - Math.round(score / 2));
+  console.log(`\n Score: ${score}% [${bar}]`);
 
   process.exit(criticalFails.length > 0 ? 1 : 0);
 }
