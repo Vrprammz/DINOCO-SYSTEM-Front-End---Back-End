@@ -434,6 +434,7 @@ Platform: ${platform} — ${platformNote}
     .replace(/`([^`]+)`/g, '$1')               // `code` → code
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')   // [text](url) → text
     .replace(/\n{3,}/g, '\n\n')                 // triple newlines → double
+    .replace(/\?/g, '')                          // ลบ ? ทุกตัว (ภาษาไทยไม่ใช้)
     .trim();
 
   // ส่ง text ก่อน
