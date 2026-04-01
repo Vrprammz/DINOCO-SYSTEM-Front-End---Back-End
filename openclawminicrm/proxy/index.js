@@ -1008,7 +1008,7 @@ app.post("/webhook/meta", express.raw({ type: "*/*" }), async (req, res) => {
         if (att.type === "image") {
           await saveMsg(sourceId, { ...baseMsgFields, content: "[รูปภาพ]", messageType: "image", imageUrl: attUrl, hasImage: true }, platform);
           const imgClaim = await getClaimSession(sourceId).catch(() => null);
-          if (imgClaim && imgClaim.status === "photo_requested") {
+          if (imgClaim && (imgClaim.status === "photo_requested" || imgClaim.status === "photo_rejected" || imgClaim.status === "photo_received")) {
             const claimReply = await processClaimMessage(sourceId, platform, "[รูปภาพ]", attUrl, userName);
             if (claimReply) { await sendMetaMessage(senderId, claimReply); await saveMsg(sourceId, { role: "assistant", userName: DEFAULT_BOT_NAME, content: claimReply, messageType: "text", isAiReply: true }, platform); }
           }
