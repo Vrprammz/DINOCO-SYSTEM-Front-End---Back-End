@@ -24,6 +24,7 @@ const { getDB, MESSAGES_COLL, AUDIT_LOG_COLL, KB_COLL, MEMORY_COLL, SKILL_LESSON
   QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, PAYMENT_KEYWORDS,
   KUNG_STAFF, KUNG_TO_FEATURE, KUNG_NAMES, KUNG_ID_TO_NAME,
   getDynamicKeySync, loadAccountKeys, seedEnvKeysToMongoDB,
+  loadActiveRules, buildRulesPrompt, clearRulesCache, clearTemplateCache, getTemplate,
 } = shared;
 
 const auth = require("./middleware/auth");
@@ -1298,6 +1299,190 @@ app.post("/api/kb-quick-add", requireAuth, express.json(), async (req, res) => {
   res.json({ ok: true, id: result.insertedId });
 });
 
+// === [BOSS] AI Boss Command System (V.1.0) ===
+
+// POST /api/boss-command/analyze — Boss AI วิเคราะห์คำสั่ง
+app.post("/api/boss-command/analyze", requireAuth, express.json({ limit: "10mb" }), async (req, res) => {
+  const { command, imageBase64 } = req.body;
+  if (!command && !imageBase64) return res.status(400).json({ error: "command or image required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const currentRules = await db.collection("ai_rules").find({ active: true, deletedAt: null }).toArray();
+  const templates = await db.collection("message_templates").find({ active: true }).toArray();
+  const bossPrompt = `คุณคือ "หัวหน้า AI" ของ DINOCO THAILAND — ผู้ผลิตอะไหล่มอเตอร์ไซค์
+หน้าที่: รับคำสั่งจาก Admin แล้ววิเคราะห์เป็นแผนปฏิบัติ
+
+กฎที่ active อยู่ (${currentRules.length} ข้อ):
+${currentRules.map((r,i) => `${i+1}. [${r.type}] ${r.instruction}`).join("\n") || "(ยังไม่มี)"}
+
+Message templates (${templates.length} ข้อ):
+${templates.map(t => `- ${t.templateId}: "${t.message}"`).join("\n") || "(ยังไม่มี)"}
+
+วิเคราะห์คำสั่ง Admin แล้วตอบเป็น JSON:
+{
+  "understanding": "สรุปสิ่งที่ Admin ต้องการ (ภาษาไทย)",
+  "actions": [
+    {
+      "type": "create_rule|update_rule|delete_rule|update_kb|update_template",
+      "ruleType": "speech_rule|content_rule|workflow_rule|tone_rule",
+      "title": "ชื่อกฎสั้นๆ",
+      "instruction": "รายละเอียดกฎที่ AI ต้องปฏิบัติ",
+      "priority": 90,
+      "templateId": "claim_start",
+      "newMessage": "ข้อความใหม่"
+    }
+  ],
+  "warnings": ["คำเตือน (ถ้ามี)"],
+  "confirmMessage": "ข้อความยืนยันภาษาไทย สุภาพ"
+}
+ถ้าคำสั่งไม่ชัด ถามกลับใน confirmMessage`;
+
+  const anthropicKey = getDynamicKeySync("ANTHROPIC_API_KEY");
+  const googleKey = getDynamicKeySync("GOOGLE_API_KEY");
+  let analysis;
+  try {
+    if (anthropicKey) {
+      const content = [];
+      if (imageBase64) content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } });
+      content.push({ type: "text", text: command || "วิเคราะห์รูปนี้ แล้วบอกว่า AI ทำอะไรผิด ควรสร้างกฎอะไร" });
+      const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2048, temperature: 0.2, system: bossPrompt, messages: [{ role: "user", content }] }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = await aiRes.json();
+      analysis = data.content?.[0]?.text;
+    } else if (googleKey) {
+      const parts = [];
+      if (imageBase64) parts.push({ inlineData: { mimeType: "image/jpeg", data: imageBase64 } });
+      parts.push({ text: command || "วิเคราะห์รูปนี้ แล้วบอกว่า AI ทำอะไรผิด ควรสร้างกฎอะไร" });
+      const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${googleKey}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ system_instruction: { parts: [{ text: bossPrompt }] }, contents: [{ role: "user", parts }], generationConfig: { temperature: 0.2, maxOutputTokens: 2048 } }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = await aiRes.json();
+      analysis = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    } else {
+      return res.status(500).json({ error: "No AI API key configured" });
+    }
+    let parsed;
+    try {
+      const jsonMatch = analysis.match(/\{[\s\S]*\}/);
+      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : { confirmMessage: analysis, actions: [] };
+    } catch { parsed = { confirmMessage: analysis, actions: [] }; }
+    const commandId = `cmd_${Date.now()}`;
+    await db.collection("boss_commands").insertOne({ commandId, input: command, hasImage: !!imageBase64, analysis: parsed, status: "pending", createdAt: new Date() });
+    res.json({ ok: true, commandId, ...parsed });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/boss-command/execute — ยืนยันแล้ว execute
+app.post("/api/boss-command/execute", requireAuth, express.json(), async (req, res) => {
+  const { commandId } = req.body;
+  if (!commandId) return res.status(400).json({ error: "commandId required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const cmd = await db.collection("boss_commands").findOne({ commandId });
+  if (!cmd || cmd.status !== "pending") return res.status(400).json({ error: "command not found or already executed" });
+  const executed = [];
+  for (const action of (cmd.analysis?.actions || [])) {
+    try {
+      if (action.type === "create_rule") {
+        const ruleId = `rule_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        await db.collection("ai_rules").insertOne({
+          ruleId, type: action.ruleType || "speech_rule", title: action.title, instruction: action.instruction,
+          priority: action.priority || 80, active: true, scope: "global",
+          bossCommandId: commandId, createdAt: new Date(), updatedAt: new Date(), deletedAt: null,
+        });
+        executed.push({ action: "create_rule", ruleId, title: action.title, result: "success" });
+      } else if (action.type === "update_template" && action.templateId) {
+        await db.collection("message_templates").updateOne(
+          { templateId: action.templateId },
+          { $set: { message: action.newMessage, updatedAt: new Date() }, $setOnInsert: { templateId: action.templateId, defaultMessage: action.newMessage, active: true, createdAt: new Date() } },
+          { upsert: true }
+        );
+        executed.push({ action: "update_template", templateId: action.templateId, result: "success" });
+      } else if (action.type === "update_kb") {
+        await db.collection("knowledge_base").updateOne(
+          { title: { $regex: action.title, $options: "i" } },
+          { $set: { content: action.instruction, updatedAt: new Date() } }
+        );
+        executed.push({ action: "update_kb", title: action.title, result: "success" });
+      }
+    } catch (e) { executed.push({ action: action.type, error: e.message }); }
+  }
+  clearRulesCache();
+  clearTemplateCache();
+  await db.collection("boss_commands").updateOne({ commandId }, { $set: { status: "executed", executedActions: executed, executedAt: new Date() } });
+  res.json({ ok: true, executed, message: `ดำเนินการ ${executed.length} รายการสำเร็จ` });
+});
+
+// GET /api/boss-command/rules — ดูกฎทั้งหมด
+app.get("/api/boss-command/rules", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ rules: [], total: 0 });
+  const rules = await db.collection("ai_rules").find({ deletedAt: null }).sort({ priority: -1 }).toArray();
+  res.json({ rules, total: rules.length });
+});
+
+// DELETE /api/boss-command/rules/:ruleId — ลบกฎ
+app.delete("/api/boss-command/rules/:ruleId", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB" });
+  await db.collection("ai_rules").updateOne({ ruleId: req.params.ruleId }, { $set: { active: false, deletedAt: new Date() } });
+  clearRulesCache();
+  res.json({ ok: true });
+});
+
+// PUT /api/boss-command/rules/:ruleId — แก้กฎ
+app.put("/api/boss-command/rules/:ruleId", requireAuth, express.json(), async (req, res) => {
+  const { instruction, active, priority } = req.body;
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB" });
+  const update = { updatedAt: new Date() };
+  if (instruction !== undefined) update.instruction = instruction;
+  if (active !== undefined) update.active = active;
+  if (priority !== undefined) update.priority = priority;
+  await db.collection("ai_rules").updateOne({ ruleId: req.params.ruleId }, { $set: update });
+  clearRulesCache();
+  res.json({ ok: true });
+});
+
+// GET /api/boss-command/templates — ดู templates
+app.get("/api/boss-command/templates", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ templates: [] });
+  const templates = await db.collection("message_templates").find({}).sort({ category: 1 }).toArray();
+  res.json({ templates });
+});
+
+// PUT /api/boss-command/templates/:templateId — แก้ template
+app.put("/api/boss-command/templates/:templateId", requireAuth, express.json(), async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: "message required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB" });
+  await db.collection("message_templates").updateOne(
+    { templateId: req.params.templateId },
+    { $set: { message, updatedAt: new Date() }, $setOnInsert: { templateId: req.params.templateId, defaultMessage: message, active: true, createdAt: new Date() } },
+    { upsert: true }
+  );
+  clearTemplateCache();
+  res.json({ ok: true });
+});
+
+// GET /api/boss-command/history — ประวัติคำสั่ง
+app.get("/api/boss-command/history", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ history: [] });
+  const history = await db.collection("boss_commands").find({}).sort({ createdAt: -1 }).limit(50).toArray();
+  res.json({ history });
+});
+
 // === Health check + root ===
 app.get("/", (req, res) => { res.json({ status: "ok", service: "DINOCO AI Agent", version: "2.1-hardened" }); });
 
@@ -1365,6 +1550,10 @@ async function ensureIndexes() {
     await database.collection(AUDIT_LOG_COLL).createIndex({ createdAt: -1 });
     await database.collection("privacy_consent").createIndex({ sourceId: 1 }, { unique: true });
     await database.collection("payments").createIndex({ status: 1, createdAt: -1 });
+    await database.collection("ai_rules").createIndex({ active: 1, deletedAt: 1, priority: -1 });
+    await database.collection("boss_commands").createIndex({ commandId: 1 }, { unique: true });
+    await database.collection("boss_commands").createIndex({ createdAt: -1 });
+    await database.collection("message_templates").createIndex({ templateId: 1 }, { unique: true });
     console.log("[Index] All indexes ready");
   } catch (e) { if (!e.message?.includes("already exists")) console.error("[Index] Error:", e.message); }
 }

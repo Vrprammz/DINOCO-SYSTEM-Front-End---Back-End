@@ -65,7 +65,8 @@ const NAV_GROUPS: NavGroup[] = [
   {
     groupLabel: "AI Agents",
     items: [
-      { href: "/agent-command", icon: "🎮", label: "บัญชาการ AI" },
+      { href: "/boss-command", icon: "\u{1F451}", label: "AI Boss Command" },
+      { href: "/agent-command", icon: "\u{1F3AE}", label: "บัญชาการ AI" },
       { href: "/ai-config", icon: "🧠", label: "ตั้งค่า AI Engine" },
       { href: "/kung-room", icon: "🦐", label: "ห้องทำงาน AI" },
       { href: "/advice", icon: "💡", label: "คำแนะนำ AI" },

@@ -1,6 +1,6 @@
 /**
  * shared.js — Shared state, constants, and DB connection
- * V.1.0 — Extracted from index.js monolith
+ * V.1.1 — Boss Command: Dynamic AI Rules + Message Templates
  */
 const { MongoClient } = require("mongodb");
 const crypto = require("crypto");
@@ -381,6 +381,54 @@ const KUNG_TO_FEATURE = Object.fromEntries(KUNG_STAFF.map(s => [s.name, s.featur
 const KUNG_NAMES = KUNG_STAFF.map(s => s.name);
 const KUNG_ID_TO_NAME = Object.fromEntries(KUNG_STAFF.map(s => [s.id, s.name]));
 
+// === [BOSS] Dynamic AI Rules — อ่านจาก MongoDB inject เข้า prompt ===
+let _cachedRules = null;
+let _cachedRulesAt = 0;
+const RULES_CACHE_TTL = 30000;
+
+async function loadActiveRules() {
+  if (_cachedRules && Date.now() - _cachedRulesAt < RULES_CACHE_TTL) return _cachedRules;
+  try {
+    const database = await getDB();
+    if (!database) return [];
+    const rules = await database.collection("ai_rules")
+      .find({ active: true, deletedAt: null })
+      .sort({ priority: -1 }).toArray();
+    _cachedRules = rules;
+    _cachedRulesAt = Date.now();
+    return rules;
+  } catch { return []; }
+}
+
+function buildRulesPrompt(rules) {
+  if (!rules || rules.length === 0) return "";
+  let prompt = "\n\n=== กฎเพิ่มเติมจาก Admin (ต้องปฏิบัติตามเคร่งครัด) ===\n";
+  rules.forEach((r, i) => { prompt += `${i + 1}. ${r.instruction}\n`; });
+  return prompt;
+}
+
+function clearRulesCache() { _cachedRules = null; _cachedRulesAt = 0; }
+
+// === [BOSS] Message Templates — แก้ข้อความ hardcoded จาก Dashboard ===
+let _cachedTemplates = null;
+let _cachedTemplatesAt = 0;
+
+async function getTemplate(templateId) {
+  if (!_cachedTemplates || Date.now() - _cachedTemplatesAt > 60000) {
+    try {
+      const database = await getDB();
+      if (database) {
+        const templates = await database.collection("message_templates").find({ active: true }).toArray();
+        _cachedTemplates = Object.fromEntries(templates.map(t => [t.templateId, t.message]));
+        _cachedTemplatesAt = Date.now();
+      }
+    } catch {}
+  }
+  return _cachedTemplates?.[templateId] || null;
+}
+
+function clearTemplateCache() { _cachedTemplates = null; _cachedTemplatesAt = 0; }
+
 module.exports = {
   getDB,
   MESSAGES_COLL,
@@ -420,4 +468,9 @@ module.exports = {
   loadAccountKeys,
   seedEnvKeysToMongoDB,
   get _cachedAccountKeys() { return _cachedAccountKeys; },
+  loadActiveRules,
+  buildRulesPrompt,
+  clearRulesCache,
+  getTemplate,
+  clearTemplateCache,
 };

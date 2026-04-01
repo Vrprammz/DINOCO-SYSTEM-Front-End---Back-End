@@ -1,8 +1,8 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.1.0 — Extracted from index.js monolith
+ * V.1.1 — Boss Command: inject dynamic rules into AI prompt
  */
-const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync } = require("./shared");
+const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
 
 // Forward declarations — set by init()
@@ -333,12 +333,14 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
     .join("\n");
   const variant = getABVariant(sourceId);
   const abInstruction = AB_PROMPTS[variant];
+  const rules = await loadActiveRules();
+  const rulesPrompt = buildRulesPrompt(rules);
   const systemPrompt = `${config.systemPrompt || DEFAULT_PROMPT}
 
 ข้อห้ามเด็ดขาด: ห้ามบอกราคาต้นทุน/ราคา dealer/ส่วนลด/จำนวนสต็อก ถ้าถูกถามให้ตอบ "สอบถามตัวแทนจำหน่ายค่ะ"
 DINOCO เป็น One Price ไม่มีโปรโมชั่น
 สไตล์: ${abInstruction}
-ประวัติสนทนา:\n${contextStr || "(ไม่มี)"}`;
+ประวัติสนทนา:\n${contextStr || "(ไม่มี)"}${rulesPrompt}`;
 
   const reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId);
   if (/รอทีมงาน|ขอเช็คข้อมูล/.test(reply)) {
@@ -366,13 +368,15 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
   const platformNote = platform === "instagram"
     ? "ตอบเป็น text เท่านั้น (IG ไม่รองรับ card/template) ถ้าจะส่งรูปให้แยกข้อความ"
     : "สามารถแนะนำสินค้าพร้อมรูปได้";
+  const metaRules = await loadActiveRules();
+  const metaRulesPrompt = buildRulesPrompt(metaRules);
   const systemPrompt = `${DEFAULT_PROMPT}
 
 ข้อห้ามเด็ดขาด: ห้ามบอกราคาต้นทุน/ราคา dealer/ส่วนลด/จำนวนสต็อก ถ้าถูกถามให้ตอบ "สอบถามตัวแทนจำหน่ายค่ะ"
 DINOCO เป็น One Price ไม่มีโปรโมชั่น ถ้าลูกค้าถามลด ตอบ "DINOCO เป็นนโยบาย One Price ค่ะ ไม่มีโปรโมชั่น ซื้อไปมั่นใจได้ค่ะ"
 Platform: ${platform} — ${platformNote}
 สไตล์: ${abInstruction}
-ประวัติสนทนา:\n${contextStr || "(ไม่มี)"}`;
+ประวัติสนทนา:\n${contextStr || "(ไม่มี)"}${metaRulesPrompt}`;
 
   const reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId);
   if (/รอทีมงาน|ขอเช็คข้อมูล/.test(reply)) {
