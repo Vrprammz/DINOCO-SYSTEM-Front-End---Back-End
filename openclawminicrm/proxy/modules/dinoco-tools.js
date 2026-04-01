@@ -216,36 +216,56 @@ async function executeTool(toolName, args, sourceId) {
       const rawQuery = (args.query || "").toLowerCase();
       const cat = (args.category || "").toLowerCase();
 
-      // Alias mapping: ภาษาไทย/ทับศัพท์/typo → คำในระบบ
+      // Alias mapping จาก KB training_phrases จริง — 85 entries
       const ALIASES = {
-        // กันล้ม / แคชบาร์
-        "แคชบาร์": "crash bar", "แค๊ชบาร์": "crash bar", "แคสบาร์": "crash bar", "แคสบา": "crash bar",
-        "กันล้ม": "crash bar", "กันล้มรถ": "crash bar", "crashbar": "crash bar", "crash": "crash bar",
-        "บาร์กันล้ม": "crash bar", "เหล็กกันล้ม": "crash bar", "กันชน": "crash bar",
-        // กล่อง
-        "กล่อง": "case", "กล่องข้าง": "side case", "กล่องหลัง": "top case",
-        "กล่องอลูมิเนียม": "case", "กล่องอลู": "case", "กล่องเหล็ก": "case",
-        "กล่องข้างรถ": "side case", "กล่องท้าย": "top case", "กล่องท้ายรถ": "top case",
-        "topcase": "top case", "sidecase": "side case", "pannier": "side case",
-        // แร็ค
-        "แร็ค": "rack", "แร็คข้าง": "side rack", "แร็คหลัง": "top rack", "แร็คท้าย": "top rack",
-        "แรค": "rack", "rack": "rack", "ตะแกรง": "rack", "ตะแกรงท้าย": "top rack",
-        // อื่นๆ
-        "ถาดรอง": "tray", "ถาด": "tray",
+        // กันล้ม / แคชบาร์ (KB #29, #67, #79, #80, #82)
+        "แคชบาร์": "crash bar", "แค๊ชบาร์": "crash bar", "แครชบาร์": "crash bar", "แคชบา": "crash bar",
+        "กันล้ม": "crash bar", "เหล็กกันล้ม": "crash bar", "โครงเหล็กกันรถ": "crash bar",
+        "เหล็กป้องกัน": "crash bar", "กันกระแทก": "crash bar", "การ์ดเครื่อง": "crash bar",
+        "โครงกัน": "crash bar", "crashbar": "crash bar", "crash bar": "crash bar",
+        "บาร์กันล้ม": "crash bar", "กันล้มรถ": "crash bar",
+        // กล่องหลัง (KB #28, #76)
+        "ปี๊บ": "case", "ปี๊ป": "case", "ปิ้บ": "case", "ปิ๊บ": "case",
+        "ปี๊บหลัง": "top case", "ปี๊ปหลัง": "top case",
+        "กล่องท้าย": "top case", "กล่องหลัง": "top case", "กล่องท้ายรถ": "top case",
+        "กล่อง": "case", "กล่องอลู": "case", "กล่องอลูมิเนียม": "case", "กล่องเหล็ก": "case",
+        "topbox": "top case", "ท็อปบ็อก": "top case", "ท็อปเคส": "top case",
+        "topcase": "top case", "top case": "top case",
+        // กล่องข้าง (KB #34, #47, #64, #81)
+        "กล่องข้าง": "side case", "ปี๊บข้าง": "side case", "ปิ้ปข้าง": "side case", "ปี๊ปข้าง": "side case",
+        "กล่องข้างอลู": "side case", "กล่องข้างอลูมิเนียม": "side case",
+        "sidebox": "side case", "ไซด์บ็อก": "side case", "ไซด์เคส": "side case",
+        "ไซด์บอกซ์": "side case", "side case": "side case", "side box": "side case",
+        // แร็ค (KB #9, #35, #63, #74, #83)
+        "แร็ค": "rack", "แร็ก": "rack", "แร๊ก": "rack", "แร๊ค": "rack",
+        "ตะแกรง": "rack", "ตะแกรงท้าย": "rack", "โครงยึดกล่อง": "rack", "เหล็กยึดกล่อง": "rack",
+        "แร็คข้าง": "side rack", "ไซด์แร็ค": "side rack", "แร็คหลัง": "rack", "แร็คท้าย": "rack",
+        "แร็คโปร": "rack pro", "แร็คสแตนดาร์ด": "rack", "top rack": "rack", "side rack": "side rack",
+        // ถาดรอง (KB #44)
+        "ถาดรอง": "plate", "เบสเพลท": "plate", "ถาดกล่อง": "plate", "ถาดบนแร็ค": "plate",
+        "ตัวล็อคกล่อง": "plate", "baseplate": "plate", "base plate": "plate",
+        "ถาดยึดกล่อง": "plate", "quick release": "plate", "ถาดสแตนเลส": "plate", "แผ่นรองกล่อง": "plate",
+        // การ์ดแฮนด์ (KB #85)
         "การ์ดแฮนด์": "hand protector", "การ์ด": "hand protector", "handguard": "hand protector",
-        "กระเป๋า": "bag", "กระเป๋ากันน้ำ": "bag", "drybag": "bag",
+        // กระเป๋า (KB #70)
+        "กระเป๋า": "bag", "กระเป๋ากันน้ำ": "bag", "drybag": "bag", "dry bag": "bag",
+        "กระเป๋าเสริม": "bag", "กระเป๋ากันน้ำดิโนโก้": "bag",
+        // ยกแฮนด์ / เบาะพิง
         "ยกแฮนด์": "handlebar riser", "riser": "handlebar riser",
-        "เบาะพิง": "pad", "เบาะ": "pad",
-        // รุ่นรถ
-        "adv": "adv350", "adv350": "adv350", "adv 350": "adv350", "แอดวี": "adv350",
+        "เบาะพิง": "pad", "เบาะ": "pad", "พนักพิง": "pad",
+        // รุ่นรถ (KB #43, #45, #46, #48, #60, #61, #66, #77)
+        "adv": "adv350", "adv350": "adv350", "adv 350": "adv350", "เอดีวี": "adv350", "แอดวี": "adv350",
         "forza": "forza350", "forza350": "forza350", "forza 350": "forza350", "ฟอร์ซ่า": "forza350",
-        "nx500": "nx500", "nx 500": "nx500", "เอ็นเอ็ก": "nx500",
-        "cb500x": "cb500x", "cb500": "cb500x", "cb 500": "cb500x", "ซีบี": "cb500x",
-        "xl750": "xl750", "transalp": "xl750", "ทรานซัลป์": "xl750",
-        // วัสดุ
-        "iron": "iron", "เหล็ก": "iron", "สีดำ": "black",
-        "stainless": "stainless", "สแตนเลส": "stainless", "สีเงิน": "silver",
-        "triple black": "triple black",
+        "forza750": "forza750", "forza 750": "forza750",
+        "nx": "nx500", "nx500": "nx500", "nx 500": "nx500", "เอ็นเอ็ก": "nx500",
+        "cb": "cb500x", "cb500": "cb500x", "cb500x": "cb500x", "cb 500": "cb500x", "ซีบี": "cb500x",
+        "xl750": "xl750", "transalp": "xl750", "ทรานซัลป์": "xl750", "ทรานซาลป์": "xl750",
+        "xadv": "xadv", "x-adv": "xadv", "xadv750": "xadv", "adv750": "xadv", "เอ็กแอดวี": "xadv",
+        // วัสดุ / สี
+        "iron": "iron", "เหล็ก": "iron",
+        "stainless": "stainless", "สแตนเลส": "stainless", "สแตนเลส304": "stainless",
+        "triple black": "triple black", "ทริปเปิ้ลแบล็ค": "triple black",
+        "pro": "pro", "std": "standard", "สแตนดาร์ด": "standard",
       };
 
       // แยก query เป็นคำ + แปลง alias
