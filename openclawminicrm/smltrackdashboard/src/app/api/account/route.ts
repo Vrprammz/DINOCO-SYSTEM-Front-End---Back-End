@@ -41,6 +41,7 @@ export async function GET() {
         lineConfig: { channelAccessToken: "", channelSecret: "" },
         fbConfig: { pageAccessToken: "", appSecret: "", verifyToken: "" },
         telegramChatId: null,
+        aiConfig: null,
       });
     }
 
@@ -79,6 +80,7 @@ export async function GET() {
         configured: !!(account.fbConfig?.pageAccessToken),
       },
       telegramChatId: account.telegramChatId || null,
+      aiConfig: account.aiConfig || null,
       createdAt: account.createdAt,
     });
   } catch (err) {
@@ -96,6 +98,8 @@ export async function PUT(req: NextRequest) {
 
     const body = await req.json();
     const db = await getDB();
+
+    console.log("[PUT /api/account] user:", user.email, "body keys:", Object.keys(body));
 
     // สร้าง update object — เฉพาะ field ที่ส่งมาและไม่ใช่ masked value
     const setFields: Record<string, unknown> = {};
@@ -132,9 +136,15 @@ export async function PUT(req: NextRequest) {
       }
     }
 
+    if (body.aiConfig && typeof body.aiConfig === "object") {
+      setFields["aiConfig"] = body.aiConfig;
+    }
+
     setFields["updatedAt"] = new Date();
 
-    await db.collection("accounts").updateOne(
+    console.log("[PUT /api/account] setFields:", JSON.stringify(Object.keys(setFields)), "filter email:", user.email);
+
+    const updateResult = await db.collection("accounts").updateOne(
       { email: user.email },
       {
         $set: setFields,
@@ -147,6 +157,8 @@ export async function PUT(req: NextRequest) {
       },
       { upsert: true }
     );
+
+    console.log("[PUT /api/account] result:", JSON.stringify({ matched: updateResult.matchedCount, modified: updateResult.modifiedCount, upserted: updateResult.upsertedCount }));
 
     return NextResponse.json({ ok: true });
   } catch (err) {
