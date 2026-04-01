@@ -12,7 +12,10 @@ async function sendClaimAlertToAdmin(claim, statusTh, sourceId) {
   if (!token || !adminGroup) return;
 
   const ticketNum = claim.wpTicketNumber || "N/A";
-  const dashboardUrl = process.env.DASHBOARD_URL || "https://ai.dinoco.in.th/dashboard";
+  const claimId = claim._id ? String(claim._id) : "";
+  const liffId = process.env.B2B_LIFF_ID || process.env.B2F_LIFF_ID || "";
+  const wpDomain = process.env.DINOCO_WP_DOMAIN || "dinoco.in.th";
+  const liffUrl = liffId ? `https://liff.line.me/${liffId}?page=claim&id=${claimId}` : `https://${wpDomain}/ai-center/?page=claim&id=${claimId}`;
 
   const flex = {
     type: "flex",
@@ -40,9 +43,8 @@ async function sendClaimAlertToAdmin(claim, statusTh, sourceId) {
       footer: {
         type: "box", layout: "vertical", spacing: "sm",
         contents: [
-          { type: "button", action: { type: "uri", label: "ดูใบเคลมใน Dashboard", uri: `${dashboardUrl}/claims` }, style: "primary", color: "#FF6B00", height: "sm" },
+          { type: "button", action: { type: "uri", label: "ดูใบเคลม + อัพเดท", uri: liffUrl }, style: "primary", color: "#FF6B00", height: "sm" },
           ...(claim.phone ? [{ type: "button", action: { type: "uri", label: `โทรลูกค้า ${claim.phone}`, uri: `tel:${claim.phone}` }, style: "secondary", height: "sm" }] : []),
-          { type: "button", action: { type: "postback", label: "อัพเดทสถานะเคลม", data: `claim_update:${ticketNum}` }, style: "secondary", height: "sm" },
         ],
       },
     },
