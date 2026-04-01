@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
- * ║  Version: V.31.4 — Flash push guaranteed + 24hr + dup guard   ║
+ * ║  Version: V.31.5 — Flash full-loop fix (refresh/routes/sig)   ║
  * ║  DB_ID: 52                                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
@@ -3066,8 +3066,12 @@ function b2b_rest_flash_webhook( WP_REST_Request $req ) {
 
     b2b_log( '[Flash WH] Received: pno=' . $pno . ' mchId=' . $mch_id );
 
-    // FIX A-2: Verify signature — reject เมื่อ fail (ไม่ process ต่อ)
-    if ( function_exists( 'b2b_flash_verify_webhook' ) && ! b2b_flash_verify_webhook( $mch_id, $nonce_str, $sign ) ) {
+    // V.31.5: Fail-safe verify — reject ถ้า function ไม่มี (ไม่ให้ bypass ถ้า S1 ไม่ load)
+    if ( ! function_exists( 'b2b_flash_verify_webhook' ) ) {
+        b2b_log( '[Flash WH] 🔴 REJECTED: verify function not available (S1 not loaded)' );
+        return new WP_REST_Response( array( 'errorCode' => '0', 'message' => 'config_error' ), 500 );
+    }
+    if ( ! b2b_flash_verify_webhook( $mch_id, $nonce_str, $sign ) ) {
         b2b_log( '[Flash WH] 🔴 REJECTED: Signature mismatch — pno=' . $pno . ' mchId=' . $mch_id );
         return new WP_REST_Response( array( 'errorCode' => '0', 'message' => 'signature_mismatch' ), 403 );
     }
@@ -3135,7 +3139,7 @@ function b2b_flash_find_ticket_by_pno( $pno ) {
     global $wpdb;
     $results = $wpdb->get_col( $wpdb->prepare(
         "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_flash_tracking_numbers' AND meta_value LIKE %s LIMIT 1",
-        '%' . $wpdb->esc_like( $pno ) . '%'
+        '%"' . $wpdb->esc_like( $pno ) . '"%'
     ) );
     return ! empty( $results ) ? intval( $results[0] ) : 0;
 }
@@ -3362,11 +3366,13 @@ function b2b_flash_wh_status( $ticket_id, $pno, $data ) {
             $pod = array_filter( $pod );
             if ( ! empty( $pod ) ) update_post_meta( $ticket_id, '_flash_pod_data', $pod );
 
-            // V.31.4: Duplicate webhook guard — ถ้า delivered_at มีอยู่แล้ว = webhook ซ้ำ → skip push + schedule
+            // V.31.5: Duplicate + race condition guard (webhook ซ้ำ หรือ webhook+cron พร้อมกัน)
             $existing_delivered_at = get_post_meta( $ticket_id, '_flash_delivered_at', true );
+            $dlv_lock = 'b2b_flash_dlv_' . $ticket_id;
 
             // FIX A-7: ไม่ auto-complete ทันที — ส่ง Flex ให้ลูกค้ายืนยัน + schedule 24hr auto-complete
-            if ( ( ! $is_multi_box || $all_active_reached ) && empty( $existing_delivered_at ) ) {
+            if ( ( ! $is_multi_box || $all_active_reached ) && empty( $existing_delivered_at ) && ! get_transient( $dlv_lock ) ) {
+                set_transient( $dlv_lock, 1, 60 );
                 // ยังไม่เปลี่ยนเป็น completed — รอลูกค้ายืนยัน หรือ 24 ชม.
                 update_post_meta( $ticket_id, '_flash_delivered_at', current_time( 'mysql' ) );
                 // ส่ง Flex แจ้งลูกค้าว่าของถึง + ปุ่มยืนยัน
@@ -3541,6 +3547,9 @@ function b2b_flash_wh_courier( $ticket_id, $pno, $data ) {
         foreach ( $all_tids as $otid ) {
             update_post_meta( $otid, '_flash_packing_status', 'picked_up' );
             update_post_meta( $otid, '_flash_courier_info', $info );
+            // V.31.5: Duplicate guard — ถ้าแจ้ง pickup ไปแล้ว ไม่ส่ง Flex ซ้ำ
+            if ( get_post_meta( $otid, '_flash_pickup_notified', true ) ) continue;
+            update_post_meta( $otid, '_flash_pickup_notified', 1 );
             // Send customer Flex (tracking + status)
             $sgid = get_field( 'source_group_id', $otid );
             $tracking = get_field( 'tracking_number', $otid ) ?: '';
@@ -3714,8 +3723,27 @@ function b2b_flash_wh_routes( $ticket_id, $pno, $data ) {
         'label'    => $label,
         'message'  => isset( $data['message'] )         ? sanitize_text_field( $data['message'] )         : '',
         'province' => isset( $data['currentProvince'] ) ? sanitize_text_field( $data['currentProvince'] ) : '',
-        'routedAt' => isset( $data['routedAt'] )        ? $data['routedAt']        : '',
+        'routedAt' => isset( $data['routedAt'] )        ? sanitize_text_field( $data['routedAt'] )        : '',
     ) );
+
+    // V.31.5: ถ้า routes webhook state=5 (delivered) → schedule 24hr เหมือน status webhook
+    if ( $state === 5 ) {
+        $delivered_at = get_post_meta( $ticket_id, '_flash_delivered_at', true );
+        if ( empty( $delivered_at ) ) {
+            update_post_meta( $ticket_id, '_flash_delivered_at', current_time( 'mysql' ) );
+            $sgid = get_field( 'source_group_id', $ticket_id );
+            if ( $sgid && function_exists( 'b2b_build_flex_flash_status' ) ) {
+                $flex = b2b_build_flex_flash_status( $ticket_id, 5, 'พัสดุส่งถึงแล้ว (ตรวจพบจาก Routes)' );
+                if ( function_exists( 'b2b_push_guaranteed' ) ) {
+                    b2b_push_guaranteed( $sgid, array( $flex ), $ticket_id, 'flash_delivered_routes' );
+                } else {
+                    b2b_line_push_raw( $sgid, array( $flex ) );
+                }
+            }
+            wp_schedule_single_event( time() + ( 24 * HOUR_IN_SECONDS ), 'b2b_flash_24hr_complete', array( $ticket_id ) );
+            b2b_add_audit_log( $ticket_id, 'flash_delivered_routes', 'Flash Routes: ส่งถึง — รอยืนยันรับ 24 ชม.' );
+        }
+    }
 }
 
 /**
@@ -3787,12 +3815,15 @@ function b2b_rest_flash_tracking( WP_REST_Request $req ) {
             update_post_meta( $tid, '_flash_packing_status', $state_to_packing[ $latest_state ] );
         }
 
-        // Auto-complete if all delivered
+        // V.31.5: ถ้า delivered → schedule 24hr auto-complete (ไม่ complete ทันที)
         $agg_final = is_array($pno_statuses) && function_exists('b2b_flash_aggregate_status') ? b2b_flash_aggregate_status($pno_statuses) : ( isset($state_to_packing[$latest_state]) ? $state_to_packing[$latest_state] : '' );
-        if ( $agg_final === 'delivered' && function_exists('b2b_set_order_status') ) {
+        if ( $agg_final === 'delivered' ) {
             $cur = get_field('order_status', $tid);
-            if ( in_array($cur, array('shipped','packed'), true) ) {
-                b2b_set_order_status($tid, 'completed');
+            $delivered_at = get_post_meta( $tid, '_flash_delivered_at', true );
+            if ( in_array($cur, array('shipped','packed'), true) && empty($delivered_at) ) {
+                update_post_meta( $tid, '_flash_delivered_at', current_time('mysql') );
+                wp_schedule_single_event( time() + ( 24 * HOUR_IN_SECONDS ), 'b2b_flash_24hr_complete', array( $tid ) );
+                b2b_add_audit_log( $tid, 'flash_delivered_refresh', 'Flash Tracking refresh: ส่งถึง — schedule 24hr auto-complete' );
             }
         }
 
