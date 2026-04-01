@@ -1309,33 +1309,47 @@ app.post("/api/boss-command/analyze", requireAuth, express.json({ limit: "10mb" 
   if (!db) return res.status(500).json({ error: "DB unavailable" });
   const currentRules = await db.collection("ai_rules").find({ active: true, deletedAt: null }).toArray();
   const templates = await db.collection("message_templates").find({ active: true }).toArray();
-  const bossPrompt = `คุณคือ "หัวหน้า AI" ของ DINOCO THAILAND — ผู้ผลิตอะไหล่มอเตอร์ไซค์
-หน้าที่: รับคำสั่งจาก Admin แล้ววิเคราะห์เป็นแผนปฏิบัติ
+  const bossPrompt = `คุณคือ "หัวหน้า AI" ของ DINOCO THAILAND — ผู้ผลิตอะไหล่มอเตอร์ไซค์พรีเมียม (กล่องอลูมิเนียม แคชบาร์ แร็ค)
+DINOCO ไม่ขายปลีก → ขายผ่านตัวแทนจำหน่าย 40+ ร้านทั่วไทย
+AI ตอบแชทลูกค้าใน Facebook/Instagram/LINE แทนทีมงาน
+
+หน้าที่ของคุณ: รับคำสั่งจาก Admin (เจ้าของ DINOCO) แล้ววิเคราะห์เป็นแผนปฏิบัติ
+ถ้า Admin ส่งรูป screenshot มา → วิเคราะห์ว่า AI ทำอะไรผิด แล้วเสนอกฎแก้ไข
+
+สิ่งที่คุณทำได้:
+1. สร้างกฎพฤติกรรม AI (ai_rules) — เช่น "ห้ามบอกว่าเป็น AI" "ห้ามใช้ ?" "ห้ามเอ่ยคู่แข่ง"
+2. แก้ข้อความ template — เช่น ข้อความตอนเคลม ข้อความทักทาย
+3. แก้ฐานความรู้ (KB) — เช่น "คำตอบเรื่องค่าส่งผิด"
 
 กฎที่ active อยู่ (${currentRules.length} ข้อ):
-${currentRules.map((r,i) => `${i+1}. [${r.type}] ${r.instruction}`).join("\n") || "(ยังไม่มี)"}
+${currentRules.map((r,i) => `${i+1}. [${r.type}] ${r.instruction}`).join("\n") || "(ยังไม่มีกฎเพิ่มเติม)"}
 
 Message templates (${templates.length} ข้อ):
-${templates.map(t => `- ${t.templateId}: "${t.message}"`).join("\n") || "(ยังไม่มี)"}
+${templates.map(t => `- ${t.templateId}: "${t.message}"`).join("\n") || "(ยังไม่มี — ใช้ค่า default ในโค้ด)"}
 
-วิเคราะห์คำสั่ง Admin แล้วตอบเป็น JSON:
+ตอบเป็น JSON เท่านั้น (ห้ามมี text อื่นนอก JSON):
 {
-  "understanding": "สรุปสิ่งที่ Admin ต้องการ (ภาษาไทย)",
+  "understanding": "สรุปสั้นๆ ว่า Admin ต้องการอะไร (ภาษาไทย 1-2 ประโยค)",
   "actions": [
     {
-      "type": "create_rule|update_rule|delete_rule|update_kb|update_template",
-      "ruleType": "speech_rule|content_rule|workflow_rule|tone_rule",
-      "title": "ชื่อกฎสั้นๆ",
-      "instruction": "รายละเอียดกฎที่ AI ต้องปฏิบัติ",
-      "priority": 90,
-      "templateId": "claim_start",
-      "newMessage": "ข้อความใหม่"
+      "type": "create_rule",
+      "ruleType": "speech_rule",
+      "title": "ชื่อกฎสั้นๆ ภาษาไทย",
+      "instruction": "คำอธิบายกฎละเอียดที่ AI ต้องปฏิบัติ",
+      "priority": 90
     }
   ],
-  "warnings": ["คำเตือน (ถ้ามี)"],
-  "confirmMessage": "ข้อความยืนยันภาษาไทย สุภาพ"
+  "warnings": [],
+  "confirmMessage": "ข้อความสรุปสิ่งที่จะทำให้ Admin ยืนยัน (ภาษาไทย สุภาพ ใช้ ค่ะ/นะคะ)"
 }
-ถ้าคำสั่งไม่ชัด ถามกลับใน confirmMessage`;
+
+ตัวอย่าง:
+- Admin: "ห้ามบอกลูกค้าว่าเป็น AI" → สร้าง speech_rule "ห้ามเอ่ยว่าเป็น AI/บอท ตอบเสมือนทีมงาน DINOCO"
+- Admin: "ห้ามใช้ ?" → สร้าง speech_rule "ห้ามใช้เครื่องหมาย ? ใช้คำว่า คะ แทน"
+- Admin ส่งรูป AI ตอบผิด → วิเคราะห์จากรูปว่าผิดอะไร แล้วสร้างกฎแก้ไข
+- Admin: "แก้ KB เรื่อง X" → type: "update_kb"
+
+ถ้าคำสั่งไม่ชัดเจน → ถามกลับใน confirmMessage ว่าต้องการอะไรเพิ่ม`;
 
   const anthropicKey = getDynamicKeySync("ANTHROPIC_API_KEY");
   const googleKey = getDynamicKeySync("GOOGLE_API_KEY");
@@ -1369,9 +1383,21 @@ ${templates.map(t => `- ${t.templateId}: "${t.message}"`).join("\n") || "(ยั
     }
     let parsed;
     try {
+      // หา JSON block จาก response (อาจมี text อื่นล้อมรอบ)
       const jsonMatch = analysis.match(/\{[\s\S]*\}/);
-      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : { confirmMessage: analysis, actions: [] };
-    } catch { parsed = { confirmMessage: analysis, actions: [] }; }
+      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+    } catch { parsed = null; }
+
+    // Fallback: ถ้า parse JSON ไม่ได้ → ใช้ raw text เป็น confirmMessage
+    if (!parsed || !parsed.confirmMessage) {
+      parsed = {
+        understanding: command || "วิเคราะห์จากรูปที่ส่ง",
+        actions: [],
+        warnings: [],
+        confirmMessage: analysis || "ไม่สามารถวิเคราะห์ได้ กรุณาลองใหม่ค่ะ",
+      };
+    }
+
     const commandId = `cmd_${Date.now()}`;
     await db.collection("boss_commands").insertOne({ commandId, input: command, hasImage: !!imageBase64, analysis: parsed, status: "pending", createdAt: new Date() });
     res.json({ ok: true, commandId, ...parsed });

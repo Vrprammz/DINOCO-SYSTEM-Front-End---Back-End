@@ -442,11 +442,20 @@ export default function BossCommandPage() {
             {/* Analysis result */}
             {analysis && (
               <div className="glass-card rounded-xl p-4 space-y-3 animate-fade-in" style={{ border: "1px solid rgba(255,107,0,0.15)" }}>
+                {/* Confirm message (แสดงก่อน — สำคัญสุด) */}
+                {analysis.confirmMessage && (
+                  <div className="p-3 rounded-lg" style={{ background: "rgba(255,107,0,0.06)", borderLeft: "3px solid var(--primary)" }}>
+                    <p className="text-sm theme-text whitespace-pre-wrap">{analysis.confirmMessage}</p>
+                  </div>
+                )}
+
                 {/* Understanding */}
+                {analysis.understanding && (
                 <div>
                   <h3 className="text-[11px] font-semibold theme-text-secondary mb-1">สิ่งที่เข้าใจ</h3>
                   <p className="text-xs theme-text">{analysis.understanding}</p>
                 </div>
+                )}
 
                 {/* Actions */}
                 {analysis.actions && analysis.actions.length > 0 && (
@@ -476,16 +485,11 @@ export default function BossCommandPage() {
                   </div>
                 )}
 
-                {/* Confirm message */}
-                {analysis.confirmMessage && (
-                  <p className="text-xs theme-text-secondary italic">{analysis.confirmMessage}</p>
-                )}
-
                 {/* Action buttons */}
                 <div className="flex gap-2 pt-1">
                   <button
                     onClick={handleExecute}
-                    disabled={executing || !analysis.actions?.length}
+                    disabled={executing}
                     className="flex-1 py-2 rounded-lg text-xs font-medium disabled:opacity-50"
                     style={{ background: "rgba(74,222,128,0.12)", color: "#4ade80", border: "1px solid rgba(74,222,128,0.2)" }}
                   >
