@@ -1,12 +1,88 @@
 /**
- * claim-flow.js — Manual claim flow, claim detection, Vision AI analysis
- * V.1.1 — Boss Command: dynamic message templates
+ * claim-flow.js — Manual claim flow, AI-powered claim detection + KB-aware questions
+ * V.2.0 — AI ถามฉลาด ดึง KB + วิเคราะห์รูป ไม่ใช้ hardcode steps
  */
-const { getDB, getTemplate } = require("./shared");
+const { getDB, getTemplate, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
 
 // Forward declarations
 let analyzeImage = null;
+
+// === AI-Powered Claim Question — ถามฉลาดจาก KB + รูป + context ===
+async function aiClaimQuestion(claim, newInfo) {
+  const db = await getDB();
+  const apiKey = getDynamicKeySync("GOOGLE_API_KEY");
+  if (!apiKey || !db) return null;
+
+  // ดึง KB เรื่องเคลมที่เกี่ยวข้อง
+  const kbEntries = await db.collection("knowledge_base")
+    .find({ $or: [
+      { category: "warranty" },
+      { tags: { $in: ["เคลม", "ประกัน", "ชำรุด", "สติ๊กเกอร์", "กุญแจ", "แตก", "ลอก", "หลุด"] } },
+      { trainingPhrases: { $regex: "เคลม|ประกัน|ชำรุด|สติ๊กเกอร์|แตก|ลอก", $options: "i" } },
+    ] })
+    .limit(5).toArray();
+
+  const kbContext = kbEntries.map(k => `• ${k.title}: ${(k.content || "").substring(0, 200)}`).join("\n");
+
+  // สร้าง context จากข้อมูลที่เก็บไว้แล้ว
+  const collected = [];
+  if (claim.product) collected.push(`สินค้า: ${claim.product}`);
+  if (claim.symptoms) collected.push(`อาการ: ${claim.symptoms}`);
+  if (claim.purchaseFrom) collected.push(`ร้าน: ${claim.purchaseFrom}`);
+  if (claim.purchaseDate) collected.push(`ซื้อเมื่อ: ${claim.purchaseDate}`);
+  if (claim.phone) collected.push(`เบอร์: ${claim.phone}`);
+  if (claim.aiAnalysis) collected.push(`AI วิเคราะห์รูป (ภายใน): ${claim.aiAnalysis}`);
+
+  // ข้อมูลใหม่ที่เพิ่งได้
+  if (newInfo) collected.push(`ข้อมูลล่าสุด: ${newInfo}`);
+
+  // ข้อมูลที่ยังขาด
+  const missing = [];
+  if (!claim.product) missing.push("สินค้ารุ่นอะไร (เช่น กล่องข้าง, แคชบาร์, แร็ค)");
+  if (!claim.symptoms) missing.push("อาการเป็นยังไง (เช่น สติ๊กเกอร์ลอก, แตก, กุญแจหาย)");
+  if (!claim.purchaseFrom) missing.push("ซื้อจากร้านไหน");
+  if (!claim.purchaseDate) missing.push("ซื้อประมาณเมื่อไหร่");
+  if (!claim.phone) missing.push("เบอร์โทรติดต่อกลับ");
+
+  if (missing.length === 0) return null; // ข้อมูลครบแล้ว
+
+  const prompt = `คุณเป็นทีมงาน DINOCO กำลังรับเรื่องเคลมสินค้า (ห้ามบอกว่าเป็น AI เด็ดขาด)
+สินค้า DINOCO: กล่องอลูมิเนียม, แคชบาร์ (กันล้ม), แร็ค, ถาดรอง, การ์ดแฮนด์
+
+ความรู้เรื่องเคลมที่คุณมี (ใช้เป็นสมองคิด ไม่ต้อง copy ตาม):
+${kbContext || "(ไม่มี)"}
+
+ข้อมูลที่เก็บได้แล้วจากลูกค้า:
+${collected.join("\n") || "(ยังไม่มี)"}
+
+ข้อมูลที่ยังขาด ต้องถามเพิ่ม:
+${missing.join("\n")}
+
+วิธีถาม:
+- ถามทีละข้อ สั้นๆ 1-2 ประโยค
+- ถ้าวิเคราะห์รูปได้ว่าเป็นสินค้าอะไร/อาการอะไร → ถามยืนยันแทน เช่น "ดูจากรูปเหมือนแคชบาร์ใช่ไหมคะ" ไม่ใช่ถามใหม่ทั้งหมด
+- ใช้ความรู้จาก KB คิดว่าควรถามอะไร เช่น ถ้า KB บอกว่าเคลมสติ๊กเกอร์ต้องดูบัตรรับประกัน → ถามเรื่องบัตรรับประกัน
+- ห้ามใช้ ? ใช้ คะ/นะคะ แทน
+- เรียกลูกค้าว่า "พี่"
+- พูดเหมือนคนจริงๆ ไม่ใช่สคริปต์`;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(10000),
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: prompt }] },
+        contents: [{ role: "user", parts: [{ text: `ถามข้อมูลที่ขาดจากลูกค้า (เหลือ ${missing.length} ข้อ)` }] }],
+        generationConfig: { temperature: 0.4, maxOutputTokens: 200 },
+      }),
+    });
+    const data = await res.json();
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (reply && reply.length > 5) return reply.replace(/\?/g, "").trim();
+  } catch (e) { console.error("[ClaimAI] Question error:", e.message); }
+  return null;
+}
 
 function init(deps) {
   analyzeImage = deps.analyzeImage;
@@ -122,7 +198,9 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
           await db.collection("manual_claims").updateOne({ _id: claim._id }, {
             $set: { status: "photo_received", aiAnalysis: analysis, updatedAt: new Date() },
           });
-          return await getTemplate("claim_photo_received") || "ได้รูปแล้วค่ะ ขอบคุณนะคะ\nสินค้ารุ่นอะไรคะ";
+          // AI ถามฉลาด — ใช้ KB + รูปวิเคราะห์
+          const smartQ = await aiClaimQuestion(claim, null);
+          return smartQ || await getTemplate("claim_photo_received") || "ได้รูปแล้วค่ะ ขอบคุณนะคะ\nสินค้ารุ่นอะไรคะ";
         }
         const photoCount = (claim.photos?.length || 0) + 1;
         if (photoCount >= 2) {
@@ -159,29 +237,40 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
         await db.collection("manual_claims").updateOne({ _id: claim._id }, {
           $set: { product: text, status: "info_collecting", updatedAt: new Date() },
         });
-        return await getTemplate("claim_ask_shop") || "ซื้อจากร้านไหนคะ";
+        const smartQ = await aiClaimQuestion({ ...claim, product: text }, text);
+        return smartQ || await getTemplate("claim_ask_shop") || "ซื้อจากร้านไหนคะ";
       }
-      return "สินค้ารุ่นอะไรคะ";
+      const smartQ = await aiClaimQuestion(claim, null);
+      return smartQ || "สินค้ารุ่นอะไรคะ";
     }
 
     case "info_collecting": {
-      if (!claim.purchaseFrom && text) {
-        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { purchaseFrom: text, updatedAt: new Date() },
-        });
-        return await getTemplate("claim_ask_date") || "ประมาณซื้อเมื่อไหร่คะ";
-      }
-      if (claim.purchaseFrom && !claim.purchaseDate && text) {
-        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { purchaseDate: text, updatedAt: new Date() },
-        });
-        return await getTemplate("claim_ask_symptoms") || "อาการเป็นยังไงคะ";
-      }
-      if (claim.purchaseFrom && claim.purchaseDate && !claim.symptoms && text) {
-        await db.collection("manual_claims").updateOne({ _id: claim._id }, {
-          $set: { symptoms: text, updatedAt: new Date() },
-        });
-        return await getTemplate("claim_ask_phone") || "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
+      // AI เก็บข้อมูลฉลาด — ดูว่าลูกค้าตอบอะไรมา แล้วเก็บให้ถูก field
+      if (text) {
+        // AI ตรวจว่าข้อมูลใหม่เป็น field ไหน
+        const lower = text.toLowerCase();
+        if (!claim.purchaseFrom && !claim.purchaseDate && !claim.symptoms) {
+          // ยังไม่มีอะไรเลย → เก็บเป็น purchaseFrom (ร้านที่ซื้อ)
+          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+            $set: { purchaseFrom: text, updatedAt: new Date() },
+          });
+          const smartQ = await aiClaimQuestion({ ...claim, purchaseFrom: text }, text);
+          return smartQ || await getTemplate("claim_ask_date") || "ประมาณซื้อเมื่อไหร่คะ";
+        }
+        if (claim.purchaseFrom && !claim.purchaseDate) {
+          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+            $set: { purchaseDate: text, updatedAt: new Date() },
+          });
+          const smartQ = await aiClaimQuestion({ ...claim, purchaseDate: text }, text);
+          return smartQ || await getTemplate("claim_ask_symptoms") || "อาการเป็นยังไงคะ";
+        }
+        if (claim.purchaseFrom && claim.purchaseDate && !claim.symptoms) {
+          await db.collection("manual_claims").updateOne({ _id: claim._id }, {
+            $set: { symptoms: text, updatedAt: new Date() },
+          });
+          const smartQ = await aiClaimQuestion({ ...claim, symptoms: text }, text);
+          return smartQ || await getTemplate("claim_ask_phone") || "ขอเบอร์โทรติดต่อกลับหน่อยนะคะ";
+        }
       }
       if (claim.symptoms && !claim.phone && text) {
         const phoneMatch = text.replace(/[^0-9]/g, "");
