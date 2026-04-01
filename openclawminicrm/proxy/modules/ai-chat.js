@@ -383,6 +383,66 @@ DINOCO เป็น One Price ไม่มีโปรโมชั่น
 }
 
 // === AI Reply to Facebook/Instagram ===
+// === Claude หัวหน้าตรวจงาน Gemini — เฉพาะเรื่องยาก ===
+async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr) {
+  // เช็คว่าต้องตรวจไหม
+  const needsReview =
+    geminiReply.length > 300 ||                    // ตอบยาวเกิน
+    /ซ้ำ|เหมือนเดิม/i.test(customerText) ||       // ลูกค้าบ่นว่าซ้ำ
+    /ไม่เข้าใจ|ไม่ใช่|ผิด/i.test(customerText) || // ลูกค้าบอกผิด
+    (contextStr && contextStr.includes(geminiReply.substring(0, 50))) || // ตอบซ้ำกับก่อนหน้า
+    /\?/.test(geminiReply) ||                      // มี ? หลุด
+    /AI|บอท|bot|ระบบอัตโนมัติ/i.test(geminiReply); // เผยตัวว่าเป็น AI
+
+  if (!needsReview) return geminiReply;
+
+  const claudeKey = getDynamicKeySync("ANTHROPIC_API_KEY");
+  if (!claudeKey) return geminiReply;
+
+  console.log("[Boss] Claude reviewing Gemini reply...");
+
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": claudeKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514", max_tokens: 512, temperature: 0.2,
+        system: `คุณเป็นหัวหน้า AI ของ DINOCO ตรวจงานลูกน้อง (Gemini)
+ลูกค้าถาม: "${customerText}"
+Gemini ตอบ: "${geminiReply}"
+ประวัติสนทนา: ${contextStr || "(ไม่มี)"}
+
+ตรวจว่า:
+1. ตอบซ้ำกับก่อนหน้าไหม (ดูจากประวัติ) → ถ้าซ้ำ ต้องแก้
+2. ตอบตรงคำถามไหม → ถ้าลูกค้าเลือกตัว ต้องตอบเฉพาะตัวนั้น
+3. มี ? ไหม → ลบออก
+4. เผยว่าเป็น AI ไหม → ลบออก
+5. กุข้อมูลไหม → ลบออก
+6. ยาวเกินไปไหม → ย่อ
+
+ถ้าคำตอบ Gemini ดีแล้ว → ตอบ "OK" เท่านั้น
+ถ้าต้องแก้ → ตอบข้อความที่แก้แล้ว (ส่งให้ลูกค้าโดยตรง)`,
+        messages: [{ role: "user", content: "ตรวจแล้วคำตอบนี้ดีไหม ต้องแก้ไหม" }],
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await res.json();
+    const review = data.content?.[0]?.text || "";
+
+    if (review.trim() === "OK" || review.trim() === "ok" || review.includes("ดีแล้ว")) {
+      console.log("[Boss] Claude approved ✅");
+      return geminiReply;
+    }
+
+    // Claude แก้ไข → ใช้ข้อความใหม่
+    console.log("[Boss] Claude revised ✏️");
+    return review.replace(/\?/g, "").trim();
+  } catch (e) {
+    console.log("[Boss] Claude timeout/error — use Gemini reply:", e.message);
+    return geminiReply; // fallback ใช้ Gemini เดิม
+  }
+}
+
 async function aiReplyToMeta(senderId, text, sourceId, platform) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
@@ -404,10 +464,13 @@ Platform: ${platform} — ${platformNote}
 สไตล์: ${abInstruction}
 ประวัติสนทนา:\n${contextStr || "(ไม่มี)"}${metaRulesPrompt}`;
 
-  const reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId);
+  let reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId);
   if (/รอทีมงาน|ขอเช็คข้อมูล/.test(reply)) {
     await createAiHandoffAlert(sourceId, senderId, text, platform);
   }
+
+  // === Claude หัวหน้าตรวจงาน Gemini (เฉพาะเรื่องยาก) ===
+  reply = await claudeSupervisor(reply, text, sourceId, contextStr);
 
   // ตรวจหา image URL ใน reply → ส่งเป็นรูปจริง แยกจาก text
   console.log(`[AI-Debug] reply length=${reply.length} hasImageUrl=${/https?:\/\/.*\.(png|jpg|jpeg)/i.test(reply)}`);
