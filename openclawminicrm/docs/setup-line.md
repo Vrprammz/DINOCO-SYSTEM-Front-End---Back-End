@@ -36,7 +36,7 @@
 2. หา **Webhook URL** → กด **Edit**
 3. ใส่:
    ```
-   https://smlclaw.satistang.com/webhook
+   https://ai.dinoco.in.th/webhook
    ```
    (หรือ URL ของ Cloudflare Tunnel ที่ตั้งไว้)
 4. กด **Update**

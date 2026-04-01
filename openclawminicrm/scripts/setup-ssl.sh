@@ -5,8 +5,8 @@
 # ==============================================
 set -e
 
-DOMAIN="${1:-smlclaw.satistang.com}"
-EMAIL="${2:-admin@satistang.com}"
+DOMAIN="${1:-ai.dinoco.in.th}"
+EMAIL="${2:-admin@dinoco.in.th}"
 
 echo "=== Setting up SSL for ${DOMAIN} ==="
 

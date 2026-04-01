@@ -64,7 +64,7 @@ nano .env
 # ชี้ domain ไปที่ IP ของ Hetzner ก่อน (DNS A record)
 # แล้วรัน:
 chmod +x scripts/setup-ssl.sh
-./scripts/setup-ssl.sh smlclaw.satistang.com admin@satistang.com
+./scripts/setup-ssl.sh ai.dinoco.in.th admin@dinoco.in.th
 ```
 
 ### 6. Deploy
@@ -91,7 +91,7 @@ smltrack-certbot      Up
 smltrack-watchtower   Up
 ```
 
-ทดสอบ: https://smlclaw.satistang.com/dashboard
+ทดสอบ: https://ai.dinoco.in.th/dashboard
 
 ---
 
@@ -188,5 +188,5 @@ docker compose -f docker-compose.prod.yml logs --since 1h agent
 ### ตรวจ SSL cert
 
 ```bash
-echo | openssl s_client -connect smlclaw.satistang.com:443 2>/dev/null | openssl x509 -noout -dates
+echo | openssl s_client -connect ai.dinoco.in.th:443 2>/dev/null | openssl x509 -noout -dates
 ```

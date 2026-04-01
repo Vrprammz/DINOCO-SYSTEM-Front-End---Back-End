@@ -125,7 +125,7 @@ smltrack-tunnel       Up
 | Agent ทำงาน | http://localhost:3000/ | แสดงข้อความ OK |
 | OpenClaw | http://localhost:18789/ | Control UI |
 | Dashboard | http://localhost:3002/dashboard | เห็นหน้า Dashboard |
-| ผ่าน Internet | https://smlclaw.satistang.com/dashboard | เข้าได้จากข้างนอก |
+| ผ่าน Internet | https://ai.dinoco.in.th/dashboard | เข้าได้จากข้างนอก |
 
 ---
 
@@ -135,7 +135,7 @@ smltrack-tunnel       Up
 LINE OA
   |
   v
-Cloudflare Tunnel (smlclaw.satistang.com)
+Cloudflare Tunnel (ai.dinoco.in.th)
   |
   v
 +------------------ Docker Desktop --------------------+

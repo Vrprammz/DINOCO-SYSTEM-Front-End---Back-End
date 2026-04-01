@@ -133,7 +133,7 @@ export default function ConnectionsPage() {
               <div className="theme-bg-card border theme-border rounded-xl p-4 space-y-2">
                 <p className="text-xs font-medium theme-text-secondary">Webhook URL</p>
                 <code className="text-xs text-indigo-300 font-mono block break-all">
-                  https://smlclaw.satistang.com/webhook
+                  https://ai.dinoco.in.th/webhook
                 </code>
                 <p className="text-xs theme-text-muted">ตั้งค่าที่ LINE Developers Console → Messaging API → Webhook URL</p>
               </div>

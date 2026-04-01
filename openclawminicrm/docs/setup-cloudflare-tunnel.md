@@ -16,7 +16,7 @@
 > ถ้าผู้ดูแลระบบให้ Tunnel Token มาแล้ว ข้ามไป Step 5
 
 1. เข้า Dashboard → กด **Add a site**
-2. ใส่ชื่อโดเมน เช่น `satistang.com`
+2. ใส่ชื่อโดเมน เช่น `dinoco.in.th`
 3. เลือก **Free plan** → กด **Continue**
 4. Cloudflare จะแสดง Nameservers → ไปเปลี่ยนที่ผู้ให้บริการโดเมน
 5. รอ Nameserver propagation (1-24 ชม.)
@@ -47,7 +47,7 @@
    - **URL:** `agent:3000`
 3. กด **Save hostname**
 
-> ผลลัพธ์: `https://smlclaw.satistang.com` → จะ forward ไปที่ agent container port 3000
+> ผลลัพธ์: `https://ai.dinoco.in.th` → จะ forward ไปที่ agent container port 3000
 
 ## Step 6 — เพิ่ม Dashboard route (ถ้าต้องการ)
 
@@ -68,8 +68,8 @@ CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoixxxxxxxxx...
 
 1. ดู logs: `docker compose logs tunnel -f`
 2. ต้องเห็น `Connection registered` หรือ `Registered tunnel connection`
-3. เข้า `https://smlclaw.satistang.com/` → ต้องตอบ OK
-4. เข้า `https://smlclaw.satistang.com/dashboard` → ต้องเห็น Dashboard
+3. เข้า `https://ai.dinoco.in.th/` → ต้องตอบ OK
+4. เข้า `https://ai.dinoco.in.th/dashboard` → ต้องเห็น Dashboard
 
 ## แก้ปัญหา
 

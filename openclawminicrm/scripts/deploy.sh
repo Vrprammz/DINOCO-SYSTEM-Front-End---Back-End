@@ -51,4 +51,4 @@ ssh "${REMOTE_USER}@${REMOTE_HOST}" "cd ${REMOTE_DIR} && docker compose -f ${COM
 
 echo ""
 echo "=== Deploy complete! ==="
-echo "Dashboard: https://smlclaw.satistang.com/dashboard"
+echo "Dashboard: https://ai.dinoco.in.th/dashboard"

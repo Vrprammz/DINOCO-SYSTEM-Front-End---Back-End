@@ -1128,7 +1128,7 @@ app.post("/api/inbox/send", requireAuth, sendLimiter, express.json(), async (req
 app.post("/api/inbox/upload", requireAuth, uploadLimiter, upload.single("image"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "ไม่มีไฟล์รูปภาพ" });
   if (!validateImageSignature(req.file.path)) { fs.unlinkSync(req.file.path); return res.status(400).json({ error: "ไฟล์ไม่ใช่รูปภาพที่รองรับ" }); }
-  const baseUrl = process.env.BASE_URL || "https://crm.satistang.com";
+  const baseUrl = process.env.BASE_URL || "https://ai.dinoco.in.th";
   res.json({ ok: true, imageUrl: `${baseUrl}/uploads/${req.file.filename}`, filename: req.file.filename });
 });
 

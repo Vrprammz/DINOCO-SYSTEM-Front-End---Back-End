@@ -60,7 +60,7 @@ nano .env
 ### 5. DNS --- ชี้ domain
 
 ที่ Cloudflare DNS (หรือ registrar อื่น):
-- เพิ่ม A record: `crm.satistang.com` --> IP ของ DigitalOcean
+- เพิ่ม A record: `ai.dinoco.in.th` --> IP ของ DigitalOcean
 - **DNS only (grey cloud)** --- ให้ Caddy จัดการ SSL เอง
 
 ### 6. Deploy
@@ -85,12 +85,12 @@ smltrack-openclaw     Up
 smltrack-mongodb      Up
 ```
 
-ทดสอบ: https://crm.satistang.com/dashboard
+ทดสอบ: https://ai.dinoco.in.th/dashboard
 
 ### 8. Seed ข้อมูลตัวอย่าง
 
 ```bash
-curl -s -X POST "https://crm.satistang.com/dashboard/api/seed"
+curl -s -X POST "https://ai.dinoco.in.th/dashboard/api/seed"
 ```
 
 ---

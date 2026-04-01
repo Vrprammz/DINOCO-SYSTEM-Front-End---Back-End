@@ -2,7 +2,7 @@
 # Seed extra demo data to production via existing API endpoints
 # Uses cookies from /tmp/crm-cookies.txt (login first)
 
-BASE="https://crm.satistang.com/dashboard/api"
+BASE="https://ai.dinoco.in.th/dashboard/api"
 COOKIES="/tmp/crm-cookies.txt"
 
 post() {
