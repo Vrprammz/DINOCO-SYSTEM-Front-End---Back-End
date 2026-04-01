@@ -26,7 +26,9 @@ export async function GET() {
     }
 
     const db = await getDB();
+    console.log("[GET /api/account] user email:", user.email);
     const account = await db.collection("accounts").findOne({ email: user.email });
+    console.log("[GET /api/account] found:", !!account, "hasAiConfig:", !!account?.aiConfig);
 
     if (!account) {
       // ยังไม่มี account doc → return ข้อมูลพื้นฐานจาก session
