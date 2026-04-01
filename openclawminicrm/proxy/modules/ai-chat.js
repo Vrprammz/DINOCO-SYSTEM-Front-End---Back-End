@@ -12,6 +12,9 @@ let executeTool = null;
 let AGENT_TOOLS = null;
 let saveMsg = null;
 let buildAIContext = null;
+
+// ★ V.1.4: เก็บ tool results ล่าสุดของแต่ละ sourceId สำหรับ claudeSupervisor
+const _lastToolResults = new Map();
 let createAiHandoffAlert = null;
 let replyToLine = null;
 let sendMetaMessage = null;
@@ -249,18 +252,30 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
     name: t.function.name, description: t.function.description, parameters: t.function.parameters,
   }));
 
-  // ส่ง conversation history ให้ Gemini จำ context ได้
+  // ★ V.1.4: ส่ง conversation history + dedup consecutive same-role (Gemini ต้อง alternate user/model)
   const contents = [];
   try {
     const recentMsgs = await getRecentMessages(sourceId, 6);
+    let lastRole = "";
     for (const m of recentMsgs.reverse()) {
       const role = m.role === "assistant" ? "model" : "user";
       if (m.content && m.content.length > 0 && m.content !== "[รูปภาพ]") {
-        contents.push({ role, parts: [{ text: m.content }] });
+        if (role === lastRole && contents.length > 0) {
+          // merge consecutive same-role → ต่อท้ายข้อความเดิม
+          contents[contents.length - 1].parts[0].text += "\n" + m.content;
+        } else {
+          contents.push({ role, parts: [{ text: m.content }] });
+        }
+        lastRole = role;
       }
     }
   } catch {}
-  contents.push({ role: "user", parts: [{ text: userMessage }] });
+  // ถ้า last message เป็น user อยู่แล้ว → merge กับ userMessage
+  if (contents.length > 0 && contents[contents.length - 1].role === "user") {
+    contents[contents.length - 1].parts[0].text += "\n" + userMessage;
+  } else {
+    contents.push({ role: "user", parts: [{ text: userMessage }] });
+  }
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents,
@@ -286,6 +301,9 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
         const { name, args } = funcCall.functionCall;
         console.log(`[Gemini] Tool call: ${name}(${JSON.stringify(args).substring(0, 80)})`);
         const toolResult = await executeTool(name, args || {}, sourceId);
+        // ★ V.1.4: เก็บ tool results ล่าสุดสำหรับ claudeSupervisor
+        const toolSummary = typeof toolResult === "string" ? toolResult.substring(0, 500) : JSON.stringify(toolResult).substring(0, 500);
+        _lastToolResults.set(sourceId, { name, args, result: toolSummary, at: Date.now() });
         contents.push({ role: "model", parts: [{ functionCall: { name, args: args || {} } }] });
         contents.push({ role: "user", parts: [{ functionResponse: { name, response: { result: toolResult } } }] });
         body.contents = contents;
@@ -309,18 +327,28 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId) {
     name: t.function.name, description: t.function.description, input_schema: t.function.parameters,
   }));
 
-  // ส่ง conversation history ให้ Claude จำ context ได้
+  // ★ V.1.4: ส่ง conversation history + dedup consecutive same-role (Claude ต้อง alternate user/assistant)
   const messages = [];
   try {
     const recentMsgs = await getRecentMessages(sourceId, 6);
+    let lastRole = "";
     for (const m of recentMsgs.reverse()) {
       const role = m.role === "assistant" ? "assistant" : "user";
       if (m.content && m.content.length > 0 && m.content !== "[รูปภาพ]") {
-        messages.push({ role, content: m.content });
+        if (role === lastRole && messages.length > 0) {
+          messages[messages.length - 1].content += "\n" + m.content;
+        } else {
+          messages.push({ role, content: m.content });
+        }
+        lastRole = role;
       }
     }
   } catch {}
-  messages.push({ role: "user", content: userMessage });
+  if (messages.length > 0 && messages[messages.length - 1].role === "user") {
+    messages[messages.length - 1].content += "\n" + userMessage;
+  } else {
+    messages.push({ role: "user", content: userMessage });
+  }
   for (let i = 0; i < 4; i++) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -410,7 +438,7 @@ async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr)
     (contextStr && contextStr.includes(geminiReply.substring(0, 50))) || // ตอบซ้ำกับก่อนหน้า
     /\?/.test(geminiReply) ||                      // มี ? หลุด
     /AI|บอท|bot|ระบบอัตโนมัติ/i.test(geminiReply) || // เผยตัวว่าเป็น AI
-    /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม/i.test(geminiReply); // cross-sell hallucination
+    /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม|นอกจากนี้.*มี/i.test(geminiReply); // cross-sell hallucination
 
   if (!needsReview) return geminiReply;
 
@@ -418,6 +446,12 @@ async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr)
   if (!claudeKey) return geminiReply;
 
   console.log("[Boss] Claude reviewing Gemini reply...");
+
+  // ★ V.1.4: ส่ง tool results ให้ Claude ตรวจ hallucination ได้แม่นยำขึ้น
+  const lastTool = _lastToolResults.get(sourceId);
+  const toolInfo = lastTool && (Date.now() - lastTool.at < 60000)
+    ? `\nTool ที่ Gemini เรียก: ${lastTool.name}(${JSON.stringify(lastTool.args)})\nผลลัพธ์จาก tool: ${lastTool.result}`
+    : "";
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -428,34 +462,40 @@ async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr)
         system: `คุณเป็นหัวหน้า AI ของ DINOCO ตรวจงานลูกน้อง (Gemini)
 ลูกค้าถาม: "${customerText}"
 Gemini ตอบ: "${geminiReply}"
-ประวัติสนทนา: ${contextStr || "(ไม่มี)"}
+ประวัติสนทนา: ${contextStr || "(ไม่มี)"}${toolInfo}
 
 ตรวจว่า:
 1. ตอบซ้ำกับก่อนหน้าไหม (ดูจากประวัติ) → ถ้าซ้ำ ต้องแก้
 2. ตอบตรงคำถามไหม → ถ้าลูกค้าเลือกตัว ต้องตอบเฉพาะตัวนั้น
-3. มี ? ไหม → ลบออก
+3. มี ? ไหม → แปลงเป็น คะ/นะคะ/ไหมคะ
 4. เผยว่าเป็น AI ไหม → ลบออก
-5. กุข้อมูลไหม → ลบออก
+5. กุข้อมูลสินค้าที่ไม่มีใน tool result ไหม → ลบออก (สำคัญมาก! ADV350/Forza350 ไม่มีกล่องข้าง)
 6. ยาวเกินไปไหม → ย่อ
-7. กระซิบ/แนะนำสินค้าที่ไม่ได้อยู่ในคำตอบหลักไหม → ลบออก (เช่น "มีกล่องข้างด้วยนะ" ทั้งที่ลูกค้าถามแคชบาร์ = hallucination)
+7. กระซิบ/แนะนำสินค้าที่ไม่ได้อยู่ใน tool result ไหม → ลบออก
 
-ถ้าคำตอบ Gemini ดีแล้ว → ตอบ "OK" เท่านั้น
-ถ้าต้องแก้ → ตอบข้อความที่แก้แล้ว (ส่งให้ลูกค้าโดยตรง)`,
+ถ้าคำตอบ Gemini ดีแล้ว → ตอบคำเดียว "OK"
+ถ้าต้องแก้ → ตอบข้อความที่แก้แล้วเท่านั้น (ส่งให้ลูกค้าโดยตรง ห้ามใส่คำอธิบาย)`,
         messages: [{ role: "user", content: "ตรวจแล้วคำตอบนี้ดีไหม ต้องแก้ไหม" }],
       }),
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(12000), // ★ V.1.4: เพิ่มจาก 8 → 12 วินาที
     });
     const data = await res.json();
-    const review = data.content?.[0]?.text || "";
+    const review = (data.content?.[0]?.text || "").trim();
 
-    if (review.trim() === "OK" || review.trim() === "ok" || review.includes("ดีแล้ว")) {
+    // ★ V.1.4: exact match "OK" เท่านั้น — ป้องกัน "ดีแล้วค่ะ แต่..." false positive
+    if (review === "OK" || review === "ok") {
       console.log("[Boss] Claude approved ✅");
       return geminiReply;
     }
 
-    // Claude แก้ไข → ใช้ข้อความใหม่
+    // Claude แก้ไข → ใช้ข้อความใหม่ (ลบ ? เฉพาะที่ไม่ใช่ URL)
     console.log("[Boss] Claude revised ✏️");
-    return review.replace(/\?/g, "").trim();
+    // ★ V.1.4: track cost สำหรับ supervisor
+    if (data.usage) {
+      trackAICost({ provider: "Claude-Supervisor", model: "claude-sonnet-4-20250514", feature: "supervisor",
+        inputTokens: data.usage.input_tokens || 0, outputTokens: data.usage.output_tokens || 0, sourceId });
+    }
+    return review.replace(/\?(?![a-zA-Z_=&])/g, "").trim();
   } catch (e) {
     console.log("[Boss] Claude timeout/error — use Gemini reply:", e.message);
     return geminiReply; // fallback ใช้ Gemini เดิม

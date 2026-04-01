@@ -400,6 +400,7 @@ async function analyzeImage(imageBuffer) {
 // === Auto-reply after 5 min ===
 async function doAutoReply(sourceId, userName, customerMessage) {
   const db = await getDB();
+  if (!db) return; // ★ V.1.4: ป้องกัน crash ถ้า MongoDB disconnect
   const lastMsg = await db.collection("messages").findOne({ sourceId }, { sort: { createdAt: -1 } });
   if (lastMsg && lastMsg.role === "assistant") return;
   const customer = await db.collection("customers").findOne({ rooms: sourceId }).catch(() => null);
@@ -915,7 +916,11 @@ async function handleLinePostback(event, sourceId) {
   const db = await getDB(); if (!db) return;
   if (data.startsWith("lead_accepted:")) {
     const leadId = data.replace("lead_accepted:", "");
-    await db.collection("leads").updateOne({ _id: leadId }, { $set: { status: "dealer_contacted", updatedAt: new Date() } });
+    // ★ V.1.4: แปลง string → ObjectId (MongoDB _id เป็น ObjectId)
+    const { ObjectId } = require("mongodb");
+    let leadQuery;
+    try { leadQuery = { _id: new ObjectId(leadId) }; } catch { leadQuery = { _id: leadId }; }
+    await db.collection("leads").updateOne(leadQuery, { $set: { status: "dealer_contacted", updatedAt: new Date() } });
     await replyToLine(event.replyToken, "รับทราบค่ะ! กรุณาติดต่อลูกค้าภายใน 4 ชม. นะคะ 🙏");
     return;
   }
@@ -1067,9 +1072,24 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
       analyzeChat(sourceId, userName, messageText, source.userId || null, source).catch(() => {});
       learnFromMessage(sourceId, userName, messageText, msg.type, source.type).catch(() => {});
       const isOptedOut = await checkOptedOut(sourceId).catch(() => false);
-      if (msg.text && event.replyToken && !isOptedOut) {
-        const config = await getBotConfig(sourceId);
-        if (await shouldAiReply(config, msg.text, userName, source)) aiReplyToLine(event, sourceId, userName, msg.text, config).catch(() => {});
+      if (!isOptedOut) {
+        // ★ V.1.4: Claim flow check สำหรับ LINE (เดิมทำเฉพาะ Meta)
+        const activeClaim = await getClaimSession(sourceId).catch(() => null);
+        if (msg.type === "image" && activeClaim && ["photo_requested","photo_rejected","photo_received"].includes(activeClaim.status)) {
+          // ลูกค้า LINE ส่งรูปเคลม
+          const imgBuffer = await downloadLineImage(msg.id).catch(() => null);
+          const imgUrl = imgBuffer ? `data:image/jpeg;base64,${imgBuffer.toString("base64")}` : null;
+          const claimReply = await processClaimMessage(sourceId, "line", "[รูปภาพ]", imgUrl, userName);
+          if (claimReply && event.replyToken) { await replyToLine(event.replyToken, claimReply); await saveMsg(sourceId, { role: "assistant", userName: DEFAULT_BOT_NAME, content: claimReply, messageType: "text", isAiReply: true }, "line"); }
+        } else if (msg.text && (activeClaim || isClaimIntent(msg.text))) {
+          // ลูกค้า LINE พิมพ์ข้อความเคลม
+          const claimReply = await processClaimMessage(sourceId, "line", msg.text, null, userName);
+          if (claimReply && event.replyToken) { await replyToLine(event.replyToken, claimReply); await saveMsg(sourceId, { role: "assistant", userName: DEFAULT_BOT_NAME, content: claimReply, messageType: "text", isAiReply: true }, "line"); }
+        } else if (msg.text && event.replyToken) {
+          // ปกติ — AI reply
+          const config = await getBotConfig(sourceId);
+          if (await shouldAiReply(config, msg.text, userName, source)) aiReplyToLine(event, sourceId, userName, msg.text, config).catch(() => {});
+        }
       }
     } catch (e) { console.error("[Listen] Error:", e.message); }
   }
@@ -1146,7 +1166,7 @@ app.get("/api/claims", requireAuth, async (req, res) => { const db = await getDB
 app.get("/api/claims/:id", requireAuth, async (req, res) => { const db = await getDB(); const { ObjectId } = require("mongodb"); const claim = await db.collection("manual_claims").findOne({ _id: new ObjectId(req.params.id) }); if (!claim) return res.status(404).json({ error: "Not found" }); res.json(claim); });
 
 // === KB API ===
-app.get("/api/km", async (req, res) => { const db = await getDB(); res.json(await db.collection(KB_COLL).find({}, { projection: { embedding: 0 } }).sort({ updatedAt: -1 }).toArray()); });
+app.get("/api/km", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection(KB_COLL).find({}, { projection: { embedding: 0 } }).sort({ updatedAt: -1 }).toArray()); }); // ★ V.1.4: เพิ่ม requireAuth + null check
 app.post("/api/km", requireAuth, express.json({ limit: "5mb" }), async (req, res) => {
   const { title, content, category, tags } = req.body;
   if (!title || !content) return res.status(400).json({ error: "title and content required" });
@@ -1163,12 +1183,12 @@ app.post("/api/kb-suggestions/:id/resolve", requireAuth, async (req, res) => { c
 
 // === Memory / Skills / Audit ===
 app.get("/api/memory/:sourceId", requireAuth, async (req, res) => { const db = await getDB(); const memory = await getMemory(req.params.sourceId); const lessons = await db.collection(SKILL_LESSONS_COLL).find({ sourceId: req.params.sourceId }).sort({ createdAt: -1 }).limit(10).toArray(); res.json({ memory: memory || {}, lessons, globalLessons: await getSkillLessons(10) }); });
-app.get("/api/skills/lessons", async (req, res) => { const db = await getDB(); res.json(await db.collection(SKILL_LESSONS_COLL).find({}).sort({ createdAt: -1 }).limit(50).toArray()); });
+app.get("/api/skills/lessons", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection(SKILL_LESSONS_COLL).find({}).sort({ createdAt: -1 }).limit(50).toArray()); }); // ★ V.1.4: เพิ่ม requireAuth + null check
 app.get("/api/audit-logs", requireAuth, async (req, res) => { const db = await getDB(); res.json(await db.collection(AUDIT_LOG_COLL).find({}).sort({ createdAt: -1 }).limit(parseInt(req.query.limit || "100")).toArray()); });
 app.get("/api/customers/duplicates", requireAuth, async (req, res) => { res.json({ groups: [], singlePlatform: 0, totalCustomers: 0, duplicateGroups: 0 }); }); // Simplified for brevity
 app.post("/api/customers/merge/consolidate", requireAuth, express.json(), async (req, res) => { res.json({ ok: true }); }); // Simplified
 app.get("/api/customers/churn-risk", requireAuth, async (req, res) => { res.json({ risks: [], total: 0 }); }); // Simplified
-app.get("/api/ab-results", async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("messages").aggregate([{ $match: { abVariant: { $exists: true }, role: "assistant" } }, { $group: { _id: "$abVariant", count: { $sum: 1 } } }]).toArray()); });
+app.get("/api/ab-results", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("messages").aggregate([{ $match: { abVariant: { $exists: true }, role: "assistant" } }, { $group: { _id: "$abVariant", count: { $sum: 1 } } }]).toArray()); }); // ★ V.1.4: เพิ่ม requireAuth
 app.post("/api/cache/invalidate", requireAuth, express.json(), (req, res) => { invalidateWPCache(req.body.key || "all"); res.json({ status: "ok" }); });
 app.get("/api/free-models", (req, res) => { const now = Date.now(); const cooldowns = {}; for (const [k, v] of Object.entries(aiChat.lightAICooldown)) { if (v > now) cooldowns[k] = { until: new Date(v).toISOString() }; } res.json({ count: aiChat.discoveredFreeModels().length, models: aiChat.discoveredFreeModels(), cooldowns, paidAI: PAID_AI }); });
 
