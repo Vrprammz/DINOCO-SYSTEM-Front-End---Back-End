@@ -18,10 +18,24 @@ export interface AuthUser {
  */
 export async function getAuthUser(): Promise<AuthUser | null> {
   if (DEV_MODE) {
+    // ดึง account แรกจาก DB ให้ตรงกับ account ที่ seed ไว้
+    try {
+      const devDb = await getDB();
+      const firstAccount = await devDb.collection("accounts").findOne({}, { sort: { createdAt: 1 } });
+      if (firstAccount) {
+        return {
+          id: String(firstAccount._id),
+          name: firstAccount.name || "DINOCO Admin",
+          email: firstAccount.email || "admin@dinoco.in.th",
+          image: firstAccount.image || null,
+          plan: "free",
+        };
+      }
+    } catch {}
     return {
       id: "dev-user",
-      name: "Dev User",
-      email: "dev@localhost",
+      name: "DINOCO Admin",
+      email: "admin@dinoco.in.th",
       image: null,
       plan: "free",
     };
