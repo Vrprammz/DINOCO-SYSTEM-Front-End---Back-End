@@ -487,7 +487,12 @@ export default function Sidebar() {
             <img
               src="https://dinoco.in.th/wp-content/uploads/elementor/thumbs/800x800-riocrwy2320s7fp9ckfr60v72hcgkotli7ipsiol48.png"
               alt="DINOCO"
-              className="h-8 object-contain"
+              className="h-8 object-contain dark:hidden"
+            />
+            <img
+              src="https://www.dinoco.in.th/wp-content/uploads/2026/01/sss.png"
+              alt="DINOCO"
+              className="h-8 object-contain hidden dark:block"
             />
           </div>
 
