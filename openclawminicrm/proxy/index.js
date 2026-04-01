@@ -1362,18 +1362,25 @@ ${templates.map(t => `- ${t.templateId}: "${t.message}"`).join("\n") || "(ยั
       const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2048, temperature: 0.2, system: bossPrompt, messages: [{ role: "user", content }] }),
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 2048, temperature: 0.2, system: bossPrompt,
+          messages: [
+            { role: "user", content },
+            { role: "assistant", content: "{" },
+          ]
+        }),
         signal: AbortSignal.timeout(30000),
       });
       const data = await aiRes.json();
-      analysis = data.content?.[0]?.text;
+      // Claude prefill เริ่ม "{" → response ไม่มี { นำหน้า ต้องเติมกลับ
+      const rawText = data.content?.[0]?.text || "";
+      analysis = rawText.startsWith("{") ? rawText : "{" + rawText;
     } else if (googleKey) {
       const parts = [];
       if (imageBase64) parts.push({ inlineData: { mimeType: "image/jpeg", data: imageBase64 } });
       parts.push({ text: command || "วิเคราะห์รูปนี้ แล้วบอกว่า AI ทำอะไรผิด ควรสร้างกฎอะไร" });
       const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${googleKey}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ system_instruction: { parts: [{ text: bossPrompt }] }, contents: [{ role: "user", parts }], generationConfig: { temperature: 0.2, maxOutputTokens: 2048 } }),
+        body: JSON.stringify({ system_instruction: { parts: [{ text: bossPrompt }] }, contents: [{ role: "user", parts }], generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: "application/json" } }),
         signal: AbortSignal.timeout(30000),
       });
       const data = await aiRes.json();
