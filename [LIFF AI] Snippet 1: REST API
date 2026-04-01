@@ -1,0 +1,811 @@
+/**
+ * File: [LIFF AI] Snippet 1: REST API
+ * Description: REST API + Auth สำหรับ LIFF AI Command Center
+ * Version: V.1.0
+ * DB_ID: 1180
+ *
+ * Dependencies:
+ *   - [B2B] Snippet 15: DINOCO_JWT (encode/verify)
+ *   - [B2B] Snippet 1: b2b_get_dist_by_group()
+ *   - Agent proxy (agent:3000) สำหรับ Lead data
+ *
+ * Auth: LIFF + LINE ID Token verify → JWT session (X-LIFF-AI-Token)
+ * Namespace: /wp-json/liff-ai/v1/
+ *
+ * Roles:
+ *   admin  = WP user ที่มี manage_options + line_user_id meta
+ *   dealer = WP user ที่มี line_user_id meta + linked distributor (user meta 'linked_distributor_id')
+ *            หรือ distributor CPT ที่มี ACF 'owner_line_uid' = LINE UID
+ */
+
+// ══════════════════════════════════════════════════════════════
+// 0. CONSTANTS — Auto-generate ถ้าไม่มี
+// ══════════════════════════════════════════════════════════════
+
+if ( ! defined( 'LIFF_AI_SECRET_KEY' ) ) {
+    $stored = get_option( 'liff_ai_secret_key' );
+    if ( ! $stored ) {
+        $stored = wp_generate_password( 64, false );
+        update_option( 'liff_ai_secret_key', $stored, false );
+    }
+    define( 'LIFF_AI_SECRET_KEY', $stored );
+}
+
+if ( ! defined( 'LIFF_AI_JWT_SECRET' ) ) {
+    $stored = get_option( 'liff_ai_jwt_secret' );
+    if ( ! $stored ) {
+        $stored = wp_generate_password( 64, false );
+        update_option( 'liff_ai_jwt_secret', $stored, false );
+    }
+    define( 'LIFF_AI_JWT_SECRET', $stored );
+}
+
+if ( ! defined( 'LIFF_AI_AGENT_URL' ) ) {
+    define( 'LIFF_AI_AGENT_URL', 'http://agent:3000' );
+}
+
+if ( ! defined( 'LIFF_AI_AGENT_KEY' ) ) {
+    $stored = get_option( 'liff_ai_agent_key', '' );
+    if ( $stored ) {
+        define( 'LIFF_AI_AGENT_KEY', $stored );
+    } else {
+        define( 'LIFF_AI_AGENT_KEY', '' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// 1. REGISTER REST ROUTES — /wp-json/liff-ai/v1/
+// ══════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function () {
+    $ns = 'liff-ai/v1';
+
+    // ── Public ──
+    register_rest_route( $ns, '/auth', array(
+        'methods'             => 'POST',
+        'callback'            => 'liff_ai_rest_auth',
+        'permission_callback' => '__return_true',
+    ) );
+
+    // ── Admin only ──
+    register_rest_route( $ns, '/dashboard', array(
+        'methods'             => 'GET',
+        'callback'            => 'liff_ai_rest_dashboard',
+        'permission_callback' => 'liff_ai_perm_admin',
+    ) );
+
+    // ── Dealer only ──
+    register_rest_route( $ns, '/dealer-dashboard', array(
+        'methods'             => 'GET',
+        'callback'            => 'liff_ai_rest_dealer_dashboard',
+        'permission_callback' => 'liff_ai_perm_dealer',
+    ) );
+
+    // ── Admin + Dealer ──
+    register_rest_route( $ns, '/leads', array(
+        'methods'             => 'GET',
+        'callback'            => 'liff_ai_rest_leads',
+        'permission_callback' => 'liff_ai_perm_any',
+    ) );
+    register_rest_route( $ns, '/lead/(?P<id>[a-f0-9]+)', array(
+        'methods'             => 'GET',
+        'callback'            => 'liff_ai_rest_lead_detail',
+        'permission_callback' => 'liff_ai_perm_any',
+    ) );
+    register_rest_route( $ns, '/lead/(?P<id>[a-f0-9]+)/accept', array(
+        'methods'             => 'POST',
+        'callback'            => 'liff_ai_rest_lead_accept',
+        'permission_callback' => 'liff_ai_perm_dealer',
+    ) );
+    register_rest_route( $ns, '/lead/(?P<id>[a-f0-9]+)/note', array(
+        'methods'             => 'POST',
+        'callback'            => 'liff_ai_rest_lead_note',
+        'permission_callback' => 'liff_ai_perm_any',
+    ) );
+    register_rest_route( $ns, '/lead/(?P<id>[a-f0-9]+)/status', array(
+        'methods'             => 'POST',
+        'callback'            => 'liff_ai_rest_lead_status',
+        'permission_callback' => 'liff_ai_perm_admin',
+    ) );
+
+    // ── Admin only: Claims ──
+    register_rest_route( $ns, '/claims', array(
+        'methods'             => 'GET',
+        'callback'            => 'liff_ai_rest_claims',
+        'permission_callback' => 'liff_ai_perm_admin',
+    ) );
+    register_rest_route( $ns, '/claim/(?P<id>[a-f0-9]+)', array(
+        'methods'             => 'GET',
+        'callback'            => 'liff_ai_rest_claim_detail',
+        'permission_callback' => 'liff_ai_perm_admin',
+    ) );
+    register_rest_route( $ns, '/claim/(?P<id>[a-f0-9]+)/status', array(
+        'methods'             => 'POST',
+        'callback'            => 'liff_ai_rest_claim_status',
+        'permission_callback' => 'liff_ai_perm_admin',
+    ) );
+} );
+
+
+// ══════════════════════════════════════════════════════════════
+// 2. AUTH ENDPOINT — POST /liff-ai/v1/auth
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'liff_ai_rest_auth' ) ) {
+    function liff_ai_rest_auth( WP_REST_Request $request ) {
+        // Rate limit: 20 per 5 min per IP
+        $ip       = isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : 'unknown';
+        $rate_key = 'liff_ai_auth_' . md5( $ip );
+        $attempts = intval( get_transient( $rate_key ) );
+        if ( $attempts > 20 ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'Too many attempts' ), 429 );
+        }
+        set_transient( $rate_key, $attempts + 1, 300 );
+
+        $line_uid = sanitize_text_field( $request->get_param( 'line_user_id' ) );
+        $id_token = sanitize_text_field( $request->get_param( 'id_token' ) );
+
+        if ( empty( $line_uid ) ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ต้องเปิดผ่าน LINE เท่านั้น' ), 200 );
+        }
+
+        // ── Verify LINE ID Token (primary auth layer) ──
+        if ( ! empty( $id_token ) ) {
+            $liff_channel_id = '';
+            if ( defined( 'B2B_LIFF_ID' ) ) {
+                $liff_channel_id = preg_replace( '/-.*$/', '', B2B_LIFF_ID );
+            }
+            if ( $liff_channel_id ) {
+                $verify_resp = wp_remote_post( 'https://api.line.me/oauth2/v2.1/verify', array(
+                    'body'    => array( 'id_token' => $id_token, 'client_id' => $liff_channel_id ),
+                    'timeout' => 10,
+                ) );
+                if ( ! is_wp_error( $verify_resp ) ) {
+                    $verify_body = json_decode( wp_remote_retrieve_body( $verify_resp ), true );
+                    if ( ! empty( $verify_body['sub'] ) ) {
+                        $line_uid = sanitize_text_field( $verify_body['sub'] );
+                    } else {
+                        return new WP_REST_Response( array(
+                            'authorized' => false,
+                            'message'    => 'ยืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่',
+                        ), 200 );
+                    }
+                }
+            }
+        }
+
+        // ── Determine role ──
+        $role      = '';
+        $dealer_id = 0;
+        $name      = '';
+
+        // 1) Check WP admin user
+        $admin_users = get_users( array(
+            'meta_key'   => 'line_user_id',
+            'meta_value' => $line_uid,
+            'role'       => 'administrator',
+            'number'     => 1,
+        ) );
+        if ( ! empty( $admin_users ) ) {
+            $role = 'admin';
+            $name = $admin_users[0]->display_name;
+        }
+
+        // 2) Check distributor CPT (ACF field owner_line_uid)
+        if ( empty( $role ) ) {
+            $dist_posts = get_posts( array(
+                'post_type'      => 'distributor',
+                'posts_per_page' => 1,
+                'post_status'    => 'publish',
+                'meta_query'     => array( array(
+                    'key'   => 'owner_line_uid',
+                    'value' => $line_uid,
+                ) ),
+            ) );
+            if ( ! empty( $dist_posts ) ) {
+                $role      = 'dealer';
+                $dealer_id = $dist_posts[0]->ID;
+                $name      = get_the_title( $dist_posts[0]->ID );
+            }
+        }
+
+        // 3) Check WP user linked to distributor (user meta linked_distributor_id)
+        if ( empty( $role ) ) {
+            $wp_users = get_users( array(
+                'meta_key'   => 'line_user_id',
+                'meta_value' => $line_uid,
+                'number'     => 1,
+            ) );
+            if ( ! empty( $wp_users ) ) {
+                $linked = get_user_meta( $wp_users[0]->ID, 'linked_distributor_id', true );
+                if ( $linked && get_post_status( $linked ) === 'publish' ) {
+                    $role      = 'dealer';
+                    $dealer_id = intval( $linked );
+                    $name      = get_the_title( $dealer_id );
+                }
+            }
+        }
+
+        // Not found
+        if ( empty( $role ) ) {
+            return new WP_REST_Response( array(
+                'authorized' => false,
+                'message'    => 'ไม่พบสิทธิ์ในระบบ กรุณาติดต่อแอดมิน',
+            ), 200 );
+        }
+
+        // ── Issue JWT ──
+        $payload = array(
+            'uid'       => $line_uid,
+            'role'      => $role,
+            'dealer_id' => $dealer_id,
+        );
+        $token = '';
+        if ( class_exists( 'DINOCO_JWT' ) ) {
+            $token = DINOCO_JWT::create( $payload, 7200 );
+        } else {
+            // Fallback: transient-based token
+            $token = bin2hex( random_bytes( 32 ) );
+            $payload['created'] = time();
+            set_transient( 'liff_ai_sess_' . $token, $payload, 7200 );
+        }
+
+        liff_ai_log( sprintf( '[Auth] OK uid=%s role=%s dealer=%d', $line_uid, $role, $dealer_id ) );
+
+        return new WP_REST_Response( array(
+            'authorized' => true,
+            'token'      => $token,
+            'role'       => $role,
+            'dealer_id'  => $dealer_id,
+            'name'       => $name,
+        ), 200 );
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// 3. TOKEN VERIFY MIDDLEWARE
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'liff_ai_verify_token' ) ) {
+    /**
+     * Verify JWT token จาก X-LIFF-AI-Token header
+     * @return array|WP_Error  { uid, role, dealer_id } หรือ WP_Error
+     */
+    function liff_ai_verify_token( WP_REST_Request $request ) {
+        // WP admin session fallback
+        if ( current_user_can( 'manage_options' ) ) {
+            $uid = get_user_meta( get_current_user_id(), 'line_user_id', true );
+            return array( 'uid' => $uid ?: 'wp_admin', 'role' => 'admin', 'dealer_id' => 0 );
+        }
+
+        $token = $request->get_header( 'X-LIFF-AI-Token' );
+        if ( empty( $token ) ) {
+            $token = sanitize_text_field( $request->get_param( '_token' ) );
+        }
+        if ( empty( $token ) ) {
+            return new WP_Error( 'no_token', 'ไม่พบ token กรุณาเข้าสู่ระบบใหม่', array( 'status' => 401 ) );
+        }
+
+        // JWT verify
+        if ( class_exists( 'DINOCO_JWT' ) && strpos( $token, '.' ) !== false ) {
+            $payload = DINOCO_JWT::verify( $token );
+            if ( $payload && ! empty( $payload['role'] ) ) {
+                return array(
+                    'uid'       => $payload['uid'] ?? '',
+                    'role'      => $payload['role'],
+                    'dealer_id' => intval( $payload['dealer_id'] ?? 0 ),
+                );
+            }
+            return new WP_Error( 'invalid_token', 'Token หมดอายุ กรุณาเข้าสู่ระบบใหม่', array( 'status' => 401 ) );
+        }
+
+        // Transient fallback
+        $clean = preg_replace( '/[^a-f0-9]/i', '', $token );
+        if ( empty( $clean ) ) {
+            return new WP_Error( 'invalid_token', 'Token ไม่ถูกต้อง', array( 'status' => 401 ) );
+        }
+        $data = get_transient( 'liff_ai_sess_' . $clean );
+        if ( ! $data || empty( $data['role'] ) ) {
+            return new WP_Error( 'expired_token', 'Token หมดอายุ กรุณาเข้าสู่ระบบใหม่', array( 'status' => 401 ) );
+        }
+        return $data;
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// 4. PERMISSION CALLBACKS
+// ══════════════════════════════════════════════════════════════
+
+function liff_ai_perm_admin( WP_REST_Request $request ) {
+    $auth = liff_ai_verify_token( $request );
+    if ( is_wp_error( $auth ) ) return $auth;
+    if ( $auth['role'] !== 'admin' ) {
+        return new WP_Error( 'forbidden', 'ไม่มีสิทธิ์เข้าถึง', array( 'status' => 403 ) );
+    }
+    $request->set_param( '_auth', $auth );
+    return true;
+}
+
+function liff_ai_perm_dealer( WP_REST_Request $request ) {
+    $auth = liff_ai_verify_token( $request );
+    if ( is_wp_error( $auth ) ) return $auth;
+    if ( $auth['role'] !== 'dealer' && $auth['role'] !== 'admin' ) {
+        return new WP_Error( 'forbidden', 'ไม่มีสิทธิ์เข้าถึง', array( 'status' => 403 ) );
+    }
+    $request->set_param( '_auth', $auth );
+    return true;
+}
+
+function liff_ai_perm_any( WP_REST_Request $request ) {
+    $auth = liff_ai_verify_token( $request );
+    if ( is_wp_error( $auth ) ) return $auth;
+    $request->set_param( '_auth', $auth );
+    return true;
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// 5. AGENT PROXY — เรียก Agent API (agent:3000)
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'liff_ai_call_agent' ) ) {
+    /**
+     * เรียก Agent API (MongoDB-backed)
+     * @param string $method   GET|POST|PUT|DELETE
+     * @param string $endpoint เช่น /api/leads
+     * @param array  $body     Body สำหรับ POST/PUT
+     * @return array|WP_Error
+     */
+    function liff_ai_call_agent( $method, $endpoint, $body = null ) {
+        $base_url = LIFF_AI_AGENT_URL;
+        $url = rtrim( $base_url, '/' ) . '/' . ltrim( $endpoint, '/' );
+
+        $args = array(
+            'method'  => strtoupper( $method ),
+            'headers' => array(
+                'Content-Type'  => 'application/json',
+                'Authorization' => 'Bearer ' . LIFF_AI_AGENT_KEY,
+            ),
+            'timeout' => 10,
+        );
+
+        if ( $body && in_array( $args['method'], array( 'POST', 'PUT', 'PATCH' ), true ) ) {
+            $args['body'] = wp_json_encode( $body );
+        }
+
+        // URL params สำหรับ GET
+        if ( $body && $args['method'] === 'GET' ) {
+            $url = add_query_arg( $body, $url );
+        }
+
+        $response = wp_remote_request( $url, $args );
+
+        if ( is_wp_error( $response ) ) {
+            // Fallback: try localhost
+            if ( strpos( $base_url, 'agent:' ) !== false ) {
+                $fallback_url = str_replace( 'agent:', 'localhost:', $url );
+                $response = wp_remote_request( $fallback_url, $args );
+                if ( is_wp_error( $response ) ) {
+                    return $response;
+                }
+            } else {
+                return $response;
+            }
+        }
+
+        $code = wp_remote_retrieve_response_code( $response );
+        $body_str = wp_remote_retrieve_body( $response );
+        $data = json_decode( $body_str, true );
+
+        if ( $code >= 400 ) {
+            return new WP_Error( 'agent_error', $data['message'] ?? 'Agent error', array( 'status' => $code ) );
+        }
+
+        return $data ?: array();
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// 6. DASHBOARD ENDPOINTS
+// ══════════════════════════════════════════════════════════════
+
+// ── GET /dashboard (Admin) ──
+if ( ! function_exists( 'liff_ai_rest_dashboard' ) ) {
+    function liff_ai_rest_dashboard( WP_REST_Request $request ) {
+        $data = liff_ai_call_agent( 'GET', '/api/advisor/sources-changed', array(
+            'since' => gmdate( 'Y-m-d\TH:i:s\Z', strtotime( '-24 hours' ) ),
+        ) );
+
+        // Lead stats จาก Agent
+        $lead_stats = liff_ai_call_agent( 'GET', '/api/leads', array(
+            'limit' => 0,
+            'stats' => 'true',
+        ) );
+
+        // Claim stats จาก WP
+        $claim_pending = new WP_Query( array(
+            'post_type'      => 'warranty_claim',
+            'post_status'    => 'publish',
+            'posts_per_page' => -1,
+            'meta_query'     => array( array(
+                'key'     => 'claim_status',
+                'value'   => array( 'pending', 'reviewing', 'approved' ),
+                'compare' => 'IN',
+            ) ),
+            'fields'         => 'ids',
+        ) );
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'data'    => array(
+                'active_conversations' => is_array( $data ) ? count( $data['sources'] ?? array() ) : 0,
+                'lead_stats'           => is_array( $lead_stats ) ? ( $lead_stats['stats'] ?? array() ) : array(),
+                'pending_claims'       => $claim_pending->found_posts,
+                'updated_at'           => current_time( 'c' ),
+            ),
+        ), 200 );
+    }
+}
+
+// ── GET /dealer-dashboard ──
+if ( ! function_exists( 'liff_ai_rest_dealer_dashboard' ) ) {
+    function liff_ai_rest_dealer_dashboard( WP_REST_Request $request ) {
+        $auth      = $request->get_param( '_auth' );
+        $dealer_id = intval( $auth['dealer_id'] ?? 0 );
+
+        if ( ! $dealer_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบข้อมูลร้านค้า' ), 200 );
+        }
+
+        // ดึง lead ของตัวแทนนี้จาก Agent
+        $leads = liff_ai_call_agent( 'GET', '/api/leads', array(
+            'dealerId' => strval( $dealer_id ),
+            'limit'    => 50,
+        ) );
+
+        $leads_data = is_array( $leads ) ? ( $leads['data'] ?? array() ) : array();
+
+        // นับสถิติ
+        $new_count     = 0;
+        $active_count  = 0;
+        $pending_leads = array();
+        $active_statuses = array( 'checking_contact', 'dealer_contacted', 'waiting_order', 'order_placed', 'waiting_delivery', 'delivered', 'waiting_install', 'installed' );
+
+        foreach ( $leads_data as $lead ) {
+            $status = $lead['status'] ?? '';
+            if ( in_array( $status, array( 'lead_created', 'dealer_notified' ), true ) ) {
+                $new_count++;
+                $pending_leads[] = $lead;
+            }
+            if ( in_array( $status, $active_statuses, true ) ) {
+                $active_count++;
+            }
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'data'    => array(
+                'dealer_id'     => $dealer_id,
+                'dealer_name'   => get_the_title( $dealer_id ),
+                'new_leads'     => $new_count,
+                'active_leads'  => $active_count,
+                'pending_leads' => array_slice( $pending_leads, 0, 10 ),
+                'recent_leads'  => array_slice( $leads_data, 0, 20 ),
+                'updated_at'    => current_time( 'c' ),
+            ),
+        ), 200 );
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// 7. LEAD ENDPOINTS
+// ══════════════════════════════════════════════════════════════
+
+// ── GET /leads ──
+if ( ! function_exists( 'liff_ai_rest_leads' ) ) {
+    function liff_ai_rest_leads( WP_REST_Request $request ) {
+        $auth   = $request->get_param( '_auth' );
+        $status = sanitize_text_field( $request->get_param( 'status' ) );
+        $page   = max( 1, intval( $request->get_param( 'page' ) ) );
+        $limit  = min( 50, max( 1, intval( $request->get_param( 'limit' ) ?: 20 ) ) );
+
+        $params = array(
+            'page'  => $page,
+            'limit' => $limit,
+        );
+        if ( $status ) {
+            $params['status'] = $status;
+        }
+
+        // Dealer = own leads only
+        if ( $auth['role'] === 'dealer' ) {
+            $params['dealerId'] = strval( $auth['dealer_id'] );
+        }
+
+        $result = liff_ai_call_agent( 'GET', '/api/leads', $params );
+        if ( is_wp_error( $result ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'ไม่สามารถเชื่อมต่อระบบ Lead ได้',
+            ), 200 );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'data'    => $result['data'] ?? array(),
+            'total'   => $result['total'] ?? 0,
+            'page'    => $page,
+        ), 200 );
+    }
+}
+
+// ── GET /lead/{id} ──
+if ( ! function_exists( 'liff_ai_rest_lead_detail' ) ) {
+    function liff_ai_rest_lead_detail( WP_REST_Request $request ) {
+        $auth = $request->get_param( '_auth' );
+        $id   = sanitize_text_field( $request->get_param( 'id' ) );
+
+        $result = liff_ai_call_agent( 'GET', '/api/leads/' . $id );
+        if ( is_wp_error( $result ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบข้อมูล Lead' ), 200 );
+        }
+
+        $lead = $result['data'] ?? $result;
+
+        // Dealer สามารถดูได้เฉพาะ lead ของตัวเอง
+        if ( $auth['role'] === 'dealer' ) {
+            $lead_dealer = strval( $lead['dealerId'] ?? '' );
+            if ( $lead_dealer !== strval( $auth['dealer_id'] ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่มีสิทธิ์ดู Lead นี้' ), 403 );
+            }
+        }
+
+        return new WP_REST_Response( array( 'success' => true, 'data' => $lead ), 200 );
+    }
+}
+
+// ── POST /lead/{id}/accept (Dealer กดรับ) ──
+if ( ! function_exists( 'liff_ai_rest_lead_accept' ) ) {
+    function liff_ai_rest_lead_accept( WP_REST_Request $request ) {
+        $auth = $request->get_param( '_auth' );
+        $id   = sanitize_text_field( $request->get_param( 'id' ) );
+
+        // ตรวจว่า lead เป็นของ dealer นี้
+        $lead_data = liff_ai_call_agent( 'GET', '/api/leads/' . $id );
+        if ( is_wp_error( $lead_data ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบ Lead' ), 200 );
+        }
+        $lead = $lead_data['data'] ?? $lead_data;
+        if ( strval( $lead['dealerId'] ?? '' ) !== strval( $auth['dealer_id'] ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่มีสิทธิ์รับ Lead นี้' ), 403 );
+        }
+
+        // Transition: dealer_notified → checking_contact
+        $result = liff_ai_call_agent( 'POST', '/api/leads/' . $id . '/status', array(
+            'status'   => 'checking_contact',
+            'metadata' => array(
+                'accepted_by' => $auth['uid'],
+                'accepted_at' => current_time( 'c' ),
+            ),
+        ) );
+
+        if ( is_wp_error( $result ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่สามารถรับ Lead ได้' ), 200 );
+        }
+
+        liff_ai_log( sprintf( '[Lead] Accepted id=%s by dealer=%d', $id, $auth['dealer_id'] ) );
+
+        return new WP_REST_Response( array( 'success' => true, 'message' => 'รับ Lead สำเร็จ' ), 200 );
+    }
+}
+
+// ── POST /lead/{id}/note ──
+if ( ! function_exists( 'liff_ai_rest_lead_note' ) ) {
+    function liff_ai_rest_lead_note( WP_REST_Request $request ) {
+        $auth = $request->get_param( '_auth' );
+        $id   = sanitize_text_field( $request->get_param( 'id' ) );
+        $note = sanitize_textarea_field( $request->get_param( 'note' ) );
+
+        if ( empty( $note ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'กรุณากรอกหมายเหตุ' ), 200 );
+        }
+
+        // Dealer ownership check
+        if ( $auth['role'] === 'dealer' ) {
+            $lead_data = liff_ai_call_agent( 'GET', '/api/leads/' . $id );
+            if ( is_wp_error( $lead_data ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบ Lead' ), 200 );
+            }
+            $lead = $lead_data['data'] ?? $lead_data;
+            if ( strval( $lead['dealerId'] ?? '' ) !== strval( $auth['dealer_id'] ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่มีสิทธิ์' ), 403 );
+            }
+        }
+
+        $result = liff_ai_call_agent( 'POST', '/api/leads/' . $id . '/note', array(
+            'note'  => $note,
+            'by'    => $auth['role'] === 'dealer' ? get_the_title( $auth['dealer_id'] ) : 'Admin',
+            'uid'   => $auth['uid'],
+            'at'    => current_time( 'c' ),
+        ) );
+
+        if ( is_wp_error( $result ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'บันทึกหมายเหตุไม่สำเร็จ' ), 200 );
+        }
+
+        return new WP_REST_Response( array( 'success' => true, 'message' => 'บันทึกหมายเหตุสำเร็จ' ), 200 );
+    }
+}
+
+// ── POST /lead/{id}/status (Admin only) ──
+if ( ! function_exists( 'liff_ai_rest_lead_status' ) ) {
+    function liff_ai_rest_lead_status( WP_REST_Request $request ) {
+        $auth       = $request->get_param( '_auth' );
+        $id         = sanitize_text_field( $request->get_param( 'id' ) );
+        $new_status = sanitize_text_field( $request->get_param( 'status' ) );
+
+        $valid_statuses = array(
+            'lead_created', 'dealer_notified', 'checking_contact',
+            'dealer_contacted', 'dealer_no_response',
+            'waiting_order', 'order_placed',
+            'waiting_delivery', 'delivered',
+            'waiting_install', 'installed',
+            'satisfaction_checked',
+            'closed_satisfied', 'closed_lost', 'closed_cancelled',
+            'admin_escalated', 'dormant',
+        );
+
+        if ( ! in_array( $new_status, $valid_statuses, true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'สถานะไม่ถูกต้อง' ), 200 );
+        }
+
+        $result = liff_ai_call_agent( 'POST', '/api/leads/' . $id . '/status', array(
+            'status'   => $new_status,
+            'metadata' => array(
+                'changed_by' => 'admin',
+                'uid'        => $auth['uid'],
+            ),
+        ) );
+
+        if ( is_wp_error( $result ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'อัพเดทสถานะไม่สำเร็จ' ), 200 );
+        }
+
+        liff_ai_log( sprintf( '[Lead] Status changed id=%s to=%s by admin', $id, $new_status ) );
+
+        return new WP_REST_Response( array( 'success' => true, 'message' => 'อัพเดทสถานะสำเร็จ' ), 200 );
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// 8. CLAIM ENDPOINTS
+// ══════════════════════════════════════════════════════════════
+
+// ── GET /claims ──
+if ( ! function_exists( 'liff_ai_rest_claims' ) ) {
+    function liff_ai_rest_claims( WP_REST_Request $request ) {
+        $status = sanitize_text_field( $request->get_param( 'status' ) );
+        $page   = max( 1, intval( $request->get_param( 'page' ) ) );
+        $limit  = min( 50, max( 1, intval( $request->get_param( 'limit' ) ?: 20 ) ) );
+
+        $args = array(
+            'post_type'      => 'warranty_claim',
+            'post_status'    => 'publish',
+            'posts_per_page' => $limit,
+            'paged'          => $page,
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+        );
+
+        if ( $status ) {
+            $args['meta_query'] = array( array(
+                'key'   => 'claim_status',
+                'value' => $status,
+            ) );
+        }
+
+        $query  = new WP_Query( $args );
+        $claims = array();
+
+        foreach ( $query->posts as $post ) {
+            $claims[] = array(
+                'id'           => $post->ID,
+                'ticket'       => get_field( 'ticket_number', $post->ID ) ?: get_post_meta( $post->ID, 'ticket_number', true ),
+                'customer'     => get_field( 'customer_name', $post->ID ) ?: get_the_title( $post->ID ),
+                'product'      => get_field( 'product_name', $post->ID ) ?: '',
+                'status'       => get_field( 'claim_status', $post->ID ) ?: 'pending',
+                'symptoms'     => get_field( 'symptoms', $post->ID ) ?: '',
+                'phone'        => get_field( 'phone', $post->ID ) ?: '',
+                'created_at'   => get_the_date( 'c', $post->ID ),
+                'updated_at'   => get_the_modified_date( 'c', $post->ID ),
+            );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'data'    => $claims,
+            'total'   => $query->found_posts,
+            'page'    => $page,
+        ), 200 );
+    }
+}
+
+// ── GET /claim/{id} ──
+if ( ! function_exists( 'liff_ai_rest_claim_detail' ) ) {
+    function liff_ai_rest_claim_detail( WP_REST_Request $request ) {
+        $id   = sanitize_text_field( $request->get_param( 'id' ) );
+        $post = get_post( intval( $id ) );
+
+        if ( ! $post || $post->post_type !== 'warranty_claim' ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบใบเคลม' ), 200 );
+        }
+
+        $claim = array(
+            'id'           => $post->ID,
+            'ticket'       => get_field( 'ticket_number', $post->ID ) ?: get_post_meta( $post->ID, 'ticket_number', true ),
+            'customer'     => get_field( 'customer_name', $post->ID ) ?: get_the_title( $post->ID ),
+            'product'      => get_field( 'product_name', $post->ID ) ?: '',
+            'model'        => get_field( 'motorcycle_model', $post->ID ) ?: '',
+            'status'       => get_field( 'claim_status', $post->ID ) ?: 'pending',
+            'symptoms'     => get_field( 'symptoms', $post->ID ) ?: '',
+            'phone'        => get_field( 'phone', $post->ID ) ?: '',
+            'photos'       => get_field( 'claim_photos', $post->ID ) ?: array(),
+            'admin_note'   => get_field( 'admin_note', $post->ID ) ?: '',
+            'resolution'   => get_field( 'resolution', $post->ID ) ?: '',
+            'created_at'   => get_the_date( 'c', $post->ID ),
+            'updated_at'   => get_the_modified_date( 'c', $post->ID ),
+        );
+
+        return new WP_REST_Response( array( 'success' => true, 'data' => $claim ), 200 );
+    }
+}
+
+// ── POST /claim/{id}/status ──
+if ( ! function_exists( 'liff_ai_rest_claim_status' ) ) {
+    function liff_ai_rest_claim_status( WP_REST_Request $request ) {
+        $auth       = $request->get_param( '_auth' );
+        $id         = intval( $request->get_param( 'id' ) );
+        $new_status = sanitize_text_field( $request->get_param( 'status' ) );
+        $note       = sanitize_textarea_field( $request->get_param( 'note' ) );
+
+        $valid = array( 'pending', 'reviewing', 'approved', 'rejected', 'processing', 'shipped', 'completed', 'cancelled' );
+        if ( ! in_array( $new_status, $valid, true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'สถานะไม่ถูกต้อง' ), 200 );
+        }
+
+        $post = get_post( $id );
+        if ( ! $post || $post->post_type !== 'warranty_claim' ) {
+            return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบใบเคลม' ), 200 );
+        }
+
+        update_field( 'claim_status', $new_status, $id );
+        if ( $note ) {
+            $existing = get_field( 'admin_note', $id ) ?: '';
+            $timestamp = current_time( 'Y-m-d H:i' );
+            $updated = $existing . "\n[{$timestamp}] {$note}";
+            update_field( 'admin_note', trim( $updated ), $id );
+        }
+
+        liff_ai_log( sprintf( '[Claim] Status changed id=%d to=%s', $id, $new_status ) );
+
+        return new WP_REST_Response( array( 'success' => true, 'message' => 'อัพเดทสถานะเคลมสำเร็จ' ), 200 );
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// 9. HELPER: LOGGING
+// ══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'liff_ai_log' ) ) {
+    function liff_ai_log( $msg ) {
+        if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+            error_log( '[LIFF-AI] ' . $msg );
+        }
+    }
+}

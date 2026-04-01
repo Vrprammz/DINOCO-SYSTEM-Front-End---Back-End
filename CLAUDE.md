@@ -29,6 +29,7 @@ DINOCO System is a **WordPress-based motorcycle warranty management platform** s
 | `[b2f_admin_orders_tab]` | B2F Orders tab (embedded in Admin Dashboard) |
 | `[b2f_admin_makers_tab]` | B2F Makers management tab |
 | `[b2f_admin_credit_tab]` | B2F Credit tracking tab |
+| `[liff_ai_page]` | LIFF AI Command Center (Lead management for dealers + admin) |
 
 ## REST API Endpoints (B2B)
 
@@ -37,6 +38,10 @@ All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, 
 ## REST API Endpoints (B2F)
 
 All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `maker-deliver`, `approve-reschedule`, `receive-goods`, `record-payment`, `reject-lot`, `po-complete`, `dashboard-stats`, `po-history`.
+
+## REST API Endpoints (LIFF AI)
+
+All under `/wp-json/liff-ai/v1/`: `auth`, `dashboard`, `dealer-dashboard`, `leads`, `lead/{id}`, `lead/{id}/accept`, `lead/{id}/note`, `lead/{id}/status`, `claims`, `claim/{id}`, `claim/{id}/status`.
 
 ## REST API Endpoints (MCP Bridge)
 
@@ -118,3 +123,13 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Flash cron `b2b_flash_tracking_cron` ใช้ fallback interval `everytwohours` (จาก WP Fastest Cache) เพราะ `every_2hr_b2b` ไม่ load ใน REST context + DISABLE_WP_CRON=true
   - Flash Webhook ต้องกดตั้งค่าใน B2B Admin → Flash → ตั้งค่า Webhook ทุกครั้งที่เปลี่ยน API key/domain
   - `/debug-flash/{ticket_id}` (admin only ใน B2B Snippet 5) — ดึง Flash Routes API + force update สถานะ + schedule cron
+- **LIFF AI Snippets** (DB_ID 1180-1181):
+  - Snippet 1 (1180): REST API — Auth (LINE ID Token verify + JWT) + Lead/Claim endpoints + Agent proxy (`liff_ai_call_agent`)
+  - Snippet 2 (1181): Frontend — shortcode `[liff_ai_page]` route `/ai-center/` + SPA-like pages (dashboard, dealer, lead detail, claim)
+- **LIFF AI Architecture**: ตัวแทน (dealer) เปิด LIFF → verify id_token → ค้นหา distributor CPT (`owner_line_uid` field) หรือ WP user (`linked_distributor_id` meta) → issue JWT → ใช้ `X-LIFF-AI-Token` header. Lead data อยู่ใน MongoDB (ผ่าน Agent proxy:3000). Claim data อยู่ใน WP (warranty_claim CPT).
+- **LIFF AI Constants**: `LIFF_AI_SECRET_KEY`, `LIFF_AI_JWT_SECRET` (auto-generate เก็บ wp_options), `LIFF_AI_AGENT_URL` (default `http://agent:3000`), `LIFF_AI_AGENT_KEY`
+- **LIFF AI Gotchas**:
+  - Auth ใช้ LINE ID Token verify อย่างเดียว (ไม่ต้อง HMAC sig จาก client — secret key ฝัง JS ไม่ปลอดภัย)
+  - Dealer ต้องมี ACF field `owner_line_uid` บน distributor CPT หรือ WP user meta `linked_distributor_id`
+  - CSS prefix `.liff-ai-*` ทุก class (dark theme), scoped ไม่ conflict กับ B2B/B2F
+  - Lead statuses ตรงกับ `LEAD_STATUSES` ใน `lead-pipeline.js` (17 statuses)
