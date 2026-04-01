@@ -628,7 +628,7 @@ export default function AiConfigPage() {
     // If setting to primary/leader, remove that role from other providers
     if (role === "primary" || role === "leader") {
       setProviders(prev => prev.map(p => {
-        if (p.id === id) return { ...p, role, enabled: role !== "none" ? true : p.enabled };
+        if (p.id === id) return { ...p, role, enabled: true };
         if (p.role === role) return { ...p, role: "fallback" };
         return p;
       }));
