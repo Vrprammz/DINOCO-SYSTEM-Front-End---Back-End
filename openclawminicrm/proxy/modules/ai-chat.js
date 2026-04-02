@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.1.4 — Anti-hallucination V2: claudeSupervisor on LINE, expanded sanitize patterns, cross-sell blocker
+ * V.2.0 — 3-Tier AI: Gemini 2.5 Flash (ลูกน้อง) + Haiku 4.5 (รองหัวหน้า 20%) + Sonnet 4 (หัวหน้าใหญ่ 10%)
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -282,7 +282,8 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
     tools: [{ functionDeclarations }],
     generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
   };
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  // ★ V.2.0: เปลี่ยนเป็น Gemini 2.5 Flash (ฉลาดกว่า 2.0 Flash มาก tool calling ดีขึ้น)
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
   for (let i = 0; i < 4; i++) {
     try {
       const res = await fetch(url, {
@@ -319,8 +320,8 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
   return null;
 }
 
-// === Claude Sonnet with Tool Use ===
-async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId) {
+// === Claude with Tool Use (รองรับ Haiku/Sonnet/Opus) ===
+async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, model = "claude-sonnet-4-20250514") {
   const apiKey = getDynamicKeySync("ANTHROPIC_API_KEY");
   if (!apiKey) return null;
   const claudeTools = tools.map((t) => ({
@@ -355,15 +356,15 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId) {
         method: "POST",
         headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514", max_tokens: 2048, temperature: 0.2,
+          model, max_tokens: 2048, temperature: 0.2,
           system: systemPrompt, tools: claudeTools, messages,
         }),
         signal: AbortSignal.timeout(60000),
       });
-      if (!res.ok) return null;
+      if (!res.ok) { console.warn(`[Claude] ${model} HTTP ${res.status}`); return null; }
       const data = await res.json();
       if (data.usage) {
-        trackAICost({ provider: "Claude-Sonnet", model: "claude-sonnet-4-20250514", feature: "chat-with-tools",
+        trackAICost({ provider: model.includes("haiku") ? "Claude-Haiku" : "Claude-Sonnet", model, feature: "chat-with-tools",
           inputTokens: data.usage.input_tokens || 0, outputTokens: data.usage.output_tokens || 0, sourceId });
       }
       const toolUse = data.content?.find((c) => c.type === "tool_use");
@@ -382,14 +383,20 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId) {
   return null;
 }
 
-// === DINOCO AI — Gemini primary, Claude fallback ===
+// === DINOCO AI V.2.0 — Gemini 2.5 Flash primary, Haiku fallback ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
+  // ★ Tier 1: Gemini 2.5 Flash (ลูกน้อง — ทุกข้อความ)
   const geminiReply = await callGeminiWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
   if (geminiReply) return sanitizeAIOutput(geminiReply);
-  console.log("[AI] Gemini failed -> trying Claude Sonnet...");
-  const claudeReply = await callClaudeWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
-  if (claudeReply) return sanitizeAIOutput(claudeReply);
-  console.error("[AI] Both Gemini + Claude failed");
+  // ★ Tier 1 fallback: Claude Haiku 4.5 (ถ้า Gemini พัง)
+  console.log("[AI] Gemini 2.5 Flash failed -> trying Claude Haiku 4.5...");
+  const haikuReply = await callClaudeWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId, "claude-haiku-4-5-20251001");
+  if (haikuReply) return sanitizeAIOutput(haikuReply);
+  // ★ Tier 1 last resort: Claude Sonnet 4
+  console.log("[AI] Haiku also failed -> trying Claude Sonnet 4...");
+  const sonnetReply = await callClaudeWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
+  if (sonnetReply) return sanitizeAIOutput(sonnetReply);
+  console.error("[AI] All 3 models failed");
   return "ขอเช็คข้อมูลกับทีมงานก่อนนะคะ รอสักครู่ค่ะ 🙏";
 }
 
@@ -428,24 +435,31 @@ DINOCO เป็น One Price ไม่มีโปรโมชั่น
 }
 
 // === AI Reply to Facebook/Instagram ===
-// === Claude หัวหน้าตรวจงาน Gemini — เฉพาะเรื่องยาก ===
+// === ★ V.2.0: ระบบ 3 ชั้น — Haiku รองหัวหน้า 20% + Sonnet หัวหน้าใหญ่ 10% ===
 async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr) {
-  // เช็คว่าต้องตรวจไหม
-  const needsReview =
-    geminiReply.length > 300 ||                    // ตอบยาวเกิน
-    /ซ้ำ|เหมือนเดิม/i.test(customerText) ||       // ลูกค้าบ่นว่าซ้ำ
-    /ไม่เข้าใจ|ไม่ใช่|ผิด/i.test(customerText) || // ลูกค้าบอกผิด
-    (contextStr && contextStr.includes(geminiReply.substring(0, 50))) || // ตอบซ้ำกับก่อนหน้า
+  // ★ Tier 2: Haiku รองหัวหน้า (20% — ตรวจเรื่องทั่วไป)
+  const needsHaikuReview =
+    geminiReply.length > 250 ||                    // ตอบยาวเกิน
     /\?/.test(geminiReply) ||                      // มี ? หลุด
-    /AI|บอท|bot|ระบบอัตโนมัติ/i.test(geminiReply) || // เผยตัวว่าเป็น AI
-    /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม|นอกจากนี้.*มี/i.test(geminiReply); // cross-sell hallucination
+    /ซ้ำ|เหมือนเดิม/i.test(customerText) ||       // ลูกค้าบ่นว่าซ้ำ
+    (contextStr && contextStr.includes(geminiReply.substring(0, 50))) || // ตอบซ้ำกับก่อนหน้า
+    /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม|นอกจากนี้.*มี/i.test(geminiReply); // cross-sell
 
-  if (!needsReview) return geminiReply;
+  // ★ Tier 3: Sonnet หัวหน้าใหญ่ (10% — เรื่องยากเท่านั้น)
+  const needsSonnetReview =
+    /ไม่เข้าใจ|ไม่ใช่|ผิด|โกรธ|ห่วย|แย่/i.test(customerText) || // ลูกค้าไม่พอใจ
+    /AI|บอท|bot|ระบบอัตโนมัติ/i.test(geminiReply) || // เผยตัวว่าเป็น AI
+    /เป็น AI|เป็นบอท/i.test(geminiReply); // เผยตัวชัดเจน
+
+  if (!needsHaikuReview && !needsSonnetReview) return geminiReply;
 
   const claudeKey = getDynamicKeySync("ANTHROPIC_API_KEY");
   if (!claudeKey) return geminiReply;
 
-  console.log("[Boss] Claude reviewing Gemini reply...");
+  // เลือก model ตาม tier
+  const reviewModel = needsSonnetReview ? "claude-sonnet-4-20250514" : "claude-haiku-4-5-20251001";
+  const reviewTier = needsSonnetReview ? "Sonnet-Boss" : "Haiku-VP";
+  console.log(`[${reviewTier}] Reviewing Gemini reply...`);
 
   // ★ V.1.4: ส่ง tool results ให้ Claude ตรวจ hallucination ได้แม่นยำขึ้น
   const lastTool = _lastToolResults.get(sourceId);
@@ -458,8 +472,8 @@ async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr)
       method: "POST",
       headers: { "x-api-key": claudeKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514", max_tokens: 512, temperature: 0.2,
-        system: `คุณเป็นหัวหน้า AI ของ DINOCO ตรวจงานลูกน้อง (Gemini)
+        model: reviewModel, max_tokens: 512, temperature: 0.2,
+        system: `คุณเป็น${reviewTier === "Sonnet-Boss" ? "หัวหน้าใหญ่" : "รองหัวหน้า"} AI ของ DINOCO ตรวจงานลูกน้อง (Gemini)
 ลูกค้าถาม: "${customerText}"
 Gemini ตอบ: "${geminiReply}"
 ประวัติสนทนา: ${contextStr || "(ไม่มี)"}${toolInfo}
@@ -484,15 +498,14 @@ Gemini ตอบ: "${geminiReply}"
 
     // ★ V.1.4: exact match "OK" เท่านั้น — ป้องกัน "ดีแล้วค่ะ แต่..." false positive
     if (review === "OK" || review === "ok") {
-      console.log("[Boss] Claude approved ✅");
+      console.log(`[${reviewTier}] Approved ✅`);
       return geminiReply;
     }
 
     // Claude แก้ไข → ใช้ข้อความใหม่ (ลบ ? เฉพาะที่ไม่ใช่ URL)
-    console.log("[Boss] Claude revised ✏️");
-    // ★ V.1.4: track cost สำหรับ supervisor
+    console.log(`[${reviewTier}] Revised ✏️`);
     if (data.usage) {
-      trackAICost({ provider: "Claude-Supervisor", model: "claude-sonnet-4-20250514", feature: "supervisor",
+      trackAICost({ provider: `Claude-${reviewTier}`, model: reviewModel, feature: "supervisor",
         inputTokens: data.usage.input_tokens || 0, outputTokens: data.usage.output_tokens || 0, sourceId });
     }
     return review.replace(/\?(?![a-zA-Z_=&])/g, "").trim();
