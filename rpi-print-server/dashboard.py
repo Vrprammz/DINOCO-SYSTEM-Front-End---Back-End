@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard
-Web UI for monitoring printers, testing prints, and viewing logs.
+DINOCO B2B -- RPi Print Server Dashboard  V.38.0
+Web UI for monitoring printers, testing prints, viewing logs,
+and Manual Flash Shipping (standalone label creation).
 
 Usage:
     python3 dashboard.py                # Run on port 5555
     python3 dashboard.py --port 8080    # Custom port
 
 Access at http://dinocoth.local:5555
+Manual Shipping: http://dinocoth.local:5555/manual-ship
 """
 
 import json
@@ -18,10 +20,12 @@ import subprocess
 import argparse
 import tempfile
 import functools
+import base64
+import logging
 from datetime import datetime, timezone, timedelta
 
 import requests as http_requests
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, Response
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
@@ -45,6 +49,25 @@ def require_auth(f):
         key = request.headers.get('X-Print-Key') or request.args.get('key')
         if key != config.get('api_key'):
             return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+def require_basic_auth(f):
+    """Decorator for HTTP Basic Auth on manual shipping pages."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        config = load_config()
+        expected_user = config.get('manual_ship_user', 'dinoco')
+        expected_pass = config.get('manual_ship_pass', '')
+        if not expected_pass:
+            return Response('Manual shipping not configured (set manual_ship_pass in config.json)', 403)
+        auth = request.authorization
+        if not auth or auth.username != expected_user or auth.password != expected_pass:
+            return Response(
+                'Login required', 401,
+                {'WWW-Authenticate': 'Basic realm="Manual Shipping"'}
+            )
         return f(*args, **kwargs)
     return decorated
 
@@ -411,6 +434,237 @@ def api_flash_ship_packed():
         return jsonify({'success': False, 'message': str(e)}), 502
 
 
+# ═══════════════════════════════════════════════════════════════════
+# V.38: Manual Flash Shipping — standalone label creation
+# ═══════════════════════════════════════════════════════════════════
+
+logger = logging.getLogger('manual_ship')
+
+
+def _get_sender_info():
+    """Get sender info from WordPress warehouse settings (cached)."""
+    config = load_config()
+    return {
+        'name':    config.get('manual_ship_sender_name', 'DINOCO THAILAND'),
+        'phone':   config.get('manual_ship_sender_phone', '0616399994'),
+        'address': config.get('manual_ship_sender_address',
+                              '21/106 ซอยลาดพร้าว 15 แขวงจอมพล เขตจตุจักร กรุงเทพมหานคร 10900'),
+    }
+
+
+def _render_manual_label(flash_data, recipient, sender, item_desc='', remark='', ref_no=''):
+    """Render manual_shipping_label.html → PDF bytes."""
+    from jinja2 import Environment, FileSystemLoader
+    env = Environment(loader=FileSystemLoader(os.path.join(BASE_DIR, 'templates')))
+    tmpl = env.get_template('manual_shipping_label.html')
+
+    now_bkk = datetime.now(timezone(timedelta(hours=7))).strftime('%d/%m/%Y %H:%M')
+
+    ctx = {
+        'flash': flash_data,
+        'sender': sender,
+        'recipient': recipient,
+        'item_desc': item_desc,
+        'remark': remark,
+        'ref_no': ref_no,
+        'now': now_bkk,
+    }
+    html = tmpl.render(ctx)
+
+    pdf_tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    pdf_tmp.close()
+    try:
+        from weasyprint import HTML as WeasyHTML
+        WeasyHTML(string=html, base_url=BASE_DIR).write_pdf(pdf_tmp.name)
+        return pdf_tmp.name
+    except Exception as e:
+        if os.path.exists(pdf_tmp.name):
+            os.unlink(pdf_tmp.name)
+        raise e
+
+
+def _generate_barcode_uri(text):
+    """Generate Code128 barcode as data URI."""
+    try:
+        import barcode
+        from barcode.writer import ImageWriter
+        import io
+        code128 = barcode.get('code128', text, writer=ImageWriter())
+        buf = io.BytesIO()
+        code128.write(buf, options={'write_text': False, 'module_height': 8, 'quiet_zone': 2})
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode()
+        return f'data:image/png;base64,{b64}'
+    except Exception:
+        return ''
+
+
+def _generate_qr_uri(text):
+    """Generate QR code as data URI."""
+    try:
+        import qrcode
+        import io
+        qr = qrcode.make(text, box_size=8, border=1)
+        buf = io.BytesIO()
+        qr.save(buf, format='PNG')
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode()
+        return f'data:image/png;base64,{b64}'
+    except Exception:
+        return ''
+
+
+def _print_label_pdf(pdf_path):
+    """Print label PDF using configured label printer."""
+    config = load_config()
+    printer = config.get('printer_label', '')
+    if not printer:
+        logger.warning('No label printer configured')
+        return False
+
+    try:
+        # Try PrinterManager first (thermal support)
+        from printer import PrinterManager
+        pm = PrinterManager(config)
+        pm.print_labels([pdf_path], 'manual')
+        return True
+    except Exception:
+        pass
+
+    # Fallback to CUPS
+    try:
+        result = subprocess.run(
+            ['lp', '-d', printer, pdf_path],
+            capture_output=True, text=True, timeout=15
+        )
+        return 'request id' in result.stdout.lower()
+    except Exception as e:
+        logger.error(f'Print failed: {e}')
+        return False
+
+
+@app.route('/manual-ship')
+@require_basic_auth
+def manual_ship():
+    """Manual shipping page — requires Basic Auth."""
+    config = load_config()
+    sender = _get_sender_info()
+    return render_template(
+        'manual_ship.html',
+        api_key=config.get('api_key', ''),
+        sender_name=sender['name'],
+        sender_phone=sender['phone'],
+        sender_address=sender['address'],
+    )
+
+
+@app.route('/api/manual-flash-create', methods=['POST'])
+@require_auth
+def api_manual_flash_create():
+    """Create Flash order + render & print label."""
+    config = load_config()
+    wp_url = config.get('wp_url', '').rstrip('/')
+    api_key = config.get('api_key', '')
+
+    body = request.json or {}
+
+    # 1. Create Flash order via WordPress
+    try:
+        resp = http_requests.post(
+            f'{wp_url}/wp-json/b2b/v1/manual-flash-create',
+            json=body,
+            headers={'X-Print-Key': api_key},
+            timeout=35,
+        )
+        data = resp.json()
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'WordPress API error: {e}'}), 502
+
+    if not data.get('success'):
+        return jsonify(data), resp.status_code
+
+    pno = data.get('pno', '')
+    sort_code = data.get('sort_code', '')
+    slc = data.get('sorting_line_code', '')
+    dst_store = data.get('dst_store_name', '')
+
+    # 2. Render label with Flash data
+    sender = _get_sender_info()
+    recipient = {
+        'name': body.get('dst_name', ''),
+        'phone': body.get('dst_phone', ''),
+        'address': body.get('dst_address', ''),
+        'district': (body.get('dst_district', '') + ' ' + body.get('dst_city', '')).strip(),
+        'province': body.get('dst_province', ''),
+        'postcode': body.get('dst_postcode', ''),
+    }
+    flash_data = {
+        'pno': pno,
+        'sort_code': sort_code,
+        'sorting_line_code': slc,
+        'dst_store_name': dst_store,
+        'barcode_uri': _generate_barcode_uri(pno),
+        'qr_uri': _generate_qr_uri(pno),
+    }
+
+    printed = False
+    try:
+        pdf_path = _render_manual_label(
+            flash_data, recipient, sender,
+            item_desc=body.get('item_desc', ''),
+            remark=body.get('remark', ''),
+            ref_no=data.get('out_trade_no', ''),
+        )
+        printed = _print_label_pdf(pdf_path)
+        # Cleanup
+        if os.path.exists(pdf_path):
+            os.unlink(pdf_path)
+    except Exception as e:
+        logger.error(f'Label render/print error: {e}')
+
+    data['printed'] = printed
+    return jsonify(data)
+
+
+@app.route('/api/manual-shipments')
+@require_auth
+def api_manual_shipments():
+    """Get manual shipments list (proxied from WordPress)."""
+    config = load_config()
+    month = request.args.get('month', '')
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/b2b/v1/manual-shipments'
+        resp = http_requests.get(
+            url, params={'month': month},
+            headers={'X-Print-Key': api_key}, timeout=15,
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 502
+
+
+@app.route('/api/manual-flash-ready', methods=['POST'])
+@require_auth
+def api_manual_flash_ready():
+    """Call courier for manual shipment (uses existing Flash notify)."""
+    config = load_config()
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/b2b/v1/rpi-flash-ready'
+        # Manual shipments don't have ticket_id — use notify_courier directly
+        # We pass a dummy ticket_id=0 to trigger the Flash notify without ticket
+        resp = http_requests.post(
+            url, json={'ticket_id': 0, 'manual': True},
+            headers={'X-Print-Key': api_key}, timeout=35,
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 502
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DINOCO Print Dashboard')
     parser.add_argument('--port', type=int, default=5555)
@@ -418,4 +672,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(f'DINOCO Print Dashboard: http://0.0.0.0:{args.port}')
+    print(f'Manual Shipping: http://0.0.0.0:{args.port}/manual-ship')
     app.run(host=args.host, port=args.port, debug=False)
