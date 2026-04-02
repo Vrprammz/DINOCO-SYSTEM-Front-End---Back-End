@@ -299,11 +299,9 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
       temperature: 0.3,
       maxOutputTokens: 8192,
     },
-    // ★ V.2.4: thinkingConfig ต้องอยู่ระดับ top-level ไม่ใช่ใน generationConfig
-    thinkingConfig: { thinkingBudget: 2048 },
   };
 
-  // ★ V.2.4: ใช้ stable model gemini-2.5-flash (ไม่ใช่ preview-05-20 ที่ function calling พัง)
+  // ★ V.2.5: gemini-2.5-flash stable — ลบ thinkingConfig ออก (REST API ไม่รองรับ field นี้)
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
   for (let i = 0; i < 4; i++) {
