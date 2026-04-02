@@ -1,6 +1,6 @@
 # DINOCO System -- Complete User Journey Documentation
 
-> Updated: 2026-03-27 | Based on codebase analysis of 38 files (~50,000 lines)
+> Updated: 2026-04-02 | Based on codebase analysis of 38 files (~50,000 lines)
 > Source files referenced are relative to the project root.
 
 ---
@@ -24,6 +24,7 @@
 15. [B2F: Maker Confirm/Reject PO](#15-b2f-maker-confirmreject-po)
 16. [B2F: Maker Deliver Goods](#16-b2f-maker-deliver-goods)
 17. [B2F: Admin Receive & Pay](#17-b2f-admin-receive--pay)
+18. [B2B: Walk-in Order (ร้านหน้าโกดัง)](#18-b2b-walk-in-order-ร้านหน้าโกดัง)
 
 ---
 
@@ -714,6 +715,49 @@ Pages protected by login check: if not logged in, redirected to `/warranty/`.
 
 ---
 
+## 18. B2B: Walk-in Order (ร้านหน้าโกดัง)
+
+**Who:** ร้านตัวแทนหน้าโกดัง (distributor ที่เปิด `is_walkin = true`) -- ปัจจุบันมี 2 ร้าน
+**Trigger:** เหมือนปกติ -- พิมพ์ "สั่งของ" ใน LINE group หรือเปิด LIFF catalog
+**Source files:** `[B2B] Snippet 1: Core Utilities`, `[B2B] Snippet 2: LINE Webhook Gateway & Order Creator`, `[B2B] Snippet 9: Admin Control`, `[B2B] Snippet 14: Order State Machine`
+
+### Step-by-step flow
+
+| Step | User Action | UI Element | System Response |
+|------|-------------|------------|-----------------|
+| 18.1 | พิมพ์ "สั่งของ" ใน LINE group | LINE chat text input | เหมือน Journey 5 -- ส่ง LIFF catalog link Flex card |
+| 18.2 | เปิด LIFF catalog + เลือกสินค้า | LIFF E-Catalog UI | เหมือน Journey 5 (Step 5.3-5.10) |
+| 18.3 | ยืนยันส่งออเดอร์ | "Confirm Order" button | สร้าง `b2b_order` status `draft` + stamp `_b2b_is_walkin=1` |
+| 18.4 | กดยืนยันบน Flex card (confirm_order) | LINE postback | **ต่างจากปกติ:** ระบบตรวจ `b2b_is_walkin_order()` → ข้ามเช็คสต็อก → status `draft` → `awaiting_confirm` โดยตรง (ไม่ผ่าน `checking_stock`) |
+| 18.5 | ลูกค้ายืนยันบิล (confirm_bill) | LINE postback | เหมือนปกติ -- เพิ่มหนี้ + สร้าง Invoice + ส่ง Flex แจ้งยอด |
+| 18.6 | ส่งสลิปชำระเงิน | ส่งรูปสลิปใน LINE group | เหมือน Journey 7 -- Slip2Go verify + ตัดหนี้ + mark `paid` |
+| 18.7 | (อัตโนมัติ) Auto-complete | N/A | Hook `b2b_order_status_changed` → `b2b_walkin_auto_complete()` ตรวจ `_b2b_is_walkin=1` → status `paid` → `completed` ทันที (ข้ามเลือกวิธีส่ง) |
+| 18.8 | ลูกค้ารับแจ้ง order completed | Flex card ใน LINE group | Flex แจ้ง "ออเดอร์เสร็จสิ้น" |
+
+### ความแตกต่างจาก Journey 5 (B2B: Place Order ปกติ)
+
+| จุดที่ต่าง | ปกติ (Journey 5) | Walk-in (Journey 18) |
+|-----------|------------------|----------------------|
+| ยืนยัน order | `draft` → `checking_stock` → Admin เช็ค → `awaiting_confirm` | `draft` → `awaiting_confirm` (skip stock check) |
+| หลังจ่ายเงิน | `paid` → Admin เลือกวิธีส่ง → `packed`/`shipped` → `completed` | `paid` → **auto** `completed` (skip shipping) |
+| Shipping Choice Flex | Admin ได้รับ Flex เลือก Flash/ส่งเอง/Rider/มารับเอง | ไม่ส่ง Shipping Choice Flex |
+| ระยะเวลา | 1-3 วัน (รอจัดส่ง+ขนส่ง) | ทันที (ลูกค้ามารับของเอง) |
+
+### Decision points
+
+- **Walk-in flag มาจากไหน:** ระบบตรวจ `is_walkin` field บน distributor CPT ตอน confirm order + stamp `_b2b_is_walkin=1` บน order เพื่อ lock ค่าไว้ (ป้องกันเปลี่ยน flag หลังสั่ง)
+- **ชำระเงินหลายรอบ (partial):** ทำงานได้เหมือนปกติ -- auto-complete trigger เมื่อ status เปลี่ยนเป็น `paid`
+- **Cancel request:** ทำงานได้เหมือนปกติ -- walk-in ไม่ได้ block cancel flow
+- **Admin ปิด Walk-in ทีหลัง:** order ที่ stamp `_b2b_is_walkin=1` ไปแล้วจะยังคง auto-complete ตาม flag
+
+### Where can the user get stuck
+
+- **ไม่ต่างจาก Journey 5 มากนัก:** เพราะ flow เหมือนกัน แค่ข้ามขั้นตอน -- UX เดิมทำงานได้
+- **ไม่เห็น Shipping Choice:** ไม่ใช่ bug -- Walk-in order ข้ามขั้นตอนนี้โดยออกแบบ
+- **Auto-complete เร็วมาก:** ถ้าจ่ายสลิปแล้ว order จะ completed ทันที ลูกค้าอาจสงสัยว่าทำไมเร็ว
+
+---
+
 ## Key Files Referenced
 
 | Journey | Primary Source Files |
@@ -735,4 +779,5 @@ Pages protected by login check: if not logged in, redirected to `/warranty/`.
 | 15. B2F: Maker Confirm/Reject | `[B2F] Snippet 3: Webhook Handler`, `[B2F] Snippet 2: REST API`, `[B2F] Snippet 4: Maker LIFF Pages` |
 | 16. B2F: Maker Deliver | `[B2F] Snippet 3: Webhook Handler`, `[B2F] Snippet 2: REST API` |
 | 17. B2F: Admin Receive & Pay | `[B2F] Snippet 2: REST API`, `[B2F] Snippet 5: Admin Dashboard Tabs`, `[B2F] Snippet 7: Credit Transaction Manager` |
+| 18. B2B: Walk-in Order | `[B2B] Snippet 1: Core Utilities`, `[B2B] Snippet 2: LINE Webhook Gateway`, `[B2B] Snippet 9: Admin Control`, `[B2B] Snippet 14: Order State Machine` |
 | Navigation | `[System] DINOCO Global App Menu` |

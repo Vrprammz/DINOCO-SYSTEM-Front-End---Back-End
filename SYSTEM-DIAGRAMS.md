@@ -1,6 +1,6 @@
 # DINOCO System Diagrams -- Complete Reference
 
-> Generated: 2026-03-27 | Based on: SYSTEM-ARCHITECTURE.md V.30.2 + actual code analysis
+> Updated: 2026-04-02 | Based on: SYSTEM-ARCHITECTURE.md V.39.0 + actual code analysis
 
 ---
 
@@ -127,6 +127,7 @@ stateDiagram-v2
     [*] --> draft : Customer places order<br/>(LIFF catalog / LINE text)
 
     draft --> checking_stock : Customer postback<br/>confirm_order
+    draft --> awaiting_confirm : System auto<br/>(walk-in: skip stock check)<br/>b2b_walkin_auto_complete
     draft --> backorder : confirm_order detects OOS<br/>(b2b_check_order_oos)
     draft --> cancelled : Customer postback<br/>cancel_draft
 
@@ -150,6 +151,7 @@ stateDiagram-v2
     paid --> shipped : Admin postback<br/>pack_done (manual mode)<br/>ship_manual / ship_rider
     paid --> packed : Admin postback<br/>pack_flash<br/>(Flash Express)
     paid --> completed : Admin postback<br/>ship_self_pickup<br/>(immediate)
+    paid --> completed : System auto<br/>(walk-in: auto-complete)<br/>b2b_walkin_auto_complete
     paid --> claim_opened : Customer postback<br/>claim_open
 
     packed --> shipped : Flash courier pickup<br/>or Flash tracking update
@@ -181,8 +183,18 @@ stateDiagram-v2
         confirm_bill triggers:
         1. Add debt to distributor
         2. Send Shipping Choice Flex to admin
+           (skipped for walk-in orders)
         3. Schedule auto-Flash fallback (1hr)
+           (skipped for walk-in orders)
         4. Send Invoice Flex + PNG to customer
+    end note
+
+    note left of draft
+        Walk-in orders (is_walkin=true):
+        1. draft -> awaiting_confirm (skip stock check)
+        2. paid -> completed (auto, skip shipping)
+        Stamp: _b2b_is_walkin=1 on order
+        Hook: b2b_walkin_auto_complete()
     end note
 ```
 

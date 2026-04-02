@@ -1,6 +1,6 @@
 # DINOCO System Data Model
 
-> Updated: 2026-04-01 | Covers all 13 CPTs (8 B2C/B2B + 5 B2F), wp_options shared state, debt + credit lifecycle
+> Updated: 2026-04-02 | Covers all 13 CPTs (8 B2C/B2B + 5 B2F), wp_options shared state, debt + credit lifecycle
 
 ---
 
@@ -65,6 +65,7 @@ erDiagram
         string dist_address
         string dist_province
         string recommended_skus "CSV"
+        bool is_walkin "walk-in distributor (ร้านหน้าโกดัง)"
     }
 
     b2b_order {
@@ -86,6 +87,7 @@ erDiagram
         text _b2b_shipments "JSON array"
         string _flash_packing_status
         text _flash_tracking_numbers "JSON array"
+        bool _b2b_is_walkin "walk-in order stamp (locked at confirm)"
     }
 
     b2b_product {
@@ -199,7 +201,7 @@ erDiagram
 | **Created by** | Distributor via LIFF E-Catalog (`/place-order` API), or Admin via Manual Invoice System |
 | **Trigger** | Distributor submits cart from LIFF, or Admin creates manual invoice for a distributor |
 | **Initial state** | `order_status = draft` (LIFF), or `awaiting_payment` (manual invoice with `_order_source = manual_invoice`) |
-| **Status workflow** | `draft` -> `checking_stock` -> `awaiting_confirm` -> `awaiting_payment` -> `paid` -> `packed` -> `shipped` -> `completed`. Branch: `backorder`, `cancel_requested` -> `cancelled`, `change_requested`, `claim_opened` -> `claim_resolved` |
+| **Status workflow** | `draft` -> `checking_stock` -> `awaiting_confirm` -> `awaiting_payment` -> `paid` -> `packed` -> `shipped` -> `completed`. Branch: `backorder`, `cancel_requested` -> `cancelled`, `change_requested`, `claim_opened` -> `claim_resolved`. **Walk-in variant:** `draft` -> `awaiting_confirm` (skip stock check) -> ... -> `paid` -> `completed` (auto, skip shipping) |
 | **Billing** | When admin confirms bill (`is_billed = true`), `current_debt` on distributor increases by `total_amount` |
 | **Payment** | Slip via LINE (auto-verified by Slip2Go), LIFF upload, or admin manual entry. Reduces `current_debt`. Sets `_inv_paid_amount`, appends to `_inv_partial_payments` |
 | **Shipping** | Flash Express (auto), self-ship, rider, self-pickup. Creates `_b2b_shipments` entries, sets Flash tracking meta |
@@ -213,8 +215,8 @@ erDiagram
 |-------|---------|
 | **Created by** | Admin via B2B Admin Control Panel |
 | **Trigger** | Admin registers a new distributor shop |
-| **Initial state** | `rank_system = standard`, `current_debt = 0`, `bot_enabled = 1`, `credit_hold = false` |
-| **Changes over time** | `current_debt` changes with every invoice/payment/cancel (see Section 4). `rank_system` updated monthly by cron. `credit_hold` set by dunning cron when overdue. `monthly_sales_mtd` reset monthly |
+| **Initial state** | `rank_system = standard`, `current_debt = 0`, `bot_enabled = 1`, `credit_hold = false`, `is_walkin = false` |
+| **Changes over time** | `current_debt` changes with every invoice/payment/cancel (see Section 4). `rank_system` updated monthly by cron. `credit_hold` set by dunning cron when overdue. `monthly_sales_mtd` reset monthly. `is_walkin` set by admin (toggle in B2B Admin Control) -- walk-in orders skip stock check + auto-complete after payment |
 | **Read by** | All B2B endpoints (auth, catalog pricing, order creation), Admin Control Panel, Cron jobs, Invoice system, Slip payment handler |
 | **Deletion** | Never deleted. Can be effectively disabled by setting `bot_enabled = 0` |
 

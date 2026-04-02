@@ -1,6 +1,6 @@
 # DINOCO System Architecture — Complete Reference
 
-> Updated: 2026-03-28 | Version: V.34.2 | 38 files, ~50,000 lines
+> Updated: 2026-04-02 | Version: V.39.0 | 38 files, ~50,000 lines
 
 ## Overview
 
@@ -57,7 +57,7 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 | `legacy_request` | Legacy system migration | `request_status`, `dnc_old_code`, `legacy_items` |
 | `b2b_order` | B2B orders + manual invoices | `order_status`, `total_amount`, `source_group_id`, `is_billed` |
 | `b2b_product` | B2B product catalog | `product_sku`, `price_standard`, `stock_status`, `b2b_discount_percent` |
-| `distributor` | B2B distributor/shop | `shop_name`, `line_group_id`, `credit_limit`, `current_debt`, `bot_enabled` |
+| `distributor` | B2B distributor/shop | `shop_name`, `line_group_id`, `credit_limit`, `current_debt`, `bot_enabled`, `is_walkin` |
 | `ai_knowledge` | AI knowledge base entries | `training_phrases`, `core_facts`, `ai_action` |
 | `product_bundle` | Product bundle recipes | Bundle children references |
 | `brand_voice` | เสียงลูกค้า (Brand Voice Pool) | `bv_brands`, `bv_content`, `bv_summary`, `bv_sentiment`, `bv_intensity`, `bv_categories`, `bv_platform`, `bv_entry_method` |
@@ -203,38 +203,44 @@ All code runs as **WordPress Code Snippets** (no build step). Frontend is vanill
 สั่งของ (LIFF/LINE)
     │
     ▼
-[draft] ─── ลูกค้ายืนยัน ──→ [checking_stock]
-                                    │
-                         ┌──────────┼──────────┐
-                         ▼          ▼          ▼
-                    [มีครบ]    [หมดบางส่วน]  [หมดทั้งหมด]
-                         │          │          │
-                         ▼          ▼          ▼
-              [awaiting_confirm] [backorder]  [OOS notification]
-                         │          │
-              ลูกค้ายืนยันบิล    BO flow
-                         │
-                         ▼
-              [awaiting_payment] ←── Flex แจ้งหนี้ + Invoice image
-                         │
-              ┌──────────┼──────────┐
-              ▼          ▼          ▼
-          [สลิป LINE]  [อัพโหลด]  [กรอกมือ]
-              │          │          │
-              ▼          ▼          ▼
-           [paid] ──── Shipping Choice Flex ────→ Admin เลือกวิธีส่ง
-                    │          │         │         │
-                    ▼          ▼         ▼         ▼
-              [Flash]    [ส่งเอง]   [Rider]   [มารับเอง]
-                    │          │         │         │
-                    ▼          ▼         ▼         ▼
-              [packed]   [packed]  [shipped]  [completed]
-                    │          │
-                    ▼          ▼
-              [shipped] ── Delivery check (1-3 วัน)
-                    │
-                    ▼
-              [completed] ← ลูกค้ายืนยันรับ
+[draft] ─── ลูกค้ายืนยัน ──→ [checking_stock]     ← ปกติ
+    │                               │
+    │ (Walk-in)                ┌────┼──────────┐
+    │ ข้ามเช็คสต็อก            ▼    ▼          ▼
+    └──→ [awaiting_confirm] [มีครบ] [หมดบาง]  [หมดทั้งหมด]
+              │                │      │          │
+              │                ▼      ▼          ▼
+              │   [awaiting_confirm] [backorder] [OOS]
+              │                │      │
+              ├────────────────┘      BO flow
+              │
+    ลูกค้ายืนยันบิล
+              │
+              ▼
+    [awaiting_payment] ←── Flex แจ้งหนี้ + Invoice image
+              │
+    ┌─────────┼──────────┐
+    ▼         ▼          ▼
+[สลิป LINE] [อัพโหลด] [กรอกมือ]
+    │         │          │
+    ▼         ▼          ▼
+ [paid] ─────────────────────────────────────┐
+    │                                        │
+    ├── (Walk-in) auto-complete ──→ [completed]
+    │
+    └── (ปกติ) Shipping Choice Flex ──→ Admin เลือกวิธีส่ง
+                │          │         │         │
+                ▼          ▼         ▼         ▼
+          [Flash]    [ส่งเอง]   [Rider]   [มารับเอง]
+                │          │         │         │
+                ▼          ▼         ▼         ▼
+          [packed]   [packed]  [shipped]  [completed]
+                │          │
+                ▼          ▼
+          [shipped] ── Delivery check (1-3 วัน)
+                │
+                ▼
+          [completed] ← ลูกค้ายืนยันรับ
 ```
 
 ---
@@ -334,7 +340,7 @@ Slip2Go API ตรวจ QR
 `order_status`, `order_items`, `total_amount`, `source_group_id`, `is_billed`, `due_date`, `tracking_number`, `shipping_provider`, `shipped_date`, `customer_note`, `dist_name`, `dist_phone`, `dist_address`, `dist_district`, `dist_city`, `dist_province`, `dist_postcode`, `print_status`, `print_error`
 
 ### Distributor
-`shop_name`, `shop_logo_url`, `line_group_id`, `rank_system`, `credit_limit`, `credit_term_days`, `current_debt`, `credit_hold`, `monthly_sales_mtd`, `bot_enabled`, `dist_phone`, `dist_address`, `dist_district`, `dist_city`, `dist_province`, `dist_postcode`, `recommended_skus`
+`shop_name`, `shop_logo_url`, `line_group_id`, `rank_system`, `credit_limit`, `credit_term_days`, `current_debt`, `credit_hold`, `monthly_sales_mtd`, `bot_enabled`, `is_walkin`, `dist_phone`, `dist_address`, `dist_district`, `dist_city`, `dist_province`, `dist_postcode`, `recommended_skus`
 
 ### B2B Product
 `product_sku`, `product_category`, `stock_status`, `b2b_discount_percent`, `price_standard`, `price_silver`, `price_gold`, `price_platinum`, `price_diamond`, `boxes_per_unit`, `min_order_qty`, `oos_timestamp`, `oos_duration_hours`, `oos_eta_date`
@@ -622,6 +628,7 @@ Methods: `chat()`, `stream()` — รับ messages array + options → return 
 | `bot_enabled` | Text | '0' = off, '1' = on |
 | `dist_phone/address/district/city/province/postcode` | Text | Shop address |
 | `recommended_skus` | Text | Comma-separated SKUs |
+| `is_walkin` | True/False | Walk-in distributor (ร้านหน้าโกดัง) -- skip stock check + auto-complete |
 
 ### b2b_product (Product Catalog)
 | Field | Type | Purpose |
@@ -693,6 +700,11 @@ Methods: `chat()`, `stream()` — รับ messages array + options → return 
 | `_inv_slip_ref` | Verified slip reference |
 | `_order_source` | 'manual_invoice' or absent (B2B) |
 | `_dist_post_id` | Distributor post ID |
+
+### Walk-in (`_b2b_is_walkin` on b2b_order)
+| Key | Purpose |
+|-----|---------|
+| `_b2b_is_walkin` | Walk-in order stamp (1=walk-in, locked at confirm time from distributor.is_walkin) |
 
 ### Other
 | Key | Purpose |

@@ -246,6 +246,42 @@ if ($result['success']) {
 
 ---
 
+## 6. Walk-in Distributor Feature (V.39.0)
+
+### What's New
+- ร้านตัวแทนหน้าโกดัง (Walk-in) สั่งของได้เหมือนเดิม แต่ **ข้ามเช็คสต็อก** + **ข้ามจัดส่ง** (auto-complete หลังจ่ายเงิน)
+- เพิ่ม toggle `is_walkin` บน distributor CPT
+- Order ที่สั่งจากร้าน Walk-in จะมี stamp `_b2b_is_walkin=1`
+- ระบบเครดิต/หนี้/สลิปชำระ ทำงานเหมือนเดิม 100%
+
+### How to Enable
+1. ไปที่ **Admin Dashboard** → **B2B Admin Control** → เลือก distributor
+2. เปิด toggle **"Walk-in (ร้านหน้าโกดัง)"**
+3. เสร็จ -- ระบบจะ auto-detect เมื่อร้านนี้สั่งของ
+
+### What Changes for Walk-in Orders
+| ขั้นตอน | ปกติ | Walk-in |
+|---------|------|---------|
+| สั่งของ (draft) | เหมือนกัน | เหมือนกัน |
+| ลูกค้ายืนยัน | → `checking_stock` | → `awaiting_confirm` (ข้ามเช็คสต็อก) |
+| ยืนยันบิล | เหมือนกัน | เหมือนกัน |
+| จ่ายเงิน | → `paid` → เลือกวิธีส่ง | → `paid` → **auto `completed`** (ข้ามจัดส่ง) |
+
+### No Migration Needed
+- ไม่ต้องสร้างตาราง/ฟิลด์ใหม่ — ACF field + post meta เท่านั้น
+- ไม่ต้องแก้ wp-config.php
+- Snippets อัพเดทผ่าน GitHub Sync ปกติ
+
+### Files Changed
+| File | Version | Change |
+|------|---------|--------|
+| **Snippet 1**: Core Utilities | V.39.0 | เพิ่ม `b2b_is_walkin_order()` helper |
+| **Snippet 2**: Webhook Gateway | V.39.0 | เพิ่ม `b2b_walkin_auto_complete()` hook + skip stock check logic |
+| **Snippet 9**: Admin Control | V.39.0 | เพิ่ม Walk-in toggle + badge ใน distributor management |
+| **Snippet 14**: Order State Machine | V.39.0 | เพิ่ม `draft→awaiting_confirm` (system) + `paid→completed` เปลี่ยนเป็น `any` |
+
+---
+
 ## Checklist สรุป
 
 - [x] Deploy Snippet 13 (Debt Transaction) ใน WordPress Code Snippets ✅ 2026-03-27
@@ -256,3 +292,4 @@ if ($result['success']) {
 - [x] Server Cron — Bangmod Cloud มี crontab อยู่แล้ว (ทุก 5 นาที) ✅
 - [x] ลง Node.js + Vite + Tailwind บนเครื่อง dev ✅ 2026-03-27
 - [x] ลงทะเบียน Pusher + แก้ RPi client ✅ 2026-03-27 (WebSocket connected)
+- [x] Walk-in Distributor Feature (V.39.0) — toggle + auto-complete flow ✅ 2026-04-02
