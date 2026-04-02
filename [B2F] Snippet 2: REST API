@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.5.7 — Fix delivery Flex "ส่ง" double-count + receive-goods remaining ใช้ shipped cap
+ * Version: V.5.8 — Payment lock+idempotency + init poi_qty_shipped + delivery fixes
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -1006,6 +1006,7 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 'poi_product_name' => $pi['product_name'],
                 'poi_qty_ordered'  => $pi['qty'],
                 'poi_unit_cost'    => $pi['unit_cost'],
+                'poi_qty_shipped'  => 0,
                 'poi_qty_received' => 0,
                 'poi_qty_rejected' => 0,
             );
@@ -2712,17 +2713,33 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
         }
 
+        // FIX-2a: MySQL GET_LOCK ป้องกัน concurrent payment (เหมือน receive-goods)
+        $pmt_lock_key = 'b2f_pmt_' . intval( $po_id );
+        global $wpdb;
+        $got_pmt_lock = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 0)", $pmt_lock_key ) );
+        if ( ! $got_pmt_lock ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'มีคนอื่นกำลังบันทึกจ่ายเงิน PO นี้อยู่ กรุณารอสักครู่', 'code' => 'LOCKED' ), 423 );
+        }
+
+        // FIX-2b: Idempotency — ป้องกันกดซ้ำภายใน 10 วินาที
+        $idem_key = 'b2f_pmt_idem_' . $po_id . '_' . md5( $amount . $method . $date );
+        if ( get_transient( $idem_key ) ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $pmt_lock_key ) );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'คำขอซ้ำ กรุณารอสักครู่', 'code' => 'DUPLICATE' ), 409 );
+        }
+        set_transient( $idem_key, 1, 10 );
+
         $current_status = get_field( 'po_status', $po_id );
         // BUG-3 fix: ลบ partial_received — FSM ไม่มี transition partial_received→paid
         // Admin ต้องรอรับครบก่อนจ่ายเงิน (received/partial_paid)
         $payable_statuses = array( 'received', 'partial_paid' );
         if ( ! in_array( $current_status, $payable_statuses, true ) ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $pmt_lock_key ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่สามารถบันทึกการจ่ายเงินในสถานะนี้', 'code' => 'NOT_PAYABLE' ), 400 );
         }
 
         // G-08 fix: ใช้ received value จริง (SUM rcv_total_value) แทน po_total_amount
         // เพราะ partial receive → ค้างจ่ายจริง = มูลค่าที่รับ ไม่ใช่มูลค่าที่สั่ง
-        global $wpdb;
         $received_total = (float) $wpdb->get_var( $wpdb->prepare(
             "SELECT COALESCE(SUM(pm.meta_value), 0)
              FROM {$wpdb->posts} rcv
@@ -2738,6 +2755,7 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
         $remaining   = round( $po_total - $paid_so_far, 2 );
 
         if ( $amount > $remaining + 0.01 ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $pmt_lock_key ) );
             return new WP_REST_Response( array(
                 'success'   => false,
                 'error'     => sprintf( 'จำนวนเงิน (%.2f) เกินยอดค้างจ่าย (%.2f)', $amount, $remaining ),
@@ -2772,6 +2790,7 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
         ) );
 
         if ( is_wp_error( $pmt_id ) ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $pmt_lock_key ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'บันทึกการจ่ายเงินไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
         }
 
@@ -2839,6 +2858,9 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
         }
 
         $new_remaining = round( $po_total - $new_paid, 2 );
+
+        // FIX-2a: Release payment lock
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $pmt_lock_key ) );
 
         return new WP_REST_Response( array(
             'success'        => true,
