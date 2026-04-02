@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.1.5 — KB search + Dealer lookup: MongoDB local first → WP API fallback
+ * V.1.6 — KB search synonym mapping + multi-strategy search + dealer fallback
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -376,12 +376,59 @@ async function executeTool(toolName, args, sourceId) {
   }
   if (toolName === "dinoco_kb_search") {
     const question = args.question || "";
-    // ★ V.1.5: ค้น MongoDB KB ก่อน (101 entries ที่ import ไว้) → fallback WP API
+    // ★ V.1.6: ค้น MongoDB KB ก่อน — synonym mapping + multi-strategy search
     const db = await getDB();
     if (db && question) {
       try {
-        const keywords = question.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim();
-        const regexParts = keywords.split(/\s+/).filter(w => w.length >= 2).slice(0, 5).join("|");
+        // Synonym mapping — คำที่ลูกค้าใช้ → คำใน KB
+        const SYNONYMS = {
+          "บุบ": "บุบ|ยุบ|Safety|ซับแรง|อลูมิเนียม 5052",
+          "สนิม": "สนิม|สแตนเลส|304|Self-healing",
+          "กันน้ำ": "กันน้ำ|IP67|ซีล|waterproof",
+          "น้ำเข้า": "กันน้ำ|น้ำเข้า|รั่ว|ซีล",
+          "กุญแจหาย": "กุญแจหาย|เปลี่ยนกุญแจ|ดอกกุญแจ",
+          "กุญแจฝืด": "กุญแจฝืด|WD-40|สเปรย์|ล็อค",
+          "ล้าง": "ล้าง|ทำความสะอาด|แชมพู|เช็ด",
+          "ขัด": "ขัด|Autosol|ครีมขัด|สแตนเลส",
+          "มุมแตก": "มุมแตก|มุมพลาสติก|ABS|เปลี่ยนมุม",
+          "สติกเกอร์": "สติกเกอร์|สติ๊กเกอร์|โลโก้|ลอก|เบิก",
+          "เคลม": "เคลม|claim|ซ่อม|ส่งซ่อม|ระยะเวลา|MC-",
+          "ล้ม": "ล้ม|อุบัติเหตุ|ซ่อมดัด|ฟรีค่าแรง|ล้มแปะ",
+          "ชนหนัก": "ชนหนัก|เสียรูป|50%|ไม่รับซ่อม|อะไหล่",
+          "ประกัน": "ประกัน|warranty|5 ปี|มือสอง|โอน",
+          "มือสอง": "มือสอง|โอน|สิทธิ์|มือแรก",
+          "ติดตั้ง": "ติดตั้ง|ค่าแรง|ช่าง|น็อต",
+          "คู่มือ": "คู่มือ|manual|วิธีติด|ลิงก์",
+          "ผ่อน": "ผ่อน|รูดบัตร|เครดิต|Shopee|Lazada|installment",
+          "COD": "COD|เก็บเงินปลายทาง|ปลายทาง|cash on delivery",
+          "ออฟฟิศ": "ออฟฟิศ|ลาดพร้าว|จตุจักร|ที่อยู่|โรงงาน|แผนที่",
+          "แบรนด์": "แบรนด์|ไทย|PPT|ผลิต|ประเทศอะไร|ของจีน",
+          "อะไหล่": "อะไหล่|การ์ดแฮนด์|แยกชิ้น|ขายเป็นชุด",
+          "หมวก": "หมวก|ใส่หมวก|ความจุ|ลิตร|45L|55L",
+          "เบาะ": "เบาะ|พิง|คนซ้อน|backrest|แถม",
+          "ถาด": "ถาด|เบสเพลท|baseplate|Quick Release|ล็อค",
+          "แร็ค": "แร็ค|rack|ตะแกรง|แร็คข้าง|แร็คหลัง|PRO|STD",
+          "ส่าย": "ส่าย|Aerodynamic|ลู่ลม|สั่น|หน้าส่าย",
+          "กระเป๋า": "กระเป๋า|DRY BAG|EXTREME|กันน้ำ|bag",
+          "ตัวแทน": "ตัวแทน|dealer|ร้าน|จำหน่าย|ซื้อที่ไหน",
+          "สมัครตัวแทน": "สมัครตัวแทน|เป็นตัวแทน|ดีลเลอร์|ชื่อร้าน|จังหวัด|เบอร์โทร",
+          "ด่า": "ร้องเรียน|ไม่พอใจ|แย่|ห่วย|complain|ผิดหวัง",
+          "edition": "Edition|ตัวแต่ง|แร็คศูนย์|BigWing",
+          "standard": "Standard|สแตนดาร์ด|ตัวธรรมดา|รถเปล่า",
+        };
+        let searchRegex = question.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim();
+        const words = searchRegex.split(/\s+/).filter(w => w.length >= 2);
+        // เพิ่ม synonyms
+        const expandedTerms = new Set(words);
+        for (const word of words) {
+          const wLower = word.toLowerCase();
+          for (const [key, syns] of Object.entries(SYNONYMS)) {
+            if (wLower.includes(key) || key.includes(wLower)) {
+              syns.split("|").forEach(s => expandedTerms.add(s));
+            }
+          }
+        }
+        const regexParts = [...expandedTerms].slice(0, 15).join("|");
         if (regexParts) {
           const localResults = await db.collection("knowledge_base").find({
             active: { $ne: false },
