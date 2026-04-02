@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * test-ai.js — ทดสอบ AI chatbot อัตโนมัติ (V.2 — อ่าน test cases จาก CSV)
+ * test-ai.js — ทดสอบ AI chatbot อัตโนมัติ (V.3 — 149 test cases ข้อยาก)
  *
  * Usage:
  *   docker cp scripts/test-ai.js smltrack-agent:/tmp/test-ai.js
