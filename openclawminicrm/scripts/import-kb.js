@@ -53,15 +53,14 @@ function parseCSV(csvText) {
     if (fields.length >= 3) {
       const [training_phrases, core_facts, ai_action] = fields;
       if (training_phrases && core_facts) {
-        // สร้าง question จาก training phrases (เอาคำแรกๆ)
-        const phrases = training_phrases.split(/[,\s]+/).filter(Boolean);
-        const question = phrases.slice(0, 5).join(" ").substring(0, 100);
+        // ★ V.2: ใช้ training phrases ทั้งหมดเป็น title (ไม่ตัด 5 คำ) → MongoDB search เจอมากขึ้น
+        const question = training_phrases.substring(0, 500);
 
         // แยก tags จาก training phrases
         const tags = training_phrases
           .split(/[\s,]+/)
           .filter(t => t.length >= 3 && t.length <= 30)
-          .slice(0, 15)
+          .slice(0, 20)
           .map(t => `#${t}`);
 
         // กำหนด category
