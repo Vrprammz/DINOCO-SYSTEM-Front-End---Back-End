@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
- * ║  Version: V.31.6 — Cancel 24hr cron on confirm + dup pickup   ║
+ * ║  Version: V.31.7 — Walk-in: skip stock/ship + auto-complete    ║
  * ║  DB_ID: 51                                                  ║
  * ║  DINOCO B2B Smart Order System                              ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -541,6 +541,29 @@ function b2b_action_confirm_order( $ticket_id, $group_id, $user_id, $reply_token
         return;
     }
 
+    // ── Walk-in: skip stock check, go straight to awaiting_confirm ──
+    if ( function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($ticket_id) ) {
+        $order_text = get_field('order_items', $ticket_id) ?: '';
+        $total = floatval(get_field('total_amount', $ticket_id));
+
+        b2b_set_order_status($ticket_id, 'awaiting_confirm');
+
+        // Send bill confirm Flex to customer
+        if ( function_exists('b2b_build_flex_stock_confirmed') && function_exists('b2b_push_guaranteed') ) {
+            $flex = b2b_build_flex_stock_confirmed($ticket_id, $total, $order_text);
+            b2b_push_guaranteed($group_id, array($flex), $ticket_id, 'stock_confirmed');
+        }
+
+        b2b_line_reply($reply_token, "✅ ส่งรายการเรียบร้อย กรุณายืนยันบิล");
+
+        // Notify admin (info only)
+        b2b_push_to_admin("🏪 [Walk-in] ออเดอร์ #" . $ticket_id);
+
+        // Skip SLA scheduling for walk-in
+        delete_transient($lock_key);
+        return;
+    }
+
     // OOS Memory Check
     $order_text = get_field('order_items', $ticket_id) ?: '';
     $oos_items = b2b_check_order_oos($order_text);
@@ -741,15 +764,20 @@ function b2b_action_confirm_bill( $ticket_id, $group_id, $user_id, $reply_token 
     // V.31.0: Send admin-critical messages FIRST (before heavy invoice image generation)
     // — shipping choice + admin notification must not be blocked by slow GD rendering
     $items_raw = get_field('order_items', $ticket_id) ?: '';
-    if ( function_exists('b2b_build_flex_shipping_choice') ) {
-        $flex = b2b_build_flex_shipping_choice($ticket_id, $dist_name, $items_raw);
-        if (function_exists('b2b_push_raw_to_admin')) b2b_push_raw_to_admin(array($flex));
-        b2b_log('[ConfirmBill] Sent shipping choice Flex to admin — #'.$ticket_id);
+    if ( function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($ticket_id) ) {
+        // Walk-in: ไม่ส่ง shipping choice, ไม่ schedule auto-Flash
+        b2b_push_to_admin("🏪 [Walk-in] บิล #" . $ticket_id . " — " . $dist_name . " ฿" . number_format($total, 0));
     } else {
-        b2b_push_to_admin("📦 เลือกวิธีจัดส่ง #".$ticket_id." — ".$dist_name." ยอด ฿".number_format($total,0));
+        if ( function_exists('b2b_build_flex_shipping_choice') ) {
+            $flex = b2b_build_flex_shipping_choice($ticket_id, $dist_name, $items_raw);
+            if (function_exists('b2b_push_raw_to_admin')) b2b_push_raw_to_admin(array($flex));
+            b2b_log('[ConfirmBill] Sent shipping choice Flex to admin — #'.$ticket_id);
+        } else {
+            b2b_push_to_admin("📦 เลือกวิธีจัดส่ง #".$ticket_id." — ".$dist_name." ยอด ฿".number_format($total,0));
+        }
+        // Auto-fallback: if admin doesn't choose within 1 hour, auto Flash + print
+        wp_schedule_single_event(time() + HOUR_IN_SECONDS, 'b2b_auto_ship_flash_event', array($ticket_id));
     }
-    // Auto-fallback: if admin doesn't choose within 1 hour, auto Flash + print
-    wp_schedule_single_event(time() + HOUR_IN_SECONDS, 'b2b_auto_ship_flash_event', array($ticket_id));
 
     // V.32: Redundant text removed — shipping choice flex above already notifies admin
 
@@ -3431,3 +3459,39 @@ function b2b_rest_confirm_delivery( WP_REST_Request $r ) {
     }
 }
 } // end function_exists b2b_rest_confirm_delivery
+
+// ── Walk-in: Auto-complete เมื่อจ่ายเงินแล้ว ──
+add_action('b2b_order_status_changed', 'b2b_walkin_auto_complete', 10, 4);
+if ( ! function_exists('b2b_walkin_auto_complete') ) {
+function b2b_walkin_auto_complete( $order_id, $from_status, $to_status, $actor ) {
+    if ( $to_status !== 'paid' ) return;
+    if ( ! function_exists('b2b_is_walkin_order') || ! b2b_is_walkin_order($order_id) ) return;
+
+    // Guard re-entry
+    static $processing = array();
+    if ( isset($processing[$order_id]) ) return;
+    $processing[$order_id] = true;
+
+    // Auto self-pickup → completed
+    if ( function_exists('b2b_transition_order') ) {
+        b2b_transition_order($order_id, 'completed', 'admin', 'walkin_auto_complete');
+    } else {
+        b2b_set_order_status($order_id, 'completed');
+    }
+    update_post_meta($order_id, '_b2b_shipping_method', 'walkin');
+
+    // Notify customer
+    $group_id = get_field('source_group_id', $order_id);
+    if ( $group_id ) {
+        if ( function_exists('b2b_line_push_raw') ) {
+            b2b_line_push_raw($group_id, array(array(
+                'type' => 'text',
+                'text' => "✅ ออเดอร์ #" . $order_id . " เสร็จสมบูรณ์\nขอบคุณที่ใช้บริการครับ 🙏"
+            )));
+        }
+    }
+
+    b2b_log('[Walk-in] Auto-completed order #' . $order_id);
+    unset($processing[$order_id]);
+}
+}
