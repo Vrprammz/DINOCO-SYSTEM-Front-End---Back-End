@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.5.5 — QC Reject flow: Flex push + rcv_has_reject flag + reject-resolve endpoint
+ * Version: V.5.6 — Fix reject-resolve: poi_unit_cost, MySQL lock, reship received, po_payment_status
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -3174,19 +3174,30 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'action ไม่ถูกต้อง (replacement/reship/write_off)', 'code' => 'INVALID_ACTION' ), 400 );
         }
 
+        // C-2: MySQL GET_LOCK ป้องกัน concurrent resolve
+        global $wpdb;
+        $lock_key = 'b2f_reject_resolve_' . $rcv_id;
+        $got_lock = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 0)", $lock_key ) );
+        if ( ! $got_lock ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กำลังดำเนินการอยู่', 'code' => 'LOCKED' ), 423 );
+        }
+
         $rcv_post = get_post( $rcv_id );
         if ( ! $rcv_post || $rcv_post->post_type !== 'b2f_receiving' ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบใบรับ', 'code' => 'NOT_FOUND' ), 404 );
         }
 
         // ตรวจว่ายัง unresolved
         if ( get_field( 'rcv_reject_resolved', $rcv_id ) ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ดำเนินการแล้ว ไม่สามารถทำซ้ำ', 'code' => 'ALREADY_RESOLVED' ), 400 );
         }
 
         $po_id    = intval( get_field( 'rcv_po_id', $rcv_id ) ?: 0 );
         $po_post  = get_post( $po_id );
         if ( ! $po_post || $po_post->post_type !== 'b2f_order' ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'PO_NOT_FOUND' ), 404 );
         }
 
@@ -3207,6 +3218,7 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
         }
 
         if ( empty( $reject_skus ) ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ reject items', 'code' => 'NO_REJECT' ), 400 );
         }
 
@@ -3220,17 +3232,17 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
             foreach ( $po_items as $pi ) {
                 $sku = $pi['poi_sku'] ?? '';
                 if ( isset( $reject_skus[ $sku ] ) ) {
-                    $unit_price = floatval( $pi['poi_unit_price'] ?? 0 );
-                    $qty        = $reject_skus[ $sku ];
+                    $unit_cost = floatval( $pi['poi_unit_cost'] ?? 0 );
+                    $qty       = $reject_skus[ $sku ];
                     $new_items[] = array(
                         'poi_sku'           => $sku,
                         'poi_product_name'  => $pi['poi_product_name'] ?? $sku,
-                        'poi_unit_price'    => $unit_price,
+                        'poi_unit_cost'     => $unit_cost,
                         'poi_qty_ordered'   => $qty,
                         'poi_qty_received'  => 0,
-                        'poi_subtotal'      => $unit_price * $qty,
+                        'poi_subtotal'      => $unit_cost * $qty,
                     );
-                    $new_total += $unit_price * $qty;
+                    $new_total += $unit_cost * $qty;
                 }
             }
 
@@ -3242,6 +3254,7 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
             ) );
 
             if ( is_wp_error( $new_po_id ) ) {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
                 return new WP_REST_Response( array( 'success' => false, 'error' => 'สร้าง PO ใหม่ไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
             }
 
@@ -3252,6 +3265,7 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
             update_field( 'po_total_amount', $new_total, $new_po_id );
             update_field( 'po_item_count', count( $new_items ), $new_po_id );
             update_field( 'po_is_replacement', 1, $new_po_id );
+            update_field( 'po_payment_status', 'unpaid', $new_po_id );
             update_field( 'po_parent_po_id', $po_id, $new_po_id );
             update_field( 'po_admin_note', 'Replacement PO จาก ' . $po_number . ' (QC reject)', $new_po_id );
 
@@ -3269,10 +3283,11 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
         // ── Action: reship — transition PO เดิม → confirmed ──
         if ( $action === 'reship' ) {
             $current_status = get_field( 'po_status', $po_id );
-            if ( $current_status === 'partial_received' ) {
+            if ( in_array( $current_status, array( 'partial_received', 'received' ), true ) ) {
                 if ( function_exists( 'b2f_transition_order' ) ) {
                     $trans = b2f_transition_order( $po_id, 'confirmed', 'admin', 'QC reject reship: ' . $note );
                     if ( is_wp_error( $trans ) ) {
+                        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
                         return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
                     }
                 } else {
@@ -3302,7 +3317,7 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
                     $accepted = $ordered - $reject_skus[ $sku ];
                     if ( $accepted < 0 ) $accepted = 0;
                     $pi['poi_qty_ordered'] = $accepted;
-                    $pi['poi_subtotal']    = floatval( $pi['poi_unit_price'] ?? 0 ) * $accepted;
+                    $pi['poi_subtotal']    = floatval( $pi['poi_unit_cost'] ?? 0 ) * $accepted;
                 }
                 $new_total    += floatval( $pi['poi_subtotal'] ?? 0 );
                 $updated_items[] = $pi;
@@ -3347,6 +3362,7 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
             b2f_log( sprintf( 'Reject resolve: rcv=#%d action=%s po=%s note=%s', $rcv_id, $action, $po_number, $note ) );
         }
 
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
         return new WP_REST_Response( array_merge( array( 'success' => true, 'rcv_id' => $rcv_id ), $result_data ), 200 );
     }
 }
