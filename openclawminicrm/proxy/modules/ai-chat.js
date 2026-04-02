@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.2.3 — Fix Gemini 2.5 Flash function calling: thinkingConfig + maxOutputTokens + role fix
+ * V.2.4 — Gemini 2.5 Flash STABLE (ไม่ใช่ preview) + thinkingConfig top-level fix
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -297,16 +297,14 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
     tool_config: { function_calling_config: { mode: "AUTO" } },
     generationConfig: {
       temperature: 0.3,
-      // ★ V.2.3: เพิ่ม maxOutputTokens เป็น 8192 เพราะ 2.5 Flash ใช้ thinking tokens จาก budget เดียวกัน
-      // 2048 น้อยเกินไป thinking กิน ~1500 tokens เหลือไม่พอ generate functionCall
       maxOutputTokens: 8192,
-      // ★ V.2.3: จำกัด thinking budget — ให้คิดไม่เกิน 1024 tokens เพื่อเหลือ budget สำหรับ function call
-      thinkingConfig: { thinkingBudget: 1024 },
     },
+    // ★ V.2.4: thinkingConfig ต้องอยู่ระดับ top-level ไม่ใช่ใน generationConfig
+    thinkingConfig: { thinkingBudget: 2048 },
   };
 
-  // ★ V.2.3: ใช้ gemini-2.5-flash-preview-05-20
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+  // ★ V.2.4: ใช้ stable model gemini-2.5-flash (ไม่ใช่ preview-05-20 ที่ function calling พัง)
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
   for (let i = 0; i < 4; i++) {
     try {
