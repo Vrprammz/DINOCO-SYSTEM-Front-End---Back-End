@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
- * ║  Version: V.31.8 — Walk-in bank + remove redundant messages     ║
+ * ║  Version: V.31.9 — Admin cancel completed walk-in + debt reverse ║
  * ║  DB_ID: 51                                                  ║
  * ║  DINOCO B2B Smart Order System                              ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -336,12 +336,18 @@ function b2b_route_bot_command( $text, $group_id, $user_id, $reply_token ) {
         return;
     }
     // V.31.0: Admin cancel command: @admincancel #[ticket_id]
+    // V.31.9: Allow cancelling completed walk-in orders
     if ( preg_match('/^@(?:admincancel|ยกเลิกเลย)\s*#?(\d+)/iu', $text, $m) ) {
         if (!$is_admin) { b2b_line_reply($reply_token, "⚠️ คำสั่งนี้ใช้ได้เฉพาะในกลุ่ม Admin ครับ"); return; }
         $tid = intval($m[1]);
         if ( $tid && get_post_type($tid) === 'b2b_order' ) {
             $status = get_field('order_status', $tid);
-            $non_cancellable = array('cancelled', 'completed', 'claim_resolved');
+            $is_walkin = function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($tid);
+            // V.31.9: completed walk-in สามารถยกเลิกได้
+            $non_cancellable = array('cancelled', 'claim_resolved');
+            if ( $status === 'completed' && ! $is_walkin ) {
+                $non_cancellable[] = 'completed';
+            }
             if ( in_array($status, $non_cancellable, true) ) {
                 b2b_line_reply($reply_token, "❌ ออเดอร์ #{$tid} ไม่สามารถยกเลิกได้ (สถานะ: {$status})");
                 return;
@@ -355,9 +361,11 @@ function b2b_route_bot_command( $text, $group_id, $user_id, $reply_token ) {
             set_transient($lock_key, 1, 10);
 
             // Reverse debt if billed (FIX C1+C2: check is_billed + set false after reverse)
+            // V.31.9: เพิ่ม 'completed' ใน debt reversal statuses สำหรับ walk-in
             $prev_status = $status;
             $was_billed = get_field('is_billed', $tid);
-            if ( $was_billed && in_array($status, array('awaiting_payment', 'paid', 'packed', 'shipped'), true) ) {
+            $debt_statuses = array('awaiting_payment', 'paid', 'packed', 'shipped', 'completed');
+            if ( $was_billed && in_array($status, $debt_statuses, true) ) {
                 $total = floatval(get_field('total_amount', $tid));
                 $gid = get_field('source_group_id', $tid);
                 $dist = $gid ? b2b_get_dist_by_group($gid) : null;
@@ -375,15 +383,36 @@ function b2b_route_bot_command( $text, $group_id, $user_id, $reply_token ) {
             update_field('cancel_prev_status', $prev_status, $tid);
             b2b_set_order_status($tid, 'cancelled');
 
-            // Notify customer
+            // V.31.9: Notify customer group — Flex card for walk-in, text for normal
             $group_id_notify = get_field('source_group_id', $tid);
             if ($group_id_notify) {
-                b2b_line_push($group_id_notify, "❌ ออเดอร์ #{$tid} ถูกยกเลิกโดยทีมงาน");
+                $cancel_total = floatval(get_field('total_amount', $tid));
+                if ($is_walkin && function_exists('b2b_flex_header')) {
+                    $body_contents = array(
+                        array('type'=>'text','text'=>'ออเดอร์ Walk-in ถูกยกเลิกโดยแอดมิน','size'=>'sm','color'=>'#374151','wrap'=>true),
+                    );
+                    if ($was_billed && $cancel_total > 0) {
+                        $body_contents[] = array('type'=>'text','text'=>'คืนเครดิต ฿' . number_format($cancel_total, 0) . ' แล้ว','size'=>'sm','color'=>'#16a34a','margin'=>'sm','wrap'=>true);
+                    }
+                    $body_contents[] = array('type'=>'text','text'=>'สามารถสั่งสินค้าใหม่ได้ตลอดเวลาครับ','size'=>'xs','color'=>'#64748b','margin'=>'sm','wrap'=>true);
+                    $flex_wc = array('type'=>'flex','altText'=>'❌ ยกเลิก Walk-in #'.$tid,
+                        'contents'=>array('type'=>'bubble','size'=>'kilo',
+                            'header'=>b2b_flex_header('❌ ยกเลิก Walk-in','ออเดอร์ #'.$tid,'#dc2626'),
+                            'body'=>array('type'=>'box','layout'=>'vertical','paddingAll'=>'14px','contents'=>$body_contents)));
+                    if (function_exists('b2b_push_guaranteed')) {
+                        b2b_push_guaranteed($group_id_notify, array($flex_wc), $tid, 'walkin_cancelled');
+                    } else {
+                        b2b_line_push_raw($group_id_notify, array($flex_wc));
+                    }
+                } else {
+                    b2b_line_push($group_id_notify, "❌ ออเดอร์ #{$tid} ถูกยกเลิกโดยทีมงาน");
+                }
             }
 
             delete_transient($lock_key);
-            b2b_line_reply($reply_token, "✅ ยกเลิกออเดอร์ #{$tid} เรียบร้อย (สถานะเดิม: {$prev_status})");
-            b2b_log("[AdminCancel] #{$tid} cancelled by admin (was: {$prev_status})");
+            $walkin_label = $is_walkin ? ' [Walk-in]' : '';
+            b2b_line_reply($reply_token, "✅ ยกเลิกออเดอร์ #{$tid}{$walkin_label} เรียบร้อย (สถานะเดิม: {$prev_status})" . ($was_billed ? ' (คืนหนี้แล้ว)' : ''));
+            b2b_log("[AdminCancel] #{$tid}{$walkin_label} cancelled by admin (was: {$prev_status})");
             return;
         }
     }
