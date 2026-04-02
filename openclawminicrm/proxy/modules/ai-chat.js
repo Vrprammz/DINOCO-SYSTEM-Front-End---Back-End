@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.2.0 — 3-Tier AI: Gemini 2.5 Flash (ลูกน้อง) + Haiku 4.5 (รองหัวหน้า 20%) + Sonnet 4 (หัวหน้าใหญ่ 10%)
+ * V.2.1 — 3-Tier AI: Haiku 4.5 (primary) + Gemini 2.5 Flash (fallback) + Sonnet 4 (boss 10%)
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -383,17 +383,17 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
   return null;
 }
 
-// === DINOCO AI V.2.0 — Gemini 2.5 Flash primary, Haiku fallback ===
+// === DINOCO AI V.2.1 — Haiku 4.5 primary (ฉลาด+ถูก), Gemini/Sonnet fallback ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
-  // ★ Tier 1: Gemini 2.5 Flash (ลูกน้อง — ทุกข้อความ)
-  const geminiReply = await callGeminiWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
-  if (geminiReply) return sanitizeAIOutput(geminiReply);
-  // ★ Tier 1 fallback: Claude Haiku 4.5 (ถ้า Gemini พัง)
-  console.log("[AI] Gemini 2.5 Flash failed -> trying Claude Haiku 4.5...");
+  // ★ Tier 1: Claude Haiku 4.5 (ลูกน้อง — ฉลาด tool calling ดี ราคาถูก)
   const haikuReply = await callClaudeWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId, "claude-haiku-4-5-20251001");
   if (haikuReply) return sanitizeAIOutput(haikuReply);
-  // ★ Tier 1 last resort: Claude Sonnet 4
-  console.log("[AI] Haiku also failed -> trying Claude Sonnet 4...");
+  // ★ Fallback: Gemini 2.0 Flash (ฟรี ถ้า Haiku พัง)
+  console.log("[AI] Haiku 4.5 failed -> trying Gemini 2.0 Flash...");
+  const geminiReply = await callGeminiWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
+  if (geminiReply) return sanitizeAIOutput(geminiReply);
+  // ★ Last resort: Claude Sonnet 4
+  console.log("[AI] Gemini also failed -> trying Claude Sonnet 4...");
   const sonnetReply = await callClaudeWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
   if (sonnetReply) return sanitizeAIOutput(sonnetReply);
   console.error("[AI] All 3 models failed");
