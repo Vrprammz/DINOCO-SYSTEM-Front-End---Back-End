@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.6.6 — Fix remaining: shipped-received (reject ไม่กลับมารับซ้ำ)
+ * Version: V.6.7 — po-cancel ลบจริง (wp_delete_post) + ลบ receiving/payment
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -1455,44 +1455,62 @@ if ( ! function_exists( 'b2f_rest_po_update' ) ) {
 
 if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
     /**
-     * POST /po-cancel — ยกเลิก PO (admin) + rollback ถ้า partial received
+     * POST /po-cancel — ลบ PO ออกจากระบบ (admin) + rollback debt + แจ้งโรงงาน
      * Body: { po_id, reason }
+     * ลบไม่ได้: completed (ปิดแล้ว)
      */
     function b2f_rest_po_cancel( WP_REST_Request $req ) {
         $po_id  = intval( $req->get_param( 'po_id' ) ?: 0 );
         $reason = sanitize_textarea_field( $req->get_param( 'reason' ) ?: '' );
 
         if ( ! $po_id ) {
-            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุใบสั่งซื้อ', 'code' => 'MISSING_PO' ), 400 );
         }
 
         $post = get_post( $po_id );
         if ( ! $post || $post->post_type !== 'b2f_order' ) {
-            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบใบสั่งซื้อ', 'code' => 'NOT_FOUND' ), 404 );
         }
 
         $current_status = get_field( 'po_status', $po_id );
         $maker_id       = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
 
-        // Transition
-        if ( function_exists( 'b2f_transition_order' ) ) {
-            $trans = b2f_transition_order( $po_id, 'cancelled', 'admin', $reason );
-            if ( is_wp_error( $trans ) ) {
-                return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
-            }
-        } else {
-            update_field( 'po_status', 'cancelled', $po_id );
+        // V.6.7: ห้ามลบ completed
+        if ( $current_status === 'completed' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ใบสั่งซื้อที่ปิดแล้วลบไม่ได้', 'code' => 'COMPLETED' ), 400 );
         }
 
-        // Save cancel metadata
-        update_field( 'po_cancelled_reason', $reason, $po_id );
-        update_field( 'po_cancelled_by', strval( get_current_user_id() ), $po_id );
-        update_field( 'po_cancelled_date', wp_date( 'Y-m-d' ), $po_id );
+        // เก็บข้อมูลก่อนลบ (สำหรับ Flex แจ้งโรงงาน)
+        $po_number      = get_field( 'po_number', $po_id ) ?: 'PO-' . $po_id;
+        $maker_name_str = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
+        $total_str      = number_format( floatval( get_field( 'po_total_amount', $po_id ) ?: 0 ), 0 );
+        $maker_group    = $maker_id ? ( get_field( 'maker_line_group_id', $maker_id ) ?: '' ) : '';
 
-        // Rollback credit — recalculate จาก data จริง (CRIT-02 fix)
-        // ใช้ recalculate แทน manual subtract — ถูกต้องทุก status ไม่ว่า cancel จาก submitted/confirmed/partial_received
+        // Rollback credit — recalculate หลังลบ
         $rollback_info = array();
         $old_debt = floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 );
+
+        // ลบ related records: receiving, payment
+        global $wpdb;
+        $related_types = array( 'b2f_receiving', 'b2f_payment' );
+        $deleted_related = 0;
+        foreach ( $related_types as $rel_type ) {
+            $related_ids = $wpdb->get_col( $wpdb->prepare(
+                "SELECT p.ID FROM {$wpdb->posts} p
+                 JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+                 WHERE p.post_type = %s AND pm.meta_key IN ('rcv_po_id','pmt_po_id') AND pm.meta_value = %s",
+                $rel_type, $po_id
+            ) );
+            foreach ( $related_ids as $rel_id ) {
+                wp_delete_post( intval( $rel_id ), true ); // force delete
+                $deleted_related++;
+            }
+        }
+
+        // ลบ PO จริง
+        wp_delete_post( $po_id, true );
+
+        // Recalculate debt หลังลบ
         if ( function_exists( 'b2f_recalculate_payable' ) && $maker_id > 0 ) {
             $new_debt = b2f_recalculate_payable( $maker_id );
             $reversed = round( $old_debt - $new_debt, 2 );
@@ -1503,17 +1521,10 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
             }
         }
 
-        // Push cancel notification ทั้ง Maker + Admin group (พร้อม fallback text)
-        $maker_group = get_field( 'maker_line_group_id', $maker_id );
-        $po_number   = get_field( 'po_number', $po_id ) ?: 'PO-' . $po_id;
+        // Push cancel notification ทั้ง Maker + Admin group
         $cancelled_by = 'Admin';
         $uid = get_current_user_id();
         if ( $uid ) { $u = get_user_by( 'id', $uid ); if ( $u ) $cancelled_by = $u->display_name; }
-
-        // → สร้าง Flex cancel inline (ไม่พึ่ง Snippet 1 function_exists)
-        $maker_name_str = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
-        $total_str      = number_format( floatval( get_field( 'po_total_amount', $po_id ) ?: 0 ), 0 );
-        $item_count_str = intval( get_field( 'po_item_count', $po_id ) ?: 0 ) . ' SKU';
 
         $cancel_body = array(
             array( 'type' => 'box', 'layout' => 'horizontal', 'contents' => array(
@@ -1534,26 +1545,26 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         $logo_url = 'https://www.dinoco.in.th/wp-content/uploads/2026/01/sss.png';
 
         // Flex Maker
-        $flex_maker = array( 'type' => 'flex', 'altText' => '❌ ยกเลิก PO ' . $po_number,
+        $flex_maker = array( 'type' => 'flex', 'altText' => '❌ ยกเลิกใบสั่งซื้อ ' . $po_number,
             'contents' => array( 'type' => 'bubble', 'size' => 'mega',
                 'header' => array( 'type' => 'box', 'layout' => 'vertical', 'backgroundColor' => '#0a0a0a', 'paddingAll' => '16px',
                     'contents' => array( array( 'type' => 'box', 'layout' => 'horizontal', 'alignItems' => 'center', 'contents' => array(
                         array( 'type' => 'image', 'url' => $logo_url, 'size' => 'xxs', 'aspectMode' => 'fit', 'flex' => 0 ),
                         array( 'type' => 'box', 'layout' => 'vertical', 'flex' => 1, 'margin' => 'md', 'contents' => array(
-                            array( 'type' => 'text', 'text' => '❌ DINOCO ยกเลิก PO', 'weight' => 'bold', 'color' => '#ffffff', 'size' => 'md' ),
+                            array( 'type' => 'text', 'text' => '❌ DINOCO ยกเลิกใบสั่งซื้อ', 'weight' => 'bold', 'color' => '#ffffff', 'size' => 'md' ),
                             array( 'type' => 'text', 'text' => $po_number, 'color' => '#f87171', 'size' => 'xs', 'margin' => 'xs' ) ) ) ) ) ) ),
                 'body' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $cancel_body ) ) );
 
         // Flex Admin (เพิ่ม "โดย")
         $admin_body = $cancel_body;
         $admin_body[] = array( 'type' => 'text', 'text' => 'ยกเลิกโดย: ' . $cancelled_by, 'size' => 'xs', 'color' => '#94a3b8', 'margin' => 'sm' );
-        $flex_admin = array( 'type' => 'flex', 'altText' => '❌ ยกเลิก PO ' . $po_number,
+        $flex_admin = array( 'type' => 'flex', 'altText' => '❌ ยกเลิกใบสั่งซื้อ ' . $po_number,
             'contents' => array( 'type' => 'bubble', 'size' => 'mega',
                 'header' => array( 'type' => 'box', 'layout' => 'vertical', 'backgroundColor' => '#0a0a0a', 'paddingAll' => '16px',
                     'contents' => array( array( 'type' => 'box', 'layout' => 'horizontal', 'alignItems' => 'center', 'contents' => array(
                         array( 'type' => 'image', 'url' => $logo_url, 'size' => 'xxs', 'aspectMode' => 'fit', 'flex' => 0 ),
                         array( 'type' => 'box', 'layout' => 'vertical', 'flex' => 1, 'margin' => 'md', 'contents' => array(
-                            array( 'type' => 'text', 'text' => '❌ ยกเลิก PO', 'weight' => 'bold', 'color' => '#ffffff', 'size' => 'md' ),
+                            array( 'type' => 'text', 'text' => '❌ ยกเลิกใบสั่งซื้อ', 'weight' => 'bold', 'color' => '#ffffff', 'size' => 'md' ),
                             array( 'type' => 'text', 'text' => $po_number, 'color' => '#f87171', 'size' => 'xs', 'margin' => 'xs' ) ) ) ) ) ) ),
                 'body' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $admin_body ) ) );
 
@@ -1568,17 +1579,16 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         }
 
         if ( function_exists( 'b2f_log' ) ) {
-            $po_number = get_field( 'po_number', $po_id );
-            b2f_log( sprintf( 'PO cancelled: %s (#%d) reason=%s rollback=%s',
-                $po_number, $po_id, $reason, wp_json_encode( $rollback_info )
+            b2f_log( sprintf( 'PO DELETED: %s (#%d) reason=%s related_deleted=%d rollback=%s',
+                $po_number, $po_id, $reason, $deleted_related, wp_json_encode( $rollback_info )
             ) );
         }
 
         $resp = array(
-            'success' => true, 'po_id' => $po_id, 'status' => 'cancelled',
+            'success' => true, 'po_id' => $po_id, 'action' => 'deleted', 'po_number' => $po_number,
+            'deleted_related' => $deleted_related,
             'push_maker' => $push_maker ? 'sent' : ( empty( $maker_group ) ? 'no_group' : 'failed' ),
             'push_admin' => $push_admin ? 'sent' : ( ! defined( 'B2B_ADMIN_GROUP_ID' ) ? 'no_config' : 'failed' ),
-            'line_push_available' => function_exists( 'b2f_line_push' ) ? 'yes' : 'NO — Snippet 1 not loaded!',
         );
         if ( ! empty( $rollback_info ) ) {
             $resp['rollback'] = $rollback_info;
