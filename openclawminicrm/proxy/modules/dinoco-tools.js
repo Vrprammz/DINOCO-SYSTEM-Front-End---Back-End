@@ -438,17 +438,35 @@ async function executeTool(toolName, args, sourceId) {
         };
         let searchRegex = question.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim();
         const words = searchRegex.split(/\s+/).filter(w => w.length >= 2);
-        // เพิ่ม synonyms
+        // ★ V.1.8: Strategy 1 — ค้นด้วยคำ original ก่อน (ไม่ expand)
+        const originalRegex = words.slice(0, 8).join("|");
+        if (originalRegex) {
+          const directResults = await db.collection("knowledge_base").find({
+            active: { $ne: false },
+            $or: [
+              { content: { $regex: originalRegex, $options: "i" } },
+              { title: { $regex: originalRegex, $options: "i" } },
+              { tags: { $regex: originalRegex, $options: "i" } },
+            ]
+          }).limit(3).toArray();
+          if (directResults.length > 0) {
+            console.log(`[KB-Local] Direct match: "${originalRegex}" → ${directResults.length} results`);
+            return directResults.map(e => `Q: ${e.title}\nA: ${e.content}`).join("\n---\n")
+              + "\n\n[คำสั่ง: ตอบจากข้อมูลข้างบนเท่านั้น ห้ามเพิ่มข้อมูลที่ไม่มี]";
+          }
+        }
+        // ★ V.1.8: Strategy 2 — ค้นด้วย synonyms (ถ้า direct ไม่เจอ)
         const expandedTerms = new Set(words);
         for (const word of words) {
           const wLower = word.toLowerCase();
           for (const [key, syns] of Object.entries(SYNONYMS)) {
-            if (wLower.includes(key) || key.includes(wLower)) {
+            // exact match เท่านั้น — ห้าม partial match (ป้องกัน "สี" match "สนิม")
+            if (wLower === key || wLower === key.toLowerCase()) {
               syns.split("|").forEach(s => expandedTerms.add(s));
             }
           }
         }
-        const regexParts = [...expandedTerms].slice(0, 15).join("|");
+        const regexParts = [...expandedTerms].slice(0, 12).join("|");
         if (regexParts) {
           const localResults = await db.collection("knowledge_base").find({
             active: { $ne: false },
