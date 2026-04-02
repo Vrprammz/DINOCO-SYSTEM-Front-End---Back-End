@@ -435,6 +435,16 @@ async function executeTool(toolName, args, sourceId) {
           "ด่า": "ร้องเรียน|ไม่พอใจ|แย่|ห่วย|complain|ผิดหวัง",
           "edition": "Edition|ตัวแต่ง|แร็คศูนย์|BigWing",
           "standard": "Standard|สแตนดาร์ด|ตัวธรรมดา|รถเปล่า",
+          // สแลง
+          "กะบ๊อก": "กล่อง|ปี๊บ|กล่องอลูมิเนียม|กะบ๊อก|box|top case",
+          "ปี๊บ": "กล่อง|ปี๊บ|กล่องอลูมิเนียม|กะบ๊อก|box|top case|ปิ๊บ",
+          "กะบ๊อกข้าง": "กล่องข้าง|ปี๊บข้าง|side case|side box",
+          // เสียง
+          "เสียง": "เสียง|ก๊อกแก๊ก|กรอบแกรบ|rattling|ดัง|กระทบ|สั่น",
+          "ก๊อกแก๊ก": "เสียง|ก๊อกแก๊ก|กรอบแกรบ|rattling|ดัง|ซับใน|PU",
+          // สเปค
+          "น้ำหนัก": "น้ำหนัก|กิโล|กก|กรัม|หนัก|เบา|weight|kg",
+          "สเปค": "สเปค|ขนาด|มิติ|น้ำหนัก|กว้าง|ยาว|สูง|ซม|cm|spec",
         };
         let searchRegex = question.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim();
         const words = searchRegex.split(/\s+/).filter(w => w.length >= 2);
