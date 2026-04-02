@@ -25,7 +25,7 @@ const args = process.argv.slice(2);
 const criticalOnly = args.includes("--critical-only");
 const quickMode = args.includes("--quick");
 const delayArg = args.find(a => a.startsWith("--delay="));
-const DELAY = delayArg ? parseInt(delayArg.split("=")[1]) : 2000;
+const DELAY = delayArg ? parseInt(delayArg.split("=")[1]) : 4000; // ★ V.5: เพิ่มเป็น 4s ลด Claude 429 rate limit
 
 // === Load test cases from CSV ===
 // CSV format: mustContain ใช้ ";" เป็น AND, "|" เป็น OR ภายในแต่ละ group
