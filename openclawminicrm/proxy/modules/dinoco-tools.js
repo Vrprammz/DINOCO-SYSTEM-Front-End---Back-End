@@ -87,8 +87,8 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "get_analytics",
-      description: "ดูคะแนนวิเคราะห์ความรู้สึกและแนวโน้มซื้อของลูกค้า",
-      parameters: { type: "object", properties: {} },
+      description: "ดูคะแนนวิเคราะห์ความรู้สึกและแนวโน้มซื้อของลูกค้า ใช้เมื่อต้องการดูสถิติหรือข้อมูลลูกค้า",
+      parameters: { type: "object", properties: {}, required: [] },
     },
   },
   {

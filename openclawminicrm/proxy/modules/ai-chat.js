@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.2.2 — 3-Tier AI: Gemini 2.5 Flash (primary + tool_config AUTO) + Haiku VP 20% + Sonnet Boss 10%
+ * V.2.3 — Fix Gemini 2.5 Flash function calling: thinkingConfig + maxOutputTokens + role fix
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -245,12 +245,25 @@ function sanitizeAIOutput(text) {
 }
 
 // === Gemini Flash with Function Calling ===
+// ★ V.2.3: Fix Gemini 2.5 Flash — thinkingConfig + maxOutputTokens 8192 + proper functionResponse
 async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
   const apiKey = getDynamicKeySync("GOOGLE_API_KEY");
   if (!apiKey) return null;
-  const functionDeclarations = tools.map((t) => ({
-    name: t.function.name, description: t.function.description, parameters: t.function.parameters,
-  }));
+
+  // ★ V.2.3: Sanitize parameters — Gemini 2.5 Flash เข้มงวดกว่า 2.0
+  // ลบ properties ที่เป็น {} (empty) เพราะ 2.5 Flash ปฏิเสธ tool ที่ไม่มี parameter
+  const functionDeclarations = tools.map((t) => {
+    const decl = {
+      name: t.function.name,
+      description: t.function.description,
+    };
+    const params = t.function.parameters;
+    if (params && params.properties && Object.keys(params.properties).length > 0) {
+      decl.parameters = params;
+    }
+    // ถ้าไม่มี properties (tool ไม่รับ args) → ไม่ส่ง parameters เลย
+    return decl;
+  });
 
   // ★ V.1.4: ส่ง conversation history + dedup consecutive same-role (Gemini ต้อง alternate user/model)
   const contents = [];
@@ -276,29 +289,61 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
   } else {
     contents.push({ role: "user", parts: [{ text: userMessage }] });
   }
+
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents,
     tools: [{ functionDeclarations }],
-    // ★ V.2.2: tool_config AUTO — บังคับ Gemini 2.5 Flash ให้พิจารณาเรียก tool ทุกครั้ง
     tool_config: { function_calling_config: { mode: "AUTO" } },
-    generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
+    generationConfig: {
+      temperature: 0.3,
+      // ★ V.2.3: เพิ่ม maxOutputTokens เป็น 8192 เพราะ 2.5 Flash ใช้ thinking tokens จาก budget เดียวกัน
+      // 2048 น้อยเกินไป thinking กิน ~1500 tokens เหลือไม่พอ generate functionCall
+      maxOutputTokens: 8192,
+      // ★ V.2.3: จำกัด thinking budget — ให้คิดไม่เกิน 1024 tokens เพื่อเหลือ budget สำหรับ function call
+      thinkingConfig: { thinkingBudget: 1024 },
+    },
   };
-  // ★ V.2.2: Gemini 2.5 Flash — ฉลาดกว่า 2.0 + tool_config AUTO แก้ปัญหาไม่เรียก tool
+
+  // ★ V.2.3: ใช้ gemini-2.5-flash-preview-05-20
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
   for (let i = 0; i < 4; i++) {
     try {
       const res = await fetch(url, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
+        body: JSON.stringify(body),
+        // ★ V.2.3: เพิ่ม timeout เป็น 60s เพราะ thinking model ใช้เวลานานกว่า
+        signal: AbortSignal.timeout(60000),
       });
-      if (!res.ok) return null;
-      const data = await res.json();
-      const parts = data.candidates?.[0]?.content?.parts || [];
-      if (data.usageMetadata) {
-        trackAICost({ provider: "Gemini-Tools", model: "gemini-2.0-flash", feature: "chat-with-tools",
-          inputTokens: data.usageMetadata.promptTokenCount || 0, outputTokens: data.usageMetadata.candidatesTokenCount || 0, sourceId });
+
+      if (!res.ok) {
+        // ★ V.2.3: Log error body เพื่อ debug
+        const errBody = await res.text().catch(() => "");
+        console.error(`[Gemini] HTTP ${res.status}: ${errBody.substring(0, 300)}`);
+        return null;
       }
+
+      const data = await res.json();
+
+      // ★ V.2.3: ตรวจ blocked/error candidates
+      if (data.candidates?.[0]?.finishReason === "SAFETY" || data.candidates?.[0]?.finishReason === "RECITATION") {
+        console.warn(`[Gemini] Blocked: ${data.candidates[0].finishReason}`);
+        return null;
+      }
+
+      const parts = data.candidates?.[0]?.content?.parts || [];
+
+      if (data.usageMetadata) {
+        trackAICost({ provider: "Gemini-Tools", model: "gemini-2.5-flash", feature: "chat-with-tools",
+          inputTokens: data.usageMetadata.promptTokenCount || 0,
+          outputTokens: data.usageMetadata.candidatesTokenCount || 0,
+          thinkingTokens: data.usageMetadata.thoughtsTokenCount || 0,
+          sourceId });
+      }
+
+      // ★ V.2.3: Gemini 2.5 Flash อาจส่ง thinking text + functionCall ใน parts เดียวกัน
+      // ต้องหา functionCall จาก parts ทั้งหมด ไม่ใช่แค่ตัวแรก
       const funcCall = parts.find((p) => p.functionCall);
       if (funcCall) {
         const { name, args } = funcCall.functionCall;
@@ -307,13 +352,24 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
         // ★ V.1.4: เก็บ tool results ล่าสุดสำหรับ claudeSupervisor
         const toolSummary = typeof toolResult === "string" ? toolResult.substring(0, 500) : JSON.stringify(toolResult).substring(0, 500);
         _lastToolResults.set(sourceId, { name, args, result: toolSummary, at: Date.now() });
+
+        // ★ V.2.3: functionResponse ต้องอยู่ใน parts[] ไม่ใช่ top-level
+        // Gemini 2.5 Flash ต้องการ role "model" สำหรับ functionCall แล้ว role "user" สำหรับ functionResponse (format ใหม่)
         contents.push({ role: "model", parts: [{ functionCall: { name, args: args || {} } }] });
-        contents.push({ role: "user", parts: [{ functionResponse: { name, response: { result: toolResult } } }] });
+        contents.push({
+          role: "user",
+          parts: [{ functionResponse: { name, response: { content: toolResult } } }],
+        });
         body.contents = contents;
         continue;
       }
-      const textReply = parts.find((p) => p.text)?.text;
-      return textReply || null;
+
+      // ★ V.2.3: กรอง thinking parts ออก — เอาแค่ text จริง (ไม่ใช่ thought)
+      const textPart = parts.find((p) => p.text && !p.thought);
+      const textReply = textPart?.text;
+      // Fallback: ถ้าไม่มี text ที่ไม่ใช่ thought ลองเอา text ตัวแรก
+      return textReply || parts.find((p) => p.text)?.text || null;
+
     } catch (e) {
       console.error("[Gemini] Error:", e.message);
       return null;
@@ -385,7 +441,7 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
   return null;
 }
 
-// === DINOCO AI V.2.2 — Gemini 2.5 Flash primary + Haiku/Sonnet fallback ===
+// === DINOCO AI V.2.3 — Gemini 2.5 Flash primary + Haiku/Sonnet fallback ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
   // ★ Tier 1: Gemini 2.5 Flash (ลูกน้อง — ทุกข้อความ)
   const geminiReply = await callGeminiWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
