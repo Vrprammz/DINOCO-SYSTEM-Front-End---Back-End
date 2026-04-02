@@ -669,16 +669,14 @@ def api_manual_flash_cancel():
 @app.route('/api/manual-flash-ready', methods=['POST'])
 @require_auth
 def api_manual_flash_ready():
-    """Call courier for manual shipment (uses existing Flash notify)."""
+    """Call courier for manual shipment — uses dedicated endpoint (no ticket_id)."""
     config = load_config()
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
         api_key = config.get('api_key', '')
-        url = f'{wp_url}/wp-json/b2b/v1/rpi-flash-ready'
-        # Manual shipments don't have ticket_id — use notify_courier directly
-        # We pass a dummy ticket_id=0 to trigger the Flash notify without ticket
+        url = f'{wp_url}/wp-json/b2b/v1/manual-flash-ready'
         resp = http_requests.post(
-            url, json={'ticket_id': 0, 'manual': True},
+            url, json=request.json or {},
             headers={'X-Print-Key': api_key}, timeout=35,
         )
         return jsonify(resp.json()), resp.status_code
