@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.5.4 — Fix $gpush → direct call + Maker Flex แสดง "สั่ง X | ส่งรอบนี้ Y"
+ * Version: V.5.5 — QC Reject flow: Flex push + rcv_has_reject flag + reject-resolve endpoint
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -177,6 +177,13 @@ add_action( 'rest_api_init', function () {
         'callback'            => 'b2f_rest_reject_lot',
         'permission_callback' => $admin_perm,
     ) );
+    // ── QC Reject Resolve (V.5.5) ──
+    register_rest_route( $ns, '/reject-resolve', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_reject_resolve',
+        'permission_callback' => $admin_perm,
+    ) );
+
     // ── GAP-05: Admin ปิด PO ที่ไม่ต้องจ่ายเงิน (received → completed) ──
     register_rest_route( $ns, '/po-complete', array(
         'methods'             => 'POST',
@@ -1938,7 +1945,8 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
                 $idx          = $sku_map[ $sku ];
                 $ordered      = intval( $po_items[ $idx ]['poi_qty_ordered'] ?? 0 );
                 $received     = intval( $po_items[ $idx ]['poi_qty_received'] ?? 0 );
-                $remaining    = $ordered - $received;
+                $rejected     = intval( $po_items[ $idx ]['poi_qty_rejected'] ?? 0 );
+                $remaining    = $ordered - ( $received - $rejected );
 
                 // Cap qty at remaining
                 if ( $qty > $remaining ) $qty = $remaining;
@@ -2314,7 +2322,8 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             }
 
             $pi_data   = $po_items_map[ $sku ];
-            $remaining = $pi_data['ordered'] - $pi_data['received'];
+            // remaining = ordered - accepted (received - rejected) — reject ไม่นับเป็นครบ
+            $remaining = $pi_data['ordered'] - ( $pi_data['received'] - $pi_data['rejected'] );
 
             if ( $qty_rcv > $remaining ) {
                 $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
@@ -2407,10 +2416,12 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่มีรายการที่รับ', 'code' => 'NO_ITEMS' ), 400 );
         }
 
-        // Check if ALL SKUs in PO are fully received
+        // Check if ALL SKUs fully received — accepted (received - rejected) >= ordered
         foreach ( $po_items_map as $sku => $pi_data ) {
             $cur_received = intval( $po_items[ $pi_data['index'] ]['poi_qty_received'] ?? 0 );
-            if ( $cur_received < $pi_data['ordered'] ) {
+            $cur_rejected = intval( $po_items[ $pi_data['index'] ]['poi_qty_rejected'] ?? 0 );
+            $cur_accepted = $cur_received - $cur_rejected;
+            if ( $cur_accepted < $pi_data['ordered'] ) {
                 $all_complete = false;
                 break;
             }
@@ -2442,6 +2453,16 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
         update_field( 'rcv_total_value', $total_rcv_value, $rcv_id );
         update_field( 'rcv_admin_note', $note, $rcv_id );
         update_field( 'rcv_inspected_by', $inspected_by, $rcv_id );
+
+        // V.5.5: Set rcv_has_reject flag
+        $has_any_reject = false;
+        foreach ( $rcv_items as $ri ) {
+            if ( intval( $ri['rcvi_qty_rejected'] ?? 0 ) > 0 ) { $has_any_reject = true; break; }
+        }
+        if ( $has_any_reject ) {
+            update_field( 'rcv_has_reject', 1, $rcv_id );
+            update_field( 'rcv_reject_resolved', 0, $rcv_id );
+        }
 
         // Transition PO status
         $new_status = $all_complete ? 'received' : 'partial_received';
@@ -2562,6 +2583,45 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             error_log( '[B2F RCV] Admin push SKIP: group=' . var_export( $admin_group, true ) );
         }
 
+        // V.5.5: QC Reject Flex push — ส่งแจ้ง Maker + Admin ถ้ามี reject items
+        if ( $has_any_reject && function_exists( 'b2f_build_flex_qc_reject' ) ) {
+            $qc_reject_items = array();
+            foreach ( $rcv_items as $ri ) {
+                $ri_rej = intval( $ri['rcvi_qty_rejected'] ?? 0 );
+                if ( $ri_rej <= 0 ) continue;
+                $ri_photo_ids  = $ri['rcvi_reject_photos'] ?? array();
+                $ri_photo_urls = array();
+                if ( is_array( $ri_photo_ids ) ) {
+                    foreach ( $ri_photo_ids as $att_id ) {
+                        $url = wp_get_attachment_url( $att_id );
+                        if ( $url ) $ri_photo_urls[] = $url;
+                    }
+                }
+                // Lookup product name from PO items
+                $ri_name = $ri['rcvi_sku'] ?? '';
+                foreach ( $po_items as $pi ) {
+                    if ( ( $pi['poi_sku'] ?? '' ) === $ri_name ) { $ri_name = $pi['poi_product_name'] ?? $ri_name; break; }
+                }
+                $qc_reject_items[] = array(
+                    'sku'        => $ri['rcvi_sku'] ?? '',
+                    'name'       => $ri_name,
+                    'reject_qty' => $ri_rej,
+                    'reason'     => $ri['rcvi_reject_reason'] ?? '',
+                    'photo_urls' => $ri_photo_urls,
+                );
+            }
+            $qc_flex = b2f_build_flex_qc_reject( $po_id, $rcv_id, $qc_reject_items );
+            if ( $qc_flex ) {
+                if ( ! empty( $maker_group ) && function_exists( 'b2f_push_guaranteed' ) ) {
+                    b2f_push_guaranteed( $maker_group, $qc_flex, $po_id, 'qc_reject_maker' );
+                }
+                if ( ! empty( $admin_group ) && function_exists( 'b2f_push_guaranteed' ) ) {
+                    b2f_push_guaranteed( $admin_group, $qc_flex, $po_id, 'qc_reject_admin' );
+                }
+                error_log( '[B2F RCV] QC Reject Flex pushed: ' . count( $qc_reject_items ) . ' items' );
+            }
+        }
+
         delete_transient( $lock_key );
 
         if ( function_exists( 'b2f_log' ) ) {
@@ -2581,6 +2641,7 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             'po_status'         => $new_status,
             'inventory_updated' => ! empty( $inventory_updated ),
             'debt_added'        => $debt_added ? $total_rcv_value : 0,
+            'has_reject'        => ! empty( $has_any_reject ),
             '_debug_push'       => array(
                 'maker_group' => $maker_group ?: 'EMPTY',
                 'admin_group' => $admin_group ?: 'EMPTY',
@@ -3084,6 +3145,209 @@ if ( ! function_exists( 'b2f_rest_reject_lot' ) ) {
         }
 
         return new WP_REST_Response( array( 'success' => true, 'po_id' => $po_id, 'status' => 'confirmed' ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// V.5.5: QC REJECT RESOLVE — Admin ดำเนินการ reject items
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
+    /**
+     * POST /reject-resolve — Admin เลือกวิธีจัดการ reject items
+     *
+     * Body: { rcv_id, action: 'replacement'|'reship'|'write_off', note? }
+     *
+     * - replacement: สร้าง PO draft ใหม่เฉพาะ reject SKUs
+     * - reship:      transition PO เดิม → confirmed ให้ Maker ส่งใหม่
+     * - write_off:   ลด qty_ordered = accepted qty + recalculate total
+     */
+    function b2f_rest_reject_resolve( WP_REST_Request $req ) {
+        $rcv_id = intval( $req->get_param( 'rcv_id' ) ?: 0 );
+        $action = sanitize_text_field( $req->get_param( 'action' ) ?: '' );
+        $note   = sanitize_textarea_field( $req->get_param( 'note' ) ?: '' );
+
+        if ( ! $rcv_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุใบรับ', 'code' => 'MISSING_RCV' ), 400 );
+        }
+        if ( ! in_array( $action, array( 'replacement', 'reship', 'write_off' ), true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'action ไม่ถูกต้อง (replacement/reship/write_off)', 'code' => 'INVALID_ACTION' ), 400 );
+        }
+
+        $rcv_post = get_post( $rcv_id );
+        if ( ! $rcv_post || $rcv_post->post_type !== 'b2f_receiving' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบใบรับ', 'code' => 'NOT_FOUND' ), 404 );
+        }
+
+        // ตรวจว่ายัง unresolved
+        if ( get_field( 'rcv_reject_resolved', $rcv_id ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ดำเนินการแล้ว ไม่สามารถทำซ้ำ', 'code' => 'ALREADY_RESOLVED' ), 400 );
+        }
+
+        $po_id    = intval( get_field( 'rcv_po_id', $rcv_id ) ?: 0 );
+        $po_post  = get_post( $po_id );
+        if ( ! $po_post || $po_post->post_type !== 'b2f_order' ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'PO_NOT_FOUND' ), 404 );
+        }
+
+        $maker_id    = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        $maker_group = $maker_id ? get_field( 'maker_line_group_id', $maker_id ) : '';
+        $admin_group = defined( 'B2B_ADMIN_GROUP_ID' ) ? B2B_ADMIN_GROUP_ID : '';
+        $po_number   = get_field( 'po_number', $po_id ) ?: 'PO-' . $po_id;
+        $rcv_items   = get_field( 'rcv_items', $rcv_id ) ?: array();
+        $po_items    = get_field( 'po_items', $po_id ) ?: array();
+
+        // Collect reject SKUs
+        $reject_skus = array();
+        foreach ( $rcv_items as $ri ) {
+            $rej = intval( $ri['rcvi_qty_rejected'] ?? 0 );
+            if ( $rej > 0 ) {
+                $reject_skus[ $ri['rcvi_sku'] ?? '' ] = $rej;
+            }
+        }
+
+        if ( empty( $reject_skus ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ reject items', 'code' => 'NO_REJECT' ), 400 );
+        }
+
+        $result_data = array( 'action' => $action );
+        $action_labels = array( 'replacement' => 'สร้างใบสั่งซื้อใหม่', 'reship' => 'ให้ส่งใหม่', 'write_off' => 'ตัดยอด' );
+
+        // ── Action: replacement — สร้าง PO draft ใหม่เฉพาะ reject SKUs ──
+        if ( $action === 'replacement' ) {
+            $new_items = array();
+            $new_total = 0;
+            foreach ( $po_items as $pi ) {
+                $sku = $pi['poi_sku'] ?? '';
+                if ( isset( $reject_skus[ $sku ] ) ) {
+                    $unit_price = floatval( $pi['poi_unit_price'] ?? 0 );
+                    $qty        = $reject_skus[ $sku ];
+                    $new_items[] = array(
+                        'poi_sku'           => $sku,
+                        'poi_product_name'  => $pi['poi_product_name'] ?? $sku,
+                        'poi_unit_price'    => $unit_price,
+                        'poi_qty_ordered'   => $qty,
+                        'poi_qty_received'  => 0,
+                        'poi_subtotal'      => $unit_price * $qty,
+                    );
+                    $new_total += $unit_price * $qty;
+                }
+            }
+
+            $new_po_number = function_exists( 'b2f_generate_po_number' ) ? b2f_generate_po_number() : 'PO-RPL-' . wp_date( 'ymdHi' );
+            $new_po_id = wp_insert_post( array(
+                'post_type'   => 'b2f_order',
+                'post_title'  => $new_po_number,
+                'post_status' => 'publish',
+            ) );
+
+            if ( is_wp_error( $new_po_id ) ) {
+                return new WP_REST_Response( array( 'success' => false, 'error' => 'สร้าง PO ใหม่ไม่สำเร็จ', 'code' => 'CREATE_FAILED' ), 500 );
+            }
+
+            update_field( 'po_number', $new_po_number, $new_po_id );
+            update_field( 'po_maker_id', $maker_id, $new_po_id );
+            update_field( 'po_status', 'draft', $new_po_id );
+            update_field( 'po_items', $new_items, $new_po_id );
+            update_field( 'po_total_amount', $new_total, $new_po_id );
+            update_field( 'po_item_count', count( $new_items ), $new_po_id );
+            update_field( 'po_is_replacement', 1, $new_po_id );
+            update_field( 'po_parent_po_id', $po_id, $new_po_id );
+            update_field( 'po_admin_note', 'Replacement PO จาก ' . $po_number . ' (QC reject)', $new_po_id );
+
+            // Link replacement PO to receiving
+            update_field( 'rcv_replacement_po_id', $new_po_id, $rcv_id );
+
+            $result_data['new_po_id']     = $new_po_id;
+            $result_data['new_po_number'] = $new_po_number;
+
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( sprintf( 'Reject resolve: replacement PO %s (#%d) from PO %s (#%d)', $new_po_number, $new_po_id, $po_number, $po_id ) );
+            }
+        }
+
+        // ── Action: reship — transition PO เดิม → confirmed ──
+        if ( $action === 'reship' ) {
+            $current_status = get_field( 'po_status', $po_id );
+            if ( $current_status === 'partial_received' ) {
+                if ( function_exists( 'b2f_transition_order' ) ) {
+                    $trans = b2f_transition_order( $po_id, 'confirmed', 'admin', 'QC reject reship: ' . $note );
+                    if ( is_wp_error( $trans ) ) {
+                        return new WP_REST_Response( array( 'success' => false, 'error' => $trans->get_error_message(), 'code' => 'TRANSITION_FAILED' ), 400 );
+                    }
+                } else {
+                    update_field( 'po_status', 'confirmed', $po_id );
+                }
+            }
+
+            // Push Flex แจ้ง Maker ให้ส่งใหม่ (ใช้ b2f_build_flex_lot_rejected ที่มีอยู่)
+            if ( function_exists( 'b2f_build_flex_lot_rejected' ) && ! empty( $maker_group ) ) {
+                $flex = b2f_build_flex_lot_rejected( $po_id, 'QC reject — กรุณาส่งของใหม่: ' . $note );
+                if ( $flex && function_exists( 'b2f_push_guaranteed' ) ) {
+                    b2f_push_guaranteed( $maker_group, $flex, $po_id, 'reject_reship_maker' );
+                }
+            }
+
+            $result_data['po_status'] = 'confirmed';
+        }
+
+        // ── Action: write_off — ลด qty_ordered = accepted (received-rejected) ──
+        if ( $action === 'write_off' ) {
+            $updated_items = array();
+            $new_total     = 0;
+            foreach ( $po_items as $pi ) {
+                $sku = $pi['poi_sku'] ?? '';
+                if ( isset( $reject_skus[ $sku ] ) ) {
+                    $ordered  = intval( $pi['poi_qty_ordered'] ?? 0 );
+                    $accepted = $ordered - $reject_skus[ $sku ];
+                    if ( $accepted < 0 ) $accepted = 0;
+                    $pi['poi_qty_ordered'] = $accepted;
+                    $pi['poi_subtotal']    = floatval( $pi['poi_unit_price'] ?? 0 ) * $accepted;
+                }
+                $new_total    += floatval( $pi['poi_subtotal'] ?? 0 );
+                $updated_items[] = $pi;
+            }
+            update_field( 'po_items', $updated_items, $po_id );
+            update_field( 'po_total_amount', $new_total, $po_id );
+
+            // Check if all items complete now
+            $all_done = true;
+            foreach ( $updated_items as $pi ) {
+                $ord = intval( $pi['poi_qty_ordered'] ?? 0 );
+                $rcvd = intval( $pi['poi_qty_received'] ?? 0 );
+                if ( $rcvd < $ord ) { $all_done = false; break; }
+            }
+            if ( $all_done ) {
+                $current_status = get_field( 'po_status', $po_id );
+                if ( $current_status === 'partial_received' && function_exists( 'b2f_transition_order' ) ) {
+                    b2f_transition_order( $po_id, 'received', 'admin', 'Write-off reject → all complete' );
+                }
+            }
+
+            $result_data['new_total'] = $new_total;
+            $result_data['all_complete'] = $all_done;
+        }
+
+        // Mark resolved
+        update_field( 'rcv_reject_action', $action, $rcv_id );
+        update_field( 'rcv_reject_resolved', 1, $rcv_id );
+        if ( $note ) update_field( 'rcv_reject_note', $note, $rcv_id );
+
+        // Push แจ้ง Maker ทุก action (text message สรุป)
+        $action_label = $action_labels[ $action ] ?? $action;
+        $text_msg = array( 'type' => 'text', 'text' => '📋 ' . $po_number . "\nQC Reject: " . $action_label . ( $note ? "\nหมายเหตุ: " . mb_substr( $note, 0, 100 ) : '' ) );
+        if ( ! empty( $maker_group ) && function_exists( 'b2f_push_guaranteed' ) ) {
+            b2f_push_guaranteed( $maker_group, $text_msg, $po_id, 'reject_resolve_maker' );
+        }
+        if ( ! empty( $admin_group ) && function_exists( 'b2f_push_guaranteed' ) ) {
+            b2f_push_guaranteed( $admin_group, $text_msg, $po_id, 'reject_resolve_admin' );
+        }
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Reject resolve: rcv=#%d action=%s po=%s note=%s', $rcv_id, $action, $po_number, $note ) );
+        }
+
+        return new WP_REST_Response( array_merge( array( 'success' => true, 'rcv_id' => $rcv_id ), $result_data ), 200 );
     }
 }
 
