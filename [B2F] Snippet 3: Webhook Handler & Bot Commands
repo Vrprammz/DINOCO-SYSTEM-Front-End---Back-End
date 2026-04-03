@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 3: Webhook Handler & Bot Commands             ║
- * ║  Version: V.2.5 — Fix: use 'view' param (page is WP reserved) ║
+ * ║  Version: V.2.6 — เพิ่ม slip image verify ในกลุ่ม Maker        ║
  * ║  DB_ID: 1164                                                 ║
  * ║  Description: B2F Bot commands สำหรับ Maker groups            ║
  * ║  เรียกจาก [B2B] Snippet 2 ผ่าน function_exists() guard       ║
@@ -47,6 +47,8 @@ if ( ! function_exists( 'b2f_route_maker_command' ) ) {
 
         if ( $type === 'message' && ( $event['message']['type'] ?? '' ) === 'text' ) {
             b2f_handle_maker_text( $event, $maker );
+        } elseif ( $type === 'message' && ( $event['message']['type'] ?? '' ) === 'image' ) {
+            b2f_handle_maker_slip_image( $event, $maker );
         } elseif ( $type === 'postback' ) {
             b2f_handle_maker_postback( $event, $maker );
         }
@@ -901,5 +903,185 @@ if ( ! function_exists( 'b2f_build_flex_new_po_for_maker' ) ) {
                 ) ),
             ),
         );
+    }
+}
+
+// ═══════════════════════════════════════��════
+// 7. MAKER GROUP — Slip Image Verification
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_handle_maker_slip_image' ) ) {
+    /**
+     * จัดการรูปสลิป��ี่ส่งในกลุ่ม Maker → download → verify via slip2go
+     */
+    function b2f_handle_maker_slip_image( $event, $maker ) {
+        $message_id  = $event['message']['id'] ?? '';
+        $reply_token = $event['replyToken'] ?? '';
+        $group_id    = $event['source']['groupId'] ?? '';
+
+        if ( empty( $message_id ) ) return;
+
+        // Dedup protection
+        if ( get_transient( 'b2f_slip_dedup_' . $message_id ) ) return;
+        set_transient( 'b2f_slip_dedup_' . $message_id, 1, 120 );
+
+        // ต้องมี verify function
+        if ( ! function_exists( 'b2f_verify_slip_image' ) ) return;
+
+        // ต้องมี bank info
+        if ( ! function_exists( 'b2f_get_maker_bank_info' ) ) return;
+        $bank = b2f_get_maker_bank_info( $maker['id'] );
+        if ( ! $bank ) {
+            // ไม่มี bank_code → เงียบ (ไม่ตอบ)
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( sprintf( 'Slip image ignored: maker=%d no bank_code', $maker['id'] ) );
+            }
+            return;
+        }
+
+        // Download image from LINE
+        $access_token = defined( 'B2B_LINE_ACCESS_TOKEN' ) ? B2B_LINE_ACCESS_TOKEN : '';
+        if ( empty( $access_token ) ) return;
+
+        $img_response = wp_remote_get( 'https://api-data.line.me/v2/bot/message/' . $message_id . '/content', array(
+            'headers' => array( 'Authorization' => 'Bearer ' . $access_token ),
+            'timeout' => 20,
+        ) );
+
+        if ( is_wp_error( $img_response ) ) {
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( 'Slip download error: ' . $img_response->get_error_message() );
+            }
+            return;
+        }
+
+        $image_data = wp_remote_retrieve_body( $img_response );
+        if ( strlen( $image_data ) < 1000 ) return; // ไม่ใช่รูปจริง
+
+        $content_type = wp_remote_retrieve_header( $img_response, 'content-type' ) ?: 'image/jpeg';
+        $base64 = 'data:' . $content_type . ';base64,' . base64_encode( $image_data );
+
+        // Verify via slip2go
+        $result = b2f_verify_slip_image( $base64, $maker['id'] );
+
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( 'Slip verify: maker=%d code=%s success=%s amount=%.2f',
+                $maker['id'],
+                $result['code'] ?? 'N/A',
+                $result['success'] ? 'Y' : 'N',
+                $result['slip_amount'] ?? 0
+            ) );
+        }
+
+        // ถ้า 200404 (ไม่ใช่สลิป) → เงียบ
+        if ( isset( $result['code'] ) && $result['code'] === '200404' ) return;
+        if ( isset( $result['code'] ) && $result['code'] === 'NO_API_KEY' ) return;
+
+        // สร้าง reply messages
+        $messages = array();
+
+        if ( ! empty( $result['success'] ) && ! empty( $result['is_receiver_valid'] ) ) {
+            // สลิปผ่าน — หา PO ที่ค้างจ่าย
+            $po_match = b2f_find_pending_po_for_slip( $maker['id'], $result['slip_amount'] );
+
+            $body = array(
+                array( 'type' => 'text', 'text' => 'สลิปตรวจผ่าน', 'weight' => 'bold', 'size' => 'lg', 'color' => '#16a34a' ),
+                array( 'type' => 'separator', 'margin' => 'md' ),
+                array( 'type' => 'box', 'layout' => 'horizontal', 'margin' => 'md', 'contents' => array(
+                    array( 'type' => 'text', 'text' => 'ยอดโอน', 'size' => 'sm', 'color' => '#666666', 'flex' => 0 ),
+                    array( 'type' => 'text', 'text' => number_format( $result['slip_amount'], 2 ) . ' บาท', 'size' => 'sm', 'weight' => 'bold', 'align' => 'end' ),
+                ) ),
+                array( 'type' => 'box', 'layout' => 'horizontal', 'margin' => 'sm', 'contents' => array(
+                    array( 'type' => 'text', 'text' => 'ผู้โอน', 'size' => 'sm', 'color' => '#666666', 'flex' => 0 ),
+                    array( 'type' => 'text', 'text' => $result['sender_name'] ?: '-', 'size' => 'sm', 'align' => 'end' ),
+                ) ),
+                array( 'type' => 'box', 'layout' => 'horizontal', 'margin' => 'sm', 'contents' => array(
+                    array( 'type' => 'text', 'text' => 'ผู้รับ', 'size' => 'sm', 'color' => '#666666', 'flex' => 0 ),
+                    array( 'type' => 'text', 'text' => $result['receiver_name'] ?: '-', 'size' => 'sm', 'align' => 'end' ),
+                ) ),
+                array( 'type' => 'box', 'layout' => 'horizontal', 'margin' => 'sm', 'contents' => array(
+                    array( 'type' => 'text', 'text' => 'Ref', 'size' => 'xs', 'color' => '#999999', 'flex' => 0 ),
+                    array( 'type' => 'text', 'text' => $result['trans_ref'] ?: '-', 'size' => 'xs', 'color' => '#999999', 'align' => 'end' ),
+                ) ),
+            );
+
+            if ( $po_match ) {
+                $body[] = array( 'type' => 'separator', 'margin' => 'md' );
+                $body[] = array( 'type' => 'text', 'text' => 'PO ที่ match: ' . $po_match['po_number'], 'size' => 'sm', 'color' => '#16a34a', 'margin' => 'md', 'weight' => 'bold' );
+            }
+
+            $messages[] = array(
+                'type' => 'flex', 'altText' => 'สลิปตรวจผ่าน ' . number_format( $result['slip_amount'], 2 ) . ' บาท',
+                'contents' => array(
+                    'type' => 'bubble', 'size' => 'kilo',
+                    'header' => array( 'type' => 'box', 'layout' => 'vertical', 'backgroundColor' => '#16a34a', 'paddingAll' => '12px', 'contents' => array(
+                        array( 'type' => 'text', 'text' => '✓ ตรวจสลิปผ่าน', 'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md' ),
+                    ) ),
+                    'body' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+                ),
+            );
+        } else {
+            // สลิปไม่ผ่าน
+            $reason = $result['error'] ?? 'สลิปไม่ผ่านการตรวจสอบ';
+
+            $messages[] = array(
+                'type' => 'flex', 'altText' => 'สลิปไม่ผ่าน: ' . $reason,
+                'contents' => array(
+                    'type' => 'bubble', 'size' => 'kilo',
+                    'header' => array( 'type' => 'box', 'layout' => 'vertical', 'backgroundColor' => '#dc2626', 'paddingAll' => '12px', 'contents' => array(
+                        array( 'type' => 'text', 'text' => '✗ สลิปไม่ผ่าน', 'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md' ),
+                    ) ),
+                    'body' => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => array(
+                        array( 'type' => 'text', 'text' => $reason, 'size' => 'sm', 'color' => '#dc2626', 'wrap' => true ),
+                        array( 'type' => 'text', 'text' => 'กรุณาตรวจสอบและส่งสลิปใหม่', 'size' => 'xs', 'color' => '#999999', 'margin' => 'md' ),
+                    ) ),
+                ),
+            );
+        }
+
+        // Reply
+        if ( ! empty( $messages ) && ! empty( $reply_token ) && function_exists( 'b2f_line_reply_raw' ) ) {
+            b2f_line_reply_raw( $reply_token, $messages );
+        } elseif ( ! empty( $messages ) && ! empty( $group_id ) && function_exists( 'b2f_line_push' ) ) {
+            b2f_line_push( $group_id, $messages );
+        }
+    }
+}
+
+/**
+ * หา PO ที่ค้างจ่ายของ Maker โดยเช็คยอดใกล้เคียง (±2%)
+ */
+if ( ! function_exists( 'b2f_find_pending_po_for_slip' ) ) {
+    function b2f_find_pending_po_for_slip( $maker_id, $slip_amount ) {
+        if ( $slip_amount <= 0 ) return null;
+
+        global $wpdb;
+        $pos = $wpdb->get_results( $wpdb->prepare(
+            "SELECT p.ID, pm_num.meta_value AS po_number,
+                    CAST(pm_total.meta_value AS DECIMAL(12,2)) AS total,
+                    CAST(COALESCE(pm_paid.meta_value, 0) AS DECIMAL(12,2)) AS paid
+             FROM {$wpdb->posts} p
+             JOIN {$wpdb->postmeta} pm_maker ON pm_maker.post_id = p.ID AND pm_maker.meta_key = 'po_maker_id'
+             JOIN {$wpdb->postmeta} pm_status ON pm_status.post_id = p.ID AND pm_status.meta_key = 'po_status'
+             JOIN {$wpdb->postmeta} pm_total ON pm_total.post_id = p.ID AND pm_total.meta_key = 'po_total_amount'
+             JOIN {$wpdb->postmeta} pm_num ON pm_num.post_id = p.ID AND pm_num.meta_key = 'po_number'
+             LEFT JOIN {$wpdb->postmeta} pm_paid ON pm_paid.post_id = p.ID AND pm_paid.meta_key = 'po_paid_amount'
+             WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+             AND pm_maker.meta_value = %s
+             AND pm_status.meta_value IN ('received', 'partial_paid')
+             ORDER BY p.post_date DESC LIMIT 20",
+            $maker_id
+        ) );
+
+        foreach ( $pos as $po ) {
+            $remaining = round( $po->total - $po->paid, 2 );
+            if ( $remaining <= 0 ) continue;
+            // Match ±2%
+            if ( abs( $slip_amount - $remaining ) <= $remaining * 0.02 ) {
+                return array( 'po_id' => $po->ID, 'po_number' => $po->po_number, 'remaining' => $remaining );
+            }
+        }
+
+        return null;
     }
 }

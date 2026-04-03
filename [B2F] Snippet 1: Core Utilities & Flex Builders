@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 1: Core Utilities & LINE Flex Builders
- * Version: V.3.1 — Delivered Flex: note "รอตรวจรับ" + shipped > accepted count
+ * Version: V.3.2 — เพิ่ม slip verify helper + Flex (verified/rejected)
  * DB_ID: 1163
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -2445,6 +2445,197 @@ if (!function_exists('b2f_build_flex_delivered_detail')) {
             'altText'  => $title . ' ' . $po['po_number'] . ' (' . count($dlv_items) . ' รายการ)',
             'contents' => $bubble,
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 19. SLIP VERIFICATION HELPER + FLEX
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * ดึงข้อมูลบัญชีธนาคาร Maker (สำหรับ slip2go verify)
+ */
+if (!function_exists('b2f_get_maker_bank_info')) {
+    function b2f_get_maker_bank_info($maker_id) {
+        $maker_id = (int) $maker_id;
+        if (!$maker_id) return null;
+
+        $bank_code    = get_field('maker_bank_code', $maker_id) ?: '';
+        $bank_account = get_field('maker_bank_account', $maker_id) ?: '';
+        $bank_holder  = get_field('maker_bank_holder', $maker_id) ?: '';
+        $bank_name    = get_field('maker_bank_name', $maker_id) ?: '';
+
+        if (empty($bank_code) || empty($bank_account)) return null;
+
+        $en_map = array(
+            '002' => 'Bangkok Bank',
+            '004' => 'KBANK',
+            '006' => 'Krungthai Bank',
+            '011' => 'TMBThanachart',
+            '014' => 'SCB',
+            '025' => 'CIMB Thai',
+            '030' => 'Government Savings Bank',
+            '069' => 'Kiatnakin Phatra Bank',
+            '073' => 'LH Bank',
+        );
+
+        return array(
+            'bank_code'    => $bank_code,
+            'bank_name'    => $bank_name,
+            'bank_name_en' => isset($en_map[$bank_code]) ? $en_map[$bank_code] : '',
+            'bank_account' => $bank_account,
+            'bank_holder'  => $bank_holder,
+            'account_type' => '01' . str_pad($bank_code, 3, '0', STR_PAD_LEFT),
+        );
+    }
+}
+
+/**
+ * เรียก Slip2Go API verify สลิป
+ * @param string $image_base64 data:image/...;base64,... format
+ * @param int    $maker_id     Maker CPT ID
+ * @return array {success, code, data, slip_amount, trans_ref, is_duplicate, is_receiver_valid, raw}
+ */
+if (!function_exists('b2f_verify_slip_image')) {
+    function b2f_verify_slip_image($image_base64, $maker_id) {
+        $bank = b2f_get_maker_bank_info($maker_id);
+        if (!$bank) {
+            return array('success' => false, 'code' => 'NO_BANK_INFO', 'error' => 'โรงงานยังไม่มีข้อมูลบัญชีธนาคาร/รหัสธนาคาร');
+        }
+
+        $api_url = defined('B2B_SLIP2GO_API_URL') ? B2B_SLIP2GO_API_URL
+                 : 'https://connect.slip2go.com/api/verify-slip/qr-base64/info';
+        $api_key = defined('B2B_SLIP2GO_SECRET_KEY') ? B2B_SLIP2GO_SECRET_KEY : '';
+
+        if (empty($api_key)) {
+            return array('success' => false, 'code' => 'NO_API_KEY', 'error' => 'ไม่พบ Slip2Go API key');
+        }
+
+        $check_receiver = array(
+            array(
+                'accountNumber' => preg_replace('/[^0-9]/', '', $bank['bank_account']),
+                'accountType'   => $bank['account_type'],
+            ),
+        );
+
+        $payload = array(
+            'payload' => array(
+                'imageBase64'    => $image_base64,
+                'checkCondition' => array(
+                    'checkDuplicate' => true,
+                    'checkReceiver'  => $check_receiver,
+                ),
+            ),
+        );
+
+        $response = wp_remote_post($api_url, array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $api_key,
+                'Content-Type'  => 'application/json',
+            ),
+            'body'    => wp_json_encode($payload),
+            'timeout' => 30,
+        ));
+
+        if (is_wp_error($response)) {
+            return array('success' => false, 'code' => 'API_ERROR', 'error' => $response->get_error_message());
+        }
+
+        $http_code = wp_remote_retrieve_response_code($response);
+        $body      = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($http_code !== 200 || empty($body)) {
+            return array('success' => false, 'code' => 'HTTP_' . $http_code, 'error' => 'Slip2Go API error', 'raw' => $body);
+        }
+
+        $api_code  = isset($body['code']) ? $body['code'] : '';
+        $data      = isset($body['data']) ? $body['data'] : array();
+        $condition = isset($body['conditionResult']) ? $body['conditionResult'] : array();
+
+        $result = array(
+            'success'            => in_array($api_code, array('200000', '200200')),
+            'code'               => $api_code,
+            'slip_amount'        => isset($data['amount']) ? floatval($data['amount']) : 0,
+            'trans_ref'          => isset($data['transRef']) ? $data['transRef'] : '',
+            'sender_name'        => isset($data['sender']['account']['name']) ? $data['sender']['account']['name'] : '',
+            'receiver_name'      => isset($data['receiver']['account']['name']) ? $data['receiver']['account']['name'] : '',
+            'is_duplicate'       => !empty($condition['isDuplicate']),
+            'is_receiver_valid'  => !empty($condition['isReceiverValid']),
+            'raw'                => $body,
+        );
+
+        // Interpret error codes
+        if ($api_code === '200501') {
+            $result['error'] = 'สลิปนี้เคยใช้แล้ว (ซ้ำ)';
+        } elseif ($api_code === '200401') {
+            $result['error'] = 'บัญชีปลายทางไม่ตรง — สลิปโอนไปบัญชีอื่น';
+        } elseif ($api_code === '200404') {
+            $result['error'] = 'ไม่ใช่รูปสลิป';
+        } elseif (!$result['is_receiver_valid'] && $result['success']) {
+            $result['success'] = false;
+            $result['error']   = 'บัญชีปลายทางไม่ตรงกับบัญชีโรงงาน';
+        }
+
+        return $result;
+    }
+}
+
+/**
+ * Flex: สลิปตรวจผ่าน (สีเขียว)
+ */
+if (!function_exists('b2f_build_flex_slip_verified')) {
+    function b2f_build_flex_slip_verified($po_id, $slip_result) {
+        $po = b2f_get_po_data($po_id);
+        if (!$po) return null;
+
+        $body = array(
+            b2f_flex_kv_row('เลขที่ PO', $po['po_number']),
+            b2f_flex_kv_row('โรงงาน', $po['maker_name']),
+            b2f_flex_separator(),
+            b2f_flex_kv_row('ยอดในสลิป', b2f_format_currency(isset($slip_result['slip_amount']) ? $slip_result['slip_amount'] : 0), B2F_COLOR_GREEN),
+            b2f_flex_kv_row('ผู้โอน', isset($slip_result['sender_name']) ? $slip_result['sender_name'] : '-'),
+            b2f_flex_kv_row('ผู้รับ', isset($slip_result['receiver_name']) ? $slip_result['receiver_name'] : '-'),
+            b2f_flex_kv_row('Trans Ref', isset($slip_result['trans_ref']) ? $slip_result['trans_ref'] : '-'),
+        );
+
+        $bubble = array(
+            'type'   => 'bubble',
+            'size'   => 'mega',
+            'header' => b2f_flex_header('สลิปตรวจผ่าน', $po['po_number'], B2F_COLOR_GREEN),
+            'body'   => array('type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body),
+        );
+
+        return array('type' => 'flex', 'altText' => 'สลิปตรวจผ่าน ' . $po['po_number'], 'contents' => $bubble);
+    }
+}
+
+/**
+ * Flex: สลิปไม่ผ่าน (สีแดง)
+ */
+if (!function_exists('b2f_build_flex_slip_rejected')) {
+    function b2f_build_flex_slip_rejected($po_id, $reason, $slip_result = array()) {
+        $po = b2f_get_po_data($po_id);
+        if (!$po) return null;
+
+        $body = array(
+            b2f_flex_kv_row('เลขที่ PO', $po['po_number']),
+            b2f_flex_kv_row('โรงงาน', $po['maker_name']),
+            b2f_flex_separator(),
+            b2f_flex_kv_row('สาเหตุ', $reason, B2F_COLOR_RED),
+        );
+
+        if (!empty($slip_result['slip_amount'])) {
+            $body[] = b2f_flex_kv_row('ยอดในสลิป', b2f_format_currency($slip_result['slip_amount']));
+        }
+
+        $bubble = array(
+            'type'   => 'bubble',
+            'size'   => 'mega',
+            'header' => b2f_flex_header('สลิปไม่ผ่านการตรวจ', $po['po_number'], B2F_COLOR_RED),
+            'body'   => array('type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body),
+        );
+
+        return array('type' => 'flex', 'altText' => 'สลิปไม่ผ่าน ' . $po['po_number'], 'contents' => $bubble);
     }
 }
 

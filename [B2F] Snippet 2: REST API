@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.6.8 — เพิ่ม credit_term_days + payment_due_date ใน API + delete PO
+ * Version: V.6.9 — เพิ่ม maker_bank_code + slip2go verify ใน record-payment
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -517,6 +517,7 @@ if ( ! function_exists( 'b2f_format_maker' ) ) {
             'bank_name'        => esc_html( get_field( 'maker_bank_name', $maker_id ) ?: '' ),
             'bank_account'     => esc_html( get_field( 'maker_bank_account', $maker_id ) ?: '' ),
             'bank_holder'      => esc_html( get_field( 'maker_bank_holder', $maker_id ) ?: '' ),
+            'bank_code'        => esc_html( get_field( 'maker_bank_code', $maker_id ) ?: '' ),
             'status'           => esc_html( get_field( 'maker_status', $maker_id ) ?: 'active' ),
             'notes'            => esc_html( get_field( 'maker_notes', $maker_id ) ?: '' ),
             'credit_limit'     => floatval( get_field( 'maker_credit_limit', $maker_id ) ?: 0 ),
@@ -535,7 +536,7 @@ if ( ! function_exists( 'b2f_rest_save_maker' ) ) {
      * POST /maker — create or update maker
      * Body: { id?, maker_name, maker_contact, maker_phone, maker_email,
      *         maker_address, maker_line_group_id, maker_tax_id,
-     *         maker_bank_name, maker_bank_account, maker_bank_holder,
+     *         maker_bank_name, maker_bank_account, maker_bank_holder, maker_bank_code,
      *         maker_status, maker_notes, maker_credit_limit, maker_credit_term_days }
      */
     function b2f_rest_save_maker( WP_REST_Request $req ) {
@@ -593,7 +594,7 @@ if ( ! function_exists( 'b2f_rest_save_maker' ) ) {
         $fields = array(
             'maker_name', 'maker_contact', 'maker_phone', 'maker_email',
             'maker_address', 'maker_line_group_id', 'maker_tax_id',
-            'maker_bank_name', 'maker_bank_account', 'maker_bank_holder',
+            'maker_bank_name', 'maker_bank_account', 'maker_bank_holder', 'maker_bank_code',
             'maker_status', 'maker_notes',
         );
         foreach ( $fields as $f ) {
@@ -2877,9 +2878,11 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
 
         $maker_id = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
 
-        // Handle slip upload
-        $slip_id = 0;
-        $files   = $req->get_file_params();
+        // Handle slip upload + verify
+        $slip_id     = 0;
+        $slip_status = '';
+        $slip_result = array();
+        $files       = $req->get_file_params();
         if ( ! empty( $files['slip_image'] ) ) {
             require_once ABSPATH . 'wp-admin/includes/image.php';
             require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -2889,6 +2892,44 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             $att_id = media_handle_upload( 'b2f_slip', 0 );
             if ( ! is_wp_error( $att_id ) ) {
                 $slip_id = $att_id;
+            }
+
+            // Slip2Go verify (ถ้ามี slip + function พร้อม)
+            if ( $slip_id && function_exists( 'b2f_verify_slip_image' ) ) {
+                $file_path  = get_attached_file( $slip_id );
+                $image_data = @file_get_contents( $file_path );
+                if ( $image_data ) {
+                    $mime   = wp_check_filetype( $file_path )['type'] ?: 'image/jpeg';
+                    $base64 = 'data:' . $mime . ';base64,' . base64_encode( $image_data );
+
+                    $slip_result = b2f_verify_slip_image( $base64, $maker_id );
+
+                    if ( ! empty( $slip_result['success'] ) ) {
+                        $slip_status = 'verified';
+                        // Duplicate check: trans_ref ซ้ำ?
+                        if ( ! empty( $slip_result['trans_ref'] ) ) {
+                            global $wpdb;
+                            $dup = $wpdb->get_var( $wpdb->prepare(
+                                "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = 'pmt_slip_trans_ref' AND meta_value = %s",
+                                $slip_result['trans_ref']
+                            ) );
+                            if ( $dup > 0 ) {
+                                $slip_status = 'rejected';
+                                $slip_result['error'] = 'สลิปนี้เคยใช้แล้วในระบบ (local duplicate)';
+                                $slip_result['success'] = false;
+                            }
+                        }
+                    } elseif ( isset( $slip_result['code'] ) && $slip_result['code'] === 'NO_BANK_INFO' ) {
+                        $slip_status = 'pending'; // ไม่มี bank_code — skip verify แต่ยังบันทึกได้
+                    } else {
+                        $slip_status = 'rejected';
+                    }
+                } else {
+                    $slip_status = 'error';
+                    $slip_result = array( 'error' => 'อ่านไฟล์สลิปไม่ได้' );
+                }
+            } elseif ( $slip_id ) {
+                $slip_status = 'pending'; // ไม่มี b2f_verify_slip_image — skip verify
             }
         }
 
@@ -2914,6 +2955,15 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
         update_field( 'pmt_note', $note, $pmt_id );
         if ( $slip_id ) {
             update_field( 'pmt_slip_image', $slip_id, $pmt_id );
+        }
+        if ( ! empty( $slip_status ) ) {
+            update_field( 'pmt_slip_status', $slip_status, $pmt_id );
+        }
+        if ( ! empty( $slip_result ) ) {
+            update_field( 'pmt_slip_verify_result', wp_json_encode( $slip_result ), $pmt_id );
+        }
+        if ( ! empty( $slip_result['trans_ref'] ) ) {
+            update_field( 'pmt_slip_trans_ref', $slip_result['trans_ref'], $pmt_id );
         }
 
         // Update PO paid amount
@@ -2962,9 +3012,21 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             }
         }
 
+        // Push Flex slip verify result ไป Admin group
+        if ( ! empty( $slip_status ) && $slip_status !== 'pending' && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+            if ( $slip_status === 'verified' && function_exists( 'b2f_build_flex_slip_verified' ) ) {
+                $flex_v = b2f_build_flex_slip_verified( $po_id, $slip_result );
+                if ( $flex_v ) b2f_line_push( B2B_ADMIN_GROUP_ID, array( $flex_v ) );
+            } elseif ( $slip_status === 'rejected' && function_exists( 'b2f_build_flex_slip_rejected' ) ) {
+                $reason = isset( $slip_result['error'] ) ? $slip_result['error'] : 'สลิปไม่ผ่านการตรวจ';
+                $flex_r = b2f_build_flex_slip_rejected( $po_id, $reason, $slip_result );
+                if ( $flex_r ) b2f_line_push( B2B_ADMIN_GROUP_ID, array( $flex_r ) );
+            }
+        }
+
         if ( function_exists( 'b2f_log' ) ) {
-            b2f_log( sprintf( 'Payment recorded: %s (#%d) amount=%.2f method=%s status=%s',
-                $po_number, $po_id, $amount, $method, $payment_status
+            b2f_log( sprintf( 'Payment recorded: %s (#%d) amount=%.2f method=%s status=%s slip=%s',
+                $po_number, $po_id, $amount, $method, $payment_status, $slip_status ?: 'none'
             ) );
         }
 
@@ -2979,6 +3041,8 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             'payment_status' => $payment_status,
             'remaining'      => $new_remaining,
             'po_status'      => esc_html( get_field( 'po_status', $po_id ) ),
+            'slip_status'    => $slip_status ?: null,
+            'slip_error'     => ( $slip_status === 'rejected' && isset( $slip_result['error'] ) ) ? $slip_result['error'] : null,
         ), 200 );
     }
 }
