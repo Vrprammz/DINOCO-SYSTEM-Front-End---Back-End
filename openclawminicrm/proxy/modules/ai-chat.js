@@ -225,9 +225,9 @@ function sanitizeAIOutput(text) {
     // ★ V.3.3.2: ลบ stray brackets/JSON artifacts ที่หลุดจาก tool response
     .replace(/^\s*[\[\]{}]\s*$/gm, "")
     .replace(/^\s*[\[\]{}]\s*\n/gm, "")
-    .replace(/ราคา\s*(ต้นทุน|dealer|ตัวแทน|ทุน|wholesale)[^\n]*/gi, "[สอบถามตัวแทนจำหน่ายค่ะ]")
-    .replace(/(ส่วนลด|discount|margin|กำไร|profit)[^\n]*/gi, "[DINOCO เป็นนโยบาย One Price ค่ะ]")
-    .replace(/(สต็อก|stock|คงเหลือ|จำนวน\s*\d+\s*ชิ้น|หมดสต็อก)[^\n]*/gi, "[สอบถามตัวแทนจำหน่ายค่ะ]")
+    .replace(/[^\n]*ราคา\s*(ต้นทุน|dealer|ตัวแทน|ทุน|wholesale)[^\n]*/gi, "สอบถามตัวแทนจำหน่ายค่ะ")
+    .replace(/[^\n]*(ส่วนลด|discount|margin|กำไร|profit)[^\n]*/gi, "DINOCO เป็นนโยบาย One Price ค่ะ")
+    .replace(/[^\n]*(สต็อก|stock|คงเหลือ|จำนวน\s*\d+\s*ชิ้น|หมดสต็อก)[^\n]*/gi, "สอบถามตัวแทนจำหน่ายค่ะ")
     .replace(/(api[_-]?key|token|secret|password)\s*[:=]\s*\S+/gi, "[REDACTED]")
     .replace(/https?:\/\/(localhost|127\.0\.0\.1|internal|admin)[^\s]*/gi, "[REDACTED]");
   // ★ V.1.4: Anti-hallucination: ลบ "กระซิบ" + cross-sell patterns ที่ AI มักเติมเอง
