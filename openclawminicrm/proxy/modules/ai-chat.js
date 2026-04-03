@@ -222,6 +222,9 @@ async function callProvider(messages, tools) {
 function sanitizeAIOutput(text) {
   if (!text || typeof text !== "string") return text;
   let result = text
+    // ★ V.3.3.2: ลบ stray brackets/JSON artifacts ที่หลุดจาก tool response
+    .replace(/^\s*[\[\]{}]\s*$/gm, "")
+    .replace(/^\s*[\[\]{}]\s*\n/gm, "")
     .replace(/ราคา\s*(ต้นทุน|dealer|ตัวแทน|ทุน|wholesale)[^\n]*/gi, "[สอบถามตัวแทนจำหน่ายค่ะ]")
     .replace(/(ส่วนลด|discount|margin|กำไร|profit)[^\n]*/gi, "[DINOCO เป็นนโยบาย One Price ค่ะ]")
     .replace(/(สต็อก|stock|คงเหลือ|จำนวน\s*\d+\s*ชิ้น|หมดสต็อก)[^\n]*/gi, "[สอบถามตัวแทนจำหน่ายค่ะ]")
