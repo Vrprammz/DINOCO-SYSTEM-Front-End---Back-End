@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.1.6 — KB search synonym mapping + multi-strategy search + dealer fallback
+ * V.2.0 — KB priority tool description + product_lookup auto-appends KB specs + lean prompt support
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -71,6 +71,19 @@ function init(deps) {
 }
 
 const AGENT_TOOLS = [
+  // ★ V.2.0: kb_search อยู่ตำแหน่งแรกของ DINOCO tools — Gemini มีแนวโน้มเลือก tool แรกที่ match
+  {
+    type: "function",
+    function: {
+      name: "dinoco_kb_search",
+      description: "★ PRIORITY TOOL — ค้นคลังความรู้ DINOCO ต้องเรียก tool นี้เมื่อลูกค้าถามเรื่อง: สเปค/น้ำหนัก/ขนาด/มิติ, ประกัน/เคลม/ระยะเวลาซ่อม, ที่อยู่ส่งเคลม/ออฟฟิศ, วัสดุ/อลูมิเนียม/สนิม/กันน้ำ, ใบเสร็จ/invoice, การ์ดแฮนด์สเปค, วิธีติดตั้ง, PRO vs STD, คืนสินค้า/ผ่อน, เวลาทำการ, แบรนด์/ผลิตที่ไหน, แปลภาษา — ห้ามตอบจากความจำ ต้องเรียก tool นี้ก่อนเสมอ",
+      parameters: {
+        type: "object",
+        properties: { question: { type: "string", description: "คำถาม เช่น 'การ์ดแฮนด์สเปค น้ำหนัก' 'ระยะเวลาเคลมกี่วัน' 'ที่อยู่ส่งเคลม' 'ใบเสร็จ' 'แปลภาษาอังกฤษ'" } },
+        required: ["question"],
+      },
+    },
+  },
   {
     type: "function",
     function: {
@@ -95,7 +108,7 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_product_lookup",
-      description: "ค้นหาสินค้า DINOCO พร้อมราคา+รูป ต้องเรียกทุกครั้งที่ลูกค้าถามเรื่องสินค้า ราคา รุ่นรถ หรือขอดูรูป ห้ามตอบจากความจำ ต้องเรียก tool นี้เสมอ ผลลัพธ์จะมี img_url ให้ส่งรูปกลับลูกค้า",
+      description: "ค้นหาสินค้า DINOCO พร้อมราคา+รูป ใช้เมื่อลูกค้าถามเรื่องราคา ดูรูปสินค้า หรือสต็อก (ถ้าถามเรื่องสเปค/น้ำหนัก/ขนาด ให้ใช้ dinoco_kb_search แทน)",
       parameters: {
         type: "object",
         properties: {
@@ -122,25 +135,13 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_warranty_check",
-      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial หรือเบอร์โทร ใช้เมื่อลูกค้าถามเรื่องประกัน เคลม หรือส่งเลข serial มา",
+      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial หรือเบอร์โทร ใช้เมื่อลูกค้าส่งเลข serial DN-XXXXX หรือเบอร์โทรมาเช็คประกัน",
       parameters: {
         type: "object",
         properties: {
           serial: { type: "string", description: "เลข serial number เช่น 'DN-12345'" },
           phone: { type: "string", description: "เบอร์โทรที่ลงทะเบียน" },
         },
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "dinoco_kb_search",
-      description: "ค้นหาข้อมูลจากคลังความรู้ DINOCO เช่น นโยบายประกัน วัสดุสินค้า วิธีติดตั้ง ค่าจัดส่ง คำถามทั่วไป ใช้เมื่อไม่ใช่เรื่องสินค้า/ตัวแทน/ประกันโดยตรง",
-      parameters: {
-        type: "object",
-        properties: { question: { type: "string", description: "คำถาม เช่น 'ส่งฟรีไหม' 'วัสดุอะไร' 'ติดตั้งยังไง'" } },
-        required: ["question"],
       },
     },
   },
@@ -209,6 +210,9 @@ async function executeTool(toolName, args, sourceId) {
     return `Sentiment: ${data.sentiment?.score}/100 (${data.sentiment?.level}) — ${data.sentiment?.reason}\nPurchase: ${data.purchaseIntent?.score}/100 (${data.purchaseIntent?.level}) — ${data.purchaseIntent?.reason}`;
   }
   if (toolName === "dinoco_product_lookup") {
+    // ★ V.2.0: ตรวจว่า query มี spec keywords → auto-append KB search หลัง product result
+    const SPEC_KEYWORDS = /สเปค|น้ำหนัก|ขนาด|มิติ|ซม\.|กก\.|กิโล|หนัก|เบา|กว้าง|ยาว|สูง|weight|spec|kg|cm|ลิตร|ความจุ|วัสดุ|อลูมิเนียม|สแตนเลส|ทำจากอะไร/i;
+    const queryNeedsSpec = SPEC_KEYWORDS.test(args.query || "");
     // ค้นจาก cached catalog ก่อน (เร็ว + ไม่ timeout)
     const { wpCache } = require("./dinoco-cache");
     const catalog = wpCache.catalog?.data || wpCache.catalog?.stale;
@@ -325,7 +329,17 @@ async function executeTool(toolName, args, sourceId) {
         const list = finalMatched.slice(0, 10).map((p) =>
           `${p.name} — ราคา ${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"} | SKU: ${p.sku}${p.img_url ? " | รูป: " + p.img_url : ""}${p.warranty_years ? " | ประกัน " + p.warranty_years + " ปี" : ""}`
         ).join("\n");
-        return `${list}\n\n[คำสั่ง: ตอบเฉพาะสินค้าในรายการนี้เท่านั้น ห้ามแนะนำ/กระซิบ/เสริมสินค้าอื่นที่ไม่อยู่ในรายการนี้เด็ดขาด ถ้าสินค้าไม่อยู่ในรายการ = ไม่มีสำหรับรุ่นนี้]`;
+        let result = `${list}\n\n[คำสั่ง: ตอบเฉพาะสินค้าในรายการนี้เท่านั้น ห้ามแนะนำ/กระซิบ/เสริมสินค้าอื่นที่ไม่อยู่ในรายการนี้เด็ดขาด ถ้าสินค้าไม่อยู่ในรายการ = ไม่มีสำหรับรุ่นนี้]`;
+        // ★ V.2.0: auto-append KB specs เมื่อ query มีคำถามสเปค
+        if (queryNeedsSpec) {
+          try {
+            const specResult = await executeTool("dinoco_kb_search", { question: args.query }, sourceId);
+            if (specResult && !specResult.includes("ไม่พบข้อมูล")) {
+              result += `\n\n=== ข้อมูลสเปคจาก KB ===\n${specResult}`;
+            }
+          } catch {}
+        }
+        return result;
       }
     }
     // Fallback: เรียก WordPress API (ถ้า cache ไม่มี)
@@ -335,7 +349,17 @@ async function executeTool(toolName, args, sourceId) {
     const wpList = result.products.map((p) =>
       `${p.name} — ราคา ${p.price ? p.price.toLocaleString() + " บาท" : "สอบถาม"} | SKU: ${p.sku}${p.img_url ? " | รูป: " + p.img_url : ""}${p.warranty_years ? " | ประกัน " + p.warranty_years + " ปี" : ""}`
     ).join("\n");
-    return `${wpList}\n\n[คำสั่ง: ตอบเฉพาะสินค้าในรายการนี้เท่านั้น ห้ามแนะนำ/กระซิบ/เสริมสินค้าอื่นที่ไม่อยู่ในรายการนี้เด็ดขาด ถ้าสินค้าไม่อยู่ในรายการ = ไม่มีสำหรับรุ่นนี้]`;
+    let wpResult = `${wpList}\n\n[คำสั่ง: ตอบเฉพาะสินค้าในรายการนี้เท่านั้น ห้ามแนะนำ/กระซิบ/เสริมสินค้าอื่นที่ไม่อยู่ในรายการนี้เด็ดขาด ถ้าสินค้าไม่อยู่ในรายการ = ไม่มีสำหรับรุ่นนี้]`;
+    // ★ V.2.0: auto-append KB specs เมื่อ query มีคำถามสเปค
+    if (queryNeedsSpec) {
+      try {
+        const specResult = await executeTool("dinoco_kb_search", { question: args.query }, sourceId);
+        if (specResult && !specResult.includes("ไม่พบข้อมูล")) {
+          wpResult += `\n\n=== ข้อมูลสเปคจาก KB ===\n${specResult}`;
+        }
+      } catch {}
+    }
+    return wpResult;
   }
   if (toolName === "dinoco_dealer_lookup") {
     const location = args.location || "";

@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.2.4 — Gemini 2.5 Flash STABLE (ไม่ใช่ preview) + thinkingConfig top-level fix
+ * V.2.5 — Lean Prompt V.3.0 support + KB priority tool description
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
