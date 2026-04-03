@@ -446,19 +446,66 @@ async function callDinocoAI(systemPrompt, userMessage, sourceId) {
     try {
       const db = await getDB();
       if (db) {
-        const words = userMessage.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim().split(/\s+/).filter(w => w.length >= 2).slice(0, 8);
-        const regex = words.join("|");
-        const kbResults = await db.collection("knowledge_base").find({
-          active: { $ne: false },
-          $or: [
-            { content: { $regex: regex, $options: "i" } },
-            { title: { $regex: regex, $options: "i" } },
-          ],
-        }).limit(3).toArray();
+        // ★ V.3.2: Smart keyword extraction — ลบ stopwords + ใช้ content-words เท่านั้น
+        const STOPWORDS = /^(เป็น|ยังไง|อะไร|มั้ย|ไหม|บ้าง|ได้|หรือ|กับ|ที่|จาก|ของ|มี|ไม่|ต้อง|แล้ว|จะ|ก็|ให้|ทำ|ดี|คือ|DINOCO|dinoco|ดิโนโก|กี่|เท่าไหร่|เท่าไร|ครับ|ค่ะ|นะ|คะ|มาก|เยอะ)$/i;
+        const words = userMessage.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim()
+          .split(/\s+/).filter(w => w.length >= 2 && !STOPWORDS.test(w)).slice(0, 6);
+
+        // Strategy 1: ค้นด้วย content-words
+        let kbResults = [];
+        if (words.length > 0) {
+          const regex = words.join("|");
+          kbResults = await db.collection("knowledge_base").find({
+            active: { $ne: false },
+            $or: [
+              { content: { $regex: regex, $options: "i" } },
+              { title: { $regex: regex, $options: "i" } },
+            ],
+          }).limit(5).toArray();
+        }
+
+        // Strategy 2: ถ้าไม่เจอ ลอง exact phrase match
+        if (kbResults.length === 0) {
+          const shortQuery = userMessage.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim().substring(0, 80);
+          kbResults = await db.collection("knowledge_base").find({
+            active: { $ne: false },
+            $or: [
+              { title: { $regex: shortQuery.split(/\s+/).slice(0, 3).join(".*"), $options: "i" } },
+            ],
+          }).limit(3).toArray();
+        }
+
+        // Strategy 3: ถ้ายังไม่เจอ ลองค้นด้วยคำสำคัญจาก regex match
+        if (kbResults.length === 0) {
+          const coreMap = {
+            "ด้านใน|ข้างใน|ภายใน": "ซับใน|ด้านใน|อินเนอร์|ช่องเก็บ",
+            "เปิด.*ฝา|เปิด.*ข้าง|เปิด.*ด้านไหน": "กล่องข้าง.*เปิด|เปิดฝา|ด้านบน",
+            "ถอด.*PRO|PRO.*ถอด": "PRO.*ถอด|ถอด.*ง่าย",
+            "STD.*PRO|PRO.*STD": "STD.*PRO|น้ำหนัก.*ใกล้เคียง|แข็งแรง",
+            "ติดตั้ง.*กี่|ใช้เวลา.*ติด|ชั่วโมง": "ติดตั้ง.*ชั่วโมง|2.*ชม|เวลา.*ติดตั้ง",
+            "สีดำ.*บุบ|สีดำ.*ล้ม|บุบ.*สีดำ|ค่าทำสี": "สีดำ.*ค่าทำสี|บุบ.*ซ่อม|กล่อง.*ดำ",
+            "ส่ง.*กี่วัน|กี่วัน.*ถึง": "จัดส่ง|3.*15.*วัน|สต็อก",
+          };
+          for (const [pattern, fallbackRegex] of Object.entries(coreMap)) {
+            if (new RegExp(pattern, "i").test(userMessage)) {
+              kbResults = await db.collection("knowledge_base").find({
+                active: { $ne: false },
+                $or: [
+                  { content: { $regex: fallbackRegex, $options: "i" } },
+                  { title: { $regex: fallbackRegex, $options: "i" } },
+                ],
+              }).limit(3).toArray();
+              if (kbResults.length > 0) break;
+            }
+          }
+        }
+
         if (kbResults.length > 0) {
           const kbText = kbResults.map(r => r.content).join("\n---\n").substring(0, 1500);
-          enrichedMessage = `${userMessage}\n\n[ข้อมูลจาก KB สำหรับอ้างอิง — ตอบจากข้อมูลนี้:]:\n${kbText}`;
+          enrichedMessage = `${userMessage}\n\n[ข้อมูลจาก KB สำหรับอ้างอิง — ตอบจากข้อมูลนี้ ห้ามตอบว่า ขอเช็คข้อมูล :]:\n${kbText}`;
           console.log(`[KB-Inject] Pre-injected ${kbResults.length} KB results for: ${userMessage.substring(0, 50)}`);
+        } else {
+          console.log(`[KB-Inject] No KB results found for: ${userMessage.substring(0, 50)}`);
         }
       }
     } catch (e) { console.error("[KB-Inject] Error:", e.message); }
