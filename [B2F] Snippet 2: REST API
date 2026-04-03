@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.7.0 — Multi-Currency: create-po (exchange_rate, shipping), receive-goods (x rate), record-payment (skip verify ≠THB), po-detail + maker-products response
+ * Version: V.7.1 — C2/C3/C5/W1/W2/W7 FIX: is_complete หัก rejected, ลบ dead transient, payment fallback THB, po-cancel lock, currency symbol, deliver lock
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -1551,11 +1551,20 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบใบสั่งซื้อ', 'code' => 'NOT_FOUND' ), 404 );
         }
 
+        // W1 FIX: Lock ป้องกัน concurrent cancel + receive/payment
+        global $wpdb;
+        $cancel_lock = 'b2f_recv_' . intval( $po_id );
+        $got_cancel_lock = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $cancel_lock ) );
+        if ( ! $got_cancel_lock ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'มีคนอื่นกำลังดำเนินการอยู่', 'code' => 'LOCKED' ), 423 );
+        }
+
         $current_status = get_field( 'po_status', $po_id );
         $maker_id       = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
 
         // ห้ามลบเฉพาะ cancelled (ลบไปแล้ว ไม่ควรมีใน list)
         if ( $current_status === 'cancelled' ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $cancel_lock ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ใบสั่งซื้อนี้ถูกยกเลิกไปแล้ว', 'code' => 'ALREADY_CANCELLED' ), 400 );
         }
 
@@ -1564,13 +1573,15 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         $maker_name_str = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
         $total_str      = number_format( floatval( get_field( 'po_total_amount', $po_id ) ?: 0 ), 0 );
         $maker_group    = $maker_id ? ( get_field( 'maker_line_group_id', $maker_id ) ?: '' ) : '';
+        // W2 FIX: เก็บ currency ก่อน wp_delete_post
+        $po_currency    = get_field( 'po_currency', $po_id ) ?: 'THB';
+        $cur_sym        = function_exists( 'b2f_currency_symbol' ) ? b2f_currency_symbol( $po_currency ) : '฿';
 
         // Rollback credit — recalculate หลังลบ
         $rollback_info = array();
         $old_debt = floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 );
 
         // ลบ related records: receiving, payment
-        global $wpdb;
         $related_types = array( 'b2f_receiving', 'b2f_payment' );
         $deleted_related = 0;
         foreach ( $related_types as $rel_type ) {
@@ -1614,7 +1625,7 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
                 array( 'type' => 'text', 'text' => $maker_name_str, 'size' => 'sm', 'weight' => 'bold', 'flex' => 3, 'align' => 'end', 'wrap' => true ) ) ),
             array( 'type' => 'box', 'layout' => 'horizontal', 'margin' => 'sm', 'contents' => array(
                 array( 'type' => 'text', 'text' => 'ยอดรวม', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
-                array( 'type' => 'text', 'text' => '฿' . $total_str, 'size' => 'sm', 'weight' => 'bold', 'flex' => 3, 'align' => 'end' ) ) ),
+                array( 'type' => 'text', 'text' => $cur_sym . $total_str, 'size' => 'sm', 'weight' => 'bold', 'flex' => 3, 'align' => 'end' ) ) ),
             array( 'type' => 'separator', 'margin' => 'md' ),
         );
         if ( ! empty( $reason ) ) {
@@ -1672,6 +1683,8 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         if ( ! empty( $rollback_info ) ) {
             $resp['rollback'] = $rollback_info;
         }
+
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $cancel_lock ) );
 
         return new WP_REST_Response( $resp, 200 );
     }
@@ -2007,6 +2020,14 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ระบบไม่พร้อม' ), 500 );
         }
 
+        // W7 FIX: Lock ป้องกัน concurrent deliver
+        global $wpdb;
+        $dlv_lock = 'b2f_dlv_' . intval( $po_id );
+        $got_dlv_lock = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 0)", $dlv_lock ) );
+        if ( ! $got_dlv_lock ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'กำลังประมวลผล กรุณารอสักครู่', 'code' => 'LOCKED' ), 423 );
+        }
+
         $current_status = get_field( 'po_status', $po_id );
         $is_additional  = ( $current_status === 'partial_received' );
         $po_items       = get_field( 'po_items', $po_id ) ?: array();
@@ -2053,15 +2074,18 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
             }
 
             if ( ! $any_qty ) {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $dlv_lock ) );
                 return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาระบุจำนวนอย่างน้อย 1 รายการ' ), 400 );
             }
 
             // ตรวจ is_complete จาก ALL items (ไม่ใช่แค่ items ที่ส่งรอบนี้)
+            // C2 FIX: shipped ที่ส่งมาจริง (หัก rejected) ต้อง >= ordered
             $is_complete = true;
             foreach ( $po_items as $pi_chk ) {
-                $chk_ordered = intval( $pi_chk['poi_qty_ordered'] ?? 0 );
-                $chk_shipped = intval( $pi_chk['poi_qty_shipped'] ?? 0 );
-                if ( $chk_shipped < $chk_ordered ) { $is_complete = false; break; }
+                $chk_ordered  = intval( $pi_chk['poi_qty_ordered'] ?? 0 );
+                $chk_shipped  = intval( $pi_chk['poi_qty_shipped'] ?? 0 );
+                $chk_rejected = intval( $pi_chk['poi_qty_rejected'] ?? 0 );
+                if ( ( $chk_shipped - $chk_rejected ) < $chk_ordered ) { $is_complete = false; break; }
             }
 
             // Save updated po_items with qty_shipped
@@ -2084,6 +2108,7 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
         $note   = $is_additional ? 'Maker ส่งของเพิ่ม (LIFF)' : 'Maker แจ้งส่งของ (LIFF)';
         $result = b2f_transition_order( $po_id, 'delivering', 'maker', $note );
         if ( is_wp_error( $result ) ) {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $dlv_lock ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => $result->get_error_message() ), 400 );
         }
 
@@ -2213,6 +2238,8 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
                 $po_number, $po_id, count( $dlv_summary ), $is_complete ? 'yes' : 'no', $is_additional ? 'yes' : 'no'
             ) );
         }
+
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $dlv_lock ) );
 
         return new WP_REST_Response( array(
             'success'         => true,
@@ -2821,7 +2848,7 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             }
         }
 
-        delete_transient( $lock_key );
+        // C3 FIX: ลบ dead code delete_transient — ใช้ MySQL GET_LOCK/RELEASE_LOCK แล้ว
 
         if ( function_exists( 'b2f_log' ) ) {
             $po_number = get_field( 'po_number', $po_id );
@@ -2931,8 +2958,8 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
              AND pm_po.meta_value = %s",
             $po_id
         ) );
-        // Fallback: ถ้า receiving records ไม่มี rcv_total_value (PO เก่า) ใช้ po_total_amount
-        $po_total    = $received_total > 0 ? $received_total : floatval( get_field( 'po_total_amount', $po_id ) ?: 0 );
+        // C5 FIX: fallback ใช้ po_total_amount_thb (THB) ไม่ใช่ po_total_amount (สกุลโรงงาน)
+        $po_total    = $received_total > 0 ? $received_total : floatval( get_field( 'po_total_amount_thb', $po_id ) ?: get_field( 'po_total_amount', $po_id ) ?: 0 );
         $paid_so_far = floatval( get_field( 'po_paid_amount', $po_id ) ?: 0 );
         $remaining   = round( $po_total - $paid_so_far, 2 );
 

@@ -99,10 +99,10 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **B2F Snippets** (DB_ID 1160-1171):
   - Snippet 0 (1160): CPT & ACF Registration — 5 CPTs + helpers + `b2f_get_maker_by_group()` (cached 5min/1hr)
   - Snippet 1 (1163): Core Utilities & Flex Builders — LINE push + 13 Flex templates + `b2f_liff_url()` (HMAC sig)
-  - Snippet 2 (1165): REST API — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin)
+  - Snippet 2 (1165): REST API V.7.1 — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin) + concurrent locks (po-cancel, maker-deliver) + is_complete หัก rejected + payment fallback THB
   - Snippet 3 (1164): Webhook Handler & Bot Commands — Maker commands + Admin B2F commands + Flex menu (self-contained)
   - Snippet 4 (1167): Maker LIFF Pages — shortcode `[b2f_maker_liff]` route `/b2f-maker/`
-  - Snippet 5 (1166): Admin Dashboard Tabs — 3 shortcodes embedded ใน Admin Dashboard + Bulk Cancel PO (V.2.0) + Multi-Currency UI (V.3.0) + Settings REST endpoint
+  - Snippet 5 (1166): Admin Dashboard Tabs V.3.1 — 3 shortcodes embedded ใน Admin Dashboard + Bulk Cancel PO (V.2.0) + Multi-Currency UI (V.3.0) + Settings REST endpoint + receive form remaining fix (shipped-received)
   - Snippet 6 (1161): Order State Machine — `B2F_Order_FSM` class
   - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`, credit เกิดตอน receive-goods เท่านั้น (ไม่หักตอน create-po), `b2f_recalculate_payable()` คำนวณจาก `rcv_total_value` ของ receiving records
   - Snippet 8 (1168): Admin LIFF E-Catalog — หน้าสั่งซื้อจาก LINE (LIFF auth V.2.0 ไม่ต้อง WP login) + Multi-Currency UI (V.3.0)
