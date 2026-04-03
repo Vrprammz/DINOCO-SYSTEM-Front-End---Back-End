@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.6.9 — เพิ่ม maker_bank_code + slip2go verify ใน record-payment
+ * Version: V.7.0 — Multi-Currency: create-po (exchange_rate, shipping), receive-goods (x rate), record-payment (skip verify ≠THB), po-detail + maker-products response
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -715,6 +715,8 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
             'notes'           => esc_html( get_field( 'mp_notes', $mp_id ) ?: '' ),
             'status'          => esc_html( get_field( 'mp_status', $mp_id ) ?: 'active' ),
             'image_url'       => esc_url( $image_url ),
+            'shipping_land'   => floatval( get_field( 'mp_shipping_land', $mp_id ) ?: 0 ),
+            'shipping_sea'    => floatval( get_field( 'mp_shipping_sea', $mp_id ) ?: 0 ),
         );
     }
 }
@@ -884,6 +886,34 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             }
         }
 
+        // ── Multi-Currency: read maker currency + validate exchange_rate + shipping_method ──
+        $currency      = get_field( 'maker_currency', $maker_id ) ?: 'THB';
+        $exchange_rate  = floatval( $req->get_param( 'exchange_rate' ) ?: 1 );
+        $shipping_method = sanitize_text_field( $req->get_param( 'shipping_method' ) ?: '' );
+
+        // THB ต้อง = 1 เสมอ
+        if ( $currency === 'THB' ) $exchange_rate = 1.0;
+
+        // Validate range
+        if ( $exchange_rate <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'อัตราแลกเปลี่ยนต้องมากกว่า 0', 'code' => 'INVALID_RATE' ), 400 );
+        }
+        $rate_ranges = array( 'THB' => array( 1, 1 ), 'CNY' => array( 2, 10 ), 'USD' => array( 25, 50 ) );
+        if ( isset( $rate_ranges[ $currency ] ) ) {
+            if ( $exchange_rate < $rate_ranges[ $currency ][0] || $exchange_rate > $rate_ranges[ $currency ][1] ) {
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => sprintf( 'RATE_OUT_OF_RANGE: %s rate must be %s-%s', $currency, $rate_ranges[ $currency ][0], $rate_ranges[ $currency ][1] ),
+                    'code'    => 'RATE_OUT_OF_RANGE',
+                ), 400 );
+            }
+        }
+
+        // ≠ THB ต้องเลือกวิธีส่ง
+        if ( $currency !== 'THB' && ! in_array( $shipping_method, array( 'land', 'sea' ), true ) ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'โรงงานต่างประเทศต้องเลือกวิธีส่ง (land/sea)', 'code' => 'SHIPPING_METHOD_REQUIRED' ), 400 );
+        }
+
         // ── Validate items ──
         if ( empty( $items ) || ! is_array( $items ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาเลือกสินค้าอย่างน้อย 1 รายการ', 'code' => 'MISSING_ITEMS' ), 400 );
@@ -944,6 +974,7 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 'qty'          => $qty,
                 'unit_cost'    => $unit_cost,
                 'subtotal'     => $subtotal,
+                'mp_post_id'   => $mp_post->ID,
             );
             $total += $subtotal;
 
@@ -995,24 +1026,48 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
         update_field( 'po_paid_amount', 0, $po_id );
         update_field( 'po_payment_status', 'unpaid', $po_id );
 
+        // ── Multi-Currency: save currency fields ──
+        update_field( 'po_currency', $currency, $po_id );
+        update_field( 'po_exchange_rate', round( $exchange_rate, 4 ), $po_id );
+        if ( $shipping_method ) {
+            update_field( 'po_shipping_method', $shipping_method, $po_id );
+        }
+
         if ( ! empty( $req_date ) ) {
             update_field( 'po_requested_date', $req_date, $po_id );
         }
 
-        // Save po_items repeater
-        $repeater = array();
+        // Save po_items repeater (with shipping per unit snapshot)
+        $repeater       = array();
+        $shipping_total = 0;
         foreach ( $po_items as $pi ) {
+            // Snapshot shipping cost per unit from maker product
+            $ship_per = 0;
+            if ( $shipping_method && ! empty( $pi['mp_post_id'] ) ) {
+                $ship_key = ( $shipping_method === 'sea' ) ? 'mp_shipping_sea' : 'mp_shipping_land';
+                $ship_per = floatval( get_field( $ship_key, $pi['mp_post_id'] ) ?: 0 );
+            }
+            $shipping_total += round( $ship_per * $pi['qty'], 2 );
+
             $repeater[] = array(
-                'poi_sku'          => $pi['sku'],
-                'poi_product_name' => $pi['product_name'],
-                'poi_qty_ordered'  => $pi['qty'],
-                'poi_unit_cost'    => $pi['unit_cost'],
-                'poi_qty_shipped'  => 0,
-                'poi_qty_received' => 0,
-                'poi_qty_rejected' => 0,
+                'poi_sku'               => $pi['sku'],
+                'poi_product_name'      => $pi['product_name'],
+                'poi_qty_ordered'       => $pi['qty'],
+                'poi_unit_cost'         => $pi['unit_cost'],
+                'poi_qty_shipped'       => 0,
+                'poi_qty_received'      => 0,
+                'poi_qty_rejected'      => 0,
+                'poi_shipping_per_unit' => $ship_per,
             );
         }
         update_field( 'po_items', $repeater, $po_id );
+
+        // ── Multi-Currency: calculate THB totals ──
+        $total_amount_thb = round( $total * $exchange_rate, 2 );
+        $grand_total_thb  = $total_amount_thb + $shipping_total;
+        update_field( 'po_total_amount_thb', $total_amount_thb, $po_id );
+        update_field( 'po_shipping_total', $shipping_total, $po_id );
+        update_field( 'po_grand_total_thb', $grand_total_thb, $po_id );
 
         // ── Transition to 'submitted' via FSM (CRIT-04 fix: ห้าม bypass FSM) ──
         if ( function_exists( 'b2f_transition_order' ) ) {
@@ -1238,8 +1293,11 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
             );
         }
 
-        $status_val = esc_html( get_field( 'po_status', $po_id ) ?: 'draft' );
-        $total_val  = floatval( get_field( 'po_total_amount', $po_id ) ?: 0 );
+        $status_val   = esc_html( get_field( 'po_status', $po_id ) ?: 'draft' );
+        $total_val    = floatval( get_field( 'po_total_amount', $po_id ) ?: 0 );
+        $po_currency  = get_field( 'po_currency', $po_id ) ?: 'THB';
+        $po_ex_rate   = floatval( get_field( 'po_exchange_rate', $po_id ) ?: 1 );
+        $po_ship_meth = get_field( 'po_shipping_method', $po_id ) ?: '';
 
         $data = array(
             'id'              => $po_id,
@@ -1252,6 +1310,17 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
             'po_items'        => $formatted_items,   // BUG-2 fix: alias สำหรับ Maker LIFF ที่ใช้ po_items
             'total_amount'    => $total_val,
             'po_total_amount' => $total_val,         // alias
+            // Multi-Currency fields
+            'currency'           => $po_currency,
+            'po_currency'        => $po_currency,
+            'exchange_rate'      => $po_ex_rate,
+            'po_exchange_rate'   => $po_ex_rate,
+            'shipping_method'    => $po_ship_meth,
+            'po_shipping_method' => $po_ship_meth,
+            'total_amount_thb'   => floatval( get_field( 'po_total_amount_thb', $po_id ) ?: 0 ),
+            'shipping_total'     => floatval( get_field( 'po_shipping_total', $po_id ) ?: 0 ),
+            'grand_total_thb'    => floatval( get_field( 'po_grand_total_thb', $po_id ) ?: 0 ),
+            'currency_symbol'    => function_exists( 'b2f_currency_symbol' ) ? b2f_currency_symbol( $po_currency ) : '฿',
             'item_count'      => intval( get_field( 'po_item_count', $po_id ) ?: 0 ),
             'po_item_count'   => intval( get_field( 'po_item_count', $po_id ) ?: 0 ),
             'requested_date'     => esc_html( get_field( 'po_requested_date', $po_id ) ?: '' ),
@@ -2440,11 +2509,12 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             $po_items[ $pi_data['index'] ]['poi_qty_received'] = $new_received;
             $po_items[ $pi_data['index'] ]['poi_qty_rejected'] = $new_rejected;
 
-            // Calculate value for debt (only count accepted items)
-            $unit_cost = floatval( $po_items[ $pi_data['index'] ]['poi_unit_cost'] ?? 0 );
-            $accepted  = $qty_rcv - $reject_qty;
+            // Calculate value for debt (only count accepted items) — always THB
+            $unit_cost     = floatval( $po_items[ $pi_data['index'] ]['poi_unit_cost'] ?? 0 );
+            $accepted      = $qty_rcv - $reject_qty;
+            $po_ex_rate    = floatval( get_field( 'po_exchange_rate', $po_id ) ?: 1 );
             if ( $accepted > 0 ) {
-                $total_rcv_value += round( $unit_cost * $accepted, 2 );
+                $total_rcv_value += round( $unit_cost * $accepted * $po_ex_rate, 2 );
             }
         }
 
@@ -2876,7 +2946,8 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             ), 400 );
         }
 
-        $maker_id = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        $maker_id    = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+        $po_currency = get_field( 'po_currency', $po_id ) ?: 'THB';
 
         // Handle slip upload + verify
         $slip_id     = 0;
@@ -2894,8 +2965,11 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
                 $slip_id = $att_id;
             }
 
-            // Slip2Go verify (ถ้ามี slip + function พร้อม)
-            if ( $slip_id && function_exists( 'b2f_verify_slip_image' ) ) {
+            // Multi-Currency: ≠ THB → ข้าม slip verify, admin approve เอง
+            if ( $po_currency !== 'THB' ) {
+                $slip_status = 'admin_approved';
+            } elseif ( $slip_id && function_exists( 'b2f_verify_slip_image' ) ) {
+                // Slip2Go verify (THB only)
                 $file_path  = get_attached_file( $slip_id );
                 $image_data = @file_get_contents( $file_path );
                 if ( $image_data ) {
@@ -2931,6 +3005,9 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             } elseif ( $slip_id ) {
                 $slip_status = 'pending'; // ไม่มี b2f_verify_slip_image — skip verify
             }
+        } elseif ( $po_currency !== 'THB' ) {
+            // ≠ THB + ไม่มีสลิป → admin_approved (จ่ายต่างประเทศไม่ต้องแนบสลิป)
+            $slip_status = 'admin_approved';
         }
 
         // Create payment record
