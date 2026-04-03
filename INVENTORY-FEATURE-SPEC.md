@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 1.1 | Date: 2026-04-04 | Author: Feature Architect
+Version: 1.2 | Date: 2026-04-04 | Author: Feature Architect
 
 ---
 
@@ -84,7 +84,7 @@ Error Paths:
 Edge Cases:
 ├── B2B order cancelled หลัง shipped → ไม่คืนสต็อก (ของส่งไปแล้ว)
 ├── Walk-in cancelled (admin cancel completed) → คืนสต็อก (type=b2b_cancel_return)
-├── SKU relations (parent/child set) → ตัดสต็อก parent SKU เท่านั้น (set ขายเป็นชุด)
+├── SKU relations (parent/child set) → ตัดสต็อก children ทุกตัว (parent เป็นแค่ bundle ไม่เก็บ stock)
 └── order_items ไม่มี SKU (legacy data) → skip, log
 ```
 
@@ -116,7 +116,14 @@ Edge Cases:
 ### 2.4 Dip Stock (Physical Count)
 
 ```
-Trigger: Cron ทุก 30 วัน push alert Admin / Admin กดเริ่มนับเอง
+Trigger: 
+  - ครั้งแรก (Initial Import): Admin เปิดระบบใหม่ → Dip Stock เป็น "god mode" set สต็อกทั้งหมด
+  - รายเดือน: Cron ทุก 30 วัน push alert Admin / Admin กดเริ่มนับเอง
+  - Manual: Admin กดเริ่มนับเมื่อไหร่ก็ได้
+
+ใช้ flow เดียวกันทั้ง initial import + นับรายเดือน:
+  - ครั้งแรก: expected_qty = 0 ทุก SKU → Admin กรอก actual_qty จริง → approve → stock_qty = actual_qty
+  - ครั้งถัดไป: expected_qty = stock_qty ปัจจุบัน → Admin นับจริง → เทียบ variance → approve
 
 Happy Path:
 1. Admin เปิดหน้า Dip Stock → กด "เริ่มนับสต็อก"
@@ -144,7 +151,7 @@ Happy Path:
 Error Paths:
 ├── Session ค้าง in_progress > 48 ชม. → auto expire + alert
 ├── Admin กรอก actual_qty < 0 → validation error
-├── มี 2 session พร้อมกัน → block "มีการนับสต็อกค้างอยู่"
+├── มี 2 session พร้อมกัน → block "มีการนับสต็อกค้างอยู่" + ปุ่ม "Force Close" สำหรับ admin
 └── ระหว่างนับมี receive/ship เกิดขึ้น → variance note "มีการเคลื่อนไหวระหว่างนับ"
 
 Edge Cases:
