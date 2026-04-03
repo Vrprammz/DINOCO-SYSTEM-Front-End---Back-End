@@ -437,10 +437,34 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
   return null;
 }
 
-// === DINOCO AI V.2.3 — Gemini 2.5 Flash primary + Haiku/Sonnet fallback ===
+// === DINOCO AI V.3.1 — Pre-inject KB + Gemini primary + Haiku/Sonnet fallback ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
+  // ★ V.3.1: Pre-inject KB — ถ้าคำถามมี keywords ที่ Gemini ไม่เรียก tool ให้ดึง KB มาแปะก่อน
+  const KB_KEYWORDS = /สเปค|น้ำหนัก|กี่กิโล|กี่กก|ขนาด|มิติ|ซม\.|กว้าง.*ยาว.*สูง|ที่อยู่.*เคลม|ส่งเคลม.*ที่ไหน|ส่งซ่อม.*ที่ไหน|ระยะเวลา.*ซ่อม|ระยะเวลา.*เคลม|กี่วัน.*เสร็จ|กี่วัน.*ซ่อม|ใบเสร็จ|ใบกำกับ|invoice|บิล/i;
+  let enrichedMessage = userMessage;
+  if (KB_KEYWORDS.test(userMessage) && executeTool) {
+    try {
+      const db = await getDB();
+      if (db) {
+        const words = userMessage.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim().split(/\s+/).filter(w => w.length >= 2).slice(0, 8);
+        const regex = words.join("|");
+        const kbResults = await db.collection("knowledge_base").find({
+          active: { $ne: false },
+          $or: [
+            { content: { $regex: regex, $options: "i" } },
+            { title: { $regex: regex, $options: "i" } },
+          ],
+        }).limit(3).toArray();
+        if (kbResults.length > 0) {
+          const kbText = kbResults.map(r => r.content).join("\n---\n").substring(0, 1500);
+          enrichedMessage = `${userMessage}\n\n[ข้อมูลจาก KB สำหรับอ้างอิง — ตอบจากข้อมูลนี้:]:\n${kbText}`;
+          console.log(`[KB-Inject] Pre-injected ${kbResults.length} KB results for: ${userMessage.substring(0, 50)}`);
+        }
+      }
+    } catch (e) { console.error("[KB-Inject] Error:", e.message); }
+  }
   // ★ Tier 1: Gemini 2.5 Flash (ลูกน้อง — ทุกข้อความ)
-  const geminiReply = await callGeminiWithTools(systemPrompt, userMessage, AGENT_TOOLS, sourceId);
+  const geminiReply = await callGeminiWithTools(systemPrompt, enrichedMessage, AGENT_TOOLS, sourceId);
   if (geminiReply) return sanitizeAIOutput(geminiReply);
   // ★ Fallback: Claude Haiku 4.5 (ถ้า Gemini พัง)
   console.log("[AI] Gemini 2.5 Flash failed -> trying Claude Haiku 4.5...");
