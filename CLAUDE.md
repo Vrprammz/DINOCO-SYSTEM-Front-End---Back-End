@@ -98,10 +98,10 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **B2F FSM**: `B2F_Order_FSM` class ใน Snippet 6. 12 statuses: draft→submitted→confirmed→delivering→received→paid→completed. Terminal: completed, cancelled. ทุก transition ต้องผ่าน `b2f_transition_order()`.
 - **B2F Snippets** (DB_ID 1160-1171):
   - Snippet 0 (1160): CPT & ACF Registration — 5 CPTs + helpers + `b2f_get_maker_by_group()` (cached 5min/1hr)
-  - Snippet 1 (1163): Core Utilities & Flex Builders — LINE push + 13 Flex templates + `b2f_liff_url()` (HMAC sig)
+  - Snippet 1 (1163): Core Utilities & Flex Builders V.5.0 — LINE push + 18 Flex templates + `b2f_liff_url()` (HMAC sig) + i18n ENG/TH (currency != THB = ENG)
   - Snippet 2 (1165): REST API V.7.1 — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin) + concurrent locks (po-cancel, maker-deliver) + is_complete หัก rejected + payment fallback THB
   - Snippet 3 (1164): Webhook Handler & Bot Commands — Maker commands + Admin B2F commands + Flex menu (self-contained)
-  - Snippet 4 (1167): Maker LIFF Pages — shortcode `[b2f_maker_liff]` route `/b2f-maker/`
+  - Snippet 4 (1167): Maker LIFF Pages V.4.0 — shortcode `[b2f_maker_liff]` route `/b2f-maker/` + LANG system (`_isEng` + `L()` for non-THB currency makers)
   - Snippet 5 (1166): Admin Dashboard Tabs V.3.1 — 3 shortcodes embedded ใน Admin Dashboard + Bulk Cancel PO (V.2.0) + Multi-Currency UI (V.3.0) + Settings REST endpoint + receive form remaining fix (shipped-received)
   - Snippet 6 (1161): Order State Machine — `B2F_Order_FSM` class
   - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`, credit เกิดตอน receive-goods เท่านั้น (ไม่หักตอน create-po), `b2f_recalculate_payable()` คำนวณจาก `rcv_total_value` ของ receiving records
@@ -120,6 +120,7 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Sync Engine ต้อง bump version เพื่อ force sync — ถ้า hash ตรง (Same) จะไม่ update แม้โค้ดจริงต่างกัน (เกิดจากสร้าง snippet ใน WP ก่อน sync)
   - Cache `b2f_get_maker_by_group()` negative result TTL 5 นาที — ถ้าเพิ่ม group_id ใน Maker แล้ว Bot เงียบ เรียก `/debug-maker/{group_id}` เพื่อ clear cache
   - Maker group_id ต้อง unique ข้าม distributor — validate ด้วย `b2f_validate_group_id()`
+  - Maker LIFF LANG system (V.4.0): `_isEng = currency !== 'THB'` set จาก API response แรก. `L(th, en)` helper switch ทุก UI string. `formatDate()` + `fmtDateShort()` switch locale ตาม `_isEng`. PHP loading text เป็น neutral English ("Connecting...")
   - Admin Dashboard sidebar ต้องมี `<div class="sidebar-nav">` wrapper เพื่อ scroll ได้เมื่อเมนูเยอะ
   - B2F REST API nonce ต้องใช้ `wp_create_nonce('wp_rest')` ไม่ใช่ custom nonce name
   - B2F API response list ต้องใช้ key `data` ไม่ใช่ `makers`/`products` (frontend อ่าน `res.data`)
