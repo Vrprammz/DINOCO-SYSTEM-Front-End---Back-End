@@ -1315,11 +1315,37 @@ function dinoco_stock_auto_status( $sku ) {
 ## Appendix B: SKU Relations & Stock Deduction
 
 สำหรับ SKU relations (parent-child set):
-- **Parent SKU** = สินค้าเซ็ต (เช่น "SET-001")
-- **Child SKUs** = สินค้าแต่ละชิ้นในเซ็ต (เช่น "PART-A", "PART-B")
-- ตัวแทนสั่ง **Parent SKU** → B2B order มี parent SKU
-- Stock deduction: ตัดสต็อก **child SKUs** ตามจำนวน (ไม่ตัด parent)
-- ถ้าไม่มี child → ตัด parent SKU ตามปกติ
+- **Parent SKU** = สินค้าเซ็ต (เช่น "SET-001") — **ไม่เก็บ stock_qty ของตัวเอง**
+- **Child SKUs** = สินค้าแต่ละชิ้นในเซ็ต (เช่น "PART-A", "PART-B") — **เก็บ stock_qty จริง**
+- ถ้าไม่มี child → เป็นสินค้าเดี่ยว ตัด parent SKU ตามปกติ
+
+### กฎสำคัญ: Parent stock = MIN(children stock)
+
+```
+ตัวอย่าง: SET-001 มี 3 ชิ้น
+  PART-A: stock_qty = 10
+  PART-B: stock_qty = 7   ← คอขวด (bottleneck)
+  PART-C: stock_qty = 12
+
+→ SET-001 available = MIN(10, 7, 12) = 7 ชุด
+→ ถ้า PART-B หมด (0) → SET-001 ก็หมด แม้ PART-A/C ยังเหลือ
+```
+
+### Stock Display สำหรับ Parent (Set)
+
+```
+dinoco_get_set_available_qty($parent_sku):
+  1. ดึง children จาก dinoco_sku_relations
+  2. ดึง stock_qty ของ children ทุกตัว
+  3. return MIN(children.stock_qty)
+
+stock_status ของ Parent:
+  - available_qty > threshold  → "มีสินค้า" (เขียว)
+  - available_qty > 0          → "ใกล้หมด" (เหลือง)  
+  - available_qty = 0          → "สินค้าหมด" (แดง)
+```
+
+### Stock Deduction เมื่อสั่ง Set
 
 ```php
 function dinoco_stock_deduct_for_order( $order_id ) {
@@ -1332,7 +1358,7 @@ function dinoco_stock_deduct_for_order( $order_id ) {
         if ( ! $sku || $qty <= 0 ) continue;
         
         if ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) {
-            // Set product: deduct each child
+            // Set product: deduct each child (parent ไม่เก็บ stock)
             foreach ( $relations[ $sku ] as $child_sku ) {
                 dinoco_stock_subtract( $child_sku, $qty, 'b2b_shipped', 'b2b_order', $order_id );
             }
@@ -1342,6 +1368,26 @@ function dinoco_stock_deduct_for_order( $order_id ) {
         }
     }
 }
+```
+
+### Stock Addition เมื่อรับของจากโรงงาน (B2F)
+
+```
+B2F receive-goods ได้ SKU = child SKU (ชิ้นส่วน)
+→ dinoco_stock_add(child_sku, qty)
+→ Parent set available อัพเดทอัตโนมัติ (computed จาก MIN children)
+→ ไม่ต้อง add stock ให้ parent แยก
+```
+
+### BO ETA สำหรับ Set
+
+```
+ถ้า SET-001 หมดเพราะ PART-B หมด:
+→ BO ETA ของ SET-001 = ETA ของ PART-B (child ที่เป็นคอขวด)
+→ dinoco_calculate_bo_eta('SET-001'):
+   1. หา children ทุกตัวที่ stock_qty = 0
+   2. หา ETA ของ children ที่หมด (จาก B2F PO)
+   3. ETA ของ Set = MAX(children ETA) — ต้องรอจนได้ครบทุกชิ้น
 ```
 
 ## Appendix C: Initial Stock Setup Plan
