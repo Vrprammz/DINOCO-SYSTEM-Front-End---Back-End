@@ -122,7 +122,13 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Admin Dashboard sidebar ต้องมี `<div class="sidebar-nav">` wrapper เพื่อ scroll ได้เมื่อเมนูเยอะ
   - B2F REST API nonce ต้องใช้ `wp_create_nonce('wp_rest')` ไม่ใช่ custom nonce name
   - B2F API response list ต้องใช้ key `data` ไม่ใช่ `makers`/`products` (frontend อ่าน `res.data`)
-- **B2F Multi-Currency** (V.3.0): Maker มี `maker_currency` (THB/CNY/USD). Product มี `mp_shipping_land` + `mp_shipping_sea` (THB/unit). PO มี `po_currency`, `po_exchange_rate`, `po_shipping_method` (land/sea), `po_total_amount_thb`, `po_shipping_total`, `po_grand_total_thb`. Frontend helpers: `b2f_currency_symbol()`, `b2f_format_currency()`, `b2f_currency_name_en()` (Snippet 1). Settings: `b2f_shipping_dest_land`, `b2f_shipping_dest_sea` (wp_options, REST `/b2f/v1/settings`). Exchange rate range: CNY 2-10, USD 25-50. Currency immutable หลัง submitted.
+- **B2F Multi-Currency** (V.3.0+): Maker มี `maker_currency` (THB/CNY/USD). Product มี `mp_shipping_land` + `mp_shipping_sea` (THB/unit). PO มี `po_currency`, `po_exchange_rate`, `po_shipping_method` (land/sea), `po_total_amount_thb`, `po_shipping_total`, `po_grand_total_thb`. Frontend helpers: `b2f_currency_symbol()`, `b2f_format_currency()`, `b2f_currency_name_en()` (Snippet 1). Settings: `b2f_shipping_dest_land`, `b2f_shipping_dest_sea` (wp_options, REST `/b2f/v1/settings`). Exchange rate range: CNY 2-10, USD 25-50. Currency immutable หลัง submitted.
+  - `b2f_get_po_data()` return `currency`, `exchange_rate`, `shipping_method` — Flex builders ทุกตัวใช้ `$po['currency']` แทน hardcode `'฿'`
+  - PO Image (Snippet 10 V.2.4): CNY/USD PO ใช้ ENG template (PURCHASE ORDER, No., Date, Supplier, Item, Qty, Unit Price, Amount) + delivery address + shipping method (By Truck K / By Sea M) + ไม่แสดง baht_text
+  - Maker LIFF (Snippet 4 V.3.18): `curSym(po)` helper ใช้ `po.currency_symbol` จาก API
+  - PO Ticket (Snippet 9 V.3.3): Admin เห็น "ต้นทุนจริง" section (ยอดสกุลโรงงาน, exchange rate, THB total, ค่าส่ง, ต้นทุนรวม) สำหรับ foreign PO
+  - Cron messages (Snippet 11 V.1.5): แสดง currency note สำหรับ foreign PO
+  - Debt/credit/payment/outstanding = THB เสมอ (ไม่แปลงสกุล)
   - Flash cron `b2b_flash_tracking_cron` ใช้ fallback interval `everytwohours` (จาก WP Fastest Cache) เพราะ `every_2hr_b2b` ไม่ load ใน REST context + DISABLE_WP_CRON=true
   - Flash Webhook ต้องกดตั้งค่าใน B2B Admin → Flash → ตั้งค่า Webhook ทุกครั้งที่เปลี่ยน API key/domain
   - `/debug-flash/{ticket_id}` (admin only ใน B2B Snippet 5) — ดึง Flash Routes API + force update สถานะ + schedule cron
