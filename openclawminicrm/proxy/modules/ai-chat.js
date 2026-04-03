@@ -440,7 +440,7 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
 // === DINOCO AI V.3.1 — Pre-inject KB + Gemini primary + Haiku/Sonnet fallback ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
   // ★ V.3.1: Pre-inject KB — ถ้าคำถามมี keywords ที่ Gemini ไม่เรียก tool ให้ดึง KB มาแปะก่อน
-  const KB_KEYWORDS = /สเปค|น้ำหนัก|กี่กิโล|กี่กก|ขนาด|มิติ|ซม\.|กว้าง.*ยาว.*สูง|ที่อยู่.*เคลม|ส่งเคลม.*ที่ไหน|ส่งซ่อม.*ที่ไหน|ระยะเวลา.*ซ่อม|ระยะเวลา.*เคลม|กี่วัน.*เสร็จ|กี่วัน.*ซ่อม|ใบเสร็จ|ใบกำกับ|invoice|บิล/i;
+  const KB_KEYWORDS = /สเปค|น้ำหนัก|กี่กิโล|กี่กก|ขนาด|มิติ|ซม\.|กว้าง.*ยาว.*สูง|ที่อยู่.*เคลม|ส่งเคลม.*ที่ไหน|ส่งซ่อม.*ที่ไหน|ระยะเวลา.*ซ่อม|ระยะเวลา.*เคลม|กี่วัน.*เสร็จ|กี่วัน.*ซ่อม|ใบเสร็จ|ใบกำกับ|invoice|บิล|รับน้ำหนัก|กี่กิโล|max|ถอด.*ง่าย|ถอด.*PRO|STD.*PRO.*น้ำหนัก|ติดตั้ง.*กี่.*ชม|กี่.*ชั่วโมง|ค่าทำสี|สีดำ.*ซ่อม|สีดำ.*บุบ|อุบัติเหตุ.*กี่วัน|ซีล.*อายุ|น้ำ.*กุญแจ|คืน.*สินค้า|เปลี่ยน.*สินค้า|ผ่อน|COD|ส่ง.*กี่วัน|กี่วัน.*ถึง|Promotion.*Set|ด้านใน.*กล่อง|เปิด.*กล่อง.*ข้าง|กล่อง.*ข้าง.*เปิด|กิ่งไม้|กัน.*ลม|กัน.*กิ่ง|ใส่.*เสื้อผ้า|ถุงนอน/i;
   let enrichedMessage = userMessage;
   if (KB_KEYWORDS.test(userMessage) && executeTool) {
     try {
