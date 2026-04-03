@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 1.2 | Date: 2026-04-04 | Author: Feature Architect
+Version: 2.0 | Date: 2026-04-04 | Author: Feature Architect
 
 ---
 
@@ -1146,6 +1146,126 @@ Deploy Phase 3 → Test:
 ├── Approve → ปรับสต็อกอัตโนมัติ
 ├── 30-day reminder ทำงาน
 └── Export/Import CSV ทำงาน
+```
+
+### Phase 4: Reserved Qty + Reorder Alert + AI Stock Query (3-4 วัน)
+
+```
+Task 4.1: Reserved Quantity (computed — ไม่เก็บ field แยก)
+├── SQL: SUM(order_items.qty) WHERE status IN 
+│   (checking_stock, awaiting_confirm, awaiting_payment, paid, packed)
+├── dinoco_get_reserved_qty($sku) → computed realtime
+├── available_qty = stock_qty - reserved_qty
+├── Distributor badge ใช้ available_qty แทน stock_qty
+├── Admin เห็นทั้ง stock_qty + reserved_qty + available_qty
+├── ไฟล์: Stock Core Functions + Catalog API
+└── เวลา: 1 วัน
+
+Task 4.2: Cancel → ปลด Reserve
+├── Cancel ก่อน shipped → reserved_qty ลดลงอัตโนมัติ (computed, ไม่ต้องทำอะไร)
+├── Cancel หลัง shipped (walk-in only) → dinoco_stock_add() คืนสต็อก
+├── ไฟล์: [B2B] Snippet 2
+└── เวลา: 0.5 วัน
+
+Task 4.3: Reorder Point Alert + Suggest PO Link
+├── Threshold: reorder_point field (per SKU, Admin ตั้งเอง)
+├── Cron daily: ตรวจ available_qty <= reorder_point
+├── LINE Flex → Admin group:
+│   "⚠️ SKU-001 เหลือ 5 ชิ้น (reorder point: 10)"
+│   [ปุ่ม: สั่งผลิต] → เปิด B2F catalog LIFF pre-filled SKU
+├── ไม่ auto-create PO (ต้องมีคนตัดสินใจ)
+├── ไฟล์: Stock Core + Cron + Flex Builder
+└── เวลา: 1 วัน
+
+Task 4.4: AI Chatbot Stock Query (OpenClaw integration)
+├── เพิ่ม tool: "check_stock_status" ใน dinoco-tools.js
+│   Input: { sku or product_name }
+│   Output: { stock_display, eta, bo_note } (ไม่ส่ง stock_qty!)
+├── AI ตอบได้:
+│   "มีของไหม?" → "สินค้า X มีสินค้า / ใกล้หมด / หมด"
+│   "เมื่อไหร่จะมี?" → "คาดว่าจะมีของ DD/MM/YYYY" (BO ETA)
+│   "มีกี่ชิ้น?" → "ขออภัย ไม่สามารถแจ้งจำนวนสต็อกได้"
+├── MCP Bridge /product-lookup เพิ่ม stock_display + eta
+├── ไฟล์: openclawminicrm/proxy/dinoco-tools.js + [System] MCP Bridge
+└── เวลา: 1 วัน
+
+Deploy Phase 4 → Test:
+├── สั่ง 8 จาก 10 → available = 2 → "ใกล้หมด"
+├── Cancel → available กลับ 10
+├── Reorder alert push LINE เมื่อถึง threshold
+├── AI bot ตอบ stock + ETA ได้ ไม่หลุดตัวเลข
+└── Walk-in cancel → คืนสต็อก
+```
+
+### Phase 5: Multi-Warehouse + Valuation + Forecasting (5-7 วัน)
+
+```
+Task 5.1: Multi-Warehouse Data Model
+├── CREATE TABLE dinoco_warehouses
+│   (id, name, code, address, is_default, is_active, created_at)
+├── ALTER TABLE dinoco_stock_transactions ADD warehouse_id
+├── CREATE TABLE dinoco_warehouse_stock
+│   (id, warehouse_id, sku, stock_qty, reserved_qty,
+│    low_stock_threshold, reorder_point, updated_at)
+│   UNIQUE KEY (warehouse_id, sku)
+├── Migration: สร้าง "โกดังหลัก" (default) + ย้าย stock_qty เข้า
+├── ไฟล์: [B2B] Snippet 15
+└── เวลา: 1 วัน
+
+Task 5.2: Multi-Warehouse Core Functions
+├── dinoco_stock_add/subtract() เพิ่ม $warehouse_id (default = primary)
+├── dinoco_get_total_stock($sku) = SUM across warehouses
+├── dinoco_get_warehouse_stock($sku, $warehouse_id)
+├── dinoco_transfer_stock($sku, $from_wh, $to_wh, $qty)
+│   → ตัด source + เพิ่ม dest + log 2 transactions
+├── stock_display ใช้ total stock (รวมทุกคลัง)
+├── B2B ship → ตัดจาก warehouse ที่ Admin เลือก (หรือ default)
+├── B2F receive → เพิ่มที่ warehouse ที่ Admin เลือก (หรือ default)
+├── ไฟล์: Stock Core Functions
+└── เวลา: 1.5 วัน
+
+Task 5.3: Multi-Warehouse Admin UI
+├── Tab "คลังสินค้า" → CRUD (ชื่อ, code, ที่อยู่, สถานะ)
+├── Stock table: filter by warehouse
+├── Stock adjust: dropdown เลือก warehouse
+├── Transfer modal: จาก [A] → ไป [B] จำนวน [__]
+├── Dip Stock: เลือก warehouse ที่จะนับ
+├── ไฟล์: [Admin System] DINOCO Global Inventory Database
+└── เวลา: 2 วัน
+
+Task 5.4: Inventory Valuation (Weighted Average)
+├── เก็บ unit_cost ใน dinoco_stock_transactions (ตอน B2F receive)
+├── weighted_avg_cost = total_cost / total_qty received
+├── Multi-currency → ใช้ THB (B2F มี po_exchange_rate อยู่แล้ว)
+├── Admin Dashboard card: "มูลค่าสินค้าคงเหลือ: ฿X,XXX,XXX"
+├── Report: SKU | qty | avg_cost | total_value
+├── ไฟล์: Stock Core + Finance Dashboard
+└── เวลา: 1.5 วัน
+
+Task 5.5: Stock Forecasting (Basic)
+├── avg_daily_usage = SUM(shipped qty) / days (30/60/90 วัน)
+├── Days of Stock = stock_qty / avg_daily_usage
+├── Suggest: "ควรสั่ง X ชิ้น ภายใน Y วัน"
+│   (buffer = stock_qty - lead_time_days × avg_daily_usage)
+├── Dashboard card: "สินค้าที่จะหมดใน 7 วัน"
+├── ต้องมี data อย่างน้อย 30 วันก่อน forecast ได้
+├── ไฟล์: Stock Core + Cron
+└── เวลา: 1 วัน
+
+Task 5.6: Barcode / QR (Optional shortcut)
+├── Admin scan barcode → lookup SKU → เปิดฟอร์ม stock adjust/dip stock
+├── ใช้ camera API + JS barcode library (quagga2 / html5-qrcode)
+├── ไม่บังคับ — manual input ยังใช้ได้เหมือนเดิม
+├── ไฟล์: [Admin System] DINOCO Global Inventory Database
+└── เวลา: 1 วัน (optional)
+
+Deploy Phase 5 → Test:
+├── สร้าง 2 warehouses → stock แยกคลัง
+├── โอนสต็อกระหว่างคลัง → ตัวเลขถูกทั้ง 2 ฝั่ง
+├── B2F receive เลือก warehouse → เข้าถูกคลัง
+├── Valuation report มูลค่าถูกต้อง (THB)
+├── Forecast "หมดใน X วัน" ตรง ± 20%
+└── Barcode scan → เปิดฟอร์มถูก SKU
 ```
 
 ---
