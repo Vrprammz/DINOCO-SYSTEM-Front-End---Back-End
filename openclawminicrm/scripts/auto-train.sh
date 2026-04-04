@@ -74,9 +74,13 @@ gen();
   docker cp scripts/test-cases.csv $AGENT:/tmp/test-cases.csv
   docker exec $AGENT node /tmp/test-ai.js 2>/dev/null > /tmp/test-result.txt || true
 
-  # Parse results
-  PASS=$(grep -c "\.\.\. PASS" /tmp/test-result.txt 2>/dev/null || echo 0)
-  FAIL=$(grep -c "\.\.\. FAIL" /tmp/test-result.txt 2>/dev/null || echo 0)
+  # Parse results — tr -d ลบ newline/space ที่ติดมา
+  PASS=$(grep -c "\.\.\. PASS" /tmp/test-result.txt 2>/dev/null || echo "0")
+  FAIL=$(grep -c "\.\.\. FAIL" /tmp/test-result.txt 2>/dev/null || echo "0")
+  PASS=$(echo "$PASS" | tr -d '[:space:]')
+  FAIL=$(echo "$FAIL" | tr -d '[:space:]')
+  PASS=${PASS:-0}
+  FAIL=${FAIL:-0}
   TOTAL=$((PASS + FAIL))
   SCORE=0
   [ "$TOTAL" -gt 0 ] && SCORE=$((PASS * 100 / TOTAL))
