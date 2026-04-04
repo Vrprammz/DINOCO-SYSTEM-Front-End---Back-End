@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.30.2
+ * Version: V.31.0
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -584,6 +584,330 @@ if (!function_exists('dinoco_calculate_duration_thai')) {
 }
 
 // =========================================================================================
+// [PART 1.5] REST API — Stock Management (namespace: dinoco-stock/v1)
+// =========================================================================================
+add_action('rest_api_init', function() {
+
+    // --- GET /dinoco-stock/v1/stock/list ---
+    register_rest_route('dinoco-stock/v1', '/stock/list', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $table = $wpdb->prefix . 'dinoco_products';
+
+            $page     = max(1, intval($request->get_param('page') ?: 1));
+            $per_page = max(1, min(100, intval($request->get_param('per_page') ?: 20)));
+            $status   = sanitize_text_field($request->get_param('status') ?: 'all');
+            $search   = sanitize_text_field($request->get_param('search') ?: '');
+
+            $where = ['is_active = 1'];
+            $params = [];
+
+            // Search filter
+            if ($search !== '') {
+                $like = '%' . $wpdb->esc_like($search) . '%';
+                $where[] = '(sku LIKE %s OR name LIKE %s)';
+                $params[] = $like;
+                $params[] = $like;
+            }
+
+            // Status filter (computed from stock_qty + threshold + manual_hold)
+            // We filter in PHP after fetch for correctness, unless optimizing later
+            $where_sql = implode(' AND ', $where);
+            $count_sql = "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}";
+            $total_all = (int) $wpdb->get_var( empty($params) ? $count_sql : $wpdb->prepare($count_sql, ...$params) );
+
+            $sql = "SELECT sku, name, image_url, stock_qty, low_stock_threshold, reorder_point, manual_hold, manual_hold_reason, stock_status, stock_updated_at
+                    FROM {$table} WHERE {$where_sql} ORDER BY name ASC";
+            $all_rows = empty($params) ? $wpdb->get_results($sql) : $wpdb->get_results($wpdb->prepare($sql, ...$params));
+
+            // Compute stock_display for each row + filter by status
+            $filtered = [];
+            $counts = ['in_stock' => 0, 'low_stock' => 0, 'out_of_stock' => 0, 'hold' => 0, 'total' => 0];
+            foreach ($all_rows as $row) {
+                $counts['total']++;
+                $display = 'in_stock';
+                if ((int)$row->manual_hold) {
+                    $display = 'hold';
+                } elseif ((int)$row->stock_qty <= 0) {
+                    $display = 'out_of_stock';
+                } elseif ((int)$row->stock_qty <= (int)$row->low_stock_threshold) {
+                    $display = 'low_stock';
+                }
+                $counts[$display]++;
+
+                if ($status !== 'all' && $display !== $status) continue;
+
+                $row->stock_display = $display;
+                $filtered[] = $row;
+            }
+
+            $total_filtered = count($filtered);
+            $pages = max(1, ceil($total_filtered / $per_page));
+            $offset = ($page - 1) * $per_page;
+            $paged = array_slice($filtered, $offset, $per_page);
+
+            $data = [];
+            foreach ($paged as $row) {
+                $data[] = [
+                    'sku'                 => $row->sku,
+                    'name'                => $row->name,
+                    'image_url'           => $row->image_url,
+                    'stock_qty'           => (int) $row->stock_qty,
+                    'stock_display'       => $row->stock_display,
+                    'low_stock_threshold' => (int) $row->low_stock_threshold,
+                    'reorder_point'       => (int) $row->reorder_point,
+                    'manual_hold'         => (bool) $row->manual_hold,
+                    'manual_hold_reason'  => $row->manual_hold_reason ?: '',
+                    'stock_updated_at'    => $row->stock_updated_at ?: '',
+                ];
+            }
+
+            return rest_ensure_response([
+                'success' => true,
+                'data'    => $data,
+                'total'   => $total_filtered,
+                'pages'   => $pages,
+                'counts'  => $counts,
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- POST /dinoco-stock/v1/stock/adjust ---
+    register_rest_route('dinoco-stock/v1', '/stock/adjust', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $table_p   = $wpdb->prefix . 'dinoco_products';
+            $table_txn = $wpdb->prefix . 'dinoco_stock_transactions';
+
+            $sku    = sanitize_text_field($request->get_param('sku'));
+            $type   = sanitize_text_field($request->get_param('type')); // add|subtract
+            $qty    = max(0, intval($request->get_param('qty')));
+            $reason = sanitize_text_field($request->get_param('reason'));
+
+            if (!$sku || !in_array($type, ['add','subtract']) || $qty <= 0) {
+                return new WP_Error('invalid_params', 'Missing sku, type (add/subtract), or qty', ['status' => 400]);
+            }
+            if (empty($reason)) {
+                return new WP_Error('missing_reason', 'กรุณาระบุเหตุผล', ['status' => 400]);
+            }
+
+            $wpdb->query('START TRANSACTION');
+            $current = $wpdb->get_row($wpdb->prepare(
+                "SELECT stock_qty, low_stock_threshold FROM {$table_p} WHERE sku = %s FOR UPDATE", $sku
+            ));
+            if (!$current) {
+                $wpdb->query('ROLLBACK');
+                return new WP_Error('sku_not_found', "SKU {$sku} not found", ['status' => 404]);
+            }
+
+            $qty_before = (int) $current->stock_qty;
+            $change     = ($type === 'add') ? $qty : -$qty;
+            $qty_after  = max(0, $qty_before + $change);
+            $txn_type   = ($type === 'add') ? 'manual_add' : 'manual_subtract';
+
+            $wpdb->update($table_p,
+                ['stock_qty' => $qty_after, 'stock_updated_at' => current_time('mysql')],
+                ['sku' => $sku]
+            );
+
+            $wpdb->insert($table_txn, [
+                'sku'            => $sku,
+                'type'           => $txn_type,
+                'qty_change'     => $change,
+                'qty_before'     => $qty_before,
+                'qty_after'      => $qty_after,
+                'reason'         => $reason,
+                'user_id'        => get_current_user_id(),
+                'created_at'     => current_time('mysql'),
+            ]);
+            $txn_id = $wpdb->insert_id;
+
+            $wpdb->query('COMMIT');
+
+            // Compute new display status
+            $threshold = (int) $current->low_stock_threshold;
+            $display = 'in_stock';
+            if ($qty_after <= 0) $display = 'out_of_stock';
+            elseif ($qty_after <= $threshold) $display = 'low_stock';
+
+            // Auto-update stock_status on b2b_product CPT for backward compat
+            $b2b_status = ($qty_after <= 0) ? 'out_of_stock' : 'in_stock';
+            if (class_exists('DINOCO_Catalog')) {
+                DINOCO_Catalog::set_stock_status($sku, $b2b_status);
+            }
+
+            return rest_ensure_response([
+                'success'       => true,
+                'new_qty'       => $qty_after,
+                'stock_display' => $display,
+                'transaction_id'=> $txn_id,
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- GET /dinoco-stock/v1/stock/transactions ---
+    register_rest_route('dinoco-stock/v1', '/stock/transactions', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $table = $wpdb->prefix . 'dinoco_stock_transactions';
+
+            $sku       = sanitize_text_field($request->get_param('sku'));
+            $page      = max(1, intval($request->get_param('page') ?: 1));
+            $per_page  = max(1, min(50, intval($request->get_param('per_page') ?: 20)));
+            $type_filter = sanitize_text_field($request->get_param('type_filter') ?: '');
+
+            if (!$sku) {
+                return new WP_Error('missing_sku', 'SKU is required', ['status' => 400]);
+            }
+
+            $where = ['sku = %s'];
+            $params = [$sku];
+
+            if ($type_filter) {
+                $where[] = 'type = %s';
+                $params[] = $type_filter;
+            }
+
+            $where_sql = implode(' AND ', $where);
+            $total = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$table} WHERE {$where_sql}", ...$params));
+
+            $offset = ($page - 1) * $per_page;
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT id, type, qty_change, qty_before, qty_after, reason, user_id, created_at, reference_type, reference_id
+                 FROM {$table} WHERE {$where_sql} ORDER BY created_at DESC LIMIT %d OFFSET %d",
+                ...array_merge($params, [$per_page, $offset])
+            ));
+
+            $data = [];
+            foreach ($rows as $r) {
+                $user_name = '';
+                if ($r->user_id) {
+                    $u = get_userdata($r->user_id);
+                    $user_name = $u ? $u->display_name : 'User #' . $r->user_id;
+                }
+                $data[] = [
+                    'id'             => (int) $r->id,
+                    'type'           => $r->type,
+                    'qty_change'     => (int) $r->qty_change,
+                    'qty_before'     => (int) $r->qty_before,
+                    'qty_after'      => (int) $r->qty_after,
+                    'reason'         => $r->reason,
+                    'user_name'      => $user_name,
+                    'created_at'     => $r->created_at,
+                    'reference_type' => $r->reference_type,
+                    'reference_id'   => $r->reference_id ? (int) $r->reference_id : null,
+                ];
+            }
+
+            return rest_ensure_response([
+                'success' => true,
+                'data'    => $data,
+                'total'   => $total,
+                'pages'   => max(1, ceil($total / $per_page)),
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- POST /dinoco-stock/v1/stock/settings ---
+    register_rest_route('dinoco-stock/v1', '/stock/settings', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            $fields = [
+                'default_threshold' => 'dinoco_inv_default_low_threshold',
+                'default_reorder'   => 'dinoco_inv_default_reorder_point',
+                'alert_enabled'     => 'dinoco_inv_alert_enabled',
+                'dip_interval'      => 'dinoco_inv_dip_stock_interval_days',
+            ];
+            foreach ($fields as $param => $option) {
+                $val = $request->get_param($param);
+                if ($val !== null) {
+                    if ($param === 'alert_enabled') {
+                        update_option($option, $val ? '1' : '0');
+                    } else {
+                        update_option($option, max(0, intval($val)));
+                    }
+                }
+            }
+            return rest_ensure_response(['success' => true]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- GET /dinoco-stock/v1/stock/settings ---
+    register_rest_route('dinoco-stock/v1', '/stock/settings', [
+        'methods'  => 'GET',
+        'callback' => function() {
+            return rest_ensure_response([
+                'success' => true,
+                'data'    => [
+                    'default_threshold' => (int) get_option('dinoco_inv_default_low_threshold', 10),
+                    'default_reorder'   => (int) get_option('dinoco_inv_default_reorder_point', 5),
+                    'alert_enabled'     => (bool) get_option('dinoco_inv_alert_enabled', true),
+                    'dip_interval'      => (int) get_option('dinoco_inv_dip_stock_interval_days', 30),
+                    'initialized'       => (bool) get_option('dinoco_inv_initialized', false),
+                ],
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- POST /dinoco-stock/v1/stock/hold ---
+    register_rest_route('dinoco-stock/v1', '/stock/hold', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $table = $wpdb->prefix . 'dinoco_products';
+            $sku    = sanitize_text_field($request->get_param('sku'));
+            $hold   = (bool) $request->get_param('hold');
+            $reason = sanitize_text_field($request->get_param('reason') ?: '');
+
+            if (!$sku) return new WP_Error('missing_sku', 'SKU required', ['status' => 400]);
+
+            $exists = $wpdb->get_var($wpdb->prepare("SELECT sku FROM {$table} WHERE sku = %s", $sku));
+            if (!$exists) return new WP_Error('sku_not_found', "SKU {$sku} not found", ['status' => 404]);
+
+            $update = [
+                'manual_hold'        => $hold ? 1 : 0,
+                'manual_hold_reason' => $hold ? $reason : null,
+                'manual_hold_by'     => $hold ? get_current_user_id() : null,
+                'stock_updated_at'   => current_time('mysql'),
+            ];
+            $wpdb->update($table, $update, ['sku' => $sku]);
+
+            // Sync stock_status on b2b_product CPT
+            if ($hold && class_exists('DINOCO_Catalog')) {
+                DINOCO_Catalog::set_stock_status($sku, 'out_of_stock');
+            } elseif (!$hold) {
+                $qty = (int) $wpdb->get_var($wpdb->prepare("SELECT stock_qty FROM {$table} WHERE sku = %s", $sku));
+                if ($qty > 0 && class_exists('DINOCO_Catalog')) {
+                    DINOCO_Catalog::set_stock_status($sku, 'in_stock');
+                }
+            }
+
+            return rest_ensure_response(['success' => true]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- POST /dinoco-stock/v1/stock/initialize ---
+    register_rest_route('dinoco-stock/v1', '/stock/initialize', [
+        'methods'  => 'POST',
+        'callback' => function() {
+            update_option('dinoco_inv_initialized', true);
+            return rest_ensure_response(['success' => true]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+});
+
+// =========================================================================================
 // [PART 2] FRONTEND INTERFACE
 // =========================================================================================
 add_shortcode('dinoco_admin_inventory', 'dinoco_render_ui_v99');
@@ -736,6 +1060,74 @@ function dinoco_render_ui_v99() {
             overflow: hidden; /* Cut off anything outside rounded corners */
         }
 
+        /* Stock Management Tab Styles (V.31.0) */
+        .st-purple { background: #f3e8ff; color: #6b21a8; }
+        .st-yellow { background: #fefce8; color: #854d0e; }
+
+        .stock-filter-tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+        .stock-filter-pill { padding: 6px 16px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; cursor: pointer; border: 1px solid #e2e8f0; background: white; color: #64748b; transition: 0.2s; }
+        .stock-filter-pill:hover { background: #f8fafc; border-color: #94a3b8; }
+        .stock-filter-pill.active { background: #1e293b; color: white; border-color: #1e293b; }
+
+        .stock-kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 20px; }
+        .stock-kpi-card { background: white; padding: 18px; border-radius: 12px; border: 1px solid #e2e8f0; text-align: center; cursor: pointer; transition: 0.2s; }
+        .stock-kpi-card:hover { transform: translateY(-2px); box-shadow: 0 8px 15px -3px rgba(0,0,0,0.06); }
+        .stock-kpi-card .skpi-val { font-size: 1.8rem; font-weight: 800; color: #0f172a; margin: 4px 0; }
+        .stock-kpi-card .skpi-label { font-size: 0.7rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.3px; }
+
+        .stock-search-row { display: flex; gap: 10px; margin-bottom: 16px; align-items: center; }
+        .stock-search-input { flex-grow: 1; padding: 10px 16px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 0.9rem; outline: none; background: #f8fafc; transition: 0.2s; }
+        .stock-search-input:focus { border-color: #3b82f6; background: white; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
+
+        .stock-table { width: 100%; border-collapse: separate; border-spacing: 0; background: white; font-size: 0.85rem; }
+        .stock-table th { background: #f8fafc; color: #475569; font-weight: 700; padding: 10px 12px; text-align: left; border-bottom: 2px solid #e2e8f0; text-transform: uppercase; font-size: 0.75rem; white-space: nowrap; }
+        .stock-table td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; color: #334155; }
+        .stock-table tr:hover { background: #f8fafc; }
+        .stock-table .stock-thumb { width: 40px; height: 40px; border-radius: 8px; border: 1px solid #e2e8f0; object-fit: contain; background: white; }
+        .stock-table .stock-thumb-placeholder { width: 40px; height: 40px; border-radius: 8px; border: 1px dashed #cbd5e1; background: #f8fafc; display: flex; align-items: center; justify-content: center; font-size: 8px; color: #94a3b8; }
+
+        .stock-actions-bar { position: sticky; bottom: 0; background: white; border-top: 1px solid #e2e8f0; padding: 12px 20px; display: flex; gap: 10px; justify-content: flex-end; z-index: 10; box-shadow: 0 -4px 6px rgba(0,0,0,0.03); border-radius: 0 0 12px 12px; }
+
+        .stock-pagination { display: flex; justify-content: center; align-items: center; gap: 6px; padding: 16px 0; }
+        .stock-pagination button { padding: 6px 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; font-size: 0.8rem; cursor: pointer; transition: 0.2s; }
+        .stock-pagination button:hover { background: #f1f5f9; }
+        .stock-pagination button.active { background: #1e293b; color: white; border-color: #1e293b; }
+        .stock-pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* Stock card layout for mobile */
+        .stock-card-list { display: none; }
+        .stock-card-item { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; margin-bottom: 10px; }
+        .stock-card-item .sc-header { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+        .stock-card-item .sc-thumb { width: 48px; height: 48px; border-radius: 8px; border: 1px solid #e2e8f0; object-fit: contain; }
+        .stock-card-item .sc-info { flex: 1; min-width: 0; }
+        .stock-card-item .sc-name { font-weight: 700; color: #334155; font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .stock-card-item .sc-sku { font-family: monospace; color: #94a3b8; font-size: 0.7rem; }
+        .stock-card-item .sc-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
+        .stock-card-item .sc-label { font-size: 0.75rem; color: #94a3b8; }
+        .stock-card-item .sc-val { font-size: 0.85rem; font-weight: 600; color: #334155; }
+        .stock-card-item .sc-actions { display: flex; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #f1f5f9; }
+
+        /* Timeline for transaction log */
+        .txn-timeline { position: relative; padding-left: 24px; }
+        .txn-timeline::before { content: ''; position: absolute; left: 8px; top: 0; bottom: 0; width: 2px; background: #e2e8f0; }
+        .txn-item { position: relative; margin-bottom: 16px; padding: 10px 14px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
+        .txn-item::before { content: ''; position: absolute; left: -20px; top: 16px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid white; }
+        .txn-item.txn-add::before { background: #22c55e; }
+        .txn-item.txn-sub::before { background: #ef4444; }
+        .txn-item.txn-neutral::before { background: #3b82f6; }
+        .txn-item .txn-date { font-size: 0.7rem; color: #94a3b8; }
+        .txn-item .txn-type { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; }
+        .txn-item .txn-change { font-size: 1.1rem; font-weight: 800; }
+        .txn-item .txn-reason { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+
+        @media (max-width: 900px) {
+            .stock-kpi-grid { grid-template-columns: repeat(2, 1fr); }
+            .stock-kpi-grid > :last-child { grid-column: span 2; }
+            #stock-table-wrap { display: none !important; }
+            .stock-card-list { display: block !important; }
+            .stock-actions-bar { flex-wrap: wrap; }
+        }
+
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
     </style>
 
@@ -765,6 +1157,7 @@ function dinoco_render_ui_v99() {
             <div class="main-tab" onclick="switchMainTab('list')"><i class="fa-solid fa-boxes-stacked"></i> Inventory Manager</div>
             <div class="main-tab" id="tab-catalog" onclick="switchMainTab('catalog')"><i class="fa-solid fa-book-open"></i> Product Catalog</div>
             <div class="main-tab" onclick="switchMainTab('generate')"><i class="fa-solid fa-industry"></i> Production (Gen SN)</div>
+            <div class="main-tab" onclick="switchMainTab('stock')"><i class="fa-solid fa-warehouse"></i> Stock Management</div>
         </div>
 
         <!-- 1. DASHBOARD -->
@@ -857,6 +1250,93 @@ function dinoco_render_ui_v99() {
                 </div>
             </div>
         </div>
+        <!-- 5. STOCK MANAGEMENT (V.31.0) -->
+        <div id="view-stock" class="view-section">
+            <!-- KPI Cards -->
+            <div class="stock-kpi-grid">
+                <div class="stock-kpi-card" onclick="StockManager.filterByStatus('all')">
+                    <div class="skpi-label">สินค้าทั้งหมด</div>
+                    <div class="skpi-val" id="skpi-total">-</div>
+                    <span class="bg-blue-soft">TOTAL</span>
+                </div>
+                <div class="stock-kpi-card" onclick="StockManager.filterByStatus('in_stock')">
+                    <div class="skpi-label">มีสต็อก</div>
+                    <div class="skpi-val" id="skpi-in-stock">-</div>
+                    <span class="bg-green-soft">IN STOCK</span>
+                </div>
+                <div class="stock-kpi-card" onclick="StockManager.filterByStatus('low_stock')">
+                    <div class="skpi-label">ใกล้หมด</div>
+                    <div class="skpi-val" id="skpi-low-stock">-</div>
+                    <span class="bg-orange-soft">LOW STOCK</span>
+                </div>
+                <div class="stock-kpi-card" onclick="StockManager.filterByStatus('out_of_stock')">
+                    <div class="skpi-label">หมดสต็อก</div>
+                    <div class="skpi-val" id="skpi-oos">-</div>
+                    <span class="bg-red-soft">OUT OF STOCK</span>
+                </div>
+                <div class="stock-kpi-card" onclick="StockManager.filterByStatus('hold')">
+                    <div class="skpi-label">Hold</div>
+                    <div class="skpi-val" id="skpi-hold">-</div>
+                    <span style="background:#f3e8ff;color:#6b21a8;padding:4px 10px;border-radius:20px;font-size:0.7rem;font-weight:700;display:inline-block;margin-top:5px;">MANUAL HOLD</span>
+                </div>
+            </div>
+
+            <!-- Filter pills + Search -->
+            <div class="stock-filter-tabs" id="stock-filter-tabs">
+                <span class="stock-filter-pill active" data-status="all" onclick="StockManager.filterByStatus('all')">ทั้งหมด</span>
+                <span class="stock-filter-pill" data-status="in_stock" onclick="StockManager.filterByStatus('in_stock')">มีสต็อก</span>
+                <span class="stock-filter-pill" data-status="low_stock" onclick="StockManager.filterByStatus('low_stock')">ใกล้หมด</span>
+                <span class="stock-filter-pill" data-status="out_of_stock" onclick="StockManager.filterByStatus('out_of_stock')">หมดสต็อก</span>
+                <span class="stock-filter-pill" data-status="hold" onclick="StockManager.filterByStatus('hold')">Hold</span>
+            </div>
+
+            <div class="stock-search-row">
+                <input type="text" id="stock-search" class="stock-search-input" placeholder="ค้นหา SKU หรือ ชื่อสินค้า..." onkeypress="if(event.key==='Enter') StockManager.loadStock()">
+                <button class="btn btn-primary" onclick="StockManager.loadStock()"><i class="fa-solid fa-magnifying-glass"></i> ค้นหา</button>
+            </div>
+
+            <!-- Desktop Table -->
+            <div class="content-box p-0 overflow-hidden" id="stock-table-wrap">
+                <div class="overflow-x-auto">
+                    <table class="stock-table">
+                        <thead>
+                            <tr>
+                                <th width="5%">รูป</th>
+                                <th width="12%">SKU</th>
+                                <th width="22%">ชื่อสินค้า</th>
+                                <th width="8%" class="text-center">สต็อก</th>
+                                <th width="10%">สถานะ</th>
+                                <th width="8%" class="text-center">Threshold</th>
+                                <th width="10%" class="text-center">อัพเดทล่าสุด</th>
+                                <th width="12%" class="text-center">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="stock-tbody">
+                            <tr><td colspan="8" class="text-center py-16 text-slate-400"><i class="fa-solid fa-boxes-stacked text-3xl opacity-20 mb-3"></i><br>กำลังโหลด...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="stock-pagination" id="stock-pagination"></div>
+                <div class="stock-actions-bar">
+                    <button class="btn btn-outline btn-sm" onclick="StockManager.exportCSV()"><i class="fa-solid fa-file-csv"></i> Export CSV</button>
+                    <button class="btn btn-outline btn-sm" onclick="StockManager.openSettings()"><i class="fa-solid fa-gear"></i> ตั้งค่า</button>
+                    <button class="btn btn-primary btn-sm" onclick="StockManager.openAdjust()"><i class="fa-solid fa-plus-minus"></i> ปรับสต็อก</button>
+                </div>
+            </div>
+
+            <!-- Mobile Card List -->
+            <div class="stock-card-list" id="stock-card-list"></div>
+            <div class="stock-card-list" id="stock-card-pagination" style="display:none;">
+                <div class="stock-pagination" id="stock-pagination-mobile"></div>
+            </div>
+            <div class="stock-card-list" style="display:none;" id="stock-mobile-actions">
+                <div class="stock-actions-bar" style="position:static;border-radius:12px;border:1px solid #e2e8f0;">
+                    <button class="btn btn-outline btn-sm" onclick="StockManager.exportCSV()"><i class="fa-solid fa-file-csv"></i> Export</button>
+                    <button class="btn btn-outline btn-sm" onclick="StockManager.openSettings()"><i class="fa-solid fa-gear"></i> ตั้งค่า</button>
+                    <button class="btn btn-primary btn-sm" onclick="StockManager.openAdjust()"><i class="fa-solid fa-plus-minus"></i> ปรับสต็อก</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Modals -->
@@ -910,11 +1390,12 @@ function dinoco_render_ui_v99() {
 
         /* --- Core: UI Switching --- */
         window.switchMainTab = function(t) {
-            $('.main-tab').removeClass('active'); $('.view-section').hide().removeClass('active'); 
-            if(t==='dash') { $('#view-dash').show().addClass('active'); $('.main-tab:eq(0)').addClass('active'); } 
-            if(t==='list') { $('#view-list').show().addClass('active'); $('.main-tab:eq(1)').addClass('active'); } 
-            if(t==='catalog') { $('#view-catalog').show().addClass('active'); $('.main-tab:eq(2)').addClass('active'); loadCatalog(); } 
-            if(t==='generate') { $('#view-generate').show().addClass('active'); $('.main-tab:eq(3)').addClass('active'); if(Object.keys(catalogData).length===0) loadCatalogDataForSelect(); } 
+            $('.main-tab').removeClass('active'); $('.view-section').hide().removeClass('active');
+            if(t==='dash') { $('#view-dash').show().addClass('active'); $('.main-tab:eq(0)').addClass('active'); }
+            if(t==='list') { $('#view-list').show().addClass('active'); $('.main-tab:eq(1)').addClass('active'); }
+            if(t==='catalog') { $('#view-catalog').show().addClass('active'); $('.main-tab:eq(2)').addClass('active'); loadCatalog(); }
+            if(t==='generate') { $('#view-generate').show().addClass('active'); $('.main-tab:eq(3)').addClass('active'); if(Object.keys(catalogData).length===0) loadCatalogDataForSelect(); }
+            if(t==='stock') { $('#view-stock').show().addClass('active'); $('.main-tab:eq(4)').addClass('active'); StockManager.loadStock(); }
         };
 
         window.goToInventory = function(filter) { switchMainTab('list'); $('#inv-filter').val(filter); executeGlobalSearch(); };
@@ -1346,6 +1827,552 @@ function dinoco_render_ui_v99() {
             }); 
         };
         
+        /* =======================================================
+         * StockManager — Stock Management Tab (V.31.0)
+         * ======================================================= */
+        const STOCK_API = '<?php echo esc_url(rest_url('dinoco-stock/v1')); ?>';
+        const STOCK_NONCE = '<?php echo wp_create_nonce('wp_rest'); ?>';
+
+        window.StockManager = {
+            _page: 1,
+            _status: 'all',
+            _search: '',
+            _allData: [],
+
+            /* Badge helper */
+            badge: function(display) {
+                const map = {
+                    'in_stock':     '<span class="st-badge st-green">มีสินค้า</span>',
+                    'low_stock':    '<span class="st-badge st-yellow">ใกล้หมด</span>',
+                    'out_of_stock': '<span class="st-badge st-red">หมดสต็อก</span>',
+                    'hold':         '<span class="st-badge st-purple">Hold</span>',
+                };
+                return map[display] || '<span class="st-badge st-gray">-</span>';
+            },
+
+            /* Thumb helper */
+            thumb: function(url) {
+                if (!url || url.length < 5) return '<div class="stock-thumb-placeholder">N/A</div>';
+                return `<img src="${url}" class="stock-thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="stock-thumb-placeholder" style="display:none">N/A</div>`;
+            },
+
+            /* Format date */
+            fmtDate: function(dt) {
+                if (!dt) return '-';
+                const d = new Date(dt);
+                if (isNaN(d)) return dt;
+                return d.toLocaleDateString('th-TH', { day:'2-digit', month:'short', year:'2-digit', hour:'2-digit', minute:'2-digit' });
+            },
+
+            /* Type label */
+            typeLabel: function(type) {
+                const map = {
+                    'b2f_receive': 'B2F รับของ',
+                    'b2b_reserved': 'B2B จอง',
+                    'b2b_shipped': 'B2B จัดส่ง',
+                    'b2b_cancel_return': 'B2B คืนสต็อก',
+                    'manual_add': 'เพิ่ม (Manual)',
+                    'manual_subtract': 'ลด (Manual)',
+                    'dip_stock_adjust': 'Dip Stock',
+                    'initial_set': 'ตั้งค่าเริ่มต้น',
+                };
+                return map[type] || type;
+            },
+
+            /* Filter by status (called from pills and KPI cards) */
+            filterByStatus: function(status) {
+                this._status = status;
+                this._page = 1;
+                $('#stock-filter-tabs .stock-filter-pill').removeClass('active');
+                $(`#stock-filter-tabs .stock-filter-pill[data-status="${status}"]`).addClass('active');
+                this.loadStock();
+            },
+
+            /* Load stock list from API */
+            loadStock: function(page) {
+                const self = this;
+                if (page) self._page = page;
+                self._search = $('#stock-search').val() || '';
+
+                $.ajax({
+                    url: STOCK_API + '/stock/list',
+                    method: 'GET',
+                    data: { page: self._page, per_page: 20, status: self._status, search: self._search },
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        if (!res.success) return;
+                        self._allData = res.data;
+
+                        // Update KPIs
+                        const c = res.counts || {};
+                        $('#skpi-total').text((c.total || 0).toLocaleString());
+                        $('#skpi-in-stock').text((c.in_stock || 0).toLocaleString());
+                        $('#skpi-low-stock').text((c.low_stock || 0).toLocaleString());
+                        $('#skpi-oos').text((c.out_of_stock || 0).toLocaleString());
+                        $('#skpi-hold').text((c.hold || 0).toLocaleString());
+
+                        // Render desktop table
+                        if (res.data.length === 0) {
+                            $('#stock-tbody').html('<tr><td colspan="8" class="text-center py-16 text-slate-400">ไม่พบสินค้า</td></tr>');
+                            $('#stock-card-list').html('<div class="text-center py-10 text-slate-400">ไม่พบสินค้า</div>');
+                        } else {
+                            let thtml = '';
+                            let chtml = '';
+                            res.data.forEach(function(p) {
+                                thtml += `<tr>
+                                    <td>${self.thumb(p.image_url)}</td>
+                                    <td class="font-mono text-xs font-bold">${p.sku}</td>
+                                    <td class="text-xs font-bold text-slate-700" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${p.name}">${p.name}</td>
+                                    <td class="text-center font-bold text-lg">${p.stock_qty.toLocaleString()}</td>
+                                    <td>${self.badge(p.stock_display)}</td>
+                                    <td class="text-center text-xs text-slate-500">${p.low_stock_threshold}</td>
+                                    <td class="text-center text-xs text-slate-400">${self.fmtDate(p.stock_updated_at)}</td>
+                                    <td class="text-center">
+                                        <div class="flex gap-1 justify-center">
+                                            <button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog('${p.sku}')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>
+                                            <button class="bg-blue-50 hover:bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openAdjust('${p.sku}')" title="ปรับสต็อก"><i class="fa-solid fa-plus-minus"></i></button>
+                                            <button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold('${p.sku}', ${!p.manual_hold})" title="${p.manual_hold ? 'ปลด Hold' : 'Hold'}"><i class="fa-solid fa-${p.manual_hold ? 'lock-open' : 'lock'}"></i></button>
+                                        </div>
+                                    </td>
+                                </tr>`;
+
+                                // Mobile card
+                                chtml += `<div class="stock-card-item">
+                                    <div class="sc-header">
+                                        ${p.image_url ? '<img src="'+p.image_url+'" class="sc-thumb" onerror="this.style.display=\'none\'">' : ''}
+                                        <div class="sc-info">
+                                            <div class="sc-name">${p.name}</div>
+                                            <div class="sc-sku">${p.sku}</div>
+                                        </div>
+                                        ${self.badge(p.stock_display)}
+                                    </div>
+                                    <div class="sc-row"><span class="sc-label">สต็อก</span><span class="sc-val">${p.stock_qty.toLocaleString()} ชิ้น</span></div>
+                                    <div class="sc-row"><span class="sc-label">Threshold</span><span class="sc-val">${p.low_stock_threshold}</span></div>
+                                    <div class="sc-actions">
+                                        <button class="btn btn-outline btn-sm flex-1" onclick="StockManager.openLog('${p.sku}')"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติ</button>
+                                        <button class="btn btn-primary btn-sm flex-1" onclick="StockManager.openAdjust('${p.sku}')"><i class="fa-solid fa-plus-minus"></i> ปรับ</button>
+                                    </div>
+                                </div>`;
+                            });
+                            $('#stock-tbody').html(thtml);
+                            $('#stock-card-list').html(chtml);
+                        }
+
+                        // Pagination
+                        self.renderPagination(res.pages, self._page);
+                    },
+                    error: function() {
+                        $('#stock-tbody').html('<tr><td colspan="8" class="text-center py-10 text-red-400">โหลดข้อมูลล้มเหลว</td></tr>');
+                    }
+                });
+            },
+
+            /* Render pagination */
+            renderPagination: function(totalPages, current) {
+                if (totalPages <= 1) { $('#stock-pagination, #stock-pagination-mobile').html(''); return; }
+                let html = `<button ${current<=1?'disabled':''} onclick="StockManager.loadStock(${current-1})">&laquo;</button>`;
+                for (let i = 1; i <= totalPages; i++) {
+                    if (totalPages > 7 && Math.abs(i - current) > 2 && i !== 1 && i !== totalPages) {
+                        if (i === 2 || i === totalPages - 1) html += '<button disabled>...</button>';
+                        continue;
+                    }
+                    html += `<button class="${i===current?'active':''}" onclick="StockManager.loadStock(${i})">${i}</button>`;
+                }
+                html += `<button ${current>=totalPages?'disabled':''} onclick="StockManager.loadStock(${current+1})">&raquo;</button>`;
+                $('#stock-pagination, #stock-pagination-mobile').html(html);
+            },
+
+            /* Open Adjust Modal */
+            openAdjust: function(sku) {
+                const self = this;
+                let product = null;
+                if (sku) {
+                    product = self._allData.find(p => p.sku === sku);
+                }
+
+                // Build product options from catalog
+                let options = '<option value="">-- เลือกสินค้า --</option>';
+                if (Object.keys(catalogData).length) {
+                    Object.keys(catalogData).forEach(function(k) {
+                        let sel = (k === sku) ? 'selected' : '';
+                        options += `<option value="${k}" ${sel}>[${k}] ${catalogData[k].name}</option>`;
+                    });
+                } else if (self._allData.length) {
+                    self._allData.forEach(function(p) {
+                        let sel = (p.sku === sku) ? 'selected' : '';
+                        options += `<option value="${p.sku}" ${sel}>[${p.sku}] ${p.name}</option>`;
+                    });
+                }
+
+                const currentQty = product ? product.stock_qty : 0;
+                const pName = product ? product.name : '';
+
+                const html = `<div style="text-align:left;font-family:'Noto Sans Thai',sans-serif;">
+                    <div style="margin-bottom:16px;">
+                        <label style="display:block;font-size:0.75rem;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">สินค้า</label>
+                        <select id="adj-sku" class="w-full border p-3 rounded-lg" onchange="StockManager._adjSkuChanged()">${options}</select>
+                    </div>
+                    <div id="adj-product-info" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin-bottom:16px;${product?'':'display:none'}">
+                        <div style="font-weight:700;color:#334155;font-size:0.9rem;" id="adj-pname">${pName}</div>
+                        <div style="font-size:0.8rem;color:#64748b;">สต็อกปัจจุบัน: <b id="adj-current" style="color:#0f172a;font-size:1.1rem;">${currentQty}</b> ชิ้น</div>
+                    </div>
+                    <div style="margin-bottom:16px;">
+                        <label style="display:block;font-size:0.75rem;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">ประเภท</label>
+                        <div style="display:flex;gap:8px;">
+                            <label style="flex:1;padding:10px;border:2px solid #22c55e;border-radius:8px;text-align:center;cursor:pointer;background:#dcfce7;font-weight:700;color:#166534;" id="adj-type-add" onclick="StockManager._adjSetType('add')"><i class="fa-solid fa-plus"></i> เพิ่มสต็อก</label>
+                            <label style="flex:1;padding:10px;border:2px solid #e2e8f0;border-radius:8px;text-align:center;cursor:pointer;background:white;font-weight:600;color:#64748b;" id="adj-type-sub" onclick="StockManager._adjSetType('subtract')"><i class="fa-solid fa-minus"></i> ลดสต็อก</label>
+                        </div>
+                        <input type="hidden" id="adj-type" value="add">
+                    </div>
+                    <div style="margin-bottom:16px;">
+                        <label style="display:block;font-size:0.75rem;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">จำนวน</label>
+                        <input type="number" id="adj-qty" class="w-full border p-3 rounded-lg font-bold text-lg" value="1" min="1" oninput="StockManager._adjPreview()">
+                    </div>
+                    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:12px;margin-bottom:16px;text-align:center;" id="adj-preview">
+                        <span style="font-size:0.8rem;color:#3b82f6;">สต็อกหลังปรับ:</span>
+                        <span style="font-size:1.5rem;font-weight:800;color:#1e40af;margin-left:8px;" id="adj-after">${currentQty + 1}</span>
+                        <span style="font-size:0.8rem;color:#3b82f6;"> ชิ้น</span>
+                    </div>
+                    <div style="margin-bottom:8px;">
+                        <label style="display:block;font-size:0.75rem;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">เหตุผล <span style="color:#ef4444;">*</span></label>
+                        <input type="text" id="adj-reason" class="w-full border p-3 rounded-lg" placeholder="เช่น รับของจากซัพพลายเออร์, ตรวจนับพบขาด...">
+                    </div>
+                </div>`;
+
+                Swal.fire({
+                    title: 'ปรับสต็อก',
+                    html: html,
+                    showCancelButton: true,
+                    confirmButtonText: '<i class="fa-solid fa-save"></i> บันทึก',
+                    cancelButtonText: 'ยกเลิก',
+                    confirmButtonColor: '#1e293b',
+                    width: 500,
+                    preConfirm: function() { return self.submitAdjust(); }
+                });
+            },
+
+            _adjType: 'add',
+            _adjSetType: function(type) {
+                this._adjType = type;
+                $('#adj-type').val(type);
+                if (type === 'add') {
+                    $('#adj-type-add').css({border:'2px solid #22c55e', background:'#dcfce7', color:'#166534'});
+                    $('#adj-type-sub').css({border:'2px solid #e2e8f0', background:'white', color:'#64748b'});
+                } else {
+                    $('#adj-type-sub').css({border:'2px solid #ef4444', background:'#fee2e2', color:'#991b1b'});
+                    $('#adj-type-add').css({border:'2px solid #e2e8f0', background:'white', color:'#64748b'});
+                }
+                this._adjPreview();
+            },
+
+            _adjPreview: function() {
+                const cur = parseInt($('#adj-current').text()) || 0;
+                const qty = parseInt($('#adj-qty').val()) || 0;
+                const type = $('#adj-type').val();
+                const after = type === 'add' ? cur + qty : Math.max(0, cur - qty);
+                $('#adj-after').text(after);
+                if (after <= 0) {
+                    $('#adj-after').css('color', '#ef4444');
+                } else {
+                    $('#adj-after').css('color', '#1e40af');
+                }
+            },
+
+            _adjSkuChanged: function() {
+                const sku = $('#adj-sku').val();
+                const p = this._allData.find(x => x.sku === sku);
+                if (p) {
+                    $('#adj-pname').text(p.name);
+                    $('#adj-current').text(p.stock_qty);
+                    $('#adj-product-info').show();
+                } else if (sku && catalogData[sku]) {
+                    $('#adj-pname').text(catalogData[sku].name);
+                    $('#adj-current').text('0');
+                    $('#adj-product-info').show();
+                } else {
+                    $('#adj-product-info').hide();
+                }
+                this._adjPreview();
+            },
+
+            /* Submit adjust */
+            submitAdjust: function() {
+                const self = this;
+                const sku = $('#adj-sku').val();
+                const type = $('#adj-type').val();
+                const qty = parseInt($('#adj-qty').val()) || 0;
+                const reason = $('#adj-reason').val().trim();
+
+                if (!sku) { Swal.showValidationMessage('กรุณาเลือกสินค้า'); return false; }
+                if (qty <= 0) { Swal.showValidationMessage('กรุณาระบุจำนวน'); return false; }
+                if (!reason) { Swal.showValidationMessage('กรุณาระบุเหตุผล'); return false; }
+
+                // Check if subtract to 0
+                const cur = parseInt($('#adj-current').text()) || 0;
+                if (type === 'subtract' && qty >= cur) {
+                    // Continue — server will cap at 0
+                }
+
+                return $.ajax({
+                    url: STOCK_API + '/stock/adjust',
+                    method: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({ sku, type, qty, reason }),
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                }).then(function(res) {
+                    if (res.success) {
+                        Swal.fire({icon:'success', title:'บันทึกสำเร็จ', text:'สต็อกใหม่: ' + res.new_qty, timer:1500, showConfirmButton:false});
+                        self.loadStock();
+                    } else {
+                        Swal.fire('Error', res.message || 'บันทึกล้มเหลว', 'error');
+                    }
+                    return res;
+                }).catch(function(err) {
+                    const msg = err.responseJSON ? err.responseJSON.message : 'เกิดข้อผิดพลาด';
+                    Swal.showValidationMessage(msg);
+                });
+            },
+
+            /* Open Transaction Log Modal */
+            openLog: function(sku) {
+                const self = this;
+                Swal.fire({ title: 'โหลดประวัติ...', didOpen: () => Swal.showLoading(), allowOutsideClick: false });
+
+                $.ajax({
+                    url: STOCK_API + '/stock/transactions',
+                    method: 'GET',
+                    data: { sku: sku, per_page: 30 },
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        if (!res.success || !res.data.length) {
+                            Swal.fire({ title: 'ประวัติสต็อก — ' + sku, html: '<div style="text-align:center;color:#94a3b8;padding:30px;">ยังไม่มีรายการ</div>', confirmButtonColor:'#1e293b', width:550 });
+                            return;
+                        }
+
+                        let thtml = '<div class="txn-timeline" style="max-height:60vh;overflow-y:auto;padding-right:8px;">';
+                        res.data.forEach(function(t) {
+                            const isAdd = t.qty_change > 0;
+                            const cls = isAdd ? 'txn-add' : (t.qty_change < 0 ? 'txn-sub' : 'txn-neutral');
+                            const sign = isAdd ? '+' : '';
+                            const color = isAdd ? '#22c55e' : '#ef4444';
+                            thtml += `<div class="txn-item ${cls}">
+                                <div style="display:flex;justify-content:space-between;align-items:center;">
+                                    <span class="txn-type" style="color:${color}">${self.typeLabel(t.type)}</span>
+                                    <span class="txn-change" style="color:${color}">${sign}${t.qty_change}</span>
+                                </div>
+                                <div style="display:flex;justify-content:space-between;margin-top:4px;">
+                                    <span style="font-size:0.75rem;color:#94a3b8;">${t.qty_before} &rarr; ${t.qty_after}</span>
+                                    <span class="txn-date">${self.fmtDate(t.created_at)}</span>
+                                </div>
+                                ${t.reason ? '<div class="txn-reason"><i class="fa-solid fa-quote-left" style="font-size:8px;margin-right:4px;"></i>' + t.reason + '</div>' : ''}
+                                ${t.user_name ? '<div style="font-size:0.7rem;color:#94a3b8;margin-top:2px;"><i class="fa-solid fa-user" style="font-size:8px;margin-right:4px;"></i>' + t.user_name + '</div>' : ''}
+                                ${t.reference_type ? '<div style="font-size:0.65rem;color:#cbd5e1;margin-top:2px;">Ref: ' + t.reference_type + (t.reference_id ? ' #'+t.reference_id : '') + '</div>' : ''}
+                            </div>`;
+                        });
+                        thtml += '</div>';
+
+                        Swal.fire({
+                            title: '<i class="fa-solid fa-clock-rotate-left" style="margin-right:8px;"></i>ประวัติสต็อก — ' + sku,
+                            html: thtml,
+                            confirmButtonColor: '#1e293b',
+                            confirmButtonText: 'ปิด',
+                            width: 550,
+                        });
+                    }
+                });
+            },
+
+            /* Open Settings Modal */
+            openSettings: function() {
+                const self = this;
+                $.ajax({
+                    url: STOCK_API + '/stock/settings',
+                    method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const d = res.data || {};
+                        const initBtn = d.initialized
+                            ? '<div style="background:#dcfce7;border:1px solid #bbf7d0;border-radius:8px;padding:10px;text-align:center;color:#166534;font-weight:700;font-size:0.85rem;"><i class="fa-solid fa-check-circle"></i> ระบบสต็อกเปิดใช้งานแล้ว</div>'
+                            : '<button class="btn btn-primary w-full" style="background:#dc2626;border-color:#dc2626;" onclick="StockManager.initialize()"><i class="fa-solid fa-power-off"></i> เปิดระบบสต็อก</button>';
+
+                        const html = `<div style="text-align:left;font-family:'Noto Sans Thai',sans-serif;">
+                            <div style="margin-bottom:14px;">
+                                <label style="display:block;font-size:0.75rem;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Default Low Stock Threshold</label>
+                                <input type="number" id="stg-threshold" class="w-full border p-3 rounded-lg" value="${d.default_threshold || 10}">
+                            </div>
+                            <div style="margin-bottom:14px;">
+                                <label style="display:block;font-size:0.75rem;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Default Reorder Point</label>
+                                <input type="number" id="stg-reorder" class="w-full border p-3 rounded-lg" value="${d.default_reorder || 5}">
+                            </div>
+                            <div style="margin-bottom:14px;">
+                                <label style="display:block;font-size:0.75rem;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Dip Stock Interval (วัน)</label>
+                                <input type="number" id="stg-dip" class="w-full border p-3 rounded-lg" value="${d.dip_interval || 30}">
+                            </div>
+                            <div style="margin-bottom:14px;">
+                                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                                    <input type="checkbox" id="stg-alert" ${d.alert_enabled ? 'checked' : ''} style="width:18px;height:18px;">
+                                    <span style="font-size:0.85rem;font-weight:600;color:#334155;">เปิดแจ้งเตือน LINE (Low Stock Alert)</span>
+                                </label>
+                            </div>
+                            <div style="border-top:1px solid #e2e8f0;padding-top:14px;margin-top:14px;">
+                                ${initBtn}
+                            </div>
+                        </div>`;
+
+                        Swal.fire({
+                            title: '<i class="fa-solid fa-gear" style="margin-right:8px;"></i>ตั้งค่าระบบสต็อก',
+                            html: html,
+                            showCancelButton: true,
+                            confirmButtonText: '<i class="fa-solid fa-save"></i> บันทึก',
+                            cancelButtonText: 'ยกเลิก',
+                            confirmButtonColor: '#1e293b',
+                            width: 450,
+                            preConfirm: function() { return self.saveSettings(); }
+                        });
+                    }
+                });
+            },
+
+            /* Save settings */
+            saveSettings: function() {
+                const self = this;
+                return $.ajax({
+                    url: STOCK_API + '/stock/settings',
+                    method: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({
+                        default_threshold: parseInt($('#stg-threshold').val()) || 10,
+                        default_reorder: parseInt($('#stg-reorder').val()) || 5,
+                        dip_interval: parseInt($('#stg-dip').val()) || 30,
+                        alert_enabled: $('#stg-alert').is(':checked'),
+                    }),
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                }).then(function(res) {
+                    if (res.success) {
+                        Swal.fire({icon:'success', title:'บันทึกสำเร็จ', timer:1200, showConfirmButton:false});
+                    }
+                    return res;
+                });
+            },
+
+            /* Toggle hold */
+            toggleHold: function(sku, hold) {
+                const self = this;
+                if (hold) {
+                    Swal.fire({
+                        title: 'Hold สินค้า',
+                        input: 'text',
+                        inputLabel: 'เหตุผล (เช่น รอ QC, ของเสีย)',
+                        inputPlaceholder: 'ระบุเหตุผล...',
+                        showCancelButton: true,
+                        confirmButtonText: '<i class="fa-solid fa-lock"></i> Hold',
+                        confirmButtonColor: '#6b21a8',
+                        cancelButtonText: 'ยกเลิก',
+                        preConfirm: function(reason) {
+                            return $.ajax({
+                                url: STOCK_API + '/stock/hold',
+                                method: 'POST',
+                                contentType: 'application/json',
+                                data: JSON.stringify({ sku: sku, hold: true, reason: reason || '' }),
+                                beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                            }).then(function(r) {
+                                self.loadStock();
+                                return r;
+                            });
+                        }
+                    });
+                } else {
+                    Swal.fire({
+                        title: 'ปลด Hold?',
+                        text: 'สินค้า ' + sku + ' จะกลับมาแสดงสถานะปกติ',
+                        icon: 'question',
+                        showCancelButton: true,
+                        confirmButtonText: '<i class="fa-solid fa-lock-open"></i> ปลด Hold',
+                        confirmButtonColor: '#1e293b',
+                        cancelButtonText: 'ยกเลิก',
+                    }).then(function(result) {
+                        if (result.isConfirmed) {
+                            $.ajax({
+                                url: STOCK_API + '/stock/hold',
+                                method: 'POST',
+                                contentType: 'application/json',
+                                data: JSON.stringify({ sku: sku, hold: false }),
+                                beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                                success: function() {
+                                    Swal.fire({icon:'success', title:'ปลด Hold สำเร็จ', timer:1000, showConfirmButton:false});
+                                    self.loadStock();
+                                }
+                            });
+                        }
+                    });
+                }
+            },
+
+            /* Initialize stock system */
+            initialize: function() {
+                const self = this;
+                Swal.fire({
+                    title: 'เปิดระบบสต็อก?',
+                    text: 'ระบบจะเริ่มติดตามจำนวนสต็อกทุกสินค้า กรุณายืนยัน',
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: 'ยืนยัน เปิดระบบ',
+                    confirmButtonColor: '#dc2626',
+                    cancelButtonText: 'ยกเลิก',
+                }).then(function(r1) {
+                    if (r1.isConfirmed) {
+                        Swal.fire({
+                            title: 'ยืนยันอีกครั้ง',
+                            text: 'การเปิดระบบสต็อกจะเริ่มนับจำนวนสินค้าจาก 0 กรุณานับสต็อก (Dip Stock) ทันทีหลังเปิด',
+                            icon: 'warning',
+                            showCancelButton: true,
+                            confirmButtonText: 'ยืนยัน',
+                            confirmButtonColor: '#dc2626',
+                        }).then(function(r2) {
+                            if (r2.isConfirmed) {
+                                $.ajax({
+                                    url: STOCK_API + '/stock/initialize',
+                                    method: 'POST',
+                                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                                    success: function() {
+                                        Swal.fire({icon:'success', title:'เปิดระบบสต็อกสำเร็จ', text:'กรุณานับสต็อก (Dip Stock) เพื่อตั้งค่าจำนวนเริ่มต้น', confirmButtonColor:'#1e293b'});
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+            },
+
+            /* Export CSV */
+            exportCSV: function() {
+                const self = this;
+                // Fetch all data for export
+                $.ajax({
+                    url: STOCK_API + '/stock/list',
+                    method: 'GET',
+                    data: { page: 1, per_page: 9999, status: 'all' },
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        if (!res.success || !res.data.length) {
+                            Swal.fire('No Data', 'ไม่มีข้อมูลสำหรับ export', 'info');
+                            return;
+                        }
+                        let csv = '\uFEFFSKU,ชื่อสินค้า,สต็อก,สถานะ,Threshold,Reorder Point,Hold,อัพเดทล่าสุด\n';
+                        res.data.forEach(function(p) {
+                            const statusMap = { in_stock:'มีสินค้า', low_stock:'ใกล้หมด', out_of_stock:'หมดสต็อก', hold:'Hold' };
+                            csv += `"${p.sku}","${p.name}",${p.stock_qty},"${statusMap[p.stock_display]||p.stock_display}",${p.low_stock_threshold},${p.reorder_point},${p.manual_hold?'Yes':'No'},"${p.stock_updated_at||''}"\n`;
+                        });
+                        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                        const link = document.createElement('a');
+                        link.href = URL.createObjectURL(blob);
+                        link.download = 'stock_export_' + new Date().toISOString().slice(0,10) + '.csv';
+                        link.click();
+                    }
+                });
+            }
+        };
+
         loadAnalytics(); loadCatalogDataForSelect();
 
         // Auto-refresh: reload analytics every 30s when global toggle is ON
