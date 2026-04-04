@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.38.1 — Fix category cleanup (selective update) + b2b_visible column fallback + bulk cleanup button
+ * Version: V.38.2 — Fix cleanup nonce (window scope), category empty override, compatible_models column fallback
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -108,10 +108,11 @@ add_action('init', function() {
                     $item['b2b_post_id'] = $bpid;
                     // B2B visible from custom table (batch loaded)
                     $item['b2b_visible'] = isset($ct_map[$sku]) ? (int)($ct_map[$sku]['b2b_visible'] ?? 1) : 1;
-                    // Override category จาก custom table ถ้ามี (เพราะ ACF อาจมีข้อมูลเก่า)
-                    if (isset($ct_map[$sku]) && !empty($ct_map[$sku]['category'])) {
-                        $item['product_category'] = $ct_map[$sku]['category'];
-                        $item['category'] = $ct_map[$sku]['category'];
+                    // V.38.2: Override category จาก custom table เสมอเมื่อ sku อยู่ใน ct_map
+                    // (เพราะ cleanup ล้าง category เป็น '' แต่ !empty('') = false ทำให้ fallback ไป ACF เก่า)
+                    if (isset($ct_map[$sku])) {
+                        $item['product_category'] = $ct_map[$sku]['category'] ?? '';
+                        $item['category'] = $ct_map[$sku]['category'] ?? '';
                     }
                     // V.38.0: Compatible models from custom table
                     $item['compatible_models'] = isset($ct_map[$sku]) ? ($ct_map[$sku]['compatible_models'] ?: '[]') : '[]';
@@ -150,7 +151,10 @@ add_action('init', function() {
 
                 // V.31: Sync to custom table (dual write)
                 $b2b_vis = isset($_POST['b2b_visible']) ? intval($_POST['b2b_visible']) : 1;
-                $compat = isset($_POST['compatible_models']) ? sanitize_text_field($_POST['compatible_models']) : '[]';
+                // V.38.2: Use wp_unslash + json_decode validation (sanitize_text_field strips chars in long JSON)
+                $compat_raw = isset($_POST['compatible_models']) ? wp_unslash($_POST['compatible_models']) : '[]';
+                $compat_decoded = json_decode($compat_raw, true);
+                $compat = is_array($compat_decoded) ? wp_json_encode($compat_decoded) : '[]';
 
                 // V.38.1: Ensure b2b_visible column exists before writing
                 global $wpdb;
@@ -160,6 +164,13 @@ add_action('init', function() {
                     $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN b2b_visible TINYINT(1) NOT NULL DEFAULT 1 AFTER is_active");
                 }
 
+                // V.38.2: Ensure compatible_models column exists (dbDelta may skip TEXT DEFAULT NULL)
+                $compat_col = $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'compatible_models'");
+                if (!$compat_col) {
+                    $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN compatible_models TEXT DEFAULT NULL AFTER manual_hold_by");
+                }
+
+                $save_debug = [];
                 if (class_exists('DINOCO_Catalog')) {
                     $upsert_result = DINOCO_Catalog::upsert(array(
                         'sku' => $sku, 'name' => $name, 'subtitle' => sanitize_text_field($_POST['sub']) ?: '-',
@@ -167,10 +178,19 @@ add_action('init', function() {
                         'warranty_years' => intval($_POST['years']),
                         'b2b_visible' => $b2b_vis,
                     ));
-                    // Fallback: update b2b_visible + compatible_models ตรงๆ
-                    if ($upsert_result) {
-                        $wpdb->update($ct_table, array('b2b_visible' => $b2b_vis, 'compatible_models' => $compat), array('sku' => $sku));
-                    }
+                    $save_debug['upsert_result'] = $upsert_result;
+                    $save_debug['upsert_error'] = $wpdb->last_error;
+
+                    // V.38.2: Direct update b2b_visible + compatible_models (regardless of upsert result)
+                    $direct_upd = $wpdb->update($ct_table, array('b2b_visible' => $b2b_vis, 'compatible_models' => $compat), array('sku' => $sku));
+                    $save_debug['direct_update'] = $direct_upd;
+                    $save_debug['direct_error'] = $wpdb->last_error;
+                    $save_debug['b2b_visible_sent'] = $b2b_vis;
+                    $save_debug['compatible_models_sent'] = $compat;
+
+                    // V.38.2: Verify saved values
+                    $verify = $wpdb->get_row($wpdb->prepare("SELECT b2b_visible, compatible_models, category FROM {$ct_table} WHERE sku = %s", $sku), ARRAY_A);
+                    $save_debug['verified'] = $verify;
                 }
 
                 // Auto-create B2B Product post if not exists
@@ -196,7 +216,7 @@ add_action('init', function() {
                     }
                 }
 
-                echo json_encode(['success' => true]); exit;
+                echo json_encode(['success' => true, 'debug' => $save_debug]); exit;
             }
             if ($act === 'delete_product') {
                  $sku = sanitize_text_field($_POST['sku']);
@@ -1584,6 +1604,12 @@ add_action('rest_api_init', function() {
                 $b2b_visible = intval($params['b2b_visible']) ? 1 : 0;
                 $custom_data['b2b_visible'] = $b2b_visible;
             }
+            // V.38.2: compatible_models via pricing endpoint
+            if (array_key_exists('compatible_models', $params)) {
+                $cm_raw = $params['compatible_models'];
+                $cm_decoded = is_array($cm_raw) ? $cm_raw : json_decode($cm_raw, true);
+                $custom_data['compatible_models'] = is_array($cm_decoded) ? wp_json_encode($cm_decoded) : '[]';
+            }
 
             // V.38.1: Ensure b2b_visible column exists (ALTER TABLE fallback)
             $col_check = $wpdb->get_var("SHOW COLUMNS FROM {$table} LIKE 'b2b_visible'");
@@ -1591,16 +1617,28 @@ add_action('rest_api_init', function() {
                 $wpdb->query("ALTER TABLE {$table} ADD COLUMN b2b_visible TINYINT(1) NOT NULL DEFAULT 1 AFTER is_active");
             }
 
+            // V.38.2: Ensure compatible_models column exists
+            $compat_check = $wpdb->get_var("SHOW COLUMNS FROM {$table} LIKE 'compatible_models'");
+            if (!$compat_check) {
+                $wpdb->query("ALTER TABLE {$table} ADD COLUMN compatible_models TEXT DEFAULT NULL AFTER manual_hold_by");
+            }
+
+            $debug = ['custom_data' => $custom_data, 'acf_data' => array_keys($acf_data)];
+
             // 1) Update dinoco_products custom table (only changed fields)
             if (!empty($custom_data)) {
                 $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$table} WHERE sku = %s AND is_active = 1", $sku));
                 if ($exists) {
-                    $wpdb->update($table, $custom_data, ['sku' => $sku]);
+                    $upd_result = $wpdb->update($table, $custom_data, ['sku' => $sku]);
+                    $debug['ct_update'] = $upd_result;
+                    $debug['ct_error'] = $wpdb->last_error;
                 } else {
                     // Product should exist in custom table — create minimal row
                     $custom_data['sku'] = $sku;
                     $custom_data['name'] = $sku;
-                    $wpdb->insert($table, $custom_data);
+                    $ins_result = $wpdb->insert($table, $custom_data);
+                    $debug['ct_insert'] = $ins_result;
+                    $debug['ct_error'] = $wpdb->last_error;
                 }
             }
 
@@ -1632,12 +1670,17 @@ add_action('rest_api_init', function() {
                 foreach ($acf_data as $acf_key => $acf_val) {
                     update_field($acf_key, $acf_val, $b2b_id);
                 }
+                $debug['b2b_id'] = $b2b_id;
             }
+
+            // V.38.2: Verify saved values
+            $verify = $wpdb->get_row($wpdb->prepare("SELECT b2b_visible, category, compatible_models FROM {$table} WHERE sku = %s AND is_active = 1", $sku), ARRAY_A);
+            $debug['verified'] = $verify;
 
             // 3) Clear transient cache
             delete_transient('b2b_sku_data_map');
 
-            return new WP_REST_Response(['success' => true, 'message' => 'Pricing saved for ' . $sku, 'b2b_post_id' => isset($b2b_id) ? $b2b_id : 0], 200);
+            return new WP_REST_Response(['success' => true, 'message' => 'Pricing saved for ' . $sku, 'b2b_post_id' => isset($b2b_id) ? $b2b_id : 0, 'debug' => $debug], 200);
         },
         'permission_callback' => function() { return current_user_can('manage_options'); },
     ]);
@@ -2667,6 +2710,9 @@ function dinoco_render_ui_v99() {
         // V.35: Stock API constants (also defined later in stock section, but needed here for saveCatalogItem)
         const STOCK_API_EARLY = '<?php echo esc_url(rest_url('dinoco-stock/v1')); ?>';
         const STOCK_NONCE_EARLY = '<?php echo wp_create_nonce('wp_rest'); ?>';
+        // V.38.2: Expose to window scope for cleanup functions that use window.STOCK_*
+        window.STOCK_API_EARLY = STOCK_API_EARLY;
+        window.STOCK_NONCE_EARLY = STOCK_NONCE_EARLY;
         let catalogData = {}; let skuRelations = {}; let godModeTimer; const _p = "<?php echo base64_encode( defined('DINOCO_GOD_MODE_PIN') ? DINOCO_GOD_MODE_PIN : '' ); ?>";
         // V.35: Pre-load valuation map for avg cost display
         window._valuationMap = {};
@@ -3134,21 +3180,33 @@ function dinoco_render_ui_v99() {
             manageCategoriesModal(); // refresh modal
         };
 
-        // V.38.1: Sequential cleanup helper — sends ONLY category:'' (no price reset)
+        // V.38.2: Sequential cleanup helper — sends ONLY category:'' (no price reset)
+        // Uses STOCK_API_EARLY / STOCK_NONCE_EARLY from local const (same jQuery.ready scope)
         function _cleanupSkuList(skuList) {
             var idx = 0;
+            var failCount = 0;
             function next() {
-                if (idx >= skuList.length) return Promise.resolve();
+                if (idx >= skuList.length) {
+                    if (failCount > 0) console.warn('[Cleanup] Done with ' + failCount + ' failures out of ' + skuList.length);
+                    return Promise.resolve();
+                }
                 var sku = skuList[idx++];
                 catalogData[sku].product_category = '';
                 catalogData[sku].category = '';
                 return $.ajax({
-                    url: (window.STOCK_API_EARLY || '/wp-json/dinoco-stock/v1') + '/product/pricing',
+                    url: STOCK_API_EARLY + '/product/pricing',
                     method: 'POST',
                     contentType: 'application/json',
-                    headers: { 'X-WP-Nonce': (window.STOCK_NONCE_EARLY || '') },
+                    headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY },
                     data: JSON.stringify({ sku: sku, category: '' }),
-                }).then(next, next); // continue even if one fails
+                }).then(function(res) {
+                    console.log('[Cleanup] OK', sku, res);
+                    return next();
+                }, function(err) {
+                    failCount++;
+                    console.error('[Cleanup] FAIL', sku, err.status, err.responseText);
+                    return next(); // continue even if one fails
+                });
             }
             return next();
         }
@@ -3191,10 +3249,10 @@ function dinoco_render_ui_v99() {
                         catalogData[sku].product_category = '';
                         catalogData[sku].category = '';
                         $.ajax({
-                            url: (window.STOCK_API_EARLY || '/wp-json/dinoco-stock/v1') + '/product/pricing',
+                            url: STOCK_API_EARLY + '/product/pricing',
                             method: 'POST',
                             contentType: 'application/json',
-                            headers: { 'X-WP-Nonce': (window.STOCK_NONCE_EARLY || '') },
+                            headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY },
                             data: JSON.stringify({ sku: sku, category: '' }),
                         }).always(function() {
                             done++;
@@ -3377,18 +3435,21 @@ function dinoco_render_ui_v99() {
                 category: $('#cat-category').val() || '',
                 moq: parseInt($('#cat-moq').val()) || 1,
                 boxes_per_unit: parseInt($('#cat-bpu').val()) || 1,
-                b2b_visible: $('#cat-b2b-visible').is(':checked') ? 1 : 0
+                b2b_visible: $('#cat-b2b-visible').is(':checked') ? 1 : 0,
+                compatible_models: _compatModels
             };
 
             // Save sequential: product → relations → pricing (ป้องกัน race condition)
             $.post('', d).done(function(r1) {
                 var res = typeof r1 === 'string' ? JSON.parse(r1) : r1;
+                // V.38.2: Debug logging
+                if (res && res.debug) console.log('[SaveProduct] debug:', res.debug);
                 if (res && res.success === false) { Swal.fire('Error', res.message || 'Save failed', 'error'); return; }
 
                 // Relations + Pricing พร้อมกัน (ไม่ depend กัน)
                 $.when(
                     $.post('', { dinoco_inventory_action: 'save_sku_relation', dinoco_admin_nonce: DINOCO_NONCE, parent_sku: sku, child_skus: children }),
-                    $.ajax({ url: STOCK_API_EARLY + '/product/pricing', method: 'POST', contentType: 'application/json', headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY }, data: JSON.stringify(pricingData) })
+                    $.ajax({ url: STOCK_API_EARLY + '/product/pricing', method: 'POST', contentType: 'application/json', headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY }, data: JSON.stringify(pricingData) }).done(function(pr) { console.log('[Pricing] response:', pr); })
                 ).done(function() {
                     Swal.fire({icon:'success', title:'บันทึกสำเร็จ', timer:1000, showConfirmButton:false});
                     document.body.style.overflow = '';
