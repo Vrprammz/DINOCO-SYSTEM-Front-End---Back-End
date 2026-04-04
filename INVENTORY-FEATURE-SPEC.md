@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 2.4 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead Review
+Version: 2.5 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead Review
 
 ---
 
@@ -1388,30 +1388,70 @@ BO ETA:
 ระหว่างรอ: stock_status ยังใช้ค่าเดิม (ของจาก postmeta) ไม่เปลี่ยนแปลง
 ```
 
-### DD-4: Stock Deduction — ตัดสต็อกที่ create-shipment endpoint (ไม่ใช่ status hook)
+### DD-4: Stock Deduction — ตัดสต็อกตอน `awaiting_confirm` + Auto-cancel 30 นาที
 
-**ตัดสินใจ**: ตัดสต็อกใน `create-shipment` REST endpoint ตรงๆ (Snippet 3 ~line 3344)
+**ตัดสินใจ**: ตัดสต็อกตอน Admin ยืนยันว่ามีสินค้า (status → `awaiting_confirm`)
+ไม่ใช่ตอน ship เพราะถึง awaiting_confirm ของถูก "จอง" แล้วจริงๆ
 
-**เหตุผลเปลี่ยนจาก status hook**:
-1. `create-shipment` มี `$clean_items` array ที่เป็น structured data (sku + qty พร้อม) ไม่ต้อง parse text
-2. รองรับ partial shipment (ตัดแค่ items ที่ ship รอบนี้)
-3. Dedup ใช้ `shipment_id` + SKU แทน order-level flag
-
+**Flow**:
 ```
-เมื่อ Admin สร้าง shipment:
-├── POST /b2b/v1/create-shipment → มี $clean_items[{sku, qty}]
-├── หลังสร้าง shipment สำเร็จ:
-│   foreach ($clean_items as $item) {
-│       dinoco_stock_deduct_for_shipment($item['sku'], $item['qty'], $shipment_id);
-│   }
-├── Dedup: ตรวจ meta '_stock_deducted_shipment_{id}' ป้องกันตัดซ้ำ
-└── Walk-in completed → ใช้ flow เดียวกัน (walk-in ก็สร้าง shipment)
+ตัวแทนสั่ง → Admin เช็คสต็อก ✓ → status = awaiting_confirm
+  → ⚡ ตัดสต็อกตรงนี้ (dinoco_stock_subtract per SKU)
+  → Dedup: meta '_stock_deducted' = 1
 
-สำหรับ walk-in cancel (completed → cancelled):
-├── Hook: b2b_order_status_changed($order_id, $old_status, $new_status, $actor)
-│   NOTE: parameter order จริง = ($id, $OLD, $NEW, $actor) ← ระวัง!
-├── ถ้า old=completed + new=cancelled + is_walkin → dinoco_stock_add() คืนสต็อก
-└── ไฟล์: [B2B] Snippet 2
+ตัวแทน confirm ใน 30 นาที → ดำเนินต่อปกติ (สต็อกตัดไปแล้ว)
+
+ตัวแทนไม่ confirm 30 นาที:
+  → wp_schedule_single_event(time() + 1800, 'dinoco_inv_auto_cancel', [$order_id])
+  → Cron fire: ตรวจว่า status ยังเป็น awaiting_confirm ไหม?
+    ├── ยังเป็น → auto cancel + dinoco_stock_add() คืนสต็อก
+    │   → Flex แจ้งตัวแทน: "หมดเวลายืนยัน order #XXX ถูกยกเลิก"
+    │   → Flex แจ้ง Admin: "Auto-cancel order #XXX (หมดเวลา 30 นาที)"
+    └── ไม่ใช่แล้ว (ตัวแทน confirm ทัน) → skip
+```
+
+**จุดตัดสต็อก** (Hook):
+```
+Hook: b2b_order_status_changed($order_id, $old_status, $new_status, $actor)
+NOTE: parameter order จริง = ($id, $OLD, $NEW, $actor) ← ระวัง!
+
+เมื่อ new_status = 'awaiting_confirm':
+├── ตัดสต็อก: parse order text ด้วย regex /\(([A-Z0-9\-]+)\)\s*x(\d+)/i
+│   (order_items เป็น plain text ไม่ใช่ array — ดู Snippet 2:709)
+├── dinoco_stock_subtract($sku, $qty, 'b2b_reserved', 'b2b_order', $order_id)
+├── Set meta: '_stock_deducted' = 1
+├── Schedule auto-cancel: wp_schedule_single_event(+1800)
+└── delete_transient('b2b_sku_data_map') — DD-5 cache invalidation
+
+เมื่อ new_status = 'cancelled' (ทุกกรณี):
+├── ถ้า '_stock_deducted' = 1 → dinoco_stock_add() คืนสต็อก
+├── ลบ meta '_stock_deducted'
+├── delete_transient('b2b_sku_data_map')
+└── ไฟล์: [B2B] Snippet 2 (hook b2b_order_status_changed ~line 974 ใน Snippet 1)
+
+Walk-in:
+├── Walk-in complete (skip shipped) → ตัดสต็อกตอน awaiting_confirm เหมือนกัน
+│   (walk-in ก็ผ่าน awaiting_confirm → ตัดไปแล้ว)
+├── Walk-in cancel (completed → cancelled) → คืนสต็อก (ถ้า '_stock_deducted')
+└── Walk-in ไม่มี auto-cancel 30 นาที (walk-in confirm ทันทีอยู่แล้ว)
+
+Flash Express:
+├── Flash flow ก็ผ่าน awaiting_confirm → ตัดสต็อกจุดเดียวกัน
+└── ไม่ต้องแยก hook สำหรับ Flash
+
+Manual Flash Shipping (RPi manual_ship.html):
+└── ไม่ตัดสต็อก — เป็นแค่ส่งพัสดุทั่วไป ไม่ใช่ขาย DINOCO products
+```
+
+**Backorder Integration กับ stock_qty ใหม่**:
+```
+ระบบ backorder มีอยู่แล้ว (b2b_build_flex_bo_restock):
+├── เดิม: trigger เมื่อ set_stock_status('in_stock')
+├── ใหม่: trigger เมื่อ stock_qty เพิ่มจาก 0 → > 0 (หลัง B2F receive / manual add)
+│   → Auto-notify ตัวแทนที่มี backorder order: "สินค้า X กลับมาแล้ว"
+├── Backorder orders ไม่นับเป็น reserved_qty
+│   (เพราะ backorder = รอของ ยังไม่ commit จองสินค้า)
+└── ตัวแทนต้อง re-confirm backorder → ถ้า confirm → เข้า flow ปกติ → ตัดสต็อก
 ```
 
 ### DD-5: Cache Invalidation — ต้อง delete_transient เมื่อ stock เปลี่ยน
@@ -1517,8 +1557,15 @@ GET /dinoco-stock/v1/stock/list?page=1&per_page=50&status=low_stock
 - [ ] **Concurrent**: 2 requests พร้อมกัน → qty ถูกต้อง (ไม่ lost update)
 - [ ] **B2F receive-goods**: รับ 50 ชิ้น SKU "A" → stock_qty เพิ่ม 50
 - [ ] **B2F receive-goods**: SKU ไม่อยู่ใน catalog → log warning, ไม่ error
-- [ ] **B2B shipped**: ส่ง 5 ชิ้น SKU "A" → stock_qty ลด 5
-- [ ] **B2B shipped**: stock_qty < order qty → cap at 0, log warning
+- [ ] **B2B awaiting_confirm**: Admin ยืนยันสต็อก → stock_qty ลดตาม order items
+- [ ] **B2B awaiting_confirm**: parse plain text order_items ด้วย regex ได้ถูก
+- [ ] **B2B auto-cancel 30 นาที**: ตัวแทนไม่ confirm → auto cancel + คืนสต็อก
+- [ ] **B2B auto-cancel**: ตัวแทน confirm ทัน → cron skip ไม่ cancel
+- [ ] **B2B cancel**: ยกเลิก order → คืนสต็อก (ทุก status ที่ตัดไปแล้ว)
+- [ ] **B2B cancel ซ้ำ**: cancel order ที่ไม่เคยตัดสต็อก → ไม่คืน (dedup)
+- [ ] **B2B stock_qty < order qty**: cap at 0, log warning
+- [ ] **Flex awaiting_confirm**: ตัวแทนเห็น "จัดเตรียมไว้แล้ว ยืนยันภายใน 30 นาที"
+- [ ] **Flex auto-cancel**: ตัวแทนเห็น "หมดเวลา order ถูกยกเลิก"
 - [ ] **Walk-in cancel**: คืนสต็อก qty ถูกต้อง
 - [ ] **Auto status**: qty > threshold → in_stock
 - [ ] **Auto status**: 0 < qty <= threshold → low_stock (ถ้า threshold > 0)
@@ -1688,44 +1735,92 @@ stock_status ของ Parent:
 
 ### Stock Deduction เมื่อสั่ง Set
 
-> **IMPORTANT**: ตัดสต็อกที่ `create-shipment` endpoint (DD-4) ไม่ใช่ order-level
-> `$clean_items` ใน create-shipment เป็น structured array [{sku, qty}] พร้อมใช้
-> ไม่ต้อง parse text จาก `order_items` (ซึ่งเป็น plain text format)
+> **IMPORTANT**: ตัดสต็อกตอน status → `awaiting_confirm` (DD-4) ไม่ใช่ตอน ship
+> `order_items` เป็น plain text → parse ด้วย regex `/\(([A-Z0-9\-]+)\)\s*x(\d+)/i`
+> ตัวแทนไม่ confirm 30 นาที → auto cancel + คืนสต็อก
 
 ```php
 /**
- * ตัดสต็อกจาก shipment items (structured data จาก create-shipment endpoint)
- * เรียกจาก create-shipment REST handler หลังสร้าง shipment สำเร็จ
- * 
- * @param array $items [{sku, qty}] — structured, ไม่ใช่ plain text
- * @param int   $shipment_id — สำหรับ dedup
- * @param int   $order_id — สำหรับ transaction log reference
+ * ตัดสต็อกเมื่อ order status → awaiting_confirm (DD-4)
+ * order_items เป็น plain text → parse ด้วย regex
+ * เรียกจาก hook b2b_order_status_changed
  */
-function dinoco_stock_deduct_for_shipment( $items, $shipment_id, $order_id ) {
-    // Dedup: ป้องกันตัดซ้ำ (กดปุ่มซ้ำ / retry)
-    if ( get_post_meta( $order_id, '_stock_deducted_ship_' . $shipment_id, true ) ) return;
+function dinoco_stock_deduct_for_order( $order_id ) {
+    // Dedup
+    if ( get_post_meta( $order_id, '_stock_deducted', true ) ) return;
+    
+    // Parse plain text order_items: "ชื่อสินค้า (SKU-001) x10 = ฿1,000"
+    $order_text = get_field( 'order_items', $order_id ) ?: '';
+    if ( ! preg_match_all( '/\(([A-Z0-9\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) return;
     
     $relations = get_option( 'dinoco_sku_relations', [] );
     
-    foreach ( $items as $item ) {
-        $sku = $item['sku'] ?? '';
-        $qty = intval( $item['qty'] ?? 0 );
-        if ( ! $sku || $qty <= 0 ) continue;
+    foreach ( $matches as $m ) {
+        $sku = $m[1];
+        $qty = intval( $m[2] );
+        if ( $qty <= 0 ) continue;
         
         if ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) {
             // Set product: deduct each child (parent ไม่เก็บ stock)
             foreach ( $relations[ $sku ] as $child_sku ) {
-                dinoco_stock_subtract( $child_sku, $qty, 'b2b_shipped', 'b2b_order', $order_id );
+                dinoco_stock_subtract( $child_sku, $qty, 'b2b_reserved', 'b2b_order', $order_id );
             }
         } else {
-            // Single product: deduct directly
-            dinoco_stock_subtract( $sku, $qty, 'b2b_shipped', 'b2b_order', $order_id );
+            dinoco_stock_subtract( $sku, $qty, 'b2b_reserved', 'b2b_order', $order_id );
         }
     }
     
-    update_post_meta( $order_id, '_stock_deducted_ship_' . $shipment_id, 1 );
-    delete_transient( 'b2b_sku_data_map' ); // DD-5: invalidate catalog cache
+    update_post_meta( $order_id, '_stock_deducted', 1 );
+    delete_transient( 'b2b_sku_data_map' ); // DD-5
+    
+    // Schedule auto-cancel 30 นาที
+    wp_schedule_single_event( time() + 1800, 'dinoco_inv_auto_cancel', array( $order_id ) );
 }
+
+/**
+ * คืนสต็อกเมื่อ order cancelled (ทุกกรณี)
+ */
+function dinoco_stock_return_for_order( $order_id ) {
+    if ( ! get_post_meta( $order_id, '_stock_deducted', true ) ) return;
+    
+    $order_text = get_field( 'order_items', $order_id ) ?: '';
+    if ( ! preg_match_all( '/\(([A-Z0-9\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) return;
+    
+    $relations = get_option( 'dinoco_sku_relations', [] );
+    
+    foreach ( $matches as $m ) {
+        $sku = $m[1];
+        $qty = intval( $m[2] );
+        if ( $qty <= 0 ) continue;
+        
+        if ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) {
+            foreach ( $relations[ $sku ] as $child_sku ) {
+                dinoco_stock_add( $child_sku, $qty, 'b2b_cancel_return', 'b2b_order', $order_id );
+            }
+        } else {
+            dinoco_stock_add( $sku, $qty, 'b2b_cancel_return', 'b2b_order', $order_id );
+        }
+    }
+    
+    delete_post_meta( $order_id, '_stock_deducted' );
+    delete_transient( 'b2b_sku_data_map' );
+}
+```
+
+### Flex Message: แจ้งตัวแทนตอน awaiting_confirm (แก้ Flex เดิม)
+
+```
+Flex เดิมที่ส่งตัวแทนตอน awaiting_confirm ต้องเพิ่มข้อความ:
+
+"สินค้าถูกจัดเตรียมไว้ให้แล้ว
+กรุณายืนยันภายใน 30 นาที
+หากไม่ยืนยัน รายการจะถูกยกเลิกอัตโนมัติ"
+
+Flex auto-cancel ไปตัวแทน:
+"หมดเวลายืนยัน ⏰
+Order #XXX ถูกยกเลิกอัตโนมัติ
+สินค้าถูกคืนสู่คลังแล้ว
+หากต้องการสั่งใหม่ กรุณาสั่งอีกครั้ง"
 ```
 
 ### Stock Addition เมื่อรับของจากโรงงาน (B2F)
