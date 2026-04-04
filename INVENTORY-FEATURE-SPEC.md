@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 2.2 | Date: 2026-04-04 | Author: Feature Architect + Fullstack Review
+Version: 2.3 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead Review
 
 ---
 
@@ -1353,23 +1353,50 @@ BO ETA:
 ระหว่างรอ: stock_status ยังใช้ค่าเดิม (ของจาก postmeta) ไม่เปลี่ยนแปลง
 ```
 
-### DD-4: Walk-in Hook → ตัดสต็อกที่ completed ด้วย
+### DD-4: Stock Deduction — ตัดสต็อกที่ create-shipment endpoint (ไม่ใช่ status hook)
 
-**ตัดสินใจ**: Hook ทั้ง `shipped` + `completed` + dedup guard
+**ตัดสินใจ**: ตัดสต็อกใน `create-shipment` REST endpoint ตรงๆ (Snippet 3 ~line 3344)
+
+**เหตุผลเปลี่ยนจาก status hook**:
+1. `create-shipment` มี `$clean_items` array ที่เป็น structured data (sku + qty พร้อม) ไม่ต้อง parse text
+2. รองรับ partial shipment (ตัดแค่ items ที่ ship รอบนี้)
+3. Dedup ใช้ `shipment_id` + SKU แทน order-level flag
 
 ```
-เมื่อ status change:
-├── → shipped (ปกติ B2B) → dinoco_stock_deduct_for_order()
-├── → completed (walk-in skip shipped) → dinoco_stock_deduct_for_order()
-└── dedup: ตรวจ post_meta '_stock_deducted' = 1 → ถ้ามีแล้วข้าม
+เมื่อ Admin สร้าง shipment:
+├── POST /b2b/v1/create-shipment → มี $clean_items[{sku, qty}]
+├── หลังสร้าง shipment สำเร็จ:
+│   foreach ($clean_items as $item) {
+│       dinoco_stock_deduct_for_shipment($item['sku'], $item['qty'], $shipment_id);
+│   }
+├── Dedup: ตรวจ meta '_stock_deducted_shipment_{id}' ป้องกันตัดซ้ำ
+└── Walk-in completed → ใช้ flow เดียวกัน (walk-in ก็สร้าง shipment)
 
-function dinoco_on_order_status_change($order_id, $new_status, $old_status) {
-    if (!in_array($new_status, ['shipped', 'completed'])) return;
-    if (get_post_meta($order_id, '_stock_deducted', true)) return; // dedup
-    dinoco_stock_deduct_for_order($order_id);
-    update_post_meta($order_id, '_stock_deducted', 1);
-}
+สำหรับ walk-in cancel (completed → cancelled):
+├── Hook: b2b_order_status_changed($order_id, $old_status, $new_status, $actor)
+│   NOTE: parameter order จริง = ($id, $OLD, $NEW, $actor) ← ระวัง!
+├── ถ้า old=completed + new=cancelled + is_walkin → dinoco_stock_add() คืนสต็อก
+└── ไฟล์: [B2B] Snippet 2
 ```
+
+### DD-5: Cache Invalidation — ต้อง delete_transient เมื่อ stock เปลี่ยน
+
+**ปัญหา**: `b2b_get_sku_data_map()` (Snippet 3:270) cache ไว้ 5 นาที อ่าน stock_status จาก postmeta → ถ้า stock เปลี่ยนแต่ cache ยังอยู่ ตัวแทนเห็นข้อมูลเก่า
+
+**ต้องเพิ่มใน `dinoco_stock_auto_status()`**:
+```php
+// หลัง update stock_status ทุกครั้ง:
+delete_transient('b2b_sku_data_map');
+// หรือทุกจุดที่เรียก dinoco_stock_add/subtract:
+delete_transient('b2b_sku_data_map');
+```
+
+### DD-6: dbDelta Pattern — ไม่ใช่ raw ALTER TABLE
+
+**สำหรับ dev**: Snippet 15 ใช้ `dbDelta()` + version check `'1.0'` (line 26-64). Implementation ต้อง:
+1. Bump version เป็น `'2.0'`
+2. เขียน full CREATE TABLE ที่รวม columns เดิม + ใหม่ทั้งหมด
+3. dbDelta จะจัดการ ADD COLUMN เอง (ไม่ run ALTER TABLE ตรง)
 
 ---
 
@@ -1626,9 +1653,23 @@ stock_status ของ Parent:
 
 ### Stock Deduction เมื่อสั่ง Set
 
+> **IMPORTANT**: ตัดสต็อกที่ `create-shipment` endpoint (DD-4) ไม่ใช่ order-level
+> `$clean_items` ใน create-shipment เป็น structured array [{sku, qty}] พร้อมใช้
+> ไม่ต้อง parse text จาก `order_items` (ซึ่งเป็น plain text format)
+
 ```php
-function dinoco_stock_deduct_for_order( $order_id ) {
-    $items = get_field( 'order_items', $order_id );
+/**
+ * ตัดสต็อกจาก shipment items (structured data จาก create-shipment endpoint)
+ * เรียกจาก create-shipment REST handler หลังสร้าง shipment สำเร็จ
+ * 
+ * @param array $items [{sku, qty}] — structured, ไม่ใช่ plain text
+ * @param int   $shipment_id — สำหรับ dedup
+ * @param int   $order_id — สำหรับ transaction log reference
+ */
+function dinoco_stock_deduct_for_shipment( $items, $shipment_id, $order_id ) {
+    // Dedup: ป้องกันตัดซ้ำ (กดปุ่มซ้ำ / retry)
+    if ( get_post_meta( $order_id, '_stock_deducted_ship_' . $shipment_id, true ) ) return;
+    
     $relations = get_option( 'dinoco_sku_relations', [] );
     
     foreach ( $items as $item ) {
@@ -1646,6 +1687,9 @@ function dinoco_stock_deduct_for_order( $order_id ) {
             dinoco_stock_subtract( $sku, $qty, 'b2b_shipped', 'b2b_order', $order_id );
         }
     }
+    
+    update_post_meta( $order_id, '_stock_deducted_ship_' . $shipment_id, 1 );
+    delete_transient( 'b2b_sku_data_map' ); // DD-5: invalidate catalog cache
 }
 ```
 
