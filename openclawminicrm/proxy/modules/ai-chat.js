@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.2.5 — Lean Prompt V.3.0 support + KB priority tool description
+ * V.2.6 — Blacklist KB inject (inject ทุกคำถาม ยกเว้น SKIP patterns)
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -440,12 +440,18 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
   return null;
 }
 
-// === DINOCO AI V.3.1 — Pre-inject KB + Gemini primary + Haiku/Sonnet fallback ===
+// === DINOCO AI V.3.3 — Blacklist KB inject + Gemini primary + Haiku/Sonnet fallback ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
-  // ★ V.3.1: Pre-inject KB — ถ้าคำถามมี keywords ที่ Gemini ไม่เรียก tool ให้ดึง KB มาแปะก่อน
-  const KB_KEYWORDS = /สเปค|น้ำหนัก|กี่กิโล|กี่กก|ขนาด|มิติ|ซม\.|กว้าง.*ยาว.*สูง|ที่อยู่.*เคลม|ส่งเคลม.*ที่ไหน|ส่งซ่อม.*ที่ไหน|ระยะเวลา.*ซ่อม|ระยะเวลา.*เคลม|กี่วัน.*เสร็จ|กี่วัน.*ซ่อม|ใบเสร็จ|ใบกำกับ|invoice|บิล|ใบกำกับภาษี|รับน้ำหนัก|max|ถอด.*ง่าย|ถอด.*PRO|PRO.*ถอด|STD.*PRO|PRO.*STD|ติดตั้ง.*กี่|กี่.*ชั่วโมง|ใช้เวลา.*ติด|ค่าทำสี|สีดำ.*ซ่อม|สีดำ.*บุบ|สีดำ.*ล้ม|บุบ.*สีดำ|อุบัติเหตุ.*กี่วัน|ซีล.*อายุ|น้ำ.*กุญแจ|คืน.*สินค้า|เปลี่ยน.*สินค้า|คืนได้|ผ่อน|COD|ส่ง.*กี่วัน|กี่วัน.*ถึง|Promotion.*Set|ด้านใน.*กล่อง|ข้างใน.*กล่อง|เปิด.*กล่อง.*ข้าง|กล่อง.*ข้าง.*เปิด|เปิดฝา.*ข้าง|37L.*เปิด|กิ่งไม้|กัน.*กิ่ง|ใส่.*เสื้อผ้า|ถุงนอน|เปิด.*ด้านไหน|เปิด.*จาก|ด้านใน.*เป็นยังไง|มีอะไร.*ข้างใน|ภายใน.*กล่อง|EXPAND.*กันน้ำ|กระเป๋า.*กันน้ำ|สนิม|ประกัน.*ตลอดชีพ|ตลอดชีพ|STD.*Edition|Edition.*STD|ครอบคลุม.*ประกัน|ประกัน.*ครอบคลุม|สีเงิน.*บุบ|สีเงิน.*ล้ม|เคลม.*เงิน|ลังเล|แพง.*มาก|ไม่คุ้ม|ฝน.*น้ำเข้า|น้ำเข้า.*กล่อง|ประกับ|ประกับ.*ลอก|สติ๊กเกอร์.*ลอก|สติกเกอร์.*ลอก|ลอก|หลุด|น้ำเข้า.*กล่อง|ขับฝน|ฝนหนัก|แคชบาร์.*สีดำ|สีดำ.*สแตนเลส|เจาะ.*รถ|เจาะ.*แร็ค|รอ.*กี่วัน|ได้เรื่อง.*รอ|PRO.*STD.*ต่าง|ต่าง.*กัน.*เท่าไหร่|รอนาน|ยังไม่ได้ของ|สั่ง.*อาทิตย์/i;
+  // ★ V.3.3: Blacklist KB inject — inject ทุกคำถาม ยกเว้น SKIP patterns
+  // เหตุผล: whitelist (KB_KEYWORDS) ไม่ครอบคลุม ต้องเพิ่มทุกครั้ง → กลับ logic เป็น blacklist
+  const SKIP_KB_INJECT = /^(สวัสดี|หวัดดี|ดี|hello|hi|hey|ไง|ว่าไง|555|5555|หาย|ขอบคุณ|ขอบใจ|thank|ok|โอเค|ตกลง|เข้าใจแล้ว|ได้เลย|รับทราบ|👍|🙏|😊|😂|🤣|❤️|สติ๊กเกอร์|sticker)[\s!ๆ]*$/i;
+  // คำถามที่ tools จัดการเอง — ไม่ต้อง inject KB (Gemini จะเรียก function calling)
+  const TOOL_HANDLED = /^(ราคา|price|เท่าไหร่|เท่าไร|สต็อก|stock|มีของ).{0,30}$/i;
+  const DEALER_QUERY = /ตัวแทน.*จังหวัด|ร้าน.*จังหวัด|dealer.*จังหวัด|จังหวัด.*(ตัวแทน|ร้าน|dealer)/i;
+  const CLAIM_SERIAL = /^(MC|mc|Mc)\d{4,}|^\d{10,}|สถานะ.*เคลม.*\d|เคลม.*สถานะ.*\d/i;
   let enrichedMessage = userMessage;
-  if (KB_KEYWORDS.test(userMessage) && executeTool) {
+  const shouldSkip = SKIP_KB_INJECT.test(userMessage.trim()) || TOOL_HANDLED.test(userMessage.trim()) || DEALER_QUERY.test(userMessage) || CLAIM_SERIAL.test(userMessage.trim());
+  if (!shouldSkip && executeTool) {
     try {
       const db = await getDB();
       if (db) {
