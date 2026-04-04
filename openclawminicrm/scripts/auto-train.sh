@@ -1,167 +1,177 @@
 #!/bin/bash
-# auto-train.sh V3 — DINOCO AI Chatbot Self-Improving Loop
-# Usage: bash scripts/auto-train.sh [--rounds 10] [--gen 50]
+# auto-train.sh V4.0 — DINOCO AI Self-Improving Loop (Gemini-as-Judge)
+#
+# V4 changes:
+# - ใช้ Gemini ตัดสินแทน regex mustContain (smart-judge.js)
+# - ข้อ FAIL → วิเคราะห์สาเหตุ → auto-fix KB
+# - Score tracking ทุกรอบ + trend
+# - 4 phases: generate → judge → analyze → fix → repeat
+#
+# Usage: bash scripts/auto-train.sh [--rounds 5] [--gen 30] [--no-fix] [--v3]
 set -euo pipefail
 cd /opt/dinoco/openclawminicrm
 
-ROUNDS=10
-GEN_COUNT=50
-MAX_RETRY=2
-AGENT=$(docker ps --format '{{.Names}}' | grep -i agent)
+# ═══ Config ═══
+ROUNDS=5
+GEN_COUNT=30
+AUTO_FIX=true
+LEGACY_MODE=false
+AGENT=$(docker ps --format '{{.Names}}' | grep -i agent || echo "dinoco-agent")
 TOTAL_PASS=0
 TOTAL_FAIL=0
-TOTAL_GENERATED=0
+TOTAL_KB_ADDED=0
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --rounds) ROUNDS=$2; shift 2;;
     --gen) GEN_COUNT=$2; shift 2;;
+    --no-fix) AUTO_FIX=false; shift;;
+    --v3) LEGACY_MODE=true; shift;;
     *) shift;;
   esac
 done
 
-echo "╔════════════════════════════════════════════╗"
-echo "║  DINOCO Auto-Train v3.0                    ║"
-echo "║  Rounds: $ROUNDS | Gen: $GEN_COUNT | MaxRetry: $MAX_RETRY  ║"
-echo "╚════════════════════════════════════════════╝"
+echo "=================================================="
+echo "  DINOCO Auto-Train V4.0 — Gemini-as-Judge"
+echo "  Rounds: $ROUNDS | Gen: $GEN_COUNT | AutoFix: $AUTO_FIX"
+echo "=================================================="
 
-for ROUND in $(seq 1 $ROUNDS); do
-  TESTS=$(tail -n +2 scripts/test-cases.csv 2>/dev/null | grep -c "." 2>/dev/null || true)
-  TESTS=$(echo "$TESTS" | tr -d '[:space:]')
-  TESTS=${TESTS:-0}
-
-  # ═══ ไม่มี test → Gemini สร้างใหม่ ═══
-  if [ "$TESTS" -eq 0 ] || [ "$TESTS" = "0" ]; then
-    echo ""
-    echo "═══ Round $ROUND: ไม่มี test → สร้างคำถามใหม่ $GEN_COUNT ข้อ ═══"
-
-    # ★ อ่าน KB จริงจาก MongoDB แล้วให้ Gemini สร้างคำถามจาก KB content
-    docker exec $AGENT node -e "
-const { MongoClient } = require('mongodb');
-async function gen() {
-  const apiKey = process.env.GOOGLE_API_KEY;
-  const mongoUri = process.env.MONGODB_URI;
-  if (!apiKey) { console.log('GENERATED:0'); return; }
-
-  // ★ อ่าน KB จริงจาก MongoDB
-  let kbText = 'ไม่มี KB';
-  try {
-    const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 });
-    await client.connect();
-    const db = client.db(process.env.MONGODB_DB || 'smltrack');
-    const kb = await db.collection('knowledge_base').find({active:{\$ne:false}}).limit(80).toArray();
-    kbText = kb.map(k => '• ' + (k.title||'').substring(0,80) + ': ' + (k.content||'').substring(0,150)).join('\n');
-    await client.close();
-    console.error('[Gen] Read ' + kb.length + ' KB entries');
-  } catch(e) { console.error('[Gen] KB error: ' + e.message); }
-
-  const prompt = 'คุณคือผู้เชี่ยวชาญทดสอบ AI chatbot DINOCO THAILAND\n\n=== ข้อมูลจาก Knowledge Base จริง ===\n' + kbText + '\n\n=== คำสั่ง ===\nสร้าง ${GEN_COUNT} คำถามจำลองลูกค้าจริง ภาษาไทย อ้างอิงจาก KB\n\n★★★ กฎ mustContain สำคัญมาก:\n- ใช้ keywords สั้นๆ 2-4 คำ คั่นด้วย | เช่น \"5 ปี|ประกัน|กล่อง\"\n- ห้ามใช้ประโยคยาว ห้าม copy ข้อความจาก KB ตรงๆ\n- ห้ามใส่ : หรือ / ใน mustContain\n- ตัวอย่างดี: \"กก|กิโล|น้ำหนัก|6.5\"\n- ตัวอย่างผิด: \"กล่อง 45L น้ำหนัก 6.5 กก. ขนาด 44x37x36 ซม.\"\n\nmustNotContain เว้นว่าง \"\" เกือบทั้งหมด\ncritical true เฉพาะข้อสำคัญ\nname ใช้ GEN1-GEN${GEN_COUNT}\n\nFormat CSV (ไม่ต้อง header ไม่ต้อง code block):\n\"message\",\"mustContain\",\"mustNotContain\",\"critical\",\"name\"\n\nตอบเฉพาะ CSV rows';
-  try {
-    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+apiKey, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      signal: AbortSignal.timeout(60000),
-      body: JSON.stringify({contents:[{role:'user',parts:[{text:prompt}]}],generationConfig:{temperature:0.7,maxOutputTokens:8000}}),
-    });
-    const data = await res.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const lines = text.split('\n').filter(l => l.trim().startsWith('\"') && l.includes(',') && !l.includes('message,mustContain'));
-    console.log('GENERATED:' + lines.length);
-    lines.forEach(l => console.log(l));
-  } catch(e) { console.log('GENERATED:0 ERR:' + e.message); }
+# ═══ Copy smart-judge.js เข้า Docker ═══
+copy_judge() {
+  docker cp scripts/smart-judge.js $AGENT:/tmp/smart-judge.js 2>/dev/null || true
 }
-gen();
-" 2>/dev/null > /tmp/gen-output.txt
 
-    GEN_LINES=$(grep "^GENERATED:" /tmp/gen-output.txt | head -1 | cut -d: -f2 | tr -d ' ')
-    if [ "${GEN_LINES:-0}" -gt 0 ] 2>/dev/null; then
-      grep "^\"" /tmp/gen-output.txt >> scripts/test-cases.csv
-      TOTAL_GENERATED=$((TOTAL_GENERATED + GEN_LINES))
-      echo "✅ สร้าง $GEN_LINES ข้อใหม่ (รวม $TOTAL_GENERATED)"
-    else
-      echo "⚠️ Gemini สร้างไม่ได้ ข้ามรอบ"
-      cat /tmp/gen-output.txt 2>/dev/null | head -5
-    fi
-    continue
-  fi
-
-  # ═══ มี test → รัน ═══
+# ═══ Legacy V3 mode (fallback) ═══
+run_legacy_round() {
+  local ROUND=$1
   echo ""
-  echo "═══ Round $ROUND/$ROUNDS: Testing $TESTS ข้อ ═══"
-
+  echo "--- Round $ROUND (Legacy V3 mode) ---"
   docker cp scripts/test-ai.js $AGENT:/tmp/test-ai.js
   docker cp scripts/test-cases.csv $AGENT:/tmp/test-cases.csv
-  docker exec $AGENT node /tmp/test-ai.js 2>/dev/null > /tmp/test-result.txt || true
+  docker exec $AGENT node /tmp/test-ai.js 2>/dev/null || true
+}
 
-  # Parse results — tr -d ลบ newline/space ที่ติดมา
-  PASS=$(grep -c "\.\.\. PASS" /tmp/test-result.txt 2>/dev/null || echo "0")
-  FAIL=$(grep -c "\.\.\. FAIL" /tmp/test-result.txt 2>/dev/null || echo "0")
+# ═══ V4 Main Loop ═══
+for ROUND in $(seq 1 $ROUNDS); do
+  echo ""
+  echo "=================================================="
+  echo "  Round $ROUND / $ROUNDS"
+  echo "=================================================="
+
+  copy_judge
+
+  # --- Phase 1: Generate test cases ---
+  echo ""
+  echo "[Phase 1] Generating $GEN_COUNT test cases..."
+  docker exec $AGENT node /tmp/smart-judge.js --generate $GEN_COUNT 2>/dev/null > /tmp/gen-v4-output.txt || true
+  GEN_LINES=$(grep -c "Generated" /tmp/gen-v4-output.txt 2>/dev/null || echo "0")
+  GEN_LINES=$(echo "$GEN_LINES" | tr -d '[:space:]')
+  cat /tmp/gen-v4-output.txt
+
+  if [ "${GEN_LINES:-0}" -eq 0 ]; then
+    echo "[WARN] Generate may have failed, check output above"
+  fi
+
+  # --- Phase 2: Judge (Gemini ตัดสิน) ---
+  echo ""
+  echo "[Phase 2] Judging with Gemini..."
+  docker exec $AGENT node /tmp/smart-judge.js --judge 2>/dev/null > /tmp/judge-output.txt || true
+  cat /tmp/judge-output.txt
+
+  # Parse score from output
+  SCORE_LINE=$(grep "Score:" /tmp/judge-output.txt 2>/dev/null | tail -1 || echo "")
+  PASS_LINE=$(grep "PASS:" /tmp/judge-output.txt 2>/dev/null | tail -1 || echo "")
+
+  # Extract numbers
+  PASS=$(echo "$PASS_LINE" | grep -oP 'PASS: \K[0-9]+' 2>/dev/null || echo "0")
+  FAIL=$(echo "$PASS_LINE" | grep -oP 'FAIL: \K[0-9]+' 2>/dev/null || echo "0")
   PASS=$(echo "$PASS" | tr -d '[:space:]')
   FAIL=$(echo "$FAIL" | tr -d '[:space:]')
   PASS=${PASS:-0}
   FAIL=${FAIL:-0}
-  TOTAL=$((PASS + FAIL))
-  SCORE=0
-  [ "$TOTAL" -gt 0 ] && SCORE=$((PASS * 100 / TOTAL))
-
-  echo "📊 PASS: $PASS | FAIL: $FAIL | Score: $SCORE%"
   TOTAL_PASS=$((TOTAL_PASS + PASS))
   TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
 
-  if [ "$FAIL" -eq 0 ]; then
-    echo "🎉 ALL PASS! → ล้าง test สร้างใหม่รอบหน้า"
-    echo '"message","mustContain","mustNotContain","critical","name"' > scripts/test-cases.csv
+  if [ "$FAIL" -eq 0 ] 2>/dev/null; then
+    echo ""
+    echo "[Round $ROUND] ALL PASS! Score: 100%"
     continue
   fi
 
-  # ═══ ลบ PASS เก็บ FAIL ═══
-  echo "🗑️ ลบ $PASS PASS เก็บ $FAIL FAIL"
-
-  # ดึงชื่อ FAIL จาก test result
-  grep "\.\.\. FAIL" /tmp/test-result.txt | sed 's/.*\] //' | cut -d: -f1 | sed 's/ *$//' > /tmp/fail-names.txt
-
-  FAIL_ACTUAL=$(wc -l < /tmp/fail-names.txt | tr -d ' ')
-  echo "   FAIL names: $FAIL_ACTUAL"
-
-  # เก็บเฉพาะ FAIL
-  python3 << 'PYEOF'
-import csv
-fails = set()
-with open('/tmp/fail-names.txt') as f:
-    for line in f:
-        n = line.strip()
-        if n:
-            fails.add(n)
-
-rows = []
-with open('scripts/test-cases.csv', 'r') as f:
-    reader = csv.reader(f)
-    header = next(reader)
-    rows.append(header)
-    for row in reader:
-        if len(row) < 5: continue
-        prefix = row[4].split(':')[0].strip()
-        if prefix in fails:
-            rows.append(row)
-
-with open('scripts/test-cases.csv', 'w', newline='') as f:
-    writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-    for row in rows:
-        writer.writerow(row)
-print(f"   เหลือ {len(rows)-1} ข้อ FAIL")
-PYEOF
-
-  # แสดง FAIL
-  echo "❌ FAIL:"
-  grep "\.\.\. FAIL" /tmp/test-result.txt | head -10
+  # --- Phase 3: Analyze failures ---
   echo ""
+  echo "[Phase 3] Analyzing ${FAIL} failures..."
+  docker exec $AGENT node /tmp/smart-judge.js --analyze-fails 2>/dev/null > /tmp/analyze-output.txt || true
+  cat /tmp/analyze-output.txt
 
-  sleep 3
+  # --- Phase 4: Auto-fix KB ---
+  if [ "$AUTO_FIX" = true ]; then
+    echo ""
+    echo "[Phase 4] Auto-fixing KB..."
+    docker exec $AGENT node /tmp/smart-judge.js --auto-fix-kb 2>/dev/null > /tmp/fix-output.txt || true
+    cat /tmp/fix-output.txt
+
+    # Count KB additions
+    KB_ADDED=$(grep -c "ADDED:" /tmp/fix-output.txt 2>/dev/null || echo "0")
+    KB_ADDED=$(echo "$KB_ADDED" | tr -d '[:space:]')
+    TOTAL_KB_ADDED=$((TOTAL_KB_ADDED + ${KB_ADDED:-0}))
+
+    if [ "${KB_ADDED:-0}" -gt 0 ]; then
+      echo ""
+      echo "[Round $ROUND] Added $KB_ADDED KB entries. Next round will re-test."
+    fi
+  else
+    echo "[Phase 4] Skipped (--no-fix)"
+  fi
+
+  # Brief pause between rounds
+  if [ "$ROUND" -lt "$ROUNDS" ]; then
+    echo ""
+    echo "--- Waiting 5s before next round ---"
+    sleep 5
+  fi
 done
 
+# ═══ Copy score history back ═══
 echo ""
-echo "╔════════════════════════════════════════════════╗"
-echo "║  Auto-Train V3 สรุปผล                          ║"
-echo "║  Total PASS: $TOTAL_PASS                              ║"
-echo "║  Total FAIL: $TOTAL_FAIL                              ║"
-echo "║  Generated:  $TOTAL_GENERATED ข้อใหม่                       ║"
-echo "╚════════════════════════════════════════════════╝"
+echo "=================================================="
+docker cp $AGENT:/tmp/score-history.json scripts/score-history.json 2>/dev/null || true
+docker cp $AGENT:/tmp/judge-results.json scripts/judge-results.json 2>/dev/null || true
+docker cp $AGENT:/tmp/fail-analysis.json scripts/fail-analysis.json 2>/dev/null || true
+
+# ═══ Final Summary ═══
+GRAND_TOTAL=$((TOTAL_PASS + TOTAL_FAIL))
+GRAND_SCORE=0
+[ "$GRAND_TOTAL" -gt 0 ] && GRAND_SCORE=$((TOTAL_PASS * 100 / GRAND_TOTAL))
+
+echo "=================================================="
+echo "  Auto-Train V4 Summary"
+echo "  Rounds:    $ROUNDS"
+echo "  Total:     $GRAND_TOTAL tests"
+echo "  Passed:    $TOTAL_PASS"
+echo "  Failed:    $TOTAL_FAIL"
+echo "  Score:     $GRAND_SCORE%"
+echo "  KB Added:  $TOTAL_KB_ADDED entries"
+echo "=================================================="
+
+# Show score trend
+if [ -f scripts/score-history.json ]; then
+  echo ""
+  echo "Score History (last 10):"
+  python3 -c "
+import json
+try:
+    h = json.load(open('scripts/score-history.json'))
+    for e in h[-10:]:
+        ts = e['timestamp'][:16]
+        s = e['score']
+        bar = '#' * (s // 5) + '-' * (20 - s // 5)
+        print(f'  {ts}  {s:3d}% [{bar}]')
+except: pass
+" 2>/dev/null || true
+fi
+
+echo ""
+echo "Results: scripts/judge-results.json"
+echo "Analysis: scripts/fail-analysis.json"
+echo "History: scripts/score-history.json"
