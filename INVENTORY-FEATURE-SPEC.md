@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 2.0 | Date: 2026-04-04 | Author: Feature Architect
+Version: 2.1 | Date: 2026-04-04 | Author: Feature Architect + Fullstack Review
 
 ---
 
@@ -274,6 +274,9 @@ Rules:
 | `bo_eta_buffer_days` | TINYINT UNSIGNED | 0 | Admin กำหนด buffer วันเพิ่มจาก PO ETA |
 | `bo_eta_override` | DATE | NULL | Admin override ETA ตรงๆ (ใช้แทนคำนวณ) |
 | `bo_note` | VARCHAR(255) | NULL | หมายเหตุ BO ("รอของจากจีน ล็อต 2") |
+| `manual_hold` | TINYINT(1) | 0 | Admin ล็อกสต็อกแม้ qty > 0 (เช่น ของเสีย/รอ QC) |
+| `manual_hold_reason` | VARCHAR(255) | NULL | เหตุผล manual hold |
+| `manual_hold_by` | INT UNSIGNED | NULL | Admin user ID ที่กด hold |
 
 ```sql
 ALTER TABLE wp_dinoco_products
@@ -284,7 +287,10 @@ ALTER TABLE wp_dinoco_products
   ADD COLUMN last_dip_stock_qty INT UNSIGNED DEFAULT NULL AFTER last_dip_stock_date,
   ADD COLUMN bo_eta_buffer_days TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER last_dip_stock_qty,
   ADD COLUMN bo_eta_override DATE DEFAULT NULL AFTER bo_eta_buffer_days,
-  ADD COLUMN bo_note VARCHAR(255) DEFAULT NULL AFTER bo_eta_override;
+  ADD COLUMN bo_note VARCHAR(255) DEFAULT NULL AFTER bo_eta_override,
+  ADD COLUMN manual_hold TINYINT(1) NOT NULL DEFAULT 0 AFTER bo_note,
+  ADD COLUMN manual_hold_reason VARCHAR(255) DEFAULT NULL AFTER manual_hold,
+  ADD COLUMN manual_hold_by INT UNSIGNED DEFAULT NULL AFTER manual_hold_reason;
 ```
 
 ### 3.2 NEW TABLE `dinoco_stock_transactions` (Transaction Log)
@@ -1266,6 +1272,103 @@ Deploy Phase 5 → Test:
 ├── Valuation report มูลค่าถูกต้อง (THB)
 ├── Forecast "หมดใน X วัน" ตรง ± 20%
 └── Barcode scan → เปิดฟอร์มถูก SKU
+```
+
+---
+
+## 7.5 Design Decisions (จาก Code Review)
+
+### DD-1: Single Source of Truth → Custom Table + Dual-Write Transition
+
+**ตัดสินใจ**: `dinoco_products` custom table เป็น source of truth
+
+**ปัญหาเดิม**: `stock_status` เก็บ 2 ที่ — custom table + ACF postmeta บน `b2b_product` CPT — ไม่ sync กัน
+
+**วิธีแก้**:
+```
+Phase 1: Dual-write (เขียนทั้ง 2 ที่)
+├── dinoco_stock_add/subtract() → update custom table + sync postmeta
+├── b2b_mark_product_oos() → แก้ให้ update custom table ด้วย
+├── b2b_unlock_product_oos() → แก้ให้ update custom table ด้วย
+└── ทุกจุดที่อ่าน stock_status → อ่านจาก custom table เป็นหลัก
+
+Phase 2+: ค่อยๆ ลบ postmeta reads
+├── E-Catalog (Snippet 3:290) → ย้ายอ่าน custom table
+├── Admin Control Panel (Snippet 9) → ย้ายอ่าน custom table
+└── เมื่อ stable → deprecate postmeta stock_status (ไม่ลบ แค่ไม่อ่าน)
+```
+
+**Files ที่ต้องแก้** (Phase 1):
+- `[B2B] Snippet 1` → `b2b_mark_product_oos()`, `b2b_unlock_product_oos()` เพิ่ม custom table write
+- `[B2B] Snippet 3` → `b2b_get_sku_data_map()` เปลี่ยนอ่าน custom table
+- `[B2B] Snippet 15` → `DINOCO_Catalog::set_stock_status()` เพิ่ม postmeta sync
+- Stock Core Functions (ใหม่) → `dinoco_stock_add/subtract()` dual-write
+
+### DD-2: OOS Memory → ยกเลิก ใช้ qty-based + Manual Hold Flag แทน
+
+**ตัดสินใจ**: Deprecate OOS Memory System (oos_timestamp + oos_duration_hours + oos_eta_date)
+
+**แทนที่ด้วย**:
+```
+stock_qty = 0              → auto out_of_stock
+stock_qty > 0 + hold=false → auto in_stock (หรือ low_stock)
+stock_qty > 0 + hold=true  → manual_hold (Admin ล็อกเอง เช่น ของเสีย/รอ QC)
+
+Fields ใหม่ใน dinoco_products:
+├── manual_hold (TINYINT 0/1) — Admin กดล็อก แม้ qty > 0
+├── manual_hold_reason (VARCHAR 255) — เหตุผล เช่น "รอ QC" "ของชำรุด"
+└── manual_hold_by (INT) — Admin user ID ที่กด
+
+auto_status logic:
+├── ถ้า manual_hold = 1 → stock_status = 'out_of_stock' (ข้ามทุกอย่าง)
+├── ถ้า stock_qty = 0 → stock_status = 'out_of_stock'
+├── ถ้า stock_qty <= threshold → stock_display = 'low_stock'
+└── ถ้า stock_qty > threshold → stock_status = 'in_stock'
+
+BO ETA:
+├── เดิม: oos_eta_date (กรอก manual)
+└── ใหม่: คำนวณจาก B2F PO + buffer days (DD ใน section 2.6)
+```
+
+**Migration**:
+```
+1. SKU ที่เป็น out_of_stock + oos_duration_hours > 0 → set manual_hold = 1 + reason = "migrated from OOS timer"
+2. oos_eta_date → copy ไป bo_eta_override (ถ้ามี)
+3. ปิด b2b_oos_expiry_check cron
+4. ลบ inline auto-expire ใน Catalog endpoint (Snippet 3:422-433)
+```
+
+### DD-3: Deploy Safety → ปิด auto_status_cron จนกว่า Dip Stock แรกเสร็จ
+
+**ตัดสินใจ**: ใช้ flag `dinoco_inv_initialized` (wp_option)
+
+```
+ขั้นตอน:
+1. Deploy Phase 1: stock_qty = 0 ทุกตัว + auto_status_cron ตรวจ flag ก่อนรัน
+2. ถ้า dinoco_inv_initialized = false → cron skip ไม่แก้ stock_status
+3. Admin ทำ Dip Stock ครั้งแรก → stock_qty ถูกต้อง
+4. Admin กดปุ่ม "เปิดระบบสต็อก" → set dinoco_inv_initialized = true
+5. cron เริ่มทำงาน auto_status ปกติ
+
+ระหว่างรอ: stock_status ยังใช้ค่าเดิม (ของจาก postmeta) ไม่เปลี่ยนแปลง
+```
+
+### DD-4: Walk-in Hook → ตัดสต็อกที่ completed ด้วย
+
+**ตัดสินใจ**: Hook ทั้ง `shipped` + `completed` + dedup guard
+
+```
+เมื่อ status change:
+├── → shipped (ปกติ B2B) → dinoco_stock_deduct_for_order()
+├── → completed (walk-in skip shipped) → dinoco_stock_deduct_for_order()
+└── dedup: ตรวจ post_meta '_stock_deducted' = 1 → ถ้ามีแล้วข้าม
+
+function dinoco_on_order_status_change($order_id, $new_status, $old_status) {
+    if (!in_array($new_status, ['shipped', 'completed'])) return;
+    if (get_post_meta($order_id, '_stock_deducted', true)) return; // dedup
+    dinoco_stock_deduct_for_order($order_id);
+    update_post_meta($order_id, '_stock_deducted', 1);
+}
 ```
 
 ---
