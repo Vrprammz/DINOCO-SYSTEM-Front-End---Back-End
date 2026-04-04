@@ -1293,13 +1293,6 @@ Task 5.5: Stock Forecasting (Basic)
 ├── ไฟล์: Stock Core + Cron
 └── เวลา: 1 วัน
 
-Task 5.6: Barcode / QR (Optional shortcut)
-├── Admin scan barcode → lookup SKU → เปิดฟอร์ม stock adjust/dip stock
-├── ใช้ camera API + JS barcode library (quagga2 / html5-qrcode)
-├── ไม่บังคับ — manual input ยังใช้ได้เหมือนเดิม
-├── ไฟล์: [Admin System] DINOCO Global Inventory Database
-└── เวลา: 1 วัน (optional)
-
 Deploy Phase 5 → Test:
 ├── สร้าง 2 warehouses → stock แยกคลัง
 ├── โอนสต็อกระหว่างคลัง → ตัวเลขถูกทั้ง 2 ฝั่ง
@@ -1900,3 +1893,13 @@ B2F receive-goods ได้ SKU = child SKU (ชิ้นส่วน)
 - [x] Performance impact ประเมินแล้ว (~10ms per stock operation)
 - [x] Security review: stock_qty ไม่ leak ไป distributor, nonce, rate limit
 - [x] Rollback plan มีทุก phase
+
+---
+
+## Backlog (ทำเมื่อพร้อม — ไม่อยู่ใน Phase 1-5)
+
+| Feature | รายละเอียด | ทำเมื่อ |
+|---------|-----------|---------|
+| Barcode / QR scan | Admin scan barcode → lookup SKU → เปิดฟอร์ม adjust/dip stock. ใช้ camera API + html5-qrcode library. ไม่บังคับ — manual input ยังใช้ได้ | เมื่อ Phase 3 (Dip Stock) stable + Admin ต้องการ |
+| Claim parts ตัดสต็อก | เคลม warranty → ส่งชิ้นส่วนทดแทน → ตัดสต็อกอัตโนมัติ | เมื่อ volume เคลมเยอะพอ |
+| Admin Dashboard KPI card | เพิ่ม "สินค้าใกล้หมด X รายการ" card ใน overview | เมื่อ Phase 2 stable |
