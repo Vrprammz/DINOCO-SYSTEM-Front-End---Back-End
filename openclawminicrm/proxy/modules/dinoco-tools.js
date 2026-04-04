@@ -245,20 +245,23 @@ async function executeTool(toolName, args, sourceId) {
       const ALIASES = {
         // กันล้ม / แคชบาร์ (KB #29, #67, #79, #80, #82)
         "แคชบาร์": "crash bar", "แค๊ชบาร์": "crash bar", "แครชบาร์": "crash bar", "แคชบา": "crash bar",
+        "แคทบาร์": "crash bar", "แคสบาร์": "crash bar", "แค็ชบาร์": "crash bar", "เเคชบาร์": "crash bar",
         "กันล้ม": "crash bar", "เหล็กกันล้ม": "crash bar", "โครงเหล็กกันรถ": "crash bar",
         "เหล็กป้องกัน": "crash bar", "กันกระแทก": "crash bar", "การ์ดเครื่อง": "crash bar",
         "โครงกัน": "crash bar", "crashbar": "crash bar", "crash bar": "crash bar",
-        "บาร์กันล้ม": "crash bar", "กันล้มรถ": "crash bar",
+        "บาร์กันล้ม": "crash bar", "กันล้มรถ": "crash bar", "ประกับกันล้ม": "crash bar", "ประกับแคชบาร์": "crash bar",
         // กล่องหลัง (KB #28, #76)
         "ปี๊บ": "case", "ปี๊ป": "case", "ปิ้บ": "case", "ปิ๊บ": "case",
-        "ปี๊บหลัง": "top case", "ปี๊ปหลัง": "top case",
+        "ปี๊บหลัง": "top case", "ปี๊ปหลัง": "top case", "กะบ๊อกหลัง": "top case",
         "กล่องท้าย": "top case", "กล่องหลัง": "top case", "กล่องท้ายรถ": "top case",
+        "กล่องอลูมิเนียมหลัง": "top case", "กล่องอลูหลัง": "top case",
         "กล่อง": "case", "กล่องอลู": "case", "กล่องอลูมิเนียม": "case", "กล่องเหล็ก": "case",
         "topbox": "top case", "ท็อปบ็อก": "top case", "ท็อปเคส": "top case",
         "topcase": "top case", "top case": "top case",
         // กล่องข้าง (KB #34, #47, #64, #81)
         "กล่องข้าง": "side case", "ปี๊บข้าง": "side case", "ปิ้ปข้าง": "side case", "ปี๊ปข้าง": "side case",
-        "กล่องข้างอลู": "side case", "กล่องข้างอลูมิเนียม": "side case",
+        "กล่องข้างอลู": "side case", "กล่องข้างอลูมิเนียม": "side case", "กล่องอลูมิเนียมข้าง": "side case",
+        "กล่องอลูข้าง": "side case", "กะบ๊อกข้าง": "side case",
         "sidebox": "side case", "ไซด์บ็อก": "side case", "ไซด์เคส": "side case",
         "ไซด์บอกซ์": "side case", "side case": "side case", "side box": "side case",
         // แร็ค (KB #9, #35, #63, #74, #83)
