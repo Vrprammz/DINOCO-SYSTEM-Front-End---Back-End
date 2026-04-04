@@ -1107,18 +1107,20 @@ Task 1.4: B2B awaiting_confirm → Auto Stock Deduct (DD-4) + Auto-cancel 30 น
 ├── ไฟล์: [B2B] Snippet 2
 └── เวลา: 1 วัน
 
-Task 1.5: Admin Stock View (Basic)
-├── Stock list table + qty display
-├── Manual adjust modal
-├── Transaction log view
-├── REST endpoints: /stock/list, /stock/adjust, /stock/transactions
+Task 1.5: Admin Stock View (Basic) ✅ DONE (V.31.0)
+├── Stock list table + qty display + KPI cards + filter pills + pagination
+├── Manual adjust modal (add/subtract + preview + reason required)
+├── Transaction log view (timeline layout per SKU)
+├── Hold/Unhold per SKU + Export CSV
+├── REST endpoints: /stock/list, /stock/adjust, /stock/transactions, /stock/hold, /stock/settings, /stock/initialize
 ├── ไฟล์: [Admin System] DINOCO Global Inventory Database (DB_ID: 22)
 └── เวลา: 2 วัน
 
-Task 1.6: Auto stock_status Update
-├── stock_qty → auto set in_stock / low_stock / out_of_stock
-├── Threshold settings (per product + global default)
-├── ไฟล์: Stock Core Functions
+Task 1.6: Auto stock_status Update ✅ DONE (V.31.0)
+├── stock_qty → auto set in_stock / low_stock / out_of_stock / hold
+├── Threshold settings modal (global default + alert toggle + dip interval)
+├── Auto sync stock_status to b2b_product CPT (backward compat)
+├── ไฟล์: [Admin System] DINOCO Global Inventory Database (DB_ID: 22)
 └── เวลา: 0.5 วัน
 
 Deploy Phase 1 → Test:
