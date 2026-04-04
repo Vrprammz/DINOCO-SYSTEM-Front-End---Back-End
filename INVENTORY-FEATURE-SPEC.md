@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 2.3 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead Review
+Version: 2.4 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead Review
 
 ---
 
@@ -1154,7 +1154,7 @@ Deploy Phase 3 → Test:
 └── Export/Import CSV ทำงาน
 ```
 
-### Phase 4: Reserved Qty + Reorder Alert + AI Stock Query (3-4 วัน)
+### Phase 4: Reserved Qty + Stock Conflict + Reorder Alert + AI (5-6 วัน)
 
 ```
 Task 4.1: Reserved Quantity (computed — ไม่เก็บ field แยก)
@@ -1173,7 +1173,38 @@ Task 4.2: Cancel → ปลด Reserve
 ├── ไฟล์: [B2B] Snippet 2
 └── เวลา: 0.5 วัน
 
-Task 4.3: Reorder Point Alert + Suggest PO Link
+Task 4.3: Stock Conflict Detection (Walk-in ชน B2B)
+├── Trigger: ทุกครั้งที่ stock_qty ลดลง (walk-in complete / manual subtract / ship)
+├── Logic:
+│   if (new_stock_qty < total_reserved_qty):
+│     → หา orders ที่ reserve SKU นี้ (status ∈ checking_stock, awaiting_confirm, paid, packed)
+│     → เรียงตาม post_date DESC (order ล่าสุด conflict ก่อน)
+│     → flag meta '_stock_conflict' = 1
+│     → Push LINE Flex ไป Admin group:
+│       "⚠️ สต็อก SKU-001 = 0 แต่มี 1 order ค้าง"
+│       "Order #1234 — ตัวแทน: ร้าน ABC — สั่ง 1 ชิ้น"
+│       [ปุ่ม: ยกเลิก order] [ปุ่ม: เปลี่ยนเป็น Backorder]
+├── Admin Resolution:
+│   Option 1: ยกเลิก B2B order
+│   ├── status → cancelled
+│   ├── Flex ไปตัวแทน: "ขออภัย สินค้า X หมดสต็อก"
+│   ├── ถ้ามี BO ETA → "คาดว่าจะมีของ DD/MM/YYYY"
+│   └── reserved ลดอัตโนมัติ (computed)
+│
+│   Option 2: เปลี่ยนเป็น Backorder
+│   ├── status → backorder
+│   ├── Flex ไปตัวแทน: "สินค้า X รอผลิต — คาดว่าจะมีของ DD/MM/YYYY"
+│   └── ETA จาก B2F PO (ถ้ามี)
+│
+│   Option 3: ไม่ทำอะไร (Admin resolve manual)
+│   └── กด "Resolve" → ลบ _stock_conflict flag
+├── Priority Rule: Walk-in ชนะ B2B เสมอ
+│   (Walk-in = ของหยิบไปแล้ว ย้อนไม่ได้, B2B = ยังไม่ส่ง)
+├── Admin Dashboard: แสดง conflict orders สีแดง + badge "⚠️ สต็อกไม่พอ"
+├── ไฟล์: Stock Core + Flex Builder + [B2B] Snippet 2
+└── เวลา: 1.5 วัน
+
+Task 4.5: Reorder Point Alert + Suggest PO Link
 ├── Threshold: reorder_point field (per SKU, Admin ตั้งเอง)
 ├── Cron daily: ตรวจ available_qty <= reorder_point
 ├── LINE Flex → Admin group:
@@ -1183,7 +1214,7 @@ Task 4.3: Reorder Point Alert + Suggest PO Link
 ├── ไฟล์: Stock Core + Cron + Flex Builder
 └── เวลา: 1 วัน
 
-Task 4.4: AI Chatbot Stock Query (OpenClaw integration)
+Task 4.6: AI Chatbot Stock Query (OpenClaw integration)
 ├── เพิ่ม tool: "check_stock_status" ใน dinoco-tools.js
 │   Input: { sku or product_name }
 │   Output: { stock_display, eta, bo_note } (ไม่ส่ง stock_qty!)
@@ -1198,6 +1229,10 @@ Task 4.4: AI Chatbot Stock Query (OpenClaw integration)
 Deploy Phase 4 → Test:
 ├── สั่ง 8 จาก 10 → available = 2 → "ใกล้หมด"
 ├── Cancel → available กลับ 10
+├── Stock conflict: stock=1 + B2B reserved=1 + Walk-in complete
+│   → Admin เห็น alert + ปุ่มยกเลิก/backorder
+├── Conflict ยกเลิก → Flex ขอโทษตัวแทน + reserved = 0
+├── Conflict backorder → Flex แจ้งรอ + ETA
 ├── Reorder alert push LINE เมื่อถึง threshold
 ├── AI bot ตอบ stock + ETA ได้ ไม่หลุดตัวเลข
 └── Walk-in cancel → คืนสต็อก
