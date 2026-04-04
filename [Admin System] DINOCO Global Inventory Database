@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.34.1 — WARN-08: XSS escape user input in JS
+ * Version: V.35.0 — Product Data Consolidation: pricing/discount/tier ใน Catalog modal + REST endpoint
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -69,10 +69,31 @@ add_action('init', function() {
             if ($act === 'get_catalog') {
                 $catalog = dinoco_get_current_catalog();
                 $relations = dinoco_get_current_sku_relations();
+
+                // V.35: Enrich with B2B pricing data
+                $b2b_posts = get_posts(['post_type' => 'b2b_product', 'posts_per_page' => -1, 'post_status' => 'publish']);
+                $b2b_map = [];
+                foreach ($b2b_posts as $bp) {
+                    $bsku = get_field('product_sku', $bp->ID);
+                    if ($bsku) $b2b_map[$bsku] = $bp->ID;
+                }
+
                 foreach ($catalog as $sku => &$item) {
                     $item['is_set'] = isset($relations[$sku]);
                     $item['child_count'] = isset($relations[$sku]) ? count($relations[$sku]) : 0;
-                    $item['children'] = isset($relations[$sku]) ? $relations[$sku] : []; 
+                    $item['children'] = isset($relations[$sku]) ? $relations[$sku] : [];
+                    // V.35: B2B pricing fields
+                    $bpid = isset($b2b_map[$sku]) ? $b2b_map[$sku] : 0;
+                    $item['b2b_discount'] = $bpid ? floatval(get_field('b2b_discount_percent', $bpid)) : 0;
+                    $item['price_standard'] = $bpid ? floatval(get_field('price_standard', $bpid)) : 0;
+                    $item['price_silver'] = $bpid ? floatval(get_field('price_silver', $bpid)) : 0;
+                    $item['price_gold'] = $bpid ? floatval(get_field('price_gold', $bpid)) : 0;
+                    $item['price_platinum'] = $bpid ? floatval(get_field('price_platinum', $bpid)) : 0;
+                    $item['price_diamond'] = $bpid ? floatval(get_field('price_diamond', $bpid)) : 0;
+                    $item['product_category'] = $bpid ? (get_field('product_category', $bpid) ?: '') : '';
+                    $item['min_order_qty'] = $bpid ? intval(get_field('min_order_qty', $bpid)) : 1;
+                    $item['boxes_per_unit'] = $bpid ? max(1, intval(get_field('boxes_per_unit', $bpid))) : 1;
+                    $item['b2b_post_id'] = $bpid;
                 }
                 echo json_encode(['success' => true, 'data' => $catalog]); exit;
             }
@@ -1439,6 +1460,90 @@ add_action('rest_api_init', function() {
         'permission_callback' => function() { return current_user_can('manage_options'); },
     ]);
 
+    // --- POST /dinoco-stock/v1/product/pricing --- V.35.0: Save discount + tier prices (dual-write)
+    register_rest_route('dinoco-stock/v1', '/product/pricing', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $table = $wpdb->prefix . 'dinoco_products';
+
+            $sku = sanitize_text_field($request->get_param('sku'));
+            if (empty($sku)) {
+                return new WP_REST_Response(['success' => false, 'message' => 'SKU required'], 400);
+            }
+
+            $discount   = max(0, min(100, floatval($request->get_param('discount_percent'))));
+            $ps  = max(0, floatval($request->get_param('price_standard')));
+            $psi = max(0, floatval($request->get_param('price_silver')));
+            $pg  = max(0, floatval($request->get_param('price_gold')));
+            $pp  = max(0, floatval($request->get_param('price_platinum')));
+            $pd  = max(0, floatval($request->get_param('price_diamond')));
+            $cat = sanitize_text_field($request->get_param('category') ?: '');
+            $moq = max(1, intval($request->get_param('moq') ?: 1));
+            $bpu = max(1, intval($request->get_param('boxes_per_unit') ?: 1));
+
+            // 1) Update dinoco_products custom table
+            $custom_data = [
+                'b2b_discount_percent' => $discount,
+                'price_silver'    => $psi,
+                'price_gold'      => $pg,
+                'price_platinum'  => $pp,
+                'price_diamond'   => $pd,
+                'category'        => $cat,
+                'min_order_qty'   => $moq,
+                'boxes_per_unit'  => $bpu,
+            ];
+            $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$table} WHERE sku = %s AND is_active = 1", $sku));
+            if ($exists) {
+                $wpdb->update($table, $custom_data, ['sku' => $sku]);
+            } else {
+                // Product should exist in custom table — create minimal row
+                $custom_data['sku'] = $sku;
+                $custom_data['name'] = $sku;
+                $wpdb->insert($table, $custom_data);
+            }
+
+            // 2) Dual-write to b2b_product ACF postmeta
+            $b2b_posts = get_posts([
+                'post_type'      => 'b2b_product',
+                'posts_per_page' => 1,
+                'post_status'    => 'publish',
+                'meta_query'     => [['key' => 'product_sku', 'value' => $sku]],
+            ]);
+            $b2b_id = !empty($b2b_posts) ? $b2b_posts[0]->ID : 0;
+            if (!$b2b_id) {
+                // Auto-create b2b_product post
+                $catalog = dinoco_get_current_catalog();
+                $name = isset($catalog[$sku]['name']) ? $catalog[$sku]['name'] : $sku;
+                $b2b_id = wp_insert_post([
+                    'post_type'   => 'b2b_product',
+                    'post_title'  => $name . ' (' . $sku . ')',
+                    'post_status' => 'publish',
+                ]);
+                if (is_wp_error($b2b_id)) {
+                    return new WP_REST_Response(['success' => false, 'message' => 'Failed to create b2b_product'], 500);
+                }
+                update_field('product_sku', $sku, $b2b_id);
+                update_field('stock_status', 'in_stock', $b2b_id);
+            }
+            update_field('b2b_discount_percent', $discount, $b2b_id);
+            update_field('price_standard', $ps, $b2b_id);
+            update_field('price_silver', $psi, $b2b_id);
+            update_field('price_gold', $pg, $b2b_id);
+            update_field('price_platinum', $pp, $b2b_id);
+            update_field('price_diamond', $pd, $b2b_id);
+            update_field('product_category', $cat, $b2b_id);
+            update_field('min_order_qty', $moq, $b2b_id);
+            update_field('boxes_per_unit', $bpu, $b2b_id);
+
+            // 3) Clear transient cache
+            delete_transient('b2b_sku_data_map');
+
+            return new WP_REST_Response(['success' => true, 'message' => 'Pricing saved for ' . $sku, 'b2b_post_id' => $b2b_id], 200);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
 });
 
 // =========================================================================================
@@ -2053,9 +2158,10 @@ function dinoco_render_ui_v99() {
                 <span class="cursor-pointer hover:text-red-400 bg-slate-700 w-8 h-8 flex items-center justify-center rounded-full transition" onclick="jQuery('#modal-catalog-editor').fadeOut()">x</span>
             </div>
             <div class="p-6 overflow-y-auto flex-grow">
-                <!-- Tabs UI Fixed -->
+                <!-- Tabs UI Fixed — V.35: Added Pricing tab -->
                 <div class="modal-tabs">
                     <div class="modal-tab active" onclick="jQuery('.cat-tab').hide();jQuery('#cat-tab-1').fadeIn();jQuery(this).addClass('active').siblings().removeClass('active');">General Info</div>
+                    <div class="modal-tab" onclick="jQuery('.cat-tab').hide();jQuery('#cat-tab-3').fadeIn();jQuery(this).addClass('active').siblings().removeClass('active');">Pricing & B2B</div>
                     <div class="modal-tab" onclick="jQuery('.cat-tab').hide();jQuery('#cat-tab-2').fadeIn();jQuery(this).addClass('active').siblings().removeClass('active');">Set Components (ลูก)</div>
                 </div>
 
@@ -2067,6 +2173,31 @@ function dinoco_render_ui_v99() {
                         <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Price</label><input id="cat-price" class="w-full border p-3 rounded-lg" placeholder="1,000"></div>
                         <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">Warranty Years</label><input type="number" id="cat-years" class="w-full border p-3 rounded-lg" value="1"></div>
                     </div>
+                </div>
+
+                <!-- V.35: Pricing & B2B Tab -->
+                <div id="cat-tab-3" class="cat-tab" style="display:none;">
+                    <div class="bg-amber-50 border border-amber-200 p-3 rounded-xl mb-4 text-sm text-amber-700"><i class="fa-solid fa-coins mr-1"></i> ตั้งราคาตัวแทนตาม Rank — ข้อมูลจะ sync ไป B2B ระบบอัตโนมัติ</div>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">ส่วนลดตัวแทน (%)</label><input type="number" id="cat-discount" class="w-full border p-3 rounded-lg" min="0" max="100" step="0.5" value="0" placeholder="0"></div>
+                        <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">หมวดหมู่ (Category)</label><input id="cat-category" class="w-full border p-3 rounded-lg" placeholder="เช่น Engine Guard"></div>
+                    </div>
+                    <div class="text-xs font-bold text-slate-500 uppercase mb-2">ราคาตาม Rank (5 Tier)</div>
+                    <div class="grid grid-cols-3 gap-3 mb-4">
+                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">Standard</label><input type="number" id="cat-ps" class="w-full border p-2 rounded-lg text-center font-mono" min="0" value="0"></div>
+                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">Silver</label><input type="number" id="cat-psi" class="w-full border p-2 rounded-lg text-center font-mono" min="0" value="0"></div>
+                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">Gold</label><input type="number" id="cat-pg" class="w-full border p-2 rounded-lg text-center font-mono" min="0" value="0"></div>
+                    </div>
+                    <div class="grid grid-cols-3 gap-3 mb-4">
+                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">Platinum</label><input type="number" id="cat-pp" class="w-full border p-2 rounded-lg text-center font-mono" min="0" value="0"></div>
+                        <div><label class="block text-[10px] font-bold text-slate-400 mb-1">Diamond</label><input type="number" id="cat-pd" class="w-full border p-2 rounded-lg text-center font-mono" min="0" value="0"></div>
+                        <div></div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">MOQ (Min Order Qty)</label><input type="number" id="cat-moq" class="w-full border p-3 rounded-lg" min="1" value="1"></div>
+                        <div><label class="block text-xs font-bold text-slate-500 uppercase mb-1">กล่อง/ชิ้น (Boxes per Unit)</label><input type="number" id="cat-bpu" class="w-full border p-3 rounded-lg" min="1" value="1"></div>
+                    </div>
+                    <div id="cat-avg-cost" class="bg-slate-50 border border-slate-200 p-3 rounded-lg text-sm text-slate-500" style="display:none;"><i class="fa-solid fa-calculator mr-1"></i> <span id="cat-avg-cost-val"></span></div>
                 </div>
 
                 <div id="cat-tab-2" class="cat-tab" style="display:none;">
@@ -2087,7 +2218,15 @@ function dinoco_render_ui_v99() {
         // WARN-08: XSS escape helper
         function esc(s) { if (!s) return ''; var d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
         const DINOCO_NONCE = "<?php echo wp_create_nonce('dinoco_admin_action'); ?>";
+        // V.35: Stock API constants (also defined later in stock section, but needed here for saveCatalogItem)
+        const STOCK_API_EARLY = '<?php echo esc_url(rest_url('dinoco-stock/v1')); ?>';
+        const STOCK_NONCE_EARLY = '<?php echo wp_create_nonce('wp_rest'); ?>';
         let catalogData = {}; let skuRelations = {}; let godModeTimer; const _p = "<?php echo base64_encode( defined('DINOCO_GOD_MODE_PIN') ? DINOCO_GOD_MODE_PIN : '' ); ?>";
+        // V.35: Pre-load valuation map for avg cost display
+        window._valuationMap = {};
+        $.ajax({ url: STOCK_API_EARLY + '/valuation', method: 'GET', beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE_EARLY); }, success: function(res) {
+            if (res.success && res.data && res.data.items) { res.data.items.forEach(function(v) { if (v.avg_cost > 0) window._valuationMap[v.sku] = v.avg_cost; }); }
+        }});
         function checkPin(input) { return btoa(input) === _p; }
         
         /* Pass Repair Map to JS */
@@ -2168,11 +2307,32 @@ function dinoco_render_ui_v99() {
                     $('#cat-modal-title').text('แก้ไขข้อมูลสินค้า (Edit Product)');
                     $('#cat-sku').val(sku).prop('readonly', true);
                     $('#cat-name').val(item.name); $('#cat-img').val(item.img); $('#cat-price').val(item.price); $('#cat-years').val(item.years);
+                    // V.35: Populate pricing fields
+                    $('#cat-discount').val(item.b2b_discount || 0);
+                    $('#cat-category').val(item.product_category || '');
+                    $('#cat-ps').val(item.price_standard || 0);
+                    $('#cat-psi').val(item.price_silver || 0);
+                    $('#cat-pg').val(item.price_gold || 0);
+                    $('#cat-pp').val(item.price_platinum || 0);
+                    $('#cat-pd').val(item.price_diamond || 0);
+                    $('#cat-moq').val(item.min_order_qty || 1);
+                    $('#cat-bpu').val(item.boxes_per_unit || 1);
+                    // V.35: Show avg cost if valuation available
+                    if (window._valuationMap && window._valuationMap[sku]) {
+                        $('#cat-avg-cost').show();
+                        $('#cat-avg-cost-val').text('ราคาทุนเฉลี่ย (WAC): ' + Number(window._valuationMap[sku]).toLocaleString() + ' บาท');
+                    } else {
+                        $('#cat-avg-cost').hide();
+                    }
                     renderCatChildren(sku);
                 } else {
                     $('#cat-modal-title').text('เพิ่มสินค้าใหม่ (Add New Product)');
                     $('#cat-sku').val('').prop('readonly', false);
                     $('#cat-name').val(''); $('#cat-img').val(''); $('#cat-price').val(''); $('#cat-years').val(5);
+                    // V.35: Reset pricing fields
+                    $('#cat-discount').val(0); $('#cat-category').val('');
+                    $('#cat-ps').val(0); $('#cat-psi').val(0); $('#cat-pg').val(0); $('#cat-pp').val(0); $('#cat-pd').val(0);
+                    $('#cat-moq').val(1); $('#cat-bpu').val(1); $('#cat-avg-cost').hide();
                     $('#cat-children-list').html('<div class="text-center text-slate-400 text-xs py-4">Save product first to add components</div>');
                 }
                 $('#modal-catalog-editor').fadeIn().css('display','flex');
@@ -2209,13 +2369,31 @@ function dinoco_render_ui_v99() {
             /* [FIX] Use unique action key */
             let d = { dinoco_inventory_action: 'save_product', dinoco_admin_nonce: DINOCO_NONCE, sku: sku, name: $('#cat-name').val(), img: $('#cat-img').val(), price: $('#cat-price').val(), years: $('#cat-years').val() };
             let children = skuRelations[sku] || [];
+
+            // V.35: Pricing data via REST API (dual-write)
+            let pricingData = {
+                sku: sku,
+                discount_percent: parseFloat($('#cat-discount').val()) || 0,
+                price_standard: parseFloat($('#cat-ps').val()) || 0,
+                price_silver: parseFloat($('#cat-psi').val()) || 0,
+                price_gold: parseFloat($('#cat-pg').val()) || 0,
+                price_platinum: parseFloat($('#cat-pp').val()) || 0,
+                price_diamond: parseFloat($('#cat-pd').val()) || 0,
+                category: $('#cat-category').val() || '',
+                moq: parseInt($('#cat-moq').val()) || 1,
+                boxes_per_unit: parseInt($('#cat-bpu').val()) || 1
+            };
+
             $.when(
                 $.post('', d),
-                $.post('', { dinoco_inventory_action: 'save_sku_relation', dinoco_admin_nonce: DINOCO_NONCE, parent_sku: sku, child_skus: children })
-            ).done(function(r1) {
+                $.post('', { dinoco_inventory_action: 'save_sku_relation', dinoco_admin_nonce: DINOCO_NONCE, parent_sku: sku, child_skus: children }),
+                $.ajax({ url: STOCK_API_EARLY + '/product/pricing', method: 'POST', contentType: 'application/json', headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY }, data: JSON.stringify(pricingData) })
+            ).done(function(r1, r2, r3) {
                 var res = r1 && r1[0] ? r1[0] : r1;
                 if (res && res.success === false) { Swal.fire('Error', res.message || 'Save failed', 'error'); return; }
                 Swal.fire({icon:'success', title:'Saved', timer:1000, showConfirmButton:false}); $('#modal-catalog-editor').fadeOut(); loadCatalog();
+            }).fail(function(err) {
+                Swal.fire('Error', 'Save failed: ' + (err.responseJSON ? err.responseJSON.message : err.statusText), 'error');
             });
         };
 
@@ -2258,7 +2436,10 @@ function dinoco_render_ui_v99() {
                         let editBtn = `<div class="btn-edit-cat" onclick="openEditCatalogModal('${sku}'); event.stopPropagation();"><i class="fa-solid fa-pen"></i></div>`;
                         let imgHtml = renderImageOrPlaceholder(item.img);
                         let badge = item.is_set ? '<span class="set-badge">SET</span>' : '';
-                        html += `<div class="catalog-item" onclick="searchCatalogItem('${sku}')">${deleteBtn}${editBtn}${badge}<div class="catalog-img-wrap">${imgHtml}</div><div class="catalog-body"><span class="catalog-sku">${sku}</span><div class="catalog-title">${item.name}</div><div class="text-xs text-slate-400 mb-2">Warranty: ${item.years} Years</div><div class="catalog-price">${item.price} ฿</div></div></div>`;
+                        // V.35: Show discount & standard price in card
+                        let discBadge = item.b2b_discount > 0 ? `<span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:1px 6px;border-radius:8px;margin-left:4px;">-${item.b2b_discount}%</span>` : '';
+                        let stdPrice = item.price_standard > 0 ? `<div style="font-size:11px;color:#6366f1;font-weight:600;">Std: ${Number(item.price_standard).toLocaleString()} ฿</div>` : '';
+                        html += `<div class="catalog-item" onclick="searchCatalogItem('${sku}')">${deleteBtn}${editBtn}${badge}<div class="catalog-img-wrap">${imgHtml}</div><div class="catalog-body"><span class="catalog-sku">${sku}</span><div class="catalog-title">${item.name}</div><div class="text-xs text-slate-400 mb-1">Warranty: ${item.years} Years</div><div class="catalog-price">${item.price} ฿${discBadge}</div>${stdPrice}</div></div>`;
                     });
                     $('#catalog-container').html(html);
                     populateGenSelect(); 
