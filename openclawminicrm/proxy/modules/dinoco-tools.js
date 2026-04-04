@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.2.0 — KB priority tool description + product_lookup auto-appends KB specs + lean prompt support
+ * V.3.0 — KB priority + product_lookup auto-appends KB specs + check_stock_status tool (Phase 4)
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -208,6 +208,20 @@ const AGENT_TOOLS = [
           purchase_from: { type: "string", description: "ร้านที่ซื้อสินค้า (ถ้ารู้)" },
         },
         required: ["symptoms", "phone", "customer_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "check_stock_status",
+      description: "ตรวจสอบสถานะสต็อกสินค้า ว่ามีสินค้าหรือไม่ ใกล้หมดหรือไม่ และ ETA ถ้าหมด ใช้เมื่อลูกค้าถามว่า 'มีของไหม' 'หมดไหม' 'เมื่อไหร่จะมี' 'พร้อมส่งไหม'",
+      parameters: {
+        type: "object",
+        properties: {
+          product_name_or_sku: { type: "string", description: "ชื่อสินค้าหร��อ SKU ที่ต้องการเช็ค เช่น 'แคชบาร์ ADV350' หรือ 'DNK-CB-ADV350-PRO'" },
+        },
+        required: ["product_name_or_sku"],
       },
     },
   },
@@ -550,6 +564,51 @@ async function executeTool(toolName, args, sourceId) {
       return result.message || "ไม่พบข้อมูลในคลังความรู้ — ขอเช็คข้อมูลกับทีมงานก่อนนะคะ";
     }
     return result.entries.map((e) => `Q: ${e.question}\nA: ${e.facts}\nวิธีตอบ: ${e.action}`).join("\n---\n");
+  }
+  // ★ V.3.0: Stock status query (Phase 4) — ห้าม return stock_qty
+  if (toolName === "check_stock_status") {
+    const query = args.product_name_or_sku || "";
+    if (!query) return "กรุณาระบุชื่อสินค้าหรือ SKU";
+
+    // เรียก MCP Bridge /product-lookup (มี stock_display + stock_eta อยู่แล้ว)
+    const result = await callDinocoAPI("/product-lookup", { query, category: "" });
+    if (typeof result === "string") return result;
+    if (!result.found || !result.products || result.products.length === 0) {
+      return `ไม่พบสินค้า "${query}" ในระบบ — ตอบลูกค้าว่า "ขอเช็คชื่อสินค้าอีกครั้งนะคะ"`;
+    }
+
+    const p = result.products[0];
+    const stockDisplay = p.stock_display || p.stock_status || "in_stock";
+    const eta = p.stock_eta || p.oos_eta_date || null;
+    const productName = p.name || query;
+
+    const stockMessages = {
+      in_stock: `สินค้า ${productName} มีสินค้าพร้อมจัดส่งค่ะ`,
+      low_stock: `สินค้า ${productName} ใกล้หมดแล้วค่ะ สั่งก่อนหมดนะคะ`,
+      out_of_stock: `สินค้า ${productName} หมดสต็อกชั่วคราวค่ะ`,
+    };
+
+    let response = {
+      stock_display: stockDisplay,
+      stock_message: stockMessages[stockDisplay] || stockMessages.in_stock,
+      note: "ไม่สามารถแจ้งจำนวนสต็อกที่แน่นอนได้",
+    };
+
+    if (stockDisplay === "out_of_stock" && eta) {
+      // Format ETA date
+      let etaFormatted = eta;
+      try {
+        const d = new Date(eta);
+        if (!isNaN(d)) etaFormatted = d.toLocaleDateString("th-TH", { day: "2-digit", month: "2-digit", year: "numeric" });
+      } catch {}
+      response.eta = etaFormatted;
+      response.eta_message = `คาดว่าจะมีของ ${etaFormatted}`;
+    } else if (stockDisplay === "out_of_stock") {
+      response.eta = null;
+      response.eta_message = "ยังไม่ทราบกำหนด";
+    }
+
+    return JSON.stringify(response);
   }
   if (toolName === "dinoco_escalate") {
     const reason = args.reason || "ลูกค้าต้องการความช่วยเหลือ";

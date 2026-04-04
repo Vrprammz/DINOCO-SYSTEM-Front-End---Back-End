@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 3.0 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead + DB Expert + Production Safety + Final Sign-off
+Version: 4.0 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead + DB Expert + Production Safety + Final Sign-off
 
 ---
 
@@ -1211,7 +1211,7 @@ Deploy Phase 3 → Test:
 └── Export/Import CSV ทำงาน
 ```
 
-### Phase 4: Reserved Qty + Stock Conflict + Reorder Alert + AI (5-6 วัน)
+### Phase 4: Reserved Qty + Stock Conflict + Reorder Alert + AI (5-6 วัน) -- DONE 2026-04-04
 
 ```
 Task 4.1: Reserved Quantity (computed — ไม่เก็บ field แยก)

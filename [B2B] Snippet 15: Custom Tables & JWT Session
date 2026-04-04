@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.3.2 — Inventory Phase 3: Dip Stock tables+cron ║
+ * ║  Version: V.4.0 — Inventory Phase 4: Reserved Qty + Conflict ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -377,6 +377,11 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
 
         dinoco_stock_auto_status( $sku );
 
+        // Phase 4: Stock conflict detection หลัง subtract
+        if ( function_exists( 'dinoco_check_stock_conflict' ) ) {
+            dinoco_check_stock_conflict( $sku );
+        }
+
         if ( function_exists( 'b2b_log' ) ) {
             b2b_log( sprintf( '[Stock] SUBTRACT %s -%d (%d→%d) type=%s ref=%s:%d', $sku, $qty, $old_qty, $new_qty, $type, $ref_type, $ref_id ) );
         }
@@ -405,7 +410,11 @@ if ( ! function_exists( 'dinoco_stock_auto_status' ) ) {
         $qty       = (int) $product->stock_qty;
         $threshold = (int) $product->low_stock_threshold;
 
-        if ( $qty <= 0 ) {
+        // Phase 4: ใช้ available_qty (stock - reserved) แทน stock_qty สำหรับ display
+        $reserved  = function_exists( 'dinoco_get_reserved_qty' ) ? dinoco_get_reserved_qty( $sku ) : 0;
+        $available = max( 0, $qty - $reserved );
+
+        if ( $available <= 0 ) {
             $new_status = 'out_of_stock';
         } else {
             $new_status = 'in_stock';
@@ -452,12 +461,17 @@ if ( ! function_exists( 'dinoco_stock_get' ) ) {
         ), ARRAY_A );
         if ( ! $row ) return null;
 
-        // Compute stock_display (ไม่เก็บ DB — API layer only)
-        $qty       = (int) $row['stock_qty'];
+        // Phase 4: compute reserved_qty + available_qty
+        $reserved = function_exists( 'dinoco_get_reserved_qty' ) ? dinoco_get_reserved_qty( $sku ) : 0;
+        $available = max( 0, (int) $row['stock_qty'] - $reserved );
+        $row['reserved_qty']  = $reserved;
+        $row['available_qty'] = $available;
+
+        // Compute stock_display ใช้ available_qty (Phase 4)
         $threshold = (int) $row['low_stock_threshold'];
-        if ( (int) $row['manual_hold'] || $qty <= 0 ) {
+        if ( (int) $row['manual_hold'] || $available <= 0 ) {
             $row['stock_display'] = 'out_of_stock';
-        } elseif ( $threshold > 0 && $qty <= $threshold ) {
+        } elseif ( $threshold > 0 && $available <= $threshold ) {
             $row['stock_display'] = 'low_stock';
         } else {
             $row['stock_display'] = 'in_stock';
@@ -468,7 +482,198 @@ if ( ! function_exists( 'dinoco_stock_get' ) ) {
 }
 
 // ════════════════════════════════════════════════════════════
-// PART 1.5: LOW STOCK ALERT CRON (V.3.1 — Inventory Phase 2)
+// PART 1.4: RESERVED QTY + AVAILABLE QTY + CONFLICT (V.4.0 — Phase 4)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * คำนวณ reserved_qty สำหรับ SKU (computed — ไม่เก็บ field แยก)
+ * Query จาก b2b_order ที่ status IN (checking_stock, awaiting_confirm, awaiting_payment, paid, packed)
+ * Parse order_items text ด้วย regex เพื่อหา SKU + qty
+ * SKU Set: ถ้า SKU เป็น child → หา parent ที่มี child ตรง → sum
+ * Cache ด้วย transient 60 วินาที (PO-3)
+ */
+if ( ! function_exists( 'dinoco_get_reserved_qty' ) ) {
+    function dinoco_get_reserved_qty( $sku ) {
+        $sku = strtoupper( trim( $sku ) );
+        $cache_key = 'dinoco_reserved_' . $sku;
+        $cached = get_transient( $cache_key );
+        if ( $cached !== false ) return (int) $cached;
+
+        $reserve_statuses = array( 'checking_stock', 'awaiting_confirm', 'awaiting_payment', 'paid', 'packed' );
+        $relations = get_option( 'dinoco_sku_relations', array() );
+
+        // สร้าง list ของ SKU ที่ต้อง match: ตัวเอง + parent ที่มี child = ตัวเอง
+        $match_skus = array( $sku ); // direct match
+        foreach ( $relations as $parent_sku => $children ) {
+            if ( is_array( $children ) && in_array( $sku, array_map( 'strtoupper', $children ), true ) ) {
+                $match_skus[] = strtoupper( $parent_sku );
+            }
+        }
+        $match_skus = array_unique( $match_skus );
+
+        // Query all active orders with reserve statuses
+        $orders = get_posts( array(
+            'post_type'      => 'b2b_order',
+            'post_status'    => 'publish',
+            'posts_per_page' => -1,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                array(
+                    'key'     => 'order_status',
+                    'value'   => $reserve_statuses,
+                    'compare' => 'IN',
+                ),
+            ),
+        ) );
+
+        $total_reserved = 0;
+
+        foreach ( $orders as $order_id ) {
+            $order_text = get_field( 'order_items', $order_id ) ?: '';
+            if ( ! preg_match_all( '/\(([A-Za-z0-9_\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) {
+                continue;
+            }
+
+            foreach ( $matches as $m ) {
+                $item_sku = strtoupper( trim( $m[1] ) );
+                $item_qty = intval( $m[2] );
+                if ( $item_qty <= 0 ) continue;
+
+                // Direct SKU match
+                if ( $item_sku === $sku ) {
+                    $total_reserved += $item_qty;
+                    continue;
+                }
+
+                // ถ้า item_sku เป็น parent set ที่มี child = $sku → reserved
+                if ( in_array( $item_sku, $match_skus, true ) && isset( $relations[ $item_sku ] ) ) {
+                    $children = array_map( 'strtoupper', $relations[ $item_sku ] );
+                    if ( in_array( $sku, $children, true ) ) {
+                        $total_reserved += $item_qty;
+                    }
+                }
+            }
+        }
+
+        set_transient( $cache_key, $total_reserved, 60 ); // cache 1 นาที
+        return $total_reserved;
+    }
+}
+
+/**
+ * คำนวณ available_qty = max(0, stock_qty - reserved_qty)
+ */
+if ( ! function_exists( 'dinoco_get_available_qty' ) ) {
+    function dinoco_get_available_qty( $sku ) {
+        $sku = strtoupper( trim( $sku ) );
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_products';
+        $stock_qty = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT stock_qty FROM {$table} WHERE sku = %s", $sku
+        ) );
+        $reserved = dinoco_get_reserved_qty( $sku );
+        return max( 0, $stock_qty - $reserved );
+    }
+}
+
+/**
+ * Stock Conflict Detection (Task 4.3)
+ * เรียกหลัง dinoco_stock_subtract() — ตรวจว่า stock_qty < reserved_qty หรือไม่
+ * ถ้าใช่ → flag orders + push LINE alert
+ */
+if ( ! function_exists( 'dinoco_check_stock_conflict' ) ) {
+    function dinoco_check_stock_conflict( $sku ) {
+        $sku = strtoupper( trim( $sku ) );
+
+        // ล้าง cache เพื่อให้ reserved_qty เป็นปัจจุบัน
+        delete_transient( 'dinoco_reserved_' . $sku );
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_products';
+        $stock_qty = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT stock_qty FROM {$table} WHERE sku = %s", $sku
+        ) );
+
+        $reserved_qty = dinoco_get_reserved_qty( $sku );
+
+        if ( $stock_qty >= $reserved_qty ) return; // ไม่มี conflict
+
+        // หา orders ที่ reserve SKU นี้
+        $reserve_statuses = array( 'checking_stock', 'awaiting_confirm', 'awaiting_payment', 'paid', 'packed' );
+        $relations = get_option( 'dinoco_sku_relations', array() );
+
+        $orders = get_posts( array(
+            'post_type'      => 'b2b_order',
+            'post_status'    => 'publish',
+            'posts_per_page' => -1,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                array(
+                    'key'     => 'order_status',
+                    'value'   => $reserve_statuses,
+                    'compare' => 'IN',
+                ),
+            ),
+            'orderby' => 'date',
+            'order'   => 'DESC',
+        ) );
+
+        $conflict_orders = array();
+
+        foreach ( $orders as $order_id ) {
+            $order_text = get_field( 'order_items', $order_id ) ?: '';
+            if ( ! preg_match_all( '/\(([A-Za-z0-9_\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) {
+                continue;
+            }
+
+            foreach ( $matches as $m ) {
+                $item_sku = strtoupper( trim( $m[1] ) );
+                $item_qty = intval( $m[2] );
+                if ( $item_qty <= 0 ) continue;
+
+                $is_match = false;
+
+                if ( $item_sku === $sku ) {
+                    $is_match = true;
+                } elseif ( isset( $relations[ $item_sku ] ) ) {
+                    $children = array_map( 'strtoupper', $relations[ $item_sku ] );
+                    if ( in_array( $sku, $children, true ) ) {
+                        $is_match = true;
+                    }
+                }
+
+                if ( $is_match ) {
+                    update_post_meta( $order_id, '_stock_conflict', 1 );
+                    $ticket_no = get_field( 'ticket_number', $order_id ) ?: '#' . $order_id;
+                    $dist_name = get_field( 'distributor_name', $order_id ) ?: '-';
+                    $conflict_orders[] = "- {$ticket_no} ({$dist_name}) x{$item_qty}";
+                    break; // 1 order match ก็พอ
+                }
+            }
+        }
+
+        if ( empty( $conflict_orders ) ) return;
+
+        // Push LINE alert ไป Admin group
+        $n = count( $conflict_orders );
+        $order_list = implode( "\n", array_slice( $conflict_orders, 0, 10 ) );
+        $message = "สต็อก {$sku} ไม่พอ!\n"
+                 . "สต็อก: {$stock_qty} ชิ้น แต่มี {$n} order ค้าง (จอง {$reserved_qty})\n"
+                 . "{$order_list}\n"
+                 . "กรุณาตรวจสอบและยกเลิก/backorder";
+
+        if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_line_push' ) ) {
+            b2b_line_push( B2B_ADMIN_GROUP_ID, $message );
+        }
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf( '[Stock] CONFLICT: %s stock=%d reserved=%d orders=%d', $sku, $stock_qty, $reserved_qty, $n ) );
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+// PART 1.5: LOW STOCK ALERT CRON (V.4.0 — Inventory Phase 2+4)
 // ════════════════════════════════════════════════════════════
 
 /**
@@ -520,7 +725,27 @@ if ( ! function_exists( 'dinoco_run_stock_low_alert' ) ) {
              LIMIT 50"
         );
 
-        if ( empty( $low_items ) && empty( $oos_items ) ) return; // ไม่มีอะไรต้องแจ้ง
+        // Phase 4: Reorder Point Alert — query SKU ที่ available_qty <= reorder_point
+        $reorder_items = array();
+        $all_active = $wpdb->get_results(
+            "SELECT sku, name, stock_qty, reorder_point
+             FROM {$table}
+             WHERE is_active = 1
+               AND manual_hold = 0
+               AND reorder_point > 0
+               AND stock_qty > 0
+             ORDER BY stock_qty ASC
+             LIMIT 50"
+        );
+        foreach ( $all_active as $item ) {
+            $available = max( 0, (int) $item->stock_qty - ( function_exists( 'dinoco_get_reserved_qty' ) ? dinoco_get_reserved_qty( $item->sku ) : 0 ) );
+            if ( $available <= (int) $item->reorder_point ) {
+                $reorder_items[] = $item;
+                $item->_available = $available;
+            }
+        }
+
+        if ( empty( $low_items ) && empty( $oos_items ) && empty( $reorder_items ) ) return; // ไม่มีอะไรต้องแจ้ง
 
         $lines = array();
 
@@ -536,6 +761,16 @@ if ( ! function_exists( 'dinoco_run_stock_low_alert' ) ) {
             $lines[] = "หมดสต็อก (" . count( $oos_items ) . " รายการ):";
             foreach ( $oos_items as $item ) {
                 $lines[] = "- " . $item->sku . " " . $item->name . ": 0 ชิ้น";
+            }
+        }
+
+        // Phase 4: Reorder point section
+        if ( ! empty( $reorder_items ) ) {
+            if ( ! empty( $lines ) ) $lines[] = "";
+            $lines[] = "ควรสั่งผลิตเพิ่ม (" . count( $reorder_items ) . " รายการ):";
+            foreach ( $reorder_items as $item ) {
+                $avail = isset( $item->_available ) ? $item->_available : (int) $item->stock_qty;
+                $lines[] = "- " . $item->sku . " " . $item->name . ": เหลือ " . $avail . " ชิ้น (reorder: " . $item->reorder_point . ")";
             }
         }
 
