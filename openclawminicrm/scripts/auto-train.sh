@@ -35,11 +35,27 @@ for ROUND in $(seq 1 $ROUNDS); do
     echo ""
     echo "═══ Round $ROUND: ไม่มี test → สร้างคำถามใหม่ $GEN_COUNT ข้อ ═══"
 
+    # ★ อ่าน KB จริงจาก MongoDB แล้วให้ Gemini สร้างคำถามจาก KB content
     docker exec $AGENT node -e "
+const { MongoClient } = require('mongodb');
 async function gen() {
   const apiKey = process.env.GOOGLE_API_KEY;
+  const mongoUri = process.env.MONGODB_URI;
   if (!apiKey) { console.log('GENERATED:0'); return; }
-  const prompt = 'คุณคือผู้เชี่ยวชาญทดสอบ AI chatbot DINOCO THAILAND (อะไหล่มอเตอร์ไซค์พรีเมียม)\nสินค้า: กล่องอลูมิเนียม IP67 กันล้ม แร็ค ถาดรอง การ์ดแฮนด์ กระเป๋า\nรุ่นรถ: ADV350 Forza350(2024+) NX500 CB500X XL750(BigWing) Versys650(การ์ดแฮนด์)\n\nสร้าง ${GEN_COUNT} คำถามจำลองลูกค้าจริง ภาษาไทย หลากหลาย:\n- ถามราคา/สเปค/เทียบรุ่น\n- เคลม/ซ่อม/ประกัน\n- ตัวแทน/จังหวัด/สั่งซื้อ\n- สแลง/อารมณ์/หลอก/injection\n- ติดตั้ง/ดูแล/ใช้งานจริง\n\nFormat CSV (ไม่ต้อง header ไม่ต้อง code block):\n\"message\",\"mustContain\",\"mustNotContain\",\"critical\",\"name\"\n\nmustContain ใช้ | เป็น OR / mustNotContain เว้นว่าง \"\" / name ใช้ GEN1-GEN${GEN_COUNT}';
+
+  // ★ อ่าน KB จริงจาก MongoDB
+  let kbText = 'ไม่มี KB';
+  try {
+    const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 });
+    await client.connect();
+    const db = client.db(process.env.MONGODB_DB || 'smltrack');
+    const kb = await db.collection('knowledge_base').find({active:{\$ne:false}}).limit(80).toArray();
+    kbText = kb.map(k => '• ' + (k.title||'').substring(0,80) + ': ' + (k.content||'').substring(0,150)).join('\n');
+    await client.close();
+    console.error('[Gen] Read ' + kb.length + ' KB entries');
+  } catch(e) { console.error('[Gen] KB error: ' + e.message); }
+
+  const prompt = 'คุณคือผู้เชี่ยวชาญทดสอบ AI chatbot DINOCO THAILAND\n\n=== ข้อมูลจาก Knowledge Base จริง (ใช้สร้างคำถาม) ===\n' + kbText + '\n\n=== คำสั่ง ===\nจากข้อมูล KB ด้านบน สร้าง ${GEN_COUNT} คำถามจำลองลูกค้าจริง ภาษาไทย\nคำถามต้องอ้างอิงข้อมูลจาก KB จริง เช่น ถามสเปค/ราคา/วิธีเคลม/ข้อจำกัด ที่อยู่ใน KB\n\nประเภทคำถาม:\n- ถามข้อมูลที่อยู่ใน KB (ต้องตอบได้)\n- ถามข้อมูลที่ไม่อยู่ใน KB (ต้องบอกว่าไม่มี)\n- ถามหลอก/trap (ต้องไม่หลงตอบ)\n- สแลง/ภาษาไม่ชัด\n- อารมณ์ลูกค้า (ด่า/ชม/ลังเล)\n\nFormat CSV (ไม่ต้อง header ไม่ต้อง code block):\n\"message\",\"mustContain\",\"mustNotContain\",\"critical\",\"name\"\n\nmustContain ใช้ | เป็น OR / mustNotContain เว้นว่าง \"\" เกือบทั้งหมด / name ใช้ GEN1-GEN${GEN_COUNT}\nตอบเฉพาะ CSV rows';
   try {
     const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+apiKey, {
       method:'POST', headers:{'Content-Type':'application/json'},
