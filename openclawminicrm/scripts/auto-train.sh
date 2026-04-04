@@ -38,16 +38,12 @@ for ROUND in $(seq 1 $ROUNDS); do
     # Reset fail counts
     declare -A FAIL_COUNT
 
+    # ★ ใช้ Gemini API ตรงๆ ไม่ require modules
     docker exec $AGENT node -e "
-const { getDB } = require('./modules/shared');
 async function gen() {
-  const db = await getDB();
-  if (!db) { console.log('GENERATED:0'); return; }
-  const kb = await db.collection('knowledge_base').find({active:{\$ne:false}}).limit(50).toArray();
-  const kbText = kb.map(k => k.title + ': ' + (k.content||'').substring(0,100)).join('\n');
   const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) { console.log('GENERATED:0'); return; }
-  const prompt = 'สร้าง test cases สำหรับ AI chatbot DINOCO (อะไหล่มอเตอร์ไซค์)\nจาก KB:\n' + kbText + '\n\nสร้าง ${GEN_COUNT} คำถามใหม่ ภาษาไทย จำลองลูกค้าจริง\nFormat CSV:\nmessage,mustContain,mustNotContain,critical,name\n\nกฎ: mustContain ใช้ | เป็น OR / mustNotContain เว้นว่าง / critical true เฉพาะข้อสำคัญ / คำถามหลากหลาย / ห้ามซ้ำ\nตอบเฉพาะ CSV rows ไม่ต้อง header ไม่ต้องอธิบาย';
+  const prompt = 'คุณคือผู้เชี่ยวชาญทดสอบ AI chatbot ขายอะไหล่มอเตอร์ไซค์ DINOCO THAILAND\nสินค้า: กล่องอลูมิเนียม กันล้ม แร็ค ถาดรอง การ์ดแฮนด์ กระเป๋า\nรุ่นรถ: ADV350 Forza350(2024+) NX500 CB500X XL750(BigWing) Versys650\n\nสร้าง ${GEN_COUNT} คำถามจำลองลูกค้าจริง ภาษาไทย\nFormat CSV (ไม่ต้อง header):\n\"message\",\"mustContain\",\"mustNotContain\",\"critical\",\"name\"\n\nกฎ:\n- mustContain ใช้ | เป็น OR (match อย่างน้อย 1)\n- mustNotContain เว้นว่าง \"\" เกือบทั้งหมด\n- critical true เฉพาะข้อสำคัญ (ห้ามพลาด)\n- คำถามหลากหลาย: ราคา สเปค เคลม ตัวแทน สแลง อารมณ์ หลอก ติดตั้ง ดูแล\n- name ใช้ GEN1 GEN2 GEN3...\n\nตอบเฉพาะ CSV rows เท่านั้น';
   try {
     const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+apiKey, {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -56,10 +52,10 @@ async function gen() {
     });
     const data = await res.json();
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const lines = text.split('\n').filter(l => l.trim().startsWith('\"') && l.includes(','));
+    const lines = text.split('\n').filter(l => l.trim().startsWith('\"') && l.includes(',') && !l.includes('message,mustContain'));
     console.log('GENERATED:' + lines.length);
     lines.forEach(l => console.log(l));
-  } catch(e) { console.log('GENERATED:0'); }
+  } catch(e) { console.log('GENERATED:0 ' + e.message); }
 }
 gen();
 " 2>/dev/null > /tmp/gen-output.txt
