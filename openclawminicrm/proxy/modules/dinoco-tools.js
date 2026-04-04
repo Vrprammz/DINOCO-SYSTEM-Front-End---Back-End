@@ -190,6 +190,25 @@ const AGENT_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "dinoco_create_claim",
+      description: "★ เปิดใบเคลมสินค้า DINOCO เข้าระบบ — ใช้เมื่อลูกค้าต้องการเคลม+ได้ข้อมูลครบแล้ว (อาการ+เบอร์โทร) ★ ห้ามเรียกถ้ายังไม่ได้ข้อมูลครบ ต้องถามก่อน: (1) อาการ/ปัญหา (2) เบอร์โทร (3) รูปถ่าย (ถ้ามี)",
+      parameters: {
+        type: "object",
+        properties: {
+          symptoms: { type: "string", description: "อาการ/ปัญหาที่ลูกค้าแจ้ง เช่น 'กล่องบุบจากล้มรถ' 'สติกเกอร์ลอก' 'กุญแจหาย'" },
+          phone: { type: "string", description: "เบอร์โทรลูกค้า เช่น '0812345678'" },
+          customer_name: { type: "string", description: "ชื่อลูกค้า (ถ้ารู้)" },
+          product: { type: "string", description: "สินค้าที่เคลม เช่น 'กล่อง 45L สีดำ' 'กันล้ม ADV350 สแตนเลส'" },
+          photos: { type: "array", items: { type: "string" }, description: "URL รูปถ่ายความเสียหาย (ถ้ามี)" },
+          serial: { type: "string", description: "เลข serial/เลขประกัน (ถ้ามี)" },
+        },
+        required: ["symptoms", "phone"],
+      },
+    },
+  },
 ];
 
 // === Execute Tool ===
@@ -627,6 +646,78 @@ async function executeTool(toolName, args, sourceId) {
 
     return `ใบเคลม: ${ticketNum}\nสถานะ: ${statusTh}\nสินค้า: ${claim.product || "-"}\nอาการ: ${claim.symptoms || "-"}\n\nตอบลูกค้าว่า "ใบเคลม ${ticketNum} สถานะ: ${statusTh} ค่ะ ทีมงานกำลังดูแลอยู่นะคะ"`;
   }
+
+  // ★ V.3.4: เปิดใบเคลม DINOCO เข้าระบบ WP
+  if (toolName === "dinoco_create_claim") {
+    const symptoms = args.symptoms || "";
+    const phone = args.phone || "";
+    if (!symptoms || !phone) {
+      return "ข้อมูลไม่ครบ — ต้องมีอาการ+เบอร์โทร ก่อนเปิดเคลม ตอบลูกค้าว่า: รบกวนแจ้งอาการปัญหา+เบอร์โทรติดต่อด้วยนะคะ";
+    }
+
+    try {
+      // 1. สร้างเคลมใน MongoDB (manual_claims)
+      const database = await getDB();
+      const claimDoc = {
+        symptoms,
+        phone,
+        customerName: args.customer_name || "",
+        product: args.product || "",
+        photos: args.photos || [],
+        serial: args.serial || "",
+        sourceId,
+        platform: "facebook",
+        status: "info_collected",
+        createdAt: new Date(),
+        initiatedBy: "ai_tool",
+      };
+
+      if (database) {
+        const result = await database.collection("manual_claims").insertOne(claimDoc);
+        claimDoc._id = result.insertedId;
+      }
+
+      // 2. ส่งไป WordPress MCP
+      const wpResult = await callDinocoAPI("/claim-manual-create", {
+        symptoms,
+        phone,
+        customer_name: args.customer_name || "",
+        product: args.product || "",
+        photos: args.photos || [],
+        serial: args.serial || "",
+        source_id: sourceId,
+        platform: "facebook",
+        initiated_by: "customer",
+        ai_analysis: `AI เปิดเคลมอัตโนมัติ — อาการ: ${symptoms}`,
+      });
+
+      let ticketNumber = "รอเลขจากระบบ";
+      if (typeof wpResult !== "string" && wpResult?.success) {
+        ticketNumber = wpResult.ticket_number || `MC-${wpResult.claim_id}`;
+        // อัพเดท MongoDB ด้วยเลข WP
+        if (database && claimDoc._id) {
+          await database.collection("manual_claims").updateOne(
+            { _id: claimDoc._id },
+            { $set: { wpTicketNumber: ticketNumber, wpClaimId: wpResult.claim_id } }
+          );
+        }
+        console.log(`[Claim] Created: ${ticketNumber} for ${phone}`);
+      } else {
+        console.warn(`[Claim] WP failed:`, wpResult);
+        // ยังมี MongoDB record → ไม่หาย
+        ticketNumber = "รอทีมตรวจสอบ";
+      }
+
+      // 3. ส่ง alert ไปกลุ่ม Admin LINE
+      sendClaimAlertToAdmin({ ...claimDoc, wpTicketNumber: ticketNumber }, "เปิดเคลมใหม่", sourceId).catch(() => {});
+
+      return `เปิดใบเคลมสำเร็จ เลข: ${ticketNumber}\nอาการ: ${symptoms}\nเบอร์โทร: ${phone}\nสินค้า: ${args.product || "-"}\n\nตอบลูกค้าว่า "เปิดใบเคลมให้แล้วค่ะ เลข ${ticketNumber} ทีมช่างจะตรวจสอบและติดต่อกลับเร็วที่สุดนะคะ"`;
+    } catch (e) {
+      console.error("[Claim] Create error:", e.message);
+      return "เกิดข้อผิดพลาดในการเปิดเคลม ตอบลูกค้าว่า: ขออภัยค่ะ ระบบมีปัญหา ให้ทีมงานช่วยเปิดเคลมให้นะคะ";
+    }
+  }
+
   // MCP tools
   if (mcpToolHandlers[toolName]) {
     return await callMCPTool(toolName, args);
