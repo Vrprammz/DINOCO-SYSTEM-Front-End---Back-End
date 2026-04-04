@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
- * ║  Version: V.31.9 — Admin cancel completed walk-in + debt reverse ║
+ * ║  Version: V.32.0 — Inventory V.3.0: stock deduct/return hooks   ║
  * ║  DB_ID: 51                                                  ║
  * ║  DINOCO B2B Smart Order System                              ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -3503,6 +3503,122 @@ function b2b_rest_confirm_delivery( WP_REST_Request $r ) {
     }
 }
 } // end function_exists b2b_rest_confirm_delivery
+
+// ── Inventory V.3.0: ตัดสต็อกตอน awaiting_confirm + คืนสต็อกตอน cancel ──
+add_action('b2b_order_status_changed', 'dinoco_inv_on_status_change', 5, 4);
+if ( ! function_exists('dinoco_inv_on_status_change') ) {
+function dinoco_inv_on_status_change( $order_id, $from_status, $to_status, $actor ) {
+    // ─── ตัดสต็อกเมื่อ → awaiting_confirm (DD-4) ───
+    if ( $to_status === 'awaiting_confirm' ) {
+        if ( get_post_meta( $order_id, '_stock_deducted', true ) ) return; // dedup
+
+        if ( ! function_exists( 'dinoco_stock_subtract' ) ) return;
+
+        $order_text = get_field( 'order_items', $order_id ) ?: '';
+        if ( ! preg_match_all( '/\(([A-Za-z0-9_\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) {
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[Stock] WARNING: No SKU found in order #{$order_id} items, skip deduct" );
+            return;
+        }
+
+        $relations = get_option( 'dinoco_sku_relations', array() );
+
+        foreach ( $matches as $m ) {
+            $sku = strtoupper( trim( $m[1] ) );
+            $qty = intval( $m[2] );
+            if ( $qty <= 0 ) continue;
+
+            if ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) {
+                // Set product: validate children ก่อน deduct (E-4)
+                $all_valid = true;
+                foreach ( $relations[ $sku ] as $child_sku ) {
+                    if ( class_exists( 'DINOCO_Catalog' ) && ! DINOCO_Catalog::get_by_sku( $child_sku ) ) {
+                        $all_valid = false;
+                        if ( function_exists( 'b2b_log' ) ) b2b_log( "[Stock] WARNING: child SKU {$child_sku} not in catalog, skip set {$sku}" );
+                    }
+                }
+                if ( ! $all_valid ) continue;
+
+                foreach ( $relations[ $sku ] as $child_sku ) {
+                    dinoco_stock_subtract( $child_sku, $qty, 'b2b_reserved', 'b2b_order', $order_id );
+                }
+            } else {
+                dinoco_stock_subtract( $sku, $qty, 'b2b_reserved', 'b2b_order', $order_id );
+            }
+        }
+
+        update_post_meta( $order_id, '_stock_deducted', 1 );
+        update_post_meta( $order_id, '_awaiting_confirm_at', current_time( 'mysql' ) );
+
+        // Schedule auto-cancel 30 นาที (ไม่ทำกับ walk-in)
+        if ( ! get_post_meta( $order_id, '_b2b_is_walkin', true ) ) {
+            wp_schedule_single_event( time() + 1800, 'dinoco_inv_auto_cancel', array( $order_id ) );
+        }
+    }
+
+    // ─── คืนสต็อกเมื่อ → cancelled (ทุกกรณี) ───
+    if ( $to_status === 'cancelled' && get_post_meta( $order_id, '_stock_deducted', true ) ) {
+        if ( ! function_exists( 'dinoco_stock_add' ) ) return;
+
+        $order_text = get_field( 'order_items', $order_id ) ?: '';
+        if ( ! preg_match_all( '/\(([A-Za-z0-9_\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) return;
+
+        $relations = get_option( 'dinoco_sku_relations', array() );
+
+        foreach ( $matches as $m ) {
+            $sku = strtoupper( trim( $m[1] ) );
+            $qty = intval( $m[2] );
+            if ( $qty <= 0 ) continue;
+
+            if ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) {
+                foreach ( $relations[ $sku ] as $child_sku ) {
+                    dinoco_stock_add( $child_sku, $qty, 'b2b_cancel_return', 'b2b_order', $order_id );
+                }
+            } else {
+                dinoco_stock_add( $sku, $qty, 'b2b_cancel_return', 'b2b_order', $order_id );
+            }
+        }
+
+        delete_post_meta( $order_id, '_stock_deducted' );
+    }
+}
+}
+
+// ── Inventory: Auto-cancel 30 นาทีถ้าไม่ confirm ──
+add_action( 'dinoco_inv_auto_cancel', 'dinoco_inv_handle_auto_cancel' );
+if ( ! function_exists('dinoco_inv_handle_auto_cancel') ) {
+function dinoco_inv_handle_auto_cancel( $order_id ) {
+    $status = get_field( 'order_status', $order_id );
+    if ( $status !== 'awaiting_confirm' ) return; // ตัวแทน confirm ทันแล้ว — skip
+
+    // Guard: ไม่ cancel walk-in
+    if ( function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($order_id) ) return;
+
+    // ตรวจเวลาจริง (safety — ใช้ _awaiting_confirm_at ไม่ใช่ post_date)
+    $confirm_at = get_post_meta( $order_id, '_awaiting_confirm_at', true );
+    if ( $confirm_at && ( time() - strtotime( $confirm_at ) ) < 1740 ) return; // < 29 นาที → อาจเร็วเกินไป
+
+    // Auto-cancel
+    if ( function_exists('b2b_set_order_status') ) {
+        b2b_set_order_status( $order_id, 'cancelled' );
+    }
+    update_post_meta( $order_id, '_auto_cancelled', 1 );
+    update_post_meta( $order_id, '_cancel_reason', 'หมดเวลายืนยัน 30 นาที (auto-cancel)' );
+
+    if ( function_exists( 'b2b_log' ) ) {
+        b2b_log( sprintf( '[Stock] Auto-cancel order #%d — ไม่ confirm ภายใน 30 นาที', $order_id ) );
+    }
+
+    // ส่ง Flex แจ้งตัวแทน
+    $group_id = get_field( 'source_group_id', $order_id );
+    if ( $group_id && function_exists( 'b2b_line_push' ) ) {
+        $ticket_no = get_field( 'ticket_number', $order_id ) ?: '#' . $order_id;
+        b2b_line_push( $group_id, array( array(
+            'type' => 'text',
+            'text' => "⏰ หมดเวลายืนยัน\nOrder {$ticket_no} ถูกยกเลิกอัตโนมัติ\nสินค้าคืนสู่คลังแล้ว\n\nหากต้องการสั่งใหม่ กรุณาสั่งอีกครั้งครับ",
+        ) ) );
+    }
+}
+}
 
 // ── Walk-in: Auto-complete เมื่อจ่ายเงินแล้ว ──
 add_action('b2b_order_status_changed', 'b2b_walkin_auto_complete', 10, 4);

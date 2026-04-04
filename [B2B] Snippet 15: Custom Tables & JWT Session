@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.2.0 — Moto Catalog Tables                         ║
+ * ║  Version: V.3.0 — Inventory System (stock_qty + transactions)  ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -24,13 +24,15 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '1.0';
-    if ( get_option( '_dinoco_catalog_table_version' ) === $db_version ) return;
+    $db_version = '3.0';
+    $current = get_option( '_dinoco_catalog_table_version', '0' );
+    if ( version_compare( $current, $db_version, '>=' ) ) return;
 
     global $wpdb;
     $table = $wpdb->prefix . 'dinoco_products';
     $charset = $wpdb->get_charset_collate();
 
+    // dbDelta: full CREATE TABLE — จะ ADD COLUMN ที่ขาดอัตโนมัติ
     $sql = "CREATE TABLE IF NOT EXISTS {$table} (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         sku VARCHAR(50) NOT NULL,
@@ -50,18 +52,59 @@ add_action( 'init', function() {
         min_order_qty INT DEFAULT 1,
         oos_eta_date DATE DEFAULT NULL,
         is_active TINYINT(1) DEFAULT 1,
+        stock_qty INT UNSIGNED NOT NULL DEFAULT 0,
+        low_stock_threshold INT UNSIGNED NOT NULL DEFAULT 10,
+        reorder_point INT UNSIGNED NOT NULL DEFAULT 5,
+        last_dip_stock_date DATE DEFAULT NULL,
+        last_dip_stock_qty INT UNSIGNED DEFAULT NULL,
+        bo_eta_buffer_days TINYINT UNSIGNED NOT NULL DEFAULT 0,
+        bo_eta_override DATE DEFAULT NULL,
+        bo_note VARCHAR(255) DEFAULT NULL,
+        manual_hold TINYINT(1) NOT NULL DEFAULT 0,
+        manual_hold_reason VARCHAR(255) DEFAULT NULL,
+        manual_hold_by INT UNSIGNED DEFAULT NULL,
+        stock_updated_at DATETIME DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         UNIQUE KEY idx_sku (sku),
         KEY idx_category (category),
-        KEY idx_stock (stock_status, is_active)
+        KEY idx_active_stock (is_active, stock_status, stock_qty)
     ) {$charset};";
 
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta( $sql );
+
+    // Stock transactions table
+    $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+    $sql2 = "CREATE TABLE IF NOT EXISTS {$txn_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        sku VARCHAR(50) NOT NULL,
+        type VARCHAR(30) NOT NULL,
+        qty_change INT NOT NULL,
+        qty_before INT UNSIGNED NOT NULL DEFAULT 0,
+        qty_after INT UNSIGNED NOT NULL DEFAULT 0,
+        reference_type VARCHAR(30) DEFAULT NULL,
+        reference_id BIGINT UNSIGNED DEFAULT NULL,
+        reason VARCHAR(500) DEFAULT '',
+        user_id BIGINT UNSIGNED DEFAULT NULL,
+        batch_id VARCHAR(50) DEFAULT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_sku_created (sku, created_at),
+        KEY idx_created (created_at),
+        KEY idx_ref (reference_type, reference_id),
+        KEY idx_batch (batch_id)
+    ) {$charset};";
+    dbDelta( $sql2 );
+
+    // Set initialized flag = false (Admin ต้องทำ Dip Stock ก่อน)
+    if ( ! get_option( 'dinoco_inv_initialized' ) ) {
+        update_option( 'dinoco_inv_initialized', false );
+    }
+
     update_option( '_dinoco_catalog_table_version', $db_version );
-    b2b_log( '[DB] Created/updated dinoco_products table v' . $db_version );
+    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated dinoco_products + stock_transactions v' . $db_version );
 }, 5 );
 
 /**
@@ -164,6 +207,226 @@ class DINOCO_Catalog {
 
 // Auto-migrate on first load
 add_action( 'init', array( 'DINOCO_Catalog', 'migrate_from_options' ), 10 );
+
+// ════════════════════════════════════════════
+// PART 1B: STOCK CORE FUNCTIONS (V.3.0)
+// ════════════════════════════════════════════
+
+/**
+ * Atomic stock operations — FOR UPDATE lock per SKU
+ * Pattern เหมือน b2b_debt_add/subtract ที่พิสูจน์แล้ว
+ */
+
+if ( ! function_exists( 'dinoco_stock_add' ) ) {
+    /**
+     * เพิ่มสต็อก (B2F receive, manual add, cancel return)
+     */
+    function dinoco_stock_add( $sku, $qty, $type = 'manual_add', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '' ) {
+        if ( $qty <= 0 ) return new WP_Error( 'invalid_qty', 'จำนวนต้องมากกว่า 0' );
+
+        global $wpdb;
+        $table     = $wpdb->prefix . 'dinoco_products';
+        $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+        $sku       = strtoupper( trim( $sku ) );
+
+        $wpdb->query( 'START TRANSACTION' );
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, stock_qty FROM {$table} WHERE sku = %s FOR UPDATE", $sku
+        ) );
+
+        if ( ! $row ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[Stock] WARNING: SKU {$sku} not in catalog, skip add" );
+            return new WP_Error( 'sku_not_found', "SKU {$sku} ไม่อยู่ใน catalog" );
+        }
+
+        $old_qty = (int) $row->stock_qty;
+        $new_qty = $old_qty + (int) $qty;
+
+        $updated = $wpdb->update( $table, array(
+            'stock_qty'        => $new_qty,
+            'stock_updated_at' => current_time( 'mysql' ),
+        ), array( 'sku' => $sku ) );
+
+        $inserted = $wpdb->insert( $txn_table, array(
+            'sku'            => $sku,
+            'type'           => $type,
+            'qty_change'     => (int) $qty,
+            'qty_before'     => $old_qty,
+            'qty_after'      => $new_qty,
+            'reference_type' => $ref_type ?: null,
+            'reference_id'   => $ref_id ?: null,
+            'reason'         => $reason,
+            'user_id'        => get_current_user_id() ?: null,
+            'batch_id'       => $batch_id ?: null,
+        ) );
+
+        if ( $updated === false || $inserted === false ) {
+            $wpdb->query( 'ROLLBACK' );
+            return new WP_Error( 'db_error', 'Stock update failed' );
+        }
+
+        $wpdb->query( 'COMMIT' );
+
+        // Auto-update stock_status (outside transaction — ลด lock time)
+        dinoco_stock_auto_status( $sku );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf( '[Stock] ADD %s +%d (%d→%d) type=%s ref=%s:%d', $sku, $qty, $old_qty, $new_qty, $type, $ref_type, $ref_id ) );
+        }
+
+        return array( 'sku' => $sku, 'old_qty' => $old_qty, 'new_qty' => $new_qty );
+    }
+}
+
+if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
+    /**
+     * ลดสต็อก (B2B reserved, manual subtract)
+     */
+    function dinoco_stock_subtract( $sku, $qty, $type = 'manual_subtract', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '' ) {
+        if ( $qty <= 0 ) return new WP_Error( 'invalid_qty', 'จำนวนต้องมากกว่า 0' );
+
+        global $wpdb;
+        $table     = $wpdb->prefix . 'dinoco_products';
+        $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+        $sku       = strtoupper( trim( $sku ) );
+
+        $wpdb->query( 'START TRANSACTION' );
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, stock_qty FROM {$table} WHERE sku = %s FOR UPDATE", $sku
+        ) );
+
+        if ( ! $row ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[Stock] WARNING: SKU {$sku} not in catalog, skip subtract" );
+            return new WP_Error( 'sku_not_found', "SKU {$sku} ไม่อยู่ใน catalog" );
+        }
+
+        $old_qty = (int) $row->stock_qty;
+        $new_qty = max( 0, $old_qty - (int) $qty ); // cap at 0
+
+        if ( $old_qty < (int) $qty && function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf( '[Stock] WARNING: %s stock=%d < requested=%d, cap at 0', $sku, $old_qty, $qty ) );
+        }
+
+        $updated = $wpdb->update( $table, array(
+            'stock_qty'        => $new_qty,
+            'stock_updated_at' => current_time( 'mysql' ),
+        ), array( 'sku' => $sku ) );
+
+        $inserted = $wpdb->insert( $txn_table, array(
+            'sku'            => $sku,
+            'type'           => $type,
+            'qty_change'     => -1 * abs( (int) $qty ),
+            'qty_before'     => $old_qty,
+            'qty_after'      => $new_qty,
+            'reference_type' => $ref_type ?: null,
+            'reference_id'   => $ref_id ?: null,
+            'reason'         => $reason,
+            'user_id'        => get_current_user_id() ?: null,
+            'batch_id'       => $batch_id ?: null,
+        ) );
+
+        if ( $updated === false || $inserted === false ) {
+            $wpdb->query( 'ROLLBACK' );
+            return new WP_Error( 'db_error', 'Stock update failed' );
+        }
+
+        $wpdb->query( 'COMMIT' );
+
+        dinoco_stock_auto_status( $sku );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf( '[Stock] SUBTRACT %s -%d (%d→%d) type=%s ref=%s:%d', $sku, $qty, $old_qty, $new_qty, $type, $ref_type, $ref_id ) );
+        }
+
+        return array( 'sku' => $sku, 'old_qty' => $old_qty, 'new_qty' => $new_qty );
+    }
+}
+
+if ( ! function_exists( 'dinoco_stock_auto_status' ) ) {
+    /**
+     * Auto-update stock_status ตาม stock_qty + threshold + manual_hold
+     * เรียกหลัง add/subtract (outside transaction)
+     */
+    function dinoco_stock_auto_status( $sku ) {
+        // Guard: ยังไม่ initialized → skip (DD-3)
+        if ( ! get_option( 'dinoco_inv_initialized', false ) ) return;
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_products';
+
+        $product = $wpdb->get_row( $wpdb->prepare(
+            "SELECT stock_qty, low_stock_threshold, manual_hold FROM {$table} WHERE sku = %s", $sku
+        ) );
+        if ( ! $product ) return;
+
+        $qty       = (int) $product->stock_qty;
+        $threshold = (int) $product->low_stock_threshold;
+
+        if ( $qty <= 0 ) {
+            $new_status = 'out_of_stock';
+        } else {
+            $new_status = 'in_stock';
+        }
+
+        // manual_hold = 1 → force out_of_stock (Admin ล็อกเอง)
+        if ( (int) $product->manual_hold ) {
+            $new_status = 'out_of_stock';
+        }
+
+        $wpdb->update( $table, array(
+            'stock_status'     => $new_status,
+            'stock_updated_at' => current_time( 'mysql' ),
+        ), array( 'sku' => $sku ) );
+
+        // Dual-write: sync to b2b_product CPT postmeta (DD-1)
+        $b2b_post = get_posts( array(
+            'post_type'      => 'b2b_product',
+            'meta_query'     => array( array( 'key' => 'product_sku', 'value' => $sku ) ),
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+        ) );
+        if ( ! empty( $b2b_post ) ) {
+            update_field( 'stock_status', $new_status, $b2b_post[0] );
+        }
+
+        // Cache invalidation (DD-5)
+        delete_transient( 'b2b_sku_data_map' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_stock_get' ) ) {
+    /**
+     * ดึง stock info สำหรับ SKU (admin view)
+     */
+    function dinoco_stock_get( $sku ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_products';
+        $sku   = strtoupper( trim( $sku ) );
+        $row   = $wpdb->get_row( $wpdb->prepare(
+            "SELECT sku, name, stock_qty, stock_status, low_stock_threshold, reorder_point,
+                    manual_hold, manual_hold_reason, bo_eta_override, bo_eta_buffer_days, bo_note, stock_updated_at
+             FROM {$table} WHERE sku = %s", $sku
+        ), ARRAY_A );
+        if ( ! $row ) return null;
+
+        // Compute stock_display (ไม่เก็บ DB — API layer only)
+        $qty       = (int) $row['stock_qty'];
+        $threshold = (int) $row['low_stock_threshold'];
+        if ( (int) $row['manual_hold'] || $qty <= 0 ) {
+            $row['stock_display'] = 'out_of_stock';
+        } elseif ( $threshold > 0 && $qty <= $threshold ) {
+            $row['stock_display'] = 'low_stock';
+        } else {
+            $row['stock_display'] = 'in_stock';
+        }
+
+        return $row;
+    }
+}
 
 // ════════════════════════════════════════════
 // PART 2: JWT-LIKE SESSION TOKENS (HMAC-based)
