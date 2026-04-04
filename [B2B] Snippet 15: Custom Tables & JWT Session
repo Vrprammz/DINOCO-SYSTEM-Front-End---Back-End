@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.3.1 — Inventory Phase 2: Low Stock Alert cron  ║
+ * ║  Version: V.3.2 — Inventory Phase 3: Dip Stock tables+cron ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '3.0';
+    $db_version = '3.2';
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -98,13 +98,52 @@ add_action( 'init', function() {
     ) {$charset};";
     dbDelta( $sql2 );
 
+    // Dip Stock sessions table (Phase 3)
+    $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
+    $sql3 = "CREATE TABLE IF NOT EXISTS {$dip_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        session_date DATE NOT NULL,
+        status ENUM('in_progress','completed','expired') DEFAULT 'in_progress',
+        started_by BIGINT UNSIGNED DEFAULT NULL,
+        completed_at DATETIME DEFAULT NULL,
+        total_skus INT UNSIGNED DEFAULT 0,
+        counted_skus INT UNSIGNED DEFAULT 0,
+        adjusted_skus INT UNSIGNED DEFAULT 0,
+        notes TEXT DEFAULT NULL,
+        snapshot_at DATETIME DEFAULT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_status (status),
+        KEY idx_date (session_date)
+    ) {$charset};";
+    dbDelta( $sql3 );
+
+    // Dip Stock items table (Phase 3)
+    $dip_items_table = $wpdb->prefix . 'dinoco_dip_stock_items';
+    $sql4 = "CREATE TABLE IF NOT EXISTS {$dip_items_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        dip_stock_id BIGINT UNSIGNED NOT NULL,
+        sku VARCHAR(50) NOT NULL,
+        expected_qty INT UNSIGNED NOT NULL DEFAULT 0,
+        actual_qty INT UNSIGNED DEFAULT NULL,
+        variance INT DEFAULT NULL,
+        variance_pct DECIMAL(5,2) DEFAULT NULL,
+        adjusted TINYINT(1) DEFAULT 0,
+        note VARCHAR(500) DEFAULT '',
+        PRIMARY KEY (id),
+        UNIQUE KEY idx_session_sku (dip_stock_id, sku),
+        KEY idx_sku (sku)
+    ) {$charset};";
+    dbDelta( $sql4 );
+
     // Set initialized flag = false (Admin ต้องทำ Dip Stock ก่อน)
     if ( ! get_option( 'dinoco_inv_initialized' ) ) {
         update_option( 'dinoco_inv_initialized', false );
     }
 
     update_option( '_dinoco_catalog_table_version', $db_version );
-    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated dinoco_products + stock_transactions v' . $db_version );
+    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated dinoco_products + stock_transactions + dip_stock v' . $db_version );
 }, 5 );
 
 /**
@@ -511,6 +550,90 @@ if ( ! function_exists( 'dinoco_run_stock_low_alert' ) ) {
         set_transient( 'dinoco_stock_alert_sent_today', 1, 20 * HOUR_IN_SECONDS );
     }
 }
+
+// ════════════════════════════════════════════════════════════
+// PART 1.6: DIP STOCK CRONS (V.3.2 — Phase 3)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Cron 1: Reminder — ทุก 30 วันหลังนับครั้งล่าสุด → LINE push "ถึงรอบนับสต็อก"
+ * Cron 2: Expire — session in_progress > 48 ชม. → auto set expired
+ */
+add_action( 'init', function () {
+    if ( ! wp_next_scheduled( 'dinoco_dip_stock_reminder_cron' ) ) {
+        wp_schedule_event( time(), 'daily', 'dinoco_dip_stock_reminder_cron' );
+    }
+    if ( ! wp_next_scheduled( 'dinoco_dip_stock_expire_cron' ) ) {
+        wp_schedule_event( time(), 'twicedaily', 'dinoco_dip_stock_expire_cron' );
+    }
+} );
+
+// Cron 1: Reminder
+add_action( 'dinoco_dip_stock_reminder_cron', function () {
+    if ( ! get_option( 'dinoco_inv_initialized', false ) ) return;
+
+    $interval = (int) get_option( 'dinoco_stock_dip_interval', 30 );
+    if ( $interval <= 0 ) $interval = 30;
+
+    global $wpdb;
+    $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
+
+    // หา session สำเร็จครั้งล่าสุด
+    $last = $wpdb->get_var( "SELECT MAX(session_date) FROM {$dip_table} WHERE status = 'completed'" );
+
+    $should_remind = false;
+    if ( ! $last ) {
+        // ยังไม่เคยนับเลย → remind
+        $should_remind = true;
+    } else {
+        $days_ago = (int) ( ( time() - strtotime( $last ) ) / DAY_IN_SECONDS );
+        if ( $days_ago >= $interval ) {
+            $should_remind = true;
+        }
+    }
+
+    if ( ! $should_remind ) return;
+
+    // Guard ไม่ส่งซ้ำภายใน 24 ชม.
+    if ( get_transient( 'dinoco_dip_stock_reminder_sent' ) ) return;
+
+    $msg = "ถึงรอบนับสต็อก (Dip Stock)\n";
+    if ( $last ) {
+        $msg .= "นับล่าสุด: " . wp_date( 'd/m/Y', strtotime( $last ) ) . " (" . $days_ago . " วันที่แล้ว)\n";
+    } else {
+        $msg .= "ยังไม่เคยนับสต็อก\n";
+    }
+    $msg .= "กรุณาเข้าหน้า Inventory > นับสต็อก เพื่อเริ่มนับ";
+
+    if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_line_push' ) ) {
+        b2b_line_push( B2B_ADMIN_GROUP_ID, $msg );
+    }
+
+    set_transient( 'dinoco_dip_stock_reminder_sent', 1, 24 * HOUR_IN_SECONDS );
+} );
+
+// Cron 2: Expire stuck sessions (> 48 ชม.)
+add_action( 'dinoco_dip_stock_expire_cron', function () {
+    global $wpdb;
+    $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
+
+    $cutoff = gmdate( 'Y-m-d H:i:s', time() - ( 48 * HOUR_IN_SECONDS ) );
+
+    $expired = $wpdb->query( $wpdb->prepare(
+        "UPDATE {$dip_table} SET status = 'expired', updated_at = %s WHERE status = 'in_progress' AND created_at < %s",
+        current_time( 'mysql' ),
+        $cutoff
+    ) );
+
+    if ( $expired > 0 && function_exists( 'b2b_log' ) ) {
+        b2b_log( "[DipStock] Auto-expired {$expired} stuck sessions (>48h)" );
+
+        // แจ้ง Admin
+        if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_line_push' ) ) {
+            b2b_line_push( B2B_ADMIN_GROUP_ID, "Dip Stock: มี {$expired} session หมดอายุอัตโนมัติ (เกิน 48 ชม.)" );
+        }
+    }
+} );
 
 // ════════════════════════════════════════════
 // PART 2: JWT-LIKE SESSION TOKENS (HMAC-based)

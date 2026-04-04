@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.31.0
+ * Version: V.32.0
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -905,6 +905,386 @@ add_action('rest_api_init', function() {
         'permission_callback' => function() { return current_user_can('manage_options'); },
     ]);
 
+    // ═══════════════════════════════════════════════════════
+    // DIP STOCK REST API (V.32.0 — Phase 3)
+    // ═══════════════════════════════════════════════════════
+
+    // --- POST /dinoco-stock/v1/dip-stock/start ---
+    register_rest_route('dinoco-stock/v1', '/dip-stock/start', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $dip_table   = $wpdb->prefix . 'dinoco_dip_stock';
+            $items_table = $wpdb->prefix . 'dinoco_dip_stock_items';
+            $prod_table  = $wpdb->prefix . 'dinoco_products';
+
+            // ตรวจว่าไม่มี session ค้าง
+            $existing = $wpdb->get_row( "SELECT id FROM {$dip_table} WHERE status = 'in_progress' LIMIT 1" );
+            if ( $existing ) {
+                return new WP_REST_Response([
+                    'success'    => false,
+                    'message'    => 'มีการนับสต็อกค้างอยู่ กรุณาปิด session เดิมก่อน',
+                    'session_id' => (int) $existing->id,
+                ], 409);
+            }
+
+            $now = current_time( 'mysql' );
+
+            $wpdb->insert( $dip_table, [
+                'session_date' => current_time( 'Y-m-d' ),
+                'status'       => 'in_progress',
+                'started_by'   => get_current_user_id(),
+                'snapshot_at'  => $now,
+                'created_at'   => $now,
+            ] );
+            $session_id = $wpdb->insert_id;
+
+            if ( ! $session_id ) {
+                return rest_ensure_response([ 'success' => false, 'message' => 'สร้าง session ล้มเหลว' ]);
+            }
+
+            // Snapshot: ทุก active product → insert dip_stock_items
+            $products = $wpdb->get_results(
+                "SELECT sku, stock_qty FROM {$prod_table} WHERE is_active = 1 ORDER BY sku"
+            );
+            $total = 0;
+            foreach ( $products as $p ) {
+                $wpdb->insert( $items_table, [
+                    'dip_stock_id' => $session_id,
+                    'sku'          => $p->sku,
+                    'expected_qty' => (int) $p->stock_qty,
+                ] );
+                $total++;
+            }
+
+            $wpdb->update( $dip_table, [ 'total_skus' => $total ], [ 'id' => $session_id ] );
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[DipStock] Started session #{$session_id}, {$total} SKUs snapshot" );
+            }
+
+            return rest_ensure_response([
+                'success'    => true,
+                'session_id' => (int) $session_id,
+                'total_skus' => $total,
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- GET /dinoco-stock/v1/dip-stock/current ---
+    register_rest_route('dinoco-stock/v1', '/dip-stock/current', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $dip_table   = $wpdb->prefix . 'dinoco_dip_stock';
+            $items_table = $wpdb->prefix . 'dinoco_dip_stock_items';
+            $prod_table  = $wpdb->prefix . 'dinoco_products';
+
+            $session = $wpdb->get_row( "SELECT * FROM {$dip_table} WHERE status = 'in_progress' ORDER BY id DESC LIMIT 1", ARRAY_A );
+
+            if ( ! $session ) {
+                return rest_ensure_response([
+                    'success' => true,
+                    'active'  => false,
+                    'session' => null,
+                    'items'   => [],
+                ]);
+            }
+
+            $items = $wpdb->get_results( $wpdb->prepare(
+                "SELECT di.*, p.name, p.image_url
+                 FROM {$items_table} di
+                 LEFT JOIN {$prod_table} p ON di.sku = p.sku
+                 WHERE di.dip_stock_id = %d
+                 ORDER BY di.sku",
+                $session['id']
+            ), ARRAY_A );
+
+            // Recount counted_skus from actual data
+            $counted = 0;
+            foreach ( $items as &$item ) {
+                $item['expected_qty'] = (int) $item['expected_qty'];
+                $item['actual_qty']   = $item['actual_qty'] !== null ? (int) $item['actual_qty'] : null;
+                $item['variance']     = $item['variance'] !== null ? (int) $item['variance'] : null;
+                $item['variance_pct'] = $item['variance_pct'] !== null ? (float) $item['variance_pct'] : null;
+                $item['adjusted']     = (bool) $item['adjusted'];
+                if ( $item['actual_qty'] !== null ) $counted++;
+            }
+
+            $session['total_skus']   = (int) $session['total_skus'];
+            $session['counted_skus'] = $counted;
+            $session['adjusted_skus'] = (int) $session['adjusted_skus'];
+
+            return rest_ensure_response([
+                'success' => true,
+                'active'  => true,
+                'session' => $session,
+                'items'   => $items,
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- POST /dinoco-stock/v1/dip-stock/count ---
+    register_rest_route('dinoco-stock/v1', '/dip-stock/count', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $dip_table   = $wpdb->prefix . 'dinoco_dip_stock';
+            $items_table = $wpdb->prefix . 'dinoco_dip_stock_items';
+
+            $session_id = (int) $request->get_param('session_id');
+            $items      = $request->get_param('items');
+
+            if ( ! $session_id || ! is_array( $items ) || empty( $items ) ) {
+                return new WP_REST_Response([ 'success' => false, 'message' => 'ข้อมูลไม่ครบ' ], 400);
+            }
+
+            // Validate session
+            $session = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, status FROM {$dip_table} WHERE id = %d", $session_id
+            ) );
+            if ( ! $session || $session->status !== 'in_progress' ) {
+                return new WP_REST_Response([ 'success' => false, 'message' => 'Session ไม่ถูกต้องหรือปิดแล้ว' ], 400);
+            }
+
+            $updated_count = 0;
+            foreach ( $items as $item ) {
+                $sku       = strtoupper( trim( sanitize_text_field( $item['sku'] ?? '' ) ) );
+                $actual    = isset( $item['actual_qty'] ) ? max( 0, (int) $item['actual_qty'] ) : null;
+                $note      = sanitize_text_field( $item['note'] ?? '' );
+
+                if ( ! $sku || $actual === null ) continue;
+
+                // Get expected_qty for variance calc
+                $row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT id, expected_qty FROM {$items_table} WHERE dip_stock_id = %d AND sku = %s",
+                    $session_id, $sku
+                ) );
+                if ( ! $row ) continue;
+
+                $expected = (int) $row->expected_qty;
+                $variance = $actual - $expected;
+                $variance_pct = $expected > 0
+                    ? round( ( $variance / $expected ) * 100, 2 )
+                    : ( $actual > 0 ? 100.00 : 0.00 );
+
+                $wpdb->update( $items_table, [
+                    'actual_qty'   => $actual,
+                    'variance'     => $variance,
+                    'variance_pct' => $variance_pct,
+                    'note'         => $note,
+                ], [ 'id' => $row->id ] );
+
+                $updated_count++;
+            }
+
+            // Update session counted_skus
+            $counted = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$items_table} WHERE dip_stock_id = %d AND actual_qty IS NOT NULL",
+                $session_id
+            ) );
+            $total = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT total_skus FROM {$dip_table} WHERE id = %d", $session_id
+            ) );
+            $wpdb->update( $dip_table, [ 'counted_skus' => $counted ], [ 'id' => $session_id ] );
+
+            return rest_ensure_response([
+                'success'   => true,
+                'updated'   => $updated_count,
+                'counted'   => $counted,
+                'remaining' => $total - $counted,
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- POST /dinoco-stock/v1/dip-stock/approve ---
+    register_rest_route('dinoco-stock/v1', '/dip-stock/approve', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $dip_table   = $wpdb->prefix . 'dinoco_dip_stock';
+            $items_table = $wpdb->prefix . 'dinoco_dip_stock_items';
+            $prod_table  = $wpdb->prefix . 'dinoco_products';
+
+            $session_id = (int) $request->get_param('session_id');
+            $skus       = $request->get_param('skus');
+
+            if ( ! $session_id ) {
+                return new WP_REST_Response([ 'success' => false, 'message' => 'ไม่ได้ระบุ session_id' ], 400);
+            }
+
+            $session = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, status FROM {$dip_table} WHERE id = %d", $session_id
+            ) );
+            if ( ! $session || $session->status !== 'in_progress' ) {
+                return new WP_REST_Response([ 'success' => false, 'message' => 'Session ไม่ถูกต้อง' ], 400);
+            }
+
+            $batch_id = 'DIP-' . $session_id;
+
+            // ถ้า skus ว่าง = approve ทั้งหมดที่นับแล้ว+ยังไม่ adjusted
+            $where_sku = '';
+            if ( ! empty( $skus ) && is_array( $skus ) ) {
+                $placeholders = implode( ',', array_fill( 0, count( $skus ), '%s' ) );
+                $where_sku = $wpdb->prepare( " AND di.sku IN ({$placeholders})", ...$skus );
+            }
+
+            $items_to_approve = $wpdb->get_results( $wpdb->prepare(
+                "SELECT di.id, di.sku, di.expected_qty, di.actual_qty
+                 FROM {$items_table} di
+                 WHERE di.dip_stock_id = %d AND di.actual_qty IS NOT NULL AND di.adjusted = 0 {$where_sku}",
+                $session_id
+            ) );
+
+            $adjusted_count = 0;
+            foreach ( $items_to_approve as $item ) {
+                $expected = (int) $item->expected_qty;
+                $actual   = (int) $item->actual_qty;
+                $delta    = $actual - $expected;
+
+                if ( $delta !== 0 ) {
+                    // ใช้ stock_add/subtract ให้ได้ transaction log ถูกต้อง
+                    if ( $delta > 0 ) {
+                        if ( function_exists( 'dinoco_stock_add' ) ) {
+                            dinoco_stock_add( $item->sku, abs( $delta ), 'dip_stock_adjust', 'dip_stock', $session_id, 'Dip Stock adjust', $batch_id );
+                        }
+                    } else {
+                        if ( function_exists( 'dinoco_stock_subtract' ) ) {
+                            dinoco_stock_subtract( $item->sku, abs( $delta ), 'dip_stock_adjust', 'dip_stock', $session_id, 'Dip Stock adjust', $batch_id );
+                        }
+                    }
+                } elseif ( $delta === 0 ) {
+                    // ไม่ต้อง adjust — แค่ mark เป็น adjusted
+                }
+
+                // Update last_dip_stock_date + last_dip_stock_qty
+                $wpdb->update( $prod_table, [
+                    'last_dip_stock_date' => current_time( 'Y-m-d' ),
+                    'last_dip_stock_qty'  => $actual,
+                ], [ 'sku' => $item->sku ] );
+
+                // Mark adjusted
+                $wpdb->update( $items_table, [ 'adjusted' => 1 ], [ 'id' => $item->id ] );
+                $adjusted_count++;
+            }
+
+            // Update session
+            $total_adjusted = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$items_table} WHERE dip_stock_id = %d AND adjusted = 1",
+                $session_id
+            ) );
+            $total_items = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT total_skus FROM {$dip_table} WHERE id = %d", $session_id
+            ) );
+            $total_counted = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$items_table} WHERE dip_stock_id = %d AND actual_qty IS NOT NULL",
+                $session_id
+            ) );
+
+            $update_data = [ 'adjusted_skus' => $total_adjusted ];
+
+            // ถ้า approve ทั้งหมดแล้ว → completed
+            if ( $total_adjusted >= $total_counted ) {
+                $update_data['status']       = 'completed';
+                $update_data['completed_at'] = current_time( 'mysql' );
+            }
+
+            $wpdb->update( $dip_table, $update_data, [ 'id' => $session_id ] );
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[DipStock] Approved {$adjusted_count} SKUs for session #{$session_id}" );
+            }
+
+            return rest_ensure_response([
+                'success'        => true,
+                'adjusted_count' => $adjusted_count,
+                'completed'      => isset( $update_data['status'] ) && $update_data['status'] === 'completed',
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- POST /dinoco-stock/v1/dip-stock/force-close ---
+    register_rest_route('dinoco-stock/v1', '/dip-stock/force-close', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $dip_table  = $wpdb->prefix . 'dinoco_dip_stock';
+            $session_id = (int) $request->get_param('session_id');
+
+            if ( ! $session_id ) {
+                // Close any in_progress session
+                $session_id = (int) $wpdb->get_var( "SELECT id FROM {$dip_table} WHERE status = 'in_progress' ORDER BY id DESC LIMIT 1" );
+            }
+
+            if ( ! $session_id ) {
+                return rest_ensure_response([ 'success' => false, 'message' => 'ไม่มี session ที่เปิดอยู่' ]);
+            }
+
+            $wpdb->update( $dip_table, [
+                'status'     => 'expired',
+                'updated_at' => current_time( 'mysql' ),
+            ], [ 'id' => $session_id, 'status' => 'in_progress' ] );
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[DipStock] Force-closed session #{$session_id}" );
+            }
+
+            return rest_ensure_response([ 'success' => true ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
+    // --- GET /dinoco-stock/v1/dip-stock/history ---
+    register_rest_route('dinoco-stock/v1', '/dip-stock/history', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $request ) {
+            global $wpdb;
+            $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
+
+            $sessions = $wpdb->get_results(
+                "SELECT id, session_date, status, started_by, completed_at, total_skus, counted_skus, adjusted_skus, notes, created_at
+                 FROM {$dip_table}
+                 ORDER BY id DESC
+                 LIMIT 20",
+                ARRAY_A
+            );
+
+            foreach ( $sessions as &$s ) {
+                $s['id']            = (int) $s['id'];
+                $s['total_skus']    = (int) $s['total_skus'];
+                $s['counted_skus']  = (int) $s['counted_skus'];
+                $s['adjusted_skus'] = (int) $s['adjusted_skus'];
+
+                // Compute variance summary
+                $items_table = $wpdb->prefix . 'dinoco_dip_stock_items';
+                $variance_count = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$items_table} WHERE dip_stock_id = %d AND variance IS NOT NULL AND variance != 0",
+                    $s['id']
+                ) );
+                $s['variance_count'] = $variance_count;
+                $s['match_count']    = $s['counted_skus'] - $variance_count;
+
+                // User display name
+                if ( $s['started_by'] ) {
+                    $user = get_userdata( $s['started_by'] );
+                    $s['started_by_name'] = $user ? $user->display_name : 'User #' . $s['started_by'];
+                } else {
+                    $s['started_by_name'] = '-';
+                }
+            }
+
+            return rest_ensure_response([
+                'success'  => true,
+                'sessions' => $sessions,
+            ]);
+        },
+        'permission_callback' => function() { return current_user_can('manage_options'); },
+    ]);
+
 });
 
 // =========================================================================================
@@ -1120,6 +1500,35 @@ function dinoco_render_ui_v99() {
         .txn-item .txn-change { font-size: 1.1rem; font-weight: 800; }
         .txn-item .txn-reason { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
 
+        /* Dip Stock cards (V.32.0) */
+        .dip-card { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; transition: 0.2s; }
+        .dip-card:hover { border-color: #94a3b8; }
+        .dip-card.dip-counted { border-left: 4px solid #22c55e; }
+        .dip-card.dip-variance-pos { border-left: 4px solid #f59e0b; }
+        .dip-card.dip-variance-neg { border-left: 4px solid #ef4444; }
+        .dip-card.dip-match { border-left: 4px solid #22c55e; }
+        .dip-card .dip-sku { font-family: monospace; font-size: 0.75rem; color: #64748b; background: #f1f5f9; padding: 2px 8px; border-radius: 4px; display: inline-block; }
+        .dip-card .dip-name { font-weight: 700; color: #334155; font-size: 0.9rem; margin: 6px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .dip-card .dip-thumb { width: 48px; height: 48px; border-radius: 8px; border: 1px solid #e2e8f0; object-fit: contain; background: white; }
+        .dip-card .dip-input { width: 100px; padding: 8px 12px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 1rem; font-weight: 700; text-align: center; outline: none; transition: 0.2s; }
+        .dip-card .dip-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
+        .dip-card .dip-note-input { width: 100%; padding: 6px 10px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.8rem; outline: none; margin-top: 6px; }
+        .dip-card .dip-expected { font-size: 0.8rem; color: #94a3b8; }
+        .dip-card .dip-variance-badge { font-size: 0.75rem; font-weight: 700; padding: 2px 8px; border-radius: 12px; display: inline-block; }
+        .dip-vb-red { background: #fee2e2; color: #991b1b; }
+        .dip-vb-yellow { background: #fef3c7; color: #92400e; }
+        .dip-vb-green { background: #dcfce7; color: #166534; }
+
+        .dip-history-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f1f5f9; }
+        .dip-history-item:last-child { border-bottom: none; }
+        .dip-status-badge { font-size: 0.7rem; font-weight: 700; padding: 3px 10px; border-radius: 12px; }
+        .dip-st-completed { background: #dcfce7; color: #166534; }
+        .dip-st-expired { background: #fee2e2; color: #991b1b; }
+        .dip-st-in_progress { background: #dbeafe; color: #1e40af; }
+
+        .dip-report-card { background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; display: flex; align-items: center; gap: 14px; }
+        .dip-report-card .dip-rpt-checkbox { width: 20px; height: 20px; accent-color: #1e293b; cursor: pointer; }
+
         @media (max-width: 900px) {
             .stock-kpi-grid { grid-template-columns: repeat(2, 1fr); }
             .stock-kpi-grid > :last-child { grid-column: span 2; }
@@ -1158,6 +1567,7 @@ function dinoco_render_ui_v99() {
             <div class="main-tab" id="tab-catalog" onclick="switchMainTab('catalog')"><i class="fa-solid fa-book-open"></i> Product Catalog</div>
             <div class="main-tab" onclick="switchMainTab('generate')"><i class="fa-solid fa-industry"></i> Production (Gen SN)</div>
             <div class="main-tab" onclick="switchMainTab('stock')"><i class="fa-solid fa-warehouse"></i> Stock Management</div>
+            <div class="main-tab" onclick="switchMainTab('dipstock')"><i class="fa-solid fa-clipboard-check"></i> นับสต็อก (Dip Stock)</div>
         </div>
 
         <!-- 1. DASHBOARD -->
@@ -1337,6 +1747,85 @@ function dinoco_render_ui_v99() {
                 </div>
             </div>
         </div>
+
+        <!-- 6. DIP STOCK (V.32.0) -->
+        <div id="view-dipstock" class="view-section">
+            <div id="dip-no-session" style="display:none;">
+                <div class="content-box" style="text-align:center;padding:40px 20px;">
+                    <div style="font-size:3rem;color:#94a3b8;margin-bottom:16px;"><i class="fa-solid fa-clipboard-check"></i></div>
+                    <h3 style="font-size:1.2rem;font-weight:700;color:#334155;margin-bottom:8px;">นับสต็อก (Dip Stock)</h3>
+                    <div id="dip-last-info" style="font-size:0.85rem;color:#64748b;margin-bottom:20px;"></div>
+                    <button class="btn btn-primary" style="padding:14px 32px;font-size:1rem;border-radius:12px;background:#1e293b;color:white;border:none;cursor:pointer;font-weight:700;" onclick="DipStockManager.startSession()">
+                        <i class="fa-solid fa-play"></i> เริ่มนับสต็อก
+                    </button>
+                </div>
+                <div class="content-box" style="margin-top:20px;">
+                    <h4 style="font-weight:700;color:#334155;margin-bottom:14px;display:flex;align-items:center;gap:8px;"><i class="fa-solid fa-clock-rotate-left" style="color:#94a3b8;"></i> ประวัติการนับ</h4>
+                    <div id="dip-history-list"><div style="text-align:center;color:#94a3b8;padding:20px;">กำลังโหลด...</div></div>
+                </div>
+            </div>
+
+            <div id="dip-active-session" style="display:none;">
+                <div class="content-box" style="margin-bottom:16px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                        <div>
+                            <h3 style="font-weight:700;color:#334155;font-size:1.1rem;margin:0;">กำลังนับสต็อก</h3>
+                            <div style="font-size:0.8rem;color:#94a3b8;margin-top:2px;" id="dip-session-info"></div>
+                        </div>
+                        <div style="display:flex;gap:8px;">
+                            <button class="btn btn-primary btn-sm" onclick="DipStockManager.showReport()" style="background:#1e40af;border-color:#1e40af;"><i class="fa-solid fa-chart-bar"></i> ดูผลนับ</button>
+                            <button class="btn btn-outline btn-sm" onclick="DipStockManager.forceClose()" style="color:#ef4444;border-color:#fca5a5;"><i class="fa-solid fa-xmark"></i> Force Close</button>
+                        </div>
+                    </div>
+                    <!-- Progress Bar -->
+                    <div style="margin-top:14px;">
+                        <div style="display:flex;justify-content:space-between;font-size:0.75rem;font-weight:600;color:#64748b;margin-bottom:4px;">
+                            <span>Progress</span>
+                            <span id="dip-progress-text">0/0 SKU</span>
+                        </div>
+                        <div style="background:#e2e8f0;border-radius:20px;height:10px;overflow:hidden;">
+                            <div id="dip-progress-bar" style="background:linear-gradient(90deg,#22c55e,#16a34a);height:100%;border-radius:20px;transition:width 0.5s;width:0%;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Search + Filter -->
+                <div style="display:flex;gap:10px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">
+                    <input type="text" id="dip-search" class="stock-search-input" placeholder="ค้นหา SKU หรือ ชื่อสินค้า..." style="flex:1;min-width:200px;" oninput="DipStockManager.filterItems()">
+                    <div class="stock-filter-tabs" style="margin-bottom:0;flex-wrap:nowrap;">
+                        <span class="stock-filter-pill active" data-dip-filter="all" onclick="DipStockManager.setFilter('all')">ทั้งหมด</span>
+                        <span class="stock-filter-pill" data-dip-filter="uncounted" onclick="DipStockManager.setFilter('uncounted')">ยังไม่นับ</span>
+                        <span class="stock-filter-pill" data-dip-filter="counted" onclick="DipStockManager.setFilter('counted')">นับแล้ว</span>
+                        <span class="stock-filter-pill" data-dip-filter="variance" onclick="DipStockManager.setFilter('variance')">มีส่วนต่าง</span>
+                    </div>
+                </div>
+
+                <!-- Items List -->
+                <div id="dip-items-list" style="display:grid;gap:12px;"></div>
+            </div>
+
+            <!-- Variance Report (shown via DipStockManager.showReport) -->
+            <div id="dip-report" style="display:none;">
+                <div class="content-box" style="margin-bottom:16px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                        <div>
+                            <h3 style="font-weight:700;color:#334155;font-size:1.1rem;margin:0;"><i class="fa-solid fa-chart-bar" style="color:#3b82f6;"></i> ผลตรวจนับ</h3>
+                            <div style="font-size:0.8rem;color:#64748b;margin-top:4px;" id="dip-report-summary"></div>
+                        </div>
+                        <div style="display:flex;gap:8px;">
+                            <button class="btn btn-outline btn-sm" onclick="DipStockManager.backToCount()"><i class="fa-solid fa-arrow-left"></i> กลับ</button>
+                            <button class="btn btn-outline btn-sm" onclick="DipStockManager.exportDipCSV()"><i class="fa-solid fa-file-csv"></i> Export</button>
+                        </div>
+                    </div>
+                </div>
+                <div id="dip-report-items" style="display:grid;gap:10px;"></div>
+                <div style="margin-top:20px;text-align:center;" id="dip-approve-bar">
+                    <button class="btn btn-primary" style="padding:14px 40px;font-size:1rem;border-radius:12px;background:#1e293b;color:white;border:none;cursor:pointer;font-weight:700;" onclick="DipStockManager.approveSelected()">
+                        <i class="fa-solid fa-check-double"></i> ปรับสต็อกที่เลือก (<span id="dip-approve-count">0</span> รายการ)
+                    </button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Modals -->
@@ -1396,6 +1885,7 @@ function dinoco_render_ui_v99() {
             if(t==='catalog') { $('#view-catalog').show().addClass('active'); $('.main-tab:eq(2)').addClass('active'); loadCatalog(); }
             if(t==='generate') { $('#view-generate').show().addClass('active'); $('.main-tab:eq(3)').addClass('active'); if(Object.keys(catalogData).length===0) loadCatalogDataForSelect(); }
             if(t==='stock') { $('#view-stock').show().addClass('active'); $('.main-tab:eq(4)').addClass('active'); StockManager.loadStock(); }
+            if(t==='dipstock') { $('#view-dipstock').show().addClass('active'); $('.main-tab:eq(5)').addClass('active'); DipStockManager.checkSession(); }
         };
 
         window.goToInventory = function(filter) { switchMainTab('list'); $('#inv-filter').val(filter); executeGlobalSearch(); };
@@ -2370,6 +2860,451 @@ function dinoco_render_ui_v99() {
                         link.click();
                     }
                 });
+            }
+        };
+
+        /* =======================================================
+         * DipStockManager — Dip Stock Tab (V.32.0 — Phase 3)
+         * ======================================================= */
+        window.DipStockManager = {
+            _session: null,
+            _items: [],
+            _filter: 'all',
+
+            /* Check session and render appropriate state */
+            checkSession: function() {
+                const self = this;
+                $.ajax({
+                    url: STOCK_API + '/dip-stock/current',
+                    method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        if (res.active && res.session) {
+                            self._session = res.session;
+                            self._items = res.items || [];
+                            self.renderActive();
+                        } else {
+                            self._session = null;
+                            self._items = [];
+                            self.renderNoSession();
+                        }
+                    },
+                    error: function() {
+                        self.renderNoSession();
+                    }
+                });
+            },
+
+            /* Render: no active session */
+            renderNoSession: function() {
+                $('#dip-no-session').show();
+                $('#dip-active-session').hide();
+                $('#dip-report').hide();
+                this.loadHistory();
+
+                // Last dip stock info
+                $.ajax({
+                    url: STOCK_API + '/dip-stock/history',
+                    method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const sessions = res.sessions || [];
+                        const completed = sessions.filter(s => s.status === 'completed');
+                        let infoHtml = '';
+                        if (completed.length > 0) {
+                            const last = completed[0];
+                            const lastDate = new Date(last.session_date);
+                            const daysAgo = Math.floor((Date.now() - lastDate.getTime()) / 86400000);
+                            const interval = parseInt($('#stg-dip').val()) || 30;
+                            infoHtml = 'นับล่าสุด: ' + lastDate.toLocaleDateString('th-TH', {day:'2-digit',month:'short',year:'numeric'}) +
+                                ' (' + daysAgo + ' วันที่แล้ว) | ' + last.total_skus + ' SKU';
+                        } else {
+                            infoHtml = 'ยังไม่เคยนับสต็อก — กดเริ่มเพื่อตั้งค่าสต็อกเริ่มต้น';
+                        }
+                        $('#dip-last-info').html(infoHtml);
+                    }
+                });
+            },
+
+            /* Render: active session counting form */
+            renderActive: function() {
+                const self = this;
+                $('#dip-no-session').hide();
+                $('#dip-active-session').show();
+                $('#dip-report').hide();
+
+                const s = self._session;
+                const counted = self._items.filter(i => i.actual_qty !== null).length;
+                const total = self._items.length;
+                const pct = total > 0 ? Math.round((counted / total) * 100) : 0;
+
+                $('#dip-session-info').text('Session #' + s.id + ' | ' + s.session_date + ' | เริ่มเมื่อ ' + (s.created_at || ''));
+                $('#dip-progress-text').text(counted + '/' + total + ' SKU (' + pct + '%)');
+                $('#dip-progress-bar').css('width', pct + '%');
+
+                self.renderItems();
+            },
+
+            /* Render item cards */
+            renderItems: function() {
+                const self = this;
+                const search = ($('#dip-search').val() || '').toLowerCase();
+                let filtered = self._items;
+
+                if (search) {
+                    filtered = filtered.filter(i =>
+                        (i.sku || '').toLowerCase().includes(search) ||
+                        (i.name || '').toLowerCase().includes(search)
+                    );
+                }
+
+                if (self._filter === 'uncounted') {
+                    filtered = filtered.filter(i => i.actual_qty === null);
+                } else if (self._filter === 'counted') {
+                    filtered = filtered.filter(i => i.actual_qty !== null);
+                } else if (self._filter === 'variance') {
+                    filtered = filtered.filter(i => i.variance !== null && i.variance !== 0);
+                }
+
+                if (filtered.length === 0) {
+                    $('#dip-items-list').html('<div class="content-box" style="text-align:center;color:#94a3b8;padding:30px;">ไม่พบรายการ</div>');
+                    return;
+                }
+
+                let html = '';
+                filtered.forEach(function(item) {
+                    const isCounted = item.actual_qty !== null;
+                    const cls = isCounted ? 'dip-counted' : '';
+                    const imgHtml = item.image_url
+                        ? '<img src="'+item.image_url+'" class="dip-thumb" onerror="this.style.display=\'none\'">'
+                        : '';
+                    const curVal = isCounted ? item.actual_qty : '';
+                    const varianceHtml = isCounted && item.variance !== null && item.variance !== 0
+                        ? '<span class="dip-variance-badge ' + (Math.abs(item.variance_pct) > 5 ? 'dip-vb-red' : (Math.abs(item.variance_pct) > 0 ? 'dip-vb-yellow' : 'dip-vb-green')) + '">' + (item.variance > 0 ? '+' : '') + item.variance + ' (' + (item.variance > 0 ? '+' : '') + item.variance_pct + '%)</span>'
+                        : (isCounted ? '<span class="dip-variance-badge dip-vb-green">ตรง</span>' : '');
+
+                    html += '<div class="dip-card ' + cls + '">' +
+                        '<div style="display:flex;gap:12px;align-items:center;">' +
+                            imgHtml +
+                            '<div style="flex:1;min-width:0;">' +
+                                '<span class="dip-sku">' + item.sku + '</span>' +
+                                '<div class="dip-name" title="' + (item.name || '') + '">' + (item.name || item.sku) + '</div>' +
+                                '<div class="dip-expected">ระบบ: <b>' + item.expected_qty + '</b> ชิ้น ' + varianceHtml + '</div>' +
+                            '</div>' +
+                            '<div style="text-align:right;">' +
+                                '<input type="number" class="dip-input" data-sku="' + item.sku + '" placeholder="-" min="0" value="' + curVal + '" onchange="DipStockManager.countSingle(this)">' +
+                                '<div style="font-size:0.65rem;color:#94a3b8;margin-top:2px;">นับจริง</div>' +
+                            '</div>' +
+                        '</div>' +
+                        '<input type="text" class="dip-note-input" data-sku-note="' + item.sku + '" placeholder="หมายเหตุ (ไม่บังคับ)" value="' + (item.note || '') + '">' +
+                    '</div>';
+                });
+
+                $('#dip-items-list').html(html);
+            },
+
+            /* Filter items */
+            filterItems: function() { this.renderItems(); },
+
+            /* Set filter pill */
+            setFilter: function(f) {
+                this._filter = f;
+                $('[data-dip-filter]').removeClass('active');
+                $('[data-dip-filter="'+f+'"]').addClass('active');
+                this.renderItems();
+            },
+
+            /* Count single item */
+            countSingle: function(el) {
+                const self = this;
+                const sku = $(el).data('sku');
+                const actual = parseInt($(el).val());
+                const noteEl = $('[data-sku-note="'+sku+'"]');
+                const note = noteEl.val() || '';
+
+                if (isNaN(actual) || actual < 0) return;
+
+                $.ajax({
+                    url: STOCK_API + '/dip-stock/count',
+                    method: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({
+                        session_id: self._session.id,
+                        items: [{ sku: sku, actual_qty: actual, note: note }]
+                    }),
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        if (res.success) {
+                            // Update local item
+                            const item = self._items.find(i => i.sku === sku);
+                            if (item) {
+                                item.actual_qty = actual;
+                                item.variance = actual - item.expected_qty;
+                                item.variance_pct = item.expected_qty > 0
+                                    ? parseFloat(((item.variance / item.expected_qty) * 100).toFixed(2))
+                                    : (actual > 0 ? 100 : 0);
+                                item.note = note;
+                            }
+                            // Update progress
+                            const counted = self._items.filter(i => i.actual_qty !== null).length;
+                            const total = self._items.length;
+                            const pct = total > 0 ? Math.round((counted / total) * 100) : 0;
+                            $('#dip-progress-text').text(counted + '/' + total + ' SKU (' + pct + '%)');
+                            $('#dip-progress-bar').css('width', pct + '%');
+
+                            // Brief success indicator
+                            $(el).css('border-color', '#22c55e');
+                            setTimeout(function() { $(el).css('border-color', '#e2e8f0'); }, 800);
+                        }
+                    }
+                });
+            },
+
+            /* Start session */
+            startSession: function() {
+                const self = this;
+                Swal.fire({
+                    title: 'เริ่มนับสต็อก?',
+                    html: 'ระบบจะ snapshot สต็อกปัจจุบันทั้งหมด<br>แล้วเปิดฟอร์มให้กรอกจำนวนนับจริง',
+                    icon: 'question',
+                    showCancelButton: true,
+                    confirmButtonText: '<i class="fa-solid fa-play"></i> เริ่มนับ',
+                    cancelButtonText: 'ยกเลิก',
+                    confirmButtonColor: '#1e293b',
+                }).then(function(r) {
+                    if (!r.isConfirmed) return;
+                    Swal.fire({ title: 'กำลังสร้าง session...', didOpen: () => Swal.showLoading(), allowOutsideClick: false });
+                    $.ajax({
+                        url: STOCK_API + '/dip-stock/start',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({}),
+                        beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                        success: function(res) {
+                            if (res.success) {
+                                Swal.fire({ icon: 'success', title: 'เริ่มนับสต็อก', text: 'Snapshot ' + res.total_skus + ' SKU สำเร็จ', timer: 1500, showConfirmButton: false });
+                                setTimeout(function() { self.checkSession(); }, 1600);
+                            } else {
+                                Swal.fire('Error', res.message || 'ไม่สามารถเริ่ม session ได้', 'error');
+                            }
+                        },
+                        error: function(xhr) {
+                            const res = xhr.responseJSON || {};
+                            if (xhr.status === 409) {
+                                Swal.fire({
+                                    icon: 'warning',
+                                    title: 'มี session ค้างอยู่',
+                                    text: 'Session #' + (res.session_id || '') + ' ยังเปิดอยู่ กรุณาปิดก่อนหรือ Force Close',
+                                    confirmButtonColor: '#1e293b'
+                                });
+                            } else {
+                                Swal.fire('Error', res.message || 'เกิดข้อผิดพลาด', 'error');
+                            }
+                        }
+                    });
+                });
+            },
+
+            /* Show Variance Report */
+            showReport: function() {
+                const self = this;
+                $('#dip-active-session').hide();
+                $('#dip-report').show();
+
+                const counted = self._items.filter(i => i.actual_qty !== null);
+                const withVariance = counted.filter(i => i.variance !== null && i.variance !== 0);
+                const matched = counted.length - withVariance.length;
+
+                $('#dip-report-summary').html(
+                    'นับแล้ว: <b>' + counted.length + '/' + self._items.length + '</b> SKU | ' +
+                    'ตรง: <b style="color:#16a34a">' + matched + '</b> | ' +
+                    'ต่าง: <b style="color:#dc2626">' + withVariance.length + '</b>'
+                );
+
+                // Sort by abs variance_pct desc, then matched items
+                const sorted = [...counted].sort(function(a, b) {
+                    const aPct = Math.abs(a.variance_pct || 0);
+                    const bPct = Math.abs(b.variance_pct || 0);
+                    return bPct - aPct;
+                });
+
+                let html = '';
+                sorted.forEach(function(item) {
+                    const v = item.variance || 0;
+                    const vp = item.variance_pct || 0;
+                    let colorCls = 'dip-vb-green';
+                    let borderCls = 'dip-match';
+                    if (Math.abs(vp) > 5) { colorCls = 'dip-vb-red'; borderCls = 'dip-variance-neg'; }
+                    else if (Math.abs(vp) > 0) { colorCls = 'dip-vb-yellow'; borderCls = 'dip-variance-pos'; }
+
+                    const needsAdjust = v !== 0 && !item.adjusted;
+                    const checkboxHtml = needsAdjust
+                        ? '<input type="checkbox" class="dip-rpt-checkbox" data-approve-sku="'+item.sku+'" checked onchange="DipStockManager.updateApproveCount()">'
+                        : (item.adjusted ? '<i class="fa-solid fa-check-circle" style="color:#22c55e;font-size:1.2rem;" title="ปรับแล้ว"></i>' : '<i class="fa-solid fa-check" style="color:#22c55e;" title="ตรง"></i>');
+
+                    html += '<div class="dip-report-card ' + borderCls + '">' +
+                        checkboxHtml +
+                        '<div style="flex:1;min-width:0;">' +
+                            '<span class="dip-sku">' + item.sku + '</span>' +
+                            '<div style="font-weight:600;color:#334155;font-size:0.85rem;margin:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + (item.name || item.sku) + '</div>' +
+                            '<div style="font-size:0.8rem;color:#64748b;">' +
+                                'ระบบ: <b>' + item.expected_qty + '</b> | นับจริง: <b>' + item.actual_qty + '</b>' +
+                            '</div>' +
+                            (item.note ? '<div style="font-size:0.75rem;color:#94a3b8;margin-top:2px;"><i class="fa-solid fa-quote-left" style="font-size:8px;"></i> ' + item.note + '</div>' : '') +
+                        '</div>' +
+                        '<div style="text-align:right;">' +
+                            '<span class="dip-variance-badge ' + colorCls + '">' + (v > 0 ? '+' : '') + v + '</span>' +
+                            '<div style="font-size:0.7rem;color:#94a3b8;margin-top:2px;">' + (v !== 0 ? (vp > 0 ? '+' : '') + vp + '%' : 'ตรง') + '</div>' +
+                        '</div>' +
+                    '</div>';
+                });
+
+                $('#dip-report-items').html(html || '<div style="text-align:center;color:#94a3b8;padding:30px;">ยังไม่มีข้อมูลนับ</div>');
+                self.updateApproveCount();
+            },
+
+            /* Back to counting form */
+            backToCount: function() {
+                $('#dip-report').hide();
+                $('#dip-active-session').show();
+            },
+
+            /* Update approve count */
+            updateApproveCount: function() {
+                const count = $('[data-approve-sku]:checked').length;
+                $('#dip-approve-count').text(count);
+            },
+
+            /* Approve selected adjustments */
+            approveSelected: function() {
+                const self = this;
+                const checked = $('[data-approve-sku]:checked');
+                const skus = [];
+                checked.each(function() { skus.push($(this).data('approve-sku')); });
+
+                if (skus.length === 0) {
+                    Swal.fire('ไม่มีรายการ', 'กรุณาเลือกรายการที่ต้องการปรับสต็อก', 'info');
+                    return;
+                }
+
+                Swal.fire({
+                    title: 'ปรับสต็อก ' + skus.length + ' รายการ?',
+                    html: 'ระบบจะปรับ stock_qty ให้ตรงกับจำนวนนับจริง<br>และบันทึก transaction log',
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: '<i class="fa-solid fa-check-double"></i> ยืนยันปรับสต็อก',
+                    cancelButtonText: 'ยกเลิก',
+                    confirmButtonColor: '#1e293b',
+                }).then(function(r) {
+                    if (!r.isConfirmed) return;
+                    Swal.fire({ title: 'กำลังปรับสต็อก...', didOpen: () => Swal.showLoading(), allowOutsideClick: false });
+
+                    $.ajax({
+                        url: STOCK_API + '/dip-stock/approve',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({ session_id: self._session.id, skus: skus }),
+                        beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                        success: function(res) {
+                            if (res.success) {
+                                const msg = 'ปรับสต็อก ' + res.adjusted_count + ' รายการสำเร็จ';
+                                if (res.completed) {
+                                    Swal.fire({
+                                        icon: 'success',
+                                        title: 'นับสต็อกเสร็จสมบูรณ์',
+                                        text: msg,
+                                        confirmButtonColor: '#1e293b'
+                                    }).then(function() { self.checkSession(); });
+                                } else {
+                                    Swal.fire({ icon: 'success', title: msg, timer: 1500, showConfirmButton: false });
+                                    setTimeout(function() { self.checkSession(); }, 1600);
+                                }
+                            } else {
+                                Swal.fire('Error', res.message || 'ปรับสต็อกล้มเหลว', 'error');
+                            }
+                        },
+                        error: function() {
+                            Swal.fire('Error', 'เกิดข้อผิดพลาด', 'error');
+                        }
+                    });
+                });
+            },
+
+            /* Force close session */
+            forceClose: function() {
+                const self = this;
+                Swal.fire({
+                    title: 'Force Close?',
+                    text: 'ปิด session นับสต็อกนี้ (ข้อมูลนับจะยังอยู่แต่ไม่สามารถแก้ไขได้)',
+                    icon: 'warning',
+                    showCancelButton: true,
+                    confirmButtonText: 'Force Close',
+                    confirmButtonColor: '#ef4444',
+                    cancelButtonText: 'ยกเลิก',
+                }).then(function(r) {
+                    if (!r.isConfirmed) return;
+                    $.ajax({
+                        url: STOCK_API + '/dip-stock/force-close',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({ session_id: self._session ? self._session.id : 0 }),
+                        beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                        success: function() {
+                            Swal.fire({ icon: 'success', title: 'ปิด session สำเร็จ', timer: 1200, showConfirmButton: false });
+                            setTimeout(function() { self.checkSession(); }, 1300);
+                        }
+                    });
+                });
+            },
+
+            /* Load history */
+            loadHistory: function() {
+                $.ajax({
+                    url: STOCK_API + '/dip-stock/history',
+                    method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const sessions = res.sessions || [];
+                        if (sessions.length === 0) {
+                            $('#dip-history-list').html('<div style="text-align:center;color:#94a3b8;padding:20px;">ยังไม่มีประวัติ</div>');
+                            return;
+                        }
+                        let html = '';
+                        sessions.forEach(function(s) {
+                            const statusMap = { completed: 'dip-st-completed', expired: 'dip-st-expired', in_progress: 'dip-st-in_progress' };
+                            const statusLabel = { completed: 'สำเร็จ', expired: 'หมดอายุ', in_progress: 'กำลังนับ' };
+                            const d = new Date(s.session_date);
+                            const dateStr = d.toLocaleDateString('th-TH', {day:'2-digit',month:'short',year:'numeric'});
+                            html += '<div class="dip-history-item">' +
+                                '<div>' +
+                                    '<div style="font-weight:700;color:#334155;font-size:0.9rem;">DIP-' + s.id + ': ' + dateStr + '</div>' +
+                                    '<div style="font-size:0.75rem;color:#94a3b8;">' + s.total_skus + ' SKU | ตรง: ' + s.match_count + ' | ต่าง: ' + s.variance_count + ' | โดย: ' + s.started_by_name + '</div>' +
+                                '</div>' +
+                                '<span class="dip-status-badge ' + (statusMap[s.status]||'') + '">' + (statusLabel[s.status]||s.status) + '</span>' +
+                            '</div>';
+                        });
+                        $('#dip-history-list').html(html);
+                    }
+                });
+            },
+
+            /* Export Dip Stock CSV */
+            exportDipCSV: function() {
+                const self = this;
+                const counted = self._items.filter(i => i.actual_qty !== null);
+                if (counted.length === 0) {
+                    Swal.fire('No Data', 'ไม่มีข้อมูลนับ', 'info');
+                    return;
+                }
+                let csv = '\uFEFFSKU,ชื่อสินค้า,สต็อกระบบ,นับจริง,ส่วนต่าง,ส่วนต่าง(%),หมายเหตุ\n';
+                counted.forEach(function(i) {
+                    csv += '"' + i.sku + '","' + (i.name||'') + '",' + i.expected_qty + ',' + i.actual_qty + ',' + (i.variance||0) + ',' + (i.variance_pct||0) + ',"' + (i.note||'') + '"\n';
+                });
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = 'dip_stock_' + (self._session ? self._session.session_date : new Date().toISOString().slice(0,10)) + '.csv';
+                link.click();
             }
         };
 
