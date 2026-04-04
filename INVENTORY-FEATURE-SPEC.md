@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 2.1 | Date: 2026-04-04 | Author: Feature Architect + Fullstack Review
+Version: 2.2 | Date: 2026-04-04 | Author: Feature Architect + Fullstack Review
 
 ---
 
@@ -1370,6 +1370,62 @@ function dinoco_on_order_status_change($order_id, $new_status, $old_status) {
     update_post_meta($order_id, '_stock_deducted', 1);
 }
 ```
+
+---
+
+## 7.6 Performance Optimization
+
+### PO-1: Index เพิ่มตอน ALTER TABLE (Phase 1 — ฟรี)
+
+```sql
+ALTER TABLE wp_dinoco_products
+  ADD INDEX idx_stock_qty (stock_qty, stock_status, is_active),
+  ADD INDEX idx_sku_active (sku, is_active);
+```
+
+### PO-2: Single Aggregate Query แทน N+1 Loop
+
+```
+❌ เดิม: วน loop 200 SKU → get_field() ทีละตัว = 200 queries
+✅ ใหม่: SELECT sku, stock_qty, stock_status FROM dinoco_products WHERE is_active=1 = 1 query
+
+ใช้ใน: stock list, catalog, dashboard stats, dip stock
+```
+
+### PO-3: Transient Cache สำหรับ reserved_qty (Phase 4)
+
+```php
+// reserved_qty คำนวณหนัก (SUM จาก order_items) → cache 1 นาที
+function dinoco_get_reserved_qty($sku) {
+    $cache_key = 'dinoco_reserved_' . $sku;
+    $cached = get_transient($cache_key);
+    if ($cached !== false) return (int) $cached;
+    
+    // ... heavy SQL query ...
+    
+    set_transient($cache_key, $result, 60); // 1 min
+    return $result;
+}
+// Invalidate: เมื่อ order status เปลี่ยน → delete_transient()
+```
+
+### PO-4: Selective API Response
+
+```
+Catalog endpoint เพิ่ม ?fields= parameter:
+GET /b2b/v1/catalog-products?fields=sku,name,price,stock_display
+→ ส่งแค่ที่ frontend ต้องการ (ลด payload 70%)
+```
+
+### PO-5: Pagination สำหรับ Stock List
+
+```
+GET /dinoco-stock/v1/stock/list?page=1&per_page=50&status=low_stock
+→ ไม่โหลด 200+ SKU ทีเดียว
+→ ใช้ SQL LIMIT + OFFSET (index-backed)
+```
+
+> **Note**: Custom table (`dinoco_products`) เร็วกว่า postmeta มากอยู่แล้ว ไม่ต้อง Redis สำหรับ 200-300 SKU. PO-1 + PO-2 ทำ Phase 1 เลย, PO-3/4/5 ค่อยทำตอนที่ต้องใช้
 
 ---
 
