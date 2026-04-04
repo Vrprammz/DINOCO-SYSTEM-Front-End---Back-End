@@ -26,10 +26,12 @@ echo "║  Rounds: $ROUNDS | Gen: $GEN_COUNT | MaxRetry: $MAX_RETRY  ║"
 echo "╚════════════════════════════════════════════╝"
 
 for ROUND in $(seq 1 $ROUNDS); do
-  TESTS=$(tail -n +2 scripts/test-cases.csv | grep -c "." || echo 0)
+  TESTS=$(tail -n +2 scripts/test-cases.csv 2>/dev/null | grep -c "." 2>/dev/null || true)
+  TESTS=$(echo "$TESTS" | tr -d '[:space:]')
+  TESTS=${TESTS:-0}
 
   # ═══ ไม่มี test → Gemini สร้างใหม่ ═══
-  if [ "$TESTS" -eq 0 ]; then
+  if [ "$TESTS" -eq 0 ] || [ "$TESTS" = "0" ]; then
     echo ""
     echo "═══ Round $ROUND: ไม่มี test → สร้างคำถามใหม่ $GEN_COUNT ข้อ ═══"
 
