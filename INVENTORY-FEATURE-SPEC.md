@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 4.0 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead + DB Expert + Production Safety + Final Sign-off
+Version: 5.0 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead + DB Expert + Production Safety + Final Sign-off
 
 ---
 

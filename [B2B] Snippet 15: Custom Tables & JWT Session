@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.4.0 — Inventory Phase 4: Reserved Qty + Conflict ║
+ * ║  Version: V.5.0 — Phase 5: Multi-Warehouse + Valuation + Forecast ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '3.2';
+    $db_version = '5.0';
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -137,13 +137,76 @@ add_action( 'init', function() {
     ) {$charset};";
     dbDelta( $sql4 );
 
+    // Phase 5: Warehouses table
+    $wh_table = $wpdb->prefix . 'dinoco_warehouses';
+    $sql5 = "CREATE TABLE IF NOT EXISTS {$wh_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        name VARCHAR(100) NOT NULL,
+        code VARCHAR(20) NOT NULL,
+        address TEXT DEFAULT NULL,
+        is_default TINYINT(1) NOT NULL DEFAULT 0,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY idx_code (code)
+    ) {$charset};";
+    dbDelta( $sql5 );
+
+    // Phase 5: Warehouse stock table
+    $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
+    $sql6 = "CREATE TABLE IF NOT EXISTS {$whs_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        warehouse_id BIGINT UNSIGNED NOT NULL,
+        sku VARCHAR(50) NOT NULL,
+        stock_qty INT UNSIGNED NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY idx_wh_sku (warehouse_id, sku),
+        KEY idx_sku (sku)
+    ) {$charset};";
+    dbDelta( $sql6 );
+
+    // Phase 5: ALTER stock_transactions — add warehouse_id + unit_cost_thb
+    $col_check = $wpdb->get_results( "SHOW COLUMNS FROM {$txn_table} LIKE 'warehouse_id'" );
+    if ( empty( $col_check ) ) {
+        $wpdb->query( "ALTER TABLE {$txn_table} ADD COLUMN warehouse_id BIGINT UNSIGNED DEFAULT NULL AFTER batch_id" );
+        $wpdb->query( "ALTER TABLE {$txn_table} ADD KEY idx_warehouse (warehouse_id)" );
+    }
+    $col_check2 = $wpdb->get_results( "SHOW COLUMNS FROM {$txn_table} LIKE 'unit_cost_thb'" );
+    if ( empty( $col_check2 ) ) {
+        $wpdb->query( "ALTER TABLE {$txn_table} ADD COLUMN unit_cost_thb DECIMAL(12,2) DEFAULT NULL AFTER warehouse_id" );
+    }
+
+    // Phase 5 Migration: create default warehouse + copy stock
+    $default_wh = $wpdb->get_var( "SELECT id FROM {$wh_table} WHERE code = 'MAIN' LIMIT 1" );
+    if ( ! $default_wh ) {
+        $wpdb->insert( $wh_table, array(
+            'name'       => 'โกดังหลัก',
+            'code'       => 'MAIN',
+            'address'    => '',
+            'is_default' => 1,
+            'is_active'  => 1,
+            'created_at' => current_time( 'mysql' ),
+        ) );
+        $default_wh = $wpdb->insert_id;
+
+        // Copy stock_qty from dinoco_products to warehouse_stock
+        $wpdb->query( "INSERT INTO {$whs_table} (warehouse_id, sku, stock_qty, updated_at)
+            SELECT {$default_wh}, sku, stock_qty, NOW()
+            FROM {$table}
+            WHERE is_active = 1 AND stock_qty > 0
+            ON DUPLICATE KEY UPDATE stock_qty = VALUES(stock_qty)" );
+
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Phase 5: Created default warehouse MAIN (id=' . $default_wh . ') + migrated stock' );
+    }
+
     // Set initialized flag = false (Admin ต้องทำ Dip Stock ก่อน)
     if ( ! get_option( 'dinoco_inv_initialized' ) ) {
         update_option( 'dinoco_inv_initialized', false );
     }
 
     update_option( '_dinoco_catalog_table_version', $db_version );
-    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated dinoco_products + stock_transactions + dip_stock v' . $db_version );
+    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated tables v' . $db_version . ' (Phase 5: warehouse + valuation + forecast)' );
 }, 5 );
 
 /**
@@ -260,13 +323,19 @@ if ( ! function_exists( 'dinoco_stock_add' ) ) {
     /**
      * เพิ่มสต็อก (B2F receive, manual add, cancel return)
      */
-    function dinoco_stock_add( $sku, $qty, $type = 'manual_add', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '' ) {
+    function dinoco_stock_add( $sku, $qty, $type = 'manual_add', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '', $warehouse_id = null, $unit_cost_thb = null ) {
         if ( $qty <= 0 ) return new WP_Error( 'invalid_qty', 'จำนวนต้องมากกว่า 0' );
 
         global $wpdb;
         $table     = $wpdb->prefix . 'dinoco_products';
         $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+        $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
         $sku       = strtoupper( trim( $sku ) );
+
+        // Resolve warehouse (default if not specified)
+        if ( ! $warehouse_id && function_exists( 'dinoco_get_default_warehouse_id' ) ) {
+            $warehouse_id = dinoco_get_default_warehouse_id();
+        }
 
         $wpdb->query( 'START TRANSACTION' );
 
@@ -288,7 +357,7 @@ if ( ! function_exists( 'dinoco_stock_add' ) ) {
             'stock_updated_at' => current_time( 'mysql' ),
         ), array( 'sku' => $sku ) );
 
-        $inserted = $wpdb->insert( $txn_table, array(
+        $txn_data = array(
             'sku'            => $sku,
             'type'           => $type,
             'qty_change'     => (int) $qty,
@@ -299,7 +368,33 @@ if ( ! function_exists( 'dinoco_stock_add' ) ) {
             'reason'         => $reason,
             'user_id'        => get_current_user_id() ?: null,
             'batch_id'       => $batch_id ?: null,
-        ) );
+            'warehouse_id'   => $warehouse_id ?: null,
+            'unit_cost_thb'  => $unit_cost_thb !== null ? (float) $unit_cost_thb : null,
+        );
+        $inserted = $wpdb->insert( $txn_table, $txn_data );
+
+        // Phase 5: Update warehouse_stock (if table exists)
+        if ( $warehouse_id ) {
+            $whs_exists = $wpdb->get_var( "SHOW TABLES LIKE '{$whs_table}'" );
+            if ( $whs_exists ) {
+                $wh_row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT id, stock_qty FROM {$whs_table} WHERE warehouse_id = %d AND sku = %s FOR UPDATE",
+                    $warehouse_id, $sku
+                ) );
+                if ( $wh_row ) {
+                    $wpdb->update( $whs_table,
+                        array( 'stock_qty' => (int) $wh_row->stock_qty + (int) $qty ),
+                        array( 'id' => $wh_row->id )
+                    );
+                } else {
+                    $wpdb->insert( $whs_table, array(
+                        'warehouse_id' => $warehouse_id,
+                        'sku'          => $sku,
+                        'stock_qty'    => (int) $qty,
+                    ) );
+                }
+            }
+        }
 
         if ( $updated === false || $inserted === false ) {
             $wpdb->query( 'ROLLBACK' );
@@ -308,11 +403,11 @@ if ( ! function_exists( 'dinoco_stock_add' ) ) {
 
         $wpdb->query( 'COMMIT' );
 
-        // Auto-update stock_status (outside transaction — ลด lock time)
+        // Auto-update stock_status (outside transaction)
         dinoco_stock_auto_status( $sku );
 
         if ( function_exists( 'b2b_log' ) ) {
-            b2b_log( sprintf( '[Stock] ADD %s +%d (%d→%d) type=%s ref=%s:%d', $sku, $qty, $old_qty, $new_qty, $type, $ref_type, $ref_id ) );
+            b2b_log( sprintf( '[Stock] ADD %s +%d (%d->%d) type=%s ref=%s:%d wh=%s', $sku, $qty, $old_qty, $new_qty, $type, $ref_type, $ref_id, $warehouse_id ?: 'default' ) );
         }
 
         return array( 'sku' => $sku, 'old_qty' => $old_qty, 'new_qty' => $new_qty );
@@ -323,13 +418,19 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
     /**
      * ลดสต็อก (B2B reserved, manual subtract)
      */
-    function dinoco_stock_subtract( $sku, $qty, $type = 'manual_subtract', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '' ) {
+    function dinoco_stock_subtract( $sku, $qty, $type = 'manual_subtract', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '', $warehouse_id = null ) {
         if ( $qty <= 0 ) return new WP_Error( 'invalid_qty', 'จำนวนต้องมากกว่า 0' );
 
         global $wpdb;
         $table     = $wpdb->prefix . 'dinoco_products';
         $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+        $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
         $sku       = strtoupper( trim( $sku ) );
+
+        // Resolve warehouse
+        if ( ! $warehouse_id && function_exists( 'dinoco_get_default_warehouse_id' ) ) {
+            $warehouse_id = dinoco_get_default_warehouse_id();
+        }
 
         $wpdb->query( 'START TRANSACTION' );
 
@@ -344,7 +445,7 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
         }
 
         $old_qty = (int) $row->stock_qty;
-        $new_qty = max( 0, $old_qty - (int) $qty ); // cap at 0
+        $new_qty = max( 0, $old_qty - (int) $qty );
 
         if ( $old_qty < (int) $qty && function_exists( 'b2b_log' ) ) {
             b2b_log( sprintf( '[Stock] WARNING: %s stock=%d < requested=%d, cap at 0', $sku, $old_qty, $qty ) );
@@ -366,7 +467,23 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
             'reason'         => $reason,
             'user_id'        => get_current_user_id() ?: null,
             'batch_id'       => $batch_id ?: null,
+            'warehouse_id'   => $warehouse_id ?: null,
         ) );
+
+        // Phase 5: Update warehouse_stock
+        if ( $warehouse_id ) {
+            $whs_exists = $wpdb->get_var( "SHOW TABLES LIKE '{$whs_table}'" );
+            if ( $whs_exists ) {
+                $wh_row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT id, stock_qty FROM {$whs_table} WHERE warehouse_id = %d AND sku = %s FOR UPDATE",
+                    $warehouse_id, $sku
+                ) );
+                if ( $wh_row ) {
+                    $new_wh_qty = max( 0, (int) $wh_row->stock_qty - (int) $qty );
+                    $wpdb->update( $whs_table, array( 'stock_qty' => $new_wh_qty ), array( 'id' => $wh_row->id ) );
+                }
+            }
+        }
 
         if ( $updated === false || $inserted === false ) {
             $wpdb->query( 'ROLLBACK' );
@@ -377,13 +494,13 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
 
         dinoco_stock_auto_status( $sku );
 
-        // Phase 4: Stock conflict detection หลัง subtract
+        // Phase 4: Stock conflict detection
         if ( function_exists( 'dinoco_check_stock_conflict' ) ) {
             dinoco_check_stock_conflict( $sku );
         }
 
         if ( function_exists( 'b2b_log' ) ) {
-            b2b_log( sprintf( '[Stock] SUBTRACT %s -%d (%d→%d) type=%s ref=%s:%d', $sku, $qty, $old_qty, $new_qty, $type, $ref_type, $ref_id ) );
+            b2b_log( sprintf( '[Stock] SUBTRACT %s -%d (%d->%d) type=%s ref=%s:%d wh=%s', $sku, $qty, $old_qty, $new_qty, $type, $ref_type, $ref_id, $warehouse_id ?: 'default' ) );
         }
 
         return array( 'sku' => $sku, 'old_qty' => $old_qty, 'new_qty' => $new_qty );
@@ -669,6 +786,316 @@ if ( ! function_exists( 'dinoco_check_stock_conflict' ) ) {
         if ( function_exists( 'b2b_log' ) ) {
             b2b_log( sprintf( '[Stock] CONFLICT: %s stock=%d reserved=%d orders=%d', $sku, $stock_qty, $reserved_qty, $n ) );
         }
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+// PART 1.45: MULTI-WAREHOUSE CORE FUNCTIONS (V.5.0 — Phase 5)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Get default warehouse ID (the one with is_default=1)
+ * Cached per request via static variable.
+ */
+if ( ! function_exists( 'dinoco_get_default_warehouse_id' ) ) {
+    function dinoco_get_default_warehouse_id() {
+        static $cached_id = null;
+        if ( $cached_id !== null ) return $cached_id;
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_warehouses';
+
+        // Check if table exists (backward compat)
+        $exists = $wpdb->get_var( "SHOW TABLES LIKE '{$table}'" );
+        if ( ! $exists ) return null;
+
+        $id = $wpdb->get_var( "SELECT id FROM {$table} WHERE is_default = 1 AND is_active = 1 LIMIT 1" );
+        $cached_id = $id ? (int) $id : null;
+        return $cached_id;
+    }
+}
+
+/**
+ * Get total stock across all warehouses for a SKU
+ * Falls back to dinoco_products.stock_qty if warehouse table doesn't exist
+ */
+if ( ! function_exists( 'dinoco_get_total_stock' ) ) {
+    function dinoco_get_total_stock( $sku ) {
+        global $wpdb;
+        $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
+        $sku = strtoupper( trim( $sku ) );
+
+        $exists = $wpdb->get_var( "SHOW TABLES LIKE '{$whs_table}'" );
+        if ( ! $exists ) {
+            $table = $wpdb->prefix . 'dinoco_products';
+            return (int) $wpdb->get_var( $wpdb->prepare( "SELECT stock_qty FROM {$table} WHERE sku = %s", $sku ) );
+        }
+
+        return (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COALESCE(SUM(stock_qty), 0) FROM {$whs_table} WHERE sku = %s", $sku
+        ) );
+    }
+}
+
+/**
+ * Get stock for a specific warehouse + SKU
+ */
+if ( ! function_exists( 'dinoco_get_warehouse_stock' ) ) {
+    function dinoco_get_warehouse_stock( $sku, $warehouse_id ) {
+        global $wpdb;
+        $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
+        $sku = strtoupper( trim( $sku ) );
+
+        return (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COALESCE(stock_qty, 0) FROM {$whs_table} WHERE sku = %s AND warehouse_id = %d",
+            $sku, $warehouse_id
+        ) );
+    }
+}
+
+/**
+ * Transfer stock between warehouses (atomic)
+ */
+if ( ! function_exists( 'dinoco_transfer_stock' ) ) {
+    function dinoco_transfer_stock( $sku, $from_wh, $to_wh, $qty, $reason = '' ) {
+        if ( $qty <= 0 ) return new WP_Error( 'invalid_qty', 'จำนวนต้องมากกว่า 0' );
+        if ( $from_wh == $to_wh ) return new WP_Error( 'same_warehouse', 'คลังต้นทางและปลายทางเหมือนกัน' );
+
+        global $wpdb;
+        $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
+        $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+        $sku       = strtoupper( trim( $sku ) );
+        $batch_id  = 'TRF-' . wp_generate_uuid4();
+
+        $wpdb->query( 'START TRANSACTION' );
+
+        $source = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, stock_qty FROM {$whs_table} WHERE sku = %s AND warehouse_id = %d FOR UPDATE",
+            $sku, $from_wh
+        ) );
+
+        if ( ! $source || (int) $source->stock_qty < $qty ) {
+            $wpdb->query( 'ROLLBACK' );
+            $avail = $source ? (int) $source->stock_qty : 0;
+            return new WP_Error( 'insufficient_stock', "สต็อกไม่พอ (มี {$avail}, ต้องการ {$qty})" );
+        }
+
+        $old_src = (int) $source->stock_qty;
+        $new_src = $old_src - $qty;
+        $wpdb->update( $whs_table, array( 'stock_qty' => $new_src ), array( 'id' => $source->id ) );
+
+        $dest = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, stock_qty FROM {$whs_table} WHERE sku = %s AND warehouse_id = %d FOR UPDATE",
+            $sku, $to_wh
+        ) );
+
+        if ( $dest ) {
+            $old_dst = (int) $dest->stock_qty;
+            $new_dst = $old_dst + $qty;
+            $wpdb->update( $whs_table, array( 'stock_qty' => $new_dst ), array( 'id' => $dest->id ) );
+        } else {
+            $old_dst = 0;
+            $new_dst = $qty;
+            $wpdb->insert( $whs_table, array(
+                'warehouse_id' => $to_wh,
+                'sku'          => $sku,
+                'stock_qty'    => $new_dst,
+            ) );
+        }
+
+        $wpdb->insert( $txn_table, array(
+            'sku' => $sku, 'type' => 'transfer_out', 'qty_change' => -1 * abs( $qty ),
+            'qty_before' => $old_src, 'qty_after' => $new_src,
+            'reason' => $reason ?: 'โอนสต็อกระหว่างคลัง',
+            'user_id' => get_current_user_id() ?: null, 'batch_id' => $batch_id,
+            'warehouse_id' => $from_wh, 'created_at' => current_time( 'mysql' ),
+        ) );
+
+        $wpdb->insert( $txn_table, array(
+            'sku' => $sku, 'type' => 'transfer_in', 'qty_change' => abs( $qty ),
+            'qty_before' => $old_dst, 'qty_after' => $new_dst,
+            'reason' => $reason ?: 'โอนสต็อกระหว่างคลัง',
+            'user_id' => get_current_user_id() ?: null, 'batch_id' => $batch_id,
+            'warehouse_id' => $to_wh, 'created_at' => current_time( 'mysql' ),
+        ) );
+
+        $wpdb->query( 'COMMIT' );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf( '[Stock] TRANSFER %s qty=%d wh:%d->%d batch=%s', $sku, $qty, $from_wh, $to_wh, $batch_id ) );
+        }
+
+        return array( 'sku' => $sku, 'qty' => $qty, 'from_wh' => $from_wh, 'to_wh' => $to_wh, 'batch_id' => $batch_id );
+    }
+}
+
+/**
+ * Get all warehouses (active only by default)
+ */
+if ( ! function_exists( 'dinoco_get_warehouses' ) ) {
+    function dinoco_get_warehouses( $active_only = true ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_warehouses';
+
+        $exists = $wpdb->get_var( "SHOW TABLES LIKE '{$table}'" );
+        if ( ! $exists ) return array();
+
+        $where = $active_only ? 'WHERE is_active = 1' : '';
+        return $wpdb->get_results( "SELECT * FROM {$table} {$where} ORDER BY is_default DESC, name ASC", ARRAY_A ) ?: array();
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+// PART 1.46: INVENTORY VALUATION (V.5.0 — Phase 5 Task 5.4)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Get inventory valuation using Weighted Average Cost
+ * WAC = SUM(unit_cost_thb * qty_change) / SUM(qty_change) WHERE type=b2f_receive
+ */
+if ( ! function_exists( 'dinoco_get_inventory_valuation' ) ) {
+    function dinoco_get_inventory_valuation() {
+        global $wpdb;
+        $p_table   = $wpdb->prefix . 'dinoco_products';
+        $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+
+        $costs = $wpdb->get_results(
+            "SELECT sku,
+                    SUM(unit_cost_thb * qty_change) / SUM(qty_change) AS avg_cost,
+                    SUM(qty_change) AS total_received
+             FROM {$txn_table}
+             WHERE type = 'b2f_receive'
+               AND qty_change > 0
+               AND unit_cost_thb IS NOT NULL
+               AND unit_cost_thb > 0
+             GROUP BY sku",
+            OBJECT_K
+        );
+
+        $products = $wpdb->get_results(
+            "SELECT sku, name, stock_qty, image_url FROM {$p_table} WHERE is_active = 1 ORDER BY name ASC",
+            ARRAY_A
+        );
+
+        $result      = array();
+        $total_value = 0;
+        $costed      = 0;
+
+        foreach ( $products as $p ) {
+            $sku  = $p['sku'];
+            $qty  = (int) $p['stock_qty'];
+            $cost = isset( $costs[ $sku ] ) ? round( (float) $costs[ $sku ]->avg_cost, 2 ) : 0;
+            $val  = round( $cost * $qty, 2 );
+
+            if ( $cost > 0 ) $costed++;
+            $total_value += $val;
+
+            $result[] = array(
+                'sku'         => $sku,
+                'name'        => $p['name'],
+                'image_url'   => $p['image_url'],
+                'stock_qty'   => $qty,
+                'avg_cost'    => $cost,
+                'total_value' => $val,
+            );
+        }
+
+        return array(
+            'items'       => $result,
+            'total_value' => round( $total_value, 2 ),
+            'total_skus'  => count( $result ),
+            'costed_skus' => $costed,
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+// PART 1.47: STOCK FORECASTING (V.5.0 — Phase 5 Task 5.5)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Forecast stock for a single SKU
+ */
+if ( ! function_exists( 'dinoco_get_stock_forecast' ) ) {
+    function dinoco_get_stock_forecast( $sku, $days = 30 ) {
+        global $wpdb;
+        $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+        $p_table   = $wpdb->prefix . 'dinoco_products';
+        $sku       = strtoupper( trim( $sku ) );
+
+        $cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
+
+        $first_txn = $wpdb->get_var( $wpdb->prepare(
+            "SELECT MIN(created_at) FROM {$txn_table} WHERE sku = %s AND type IN ('b2b_reserved','b2b_shipped','manual_subtract')", $sku
+        ) );
+
+        $has_enough_data = false;
+        if ( $first_txn ) {
+            $data_days = (int) ( ( time() - strtotime( $first_txn ) ) / DAY_IN_SECONDS );
+            $has_enough_data = ( $data_days >= $days );
+        }
+
+        $total_out = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COALESCE(SUM(ABS(qty_change)), 0) FROM {$txn_table}
+             WHERE sku = %s AND type IN ('b2b_reserved','b2b_shipped','manual_subtract') AND created_at >= %s",
+            $sku, $cutoff
+        ) );
+
+        $avg_daily = $days > 0 ? round( $total_out / $days, 2 ) : 0;
+
+        $stock_qty = (int) $wpdb->get_var( $wpdb->prepare( "SELECT stock_qty FROM {$p_table} WHERE sku = %s", $sku ) );
+
+        $product = $wpdb->get_row( $wpdb->prepare(
+            "SELECT name, reorder_point, bo_eta_buffer_days FROM {$p_table} WHERE sku = %s", $sku
+        ) );
+
+        $lead_time_days = $product ? max( 1, (int) $product->bo_eta_buffer_days ) : 7;
+
+        $days_of_stock   = $avg_daily > 0 ? round( $stock_qty / $avg_daily, 1 ) : null;
+        $reorder_in_days = $days_of_stock !== null ? round( $days_of_stock - $lead_time_days, 1 ) : null;
+        $suggested_qty   = $avg_daily > 0 ? (int) ceil( $avg_daily * 30 ) : 0;
+
+        return array(
+            'sku'                 => $sku,
+            'name'                => $product ? $product->name : '',
+            'stock_qty'           => $stock_qty,
+            'avg_daily_usage'     => $avg_daily,
+            'days_of_stock'       => $days_of_stock,
+            'reorder_in_days'     => $reorder_in_days,
+            'lead_time_days'      => $lead_time_days,
+            'suggested_order_qty' => $suggested_qty,
+            'has_enough_data'     => $has_enough_data,
+            'period_days'         => $days,
+            'total_out'           => $total_out,
+        );
+    }
+}
+
+/**
+ * Forecast all active SKUs, sorted by days_of_stock ASC (most urgent first)
+ */
+if ( ! function_exists( 'dinoco_get_stock_forecast_all' ) ) {
+    function dinoco_get_stock_forecast_all( $days = 30, $limit = 50 ) {
+        global $wpdb;
+        $p_table = $wpdb->prefix . 'dinoco_products';
+
+        $skus = $wpdb->get_col( "SELECT sku FROM {$p_table} WHERE is_active = 1 AND stock_qty > 0 ORDER BY name ASC" );
+
+        $forecasts = array();
+        foreach ( $skus as $sku ) {
+            $f = dinoco_get_stock_forecast( $sku, $days );
+            if ( $f['avg_daily_usage'] > 0 ) {
+                $forecasts[] = $f;
+            }
+        }
+
+        usort( $forecasts, function( $a, $b ) {
+            $ad = $a['days_of_stock'] ?? PHP_INT_MAX;
+            $bd = $b['days_of_stock'] ?? PHP_INT_MAX;
+            return $ad <=> $bd;
+        } );
+
+        return array_slice( $forecasts, 0, $limit );
     }
 }
 
