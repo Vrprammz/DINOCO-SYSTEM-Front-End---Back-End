@@ -1,6 +1,6 @@
 # Feature Spec: Central Inventory System
 
-Version: 2.7 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead + DB Expert + Production Safety Review
+Version: 3.0 | Date: 2026-04-04 | Author: Feature Architect + Fullstack + Tech Lead + DB Expert + Production Safety + Final Sign-off
 
 ---
 
@@ -60,32 +60,39 @@ Error Paths:
 └── stock_qty overflow (>999999) → cap at 999999, alert admin
 ```
 
-### 2.2 Auto Stock Deduction (B2B Shipped)
+### 2.2 Auto Stock Deduction (B2B awaiting_confirm) — ดู DD-4 สำหรับรายละเอียด
 
 ```
-Trigger: Admin กด "จัดส่ง" (Flash หรือ Manual) → status = shipped
+Trigger: Admin ยืนยันว่ามีสินค้า → status = awaiting_confirm
+(ไม่ใช่ตอน shipped — ตัดตั้งแต่ยืนยันเพื่อ "จอง" ของไว้)
 
 Happy Path:
-1. B2B order transition to "shipped" (existing flow)
-2. [NEW] Hook: b2b_order_status_changed (shipped)
-   a. ดึง order_items
+1. Admin กดยืนยันสต็อก → status = awaiting_confirm
+2. [NEW] Hook: b2b_order_status_changed (priority 5)
+   a. Parse order_items (plain text) ด้วย regex
    b. สำหรับแต่ละ SKU:
-      - stock_qty -= qty_ordered
-      - ถ้า stock_qty < 0 → set เป็น 0 + log warning
-      - บันทึก stock_transaction (type=b2b_shipped)
+      - dinoco_stock_subtract(sku, qty, 'b2b_reserved')
+      - SKU Set → ตัด children ทุกตัว (validate ก่อน)
       - Auto-update stock_status ตาม threshold
-3. → ส่ง low stock alert ถ้าถึง threshold
+   c. Set meta '_stock_deducted' = 1 + '_awaiting_confirm_at' = now
+   d. Schedule auto-cancel 30 นาที (ถ้าไม่ใช่ walk-in)
+3. ตัวแทน confirm → ดำเนินต่อ (สต็อกตัดไปแล้ว)
+4. ตัวแทนไม่ confirm 30 นาที → auto cancel + คืนสต็อก
+5. → ส่ง low stock alert ถ้าถึง threshold
 
 Error Paths:
-├── stock_qty ไม่พอ (< order qty) → deduct ถึง 0, log warning, ไม่ block shipment
+├── stock_qty ไม่พอ (< order qty) → deduct ถึง 0, log warning, ไม่ block
 ├── SKU ไม่มีใน catalog → log warning, skip
-└── Walk-in order completed → ตัดสต็อกเหมือนกัน (hook on shipped OR completed for walk-in)
+├── Regex parse ไม่เจอ SKU → skip order, log warning
+└── Walk-in → ตัดสต็อกจุดเดียวกัน (ผ่าน awaiting_confirm เหมือนกัน)
 
 Edge Cases:
-├── B2B order cancelled หลัง shipped → ไม่คืนสต็อก (ของส่งไปแล้ว)
-├── Walk-in cancelled (admin cancel completed) → คืนสต็อก (type=b2b_cancel_return)
-├── SKU relations (parent/child set) → ตัดสต็อก children ทุกตัว (parent เป็นแค่ bundle ไม่เก็บ stock)
-└── order_items ไม่มี SKU (legacy data) → skip, log
+├── Cancel ทุกกรณี (ก่อน ship) → คืนสต็อก (ถ้า _stock_deducted = 1)
+├── Walk-in cancel (completed → cancelled) → คืนสต็อก
+├── Auto-cancel 30 นาที → คืนสต็อก + Flex แจ้งตัวแทน
+├── SKU relations (parent/child set) → ตัด children, validate ครบก่อน deduct
+├── order_items ไม่มี SKU (legacy data) → skip, log
+└── Flash Express → ผ่าน awaiting_confirm เหมือนกัน (ตัดสต็อกจุดเดียว)
 ```
 
 ### 2.3 Manual Stock Adjustment (Admin)
@@ -291,7 +298,8 @@ ALTER TABLE wp_dinoco_products
   ADD COLUMN bo_note VARCHAR(255) DEFAULT NULL AFTER bo_eta_override,
   ADD COLUMN manual_hold TINYINT(1) NOT NULL DEFAULT 0 AFTER bo_note,
   ADD COLUMN manual_hold_reason VARCHAR(255) DEFAULT NULL AFTER manual_hold,
-  ADD COLUMN manual_hold_by INT UNSIGNED DEFAULT NULL AFTER manual_hold_reason;
+  ADD COLUMN manual_hold_by INT UNSIGNED DEFAULT NULL AFTER manual_hold_reason,
+  ADD COLUMN stock_updated_at DATETIME DEFAULT NULL AFTER manual_hold_by;
 ```
 
 ### 3.2 NEW TABLE `dinoco_stock_transactions` (Transaction Log)
@@ -311,9 +319,10 @@ ALTER TABLE wp_dinoco_products
 | `created_at` | DATETIME DEFAULT CURRENT_TIMESTAMP | Timestamp |
 
 **Transaction types:**
-- `b2f_receive` -- รับของจาก B2F
-- `b2b_shipped` -- ตัดสต็อกเมื่อจัดส่ง B2B
-- `b2b_cancel_return` -- คืนสต็อกเมื่อยกเลิก walk-in
+- `b2f_receive` -- รับของจาก B2F (เพิ่มสต็อก)
+- `b2b_reserved` -- ตัดสต็อก (จอง) เมื่อ awaiting_confirm (DD-4)
+- `b2b_shipped` -- reserved for future use (ปัจจุบันใช้ `b2b_reserved` แทน)
+- `b2b_cancel_return` -- คืนสต็อกเมื่อยกเลิก order (ทุกกรณีที่เคยตัดไป)
 - `manual_add` -- Admin เพิ่มสต็อก manual
 - `manual_subtract` -- Admin ลดสต็อก manual
 - `dip_stock_adjust` -- ปรับจาก Dip Stock
@@ -429,9 +438,7 @@ CREATE TABLE IF NOT EXISTS wp_dinoco_dip_stock_items (
 
 ### 4.1 New REST Endpoints (namespace: `dinoco-inv/v1`)
 
-> **หมายเหตุ**: ใช้ namespace `dinoco-inv/v1` ที่มีอยู่แล้ว (Manual Invoice System) ย้ายมาเป็น inventory namespace ใหม่ หรือสร้าง `dinoco-stock/v1` แยก
-
-**แนะนำ: ใช้ namespace ใหม่ `dinoco-stock/v1`** เพื่อไม่ conflict กับ `dinoco-inv/v1` (Invoice)
+> **ตัดสินใจ**: ใช้ namespace ใหม่ **`dinoco-stock/v1`** (ไม่ใช้ `dinoco-inv/v1` ที่เป็น Invoice)
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
@@ -1094,7 +1101,7 @@ Task 1.3: B2F Receive → Auto Stock Add
 ├── ไฟล์: [B2F] Snippet 2
 └── เวลา: 0.5 วัน
 
-Task 1.4: B2B Shipped → Auto Stock Deduct
+Task 1.4: B2B awaiting_confirm → Auto Stock Deduct (DD-4) + Auto-cancel 30 นาที
 ├── Hook b2b_order_status_changed → stock deduction
 ├── Walk-in cancel → stock return
 ├── ไฟล์: [B2B] Snippet 2
@@ -1878,7 +1885,7 @@ function dinoco_stock_return_for_order( $order_id ) {
     $relations = get_option( 'dinoco_sku_relations', [] );
     
     foreach ( $matches as $m ) {
-        $sku = $m[1];
+        $sku = strtoupper( trim( $m[1] ) ); // normalize เหมือน deduct function
         $qty = intval( $m[2] );
         if ( $qty <= 0 ) continue;
         
