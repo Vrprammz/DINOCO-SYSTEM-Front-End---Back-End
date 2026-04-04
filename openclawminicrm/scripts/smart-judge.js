@@ -35,9 +35,9 @@ const API_URL = "http://localhost:3000";
 const API_KEY = process.env.API_SECRET_KEY || "dnc-api-2026-supersecret-changethis";
 const SOURCE_ID = "judge-" + Date.now();
 
-const CSV_PATH = "/tmp/test-cases-v4.csv";
-const RESULTS_PATH = "/tmp/judge-results.json";
-const SCORE_LOG_PATH = "/tmp/score-history.json";
+const CSV_PATH = "/app/scripts/test-cases-v4.csv";
+const RESULTS_PATH = "/app/scripts/judge-results.json";
+const SCORE_LOG_PATH = "/app/scripts/score-history.json";
 
 // ═══════════════════════════════════════
 // Args
@@ -400,8 +400,8 @@ ${failsSummary}
     });
 
     // Save analysis
-    fs.writeFileSync("/tmp/fail-analysis.json", JSON.stringify(analysis, null, 2));
-    console.log(`\nAnalysis saved: /tmp/fail-analysis.json`);
+    fs.writeFileSync("/app/scripts/fail-analysis.json", JSON.stringify(analysis, null, 2));
+    console.log(`\nAnalysis saved: /app/scripts/fail-analysis.json`);
 
     return analysis;
   } catch (e) {
@@ -414,7 +414,7 @@ ${failsSummary}
 // ═══════════════════════════════════════
 async function modeAutoFixKB() {
   let analysis;
-  try { analysis = JSON.parse(fs.readFileSync("/tmp/fail-analysis.json", "utf-8")); } catch {
+  try { analysis = JSON.parse(fs.readFileSync("/app/scripts/fail-analysis.json", "utf-8")); } catch {
     console.log("No analysis found. Run --analyze-fails first."); return;
   }
 

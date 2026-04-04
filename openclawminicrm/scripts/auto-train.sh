@@ -38,7 +38,8 @@ echo "=================================================="
 
 # ═══ Copy smart-judge.js เข้า Docker ═══
 copy_judge() {
-  docker cp scripts/smart-judge.js $AGENT:/tmp/smart-judge.js 2>/dev/null || true
+  docker exec $AGENT mkdir -p /app/scripts 2>/dev/null || true
+  docker cp scripts/smart-judge.js $AGENT:/app/scripts/smart-judge.js 2>/dev/null || true
 }
 
 # ═══ Legacy V3 mode (fallback) ═══
@@ -63,7 +64,7 @@ for ROUND in $(seq 1 $ROUNDS); do
   # --- Phase 1: Generate test cases ---
   echo ""
   echo "[Phase 1] Generating $GEN_COUNT test cases..."
-  docker exec $AGENT node /tmp/smart-judge.js --generate $GEN_COUNT 2>/dev/null > /tmp/gen-v4-output.txt || true
+  docker exec $AGENT node /app/scripts/smart-judge.js --generate $GEN_COUNT 2>/dev/null > /tmp/gen-v4-output.txt || true
   GEN_LINES=$(grep -c "Generated" /tmp/gen-v4-output.txt 2>/dev/null || echo "0")
   GEN_LINES=$(echo "$GEN_LINES" | tr -d '[:space:]')
   cat /tmp/gen-v4-output.txt
@@ -75,7 +76,7 @@ for ROUND in $(seq 1 $ROUNDS); do
   # --- Phase 2: Judge (Gemini ตัดสิน) ---
   echo ""
   echo "[Phase 2] Judging with Gemini..."
-  docker exec $AGENT node /tmp/smart-judge.js --judge 2>/dev/null > /tmp/judge-output.txt || true
+  docker exec $AGENT node /app/scripts/smart-judge.js --judge 2>/dev/null > /tmp/judge-output.txt || true
   cat /tmp/judge-output.txt
 
   # Parse score from output
@@ -101,14 +102,14 @@ for ROUND in $(seq 1 $ROUNDS); do
   # --- Phase 3: Analyze failures ---
   echo ""
   echo "[Phase 3] Analyzing ${FAIL} failures..."
-  docker exec $AGENT node /tmp/smart-judge.js --analyze-fails 2>/dev/null > /tmp/analyze-output.txt || true
+  docker exec $AGENT node /app/scripts/smart-judge.js --analyze-fails 2>/dev/null > /tmp/analyze-output.txt || true
   cat /tmp/analyze-output.txt
 
   # --- Phase 4: Auto-fix KB ---
   if [ "$AUTO_FIX" = true ]; then
     echo ""
     echo "[Phase 4] Auto-fixing KB..."
-    docker exec $AGENT node /tmp/smart-judge.js --auto-fix-kb 2>/dev/null > /tmp/fix-output.txt || true
+    docker exec $AGENT node /app/scripts/smart-judge.js --auto-fix-kb 2>/dev/null > /tmp/fix-output.txt || true
     cat /tmp/fix-output.txt
 
     # Count KB additions
@@ -135,9 +136,9 @@ done
 # ═══ Copy score history back ═══
 echo ""
 echo "=================================================="
-docker cp $AGENT:/tmp/score-history.json scripts/score-history.json 2>/dev/null || true
-docker cp $AGENT:/tmp/judge-results.json scripts/judge-results.json 2>/dev/null || true
-docker cp $AGENT:/tmp/fail-analysis.json scripts/fail-analysis.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/score-history.json scripts/score-history.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/judge-results.json scripts/judge-results.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/fail-analysis.json scripts/fail-analysis.json 2>/dev/null || true
 
 # ═══ Final Summary ═══
 GRAND_TOTAL=$((TOTAL_PASS + TOTAL_FAIL))
