@@ -407,22 +407,59 @@ def process_job(job, config, printer_mgr):
         logger.error(f'  Invoice print error #{tid}: {e}', exc_info=True)
         errors.append(f'Invoice: {e}')
 
-    # 2. Picking List FIRST — print before labels so staff can pick items
+    # 2. Picking List — คำนวณหน้าก่อนปริ้น (100×180mm per page)
     try:
         logger.info(f'  Rendering picking list #{tid}...')
         pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
-        pick_ctx = {**context,
-                    'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
-        pick_html = render_template(pick_tpl, pick_ctx)
-        # Thermal: use tall page to avoid page breaks (continuous feed)
-        # Estimate: header 30mm + ~15mm per item + totals 30mm + addr 25mm + QR 40mm
-        item_count = len(order.get('items', []))
-        children_count = sum(len(it.get('children', [])) for it in order.get('items', []))
-        pick_h = min(2000, max(180, 120 + (item_count + children_count) * 15))  # cap 2000mm ป้องกัน buffer ล้น
-        pick_pdf = html_to_pdf(pick_html, 100, pick_h)
-        printer_mgr.print_picking_list(pick_pdf, tid)
+
+        # คำนวณจำนวน rows ทั้งหมด (items + children)
+        all_items = order.get('items', [])
+        all_rows = []
+        for it in all_items:
+            all_rows.append(it)
+            for child in it.get('children', []):
+                all_rows.append({'name': child.get('name', child.get('sku', '')), 'sku': child.get('sku', ''), 'is_child': True})
+
+        # คำนวณหน้า: header 35mm + totals 25mm + addr 20mm + footer 8mm = ~88mm fixed
+        # แต่ละ row ~15mm, page height 180mm → rows per page = (180 - 88) / 15 ≈ 6 rows per page
+        FIXED_MM = 88
+        ROW_MM = 15
+        PAGE_H = 180
+        rows_per_page = max(1, int((PAGE_H - FIXED_MM) / ROW_MM))
+        total_pages = max(1, -(-len(all_rows) // rows_per_page))  # ceil division
+
+        logger.info(f'  Picking list #{tid}: {len(all_rows)} rows, {total_pages} pages ({rows_per_page} rows/page)')
+
+        # ปริ้นทีละหน้า
+        for page_idx in range(total_pages):
+            page_num = page_idx + 1
+            start = page_idx * rows_per_page
+            end = start + rows_per_page
+            page_items = all_rows[start:end]
+
+            # สร้าง context สำหรับหน้านี้
+            pick_ctx = {**context,
+                        'page_num': page_num,
+                        'total_pages': total_pages,
+                        'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
+
+            # หน้าแรก: แสดง header + items + totals (ถ้าหน้าเดียว)
+            # หน้าต่อไป: แสดง items ต่อ + totals (หน้าสุดท้าย)
+            if total_pages == 1:
+                # หน้าเดียว — ปริ้นปกติ
+                pick_html = render_template(pick_tpl, pick_ctx)
+                pick_h = min(2000, max(180, FIXED_MM + len(page_items) * ROW_MM + 10))
+            else:
+                # หลายหน้า — ปริ้นปกติ (template handle pagination ผ่าน page_num/total_pages)
+                pick_html = render_template(pick_tpl, pick_ctx)
+                pick_h = PAGE_H
+
+            pick_pdf = html_to_pdf(pick_html, 100, pick_h)
+            printer_mgr.print_picking_list(pick_pdf, tid)
+            os.unlink(pick_pdf)
+
         details['picking_list'] = True
-        os.unlink(pick_pdf)
+        details['picking_pages'] = total_pages
     except Exception as e:
         logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
         errors.append(f'PickingList: {e}')
