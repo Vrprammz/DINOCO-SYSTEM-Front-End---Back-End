@@ -133,12 +133,23 @@ for ROUND in $(seq 1 $ROUNDS); do
   fi
 done
 
-# ═══ Copy score history back ═══
+# ═══ Copy results + KB backup back ═══
 echo ""
 echo "=================================================="
 docker cp $AGENT:/app/scripts/score-history.json scripts/score-history.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/judge-results.json scripts/judge-results.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/fail-analysis.json scripts/fail-analysis.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/kb-auto-added.csv scripts/kb-auto-added.csv 2>/dev/null || true
+
+# ★ V4.2: Merge auto-added KB back to main CSV (กันหาย)
+if [ -f scripts/kb-auto-added.csv ]; then
+  echo ""
+  echo "  Merging auto-added KB back to main CSV..."
+  # Append ข้อใหม่ที่ไม่ซ้ำ
+  tail -n +2 scripts/kb-auto-added.csv >> "../dinoco_ai_logic_backup (2).csv" 2>/dev/null || true
+  KB_NEW=$(tail -n +2 scripts/kb-auto-added.csv 2>/dev/null | wc -l | tr -d ' ')
+  echo "  Merged $KB_NEW auto-added KB entries to backup CSV"
+fi
 
 # ═══ Final Summary ═══
 GRAND_TOTAL=$((TOTAL_PASS + TOTAL_FAIL))

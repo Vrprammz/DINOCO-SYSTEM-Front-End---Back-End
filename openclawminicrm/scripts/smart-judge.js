@@ -475,6 +475,25 @@ async function modeAutoFixKB() {
     }
   }
 
+  // ★ V4.2: Export KB entries ที่เพิ่มใหม่ กลับเข้า CSV backup (กันหาย)
+  if (added > 0 || updated > 0) {
+    try {
+      const allKB = await kbCollection.find({ source: "auto-train-v4" }).toArray();
+      const csvLines = allKB.map(k => {
+        const title = (k.title || "").replace(/"/g, "'");
+        const content = (k.content || "").replace(/"/g, "'").replace(/\n/g, " / ");
+        const tags = (k.tags || []).join(",");
+        return `"${title}","${content}","category: ${k.category || 'auto'} / tags: ${tags}"`;
+      });
+      if (csvLines.length > 0) {
+        const backupPath = "/app/scripts/kb-auto-added.csv";
+        const header = '"training_phrases","core_facts","ai_action"';
+        fs.writeFileSync(backupPath, header + "\n" + csvLines.join("\n") + "\n");
+        console.log(`  Backup: ${csvLines.length} auto-added entries -> ${backupPath}`);
+      }
+    } catch (e) { console.error("  Backup error:", e.message); }
+  }
+
   await client.close();
 
   console.log(`\nKB Auto-Fix Complete:`);
