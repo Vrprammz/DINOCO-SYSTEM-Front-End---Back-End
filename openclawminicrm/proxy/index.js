@@ -1182,6 +1182,38 @@ app.get("/api/kb-suggestions", requireAuth, async (req, res) => { const db = awa
 app.post("/api/kb-suggestions/:id/resolve", requireAuth, async (req, res) => { const { ObjectId } = require("mongodb"); const db = await getDB(); await db.collection("kb_suggestions").updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: "resolved", resolvedAt: new Date() } }); res.json({ ok: true }); });
 
 // === Memory / Skills / Audit ===
+
+// ★ V.1.5: Clear all memory + history for a sourceId (called by Dashboard "ล้างความจำ")
+app.post("/api/clear-memory/:sourceId", requireAuth, async (req, res) => {
+  const { sourceId } = req.params;
+  if (!sourceId) return res.status(400).json({ error: "sourceId required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const results = {};
+  try {
+    // 1. ลบ messages (conversation history)
+    results.messages = (await db.collection(MESSAGES_COLL).deleteMany({ sourceId })).deletedCount;
+    // 2. ลบ AI memory (compactSummary, personality, interests ฯลฯ)
+    results.ai_memory = (await db.collection(MEMORY_COLL).deleteMany({ sourceId })).deletedCount;
+    // 3. ลบ chat analytics
+    results.chat_analytics = (await db.collection("chat_analytics").deleteMany({ sourceId })).deletedCount;
+    // 4. ลบ skill lessons ของ sourceId นี้
+    results.skill_lessons = (await db.collection(SKILL_LESSONS_COLL).deleteMany({ sourceId })).deletedCount;
+    // 5. ลบ active claim sessions (manual_claims) — ไม่งั้น AI จะ resume claim flow เก่า
+    results.manual_claims = (await db.collection("manual_claims").deleteMany({ sourceId })).deletedCount;
+    // 6. ลบ leads ของ sourceId นี้
+    results.leads = (await db.collection("leads").deleteMany({ sourceId })).deletedCount;
+    // 7. Clear in-memory pendingAutoReply
+    const pending = pendingAutoReply.get(sourceId);
+    if (pending) { clearTimeout(pending.timer); pendingAutoReply.delete(sourceId); results.pendingAutoReply = true; }
+    console.log(`[ClearMemory] sourceId=${sourceId} deleted:`, results);
+    res.json({ ok: true, deleted: results });
+  } catch (err) {
+    console.error("[ClearMemory] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/memory/:sourceId", requireAuth, async (req, res) => { const db = await getDB(); const memory = await getMemory(req.params.sourceId); const lessons = await db.collection(SKILL_LESSONS_COLL).find({ sourceId: req.params.sourceId }).sort({ createdAt: -1 }).limit(10).toArray(); res.json({ memory: memory || {}, lessons, globalLessons: await getSkillLessons(10) }); });
 app.get("/api/skills/lessons", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection(SKILL_LESSONS_COLL).find({}).sort({ createdAt: -1 }).limit(50).toArray()); }); // ★ V.1.4: เพิ่ม requireAuth + null check
 app.get("/api/audit-logs", requireAuth, async (req, res) => { const db = await getDB(); res.json(await db.collection(AUDIT_LOG_COLL).find({}).sort({ createdAt: -1 }).limit(parseInt(req.query.limit || "100")).toArray()); });

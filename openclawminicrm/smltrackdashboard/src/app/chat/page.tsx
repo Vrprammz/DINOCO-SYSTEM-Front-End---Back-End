@@ -387,10 +387,16 @@ function ChatPanel({
         </div>
         <button
           onClick={async () => {
-            if (!confirm("ล้างประวัติแชท + ความจำ AI ของห้องนี้ ยืนยันไหม")) return;
+            if (!confirm("ล้างประวัติแชท + ความจำ AI + เคลม + leads ของห้องนี้ ยืนยันไหม?\n\nAI จะลืมทุกอย่างเกี่ยวกับห้องนี้")) return;
             try {
-              await fetch(`/dashboard/api/chat-list/${conv.id}/clear`, { method: "POST" });
+              const res = await fetch(`/dashboard/api/chat-list/${conv.id}/clear`, { method: "POST" });
+              const data = await res.json();
               setMessages([]);
+              setMemoryData(null);
+              if (data.ok) {
+                const d = data.deleted || {};
+                alert(`ล้างสำเร็จ: ${d.messages || 0} ข้อความ, ${d.ai_memory || 0} memory, ${d.manual_claims || 0} เคลม, ${d.leads || 0} leads`);
+              }
             } catch {}
           }}
           className="p-1 rounded hover:bg-yellow-900/40 text-yellow-400 hover:text-yellow-300 transition text-sm shrink-0"
