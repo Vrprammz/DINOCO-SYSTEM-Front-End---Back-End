@@ -1,8 +1,12 @@
 """
-DINOCO B2B — CUPS Printer Wrapper
+DINOCO B2B — CUPS Printer Wrapper V.2.0
 Handles printing PDFs to configured CUPS printers.
 For thermal label printers: converts PDF → image → TSPL or ESC/POS raster.
 XP-420B: sends TSPL via USB directly (pyusb) since usblp driver doesn't claim it.
+
+V.2.0 — Page break + auto-cut between Picking List and Labels
+  - TSPL: CUT command after each page (auto-cutter)
+  - ESC/POS: GS V 1 (partial cut) after each page instead of only at end
 """
 
 import cups
@@ -160,6 +164,8 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True):
                 data += row
 
             data += b'\r\nPRINT 1,1\r\n'
+            # Auto-cut after each page (supported by XP-420B and similar cutters)
+            data += b'CUT\r\n'
 
     return bytes(data)
 
@@ -212,9 +218,9 @@ def pdf_to_escpos(pdf_path, max_width=576):
                 data += row
 
             data += b'\n'
-
-        data += b'\n\n\n'
-        data += b'\x1d\x56\x01'  # GS V 1 — Partial cut
+            # Feed + partial cut after each page (separate each label/picking list)
+            data += b'\n\n\n'
+            data += b'\x1d\x56\x01'  # GS V 1 — Partial cut
 
     return bytes(data)
 

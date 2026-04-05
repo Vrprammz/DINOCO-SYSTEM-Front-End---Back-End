@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.2.0 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -11,6 +11,8 @@ Usage:
     python3 print_client.py --poll-only  # Force polling mode (no WebSocket)
 
 systemd runs this with --daemon flag.
+
+V.2.0 — Picking List prints FIRST (before labels), auto-cut between each page
 """
 
 import json
@@ -341,8 +343,8 @@ def process_job(job, config, printer_mgr):
     """
     Process a single print job:
     1. Render invoice → PDF → print on Printer 1 (A4)
-    2. Render shipping labels × N → PDF → print on Printer 2 (Label)
-    3. Render picking list → PDF → print on Printer 2
+    2. Render picking list → PDF → print on Printer 2 (Label) — FIRST so staff can pick
+    3. Render shipping labels × N (1 per box) → PDF → print on Printer 2 (Label) — auto-cut each
     4. POST ack back to WordPress
     """
     tid = job['ticket_id']
@@ -405,7 +407,27 @@ def process_job(job, config, printer_mgr):
         logger.error(f'  Invoice print error #{tid}: {e}', exc_info=True)
         errors.append(f'Invoice: {e}')
 
-    # 2. Shipping Labels — DINOCO template with Flash data when available
+    # 2. Picking List FIRST — print before labels so staff can pick items
+    try:
+        logger.info(f'  Rendering picking list #{tid}...')
+        pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
+        pick_ctx = {**context,
+                    'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
+        pick_html = render_template(pick_tpl, pick_ctx)
+        # Thermal: use tall page to avoid page breaks (continuous feed)
+        # Estimate: header 30mm + ~15mm per item + totals 30mm + addr 25mm + QR 40mm
+        item_count = len(order.get('items', []))
+        children_count = sum(len(it.get('children', [])) for it in order.get('items', []))
+        pick_h = max(180, 120 + (item_count + children_count) * 15)
+        pick_pdf = html_to_pdf(pick_html, 100, pick_h)
+        printer_mgr.print_picking_list(pick_pdf, tid)
+        details['picking_list'] = True
+        os.unlink(pick_pdf)
+    except Exception as e:
+        logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
+        errors.append(f'PickingList: {e}')
+
+    # 3. Shipping Labels — one label per box, each auto-cut separately
     try:
         flash_pnos = job.get('flash_label_pnos', [])
         flash_meta = job.get('flash_meta', {})
@@ -456,26 +478,6 @@ def process_job(job, config, printer_mgr):
     except Exception as e:
         logger.error(f'  Label print error #{tid}: {e}', exc_info=True)
         errors.append(f'Labels: {e}')
-
-    # 3. Picking List — separate print on thermal label printer
-    try:
-        logger.info(f'  Rendering picking list #{tid}...')
-        pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
-        pick_ctx = {**context,
-                    'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
-        pick_html = render_template(pick_tpl, pick_ctx)
-        # Thermal: use tall page to avoid page breaks (continuous feed)
-        # Estimate: header 30mm + ~15mm per item + totals 30mm + addr 25mm + QR 40mm
-        item_count = len(order.get('items', []))
-        children_count = sum(len(it.get('children', [])) for it in order.get('items', []))
-        pick_h = max(180, 120 + (item_count + children_count) * 15)
-        pick_pdf = html_to_pdf(pick_html, 100, pick_h)
-        printer_mgr.print_picking_list(pick_pdf, tid)
-        details['picking_list'] = True
-        os.unlink(pick_pdf)
-    except Exception as e:
-        logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
-        errors.append(f'PickingList: {e}')
 
     # Determine final status
     if not errors:
