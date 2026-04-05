@@ -656,6 +656,40 @@ if ( ! function_exists( 'dinoco_stock_auto_status' ) ) {
 
         // Cache invalidation (DD-5)
         delete_transient( 'b2b_sku_data_map' );
+
+        // SET parent update: ถ้า $sku เป็น child ของ SET → update parent status ด้วย
+        $relations = get_option( 'dinoco_sku_relations', [] );
+        foreach ( $relations as $parent_sku => $children ) {
+            if ( in_array( $sku, $children ) ) {
+                // คำนวณ parent stock = MIN(children)
+                $min_child = PHP_INT_MAX;
+                foreach ( $children as $c ) {
+                    $cq = $wpdb->get_var( $wpdb->prepare(
+                        "SELECT stock_qty FROM {$table} WHERE sku = %s AND is_active = 1", $c
+                    ) );
+                    $cq = $cq !== null ? (int) $cq : 0;
+                    if ( $cq < $min_child ) $min_child = $cq;
+                }
+                $parent_qty = $min_child === PHP_INT_MAX ? 0 : $min_child;
+                $parent_status = $parent_qty > 0 ? 'in_stock' : 'out_of_stock';
+
+                // Update parent stock_status
+                $wpdb->update( $table, array(
+                    'stock_status'     => $parent_status,
+                    'stock_updated_at' => current_time( 'mysql' ),
+                ), array( 'sku' => $parent_sku ) );
+
+                // Dual-write parent to ACF
+                $parent_b2b = get_posts( array(
+                    'post_type' => 'b2b_product',
+                    'meta_query' => array( array( 'key' => 'product_sku', 'value' => $parent_sku ) ),
+                    'posts_per_page' => 1, 'fields' => 'ids',
+                ) );
+                if ( ! empty( $parent_b2b ) ) {
+                    update_field( 'stock_status', $parent_status, $parent_b2b[0] );
+                }
+            }
+        }
     }
 }
 
@@ -673,6 +707,26 @@ if ( ! function_exists( 'dinoco_stock_get' ) ) {
              FROM {$table} WHERE sku = %s", $sku
         ), ARRAY_A );
         if ( ! $row ) return null;
+
+        // SET (แม่): stock = MIN(children stock) — ไม่ใช้ stock_qty ของตัวเอง
+        $relations = get_option( 'dinoco_sku_relations', [] );
+        $is_set = isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] );
+        $row['is_set'] = $is_set;
+
+        if ( $is_set ) {
+            $children = $relations[ $sku ];
+            $min_child_stock = PHP_INT_MAX;
+            foreach ( $children as $child_sku ) {
+                $child = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT stock_qty FROM {$table} WHERE sku = %s AND is_active = 1", $child_sku
+                ) );
+                $child_stock = $child !== null ? (int) $child : 0;
+                if ( $child_stock < $min_child_stock ) $min_child_stock = $child_stock;
+            }
+            if ( $min_child_stock === PHP_INT_MAX ) $min_child_stock = 0;
+            $row['stock_qty'] = $min_child_stock; // override กับค่าที่คำนวณ
+            $row['stock_qty_source'] = 'computed_from_children';
+        }
 
         // Phase 4: compute reserved_qty + available_qty
         $reserved = function_exists( 'dinoco_get_reserved_qty' ) ? dinoco_get_reserved_qty( $sku ) : 0;
@@ -1046,8 +1100,10 @@ if ( ! function_exists( 'dinoco_get_warehouses' ) ) {
 // ════════════════════════════════════════════════════════════
 
 /**
- * Get inventory valuation using Weighted Average Cost
- * WAC = SUM(unit_cost_thb * qty_change) / SUM(qty_change) WHERE type=b2f_receive
+ * Get inventory valuation — ดึงต้นทุนจากหลายแหล่ง:
+ * 1. WAC จาก B2F receive transactions (unit_cost_thb)
+ * 2. Fallback: B2F maker_product (mp_unit_cost × exchange_rate)
+ * 3. ถ้าไม่มีเลย → cost = 0
  */
 if ( ! function_exists( 'dinoco_get_inventory_valuation' ) ) {
     function dinoco_get_inventory_valuation() {
@@ -1055,18 +1111,48 @@ if ( ! function_exists( 'dinoco_get_inventory_valuation' ) ) {
         $p_table   = $wpdb->prefix . 'dinoco_products';
         $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
 
-        $costs = $wpdb->get_results(
-            "SELECT sku,
-                    SUM(unit_cost_thb * qty_change) / SUM(qty_change) AS avg_cost,
-                    SUM(qty_change) AS total_received
-             FROM {$txn_table}
-             WHERE type = 'b2f_receive'
-               AND qty_change > 0
-               AND unit_cost_thb IS NOT NULL
-               AND unit_cost_thb > 0
-             GROUP BY sku",
-            OBJECT_K
-        );
+        // Source 1: WAC จาก B2F receive transactions
+        $txn_exists = (bool) $wpdb->get_var( "SHOW TABLES LIKE '{$txn_table}'" );
+        $costs = array();
+        if ( $txn_exists ) {
+            $has_cost_col = (bool) $wpdb->get_var( "SHOW COLUMNS FROM {$txn_table} LIKE 'unit_cost_thb'" );
+            if ( $has_cost_col ) {
+                $costs = $wpdb->get_results(
+                    "SELECT sku,
+                            SUM(unit_cost_thb * qty_change) / NULLIF(SUM(qty_change), 0) AS avg_cost,
+                            SUM(qty_change) AS total_received
+                     FROM {$txn_table}
+                     WHERE type = 'b2f_receive'
+                       AND qty_change > 0
+                       AND unit_cost_thb IS NOT NULL
+                       AND unit_cost_thb > 0
+                     GROUP BY sku",
+                    OBJECT_K
+                ) ?: array();
+            }
+        }
+
+        // Source 2: Fallback — B2F maker_product (mp_unit_cost) ล่าสุด per SKU
+        $b2f_costs = array();
+        $mp_posts = get_posts(array(
+            'post_type' => 'b2f_maker_product',
+            'posts_per_page' => -1,
+            'post_status' => 'publish',
+            'fields' => 'ids',
+        ));
+        foreach ( $mp_posts as $mp_id ) {
+            $mp_sku  = get_field( 'mp_product_sku', $mp_id );
+            $mp_cost = floatval( get_field( 'mp_unit_cost', $mp_id ) ?: 0 );
+            if ( $mp_sku && $mp_cost > 0 ) {
+                // ถ้ามีหลาย maker → ใช้ราคาต่ำสุด (conservative)
+                if ( ! isset( $b2f_costs[ $mp_sku ] ) || $mp_cost < $b2f_costs[ $mp_sku ] ) {
+                    $b2f_costs[ $mp_sku ] = $mp_cost;
+                }
+            }
+        }
+
+        // SET (แม่) relations
+        $relations = get_option( 'dinoco_sku_relations', [] );
 
         $products = $wpdb->get_results(
             "SELECT sku, name, stock_qty, image_url FROM {$p_table} WHERE is_active = 1 ORDER BY name ASC",
@@ -1079,9 +1165,32 @@ if ( ! function_exists( 'dinoco_get_inventory_valuation' ) ) {
 
         foreach ( $products as $p ) {
             $sku  = $p['sku'];
-            $qty  = (int) $p['stock_qty'];
-            $cost = isset( $costs[ $sku ] ) ? round( (float) $costs[ $sku ]->avg_cost, 2 ) : 0;
-            $val  = round( $cost * $qty, 2 );
+            $is_set = isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] );
+
+            // SET (แม่): stock = MIN(children) — ไม่นับ stock ของตัวเอง
+            if ( $is_set ) {
+                $min_child = PHP_INT_MAX;
+                foreach ( $relations[ $sku ] as $c ) {
+                    $cq = $wpdb->get_var( $wpdb->prepare( "SELECT stock_qty FROM {$p_table} WHERE sku = %s AND is_active = 1", $c ) );
+                    $cq = $cq !== null ? (int) $cq : 0;
+                    if ( $cq < $min_child ) $min_child = $cq;
+                }
+                $qty = $min_child === PHP_INT_MAX ? 0 : $min_child;
+            } else {
+                $qty = (int) $p['stock_qty'];
+            }
+
+            // ต้นทุน: WAC > B2F maker_product > 0
+            $cost = 0;
+            $cost_source = 'none';
+            if ( isset( $costs[ $sku ] ) && (float) $costs[ $sku ]->avg_cost > 0 ) {
+                $cost = round( (float) $costs[ $sku ]->avg_cost, 2 );
+                $cost_source = 'wac';
+            } elseif ( isset( $b2f_costs[ $sku ] ) ) {
+                $cost = round( $b2f_costs[ $sku ], 2 );
+                $cost_source = 'b2f_maker';
+            }
+            $val = round( $cost * $qty, 2 );
 
             if ( $cost > 0 ) $costed++;
             $total_value += $val;
@@ -1089,10 +1198,12 @@ if ( ! function_exists( 'dinoco_get_inventory_valuation' ) ) {
             $result[] = array(
                 'sku'         => $sku,
                 'name'        => $p['name'],
-                'image_url'   => $p['image_url'],
+                'image_url'   => $p['image_url'] ?? '',
                 'stock_qty'   => $qty,
                 'avg_cost'    => $cost,
+                'cost_source' => $cost_source,
                 'total_value' => $val,
+                'is_set'      => $is_set,
             );
         }
 
