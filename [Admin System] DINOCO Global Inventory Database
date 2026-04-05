@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.38.4 — pricing อ่านจาก ct_map (custom table) แทน ACF ทั้งหมด
+ * Version: V.38.5 — dinoco_get_current_catalog() อ่าน custom table ก่อน + dual-write ct→wp_options + ลด ACF fallback
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -70,13 +70,9 @@ add_action('init', function() {
                 $catalog = dinoco_get_current_catalog();
                 $relations = dinoco_get_current_sku_relations();
 
-                // V.38.4: B2B pricing — read from ct_map (custom table) first, fallback ACF
-                $b2b_posts = get_posts(['post_type' => 'b2b_product', 'posts_per_page' => -1, 'post_status' => 'publish']);
-                $b2b_map = [];
-                foreach ($b2b_posts as $bp) {
-                    $bsku = get_field('product_sku', $bp->ID);
-                    if ($bsku) $b2b_map[$bsku] = $bp->ID;
-                }
+                // V.38.5: B2B pricing — ct_map is source of truth, ACF fallback only when sku missing from ct_map
+                // Lazy-load b2b_map only if needed (when ct_map doesn't cover all SKUs)
+                $b2b_map = null; // deferred
 
                 // Batch load b2b_visible + category จาก custom table (1 query แทน N)
                 $ct_map = [];
@@ -117,8 +113,7 @@ add_action('init', function() {
                     $item['is_set'] = isset($relations[$sku]);
                     $item['child_count'] = isset($relations[$sku]) ? count($relations[$sku]) : 0;
                     $item['children'] = isset($relations[$sku]) ? $relations[$sku] : [];
-                    // V.38.4: B2B pricing — read from ct_map (custom table) first → fallback ACF
-                    $bpid = isset($b2b_map[$sku]) ? $b2b_map[$sku] : 0;
+                    // V.38.5: B2B pricing — ct_map first, lazy-load ACF fallback only when needed
                     if (isset($ct_map[$sku])) {
                         $ct = $ct_map[$sku];
                         $item['b2b_discount'] = floatval($ct['b2b_discount_percent'] ?? 0);
@@ -132,7 +127,16 @@ add_action('init', function() {
                         $item['oos_timestamp'] = intval($ct['oos_timestamp'] ?? 0);
                         $item['oos_duration_hours'] = intval($ct['oos_duration_hours'] ?? 0);
                     } else {
-                        // Fallback ACF
+                        // Lazy-load b2b_map once (only when ACF fallback needed)
+                        if ($b2b_map === null) {
+                            $b2b_map = [];
+                            $b2b_posts = get_posts(['post_type' => 'b2b_product', 'posts_per_page' => -1, 'post_status' => 'publish']);
+                            foreach ($b2b_posts as $bp) {
+                                $bsku = get_field('product_sku', $bp->ID);
+                                if ($bsku) $b2b_map[$bsku] = $bp->ID;
+                            }
+                        }
+                        $bpid = isset($b2b_map[$sku]) ? $b2b_map[$sku] : 0;
                         $item['b2b_discount'] = $bpid ? floatval(get_field('b2b_discount_percent', $bpid)) : 0;
                         $item['price_standard'] = $bpid ? floatval(get_field('price_standard', $bpid)) : 0;
                         $item['price_silver'] = $bpid ? floatval(get_field('price_silver', $bpid)) : 0;
@@ -142,6 +146,8 @@ add_action('init', function() {
                         $item['min_order_qty'] = $bpid ? intval(get_field('min_order_qty', $bpid)) : 1;
                         $item['boxes_per_unit'] = $bpid ? max(1, intval(get_field('boxes_per_unit', $bpid))) : 1;
                     }
+                    // b2b_post_id: lookup only if b2b_map loaded
+                    $bpid = isset($ct_map[$sku]) ? 0 : (isset($b2b_map[$sku]) ? $b2b_map[$sku] : 0);
                     $item['b2b_post_id'] = $bpid;
                     // B2B visible from custom table (batch loaded)
                     $item['b2b_visible'] = isset($ct_map[$sku]) ? (int)($ct_map[$sku]['b2b_visible'] ?? 1) : 1;
@@ -184,9 +190,8 @@ add_action('init', function() {
                     'img' => sanitize_text_field($_POST['img']), 'price' => $price,
                     'years' => intval($_POST['years'])
                 ];
-                update_option('dinoco_product_catalog', $catalog);
 
-                // V.31: Sync to custom table (dual write)
+                // V.38.5: Write custom table FIRST (source of truth), then sync wp_options (backward compat)
                 $b2b_vis = isset($_POST['b2b_visible']) ? intval($_POST['b2b_visible']) : 1;
                 // V.38.2: Use wp_unslash + json_decode validation (sanitize_text_field strips chars in long JSON)
                 $compat_raw = isset($_POST['compatible_models']) ? wp_unslash($_POST['compatible_models']) : '[]';
@@ -232,6 +237,9 @@ add_action('init', function() {
                     $save_debug['verified'] = $verify;
                 }
 
+                // V.38.5: Sync wp_options (backward compat — written AFTER custom table)
+                update_option('dinoco_product_catalog', $catalog);
+
                 // Auto-create B2B Product post if not exists
                 $existing = get_posts(array(
                     'post_type'      => 'b2b_product',
@@ -269,11 +277,12 @@ add_action('init', function() {
                  $sku = sanitize_text_field($_POST['sku']);
                  $catalog = dinoco_get_current_catalog();
                  if (isset($catalog[$sku])) {
-                     unset($catalog[$sku]); update_option('dinoco_product_catalog', $catalog);
-                     // V.31: Sync delete to custom table
+                     // V.38.5: Deactivate custom table FIRST (source of truth)
                      if (class_exists('DINOCO_Catalog')) {
                          global $wpdb; $wpdb->update($wpdb->prefix.'dinoco_products', array('is_active'=>0), array('sku'=>$sku));
                      }
+                     // V.38.5: Sync wp_options (backward compat)
+                     unset($catalog[$sku]); update_option('dinoco_product_catalog', $catalog);
                  }
                  echo json_encode(['success' => true]); exit;
             }
@@ -547,6 +556,11 @@ add_action('init', function() {
 /* [FIX] Wrap Helper Functions to avoid Redeclaration Error */
 if (!function_exists('dinoco_get_current_catalog')) {
     function dinoco_get_current_catalog() {
+        // V.38.5: อ่านจาก custom table ก่อน (source of truth)
+        if (function_exists('b2b_get_catalog')) {
+            return b2b_get_catalog();
+        }
+        // Fallback wp_options
         $db_catalog = get_option('dinoco_product_catalog', []);
         return is_array($db_catalog) ? $db_catalog : [];
     }
@@ -1807,16 +1821,16 @@ add_action('rest_api_init', function() {
 
             // If SKU provided, update catalog image
             if ( $sku ) {
-                // 1) Update wp_options catalog
+                // V.38.5: 1) Update custom table FIRST (source of truth)
+                if ( class_exists('DINOCO_Catalog') ) {
+                    global $wpdb;
+                    $wpdb->update($wpdb->prefix . 'dinoco_products', ['image_url' => $url], ['sku' => $sku]);
+                }
+                // 2) Sync wp_options (backward compat)
                 $catalog = dinoco_get_current_catalog();
                 if ( isset($catalog[$sku]) ) {
                     $catalog[$sku]['img'] = $url;
                     update_option('dinoco_product_catalog', $catalog);
-                }
-                // 2) Update custom table
-                if ( class_exists('DINOCO_Catalog') ) {
-                    global $wpdb;
-                    $wpdb->update($wpdb->prefix . 'dinoco_products', ['image_url' => $url], ['sku' => $sku]);
                 }
                 // 3) Update b2b_product ACF
                 $b2b_posts = get_posts([
