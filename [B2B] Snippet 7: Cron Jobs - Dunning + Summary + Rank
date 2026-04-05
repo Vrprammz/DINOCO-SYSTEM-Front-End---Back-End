@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 7: Cron Jobs — Complete System               ║
- * ║  Version: V.30.4 — OOS expiry guard for Inventory system      ║
+ * ║  Version: V.30.5 — OOS expiry reads custom table + dual-write  ║
  * ║  DB_ID: 56                                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
@@ -729,28 +729,67 @@ function b2b_run_oos_expiry_check() {
     try {
     b2b_log('[Cron] OOS expiry check');
 
-    $products = get_posts(array(
-        'post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish',
-        'meta_query'=>array(
-            array('key'=>'stock_status','value'=>'out_of_stock'),
-            array('key'=>'oos_timestamp','value'=>0,'compare'=>'>'),
-            array('key'=>'oos_duration_hours','value'=>0,'compare'=>'>'),
-        ),
-    ));
-
     $count = 0;
-    foreach ($products as $p) {
-        $ts = intval(get_field('oos_timestamp', $p->ID));
-        $hrs = intval(get_field('oos_duration_hours', $p->ID));
-        if ($ts && $hrs && time() >= $ts + ($hrs * 3600)) {
-            $sku = get_field('product_sku', $p->ID);
-            update_field('stock_status', 'in_stock', $p->ID);
-            update_field('oos_timestamp', 0, $p->ID);
-            b2b_log("[OOS] Auto-unlocked SKU: {$sku}");
-            $count++;
+
+    // V.30.5: Read from custom table first (source of truth)
+    if ( class_exists('DINOCO_Catalog') ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_products';
+        $expired = $wpdb->get_results(
+            "SELECT sku, oos_timestamp, oos_duration_hours FROM {$table}
+             WHERE is_active = 1 AND stock_status = 'out_of_stock'
+             AND oos_timestamp IS NOT NULL AND oos_timestamp > 0
+             AND oos_duration_hours IS NOT NULL AND oos_duration_hours > 0",
+            ARRAY_A
+        );
+        foreach ($expired as $row) {
+            $ts = intval($row['oos_timestamp']);
+            $hrs = intval($row['oos_duration_hours']);
+            if ($ts && $hrs && time() >= $ts + ($hrs * 3600)) {
+                $sku = $row['sku'];
+                // Dual-write: custom table
+                $wpdb->update($table, array(
+                    'stock_status'       => 'in_stock',
+                    'oos_timestamp'      => null,
+                    'oos_duration_hours' => null,
+                    'oos_eta_date'       => null,
+                ), array('sku' => $sku));
+                // Dual-write: ACF
+                if (function_exists('b2b_find_product_by_sku')) {
+                    $pid = b2b_find_product_by_sku($sku);
+                    if ($pid) {
+                        update_field('stock_status', 'in_stock', $pid);
+                        update_field('oos_timestamp', 0, $pid);
+                    }
+                }
+                b2b_log("[OOS] Auto-unlocked SKU: {$sku}");
+                $count++;
+            }
+        }
+    } else {
+        // Fallback: ACF
+        $products = get_posts(array(
+            'post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish',
+            'meta_query'=>array(
+                array('key'=>'stock_status','value'=>'out_of_stock'),
+                array('key'=>'oos_timestamp','value'=>0,'compare'=>'>'),
+                array('key'=>'oos_duration_hours','value'=>0,'compare'=>'>'),
+            ),
+        ));
+        foreach ($products as $p) {
+            $ts = intval(get_field('oos_timestamp', $p->ID));
+            $hrs = intval(get_field('oos_duration_hours', $p->ID));
+            if ($ts && $hrs && time() >= $ts + ($hrs * 3600)) {
+                $sku = get_field('product_sku', $p->ID);
+                update_field('stock_status', 'in_stock', $p->ID);
+                update_field('oos_timestamp', 0, $p->ID);
+                b2b_log("[OOS] Auto-unlocked SKU: {$sku}");
+                $count++;
+            }
         }
     }
 
+    delete_transient('b2b_sku_data_map');
     b2b_log("[Cron] OOS expired: {$count} products unlocked");
     } catch ( Exception $e ) {
         b2b_log('[Cron] b2b_run_oos_expiry_check FAILED: ' . $e->getMessage());

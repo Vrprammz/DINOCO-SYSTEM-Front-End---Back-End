@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
- * ║  Version: V.39.0 — boxes_per_unit ใช้ helper กลาง b2b_get_boxes_per_unit()   ║
+ * ║  Version: V.39.1 — custom table source of truth (b2b_get_product_data)      ║
  * ║  DB_ID: 52                                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
@@ -266,12 +266,51 @@ if ( ! function_exists('b2b_unauthorized_response') ) {
 // SHARED SKU DATA CACHE
 // ═══════════════════════════════════════
 
-/** Cached SKU data map — shared between catalog and place-order */
+/** Cached SKU data map — V.39.1: batch query from custom table (source of truth) */
 function b2b_get_sku_data_map() {
     $cache_key = 'b2b_sku_data_map';
     $data = get_transient($cache_key);
     if ( false !== $data ) return $data;
 
+    $data = array();
+
+    // Source 1: Custom table (batch query — 1 SQL)
+    if ( class_exists( 'DINOCO_Catalog' ) ) {
+        $all = DINOCO_Catalog::get_all();
+        if ( ! empty( $all ) ) {
+            // Also build pid map for backward compat
+            $pid_map = array();
+            $ids = get_posts(array('post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish','fields'=>'ids'));
+            if ( !empty($ids) ) update_meta_cache('post', $ids);
+            foreach ( $ids as $pid ) {
+                $s = get_post_meta($pid, 'product_sku', true);
+                if ($s) $pid_map[strtoupper(trim($s))] = $pid;
+            }
+            foreach ( $all as $p ) {
+                $sku = $p['sku'];
+                $data[$sku] = array(
+                    'pid'            => isset($pid_map[$sku]) ? $pid_map[$sku] : 0,
+                    'discount'       => floatval( $p['b2b_discount_percent'] ?? 0 ),
+                    'stock_status'   => $p['stock_status'] ?: 'in_stock',
+                    'oos_eta'        => $p['oos_eta_date'] ?: '',
+                    'oos_timestamp'  => intval( $p['oos_timestamp'] ?? 0 ),
+                    'oos_duration'   => intval( $p['oos_duration_hours'] ?? 0 ),
+                    'boxes_per_unit' => max( 1, intval( $p['boxes_per_unit'] ?? 1 ) ),
+                    'price_standard' => floatval( $p['base_price'] ?? 0 ),
+                    'price_silver'   => floatval( $p['price_silver'] ?? 0 ),
+                    'price_gold'     => floatval( $p['price_gold'] ?? 0 ),
+                    'price_platinum' => floatval( $p['price_platinum'] ?? 0 ),
+                    'price_diamond'  => floatval( $p['price_diamond'] ?? 0 ),
+                    'min_order_qty'  => max( 1, intval( $p['min_order_qty'] ?? 1 ) ),
+                    'category'       => $p['category'] ?? '',
+                );
+            }
+            set_transient($cache_key, $data, 300);
+            return $data;
+        }
+    }
+
+    // Source 2: Fallback ACF
     $ids = get_posts(array(
         'post_type'      => 'b2b_product',
         'posts_per_page' => -1,
@@ -280,7 +319,6 @@ function b2b_get_sku_data_map() {
     ));
     if ( !empty($ids) ) update_meta_cache('post', $ids);
 
-    $data = array();
     foreach ( $ids as $pid ) {
         $sku = get_post_meta($pid, 'product_sku', true);
         if ( !$sku ) continue;
@@ -523,15 +561,24 @@ function b2b_rest_place_order( WP_REST_Request $request ) {
         return new WP_REST_Response(array('success'=>false,'message'=>'⛔ ร้าน '.$dist_name.' ถูกระงับสิทธิ์สั่งสินค้าชั่วคราว'), 403);
 
     // SEC: Server-side price lookup — never trust client-supplied prices
+    // V.39.1: Read pricing from custom table (via sku_data_map) — no ACF calls
     $catalog = function_exists('b2b_get_catalog') ? b2b_get_catalog() : get_option('dinoco_product_catalog', array());
     $rank = get_field('rank_system', $dist->ID) ?: 'standard';
     $price_map = array();
     $sku_data_map = b2b_get_sku_data_map();
     foreach ($sku_data_map as $sku => $sdata) {
-        $pid = $sdata['pid'];
-        $rank_price = floatval(get_post_meta($pid, 'price_'.$rank, true));
+        // V.39.1: Read rank price from sku_data_map (custom table) first, fallback ACF
+        $rank_price = 0;
+        $rank_key = 'price_' . strtolower($rank);
+        if ( isset($sdata[$rank_key]) && floatval($sdata[$rank_key]) > 0 ) {
+            $rank_price = floatval($sdata[$rank_key]);
+        } elseif ( $sdata['pid'] > 0 ) {
+            $rank_price = floatval(get_post_meta($sdata['pid'], 'price_'.$rank, true));
+        }
         $discount = $sdata['discount'];
-        $base = isset($catalog[$sku]['price']) ? b2b_parse_price($catalog[$sku]['price']) : 0;
+        $base = isset($sdata['price_standard']) && $sdata['price_standard'] > 0
+            ? $sdata['price_standard']
+            : (isset($catalog[$sku]['price']) ? b2b_parse_price($catalog[$sku]['price']) : 0);
         $dealer = $rank_price > 0 ? $rank_price : round($base * (1 - $discount / 100), 2);
         if ($dealer > 0) $price_map[$sku] = $dealer;
     }
@@ -1190,16 +1237,11 @@ if ( ! function_exists('b2b_rest_verify_admin') ) {
 }
 
 /**
- * GET /admin-stock-list — all products + stock status + BO ticket count
+ * GET /admin-stock-list — V.39.1: Read from custom table (source of truth)
  */
 function b2b_rest_admin_stock_list( WP_REST_Request $request ) {
     $session = b2b_rest_verify_admin($request);
     if ( !$session ) return b2b_unauthorized_response('Admin only');
-
-    $products = get_posts(array(
-        'post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish',
-        'orderby'=>'title','order'=>'ASC',
-    ));
 
     // Get all BO tickets at once for counting
     $bo_tickets = get_posts(array(
@@ -1221,23 +1263,52 @@ function b2b_rest_admin_stock_list( WP_REST_Request $request ) {
     }
 
     $result = array();
-    foreach ($products as $p) {
-        $sku = get_field('product_sku', $p->ID) ?: '';
-        $stock = get_field('stock_status', $p->ID) ?: 'in_stock';
-        $oos_ts = intval(get_field('oos_timestamp', $p->ID));
-        $eta = get_field('oos_eta_date', $p->ID) ?: '';
-        $bo_count = isset($bo_count_map[strtoupper($sku)]) ? $bo_count_map[strtoupper($sku)] : 0;
 
-        $result[] = array(
-            'id'         => $p->ID,
-            'name'       => get_the_title($p->ID),
-            'sku'        => $sku,
-            'stock'      => $stock,
-            'oos_since'  => $oos_ts > 0 ? b2b_date('Y-m-d H:i', $oos_ts) : '',
-            'oos_days'   => $oos_ts > 0 ? floor((time() - $oos_ts) / 86400) : 0,
-            'eta'        => $eta,
-            'bo_count'   => $bo_count,
-        );
+    // V.39.1: Read from custom table first
+    if ( class_exists('DINOCO_Catalog') ) {
+        $all_products = DINOCO_Catalog::get_all();
+        // Build pid map for backward compat
+        $pid_map = array();
+        $b2b_ids = get_posts(array('post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish','fields'=>'ids'));
+        foreach ($b2b_ids as $bpid) {
+            $s = get_post_meta($bpid, 'product_sku', true);
+            if ($s) $pid_map[strtoupper(trim($s))] = $bpid;
+        }
+        foreach ($all_products as $p) {
+            $sku = $p['sku'];
+            $oos_ts = intval($p['oos_timestamp'] ?? 0);
+            $bo_count = isset($bo_count_map[$sku]) ? $bo_count_map[$sku] : 0;
+            $result[] = array(
+                'id'         => isset($pid_map[$sku]) ? $pid_map[$sku] : 0,
+                'name'       => $p['name'],
+                'sku'        => $sku,
+                'stock'      => $p['stock_status'] ?: 'in_stock',
+                'oos_since'  => $oos_ts > 0 ? b2b_date('Y-m-d H:i', $oos_ts) : '',
+                'oos_days'   => $oos_ts > 0 ? floor((time() - $oos_ts) / 86400) : 0,
+                'eta'        => $p['oos_eta_date'] ?: '',
+                'bo_count'   => $bo_count,
+            );
+        }
+    } else {
+        // Fallback: ACF
+        $products = get_posts(array('post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish','orderby'=>'title','order'=>'ASC'));
+        foreach ($products as $p) {
+            $sku = get_field('product_sku', $p->ID) ?: '';
+            $stock = get_field('stock_status', $p->ID) ?: 'in_stock';
+            $oos_ts = intval(get_field('oos_timestamp', $p->ID));
+            $eta = get_field('oos_eta_date', $p->ID) ?: '';
+            $bo_count = isset($bo_count_map[strtoupper($sku)]) ? $bo_count_map[strtoupper($sku)] : 0;
+            $result[] = array(
+                'id'         => $p->ID,
+                'name'       => get_the_title($p->ID),
+                'sku'        => $sku,
+                'stock'      => $stock,
+                'oos_since'  => $oos_ts > 0 ? b2b_date('Y-m-d H:i', $oos_ts) : '',
+                'oos_days'   => $oos_ts > 0 ? floor((time() - $oos_ts) / 86400) : 0,
+                'eta'        => $eta,
+                'bo_count'   => $bo_count,
+            );
+        }
     }
 
     return new WP_REST_Response(array('success'=>true,'products'=>$result), 200);
