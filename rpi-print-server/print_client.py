@@ -304,7 +304,7 @@ def html_to_pdf(html_string, width_mm=None, height_mm=None):
 
     page_css = None
     if width_mm and height_mm:
-        page_css = CSS(string=f'@page {{ size: {width_mm}mm {height_mm}mm; margin: 0; }}')
+        page_css = CSS(string=f'@page {{ size: {width_mm}mm {height_mm}mm; margin: 3mm; }}')
 
     tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
     tmp.close()
@@ -418,7 +418,7 @@ def process_job(job, config, printer_mgr):
         # Estimate: header 30mm + ~15mm per item + totals 30mm + addr 25mm + QR 40mm
         item_count = len(order.get('items', []))
         children_count = sum(len(it.get('children', [])) for it in order.get('items', []))
-        pick_h = max(180, 120 + (item_count + children_count) * 15)
+        pick_h = min(2000, max(180, 120 + (item_count + children_count) * 15))  # cap 2000mm ป้องกัน buffer ล้น
         pick_pdf = html_to_pdf(pick_html, 100, pick_h)
         printer_mgr.print_picking_list(pick_pdf, tid)
         details['picking_list'] = True
@@ -451,6 +451,12 @@ def process_job(job, config, printer_mgr):
                         'item_name': item['name'],
                         'item_sku': item['sku'],
                     })
+
+            # Guard: ถ้าจำนวนกล่องจริงไม่ตรงกับ total_boxes → ใช้จำนวนจริง
+            if len(box_items) != total_boxes:
+                logger.warning(f'  #{tid} total_boxes mismatch: WP={total_boxes} actual={len(box_items)}')
+                for bi in box_items:
+                    bi['total_boxes'] = len(box_items)
 
             for i, bi in enumerate(box_items):
                 label_ctx = {**context, 'box': bi,
