@@ -1133,14 +1133,29 @@ def main():
             if should_sleep and not _screen_is_off:
                 logger.info(f'Screen sleep — turning off display ({hour}:00 Bangkok)')
                 try:
-                    os.system('vcgencmd display_power 0 2>/dev/null || xset dpms force off 2>/dev/null || wlr-randr --output HDMI-A-1 --off 2>/dev/null')
+                    # Try ALL methods (;) — vcgencmd (legacy), xset (X11), wlr-randr (Wayland)
+                    # Must re-enable DPMS first since install.sh disables it
+                    os.system(
+                        'vcgencmd display_power 0 2>/dev/null; '
+                        'DISPLAY=:0 xset +dpms 2>/dev/null; '
+                        'DISPLAY=:0 xset dpms force off 2>/dev/null; '
+                        'wlr-randr --output HDMI-A-1 --off 2>/dev/null'
+                    )
                 except Exception as e:
                     logger.debug(f'Screen off error: {e}')
                 _screen_is_off = True
             elif not should_sleep and _screen_is_off:
                 logger.info(f'Screen wake — turning on display ({hour}:00 Bangkok)')
                 try:
-                    os.system('vcgencmd display_power 1 2>/dev/null || xset dpms force on 2>/dev/null || wlr-randr --output HDMI-A-1 --on 2>/dev/null')
+                    # Wake display + re-disable DPMS for daytime (kiosk always-on)
+                    os.system(
+                        'vcgencmd display_power 1 2>/dev/null; '
+                        'DISPLAY=:0 xset dpms force on 2>/dev/null; '
+                        'DISPLAY=:0 xset -dpms 2>/dev/null; '
+                        'DISPLAY=:0 xset s off 2>/dev/null; '
+                        'DISPLAY=:0 xset s noblank 2>/dev/null; '
+                        'wlr-randr --output HDMI-A-1 --on 2>/dev/null'
+                    )
                 except Exception as e:
                     logger.debug(f'Screen on error: {e}')
                 _screen_is_off = False
