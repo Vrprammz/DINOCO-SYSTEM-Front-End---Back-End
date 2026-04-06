@@ -1,8 +1,13 @@
 """
-DINOCO B2B — CUPS Printer Wrapper V.2.1
+DINOCO B2B — CUPS Printer Wrapper V.2.2
 Handles printing PDFs to configured CUPS printers.
 For thermal label printers: converts PDF → image → TSPL or ESC/POS raster.
 XP-420B: sends TSPL via USB directly (pyusb) since usblp driver doesn't claim it.
+
+V.2.2 — Configurable GAP + DIRECTION for TSPL
+  - GAP and DIRECTION read from config (no more hardcode)
+  - GAP 2mm default for pre-cut 100x180mm labels (was 0mm — caused cumulative feed drift)
+  - DIRECTION configurable (default 1 = bottom-to-top)
 
 V.2.1 — UsbSession + TSPL Status Query
   - UsbSession: keep USB connection open for multiple prints in one order
@@ -219,7 +224,7 @@ def usb_send(vendor_id, product_id, data):
 
 # ── PDF Conversion ─────────────────────────────────────────────────
 
-def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True):
+def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=2, direction=1):
     """Convert a PDF to TSPL bitmap commands for Xprinter XP-420B and similar.
 
     Args:
@@ -229,6 +234,9 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True):
         invert: Invert bitmap polarity. True for printers where
                 bit 0 = print black (XP-420B), False for standard TSPL
                 where bit 1 = print black.
+        gap_mm: Gap between pre-cut labels in mm (0 for continuous roll,
+                2-3 for standard pre-cut 100x180mm labels).
+        direction: Print direction (0=top-to-bottom, 1=bottom-to-top).
 
     Returns:
         bytes: TSPL command data ready to send to printer
@@ -264,8 +272,8 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True):
 
             # TSPL commands
             data += f'SIZE {img.width / dpi * 25.4:.1f} mm, {height / dpi * 25.4:.1f} mm\r\n'.encode()
-            data += b'GAP 0 mm, 0 mm\r\n'
-            data += b'DIRECTION 1,0\r\n'
+            data += f'GAP {gap_mm} mm, 0 mm\r\n'.encode()
+            data += f'DIRECTION {direction},0\r\n'.encode()
             data += b'CLS\r\n'
 
             # BITMAP x, y, width_bytes, height, mode, data
@@ -364,6 +372,9 @@ class PrinterManager:
         self.label_usb_direct = config.get('label_usb_direct', None)
         # TSPL bitmap invert: True for XP-420B (bit 0 = print black)
         self.label_tspl_invert = config.get('label_tspl_invert', True)
+        # TSPL GAP (mm between pre-cut labels) and DIRECTION (0=top-down, 1=bottom-up)
+        self.label_gap_mm = config.get('label_gap_mm', 2)
+        self.label_direction = config.get('label_direction', 1)
         self.conn = None
 
     def _get_conn(self):
@@ -417,7 +428,8 @@ class PrinterManager:
         logger.info(f'Converting PDF to {protocol.upper()} for thermal printer: {title}')
 
         if protocol == 'tspl':
-            raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert)
+            raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert,
+                                   gap_mm=self.label_gap_mm, direction=self.label_direction)
         else:
             raw_data = pdf_to_escpos(pdf_path)
 
@@ -459,7 +471,8 @@ class PrinterManager:
         logger.info(f'Converting PDF to {protocol.upper()} for thermal printer: {title}')
 
         if protocol == 'tspl':
-            raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert)
+            raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert,
+                                   gap_mm=self.label_gap_mm, direction=self.label_direction)
         else:
             raw_data = pdf_to_escpos(pdf_path)
 

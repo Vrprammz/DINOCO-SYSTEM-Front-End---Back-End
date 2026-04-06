@@ -39,14 +39,14 @@ All active code lives in `rpi-print-server/`. There is no test suite or linter c
 ### Core Python Files
 
 - **`print_client.py`** — Polling daemon. Fetches jobs from WordPress (`/wp-json/b2b/v1/print-jobs`), renders HTML→PDF via WeasyPrint, prints via CUPS or USB direct, then ACKs back to WordPress. Runs as a loop with adaptive polling (10s active → 30s idle).
-- **`printer.py`** — `PrinterManager` class abstracting CUPS and thermal printers. Handles PDF→TSPL and PDF→ESC-POS conversion for thermal labels. Supports USB direct bypass for XP-420B.
+- **`printer.py`** — `PrinterManager` class abstracting CUPS and thermal printers. Handles PDF→TSPL and PDF→ESC-POS conversion for thermal labels. Supports USB direct bypass for XP-420B. TSPL GAP/DIRECTION configurable via `config.json`.
 - **`dashboard.py`** — Flask app serving the admin dashboard and kiosk UI. Proxies WordPress API calls and reads shared state from `/tmp/dinoco-print-state.json`.
 
 ### Print Job Flow
 
 WordPress API → `print_client.py` polls → renders Jinja2 templates → WeasyPrint PDF → CUPS (A4) or TSPL/ESC-POS (thermal) → ACK back to WordPress.
 
-Print sequence per order: Invoice (A4, Epson) → Picking List (thermal, paginated) → Shipping Labels (thermal, one per box). USB Session mode (V.2.4): single USB connection for all thermal prints with TSPL status query (busy-wait) instead of blind `time.sleep()` delays. Falls back to CUPS if USB direct not configured.
+Print sequence per order: Invoice (A4, Epson) → Picking List (thermal, paginated) → Shipping Labels (thermal, one per box). USB Session mode (V.2.5): single USB connection for all thermal prints with TSPL status query (busy-wait) instead of blind `time.sleep()` delays. Falls back to CUPS if USB direct not configured. TSPL paper size is single-source from `config.json` (`label_width_mm` x `label_height_mm`) — templates must NOT have their own `@page` rules.
 
 The dashboard reads job state from a shared `/tmp/dinoco-print-state.json` file written by the print client.
 
@@ -78,6 +78,9 @@ All routes require `X-Print-Key` header or `?key=` query param matching `config.
 - `printer_invoice` / `printer_label` — CUPS printer names
 - `label_thermal` / `label_thermal_protocol` — thermal mode (`tspl` or `escpos`)
 - `label_usb_direct` — optional USB vendor/product IDs for XP-420B bypass
+- `label_width_mm` / `label_height_mm` — label paper size (default 100x180mm). **Must match physical paper!**
+- `label_gap_mm` — gap between pre-cut labels in mm (default 2, use 0 for continuous roll)
+- `label_direction` — TSPL print direction (0=top-down, 1=bottom-up, default 1)
 - `poll_interval` — seconds between polls (default 10)
 
 ## Dependencies
