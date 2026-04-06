@@ -169,9 +169,9 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - **Agent** (`proxy/`): Node.js + Express, Gemini Flash + Claude Sonnet (function calling), MongoDB Atlas
   - **Modules**: `ai-chat.js` (AI providers + supervisor), `dinoco-tools.js` (11 tools), `shared.js` (prompt + config), `claim-flow.js`, `lead-pipeline.js`, `dinoco-cache.js`
   - **Tools** (11 ตัว): เดิม 8 + เพิ่ม `check_stock_status`, `dinoco_claim_status`, `dinoco_create_claim`. `dinoco_create_claim` platform detect จาก sourceId (ไม่ hardcode facebook อีกต่อไป)
-  - **Claim Flow**: auto-timeout 48h สำหรับ abandoned claims (ไม่มีการตอบ 48 ชม. → auto-cancel). Claim photos เก็บเป็น file URL (ไม่ใช่ base64)
+  - **Claim Flow V.3.0**: auto-timeout 24h (เดิม 48h), isClaimIntent strict mode 2 ระดับ (explicit/symptoms+product), "สอบถามสินค้า" ไม่เข้า claim อีกต่อไป
   - **Lead Pipeline**: ทุก status มีทางไป `closed_lost`/`cancelled` แล้ว (เดิมบาง status ไม่มีทางออก)
-  - **Anti-Hallucination V.1.4**: 3 ชั้นป้องกัน (prompt → tool boundary → output sanitize), claudeSupervisor ตรวจทุก platform, product restrictions per model
+  - **Anti-Hallucination V.4.0**: 3 ชั้นป้องกัน + intent pre-check + context-aware supervisor, prompt restructure กฎสำคัญขึ้นบนสุด, conversation history 12 msgs, isClaimIntent strict 2 ระดับ, claim timeout 24h
   - **Security**: requireAuth ทุก API endpoint, prompt injection protection 14 patterns, PII masking, rate limiting
 
 ## Reference Documentation

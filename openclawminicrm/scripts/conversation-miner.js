@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * conversation-miner.js V.1.0 — Mining real customer chats for AI training
+ * conversation-miner.js V.2.0 — Mining real customer chats for AI training
  *
  * อ่าน messages collection จาก MongoDB แล้วสกัดข้อมูลสำหรับเทรน AI
  * แทน Gemini สร้างคำถามเอง — ใช้แชทจริงจากลูกค้า
@@ -10,6 +10,7 @@
  *   --extract-kb         สกัด Q&A pairs จาก conversation ที่ดี → KB draft
  *   --tone-check         ตรวจน้ำเสียงจาก chat จริง (ดิฉัน, พี่, น้อง ฯลฯ)
  *   --stats              สรุปสถิติรวม (resolution rate, top intents, drop-off)
+ *   --context-check      ★ V.2.0: หา conversations ที่ AI ถามซ้ำ/ไม่จำ context
  *
  * Env: MONGODB_URI, MONGODB_DB (default: dinoco), GOOGLE_API_KEY
  *
@@ -18,6 +19,7 @@
  *   node scripts/conversation-miner.js --extract-kb [--days 30] [--limit 100]
  *   node scripts/conversation-miner.js --tone-check [--days 7]
  *   node scripts/conversation-miner.js --stats [--days 30]
+ *   node scripts/conversation-miner.js --context-check [--days 7]
  */
 
 const { MongoClient } = require("mongodb");
@@ -38,6 +40,7 @@ const FAILURES_PATH = path.join(OUTPUT_DIR, "mined-failures.json");
 const KB_DRAFT_PATH = path.join(OUTPUT_DIR, "mined-kb-draft.json");
 const TONE_PATH = path.join(OUTPUT_DIR, "mined-tone-report.json");
 const STATS_PATH = path.join(OUTPUT_DIR, "mined-stats.json");
+const CONTEXT_PATH = path.join(OUTPUT_DIR, "mined-context-failures.json");
 
 // ═══════════════════════════════════════
 // Args
@@ -643,6 +646,167 @@ async function stats() {
 }
 
 // ═══════════════════════════════════════
+// Mode 5: --context-check
+// ═══════════════════════════════════════
+async function contextCheck() {
+  console.log(`\n=== Context Check (last ${days} days) ===\n`);
+
+  const convMap = await getConversations();
+  const contextFailures = [];
+
+  // รุ่นรถ keywords
+  const MODEL_KEYWORDS = /ADV\s*350|Forza\s*350|NX\s*500|CB\s*500|XL\s*750|Versys|เอดีวี|ฟอร์ซ่า/i;
+  // AI ถามรุ่นรถ
+  const AI_ASK_MODEL = /รุ่นอะไร|ใช้รถ.*รุ่น|ใช้รถอะไร|รุ่นรถ|ขับ.*อะไร/i;
+  // AI ถาม "มีอะไรให้ช่วย" ทั้งที่ลูกค้าบอกแล้ว
+  const AI_GENERIC_REPLY = /มีอะไรให้.*ช่วย|ยินดีให้บริการ|สอบถาม.*อะไร/i;
+  const USER_HAS_INTENT = /สอบถาม|อยากดู|สนใจ|ราคา|อยากได้|มีอะไรบ้าง|ดูสินค้า/i;
+  // ลูกค้าขอดูรูป → AI ถามรุ่นซ้ำ
+  const USER_ASK_IMAGE = /มีรูปไหม|ขอดูรูป|ส่งรูป|ขอรูป|ดูรูป/i;
+  // ลูกค้าอ้างอิงสินค้าก่อนหน้า
+  const USER_REFERENCE = /ตัว\s*\d+|ตัวนี้|อันนี้|ตัวไหน|\d{3,5}\s*(ไง|ตัว|อัน|บาท)/i;
+
+  for (const [sourceId, msgs] of convMap) {
+    const userMsgs = msgs.filter(m => m.role === "user");
+    const aiMsgs = msgs.filter(m => m.role === "assistant" && m.isAiReply);
+
+    if (userMsgs.length < 2 || aiMsgs.length < 1) continue;
+
+    // Pattern 1: ลูกค้าบอกรุ่นรถแล้ว → AI ยังถามรุ่นอีก
+    let customerModel = null;
+    for (const msg of msgs) {
+      if (msg.role === "user") {
+        const modelMatch = (msg.content || "").match(MODEL_KEYWORDS);
+        if (modelMatch) customerModel = modelMatch[0];
+      }
+      if (msg.role === "assistant" && msg.isAiReply && customerModel) {
+        if (AI_ASK_MODEL.test(msg.content || "")) {
+          contextFailures.push({
+            type: "ask_model_again",
+            sourceId,
+            platform: msgs[0].platform,
+            customerToldModel: customerModel,
+            aiAskedAgain: (msg.content || "").substring(0, 200),
+            timestamp: msg.createdAt,
+            context: extractContext(msgs, msg),
+          });
+        }
+      }
+    }
+
+    // Pattern 2: ลูกค้าบอกความต้องการ → AI ตอบ "มีอะไรให้ช่วย"
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].role === "user" && USER_HAS_INTENT.test(msgs[i].content || "")) {
+        // หา AI reply ถัดไป
+        for (let j = i + 1; j < msgs.length; j++) {
+          if (msgs[j].role === "assistant" && msgs[j].isAiReply) {
+            if (AI_GENERIC_REPLY.test(msgs[j].content || "")) {
+              contextFailures.push({
+                type: "generic_reply_to_intent",
+                sourceId,
+                platform: msgs[0].platform,
+                customerIntent: (msgs[i].content || "").substring(0, 200),
+                aiGenericReply: (msgs[j].content || "").substring(0, 200),
+                timestamp: msgs[j].createdAt,
+                context: extractContext(msgs, msgs[j]),
+              });
+            }
+            break;
+          }
+          if (msgs[j].role === "user") break;
+        }
+      }
+    }
+
+    // Pattern 3: ลูกค้าขอดูรูป/อ้างอิงสินค้า → AI ถามรุ่นซ้ำ
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].role === "user" && (USER_ASK_IMAGE.test(msgs[i].content || "") || USER_REFERENCE.test(msgs[i].content || ""))) {
+        for (let j = i + 1; j < msgs.length; j++) {
+          if (msgs[j].role === "assistant" && msgs[j].isAiReply) {
+            if (AI_ASK_MODEL.test(msgs[j].content || "")) {
+              contextFailures.push({
+                type: "ask_model_after_reference",
+                sourceId,
+                platform: msgs[0].platform,
+                customerReference: (msgs[i].content || "").substring(0, 200),
+                aiAskedModel: (msgs[j].content || "").substring(0, 200),
+                timestamp: msgs[j].createdAt,
+                context: extractContext(msgs, msgs[j]),
+              });
+            }
+            break;
+          }
+          if (msgs[j].role === "user") break;
+        }
+      }
+    }
+
+    // Pattern 4: AI เสนอ ADV160 หรือสินค้าที่ไม่มีจริง
+    const NONEXISTENT = /ADV\s*160|PCX|NMAX|Click|Wave|กล่องข้าง.*ADV\s*350|กล่องข้าง.*Forza|แร็คข้าง.*ADV\s*350|แร็คข้าง.*Forza/i;
+    for (const aiMsg of aiMsgs) {
+      if (NONEXISTENT.test(aiMsg.content || "")) {
+        const userBefore = findUserBefore(msgs, aiMsg);
+        contextFailures.push({
+          type: "suggest_nonexistent",
+          sourceId,
+          platform: msgs[0].platform,
+          aiSuggested: (aiMsg.content || "").substring(0, 200),
+          customerAsked: userBefore ? (userBefore.content || "").substring(0, 200) : "",
+          timestamp: aiMsg.createdAt,
+          context: extractContext(msgs, aiMsg),
+        });
+      }
+    }
+  }
+
+  // Deduplicate
+  const seen = new Set();
+  const deduped = contextFailures.filter(f => {
+    const key = `${f.sourceId}:${f.type}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  deduped.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  const result = deduped.slice(0, limit);
+
+  fs.writeFileSync(CONTEXT_PATH, JSON.stringify(result, null, 2));
+
+  // Summary
+  const byType = {};
+  for (const f of result) {
+    byType[f.type] = (byType[f.type] || 0) + 1;
+  }
+
+  console.log(`Total context failures: ${result.length}`);
+  console.log("By type:");
+  for (const [type, count] of Object.entries(byType)) {
+    console.log(`  ${type}: ${count}`);
+  }
+
+  // Print top examples
+  for (const type of Object.keys(byType)) {
+    const examples = result.filter(f => f.type === type).slice(0, 3);
+    console.log(`\n--- ${type} (${byType[type]} total) ---`);
+    for (const ex of examples) {
+      if (ex.type === "ask_model_again") {
+        console.log(`  Customer told: "${ex.customerToldModel}" → AI asked: "${(ex.aiAskedAgain || "").substring(0, 80)}"`);
+      } else if (ex.type === "generic_reply_to_intent") {
+        console.log(`  Customer: "${(ex.customerIntent || "").substring(0, 60)}" → AI: "${(ex.aiGenericReply || "").substring(0, 80)}"`);
+      } else if (ex.type === "ask_model_after_reference") {
+        console.log(`  Customer: "${(ex.customerReference || "").substring(0, 60)}" → AI asked model again`);
+      } else if (ex.type === "suggest_nonexistent") {
+        console.log(`  AI suggested: "${(ex.aiSuggested || "").substring(0, 80)}"`);
+      }
+    }
+  }
+
+  console.log(`\nOutput: ${CONTEXT_PATH}`);
+  return result;
+}
+
+// ═══════════════════════════════════════
 // Helper functions
 // ═══════════════════════════════════════
 
@@ -759,7 +923,7 @@ function sleep(ms) {
 // ═══════════════════════════════════════
 async function main() {
   console.log("═══════════════════════════════════════");
-  console.log("  Conversation Miner V.1.0");
+  console.log("  Conversation Miner V.2.0");
   console.log(`  Mode: ${mode} | Days: ${days} | Limit: ${limit}`);
   console.log(`  DB: ${MONGO_DB}`);
   console.log("═══════════════════════════════════════");
@@ -780,9 +944,12 @@ async function main() {
       case "stats":
         await stats();
         break;
+      case "context-check":
+        await contextCheck();
+        break;
       default:
         console.error(`Unknown mode: ${mode}`);
-        console.log("Available: --find-failures, --extract-kb, --tone-check, --stats");
+        console.log("Available: --find-failures, --extract-kb, --tone-check, --stats, --context-check");
         process.exit(1);
     }
   } finally {

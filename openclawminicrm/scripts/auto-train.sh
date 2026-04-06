@@ -1,15 +1,11 @@
 #!/bin/bash
-# auto-train.sh V6.0 — DINOCO AI Self-Improving Loop (Conversation Mining + Gemini-as-Judge + Flow Test)
+# auto-train.sh V7.0 — DINOCO AI Self-Improving Loop (Mine + Context Check + Judge + Flow Test)
 #
-# V6 changes:
-# - เพิ่ม --mine mode เรียก conversation-miner.js ดึงข้อมูลจากแชทจริง
-# - เพิ่ม Phase 0: mine จาก chat จริงก่อน generate (ถ้าไม่ได้ --no-mine)
-# - 6 phases: mine → generate → judge → flow-test → analyze → fix → repeat
-#
-# V5 changes:
-# - เพิ่ม --flow-test mode ทดสอบ multi-turn conversation (context, tone, accuracy)
-# - 10 flow scenarios ครอบคลุม: สินค้า, เคลม, น้ำเสียง, prompt injection, สแลง
-# - 5 phases: generate → judge → flow-test → analyze → fix → repeat
+# V7 changes:
+# - เพิ่ม --mine mode เรียก conversation-miner.js ทุก mode รวม context-check
+# - Phase 0: mine จากแชทจริง (failures + context + tone + stats + kb)
+# - context-check mode ใหม่ — หา AI ถามซ้ำ/ไม่จำ context/เสนอสินค้าที่ไม่มี
+# - 7 phases: mine → context-check → generate → judge → flow-test → analyze → fix
 #
 # Usage: bash scripts/auto-train.sh [--rounds 5] [--gen 30] [--no-fix] [--v3] [--flow-only] [--mine] [--no-mine] [--mine-days 7]
 set -euo pipefail
@@ -46,8 +42,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+MINE_CONTEXT=0
+
 echo "=================================================="
-echo "  DINOCO Auto-Train V6.0 — Conversation Mining + Gemini-as-Judge + Flow Test"
+echo "  DINOCO Auto-Train V7.0 — Mine + Context Check + Judge + Flow Test"
 echo "  Rounds: $ROUNDS | Gen: $GEN_COUNT | AutoFix: $AUTO_FIX | FlowOnly: $FLOW_ONLY"
 echo "  Mine: $DO_MINE | MineDays: $MINE_DAYS"
 echo "=================================================="
@@ -86,28 +84,33 @@ run_legacy_round() {
 # ═══ Mine-only shortcut ═══
 if [ "$MINE_ONLY" = true ]; then
   echo ""
-  echo "=== Conversation Mining Only Mode ==="
+  echo "=== Conversation Mining Only Mode (V7.0) ==="
   run_mine "find-failures"
-  run_mine "extract-kb" "--limit 100"
+  run_mine "context-check"
   run_mine "tone-check"
+  run_mine "extract-kb" "--limit 100"
   run_mine "stats"
 
   # Copy results back
   docker cp $AGENT:/app/scripts/mined-failures.json scripts/mined-failures.json 2>/dev/null || true
+  docker cp $AGENT:/app/scripts/mined-context-failures.json scripts/mined-context-failures.json 2>/dev/null || true
   docker cp $AGENT:/app/scripts/mined-kb-draft.json scripts/mined-kb-draft.json 2>/dev/null || true
   docker cp $AGENT:/app/scripts/mined-tone-report.json scripts/mined-tone-report.json 2>/dev/null || true
   docker cp $AGENT:/app/scripts/mined-stats.json scripts/mined-stats.json 2>/dev/null || true
 
   MINE_FAILURES=$(grep "Total failures" /tmp/mine-find-failures-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
+  MINE_CONTEXT=$(grep "Total context" /tmp/mine-context-check-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
   MINE_KB=$(grep "KB draft" /tmp/mine-extract-kb-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
 
   echo ""
   echo "=================================================="
-  echo "  Mining Summary"
-  echo "  Failures found:  $MINE_FAILURES"
-  echo "  KB drafts:       $MINE_KB"
+  echo "  Mining Summary (V7.0)"
+  echo "  Failures found:     $MINE_FAILURES"
+  echo "  Context failures:   $MINE_CONTEXT"
+  echo "  KB drafts:          $MINE_KB"
   echo "  Reports:"
   echo "    scripts/mined-failures.json"
+  echo "    scripts/mined-context-failures.json"
   echo "    scripts/mined-kb-draft.json"
   echo "    scripts/mined-tone-report.json"
   echo "    scripts/mined-stats.json"
@@ -140,15 +143,18 @@ for ROUND in $(seq 1 $ROUNDS); do
 
   copy_judge
 
-  # --- Phase 0: Mine real conversations (Round 1 only) ---
+  # --- Phase 0: Mine real conversations (Round 1 only, V7.0) ---
   if [ "$DO_MINE" = true ] && [ "$ROUND" -eq 1 ]; then
     echo ""
     echo "[Phase 0] Mining real customer conversations (last $MINE_DAYS days)..."
     run_mine "find-failures"
+    run_mine "context-check"
+    run_mine "tone-check"
     run_mine "stats"
 
     MINE_FAILURES=$(grep "Total failures" /tmp/mine-find-failures-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
-    echo "[Phase 0] Found $MINE_FAILURES failure patterns from real chats"
+    MINE_CONTEXT=$(grep "Total context" /tmp/mine-context-check-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
+    echo "[Phase 0] Found $MINE_FAILURES failures + $MINE_CONTEXT context issues from real chats"
 
     # Extract KB from good conversations
     run_mine "extract-kb" "--limit 50"
@@ -157,7 +163,9 @@ for ROUND in $(seq 1 $ROUNDS); do
 
     # Copy results back
     docker cp $AGENT:/app/scripts/mined-failures.json scripts/mined-failures.json 2>/dev/null || true
+    docker cp $AGENT:/app/scripts/mined-context-failures.json scripts/mined-context-failures.json 2>/dev/null || true
     docker cp $AGENT:/app/scripts/mined-kb-draft.json scripts/mined-kb-draft.json 2>/dev/null || true
+    docker cp $AGENT:/app/scripts/mined-tone-report.json scripts/mined-tone-report.json 2>/dev/null || true
     docker cp $AGENT:/app/scripts/mined-stats.json scripts/mined-stats.json 2>/dev/null || true
   fi
 
@@ -249,6 +257,7 @@ docker cp $AGENT:/app/scripts/fail-analysis.json scripts/fail-analysis.json 2>/d
 docker cp $AGENT:/app/scripts/kb-auto-added.csv scripts/kb-auto-added.csv 2>/dev/null || true
 docker cp $AGENT:/app/scripts/flow-results.json scripts/flow-results.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/mined-failures.json scripts/mined-failures.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/mined-context-failures.json scripts/mined-context-failures.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/mined-kb-draft.json scripts/mined-kb-draft.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/mined-stats.json scripts/mined-stats.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/mined-tone-report.json scripts/mined-tone-report.json 2>/dev/null || true
@@ -269,14 +278,16 @@ GRAND_SCORE=0
 [ "$GRAND_TOTAL" -gt 0 ] && GRAND_SCORE=$((TOTAL_PASS * 100 / GRAND_TOTAL))
 
 echo "=================================================="
-echo "  Auto-Train V6 Summary"
-echo "  Rounds:       $ROUNDS"
-echo "  Single-turn:  $GRAND_TOTAL tests ($GRAND_SCORE%)"
-echo "  Passed:       $TOTAL_PASS"
-echo "  Failed:       $TOTAL_FAIL"
-echo "  Flow Test:    $FLOW_SCORE"
-echo "  KB Added:     $TOTAL_KB_ADDED entries"
-echo "  Mined:        $MINE_FAILURES failures / $MINE_KB KB drafts"
+echo "  Auto-Train V7.0 Summary"
+echo "  Rounds:          $ROUNDS"
+echo "  Single-turn:     $GRAND_TOTAL tests ($GRAND_SCORE%)"
+echo "  Passed:          $TOTAL_PASS"
+echo "  Failed:          $TOTAL_FAIL"
+echo "  Flow Test:       $FLOW_SCORE"
+echo "  KB Added:        $TOTAL_KB_ADDED entries"
+echo "  Mined failures:  $MINE_FAILURES"
+echo "  Context issues:  $MINE_CONTEXT"
+echo "  KB drafts:       $MINE_KB"
 echo "=================================================="
 
 # Show score trend

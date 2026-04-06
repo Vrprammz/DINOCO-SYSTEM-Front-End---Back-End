@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.2.6 — Blacklist KB inject (inject ทุกคำถาม ยกเว้น SKIP patterns)
+ * V.3.0 — Context-aware: history 12 msgs, intent pre-check, strict context supervisor
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -271,7 +271,7 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
   // ★ V.1.4: ส่ง conversation history + dedup consecutive same-role (Gemini ต้อง alternate user/model)
   const contents = [];
   try {
-    const recentMsgs = await getRecentMessages(sourceId, 6);
+    const recentMsgs = await getRecentMessages(sourceId, 12);
     let lastRole = "";
     for (const m of recentMsgs.reverse()) {
       const role = m.role === "assistant" ? "model" : "user";
@@ -388,7 +388,7 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
   // ★ V.1.4: ส่ง conversation history + dedup consecutive same-role (Claude ต้อง alternate user/assistant)
   const messages = [];
   try {
-    const recentMsgs = await getRecentMessages(sourceId, 6);
+    const recentMsgs = await getRecentMessages(sourceId, 12);
     let lastRole = "";
     for (const m of recentMsgs.reverse()) {
       const role = m.role === "assistant" ? "assistant" : "user";
@@ -440,10 +440,25 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
   return null;
 }
 
-// === DINOCO AI V.3.3 — Blacklist KB inject + Gemini primary + Haiku/Sonnet fallback ===
+// === DINOCO AI V.4.0 — Context-aware + Blacklist KB inject + Gemini primary ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
+  // ★ V.4.0: Intent pre-check — ตรวจ intent ก่อนส่ง AI ป้องกัน "มีอะไรให้ช่วย" ทั้งที่ลูกค้าบอกแล้ว
+  const PRODUCT_INTENT = /สอบถาม|อยากดู|มีอะไรบ้าง|สนใจ.*สินค้า|ดูสินค้า|อยากได้/i;
+  const PRICE_INTENT = /ราคา|เท่าไ|กี่บาท/i;
+  const IMAGE_INTENT = /มีรูป|ขอดูรูป|ส่งรูป|ขอรูป|ดูรูป/i;
+  const REFERENCE_INTENT = /ตัว\s*\d+|ตัวนี้|อันนี้|ตัวไหน|\d{3,5}\s*(ไง|ตัว|อัน|บาท)/i;
+  let intentHint = "";
+  if (PRODUCT_INTENT.test(userMessage)) {
+    intentHint = "\n[INTENT: ลูกค้าสอบถามสินค้า → ถามรุ่นรถทันที ห้ามตอบ 'มีอะไรให้ช่วย']";
+  } else if (IMAGE_INTENT.test(userMessage)) {
+    intentHint = "\n[INTENT: ลูกค้าขอดูรูป → ดูจากสินค้าที่เพิ่งคุยในประวัติ ส่งรูปเลย ห้ามถามซ้ำ]";
+  } else if (REFERENCE_INTENT.test(userMessage)) {
+    intentHint = "\n[INTENT: ลูกค้าอ้างอิงสินค้าจากก่อนหน้า → ดูประวัติแล้วตอบเลย ห้ามถามซ้ำ]";
+  } else if (PRICE_INTENT.test(userMessage)) {
+    intentHint = "\n[INTENT: ลูกค้าถามราคา → ถามรุ่นรถแล้วเรียก product_lookup]";
+  }
+
   // ★ V.3.3: Blacklist KB inject — inject ทุกคำถาม ยกเว้น SKIP patterns
-  // เหตุผล: whitelist (KB_KEYWORDS) ไม่ครอบคลุม ต้องเพิ่มทุกครั้ง → กลับ logic เป็น blacklist
   const SKIP_KB_INJECT = /^(สวัสดี|หวัดดี|ดี|hello|hi|hey|ไง|ว่าไง|555|5555|หาย|ขอบคุณ|ขอบใจ|thank|ok|โอเค|ตกลง|เข้าใจแล้ว|ได้เลย|รับทราบ|👍|🙏|😊|😂|🤣|❤️|สติ๊กเกอร์|sticker)[\s!ๆ]*$/i;
   // คำถามที่ tools จัดการเอง — ไม่ต้อง inject KB (Gemini จะเรียก function calling)
   const TOOL_HANDLED = /^(ราคา|price|เท่าไหร่|เท่าไร|สต็อก|stock|มีของ).{0,30}$/i;
@@ -534,6 +549,9 @@ async function callDinocoAI(systemPrompt, userMessage, sourceId) {
       }
     } catch (e) { console.error("[KB-Inject] Error:", e.message); }
   }
+  // ★ V.4.0: Append intent hint ถ้ามี
+  if (intentHint) enrichedMessage += intentHint;
+
   // ★ Tier 1: Gemini 2.5 Flash (ลูกน้อง — ทุกข้อความ)
   const geminiReply = await callGeminiWithTools(systemPrompt, enrichedMessage, AGENT_TOOLS, sourceId);
   if (geminiReply) return sanitizeAIOutput(geminiReply);
@@ -553,7 +571,8 @@ async function callDinocoAI(systemPrompt, userMessage, sourceId) {
 async function aiReplyToLine(event, sourceId, userName, text, config) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
-  const contextStr = contextDocs.slice(0, 5)
+  // ★ V.4.0: เพิ่มจาก 5 เป็น 10 เพื่อจำ context ข้ามข้อความได้ดีขึ้น
+  const contextStr = contextDocs.slice(0, 10)
     .map((d) => `[${d.role === "assistant" ? config.botName || DEFAULT_BOT_NAME : d.userName || "User"}] ${d.content}`)
     .join("\n");
   const variant = getABVariant(sourceId);
@@ -586,13 +605,21 @@ DINOCO เป็น One Price ไม่มีโปรโมชั่น
 // === AI Reply to Facebook/Instagram ===
 // === ★ V.2.0: ระบบ 3 ชั้น — Haiku รองหัวหน้า 20% + Sonnet หัวหน้าใหญ่ 10% ===
 async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr) {
+  // ★ V.4.0: Context awareness check — ตรวจจับ AI ถามซ้ำสิ่งที่ลูกค้าบอกแล้ว
+  const askingModelAgain = /รุ่นอะไร|ใช้รถ.*รุ่น|ใช้รถอะไร/i.test(geminiReply) && contextStr && /ADV|NX|Forza|CB500|เอดีวี|ฟอร์ซ่า/i.test(contextStr);
+  const askingRepeat = /มีอะไรให้.*ช่วย|ยินดีให้บริการ|สอบถาม.*อะไร/i.test(geminiReply) && /สอบถาม|อยากดู|สนใจ|ราคา|อยากได้/i.test(customerText);
+  const wrongTone = /ดิฉัน|พี่(?!พี)|น้อง(?!ๆ)|ยินดีให้บริการด้านสินค้า/i.test(geminiReply);
+
   // ★ Tier 2: Haiku รองหัวหน้า (20% — ตรวจเรื่องทั่วไป)
   const needsHaikuReview =
     geminiReply.length > 250 ||                    // ตอบยาวเกิน
     /\?/.test(geminiReply) ||                      // มี ? หลุด
     /ซ้ำ|เหมือนเดิม/i.test(customerText) ||       // ลูกค้าบ่นว่าซ้ำ
     (contextStr && contextStr.includes(geminiReply.substring(0, 50))) || // ตอบซ้ำกับก่อนหน้า
-    /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม|นอกจากนี้.*มี/i.test(geminiReply); // cross-sell
+    /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม|นอกจากนี้.*มี/i.test(geminiReply) || // cross-sell
+    askingModelAgain ||                            // ★ V.4.0: ถามรุ่นรถซ้ำทั้งที่ลูกค้าบอกแล้ว
+    askingRepeat ||                                // ★ V.4.0: ถาม "มีอะไรให้ช่วย" ทั้งที่ลูกค้าบอกแล้ว
+    wrongTone;                                     // ★ V.4.0: น้ำเสียงผิด
 
   // ★ Tier 3: Sonnet หัวหน้าใหญ่ (10% — เรื่องยากเท่านั้น)
   const needsSonnetReview =
@@ -628,13 +655,14 @@ Gemini ตอบ: "${geminiReply}"
 ประวัติสนทนา: ${contextStr || "(ไม่มี)"}${toolInfo}
 
 ตรวจว่า:
-1. ตอบซ้ำกับก่อนหน้าไหม (ดูจากประวัติ) → ถ้าซ้ำ ต้องแก้
-2. ตอบตรงคำถามไหม → ถ้าลูกค้าเลือกตัว ต้องตอบเฉพาะตัวนั้น
-3. มี ? ไหม → แปลงเป็น คะ/นะคะ/ไหมคะ
-4. เผยว่าเป็น AI ไหม → ลบออก
-5. กุข้อมูลสินค้าที่ไม่มีใน tool result ไหม → ลบออก (สำคัญมาก! ADV350/Forza350 ไม่มีกล่องข้าง)
-6. ยาวเกินไปไหม → ย่อ
-7. กระซิบ/แนะนำสินค้าที่ไม่ได้อยู่ใน tool result ไหม → ลบออก
+1. ★★★ CONTEXT: ถามซ้ำสิ่งที่ลูกค้าบอกแล้วไหม (ดูประวัติ!) เช่น ลูกค้าบอกรุ่นรถแล้ว Gemini ยังถามรุ่น หรือลูกค้าบอก "สอบถามสินค้า" แล้ว Gemini ตอบ "มีอะไรให้ช่วย" → ต้องแก้! ถามรุ่นรถแทน
+2. ★★★ CONTEXT: ลูกค้าพิมพ์ "มีรูปไหม" "ตัว4400" → Gemini ต้องดูจากสินค้าที่เพิ่งคุย ห้ามถามซ้ำ
+3. ตอบซ้ำกับก่อนหน้าไหม → ถ้าซ้ำ ต้องแก้
+4. มี ? ไหม → แปลงเป็น คะ/นะคะ/ไหมคะ
+5. ใช้ "พี่" "น้อง" "ดิฉัน" "ยินดีให้บริการ" ไหม → แก้เป็น "ลูกค้า" "ค่ะ"
+6. เผยว่าเป็น AI ไหม → ลบออก
+7. กุข้อมูลสินค้าที่ไม่มีใน tool result ไหม → ลบออก (ADV350/Forza350 ไม่มีกล่องข้าง)
+8. กระซิบ/แนะนำสินค้าที่ไม่ได้อยู่ใน tool result ไหม → ลบออก
 
 ถ้าคำตอบ Gemini ดีแล้ว → ตอบคำเดียว "OK"
 ถ้าต้องแก้ → ตอบข้อความที่แก้แล้วเท่านั้น (ส่งให้ลูกค้าโดยตรง ห้ามใส่คำอธิบาย)`,
@@ -667,7 +695,8 @@ Gemini ตอบ: "${geminiReply}"
 async function aiReplyToMeta(senderId, text, sourceId, platform) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
-  const contextStr = contextDocs.slice(0, 5)
+  // ★ V.4.0: เพิ่มจาก 5 เป็น 10
+  const contextStr = contextDocs.slice(0, 10)
     .map((d) => `[${d.role === "assistant" ? DEFAULT_BOT_NAME : d.userName || "User"}] ${d.content}`)
     .join("\n");
   const variant = getABVariant(sourceId);

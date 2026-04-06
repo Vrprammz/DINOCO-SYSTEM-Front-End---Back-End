@@ -98,12 +98,15 @@ groups_meta     { sourceId, groupName, platform, teamId }
 - **CI/CD:** GitHub Actions → SSH → Hetzner
 - **คู่มือ:** `docs/DEPLOY-HETZNER.md`
 
-## AI Anti-Hallucination (V.1.4)
+## AI Anti-Hallucination (V.4.0)
 - **3 ชั้นป้องกัน**: System prompt rules → Tool result boundary instruction → Output sanitization (regex)
-- **claudeSupervisor**: Claude ตรวจงาน Gemini ทั้ง LINE + FB + IG (เดิมเฉพาะ Meta)
+- **claudeSupervisor V.4.0**: Claude ตรวจงาน Gemini ทั้ง LINE + FB + IG + context awareness (ถามซ้ำ/น้ำเสียง/ไม่จำ context)
+- **Intent pre-check**: ตรวจ intent ก่อนส่ง AI (สอบถามสินค้า→ถามรุ่น, มีรูปไหม→ส่งรูปเลย, ตัว4400→ตอบเลย)
 - **Product restrictions**: ADV350/Forza350 ไม่มีกล่องข้าง/แร็คข้าง — tool return "ไม่มี" + prompt ห้ามแนะนำ
 - **OR fallback**: Product lookup ต้อง match model ก่อน — ห้ามคืนสินค้าข้ามรุ่น
-- **Claim flow**: LINE + Meta ทำงานเหมือนกัน (getClaimSession + isClaimIntent)
+- **Claim flow V.3.0**: isClaimIntent strict mode (2 ระดับ: explicit/symptoms+product), timeout 24h (เดิม 48h)
+- **Conversation history**: 12 messages (เดิม 6) + context search 10 docs (เดิม 5)
+- **Prompt restructure**: กฎสำคัญ (context/intent/tone) อยู่บนสุด ไม่จมล่าง
 
 ## สิ่งที่ห้ามทำ
 - ห้ามลบ folder/service โดยไม่ถามบอสก่อน

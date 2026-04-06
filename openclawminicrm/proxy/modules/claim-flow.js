@@ -1,6 +1,6 @@
 /**
  * claim-flow.js — Manual claim flow, AI-powered claim detection + KB-aware questions
- * V.2.2 — Fix: ลบคำว่า "พี่" ออกจาก claim prompts + hardcoded messages ทั้งหมด
+ * V.3.0 — Fix: isClaimIntent strict mode + ห้าม hijack "สอบถามสินค้า" + claim timeout 24h
  */
 const { getDB, getTemplate, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -156,12 +156,27 @@ const CLAIM_STATUSES = [
   "customer_no_response", "reopened",
 ];
 
-const CLAIM_KEYWORDS = /มีปัญหา|แตก|ลอก|เสีย|หลุด|หาย|ชำรุด|พัง|ร้าว|บิ่น|สติ๊กเกอร์|สติกเกอร์|กุญแจ|ซ่อม|เคลม|คืน|น้ำเข้า|เบี้ยว|ขีดข่วน/;
-const NOT_CLAIM_KEYWORDS = /เปลี่ยนรุ่น|เปลี่ยนสี|เปลี่ยนยี่ห้อ|เปลี่ยนแบบ|เปลี่ยนขนาด|เปลี่ยนรถ|ราคา|สั่ง|ซื้อ|อยากได้|สนใจ|มีไหม|กี่บาท/;
+// ★ V.3.0: Strict claim detection — 2 ระดับ
+// ระดับ 1: คำที่ชัดเจนว่าเคลม (trigger เดี่ยวได้)
+const CLAIM_EXPLICIT = /เคลม|ส่งซ่อม|ขอเคลม|เคลมสินค้า|เคลมประกัน/;
+// ระดับ 2: คำอาการ (ต้อง combine กับ context ว่าพูดถึงสินค้า DINOCO)
+const CLAIM_SYMPTOMS = /แตก|ลอก|หลุด|ชำรุด|พัง|ร้าว|บิ่น|น้ำเข้า|เบี้ยว|ขีดข่วน|งอ|บุบ|สนิม/;
+const CLAIM_PRODUCT_CONTEXT = /สติ๊กเกอร์|สติกเกอร์|กุญแจ|กล่อง|แคชบาร์|กันล้ม|แร็ค|ถาด|การ์ดแฮนด์|ประกับ|DINOCO|ดิโนโก/i;
+// คำที่ห้ามเป็น claim เด็ดขาด — สอบถามสินค้าทั่วไป
+const NOT_CLAIM_KEYWORDS = /เปลี่ยนรุ่น|เปลี่ยนสี|เปลี่ยนยี่ห้อ|เปลี่ยนแบบ|เปลี่ยนขนาด|เปลี่ยนรถ|ราคา|สั่ง|ซื้อ|อยากได้|สนใจ|มีไหม|กี่บาท|สอบถามสินค้า|อยากดู|ดูสินค้า|มีอะไรบ้าง|ขอดูรูป|มีรูป|ตัวแทน|ร้าน|จังหวัด/;
+// ★ Backward-compatible: keep CLAIM_KEYWORDS for external usage
+const CLAIM_KEYWORDS = /เคลม|ส่งซ่อม|สติ๊กเกอร์.*ลอก|กุญแจ.*หาย|แตก|ลอก|หลุด|ชำรุด|พัง|ร้าว|บิ่น|น้ำเข้า|เบี้ยว/;
 
 function isClaimIntent(text) {
+  // ★ V.3.0: NOT_CLAIM ตรวจก่อน — ป้องกัน "สอบถามสินค้า" เข้า claim flow
   if (NOT_CLAIM_KEYWORDS.test(text)) return false;
-  return CLAIM_KEYWORDS.test(text);
+  // ระดับ 1: คำชัดเจน → เข้า claim ทันที
+  if (CLAIM_EXPLICIT.test(text)) return true;
+  // ระดับ 2: อาการ + ต้องมี context สินค้า DINOCO
+  if (CLAIM_SYMPTOMS.test(text) && CLAIM_PRODUCT_CONTEXT.test(text)) return true;
+  // ★ ถ้ามีแค่อาการแต่ไม่มี context สินค้า → ไม่ trigger claim (อาจแค่สอบถาม)
+  // เช่น "มีปัญหา" โดดๆ ไม่ trigger, ต้อง "กล่องมีปัญหา" หรือ "สติ๊กเกอร์ลอก"
+  return false;
 }
 
 async function analyzeClaimPhoto(imageUrl) {
@@ -209,10 +224,10 @@ async function getClaimSession(sourceId) {
     status: { $nin: ["closed_resolved", "closed_rejected", "customer_no_response"] },
   });
 
-  // Auto-timeout claims inactive for 48 hours
+  // ★ V.3.0: Auto-timeout claims inactive for 24 hours (เดิม 48h — ลด claim session ค้าง)
   if (claim && claim.updatedAt) {
     const hoursSinceUpdate = (Date.now() - new Date(claim.updatedAt).getTime()) / (1000 * 60 * 60);
-    if (hoursSinceUpdate > 48 && ["photo_requested", "photo_rejected", "photo_received", "info_collecting"].includes(claim.status)) {
+    if (hoursSinceUpdate > 24 && ["photo_requested", "photo_rejected", "photo_received", "info_collecting"].includes(claim.status)) {
       await db.collection("manual_claims").updateOne(
         { _id: claim._id },
         { $set: { status: "customer_no_response", updatedAt: new Date(), auto_timeout: true } }
