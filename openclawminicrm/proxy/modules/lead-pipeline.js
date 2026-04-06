@@ -1,6 +1,6 @@
 /**
  * lead-pipeline.js — Lead statuses, transitions, CRUD, Mayom follow-up cron
- * V.1.1 — Fix dead-end statuses: order_placed..installed can now reach closed_lost/closed_cancelled
+ * V.1.2 — Fix: ลบคำว่า "พี่" ออกจาก follow-up messages ทั้งหมด, ใช้ "ลูกค้า" แทน
  */
 const { getDB, DEFAULT_BOT_NAME, auditLog } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -152,9 +152,9 @@ async function checkClosingSoonWindows() {
     const dealer = lead.dealerName || "ตัวแทนจำหน่าย";
     let msg;
     if (!lead.phone && !lead.lineId) {
-      msg = `พี่คะ ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ 🙏\nร้าน ${dealer} พร้อมให้บริการเรื่อง ${product} ค่ะ\n\nรบกวนขอเบอร์โทรหรือ LINE ID พี่ได้ไหมคะ?\nจะได้ให้ทางร้านติดต่อกลับสะดวกค่ะ`;
+      msg = `สวัสดีค่ะลูกค้า แอดมิน DINOCO ค่ะ 🙏\nร้าน ${dealer} พร้อมให้บริการเรื่อง ${product} ค่ะ\n\nรบกวนขอเบอร์โทรหรือ LINE ID ได้ไหมคะ\nจะได้ให้ทางร้านติดต่อกลับสะดวกค่ะ`;
     } else {
-      msg = `พี่คะ ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ 😊\nมีอะไรสงสัยเรื่อง ${product} ทักมาได้เลยนะคะ\nร้าน ${dealer} ยินดีให้บริการค่ะ`;
+      msg = `สวัสดีค่ะลูกค้า แอดมิน DINOCO ค่ะ 😊\nมีอะไรสงสัยเรื่อง ${product} ทักมาได้เลยนะคะ\nร้าน ${dealer} ยินดีให้บริการค่ะ`;
     }
     await sendMetaMessage(senderId, msg).catch(() => {});
     await db.collection("leads").updateOne({ _id: lead._id }, { $set: { closingSoonSent: true, updatedAt: now } });
@@ -198,12 +198,12 @@ async function processFollowUp(lead) {
     case "first_check": {
       const method = selectFollowUpMethod(lead);
       if (method === "fb_ig_message" || method === "otn") {
-        const msg = `สวัสดีค่ะ 🙏 ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ\nตัวแทน ${lead.dealerName || "จำหน่าย"} ติดต่อพี่แล้วหรือยังคะ?`;
+        const msg = `สวัสดีค่ะลูกค้า 🙏 แอดมิน DINOCO ค่ะ\nตัวแทน ${lead.dealerName || "จำหน่าย"} ติดต่อลูกค้าแล้วหรือยังคะ`;
         if (lead.platform === "facebook" || lead.platform === "instagram") {
           await sendMetaMessage(lead.sourceId, msg).catch(() => {});
         }
       } else if (method === "line" && lead.lineId) {
-        const lineMsg = `สวัสดีค่ะ ${DEFAULT_BOT_NAME} จาก DINOCO ค่ะ\nตัวแทน ${lead.dealerName || ""} ติดต่อพี่แล้วหรือยังคะ?`;
+        const lineMsg = `สวัสดีค่ะลูกค้า แอดมิน DINOCO ค่ะ\nตัวแทน ${lead.dealerName || ""} ติดต่อลูกค้าแล้วหรือยังคะ`;
         await sendLinePush(lead.lineId, [{ type: "text", text: lineMsg }]).catch(() => {});
       }
       await callDinocoAPI("/distributor-notify", {

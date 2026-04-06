@@ -1,6 +1,6 @@
 /**
  * claim-flow.js — Manual claim flow, AI-powered claim detection + KB-aware questions
- * V.2.1 — Auto-timeout abandoned claims (48h inactive → customer_no_response)
+ * V.2.2 — Fix: ลบคำว่า "พี่" ออกจาก claim prompts + hardcoded messages ทั้งหมด
  */
 const { getDB, getTemplate, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -65,7 +65,7 @@ ${missing.join("\n")}
 - ถ้าวิเคราะห์รูปได้ว่าเป็นสินค้าอะไร/อาการอะไร → ถามยืนยันแทน เช่น "ดูจากรูปเหมือนแคชบาร์ใช่ไหมคะ" ไม่ใช่ถามใหม่ทั้งหมด
 - ใช้ความรู้จาก KB คิดว่าควรถามอะไร เช่น ถ้า KB บอกว่าเคลมสติ๊กเกอร์ต้องดูบัตรรับประกัน → ถามเรื่องบัตรรับประกัน
 - ห้ามใช้ ? ใช้ คะ/นะคะ แทน
-- เรียกลูกค้าว่า "พี่"
+- เรียกลูกค้าว่า "คุณลูกค้า" หรือ "ลูกค้า" เท่านั้น ห้ามใช้ "พี่" "น้อง" "ดิฉัน"
 - พูดเหมือนคนจริงๆ ไม่ใช่สคริปต์`;
 
   try {
@@ -120,7 +120,7 @@ ${kbText}
 2. ตอบตาม KB — ถ้า KB มีวิธีตอบชัดเจน ให้ใช้ตามนั้น (เช่น ขอรูป + ที่อยู่จัดส่ง)
 3. ถ้า KB บอกว่าต้องขอรูปอะไรบ้าง → ขอตาม KB
 4. ห้ามใช้ ? ใช้ คะ/นะคะ แทน
-5. เรียกลูกค้าว่า "พี่" หรือ "คุณลูกค้า"
+5. เรียกลูกค้าว่า "คุณลูกค้า" หรือ "ลูกค้า" เท่านั้น ห้ามใช้ "พี่" "น้อง" "ดิฉัน"
 6. ห้ามพูดว่าฟรีตลอดอายุการใช้งาน หรือประกันตลอดชีพ`;
 
   try {
@@ -422,10 +422,10 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
     }
 
     case "info_collected":
-      return `เรื่องเคลมของพี่อยู่ระหว่างตรวจสอบค่ะ${claim.wpTicketNumber ? " (ใบเคลม: " + claim.wpTicketNumber + ")" : ""}\nทีมงานจะติดต่อกลับเร็วที่สุดค่ะ\n\nมีอะไรเพิ่มเติมทักมาได้เลยนะคะ`;
+      return `เรื่องเคลมของลูกค้าอยู่ระหว่างตรวจสอบค่ะ${claim.wpTicketNumber ? " (ใบเคลม: " + claim.wpTicketNumber + ")" : ""}\nทีมงานจะติดต่อกลับเร็วที่สุดค่ะ\n\nมีอะไรเพิ่มเติมทักมาได้เลยนะคะ`;
 
     default:
-      return `เรื่องเคลมของพี่สถานะ: ${claim.status} ค่ะ${claim.wpTicketNumber ? "\nใบเคลม: " + claim.wpTicketNumber : ""}\nสอบถามเพิ่มเติมได้ค่ะ`;
+      return `เรื่องเคลมของลูกค้าสถานะ: ${claim.status} ค่ะ${claim.wpTicketNumber ? "\nใบเคลม: " + claim.wpTicketNumber : ""}\nสอบถามเพิ่มเติมได้ค่ะ`;
   }
 }
 

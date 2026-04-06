@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.3.0 — KB priority + product_lookup auto-appends KB specs + check_stock_status tool (Phase 4)
+ * V.3.1 — Fix: ลบคำว่า "พี่" ออกจาก lead response template
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -658,7 +658,7 @@ async function executeTool(toolName, args, sourceId) {
         { $set: { status: "dealer_notified", updatedAt: new Date() }, $push: { history: { status: "dealer_notified", at: new Date(), by: "ai" } } }
       );
     }
-    return `สร้าง lead สำเร็จ แจ้งตัวแทน ${args.dealer_name} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${args.dealer_name} แล้วค่ะ จะติดต่อพี่กลับเร็วที่สุดนะคะ ${DEFAULT_BOT_NAME} จะติดตามให้จนจบค่ะ"`;
+    return `สร้าง lead สำเร็จ แจ้งตัวแทน ${args.dealer_name} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${args.dealer_name} แล้วค่ะ จะติดต่อลูกค้ากลับเร็วที่สุดนะคะ แอดมินจะติดตามให้จนจบค่ะ"`;
   }
   if (toolName === "dinoco_claim_status") {
     const database = await getDB();
