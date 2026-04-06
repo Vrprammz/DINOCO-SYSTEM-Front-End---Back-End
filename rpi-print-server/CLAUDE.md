@@ -46,13 +46,15 @@ All active code lives in `rpi-print-server/`. There is no test suite or linter c
 
 WordPress API → `print_client.py` polls → renders Jinja2 templates → WeasyPrint PDF → CUPS (A4) or TSPL/ESC-POS (thermal) → ACK back to WordPress.
 
+Print sequence per order: Invoice (A4) → Picking List (thermal, paginated) → **10s delay** → Shipping Labels (thermal, one per box).
+
 The dashboard reads job state from a shared `/tmp/dinoco-print-state.json` file written by the print client.
 
 ### Templates (`rpi-print-server/templates/`)
 
 - `invoice.html` — A4 invoice with Thai fonts
 - `shipping_label.html` — 100×180mm thermal label with barcode/QR
-- `picking_list.html` / `picking_list_thermal.html` — A4 and thermal picking lists
+- `picking_list.html` / `picking_list_thermal.html` — A4 and thermal picking lists (V.2.1: pagination fixed, QR code on last page, 180mm fixed height)
 - `dashboard.html` — Admin web UI
 - `kiosk.html` — 480×320 touchscreen UI (3 tabs: Packing KPIs, Pipeline, System)
 
