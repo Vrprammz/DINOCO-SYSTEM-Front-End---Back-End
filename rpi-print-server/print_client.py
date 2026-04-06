@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.2.6 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.2.7 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -298,13 +298,13 @@ def render_template(template_name, context):
     return template.render(**context)
 
 
-def html_to_pdf(html_string, width_mm=None, height_mm=None):
+def html_to_pdf(html_string, width_mm=None, height_mm=None, margin_mm=0):
     """Convert HTML string to a temporary PDF file path."""
     from weasyprint import CSS
 
     page_css = None
     if width_mm and height_mm:
-        page_css = CSS(string=f'@page {{ size: {width_mm}mm {height_mm}mm; margin: 3mm; }}')
+        page_css = CSS(string=f'@page {{ size: {width_mm}mm {height_mm}mm; margin: {margin_mm}mm; }}')
 
     tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
     tmp.close()
@@ -427,7 +427,7 @@ def process_job(job, config, printer_mgr):
                 FOOTER_LAST_MM = 45     # totals box + address + footer line (ไม่มี QR แล้ว)
                 FOOTER_NORMAL_MM = 12   # footer line only
                 PAGE_H = 180
-                MARGIN_MM = 6           # top+bottom margin จาก @page
+                MARGIN_MM = 0           # margin 0 — template จัดการ spacing เอง
 
                 usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
                 usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
@@ -580,7 +580,7 @@ def process_job(job, config, printer_mgr):
             FOOTER_LAST_MM = 75
             FOOTER_NORMAL_MM = 12
             PAGE_H = 180
-            MARGIN_MM = 6
+            MARGIN_MM = 0           # margin 0 — template จัดการ spacing เอง
 
             usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
             usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
