@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.2.1 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.2.2 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -407,60 +407,75 @@ def process_job(job, config, printer_mgr):
         logger.error(f'  Invoice print error #{tid}: {e}', exc_info=True)
         errors.append(f'Invoice: {e}')
 
-    # 2. Picking List — คำนวณหน้าก่อนปริ้น (100×180mm per page)
+    # 2. Picking List — V.2.2: pagination per-item group (parent+children = 1 unit)
     try:
         logger.info(f'  Rendering picking list #{tid}...')
         pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
 
-        # คำนวณจำนวน rows ทั้งหมด (items + children)
         all_items = order.get('items', [])
-        all_rows = []
-        for it in all_items:
-            all_rows.append(it)
-            for child in it.get('children', []):
-                all_rows.append({'name': child.get('name', child.get('sku', '')), 'sku': child.get('sku', ''), 'is_child': True})
 
-        # คำนวณหน้า: header 35mm + totals 25mm + addr 20mm + footer 8mm = ~88mm fixed
-        # แต่ละ row ~15mm, page height 180mm → rows per page = (180 - 88) / 15 ≈ 6 rows per page
-        FIXED_MM = 88
-        ROW_MM = 15
+        # นับ rows ต่อ item (parent 1 row + children N rows)
+        ROW_MM = 13
+        HEADER_MM = 38          # logo + ticket# + shop name + note
+        FOOTER_LAST_MM = 75     # totals box + address + QR + footer line
+        FOOTER_NORMAL_MM = 12   # footer line only
         PAGE_H = 180
-        rows_per_page = max(1, int((PAGE_H - FIXED_MM) / ROW_MM))
-        total_pages = max(1, -(-len(all_rows) // rows_per_page))  # ceil division
+        MARGIN_MM = 6           # top+bottom margin จาก @page
 
-        logger.info(f'  Picking list #{tid}: {len(all_rows)} rows, {total_pages} pages ({rows_per_page} rows/page)')
+        usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
+        usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
 
-        # ปริ้นทีละหน้า
-        for page_idx in range(total_pages):
+        # แบ่ง items เป็น pages — นับ rows per item group
+        pages = []
+        current_page = []
+        current_mm = 0
+
+        for it in all_items:
+            n_children = len(it.get('children', []))
+            item_mm = (1 + n_children) * ROW_MM  # parent + children rows
+
+            # ถ้าเกินหน้า → ขึ้นหน้าใหม่ (ยกเว้นหน้าว่าง)
+            if current_page and (current_mm + item_mm) > usable_normal:
+                pages.append(current_page)
+                current_page = []
+                current_mm = 0
+
+            current_page.append(it)
+            current_mm += item_mm
+
+        if current_page:
+            pages.append(current_page)
+
+        # ตรวจหน้าสุดท้าย: ถ้า content + footer เกิน → ย้าย item สุดท้ายไปหน้าใหม่
+        if len(pages) >= 1:
+            last = pages[-1]
+            last_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in last)
+            if last_mm > usable_last and len(last) > 1:
+                overflow = last.pop()
+                pages.append([overflow])
+
+        total_pages = len(pages)
+        total_rows = sum(1 + len(it.get('children', [])) for it in all_items)
+        logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_rows} rows, {total_pages} pages')
+
+        for page_idx, page_items in enumerate(pages):
             page_num = page_idx + 1
-            start = page_idx * rows_per_page
-            end = start + rows_per_page
-            page_items = all_rows[start:end]
+            is_last = page_num == total_pages
 
-            # สร้าง page_items ที่แปลงกลับเป็น format ที่ template เข้าใจ
-            # (template ใช้ item.sku, item.name, item.qty, item.boxes_per_unit, item.children)
-            page_order_items = []
-            for row in page_items:
-                if row.get('is_child'):
-                    # child rows ถูกรวมเข้า parent แล้ว — skip (จะแสดงผ่าน parent.children)
-                    continue
-                # หา original item จาก all_items เพื่อเอา children + fields ครบ
-                orig = next((it for it in all_items if it.get('sku') == row.get('sku')), row)
-                page_order_items.append(orig)
+            page_order = {**order, 'items': page_items}
 
-            # Override order items เป็นเฉพาะหน้านี้
-            page_order = {**order, 'items': page_order_items}
-
-            # สร้าง context สำหรับหน้านี้
             pick_ctx = {**context,
                         'order': page_order,
                         'page_num': page_num,
                         'total_pages': total_pages,
-                        'is_last_page': page_num == total_pages,
+                        'is_last_page': is_last,
                         'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
 
-            # คำนวณความสูงหน้า — บังคับ 180mm ทุกหน้า (ตรงกับ label stock 100x180mm)
-            pick_h = PAGE_H
+            # Dynamic height ตาม content จริง — ไม่บังคับ 180mm
+            rows_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in page_items)
+            footer_mm = FOOTER_LAST_MM if is_last else FOOTER_NORMAL_MM
+            content_h = HEADER_MM + rows_mm + footer_mm + MARGIN_MM + 5  # 5mm padding
+            pick_h = max(content_h, 80)  # minimum 80mm
 
             pick_html = render_template(pick_tpl, pick_ctx)
             pick_pdf = html_to_pdf(pick_html, 100, pick_h)
@@ -474,8 +489,6 @@ def process_job(job, config, printer_mgr):
         errors.append(f'PickingList: {e}')
 
     # ── Delay 10s ระหว่าง Picking List กับ Shipping Labels ──
-    # ให้ XP-420B จัดหน้า+ตัดกระดาษเสร็จก่อน ป้องกัน feed ซ้อนกัน
-    import time
     logger.info(f'  Waiting 10s before shipping labels #{tid}...')
     time.sleep(10)
 
