@@ -86,7 +86,6 @@ System deps (installed by `install.sh`): CUPS, poppler-utils (pdftoppm), Thai fo
 
 ## Security Notes
 
-See `SECURITY-AUDIT-REPORT.md` for the full audit. Key issues flagged:
 - API key must not be committed to git (`config.json` is gitignored)
 - Dashboard commands use `subprocess.run()` with explicit arg lists to avoid shell injection
 - Dashboard auth is via shared API key header — no per-user auth
