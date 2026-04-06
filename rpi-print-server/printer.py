@@ -306,7 +306,7 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
             # Auto-cut + feed out ~10mm so user can grab the paper
             # Without FEED, cutter leaves paper flush → falls back inside → jam
             data += b'CUT\r\n'
-            data += b'FEED 80\r\n'  # 80 dots ≈ 10mm at 203 DPI
+            data += b'FEED 8\r\n'  # 8 dots ≈ 1mm at 203 DPI
 
     return bytes(data)
 
