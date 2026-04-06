@@ -483,6 +483,13 @@ class PrinterManager:
         pid = int(self.label_usb_direct['product_id'], 16)
         return UsbSession(vid, pid)
 
+    def convert_to_tspl(self, pdf_path):
+        """Convert PDF to TSPL bytes without sending. For batch mode."""
+        return pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert,
+                           gap_mm=self.label_gap_mm, direction=self.label_direction,
+                           paper_width_mm=self.label_width_mm,
+                           paper_height_mm=self.label_height_mm)
+
     def print_thermal_session(self, pdf_path, usb_session, title='DINOCO Label'):
         """Print PDF via existing USB session (no re-enumerate)."""
         protocol = self.label_thermal_protocol

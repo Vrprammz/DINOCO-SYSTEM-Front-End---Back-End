@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.3.1 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.3.5 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -414,34 +414,35 @@ def process_job(job, config, printer_mgr):
         try:
             usb_session.open()
 
-            # 2. Picking List — V.2.2 pagination per-item group (parent+children = 1 unit)
+            # ═══ BATCH MODE: สะสม TSPL ทั้งหมด → write ทีเดียว (ไม่ให้เครื่อง backfeed) ═══
+            all_tspl = bytearray()
+            temp_pdfs = []
+
+            # 2. Picking List — pagination per-item group
             try:
                 logger.info(f'  Rendering picking list #{tid}...')
                 pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
 
                 all_items = order.get('items', [])
 
-                # นับ rows ต่อ item (parent 1 row + children N rows)
                 ROW_MM = 13
-                HEADER_MM = 38          # logo + ticket# + shop name + note
-                FOOTER_LAST_MM = 45     # totals box + address + footer line (ไม่มี QR แล้ว)
-                FOOTER_NORMAL_MM = 12   # footer line only
+                HEADER_MM = 38
+                FOOTER_LAST_MM = 45
+                FOOTER_NORMAL_MM = 12
                 PAGE_H = 180
-                MARGIN_MM = 0           # margin 0 — template จัดการ spacing เอง
+                MARGIN_MM = 0
 
                 usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
                 usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
 
-                # แบ่ง items เป็น pages — นับ rows per item group
                 pages = []
                 current_page = []
                 current_mm = 0
 
                 for it in all_items:
                     n_children = len(it.get('children', []))
-                    item_mm = (1 + n_children) * ROW_MM  # parent + children rows
+                    item_mm = (1 + n_children) * ROW_MM
 
-                    # ถ้าเกินหน้า → ขึ้นหน้าใหม่ (ยกเว้นหน้าว่าง)
                     if current_page and (current_mm + item_mm) > usable_normal:
                         pages.append(current_page)
                         current_page = []
@@ -453,7 +454,6 @@ def process_job(job, config, printer_mgr):
                 if current_page:
                     pages.append(current_page)
 
-                # ตรวจหน้าสุดท้าย: ถ้า content + footer เกิน → ย้าย item สุดท้ายไปหน้าใหม่
                 if len(pages) >= 1:
                     last = pages[-1]
                     last_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in last)
@@ -462,15 +462,12 @@ def process_job(job, config, printer_mgr):
                         pages.append([overflow])
 
                 total_pages = len(pages)
-                total_rows = sum(1 + len(it.get('children', [])) for it in all_items)
-                logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_rows} rows, {total_pages} pages')
+                logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_pages} pages')
 
                 for page_idx, page_items in enumerate(pages):
                     page_num = page_idx + 1
                     is_last = page_num == total_pages
-
                     page_order = {**order, 'items': page_items}
-
                     pick_ctx = {**context,
                                 'order': page_order,
                                 'page_num': page_num,
@@ -478,14 +475,11 @@ def process_job(job, config, printer_mgr):
                                 'is_last_page': is_last,
                                 'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
 
-                    # Fanfold paper: ต้อง feed ตรง 180mm (perforation) เสมอ
                     pick_h = PAGE_H
-
                     pick_html = render_template(pick_tpl, pick_ctx)
                     pick_pdf = html_to_pdf(pick_html, 100, pick_h)
-                    printer_mgr.print_thermal_session(pick_pdf, usb_session, title=f'PickingList #{tid} p{page_num}')
-                    os.unlink(pick_pdf)
-                    usb_session.wait_ready(timeout=15)  # wait for cutter
+                    all_tspl += printer_mgr.convert_to_tspl(pick_pdf)
+                    temp_pdfs.append(pick_pdf)
 
                 details['picking_list'] = True
                 details['picking_pages'] = total_pages
@@ -493,10 +487,7 @@ def process_job(job, config, printer_mgr):
                 logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
                 errors.append(f'PickingList: {e}')
 
-            # Wait for picking list to finish before labels
-            usb_session.wait_ready(timeout=20)
-
-            # 3. Shipping Labels — one label per box, each auto-cut separately
+            # 3. Shipping Labels
             try:
                 flash_pnos = job.get('flash_label_pnos', [])
                 flash_meta = job.get('flash_meta', {})
@@ -505,7 +496,6 @@ def process_job(job, config, printer_mgr):
                 if total_boxes > 0:
                     label_w = config.get('label_width_mm', 100)
                     label_h = config.get('label_height_mm', 180)
-                    label_pdfs = []
 
                     box_num = 0
                     box_items = []
@@ -521,7 +511,6 @@ def process_job(job, config, printer_mgr):
                                 'item_sku': item['sku'],
                             })
 
-                    # Guard: ถ้าจำนวนกล่องจริงไม่ตรงกับ total_boxes → ใช้จำนวนจริง
                     if len(box_items) != total_boxes:
                         logger.warning(f'  #{tid} total_boxes mismatch: WP={total_boxes} actual={len(box_items)}')
                         for bi in box_items:
@@ -530,7 +519,6 @@ def process_job(job, config, printer_mgr):
                     for i, bi in enumerate(box_items):
                         label_ctx = {**context, 'box': bi,
                                      'logo_path': context.get('logo_path_white', '') or context.get('logo_path_bw', '')}
-                        # Add Flash Express data if available
                         pno = flash_pnos[i] if i < len(flash_pnos) else ''
                         if pno:
                             label_ctx['flash'] = {
@@ -543,21 +531,22 @@ def process_job(job, config, printer_mgr):
                             }
                         label_html = render_template('shipping_label.html', label_ctx)
                         pdf_path = html_to_pdf(label_html, label_w, label_h)
-                        label_pdfs.append(pdf_path)
+                        all_tspl += printer_mgr.convert_to_tspl(pdf_path)
+                        temp_pdfs.append(pdf_path)
 
-                    logger.info(f'  Printing {len(label_pdfs)} labels #{tid} via USB session...')
-                    for i, pdf_path in enumerate(label_pdfs):
-                        title = f'Label #{tid} ({i+1}/{len(label_pdfs)})'
-                        printer_mgr.print_thermal_session(pdf_path, usb_session, title=title)
-                        usb_session.wait_ready(timeout=15)  # wait between labels
-
-                    details['labels_printed'] = len(label_pdfs)
-
-                    for p in label_pdfs:
-                        os.unlink(p)
+                    details['labels_printed'] = len(box_items)
             except Exception as e:
                 logger.error(f'  Label print error #{tid}: {e}', exc_info=True)
                 errors.append(f'Labels: {e}')
+
+            # ═══ SEND ALL AT ONCE — no backfeed between pages ═══
+            if all_tspl:
+                logger.info(f'  Sending {len(all_tspl)} bytes TSPL batch #{tid}...')
+                usb_session.write(bytes(all_tspl))
+                usb_session.wait_ready(timeout=60)
+
+            for p in temp_pdfs:
+                os.unlink(p)
 
         except Exception as e:
             logger.error(f'  USB session error #{tid}: {e}', exc_info=True)
