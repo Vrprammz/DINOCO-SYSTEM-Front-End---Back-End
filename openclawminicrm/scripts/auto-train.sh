@@ -1,13 +1,12 @@
 #!/bin/bash
-# auto-train.sh V4.0 — DINOCO AI Self-Improving Loop (Gemini-as-Judge)
+# auto-train.sh V5.0 — DINOCO AI Self-Improving Loop (Gemini-as-Judge + Flow Test)
 #
-# V4 changes:
-# - ใช้ Gemini ตัดสินแทน regex mustContain (smart-judge.js)
-# - ข้อ FAIL → วิเคราะห์สาเหตุ → auto-fix KB
-# - Score tracking ทุกรอบ + trend
-# - 4 phases: generate → judge → analyze → fix → repeat
+# V5 changes:
+# - เพิ่ม --flow-test mode ทดสอบ multi-turn conversation (context, tone, accuracy)
+# - 10 flow scenarios ครอบคลุม: สินค้า, เคลม, น้ำเสียง, prompt injection, สแลง
+# - 5 phases: generate → judge → flow-test → analyze → fix → repeat
 #
-# Usage: bash scripts/auto-train.sh [--rounds 5] [--gen 30] [--no-fix] [--v3]
+# Usage: bash scripts/auto-train.sh [--rounds 5] [--gen 30] [--no-fix] [--v3] [--flow-only]
 set -euo pipefail
 cd /opt/dinoco/openclawminicrm
 
@@ -16,10 +15,12 @@ ROUNDS=5
 GEN_COUNT=30
 AUTO_FIX=true
 LEGACY_MODE=false
+FLOW_ONLY=false
 AGENT=$(docker ps --format '{{.Names}}' | grep -i agent || echo "dinoco-agent")
 TOTAL_PASS=0
 TOTAL_FAIL=0
 TOTAL_KB_ADDED=0
+FLOW_SCORE=0
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -27,13 +28,14 @@ while [[ $# -gt 0 ]]; do
     --gen) GEN_COUNT=$2; shift 2;;
     --no-fix) AUTO_FIX=false; shift;;
     --v3) LEGACY_MODE=true; shift;;
+    --flow-only) FLOW_ONLY=true; shift;;
     *) shift;;
   esac
 done
 
 echo "=================================================="
-echo "  DINOCO Auto-Train V4.0 — Gemini-as-Judge"
-echo "  Rounds: $ROUNDS | Gen: $GEN_COUNT | AutoFix: $AUTO_FIX"
+echo "  DINOCO Auto-Train V5.0 — Gemini-as-Judge + Flow Test"
+echo "  Rounds: $ROUNDS | Gen: $GEN_COUNT | AutoFix: $AUTO_FIX | FlowOnly: $FLOW_ONLY"
 echo "=================================================="
 
 # ═══ Copy smart-judge.js เข้า Docker ═══
@@ -52,7 +54,23 @@ run_legacy_round() {
   docker exec $AGENT node /tmp/test-ai.js 2>/dev/null || true
 }
 
-# ═══ V4 Main Loop ═══
+# ═══ Flow-only shortcut ═══
+if [ "$FLOW_ONLY" = true ]; then
+  echo ""
+  echo "=== Flow Test Only Mode ==="
+  copy_judge
+  echo ""
+  echo "[Flow Test] Running multi-turn conversation tests..."
+  docker exec $AGENT node /app/scripts/smart-judge.js --flow-test 2>/dev/null | tee /tmp/flow-output.txt || true
+  FLOW_SCORE=$(grep "Score:" /tmp/flow-output.txt 2>/dev/null | tail -1 | grep -oE '[0-9]+%' | head -1 || echo "0%")
+  docker cp $AGENT:/app/scripts/flow-results.json scripts/flow-results.json 2>/dev/null || true
+  echo ""
+  echo "Flow Test Score: $FLOW_SCORE"
+  echo "Results: scripts/flow-results.json"
+  exit 0
+fi
+
+# ═══ V5 Main Loop ═══
 for ROUND in $(seq 1 $ROUNDS); do
   echo ""
   echo "=================================================="
@@ -73,9 +91,9 @@ for ROUND in $(seq 1 $ROUNDS); do
     echo "[WARN] Generate may have failed, check output above"
   fi
 
-  # --- Phase 2: Judge (Gemini ตัดสิน) ---
+  # --- Phase 2: Judge (Gemini ตัดสิน single-turn) ---
   echo ""
-  echo "[Phase 2] Judging with Gemini..."
+  echo "[Phase 2] Judging with Gemini (single-turn)..."
   docker exec $AGENT node /app/scripts/smart-judge.js --judge 2>/dev/null > /tmp/judge-output.txt || true
   cat /tmp/judge-output.txt
 
@@ -93,9 +111,16 @@ for ROUND in $(seq 1 $ROUNDS); do
   TOTAL_PASS=$((TOTAL_PASS + PASS))
   TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
 
+  # --- Phase 2.5: Flow Test (multi-turn) ---
+  echo ""
+  echo "[Phase 2.5] Flow Test (multi-turn conversations)..."
+  docker exec $AGENT node /app/scripts/smart-judge.js --flow-test 2>/dev/null > /tmp/flow-output.txt || true
+  cat /tmp/flow-output.txt
+  FLOW_SCORE=$(grep "Score:" /tmp/flow-output.txt 2>/dev/null | tail -1 | grep -oE '[0-9]+%' | head -1 || echo "0%")
+
   if [ "$FAIL" -eq 0 ] 2>/dev/null; then
     echo ""
-    echo "[Round $ROUND] ALL PASS! Score: 100%"
+    echo "[Round $ROUND] Single-turn ALL PASS! Flow: $FLOW_SCORE"
     continue
   fi
 
@@ -140,6 +165,7 @@ docker cp $AGENT:/app/scripts/score-history.json scripts/score-history.json 2>/d
 docker cp $AGENT:/app/scripts/judge-results.json scripts/judge-results.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/fail-analysis.json scripts/fail-analysis.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/kb-auto-added.csv scripts/kb-auto-added.csv 2>/dev/null || true
+docker cp $AGENT:/app/scripts/flow-results.json scripts/flow-results.json 2>/dev/null || true
 
 # ★ V4.2: Merge auto-added KB back to main CSV (กันหาย)
 if [ -f scripts/kb-auto-added.csv ]; then
@@ -157,13 +183,13 @@ GRAND_SCORE=0
 [ "$GRAND_TOTAL" -gt 0 ] && GRAND_SCORE=$((TOTAL_PASS * 100 / GRAND_TOTAL))
 
 echo "=================================================="
-echo "  Auto-Train V4 Summary"
-echo "  Rounds:    $ROUNDS"
-echo "  Total:     $GRAND_TOTAL tests"
-echo "  Passed:    $TOTAL_PASS"
-echo "  Failed:    $TOTAL_FAIL"
-echo "  Score:     $GRAND_SCORE%"
-echo "  KB Added:  $TOTAL_KB_ADDED entries"
+echo "  Auto-Train V5 Summary"
+echo "  Rounds:       $ROUNDS"
+echo "  Single-turn:  $GRAND_TOTAL tests ($GRAND_SCORE%)"
+echo "  Passed:       $TOTAL_PASS"
+echo "  Failed:       $TOTAL_FAIL"
+echo "  Flow Test:    $FLOW_SCORE"
+echo "  KB Added:     $TOTAL_KB_ADDED entries"
 echo "=================================================="
 
 # Show score trend
@@ -184,6 +210,7 @@ except: pass
 fi
 
 echo ""
-echo "Results: scripts/judge-results.json"
+echo "Results:  scripts/judge-results.json"
+echo "Flows:    scripts/flow-results.json"
 echo "Analysis: scripts/fail-analysis.json"
-echo "History: scripts/score-history.json"
+echo "History:  scripts/score-history.json"
