@@ -87,8 +87,8 @@
 | Component | Status | Notes |
 |-----------|--------|-------|
 | CPT & ACF (Snippet 0) | Done | 5 CPTs + ACF fields + helpers |
-| Core Utilities & Flex (Snippet 1) | Partial | Flex builders มี แต่ `b2f_liff_url()` crash -- ใช้ inline Flex ใน Snippet 3 แทน |
-| REST API (Snippet 2) | Done | 19+ endpoints + debug endpoints (ชั่วคราว) |
+| Core Utilities & Flex (Snippet 1) | Done | V.6.0 -- 22 Flex builders + `b2f_liff_url()` HMAC sig + `b2f_t()` 3-language helper |
+| REST API (Snippet 2) | Done | V.8.2 -- 20+ endpoints, po-cancel ใช้ FSM transition (ไม่ลบ PO), concurrent locks |
 | Webhook Handler (Snippet 3) | Done | Maker commands + Admin B2F commands + self-contained Flex menu |
 | Maker LIFF (Snippet 4) | Done | Shortcode `[b2f_maker_liff]` page `/b2f-maker/` |
 | Admin Dashboard Tabs (Snippet 5) | Done | Orders + Makers + Credit tabs + SKU picker (grid+multi-select) |
@@ -115,10 +115,9 @@
 
 | Issue | Severity | Description |
 |-------|----------|-------------|
-| `b2f_liff_url()` crash | Medium | Function error ทำให้ Flex ที่เรียกมันพังทั้ง function -- ต้อง debug root cause |
+| ~~`b2f_liff_url()` crash~~ | ~~Medium~~ | **FIXED V.1.2** -- ใช้ HMAC sig แทน JWT |
+| ~~po-cancel ลบ PO~~ | ~~High~~ | **FIXED V.8.2** -- ใช้ FSM transition ไม่ลบ PO อีกต่อไป, คืนสต็อก, เก็บ audit trail |
 | Debug endpoints ยังเปิดอยู่ | Low | `/debug-maker/`, `/debug-route/` เป็น public -- ต้องลบ/ปิดหลัง debug |
-| Maker LIFF ยังไม่ทดสอบ | Medium | Snippet 4 deploy แล้วแต่ยังไม่ได้ทดสอบ confirm PO flow จริง |
-| B2F Orders tab ยังไม่ทดสอบ | Medium | สร้าง PO จาก Admin Dashboard ยังไม่ได้ทดสอบ |
 | `b2f_format_maker()` N+1 query | Low | นับ product_count + po_count ต่อ maker -- ช้าเมื่อ makers เยอะ |
 
 ## 1.4 Problem & Goal
@@ -258,10 +257,14 @@ Admin แก้ไข PO (ก่อน Maker ยืนยัน)
 ├── ส่ง Flex "ใบสั่งซื้อแก้ไข (ฉบับที่ N)" → ห้อง Maker
 └── Maker ต้องยืนยันใหม่
 
-Admin ยกเลิก PO
+Admin ยกเลิก PO (V.8.2)
 ├── Admin กด "ยกเลิก PO" + ให้เหตุผล (confirm 2 ครั้ง)
-├── PO status = "cancelled"
-└── ส่ง Flex "ยกเลิกใบสั่งซื้อ" → ห้อง Maker
+├── FSM transition → cancelled (ไม่ใช่ wp_delete_post)
+├── คืนสต็อก: dinoco_stock_subtract() per received SKU
+├── เก็บ receiving + payment records ทั้งหมด (audit trail)
+├── บันทึก: po_cancelled_reason, po_cancelled_by, po_cancelled_date
+├── PO status = "cancelled" (ยัง query ได้, ไม่หายจากระบบ)
+└── ส่ง Flex "ยกเลิกใบสั่งซื้อ" → ห้อง Maker + Admin
 
 Maker ขอเลื่อนส่ง
 ├── Maker กดปุ่ม "ขอเลื่อนวันส่ง" → กรอกวันใหม่ + เหตุผล
@@ -515,7 +518,7 @@ $transitions = array(
 | POST | `/create-po` | admin | สร้าง Purchase Order |
 | GET | `/po-detail/{po_id}` | admin/maker | ดูรายละเอียด PO |
 | POST | `/po-update` | admin | แก้ไข PO |
-| POST | `/po-cancel` | admin | ยกเลิก PO |
+| POST | `/po-cancel` | admin | ยกเลิก PO (V.8.2: FSM transition, คืนสต็อก, เก็บ audit trail) |
 | POST | `/maker-confirm` | maker (LIFF) | Maker ยืนยัน PO + ETA |
 | POST | `/maker-reject` | maker (LIFF) | Maker ปฏิเสธ PO |
 | POST | `/maker-reschedule` | maker (LIFF) | Maker ขอเลื่อนวันส่ง |
@@ -581,7 +584,7 @@ $transitions = array(
 | `[B2F] Snippet 5: Admin Dashboard Tabs` | shortcode modules |
 | `[B2F] Snippet 6: Order State Machine` | FSM class |
 | `[B2F] Snippet 7: Credit Transaction Manager` | Atomic payable operations |
-| `[B2F] Snippet 8: Cron Jobs` | Reminders, overdue, summaries |
+| `[B2F] Snippet 11: Cron Jobs & Reminders` | V.2.1 -- Reminders, overdue, summaries + rejected PO escalation (7 days) |
 
 ### Side Effects
 
@@ -1308,6 +1311,8 @@ Base: `/wp-json/dinoco-mcp/v1/` | Auth: `X-API-Key` header
 - **EXISTS (6 endpoints)**: product-lookup, dealer-lookup, warranty-check, kb-search, kb-export, catalog-full
 - **NEW-P1 (11 endpoints)**: distributor-list, distributor-notify, lead-create/update/list, lead-followup-schedule, claim-manual-create/update/status, brand-voice-submit, kb-suggest
 - **NEW-P2 (8 endpoints)**: warranty-registered, member-motorcycle/assets, claim-status, customer-link, dealer-sla-report, etc.
+
+> **Note (LIFF AI V.1.4):** LIFF AI claim endpoints (`/liff-ai/v1/claim/*`) เคย broken เนื่องจากใช้ผิด CPT -- fixed แล้วใน V.1.4 (Snippet 1, DB_ID: 1180)
 - **NEW-P3 (6 endpoints)**: kb-updated, inventory-changed, moto-catalog, dashboard-inject-metrics, lead-attribution
 - **REMOVED (10 endpoints)**: All financial data endpoints (debt, pricing, payment, finance-summary, bank-info, invoice-image)
 
