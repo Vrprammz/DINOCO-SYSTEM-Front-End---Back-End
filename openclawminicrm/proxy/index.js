@@ -1078,7 +1078,15 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
         if (msg.type === "image" && activeClaim && ["photo_requested","photo_rejected","photo_received"].includes(activeClaim.status)) {
           // ลูกค้า LINE ส่งรูปเคลม
           const imgBuffer = await downloadLineImage(msg.id).catch(() => null);
-          const imgUrl = imgBuffer ? `data:image/jpeg;base64,${imgBuffer.toString("base64")}` : null;
+          let imgUrl = null;
+          if (imgBuffer) {
+            const claimUploadsDir = path.join(__dirname, 'uploads', 'claims');
+            if (!fs.existsSync(claimUploadsDir)) fs.mkdirSync(claimUploadsDir, { recursive: true });
+            const filename = `claim_${sourceId}_${Date.now()}.jpg`;
+            fs.writeFileSync(path.join(claimUploadsDir, filename), imgBuffer);
+            const baseUrl = process.env.BASE_URL || 'https://ai.dinoco.in.th';
+            imgUrl = `${baseUrl}/uploads/claims/${filename}`;
+          }
           const claimReply = await processClaimMessage(sourceId, "line", "[รูปภาพ]", imgUrl, userName);
           if (claimReply && event.replyToken) { await replyToLine(event.replyToken, claimReply); await saveMsg(sourceId, { role: "assistant", userName: DEFAULT_BOT_NAME, content: claimReply, messageType: "text", isAiReply: true }, "line"); }
         } else if (msg.text && (activeClaim || isClaimIntent(msg.text))) {

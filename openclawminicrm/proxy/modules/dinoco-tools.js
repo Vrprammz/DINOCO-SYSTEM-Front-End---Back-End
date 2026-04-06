@@ -723,6 +723,7 @@ async function executeTool(toolName, args, sourceId) {
     try {
       // 1. สร้างเคลมใน MongoDB (manual_claims)
       const database = await getDB();
+      const detectedPlatform = sourceId.startsWith("fb_") ? "facebook" : sourceId.startsWith("ig_") ? "instagram" : "line";
       const claimDoc = {
         symptoms,
         phone,
@@ -733,7 +734,7 @@ async function executeTool(toolName, args, sourceId) {
         serial: args.serial || "",
         purchaseFrom: args.purchase_from || "",
         sourceId,
-        platform: "facebook",
+        platform: detectedPlatform,
         status: "info_collected",
         createdAt: new Date(),
         initiatedBy: "ai_tool",
@@ -755,7 +756,7 @@ async function executeTool(toolName, args, sourceId) {
         serial: args.serial || "",
         purchase_from: args.purchase_from || "",
         source_id: sourceId,
-        platform: "facebook",
+        platform: detectedPlatform,
         initiated_by: "customer",
         ai_analysis: `AI เปิดเคลมอัตโนมัติ — อาการ: ${symptoms}`,
       });

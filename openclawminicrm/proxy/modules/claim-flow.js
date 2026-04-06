@@ -1,6 +1,6 @@
 /**
  * claim-flow.js — Manual claim flow, AI-powered claim detection + KB-aware questions
- * V.2.0 — AI ถามฉลาด ดึง KB + วิเคราะห์รูป ไม่ใช้ hardcode steps
+ * V.2.1 — Auto-timeout abandoned claims (48h inactive → customer_no_response)
  */
 const { getDB, getTemplate, getDynamicKeySync } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -204,10 +204,25 @@ async function analyzeClaimPhoto(imageUrl) {
 async function getClaimSession(sourceId) {
   const db = await getDB();
   if (!db) return null;
-  return db.collection("manual_claims").findOne({
+  const claim = await db.collection("manual_claims").findOne({
     sourceId,
     status: { $nin: ["closed_resolved", "closed_rejected", "customer_no_response"] },
   });
+
+  // Auto-timeout claims inactive for 48 hours
+  if (claim && claim.updatedAt) {
+    const hoursSinceUpdate = (Date.now() - new Date(claim.updatedAt).getTime()) / (1000 * 60 * 60);
+    if (hoursSinceUpdate > 48 && ["photo_requested", "photo_rejected", "photo_received", "info_collecting"].includes(claim.status)) {
+      await db.collection("manual_claims").updateOne(
+        { _id: claim._id },
+        { $set: { status: "customer_no_response", updatedAt: new Date(), auto_timeout: true } }
+      );
+      console.log(`[Claim] Auto-timeout: ${claim.customerName || sourceId} (${claim.status}, ${Math.round(hoursSinceUpdate)}h inactive)`);
+      return null; // Return null so normal AI chat handles the message
+    }
+  }
+
+  return claim;
 }
 
 async function startClaimFlow(sourceId, platform, customerName, initialMessage) {

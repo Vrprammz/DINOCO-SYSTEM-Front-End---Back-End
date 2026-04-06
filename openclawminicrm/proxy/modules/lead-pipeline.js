@@ -1,6 +1,6 @@
 /**
  * lead-pipeline.js — Lead statuses, transitions, CRUD, Mayom follow-up cron
- * V.1.0 — Extracted from index.js monolith
+ * V.1.1 — Fix dead-end statuses: order_placed..installed can now reach closed_lost/closed_cancelled
  */
 const { getDB, DEFAULT_BOT_NAME, auditLog } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -34,11 +34,11 @@ const LEAD_TRANSITIONS = {
   dealer_contacted: ["waiting_order", "closed_lost"],
   dealer_no_response: ["admin_escalated", "dealer_contacted"],
   waiting_order: ["order_placed", "closed_lost", "admin_escalated"],
-  order_placed: ["waiting_delivery"],
-  waiting_delivery: ["delivered", "admin_escalated"],
-  delivered: ["waiting_install"],
-  waiting_install: ["installed"],
-  installed: ["satisfaction_checked"],
+  order_placed: ["waiting_delivery", "closed_cancelled", "closed_lost", "admin_escalated"],
+  waiting_delivery: ["delivered", "closed_cancelled", "closed_lost", "admin_escalated"],
+  delivered: ["waiting_install", "closed_cancelled", "closed_lost", "admin_escalated"],
+  waiting_install: ["installed", "closed_cancelled", "closed_lost", "admin_escalated"],
+  installed: ["satisfaction_checked", "closed_cancelled", "closed_lost", "admin_escalated"],
   satisfaction_checked: ["closed_satisfied", "closed_lost"],
   admin_escalated: ["dealer_contacted", "closed_cancelled", "dormant"],
   dormant: ["lead_created"],
