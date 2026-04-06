@@ -573,10 +573,10 @@ sequenceDiagram
 | `oos_timestamp` | number | Timestamp when OOS |
 | `b2b_discount_percent` | number | Default discount % |
 | `price_standard` | number | Standard tier price |
-| `price_silver` | number | Silver tier price |
-| `price_gold` | number | Gold tier price |
-| `price_platinum` | number | Platinum tier price |
-| `price_diamond` | number | Diamond tier price |
+| `price_silver` | number | Silver tier discount % (0-100) |
+| `price_gold` | number | Gold tier discount % (0-100) |
+| `price_platinum` | number | Platinum tier discount % (0-100) |
+| `price_diamond` | number | Diamond tier discount % (0-100) |
 | `unit_of_measure` | text | Unit (ชิ้น, กล่อง, etc.) |
 | `min_order_qty` | number | Minimum order quantity |
 | `boxes_per_unit` | number | Boxes per unit |
