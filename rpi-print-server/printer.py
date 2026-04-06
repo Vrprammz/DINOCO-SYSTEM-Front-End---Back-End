@@ -263,16 +263,17 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
 
         data = bytearray()
 
+        # Target bitmap size = exact dots for SIZE command (ห้ามเกินแม้แต่ 1 dot)
+        target_w = int(paper_width_mm / 25.4 * dpi)
+        target_h = int(paper_height_mm / 25.4 * dpi)
+
         for page_file in pages[:1]:  # Only print first page — prevent blank label
             img = Image.open(os.path.join(tmpdir, page_file))
 
-            # Resize to fit printer width
-            if img.width > max_width:
-                ratio = max_width / img.width
-                img = img.resize((max_width, int(img.height * ratio)))
+            # Resize to exact target size (match SIZE command precisely)
+            img = img.resize((target_w, target_h))
 
             # Rotate 180° in software so we can use DIRECTION 0 (no retract)
-            # DIRECTION 1 retracts paper ~180mm before printing → causes paper jam
             img = img.rotate(180)
 
             # Convert to 1-bit black/white
@@ -281,14 +282,14 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
             width_bytes = (img.width + 7) // 8
             height = img.height
 
-            # TSPL SIZE = กระดาษจริง (fanfold 180mm ต้อง feed ตรง perforation)
+            # TSPL — SIZE ต้องตรงกับ bitmap เป๊ะ ไม่งั้นเลื่อนสะสมทุกแผ่น
             data += f'SIZE {paper_width_mm} mm, {paper_height_mm} mm\r\n'.encode()
             data += f'GAP {gap_mm} mm, 0 mm\r\n'.encode()
             data += f'DIRECTION {direction},0\r\n'.encode()
-            data += b'SET TEAR OFF\r\n'    # ปิด tear mode — ไม่ feed ไปตำแหน่งฉีก
-            data += b'SET CUTTER OFF\r\n'  # ปิด cutter mode
-            data += b'SET PEEL OFF\r\n'    # ปิด peel mode
-            data += b'SET BACK 0\r\n'      # ปิด auto backfeed
+            data += b'SET TEAR OFF\r\n'
+            data += b'SET CUTTER OFF\r\n'
+            data += b'SET PEEL OFF\r\n'
+            data += b'SET BACK 0\r\n'
             data += b'CLS\r\n'
 
             # BITMAP x, y, width_bytes, height, mode, data
