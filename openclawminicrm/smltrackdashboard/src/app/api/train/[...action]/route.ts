@@ -14,7 +14,8 @@ async function proxyToAgent(
   const url = `${agentUrl()}/api/train/${path}`;
 
   try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const apiKey = process.env.API_SECRET_KEY || process.env.AGENT_API_KEY || "dnc-api-2026-supersecret-changethis";
+    const headers: Record<string, string> = { "Content-Type": "application/json", "x-api-key": apiKey };
     const opts: RequestInit = { method, headers };
 
     if (method !== "GET" && method !== "DELETE") {
