@@ -285,7 +285,10 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
             data += f'SIZE {paper_width_mm} mm, {paper_height_mm} mm\r\n'.encode()
             data += f'GAP {gap_mm} mm, 0 mm\r\n'.encode()
             data += f'DIRECTION {direction},0\r\n'.encode()
-            data += b'SET BACK 0\r\n'  # ปิด auto backfeed — ป้องกันกระดาษถอยหลัง
+            data += b'SET TEAR OFF\r\n'    # ปิด tear mode — ไม่ feed ไปตำแหน่งฉีก
+            data += b'SET CUTTER OFF\r\n'  # ปิด cutter mode
+            data += b'SET PEEL OFF\r\n'    # ปิด peel mode
+            data += b'SET BACK 0\r\n'      # ปิด auto backfeed
             data += b'CLS\r\n'
 
             # BITMAP x, y, width_bytes, height, mode, data
