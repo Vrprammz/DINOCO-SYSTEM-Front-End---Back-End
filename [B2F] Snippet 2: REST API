@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.8.1 — Inventory V.3.0: dinoco_stock_add() ใน receive-goods
+ * Version: V.8.2 — Fix po-cancel: FSM transition + reverse stock + keep audit trail (no delete)
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -1553,9 +1553,9 @@ if ( ! function_exists( 'b2f_rest_po_update' ) ) {
 
 if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
     /**
-     * POST /po-cancel — ลบ PO ออกจากระบบ (admin) + rollback debt + แจ้งโรงงาน
+     * POST /po-cancel — ยกเลิก PO (admin) + reverse stock + rollback credit + แจ้งโรงงาน
      * Body: { po_id, reason }
-     * ลบไม่ได้: completed (ปิดแล้ว)
+     * V.8.2: ใช้ FSM transition แทน wp_delete_post — เก็บ PO + receiving + payment เป็น audit trail
      */
     function b2f_rest_po_cancel( WP_REST_Request $req ) {
         $po_id  = intval( $req->get_param( 'po_id' ) ?: 0 );
@@ -1581,45 +1581,74 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         $current_status = get_field( 'po_status', $po_id );
         $maker_id       = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
 
-        // ห้ามลบเฉพาะ cancelled (ลบไปแล้ว ไม่ควรมีใน list)
+        // ห้ามยกเลิกซ้ำ
         if ( $current_status === 'cancelled' ) {
             $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $cancel_lock ) );
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ใบสั่งซื้อนี้ถูกยกเลิกไปแล้ว', 'code' => 'ALREADY_CANCELLED' ), 400 );
         }
 
-        // เก็บข้อมูลก่อนลบ (สำหรับ Flex แจ้งโรงงาน)
+        // V.8.2: FSM transition แทน wp_delete_post
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            $fsm_result = b2f_transition_order( $po_id, 'cancelled', 'admin', $reason );
+            if ( is_wp_error( $fsm_result ) ) {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $cancel_lock ) );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => $fsm_result->get_error_message(),
+                    'code'    => 'FSM_REJECTED',
+                ), 400 );
+            }
+        } else {
+            // Fallback: direct status update ถ้า FSM ไม่ load
+            update_field( 'po_status', 'cancelled', $po_id );
+        }
+
+        // V.8.2: บันทึก cancellation metadata (audit trail)
+        $cancelled_by = 'Admin';
+        $uid = get_current_user_id();
+        if ( $uid ) { $u = get_user_by( 'id', $uid ); if ( $u ) $cancelled_by = $u->display_name; }
+
+        update_field( 'po_cancelled_reason', $reason, $po_id );
+        update_field( 'po_cancelled_by', $cancelled_by, $po_id );
+        $tz = new DateTimeZone( 'Asia/Bangkok' );
+        update_field( 'po_cancelled_date', ( new DateTime( 'now', $tz ) )->format( 'Y-m-d' ), $po_id );
+
+        // เก็บข้อมูลสำหรับ Flex notification
         $po_number      = get_field( 'po_number', $po_id ) ?: 'PO-' . $po_id;
         $maker_name_str = is_numeric( $maker_id ) ? ( get_field( 'maker_name', $maker_id ) ?: '' ) : '';
         $total_str      = number_format( floatval( get_field( 'po_total_amount', $po_id ) ?: 0 ), 0 );
         $maker_group    = $maker_id ? ( get_field( 'maker_line_group_id', $maker_id ) ?: '' ) : '';
-        // W2 FIX: เก็บ currency ก่อน wp_delete_post
         $po_currency    = get_field( 'po_currency', $po_id ) ?: 'THB';
         $cur_sym        = function_exists( 'b2f_currency_symbol' ) ? b2f_currency_symbol( $po_currency ) : '฿';
 
-        // Rollback credit — recalculate หลังลบ
-        $rollback_info = array();
-        $old_debt = floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 );
-
-        // ลบ related records: receiving, payment
-        $related_types = array( 'b2f_receiving', 'b2f_payment' );
-        $deleted_related = 0;
-        foreach ( $related_types as $rel_type ) {
-            $related_ids = $wpdb->get_col( $wpdb->prepare(
-                "SELECT p.ID FROM {$wpdb->posts} p
-                 JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
-                 WHERE p.post_type = %s AND pm.meta_key IN ('rcv_po_id','pmt_po_id') AND pm.meta_value = %s",
-                $rel_type, $po_id
-            ) );
-            foreach ( $related_ids as $rel_id ) {
-                wp_delete_post( intval( $rel_id ), true ); // force delete
-                $deleted_related++;
+        // V.8.2: Reverse stock — คืนสต็อกที่เคย add ผ่าน receive-goods
+        $stock_reversed = 0;
+        $receivings = get_posts( array(
+            'post_type'      => 'b2f_receiving',
+            'meta_query'     => array( array( 'key' => 'rcv_po_id', 'value' => $po_id ) ),
+            'posts_per_page' => -1,
+            'post_status'    => 'any',
+        ) );
+        foreach ( $receivings as $rcv ) {
+            $rcv_items = get_field( 'rcv_items', $rcv->ID );
+            if ( ! $rcv_items || ! is_array( $rcv_items ) ) continue;
+            if ( function_exists( 'dinoco_stock_subtract' ) ) {
+                foreach ( $rcv_items as $item ) {
+                    $sku = $item['rcvi_sku'] ?? '';
+                    // receive-goods เพิ่มเฉพาะ rcvi_qty_received (rejected ไม่เคยถูก add)
+                    $qty = intval( $item['rcvi_qty_received'] ?? 0 );
+                    if ( $sku && $qty > 0 ) {
+                        dinoco_stock_subtract( $sku, $qty, 'b2f_cancel', 'b2f_order', $po_id, 'B2F Cancel ' . $po_number );
+                        $stock_reversed += $qty;
+                    }
+                }
             }
         }
 
-        // ลบ PO จริง
-        wp_delete_post( $po_id, true );
-
-        // Recalculate debt หลังลบ
+        // V.8.2: Recalculate payable (receiving + payment records ยังอยู่ แต่ FSM status=cancelled
+        // ทำให้ b2f_recalculate_payable ไม่นับ cancelled PO)
+        $rollback_info = array();
+        $old_debt = floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 );
         if ( function_exists( 'b2f_recalculate_payable' ) && $maker_id > 0 ) {
             $new_debt = b2f_recalculate_payable( $maker_id );
             $reversed = round( $old_debt - $new_debt, 2 );
@@ -1629,11 +1658,6 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
                 $rollback_info['new_debt']      = $new_debt;
             }
         }
-
-        // Push cancel notification ทั้ง Maker + Admin group
-        $cancelled_by = 'Admin';
-        $uid = get_current_user_id();
-        if ( $uid ) { $u = get_user_by( 'id', $uid ); if ( $u ) $cancelled_by = $u->display_name; }
 
         // V.8.0: 3-lang labels for Maker Flex (THB/USD/CNY)
         $cur = $po_currency ?: 'THB';
@@ -1688,6 +1712,9 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         // Flex Admin (เพิ่ม "โดย") — always Thai
         $admin_body = $cancel_body_admin;
         $admin_body[] = array( 'type' => 'text', 'text' => 'ยกเลิกโดย: ' . $cancelled_by, 'size' => 'xs', 'color' => '#94a3b8', 'margin' => 'sm' );
+        if ( $stock_reversed > 0 ) {
+            $admin_body[] = array( 'type' => 'text', 'text' => 'คืนสต็อก: ' . $stock_reversed . ' ชิ้น', 'size' => 'xs', 'color' => '#f59e0b', 'margin' => 'xs' );
+        }
         $flex_admin = array( 'type' => 'flex', 'altText' => '❌ ยกเลิกใบสั่งซื้อ ' . $po_number,
             'contents' => array( 'type' => 'bubble', 'size' => 'mega',
                 'header' => array( 'type' => 'box', 'layout' => 'vertical', 'backgroundColor' => '#0a0a0a', 'paddingAll' => '16px',
@@ -1709,16 +1736,19 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         }
 
         if ( function_exists( 'b2f_log' ) ) {
-            b2f_log( sprintf( 'PO DELETED: %s (#%d) reason=%s related_deleted=%d rollback=%s',
-                $po_number, $po_id, $reason, $deleted_related, wp_json_encode( $rollback_info )
+            b2f_log( sprintf( 'PO CANCELLED: %s (#%d) reason=%s stock_reversed=%d rollback=%s by=%s',
+                $po_number, $po_id, $reason, $stock_reversed, wp_json_encode( $rollback_info ), $cancelled_by
             ) );
         }
 
         $resp = array(
-            'success' => true, 'po_id' => $po_id, 'action' => 'deleted', 'po_number' => $po_number,
-            'deleted_related' => $deleted_related,
-            'push_maker' => $push_maker ? 'sent' : ( empty( $maker_group ) ? 'no_group' : 'failed' ),
-            'push_admin' => $push_admin ? 'sent' : ( ! defined( 'B2B_ADMIN_GROUP_ID' ) ? 'no_config' : 'failed' ),
+            'success'        => true,
+            'po_id'          => $po_id,
+            'action'         => 'cancelled',
+            'po_number'      => $po_number,
+            'stock_reversed' => $stock_reversed,
+            'push_maker'     => $push_maker ? 'sent' : ( empty( $maker_group ) ? 'no_group' : 'failed' ),
+            'push_admin'     => $push_admin ? 'sent' : ( ! defined( 'B2B_ADMIN_GROUP_ID' ) ? 'no_config' : 'failed' ),
         );
         if ( ! empty( $rollback_info ) ) {
             $resp['rollback'] = $rollback_info;
