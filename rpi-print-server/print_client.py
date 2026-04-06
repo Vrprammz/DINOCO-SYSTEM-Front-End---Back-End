@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.2.3 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.2.4 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -407,152 +407,292 @@ def process_job(job, config, printer_mgr):
         logger.error(f'  Invoice print error #{tid}: {e}', exc_info=True)
         errors.append(f'Invoice: {e}')
 
-    # ── Delay 5s หลัง Invoice ให้ USB device พร้อม ──
-    logger.info(f'  Waiting 5s after invoice #{tid}...')
-    time.sleep(5)
+    # ═══ THERMAL PRINTS (USB Session — open once, send all) ═══
+    # Invoice goes to Epson (different device) — no delay needed before thermal
+    usb_session = printer_mgr.create_usb_session()
+    if usb_session:
+        try:
+            usb_session.open()
 
-    # 2. Picking List — V.2.3: pagination per-item group (parent+children = 1 unit)
-    try:
-        logger.info(f'  Rendering picking list #{tid}...')
-        pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
+            # 2. Picking List — V.2.2 pagination per-item group (parent+children = 1 unit)
+            try:
+                logger.info(f'  Rendering picking list #{tid}...')
+                pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
 
-        all_items = order.get('items', [])
+                all_items = order.get('items', [])
 
-        # นับ rows ต่อ item (parent 1 row + children N rows)
-        ROW_MM = 13
-        HEADER_MM = 38          # logo + ticket# + shop name + note
-        FOOTER_LAST_MM = 75     # totals box + address + QR + footer line
-        FOOTER_NORMAL_MM = 12   # footer line only
-        PAGE_H = 180
-        MARGIN_MM = 6           # top+bottom margin จาก @page
+                # นับ rows ต่อ item (parent 1 row + children N rows)
+                ROW_MM = 13
+                HEADER_MM = 38          # logo + ticket# + shop name + note
+                FOOTER_LAST_MM = 75     # totals box + address + QR + footer line
+                FOOTER_NORMAL_MM = 12   # footer line only
+                PAGE_H = 180
+                MARGIN_MM = 6           # top+bottom margin จาก @page
 
-        usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
-        usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
+                usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
+                usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
 
-        # แบ่ง items เป็น pages — นับ rows per item group
-        pages = []
-        current_page = []
-        current_mm = 0
-
-        for it in all_items:
-            n_children = len(it.get('children', []))
-            item_mm = (1 + n_children) * ROW_MM  # parent + children rows
-
-            # ถ้าเกินหน้า → ขึ้นหน้าใหม่ (ยกเว้นหน้าว่าง)
-            if current_page and (current_mm + item_mm) > usable_normal:
-                pages.append(current_page)
+                # แบ่ง items เป็น pages — นับ rows per item group
+                pages = []
                 current_page = []
                 current_mm = 0
 
-            current_page.append(it)
-            current_mm += item_mm
+                for it in all_items:
+                    n_children = len(it.get('children', []))
+                    item_mm = (1 + n_children) * ROW_MM  # parent + children rows
 
-        if current_page:
-            pages.append(current_page)
+                    # ถ้าเกินหน้า → ขึ้นหน้าใหม่ (ยกเว้นหน้าว่าง)
+                    if current_page and (current_mm + item_mm) > usable_normal:
+                        pages.append(current_page)
+                        current_page = []
+                        current_mm = 0
 
-        # ตรวจหน้าสุดท้าย: ถ้า content + footer เกิน → ย้าย item สุดท้ายไปหน้าใหม่
-        if len(pages) >= 1:
-            last = pages[-1]
-            last_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in last)
-            if last_mm > usable_last and len(last) > 1:
-                overflow = last.pop()
-                pages.append([overflow])
+                    current_page.append(it)
+                    current_mm += item_mm
 
-        total_pages = len(pages)
-        total_rows = sum(1 + len(it.get('children', [])) for it in all_items)
-        logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_rows} rows, {total_pages} pages')
+                if current_page:
+                    pages.append(current_page)
 
-        for page_idx, page_items in enumerate(pages):
-            page_num = page_idx + 1
-            is_last = page_num == total_pages
+                # ตรวจหน้าสุดท้าย: ถ้า content + footer เกิน → ย้าย item สุดท้ายไปหน้าใหม่
+                if len(pages) >= 1:
+                    last = pages[-1]
+                    last_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in last)
+                    if last_mm > usable_last and len(last) > 1:
+                        overflow = last.pop()
+                        pages.append([overflow])
 
-            page_order = {**order, 'items': page_items}
+                total_pages = len(pages)
+                total_rows = sum(1 + len(it.get('children', [])) for it in all_items)
+                logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_rows} rows, {total_pages} pages')
 
-            pick_ctx = {**context,
-                        'order': page_order,
-                        'page_num': page_num,
-                        'total_pages': total_pages,
-                        'is_last_page': is_last,
-                        'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
+                for page_idx, page_items in enumerate(pages):
+                    page_num = page_idx + 1
+                    is_last = page_num == total_pages
 
-            # Dynamic height ตาม content จริง — ไม่บังคับ 180mm
-            rows_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in page_items)
-            footer_mm = FOOTER_LAST_MM if is_last else FOOTER_NORMAL_MM
-            content_h = HEADER_MM + rows_mm + footer_mm + MARGIN_MM + 5  # 5mm padding
-            pick_h = max(content_h, 80)  # minimum 80mm
+                    page_order = {**order, 'items': page_items}
 
-            pick_html = render_template(pick_tpl, pick_ctx)
-            pick_pdf = html_to_pdf(pick_html, 100, pick_h)
-            printer_mgr.print_picking_list(pick_pdf, tid)
-            os.unlink(pick_pdf)
+                    pick_ctx = {**context,
+                                'order': page_order,
+                                'page_num': page_num,
+                                'total_pages': total_pages,
+                                'is_last_page': is_last,
+                                'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
 
-        details['picking_list'] = True
-        details['picking_pages'] = total_pages
-    except Exception as e:
-        logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
-        errors.append(f'PickingList: {e}')
+                    # Dynamic height ตาม content จริง — ไม่บังคับ 180mm
+                    rows_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in page_items)
+                    footer_mm = FOOTER_LAST_MM if is_last else FOOTER_NORMAL_MM
+                    content_h = HEADER_MM + rows_mm + footer_mm + MARGIN_MM + 5  # 5mm padding
+                    pick_h = max(content_h, 80)  # minimum 80mm
 
-    # ── Delay 10s ระหว่าง Picking List กับ Shipping Labels ──
-    logger.info(f'  Waiting 10s before shipping labels #{tid}...')
-    time.sleep(10)
+                    pick_html = render_template(pick_tpl, pick_ctx)
+                    pick_pdf = html_to_pdf(pick_html, 100, pick_h)
+                    printer_mgr.print_thermal_session(pick_pdf, usb_session, title=f'PickingList #{tid} p{page_num}')
+                    os.unlink(pick_pdf)
+                    usb_session.wait_ready(timeout=15)  # wait for cutter
 
-    # 3. Shipping Labels — one label per box, each auto-cut separately
-    try:
-        flash_pnos = job.get('flash_label_pnos', [])
-        flash_meta = job.get('flash_meta', {})
-        total_boxes = order.get('total_boxes', 0)
+                details['picking_list'] = True
+                details['picking_pages'] = total_pages
+            except Exception as e:
+                logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
+                errors.append(f'PickingList: {e}')
 
-        if total_boxes > 0:
-            label_w = config.get('label_width_mm', 100)
-            label_h = config.get('label_height_mm', 180)
-            label_pdfs = []
+            # Wait for picking list to finish before labels
+            usb_session.wait_ready(timeout=20)
 
-            box_num = 0
-            box_items = []
-            for item in order.get('items', []):
-                bpu = item.get('boxes_per_unit', 1)
-                item_boxes = item['qty'] * bpu
-                for _ in range(item_boxes):
-                    box_num += 1
-                    box_items.append({
-                        'box_num': box_num,
-                        'total_boxes': total_boxes,
-                        'item_name': item['name'],
-                        'item_sku': item['sku'],
-                    })
+            # 3. Shipping Labels — one label per box, each auto-cut separately
+            try:
+                flash_pnos = job.get('flash_label_pnos', [])
+                flash_meta = job.get('flash_meta', {})
+                total_boxes = order.get('total_boxes', 0)
 
-            # Guard: ถ้าจำนวนกล่องจริงไม่ตรงกับ total_boxes → ใช้จำนวนจริง
-            if len(box_items) != total_boxes:
-                logger.warning(f'  #{tid} total_boxes mismatch: WP={total_boxes} actual={len(box_items)}')
-                for bi in box_items:
-                    bi['total_boxes'] = len(box_items)
+                if total_boxes > 0:
+                    label_w = config.get('label_width_mm', 100)
+                    label_h = config.get('label_height_mm', 180)
+                    label_pdfs = []
 
-            for i, bi in enumerate(box_items):
-                label_ctx = {**context, 'box': bi,
-                             'logo_path': context.get('logo_path_white', '') or context.get('logo_path_bw', '')}
-                # Add Flash Express data if available
-                pno = flash_pnos[i] if i < len(flash_pnos) else ''
-                if pno:
-                    label_ctx['flash'] = {
-                        'pno': pno,
-                        'sort_code': flash_meta.get('sort_code', ''),
-                        'sorting_line_code': flash_meta.get('sorting_line_code', ''),
-                        'dst_store_name': flash_meta.get('dst_store_name', ''),
-                        'barcode_uri': generate_barcode_data_uri(pno),
-                        'qr_uri': generate_qr_data_uri(pno, box_size=8, border=1),
-                    }
-                label_html = render_template('shipping_label.html', label_ctx)
-                pdf_path = html_to_pdf(label_html, label_w, label_h)
-                label_pdfs.append(pdf_path)
+                    box_num = 0
+                    box_items = []
+                    for item in order.get('items', []):
+                        bpu = item.get('boxes_per_unit', 1)
+                        item_boxes = item['qty'] * bpu
+                        for _ in range(item_boxes):
+                            box_num += 1
+                            box_items.append({
+                                'box_num': box_num,
+                                'total_boxes': total_boxes,
+                                'item_name': item['name'],
+                                'item_sku': item['sku'],
+                            })
 
-            logger.info(f'  Printing {len(label_pdfs)} labels #{tid}...')
-            details['labels_printed'] = printer_mgr.print_labels(label_pdfs, tid)
+                    # Guard: ถ้าจำนวนกล่องจริงไม่ตรงกับ total_boxes → ใช้จำนวนจริง
+                    if len(box_items) != total_boxes:
+                        logger.warning(f'  #{tid} total_boxes mismatch: WP={total_boxes} actual={len(box_items)}')
+                        for bi in box_items:
+                            bi['total_boxes'] = len(box_items)
 
-            for p in label_pdfs:
-                os.unlink(p)
-    except Exception as e:
-        logger.error(f'  Label print error #{tid}: {e}', exc_info=True)
-        errors.append(f'Labels: {e}')
+                    for i, bi in enumerate(box_items):
+                        label_ctx = {**context, 'box': bi,
+                                     'logo_path': context.get('logo_path_white', '') or context.get('logo_path_bw', '')}
+                        # Add Flash Express data if available
+                        pno = flash_pnos[i] if i < len(flash_pnos) else ''
+                        if pno:
+                            label_ctx['flash'] = {
+                                'pno': pno,
+                                'sort_code': flash_meta.get('sort_code', ''),
+                                'sorting_line_code': flash_meta.get('sorting_line_code', ''),
+                                'dst_store_name': flash_meta.get('dst_store_name', ''),
+                                'barcode_uri': generate_barcode_data_uri(pno),
+                                'qr_uri': generate_qr_data_uri(pno, box_size=8, border=1),
+                            }
+                        label_html = render_template('shipping_label.html', label_ctx)
+                        pdf_path = html_to_pdf(label_html, label_w, label_h)
+                        label_pdfs.append(pdf_path)
+
+                    logger.info(f'  Printing {len(label_pdfs)} labels #{tid} via USB session...')
+                    for i, pdf_path in enumerate(label_pdfs):
+                        title = f'Label #{tid} ({i+1}/{len(label_pdfs)})'
+                        printer_mgr.print_thermal_session(pdf_path, usb_session, title=title)
+                        usb_session.wait_ready(timeout=15)  # wait between labels
+
+                    details['labels_printed'] = len(label_pdfs)
+
+                    for p in label_pdfs:
+                        os.unlink(p)
+            except Exception as e:
+                logger.error(f'  Label print error #{tid}: {e}', exc_info=True)
+                errors.append(f'Labels: {e}')
+
+        except Exception as e:
+            logger.error(f'  USB session error #{tid}: {e}', exc_info=True)
+            errors.append(f'USB: {e}')
+        finally:
+            usb_session.close()
+    else:
+        # ═══ Non-USB fallback — use existing CUPS print methods ═══
+        # 2. Picking List (CUPS)
+        try:
+            logger.info(f'  Rendering picking list #{tid} (CUPS)...')
+            pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
+
+            all_items = order.get('items', [])
+            ROW_MM = 13
+            HEADER_MM = 38
+            FOOTER_LAST_MM = 75
+            FOOTER_NORMAL_MM = 12
+            PAGE_H = 180
+            MARGIN_MM = 6
+
+            usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
+            usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
+
+            pages = []
+            current_page = []
+            current_mm = 0
+
+            for it in all_items:
+                n_children = len(it.get('children', []))
+                item_mm = (1 + n_children) * ROW_MM
+                if current_page and (current_mm + item_mm) > usable_normal:
+                    pages.append(current_page)
+                    current_page = []
+                    current_mm = 0
+                current_page.append(it)
+                current_mm += item_mm
+
+            if current_page:
+                pages.append(current_page)
+
+            if len(pages) >= 1:
+                last = pages[-1]
+                last_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in last)
+                if last_mm > usable_last and len(last) > 1:
+                    overflow = last.pop()
+                    pages.append([overflow])
+
+            total_pages = len(pages)
+            total_rows = sum(1 + len(it.get('children', [])) for it in all_items)
+            logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_rows} rows, {total_pages} pages')
+
+            for page_idx, page_items in enumerate(pages):
+                page_num = page_idx + 1
+                is_last = page_num == total_pages
+                page_order = {**order, 'items': page_items}
+                pick_ctx = {**context,
+                            'order': page_order,
+                            'page_num': page_num,
+                            'total_pages': total_pages,
+                            'is_last_page': is_last,
+                            'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
+                rows_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in page_items)
+                footer_mm = FOOTER_LAST_MM if is_last else FOOTER_NORMAL_MM
+                content_h = HEADER_MM + rows_mm + footer_mm + MARGIN_MM + 5
+                pick_h = max(content_h, 80)
+                pick_html = render_template(pick_tpl, pick_ctx)
+                pick_pdf = html_to_pdf(pick_html, 100, pick_h)
+                printer_mgr.print_picking_list(pick_pdf, tid)
+                os.unlink(pick_pdf)
+
+            details['picking_list'] = True
+            details['picking_pages'] = total_pages
+        except Exception as e:
+            logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
+            errors.append(f'PickingList: {e}')
+
+        # 3. Shipping Labels (CUPS)
+        try:
+            flash_pnos = job.get('flash_label_pnos', [])
+            flash_meta = job.get('flash_meta', {})
+            total_boxes = order.get('total_boxes', 0)
+
+            if total_boxes > 0:
+                label_w = config.get('label_width_mm', 100)
+                label_h = config.get('label_height_mm', 180)
+                label_pdfs = []
+
+                box_num = 0
+                box_items = []
+                for item in order.get('items', []):
+                    bpu = item.get('boxes_per_unit', 1)
+                    item_boxes = item['qty'] * bpu
+                    for _ in range(item_boxes):
+                        box_num += 1
+                        box_items.append({
+                            'box_num': box_num,
+                            'total_boxes': total_boxes,
+                            'item_name': item['name'],
+                            'item_sku': item['sku'],
+                        })
+
+                if len(box_items) != total_boxes:
+                    logger.warning(f'  #{tid} total_boxes mismatch: WP={total_boxes} actual={len(box_items)}')
+                    for bi in box_items:
+                        bi['total_boxes'] = len(box_items)
+
+                for i, bi in enumerate(box_items):
+                    label_ctx = {**context, 'box': bi,
+                                 'logo_path': context.get('logo_path_white', '') or context.get('logo_path_bw', '')}
+                    pno = flash_pnos[i] if i < len(flash_pnos) else ''
+                    if pno:
+                        label_ctx['flash'] = {
+                            'pno': pno,
+                            'sort_code': flash_meta.get('sort_code', ''),
+                            'sorting_line_code': flash_meta.get('sorting_line_code', ''),
+                            'dst_store_name': flash_meta.get('dst_store_name', ''),
+                            'barcode_uri': generate_barcode_data_uri(pno),
+                            'qr_uri': generate_qr_data_uri(pno, box_size=8, border=1),
+                        }
+                    label_html = render_template('shipping_label.html', label_ctx)
+                    pdf_path = html_to_pdf(label_html, label_w, label_h)
+                    label_pdfs.append(pdf_path)
+
+                logger.info(f'  Printing {len(label_pdfs)} labels #{tid} (CUPS)...')
+                details['labels_printed'] = printer_mgr.print_labels(label_pdfs, tid)
+
+                for p in label_pdfs:
+                    os.unlink(p)
+        except Exception as e:
+            logger.error(f'  Label print error #{tid}: {e}', exc_info=True)
+            errors.append(f'Labels: {e}')
 
     # Determine final status
     if not errors:

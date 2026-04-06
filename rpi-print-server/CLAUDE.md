@@ -46,7 +46,7 @@ All active code lives in `rpi-print-server/`. There is no test suite or linter c
 
 WordPress API → `print_client.py` polls → renders Jinja2 templates → WeasyPrint PDF → CUPS (A4) or TSPL/ESC-POS (thermal) → ACK back to WordPress.
 
-Print sequence per order: Invoice (A4) → Picking List (thermal, paginated) → **10s delay** → Shipping Labels (thermal, one per box).
+Print sequence per order: Invoice (A4, Epson) → Picking List (thermal, paginated) → Shipping Labels (thermal, one per box). USB Session mode (V.2.4): single USB connection for all thermal prints with TSPL status query (busy-wait) instead of blind `time.sleep()` delays. Falls back to CUPS if USB direct not configured.
 
 The dashboard reads job state from a shared `/tmp/dinoco-print-state.json` file written by the print client.
 

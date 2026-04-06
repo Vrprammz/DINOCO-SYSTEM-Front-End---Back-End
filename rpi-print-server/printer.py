@@ -1,8 +1,13 @@
 """
-DINOCO B2B — CUPS Printer Wrapper V.2.0
+DINOCO B2B — CUPS Printer Wrapper V.2.1
 Handles printing PDFs to configured CUPS printers.
 For thermal label printers: converts PDF → image → TSPL or ESC/POS raster.
 XP-420B: sends TSPL via USB directly (pyusb) since usblp driver doesn't claim it.
+
+V.2.1 — UsbSession + TSPL Status Query
+  - UsbSession: keep USB connection open for multiple prints in one order
+  - TSPL status query via IN endpoint (busy-wait instead of blind sleep)
+  - Eliminates USB re-enumeration between documents (root cause of errno 32/110)
 
 V.2.0 — Page break + auto-cut between Picking List and Labels
   - TSPL: CUT command after each page (auto-cutter)
@@ -18,7 +23,114 @@ import logging
 
 logger = logging.getLogger('dinoco-print')
 
-# ── USB Direct (pyusb) ─────────────────────────────────────────────
+# ── USB Session (persistent connection) ───────────────────────────
+
+class UsbSession:
+    """Keep USB connection open for multiple prints in one order.
+    Eliminates re-enumeration between documents (root cause of errno 32/110).
+    Supports TSPL status query via IN endpoint for busy-wait instead of blind sleep.
+    """
+
+    def __init__(self, vendor_id, product_id):
+        self.vid = vendor_id
+        self.pid = product_id
+        self.dev = None
+        self.ep_out = None
+        self.ep_in = None
+
+    def open(self):
+        import usb.core, usb.util
+        self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+        if self.dev is None:
+            raise RuntimeError(f'USB device {self.vid:#06x}:{self.pid:#06x} not found')
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+        except Exception:
+            pass
+
+        # Retry set_configuration
+        import time
+        for attempt in range(5):
+            try:
+                self.dev.set_configuration()
+                break
+            except usb.core.USBError as e:
+                if attempt < 4 and e.errno in (16, 32, 110):
+                    logger.warning(f'USB session open retry {attempt+1}/5: errno {e.errno}')
+                    time.sleep(2)
+                else:
+                    raise
+
+        cfg = self.dev.get_active_configuration()
+        intf = cfg[(0, 0)]
+        self.ep_out = usb.util.find_descriptor(
+            intf,
+            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+        )
+        self.ep_in = usb.util.find_descriptor(
+            intf,
+            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
+        )
+        if self.ep_out is None:
+            raise RuntimeError('USB OUT endpoint not found')
+        logger.info(f'USB session opened: OUT={self.ep_out.bEndpointAddress:#04x}, IN={"yes" if self.ep_in else "no"}')
+
+    def write(self, data):
+        """Send raw data to printer."""
+        chunk_size = 64 * 1024
+        for offset in range(0, len(data), chunk_size):
+            self.ep_out.write(data[offset:offset + chunk_size])
+
+    def wait_ready(self, timeout=30):
+        """Poll TSPL status until printer is idle. Returns True if ready."""
+        if not self.ep_in:
+            # No IN endpoint — fallback to fixed delay
+            import time
+            time.sleep(1)
+            return True
+
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                # TSPL status query: ESC ! ?
+                self.ep_out.write(b'\x1b!?\r\n')
+                status = self.ep_in.read(1, timeout=2000)
+                if len(status) > 0:
+                    busy = bool(status[0] & 0x20)  # bit 5 = printing
+                    error = bool(status[0] & 0x80)  # bit 7 = error
+                    if error:
+                        logger.warning(f'Printer error status: {status[0]:#04x}')
+                    if not busy:
+                        return True
+            except Exception:
+                pass  # read timeout = printer still processing
+            time.sleep(0.3)
+
+        logger.warning(f'Printer not ready after {timeout}s, proceeding anyway')
+        return False
+
+    def close(self):
+        import usb.util
+        if self.dev:
+            try:
+                usb.util.dispose_resources(self.dev)
+            except Exception:
+                pass
+            self.dev = None
+            self.ep_out = None
+            self.ep_in = None
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+# ── USB Direct (pyusb) — single-shot, kept for backward compat ───
 
 def usb_send(vendor_id, product_id, data):
     """Send raw bytes to a USB device using pyusb.
@@ -332,6 +444,27 @@ class PrinterManager:
             logger.info(f'Thermal print ({protocol}) sent to {printer_name}: {title}')
         finally:
             os.unlink(tmp_path)
+
+    def create_usb_session(self):
+        """Create a UsbSession for batch printing. Returns None if not USB direct."""
+        if not self.label_usb_direct:
+            return None
+        vid = int(self.label_usb_direct['vendor_id'], 16)
+        pid = int(self.label_usb_direct['product_id'], 16)
+        return UsbSession(vid, pid)
+
+    def print_thermal_session(self, pdf_path, usb_session, title='DINOCO Label'):
+        """Print PDF via existing USB session (no re-enumerate)."""
+        protocol = self.label_thermal_protocol
+        logger.info(f'Converting PDF to {protocol.upper()} for thermal printer: {title}')
+
+        if protocol == 'tspl':
+            raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert)
+        else:
+            raw_data = pdf_to_escpos(pdf_path)
+
+        usb_session.write(raw_data)
+        logger.info(f'Thermal print ({protocol}) via USB session: {title}')
 
     def print_invoice(self, pdf_path, ticket_id):
         """Print A4 invoice on the invoice printer."""
