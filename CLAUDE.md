@@ -11,7 +11,8 @@ DINOCO System is a **WordPress-based motorcycle warranty management platform** s
 - **Backend**: WordPress + Advanced Custom Fields (ACF). Data is stored in Custom Post Types (claims, registrations, B2B orders) and user metadata.
 - **Frontend**: Vanilla HTML/CSS/JavaScript embedded inline in PHP files. UI is exposed via WordPress shortcodes.
 - **Authentication**: LINE Login (OAuth2) creates/links WordPress users. Admin access uses `current_user_can('manage_options')`.
-- **AI Module**: Google Gemini API with function calling (v22.0). The AI retrieves real data via PHP functions rather than generating answers from training data. Conversations capped at 12 messages, temperature 0.35.
+- **AI Module (WordPress)**: Google Gemini API with function calling (v22.0). The AI retrieves real data via PHP functions rather than generating answers from training data. Temperature 0.35.
+- **AI Module (Chatbot)**: OpenClaw Mini CRM — Gemini 2.5 Flash (primary) + Claude Haiku 4.5 (fallback) + Claude Sonnet 4 (supervisor). ไม่มี message cap (context ใช้ 6-10 messages ล่าสุด). Temperature 0.3 (tools), 0.2 (Claude), 0.4 (claim questions).
 - **Integrations**: LINE push notifications (B2B alerts), PDF generation (claims), CSV export (admin dashboards).
 
 ## Key Shortcodes (Entry Points)
