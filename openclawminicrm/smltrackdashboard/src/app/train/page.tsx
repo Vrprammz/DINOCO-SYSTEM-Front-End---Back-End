@@ -979,6 +979,11 @@ function AutoTrainTab() {
                         {d.reason}
                       </div>
                     )}
+                    {d.verdict === "fail" && (
+                      <div className="mt-2">
+                        <FixAnswerButton question={d.question} currentAnswer={d.expected} />
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1142,6 +1147,83 @@ function StatsTab() {
 }
 
 /* ═══════════════════════════════════════════
+   Shared: FixAnswerButton — แก้คำตอบที่ผิด + บันทึก KB
+   ═══════════════════════════════════════════ */
+function FixAnswerButton({ logId, question, currentAnswer }: { logId?: string; question: string; currentAnswer?: string }) {
+  const [open, setOpen] = useState(false);
+  const [answer, setAnswer] = useState(currentAnswer || "");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  if (saved) {
+    return <span className="text-xs text-emerald-400 font-medium">KB updated</span>;
+  }
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="text-xs px-2 py-1 rounded hover:bg-amber-900/30 transition-colors"
+        style={{ color: "#fbbf24", border: "1px solid #fbbf2444" }}
+      >
+        แก้คำตอบ
+      </button>
+    );
+  }
+
+  const handleSave = async () => {
+    if (!answer.trim()) return;
+    setSaving(true);
+    try {
+      const res = await fetch("/dashboard/api/train/fix-answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ log_id: logId, correct_answer: answer.trim(), question }),
+      });
+      const data = await res.json();
+      if (data.success || data.kb_id) {
+        setSaved(true);
+      }
+    } catch { /* ignore */ }
+    setSaving(false);
+  };
+
+  return (
+    <div className="mt-2 space-y-2">
+      <textarea
+        value={answer}
+        onChange={(e) => setAnswer(e.target.value)}
+        placeholder="พิมพ์คำตอบที่ถูกต้อง..."
+        rows={3}
+        className="w-full rounded-lg p-2 text-xs resize-none"
+        style={{
+          background: "var(--bg-primary)",
+          color: "var(--text-primary)",
+          border: "1px solid var(--border-primary)",
+        }}
+      />
+      <div className="flex gap-2">
+        <button
+          onClick={handleSave}
+          disabled={saving || !answer.trim()}
+          className="px-3 py-1 rounded text-xs font-semibold text-white"
+          style={{ background: saving ? "var(--border-primary)" : "#10b981" }}
+        >
+          {saving ? "กำลังบันทึก..." : "บันทึก KB"}
+        </button>
+        <button
+          onClick={() => setOpen(false)}
+          className="px-3 py-1 rounded text-xs"
+          style={{ color: "var(--text-muted)", border: "1px solid var(--border)" }}
+        >
+          ยกเลิก
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════
    Tab 4: ประวัติ Training Logs
    ═══════════════════════════════════════════ */
 function LogsTab() {
@@ -1217,12 +1299,17 @@ function LogsTab() {
                   หมายเหตุ: {log.notes}
                 </p>
               )}
-              <p
-                className="text-[10px] mt-1"
-                style={{ color: "var(--text-muted)" }}
-              >
-                {fmtDate(log.timestamp)}
-              </p>
+              <div className="flex items-center gap-3 mt-1">
+                <p
+                  className="text-[10px]"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  {fmtDate(log.timestamp)}
+                </p>
+                {log.verdict === "fail" && (
+                  <FixAnswerButton logId={log._id} question={log.message} currentAnswer={log.correct_answer} />
+                )}
+              </div>
             </div>
           </div>
         </Card>

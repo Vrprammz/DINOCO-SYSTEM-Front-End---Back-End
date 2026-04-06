@@ -1344,9 +1344,19 @@ app.post("/api/train/generate", requireAuth, express.json(), async (req, res) =>
     const kbItems = await db.collection(KB_COLL).find({ active: { $ne: false } }, { projection: { title: 1, content: 1, category: 1 } }).limit(30).toArray();
     const kbSummary = kbItems.map(k => `[${k.category}] ${k.title}: ${k.content.substring(0, 150)}`).join("\n");
 
+    // ดึงคำถามที่เคยถามแล้ว → ป้องกันสร้างซ้ำ
+    const askedLogs = await db.collection(TRAINING_LOGS_COLL)
+      .find({}, { projection: { message: 1 } })
+      .sort({ timestamp: -1 }).limit(50).toArray();
+    const askedQuestions = askedLogs.map(l => l.message);
+    const askedHint = askedQuestions.length > 0
+      ? `\n\nห้ามสร้างคำถามที่ซ้ำหรือคล้ายกับเหล่านี้:\n${askedQuestions.map((q, i) => `${i + 1}. ${q}`).join("\n")}`
+      : "";
+
     const prompt = `จากข้อมูล Knowledge Base ต่อไปนี้ ให้สร้างคำถามจำลอง 10 ข้อที่ลูกค้าอาจถามผ่านแชท
 ใช้ภาษาไทยที่เป็นธรรมชาติ เหมือนลูกค้าจริง (ภาษาพูด สแลง คำสั้นๆ)
 ให้คำถามหลากหลาย: สอบถามสินค้า ราคา เคลม ประกัน ตัวแทน จัดส่ง
+สร้างคำถามใหม่ที่ยังไม่เคยถาม เน้นมุมใหม่ เจาะลึก${askedHint}
 ตอบเป็น JSON array เท่านั้น ห้ามมี markdown:
 ["คำถาม1", "คำถาม2", ...]
 
@@ -1388,15 +1398,27 @@ app.post("/api/train/auto-run", requireAuth, express.json(), async (req, res) =>
   const results = { generated: 0, tested: 0, passed: 0, failed: 0, kb_added: 0, details: [] };
 
   try {
-    // Phase 1: Gemini สร้างคำถามจาก KB จริง
+    // Phase 1: Gemini สร้างคำถามจาก KB จริง — ดึง PASS history เพื่อไม่ให้ซ้ำ
     const kb = await db.collection(KB_COLL).find({ active: { $ne: false } }).limit(50).toArray();
     const kbText = kb.map(k => "• " + (k.title || "").substring(0, 60) + ": " + (k.content || "").substring(0, 100)).join("\n");
+
+    // ดึงคำถามที่ PASS แล้ว 50 ข้อล่าสุด + ที่เคยถามทั้งหมด 30 ข้อล่าสุด → ป้องกัน Gemini สร้างซ้ำ
+    const passedLogs = await db.collection(TRAINING_LOGS_COLL)
+      .find({ verdict: "pass" }, { projection: { message: 1 } })
+      .sort({ timestamp: -1 }).limit(50).toArray();
+    const recentLogs = await db.collection(TRAINING_LOGS_COLL)
+      .find({}, { projection: { message: 1 } })
+      .sort({ timestamp: -1 }).limit(30).toArray();
+    const allAsked = [...new Set([...passedLogs, ...recentLogs].map(l => l.message))];
+    const askedList = allAsked.length > 0
+      ? `\n\nห้ามสร้างคำถามที่ซ้ำหรือคล้ายกับเหล่านี้ (AI ตอบถูกแล้ว/เคยถามแล้ว):\n${allAsked.map((q, i) => `${i + 1}. ${q}`).join("\n")}`
+      : "";
 
     const genRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: AbortSignal.timeout(30000),
       body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: `จาก KB นี้:\n${kbText}\n\nสร้าง ${count} คำถามจำลองลูกค้า DINOCO (อะไหล่มอเตอร์ไซค์) ภาษาไทย หลากหลาย\nพร้อมคำตอบที่ถูกต้องจาก KB\n\nตอบ JSON array: [{"question":"...","expected":"คำตอบสั้นที่ถูก","category":"สินค้า|เคลม|ตัวแทน|สเปค|ดูแล"}]\nไม่ต้อง code block` }] }],
+        contents: [{ role: "user", parts: [{ text: `จาก KB นี้:\n${kbText}\n\nสร้าง ${count} คำถามจำลองลูกค้า DINOCO (อะไหล่มอเตอร์ไซค์) ภาษาไทย หลากหลาย\nพร้อมคำตอบที่ถูกต้องจาก KB\nสร้างคำถามใหม่ที่ยังไม่เคยถาม เน้นมุมใหม่ เจาะลึก edge case${askedList}\n\nตอบ JSON array: [{"question":"...","expected":"คำตอบสั้นที่ถูก","category":"สินค้า|เคลม|ตัวแทน|สเปค|ดูแล"}]\nไม่ต้อง code block` }] }],
         generationConfig: { temperature: 0.7, maxOutputTokens: 4000 },
       }),
     });
@@ -1513,6 +1535,79 @@ app.get("/api/train/logs", requireAuth, async (req, res) => {
   if (!db) return res.json([]);
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   res.json(await db.collection(TRAINING_LOGS_COLL).find().sort({ timestamp: -1 }).limit(limit).toArray());
+});
+
+// POST /api/train/fix-answer — แก้คำตอบที่ผิด + เพิ่ม/อัพเดท KB entry
+app.post("/api/train/fix-answer", requireAuth, express.json(), async (req, res) => {
+  const { log_id, correct_answer, question } = req.body;
+  if (!correct_answer) return res.status(400).json({ error: "correct_answer required" });
+  if (!log_id && !question) return res.status(400).json({ error: "log_id or question required" });
+  const { ObjectId } = require("mongodb");
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+
+  try {
+    // 1. อัพเดท training_log (ถ้ามี log_id)
+    let questionText = question || "";
+    if (log_id) {
+      const logDoc = await db.collection(TRAINING_LOGS_COLL).findOne({ _id: new ObjectId(log_id) });
+      if (logDoc) {
+        questionText = logDoc.message || questionText;
+        await db.collection(TRAINING_LOGS_COLL).updateOne(
+          { _id: new ObjectId(log_id) },
+          { $set: { correct_answer, verdict: "fail", fixed: true, fixedAt: new Date() } }
+        );
+      }
+    } else if (question) {
+      // ถ้าไม่มี log_id แต่มี question → หา log ล่าสุดที่ตรงกัน
+      const logDoc = await db.collection(TRAINING_LOGS_COLL).findOne(
+        { message: question, verdict: "fail" },
+        { sort: { timestamp: -1 } }
+      );
+      if (logDoc) {
+        await db.collection(TRAINING_LOGS_COLL).updateOne(
+          { _id: logDoc._id },
+          { $set: { correct_answer, fixed: true, fixedAt: new Date() } }
+        );
+      }
+    }
+
+    if (!questionText) return res.status(400).json({ error: "Could not determine question" });
+
+    // 2. เพิ่ม/อัพเดท KB entry — ค้นหาจาก title ที่ตรงกับคำถาม
+    const existingKB = await db.collection(KB_COLL).findOne({
+      title: questionText,
+      source: { $in: ["training_dashboard", "auto-train-dashboard", "fix-answer"] }
+    });
+
+    let kb_id;
+    if (existingKB) {
+      // อัพเดท KB ที่มีอยู่
+      await db.collection(KB_COLL).updateOne(
+        { _id: existingKB._id },
+        { $set: { content: correct_answer, updatedAt: new Date() } }
+      );
+      kb_id = existingKB._id.toString();
+    } else {
+      // สร้าง KB entry ใหม่
+      const inserted = await db.collection(KB_COLL).insertOne({
+        title: questionText.substring(0, 200),
+        content: correct_answer,
+        category: "faq",
+        tags: ["fix-answer"],
+        active: true,
+        source: "fix-answer",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      kb_id = inserted.insertedId.toString();
+    }
+
+    res.json({ success: true, kb_id, updated: !!existingKB });
+  } catch (e) {
+    console.error("[Train/FixAnswer] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // === Memory / Skills / Audit ===
