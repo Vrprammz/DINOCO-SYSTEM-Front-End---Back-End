@@ -95,9 +95,9 @@
 | File | Version | DB_ID | Shortcode | Description |
 |------|---------|-------|-----------|-------------|
 | [System] DINOCO Gateway | V.30.2 | 9 | `[dinoco_login_button]` | LINE Login card UI |
-| [System] LINE Callback | V.30.2 | 10 | `[dinoco_gateway]` | OAuth callback + warranty registration button |
+| [System] LINE Callback | V.30.3 | 10 | `[dinoco_gateway]` | OAuth callback + warranty registration + login_error UI |
 | [System] Member Dashboard Main | V.30.2 | 11 | `[dinoco_dashboard]` | Main controller, routing, rate limiting |
-| [System] author profile line | V.30.2 | 12 | -- | LINE profile picture for WP author |
+| [System] author profile line | V.30.3 | 12 | -- | LINE profile picture (WP default avatar fallback) |
 | [System] Dinoco Custom Header | V.30.2 | 13 | -- | Hide admin bar for non-admin users |
 | [System] Transfer Warranty Page | V.30.2 | 15 | `[dinoco_transfer_sys]` / `[dinoco_transfer_v3]` | Warranty ownership transfer |
 | [System] DINOCO Claim System | V.30.2 | 16 | `[dinoco_claim_page]` | Claim submission + PDF generation |
@@ -106,7 +106,7 @@
 | [System] Legacy Migration Logic | V.30.2 | 19 | `[dinoco_legacy_migration]` | Legacy warranty migration (admin-ajax) |
 | [System] Dashboard - Header & Forms | V.30.3 | 28 | `[dinoco_dashboard_header]` | Sidebar, profile card, PDPA, registration forms |
 | [System] Dashboard - Assets List | V.30.2 | 29 | `[dinoco_dashboard_assets]` | Assets list with bundle support |
-| [System] DINOCO MCP Bridge | V.2.1 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints) |
+| [System] DINOCO MCP Bridge | V.2.2 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints, per-lead storage) |
 
 ### 2.2 [Admin System] -- Admin/Management
 
@@ -117,9 +117,9 @@
 | [Admin System] DINOCO Legacy Migration Requests | V.30.2 | 23 | `[dinoco_admin_legacy]` | Admin legacy migration manager |
 | [Admin System] DINOCO User Management | V.30.2 | 25 | `[dinoco_admin_users]` | CRM + full analytics |
 | [Admin System] DINOCO Manual Transfer Tool | V.30.2 | 26 | `[dinoco_admin_transfer]` | Force transfer warranty ownership |
-| [Admin System] DINOCO Service Center & Claims | V.30.2 | 27 | `[dinoco_admin_claims]` | Claims management + auto-close cron |
+| [Admin System] DINOCO Service Center & Claims | V.30.3 | 27 | `[dinoco_admin_claims]` | Claims management + auto-close 3 statuses (30d) |
 | [Admin System] AI Control Module | V.30.2 | 35 | `[dinoco_admin_ai_control]` | AI Command Center (Gemini v22.0 function calling) |
-| [Admin System] KB Trainer Bot v2.0 | V.30.2 | 62 | -- | Knowledge Base trainer (Gemini) |
+| [Admin System] KB Trainer Bot v2.0 | V.30.3 | 62 | -- | Knowledge Base trainer (Gemini, limit 200 entries) |
 | [Admin System] DINOCO Manual Invoice System | V.33.1 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
 | [Admin System] AI Provider Abstraction | V.1.2 | 1040 | -- | Multi-AI provider (Claude/Gemini/OpenAI) |
 | [Admin System] DINOCO Moto Manager | V.1.0 | 1157 | `[dinoco_admin_moto]` | Motorcycle brands & models CRUD |
