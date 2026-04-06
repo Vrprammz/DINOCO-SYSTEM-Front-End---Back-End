@@ -424,7 +424,7 @@ def process_job(job, config, printer_mgr):
                 # นับ rows ต่อ item (parent 1 row + children N rows)
                 ROW_MM = 13
                 HEADER_MM = 38          # logo + ticket# + shop name + note
-                FOOTER_LAST_MM = 75     # totals box + address + QR + footer line
+                FOOTER_LAST_MM = 45     # totals box + address + footer line (ไม่มี QR แล้ว)
                 FOOTER_NORMAL_MM = 12   # footer line only
                 PAGE_H = 180
                 MARGIN_MM = 6           # top+bottom margin จาก @page

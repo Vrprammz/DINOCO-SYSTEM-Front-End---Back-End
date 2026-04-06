@@ -264,7 +264,7 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True):
 
             # TSPL commands
             data += f'SIZE {img.width / dpi * 25.4:.1f} mm, {height / dpi * 25.4:.1f} mm\r\n'.encode()
-            data += b'GAP 3 mm, 0 mm\r\n'
+            data += b'GAP 0 mm, 0 mm\r\n'
             data += b'DIRECTION 1,0\r\n'
             data += b'CLS\r\n'
 
