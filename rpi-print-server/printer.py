@@ -271,6 +271,10 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
                 ratio = max_width / img.width
                 img = img.resize((max_width, int(img.height * ratio)))
 
+            # Rotate 180° in software so we can use DIRECTION 0 (no retract)
+            # DIRECTION 1 retracts paper ~180mm before printing → causes paper jam
+            img = img.rotate(180)
+
             # Convert to 1-bit black/white
             img = img.convert('1')
 
@@ -303,10 +307,8 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
                 data += row
 
             data += b'\r\nPRINT 1,1\r\n'
-            # Auto-cut + feed out ~10mm so user can grab the paper
-            # Without FEED, cutter leaves paper flush → falls back inside → jam
+            # Auto-cut after each page
             data += b'CUT\r\n'
-            data += b'FEED 8\r\n'  # 8 dots ≈ 1mm at 203 DPI
 
     return bytes(data)
 
@@ -383,7 +385,7 @@ class PrinterManager:
         self.label_tspl_invert = config.get('label_tspl_invert', True)
         # TSPL GAP (0 for continuous/fanfold) and DIRECTION (0=top-down, 1=bottom-up)
         self.label_gap_mm = config.get('label_gap_mm', 0)
-        self.label_direction = config.get('label_direction', 1)
+        self.label_direction = config.get('label_direction', 0)
         # Physical paper size — SIZE command ต้องตรงกับกระดาษจริง (fanfold feed)
         self.label_width_mm = config.get('label_width_mm', 100)
         self.label_height_mm = config.get('label_height_mm', 180)
