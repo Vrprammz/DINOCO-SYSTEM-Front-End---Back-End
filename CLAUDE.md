@@ -37,11 +37,11 @@ All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, 
 
 ## REST API Endpoints (B2F)
 
-All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `maker-deliver`, `approve-reschedule`, `receive-goods`, `record-payment`, `reject-lot`, `po-complete`, `dashboard-stats`, `po-history`.
+All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `maker-deliver`, `approve-reschedule`, `receive-goods`, `record-payment`, `reject-lot`, `reject-resolve`, `po-complete`, `dashboard-stats`, `po-history`.
 
 ## REST API Endpoints (LIFF AI)
 
-All under `/wp-json/liff-ai/v1/`: `auth`, `dashboard`, `dealer-dashboard`, `leads`, `lead/{id}`, `lead/{id}/accept`, `lead/{id}/note`, `lead/{id}/status`, `claims`, `claim/{id}`, `claim/{id}/status`.
+All under `/wp-json/liff-ai/v1/`: `auth`, `dashboard`, `dealer-dashboard`, `leads`, `lead/{id}`, `lead/{id}/accept`, `lead/{id}/note`, `lead/{id}/status`, `claims`, `claim/{id}`, `claim/{id}/status`, `agent-ask`.
 
 ## REST API Endpoints (MCP Bridge)
 
@@ -55,6 +55,7 @@ All under `/wp-json/dinoco-mcp/v1/` (32 endpoints, V.2.0):
 ## Required WordPress Constants
 
 - `DINOCO_LINE_CHANNEL_ID` — LINE OAuth app ID
+- `DINOCO_LINE_CHANNEL_SECRET` — LINE OAuth channel secret (required for ID Token verify)
 - `DINOCO_LINE_REDIRECT_URI` — OAuth callback URL
 - `B2B_LINE_ACCESS_TOKEN` — Bot token for LINE notifications
 - `B2B_ADMIN_GROUP_ID` — Admin LINE group for alerts
@@ -69,7 +70,7 @@ Files are named by feature area with bracket prefixes:
 - `[System] *` — Member-facing features (dashboard, registration, claims, profile)
 - `[Admin System] *` — Admin/management features (analytics, CRM, AI, knowledge base)
 - `[B2B] Snippet N: *` — B2B distributor modules (versioned snippets)
-- `[B2F] Snippet N: *` — B2F factory purchasing modules (Snippets 0-7)
+- `[B2F] Snippet N: *` — B2F factory purchasing modules (Snippets 0-11)
 - `[GitHub] *` — Webhook integration
 
 Each file is a self-contained module with its own version number (e.g., V.32.x, V.34.x).
@@ -86,7 +87,7 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **Language**: UI text and code comments are primarily in Thai.
 - **Security patterns**: WordPress nonce verification, honeypot fields, rate limiting via transients, `sanitize_text_field`/`esc_html`/`esc_url` for output.
 - **CSS scoping**: Styles are inline within each PHP file. Recent work has focused on scoping CSS to avoid cross-module conflicts.
-- **Inventory System** (V.5.0): `dinoco_stock_add/subtract()` ใน Snippet 15 — atomic `FOR UPDATE` lock per SKU + warehouse sync. ตัดสต็อกตอน `awaiting_confirm` (ไม่ใช่ shipped) ผ่าน hook `b2b_order_status_changed` priority 5. Auto-cancel 30 นาทีถ้าตัวแทนไม่ confirm (`dinoco_inv_auto_cancel` cron + lazy check). `dinoco_stock_auto_status()` compute `stock_display` = in_stock/low_stock/out_of_stock (low_stock เป็น computed ไม่เก็บ DB). Flag `dinoco_inv_initialized` ต้อง true ก่อน auto_status ทำงาน (Admin ทำ Dip Stock ครั้งแรก). SKU Set: ตัด children, Parent stock = MIN(children). B2F receive → `dinoco_stock_add()`. Cancel → `dinoco_stock_add()` คืน.
+- **Inventory System** (V.5.6): `dinoco_stock_add/subtract()` ใน Snippet 15 — atomic `FOR UPDATE` lock per SKU + warehouse sync. ตัดสต็อกตอน `awaiting_confirm` (ไม่ใช่ shipped) ผ่าน hook `b2b_order_status_changed` priority 5. Auto-cancel 30 นาทีถ้าตัวแทนไม่ confirm (`dinoco_inv_auto_cancel` cron + lazy check). `dinoco_stock_auto_status()` compute `stock_display` = in_stock/low_stock/out_of_stock (low_stock เป็น computed ไม่เก็บ DB). Flag `dinoco_inv_initialized` ต้อง true ก่อน auto_status ทำงาน (Admin ทำ Dip Stock ครั้งแรก). SKU Set: ตัด children, Parent stock = MIN(children). B2F receive → `dinoco_stock_add()`. Cancel → `dinoco_stock_add()` คืน.
 - **Multi-Warehouse** (V.5.0 — Phase 5): Tables: `dinoco_warehouses` (id, name, code, address, is_default) + `dinoco_warehouse_stock` (warehouse_id, sku, stock_qty) ใน Snippet 15. Migration: auto-create "โกดังหลัก" (code=MAIN, is_default=1) + copy stock. Functions: `dinoco_get_default_warehouse_id()`, `dinoco_get_total_stock($sku)`, `dinoco_get_warehouse_stock($sku, $wh)`, `dinoco_transfer_stock($sku, $from, $to, $qty)`, `dinoco_get_warehouses()`. `dinoco_stock_add/subtract()` รับ `$warehouse_id` (default=primary). REST: `/warehouses`, `/warehouse` (CRUD), `/stock/transfer`, `/stock/list?warehouse_id=`, `/stock/adjust` (+warehouse_id). UI: tab "คลังสินค้า" + Transfer modal. Backward compat: ถ้ามี 1 warehouse ทำงานเหมือนเดิม.
 - **Inventory Valuation** (V.5.0 — Phase 5): `unit_cost_thb` column ใน `dinoco_stock_transactions` — เก็บตอน B2F receive (unit_price * exchange_rate). `dinoco_get_inventory_valuation()` คำนวณ WAC (Weighted Average Cost) per SKU. REST: `/valuation`. Admin UI: "มูลค่าสินค้าคงเหลือ" card + table + CSV export. THB เสมอ.
 - **Stock Forecasting** (V.5.0 — Phase 5): `dinoco_get_stock_forecast($sku, $days)` คำนวณ avg_daily_usage, days_of_stock, reorder_in_days, suggested_order_qty จาก outbound transactions (b2b_reserved, b2b_shipped, manual_subtract). `dinoco_get_stock_forecast_all()` sort by days_of_stock ASC. REST: `/forecast`. Admin UI: "สินค้าที่จะหมดเร็ว" table. Guard: ต้องมี data >= 30 วัน.
@@ -95,7 +96,7 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **setTimeout gotcha**: Admin Dashboard overrides `window.setTimeout` to capture timers >= 3s for auto-refresh control. Toast/notification auto-dismiss must use `(window._dncAutoRefresh && window._dncAutoRefresh.origSetTimeout) || setTimeout` to bypass the override.
 - **Modal pattern**: Modals use event delegation for dynamically created elements. Backdrop click-to-close is a common interaction pattern.
 - **View/Edit toggle pattern**: Profile page uses Facebook-style view-mode cards. Info is read-only by default; tap "แก้ไข" to expand the form. Save button only appears when a section is in edit mode.
-- **Product Data Source of Truth** (V.32.4): Custom table `wp_dinoco_products` (Snippet 15) is the single source of truth for ALL product fields: pricing (base, silver, gold, platinum, diamond), stock_status, oos_timestamp, oos_duration_hours, oos_eta_date, b2b_discount_percent, boxes_per_unit, min_order_qty, category, compatible_models, b2b_visible. Central helper `b2b_get_product_data($sku)` (Snippet 1) reads from custom table with ACF fallback. Batch helper `b2b_get_product_data_batch()` returns all products in 1 query. All WRITE operations must dual-write: custom table + ACF (for backward compat). All READ operations should use custom table helpers first, fallback ACF. `b2b_get_sku_data_map()` (Snippet 3) now batch-reads from custom table including pricing tiers.
+- **Product Data Source of Truth** (V.32.5): Custom table `wp_dinoco_products` (Snippet 15) is the single source of truth for ALL product fields: pricing (base, silver, gold, platinum, diamond), stock_status, oos_timestamp, oos_duration_hours, oos_eta_date, b2b_discount_percent, boxes_per_unit, min_order_qty, category, compatible_models, b2b_visible. Central helper `b2b_get_product_data($sku)` (Snippet 1) reads from custom table with ACF fallback. Batch helper `b2b_get_product_data_batch()` returns all products in 1 query. All WRITE operations must dual-write: custom table + ACF (for backward compat). All READ operations should use custom table helpers first, fallback ACF. `b2b_get_sku_data_map()` (Snippet 3) now batch-reads from custom table including pricing tiers.
 - **Motorcycle Catalog**: Brands/models/images/aliases stored in custom MySQL tables (`dinoco_moto_brands` + `dinoco_moto_models`) via `DINOCO_MotoDB` class in Snippet 15. Admin UI via `[dinoco_admin_moto]`. Consumer files use `dinoco_get_brands_list()`, `dinoco_get_model_image()`, `dinoco_get_moto_catalog_json()` with `class_exists` fallback.
 - **Negative margin gotcha**: Elements with negative margin (e.g. cover photo `margin: -20px -20px 0`) cause horizontal scroll. Always add `overflow-x: hidden` on the parent wrapper.
 - **B2F System**: Business to Factory — DINOCO สั่งซื้อสินค้าจากโรงงานผู้ผลิต (Maker). ใช้ LINE Bot เดียวกับ B2B + LIFF ID เดียวกัน. Kill switch: `define('B2F_DISABLED', true)`.
@@ -105,8 +106,8 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **B2F FSM**: `B2F_Order_FSM` class ใน Snippet 6. 12 statuses: draft→submitted→confirmed→delivering→received→paid→completed. Terminal: completed, cancelled. ทุก transition ต้องผ่าน `b2f_transition_order()`.
 - **B2F Snippets** (DB_ID 1160-1171):
   - Snippet 0 (1160): CPT & ACF Registration — 5 CPTs + helpers + `b2f_get_maker_by_group()` (cached 5min/1hr)
-  - Snippet 1 (1163): Core Utilities & Flex Builders V.5.0 — LINE push + 18 Flex templates + `b2f_liff_url()` (HMAC sig) + i18n ENG/TH (currency != THB = ENG)
-  - Snippet 2 (1165): REST API V.7.1 — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin) + concurrent locks (po-cancel, maker-deliver) + is_complete หัก rejected + payment fallback THB
+  - Snippet 1 (1163): Core Utilities & Flex Builders V.6.0 — LINE push + 22 Flex templates + `b2f_liff_url()` (HMAC sig) + i18n ENG/TH/ZH (currency != THB = ENG/ZH)
+  - Snippet 2 (1165): REST API V.8.2 — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin) + concurrent locks (po-cancel, maker-deliver) + is_complete หัก rejected + payment fallback THB + `reject-resolve` endpoint + po-cancel ไม่ลบ PO (FSM transition + stock restore + audit trail)
   - Snippet 3 (1164): Webhook Handler & Bot Commands — Maker commands + Admin B2F commands + Flex menu (self-contained)
   - Snippet 4 (1167): Maker LIFF Pages V.4.0 — shortcode `[b2f_maker_liff]` route `/b2f-maker/` + LANG system (`_isEng` + `L()` for non-THB currency makers)
   - Snippet 5 (1166): Admin Dashboard Tabs V.3.1 — 3 shortcodes embedded ใน Admin Dashboard + Bulk Cancel PO (V.2.0) + Multi-Currency UI (V.3.0) + Settings REST endpoint + receive form remaining fix (shipped-received)
@@ -114,8 +115,8 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`, credit เกิดตอน receive-goods เท่านั้น (ไม่หักตอน create-po), `b2f_recalculate_payable()` คำนวณจาก `rcv_total_value` ของ receiving records
   - Snippet 8 (1168): Admin LIFF E-Catalog — หน้าสั่งซื้อจาก LINE (LIFF auth V.2.0 ไม่ต้อง WP login) + Multi-Currency UI (V.3.0)
   - Snippet 9 (1169): PO Ticket View — หน้าดูรายละเอียด PO (status timeline, items, receiving, payment, credit)
-  - Snippet 10 (1170): PO Image Generator — สร้างรูปใบสั่งซื้อ A4 ด้วย GD Library + REST `/b2f/v1/po-image`
-  - Snippet 11 (1171): Cron Jobs & Reminders — 7 cron jobs (เตือนจัดส่ง/ล่าช้า/ชำระ/Maker ไม่ตอบ/สรุปวัน/สัปดาห์/เดือน)
+  - Snippet 10 (1170): PO Image Generator V.2.5 — สร้างรูปใบสั่งซื้อ A4 ด้วย GD Library + REST `/b2f/v1/po-image`
+  - Snippet 11 (1171): Cron Jobs & Reminders V.2.1 — 8 cron jobs (เตือนจัดส่ง/ล่าช้า/ชำระ/Maker ไม่ตอบ/สรุปวัน/สัปดาห์/เดือน/rejected PO escalation 7 วัน)
 - **B2F Slip Verification**: `b2f_verify_slip_image()` (Snippet 1) เรียก Slip2Go API verify สลิปจ่ายเงินโรงงาน ใช้ `B2B_SLIP2GO_SECRET_KEY` เดียวกับ B2B. Maker ต้องมี `maker_bank_code` (ACF field) ถึงจะ verify ได้ ถ้าไม่มี → `slip_status=pending`. Bot รับรูปสลิปในกลุ่ม Maker อัตโนมัติ (Snippet 3 `b2f_handle_maker_slip_image`). `b2f_find_pending_po_for_slip()` match PO ค้างจ่าย ±2%.
 - **B2F ENG Labels** (V.7.2/V.2.8/V.1.6): Maker-facing Flex/text ใช้ ENG เมื่อ `po_currency` (หรือ `maker_currency`) ไม่ใช่ THB. ใช้ `$is_eng = $po_currency !== 'THB'` + ternary. Admin group Flex ยังไทยเสมอ. Payment/Debt แสดง THB เสมอ แต่ ENG label "Outstanding (THB)". Snippet 2 (REST): po-cancel แยก `$cancel_body_maker`/`$cancel_body_admin`, maker-deliver + receive-goods ใช้ `$rcv_build_body()` closure สร้าง body แยก lang. Snippet 3 (Webhook): @mention menu, confirm/reject/deliver reply, New PO Flex, PO list, deliverable list, reschedule approve/reject. Snippet 11 (Cron): delivery reminder, overdue, no-response fallback text.
 - **B2F Gotchas**:
@@ -131,13 +132,16 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Admin Dashboard sidebar ต้องมี `<div class="sidebar-nav">` wrapper เพื่อ scroll ได้เมื่อเมนูเยอะ
   - B2F REST API nonce ต้องใช้ `wp_create_nonce('wp_rest')` ไม่ใช่ custom nonce name
   - B2F API response list ต้องใช้ key `data` ไม่ใช่ `makers`/`products` (frontend อ่าน `res.data`)
+  - `po-cancel` V.8.2 ไม่ลบ PO อีกต่อไป — ใช้ FSM transition เป็น `cancelled` + คืนสต็อกผ่าน `dinoco_stock_add()` + เก็บ audit trail (`_b2f_cancel_reason`, `_b2f_cancelled_by`, `_b2f_cancelled_at`)
+  - Flex builders เพิ่มเป็น 22 ตัว (เดิม 18) ใน Snippet 1 V.6.0 — เพิ่ม reject-resolve, cancel confirmation, stock restore notification, escalation alert
+  - `reject-resolve` endpoint สำหรับ resolve rejected lots — Admin ยืนยันว่า lot ที่ reject แล้วได้รับการแก้ไข (re-ship หรือ credit note)
 - **B2F Multi-Currency** (V.3.0+): Maker มี `maker_currency` (THB/CNY/USD). Product มี `mp_shipping_land` + `mp_shipping_sea` (THB/unit). PO มี `po_currency`, `po_exchange_rate`, `po_shipping_method` (land/sea), `po_total_amount_thb`, `po_shipping_total`, `po_grand_total_thb`. Frontend helpers: `b2f_currency_symbol()`, `b2f_format_currency()`, `b2f_currency_name_en()` (Snippet 1). Settings: `b2f_shipping_dest_land`, `b2f_shipping_dest_sea` (wp_options, REST `/b2f/v1/settings`). Exchange rate range: CNY 2-10, USD 25-50. Currency immutable หลัง submitted.
   - `b2f_get_po_data()` return `currency`, `exchange_rate`, `shipping_method` — Flex builders ทุกตัวใช้ `$po['currency']` แทน hardcode `'฿'`
-  - PO Image (Snippet 10 V.2.4): CNY/USD PO ใช้ ENG template (PURCHASE ORDER, No., Date, Supplier, Item, Qty, Unit Price, Amount) + delivery address + shipping method (By Truck K / By Sea M) + ไม่แสดง baht_text
+  - PO Image (Snippet 10 V.2.5): CNY/USD PO ใช้ ENG template (PURCHASE ORDER, No., Date, Supplier, Item, Qty, Unit Price, Amount) + delivery address + shipping method (By Truck K / By Sea M) + ไม่แสดง baht_text
   - **3-Language Support** (V.6.0): `b2f_t($th, $en, $zh, $currency)` helper ใน Snippet 1. THB→ไทย, USD→English, CNY→中文 (fallback ถ้า $zh empty ใช้ $en). Snippet 1/2/3/11 ใช้ `b2f_t()` แทน `$is_eng ? 'EN' : 'TH'` ternary เดิม. `b2f_flex_status_badge($status, $currency)` เปลี่ยน signature จาก `$is_eng` เป็น `$currency` (backward compat: boolean → auto convert)
   - Maker LIFF (Snippet 4 V.3.18): `curSym(po)` helper ใช้ `po.currency_symbol` จาก API
   - PO Ticket (Snippet 9 V.3.3): Admin เห็น "ต้นทุนจริง" section (ยอดสกุลโรงงาน, exchange rate, THB total, ค่าส่ง, ต้นทุนรวม) สำหรับ foreign PO
-  - Cron messages (Snippet 11 V.1.5): แสดง currency note สำหรับ foreign PO
+  - Cron messages (Snippet 11 V.2.1): แสดง currency note สำหรับ foreign PO + rejected PO escalation (7 วันไม่ resolve → แจ้ง admin)
   - Debt/credit/payment/outstanding = THB เสมอ (ไม่แปลงสกุล)
   - Flash cron `b2b_flash_tracking_cron` ใช้ fallback interval `everytwohours` (จาก WP Fastest Cache) เพราะ `every_2hr_b2b` ไม่ load ใน REST context + DISABLE_WP_CRON=true
   - Flash Webhook ต้องกดตั้งค่าใน B2B Admin → Flash → ตั้งค่า Webhook ทุกครั้งที่เปลี่ยน API key/domain
@@ -145,10 +149,12 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **Manual Flash Shipping** (V.38.0): ระบบส่งพัสดุ standalone ไม่ต้องมี B2B order. เข้าผ่าน RPi Dashboard `/manual-ship` (Basic Auth). สร้าง Flash order ตรง + render label (ไม่มี LOGO/แถบดำ DINOCO) + print ผ่าน RPi. เก็บรายการใน `wp_options` key `b2b_manual_shipments_{YYYY_MM}`. Config: `manual_ship_user`, `manual_ship_pass`, `manual_ship_sender_*` ใน `config.json`.
 - **Walk-in Distributor** (V.39.0): ร้านหน้าโกดัง — เปิด toggle `is_walkin` บน distributor CPT ใน Admin Panel. Flow: สั่งของ → ยืนยัน → **ข้ามเช็คสต็อก** (auto `awaiting_confirm`) → ยืนยันบิล → เพิ่มหนี้+INV เหมือนเดิม → จ่าย → **auto completed** (ข้ามเลือกวิธีส่ง). ระบบเครดิต/หนี้/สลิปชำระเหมือนเดิม 100%. Order stamp `_b2b_is_walkin=1`. Hook `b2b_order_status_changed` → `b2b_walkin_auto_complete()` ใน Snippet 2.
 - **Walk-in Bank Account** (V.32.0): Walk-in orders ใช้บัญชีธนาคารแยกได้ผ่าน constants `B2B_WALKIN_BANK_*` (BANK_NAME, BANK_NAME_EN, BANK_ACCOUNT, BANK_HOLDER, BANK_CODE, BANK_LOGO_URL, PROMPTPAY_ID). ถ้าไม่ define จะ fallback เป็น `B2B_BANK_*` ปกติ. `b2b_get_bank_info($order_id)` / `b2b_get_bank_logo_url($order_id)` / `b2b_get_bank_copy_text($order_id)` รับ order_id เพื่อเช็ค walk-in. Slip verification (Snippet 2+3) accept ทั้ง 2 บัญชี. Walk-in confirm_order+confirm_bill ไม่ส่ง text ซ้ำ (Flex card เพียงพอ).
-- **Walk-in Cancel** (V.31.9): Admin สามารถยกเลิก completed walk-in order ได้. FSM V.1.3 เพิ่ม `completed→cancelled` (admin only). `@admincancel` + Admin Dashboard dropdown รองรับ. คืนหนี้อัตโนมัติ (`is_billed` check + `b2b_recalculate_debt`). ส่ง Flex card ไปกลุ่มลูกค้า (แจ้งยกเลิก + แจ้งคืนเครดิต). Non-walk-in completed orders ยังคง terminal state.
-- **LIFF AI Snippets** (DB_ID 1180-1181):
-  - Snippet 1 (1180): REST API V.1.1 — Auth (LINE ID Token verify + JWT) + Lead/Claim endpoints + Agent proxy (`liff_ai_call_agent`). Claim detail returns photos (normalized URLs), ai_analysis, status_history. Claim status update logs history + supports 13 statuses.
-  - Snippet 2 (1181): Frontend V.2.0 — shortcode `[liff_ai_page]` route `/ai-center/` + SPA-like pages (dashboard, dealer, lead detail, claim list, claim detail, agent chat). Bottom nav (Admin: 4 tabs, Dealer: 2 tabs). Photo lightbox with swipe. Claim status change modal (Admin). AI Agent placeholder (Phase 3).
+- **Walk-in Cancel** (V.33.2): Admin สามารถยกเลิก completed walk-in order ได้. FSM V.1.5 เพิ่ม `completed→cancelled` (admin only) + `cancel_request` transitions. `@admincancel` + Admin Dashboard dropdown รองรับ. คืนหนี้อัตโนมัติ (`is_billed` check + `b2b_recalculate_debt`). ส่ง Flex card ไปกลุ่มลูกค้า (แจ้งยกเลิก + แจ้งคืนเครดิต). Non-walk-in completed orders ยังคง terminal state.
+- **B2B Cancel Request** (V.39.2): `cancel-request` ใน Snippet 3 ใช้ `b2b_set_order_status()` ผ่าน FSM แล้ว (เดิม bypass direct update). FSM V.1.5 เพิ่ม `cancel_request` transitions. ทุก status change ผ่าน FSM validation เสมอ.
+- **B2B Stock Restore Guard** (V.31.7): Snippet 5 cancel stock restore มี `_stock_returned` meta guard ป้องกัน double restore เมื่อ cancel order. เช็ค flag ก่อน `dinoco_stock_add()` + set flag หลัง restore สำเร็จ.
+- **LIFF AI Snippets** (DB_ID 1173-1174):
+  - Snippet 1 (1173): REST API V.1.4 — Auth (LINE ID Token verify + JWT) + Lead/Claim endpoints + Agent proxy (`liff_ai_call_agent`) + `agent-ask` endpoint. Claims ใช้ CPT `claim_ticket` + field `ticket_status`. Claim detail returns photos (normalized URLs), ai_analysis, status_history. Claim status update logs history + supports 11 statuses (ตรงกับ Service Center).
+  - Snippet 2 (1174): Frontend V.3.1 — shortcode `[liff_ai_page]` route `/ai-center/` + SPA-like pages (dashboard, dealer, lead detail, claim list, claim detail, agent chat). Bottom nav (Admin: 4 tabs, Dealer: 2 tabs). Photo lightbox with swipe. Claim status change modal (Admin). AI Agent chat (Phase 3).
 - **LIFF AI Architecture**: ตัวแทน (dealer) เปิด LIFF → verify id_token → ค้นหา distributor CPT (`owner_line_uid` field) หรือ WP user (`linked_distributor_id` meta) → issue JWT → ใช้ `X-LIFF-AI-Token` header. Lead data อยู่ใน MongoDB (ผ่าน Agent proxy:3000). Claim data อยู่ใน WP (warranty_claim CPT).
 - **LIFF AI Constants**: `LIFF_AI_SECRET_KEY`, `LIFF_AI_JWT_SECRET` (auto-generate เก็บ wp_options), `LIFF_AI_AGENT_URL` (default `http://agent:3000`), `LIFF_AI_AGENT_KEY`
 - **LIFF AI Gotchas**:
@@ -156,8 +162,19 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Dealer ต้องมี ACF field `owner_line_uid` บน distributor CPT หรือ WP user meta `linked_distributor_id`
   - CSS prefix `.liff-ai-*` ทุก class (dark theme), scoped ไม่ conflict กับ B2B/B2F
   - Lead statuses ตรงกับ `LEAD_STATUSES` ใน `lead-pipeline.js` (17 statuses)
+  - Claims ใช้ CPT `claim_ticket` + field `ticket_status` (แก้แล้ว V.1.4 — เดิมใช้ `warranty_claim` + `claim_status` ผิด)
+  - Claim statuses ต้องตรงกับ Service Center (11 statuses: pending, reviewing, approved, in_progress, waiting_parts, repairing, quality_check, completed, rejected, cancelled, closed)
 - **OpenClaw Mini CRM** (`openclawminicrm/`): Multi-platform AI chatbot (LINE + Facebook + Instagram). ดู `openclawminicrm/CLAUDE.md` สำหรับรายละเอียด.
   - **Agent** (`proxy/`): Node.js + Express, Gemini Flash + Claude Sonnet (function calling), MongoDB Atlas
-  - **Modules**: `ai-chat.js` (AI providers + supervisor), `dinoco-tools.js` (8 tools), `shared.js` (prompt + config), `claim-flow.js`, `lead-pipeline.js`, `dinoco-cache.js`
+  - **Modules**: `ai-chat.js` (AI providers + supervisor), `dinoco-tools.js` (11 tools), `shared.js` (prompt + config), `claim-flow.js`, `lead-pipeline.js`, `dinoco-cache.js`
+  - **Tools** (11 ตัว): เดิม 8 + เพิ่ม `check_stock_status`, `dinoco_claim_status`, `dinoco_create_claim`. `dinoco_create_claim` platform detect จาก sourceId (ไม่ hardcode facebook อีกต่อไป)
+  - **Claim Flow**: auto-timeout 48h สำหรับ abandoned claims (ไม่มีการตอบ 48 ชม. → auto-cancel). Claim photos เก็บเป็น file URL (ไม่ใช่ base64)
+  - **Lead Pipeline**: ทุก status มีทางไป `closed_lost`/`cancelled` แล้ว (เดิมบาง status ไม่มีทางออก)
   - **Anti-Hallucination V.1.4**: 3 ชั้นป้องกัน (prompt → tool boundary → output sanitize), claudeSupervisor ตรวจทุก platform, product restrictions per model
   - **Security**: requireAuth ทุก API endpoint, prompt injection protection 14 patterns, PII masking, rate limiting
+
+## Reference Documentation
+
+- `SYSTEM-REFERENCE.md` — System architecture, snippet mapping, DB schema, constants reference
+- `WORKFLOW-REFERENCE.md` — Business workflows (B2B order flow, B2F PO flow, claim flow, inventory flow)
+- `FEATURE-SPECS.md` — Feature specifications and implementation details
