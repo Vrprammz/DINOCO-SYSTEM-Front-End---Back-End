@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.2.5 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.2.6 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -478,11 +478,11 @@ def process_job(job, config, printer_mgr):
                                 'is_last_page': is_last,
                                 'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
 
-                    # Dynamic height ตาม content จริง — ไม่บังคับ 180mm
+                    # Height ต้องตรงกับกระดาษ pre-cut (PAGE_H) เพื่อให้ GAP sensor ทำงานถูก
                     rows_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in page_items)
                     footer_mm = FOOTER_LAST_MM if is_last else FOOTER_NORMAL_MM
                     content_h = HEADER_MM + rows_mm + footer_mm + MARGIN_MM + 5  # 5mm padding
-                    pick_h = max(content_h, 80)  # minimum 80mm
+                    pick_h = max(content_h, PAGE_H)  # ต้องเท่ากระดาษจริง (180mm) สำหรับ pre-cut labels
 
                     pick_html = render_template(pick_tpl, pick_ctx)
                     pick_pdf = html_to_pdf(pick_html, 100, pick_h)
@@ -626,7 +626,7 @@ def process_job(job, config, printer_mgr):
                 rows_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in page_items)
                 footer_mm = FOOTER_LAST_MM if is_last else FOOTER_NORMAL_MM
                 content_h = HEADER_MM + rows_mm + footer_mm + MARGIN_MM + 5
-                pick_h = max(content_h, 80)
+                pick_h = max(content_h, PAGE_H)  # ต้องเท่ากระดาษจริง (180mm)
                 pick_html = render_template(pick_tpl, pick_ctx)
                 pick_pdf = html_to_pdf(pick_html, 100, pick_h)
                 printer_mgr.print_picking_list(pick_pdf, tid)
