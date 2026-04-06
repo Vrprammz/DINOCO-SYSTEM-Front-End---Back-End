@@ -1,5 +1,5 @@
 """
-DINOCO B2B — CUPS Printer Wrapper V.2.2
+DINOCO B2B — CUPS Printer Wrapper V.2.3
 Handles printing PDFs to configured CUPS printers.
 For thermal label printers: converts PDF → image → TSPL or ESC/POS raster.
 XP-420B: sends TSPL via USB directly (pyusb) since usblp driver doesn't claim it.
@@ -224,7 +224,8 @@ def usb_send(vendor_id, product_id, data):
 
 # ── PDF Conversion ─────────────────────────────────────────────────
 
-def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=2, direction=1):
+def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=2, direction=1,
+                paper_width_mm=100, paper_height_mm=180):
     """Convert a PDF to TSPL bitmap commands for Xprinter XP-420B and similar.
 
     Args:
@@ -237,6 +238,8 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=2, directi
         gap_mm: Gap between pre-cut labels in mm (0 for continuous roll,
                 2-3 for standard pre-cut 100x180mm labels).
         direction: Print direction (0=top-to-bottom, 1=bottom-to-top).
+        paper_width_mm: Physical paper width (used in SIZE command).
+        paper_height_mm: Physical paper height (used in SIZE command).
 
     Returns:
         bytes: TSPL command data ready to send to printer
@@ -254,9 +257,13 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=2, directi
         if not pages:
             raise RuntimeError('pdftoppm produced no output')
 
+        if len(pages) > 1:
+            logger.warning(f'PDF has {len(pages)} pages — expected 1 for thermal label. '
+                           f'Only printing page 1. Content may overflow.')
+
         data = bytearray()
 
-        for page_file in pages:
+        for page_file in pages[:1]:  # Only print first page — prevent blank label
             img = Image.open(os.path.join(tmpdir, page_file))
 
             # Resize to fit printer width
@@ -270,8 +277,8 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=2, directi
             width_bytes = (img.width + 7) // 8
             height = img.height
 
-            # TSPL commands
-            data += f'SIZE {img.width / dpi * 25.4:.1f} mm, {height / dpi * 25.4:.1f} mm\r\n'.encode()
+            # TSPL commands — SIZE ใช้ค่าจาก config (กระดาษจริง) ไม่คำนวณจาก pixel
+            data += f'SIZE {paper_width_mm} mm, {paper_height_mm} mm\r\n'.encode()
             data += f'GAP {gap_mm} mm, 0 mm\r\n'.encode()
             data += f'DIRECTION {direction},0\r\n'.encode()
             data += b'CLS\r\n'
@@ -375,6 +382,9 @@ class PrinterManager:
         # TSPL GAP (mm between pre-cut labels) and DIRECTION (0=top-down, 1=bottom-up)
         self.label_gap_mm = config.get('label_gap_mm', 2)
         self.label_direction = config.get('label_direction', 1)
+        # Physical paper size (for TSPL SIZE command — must match real paper)
+        self.label_width_mm = config.get('label_width_mm', 100)
+        self.label_height_mm = config.get('label_height_mm', 180)
         self.conn = None
 
     def _get_conn(self):
@@ -429,7 +439,9 @@ class PrinterManager:
 
         if protocol == 'tspl':
             raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert,
-                                   gap_mm=self.label_gap_mm, direction=self.label_direction)
+                                   gap_mm=self.label_gap_mm, direction=self.label_direction,
+                                   paper_width_mm=self.label_width_mm,
+                                   paper_height_mm=self.label_height_mm)
         else:
             raw_data = pdf_to_escpos(pdf_path)
 
@@ -472,7 +484,9 @@ class PrinterManager:
 
         if protocol == 'tspl':
             raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert,
-                                   gap_mm=self.label_gap_mm, direction=self.label_direction)
+                                   gap_mm=self.label_gap_mm, direction=self.label_direction,
+                                   paper_width_mm=self.label_width_mm,
+                                   paper_height_mm=self.label_height_mm)
         else:
             raw_data = pdf_to_escpos(pdf_path)
 
