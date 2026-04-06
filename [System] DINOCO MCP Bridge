@@ -1,7 +1,7 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
- * Version: V.2.1 — Inventory Phase 2: stock_display + stock_eta (no qty)
+ * Version: V.2.2 — Lead storage: per-row wp_options (scalable) + migration from flat array
  * DB_ID: 1050
  * Author: DINOCO Dev Team
  *
@@ -1079,6 +1079,95 @@ function dinoco_mcp_brand_voice_submit( $request ) {
 }
 
 // =========================================================================
+// Lead Storage Helpers (V.2.2) — per-row wp_options แทน flat array
+// แต่ละ lead เก็บแยก option: dinoco_mcp_lead_{lead_id}
+// ปลอดภัยกว่า read-modify-write flat array + ไม่ degrade ตาม lead count
+// =========================================================================
+
+/**
+ * Migrate flat array (dinoco_mcp_leads) → per-row wp_options
+ * เรียกอัตโนมัติครั้งแรกที่มีการอ่าน/เขียน lead
+ */
+function dinoco_mcp_migrate_leads_if_needed() {
+    // ถ้า migrate แล้วไม่ต้องทำซ้ำ
+    if ( get_option( 'dinoco_mcp_leads_migrated', false ) ) return;
+
+    $old_leads = get_option( 'dinoco_mcp_leads', array() );
+    if ( ! empty( $old_leads ) && is_array( $old_leads ) ) {
+        foreach ( $old_leads as $lead ) {
+            if ( empty( $lead['lead_id'] ) ) continue;
+            $key = 'dinoco_mcp_lead_' . sanitize_key( $lead['lead_id'] );
+            // ไม่ overwrite ถ้ามีอยู่แล้ว (กรณี migrate ซ้ำ)
+            if ( false === get_option( $key ) ) {
+                update_option( $key, $lead, false );
+            }
+        }
+    }
+
+    update_option( 'dinoco_mcp_leads_migrated', true, false );
+    // เก็บ old option ไว้ backup — ไม่ delete ทันที
+}
+
+/**
+ * บันทึก lead เดี่ยวลง wp_options
+ */
+function dinoco_mcp_save_lead( $lead ) {
+    $lead_id = $lead['lead_id'] ?? uniqid( 'LEAD-' );
+    $lead['lead_id']    = $lead_id;
+    $lead['updated_at'] = current_time( 'mysql' );
+    update_option( 'dinoco_mcp_lead_' . sanitize_key( $lead_id ), $lead, false );
+    return $lead_id;
+}
+
+/**
+ * ดึง lead เดี่ยวจาก lead_id
+ */
+function dinoco_mcp_get_lead( $lead_id ) {
+    dinoco_mcp_migrate_leads_if_needed();
+    $lead = get_option( 'dinoco_mcp_lead_' . sanitize_key( $lead_id ), null );
+    return $lead;
+}
+
+/**
+ * ดึง leads ทั้งหมดจาก DB (per-row query)
+ * $limit/$offset สำหรับ pagination, $filters สำหรับ PHP-side filtering
+ */
+function dinoco_mcp_get_all_leads( $limit = 100, $offset = 0, $filters = array() ) {
+    dinoco_mcp_migrate_leads_if_needed();
+    global $wpdb;
+
+    // ดึงทั้งหมดที่ match prefix แล้ว filter ใน PHP (wp_options ไม่มี index บน value)
+    $rows = $wpdb->get_results( $wpdb->prepare(
+        "SELECT option_name, option_value FROM {$wpdb->options}
+         WHERE option_name LIKE %s
+         ORDER BY option_id DESC",
+        $wpdb->esc_like( 'dinoco_mcp_lead_' ) . '%'
+    ) );
+
+    $leads = array();
+    foreach ( $rows as $row ) {
+        $lead = maybe_unserialize( $row->option_value );
+        if ( ! is_array( $lead ) || empty( $lead['lead_id'] ) ) continue;
+
+        // Apply filters
+        if ( ! empty( $filters['status'] ) && ( $lead['status'] ?? '' ) !== $filters['status'] ) continue;
+        if ( ! empty( $filters['dealer_id'] ) && ( $lead['dealer_id'] ?? '' ) !== $filters['dealer_id'] ) continue;
+
+        $leads[] = $lead;
+    }
+
+    // Sort by created_at DESC
+    usort( $leads, function( $a, $b ) {
+        return strcmp( $b['created_at'] ?? '', $a['created_at'] ?? '' );
+    } );
+
+    $total = count( $leads );
+    $paged = array_slice( $leads, $offset, $limit );
+
+    return array( 'leads' => $paged, 'total' => $total );
+}
+
+// =========================================================================
 // P1-1. LEAD CREATE — สร้าง lead record ใหม่
 // =========================================================================
 function dinoco_mcp_lead_create( $request ) {
@@ -1095,8 +1184,11 @@ function dinoco_mcp_lead_create( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'customer_name, phone, or source_id required' ), 400 );
     }
 
-    // เก็บ leads ใน wp_options เป็น array (simple — ย้ายไป CPT ทีหลังได้)
-    $leads = get_option( 'dinoco_mcp_leads', array() );
+    // TODO: MCP leads ถูกเก็บใน WP (wp_options) แต่ LIFF AI leads อยู่ใน MongoDB (ผ่าน Agent proxy)
+    // ยังไม่มี sync mechanism ระหว่าง 2 ระบบ — ควรรวมเป็น single source of truth ในอนาคต
+    // ตัวเลือก: (1) ให้ MCP Bridge forward ไป Agent proxy (2) ให้ LIFF AI อ่านจาก WP
+
+    dinoco_mcp_migrate_leads_if_needed();
 
     $lead_id = 'LEAD-' . time() . '-' . wp_rand( 1000, 9999 );
 
@@ -1110,7 +1202,7 @@ function dinoco_mcp_lead_create( $request ) {
         'platform'           => $platform ?: 'unknown',
         'source_id'          => $source_id,
         'customer_platform'  => $customer_platform,
-        'status'             => 'new', // new → contacted → qualified → converted → lost
+        'status'             => 'new', // new -> contacted -> qualified -> converted -> lost
         'notes'              => '',
         'followup_at'        => '',
         'created_at'         => current_time( 'mysql' ),
@@ -1118,8 +1210,7 @@ function dinoco_mcp_lead_create( $request ) {
         'updated_by'         => 'agent',
     );
 
-    $leads[] = $new_lead;
-    update_option( 'dinoco_mcp_leads', $leads, false );
+    dinoco_mcp_save_lead( $new_lead );
 
     return new WP_REST_Response( array(
         'success' => true,
@@ -1147,28 +1238,19 @@ function dinoco_mcp_lead_update( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'Invalid status. Valid: ' . implode( ', ', $valid_statuses ) ), 400 );
     }
 
-    $leads = get_option( 'dinoco_mcp_leads', array() );
-    $found = false;
-
-    foreach ( $leads as &$lead ) {
-        if ( $lead['lead_id'] === $lead_id ) {
-            if ( ! empty( $status ) )     $lead['status']      = $status;
-            if ( ! empty( $notes ) )      $lead['notes']       = $lead['notes'] . "\n[" . current_time( 'Y-m-d H:i' ) . '] ' . $notes;
-            if ( ! empty( $updated_by ) ) $lead['updated_by']  = $updated_by;
-            if ( ! empty( $followup ) )   $lead['followup_at'] = $followup;
-            $lead['updated_at'] = current_time( 'mysql' );
-            $found = true;
-            break;
-        }
-    }
-
-    if ( ! $found ) {
+    $lead = dinoco_mcp_get_lead( $lead_id );
+    if ( ! $lead ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'Lead not found' ), 404 );
     }
 
-    update_option( 'dinoco_mcp_leads', $leads, false );
+    if ( ! empty( $status ) )     $lead['status']      = $status;
+    if ( ! empty( $notes ) )      $lead['notes']       = ( $lead['notes'] ?? '' ) . "\n[" . current_time( 'Y-m-d H:i' ) . '] ' . $notes;
+    if ( ! empty( $updated_by ) ) $lead['updated_by']  = $updated_by;
+    if ( ! empty( $followup ) )   $lead['followup_at'] = $followup;
 
-    return new WP_REST_Response( array( 'success' => true, 'lead_id' => $lead_id, 'status' => $status ), 200 );
+    dinoco_mcp_save_lead( $lead );
+
+    return new WP_REST_Response( array( 'success' => true, 'lead_id' => $lead_id, 'status' => $lead['status'] ), 200 );
 }
 
 // =========================================================================
@@ -1180,35 +1262,19 @@ function dinoco_mcp_lead_list( $request ) {
     $page      = max( 1, (int) $request->get_param( 'page' ) );
     $per_page  = min( max( 1, (int) ( $request->get_param( 'per_page' ) ?: 20 ) ), 100 );
 
-    $leads = get_option( 'dinoco_mcp_leads', array() );
+    $filters = array();
+    if ( ! empty( $status ) )    $filters['status']    = $status;
+    if ( ! empty( $dealer_id ) ) $filters['dealer_id'] = $dealer_id;
 
-    // Filter
-    if ( ! empty( $status ) ) {
-        $leads = array_filter( $leads, function( $l ) use ( $status ) {
-            return $l['status'] === $status;
-        } );
-    }
-    if ( ! empty( $dealer_id ) ) {
-        $leads = array_filter( $leads, function( $l ) use ( $dealer_id ) {
-            return $l['dealer_id'] === $dealer_id;
-        } );
-    }
-
-    // Sort by created_at DESC
-    usort( $leads, function( $a, $b ) {
-        return strcmp( $b['created_at'] ?? '', $a['created_at'] ?? '' );
-    } );
-
-    $total  = count( $leads );
     $offset = ( $page - 1 ) * $per_page;
-    $paged  = array_slice( array_values( $leads ), $offset, $per_page );
+    $result = dinoco_mcp_get_all_leads( $per_page, $offset, $filters );
 
     return new WP_REST_Response( array(
-        'count'    => count( $paged ),
-        'total'    => $total,
+        'count'    => count( $result['leads'] ),
+        'total'    => $result['total'],
         'page'     => $page,
         'per_page' => $per_page,
-        'leads'    => $paged,
+        'leads'    => $result['leads'],
     ), 200 );
 }
 
@@ -1218,20 +1284,16 @@ function dinoco_mcp_lead_list( $request ) {
 function dinoco_mcp_lead_get( $request ) {
     $id = sanitize_text_field( $request['id'] );
 
-    // lead_id format: LEAD-{timestamp}-{rand} — id param is numeric index or we search by suffix
-    $leads = get_option( 'dinoco_mcp_leads', array() );
-
-    // ลองหา exact match ก่อน (ถ้า id เป็น numeric ใช้เป็น index)
-    foreach ( $leads as $lead ) {
-        if ( $lead['lead_id'] === $id || $lead['lead_id'] === 'LEAD-' . $id ) {
-            return new WP_REST_Response( array( 'found' => true, 'lead' => $lead ), 200 );
-        }
+    // ลองหา exact match (lead_id format: LEAD-{timestamp}-{rand})
+    $lead = dinoco_mcp_get_lead( $id );
+    if ( $lead ) {
+        return new WP_REST_Response( array( 'found' => true, 'lead' => $lead ), 200 );
     }
 
-    // Fallback: search by array index
-    $idx = (int) $id;
-    if ( isset( $leads[ $idx ] ) ) {
-        return new WP_REST_Response( array( 'found' => true, 'lead' => $leads[ $idx ] ), 200 );
+    // Fallback: ลองเติม prefix
+    $lead = dinoco_mcp_get_lead( 'LEAD-' . $id );
+    if ( $lead ) {
+        return new WP_REST_Response( array( 'found' => true, 'lead' => $lead ), 200 );
     }
 
     return new WP_REST_Response( array( 'found' => false, 'message' => 'Lead not found' ), 404 );
@@ -1241,11 +1303,11 @@ function dinoco_mcp_lead_get( $request ) {
 // P1-5. LEAD FOLLOWUP SCHEDULE — pending follow-ups for cron
 // =========================================================================
 function dinoco_mcp_lead_followup_schedule( $request ) {
-    $leads = get_option( 'dinoco_mcp_leads', array() );
-    $now   = current_time( 'mysql' );
+    $result = dinoco_mcp_get_all_leads( 500, 0 );
+    $now    = current_time( 'mysql' );
 
     $pending = array();
-    foreach ( $leads as $lead ) {
+    foreach ( $result['leads'] as $lead ) {
         // Skip closed leads
         if ( in_array( $lead['status'] ?? '', array( 'converted', 'lost' ), true ) ) continue;
         // Has a followup_at set and it's due
@@ -1731,16 +1793,12 @@ function dinoco_mcp_lead_attribution( $request ) {
     update_option( 'dinoco_mcp_attributions', $attributions, false );
 
     // อัพเดท lead status เป็น converted ถ้ายังไม่ converted
-    $leads = get_option( 'dinoco_mcp_leads', array() );
-    foreach ( $leads as &$lead ) {
-        if ( $lead['lead_id'] === $lead_id && $lead['status'] !== 'converted' ) {
-            $lead['status']     = 'converted';
-            $lead['updated_at'] = current_time( 'mysql' );
-            $lead['notes']      = ( $lead['notes'] ?? '' ) . "\n[" . current_time( 'Y-m-d H:i' ) . "] Auto-converted via attribution ({$event})";
-            break;
-        }
+    $lead = dinoco_mcp_get_lead( $lead_id );
+    if ( $lead && ( $lead['status'] ?? '' ) !== 'converted' ) {
+        $lead['status']     = 'converted';
+        $lead['notes']      = ( $lead['notes'] ?? '' ) . "\n[" . current_time( 'Y-m-d H:i' ) . "] Auto-converted via attribution ({$event})";
+        dinoco_mcp_save_lead( $lead );
     }
-    update_option( 'dinoco_mcp_leads', $leads, false );
 
     return new WP_REST_Response( array(
         'success'  => true,
