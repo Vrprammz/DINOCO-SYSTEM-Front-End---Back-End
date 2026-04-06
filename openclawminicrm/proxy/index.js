@@ -1377,6 +1377,96 @@ ${kbSummary}`;
   }
 });
 
+// POST /api/train/auto-run — รัน auto-train จาก Dashboard (Gemini สร้างคำถาม + judge + fix KB)
+app.post("/api/train/auto-run", requireAuth, express.json(), async (req, res) => {
+  const count = req.body.count || 10;
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB error" });
+  const apiKey = getDynamicKeySync("GOOGLE_API_KEY");
+  if (!apiKey) return res.status(500).json({ error: "No API key" });
+
+  const results = { generated: 0, tested: 0, passed: 0, failed: 0, kb_added: 0, details: [] };
+
+  try {
+    // Phase 1: Gemini สร้างคำถามจาก KB จริง
+    const kb = await db.collection(KB_COLL).find({ active: { $ne: false } }).limit(50).toArray();
+    const kbText = kb.map(k => "• " + (k.title || "").substring(0, 60) + ": " + (k.content || "").substring(0, 100)).join("\n");
+
+    const genRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(30000),
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: `จาก KB นี้:\n${kbText}\n\nสร้าง ${count} คำถามจำลองลูกค้า DINOCO (อะไหล่มอเตอร์ไซค์) ภาษาไทย หลากหลาย\nพร้อมคำตอบที่ถูกต้องจาก KB\n\nตอบ JSON array: [{"question":"...","expected":"คำตอบสั้นที่ถูก","category":"สินค้า|เคลม|ตัวแทน|สเปค|ดูแล"}]\nไม่ต้อง code block` }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 4000 },
+      }),
+    });
+    const genData = await genRes.json();
+    const genText = genData.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+    const jsonMatch = genText.match(/\[[\s\S]*\]/);
+    const questions = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    results.generated = questions.length;
+
+    // Phase 2: ทดสอบแต่ละข้อ + Gemini Judge
+    for (const q of questions) {
+      try {
+        // ส่งคำถามไป AI
+        const config = await getBotConfig("auto-train");
+        const systemPrompt = config.systemPrompt || DEFAULT_PROMPT;
+        const reply = await callDinocoAI(systemPrompt, q.question, "auto-train-" + Date.now());
+        results.tested++;
+
+        // Gemini Judge ตัดสิน
+        const judgeRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(15000),
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: `คำถาม: ${q.question}\nคำตอบที่ถูก: ${q.expected}\nAI ตอบ: ${reply}\n\nตัดสิน: AI ตอบถูกต้องตามข้อเท็จจริงไหม\nตอบ JSON: {"verdict":"pass"|"fail","reason":"สั้นๆ","missing":"ข้อมูลที่ขาด (ถ้า fail)"}` }] }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
+          }),
+        });
+        const judgeData = await judgeRes.json();
+        const judgeText = judgeData.candidates?.[0]?.content?.parts?.[0]?.text || '{"verdict":"pass"}';
+        const judgeMatch = judgeText.match(/\{[\s\S]*\}/);
+        const judge = judgeMatch ? JSON.parse(judgeMatch[0]) : { verdict: "pass" };
+
+        const detail = { question: q.question, expected: q.expected, reply: reply.substring(0, 200), verdict: judge.verdict, reason: judge.reason || "" };
+        results.details.push(detail);
+
+        if (judge.verdict === "pass") {
+          results.passed++;
+        } else {
+          results.failed++;
+          // Auto-fix: เพิ่ม KB ถ้า fail
+          if (q.expected && judge.missing) {
+            await db.collection(KB_COLL).insertOne({
+              title: q.question.substring(0, 200),
+              content: q.expected + (judge.missing ? "\n\n" + judge.missing : ""),
+              category: q.category || "auto-train",
+              tags: ["auto-train"],
+              active: true, source: "auto-train-dashboard",
+              createdAt: new Date(), updatedAt: new Date(),
+            });
+            results.kb_added++;
+          }
+        }
+
+        // บันทึก training log
+        await db.collection("training_logs").insertOne({
+          message: q.question, reply, verdict: judge.verdict,
+          correct_answer: q.expected, notes: judge.reason,
+          source: "auto-train", timestamp: new Date(),
+        });
+      } catch (e) { results.details.push({ question: q.question, error: e.message }); }
+    }
+
+    results.score = results.tested > 0 ? Math.round(results.passed * 100 / results.tested) : 0;
+    res.json(results);
+  } catch (e) {
+    console.error("[Train/AutoRun] Error:", e.message);
+    res.status(500).json({ error: e.message, ...results });
+  }
+});
+
 // GET /api/train/stats — สถิติ training
 app.get("/api/train/stats", requireAuth, async (req, res) => {
   const db = await getDB();

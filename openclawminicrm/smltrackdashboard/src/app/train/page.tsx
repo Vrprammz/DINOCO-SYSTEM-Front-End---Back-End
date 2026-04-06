@@ -53,6 +53,7 @@ interface KBRef {
 const TABS = [
   { id: "test", label: "ทดสอบ AI", icon: "🧪" },
   { id: "kb", label: "ถังข้อมูล", icon: "📚" },
+  { id: "auto", label: "Auto-Train", icon: "🤖" },
   { id: "stats", label: "สถิติ", icon: "📊" },
   { id: "logs", label: "ประวัติ", icon: "📝" },
 ];
@@ -158,6 +159,7 @@ export default function TrainPage() {
       {/* Tab Content */}
       {tab === "test" && <TestTab />}
       {tab === "kb" && <KBTab />}
+      {tab === "auto" && <AutoTrainTab />}
       {tab === "stats" && <StatsTab />}
       {tab === "logs" && <LogsTab />}
     </div>
@@ -825,6 +827,164 @@ function KBTab() {
             </Card>
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════
+   Tab: Auto-Train (Gemini สร้าง+ทดสอบ+fix KB อัตโนมัติ)
+   ═══════════════════════════════════════════ */
+function AutoTrainTab() {
+  const [running, setRunning] = useState(false);
+  const [count, setCount] = useState(10);
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState("");
+
+  const runAutoTrain = async () => {
+    setRunning(true);
+    setError("");
+    setResult(null);
+    try {
+      const res = await fetch("/api/train/auto-run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ count }),
+      });
+      const data = await res.json();
+      if (data.error) setError(data.error);
+      else setResult(data);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text-primary)" }}>
+          Auto-Train — Gemini สร้างคำถาม + ทดสอบ + แก้ KB อัตโนมัติ
+        </h3>
+        <p className="text-xs mb-4" style={{ color: "var(--text-secondary)" }}>
+          Gemini อ่าน KB จริง → สร้างคำถามจำลองลูกค้า → AI ตอบ → Gemini Judge ตัดสิน → ข้อที่ผิดเพิ่ม KB อัตโนมัติ (ฟรี)
+        </p>
+
+        <div className="flex items-center gap-3 mb-4">
+          <label className="text-xs" style={{ color: "var(--text-secondary)" }}>จำนวนคำถาม:</label>
+          <select
+            value={count}
+            onChange={(e) => setCount(Number(e.target.value))}
+            className="rounded px-2 py-1 text-sm"
+            style={{ background: "var(--bg-primary)", color: "var(--text-primary)", border: "1px solid var(--border-primary)" }}
+          >
+            <option value={5}>5 ข้อ (~1 นาที)</option>
+            <option value={10}>10 ข้อ (~2 นาที)</option>
+            <option value={20}>20 ข้อ (~4 นาที)</option>
+            <option value={30}>30 ข้อ (~6 นาที)</option>
+          </select>
+
+          <button
+            onClick={runAutoTrain}
+            disabled={running}
+            className="px-4 py-2 rounded text-sm font-semibold text-white"
+            style={{ background: running ? "var(--border-primary)" : "#8b5cf6" }}
+          >
+            {running ? "กำลังเทรน..." : "เริ่ม Auto-Train"}
+          </button>
+        </div>
+
+        {running && (
+          <div className="flex items-center gap-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+            <div className="animate-spin w-4 h-4 border-2 border-purple-500 border-t-transparent rounded-full" />
+            Gemini กำลังสร้างคำถาม + ทดสอบ AI + แก้ KB... รอสักครู่
+          </div>
+        )}
+
+        {error && (
+          <div className="p-3 rounded text-sm" style={{ background: "#450a0a", color: "#f87171" }}>
+            {error}
+          </div>
+        )}
+      </Card>
+
+      {result && (
+        <>
+          {/* Score Summary */}
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            {[
+              { label: "สร้าง", value: result.generated, color: "#60a5fa" },
+              { label: "ทดสอบ", value: result.tested, color: "#a78bfa" },
+              { label: "ผ่าน", value: result.passed, color: "#34d399" },
+              { label: "ไม่ผ่าน", value: result.failed, color: "#f87171" },
+              { label: "KB เพิ่ม", value: result.kb_added, color: "#fbbf24" },
+            ].map((s) => (
+              <Card key={s.label}>
+                <div className="text-center">
+                  <div className="text-2xl font-bold" style={{ color: s.color }}>{s.value}</div>
+                  <div className="text-xs mt-1" style={{ color: "var(--text-secondary)" }}>{s.label}</div>
+                </div>
+              </Card>
+            ))}
+          </div>
+
+          {/* Score Bar */}
+          <Card>
+            <div className="flex items-center gap-3">
+              <span className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
+                Score: {result.score}%
+              </span>
+              <div className="flex-1 h-3 rounded-full" style={{ background: "var(--bg-primary)" }}>
+                <div
+                  className="h-full rounded-full transition-all"
+                  style={{
+                    width: `${result.score || 0}%`,
+                    background: (result.score || 0) >= 90 ? "#34d399" : (result.score || 0) >= 70 ? "#fbbf24" : "#f87171",
+                  }}
+                />
+              </div>
+            </div>
+          </Card>
+
+          {/* Details */}
+          {result.details && result.details.length > 0 && (
+            <Card>
+              <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text-primary)" }}>
+                รายละเอียด ({result.details.length} ข้อ)
+              </h3>
+              <div className="space-y-2 max-h-96 overflow-y-auto">
+                {result.details.map((d: any, i: number) => (
+                  <div
+                    key={i}
+                    className="p-2 rounded text-xs"
+                    style={{
+                      background: d.verdict === "pass" ? "#064e3b22" : "#450a0a22",
+                      border: `1px solid ${d.verdict === "pass" ? "#10b981" : "#dc2626"}33`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <span>{d.verdict === "pass" ? "✅" : "❌"}</span>
+                      <span className="font-medium" style={{ color: "var(--text-primary)" }}>
+                        {d.question}
+                      </span>
+                    </div>
+                    {d.reply && (
+                      <div style={{ color: "var(--text-secondary)" }}>
+                        AI: {d.reply.substring(0, 150)}...
+                      </div>
+                    )}
+                    {d.reason && (
+                      <div className="mt-1" style={{ color: d.verdict === "pass" ? "#34d399" : "#f87171" }}>
+                        {d.reason}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+        </>
       )}
     </div>
   );
