@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
-const agentUrl = () => process.env.AGENT_URL || "http://agent:3000";
+const agentUrl = () => process.env.AGENT_URL || "http://dinoco-agent:3000";
 
 // Proxy all /api/train/* requests to Agent
 async function proxyToAgent(
@@ -16,7 +16,12 @@ async function proxyToAgent(
   try {
     const apiKey = process.env.API_SECRET_KEY || process.env.AGENT_API_KEY || "dnc-api-2026-supersecret-changethis";
     const headers: Record<string, string> = { "Content-Type": "application/json", "x-api-key": apiKey };
-    const opts: RequestInit = { method, headers };
+    // auto-run ใช้เวลานาน ต้อง timeout สูง
+    const isLongRunning = path.includes("auto-run");
+    const opts: RequestInit = {
+      method, headers,
+      signal: AbortSignal.timeout(isLongRunning ? 300000 : 30000), // 5 นาที vs 30 วิ
+    };
 
     if (method !== "GET" && method !== "DELETE") {
       const body = await request.json().catch(() => ({}));
