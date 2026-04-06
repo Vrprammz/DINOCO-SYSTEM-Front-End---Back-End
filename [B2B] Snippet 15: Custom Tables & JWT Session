@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.5.6 — oos_timestamp + oos_duration_hours columns              ║
+ * ║  Version: V.5.7 — tier pricing เปลี่ยนเป็น % ส่วนลด + migration           ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '5.6';
+    $db_version = '5.7';
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -318,14 +318,37 @@ class DINOCO_Catalog {
         return $wpdb->update( self::table(), array( 'b2b_visible' => $visible ? 1 : 0 ), array( 'sku' => $sku ) );
     }
 
+    /**
+     * Get dealer price for a specific rank.
+     * V.5.7: columns price_silver/gold/platinum/diamond now store % discount (0-100).
+     * Standard rank uses b2b_discount_percent. Fallback: base_price (no discount).
+     */
     public static function get_price_for_rank( $sku, $rank ) {
         $product = self::get_by_sku( $sku );
         if ( ! $product ) return 0;
-        $rank_key = 'price_' . strtolower( $rank );
-        if ( isset( $product[ $rank_key ] ) && floatval( $product[ $rank_key ] ) > 0 ) {
-            return floatval( $product[ $rank_key ] );
+        $base = floatval( $product['base_price'] );
+        if ( $base <= 0 ) return 0;
+
+        $rank_lower = strtolower( $rank );
+        $discount_pct = 0;
+
+        if ( $rank_lower === 'standard' ) {
+            $discount_pct = floatval( $product['b2b_discount_percent'] );
+        } else {
+            $rank_key = 'price_' . $rank_lower; // column ชื่อเดิม แต่เก็บ % แล้ว
+            $tier_val = isset( $product[ $rank_key ] ) ? floatval( $product[ $rank_key ] ) : 0;
+            if ( $tier_val > 0 && $tier_val <= 100 ) {
+                $discount_pct = $tier_val;
+            } else {
+                // Fallback ไป b2b_discount_percent (default discount)
+                $discount_pct = floatval( $product['b2b_discount_percent'] );
+            }
         }
-        return floatval( $product['base_price'] );
+
+        if ( $discount_pct > 0 && $discount_pct <= 100 ) {
+            return round( $base * ( 1 - $discount_pct / 100 ), 2 );
+        }
+        return $base;
     }
 
     public static function upsert( $data ) {
@@ -393,10 +416,92 @@ class DINOCO_Catalog {
     }
 }
 
+    /**
+     * V.5.7: Migrate tier pricing จากราคาเลข → % ส่วนลด
+     * Run ครั้งเดียว — ตรวจ flag dinoco_tier_pricing_migrated
+     * Logic: ถ้า value > 100 → น่าจะเป็นราคาเลข → convert เป็น %
+     *        ถ้า value <= 100 → อาจเป็น % แล้ว → skip
+     *        ถ้า value = 0 → ไม่ต้องทำอะไร
+     */
+    public static function migrate_tier_to_percent() {
+        if ( get_option( '_dinoco_tier_pricing_migrated' ) ) return;
+
+        global $wpdb;
+        $table = self::table();
+        $products = $wpdb->get_results( "SELECT sku, base_price, price_silver, price_gold, price_platinum, price_diamond FROM {$table} WHERE is_active = 1", ARRAY_A );
+        if ( empty( $products ) ) {
+            update_option( '_dinoco_tier_pricing_migrated', 1 );
+            return;
+        }
+
+        $converted = 0;
+        $tier_cols = array( 'price_silver', 'price_gold', 'price_platinum', 'price_diamond' );
+
+        foreach ( $products as $p ) {
+            $base = floatval( $p['base_price'] );
+            if ( $base <= 0 ) continue;
+
+            $updates = array();
+            foreach ( $tier_cols as $col ) {
+                $val = floatval( $p[ $col ] );
+                if ( $val <= 0 ) continue; // 0 = no tier set → skip
+                if ( $val > 100 ) {
+                    // ราคาเลข → convert เป็น % ส่วนลด
+                    $pct = round( ( 1 - $val / $base ) * 100, 2 );
+                    if ( $pct < 0 ) $pct = 0;
+                    if ( $pct > 100 ) $pct = 100;
+                    $updates[ $col ] = $pct;
+                }
+                // <= 100 → อาจเป็น % แล้ว → skip
+            }
+
+            if ( ! empty( $updates ) ) {
+                $wpdb->update( $table, $updates, array( 'sku' => $p['sku'] ) );
+                $converted++;
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( "[TierMigrate] {$p['sku']}: " . wp_json_encode( $updates ) );
+                }
+            }
+        }
+
+        // Also migrate ACF fields on b2b_product CPT
+        $acf_tier_map = array(
+            'price_silver'   => 'price_silver',
+            'price_gold'     => 'price_gold',
+            'price_platinum' => 'price_platinum',
+            'price_diamond'  => 'price_diamond',
+        );
+        $b2b_posts = get_posts( array( 'post_type' => 'b2b_product', 'posts_per_page' => -1, 'post_status' => 'publish', 'fields' => 'ids' ) );
+        foreach ( $b2b_posts as $pid ) {
+            $bp = floatval( get_field( 'price_standard', $pid ) );
+            if ( $bp <= 0 ) continue;
+            foreach ( $acf_tier_map as $acf_key => $col ) {
+                $val = floatval( get_field( $acf_key, $pid ) );
+                if ( $val > 100 ) {
+                    $pct = round( ( 1 - $val / $bp ) * 100, 2 );
+                    if ( $pct < 0 ) $pct = 0;
+                    if ( $pct > 100 ) $pct = 100;
+                    update_field( $acf_key, $pct, $pid );
+                }
+            }
+        }
+
+        update_option( '_dinoco_tier_pricing_migrated', 1 );
+        // Clear cache
+        delete_transient( 'b2b_sku_data_map' );
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[TierMigrate] Done. Converted {$converted} products (custom table) + ACF fallback." );
+        }
+    }
+
+} // end class DINOCO_Catalog
+
 } // end class_exists DINOCO_Catalog
 
 // Auto-migrate on first load
 add_action( 'init', array( 'DINOCO_Catalog', 'migrate_from_options' ), 10 );
+// V.5.7: Migrate tier pricing to % discount
+add_action( 'init', array( 'DINOCO_Catalog', 'migrate_tier_to_percent' ), 11 );
 
 // ════════════════════════════════════════════
 // PART 1B: STOCK CORE FUNCTIONS (V.3.0)

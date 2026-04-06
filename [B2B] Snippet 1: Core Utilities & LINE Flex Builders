@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
- * ║  Version: V.32.5 — b2b_get_sku_relations() bridge + custom table source of truth ║
+ * ║  Version: V.32.6 — tier pricing % discount + b2b_compute_dealer_price() helper ║
  * ║  DB_ID: 72                                                  ║
  * ║  DINOCO B2B Smart Order System                               ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -607,18 +607,65 @@ if ( ! function_exists( 'b2b_get_catalog_b2b' ) ) {
     }
 }
 
+/**
+ * V.32.6: Central helper — คำนวณราคาตัวแทนจาก base_price + tier discount %
+ * ใช้ทั้ง GET /catalog, POST /place-order, Flex cards, Invoice
+ *
+ * @param float  $base_price  ราคาปลีก
+ * @param string $rank        standard|silver|gold|platinum|diamond
+ * @param array  $sku_data    product data array (must have discount/price_silver/etc + b2b_discount_percent)
+ * @return float dealer price (rounded 2 decimal)
+ */
+if ( ! function_exists( 'b2b_compute_dealer_price' ) ) {
+    function b2b_compute_dealer_price( $base_price, $rank, $sku_data ) {
+        $base = floatval( $base_price );
+        if ( $base <= 0 ) return 0;
+
+        $rank_lower = strtolower( $rank );
+        $discount_pct = 0;
+
+        if ( $rank_lower === 'standard' ) {
+            // Standard ใช้ b2b_discount_percent (default discount) หรือ discount_standard ถ้ามี
+            $discount_pct = floatval( $sku_data['discount_standard'] ?? $sku_data['b2b_discount_percent'] ?? $sku_data['discount'] ?? 0 );
+        } else {
+            // Tier-specific: price_silver/gold/platinum/diamond ตอนนี้เก็บ % (0-100)
+            $tier_key = 'price_' . $rank_lower;
+            $tier_val = isset( $sku_data[ $tier_key ] ) ? floatval( $sku_data[ $tier_key ] ) : 0;
+
+            if ( $tier_val > 0 && $tier_val <= 100 ) {
+                $discount_pct = $tier_val;
+            } else {
+                // Fallback ไป b2b_discount_percent (default discount)
+                $discount_pct = floatval( $sku_data['b2b_discount_percent'] ?? $sku_data['discount'] ?? 0 );
+            }
+        }
+
+        if ( $discount_pct > 0 && $discount_pct <= 100 ) {
+            return round( $base * ( 1 - $discount_pct / 100 ), 2 );
+        }
+        return $base; // no discount
+    }
+}
+
 // V.31: Get price for a specific rank from custom table
 if ( ! function_exists( 'b2b_get_product_price' ) ) {
     function b2b_get_product_price( $sku, $rank = 'standard' ) {
         if ( class_exists( 'DINOCO_Catalog' ) ) {
             return DINOCO_Catalog::get_price_for_rank( $sku, $rank );
         }
-        // Fallback: b2b_product CPT
+        // Fallback: b2b_product CPT — V.32.6: use b2b_compute_dealer_price
         $pid = b2b_find_product_by_sku( $sku );
         if ( ! $pid ) return 0;
-        $field = 'price_' . strtolower( $rank );
-        $price = floatval( get_field( $field, $pid ) );
-        return $price > 0 ? $price : floatval( get_field( 'price_standard', $pid ) );
+        $base = floatval( get_field( 'price_standard', $pid ) );
+        if ( $base <= 0 ) return 0;
+        $sku_data = array(
+            'b2b_discount_percent' => floatval( get_field( 'b2b_discount_percent', $pid ) ),
+            'price_silver'   => floatval( get_field( 'price_silver', $pid ) ),
+            'price_gold'     => floatval( get_field( 'price_gold', $pid ) ),
+            'price_platinum' => floatval( get_field( 'price_platinum', $pid ) ),
+            'price_diamond'  => floatval( get_field( 'price_diamond', $pid ) ),
+        );
+        return b2b_compute_dealer_price( $base, $rank, $sku_data );
     }
 }
 
@@ -1523,7 +1570,7 @@ if ( ! function_exists( 'b2b_build_flex_draft_confirm' ) ) {
         $gid = get_field('source_group_id', $ticket_id) ?: '';
         $dist = $gid ? b2b_get_dist_by_group($gid) : null;
         $dist_rank = $dist ? (get_field('rank_system', $dist->ID) ?: 'standard') : 'standard';
-        $rank_price_field = 'price_' . $dist_rank;
+        // V.32.6: Use b2b_compute_dealer_price for discount calculation
         $parsed = array();
         $total_retail = 0;
         preg_match_all('/^(.+?)\s*\(([A-Z0-9\-]+)\)\s*x(\d+)\s*=\s*[฿B]?([\d,.]+)/mu', $items_preview, $matches, PREG_SET_ORDER);
@@ -1534,14 +1581,20 @@ if ( ! function_exists( 'b2b_build_flex_draft_confirm' ) ) {
             $unit_price = $qty > 0 ? $line_total / $qty : $line_total;
             $img_url = isset($catalog[$sku]['img']) ? $catalog[$sku]['img'] : '';
             $retail = 0; $disc_pct = 0;
-            if (function_exists('b2b_find_product_by_sku')) {
+            $pd = function_exists('b2b_get_product_data') ? b2b_get_product_data($sku) : null;
+            if ($pd) {
+                $retail = floatval($pd['base_price'] ?? $pd['price_standard'] ?? 0);
+                if ($retail <= 0 && isset($catalog[$sku]['price'])) $retail = floatval(str_replace(',', '', $catalog[$sku]['price']));
+                if ($retail > 0 && function_exists('b2b_compute_dealer_price')) {
+                    $dealer = b2b_compute_dealer_price($retail, $dist_rank, $pd);
+                    if ($dealer < $retail) $disc_pct = round((1 - $dealer / $retail) * 100, 1);
+                }
+            } elseif (function_exists('b2b_find_product_by_sku')) {
                 $pid = b2b_find_product_by_sku($sku);
                 if ($pid) {
                     $retail = floatval(get_field('price_standard', $pid));
                     if ($retail <= 0 && isset($catalog[$sku]['price'])) $retail = floatval(str_replace(',', '', $catalog[$sku]['price']));
-                    $rp = floatval(get_field($rank_price_field, $pid));
-                    if ($rp > 0 && $retail > 0 && $rp < $retail) $disc_pct = round((1 - $rp / $retail) * 100, 1);
-                    elseif ($retail > 0 && $unit_price > 0 && $unit_price < $retail) $disc_pct = round((1 - $unit_price / $retail) * 100, 1);
+                    if ($retail > 0 && $unit_price > 0 && $unit_price < $retail) $disc_pct = round((1 - $unit_price / $retail) * 100, 1);
                 }
             }
             if ($retail <= 0 && isset($catalog[$sku]['price'])) $retail = floatval(str_replace(',', '', $catalog[$sku]['price']));
@@ -2121,7 +2174,7 @@ if ( ! function_exists( 'b2b_build_flex_payment_invoice' ) ) {
         $gid = get_field('source_group_id', $ticket_id) ?: '';
         $dist = $gid ? b2b_get_dist_by_group($gid) : null;
         $dist_rank = $dist ? (get_field('rank_system', $dist->ID) ?: 'standard') : 'standard';
-        $rank_price_field = 'price_' . $dist_rank;
+        // V.32.6: Use b2b_compute_dealer_price for discount calculation
         $parsed = array();
         $inv_total_retail = 0;
         $clean_items = preg_replace('/^.*?ขอยืนยัน[^:]*:\s*/u', '', $items_raw);
@@ -2133,14 +2186,20 @@ if ( ! function_exists( 'b2b_build_flex_payment_invoice' ) ) {
             $unit_price = $qty > 0 ? $line_total / $qty : $line_total;
             $img_url = isset($catalog[$sku]['img']) ? $catalog[$sku]['img'] : '';
             $retail = 0; $disc_pct = 0;
-            if (function_exists('b2b_find_product_by_sku')) {
+            $pd = function_exists('b2b_get_product_data') ? b2b_get_product_data($sku) : null;
+            if ($pd) {
+                $retail = floatval($pd['base_price'] ?? $pd['price_standard'] ?? 0);
+                if ($retail <= 0 && isset($catalog[$sku]['price'])) $retail = floatval(str_replace(',', '', $catalog[$sku]['price']));
+                if ($retail > 0 && function_exists('b2b_compute_dealer_price')) {
+                    $dealer = b2b_compute_dealer_price($retail, $dist_rank, $pd);
+                    if ($dealer < $retail) $disc_pct = round((1 - $dealer / $retail) * 100, 1);
+                }
+            } elseif (function_exists('b2b_find_product_by_sku')) {
                 $pid = b2b_find_product_by_sku($sku);
                 if ($pid) {
                     $retail = floatval(get_field('price_standard', $pid));
                     if ($retail <= 0 && isset($catalog[$sku]['price'])) $retail = floatval(str_replace(',', '', $catalog[$sku]['price']));
-                    $rp = floatval(get_field($rank_price_field, $pid));
-                    if ($rp > 0 && $retail > 0 && $rp < $retail) $disc_pct = round((1 - $rp / $retail) * 100, 1);
-                    elseif ($retail > 0 && $unit_price > 0 && $unit_price < $retail) $disc_pct = round((1 - $unit_price / $retail) * 100, 1);
+                    if ($retail > 0 && $unit_price > 0 && $unit_price < $retail) $disc_pct = round((1 - $unit_price / $retail) * 100, 1);
                 }
             }
             if ($retail <= 0 && isset($catalog[$sku]['price'])) $retail = floatval(str_replace(',', '', $catalog[$sku]['price']));
