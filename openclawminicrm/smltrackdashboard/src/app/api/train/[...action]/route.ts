@@ -33,13 +33,19 @@ async function proxyToAgent(
       const searchParams = request.nextUrl.searchParams.toString();
       const fullUrl = searchParams ? `${url}?${searchParams}` : url;
       const res = await fetch(fullUrl, opts);
-      return NextResponse.json(await res.json(), { status: res.status });
+      const data = await res.json().catch(() => ({ error: "Invalid response" }));
+      const status = res.status === 401 ? 403 : res.status;
+      return NextResponse.json(data, { status });
     }
 
     const res = await fetch(url, opts);
-    return NextResponse.json(await res.json(), { status: res.status });
+    const data = await res.json().catch(() => ({ error: "Invalid response" }));
+    // ห้าม return 401 ให้ browser — จะ popup Basic Auth
+    const status = res.status === 401 ? 403 : res.status;
+    return NextResponse.json(data, { status });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    const msg = err.name === "TimeoutError" ? "กำลังเทรนอยู่ รอสักครู่..." : err.message;
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
 
