@@ -1,5 +1,5 @@
 """
-DINOCO B2B — CUPS Printer Wrapper V.3.0
+DINOCO B2B — CUPS Printer Wrapper V.3.1
 Handles printing PDFs to configured CUPS printers.
 For thermal label printers: converts PDF → image → TSPL or ESC/POS raster.
 XP-420B: sends TSPL via USB directly (pyusb) since usblp driver doesn't claim it.
@@ -224,7 +224,8 @@ def usb_send(vendor_id, product_id, data):
 
 # ── PDF Conversion ─────────────────────────────────────────────────
 
-def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, direction=0):
+def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, direction=1,
+                paper_width_mm=100, paper_height_mm=180):
     """Convert a PDF to TSPL bitmap commands for Xprinter XP-420B and similar.
 
     Args:
@@ -236,6 +237,9 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
                 where bit 1 = print black.
         gap_mm: Gap between labels in mm (0 for continuous/fanfold paper).
         direction: Print direction (0=top-to-bottom, 1=bottom-to-top).
+        paper_width_mm: Physical paper width for SIZE command.
+        paper_height_mm: Physical paper height for SIZE command.
+                         Must match real paper to feed correctly on fanfold.
 
     Returns:
         bytes: TSPL command data ready to send to printer
@@ -273,8 +277,8 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
             width_bytes = (img.width + 7) // 8
             height = img.height
 
-            # TSPL commands — SIZE คำนวณจาก image จริง (GAP 0 = continuous mode, SIZE ควบคุม feed)
-            data += f'SIZE {img.width / dpi * 25.4:.1f} mm, {height / dpi * 25.4:.1f} mm\r\n'.encode()
+            # TSPL SIZE = กระดาษจริง (fanfold 180mm ต้อง feed ตรง perforation)
+            data += f'SIZE {paper_width_mm} mm, {paper_height_mm} mm\r\n'.encode()
             data += f'GAP {gap_mm} mm, 0 mm\r\n'.encode()
             data += f'DIRECTION {direction},0\r\n'.encode()
             data += b'CLS\r\n'
@@ -377,7 +381,10 @@ class PrinterManager:
         self.label_tspl_invert = config.get('label_tspl_invert', True)
         # TSPL GAP (0 for continuous/fanfold) and DIRECTION (0=top-down, 1=bottom-up)
         self.label_gap_mm = config.get('label_gap_mm', 0)
-        self.label_direction = config.get('label_direction', 0)
+        self.label_direction = config.get('label_direction', 1)
+        # Physical paper size — SIZE command ต้องตรงกับกระดาษจริง (fanfold feed)
+        self.label_width_mm = config.get('label_width_mm', 100)
+        self.label_height_mm = config.get('label_height_mm', 180)
         self.conn = None
 
     def _get_conn(self):
@@ -432,7 +439,9 @@ class PrinterManager:
 
         if protocol == 'tspl':
             raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert,
-                                   gap_mm=self.label_gap_mm, direction=self.label_direction)
+                                   gap_mm=self.label_gap_mm, direction=self.label_direction,
+                                   paper_width_mm=self.label_width_mm,
+                                   paper_height_mm=self.label_height_mm)
         else:
             raw_data = pdf_to_escpos(pdf_path)
 
@@ -475,7 +484,9 @@ class PrinterManager:
 
         if protocol == 'tspl':
             raw_data = pdf_to_tspl(pdf_path, max_width=832, invert=self.label_tspl_invert,
-                                   gap_mm=self.label_gap_mm, direction=self.label_direction)
+                                   gap_mm=self.label_gap_mm, direction=self.label_direction,
+                                   paper_width_mm=self.label_width_mm,
+                                   paper_height_mm=self.label_height_mm)
         else:
             raw_data = pdf_to_escpos(pdf_path)
 
