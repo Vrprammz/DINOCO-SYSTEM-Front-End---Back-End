@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.2.0 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.2.1 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -437,23 +437,32 @@ def process_job(job, config, printer_mgr):
             end = start + rows_per_page
             page_items = all_rows[start:end]
 
+            # สร้าง page_items ที่แปลงกลับเป็น format ที่ template เข้าใจ
+            # (template ใช้ item.sku, item.name, item.qty, item.boxes_per_unit, item.children)
+            page_order_items = []
+            for row in page_items:
+                if row.get('is_child'):
+                    # child rows ถูกรวมเข้า parent แล้ว — skip (จะแสดงผ่าน parent.children)
+                    continue
+                # หา original item จาก all_items เพื่อเอา children + fields ครบ
+                orig = next((it for it in all_items if it.get('sku') == row.get('sku')), row)
+                page_order_items.append(orig)
+
+            # Override order items เป็นเฉพาะหน้านี้
+            page_order = {**order, 'items': page_order_items}
+
             # สร้าง context สำหรับหน้านี้
             pick_ctx = {**context,
+                        'order': page_order,
                         'page_num': page_num,
                         'total_pages': total_pages,
+                        'is_last_page': page_num == total_pages,
                         'logo_path': context.get('logo_path_bw', '') or context.get('logo_path_white', '')}
 
-            # หน้าแรก: แสดง header + items + totals (ถ้าหน้าเดียว)
-            # หน้าต่อไป: แสดง items ต่อ + totals (หน้าสุดท้าย)
-            if total_pages == 1:
-                # หน้าเดียว — ปริ้นปกติ
-                pick_html = render_template(pick_tpl, pick_ctx)
-                pick_h = min(2000, max(180, FIXED_MM + len(page_items) * ROW_MM + 10))
-            else:
-                # หลายหน้า — ปริ้นปกติ (template handle pagination ผ่าน page_num/total_pages)
-                pick_html = render_template(pick_tpl, pick_ctx)
-                pick_h = PAGE_H
+            # คำนวณความสูงหน้า — บังคับ 180mm ทุกหน้า (ตรงกับ label stock 100x180mm)
+            pick_h = PAGE_H
 
+            pick_html = render_template(pick_tpl, pick_ctx)
             pick_pdf = html_to_pdf(pick_html, 100, pick_h)
             printer_mgr.print_picking_list(pick_pdf, tid)
             os.unlink(pick_pdf)
@@ -463,6 +472,12 @@ def process_job(job, config, printer_mgr):
     except Exception as e:
         logger.error(f'  Picking list print error #{tid}: {e}', exc_info=True)
         errors.append(f'PickingList: {e}')
+
+    # ── Delay 10s ระหว่าง Picking List กับ Shipping Labels ──
+    # ให้ XP-420B จัดหน้า+ตัดกระดาษเสร็จก่อน ป้องกัน feed ซ้อนกัน
+    import time
+    logger.info(f'  Waiting 10s before shipping labels #{tid}...')
+    time.sleep(10)
 
     # 3. Shipping Labels — one label per box, each auto-cut separately
     try:
