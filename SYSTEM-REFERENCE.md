@@ -1,6 +1,6 @@
 # DINOCO System Reference -- Complete Wiki
 
-> Date: 2026-04-06 | Version: V.40.0 | 40+ files, ~55,000 lines
+> Last updated: 2026-04-06 | Version: V.40.0 | 40+ files, ~55,000 lines
 > Consolidated from: SYSTEM-ARCHITECTURE.md, DATA-MODEL.md, SYSTEM-DIAGRAMS.md, USER-JOURNEYS.md
 
 ---
@@ -102,18 +102,18 @@
 | [System] Transfer Warranty Page | V.30.2 | 15 | `[dinoco_transfer_sys]` / `[dinoco_transfer_v3]` | Warranty ownership transfer |
 | [System] DINOCO Claim System | V.30.2 | 16 | `[dinoco_claim_page]` | Claim submission + PDF generation |
 | [System] DINOCO Global App Menu | V.31.1 | 17 | -- | Bottom navigation bar (native app style) |
-| [System] DINOCO Edit Profile | V.34.2 | 18 | `[dinoco_edit_profile]` | User profile edit (Facebook-style view/edit toggle) |
+| [System] DINOCO Edit Profile | V.34.3 | 18 | `[dinoco_edit_profile]` | User profile edit (Facebook-style view/edit toggle) |
 | [System] Legacy Migration Logic | V.30.2 | 19 | `[dinoco_legacy_migration]` | Legacy warranty migration (admin-ajax) |
 | [System] Dashboard - Header & Forms | V.30.3 | 28 | `[dinoco_dashboard_header]` | Sidebar, profile card, PDPA, registration forms |
 | [System] Dashboard - Assets List | V.30.2 | 29 | `[dinoco_dashboard_assets]` | Assets list with bundle support |
-| [System] DINOCO MCP Bridge | V.2.0 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints) |
+| [System] DINOCO MCP Bridge | V.2.1 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints) |
 
 ### 2.2 [Admin System] -- Admin/Management
 
 | File | Version | DB_ID | Shortcode | Description |
 |------|---------|-------|-----------|-------------|
-| [Admin System] DINOCO Admin Dashboard | V.30.5 | 21 | `[dinoco_admin_dashboard]` | Command Center: KPIs, charts, pipeline, AI Inbox |
-| [Admin System] DINOCO Global Inventory Database | V.30.2 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center |
+| [Admin System] DINOCO Admin Dashboard | V.32.1 | 21 | `[dinoco_admin_dashboard]` | Command Center: KPIs, charts, pipeline, AI Inbox |
+| [Admin System] DINOCO Global Inventory Database | V.38.5 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center |
 | [Admin System] DINOCO Legacy Migration Requests | V.30.2 | 23 | `[dinoco_admin_legacy]` | Admin legacy migration manager |
 | [Admin System] DINOCO User Management | V.30.2 | 25 | `[dinoco_admin_users]` | CRM + full analytics |
 | [Admin System] DINOCO Manual Transfer Tool | V.30.2 | 26 | `[dinoco_admin_transfer]` | Force transfer warranty ownership |
@@ -136,45 +136,45 @@
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
-| Snippet 1: Core Utilities & LINE Flex Builders | V.32.0 | 72 | LINE push, Flex templates, HMAC URL, bank helpers |
-| Snippet 2: LINE Webhook Gateway & Order Creator | V.31.9 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete |
-| Snippet 3: LIFF E-Catalog REST API | V.38.6 | 52 | REST API (auth, catalog, orders, slip, flash) |
-| Snippet 4: LIFF E-Catalog Frontend | V.30.7 | 53 | LIFF SPA for distributors (catalog, cart, history) |
-| Snippet 5: Admin Dashboard | V.31.5 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash |
-| Snippet 6: Admin Discount Mapping | V.30.3 | 55 | `[b2b_discount_mapping]` -- SKU pricing + rank tiers |
-| Snippet 7: Cron Jobs - Dunning + Summary + Rank | V.30.3 | 56 | 9 cron jobs (dunning, summary, rank, flash, shipping) |
-| Snippet 8: Distributor Ticket View | V.30.3 | 57 | `/b2b-ticket/` -- Order detail page (admin/customer split) |
-| Snippet 9: Admin Control Panel | V.31.7 | 58 | `[b2b_admin_control]` -- Distributors, products, settings, Flash |
-| Snippet 10: Invoice Image Generator | V.30.3 | 61 | A4 invoice PNG (GD Library) |
+| Snippet 1: Core Utilities & LINE Flex Builders | V.32.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers |
+| Snippet 2: LINE Webhook Gateway & Order Creator | V.33.2 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete |
+| Snippet 3: LIFF E-Catalog REST API | V.39.2 | 52 | REST API (auth, catalog, orders, slip, flash) |
+| Snippet 4: LIFF E-Catalog Frontend | V.31.0 | 53 | LIFF SPA for distributors (catalog, cart, history) |
+| Snippet 5: Admin Dashboard | V.31.7 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash |
+| Snippet 6: Admin Discount Mapping | V.31.1 | 55 | `[b2b_discount_mapping]` -- SKU pricing + rank tiers |
+| Snippet 7: Cron Jobs - Dunning + Summary + Rank | V.30.5 | 56 | 9 cron jobs (dunning, summary, rank, flash, shipping) |
+| Snippet 8: Distributor Ticket View | V.30.4 | 57 | `/b2b-ticket/` -- Order detail page (admin/customer split) |
+| Snippet 9: Admin Control Panel | V.33.2 | 58 | `[b2b_admin_control]` -- Distributors, products, settings, Flash |
+| Snippet 10: Invoice Image Generator | V.30.4 | 61 | A4 invoice PNG (GD Library) |
 | Snippet 11: Customer LIFF Pages | V.30.2 | 64 | `[b2b_commands]`, `[b2b_orders]`, `[b2b_account]` |
 | Snippet 12: Admin Dashboard LIFF | V.31.2 | 65 | `[b2b_dashboard]`, `[b2b_stock_manager]`, `[b2b_tracking_entry]` |
 | Snippet 13: Debt Transaction Manager | V.2.0 | 1036 | Atomic debt operations (MySQL transactions, FOR UPDATE) |
-| Snippet 14: Order State Machine | V.1.4 | 1038 | B2B_Order_FSM class (14 statuses) |
-| Snippet 15: Custom Tables & JWT Session | V.2.0 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class |
+| Snippet 14: Order State Machine | V.1.5 | 1038 | B2B_Order_FSM class (14 statuses) |
+| Snippet 15: Custom Tables & JWT Session | V.5.6 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class |
 
 ### 2.5 [B2F] -- Factory Purchasing System (12 Snippets)
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
 | Snippet 0: CPT & ACF Registration | V.3.0 | 1160 | 5 CPTs + ACF fields + helpers + group cache |
-| Snippet 1: Core Utilities & Flex Builders | V.5.1 | 1163 | LINE push, 18 Flex templates, LIFF URL (HMAC), i18n ENG/TH |
-| Snippet 2: REST API | V.7.3 | 1165 | 20+ endpoints `/b2f/v1/*` + auth-admin JWT |
-| Snippet 3: Webhook Handler & Bot Commands | V.2.8 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
+| Snippet 1: Core Utilities & Flex Builders | V.6.0 | 1163 | LINE push, 18 Flex templates, LIFF URL (HMAC), i18n 3-lang (TH/EN/ZH) |
+| Snippet 2: REST API | V.8.2 | 1165 | 20+ endpoints `/b2f/v1/*` + auth-admin JWT |
+| Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.0 | 1167 | `[b2f_maker_liff]` -- LANG system (ENG for non-THB) |
 | Snippet 5: Admin Dashboard Tabs | V.3.3 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]`, `[b2f_admin_credit_tab]` |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
 | Snippet 8: Admin LIFF E-Catalog | V.3.0 | 1168 | LIFF ordering page (auth via JWT, no WP login) |
 | Snippet 9: PO Ticket View | V.3.3 | 1169 | PO detail page (status timeline, items, receiving, payment) |
-| Snippet 10: PO Image Generator | V.2.4 | 1170 | A4 PO PNG (GD Library), ENG template for CNY/USD |
-| Snippet 11: Cron Jobs & Reminders | V.1.6 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
+| Snippet 10: PO Image Generator | V.2.5 | 1170 | A4 PO PNG (GD Library), ENG template for CNY/USD |
+| Snippet 11: Cron Jobs & Reminders | V.2.1 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
 
 ### 2.6 [LIFF AI] -- AI Command Center (2 Snippets)
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
-| Snippet 1: REST API | V.1.1 | 1180 | Auth (LINE ID Token + JWT), Lead/Claim endpoints, Agent proxy |
-| Snippet 2: Frontend | V.2.0 | 1181 | `[liff_ai_page]` -- SPA pages (dashboard, leads, claims, agent) |
+| Snippet 1: REST API | V.1.4 | 1173 | Auth (LINE ID Token + JWT), Lead/Claim endpoints, Agent proxy |
+| Snippet 2: Frontend | V.3.1 | 1174 | `[liff_ai_page]` -- SPA pages (dashboard, leads, claims, agent) |
 
 ### 2.7 OpenClaw Mini CRM (Chatbot Agent)
 
@@ -493,9 +493,9 @@ sequenceDiagram
 | `po_created_by` | text | No | สร้างโดย |
 | `po_paid_amount` | number | No | จ่ายแล้ว (THB) |
 | `po_payment_status` | select | No | unpaid / partial / paid |
-| `po_cancelled_reason` | textarea | No | เหตุผลยกเลิก |
-| `po_cancelled_by` | text | No | ยกเลิกโดย |
-| `po_cancelled_date` | date_picker | No | วันที่ยกเลิก |
+| `po_cancelled_reason` | textarea | No | เหตุผลยกเลิก (populated by po-cancel endpoint) |
+| `po_cancelled_by` | text | No | ยกเลิกโดย (user display name, set on cancel) |
+| `po_cancelled_date` | date_picker | No | วันที่ยกเลิก (auto-set on cancel, Asia/Bangkok) |
 | `po_rejected_reason` | textarea | No | เหตุผลปฏิเสธ |
 | `po_parent_po_id` | number | No | Parent PO (for replacements) |
 | `po_is_replacement` | true_false | No | Is Replacement PO |
@@ -759,7 +759,7 @@ dinoco_moto_brands → dinoco_moto_models (1:N) -- Motorcycle catalog
 
 ## 6. FSM Statuses (B2B + B2F)
 
-### 6.1 B2B Order Statuses (FSM V.1.4)
+### 6.1 B2B Order Statuses (FSM V.1.5)
 
 | Status | Label (TH) | Next Possible |
 |--------|-----------|---------------|
@@ -777,6 +777,8 @@ dinoco_moto_brands → dinoco_moto_models (1:N) -- Motorcycle catalog
 | claim_resolved | เคลมเสร็จ | completed |
 | completed | เสร็จสิ้น | cancelled (walk-in only, admin) |
 | cancelled | ยกเลิก | (terminal) |
+
+> **V.1.5 Note:** `cancel_requested` now goes through FSM properly (V.39.2 REST API). All cancel request transitions are validated by `B2B_Order_FSM::can_transition()` instead of ad-hoc status checks.
 
 ### 6.2 B2F Order Statuses (FSM V.1.5)
 
@@ -1546,6 +1548,7 @@ sequenceDiagram
 | Constant | Description |
 |----------|-------------|
 | `DINOCO_LINE_CHANNEL_ID` | LINE OAuth app ID |
+| `DINOCO_LINE_CHANNEL_SECRET` | LINE Channel Secret (for ID Token verification) |
 | `DINOCO_LINE_REDIRECT_URI` | OAuth callback URL |
 
 #### B2B
