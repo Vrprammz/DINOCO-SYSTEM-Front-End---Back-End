@@ -1,12 +1,17 @@
 #!/bin/bash
-# auto-train.sh V5.0 — DINOCO AI Self-Improving Loop (Gemini-as-Judge + Flow Test)
+# auto-train.sh V6.0 — DINOCO AI Self-Improving Loop (Conversation Mining + Gemini-as-Judge + Flow Test)
+#
+# V6 changes:
+# - เพิ่ม --mine mode เรียก conversation-miner.js ดึงข้อมูลจากแชทจริง
+# - เพิ่ม Phase 0: mine จาก chat จริงก่อน generate (ถ้าไม่ได้ --no-mine)
+# - 6 phases: mine → generate → judge → flow-test → analyze → fix → repeat
 #
 # V5 changes:
 # - เพิ่ม --flow-test mode ทดสอบ multi-turn conversation (context, tone, accuracy)
 # - 10 flow scenarios ครอบคลุม: สินค้า, เคลม, น้ำเสียง, prompt injection, สแลง
 # - 5 phases: generate → judge → flow-test → analyze → fix → repeat
 #
-# Usage: bash scripts/auto-train.sh [--rounds 5] [--gen 30] [--no-fix] [--v3] [--flow-only]
+# Usage: bash scripts/auto-train.sh [--rounds 5] [--gen 30] [--no-fix] [--v3] [--flow-only] [--mine] [--no-mine] [--mine-days 7]
 set -euo pipefail
 cd /opt/dinoco/openclawminicrm
 
@@ -16,11 +21,16 @@ GEN_COUNT=30
 AUTO_FIX=true
 LEGACY_MODE=false
 FLOW_ONLY=false
+MINE_ONLY=false
+DO_MINE=true
+MINE_DAYS=7
 AGENT=$(docker ps --format '{{.Names}}' | grep -i agent || echo "dinoco-agent")
 TOTAL_PASS=0
 TOTAL_FAIL=0
 TOTAL_KB_ADDED=0
 FLOW_SCORE=0
+MINE_FAILURES=0
+MINE_KB=0
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -29,19 +39,38 @@ while [[ $# -gt 0 ]]; do
     --no-fix) AUTO_FIX=false; shift;;
     --v3) LEGACY_MODE=true; shift;;
     --flow-only) FLOW_ONLY=true; shift;;
+    --mine) MINE_ONLY=true; shift;;
+    --no-mine) DO_MINE=false; shift;;
+    --mine-days) MINE_DAYS=$2; shift 2;;
     *) shift;;
   esac
 done
 
 echo "=================================================="
-echo "  DINOCO Auto-Train V5.0 — Gemini-as-Judge + Flow Test"
+echo "  DINOCO Auto-Train V6.0 — Conversation Mining + Gemini-as-Judge + Flow Test"
 echo "  Rounds: $ROUNDS | Gen: $GEN_COUNT | AutoFix: $AUTO_FIX | FlowOnly: $FLOW_ONLY"
+echo "  Mine: $DO_MINE | MineDays: $MINE_DAYS"
 echo "=================================================="
 
-# ═══ Copy smart-judge.js เข้า Docker ═══
+# ═══ Copy scripts เข้า Docker ═══
 copy_judge() {
   docker exec $AGENT mkdir -p /app/scripts 2>/dev/null || true
   docker cp scripts/smart-judge.js $AGENT:/app/scripts/smart-judge.js 2>/dev/null || true
+}
+
+copy_miner() {
+  docker exec $AGENT mkdir -p /app/scripts 2>/dev/null || true
+  docker cp scripts/conversation-miner.js $AGENT:/app/scripts/conversation-miner.js 2>/dev/null || true
+}
+
+# ═══ Run conversation mining ═══
+run_mine() {
+  local MINE_MODE=$1
+  local EXTRA_ARGS=${2:-""}
+  copy_miner
+  echo ""
+  echo "[Mine] Running conversation-miner.js --${MINE_MODE} --days $MINE_DAYS $EXTRA_ARGS..."
+  docker exec $AGENT node /app/scripts/conversation-miner.js --${MINE_MODE} --days $MINE_DAYS $EXTRA_ARGS 2>/dev/null | tee /tmp/mine-${MINE_MODE}-output.txt || true
 }
 
 # ═══ Legacy V3 mode (fallback) ═══
@@ -53,6 +82,38 @@ run_legacy_round() {
   docker cp scripts/test-cases.csv $AGENT:/tmp/test-cases.csv
   docker exec $AGENT node /tmp/test-ai.js 2>/dev/null || true
 }
+
+# ═══ Mine-only shortcut ═══
+if [ "$MINE_ONLY" = true ]; then
+  echo ""
+  echo "=== Conversation Mining Only Mode ==="
+  run_mine "find-failures"
+  run_mine "extract-kb" "--limit 100"
+  run_mine "tone-check"
+  run_mine "stats"
+
+  # Copy results back
+  docker cp $AGENT:/app/scripts/mined-failures.json scripts/mined-failures.json 2>/dev/null || true
+  docker cp $AGENT:/app/scripts/mined-kb-draft.json scripts/mined-kb-draft.json 2>/dev/null || true
+  docker cp $AGENT:/app/scripts/mined-tone-report.json scripts/mined-tone-report.json 2>/dev/null || true
+  docker cp $AGENT:/app/scripts/mined-stats.json scripts/mined-stats.json 2>/dev/null || true
+
+  MINE_FAILURES=$(grep "Total failures" /tmp/mine-find-failures-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
+  MINE_KB=$(grep "KB draft" /tmp/mine-extract-kb-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
+
+  echo ""
+  echo "=================================================="
+  echo "  Mining Summary"
+  echo "  Failures found:  $MINE_FAILURES"
+  echo "  KB drafts:       $MINE_KB"
+  echo "  Reports:"
+  echo "    scripts/mined-failures.json"
+  echo "    scripts/mined-kb-draft.json"
+  echo "    scripts/mined-tone-report.json"
+  echo "    scripts/mined-stats.json"
+  echo "=================================================="
+  exit 0
+fi
 
 # ═══ Flow-only shortcut ═══
 if [ "$FLOW_ONLY" = true ]; then
@@ -78,6 +139,27 @@ for ROUND in $(seq 1 $ROUNDS); do
   echo "=================================================="
 
   copy_judge
+
+  # --- Phase 0: Mine real conversations (Round 1 only) ---
+  if [ "$DO_MINE" = true ] && [ "$ROUND" -eq 1 ]; then
+    echo ""
+    echo "[Phase 0] Mining real customer conversations (last $MINE_DAYS days)..."
+    run_mine "find-failures"
+    run_mine "stats"
+
+    MINE_FAILURES=$(grep "Total failures" /tmp/mine-find-failures-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
+    echo "[Phase 0] Found $MINE_FAILURES failure patterns from real chats"
+
+    # Extract KB from good conversations
+    run_mine "extract-kb" "--limit 50"
+    MINE_KB=$(grep "KB draft" /tmp/mine-extract-kb-output.txt 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
+    echo "[Phase 0] Extracted $MINE_KB KB draft entries from real chats"
+
+    # Copy results back
+    docker cp $AGENT:/app/scripts/mined-failures.json scripts/mined-failures.json 2>/dev/null || true
+    docker cp $AGENT:/app/scripts/mined-kb-draft.json scripts/mined-kb-draft.json 2>/dev/null || true
+    docker cp $AGENT:/app/scripts/mined-stats.json scripts/mined-stats.json 2>/dev/null || true
+  fi
 
   # --- Phase 1: Generate test cases ---
   echo ""
@@ -166,6 +248,10 @@ docker cp $AGENT:/app/scripts/judge-results.json scripts/judge-results.json 2>/d
 docker cp $AGENT:/app/scripts/fail-analysis.json scripts/fail-analysis.json 2>/dev/null || true
 docker cp $AGENT:/app/scripts/kb-auto-added.csv scripts/kb-auto-added.csv 2>/dev/null || true
 docker cp $AGENT:/app/scripts/flow-results.json scripts/flow-results.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/mined-failures.json scripts/mined-failures.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/mined-kb-draft.json scripts/mined-kb-draft.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/mined-stats.json scripts/mined-stats.json 2>/dev/null || true
+docker cp $AGENT:/app/scripts/mined-tone-report.json scripts/mined-tone-report.json 2>/dev/null || true
 
 # ★ V4.2: Merge auto-added KB back to main CSV (กันหาย)
 if [ -f scripts/kb-auto-added.csv ]; then
@@ -183,13 +269,14 @@ GRAND_SCORE=0
 [ "$GRAND_TOTAL" -gt 0 ] && GRAND_SCORE=$((TOTAL_PASS * 100 / GRAND_TOTAL))
 
 echo "=================================================="
-echo "  Auto-Train V5 Summary"
+echo "  Auto-Train V6 Summary"
 echo "  Rounds:       $ROUNDS"
 echo "  Single-turn:  $GRAND_TOTAL tests ($GRAND_SCORE%)"
 echo "  Passed:       $TOTAL_PASS"
 echo "  Failed:       $TOTAL_FAIL"
 echo "  Flow Test:    $FLOW_SCORE"
 echo "  KB Added:     $TOTAL_KB_ADDED entries"
+echo "  Mined:        $MINE_FAILURES failures / $MINE_KB KB drafts"
 echo "=================================================="
 
 # Show score trend
@@ -214,3 +301,6 @@ echo "Results:  scripts/judge-results.json"
 echo "Flows:    scripts/flow-results.json"
 echo "Analysis: scripts/fail-analysis.json"
 echo "History:  scripts/score-history.json"
+echo "Mined:    scripts/mined-failures.json"
+echo "KB Draft: scripts/mined-kb-draft.json"
+echo "Stats:    scripts/mined-stats.json"
