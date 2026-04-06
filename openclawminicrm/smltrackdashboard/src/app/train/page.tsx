@@ -882,7 +882,8 @@ function AutoTrainTab() {
             <option value={5}>5 ข้อ (~1 นาที)</option>
             <option value={10}>10 ข้อ (~2 นาที)</option>
             <option value={20}>20 ข้อ (~4 นาที)</option>
-            <option value={30}>30 ข้อ (~6 นาที)</option>
+            <option value={50}>50 ข้อ (~10 นาที)</option>
+            <option value={100}>100 ข้อ (~20 นาที) ฟรี!</option>
           </select>
 
           <button
