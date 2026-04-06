@@ -46,16 +46,18 @@ def usb_send(vendor_id, product_id, data):
     except Exception as e:
         logger.debug(f'USB kernel driver detach: {e}')
 
-    # Retry set_configuration in case device is momentarily busy
-    for attempt in range(3):
+    # Retry set_configuration — handle busy (16), pipe error (32), timeout (110)
+    retryable = {16, 32, 110}  # Resource busy, Pipe error, Timeout
+    for attempt in range(5):
         try:
             dev.set_configuration()
             break
         except usb.core.USBError as e:
-            if attempt < 2 and e.errno == 16:  # [Errno 16] Resource busy
-                logger.warning(f'USB device busy, retry {attempt+1}/3 in 1s...')
+            if attempt < 4 and e.errno in retryable:
+                wait = 2 * (attempt + 1)  # 2s, 4s, 6s, 8s
+                logger.warning(f'USB error {e.errno}, retry {attempt+1}/5 in {wait}s...')
                 usb.util.dispose_resources(dev)
-                time.sleep(1)
+                time.sleep(wait)
                 dev = usb.core.find(idVendor=vendor_id, idProduct=product_id)
                 if dev is None:
                     raise RuntimeError('USB device lost during retry')
@@ -79,10 +81,20 @@ def usb_send(vendor_id, product_id, data):
         if ep_out is None:
             raise RuntimeError('USB OUT endpoint not found')
 
-        # Send data in chunks (max 64KB per transfer)
+        # Send data in chunks (max 64KB per transfer) with retry
         chunk_size = 64 * 1024
         for offset in range(0, len(data), chunk_size):
-            ep_out.write(data[offset:offset + chunk_size])
+            chunk = data[offset:offset + chunk_size]
+            for wr_attempt in range(3):
+                try:
+                    ep_out.write(chunk)
+                    break
+                except usb.core.USBError as we:
+                    if wr_attempt < 2 and we.errno in retryable:
+                        logger.warning(f'USB write error {we.errno} at offset {offset}, retry {wr_attempt+1}/3 in 3s...')
+                        time.sleep(3)
+                    else:
+                        raise
 
         logger.info(f'USB direct: sent {len(data)} bytes to {vendor_id:#06x}:{product_id:#06x}')
     finally:
@@ -335,9 +347,9 @@ class PrinterManager:
         for i, path in enumerate(pdf_paths):
             title = f'Label #{ticket_id} ({i+1}/{len(pdf_paths)})'
             if self.label_thermal:
-                # Brief pause between USB prints to let device settle
+                # Pause between USB prints to let XP-420B finish cut + feed
                 if i > 0 and self.label_usb_direct:
-                    time.sleep(0.5)
+                    time.sleep(3)
                 self.print_thermal(path, self.printer_label, title=title)
             else:
                 self.print_pdf(path, self.printer_label, title=title)

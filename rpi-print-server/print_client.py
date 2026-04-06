@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.2.2 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon V.2.3 (Raspberry Pi)
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -407,7 +407,11 @@ def process_job(job, config, printer_mgr):
         logger.error(f'  Invoice print error #{tid}: {e}', exc_info=True)
         errors.append(f'Invoice: {e}')
 
-    # 2. Picking List — V.2.2: pagination per-item group (parent+children = 1 unit)
+    # ── Delay 5s หลัง Invoice ให้ USB device พร้อม ──
+    logger.info(f'  Waiting 5s after invoice #{tid}...')
+    time.sleep(5)
+
+    # 2. Picking List — V.2.3: pagination per-item group (parent+children = 1 unit)
     try:
         logger.info(f'  Rendering picking list #{tid}...')
         pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
