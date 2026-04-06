@@ -307,8 +307,6 @@ def pdf_to_tspl(pdf_path, max_width=832, dpi=203, invert=True, gap_mm=0, directi
                 data += row
 
             data += b'\r\nPRINT 1,1\r\n'
-            # Auto-cut after each page
-            data += b'CUT\r\n'
 
     return bytes(data)
 
