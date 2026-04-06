@@ -108,6 +108,15 @@ groups_meta     { sourceId, groupName, platform, teamId }
 - **Conversation history**: 12 messages (เดิม 6) + context search 10 docs (เดิม 5)
 - **Prompt restructure**: กฎสำคัญ (context/intent/tone) อยู่บนสุด ไม่จมล่าง
 
+## Training Dashboard (V.1.0)
+- **หน้า:** `/dashboard/train` — บอสเทรน chatbot ผ่าน UI
+- **Agent API:** `/api/train/test`, `/api/train/judge`, `/api/train/kb`, `/api/train/generate`, `/api/train/stats`, `/api/train/logs`
+- **Dashboard API proxy:** `/api/train/[...action]` → proxy ไป Agent
+- **MongoDB collections:** `training_logs` (verdict+correct_answer), `knowledge_base` (KB entries, source=training_dashboard)
+- **Tabs:** ทดสอบ AI / ถังข้อมูล (KB) / สถิติ / ประวัติ
+- **KB from training:** ถ้าตัดสินว่า fail + ใส่คำตอบที่ถูก → สร้าง KB entry อัตโนมัติ (source: training_dashboard)
+- **Generate:** Gemini สร้างคำถามจำลองลูกค้า 10 ข้อจาก KB
+
 ## สิ่งที่ห้ามทำ
 - ห้ามลบ folder/service โดยไม่ถามบอสก่อน
 - ห้ามเปลี่ยน deploy strategy โดยไม่แจ้ง

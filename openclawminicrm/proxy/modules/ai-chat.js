@@ -807,4 +807,5 @@ module.exports = {
   lightAICooldown,
   providerCooldown,
   getOpenRouterFreeProviders,
+  _lastToolResults,
 };

@@ -1189,6 +1189,242 @@ app.post("/api/km/search", aiLimiter, express.json(), async (req, res) => { if (
 app.get("/api/kb-suggestions", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json({ suggestions: [] }); const filter = {}; if (req.query.status) filter.status = req.query.status; res.json({ suggestions: await db.collection("kb_suggestions").find(filter).sort({ frequency: -1 }).limit(50).toArray() }); });
 app.post("/api/kb-suggestions/:id/resolve", requireAuth, async (req, res) => { const { ObjectId } = require("mongodb"); const db = await getDB(); await db.collection("kb_suggestions").updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: "resolved", resolvedAt: new Date() } }); res.json({ ok: true }); });
 
+// === Training Dashboard API (V.1.0) ===
+const TRAINING_LOGS_COLL = "training_logs";
+
+// POST /api/train/test — ทดสอบคำถามเหมือนลูกค้าจริง
+app.post("/api/train/test", requireAuth, express.json(), async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: "message required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  try {
+    const testSourceId = `train_${Date.now()}`;
+    const botConfig = await getBotConfig();
+    const systemPrompt = botConfig?.prompt || DEFAULT_PROMPT;
+
+    // Collect tool calls + KB used
+    const toolsCalled = [];
+    const kbUsed = [];
+
+    // Pre-inject KB (same logic as callDinocoAI)
+    const STOPWORDS = /^(เป็น|ยังไง|อะไร|มั้ย|ไหม|บ้าง|ได้|หรือ|กับ|ที่|จาก|ของ|มี|ไม่|ต้อง|แล้ว|จะ|ก็|ให้|ทำ|ดี|คือ|ครับ|ค่ะ|นะ|คะ)$/i;
+    const words = message.replace(/[^\u0E00-\u0E7Fa-zA-Z0-9\s]/g, "").trim()
+      .split(/\s+/).filter(w => w.length >= 2 && !STOPWORDS.test(w)).slice(0, 6);
+    if (words.length > 0) {
+      const regex = words.join("|");
+      const kbResults = await db.collection(KB_COLL).find({
+        active: { $ne: false },
+        $or: [
+          { content: { $regex: regex, $options: "i" } },
+          { title: { $regex: regex, $options: "i" } },
+        ],
+      }).limit(5).toArray();
+      kbResults.forEach(r => kbUsed.push({ id: r._id, title: r.title, category: r.category }));
+    }
+
+    // Call AI with tools
+    const reply = await callDinocoAI(systemPrompt, cleanForAI(message), testSourceId);
+
+    // Check _lastToolResults for this sourceId
+    const lastTools = aiChat._lastToolResults?.get(testSourceId);
+    if (lastTools) {
+      if (Array.isArray(lastTools)) lastTools.forEach(t => toolsCalled.push(t));
+      else toolsCalled.push(lastTools);
+      aiChat._lastToolResults?.delete(testSourceId);
+    }
+
+    res.json({
+      reply: reply || "AI ไม่สามารถตอบได้",
+      tools_called: toolsCalled,
+      kb_used: kbUsed,
+    });
+  } catch (e) {
+    console.error("[Train/Test] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/train/judge — บอสตัดสินคำตอบ
+app.post("/api/train/judge", requireAuth, express.json(), async (req, res) => {
+  const { message, reply, verdict, correct_answer, notes } = req.body;
+  if (!message || !verdict) return res.status(400).json({ error: "message and verdict required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  try {
+    const log = {
+      message, reply, verdict, correct_answer: correct_answer || null,
+      notes: notes || null, timestamp: new Date(),
+    };
+    await db.collection(TRAINING_LOGS_COLL).insertOne(log);
+
+    // ถ้า fail + มี correct_answer → สร้าง KB draft entry
+    let kbCreated = null;
+    if (verdict === "fail" && correct_answer) {
+      const kbDoc = {
+        title: `[Training] ${message.substring(0, 80)}`,
+        content: correct_answer,
+        category: "faq",
+        tags: ["training_dashboard", "auto_generated"],
+        active: true,
+        source: "training_dashboard",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const result = await db.collection(KB_COLL).insertOne(kbDoc);
+      kbCreated = result.insertedId;
+    }
+
+    res.json({ ok: true, kbCreated });
+  } catch (e) {
+    console.error("[Train/Judge] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/train/kb — list KB ทั้งหมด
+app.get("/api/train/kb", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json([]);
+  const { search, category } = req.query;
+  const filter = {};
+  if (category && category !== "all") filter.category = category;
+  if (search) {
+    filter.$or = [
+      { title: { $regex: search, $options: "i" } },
+      { content: { $regex: search, $options: "i" } },
+    ];
+  }
+  res.json(await db.collection(KB_COLL).find(filter, { projection: { embedding: 0 } }).sort({ updatedAt: -1 }).toArray());
+});
+
+// POST /api/train/kb — เพิ่ม KB entry
+app.post("/api/train/kb", requireAuth, express.json(), async (req, res) => {
+  const { title, content, category, tags } = req.body;
+  if (!title || !content) return res.status(400).json({ error: "title and content required" });
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const doc = {
+    title: title.trim(), content: content.trim(),
+    category: category || "general",
+    tags: Array.isArray(tags) ? tags : (tags || "").split(",").map(t => t.trim()).filter(Boolean),
+    active: true, source: "training_dashboard",
+    createdAt: new Date(), updatedAt: new Date(),
+  };
+  const result = await db.collection(KB_COLL).insertOne(doc);
+  res.json({ ok: true, id: result.insertedId });
+});
+
+// PATCH /api/train/kb/:id — แก้ KB entry
+app.patch("/api/train/kb/:id", requireAuth, express.json(), async (req, res) => {
+  const { ObjectId } = require("mongodb");
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const update = { updatedAt: new Date() };
+  Object.entries(req.body).forEach(([k, v]) => { if (v !== undefined) update[k] = v; });
+  await db.collection(KB_COLL).updateOne({ _id: new ObjectId(req.params.id) }, { $set: update });
+  res.json({ ok: true });
+});
+
+// DELETE /api/train/kb/:id — ลบ KB entry
+app.delete("/api/train/kb/:id", requireAuth, express.json(), async (req, res) => {
+  const { ObjectId } = require("mongodb");
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  await db.collection(KB_COLL).deleteOne({ _id: new ObjectId(req.params.id) });
+  res.json({ ok: true });
+});
+
+// POST /api/train/generate — Gemini สร้างคำถามจำลอง
+app.post("/api/train/generate", requireAuth, express.json(), async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  try {
+    // ดึง KB entries เพื่อให้ Gemini อ้างอิง
+    const kbItems = await db.collection(KB_COLL).find({ active: { $ne: false } }, { projection: { title: 1, content: 1, category: 1 } }).limit(30).toArray();
+    const kbSummary = kbItems.map(k => `[${k.category}] ${k.title}: ${k.content.substring(0, 150)}`).join("\n");
+
+    const prompt = `จากข้อมูล Knowledge Base ต่อไปนี้ ให้สร้างคำถามจำลอง 10 ข้อที่ลูกค้าอาจถามผ่านแชท
+ใช้ภาษาไทยที่เป็นธรรมชาติ เหมือนลูกค้าจริง (ภาษาพูด สแลง คำสั้นๆ)
+ให้คำถามหลากหลาย: สอบถามสินค้า ราคา เคลม ประกัน ตัวแทน จัดส่ง
+ตอบเป็น JSON array เท่านั้น ห้ามมี markdown:
+["คำถาม1", "คำถาม2", ...]
+
+Knowledge Base:
+${kbSummary}`;
+
+    const apiKey = getDynamicKeySync("GOOGLE_API_KEY");
+    if (!apiKey) return res.status(500).json({ error: "GOOGLE_API_KEY not set" });
+
+    const gRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.8, maxOutputTokens: 2048 },
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const gData = await gRes.json();
+    const text = gData.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+    // Parse JSON from response (handle markdown code blocks)
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    const questions = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    res.json({ questions });
+  } catch (e) {
+    console.error("[Train/Generate] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/train/stats — สถิติ training
+app.get("/api/train/stats", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ total: 0, pass: 0, fail: 0, passRate: 0, kbCount: 0, topFails: [] });
+  try {
+    const total = await db.collection(TRAINING_LOGS_COLL).countDocuments();
+    const pass = await db.collection(TRAINING_LOGS_COLL).countDocuments({ verdict: "pass" });
+    const fail = await db.collection(TRAINING_LOGS_COLL).countDocuments({ verdict: "fail" });
+    const kbCount = await db.collection(KB_COLL).countDocuments({ active: { $ne: false } });
+
+    // Top fails
+    const topFails = await db.collection(TRAINING_LOGS_COLL).find({ verdict: "fail" })
+      .sort({ timestamp: -1 }).limit(10)
+      .project({ message: 1, reply: 1, correct_answer: 1, timestamp: 1 }).toArray();
+
+    // Daily trend (last 14 days)
+    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 3600000);
+    const dailyPipeline = [
+      { $match: { timestamp: { $gte: fourteenDaysAgo } } },
+      { $group: {
+        _id: { $dateToString: { format: "%Y-%m-%d", date: "$timestamp" } },
+        total: { $sum: 1 },
+        pass: { $sum: { $cond: [{ $eq: ["$verdict", "pass"] }, 1, 0] } },
+        fail: { $sum: { $cond: [{ $eq: ["$verdict", "fail"] }, 1, 0] } },
+      }},
+      { $sort: { _id: 1 } },
+    ];
+    const dailyTrend = await db.collection(TRAINING_LOGS_COLL).aggregate(dailyPipeline).toArray();
+
+    res.json({
+      total, pass, fail,
+      passRate: total > 0 ? Math.round((pass / total) * 100) : 0,
+      kbCount, topFails, dailyTrend,
+    });
+  } catch (e) {
+    console.error("[Train/Stats] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/train/logs — ดู training logs
+app.get("/api/train/logs", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json([]);
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  res.json(await db.collection(TRAINING_LOGS_COLL).find().sort({ timestamp: -1 }).limit(limit).toArray());
+});
+
 // === Memory / Skills / Audit ===
 
 // ★ V.1.5: Clear all memory + history for a sourceId (called by Dashboard "ล้างความจำ")
@@ -1662,6 +1898,8 @@ async function ensureIndexes() {
     await database.collection("boss_commands").createIndex({ commandId: 1 }, { unique: true });
     await database.collection("boss_commands").createIndex({ createdAt: -1 });
     await database.collection("message_templates").createIndex({ templateId: 1 }, { unique: true });
+    await database.collection("training_logs").createIndex({ timestamp: -1 });
+    await database.collection("training_logs").createIndex({ verdict: 1, timestamp: -1 });
     console.log("[Index] All indexes ready");
   } catch (e) { if (!e.message?.includes("already exists")) console.error("[Index] Error:", e.message); }
 }

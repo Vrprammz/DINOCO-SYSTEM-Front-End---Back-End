@@ -173,6 +173,7 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - **Lead Pipeline**: ทุก status มีทางไป `closed_lost`/`cancelled` แล้ว (เดิมบาง status ไม่มีทางออก)
   - **Anti-Hallucination V.4.0**: 3 ชั้นป้องกัน + intent pre-check + context-aware supervisor, prompt restructure กฎสำคัญขึ้นบนสุด, conversation history 12 msgs, isClaimIntent strict 2 ระดับ, claim timeout 24h
   - **Security**: requireAuth ทุก API endpoint, prompt injection protection 14 patterns, PII masking, rate limiting
+  - **Training Dashboard V.1.0**: หน้า `/dashboard/train` — บอสเทรน AI ผ่าน UI. Agent API `/api/train/*` (test, judge, kb, generate, stats, logs). KB จาก training มี `source: "training_dashboard"`. MongoDB collection `training_logs`.
 
 ## Reference Documentation
 

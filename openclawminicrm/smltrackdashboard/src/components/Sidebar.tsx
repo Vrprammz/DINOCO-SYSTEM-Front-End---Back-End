@@ -53,6 +53,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { href: "/claims", icon: "📋", label: "ตรวจเคลม" },
       { href: "/km", icon: "📚", label: "คลังความรู้" },
+      { href: "/train", icon: "🎯", label: "เทรน AI" },
     ],
   },
   {
