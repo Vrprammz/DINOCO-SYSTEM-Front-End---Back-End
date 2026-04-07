@@ -549,7 +549,7 @@ function buildIntentHint(intent, context, userMessage) {
       return { hint: "\n[INTENT: BULK — ลูกค้าถามซื้อจำนวนเยอะ/ราคาส่ง → ตอบ 'DINOCO เป็นนโยบาย One Price ค่ะ ไม่ว่าซื้อกี่ชิ้นราคาเท่ากันค่ะ ถ้าสนใจเปิดเป็นตัวแทนจำหน่าย รบกวนแจ้ง ชื่อร้าน จังหวัด เบอร์โทร แอดมินจะส่งข้อมูลให้ฝ่ายขายค่ะ']", skipKB: true };
 
     case "COMPETITOR_COMPARISON":
-      return { hint: "\n[INTENT: COMPETITOR — ลูกค้าเทียบแบรนด์อื่น/ถามเรื่องคู่แข่ง → ห้ามเอ่ยชื่อแบรนด์คู่แข่ง/H2C เด็ดขาด ตอบแค่จุดเด่นของ DINOCO (อลูมิเนียม 5052, IP67, ประกัน 5 ปี, ตรงรุ่น) ห้ามพูดชื่อแบรนด์อื่นซ้ำ]", skipKB: false };
+      return { hint: "\n[INTENT: COMPETITOR — ลูกค้าเทียบแบรนด์อื่น → ห้ามเอ่ยชื่อแบรนด์คู่แข่งเด็ดขาด ตอบจุดเด่น DINOCO ตรงสินค้าที่ถาม: กันล้ม=สแตนเลส304, กล่อง=อลู5052 IP67, ประกัน5ปี, ตรงรุ่น, ผลิตในไทย — ห้ามรวมวัสดุมั่ว]", skipKB: false };
 
     case "DEALER_INQUIRY":
       hint = "\n[INTENT: DEALER — ลูกค้าถามร้าน/ตัวแทน/ที่ติดตั้ง → เรียก dinoco_dealer_lookup ทันที";
