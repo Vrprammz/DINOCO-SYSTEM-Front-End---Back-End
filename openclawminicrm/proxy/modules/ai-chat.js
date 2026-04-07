@@ -685,7 +685,13 @@ Gemini ตอบ: "${geminiReply}"
       trackAICost({ provider: `Claude-${reviewTier}`, model: reviewModel, feature: "supervisor",
         inputTokens: data.usage.input_tokens || 0, outputTokens: data.usage.output_tokens || 0, sourceId });
     }
-    return review.replace(/\?(?![a-zA-Z_=&])/g, "").trim();
+    const revised = review.replace(/\?(?![a-zA-Z_=&])/g, "").trim();
+    // ★ V.4.1: ถ้า Claude return ว่าง/สั้นเกิน → fallback ใช้ Gemini เดิม
+    if (!revised || revised.length < 5) {
+      console.log(`[${reviewTier}] Empty revision → fallback to Gemini`);
+      return geminiReply;
+    }
+    return revised;
   } catch (e) {
     console.log("[Boss] Claude timeout/error — use Gemini reply:", e.message);
     return geminiReply; // fallback ใช้ Gemini เดิม
