@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.6.1 — Fix: FB image URL extraction (robust regex + send all images + log errors) + Side Rack/Rear Rack supervisor check
+ * V.6.2 — Fix: AI crash on PII messages (sanitize history content, ensure user-first, log error bodies, robust JSON parse)
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -269,24 +269,34 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
     return decl;
   });
 
-  // ★ V.1.4: ส่ง conversation history + dedup consecutive same-role (Gemini ต้อง alternate user/model)
+  // ★ V.6.2: ส่ง conversation history + dedup consecutive same-role (Gemini ต้อง alternate user/model)
+  // Sanitize content: ensure string, mask PII, prevent Gemini SAFETY block
   const contents = [];
   try {
     const recentMsgs = await getRecentMessages(sourceId, 12);
     let lastRole = "";
     for (const m of recentMsgs.reverse()) {
       const role = m.role === "assistant" ? "model" : "user";
-      if (m.content && m.content.length > 0 && m.content !== "[รูปภาพ]") {
-        if (role === lastRole && contents.length > 0) {
-          // merge consecutive same-role → ต่อท้ายข้อความเดิม
-          contents[contents.length - 1].parts[0].text += "\n" + m.content;
-        } else {
-          contents.push({ role, parts: [{ text: m.content }] });
-        }
-        lastRole = role;
+      // ★ V.6.2: Ensure content is valid string (ป้องกัน non-string content จาก DB)
+      const raw = m.content;
+      if (!raw || (typeof raw === "string" && raw.length === 0) || raw === "[รูปภาพ]") continue;
+      const text = typeof raw === "string" ? raw : String(raw);
+      // ★ V.6.2: Mask PII ใน history ด้วย (ป้องกัน Gemini SAFETY block จากเบอร์โทร/บัตรปชช. ใน history)
+      const cleaned = typeof cleanForAI === "function" ? cleanForAI(text) : text;
+      if (!cleaned || cleaned.length === 0) continue;
+      if (role === lastRole && contents.length > 0) {
+        // merge consecutive same-role → ต่อท้ายข้อความเดิม
+        contents[contents.length - 1].parts[0].text += "\n" + cleaned;
+      } else {
+        contents.push({ role, parts: [{ text: cleaned }] });
       }
+      lastRole = role;
     }
-  } catch {}
+  } catch (e) { console.error("[Gemini] History load error:", e.message); }
+  // ★ V.6.2: Ensure first content is user role (Gemini requirement)
+  if (contents.length > 0 && contents[0].role !== "user") {
+    contents.unshift({ role: "user", parts: [{ text: "(ข้อความก่อนหน้า)" }] });
+  }
   // ถ้า last message เป็น user อยู่แล้ว → merge กับ userMessage
   if (contents.length > 0 && contents[contents.length - 1].role === "user") {
     contents[contents.length - 1].parts[0].text += "\n" + userMessage;
@@ -348,9 +358,11 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
       if (funcCall) {
         const { name, args } = funcCall.functionCall;
         console.log(`[Gemini] Tool call: ${name}(${JSON.stringify(args).substring(0, 80)})`);
-        const toolResult = await executeTool(name, args || {}, sourceId);
+        const rawToolResult = await executeTool(name, args || {}, sourceId);
+        // ★ V.6.2: Ensure tool result is always string (ป้องกัน Gemini/Claude reject non-string content)
+        const toolResult = typeof rawToolResult === "string" ? rawToolResult : JSON.stringify(rawToolResult);
         // ★ V.1.4: เก็บ tool results ล่าสุดสำหรับ claudeSupervisor
-        const toolSummary = typeof toolResult === "string" ? toolResult.substring(0, 500) : JSON.stringify(toolResult).substring(0, 500);
+        const toolSummary = toolResult.substring(0, 500);
         _lastToolResults.set(sourceId, { name, args, result: toolSummary, at: Date.now() });
 
         // ★ V.2.3: functionResponse ต้องอยู่ใน parts[] ไม่ใช่ top-level
@@ -368,7 +380,12 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
       const textPart = parts.find((p) => p.text && !p.thought);
       const textReply = textPart?.text;
       // Fallback: ถ้าไม่มี text ที่ไม่ใช่ thought ลองเอา text ตัวแรก
-      return textReply || parts.find((p) => p.text)?.text || null;
+      const finalReply = textReply || parts.find((p) => p.text)?.text || null;
+      // ★ V.6.2: Log เมื่อ parts ว่าง (ไม่มี text หรือ functionCall) — ป้องกัน silent null
+      if (!finalReply && !funcCall) {
+        console.warn(`[Gemini] Empty response — no text or functionCall in parts. finishReason=${data.candidates?.[0]?.finishReason || "unknown"}, parts=${parts.length}`);
+      }
+      return finalReply;
 
     } catch (e) {
       console.error("[Gemini] Error:", e.message);
@@ -386,23 +403,33 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
     name: t.function.name, description: t.function.description, input_schema: t.function.parameters,
   }));
 
-  // ★ V.1.4: ส่ง conversation history + dedup consecutive same-role (Claude ต้อง alternate user/assistant)
+  // ★ V.6.2: ส่ง conversation history + dedup consecutive same-role (Claude ต้อง alternate user/assistant)
+  // Sanitize content: ensure string, mask PII, enforce user-first
   const messages = [];
   try {
     const recentMsgs = await getRecentMessages(sourceId, 12);
     let lastRole = "";
     for (const m of recentMsgs.reverse()) {
       const role = m.role === "assistant" ? "assistant" : "user";
-      if (m.content && m.content.length > 0 && m.content !== "[รูปภาพ]") {
-        if (role === lastRole && messages.length > 0) {
-          messages[messages.length - 1].content += "\n" + m.content;
-        } else {
-          messages.push({ role, content: m.content });
-        }
-        lastRole = role;
+      // ★ V.6.2: Ensure content is valid string (ป้องกัน non-string/null content จาก DB)
+      const raw = m.content;
+      if (!raw || (typeof raw === "string" && raw.length === 0) || raw === "[รูปภาพ]") continue;
+      const text = typeof raw === "string" ? raw : String(raw);
+      // ★ V.6.2: Mask PII ใน history (เบอร์โทร/เลขบัตร) ป้องกัน API reject
+      const cleaned = typeof cleanForAI === "function" ? cleanForAI(text) : text;
+      if (!cleaned || cleaned.length === 0) continue;
+      if (role === lastRole && messages.length > 0) {
+        messages[messages.length - 1].content += "\n" + cleaned;
+      } else {
+        messages.push({ role, content: cleaned });
       }
+      lastRole = role;
     }
-  } catch {}
+  } catch (e) { console.error("[Claude] History load error:", e.message); }
+  // ★ V.6.2: Ensure first message is user role (Claude API requirement — HTTP 400 if not)
+  if (messages.length > 0 && messages[0].role !== "user") {
+    messages.unshift({ role: "user", content: "(ข้อความก่อนหน้า)" });
+  }
   if (messages.length > 0 && messages[messages.length - 1].role === "user") {
     messages[messages.length - 1].content += "\n" + userMessage;
   } else {
@@ -419,7 +446,12 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
         }),
         signal: AbortSignal.timeout(60000),
       });
-      if (!res.ok) { console.warn(`[Claude] ${model} HTTP ${res.status}`); return null; }
+      if (!res.ok) {
+        // ★ V.6.2: Log error body เพื่อ debug HTTP 400/500
+        const errBody = await res.text().catch(() => "");
+        console.warn(`[Claude] ${model} HTTP ${res.status}: ${errBody.substring(0, 300)}`);
+        return null;
+      }
       const data = await res.json();
       if (data.usage) {
         trackAICost({ provider: model.includes("haiku") ? "Claude-Haiku" : "Claude-Sonnet", model, feature: "chat-with-tools",
@@ -427,7 +459,9 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
       }
       const toolUse = data.content?.find((c) => c.type === "tool_use");
       if (toolUse) {
-        const toolResult = await executeTool(toolUse.name, toolUse.input || {}, sourceId);
+        const rawToolResult = await executeTool(toolUse.name, toolUse.input || {}, sourceId);
+        // ★ V.6.2: Ensure tool result is string for Claude tool_result content
+        const toolResult = typeof rawToolResult === "string" ? rawToolResult : JSON.stringify(rawToolResult);
         messages.push({ role: "assistant", content: data.content });
         messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: toolUse.id, content: toolResult }] });
         continue;
@@ -842,9 +876,13 @@ async function callDinocoAI(systemPrompt, userMessage, sourceId, contextStr) {
 async function aiReplyToLine(event, sourceId, userName, text, config) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
-  // ★ V.4.0: เพิ่มจาก 5 เป็น 10 เพื่อจำ context ข้ามข้อความได้ดีขึ้น
+  // ★ V.6.2: Clean PII จาก context history ก่อนใส่ system prompt (ป้องกัน Gemini SAFETY block)
   const contextStr = contextDocs.slice(0, 10)
-    .map((d) => `[${d.role === "assistant" ? config.botName || DEFAULT_BOT_NAME : d.userName || "User"}] ${d.content}`)
+    .map((d) => {
+      const label = d.role === "assistant" ? config.botName || DEFAULT_BOT_NAME : d.userName || "User";
+      const content = typeof d.content === "string" ? d.content : String(d.content || "");
+      return `[${label}] ${typeof cleanForAI === "function" ? cleanForAI(content) : content}`;
+    })
     .join("\n");
   const variant = getABVariant(sourceId);
   const abInstruction = AB_PROMPTS[variant];
@@ -994,9 +1032,13 @@ Gemini ตอบ: "${geminiReply}"
 async function aiReplyToMeta(senderId, text, sourceId, platform) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
-  // ★ V.4.0: เพิ่มจาก 5 เป็น 10
+  // ★ V.6.2: Clean PII จาก context history ก่อนใส่ system prompt
   const contextStr = contextDocs.slice(0, 10)
-    .map((d) => `[${d.role === "assistant" ? DEFAULT_BOT_NAME : d.userName || "User"}] ${d.content}`)
+    .map((d) => {
+      const label = d.role === "assistant" ? DEFAULT_BOT_NAME : d.userName || "User";
+      const content = typeof d.content === "string" ? d.content : String(d.content || "");
+      return `[${label}] ${typeof cleanForAI === "function" ? cleanForAI(content) : content}`;
+    })
     .join("\n");
   const variant = getABVariant(sourceId);
   const abInstruction = AB_PROMPTS[variant];

@@ -808,7 +808,17 @@ async function analyzeChat(sourceId, userName, messageText, lineUserId, source) 
       { role: "user", content: `${prevContext}\nข้อความใหม่: "${cleanForAI(messageText.substring(0, 200))}"` },
     ], { json: true, maxTokens: 300 });
     if (!content) return;
-    const skill = JSON.parse(content);
+    // ★ V.6.2: Robust JSON parse — handle truncated/malformed AI response
+    let skill;
+    try {
+      skill = JSON.parse(content);
+    } catch {
+      // Fallback: ลอง extract JSON object จาก response (กรณี AI ตอบ text ก่อน JSON)
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) { try { skill = JSON.parse(jsonMatch[0]); } catch { return; } }
+      else return;
+    }
+    if (!skill || typeof skill !== "object") return;
     const tags = [...new Set([...(skill.tags || []), ...prevTags])].slice(0, 10);
     const pipelineStage = skill.pipelineStage || prevStage || "new";
     await database.collection("user_skills").updateOne(
