@@ -1300,14 +1300,21 @@ app.get("/api/train/kb", requireAuth, async (req, res) => {
 
 // POST /api/train/kb — เพิ่ม KB entry
 app.post("/api/train/kb", requireAuth, express.json(), async (req, res) => {
-  const { title, content, category, tags } = req.body;
+  const { title, content, category, tags, intent_tags } = req.body;
   if (!title || !content) return res.status(400).json({ error: "title and content required" });
   const db = await getDB();
   if (!db) return res.status(500).json({ error: "DB unavailable" });
+  // ★ V.6.0: auto-generate intent_tags จาก title ถ้าไม่ได้ส่งมา
+  let finalIntentTags = Array.isArray(intent_tags) ? intent_tags : [];
+  if (finalIntentTags.length === 0) {
+    finalIntentTags = (title.match(/กล่อง|แร็ค|กันล้ม|ประกัน|เคลม|ซ่อม|สเปค|ขนาด|น้ำหนัก|ติดตั้ง|กันน้ำ|ตัวแทน|ร้าน|สี|วัสดุ|กุญแจ|สนิม|ADV|NX|Forza|CB500|PRO|STD|กระเป๋า|ถาด|การ์ดแฮนด์|Full Set/gi) || [])
+      .map(t => t.toLowerCase()).filter((v, i, a) => a.indexOf(v) === i);
+  }
   const doc = {
     title: title.trim(), content: content.trim(),
     category: category || "general",
     tags: Array.isArray(tags) ? tags : (tags || "").split(",").map(t => t.trim()).filter(Boolean),
+    intent_tags: finalIntentTags,
     active: true, source: "training_dashboard",
     createdAt: new Date(), updatedAt: new Date(),
   };
@@ -1460,15 +1467,28 @@ app.post("/api/train/auto-run", requireAuth, express.json(), async (req, res) =>
           results.failed++;
           // Auto-fix: เพิ่ม KB ถ้า fail
           if (q.expected && judge.missing) {
-            await db.collection(KB_COLL).insertOne({
+            // ★ V.6.0: Dedup check — ถ้ามี KB ที่คล้ายกัน (title ตรง) → ไม่เพิ่มซ้ำ
+            const existingKB = await db.collection(KB_COLL).findOne({
               title: q.question.substring(0, 200),
-              content: q.expected + (judge.missing ? "\n\n" + judge.missing : ""),
-              category: q.category || "auto-train",
-              tags: ["auto-train"],
-              active: true, source: "auto-train-dashboard",
-              createdAt: new Date(), updatedAt: new Date(),
+              active: { $ne: false },
             });
-            results.kb_added++;
+            if (!existingKB) {
+              // ★ V.6.0: เพิ่ม intent_tags จากคำสำคัญใน question
+              const autoTags = (q.question.match(/กล่อง|แร็ค|กันล้ม|ประกัน|เคลม|ซ่อม|สเปค|ขนาด|น้ำหนัก|ติดตั้ง|กันน้ำ|ตัวแทน|ร้าน|สี|วัสดุ|กุญแจ|สนิม|ADV|NX|Forza|CB500|PRO|STD|กระเป๋า|ถาด|การ์ดแฮนด์|Full Set/gi) || [])
+                .map(t => t.toLowerCase()).filter((v, i, a) => a.indexOf(v) === i);
+              await db.collection(KB_COLL).insertOne({
+                title: q.question.substring(0, 200),
+                content: q.expected + (judge.missing ? "\n\n" + judge.missing : ""),
+                category: q.category || "auto-train",
+                tags: ["auto-train"],
+                intent_tags: autoTags,
+                active: true, source: "auto-train-dashboard",
+                createdAt: new Date(), updatedAt: new Date(),
+              });
+              results.kb_added++;
+            } else {
+              console.log(`[Auto-Train] Skip duplicate KB: "${q.question.substring(0, 50)}"`);
+            }
           }
         }
 
