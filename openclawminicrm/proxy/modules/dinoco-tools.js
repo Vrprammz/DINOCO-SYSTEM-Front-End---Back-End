@@ -428,7 +428,7 @@ async function executeTool(toolName, args, sourceId) {
           }).limit(2).toArray();
           if (dealerKB.length > 0) {
             return dealerKB.map(e => `${e.title}\n${e.content}`).join("\n---\n")
-              + "\n\n[คำสั่ง: แนะนำร้านตัวแทนตามข้อมูลข้างบน ห้ามกุชื่อร้านที่ไม่มีในข้อมูล ★ หลังบอกร้านแล้ว ต้องเสนอประสานให้ตัวแทนติดต่อกลับเสมอ: 'ถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ']";
+              + "\n\n[คำสั่ง: แนะนำร้านตัวแทนตามข้อมูลข้างบน ห้ามกุชื่อร้านที่ไม่มีในข้อมูล]";
           }
         }
       } catch (e) { console.error("[Dealer-Local]", e.message); }
@@ -437,7 +437,7 @@ async function executeTool(toolName, args, sourceId) {
     const result = await callDinocoAPI("/dealer-lookup", { location });
     if (typeof result === "string") return result;
     if (!result.found) return result.message || "ไม่พบตัวแทนในพื้นที่นี้";
-    return `ตัวแทนจำหน่ายในพื้นที่ ${result.location}:\n${result.dealers}\n\nวิธีตอบ: ${result.how_to_respond || ""}\n★ หลังบอกร้านแล้ว ต้องเสนอประสานให้ตัวแทนติดต่อกลับ: "ถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ"`;
+    return `ตัวแทนจำหน่ายในพื้นที่ ${result.location}:\n${result.dealers}\n\nวิธีตอบ: ${result.how_to_respond || ""}`;
   }
   if (toolName === "dinoco_warranty_check") {
     const result = await callDinocoAPI("/warranty-check", { serial: args.serial || "", phone: args.phone || "" });
