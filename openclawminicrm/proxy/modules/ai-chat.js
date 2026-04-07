@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.3.0 — Context-aware: history 12 msgs, intent pre-check, strict context supervisor
+ * V.3.1 — Dealer intent detection + no-repeat-price + context awareness upgrade
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { cleanForAI } = require("../middleware/auth");
@@ -442,13 +442,18 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
 
 // === DINOCO AI V.4.0 — Context-aware + Blacklist KB inject + Gemini primary ===
 async function callDinocoAI(systemPrompt, userMessage, sourceId) {
-  // ★ V.4.0: Intent pre-check — ตรวจ intent ก่อนส่ง AI ป้องกัน "มีอะไรให้ช่วย" ทั้งที่ลูกค้าบอกแล้ว
+  // ★ V.3.1: Intent pre-check — ตรวจ intent ก่อนส่ง AI ป้องกัน "มีอะไรให้ช่วย" ทั้งที่ลูกค้าบอกแล้ว
   const PRODUCT_INTENT = /สอบถาม|อยากดู|มีอะไรบ้าง|สนใจ.*สินค้า|ดูสินค้า|อยากได้/i;
   const PRICE_INTENT = /ราคา|เท่าไ|กี่บาท/i;
   const IMAGE_INTENT = /มีรูป|ขอดูรูป|ส่งรูป|ขอรูป|ดูรูป/i;
   const REFERENCE_INTENT = /ตัว\s*\d+|ตัวนี้|อันนี้|ตัวไหน|\d{3,5}\s*(ไง|ตัว|อัน|บาท)/i;
+  // ★ V.3.1: Dealer/ร้าน/ตัวแทน intent — ต้องเรียก dealer_lookup ทันที ห้ามบอกราคาซ้ำ
+  const DEALER_INTENT = /ติด.*ที่ไหน|ติดตั้ง.*ที่ไหน|ติดได้ที่ไหน|ซื้อ.*ที่ไหน|ซื้อได้ที่ไหน|หาซื้อ|ร้าน.*แถว|ร้าน.*ไหน|มีร้าน|ตัวแทน.*จำหน่าย|หาตัวแทน|ร้านไหน|ร้านใกล้|แถว.*มีร้าน|จังหวัด.*มีร้าน|มีตัวแทน|ช่าง.*ที่ไหน|ช่าง.*แถว|ร้านติดตั้ง|ที่ไหนติด/i;
   let intentHint = "";
-  if (PRODUCT_INTENT.test(userMessage)) {
+  // ★ V.3.1: Dealer intent ต้องเช็คก่อน — priority สูงสุด (ป้องกัน AI บอกราคาซ้ำ)
+  if (DEALER_INTENT.test(userMessage)) {
+    intentHint = "\n[INTENT: ลูกค้าถามร้าน/ตัวแทน/ที่ติดตั้ง → เรียก dinoco_dealer_lookup ทันที ถ้ามีชื่อจังหวัด/พื้นที่ในข้อความ ส่งเป็น query เลย ถ้าไม่มี ถามจังหวัดลูกค้า ห้ามบอกราคาซ้ำเด็ดขาด ห้ามแนะนำสินค้าซ้ำ ตอบเรื่องร้าน/ตัวแทนเท่านั้น]";
+  } else if (PRODUCT_INTENT.test(userMessage)) {
     intentHint = "\n[INTENT: ลูกค้าสอบถามสินค้า → ถามรุ่นรถทันที ห้ามตอบ 'มีอะไรให้ช่วย']";
   } else if (IMAGE_INTENT.test(userMessage)) {
     intentHint = "\n[INTENT: ลูกค้าขอดูรูป → ดูจากสินค้าที่เพิ่งคุยในประวัติ ส่งรูปเลย ห้ามถามซ้ำ]";
@@ -462,7 +467,8 @@ async function callDinocoAI(systemPrompt, userMessage, sourceId) {
   const SKIP_KB_INJECT = /^(สวัสดี|หวัดดี|ดี|hello|hi|hey|ไง|ว่าไง|555|5555|หาย|ขอบคุณ|ขอบใจ|thank|ok|โอเค|ตกลง|เข้าใจแล้ว|ได้เลย|รับทราบ|👍|🙏|😊|😂|🤣|❤️|สติ๊กเกอร์|sticker)[\s!ๆ]*$/i;
   // คำถามที่ tools จัดการเอง — ไม่ต้อง inject KB (Gemini จะเรียก function calling)
   const TOOL_HANDLED = /^(ราคา|price|เท่าไหร่|เท่าไร|สต็อก|stock|มีของ).{0,30}$/i;
-  const DEALER_QUERY = /ตัวแทน.*จังหวัด|ร้าน.*จังหวัด|dealer.*จังหวัด|จังหวัด.*(ตัวแทน|ร้าน|dealer)/i;
+  // ★ V.3.1: ขยาย DEALER_QUERY ให้ครอบคลุม ติดที่ไหน/ร้านแถว/ซื้อที่ไหน (skip KB inject → ให้ Gemini เรียก dealer_lookup เอง)
+  const DEALER_QUERY = /ตัวแทน|ร้าน.*แถว|ร้าน.*ไหน|ร้านติดตั้ง|dealer|ติด.*ที่ไหน|ติดตั้ง.*ที่ไหน|ซื้อ.*ที่ไหน|ซื้อได้ที่ไหน|หาซื้อ|มีร้าน|ร้านไหน|ร้านใกล้|ช่าง.*ที่ไหน|ที่ไหนติด/i;
   const CLAIM_SERIAL = /^(MC|mc|Mc)\d{4,}|^\d{10,}|สถานะ.*เคลม.*\d|เคลม.*สถานะ.*\d/i;
   let enrichedMessage = userMessage;
   const shouldSkip = SKIP_KB_INJECT.test(userMessage.trim()) || TOOL_HANDLED.test(userMessage.trim()) || DEALER_QUERY.test(userMessage) || CLAIM_SERIAL.test(userMessage.trim());
@@ -605,10 +611,12 @@ DINOCO เป็น One Price ไม่มีโปรโมชั่น
 // === AI Reply to Facebook/Instagram ===
 // === ★ V.2.0: ระบบ 3 ชั้น — Haiku รองหัวหน้า 20% + Sonnet หัวหน้าใหญ่ 10% ===
 async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr) {
-  // ★ V.4.0: Context awareness check — ตรวจจับ AI ถามซ้ำสิ่งที่ลูกค้าบอกแล้ว
+  // ★ V.3.1: Context awareness check — ตรวจจับ AI ถามซ้ำสิ่งที่ลูกค้าบอกแล้ว
   const askingModelAgain = /รุ่นอะไร|ใช้รถ.*รุ่น|ใช้รถอะไร/i.test(geminiReply) && contextStr && /ADV|NX|Forza|CB500|เอดีวี|ฟอร์ซ่า/i.test(contextStr);
   const askingRepeat = /มีอะไรให้.*ช่วย|ยินดีให้บริการ|สอบถาม.*อะไร/i.test(geminiReply) && /สอบถาม|อยากดู|สนใจ|ราคา|อยากได้/i.test(customerText);
   const wrongTone = /ดิฉัน|พี่(?!พี)|น้อง(?!ๆ)|ยินดีให้บริการด้านสินค้า/i.test(geminiReply);
+  // ★ V.3.1: ลูกค้าถามร้าน/ตัวแทน แต่ AI บอกราคาซ้ำแทนที่จะหาร้าน
+  const dealerIntentButPriceReply = /ติด.*ที่ไหน|ร้าน|ตัวแทน|ซื้อ.*ที่ไหน|ช่าง.*ที่ไหน|มีร้าน|ร้านไหน|ติดตั้ง.*ที่ไหน/i.test(customerText) && /ราคา|บาท|\d{3,5}\s*บาท|฿/i.test(geminiReply) && !/ตัวแทน|ร้าน|dealer|จังหวัด/i.test(geminiReply);
 
   // ★ Tier 2: Haiku รองหัวหน้า (20% — ตรวจเรื่องทั่วไป)
   const needsHaikuReview =
@@ -617,9 +625,10 @@ async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr)
     /ซ้ำ|เหมือนเดิม/i.test(customerText) ||       // ลูกค้าบ่นว่าซ้ำ
     (contextStr && contextStr.includes(geminiReply.substring(0, 50))) || // ตอบซ้ำกับก่อนหน้า
     /แอบกระซิบ|มี.*ด้วยนะ|แนะนำเพิ่ม|นอกจากนี้.*มี/i.test(geminiReply) || // cross-sell
-    askingModelAgain ||                            // ★ V.4.0: ถามรุ่นรถซ้ำทั้งที่ลูกค้าบอกแล้ว
-    askingRepeat ||                                // ★ V.4.0: ถาม "มีอะไรให้ช่วย" ทั้งที่ลูกค้าบอกแล้ว
-    wrongTone;                                     // ★ V.4.0: น้ำเสียงผิด
+    askingModelAgain ||                            // ถามรุ่นรถซ้ำทั้งที่ลูกค้าบอกแล้ว
+    askingRepeat ||                                // ถาม "มีอะไรให้ช่วย" ทั้งที่ลูกค้าบอกแล้ว
+    wrongTone ||                                   // น้ำเสียงผิด
+    dealerIntentButPriceReply;                     // ★ V.3.1: ลูกค้าถามร้าน แต่ AI บอกราคาซ้ำ
 
   // ★ Tier 3: Sonnet หัวหน้าใหญ่ (10% — เรื่องยากเท่านั้น)
   const needsSonnetReview =
@@ -663,6 +672,8 @@ Gemini ตอบ: "${geminiReply}"
 6. เผยว่าเป็น AI ไหม → ลบออก
 7. กุข้อมูลสินค้าที่ไม่มีใน tool result ไหม → ลบออก (ADV350/Forza350 ไม่มีกล่องข้าง)
 8. กระซิบ/แนะนำสินค้าที่ไม่ได้อยู่ใน tool result ไหม → ลบออก
+9. ★★★ ลูกค้าถามร้าน/ตัวแทน/ติดที่ไหน/ซื้อที่ไหน แต่ Gemini บอกราคาซ้ำ/แนะนำสินค้าซ้ำ → ต้องแก้! ถามจังหวัดลูกค้าเพื่อหาตัวแทนแทน ห้ามบอกราคาซ้ำเด็ดขาด
+10. ★★★ ถ้าเพิ่งบอกราคาไปแล้วในประวัติ + ลูกค้าไม่ได้ถามราคา → Gemini ห้ามบอกราคาอีก ตอบเรื่องที่ลูกค้าถามใหม่เลย
 
 ถ้าคำตอบ Gemini ดีแล้ว → ตอบคำเดียว "OK"
 ถ้าต้องแก้ → ตอบข้อความที่แก้แล้วเท่านั้น (ส่งให้ลูกค้าโดยตรง ห้ามใส่คำอธิบาย)`,
