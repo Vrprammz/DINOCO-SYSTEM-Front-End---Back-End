@@ -318,19 +318,16 @@ async function executeTool(toolName, args, sourceId) {
       // เพิ่ม alias ของ query ทั้ง string
       if (ALIASES[rawQuery]) searchTerms.push(ALIASES[rawQuery]);
 
-      // ★ V.4.2: กรองสินค้าที่หยุดจำหน่าย/ไม่แสดง/หมดสต็อก ออกก่อน
+      // ★ V.4.3: กรองสินค้าที่หยุดจำหน่ายถาวร ออก (ไม่กรองหมดสต็อกชั่วคราว)
       const activeProducts = catalog.products.filter(p => {
-        // b2b_visible = false → ซ่อนจากลูกค้า
+        // b2b_visible = false → Admin ซ่อนจากลูกค้า (หยุดขายถาวร)
         if (p.b2b_visible === false || p.b2b_visible === "0" || p.b2b_visible === 0) return false;
-        // stock_status = out_of_stock → หมดสต็อก
-        if (p.stock_status === "out_of_stock") return false;
-        // stock_display = out_of_stock → ระบบคำนวณว่าหมด
-        if (p.stock_display === "out_of_stock") return false;
-        // mp_status = discontinued → สินค้าจากโรงงานหยุดผลิต
+        // mp_status = discontinued → โรงงานหยุดผลิตแล้ว
         if (p.mp_status === "discontinued") return false;
         // X Travel Pro เลิกขาย → ปัจจุบันเป็น Grand Travel
         const name = (p.name || "").toLowerCase();
         if (name.includes("x travel pro")) return false;
+        // ★ stock_status = out_of_stock → ยังแสดงได้ แต่บอกว่าหมดชั่วคราว (ไม่ซ่อน)
         return true;
       });
 
