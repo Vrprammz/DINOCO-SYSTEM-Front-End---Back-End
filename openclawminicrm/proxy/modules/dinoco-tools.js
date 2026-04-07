@@ -318,7 +318,15 @@ async function executeTool(toolName, args, sourceId) {
       // เพิ่ม alias ของ query ทั้ง string
       if (ALIASES[rawQuery]) searchTerms.push(ALIASES[rawQuery]);
 
-      const matched = catalog.products.filter(p => {
+      // ★ V.4.1: กรองสินค้าที่หยุดจำหน่าย/ไม่แสดง ออกก่อน
+      const activeProducts = catalog.products.filter(p => {
+        if (p.b2b_visible === false || p.b2b_visible === "0" || p.b2b_visible === 0) return false;
+        const name = (p.name || "").toLowerCase();
+        if (name.includes("x travel pro")) return false; // เลิกขายแล้ว
+        return true;
+      });
+
+      const matched = activeProducts.filter(p => {
         const name = (p.name || "").toLowerCase();
         const sku = (p.sku || "").toLowerCase();
         const price = (p.price || "").toString();
