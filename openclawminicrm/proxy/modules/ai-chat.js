@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.6.0 — Deep Refactor: Centralized Intent Router (complete), Smart Supervisor, KB Intelligence
+ * V.6.1 — Fix: FB image URL extraction (robust regex + send all images + log errors) + Side Rack/Rear Rack supervisor check
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -946,7 +946,7 @@ Gemini ตอบ: "${geminiReply}"
 4. มี ? ไหม → แปลงเป็น คะ/นะคะ/ไหมคะ
 5. ใช้ "พี่" "น้อง" "ดิฉัน" "ยินดีให้บริการ" ไหม → แก้เป็น "ลูกค้า" "ค่ะ"
 6. เผยว่าเป็น AI ไหม → ลบออก
-7. กุข้อมูลสินค้าที่ไม่มีใน tool result ไหม → ลบออก (ADV350/Forza350 ไม่มีกล่องข้าง)
+7. กุข้อมูลสินค้าที่ไม่มีใน tool result ไหม → ลบออก (ADV350/Forza350 ไม่มีกล่องข้าง) ★ พูดเรื่อง "ถอดมือจับ" กับ Side Rack/Side Case ไหม → มือจับเกี่ยวกับ Rear Rack เท่านั้น ห้ามปนกัน
 8. กระซิบ/แนะนำสินค้าที่ไม่ได้อยู่ใน tool result ไหม → ลบออก
 9. ★★★ ลูกค้าถามร้าน/ตัวแทน/ติดที่ไหน/ซื้อที่ไหน แต่ Gemini บอกราคาซ้ำ/แนะนำสินค้าซ้ำ → ต้องแก้! ถามจังหวัดลูกค้าเพื่อหาตัวแทนแทน ห้ามบอกราคาซ้ำเด็ดขาด
 10. ★★★ ถ้าเพิ่งบอกราคาไปแล้วในประวัติ + ลูกค้าไม่ได้ถามราคา → Gemini ห้ามบอกราคาอีก ตอบเรื่องที่ลูกค้าถามใหม่เลย
@@ -1015,14 +1015,19 @@ Platform: ${platform} — ${platformNote}
   const route = intentRouter(cleanForAI(text), contextStr);
   reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier);
 
-  // ตรวจหา image URL ใน reply → ส่งเป็นรูปจริง แยกจาก text
-  console.log(`[AI-Debug] reply length=${reply.length} hasImageUrl=${/https?:\/\/.*\.(png|jpg|jpeg)/i.test(reply)}`);
-  const imgUrlRegex = /(https?:\/\/[^\s\]\)]+\.(?:png|jpg|jpeg|gif|webp))/gi;
-  const imageUrls = reply.match(imgUrlRegex) || [];
+  // ★ V.6.1: Robust image URL extraction — match ทั้ง .jpg/.png/.webp + WP upload URLs + query strings
+  const imgUrlRegex = /(https?:\/\/[^\s\]\)"|]+\.(?:png|jpg|jpeg|gif|webp)(?:\?[^\s\]\)"|]*)?)/gi;
+  const wpUploadRegex = /(https?:\/\/[^\s\]\)"|]*\/wp-content\/uploads\/[^\s\]\)"|]+)/gi;
+  const imageUrls = [...new Set([...(reply.match(imgUrlRegex) || []), ...(reply.match(wpUploadRegex) || [])])];
+  console.log(`[AI-Debug] reply length=${reply.length} imageUrls=${JSON.stringify(imageUrls)}`);
+
   let cleanReply = reply;
   for (const url of imageUrls) {
-    // ลบ URL + markdown link syntax ออกจาก text
-    cleanReply = cleanReply.replace(new RegExp(`\\[?[^\\]]*\\]?\\(?${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)?`, 'g'), '').trim();
+    // ลบ markdown link syntax: [text](url)
+    const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    cleanReply = cleanReply.replace(new RegExp(`\\[[^\\]]*\\]\\(${escapedUrl}\\)`, 'g'), '').trim();
+    // ลบ URL เปล่า + prefix "รูป:" ที่อาจติดมา
+    cleanReply = cleanReply.replace(new RegExp(`\\|?\\s*รูป:\\s*${escapedUrl}`, 'g'), '').trim();
     cleanReply = cleanReply.replace(url, '').trim();
   }
   // ลบ markdown ที่ FB Messenger ไม่รองรับ → plain text
@@ -1042,15 +1047,22 @@ Platform: ${platform} — ${platformNote}
     .replace(/\[Image[^\]]*\]/gi, '')           // [Image of ...] → ลบ (AI กุ image placeholder)
     .replace(/\n{3,}/g, '\n\n')                 // triple newlines → double
     .replace(/\?/g, '')                          // ลบ ? ทุกตัว (ภาษาไทยไม่ใช้)
+    // ★ V.6.1: ลบ leftover URL-like text ที่ regex แรกพลาด
+    .replace(/https?:\/\/\S+/g, '')             // ลบ URL ที่เหลือทั้งหมด (safety net)
+    .replace(/รูป:\s*/g, '')                     // ลบ "รูป:" ที่เหลือ
+    .replace(/\|\s*\|/g, '|')                   // ลบ || ที่เกิดจากลบ URL ระหว่าง pipes
+    .replace(/\|\s*$/gm, '')                    // ลบ trailing pipe
+    .replace(/\n{3,}/g, '\n\n')                 // triple newlines → double (cleanup อีกรอบ)
     .trim();
 
   // ส่ง text ก่อน
   if (cleanReply) {
     await sendMetaMessage(senderId, cleanReply);
   }
-  // ส่งรูปจริง (ถ้ามี — max 1 รูปต่อข้อความ)
-  if (imageUrls.length > 0) {
-    await sendMetaImage(senderId, imageUrls[0]).catch(() => {});
+  // ★ V.6.1: ส่งรูปจริงทุกตัวที่เจอ (ไม่จำกัดแค่ 1 รูป) + log error แทน catch เงียบ
+  for (const imgUrl of imageUrls) {
+    const imgSent = await sendMetaImage(senderId, imgUrl).catch((e) => { console.error(`[Meta] sendMetaImage error:`, e.message); return false; });
+    console.log(`[AI-Reply] ${platform} image ${imgSent ? 'sent' : 'FAILED'}: ${imgUrl.substring(0, 80)}`);
   }
 
   const sent = cleanReply || imageUrls.length > 0;

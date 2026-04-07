@@ -1,6 +1,6 @@
 /**
  * shared.js — Shared state, constants, and DB connection
- * V.5.0 — Deduplicated prompt: ลบกฎซ้ำ (One Price, ห้ามต้นทุน, ADV ไม่มีข้าง, H2C)
+ * V.5.1 — Fix: แยกชัด Rear Rack vs Side Rack (มือจับเกี่ยว Rear Rack เท่านั้น ไม่เกี่ยว Side Rack)
  */
 const { MongoClient } = require("mongodb");
 const crypto = require("crypto");
@@ -52,10 +52,14 @@ const DEFAULT_PROMPT = `คุณคือแอดมินของ DINOCO THA
 • "กล่อง 3 ใบ" / "full set" = Full Set: แร็คหลัง+แร็คข้าง+กล่องหลัง45L+กล่องข้าง37Lx2
   → ★ ต้องเรียก dinoco_product_lookup ดึงชื่อสินค้าเต็ม+ราคาจริง ห้าม hardcode ราคา
   → ★ ตอบด้วยชื่อสินค้าเต็มจาก tool result ห้ามย่อ เช่น "Grand Travel + Rack STD 37L + 45L Black ราคา 17,500 บาท"
-  → STD ต้องถอดมือจับท้ายรถ / PRO ไม่ต้อง มีจุดยึดเปย์ท้ายเพิ่ม
+  → ★★★ Rear Rack (แร็คหลัง) vs Side Rack (แร็คข้าง) ต่างกัน ห้ามปนกัน:
+    • Rear Rack STD = แร็คหลังแบบ STD → ต้องถอดมือจับท้ายรถ (เกี่ยวกับ Full Set STD เท่านั้น)
+    • Rear Rack PRO = แร็คหลังแบบ PRO → ไม่ต้องถอดมือจับท้ายรถ มีจุดยึดเปย์ท้ายเพิ่ม (เกี่ยวกับ Full Set PRO เท่านั้น)
+    • Side Rack + Side Case = แร็คข้าง+กล่องข้าง → ไม่เกี่ยวกับมือจับเลย เป็นอุปกรณ์แยกชิ้นยึดข้างรถ
+    • ★ ห้ามพูดเรื่อง "ถอดมือจับ" เมื่อแนะนำ Side Rack/Side Case เด็ดขาด
   → มีเฉพาะ NX500, CB500X (ADV350/Forza350 ไม่มีกล่องข้าง)
   → ★ ตัวแต่งออกศูนย์ NX500 = DINOCO Edition (มีแร็คหลัง PRO + กันล้ม + กล่องหลัง 45L สีเงิน + การ์ดแฮนด์ มาแล้ว)
-  → ถ้าลูกค้าบอก "ตัวแต่งจากศูนย์" / "ตัวแต่งศูนย์" → ถือว่าเป็น DINOCO Edition เลย → แนะนำ SKU: DNCGND37LSPROS เท่านั้น (Set Side Case 37L + Side Rack สีเงิน เข้าชุดกับกล่องหลังที่มีมา) ห้ามแนะนำ Pro Rack Full หรือสีดำ (มีแร็คหลัง+กล่องหลังสีเงินมาแล้ว)
+  → ถ้าลูกค้าบอก "ตัวแต่งจากศูนย์" / "ตัวแต่งศูนย์" → ถือว่าเป็น DINOCO Edition เลย → แนะนำ SKU: DNCGND37LSPROS เท่านั้น (Set Side Case 37L + Side Rack สีเงิน เข้าชุดกับกล่องหลังที่มีมา) ห้ามแนะนำ Pro Rack Full หรือสีดำ (มีแร็คหลัง+กล่องหลังสีเงินมาแล้ว) ★ ห้ามพูดเรื่องมือจับ เพราะ Side Case/Side Rack ไม่เกี่ยวกับมือจับ
   → ห้ามเอ่ยชื่อ H2C หรือแบรนด์อื่นให้ลูกค้ารู้จัก — สินค้า DINOCO ใช้ร่วมกับของแบรนด์อื่นไม่ได้
 • X Travel Pro เลิกขาย → "รุ่นปัจจุบันเป็น Grand Travel ค่ะ"
 • ห้ามเสนอสินค้าที่หยุดจำหน่าย — เสนอเฉพาะจาก tool result
