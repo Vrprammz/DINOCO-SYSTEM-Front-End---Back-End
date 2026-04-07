@@ -555,7 +555,12 @@ function buildIntentHint(intent, context, userMessage) {
       hint = "\n[INTENT: DEALER — ลูกค้าถามร้าน/ตัวแทน/ที่ติดตั้ง → เรียก dinoco_dealer_lookup ทันที";
       if (context.LAST_AREA) hint += ` (พื้นที่จากประวัติ: ${context.LAST_AREA})`;
       hint += " ถ้ามีชื่อจังหวัด/พื้นที่ในข้อความส่งเป็น query เลย ถ้าไม่มีถามจังหวัดลูกค้า";
-      hint += " ★ ห้ามบอกราคาซ้ำเด็ดขาด ห้ามแนะนำสินค้าซ้ำ ตอบเรื่องร้าน/ตัวแทนเท่านั้น]";
+      hint += " ★ ห้ามบอกราคาซ้ำเด็ดขาด ห้ามแนะนำสินค้าซ้ำ ตอบเรื่องร้าน/ตัวแทนเท่านั้น";
+      // ถ้าลูกค้าคุยสินค้ามาก่อน → สร้าง lead ติดตามปิดการขาย
+      if (context.ALREADY_CHOSE_PRODUCT || context.LAST_PRODUCT) {
+        hint += " ★ ลูกค้าสนใจสินค้าแล้วถามร้าน = buying intent สูง → เรียก dinoco_lead_create ด้วย (ใส่ product ที่สนใจ + dealer_name จาก dealer_lookup + customer_name)";
+      }
+      hint += "]";
       return { hint, skipKB: true };
 
     case "CLAIM_STATUS":
