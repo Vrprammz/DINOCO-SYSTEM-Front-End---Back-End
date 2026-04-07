@@ -318,16 +318,13 @@ async function executeTool(toolName, args, sourceId) {
       // เพิ่ม alias ของ query ทั้ง string
       if (ALIASES[rawQuery]) searchTerms.push(ALIASES[rawQuery]);
 
-      // ★ V.4.3: กรองสินค้าที่หยุดจำหน่ายถาวร ออก (ไม่กรองหมดสต็อกชั่วคราว)
+      // ★ V.4.4: กรองเฉพาะสินค้าที่ Admin ซ่อน (b2b_visible=false) เท่านั้น
+      // สินค้าทุกตัวที่มีในระบบ = ขายอยู่ ต้องแสดงทั้งหมด
+      // stock_status หมดชั่วคราว ≠ หยุดขาย → ยังแสดง (เรื่องหมด/ไม่หมดเป็นเรื่องประสานตัวแทน)
       const activeProducts = catalog.products.filter(p => {
-        // b2b_visible = false → Admin ซ่อนจากลูกค้า (หยุดขายถาวร)
         if (p.b2b_visible === false || p.b2b_visible === "0" || p.b2b_visible === 0) return false;
-        // mp_status = discontinued → โรงงานหยุดผลิตแล้ว
-        if (p.mp_status === "discontinued") return false;
-        // X Travel Pro เลิกขาย → ปัจจุบันเป็น Grand Travel
         const name = (p.name || "").toLowerCase();
         if (name.includes("x travel pro")) return false;
-        // ★ stock_status = out_of_stock → ยังแสดงได้ แต่บอกว่าหมดชั่วคราว (ไม่ซ่อน)
         return true;
       });
 
