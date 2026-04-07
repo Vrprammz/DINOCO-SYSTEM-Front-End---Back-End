@@ -867,7 +867,7 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
   }
   // ★ V.6.0: Smart Supervisor — ใช้ reviewTier จาก intentRouter
   const route = intentRouter(cleanForAI(text), contextStr);
-  reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier);
+  reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier, userName, "line");
   const sent = await replyToLine(event.replyToken, reply);
   if (sent) {
     await saveMsg(sourceId, {
@@ -880,7 +880,7 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
 
 // === AI Reply to Facebook/Instagram ===
 // === ★ V.6.0: Smart Supervisor — reviewTier จาก intentRouter ลดการเรียก Claude ===
-async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr, intentReviewTier = "haiku") {
+async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr, intentReviewTier = "haiku", userName = "", platform = "") {
   // ★ V.6.0: ถ้า intent ชัดเจน + reviewTier = "none" → skip review เลย (ประหยัด 20%)
   if (intentReviewTier === "none") {
     // ยังต้อง regex pre-check เรื่องร้ายแรง (เผยตัว AI, น้ำเสียงผิด) — ถ้าเจอถึง review
@@ -972,18 +972,19 @@ Gemini ตอบ: "${geminiReply}"
     }
 
     // Claude แก้ไข → ใช้ข้อความใหม่ (ลบ ? เฉพาะที่ไม่ใช่ URL)
-    console.log(`[${reviewTier}] Revised ✏️`);
-    sendTelegramAlert("hallucination", { sourceId, customerText, geminiReply, revisedReply: review.substring(0, 150) }).catch(() => {});
+    const revised = review.replace(/\?(?![a-zA-Z_=&])/g, "").trim();
     if (data.usage) {
       trackAICost({ provider: `Claude-${reviewTier}`, model: reviewModel, feature: "supervisor",
         inputTokens: data.usage.input_tokens || 0, outputTokens: data.usage.output_tokens || 0, sourceId });
     }
-    const revised = review.replace(/\?(?![a-zA-Z_=&])/g, "").trim();
-    // ★ V.4.1: ถ้า Claude return ว่าง/สั้นเกิน → fallback ใช้ Gemini เดิม
+    // ★ V.4.2: ถ้า Claude return ว่าง/สั้นเกิน → Gemini ตอบถูกอยู่แล้ว ไม่ใช่ hallucination
     if (!revised || revised.length < 5) {
-      console.log(`[${reviewTier}] Empty revision → fallback to Gemini`);
+      console.log(`[${reviewTier}] Empty revision → Gemini reply OK (not hallucination)`);
       return geminiReply;
     }
+    // ★ มี revision จริง = hallucination จริง → แจ้ง Telegram + ส่ง revision ให้ลูกค้า
+    console.log(`[${reviewTier}] Revised ✏️`);
+    sendTelegramAlert("hallucination", { sourceId, customerText, geminiReply, revisedReply: revised.substring(0, 150), customerName: userName || "ลูกค้า", platform }).catch(() => {});
     return revised;
   } catch (e) {
     console.log("[Boss] Claude timeout/error — use Gemini reply:", e.message);
@@ -1018,7 +1019,9 @@ Platform: ${platform} — ${platformNote}
 
   // ★ V.6.0: Smart Supervisor — ใช้ reviewTier จาก intentRouter
   const route = intentRouter(cleanForAI(text), contextStr);
-  reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier);
+  // ดึงชื่อลูกค้าจาก context
+  const metaUserName = contextDocs.find(d => d.role === "user" && d.userName)?.userName || "ลูกค้า";
+  reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier, metaUserName, platform);
 
   // ★ V.6.1: Robust image URL extraction — match ทั้ง .jpg/.png/.webp + WP upload URLs + query strings
   const imgUrlRegex = /(https?:\/\/[^\s\]\)"|]+\.(?:png|jpg|jpeg|gif|webp)(?:\?[^\s\]\)"|]*)?)/gi;
