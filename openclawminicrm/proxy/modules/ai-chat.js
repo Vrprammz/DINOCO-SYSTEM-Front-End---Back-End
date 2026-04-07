@@ -863,8 +863,10 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
   // ★ V.6.0: Smart Supervisor — ใช้ reviewTier จาก intentRouter
   const route = intentRouter(cleanForAI(text), contextStr);
   reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier, userName, "line");
-  // ★ V.6.2: Post-process append (เช่น ข้อความประสานตัวแทน) — Gemini ไม่มีทางเลี่ยง
-  if (route.appendAfter && !reply.includes("แจ้งชื่อและเบอร์")) reply += route.appendAfter;
+  // ★ V.6.3: ถ้าตอบเรื่องร้าน/ตัวแทน (มีเบอร์โทร) → append ข้อความประสาน
+  if (/ร้าน.*โทร|โทร\s*\d{2,3}[-.]\d{3}[-.]\d{4}|SHOP|ตัวแทน.*จำหน่าย/i.test(reply) && !reply.includes("แจ้งชื่อและเบอร์")) {
+    reply += "\n\nถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ 😊";
+  }
   const sent = await replyToLine(event.replyToken, reply);
   if (sent) {
     await saveMsg(sourceId, {
@@ -1019,8 +1021,10 @@ Platform: ${platform} — ${platformNote}
   // ดึงชื่อลูกค้าจาก context
   const metaUserName = contextDocs.find(d => d.role === "user" && d.userName)?.userName || "ลูกค้า";
   reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier, metaUserName, platform);
-  // ★ V.6.2: Post-process append (เช่น ข้อความประสานตัวแทน)
-  if (route.appendAfter && !reply.includes("แจ้งชื่อและเบอร์")) reply += route.appendAfter;
+  // ★ V.6.3: ถ้าตอบเรื่องร้าน/ตัวแทน (มีเบอร์โทร) → append ข้อความประสาน
+  if (/ร้าน.*โทร|โทร\s*\d{2,3}[-.]\d{3}[-.]\d{4}|SHOP|ตัวแทน.*จำหน่าย/i.test(reply) && !reply.includes("แจ้งชื่อและเบอร์")) {
+    reply += "\n\nถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ 😊";
+  }
 
   // ★ V.6.1: Robust image URL extraction — match ทั้ง .jpg/.png/.webp + WP upload URLs + query strings
   const imgUrlRegex = /(https?:\/\/[^\s\]\)"|]+\.(?:png|jpg|jpeg|gif|webp)(?:\?[^\s\]\)"|]*)?)/gi;
