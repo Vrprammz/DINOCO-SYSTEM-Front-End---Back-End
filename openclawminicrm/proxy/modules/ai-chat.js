@@ -555,14 +555,8 @@ function buildIntentHint(intent, context, userMessage) {
       hint = "\n[INTENT: DEALER — ลูกค้าถามร้าน/ตัวแทน/ที่ติดตั้ง → เรียก dinoco_dealer_lookup ทันที";
       if (context.LAST_AREA) hint += ` (พื้นที่จากประวัติ: ${context.LAST_AREA})`;
       hint += " ถ้ามีชื่อจังหวัด/พื้นที่ในข้อความส่งเป็น query เลย ถ้าไม่มีถามจังหวัดลูกค้า";
-      hint += " ★ ห้ามบอกราคาซ้ำเด็ดขาด ห้ามแนะนำสินค้าซ้ำ ตอบเรื่องร้าน/ตัวแทนเท่านั้น";
-      hint += " ★★★ หลังบอกร้าน → เสนอประสานให้ตัวแทนติดต่อกลับ เช่น 'ถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ' ห้ามแค่โยนเบอร์แล้วจบ";
-      // ถ้าลูกค้าคุยสินค้ามาก่อน → สร้าง lead ติดตามปิดการขาย
-      if (context.ALREADY_CHOSE_PRODUCT || context.LAST_PRODUCT) {
-        hint += " ★ ลูกค้าสนใจสินค้าแล้วถามร้าน = buying intent สูง → เรียก dinoco_lead_create ด้วย (ใส่ product ที่สนใจ + dealer_name จาก dealer_lookup + customer_name + province)";
-      }
-      hint += "]";
-      return { hint, skipKB: true };
+      hint += " ★ ห้ามบอกราคาซ้ำเด็ดขาด ห้ามแนะนำสินค้าซ้ำ ตอบเรื่องร้าน/ตัวแทนเท่านั้น]";
+      return { hint, skipKB: true, appendAfter: "\n\nถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ 😊" };
 
     case "CLAIM_STATUS":
       return { hint: "\n[INTENT: CLAIM_STATUS — ลูกค้าส่งเลขเคลม → เรียก dinoco_claim_status ทันที]", skipKB: true };
@@ -869,6 +863,8 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
   // ★ V.6.0: Smart Supervisor — ใช้ reviewTier จาก intentRouter
   const route = intentRouter(cleanForAI(text), contextStr);
   reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier, userName, "line");
+  // ★ V.6.2: Post-process append (เช่น ข้อความประสานตัวแทน) — Gemini ไม่มีทางเลี่ยง
+  if (route.appendAfter && !reply.includes("แจ้งชื่อและเบอร์")) reply += route.appendAfter;
   const sent = await replyToLine(event.replyToken, reply);
   if (sent) {
     await saveMsg(sourceId, {
@@ -1023,6 +1019,8 @@ Platform: ${platform} — ${platformNote}
   // ดึงชื่อลูกค้าจาก context
   const metaUserName = contextDocs.find(d => d.role === "user" && d.userName)?.userName || "ลูกค้า";
   reply = await claudeSupervisor(reply, text, sourceId, contextStr, route.reviewTier, metaUserName, platform);
+  // ★ V.6.2: Post-process append (เช่น ข้อความประสานตัวแทน)
+  if (route.appendAfter && !reply.includes("แจ้งชื่อและเบอร์")) reply += route.appendAfter;
 
   // ★ V.6.1: Robust image URL extraction — match ทั้ง .jpg/.png/.webp + WP upload URLs + query strings
   const imgUrlRegex = /(https?:\/\/[^\s\]\)"|]+\.(?:png|jpg|jpeg|gif|webp)(?:\?[^\s\]\)"|]*)?)/gi;
