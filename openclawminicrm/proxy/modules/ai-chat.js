@@ -556,9 +556,10 @@ function buildIntentHint(intent, context, userMessage) {
       if (context.LAST_AREA) hint += ` (พื้นที่จากประวัติ: ${context.LAST_AREA})`;
       hint += " ถ้ามีชื่อจังหวัด/พื้นที่ในข้อความส่งเป็น query เลย ถ้าไม่มีถามจังหวัดลูกค้า";
       hint += " ★ ห้ามบอกราคาซ้ำเด็ดขาด ห้ามแนะนำสินค้าซ้ำ ตอบเรื่องร้าน/ตัวแทนเท่านั้น";
+      hint += " ★★★ หลังบอกร้าน → เสนอประสานให้ตัวแทนติดต่อกลับ เช่น 'ถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ' ห้ามแค่โยนเบอร์แล้วจบ";
       // ถ้าลูกค้าคุยสินค้ามาก่อน → สร้าง lead ติดตามปิดการขาย
       if (context.ALREADY_CHOSE_PRODUCT || context.LAST_PRODUCT) {
-        hint += " ★ ลูกค้าสนใจสินค้าแล้วถามร้าน = buying intent สูง → เรียก dinoco_lead_create ด้วย (ใส่ product ที่สนใจ + dealer_name จาก dealer_lookup + customer_name)";
+        hint += " ★ ลูกค้าสนใจสินค้าแล้วถามร้าน = buying intent สูง → เรียก dinoco_lead_create ด้วย (ใส่ product ที่สนใจ + dealer_name จาก dealer_lookup + customer_name + province)";
       }
       hint += "]";
       return { hint, skipKB: true };
