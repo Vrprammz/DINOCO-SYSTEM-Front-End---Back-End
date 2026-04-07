@@ -59,6 +59,11 @@ const { LEAD_STATUSES, createLead, updateLeadStatus, notifyDealer,
   startMayomCron, ensureLeadIndexes, runLeadCronByType,
 } = leadPipeline;
 
+const telegramAlert = require("./modules/telegram-alert");
+const { sendTelegramReply, sendTelegramPhoto } = telegramAlert;
+const telegramGung = require("./modules/telegram-gung");
+const { handleTelegramMessage, sendDailySummary, checkLeadNoContact, checkClaimAging } = telegramGung;
+
 // === Wire up cross-module dependencies ===
 dinocoTools.init({ searchMessages, getRecentMessages, callMCPTool });
 aiChat.init({
@@ -67,6 +72,11 @@ aiChat.init({
 });
 claimFlow.init({ analyzeImage });
 leadPipeline.init({ sendLinePush, sendMetaMessage, replyToLine });
+telegramAlert.init({ getDB });
+telegramGung.init({
+  sendLinePush, sendMetaMessage, sendTelegramReply, sendTelegramPhoto,
+  callDinocoAPI, searchKB, saveMsg, getDB,
+});
 
 // === Reply Token Cache: 5-Min Auto-Reply Timer ===
 const pendingAutoReply = new Map();
@@ -1103,6 +1113,22 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
   }
 });
 
+// === Telegram Webhook (น้องกุ้ง Command Center) ===
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || crypto.randomBytes(16).toString("hex");
+app.post(`/webhook/telegram/${TELEGRAM_WEBHOOK_SECRET}`, express.json(), async (req, res) => {
+  res.sendStatus(200); // Telegram expects immediate 200
+  if (req.body.message) {
+    handleTelegramMessage(req.body.message).catch(e => console.error("[Telegram] Handler error:", e.message));
+  }
+});
+// Fallback: accept requests without secret for easy testing (still checks chat_id inside handler)
+app.post("/webhook/telegram", express.json(), async (req, res) => {
+  res.sendStatus(200);
+  if (req.body.message) {
+    handleTelegramMessage(req.body.message).catch(e => console.error("[Telegram] Handler error:", e.message));
+  }
+});
+
 // === Config API ===
 app.get("/config/:sourceId", requireAuth, async (req, res) => { res.json(await getBotConfig(req.params.sourceId)); });
 app.post("/config/:sourceId", requireAuth, express.json(), async (req, res) => {
@@ -2124,12 +2150,42 @@ getDB().then(async () => {
   startMayomCron();
   ensureLeadIndexes().catch(() => {});
   ensureClaimIndexes().catch(() => {});
+  // Telegram indexes
+  const database = await getDB();
+  if (database) {
+    database.collection("telegram_alerts").createIndex({ telegramMessageId: 1 }, { unique: true }).catch(() => {});
+    database.collection("telegram_alerts").createIndex({ status: 1, createdAt: -1 }).catch(() => {});
+    database.collection("telegram_alerts").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 604800 }).catch(() => {});
+    database.collection("telegram_command_log").createIndex({ createdAt: -1 }).catch(() => {});
+    database.collection("telegram_command_log").createIndex({ intent: 1, createdAt: -1 }).catch(() => {});
+  }
+  // Register Telegram webhook
+  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+  const baseUrl = process.env.BASE_URL || "https://ai.dinoco.in.th";
+  if (tgToken) {
+    const tgWebhookUrl = `${baseUrl}/webhook/telegram/${TELEGRAM_WEBHOOK_SECRET}`;
+    fetch(`https://api.telegram.org/bot${tgToken}/setWebhook`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: tgWebhookUrl, allowed_updates: ["message"] }),
+    }).then(r => r.json()).then(d => console.log(`[Telegram] Webhook registered: ${d.ok ? tgWebhookUrl : d.description}`))
+      .catch(e => console.error(`[Telegram] Webhook registration failed: ${e.message}`));
+  }
+  // Telegram cron: daily summary 09:00 Bangkok, lead/claim check every 4 hours
+  setInterval(() => {
+    const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Bangkok" }));
+    if (now.getHours() === 9 && now.getMinutes() === 0) sendDailySummary().catch(() => {});
+  }, 60000);
+  setInterval(() => {
+    checkLeadNoContact().catch(() => {});
+    checkClaimAging().catch(() => {});
+  }, 4 * 60 * 60 * 1000);
   // Qdrant init
   if (QDRANT_URL) { qdrantRequest("GET", `/collections/${QDRANT_COLLECTION}`).catch(() => { qdrantRequest("PUT", `/collections/${QDRANT_COLLECTION}`, { vectors: { size: 768, distance: "Cosine" } }).catch(() => {}); }); }
   app.listen(PORT, () => {
     console.log(`[Agent] Running on port ${PORT}`);
-    console.log(`[Agent] V.2.0 Modular — 7 modules extracted`);
+    console.log(`[Agent] V.2.1 Modular — 8 modules (+ Telegram Command Center)`);
     console.log(`[Agent] AI: Gemini Flash (primary) -> Claude Sonnet (fallback) -> Free models (analytics)`);
     console.log(`[Agent] Tools: ${AGENT_TOOLS.length} built-in + ${mcpTools.length} MCP`);
+    if (tgToken) console.log(`[Agent] Telegram น้องกุ้ง: active`);
   });
 });
