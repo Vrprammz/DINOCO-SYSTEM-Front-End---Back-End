@@ -3,6 +3,7 @@
  * V.6.0 — Deep Refactor: Centralized Intent Router (complete), Smart Supervisor, KB Intelligence
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
+const { sendTelegramAlert } = require("./telegram-alert");
 const { cleanForAI } = require("../middleware/auth");
 
 // Forward declarations — set by init()
@@ -857,6 +858,7 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
   let reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId, contextStr);
   if (/รอทีมงาน|ขอเช็คข้อมูล/.test(reply)) {
     await createAiHandoffAlert(sourceId, userName, text);
+    sendTelegramAlert("ai_confused", { sourceId, customerName: userName, customerText: text, platform: "line" }).catch(() => {});
   }
   // ★ V.6.0: Smart Supervisor — ใช้ reviewTier จาก intentRouter
   const route = intentRouter(cleanForAI(text), contextStr);
@@ -966,6 +968,7 @@ Gemini ตอบ: "${geminiReply}"
 
     // Claude แก้ไข → ใช้ข้อความใหม่ (ลบ ? เฉพาะที่ไม่ใช่ URL)
     console.log(`[${reviewTier}] Revised ✏️`);
+    sendTelegramAlert("hallucination", { sourceId, customerText, geminiReply, revisedReply: review.substring(0, 150) }).catch(() => {});
     if (data.usage) {
       trackAICost({ provider: `Claude-${reviewTier}`, model: reviewModel, feature: "supervisor",
         inputTokens: data.usage.input_tokens || 0, outputTokens: data.usage.output_tokens || 0, sourceId });
@@ -1005,6 +1008,7 @@ Platform: ${platform} — ${platformNote}
   let reply = await callDinocoAI(systemPrompt, cleanForAI(text), sourceId, contextStr);
   if (/รอทีมงาน|ขอเช็คข้อมูล/.test(reply)) {
     await createAiHandoffAlert(sourceId, senderId, text, platform);
+    sendTelegramAlert("ai_confused", { sourceId, customerName: userName, customerText: text, platform }).catch(() => {});
   }
 
   // ★ V.6.0: Smart Supervisor — ใช้ reviewTier จาก intentRouter

@@ -3,6 +3,7 @@
  * V.3.1 — Fix: ลบคำว่า "พี่" ออกจาก lead response template
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
+const { sendTelegramAlert } = require("./telegram-alert");
 const { callDinocoAPI } = require("./dinoco-cache");
 
 // === Send Claim Alert to Admin LINE Group ===
@@ -788,8 +789,9 @@ async function executeTool(toolName, args, sourceId) {
         ticketNumber = "รอทีมตรวจสอบ";
       }
 
-      // 3. ส่ง alert ไปกลุ่ม Admin LINE
+      // 3. ส่ง alert ไปกลุ่ม Admin LINE + Telegram
       sendClaimAlertToAdmin({ ...claimDoc, wpTicketNumber: ticketNumber }, "เปิดเคลมใหม่", sourceId).catch(() => {});
+      sendTelegramAlert("new_claim", { sourceId, customerName: args.customer_name, symptoms, phone, ticketNumber, platform: "facebook" }).catch(() => {});
 
       return `เปิดใบเคลมสำเร็จ เลข: ${ticketNumber}\nอาการ: ${symptoms}\nเบอร์โทร: ${phone}\nสินค้า: ${args.product || "-"}\n\nตอบลูกค้าว่า "เปิดใบเคลมให้แล้วค่ะ เลข ${ticketNumber} ทีมช่างจะตรวจสอบและติดต่อกลับเร็วที่สุดนะคะ"`;
     } catch (e) {
