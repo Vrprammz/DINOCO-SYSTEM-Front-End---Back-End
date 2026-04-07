@@ -166,15 +166,16 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - Lead statuses ตรงกับ `LEAD_STATUSES` ใน `lead-pipeline.js` (17 statuses)
   - Claims ใช้ CPT `claim_ticket` + field `ticket_status` (แก้แล้ว V.1.4 — เดิมใช้ `warranty_claim` + `claim_status` ผิด)
   - Claim statuses ต้องตรงกับ Service Center (11 statuses: pending, reviewing, approved, in_progress, waiting_parts, repairing, quality_check, completed, rejected, cancelled, closed)
-- **OpenClaw Mini CRM** (`openclawminicrm/`): Multi-platform AI chatbot (LINE + Facebook + Instagram). ดู `openclawminicrm/CLAUDE.md` สำหรับรายละเอียด.
-  - **Agent** (`proxy/`): Node.js + Express, Gemini Flash + Claude Sonnet (function calling), MongoDB Atlas
-  - **Modules**: `ai-chat.js` (AI providers + supervisor), `dinoco-tools.js` (11 tools), `shared.js` (prompt + config), `claim-flow.js`, `lead-pipeline.js`, `dinoco-cache.js`
+- **OpenClaw Mini CRM** (`openclawminicrm/`): Multi-platform AI chatbot (LINE + Facebook + Instagram + Telegram). ดู `openclawminicrm/CLAUDE.md` สำหรับรายละเอียด.
+  - **Agent** (`proxy/`): Node.js + Express (V.2.1), Gemini Flash + Claude Sonnet (function calling), MongoDB Atlas
+  - **Modules** (8 ไฟล์): `ai-chat.js` (AI providers + supervisor), `dinoco-tools.js` (11 tools), `shared.js` (prompt + config), `claim-flow.js`, `lead-pipeline.js`, `dinoco-cache.js`, `telegram-alert.js` (V.2.0), `telegram-gung.js` (V.1.0)
   - **Tools** (11 ตัว): เดิม 8 + เพิ่ม `check_stock_status`, `dinoco_claim_status`, `dinoco_create_claim`. `dinoco_create_claim` platform detect จาก sourceId (ไม่ hardcode facebook อีกต่อไป)
   - **Claim Flow V.3.0**: auto-timeout 24h (เดิม 48h), isClaimIntent strict mode 2 ระดับ (explicit/symptoms+product), "สอบถามสินค้า" ไม่เข้า claim อีกต่อไป
   - **Lead Pipeline**: ทุก status มีทางไป `closed_lost`/`cancelled` แล้ว (เดิมบาง status ไม่มีทางออก)
   - **Anti-Hallucination V.4.0**: 3 ชั้นป้องกัน + intent pre-check + context-aware supervisor, prompt restructure กฎสำคัญขึ้นบนสุด, conversation history 12 msgs, isClaimIntent strict 2 ระดับ, claim timeout 24h
   - **Security**: requireAuth ทุก API endpoint, prompt injection protection 14 patterns, PII masking, rate limiting
   - **Training Dashboard V.1.0**: หน้า `/dashboard/train` — บอสเทรน AI ผ่าน UI. Agent API `/api/train/*` (test, judge, kb, generate, stats, logs). KB จาก training มี `source: "training_dashboard"`. MongoDB collection `training_logs`.
+  - **Telegram Bot V.1.0** (น้องกุ้ง): `telegram-gung.js` — Command Center ผ่าน @dinoco_alert_bot. 20+ commands (เคลม/ตอบลูกค้า/KB/Lead/สถิติ). `telegram-alert.js` V.2.0 — alert system (sendTelegramAlert/Reply/Photo + MongoDB logging). Webhook: `POST /webhook/telegram/{secret}`. Cron: daily summary 09:00, lead no contact ทุก 4 ชม., claim aging ทุก 4 ชม. Security: chat_id check (บอสเท่านั้น). Env: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET`, `BASE_URL`. MongoDB: `telegram_alerts` (message_id <-> sourceId), `telegram_command_log` (audit trail).
 
 ## Reference Documentation
 

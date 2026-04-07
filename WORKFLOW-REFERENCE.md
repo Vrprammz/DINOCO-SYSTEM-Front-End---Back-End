@@ -725,13 +725,13 @@ sequenceDiagram
 ```
 Trigger: ลูกค้าส่งข้อความผ่าน LINE / Facebook / Instagram
 
-1. Platform webhook → OpenClaw proxy/index.js
+1. Platform webhook → OpenClaw proxy/index.js (V.2.1)
 2. Auth middleware → ตรวจ platform token
 3. Load conversation from MongoDB
 4. AI Provider:
    a. Gemini Flash (primary) → function calling
    b. Claude Sonnet (supervisor) → quality check
-5. Available Tools (8):
+5. Available Tools (11):
    - get_product → MCP Bridge → product-lookup
    - get_dealer → MCP Bridge → dealer-lookup
    - check_warranty → MCP Bridge → warranty-check
@@ -740,13 +740,75 @@ Trigger: ลูกค้าส่งข้อความผ่าน LINE / Fac
    - create_lead → MCP Bridge → lead-create
    - escalate_to_admin → notify admin
    - get_moto_catalog → MCP Bridge → moto-catalog
+   - check_stock_status → MCP Bridge → product-lookup (stock_status)
+   - dinoco_claim_status → MCP Bridge → claim-status
+   - dinoco_create_claim → MCP Bridge → claim-manual-create (platform auto-detect)
 6. Anti-hallucination:
    - Prompt layer: strict instructions
    - Tool boundary: only use tool results
    - Output sanitize: claudeSupervisor check
 7. Response → platform-specific format → reply
+8. Telegram alert → telegram-alert.js → บอส (new chat/escalation/claim)
 
 Conversation Cap: 12 messages, Temperature: 0.35
+```
+
+### 7.1 Telegram Command Workflow (น้องกุ้ง V.1.0)
+
+```
+Trigger: บอสส่งข้อความใน Telegram @dinoco_alert_bot
+
+1. Telegram webhook → POST /webhook/telegram/{secret}
+2. Security check: chat_id == TELEGRAM_CHAT_ID (บอสเท่านั้น)
+3. Command parser → route to handler:
+
+   เคลม Commands:
+   - "เคลม MC-XXXXX" → ดึงรายละเอียดเคลม
+   - "อนุมัติ" → อนุมัติเคลมที่กำลังดูอยู่
+   - "ปฏิเสธ [เหตุผล]" → ปฏิเสธเคลมพร้อมเหตุผล
+   - "เคลมรอตรวจ" → list เคลมรอ review
+   - "เคลมวันนี้" → list เคลมที่เข้าวันนี้
+
+   ตอบลูกค้า Commands:
+   - "ตอบ [ชื่อ]: [ข้อความ]" → ส่งข้อความกลับผ่าน platform เดิม
+   - "ตอบล่าสุด" → ตอบ conversation ล่าสุดที่ alert
+   - Reply alert message → ตอบกลับ conversation ที่ alert นั้น
+
+   Lead/KB/Stats Commands:
+   - "ตัวแทน [จังหวัด]" → ค้นหาตัวแทน
+   - "Lead วันนี้" → สรุป lead
+   - "Lead รอติดต่อ" → leads ที่ยังไม่ contact
+   - "KB เพิ่ม/ค้นหา/ทั้งหมด" → จัดการ Knowledge Base
+   - "แชทวันนี้" → สถิติ chat
+   - "สถิติ AI" → AI performance stats
+   - "เทรน [จำนวน]" → generate training set
+   - "สถานะ" → system status
+   - "ล้างแชท" → clear context
+   - "/help" → แสดงรายการคำสั่ง
+
+4. Response → plain text (ป้องกัน Markdown parse error)
+5. Command logged → MongoDB telegram_command_log
+
+Cron Jobs (น้องกุ้ง):
+- Daily summary: 09:00 ICT → สรุปยอดวันก่อน
+- Lead no contact: ทุก 4 ชม. → แจ้ง leads ที่ยังไม่ติดต่อ
+- Claim aging: ทุก 4 ชม. → แจ้ง claims ที่ค้างนาน
+```
+
+### 7.2 Telegram Alert Flow
+
+```
+Trigger: เหตุการณ์สำคัญในระบบ (chat ใหม่ / escalation / claim ใหม่)
+
+1. Event เกิดใน OpenClaw Agent
+2. telegram-alert.js V.2.0:
+   a. sendTelegramAlert(title, body) → ส่ง text message
+   b. sendTelegramReply(chatId, replyToMsgId, text) → reply to specific message
+   c. sendTelegramPhoto(chatId, photoUrl, caption) → ส่งรูป
+   d. escapeMarkdown(text) → escape special chars
+3. บันทึก alert record → MongoDB telegram_alerts collection
+   - mapping: message_id ↔ sourceId (เพื่อ reply กลับถูก conversation)
+4. init({getDB}) → wire up MongoDB connection ตอน server start
 ```
 
 ---
@@ -898,6 +960,14 @@ gantt
 | `b2b_cleanup_old_slips` | Daily (on summary) | B2B Snippet 3 | Cleanup old slip images |
 | `dinoco_inv_cron_reminder` | Daily 09:00 | Manual Invoice | Invoice payment reminders |
 | `dinoco_inv_cron_overdue` | Daily | Manual Invoice | Overdue invoice notices |
+
+### 9.8 OpenClaw Cron Jobs (Node.js)
+
+| Job | Schedule | Source | Description |
+|-----|----------|--------|-------------|
+| Telegram Daily Summary | Daily 09:00 ICT | telegram-gung.js | สรุปยอดวันก่อน (chat, lead, claim) ส่ง Telegram |
+| Telegram Lead No Contact | Every 4 hours | telegram-gung.js | แจ้ง leads ที่ยังไม่ติดต่อ |
+| Telegram Claim Aging | Every 4 hours | telegram-gung.js | แจ้ง claims ที่ค้างนาน (reviewing > 48h, etc.) |
 
 ---
 

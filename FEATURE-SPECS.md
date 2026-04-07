@@ -1,6 +1,6 @@
 # DINOCO Feature Specs -- Complete Wiki
 
-**Date:** 2026-04-06
+**Date:** 2026-04-07
 
 > Consolidated from: B2F-FEATURE-SPEC.md, INVENTORY-FEATURE-SPEC.md, FINANCE-DASHBOARD.md, BRAND-VOICE.md, MASTER-PLAN.md
 
@@ -72,6 +72,15 @@
   - [5.9 Dashboard Plan](#59-dashboard-plan)
   - [5.10 Risk & Rollback](#510-risk--rollback)
   - [5.11 Appendices (Master Plan)](#511-appendices-master-plan)
+- [6. น้องกุ้ง Telegram Command Center](#6-น้องกุ้ง-telegram-command-center)
+  - [6.1 Overview](#61-overview)
+  - [6.2 Commands Reference](#62-commands-reference)
+  - [6.3 Cron Jobs](#63-cron-jobs)
+  - [6.4 telegram-alert.js V.2.0](#64-telegram-alertjs-v20)
+  - [6.5 Architecture](#65-architecture)
+  - [6.6 Environment Variables](#66-environment-variables)
+  - [6.7 MongoDB Collections](#67-mongodb-collections)
+  - [6.8 Security](#68-security)
 
 ---
 
@@ -1457,6 +1466,138 @@ Base: `/wp-json/dinoco-mcp/v1/` | Auth: `X-API-Key` header
 
 **WordPress (modify):** `[System] DINOCO MCP Bridge` -- add 25 endpoints
 **WordPress (new):** `[System] DINOCO Manual Claim System`
-**OpenClaw (modify):** proxy/index.js, openclaw.json, cron/jobs.json, skills, dashboard CSS/layout, docker-compose, nginx
-**OpenClaw (new):** Agent #15 Mayom skill, .env
+**OpenClaw (modify):** proxy/index.js (V.2.1), proxy/modules/telegram-alert.js (V.2.0), openclaw.json, cron/jobs.json, skills, dashboard CSS/layout, docker-compose, nginx
+**OpenClaw (new):** proxy/modules/telegram-gung.js (V.1.0), Agent #15 Mayom skill, .env
 **Documentation:** MASTER-PLAN.md (single source of truth), INTEGRATION-ARCHITECTURE.md (detailed specs)
+
+---
+
+# 6. น้องกุ้ง Telegram Command Center
+
+**Status:** Implemented V.1.0
+
+> Created: 2026-04-07
+> Module: `proxy/modules/telegram-gung.js` (V.1.0) + `proxy/modules/telegram-alert.js` (V.2.0)
+> Entry: `proxy/index.js` (V.2.1) -- webhook route `/webhook/telegram/{secret}`
+
+## 6.1 Overview
+
+น้องกุ้ง คือ Telegram Bot ที่ให้บอสจัดการระบบ DINOCO ผ่าน Telegram ได้โดยตรง: ดูเคลม/อนุมัติ/ปฏิเสธ, ตอบลูกค้าข้ามแพลตฟอร์ม, จัดการ KB, ดูสถิติ Lead/AI, และรับ daily summary อัตโนมัติ
+
+- **Bot**: @dinoco_alert_bot
+- **Security**: chat_id check (บอสเท่านั้น) + webhook secret path
+- **Response format**: Plain text เสมอ (ป้องกัน Telegram Markdown parse error)
+
+## 6.2 Commands Reference
+
+### เคลม Commands
+
+| Command | Description |
+|---------|-------------|
+| `เคลม MC-XXXXX` | ดึงรายละเอียดเคลม (สถานะ, ลูกค้า, สินค้า, รูป) |
+| `อนุมัติ` | อนุมัติเคลมที่กำลังดูอยู่ (context จาก command ก่อนหน้า) |
+| `ปฏิเสธ [เหตุผล]` | ปฏิเสธเคลมพร้อมเหตุผล |
+| `เคลมรอตรวจ` | แสดงรายการเคลมรอ review (status: reviewing) |
+| `เคลมวันนี้` | แสดงรายการเคลมที่เข้ามาวันนี้ |
+
+### ตอบลูกค้า Commands
+
+| Command | Description |
+|---------|-------------|
+| `ตอบ [ชื่อ]: [ข้อความ]` | ส่งข้อความกลับผ่าน platform เดิมของลูกค้า (LINE/FB/IG) |
+| `ตอบล่าสุด` | ตอบ conversation ล่าสุดที่ alert เข้ามา |
+| Reply alert message | ตอบกลับ conversation ที่ alert นั้น (Telegram reply feature) |
+
+### ตัวแทน & Lead Commands
+
+| Command | Description |
+|---------|-------------|
+| `ตัวแทน [จังหวัด]` | ค้นหาตัวแทนจำหน่ายตามจังหวัด |
+| `Lead วันนี้` | สรุป lead ที่เข้ามาวันนี้ |
+| `Lead รอติดต่อ` | แสดง leads ที่ยังไม่ได้ contact |
+
+### Knowledge Base Commands
+
+| Command | Description |
+|---------|-------------|
+| `KB เพิ่ม [หัวข้อ]: [เนื้อหา]` | เพิ่ม KB entry ใหม่ |
+| `KB ค้นหา [คำค้น]` | ค้นหา KB |
+| `KB ทั้งหมด` | แสดง KB ทั้งหมด |
+
+### สถิติ & ระบบ Commands
+
+| Command | Description |
+|---------|-------------|
+| `แชทวันนี้` | สถิติ chat วันนี้ (จำนวน, platform breakdown) |
+| `สถิติ AI` | AI performance stats (accuracy, tool usage, fallback rate) |
+| `เทรน [จำนวน]` | Generate training set สำหรับ AI |
+| `สถานะ` | System status (uptime, connections, queue) |
+| `ล้างแชท` | Clear command context |
+| `/help` | แสดงรายการคำสั่งทั้งหมด |
+
+## 6.3 Cron Jobs
+
+| Job | Schedule | Description |
+|-----|----------|-------------|
+| Daily Summary | 09:00 ICT | สรุปยอดวันก่อน: จำนวน chat, leads ใหม่, claims ใหม่, AI accuracy |
+| Lead No Contact | ทุก 4 ชม. | แจ้ง leads ที่สร้างมาแล้วแต่ยังไม่มีใคร contact |
+| Claim Aging | ทุก 4 ชม. | แจ้ง claims ที่ค้างนาน (reviewing > 48h, in_progress > 7d, etc.) |
+
+## 6.4 telegram-alert.js V.2.0
+
+อัพจาก V.1.0 -- เพิ่มฟังก์ชันใหม่:
+
+| Function | Description |
+|----------|-------------|
+| `sendTelegramAlert(title, body)` | ส่ง text alert ไป Telegram (เดิม V.1.0) |
+| `sendTelegramReply(chatId, replyToMsgId, text)` | Reply to specific message (NEW V.2.0) |
+| `sendTelegramPhoto(chatId, photoUrl, caption)` | ส่งรูปภาพ (NEW V.2.0) |
+| `escapeMarkdown(text)` | Escape Telegram MarkdownV2 special chars (NEW V.2.0) |
+| `init({getDB})` | Initialize MongoDB connection for alert logging (NEW V.2.0) |
+
+Alert records บันทึกลง MongoDB `telegram_alerts` collection -- mapping `message_id` กับ `sourceId` เพื่อให้บอส reply alert แล้วระบบส่งกลับถูก conversation
+
+## 6.5 Architecture
+
+```
+Telegram Bot API
+    |
+    v
+POST /webhook/telegram/{secret}  ← index.js V.2.1
+    |
+    ├─ chat_id check (บอสเท่านั้น)
+    |
+    ├─ Reply to alert? → ค้นหา telegram_alerts → ส่งกลับ platform เดิม
+    |
+    └─ Text command → telegram-gung.js command parser
+         |
+         ├─ เคลม commands → MCP Bridge → WordPress claim_ticket CPT
+         ├─ ตอบ commands → platform-response.js → LINE/FB/IG
+         ├─ Lead commands → MCP Bridge → lead-list/lead-get
+         ├─ KB commands → MCP Bridge → kb-search/kb-suggest
+         ├─ Stats commands → MongoDB aggregation
+         └─ System commands → internal state
+```
+
+## 6.6 Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot API token (@dinoco_alert_bot) |
+| `TELEGRAM_CHAT_ID` | Boss chat_id (security: only this chat_id can send commands) |
+| `TELEGRAM_WEBHOOK_SECRET` | Secret path segment for webhook URL |
+| `BASE_URL` | Server base URL (e.g., https://ai.dinoco.co.th) |
+
+## 6.7 MongoDB Collections
+
+| Collection | Indexes | Description |
+|-----------|---------|-------------|
+| `telegram_alerts` | `message_id`, `sourceId`, `created_at` | Alert message mapping (message_id <-> sourceId) สำหรับ reply routing |
+| `telegram_command_log` | `chat_id`, `command`, `created_at` | Audit trail ทุก command ที่บอสใช้ |
+
+## 6.8 Security
+
+- **chat_id whitelist**: เฉพาะ `TELEGRAM_CHAT_ID` (บอส) เท่านั้นที่สั่งได้
+- **Webhook secret**: URL path มี secret segment ป้องกัน unauthorized POST
+- **Plain text response**: ไม่ใช้ Markdown เพื่อป้องกัน parse error กับ Thai text + special chars
+- **Command logging**: ทุก command บันทึกลง MongoDB สำหรับ audit

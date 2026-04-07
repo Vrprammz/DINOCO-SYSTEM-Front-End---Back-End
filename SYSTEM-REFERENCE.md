@@ -178,17 +178,19 @@
 
 ### 2.7 OpenClaw Mini CRM (Chatbot Agent)
 
-| File | Location | Description |
-|------|----------|-------------|
-| index.js | `proxy/` | Main Express server (~110K) |
-| ai-chat.js | `proxy/modules/` | AI providers + claudeSupervisor |
-| dinoco-tools.js | `proxy/modules/` | 8 function-calling tools |
-| shared.js | `proxy/modules/` | Prompt templates + config |
-| claim-flow.js | `proxy/modules/` | Claim workflow automation |
-| lead-pipeline.js | `proxy/modules/` | Lead management (17 statuses) |
-| dinoco-cache.js | `proxy/modules/` | Redis/memory cache layer |
-| platform-response.js | `proxy/modules/` | Multi-platform response builder |
-| auth.js | `proxy/middleware/` | Authentication middleware |
+| File | Location | Version | Description |
+|------|----------|---------|-------------|
+| index.js | `proxy/` | V.2.1 | Main Express server (~110K) + Telegram webhook route |
+| ai-chat.js | `proxy/modules/` | -- | AI providers + claudeSupervisor |
+| dinoco-tools.js | `proxy/modules/` | -- | 11 function-calling tools |
+| shared.js | `proxy/modules/` | -- | Prompt templates + config |
+| claim-flow.js | `proxy/modules/` | -- | Claim workflow automation |
+| lead-pipeline.js | `proxy/modules/` | -- | Lead management (17 statuses) |
+| dinoco-cache.js | `proxy/modules/` | -- | Redis/memory cache layer |
+| platform-response.js | `proxy/modules/` | -- | Multi-platform response builder |
+| telegram-alert.js | `proxy/modules/` | V.2.0 | Telegram alert system (sendTelegramAlert/Reply/Photo, escapeMarkdown, MongoDB logging) |
+| telegram-gung.js | `proxy/modules/` | V.1.0 | น้องกุ้ง Telegram Bot Command Center (command parser + router + 20+ handlers + cron) |
+| auth.js | `proxy/middleware/` | -- | Authentication middleware |
 
 ---
 
@@ -690,6 +692,16 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 | `dinoco_limit_{user_id}_{action}` | 2 sec | Rate limiting |
 | `b2b_flash_courier_retry_{tid}` | varies | Flash retry state |
 
+### 5.4.5 MongoDB Collections (OpenClaw)
+
+| Collection | Description |
+|-----------|-------------|
+| `conversations` | Chat history per user per platform |
+| `leads` | Lead records (from AI chat + manual) |
+| `training_logs` | AI training dashboard logs |
+| `telegram_alerts` | Telegram alert records (message_id <-> sourceId mapping) |
+| `telegram_command_log` | Telegram command audit trail (who, what, when) |
+
 ### 5.5 User Meta
 
 | Meta Key | Description |
@@ -834,9 +846,11 @@ graph TB
     end
 
     subgraph "OpenClaw Mini CRM"
-        AGENT[Node.js Agent<br>proxy/index.js]
+        AGENT[Node.js Agent<br>proxy/index.js V.2.1]
         MONGO[(MongoDB Atlas)]
-        TOOLS[8 Function Tools<br>dinoco-tools.js]
+        TOOLS[11 Function Tools<br>dinoco-tools.js]
+        TGBOT[Telegram Bot<br>telegram-gung.js V.1.0]
+        TGALERT[Telegram Alert<br>telegram-alert.js V.2.0]
     end
 
     subgraph "Infrastructure"
@@ -869,6 +883,9 @@ graph TB
     AGENT --> MONGO
     AGENT --> TOOLS
     TOOLS -->|REST calls| REST
+    TGBOT -->|Commands| AGENT
+    TGALERT -->|Alerts| MONGO
+    TGBOT -->|Webhook| AGENT
 
     GH -->|Webhook| REST
 ```
@@ -1430,6 +1447,9 @@ sequenceDiagram
 | แจ้งความสนใจ | create_lead | สร้าง lead record |
 | ขอคุยกับคน | escalate_to_admin | ส่งต่อ admin |
 | ดูรุ่นมอเตอร์ไซค์ | get_moto_catalog | Catalog รุ่นรถ |
+| เช็คสต็อกสินค้า | check_stock_status | เช็คสถานะสต็อก (in_stock/low_stock/out_of_stock) |
+| เช็คสถานะเคลม | dinoco_claim_status | ดูสถานะเคลมจาก ticket ID |
+| สร้างเคลมจากแชท | dinoco_create_claim | เปิดเคลมจริงเข้า WP (platform auto-detect) |
 
 #### ข้อจำกัด
 - Max 12 messages per conversation
@@ -1538,6 +1558,8 @@ sequenceDiagram
 | OpenClaw Agent | WordPress MCP Bridge | REST API | Product lookup, claims, leads |
 | OpenClaw Agent | MongoDB Atlas | MongoDB Driver | Chat history, leads, analytics |
 | OpenClaw Agent | LINE/Facebook/IG | Webhook | Multi-platform chatbot |
+| OpenClaw Agent | Telegram Bot API | Webhook POST | น้องกุ้ง Command Center (admin alerts + commands) |
+| Telegram Bot | OpenClaw Agent | Webhook POST | Boss commands (claim/lead/KB/stats) |
 | GitHub | WordPress (Sync Engine) | Webhook POST | Auto-deploy code changes |
 | WordPress | GD Library (local) | PHP function | Invoice/PO image generation |
 
@@ -1595,6 +1617,15 @@ sequenceDiagram
 | `LIFF_AI_AGENT_URL` | Agent URL (default http://agent:3000) |
 | `LIFF_AI_AGENT_KEY` | Agent API key |
 
+#### Telegram Bot (OpenClaw .env)
+
+| Env Variable | Description |
+|-------------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot API token (@dinoco_alert_bot) |
+| `TELEGRAM_CHAT_ID` | Boss chat_id (security: only this chat_id can send commands) |
+| `TELEGRAM_WEBHOOK_SECRET` | Webhook URL secret path segment |
+| `BASE_URL` | Server base URL for webhook registration |
+
 #### MCP Bridge
 
 | Constant | Description |
@@ -1607,6 +1638,7 @@ sequenceDiagram
 |--------|-------|--------|
 | `define('B2F_DISABLED', true)` | All B2F snippets (0-11) | Disables entire B2F system |
 | `define('DISABLE_WP_CRON', true)` | WordPress Cron | Use external cron trigger instead |
+| Unset `TELEGRAM_BOT_TOKEN` | Telegram Bot (OpenClaw) | Disables น้องกุ้ง + alerts (graceful -- no crash) |
 
 ---
 
