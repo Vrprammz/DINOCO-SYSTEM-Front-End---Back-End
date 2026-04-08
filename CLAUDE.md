@@ -172,6 +172,7 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - **Tools** (11 ตัว): เดิม 8 + เพิ่ม `check_stock_status`, `dinoco_claim_status`, `dinoco_create_claim`. `dinoco_create_claim` platform detect จาก sourceId (ไม่ hardcode facebook อีกต่อไป)
   - **Claim Flow V.3.0**: auto-timeout 24h (เดิม 48h), isClaimIntent strict mode 2 ระดับ (explicit/symptoms+product), "สอบถามสินค้า" ไม่เข้า claim อีกต่อไป
   - **Lead Pipeline**: ทุก status มีทางไป `closed_lost`/`cancelled` แล้ว (เดิมบาง status ไม่มีทางออก)
+  - **Auto-Lead V.6.6**: `ai-chat.js` auto-lead (LINE + Meta) ดึง `productInterest`+`province` จาก conversation history ด้วย `extractLeadContext()`, resolve `dealerId` จาก WP MCP `/dealer-lookup` ด้วย `resolveDealer()`, แล้ว notify dealer ผ่าน `/distributor-notify` + อัพเดท status เป็น `dealer_notified` ด้วย `notifyDealerForAutoLead()`. ถ้าไม่มี dealerId → fallback ส่ง admin group.
   - **Anti-Hallucination V.4.0**: 3 ชั้นป้องกัน + intent pre-check + context-aware supervisor, prompt restructure กฎสำคัญขึ้นบนสุด, conversation history 12 msgs, isClaimIntent strict 2 ระดับ, claim timeout 24h
   - **Security**: requireAuth ทุก API endpoint, prompt injection protection 14 patterns, PII masking, rate limiting
   - **Training Dashboard V.1.0**: หน้า `/dashboard/train` — บอสเทรน AI ผ่าน UI. Agent API `/api/train/*` (test, judge, kb, generate, stats, logs). KB จาก training มี `source: "training_dashboard"`. MongoDB collection `training_logs`.

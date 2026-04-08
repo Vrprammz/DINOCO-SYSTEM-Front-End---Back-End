@@ -1,10 +1,11 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.6.2 — Fix: AI crash on PII messages (sanitize history content, ensure user-first, log error bodies, robust JSON parse)
+ * V.6.6 — Fix: Auto-lead enrichment — extract productInterest+province from conversation, notify dealer via MCP, resolve dealerId
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
 const { cleanForAI } = require("../middleware/auth");
+const { callDinocoAPI } = require("./dinoco-cache");
 
 // Forward declarations — set by init()
 let searchMessages = null;
@@ -872,15 +873,137 @@ async function callDinocoAI(systemPrompt, userMessage, sourceId, contextStr) {
   return "ขอเช็คข้อมูลกับทีมงานก่อนนะคะ รอสักครู่ค่ะ 🙏";
 }
 
+// === V.6.6: Auto-Lead Helpers — extract context + notify dealer ===
+
+// Product regex — ครอบคลุมสินค้า DINOCO ทั้งหมด
+const PRODUCT_REGEX = /(Full\s*Set|กล่อง(?:ข้าง|หลัง)?|แร็ค(?:ข้าง|หลัง)?|แคชบาร์|กันล้ม|การ์ดแฮนด์|กระเป๋า|ถาดรอง|Grand\s*Travel|X\s*Travel|EXPAND|Top\s*Case|Side\s*Case|แร็กท้าย|แร็กหลัง|ตะแกรง|เพลทรอง|สไลเดอร์|การ์ดเครื่อง|หมวก|windshield|บังลม)\s*(?:หลัง|ข้าง|PRO|STD|45L|55L|37L)?/i;
+const MODEL_REGEX = /ADV\s*350|Forza\s*350|NX\s*500|CB\s*500\s*X|XL\s*750|Versys\s*650|CT\s*125|CRF\s*300|Rebel\s*500|X-?ADV\s*750|XMAX|NMAX|Aerox|PCX|Click|Wave|Scoopy|MSX|Monkey|Dax|C125/i;
+const PROVINCE_REGEX = /(กรุงเทพ|กทม|เชียงใหม่|เชียงราย|นครราชสีมา|โคราช|ขอนแก่น|อุดรธานี|อุดร|ภูเก็ต|สงขลา|หาดใหญ่|ชลบุรี|พัทยา|ระยอง|นครปฐม|สมุทรปราการ|สมุทรสาคร|นนทบุรี|ปทุมธานี|เพชรบุรี|ประจวบ|สุราษฎร์|นครศรี|กระบี่|ตรัง|พังงา|ลำปาง|ลำพูน|พิษณุโลก|นครสวรรค์|สุโขทัย|ตาก|แม่ฮ่องสอน|น่าน|แพร่|พะเยา|อุตรดิตถ์|เลย|หนองคาย|สกลนคร|นครพนม|มุกดาหาร|ร้อยเอ็ด|มหาสารคาม|กาฬสินธุ์|อุบลราชธานี|ศรีสะเกษ|สุรินทร์|บุรีรัมย์|ชัยภูมิ|ปราจีนบุรี|สระแก้ว|จันทบุรี|ตราด|กาญจนบุรี|ราชบุรี|สุพรรณบุรี|อยุธยา|สระบุรี|ลพบุรี|นครนายก|สิงห์บุรี|อ่างทอง|ฉะเชิงเทรา|ชุมพร|ระนอง|พัทลุง|สตูล|ยะลา|ปัตตานี|นราธิวาส|รามอินทรา|ลาดพร้าว|บางนา|สุขุมวิท|รังสิต|บางแค|มีนบุรี|หนองจอก)/i;
+
+/**
+ * Extract productInterest + province + model from recent messages
+ * ดึงข้อมูลจากทั้ง user + assistant messages ที่มีอยู่แล้ว ไม่ถามเพิ่ม
+ */
+function extractLeadContext(recentMsgs) {
+  let productInterest = "";
+  let province = "";
+  let model = "";
+
+  // scan ทุก message (ทั้ง user + assistant) เอา context ที่มี
+  for (const msg of recentMsgs) {
+    const content = msg.content || "";
+
+    // ดึง product
+    if (!productInterest) {
+      const pm = content.match(PRODUCT_REGEX);
+      if (pm) productInterest = pm[0].trim();
+    }
+
+    // ดึง model
+    if (!model) {
+      const mm = content.match(MODEL_REGEX);
+      if (mm) model = mm[0].trim();
+    }
+
+    // ดึง province
+    if (!province) {
+      const pvm = content.match(PROVINCE_REGEX);
+      if (pvm) province = pvm[1].trim();
+    }
+  }
+
+  // รวม model + product เป็น productInterest ที่มีความหมาย
+  if (model && productInterest) {
+    productInterest = `${productInterest} ${model}`;
+  } else if (model && !productInterest) {
+    productInterest = `อุปกรณ์ ${model}`;
+  }
+
+  return { productInterest, province };
+}
+
+/**
+ * Resolve dealerId จาก dealerName ผ่าน WP MCP /dealer-lookup
+ * ถ้า province มีให้ใช้ province ค้นหา, ถ้าไม่มีใช้ dealerName
+ */
+async function resolveDealer(dealerName, province) {
+  if (!dealerName && !province) return null;
+  try {
+    const query = province || dealerName;
+    const result = await callDinocoAPI("/dealer-lookup", { location: query });
+    if (typeof result === "string" || !result?.found) return null;
+
+    // dealers อาจเป็น string (formatted) — ลอง parse dealer_id จาก response
+    if (result.dealer_id) return String(result.dealer_id);
+
+    // ถ้า result มี dealers array
+    if (Array.isArray(result.dealers_raw)) {
+      // หา dealer ที่ชื่อตรงกับ dealerName
+      const match = result.dealers_raw.find(d =>
+        (d.name || "").toLowerCase().includes((dealerName || "").toLowerCase()) ||
+        (dealerName || "").toLowerCase().includes((d.name || "").toLowerCase())
+      );
+      if (match?.id) return String(match.id);
+      // fallback ใช้ตัวแรก
+      if (result.dealers_raw[0]?.id) return String(result.dealers_raw[0].id);
+    }
+
+    return null;
+  } catch (e) {
+    console.error("[Lead] resolveDealer error:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Notify dealer (or admin fallback) for auto-created lead
+ * เรียก /distributor-notify → อัพเดท status เป็น dealer_notified
+ */
+async function notifyDealerForAutoLead(leadId, db, { dealerId, dealerName, customerName, productInterest, province, phone, platform }) {
+  try {
+    const notifyPayload = {
+      customer_name: customerName,
+      product_interest: productInterest || "สินค้า DINOCO",
+      province: province || "",
+      phone: phone || "",
+      lead_id: String(leadId),
+      message: `[Auto] ลูกค้าสนใจ: ${productInterest || "สินค้า DINOCO"}${province ? ` จ.${province}` : ""}`,
+      type: "new_lead",
+    };
+
+    if (dealerId) {
+      notifyPayload.distributor_id = dealerId;
+    }
+    // ถ้าไม่มี dealerId → /distributor-notify จะ fallback ส่ง admin group
+
+    const result = await callDinocoAPI("/distributor-notify", notifyPayload);
+    if (typeof result !== "string") {
+      // notify สำเร็จ → อัพเดท status
+      await db.collection("leads").updateOne(
+        { _id: leadId },
+        {
+          $set: { status: "dealer_notified", dealerId: dealerId || null, updatedAt: new Date() },
+          $push: { history: { status: "dealer_notified", at: new Date(), by: "ai_auto" } },
+        }
+      );
+      console.log(`[Lead] Notified ${dealerId ? `dealer ${dealerName}` : "admin group"} for lead ${customerName}`);
+    } else {
+      console.warn(`[Lead] Notify failed for ${customerName}: ${result}`);
+    }
+  } catch (e) {
+    console.error(`[Lead] notifyDealerForAutoLead error:`, e.message);
+  }
+}
+
 // === AI Reply to LINE ===
 async function aiReplyToLine(event, sourceId, userName, text, config) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
 
-  // ★ V.6.5: Auto Lead — ถ้ามีเบอร์ 9-10 หลัก + ข้อความล่าสุดจาก bot มี "แจ้งชื่อ" → สร้าง lead ทันที
+  // ★ V.6.6: Auto Lead — ถ้ามีเบอร์ 9-10 หลัก + ข้อความล่าสุดจาก bot มี "แจ้งชื่อ" → สร้าง lead + notify dealer ทันที
   const phoneMatch = text.match(/(\d{9,10})/);
   if (phoneMatch) {
-    const recentMsgs = await getRecentMessages(sourceId, 5).catch(() => []);
+    const recentMsgs = await getRecentMessages(sourceId, 10).catch(() => []);
     const lastBotMsg = recentMsgs.find(d => d.role === "assistant" && /แจ้งชื่อและเบอร์|ประสานให้ตัวแทน|แจ้งชื่อ.*เบอร์/.test(d.content || ""));
     if (lastBotMsg) {
       const nameMatch = text.replace(/\d+/g, "").replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, "").trim();
@@ -888,20 +1011,34 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
       const dealerMsg = recentMsgs.find(d => d.role === "assistant" && /ร้าน|SHOP|FOX|Garaji|ไอซ์เซอร์วิส/i.test(d.content || ""));
       const dealerNameMatch = (dealerMsg?.content || "").match(/ร้าน\s*([^\s\n:,]+(?:\s+[^\s\n:,]+)?)|([A-Z][A-Z\s]+SHOP)/i);
       const dealerName = dealerNameMatch ? (dealerNameMatch[1] || dealerNameMatch[2] || "").trim() : "";
+
+      // ★ V.6.6: Extract product + province จาก conversation history
+      const { productInterest, province } = extractLeadContext(recentMsgs);
+
+      // ★ V.6.6: Resolve dealerId จาก WP MCP
+      const dealerId = await resolveDealer(dealerName, province);
+
       try {
         const db = await getDB();
         if (db) {
-          await db.collection("leads").insertOne({
+          const insertResult = await db.collection("leads").insertOne({
             sourceId, platform: "line", customerName, phone: phoneMatch[0],
-            productInterest: "", dealerName,
+            productInterest, province, dealerName, dealerId: dealerId || null,
+            lineId: event.source?.userId || null,
             status: "lead_created",
             nextFollowUpAt: new Date(Date.now() + 4 * 3600000),
             nextFollowUpType: "first_check",
             windowExpiresAt: new Date(Date.now() + 86400000),
+            otnToken: null, otnTokenUsed: false, closedAt: null,
             history: [{ status: "lead_created", at: new Date(), by: "ai_auto" }],
             createdAt: new Date(), updatedAt: new Date(),
           });
-          console.log(`[Lead] Auto-created from LINE: ${customerName} ${phoneMatch[0]} → ${dealerName}`);
+          console.log(`[Lead] Auto-created from LINE: ${customerName} ${phoneMatch[0]} → ${dealerName} (product: ${productInterest || "N/A"}, province: ${province || "N/A"})`);
+
+          // ★ V.6.6: Notify dealer (or admin fallback) + update status
+          notifyDealerForAutoLead(insertResult.insertedId, db, {
+            dealerId, dealerName, customerName, productInterest, province, phone: phoneMatch[0], platform: "line",
+          }).catch(e => console.error("[Lead] LINE notify error:", e.message));
         }
       } catch (e) { console.error(`[Lead] Auto-create failed:`, e.message); }
       const replyText = `ขอบคุณค่ะคุณ${customerName} รับข้อมูลแล้วนะคะ แอดมินจะประสานให้${dealerName ? `ร้าน ${dealerName} ` : "ตัวแทน"}ติดต่อกลับเร็วที่สุดค่ะ 😊`;
@@ -1067,11 +1204,11 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
 
-  // ★ V.6.5: Auto Lead — ถ้ามีเบอร์ 9-10 หลัก + ข้อความล่าสุดจาก bot มี "แจ้งชื่อ" → สร้าง lead ทันที
+  // ★ V.6.6: Auto Lead — ถ้ามีเบอร์ 9-10 หลัก + ข้อความล่าสุดจาก bot มี "แจ้งชื่อ" → สร้าง lead + notify dealer ทันที
   const phoneMatch = text.match(/(\d{9,10})/);
   if (phoneMatch) {
     // ดึง recent messages (ไม่ใช่ vector search) เพื่อเช็คข้อความล่าสุดจาก bot
-    const recentMsgs = await getRecentMessages(sourceId, 5).catch(() => []);
+    const recentMsgs = await getRecentMessages(sourceId, 10).catch(() => []);
     const lastBotMsg = recentMsgs.find(d => d.role === "assistant" && /แจ้งชื่อและเบอร์|ประสานให้ตัวแทน|แจ้งชื่อ.*เบอร์/.test(d.content || ""));
     if (lastBotMsg) {
       // แยกชื่อ: ทุกอย่างที่ไม่ใช่ตัวเลข = ชื่อ
@@ -1081,23 +1218,33 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
       const dealerMsg = recentMsgs.find(d => d.role === "assistant" && /ร้าน|SHOP|FOX|Garaji|ไอซ์เซอร์วิส/i.test(d.content || ""));
       const dealerNameMatch = (dealerMsg?.content || "").match(/ร้าน\s*([^\s\n:,]+(?:\s+[^\s\n:,]+)?)|([A-Z][A-Z\s]+SHOP)/i);
       const dealerName = dealerNameMatch ? (dealerNameMatch[1] || dealerNameMatch[2] || "").trim() : "";
-      const productMsg = recentMsgs.find(d => d.role === "assistant" && /Full Set|กล่อง|แร็ค|กันล้ม|Side Case/i.test(d.content || ""));
-      const product = productMsg ? (productMsg.content || "").substring(0, 80) : "";
+
+      // ★ V.6.6: Extract product + province จาก conversation history
+      const { productInterest, province } = extractLeadContext(recentMsgs);
+
+      // ★ V.6.6: Resolve dealerId จาก WP MCP
+      const dealerId = await resolveDealer(dealerName, province);
 
       try {
         const db = await getDB();
         if (db) {
-          await db.collection("leads").insertOne({
+          const insertResult = await db.collection("leads").insertOne({
             sourceId, platform, customerName, phone: phoneMatch[0],
-            productInterest: product, dealerName,
+            productInterest, province, dealerName, dealerId: dealerId || null,
             status: "lead_created",
             nextFollowUpAt: new Date(Date.now() + 4 * 3600000),
             nextFollowUpType: "first_check",
             windowExpiresAt: new Date(Date.now() + 86400000),
+            otnToken: null, otnTokenUsed: false, closedAt: null,
             history: [{ status: "lead_created", at: new Date(), by: "ai_auto" }],
             createdAt: new Date(), updatedAt: new Date(),
           });
-          console.log(`[Lead] Auto-created from ${platform}: ${customerName} ${phoneMatch[0]} → ${dealerName}`);
+          console.log(`[Lead] Auto-created from ${platform}: ${customerName} ${phoneMatch[0]} → ${dealerName} (product: ${productInterest || "N/A"}, province: ${province || "N/A"})`);
+
+          // ★ V.6.6: Notify dealer (or admin fallback) + update status
+          notifyDealerForAutoLead(insertResult.insertedId, db, {
+            dealerId, dealerName, customerName, productInterest, province, phone: phoneMatch[0], platform,
+          }).catch(e => console.error("[Lead] Meta notify error:", e.message));
         }
       } catch (e) { console.error(`[Lead] Auto-create failed:`, e.message); }
 
