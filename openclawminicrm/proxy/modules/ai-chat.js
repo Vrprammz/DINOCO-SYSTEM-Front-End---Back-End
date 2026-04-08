@@ -1223,6 +1223,11 @@ Gemini ตอบ: "${geminiReply}"
       return geminiReply;
     }
 
+    // ★ V.8.1: ถ้า Claude return review/debug text ไม่ใช่คำตอบจริง → ใช้ Gemini เดิม
+    if (/ตรวจสอบแล้ว|พบข้อผิดพลาด|ปัญหา:|คำตอบที่แก้แล้ว|เหตุผล:|วิเคราะห์|ข้อสังเกต|สรุป:|แก้ไข:|---/.test(review)) {
+      console.log(`[${reviewTier}] Review text leaked — fallback to Gemini`);
+      return geminiReply;
+    }
     // Claude แก้ไข → ใช้ข้อความใหม่ (ลบ ? เฉพาะที่ไม่ใช่ URL)
     const revised = review.replace(/\?(?![a-zA-Z_=&])/g, "").trim();
     if (data.usage) {
