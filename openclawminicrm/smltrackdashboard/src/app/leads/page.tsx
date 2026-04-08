@@ -53,10 +53,10 @@ export default function LeadsPage() {
 
   const fetchLeads = useCallback(async () => {
     try {
-      const url = filter === "all" ? "/api/proxy/leads" : `/api/proxy/leads?status=${filter}`;
+      const url = filter === "all" ? "/dashboard/api/proxy/leads" : `/dashboard/api/proxy/leads?status=${filter}`;
       const [leadsRes, attentionRes] = await Promise.all([
         fetch(url),
-        fetch("/api/proxy/leads/needs-attention"),
+        fetch("/dashboard/api/proxy/leads/needs-attention"),
       ]);
       const leadsData = await leadsRes.json();
       const attentionData = await attentionRes.json();
