@@ -17,7 +17,7 @@ interface Dealer {
   ownerName: string;
   phone: string;
   province: string;
-  district: string;
+  address: string;
   lineGroupId: string | null;
   rank: string;
   isWalkin: boolean;
@@ -281,7 +281,7 @@ export default function DealersPage() {
 // === Add Dealer Modal ===
 function AddDealerModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
   const [form, setForm] = useState({
-    name: "", ownerName: "", province: "", district: "", phone: "",
+    name: "", ownerName: "", province: "", address: "", phone: "",
     lineGroupId: "", rank: "Standard", isWalkin: false, coverageAreas: "", notes: "",
   });
   const [saving, setSaving] = useState(false);
@@ -327,7 +327,7 @@ function AddDealerModal({ onClose, onSaved }: { onClose: () => void; onSaved: ()
             <ModalField label="ชื่อร้าน *" value={form.name} onChange={(v) => setForm(f => ({ ...f, name: v }))} />
             <ModalField label="เจ้าของร้าน" value={form.ownerName} onChange={(v) => setForm(f => ({ ...f, ownerName: v }))} />
             <ModalField label="จังหวัด *" value={form.province} onChange={(v) => setForm(f => ({ ...f, province: v }))} />
-            <ModalField label="อำเภอ" value={form.district} onChange={(v) => setForm(f => ({ ...f, district: v }))} />
+            <ModalField label="ที่อยู่ (เช่น 78 ถ.รามอินทรา แขวงท่าแร้ง เขตบางเขน กรุงเทพ 10220)" value={form.address} onChange={(v) => setForm(f => ({ ...f, address: v }))} />
             <ModalField label="เบอร์โทร" value={form.phone} onChange={(v) => setForm(f => ({ ...f, phone: v }))} />
             <ModalField label="LINE Group ID" value={form.lineGroupId} onChange={(v) => setForm(f => ({ ...f, lineGroupId: v }))} />
             <div>

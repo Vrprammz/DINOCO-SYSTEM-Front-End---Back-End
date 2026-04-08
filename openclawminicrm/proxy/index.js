@@ -1320,9 +1320,7 @@ app.post("/api/dealers", requireAuth, express.json(), async (req, res) => {
       ownerName: (req.body.ownerName || "").trim(),
       phone: (req.body.phone || "").trim(),
       province: province.trim(),
-      district: (req.body.district || "").trim(),
       address: (req.body.address || "").trim(),
-      postcode: (req.body.postcode || "").trim(),
       coverageAreas: Array.isArray(req.body.coverageAreas) ? req.body.coverageAreas : (req.body.coverageAreas || "").split(",").map(s => s.trim()).filter(Boolean),
       lineGroupId: (req.body.lineGroupId || "").trim() || null,
       ownerLineUid: (req.body.ownerLineUid || "").trim() || null,
@@ -1351,7 +1349,7 @@ app.patch("/api/dealers/:id", requireAuth, express.json(), async (req, res) => {
     const { ObjectId } = require("mongodb");
     let dealerId;
     try { dealerId = new ObjectId(req.params.id); } catch { return res.status(400).json({ ok: false, error: "Invalid ID" }); }
-    const allowedFields = ["name", "ownerName", "phone", "province", "district", "address", "postcode", "coverageAreas", "lineGroupId", "ownerLineUid", "rank", "isWalkin", "active", "notes"];
+    const allowedFields = ["name", "ownerName", "phone", "province", "address", "coverageAreas", "lineGroupId", "ownerLineUid", "rank", "isWalkin", "active", "notes"];
     const update = { updatedAt: new Date() };
     for (const key of allowedFields) {
       if (req.body[key] !== undefined) {
@@ -1459,9 +1457,7 @@ app.post("/api/dealers/import", requireAuth, express.json(), async (req, res) =>
             $set: dealerDoc,
             $setOnInsert: {
               ownerName: dist.owner_name || "",
-              district: dist.district || "",
-              address: dist.address || "",
-              postcode: dist.postcode || "",
+              address: [dist.address, dist.district, dist.postcode].filter(Boolean).join(" ") || "",
               coverageAreas: [],
               ownerLineUid: dist.owner_line_uid || null,
               notes: "",

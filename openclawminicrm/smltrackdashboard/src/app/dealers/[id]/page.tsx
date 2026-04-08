@@ -11,9 +11,7 @@ interface Dealer {
   ownerName: string;
   phone: string;
   province: string;
-  district: string;
   address: string;
-  postcode: string;
   lineGroupId: string | null;
   ownerLineUid: string | null;
   rank: string;
@@ -115,7 +113,7 @@ export default function DealerDetailPage() {
     if (!dealer) return;
     setEditForm({
       name: dealer.name, ownerName: dealer.ownerName, phone: dealer.phone,
-      province: dealer.province, district: dealer.district, address: dealer.address || "",
+      province: dealer.province, address: dealer.address || "",
       postcode: dealer.postcode || "", lineGroupId: dealer.lineGroupId || "",
       ownerLineUid: dealer.ownerLineUid || "", rank: dealer.rank,
       isWalkin: dealer.isWalkin, coverageAreas: (dealer.coverageAreas || []).join(", "),
@@ -233,7 +231,7 @@ export default function DealerDetailPage() {
                 <EditField label="เจ้าของ" value={editForm.ownerName as string} onChange={(v) => setEditForm(f => ({ ...f, ownerName: v }))} />
                 <EditField label="เบอร์โทร" value={editForm.phone as string} onChange={(v) => setEditForm(f => ({ ...f, phone: v }))} />
                 <EditField label="จังหวัด" value={editForm.province as string} onChange={(v) => setEditForm(f => ({ ...f, province: v }))} />
-                <EditField label="อำเภอ" value={editForm.district as string} onChange={(v) => setEditForm(f => ({ ...f, district: v }))} />
+                <EditField label="ที่อยู่" value={editForm.address as string} onChange={(v) => setEditForm(f => ({ ...f, address: v }))} />
                 <EditField label="ที่อยู่" value={editForm.address as string} onChange={(v) => setEditForm(f => ({ ...f, address: v }))} />
                 <EditField label="รหัสไปรษณีย์" value={editForm.postcode as string} onChange={(v) => setEditForm(f => ({ ...f, postcode: v }))} />
                 <EditField label="LINE Group ID" value={editForm.lineGroupId as string} onChange={(v) => setEditForm(f => ({ ...f, lineGroupId: v }))} />
@@ -266,7 +264,7 @@ export default function DealerDetailPage() {
                 <InfoRow label="เจ้าของ" value={dealer.ownerName || "-"} />
                 <InfoRow label="เบอร์โทร" value={dealer.phone || "-"} />
                 <InfoRow label="จังหวัด" value={dealer.province} />
-                <InfoRow label="อำเภอ" value={dealer.district || "-"} />
+                <InfoRow label="ที่อยู่" value={dealer.address || "-"} />
                 <InfoRow label="ที่อยู่" value={dealer.address || "-"} />
                 <InfoRow label="รหัสไปรษณีย์" value={dealer.postcode || "-"} />
                 <InfoRow label="LINE Group ID" value={dealer.lineGroupId || "ยังไม่ผูก"} />
