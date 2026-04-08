@@ -157,9 +157,38 @@ function buildLeadNotifyFlex(lead) {
     type: "bubble",
     size: "mega",
     styles: {
-      header: { backgroundColor: fallbackAdmin ? "#FFF5F5" : "#FFF7ED" },
+      header: { backgroundColor: "#1A1A1A" },
       footer: { separator: true },
     },
+  };
+
+  // Header — DINOCO CO DEALER (สีดำ + logo + platform badge)
+  bubble.header = {
+    type: "box", layout: "horizontal", paddingAll: "12px",
+    contents: [
+      {
+        type: "image",
+        url: "https://dinoco.in.th/wp-content/uploads/2024/01/dinoco-logo-white.png",
+        size: "xxs", aspectRatio: "1:1", aspectMode: "cover", flex: 0,
+      },
+      {
+        type: "box", layout: "vertical", flex: 4, paddingStart: "10px",
+        contents: [
+          { type: "text", text: "DINOCO CO DEALER", weight: "bold", size: "sm", color: "#FFFFFF" },
+          { type: "text", text: fallbackAdmin ? "Lead (ไม่พบตัวแทน)" : "🔔 Lead ใหม่", weight: "bold", size: "lg", color: fallbackAdmin ? "#FF6B6B" : "#FF6B00" },
+        ],
+      },
+      {
+        type: "box", layout: "vertical", flex: 0,
+        cornerRadius: "4px",
+        backgroundColor: platform === "facebook" ? "#1877F2" : platform === "instagram" ? "#E1306C" : "#06C755",
+        paddingAll: "4px", paddingStart: "8px", paddingEnd: "8px",
+        contents: [
+          { type: "text", text: platformLabel, size: "xs", color: "#FFFFFF", weight: "bold", align: "center" },
+        ],
+      },
+    ],
+    alignItems: "center",
   };
 
   // Hero image (if available)
@@ -172,29 +201,6 @@ function buildLeadNotifyFlex(lead) {
       aspectMode: "cover",
     };
   }
-
-  // Header
-  bubble.header = {
-    type: "box", layout: "vertical",
-    contents: [
-      {
-        type: "box", layout: "horizontal",
-        contents: [
-          { type: "text", text: fallbackAdmin ? "Lead (ไม่พบตัวแทน)" : "Lead ใหม่", weight: "bold", size: "xl", color: fallbackAdmin ? "#E53E3E" : "#FF6B00", flex: 4 },
-          {
-            type: "box", layout: "vertical", flex: 0,
-            cornerRadius: "4px",
-            backgroundColor: platform === "facebook" ? "#1877F2" : platform === "instagram" ? "#E1306C" : "#06C755",
-            paddingAll: "4px", paddingStart: "8px", paddingEnd: "8px",
-            contents: [
-              { type: "text", text: platformLabel, size: "xs", color: "#FFFFFF", weight: "bold", align: "center" },
-            ],
-          },
-        ],
-        alignItems: "center",
-      },
-    ],
-  };
 
   // Body
   const bodyContents = [
