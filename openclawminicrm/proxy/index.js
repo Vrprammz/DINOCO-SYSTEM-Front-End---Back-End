@@ -1426,7 +1426,7 @@ app.post("/api/dealers/import", requireAuth, express.json(), async (req, res) =>
     const db = await getDB();
     if (!db) return res.status(500).json({ ok: false, error: "DB not available" });
     // Fetch from WP MCP Bridge
-    const wpResult = await callDinocoAPI("/distributor-list", {});
+    const wpResult = await callDinocoAPI("/distributor-list", null);
     if (typeof wpResult === "string" || !wpResult) {
       return res.status(502).json({ ok: false, error: "ไม่สามารถเชื่อมต่อ WordPress ได้" });
     }
