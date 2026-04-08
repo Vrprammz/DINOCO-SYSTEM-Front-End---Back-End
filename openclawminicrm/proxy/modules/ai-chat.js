@@ -877,15 +877,16 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
 
-  // ★ V.6.4: Auto Lead — ถ้าเราเพิ่งถามชื่อ+เบอร์ + ลูกค้าตอบด้วยเบอร์โทร → สร้าง lead ทันที
+  // ★ V.6.5: Auto Lead — ถ้ามีเบอร์ 9-10 หลัก + ข้อความล่าสุดจาก bot มี "แจ้งชื่อ" → สร้าง lead ทันที
   const phoneMatch = text.match(/(\d{9,10})/);
   if (phoneMatch) {
-    const lastBotMsg = contextDocs.find(d => d.role === "assistant" && /แจ้งชื่อและเบอร์|ประสานให้ตัวแทน/.test(d.content || ""));
+    const recentMsgs = await getRecentMessages(sourceId, 5).catch(() => []);
+    const lastBotMsg = recentMsgs.find(d => d.role === "assistant" && /แจ้งชื่อและเบอร์|ประสานให้ตัวแทน|แจ้งชื่อ.*เบอร์/.test(d.content || ""));
     if (lastBotMsg) {
-      const nameMatch = text.replace(phoneMatch[0], "").replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, "").trim();
+      const nameMatch = text.replace(/\d+/g, "").replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, "").trim();
       const customerName = nameMatch || userName;
-      const dealerMsg = contextDocs.find(d => d.role === "assistant" && /ร้าน|SHOP|โทร\s*\d{2,3}[-.]\d{3}[-.]\d{4}/i.test(d.content || ""));
-      const dealerNameMatch = (dealerMsg?.content || "").match(/ร้าน\s*([^\s:]+(?:\s+[^\s:]+)?)|([A-Z][A-Z\s]+SHOP)/i);
+      const dealerMsg = recentMsgs.find(d => d.role === "assistant" && /ร้าน|SHOP|FOX|Garaji|ไอซ์เซอร์วิส/i.test(d.content || ""));
+      const dealerNameMatch = (dealerMsg?.content || "").match(/ร้าน\s*([^\s\n:,]+(?:\s+[^\s\n:,]+)?)|([A-Z][A-Z\s]+SHOP)/i);
       const dealerName = dealerNameMatch ? (dealerNameMatch[1] || dealerNameMatch[2] || "").trim() : "";
       try {
         const db = await getDB();
@@ -903,7 +904,7 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
           console.log(`[Lead] Auto-created from LINE: ${customerName} ${phoneMatch[0]} → ${dealerName}`);
         }
       } catch (e) { console.error(`[Lead] Auto-create failed:`, e.message); }
-      const replyText = `ขอบคุณค่ะคุณ${customerName} รับข้อมูลแล้วนะคะ แอดมินจะประสานให้${dealerName ? `ร้าน ${dealerName}` : "ตัวแทน"}ติดต่อกลับเร็วที่สุดค่ะ 😊`;
+      const replyText = `ขอบคุณค่ะคุณ${customerName} รับข้อมูลแล้วนะคะ แอดมินจะประสานให้${dealerName ? `ร้าน ${dealerName} ` : "ตัวแทน"}ติดต่อกลับเร็วที่สุดค่ะ 😊`;
       if (event.replyToken) await replyToLine(event.replyToken, replyText);
       await saveMsg(sourceId, { role: "assistant", userName: config.botName || DEFAULT_BOT_NAME, content: replyText, messageType: "text", isAiReply: true }, "line");
       return;
@@ -1066,24 +1067,27 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
   const startTime = Date.now();
   const contextDocs = await searchMessages(sourceId, text).catch(() => []);
 
-  // ★ V.6.4: Auto Lead — ถ้าเราเพิ่งถามชื่อ+เบอร์ + ลูกค้าตอบด้วยเบอร์โทร → สร้าง lead ทันที ไม่ถาม AI
+  // ★ V.6.5: Auto Lead — ถ้ามีเบอร์ 9-10 หลัก + ข้อความล่าสุดจาก bot มี "แจ้งชื่อ" → สร้าง lead ทันที
   const phoneMatch = text.match(/(\d{9,10})/);
   if (phoneMatch) {
-    const lastBotMsg = contextDocs.find(d => d.role === "assistant" && /แจ้งชื่อและเบอร์|ประสานให้ตัวแทน/.test(d.content || ""));
+    // ดึง recent messages (ไม่ใช่ vector search) เพื่อเช็คข้อความล่าสุดจาก bot
+    const recentMsgs = await getRecentMessages(sourceId, 5).catch(() => []);
+    const lastBotMsg = recentMsgs.find(d => d.role === "assistant" && /แจ้งชื่อและเบอร์|ประสานให้ตัวแทน|แจ้งชื่อ.*เบอร์/.test(d.content || ""));
     if (lastBotMsg) {
-      const nameMatch = text.replace(phoneMatch[0], "").replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, "").trim();
-      const customerName = nameMatch || senderId;
-      // หา dealer จาก context
-      const dealerMsg = contextDocs.find(d => d.role === "assistant" && /ร้าน|SHOP|โทร\s*\d{2,3}[-.]\d{3}[-.]\d{4}/i.test(d.content || ""));
-      const dealerNameMatch = (dealerMsg?.content || "").match(/ร้าน\s*([^\s:]+(?:\s+[^\s:]+)?)|([A-Z][A-Z\s]+SHOP)/i);
+      // แยกชื่อ: ทุกอย่างที่ไม่ใช่ตัวเลข = ชื่อ
+      const nameMatch = text.replace(/\d+/g, "").replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, "").trim();
+      const customerName = nameMatch || "ลูกค้า";
+      // หา dealer จาก recent messages
+      const dealerMsg = recentMsgs.find(d => d.role === "assistant" && /ร้าน|SHOP|FOX|Garaji|ไอซ์เซอร์วิส/i.test(d.content || ""));
+      const dealerNameMatch = (dealerMsg?.content || "").match(/ร้าน\s*([^\s\n:,]+(?:\s+[^\s\n:,]+)?)|([A-Z][A-Z\s]+SHOP)/i);
       const dealerName = dealerNameMatch ? (dealerNameMatch[1] || dealerNameMatch[2] || "").trim() : "";
-      const productMsg = contextDocs.find(d => d.role === "assistant" && /Full Set|กล่อง|แร็ค|กันล้ม|Side Case/i.test(d.content || ""));
+      const productMsg = recentMsgs.find(d => d.role === "assistant" && /Full Set|กล่อง|แร็ค|กันล้ม|Side Case/i.test(d.content || ""));
       const product = productMsg ? (productMsg.content || "").substring(0, 80) : "";
 
       try {
         const db = await getDB();
         if (db) {
-          const leadData = {
+          await db.collection("leads").insertOne({
             sourceId, platform, customerName, phone: phoneMatch[0],
             productInterest: product, dealerName,
             status: "lead_created",
@@ -1092,13 +1096,12 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
             windowExpiresAt: new Date(Date.now() + 86400000),
             history: [{ status: "lead_created", at: new Date(), by: "ai_auto" }],
             createdAt: new Date(), updatedAt: new Date(),
-          };
-          await db.collection("leads").insertOne(leadData);
-          console.log(`[Lead] Auto-created from FB: ${customerName} ${phoneMatch[0]} → ${dealerName}`);
+          });
+          console.log(`[Lead] Auto-created from ${platform}: ${customerName} ${phoneMatch[0]} → ${dealerName}`);
         }
       } catch (e) { console.error(`[Lead] Auto-create failed:`, e.message); }
 
-      const replyText = `ขอบคุณค่ะคุณ${customerName} รับข้อมูลแล้วนะคะ แอดมินจะประสานให้${dealerName ? `ร้าน ${dealerName}` : "ตัวแทน"} ติดต่อกลับเร็วที่สุดค่ะ 😊`;
+      const replyText = `ขอบคุณค่ะคุณ${customerName} รับข้อมูลแล้วนะคะ แอดมินจะประสานให้${dealerName ? `ร้าน ${dealerName} ` : "ตัวแทน"}ติดต่อกลับเร็วที่สุดค่ะ 😊`;
       await sendMetaMessage(senderId, replyText);
       await saveMsg(sourceId, { role: "assistant", userName: DEFAULT_BOT_NAME, content: replyText, messageType: "text", isAiReply: true }, platform);
       console.log(`[AI-Reply] Meta lead-auto in ${Date.now() - startTime}ms`);
