@@ -3,12 +3,12 @@ import { NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 
 const AGENT_URL = process.env.AGENT_URL || "http://agent:3000";
-const AGENT_AUTH = process.env.AGENT_AUTH_TOKEN || process.env.MCP_ERP_API_KEY || "";
+const API_KEY = process.env.API_SECRET_KEY || process.env.MCP_ERP_API_KEY || "";
 
 export async function POST() {
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (AGENT_AUTH) headers["Authorization"] = `Bearer ${AGENT_AUTH}`;
+    if (API_KEY) headers["x-api-key"] = API_KEY;
 
     const res = await fetch(`${AGENT_URL}/api/dealers/import`, {
       method: "POST",
