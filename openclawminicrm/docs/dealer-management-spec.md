@@ -1077,3 +1077,773 @@ USE_MONGODB_DEALERS=true    # false = fallback to WP API (safe rollback)
 ```
 
 ค่า default = `false` (backward compatible). เปิด `true` หลัง import + validate data ครบ.
+
+---
+
+## Appendix D: Full Loop Workflow — Lead Pipeline End-to-End
+
+Version: 1.0 | Date: 2026-04-07
+
+### D.1 Overview
+
+Full Loop Workflow คือ lifecycle ทั้งหมดของ Lead ตั้งแต่ลูกค้าสนใจสินค้าจน post-sale satisfaction check. ระบบทำงานร่วมกัน 5 ส่วน:
+
+1. **AI Chatbot** (LINE/FB/IG) -- สร้าง lead อัตโนมัติเมื่อลูกค้าให้ข้อมูลติดต่อ
+2. **LINE Push** -- ส่ง Flex card แจ้งตัวแทนจำหน่าย
+3. **Mayom Cron** -- cron ทุก 30 นาที ตรวจ follow-up ทุกขั้นตอน
+4. **Telegram น้องกุ้ง** -- แจ้ง admin ทุก event สำคัญ + command center
+5. **AI Dashboard + LIFF** -- admin/dealer ดูสถานะ + update lead
+
+---
+
+### D.2 Status Flow Diagram
+
+#### 17 Statuses (ตาม `LEAD_STATUSES` ใน `lead-pipeline.js`)
+
+```
+lead_created            -- สร้างใหม่ (AI chatbot สร้างอัตโนมัติ)
+dealer_notified         -- แจ้งตัวแทนแล้ว (Flex card ส่งไปกลุ่ม LINE)
+checking_contact        -- Mayom ถามลูกค้าว่าตัวแทนติดต่อแล้วยัง
+dealer_contacted        -- ตัวแทนติดต่อลูกค้าแล้ว
+dealer_no_response      -- ตัวแทนไม่ตอบ 24 ชม.
+waiting_order           -- ลูกค้าสนใจ รอตัดสินใจสั่ง
+order_placed            -- ลูกค้าสั่งซื้อแล้ว
+waiting_delivery        -- รอจัดส่ง
+delivered               -- สินค้าถึงลูกค้าแล้ว
+waiting_install         -- รอติดตั้ง
+installed               -- ติดตั้งเรียบร้อย
+satisfaction_checked    -- ถามความพอใจแล้ว (30 วันหลังติดตั้ง)
+closed_satisfied        -- ปิดสำเร็จ (ลูกค้าพอใจ)
+closed_lost             -- ปิด (ลูกค้าไม่ซื้อ)
+closed_cancelled        -- ปิด (ยกเลิก)
+admin_escalated         -- ส่ง admin จัดการ
+dormant                 -- หยุดติดตาม (ไม่มีกิจกรรม 14 วัน)
+```
+
+#### State Machine Diagram
+
+```
+                          +-----------------+
+                          |  lead_created   |
+                          +--------+--------+
+                                   |
+                          (AI sends LINE Flex card)
+                                   |
+                                   v
+                        +--------------------+
+                        | dealer_notified    |
+                        +--------+-----------+
+                                 |
+                    +------------+------------+
+                    |                         |
+            (4 ชม. Mayom check)       (ตัวแทนไม่ตอบ 24 ชม.)
+                    |                         |
+                    v                         v
+           +------------------+    +---------------------+
+           | checking_contact |    | dealer_no_response  |
+           +--------+---------+    +---------+-----------+
+                    |                        |
+          +---------+---------+     +--------+--------+
+          |                   |     |                 |
+    (ตัวแทนตอบ)         (ไม่ตอบ)  (admin จัดการ)  (ตัวแทนตอบทีหลัง)
+          |                   |     |                 |
+          v                   |     v                 |
+  +-------------------+       |  +------------------+ |
+  | dealer_contacted  |<------+  | admin_escalated  | |
+  +--------+----------+       |  +--------+---------+ |
+           |                  |           |            |
+           |                  +-----------+            |
+           |                              |            |
+     +-----+------+              +-------+-------+    |
+     |            |              |       |       |    |
+     v            v              v       v       v    |
++-------------+ +-----------+ (ติดต่อ) (ยกเลิก) (dormant)
+| waiting_order| |closed_lost|     |
++------+------+ +-----------+     |
+       |                          |
+       v                          |
++-------------+                   |
+| order_placed|<------------------+
++------+------+
+       |
+       v
++------------------+
+| waiting_delivery |
++--------+---------+
+         |
+         v
+  +-----------+
+  | delivered |
+  +-----+-----+
+        |
+        v
+  +------------------+
+  | waiting_install  |
+  +--------+---------+
+           |
+           v
+    +-----------+
+    | installed |
+    +-----+-----+
+          |
+    (30 วันหลังติดตั้ง)
+          |
+          v
+  +-----------------------+
+  | satisfaction_checked  |
+  +-----------+-----------+
+              |
+        +-----+------+
+        |            |
+        v            v
++----------------+ +-----------+
+|closed_satisfied| |closed_lost|
++----------------+ +-----------+
+```
+
+#### Transition Table (ตรงกับ `LEAD_TRANSITIONS` ใน code)
+
+| From | To (valid transitions) |
+|------|----------------------|
+| `lead_created` | `dealer_notified` |
+| `dealer_notified` | `checking_contact`, `dealer_no_response` |
+| `checking_contact` | `dealer_contacted`, `dealer_no_response`, `admin_escalated` |
+| `dealer_contacted` | `waiting_order`, `closed_lost` |
+| `dealer_no_response` | `admin_escalated`, `dealer_contacted` |
+| `waiting_order` | `order_placed`, `closed_lost`, `admin_escalated` |
+| `order_placed` | `waiting_delivery`, `closed_cancelled`, `closed_lost`, `admin_escalated` |
+| `waiting_delivery` | `delivered`, `closed_cancelled`, `closed_lost`, `admin_escalated` |
+| `delivered` | `waiting_install`, `closed_cancelled`, `closed_lost`, `admin_escalated` |
+| `waiting_install` | `installed`, `closed_cancelled`, `closed_lost`, `admin_escalated` |
+| `installed` | `satisfaction_checked`, `closed_cancelled`, `closed_lost`, `admin_escalated` |
+| `satisfaction_checked` | `closed_satisfied`, `closed_lost` |
+| `admin_escalated` | `dealer_contacted`, `closed_cancelled`, `dormant` |
+| `dormant` | `lead_created` (reactivate) |
+
+Terminal states: `closed_satisfied`, `closed_lost`, `closed_cancelled`
+Semi-terminal: `dormant` (สามารถ reactivate ได้)
+
+Note: ทุก status ตั้งแต่ `order_placed` ถึง `installed` สามารถไป `closed_lost`, `closed_cancelled`, `admin_escalated` ได้ทุกจุด เพราะลูกค้าอาจยกเลิกได้ตลอด
+
+---
+
+### D.3 Full Loop Timeline (Step-by-Step)
+
+#### Step 1: Lead Created (T+0)
+
+**Trigger**: AI chatbot detect ว่าลูกค้าสนใจสินค้า + ให้ชื่อ/เบอร์/จังหวัด
+
+**Process**:
+1. AI เรียก `dinoco_create_lead` tool
+2. Tool ค้น MongoDB `dealers` collection (match province + name)
+3. Insert lead ใน `leads` collection:
+   ```javascript
+   {
+     sourceId, platform,
+     customerName, phone, lineId,
+     productInterest, province,
+     dealerId, dealerName,
+     status: "lead_created",
+     windowExpiresAt: T+24h,        // Meta messaging window
+     nextFollowUpAt: T+4h,          // SLA first check
+     nextFollowUpType: "first_check",
+     followUpHistory: [],
+     createdAt: now, updatedAt: now, closedAt: null
+   }
+   ```
+4. Status: `lead_created`
+
+**Data collected**:
+| Field | Source | Required |
+|-------|--------|----------|
+| customerName | ลูกค้าบอก AI | Yes |
+| phone | ลูกค้าบอก AI | Preferred |
+| productInterest | AI detect จากบทสนทนา | Yes |
+| province | ลูกค้าบอก / AI detect | Preferred |
+| lineId | LINE platform auto | LINE only |
+| sourceId | Platform auto | Yes |
+| platform | line / facebook / instagram | Yes |
+| dealerId | MongoDB dealers lookup | Auto-matched |
+| dealerName | MongoDB dealers lookup | Auto-matched |
+
+#### Step 2: Dealer Notification (T+0 ถึง T+5s)
+
+**Trigger**: Lead created สำเร็จ + มี dealer match
+
+**Process**:
+1. Agent สร้าง LINE Flex card (`buildLeadNotifyFlex()`)
+2. ส่ง `sendLinePush(dealer.lineGroupId, [flexMessage])` ตรง (ไม่ผ่าน WP)
+3. Update status: `lead_created` -> `dealer_notified`
+4. Telegram แจ้งน้องกุ้ง (alert type: `new_lead`)
+
+**LINE Flex Card Content** (ส่งไปกลุ่ม LINE ตัวแทน):
+```
++------------------------------------------+
+| Lead ใหม่จาก DINOCO           (สีส้ม)    |
+|                                          |
+| ลูกค้า: คุณสมชาย                         |
+| สนใจ: แคชบาร์ ADV350                    |
+| จังหวัด: เชียงใหม่                        |
+| กรุณาติดต่อลูกค้าภายใน 4 ชม.  (สีแดง)   |
+|                                          |
+| [โทรลูกค้า 081-xxx-xxxx]    (ปุ่มส้ม)    |
+| [รับแล้ว]                    (ปุ่มรอง)    |
++------------------------------------------+
+```
+
+**Fallback scenarios**:
+| Condition | Action |
+|-----------|--------|
+| ไม่พบตัวแทนในจังหวัด | ส่ง admin group แทน + สร้าง alert |
+| ตัวแทนไม่มี lineGroupId | ส่ง admin group + badge "ยังไม่ผูก LINE" |
+| LINE push fail | log error + สร้าง alert + Telegram แจ้งน้องกุ้ง |
+| ตัวแทน active=false | ข้ามไป ค้นตัวแทนอื่นในจังหวัด |
+
+#### Step 3: SLA Timer (T+4h / T+12h / T+24h)
+
+Mayom cron ทำงานทุก 30 นาที scan leads ที่ `nextFollowUpAt <= now`
+
+**SLA Escalation Ladder**:
+
+| Time | Trigger | Action | Status Change | nextFollowUpType |
+|------|---------|--------|---------------|------------------|
+| T+4h | `first_check` | ถามลูกค้าว่า "ตัวแทนติดต่อแล้วยัง?" + แจ้งตัวแทนอีกรอบ | `dealer_notified` -> `checking_contact` | `contact_recheck` |
+| T+28h (4+24) | `contact_recheck` | ตัวแทนยังไม่ตอบ -> insert alert (level: red) + แจ้ง Telegram | `checking_contact` -> `dealer_no_response` | `delivery_check` (dormant delay) |
+| T+5d (post contact) | `delivery_check` | ถามลูกค้า "สินค้ามาถึงแล้วยัง?" | -- | `install_check` |
+| T+7d | `install_check` | ถามลูกค้า "ติดตั้งเรียบร้อยไหม?" | -- | `satisfaction_check` |
+| T+37d (30d post install) | `satisfaction_check` | ถามลูกค้า "ใช้งานเป็นยังไงบ้าง?" | -- | null (end cron) |
+
+**Follow-up message channels** (ตาม `selectFollowUpMethod()`):
+
+| Priority | Condition | Channel |
+|----------|-----------|---------|
+| 1 | Meta window open (< 24h) | FB/IG direct message |
+| 2 | มี lineId | LINE push |
+| 3 | FB + OTN token (unused) | One-Time Notification |
+| 4 | มี phone | SMS (future) |
+| 5 | None | admin_manual (สร้าง alert ให้ admin ติดต่อเอง) |
+
+**Meta 24-hour window constraint**:
+- `windowExpiresAt` set ตอนลูกค้าส่งข้อความล่าสุดบน FB/IG
+- `checkClosingSoonWindows()` scan leads ที่ window จะหมดใน 2 ชม. -> ส่งข้อความขอเบอร์/LINE ID
+- หลัง window หมด -> fallback LINE/SMS/manual
+- `updateMetaWindow(sourceId)` reset window ทุกครั้งที่ลูกค้าส่งข้อความใหม่
+
+#### Step 4: Dealer Accepted (T+0 ถึง T+4h typically)
+
+**Trigger**: ตัวแทนกดปุ่ม "รับแล้ว" ใน LINE Flex card
+
+**Process (LINE Postback)**:
+1. LINE ส่ง postback event `data: "lead_accepted:{leadId}"`
+2. `handleLinePostback()` ใน `index.js` จับ event
+3. Update lead: `status = "dealer_contacted"`, `updatedAt = now`
+4. Reply ตัวแทน: "รับทราบค่ะ! กรุณาติดต่อลูกค้าภายใน 4 ชม. นะคะ"
+
+**Alternative acceptance paths**:
+
+| Path | Trigger | Handler |
+|------|---------|---------|
+| LINE Flex postback | กดปุ่ม "รับแล้ว" | `handleLinePostback()` -> direct MongoDB update |
+| LIFF AI Dashboard | ตัวแทนเปิด Lead detail -> กด "รับงาน" | `POST /liff-ai/v1/lead/{id}/accept` |
+| Admin Dashboard | Admin เปลี่ยน status dropdown | `POST /api/leads/:id/status` body: `{ status: "dealer_contacted" }` |
+| Telegram น้องกุ้ง | admin พิมพ์ command | (future: `lead รับ {id}`) |
+
+**Post-acceptance actions**:
+- Mayom cron `nextFollowUpType` ถูกเลื่อนไปเป็น `delivery_check` (T+5 days)
+- Telegram alert: "ตัวแทน {dealerName} รับ lead {customerName} แล้ว"
+- Dashboard alert level เปลี่ยนจาก yellow เป็น green
+
+#### Step 5: Follow-up (Mayom Cron)
+
+Mayom (`มะยม`) = cron daemon ทำงานทุก 30 นาที (`startMayomCron()` -> `setInterval 30*60*1000`)
+
+**Follow-up schedule ตาม `processFollowUp()`**:
+
+```
+T+4h    first_check
+  |     ถามลูกค้า: "ตัวแทนติดต่อแล้วยัง?"
+  |     แจ้งตัวแทน: "ติดต่อลูกค้า XXX แล้วหรือยัง?"
+  |     Status -> checking_contact
+  |
+T+28h   contact_recheck
+  |     ถ้า status ยัง checking_contact -> dealer_no_response
+  |     Insert alert (type: lead_no_response, level: red)
+  |     Telegram แจ้ง admin
+  |     nextFollowUp -> delivery_check (5 วัน)
+  |
+T+5d    delivery_check (หลังตัวแทนรับงาน)
+  |     ถามลูกค้า: "สินค้ามาถึงแล้วยัง?"
+  |     nextFollowUp -> install_check (2 วัน)
+  |
+T+7d    install_check
+  |     ถามลูกค้า: "ติดตั้งเรียบร้อยไหม?"
+  |     nextFollowUp -> satisfaction_check (30 วัน)
+  |
+T+37d   satisfaction_check
+  |     ถามลูกค้า: "ใช้งานมา 1 เดือน เป็นยังไงบ้าง?"
+  |     nextFollowUp -> null (end cron loop)
+  |
+T+14d   dormant_cleanup (separate cron)
+        ถ้าไม่มี activity 14 วัน + status ไม่ใช่ terminal/active-commerce
+        -> status = dormant, dormantReason = "no_activity_14d"
+
+T+90d   PII purge (separate cron)
+        closed leads > 90 วัน -> ลบ customerName/phone/lineId (PDPA compliance)
+```
+
+#### Step 6: Post-Contact Statuses
+
+เมื่อตัวแทนติดต่อลูกค้าแล้ว (`dealer_contacted`) lead จะไหลผ่าน statuses เหล่านี้:
+
+| Status | Meaning | Who Updates | How |
+|--------|---------|-------------|-----|
+| `waiting_order` | ลูกค้าสนใจ รอตัดสินใจ | Dealer (LIFF) / Admin | LIFF status dropdown / Dashboard |
+| `order_placed` | ลูกค้าสั่งซื้อแล้ว | Dealer / Admin | Manual update |
+| `waiting_delivery` | รอจัดส่ง/ตัวแทนเตรียมของ | Dealer / Admin | Manual update |
+| `delivered` | สินค้าถึงลูกค้าแล้ว | Dealer / Admin / Mayom (confirm) | Manual or Mayom delivery_check |
+| `waiting_install` | รอช่างติดตั้ง | Dealer / Admin | Manual update |
+| `installed` | ติดตั้งเรียบร้อย | Dealer / Admin / Mayom (confirm) | Manual or Mayom install_check |
+
+**Dealer LIFF interaction** (ผ่าน LIFF AI Command Center `/ai-center/`):
+- Dealer เปิด LIFF -> auth ผ่าน LINE ID Token -> JWT
+- หน้า Dealer Dashboard: list leads ที่ assign ให้ตัวเอง
+- กดเข้า Lead detail -> เห็นข้อมูลลูกค้า + ปุ่ม update status
+- กด "อัพเดทสถานะ" -> เลือก status ใหม่ -> `POST /liff-ai/v1/lead/{id}/status`
+- เพิ่ม note ได้ -> `POST /liff-ai/v1/lead/{id}/note`
+
+#### Step 7: Close (Terminal States)
+
+| Terminal | Trigger | Data Collected | Post-Action |
+|----------|---------|---------------|-------------|
+| `closed_satisfied` | ลูกค้า rate 4-5 stars / ตัวแทน confirm | satisfaction_score, closedAt | SLA report + Telegram summary |
+| `closed_lost` | ลูกค้าไม่ซื้อ / ไม่สนใจ | lost_reason, closedAt | ถาม reason ("ราคาแพง" / "เลือกแบรนด์อื่น" / "ยังไม่พร้อม") |
+| `closed_cancelled` | ยกเลิก (admin/system) | cancel_reason, closedAt | Telegram แจ้ง admin |
+
+**Lost reasons tracking** (เก็บใน `followUpHistory` entry):
+```javascript
+{
+  from: "waiting_order",
+  to: "closed_lost",
+  at: Date,
+  lost_reason: "ราคาแพงไป",     // ข้อมูลจาก dealer/admin
+  competitor: "Givi",            // optional: แบรนด์คู่แข่ง
+  closedBy: "dealer"             // "dealer" | "admin" | "system"
+}
+```
+
+#### Step 8: Post-Sale (Satisfaction + SLA Reporting)
+
+**Satisfaction flow** (triggered by `satisfaction_check` cron at T+37d):
+1. Mayom ส่งข้อความถามลูกค้า: "ใช้สินค้ามา 1 เดือน เป็นยังไงบ้าง?"
+2. AI chatbot รับ response + classify sentiment
+3. ถ้า positive -> `installed` -> `satisfaction_checked` -> `closed_satisfied`
+4. ถ้า negative -> `satisfaction_checked` -> ส่ง alert admin + Telegram
+5. ถ้าลูกค้าไม่ตอบ -> Mayom ไม่มี next follow-up -> eventually dormant cleanup (14 days)
+
+**SLA Report** (weekly cron `dealer-sla-weekly`):
+1. Aggregate leads per dealer (7 วันล่าสุด)
+2. Calculate metrics:
+   - `contactRate` = contacted / totalLeads
+   - `satisfactionRate` = satisfied / closed
+   - `noResponse` count
+3. Insert `dealer_sla_reports` collection
+4. Alert ถ้ามี bad dealers (noResponse > 0)
+5. Telegram weekly summary
+
+---
+
+### D.4 Notification Matrix
+
+#### Per-Step Notification Table
+
+| Step | Event | LINE (ตัวแทน) | LINE (ลูกค้า) | FB/IG (ลูกค้า) | Telegram (admin) | Dashboard Alert |
+|------|-------|---------------|---------------|----------------|-------------------|-----------------|
+| 1 | Lead created | -- | -- | -- | new_lead alert | New lead row |
+| 2 | Dealer notified | Flex card (lead info + call + accept buttons) | -- | -- | "Lead ใหม่ -> {dealer}" | Status update |
+| 3a | 4h SLA check | "ติดต่อลูกค้าแล้วยัง?" (via MCP notify) | -- | "ตัวแทนติดต่อแล้วยัง?" (if window open) | -- | -- |
+| 3b | 24h no response | -- | -- | -- | "ตัวแทน {name} ไม่ตอบ 24 ชม." (RED) | Red alert badge |
+| 3c | Meta window closing | -- | -- | "มีอะไรสงสัยทักมาได้เลย" / "ขอเบอร์โทรได้ไหม" | -- | -- |
+| 4 | Dealer accepted | Reply "รับทราบ!" | -- | -- | "{dealer} รับ lead แล้ว" | Status green |
+| 5a | Delivery check (5d) | -- | "สินค้ามาถึงแล้วยัง?" (LINE) | -- | -- | -- |
+| 5b | Install check (7d) | -- | "ติดตั้งเรียบร้อยไหม?" (LINE) | -- | -- | -- |
+| 5c | Satisfaction (37d) | -- | "ใช้งานเป็นยังไงบ้าง?" (LINE) | -- | -- | -- |
+| 6 | Status update | -- | -- | -- | Summary (if notable) | Status badge change |
+| 7a | Closed won | -- | "ขอบคุณที่เลือก DINOCO" (future) | -- | "ปิดการขายสำเร็จ" | Green closed |
+| 7b | Closed lost | -- | -- | -- | "Lead หลุด: {reason}" | Gray closed |
+| 8 | Weekly SLA | -- | -- | -- | Full SLA report per dealer | SLA page update |
+
+#### Notification Channel Priority
+
+```
+ลูกค้า:
+  1. FB/IG direct (ถ้า window open < 24h)
+  2. LINE push (ถ้ามี lineId)
+  3. OTN (Facebook One-Time Notification, ถ้ามี token)
+  4. SMS (future)
+  5. admin_manual (สร้าง alert)
+
+ตัวแทน:
+  1. LINE push ไปกลุ่มตัวแทน (lineGroupId)
+  2. LINE push ไปเจ้าของร้าน (ownerLineUid) — fallback
+  3. Admin group (fallback สุดท้าย)
+
+Admin:
+  1. Telegram น้องกุ้ง (real-time)
+  2. Dashboard alerts collection (persistent)
+  3. Weekly SLA email/summary (future)
+```
+
+---
+
+### D.5 Cron Schedule
+
+#### Mayom Cron (`startMayomCron()` -- every 30 minutes)
+
+| Cron Type | Interval | Description | Status Change | Limit/batch |
+|-----------|----------|-------------|---------------|-------------|
+| `first-check` | 30 min scan | Lead ที่ครบ 4 ชม. แต่ยังไม่มี contact | `dealer_notified` -> `checking_contact` | 20 leads/batch |
+| `contact-recheck` | 30 min scan | Lead ที่ครบ 24 ชม. หลัง first-check | `checking_contact` -> `dealer_no_response` | 20 leads/batch |
+| `delivery-check` | 30 min scan | Lead ที่ตัวแทนรับแล้ว 5 วัน | No auto-change (ถามลูกค้า) | 20 leads/batch |
+| `install-check` | 30 min scan | Lead ที่ delivery 2 วัน | No auto-change (ถามลูกค้า) | 20 leads/batch |
+| `30day-check` | 30 min scan | Lead ที่ installed 30 วัน | No auto-change (ถามลูกค้า) | 50 leads/batch |
+| `closing-soon` | 30 min scan | Meta window หมดใน 2 ชม. | No change (ส่งข้อความขอข้อมูลติดต่อ) | 10 leads/batch |
+| `dormant-cleanup` | Manual / scheduled | ไม่มี activity 14 วัน | -> `dormant` | Batch update |
+| `dealer-sla-weekly` | Manual / weekly | Aggregate SLA per dealer | No change (report only) | All dealers |
+
+#### Cron Execution Detail
+
+```javascript
+// ทุก 30 นาที scan leads ที่ nextFollowUpAt <= now
+mayomFollowUpCron():
+  1. Query: { nextFollowUpAt: { $lte: now }, closedAt: null, status not terminal }
+  2. Limit 20 per batch (prevent overload)
+  3. For each lead -> processFollowUp(lead) ตาม nextFollowUpType
+  4. Update nextFollowUpAt + nextFollowUpType สำหรับรอบถัดไป
+
+// Manual trigger via API (Admin Dashboard):
+POST /api/leads/cron/:type
+  Types: first-check, contact-recheck, delivery-check, install-check,
+         30day-check, dormant-cleanup, closing-soon, dealer-sla-weekly
+```
+
+#### Follow-Up Type Chain
+
+```
+first_check (T+4h)
+  -> contact_recheck (T+4h+24h = T+28h)
+    -> delivery_check (T+28h+5d)
+      -> install_check (T+28h+5d+2d)
+        -> satisfaction_check (T+28h+5d+2d+30d)
+          -> null (end)
+```
+
+Note: ถ้าตัวแทนกด "รับแล้ว" ก่อน first_check fire ระบบยังไม่มี auto-skip (TODO Phase 2: ถ้า status เลย checking_contact ไปแล้ว ให้ skip contact_recheck)
+
+---
+
+### D.6 Telegram Integration (น้องกุ้ง)
+
+#### Lead-Related Commands (`telegram-gung.js`)
+
+| Command | Intent | Description |
+|---------|--------|-------------|
+| `lead วันนี้` | `lead_today` | สรุป leads ที่สร้างวันนี้ (จำนวน + top leads) |
+| `lead รอ` / `lead รอติดต่อ` | `lead_pending` | list leads ที่ status = dealer_notified / dealer_no_response |
+| `ตัวแทน {query}` | `dealer_search` | ค้นหาตัวแทน + แสดง lead stats |
+
+#### Auto-Alert Events (Telegram -> Admin)
+
+| Event | Alert Type | Level | Message Format |
+|-------|-----------|-------|----------------|
+| Lead created | `new_lead` | info | "Lead ใหม่: {customer} สนใจ {product} จ.{province} -> {dealer}" |
+| Dealer no response (24h) | `lead_no_response` | red | "ตัวแทน {dealer} ไม่ตอบ 24 ชม. -- lead {customer} สนใจ {product}" |
+| Admin escalated | `lead_escalated` | red | "Lead escalated: {customer} -- ต้องจัดการด่วน" |
+| Closed won | `lead_closed_won` | green | "ปิดการขายสำเร็จ: {customer} ซื้อ {product} จาก {dealer}" |
+| Closed lost | `lead_closed_lost` | yellow | "Lead หลุด: {customer} -- เหตุผล: {reason}" |
+| Weekly SLA | `dealer_sla_weekly` | yellow | Full report: dealers + contactRate + noResponse count |
+
+#### Reply Flow (Telegram -> Customer)
+
+Admin สามารถตอบลูกค้าตรงจาก Telegram:
+1. น้องกุ้งส่ง alert มา (เช่น "ตัวแทนไม่ตอบ")
+2. Admin reply ข้อความที่ alert message
+3. `handleAlertReply()` -> ส่งข้อความกลับลูกค้าผ่าน LINE/FB/IG
+4. Auto-save ใน `messages` collection + `knowledge_base` (ถ้าเป็น ai_confused)
+
+---
+
+### D.7 Dashboard Views
+
+#### 7.1 Lead Pipeline Page (`/dashboard/leads`)
+
+**Existing views** (already implemented):
+- **List view**: table ของ leads ทั้งหมด + status badges
+- **Kanban view**: columns ตาม PIPELINE_STAGES (11 stages)
+- **Stats cards**: Active leads / ต้องจัดการ / ปิดสำเร็จ / ปิดทั้งหมด
+- **Needs attention**: filter leads ที่ status = `dealer_no_response` / `admin_escalated` / `dormant`
+
+**Status badge colors** (ตาม `STATUS_LABELS` ใน leads page):
+
+| Status | Label | Color | Icon |
+|--------|-------|-------|------|
+| lead_created | สร้างใหม่ | blue | New |
+| dealer_notified | แจ้งตัวแทนแล้ว | yellow | Sent |
+| checking_contact | รอติดต่อ | orange | Phone |
+| dealer_contacted | ติดต่อแล้ว | green | Check |
+| dealer_no_response | ตัวแทนไม่ตอบ | red | Alert |
+| waiting_order | รอสั่งซื้อ | purple | Cart |
+| order_placed | สั่งแล้ว | emerald | Package |
+| waiting_delivery | รอจัดส่ง | cyan | Truck |
+| delivered | ส่งแล้ว | teal | Mailbox |
+| waiting_install | รอติดตั้ง | indigo | Wrench |
+| installed | ติดตั้งแล้ว | lime | Sparkle |
+| satisfaction_checked | ถามความพอใจแล้ว | pink | Chat |
+| closed_satisfied | ปิด (พอใจ) | green-600 | Smile |
+| closed_lost | ปิด (หาย) | gray-500 | Sleep |
+| closed_cancelled | ปิด (ยกเลิก) | gray-600 | Cross |
+| admin_escalated | ส่ง Admin | red-600 | Red circle |
+| dormant | หยุดติดตาม | gray-700 | Sleep |
+
+#### 7.2 Dealer Detail -> Lead History Tab
+
+(Spec อยู่ใน Section 5.2 ด้านบน)
+
+Per-dealer view ของ leads ที่ assign ให้ร้านนั้น:
+- Table: ลูกค้า / สินค้า / สถานะ / วันที่
+- Filter by status
+- Click lead -> expand detail
+
+#### 7.3 SLA Dashboard (`/dashboard/dealer-sla`)
+
+**Existing page** with weekly SLA report:
+- Contact rate per dealer
+- No-response count
+- Grade: A (>= 90% contact + 80% satisfaction) / B (>= 70%+60%) / C (>= 50%) / D (< 50%)
+- Trend chart (week-over-week)
+
+#### 7.4 Conversion Funnel (New -- recommended for Phase 4)
+
+Dashboard widget showing conversion at each stage:
+```
+lead_created (100%)
+  -> dealer_notified (95%)
+    -> dealer_contacted (78%)
+      -> waiting_order (60%)
+        -> order_placed (35%)
+          -> delivered (30%)
+            -> installed (28%)
+              -> closed_satisfied (25%)
+```
+
+---
+
+### D.8 SLA Scoring
+
+#### Metrics Calculated (weekly cron `dealer-sla-weekly`)
+
+| Metric | Formula | Description |
+|--------|---------|-------------|
+| `totalLeads` | COUNT(leads WHERE createdAt >= 7 days ago AND dealerId = X) | จำนวน leads ทั้งหมดใน 7 วัน |
+| `contacted` | COUNT(leads WHERE status IN [dealer_contacted, waiting_order, order_placed, waiting_delivery, delivered, installed, closed_satisfied]) | leads ที่ตัวแทนติดต่อแล้ว |
+| `noResponse` | COUNT(leads WHERE status = dealer_no_response) | leads ที่ตัวแทนไม่ตอบ |
+| `closed` | COUNT(leads WHERE status IN [closed_satisfied, closed_lost, closed_cancelled]) | leads ที่ปิดแล้ว |
+| `satisfied` | COUNT(leads WHERE status = closed_satisfied) | leads ที่ปิดสำเร็จ (ลูกค้าพอใจ) |
+| `contactRate` | contacted / totalLeads | อัตราการติดต่อ |
+| `satisfactionRate` | satisfied / closed | อัตราความพอใจ |
+
+#### Grade Calculation
+
+| Grade | Contact Rate | Satisfaction Rate | Description |
+|-------|-------------|-------------------|-------------|
+| A | >= 90% | >= 80% | ยอดเยี่ยม |
+| B | >= 70% | >= 60% | ดี |
+| C | >= 50% | any | ปานกลาง -- ต้องปรับปรุง |
+| D | < 50% | any | แย่ -- ต้อง escalate |
+
+#### SLA Time Benchmarks
+
+| Metric | Target | Red Flag |
+|--------|--------|----------|
+| First contact (ตัวแทนติดต่อลูกค้าครั้งแรก) | < 4 ชม. | > 24 ชม. |
+| Lead to order (สนใจจนสั่งซื้อ) | < 7 วัน | > 14 วัน |
+| Order to delivery | < 3 วัน | > 7 วัน |
+| Full cycle (lead to closed_satisfied) | < 45 วัน | > 90 วัน |
+
+#### SLA Data Storage
+
+```javascript
+// Collection: dealer_sla_reports
+{
+  weekOf: Date,                    // วันที่สร้าง report
+  report: [
+    {
+      _id: dealerId,               // ObjectId (MongoDB dealer)
+      dealerName: "Garaji Moto",
+      totalLeads: 12,
+      contacted: 10,
+      noResponse: 1,
+      closed: 8,
+      satisfied: 7,
+      contactRate: 0.83,
+      satisfactionRate: 0.875,
+    },
+    ...
+  ],
+  createdAt: Date,
+}
+```
+
+---
+
+### D.9 LIFF AI (Dealer Interaction)
+
+Dealer โต้ตอบกับ Lead Pipeline ผ่าน LIFF AI Command Center (`[liff_ai_page]` shortcode, route `/ai-center/`)
+
+#### Dealer Capabilities
+
+| Action | Endpoint | Description |
+|--------|----------|-------------|
+| ดู leads ของตัวเอง | `GET /liff-ai/v1/dealer-dashboard` | List leads WHERE dealerId = this dealer |
+| ดู lead detail | `GET /liff-ai/v1/lead/{id}` | ข้อมูลลูกค้า + product + status history |
+| รับงาน | `POST /liff-ai/v1/lead/{id}/accept` | Status -> dealer_contacted |
+| เพิ่ม note | `POST /liff-ai/v1/lead/{id}/note` | บันทึกหมายเหตุ (เช่น "ลูกค้านัดดูของวันศุกร์") |
+| เปลี่ยน status | `POST /liff-ai/v1/lead/{id}/status` | Update status (validated by FSM transitions) |
+
+#### Dealer Auth Flow
+
+```
+Dealer กดลิงก์ LIFF ใน LINE Flex card
+  -> LIFF SDK init
+  -> Get LINE ID Token
+  -> POST /liff-ai/v1/auth { idToken }
+  -> Server verify ID Token with LINE API
+  -> Lookup distributor CPT by owner_line_uid OR WP user meta linked_distributor_id
+  -> Issue JWT (X-LIFF-AI-Token)
+  -> Dealer LIFF pages ใช้ JWT header ทุก request
+```
+
+#### Dealer LIFF Pages (Frontend V.3.1 -- Snippet 2 DB_ID 1174)
+
+| Page | Route | Description |
+|------|-------|-------------|
+| Dealer Dashboard | `/ai-center/` (dealer role) | List leads + stats |
+| Lead Detail | `/ai-center/lead/{id}` | ข้อมูล + timeline + actions |
+| Agent Chat | `/ai-center/agent` | ถาม AI (Phase 3) |
+
+#### LINE Flex Interaction Points
+
+| Flex Button | Postback Data | Handler |
+|-------------|--------------|---------|
+| "รับแล้ว" | `lead_accepted:{leadId}` | `handleLinePostback()` -> direct update |
+| "โทรลูกค้า" | URI action `tel:{phone}` | Native phone call |
+
+---
+
+### D.10 Edge Cases & Error Handling
+
+| Scenario | Current Handling | Note |
+|----------|-----------------|------|
+| ลูกค้าให้เบอร์ผิด | ตัวแทนโทรไม่ติด -> update note -> admin จัดการ | Future: phone validation |
+| ลูกค้าเปลี่ยนใจกลางทาง | Dealer/Admin update -> closed_lost + reason | ทุก status มี path ไป closed_lost |
+| ตัวแทนถูก deactivate ระหว่าง lead active | Lead ยังอ้างอิง dealer เดิม (soft delete) | Admin ต้อง reassign manually |
+| Lead ซ้ำ (ลูกค้าคนเดียวกัน) | ปัจจุบันสร้าง lead ใหม่ทุกครั้ง | TODO: dedup by phone/lineId within 7 days |
+| Meta window หมด ก่อน first_check | Fallback LINE/SMS/manual | `selectFollowUpMethod()` handle |
+| Mayom crash / restart | cron scan by `nextFollowUpAt <= now` -> catch up automatically | Idempotent design |
+| LINE push quota exceeded | Error logged + alert created | Bot plan: 500 push/month (free) or unlimited (paid) |
+| ตัวแทนหลายคนในจังหวัดเดียว | AI เลือก best match (name proximity/rank) | Return array -> AI pick |
+| ลูกค้าคุยกลับมาหลัง dormant | `dormant` -> `lead_created` (reactivate) | Meta window may be expired |
+
+---
+
+### D.11 Data Retention & Privacy (PDPA)
+
+| Data | Retention | After Expiry |
+|------|-----------|-------------|
+| Active leads | Indefinite | -- |
+| Closed leads (customerName, phone, lineId) | 90 days after closedAt | PII purged (`[ลบแล้ว]`) |
+| followUpHistory | 90 days after closedAt | Kept (anonymized -- no PII in history entries) |
+| dealer_sla_reports | 1 year | Archive to cold storage (future) |
+| telegram_alerts | 90 days | Auto-delete (future) |
+
+PII purge runs in `dormant-cleanup` cron:
+```javascript
+const retentionCutoff = new Date(now - 90 * 24 * 60 * 60 * 1000);
+await db.collection("leads").updateMany(
+  { closedAt: { $lt: retentionCutoff } },
+  { $set: { customerName: "[ลบแล้ว]", phone: null, lineId: null, otnToken: null, purgedAt: now } }
+);
+```
+
+---
+
+### D.12 Implementation Gaps (Current Code vs Full Spec)
+
+สิ่งที่มีอยู่แล้วใน code vs สิ่งที่ต้องเพิ่ม:
+
+| Feature | Status | Location | Note |
+|---------|--------|----------|------|
+| 17 statuses + transitions | Implemented | `lead-pipeline.js` | Complete |
+| createLead() | Implemented | `lead-pipeline.js` | Sets nextFollowUpAt T+4h |
+| notifyDealer() | Implemented (WP) | `lead-pipeline.js` | TODO: switch to direct LINE (Phase 2) |
+| Mayom cron (30 min) | Implemented | `lead-pipeline.js` `startMayomCron()` | All 5 follow-up types working |
+| processFollowUp() | Implemented | `lead-pipeline.js` | 5 types: first_check, contact_recheck, delivery_check, install_check, satisfaction_check |
+| selectFollowUpMethod() | Implemented | `lead-pipeline.js` | Priority: fb_ig > line > otn > sms > manual |
+| Meta window tracking | Implemented | `lead-pipeline.js` | updateMetaWindow() + checkClosingSoonWindows() |
+| LINE postback "รับแล้ว" | Implemented | `index.js` handleLinePostback() | Directly updates MongoDB |
+| runLeadCronByType() | Implemented | `lead-pipeline.js` | 8 cron types including dormant-cleanup + SLA weekly |
+| Dormant cleanup (14d) | Implemented | `lead-pipeline.js` dormant-cleanup | PII purge 90d included |
+| SLA weekly report | Implemented | `lead-pipeline.js` dealer-sla-weekly | Aggregate + alert bad dealers |
+| Dashboard leads page | Implemented | `smltrackdashboard` leads/page.tsx | List + Kanban + Stats |
+| Telegram lead commands | Implemented | `telegram-gung.js` | lead_today, lead_pending, dealer_search |
+| Telegram auto-alerts for lead_no_response | Implemented | `lead-pipeline.js` contact_recheck -> alerts collection | Alert type: lead_no_response, level: red |
+| --- | --- | --- | --- |
+| Telegram alert for new lead | NOT YET | `telegram-alert.js` | Need new alert type: new_lead |
+| Telegram alert for closed_won | NOT YET | -- | Need hook in updateLeadStatus() |
+| Telegram alert for closed_lost | NOT YET | -- | Need hook in updateLeadStatus() |
+| Telegram alert for admin_escalated | NOT YET | -- | Need hook in updateLeadStatus() |
+| Direct LINE Flex notification (no WP) | NOT YET | `lead-pipeline.js` notifyDealer() | Spec in dealer-management Phase 2 |
+| LIFF AI lead accept endpoint | NOT YET | WP `[liff_ai_page]` Snippet 1 | REST endpoint exists but may need MongoDB dealer lookup |
+| LIFF dealer status update | PARTIAL | WP `liff-ai/v1/lead/{id}/status` | Exists but needs FSM validation |
+| Lost reason collection | NOT YET | -- | Need metadata field in updateLeadStatus() |
+| Satisfaction score (1-5) | NOT YET | -- | Need field on lead + collection flow |
+| Conversion funnel dashboard | NOT YET | -- | Dashboard widget |
+| Lead dedup (same customer) | NOT YET | -- | Match by phone/lineId within 7 days |
+| Skip follow-up when status advanced | NOT YET | processFollowUp() | Contact_recheck should skip if already dealer_contacted |
+| avgResponseHours calculation | NOT YET | SLA aggregation | Need timestamp diff between dealer_notified and dealer_contacted |
+
+---
+
+### D.13 Recommended Implementation Priority
+
+#### Priority 1: Telegram Alerts for Key Events (1 day)
+- Hook `updateLeadStatus()` to send Telegram alerts for: new_lead, closed_won, closed_lost, admin_escalated
+- Critical for admin visibility across the full loop
+
+#### Priority 2: Direct LINE Notification (2 days)
+- Switch `notifyDealer()` from WP API to direct `sendLinePush()`
+- Eliminates WP dependency + reduces latency from 2-10s to <500ms
+- (Already specced in Phase 2 above)
+
+#### Priority 3: Lost Reason Collection (0.5 day)
+- Add `lost_reason` metadata to `updateLeadStatus()` when transitioning to `closed_lost`
+- Dashboard dropdown for common reasons + free text
+- Important for business intelligence
+
+#### Priority 4: Follow-Up Skip Logic (0.5 day)
+- In `processFollowUp()`, check if lead status has already advanced past the follow-up type
+- Example: if lead is `waiting_order`, skip `contact_recheck` and move to `delivery_check`
+- Prevents sending irrelevant messages
+
+#### Priority 5: Satisfaction Score (1 day)
+- Add `satisfactionScore` field (1-5) on lead
+- AI chatbot can parse customer response to satisfaction_check message
+- Dashboard shows average satisfaction per dealer
+
+#### Priority 6: Conversion Funnel Widget (1 day)
+- New dashboard component showing drop-off at each pipeline stage
+- Helps identify bottleneck (e.g., 60% -> 35% at waiting_order = pricing issue?)
+
+#### Priority 7: Lead Dedup (1 day)
+- Before createLead(), check if open lead exists with same phone/lineId within 7 days
+- If exists, update existing lead instead of creating duplicate
+- Prevents dealer confusion from multiple leads for same customer
