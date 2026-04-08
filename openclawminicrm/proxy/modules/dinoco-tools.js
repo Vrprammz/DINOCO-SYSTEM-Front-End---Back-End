@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.4.0 — Dealer Management: dinoco_dealer_lookup + dinoco_create_lead use MongoDB dealers + notifyDealerDirect
+ * V.5.0 — Lead Flex with product image/price: dinoco_dealer_lookup + dinoco_create_lead use MongoDB dealers + notifyDealerDirect
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -172,6 +172,8 @@ const AGENT_TOOLS = [
           dealer_id: { type: "string", description: "ID ตัวแทน (จาก dealer-lookup)" },
           customer_name: { type: "string", description: "ชื่อลูกค้า (ถ้ารู้)" },
           phone: { type: "string", description: "เบอร์โทรลูกค้า (ถ้าให้มา)" },
+          image_url: { type: "string", description: "URL รูปสินค้า (จาก product lookup ก่อนหน้า)" },
+          price: { type: "number", description: "ราคาสินค้า (จาก product lookup ก่อนหน้า)" },
         },
         required: ["product_interest", "dealer_name"],
       },
@@ -674,6 +676,8 @@ async function executeTool(toolName, args, sourceId) {
       productInterest: args.product_interest || "",
       province: args.province || "",
       phone: args.phone || null,
+      imageUrl: args.image_url || null,
+      price: args.price || null,
       lineId: null,
       dealerId, dealerName,
       status: "lead_created",

@@ -1,9 +1,39 @@
 /**
  * lead-pipeline.js — Lead statuses, transitions, CRUD, Mayom follow-up cron, Flex builders, dealer notify
- * V.2.0 — Dealer Management: new statuses, history field, Flex builders, notifyDealerDirect, lookupDealerByProvince
+ * V.3.0 — Lead Notification Flex with hero image, product name, price + lookupProductForLead helper
  */
 const { getDB, DEFAULT_BOT_NAME, auditLog } = require("./shared");
-const { callDinocoAPI } = require("./dinoco-cache");
+const { callDinocoAPI, wpCache } = require("./dinoco-cache");
+
+/**
+ * Lookup product image/price from cached catalog by productInterest string
+ * Returns { imageUrl, price, productName } or nulls
+ */
+function lookupProductForLead(productInterest) {
+  if (!productInterest) return { imageUrl: null, price: null, productName: null };
+  const catalog = wpCache?.catalog?.data || wpCache?.catalog?.stale;
+  if (!catalog?.products || catalog.products.length === 0) return { imageUrl: null, price: null, productName: null };
+  const query = productInterest.toLowerCase();
+  const terms = query.split(/[\s,+]+/).filter(t => t.length > 2);
+  let best = null;
+  let bestScore = 0;
+  for (const p of catalog.products) {
+    const name = (p.name || "").toLowerCase();
+    const sku = (p.sku || "").toLowerCase();
+    let score = 0;
+    for (const term of terms) {
+      if (name.includes(term)) score++;
+      if (sku.includes(term)) score++;
+    }
+    if (score > bestScore) { best = p; bestScore = score; }
+  }
+  if (!best || bestScore === 0) return { imageUrl: null, price: null, productName: null };
+  return {
+    imageUrl: best.img_url || null,
+    price: best.price || null,
+    productName: best.name || null,
+  };
+}
 
 // Forward declarations
 let sendLinePush = null;
@@ -101,44 +131,146 @@ async function updateLeadStatus(leadId, newStatus, metadata = {}) {
 // === Flex Builders for LINE Push ===
 
 function buildLeadNotifyFlex(lead) {
-  const { customerName, productInterest, province, phone, _id, fallbackAdmin } = lead;
+  const { customerName, productInterest, province, phone, _id, fallbackAdmin, platform } = lead;
   const leadId = String(_id);
-  return {
-    type: "flex",
-    altText: `Lead ${fallbackAdmin ? "(fallback)" : "ใหม่"}: ${customerName} สนใจ ${productInterest || "สินค้า DINOCO"}`,
-    contents: {
-      type: "bubble",
-      header: {
-        type: "box", layout: "vertical",
+
+  // Resolve product image/price — from lead fields or catalog lookup
+  let imageUrl = lead.imageUrl || null;
+  let price = lead.price || null;
+  let productName = lead.productName || productInterest || "สินค้า DINOCO";
+  if (!imageUrl || !price) {
+    const lookup = lookupProductForLead(productInterest);
+    if (!imageUrl && lookup.imageUrl) imageUrl = lookup.imageUrl;
+    if (!price && lookup.price) price = lookup.price;
+    if (lookup.productName && (!lead.productName)) productName = lookup.productName;
+  }
+
+  // Platform icon
+  const platformIcons = { facebook: "FB", line: "LINE", instagram: "IG" };
+  const platformLabel = platformIcons[platform] || (platform || "").toUpperCase() || "CHAT";
+
+  // Price display
+  const priceText = price ? `฿${Number(price).toLocaleString()}` : "สอบถามราคา";
+
+  // Build bubble
+  const bubble = {
+    type: "bubble",
+    size: "mega",
+    styles: {
+      header: { backgroundColor: fallbackAdmin ? "#FFF5F5" : "#FFF7ED" },
+      footer: { separator: true },
+    },
+  };
+
+  // Hero image (if available)
+  if (imageUrl) {
+    bubble.hero = {
+      type: "image",
+      url: imageUrl,
+      size: "full",
+      aspectRatio: "20:13",
+      aspectMode: "cover",
+    };
+  }
+
+  // Header
+  bubble.header = {
+    type: "box", layout: "vertical",
+    contents: [
+      {
+        type: "box", layout: "horizontal",
         contents: [
-          { type: "text", text: fallbackAdmin ? "Lead (ไม่พบกลุ่มตัวแทน)" : "Lead ใหม่จาก DINOCO", weight: "bold", size: "lg", color: fallbackAdmin ? "#E53E3E" : "#FF6B00" },
-        ],
-      },
-      body: {
-        type: "box", layout: "vertical", spacing: "md",
-        contents: [
-          { type: "text", text: `ลูกค้า: ${customerName || "-"}`, size: "md" },
-          { type: "text", text: `สนใจ: ${productInterest || "สินค้า DINOCO"}`, size: "md", color: "#1A3A5C" },
-          { type: "text", text: `จังหวัด: ${province || "-"}`, size: "sm", color: "#666666" },
-          { type: "text", text: "กรุณาติดต่อลูกค้าภายใน 4 ชม.", size: "sm", color: "#FF0000", weight: "bold" },
-        ],
-      },
-      footer: {
-        type: "box", layout: "vertical", spacing: "sm",
-        contents: [
-          ...(phone ? [{
-            type: "button",
-            action: { type: "uri", label: `โทรลูกค้า ${phone}`, uri: `tel:${phone}` },
-            style: "primary", color: "#FF6B00", height: "sm",
-          }] : []),
+          { type: "text", text: fallbackAdmin ? "Lead (ไม่พบตัวแทน)" : "Lead ใหม่", weight: "bold", size: "xl", color: fallbackAdmin ? "#E53E3E" : "#FF6B00", flex: 4 },
           {
-            type: "button",
-            action: { type: "postback", label: "รับแล้ว", data: `lead_accepted:${leadId}` },
-            style: "secondary", height: "sm",
+            type: "box", layout: "vertical", flex: 0,
+            cornerRadius: "4px",
+            backgroundColor: platform === "facebook" ? "#1877F2" : platform === "instagram" ? "#E1306C" : "#06C755",
+            paddingAll: "4px", paddingStart: "8px", paddingEnd: "8px",
+            contents: [
+              { type: "text", text: platformLabel, size: "xs", color: "#FFFFFF", weight: "bold", align: "center" },
+            ],
           },
         ],
+        alignItems: "center",
       },
+    ],
+  };
+
+  // Body
+  const bodyContents = [
+    // Product name — full, no truncate
+    { type: "text", text: productName, size: "md", weight: "bold", color: "#1A3A5C", wrap: true },
+    // Price
+    { type: "text", text: priceText, size: "lg", weight: "bold", color: "#FF6B00", margin: "sm" },
+    // Separator
+    { type: "separator", margin: "lg" },
+    // Customer info section
+    {
+      type: "box", layout: "vertical", spacing: "sm", margin: "lg",
+      contents: [
+        {
+          type: "box", layout: "horizontal",
+          contents: [
+            { type: "text", text: "ลูกค้า", size: "sm", color: "#999999", flex: 2 },
+            { type: "text", text: customerName || "-", size: "sm", weight: "bold", flex: 5 },
+          ],
+        },
+        {
+          type: "box", layout: "horizontal",
+          contents: [
+            { type: "text", text: "เบอร์โทร", size: "sm", color: "#999999", flex: 2 },
+            { type: "text", text: phone || "-", size: "sm", weight: "bold", flex: 5 },
+          ],
+        },
+        {
+          type: "box", layout: "horizontal",
+          contents: [
+            { type: "text", text: "จังหวัด", size: "sm", color: "#999999", flex: 2 },
+            { type: "text", text: province || "-", size: "sm", flex: 5 },
+          ],
+        },
+      ],
     },
+    // Urgency
+    {
+      type: "box", layout: "horizontal", margin: "lg",
+      cornerRadius: "4px", backgroundColor: "#FFF5F5", paddingAll: "8px",
+      contents: [
+        { type: "text", text: "กรุณาติดต่อลูกค้าภายใน 4 ชม.", size: "sm", color: "#E53E3E", weight: "bold", align: "center", flex: 0 },
+      ],
+      justifyContent: "center",
+    },
+  ];
+
+  bubble.body = {
+    type: "box", layout: "vertical", spacing: "md", paddingAll: "16px",
+    contents: bodyContents,
+  };
+
+  // Footer — action buttons
+  const footerContents = [];
+  if (phone) {
+    footerContents.push({
+      type: "button",
+      action: { type: "uri", label: `โทรลูกค้า ${phone}`, uri: `tel:${phone}` },
+      style: "primary", color: "#FF6B00", height: "sm",
+    });
+  }
+  footerContents.push({
+    type: "button",
+    action: { type: "postback", label: "รับแล้ว ✓", data: `lead_accepted:${leadId}` },
+    style: "secondary", height: "sm",
+  });
+
+  bubble.footer = {
+    type: "box", layout: "vertical", spacing: "sm", paddingAll: "12px",
+    contents: footerContents,
+  };
+
+  return {
+    type: "flex",
+    altText: `Lead ${fallbackAdmin ? "(fallback)" : "ใหม่"}: ${customerName} สนใจ ${productName}`,
+    contents: bubble,
   };
 }
 
@@ -679,6 +811,7 @@ module.exports = {
   notifyDealerDirect,
   lookupDealerByProvince,
   buildLeadNotifyFlex,
+  lookupProductForLead,
   buildFollowUpFlex,
   buildStockBackFlex,
   buildDealerReminderFlex,

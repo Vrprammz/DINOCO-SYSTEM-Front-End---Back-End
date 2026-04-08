@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.7.0 — Dealer Management: resolveDealer MongoDB first, notifyDealerForAutoLead direct LINE push, USE_MONGODB_DEALERS feature flag
+ * V.8.0 — Lead Flex with product image/price enrichment: resolveDealer MongoDB first, notifyDealerForAutoLead direct LINE push, USE_MONGODB_DEALERS feature flag
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -1061,9 +1061,13 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
       try {
         const db = await getDB();
         if (db) {
+          // Enrich with product image/price from catalog
+          const { lookupProductForLead } = require("./lead-pipeline");
+          const productData = lookupProductForLead(productInterest);
           const insertResult = await db.collection("leads").insertOne({
             sourceId, platform: "line", customerName, phone: phoneMatch[0],
             productInterest, province, dealerName: resolvedDealerName, dealerId: dealerId || null,
+            imageUrl: productData.imageUrl, price: productData.price, productName: productData.productName,
             lineId: event.source?.userId || null,
             status: "lead_created",
             nextFollowUpAt: new Date(Date.now() + 4 * 3600000),
@@ -1271,9 +1275,13 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
       try {
         const db = await getDB();
         if (db) {
+          // Enrich with product image/price from catalog
+          const { lookupProductForLead: lookupProduct2 } = require("./lead-pipeline");
+          const productData2 = lookupProduct2(productInterest);
           const insertResult = await db.collection("leads").insertOne({
             sourceId, platform, customerName, phone: phoneMatch[0],
             productInterest, province, dealerName: resolvedDealerName, dealerId: dealerId || null,
+            imageUrl: productData2.imageUrl, price: productData2.price, productName: productData2.productName,
             status: "lead_created",
             nextFollowUpAt: new Date(Date.now() + 4 * 3600000),
             nextFollowUpType: "first_check",
