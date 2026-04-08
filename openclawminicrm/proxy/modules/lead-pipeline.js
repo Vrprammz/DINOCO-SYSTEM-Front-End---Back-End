@@ -1,6 +1,6 @@
 /**
- * lead-pipeline.js — Lead statuses, transitions, CRUD, Mayom follow-up cron
- * V.1.2 — Fix: ลบคำว่า "พี่" ออกจาก follow-up messages ทั้งหมด, ใช้ "ลูกค้า" แทน
+ * lead-pipeline.js — Lead statuses, transitions, CRUD, Mayom follow-up cron, Flex builders, dealer notify
+ * V.2.0 — Dealer Management: new statuses, history field, Flex builders, notifyDealerDirect, lookupDealerByProvince
  */
 const { getDB, DEFAULT_BOT_NAME, auditLog } = require("./shared");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -23,16 +23,21 @@ const LEAD_STATUSES = [
   "waiting_delivery", "delivered",
   "waiting_install", "installed",
   "satisfaction_checked",
+  "waiting_decision",          // ลูกค้ากำลังคิด
+  "waiting_stock",             // รอสต็อกกลับมา (เก็บ waitingSKU)
   "closed_satisfied", "closed_lost", "closed_cancelled",
+  "closed_won",                // ลูกค้าสั่งแล้ว ปิดสำเร็จ (short-track)
   "admin_escalated", "dormant",
 ];
 
 const LEAD_TRANSITIONS = {
   lead_created: ["dealer_notified"],
-  dealer_notified: ["checking_contact", "dealer_no_response"],
+  dealer_notified: ["checking_contact", "dealer_no_response", "dealer_contacted"],
   checking_contact: ["dealer_contacted", "dealer_no_response", "admin_escalated"],
-  dealer_contacted: ["waiting_order", "closed_lost"],
+  dealer_contacted: ["waiting_order", "waiting_decision", "waiting_stock", "closed_won", "closed_lost"],
   dealer_no_response: ["admin_escalated", "dealer_contacted"],
+  waiting_decision: ["closed_won", "closed_lost", "closed_cancelled", "admin_escalated"],
+  waiting_stock: ["dealer_notified", "closed_lost", "closed_cancelled"],
   waiting_order: ["order_placed", "closed_lost", "admin_escalated"],
   order_placed: ["waiting_delivery", "closed_cancelled", "closed_lost", "admin_escalated"],
   waiting_delivery: ["delivered", "closed_cancelled", "closed_lost", "admin_escalated"],
@@ -65,7 +70,7 @@ async function createLead({ sourceId, platform, customerName, productInterest, p
     otnToken: null, otnTokenUsed: false,
     nextFollowUpAt: new Date(Date.now() + 4 * 60 * 60 * 1000),
     nextFollowUpType: "first_check",
-    followUpHistory: [],
+    history: [{ status: "lead_created", at: new Date(), by: "system" }],
     createdAt: new Date(), updatedAt: new Date(), closedAt: null,
   };
   const result = await db.collection("leads").insertOne(lead);
@@ -85,7 +90,7 @@ async function updateLeadStatus(leadId, newStatus, metadata = {}) {
   }
   const update = {
     $set: { status: newStatus, updatedAt: new Date(), ...metadata },
-    $push: { followUpHistory: { from: lead.status, to: newStatus, at: new Date(), ...metadata } },
+    $push: { history: { from: lead.status, to: newStatus, status: newStatus, at: new Date(), ...metadata } },
   };
   if (newStatus.startsWith("closed_")) update.$set.closedAt = new Date();
   await db.collection("leads").updateOne({ _id: leadId }, update);
@@ -93,8 +98,269 @@ async function updateLeadStatus(leadId, newStatus, metadata = {}) {
   return true;
 }
 
+// === Flex Builders for LINE Push ===
+
+function buildLeadNotifyFlex(lead) {
+  const { customerName, productInterest, province, phone, _id, fallbackAdmin } = lead;
+  const leadId = String(_id);
+  return {
+    type: "flex",
+    altText: `Lead ${fallbackAdmin ? "(fallback)" : "ใหม่"}: ${customerName} สนใจ ${productInterest || "สินค้า DINOCO"}`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical",
+        contents: [
+          { type: "text", text: fallbackAdmin ? "Lead (ไม่พบกลุ่มตัวแทน)" : "Lead ใหม่จาก DINOCO", weight: "bold", size: "lg", color: fallbackAdmin ? "#E53E3E" : "#FF6B00" },
+        ],
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "md",
+        contents: [
+          { type: "text", text: `ลูกค้า: ${customerName || "-"}`, size: "md" },
+          { type: "text", text: `สนใจ: ${productInterest || "สินค้า DINOCO"}`, size: "md", color: "#1A3A5C" },
+          { type: "text", text: `จังหวัด: ${province || "-"}`, size: "sm", color: "#666666" },
+          { type: "text", text: "กรุณาติดต่อลูกค้าภายใน 4 ชม.", size: "sm", color: "#FF0000", weight: "bold" },
+        ],
+      },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [
+          ...(phone ? [{
+            type: "button",
+            action: { type: "uri", label: `โทรลูกค้า ${phone}`, uri: `tel:${phone}` },
+            style: "primary", color: "#FF6B00", height: "sm",
+          }] : []),
+          {
+            type: "button",
+            action: { type: "postback", label: "รับแล้ว", data: `lead_accepted:${leadId}` },
+            style: "secondary", height: "sm",
+          },
+        ],
+      },
+    },
+  };
+}
+
+function buildFollowUpFlex(lead) {
+  const dealer = lead.dealerName || "ตัวแทนจำหน่าย";
+  const product = lead.productInterest || "สินค้า DINOCO";
+  return {
+    type: "flex",
+    altText: `ติดตามลูกค้า: ${lead.customerName}`,
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical", spacing: "md",
+        contents: [
+          { type: "text", text: "ติดตามลูกค้า", weight: "bold", size: "lg", color: "#FF6B00" },
+          { type: "text", text: `ร้าน ${dealer} ติดต่อเรื่อง ${product} แล้วหรือยังคะ?`, size: "sm", wrap: true },
+        ],
+      },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [
+          { type: "button", action: { type: "postback", label: "ติดต่อแล้ว", data: `followup_contacted:${String(lead._id)}` }, style: "primary", color: "#38A169", height: "sm" },
+          { type: "button", action: { type: "postback", label: "ยังไม่ได้ติดต่อ", data: `followup_not_yet:${String(lead._id)}` }, style: "secondary", height: "sm" },
+        ],
+      },
+    },
+  };
+}
+
+function buildStockBackFlex(lead, dealer, sku) {
+  return {
+    type: "flex",
+    altText: `สต็อกกลับมา: ${sku || "สินค้า"}`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical",
+        contents: [
+          { type: "text", text: "สต็อกกลับมาแล้ว!", weight: "bold", size: "lg", color: "#38A169" },
+        ],
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "md",
+        contents: [
+          { type: "text", text: `สินค้า ${sku || lead.productInterest || "-"} กลับมาแล้ว`, size: "md" },
+          { type: "text", text: `ลูกค้า: ${lead.customerName || "-"}`, size: "sm" },
+          { type: "text", text: `เบอร์: ${lead.phone || "-"}`, size: "sm", color: "#666666" },
+          { type: "text", text: "กรุณาติดต่อลูกค้าเพื่อยืนยันออเดอร์", size: "sm", color: "#FF0000", weight: "bold" },
+        ],
+      },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [
+          ...(lead.phone ? [{
+            type: "button",
+            action: { type: "uri", label: `โทรลูกค้า ${lead.phone}`, uri: `tel:${lead.phone}` },
+            style: "primary", color: "#FF6B00", height: "sm",
+          }] : []),
+          {
+            type: "button",
+            action: { type: "postback", label: "รับแล้ว", data: `lead_accepted:${String(lead._id)}` },
+            style: "secondary", height: "sm",
+          },
+        ],
+      },
+    },
+  };
+}
+
+function buildDealerReminderFlex(lead, dealer) {
+  return {
+    type: "flex",
+    altText: `เตือน: ยังไม่ติดต่อลูกค้า ${lead.customerName}`,
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical", spacing: "md",
+        contents: [
+          { type: "text", text: "เตือน: ยังไม่ติดต่อลูกค้า", weight: "bold", size: "lg", color: "#E53E3E" },
+          { type: "text", text: `ลูกค้า ${lead.customerName} สนใจ ${lead.productInterest || "สินค้า DINOCO"}`, size: "sm", wrap: true },
+          { type: "text", text: `จังหวัด: ${lead.province || "-"}`, size: "sm", color: "#666666" },
+          { type: "text", text: "กรุณาติดต่อโดยเร็ว", size: "sm", color: "#FF0000", weight: "bold" },
+        ],
+      },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [
+          ...(lead.phone ? [{
+            type: "button",
+            action: { type: "uri", label: `โทรลูกค้า ${lead.phone}`, uri: `tel:${lead.phone}` },
+            style: "primary", color: "#E53E3E", height: "sm",
+          }] : []),
+        ],
+      },
+    },
+  };
+}
+
+function buildClosedFlex(lead) {
+  const isSatisfied = lead.status === "closed_satisfied" || lead.status === "closed_won";
+  return {
+    type: "flex",
+    altText: `ปิดเคส: ${lead.customerName}`,
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical", spacing: "md",
+        contents: [
+          { type: "text", text: isSatisfied ? "ปิดเคสสำเร็จ" : "ปิดเคส", weight: "bold", size: "lg", color: isSatisfied ? "#38A169" : "#718096" },
+          { type: "text", text: `ลูกค้า: ${lead.customerName || "-"}`, size: "sm" },
+          { type: "text", text: `สินค้า: ${lead.productInterest || "-"}`, size: "sm" },
+          { type: "text", text: `สถานะ: ${lead.status}`, size: "sm", color: "#666666" },
+        ],
+      },
+    },
+  };
+}
+
+// === Dealer Lookup from MongoDB ===
+
+async function lookupDealerByProvince(province, name) {
+  const db = await getDB();
+  if (!db) return [];
+  const filter = { active: true };
+  const orConditions = [];
+  if (province) {
+    const prov = province.replace(/จ\.|จังหวัด/g, "").trim();
+    orConditions.push(
+      { province: { $regex: prov, $options: "i" } },
+      { coverageAreas: { $regex: prov, $options: "i" } }
+    );
+  }
+  if (name) {
+    orConditions.push(
+      { name: { $regex: name, $options: "i" } }
+    );
+  }
+  if (orConditions.length > 0) {
+    filter.$or = orConditions;
+  }
+  try {
+    const dealers = await db.collection("dealers").find(filter).limit(10).toArray();
+    return dealers;
+  } catch (e) {
+    console.error("[Dealer] lookupDealerByProvince error:", e.message);
+    return [];
+  }
+}
+
+// === Centralized Dealer Notification (Direct LINE Push) ===
+
+async function notifyDealerDirect(lead, dealer) {
+  // dealer not found or no lineGroupId → fallback admin group
+  if (!dealer?.lineGroupId) {
+    const adminGroupId = process.env.B2B_ADMIN_GROUP_ID;
+    if (adminGroupId && sendLinePush) {
+      const flex = buildLeadNotifyFlex({ ...lead, fallbackAdmin: true });
+      await sendLinePush(adminGroupId, [flex]).catch(e => console.error("[Lead] Admin fallback push error:", e.message));
+    }
+    // create alert for missing LINE group
+    const db = await getDB();
+    if (db) {
+      await db.collection("alerts").insertOne({
+        type: "dealer_no_line_group",
+        sourceId: lead.sourceId,
+        customerName: lead.customerName,
+        message: `ตัวแทน ${dealer?.name || lead.dealerName || "ไม่ระบุ"} ไม่มี LINE Group ID — ส่ง admin group แทน`,
+        level: "yellow", read: false, createdAt: new Date(),
+      });
+    }
+    console.warn(`[Lead] Dealer ${dealer?.name || "unknown"} has no lineGroupId, fallback to admin`);
+    return false;
+  }
+
+  if (!sendLinePush) {
+    console.error("[Lead] sendLinePush not initialized");
+    return false;
+  }
+
+  const flex = buildLeadNotifyFlex(lead);
+  try {
+    await sendLinePush(dealer.lineGroupId, [flex]);
+    await updateLeadStatus(lead._id, "dealer_notified", { by: "system" });
+    console.log(`[Lead] Notified dealer: ${dealer.name} (group: ${dealer.lineGroupId})`);
+    return true;
+  } catch (e) {
+    console.error(`[Lead] LINE push to dealer ${dealer.name} failed:`, e.message);
+    // fallback to admin group on push failure
+    const adminGroupId = process.env.B2B_ADMIN_GROUP_ID;
+    if (adminGroupId) {
+      await sendLinePush(adminGroupId, [buildLeadNotifyFlex({ ...lead, fallbackAdmin: true })]).catch(() => {});
+    }
+    const db = await getDB();
+    if (db) {
+      await db.collection("alerts").insertOne({
+        type: "dealer_line_push_fail",
+        sourceId: lead.sourceId,
+        customerName: lead.customerName,
+        message: `LINE push ไปกลุ่ม ${dealer.name} (${dealer.lineGroupId}) ล้มเหลว: ${e.message}`,
+        level: "red", read: false, createdAt: new Date(),
+      });
+    }
+    return false;
+  }
+}
+
+// Legacy wrapper — kept for backward compat
 async function notifyDealer(lead) {
   if (!lead.dealerId) return;
+  // Try MongoDB dealer first
+  const useMongoDB = process.env.USE_MONGODB_DEALERS === "true";
+  if (useMongoDB) {
+    const dealers = await lookupDealerByProvince(lead.province, lead.dealerName);
+    const dealer = dealers[0] || null;
+    if (dealer) {
+      lead.dealerId = String(dealer._id);
+      lead.dealerName = dealer.name;
+    }
+    await notifyDealerDirect(lead, dealer);
+    return;
+  }
+  // Fallback to WP API
   const result = await callDinocoAPI("/distributor-notify", {
     distributor_id: lead.dealerId, customer_name: lead.customerName,
     product_interest: lead.productInterest, province: lead.province,
@@ -295,7 +561,17 @@ async function ensureLeadIndexes() {
     await kbSugg.createIndex({ frequency: -1, lastAskedAt: -1 });
     await kbSugg.createIndex({ status: 1, frequency: -1 });
     await db.collection("dealer_sla_reports").createIndex({ weekOf: -1 });
-    console.log("[DB] Lead + KB + SLA indexes created");
+    // Dealers indexes
+    await db.collection("dealers").createIndex({ province: 1, active: 1 });
+    await db.collection("dealers").createIndex({ wp_id: 1 }, { unique: true, sparse: true });
+    await db.collection("dealers").createIndex({ lineGroupId: 1 });
+    await db.collection("dealers").createIndex({ active: 1, rank: 1 });
+    await db.collection("dealers").createIndex({ ownerLineUid: 1 });
+    await db.collection("dealers").createIndex(
+      { name: "text", province: "text", coverageAreas: "text" },
+      { name: "dealers_text_search" }
+    );
+    console.log("[DB] Lead + KB + SLA + Dealers indexes created");
   } catch (e) { console.error("[DB] Lead index error:", e.message); }
 }
 
@@ -400,6 +676,13 @@ module.exports = {
   createLead,
   updateLeadStatus,
   notifyDealer,
+  notifyDealerDirect,
+  lookupDealerByProvince,
+  buildLeadNotifyFlex,
+  buildFollowUpFlex,
+  buildStockBackFlex,
+  buildDealerReminderFlex,
+  buildClosedFlex,
   selectFollowUpMethod,
   updateMetaWindow,
   checkClosingSoonWindows,

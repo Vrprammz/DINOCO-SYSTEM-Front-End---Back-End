@@ -35,6 +35,10 @@ export async function getDB(): Promise<Db> {
       db.collection("documents").createIndex({ status: 1, createdAt: -1 }),
       db.collection("appointments").createIndex({ date: 1, status: 1 }),
       db.collection("appointments").createIndex({ staffNames: 1, date: 1 }),
+      // Dealers indexes
+      db.collection("dealers").createIndex({ province: 1, active: 1 }),
+      db.collection("dealers").createIndex({ wp_id: 1 }, { unique: true, sparse: true }),
+      db.collection("dealers").createIndex({ active: 1, rank: 1 }),
     ]);
     console.log("[MongoDB] Indexes ensured");
   } catch (e) {

@@ -54,7 +54,8 @@ const { CLAIM_KEYWORDS, isClaimIntent, analyzeClaimPhoto, getClaimSession,
 } = claimFlow;
 
 const leadPipeline = require("./modules/lead-pipeline");
-const { LEAD_STATUSES, createLead, updateLeadStatus, notifyDealer,
+const { LEAD_STATUSES, createLead, updateLeadStatus, notifyDealer, notifyDealerDirect,
+  lookupDealerByProvince, buildLeadNotifyFlex,
   selectFollowUpMethod, updateMetaWindow, checkClosingSoonWindows, isMetaWindowOpen,
   startMayomCron, ensureLeadIndexes, runLeadCronByType,
 } = leadPipeline;
@@ -935,13 +936,16 @@ async function handleLinePostback(event, sourceId) {
   const data = event.postback?.data || "";
   const db = await getDB(); if (!db) return;
   if (data.startsWith("lead_accepted:")) {
-    const leadId = data.replace("lead_accepted:", "");
-    // ★ V.1.4: แปลง string → ObjectId (MongoDB _id เป็น ObjectId)
+    // ★ V.2.0: ใช้ updateLeadStatus() ผ่าน FSM validation แทน direct updateOne
     const { ObjectId } = require("mongodb");
-    let leadQuery;
-    try { leadQuery = { _id: new ObjectId(leadId) }; } catch { leadQuery = { _id: leadId }; }
-    await db.collection("leads").updateOne(leadQuery, { $set: { status: "dealer_contacted", updatedAt: new Date() } });
-    await replyToLine(event.replyToken, "รับทราบค่ะ! กรุณาติดต่อลูกค้าภายใน 4 ชม. นะคะ 🙏");
+    let leadId;
+    try { leadId = new ObjectId(data.replace("lead_accepted:", "")); } catch { leadId = data.replace("lead_accepted:", ""); }
+    const success = await updateLeadStatus(leadId, "dealer_contacted", { by: "dealer_postback" });
+    if (success) {
+      await replyToLine(event.replyToken, "รับทราบค่ะ! กรุณาติดต่อลูกค้าภายใน 4 ชม. นะคะ");
+    } else {
+      await replyToLine(event.replyToken, "สถานะ lead อัพเดทแล้ว ขอบคุณค่ะ");
+    }
     return;
   }
   if (data === "dealer_call_back") await replyToLine(event.replyToken, "ได้ค่ะ! จะแจ้งตัวแทนให้โทรกลับนะคะ 📞");
@@ -1203,8 +1207,286 @@ app.get("/api/leads/needs-attention", requireAuth, async (req, res) => { const d
 app.get("/api/leads/:id", requireAuth, async (req, res) => { const db = await getDB(); const { ObjectId } = require("mongodb"); const lead = await db.collection("leads").findOne({ _id: new ObjectId(req.params.id) }); if (!lead) return res.status(404).json({ error: "Not found" }); res.json(lead); });
 app.post("/api/leads", requireAuth, express.json(), async (req, res) => { const lead = await createLead(req.body); if (!lead) return res.status(500).json({ error: "Failed" }); if (lead.dealerId) notifyDealer(lead).catch(() => {}); res.json({ success: true, lead }); });
 app.post("/api/leads/:id/status", requireAuth, express.json(), async (req, res) => { const { ObjectId } = require("mongodb"); const { status, ...metadata } = req.body; const ok = await updateLeadStatus(new ObjectId(req.params.id), status, metadata); if (!ok) return res.status(400).json({ error: "Invalid transition" }); res.json({ success: true }); });
-app.post("/api/leads/b2b-order-linked", requireAuth, express.json(), async (req, res) => { const db = await getDB(); if (!db) return res.status(500).json({ error: "DB error" }); const { distributor_id, order_id } = req.body; const lead = await db.collection("leads").findOne({ dealerId: String(distributor_id), status: { $in: ["waiting_order", "dealer_contacted", "checking_contact", "dealer_notified"] }, closedAt: null }, { sort: { createdAt: -1 } }); if (!lead) return res.json({ linked: false }); await db.collection("leads").updateOne({ _id: lead._id }, { $set: { status: "order_placed", b2bOrderId: order_id, updatedAt: new Date() }, $push: { followUpHistory: { from: lead.status, to: "order_placed", at: new Date() } } }); res.json({ linked: true, lead_id: String(lead._id) }); });
+app.post("/api/leads/b2b-order-linked", requireAuth, express.json(), async (req, res) => { const db = await getDB(); if (!db) return res.status(500).json({ error: "DB error" }); const { distributor_id, order_id } = req.body; const lead = await db.collection("leads").findOne({ dealerId: String(distributor_id), status: { $in: ["waiting_order", "dealer_contacted", "checking_contact", "dealer_notified"] }, closedAt: null }, { sort: { createdAt: -1 } }); if (!lead) return res.json({ linked: false }); await db.collection("leads").updateOne({ _id: lead._id }, { $set: { status: "order_placed", b2bOrderId: order_id, updatedAt: new Date() }, $push: { history: { from: lead.status, to: "order_placed", status: "order_placed", at: new Date(), by: "b2b_link" } } }); res.json({ linked: true, lead_id: String(lead._id) }); });
 app.post("/api/leads/cron/:type", requireAuth, async (req, res) => { const validTypes = ["first-check", "contact-recheck", "delivery-check", "install-check", "30day-check", "dormant-cleanup", "dealer-sla-weekly", "closing-soon"]; if (!validTypes.includes(req.params.type)) return res.status(400).json({ error: "Invalid type" }); try { const result = await runLeadCronByType(req.params.type); res.json({ ok: true, ...result }); } catch (e) { res.status(500).json({ error: e.message }); } });
+
+// === Dealers API (V.2.0 — Dealer Management) ===
+app.get("/api/dealers", requireAuth, async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.json({ ok: false, error: "DB not available" });
+    const { ObjectId } = require("mongodb");
+    const filter = {};
+    if (req.query.active !== undefined) filter.active = req.query.active === "true";
+    else filter.active = true; // default: show active only
+    if (req.query.province) filter.province = { $regex: req.query.province.replace(/จ\.|จังหวัด/g, "").trim(), $options: "i" };
+    if (req.query.rank) filter.rank = req.query.rank;
+    if (req.query.search) {
+      const s = req.query.search.trim();
+      filter.$or = [
+        { name: { $regex: s, $options: "i" } },
+        { province: { $regex: s, $options: "i" } },
+        { phone: { $regex: s, $options: "i" } },
+      ];
+    }
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const skip = parseInt(req.query.skip) || 0;
+    const [dealers, total] = await Promise.all([
+      db.collection("dealers").find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection("dealers").countDocuments(filter),
+    ]);
+    // Aggregate lead stats per dealer
+    const dealerIds = dealers.map(d => String(d._id));
+    const leadStats = {};
+    if (dealerIds.length > 0) {
+      const pipeline = [
+        { $match: { dealerId: { $in: dealerIds } } },
+        { $group: {
+          _id: "$dealerId",
+          total: { $sum: 1 },
+          active: { $sum: { $cond: [{ $not: [{ $in: ["$status", ["closed_satisfied", "closed_lost", "closed_cancelled", "closed_won", "dormant"]] }] }, 1, 0] } },
+          noResponse: { $sum: { $cond: [{ $eq: ["$status", "dealer_no_response"] }, 1, 0] } },
+          contacted: { $sum: { $cond: [{ $in: ["$status", ["dealer_contacted", "waiting_order", "order_placed", "waiting_delivery", "delivered", "installed", "closed_satisfied", "closed_won"]] }, 1, 0] } },
+        }},
+      ];
+      const stats = await db.collection("leads").aggregate(pipeline).toArray();
+      for (const s of stats) {
+        leadStats[s._id] = { total: s.total, active: s.active, noResponse: s.noResponse, contactRate: s.total > 0 ? s.contacted / s.total : 0 };
+      }
+    }
+    const enriched = dealers.map(d => ({ ...d, leadStats: leadStats[String(d._id)] || { total: 0, active: 0, noResponse: 0, contactRate: 0 } }));
+    res.json({ ok: true, count: enriched.length, total, dealers: enriched });
+  } catch (e) {
+    console.error("[API/dealers]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/dealers/lookup", requireAuth, async (req, res) => {
+  const dealers = await lookupDealerByProvince(req.query.province, req.query.name);
+  res.json({ ok: true, dealers: dealers.map(d => ({ _id: String(d._id), name: d.name, province: d.province, lineGroupId: d.lineGroupId, phone: d.phone })) });
+});
+
+app.get("/api/dealers/:id", requireAuth, async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ ok: false, error: "DB not available" });
+    const { ObjectId } = require("mongodb");
+    let dealer;
+    try { dealer = await db.collection("dealers").findOne({ _id: new ObjectId(req.params.id) }); } catch { dealer = null; }
+    // Fallback: try wp_id
+    if (!dealer) {
+      const wpId = parseInt(req.params.id, 10);
+      if (!isNaN(wpId)) dealer = await db.collection("dealers").findOne({ wp_id: wpId });
+    }
+    if (!dealer) return res.status(404).json({ ok: false, error: "ไม่พบตัวแทน" });
+    // Get leads for this dealer
+    const leads = await db.collection("leads").find({ dealerId: String(dealer._id) }).sort({ createdAt: -1 }).limit(50).toArray();
+    // SLA calculation (30 days)
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const slaLeads = leads.filter(l => new Date(l.createdAt) >= thirtyDaysAgo);
+    const totalLeads = slaLeads.length;
+    const contacted = slaLeads.filter(l => ["dealer_contacted", "waiting_order", "order_placed", "waiting_delivery", "delivered", "installed", "closed_satisfied", "closed_won"].includes(l.status)).length;
+    const noResponse = slaLeads.filter(l => l.status === "dealer_no_response").length;
+    const closed = slaLeads.filter(l => ["closed_satisfied", "closed_lost", "closed_cancelled", "closed_won"].includes(l.status)).length;
+    const satisfied = slaLeads.filter(l => l.status === "closed_satisfied" || l.status === "closed_won").length;
+    const contactRate = totalLeads > 0 ? contacted / totalLeads : 0;
+    const satisfactionRate = closed > 0 ? satisfied / closed : 0;
+    let grade = "A";
+    if (contactRate < 0.5) grade = "D";
+    else if (contactRate < 0.7) grade = "C";
+    else if (contactRate < 0.85) grade = "B";
+    res.json({
+      ok: true, dealer, leads,
+      sla: { totalLeads, contacted, noResponse, closed, satisfied, contactRate, satisfactionRate, grade },
+    });
+  } catch (e) {
+    console.error("[API/dealers/:id]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/dealers", requireAuth, express.json(), async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ ok: false, error: "DB not available" });
+    const { name, province } = req.body;
+    if (!name || !province || name.trim().length < 2 || province.trim().length < 2) {
+      return res.status(400).json({ ok: false, error: "ชื่อร้านและจังหวัดจำเป็น (อย่างน้อย 2 ตัวอักษร)" });
+    }
+    const dealer = {
+      wp_id: null,
+      name: name.trim(),
+      ownerName: (req.body.ownerName || "").trim(),
+      phone: (req.body.phone || "").trim(),
+      province: province.trim(),
+      district: (req.body.district || "").trim(),
+      address: (req.body.address || "").trim(),
+      postcode: (req.body.postcode || "").trim(),
+      coverageAreas: Array.isArray(req.body.coverageAreas) ? req.body.coverageAreas : (req.body.coverageAreas || "").split(",").map(s => s.trim()).filter(Boolean),
+      lineGroupId: (req.body.lineGroupId || "").trim() || null,
+      ownerLineUid: (req.body.ownerLineUid || "").trim() || null,
+      rank: req.body.rank || "Standard",
+      isWalkin: !!req.body.isWalkin,
+      active: true,
+      notes: (req.body.notes || "").trim(),
+      importedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await db.collection("dealers").insertOne(dealer);
+    dealer._id = result.insertedId;
+    console.log(`[Dealer] Created: ${dealer.name} (${dealer.province})`);
+    res.status(201).json({ ok: true, dealer });
+  } catch (e) {
+    console.error("[API/dealers POST]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.patch("/api/dealers/:id", requireAuth, express.json(), async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ ok: false, error: "DB not available" });
+    const { ObjectId } = require("mongodb");
+    let dealerId;
+    try { dealerId = new ObjectId(req.params.id); } catch { return res.status(400).json({ ok: false, error: "Invalid ID" }); }
+    const allowedFields = ["name", "ownerName", "phone", "province", "district", "address", "postcode", "coverageAreas", "lineGroupId", "ownerLineUid", "rank", "isWalkin", "active", "notes"];
+    const update = { updatedAt: new Date() };
+    for (const key of allowedFields) {
+      if (req.body[key] !== undefined) {
+        if (key === "coverageAreas" && typeof req.body[key] === "string") {
+          update[key] = req.body[key].split(",").map(s => s.trim()).filter(Boolean);
+        } else {
+          update[key] = req.body[key];
+        }
+      }
+    }
+    const result = await db.collection("dealers").findOneAndUpdate(
+      { _id: dealerId },
+      { $set: update },
+      { returnDocument: "after" }
+    );
+    if (!result) return res.status(404).json({ ok: false, error: "ไม่พบตัวแทน" });
+    console.log(`[Dealer] Updated: ${result.name || req.params.id}`);
+    res.json({ ok: true, dealer: result });
+  } catch (e) {
+    console.error("[API/dealers PATCH]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete("/api/dealers/:id", requireAuth, async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ ok: false, error: "DB not available" });
+    const { ObjectId } = require("mongodb");
+    let dealerId;
+    try { dealerId = new ObjectId(req.params.id); } catch { return res.status(400).json({ ok: false, error: "Invalid ID" }); }
+    const result = await db.collection("dealers").findOneAndUpdate(
+      { _id: dealerId },
+      { $set: { active: false, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+    if (!result) return res.status(404).json({ ok: false, error: "ไม่พบตัวแทน" });
+    console.log(`[Dealer] Soft deleted: ${result.name}`);
+    res.json({ ok: true, message: "ปิดใช้งานตัวแทนแล้ว" });
+  } catch (e) {
+    console.error("[API/dealers DELETE]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/dealers/:id/notify", requireAuth, express.json(), async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ ok: false, error: "DB not available" });
+    const { ObjectId } = require("mongodb");
+    let dealer;
+    try { dealer = await db.collection("dealers").findOne({ _id: new ObjectId(req.params.id) }); } catch { dealer = null; }
+    if (!dealer) return res.status(404).json({ ok: false, error: "ไม่พบตัวแทน" });
+    if (!dealer.lineGroupId) return res.json({ ok: false, error: "ตัวแทนนี้ยังไม่ผูก LINE Group" });
+    const msgType = req.body.type || "test";
+    let messages;
+    if (msgType === "test") {
+      messages = [{ type: "text", text: `ทดสอบระบบ DINOCO AI Dashboard\nส่งถึงกลุ่ม: ${dealer.name}` }];
+    } else {
+      if (!req.body.message) return res.status(400).json({ ok: false, error: "ต้องระบุข้อความ" });
+      messages = [{ type: "text", text: req.body.message }];
+    }
+    await sendLinePush(dealer.lineGroupId, messages);
+    console.log(`[Dealer] Sent ${msgType} notification to ${dealer.name}`);
+    res.json({ ok: true, sent: true });
+  } catch (e) {
+    console.error("[API/dealers/:id/notify]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/dealers/import", requireAuth, express.json(), async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ ok: false, error: "DB not available" });
+    // Fetch from WP MCP Bridge
+    const wpResult = await callDinocoAPI("/distributor-list", {});
+    if (typeof wpResult === "string" || !wpResult) {
+      return res.status(502).json({ ok: false, error: "ไม่สามารถเชื่อมต่อ WordPress ได้" });
+    }
+    const distributors = wpResult.distributors || wpResult.data || wpResult;
+    if (!Array.isArray(distributors) || distributors.length === 0) {
+      return res.json({ ok: false, error: "ไม่พบข้อมูลตัวแทนใน WordPress" });
+    }
+    let imported = 0, updated = 0, skipped = 0;
+    const errors = [];
+    for (const dist of distributors) {
+      try {
+        const wpId = dist.id || dist.ID;
+        if (!wpId) { skipped++; continue; }
+        const dealerDoc = {
+          wp_id: Number(wpId),
+          name: dist.name || dist.shop_name || `Dealer ${wpId}`,
+          province: dist.province || "",
+          phone: dist.phone || "",
+          lineGroupId: dist.line_group_id || null,
+          active: dist.active !== undefined ? !!dist.active : true,
+          rank: dist.rank || "Standard",
+          isWalkin: !!dist.is_walkin,
+          updatedAt: new Date(),
+        };
+        const result = await db.collection("dealers").updateOne(
+          { wp_id: dealerDoc.wp_id },
+          {
+            $set: dealerDoc,
+            $setOnInsert: {
+              ownerName: dist.owner_name || "",
+              district: dist.district || "",
+              address: dist.address || "",
+              postcode: dist.postcode || "",
+              coverageAreas: [],
+              ownerLineUid: dist.owner_line_uid || null,
+              notes: "",
+              importedAt: new Date(),
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+        if (result.upsertedCount > 0) imported++;
+        else if (result.modifiedCount > 0) updated++;
+        else skipped++;
+      } catch (err) {
+        errors.push({ wp_id: dist.id, error: err.message });
+        skipped++;
+      }
+    }
+    console.log(`[Dealer] Import: ${imported} new, ${updated} updated, ${skipped} skipped`);
+    res.json({ ok: true, imported, updated, skipped, errors });
+  } catch (e) {
+    console.error("[API/dealers/import]", e);
+    res.status(502).json({ ok: false, error: "ไม่สามารถเชื่อมต่อ WordPress ได้: " + e.message });
+  }
+});
+
 app.post("/api/claims/status-changed", requireAuth, express.json(), async (req, res) => { const { claim_id, ticket_number, new_status, case_type, source_id, platform } = req.body; if (source_id && platform) { let msg = ""; if (new_status === "return_to_customer") msg = `สินค้าซ่อม/เปลี่ยนเสร็จแล้วค่ะ! 📦\nใบเคลม: ${ticket_number}`; else if (new_status === "closed_resolved") msg = `เคลม ${ticket_number} เสร็จสมบูรณ์แล้วค่ะ 🙏`; if (msg) { if (platform === "line") sendLinePush(source_id, [{ type: "text", text: msg }]).catch(() => {}); else sendMetaMessage(source_id, msg).catch(() => {}); } } res.json({ success: true }); });
 app.get("/api/claims", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json({ claims: [] }); const filter = {}; if (req.query.status) filter.status = req.query.status; res.json({ claims: await db.collection("manual_claims").find(filter).sort({ updatedAt: -1 }).limit(50).toArray() }); });
 app.get("/api/claims/:id", requireAuth, async (req, res) => { const db = await getDB(); const { ObjectId } = require("mongodb"); const claim = await db.collection("manual_claims").findOne({ _id: new ObjectId(req.params.id) }); if (!claim) return res.status(404).json({ error: "Not found" }); res.json(claim); });

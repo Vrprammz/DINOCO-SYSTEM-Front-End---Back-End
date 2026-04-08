@@ -42,6 +42,7 @@ const NAV_GROUPS: NavGroup[] = [
     groupLabel: "Lead Pipeline",
     items: [
       { href: "/leads", icon: "🎯", label: "ติดตาม Leads" },
+      { href: "/dealers", icon: "🏬", label: "ตัวแทน" },
       { href: "/dealer-sla", icon: "🏪", label: "SLA ตัวแทน" },
       { href: "/crm", icon: "👥", label: "CRM ลูกค้า" },
       { href: "/scorecard", icon: "🏆", label: "คะแนนลูกค้า" },

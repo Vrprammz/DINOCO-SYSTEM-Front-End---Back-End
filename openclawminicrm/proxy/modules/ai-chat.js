@@ -1,6 +1,6 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
- * V.6.6 — Fix: Auto-lead enrichment — extract productInterest+province from conversation, notify dealer via MCP, resolve dealerId
+ * V.7.0 — Dealer Management: resolveDealer MongoDB first, notifyDealerForAutoLead direct LINE push, USE_MONGODB_DEALERS feature flag
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -923,18 +923,43 @@ function extractLeadContext(recentMsgs) {
 }
 
 /**
- * Resolve dealerId จาก dealerName ผ่าน WP MCP /dealer-lookup
- * ถ้า province มีให้ใช้ province ค้นหา, ถ้าไม่มีใช้ dealerName
+ * Resolve dealerId — MongoDB dealers first (USE_MONGODB_DEALERS), fallback WP MCP
  */
 async function resolveDealer(dealerName, province) {
   if (!dealerName && !province) return null;
+
+  // ★ V.2.0: MongoDB dealers (direct, sub-ms)
+  const useMongoDB = process.env.USE_MONGODB_DEALERS === "true";
+  if (useMongoDB) {
+    try {
+      const { lookupDealerByProvince } = require("./lead-pipeline");
+      const dealers = await lookupDealerByProvince(province, dealerName);
+      if (dealers.length > 0) {
+        // If dealerName provided, try fuzzy match
+        if (dealerName) {
+          const match = dealers.find(d =>
+            (d.name || "").toLowerCase().includes(dealerName.toLowerCase()) ||
+            dealerName.toLowerCase().includes((d.name || "").toLowerCase())
+          );
+          if (match) return { id: String(match._id), name: match.name, dealer: match };
+        }
+        const first = dealers[0];
+        return { id: String(first._id), name: first.name, dealer: first };
+      }
+    } catch (e) {
+      console.error("[Lead] resolveDealer MongoDB error:", e.message);
+    }
+    return null;
+  }
+
+  // Fallback: WP MCP API
   try {
     const query = province || dealerName;
     const result = await callDinocoAPI("/dealer-lookup", { location: query });
     if (typeof result === "string" || !result?.found) return null;
 
     // dealers อาจเป็น string (formatted) — ลอง parse dealer_id จาก response
-    if (result.dealer_id) return String(result.dealer_id);
+    if (result.dealer_id) return { id: String(result.dealer_id), name: dealerName };
 
     // ถ้า result มี dealers array
     if (Array.isArray(result.dealers_raw)) {
@@ -943,9 +968,9 @@ async function resolveDealer(dealerName, province) {
         (d.name || "").toLowerCase().includes((dealerName || "").toLowerCase()) ||
         (dealerName || "").toLowerCase().includes((d.name || "").toLowerCase())
       );
-      if (match?.id) return String(match.id);
+      if (match?.id) return { id: String(match.id), name: match.name || dealerName };
       // fallback ใช้ตัวแรก
-      if (result.dealers_raw[0]?.id) return String(result.dealers_raw[0].id);
+      if (result.dealers_raw[0]?.id) return { id: String(result.dealers_raw[0].id), name: result.dealers_raw[0].name || dealerName };
     }
 
     return null;
@@ -957,10 +982,24 @@ async function resolveDealer(dealerName, province) {
 
 /**
  * Notify dealer (or admin fallback) for auto-created lead
- * เรียก /distributor-notify → อัพเดท status เป็น dealer_notified
+ * V.2.0: Use notifyDealerDirect (LINE push) when USE_MONGODB_DEALERS=true + dealer object available
+ * Fallback: WP MCP /distributor-notify
  */
-async function notifyDealerForAutoLead(leadId, db, { dealerId, dealerName, customerName, productInterest, province, phone, platform }) {
+async function notifyDealerForAutoLead(leadId, db, { dealerId, dealerName, customerName, productInterest, province, phone, platform, dealer }) {
   try {
+    const useMongoDB = process.env.USE_MONGODB_DEALERS === "true";
+
+    // ★ V.2.0: Direct LINE push via notifyDealerDirect (no WP roundtrip)
+    if (useMongoDB) {
+      const { notifyDealerDirect } = require("./lead-pipeline");
+      const lead = await db.collection("leads").findOne({ _id: leadId });
+      if (lead) {
+        await notifyDealerDirect(lead, dealer);
+      }
+      return;
+    }
+
+    // Fallback: WP MCP API
     const notifyPayload = {
       customer_name: customerName,
       product_interest: productInterest || "สินค้า DINOCO",
@@ -974,11 +1013,9 @@ async function notifyDealerForAutoLead(leadId, db, { dealerId, dealerName, custo
     if (dealerId) {
       notifyPayload.distributor_id = dealerId;
     }
-    // ถ้าไม่มี dealerId → /distributor-notify จะ fallback ส่ง admin group
 
     const result = await callDinocoAPI("/distributor-notify", notifyPayload);
     if (typeof result !== "string") {
-      // notify สำเร็จ → อัพเดท status
       await db.collection("leads").updateOne(
         { _id: leadId },
         {
@@ -1015,15 +1052,18 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
       // ★ V.6.6: Extract product + province จาก conversation history
       const { productInterest, province } = extractLeadContext(recentMsgs);
 
-      // ★ V.6.6: Resolve dealerId จาก WP MCP
-      const dealerId = await resolveDealer(dealerName, province);
+      // ★ V.2.0: Resolve dealer — returns { id, name, dealer } or null
+      const resolved = await resolveDealer(dealerName, province);
+      const dealerId = resolved?.id || null;
+      const resolvedDealerName = resolved?.name || dealerName;
+      const resolvedDealer = resolved?.dealer || null; // MongoDB dealer object (if USE_MONGODB_DEALERS)
 
       try {
         const db = await getDB();
         if (db) {
           const insertResult = await db.collection("leads").insertOne({
             sourceId, platform: "line", customerName, phone: phoneMatch[0],
-            productInterest, province, dealerName, dealerId: dealerId || null,
+            productInterest, province, dealerName: resolvedDealerName, dealerId: dealerId || null,
             lineId: event.source?.userId || null,
             status: "lead_created",
             nextFollowUpAt: new Date(Date.now() + 4 * 3600000),
@@ -1033,11 +1073,11 @@ async function aiReplyToLine(event, sourceId, userName, text, config) {
             history: [{ status: "lead_created", at: new Date(), by: "ai_auto" }],
             createdAt: new Date(), updatedAt: new Date(),
           });
-          console.log(`[Lead] Auto-created from LINE: ${customerName} ${phoneMatch[0]} → ${dealerName} (product: ${productInterest || "N/A"}, province: ${province || "N/A"})`);
+          console.log(`[Lead] Auto-created from LINE: ${customerName} ${phoneMatch[0]} → ${resolvedDealerName} (product: ${productInterest || "N/A"}, province: ${province || "N/A"})`);
 
-          // ★ V.6.6: Notify dealer (or admin fallback) + update status
+          // ★ V.2.0: Notify dealer — use notifyDealerDirect if MongoDB dealer available
           notifyDealerForAutoLead(insertResult.insertedId, db, {
-            dealerId, dealerName, customerName, productInterest, province, phone: phoneMatch[0], platform: "line",
+            dealerId, dealerName: resolvedDealerName, customerName, productInterest, province, phone: phoneMatch[0], platform: "line", dealer: resolvedDealer,
           }).catch(e => console.error("[Lead] LINE notify error:", e.message));
         }
       } catch (e) { console.error(`[Lead] Auto-create failed:`, e.message); }
@@ -1222,15 +1262,18 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
       // ★ V.6.6: Extract product + province จาก conversation history
       const { productInterest, province } = extractLeadContext(recentMsgs);
 
-      // ★ V.6.6: Resolve dealerId จาก WP MCP
-      const dealerId = await resolveDealer(dealerName, province);
+      // ★ V.2.0: Resolve dealer — returns { id, name, dealer } or null
+      const resolved2 = await resolveDealer(dealerName, province);
+      const dealerId = resolved2?.id || null;
+      const resolvedDealerName = resolved2?.name || dealerName;
+      const resolvedDealer2 = resolved2?.dealer || null;
 
       try {
         const db = await getDB();
         if (db) {
           const insertResult = await db.collection("leads").insertOne({
             sourceId, platform, customerName, phone: phoneMatch[0],
-            productInterest, province, dealerName, dealerId: dealerId || null,
+            productInterest, province, dealerName: resolvedDealerName, dealerId: dealerId || null,
             status: "lead_created",
             nextFollowUpAt: new Date(Date.now() + 4 * 3600000),
             nextFollowUpType: "first_check",
@@ -1239,11 +1282,11 @@ async function aiReplyToMeta(senderId, text, sourceId, platform) {
             history: [{ status: "lead_created", at: new Date(), by: "ai_auto" }],
             createdAt: new Date(), updatedAt: new Date(),
           });
-          console.log(`[Lead] Auto-created from ${platform}: ${customerName} ${phoneMatch[0]} → ${dealerName} (product: ${productInterest || "N/A"}, province: ${province || "N/A"})`);
+          console.log(`[Lead] Auto-created from ${platform}: ${customerName} ${phoneMatch[0]} → ${resolvedDealerName} (product: ${productInterest || "N/A"}, province: ${province || "N/A"})`);
 
-          // ★ V.6.6: Notify dealer (or admin fallback) + update status
+          // ★ V.2.0: Notify dealer — use notifyDealerDirect if MongoDB dealer available
           notifyDealerForAutoLead(insertResult.insertedId, db, {
-            dealerId, dealerName, customerName, productInterest, province, phone: phoneMatch[0], platform,
+            dealerId, dealerName: resolvedDealerName, customerName, productInterest, province, phone: phoneMatch[0], platform, dealer: resolvedDealer2,
           }).catch(e => console.error("[Lead] Meta notify error:", e.message));
         }
       } catch (e) { console.error(`[Lead] Auto-create failed:`, e.message); }

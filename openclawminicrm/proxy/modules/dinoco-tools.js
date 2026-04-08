@@ -1,6 +1,6 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
- * V.3.1 — Fix: ลบคำว่า "พี่" ออกจาก lead response template
+ * V.4.0 — Dealer Management: dinoco_dealer_lookup + dinoco_create_lead use MongoDB dealers + notifyDealerDirect
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -412,6 +412,18 @@ async function executeTool(toolName, args, sourceId) {
   }
   if (toolName === "dinoco_dealer_lookup") {
     const location = args.location || "";
+    const useMongoDB = process.env.USE_MONGODB_DEALERS === "true";
+
+    // ★ V.4.0: MongoDB dealers collection (sub-ms lookup)
+    if (useMongoDB) {
+      const { lookupDealerByProvince } = require("./lead-pipeline");
+      const dealers = await lookupDealerByProvince(location, location);
+      if (dealers.length > 0) {
+        const list = dealers.map(d => `${d.name} — ${d.province}${d.phone ? ` | โทร ${d.phone}` : ""}${d.rank && d.rank !== "Standard" ? ` | ${d.rank}` : ""}`).join("\n");
+        return `ตัวแทนจำหน่าย DINOCO ในพื้นที่ ${location}:\n${list}\n\n[คำสั่ง: แนะนำร้านตัวแทนตามข้อมูลข้างบน ห้ามกุชื่อร้านที่ไม่มีในข้อมูล ถ้าลูกค้าสนใจให้ใช้ dinoco_create_lead แจ้งตัวแทน]`;
+      }
+    }
+
     // ★ V.1.5: ค้น MongoDB KB ก่อน (มีข้อมูลตัวแทนแต่ละจังหวัด) → fallback WP API
     const db = await getDB();
     if (db && location) {
@@ -638,14 +650,32 @@ async function executeTool(toolName, args, sourceId) {
     const meta = await database.collection("groups_meta").findOne({ sourceId });
     const platform = sourceId.startsWith("fb_") ? "facebook" : sourceId.startsWith("ig_") ? "instagram" : "line";
     const customerName = args.customer_name || meta?.groupName || meta?.displayName || "ลูกค้า";
+    const useMongoDB = process.env.USE_MONGODB_DEALERS === "true";
+
+    // ★ V.4.0: Resolve dealer from MongoDB if available
+    let dealerId = args.dealer_id || null;
+    let dealerName = args.dealer_name || "";
+    let dealerObj = null;
+    if (useMongoDB && (args.dealer_name || args.province)) {
+      const { lookupDealerByProvince } = require("./lead-pipeline");
+      const dealers = await lookupDealerByProvince(args.province, args.dealer_name);
+      if (dealers.length > 0) {
+        const match = args.dealer_name
+          ? dealers.find(d => (d.name || "").toLowerCase().includes(args.dealer_name.toLowerCase()))
+          : null;
+        dealerObj = match || dealers[0];
+        dealerId = String(dealerObj._id);
+        dealerName = dealerObj.name;
+      }
+    }
+
     const leadData = {
       sourceId, platform, customerName,
       productInterest: args.product_interest || "",
       province: args.province || "",
       phone: args.phone || null,
       lineId: null,
-      dealerId: args.dealer_id || null,
-      dealerName: args.dealer_name || "",
+      dealerId, dealerName,
       status: "lead_created",
       nextFollowUpAt: new Date(Date.now() + 4 * 60 * 60 * 1000),
       nextFollowUpType: "first_check",
@@ -655,21 +685,30 @@ async function executeTool(toolName, args, sourceId) {
       createdAt: new Date(), updatedAt: new Date(),
     };
     const result = await database.collection("leads").insertOne(leadData);
-    console.log(`[Lead] AI auto-created: ${customerName} → ${args.dealer_name} (${args.product_interest})`);
-    if (args.dealer_id || args.dealer_name) {
-      await callDinocoAPI("/distributor-notify", {
-        distributor_id: args.dealer_id, customer_name: customerName,
-        product_interest: args.product_interest, province: args.province || "",
-        lead_id: String(result.insertedId),
-        message: `ลูกค้าสนใจ: ${args.product_interest} จ.${args.province || "ไม่ระบุ"}`,
-        type: "new_lead",
-      }).catch(() => {});
-      await database.collection("leads").updateOne(
-        { _id: result.insertedId },
-        { $set: { status: "dealer_notified", updatedAt: new Date() }, $push: { history: { status: "dealer_notified", at: new Date(), by: "ai" } } }
-      );
+    console.log(`[Lead] AI auto-created: ${customerName} → ${dealerName} (${args.product_interest})`);
+
+    if (dealerId || dealerName) {
+      // ★ V.4.0: Direct LINE push via notifyDealerDirect (no WP roundtrip)
+      if (useMongoDB) {
+        const { notifyDealerDirect } = require("./lead-pipeline");
+        const lead = await database.collection("leads").findOne({ _id: result.insertedId });
+        if (lead) await notifyDealerDirect(lead, dealerObj).catch(e => console.error("[Lead] notifyDealerDirect error:", e.message));
+      } else {
+        // Fallback: WP MCP API
+        await callDinocoAPI("/distributor-notify", {
+          distributor_id: dealerId, customer_name: customerName,
+          product_interest: args.product_interest, province: args.province || "",
+          lead_id: String(result.insertedId),
+          message: `ลูกค้าสนใจ: ${args.product_interest} จ.${args.province || "ไม่ระบุ"}`,
+          type: "new_lead",
+        }).catch(() => {});
+        await database.collection("leads").updateOne(
+          { _id: result.insertedId },
+          { $set: { status: "dealer_notified", updatedAt: new Date() }, $push: { history: { status: "dealer_notified", at: new Date(), by: "ai" } } }
+        );
+      }
     }
-    return `สร้าง lead สำเร็จ แจ้งตัวแทน ${args.dealer_name} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${args.dealer_name} แล้วค่ะ จะติดต่อลูกค้ากลับเร็วที่สุดนะคะ แอดมินจะติดตามให้จนจบค่ะ"`;
+    return `สร้าง lead สำเร็จ แจ้งตัวแทน ${dealerName} แล้ว — ตอบลูกค้าว่า "แจ้งตัวแทน ${dealerName} แล้วค่ะ จะติดต่อลูกค้ากลับเร็วที่สุดนะคะ แอดมินจะติดตามให้จนจบค่ะ"`;
   }
   if (toolName === "dinoco_claim_status") {
     const database = await getDB();
