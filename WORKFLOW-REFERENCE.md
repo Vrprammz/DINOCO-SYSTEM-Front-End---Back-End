@@ -750,10 +750,49 @@ Trigger: ลูกค้าส่งข้อความผ่าน LINE / Fac
 7. Response → platform-specific format → reply
 8. Telegram alert → telegram-alert.js → บอส (new chat/escalation/claim)
 
-Conversation Cap: 12 messages, Temperature: 0.35
+No message cap (context: 6-10 messages ล่าสุด), Temperature: 0.3 (tools), 0.2 (Claude), 0.4 (claim)
+Additional guards (V.8.1): PII masking in history, Claude review text guard, false hallucination fix
 ```
 
-### 7.1 Telegram Command Workflow (น้องกุ้ง V.1.0)
+### 7.1 Auto-Lead V.8.0 Flow
+
+```
+Trigger: ลูกค้าพิมพ์ชื่อ+เบอร์ในแชท
+
+1. ai-chat.js detect ชื่อ+เบอร์ในข้อความ
+2. create_lead tool → MCP lead-create → MongoDB leads collection
+3. lookupProductForLead() → MCP product-lookup → enrich lead ด้วยรูป+ราคา
+4. notifyDealerDirect() → LINE Push API → ส่ง Flex card (LeadNotify) ตรงไปตัวแทน
+   - Flex: DINOCO CO DEALER header + รูปสินค้า + ราคา + ข้อมูลลูกค้า
+   - ไม่ผ่าน WP /distributor-notify (ส่งตรงจาก Agent)
+5. Lead status → dealer_notified
+
+Output-based coordination (V.6.3):
+- AI ตอบลูกค้าพร้อมชื่อร้าน+เบอร์
+- ai-chat.js detect → append "ทางเราจะประสานงานกับตัวแทนให้ครับ"
+```
+
+### 7.2 Dealer Notification Flow (V.2.0)
+
+```
+Trigger: Lead ใหม่ / สินค้ากลับมามีสต็อก / เตือนติดตาม
+
+1. Event trigger → lead-pipeline.js
+2. lookupProductForLead() → enrich product data (รูป+ราคา)
+3. Build Flex card (5 builders: LeadNotify, FollowUp, StockBack, DealerReminder, Closed)
+4. notifyDealerDirect() → LINE Push API (LINE_CHANNEL_ACCESS_TOKEN)
+   - ส่งไป owner_line_uid ของ dealer
+   - ถ้าไม่มี → fallback admin group
+5. Postback จาก Flex → postback handler → updateLeadStatus (FSM)
+
+Lead Statuses (V.2.0 — 20 statuses):
+  new → contacted → interested → dealer_notified → waiting_decision → closed_won
+                                                  → waiting_stock → dealer_notified
+                                                  → closed_lost
+  (ทุก status มีทางไป closed_lost/cancelled)
+```
+
+### 7.3 Telegram Command Workflow (น้องกุ้ง V.1.0)
 
 ```
 Trigger: บอสส่งข้อความใน Telegram @dinoco_alert_bot

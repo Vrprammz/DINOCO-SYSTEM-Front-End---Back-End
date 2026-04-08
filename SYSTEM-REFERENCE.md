@@ -181,11 +181,11 @@
 | File | Location | Version | Description |
 |------|----------|---------|-------------|
 | index.js | `proxy/` | V.2.1 | Main Express server (~110K) + Telegram webhook route |
-| ai-chat.js | `proxy/modules/` | -- | AI providers + claudeSupervisor |
+| ai-chat.js | `proxy/modules/` | V.8.1 | AI providers + claudeSupervisor + PII masking + Claude review guard |
 | dinoco-tools.js | `proxy/modules/` | -- | 11 function-calling tools |
-| shared.js | `proxy/modules/` | -- | Prompt templates + config |
+| shared.js | `proxy/modules/` | -- | Prompt templates + config + product knowledge rules |
 | claim-flow.js | `proxy/modules/` | -- | Claim workflow automation |
-| lead-pipeline.js | `proxy/modules/` | -- | Lead management (17 statuses) |
+| lead-pipeline.js | `proxy/modules/` | V.2.0 | Lead management (20 statuses incl. closed_won, waiting_decision, waiting_stock) + 5 Flex builders + notifyDealerDirect |
 | dinoco-cache.js | `proxy/modules/` | -- | Redis/memory cache layer |
 | platform-response.js | `proxy/modules/` | -- | Multi-platform response builder |
 | telegram-alert.js | `proxy/modules/` | V.2.0 | Telegram alert system (sendTelegramAlert/Reply/Photo, escapeMarkdown, MongoDB logging) |
@@ -699,6 +699,7 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 | `conversations` | Chat history per user per platform |
 | `leads` | Lead records (from AI chat + manual) |
 | `training_logs` | AI training dashboard logs |
+| `dealers` | Dealer/distributor records (imported from WP, CRUD via dashboard API). Feature flag: `USE_MONGODB_DEALERS=true` |
 | `telegram_alerts` | Telegram alert records (message_id <-> sourceId mapping) |
 | `telegram_command_log` | Telegram command audit trail (who, what, when) |
 
@@ -1452,12 +1453,14 @@ sequenceDiagram
 | สร้างเคลมจากแชท | dinoco_create_claim | เปิดเคลมจริงเข้า WP (platform auto-detect) |
 
 #### ข้อจำกัด
-- Max 12 messages per conversation
-- Temperature 0.35 (conservative)
-- Anti-hallucination: 3 layers (prompt, tool boundary, supervisor)
+- ไม่มี message cap (context ใช้ 6-10 messages ล่าสุด)
+- Temperature 0.3 (tools), 0.2 (Claude), 0.4 (claim questions)
+- Anti-hallucination V.4.0: 3 layers (prompt, tool boundary, supervisor) + intent pre-check + context-aware supervisor
 - Product data ต้องมาจาก function calling เท่านั้น (ไม่ generate)
 - Prompt injection protection: 14 patterns
-- PII masking
+- PII masking ใน conversation history (ป้องกัน Gemini SAFETY block)
+- Claude review text guard: ดัก review text ไม่ให้หลุดไปหาลูกค้า (V.8.1)
+- Product knowledge rules: ห้ามเอ่ย H2C, วัสดุตรงสินค้า, DINOCO Edition NX500 = สีเงินเท่านั้น, Side Rack ไม่ใช่มือจับ
 
 ### 8.6 Dealer (LIFF AI)
 
@@ -1558,6 +1561,8 @@ sequenceDiagram
 | OpenClaw Agent | WordPress MCP Bridge | REST API | Product lookup, claims, leads |
 | OpenClaw Agent | MongoDB Atlas | MongoDB Driver | Chat history, leads, analytics |
 | OpenClaw Agent | LINE/Facebook/IG | Webhook | Multi-platform chatbot |
+| OpenClaw Dashboard | MongoDB dealers | Internal API | Dealer CRUD (8 endpoints) + import from WP |
+| OpenClaw Agent | LINE Push API | REST API | Direct Flex card to dealer (notifyDealerDirect) |
 | OpenClaw Agent | Telegram Bot API | Webhook POST | น้องกุ้ง Command Center (admin alerts + commands) |
 | Telegram Bot | OpenClaw Agent | Webhook POST | Boss commands (claim/lead/KB/stats) |
 | GitHub | WordPress (Sync Engine) | Webhook POST | Auto-deploy code changes |
@@ -1625,6 +1630,14 @@ sequenceDiagram
 | `TELEGRAM_CHAT_ID` | Boss chat_id (security: only this chat_id can send commands) |
 | `TELEGRAM_WEBHOOK_SECRET` | Webhook URL secret path segment |
 | `BASE_URL` | Server base URL for webhook registration |
+
+#### Dealer Management & LINE (OpenClaw .env)
+
+| Env Variable | Description |
+|-------------|-------------|
+| `USE_MONGODB_DEALERS` | Feature flag: `true` = use MongoDB dealers collection instead of WP |
+| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Bot token for direct Flex push (same as WP B2B_LINE_ACCESS_TOKEN) |
+| `MONGODB_URI` | MongoDB connection string (hostname `mongodb` in Docker compose) |
 
 #### MCP Bridge
 

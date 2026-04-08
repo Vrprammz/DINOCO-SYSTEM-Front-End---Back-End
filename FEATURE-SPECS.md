@@ -81,6 +81,10 @@
   - [6.6 Environment Variables](#66-environment-variables)
   - [6.7 MongoDB Collections](#67-mongodb-collections)
   - [6.8 Security](#68-security)
+- [7. Dealer Management System V.2.0](#7-dealer-management-system-v20)
+- [8. Lead Pipeline V.2.0](#8-lead-pipeline-v20)
+- [9. AI Chat Fixes (V.8.1)](#9-ai-chat-fixes-v81)
+- [10. Docker/Deploy Updates](#10-dockerdeploy-updates-2026-04-07)
 
 ---
 
@@ -1601,3 +1605,164 @@ POST /webhook/telegram/{secret}  ← index.js V.2.1
 - **Webhook secret**: URL path มี secret segment ป้องกัน unauthorized POST
 - **Plain text response**: ไม่ใช้ Markdown เพื่อป้องกัน parse error กับ Thai text + special chars
 - **Command logging**: ทุก command บันทึกลง MongoDB สำหรับ audit
+
+---
+
+# 7. Dealer Management System V.2.0
+
+**Status:** Implemented V.2.0
+> Created: 2026-04-07
+> Module: `proxy/` (index.js API routes) + `dashboard/` (2 pages)
+
+## 7.1 Overview
+
+ระบบจัดการตัวแทนจำหน่ายใน MongoDB แทน WordPress — รองรับ CRUD, import จาก WP, และส่ง LINE Flex card notification ตรงไม่ผ่าน WP.
+
+- **Feature flag**: `USE_MONGODB_DEALERS=true` ใน .env
+- **MongoDB collection**: `dealers`
+- **Dashboard**: 2 pages (list + detail) + sidebar menu "ตัวแทน"
+
+## 7.2 API Endpoints (8)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/dealers` | List all dealers (paginated, search, filter by province) |
+| GET | `/api/dealers/:id` | Get dealer detail |
+| POST | `/api/dealers` | Create dealer |
+| PUT | `/api/dealers/:id` | Update dealer |
+| DELETE | `/api/dealers/:id` | Delete dealer |
+| POST | `/api/dealers/import` | Import dealers from WP `/distributor-list` |
+| POST | `/api/dealers/:id/notify` | Send LINE Flex card to dealer |
+| GET | `/api/dealers/provinces` | List distinct provinces |
+
+## 7.3 Dashboard Pages
+
+| Page | Path | Description |
+|------|------|-------------|
+| Dealer List | `/dashboard/dealers` | ตาราง + search + filter province + import button |
+| Dealer Detail | `/dashboard/dealers/:id` | รายละเอียด + edit form + send notification |
+
+## 7.4 LINE Flex Card
+
+- Header: DINOCO CO DEALER สีดำ + logo
+- Content: รูปสินค้า + ราคา + รายละเอียด
+- ส่งผ่าน `LINE_CHANNEL_ACCESS_TOKEN` ตรง (ไม่ผ่าน WP MCP)
+
+## 7.5 Data Model (MongoDB `dealers`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `_id` | ObjectId | Primary key |
+| `name` | String | ชื่อร้าน |
+| `owner_name` | String | ชื่อเจ้าของ |
+| `province` | String | จังหวัด |
+| `phone` | String | เบอร์โทร |
+| `line_group_id` | String | LINE Group ID (for Flex push) |
+| `owner_line_uid` | String | LINE User ID ของเจ้าของ |
+| `wp_distributor_id` | Number | WordPress CPT post ID (if imported) |
+| `rank` | String | Tier (Standard/Silver/Gold/Platinum/Diamond) |
+| `is_active` | Boolean | สถานะ active |
+| `created_at` | Date | วันที่สร้าง |
+| `updated_at` | Date | วันที่อัพเดทล่าสุด |
+
+---
+
+# 8. Lead Pipeline V.2.0
+
+**Status:** Implemented V.2.0
+> Updated: 2026-04-07
+> Module: `proxy/modules/lead-pipeline.js` (V.2.0)
+
+## 8.1 New Statuses (เพิ่มจาก V.1.0)
+
+| Status | Description |
+|--------|-------------|
+| `closed_won` | ปิดการขายสำเร็จ |
+| `waiting_decision` | ลูกค้ากำลังตัดสินใจ |
+| `waiting_stock` | รอสินค้าเข้า |
+
+## 8.2 New Transitions
+
+ทุก status มีทางไป `closed_lost`/`cancelled` แล้ว (ไม่มี dead-end). เพิ่ม:
+- `dealer_notified` → `waiting_decision` / `waiting_stock`
+- `waiting_decision` → `closed_won` / `closed_lost`
+- `waiting_stock` → `dealer_notified` (สินค้าเข้าแล้ว แจ้งตัวแทน)
+- `contacted` → `closed_won`
+
+## 8.3 Auto-Lead V.8.0
+
+Flow:
+1. ลูกค้าพิมพ์ชื่อ+เบอร์ใน chat → AI detect
+2. `create_lead` tool สร้าง lead ทันที
+3. `lookupProductForLead()` enrich lead ด้วยรูป+ราคาจาก MCP product-lookup
+4. `notifyDealerDirect()` ส่ง LINE Flex card ตรงไปตัวแทน (ไม่ผ่าน WP `/distributor-notify`)
+5. Status → `dealer_notified`
+
+## 8.4 Flex Builders (5 ตัว)
+
+| Builder | Description |
+|---------|-------------|
+| `buildLeadNotifyFlex` | แจ้งตัวแทนว่ามี lead ใหม่ (รูป+ราคา+ข้อมูลลูกค้า) |
+| `buildFollowUpFlex` | เตือนติดตาม lead |
+| `buildStockBackFlex` | แจ้งสินค้ากลับมามีสต็อก |
+| `buildDealerReminderFlex` | เตือนตัวแทนที่ไม่ตอบ |
+| `buildClosedFlex` | สรุปผล lead (won/lost) |
+
+## 8.5 Postback Handler
+
+Postback ใช้ FSM (`updateLeadStatus`) แทน direct update เดิม — enforce valid transitions.
+
+## 8.6 Output-Based Dealer Coordination (V.6.3)
+
+`ai-chat.js` detect ร้าน+เบอร์ในคำตอบ AI → append ข้อความ "ทางเราจะประสานงานกับตัวแทนให้ครับ" อัตโนมัติ.
+
+---
+
+# 9. AI Chat Fixes (V.8.1)
+
+**Status:** Implemented
+> Updated: 2026-04-07
+> Module: `proxy/modules/ai-chat.js` (V.8.1), `proxy/modules/shared.js`
+
+## 9.1 Claude Review Guard (V.8.1)
+
+ดัก Claude review/evaluation text ที่หลุดไปหาลูกค้า — ตรวจ output patterns เช่น "This response", "The answer" แล้ว strip ออกก่อนส่ง.
+
+## 9.2 PII Masking in Conversation History
+
+Mask เบอร์โทร/ชื่อจริงใน conversation history ก่อนส่ง Gemini — ป้องกัน SAFETY block จาก PII detection.
+
+## 9.3 False Hallucination Alert Fix (V.4.2)
+
+แก้ supervisor trigger false positive เมื่อ AI ตอบถูกต้องแต่ใช้คำที่คล้าย hallucination pattern.
+
+## 9.4 Product Knowledge Rules (shared.js)
+
+- ห้ามเอ่ย H2C (คู่แข่ง) — ใช้ "ตัวแต่งจากศูนย์" = DINOCO Edition
+- วัสดุตรงสินค้า: กันล้ม = สแตนเลส, กล่อง = อลูมิเนียม
+- DINOCO Edition NX500 = SKU DNCGND37LSPROS สีเงินเท่านั้น
+- Side Rack ไม่ใช่มือจับ (มือจับเกี่ยวกับ Rear Rack เท่านั้น)
+
+---
+
+# 10. Docker/Deploy Updates (2026-04-07)
+
+## 10.1 docker-compose.prod.yml
+
+- เพิ่ม `mongodb` service ใน compose (ไม่ใช่ external container)
+- Agent `depends_on: mongodb`
+- Volume: `mongo-data` (ไม่ใช่ `mongodb-data` — ชื่อผิด = ข้อมูลหาย)
+- MONGODB_URI hostname: `mongodb` (docker compose internal DNS)
+
+## 10.2 Nginx
+
+- Port 80 serve ตรง ไม่ redirect HTTPS (Cloudflare Tunnel จัดการ SSL)
+
+## 10.3 Network Rules
+
+- ทุก service ต้องอยู่ใน compose file เดียวกัน
+- ห้ามใช้ `docker network connect` แก้ปัญหา (หลุดทุก rebuild)
+
+## 10.4 Environment Variables
+
+- `LINE_CHANNEL_ACCESS_TOKEN` ต้องใส่ใน .env (B2B bot token เดียวกับ WP `B2B_LINE_ACCESS_TOKEN`)
