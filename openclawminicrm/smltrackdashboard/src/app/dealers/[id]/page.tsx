@@ -114,7 +114,7 @@ export default function DealerDetailPage() {
     setEditForm({
       name: dealer.name, ownerName: dealer.ownerName, phone: dealer.phone,
       province: dealer.province, address: dealer.address || "",
-      postcode: dealer.postcode || "", lineGroupId: dealer.lineGroupId || "",
+      lineGroupId: dealer.lineGroupId || "",
       ownerLineUid: dealer.ownerLineUid || "", rank: dealer.rank,
       isWalkin: dealer.isWalkin, coverageAreas: (dealer.coverageAreas || []).join(", "),
       notes: dealer.notes || "",
@@ -233,7 +233,6 @@ export default function DealerDetailPage() {
                 <EditField label="จังหวัด" value={editForm.province as string} onChange={(v) => setEditForm(f => ({ ...f, province: v }))} />
                 <EditField label="ที่อยู่" value={editForm.address as string} onChange={(v) => setEditForm(f => ({ ...f, address: v }))} />
                 <EditField label="ที่อยู่" value={editForm.address as string} onChange={(v) => setEditForm(f => ({ ...f, address: v }))} />
-                <EditField label="รหัสไปรษณีย์" value={editForm.postcode as string} onChange={(v) => setEditForm(f => ({ ...f, postcode: v }))} />
                 <EditField label="LINE Group ID" value={editForm.lineGroupId as string} onChange={(v) => setEditForm(f => ({ ...f, lineGroupId: v }))} />
                 <EditField label="Owner LINE UID" value={editForm.ownerLineUid as string} onChange={(v) => setEditForm(f => ({ ...f, ownerLineUid: v }))} />
                 <div>
@@ -266,7 +265,6 @@ export default function DealerDetailPage() {
                 <InfoRow label="จังหวัด" value={dealer.province} />
                 <InfoRow label="ที่อยู่" value={dealer.address || "-"} />
                 <InfoRow label="ที่อยู่" value={dealer.address || "-"} />
-                <InfoRow label="รหัสไปรษณีย์" value={dealer.postcode || "-"} />
                 <InfoRow label="LINE Group ID" value={dealer.lineGroupId || "ยังไม่ผูก"} />
                 <InfoRow label="Owner LINE UID" value={dealer.ownerLineUid || "-"} />
                 <InfoRow label="Rank" value={dealer.rank} />
