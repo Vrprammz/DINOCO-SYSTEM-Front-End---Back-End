@@ -2363,7 +2363,7 @@ Mobile UX notes:
 | # | ไฟล์ | DB_ID | สิ่งที่แก้ |
 |---|------|-------|----------|
 | 4 | `[B2B] Snippet 3: LIFF E-Catalog REST API` | 52 | GET /catalog return tree data + place-order resolve leaf SKUs |
-| 5 | `[B2B] Snippet 4: LIFF E-Catalog Frontend` | 53 | เพิ่ม product detail view สำหรับ SET + ซื้อ grandchild แยก |
+| 5 | `[B2B] Snippet 4: LIFF E-Catalog Frontend` | 53 | V.32.0 DONE: SET badge + full-page detail view + children/grandchildren qty + cart duplicate detection |
 | 6 | `[B2B] Snippet 1: Core Utilities & Flex Builders` | — | แก้ `b2b_calculate_box_manifest()` leaf resolution + Flex builders แสดง grandchild |
 | 7 | `[B2B] Snippet 5: Admin Dashboard` | 54 | แก้ cancel stock restore ใช้ `dinoco_get_leaf_skus()` |
 | 8 | `[B2B] Snippet 9: Admin Control Panel` | 58 | แก้ product list + save ส่ง grandchild relations |
