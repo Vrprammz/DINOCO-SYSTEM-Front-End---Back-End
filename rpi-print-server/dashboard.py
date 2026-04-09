@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.38.0
+DINOCO B2B -- RPi Print Server Dashboard  V.39.0
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
 
@@ -452,22 +452,41 @@ def _get_sender_info():
     }
 
 
-def _render_manual_label(flash_data, recipient, sender, item_desc='', remark='', ref_no=''):
-    """Render manual_shipping_label.html → PDF bytes."""
+def _render_manual_label(flash_data, recipient, sender, item_desc='', remark='', ref_no='', use_logo=False):
+    """Render shipping_label.html → PDF bytes (same template as B2B orders)."""
     from jinja2 import Environment, FileSystemLoader
     env = Environment(loader=FileSystemLoader(os.path.join(BASE_DIR, 'templates')))
-    tmpl = env.get_template('manual_shipping_label.html')
+    tmpl = env.get_template('shipping_label.html')
 
     now_bkk = datetime.now(timezone(timedelta(hours=7))).strftime('%d/%m/%Y %H:%M')
 
+    # Map to shipping_label.html variable names
+    logo_path = os.path.join(BASE_DIR, 'assets', 'logo_bw.png') if use_logo else None
+    if logo_path and not os.path.exists(logo_path):
+        logo_path = None
+
     ctx = {
         'flash': flash_data,
-        'sender': sender,
-        'recipient': recipient,
+        'company': {
+            'name': sender.get('name', ''),
+            'phone': sender.get('phone', ''),
+            'address': sender.get('address', ''),
+        },
+        'order': {
+            'dist_name': recipient.get('name', ''),
+            'dist_phone': recipient.get('phone', ''),
+            'dist_address': recipient.get('address', ''),
+            'dist_district': recipient.get('district', ''),
+            'dist_province': recipient.get('province', ''),
+            'dist_postcode': recipient.get('postcode', ''),
+        },
+        'logo_path': logo_path,
+        'ticket_id': ref_no or '',
         'item_desc': item_desc,
         'remark': remark,
-        'ref_no': ref_no,
         'now': now_bkk,
+        'box': None,
+        'qr_data_uri': flash_data.get('qr_uri', ''),
     }
     html = tmpl.render(ctx)
 
@@ -589,7 +608,16 @@ def api_manual_flash_create():
     dst_store = data.get('dst_store_name', '')
 
     # 2. Render label with Flash data
-    sender = _get_sender_info()
+    # Use sender from request body (frontend dropdown), fallback to config
+    if body.get('src_name'):
+        sender = {
+            'name': body['src_name'],
+            'phone': body.get('src_phone', ''),
+            'address': body.get('src_address', ''),
+        }
+    else:
+        sender = _get_sender_info()
+    use_logo = body.get('sender_key') == 'dinoco'
     recipient = {
         'name': body.get('dst_name', ''),
         'phone': body.get('dst_phone', ''),
@@ -614,6 +642,7 @@ def api_manual_flash_create():
             item_desc=body.get('item_desc', ''),
             remark=body.get('remark', ''),
             ref_no=data.get('out_trade_no', ''),
+            use_logo=use_logo,
         )
         printed = _print_label_pdf(pdf_path)
         # Cleanup
