@@ -670,6 +670,21 @@ def api_manual_shipments():
         return jsonify({'success': False, 'message': str(e)}), 502
 
 
+@app.route('/api/rpi-distributors')
+@require_auth
+def api_rpi_distributors():
+    """Get distributor list from WordPress for auto-fill recipient."""
+    config = load_config()
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/b2b/v1/rpi-distributors'
+        resp = http_requests.get(url, headers={'X-Print-Key': api_key}, timeout=15)
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 502
+
+
 @app.route('/api/manual-flash-cancel', methods=['POST'])
 @require_auth
 def api_manual_flash_cancel():
