@@ -567,13 +567,9 @@ def _print_label_pdf(pdf_path):
 def manual_ship():
     """Manual shipping page — requires Basic Auth."""
     config = load_config()
-    sender = _get_sender_info()
     return render_template(
         'manual_ship.html',
         api_key=config.get('api_key', ''),
-        sender_name=sender['name'],
-        sender_phone=sender['phone'],
-        sender_address=sender['address'],
     )
 
 
