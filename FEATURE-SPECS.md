@@ -2357,6 +2357,7 @@ Mobile UX notes:
 | 1 | `[B2B] Snippet 15: Custom Tables & JWT Session` | — | **สร้าง 7 helper functions** + แก้ `dinoco_stock_auto_status()` [C-2], `dinoco_stock_get()` [M-1], `dinoco_get_reserved_qty()` [C-3], `dinoco_check_stock_conflict()` [M-2], `dinoco_get_inventory_valuation()` [M-1] |
 | 2 | `[B2B] Snippet 2: LINE Webhook Gateway` | — | แก้ stock deduct/return ใช้ `dinoco_get_leaf_skus()` [C-1] + cache invalidation cascade ancestors |
 | 3 | `[Admin System] DINOCO Global Inventory Database` | 22 | แก้ `save_sku_relation` รับ grandchild_map + UI renderCatChildren 2 ระดับ + loadCatalog + Dip Stock filter non-leaf + Inventory Manage computed stock + product delete cleanup |
+| 3.1 | `[Admin System] DINOCO Global Inventory Database` | 22 | V.39.1: Product Catalog hierarchy UI — filter bar (5 types: ทั้งหมด/SET/เดี่ยว/ลูกชิ้นส่วน/ชิ้นส่วนย่อย) + card type accents (border-left color) + hierarchy badges (child/grandchild) + context-aware modal (title + banner + set-section visibility) + `gotoParentSet()` navigate |
 
 ### Phase 2: B2B + Display
 
