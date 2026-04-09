@@ -453,40 +453,26 @@ def _get_sender_info():
 
 
 def _render_manual_label(flash_data, recipient, sender, item_desc='', remark='', ref_no='', use_logo=False):
-    """Render shipping_label.html → PDF bytes (same template as B2B orders)."""
+    """Render manual_shipping_label.html → PDF bytes."""
     from jinja2 import Environment, FileSystemLoader
     env = Environment(loader=FileSystemLoader(os.path.join(BASE_DIR, 'templates')))
-    tmpl = env.get_template('shipping_label.html')
+    tmpl = env.get_template('manual_shipping_label.html')
 
     now_bkk = datetime.now(timezone(timedelta(hours=7))).strftime('%d/%m/%Y %H:%M')
 
-    # Map to shipping_label.html variable names
     logo_path = os.path.join(BASE_DIR, 'assets', 'logo_bw.png') if use_logo else None
     if logo_path and not os.path.exists(logo_path):
         logo_path = None
 
     ctx = {
         'flash': flash_data,
-        'company': {
-            'name': sender.get('name', ''),
-            'phone': sender.get('phone', ''),
-            'address': sender.get('address', ''),
-        },
-        'order': {
-            'dist_name': recipient.get('name', ''),
-            'dist_phone': recipient.get('phone', ''),
-            'dist_address': recipient.get('address', ''),
-            'dist_district': recipient.get('district', ''),
-            'dist_province': recipient.get('province', ''),
-            'dist_postcode': recipient.get('postcode', ''),
-        },
+        'sender': sender,
+        'recipient': recipient,
         'logo_path': logo_path,
-        'ticket_id': ref_no or '',
         'item_desc': item_desc,
         'remark': remark,
+        'ref_no': ref_no,
         'now': now_bkk,
-        'box': None,
-        'qr_data_uri': flash_data.get('qr_uri', ''),
     }
     html = tmpl.render(ctx)
 
