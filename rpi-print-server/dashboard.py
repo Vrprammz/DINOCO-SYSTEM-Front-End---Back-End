@@ -460,15 +460,13 @@ def _render_manual_label(flash_data, recipient, sender, item_desc='', remark='',
 
     now_bkk = datetime.now(timezone(timedelta(hours=7))).strftime('%d/%m/%Y %H:%M')
 
-    logo_path = os.path.join(BASE_DIR, 'assets', 'logo_bw.png') if use_logo else None
-    if logo_path and not os.path.exists(logo_path):
-        logo_path = None
+    logo_url = 'https://www.dinoco.in.th/wp-content/uploads/2026/01/sss.png' if use_logo else None
 
     ctx = {
         'flash': flash_data,
         'sender': sender,
         'recipient': recipient,
-        'logo_path': logo_path,
+        'logo_url': logo_url,
         'item_desc': item_desc,
         'remark': remark,
         'ref_no': ref_no,
