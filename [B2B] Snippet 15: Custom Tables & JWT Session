@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.5.14 — ROOT CAUSE: migration method อยู่นอก class → ย้ายกลับ ║
+ * ║  Version: V.6.0 — 3-Level Product Hierarchy: 7 helper functions + cascade stock ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -790,36 +790,28 @@ if ( ! function_exists( 'dinoco_stock_auto_status' ) ) {
         // Cache invalidation (DD-5)
         delete_transient( 'b2b_sku_data_map' );
 
-        // SET parent update: ถ้า $sku เป็น child ของ SET → update parent status ด้วย
-        $relations = get_option( 'dinoco_sku_relations', [] );
-        foreach ( $relations as $parent_sku => $children ) {
-            if ( in_array( $sku, $children ) ) {
-                // คำนวณ parent stock = MIN(children)
-                $min_child = PHP_INT_MAX;
-                foreach ( $children as $c ) {
-                    $cq = $wpdb->get_var( $wpdb->prepare(
-                        "SELECT stock_qty FROM {$table} WHERE sku = %s AND is_active = 1", $c
-                    ) );
-                    $cq = $cq !== null ? (int) $cq : 0;
-                    if ( $cq < $min_child ) $min_child = $cq;
-                }
-                $parent_qty = $min_child === PHP_INT_MAX ? 0 : $min_child;
-                $parent_status = $parent_qty > 0 ? 'in_stock' : 'out_of_stock';
+        // V.6.0 [C-2 FIX]: Cascade update ancestor ทุกระดับ (grandchild → child → parent)
+        // ใช้ dinoco_get_ancestor_skus() + dinoco_compute_hierarchy_stock() แทน loop 1 ระดับ
+        if ( function_exists( 'dinoco_get_ancestor_skus' ) && function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            $ancestors = dinoco_get_ancestor_skus( $sku, $relations );
+            foreach ( $ancestors as $ancestor_sku ) {
+                $ancestor_stock  = dinoco_compute_hierarchy_stock( $ancestor_sku, $relations );
+                $ancestor_status = $ancestor_stock > 0 ? 'in_stock' : 'out_of_stock';
 
-                // Update parent stock_status
                 $wpdb->update( $table, array(
-                    'stock_status'     => $parent_status,
+                    'stock_status'     => $ancestor_status,
                     'stock_updated_at' => current_time( 'mysql' ),
-                ), array( 'sku' => $parent_sku ) );
+                ), array( 'sku' => $ancestor_sku ) );
 
-                // Dual-write parent to ACF
-                $parent_b2b = get_posts( array(
-                    'post_type' => 'b2b_product',
-                    'meta_query' => array( array( 'key' => 'product_sku', 'value' => $parent_sku ) ),
+                // Dual-write ancestor to ACF
+                $anc_b2b = get_posts( array(
+                    'post_type'      => 'b2b_product',
+                    'meta_query'     => array( array( 'key' => 'product_sku', 'value' => $ancestor_sku ) ),
                     'posts_per_page' => 1, 'fields' => 'ids',
                 ) );
-                if ( ! empty( $parent_b2b ) ) {
-                    update_field( 'stock_status', $parent_status, $parent_b2b[0] );
+                if ( ! empty( $anc_b2b ) ) {
+                    update_field( 'stock_status', $ancestor_status, $anc_b2b[0] );
                 }
             }
         }
@@ -841,23 +833,14 @@ if ( ! function_exists( 'dinoco_stock_get' ) ) {
         ), ARRAY_A );
         if ( ! $row ) return null;
 
-        // SET (แม่): stock = MIN(children stock) — ไม่ใช้ stock_qty ของตัวเอง
+        // V.6.0 [M-1 FIX]: non-leaf stock = recursive MIN via dinoco_compute_hierarchy_stock()
         $relations = get_option( 'dinoco_sku_relations', [] );
-        $is_set = isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] );
+        $is_set = ! dinoco_is_leaf_sku( $sku, $relations );
         $row['is_set'] = $is_set;
+        $row['is_leaf'] = ! $is_set;
 
-        if ( $is_set ) {
-            $children = $relations[ $sku ];
-            $min_child_stock = PHP_INT_MAX;
-            foreach ( $children as $child_sku ) {
-                $child = $wpdb->get_var( $wpdb->prepare(
-                    "SELECT stock_qty FROM {$table} WHERE sku = %s AND is_active = 1", $child_sku
-                ) );
-                $child_stock = $child !== null ? (int) $child : 0;
-                if ( $child_stock < $min_child_stock ) $min_child_stock = $child_stock;
-            }
-            if ( $min_child_stock === PHP_INT_MAX ) $min_child_stock = 0;
-            $row['stock_qty'] = $min_child_stock; // override กับค่าที่คำนวณ
+        if ( $is_set && function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
+            $row['stock_qty'] = dinoco_compute_hierarchy_stock( $sku, $relations );
             $row['stock_qty_source'] = 'computed_from_children';
         }
 
@@ -882,6 +865,269 @@ if ( ! function_exists( 'dinoco_stock_get' ) ) {
 }
 
 // ════════════════════════════════════════════════════════════
+// PART 1.35: SKU HIERARCHY HELPERS (V.6.0 — 3-Level Product Hierarchy)
+// ════════════════════════════════════════════════════════════
+// 7 helper functions สำหรับระบบ 3 ระดับ (แม่→ลูก→ชิ้นส่วนย่อย)
+// flat format: wp_options 'dinoco_sku_relations' = { parent: [children], child: [grandchildren] }
+// Max depth = 3, leaf-only stock deduction, shared child allowed
+
+/**
+ * ดึง leaf nodes ทั้งหมดของ SKU (recursive, max depth 3)
+ * leaf = SKU ที่ไม่มี children → ตัดสต็อกเฉพาะ leaf เท่านั้น [DD-2]
+ *
+ * dinoco_get_leaf_skus('SET_A')    → ['CHILD_C', 'GRAND_B1', 'GRAND_B2']
+ * dinoco_get_leaf_skus('CHILD_B')  → ['GRAND_B1', 'GRAND_B2']
+ * dinoco_get_leaf_skus('GRAND_B1') → ['GRAND_B1']
+ */
+if ( ! function_exists( 'dinoco_get_leaf_skus' ) ) {
+    function dinoco_get_leaf_skus( $sku, $relations = null, $depth = 0, &$visited = array() ) {
+        if ( $depth > 3 ) return array( $sku ); // hard limit [DD-4]
+
+        if ( $relations === null ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+        }
+
+        $sku_upper = strtoupper( trim( $sku ) );
+
+        // circular ref guard
+        if ( in_array( $sku_upper, $visited, true ) ) return array();
+        $visited[] = $sku_upper;
+
+        // ถ้าไม่มี children → เป็น leaf
+        if ( ! isset( $relations[ $sku_upper ] ) || empty( $relations[ $sku_upper ] ) ) {
+            // ลอง original case ด้วย
+            if ( ! isset( $relations[ $sku ] ) || empty( $relations[ $sku ] ) ) {
+                return array( $sku_upper );
+            }
+            $children = $relations[ $sku ];
+        } else {
+            $children = $relations[ $sku_upper ];
+        }
+
+        if ( ! is_array( $children ) || empty( $children ) ) {
+            return array( $sku_upper );
+        }
+
+        // recursive resolve children → leaf nodes
+        $leaves = array();
+        foreach ( $children as $child ) {
+            $child_leaves = dinoco_get_leaf_skus( $child, $relations, $depth + 1, $visited );
+            $leaves = array_merge( $leaves, $child_leaves );
+        }
+
+        return $leaves;
+    }
+}
+
+/**
+ * เช็คว่า SKU เป็น leaf (ไม่มี children) → ใช้ filter Dip Stock snapshot
+ */
+if ( ! function_exists( 'dinoco_is_leaf_sku' ) ) {
+    function dinoco_is_leaf_sku( $sku, $relations = null ) {
+        if ( $relations === null ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+        }
+        $sku_upper = strtoupper( trim( $sku ) );
+        if ( isset( $relations[ $sku_upper ] ) && ! empty( $relations[ $sku_upper ] ) ) return false;
+        if ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) return false;
+        return true;
+    }
+}
+
+/**
+ * หา ancestor (parent) ทุกระดับของ SKU [C-2, C-3 FIX]
+ *
+ * dinoco_get_ancestor_skus('GRAND_B1') → ['CHILD_B', 'SET_A']
+ * dinoco_get_ancestor_skus('CHILD_C')  → ['SET_A']
+ * dinoco_get_ancestor_skus('SET_A')    → []
+ */
+if ( ! function_exists( 'dinoco_get_ancestor_skus' ) ) {
+    function dinoco_get_ancestor_skus( $sku, $relations = null ) {
+        if ( $relations === null ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+        }
+        $sku_upper = strtoupper( trim( $sku ) );
+        $ancestors = array();
+        $max_depth = 3;
+        $current   = $sku_upper;
+
+        for ( $i = 0; $i < $max_depth; $i++ ) {
+            $found_parent = null;
+            foreach ( $relations as $parent => $children ) {
+                if ( ! is_array( $children ) ) continue;
+                $children_upper = array_map( function( $c ) { return strtoupper( trim( $c ) ); }, $children );
+                if ( in_array( $current, $children_upper, true ) ) {
+                    $found_parent = strtoupper( trim( $parent ) );
+                    break;
+                }
+            }
+            if ( $found_parent === null ) break;
+            if ( in_array( $found_parent, $ancestors, true ) ) break; // circular guard
+            $ancestors[] = $found_parent;
+            $current = $found_parent;
+        }
+
+        return $ancestors;
+    }
+}
+
+/**
+ * คำนวณ stock สำหรับ SKU (recursive MIN) [M-1 FIX — centralize]
+ * leaf → return stock_qty จาก DB
+ * non-leaf → return MIN(children computed stock)
+ */
+if ( ! function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
+    function dinoco_compute_hierarchy_stock( $sku, $relations = null, $depth = 0 ) {
+        if ( $depth > 3 ) return 0;
+
+        if ( $relations === null ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+        }
+
+        global $wpdb;
+        $table     = $wpdb->prefix . 'dinoco_products';
+        $sku_upper = strtoupper( trim( $sku ) );
+
+        // หา children
+        $children = null;
+        if ( isset( $relations[ $sku_upper ] ) && ! empty( $relations[ $sku_upper ] ) ) {
+            $children = $relations[ $sku_upper ];
+        } elseif ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) {
+            $children = $relations[ $sku ];
+        }
+
+        // leaf → return stock_qty ตรง
+        if ( ! is_array( $children ) || empty( $children ) ) {
+            $qty = $wpdb->get_var( $wpdb->prepare(
+                "SELECT stock_qty FROM {$table} WHERE sku = %s AND is_active = 1", $sku_upper
+            ) );
+            return $qty !== null ? (int) $qty : 0;
+        }
+
+        // non-leaf → MIN(children computed stock)
+        $min_stock = PHP_INT_MAX;
+        foreach ( $children as $child ) {
+            $child_stock = dinoco_compute_hierarchy_stock( $child, $relations, $depth + 1 );
+            if ( $child_stock < $min_stock ) $min_stock = $child_stock;
+        }
+
+        return $min_stock === PHP_INT_MAX ? 0 : $min_stock;
+    }
+}
+
+/**
+ * เช็คว่า SKU เป็น top-level SET (เป็น parent แต่ไม่เป็น child ของใคร) [DD-6]
+ * ใช้ filter B2C pages — ไม่แสดง sub-SET เป็น standalone bundle
+ */
+if ( ! function_exists( 'dinoco_is_top_level_set' ) ) {
+    function dinoco_is_top_level_set( $sku, $relations = null ) {
+        if ( $relations === null ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+        }
+        $sku_upper = strtoupper( trim( $sku ) );
+
+        // ต้องเป็น parent (มี children)
+        $is_parent = ( isset( $relations[ $sku_upper ] ) && ! empty( $relations[ $sku_upper ] ) )
+                  || ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) );
+        if ( ! $is_parent ) return false;
+
+        // ต้องไม่เป็น child ของ parent อื่น
+        foreach ( $relations as $parent => $children ) {
+            if ( ! is_array( $children ) ) continue;
+            $children_upper = array_map( function( $c ) { return strtoupper( trim( $c ) ); }, $children );
+            if ( in_array( $sku_upper, $children_upper, true ) ) {
+                return false; // เป็น child ของ $parent → ไม่ใช่ top-level
+            }
+        }
+
+        return true;
+    }
+}
+
+/**
+ * Validate ว่าเพิ่ม child ได้หรือไม่ (ก่อน save) [DD-4]
+ * - ห้าม self reference
+ * - ห้าม circular reference
+ * - ห้าม depth > 3
+ * - Allow shared child [DD-3]
+ */
+if ( ! function_exists( 'dinoco_validate_sku_hierarchy' ) ) {
+    function dinoco_validate_sku_hierarchy( $parent_sku, $child_sku, $relations = null ) {
+        if ( $relations === null ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+        }
+        $parent_upper = strtoupper( trim( $parent_sku ) );
+        $child_upper  = strtoupper( trim( $child_sku ) );
+
+        // self reference
+        if ( $parent_upper === $child_upper ) return false;
+
+        // circular: child ต้องไม่เป็น ancestor ของ parent
+        $parent_ancestors = dinoco_get_ancestor_skus( $parent_upper, $relations );
+        if ( in_array( $child_upper, $parent_ancestors, true ) ) return false;
+
+        // depth: สมมุติ parent อยู่ depth X → child จะอยู่ depth X+1
+        // ถ้า child มี children อยู่แล้ว → depth X+2 ต้อง <= 3
+        $parent_depth = count( dinoco_get_ancestor_skus( $parent_upper, $relations ) ) + 1; // parent's own depth
+        $child_max_depth = 0;
+        if ( isset( $relations[ $child_upper ] ) && ! empty( $relations[ $child_upper ] ) ) {
+            $child_max_depth = 1; // child มี children = อย่างน้อย 1 ระดับลง
+            foreach ( $relations[ $child_upper ] as $gc ) {
+                $gc_upper = strtoupper( trim( $gc ) );
+                if ( isset( $relations[ $gc_upper ] ) && ! empty( $relations[ $gc_upper ] ) ) {
+                    $child_max_depth = 2;
+                    break;
+                }
+            }
+        }
+
+        // total depth = parent_depth + 1 (child) + child_max_depth
+        if ( $parent_depth + 1 + $child_max_depth > 3 ) return false;
+
+        return true;
+    }
+}
+
+/**
+ * ดึง hierarchy tree ของ SKU (สำหรับ Admin UI + B2B detail)
+ * Return: ['sku'=>'X', 'children'=>[['sku'=>'A','children'=>[...]], ...]]
+ */
+if ( ! function_exists( 'dinoco_get_sku_tree' ) ) {
+    function dinoco_get_sku_tree( $sku, $relations = null, $depth = 0 ) {
+        if ( $depth > 3 ) return array( 'sku' => $sku, 'children' => array() );
+
+        if ( $relations === null ) {
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+        }
+        $sku_upper = strtoupper( trim( $sku ) );
+
+        $children_skus = null;
+        if ( isset( $relations[ $sku_upper ] ) && ! empty( $relations[ $sku_upper ] ) ) {
+            $children_skus = $relations[ $sku_upper ];
+        } elseif ( isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] ) ) {
+            $children_skus = $relations[ $sku ];
+        }
+
+        $tree = array( 'sku' => $sku_upper, 'children' => array() );
+
+        if ( is_array( $children_skus ) && ! empty( $children_skus ) ) {
+            foreach ( $children_skus as $child ) {
+                $tree['children'][] = dinoco_get_sku_tree( $child, $relations, $depth + 1 );
+            }
+        }
+
+        return $tree;
+    }
+}
+
+// ════════════════════════════════════════════════════════════
 // PART 1.4: RESERVED QTY + AVAILABLE QTY + CONFLICT (V.4.0 — Phase 4)
 // ════════════════════════════════════════════════════════════
 
@@ -902,11 +1148,17 @@ if ( ! function_exists( 'dinoco_get_reserved_qty' ) ) {
         $reserve_statuses = array( 'checking_stock', 'awaiting_confirm', 'awaiting_payment', 'paid', 'packed' );
         $relations = get_option( 'dinoco_sku_relations', array() );
 
-        // สร้าง list ของ SKU ที่ต้อง match: ตัวเอง + parent ที่มี child = ตัวเอง
+        // V.6.0 [C-3 FIX]: สร้าง list ของ SKU ที่ต้อง match: ตัวเอง + ancestor ทุกระดับ
         $match_skus = array( $sku ); // direct match
-        foreach ( $relations as $parent_sku => $children ) {
-            if ( is_array( $children ) && in_array( $sku, array_map( 'strtoupper', $children ), true ) ) {
-                $match_skus[] = strtoupper( $parent_sku );
+        if ( function_exists( 'dinoco_get_ancestor_skus' ) ) {
+            $ancestors = dinoco_get_ancestor_skus( $sku, $relations );
+            $match_skus = array_merge( $match_skus, $ancestors );
+        } else {
+            // fallback: 1 ระดับเดิม
+            foreach ( $relations as $parent_sku => $children ) {
+                if ( is_array( $children ) && in_array( $sku, array_map( 'strtoupper', $children ), true ) ) {
+                    $match_skus[] = strtoupper( $parent_sku );
+                }
             }
         }
         $match_skus = array_unique( $match_skus );
@@ -945,11 +1197,21 @@ if ( ! function_exists( 'dinoco_get_reserved_qty' ) ) {
                     continue;
                 }
 
-                // ถ้า item_sku เป็น parent set ที่มี child = $sku → reserved
-                if ( in_array( $item_sku, $match_skus, true ) && isset( $relations[ $item_sku ] ) ) {
-                    $children = array_map( 'strtoupper', $relations[ $item_sku ] );
-                    if ( in_array( $sku, $children, true ) ) {
-                        $total_reserved += $item_qty;
+                // V.6.0 [C-3 FIX]: ถ้า item_sku เป็น ancestor ของ $sku → reserved
+                // ancestor matching ครอบคลุมทั้ง parent (1 ระดับ) + grandparent (2 ระดับ)
+                if ( in_array( $item_sku, $match_skus, true ) ) {
+                    // ตรวจว่า $sku เป็น leaf ของ $item_sku จริง
+                    if ( function_exists( 'dinoco_get_leaf_skus' ) ) {
+                        $item_leaves = dinoco_get_leaf_skus( $item_sku, $relations );
+                        $item_leaves_upper = array_map( 'strtoupper', $item_leaves );
+                        if ( in_array( $sku, $item_leaves_upper, true ) ) {
+                            $total_reserved += $item_qty;
+                        }
+                    } elseif ( isset( $relations[ $item_sku ] ) ) {
+                        $children = array_map( 'strtoupper', $relations[ $item_sku ] );
+                        if ( in_array( $sku, $children, true ) ) {
+                            $total_reserved += $item_qty;
+                        }
                     }
                 }
             }
@@ -1035,6 +1297,12 @@ if ( ! function_exists( 'dinoco_check_stock_conflict' ) ) {
 
                 if ( $item_sku === $sku ) {
                     $is_match = true;
+                } elseif ( function_exists( 'dinoco_get_leaf_skus' ) ) {
+                    // V.6.0 [M-2 FIX]: resolve leaf nodes 3 ระดับ
+                    $item_leaves = array_map( 'strtoupper', dinoco_get_leaf_skus( $item_sku, $relations ) );
+                    if ( in_array( $sku, $item_leaves, true ) ) {
+                        $is_match = true;
+                    }
                 } elseif ( isset( $relations[ $item_sku ] ) ) {
                     $children = array_map( 'strtoupper', $relations[ $item_sku ] );
                     if ( in_array( $sku, $children, true ) ) {
@@ -1329,17 +1597,11 @@ if ( ! function_exists( 'dinoco_get_inventory_valuation' ) ) {
 
         foreach ( $products as $p ) {
             $sku  = $p['sku'];
-            $is_set = isset( $relations[ $sku ] ) && ! empty( $relations[ $sku ] );
+            // V.6.0 [M-1 FIX]: non-leaf stock = recursive MIN via helper
+            $is_set = ! dinoco_is_leaf_sku( $sku, $relations );
 
-            // SET (แม่): stock = MIN(children) — ไม่นับ stock ของตัวเอง
-            if ( $is_set ) {
-                $min_child = PHP_INT_MAX;
-                foreach ( $relations[ $sku ] as $c ) {
-                    $cq = $wpdb->get_var( $wpdb->prepare( "SELECT stock_qty FROM {$p_table} WHERE sku = %s AND is_active = 1", $c ) );
-                    $cq = $cq !== null ? (int) $cq : 0;
-                    if ( $cq < $min_child ) $min_child = $cq;
-                }
-                $qty = $min_child === PHP_INT_MAX ? 0 : $min_child;
+            if ( $is_set && function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
+                $qty = dinoco_compute_hierarchy_stock( $sku, $relations );
             } else {
                 $qty = (int) $p['stock_qty'];
             }

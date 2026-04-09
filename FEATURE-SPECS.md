@@ -85,6 +85,20 @@
 - [8. Lead Pipeline V.2.0](#8-lead-pipeline-v20)
 - [9. AI Chat Fixes (V.8.1)](#9-ai-chat-fixes-v81)
 - [10. Docker/Deploy Updates](#10-dockerdeploy-updates-2026-04-07)
+- [11. Product Hierarchy 3 ระดับ (แม่-ลูก-หลาน)](#11-product-hierarchy-3-ระดับ-แม่-ลูก-หลาน)
+  - [11.1 Problem & Goal](#111-problem--goal-1)
+  - [11.2 Design Decisions](#112-design-decisions)
+  - [11.3 Data Model](#113-data-model)
+  - [11.4 Helper Functions (Snippet 15)](#114-helper-functions-snippet-15)
+  - [11.5 User Flows](#115-user-flows)
+  - [11.6 API & Backend Changes](#116-api--backend-changes)
+  - [11.7 UI Changes](#117-ui-changes)
+  - [11.8 Files Impact Map (16 ไฟล์)](#118-files-impact-map-16-ไฟล์)
+  - [11.9 Implementation Roadmap (3 Phases)](#119-implementation-roadmap-3-phases)
+  - [11.10 Edge Cases & Rules](#1110-edge-cases--rules)
+  - [11.11 Risk & Mitigation](#1111-risk--mitigation)
+  - [11.12 Testing Checklist](#1112-testing-checklist)
+  - [11.13 Rollback Plan](#1113-rollback-plan)
 
 ---
 
@@ -1766,3 +1780,783 @@ Mask เบอร์โทร/ชื่อจริงใน conversation histor
 ## 10.4 Environment Variables
 
 - `LINE_CHANNEL_ACCESS_TOKEN` ต้องใส่ใน .env (B2B bot token เดียวกับ WP `B2B_LINE_ACCESS_TOKEN`)
+
+---
+
+# 11. Product Hierarchy 3 ระดับ (แม่-ลูก-หลาน)
+
+**Status:** 📋 Planned (ยังไม่ implement)
+**Date:** 2026-04-09 | **Author:** Feature Architect + Tech Lead Review
+**Reviewed:** APPROVE WITH CONDITIONS — patched 3 Critical + 2 Missing Files
+
+> ระบบ SKU relations ปัจจุบันรองรับแค่ 2 ระดับ (แม่→ลูก) แต่สินค้าจริงมี 3 ระดับ
+> หลาน (grandchild) แสดงเฉพาะ B2B + Admin หลังบ้าน ไม่กระทบลูกค้าหน้าบ้าน (B2C)
+
+## 11.1 Problem & Goal
+
+### ปัญหา
+
+สินค้าบางตัว "ลูก" แยกได้อีก:
+
+```
+ชุดกันล้ม Honda Forza 350 (SET — แม่)
+  ├── กันล้มบน (ลูก — ชิ้นเดียว ขายแยกได้)
+  └── กันล้มล่าง ชุด (ลูก — ตัวเองก็เป็น sub-SET)
+        ├── กันล้มล่าง ข้างซ้าย (หลาน)
+        └── กันล้มล่าง ข้างขวา (หลาน)
+```
+
+ระบบ 2 ระดับจัดการไม่ได้ เพราะ stock computation, reserved qty, stock deduction ไม่รองรับ cascade 3 ชั้น
+
+### ใครมีปัญหา
+
+- **Admin**: สร้าง product hierarchy ครบไม่ได้ใน Product Catalog
+- **B2B ตัวแทน**: สั่งซื้อหลาน (อะไหล่ย่อย เช่น กันล้มล่างข้างซ้าย) แยกไม่ได้
+- **Inventory**: สต็อกคำนวณผิดเมื่อ child มี grandchildren
+
+### ขอบเขต (Scope)
+
+- **หลานแสดงเฉพาะ B2B + Admin** — ตัวแทนจำหน่ายซื้อหลานแยกเป็นอะไหล่ได้
+- **ลูกค้าหน้าบ้าน (B2C) ไม่เกี่ยว** — หน้า Edit Profile, Assets List, Member Dashboard เห็นแค่ SET ระดับบนสุดเหมือนเดิม
+- **B2F เห็นหลานได้** — สั่งโรงงานสั่ง SKU หลานแยกได้ (B2F ใช้ SKU ตรง + `dinoco_stock_add()` trigger cascade อัตโนมัติ ไม่ต้องแก้ B2F code)
+
+### Success Metrics
+
+1. Admin สร้าง hierarchy 3 ระดับได้ใน Product Catalog UI
+2. Stock cascade ถูกต้อง: grandchild → child → parent
+3. ตัวแทน (B2B) สั่ง grandchild แยกได้ใน E-Catalog LIFF
+4. Reserved qty cascade 3 ระดับถูกต้อง
+5. ลูกค้าหน้าบ้านไม่เห็นความเปลี่ยนแปลง
+6. Backward compatible: product 2 ระดับเดิมทำงานเหมือนเดิม 100%
+
+## 11.2 Design Decisions
+
+### DD-1: Flat format ใน wp_options (ไม่เปลี่ยน data structure)
+
+```php
+// ปัจจุบัน:
+{ "SET_A": ["CHILD_B", "CHILD_C"] }
+
+// หลังอัพเกรด (เพิ่ม entry สำหรับ child ที่มี grandchildren):
+{
+  "SET_A":   ["CHILD_B", "CHILD_C"],
+  "CHILD_B": ["GRAND_B1", "GRAND_B2"]    // ← เพิ่มใหม่
+}
+```
+
+**เหตุผล**: code 17+ จุดอ่าน format `{ parent: [children] }` อยู่ — ถ้าเปลี่ยน format ต้องแก้ทุกจุดพร้อมกัน เสี่ยงพัง
+
+### DD-2: Leaf-only stock deduction (กฎเหล็ก)
+
+ตัดสต็อกเฉพาะ leaf nodes (SKU ที่ไม่มี children) เท่านั้น:
+- สั่ง SET → ตัด leaf [child_A, grand_B1, grand_B2]
+- สั่ง child_B (มี grandchildren) → ตัด leaf [grand_B1, grand_B2]
+- สั่ง grand_B1 → ตัดตรง [grand_B1]
+
+Non-leaf stock เป็น computed (MIN) เสมอ ไม่ตัดตรง
+
+### DD-3: Shared child = Allow
+
+สินค้า DINOCO มี child ที่ใช้ร่วมข้ามหลาย SET ได้ (เช่น กันล้มบน ใช้ได้กับหลายรุ่นรถ ไม่ได้แยก SKU) ดังนั้น:
+- child/grandchild ตัวเดียว **อยู่ใน หลาย SET ได้**
+- Reserved qty จะนับรวมจากทุก SET ที่มี child ตัวนั้น (ถูกต้อง)
+
+### DD-4: Max depth = 3 (hard limit)
+
+ไม่ recursive ไม่จำกัด — business case จริงไม่เคยเกิน 3 ระดับ
+
+### DD-5: Walk-in ตัดสต็อกเกินได้ (ติดลบ)
+
+Walk-in ข้าม stock check แต่ยังตัดสต็อก leaf nodes — ถ้าตัดเกินให้ติดลบในระบบ
+
+### DD-6: หลานไม่กระทบลูกค้าหน้าบ้าน (B2C) แต่ B2B + B2F เห็น
+
+- **B2C**: หน้า Edit Profile, Assets List, Member Dashboard เห็นแค่ top-level SET — ใช้ `dinoco_is_top_level_set()` filter sub-SET ออก
+- **B2B + B2F**: เห็นหลานได้ สั่งซื้อ/สั่งโรงงาน SKU หลานแยกได้
+
+### DD-7: B2F สั่งแม่ → Auto-expand leaf ทั้งหมด / B2B สั่งแม่ → แสดงแค่ลูก
+
+- **B2F (สั่งโรงงาน)**: Admin สั่ง SET (แม่) → ระบบ auto list ลูก+ชิ้นส่วนย่อย (leaf nodes ทั้งหมด) ในใบสั่งซื้อ PO + Flex card เลย เพราะโรงงานต้องเห็นรายการจริงที่ผลิต/ส่ง
+- **B2B (ตัวแทนสั่ง)**: สั่ง SET (แม่) → Flex/Invoice แสดงแค่ลูกชั้นเดียวเหมือนเดิม ไม่ขยายถึงชิ้นส่วนย่อย (แสดงเยอะเกินไปสำหรับตัวแทน)
+
+**DD-7 Expansion Point — Option A (expand ตอน create-po)**:
+- Expand เกิดที่ `b2f_rest_create_po()` ใน B2F Snippet 2 — ก่อน save items เข้า ACF repeater `po_items`
+- ระบบ resolve SET SKU → leaf SKUs ด้วย `dinoco_get_leaf_skus()` แล้วเก็บ leaf items ใน PO ตรง
+- **Leaf SKUs ต้องมี `b2f_maker_product` entries ด้วย** — ถ้าไม่มี → error "สินค้า X ยังไม่ได้ลงทะเบียนกับโรงงาน"
+- ข้อดี: Flex builders / PO Image / PO Ticket / Admin Dashboard **ไม่ต้องแก้เลย** เพราะอ่าน `po_items` ที่ expanded แล้ว
+- **B2F ต้องแก้แค่ Snippet 2 จุด `create-po` เท่านั้น** (ลดจาก 5 ไฟล์ เหลือ 1 ไฟล์)
+
+## 11.3 Data Model
+
+### Storage: `wp_options` key `dinoco_sku_relations`
+
+ไม่สร้าง table ใหม่ — ใช้ flat format เดิม เพิ่มแค่ entries สำหรับ child ที่มี grandchildren
+
+### Migration: ไม่ต้องทำ
+
+format เดิม `{ parent: [children] }` compatible กับ format ใหม่ 100% — เพิ่ม entries ใหม่เมื่อ admin กำหนด grandchild ผ่าน UI
+
+### Grandchild ต้องเป็น product ที่มีอยู่
+
+grandchild SKU ต้องมี row ใน `dinoco_products` custom table อยู่แล้ว (Admin ต้องสร้าง product entry ก่อนเพิ่ม relation)
+
+### Product delete cleanup
+
+เมื่อ admin ลบ product จาก catalog → auto-remove SKU นั้นจาก `dinoco_sku_relations` ทุก entry ที่มีอยู่ (ทั้ง child และ grandchild) ป้องกัน stock compute query ไม่เจอ → return 0 → ทำให้ stock chain เป็น 0 ทั้งหมด
+
+## 11.4 Helper Functions (Snippet 15)
+
+สร้างใน `[B2B] Snippet 15` (centralized) wrapped ใน `function_exists` guard:
+
+### `dinoco_get_leaf_skus($sku, $relations = null, $depth = 0, &$visited = [])`
+
+Resolve leaf nodes recursive (max depth 3):
+- ถ้า $sku ไม่มี children → return [$sku] (ตัวเองเป็น leaf)
+- ถ้า $sku มี children → recursive ลง children
+- Guard: circular ref ด้วย $visited set + depth limit
+
+```
+dinoco_get_leaf_skus('SET_A')   → ['CHILD_C', 'GRAND_B1', 'GRAND_B2']
+dinoco_get_leaf_skus('CHILD_B') → ['GRAND_B1', 'GRAND_B2']
+dinoco_get_leaf_skus('GRAND_B1') → ['GRAND_B1']
+```
+
+### `dinoco_is_leaf_sku($sku, $relations = null)`
+
+เช็คว่า SKU ไม่มี children (เป็น leaf node) — ใช้ filter Dip Stock snapshot
+
+### `dinoco_get_ancestor_skus($sku, $relations = null)`
+
+หา parent ทุกระดับ recursive:
+```
+dinoco_get_ancestor_skus('GRAND_B1') → ['CHILD_B', 'SET_A']
+dinoco_get_ancestor_skus('CHILD_C')  → ['SET_A']
+dinoco_get_ancestor_skus('SET_A')    → []
+```
+
+**[CRITICAL-3 FIX]** ใช้ใน `dinoco_get_reserved_qty()` + `dinoco_check_stock_conflict()` เพื่อ match ancestor ทุกระดับ
+
+### `dinoco_compute_hierarchy_stock($sku, $relations = null)`
+
+Recursive MIN stock:
+- leaf → return stock_qty จาก DB
+- non-leaf → return MIN(children computed stock)
+
+**[MEDIUM-1 FIX]** ใช้แทน inline MIN(children) ที่ copy-paste 5+ จุด — centralize เป็น function เดียว
+
+### `dinoco_is_top_level_set($sku, $relations = null)`
+
+**[DD-6]** เช็คว่า SKU เป็น key ใน relations map **แต่ไม่เป็น child ของ key อื่น** → เป็น SET ระดับบนสุดจริงๆ
+
+ใช้ใน B2C pages (Edit Profile, Assets List, Member Dashboard) เพื่อ filter sub-SET ออก
+
+### `dinoco_validate_sku_hierarchy($parent_sku, $child_sku, $relations = null)`
+
+Validate ก่อน save:
+- ห้าม self reference (A→A)
+- ห้าม circular ref (A→B→C→A)
+- ห้าม depth > 3
+- **Allow** shared child (child อยู่ใน หลาย parent ได้ — DD-3)
+
+### `dinoco_get_sku_tree($sku, $relations = null, $depth = 0)`
+
+Return hierarchy tree:
+```php
+['sku'=>'SET_A', 'children'=>[
+    ['sku'=>'CHILD_B', 'children'=>[
+        ['sku'=>'GRAND_B1', 'children'=>[]],
+        ['sku'=>'GRAND_B2', 'children'=>[]]
+    ]],
+    ['sku'=>'CHILD_C', 'children'=>[]]
+]]
+```
+
+ใช้ใน Admin UI render tree + B2B LIFF product detail
+
+## 11.5 User Flows
+
+### Flow A: Admin สร้าง 3-level hierarchy (Product Catalog)
+
+```
+Happy Path:
+1. เปิด Product Catalog → กด Edit product ที่เป็น SET
+2. เห็น "องค์ประกอบชุด" section
+3. เพิ่ม child A (เดี่ยว) + child B (จะมี grandchild)
+4. คลิกขยาย child B → "เพิ่มชิ้นส่วนย่อย"
+5. Search + เลือก grandchild G1, G2
+6. กด "บันทึก" → save product + relations
+7. กลับหน้า catalog → เห็น SET badge + child count
+
+Error Paths:
+├── Circular ref → alert "พบ circular reference"
+├── Max depth → alert "รองรับสูงสุด 3 ระดับ"
+├── Save fail → Swal error
+└── ลบ child ที่มี grandchildren → prompt ยืนยัน
+```
+
+### Flow B: B2B ตัวแทนซื้อ grandchild แยก (E-Catalog LIFF)
+
+```
+Happy Path:
+1. เปิด E-Catalog → เห็น product grid
+2. กดที่ SET product → เปิด product detail
+3. เห็น: ซื้อชุดเต็ม / หรือเลือกซื้อรายชิ้น
+4. กด [+] ที่ grandchild → เข้า cart
+5. Checkout → order สร้างสำเร็จ
+
+Error Paths:
+├── grandchild หมดสต็อก → ปุ่ม disabled + badge "สินค้าหมด"
+└── สั่งเกิน available → alert "ไม่เพียงพอ"
+```
+
+### Flow C: Stock Deduction Cascade (กฎ leaf-only)
+
+```
+สั่ง SET (แม่):
+├── resolve leaf nodes: [child_A, grand_B1, grand_B2]
+├── ตัดสต็อก leaf nodes ทั้งหมด
+└── cascade update status: grand → child → parent
+
+สั่ง child_B (มี grandchildren):
+├── resolve leaf: [grand_B1, grand_B2]
+├── ตัดสต็อก grand_B1 + grand_B2 (ไม่ตัด child_B)
+└── cascade update: grand → child_B → parent (ถ้ามี)
+
+สั่ง grand_B1 (leaf):
+├── ตัดสต็อก grand_B1 ตรง
+└── cascade update: grand_B1 → child_B → parent
+```
+
+### Flow D: Walk-in + 3-level
+
+```
+สั่ง SET → ข้าม stock check → ตัดสต็อก leaf nodes → ถ้าเกิน stock ให้ติดลบ
+```
+
+### Flow E: Dip Stock (นับสต็อก) กับ 3 ระดับ
+
+```
+1. เริ่ม session → snapshot เฉพาะ leaf nodes (filter non-leaf ออก)
+2. Admin นับจำนวนจริง leaf nodes เท่านั้น
+3. Approve → ปรับ stock leaf → cascade update child → parent
+```
+
+## 11.6 API & Backend Changes
+
+### [CRITICAL-1 FIX] Stock Deduction — ใช้ `dinoco_get_leaf_skus()` แทน `$relations[$sku]`
+
+**Snippet 2** `dinoco_inv_on_status_change()`:
+```php
+// เดิม (บรรทัด 3574-3587):
+if (isset($relations[$sku]) && !empty($relations[$sku])) {
+    foreach ($relations[$sku] as $child_sku) {
+        dinoco_stock_subtract($child_sku, $qty, ...);  // ← แค่ 1 ระดับ
+    }
+}
+
+// ใหม่:
+$leaf_skus = dinoco_get_leaf_skus($sku, $relations);
+foreach ($leaf_skus as $leaf) {
+    dinoco_stock_subtract($leaf, $qty, ...);  // ← ตัด leaf เท่านั้น
+}
+```
+
+เดียวกันกับ cancel stock return (บรรทัด 3620-3623) + **Snippet 5** admin cancel (บรรทัด 749-761)
+
+### [CRITICAL-2 FIX] `dinoco_stock_auto_status()` — cascade ขึ้น grandparent
+
+**Snippet 15** (บรรทัด 794-825):
+```php
+// เดิม: หา parent 1 ระดับ แล้วจบ
+// ใหม่: หา ancestor ทุกระดับ แล้ว update ทุกตัว
+$ancestors = dinoco_get_ancestor_skus($sku, $relations);
+foreach ($ancestors as $ancestor_sku) {
+    $ancestor_stock = dinoco_compute_hierarchy_stock($ancestor_sku, $relations);
+    $ancestor_status = $ancestor_stock > 0 ? 'in_stock' : 'out_of_stock';
+    // update $ancestor_sku status...
+}
+```
+
+### [CRITICAL-3 FIX] `dinoco_get_reserved_qty()` — ancestor matching ทุกระดับ
+
+**Snippet 15** (บรรทัด 903-912):
+```php
+// เดิม: หา parent 1 ระดับ
+// ใหม่: หา ancestor ทุกระดับ
+$match_skus = array($sku);
+$ancestors = dinoco_get_ancestor_skus($sku, $relations);
+$match_skus = array_merge($match_skus, $ancestors);
+$match_skus = array_unique($match_skus);
+```
+
+### Inventory Database — save_sku_relation action
+
+แก้ (บรรทัด 170-178) ให้รับ `grandchild_map`:
+```
+POST: { action: 'save_sku_relation', parent_sku: 'SET_A', child_skus: ['A', 'B'],
+         grandchild_map: { 'B': ['G1', 'G2'] } }
+```
+PHP: save `relations[parent] = children` + save `relations[child] = grandchildren` + cleanup orphaned grandchild entries + validate hierarchy
+
+### Inventory Database — get_catalog action
+
+เพิ่ม flag ใน catalog data:
+- `is_set` (เหมือนเดิม)
+- `has_grandchildren` (ใหม่ — ถ้า child ตัวไหนมี entry ใน relations)
+- `is_leaf` (ใหม่ — ไม่มี children)
+
+### B2B Snippet 3 — GET /catalog
+
+Return children + grandchildren data สำหรับ LIFF frontend:
+```json
+{
+  "sku": "SET_A",
+  "is_set": true,
+  "children": ["CHILD_B", "CHILD_C"],
+  "tree": { ... }  // จาก dinoco_get_sku_tree()
+}
+```
+
+### B2B Snippet 3 — place-order
+
+Validate + resolve leaf SKUs สำหรับ stock check ก่อนสร้าง order
+
+### Product Delete Cleanup
+
+เมื่อ admin ลบ product → scan `dinoco_sku_relations` ทุก entry → remove SKU ที่ถูกลบ → ถ้า children array เปล่า → ลบ entry ทั้ง row
+
+## 11.7 UI Changes
+
+### Thai Label Guide (ห้ามใช้คำว่า "หลาน" ใน UI)
+
+| Context | Thai Label | หมายเหตุ |
+|---------|-----------|---------|
+| Admin: child ที่มี grandchildren | **ชุดย่อย** หรือ badge `[SUB-SET]` | ใน editor modal |
+| Admin/B2B: grandchild | **ชิ้นส่วนย่อย** | ใช้ทุกที่แทนคำว่า "หลาน" |
+| B2B: section header ใน detail | **ซื้อแยกชิ้น** | ใน product detail view |
+| B2B: SET button | **เพิ่มชุดเต็มลงตะกร้า** | primary action |
+| Admin: เพิ่ม grandchild | **เพิ่มชิ้นส่วนย่อย** | ปุ่มใน editor modal |
+| Admin: section title | **องค์ประกอบชุด** | ใช้อยู่แล้วไม่ต้องเปลี่ยน |
+| Admin: child count | **X ชิ้นในชุด** | ใน catalog card |
+| Cart: duplicate warning | **มีสินค้าซ้ำกับชุด** | toast message |
+| Cart: duplicate detail | **ซ้ำกับชุดด้านบน X ชิ้น** | ใน cart modal |
+| Stock: computed stock | **(คำนวณ)** | ข้างตัวเลข stock ของ non-leaf |
+| Dip Stock: filter info | **แสดงเฉพาะสินค้าที่นับได้** | info message |
+| Admin: shared child info | **สินค้านี้อยู่ในชุดอื่นด้วย: [SET names]** | warning text |
+| Error: circular ref | **ไม่สามารถเพิ่มได้ เนื่องจากจะเกิดการอ้างอิงวน** | |
+| Error: max depth | **รองรับสูงสุด 3 ระดับ** | |
+| Error: OOS | **สินค้าหมด** | badge เหมือนเดิม |
+
+### Admin Product Catalog Card
+
+SET badge เหมือนเดิม + child count ใน card:
+
+```
+Normal SET card:
+┌─────────────────┐
+│ [SET]  [Edit][X] │
+│  [Product Image] │
+│  ชุดกันล้ม Forza │
+│  DNCSETXXX       │
+│  1,990 THB       │
+│  3 ชิ้นในชุด     │
+└─────────────────┘
+
+sub-SET card (child ที่มี grandchild):
+┌─────────────────┐
+│ [SET]  [Edit][X] │
+│  [Product Image] │
+│  กันล้มล่าง ชุด  │
+│  DNCSUBXXX       │
+│  890 THB         │
+│  2 ชิ้นในชุด     │
+│  [อยู่ใน: SETXXX]│  ← แสดง parent SET
+└─────────────────┘
+```
+
+Admin catalog filter เพิ่ม: `ทั้งหมด | ชุด (SET) | เดี่ยว | ชิ้นส่วนย่อย` (ปัจจุบัน filter buttons ยังไม่มี HTML จริง ต้องสร้าง)
+
+### Admin Product Catalog Editor Modal
+
+แก้ section "องค์ประกอบชุด" — เพิ่ม grandchild + shared child warning:
+
+```
+┌─────────────────────────────────────────┐
+│ องค์ประกอบชุด               SET ✓       │
+├─────────────────────────────────────────┤
+│ ┌─ [IMG] CHILD_A ──────────────── [X]  │
+│ │   กันล้มบน | DNCXXX                   │
+│ │   [ไม่มีชิ้นส่วนย่อย]                  │
+│ │   [▶ เพิ่มชิ้นส่วนย่อย]                │  ← collapsed
+│ └──────────────────────────────────────│
+│                                         │
+│ ┌─ [IMG] CHILD_B ─── [SUB-SET] ── [X]  │
+│ │   กันล้มล่าง ชุด | DNCYYY              │
+│ │   [▼ 2 ชิ้นส่วนย่อย]                   │  ← expanded
+│ │  ┌────────────────────────────────┐   │
+│ │  │ [IMG] กันล้มล่าง ซ้าย DNCZZZ [X]│   │
+│ │  │ [IMG] กันล้มล่าง ขวา DNCWWW  [X]│   │
+│ │  │ [🔍] ค้นหาเพิ่ม...              │   │  ← autocomplete
+│ │  └────────────────────────────────┘   │
+│ │  ⚠️ DNCZZZ อยู่ในชุดอื่นด้วย: SETYYY │  ← shared child warning
+│ └──────────────────────────────────────│
+│ [🔍 ค้นหาสินค้าเพื่อเพิ่ม...]            │
+└─────────────────────────────────────────┘
+```
+
+Interaction spec:
+- [▶]/[▼] toggle expand/collapse (animation 150ms)
+- Autocomplete filter: circular ref + max depth 3
+- ลบ child ที่มี grandchildren → prompt ยืนยัน "ลบจะเอาชิ้นส่วนย่อยออกด้วย ยืนยัน?"
+- Shared child: แสดง warning text ใต้ child card (informational ไม่ block)
+- Touch target [X] ลบ: min-width 44px
+
+### B2B LIFF E-Catalog — Product Detail View (ใหม่ทั้งหมด)
+
+**สำคัญ: ใช้ page view (ไม่ใช่ modal)** เพราะ LINE browser มีปัญหา scroll ใน modal + ต้องใช้ `history.pushState` ให้ browser back ทำงานถูก
+
+**Loading state:**
+```
+┌──────────────────────────────────┐
+│ ← กลับ                           │
+│ ┌────────────────────────────┐   │
+│ │  ░░░░░ skeleton ░░░░░       │   │
+│ │  ░░░░ skeleton ░░░          │   │
+│ └────────────────────────────┘   │
+└──────────────────────────────────┘
+```
+
+**Error state:**
+```
+┌──────────────────────────────────┐
+│ ← กลับ                           │
+│  ไม่สามารถโหลดข้อมูลสินค้าได้     │
+│  [ลองใหม่]                        │
+└──────────────────────────────────┘
+```
+
+**Normal state (ขยาย):**
+```
+┌──────────────────────────────────┐
+│ ← กลับ                           │
+│ [Product Image - full width]      │
+│                                   │
+│ ชุดกันล้ม Honda Forza 350         │
+│ SKU: DNCSETXXX                    │
+│                                   │
+│ ┌────────────────────────────┐   │
+│ │ ราคาชุดเต็ม     ฿1,990      │   │
+│ │ (ราคาปลีก ฿2,490 ลด 20%)    │   │  ← แสดง retail + tier discount
+│ │ [+ เพิ่มชุดเต็มลงตะกร้า]    │   │  ← min-height 48px
+│ └────────────────────────────┘   │
+│                                   │
+│ ────── ซื้อแยกชิ้น ──────         │
+│                                   │
+│ ┌────────────────────────────┐   │
+│ │ [IMG] กันล้มบน              │   │
+│ │ DNCXXX    ฿690   [- 0 +]   │   │  ← qty control inline
+│ └────────────────────────────┘   │
+│                                   │
+│ ┌────────────────────────────┐   │
+│ │ [IMG] กันล้มล่าง ชุด ฿890   │   │
+│ │ DNCYYY         [- 0 +]     │   │
+│ │ ┌──────────────────────┐   │   │
+│ │ │ ซื้อแยกชิ้น:          │   │   │
+│ │ │ กันล้มล่าง ซ้าย ฿490  │   │   │
+│ │ │ [- 0 +]               │   │   │
+│ │ │ กันล้มล่าง ขวา  ฿490  │   │   │
+│ │ │ [- 0 +]               │   │   │
+│ │ └──────────────────────┘   │   │
+│ └────────────────────────────┘   │
+│                                   │
+│ OOS grandchild:                   │
+│ ┌────────────────────────────┐   │
+│ │ กันล้มล่าง ซ้าย  สินค้าหมด  │   │  ← disabled + grey
+│ │ คาดว่ามีของ 15/05/2026      │   │  ← ETA ถ้ามี
+│ └────────────────────────────┘   │
+└──────────────────────────────────┘
+```
+
+Mobile UX notes:
+- Grandchild ใช้ background สีต่าง (เช่น #f8fafc) + border-left แทน indent ลึก เพื่อประหยัด horizontal space ใน 375px
+- ทุกปุ่ม [+] [-] ≥ 44px touch target
+- Grandchild images เล็กกว่า (48x48px)
+- `loading="lazy"` สำหรับ child/grandchild images
+- `history.pushState` ให้ LINE browser back button กลับไป grid (ไม่ปิด LIFF)
+- Scroll position preserved เมื่อกลับจาก detail
+
+### B2B Cart — Duplicate Detection
+
+**Timing**: แสดงตอนกด add grandchild ที่ซ้ำกับ SET ในตะกร้า (informational — ไม่ blocking)
+
+**Toast notification (4 วินาที):**
+```
+┌──────────────────────────────────┐
+│ ⚠️ "กันล้มล่าง ซ้าย" มีอยู่ใน   │
+│ "ชุดกันล้ม Forza" ที่อยู่ในตะกร้า │
+│ แล้ว — สั่งซ้ำหรือไม่?            │
+│ [ยกเลิก]  [เพิ่มซ้ำ]              │
+└──────────────────────────────────┘
+```
+
+**ใน Cart Modal:**
+```
+┌──────────────────────────────────┐
+│ ⚠️ สินค้าซ้ำกับชุด               │
+│ ────────────────────────          │
+│ ชุดกันล้ม Forza x1     ฿1,990    │
+│   (มี: กันล้มบน, ล่างซ้าย, ล่างขวา)│
+│ กันล้มล่าง ซ้าย x2      ฿980    │  ← highlight ซ้ำ
+│   ⚠️ ซ้ำกับชุดด้านบน 1 ชิ้น      │
+│ ────────────────────────          │
+│ รวม                     ฿2,970   │
+│ [ยืนยันสั่งสินค้า]                 │
+└──────────────────────────────────┘
+```
+
+### Inventory Manage Tab — Non-leaf Stock Display
+
+```
+┌──────┬───────────────┬────────┬─────────┬──────────┐
+│ Img  │ SKU / Name    │ Stock  │ Status  │ Actions  │
+├──────┼───────────────┼────────┼─────────┼──────────┤
+│ [img]│ DNCSETXXX     │        │         │          │
+│      │ ชุดกันล้ม Forza│ 5(คำนวณ)│ in_stock│ [expand] │
+│      │ [SET] 3 ชิ้น  │        │         │ ไม่มี +/-│
+├──────┼───────────────┼────────┼─────────┼──────────┤
+│  ├── │ DNCXXX        │        │         │          │
+│      │ กันล้มบน      │ 8      │ in_stock│ [+] [-]  │  ← leaf แก้ได้
+├──────┼───────────────┼────────┼─────────┼──────────┤
+│  ├── │ DNCYYY [SUB]  │ 5(คำนวณ)│ in_stock│ [expand] │
+│      │ กันล้มล่าง ชุด │        │         │ ไม่มี +/-│
+├──────┼───────────────┼────────┼─────────┼──────────┤
+│  │├──│ DNCZZZ        │ 5      │ in_stock│ [+] [-]  │  ← leaf
+│      │ กันล้มล่าง ซ้าย│        │         │          │
+├──────┼───────────────┼────────┼─────────┼──────────┤
+│  │└──│ DNCWWW        │ 7      │ in_stock│ [+] [-]  │  ← leaf
+│      │ กันล้มล่าง ขวา │        │         │          │
+└──────┴───────────────┴────────┴─────────┴──────────┘
+```
+
+- Non-leaf: stock แสดง "(คำนวณ)" ไม่มีปุ่มแก้สต็อกตรง
+- Leaf: แก้สต็อกได้ปกติ [+] [-]
+- Expand/collapse icon สำหรับ SET/SUB-SET
+
+### Manual Invoice System + RPi Print Server
+
+- Render grandchild names ใน invoice/picking list
+- Row height calculation รองรับ nested children
+- ใช้คำว่า "ชิ้นส่วนย่อย" ไม่ใช่ "หลาน"
+
+## 11.8 Files Impact Map (16 ไฟล์)
+
+### Phase 1: Core (ต้องเสร็จก่อน)
+
+| # | ไฟล์ | DB_ID | สิ่งที่แก้ |
+|---|------|-------|----------|
+| 1 | `[B2B] Snippet 15: Custom Tables & JWT Session` | — | **สร้าง 7 helper functions** + แก้ `dinoco_stock_auto_status()` [C-2], `dinoco_stock_get()` [M-1], `dinoco_get_reserved_qty()` [C-3], `dinoco_check_stock_conflict()` [M-2], `dinoco_get_inventory_valuation()` [M-1] |
+| 2 | `[B2B] Snippet 2: LINE Webhook Gateway` | — | แก้ stock deduct/return ใช้ `dinoco_get_leaf_skus()` [C-1] + cache invalidation cascade ancestors |
+| 3 | `[Admin System] DINOCO Global Inventory Database` | 22 | แก้ `save_sku_relation` รับ grandchild_map + UI renderCatChildren 2 ระดับ + loadCatalog + Dip Stock filter non-leaf + Inventory Manage computed stock + product delete cleanup |
+
+### Phase 2: B2B + Display
+
+| # | ไฟล์ | DB_ID | สิ่งที่แก้ |
+|---|------|-------|----------|
+| 4 | `[B2B] Snippet 3: LIFF E-Catalog REST API` | 52 | GET /catalog return tree data + place-order resolve leaf SKUs |
+| 5 | `[B2B] Snippet 4: LIFF E-Catalog Frontend` | 53 | เพิ่ม product detail view สำหรับ SET + ซื้อ grandchild แยก |
+| 6 | `[B2B] Snippet 1: Core Utilities & Flex Builders` | — | แก้ `b2b_calculate_box_manifest()` leaf resolution + Flex builders แสดง grandchild |
+| 7 | `[B2B] Snippet 5: Admin Dashboard` | 54 | แก้ cancel stock restore ใช้ `dinoco_get_leaf_skus()` |
+| 8 | `[B2B] Snippet 9: Admin Control Panel` | 58 | แก้ product list + save ส่ง grandchild relations |
+| 9 | `[B2B] Snippet 10: Invoice Image Generator` | — | แก้ SET children display แสดง grandchild |
+| 10 | `[Admin System] DINOCO Manual Invoice System` | — | **[MISSING-1]** Render grandchild ในใบแจ้งหนี้ (บรรทัด 1203, 3424-3441, 3544-3616, 4456-4506) |
+| 11 | `rpi-print-server/` | — | **[MISSING-2]** Picking list + invoice template render nested children + row height calc (print_client.py:443,579, templates/*.html) |
+| 12 | `[B2F] Snippet 2: REST API` | 1165 | **[DD-7]** `create-po`: สั่ง SET → auto-expand เป็น leaf items ก่อน save (Option A — expand ตอน create เท่านั้น) |
+
+### Phase 3: B2C Guard + Polish
+
+| # | ไฟล์ | DB_ID | สิ่งที่แก้ |
+|---|------|-------|----------|
+| 13 | `[System] DINOCO Edit Profile` | — | ใส่ `dinoco_is_top_level_set()` filter [DD-6] — ไม่ให้ sub-SET นับเป็น set bonus |
+| 14 | `[System] Dashboard - Assets List` | — | ใส่ `dinoco_is_top_level_set()` filter [DD-6] — ไม่แสดง sub-SET เป็น bundle recipe |
+| 15 | `[System] Member Dashboard Main` | — | ใส่ `dinoco_is_top_level_set()` filter [DD-6] — create_bundle เฉพาะ top-level SET |
+| 16 | `[Admin System] DINOCO Legacy Migration Requests` | — | แก้ `expandSKUWithParent()` JS resolve 3 ระดับ |
+
+### ไฟล์ที่ไม่ต้องแก้ code (แต่ได้ประโยชน์จาก Phase 1 อัตโนมัติ)
+
+- **B2F Snippet 0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11** — ไม่ต้องแก้ code (DD-7 Option A: expand ตอน create-po แล้วเก็บ leaf items ตรง → Flex/PO Image/Ticket อ่าน expanded items อัตโนมัติ + `dinoco_stock_add()` cascade อัตโนมัติ)
+- **B2F Snippet 2 (REST API)** — **ต้องแก้ 1 จุด**: `b2f_rest_create_po()` expand SET → leaf items ก่อน save
+- **LIFF AI Snippet 1-2** — ไม่ใช้ SKU relations
+- **MCP Bridge** — เรียก `dinoco_stock_get()` ซึ่งแก้ใน Phase 1 → downstream ถูกต้องอัตโนมัติ
+- **OpenClaw dinoco-tools.js** — proxy ไป MCP Bridge → ถูกต้องอัตโนมัติ
+
+## 11.9 Implementation Roadmap (3 Phases)
+
+### Phase 1: MVP — Helpers + Stock Logic + Admin UI
+
+```
+Task 1.1: สร้าง 7 Helper Functions ใน Snippet 15
+  → dinoco_get_leaf_skus, dinoco_is_leaf_sku, dinoco_get_ancestor_skus,
+    dinoco_compute_hierarchy_stock, dinoco_is_top_level_set,
+    dinoco_validate_sku_hierarchy, dinoco_get_sku_tree
+
+Task 1.2: แก้ Stock Computation (Snippet 15)
+  → dinoco_stock_auto_status() — cascade ขึ้น grandparent [C-2]
+  → dinoco_stock_get() — ใช้ compute_hierarchy_stock [M-1]
+  → dinoco_get_reserved_qty() — ancestor matching ทุกระดับ [C-3]
+  → dinoco_check_stock_conflict() — ancestor matching [M-2]
+  → dinoco_get_inventory_valuation() — computed stock [M-1]
+
+Task 1.3: แก้ Stock Deduction/Return (Snippet 2 + Snippet 5)
+  → ใช้ dinoco_get_leaf_skus() แทน $relations[$sku] [C-1]
+  → cache invalidation cascade ancestors
+
+Task 1.4: แก้ Product Catalog UI (Inventory Database)
+  → save_sku_relation — รับ grandchild_map
+  → renderCatChildren() — 2-level tree view
+  → selectChildComponent() — support grandchild
+  → saveCatalogItem() — ส่ง grandchild_map
+  → filterChildOptions() — circular ref prevention
+  → product delete → cleanup relations
+
+Task 1.5: แก้ Inventory Manage + Dip Stock
+  → Manage: computed stock สำหรับ non-leaf
+  → Dip Stock: filter non-leaf (ใช้ dinoco_is_leaf_sku)
+
+→ Deploy Phase 1 & Test
+```
+
+### Phase 2: B2B E-Catalog + Invoice + Print
+
+```
+Task 2.1: B2B REST API (Snippet 3) — catalog tree data + place-order leaf resolve
+Task 2.2: B2B LIFF Frontend (Snippet 4) — product detail view + ซื้อ grandchild
+Task 2.3: Flex Card Builders (Snippet 1) — grandchild display + box manifest
+Task 2.4: Admin Dashboard cancel (Snippet 5) — leaf-only restore
+Task 2.5: Admin Control Panel (Snippet 9) — product save + grandchild relations
+Task 2.6: Invoice Image (Snippet 10) — grandchild display
+Task 2.7: Manual Invoice System — nested children render [MISSING-1]
+Task 2.8: RPi Print Server — picking list + invoice templates [MISSING-2]
+Task 2.9: B2F Snippet 2 (REST API) — create-po auto-expand SET → leaf items (Option A) [DD-7]
+        → Snippet 1/5/9/10 ไม่ต้องแก้ (อ่าน expanded po_items อัตโนมัติ)
+
+→ Deploy Phase 2 & Test
+```
+
+### Phase 3: B2C Guard + Legacy + Docs
+
+```
+Task 3.1: Edit Profile — dinoco_is_top_level_set() filter [DD-6]
+Task 3.2: Assets List — dinoco_is_top_level_set() filter [DD-6]
+Task 3.3: Member Dashboard — dinoco_is_top_level_set() filter [DD-6]
+Task 3.4: Legacy Migration — expandSKUWithParent() 3 ระดับ
+Task 3.5: อัพเดท docs (CLAUDE.md, SYSTEM-REFERENCE, WORKFLOW-REFERENCE, FEATURE-SPECS)
+
+→ Deploy Phase 3 & Test
+```
+
+## 11.10 Edge Cases & Rules
+
+| Case | Rule |
+|------|------|
+| Shared child ข้าม SET | **Allow** — reserved qty นับรวมทุก SET (DD-3) |
+| Circular reference (A→B→A) | **Block** — validate ก่อน save |
+| Depth > 3 | **Block** — hard limit ไม่มีปุ่มเพิ่ม |
+| ลบ product ที่เป็น grandchild | **Auto-cleanup** relations |
+| Walk-in สั่ง SET 3 ระดับ | **ตัด leaf** + ถ้าเกินให้ **ติดลบ** (DD-5) |
+| B2C เห็น sub-SET | **ไม่เห็น** — filter ด้วย `is_top_level_set()` (DD-6) |
+| B2F receive-goods grandchild | **ไม่ต้องแก้ B2F** — `dinoco_stock_add()` trigger `auto_status()` cascade อัตโนมัติ |
+| Dip Stock นับ sub-SET | **ไม่นับ** — filter non-leaf ออก (นับแค่ leaf) |
+| Cart มีทั้ง SET + grandchild ของ SET เดียวกัน | **Frontend warn** — "มีสินค้าซ้ำกับชุด" |
+| child/grandchild stock = 0 | parent stock **เป็น 0 ด้วย** (MIN cascade) |
+| Shared child ถูกสั่งใน 2 SET ใน order เดียวกัน | deduct per-item loop (ไม่ flatten+unique) — A x qty(SET_X) + A x qty(SET_Y) |
+| Admin ลบ child ที่เป็น sub-SET | cleanup ทั้ง child entry + grandchild entries ที่ orphan |
+| B2F create-po สั่ง SET แต่ Maker ไม่มี leaf product | validate leaf SKUs มี `b2f_maker_product` → error "สินค้า X ยังไม่ลงทะเบียนกับโรงงาน" |
+
+## 11.11 Risk & Mitigation
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| Stock double-deduction (ตัดทั้ง child + grandchild) | CRITICAL | Leaf-only rule + ใช้ `dinoco_get_leaf_skus()` ทุกจุด |
+| Circular reference infinite loop | CRITICAL | `dinoco_validate_sku_hierarchy()` + depth guard + visited set |
+| `auto_status()` ไม่ cascade ขึ้น grandparent | CRITICAL | ใช้ `dinoco_get_ancestor_skus()` + update ทุก ancestor |
+| Reserved qty ไม่นับ order ที่สั่ง ancestor | CRITICAL | ใช้ `dinoco_get_ancestor_skus()` ใน match_skus |
+| B2C เห็น sub-SET เป็น standalone bundle | HIGH | `dinoco_is_top_level_set()` filter ทุก B2C page |
+| ลบ product ที่เป็น grandchild → stock chain = 0 | HIGH | Auto-cleanup relations on product delete |
+| Performance 3-level query | LOW | `get_option()` cached + static cache ใน helpers + SKU < 200 |
+| wp_options bloat | VERY LOW | SKU < 200, relations < 50 entries |
+
+## 11.12 Testing Checklist
+
+### Helper Functions
+
+- [ ] `dinoco_get_leaf_skus('SET')` → returns [child_A, grand_1, grand_2]
+- [ ] `dinoco_get_leaf_skus('CHILD_B')` → returns [grand_1, grand_2]
+- [ ] `dinoco_get_leaf_skus('GRAND_1')` → returns [grand_1]
+- [ ] `dinoco_get_leaf_skus('STANDALONE')` → returns [STANDALONE]
+- [ ] `dinoco_is_leaf_sku('GRAND_1')` → true
+- [ ] `dinoco_is_leaf_sku('CHILD_B')` → false
+- [ ] `dinoco_get_ancestor_skus('GRAND_1')` → ['CHILD_B', 'SET']
+- [ ] `dinoco_get_ancestor_skus('CHILD_A')` → ['SET']
+- [ ] `dinoco_is_top_level_set('SET')` → true
+- [ ] `dinoco_is_top_level_set('CHILD_B')` → false (เป็น child ของ SET)
+- [ ] `dinoco_validate_sku_hierarchy('A', 'A')` → false (self ref)
+- [ ] `dinoco_validate_sku_hierarchy('GRAND_1', 'SET')` → false (circular)
+
+### Stock Deduction [C-1]
+
+- [ ] สั่ง SET x2 → ตัด child_A x2, grand_1 x2, grand_2 x2
+- [ ] สั่ง CHILD_B x1 → ตัด grand_1 x1, grand_2 x1 (ไม่ตัด CHILD_B)
+- [ ] สั่ง GRAND_1 x3 → ตัด grand_1 x3 เท่านั้น
+- [ ] Cancel SET → คืน leaf nodes ทุกตัว
+- [ ] Walk-in SET → ตัด leaf + ติดลบได้
+
+### Stock Status Cascade [C-2]
+
+- [ ] grand_1 stock = 0 → child_B status = out_of_stock → parent status = out_of_stock
+- [ ] B2F receive grand_1 stock +10 → child_B = in_stock → parent = in_stock (ถ้า child อื่นก็ in_stock)
+
+### Reserved Qty [C-3]
+
+- [ ] Order มี SET x1 → reserved ของ grand_1 = 1, grand_2 = 1, child_A = 1
+- [ ] Order มี CHILD_B x2 → reserved ของ grand_1 = 2, grand_2 = 2
+- [ ] Mixed: SET x1 + GRAND_1 x2 → grand_1 reserved = 3
+
+### B2C Guard [DD-6]
+
+- [ ] Edit Profile: sub-SET ไม่นับเป็น set bonus
+- [ ] Assets List: sub-SET ไม่แสดงเป็น bundle recipe
+- [ ] Member Dashboard: create_bundle เฉพาะ top-level SET
+
+### Backward Compatibility
+
+- [ ] Product 2 ระดับเดิม (ไม่มี grandchild) ทำงานเหมือนเดิม 100%
+- [ ] Product เดี่ยว ทำงานเหมือนเดิม 100%
+- [ ] Old orders ไม่กระทบ
+
+### Admin UI
+
+- [ ] สร้าง SET → เพิ่ม child → เพิ่ม grandchild → save → reload → verify
+- [ ] ลบ grandchild → child กลับเป็น leaf
+- [ ] ลบ product ที่เป็น grandchild → relations auto-cleanup
+- [ ] Dip Stock: เห็นเฉพาะ leaf nodes
+
+## 11.13 Rollback Plan
+
+### Soft Rollback (~15 นาที)
+
+1. ลบ grandchild entries จาก `dinoco_sku_relations` (entries ที่ child เป็น parent)
+2. Helper functions ยังอยู่แต่จะ return 2-level อัตโนมัติ (เพราะไม่มี grandchild entries)
+3. ลูกค้าหน้าบ้านไม่กระทบ
+
+### Hard Rollback (~30 นาที)
+
+1. Git revert commits ของ Phase 1-3
+2. Push to main → GitHub Webhook auto-sync
+3. Data format ไม่ต้อง rollback (format เดิมยัง compatible)
+
+### ไม่กระทบ
+
+- Orders เดิม (order_items เก็บ SKU text ตรง ไม่พึ่ง relations)
+- Stock ตัวเลข (stock_qty เก็บ per SKU ไม่ว่าจะ leaf หรือ non-leaf)
+- Debt/Invoice/Payment (ไม่เกี่ยวกับ SKU relations)
+- B2F system + B2C member pages
