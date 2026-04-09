@@ -1,6 +1,6 @@
 # DINOCO System Reference -- Complete Wiki
 
-> Last updated: 2026-04-06 | Version: V.40.0 | 40+ files, ~55,000 lines
+> Last updated: 2026-04-09 | Version: V.41.0 | 40+ files, ~55,000 lines
 > Consolidated from: SYSTEM-ARCHITECTURE.md, DATA-MODEL.md, SYSTEM-DIAGRAMS.md, USER-JOURNEYS.md
 
 ---
@@ -113,7 +113,7 @@
 | File | Version | DB_ID | Shortcode | Description |
 |------|---------|-------|-----------|-------------|
 | [Admin System] DINOCO Admin Dashboard | V.32.1 | 21 | `[dinoco_admin_dashboard]` | Command Center: KPIs, charts, pipeline, AI Inbox |
-| [Admin System] DINOCO Global Inventory Database | V.38.5 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center |
+| [Admin System] DINOCO Global Inventory Database | V.39.0 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center, 3-level hierarchy UI |
 | [Admin System] DINOCO Legacy Migration Requests | V.30.2 | 23 | `[dinoco_admin_legacy]` | Admin legacy migration manager |
 | [Admin System] DINOCO User Management | V.30.2 | 25 | `[dinoco_admin_users]` | CRM + full analytics |
 | [Admin System] DINOCO Manual Transfer Tool | V.30.2 | 26 | `[dinoco_admin_transfer]` | Force transfer warranty ownership |
@@ -137,10 +137,10 @@
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
 | Snippet 1: Core Utilities & LINE Flex Builders | V.32.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers |
-| Snippet 2: LINE Webhook Gateway & Order Creator | V.33.2 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete |
+| Snippet 2: LINE Webhook Gateway & Order Creator | V.34.0 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete, leaf-only stock deduct |
 | Snippet 3: LIFF E-Catalog REST API | V.39.2 | 52 | REST API (auth, catalog, orders, slip, flash) |
 | Snippet 4: LIFF E-Catalog Frontend | V.31.0 | 53 | LIFF SPA for distributors (catalog, cart, history) |
-| Snippet 5: Admin Dashboard | V.31.7 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash |
+| Snippet 5: Admin Dashboard | V.32.0 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash, leaf-only cancel restore |
 | Snippet 6: Admin Discount Mapping | V.31.1 | 55 | `[b2b_discount_mapping]` -- SKU pricing + rank tiers |
 | Snippet 7: Cron Jobs - Dunning + Summary + Rank | V.30.5 | 56 | 9 cron jobs (dunning, summary, rank, flash, shipping) |
 | Snippet 8: Distributor Ticket View | V.30.4 | 57 | `/b2b-ticket/` -- Order detail page (admin/customer split) |
@@ -150,7 +150,7 @@
 | Snippet 12: Admin Dashboard LIFF | V.31.2 | 65 | `[b2b_dashboard]`, `[b2b_stock_manager]`, `[b2b_tracking_entry]` |
 | Snippet 13: Debt Transaction Manager | V.2.0 | 1036 | Atomic debt operations (MySQL transactions, FOR UPDATE) |
 | Snippet 14: Order State Machine | V.1.5 | 1038 | B2B_Order_FSM class (14 statuses) |
-| Snippet 15: Custom Tables & JWT Session | V.5.6 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class |
+| Snippet 15: Custom Tables & JWT Session | V.6.0 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class, 3-level SKU hierarchy helpers |
 
 ### 2.5 [B2F] -- Factory Purchasing System (12 Snippets)
 
@@ -666,8 +666,30 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 |------------|------|-------------|
 | `b2b_warehouse_address` | array | Warehouse name, address, phone |
 | `b2b_manual_shipments_{YYYY_MM}` | array | Manual Flash shipment records (monthly) |
-| `b2b_sku_relations` | array | Parent-child SKU relationships |
+| `b2b_sku_relations` | array | Parent-child-grandchild SKU relationships (3-level flat format: `{ parent: [children], child: [grandchildren] }`) |
 | `dinoco_sku_relations` | array | SKU relations for legacy migration |
+
+#### SKU Hierarchy Helper Functions (Snippet 15 PART 1.35, V.6.0)
+
+7 helper functions สำหรับ 3-level product hierarchy (แม่ → ลูก → ชิ้นส่วนย่อย):
+
+| Function | Parameters | Returns | Description |
+|----------|------------|---------|-------------|
+| `dinoco_get_leaf_skus` | `($sku, $relations?, $depth?, &$visited?)` | `array` of SKU strings | Resolve leaf nodes recursive (max depth 3), ป้องกัน circular ref |
+| `dinoco_is_leaf_sku` | `($sku, $relations?)` | `bool` | Check ว่า SKU ไม่มี children (เป็นสินค้าชิ้นเดี่ยว) |
+| `dinoco_get_ancestor_skus` | `($sku, $relations?)` | `array` of SKU strings | หา parent ทุกระดับขึ้นไป (ใช้ cascade stock status) |
+| `dinoco_compute_hierarchy_stock` | `($sku, $relations?, $depth?)` | `int` | คำนวณ stock recursive: leaf = stock จริง, parent = MIN(children computed) |
+| `dinoco_is_top_level_set` | `($sku, $relations?)` | `bool` | เป็น parent แต่ไม่เป็น child ของใคร (top-level set) |
+| `dinoco_validate_sku_hierarchy` | `($parent_sku, $child_sku, $relations?)` | `bool` | Validate ไม่มี circular ref + depth ไม่เกิน 3 ระดับ |
+| `dinoco_get_sku_tree` | `($sku, $relations?, $depth?)` | `array` (nested tree) | สร้าง hierarchy tree สำหรับ UI แสดงโครงสร้างสินค้า |
+
+**Stock Logic (V.6.0):**
+- **Stock Deduct** (B2B order): `dinoco_get_leaf_skus()` resolve ลง leaf → ตัดเฉพาะ leaf SKUs
+- **Stock Restore** (cancel): เหมือนกัน — restore เฉพาะ leaf SKUs + `_stock_returned` guard
+- **Stock Status**: `dinoco_stock_auto_status()` cascade ขึ้น ancestor ทุกระดับ
+- **Reserved Qty**: `dinoco_get_reserved_qty()` match ทั้ง leaf + ancestor orders
+- **Inventory Valuation**: ใช้ `dinoco_compute_hierarchy_stock()` แทน raw stock
+- **Dip Stock**: snapshot เฉพาะ leaf SKUs (filter ด้วย `dinoco_is_leaf_sku()`)
 
 #### B2F Settings
 
@@ -729,14 +751,17 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 | Admin Inventory DB | `[dinoco_admin_inventory]` | shortcode | Inventory Command Center (manual) |
 | B2F receiving | `rcv_items.rcvi_qty_received` | repeater | จำนวนรับเข้าคลัง (ไม่ auto-update stock) |
 
-#### สิ่งที่ยังไม่มี
+#### Automated Inventory (V.6.0)
 
-- **stock_qty** (จำนวนสต็อกจริง) -- ไม่มี field นี้ในระบบ
-- **Auto stock deduction** เมื่อ B2B order shipped -- ไม่มี
-- **Auto stock addition** เมื่อ B2F receive-goods -- ไม่มี
-- **inventory_count** -- ไม่มี field นับจำนวน
+- **stock_qty** -- `dinoco_warehouse_stock.stock_qty` per SKU per warehouse (Snippet 15)
+- **Auto stock deduction** -- ตัดตอน `checking_stock → awaiting_confirm` ผ่าน `dinoco_stock_subtract()` leaf SKUs only (Snippet 2 V.34.0)
+- **Auto stock addition** -- B2F receive-goods → `dinoco_stock_add()` (Snippet 2)
+- **3-Level hierarchy** -- แม่→ลูก→ชิ้นส่วนย่อย, Parent stock = MIN(children computed) recursive
+- **Stock status** -- `dinoco_stock_auto_status()` compute in_stock/low_stock/out_of_stock + cascade ancestor
+- **Dip Stock** -- Physical count sessions, snapshot เฉพาะ leaf SKUs
+- **Valuation** -- WAC per SKU, inventory valuation with hierarchy-aware stock
 
-> **สรุป:** ระบบ inventory เป็น manual toggle (in_stock/out_of_stock) ไม่มี quantity tracking อัตโนมัติ
+> **สรุป:** ระบบ inventory เป็น automated quantity tracking (V.6.0) รองรับ 3-level SKU hierarchy, multi-warehouse, stock forecasting, และ physical count (Dip Stock)
 
 ### 5.7 Relationships Diagram (Text)
 
@@ -1125,28 +1150,33 @@ graph LR
         PO[สร้าง PO] --> MAKER_DELIVER[Maker ส่งของ]
         MAKER_DELIVER --> RECEIVE[Admin ตรวจรับ<br>b2f_receiving]
         RECEIVE --> CREDIT[เพิ่มหนี้<br>b2f_payable_add]
+        RECEIVE -->|dinoco_stock_add| STOCK_DB
     end
 
-    subgraph "Inventory (Manual)"
-        STOCK_TOGGLE[Admin toggle<br>stock_status<br>in_stock / out_of_stock]
-        INV_DB[Inventory DB<br>dinoco_admin_inventory]
+    subgraph "Inventory (Automated V.6.0)"
+        STOCK_DB[dinoco_warehouse_stock<br>per SKU per warehouse]
+        HIERARCHY[3-Level Hierarchy<br>แม่→ลูก→ชิ้นส่วนย่อย]
+        AUTO_STATUS[dinoco_stock_auto_status<br>cascade ancestor]
+        STOCK_DB --> AUTO_STATUS
+        HIERARCHY --> AUTO_STATUS
     end
 
     subgraph "B2B (ขายให้ตัวแทน)"
         ORDER[ตัวแทนสั่งของ] --> CHECK[Admin เช็คสต็อก]
-        CHECK --> CONFIRM[ยืนยัน → จัดส่ง]
+        CHECK --> DEDUCT[ตัด leaf SKUs<br>dinoco_get_leaf_skus]
+        DEDUCT --> CONFIRM[awaiting_confirm]
         CONFIRM --> SHIP[Flash/Manual ship]
     end
 
-    RECEIVE -.->|ไม่ auto-update| STOCK_TOGGLE
-    SHIP -.->|ไม่ auto-deduct| STOCK_TOGGLE
+    DEDUCT -->|dinoco_stock_subtract<br>leaf only| STOCK_DB
 
-    style STOCK_TOGGLE fill:#ffa,stroke:#333
-    style RECEIVE fill:#afa,stroke:#333
-    style SHIP fill:#faa,stroke:#333
+    style STOCK_DB fill:#afa,stroke:#333
+    style HIERARCHY fill:#adf,stroke:#333
+    style DEDUCT fill:#faa,stroke:#333
+    style AUTO_STATUS fill:#ffa,stroke:#333
 ```
 
-**Note:** เส้นประ (-.->)  หมายถึง connection ที่ยังไม่ได้ implement. ระบบ inventory ปัจจุบันเป็น manual toggle ไม่มี auto stock quantity tracking.
+**Note (V.6.0):** Stock deduction ตัดเฉพาะ leaf SKUs (ชิ้นส่วนย่อยสุด). Parent stock = MIN(children computed stock) recursive. `dinoco_stock_auto_status()` cascade ขึ้น ancestor ทุกระดับ. ระบบรองรับ 3-level hierarchy: แม่ → ลูก → ชิ้นส่วนย่อย.
 
 ### 7.8 B2F Multi-Currency Flow
 
