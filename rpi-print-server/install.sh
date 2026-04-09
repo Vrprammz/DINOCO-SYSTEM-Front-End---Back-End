@@ -116,11 +116,11 @@ fi
 echo ""
 echo "⚙️ Setting up systemd services..."
 
-# Replace placeholder user with actual service user
+# Replace placeholder paths with actual install directory and user
 sed -i "s|User=dinocoth|User=$SERVICE_USER|g" "$INSTALL_DIR/dinoco-print.service"
-sed -i "s|/home/dinocoth|/home/$SERVICE_USER|g" "$INSTALL_DIR/dinoco-print.service"
+sed -i "s|/home/dinocoth/DINOCO-SYSTEM-Front-End---Back-End/rpi-print-server|$INSTALL_DIR|g" "$INSTALL_DIR/dinoco-print.service"
 sed -i "s|User=dinocoth|User=$SERVICE_USER|g" "$INSTALL_DIR/dinoco-dashboard.service"
-sed -i "s|/home/dinocoth|/home/$SERVICE_USER|g" "$INSTALL_DIR/dinoco-dashboard.service"
+sed -i "s|/home/dinocoth/DINOCO-SYSTEM-Front-End---Back-End/rpi-print-server|$INSTALL_DIR|g" "$INSTALL_DIR/dinoco-dashboard.service"
 
 cp "$INSTALL_DIR/dinoco-print.service" /etc/systemd/system/
 cp "$INSTALL_DIR/dinoco-dashboard.service" /etc/systemd/system/
