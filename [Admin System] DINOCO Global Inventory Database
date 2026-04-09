@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.40.5 — Stock Management tree view: indent + colors + filter bar + sort
+ * Version: V.40.6 — Fix grandchild missing from Stock Management (auto-sync relations → dinoco_products)
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -207,6 +207,50 @@ add_action('init', function() {
                 }
 
                 update_option('dinoco_sku_relations', $relations);
+
+                // V.40.6: Auto-create dinoco_products rows สำหรับ child/grandchild ที่ยังไม่มี
+                global $wpdb;
+                $prod_table = $wpdb->prefix . 'dinoco_products';
+                $check_tbl = $wpdb->get_var("SHOW TABLES LIKE '{$prod_table}'");
+                if ($check_tbl) {
+                    $catalog = dinoco_get_current_catalog();
+                    // Collect all SKUs ที่ต้องมี row (children + grandchildren)
+                    $ensure_skus = array_map('strtoupper', $children);
+                    if (is_array($grandchild_map_raw)) {
+                        foreach ($grandchild_map_raw as $gc_arr) {
+                            if (is_array($gc_arr)) {
+                                foreach ($gc_arr as $g) {
+                                    $ensure_skus[] = strtoupper(sanitize_text_field($g));
+                                }
+                            }
+                        }
+                    }
+                    $ensure_skus = array_unique(array_filter($ensure_skus));
+                    if (!empty($ensure_skus)) {
+                        // Check existing rows in 1 query
+                        $placeholders = implode(',', array_fill(0, count($ensure_skus), '%s'));
+                        $existing = $wpdb->get_col($wpdb->prepare(
+                            "SELECT sku FROM {$prod_table} WHERE sku IN ({$placeholders})",
+                            ...$ensure_skus
+                        ));
+                        $existing_upper = array_map('strtoupper', $existing);
+                        foreach ($ensure_skus as $esku) {
+                            if (!in_array($esku, $existing_upper)) {
+                                $cat_item = isset($catalog[$esku]) ? $catalog[$esku] : null;
+                                $wpdb->insert($prod_table, [
+                                    'sku' => $esku,
+                                    'name' => $cat_item ? ($cat_item['name'] ?? $esku) : $esku,
+                                    'image_url' => $cat_item ? ($cat_item['img'] ?? '') : '',
+                                    'price' => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
+                                    'stock_qty' => 0,
+                                    'stock_status' => 'out_of_stock',
+                                    'is_active' => 1,
+                                ]);
+                            }
+                        }
+                    }
+                }
+
                 echo json_encode(['success' => true]); exit;
             }
 
@@ -810,16 +854,19 @@ add_action('rest_api_init', function() {
                     FROM {$table} WHERE {$where_sql} ORDER BY name ASC";
             $all_rows = empty($params) ? $wpdb->get_results($sql) : $wpdb->get_results($wpdb->prepare($sql, ...$params));
 
-            // V.40.5: Auto-sync missing products จาก catalog → dinoco_products table
+            // V.40.6: Auto-sync missing products จาก catalog + sku_relations → dinoco_products table
             if (empty($search) && $status === 'all') {
                 $catalog = function_exists('dinoco_get_current_catalog') ? dinoco_get_current_catalog() : [];
+                $existing_skus = array_map(function($r) { return strtoupper($r->sku); }, $all_rows);
+                $missing = [];
+
+                // 1. Sync จาก catalog (เดิม)
                 if (!empty($catalog)) {
-                    $existing_skus = array_map(function($r) { return strtoupper($r->sku); }, $all_rows);
-                    $missing = [];
                     foreach ($catalog as $csku => $citem) {
                         $csku_u = strtoupper($csku);
                         if (!in_array($csku_u, $existing_skus)) {
                             $missing[] = $csku_u;
+                            $existing_skus[] = $csku_u; // prevent double insert
                             $wpdb->insert($table, [
                                 'sku' => $csku_u,
                                 'name' => $citem['name'] ?? $csku_u,
@@ -831,10 +878,37 @@ add_action('rest_api_init', function() {
                             ]);
                         }
                     }
-                    if (!empty($missing)) {
-                        // Re-query เพื่อรวม rows ใหม่
-                        $all_rows = $wpdb->get_results("SELECT sku, name, image_url, stock_qty, low_stock_threshold, reorder_point, manual_hold, manual_hold_reason, stock_status, stock_updated_at FROM {$table} WHERE is_active = 1 ORDER BY name ASC");
+                }
+
+                // 2. V.40.6: Sync จาก sku_relations — child/grandchild ที่อยู่ใน relations แต่ไม่มี row ใน dinoco_products
+                $sku_rel_sync = get_option('dinoco_sku_relations', []);
+                if (is_array($sku_rel_sync)) {
+                    foreach ($sku_rel_sync as $p_sku => $ch_arr) {
+                        if (!is_array($ch_arr)) continue;
+                        foreach ($ch_arr as $ch_sku) {
+                            $ch_u = strtoupper($ch_sku);
+                            if (!in_array($ch_u, $existing_skus)) {
+                                $missing[] = $ch_u;
+                                $existing_skus[] = $ch_u;
+                                // ดึงชื่อ+รูปจาก catalog ถ้ามี
+                                $cat_item = isset($catalog[$ch_u]) ? $catalog[$ch_u] : (isset($catalog[$ch_sku]) ? $catalog[$ch_sku] : null);
+                                $wpdb->insert($table, [
+                                    'sku' => $ch_u,
+                                    'name' => $cat_item ? ($cat_item['name'] ?? $ch_u) : $ch_u,
+                                    'image_url' => $cat_item ? ($cat_item['img'] ?? '') : '',
+                                    'price' => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
+                                    'stock_qty' => 0,
+                                    'stock_status' => 'out_of_stock',
+                                    'is_active' => 1,
+                                ]);
+                            }
+                        }
                     }
+                }
+
+                if (!empty($missing)) {
+                    // Re-query เพื่อรวม rows ใหม่
+                    $all_rows = $wpdb->get_results("SELECT sku, name, image_url, stock_qty, low_stock_threshold, reorder_point, manual_hold, manual_hold_reason, stock_status, stock_updated_at FROM {$table} WHERE is_active = 1 ORDER BY name ASC");
                 }
             }
 
@@ -874,18 +948,18 @@ add_action('rest_api_init', function() {
             $type_counts_all = ['all' => 0, 'set' => 0, 'single' => 0, 'child' => 0, 'grandchild' => 0]; // V.40.5: นับก่อน type_filter
             foreach ($all_rows as $row) {
                 $counts['total']++;
+                $row_sku_upper = strtoupper($row->sku); // V.40.6: normalize uppercase for reliable matching
 
                 // V.40.3: classify product_type ให้ตรงกับ JS computeProductTypes()
-                $is_parent = in_array($row->sku, $parent_skus); // มี children
-                $my_parent = isset($child_to_parent[$row->sku]) ? $child_to_parent[$row->sku] : null;
+                $is_parent = in_array($row_sku_upper, $parent_skus); // มี children
+                $my_parent = isset($child_to_parent[$row_sku_upper]) ? $child_to_parent[$row_sku_upper] : null;
                 $is_set = $is_parent && !$my_parent; // เป็น parent แต่ไม่เป็น child ของใคร = top-level SET
                 $is_non_leaf = $is_parent; // มี children = non-leaf (ไม่ว่าจะเป็น SET หรือ sub-SET)
                 $row->is_set = $is_non_leaf; // backward compat: is_set = true สำหรับทุก non-leaf
                 $row->is_leaf = !$is_non_leaf;
                 // V.40.5: non-leaf stock = MIN(children) — ใช้ pre-built $stock_map (O(1) lookup)
                 if ($is_non_leaf && !empty($_stock_map)) {
-                    $sku_u = strtoupper($row->sku);
-                    $ch_skus = isset($_rel_upper[$sku_u]) ? $_rel_upper[$sku_u] : [];
+                    $ch_skus = isset($_rel_upper[$row_sku_upper]) ? $_rel_upper[$row_sku_upper] : [];
                     if (!empty($ch_skus)) {
                         $min_stock = PHP_INT_MAX;
                         foreach ($ch_skus as $cs_u) {
@@ -927,7 +1001,8 @@ add_action('rest_api_init', function() {
                 } elseif ($is_parent) {
                     // sku มี children แต่ไม่เป็น child ของใคร = top-level SET
                     $row->product_type = 'set';
-                    $row->children_count = count($sku_relations[$row->sku] ?? []);
+                    // V.40.6: ใช้ $_rel_upper ที่ uppercase แล้ว เพื่อ match ได้เสมอ
+                    $row->children_count = isset($_rel_upper[$row_sku_upper]) ? count($_rel_upper[$row_sku_upper]) : 0;
                 }
                 // else: product_type = 'single' (default)
 
@@ -978,13 +1053,21 @@ add_action('rest_api_init', function() {
                 elseif ($t === 'grandchild') { $gc_map[$row->parent_sku][] = $row; }
                 else { $singles[] = $row; }
             }
+            // V.40.6: Build uppercase-keyed maps for reliable hierarchy matching
+            $child_map_u = [];
+            foreach ($child_map as $pk => $rows) { $child_map_u[strtoupper($pk)] = $rows; }
+            $gc_map_u = [];
+            foreach ($gc_map as $pk => $rows) { $gc_map_u[strtoupper($pk)] = $rows; }
+
             // Build sorted: SET → children (→ grandchildren) → ... → singles
             foreach ($sets as $set) {
                 $sorted[] = $set;
-                $children = $child_map[$set->sku] ?? [];
+                $set_sku_u = strtoupper($set->sku);
+                $children = $child_map_u[$set_sku_u] ?? [];
                 foreach ($children as $child) {
                     $sorted[] = $child;
-                    $gcs = $gc_map[$child->sku] ?? [];
+                    $child_sku_u = strtoupper($child->sku);
+                    $gcs = $gc_map_u[$child_sku_u] ?? [];
                     foreach ($gcs as $gc) { $sorted[] = $gc; }
                 }
             }
@@ -4634,7 +4717,7 @@ function dinoco_render_ui_v99() {
                 $children.slideUp(200);
                 // Also hide grandchildren
                 $children.each(function() {
-                    var childSku = ($(this).data('sku') || '').toString().replace(/[^a-zA-Z0-9]/g, '_');
+                    var childSku = ($(this).data('sku') || '').toString().toUpperCase().replace(/[^a-zA-Z0-9]/g, '_'); // V.40.6: uppercase for reliable match
                     if (childSku) {
                         $('.stock-child-of-' + childSku).slideUp(200);
                     }
@@ -4645,7 +4728,7 @@ function dinoco_render_ui_v99() {
                 $children.slideDown(200);
                 // V.40.3: cascade แสดง grandchildren ด้วย
                 $children.each(function() {
-                    var childSku = ($(this).data('sku') || '').toString().replace(/[^a-zA-Z0-9]/g, '_');
+                    var childSku = ($(this).data('sku') || '').toString().toUpperCase().replace(/[^a-zA-Z0-9]/g, '_'); // V.40.6: uppercase for reliable match
                     if (childSku) {
                         $('.stock-child-of-' + childSku).slideDown(200);
                     }
@@ -4703,21 +4786,22 @@ function dinoco_render_ui_v99() {
                 return map[type] || type;
             },
 
-            /* V.40.1: Sort data for hierarchy tree view */
+            /* V.40.6: Sort data for hierarchy tree view — uppercase keys for reliable matching */
             sortHierarchy: function(data) {
-                // Build lookup maps
+                // Build lookup maps (V.40.6: uppercase all keys)
                 var sets = [], children = {}, grandchildren = {}, singles = [];
                 data.forEach(function(p) {
                     var t = p.product_type || 'single';
+                    var skuU = (p.sku || '').toUpperCase();
                     if (t === 'set') {
                         sets.push(p);
-                        if (!children[p.sku]) children[p.sku] = [];
+                        if (!children[skuU]) children[skuU] = [];
                     } else if (t === 'child') {
-                        var pk = p.parent_sku || '_none';
+                        var pk = (p.parent_sku || '_none').toUpperCase();
                         if (!children[pk]) children[pk] = [];
                         children[pk].push(p);
                     } else if (t === 'grandchild') {
-                        var pk2 = p.parent_sku || '_none';
+                        var pk2 = (p.parent_sku || '_none').toUpperCase();
                         if (!grandchildren[pk2]) grandchildren[pk2] = [];
                         grandchildren[pk2].push(p);
                     } else {
@@ -4728,26 +4812,26 @@ function dinoco_render_ui_v99() {
                 var sorted = [];
                 sets.forEach(function(s) {
                     sorted.push(s);
-                    var ch = children[s.sku] || [];
+                    var sU = (s.sku || '').toUpperCase();
+                    var ch = children[sU] || [];
                     ch.forEach(function(c) {
                         sorted.push(c);
-                        var gc = grandchildren[c.sku] || [];
+                        var cU = (c.sku || '').toUpperCase();
+                        var gc = grandchildren[cU] || [];
                         gc.forEach(function(g) { sorted.push(g); });
                     });
                 });
                 // Orphan children (parent not in current page)
                 Object.keys(children).forEach(function(pk) {
-                    if (sets.find(function(s){return s.sku===pk;})) return;
-                    children[pk].forEach(function(c) { sorted.push(c); });
+                    if (sets.find(function(s){return (s.sku||'').toUpperCase()===pk;})) return;
+                    children[pk].forEach(function(c) {
+                        if (sorted.indexOf(c) === -1) sorted.push(c);
+                    });
                 });
                 Object.keys(grandchildren).forEach(function(pk) {
-                    var alreadyAdded = false;
-                    Object.keys(children).forEach(function(pk2) {
-                        children[pk2].forEach(function(c) { if (c.sku === pk) alreadyAdded = true; });
+                    grandchildren[pk].forEach(function(g) {
+                        if (sorted.indexOf(g) === -1) sorted.push(g);
                     });
-                    if (!alreadyAdded) {
-                        grandchildren[pk].forEach(function(g) { sorted.push(g); });
-                    }
                 });
                 singles.forEach(function(s) { sorted.push(s); });
                 return sorted;
@@ -4818,7 +4902,7 @@ function dinoco_render_ui_v99() {
                             let thtml = '';
                             let chtml = '';
                             sorted.forEach(function(p) {
-                                var safeSku = (p.sku || '').replace(/[^a-zA-Z0-9]/g, '_');
+                                var safeSku = (p.sku || '').toUpperCase().replace(/[^a-zA-Z0-9]/g, '_'); // V.40.6: uppercase for reliable CSS class match
                                 var ptype = p.product_type || 'single';
                                 const reservedBadge = p.reserved_qty > 0 ? '<span style="color:#f59e0b;font-weight:700;">'+p.reserved_qty.toLocaleString()+'</span>' : '<span class="text-slate-300">0</span>';
                                 const availColor = p.available_qty <= 0 ? 'color:#ef4444;' : (p.available_qty <= p.low_stock_threshold ? 'color:#f59e0b;' : 'color:#22c55e;');
@@ -4859,7 +4943,7 @@ function dinoco_render_ui_v99() {
 
                                 } else if (ptype === 'child') {
                                     // V.40.2: Child row — blue bg, indented, tree connector
-                                    var parentSafe = (p.parent_sku || '').replace(/[^a-zA-Z0-9]/g, '_');
+                                    var parentSafe = (p.parent_sku || '').toUpperCase().replace(/[^a-zA-Z0-9]/g, '_'); // V.40.6: uppercase
                                     thtml += '<tr class="stock-row stock-row-child stock-child-of-'+parentSafe+'" data-sku="'+esc(p.sku)+'" data-type="child" style="display:none;">' +
                                         '<td></td>' +
                                         '<td>'+self.thumb(p.image_url)+'</td>' +
@@ -4894,8 +4978,8 @@ function dinoco_render_ui_v99() {
 
                                 } else if (ptype === 'grandchild') {
                                     // V.40.2: Grandchild row — yellow bg, deeper indent
-                                    var parentSafe2 = (p.parent_sku || '').replace(/[^a-zA-Z0-9]/g, '_');
-                                    var gpSafe = (p.grandparent_sku || '').replace(/[^a-zA-Z0-9]/g, '_');
+                                    var parentSafe2 = (p.parent_sku || '').toUpperCase().replace(/[^a-zA-Z0-9]/g, '_'); // V.40.6: uppercase
+                                    var gpSafe = (p.grandparent_sku || '').toUpperCase().replace(/[^a-zA-Z0-9]/g, '_'); // V.40.6: uppercase
                                     thtml += '<tr class="stock-row stock-row-grandchild stock-child-of-'+parentSafe2+' stock-grandchild-of-'+gpSafe+'" data-sku="'+esc(p.sku)+'" data-type="grandchild" style="display:none;">' +
                                         '<td></td>' +
                                         '<td>'+self.thumb(p.image_url)+'</td>' +
