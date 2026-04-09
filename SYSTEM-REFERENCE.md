@@ -581,7 +581,8 @@ sequenceDiagram
 | `price_diamond` | number | Diamond tier discount % (0-100) |
 | `unit_of_measure` | text | Unit (ชิ้น, กล่อง, etc.) |
 | `min_order_qty` | number | Minimum order quantity |
-| `boxes_per_unit` | number | Boxes per unit |
+| `boxes_per_unit` | number | Boxes per unit (สินค้าใหญ่ เช่น SET กันล้ม = 4 กล่อง) |
+| `units_per_box` | number | Units per box (สินค้าเล็ก เช่น กระเป๋า 6L = 20 ชิ้น/กล่อง, default 1) |
 
 #### `b2b_order` Fields
 
@@ -631,8 +632,10 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 | `sku` | VARCHAR | Product SKU |
 | `name` | VARCHAR | Product name |
 | `category` | VARCHAR | Category |
-| `price` | DECIMAL | Base price |
+| `base_price` | DECIMAL | Base price (retail) |
 | `image_url` | TEXT | Product image |
+| `boxes_per_unit` | INT DEFAULT 1 | Boxes per unit (สินค้าใหญ่) |
+| `units_per_box` | INT DEFAULT 1 | Units per box (สินค้าเล็กแพ็ครวม) |
 
 #### `dinoco_moto_brands` (B2B Snippet 15, DINOCO_MotoDB class)
 
