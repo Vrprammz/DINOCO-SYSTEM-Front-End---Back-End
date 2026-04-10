@@ -1068,14 +1068,15 @@ Helper Functions (PART 1.35):
 ```
 Trigger: Admin ยืนยัน order → status: checking_stock → awaiting_confirm
 
-Flow (Snippet 2 V.34.0):
+Flow (Snippet 2 V.34.2 — walk-in allow_negative):
   1. วน order_items แต่ละ SKU
-  2. dinoco_get_leaf_skus($sku) → resolve เป็น leaf SKUs
-  3. dinoco_stock_subtract() เฉพาะ leaf SKUs (ไม่ตัด parent/sub-set)
-  4. dinoco_stock_auto_status() → อัพเดท stock_status ของ leaf
-  5. dinoco_get_ancestor_skus($leaf) → หา parent ทุกระดับ
-  6. cascade dinoco_stock_auto_status() ขึ้น ancestor ทุกตัว
-  7. Delete transient cache (leaf + ancestors)
+  2. Detect _b2b_is_walkin meta → set $allow_neg flag
+  3. dinoco_get_leaf_skus($sku) → resolve เป็น leaf SKUs (V.7.1 value-copy visited)
+  4. dinoco_stock_subtract($leaf, $qty, ..., $allow_neg) — walk-in = true ให้ติดลบได้
+  5. dinoco_stock_auto_status() → อัพเดท stock_status ของ leaf
+  6. dinoco_get_ancestor_skus($leaf) → หา parent ทุกระดับ
+  7. cascade dinoco_stock_auto_status() ขึ้น ancestor ทุกตัว
+  8. Delete transient cache (leaf + ancestors)
 
 Cancel / Stock Restore (Snippet 2 + Snippet 5 V.32.0):
   1. dinoco_get_leaf_skus($sku) → resolve เป็น leaf SKUs
@@ -1118,6 +1119,80 @@ Multi-Warehouse:
   - dinoco_warehouses table (โกดังหลัก = default)
   - dinoco_get_total_stock($sku) รวมทุกคลัง
   - dinoco_transfer_stock($sku, $from, $to, $qty)
+```
+
+### 10.6 Auto-Split Workflow (V.41.0 → V.42.8)
+
+```
+Purpose: แยกสินค้าเดี่ยวหรือ child → 2 ชิ้นส่วนย่อย (L/R) ในคลิกเดียว
+
+Entry: Admin Inventory → Edit product (single หรือ child) → กด "Auto-Split L/R"
+
+Pre-check (V.42.8):
+  - type = 'single' หรือ 'child' (เดิม block 'single' ผิด — V.41.2 เพิ่มปุ่มแต่ลืมแก้ check, V.42.8 fix)
+  - parent ต้องยังไม่มี children (skuRelations[parent].length === 0)
+  - ถ้า -L/-R orphan มีอยู่แล้ว (V.42.7 resume mode) → allow resume ถ้าไม่ได้ link กับ parent ไหน
+
+Price Split Modes (V.42.8 Phase 1):
+  - equal (default): ลูก /2 เท่ากัน
+  - percent: admin ใส่ % (ต้องรวม 100)
+  - quantity: L qty vs R qty → สัดส่วน
+  - manual: admin กรอกเอง
+  → ปุ่ม "คำนวณ" auto-fill ราคาทั้ง 2 ช่อง
+
+Execute Flow (4 steps):
+  1. save_product sku1 (-L)  + save_product sku2 (-R)    ← parallel (V.42.0 H-8)
+  2. save pricing sku1 + sku2                            ← parallel (copy tier จากแม่)
+  3. save_sku_relation parent={parent}, children=[sku1, sku2], confirm_stock_migrate=1 (V.42.5)
+      ├── backend detect parent had stock → migrate ไป sku1 (H1)
+      └── insert audit: hierarchy_migrate_out (parent) + hierarchy_migrate_in (sku1)
+  4. Success → แสดงผล + reload catalog
+
+Error Handling:
+  - Step 4 fail เดิม → orphan -L/-R ค้าง (V.42.7 fix: allow resume)
+  - Response success:false → แสดง error message จริงจาก backend (V.42.6)
+  - Silent fail (HTTP 200 + success:false) → ถูกจับด้วย relationResponse inspection (V.42.6)
+
+Auto-Split Image (V.42.0 → V.42.3):
+  - Canvas = aspect ratio ของรูปต้นฉบับ (maxDim 1600)
+  - แถบแดงซ้อนทับด้านล่าง 16% ของ canvas height
+  - Text overlay (Thai font) 50% ของ bar height
+  - jpeg quality 0.9 → upload + overwrite SKU image
+```
+
+### 10.7 Hierarchy Bug Fixes (V.7.1 / V.42.4-42.8 — 2026-04-10)
+
+```
+3 CRITICAL + 2 HIGH bugs จาก audit SKU hierarchy system
+
+🔴 C1/C2 — Shared child (DD-3) แตก
+  File: Snippet 15 V.7.1
+  Bug: $visited เป็น reference → sibling branches share → shared leaf return 0/empty
+  Fix: value-copy + array_unique dedup
+  Functions: dinoco_get_leaf_skus, dinoco_compute_hierarchy_stock, dinoco_get_sku_tree
+
+🔴 C3 — Walk-in stock ติดลบไม่ได้
+  File: Snippet 15 V.7.1 + Snippet 2 V.34.2
+  Bug: max(0, ...) cap เสมอ → ขัด DD-5
+  Fix: $allow_negative param + walk-in path ส่ง true (detect _b2b_is_walkin)
+
+🟡 H1 — Auto-Split parent stock หาย
+  File: Admin Inventory V.42.4
+  Bug: parent มี stock_qty > 0 → กลายเป็น non-leaf → stock หาย (compute ไม่อ่าน parent)
+  Fix: save_sku_relation เช็ค becoming_parent → require confirm_stock_migrate flag
+       → migrate parent stock → leaf แรก + audit trail (hierarchy_migrate_out/in)
+
+🟡 H2 — Defensive leaf guard
+  File: Snippet 15 V.7.1
+  Fix: dinoco_stock_add/subtract เพิ่ม guard ต้น function
+       → !dinoco_is_leaf_sku → return WP_Error('not_leaf') + log CRITICAL
+       → caller ทุกตัวต้อง expand leaf ก่อน (Snippet 2/5 + B2F Snippet 2 ทำถูกแล้ว)
+
+Frontend Fix Wave (V.42.5-42.8):
+  V.42.5 — Auto-Split JS ส่ง confirm_stock_migrate=1 auto
+  V.42.6 — Manual Edit modal ส่ง flag + inspect relationResponse (silent fail fix)
+  V.42.7 — Auto-Split resume from orphan (retry ได้ไม่ติด guard)
+  V.42.8 — Price split mode 4 แบบ + type check fix (single) + debug console log
 ```
 
 ---

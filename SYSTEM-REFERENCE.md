@@ -672,27 +672,35 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 | `b2b_sku_relations` | array | Parent-child-grandchild SKU relationships (3-level flat format: `{ parent: [children], child: [grandchildren] }`) |
 | `dinoco_sku_relations` | array | SKU relations for legacy migration |
 
-#### SKU Hierarchy Helper Functions (Snippet 15 PART 1.35, V.6.0)
+#### SKU Hierarchy Helper Functions (Snippet 15 PART 1.35, V.7.1)
 
 7 helper functions สำหรับ 3-level product hierarchy (แม่ → ลูก → ชิ้นส่วนย่อย):
 
 | Function | Parameters | Returns | Description |
 |----------|------------|---------|-------------|
-| `dinoco_get_leaf_skus` | `($sku, $relations?, $depth?, &$visited?)` | `array` of SKU strings | Resolve leaf nodes recursive (max depth 3), ป้องกัน circular ref |
+| `dinoco_get_leaf_skus` | `($sku, $relations?, $depth?, $visited?)` | `array` of SKU strings (dedup) | Resolve leaf nodes recursive (max depth 3), ป้องกัน circular ref. **V.7.1**: `$visited` เป็น value-copy (ไม่ใช่ reference) + `array_unique` output → DD-3 shared child ผ่านหลาย path คืนค่าถูก |
 | `dinoco_is_leaf_sku` | `($sku, $relations?)` | `bool` | Check ว่า SKU ไม่มี children (เป็นสินค้าชิ้นเดี่ยว) |
 | `dinoco_get_ancestor_skus` | `($sku, $relations?)` | `array` of SKU strings | หา parent ทุกระดับขึ้นไป (ใช้ cascade stock status) |
-| `dinoco_compute_hierarchy_stock` | `($sku, $relations?, $depth?)` | `int` | คำนวณ stock recursive: leaf = stock จริง, parent = MIN(children computed) |
+| `dinoco_compute_hierarchy_stock` | `($sku, $relations?, $depth?, $visited?, $stock_map?)` | `int` | คำนวณ stock recursive: leaf = stock จริง, parent = MIN(children computed). **V.7.1**: value-copy visited → shared child DD-3 คำนวณ MIN ถูก (เดิม = 0 ผิด) |
 | `dinoco_is_top_level_set` | `($sku, $relations?)` | `bool` | เป็น parent แต่ไม่เป็น child ของใคร (top-level set) |
 | `dinoco_validate_sku_hierarchy` | `($parent_sku, $child_sku, $relations?)` | `bool` | Validate ไม่มี circular ref + depth ไม่เกิน 3 ระดับ |
-| `dinoco_get_sku_tree` | `($sku, $relations?, $depth?)` | `array` (nested tree) | สร้าง hierarchy tree สำหรับ UI แสดงโครงสร้างสินค้า |
+| `dinoco_get_sku_tree` | `($sku, $relations?, $depth?, $visited?)` | `array` (nested tree) | สร้าง hierarchy tree สำหรับ UI. **V.7.1**: value-copy visited → shared child render ถูก |
 
-**Stock Logic (V.6.0):**
-- **Stock Deduct** (B2B order): `dinoco_get_leaf_skus()` resolve ลง leaf → ตัดเฉพาะ leaf SKUs
+#### Atomic Stock Functions (Snippet 15 V.7.1)
+
+| Function | Signature | Behavior |
+|----------|-----------|----------|
+| `dinoco_stock_add` | `($sku, $qty, $type, $ref_type, $ref_id, $reason, $batch_id, $warehouse_id, $unit_cost_thb)` | **V.7.1 H2**: ถ้า `!dinoco_is_leaf_sku($sku)` → return `WP_Error('not_leaf')` + log CRITICAL. caller ต้อง expand leaf ก่อน |
+| `dinoco_stock_subtract` | `($sku, $qty, $type, $ref_type, $ref_id, $reason, $batch_id, $warehouse_id, $allow_negative=false)` | **V.7.1 C3**: param `$allow_negative` — walk-in order ส่ง `true` ให้ stock ติดลบได้ตาม DD-5. honor ทั้ง `dinoco_products.stock_qty` + `dinoco_warehouse_stock`. **H2**: leaf guard เหมือน add |
+
+**Stock Logic (V.7.1):**
+- **Stock Deduct** (B2B order): `dinoco_get_leaf_skus()` resolve ลง leaf → ตัดเฉพาะ leaf SKUs. Snippet 2 V.34.2 detect `_b2b_is_walkin` → ส่ง `allow_negative=true`
 - **Stock Restore** (cancel): เหมือนกัน — restore เฉพาะ leaf SKUs + `_stock_returned` guard
 - **Stock Status**: `dinoco_stock_auto_status()` cascade ขึ้น ancestor ทุกระดับ
 - **Reserved Qty**: `dinoco_get_reserved_qty()` match ทั้ง leaf + ancestor orders
 - **Inventory Valuation**: ใช้ `dinoco_compute_hierarchy_stock()` แทน raw stock
 - **Dip Stock**: snapshot เฉพาะ leaf SKUs (filter ด้วย `dinoco_is_leaf_sku()`)
+- **Hierarchy Migration (H1)**: `save_sku_relation` ใน Admin Inventory V.42.4 — ถ้า parent เคยมี `stock_qty > 0` แล้วกลายเป็น non-leaf → ต้องส่ง POST flag `confirm_stock_migrate=1` → โอน stock ไปที่ leaf แรก + audit trail (`hierarchy_migrate_out/in` transaction types)
 
 #### B2F Settings
 
