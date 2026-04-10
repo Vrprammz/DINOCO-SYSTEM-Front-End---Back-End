@@ -88,7 +88,7 @@ export async function PATCH(
             note: note || null,
           },
         },
-      }
+      } as never
     );
 
     console.log(
