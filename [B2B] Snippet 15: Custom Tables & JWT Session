@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.6.2 — C-1 visited guard for recursive hierarchy functions  ║
+ * ║  Version: V.7.0 — Bulk reserved map + SKU→post_id map + child-to-parent map + stock_map + DB indexes  ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -24,7 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '5.15';
+    $db_version = '5.16'; // V.7.0: extra indexes (H-3)
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -198,6 +198,26 @@ add_action( 'init', function() {
         $wpdb->query( "ALTER TABLE {$txn_table} ADD COLUMN unit_cost_thb DECIMAL(12,2) DEFAULT NULL AFTER warehouse_id" );
     }
 
+    // V.7.0 [H-3]: Ensure performance indexes exist (ALTER TABLE fallback)
+    $prefix = $wpdb->prefix;
+    $existing_idx_ts = $wpdb->get_col( "SHOW INDEX FROM {$prefix}dinoco_stock_transactions WHERE Key_name = 'idx_type_sku'" );
+    if ( empty( $existing_idx_ts ) ) {
+        $wpdb->query( "ALTER TABLE {$prefix}dinoco_stock_transactions ADD INDEX idx_type_sku (type, sku, unit_cost_thb)" );
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] V.7.0: added idx_type_sku to dinoco_stock_transactions' );
+    }
+
+    $existing_idx_avn = $wpdb->get_col( "SHOW INDEX FROM {$prefix}dinoco_products WHERE Key_name = 'idx_active_visible_name'" );
+    if ( empty( $existing_idx_avn ) ) {
+        $wpdb->query( "ALTER TABLE {$prefix}dinoco_products ADD INDEX idx_active_visible_name (is_active, b2b_visible, name)" );
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] V.7.0: added idx_active_visible_name to dinoco_products' );
+    }
+
+    $existing_idx_acn = $wpdb->get_col( "SHOW INDEX FROM {$prefix}dinoco_products WHERE Key_name = 'idx_active_category_name'" );
+    if ( empty( $existing_idx_acn ) ) {
+        $wpdb->query( "ALTER TABLE {$prefix}dinoco_products ADD INDEX idx_active_category_name (is_active, category, name)" );
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] V.7.0: added idx_active_category_name to dinoco_products' );
+    }
+
     // Phase 5 Migration: create default warehouse + copy stock
     $default_wh = $wpdb->get_var( "SELECT id FROM {$wh_table} WHERE code = 'MAIN' LIMIT 1" );
     if ( ! $default_wh ) {
@@ -224,6 +244,20 @@ add_action( 'init', function() {
     // Set initialized flag = false (Admin ต้องทำ Dip Stock ก่อน)
     if ( ! get_option( 'dinoco_inv_initialized' ) ) {
         update_option( 'dinoco_inv_initialized', false );
+    }
+
+    // V.7.0 [H-3]: Extra indexes for valuation/catalog queries
+    $index_map = array(
+        array( 'table' => $txn_table, 'name' => 'idx_type_sku_cost',     'sql' => "ALTER TABLE {$txn_table} ADD INDEX idx_type_sku_cost (type, sku, unit_cost_thb)" ),
+        array( 'table' => $table,     'name' => 'idx_active_visible',    'sql' => "ALTER TABLE {$table} ADD INDEX idx_active_visible (is_active, b2b_visible, name)" ),
+        array( 'table' => $table,     'name' => 'idx_active_category',   'sql' => "ALTER TABLE {$table} ADD INDEX idx_active_category (is_active, category, name)" ),
+    );
+    foreach ( $index_map as $idx ) {
+        $exists = $wpdb->get_var( "SHOW INDEX FROM {$idx['table']} WHERE Key_name = '{$idx['name']}'" );
+        if ( ! $exists ) {
+            $wpdb->query( $idx['sql'] );
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[DB] Added index {$idx['name']} on {$idx['table']}" );
+        }
     }
 
     update_option( '_dinoco_catalog_table_version', $db_version );
@@ -738,6 +772,27 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
     }
 }
 
+// V.7.0 [C-8]: Batch SKU → b2b_product post_id map (avoid N+1 get_posts per SKU)
+if ( ! function_exists( 'b2b_get_sku_to_post_id_map' ) ) {
+    function b2b_get_sku_to_post_id_map() {
+        static $map = null;
+        if ( $map !== null ) return $map;
+        $cached = wp_cache_get( 'b2b_sku_pid_map' );
+        if ( $cached !== false ) { $map = $cached; return $map; }
+        global $wpdb;
+        $rows = $wpdb->get_results( "
+            SELECT pm.meta_value AS sku, pm.post_id
+            FROM {$wpdb->postmeta} pm
+            INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+            WHERE pm.meta_key = 'product_sku' AND p.post_type = 'b2b_product' AND p.post_status = 'publish'
+        " );
+        $map = array();
+        foreach ( $rows as $r ) $map[ strtoupper( $r->sku ) ] = (int) $r->post_id;
+        wp_cache_set( 'b2b_sku_pid_map', $map, '', 600 );
+        return $map;
+    }
+}
+
 if ( ! function_exists( 'dinoco_stock_auto_status' ) ) {
     /**
      * Auto-update stock_status ตาม stock_qty + threshold + manual_hold
@@ -778,42 +833,45 @@ if ( ! function_exists( 'dinoco_stock_auto_status' ) ) {
             'stock_updated_at' => current_time( 'mysql' ),
         ), array( 'sku' => $sku ) );
 
-        // Dual-write: sync to b2b_product CPT postmeta (DD-1)
-        $b2b_post = get_posts( array(
-            'post_type'      => 'b2b_product',
-            'meta_query'     => array( array( 'key' => 'product_sku', 'value' => $sku ) ),
-            'posts_per_page' => 1,
-            'fields'         => 'ids',
-        ) );
-        if ( ! empty( $b2b_post ) ) {
-            update_field( 'stock_status', $new_status, $b2b_post[0] );
+        // V.7.0 [C-8]: Dual-write via SKU → post_id map (no get_posts N+1)
+        $pid_map = function_exists( 'b2b_get_sku_to_post_id_map' ) ? b2b_get_sku_to_post_id_map() : array();
+        $pid = $pid_map[ strtoupper( $sku ) ] ?? 0;
+        if ( $pid ) {
+            update_post_meta( $pid, 'stock_status', $new_status );
         }
 
         // Cache invalidation (DD-5)
         delete_transient( 'b2b_sku_data_map' );
 
-        // V.6.0 [C-2 FIX]: Cascade update ancestor ทุกระดับ (grandchild → child → parent)
-        // ใช้ dinoco_get_ancestor_skus() + dinoco_compute_hierarchy_stock() แทน loop 1 ระดับ
+        // V.7.0 [C-8]: Cascade ancestor ใช้ full status logic (threshold + manual_hold + reserved)
         if ( function_exists( 'dinoco_get_ancestor_skus' ) && function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
             $relations = get_option( 'dinoco_sku_relations', array() );
             $ancestors = dinoco_get_ancestor_skus( $sku, $relations );
             foreach ( $ancestors as $ancestor_sku ) {
-                $ancestor_stock  = dinoco_compute_hierarchy_stock( $ancestor_sku, $relations );
-                $ancestor_status = $ancestor_stock > 0 ? 'in_stock' : 'out_of_stock';
+                $anc_stock     = dinoco_compute_hierarchy_stock( $ancestor_sku, $relations );
+                $anc_reserved  = function_exists( 'dinoco_get_reserved_qty' ) ? dinoco_get_reserved_qty( $ancestor_sku ) : 0;
+                $anc_available = max( 0, $anc_stock - $anc_reserved );
+
+                $anc_row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT low_stock_threshold, manual_hold FROM {$table} WHERE sku = %s", $ancestor_sku
+                ) );
+                $anc_manual_hold = $anc_row ? (int) $anc_row->manual_hold : 0;
+
+                if ( $anc_manual_hold || $anc_available <= 0 ) {
+                    $anc_status = 'out_of_stock';
+                } else {
+                    $anc_status = 'in_stock';
+                }
 
                 $wpdb->update( $table, array(
-                    'stock_status'     => $ancestor_status,
+                    'stock_status'     => $anc_status,
                     'stock_updated_at' => current_time( 'mysql' ),
                 ), array( 'sku' => $ancestor_sku ) );
 
-                // Dual-write ancestor to ACF
-                $anc_b2b = get_posts( array(
-                    'post_type'      => 'b2b_product',
-                    'meta_query'     => array( array( 'key' => 'product_sku', 'value' => $ancestor_sku ) ),
-                    'posts_per_page' => 1, 'fields' => 'ids',
-                ) );
-                if ( ! empty( $anc_b2b ) ) {
-                    update_field( 'stock_status', $ancestor_status, $anc_b2b[0] );
+                // Dual-write ancestor via post_id map (no get_posts)
+                $anc_pid = $pid_map[ strtoupper( $ancestor_sku ) ] ?? 0;
+                if ( $anc_pid ) {
+                    update_post_meta( $anc_pid, 'stock_status', $anc_status );
                 }
             }
         }
@@ -939,7 +997,29 @@ if ( ! function_exists( 'dinoco_is_leaf_sku' ) ) {
 }
 
 /**
- * หา ancestor (parent) ทุกระดับของ SKU [C-2, C-3 FIX]
+ * V.7.0 [H-12]: สร้าง child → parent map (O(1) lookup) แทน loop ผ่าน relations ทุกครั้ง
+ * Static cache ต่อ request
+ */
+if ( ! function_exists( 'dinoco_get_child_to_parent_map' ) ) {
+    function dinoco_get_child_to_parent_map() {
+        static $map = null;
+        if ( $map !== null ) return $map;
+        $relations = get_option( 'dinoco_sku_relations', array() );
+        if ( ! is_array( $relations ) ) $relations = array();
+        $map = array();
+        foreach ( $relations as $p => $ch ) {
+            if ( ! is_array( $ch ) ) continue;
+            $pu = strtoupper( trim( $p ) );
+            foreach ( $ch as $c ) {
+                $map[ strtoupper( trim( $c ) ) ] = $pu;
+            }
+        }
+        return $map;
+    }
+}
+
+/**
+ * หา ancestor (parent) ทุกระดับของ SKU [C-2, C-3 FIX, V.7.0 H-12: O(depth) ผ่าน child→parent map]
  *
  * dinoco_get_ancestor_skus('GRAND_B1') → ['CHILD_B', 'SET_A']
  * dinoco_get_ancestor_skus('CHILD_C')  → ['SET_A']
@@ -947,31 +1027,17 @@ if ( ! function_exists( 'dinoco_is_leaf_sku' ) ) {
  */
 if ( ! function_exists( 'dinoco_get_ancestor_skus' ) ) {
     function dinoco_get_ancestor_skus( $sku, $relations = null ) {
-        if ( $relations === null ) {
-            $relations = get_option( 'dinoco_sku_relations', array() );
-            if ( ! is_array( $relations ) ) $relations = array();
-        }
-        $sku_upper = strtoupper( trim( $sku ) );
+        // V.7.0: ใช้ child→parent map (O(1) lookup) — $relations param kept for back-compat
+        $map = dinoco_get_child_to_parent_map();
         $ancestors = array();
-        $max_depth = 3;
-        $current   = $sku_upper;
-
-        for ( $i = 0; $i < $max_depth; $i++ ) {
-            $found_parent = null;
-            foreach ( $relations as $parent => $children ) {
-                if ( ! is_array( $children ) ) continue;
-                $children_upper = array_map( function( $c ) { return strtoupper( trim( $c ) ); }, $children );
-                if ( in_array( $current, $children_upper, true ) ) {
-                    $found_parent = strtoupper( trim( $parent ) );
-                    break;
-                }
-            }
-            if ( $found_parent === null ) break;
-            if ( in_array( $found_parent, $ancestors, true ) ) break; // circular guard
-            $ancestors[] = $found_parent;
-            $current = $found_parent;
+        $current = strtoupper( trim( $sku ) );
+        for ( $i = 0; $i < 3; $i++ ) {
+            if ( ! isset( $map[ $current ] ) ) break;
+            $p = $map[ $current ];
+            if ( in_array( $p, $ancestors, true ) ) break; // circular guard
+            $ancestors[] = $p;
+            $current = $p;
         }
-
         return $ancestors;
     }
 }
@@ -982,7 +1048,7 @@ if ( ! function_exists( 'dinoco_get_ancestor_skus' ) ) {
  * non-leaf → return MIN(children computed stock)
  */
 if ( ! function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
-    function dinoco_compute_hierarchy_stock( $sku, $relations = null, $depth = 0, &$visited = array() ) {
+    function dinoco_compute_hierarchy_stock( $sku, $relations = null, $depth = 0, &$visited = array(), $stock_map = null ) {
         if ( $depth > 3 ) return 0;
 
         if ( $relations === null ) {
@@ -990,8 +1056,22 @@ if ( ! function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
             if ( ! is_array( $relations ) ) $relations = array();
         }
 
-        global $wpdb;
-        $table     = $wpdb->prefix . 'dinoco_products';
+        // V.7.0 [H-13]: batch-load stock_qty for all active SKUs (1 query) แทน query per leaf
+        if ( $stock_map === null ) {
+            static $cached_map = null;
+            if ( $cached_map === null ) {
+                global $wpdb;
+                $rows = $wpdb->get_results( "SELECT sku, stock_qty FROM {$wpdb->prefix}dinoco_products WHERE is_active = 1", OBJECT_K );
+                $cached_map = array();
+                if ( is_array( $rows ) ) {
+                    foreach ( $rows as $s => $r ) {
+                        $cached_map[ strtoupper( $s ) ] = (int) $r->stock_qty;
+                    }
+                }
+            }
+            $stock_map = $cached_map;
+        }
+
         $sku_upper = strtoupper( trim( $sku ) );
 
         // C-1: circular reference guard
@@ -1006,18 +1086,15 @@ if ( ! function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
             $children = $relations[ $sku ];
         }
 
-        // leaf → return stock_qty ตรง
+        // leaf → return stock_qty จาก stock_map (O(1))
         if ( ! is_array( $children ) || empty( $children ) ) {
-            $qty = $wpdb->get_var( $wpdb->prepare(
-                "SELECT stock_qty FROM {$table} WHERE sku = %s AND is_active = 1", $sku_upper
-            ) );
-            return $qty !== null ? (int) $qty : 0;
+            return $stock_map[ $sku_upper ] ?? 0;
         }
 
         // non-leaf → MIN(children computed stock)
         $min_stock = PHP_INT_MAX;
         foreach ( $children as $child ) {
-            $child_stock = dinoco_compute_hierarchy_stock( $child, $relations, $depth + 1, $visited );
+            $child_stock = dinoco_compute_hierarchy_stock( $child, $relations, $depth + 1, $visited, $stock_map );
             if ( $child_stock < $min_stock ) $min_stock = $child_stock;
         }
 
@@ -1142,95 +1219,88 @@ if ( ! function_exists( 'dinoco_get_sku_tree' ) ) {
 // ════════════════════════════════════════════════════════════
 
 /**
+ * V.7.0 [C-7]: Bulk reserved map builder — single JOIN query over all active reserved orders
+ *   → return map: sku → reserved_qty (รวม leaf + ancestor + self charges)
+ * Cache 60 วินาที (transient `b2b_reserved_map_bulk`)
+ * แทนที่การ query get_posts() ต่อ SKU (N+1)
+ */
+if ( ! function_exists( 'b2b_build_reserved_map_bulk' ) ) {
+    function b2b_build_reserved_map_bulk() {
+        $cache = get_transient( 'b2b_reserved_map_bulk' );
+        if ( $cache !== false ) return $cache;
+
+        global $wpdb;
+        $rows = $wpdb->get_results( "
+            SELECT pm.meta_value AS items
+            FROM {$wpdb->postmeta} pm
+            INNER JOIN {$wpdb->postmeta} pm2 ON pm.post_id = pm2.post_id
+            INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+            WHERE pm.meta_key = 'order_items'
+              AND pm2.meta_key = 'order_status'
+              AND pm2.meta_value IN ('checking_stock','awaiting_confirm','awaiting_payment','paid','packed')
+              AND p.post_type = 'b2b_order' AND p.post_status = 'publish'
+        " );
+
+        $relations = get_option( 'dinoco_sku_relations', array() );
+        if ( ! is_array( $relations ) ) $relations = array();
+
+        $map = array();
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        foreach ( $rows as $r ) {
+            if ( empty( $r->items ) ) continue;
+            if ( ! preg_match_all( '/\(([A-Za-z0-9_\-]+)\)\s*x(\d+)/i', $r->items, $m, PREG_SET_ORDER ) ) continue;
+
+            foreach ( $m as $hit ) {
+                $sku_hit = strtoupper( $hit[1] );
+                $qty     = (int) $hit[2];
+                if ( $qty <= 0 ) continue;
+
+                // Charge leaves (ตัดสต็อกจริงอยู่ที่ leaf)
+                $leaves = function_exists( 'dinoco_get_leaf_skus' )
+                    ? dinoco_get_leaf_skus( $sku_hit, $relations )
+                    : array( $sku_hit );
+                foreach ( $leaves as $leaf ) {
+                    $lu = strtoupper( $leaf );
+                    $map[ $lu ] = ( $map[ $lu ] ?? 0 ) + $qty;
+                }
+
+                // Charge ancestors (parent/grandparent — display layer)
+                if ( function_exists( 'dinoco_get_ancestor_skus' ) ) {
+                    $ancestors = dinoco_get_ancestor_skus( $sku_hit, $relations );
+                    foreach ( $ancestors as $anc ) {
+                        $map[ $anc ] = ( $map[ $anc ] ?? 0 ) + $qty;
+                    }
+                }
+
+                // Charge self (กรณี hit เป็น parent หรือ leaf ตรง — leaf จะถูก charge ซ้ำแต่เราใช้ +=)
+                // leaf ถูก charge แล้ว, parent ยังไม่ถูก charge → เพิ่ม self ถ้ายังไม่ใช่ leaf
+                if ( ! in_array( $sku_hit, array_map( 'strtoupper', $leaves ), true ) ) {
+                    $map[ $sku_hit ] = ( $map[ $sku_hit ] ?? 0 ) + $qty;
+                }
+            }
+        }
+
+        set_transient( 'b2b_reserved_map_bulk', $map, 60 );
+        return $map;
+    }
+}
+
+/**
  * คำนวณ reserved_qty สำหรับ SKU (computed — ไม่เก็บ field แยก)
- * Query จาก b2b_order ที่ status IN (checking_stock, awaiting_confirm, awaiting_payment, paid, packed)
- * Parse order_items text ด้วย regex เพื่อหา SKU + qty
- * SKU Set: ถ้า SKU เป็น child → หา parent ที่มี child ตรง → sum
- * Cache ด้วย transient 60 วินาที (PO-3)
+ * V.7.0 [C-7]: ใช้ bulk map (1 query ต่อ request) แทน query ต่อ SKU
  */
 if ( ! function_exists( 'dinoco_get_reserved_qty' ) ) {
     function dinoco_get_reserved_qty( $sku ) {
-        $sku = strtoupper( trim( $sku ) );
-        $cache_key = 'dinoco_reserved_' . $sku;
-        $cached = get_transient( $cache_key );
-        if ( $cached !== false ) return (int) $cached;
-
-        $reserve_statuses = array( 'checking_stock', 'awaiting_confirm', 'awaiting_payment', 'paid', 'packed' );
-        $relations = get_option( 'dinoco_sku_relations', array() );
-
-        // V.6.0 [C-3 FIX]: สร้าง list ของ SKU ที่ต้อง match: ตัวเอง + ancestor ทุกระดับ
-        $match_skus = array( $sku ); // direct match
-        if ( function_exists( 'dinoco_get_ancestor_skus' ) ) {
-            $ancestors = dinoco_get_ancestor_skus( $sku, $relations );
-            $match_skus = array_merge( $match_skus, $ancestors );
-        } else {
-            // fallback: 1 ระดับเดิม
-            foreach ( $relations as $parent_sku => $children ) {
-                if ( is_array( $children ) && in_array( $sku, array_map( 'strtoupper', $children ), true ) ) {
-                    $match_skus[] = strtoupper( $parent_sku );
-                }
-            }
+        static $bulk_map = null;
+        if ( $bulk_map === null ) {
+            $bulk_map = b2b_build_reserved_map_bulk();
         }
-        $match_skus = array_unique( $match_skus );
-
-        // Query all active orders with reserve statuses
-        $orders = get_posts( array(
-            'post_type'      => 'b2b_order',
-            'post_status'    => 'publish',
-            'posts_per_page' => -1,
-            'fields'         => 'ids',
-            'meta_query'     => array(
-                array(
-                    'key'     => 'order_status',
-                    'value'   => $reserve_statuses,
-                    'compare' => 'IN',
-                ),
-            ),
-        ) );
-
-        $total_reserved = 0;
-
-        foreach ( $orders as $order_id ) {
-            $order_text = get_field( 'order_items', $order_id ) ?: '';
-            if ( ! preg_match_all( '/\(([A-Za-z0-9_\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) {
-                continue;
-            }
-
-            foreach ( $matches as $m ) {
-                $item_sku = strtoupper( trim( $m[1] ) );
-                $item_qty = intval( $m[2] );
-                if ( $item_qty <= 0 ) continue;
-
-                // Direct SKU match
-                if ( $item_sku === $sku ) {
-                    $total_reserved += $item_qty;
-                    continue;
-                }
-
-                // V.6.0 [C-3 FIX]: ถ้า item_sku เป็น ancestor ของ $sku → reserved
-                // ancestor matching ครอบคลุมทั้ง parent (1 ระดับ) + grandparent (2 ระดับ)
-                if ( in_array( $item_sku, $match_skus, true ) ) {
-                    // ตรวจว่า $sku เป็น leaf ของ $item_sku จริง
-                    if ( function_exists( 'dinoco_get_leaf_skus' ) ) {
-                        $item_leaves = dinoco_get_leaf_skus( $item_sku, $relations );
-                        $item_leaves_upper = array_map( 'strtoupper', $item_leaves );
-                        if ( in_array( $sku, $item_leaves_upper, true ) ) {
-                            $total_reserved += $item_qty;
-                        }
-                    } elseif ( isset( $relations[ $item_sku ] ) ) {
-                        $children = array_map( 'strtoupper', $relations[ $item_sku ] );
-                        if ( in_array( $sku, $children, true ) ) {
-                            $total_reserved += $item_qty;
-                        }
-                    }
-                }
-            }
-        }
-
-        set_transient( $cache_key, $total_reserved, 60 ); // cache 1 นาที
-        return $total_reserved;
+        return (int) ( $bulk_map[ strtoupper( trim( $sku ) ) ] ?? 0 );
     }
 }
+
+// V.7.0 [C-8]: b2b_get_sku_to_post_id_map() defined earlier near dinoco_stock_auto_status()
 
 /**
  * คำนวณ available_qty = max(0, stock_qty - reserved_qty)
@@ -1257,8 +1327,9 @@ if ( ! function_exists( 'dinoco_check_stock_conflict' ) ) {
     function dinoco_check_stock_conflict( $sku ) {
         $sku = strtoupper( trim( $sku ) );
 
-        // ล้าง cache เพื่อให้ reserved_qty เป็นปัจจุบัน
-        delete_transient( 'dinoco_reserved_' . $sku );
+        // ล้าง cache เพื่อให้ reserved_qty เป็นปัจจุบัน (V.7.0: bulk map cache)
+        delete_transient( 'b2b_reserved_map_bulk' );
+        delete_transient( 'dinoco_reserved_' . $sku ); // legacy key cleanup
 
         global $wpdb;
         $table = $wpdb->prefix . 'dinoco_products';

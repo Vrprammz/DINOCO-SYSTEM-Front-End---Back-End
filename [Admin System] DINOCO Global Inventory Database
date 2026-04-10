@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.41.2 — Auto-Split "ใช้รูปแม่" สร้าง overlay text อัตโนมัติ (canvas bar + label)
+ * Version: V.42.0 — Batch P0+P1 security/data/performance fixes (C-1..C-9 + H-1..H-14)
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -10,6 +10,14 @@
 // =========================================================================================
 // [PART 1] BACKEND LOGIC
 // =========================================================================================
+
+// V.42.0 [H-4 FIX]: One-time autoload=no for large options to reduce alloptions cache
+add_action('init', function() {
+    if (get_option('_dinoco_autoload_fixed_v42')) return;
+    global $wpdb;
+    $wpdb->query("UPDATE {$wpdb->options} SET autoload = 'no' WHERE option_name IN ('dinoco_product_catalog','dinoco_sku_relations')");
+    update_option('_dinoco_autoload_fixed_v42', 1, false);
+}, 1);
 
 /* [FIX] Use Anonymous Function to prevent Handler Name Collision */
 add_action('init', function() {
@@ -39,9 +47,21 @@ add_action('init', function() {
         $act = sanitize_text_field($_POST['dinoco_inventory_action']);
 
         /* CSRF Protection - only for state-changing operations */
+        // V.42.0 [H-14 FIX]: Per-action nonce keys (backward compat with shared nonce)
         $write_actions = array('save_sku_relation', 'save_product', 'delete_product', 'upd_inv', 'gen_batch');
         if ( in_array($act, $write_actions, true) ) {
-            if ( ! isset( $_POST['dinoco_admin_nonce'] ) || ! wp_verify_nonce( $_POST['dinoco_admin_nonce'], 'dinoco_admin_action' ) ) {
+            $nonce_val = isset($_POST['dinoco_admin_nonce']) ? $_POST['dinoco_admin_nonce'] : '';
+            $per_action_keys = array(
+                'save_sku_relation' => 'dinoco_save_relation',
+                'save_product'      => 'dinoco_save_product',
+                'delete_product'    => 'dinoco_delete_product',
+                'upd_inv'           => 'dinoco_upd_inv',
+                'gen_batch'         => 'dinoco_gen_batch',
+            );
+            // Accept per-action key OR legacy shared key (backward compat)
+            $ok = wp_verify_nonce( $nonce_val, $per_action_keys[$act] )
+                || wp_verify_nonce( $nonce_val, 'dinoco_admin_action' );
+            if ( ! $ok ) {
                 echo json_encode( [ 'success' => false, 'message' => 'Security token invalid. Please refresh.' ] );
                 exit;
             }
@@ -176,37 +196,93 @@ add_action('init', function() {
             // --- 2. MANAGE RELATIONS ---
             if ($act === 'save_sku_relation') {
                 $parent = strtoupper(sanitize_text_field($_POST['parent_sku']));
+                // V.42.0 [C-9]: SKU whitelist regex
+                if (!$parent || !preg_match('/^[A-Z0-9\-_]{1,40}$/', $parent)) { echo json_encode(['success' => false, 'message' => 'Invalid parent SKU']); exit; }
                 $children = isset($_POST['child_skus']) ? array_map(function($c) { return strtoupper(sanitize_text_field($c)); }, $_POST['child_skus']) : [];
-                if (!$parent) { echo json_encode(['success' => false]); exit; }
-                $relations = dinoco_get_current_sku_relations();
-                $children = array_filter($children);
-                if (empty($children)) unset($relations[$parent]); else $relations[$parent] = array_values($children);
+                $children = array_values(array_filter($children, function($c) { return preg_match('/^[A-Z0-9\-_]{1,40}$/', $c); }));
 
-                // V.6.0: grandchild_map — save child→grandchild relations
-                $grandchild_map_raw = isset($_POST['grandchild_map']) ? $_POST['grandchild_map'] : [];
-                if (is_string($grandchild_map_raw)) $grandchild_map_raw = json_decode(stripslashes($grandchild_map_raw), true);
-                if (is_array($grandchild_map_raw)) {
-                    // ก่อนอื่น: ลบ grandchild entries เก่าของ children ที่ไม่มี grandchild แล้ว
-                    foreach ($children as $child) {
-                        $child_clean = strtoupper(sanitize_text_field($child));
-                        if (!isset($grandchild_map_raw[$child_clean]) || empty($grandchild_map_raw[$child_clean])) {
-                            unset($relations[$child_clean]);
+                // V.42.0 [C-6 FIX]: Optimistic lock via MySQL transaction + FOR UPDATE on options row
+                global $wpdb;
+                $wpdb->query('START TRANSACTION');
+                try {
+                    // Lock the option row to prevent lost update
+                    $wpdb->get_var($wpdb->prepare(
+                        "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s FOR UPDATE",
+                        'dinoco_sku_relations'
+                    ));
+
+                    $relations = dinoco_get_current_sku_relations();
+                    $old_relations = $relations; // V.42.0 [H-1]: preserve for merge mode
+
+                    if (empty($children)) unset($relations[$parent]); else $relations[$parent] = array_values($children);
+
+                    // V.42.0 [C-3 FIX]: validate hierarchy (circular / self-ref / depth>3)
+                    if (function_exists('dinoco_validate_sku_hierarchy')) {
+                        foreach ($children as $child) {
+                            if (!dinoco_validate_sku_hierarchy($parent, $child, $relations)) {
+                                $wpdb->query('ROLLBACK');
+                                echo json_encode(['success' => false, 'message' => "ไม่สามารถเพิ่ม {$child} เป็นลูกของ {$parent} (circular/self-ref/depth>3)"]);
+                                exit;
+                            }
                         }
                     }
-                    // เพิ่ม grandchild entries ใหม่
-                    foreach ($grandchild_map_raw as $child_sku => $grandchildren) {
-                        $child_clean = strtoupper(sanitize_text_field($child_sku));
-                        if (!in_array($child_clean, $children)) continue; // ต้องเป็น child จริง
-                        $gc_clean = array_filter(array_map(function($g) { return strtoupper(sanitize_text_field($g)); }, (array)$grandchildren));
-                        if (!empty($gc_clean)) {
-                            $relations[$child_clean] = array_values($gc_clean);
+
+                    // V.6.0: grandchild_map — save child→grandchild relations
+                    $grandchild_map_raw = isset($_POST['grandchild_map']) ? $_POST['grandchild_map'] : [];
+                    if (is_string($grandchild_map_raw)) $grandchild_map_raw = json_decode(stripslashes($grandchild_map_raw), true);
+                    // V.42.0 [H-1]: explicit gc_mode flag — merge keeps existing grandchildren for children not in payload
+                    $gc_mode = isset($_POST['gc_mode']) ? sanitize_text_field($_POST['gc_mode']) : 'replace';
+                    if (is_array($grandchild_map_raw)) {
+                        if ($gc_mode !== 'merge') {
+                            // REPLACE mode — ลบ grandchild entries เก่าของ children ที่ไม่มี grandchild แล้ว
+                            foreach ($children as $child) {
+                                $child_clean = strtoupper(sanitize_text_field($child));
+                                if (!isset($grandchild_map_raw[$child_clean]) || empty($grandchild_map_raw[$child_clean])) {
+                                    unset($relations[$child_clean]);
+                                }
+                            }
                         } else {
-                            unset($relations[$child_clean]);
+                            // MERGE mode — keep existing grandchildren for children not in payload
+                            foreach ($children as $child) {
+                                $cu = strtoupper(sanitize_text_field($child));
+                                if (!isset($grandchild_map_raw[$cu]) && isset($old_relations[$cu])) {
+                                    $relations[$cu] = $old_relations[$cu];
+                                }
+                            }
+                        }
+                        // เพิ่ม grandchild entries ใหม่
+                        foreach ($grandchild_map_raw as $child_sku => $grandchildren) {
+                            $child_clean = strtoupper(sanitize_text_field($child_sku));
+                            if (!preg_match('/^[A-Z0-9\-_]{1,40}$/', $child_clean)) continue;
+                            if (!in_array($child_clean, $children)) continue; // ต้องเป็น child จริง
+                            $gc_clean = array_filter(array_map(function($g) { return strtoupper(sanitize_text_field($g)); }, (array)$grandchildren), function($g) { return preg_match('/^[A-Z0-9\-_]{1,40}$/', $g); });
+                            if (!empty($gc_clean)) {
+                                // V.42.0 [C-3]: validate each grandchild insertion
+                                if (function_exists('dinoco_validate_sku_hierarchy')) {
+                                    foreach ($gc_clean as $gc) {
+                                        if (!dinoco_validate_sku_hierarchy($child_clean, $gc, $relations)) {
+                                            $wpdb->query('ROLLBACK');
+                                            echo json_encode(['success' => false, 'message' => "Invalid hierarchy: {$child_clean} → {$gc}"]);
+                                            exit;
+                                        }
+                                    }
+                                }
+                                $relations[$child_clean] = array_values($gc_clean);
+                            } else {
+                                unset($relations[$child_clean]);
+                            }
                         }
                     }
-                }
 
-                update_option('dinoco_sku_relations', $relations);
+                    // V.42.0 [H-4]: autoload=no for relations too (prevents huge options cache)
+                    update_option('dinoco_sku_relations', $relations, false);
+                    $wpdb->query('COMMIT');
+                } catch (Exception $e) {
+                    $wpdb->query('ROLLBACK');
+                    error_log('[Inventory] save_sku_relation lock error: ' . $e->getMessage());
+                    echo json_encode(['success' => false, 'message' => 'Internal error (lock)']);
+                    exit;
+                }
 
                 // V.40.6: Auto-create dinoco_products rows สำหรับ child/grandchild ที่ยังไม่มี
                 global $wpdb;
@@ -237,15 +313,19 @@ add_action('init', function() {
                         foreach ($ensure_skus as $esku) {
                             if (!in_array($esku, $existing_upper)) {
                                 $cat_item = isset($catalog[$esku]) ? $catalog[$esku] : null;
-                                $wpdb->insert($prod_table, [
+                                // V.42.0 [C-1 FIX]: column is base_price, not price
+                                $ins_ok = $wpdb->insert($prod_table, [
                                     'sku' => $esku,
                                     'name' => $cat_item ? ($cat_item['name'] ?? $esku) : $esku,
                                     'image_url' => $cat_item ? ($cat_item['img'] ?? '') : '',
-                                    'price' => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
+                                    'base_price' => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
                                     'stock_qty' => 0,
                                     'stock_status' => 'out_of_stock',
                                     'is_active' => 1,
                                 ]);
+                                if ($ins_ok === false) {
+                                    error_log('[Inventory] auto-create row fail sku=' . $esku . ' error=' . $wpdb->last_error);
+                                }
                             }
                         }
                     }
@@ -257,7 +337,8 @@ add_action('init', function() {
             // --- 3. SAVE/DELETE PRODUCT ---
             if ($act === 'save_product') {
                 $sku = strtoupper(sanitize_text_field($_POST['sku'])); // V.40.5 [Bug#2]: strtoupper
-                if (!$sku) { echo json_encode(['success' => false]); exit; }
+                // V.42.0 [C-9 FIX]: Whitelist SKU format (prevent accidental overwrite / injection)
+                if (!$sku || !preg_match('/^[A-Z0-9\-_]{1,40}$/', $sku)) { echo json_encode(['success' => false, 'message' => 'Invalid SKU format']); exit; }
                 $name = sanitize_text_field($_POST['name']);
                 $price = sanitize_text_field($_POST['price']);
                 $catalog = dinoco_get_current_catalog();
@@ -272,7 +353,20 @@ add_action('init', function() {
                 // V.38.2: Use wp_unslash + json_decode validation (sanitize_text_field strips chars in long JSON)
                 $compat_raw = isset($_POST['compatible_models']) ? wp_unslash($_POST['compatible_models']) : '[]';
                 $compat_decoded = json_decode($compat_raw, true);
-                $compat = is_array($compat_decoded) ? wp_json_encode($compat_decoded) : '[]';
+                // V.42.0 [H-11 FIX]: whitelist shape + cap 50 items
+                if (is_array($compat_decoded)) {
+                    $clean = [];
+                    foreach (array_slice($compat_decoded, 0, 50) as $c) {
+                        if (!is_array($c)) continue;
+                        $clean[] = [
+                            'brand_name' => sanitize_text_field($c['brand_name'] ?? ''),
+                            'name'       => sanitize_text_field($c['name'] ?? ''),
+                        ];
+                    }
+                    $compat = wp_json_encode($clean);
+                } else {
+                    $compat = '[]';
+                }
 
                 // V.38.1: Ensure b2b_visible column exists before writing
                 global $wpdb;
@@ -314,7 +408,8 @@ add_action('init', function() {
                 }
 
                 // V.38.5: Sync wp_options (backward compat — written AFTER custom table)
-                update_option('dinoco_product_catalog', $catalog);
+                // V.42.0 [H-4]: autoload=no
+                update_option('dinoco_product_catalog', $catalog, false);
 
                 // Auto-create B2B Product post if not exists
                 $existing = get_posts(array(
@@ -357,8 +452,8 @@ add_action('init', function() {
                      if (class_exists('DINOCO_Catalog')) {
                          global $wpdb; $wpdb->update($wpdb->prefix.'dinoco_products', array('is_active'=>0), array('sku'=>$sku));
                      }
-                     // V.38.5: Sync wp_options (backward compat)
-                     unset($catalog[$sku]); update_option('dinoco_product_catalog', $catalog);
+                     // V.38.5: Sync wp_options (backward compat) — V.42.0 [H-4] autoload=no
+                     unset($catalog[$sku]); update_option('dinoco_product_catalog', $catalog, false);
 
                      // V.6.0: Cleanup SKU จาก dinoco_sku_relations (ทั้ง parent entry + child references)
                      $relations = dinoco_get_current_sku_relations();
@@ -621,7 +716,10 @@ add_action('init', function() {
             // --- 8. GEN BATCH ---
             if ($act === 'gen_batch') {
                 $sku = sanitize_text_field($_POST['sku']);
-                $qty = intval($_POST['qty']); $model = sanitize_text_field($_POST['model']);
+                // V.42.0 [C-9 FIX]: qty cap 1000 (prevent DoS) + whitelist SKU
+                if (!preg_match('/^[A-Z0-9\-_]{1,40}$/i', $sku)) { echo json_encode(['success'=>false,'msg'=>'Invalid SKU format']); exit; }
+                $qty = min(1000, max(1, intval($_POST['qty'])));
+                $model = sanitize_text_field($_POST['model']);
                 $years = intval($_POST['years']);
                 $catalog = dinoco_get_current_catalog();
                 $catalog_item = isset($catalog[$sku]) ? $catalog[$sku] : null;
@@ -641,7 +739,12 @@ add_action('init', function() {
                 }
                 echo json_encode(['success'=>true, 'samples'=>$samples, 'csv_data'=>$csv_data]); exit;
             }
-        } catch (Exception $e) { echo json_encode(['success' => false, 'msg' => $e->getMessage()]); exit; }
+        } catch (Exception $e) {
+            // V.42.0 [H-5]: sanitize error — ห้ามส่ง internal details ไป frontend
+            error_log('[Inventory] action=' . $act . ' error: ' . $e->getMessage());
+            echo json_encode(['success' => false, 'msg' => 'Internal error']);
+            exit;
+        }
     }
 }); // Priority 10 Default
 
@@ -860,22 +963,23 @@ add_action('rest_api_init', function() {
                 $existing_skus = array_map(function($r) { return strtoupper($r->sku); }, $all_rows);
                 $missing = [];
 
-                // 1. Sync จาก catalog (เดิม)
+                // 1. Sync จาก catalog (เดิม) — V.42.0 [C-1 FIX]: base_price + log
                 if (!empty($catalog)) {
                     foreach ($catalog as $csku => $citem) {
                         $csku_u = strtoupper($csku);
                         if (!in_array($csku_u, $existing_skus)) {
                             $missing[] = $csku_u;
                             $existing_skus[] = $csku_u; // prevent double insert
-                            $wpdb->insert($table, [
+                            $ins_ok = $wpdb->insert($table, [
                                 'sku' => $csku_u,
                                 'name' => $citem['name'] ?? $csku_u,
                                 'image_url' => $citem['img'] ?? '',
-                                'price' => floatval(str_replace(',', '', $citem['price'] ?? '0')),
+                                'base_price' => floatval(str_replace(',', '', $citem['price'] ?? '0')),
                                 'stock_qty' => 0,
                                 'stock_status' => 'out_of_stock',
                                 'is_active' => 1,
                             ]);
+                            if ($ins_ok === false) error_log('[Inventory] auto-sync catalog fail sku=' . $csku_u . ' error=' . $wpdb->last_error);
                         }
                     }
                 }
@@ -892,15 +996,17 @@ add_action('rest_api_init', function() {
                                 $existing_skus[] = $ch_u;
                                 // ดึงชื่อ+รูปจาก catalog ถ้ามี
                                 $cat_item = isset($catalog[$ch_u]) ? $catalog[$ch_u] : (isset($catalog[$ch_sku]) ? $catalog[$ch_sku] : null);
-                                $wpdb->insert($table, [
+                                // V.42.0 [C-1 FIX]: base_price + log
+                                $ins_ok2 = $wpdb->insert($table, [
                                     'sku' => $ch_u,
                                     'name' => $cat_item ? ($cat_item['name'] ?? $ch_u) : $ch_u,
                                     'image_url' => $cat_item ? ($cat_item['img'] ?? '') : '',
-                                    'price' => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
+                                    'base_price' => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
                                     'stock_qty' => 0,
                                     'stock_status' => 'out_of_stock',
                                     'is_active' => 1,
                                 ]);
+                                if ($ins_ok2 === false) error_log('[Inventory] auto-sync relations fail sku=' . $ch_u . ' error=' . $wpdb->last_error);
                             }
                         }
                     }
@@ -1152,6 +1258,11 @@ add_action('rest_api_init', function() {
             }
             if (empty($reason)) {
                 return new WP_Error('missing_reason', 'กรุณาระบุเหตุผล', ['status' => 400]);
+            }
+
+            // V.42.0 [H-9 FIX]: ห้ามปรับสต็อก SET/parent ตรงๆ — ต้องปรับที่ leaf
+            if (function_exists('dinoco_is_leaf_sku') && !dinoco_is_leaf_sku($sku)) {
+                return new WP_Error('not_leaf', 'ไม่สามารถปรับสต็อก SET/parent โดยตรง — กรุณาปรับที่สินค้าย่อย (leaf) แทน', ['status' => 400]);
             }
 
             // Phase 5: Use stock functions which handle warehouse sync
@@ -1445,20 +1556,27 @@ add_action('rest_api_init', function() {
                 return rest_ensure_response([ 'success' => false, 'message' => 'ไม่พบสินค้าใน catalog (dinoco_products table อาจว่าง)' ]);
             }
 
+            // V.42.0 [H-7 FIX]: Bulk insert (1 query) แทน insert per SKU
             $total = 0;
             $errors = 0;
+            $values = [];
+            $placeholders = [];
             foreach ( $products as $p ) {
-                $inserted = $wpdb->insert( $items_table, [
-                    'dip_stock_id' => $session_id,
-                    'sku'          => $p->sku,
-                    'expected_qty' => (int) $p->stock_qty,
-                ] );
-                if ( $inserted ) {
-                    $total++;
-                } else {
-                    $errors++;
-                    if ( function_exists( 'b2b_log' ) ) {
-                        b2b_log( "[DipStock] ERROR insert item: sku={$p->sku} error={$wpdb->last_error}" );
+                $placeholders[] = '(%d,%s,%d)';
+                array_push( $values, $session_id, $p->sku, (int) $p->stock_qty );
+            }
+            if ( ! empty( $placeholders ) ) {
+                // Split ทีละ 500 rows กันเกิน max_allowed_packet
+                $chunks = array_chunk( $placeholders, 500 );
+                $val_chunks = array_chunk( $values, 500 * 3 );
+                foreach ( $chunks as $idx => $chunk ) {
+                    $sql = "INSERT INTO {$items_table} (dip_stock_id, sku, expected_qty) VALUES " . implode( ',', $chunk );
+                    $res = $wpdb->query( $wpdb->prepare( $sql, $val_chunks[ $idx ] ) );
+                    if ( $res === false ) {
+                        $errors++;
+                        if ( function_exists( 'b2b_log' ) ) b2b_log( "[DipStock] ERROR bulk insert chunk {$idx}: {$wpdb->last_error}" );
+                    } else {
+                        $total += (int) $res;
                     }
                 }
             }
@@ -2032,9 +2150,16 @@ add_action('rest_api_init', function() {
             }
             if (array_key_exists('units_per_box', $params)) {
                 $upb = max(1, intval($params['units_per_box'] ?: 1));
-                // V.40.5: Validation — ห้ามตั้งทั้งสอง > 1 พร้อมกัน
-                // ใช้ค่าที่ **กำลังจะ save** (ไม่ใช่ค่าเก่า DB) เพื่อให้ reset เป็น 1 ได้
-                $final_bpu = isset($custom_data['boxes_per_unit']) ? (int)$custom_data['boxes_per_unit'] : max(1, intval($params['boxes_per_unit'] ?? 1));
+                // V.42.0 [H-2 FIX]: Load current DB value if bpu not in payload
+                // (prevents false positive when client only sends units_per_box)
+                if (isset($custom_data['boxes_per_unit'])) {
+                    $final_bpu = (int) $custom_data['boxes_per_unit'];
+                } else {
+                    $current_bpu_db = (int) $wpdb->get_var($wpdb->prepare(
+                        "SELECT boxes_per_unit FROM {$table} WHERE sku = %s AND is_active = 1", $sku
+                    ));
+                    $final_bpu = $current_bpu_db > 0 ? $current_bpu_db : 1;
+                }
                 if ($final_bpu > 1 && $upb > 1) {
                     return new WP_REST_Response(['success' => false, 'message' => 'ไม่สามารถตั้งทั้ง กล่อง/ชิ้น > 1 และ ชิ้น/กล่อง > 1 พร้อมกัน'], 400);
                 }
@@ -2045,10 +2170,23 @@ add_action('rest_api_init', function() {
                 $custom_data['b2b_visible'] = $b2b_visible;
             }
             // V.38.2: compatible_models via pricing endpoint
+            // V.42.0 [H-11 FIX]: whitelist shape + cap 50 items
             if (array_key_exists('compatible_models', $params)) {
                 $cm_raw = $params['compatible_models'];
                 $cm_decoded = is_array($cm_raw) ? $cm_raw : json_decode($cm_raw, true);
-                $custom_data['compatible_models'] = is_array($cm_decoded) ? wp_json_encode($cm_decoded) : '[]';
+                if (is_array($cm_decoded)) {
+                    $cm_clean = [];
+                    foreach (array_slice($cm_decoded, 0, 50) as $c) {
+                        if (!is_array($c)) continue;
+                        $cm_clean[] = [
+                            'brand_name' => sanitize_text_field($c['brand_name'] ?? ''),
+                            'name'       => sanitize_text_field($c['name'] ?? ''),
+                        ];
+                    }
+                    $custom_data['compatible_models'] = wp_json_encode($cm_clean);
+                } else {
+                    $custom_data['compatible_models'] = '[]';
+                }
             }
 
             // V.38.1: Ensure b2b_visible column exists (ALTER TABLE fallback)
@@ -2142,14 +2280,21 @@ add_action('rest_api_init', function() {
                 require_once ABSPATH . 'wp-admin/includes/media.php';
             }
 
-            if ( empty($_FILES['product_image']) ) {
+            // V.42.0 [C-5 FIX]: Content-based validation (reject polyglot files + spoofed headers)
+            if ( empty($_FILES['product_image']) || ! is_uploaded_file($_FILES['product_image']['tmp_name']) ) {
                 return new WP_REST_Response(['success' => false, 'message' => 'No file uploaded'], 400);
             }
 
-            // Validate file type
-            $allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-            if ( ! in_array($_FILES['product_image']['type'], $allowed) ) {
-                return new WP_REST_Response(['success' => false, 'message' => 'Invalid file type. Allowed: JPG, PNG, WebP, GIF'], 400);
+            // 1) Check extension from actual file content via wp_check_filetype_and_ext
+            $allowed_ext = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+            $check = wp_check_filetype_and_ext($_FILES['product_image']['tmp_name'], $_FILES['product_image']['name']);
+            if ( empty($check['ext']) || ! in_array(strtolower($check['ext']), $allowed_ext, true) ) {
+                return new WP_REST_Response(['success' => false, 'message' => 'Invalid file type'], 400);
+            }
+
+            // 2) Verify actual image content (getimagesize fails on polyglot/fake images)
+            if ( ! @getimagesize($_FILES['product_image']['tmp_name']) ) {
+                return new WP_REST_Response(['success' => false, 'message' => 'Not a valid image'], 400);
             }
 
             // Validate file size (max 5MB)
@@ -2157,12 +2302,19 @@ add_action('rest_api_init', function() {
                 return new WP_REST_Response(['success' => false, 'message' => 'File too large. Max 5MB'], 400);
             }
 
-            $sku = sanitize_text_field($request->get_param('sku'));
+            // V.42.0 [C-5 FIX]: Whitelist SKU format
+            $sku_raw = $request->get_param('sku');
+            $sku = $sku_raw ? strtoupper(preg_replace('/[^A-Z0-9\-_]/i', '', (string)$sku_raw)) : '';
+            if ($sku && strlen($sku) > 40) {
+                return new WP_REST_Response(['success' => false, 'message' => 'SKU too long'], 400);
+            }
 
             // Upload to WordPress Media Library
             $attachment_id = media_handle_upload('product_image', 0);
             if ( is_wp_error($attachment_id) ) {
-                return new WP_REST_Response(['success' => false, 'message' => $attachment_id->get_error_message()], 500);
+                // V.42.0 [H-5]: sanitize internal error
+                error_log('[Inventory] upload-image error: ' . $attachment_id->get_error_message());
+                return new WP_REST_Response(['success' => false, 'message' => 'Upload failed'], 500);
             }
 
             $url = wp_get_attachment_url($attachment_id);
@@ -2174,11 +2326,11 @@ add_action('rest_api_init', function() {
                     global $wpdb;
                     $wpdb->update($wpdb->prefix . 'dinoco_products', ['image_url' => $url], ['sku' => $sku]);
                 }
-                // 2) Sync wp_options (backward compat)
+                // 2) Sync wp_options (backward compat) — V.42.0 [H-4] autoload=no
                 $catalog = dinoco_get_current_catalog();
                 if ( isset($catalog[$sku]) ) {
                     $catalog[$sku]['img'] = $url;
-                    update_option('dinoco_product_catalog', $catalog);
+                    update_option('dinoco_product_catalog', $catalog, false);
                 }
                 // 3) Update b2b_product ACF
                 $b2b_posts = get_posts([
@@ -4608,6 +4760,13 @@ function dinoco_render_ui_v99() {
             if (!skipConfirm && (_splitState.col[1].uploading || _splitState.col[2].uploading)) {
                 Swal.fire('กำลังอัพโหลด','รออัพโหลดรูปเสร็จก่อน','info'); return;
             }
+            // V.42.0 [H-8 FIX]: Revoke blob: URLs to prevent memory leak
+            try {
+                [1,2].forEach(function(i) {
+                    var src = $('#split-col'+i+'-img-tag').attr('src');
+                    if (src && src.indexOf('blob:') === 0) URL.revokeObjectURL(src);
+                });
+            } catch(e) {}
             $('#modal-split').fadeOut(150);
             document.body.style.overflow = '';
         };
@@ -4891,33 +5050,39 @@ function dinoco_render_ui_v99() {
                     b2b_visible: pricing.b2b_visible, compatible_models: JSON.stringify(pricing.compatible_models) };
             };
 
-            $.post('', saveData(sku1, name1, img1, price1)).done(function(r1) {
+            // V.42.0 [H-8 FIX]: Parallel save1 + save2 (ลด latency 50%)
+            markStep('save2','active');
+            $.when(
+                $.post('', saveData(sku1, name1, img1, price1)),
+                $.post('', saveData(sku2, name2, img2, price2))
+            ).done(function(r1Arr, r2Arr) {
+                var r1 = r1Arr[0];
+                var r2 = r2Arr[0];
                 var r1p = typeof r1 === 'string' ? JSON.parse(r1) : r1;
+                var r2p = typeof r2 === 'string' ? JSON.parse(r2) : r2;
                 if (r1p && r1p.success === false) return markStep('save1','error','สร้าง '+sku1+' ไม่สำเร็จ');
-                markStep('save1','done'); markStep('save2','active');
+                if (r2p && r2p.success === false) return markStep('save2','error','สร้าง '+sku2+' ไม่สำเร็จ');
+                markStep('save1','done'); markStep('save2','done'); markStep('pricing','active');
 
-                $.post('', saveData(sku2, name2, img2, price2)).done(function(r2) {
-                    var r2p = typeof r2 === 'string' ? JSON.parse(r2) : r2;
-                    if (r2p && r2p.success === false) return markStep('save2','error','สร้าง '+sku2+' ไม่สำเร็จ');
-                    markStep('save2','done'); markStep('pricing','active');
-
-                    var savePricing = function(sku) {
-                        return $.ajax({ url: STOCK_API_EARLY+'/product/pricing', method:'POST', contentType:'application/json',
-                            headers:{'X-WP-Nonce':STOCK_NONCE_EARLY},
-                            data: JSON.stringify(Object.assign({}, pricing, {sku:sku})) });
-                    };
-                    $.when(savePricing(sku1), savePricing(sku2)).done(function() {
-                        markStep('pricing','done'); markStep('relation','active');
-                        $.post('', { dinoco_inventory_action:'save_sku_relation', dinoco_admin_nonce:DINOCO_NONCE,
-                            parent_sku: _splitState.parentSku, child_skus:[sku1, sku2] }).done(function(rr) {
-                            var rrp = typeof rr === 'string' ? JSON.parse(rr) : rr;
-                            if (rrp && rrp.success === false) return markStep('relation','error','link ไม่สำเร็จ');
-                            markStep('relation','done');
-                            showSplitSuccess(sku1, sku2, name1, name2, img1, img2, sfx1, sfx2);
-                        }).fail(function() { markStep('relation','error','link ไม่สำเร็จ'); });
-                    }).fail(function() { markStep('pricing','error','set pricing ไม่สมบูรณ์'); });
-                }).fail(function() { markStep('save2','error','สร้าง '+sku2+' ไม่สำเร็จ'); });
-            }).fail(function() { markStep('save1','error','สร้าง '+sku1+' ไม่สำเร็จ'); });
+                var savePricing = function(sku) {
+                    return $.ajax({ url: STOCK_API_EARLY+'/product/pricing', method:'POST', contentType:'application/json',
+                        headers:{'X-WP-Nonce':STOCK_NONCE_EARLY},
+                        data: JSON.stringify(Object.assign({}, pricing, {sku:sku})) });
+                };
+                $.when(savePricing(sku1), savePricing(sku2)).done(function() {
+                    markStep('pricing','done'); markStep('relation','active');
+                    $.post('', { dinoco_inventory_action:'save_sku_relation', dinoco_admin_nonce:DINOCO_NONCE,
+                        parent_sku: _splitState.parentSku, child_skus:[sku1, sku2] }).done(function(rr) {
+                        var rrp = typeof rr === 'string' ? JSON.parse(rr) : rr;
+                        if (rrp && rrp.success === false) return markStep('relation','error','link ไม่สำเร็จ');
+                        markStep('relation','done');
+                        showSplitSuccess(sku1, sku2, name1, name2, img1, img2, sfx1, sfx2);
+                    }).fail(function() { markStep('relation','error','link ไม่สำเร็จ'); });
+                }).fail(function() { markStep('pricing','error','set pricing ไม่สมบูรณ์'); });
+            }).fail(function() {
+                markStep('save1','error','save parallel ล้มเหลว');
+                markStep('save2','error','save parallel ล้มเหลว');
+            });
         };
 
         function markStep(step, state, errMsg) {
@@ -4997,8 +5162,10 @@ function dinoco_render_ui_v99() {
                         } else if (typeInfo.type === 'grandchild') {
                             hierarchyBadge = '<span class="catalog-hierarchy-badge badge-grandchild" title="'+esc(typeInfo.parent_sku)+'"><i class="fa-solid fa-gear" style="margin-right:3px;font-size:0.5rem;"></i>ชิ้นส่วนย่อยของ: '+esc(typeInfo.parent_name)+'</span>';
                         }
-                        let deleteBtn = `<div class="btn-delete-cat" onclick="deleteProduct('${sku}'); event.stopPropagation();"><i class="fa-solid fa-trash"></i></div>`;
-                        let editBtn = `<div class="btn-edit-cat" onclick="openEditCatalogModal('${sku}'); event.stopPropagation();"><i class="fa-solid fa-pen"></i></div>`;
+                        // V.42.0 [C-4 FIX]: escape SKU in onclick
+                        let _skuSafe = String(sku).replace(/[^A-Z0-9\-_]/gi, '');
+                        let deleteBtn = `<div class="btn-delete-cat" onclick="deleteProduct('${_skuSafe}'); event.stopPropagation();"><i class="fa-solid fa-trash"></i></div>`;
+                        let editBtn = `<div class="btn-edit-cat" onclick="openEditCatalogModal('${_skuSafe}'); event.stopPropagation();"><i class="fa-solid fa-pen"></i></div>`;
                         let imgHtml = renderImageOrPlaceholder(item.img);
                         // V.40.5 [Bug#4]: SET badge เฉพาะ top-level SET (ไม่ซ้ำกับ hierarchy badge ของ sub-SET)
                         let badge = (item.is_set && typeInfo.type === 'set') ? '<span class="set-badge">SET</span>' : '';
@@ -5028,7 +5195,8 @@ function dinoco_render_ui_v99() {
                         if (item.is_set && item.child_count > 0) {
                             childCountHtml = `<div style="font-size:10px;color:#7c3aed;font-weight:600;margin-top:2px;">${item.child_count} ชิ้นในชุด</div>`;
                         }
-                        html += `<div class="catalog-item" ${typeAttr} style="${cardOpacity}" onclick="searchCatalogItem('${sku}')">${deleteBtn}${editBtn}${badge}${hierarchyBadge}${hiddenBadge}<div class="catalog-img-wrap">${imgHtml}</div><div class="catalog-body"><span class="catalog-sku">${sku}</span><div class="catalog-title">${item.name}</div><div class="text-xs text-slate-400 mb-1">Warranty: ${item.years} Years</div><div class="catalog-price">${item.price} ฿${discBadge}</div>${stdPrice}${childCountHtml}${compatHtml}</div></div>`;
+                        // V.42.0 [C-4 FIX]: esc() all dynamic values to prevent stored XSS
+                        html += `<div class="catalog-item" ${typeAttr} style="${cardOpacity}" onclick="searchCatalogItem('${esc(sku)}')">${deleteBtn}${editBtn}${badge}${hierarchyBadge}${hiddenBadge}<div class="catalog-img-wrap">${imgHtml}</div><div class="catalog-body"><span class="catalog-sku">${esc(sku)}</span><div class="catalog-title">${esc(item.name)}</div><div class="text-xs text-slate-400 mb-1">Warranty: ${esc(String(item.years||''))} Years</div><div class="catalog-price">${esc(String(item.price||''))} ฿${discBadge}</div>${stdPrice}${childCountHtml}${compatHtml}</div></div>`;
                     });
                     $('#catalog-container').html(html);
                     updateFilterCounts();
@@ -5038,7 +5206,14 @@ function dinoco_render_ui_v99() {
         };
 
         window.searchCatalogItem = function(sku) { $('#global-search').val(sku); executeGlobalSearch(); };
-        function populateGenSelect() { let opts = '<option value="">-- Select Product --</option>'; Object.keys(catalogData).forEach(sku => { opts += `<option value="${sku}">[${sku}] ${catalogData[sku].name}</option>`; }); $('#gen-catalog-select').html(opts); }
+        function populateGenSelect() {
+            // V.42.0 [C-4 FIX]: escape all dynamic values
+            let opts = '<option value="">-- Select Product --</option>';
+            Object.keys(catalogData).forEach(sku => {
+                opts += `<option value="${esc(sku)}">[${esc(sku)}] ${esc(catalogData[sku].name)}</option>`;
+            });
+            $('#gen-catalog-select').html(opts);
+        }
         /* [FIX] Use unique action key */
         function loadCatalogDataForSelect() { $.post('', { dinoco_inventory_action: 'get_catalog' }, function(res) { if(res.success) { catalogData = res.data; window._dncCatalogData = catalogData; populateGenSelect(); } }); }
         window.fillGenData = function() { let sku = $('#gen-catalog-select').val(); if(sku && catalogData[sku]) { $('#gen-model').val(catalogData[sku].name); $('#gen-sku').val(sku); $('#gen-years').val(catalogData[sku].years || 1); } };
@@ -5074,21 +5249,23 @@ function dinoco_render_ui_v99() {
                 is_god_mode: isGod 
             }, function(res) {
                 if(res.success && res.data.length > 0) {
+                    // V.42.0 [C-4 FIX]: esc() all dynamic values to prevent stored XSS
                     let html = res.data.map(i => {
                         let stClass = (i.status_key === 'warranty_on') ? 'st-green' : ((i.status_key === 'warranty_available') ? 'st-blue' : 'st-gray');
+                        let _idSafe = String(i.id || '').replace(/[^0-9]/g, '');
                         return `<tr class="border-b hover:bg-slate-50">
                             <td class="px-3 py-3 max-w-xs">
-                                <div class="font-bold text-slate-700 text-xs line-clamp-2">${i.model}</div>
-                                <div class="text-[10px] text-slate-400 font-mono mt-1">${i.sku}</div>
+                                <div class="font-bold text-slate-700 text-xs line-clamp-2">${esc(i.model)}</div>
+                                <div class="text-[10px] text-slate-400 font-mono mt-1">${esc(i.sku)}</div>
                             </td>
-                            <td class="font-mono font-bold text-slate-600 px-3 py-3 text-xs">${i.sn}</td>
-                            <td class="text-xs px-3 py-3 text-slate-500">${i.reg_date}</td>
-                            <td class="text-xs px-3 py-3 text-slate-500">${i.usage_age}</td>
-                            <td class="text-xs px-3 py-3 text-slate-500 font-mono">${i.expiry}</td>
-                            <td class="px-3 py-3"><span class="st-badge ${stClass}">${i.status_label}</span></td>
-                            <td class="text-center text-xs px-3 py-3 font-bold text-slate-400">${i.seq}</td>
-                            <td class="text-center text-xs px-3 py-3 font-bold text-slate-400">${i.repair_count}</td>
-                            <td class="text-center px-3 py-3"><button class="bg-slate-800 text-white w-8 h-8 rounded flex items-center justify-center hover:bg-slate-900 transition" onclick="openDinocoEditModal_v9927('${i.id}')"><i class="fa-solid fa-pen"></i></button></td>
+                            <td class="font-mono font-bold text-slate-600 px-3 py-3 text-xs">${esc(i.sn)}</td>
+                            <td class="text-xs px-3 py-3 text-slate-500">${esc(i.reg_date)}</td>
+                            <td class="text-xs px-3 py-3 text-slate-500">${esc(i.usage_age)}</td>
+                            <td class="text-xs px-3 py-3 text-slate-500 font-mono">${esc(i.expiry)}</td>
+                            <td class="px-3 py-3"><span class="st-badge ${stClass}">${esc(i.status_label)}</span></td>
+                            <td class="text-center text-xs px-3 py-3 font-bold text-slate-400">${esc(String(i.seq||''))}</td>
+                            <td class="text-center text-xs px-3 py-3 font-bold text-slate-400">${esc(String(i.repair_count||''))}</td>
+                            <td class="text-center px-3 py-3"><button class="bg-slate-800 text-white w-8 h-8 rounded flex items-center justify-center hover:bg-slate-900 transition" onclick="openDinocoEditModal_v9927('${_idSafe}')"><i class="fa-solid fa-pen"></i></button></td>
                         </tr>`;
                     }).join('');
                     $('#inv-body').html(html);
@@ -5151,12 +5328,13 @@ function dinoco_render_ui_v99() {
                         {val:'void', label:'ตัดประกัน (Void)'}
                     ];
                     
+                    // V.42.0 [C-4 FIX]: esc() all dynamic values
                     let statusBtnsHtml = '<div class="status-grid">';
-                    statusOptions.forEach( opt => { 
-                        let activeClass = (d.w_status === opt.val) ? 'active-green' : ''; 
-                        statusBtnsHtml += `<div class="status-btn ${activeClass}" onclick="selectStatus(this, '${opt.val}')">${opt.label}</div>`; 
+                    statusOptions.forEach( opt => {
+                        let activeClass = (d.w_status === opt.val) ? 'active-green' : '';
+                        statusBtnsHtml += `<div class="status-btn ${activeClass}" onclick="selectStatus(this, '${esc(opt.val)}')">${esc(opt.label)}</div>`;
                     });
-                    statusBtnsHtml += '</div><input type="hidden" id="edit-status" value="' + d.w_status + '">';
+                    statusBtnsHtml += '</div><input type="hidden" id="edit-status" value="' + esc(d.w_status) + '">';
 
                     let repairOpts = renderRepairOptions();
 
@@ -5172,19 +5350,19 @@ function dinoco_render_ui_v99() {
                                 <div class="flex items-start gap-4 mb-4">
                                     <div class="w-32 h-32 flex-shrink-0 bg-white border rounded-lg p-2 flex items-center justify-center">${renderThumb(d.pic_url)}</div>
                                     <div class="flex-grow space-y-2">
-                                        <div><label class="text-[10px] text-slate-400 font-bold uppercase">Serial Number</label><div class="font-mono font-bold text-slate-700 bg-slate-50 p-2 rounded border">${d.sn}</div></div>
-                                        <div><label class="text-[10px] text-slate-400 font-bold uppercase">Model / SKU</label><div class="text-xs text-slate-600 bg-slate-50 p-2 rounded border">${d.model}<br><span class="text-[10px] text-slate-400">${d.sku}</span></div></div>
+                                        <div><label class="text-[10px] text-slate-400 font-bold uppercase">Serial Number</label><div class="font-mono font-bold text-slate-700 bg-slate-50 p-2 rounded border">${esc(d.sn)}</div></div>
+                                        <div><label class="text-[10px] text-slate-400 font-bold uppercase">Model / SKU</label><div class="text-xs text-slate-600 bg-slate-50 p-2 rounded border">${esc(d.model)}<br><span class="text-[10px] text-slate-400">${esc(d.sku)}</span></div></div>
                                     </div>
                                 </div>
-                                
+
                                 <div class="grid grid-cols-2 gap-4">
-                                    <div><label class="text-[10px] text-slate-400 font-bold uppercase">Owner</label><div class="bg-slate-50 p-2 rounded border text-xs text-slate-600 truncate">${d.owner_product || '-'}</div></div>
-                                    <div><label class="text-[10px] text-slate-400 font-bold uppercase">Register Date</label><div class="bg-slate-50 p-2 rounded border text-xs text-slate-600">${d.warranty_register_date}</div></div>
+                                    <div><label class="text-[10px] text-slate-400 font-bold uppercase">Owner</label><div class="bg-slate-50 p-2 rounded border text-xs text-slate-600 truncate">${esc(d.owner_product || '-')}</div></div>
+                                    <div><label class="text-[10px] text-slate-400 font-bold uppercase">Register Date</label><div class="bg-slate-50 p-2 rounded border text-xs text-slate-600">${esc(d.warranty_register_date)}</div></div>
                                 </div>
 
                                 <div class="mt-4">
                                     <label class="block text-xs font-bold text-slate-700 uppercase mb-2">Repair Logs (ประวัติซ่อม - ภาษาไทย)</label>
-                                    <textarea id="repair-logs-area" class="w-full border p-4 rounded-lg bg-slate-50 text-slate-600 font-mono text-sm h-64 focus:ring-2 focus:ring-blue-500 transition shadow-inner leading-relaxed" placeholder="ยังไม่มีรายการซ่อม...">${d.repair_logs || ''}</textarea>
+                                    <textarea id="repair-logs-area" class="w-full border p-4 rounded-lg bg-slate-50 text-slate-600 font-mono text-sm h-64 focus:ring-2 focus:ring-blue-500 transition shadow-inner leading-relaxed" placeholder="ยังไม่มีรายการซ่อม...">${esc(d.repair_logs || '')}</textarea>
                                     <div class="text-[10px] text-slate-400 mt-1 text-right">* แสดงผลเป็นภาษาไทย (Auto-Translated)</div>
                                 </div>
                             </div>
@@ -5195,7 +5373,7 @@ function dinoco_render_ui_v99() {
                                 
                                 <div class="mb-4">
                                     <label class="block text-xs font-bold text-slate-500 uppercase mb-1">สถานะเดิม (Current)</label>
-                                    <div class="bg-slate-800 text-white p-3 rounded-lg text-center font-bold">${d.status_label}</div>
+                                    <div class="bg-slate-800 text-white p-3 rounded-lg text-center font-bold">${esc(d.status_label)}</div>
                                 </div>
 
                                 <div>
@@ -5205,12 +5383,12 @@ function dinoco_render_ui_v99() {
                                 
                                 <div>
                                     <label class="block text-xs font-bold text-slate-500 uppercase mb-1">วันหมดอายุ (Expiry)</label>
-                                    <input id="edit-expiry" class="w-full border p-3 rounded text-center font-bold text-slate-700 text-lg" value="${d.warranty_expiry}">
+                                    <input id="edit-expiry" class="w-full border p-3 rounded text-center font-bold text-slate-700 text-lg" value="${esc(d.warranty_expiry)}">
                                 </div>
-                                
+
                                 <div>
                                     <label class="block text-xs font-bold text-slate-500 uppercase mb-1">ระยะเวลา (ปี)</label>
-                                    <input id="edit-duration" type="number" class="w-full border p-3 rounded text-lg" value="${d.warranty_duration_years}">
+                                    <input id="edit-duration" type="number" class="w-full border p-3 rounded text-lg" value="${esc(String(d.warranty_duration_years||''))}">
                                 </div>
 
                                 <div class="bg-blue-50 p-4 rounded-xl border border-blue-100">
@@ -5222,7 +5400,7 @@ function dinoco_render_ui_v99() {
                         </div>
                         <div class="p-4 border-t bg-slate-50 flex justify-end gap-3 sticky bottom-0 bg-white">
                             <button class="bg-white border border-slate-300 text-slate-600 px-6 py-2 rounded hover:bg-slate-50 font-bold" onclick="Swal.close()">ยกเลิก (Cancel)</button>
-                            <button class="bg-slate-900 hover:bg-black text-white px-8 py-2 rounded shadow-lg font-bold" onclick="confirmSaveInv('${d.id}')"><i class="fa-solid fa-save"></i> บันทึกข้อมูล (Save Changes)</button>
+                            <button class="bg-slate-900 hover:bg-black text-white px-8 py-2 rounded shadow-lg font-bold" onclick="confirmSaveInv('${String(d.id||'').replace(/[^0-9]/g,'')}')"><i class="fa-solid fa-save"></i> บันทึกข้อมูล (Save Changes)</button>
                         </div>
                     </div>`;
                     
@@ -5559,8 +5737,8 @@ function dinoco_render_ui_v99() {
                                         '<td class="text-center text-xs text-slate-500">'+p.low_stock_threshold+'</td>' +
                                         '<td class="text-center text-xs text-slate-400">'+self.fmtDate(p.stock_updated_at)+'</td>' +
                                         '<td class="text-center"><div class="flex gap-1 justify-center">' +
-                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+p.sku+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
-                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+p.sku+'\', '+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
+                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
+                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\','+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
                                         '</div></td>' +
                                     '</tr>';
                                     // V.40.2: Mobile SET card — purple accent
@@ -5590,9 +5768,9 @@ function dinoco_render_ui_v99() {
                                         '<td class="text-center text-xs text-slate-500">'+p.low_stock_threshold+'</td>' +
                                         '<td class="text-center text-xs text-slate-400">'+self.fmtDate(p.stock_updated_at)+'</td>' +
                                         '<td class="text-center"><div class="flex gap-1 justify-center">' +
-                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+p.sku+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
-                                            '<button class="bg-blue-50 hover:bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openAdjust(\''+p.sku+'\')" title="ปรับสต็อก"><i class="fa-solid fa-plus-minus"></i></button>' +
-                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+p.sku+'\', '+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
+                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
+                                            '<button class="bg-blue-50 hover:bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openAdjust(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')" title="ปรับสต็อก"><i class="fa-solid fa-plus-minus"></i></button>' +
+                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\','+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
                                         '</div></td>' +
                                     '</tr>';
                                     // V.40.2: Mobile child card — blue accent, indented
@@ -5605,8 +5783,8 @@ function dinoco_render_ui_v99() {
                                         '<div class="sc-row"><span class="sc-label">สต็อก</span><span class="sc-val">'+p.stock_qty.toLocaleString()+' ชิ้น</span></div>' +
                                         '<div class="sc-row"><span class="sc-label">คงเหลือจริง</span><span class="sc-val" style="color:'+(p.available_qty <= 0 ? '#ef4444' : '#22c55e')+';font-weight:700">'+p.available_qty.toLocaleString()+' ชิ้น</span></div>' +
                                         '<div class="sc-actions">' +
-                                            '<button class="btn btn-outline btn-sm flex-1" onclick="StockManager.openLog(\''+p.sku+'\')"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติ</button>' +
-                                            '<button class="btn btn-primary btn-sm flex-1" onclick="StockManager.openAdjust(\''+p.sku+'\')"><i class="fa-solid fa-plus-minus"></i> ปรับ</button>' +
+                                            '<button class="btn btn-outline btn-sm flex-1" onclick="StockManager.openLog(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติ</button>' +
+                                            '<button class="btn btn-primary btn-sm flex-1" onclick="StockManager.openAdjust(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')"><i class="fa-solid fa-plus-minus"></i> ปรับ</button>' +
                                         '</div>' +
                                     '</div>';
 
@@ -5626,9 +5804,9 @@ function dinoco_render_ui_v99() {
                                         '<td class="text-center text-xs text-slate-500">'+p.low_stock_threshold+'</td>' +
                                         '<td class="text-center text-xs text-slate-400">'+self.fmtDate(p.stock_updated_at)+'</td>' +
                                         '<td class="text-center"><div class="flex gap-1 justify-center">' +
-                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+p.sku+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
-                                            '<button class="bg-blue-50 hover:bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openAdjust(\''+p.sku+'\')" title="ปรับสต็อก"><i class="fa-solid fa-plus-minus"></i></button>' +
-                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+p.sku+'\', '+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
+                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
+                                            '<button class="bg-blue-50 hover:bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openAdjust(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')" title="ปรับสต็อก"><i class="fa-solid fa-plus-minus"></i></button>' +
+                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\','+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
                                         '</div></td>' +
                                     '</tr>';
                                     // V.40.2: Mobile grandchild card — yellow accent, deep indent
@@ -5641,8 +5819,8 @@ function dinoco_render_ui_v99() {
                                         '<div class="sc-row"><span class="sc-label">สต็อก</span><span class="sc-val">'+p.stock_qty.toLocaleString()+' ชิ้น</span></div>' +
                                         '<div class="sc-row"><span class="sc-label">คงเหลือจริง</span><span class="sc-val" style="color:'+(p.available_qty <= 0 ? '#ef4444' : '#22c55e')+';font-weight:700">'+p.available_qty.toLocaleString()+' ชิ้น</span></div>' +
                                         '<div class="sc-actions">' +
-                                            '<button class="btn btn-outline btn-sm flex-1" onclick="StockManager.openLog(\''+p.sku+'\')"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติ</button>' +
-                                            '<button class="btn btn-primary btn-sm flex-1" onclick="StockManager.openAdjust(\''+p.sku+'\')"><i class="fa-solid fa-plus-minus"></i> ปรับ</button>' +
+                                            '<button class="btn btn-outline btn-sm flex-1" onclick="StockManager.openLog(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติ</button>' +
+                                            '<button class="btn btn-primary btn-sm flex-1" onclick="StockManager.openAdjust(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')"><i class="fa-solid fa-plus-minus"></i> ปรับ</button>' +
                                         '</div>' +
                                     '</div>';
 
@@ -5660,9 +5838,9 @@ function dinoco_render_ui_v99() {
                                         '<td class="text-center text-xs text-slate-500">'+p.low_stock_threshold+'</td>' +
                                         '<td class="text-center text-xs text-slate-400">'+self.fmtDate(p.stock_updated_at)+'</td>' +
                                         '<td class="text-center"><div class="flex gap-1 justify-center">' +
-                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+p.sku+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
-                                            '<button class="bg-blue-50 hover:bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openAdjust(\''+p.sku+'\')" title="ปรับสต็อก"><i class="fa-solid fa-plus-minus"></i></button>' +
-                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+p.sku+'\', '+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
+                                            '<button class="bg-slate-100 hover:bg-slate-200 text-slate-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openLog(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')" title="ประวัติ"><i class="fa-solid fa-clock-rotate-left"></i></button>' +
+                                            '<button class="bg-blue-50 hover:bg-blue-100 text-blue-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.openAdjust(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')" title="ปรับสต็อก"><i class="fa-solid fa-plus-minus"></i></button>' +
+                                            '<button class="bg-purple-50 hover:bg-purple-100 text-purple-600 w-8 h-8 rounded flex items-center justify-center text-xs" onclick="StockManager.toggleHold(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\','+(!p.manual_hold)+')" title="'+(p.manual_hold ? 'ปลด Hold' : 'Hold')+'"><i class="fa-solid fa-'+(p.manual_hold ? 'lock-open' : 'lock')+'"></i></button>' +
                                         '</div></td>' +
                                     '</tr>';
                                     // Mobile single card
@@ -5677,8 +5855,8 @@ function dinoco_render_ui_v99() {
                                         '<div class="sc-row"><span class="sc-label">คงเหลือจริง</span><span class="sc-val" style="color:'+(p.available_qty <= 0 ? '#ef4444' : '#22c55e')+';font-weight:700">'+p.available_qty.toLocaleString()+' ชิ้น</span></div>' +
                                         '<div class="sc-row"><span class="sc-label">Threshold</span><span class="sc-val">'+p.low_stock_threshold+'</span></div>' +
                                         '<div class="sc-actions">' +
-                                            '<button class="btn btn-outline btn-sm flex-1" onclick="StockManager.openLog(\''+p.sku+'\')"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติ</button>' +
-                                            '<button class="btn btn-primary btn-sm flex-1" onclick="StockManager.openAdjust(\''+p.sku+'\')"><i class="fa-solid fa-plus-minus"></i> ปรับ</button>' +
+                                            '<button class="btn btn-outline btn-sm flex-1" onclick="StockManager.openLog(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')"><i class="fa-solid fa-clock-rotate-left"></i> ประวัติ</button>' +
+                                            '<button class="btn btn-primary btn-sm flex-1" onclick="StockManager.openAdjust(\''+String(p.sku||'').replace(/[^A-Z0-9\-_]/gi,'')+'\')"><i class="fa-solid fa-plus-minus"></i> ปรับ</button>' +
                                         '</div>' +
                                     '</div>';
                                 }
