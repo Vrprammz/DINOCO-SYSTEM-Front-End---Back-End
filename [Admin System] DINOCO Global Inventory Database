@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.42.3 — Auto-Split canvas ใหญ่ขึ้น (maxDim 1600) + แถบแดงหนาขึ้น 16% + ฟอนต์ใหญ่ขึ้น
+ * Version: V.42.4 — H1 Fix: save_sku_relation parent stock migration (ต้อง confirm + audit trail)
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -270,6 +270,77 @@ add_action('init', function() {
                                 $relations[$child_clean] = array_values($gc_clean);
                             } else {
                                 unset($relations[$child_clean]);
+                            }
+                        }
+                    }
+
+                    // V.42.4 [H1 FIX]: ถ้า parent มี stock_qty > 0 ก่อนกลายเป็น non-leaf → ต้อง confirm migrate
+                    //   เดิม: parent เคยเก็บ stock อยู่ → หลัง split กลายเป็น SET → dinoco_compute_hierarchy_stock() ไม่อ่าน parent.stock_qty → stock หาย
+                    $had_children_before = isset($old_relations[$parent]) && !empty($old_relations[$parent]);
+                    $becoming_parent = !empty($children);
+                    if ($becoming_parent && !$had_children_before) {
+                        $prod_tbl_check = $wpdb->prefix . 'dinoco_products';
+                        $parent_row = $wpdb->get_row($wpdb->prepare(
+                            "SELECT stock_qty FROM {$prod_tbl_check} WHERE sku = %s",
+                            $parent
+                        ));
+                        $parent_stock = $parent_row ? (int)$parent_row->stock_qty : 0;
+                        $confirm_migrate = !empty($_POST['confirm_stock_migrate']);
+
+                        if ($parent_stock > 0 && !$confirm_migrate) {
+                            $wpdb->query('ROLLBACK');
+                            echo json_encode([
+                                'success' => false,
+                                'code' => 'parent_has_stock',
+                                'parent_stock' => $parent_stock,
+                                'message' => "SKU {$parent} มี stock {$parent_stock} ชิ้นอยู่ — หลัง Auto-Split จะกลายเป็น SET (stock ย้ายไปที่ leaf) → ยืนยันโอนไป {$children[0]}?"
+                            ]);
+                            exit;
+                        }
+
+                        // confirm=true → โอน parent stock → leaf แรก + zero parent + log transaction
+                        if ($parent_stock > 0 && $confirm_migrate && !empty($children)) {
+                            $target_leaf = strtoupper($children[0]);
+                            // ถ้า target_leaf ก็มี children อีก → drill down หา leaf จริงๆ (ใช้ relations ใหม่)
+                            if (function_exists('dinoco_get_leaf_skus')) {
+                                $target_leaves = dinoco_get_leaf_skus($target_leaf, $relations);
+                                if (!empty($target_leaves)) $target_leaf = $target_leaves[0];
+                            }
+
+                            // add → target leaf
+                            $wpdb->query($wpdb->prepare(
+                                "UPDATE {$prod_tbl_check} SET stock_qty = stock_qty + %d, stock_updated_at = %s WHERE sku = %s",
+                                $parent_stock, current_time('mysql'), $target_leaf
+                            ));
+                            // zero → parent
+                            $wpdb->query($wpdb->prepare(
+                                "UPDATE {$prod_tbl_check} SET stock_qty = 0, stock_updated_at = %s WHERE sku = %s",
+                                current_time('mysql'), $parent
+                            ));
+                            // audit trail (2 transactions: subtract parent + add leaf)
+                            $txn_tbl = $wpdb->prefix . 'dinoco_stock_transactions';
+                            $wpdb->insert($txn_tbl, [
+                                'sku' => $parent,
+                                'type' => 'hierarchy_migrate_out',
+                                'qty_change' => -1 * $parent_stock,
+                                'qty_before' => $parent_stock,
+                                'qty_after' => 0,
+                                'reference_type' => 'auto_split',
+                                'reason' => "H1: parent กลายเป็น SET → โอน stock ไป {$target_leaf}",
+                                'user_id' => get_current_user_id() ?: null,
+                            ]);
+                            $wpdb->insert($txn_tbl, [
+                                'sku' => $target_leaf,
+                                'type' => 'hierarchy_migrate_in',
+                                'qty_change' => $parent_stock,
+                                'qty_before' => 0, // snapshot เก่าไม่แม่นยำ — เก็บไว้เพื่อ audit
+                                'qty_after' => 0,
+                                'reference_type' => 'auto_split',
+                                'reason' => "H1: รับ stock โอนจาก {$parent} (Auto-Split)",
+                                'user_id' => get_current_user_id() ?: null,
+                            ]);
+                            if (function_exists('b2b_log')) {
+                                b2b_log("[Inventory] H1 migrate {$parent} stock={$parent_stock} → {$target_leaf} (Auto-Split)");
                             }
                         }
                     }

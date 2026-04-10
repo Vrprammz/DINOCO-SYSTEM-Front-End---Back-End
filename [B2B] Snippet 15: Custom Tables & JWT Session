@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.7.0 — Bulk reserved map + SKU→post_id map + child-to-parent map + stock_map + DB indexes  ║
+ * ║  Version: V.7.1 — DD-3 shared child fix (visited value-copy) + walk-in negative stock + leaf guard  ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -585,6 +585,15 @@ if ( ! function_exists( 'dinoco_stock_add' ) ) {
         $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
         $sku       = strtoupper( trim( $sku ) );
 
+        // V.7.1 [H2 FIX]: DD-2 leaf-only guard — block parent/intermediate SKU
+        // caller ต้อง expand leaf ก่อนด้วย dinoco_get_leaf_skus() ถ้าเป็น SET
+        if ( function_exists( 'dinoco_is_leaf_sku' ) && ! dinoco_is_leaf_sku( $sku ) ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[Stock] CRITICAL: add blocked — {$sku} ไม่ใช่ leaf (DD-2 violation). caller ต้องเรียก dinoco_get_leaf_skus() ก่อน. type={$type} ref={$ref_type}:{$ref_id}" );
+            }
+            return new WP_Error( 'not_leaf', "SKU {$sku} เป็น SET/intermediate — ต้องเพิ่มสต็อกที่ leaf เท่านั้น (DD-2)" );
+        }
+
         // Resolve warehouse (default if not specified)
         if ( ! $warehouse_id && function_exists( 'dinoco_get_default_warehouse_id' ) ) {
             $warehouse_id = dinoco_get_default_warehouse_id();
@@ -676,8 +685,10 @@ if ( ! function_exists( 'dinoco_stock_add' ) ) {
 if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
     /**
      * ลดสต็อก (B2B reserved, manual subtract)
+     * V.7.1 [C3 FIX]: เพิ่ม $allow_negative — walk-in order สั่งเกิน stock ได้ (DD-5)
+     * V.7.1 [H2 FIX]: เพิ่ม defensive leaf guard — DD-2 (ตัดสต็อกเฉพาะ leaf)
      */
-    function dinoco_stock_subtract( $sku, $qty, $type = 'manual_subtract', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '', $warehouse_id = null ) {
+    function dinoco_stock_subtract( $sku, $qty, $type = 'manual_subtract', $ref_type = '', $ref_id = 0, $reason = '', $batch_id = '', $warehouse_id = null, $allow_negative = false ) {
         if ( $qty <= 0 ) return new WP_Error( 'invalid_qty', 'จำนวนต้องมากกว่า 0' );
 
         global $wpdb;
@@ -685,6 +696,15 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
         $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
         $whs_table = $wpdb->prefix . 'dinoco_warehouse_stock';
         $sku       = strtoupper( trim( $sku ) );
+
+        // V.7.1 [H2 FIX]: DD-2 leaf-only guard — block parent/intermediate SKU
+        // caller ต้อง expand leaf ก่อนด้วย dinoco_get_leaf_skus() ถ้าเป็น SET
+        if ( function_exists( 'dinoco_is_leaf_sku' ) && ! dinoco_is_leaf_sku( $sku ) ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[Stock] CRITICAL: subtract blocked — {$sku} ไม่ใช่ leaf (DD-2 violation). caller ต้องเรียก dinoco_get_leaf_skus() ก่อน. type={$type} ref={$ref_type}:{$ref_id}" );
+            }
+            return new WP_Error( 'not_leaf', "SKU {$sku} เป็น SET/intermediate — ต้องตัดสต็อกที่ leaf เท่านั้น (DD-2)" );
+        }
 
         // Resolve warehouse
         if ( ! $warehouse_id && function_exists( 'dinoco_get_default_warehouse_id' ) ) {
@@ -710,10 +730,15 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
         }
 
         $old_qty = (int) $row->stock_qty;
-        $new_qty = max( 0, $old_qty - (int) $qty );
+        // V.7.1 [C3 FIX]: walk-in order (allow_negative=true) → stock ติดลบได้ตาม DD-5
+        $new_qty = $allow_negative ? ( $old_qty - (int) $qty ) : max( 0, $old_qty - (int) $qty );
 
         if ( $old_qty < (int) $qty && function_exists( 'b2b_log' ) ) {
-            b2b_log( sprintf( '[Stock] WARNING: %s stock=%d < requested=%d, cap at 0', $sku, $old_qty, $qty ) );
+            if ( $allow_negative ) {
+                b2b_log( sprintf( '[Stock] NOTICE: %s stock=%d < requested=%d → allow_negative=true → new=%d (walk-in DD-5)', $sku, $old_qty, $qty, $new_qty ) );
+            } else {
+                b2b_log( sprintf( '[Stock] WARNING: %s stock=%d < requested=%d, cap at 0', $sku, $old_qty, $qty ) );
+            }
         }
 
         $updated = $wpdb->update( $table, array(
@@ -743,7 +768,8 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
                 $warehouse_id, $sku
             ) );
             if ( $wh_row ) {
-                $new_wh_qty = max( 0, (int) $wh_row->stock_qty - (int) $qty );
+                // V.7.1 [C3 FIX]: honor allow_negative บน warehouse_stock ด้วย
+                $new_wh_qty = $allow_negative ? ( (int) $wh_row->stock_qty - (int) $qty ) : max( 0, (int) $wh_row->stock_qty - (int) $qty );
                 $wpdb->update( $whs_table, array( 'stock_qty' => $new_wh_qty ), array( 'id' => $wh_row->id ) );
             }
             if ( $wpdb->last_error ) $wh_ok = false;
@@ -940,8 +966,11 @@ if ( ! function_exists( 'dinoco_stock_get' ) ) {
  * dinoco_get_leaf_skus('GRAND_B1') → ['GRAND_B1']
  */
 if ( ! function_exists( 'dinoco_get_leaf_skus' ) ) {
-    function dinoco_get_leaf_skus( $sku, $relations = null, $depth = 0, &$visited = array() ) {
-        if ( $depth > 3 ) return array( $sku ); // hard limit [DD-4]
+    // V.7.1 [C1 FIX]: $visited เป็น value-copy (ไม่ใช่ reference) — sibling branches ต้องไม่ share visited
+    //   → DD-3 shared child ผ่าน 2 paths จะคืน leaf ถูกต้อง (เดิม sibling รอบสองเจอ visited → return [])
+    //   → dedup output ด้วย array_unique ป้องกัน double-subtract เมื่อ shared leaf ปรากฏหลาย path
+    function dinoco_get_leaf_skus( $sku, $relations = null, $depth = 0, $visited = array() ) {
+        if ( $depth > 3 ) return array( strtoupper( trim( $sku ) ) ); // hard limit [DD-4]
 
         if ( $relations === null ) {
             $relations = get_option( 'dinoco_sku_relations', array() );
@@ -950,7 +979,7 @@ if ( ! function_exists( 'dinoco_get_leaf_skus' ) ) {
 
         $sku_upper = strtoupper( trim( $sku ) );
 
-        // circular ref guard
+        // circular ref guard (cycle ใน current DFS path เท่านั้น — value-copy ทำให้ sibling branch มี visited ของตัวเอง)
         if ( in_array( $sku_upper, $visited, true ) ) return array();
         $visited[] = $sku_upper;
 
@@ -969,14 +998,15 @@ if ( ! function_exists( 'dinoco_get_leaf_skus' ) ) {
             return array( $sku_upper );
         }
 
-        // recursive resolve children → leaf nodes
+        // recursive resolve children → leaf nodes (ส่ง $visited เป็น value-copy ทุกครั้ง)
         $leaves = array();
         foreach ( $children as $child ) {
             $child_leaves = dinoco_get_leaf_skus( $child, $relations, $depth + 1, $visited );
             $leaves = array_merge( $leaves, $child_leaves );
         }
 
-        return $leaves;
+        // V.7.1: dedup — shared leaf ผ่านหลาย path จะนับครั้งเดียว (ป้องกัน double-subtract)
+        return array_values( array_unique( $leaves ) );
     }
 }
 
@@ -1048,7 +1078,9 @@ if ( ! function_exists( 'dinoco_get_ancestor_skus' ) ) {
  * non-leaf → return MIN(children computed stock)
  */
 if ( ! function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
-    function dinoco_compute_hierarchy_stock( $sku, $relations = null, $depth = 0, &$visited = array(), $stock_map = null ) {
+    // V.7.1 [C1 FIX]: $visited เป็น value-copy — DD-3 shared child ทำให้ MIN() คำนวณถูก
+    //   Repro เดิม: SET → [CHILD_B, CHILD_C] ทั้งคู่มี LEAF_X → รอบสอง LEAF_X เจอ visited → return 0 → SET=0 ผิด
+    function dinoco_compute_hierarchy_stock( $sku, $relations = null, $depth = 0, $visited = array(), $stock_map = null ) {
         if ( $depth > 3 ) return 0;
 
         if ( $relations === null ) {
@@ -1182,7 +1214,8 @@ if ( ! function_exists( 'dinoco_validate_sku_hierarchy' ) ) {
  * Return: ['sku'=>'X', 'children'=>[['sku'=>'A','children'=>[...]], ...]]
  */
 if ( ! function_exists( 'dinoco_get_sku_tree' ) ) {
-    function dinoco_get_sku_tree( $sku, $relations = null, $depth = 0, &$visited = array() ) {
+    // V.7.1 [C2 FIX]: $visited เป็น value-copy — shared child ผ่านหลาย path จะแสดง tree ถูก
+    function dinoco_get_sku_tree( $sku, $relations = null, $depth = 0, $visited = array() ) {
         if ( $depth > 3 ) return array( 'sku' => $sku, 'children' => array() );
 
         if ( $relations === null ) {
