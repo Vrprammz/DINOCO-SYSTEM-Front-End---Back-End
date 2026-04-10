@@ -360,6 +360,8 @@ cd /opt/dinoco && git pull origin main && cd openclawminicrm && docker compose -
 | 2026-04-10 | REG-018 — ซื้อเยอะ bot เสนอ "ราคาพิเศษ" | เพิ่ม BULK_INQUIRY rule + ห้ามคำว่า "ราคาพิเศษ/เหมาถูกกว่า" | (this commit) | REG-018 |
 | 2026-04-10 | REG-020 — ขอรูป bot ถามรุ่นซ้ำ | Strengthen context awareness rule "มีรูปไหม" → ใช้รุ่นเดิมทันที | (this commit) | REG-020 |
 | 2026-04-10 | REG-025 — ทักทาย bot ใช้ "ยินดีให้บริการ" | เพิ่มใน HARD BANS + greeting template ในน้ำเสียง section | (this commit) | REG-025 |
+| 2026-04-11 | Regression test multi-turn ไม่มี context | `/api/test-ai` + `/api/regression/run` ไม่ saveMsg ระหว่าง turns → เพิ่ม `runRegressionTurn()` helper (saveMsg user → auto-lead → callDinocoAI → dealer append → saveMsg assistant) | (this commit) | REG-005, REG-018, REG-020, REG-021 |
+| 2026-04-11 | REG-012 regex false positive `.*` greedy | เปลี่ยนเป็น bounded proximity `[^.]{0,40}` (ReDoS-safe) | (this commit) | REG-012 |
 
 ---
 

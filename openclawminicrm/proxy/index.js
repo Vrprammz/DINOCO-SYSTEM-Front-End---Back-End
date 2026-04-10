@@ -2278,8 +2278,8 @@ app.post("/api/regression/run", requireAuth, aiLimiter, express.json({ limit: "5
 
         for (const turn of s.turns || []) {
           if ((turn.role || "user") !== "user") continue;
-          // ★ H1 helper: 45s timeout per turn
-          const turnPromise = callDinocoAI(systemPrompt, cleanForAI(turn.message), sourceId);
+          // ★ V.1.5: Use runRegressionTurn (saves messages for multi-turn context) — fixes REG-005/018/020/021
+          const turnPromise = runRegressionTurn(sourceId, turn.message);
           const reply = await Promise.race([
             turnPromise,
             new Promise((_, rej) => setTimeout(() => rej(new Error("turn_timeout")), 45000)),
@@ -2646,21 +2646,81 @@ app.get("/api/customers/churn-risk", requireAuth, async (req, res) => { res.json
 app.get("/api/ab-results", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("messages").aggregate([{ $match: { abVariant: { $exists: true }, role: "assistant" } }, { $group: { _id: "$abVariant", count: { $sum: 1 } } }]).toArray()); }); // ★ V.1.4: เพิ่ม requireAuth
 app.post("/api/cache/invalidate", requireAuth, express.json(), (req, res) => { invalidateWPCache(req.body.key || "all"); res.json({ status: "ok" }); });
 
-// ★ V.1.4: Test AI endpoint — ทดสอบ AI response โดยไม่ต้องส่งผ่าน LINE/FB
+// ★ V.1.5: runRegressionTurn — mirror aiReplyToLine core flow (saveMsg + auto-lead + dealer append)
+// Fixes multi-turn context loss in regression tests (REG-005/018/020/021)
+const DEALER_COORDINATE_TEXT = "\n\nถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสานให้ตัวแทนติดต่อกลับเลยนะคะ 😊";
+const DEALER_REPLY_REGEX = /ร้าน.*โทร|โทร\s*\d{2,3}[-.]\d{3}[-.]\d{4}|SHOP|ตัวแทน.*จำหน่าย|FOX\s*RIDER|ลาดพร้าว|เชียงใหม่|ตัวแทน\s*:/i;
+const BOT_DEALER_CUE_REGEX = /แจ้งชื่อและเบอร์|ประสานให้ตัวแทน|แจ้งชื่อ.*เบอร์/;
+
+async function runRegressionTurn(sourceId, message) {
+  const db = await getDB();
+  const platform = "line";
+
+  // 1. Save user message BEFORE callDinocoAI so history exists for next turn
+  await saveMsg(sourceId, {
+    role: "user", userName: "RegTest", content: message, messageType: "text",
+  }, platform).catch(() => {});
+
+  // 2. Auto-Lead pre-check — mirror aiReplyToLine V.6.6 phoneMatch block
+  const phoneMatch = message.match(/(\d{9,10})/);
+  if (phoneMatch && db) {
+    try {
+      const recentMsgs = await db.collection(MESSAGES_COLL)
+        .find({ sourceId }).sort({ createdAt: -1 }).limit(10)
+        .project({ role: 1, content: 1 }).toArray();
+      const lastBotCue = recentMsgs.find(d => d.role === "assistant"
+        && BOT_DEALER_CUE_REGEX.test(d.content || ""));
+      if (lastBotCue) {
+        const nameText = message.replace(/\d+/g, "")
+          .replace(/[^\u0E00-\u0E7Fa-zA-Z\s]/g, "").trim();
+        const customerName = nameText || "ลูกค้า";
+        const dealerMsg = recentMsgs.find(d => d.role === "assistant"
+          && /ร้าน|SHOP|FOX|ตัวแทน/i.test(d.content || ""));
+        const dealerNameMatch = (dealerMsg?.content || "")
+          .match(/ร้าน\s*([^\s\n:,]+(?:\s+[^\s\n:,]+)?)|([A-Z][A-Z\s]+(?:SHOP|RIDER))/i);
+        const dealerName = dealerNameMatch
+          ? (dealerNameMatch[1] || dealerNameMatch[2] || "").trim() : "";
+        const confirmReply = `ขอบคุณค่ะคุณ${customerName} รับเรื่องแล้วนะคะ แอดมินจะประสานให้${dealerName ? `ร้าน ${dealerName} ` : "ตัวแทน"}ติดต่อกลับเร็วที่สุดค่ะ 😊`;
+        await saveMsg(sourceId, {
+          role: "assistant", userName: DEFAULT_BOT_NAME,
+          content: confirmReply, messageType: "text", isAiReply: true,
+        }, platform).catch(() => {});
+        return confirmReply;
+      }
+    } catch (e) { /* fallback to AI */ }
+  }
+
+  // 3. Normal AI reply — callDinocoAI reads history now that we saved user msg
+  let reply = await callDinocoAI(DEFAULT_PROMPT, cleanForAI(message), sourceId);
+  if (!reply) reply = "ขอเช็คข้อมูลกับทีมงานก่อนนะคะ รอสักครู่ค่ะ 🙏";
+
+  // 4. Dealer coordination append — mirror aiReplyToLine V.6.3
+  if (DEALER_REPLY_REGEX.test(reply) && !reply.includes("แจ้งชื่อและเบอร์")) {
+    reply += DEALER_COORDINATE_TEXT;
+  }
+
+  // 5. Save assistant reply for next turn context
+  await saveMsg(sourceId, {
+    role: "assistant", userName: DEFAULT_BOT_NAME,
+    content: reply, messageType: "text", isAiReply: true,
+  }, platform).catch(() => {});
+
+  return reply;
+}
+
+// ★ V.1.5: Test AI endpoint — ทดสอบ AI response โดยไม่ต้องส่งผ่าน LINE/FB (uses runRegressionTurn for context)
 app.post("/api/test-ai", requireAuth, express.json(), async (req, res) => {
   const { message, sourceId } = req.body;
   if (!message) return res.status(400).json({ error: "message required" });
   const testSourceId = sourceId || "test-" + Date.now();
   try {
-    const reply = await callDinocoAI(DEFAULT_PROMPT, cleanForAI(message), testSourceId);
+    const reply = await runRegressionTurn(testSourceId, message);
     // ★ V.1.1 (regression): expose tools_called for test harnesses
     const toolsCalled = [];
     const lastTools = aiChat._lastToolResults?.get(testSourceId);
     if (lastTools) {
       if (Array.isArray(lastTools)) lastTools.forEach(t => toolsCalled.push(t));
       else toolsCalled.push(lastTools);
-      // keep in map for reg runner reads — but delete after short delay
-      // we don't delete here because reg runner may use /api/test-ai + inspect later
     }
     res.json({ reply, sourceId: testSourceId, tools_called: toolsCalled });
   } catch (e) {

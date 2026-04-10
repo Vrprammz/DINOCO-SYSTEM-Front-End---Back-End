@@ -331,7 +331,7 @@ const SCENARIOS = [
     turns: [{ role: "user", message: "DINOCO Edition NX500 มีสีอะไรบ้าง" }],
     assertions: {
       forbidden_patterns: [
-        { pattern: "DINOCO\\s*Edition.*สีดำ|สีดำ.*DINOCO\\s*Edition", flags: "i", reason: "ห้ามบอกว่า Edition มีสีดำ" },
+        { pattern: "(DINOCO\\s*Edition|Edition\\s*NX500)[^.]{0,40}สีดำ|สีดำ[^.]{0,40}(DINOCO\\s*Edition|Edition\\s*NX500)", flags: "i", reason: "ห้ามบอกว่า Edition มีสีดำ (bounded proximity)" },
       ],
       required_patterns: [
         { pattern: "เงิน|silver|DNCGND37LSPROS", flags: "i", reason: "ต้องพูดถึงสีเงินหรือ SKU" },
