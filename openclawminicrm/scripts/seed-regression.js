@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 /**
- * seed-regression.js V.1.1 — Seed regression scenarios
+ * seed-regression.js V.1.2 — Seed regression scenarios
  *
  * Seeds 25 regression scenarios:
  *   - REG-001..REG-015: from Fix History (docs/chatbot-rules.md §11)
  *   - REG-016..REG-025: from chatbot-rules.md Sections 1-10 (rule coverage)
  * into the `regression_scenarios` MongoDB collection.
+ *
+ * V.1.2 changes (2026-04-10):
+ *   - REG-005: ลบ expected_tools (auto-lead bypass AI ไม่เรียก tool) → ใช้ required_patterns
+ *   - REG-021: ลบ expected_tools (claim-flow state machine ไม่เรียก tool ตรง) → ใช้ required_patterns
  *
  * Usage:
  *   node scripts/seed-regression.js          # upsert (update existing)
@@ -159,11 +163,16 @@ const SCENARIOS = [
         { pattern: "ราคา.*บาท.*ราคา.*บาท", flags: "s", reason: "ห้ามบอกราคาซ้ำเมื่อถามร้าน" },
       ],
       required_patterns: [
-        { pattern: "ประสาน|แจ้งตัวแทน|ติดต่อกลับ", flags: "i", reason: "ต้องประสานตัวแทน" },
+        {
+          pattern: "ขอบคุณ.*คุณ|แอดมิน.*ประสาน|ติดต่อกลับ|รับเรื่อง",
+          flags: "i",
+          reason: "ต้องตอบยืนยันหลังรับชื่อ+เบอร์ (auto-lead bypass AI → insert MongoDB + Flex ตรง ไม่ผ่าน tool call)",
+        },
       ],
-      expected_tools: ["dinoco_create_lead"],
+      // NOTE: ไม่ใช้ expected_tools เพราะ auto-lead V.6.5+ bypass AI ไป insert MongoDB ตรง ไม่ผ่าน dinoco_create_lead tool
+      // Dealer lookup อาจถูกเรียกหรือไม่เรียกก็ได้ ตาม context → assert output text pattern แทน
       expect_behavior:
-        "AI ต้องแนะนำร้านตัวแทนย่านลาดพร้าว + เมื่อลูกค้าให้ชื่อ+เบอร์ ต้องเรียก dinoco_create_lead และตอบว่าแอดมินจะประสานตัวแทนติดต่อกลับ",
+        "AI ต้องแนะนำร้านตัวแทนย่านลาดพร้าว + เมื่อลูกค้าให้ชื่อ+เบอร์ ต้องตอบยืนยันว่าแอดมินจะประสานตัวแทนติดต่อกลับ (auto-lead pipeline จะ insert MongoDB + notify dealer Flex อัตโนมัติ ไม่ผ่าน tool call)",
       must_not_do: ["ห้ามบอกราคาสินค้าซ้ำเมื่อลูกค้าถามร้าน"],
     },
     retry_on_flaky: 1,
@@ -578,9 +587,17 @@ const SCENARIOS = [
       forbidden_patterns: [
         { pattern: "ซ่อม.*ฟรี|เปลี่ยน.*ฟรี|เคลม.*ได้\\s*แน่|รับประกัน.*เคลม.*ได้", flags: "i", reason: "AI ห้ามตัดสินว่าเคลมได้/ฟรี" },
       ],
-      expected_tools: ["dinoco_create_claim"],
+      required_patterns: [
+        {
+          pattern: "รูป|อาการ|ชำรุด|เคลม|รับเรื่อง|ทีมช่าง|บัตรรับประกัน",
+          flags: "i",
+          reason: "ต้องเข้า claim flow (claim-flow.js state machine ไม่ผ่าน tool call ตรง)",
+        },
+      ],
+      // NOTE: ไม่ใช้ expected_tools เพราะ claim-flow.js V.3.0 เป็น state machine — ถามข้อมูลทีละ turn
+      // จนครบ (อาการ+รูป+เบอร์+ชื่อ) แล้วค่อยเรียก dinoco_create_claim — 2 turns อาจยังไม่ครบ
       expect_behavior:
-        "AI ต้องเข้า claim flow เก็บอาการ+เบอร์+รุ่น + เรียก dinoco_create_claim เพื่อเปิดเคสในระบบ แจ้งลูกค้าว่าทีมช่างจะติดต่อกลับ (ห้ามตัดสินเองว่าเคลมได้/ไม่ได้)",
+        "AI ต้องเข้า claim flow เก็บอาการ+เบอร์+รุ่น (claim-flow state machine จะถามข้อมูลที่ขาดทีละอย่าง แล้วค่อยเรียก dinoco_create_claim เมื่อข้อมูลครบ) แจ้งลูกค้าว่าทีมช่างจะติดต่อกลับ — ห้ามตัดสินเองว่าเคลมได้/ไม่ได้",
       must_not_do: ["ห้ามบอกว่าเคลมได้/ไม่ได้เอง", "ห้ามบอกว่าซ่อมฟรี/มีค่าใช้จ่าย"],
     },
     retry_on_flaky: 1,
