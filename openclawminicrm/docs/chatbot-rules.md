@@ -320,28 +320,33 @@ cd /opt/dinoco && git pull origin main && cd openclawminicrm && docker compose -
 
 ## 11. Fix History Log
 
-| Date | Bug | Fix | Commit |
-|------|-----|-----|--------|
-| 2026-04-06 | "ดิฉัน" → ลูกค้าไม่ชอบ | เปลี่ยนเป็น "คุณลูกค้า" | — |
-| 2026-04-06 | ADV160 ถามซ้ำ | ตอบโดยตรง "ไม่มีสำหรับ ADV160" | — |
-| 2026-04-06 | Full Set ไม่มีชื่อเต็ม | hardcode Grand Travel details | — |
-| 2026-04-06 | stock_status filter ผิด | ใช้ b2b_visible แทน | — |
-| 2026-04-06 | X Travel Pro ยังขึ้น | hardcode filter | — |
-| 2026-04-06 | Bot ตอบราคาซ้ำเมื่อถามร้าน | dealerIntentButPriceReply | — |
-| 2026-04-07 | H2C ขึ้นในคำถาม | "ตัวแต่งศูนย์" = DINOCO Edition ตรง | 10c218c |
-| 2026-04-07 | วัสดุรวมมั่ว | แยกชัด กันล้ม=สแตนเลส กล่อง=อลู | a52d479 |
-| 2026-04-07 | NX500 Edition ต้องสีเงิน | SKU DNCGND37LSPROS เท่านั้น | 27a8972 |
-| 2026-04-07 | Side Rack ≠ มือจับ | แยก Rear vs Side Rack | 109a9d4 |
-| 2026-04-07 | เสนอ Pro Rack Full ซ้ำ | มีแร็คหลังแล้ว ไม่ต้องเสนอ | 355b85c |
-| 2026-04-07 | รูป FB ส่งเป็น text | regex + sendMetaImage + cleanup URL | 109a9d4 |
-| 2026-04-07 | โยนเบอร์ไม่ประสาน | output-based append ข้อความประสาน | 5d25e4f |
-| 2026-04-07 | ชื่อ+เบอร์ → AI crash | PII masking + fallback | 9eb0f50 |
-| 2026-04-07 | Auto-lead ไม่ทำงาน | getRecentMessages แทน vector search | 6b12462 |
-| 2026-04-08 | Lead ไม่มี product | extractLeadContext จาก history | 0ad836d |
-| 2026-04-08 | Lead ไม่ notify dealer | notifyDealerDirect centralized | 0ad836d |
-| 2026-04-08 | Lead ไม่มีรูป+ราคา | lookupProductForLead | ea509c5 |
-| 2026-04-08 | Flex card ไม่มี logo | DINOCO CO DEALER header สีดำ | bda1c65 |
-| 2026-04-08 | Claude review text หลุด | filter leak patterns → fallback Gemini | 2bfddc7 |
+ทุก bug ที่มี REG-NNN หมายถึงมี regression scenario ครอบคลุมแล้ว
+(ดู `regression_scenarios` collection — รัน `node scripts/regression.js --mode=gate --severity=critical`)
+
+| Date | Bug | Fix | Commit | REG |
+|------|-----|-----|--------|-----|
+| 2026-04-06 | "ดิฉัน" → ลูกค้าไม่ชอบ | เปลี่ยนเป็น "คุณลูกค้า" | — | REG-009 |
+| 2026-04-06 | ADV160 ถามซ้ำ | ตอบโดยตรง "ไม่มีสำหรับ ADV160" | — | REG-007 |
+| 2026-04-06 | Full Set ไม่มีชื่อเต็ม | hardcode Grand Travel details | — | — |
+| 2026-04-06 | stock_status filter ผิด | ใช้ b2b_visible แทน | — | — |
+| 2026-04-06 | X Travel Pro ยังขึ้น | hardcode filter | — | REG-006 |
+| 2026-04-06 | Bot ตอบราคาซ้ำเมื่อถามร้าน | dealerIntentButPriceReply | — | REG-011 |
+| 2026-04-07 | H2C ขึ้นในคำถาม | "ตัวแต่งศูนย์" = DINOCO Edition ตรง | 10c218c | REG-001 |
+| 2026-04-07 | วัสดุรวมมั่ว | แยกชัด กันล้ม=สแตนเลส กล่อง=อลู | a52d479 | REG-002 |
+| 2026-04-07 | NX500 Edition ต้องสีเงิน | SKU DNCGND37LSPROS เท่านั้น | 27a8972 | REG-012 |
+| 2026-04-07 | Side Rack ≠ มือจับ | แยก Rear vs Side Rack | 109a9d4 | REG-003 |
+| 2026-04-07 | เสนอ Pro Rack Full ซ้ำ | มีแร็คหลังแล้ว ไม่ต้องเสนอ | 355b85c | — |
+| 2026-04-07 | รูป FB ส่งเป็น text | regex + sendMetaImage + cleanup URL | 109a9d4 | REG-014 |
+| 2026-04-07 | โยนเบอร์ไม่ประสาน | output-based append ข้อความประสาน | 5d25e4f | REG-005, REG-015 |
+| 2026-04-07 | ชื่อ+เบอร์ → AI crash | PII masking + fallback | 9eb0f50 | REG-013 |
+| 2026-04-07 | Auto-lead ไม่ทำงาน | getRecentMessages แทน vector search | 6b12462 | — |
+| 2026-04-08 | Lead ไม่มี product | extractLeadContext จาก history | 0ad836d | — |
+| 2026-04-08 | Lead ไม่ notify dealer | notifyDealerDirect centralized | 0ad836d | — |
+| 2026-04-08 | Lead ไม่มีรูป+ราคา | lookupProductForLead | ea509c5 | — |
+| 2026-04-08 | Flex card ไม่มี logo | DINOCO CO DEALER header สีดำ | bda1c65 | — |
+| 2026-04-08 | Claude review text หลุด | filter leak patterns → fallback Gemini | 2bfddc7 | REG-004 |
+| — | ห้ามเผยเป็น AI | sanitizeAIOutput + 3-layer guard | — | REG-010 |
+| — | ADV350/Forza350 ไม่มีกล่องข้าง | SCOOTER_NO_SIDE list | — | REG-008 |
 
 ---
 

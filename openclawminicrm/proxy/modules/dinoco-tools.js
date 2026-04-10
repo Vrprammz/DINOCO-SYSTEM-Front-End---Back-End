@@ -1,5 +1,7 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
+ * V.5.1 — Add Regression Test Mode guard: SIDE_EFFECT_TOOLS mocked when sourceId starts with "reg_"
+ *         (prevents dinoco_create_lead / dinoco_create_claim from writing real data during regression tests)
  * V.5.0 — Lead Flex with product image/price: dinoco_dealer_lookup + dinoco_create_lead use MongoDB dealers + notifyDealerDirect
  */
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
@@ -231,7 +233,37 @@ const AGENT_TOOLS = [
 ];
 
 // === Execute Tool ===
+// ★ Regression Guard V.1.0 — Test Mode Guard
+// Tools with side effects (DB writes, external API calls that mutate state)
+// must NOT execute for real when running regression tests.
+// sourceId prefix "reg_" indicates a regression test run.
+const SIDE_EFFECT_TOOLS = new Set([
+  "dinoco_create_lead",
+  "dinoco_create_claim",
+  "dinoco_claim_status", // sends LINE alert to admin
+]);
+
+function isRegressionTestMode(sourceId) {
+  return typeof sourceId === "string" && sourceId.startsWith("reg_");
+}
+
 async function executeTool(toolName, args, sourceId) {
+  // ★ Regression Guard — mock side-effect tools in test mode
+  if (isRegressionTestMode(sourceId) && SIDE_EFFECT_TOOLS.has(toolName)) {
+    console.log(`[Regression Test Mode] Mocked ${toolName} for ${sourceId}`);
+    // Return success string mimicking real tool output so AI continues flow normally
+    if (toolName === "dinoco_create_lead") {
+      return `[TEST MODE] สร้าง lead จำลองสำเร็จ — tool_called: dinoco_create_lead, args: ${JSON.stringify(args).substring(0, 200)}`;
+    }
+    if (toolName === "dinoco_create_claim") {
+      return `[TEST MODE] เปิดเคลมจำลองสำเร็จ เลข: REG-TEST-0001 — tool_called: dinoco_create_claim`;
+    }
+    if (toolName === "dinoco_claim_status") {
+      return `[TEST MODE] ใบเคลม REG-TEST-0001 สถานะ: ทีมตรวจแล้ว (mocked)`;
+    }
+    return `[TEST MODE] mocked ${toolName}`;
+  }
+
   if (toolName === "search_history") {
     const docs = await searchMessages(sourceId, args.query || "", 5);
     if (docs.length === 0) {

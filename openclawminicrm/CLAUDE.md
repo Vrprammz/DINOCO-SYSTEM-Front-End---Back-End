@@ -113,9 +113,29 @@ groups_meta     { sourceId, groupName, platform, teamId }
 - **Agent API:** `/api/train/test`, `/api/train/judge`, `/api/train/kb`, `/api/train/generate`, `/api/train/stats`, `/api/train/logs`
 - **Dashboard API proxy:** `/api/train/[...action]` → proxy ไป Agent
 - **MongoDB collections:** `training_logs` (verdict+correct_answer), `knowledge_base` (KB entries, source=training_dashboard)
-- **Tabs:** ทดสอบ AI / ถังข้อมูล (KB) / สถิติ / ประวัติ
+- **Tabs:** ทดสอบ AI / ถังข้อมูล (KB) / สถิติ / ประวัติ / **ระบบกันถอย (Regression Guard)**
 - **KB from training:** ถ้าตัดสินว่า fail + ใส่คำตอบที่ถูก → สร้าง KB entry อัตโนมัติ (source: training_dashboard)
 - **Generate:** Gemini สร้างคำถามจำลองลูกค้า 10 ข้อจาก KB
+
+## Regression Guard System (V.1.0)
+- **Goal:** ป้องกัน bug เก่ากลับมาเวลาแก้ feature ใหม่ — block deploy ถ้า critical scenarios fail
+- **CLI:** `node scripts/regression.js --mode=gate --severity=critical,high` (0=pass, 1=fail)
+- **Seed:** `node scripts/seed-regression.js` (15 scenarios จาก `docs/chatbot-rules.md` Fix History)
+- **MongoDB collections:** `regression_scenarios` (bug_id, category, severity, turns, assertions), `regression_runs` (triggered_by, pass/fail, results)
+- **3-layer validation:** (1) Regex forbidden/required patterns — 0 tokens, (2) Tool call check (expected/forbidden), (3) Gemini semantic judge (only if hard rules pass)
+- **Test mode guard:** `dinoco-tools.js` V.5.1 mocks `dinoco_create_lead`/`dinoco_create_claim`/`dinoco_claim_status` when `sourceId` starts with `reg_` (prevents real DB writes)
+- **sourceId prefix:** `reg_${bug_id}_${timestamp}` — cleanup via cron every hour + nightly 03:30
+- **Categories:** product_knowledge, tone, flow, intent, anti_hallucination, tool_calling
+- **Severity:** critical (blocks deploy) / high (CI only) / medium (report)
+- **REST API** (namespace `/api/regression/`): scenarios (CRUD), run, runs, runs/:id, stats, auto-mine, cleanup
+- **Dashboard tab:** "ระบบกันถอย" ใน `/dashboard/train` — stats + filter + table + detail modal + form (quick/advanced JSON)
+- **Deploy gates:** `scripts/git-hooks/pre-push` (local), `.github/workflows/regression-guard.yml` (CI), `scripts/deploy.sh` step 0
+- **Phase 4 cron** (in `proxy/index.js` startup): 03:00 update `pass_rate_7d` + drift alert (<90% × ≥3 runs → Telegram `regression_drift`), 03:30 cleanup stale `reg_*` sourceIds, Sunday 04:00 archive inactive >90d
+- **Telegram alert types** (added to `telegram-alert.js`): `regression_drift`, `regression_fail_gate`
+- **Auto-mine:** `POST /api/regression/auto-mine` — Gemini scan `training_logs` fails + handoff triggers (manual review before insert)
+- **Install hooks:** `./openclawminicrm/scripts/install-hooks.sh` (one-time)
+- **Override gate:** `git push --no-verify` (emergency only) | `SKIP_REGRESSION=1 ./deploy.sh`
+- **Docs:** `docs/regression-guard.md` (full design)
 
 ## สิ่งที่ห้ามทำ
 - ห้ามลบ folder/service โดยไม่ถามบอสก่อน

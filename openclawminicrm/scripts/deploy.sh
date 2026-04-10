@@ -18,6 +18,21 @@ fi
 
 echo "=== OpenClaw Mini CRM Deploy to ${REMOTE_USER}@${REMOTE_HOST} ==="
 
+# Step 0: Regression Guard (local gate — skippable with SKIP_REGRESSION=1)
+if [ "${SKIP_REGRESSION}" != "1" ]; then
+  echo "[0/4] Running regression guard (critical scenarios)..."
+  AGENT_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'dinoco-agent|smltrack-agent' | head -1 || true)
+  if [ -n "$AGENT_CONTAINER" ]; then
+    if ! docker exec "$AGENT_CONTAINER" node /app/scripts/regression.js --mode=gate --severity=critical --triggered-by=deploy; then
+      echo "ERROR: Regression guard failed — deploy blocked"
+      echo "Fix failing scenarios or set SKIP_REGRESSION=1 to override (not recommended)"
+      exit 1
+    fi
+  else
+    echo "WARNING: Agent container not running locally — skipping pre-deploy gate"
+  fi
+fi
+
 # Step 1: Sync files (exclude secrets + runtime)
 echo "[1/4] Syncing files..."
 rsync -avz --delete \

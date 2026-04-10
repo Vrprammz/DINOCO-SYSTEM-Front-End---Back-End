@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
+import RegressionTab from "./components/RegressionTab";
 
 /* ─── Types ─── */
 interface KBItem {
@@ -54,6 +55,7 @@ const TABS = [
   { id: "test", label: "ทดสอบ AI", icon: "🧪" },
   { id: "kb", label: "ถังข้อมูล", icon: "📚" },
   { id: "auto", label: "Auto-Train", icon: "🤖" },
+  { id: "regression", label: "ระบบกันถอย", icon: "🛡️" },
   { id: "stats", label: "สถิติ", icon: "📊" },
   { id: "logs", label: "ประวัติ", icon: "📝" },
 ];
@@ -160,6 +162,7 @@ export default function TrainPage() {
       {tab === "test" && <TestTab />}
       {tab === "kb" && <KBTab />}
       {tab === "auto" && <AutoTrainTab />}
+      {tab === "regression" && <RegressionTab />}
       {tab === "stats" && <StatsTab />}
       {tab === "logs" && <LogsTab />}
     </div>

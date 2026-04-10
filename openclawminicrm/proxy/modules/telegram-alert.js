@@ -59,6 +59,8 @@ async function sendTelegramAlert(type, data) {
     hallucination: "⚠️",
     new_claim: "📋",
     ai_wrong: "❌",
+    regression_drift: "📉",
+    regression_fail_gate: "🚫",
   };
 
   const icon = icons[type] || "🔔";
@@ -113,6 +115,23 @@ async function sendTelegramAlert(type, data) {
       message += `👤 ${customer} (${platform})\n`;
       message += `💬 ลูกค้าพิมพ์: "${escapeMarkdown((data.customerText || "").substring(0, 100))}"\n`;
       message += `🤖 AI ตอบก่อนหน้า: "${escapeMarkdown((data.aiReply || "").substring(0, 100))}"`;
+      break;
+
+    case "regression_drift":
+      message += `Regression drift ตรวจพบ ❗\n`;
+      message += `🏷 ${escapeMarkdown(data.bug_id || "-")}: ${escapeMarkdown(data.title || "-")}\n`;
+      message += `⚠️ Severity: ${escapeMarkdown(data.severity || "-")}\n`;
+      message += `📊 Pass rate 7d: ${data.pass_rate || 0}% (${data.total_runs || 0} runs)\n`;
+      message += `\n💡 scenario นี้เคยผ่าน แต่เริ่ม fail — bug อาจกลับมา`;
+      break;
+
+    case "regression_fail_gate":
+      message += `Regression Guard ปิด deploy 🚫\n`;
+      message += `🏷 ${escapeMarkdown(data.bug_id || "-")}: ${escapeMarkdown(data.title || "-")}\n`;
+      message += `⚠️ Severity: ${escapeMarkdown(data.severity || "-")}\n`;
+      message += `👤 Triggered by: ${escapeMarkdown(data.triggered_by || "-")}\n`;
+      message += `💬 Reason: ${escapeMarkdown((data.reason || "").substring(0, 200))}\n`;
+      message += `\n💡 แก้ bug ก่อน push`;
       break;
 
     default:

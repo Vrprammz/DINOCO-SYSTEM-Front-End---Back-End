@@ -1,0 +1,108 @@
+name: Regression Guard
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "openclawminicrm/proxy/modules/**"
+      - "openclawminicrm/docs/chatbot-rules.md"
+      - "openclawminicrm/scripts/regression.js"
+      - "openclawminicrm/scripts/seed-regression.js"
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping:1})' --quiet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install agent deps
+        working-directory: openclawminicrm/proxy
+        run: npm ci --omit=dev || npm install --omit=dev
+
+      - name: Wait for MongoDB
+        run: |
+          for i in {1..30}; do
+            if nc -z localhost 27017; then
+              echo "MongoDB ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MongoDB not ready" && exit 1
+
+      - name: Seed regression scenarios
+        working-directory: openclawminicrm
+        env:
+          MONGODB_URI: mongodb://localhost:27017
+          MONGODB_DB: smltrack_ci
+        run: node scripts/seed-regression.js
+
+      - name: Start agent (background)
+        working-directory: openclawminicrm/proxy
+        env:
+          MONGODB_URI: mongodb://localhost:27017
+          MONGODB_DB: smltrack_ci
+          API_SECRET_KEY: ${{ secrets.API_SECRET_KEY || 'ci-test-secret' }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN || 'ci-dummy' }}
+          NODE_ENV: test
+          PORT: "3000"
+        run: |
+          node index.js &
+          echo $! > /tmp/agent.pid
+          for i in {1..30}; do
+            if curl -sf http://localhost:3000/health; then
+              echo "Agent ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Agent did not start"
+          exit 1
+
+      - name: Run regression gate (critical + high)
+        working-directory: openclawminicrm
+        env:
+          MONGODB_URI: mongodb://localhost:27017
+          MONGODB_DB: smltrack_ci
+          AGENT_URL: http://localhost:3000
+          API_SECRET_KEY: ${{ secrets.API_SECRET_KEY || 'ci-test-secret' }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: node scripts/regression.js --mode=gate --severity=critical,high --triggered-by=ci
+
+      - name: Notify Telegram on failure
+        if: failure() && env.TELEGRAM_BOT_TOKEN != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":\"🚫 Regression Guard FAILED on main — ${{ github.sha }}\\nCommit: ${{ github.event.head_commit.message }}\\nActor: ${{ github.actor }}\"}"
+
+      - name: Stop agent
+        if: always()
+        run: |
+          if [ -f /tmp/agent.pid ]; then
+            kill "$(cat /tmp/agent.pid)" 2>/dev/null || true
+          fi

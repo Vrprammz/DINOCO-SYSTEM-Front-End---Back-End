@@ -1944,6 +1944,448 @@ app.post("/api/train/fix-answer", requireAuth, express.json(), async (req, res) 
   }
 });
 
+// ═══════════════════════════════════════════════════════════
+// Regression Guard API (V.1.0) — chatbot regression scenarios
+// ═══════════════════════════════════════════════════════════
+const REGRESSION_SCENARIOS_COLL = "regression_scenarios";
+const REGRESSION_RUNS_COLL = "regression_runs";
+
+// GET /api/regression/scenarios — list (filter: category, severity, active)
+app.get("/api/regression/scenarios", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ scenarios: [] });
+  const filter = {};
+  if (req.query.active !== "all") filter.active = { $ne: false };
+  if (req.query.category) filter.category = req.query.category;
+  if (req.query.severity) filter.severity = { $in: req.query.severity.split(",") };
+  if (req.query.search) {
+    filter.$or = [
+      { title: { $regex: req.query.search, $options: "i" } },
+      { bug_id: { $regex: req.query.search, $options: "i" } },
+      { bug_context: { $regex: req.query.search, $options: "i" } },
+    ];
+  }
+  const scenarios = await db
+    .collection(REGRESSION_SCENARIOS_COLL)
+    .find(filter)
+    .sort({ severity: 1, bug_id: 1 })
+    .toArray();
+  res.json({ scenarios, count: scenarios.length });
+});
+
+// GET /api/regression/scenarios/:bug_id — detail
+app.get("/api/regression/scenarios/:bug_id", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const s = await db.collection(REGRESSION_SCENARIOS_COLL).findOne({ bug_id: req.params.bug_id });
+  if (!s) return res.status(404).json({ error: "Not found" });
+  res.json(s);
+});
+
+// POST /api/regression/scenarios — create
+app.post("/api/regression/scenarios", requireAuth, express.json(), async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const body = req.body || {};
+  if (!body.bug_id || !body.title || !body.turns) {
+    return res.status(400).json({ error: "bug_id, title, turns required" });
+  }
+  const doc = {
+    bug_id: body.bug_id,
+    title: body.title,
+    category: body.category || "general",
+    severity: body.severity || "medium",
+    platform: body.platform || "any",
+    bug_context: body.bug_context || "",
+    fix_commit: body.fix_commit || "",
+    fix_date: body.fix_date || "",
+    source: body.source || "admin_manual",
+    turns: body.turns,
+    assertions: body.assertions || {},
+    context_setup: body.context_setup || {},
+    timeout_ms: body.timeout_ms || 45000,
+    retry_on_flaky: body.retry_on_flaky || 0,
+    active: body.active !== false,
+    created_at: new Date(),
+    updated_at: new Date(),
+    last_run: null,
+    pass_rate_7d: null,
+  };
+  try {
+    await db.collection(REGRESSION_SCENARIOS_COLL).insertOne(doc);
+    res.json({ success: true, scenario: doc });
+  } catch (e) {
+    if (e.code === 11000) return res.status(409).json({ error: "bug_id already exists" });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /api/regression/scenarios/:bug_id — update
+app.patch("/api/regression/scenarios/:bug_id", requireAuth, express.json(), async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const update = { updated_at: new Date() };
+  const allowed = [
+    "title", "category", "severity", "platform", "bug_context",
+    "fix_commit", "fix_date", "turns", "assertions", "context_setup",
+    "timeout_ms", "retry_on_flaky", "active",
+  ];
+  for (const k of allowed) {
+    if (req.body[k] !== undefined) update[k] = req.body[k];
+  }
+  const result = await db
+    .collection(REGRESSION_SCENARIOS_COLL)
+    .updateOne({ bug_id: req.params.bug_id }, { $set: update });
+  if (result.matchedCount === 0) return res.status(404).json({ error: "Not found" });
+  res.json({ success: true, modified: result.modifiedCount });
+});
+
+// DELETE /api/regression/scenarios/:bug_id — soft delete (active=false)
+app.delete("/api/regression/scenarios/:bug_id", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const hard = req.query.hard === "true";
+  if (hard) {
+    const r = await db.collection(REGRESSION_SCENARIOS_COLL).deleteOne({ bug_id: req.params.bug_id });
+    return res.json({ success: true, deleted: r.deletedCount });
+  }
+  const r = await db
+    .collection(REGRESSION_SCENARIOS_COLL)
+    .updateOne({ bug_id: req.params.bug_id }, { $set: { active: false, updated_at: new Date() } });
+  res.json({ success: true, modified: r.modifiedCount });
+});
+
+// POST /api/regression/run — trigger runner
+// body: { bug_ids?: string[], severity?: string[], category?: string, mode?: 'gate'|'report' }
+app.post("/api/regression/run", requireAuth, express.json(), async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+
+  const { bug_ids, severity, category, mode = "report" } = req.body || {};
+
+  // Build filter
+  const filter = { active: { $ne: false } };
+  if (Array.isArray(bug_ids) && bug_ids.length > 0) filter.bug_id = { $in: bug_ids };
+  if (category) filter.category = category;
+  if (Array.isArray(severity) && severity.length > 0) filter.severity = { $in: severity };
+
+  const scenarios = await db.collection(REGRESSION_SCENARIOS_COLL).find(filter).toArray();
+  if (scenarios.length === 0) return res.json({ ok: true, scenarios_run: 0, pass: 0, fail: 0, results: [] });
+
+  // Reuse regression logic inline (simplified for REST context — sequential, minimal delays)
+  const GEMINI_KEY = getDynamicKeySync("GOOGLE_API_KEY");
+  const results = [];
+  let pass = 0, fail = 0, errorCnt = 0;
+
+  for (const s of scenarios) {
+    const sourceId = `reg_${s.bug_id}_${Date.now()}`;
+    const turnResults = [];
+    let error = null;
+
+    try {
+      // clear
+      await db.collection("messages").deleteMany({ sourceId });
+      await db.collection("ai_memory").deleteMany({ sourceId });
+
+      // Run turns via callDinocoAI
+      const botConfig = await getBotConfig();
+      const systemPrompt = botConfig?.prompt || DEFAULT_PROMPT;
+
+      for (const turn of s.turns || []) {
+        if ((turn.role || "user") !== "user") continue;
+        const reply = await callDinocoAI(systemPrompt, cleanForAI(turn.message), sourceId);
+        // get tools called for this sourceId
+        const lastTools = aiChat._lastToolResults?.get(sourceId);
+        const tools = [];
+        if (lastTools) {
+          if (Array.isArray(lastTools)) lastTools.forEach(t => tools.push(t));
+          else tools.push(lastTools);
+          aiChat._lastToolResults?.delete(sourceId);
+        }
+        turnResults.push({ message: turn.message, reply, tools });
+      }
+    } catch (e) {
+      error = e.message;
+    }
+
+    // Cleanup
+    await db.collection("messages").deleteMany({ sourceId });
+    await db.collection("ai_memory").deleteMany({ sourceId });
+
+    // Validate: layer 1 + 2 only (layer 3 Gemini is heavier, kept for CLI runner)
+    const violations = [];
+    if (error) {
+      violations.push({ layer: "agent_error", reason: error });
+    } else {
+      const lastReply = turnResults[turnResults.length - 1]?.reply || "";
+      const aggregated = turnResults.map(t => t.reply).join("\n\n");
+      const checkText = turnResults.length > 1 ? aggregated : lastReply;
+      const assertions = s.assertions || {};
+      // regex forbidden
+      for (const fp of assertions.forbidden_patterns || []) {
+        try {
+          if (new RegExp(fp.pattern, fp.flags || "i").test(checkText)) {
+            violations.push({ layer: "regex_forbidden", pattern: fp.pattern, reason: fp.reason });
+          }
+        } catch {}
+      }
+      // regex required
+      for (const rp of assertions.required_patterns || []) {
+        try {
+          if (!new RegExp(rp.pattern, rp.flags || "i").test(checkText)) {
+            violations.push({ layer: "regex_required", pattern: rp.pattern, reason: rp.reason });
+          }
+        } catch {}
+      }
+      // tool calls
+      const calledNames = turnResults
+        .flatMap(t => t.tools || [])
+        .map(t => (typeof t === "string" ? t : t.name || ""));
+      for (const ex of assertions.expected_tools || []) {
+        if (!calledNames.includes(ex)) {
+          violations.push({ layer: "tool_expected", tool: ex, reason: `expected ${ex} not called` });
+        }
+      }
+      for (const fb of assertions.forbidden_tools || []) {
+        if (calledNames.includes(fb)) {
+          violations.push({ layer: "tool_forbidden", tool: fb, reason: `forbidden ${fb} called` });
+        }
+      }
+    }
+
+    const status = error ? "error" : violations.length === 0 ? "pass" : "fail";
+    if (status === "pass") pass++;
+    else if (status === "error") errorCnt++;
+    else fail++;
+
+    results.push({
+      bug_id: s.bug_id,
+      title: s.title,
+      severity: s.severity,
+      category: s.category,
+      status,
+      violations,
+      turns: turnResults.map(t => ({ message: t.message, reply: (t.reply || "").substring(0, 500) })),
+      error,
+    });
+
+    // Update scenario last_run
+    await db.collection(REGRESSION_SCENARIOS_COLL).updateOne(
+      { _id: s._id },
+      { $set: { last_run: { status, timestamp: new Date(), violations_count: violations.length } } }
+    );
+  }
+
+  const passRate = scenarios.length > 0 ? Math.round((pass / scenarios.length) * 100) : 0;
+
+  // Save run
+  const runDoc = {
+    triggered_by: "dashboard",
+    mode,
+    filter: { bug_ids, severity, category },
+    scenarios_run: scenarios.length,
+    pass, fail, error: errorCnt,
+    pass_rate: passRate,
+    results,
+    created_at: new Date(),
+  };
+  const runResult = await db.collection(REGRESSION_RUNS_COLL).insertOne(runDoc);
+
+  res.json({
+    ok: true,
+    run_id: runResult.insertedId,
+    scenarios_run: scenarios.length,
+    pass, fail, error: errorCnt,
+    pass_rate: passRate,
+    results,
+  });
+});
+
+// GET /api/regression/runs — history
+app.get("/api/regression/runs", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ runs: [] });
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+  const runs = await db
+    .collection(REGRESSION_RUNS_COLL)
+    .find({}, { projection: { "results.turns": 0 } })
+    .sort({ created_at: -1 })
+    .limit(limit)
+    .toArray();
+  res.json({ runs });
+});
+
+// GET /api/regression/runs/:runId — detail
+app.get("/api/regression/runs/:runId", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  try {
+    const { ObjectId } = require("mongodb");
+    const run = await db.collection(REGRESSION_RUNS_COLL).findOne({ _id: new ObjectId(req.params.runId) });
+    if (!run) return res.status(404).json({ error: "Not found" });
+    res.json(run);
+  } catch (e) {
+    res.status(400).json({ error: "invalid runId" });
+  }
+});
+
+// GET /api/regression/stats — dashboard cards
+app.get("/api/regression/stats", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.json({ total: 0, critical: 0, last_run: null, pass_rate_7d: 0 });
+  try {
+    const total = await db.collection(REGRESSION_SCENARIOS_COLL).countDocuments({ active: { $ne: false } });
+    const critical = await db
+      .collection(REGRESSION_SCENARIOS_COLL)
+      .countDocuments({ active: { $ne: false }, severity: "critical" });
+    const high = await db
+      .collection(REGRESSION_SCENARIOS_COLL)
+      .countDocuments({ active: { $ne: false }, severity: "high" });
+    const lastRun = await db.collection(REGRESSION_RUNS_COLL).findOne({}, { sort: { created_at: -1 } });
+
+    // 7d pass rate from runs
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600000);
+    const recentRuns = await db
+      .collection(REGRESSION_RUNS_COLL)
+      .find({ created_at: { $gte: sevenDaysAgo } })
+      .toArray();
+    const totalScenariosRun = recentRuns.reduce((a, r) => a + (r.scenarios_run || 0), 0);
+    const totalPass = recentRuns.reduce((a, r) => a + (r.pass || 0), 0);
+    const passRate7d = totalScenariosRun > 0 ? Math.round((totalPass / totalScenariosRun) * 100) : null;
+
+    // Category breakdown
+    const byCategory = await db
+      .collection(REGRESSION_SCENARIOS_COLL)
+      .aggregate([
+        { $match: { active: { $ne: false } } },
+        { $group: { _id: "$category", count: { $sum: 1 } } },
+      ])
+      .toArray();
+
+    res.json({
+      total,
+      critical,
+      high,
+      last_run: lastRun
+        ? {
+            _id: lastRun._id,
+            triggered_by: lastRun.triggered_by,
+            pass: lastRun.pass,
+            fail: lastRun.fail,
+            error: lastRun.error,
+            pass_rate: lastRun.pass_rate,
+            created_at: lastRun.created_at,
+          }
+        : null,
+      pass_rate_7d: passRate7d,
+      runs_7d: recentRuns.length,
+      by_category: byCategory,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/regression/auto-mine — Phase 4: auto-mine from conversations + training_logs
+app.post("/api/regression/auto-mine", requireAuth, express.json(), async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  try {
+    const days = parseInt(req.body.days) || 30;
+    const since = new Date(Date.now() - days * 24 * 3600000);
+
+    // Pull fail patterns from training_logs (verdict=fail)
+    const fails = await db
+      .collection("training_logs")
+      .find({ verdict: "fail", timestamp: { $gte: since } })
+      .sort({ timestamp: -1 })
+      .limit(30)
+      .toArray();
+
+    // Pull handoff-triggered conversations
+    const handoffs = await db
+      .collection("messages")
+      .find({
+        createdAt: { $gte: since },
+        text: { $regex: /handoff|โอนหา|ขอคน|แอดมินมนุษย์|พนักงาน/i },
+      })
+      .limit(20)
+      .toArray();
+
+    // Ask Gemini to extract draft scenarios
+    const GEMINI_KEY = getDynamicKeySync("GOOGLE_API_KEY");
+    if (!GEMINI_KEY) return res.status(500).json({ error: "GOOGLE_API_KEY not set" });
+
+    const failsSample = fails.slice(0, 10).map((f, i) => `${i + 1}. Q: ${f.message}\n   A(wrong): ${(f.reply || "").substring(0, 200)}\n   correct: ${f.correct_answer || "-"}`).join("\n\n");
+    const prompt = `คุณคือ QA engineer ของ DINOCO Chatbot
+วิเคราะห์ failures ต่อไปนี้และสกัด "regression scenarios" ที่ควรเพิ่ม (draft)
+
+=== Training Failures (last ${days}d) ===
+${failsSample || "(none)"}
+
+สร้าง JSON array ของ draft scenarios สูงสุด 5 ตัว:
+[
+  {
+    "bug_id": "REG-AUTO-001",
+    "title": "สั้นๆ",
+    "category": "product_knowledge|tone|flow|intent|anti_hallucination|tool_calling",
+    "severity": "critical|high|medium",
+    "bug_context": "สรุป pattern ที่พบ",
+    "turns": [{"role":"user","message":"..."}],
+    "assertions": {
+      "forbidden_patterns": [{"pattern":"...","reason":"..."}],
+      "expect_behavior": "..."
+    }
+  }
+]
+
+ตอบ JSON อย่างเดียว ไม่ต้อง markdown code block`;
+
+    const gRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 3000 },
+        }),
+        signal: AbortSignal.timeout(60000),
+      }
+    );
+    const gData = await gRes.json();
+    const text = gData.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+    const m = text.match(/\[[\s\S]*\]/);
+    const suggestions = m ? JSON.parse(m[0]) : [];
+
+    res.json({
+      ok: true,
+      source_count: { fails: fails.length, handoffs: handoffs.length },
+      suggestions,
+      note: "Review suggestions before inserting — they are NOT auto-saved",
+    });
+  } catch (e) {
+    console.error("[Regression/AutoMine] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/regression/cleanup — purge test messages with sourceId prefix "reg_" older than 1h
+app.post("/api/regression/cleanup", requireAuth, async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB unavailable" });
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  const r1 = await db.collection("messages").deleteMany({
+    sourceId: { $regex: "^reg_" },
+    createdAt: { $lt: oneHourAgo },
+  });
+  const r2 = await db.collection("ai_memory").deleteMany({
+    sourceId: { $regex: "^reg_" },
+    updatedAt: { $lt: oneHourAgo },
+  });
+  res.json({ ok: true, messages_deleted: r1.deletedCount, memory_deleted: r2.deletedCount });
+});
+
 // === Memory / Skills / Audit ===
 
 // ★ V.1.5: Clear all memory + history for a sourceId (called by Dashboard "ล้างความจำ")
@@ -1993,7 +2435,16 @@ app.post("/api/test-ai", requireAuth, express.json(), async (req, res) => {
   const testSourceId = sourceId || "test-" + Date.now();
   try {
     const reply = await callDinocoAI(DEFAULT_PROMPT, cleanForAI(message), testSourceId);
-    res.json({ reply, sourceId: testSourceId });
+    // ★ V.1.1 (regression): expose tools_called for test harnesses
+    const toolsCalled = [];
+    const lastTools = aiChat._lastToolResults?.get(testSourceId);
+    if (lastTools) {
+      if (Array.isArray(lastTools)) lastTools.forEach(t => toolsCalled.push(t));
+      else toolsCalled.push(lastTools);
+      // keep in map for reg runner reads — but delete after short delay
+      // we don't delete here because reg runner may use /api/test-ai + inspect later
+    }
+    res.json({ reply, sourceId: testSourceId, tools_called: toolsCalled });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2419,6 +2870,12 @@ async function ensureIndexes() {
     await database.collection("message_templates").createIndex({ templateId: 1 }, { unique: true });
     await database.collection("training_logs").createIndex({ timestamp: -1 });
     await database.collection("training_logs").createIndex({ verdict: 1, timestamp: -1 });
+    // Regression Guard (V.1.0)
+    await database.collection("regression_scenarios").createIndex({ bug_id: 1 }, { unique: true });
+    await database.collection("regression_scenarios").createIndex({ active: 1, severity: 1 });
+    await database.collection("regression_scenarios").createIndex({ category: 1, severity: 1 });
+    await database.collection("regression_runs").createIndex({ created_at: -1 });
+    await database.collection("regression_runs").createIndex({ triggered_by: 1, created_at: -1 });
     console.log("[Index] All indexes ready");
   } catch (e) { if (!e.message?.includes("already exists")) console.error("[Index] Error:", e.message); }
 }
@@ -2467,6 +2924,97 @@ getDB().then(async () => {
     checkLeadNoContact().catch(() => {});
     checkClaimAging().catch(() => {});
   }, 4 * 60 * 60 * 1000);
+
+  // ═══ Regression Guard Crons (V.1.0 — Phase 4) ═══
+  // Nightly 03:00: update pass_rate_7d + drift check
+  // Nightly 03:30: cleanup regression sourceIds older than 1h
+  // Hourly: lightweight cleanup
+  setInterval(async () => {
+    const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Bangkok" }));
+    const h = now.getHours(), m = now.getMinutes();
+    try {
+      const db = await getDB();
+      if (!db) return;
+
+      // Hourly cleanup of old regression test sessions
+      if (m === 5) {
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        await db.collection("messages").deleteMany({
+          sourceId: { $regex: "^reg_" },
+          createdAt: { $lt: oneHourAgo },
+        }).catch(() => {});
+      }
+
+      // Nightly 03:00 — update pass_rate_7d for all scenarios
+      if (h === 3 && m === 0) {
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600000);
+        const scenarios = await db.collection(REGRESSION_SCENARIOS_COLL).find({ active: { $ne: false } }).toArray();
+        for (const s of scenarios) {
+          const runs = await db
+            .collection(REGRESSION_RUNS_COLL)
+            .find({
+              created_at: { $gte: sevenDaysAgo },
+              "results.bug_id": s.bug_id,
+            })
+            .toArray();
+          let pass = 0, total = 0;
+          for (const r of runs) {
+            const hit = (r.results || []).find(x => x.bug_id === s.bug_id);
+            if (hit) {
+              total++;
+              if (hit.status === "pass") pass++;
+            }
+          }
+          const rate = total > 0 ? pass / total : null;
+          await db.collection(REGRESSION_SCENARIOS_COLL).updateOne(
+            { _id: s._id },
+            { $set: { pass_rate_7d: rate, pass_rate_7d_updated_at: new Date() } }
+          );
+          // Drift alert: rate dropped below 0.9
+          if (rate !== null && rate < 0.9 && total >= 3) {
+            try {
+              const { sendTelegramAlert } = require("./modules/telegram-alert");
+              await sendTelegramAlert("regression_drift", {
+                bug_id: s.bug_id,
+                title: s.title,
+                severity: s.severity,
+                pass_rate: Math.round(rate * 100),
+                total_runs: total,
+              }).catch(() => {});
+            } catch {}
+          }
+        }
+        console.log(`[Regression Cron] Updated pass_rate_7d for ${scenarios.length} scenarios`);
+      }
+
+      // Nightly 03:30 — cleanup stale sessions
+      if (h === 3 && m === 30) {
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        const r1 = await db.collection("messages").deleteMany({
+          sourceId: { $regex: "^reg_" },
+          createdAt: { $lt: oneHourAgo },
+        });
+        const r2 = await db.collection("ai_memory").deleteMany({
+          sourceId: { $regex: "^reg_" },
+          updatedAt: { $lt: oneHourAgo },
+        });
+        console.log(`[Regression Cron] Cleanup: ${r1.deletedCount} messages, ${r2.deletedCount} memory`);
+      }
+
+      // Weekly Sunday 04:00 — archive inactive scenarios older than 90 days
+      if (now.getDay() === 0 && h === 4 && m === 0) {
+        const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 3600000);
+        const archived = await db.collection(REGRESSION_SCENARIOS_COLL).updateMany(
+          { active: false, updated_at: { $lt: ninetyDaysAgo } },
+          { $set: { archived: true, archived_at: new Date() } }
+        );
+        console.log(`[Regression Cron] Archived ${archived.modifiedCount} old inactive scenarios`);
+      }
+    } catch (e) {
+      console.error("[Regression Cron] Error:", e.message);
+    }
+  }, 60 * 1000); // check every minute
+
   // Qdrant init
   if (QDRANT_URL) { qdrantRequest("GET", `/collections/${QDRANT_COLLECTION}`).catch(() => { qdrantRequest("PUT", `/collections/${QDRANT_COLLECTION}`, { vectors: { size: 768, distance: "Cosine" } }).catch(() => {}); }); }
   app.listen(PORT, () => {
