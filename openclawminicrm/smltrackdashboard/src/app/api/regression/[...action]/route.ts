@@ -1,15 +1,27 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getAuthUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 const agentUrl = () => process.env.AGENT_URL || "http://dinoco-agent:3000";
 
 // Proxy all /api/regression/* requests to Agent
+// SEC-C1: session check — ต้อง login ก่อนถึงจะเข้า API ได้
+// (เดิม proxy แปะ API_SECRET_KEY ให้ทุก request → ใครก็ยิงได้)
 async function proxyToAgent(
   request: NextRequest,
   method: string,
   action: string[]
 ) {
+  // ★ Session check (SEC-C1)
+  const authUser = await getAuthUser();
+  if (!authUser?.email) {
+    return NextResponse.json(
+      { ok: false, error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
   const path = action.join("/");
   const url = `${agentUrl()}/api/regression/${path}`;
 

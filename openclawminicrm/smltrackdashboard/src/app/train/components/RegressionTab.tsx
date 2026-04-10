@@ -98,6 +98,17 @@ function fmtDate(d?: string) {
   });
 }
 
+// M5: unified pass rate formatter
+// รองรับทั้ง ratio (0-1) และ percent (0-100) เพราะ backend return ไม่ consistent:
+//   - scenario-level pass_rate_7d = ratio (0-1)
+//   - stats-level pass_rate_7d = percent (0-100, integer)
+// ถ้า value > 1 ถือว่าเป็น percent แล้ว ไม่ต้อง × 100
+function formatPct(val: number | null | undefined): string {
+  if (val == null || isNaN(val)) return "—";
+  const pct = val > 1 ? val : val * 100;
+  return `${Math.round(pct)}%`;
+}
+
 export default function RegressionTab() {
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
@@ -116,19 +127,35 @@ export default function RegressionTab() {
   const [selected, setSelected] = useState<Scenario | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [editTarget, setEditTarget] = useState<Scenario | null>(null);
+  // H7: error banner — แสดงเมื่อ auth expired หรือ agent down
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
+    setErrorMsg(null);
     try {
       const [sRes, stRes] = await Promise.all([
         fetch("/dashboard/api/regression/scenarios"),
         fetch("/dashboard/api/regression/stats"),
       ]);
-      const sData = await sRes.json();
-      const stData = await stRes.json();
+      if (sRes.status === 401 || stRes.status === 401) {
+        setErrorMsg("Session หมดอายุ กรุณา login ใหม่");
+        setLoading(false);
+        return;
+      }
+      if (!sRes.ok) {
+        setErrorMsg(`โหลด scenarios ไม่สำเร็จ (HTTP ${sRes.status})`);
+      } else if (!stRes.ok) {
+        setErrorMsg(`โหลด stats ไม่สำเร็จ (HTTP ${stRes.status})`);
+      }
+      const sData = await sRes.json().catch(() => ({}));
+      const stData = await stRes.json().catch(() => ({}));
       setScenarios(sData.scenarios || []);
-      setStats(stData);
-    } catch {}
+      setStats(stData || null);
+    } catch (err) {
+      console.error("[RegressionTab] load error:", err);
+      setErrorMsg("ไม่สามารถเชื่อมต่อ server ได้ — ตรวจสอบการเชื่อมต่อ");
+    }
     setLoading(false);
   }, []);
 
@@ -155,6 +182,7 @@ export default function RegressionTab() {
     async (severityFilter?: string[]) => {
       setRunning(true);
       setRunResult(null);
+      setErrorMsg(null);
       try {
         const res = await fetch("/dashboard/api/regression/run", {
           method: "POST",
@@ -164,18 +192,29 @@ export default function RegressionTab() {
             mode: "report",
           }),
         });
-        const data = await res.json();
-        if (data.ok) {
-          setRunResult({
-            scenarios_run: data.scenarios_run,
-            pass: data.pass,
-            fail: data.fail,
-            error: data.error,
-            pass_rate: data.pass_rate,
-          });
-          await load();
+        if (res.status === 401) {
+          setErrorMsg("Session หมดอายุ กรุณา login ใหม่");
+          setRunning(false);
+          return;
         }
-      } catch {}
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          setErrorMsg(data.error || `รัน scenarios ไม่สำเร็จ (HTTP ${res.status})`);
+          setRunning(false);
+          return;
+        }
+        setRunResult({
+          scenarios_run: data.scenarios_run,
+          pass: data.pass,
+          fail: data.fail,
+          error: data.error,
+          pass_rate: data.pass_rate,
+        });
+        await load();
+      } catch (err) {
+        console.error("[RegressionTab] run error:", err);
+        setErrorMsg("ไม่สามารถเชื่อมต่อ server ได้");
+      }
       setRunning(false);
     },
     [load]
@@ -195,17 +234,49 @@ export default function RegressionTab() {
   const handleDelete = useCallback(
     async (bugId: string) => {
       if (!confirm(`ลบ scenario ${bugId}? (soft delete — active=false)`)) return;
-      await fetch(`/dashboard/api/regression/scenarios/${bugId}`, {
-        method: "DELETE",
-      });
-      await load();
-      setSelected(null);
+      setErrorMsg(null);
+      try {
+        const res = await fetch(`/dashboard/api/regression/scenarios/${bugId}`, {
+          method: "DELETE",
+        });
+        if (res.status === 401) {
+          setErrorMsg("Session หมดอายุ กรุณา login ใหม่");
+          return;
+        }
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setErrorMsg(data.error || `ลบไม่สำเร็จ (HTTP ${res.status})`);
+          return;
+        }
+        await load();
+        setSelected(null);
+      } catch (err) {
+        console.error("[RegressionTab] delete error:", err);
+        setErrorMsg("ไม่สามารถเชื่อมต่อ server ได้");
+      }
     },
     [load]
   );
 
   return (
     <div className="space-y-4">
+      {/* H7: Error banner — auth expired / agent down */}
+      {errorMsg && (
+        <div className="rounded-xl p-3 flex items-center justify-between gap-3 bg-red-900/30 border border-red-700/60 text-red-300">
+          <div className="text-sm flex items-center gap-2">
+            <span>⚠️</span>
+            <span>{errorMsg}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setErrorMsg(null)}
+            className="text-xs px-2 py-1 rounded bg-red-900/40 hover:bg-red-900/60"
+          >
+            ปิด
+          </button>
+        </div>
+      )}
+
       {/* Stats cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatCard
@@ -222,10 +293,11 @@ export default function RegressionTab() {
         />
         <StatCard
           label="Pass rate 7d"
-          value={stats?.pass_rate_7d !== null ? `${stats?.pass_rate_7d}%` : "—"}
+          value={formatPct(stats?.pass_rate_7d)}
           sub={`${stats?.runs_7d || 0} runs`}
           color={
-            stats?.pass_rate_7d !== null && (stats?.pass_rate_7d || 0) >= 90
+            stats?.pass_rate_7d != null &&
+            (stats.pass_rate_7d > 1 ? stats.pass_rate_7d : stats.pass_rate_7d * 100) >= 90
               ? "text-green-400"
               : "text-yellow-400"
           }
@@ -426,9 +498,7 @@ export default function RegressionTab() {
                       )}
                     </td>
                     <td className="p-3 text-xs" style={{ color: "var(--text-muted)" }}>
-                      {s.pass_rate_7d !== null && s.pass_rate_7d !== undefined
-                        ? `${Math.round((s.pass_rate_7d || 0) * 100)}%`
-                        : "—"}
+                      {formatPct(s.pass_rate_7d)}
                     </td>
                     <td className="p-3">
                       <button
@@ -463,14 +533,25 @@ export default function RegressionTab() {
           onDelete={() => handleDelete(selected.bug_id)}
           onRerun={async () => {
             setRunning(true);
+            setErrorMsg(null);
             try {
-              await fetch("/dashboard/api/regression/run", {
+              const res = await fetch("/dashboard/api/regression/run", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ bug_ids: [selected.bug_id] }),
               });
-              await load();
-            } catch {}
+              if (res.status === 401) {
+                setErrorMsg("Session หมดอายุ กรุณา login ใหม่");
+              } else if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                setErrorMsg(data.error || `รันใหม่ไม่สำเร็จ (HTTP ${res.status})`);
+              } else {
+                await load();
+              }
+            } catch (err) {
+              console.error("[RegressionTab] rerun error:", err);
+              setErrorMsg("ไม่สามารถเชื่อมต่อ server ได้");
+            }
             setRunning(false);
           }}
         />

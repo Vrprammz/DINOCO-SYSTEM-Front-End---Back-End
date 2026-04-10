@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { Scenario } from "./RegressionTab";
 
 interface Props {
@@ -11,11 +11,86 @@ interface Props {
 
 type Mode = "quick" | "advanced";
 
+// H6: validate payload ก่อนส่ง — ป้องกัน invalid regex / oversized input
+function validateScenario(
+  data: Record<string, unknown>
+): Record<string, string> {
+  const errs: Record<string, string> = {};
+
+  // bug_id format
+  const bugId = String((data.bug_id as string) || "");
+  if (!bugId || !/^REG-\d{3,4}$/.test(bugId)) {
+    errs.bug_id = "รูปแบบต้องเป็น REG-XXX หรือ REG-XXXX";
+  }
+
+  // title
+  const title = String((data.title as string) || "");
+  if (!title) {
+    errs.title = "กรอก title";
+  } else if (title.length > 200) {
+    errs.title = "Title ต้องไม่เกิน 200 ตัวอักษร";
+  }
+
+  // turns
+  const turns = Array.isArray(data.turns)
+    ? (data.turns as Array<{ message?: unknown }>)
+    : [];
+  if (turns.length === 0) {
+    errs.turns = "ต้องมีอย่างน้อย 1 turn";
+  } else if (turns.length > 10) {
+    errs.turns = "ไม่เกิน 10 turns";
+  } else {
+    for (const t of turns) {
+      const msg = String((t?.message as string) || "");
+      if (!msg) {
+        errs.turns = "turn ว่างเปล่าไม่ได้";
+        break;
+      }
+      if (msg.length > 2000) {
+        errs.turns = "message แต่ละ turn ต้องไม่เกิน 2000 ตัวอักษร";
+        break;
+      }
+    }
+  }
+
+  // regex patterns
+  const assertions =
+    (data.assertions as {
+      forbidden_patterns?: Array<{ pattern?: unknown; flags?: unknown }>;
+      required_patterns?: Array<{ pattern?: unknown; flags?: unknown }>;
+    }) || {};
+  const allPatterns = [
+    ...(Array.isArray(assertions.forbidden_patterns)
+      ? assertions.forbidden_patterns
+      : []),
+    ...(Array.isArray(assertions.required_patterns)
+      ? assertions.required_patterns
+      : []),
+  ];
+  for (const pat of allPatterns) {
+    const p = String((pat?.pattern as string) || "");
+    if (!p) continue;
+    if (p.length > 200) {
+      errs.patterns = "regex pattern ต้องไม่เกิน 200 ตัวอักษร";
+      break;
+    }
+    try {
+      new RegExp(p, (pat?.flags as string) || "i");
+    } catch {
+      errs.patterns = `regex ไม่ถูกต้อง: ${p.substring(0, 30)}`;
+      break;
+    }
+  }
+
+  return errs;
+}
+
 export default function ScenarioForm({ initial, onClose, onSaved }: Props) {
   const isEdit = !!initial;
   const [mode, setMode] = useState<Mode>(isEdit ? "advanced" : "quick");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   // Shared fields
   const [bugId, setBugId] = useState(initial?.bug_id || "");
@@ -67,9 +142,57 @@ export default function ScenarioForm({ initial, onClose, onSaved }: Props) {
     )
   );
 
+  // H6: live validation สำหรับ Quick mode (disable submit button เมื่อมี error)
+  const quickModeBody = useMemo(() => {
+    if (mode !== "quick") return null;
+    return {
+      bug_id: bugId,
+      title,
+      category,
+      severity,
+      platform: "any",
+      bug_context: bugContext,
+      fix_commit: fixCommit,
+      active,
+      turns: [{ role: "user", message: quickMessage }],
+      assertions: {
+        forbidden_patterns: quickForbidden
+          ? [{ pattern: quickForbidden, flags: "i", reason: "user-defined" }]
+          : [],
+        required_patterns: quickRequired
+          ? [{ pattern: quickRequired, flags: "i", reason: "user-defined" }]
+          : [],
+        expect_behavior: quickExpect || undefined,
+      },
+    };
+  }, [
+    mode,
+    bugId,
+    title,
+    category,
+    severity,
+    bugContext,
+    fixCommit,
+    active,
+    quickMessage,
+    quickForbidden,
+    quickRequired,
+    quickExpect,
+  ]);
+
+  const quickErrors = useMemo(
+    () =>
+      quickModeBody
+        ? validateScenario(quickModeBody as unknown as Record<string, unknown>)
+        : {},
+    [quickModeBody]
+  );
+  const hasQuickErrors = Object.keys(quickErrors).length > 0;
+
   const save = async () => {
     setSaving(true);
     setErr(null);
+    setFieldErrors({});
     try {
       let body: Record<string, unknown>;
       if (mode === "advanced") {
@@ -82,31 +205,16 @@ export default function ScenarioForm({ initial, onClose, onSaved }: Props) {
           return;
         }
       } else {
-        if (!bugId || !title || !quickMessage) {
-          setErr("bug_id, title, message required");
-          setSaving(false);
-          return;
-        }
-        body = {
-          bug_id: bugId,
-          title,
-          category,
-          severity,
-          platform: "any",
-          bug_context: bugContext,
-          fix_commit: fixCommit,
-          active,
-          turns: [{ role: "user", message: quickMessage }],
-          assertions: {
-            forbidden_patterns: quickForbidden
-              ? [{ pattern: quickForbidden, flags: "i", reason: "user-defined" }]
-              : [],
-            required_patterns: quickRequired
-              ? [{ pattern: quickRequired, flags: "i", reason: "user-defined" }]
-              : [],
-            expect_behavior: quickExpect || undefined,
-          },
-        };
+        body = quickModeBody as Record<string, unknown>;
+      }
+
+      // H6: validate ก่อนส่ง — regex / length / format
+      const errs = validateScenario(body as Record<string, unknown>);
+      if (Object.keys(errs).length > 0) {
+        setFieldErrors(errs);
+        setErr(Object.values(errs).join(" · "));
+        setSaving(false);
+        return;
       }
 
       const url = isEdit
@@ -118,7 +226,12 @@ export default function ScenarioForm({ initial, onClose, onSaved }: Props) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data = await res.json();
+      if (res.status === 401) {
+        setErr("Session หมดอายุ กรุณา login ใหม่");
+        setSaving(false);
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setErr(data.error || `HTTP ${res.status}`);
         setSaving(false);
@@ -364,6 +477,28 @@ export default function ScenarioForm({ initial, onClose, onSaved }: Props) {
             </Field>
           )}
 
+          {/* H6: live validation hints สำหรับ Quick mode */}
+          {mode === "quick" && hasQuickErrors && !err && (
+            <div className="p-3 rounded-lg bg-yellow-900/30 border border-yellow-700/60 text-yellow-300 text-xs space-y-1">
+              {Object.entries(quickErrors).map(([key, msg]) => (
+                <div key={key}>
+                  <b>{key}:</b> {msg}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* field-level errors (หลังกด save) */}
+          {Object.keys(fieldErrors).length > 0 && !err && (
+            <div className="p-3 rounded-lg bg-red-900/40 border border-red-700 text-red-300 text-xs space-y-1">
+              {Object.entries(fieldErrors).map(([key, msg]) => (
+                <div key={key}>
+                  <b>{key}:</b> {msg}
+                </div>
+              ))}
+            </div>
+          )}
+
           {err && (
             <div className="p-3 rounded-lg bg-red-900/40 border border-red-700 text-red-300 text-sm">
               {err}
@@ -384,8 +519,13 @@ export default function ScenarioForm({ initial, onClose, onSaved }: Props) {
           </button>
           <button
             onClick={save}
-            disabled={saving}
-            className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium disabled:opacity-50"
+            disabled={saving || (mode === "quick" && hasQuickErrors)}
+            className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+            title={
+              mode === "quick" && hasQuickErrors
+                ? Object.values(quickErrors).join(" · ")
+                : undefined
+            }
           >
             {saving ? "กำลังบันทึก..." : isEdit ? "บันทึกการแก้ไข" : "สร้าง"}
           </button>
