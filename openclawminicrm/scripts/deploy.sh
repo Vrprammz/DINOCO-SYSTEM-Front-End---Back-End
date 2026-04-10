@@ -19,18 +19,43 @@ fi
 echo "=== OpenClaw Mini CRM Deploy to ${REMOTE_USER}@${REMOTE_HOST} ==="
 
 # Step 0: Regression Guard (local gate — skippable with SKIP_REGRESSION=1)
+#
+# H4 fix: fail-closed when agent is unreachable. Previously the gate
+# silently skipped whenever the agent container wasn't running locally,
+# which meant a bad dev environment = no gate = regressions shipped.
+#
+# We now bring the agent up ourselves (if not running) and abort deploy
+# if it still can't be reached. Override via SKIP_REGRESSION=1.
 if [ "${SKIP_REGRESSION}" != "1" ]; then
   echo "[0/4] Running regression guard (critical scenarios)..."
-  AGENT_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'dinoco-agent|smltrack-agent' | head -1 || true)
-  if [ -n "$AGENT_CONTAINER" ]; then
-    if ! docker exec "$AGENT_CONTAINER" node /app/scripts/regression.js --mode=gate --severity=critical --triggered-by=deploy; then
-      echo "ERROR: Regression guard failed — deploy blocked"
-      echo "Fix failing scenarios or set SKIP_REGRESSION=1 to override (not recommended)"
+
+  AGENT_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'smltrack-agent|dinoco-agent|openclaw.*agent' | head -1 || true)
+
+  if [ -z "$AGENT_CONTAINER" ]; then
+    echo "[0/4] Agent container not running — attempting to start..."
+    docker compose -f "$COMPOSE_FILE" up -d mongodb agent || {
+      echo "ERROR: failed to start agent container for regression gate"
+      echo "Fix docker/compose issue or set SKIP_REGRESSION=1 to override (NOT recommended)"
       exit 1
-    fi
-  else
-    echo "WARNING: Agent container not running locally — skipping pre-deploy gate"
+    }
+    # Give container time to boot
+    sleep 5
+    AGENT_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'smltrack-agent|dinoco-agent|openclaw.*agent' | head -1 || true)
   fi
+
+  if [ -z "$AGENT_CONTAINER" ]; then
+    echo "ERROR: agent container still not running after startup attempt"
+    echo "Regression gate cannot run — deploy blocked (fail-closed)"
+    echo "Emergency override: SKIP_REGRESSION=1 ./scripts/deploy.sh"
+    exit 1
+  fi
+
+  if ! docker exec "$AGENT_CONTAINER" node /app/scripts/regression.js --mode=gate --severity=critical --triggered-by=deploy; then
+    echo "ERROR: Regression guard failed — deploy blocked"
+    echo "Fix failing scenarios or set SKIP_REGRESSION=1 to override (NOT recommended)"
+    exit 1
+  fi
+  echo "[0/4] Regression gate PASSED"
 fi
 
 # Step 1: Sync files (exclude secrets + runtime)

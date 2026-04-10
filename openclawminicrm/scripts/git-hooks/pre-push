@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════
-# DINOCO Regression Guard — pre-push git hook V.1.0
+# DINOCO Regression Guard — pre-push git hook V.2.0
 #
 # Blocks push if critical regression scenarios fail.
 # Only runs if chatbot-related files changed.
 #
+# V.2.0 fixes:
+#   C4: Read refs from stdin per git hook spec (correct new branch /
+#       force push / detached HEAD handling).
+#   H4: Fail-closed when agent container is not running (override via
+#       REGRESSION_REQUIRE_AGENT=0).
+#   Q:  Auto-detect agent container name.
+#
 # To override (emergency only): git push --no-verify
+# To skip when agent is down:   REGRESSION_REQUIRE_AGENT=0 git push
 # ═══════════════════════════════════════════════════════════
 set -e
 
@@ -15,33 +23,58 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# Paths that matter to chatbot regression
-WATCH_PATHS=(
-  "openclawminicrm/proxy/modules/ai-chat.js"
-  "openclawminicrm/proxy/modules/shared.js"
-  "openclawminicrm/proxy/modules/dinoco-tools.js"
-  "openclawminicrm/proxy/modules/claim-flow.js"
-  "openclawminicrm/proxy/modules/lead-pipeline.js"
-  "openclawminicrm/proxy/modules/dinoco-cache.js"
-  "openclawminicrm/docs/chatbot-rules.md"
-)
+# Paths (regex) that matter to chatbot regression
+WATCH_REGEX='openclawminicrm/(proxy/modules/(ai-chat|shared|dinoco-tools|claim-flow|lead-pipeline|dinoco-cache)\.js|docs/chatbot-rules\.md|scripts/(regression|seed-regression)\.js)'
 
-# Check if any watched files changed in the push
-# Use @{upstream} if available, else HEAD~10
-UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
-if [ -n "$UPSTREAM" ]; then
-  CHANGED=$(git diff --name-only "$UPSTREAM"..HEAD 2>/dev/null || git diff --name-only HEAD~10..HEAD 2>/dev/null || true)
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+# ─────────────────────────────────────────────────────────────
+# C4: Read stdin refs per git hook spec:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# If stdin is a TTY (manual invocation) fall back to upstream diff.
+# ─────────────────────────────────────────────────────────────
+CHANGED=""
+
+if [ -t 0 ]; then
+  # No stdin (manual run) — fall back to upstream..HEAD
+  UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+  if [ -n "$UPSTREAM" ]; then
+    CHANGED=$(git diff --name-only "$UPSTREAM"..HEAD 2>/dev/null || true)
+  else
+    CHANGED=$(git diff --name-only HEAD~10..HEAD 2>/dev/null || true)
+  fi
 else
-  CHANGED=$(git diff --name-only HEAD~10..HEAD 2>/dev/null || true)
+  # Real git hook invocation — read refs from stdin
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    # Skip deletion pushes
+    if [ "$local_sha" = "$ZERO_SHA" ]; then
+      continue
+    fi
+
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+      # New branch being pushed — diff against any existing remote head,
+      # else all commits reachable from local_sha.
+      REMOTE_HEAD=$(git rev-parse --verify --quiet refs/remotes/origin/HEAD 2>/dev/null || echo "")
+      if [ -n "$REMOTE_HEAD" ]; then
+        RANGE_CHANGED=$(git diff --name-only "$REMOTE_HEAD".."$local_sha" 2>/dev/null || true)
+      else
+        RANGE_CHANGED=$(git diff --name-only "$(git rev-list --max-parents=0 "$local_sha" | head -1)".."$local_sha" 2>/dev/null || true)
+      fi
+    else
+      # Normal push — diff range remote_sha..local_sha
+      RANGE_CHANGED=$(git diff --name-only "$remote_sha".."$local_sha" 2>/dev/null || true)
+    fi
+
+    CHANGED="${CHANGED}"$'\n'"${RANGE_CHANGED}"
+  done
 fi
 
-SHOULD_RUN=0
-for path in "${WATCH_PATHS[@]}"; do
-  if echo "$CHANGED" | grep -qF "$path"; then
-    SHOULD_RUN=1
-    break
-  fi
-done
+# Decide whether gate should run
+if echo "$CHANGED" | grep -qE "$WATCH_REGEX"; then
+  SHOULD_RUN=1
+else
+  SHOULD_RUN=0
+fi
 
 if [ "$SHOULD_RUN" -eq 0 ]; then
   echo -e "${GREEN}[regression-guard]${NC} No chatbot files changed — skipping gate."
@@ -50,18 +83,24 @@ fi
 
 echo -e "${YELLOW}[regression-guard]${NC} Chatbot files changed — running critical scenarios..."
 
-# Check agent container is running
-if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'dinoco-agent|smltrack-agent|agent'; then
-  echo -e "${YELLOW}[regression-guard] WARNING:${NC} Agent container not running locally — skipping gate."
-  echo -e "${YELLOW}[regression-guard]${NC} Start with: docker compose up -d agent"
-  echo -e "${YELLOW}[regression-guard]${NC} Continuing push without gate (agent unavailable)"
-  exit 0
-fi
+# ─────────────────────────────────────────────────────────────
+# Q: Auto-detect agent container name
+# ─────────────────────────────────────────────────────────────
+AGENT_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'smltrack-agent|dinoco-agent|openclaw.*agent' | head -1 || true)
 
-# Detect agent container name
-AGENT_CONTAINER=$(docker ps --format '{{.Names}}' | grep -E 'dinoco-agent|smltrack-agent' | head -1)
+# ─────────────────────────────────────────────────────────────
+# H4: Fail-closed when agent container is not running
+# ─────────────────────────────────────────────────────────────
 if [ -z "$AGENT_CONTAINER" ]; then
-  AGENT_CONTAINER="agent"
+  if [ "$REGRESSION_REQUIRE_AGENT" = "0" ]; then
+    echo -e "${YELLOW}[regression-guard] WARNING:${NC} Agent container not running — skipping (REGRESSION_REQUIRE_AGENT=0)"
+    exit 0
+  fi
+  echo -e "${RED}[regression-guard] ERROR:${NC} Agent container not running — gate cannot run."
+  echo "  Start it:          docker compose -f openclawminicrm/docker-compose.prod.yml up -d agent"
+  echo "  Override gate:     REGRESSION_REQUIRE_AGENT=0 git push"
+  echo "  Emergency bypass:  git push --no-verify"
+  exit 1
 fi
 
 # Run regression gate inside the agent container
