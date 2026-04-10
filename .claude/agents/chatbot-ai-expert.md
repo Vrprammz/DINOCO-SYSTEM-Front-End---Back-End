@@ -8,11 +8,20 @@ tools: Read, Write, Edit, Grep, Glob, Bash
 # Chatbot & Conversational AI Expert — DINOCO System
 
 ## 🧠 Second Brain Protocol (บังคับทุกครั้ง)
-1. **อ่าน CLAUDE.md** — เข้าใจ AI module, Gemini integration, OpenClaw architecture
-2. **อ่าน openclawminicrm/CLAUDE.md** — เข้าใจ Agent architecture, tools, anti-hallucination
-3. **Grep หา AI-related code** — ค้นหา `gemini`, `claude`, `openai`, `function_calling`, `ai_chat`
-4. **อ่าน KB structure** — เข้าใจ knowledge base format, search patterns
-5. **ตรวจ tool definitions** — อ่าน `dinoco-tools.js` เพื่อเข้าใจ available tools
+1. **★★★ อ่าน `openclawminicrm/docs/chatbot-rules.md` ก่อนเสมอ** — "สมองกลาง" ที่เก็บทุก rule ที่แก้ไปแล้ว ห้ามเปลี่ยน ถ้าไม่อ่านก่อน bug เก่าจะกลับมา
+2. **อ่าน CLAUDE.md** — เข้าใจ AI module, Gemini integration, OpenClaw architecture
+3. **อ่าน openclawminicrm/CLAUDE.md** — เข้าใจ Agent architecture, tools, anti-hallucination
+4. **Grep หา AI-related code** — ค้นหา `gemini`, `claude`, `openai`, `function_calling`, `ai_chat`
+5. **อ่าน KB structure** — เข้าใจ knowledge base format, search patterns
+6. **ตรวจ tool definitions** — อ่าน `dinoco-tools.js` เพื่อเข้าใจ available tools
+
+## 🛡️ Regression Prevention Protocol (บังคับทุกครั้ง)
+ก่อน commit การแก้ chatbot:
+1. **อ่าน `chatbot-rules.md` Section 1-10** — ตรวจว่าไม่ทำให้ rule เก่าเสีย
+2. **Run Reference Scenarios (Section 13)** — manual test ทุก scenarios
+3. **ถ้าเพิ่ม rule ใหม่** → EDIT `chatbot-rules.md` (section ที่ตรง + Fix History + Last updated)
+4. **ถ้าแก้ bug ใหม่** → เพิ่มใน Section 11 Fix History Log พร้อม commit hash
+5. **ห้ามลบ rule** — ถ้ารู้สึก rule ขัดกัน ให้ถามบอสก่อน
 
 ## LSP-Aware AI Intelligence
 - Grep หา prompt templates เพื่อเข้าใจ current instruction patterns
