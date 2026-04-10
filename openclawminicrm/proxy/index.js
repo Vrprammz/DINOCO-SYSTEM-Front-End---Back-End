@@ -1487,6 +1487,55 @@ app.post("/api/claims/status-changed", requireAuth, express.json(), async (req, 
 app.get("/api/claims", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json({ claims: [] }); const filter = {}; if (req.query.status) filter.status = req.query.status; res.json({ claims: await db.collection("manual_claims").find(filter).sort({ updatedAt: -1 }).limit(50).toArray() }); });
 app.get("/api/claims/:id", requireAuth, async (req, res) => { const db = await getDB(); const { ObjectId } = require("mongodb"); const claim = await db.collection("manual_claims").findOne({ _id: new ObjectId(req.params.id) }); if (!claim) return res.status(404).json({ error: "Not found" }); res.json(claim); });
 
+// PATCH /api/claims/:id/status — update claim status + append history (V.1.0)
+// Body: { status: "case_a"|"case_b"|"rejected"|..., note?: string }
+const CLAIM_VALID_STATUSES = new Set([
+  // Service Center 11 statuses
+  "pending", "reviewing", "approved", "in_progress", "waiting_parts",
+  "repairing", "quality_check", "completed", "rejected", "cancelled", "closed",
+  // DINOCO Case A/B extras
+  "case_a", "case_b",
+  // Legacy manual_claims statuses
+  "photo_requested", "photo_rejected", "photo_received", "info_collecting",
+  "info_collected", "admin_reviewed", "waiting_return_shipment", "parts_shipping",
+  "closed_resolved", "closed_rejected", "customer_no_response",
+]);
+app.patch("/api/claims/:id/status", requireAuth, express.json(), async (req, res) => {
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ error: "DB not available" });
+    const { ObjectId } = require("mongodb");
+    const { status, note } = req.body || {};
+    if (!status) return res.status(400).json({ error: "status required" });
+    if (!CLAIM_VALID_STATUSES.has(status)) return res.status(400).json({ error: `Invalid status: ${status}` });
+    let objectId;
+    try { objectId = new ObjectId(req.params.id); } catch { return res.status(400).json({ error: "Invalid claim id" }); }
+    const claim = await db.collection("manual_claims").findOne({ _id: objectId });
+    if (!claim) return res.status(404).json({ error: "Claim not found" });
+    const now = new Date();
+    await db.collection("manual_claims").updateOne(
+      { _id: objectId },
+      {
+        $set: { status, updatedAt: now },
+        $push: {
+          status_history: {
+            from: claim.status,
+            to: status,
+            at: now,
+            by: "admin_dashboard",
+            note: note || null,
+          },
+        },
+      }
+    );
+    console.log(`[Claim] ${req.params.id}: ${claim.status} -> ${status}${note ? ` (${note})` : ""}`);
+    res.json({ ok: true, status });
+  } catch (e) {
+    console.error("[claim-status]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // === KB API ===
 app.get("/api/km", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection(KB_COLL).find({}, { projection: { embedding: 0 } }).sort({ updatedAt: -1 }).toArray()); }); // ★ V.1.4: เพิ่ม requireAuth + null check
 app.post("/api/km", requireAuth, express.json({ limit: "5mb" }), async (req, res) => {

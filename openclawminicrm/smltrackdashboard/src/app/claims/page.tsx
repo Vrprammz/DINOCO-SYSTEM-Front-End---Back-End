@@ -212,13 +212,30 @@ export default function ClaimsPage() {
                 <div className="space-y-2 pt-2 border-t border-[var(--border)]">
                   <div className="text-xs font-medium theme-text-secondary">ตัดสินใจ</div>
                   <div className="grid grid-cols-2 gap-2">
-                    <button className="px-3 py-2 rounded-lg bg-green-600 text-white text-sm hover:bg-green-700 transition-colors">
+                    <button
+                      type="button"
+                      onClick={() => updateClaimStatus(selectedClaim._id, "case_a")}
+                      className="px-3 py-2 rounded-lg bg-green-600 text-white text-sm hover:bg-green-700 transition-colors"
+                    >
                       ส่งกลับเปลี่ยน (Case A)
                     </button>
-                    <button className="px-3 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700 transition-colors">
+                    <button
+                      type="button"
+                      onClick={() => updateClaimStatus(selectedClaim._id, "case_b")}
+                      className="px-3 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700 transition-colors"
+                    >
                       ส่งอะไหล่ (Case B)
                     </button>
-                    <button className="px-3 py-2 rounded-lg bg-red-600 text-white text-sm hover:bg-red-700 transition-colors col-span-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const note = prompt("เหตุผลที่ปฏิเสธ:");
+                        if (note && note.trim()) {
+                          updateClaimStatus(selectedClaim._id, "rejected", note.trim());
+                        }
+                      }}
+                      className="px-3 py-2 rounded-lg bg-red-600 text-white text-sm hover:bg-red-700 transition-colors col-span-2"
+                    >
                       ปฏิเสธเคลม
                     </button>
                   </div>
