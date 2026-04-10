@@ -1945,24 +1945,106 @@ app.post("/api/train/fix-answer", requireAuth, express.json(), async (req, res) 
 });
 
 // ═══════════════════════════════════════════════════════════
-// Regression Guard API (V.1.0) — chatbot regression scenarios
+// Regression Guard API (V.1.1) — chatbot regression scenarios
+// Security hardening: SEC-C2 (ReDoS), SEC-C3 (prompt injection),
+//                     H1/H2/H3/H5, M1/M2, C2/C3/C5/L3
 // ═══════════════════════════════════════════════════════════
 const REGRESSION_SCENARIOS_COLL = "regression_scenarios";
 const REGRESSION_RUNS_COLL = "regression_runs";
 
+// === Security helpers ===
+const safeRegex = require("safe-regex2");
+
+// Escape user input before embedding in MongoDB $regex (M1 fix)
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Compile a user-supplied regex safely — reject ReDoS patterns (SEC-C2)
+function compilePatternSafe(pattern, flags) {
+  if (typeof pattern !== "string") throw new Error("pattern must be a string");
+  if (pattern.length === 0) throw new Error("pattern cannot be empty");
+  if (pattern.length > 200) throw new Error("pattern too long (max 200 chars)");
+  if (!safeRegex(pattern)) throw new Error("unsafe regex pattern (ReDoS risk)");
+  return new RegExp(pattern, flags || "i");
+}
+
+// Input validation + safe-regex enforcement for scenario body (H2 + SEC-C2)
+function validateScenarioInput(body) {
+  if (!body || typeof body !== "object") throw new Error("body must be an object");
+  if (!body.bug_id || !/^REG-[A-Z0-9]{1,10}-?\d{0,4}$|^REG-\d{3,4}$/.test(body.bug_id)) {
+    // accept REG-001, REG-AUTO-001 etc.
+    if (!/^REG-[A-Z0-9-]{3,20}$/.test(body.bug_id || "")) {
+      throw new Error("Invalid bug_id format (expected REG-XXX)");
+    }
+  }
+  if (!body.title || typeof body.title !== "string" || body.title.length > 200) {
+    throw new Error("title required, max 200 chars");
+  }
+  if (body.bug_context && (typeof body.bug_context !== "string" || body.bug_context.length > 2000)) {
+    throw new Error("bug_context max 2000 chars");
+  }
+  if (!Array.isArray(body.turns) || body.turns.length === 0 || body.turns.length > 10) {
+    throw new Error("turns: 1-10 items required");
+  }
+  for (const t of body.turns) {
+    if (!t || typeof t !== "object") throw new Error("each turn must be an object");
+    if (!t.message || typeof t.message !== "string" || t.message.length > 2000) {
+      throw new Error("turn.message: 1-2000 chars required");
+    }
+  }
+  const a = body.assertions || {};
+  const fp = Array.isArray(a.forbidden_patterns) ? a.forbidden_patterns : [];
+  const rp = Array.isArray(a.required_patterns) ? a.required_patterns : [];
+  if (fp.length > 20) throw new Error("forbidden_patterns max 20");
+  if (rp.length > 20) throw new Error("required_patterns max 20");
+  for (const p of [...fp, ...rp]) {
+    if (!p || typeof p !== "object" || !p.pattern) {
+      throw new Error("each pattern entry needs a 'pattern' field");
+    }
+    // Throws if unsafe — validated here, discarded compiled regex (for validation only)
+    compilePatternSafe(p.pattern, p.flags);
+  }
+  if (a.expect_behavior && (typeof a.expect_behavior !== "string" || a.expect_behavior.length > 2000)) {
+    throw new Error("expect_behavior max 2000 chars");
+  }
+  if (a.must_not_do) {
+    if (!Array.isArray(a.must_not_do) || a.must_not_do.length > 20) {
+      throw new Error("must_not_do: array, max 20 items");
+    }
+    for (const r of a.must_not_do) {
+      if (typeof r !== "string" || r.length > 500) {
+        throw new Error("must_not_do items: string, max 500 chars");
+      }
+    }
+  }
+  if (a.expected_tools && (!Array.isArray(a.expected_tools) || a.expected_tools.length > 10)) {
+    throw new Error("expected_tools: array, max 10");
+  }
+  if (a.forbidden_tools && (!Array.isArray(a.forbidden_tools) || a.forbidden_tools.length > 10)) {
+    throw new Error("forbidden_tools: array, max 10");
+  }
+}
+
 // GET /api/regression/scenarios — list (filter: category, severity, active)
+// M1 fix: escape user search input before $regex
 app.get("/api/regression/scenarios", requireAuth, async (req, res) => {
   const db = await getDB();
   if (!db) return res.json({ scenarios: [] });
   const filter = {};
   if (req.query.active !== "all") filter.active = { $ne: false };
-  if (req.query.category) filter.category = req.query.category;
-  if (req.query.severity) filter.severity = { $in: req.query.severity.split(",") };
-  if (req.query.search) {
+  if (req.query.category && typeof req.query.category === "string") {
+    filter.category = String(req.query.category).substring(0, 50);
+  }
+  if (req.query.severity && typeof req.query.severity === "string") {
+    filter.severity = { $in: String(req.query.severity).substring(0, 100).split(",").map(s => s.trim()).filter(Boolean) };
+  }
+  if (req.query.search && typeof req.query.search === "string") {
+    const safe = escapeRegex(String(req.query.search).substring(0, 100));
     filter.$or = [
-      { title: { $regex: req.query.search, $options: "i" } },
-      { bug_id: { $regex: req.query.search, $options: "i" } },
-      { bug_context: { $regex: req.query.search, $options: "i" } },
+      { title: { $regex: safe, $options: "i" } },
+      { bug_id: { $regex: safe, $options: "i" } },
+      { bug_context: { $regex: safe, $options: "i" } },
     ];
   }
   const scenarios = await db
@@ -1983,12 +2065,23 @@ app.get("/api/regression/scenarios/:bug_id", requireAuth, async (req, res) => {
 });
 
 // POST /api/regression/scenarios — create
-app.post("/api/regression/scenarios", requireAuth, express.json(), async (req, res) => {
+// H2 fix: strict input validation + size caps
+// SEC-C2 fix: reject unsafe ReDoS regex patterns
+// M2 fix: prototype pollution prevention via JSON round-trip
+app.post("/api/regression/scenarios", requireAuth, express.json({ limit: "100kb" }), async (req, res) => {
   const db = await getDB();
   if (!db) return res.status(500).json({ error: "DB unavailable" });
-  const body = req.body || {};
-  if (!body.bug_id || !body.title || !body.turns) {
-    return res.status(400).json({ error: "bug_id, title, turns required" });
+  // M2: JSON round-trip strips __proto__ / constructor.prototype pollution attempts
+  let body;
+  try {
+    body = JSON.parse(JSON.stringify(req.body || {}));
+  } catch {
+    return res.status(400).json({ error: "invalid json body" });
+  }
+  try {
+    validateScenarioInput(body);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
   }
   const doc = {
     bug_id: body.bug_id,
@@ -2003,8 +2096,8 @@ app.post("/api/regression/scenarios", requireAuth, express.json(), async (req, r
     turns: body.turns,
     assertions: body.assertions || {},
     context_setup: body.context_setup || {},
-    timeout_ms: body.timeout_ms || 45000,
-    retry_on_flaky: body.retry_on_flaky || 0,
+    timeout_ms: Math.min(Math.max(parseInt(body.timeout_ms) || 45000, 5000), 120000),
+    retry_on_flaky: body.retry_on_flaky ? 1 : 0,
     active: body.active !== false,
     created_at: new Date(),
     updated_at: new Date(),
@@ -2021,9 +2114,34 @@ app.post("/api/regression/scenarios", requireAuth, express.json(), async (req, r
 });
 
 // PATCH /api/regression/scenarios/:bug_id — update
-app.patch("/api/regression/scenarios/:bug_id", requireAuth, express.json(), async (req, res) => {
+// H2 + SEC-C2 + M2 fix: validate any field that affects runtime behavior
+app.patch("/api/regression/scenarios/:bug_id", requireAuth, express.json({ limit: "100kb" }), async (req, res) => {
   const db = await getDB();
   if (!db) return res.status(500).json({ error: "DB unavailable" });
+  // M2: strip prototype pollution
+  let body;
+  try {
+    body = JSON.parse(JSON.stringify(req.body || {}));
+  } catch {
+    return res.status(400).json({ error: "invalid json body" });
+  }
+
+  // Partial-validation: if the caller is changing turns/assertions, validate those subtrees
+  // by constructing a pseudo-full scenario (merging with minimal required fields).
+  if (body.turns !== undefined || body.assertions !== undefined || body.title !== undefined || body.bug_context !== undefined) {
+    try {
+      validateScenarioInput({
+        bug_id: req.params.bug_id,
+        title: body.title || "placeholder-title",
+        turns: body.turns || [{ message: "placeholder" }],
+        assertions: body.assertions || {},
+        bug_context: body.bug_context,
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
+
   const update = { updated_at: new Date() };
   const allowed = [
     "title", "category", "severity", "platform", "bug_context",
@@ -2031,7 +2149,10 @@ app.patch("/api/regression/scenarios/:bug_id", requireAuth, express.json(), asyn
     "timeout_ms", "retry_on_flaky", "active",
   ];
   for (const k of allowed) {
-    if (req.body[k] !== undefined) update[k] = req.body[k];
+    if (body[k] !== undefined) update[k] = body[k];
+  }
+  if (update.timeout_ms !== undefined) {
+    update.timeout_ms = Math.min(Math.max(parseInt(update.timeout_ms) || 45000, 5000), 120000);
   }
   const result = await db
     .collection(REGRESSION_SCENARIOS_COLL)
@@ -2057,148 +2178,189 @@ app.delete("/api/regression/scenarios/:bug_id", requireAuth, async (req, res) =>
 
 // POST /api/regression/run — trigger runner
 // body: { bug_ids?: string[], severity?: string[], category?: string, mode?: 'gate'|'report' }
-app.post("/api/regression/run", requireAuth, express.json(), async (req, res) => {
-  const db = await getDB();
-  if (!db) return res.status(500).json({ error: "DB unavailable" });
+//
+// Security / reliability fixes:
+//  - H3: in-memory lock (one run at a time)
+//  - C5: use DEFAULT_PROMPT directly (match CLI /api/test-ai behavior — don't let
+//        mutable getBotConfig() drift between runs)
+//  - C2: _lastToolResults is Array — iterate correctly + clear between turns
+//  - H1 helper: 45s timeout per turn (prevents hung runs)
+//  - SEC-C2: compile assertion patterns via compilePatternSafe() (ReDoS-safe)
+app.post("/api/regression/run", requireAuth, aiLimiter, express.json({ limit: "50kb" }), async (req, res) => {
+  // H3: in-memory lock
+  if (global.__REGRESSION_RUNNING__) {
+    return res.status(429).json({ ok: false, error: "Regression run already in progress" });
+  }
+  global.__REGRESSION_RUNNING__ = true;
 
-  const { bug_ids, severity, category, mode = "report" } = req.body || {};
+  try {
+    const db = await getDB();
+    if (!db) return res.status(500).json({ error: "DB unavailable" });
 
-  // Build filter
-  const filter = { active: { $ne: false } };
-  if (Array.isArray(bug_ids) && bug_ids.length > 0) filter.bug_id = { $in: bug_ids };
-  if (category) filter.category = category;
-  if (Array.isArray(severity) && severity.length > 0) filter.severity = { $in: severity };
+    const { bug_ids, severity, category, mode = "report" } = req.body || {};
 
-  const scenarios = await db.collection(REGRESSION_SCENARIOS_COLL).find(filter).toArray();
-  if (scenarios.length === 0) return res.json({ ok: true, scenarios_run: 0, pass: 0, fail: 0, results: [] });
+    // Build filter
+    const filter = { active: { $ne: false } };
+    if (Array.isArray(bug_ids) && bug_ids.length > 0) filter.bug_id = { $in: bug_ids.slice(0, 100) };
+    if (category && typeof category === "string") filter.category = category.substring(0, 50);
+    if (Array.isArray(severity) && severity.length > 0) filter.severity = { $in: severity.slice(0, 5) };
 
-  // Reuse regression logic inline (simplified for REST context — sequential, minimal delays)
-  const GEMINI_KEY = getDynamicKeySync("GOOGLE_API_KEY");
-  const results = [];
-  let pass = 0, fail = 0, errorCnt = 0;
+    const scenarios = await db.collection(REGRESSION_SCENARIOS_COLL).find(filter).limit(200).toArray();
+    if (scenarios.length === 0) return res.json({ ok: true, scenarios_run: 0, pass: 0, fail: 0, results: [] });
 
-  for (const s of scenarios) {
-    const sourceId = `reg_${s.bug_id}_${Date.now()}`;
-    const turnResults = [];
-    let error = null;
+    // ★ C5 fix: use DEFAULT_PROMPT (same as CLI /api/test-ai) — do NOT call getBotConfig()
+    const systemPrompt = DEFAULT_PROMPT;
 
-    try {
-      // clear
+    const results = [];
+    let pass = 0, fail = 0, errorCnt = 0;
+
+    for (const s of scenarios) {
+      const sourceId = `reg_${s.bug_id}_${Date.now()}`;
+      const turnResults = [];
+      let error = null;
+
+      // ★ C2 fix: clear any leftover tool results for this sourceId
+      if (aiChat.clearToolResults) aiChat.clearToolResults(sourceId);
+
+      try {
+        // clear prior session state
+        await db.collection("messages").deleteMany({ sourceId });
+        await db.collection("ai_memory").deleteMany({ sourceId });
+
+        for (const turn of s.turns || []) {
+          if ((turn.role || "user") !== "user") continue;
+          // ★ H1 helper: 45s timeout per turn
+          const turnPromise = callDinocoAI(systemPrompt, cleanForAI(turn.message), sourceId);
+          const reply = await Promise.race([
+            turnPromise,
+            new Promise((_, rej) => setTimeout(() => rej(new Error("turn_timeout")), 45000)),
+          ]);
+
+          // ★ C2 fix: _lastToolResults is now Array<record> — flatten all calls
+          const rawTools = aiChat._lastToolResults?.get(sourceId);
+          const tools = [];
+          if (Array.isArray(rawTools)) {
+            for (const r of rawTools) tools.push(r);
+          } else if (rawTools) {
+            tools.push(rawTools);
+          }
+          // Clear after capturing so the next turn starts fresh
+          if (aiChat.clearToolResults) aiChat.clearToolResults(sourceId);
+          else aiChat._lastToolResults?.delete(sourceId);
+
+          turnResults.push({ message: turn.message, reply, tools });
+        }
+      } catch (e) {
+        error = e.message;
+      }
+
+      // Cleanup session state
       await db.collection("messages").deleteMany({ sourceId });
       await db.collection("ai_memory").deleteMany({ sourceId });
+      if (aiChat.clearToolResults) aiChat.clearToolResults(sourceId);
 
-      // Run turns via callDinocoAI
-      const botConfig = await getBotConfig();
-      const systemPrompt = botConfig?.prompt || DEFAULT_PROMPT;
+      // Validate: layer 1 (regex) + layer 2 (tools). Layer 3 (Gemini judge) stays in CLI runner.
+      const violations = [];
+      if (error) {
+        violations.push({ layer: "agent_error", reason: error });
+      } else {
+        const lastReply = turnResults[turnResults.length - 1]?.reply || "";
+        const aggregated = turnResults.map(t => t.reply).join("\n\n");
+        const checkText = turnResults.length > 1 ? aggregated : lastReply;
+        const assertions = s.assertions || {};
 
-      for (const turn of s.turns || []) {
-        if ((turn.role || "user") !== "user") continue;
-        const reply = await callDinocoAI(systemPrompt, cleanForAI(turn.message), sourceId);
-        // get tools called for this sourceId
-        const lastTools = aiChat._lastToolResults?.get(sourceId);
-        const tools = [];
-        if (lastTools) {
-          if (Array.isArray(lastTools)) lastTools.forEach(t => tools.push(t));
-          else tools.push(lastTools);
-          aiChat._lastToolResults?.delete(sourceId);
+        // regex forbidden — SEC-C2 safe compile
+        for (const fp of assertions.forbidden_patterns || []) {
+          if (!fp?.pattern) continue;
+          try {
+            const re = compilePatternSafe(fp.pattern, fp.flags);
+            if (re.test(checkText)) {
+              violations.push({ layer: "regex_forbidden", pattern: fp.pattern, reason: fp.reason });
+            }
+          } catch (e) {
+            violations.push({ layer: "unsafe_regex", pattern: fp.pattern, reason: e.message });
+          }
         }
-        turnResults.push({ message: turn.message, reply, tools });
+        // regex required — SEC-C2 safe compile
+        for (const rp of assertions.required_patterns || []) {
+          if (!rp?.pattern) continue;
+          try {
+            const re = compilePatternSafe(rp.pattern, rp.flags);
+            if (!re.test(checkText)) {
+              violations.push({ layer: "regex_required", pattern: rp.pattern, reason: rp.reason });
+            }
+          } catch (e) {
+            violations.push({ layer: "unsafe_regex", pattern: rp.pattern, reason: e.message });
+          }
+        }
+        // tool calls
+        const calledNames = turnResults
+          .flatMap(t => t.tools || [])
+          .map(t => (typeof t === "string" ? t : t.name || ""));
+        for (const ex of assertions.expected_tools || []) {
+          if (!calledNames.includes(ex)) {
+            violations.push({ layer: "tool_expected", tool: ex, reason: `expected ${ex} not called` });
+          }
+        }
+        for (const fb of assertions.forbidden_tools || []) {
+          if (calledNames.includes(fb)) {
+            violations.push({ layer: "tool_forbidden", tool: fb, reason: `forbidden ${fb} called` });
+          }
+        }
       }
-    } catch (e) {
-      error = e.message;
+
+      const status = error ? "error" : violations.length === 0 ? "pass" : "fail";
+      if (status === "pass") pass++;
+      else if (status === "error") errorCnt++;
+      else fail++;
+
+      results.push({
+        bug_id: s.bug_id,
+        title: s.title,
+        severity: s.severity,
+        category: s.category,
+        status,
+        violations,
+        turns: turnResults.map(t => ({ message: t.message, reply: (t.reply || "").substring(0, 500) })),
+        error,
+      });
+
+      // Update scenario last_run
+      await db.collection(REGRESSION_SCENARIOS_COLL).updateOne(
+        { _id: s._id },
+        { $set: { last_run: { status, timestamp: new Date(), violations_count: violations.length } } }
+      );
     }
 
-    // Cleanup
-    await db.collection("messages").deleteMany({ sourceId });
-    await db.collection("ai_memory").deleteMany({ sourceId });
+    const passRate = scenarios.length > 0 ? Math.round((pass / scenarios.length) * 100) : 0;
 
-    // Validate: layer 1 + 2 only (layer 3 Gemini is heavier, kept for CLI runner)
-    const violations = [];
-    if (error) {
-      violations.push({ layer: "agent_error", reason: error });
-    } else {
-      const lastReply = turnResults[turnResults.length - 1]?.reply || "";
-      const aggregated = turnResults.map(t => t.reply).join("\n\n");
-      const checkText = turnResults.length > 1 ? aggregated : lastReply;
-      const assertions = s.assertions || {};
-      // regex forbidden
-      for (const fp of assertions.forbidden_patterns || []) {
-        try {
-          if (new RegExp(fp.pattern, fp.flags || "i").test(checkText)) {
-            violations.push({ layer: "regex_forbidden", pattern: fp.pattern, reason: fp.reason });
-          }
-        } catch {}
-      }
-      // regex required
-      for (const rp of assertions.required_patterns || []) {
-        try {
-          if (!new RegExp(rp.pattern, rp.flags || "i").test(checkText)) {
-            violations.push({ layer: "regex_required", pattern: rp.pattern, reason: rp.reason });
-          }
-        } catch {}
-      }
-      // tool calls
-      const calledNames = turnResults
-        .flatMap(t => t.tools || [])
-        .map(t => (typeof t === "string" ? t : t.name || ""));
-      for (const ex of assertions.expected_tools || []) {
-        if (!calledNames.includes(ex)) {
-          violations.push({ layer: "tool_expected", tool: ex, reason: `expected ${ex} not called` });
-        }
-      }
-      for (const fb of assertions.forbidden_tools || []) {
-        if (calledNames.includes(fb)) {
-          violations.push({ layer: "tool_forbidden", tool: fb, reason: `forbidden ${fb} called` });
-        }
-      }
-    }
+    // Save run
+    const runDoc = {
+      triggered_by: "dashboard",
+      mode,
+      filter: { bug_ids, severity, category },
+      scenarios_run: scenarios.length,
+      pass, fail, error: errorCnt,
+      pass_rate: passRate,
+      results,
+      created_at: new Date(),
+    };
+    const runResult = await db.collection(REGRESSION_RUNS_COLL).insertOne(runDoc);
 
-    const status = error ? "error" : violations.length === 0 ? "pass" : "fail";
-    if (status === "pass") pass++;
-    else if (status === "error") errorCnt++;
-    else fail++;
-
-    results.push({
-      bug_id: s.bug_id,
-      title: s.title,
-      severity: s.severity,
-      category: s.category,
-      status,
-      violations,
-      turns: turnResults.map(t => ({ message: t.message, reply: (t.reply || "").substring(0, 500) })),
-      error,
+    res.json({
+      ok: true,
+      run_id: runResult.insertedId,
+      scenarios_run: scenarios.length,
+      pass, fail, error: errorCnt,
+      pass_rate: passRate,
+      results,
     });
-
-    // Update scenario last_run
-    await db.collection(REGRESSION_SCENARIOS_COLL).updateOne(
-      { _id: s._id },
-      { $set: { last_run: { status, timestamp: new Date(), violations_count: violations.length } } }
-    );
+  } catch (e) {
+    console.error("[Regression/Run] fatal:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    global.__REGRESSION_RUNNING__ = false;
   }
-
-  const passRate = scenarios.length > 0 ? Math.round((pass / scenarios.length) * 100) : 0;
-
-  // Save run
-  const runDoc = {
-    triggered_by: "dashboard",
-    mode,
-    filter: { bug_ids, severity, category },
-    scenarios_run: scenarios.length,
-    pass, fail, error: errorCnt,
-    pass_rate: passRate,
-    results,
-    created_at: new Date(),
-  };
-  const runResult = await db.collection(REGRESSION_RUNS_COLL).insertOne(runDoc);
-
-  res.json({
-    ok: true,
-    run_id: runResult.insertedId,
-    scenarios_run: scenarios.length,
-    pass, fail, error: errorCnt,
-    pass_rate: passRate,
-    results,
-  });
 });
 
 // GET /api/regression/runs — history
@@ -2287,11 +2449,12 @@ app.get("/api/regression/stats", requireAuth, async (req, res) => {
 });
 
 // POST /api/regression/auto-mine — Phase 4: auto-mine from conversations + training_logs
-app.post("/api/regression/auto-mine", requireAuth, express.json(), async (req, res) => {
+// H5 fix: mask PII (phone/email/id) before sending to Gemini — PDPA compliance
+app.post("/api/regression/auto-mine", requireAuth, express.json({ limit: "10kb" }), async (req, res) => {
   const db = await getDB();
   if (!db) return res.status(500).json({ error: "DB unavailable" });
   try {
-    const days = parseInt(req.body.days) || 30;
+    const days = Math.min(Math.max(parseInt(req.body.days) || 30, 1), 180);
     const since = new Date(Date.now() - days * 24 * 3600000);
 
     // Pull fail patterns from training_logs (verdict=fail)
@@ -2316,7 +2479,13 @@ app.post("/api/regression/auto-mine", requireAuth, express.json(), async (req, r
     const GEMINI_KEY = getDynamicKeySync("GOOGLE_API_KEY");
     if (!GEMINI_KEY) return res.status(500).json({ error: "GOOGLE_API_KEY not set" });
 
-    const failsSample = fails.slice(0, 10).map((f, i) => `${i + 1}. Q: ${f.message}\n   A(wrong): ${(f.reply || "").substring(0, 200)}\n   correct: ${f.correct_answer || "-"}`).join("\n\n");
+    // ★ H5 fix: mask PII before interpolating into Gemini prompt
+    const failsSample = fails.slice(0, 10).map((f, i) => {
+      const q = maskPII((f.message || "").substring(0, 500));
+      const wrong = maskPII((f.reply || "").substring(0, 200));
+      const correct = maskPII((f.correct_answer || "-").substring(0, 300));
+      return `${i + 1}. Q: ${q}\n   A(wrong): ${wrong}\n   correct: ${correct}`;
+    }).join("\n\n");
     const prompt = `คุณคือ QA engineer ของ DINOCO Chatbot
 วิเคราะห์ failures ต่อไปนี้และสกัด "regression scenarios" ที่ควรเพิ่ม (draft)
 

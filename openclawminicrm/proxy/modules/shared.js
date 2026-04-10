@@ -1,9 +1,19 @@
 /**
  * shared.js — Shared state, constants, and DB connection
- * V.5.1 — Fix: แยกชัด Rear Rack vs Side Rack (มือจับเกี่ยว Rear Rack เท่านั้น ไม่เกี่ยว Side Rack)
+ * V.5.2 — Add isRegressionMode() helper (regression test guard at function level)
  */
 const { MongoClient } = require("mongodb");
 const crypto = require("crypto");
+
+// === Regression Test Mode ===
+// Regression runner uses sourceId prefix "reg_" (e.g. "reg_REG-001_1712345678").
+// ANY side-effect function (LINE push, DB write, external API) must check this
+// flag before firing. This is defense-in-depth on top of SIDE_EFFECT_TOOLS guard
+// in dinoco-tools.js — protects us when AI calls a non-tool function path
+// (e.g. dealer_lookup → notifyDealerDirect) during a regression run.
+function isRegressionMode(sourceId) {
+  return typeof sourceId === "string" && sourceId.startsWith("reg_");
+}
 
 // === MongoDB ===
 let db = null;
@@ -488,6 +498,7 @@ function clearTemplateCache() { _cachedTemplates = null; _cachedTemplatesAt = 0;
 
 module.exports = {
   getDB,
+  isRegressionMode,
   MESSAGES_COLL,
   AUDIT_LOG_COLL,
   KB_COLL,

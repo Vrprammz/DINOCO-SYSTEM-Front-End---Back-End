@@ -1,5 +1,9 @@
 /**
  * ai-chat.js — AI providers, Gemini/Claude with tools, DINOCO AI wrapper
+ * V.8.2 — C2 fix: _lastToolResults is now Map<sourceId, Array<result>> (append per tool call)
+ *         instead of overwriting on every call. Multi-tool turns now capture ALL tool calls.
+ *         Add clearToolResults(sourceId) for regression runner to reset between turns.
+ * V.8.1 — Claude review text leak filter + PII masking in conversation history
  * V.8.0 — Lead Flex with product image/price enrichment: resolveDealer MongoDB first, notifyDealerForAutoLead direct LINE push, USE_MONGODB_DEALERS feature flag
  */
 const { getDB, MESSAGES_COLL, DEFAULT_BOT_NAME, DEFAULT_PROMPT, AB_PROMPTS, getABVariant, AI_PRICING, PAID_AI, trackAICost, getBotConfig, mcpTools, getDynamicKeySync, loadActiveRules, buildRulesPrompt } = require("./shared");
@@ -15,8 +19,30 @@ let AGENT_TOOLS = null;
 let saveMsg = null;
 let buildAIContext = null;
 
-// ★ V.1.4: เก็บ tool results ล่าสุดของแต่ละ sourceId สำหรับ claudeSupervisor
+// ★ V.8.2 (C2 fix): Map<sourceId, Array<{name, args, result, at}>> — append per tool call
+// Previous design overwrote on every call, losing all but the last tool in multi-tool turns.
+// Regression runner + claudeSupervisor both read this; array preserves full call history.
 const _lastToolResults = new Map();
+
+// ★ V.8.2: Append a tool-call record for a sourceId (creates array if missing)
+function pushToolResult(sourceId, record) {
+  if (!sourceId) return;
+  const existing = _lastToolResults.get(sourceId);
+  if (Array.isArray(existing)) {
+    existing.push(record);
+  } else if (existing && typeof existing === "object") {
+    // Backward compat: old single-object entry — convert to array
+    _lastToolResults.set(sourceId, [existing, record]);
+  } else {
+    _lastToolResults.set(sourceId, [record]);
+  }
+}
+
+// ★ V.8.2: Clear tool history for a sourceId (regression runner calls this between turns)
+function clearToolResults(sourceId) {
+  if (!sourceId) return;
+  _lastToolResults.delete(sourceId);
+}
 let createAiHandoffAlert = null;
 let replyToLine = null;
 let sendMetaMessage = null;
@@ -363,8 +389,9 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
         // ★ V.6.2: Ensure tool result is always string (ป้องกัน Gemini/Claude reject non-string content)
         const toolResult = typeof rawToolResult === "string" ? rawToolResult : JSON.stringify(rawToolResult);
         // ★ V.1.4: เก็บ tool results ล่าสุดสำหรับ claudeSupervisor
+        // ★ V.8.2 (C2 fix): Append instead of overwrite — multi-tool turns preserve all calls
         const toolSummary = toolResult.substring(0, 500);
-        _lastToolResults.set(sourceId, { name, args, result: toolSummary, at: Date.now() });
+        pushToolResult(sourceId, { name, args, result: toolSummary, at: Date.now() });
 
         // ★ V.2.3: functionResponse ต้องอยู่ใน parts[] ไม่ใช่ top-level
         // Gemini 2.5 Flash ต้องการ role "model" สำหรับ functionCall แล้ว role "user" สำหรับ functionResponse (format ใหม่)
@@ -742,10 +769,14 @@ async function callDinocoAI(systemPrompt, userMessage, sourceId, contextStr) {
   const route = intentRouter(userMessage, contextStr);
 
   // ★ V.6.0: _lastToolResults cleanup ทุก 100 entries (ป้องกัน memory leak)
+  // ★ V.8.2: val can be Array<{at}> now — use newest entry's timestamp
   if (_lastToolResults.size > 100) {
     const cutoff = Date.now() - 300000; // ลบ entries เก่ากว่า 5 นาที
     for (const [key, val] of _lastToolResults) {
-      if (val.at < cutoff) _lastToolResults.delete(key);
+      const lastAt = Array.isArray(val)
+        ? (val[val.length - 1]?.at || 0)
+        : (val?.at || 0);
+      if (lastAt < cutoff) _lastToolResults.delete(key);
     }
     console.log(`[Memory] Cleaned _lastToolResults: ${_lastToolResults.size} remaining`);
   }
@@ -1180,8 +1211,12 @@ async function claudeSupervisor(geminiReply, customerText, sourceId, contextStr,
   console.log(`[${reviewTier}] Reviewing Gemini reply...`);
 
   // ★ V.1.4: ส่ง tool results ให้ Claude ตรวจ hallucination ได้แม่นยำขึ้น
-  const lastTool = _lastToolResults.get(sourceId);
-  const toolInfo = lastTool && (Date.now() - lastTool.at < 60000)
+  // ★ V.8.2: _lastToolResults is now Array — use newest entry (most relevant to current reply)
+  const toolsForSource = _lastToolResults.get(sourceId);
+  const lastTool = Array.isArray(toolsForSource)
+    ? toolsForSource[toolsForSource.length - 1]
+    : toolsForSource;
+  const toolInfo = lastTool && (Date.now() - (lastTool.at || 0) < 60000)
     ? `\nTool ที่ Gemini เรียก: ${lastTool.name}(${JSON.stringify(lastTool.args)})\nผลลัพธ์จาก tool: ${lastTool.result}`
     : "";
 
@@ -1445,4 +1480,6 @@ module.exports = {
   providerCooldown,
   getOpenRouterFreeProviders,
   _lastToolResults,
+  clearToolResults,
+  pushToolResult,
 };

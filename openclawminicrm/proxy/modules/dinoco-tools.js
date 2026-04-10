@@ -1,5 +1,7 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
+ * V.5.2 — C3/L3 fix: dinoco_dealer_lookup added to SIDE_EFFECT_TOOLS (defense-in-depth);
+ *         use shared isRegressionMode() helper; mock dealer lookup returns plausible text.
  * V.5.1 — Add Regression Test Mode guard: SIDE_EFFECT_TOOLS mocked when sourceId starts with "reg_"
  *         (prevents dinoco_create_lead / dinoco_create_claim from writing real data during regression tests)
  * V.5.0 — Lead Flex with product image/price: dinoco_dealer_lookup + dinoco_create_lead use MongoDB dealers + notifyDealerDirect
@@ -233,18 +235,27 @@ const AGENT_TOOLS = [
 ];
 
 // === Execute Tool ===
-// ★ Regression Guard V.1.0 — Test Mode Guard
+// ★ Regression Guard V.1.1 — Test Mode Guard (C3+L3 fix)
 // Tools with side effects (DB writes, external API calls that mutate state)
 // must NOT execute for real when running regression tests.
 // sourceId prefix "reg_" indicates a regression test run.
+//
+// IMPORTANT: dinoco_dealer_lookup is included defensively even though the tool
+// itself is read-only — it was historically the trigger for auto-lead flows
+// that reach notifyDealerDirect(). Function-level guard in lead-pipeline.js
+// is the canonical fix; this is defense-in-depth.
+const { isRegressionMode } = require("./shared");
+
 const SIDE_EFFECT_TOOLS = new Set([
   "dinoco_create_lead",
   "dinoco_create_claim",
   "dinoco_claim_status", // sends LINE alert to admin
+  "dinoco_dealer_lookup", // defensive: lookup result feeds auto-lead → LINE push
 ]);
 
+// Kept for backward compat — delegate to shared helper
 function isRegressionTestMode(sourceId) {
-  return typeof sourceId === "string" && sourceId.startsWith("reg_");
+  return isRegressionMode(sourceId);
 }
 
 async function executeTool(toolName, args, sourceId) {
@@ -260,6 +271,10 @@ async function executeTool(toolName, args, sourceId) {
     }
     if (toolName === "dinoco_claim_status") {
       return `[TEST MODE] ใบเคลม REG-TEST-0001 สถานะ: ทีมตรวจแล้ว (mocked)`;
+    }
+    if (toolName === "dinoco_dealer_lookup") {
+      // Return plausible dealer text so AI can continue the conversation
+      return `[TEST MODE] mocked dealer lookup — ตัวแทน: FOX RIDER (ลาดพร้าว) โทร 02-123-4567 (จำลอง)`;
     }
     return `[TEST MODE] mocked ${toolName}`;
   }

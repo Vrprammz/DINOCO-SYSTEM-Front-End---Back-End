@@ -1,8 +1,10 @@
 /**
  * lead-pipeline.js — Lead statuses, transitions, CRUD, Mayom follow-up cron, Flex builders, dealer notify
+ * V.3.1 — C3/L3 fix: notifyDealerDirect() short-circuits when isRegressionMode(sourceId)
+ *         (defense-in-depth — prevents LINE push during regression runs even if tool guard is bypassed)
  * V.3.0 — Lead Notification Flex with hero image, product name, price + lookupProductForLead helper
  */
-const { getDB, DEFAULT_BOT_NAME, auditLog } = require("./shared");
+const { getDB, DEFAULT_BOT_NAME, auditLog, isRegressionMode } = require("./shared");
 const { callDinocoAPI, wpCache } = require("./dinoco-cache");
 
 /**
@@ -429,6 +431,13 @@ async function lookupDealerByProvince(province, name) {
 // === Centralized Dealer Notification (Direct LINE Push) ===
 
 async function notifyDealerDirect(lead, dealer) {
+  // ★ V.3.1 — Regression Test Mode guard (C3/L3 fix)
+  // Short-circuit before ANY LINE push when sourceId indicates a regression run.
+  // This is the canonical guard: function-level (safer than tool-level only).
+  if (isRegressionMode(lead?.sourceId)) {
+    console.log(`[Regression Test Mode] Skipped notifyDealerDirect for ${lead?.sourceId} (dealer: ${dealer?.name || "unknown"})`);
+    return false;
+  }
   // dealer not found or no lineGroupId → fallback admin group
   if (!dealer?.lineGroupId) {
     const adminGroupId = process.env.B2B_ADMIN_GROUP_ID;
