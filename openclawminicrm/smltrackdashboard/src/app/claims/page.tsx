@@ -28,6 +28,9 @@ const CLAIM_STATUSES: Record<string, { label: string; color: string; icon: strin
   admin_reviewed: { label: "ตรวจแล้ว", color: "bg-cyan-500/20 text-cyan-400", icon: "✅" },
   waiting_return_shipment: { label: "รอส่งคืน", color: "bg-indigo-500/20 text-indigo-400", icon: "📦" },
   parts_shipping: { label: "ส่งอะไหล่", color: "bg-teal-500/20 text-teal-400", icon: "🚚" },
+  case_a: { label: "Case A (ส่งกลับเปลี่ยน)", color: "bg-green-500/20 text-green-400", icon: "🔁" },
+  case_b: { label: "Case B (ส่งอะไหล่)", color: "bg-blue-500/20 text-blue-400", icon: "🔧" },
+  rejected: { label: "ปฏิเสธ", color: "bg-red-500/20 text-red-400", icon: "❌" },
   closed_resolved: { label: "แก้ไขแล้ว", color: "bg-green-500/20 text-green-400", icon: "😊" },
   closed_rejected: { label: "ปฏิเสธ", color: "bg-red-500/20 text-red-400", icon: "❌" },
   customer_no_response: { label: "ลูกค้าหาย", color: "bg-gray-500/20 text-gray-400", icon: "💤" },
@@ -41,7 +44,7 @@ export default function ClaimsPage() {
 
   const fetchClaims = useCallback(async () => {
     try {
-      const url = filter === "all" ? "/api/proxy/claims" : `/api/proxy/claims?status=${filter}`;
+      const url = filter === "all" ? "/dashboard/api/proxy/claims" : `/dashboard/api/proxy/claims?status=${filter}`;
       const res = await fetch(url);
       const data = await res.json();
       setClaims(data.claims || []);
@@ -55,6 +58,32 @@ export default function ClaimsPage() {
   useEffect(() => { fetchClaims(); const t = setInterval(fetchClaims, 30000); return () => clearInterval(t); }, [fetchClaims]);
 
   const statusInfo = (status: string) => CLAIM_STATUSES[status] || { label: status, color: "bg-gray-500/20 text-gray-400", icon: "❓" };
+
+  async function updateClaimStatus(claimId: string, status: string, note?: string) {
+    const statusLabel = CLAIM_STATUSES[status]?.label || status;
+    if (!confirm(`เปลี่ยนสถานะเป็น "${statusLabel}" ?`)) return;
+    try {
+      const res = await fetch(`/dashboard/api/proxy/claims/${claimId}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status, note }),
+      });
+      if (res.status === 401) {
+        alert("Session หมดอายุ กรุณา login ใหม่");
+        return;
+      }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(`Error: ${err.error || res.status}`);
+        return;
+      }
+      await fetchClaims();
+      setSelectedClaim(null);
+    } catch (e) {
+      console.error("[updateClaimStatus]", e);
+      alert("ไม่สามารถอัพเดทสถานะได้");
+    }
+  }
 
   const pendingReview = claims.filter(c => c.status === "info_collected");
   const activeClaims = claims.filter(c => !["closed_resolved", "closed_rejected", "customer_no_response"].includes(c.status));

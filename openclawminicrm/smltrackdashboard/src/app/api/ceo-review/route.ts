@@ -12,14 +12,26 @@ export async function GET(req: NextRequest) {
     try {
       const res = await fetch(`${AGENT_URL}/api/ceo-stories`, { signal: AbortSignal.timeout(20000) });
       if (res.ok) return NextResponse.json(await res.json());
-    } catch { /* fallback */ }
-    return NextResponse.json({ stories: [] });
+      console.error("[api/ceo-review] stories agent returned non-ok:", res.status);
+    } catch (e) {
+      console.error("[api/ceo-review] stories", e);
+    }
+    return NextResponse.json(
+      { error: "agent_unavailable", stories: [] },
+      { status: 503 }
+    );
   }
 
   // ดึง plan ปกติ
   try {
     const res = await fetch(`${AGENT_URL}/api/ceo-plan`, { signal: AbortSignal.timeout(25000) });
     if (res.ok) return NextResponse.json(await res.json());
-  } catch { /* fallback */ }
-  return NextResponse.json({});
+    console.error("[api/ceo-review] plan agent returned non-ok:", res.status);
+  } catch (e) {
+    console.error("[api/ceo-review] plan", e);
+  }
+  return NextResponse.json(
+    { error: "agent_unavailable" },
+    { status: 503 }
+  );
 }

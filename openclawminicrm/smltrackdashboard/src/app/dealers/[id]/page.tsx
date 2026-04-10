@@ -232,7 +232,6 @@ export default function DealerDetailPage() {
                 <EditField label="เบอร์โทร" value={editForm.phone as string} onChange={(v) => setEditForm(f => ({ ...f, phone: v }))} />
                 <EditField label="จังหวัด" value={editForm.province as string} onChange={(v) => setEditForm(f => ({ ...f, province: v }))} />
                 <EditField label="ที่อยู่" value={editForm.address as string} onChange={(v) => setEditForm(f => ({ ...f, address: v }))} />
-                <EditField label="ที่อยู่" value={editForm.address as string} onChange={(v) => setEditForm(f => ({ ...f, address: v }))} />
                 <EditField label="LINE Group ID" value={editForm.lineGroupId as string} onChange={(v) => setEditForm(f => ({ ...f, lineGroupId: v }))} />
                 <EditField label="Owner LINE UID" value={editForm.ownerLineUid as string} onChange={(v) => setEditForm(f => ({ ...f, ownerLineUid: v }))} />
                 <div>
@@ -263,7 +262,6 @@ export default function DealerDetailPage() {
                 <InfoRow label="เจ้าของ" value={dealer.ownerName || "-"} />
                 <InfoRow label="เบอร์โทร" value={dealer.phone || "-"} />
                 <InfoRow label="จังหวัด" value={dealer.province} />
-                <InfoRow label="ที่อยู่" value={dealer.address || "-"} />
                 <InfoRow label="ที่อยู่" value={dealer.address || "-"} />
                 <InfoRow label="LINE Group ID" value={dealer.lineGroupId || "ยังไม่ผูก"} />
                 <InfoRow label="Owner LINE UID" value={dealer.ownerLineUid || "-"} />

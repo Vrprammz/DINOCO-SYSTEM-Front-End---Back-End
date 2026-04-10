@@ -17,6 +17,9 @@ export async function GET() {
     return NextResponse.json({ count: leads.length, leads });
   } catch (e) {
     console.error("[API/leads/needs-attention]", e);
-    return NextResponse.json({ leads: [] }, { status: 500 });
+    return NextResponse.json(
+      { error: "database_unavailable", leads: [] },
+      { status: 503 }
+    );
   }
 }

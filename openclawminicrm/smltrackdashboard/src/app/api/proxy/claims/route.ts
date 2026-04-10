@@ -20,6 +20,9 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ count: claims.length, claims });
   } catch (e) {
     console.error("[API/claims]", e);
-    return NextResponse.json({ claims: [] }, { status: 500 });
+    return NextResponse.json(
+      { error: "database_unavailable", claims: [] },
+      { status: 503 }
+    );
   }
 }

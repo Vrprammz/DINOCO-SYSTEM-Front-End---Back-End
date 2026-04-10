@@ -11,8 +11,12 @@ export async function GET() {
     const db = await getDB();
     const doc = await db.collection(COLLECTION).findOne({ _id: DOC_ID as any });
     return NextResponse.json({ count: doc?.count ?? 0 });
-  } catch {
-    return NextResponse.json({ count: 0 });
+  } catch (e) {
+    console.error("[api/visitor-count GET]", e);
+    return NextResponse.json(
+      { error: "database_unavailable", count: 0 },
+      { status: 503 }
+    );
   }
 }
 

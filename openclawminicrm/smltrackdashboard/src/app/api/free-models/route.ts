@@ -9,7 +9,11 @@ export async function GET() {
     const res = await fetch(`${AGENT_URL}/api/free-models`, { next: { revalidate: 0 } });
     const data = await res.json();
     return NextResponse.json(data);
-  } catch {
-    return NextResponse.json({ count: 0, lastDiscovery: null, models: [], paidAI: false });
+  } catch (e) {
+    console.error("[api/free-models]", e);
+    return NextResponse.json(
+      { error: "agent_unavailable", count: 0, lastDiscovery: null, models: [], paidAI: false },
+      { status: 503 }
+    );
   }
 }

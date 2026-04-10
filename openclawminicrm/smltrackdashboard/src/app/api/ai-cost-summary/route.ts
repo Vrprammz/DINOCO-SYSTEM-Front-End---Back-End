@@ -40,7 +40,17 @@ export async function GET() {
       week: { thb: +((result?.weekCost || 0) * THB).toFixed(2), calls: result?.weekCalls || 0 },
       month: { thb: +((result?.monthCost || 0) * THB).toFixed(2), calls: result?.monthCalls || 0, tokens: result?.monthTokens || 0 },
     });
-  } catch {
-    return NextResponse.json({ today: { thb: 0, calls: 0, tokens: 0 }, yesterday: { thb: 0, calls: 0 }, week: { thb: 0, calls: 0 }, month: { thb: 0, calls: 0, tokens: 0 } });
+  } catch (e) {
+    console.error("[api/ai-cost-summary]", e);
+    return NextResponse.json(
+      {
+        error: "database_unavailable",
+        today: { thb: 0, calls: 0, tokens: 0 },
+        yesterday: { thb: 0, calls: 0 },
+        week: { thb: 0, calls: 0 },
+        month: { thb: 0, calls: 0, tokens: 0 },
+      },
+      { status: 503 }
+    );
   }
 }

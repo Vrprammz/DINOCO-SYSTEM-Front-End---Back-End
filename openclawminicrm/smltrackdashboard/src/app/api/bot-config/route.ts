@@ -9,7 +9,11 @@ export async function GET() {
     const res = await fetch(`${agentUrl()}/configs`, { next: { revalidate: 0 } });
     const data = await res.json();
     return NextResponse.json(data);
-  } catch {
-    return NextResponse.json([]);
+  } catch (e) {
+    console.error("[api/bot-config]", e);
+    return NextResponse.json(
+      { error: "agent_unavailable", data: [] },
+      { status: 503 }
+    );
   }
 }

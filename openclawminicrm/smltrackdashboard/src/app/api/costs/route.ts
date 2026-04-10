@@ -9,7 +9,19 @@ export async function GET() {
     const res = await fetch(`${AGENT_URL}/api/costs`, { next: { revalidate: 0 } });
     const data = await res.json();
     return NextResponse.json(data);
-  } catch {
-    return NextResponse.json({ today: {}, month: {}, daily: [], byFeature: [], byProvider: [], recent: [] });
+  } catch (e) {
+    console.error("[api/costs]", e);
+    return NextResponse.json(
+      {
+        error: "agent_unavailable",
+        today: {},
+        month: {},
+        daily: [],
+        byFeature: [],
+        byProvider: [],
+        recent: [],
+      },
+      { status: 503 }
+    );
   }
 }

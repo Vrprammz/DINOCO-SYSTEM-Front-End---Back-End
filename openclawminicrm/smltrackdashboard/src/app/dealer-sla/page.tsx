@@ -32,7 +32,7 @@ export default function DealerSLAPage() {
   const [weekOf, setWeekOf] = useState<string>("");
 
   useEffect(() => {
-    fetch("/api/proxy/dealer-sla")
+    fetch("/dashboard/api/proxy/dealer-sla")
       .then(res => res.json())
       .then(data => {
         if (data.report) {

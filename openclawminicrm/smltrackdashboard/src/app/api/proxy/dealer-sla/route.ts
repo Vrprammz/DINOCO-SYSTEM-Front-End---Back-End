@@ -42,6 +42,9 @@ export async function GET() {
     return NextResponse.json({ weekOf: now.toISOString(), report });
   } catch (e) {
     console.error("[API/dealer-sla]", e);
-    return NextResponse.json({ report: [] }, { status: 500 });
+    return NextResponse.json(
+      { error: "database_unavailable", report: [] },
+      { status: 503 }
+    );
   }
 }
