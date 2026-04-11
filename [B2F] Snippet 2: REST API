@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.8.5 — Audit C4: receive-goods dual-write verification (stock_add WP_Error guard + payable rollback)
+ * Version: V.8.6 — Audit C4 v2: stock verify BEFORE FSM transition (no rollback transition; FSM received→delivering illegal)
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -2793,34 +2793,9 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             update_field( 'rcv_reject_resolved', 0, $rcv_id );
         }
 
-        // V.8.5 — Audit C4: capture prev status for rollback
-        $prev_status = get_field( 'po_status', $po_id );
-
-        // Transition PO status
-        $new_status = $all_complete ? 'received' : 'partial_received';
-        if ( function_exists( 'b2f_transition_order' ) ) {
-            b2f_transition_order( $po_id, $new_status, 'admin', sprintf( 'Receiving %s', $rcv_number ) );
-        } else {
-            update_field( 'po_status', $new_status, $po_id );
-        }
-
-        if ( $all_complete ) {
-            if ( empty( get_field( 'po_actual_date', $po_id ) ) ) update_field( 'po_actual_date', wp_date( 'Y-m-d' ), $po_id );
-        }
-
-        // Add debt (payable)
-        $debt_added = false;
-        if ( $total_rcv_value > 0 && function_exists( 'b2f_payable_add' ) ) {
-            b2f_payable_add( $maker_id, $total_rcv_value, sprintf( 'รับของ %s', $rcv_number ), $po_id );
-            $debt_added = true;
-        }
-
-        // Update stock qty + status เมื่อรับของเข้า (Inventory V.3.0)
-        // V.8.5 — Audit C4: ต้อง verify dual-write success ทุก SKU —
-        // ถ้า stock_add เฟลแม้ตัวเดียว ให้ rollback payable + log CRITICAL
-        $inventory_updated = false;
-        $stock_errors      = array();
-        $stock_succeeded   = array(); // [ [sku,qty,unit_cost], ... ] สำหรับ rollback
+        // V.8.6 — Audit C4 v2: DO NOT transition PO yet. Stock write first; transition after success.
+        // Why: FSM `received → delivering` is illegal (Snippet 6 FSM table) → rollback transition
+        //      would silently fail, leaving PO in `received` with no stock rows.
         // ดึง unit_cost จาก PO items + exchange_rate สำหรับ Valuation
         $po_items_raw = get_field( 'po_items', $po_id ) ?: [];
         $po_exchange  = floatval( get_field( 'po_exchange_rate', $po_id ) ?: 1 );
@@ -2835,19 +2810,21 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             }
         }
 
+        // === Stage 1: Stock dual-write with early-abort on first failure ===
+        $inventory_updated = false;
+        $stock_errors      = array();
+        $stock_succeeded   = array(); // [ [sku,qty], ... ] สำหรับ rollback
+
         foreach ( $rcv_items as $ri ) {
             $sku = $ri['rcvi_sku'] ?? '';
             $qty = intval( $ri['rcvi_qty_received'] ?? 0 );
             if ( ! $sku || $qty <= 0 ) continue;
 
-            // ต้นทุนต่อหน่วย (THB) จาก PO items
             $unit_cost_thb = isset( $po_cost_map[ $sku ] ) ? $po_cost_map[ $sku ] : null;
 
-            // V.3.0: เพิ่ม stock_qty ผ่าน dinoco_stock_add() (atomic + transaction log)
             if ( function_exists( 'dinoco_stock_add' ) ) {
                 $stock_result = dinoco_stock_add( $sku, $qty, 'b2f_receive', 'b2f_receiving', $rcv_id, 'B2F receive PO ' . ( get_field( 'po_number', $po_id ) ?: $po_id ), '', null, $unit_cost_thb );
                 if ( is_wp_error( $stock_result ) ) {
-                    // Dual-write failed → log + break → rollback payable ภายหลัง
                     $stock_errors[] = sprintf( '%s(%d): %s', $sku, $qty, $stock_result->get_error_message() );
                     if ( function_exists( 'b2f_log' ) ) {
                         b2f_log( sprintf( '[C4 CRITICAL] dinoco_stock_add failed on receive-goods po=%d sku=%s qty=%d err=%s', $po_id, $sku, $qty, $stock_result->get_error_message() ) );
@@ -2857,7 +2834,6 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
                 $stock_succeeded[] = array( 'sku' => $sku, 'qty' => $qty );
                 $inventory_updated = true;
             }
-            // Backward compat: set_stock_status เดิม (ถ้า stock functions ยังไม่ load)
             elseif ( class_exists( 'DINOCO_Catalog' ) ) {
                 $product = DINOCO_Catalog::get_by_sku( $sku );
                 if ( $product && $product['stock_status'] === 'out_of_stock' ) {
@@ -2867,24 +2843,39 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             }
         }
 
-        // V.8.5 — Audit C4: ถ้ามี stock error → rollback ทุก op ก่อนหน้า + rollback payable + return error
+        // === Stage 1 failure: rollback stock only, delete rcv_id, leave PO unchanged ===
         if ( ! empty( $stock_errors ) ) {
-            // Rollback stock ที่สำเร็จไปแล้ว (reverse order)
             foreach ( array_reverse( $stock_succeeded ) as $ok ) {
                 if ( function_exists( 'dinoco_stock_subtract' ) ) {
                     dinoco_stock_subtract( $ok['sku'], $ok['qty'], 'b2f_receive_rollback', 'b2f_receiving', $rcv_id, 'Rollback receive PO ' . $po_id . ' (C4 dual-write fail)' );
                 }
             }
-            // Rollback payable
-            if ( $debt_added && function_exists( 'b2f_payable_subtract' ) ) {
-                b2f_payable_subtract( $maker_id, $total_rcv_value, sprintf( 'Rollback receive %s (C4)', $rcv_number ), $po_id );
+            // Log BEFORE delete so audit refers to a real post id
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( sprintf( '[C4 ROLLBACK] deleting rcv_id=%d for po=%d (errors=%s)', $rcv_id, $po_id, implode( '; ', $stock_errors ) ) );
             }
-            // Rollback receiving record + PO status
             wp_delete_post( $rcv_id, true );
-            if ( function_exists( 'b2f_transition_order' ) ) {
-                b2f_transition_order( $po_id, $prev_status ?? 'delivering', 'admin', 'Rollback: stock dual-write failed' );
-            }
+            // PO status untouched → still `delivering`/`partial_received` (legal upstream states)
             return new WP_Error( 'stock_dual_write_failed', 'บันทึกสต็อกไม่สำเร็จ ยกเลิกการรับของแล้ว: ' . implode( '; ', $stock_errors ), array( 'status' => 500 ) );
+        }
+
+        // === Stage 2: Stock succeeded → transition PO + add payable ===
+        $new_status = $all_complete ? 'received' : 'partial_received';
+        if ( function_exists( 'b2f_transition_order' ) ) {
+            b2f_transition_order( $po_id, $new_status, 'admin', sprintf( 'Receiving %s', $rcv_number ) );
+        } else {
+            update_field( 'po_status', $new_status, $po_id );
+        }
+
+        if ( $all_complete ) {
+            if ( empty( get_field( 'po_actual_date', $po_id ) ) ) update_field( 'po_actual_date', wp_date( 'Y-m-d' ), $po_id );
+        }
+
+        // Add debt (payable) — stock already committed; this is the last write and is idempotent via b2f_payable_add audit log
+        $debt_added = false;
+        if ( $total_rcv_value > 0 && function_exists( 'b2f_payable_add' ) ) {
+            b2f_payable_add( $maker_id, $total_rcv_value, sprintf( 'รับของ %s', $rcv_number ), $po_id );
+            $debt_added = true;
         }
 
         // V.5.1: Guaranteed push — Maker + Admin with text fallback + debug log

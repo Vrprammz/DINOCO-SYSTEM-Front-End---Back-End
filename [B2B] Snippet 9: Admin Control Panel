@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 9: Admin Control Panel                      ║
- * ║  Version: V.33.5 — C3/I13 audit fix: savePrintSettings confirm + importDistCSV dry-run with row errors ║
+ * ║  Version: V.33.6 — Audit H6: CSV dry-run duplicate detect + strict bool parse + phase-2 errors UI ║
  * ║  DB_ID: 58                                                  ║
  * ║  Shortcode: [b2b_admin_control]                            ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -939,23 +939,48 @@ function b2b_rest_flash_test_simulate_webhook( WP_REST_Request $req ) {
 function b2b_rest_import_distributors( WP_REST_Request $req ) {
     try {
     $rows = $req->get_param('rows');
-    $dry_run = (bool) $req->get_param('dry_run');
+    // V.33.6 — strict bool parse (string "false" / "0" = false, not true)
+    $dry_raw = $req->get_param('dry_run');
+    $dry_run = ($dry_raw === true || $dry_raw === 1 || $dry_raw === '1' || $dry_raw === 'true');
     if (!is_array($rows)||empty($rows)) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มีข้อมูล'),400);
     if (count($rows) > 500) return new WP_REST_Response(array('success'=>false,'message'=>'ข้อมูลเกินขีดจำกัด (สูงสุด 500 แถว)'),400);
-    // V.33.5 — Audit I13: dry-run + per-row error report
+
     $imported = 0;
     $skipped  = 0;
     $errors   = array();
+    $gid_seen_in_csv = array(); // V.33.6 — detect duplicate gid WITHIN same CSV
+
     foreach ($rows as $idx => $row) {
         $rownum = $idx + 2; // 1-based + header
         $shop = sanitize_text_field($row['shop_name'] ?? '');
         $gid = sanitize_text_field($row['line_group_id'] ?? '');
         if (empty($shop)) { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'shop_name','error'=>'missing shop_name'); continue; }
         if (empty($gid))  { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'line_group_id','error'=>'missing line_group_id'); continue; }
-        // numeric sanity checks
-        if (isset($row['credit_limit']) && $row['credit_limit'] !== '' && !is_numeric($row['credit_limit'])) { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'credit_limit','error'=>'not numeric'); continue; }
-        if (isset($row['credit_term_days']) && $row['credit_term_days'] !== '' && !is_numeric($row['credit_term_days'])) { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'credit_term_days','error'=>'not numeric'); continue; }
+
+        // V.33.6 — duplicate within CSV
+        if (isset($gid_seen_in_csv[$gid])) {
+            $skipped++;
+            $errors[] = array('row'=>$rownum,'field'=>'line_group_id','error'=>'duplicate gid (also on row ' . $gid_seen_in_csv[$gid] . ')');
+            continue;
+        }
+        $gid_seen_in_csv[$gid] = $rownum;
+
+        // numeric sanity checks — allow "1,000" style by stripping commas first
+        $cl_raw = isset($row['credit_limit']) ? str_replace(',', '', (string) $row['credit_limit']) : '';
+        if ($cl_raw !== '' && !is_numeric($cl_raw)) {
+            $skipped++;
+            $errors[] = array('row'=>$rownum,'field'=>'credit_limit','error'=>'not numeric (hint: ลบ comma หรือ unit ออก)');
+            continue;
+        }
+        $ct_raw = isset($row['credit_term_days']) ? str_replace(',', '', (string) $row['credit_term_days']) : '';
+        if ($ct_raw !== '' && !is_numeric($ct_raw)) {
+            $skipped++;
+            $errors[] = array('row'=>$rownum,'field'=>'credit_term_days','error'=>'not numeric');
+            continue;
+        }
+
         if ($dry_run) { $imported++; continue; }
+
         $exists = get_posts(array('post_type'=>'distributor','posts_per_page'=>1,'meta_query'=>array(array('key'=>'line_group_id','value'=>$gid))));
         if (!empty($exists)) { $id = $exists[0]->ID; } else {
             $id = wp_insert_post(array('post_type'=>'distributor','post_title'=>$shop,'post_status'=>'publish'));
@@ -963,8 +988,8 @@ function b2b_rest_import_distributors( WP_REST_Request $req ) {
         }
         update_field('shop_name',$shop,$id); update_field('line_group_id',$gid,$id);
         if (!empty($row['rank_system'])) update_field('rank_system',sanitize_text_field($row['rank_system']),$id);
-        if (isset($row['credit_limit'])) update_field('credit_limit',floatval($row['credit_limit']),$id);
-        if (isset($row['credit_term_days'])) update_field('credit_term_days',intval($row['credit_term_days']),$id);
+        if ($cl_raw !== '') update_field('credit_limit',floatval($cl_raw),$id);
+        if ($ct_raw !== '') update_field('credit_term_days',intval($ct_raw),$id);
         foreach (array('dist_phone','dist_province','dist_address','dist_district','dist_city','dist_postcode') as $af) {
             if (!empty($row[$af])) update_field($af,sanitize_text_field($row[$af]),$id);
         }
@@ -1904,12 +1929,21 @@ window.importDistCSV=function(input){
       }
       msg+='\nยืนยัน import จริง?';
       if(!confirm(msg))return;
-      // Phase 2: real import
+      // Phase 2: real import — V.33.6: show errors[] even on success
       api('POST','import-distributors',{rows:rows},function(r){
         if(r.success){
           var t='✅ Import '+r.imported+' ตัวแทน';
           if(r.skipped) t+=' (ข้าม '+r.skipped+' แถว)';
-          toast(t,'s');loadDists();
+          toast(t,'s');
+          if(r.errors && r.errors.length){
+            var detail='⚠ มี '+r.errors.length+' แถวถูกข้าม:\n\n';
+            r.errors.slice(0,20).forEach(function(err){
+              detail+='• Row '+err.row+(err.field?' ['+err.field+']':'')+': '+err.error+'\n';
+            });
+            if(r.errors.length>20) detail+='...(อีก '+(r.errors.length-20)+' ข้อผิดพลาด)';
+            alert(detail);
+          }
+          loadDists();
         }else{
           toast('❌ '+(r.message||'import failed'),'e');
         }

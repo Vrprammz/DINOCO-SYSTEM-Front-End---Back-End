@@ -2,7 +2,7 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
- * Version: V.33.3 — Audit C2+I7: Finance refund MVP (record-refund REST + cancel dep check)
+ * Version: V.33.4 — Audit C2 v2: refund atomic lock (FOR UPDATE via wpdb transaction) + force_cancel audit
  * DB_ID: 598
  * Dependencies: b2b_order CPT, distributor CPT, b2b_product CPT, ACF
  */
@@ -1530,51 +1530,81 @@ function dinoco_inv_rest_record_payment(WP_REST_Request $req) {
     }
 }
 
-// --- V.33.3 AUDIT C2: RECORD REFUND (reverse payment) ---
-// MVP: admin บันทึกการคืนเงิน — reverse debt + mark invoice refunded + audit trail
-// ไม่มี slip upload / LINE notify (ใส่ทีหลังได้)
+// --- V.33.4 AUDIT C2 v2: RECORD REFUND with atomic lock ---
+// ใช้ wpdb transaction + FOR UPDATE บน wp_postmeta rows ของ `_inv_paid_amount`
+// + `_inv_refunded_amount` เพื่อกัน race condition เมื่อ admin 2 คนกดพร้อมกัน
 function dinoco_inv_rest_record_refund(WP_REST_Request $req) {
+    global $wpdb;
     $id      = intval($req->get_param('id'));
     $amount  = floatval($req->get_param('amount'));
     $reason  = sanitize_text_field($req->get_param('reason') ?? '');
-    $method  = sanitize_text_field($req->get_param('method') ?? 'manual'); // manual|bank_transfer|cash
+    $method  = sanitize_text_field($req->get_param('method') ?? 'manual'); // manual|bank_transfer|cash|credit_note
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
     if ($amount <= 0) return new WP_Error('invalid', 'จำนวนเงินคืนต้องมากกว่า 0', ['status' => 400]);
     if (empty($reason)) return new WP_Error('invalid', 'กรุณาระบุเหตุผลการคืนเงิน', ['status' => 400]);
+    if (strlen($reason) > 500)  return new WP_Error('invalid', 'เหตุผลยาวเกินไป (สูงสุด 500 อักขระ)', ['status' => 400]);
 
-    $paid_so_far    = floatval(get_post_meta($id, '_inv_paid_amount', true));
-    $refunded_prev  = floatval(get_post_meta($id, '_inv_refunded_amount', true));
-    $refundable     = round($paid_so_far - $refunded_prev, 2);
-    if ($amount > $refundable + 0.01) {
-        return new WP_Error('overrefund', 'คืนเงินเกิน: คืนได้สูงสุด ฿' . number_format($refundable, 2), ['status' => 400]);
+    // Start atomic block
+    $wpdb->query('START TRANSACTION');
+    try {
+        // Lock rows for `_inv_paid_amount` and `_inv_refunded_amount` under FOR UPDATE
+        // (meta_id unique per post+key → one row each). If row doesn't exist, FOR UPDATE returns empty but lock intent still taken via post row.
+        $wpdb->get_row($wpdb->prepare(
+            "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s FOR UPDATE",
+            $id, '_inv_paid_amount'
+        ));
+        $wpdb->get_row($wpdb->prepare(
+            "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s FOR UPDATE",
+            $id, '_inv_refunded_amount'
+        ));
+        // Also lock the post row so cancel/paid-status changes serialize with us
+        $wpdb->get_row($wpdb->prepare(
+            "SELECT ID FROM {$wpdb->posts} WHERE ID=%d FOR UPDATE",
+            $id
+        ));
+
+        $paid_so_far   = floatval(get_post_meta($id, '_inv_paid_amount', true));
+        $refunded_prev = floatval(get_post_meta($id, '_inv_refunded_amount', true));
+        $refundable    = round($paid_so_far - $refunded_prev, 2);
+        if ($amount > $refundable + 0.01) {
+            $wpdb->query('ROLLBACK');
+            return new WP_Error('overrefund', 'คืนเงินเกิน: คืนได้สูงสุด ฿' . number_format($refundable, 2), ['status' => 400]);
+        }
+
+        $status = get_field('order_status', $id);
+        if (!in_array($status, ['paid', 'awaiting_payment', 'cancelled'], true)) {
+            $wpdb->query('ROLLBACK');
+            return new WP_Error('invalid_status', 'ไม่สามารถบันทึกการคืนเงินในสถานะนี้', ['status' => 400]);
+        }
+
+        // Record refund entry
+        $new_refunded = round($refunded_prev + $amount, 2);
+        $refund_log   = json_decode(get_post_meta($id, '_inv_refunds', true) ?: '[]', true);
+        if (!is_array($refund_log)) $refund_log = [];
+        $refund_log[] = [
+            'amount'   => $amount,
+            'reason'   => $reason,
+            'method'   => $method,
+            'date'     => b2b_date('Y-m-d H:i:s'),
+            'admin_id' => get_current_user_id(),
+            'admin'    => wp_get_current_user()->user_login,
+        ];
+        update_post_meta($id, '_inv_refunded_amount', $new_refunded);
+        update_post_meta($id, '_inv_refunds', wp_json_encode($refund_log, JSON_UNESCAPED_UNICODE));
+
+        $wpdb->query('COMMIT');
+    } catch (\Throwable $e) {
+        $wpdb->query('ROLLBACK');
+        b2b_log('[Refund] Exception: ' . $e->getMessage());
+        return new WP_Error('refund_error', 'บันทึกคืนเงินล้มเหลว: ' . $e->getMessage(), ['status' => 500]);
     }
 
-    $status = get_field('order_status', $id);
-    // อนุญาตคืนเงินได้สำหรับ: paid, awaiting_payment (partial paid), cancelled (ยกเลิกแล้วแต่ลืมคืนเงิน)
-    if (!in_array($status, ['paid', 'awaiting_payment', 'cancelled'], true)) {
-        return new WP_Error('invalid_status', 'ไม่สามารถบันทึกการคืนเงินในสถานะนี้', ['status' => 400]);
-    }
-
-    // Record refund entry
-    $new_refunded = round($refunded_prev + $amount, 2);
-    $refund_log   = json_decode(get_post_meta($id, '_inv_refunds', true) ?: '[]', true);
-    $refund_log[] = [
-        'amount'   => $amount,
-        'reason'   => $reason,
-        'method'   => $method,
-        'date'     => b2b_date('Y-m-d H:i:s'),
-        'admin_id' => get_current_user_id(),
-        'admin'    => wp_get_current_user()->user_login,
-    ];
-    update_post_meta($id, '_inv_refunded_amount', $new_refunded);
-    update_post_meta($id, '_inv_refunds', wp_json_encode($refund_log, JSON_UNESCAPED_UNICODE));
-
-    // Cascade: recalculate debt if dist linked
+    // --- Post-commit side effects (safe, no race on ledger) ---
     $dist_id = intval(get_post_meta($id, '_dist_post_id', true));
     $total   = floatval(get_field('total_amount', $id));
+    $net_paid = round($paid_so_far - $new_refunded, 2);
 
     // ถ้า invoice status = paid และ net paid ตอนนี้ < total → เปลี่ยนกลับเป็น awaiting_payment + re-bill
-    $net_paid = round($paid_so_far - $new_refunded, 2);
     if ($status === 'paid' && $net_paid < $total - 0.01) {
         b2b_set_order_status($id, 'awaiting_payment');
         update_field('is_billed', true, $id);
@@ -2017,12 +2047,17 @@ function dinoco_inv_rest_cancel(WP_REST_Request $req) {
     $paid_so_far = floatval(get_post_meta($id, '_inv_paid_amount', true));
     $refunded    = floatval(get_post_meta($id, '_inv_refunded_amount', true));
     $net_paid    = round($paid_so_far - $refunded, 2);
+    $force_reason = sanitize_text_field($req->get_param('force_reason') ?? '');
     if ($net_paid > 0.01 && ! $force) {
         return new WP_Error(
             'has_payments',
             sprintf('ใบแจ้งหนี้นี้มีการชำระแล้ว ฿%s — ต้องบันทึกคืนเงิน (refund) ก่อนจึงจะยกเลิกได้', number_format($net_paid, 2)),
             ['status' => 400, 'net_paid' => $net_paid]
         );
+    }
+    // V.33.4 — Audit H3: force-cancel ต้องมีเหตุผล + บันทึก audit แยกชัด
+    if ($force && $net_paid > 0.01 && empty($force_reason)) {
+        return new WP_Error('missing_reason', 'force=1 ต้องระบุเหตุผล (force_reason)', ['status' => 400]);
     }
     // Collect info before changing status (used for LINE notification below)
     $inv_no    = get_post_meta($id, '_inv_number', true);
@@ -2033,7 +2068,20 @@ function dinoco_inv_rest_cancel(WP_REST_Request $req) {
 
     dinoco_inv_reverse_debt($id);
     b2b_set_order_status($id, 'cancelled');
-    b2b_add_audit_log($id, 'cancelled', 'ยกเลิกใบแจ้งหนี้/วางบิล');
+    if ($force && $net_paid > 0.01) {
+        b2b_add_audit_log(
+            $id,
+            'force_cancelled',
+            sprintf(
+                '⚠️ FORCE ยกเลิกทั้งที่มี net_paid ฿%s — เหตุผล: %s — โดย %s',
+                number_format($net_paid, 2),
+                $force_reason,
+                wp_get_current_user()->user_login
+            )
+        );
+    } else {
+        b2b_add_audit_log($id, 'cancelled', 'ยกเลิกใบแจ้งหนี้/วางบิล');
+    }
 
     // Notify distributor LINE group that invoice has been cancelled
     if ($line_gid) {
