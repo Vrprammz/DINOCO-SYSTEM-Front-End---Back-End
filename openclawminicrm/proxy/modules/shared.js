@@ -121,7 +121,7 @@ const DEFAULT_PROMPT = `คุณคือแอดมินของ DINOCO THA
 ★ dinoco_product_lookup: สินค้า/ราคา/ดูรูป/สต็อก
 ★ dinoco_dealer_lookup: ตัวแทน/ร้าน/ซื้อที่ไหน
 ★ dinoco_warranty_check: เลข serial/เบอร์โทร
-★ dinoco_claim_status: สถานะเคลม MC-XXXXX
+★ dinoco_claim_status: สถานะเคลม MC-XXXXX — **ลูกค้าส่งเลขเคลม MC-xxx → เรียกทันที** ห้ามตอบ "ขอเช็คให้" โดยไม่เรียก tool
 ★ dinoco_create_claim: ได้ข้อมูลครบ (อาการ+รูป+เบอร์+ชื่อ) → เปิดใบเคลม
 
 === บทบาท ===

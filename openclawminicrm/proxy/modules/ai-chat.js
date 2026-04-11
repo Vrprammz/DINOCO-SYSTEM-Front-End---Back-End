@@ -531,7 +531,7 @@ const INTENT_PATTERNS = [
   { intent: "DEALER_INQUIRY", pattern: /ติด.*ที่ไหน|ติดตั้ง.*ที่ไหน|ติดได้ที่ไหน|ซื้อ.*ที่ไหน|ซื้อได้ที่ไหน|หาซื้อ|ร้าน.*แถว|ร้าน.*ไหน|มีร้าน|ตัวแทน.*จำหน่าย|หาตัวแทน|ร้านไหน|ร้านใกล้|แถว.*มีร้าน|จังหวัด.*มีร้าน|มีตัวแทน|ช่าง.*ที่ไหน|ช่าง.*แถว|ร้านติดตั้ง|ที่ไหนติด|ร้านแถว|ซื้อที่ไหน/i, reviewTier: "haiku", kbTags: ["ตัวแทน", "ร้าน", "จังหวัด"] },
 
   // --- Claim / Warranty ---
-  { intent: "CLAIM_STATUS", pattern: /^(MC|mc|Mc)\d{4,}|^\d{10,}|สถานะ.*เคลม.*\d|เคลม.*สถานะ.*\d/i, reviewTier: "none", kbTags: [] },
+  { intent: "CLAIM_STATUS", pattern: /MC[-\s]?\d{3,}|^\d{10,}|สถานะ.*เคลม|เคลม.*สถานะ|เช็ค.*เคลม/i, reviewTier: "none", kbTags: [] },
   { intent: "CLAIM_INQUIRY", pattern: /เคลม|ซ่อม|พัง|แตก|ลอก|ชำรุด|หัก|บุบ|ร้าว|ส่งซ่อม|เปลี่ยน.*ใหม่|ของเสีย|กุญแจหาย/i, reviewTier: "haiku", kbTags: ["เคลม", "ซ่อม", "ประกัน", "claim"] },
   { intent: "WARRANTY_INQUIRY", pattern: /ประกัน|กี่ปี|ลงทะเบียน|วารันตี|warranty|บัตรรับประกัน|เลขซีเรียล|serial/i, reviewTier: "haiku", kbTags: ["ประกัน", "5ปี", "ลงทะเบียน", "warranty"] },
 
