@@ -209,10 +209,10 @@ None — all v1 fixes still intact per spot-check.
   - Transient-primary pattern mirrors proven `b2f_rate_limit()` semantics
   - Refactored `[B2B] Snippet 3` V.40.6 cancel-request callsite
   - Smoke test: **17/17 PASS** on simulated non-persistent WP cache (default hosting)
-- [x] **M12** — ✅ RESOLVED by commit `<commit2>` (2026-04-12)
+- [x] **M12** — ✅ RESOLVED by commit `a2e2a2b` (2026-04-12)
   - Brand Voice V.2.8 + Finance V.3.19 auto-detect FormData via `FormData.has()` entry scan
   - `_bv: true` / `_fin: true` undocumented contract eliminated entirely
-- [x] **L1** — ✅ RESOLVED by commit `<commit2>` (2026-04-12)
+- [x] **L1** — ✅ RESOLVED by commit `a2e2a2b` (2026-04-12)
   - LINE Callback V.30.7 drops dead `!== 'GENERAL_LOGIN'` / `!== 'WARRANTY_PAGE'` guards at line 385
   - Upstream blocklist at line 301-307 verified to cover these cases
 - [ ] **Pattern debt** (tracked separately) — Audit other rate-limiting sites (`[Admin System] DINOCO Manual Invoice System:2183`, `[System] Member Dashboard Main`, LIFF AI `/auth`) for same bug class. Not blocking; existing sites use transient-primary correctly (verified).
@@ -223,7 +223,7 @@ None — all v1 fixes still intact per spot-check.
 
 **Commits**:
 - `b9c94cf` — H8 architectural fix (b2b_rate_limit helper + refactor)
-- `<commit2>` — M12 + L1 cleanup
+- `a2e2a2b` — M12 + L1 cleanup
 
 **Verification**:
 - Smoke test `/tmp/dinoco-smoke/test-rate-limit.php` (not committed) — 17/17 PASS
