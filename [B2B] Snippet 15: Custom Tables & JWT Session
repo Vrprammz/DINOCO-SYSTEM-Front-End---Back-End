@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
- * ║  Version: V.7.1 — DD-3 shared child fix (visited value-copy) + walk-in negative stock + leaf guard  ║
+ * ║  Version: V.7.2 — dinoco_get_wac_for_skus() per-SKU batch helper (for V.42.17 Margin Analysis)  ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -670,6 +670,12 @@ if ( ! function_exists( 'dinoco_stock_add' ) ) {
 
         $wpdb->query( 'COMMIT' );
         delete_transient( 'b2b_sku_data_map' ); // DD-5: invalidate cache ทุกครั้ง
+
+        // V.7.2 [V.42.17 HIGH #4 FIX]: ถ้าเป็น b2f_receive → invalidate WAC cache ของ SKU นี้
+        // (defense in depth — ไม่ rely on do_action hook อย่างเดียว)
+        if ( $type === 'b2f_receive' && function_exists( 'dinoco_invalidate_wac_cache' ) ) {
+            dinoco_invalidate_wac_cache( array( $sku ) );
+        }
 
         // Auto-update stock_status (outside transaction)
         dinoco_stock_auto_status( $sku );
@@ -1620,6 +1626,181 @@ if ( ! function_exists( 'dinoco_get_warehouses' ) ) {
  * 2. Fallback: B2F maker_product (mp_unit_cost × exchange_rate)
  * 3. ถ้าไม่มีเลย → cost = 0
  */
+/**
+ * V.7.2 [V.42.17]: Per-SKU WAC lookup — lightweight alternative to full inventory valuation
+ *
+ * Fast path for Margin Analysis card: compute WAC for N specific SKUs via single SQL query
+ * (avoids looping all B2F makers/products like dinoco_get_inventory_valuation).
+ *
+ * @param array $skus Array of SKU strings (case-insensitive)
+ * @return array Map of sku => ['wac' => float, 'source' => 'wac'|'b2f_maker'|'none', 'total_received' => int]
+ */
+if ( ! function_exists( 'dinoco_get_wac_for_skus' ) ) {
+    function dinoco_get_wac_for_skus( $skus ) {
+        if ( empty( $skus ) || ! is_array( $skus ) ) return array();
+        global $wpdb;
+        $txn_table = $wpdb->prefix . 'dinoco_stock_transactions';
+
+        // Normalize + uppercase
+        $norm_skus = array_values( array_unique( array_filter( array_map( function( $s ) {
+            return strtoupper( trim( (string) $s ) );
+        }, $skus ) ) ) );
+        if ( empty( $norm_skus ) ) return array();
+
+        // Check cache first — transient `dnc_wac_{sku_hash}` 1 ชม
+        $result = array();
+        $missing = array();
+        foreach ( $norm_skus as $sku ) {
+            $cached = get_transient( 'dnc_wac_' . md5( $sku ) );
+            if ( $cached !== false ) {
+                $result[ $sku ] = $cached;
+            } else {
+                $missing[] = $sku;
+            }
+        }
+        if ( empty( $missing ) ) return $result;
+
+        // V.42.17 [HIGH #3 FIX]: Batch SQL — ใช้ sku ตรงๆ (ไม่ UPPER()) เพราะ dinoco_stock_add()
+        //   normalize เป็น uppercase ก่อน insert อยู่แล้ว → idx (type, sku, ...) ใช้งานได้
+        $txn_exists = (bool) $wpdb->get_var( "SHOW TABLES LIKE '{$txn_table}'" );
+        $wac_map = array();
+        if ( $txn_exists ) {
+            $has_cost_col = (bool) $wpdb->get_var( "SHOW COLUMNS FROM {$txn_table} LIKE 'unit_cost_thb'" );
+            if ( $has_cost_col ) {
+                $placeholders = implode( ',', array_fill( 0, count( $missing ), '%s' ) );
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT sku,
+                            SUM(unit_cost_thb * qty_change) / NULLIF(SUM(qty_change), 0) AS avg_cost,
+                            SUM(qty_change) AS total_received
+                     FROM {$txn_table}
+                     WHERE type = 'b2f_receive'
+                       AND qty_change > 0
+                       AND unit_cost_thb IS NOT NULL
+                       AND unit_cost_thb > 0
+                       AND sku IN ({$placeholders})
+                     GROUP BY sku",
+                    ...$missing
+                ) );
+                if ( $rows ) {
+                    foreach ( $rows as $r ) {
+                        // Normalize key to uppercase เผื่อ row มี mixed-case (legacy data)
+                        $sku_upper = strtoupper( $r->sku );
+                        $wac_map[ $sku_upper ] = array(
+                            'wac' => round( (float) $r->avg_cost, 2 ),
+                            'source' => 'wac',
+                            'total_received' => (int) $r->total_received,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Fill missing with B2F maker_product fallback (only for SKUs still missing)
+        $still_missing = array_diff( $missing, array_keys( $wac_map ) );
+        if ( ! empty( $still_missing ) ) {
+            // V.42.17 [HIGH #2 FIX]: mp_product_sku เก็บใน DB ไม่การันตี uppercase (Snippet 2 B2F ไม่ normalize)
+            //   → meta_query IN เป็น case-sensitive → ต้อง fetch ทุก row แล้ว PHP post-filter
+            //   (Alternative: raw SQL with UPPER() — แต่ loop ทั้ง table หนักกว่าเพราะ mp rows โดยทั่วไป < 500 row)
+            $mp_query_args = array(
+                'post_type' => 'b2f_maker_product',
+                'posts_per_page' => -1,
+                'post_status' => 'publish',
+                'fields' => 'ids',
+            );
+            $mp_ids = get_posts( $mp_query_args );
+            $still_missing_set = array_flip( $still_missing ); // O(1) lookup
+            $b2f_by_sku = array();
+            $needed_makers = array();
+            foreach ( $mp_ids as $mp_id ) {
+                $mp_sku_raw = (string) get_field( 'mp_product_sku', $mp_id );
+                $mp_sku = strtoupper( trim( $mp_sku_raw ) );
+                // Filter: เฉพาะ SKU ที่ยังต้องการ (case-insensitive match)
+                if ( ! isset( $still_missing_set[ $mp_sku ] ) ) continue;
+                $mp_cost = floatval( get_field( 'mp_unit_cost', $mp_id ) ?: 0 );
+                $maker_id = intval( get_field( 'mp_maker_id', $mp_id ) ?: 0 );
+                if ( ! $mp_sku || $mp_cost <= 0 || ! $maker_id ) continue;
+                $b2f_by_sku[ $mp_sku ][] = array( 'cost' => $mp_cost, 'maker_id' => $maker_id );
+                $needed_makers[ $maker_id ] = true;
+            }
+            // Cache maker rates (10 min) — shared across calls
+            $maker_rates = array();
+            foreach ( array_keys( $needed_makers ) as $mid ) {
+                $rate_cache = get_transient( 'dnc_maker_rate_' . $mid );
+                if ( $rate_cache !== false ) {
+                    $maker_rates[ $mid ] = $rate_cache;
+                    continue;
+                }
+                $cur = get_field( 'maker_currency', $mid ) ?: 'THB';
+                $rate = 1.0;
+                if ( $cur !== 'THB' ) {
+                    $latest = $wpdb->get_var( $wpdb->prepare(
+                        "SELECT pm.meta_value FROM {$wpdb->posts} p
+                         JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = 'po_exchange_rate'
+                         JOIN {$wpdb->postmeta} pm2 ON p.ID = pm2.post_id AND pm2.meta_key = 'po_maker_id' AND pm2.meta_value = %s
+                         WHERE p.post_type = 'b2f_order' AND p.post_status = 'publish'
+                         ORDER BY p.post_date DESC LIMIT 1",
+                        $mid
+                    ) );
+                    $rate = $latest ? floatval( $latest ) : 1.0;
+                    if ( $rate <= 0 ) $rate = 1.0;
+                }
+                $rate_data = array( 'currency' => $cur, 'rate' => $rate );
+                $maker_rates[ $mid ] = $rate_data;
+                set_transient( 'dnc_maker_rate_' . $mid, $rate_data, 10 * 60 );
+            }
+            // Compute THB cost average per SKU
+            foreach ( $b2f_by_sku as $sku => $entries ) {
+                $total = 0;
+                $count = 0;
+                foreach ( $entries as $e ) {
+                    $rate = isset( $maker_rates[ $e['maker_id'] ] ) ? $maker_rates[ $e['maker_id'] ]['rate'] : 1.0;
+                    $total += round( $e['cost'] * $rate, 2 );
+                    $count++;
+                }
+                if ( $count > 0 ) {
+                    $wac_map[ $sku ] = array(
+                        'wac' => round( $total / $count, 2 ),
+                        'source' => 'b2f_maker',
+                        'total_received' => 0,
+                    );
+                }
+            }
+        }
+
+        // Fill final missing with 'none' + cache all results
+        foreach ( $missing as $sku ) {
+            $entry = isset( $wac_map[ $sku ] )
+                ? $wac_map[ $sku ]
+                : array( 'wac' => 0, 'source' => 'none', 'total_received' => 0 );
+            $result[ $sku ] = $entry;
+            set_transient( 'dnc_wac_' . md5( $sku ), $entry, HOUR_IN_SECONDS );
+        }
+
+        return $result;
+    }
+}
+
+/**
+ * V.7.2 [V.42.17]: Invalidate WAC cache for specific SKUs
+ * เรียกตอน B2F receive-goods เสร็จ (hook b2f_receive_completed) หรือเมื่อใดก็ตามที่ stock txn เพิ่มใหม่
+ */
+if ( ! function_exists( 'dinoco_invalidate_wac_cache' ) ) {
+    function dinoco_invalidate_wac_cache( $skus = array() ) {
+        if ( empty( $skus ) ) return;
+        if ( ! is_array( $skus ) ) $skus = array( $skus );
+        foreach ( $skus as $sku ) {
+            $norm = strtoupper( trim( (string) $sku ) );
+            if ( $norm ) delete_transient( 'dnc_wac_' . md5( $norm ) );
+        }
+    }
+}
+// Hook invalidation ถ้ามี B2F receive event (Snippet 2 B2F อาจ fire hook นี้ — ถ้าไม่มี cache จะ expire เองใน 1 ชม)
+add_action( 'b2f_receive_completed', function( $receive_id, $leaf_skus = array() ) {
+    if ( function_exists( 'dinoco_invalidate_wac_cache' ) && ! empty( $leaf_skus ) ) {
+        dinoco_invalidate_wac_cache( $leaf_skus );
+    }
+}, 10, 2 );
+
 if ( ! function_exists( 'dinoco_get_inventory_valuation' ) ) {
     function dinoco_get_inventory_valuation() {
         global $wpdb;

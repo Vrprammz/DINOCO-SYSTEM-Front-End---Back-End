@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.42.16 — Sum Integrity Check (แทน equal-split): header card + contribution % + sub-SET L+R check
+ * Version: V.42.17 — Margin Analysis (God Mode): JWT cap gate + per-SKU WAC + client-side profit lines + banner
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -1015,6 +1015,169 @@ if (!function_exists('dinoco_calculate_duration_thai')) {
 // [PART 1.5] REST API — Stock Management (namespace: dinoco-stock/v1)
 // =========================================================================================
 add_action('rest_api_init', function() {
+
+    // ─────────────────────────────────────────────────────────
+    // V.42.17: Margin Analysis (God Mode Only)
+    // ─────────────────────────────────────────────────────────
+
+    // POST /dinoco-stock/v1/god-mode/verify — verify PIN, issue short-lived JWT
+    register_rest_route('dinoco-stock/v1', '/god-mode/verify', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            $uid = get_current_user_id() ?: 0;
+
+            // V.42.17 [HIGH #1 FIX]: Rate limit check BEFORE hash_equals (prevent wasted cycles + sliding TTL)
+            $fail_key = 'dnc_god_fail_' . $uid;
+            $fail_data = get_transient( $fail_key );
+            $fail_count = 0;
+            $fail_expire_at = 0;
+            if ( is_array( $fail_data ) ) {
+                $fail_count = (int) ( $fail_data['count'] ?? 0 );
+                $fail_expire_at = (int) ( $fail_data['expire_at'] ?? 0 );
+            }
+            if ( $fail_count >= 5 && $fail_expire_at > time() ) {
+                $remaining = $fail_expire_at - time();
+                return new WP_Error(
+                    'rate_limited',
+                    'กรอก PIN ผิดครบ 5 ครั้ง — รออีก ' . ceil( $remaining / 60 ) . ' นาที',
+                    [ 'status' => 429 ]
+                );
+            }
+
+            $pin = $req->get_param('pin');
+            if ( ! $pin || ! defined('DINOCO_GOD_MODE_PIN') ) {
+                return new WP_Error( 'bad_pin', 'PIN ไม่ถูกต้อง', [ 'status' => 401 ] );
+            }
+            if ( ! hash_equals( (string) DINOCO_GOD_MODE_PIN, (string) $pin ) ) {
+                // Increment fail count — preserve TTL (don't reset)
+                $new_count = $fail_count + 1;
+                $expire_at = $fail_expire_at > time() ? $fail_expire_at : ( time() + 5 * MINUTE_IN_SECONDS );
+                $ttl_remaining = max( 1, $expire_at - time() );
+                set_transient( $fail_key, [ 'count' => $new_count, 'expire_at' => $expire_at ], $ttl_remaining );
+                return new WP_Error( 'bad_pin', 'PIN ไม่ถูกต้อง (ครั้งที่ ' . $new_count . '/5)', [ 'status' => 401 ] );
+            }
+
+            // PIN correct → clear fail counter
+            delete_transient( $fail_key );
+
+            // Issue JWT via DINOCO_JWT (30 min TTL)
+            if ( ! class_exists( 'DINOCO_JWT' ) ) {
+                return new WP_Error( 'jwt_unavailable', 'ระบบ JWT ไม่พร้อมใช้งาน', [ 'status' => 500 ] );
+            }
+            $token = DINOCO_JWT::create(
+                [ 'uid' => $uid, 'scope' => 'god_cost' ],
+                30 * MINUTE_IN_SECONDS
+            );
+            return rest_ensure_response( [ 'success' => true, 'token' => $token, 'ttl' => 30 * 60 ] );
+        },
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+    ]);
+
+    // GET /dinoco-stock/v1/margin-analysis?sku=XXX — cost breakdown (client-side tier math)
+    register_rest_route('dinoco-stock/v1', '/margin-analysis', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $req ) {
+            // 1. Verify god token from header
+            $token = $req->get_header( 'x_dinoco_god' );
+            if ( ! $token || ! class_exists( 'DINOCO_JWT' ) ) {
+                return new WP_Error( 'god_required', 'ต้องเปิด God Mode ก่อน', [ 'status' => 403 ] );
+            }
+            $payload = DINOCO_JWT::verify( $token );
+            if ( ! $payload || ($payload['scope'] ?? '') !== 'god_cost' ) {
+                return new WP_Error( 'god_invalid', 'God token หมดอายุหรือไม่ถูกต้อง', [ 'status' => 403 ] );
+            }
+            $uid = get_current_user_id() ?: 0;
+            if ( ($payload['uid'] ?? 0) !== $uid ) {
+                return new WP_Error( 'god_user_mismatch', 'God token ไม่ตรงกับผู้ใช้ปัจจุบัน', [ 'status' => 403 ] );
+            }
+
+            // 2. Rate limit — 30 req/min/user
+            $rl_key = 'dnc_margin_rl_' . $uid;
+            $count = (int) get_transient( $rl_key );
+            if ( $count >= 30 ) {
+                return new WP_Error( 'rate_limited', 'เรียกบ่อยเกินไป (สูงสุด 30 ครั้ง/นาที)', [ 'status' => 429 ] );
+            }
+            set_transient( $rl_key, $count + 1, MINUTE_IN_SECONDS );
+
+            // 3. Validate SKU
+            $sku = strtoupper( trim( (string) $req->get_param('sku') ) );
+            if ( ! $sku || ! preg_match( '/^[A-Z0-9\-_]{1,40}$/', $sku ) ) {
+                return new WP_Error( 'bad_sku', 'รูปแบบ SKU ไม่ถูกต้อง', [ 'status' => 400 ] );
+            }
+
+            // V.42.17: Audit log — บันทึกว่าใครเข้าถึง cost ของ SKU ไหน
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[Margin] uid=%d accessed cost for sku=%s', $uid, $sku ) );
+            }
+
+            // 4. Fetch product data (base_price + tier discounts)
+            if ( ! function_exists( 'b2b_get_product_data' ) ) {
+                return new WP_Error( 'helper_missing', 'ระบบ product data ไม่พร้อมใช้งาน', [ 'status' => 500 ] );
+            }
+            $product = b2b_get_product_data( $sku );
+            if ( ! $product ) {
+                return new WP_Error( 'sku_not_found', 'ไม่พบ SKU ใน catalog', [ 'status' => 404 ] );
+            }
+            $retail = floatval( $product['price_standard'] ?? $product['base_price'] ?? 0 );
+            if ( $retail < 0 ) $retail = 0;
+
+            // 5. Resolve leaves (SET → leaf children, single → self)
+            if ( ! function_exists( 'dinoco_get_leaf_skus' ) ) {
+                return new WP_Error( 'leaf_helper_missing', 'ระบบ leaf resolver ไม่พร้อมใช้งาน', [ 'status' => 500 ] );
+            }
+            $leaves = dinoco_get_leaf_skus( $sku );
+            if ( empty( $leaves ) ) $leaves = [ $sku ];
+            $is_set = ( count( $leaves ) > 1 ) || ( $leaves[0] !== $sku );
+
+            // 6. Batch WAC lookup
+            if ( ! function_exists( 'dinoco_get_wac_for_skus' ) ) {
+                return new WP_Error( 'wac_helper_missing', 'ระบบ WAC ไม่พร้อมใช้งาน', [ 'status' => 500 ] );
+            }
+            $wac_map = dinoco_get_wac_for_skus( $leaves );
+
+            // 7. Build leaf breakdown + total cost
+            //    NOTE: total_cost assumes qty=1 per leaf (SET schema limitation in dinoco_sku_relations).
+            //    ถ้า SET ใช้ leaf ซ้ำ (เช่น 2x bolt) → cost จะ undercount. ต้องขยาย schema ให้รองรับ qty ก่อน (out of scope V.42.17)
+            $leaf_breakdown = array();
+            $total_cost = 0;
+            $missing_wac = array();
+            foreach ( $leaves as $leaf ) {
+                $entry = $wac_map[ $leaf ] ?? array( 'wac' => 0, 'source' => 'none', 'total_received' => 0 );
+                $cost = (float) $entry['wac'];
+                $leaf_breakdown[] = array(
+                    'sku'    => $leaf,
+                    'wac'    => $cost,
+                    'source' => $entry['source'],
+                );
+                if ( $cost > 0 ) {
+                    $total_cost += $cost;
+                } else {
+                    $missing_wac[] = $leaf;
+                }
+            }
+            $is_incomplete = ! empty( $missing_wac );
+            $cost_source = ( $total_cost > 0 )
+                ? ( $is_incomplete ? 'partial' : 'complete' )
+                : 'none';
+
+            // V.42.17 [HIGH #5 FIX]: Dropped `tiers` field — frontend คำนวณ client-side
+            // จาก _marginContext.total_cost + live slider values (ไม่มี caller ใช้ tiers server-side)
+            return rest_ensure_response( array(
+                'success' => true,
+                'data' => array(
+                    'sku'            => $sku,
+                    'is_set'         => $is_set,
+                    'retail'         => round( $retail, 2 ),
+                    'leaf_breakdown' => $leaf_breakdown,
+                    'total_cost'     => round( $total_cost, 2 ),
+                    'cost_source'    => $cost_source,
+                    'is_incomplete'  => $is_incomplete,
+                    'missing_wac_leaves' => $missing_wac,
+                ),
+            ) );
+        },
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+    ]);
 
     // --- POST /dinoco-stock/v1/image-proxy (V.42.10) ---
     // Server-side fetch + base64 encode → แก้ CORS taint ใน Auto-Split generateLabeledImage
@@ -3644,6 +3807,8 @@ function dinoco_render_ui_v99() {
                     <div class="cedit-section-header">
                         <i class="fa-solid fa-tags"></i> ราคาตัวแทน (Distributor Pricing)
                     </div>
+                    <!-- V.42.17: Margin Analysis banner (god mode only, populated by renderMarginBanner) -->
+                    <div id="cat-margin-banner" style="display:none;margin-bottom:12px;"></div>
                     <div class="cedit-pricing-info">
                         <i class="fa-solid fa-coins"></i> กรอก % ส่วนลดแต่ละ tier (0 = ใช้ส่วนลดตัวแทนหลัก) ราคาจริง = ราคาปลีก x (1 - ส่วนลด%)
                     </div>
@@ -4003,7 +4168,28 @@ function dinoco_render_ui_v99() {
                     if (tb) { tb.classList.remove('hidden'); tb.style.display = 'flex'; }
                     var fi = document.getElementById('inv-filter');
                     if (fi) { fi.style.display = 'block'; fi.classList.add('active'); }
-                    alert('✅ God Mode Active\nAdvanced Search + แก้ไขสินค้า Unlocked');
+                    // V.42.17: Verify PIN ฝั่ง server → ได้ JWT สำหรับเข้า margin-analysis
+                    // เก็บใน sessionStorage (หายเมื่อปิด tab) — ไม่ใช้ localStorage
+                    $.ajax({
+                        url: STOCK_API_EARLY + '/god-mode/verify',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY },
+                        data: JSON.stringify({ pin: pin }),
+                        success: function(res) {
+                            if (res && res.success && res.token) {
+                                sessionStorage.setItem('dnc_god_token', res.token);
+                                sessionStorage.setItem('dnc_god_token_exp', Date.now() + (res.ttl * 1000));
+                                console.log('[God Mode] Server token issued (' + Math.round(res.ttl/60) + ' min)');
+                            } else {
+                                console.warn('[God Mode] Server verify failed — cost data unavailable');
+                            }
+                        },
+                        error: function(xhr) {
+                            console.warn('[God Mode] Server verify error:', xhr.status, xhr.responseText);
+                        }
+                    });
+                    alert('✅ God Mode Active\nAdvanced Search + แก้ไขสินค้า + Margin Analysis Unlocked');
                 } else {
                     alert('❌ PIN ไม่ถูกต้อง');
                 }
@@ -4138,30 +4324,143 @@ function dinoco_render_ui_v99() {
         };
 
         /* V.38.6: Show preview = "ราคาปลีก x (1 - disc%) = ราคาตัวแทน" */
+        /* V.42.17: Extend — แสดง profit + margin% ใต้ dealer price (god mode only) */
         window.updateTierPreview = function(tid) {
             var retail = parseFloat(String($('#cat-price').val()).replace(/,/g,'')) || 0;
             var discPct = parseFloat($('#cat-' + tid).val()) || 0;
             var marginEl = $('#margin-' + tid);
+            var dealerPrice = 0;
             if (retail > 0 && discPct > 0 && discPct <= 100) {
-                var dealerPrice = Math.round(retail * (1 - discPct / 100));
-                marginEl.text(Number(dealerPrice).toLocaleString() + ' ฿');
+                dealerPrice = Math.round(retail * (1 - discPct / 100));
+                marginEl.html(Number(dealerPrice).toLocaleString() + ' ฿');
                 marginEl.removeClass('positive negative zero').addClass('positive');
             } else if (discPct === 0) {
                 // 0 = ใช้ส่วนลดหลัก (b2b_discount_percent)
                 var mainDisc = parseFloat($('#cat-discount').val()) || 0;
                 if (retail > 0 && mainDisc > 0) {
-                    var fallbackPrice = Math.round(retail * (1 - mainDisc / 100));
-                    marginEl.text(Number(fallbackPrice).toLocaleString() + ' ฿ (default)');
+                    dealerPrice = Math.round(retail * (1 - mainDisc / 100));
+                    marginEl.html(Number(dealerPrice).toLocaleString() + ' ฿ <small style="color:#94a3b8;">(default)</small>');
                     marginEl.removeClass('positive negative zero').addClass('zero');
                 } else {
-                    marginEl.text('ใช้ส่วนลดหลัก').removeClass('positive negative zero').addClass('zero');
+                    marginEl.html('ใช้ส่วนลดหลัก').removeClass('positive negative zero').addClass('zero');
                 }
             } else {
-                marginEl.text('').removeClass('positive negative zero');
+                marginEl.html('').removeClass('positive negative zero');
+            }
+            // V.42.17: append profit line (god mode only + margin context loaded)
+            if ($('body').hasClass('god-mode') && window._marginContext && window._marginContext.total_cost > 0 && dealerPrice > 0) {
+                var cost = window._marginContext.total_cost;
+                var profit = Math.round(dealerPrice - cost);
+                var marginPct = dealerPrice > 0 ? ((profit / dealerPrice) * 100).toFixed(1) : 0;
+                var pColor, pIcon;
+                if (profit > 0) {
+                    pColor = '#16a34a'; pIcon = 'fa-arrow-trend-up';
+                } else if (profit < 0) {
+                    pColor = '#dc2626'; pIcon = 'fa-triangle-exclamation';
+                } else {
+                    pColor = '#64748b'; pIcon = 'fa-minus';
+                }
+                var sign = profit > 0 ? '+' : '';
+                var profitLine = '<div style="font-size:0.65rem;font-weight:700;color:'+pColor+';margin-top:3px;"><i class="fa-solid '+pIcon+'"></i> '+sign+Number(profit).toLocaleString()+'฿ ('+sign+marginPct+'%)</div>';
+                marginEl.append(profitLine);
             }
             // Mark as manually edited
             $('#cat-' + tid).data('auto-set', false);
         };
+
+        /* V.42.17: Fetch margin analysis from backend + prefetch context */
+        window.fetchMarginAnalysis = function(sku) {
+            var token = sessionStorage.getItem('dnc_god_token');
+            var tokenExp = parseInt(sessionStorage.getItem('dnc_god_token_exp') || '0');
+            if (!token || Date.now() > tokenExp) {
+                console.warn('[Margin] No valid god token — skip fetch');
+                $('#cat-margin-banner').hide();
+                return;
+            }
+            $.ajax({
+                url: STOCK_API_EARLY + '/margin-analysis?sku=' + encodeURIComponent(sku),
+                method: 'GET',
+                headers: {
+                    'X-WP-Nonce': STOCK_NONCE_EARLY,
+                    'X-Dinoco-God': token
+                },
+                success: function(res) {
+                    if (!res || !res.success || !res.data) {
+                        $('#cat-margin-banner').hide();
+                        return;
+                    }
+                    window._marginContext = res.data;
+                    renderMarginBanner(res.data);
+                    // Re-render tier previews to show profit lines
+                    ['ps','psi','pg','pp','pd'].forEach(function(tid) { updateTierPreview(tid); });
+                },
+                error: function(xhr) {
+                    if (xhr.status === 403) {
+                        console.warn('[Margin] God token expired/invalid — please re-activate god mode');
+                        sessionStorage.removeItem('dnc_god_token');
+                        sessionStorage.removeItem('dnc_god_token_exp');
+                    } else if (xhr.status === 429) {
+                        console.warn('[Margin] Rate limited (30/min)');
+                    } else {
+                        console.warn('[Margin] Fetch failed:', xhr.status);
+                    }
+                    $('#cat-margin-banner').hide();
+                }
+            });
+        };
+
+        /* V.42.17: Render margin banner ใน Tier Pricing section
+           MEDIUM #6 FIX: ใช้ jQuery .text() สำหรับ user data (SKU names) ป้องกัน XSS defense-in-depth */
+        function renderMarginBanner(data) {
+            var $banner = $('#cat-margin-banner');
+            if (!$banner.length) return;
+            $banner.empty();
+
+            if (data.cost_source === 'none') {
+                var $warn = $('<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;font-size:0.75rem;color:#92400e;"></div>');
+                $warn.append('<i class="fa-solid fa-triangle-exclamation"></i>');
+                $warn.append($('<span>').html('💎 God Mode — <b>ยังไม่มีต้นทุน WAC</b> (สินค้านี้ยังไม่เคย B2F receive)'));
+                $banner.append($warn).show();
+                return;
+            }
+
+            var $card = $('<div style="padding:10px 14px;background:linear-gradient(135deg,#1e293b,#334155);border:1px solid #475569;border-radius:10px;color:#fff;"></div>');
+
+            var $header = $('<div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;"></div>');
+            $header.append('<i class="fa-solid fa-gem" style="color:#06b6d4;"></i>');
+            $header.append('<span style="font-weight:700;color:#06b6d4;">GOD MODE — Margin Analysis</span>');
+            $card.append($header);
+
+            // Cost line
+            var costText = Number(data.total_cost).toLocaleString() + '฿';
+            var sourceLabel = data.is_set
+                ? 'รวมจาก ' + data.leaf_breakdown.length + ' ชิ้นส่วนย่อย'
+                : 'WAC';
+            var $costLine = $('<div style="margin-top:6px;font-size:0.82rem;"></div>');
+            $costLine.append('ต้นทุนรวม: ');
+            $costLine.append($('<b style="color:#fbbf24;">').text(costText));
+            $costLine.append($('<small style="color:#94a3b8;font-weight:400;">').text(' (' + sourceLabel + ')'));
+            $card.append($costLine);
+
+            $card.append('<div style="margin-top:2px;font-size:0.68rem;color:#94a3b8;">📊 คำนวณ profit + margin% ในแต่ละ tier ด้านล่าง (อัพเดทตามราคา/ส่วนลดที่แก้)</div>');
+
+            // Incomplete warning — use .text() for SKU names (XSS defense)
+            if (data.is_incomplete && Array.isArray(data.missing_wac_leaves)) {
+                var missingCount = data.missing_wac_leaves.length;
+                var $warn = $('<div style="margin-top:4px;font-size:0.68rem;color:#dc2626;"></div>');
+                $warn.append('<i class="fa-solid fa-triangle-exclamation"></i> ขาดต้นทุน ' + missingCount + ' ชิ้น: ');
+                var preview = data.missing_wac_leaves.slice(0, 3);
+                preview.forEach(function(sku, i) {
+                    if (i > 0) $warn.append(', ');
+                    $warn.append($('<span>').text(String(sku))); // ← escaped
+                });
+                if (missingCount > 3) $warn.append('...');
+                $warn.append(' (คำนวณจากของที่มี)');
+                $card.append($warn);
+            }
+
+            $banner.append($card).show();
+        }
 
         /* Autocomplete for child component search */
         window.filterChildOptions = function(query) {
@@ -4567,12 +4866,20 @@ function dinoco_render_ui_v99() {
                     } catch(e) { _compatModels = []; }
                     renderMotoChips();
                     loadMotoBrands();
-                    // V.35: Show avg cost if valuation available
-                    if (window._valuationMap && window._valuationMap[sku]) {
+                    // V.35: Show avg cost if valuation available (hidden in god mode — banner replaces)
+                    // V.42.17 [MEDIUM #8 FIX]: เมื่อ god mode เปิด → hide #cat-avg-cost เพราะ banner แสดงข้อมูลเดียวกัน + profit line
+                    var isGodMode = $('body').hasClass('god-mode');
+                    if (!isGodMode && window._valuationMap && window._valuationMap[sku]) {
                         $('#cat-avg-cost').show();
                         $('#cat-avg-cost-val').text('ราคาทุนเฉลี่ย (WAC): ' + Number(window._valuationMap[sku]).toLocaleString() + ' บาท');
                     } else {
                         $('#cat-avg-cost').hide();
+                    }
+                    // V.42.17: Margin Analysis fetch (god mode only)
+                    window._marginContext = null;
+                    $('#cat-margin-banner').hide();
+                    if (isGodMode) {
+                        fetchMarginAnalysis(sku);
                     }
                     // V.39.1: Context-aware banner
                     var $banner = $('#cedit-context-banner');
@@ -4746,6 +5053,7 @@ function dinoco_render_ui_v99() {
         }
 
         /* V.42.15: Re-render children list เมื่อราคาแม่เปลี่ยน → suggestion อัพเดท live */
+        /* V.42.17: + refresh all tier previews (for profit line update in god mode) */
         var _priceSuggestDebounce = null;
         $(document).on('input', '#cat-price', function() {
             if (_priceSuggestDebounce) clearTimeout(_priceSuggestDebounce);
@@ -4754,6 +5062,8 @@ function dinoco_render_ui_v99() {
                 if (currentSku && skuRelations[currentSku] && skuRelations[currentSku].length > 0) {
                     renderCatChildren(currentSku);
                 }
+                // V.42.17: refresh all tier previews (profit line depends on retail)
+                ['ps','psi','pg','pp','pd'].forEach(function(tid) { updateTierPreview(tid); });
             }, 250);
         });
 

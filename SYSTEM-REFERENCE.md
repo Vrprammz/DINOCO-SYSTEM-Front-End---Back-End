@@ -301,6 +301,8 @@ Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DI
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | POST | `/image-proxy` | Admin | **V.42.10** Server-side fetch รูป + base64 encode → แก้ CORS taint ใน Auto-Split generateLabeledImage (https only, 10MB limit, image/* check) |
+| POST | `/god-mode/verify` | Admin | **V.42.17** Verify god PIN → issue JWT 30 min (scope=god_cost). Rate limit 5 failures/5min/user. Used for Margin Analysis access |
+| GET | `/margin-analysis?sku=X` | Admin + `X-Dinoco-God` JWT | **V.42.17** Per-SKU cost + tier margin breakdown. Requires god token in header. Rate limit 30 req/min/user. Uses `dinoco_get_wac_for_skus()` batch + `b2b_compute_dealer_price()` for tier fallback |
 | GET | `/stock/list` | Admin | List products with stock + filter (status/search/warehouse_id/type_filter) |
 | POST | `/stock/adjust` | Admin | Manual stock adjust (+leaf guard DD-2) |
 | GET | `/stock/transactions` | Admin | Transaction history |
@@ -727,6 +729,8 @@ Product catalog stored in custom table (separate from b2b_product CPT) — sourc
 |----------|-----------|----------|
 | `dinoco_stock_add` | `($sku, $qty, $type, $ref_type, $ref_id, $reason, $batch_id, $warehouse_id, $unit_cost_thb)` | **V.7.1 H2**: ถ้า `!dinoco_is_leaf_sku($sku)` → return `WP_Error('not_leaf')` + log CRITICAL. caller ต้อง expand leaf ก่อน |
 | `dinoco_stock_subtract` | `($sku, $qty, $type, $ref_type, $ref_id, $reason, $batch_id, $warehouse_id, $allow_negative=false)` | **V.7.1 C3**: param `$allow_negative` — walk-in order ส่ง `true` ให้ stock ติดลบได้ตาม DD-5. honor ทั้ง `dinoco_products.stock_qty` + `dinoco_warehouse_stock`. **H2**: leaf guard เหมือน add |
+| `dinoco_get_wac_for_skus` | `($skus)` → `array` sku → `{wac, source, total_received}` | **V.7.2 [V.42.17]**: Batch WAC lookup — 1 SQL query ผ่าน `dinoco_stock_transactions WHERE type='b2f_receive'`. Fallback ไป `b2f_maker_product` × exchange rate. Per-SKU transient cache 1 ชม (`dnc_wac_{md5}`). Maker rate cache 10 นาที. ใช้แทน `dinoco_get_inventory_valuation()` ที่หนักเกินสำหรับ Margin Analysis |
+| `dinoco_invalidate_wac_cache` | `($skus)` | Invalidate per-SKU WAC cache. Auto-hook `b2f_receive_completed` action — ถ้า B2F receive fire event นี้จะ clear cache ให้ |
 
 **Stock Logic (V.7.1):**
 - **Stock Deduct** (B2B order): `dinoco_get_leaf_skus()` resolve ลง leaf → ตัดเฉพาะ leaf SKUs. Snippet 2 V.34.2 detect `_b2b_is_walkin` → ส่ง `allow_negative=true`

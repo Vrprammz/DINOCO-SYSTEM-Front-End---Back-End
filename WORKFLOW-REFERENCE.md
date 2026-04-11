@@ -1287,6 +1287,24 @@ V.42.16 Sum Integrity Check (Phase 2 Redesign)
     - mismatch: "⚠️ ลูกรวมเกิน/ต่ำกว่า +/-X฿ (+/-Y%)"
   Per-grandchild: "ราคาจริง · Y% ของ sub-SET" (fallback "ของแม่")
   Live update: input handler บน #cat-price debounced 250ms (เหมือน V.42.15)
+
+V.42.17 Margin Analysis (God Mode Only)
+  Backend-enforced cost visibility — ไม่ rely on client-side class
+  Endpoints:
+    POST /dinoco-stock/v1/god-mode/verify — PIN → JWT 30 min (HMAC via DINOCO_JWT)
+    GET  /dinoco-stock/v1/margin-analysis?sku=X — header X-Dinoco-God required
+  Permissions: manage_options cap + valid god JWT + rate limit 30/min/user
+  Helper: dinoco_get_wac_for_skus() batch (Snippet 15 V.7.2) — 1 SQL query
+         fallback b2f_maker_product × exchange rate, cache 1 ชม per SKU
+  Client flow:
+    1. Admin กด god badge → prompt PIN → POST /god-mode/verify → JWT ใน sessionStorage
+    2. openEditCatalogModal → ถ้า god → fetchMarginAnalysis(sku) → prefetch _marginContext
+    3. updateTierPreview(tid) extend → append profit line ใต้ dealer price
+       (client-side math ไม่เรียก API ซ้ำ — แก้ราคา/ส่วนลด → refresh ทันที)
+    4. Banner ใน Tier Pricing section: ต้นทุน WAC + source + incomplete warning
+  Incomplete handling: partial cost + list missing_wac_leaves (not silent 0)
+  Security note: god mode client-side class ยังใช้สำหรับ UI gate (ปุ่ม edit)
+                 แต่ cost data enforce ฝั่ง server — DevTools manipulation ไม่เข้า
 ```
 
 ---
