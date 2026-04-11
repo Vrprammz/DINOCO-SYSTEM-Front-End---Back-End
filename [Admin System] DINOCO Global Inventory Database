@@ -2,7 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
- * Version: V.42.9 — CRITICAL fix: save grandchild ได้ (skipRelations ไม่ block child ที่มี grandchildren)
+ * Version: V.42.10 — CORS fallback: WP image-proxy endpoint + retry ใน generateLabeledImage
  * DB_ID: 22
  * Author: DINOCO Senior Architect
  */
@@ -992,6 +992,50 @@ if (!function_exists('dinoco_calculate_duration_thai')) {
 // [PART 1.5] REST API — Stock Management (namespace: dinoco-stock/v1)
 // =========================================================================================
 add_action('rest_api_init', function() {
+
+    // --- POST /dinoco-stock/v1/image-proxy (V.42.10) ---
+    // Server-side fetch + base64 encode → แก้ CORS taint ใน Auto-Split generateLabeledImage
+    // รูปจาก external CDN ไม่มี Access-Control-Allow-Origin → canvas.toBlob throw SecurityError
+    // → proxy ผ่าน WP ให้กลายเป็น same-origin data URL
+    register_rest_route('dinoco-stock/v1', '/image-proxy', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            $url = $req->get_param('url');
+            if ( ! $url || ! filter_var( $url, FILTER_VALIDATE_URL ) ) {
+                return new WP_Error( 'bad_url', 'Invalid URL', [ 'status' => 400 ] );
+            }
+            // Security: https only + size limit 10MB
+            $parsed = wp_parse_url( $url );
+            if ( empty( $parsed['scheme'] ) || ! in_array( $parsed['scheme'], [ 'http', 'https' ], true ) ) {
+                return new WP_Error( 'bad_scheme', 'Only http/https allowed', [ 'status' => 400 ] );
+            }
+            $response = wp_remote_get( $url, [
+                'timeout' => 10,
+                'headers' => [ 'User-Agent' => 'DINOCO-ImageProxy/1.0' ],
+            ] );
+            if ( is_wp_error( $response ) ) {
+                return new WP_Error( 'fetch_failed', $response->get_error_message(), [ 'status' => 502 ] );
+            }
+            $code = wp_remote_retrieve_response_code( $response );
+            if ( $code !== 200 ) {
+                return new WP_Error( 'upstream_error', "Upstream returned {$code}", [ 'status' => 502 ] );
+            }
+            $body = wp_remote_retrieve_body( $response );
+            if ( strlen( $body ) > 10 * 1024 * 1024 ) {
+                return new WP_Error( 'too_large', 'Image >10MB', [ 'status' => 413 ] );
+            }
+            $content_type = wp_remote_retrieve_header( $response, 'content-type' );
+            if ( strpos( $content_type, 'image/' ) !== 0 ) {
+                return new WP_Error( 'not_image', "Not an image (type={$content_type})", [ 'status' => 400 ] );
+            }
+            return rest_ensure_response( [
+                'success'  => true,
+                'data_url' => 'data:' . $content_type . ';base64,' . base64_encode( $body ),
+                'size'     => strlen( $body ),
+            ] );
+        },
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+    ]);
 
     // --- GET /dinoco-stock/v1/stock/list ---
     register_rest_route('dinoco-stock/v1', '/stock/list', [
@@ -5041,54 +5085,116 @@ function dinoco_render_ui_v99() {
         };
 
         // V.41.1 — สร้างรูปลูกจากรูปแม่ + overlay text (แถบสีแดงด้านล่าง)
+        // V.42.10 — เพิ่ม CORS fallback: ถ้า canvas tainted → proxy ผ่าน WP REST → retry
+        function _renderLabeledCanvas(img, labelText, callback) {
+            try {
+                // V.42.3: canvas = aspect ratio ของรูปต้นฉบับ + ขนาดใหญ่ขึ้น (maxDim 1600)
+                var maxDim = 1600;
+                var srcW = img.width, srcH = img.height;
+                var scale = Math.min(maxDim / srcW, maxDim / srcH, 1);
+                var cw = Math.round(srcW * scale);
+                var ch = Math.round(srcH * scale);
+
+                var canvas = document.createElement('canvas');
+                canvas.width = cw;
+                canvas.height = ch;
+                var ctx = canvas.getContext('2d');
+
+                // วาดรูปเต็ม canvas (ไม่มีขอบ)
+                ctx.drawImage(img, 0, 0, cw, ch);
+
+                // V.42.3: แถบแดงซ้อนทับด้านล่างรูป — 16% ของ canvas height
+                var barHeight = Math.round(ch * 0.16);
+                var barY = ch - barHeight;
+                ctx.fillStyle = '#dc2626'; // red-600
+                ctx.fillRect(0, barY, cw, barHeight);
+
+                // V.42.3: Text overlay (Thai) — 50% ของ bar height
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold ' + Math.round(barHeight * 0.50) + 'px "Noto Sans Thai", "Sarabun", sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(labelText, cw / 2, barY + barHeight / 2);
+
+                canvas.toBlob(function(blob) {
+                    if (!blob) { callback(null, 'toBlob failed'); return; }
+                    callback(blob, null);
+                }, 'image/jpeg', 0.9);
+            } catch (err) {
+                // CORS taint → canvas.toBlob / getImageData throw SecurityError
+                callback(null, (err && err.message) || 'canvas tainted (CORS)');
+            }
+        }
+
         function generateLabeledImage(parentImgUrl, labelText, colIdx, callback) {
-            var img = new Image();
-            img.crossOrigin = 'anonymous';
-            img.onload = function() {
-                try {
-                    // V.42.3: canvas = aspect ratio ของรูปต้นฉบับ + ขนาดใหญ่ขึ้น (maxDim 1600)
-                    // → รูปเต็มเฟรมไม่มีขอบขาว → แถบแดงซ้อนทับบนรูปจริง + ความละเอียดสูงขึ้น
-                    var maxDim = 1600;
-                    var srcW = img.width, srcH = img.height;
-                    var scale = Math.min(maxDim / srcW, maxDim / srcH, 1);
-                    var cw = Math.round(srcW * scale);
-                    var ch = Math.round(srcH * scale);
-
-                    var canvas = document.createElement('canvas');
-                    canvas.width = cw;
-                    canvas.height = ch;
-                    var ctx = canvas.getContext('2d');
-
-                    // วาดรูปเต็ม canvas (ไม่มีขอบ)
-                    ctx.drawImage(img, 0, 0, cw, ch);
-
-                    // V.42.3: แถบแดงซ้อนทับด้านล่างรูป — 16% ของ canvas height (ให้ text อ่านชัด)
-                    var barHeight = Math.round(ch * 0.16);
-                    var barY = ch - barHeight;
-                    ctx.fillStyle = '#dc2626'; // red-600
-                    ctx.fillRect(0, barY, cw, barHeight);
-
-                    // V.42.3: Text overlay (Thai) — 50% ของ bar height (bar หนาขึ้นแล้ว → font ใหญ่ขึ้นในภาพรวม)
-                    ctx.fillStyle = '#ffffff';
-                    ctx.font = 'bold ' + Math.round(barHeight * 0.50) + 'px "Noto Sans Thai", "Sarabun", sans-serif';
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillText(labelText, cw / 2, barY + barHeight / 2);
-
-                    // Convert to blob
-                    canvas.toBlob(function(blob) {
-                        if (!blob) { callback(null, 'toBlob failed'); return; }
-                        callback(blob, null);
-                    }, 'image/jpeg', 0.9);
-                } catch (err) {
-                    // CORS taint → canvas.toBlob / getImageData จะ throw SecurityError
-                    callback(null, (err && err.message) || 'canvas tainted (CORS)');
-                }
+            // V.42.10: ลองโหลดตรงก่อน (crossOrigin anonymous) — ถ้าเจอ CORS taint → proxy ผ่าน WP
+            var tried_proxy = false;
+            var doLoad = function(srcUrl, useCors) {
+                var img = new Image();
+                if (useCors) img.crossOrigin = 'anonymous';
+                img.onload = function() {
+                    _renderLabeledCanvas(img, labelText, function(blob, err) {
+                        if (blob) return callback(blob, null);
+                        // CORS taint หรือ render fail → ลอง proxy
+                        if (!tried_proxy) {
+                            tried_proxy = true;
+                            console.warn('[AutoSplit] Canvas tainted, retrying via WP proxy...', err);
+                            $.ajax({
+                                url: STOCK_API_EARLY + '/image-proxy',
+                                method: 'POST',
+                                contentType: 'application/json',
+                                headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY },
+                                data: JSON.stringify({ url: parentImgUrl }),
+                                timeout: 15000
+                            }).done(function(resp) {
+                                if (resp && resp.data_url) {
+                                    doLoad(resp.data_url, false); // data URL = same-origin, ไม่ต้อง crossOrigin
+                                } else {
+                                    callback(null, 'proxy returned no data_url');
+                                }
+                            }).fail(function(xhr) {
+                                var msg = (xhr.responseJSON && xhr.responseJSON.message) || xhr.statusText || 'proxy error';
+                                console.error('[AutoSplit] proxy failed:', msg);
+                                callback(null, 'proxy: ' + msg);
+                            });
+                        } else {
+                            callback(null, 'render failed even via proxy: ' + err);
+                        }
+                    });
+                };
+                img.onerror = function() {
+                    if (!tried_proxy && useCors) {
+                        // load fail with CORS → ลองไม่ใช้ CORS header (บาง CDN block CORS แต่ allow ปกติ)
+                        console.warn('[AutoSplit] crossOrigin load failed, retrying direct...');
+                        doLoad(srcUrl, false);
+                    } else if (!tried_proxy) {
+                        // direct load fail → ลอง proxy
+                        tried_proxy = true;
+                        console.warn('[AutoSplit] direct load failed, retrying via WP proxy...');
+                        $.ajax({
+                            url: STOCK_API_EARLY + '/image-proxy',
+                            method: 'POST',
+                            contentType: 'application/json',
+                            headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY },
+                            data: JSON.stringify({ url: parentImgUrl }),
+                            timeout: 15000
+                        }).done(function(resp) {
+                            if (resp && resp.data_url) {
+                                doLoad(resp.data_url, false);
+                            } else {
+                                callback(null, 'image load failed + proxy no data');
+                            }
+                        }).fail(function(xhr) {
+                            var msg = (xhr.responseJSON && xhr.responseJSON.message) || 'proxy error';
+                            callback(null, 'image + proxy both failed: ' + msg);
+                        });
+                    } else {
+                        callback(null, 'image load failed');
+                    }
+                };
+                img.src = srcUrl;
             };
-            img.onerror = function() {
-                callback(null, 'image load failed');
-            };
-            img.src = parentImgUrl;
+            doLoad(parentImgUrl, true);
         }
 
         window.useParentImage = function(colIdx) {
