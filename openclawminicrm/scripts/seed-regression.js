@@ -333,14 +333,14 @@ const SCENARIOS = [
       { role: "user", message: "รถผม NX500 เป็นตัวแต่งจากศูนย์ครับ อยากเพิ่มกล่องข้าง" },
     ],
     assertions: {
+      // Deterministic regex (ไม่ใช้ semantic judge เพราะ Gemini ไม่ consistent)
+      // ห้าม "สีดำ"/"black" เด็ดขาด — ถ้า AI แนะนำชุดสีดำ = fail
+      forbidden_patterns: [
+        { pattern: "สีดำ|black", flags: "i", reason: "ห้ามเสนอสีดำ — DINOCO Edition มีกล่องหลังสีเงิน" },
+        { pattern: "Pro\\s*Rack\\s*Full|Full\\s*Set\\s*Pro", flags: "i", reason: "ห้ามแนะนำ Pro Rack Full — มีแร็คหลังมาแล้ว" },
+      ],
       required_patterns: [
         { pattern: "เงิน|silver|DNCGND37LSPROS", flags: "i", reason: "ต้องแนะนำสีเงิน" },
-      ],
-      expect_behavior:
-        "ลูกค้าบอกว่าเป็นตัวแต่งจากศูนย์ (DINOCO Edition) AI ต้องแนะนำ SKU DNCGND37LSPROS สีเงินเท่านั้น — ห้ามเสนอสีดำเพราะตัวแต่งศูนย์มีกล่องหลังสีเงินมาอยู่แล้ว",
-      must_not_do: [
-        "ห้ามเสนอสีดำ เพราะ DINOCO Edition NX500 มีกล่องหลังสีเงินมาแล้ว",
-        "ห้ามแนะนำ Pro Rack Full เพราะมีแร็คหลังมาแล้ว",
       ],
     },
     retry_on_flaky: 1,
