@@ -21,7 +21,7 @@
 | 3 | ✅ **Resolved** | **M13** | Rate-limit pattern drift — 2 real holdouts migrated to `b2b_rate_limit()`; 1 site (god-mode PIN failure counter) documented as intentional exception; 1 audit false positive (`dnc_maker_rate_` is a data cache, not a rate limiter) | Brand Voice Pool V.2.9 + Inventory V.42.20 → **fixed in `403d6d4`** |
 | 4 | ✅ **Resolved** | **M14** | `wp_remote_*` timeout drift — re-scan with smart variable-tracing showed 54 total HTTP callers, 53 already OK, 1 real gap | `[System] LINE Callback:336` V.30.8 → **fixed in `c1fcd46`** |
 | 5 | 🟡 **Medium** | **M15** | Flex Card builder proliferation — **128 Flex builder functions**, 62 in `[B2B] Snippet 1` alone. No canonical base helper → altText defaults, color palette, header/footer style all duplicated | `[B2B] Snippet 1:281-2500` (spans ~2200 lines of builders) |
-| 6 | 🟡 **Medium** | **M16** | Direct `update_field('order_status'/'po_status'/'ticket_status', ...)` in 17 genuine FSM-bypass sites (after filtering initial draft + fallback branches) | `[Admin System] DINOCO Service Center & Claims:101,610`, `[B2F] Snippet 2:1153,1489,1591,1665,3362,3721,3885,3993`, `[B2B] Snippet 3:718,720`, `[System] Member Dashboard Main:288,307`, `[B2B] Snippet 5:142,146` |
+| 6 | ✅ **Resolved** | **M16** | FSM-bypass sites — Sprint 2 Phase 0 reality check found audit over-counted 8×. Only 2 B2B walk-in edit sites were genuine primary-path bypasses; all B2F sites are legitimate `function_exists` fallback patterns; claim sites overlapped with M18 and are resolved there | `[B2B] Snippet 3:718,720` V.40.7 → **fixed in `4fc4c16`**. Claim sites resolved via M18. B2F re-audited: 0 real bypasses. |
 | 7 | 🟡 **Medium** | **M17** | Postback dispatch is **not** a table — 67 postback buttons defined in Flex cards but handlers live in ad-hoc `if/elseif` chains in webhook gateway (2 dispatch sites). Adding a new button requires editing 2 files | `[B2B] Snippet 2: LINE Webhook Gateway`, `[B2F] Snippet 3: Webhook Handler` |
 | 8 | 🔵 **Low** | **L2** | 5 JS `innerHTML=` sites use string concatenation with server-returned fields without an escape helper (`esc()` missing) — low XSS risk since admin-only pages, but inconsistent with the `.innerHTML = esc(...)` pattern used everywhere else | `[Admin System] KB Trainer Bot v2.0:432`, `[B2B] Snippet 12:1965`, `[B2B] Snippet 9:1577,2040`, `[LIFF AI] Snippet 2:1732` |
 | 9 | 🔵 **Low** | **L3** | Capability model is binary — 76/78 `current_user_can()` checks use `manage_options`. No separate roles for finance / inventory / B2F admin → granting dashboard access requires full admin | global |
@@ -1052,9 +1052,9 @@ For every closed finding in v1 (26 items) + v2 (11 items) + v3 (3 items) = 40 it
 |---|---|---:|---|
 | ~~M13~~ | Migrate rate-limit holdouts to `b2b_rate_limit()` | ~~2h~~ → 0 | ✅ **closed in `403d6d4` (Sprint 1 / 2026-04-12)** |
 | ~~M14~~ | Add explicit timeout to untimed `wp_remote_*` calls | ~~1h~~ → 0 | ✅ **closed in `c1fcd46` (Sprint 1 / 2026-04-12)** |
-| M16 | Migrate 17 FSM-bypass `update_field` sites to FSM helpers | 5h | pending |
+| ~~M16~~ | Migrate FSM-bypass sites (audit said 17, reality was 2) | ~~5h~~ → 0 | ✅ **closed in `4fc4c16` (Sprint 2 / 2026-04-12)** |
 | M17 | Canonicalize postback dispatch into a table | 4h | pending |
-| M18 | Extract `dinoco_set_claim_status($id, $new, $actor)` helper | 2h | pending |
+| ~~M18~~ | Extract `dinoco_set_claim_status()` helper + migrate 8 sites | ~~2h~~ → 0 | ✅ **closed in `d1a5054` + `c48aaa7` (Sprint 2 / 2026-04-12)** |
 
 ### P3 — This quarter / architectural
 
@@ -1249,12 +1249,213 @@ Then replace `current_user_can('manage_options')` with granular caps per endpoin
 | v3 (3 items: H8, M12, L1) | 3 | 3 | 0 |
 | v1-review P1 (H9, H10) | 2 | 2 | 0 |
 | v1-review P2 Sprint 1-A (M13, M14) | 2 | 2 | 0 |
-| **Total** | **44** | **44** | **0** |
+| v1-review P2 Sprint 2 (M16, M18) | 2 | 2 | 0 |
+| v1-review P2 Sprint 2 (**NEW** M20) | 1 | 0 | 1 |
+| **Total** | **47** | **46** | **1** |
 
 ### Remaining non-blocking work (v1-review P2 + P3)
 
-- **P2** (3 items, ~11h): M16 (17 FSM bypasses), M17 (postback dispatch), M18 (claim FSM helper)
-- **P3** (10+ items, ~40h): M15 (Flex consolidation), M19 (debt recon UI), L2–L8 (misc low), second-brain doc updates
+- **P2** (1 item, ~4h): M17 (postback dispatch canonicalization)
+- **P3** (11+ items, ~48h): M15 (Flex consolidation), M19 (debt recon UI), **M20 (claim state canonicalization — NEW, observability-dependent, ~8h)**, L2–L8 (misc low), second-brain doc updates
+
+### M16 + M18 resolution details — Sprint 2 (2026-04-12)
+
+**M18 — Canonical claim-status helper** (commits `d1a5054`, `c48aaa7`)
+
+Sprint 2 Phase 0 reality check found the audit under-counted claim-status write sites (3 → 9 raw writes, of which 8 are genuine transitions and 1 is initial ticket creation). More importantly, the state space is **free-form text with ~6 variants per logical state** (Thai + English + slug + PascalCase) across 5 files — no canonical enum exists.
+
+Option A (prompt-confirmed): build a soft-allowlist helper with filter-driven vocabulary + observability for M20, rather than a strict transition matrix that would require a product canonicalization decision first.
+
+**Helper design** (`[Admin System] DINOCO Service Center & Claims` V.30.5):
+
+- `dinoco_set_claim_status($claim_id, $to_state, $context = [])` — returns `true` | `WP_Error`
+- Filter: `apply_filters('dinoco/claim/allowed_states', [])` — each subsystem registers its vocabulary
+- Idempotency: `from === to` → `WP_Error('terminal_state')`, no write
+- Appends `status_history` ACF field + `post_meta` fallback (mirrors LIFF AI V.1.5 pattern)
+- Fires `do_action('dinoco/claim/state_changed', $id, $from, $to, $context)`
+- Records every transition attempt (including rejections) to `wp_option 'dinoco_claim_observations'` (autoload=false, cap 200, trim to top-100 by count on overflow)
+- **Observation recorded BEFORE allowlist check** — captures even invalid_state attempts so M20 analysis sees vocabulary drift
+
+**Filter registrations** (explicit ownership per subsystem):
+
+| Subsystem | File | States registered |
+|---|---|---|
+| Service Center | `[Admin System] DINOCO Service Center & Claims` V.30.5 | 6 authoritative labels + `'Registered in System'` + `'In Transit to Company'` |
+| LIFF AI | `[LIFF AI] Snippet 1` V.1.6 | 6 authoritative labels (duplicate registration is safe — merge dedups) |
+| Member Dashboard | `[System] Member Dashboard Main` V.30.4 | 6 legacy variants (`'registered'`, `'Awaiting Customer Shipment'`, `'wait_shipping'`, `'รอลูกค้าส่งสินค้า'`, `'waiting_for_customer'`) + 2 member-side slugs (`'shipping_in'`, `'completed'`) |
+
+Combined allowlist after filter merge: **15 unique states**.
+
+**Sites migrated (8 transitions)** in commit `c48aaa7`:
+
+1. `[Admin System] Service Center:auto_close_cron` — 30-day auto-close (actor=system)
+2. `[Admin System] Service Center:update_claim_status` — admin UI action (actor=admin)
+3. `[LIFF AI] Snippet 1:/claim/status` — admin-side status update (actor=auth.uid)
+4. `[System] MCP Bridge:claim_manual_update` — chatbot status update (actor=chatbot) with defensive raw-write fallback on `invalid_state`
+5. `[System] Dashboard Assets List:save_track` — member tracking upload → `shipping_in`
+6. `[System] Dashboard Assets List:confirm_receipt` — member confirm → `completed`
+7. `[System] Member Dashboard Main:save_track` — member tracking → `In Transit to Company`
+8. `[System] Member Dashboard Main:confirm_receipt` — member confirm → `Maintenance Completed`
+
+**NOT migrated** (intentional): `[System] DINOCO Claim System:275` is an initial ticket creation on `wp_insert_post`, not a transition — skipping avoids the helper's `empty_state` branch when `from_state` is empty.
+
+**Smoke test** `/tmp/dinoco-lint/test-m18-helper.php` — **9/9 PASS**:
+- 3 subsystem filters merge to 15 unique states ✓
+- Happy-path transition fires 1 hook + 1 history entry ✓
+- Idempotent re-apply returns `WP_Error('terminal_state')`, 0 hooks ✓
+- Unknown state returns `WP_Error('invalid_state')`, 0 hooks ✓
+- Chain transition (In Transit → Maintenance Completed) works ✓
+- Observability records both transitions ✓
+- Legacy slug variant accepted via Member Dashboard filter ✓
+- Observability cap (250 → 100) trims correctly ✓
+- Hook payload shape (id, from, to, context) verified ✓
+
+All 5 modified files pass `php -l` via `<?php` wrapper.
+
+**M16 — FSM bypass migration** (commit `4fc4c16`)
+
+Sprint 2 Phase 0 reality check exposed a significant audit over-count. See "Phase 7 methodology caveat" below.
+
+**Sites migrated (2)**: `[B2B] Snippet 3: LIFF E-Catalog REST API:718,720` V.40.7 — walk-in and non-walk-in order edit paths that reset an existing order's status to `awaiting_confirm` / `checking_stock`. Previously raw `update_field` → hooks never fired. Now routed through `b2b_set_order_status()` with a defensive fallback that still fires `do_action('b2b_order_status_changed', ...)` if the helper hasn't loaded.
+
+**FSM table caveat acknowledged**: the current B2B FSM table doesn't include every edge this edit path needs (e.g. `'pending'` isn't in the table; `'checking_stock' → 'checking_stock'` is a self-loop; `'checking_stock' → 'awaiting_confirm'` is admin-only). These will trigger soft-fallback logs from `b2b_set_order_status()` — the writes still succeed via the fallback branch which fires the hook manually. The log entries are telemetry for future FSM table tightening.
+
+**Sites NOT migrated** (categorised in Phase 0 reality check):
+
+| Category | Count | Reason |
+|---|---:|---|
+| Internal FSM class body writes | 2 | Inside `B2B_Order_FSM::transition()` + `b2b_set_order_status()` fallback body |
+| Initial `'draft'` on `wp_insert_post` | 5 | Not a transition — new order creation |
+| `function_exists` defensive fallbacks | 18 | Correct pattern, hook still fires in the `else` branch |
+| Manual-hook defensive fallbacks (Sprint 1 H9) | 2 | My own H9 fix — fires hook directly in `else` branch |
+| **Total legitimate non-bypasses** | **27** | — |
+
+### ⚠️ Phase 7 methodology caveat (added 2026-04-12 during Sprint 2)
+
+The Full Loop Review v1 Phase 7 count of **"17 genuine FSM-bypass sites"** was over-counted by approximately **4×** because the filtering heuristic only excluded:
+- Initial `'draft'` state + sites inside files with "FSM" in the name
+
+It did NOT exclude:
+- `function_exists('b2b_set_order_status') { helper } else { raw update + hook }` defensive fallback patterns
+- Internal method body writes (inside `B2B_Order_FSM::transition()` method itself — the FSM writes its own target field)
+- Manual-hook defensive fallbacks (e.g. Sprint 1 H9 pattern where the `else` branch fires `do_action` manually)
+- Replacement PO / invoice creations that set an initial state on a freshly-inserted post
+
+After Sprint 2 Phase 0 re-classification using context-aware grep + 20+ targeted file reads, the real breakdown was:
+
+| Count source | Value |
+|---:|---|
+| Audit Phase 7 claim | 17 genuine bypasses |
+| Raw grep (all `update_field` writes to state fields) | 40 (16 B2B + 15 B2F + 9 claim) |
+| **Real primary-path bypasses after classification** | **10** (0 B2F + 2 B2B walk-in edit + 8 claim transitions) |
+| Over-count factor | **1.7×** (compared to the original 17 claim, which was itself already filtered) |
+
+**Lesson for future audits**: when counting "direct FSM bypass" sites, the classification filter must include:
+1. Inline `if (function_exists(...)) { ... } else { raw }` patterns — the primary path uses the helper, the fallback is a safety net.
+2. Writes inside the FSM method body itself — the FSM is the only code allowed to write the target field directly.
+3. Writes after the `else` branch of a `function_exists` guard that also fires `do_action` manually — that's a conscious hook-preservation fallback, not a bypass.
+4. `wp_insert_post` followed immediately by a state write — that's initial creation, not a transition.
+
+The Full Loop Review workflow documentation (`.second-brain/workflows/full-loop-review.md`) should be updated with this rubric. Tracked as a separate wiki task — not code debt.
+
+---
+
+## 🆕 M20 — Claim state canonicalization (NEW 2026-04-12, non-blocking, observability-dependent)
+
+**Severity**: 🟡 Medium
+**Status**: **Open** — observability data collection in progress
+**Effort**: ~8h (2h analysis after 2–4 weeks of data + 4h migration + 2h UI to view observation log)
+**Priority**: P3 (blocks on data, not code)
+**Discovered by**: Sprint 2 Phase 0 reality check while scoping M18
+
+### Problem
+
+The `claim_ticket.ticket_status` field is **free-form text with ~6 variants per logical state**. The same logical state ("customer hasn't shipped yet") is represented as any of these strings depending on which file wrote it:
+
+```
+'Registered in System'         (Service Center default on new ticket)
+'registered'                   (lowercase slug — legacy client build?)
+'Awaiting Customer Shipment'   (PascalCase English)
+'wait_shipping'                (snake_case slug)
+'รอลูกค้าส่งสินค้า'                (Thai phrase)
+'waiting_for_customer'         (snake_case English)
+```
+
+Evidence: `[System] Member Dashboard Main:287` has a single `in_array` guard checking all 6 variants at once — a tell that at least one of each has been seen in production over the years.
+
+Similarly, the "completed" state appears as `'Maintenance Completed'` (LIFF AI authoritative), `'completed'` (Dashboard Assets List slug), and possibly more.
+
+### Why it's M20 (not resolved in Sprint 2)
+
+- Building a strict transition matrix like `B2B_Order_FSM` requires picking ONE canonical label per logical state.
+- Picking is a product decision (which label becomes canonical? what happens to existing records with legacy labels? do we migrate the DB or add grandfather shims?).
+- Without canonicalization, the Sprint 2 helper uses a soft allowlist that accepts all 15 known variants.
+- Any label reduction today would need data: **which variants are actually still being written?** The `dinoco_claim_observations` wp_option collects exactly this.
+
+### Data collection
+
+As of commit `d1a5054`, every call to `dinoco_set_claim_status()` records the `(from, to)` pair in `wp_option 'dinoco_claim_observations'`:
+
+```
+md5(from || to) => {
+    'from'       => 'Registered in System',
+    'to'         => 'In Transit to Company',
+    'count'      => 143,
+    'first_seen' => '2026-04-12 14:02:00',
+    'last_seen'  => '2026-04-26 09:17:33'
+}
+```
+
+- Cap: 200 entries max, trim to top-100 by count on overflow
+- Storage: `autoload=false` so it doesn't bloat every WP request
+- Observation is recorded **before** the allowlist check, so invalid-state attempts are captured too (critical for finding chatbot vocabulary drift from OpenClaw agent)
+
+### Analysis plan (after 2–4 weeks)
+
+1. Pull the `dinoco_claim_observations` option.
+2. Build a frequency table of `(from, to)` pairs sorted by count.
+3. Identify synonym clusters: if two from-state strings transition to the same to-state with similar distribution, they're the same logical state.
+4. Propose a canonical label per cluster.
+5. Product review → confirm canonical names.
+6. Data migration: `UPDATE wp_postmeta SET meta_value = canonical WHERE meta_value IN (legacy_variants)`.
+7. Tighten the filter allowlist to accept only canonical names going forward.
+8. Build a strict `B2B_Claim_FSM` class if transition rules become clear from the data.
+
+### UI to support M20
+
+Admin should be able to see the observation log without SSH. Proposed tab under `[dinoco_admin_claims]`:
+
+```
+┌─ Claim State Observations (M20 data collection) ────────────────┐
+│  Total observations: 1,247                                       │
+│  Unique transitions: 34                                          │
+│  Data range: 2026-04-12 → 2026-04-26 (14 days)                  │
+│                                                                  │
+│  from                        to                    count  last  │
+│  ──────────────────────────  ────────────────────  ─────  ────  │
+│  Registered in System        In Transit to Co.      143   2h    │
+│  registered                  shipping_in             89   1d    │
+│  In Transit to Company       Maintenance Comp.       76   3h    │
+│  ...                                                             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Effort: ~2h (simple table view of the wp_option).
+
+### Dependencies
+
+- None. Can start collecting data immediately (already live as of commit `d1a5054`).
+- Analysis should wait for ≥2 weeks of production traffic for statistical significance.
+- Product decision required before migration step.
+
+### Related
+
+- Sprint 2 Commit 1 (`d1a5054`) — helper + observability foundation
+- Sprint 2 Commit 2 (`c48aaa7`) — 8 sites now feeding observations
+- [[dinoco-data-model]] — CPT definitions (may need update to document canonical state list after M20)
+- [[dinoco-openclaw-integration]] — chatbot sends free-form status strings via MCP Bridge
+
+---
 
 ### M13 + M14 resolution details — Sprint 1-A (2026-04-12)
 
