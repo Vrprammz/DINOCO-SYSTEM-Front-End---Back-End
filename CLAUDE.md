@@ -292,3 +292,39 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - `openclawminicrm/docs/regression-guard.md` — Regression Guard System V.1.5 full design
 - `openclawminicrm/docs/dealer-management-spec.md` — Dealer Management V.2.0 spec + Full Loop Workflow
 - `openclawminicrm/docs/telegram-gung-spec.md` — น้องกุ้ง Telegram Command Center V.1.0 spec
+
+---
+
+## 🧠 Second Brain Integration
+
+repo นี้เชื่อมกับ central knowledge wiki ที่ `.second-brain/`
+(symlink ไปที่ `~/Projects/second-brain/wiki/`, gitignored)
+
+### Startup — ทุก session ใหม่อ่านตามลำดับ
+
+1. `.second-brain/hot-cache.md` — ~500 words, current focus + recent changes
+2. `.second-brain/log.md` — entries บนสุด 3 อัน (ประวัติล่าสุด cross-session)
+3. CLAUDE.md นี้ — DINOCO-specific conventions
+
+### Post-fix — หลังแก้บัค/ฟีเจอร์ต้อง log 3 ที่
+
+1. Git commit (เหมือนเดิม)
+2. `.second-brain/log.md` — append entry บนสุด ตาม format ใน
+   `.second-brain/../schemas/fix.template.md`
+3. `.second-brain/hot-cache.md` — อัปเดต "Recent Changes" ถ้า change สำคัญ
+
+### Workflow references
+
+- Bug fix: `.second-brain/workflows/bug-fix.md`
+- Ingest: `.second-brain/workflows/ingest.md`
+- Query: `.second-brain/workflows/query.md`
+- Decision: `.second-brain/workflows/decision.md`
+- Lint: `.second-brain/workflows/lint.md`
+- Research: `.second-brain/workflows/research.md`
+
+### ⚠️ ห้าม
+
+- อย่า `git add .second-brain` — เป็น symlink ออกนอก repo
+- อย่าแก้ไฟล์ใน second-brain ที่ไม่เกี่ยวกับ DINOCO
+  (concepts ทั่วไป, meta-knowledge) ถ้าไม่แน่ใจ ถาม user ก่อน
+- ถ้า `.second-brain` หาย (ย้ายเครื่อง?) → แจ้ง user, อย่า assume
