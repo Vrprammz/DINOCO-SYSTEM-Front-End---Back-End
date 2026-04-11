@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
- * ║  Version: V.34.2 — Walk-in allow_negative (DD-5) ผ่าน dinoco_stock_subtract  ║
+ * ║  Version: V.34.3 — M17: b2b_dispatch_postback() wrapper (observability + uniform 3s dedup) ║
  * ║  DB_ID: 51                                                  ║
  * ║  DINOCO B2B Smart Order System                              ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -188,7 +188,9 @@ function b2b_process_line_webhook( WP_REST_Request $request ) {
             $data = isset($event['postback']['data']) ? $event['postback']['data'] : '';
             // Bot disabled — block ทุก postback ยกเว้น slip_pay (เลือกบิลจากสลิป)
             if ( $_bot_disabled && strpos($data, 'action=slip_pay') === false ) continue;
-            b2b_handle_postback( $data, $group_id, $user_id, $reply_token );
+            // M17 (Sprint 3): route through dispatch wrapper for observability + uniform dedup.
+            // Wrapper delegates to b2b_handle_postback() unchanged — see ADR-M17-postback-dispatch.md
+            b2b_dispatch_postback( $data, $group_id, $user_id, $reply_token );
         }
       } catch ( Exception $e ) {
         b2b_log('[WEBHOOK ERROR] ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
@@ -445,6 +447,68 @@ function b2b_route_bot_command( $text, $group_id, $user_id, $reply_token ) {
     // NO MATCH
     if ( mb_substr($text, 0, 1) === '@' || mb_substr($raw_text, 0, 1) === '@' ) {
         b2b_line_reply($reply_token, "❓ ไม่รู้จักคำสั่ง: \"".$text."\"\nพิมพ์ \"คำสั่ง\" เพื่อดูรายการทั้งหมด");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// POSTBACK DISPATCH WRAPPER — M17 Sprint 3 (Option B+)
+// ════════════════════════════════════════════════════════════════
+// Wraps b2b_handle_postback() with:
+//   1. Observability — records every action string hit in
+//      wp_option 'dinoco_postback_observations' (autoload=false, cap 500)
+//      BEFORE dispatch so unknown/dead actions are captured for future
+//      cleanup decisions (follows Sprint 2 M18 observability-first pattern).
+//   2. Uniform 3-second dedup keyed on md5(group_id|postback_data) —
+//      replaces per-handler advisory locks that have drifted over time
+//      (b2b_lock_$tid, b2b_lock_recv_$tid, b2b_lock_delivery_$tid, ...).
+//      Handler-level locks stay in place as belt-and-suspenders.
+//
+// Handler logic is explicitly NOT modified. See docs/ADR-M17-postback-dispatch.md
+// for the Option B+ decision rationale (rejected full $GLOBALS registry refactor
+// because Phase 0 showed the existing switch is already canonical).
+if ( ! function_exists( 'b2b_dispatch_postback' ) ) {
+    function b2b_dispatch_postback( $postback_data, $group_id, $user_id, $reply_token ) {
+        // 1. Parse action name for observability + logging
+        //    Query-string format is used by 96% of actions; fallback to colon
+        //    split handles the LIFF AI 'lead_accepted:{$lead_id}' outlier.
+        $params = array();
+        parse_str( (string) $postback_data, $params );
+        $action = isset( $params['action'] ) ? (string) $params['action'] : '';
+        if ( $action === '' && $postback_data !== '' ) {
+            $action = explode( ':', (string) $postback_data, 2 )[0];
+        }
+        if ( $action === '' ) { $action = '__empty__'; }
+
+        // 2. Observability FIRST — before dedup + dispatch.
+        //    Sprint 2 M18 lesson: moving observation after the check silently
+        //    drops invalid/unknown actions from the dataset, which is exactly
+        //    the data M21 canonicalization would need most. Record everything,
+        //    classify later.
+        $obs = get_option( 'dinoco_postback_observations', array() );
+        if ( ! is_array( $obs ) ) $obs = array();
+        $obs[ $action ] = isset( $obs[ $action ] ) ? (int) $obs[ $action ] + 1 : 1;
+        // Hostile-input containment: cap to 500 unique actions, trim lowest-
+        // frequency entries when exceeded (retain top-400 by count).
+        if ( count( $obs ) > 500 ) {
+            arsort( $obs );
+            $obs = array_slice( $obs, 0, 400, true );
+        }
+        update_option( 'dinoco_postback_observations', $obs, false );
+
+        // 3. Uniform 3-second dedup — replaces drift across per-handler locks.
+        //    Keyed on (group_id + postback_data) so the same button tapped in
+        //    two different groups is NOT treated as a duplicate.
+        $dedup_key = 'b2b_pb_dedup_' . md5( (string) $group_id . '|' . (string) $postback_data );
+        if ( get_transient( $dedup_key ) ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Postback] duplicate suppressed (3s): action=' . substr( $action, 0, 40 ) );
+            }
+            return;
+        }
+        set_transient( $dedup_key, 1, 3 );
+
+        // 4. Dispatch — hand off to existing switch statement unchanged.
+        return b2b_handle_postback( $postback_data, $group_id, $user_id, $reply_token );
     }
 }
 
