@@ -6,6 +6,7 @@
 **Method**: Static review — 10 phases, parallel greps, targeted reads, cross-reference against `.second-brain/` topic pages.
 **Commit audited**: `34689d2`
 **Report size target**: 700–1000 lines
+**Status**: ✅ **H9 + H10 RESOLVED (2026-04-12)** — see "Resolution" section at end. Both High items closed in commit `b1b8a30`.
 
 ---
 
@@ -15,8 +16,8 @@
 
 | # | Severity | Code | Title | Evidence |
 |---|---|---|---|---|
-| 1 | 🔴 **High** | **H9** | Flash auto-update bypasses `b2b_set_order_status()` — `packed→shipped→completed` never fires `b2b_order_status_changed` hook | `[B2B] Snippet 5: Admin Dashboard:142,146` |
-| 2 | 🔴 **High** | **H10** | `verify-member` endpoint has no rate limit — LINE Group enumeration + LINE API quota burn attack | `[B2B] Snippet 1:981-1042` |
+| 1 | ✅ **Resolved** | **H9** | Flash auto-update bypasses `b2b_set_order_status()` — `packed→shipped→completed` never fires `b2b_order_status_changed` hook | `[B2B] Snippet 5: Admin Dashboard:142,146` → **fixed in `b1b8a30` (V.32.3)** |
+| 2 | ✅ **Resolved** | **H10** | `verify-member` endpoint has no rate limit — LINE Group enumeration + LINE API quota burn attack | `[B2B] Snippet 1:981-1042` → **fixed in `b1b8a30` (V.33.2)** |
 | 3 | 🟡 **Medium** | **M13** | Rate-limit pattern drift still present — 3 raw-transient callsites (Brand Voice, Inventory god-mode, B2B Snippet 15) haven't been migrated to `b2b_rate_limit()` helper | `[Admin System] DINOCO Brand Voice Pool:361`, `[Admin System] DINOCO Global Inventory Database:1210`, `[B2B] Snippet 15:1728` |
 | 4 | 🟡 **Medium** | **M14** | 9 `wp_remote_*` calls have no explicit `timeout` → default 5s but some (LINE Callback, MCP Bridge, Transfer page) sit in synchronous user flows and can hang the request up to PHP `max_execution_time` | `[System] LINE Callback:336`, `[System] DINOCO MCP Bridge:634,777`, `[LIFF AI] Snippet 1:456,462` |
 | 5 | 🟡 **Medium** | **M15** | Flex Card builder proliferation — **128 Flex builder functions**, 62 in `[B2B] Snippet 1` alone. No canonical base helper → altText defaults, color palette, header/footer style all duplicated | `[B2B] Snippet 1:281-2500` (spans ~2200 lines of builders) |
@@ -28,7 +29,11 @@
 
 ### Ship recommendation
 
-**✅ Ship** — no ship-blockers. v3 baseline (all 40 prior findings closed) holds. The two High items are latent (H9 only matters for Flash-driven completions that miss hook-triggered side effects; H10 only matters under active attack). **Fix H9 + H10 within one week**, schedule remaining items against the sprint plan below.
+**✅ Ship** — no ship-blockers. v3 baseline + v1-review H9/H10 all closed (commit `b1b8a30`, 2026-04-12).
+
+**Original reasoning (pre-resolution)**: H9 was latent (only Flash-driven completions missed hook side effects); H10 was latent (only active attack enumerated groups / burned LINE API quota). Both fixed within the same session as the audit.
+
+**Post-resolution**: 42 of 42 security/quality items across v1+v2+v3+v1-review are closed. Remaining P2/P3 items are architectural / pattern-debt (Flex consolidation, FSM bypass cleanup, custom roles) and do not gate shipping.
 
 ### Effort estimate
 
@@ -1032,25 +1037,14 @@ For every closed finding in v1 (26 items) + v2 (11 items) + v3 (3 items) = 40 it
 ### P0 — Ship-blockers
 *(none)*
 
-### P1 — Within 1 week
+### P1 — Within 1 week — ✅ ALL RESOLVED (commit `b1b8a30`, 2026-04-12)
 
-| Code | Title | Effort |
-|---|---|---:|
-| H9 | Flash auto-update must go through `b2b_set_order_status()` | 1h |
-| H10 | Rate limit `verify-member` endpoint | 1h |
+| Code | Title | Effort | Status |
+|---|---|---:|---|
+| H9 | Flash auto-update must go through `b2b_set_order_status()` | 1h | ✅ **V.32.3** |
+| H10 | Rate limit `verify-member` endpoint | 1h | ✅ **V.33.2** |
 
-**Details**:
-
-- **H9 fix**: `[B2B] Snippet 5: Admin Dashboard:142,146` — replace `update_field('order_status', 'shipped', $tid)` with `b2b_set_order_status($tid, 'shipped', 'flash_cron')`. Repeat for line 146. Add a test: run Flash cron against a known order and verify `b2b_order_status_changed` fires (via temporary `error_log` sentinel on the hook).
-
-- **H10 fix**: `[B2B] Snippet 1: Core Utilities:996` — add at function entry:
-  ```php
-  $client_ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-  if ( function_exists('b2b_rate_limit') ) {
-      $rl = b2b_rate_limit('verify_member_' . md5($client_ip), 15, 60);
-      if ( is_wp_error($rl) ) return new WP_REST_Response(['ok'=>false,'error'=>'rate_limited'], 429);
-  }
-  ```
+**Resolution details** — see "Resolution Log" section at end of report.
 
 ### P2 — This sprint
 
@@ -1211,4 +1205,56 @@ Then replace `current_user_can('manage_options')` with granular caps per endpoin
 
 ---
 
-*Generated 2026-04-12 by Claude Opus 4.6 in full-loop review mode. This supplements `docs/AUDIT-REPORT-v3.md` with a system-wide perspective across backend + UI layers.*
+## 📋 Resolution Log
+
+### H9 — Flash auto-update routed through FSM
+- **Commit**: `b1b8a30` (2026-04-12)
+- **File**: `[B2B] Snippet 5: Admin Dashboard` V.32.3 lines 139–170
+- **Fix**: Replaced 2 raw `update_field('order_status', …)` calls in the `/debug-flash/{ticket_id}` endpoint with `b2b_set_order_status($tid, 'shipped')` / `b2b_set_order_status($tid, 'completed')`. The canonical helper (Snippet 1:1285) routes through `B2B_Order_FSM::transition()` which validates the edge, logs `_b2b_status_history`, and fires `do_action('b2b_order_status_changed', $tid, $old, $new, 'system')`. A `function_exists()` guard preserves the legacy direct-write path (still firing the hook) when Snippet 1 hasn't loaded. Local `$order_status` is re-fetched from the DB between the two conditional branches so a single "delivered" webhook correctly chains `packed → shipped → completed` using fresh state.
+- **Idempotency**: duplicate webhook on an already-`completed` order hits `B2B_Order_FSM::transition()`, which returns a `terminal_state` WP_Error — the helper silently no-ops and no hook fires a second time. Verified in test Scenario 2.
+- **Verification**: `/tmp/dinoco-lint/test-h9-h10.php` — 3 scenarios, all PASS:
+  - Scenario 1 (full delivery chain): 2 hooks fire (`packed→shipped`, `shipped→completed`), 2 status-history entries
+  - Scenario 2 (duplicate webhook): 0 hooks, final status stays `completed`
+  - Scenario 3 (early pickup `state=1`): 1 hook (`packed→shipped`)
+- **Verdict**: ✅ ROOT CAUSE FIXED
+
+### H10 — verify-member rate limited
+- **Commit**: `b1b8a30` (2026-04-12)
+- **File**: `[B2B] Snippet 1: Core Utilities & LINE Flex Builders` V.33.2 lines 996–1016
+- **Fix**: Prepended `b2b_rate_limit('verify_member_' . md5($_SERVER['REMOTE_ADDR']), 20, 60)` to `b2b_rest_verify_member()`. On `WP_Error` result returns `WP_REST_Response(['ok'=>false,'error'=>'rate_limited','message'=>'คำขอมากเกินไป กรุณารอสักครู่แล้วลองอีกครั้ง'], 429)`. `md5()` is used for log privacy (prefix 8 chars logged, full IP never written). `function_exists()` guard keeps the endpoint functional if Snippet 1's helper region hasn't loaded.
+- **Threshold rationale**: 20 req/min is ~5× typical legitimate burst. LIFF pages re-verify at most once per hour (`b2b_date('YmdH')` cache key), and a single page reload triggers at most 1 call. A distributor group with 50 members hitting the endpoint simultaneously (worst natural case) spreads across 50 distinct IPs → no bucket exceeds 20.
+- **Verification**: `/tmp/dinoco-lint/test-h9-h10.php` — 25 sequential calls from one IP:
+  - Requests #01–#20 → OK
+  - Requests #21–#25 → `WP_Error('rate_limited')` with Thai message
+  - Per-IP isolation: second IP (`198.51.100.99`) req #1 → OK
+- **Verdict**: ✅ ROOT CAUSE FIXED
+
+### Files touched
+
+| File | Version bump | Lines changed |
+|---|---|---:|
+| `[B2B] Snippet 1: Core Utilities & LINE Flex Builders` | V.33.1 → **V.33.2** | +22 / −1 |
+| `[B2B] Snippet 5: Admin Dashboard` | V.32.2 → **V.32.3** | +28 / −8 |
+
+### Lint
+- `(echo '<?php'; cat snippet1) | php -l` → **No syntax errors detected**
+- `(echo '<?php'; cat snippet5) | php -l` → **No syntax errors detected**
+
+### Cumulative audit status (v1 + v2 + v3 + v1-review)
+
+| Audit round | Items | Closed | Open |
+|---|---:|---:|---:|
+| v1 (26 items: C1–C4, I1–I13, N1–N9) | 26 | 26 | 0 |
+| v2 (11 items: C4 v2, I1 v2, H3–H7, M8–M11) | 11 | 11 | 0 |
+| v3 (3 items: H8, M12, L1) | 3 | 3 | 0 |
+| v1-review P1 (H9, H10) | 2 | 2 | 0 |
+| **Total** | **42** | **42** | **0** |
+
+### Remaining non-blocking work (v1-review P2 + P3)
+
+- **P2** (5 items, ~16h): M13 (rate-limit holdouts), M14 (wp_remote timeouts), M16 (17 FSM bypasses), M17 (postback dispatch), M18 (claim FSM helper)
+- **P3** (10+ items, ~40h): M15 (Flex consolidation), M19 (debt recon UI), L2–L8 (misc low), second-brain doc updates
+
+---
+
+*Generated 2026-04-12 by Claude Opus 4.6 in full-loop review mode. This supplements `docs/AUDIT-REPORT-v3.md` with a system-wide perspective across backend + UI layers. Resolution log updated 2026-04-12 after commit `b1b8a30`.*
