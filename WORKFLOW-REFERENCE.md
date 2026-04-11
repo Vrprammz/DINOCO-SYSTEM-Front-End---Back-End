@@ -1271,13 +1271,22 @@ V.42.14 Hybrid Override (Manual admin choice)
     - edge cases: override=child/gc/single บนสินค้าไม่มี parent (render ไม่มี breadcrumb)
   สำคัญ: UI layer only — ไม่กระทบ stock / orders / DD-2 (backend ใช้ structure จริง)
 
-V.42.15 Price Suggestion Phase 2 (Manual Edit suggestion per child/grandchild)
-  renderCatChildren แสดง suggestion badge ข้างแต่ละ child + grandchild
-    - Child: parent_price / N children (badge ม่วง 💡)
-    - Grandchild: child_actual_price / M grandchildren (fallback parent/N×M ถ้าลูกราคา 0)
-    - Diff% comparison: ถ้ามีราคาจริง + |diff| >= 1% → แสดง "ราคาจริง X฿ (+N%)" สีแดง/เขียว
-  Live update: input handler บน #cat-price debounced 250ms → re-render children list
-  Display-only — admin ไปกรอกราคาในแต่ละ child modal เอง (ไม่ auto-apply)
+V.42.15 Price Suggestion (deprecated — superseded ใน V.42.16)
+  เดิม equal-split /N — concept ผิดสำหรับ SET ผสมที่ราคาลูกไม่เท่ากัน
+
+V.42.16 Sum Integrity Check (Phase 2 Redesign)
+  เปลี่ยนจาก "แนะนำราคา" → "ตรวจความครบของราคา"
+  Header card: parent / sum(children effective) / margin + status
+    - ok (|diff| < 1%): เขียว "ราคาสมดุล"
+    - loss (sum > parent): แดง "แม่ถูกกว่าผลรวมลูก" (ขาดทุน)
+    - profit (sum < parent): ฟ้า "แม่แพงกว่าผลรวมลูก" (margin +)
+  Effective cost: ถ้า child เป็น sub-SET → ใช้ sum(grandchildren) แทน child.price
+  Per-child: "ราคาจริง X฿ · Y% ของแม่" (contribution %)
+  Sub-SET integrity: ถ้ามี grandchildren → เทียบ sum(gc) vs child.price
+    - match: "✅ ชิ้นย่อยรวมตรงกับ sub-SET"
+    - mismatch: "⚠️ ลูกรวมเกิน/ต่ำกว่า +/-X฿ (+/-Y%)"
+  Per-grandchild: "ราคาจริง · Y% ของ sub-SET" (fallback "ของแม่")
+  Live update: input handler บน #cat-price debounced 250ms (เหมือน V.42.15)
 ```
 
 ---

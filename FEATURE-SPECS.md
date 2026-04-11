@@ -2663,14 +2663,37 @@ Caller ทุกตัวต้องเรียก `dinoco_get_leaf_skus()` ex
 - Fix Auto-Split type check — `openAutoSplitDialog` เคย block `type !== 'child'` แต่ V.41.2 เพิ่มปุ่มให้ `single` แล้ว. V.42.8 allow `['single', 'child']`
 - Debug console log ใน `saveCatalogItem` → payload + response ของ `save_sku_relation` + SKIPPED reason (ช่วย debug production)
 
-### ✅ Phase 2 (V.42.15 — Done 2026-04-10)
+### ✅ Phase 2 (V.42.15 → V.42.16 Redesign — Done 2026-04-10)
 
-Manual Edit Product modal — แสดง **suggestion ราคาต่อชิ้น** ใน Set Components list:
-- Child suggestion: `parent_price / N children` — badge สีม่วง 💡
-- Grandchild suggestion: `child_actual_price / M grandchildren` (fallback to parent /N×M ถ้าลูกไม่มีราคา) — badge สีเขียว
-- **เปรียบเทียบราคาจริง vs แนะนำ**: ถ้ามีราคาจริงแล้ว → แสดง "ราคาจริง X ฿ (+N%)" สีแดง/เขียว บอก diff%
-- **Live update**: bind `input` handler บน `#cat-price` (debounce 250ms) → re-render children list เมื่อราคาแม่เปลี่ยน
-- Display-only (ไม่ auto-apply) — admin เห็นเป็น hint แล้วกรอกราคาในแต่ละ child/grandchild modal เอง
+**V.42.15 (deprecated)**: เดิมแสดง equal-split suggestion `parent / N children` + `child_actual / M grandchildren` + diff% — **concept ผิด** เพราะ SET ผสม (TopCase + Top Rack + Pannier Rack) ราคาลูกไม่เท่ากันอยู่แล้ว → หารเท่าๆ กันไม่สื่ออะไร
+
+**V.42.16 Sum Integrity Check** — เปลี่ยน concept จาก "แนะนำราคา" → "ตรวจความครบของราคา":
+
+**Header card**: parent / sum(children effective) / margin + status:
+
+- `ok` (|diff| < 1%) — เขียว "ราคาสมดุล"
+- `loss` (sum > parent) — แดง "แม่ถูกกว่าผลรวมลูก" (ขาดทุน)
+- `profit` (sum < parent) — ฟ้า "แม่แพงกว่าผลรวมลูก" (margin บวก)
+
+**Effective cost**: ถ้า child เป็น sub-SET ใช้ `sum(grandchildren prices)` แทน child.price (ราคาจริง ไม่ใช่ sub-SET stale). แสดง note ถ้าใช้ effective != raw
+
+**Per-child badge**: `ราคาจริง X฿ · Y% ของแม่` (contribution % ไม่ใช่ suggestion)
+
+**Sub-SET integrity**: ถ้า child มี grandchildren → เทียบ `sum(gc)` กับ `child.price`:
+
+- match → "✅ ชิ้นย่อยรวมตรงกับ sub-SET"
+- mismatch → "⚠️ ลูกรวมเกิน +X฿ (+Y%)" หรือ "ℹ️ ลูกรวมต่ำกว่า -X฿ (-Y%)"
+
+**Per-grandchild badge**: `ราคาจริง · Y% ของ sub-SET` (fallback "ของแม่" ถ้า child ไม่มีราคา)
+
+**Helpers**:
+
+- `_priceOf(sku)` — case-insensitive price lookup ผ่าน `cat()`
+- `_parsePrice()` / `_fmtBaht()` เดิม
+
+**Live update**: `input` handler บน `#cat-price` debounced 250ms (เหมือน V.42.15)
+
+**Removed จาก V.42.15**: equal-split "แนะนำ X฿" badges + diff% comparisons (concept ผิด)
 
 ---
 
