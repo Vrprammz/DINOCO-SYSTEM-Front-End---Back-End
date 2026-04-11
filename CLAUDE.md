@@ -32,9 +32,41 @@ DINOCO System is a **WordPress-based motorcycle warranty management platform** s
 | `[b2f_admin_credit_tab]` | B2F Credit tracking tab |
 | `[liff_ai_page]` | LIFF AI Command Center (Lead management for dealers + admin) |
 
+### Secondary shortcodes (admin / member / LIFF sub-pages)
+
+| Shortcode | Purpose |
+|---|---|
+| `[dinoco_admin_inventory]` | Global Inventory DB admin (stock, catalog, dip stock, warehouses, valuation, forecast) |
+| `[dinoco_admin_claims]` | Service Center & Claims admin |
+| `[dinoco_admin_users]` | User management |
+| `[dinoco_admin_transfer]` | Manual Transfer Tool (warranty transfer) |
+| `[dinoco_admin_legacy]` | Legacy migration requests admin |
+| `[dinoco_manual_invoice]` | Manual invoice system admin |
+| `[dinoco_sync_dashboard]` | GitHub Webhook Sync dashboard |
+| `[b2b_admin_control]` | B2B Admin Control Panel (Snippet 9 — print settings, bot, sys-check) |
+| `[b2b_discount_mapping]` | B2B discount tier mapping (read-only reference) |
+| `[b2b_dashboard]` / `[b2b_stock_manager]` / `[b2b_tracking_entry]` | B2B Admin Dashboard LIFF sub-pages (Snippet 12) |
+| `[b2b_commands]` / `[b2b_orders]` / `[b2b_account]` | Customer LIFF pages (Snippet 11) |
+| `[dinoco_dashboard]` | Member dashboard (main) |
+| `[dinoco_dashboard_header]` / `[dinoco_dashboard_assets]` | Member dashboard sub-components |
+| `[dinoco_edit_profile]` | Member profile edit |
+| `[dinoco_claim_page]` | Member claim submission |
+| `[dinoco_transfer_sys]` / `[dinoco_transfer_v3]` | Member warranty transfer page |
+| `[dinoco_legacy_migration]` | Member legacy migration form |
+
 ## REST API Endpoints (B2B)
 
-All under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, `update-status`, `delete-ticket`, `recalculate-total`, `flash-label`, `flash-ready-to-ship`, `manual-flash-create`, `manual-shipments`, `manual-flash-cancel`.
+### Core B2B (Snippet 3 + 5)
+Under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, `update-status`, `delete-ticket`, `recalculate-total`, `flash-label`, `flash-ready-to-ship`, `manual-flash-create`, `manual-shipments`, `manual-flash-cancel`, `cancel-request`.
+
+### Print / RPi (Snippet 3 + 9)
+`print-monitor`, `print-queue`, `print-ack`, `print-status`, `print-requeue`, `print-heartbeat`, `print-test`, `rpi-command`, `rpi-command-ack`, `rpi-dashboard`, `rpi-accept-order`, `ticket-lookup`, `pno-lookup`, `rpi-flash-ready`, `rpi-flash-box-packed`, `rpi-distributors`.
+
+### Flash logistics (Snippet 3 + 9)
+`flash-webhook`, `flash-webhook-setup`, `flash-api-test`, `flash-tracking`, `flash-dashboard-stats`, `flash-ship-packed`, `manual-flash-ready`, `flash-test/orders`, `flash-test/run-step`, `flash-test/simulate-webhook`.
+
+### Admin back-office (Snippet 3 + 6 + 9)
+`admin-bo-tickets`, `admin-stock-list`, `admin-stock-unlock`, `admin-stock-mark-oos`, `admin-shipping-queue`, `admin-submit-tracking`, `discount-mapping`, `combined-slip-upload`, `combined-invoice-gen`, `import-distributors`, `test-push`, `system-check`, `distributor/delete`, `distributor/toggle-bot`.
 
 ## REST API Endpoints (B2F)
 
@@ -43,6 +75,22 @@ All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-produc
 ## REST API Endpoints (LIFF AI)
 
 All under `/wp-json/liff-ai/v1/`: `auth`, `dashboard`, `dealer-dashboard`, `leads`, `lead/{id}`, `lead/{id}/accept`, `lead/{id}/note`, `lead/{id}/status`, `claims`, `claim/{id}`, `claim/{id}/status`, `agent-ask`.
+
+## REST API Endpoints (Inventory — `dinoco-stock/v1`)
+
+Registered in `[Admin System] DINOCO Global Inventory Database`:
+
+- **God Mode / Margin**: `god-mode/verify`, `margin-analysis` (JWT-gated, V.42.17)
+- **Stock**: `stock/list`, `stock/adjust`, `stock/transactions`, `stock/settings`, `stock/hold`, `stock/initialize`, `stock/transfer`
+- **Dip Stock** (V.39.0): `dip-stock/start`, `dip-stock/current`, `dip-stock/count`, `dip-stock/approve`, `dip-stock/force-close`, `dip-stock/history`
+- **Warehouses** (V.5.0): `warehouses`, `warehouse`
+- **Analytics** (V.5.0): `valuation`, `forecast`
+- **Products**: `product/pricing` (dual-write), `product/upload-image`, `image-proxy` (CORS)
+- **Moto catalog**: `moto/brands`, `moto/models`
+
+## REST API Endpoints (GitHub Sync — `dinoco/v1`)
+
+- `sync-status` — sync engine status (registered in `[AdminSystem-System] GitHub Webhook Sync`)
 
 ## REST API Endpoints (MCP Bridge)
 
@@ -64,6 +112,13 @@ All under `/wp-json/dinoco-mcp/v1/` (32 endpoints, V.2.0):
 - `DINOCO_GITHUB_REPO` — GitHub repo (e.g., `Vrprammz/DINOCO-SYSTEM-Front-End---Back-End`)
 - `DINOCO_GITHUB_WEBHOOK_SECRET` — Webhook signature secret
 - `B2F_LIFF_ID` — ใช้ตัวเดียวกับ `B2B_LIFF_ID` (auto-fallback ไม่ต้องตั้งแยก)
+- `LIFF_AI_SECRET_KEY` — LIFF AI auth HMAC key (required)
+- `LIFF_AI_JWT_SECRET` — LIFF AI JWT signing key (auto-generated to wp_option if undefined)
+- `LIFF_AI_AGENT_URL` — OpenClaw agent proxy URL (default `http://agent:3000`)
+- `LIFF_AI_AGENT_KEY` — agent proxy bearer token
+- `DINOCO_JWT` — HMAC secret for God Mode margin-analysis JWT (V.42.17)
+- `B2F_DISABLED` — kill switch for B2F module (optional boolean)
+- `B2B_WALKIN_BANK_*` — optional walk-in bank override (BANK_NAME, BANK_NAME_EN, BANK_ACCOUNT, BANK_HOLDER, BANK_CODE, BANK_LOGO_URL, PROMPTPAY_ID) — falls back to `B2B_BANK_*` if undefined
 
 ## File Organization
 

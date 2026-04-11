@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 9: Admin Control Panel                      ║
- * ║  Version: V.33.4 — 3-Level hierarchy: grandchild_map save + has_grandchildren flag ║
+ * ║  Version: V.33.5 — C3/I13 audit fix: savePrintSettings confirm + importDistCSV dry-run with row errors ║
  * ║  DB_ID: 58                                                  ║
  * ║  Shortcode: [b2b_admin_control]                            ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -939,17 +939,27 @@ function b2b_rest_flash_test_simulate_webhook( WP_REST_Request $req ) {
 function b2b_rest_import_distributors( WP_REST_Request $req ) {
     try {
     $rows = $req->get_param('rows');
+    $dry_run = (bool) $req->get_param('dry_run');
     if (!is_array($rows)||empty($rows)) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มีข้อมูล'),400);
     if (count($rows) > 500) return new WP_REST_Response(array('success'=>false,'message'=>'ข้อมูลเกินขีดจำกัด (สูงสุด 500 แถว)'),400);
+    // V.33.5 — Audit I13: dry-run + per-row error report
     $imported = 0;
-    foreach ($rows as $row) {
+    $skipped  = 0;
+    $errors   = array();
+    foreach ($rows as $idx => $row) {
+        $rownum = $idx + 2; // 1-based + header
         $shop = sanitize_text_field($row['shop_name'] ?? '');
         $gid = sanitize_text_field($row['line_group_id'] ?? '');
-        if (empty($shop)||empty($gid)) continue;
+        if (empty($shop)) { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'shop_name','error'=>'missing shop_name'); continue; }
+        if (empty($gid))  { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'line_group_id','error'=>'missing line_group_id'); continue; }
+        // numeric sanity checks
+        if (isset($row['credit_limit']) && $row['credit_limit'] !== '' && !is_numeric($row['credit_limit'])) { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'credit_limit','error'=>'not numeric'); continue; }
+        if (isset($row['credit_term_days']) && $row['credit_term_days'] !== '' && !is_numeric($row['credit_term_days'])) { $skipped++; $errors[] = array('row'=>$rownum,'field'=>'credit_term_days','error'=>'not numeric'); continue; }
+        if ($dry_run) { $imported++; continue; }
         $exists = get_posts(array('post_type'=>'distributor','posts_per_page'=>1,'meta_query'=>array(array('key'=>'line_group_id','value'=>$gid))));
         if (!empty($exists)) { $id = $exists[0]->ID; } else {
             $id = wp_insert_post(array('post_type'=>'distributor','post_title'=>$shop,'post_status'=>'publish'));
-            if (is_wp_error($id)) continue;
+            if (is_wp_error($id)) { $skipped++; $errors[] = array('row'=>$rownum,'error'=>$id->get_error_message()); continue; }
         }
         update_field('shop_name',$shop,$id); update_field('line_group_id',$gid,$id);
         if (!empty($row['rank_system'])) update_field('rank_system',sanitize_text_field($row['rank_system']),$id);
@@ -960,7 +970,13 @@ function b2b_rest_import_distributors( WP_REST_Request $req ) {
         }
         $imported++;
     }
-    return new WP_REST_Response(array('success'=>true,'imported'=>$imported),200);
+    return new WP_REST_Response(array(
+        'success'  => true,
+        'dry_run'  => $dry_run,
+        'imported' => $imported,
+        'skipped'  => $skipped,
+        'errors'   => $errors,
+    ),200);
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
@@ -1796,6 +1812,9 @@ window.bulkReprintErrors=function(){
   });
 };
 window.savePrintSettings=function(){
+  // V.33.5 — Audit C3: บันทึกที่อยู่คลัง/ผู้ส่ง/ผู้ลงทะเบียนจะ override ค่าปัจจุบันทันที
+  // Order ใหม่จะใช้ค่าที่เซฟนี้ — ต้องให้ Admin ยืนยันก่อน
+  if(!confirm('⚠️ อัปเดตที่อยู่คลัง/ผู้ส่ง/ผู้ลงทะเบียน?\n\nOrder ใหม่ที่สร้างหลังจากนี้จะใช้ค่านี้ — กรุณาตรวจสอบก่อนกดยืนยัน')) return;
   var data={auto_print:document.getElementById('ps_auto').value==='1',shipping_mode:document.getElementById('ps_mode').value};
   ['wh_name','wh_phone','wh_address','wh_district','wh_city','wh_province','wh_postcode'].forEach(function(k){
     var el=document.getElementById(k);if(el)data[k]=el.value;
@@ -1865,11 +1884,37 @@ function parseCSV(text){
   return rows;
 }
 window.importDistCSV=function(input){
+  // V.33.5 — Audit I13: dry-run preview + per-row error list
   if(!input.files[0])return;
   var reader=new FileReader();reader.onload=function(e){
     var rows=parseCSV(e.target.result);
     if(!rows.length){toast('ไม่พบข้อมูลใน CSV','e');return;}
-    api('POST','import-distributors',{rows:rows},function(d){toast(d.success?'✅ Import '+d.imported+' ตัวแทน':'❌ '+d.message,d.success?'s':'e');if(d.success)loadDists()});
+    // Phase 1: dry-run — validate without writing
+    api('POST','import-distributors',{rows:rows,dry_run:true},function(d){
+      if(!d.success){toast('❌ '+(d.message||'dry-run failed'),'e');return;}
+      var msg='📋 Dry-run สำเร็จ\n\n';
+      msg+='✅ พร้อม import: '+d.imported+' ตัวแทน\n';
+      msg+='⏭ ข้าม: '+(d.skipped||0)+' แถว';
+      if(d.errors && d.errors.length){
+        msg+='\n\n⚠ Errors ('+d.errors.length+'):\n';
+        d.errors.slice(0,15).forEach(function(err){
+          msg+='• Row '+err.row+(err.field?' ['+err.field+']':'')+': '+err.error+'\n';
+        });
+        if(d.errors.length>15) msg+='...(อีก '+(d.errors.length-15)+' ข้อผิดพลาด)\n';
+      }
+      msg+='\nยืนยัน import จริง?';
+      if(!confirm(msg))return;
+      // Phase 2: real import
+      api('POST','import-distributors',{rows:rows},function(r){
+        if(r.success){
+          var t='✅ Import '+r.imported+' ตัวแทน';
+          if(r.skipped) t+=' (ข้าม '+r.skipped+' แถว)';
+          toast(t,'s');loadDists();
+        }else{
+          toast('❌ '+(r.message||'import failed'),'e');
+        }
+      });
+    });
   };reader.readAsText(input.files[0],'UTF-8');input.value='';
 };
 // V.32: importProdCSV removed — managed via Product Catalog

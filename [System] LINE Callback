@@ -1,7 +1,7 @@
 /* * =================================================================
  * File: [System] LINE Callback
  * DINOCO SYSTEM: Line Callback Processor & Warranty Button
- * Version: V.30.3
+ * Version: V.30.4 — Audit I1/I8: OAuth state nonce + LINE profile name sanitize
  * DB_ID: 10
  * =================================================================
  */
@@ -47,11 +47,28 @@ function dinoco_gateway_warranty_fix() {
     } else {
         $line_ch_id     = defined( 'DINOCO_LINE_CHANNEL_ID' )   ? DINOCO_LINE_CHANNEL_ID   : '';
         $line_redir_uri = defined( 'DINOCO_LINE_REDIRECT_URI' ) ? DINOCO_LINE_REDIRECT_URI : 'https://www.dinoco.in.th/callback-login';
+
+        // V.30.4 — Audit I1: OAuth state must be a cryptographic nonce the server can later verify.
+        // Why: previously we stuffed warranty-serial/GENERAL_LOGIN into `state`, never comparing back
+        //      → attacker can feed victim a pre-signed `code` → account linking takeover.
+        // How to apply: random 32-char token stored in transient (10 min TTL) keyed by token.
+        //               Payload holds the intended serial / redirect hint.
+        $state_token = wp_generate_password( 32, false, false );
+        set_transient(
+            'dinoco_line_state_' . $state_token,
+            array(
+                'serial'  => ! empty( $serial ) ? $serial : '',
+                'intent'  => ! empty( $serial ) ? 'WARRANTY_REGISTER' : 'WARRANTY_PAGE',
+                'created' => time(),
+            ),
+            600 // 10 min
+        );
+
         $line_login_url  = 'https://access.line.me/oauth2/v2.1/authorize';
         $line_login_url .= '?response_type=code';
         $line_login_url .= '&client_id=' . urlencode( $line_ch_id );
         $line_login_url .= '&redirect_uri=' . urlencode( $line_redir_uri );
-        $line_login_url .= '&state=' . urlencode( ! empty( $serial ) ? $serial : 'WARRANTY_PAGE' );
+        $line_login_url .= '&state=' . urlencode( $state_token );
         $line_login_url .= '&scope=profile%20openid';
         $line_login_url .= '&bot_prompt=aggressive';
     }
@@ -260,6 +277,26 @@ function dinoco_master_line_callback() {
     $code  = sanitize_text_field( $_GET['code'] );
     $state = isset( $_GET['state'] ) ? sanitize_text_field( $_GET['state'] ) : '';
 
+    // V.30.4 — Audit I1: verify `state` against server-stored nonce.
+    // Legacy states (GENERAL_LOGIN, WARRANTY_PAGE, raw serial) from old sessions still accepted
+    // for one release cycle so in-flight logins don't break.
+    $state_payload = null;
+    $is_legacy_state = ( $state === 'GENERAL_LOGIN' || $state === 'WARRANTY_PAGE' || empty( $state ) );
+    if ( ! $is_legacy_state ) {
+        $state_payload = get_transient( 'dinoco_line_state_' . $state );
+        if ( $state_payload ) {
+            delete_transient( 'dinoco_line_state_' . $state ); // single-use
+        } else {
+            // Not found → could be legacy raw serial. Accept ONLY if matches WARRANTY serial pattern
+            // (A-Z0-9 and length 6-32). Anything else → reject.
+            if ( ! preg_match( '/^[A-Z0-9\-]{4,32}$/i', $state ) ) {
+                error_log( '[DINOCO LINE] Invalid/expired OAuth state rejected: ' . $state );
+                wp_safe_redirect( home_url( '/warranty/?login_error=state' ) );
+                exit;
+            }
+        }
+    }
+
     $token_url = 'https://api.line.me/oauth2/v2.1/token';
     $response  = wp_remote_post( $token_url, array(
         'body' => array('grant_type' => 'authorization_code', 'code' => $code, 'redirect_uri' => $redirect_uri, 'client_id' => $client_id, 'client_secret' => $client_secret),
@@ -300,9 +337,12 @@ function dinoco_master_line_callback() {
         }
     }
 
-    $line_user_id = $profile['userId'];
-    $display_name = $profile['displayName'];
-    $picture_url  = isset( $profile['pictureUrl'] ) ? $profile['pictureUrl'] : '';
+    // V.30.4 — Audit I8: LINE profile name may contain HTML/script. Sanitize + length cap.
+    $line_user_id = sanitize_text_field( $profile['userId'] );
+    $display_name = sanitize_text_field( $profile['displayName'] ?? '' );
+    if ( mb_strlen( $display_name ) > 60 ) { $display_name = mb_substr( $display_name, 0, 60 ); }
+    if ( empty( $display_name ) ) { $display_name = 'LINE User'; }
+    $picture_url  = isset( $profile['pictureUrl'] ) ? esc_url_raw( $profile['pictureUrl'] ) : '';
 
     $user_query = get_users( array('meta_key' => 'line_user_id', 'meta_value' => $line_user_id, 'number' => 1) );
     $user_id = 0; $is_new_user = false;
@@ -329,7 +369,13 @@ function dinoco_master_line_callback() {
 
         $redirect_params = array();
         if ( $is_new_user ) { $redirect_params['welcome'] = 'new'; } else { $redirect_params['welcome'] = 'back'; }
-        if ( $state && $state !== 'GENERAL_LOGIN' && $state !== 'WARRANTY_PAGE' ) { $redirect_params['register_serial'] = $state; }
+        // V.30.4 — Audit I1: read intended serial from verified state payload; fall back to legacy raw state
+        if ( is_array( $state_payload ) && ! empty( $state_payload['serial'] ) ) {
+            $redirect_params['register_serial'] = $state_payload['serial'];
+        } elseif ( $state && $state !== 'GENERAL_LOGIN' && $state !== 'WARRANTY_PAGE' && ! $state_payload ) {
+            // legacy: raw serial still in URL (accepted above)
+            $redirect_params['register_serial'] = $state;
+        }
 
         $redirect_to = add_query_arg( $redirect_params, home_url( '/member-dashboard/' ) );
         

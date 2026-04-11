@@ -2,7 +2,7 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
- * Version: V.33.2 — Fix invGetRankPrice() tier % discount calculation
+ * Version: V.33.3 — Audit C2+I7: Finance refund MVP (record-refund REST + cancel dep check)
  * DB_ID: 598
  * Dependencies: b2b_order CPT, distributor CPT, b2b_product CPT, ACF
  */
@@ -679,6 +679,12 @@ add_action('rest_api_init', function() {
         'callback'            => 'dinoco_inv_rest_upload_slip',
         'permission_callback' => $perm,
     ]);
+    // V.33.3 — Audit C2: Record refund (reverse payment)
+    register_rest_route($ns, '/invoice/record-refund', [
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_inv_rest_record_refund',
+        'permission_callback' => $perm,
+    ]);
     // Cancel
     register_rest_route($ns, '/invoice/cancel', [
         'methods'             => 'POST',
@@ -1038,7 +1044,8 @@ function _dinoco_inv_row($post_id) {
         'dist_id'      => intval(get_post_meta($post_id, '_dist_post_id', true)),
         'status'       => $is_overdue ? 'overdue' : $status,
         'total_amount' => floatval(get_field('total_amount', $post_id)),
-        'paid_amount'  => floatval(get_post_meta($post_id, '_inv_paid_amount', true)),
+        'paid_amount'      => floatval(get_post_meta($post_id, '_inv_paid_amount', true)),
+        'refunded_amount'  => floatval(get_post_meta($post_id, '_inv_refunded_amount', true)),
         'due_date'     => $due_ts ? b2b_date('Y-m-d', $due_ts) : '',   // always ISO for <input type="date">
         'issue_date'   => get_post_meta($post_id, '_inv_date', true) ?: get_the_date('Y-m-d', $post_id),
         'created_by'   => intval(get_post_meta($post_id, '_inv_created_by', true)),
@@ -1523,6 +1530,74 @@ function dinoco_inv_rest_record_payment(WP_REST_Request $req) {
     }
 }
 
+// --- V.33.3 AUDIT C2: RECORD REFUND (reverse payment) ---
+// MVP: admin บันทึกการคืนเงิน — reverse debt + mark invoice refunded + audit trail
+// ไม่มี slip upload / LINE notify (ใส่ทีหลังได้)
+function dinoco_inv_rest_record_refund(WP_REST_Request $req) {
+    $id      = intval($req->get_param('id'));
+    $amount  = floatval($req->get_param('amount'));
+    $reason  = sanitize_text_field($req->get_param('reason') ?? '');
+    $method  = sanitize_text_field($req->get_param('method') ?? 'manual'); // manual|bank_transfer|cash
+    if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
+    if ($amount <= 0) return new WP_Error('invalid', 'จำนวนเงินคืนต้องมากกว่า 0', ['status' => 400]);
+    if (empty($reason)) return new WP_Error('invalid', 'กรุณาระบุเหตุผลการคืนเงิน', ['status' => 400]);
+
+    $paid_so_far    = floatval(get_post_meta($id, '_inv_paid_amount', true));
+    $refunded_prev  = floatval(get_post_meta($id, '_inv_refunded_amount', true));
+    $refundable     = round($paid_so_far - $refunded_prev, 2);
+    if ($amount > $refundable + 0.01) {
+        return new WP_Error('overrefund', 'คืนเงินเกิน: คืนได้สูงสุด ฿' . number_format($refundable, 2), ['status' => 400]);
+    }
+
+    $status = get_field('order_status', $id);
+    // อนุญาตคืนเงินได้สำหรับ: paid, awaiting_payment (partial paid), cancelled (ยกเลิกแล้วแต่ลืมคืนเงิน)
+    if (!in_array($status, ['paid', 'awaiting_payment', 'cancelled'], true)) {
+        return new WP_Error('invalid_status', 'ไม่สามารถบันทึกการคืนเงินในสถานะนี้', ['status' => 400]);
+    }
+
+    // Record refund entry
+    $new_refunded = round($refunded_prev + $amount, 2);
+    $refund_log   = json_decode(get_post_meta($id, '_inv_refunds', true) ?: '[]', true);
+    $refund_log[] = [
+        'amount'   => $amount,
+        'reason'   => $reason,
+        'method'   => $method,
+        'date'     => b2b_date('Y-m-d H:i:s'),
+        'admin_id' => get_current_user_id(),
+        'admin'    => wp_get_current_user()->user_login,
+    ];
+    update_post_meta($id, '_inv_refunded_amount', $new_refunded);
+    update_post_meta($id, '_inv_refunds', wp_json_encode($refund_log, JSON_UNESCAPED_UNICODE));
+
+    // Cascade: recalculate debt if dist linked
+    $dist_id = intval(get_post_meta($id, '_dist_post_id', true));
+    $total   = floatval(get_field('total_amount', $id));
+
+    // ถ้า invoice status = paid และ net paid ตอนนี้ < total → เปลี่ยนกลับเป็น awaiting_payment + re-bill
+    $net_paid = round($paid_so_far - $new_refunded, 2);
+    if ($status === 'paid' && $net_paid < $total - 0.01) {
+        b2b_set_order_status($id, 'awaiting_payment');
+        update_field('is_billed', true, $id);
+    }
+
+    if (function_exists('b2b_recalculate_debt') && $dist_id) {
+        b2b_recalculate_debt($dist_id);
+    }
+
+    b2b_add_audit_log(
+        $id,
+        'refund_recorded',
+        sprintf('คืนเงิน ฿%s (%s) — เหตุผล: %s', number_format($amount, 0), $method, $reason)
+    );
+
+    return rest_ensure_response([
+        'success'       => true,
+        'refunded_total'=> $new_refunded,
+        'net_paid'      => $net_paid,
+        'new_status'    => get_field('order_status', $id),
+    ]);
+}
+
 // --- VERIFY SLIP ---
 function dinoco_inv_rest_verify_slip(WP_REST_Request $req) {
     $id       = intval($req->get_param('id'));
@@ -1932,10 +2007,23 @@ function dinoco_inv_rest_upload_slip(WP_REST_Request $req) {
 // --- CANCEL ---
 function dinoco_inv_rest_cancel(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
+    $force = (bool) $req->get_param('force'); // V.33.3 — allow override after refund recorded
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
     $status = get_field('order_status', $id);
     if ($status === 'cancelled') return new WP_Error('invalid', 'ยกเลิกแล้ว', ['status' => 400]);
     if ($status === 'paid') return new WP_Error('invalid', 'ชำระแล้ว ไม่สามารถยกเลิกได้', ['status' => 400]);
+
+    // V.33.3 — Audit I7: block cancel ถ้ามี payment ค้างที่ยังไม่ถูก refund
+    $paid_so_far = floatval(get_post_meta($id, '_inv_paid_amount', true));
+    $refunded    = floatval(get_post_meta($id, '_inv_refunded_amount', true));
+    $net_paid    = round($paid_so_far - $refunded, 2);
+    if ($net_paid > 0.01 && ! $force) {
+        return new WP_Error(
+            'has_payments',
+            sprintf('ใบแจ้งหนี้นี้มีการชำระแล้ว ฿%s — ต้องบันทึกคืนเงิน (refund) ก่อนจึงจะยกเลิกได้', number_format($net_paid, 2)),
+            ['status' => 400, 'net_paid' => $net_paid]
+        );
+    }
     // Collect info before changing status (used for LINE notification below)
     $inv_no    = get_post_meta($id, '_inv_number', true);
     $dist_name = get_field('dist_name', $id);
@@ -2829,6 +2917,36 @@ add_shortcode('dinoco_manual_invoice', function() {
     </div>
 </div>
 
+<!-- ========== REFUND MODAL (V.33.3 — Audit C2) ========== -->
+<div id="inv-refund-modal" style="display:none;position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,0.5);align-items:center;justify-content:center;">
+    <div class="inv-modal-inner">
+        <h3 style="color:#f59e0b;">💸 บันทึกคืนเงิน</h3>
+        <input type="hidden" id="inv-refund-id">
+        <div id="inv-refund-summary" style="background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:0.85rem;color:#78350f;"></div>
+        <div class="inv-field-row">
+            <label class="inv-label">จำนวนเงินคืน (฿) <span class="req">*</span></label>
+            <input class="inv-input" id="inv-refund-amount" type="number" min="0.01" step="0.01" placeholder="0.00">
+        </div>
+        <div class="inv-field-row">
+            <label class="inv-label">วิธีคืนเงิน</label>
+            <select class="inv-input" id="inv-refund-method">
+                <option value="bank_transfer">โอนคืน</option>
+                <option value="cash">เงินสด</option>
+                <option value="credit_note">ใบลดหนี้</option>
+                <option value="manual">อื่นๆ</option>
+            </select>
+        </div>
+        <div class="inv-field-row">
+            <label class="inv-label">เหตุผลการคืนเงิน <span class="req">*</span></label>
+            <textarea class="inv-input" id="inv-refund-reason" rows="3" placeholder="เช่น สินค้ามีตำหนิ / ลูกค้ายกเลิกคำสั่งซื้อ / คีย์ผิดบัญชี"></textarea>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+            <button class="inv-btn inv-btn-secondary" onclick="document.getElementById('inv-refund-modal').style.display='none'">ยกเลิก</button>
+            <button class="inv-btn" style="background:#f59e0b;color:#fff;" onclick="invDoRefund()">ยืนยันคืนเงิน</button>
+        </div>
+    </div>
+</div>
+
 <!-- ========== SLIP MODAL ========== -->
 <div id="inv-slip-modal">
     <div class="inv-modal-inner">
@@ -3077,11 +3195,17 @@ function invRowActions(inv) {
         btns += '<button class="inv-act-btn" onclick="invResendLine(' + id + ')">ส่ง LINE</button>';
         btns += '<button class="inv-act-btn" onclick="invPrint(' + id + ')">พิมพ์</button>';
         btns += '<button class="inv-act-btn" onclick="invDownloadInvImage(' + id + ')">ดาวน์โหลด</button>';
+        // V.33.3 — Audit C2: refund ถ้ามี partial payment
+        if ((inv.paid_amount || 0) > 0) {
+            btns += '<button class="inv-act-btn" style="color:#f59e0b;font-weight:600;" onclick="invOpenRefund(' + id + ')">คืนเงิน</button>';
+        }
         btns += '<button class="inv-act-btn" style="color:#dc2626" onclick="invCancelFromList(' + id + ')">ยกเลิก</button>';
     } else if (s === 'paid') {
         btns += '<button class="inv-act-btn" onclick="invPrint(' + id + ')">พิมพ์</button>';
         btns += '<button class="inv-act-btn" onclick="invResendLine(' + id + ')">ส่ง LINE</button>';
         btns += '<button class="inv-act-btn" onclick="invDownloadInvImage(' + id + ')">ดาวน์โหลด</button>';
+        // V.33.3 — Audit C2: refund จาก paid status
+        btns += '<button class="inv-act-btn" style="color:#f59e0b;font-weight:600;" onclick="invOpenRefund(' + id + ')">คืนเงิน</button>';
     } else if (s === 'cancelled') {
         btns += '<button class="inv-act-btn" style="color:#dc2626" onclick="invDeleteFromList(' + id + ')">ลบ</button>';
     }
@@ -3964,6 +4088,46 @@ window.invDoRecordPayment = function() {
         if (err || !data.success) { invToast('error', 'บันทึกล้มเหลว'); return; }
         document.getElementById('inv-payment-modal').classList.remove('open');
         invToast('success', data.fully_paid ? 'ชำระครบแล้ว' : 'บันทึกชำระบางส่วนแล้ว');
+        invLoadList();
+    });
+};
+
+// ========= REFUND (V.33.3 — Audit C2) =========
+window.invOpenRefund = function(id) {
+    invApi('GET', '/invoice/get', {id: id}, function(err, data) {
+        if (err || !data.success) { invToast('error', 'โหลดข้อมูลล้มเหลว'); return; }
+        var inv = data.invoice;
+        var paid = parseFloat(inv.paid_amount || 0);
+        var refundedPrev = parseFloat(inv.refunded_amount || 0);
+        var refundable = Math.round((paid - refundedPrev) * 100) / 100;
+        if (refundable <= 0) { invToast('error', 'ไม่มียอดที่คืนเงินได้'); return; }
+        document.getElementById('inv-refund-id').value = id;
+        document.getElementById('inv-refund-amount').value = refundable.toFixed(2);
+        document.getElementById('inv-refund-amount').max = refundable;
+        document.getElementById('inv-refund-reason').value = '';
+        document.getElementById('inv-refund-summary').innerHTML =
+            '<div>เลขที่: <b>' + escH(inv.inv_number || '-') + '</b></div>' +
+            '<div>ยอดรวม: <b>฿' + invFmt(inv.total_amount || 0) + '</b></div>' +
+            '<div>ยอดชำระสะสม: <b>฿' + invFmt(paid) + '</b>' + (refundedPrev > 0 ? ' (คืนไปแล้ว ฿' + invFmt(refundedPrev) + ')' : '') + '</div>' +
+            '<div style="margin-top:4px;color:#b45309;font-weight:700;">คืนได้สูงสุด: ฿' + invFmt(refundable) + '</div>';
+        document.getElementById('inv-refund-modal').style.display = 'flex';
+    });
+};
+window.invDoRefund = function() {
+    var id     = document.getElementById('inv-refund-id').value;
+    var amount = parseFloat(document.getElementById('inv-refund-amount').value);
+    var method = document.getElementById('inv-refund-method').value;
+    var reason = document.getElementById('inv-refund-reason').value.trim();
+    if (!id || !amount || amount <= 0) { invToast('error', 'กรุณาระบุจำนวนเงินคืน'); return; }
+    if (!reason) { invToast('error', 'กรุณาระบุเหตุผลการคืนเงิน'); return; }
+    if (!confirm('ยืนยันคืนเงิน ฿' + invFmt(amount) + '?\n\nระบบจะลดหนี้ตัวแทนและบันทึก audit trail — ไม่สามารถ undo ได้')) return;
+    invApi('POST', '/invoice/record-refund', {id: id, amount: amount, method: method, reason: reason}, function(err, data) {
+        if (err || !data.success) {
+            invToast('error', (data && data.message) || 'บันทึกคืนเงินล้มเหลว');
+            return;
+        }
+        document.getElementById('inv-refund-modal').style.display = 'none';
+        invToast('success', '✅ บันทึกคืนเงิน ฿' + invFmt(amount) + ' สำเร็จ');
         invLoadList();
     });
 };
