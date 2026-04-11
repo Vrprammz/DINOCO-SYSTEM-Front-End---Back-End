@@ -55,7 +55,20 @@ if ( ! function_exists( 'dinoco_set_claim_status' ) ) {
             return new WP_Error( 'empty_state', 'Target state is empty' );
         }
 
-        // 1. Allowlist — each subsystem registers its vocabulary via filter
+        // 1. Read current state (before observation so we can record it)
+        $from_state = get_field( 'ticket_status', $claim_id );
+        if ( ! is_string( $from_state ) ) $from_state = '';
+
+        // 2. Record observation for M20 — do this FIRST, before allowlist + idempotency
+        //    checks, so we capture EVERY attempted transition including:
+        //    - invalid_state rejections (chatbot or client sending unregistered labels)
+        //    - terminal_state no-ops (how often does the UI re-apply the same state?)
+        //    This is the primary data source for M20 canonicalization.
+        if ( function_exists( 'dinoco_claim_record_observation' ) ) {
+            dinoco_claim_record_observation( $from_state, $to_state );
+        }
+
+        // 3. Allowlist — each subsystem registers its vocabulary via filter
         $allowed = apply_filters( 'dinoco/claim/allowed_states', array() );
         if ( ! is_array( $allowed ) ) $allowed = array();
         if ( ! in_array( $to_state, $allowed, true ) ) {
@@ -68,19 +81,9 @@ if ( ! function_exists( 'dinoco_set_claim_status' ) ) {
             );
         }
 
-        // 2. Read current state
-        $from_state = get_field( 'ticket_status', $claim_id );
-        if ( ! is_string( $from_state ) ) $from_state = '';
-
-        // 3. Idempotency — same state = no-op (mirrors FSM terminal_state semantics)
+        // 4. Idempotency — same state = no-op (mirrors FSM terminal_state semantics)
         if ( $from_state === $to_state ) {
             return new WP_Error( 'terminal_state', 'Already in state: ' . $to_state );
-        }
-
-        // 4. Record observation for M20 (state canonicalization analysis) — do this
-        //    BEFORE the write so we capture even transitions that later hooks reject.
-        if ( function_exists( 'dinoco_claim_record_observation' ) ) {
-            dinoco_claim_record_observation( $from_state, $to_state );
         }
 
         // 5. Apply write
@@ -267,7 +270,16 @@ function dinoco_daily_auto_close_tickets() {
                 }
             }
 
-            update_field('ticket_status', 'Maintenance Completed', $pid);
+            // M18: route through helper — logs history + fires state_changed hook + records observation
+            if ( function_exists( 'dinoco_set_claim_status' ) ) {
+                dinoco_set_claim_status( $pid, 'Maintenance Completed', array(
+                    'actor'  => 'system',
+                    'source' => 'auto_close_cron',
+                    'note'   => 'Auto-closed after 30 days (PCLM)',
+                ) );
+            } else {
+                update_field('ticket_status', 'Maintenance Completed', $pid);
+            }
 
             $current_note = get_field('admin_internal_note', $pid);
             $log = "[" . current_time('d/m/Y H:i') . "] System: Auto-closed after 30 days (PCLM).";
@@ -776,7 +788,21 @@ add_action('init', function() {
 
             if(!empty($_POST['status'])) {
                 $new_status = sanitize_text_field($_POST['status']);
-                update_field('ticket_status', $new_status, $tid);
+                // M18: route through helper for allowlist + hook + history + observability.
+                // If state is not allowlisted → WP_Error but we still write fallback for backward
+                // compat (admin UI may be sending a state that hasn't been registered yet — helps
+                // M20 data collection catch gaps).
+                if ( function_exists( 'dinoco_set_claim_status' ) ) {
+                    $_r = dinoco_set_claim_status( $tid, $new_status, array(
+                        'actor'  => 'admin',
+                        'source' => 'service_center_ui',
+                    ) );
+                    if ( is_wp_error( $_r ) && $_r->get_error_code() === 'invalid_state' ) {
+                        update_field('ticket_status', $new_status, $tid); // defensive fallback
+                    }
+                } else {
+                    update_field('ticket_status', $new_status, $tid);
+                }
 
                 // [UPDATE] Check if Completed AND check for special update parameters (w_status, repair_logs)
                 if ($new_status === 'Maintenance Completed') {
