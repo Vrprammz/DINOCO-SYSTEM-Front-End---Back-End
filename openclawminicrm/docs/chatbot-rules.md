@@ -371,6 +371,8 @@ cd /opt/dinoco && git pull origin main && cd openclawminicrm && docker compose -
 | 2026-04-11 | REG-009/023 Gemini judge over-interpret | ลบ expect_behavior/must_not_do ใช้ regex อย่างเดียว (skip semantic judge) | `f6f3806` | REG-009, REG-023 |
 | 2026-04-11 | REG-019 `ตัวไหน` จับ false positive "ตัวไหนก็ได้" | Bounded regex `ตัวไหน(คะ\|ครับ\|ดี\|กัน)` | `1889869` | REG-019 |
 | 2026-04-11 | **✅ ALL 25/25 PASS** — Gate verified stable | Regression Guard V.1.6 production-ready | `4c06b4d` | — |
+| 2026-04-12 | ลูกค้าเลือกสินค้าแล้ว (pro สีเงิน 19,900) bot ไม่ส่งรูปยืนยัน ข้ามไปถามจังหวัดเลย | เพิ่ม **CONFIRM_SELECTION** rule: ลูกค้าระบุ สี/รุ่น/ราคา → ต้องเรียก product_lookup + แนบ URL รูป **ก่อน** ถามจังหวัด | (this commit) | — |
+| 2026-04-12 | List สินค้า 3+ ตัว bot dump ทุกตัวไม่ถามเชิงรุก | เพิ่ม **LIST_MANY_OPTIONS** rule: list ≥3 ตัว → ปิดท้ายถาม "ลูกค้าสนใจตัวไหน จะส่งรูปให้ดู" | (this commit) | — |
 
 ---
 
