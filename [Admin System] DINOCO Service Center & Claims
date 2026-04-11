@@ -1,10 +1,179 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
- * Version: V.30.4 — Audit N7: deleteTicket inline progress + graceful error path
+ * Version: V.30.5 — M18: add dinoco_set_claim_status() canonical helper + observability
  * DB_ID: 27
  * Author: DINOCO Senior Architect
  */
+
+// ==============================================================================
+// M18 — Canonical claim-status helper (V.30.5, 2026-04-12)
+// ==============================================================================
+//
+// Single write point for claim_ticket.ticket_status mutations across all
+// subsystems (Service Center admin UI, LIFF AI, Member Dashboard, MCP Bridge).
+//
+// Design notes (Option A from Sprint 2 decision):
+//   1. Soft allowlist via `apply_filters('dinoco/claim/allowed_states', ...)`
+//      instead of hardcoded matrix. Reason: the real claim state space is
+//      free-form text with ~6 variants per logical state (Thai + English +
+//      slug + PascalCase) across 5 files. A strict transition matrix needs a
+//      product decision on state canonicalization — tracked as M20.
+//   2. Each subsystem registers its own vocabulary via add_filter in its own
+//      file, documenting ownership (LIFF AI owns the 6 authoritative labels,
+//      Member Dashboard owns the legacy variants, etc.)
+//   3. Observability option `dinoco_claim_observations` records every
+//      (from, to) pair for M20 data collection. Cap 200 entries, trim to
+//      top-100 by count on overflow. autoload=false so it doesn't bloat every
+//      WP request.
+//   4. Idempotent: from === to → WP_Error('terminal_state'), no write.
+//   5. Fires `dinoco/claim/state_changed` hook for downstream listeners.
+//   6. Appends to `status_history` ACF field + post_meta fallback (mirrors
+//      the LIFF AI pattern).
+//
+// Callers should guard with function_exists() because this file loads on
+// init just like all other snippets — load order between snippets isn't
+// guaranteed, so some callers may fire before this helper is defined.
+// ==============================================================================
+
+if ( ! function_exists( 'dinoco_set_claim_status' ) ) {
+    /**
+     * Canonical claim-status transition helper.
+     *
+     * @param int    $claim_id  claim_ticket post ID
+     * @param string $to_state  target state string (must pass the allowlist filter)
+     * @param array  $context   optional: ['actor' => string, 'note' => string, 'source' => string]
+     * @return true|WP_Error    true on success, WP_Error on invalid/terminal
+     */
+    function dinoco_set_claim_status( $claim_id, $to_state, $context = array() ) {
+        $claim_id = intval( $claim_id );
+        if ( $claim_id <= 0 ) {
+            return new WP_Error( 'bad_claim_id', 'Invalid claim_id' );
+        }
+        $to_state = is_string( $to_state ) ? trim( $to_state ) : '';
+        if ( $to_state === '' ) {
+            return new WP_Error( 'empty_state', 'Target state is empty' );
+        }
+
+        // 1. Allowlist — each subsystem registers its vocabulary via filter
+        $allowed = apply_filters( 'dinoco/claim/allowed_states', array() );
+        if ( ! is_array( $allowed ) ) $allowed = array();
+        if ( ! in_array( $to_state, $allowed, true ) ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[ClaimStatus] Invalid state: #%d → %s', $claim_id, $to_state ) );
+            }
+            return new WP_Error(
+                'invalid_state',
+                sprintf( 'Unknown claim state: %s (register via dinoco/claim/allowed_states filter)', $to_state )
+            );
+        }
+
+        // 2. Read current state
+        $from_state = get_field( 'ticket_status', $claim_id );
+        if ( ! is_string( $from_state ) ) $from_state = '';
+
+        // 3. Idempotency — same state = no-op (mirrors FSM terminal_state semantics)
+        if ( $from_state === $to_state ) {
+            return new WP_Error( 'terminal_state', 'Already in state: ' . $to_state );
+        }
+
+        // 4. Record observation for M20 (state canonicalization analysis) — do this
+        //    BEFORE the write so we capture even transitions that later hooks reject.
+        if ( function_exists( 'dinoco_claim_record_observation' ) ) {
+            dinoco_claim_record_observation( $from_state, $to_state );
+        }
+
+        // 5. Apply write
+        update_field( 'ticket_status', $to_state, $claim_id );
+
+        // 6. Append status_history (mirror LIFF AI Snippet 1 pattern)
+        $history = get_field( 'status_history', $claim_id );
+        if ( ! is_array( $history ) ) $history = array();
+        $history[] = array(
+            'from'   => $from_state,
+            'to'     => $to_state,
+            'actor'  => isset( $context['actor'] )  ? (string) $context['actor']  : 'system',
+            'note'   => isset( $context['note'] )   ? (string) $context['note']   : '',
+            'source' => isset( $context['source'] ) ? (string) $context['source'] : '',
+            'at'     => current_time( 'c' ),
+        );
+        update_field( 'status_history', $history, $claim_id );
+        update_post_meta( $claim_id, 'status_history', $history ); // defensive fallback
+
+        // 7. Fire hook for downstream listeners
+        do_action( 'dinoco/claim/state_changed', $claim_id, $from_state, $to_state, $context );
+
+        // 8. Log
+        if ( function_exists( 'b2b_log' ) ) {
+            $actor = isset( $context['actor'] ) ? $context['actor'] : 'system';
+            b2b_log( sprintf( "[ClaimStatus] #%d: '%s' → '%s' (actor=%s)", $claim_id, $from_state, $to_state, $actor ) );
+        }
+
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_claim_record_observation' ) ) {
+    /**
+     * Record a (from, to) transition observation for M20 state canonicalization.
+     *
+     * Storage: wp_option 'dinoco_claim_observations' (autoload=false)
+     * Schema:  md5(from||to) => { from, to, count, first_seen, last_seen }
+     * Cap:     200 entries max; on overflow, trim to top-100 by count
+     *
+     * Used to answer: "Which from→to transitions actually happen in production?"
+     * Feeds into M20 analysis — once we have 2–4 weeks of data, we can see which
+     * state-string variants are real (e.g. 'registered' vs 'Registered in System')
+     * and make a product decision on canonicalization.
+     */
+    function dinoco_claim_record_observation( $from_state, $to_state ) {
+        $obs = get_option( 'dinoco_claim_observations', array() );
+        if ( ! is_array( $obs ) ) $obs = array();
+        $key = md5( (string) $from_state . '||' . (string) $to_state );
+        $now = current_time( 'mysql' );
+
+        if ( isset( $obs[ $key ] ) && is_array( $obs[ $key ] ) ) {
+            $obs[ $key ]['count']     = intval( $obs[ $key ]['count'] ?? 0 ) + 1;
+            $obs[ $key ]['last_seen'] = $now;
+        } else {
+            $obs[ $key ] = array(
+                'from'       => (string) $from_state,
+                'to'         => (string) $to_state,
+                'count'      => 1,
+                'first_seen' => $now,
+                'last_seen'  => $now,
+            );
+        }
+
+        // Cap: if over 200, keep top-100 by count (drop rarely-seen transitions)
+        if ( count( $obs ) > 200 ) {
+            uasort( $obs, function( $a, $b ) {
+                return intval( $b['count'] ?? 0 ) <=> intval( $a['count'] ?? 0 );
+            });
+            $obs = array_slice( $obs, 0, 100, true );
+        }
+
+        update_option( 'dinoco_claim_observations', $obs, false ); // autoload=false
+    }
+}
+
+// Service Center owns the authoritative Thai/English claim status labels.
+// Other subsystems register their own variants via the same filter.
+add_filter( 'dinoco/claim/allowed_states', 'dinoco_sc_register_claim_states' );
+function dinoco_sc_register_claim_states( $states ) {
+    return array_merge( is_array( $states ) ? $states : array(), array(
+        // Authoritative long-form labels (matches LIFF AI Snippet 1:880 allowlist)
+        'Registered in System',
+        'Pending Issue Verification',
+        'Maintenance Completed',
+        'Repaired Item Dispatched',
+        'Replacement Approved',
+        'Replacement Shipped',
+        'Replacement Rejected by Company',
+        // Ingress label used by member-side tracking upload
+        'In Transit to Company',
+    ) );
+}
 
 // ==============================================================================
 // 0. AUTO-CLOSE LOGIC (Runs via WP-Cron Daily - NOT admin_init)
