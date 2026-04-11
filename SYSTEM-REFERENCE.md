@@ -294,7 +294,33 @@
 
 invoice/list, invoice/get, invoice/init, invoice/create, invoice/update, invoice/issue, invoice/record-payment, invoice/verify-slip, invoice/verify-slip-combined, invoice/upload-slip, invoice/cancel, invoice/delete, invoice/send-reminder, invoice/send-overdue-notice, invoice/resend-line, invoice/pending-summary, invoice/send-summary, invoice/distributor-detail
 
-### 3.6 Infrastructure (`/wp-json/dinoco/v1/`)
+### 3.6 Inventory / Stock Management (`/wp-json/dinoco-stock/v1/`)
+
+Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DINOCO Global Inventory Database`):
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/image-proxy` | Admin | **V.42.10** Server-side fetch รูป + base64 encode → แก้ CORS taint ใน Auto-Split generateLabeledImage (https only, 10MB limit, image/* check) |
+| GET | `/stock/list` | Admin | List products with stock + filter (status/search/warehouse_id/type_filter) |
+| POST | `/stock/adjust` | Admin | Manual stock adjust (+leaf guard DD-2) |
+| GET | `/stock/transactions` | Admin | Transaction history |
+| GET/POST | `/stock/settings` | Admin | Threshold config |
+| POST | `/stock/hold` | Admin | Manual hold/unhold |
+| POST | `/stock/initialize` | Admin | Mark `dinoco_inv_initialized=true` |
+| POST | `/stock/transfer` | Admin | Transfer between warehouses |
+| GET | `/dip-stock/start` | Admin | Start physical count session |
+| GET | `/dip-stock/current` | Admin | Current session |
+| POST | `/dip-stock/count` | Admin | Record count |
+| POST | `/dip-stock/approve` | Admin | Approve + apply variance |
+| POST | `/dip-stock/force-close` | Admin | Force close session |
+| GET | `/dip-stock/history` | Admin | Past sessions |
+| GET | `/warehouses`, `/warehouse` | Admin | Multi-warehouse CRUD |
+| GET | `/valuation` | Admin | WAC inventory valuation |
+| GET | `/forecast` | Admin | Stock forecasting |
+| POST | `/product/pricing` | Admin | Product tier pricing (dual-write catalog) |
+| POST | `/product/upload-image` | Admin | Upload product image |
+
+### 3.7 Infrastructure (`/wp-json/dinoco/v1/`)
 
 github-sync (webhook), github-sync-manual, sync-status
 
@@ -624,7 +650,7 @@ sequenceDiagram
 
 #### `dinoco_products` (B2B Snippet 15)
 
-Product catalog stored in custom table (separate from b2b_product CPT).
+Product catalog stored in custom table (separate from b2b_product CPT) — source of truth for pricing, stock, hierarchy classification.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -633,9 +659,18 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 | `name` | VARCHAR | Product name |
 | `category` | VARCHAR | Category |
 | `base_price` | DECIMAL | Base price (retail) |
+| `price_silver` / `price_gold` / `price_platinum` / `price_diamond` | DECIMAL | Tier discount % (0-100) |
+| `b2b_discount_percent` | DECIMAL | Standard tier discount % |
 | `image_url` | TEXT | Product image |
 | `boxes_per_unit` | INT DEFAULT 1 | Boxes per unit (สินค้าใหญ่) |
 | `units_per_box` | INT DEFAULT 1 | Units per box (สินค้าเล็กแพ็ครวม) |
+| `stock_qty` | INT | Stock quantity (leaf SKUs only — DD-2) |
+| `stock_status` | VARCHAR | in_stock / low_stock / out_of_stock |
+| `oos_timestamp` / `oos_duration_hours` / `oos_eta_date` | — | Out-of-stock tracking |
+| `b2b_visible` | TINYINT(1) DEFAULT 1 | Show in B2B catalog (ตัวแทน) |
+| `compatible_models` | TEXT | JSON array of compatible moto models |
+| `is_active` | TINYINT(1) | Soft delete |
+| `ui_role_override` | VARCHAR(20) DEFAULT `'auto'` | **V.42.14** Manual UI classification override (`auto` / `set` / `child` / `grandchild` / `single`). Admin เลือกเองใน Edit Product modal เพื่อ override leaf-based auto classification. UI layer only — ไม่กระทบ stock / orders / DD-2 |
 
 #### `dinoco_moto_brands` (B2B Snippet 15, DINOCO_MotoDB class)
 
@@ -701,6 +736,34 @@ Product catalog stored in custom table (separate from b2b_product CPT).
 - **Inventory Valuation**: ใช้ `dinoco_compute_hierarchy_stock()` แทน raw stock
 - **Dip Stock**: snapshot เฉพาะ leaf SKUs (filter ด้วย `dinoco_is_leaf_sku()`)
 - **Hierarchy Migration (H1)**: `save_sku_relation` ใน Admin Inventory V.42.4 — ถ้า parent เคยมี `stock_qty > 0` แล้วกลายเป็น non-leaf → ต้องส่ง POST flag `confirm_stock_migrate=1` → โอน stock ไปที่ leaf แรก + audit trail (`hierarchy_migrate_out/in` transaction types)
+
+#### Admin UI Classification (Frontend `computeProductTypes`, V.42.12-42.14)
+
+แยกจาก backend hierarchy — นี่คือ **UI layer** ที่ classify สินค้าให้แสดง badge ถูกต้อง:
+
+| Type | Condition (leaf-based V.42.13) | Badge Color | Label |
+|------|-------------------------------|-------------|-------|
+| `set` | ไม่มี parent + มี children | 🟣 purple `#ede9fe/#6d28d9` | "ชุดหลัก" |
+| `child` | มี parent + มี children ของตัวเอง (intermediate/sub-SET) | 🔵 blue `#dbeafe/#1e40af` | "ชิ้นส่วน" |
+| `grandchild` | มี parent + เป็น leaf (แยกขายเป็นอะไหล่ได้) | 🟢 green `#d1fae5/#065f46` | "ชิ้นส่วนย่อย" |
+| `single` | ไม่มี parent + ไม่มี children | ⚪ gray (ไม่แสดง badge) | "เดี่ยว" |
+
+**V.42.13 Leaf-based fix**: เปลี่ยนจาก depth-based (เดิม `grandchild` = depth 3 เท่านั้น) → leaf-based (leaf + มี parent = `grandchild` เสมอ). แก้บัค `SET → [L, R]` 2 ชั้น ที่เดิม classify L/R ผิดเป็น `child`
+
+**V.42.14 Hybrid Override**: `ui_role_override` column override leaf-based default
+- ถ้า `override !== 'auto' && override !== autoType` → ใช้ override + `is_override=true`
+- Badge แสดง icon ✋ indicator เมื่อ override
+- `_productTypeMap[sku]` เก็บทั้ง `type` (final) และ `auto_type` (ต้นฉบับ)
+- UI: radio chips ใน Edit Product modal (อัตโนมัติ / ชุดหลัก / ชิ้นส่วน / ชิ้นส่วนย่อย / เดี่ยว) + hint "อัตโนมัติ: {label}"
+
+**Context fields ใน `_productTypeMap[sku]`:**
+- `parent_sku`, `parent_name`, `parent_count` (จำนวน shared parents — DD-3)
+- `grandparent_sku`, `grandparent_name` (nullable — null ถ้า 2-level flat)
+- `direct_children_count` (สำหรับ set) + `grandchildren_total` (นับรวม grandchildren ใต้ทุก child)
+- `grandchildren_count` (สำหรับ child — ถ้ามี sub-grandchildren = sub-SET)
+- `auto_type`, `is_override` (V.42.14)
+
+**Shared child (DD-3)** — `childToParents[sku]` เก็บเป็น array รองรับหลาย parent, badge แสดง `+N ชุด` indicator
 
 #### B2F Settings
 

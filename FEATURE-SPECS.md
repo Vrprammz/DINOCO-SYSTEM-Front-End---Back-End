@@ -2669,6 +2669,179 @@ Manual Edit Product modal — แสดง **suggestion ราคาต่อห
 
 ---
 
+## 11.15 Hierarchy Tag System + UX Overhaul (V.42.9 → V.42.14 — 2026-04-10)
+
+**Status**: Deployed 2026-04-10 | **File**: `[Admin System] DINOCO Global Inventory Database` | **Scope**: Product Catalog UI overhaul ใน Inventory Command Center
+
+### 11.15.1 Problem & Goal
+
+**ปัญหา**: Badge "SET" เก่าไม่สื่อโครงสร้าง 3 ระดับ + มีบัค blocker หลายจุดใน Edit Product modal + รูปโหลดบาง case มี CORS taint / random N/A / Auto-Split ทำได้แค่ 2 ชิ้น
+
+**เป้าหมาย**:
+
+1. Admin เห็น 4 ประเภทสินค้าชัดเจน: ชุดหลัก / ชิ้นส่วน / ชิ้นส่วนย่อย / เดี่ยว
+2. Breadcrumb คลิกกลับไปที่ parent ได้ (navigation พื้นฐาน)
+3. Save grandchild ได้ (เดิมมี blocker ตั้งแต่ V.40.5)
+4. Auto-Split รองรับสินค้าที่แยกเป็นหลายชิ้น (ไม่ใช่แค่ L/R)
+5. Admin override classification ได้เมื่อ auto-logic ไม่ตรงกับ business label
+
+### 11.15.2 Version Matrix
+
+| Version | Scope | Key Change |
+|---------|-------|------------|
+| **V.42.9** | CRITICAL bug | `skipRelations` condition wrong → grandchild ไม่บันทึก. แก้: skip เฉพาะ grandchild + ไม่เคยมี children |
+| **V.42.10** | CORS Image Proxy | `POST /dinoco-stock/v1/image-proxy` — server-side fetch + base64 → แก้ canvas tainted (admin panel ↔ image cross-origin) |
+| **V.42.11** | N-part Auto-Split | Dynamic 2-6 parts + parallel save ผ่าน `$.when.apply`. Count chip + pattern filter + renderSplitColumns(n) |
+| **V.42.12** | Tag Redesign | 4 badge types (purple/blue/green/gray) + breadcrumbs + counts + image skeleton + case-insensitive lookup |
+| **V.42.13** | Leaf-based Classification | เปลี่ยนจาก depth-based → leaf-based. แก้ `SET → [L, R]` ตรงๆ ที่ L/R classify ผิดเป็น child |
+| **V.42.14** | Hybrid Override | `ui_role_override` column + radio chips + auto hint + badge indicator ✋ |
+
+### 11.15.3 Badge System (V.42.12)
+
+```text
+┌──────────────────────────────────────────────────┐
+│ 🟣 ชุดหลัก (set)        — purple #ede9fe/#6d28d9 │
+│   └─ subtitle: "N ชิ้นส่วน · M ชิ้นย่อย"           │
+│                                                   │
+│ 🔵 ชิ้นส่วน (child)      — blue #dbeafe/#1e40af   │
+│   └─ breadcrumb: ← {parent_name}                  │
+│   └─ +N ชิ้นย่อย (ถ้าเป็น sub-SET)                 │
+│   └─ +N ชุด (ถ้า shared child — DD-3)             │
+│                                                   │
+│ 🟢 ชิ้นส่วนย่อย (grandchild) — green #d1fae5/#065f46 │
+│   └─ 3 ชั้น: ← {gp_name} › {parent_name}          │
+│   └─ 2 ชั้น: ← {parent_name}                       │
+│                                                   │
+│ ⚪ เดี่ยว (single)      — gray (ไม่แสดง badge)    │
+└──────────────────────────────────────────────────┘
+```
+
+**Accessibility**: ทุก badge color contrast > 7:1 (WCAG AAA). Touch target ≥ 44×44px สำหรับ breadcrumb click. Tooltip `title` attribute truncate fallback.
+
+**Filter chips** (ลำดับใหม่): `ทั้งหมด → สินค้าเดี่ยว → ชุดหลัก → └─ ชิ้นส่วน → └─ ชิ้นส่วนย่อย` (indent 18px + prefix `└─` visual hierarchy)
+
+### 11.15.4 Leaf-based Classification (V.42.13)
+
+```javascript
+// ใหม่ V.42.13 — leaf-based (แก้บัค SET → [L, R] flat)
+if (myParent && isLeaf) → 'grandchild'   // leaf ใต้ parent เสมอ = แยกขายเป็นอะไหล่ได้
+else if (myParent && isParent) → 'child'  // intermediate (sub-SET)
+else if (isParent) → 'set'                // ชุดหลัก
+else → 'single'
+```
+
+**Case matrix** (ทุก scenario):
+
+| Structure | Expected |
+|-----------|----------|
+| `SET → [L, R]` (flat 2 ชั้น) | L/R = **grandchild** ✅ (เดิมผิดเป็น child) |
+| `SET → [Upper → [L,R], Lower → [L,R]]` (3 ชั้นเต็ม) | Upper/Lower = child, L/R = grandchild ✅ |
+| `SET → [Upper(leaf), Lower → [L,R]]` (ผสม) | Upper = grandchild, Lower = child, L/R = grandchild ✅ |
+
+### 11.15.5 Hybrid Override (V.42.14)
+
+**Backend**:
+
+- Column `ui_role_override VARCHAR(20) DEFAULT 'auto'` ใน `wp_dinoco_products`
+- Auto-migration ใน `get_catalog` handler (ALTER TABLE ถ้า column ยังไม่มี)
+- `save_product` handler whitelist 5 values: `auto / set / child / grandchild / single`
+
+**Frontend**:
+
+- Radio chips ใน Edit Product modal (Section "แสดงเป็นหมวดหมู่" สีเหลือง)
+- Hint badge "อัตโนมัติ: {label}" แสดง autoType ที่ leaf-based จะเดา
+- Badge indicator ✋ (icon `fa-hand`) ต่อท้าย label ถ้า `is_override=true`
+- `_productTypeMap[sku]` เก็บทั้ง `type` (final) และ `auto_type` (original)
+
+**Logic**:
+
+```javascript
+var autoType = leafBasedClassify(sku);
+var override = item.ui_role_override || 'auto';
+if (override !== 'auto' && override !== autoType) {
+    finalType = override;
+    isOverride = true;
+} else {
+    finalType = autoType;
+}
+```
+
+**Edge cases**:
+
+- `override=child` บน single (ไม่มี parent) → ไม่ render breadcrumb
+- `override=grandchild` บน single → badge อย่างเดียว
+- `override=single` บน set/child/gc → แสดง badge "เดี่ยว" + ✋ (ปกติ single ไม่แสดง badge)
+
+**สำคัญ**: Override เป็น **UI layer only** — ไม่กระทบ stock cut, orders, DD-2 (backend ใช้ structure จริงจาก `dinoco_sku_relations`)
+
+### 11.15.6 Auto-Split N-part (V.42.11)
+
+Refactor จาก hardcoded 2 columns → dynamic 2-6 parts:
+
+**Parts count chips**: 2 / 3 / 4 / 5 / 6 ชิ้น (default 2)
+
+**Pattern chips** (filter ตาม count):
+
+- **2-part**: L|R, U|D, F|B, FR|RR
+- **3-part**: L|R|U, L|R|T, F|L|R
+- **4-part**: L|R|U|D, F|B|L|R
+- **custom**: กำหนด suffix เอง (ทำงานทุก count)
+
+**JS helpers**:
+
+- `renderSplitColumns(n)` — สร้าง N columns พร้อม accent color
+- `updateCustomSuffixInputs(n)` — N suffix input fields
+- `renderPriceModeInputs(n)` — N percent/quantity inputs
+- `filterPatternChipsByCount(n)` — hide/show chips ตรงตาม count
+- `executeAutoSplitV2()` — parallel save N SKUs ผ่าน `$.when.apply($, deferreds)`
+- `_splitState.col[1..N]` + `_splitState.sfx[N]`
+
+**Price Split Modes** (ทำงานกับ N columns):
+
+- **equal**: `floor(base/N)` + last column gets remainder
+- **percent**: admin ใส่ % ทั้ง N ช่อง (validate sum = 100)
+- **quantity**: `prices[i] = base * (qty[i] / total)`
+- **manual**: admin กรอกเอง N ช่อง
+
+### 11.15.7 Image System Fixes (V.42.10 + V.42.12)
+
+**V.42.10 CORS Proxy**:
+
+- New REST: `POST /dinoco-stock/v1/image-proxy`
+- Body: `{ url: "https://..." }`
+- Returns: `{ success, data_url: "data:image/jpeg;base64,...", size }`
+- Security: https only, 10MB limit, image/* content-type, `current_user_can('manage_options')`
+- Fallback chain ใน `generateLabeledImage`:
+  1. `new Image()` + `crossOrigin='anonymous'` (best case)
+  2. ถ้า canvas tainted → `new Image()` ไม่ใช้ CORS header
+  3. ถ้ายังไม่ได้ → `POST /image-proxy` → data URL → canvas OK
+
+**V.42.12 Image Skeleton**:
+
+- `.cedit-thumb-wrap` wrapper + skeleton shimmer animation (1.2s)
+- `<img loading="lazy">` onload → ซ่อน skeleton → smooth fade
+- แก้บัครูปแฟลช N/A ก่อนค่อยมา
+
+**V.42.12 Case-Insensitive Lookup**:
+
+- Helper `cat(sku)` ใช้ uppercase cache
+- Invalidate cache ทุกครั้ง `loadCatalog()` reload
+- แก้บัค SKU case mismatch (relations uppercase แต่ `catalogData` บางตัว mixed case) → `catalogData[child]` miss → N/A random
+
+### 11.15.8 Testing Checklist
+
+- [x] บันทึก grandchild ผ่าน Manual Edit modal (V.42.9)
+- [x] Auto-Split รูป overlay text ขึ้นถูกต้อง (V.42.10)
+- [x] Auto-Split 3+ ชิ้น (V.42.11): L/R/T, F/B/L/R
+- [x] Price mode ทั้ง 4 แบบทำงานกับ N cols (V.42.11)
+- [x] Badge 4 ประเภทแสดงถูกต้อง (V.42.12)
+- [x] Breadcrumb คลิกกลับไปที่ parent (V.42.12)
+- [x] `SET → [L, R]` flat 2 ชั้น → L/R = grandchild (V.42.13)
+- [x] Radio override → badge เปลี่ยน + ✋ indicator (V.42.14)
+- [ ] Manual Edit suggestion ราคาต่อหลาน (Phase 2 — pending)
+
+---
+
 # 13. Regression Guard System V.1.5 (OpenClaw)
 
 **Status**: Deployed 2026-04-11 | **Files**: `openclawminicrm/scripts/regression.js`, `seed-regression.js`, `proxy/index.js` (`runRegressionTurn`), `smltrackdashboard/src/app/train/components/RegressionTab.tsx` | **Spec**: `openclawminicrm/docs/regression-guard.md` | **Canonical Brain**: `openclawminicrm/docs/chatbot-rules.md`

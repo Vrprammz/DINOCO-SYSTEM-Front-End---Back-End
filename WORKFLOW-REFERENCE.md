@@ -1121,43 +1121,58 @@ Multi-Warehouse:
   - dinoco_transfer_stock($sku, $from, $to, $qty)
 ```
 
-### 10.6 Auto-Split Workflow (V.41.0 → V.42.8)
+### 10.6 Auto-Split Workflow (V.41.0 → V.42.11)
 
 ```
-Purpose: แยกสินค้าเดี่ยวหรือ child → 2 ชิ้นส่วนย่อย (L/R) ในคลิกเดียว
+Purpose: แยกสินค้าเดี่ยวหรือ child → 2-6 ชิ้นส่วนย่อย ในคลิกเดียว (V.42.11 N-part)
 
-Entry: Admin Inventory → Edit product (single หรือ child) → กด "Auto-Split L/R"
+Entry: Admin Inventory → Edit product (single หรือ child) → กด "Auto-Split"
 
-Pre-check (V.42.8):
-  - type = 'single' หรือ 'child' (เดิม block 'single' ผิด — V.41.2 เพิ่มปุ่มแต่ลืมแก้ check, V.42.8 fix)
+Pre-check (V.42.8 + V.42.11):
+  - type = 'single' หรือ 'child' (V.42.8 allow single)
   - parent ต้องยังไม่มี children (skuRelations[parent].length === 0)
-  - ถ้า -L/-R orphan มีอยู่แล้ว (V.42.7 resume mode) → allow resume ถ้าไม่ได้ link กับ parent ไหน
+  - ถ้า -sfx orphan มีอยู่แล้ว (V.42.7 resume mode) → allow resume ถ้าไม่ได้ link กับ parent ไหน
 
-Price Split Modes (V.42.8 Phase 1):
-  - equal (default): ลูก /2 เท่ากัน
-  - percent: admin ใส่ % (ต้องรวม 100)
-  - quantity: L qty vs R qty → สัดส่วน
-  - manual: admin กรอกเอง
-  → ปุ่ม "คำนวณ" auto-fill ราคาทั้ง 2 ช่อง
+N-part Selection (V.42.11):
+  - Count chips: 2 / 3 / 4 / 5 / 6 ชิ้น (default 2)
+  - Pattern chips filter ตาม count:
+    * 2-part: L|R, U|D, F|B, FR|RR
+    * 3-part: L|R|U, L|R|T, F|L|R
+    * 4-part: L|R|U|D, F|B|L|R
+    * custom: กำหนด suffix เอง (ทำงานทุก count)
+  - Columns render dynamic ผ่าน renderSplitColumns(n)
+  - _splitState.col[1..N] + _splitState.sfx[N]
 
-Execute Flow (4 steps):
-  1. save_product sku1 (-L)  + save_product sku2 (-R)    ← parallel (V.42.0 H-8)
-  2. save pricing sku1 + sku2                            ← parallel (copy tier จากแม่)
-  3. save_sku_relation parent={parent}, children=[sku1, sku2], confirm_stock_migrate=1 (V.42.5)
+Price Split Modes (V.42.8 + V.42.11 N-column):
+  - equal (default): หาร /N เท่ากัน (last col gets remainder)
+  - percent: admin ใส่ % ทั้ง N ช่อง (ต้องรวม 100)
+  - quantity: qty_1..qty_N → prices[i] = base * (qty[i] / total)
+  - manual: admin กรอกเอง N ช่อง
+  → ปุ่ม "คำนวณ" auto-fill ราคาทั้ง N ช่อง
+
+Execute Flow (4 steps + CORS proxy):
+  0. generateLabeledImage (V.42.10) — canvas + overlay text
+     ├── ลอง load ตรง (crossOrigin=anonymous)
+     ├── ถ้า canvas tainted → direct load ไม่ใช้ CORS
+     └── ถ้ายังไม่ได้ → POST /dinoco-stock/v1/image-proxy → data URL → canvas OK
+  1. save_product × N SKUs (parallel via $.when.apply)
+  2. save pricing × N SKUs (parallel)
+  3. save_sku_relation parent={parent}, child_skus=[sku1..skuN], confirm_stock_migrate=1 (V.42.5)
       ├── backend detect parent had stock → migrate ไป sku1 (H1)
       └── insert audit: hierarchy_migrate_out (parent) + hierarchy_migrate_in (sku1)
-  4. Success → แสดงผล + reload catalog
+  4. Success → แสดง N edit buttons + reload catalog
 
 Error Handling:
-  - Step 4 fail เดิม → orphan -L/-R ค้าง (V.42.7 fix: allow resume)
+  - Step 4 fail เดิม → orphan -sfx ค้าง (V.42.7 fix: allow resume)
   - Response success:false → แสดง error message จริงจาก backend (V.42.6)
   - Silent fail (HTTP 200 + success:false) → ถูกจับด้วย relationResponse inspection (V.42.6)
 
-Auto-Split Image (V.42.0 → V.42.3):
+Auto-Split Image (V.42.0 → V.42.10):
   - Canvas = aspect ratio ของรูปต้นฉบับ (maxDim 1600)
   - แถบแดงซ้อนทับด้านล่าง 16% ของ canvas height
   - Text overlay (Thai font) 50% ของ bar height
   - jpeg quality 0.9 → upload + overwrite SKU image
+  - V.42.10: WP image-proxy fallback แก้ CORS tainted (admin panel ↔ รูป cross-origin)
 ```
 
 ### 10.7 Hierarchy Bug Fixes (V.7.1 / V.42.4-42.8 — 2026-04-10)
@@ -1193,6 +1208,68 @@ Frontend Fix Wave (V.42.5-42.8):
   V.42.6 — Manual Edit modal ส่ง flag + inspect relationResponse (silent fail fix)
   V.42.7 — Auto-Split resume from orphan (retry ได้ไม่ติด guard)
   V.42.8 — Price split mode 4 แบบ + type check fix (single) + debug console log
+```
+
+### 10.8 Hierarchy Tag System + UX Overhaul (V.42.9 → V.42.14 — 2026-04-10)
+
+```
+ปัญหา: Tag "SET" เก่าไม่สื่อโครงสร้าง 3 ระดับ + มีบัคหลายจุดใน Edit modal
+
+V.42.9 CRITICAL — Save grandchild ไม่ได้ (blocker ตั้งแต่ V.40.5)
+  Bug: skipRelations = (ptype === 'child' || 'grandchild') → ห้ามส่ง save_sku_relation
+       → admin เพิ่ม grandchild ใต้ child → save → skipped → grandchild หาย
+  Fix: skip เฉพาะ grandchild + ไม่มี children และไม่เคยมี (everHadChildren check)
+
+V.42.10 CORS Image Proxy
+  Bug: Canvas tainted เวลา generateLabeledImage โหลดรูปจาก dinoco.in.th
+       บน admin panel akesa.ch (cross-origin) → toBlob throw SecurityError
+  Fix: POST /dinoco-stock/v1/image-proxy (server-side fetch + base64)
+       - https only, 10MB limit, image/* content-type check, admin only
+       - Fallback chain: direct CORS → direct no-CORS → WP proxy data URL
+       - data URL = same-origin → no CORS issue
+
+V.42.11 N-part Auto-Split (2-6 parts dynamic)
+  เดิม: hardcoded 2 cols L/R
+  ใหม่: count chip (2-6) + pattern filter + dynamic render
+        - renderSplitColumns(n) สร้าง N cols + accent color
+        - parallel save via \$.when.apply(\$, deferreds)
+        - applySplitPriceMode รองรับ N cols ทุก mode
+
+V.42.12 Hierarchy Tag Redesign + Skeleton + Case-Insensitive
+  - Badge 4 types: purple set / blue child / green grandchild / gray single
+    * Contrast AAA (>7:1) ทุกสี
+    * Icon Font Awesome: sitemap/puzzle-piece/gear/cube
+  - Breadcrumb: child "← {parent}", grandchild "← {gp} › {parent}" คลิกได้
+  - Count: set "N ชิ้นส่วน · M ชิ้นย่อย" (รวมหลานใต้ลูก)
+  - Filter chips ใหม่: ทั้งหมด / สินค้าเดี่ยว / ชุดหลัก / └─ ชิ้นส่วน / └─ ชิ้นส่วนย่อย
+  - Image skeleton loader: .cedit-thumb-wrap + shimmer animation
+  - cat(sku) helper: case-insensitive lookup + uppercase cache
+    แก้บัค SKU case mismatch (relations uppercase, catalogData mixed)
+    → รูปใน Set Components list random N/A
+  - computeProductTypes V.42.12: direct_children_count + grandchildren_total
+    + grandchildren_count + parent_count (shared child support DD-3)
+
+V.42.13 Leaf-based Classification
+  ปัญหา: SET → [L, R] ตรงๆ (2 ชั้น) classify L/R เป็น 'child' ผิด
+  เดิม (depth-based): if (myParent && childToParent[myParent]) → grandchild
+  ใหม่ (leaf-based):  if (myParent && isLeaf) → grandchild
+  Case matrix:
+    - SET → [L, R] (flat 2): L/R = grandchild ✅
+    - SET → [Upper → [L,R]] (3): Upper=child, L/R=grandchild ✅
+    - SET → [Upper(leaf), Lower → [L,R]]: Upper=grandchild, Lower=child ✅
+  Breadcrumb: 3 ชั้น (← gp › parent) หรือ 2 ชั้น (← parent เดียว) — เพิ่ม null check
+  ไม่กระทบ DD-2 backend (dinoco_get_leaf_skus leaf-aware อยู่แล้ว)
+
+V.42.14 Hybrid Override (Manual admin choice)
+  เพิ่ม column ui_role_override VARCHAR(20) DEFAULT 'auto' (auto-migration)
+  Backend save_product whitelist: auto / set / child / grandchild / single
+  Frontend:
+    - UI: radio chips ใน Edit Product modal (5 choices)
+    - Hint: "อัตโนมัติ: {auto_type_label}" ให้ admin เห็นว่า auto จะเดาเป็นอะไร
+    - computeProductTypes: ถ้า override !== 'auto' && !== autoType → ใช้ override
+    - is_override=true → แสดง icon ✋ ต่อท้าย badge label
+    - edge cases: override=child/gc/single บนสินค้าไม่มี parent (render ไม่มี breadcrumb)
+  สำคัญ: UI layer only — ไม่กระทบ stock / orders / DD-2 (backend ใช้ structure จริง)
 ```
 
 ---
