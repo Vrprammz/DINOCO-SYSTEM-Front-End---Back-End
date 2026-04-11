@@ -68,6 +68,8 @@ function parseArgs() {
     category: null,
     bugId: null,
     triggeredBy: "manual",
+    parallel: 1, // 1 = sequential, 3-5 = parallel
+    skipPassed: false, // skip scenarios ที่ pass ใน run ล่าสุด (ประหยัดเวลา)
   };
   for (const a of args) {
     if (a.startsWith("--mode=")) out.mode = a.split("=")[1];
@@ -76,6 +78,9 @@ function parseArgs() {
     else if (a.startsWith("--category=")) out.category = a.split("=")[1];
     else if (a.startsWith("--bug-id=")) out.bugId = a.split("=")[1];
     else if (a.startsWith("--triggered-by=")) out.triggeredBy = a.split("=")[1];
+    else if (a.startsWith("--parallel=")) out.parallel = Math.max(1, Math.min(5, parseInt(a.split("=")[1]) || 1));
+    else if (a === "--skip-passed") out.skipPassed = true;
+    else if (a === "--fast") { out.parallel = 3; out.skipPassed = false; }
   }
   return out;
 }
@@ -523,40 +528,47 @@ async function main() {
     process.exit(opts.mode === "gate" ? 1 : 0);
   }
 
-  console.log(bold(cyan(`\n=== DINOCO Regression Guard V.1.0 ===`)));
-  console.log(gray(`Mode: ${opts.mode} | Scenarios: ${scenarios.length} | Triggered by: ${opts.triggeredBy}`));
+  // Skip scenarios ที่ pass ใน run ล่าสุด (ประหยัดเวลา — ไม่ re-test ที่ผ่านแล้ว)
+  let filteredScenarios = scenarios;
+  if (opts.skipPassed) {
+    const before = scenarios.length;
+    filteredScenarios = scenarios.filter(s => s.last_run?.status !== "pass");
+    const skipped = before - filteredScenarios.length;
+    if (skipped > 0) {
+      console.log(gray(`\n[Skip Passed] Skipping ${skipped} scenarios that passed last run`));
+    }
+  }
+
+  console.log(bold(cyan(`\n=== DINOCO Regression Guard V.1.1 ===`)));
+  console.log(gray(`Mode: ${opts.mode} | Scenarios: ${filteredScenarios.length}/${scenarios.length} | Triggered by: ${opts.triggeredBy}`));
+  if (opts.parallel > 1) console.log(gray(`Parallel: ${opts.parallel} concurrent`));
   if (opts.severity) console.log(gray(`Severity filter: ${opts.severity.join(",")}`));
   if (opts.category) console.log(gray(`Category filter: ${opts.category}`));
   console.log(gray(`Agent: ${API_URL}`));
   console.log("");
 
-  // Run sequentially with delay (Gemini free tier = 15 RPM)
   const results = [];
   let passCount = 0, failCount = 0, errorCount = 0;
 
-  for (let i = 0; i < scenarios.length; i++) {
-    const s = scenarios[i];
-    process.stdout.write(
-      `${gray(`[${i + 1}/${scenarios.length}]`)} ${bold(s.bug_id)} ${s.title.substring(0, 50)} ... `
-    );
+  // Helper: run one scenario + update DB + log
+  async function runOne(s, idx, total) {
+    const label = `${gray(`[${idx + 1}/${total}]`)} ${bold(s.bug_id)} ${s.title.substring(0, 50)} ... `;
     try {
       const result = await runScenario(db, s, opts);
       results.push(result);
       if (result.status === "pass") {
-        console.log(green("PASS") + gray(` (${result.duration_ms}ms)`));
+        console.log(label + green("PASS") + gray(` (${result.duration_ms}ms)`));
         passCount++;
       } else if (result.status === "error") {
-        console.log(yellow(`ERROR`) + gray(` ${result.error}`));
+        console.log(label + yellow(`ERROR`) + gray(` ${result.error}`));
         errorCount++;
       } else {
-        console.log(red("FAIL") + gray(` (${result.duration_ms}ms)`));
+        console.log(label + red("FAIL") + gray(` (${result.duration_ms}ms)`));
         for (const v of result.violations) {
           console.log(`    ${red(">>")} [${v.layer}] ${v.reason || v.pattern || v.tool || ""}`);
         }
         failCount++;
       }
-
-      // Update last_run on scenario
       await db.collection(SCENARIOS_COLL).updateOne(
         { _id: s._id },
         {
@@ -571,21 +583,29 @@ async function main() {
         }
       );
     } catch (e) {
-      console.log(yellow(`ERROR`) + gray(` ${e.message}`));
+      console.log(label + yellow(`ERROR`) + gray(` ${e.message}`));
       errorCount++;
       results.push({
-        bug_id: s.bug_id,
-        title: s.title,
-        severity: s.severity,
-        category: s.category,
-        status: "error",
-        error: e.message,
-        violations: [],
+        bug_id: s.bug_id, title: s.title, severity: s.severity, category: s.category,
+        status: "error", error: e.message, violations: [],
       });
     }
+  }
 
-    // Rate limit: ~2s between scenarios (Gemini free tier)
-    if (i < scenarios.length - 1) await delay(2000);
+  // Parallel mode — batch N concurrent
+  if (opts.parallel > 1) {
+    for (let i = 0; i < filteredScenarios.length; i += opts.parallel) {
+      const batch = filteredScenarios.slice(i, i + opts.parallel);
+      await Promise.all(batch.map((s, j) => runOne(s, i + j, filteredScenarios.length)));
+      // Small gap between batches for Gemini rate limit
+      if (i + opts.parallel < filteredScenarios.length) await delay(1000);
+    }
+  } else {
+    // Sequential (default)
+    for (let i = 0; i < filteredScenarios.length; i++) {
+      await runOne(filteredScenarios[i], i, filteredScenarios.length);
+      if (i < filteredScenarios.length - 1) await delay(2000);
+    }
   }
 
   // Summary
