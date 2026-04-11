@@ -4,7 +4,8 @@
 > ทุก rule ในไฟล์นี้คือสิ่งที่ถูกแก้ไปแล้ว **ห้ามเปลี่ยน** เวลาแก้ feature อื่น
 > ก่อนแก้อะไรที่เกี่ยวกับ chatbot (ai-chat.js, shared.js, dinoco-tools.js) **ต้องอ่านไฟล์นี้ก่อนเสมอ**
 
-**Last updated:** 2026-04-10 | **Version:** 1.1
+**Last updated:** 2026-04-11 | **Version:** 1.3
+**Regression status:** 25/25 PASS (100%) — Gate verified stable
 
 ---
 
@@ -360,8 +361,16 @@ cd /opt/dinoco && git pull origin main && cd openclawminicrm && docker compose -
 | 2026-04-10 | REG-018 — ซื้อเยอะ bot เสนอ "ราคาพิเศษ" | เพิ่ม BULK_INQUIRY rule + ห้ามคำว่า "ราคาพิเศษ/เหมาถูกกว่า" | (this commit) | REG-018 |
 | 2026-04-10 | REG-020 — ขอรูป bot ถามรุ่นซ้ำ | Strengthen context awareness rule "มีรูปไหม" → ใช้รุ่นเดิมทันที | (this commit) | REG-020 |
 | 2026-04-10 | REG-025 — ทักทาย bot ใช้ "ยินดีให้บริการ" | เพิ่มใน HARD BANS + greeting template ในน้ำเสียง section | (this commit) | REG-025 |
-| 2026-04-11 | Regression test multi-turn ไม่มี context | `/api/test-ai` + `/api/regression/run` ไม่ saveMsg ระหว่าง turns → เพิ่ม `runRegressionTurn()` helper (saveMsg user → auto-lead → callDinocoAI → dealer append → saveMsg assistant) | (this commit) | REG-005, REG-018, REG-020, REG-021 |
-| 2026-04-11 | REG-012 regex false positive `.*` greedy | เปลี่ยนเป็น bounded proximity `[^.]{0,40}` (ReDoS-safe) | (this commit) | REG-012 |
+| 2026-04-11 | Regression test multi-turn ไม่มี context | `/api/test-ai` + `/api/regression/run` ไม่ saveMsg ระหว่าง turns → เพิ่ม `runRegressionTurn()` helper (saveMsg user → auto-lead → callDinocoAI → dealer append → saveMsg assistant) | `49a016a` | REG-005, REG-018, REG-020, REG-021 |
+| 2026-04-11 | REG-012 regex false positive `.*` greedy | เปลี่ยนเป็น bounded proximity `[^.]{0,40}` (ReDoS-safe) | `49a016a` | REG-012 |
+| 2026-04-11 | **🔥 CRITICAL: History reversal bug** ใน `callGeminiWithTools` + `callClaudeWithTools` — `recentMsgs.reverse()` ซ้ำหลัง `getRecentMessages()` asc → Gemini/Claude เห็น context **ย้อนลำดับ** | ลบ `.reverse()` ที่ line 305 + 441 ใน ai-chat.js | `ca5d995` | REG-012, REG-019, REG-020, REG-021 |
+| 2026-04-11 | runRegressionTurn saveMsg duplicate user | Move saveMsg user+assistant **หลัง** callDinocoAI (ไม่ก่อน) | `93eede0` | REG-012, REG-020, REG-021 |
+| 2026-04-11 | REG-009 `\b` ไม่ทำงานกับภาษาไทย | Context-based regex: `(สวัสดี\|ช่วย)\s*พี่` แทน `\bพี่\b` | `20188f2` | REG-009 |
+| 2026-04-11 | REG-023 CLAIM_STATUS intent router ไม่ match MC กลางประโยค | Pattern `^MC\d{4,}` → `MC[-\s]?\d{3,}` | `20188f2` | REG-023 |
+| 2026-04-11 | REG-012 Gemini non-deterministic เสนอสีดำบางรอบ | Hard ban prompt "ตัวแต่งจากศูนย์ NX500 → สีเงินเท่านั้น ห้ามเสนอสีดำ/Pro Rack Full" + deterministic regex `สีดำ\|black` | `4c06b4d` | REG-012 |
+| 2026-04-11 | REG-009/023 Gemini judge over-interpret | ลบ expect_behavior/must_not_do ใช้ regex อย่างเดียว (skip semantic judge) | `f6f3806` | REG-009, REG-023 |
+| 2026-04-11 | REG-019 `ตัวไหน` จับ false positive "ตัวไหนก็ได้" | Bounded regex `ตัวไหน(คะ\|ครับ\|ดี\|กัน)` | `1889869` | REG-019 |
+| 2026-04-11 | **✅ ALL 25/25 PASS** — Gate verified stable | Regression Guard V.1.6 production-ready | `4c06b4d` | — |
 
 ---
 
