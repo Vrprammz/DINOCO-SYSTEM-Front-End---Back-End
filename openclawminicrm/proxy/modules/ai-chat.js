@@ -300,9 +300,10 @@ async function callGeminiWithTools(systemPrompt, userMessage, tools, sourceId) {
   // Sanitize content: ensure string, mask PII, prevent Gemini SAFETY block
   const contents = [];
   try {
+    // getRecentMessages already returns asc order (oldest → newest) — don't reverse again!
     const recentMsgs = await getRecentMessages(sourceId, 12);
     let lastRole = "";
-    for (const m of recentMsgs.reverse()) {
+    for (const m of recentMsgs) {
       const role = m.role === "assistant" ? "model" : "user";
       // ★ V.6.2: Ensure content is valid string (ป้องกัน non-string content จาก DB)
       const raw = m.content;
@@ -435,9 +436,10 @@ async function callClaudeWithTools(systemPrompt, userMessage, tools, sourceId, m
   // Sanitize content: ensure string, mask PII, enforce user-first
   const messages = [];
   try {
+    // getRecentMessages already returns asc order (oldest → newest) — don't reverse again!
     const recentMsgs = await getRecentMessages(sourceId, 12);
     let lastRole = "";
-    for (const m of recentMsgs.reverse()) {
+    for (const m of recentMsgs) {
       const role = m.role === "assistant" ? "assistant" : "user";
       // ★ V.6.2: Ensure content is valid string (ป้องกัน non-string/null content จาก DB)
       const raw = m.content;
