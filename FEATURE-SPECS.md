@@ -2866,7 +2866,185 @@ Refactor จาก hardcoded 2 columns → dynamic 2-6 parts:
 - [x] Breadcrumb คลิกกลับไปที่ parent (V.42.12)
 - [x] `SET → [L, R]` flat 2 ชั้น → L/R = grandchild (V.42.13)
 - [x] Radio override → badge เปลี่ยน + ✋ indicator (V.42.14)
-- [x] Manual Edit suggestion ราคาต่อหลาน (V.42.15 Phase 2)
+- [x] Manual Edit suggestion ราคาต่อหลาน (V.42.15 Phase 2 — deprecated V.42.16)
+- [x] Sum Integrity Check (V.42.16): header card + contribution % + sub-SET check
+- [x] Margin Analysis god mode (V.42.17): WAC banner + profit lines
+
+---
+
+## 11.16 Margin Analysis V.42.17 (God Mode)
+
+**Status**: Deployed 2026-04-10 | **Files**: `[Admin System] DINOCO Global Inventory Database` V.42.17, `[B2B] Snippet 15: Custom Tables & JWT Session` V.7.2
+
+### 11.16.1 Problem & Goal
+
+**ปัญหา**: Admin ไม่รู้ว่าสินค้าแต่ละตัว + แต่ละ tier มี margin เท่าไหร่ → ตั้งราคาตาบอด + อาจขาดทุน Diamond tier ถ้า discount มากกว่า markup
+
+**เป้าหมาย**:
+
+1. Admin (god mode) เห็น WAC + profit per tier ใน Edit Product modal
+2. Cost data = ความลับทาง business — ต้อง protect ที่ backend (ไม่ rely on client-side class)
+3. SET ต้องคำนวณ cost จาก `sum(leaf_wac)` (ถูกหลัก DD-2 leaf-only)
+4. Live update เมื่อแก้ราคา/ส่วนลด
+
+### 11.16.2 Architecture
+
+**5 Security Layers** (ทุกชั้นเช็คที่ `GET /margin-analysis`):
+
+1. WP capability `manage_options` (`permission_callback`)
+2. JWT token ใน header `X-Dinoco-God` (HMAC via `DINOCO_JWT::verify()`)
+3. Scope check `payload.scope === 'god_cost'`
+4. User match `payload.uid === current_user_id()`
+5. Rate limit 30 req/min/user (transient)
+
+**PIN → JWT flow**:
+
+```text
+1. Admin กด version badge ค้าง 2.5s → prompt PIN
+2. checkPin(pin) — client gate (UI only — สำหรับเปิด body.god-mode class)
+3. POST /dinoco-stock/v1/god-mode/verify { pin }
+   → server verify DINOCO_GOD_MODE_PIN constant + rate limit 5 fail/5min
+   → issue JWT 30 min via DINOCO_JWT::create({ uid, scope: 'god_cost' })
+4. sessionStorage.setItem('dnc_god_token', jwt)
+5. sessionStorage.setItem('dnc_god_token_exp', Date.now() + ttl*1000)
+6. All margin-analysis calls ใช้ X-Dinoco-God: <token> header
+```
+
+**Brute-force protection**:
+
+- verify endpoint: 5 fail/5 นาที lockout per user
+- Counter **clear on success** (ไม่ให้ counter ค้างต่อเนื่อง)
+- TTL **preserved across fails** (ไม่ reset → ไม่ sliding window)
+- Check rate limit ก่อน `hash_equals` (ป้องกัน wasted cycles)
+
+### 11.16.3 Backend: `dinoco_get_wac_for_skus()` Helper
+
+สร้าง helper ใหม่ใน Snippet 15 V.7.2 แทน `dinoco_get_inventory_valuation()` ที่หนักเกิน:
+
+| Source | Method | Notes |
+|--------|--------|-------|
+| **WAC** (preferred) | Single SQL query `dinoco_stock_transactions WHERE type='b2f_receive'` | weighted avg `SUM(cost × qty) / SUM(qty)` |
+| **B2F maker_product** (fallback) | `get_posts()` + PHP post-filter case-insensitive | `mp_product_sku` ไม่ normalize uppercase → ต้อง filter PHP |
+| **none** | Return 0 + `source='none'` | admin เห็น "ยังไม่มีต้นทุน WAC" |
+
+**Cache**:
+
+- Per-SKU: `dnc_wac_{md5(sku)}` TTL 1 ชม
+- Maker exchange rate: `dnc_maker_rate_{maker_id}` TTL 10 นาที (shared)
+- **Auto-invalidate**: hook ใน `dinoco_stock_add()` — ถ้า `$type === 'b2f_receive'` → clear cache SKU นั้น (defense in depth — ไม่ rely on `do_action`)
+
+### 11.16.4 REST Endpoints
+
+**`POST /dinoco-stock/v1/god-mode/verify`**:
+
+Request: `{ "pin": "1234" }`
+
+Response (success): `{ "success": true, "token": "<jwt>", "ttl": 1800 }`
+
+Errors:
+
+- `401 bad_pin`: PIN ผิด
+- `429 rate_limited`: ผิดครบ 5 ครั้ง
+- `500 jwt_unavailable`: `DINOCO_JWT` class missing
+
+**`GET /dinoco-stock/v1/margin-analysis?sku=X`**:
+
+Headers: `X-WP-Nonce: <nonce>`, `X-Dinoco-God: <jwt>`
+
+Response:
+
+```json
+{
+  "success": true,
+  "data": {
+    "sku": "DNCSET123",
+    "is_set": true,
+    "retail": 3190,
+    "leaf_breakdown": [
+      { "sku": "LEAF_A", "wac": 900, "source": "wac" },
+      { "sku": "LEAF_B", "wac": 900, "source": "wac" }
+    ],
+    "total_cost": 1800,
+    "cost_source": "complete",
+    "is_incomplete": false,
+    "missing_wac_leaves": []
+  }
+}
+```
+
+**Note**: ไม่มี `tiers` field — frontend คำนวณ profit client-side จาก `total_cost + retail + slider values` (ไม่เรียก API ซ้ำเมื่อ slider เปลี่ยน)
+
+### 11.16.5 Frontend Implementation
+
+**`fetchMarginAnalysis(sku)`** — called ใน `openEditCatalogModal()` ถ้า god mode:
+
+1. Read JWT จาก sessionStorage
+2. GET `/margin-analysis?sku=X` with `X-Dinoco-God` header
+3. On success: `window._marginContext = data` + `renderMarginBanner(data)` + refresh all tier previews
+4. On 403: clear sessionStorage token, hide banner
+5. On 429: console warn
+
+**`updateTierPreview(tid)` extend** — client-side profit calc:
+
+```text
+dealer = retail × (1 - discPct/100)   [V.38.6 existing]
+profit = dealer - total_cost           [V.42.17 new]
+margin% = profit / dealer × 100        [V.42.17 new]
+
+color: profit > 0 → เขียว, profit < 0 → แดง, 0 → เทา
+```
+
+แสดงเป็น line ใต้ dealer price ในแต่ละ tier card (5 tiers รวม)
+
+**`renderMarginBanner(data)`** — dark gradient card ใน Tier Pricing section:
+
+- แสดง `ต้นทุนรวม: X฿` + source label ("รวมจาก N ชิ้นส่วนย่อย" หรือ "WAC")
+- ถ้า `is_incomplete` → warning "ขาดต้นทุน N ชิ้น: ..." (list 3 ชื่อแรก)
+- **XSS-safe**: SKU names ใช้ jQuery `$('<span>').text()` ไม่ใช่ `.html()`
+
+**Live update**:
+
+- `$(document).on('input', '#cat-price', ...)` — debounced 250ms
+- Re-render children list (V.42.15) + refresh all tier previews (profit lines update ทันที)
+
+### 11.16.6 Code Review Fixes Applied (5 HIGH + 2 MEDIUM)
+
+จาก `code-reviewer` agent — ตรวจก่อน commit:
+
+| # | Severity | Issue | Fix |
+|---|----------|-------|-----|
+| 1 | HIGH | Rate limit TTL reset sliding window | Check before `hash_equals` + preserve TTL + clear on success |
+| 2 | HIGH | B2F fallback miss เพราะ `mp_product_sku` ไม่ normalize | PHP post-filter case-insensitive (แทน `meta_query IN`) |
+| 3 | HIGH | `UPPER(sku)` prevent index use | ลบ `UPPER()` — txn table uppercase อยู่แล้ว |
+| 4 | HIGH | `b2f_receive_completed` hook ไม่ fire → cache stale 1 ชม | Invalidate ใน `dinoco_stock_add` type=b2f_receive (defense in depth) |
+| 5 | HIGH | Backend `tiers` field ไม่มี caller | Drop field — frontend client-side math only |
+| 6 | MEDIUM | `missing_wac_leaves` ใน innerHTML = XSS risk | jQuery `.text()` escape |
+| 8 | MEDIUM | `#cat-avg-cost` + banner ซ้ำ | Hide `#cat-avg-cost` เมื่อ god mode |
+
+### 11.16.7 Testing Checklist
+
+- [x] PIN verify issue JWT (server-side) + sessionStorage token
+- [x] PIN ผิด 5 ครั้ง → 429 lockout + TTL ไม่ reset
+- [x] PIN ถูก → counter clear
+- [x] Edit SET single leaf → banner แสดง "ต้นทุนรวม" + "WAC" label
+- [x] Edit SET 3 leaves → "รวมจาก 3 ชิ้นส่วนย่อย" label
+- [x] Edit SET ที่ leaf บางตัวไม่มี WAC → `is_incomplete` + `missing_wac_leaves` list
+- [x] แก้ `#cat-price` slider → profit line update ทันที (debounced 250ms)
+- [x] แก้ tier discount → profit line update ทันที
+- [x] Diamond discount สูงจนติดลบ → profit line แดง + `fa-triangle-exclamation`
+- [x] สินค้าใหม่ไม่มี receive → banner "ยังไม่มีต้นทุน WAC"
+- [x] DevTools remove `body.god-mode` class → ปุ่มหาย แต่ banner/data ยังอยู่ (backend enforce)
+- [x] Token expire 30 min → fetchMarginAnalysis 403 → clear sessionStorage + hide banner
+- [x] Audit log: `b2b_log('[Margin] uid=X accessed cost for sku=Y')` ทุก access
+- [x] `#cat-avg-cost` hidden เมื่อ god mode (banner replaces)
+
+### 11.16.8 Rollback Plan
+
+**Soft**: remove `body.god-mode` class ใน DevTools → banner ไม่โผล่ตอน open modal (non-god modal flow ปกติ)
+
+**Hard**: revert commit V.42.17 — Snippet 15 V.7.2 + Admin Inventory V.42.17 revert → ไม่มี backend helper + ไม่มี endpoint → frontend fetch 404 silent fail → banner hide
+
+**Data integrity**: V.42.17 ไม่แก้ database schema เลย — rollback safe 100%. Cache transient หายเองใน 1 ชม
 
 ---
 
