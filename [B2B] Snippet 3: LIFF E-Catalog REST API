@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
- * ║  Version: V.40.5 — Audit H7: rate limit AFTER ownership check + atomic option-based counter ║
+ * ║  Version: V.40.6 — Audit H8: cancel-request uses b2b_rate_limit() helper (transient-primary, default-WP safe) ║
  * ║  DB_ID: 52                                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
@@ -832,51 +832,27 @@ function b2b_rest_cancel_request( WP_REST_Request $request ) {
             return new WP_REST_Response(array('success' => false, 'message' => 'Missing ticket_id'), 400);
         }
 
-        // V.40.5 — Audit H7: ownership check BEFORE rate limiter.
-        // Why: previously the counter incremented for any session token → attacker with
-        //      their own valid session could burn legit owner's quota by spamming ticket_ids
-        //      they don't own. Check ownership first; only legitimate owners consume quota.
+        // V.40.6 — Audit H8: ownership check BEFORE rate limiter, then use canonical helper.
+        // Ownership-first prevents attackers from burning a victim's quota by spamming
+        // ticket_ids they don't own. The helper uses transient-primary so it works on
+        // default WP (no Redis/Memcache required) — unlike V.40.5 which relied on
+        // wp_cache_* that resets per-request on non-persistent backends.
         $group_id = $session['gid'];
         $ticket_gid = get_field('source_group_id', $ticket_id);
         if ( $ticket_gid !== $group_id ) {
             return new WP_REST_Response(array('success' => false, 'message' => 'ไม่มีสิทธิ์ยกเลิกออเดอร์นี้'), 403);
         }
 
-        // V.40.5 — Audit H7: atomic counter via wp_cache_add + fallback.
-        // wp_cache_add is atomic per cache backend; two concurrent requests can't both
-        // see count=0. Transient mirror ensures rate limit survives non-persistent cache.
-        $rl_key   = 'b2b_cancel_rl_' . md5( $group_id );
-        $rl_group = 'b2b_rl';
-        $window   = 60;
-        $limit    = 5;
-
-        $cache_val = wp_cache_get( $rl_key, $rl_group );
-        if ( $cache_val === false ) {
-            // Try atomic init
-            if ( ! wp_cache_add( $rl_key, 1, $rl_group, $window ) ) {
-                // Race lost → someone else initialized between get & add; re-read & incr
-                $cache_val = (int) wp_cache_get( $rl_key, $rl_group );
-                if ( $cache_val >= $limit ) {
-                    return new WP_REST_Response( array(
-                        'success' => false,
-                        'message' => 'ขอยกเลิกบ่อยเกินไป กรุณารอสักครู่ (สูงสุด ' . $limit . ' ครั้ง/นาที)',
-                    ), 429 );
-                }
-                wp_cache_incr( $rl_key, 1, $rl_group );
-            }
-        } else {
-            if ( (int) $cache_val >= $limit ) {
+        // V.40.6 — Canonical rate limit helper (see [B2B] Snippet 1: b2b_rate_limit)
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'cancel_' . $group_id, 5, 60 );
+            if ( is_wp_error( $rl ) ) {
                 return new WP_REST_Response( array(
                     'success' => false,
-                    'message' => 'ขอยกเลิกบ่อยเกินไป กรุณารอสักครู่ (สูงสุด ' . $limit . ' ครั้ง/นาที)',
+                    'message' => $rl->get_error_message(),
                 ), 429 );
             }
-            wp_cache_incr( $rl_key, 1, $rl_group );
         }
-        // Transient mirror — guards against non-persistent object cache
-        $final = (int) wp_cache_get( $rl_key, $rl_group );
-        if ( $final < 1 ) $final = 1;
-        set_transient( $rl_key, $final, $window );
 
         $status = get_field('order_status', $ticket_id);
         $cancellable = array('draft', 'pending', 'checking_stock', 'awaiting_confirm', 'awaiting_payment');
