@@ -2656,12 +2656,7 @@ async function runRegressionTurn(sourceId, message) {
   const db = await getDB();
   const platform = "line";
 
-  // 1. Save user message BEFORE callDinocoAI so history exists for next turn
-  await saveMsg(sourceId, {
-    role: "user", userName: "RegTest", content: message, messageType: "text",
-  }, platform).catch(() => {});
-
-  // 2. Auto-Lead pre-check — mirror aiReplyToLine V.6.6 phoneMatch block
+  // 1. Auto-Lead pre-check BEFORE saveMsg — check history for dealer cue from prev turn
   const phoneMatch = message.match(/(\d{9,10})/);
   if (phoneMatch && db) {
     try {
@@ -2681,6 +2676,10 @@ async function runRegressionTurn(sourceId, message) {
         const dealerName = dealerNameMatch
           ? (dealerNameMatch[1] || dealerNameMatch[2] || "").trim() : "";
         const confirmReply = `ขอบคุณค่ะคุณ${customerName} รับเรื่องแล้วนะคะ แอดมินจะประสานให้${dealerName ? `ร้าน ${dealerName} ` : "ตัวแทน"}ติดต่อกลับเร็วที่สุดค่ะ 😊`;
+        // Save both user + assistant messages AFTER handling (for next turn context)
+        await saveMsg(sourceId, {
+          role: "user", userName: "RegTest", content: message, messageType: "text",
+        }, platform).catch(() => {});
         await saveMsg(sourceId, {
           role: "assistant", userName: DEFAULT_BOT_NAME,
           content: confirmReply, messageType: "text", isAiReply: true,
@@ -2690,16 +2689,20 @@ async function runRegressionTurn(sourceId, message) {
     } catch (e) { /* fallback to AI */ }
   }
 
-  // 3. Normal AI reply — callDinocoAI reads history now that we saved user msg
+  // 2. Call AI — history contains prev turn only (user msg NOT saved yet, passed via userMessage)
   let reply = await callDinocoAI(DEFAULT_PROMPT, cleanForAI(message), sourceId);
   if (!reply) reply = "ขอเช็คข้อมูลกับทีมงานก่อนนะคะ รอสักครู่ค่ะ 🙏";
 
-  // 4. Dealer coordination append — mirror aiReplyToLine V.6.3
+  // 3. Dealer coordination append — mirror aiReplyToLine V.6.3
   if (DEALER_REPLY_REGEX.test(reply) && !reply.includes("แจ้งชื่อและเบอร์")) {
     reply += DEALER_COORDINATE_TEXT;
   }
 
-  // 5. Save assistant reply for next turn context
+  // 4. Save user + assistant AFTER AI call (for next turn context)
+  //    Save sequentially to ensure DB write order before next turn's getRecentMessages
+  await saveMsg(sourceId, {
+    role: "user", userName: "RegTest", content: message, messageType: "text",
+  }, platform).catch(() => {});
   await saveMsg(sourceId, {
     role: "assistant", userName: DEFAULT_BOT_NAME,
     content: reply, messageType: "text", isAiReply: true,

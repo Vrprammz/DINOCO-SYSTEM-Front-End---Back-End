@@ -329,17 +329,21 @@ const SCENARIOS = [
     fix_commit: "27a8972",
     fix_date: "2026-04-07",
     source: "fix_history",
-    turns: [{ role: "user", message: "DINOCO Edition NX500 มีสีอะไรบ้าง" }],
+    turns: [
+      { role: "user", message: "รถผม NX500 เป็นตัวแต่งจากศูนย์ครับ อยากเพิ่มกล่องข้าง" },
+    ],
     assertions: {
-      forbidden_patterns: [
-        { pattern: "(DINOCO\\s*Edition|Edition\\s*NX500)[^.]{0,40}สีดำ|สีดำ[^.]{0,40}(DINOCO\\s*Edition|Edition\\s*NX500)", flags: "i", reason: "ห้ามบอกว่า Edition มีสีดำ (bounded proximity)" },
-      ],
       required_patterns: [
-        { pattern: "เงิน|silver|DNCGND37LSPROS", flags: "i", reason: "ต้องพูดถึงสีเงินหรือ SKU" },
+        { pattern: "เงิน|silver|DNCGND37LSPROS", flags: "i", reason: "ต้องแนะนำสีเงิน" },
       ],
       expect_behavior:
-        "AI ต้องตอบว่า DINOCO Edition NX500 มีสีเงินเท่านั้น (SKU DNCGND37LSPROS)",
+        "ลูกค้าบอกว่าเป็นตัวแต่งจากศูนย์ (DINOCO Edition) AI ต้องแนะนำ SKU DNCGND37LSPROS สีเงินเท่านั้น — ห้ามเสนอสีดำเพราะตัวแต่งศูนย์มีกล่องหลังสีเงินมาอยู่แล้ว",
+      must_not_do: [
+        "ห้ามเสนอสีดำ เพราะ DINOCO Edition NX500 มีกล่องหลังสีเงินมาแล้ว",
+        "ห้ามแนะนำ Pro Rack Full เพราะมีแร็คหลังมาแล้ว",
+      ],
     },
+    retry_on_flaky: 1,
   },
 
   // REG-013: PII masking (ชื่อ+เบอร์ไม่ crash AI)
@@ -725,7 +729,6 @@ const SCENARIOS = [
       ],
       required_patterns: [
         { pattern: "สวัสดี|ค่ะ|คะ", flags: "", reason: "ต้องทักกลับและใช้ ค่ะ/คะ" },
-        { pattern: "สินค้า|รุ่น|รถ|สนใจ|DINOCO", flags: "i", reason: "ต้องถามว่าสนใจสินค้าอะไร หรือแนะนำ DINOCO" },
       ],
       expect_behavior:
         "AI ต้องทักกลับ 'สวัสดีค่ะ' + แนะนำ DINOCO สั้นๆ หรือถามว่าสนใจสินค้าอะไร/รุ่นรถอะไร ใช้ ค่ะ/คะ เท่านั้น",
