@@ -18,8 +18,8 @@
 |---|---|---|---|---|
 | 1 | ✅ **Resolved** | **H9** | Flash auto-update bypasses `b2b_set_order_status()` — `packed→shipped→completed` never fires `b2b_order_status_changed` hook | `[B2B] Snippet 5: Admin Dashboard:142,146` → **fixed in `b1b8a30` (V.32.3)** |
 | 2 | ✅ **Resolved** | **H10** | `verify-member` endpoint has no rate limit — LINE Group enumeration + LINE API quota burn attack | `[B2B] Snippet 1:981-1042` → **fixed in `b1b8a30` (V.33.2)** |
-| 3 | 🟡 **Medium** | **M13** | Rate-limit pattern drift still present — 3 raw-transient callsites (Brand Voice, Inventory god-mode, B2B Snippet 15) haven't been migrated to `b2b_rate_limit()` helper | `[Admin System] DINOCO Brand Voice Pool:361`, `[Admin System] DINOCO Global Inventory Database:1210`, `[B2B] Snippet 15:1728` |
-| 4 | 🟡 **Medium** | **M14** | 9 `wp_remote_*` calls have no explicit `timeout` → default 5s but some (LINE Callback, MCP Bridge, Transfer page) sit in synchronous user flows and can hang the request up to PHP `max_execution_time` | `[System] LINE Callback:336`, `[System] DINOCO MCP Bridge:634,777`, `[LIFF AI] Snippet 1:456,462` |
+| 3 | ✅ **Resolved** | **M13** | Rate-limit pattern drift — 2 real holdouts migrated to `b2b_rate_limit()`; 1 site (god-mode PIN failure counter) documented as intentional exception; 1 audit false positive (`dnc_maker_rate_` is a data cache, not a rate limiter) | Brand Voice Pool V.2.9 + Inventory V.42.20 → **fixed in `403d6d4`** |
+| 4 | ✅ **Resolved** | **M14** | `wp_remote_*` timeout drift — re-scan with smart variable-tracing showed 54 total HTTP callers, 53 already OK, 1 real gap | `[System] LINE Callback:336` V.30.8 → **fixed in `c1fcd46`** |
 | 5 | 🟡 **Medium** | **M15** | Flex Card builder proliferation — **128 Flex builder functions**, 62 in `[B2B] Snippet 1` alone. No canonical base helper → altText defaults, color palette, header/footer style all duplicated | `[B2B] Snippet 1:281-2500` (spans ~2200 lines of builders) |
 | 6 | 🟡 **Medium** | **M16** | Direct `update_field('order_status'/'po_status'/'ticket_status', ...)` in 17 genuine FSM-bypass sites (after filtering initial draft + fallback branches) | `[Admin System] DINOCO Service Center & Claims:101,610`, `[B2F] Snippet 2:1153,1489,1591,1665,3362,3721,3885,3993`, `[B2B] Snippet 3:718,720`, `[System] Member Dashboard Main:288,307`, `[B2B] Snippet 5:142,146` |
 | 7 | 🟡 **Medium** | **M17** | Postback dispatch is **not** a table — 67 postback buttons defined in Flex cards but handlers live in ad-hoc `if/elseif` chains in webhook gateway (2 dispatch sites). Adding a new button requires editing 2 files | `[B2B] Snippet 2: LINE Webhook Gateway`, `[B2F] Snippet 3: Webhook Handler` |
@@ -1048,13 +1048,13 @@ For every closed finding in v1 (26 items) + v2 (11 items) + v3 (3 items) = 40 it
 
 ### P2 — This sprint
 
-| Code | Title | Effort |
-|---|---|---:|
-| M13 | Migrate 3 raw-transient rate-limit holdouts to `b2b_rate_limit()` | 2h |
-| M14 | Add explicit timeout to 9 `wp_remote_*` calls in sync flows | 1h |
-| M16 | Migrate 17 FSM-bypass `update_field` sites to FSM helpers | 5h |
-| M17 | Canonicalize postback dispatch into a table | 4h |
-| M18 | Extract `dinoco_set_claim_status($id, $new, $actor)` helper | 2h |
+| Code | Title | Effort | Status |
+|---|---|---:|---|
+| ~~M13~~ | Migrate rate-limit holdouts to `b2b_rate_limit()` | ~~2h~~ → 0 | ✅ **closed in `403d6d4` (Sprint 1 / 2026-04-12)** |
+| ~~M14~~ | Add explicit timeout to untimed `wp_remote_*` calls | ~~1h~~ → 0 | ✅ **closed in `c1fcd46` (Sprint 1 / 2026-04-12)** |
+| M16 | Migrate 17 FSM-bypass `update_field` sites to FSM helpers | 5h | pending |
+| M17 | Canonicalize postback dispatch into a table | 4h | pending |
+| M18 | Extract `dinoco_set_claim_status($id, $new, $actor)` helper | 2h | pending |
 
 ### P3 — This quarter / architectural
 
@@ -1248,12 +1248,50 @@ Then replace `current_user_can('manage_options')` with granular caps per endpoin
 | v2 (11 items: C4 v2, I1 v2, H3–H7, M8–M11) | 11 | 11 | 0 |
 | v3 (3 items: H8, M12, L1) | 3 | 3 | 0 |
 | v1-review P1 (H9, H10) | 2 | 2 | 0 |
-| **Total** | **42** | **42** | **0** |
+| v1-review P2 Sprint 1-A (M13, M14) | 2 | 2 | 0 |
+| **Total** | **44** | **44** | **0** |
 
 ### Remaining non-blocking work (v1-review P2 + P3)
 
-- **P2** (5 items, ~16h): M13 (rate-limit holdouts), M14 (wp_remote timeouts), M16 (17 FSM bypasses), M17 (postback dispatch), M18 (claim FSM helper)
+- **P2** (3 items, ~11h): M16 (17 FSM bypasses), M17 (postback dispatch), M18 (claim FSM helper)
 - **P3** (10+ items, ~40h): M15 (Flex consolidation), M19 (debt recon UI), L2–L8 (misc low), second-brain doc updates
+
+### M13 + M14 resolution details — Sprint 1-A (2026-04-12)
+
+**M13 — rate-limit canonicalization** (commit `403d6d4`)
+
+The Full Loop Review v1 audit flagged 3 raw-transient rate-limit callsites based on a regex scan. A re-scan with tighter semantics revealed reality was slightly different:
+
+| Site | Status |
+|---|---|
+| `[Admin System] DINOCO Brand Voice Pool:361` (V.2.9) | ✅ **migrated** to `b2b_rate_limit('bv_api_' . $short_hash, 60, 120)`. Sliding window is strictly tighter than the previous fixed `YmdHi` bucket. |
+| `[Admin System] DINOCO Global Inventory Database:1210` (V.42.20) | ✅ **migrated** to `b2b_rate_limit('margin_analysis_' . $uid, 30, MINUTE_IN_SECONDS)`. Error shape preserved. |
+| `[B2B] Snippet 15: Custom Tables & JWT Session:1728` | ⚠️ **audit false positive** — the `dnc_maker_rate_` transient is a B2F currency-rate data cache, not a rate limiter. The `_rate_` substring triggered the regex. No migration needed. |
+| `[Admin System] DINOCO Global Inventory Database:1146` (god-mode PIN) | ⚠️ **intentional exception** — this is a fail-counter not a request-counter with three security-critical semantics that differ from the generic helper: (1) increments only on wrong PIN, (2) preserves sliding TTL across fails, (3) fully resets on successful PIN. Migrating would weaken the PIN lockout. Documented with a comment block at lines 1144–1160 explaining the rationale. |
+
+Smoke test `/tmp/dinoco-lint/test-m13.php` — **4/4 PASS**:
+- Brand Voice: 60 req pass, 61st blocked, per-API-key isolation verified.
+- Margin analysis: 30 req pass, 31st blocked, per-user isolation verified.
+
+**M14 — wp_remote_* timeout canonicalization** (commit `c1fcd46`)
+
+Full Loop Review v1 Phase 1.7 flagged 9 untimed `wp_remote_*` calls out of "145" total. A re-scan with a smarter scanner (that traces variable-based `$args` / `$req_args` up to 50 lines above each call) found reality was very different:
+
+| Metric | Audit estimate | Actual |
+|---|---:|---:|
+| Total `wp_remote_*` HTTP callers | 145 | **54** |
+| Missing explicit timeout | 9 | **1** |
+
+The "145" count in Phase 1.7 included `wp_remote_retrieve_body/header/response_code` (response parsers, not HTTP callers). The "9 missing" count flagged 8 false positives where the args variable was defined above with an explicit timeout that the naive regex couldn't see.
+
+| Site | Status |
+|---|---|
+| `[B2B] Snippet 1: Core Utilities:3698, 3705` (Flash API) | ✅ already `'timeout' => 30` in `$req_args` above. False positive. |
+| `[LIFF AI] Snippet 1: REST API:456, 462` (agent proxy) | ✅ already `'timeout' => 10` in `$args` above. False positive. |
+| `[System] Transfer Warranty Page:265` | ✅ already `'timeout' => 10` in `$args` above. False positive. |
+| `[System] LINE Callback:336` (V.30.8) | ✅ **fixed** — added `'timeout' => 10` inline. Sits in synchronous OAuth redirect where a stall is user-visible. |
+
+Verification: Python scan shows **54/54 HTTP callers now have explicit timeout**, 0 untimed remaining.
 
 ---
 
