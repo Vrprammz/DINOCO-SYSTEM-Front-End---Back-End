@@ -22,7 +22,7 @@
 | 4 | ✅ **Resolved** | **M14** | `wp_remote_*` timeout drift — re-scan with smart variable-tracing showed 54 total HTTP callers, 53 already OK, 1 real gap | `[System] LINE Callback:336` V.30.8 → **fixed in `c1fcd46`** |
 | 5 | 🟡 **Medium** | **M15** | Flex Card builder proliferation — **128 Flex builder functions**, 62 in `[B2B] Snippet 1` alone. No canonical base helper → altText defaults, color palette, header/footer style all duplicated | `[B2B] Snippet 1:281-2500` (spans ~2200 lines of builders) |
 | 6 | ✅ **Resolved** | **M16** | FSM-bypass sites — Sprint 2 Phase 0 reality check found audit over-counted 8×. Only 2 B2B walk-in edit sites were genuine primary-path bypasses; all B2F sites are legitimate `function_exists` fallback patterns; claim sites overlapped with M18 and are resolved there | `[B2B] Snippet 3:718,720` V.40.7 → **fixed in `4fc4c16`**. Claim sites resolved via M18. B2F re-audited: 0 real bypasses. |
-| 7 | 🟡 **Medium** | **M17** | Postback dispatch is **not** a table — 67 postback buttons defined in Flex cards but handlers live in ad-hoc `if/elseif` chains in webhook gateway (2 dispatch sites). Adding a new button requires editing 2 files | `[B2B] Snippet 2: LINE Webhook Gateway`, `[B2F] Snippet 3: Webhook Handler` |
+| 7 | ✅ **Resolved** | **M17** | Postback dispatch — Sprint 3 Phase 0 found audit was wrong on premise (switch statements, not if/elseif; 27 unique actions, not 67; 3 dispatchers, not 2; fragmentation 1.04). Adopted Option B+: observability wrapper + uniform dedup, skipped the full $GLOBALS registry refactor. See ADR. | `[B2B] Snippet 2:454` V.34.3 → **fixed in `724d0a5`**, ADR in `docs/ADR-M17-postback-dispatch.md` (`e135eb3`) |
 | 8 | 🔵 **Low** | **L2** | 5 JS `innerHTML=` sites use string concatenation with server-returned fields without an escape helper (`esc()` missing) — low XSS risk since admin-only pages, but inconsistent with the `.innerHTML = esc(...)` pattern used everywhere else | `[Admin System] KB Trainer Bot v2.0:432`, `[B2B] Snippet 12:1965`, `[B2B] Snippet 9:1577,2040`, `[LIFF AI] Snippet 2:1732` |
 | 9 | 🔵 **Low** | **L3** | Capability model is binary — 76/78 `current_user_can()` checks use `manage_options`. No separate roles for finance / inventory / B2F admin → granting dashboard access requires full admin | global |
 | 10 | 🔵 **Low** | **L4** | ~733 inline `onclick="..."` handlers in PHP-emitted HTML → CSP incompatibility, tight HTML-JS coupling, and impossible to unit-test event wiring | global (admin dashboards + LIFF pages) |
@@ -1053,7 +1053,7 @@ For every closed finding in v1 (26 items) + v2 (11 items) + v3 (3 items) = 40 it
 | ~~M13~~ | Migrate rate-limit holdouts to `b2b_rate_limit()` | ~~2h~~ → 0 | ✅ **closed in `403d6d4` (Sprint 1 / 2026-04-12)** |
 | ~~M14~~ | Add explicit timeout to untimed `wp_remote_*` calls | ~~1h~~ → 0 | ✅ **closed in `c1fcd46` (Sprint 1 / 2026-04-12)** |
 | ~~M16~~ | Migrate FSM-bypass sites (audit said 17, reality was 2) | ~~5h~~ → 0 | ✅ **closed in `4fc4c16` (Sprint 2 / 2026-04-12)** |
-| M17 | Canonicalize postback dispatch into a table | 4h | pending |
+| ~~M17~~ | Postback dispatch — observability wrapper (Option B+, scope narrowed after Phase 0) | ~~4h~~ → 0 | ✅ **closed in `e135eb3` + `724d0a5` (Sprint 3 / 2026-04-12)** |
 | ~~M18~~ | Extract `dinoco_set_claim_status()` helper + migrate 8 sites | ~~2h~~ → 0 | ✅ **closed in `d1a5054` + `c48aaa7` (Sprint 2 / 2026-04-12)** |
 
 ### P3 — This quarter / architectural
@@ -1250,13 +1250,132 @@ Then replace `current_user_can('manage_options')` with granular caps per endpoin
 | v1-review P1 (H9, H10) | 2 | 2 | 0 |
 | v1-review P2 Sprint 1-A (M13, M14) | 2 | 2 | 0 |
 | v1-review P2 Sprint 2 (M16, M18) | 2 | 2 | 0 |
-| v1-review P2 Sprint 2 (**NEW** M20) | 1 | 0 | 1 |
-| **Total** | **47** | **46** | **1** |
+| v1-review P2 Sprint 2 (NEW M20) | 1 | 0 | 1 |
+| v1-review P2 Sprint 3 (M17) | 1 | 1 | 0 |
+| v1-review P3 Sprint 3 (**NEW** L9) | 1 | 0 | 1 |
+| **Total** | **49** | **47** | **2** |
 
 ### Remaining non-blocking work (v1-review P2 + P3)
 
-- **P2** (1 item, ~4h): M17 (postback dispatch canonicalization)
-- **P3** (11+ items, ~48h): M15 (Flex consolidation), M19 (debt recon UI), **M20 (claim state canonicalization — NEW, observability-dependent, ~8h)**, L2–L8 (misc low), second-brain doc updates
+- **P2** (0 items) — all closed as of Sprint 3
+- **P3** (13+ items, ~48h): M15 (Flex consolidation), M19 (debt recon UI), **M20 (claim state canonicalization — NEW, observability-dependent, ~8h)**, **L9 (postback dead-handler cleanup — NEW, observability-dependent, ~2h)**, L2–L8 (misc low), second-brain doc updates
+
+### M17 resolution details — Sprint 3 (2026-04-12)
+
+**M17 — Postback dispatch consolidation** (commits `e135eb3` ADR, `724d0a5` wrapper)
+
+Sprint 3 Phase 0 reality check exposed audit over-count on **two** axes:
+
+| Audit claim | Reality |
+|---|---|
+| 67 postback buttons | 66 emitter sites → **27 unique action strings** |
+| 2 ad-hoc `if/elseif` dispatchers | **3 dispatchers**, all using clean `switch` statements + `parse_str()` + namespace-prefix routing (B2B at `[B2B] Snippet 2:454`, B2F admin at `[B2F] Snippet 3:471`, B2F maker at `[B2F] Snippet 3:269`) |
+| Format drift (query-string / colon / bare) | **96% uniform query-string** format (`action=xxx&ticket_id=X`) — 1 outlier (`lead_accepted:{id}` in LIFF AI) |
+| Fragmentation unknown | **Ratio 1.04** (≤1.5 threshold = clean — opposite of M18/M20's 2.5 chaos) |
+
+Phase 0 also surfaced two secondary findings:
+
+1. **`confirm_received` vs `delivery_ok` semantic duplicate** — same Thai label `"✅ ได้รับสินค้าแล้ว"`. Handler inspection showed these are NOT removable: `confirm_received` (V.38) is a multi-box-aware superset of legacy `delivery_ok`. Both live, both needed until legacy Flex cards retire. Not fixing in this sprint.
+
+2. **B2F reschedule double-registration** — `b2f_approve_reschedule` / `b2f_reject_reschedule` appeared in both `b2f_handle_maker_postback()` (line 391) AND `b2f_handle_admin_postback()` (lines 475, 508). Flagged as possible shadow bug; 15-min verification found it's an **explicit defensive no-op**: the maker-group case is just `break;` with comment `// Admin actions — handled ใน admin group (ไม่ใช่ maker group)`. Correct behavior — if a reschedule postback accidentally reaches the maker group, it's gracefully ignored rather than double-processed. **NOT a bug, no fix commit needed.**
+
+**Option decision** (documented in `docs/ADR-M17-postback-dispatch.md`):
+
+Rejected the original wiki design (`topics/postback-dispatch-pattern.md` Option A — full `$GLOBALS['B2B_POSTBACK_HANDLERS']` registry refactor) because:
+- The existing `switch` is already canonical (`if/elseif` was a myth)
+- Extracting 45 cases into closures risks well-tested production code for zero correctness benefit
+- Fragmentation is 1.04 — no canonicalization crisis like M18 had
+- Sprint budget ~2h cannot absorb the realistic ~6h of full refactor + exhaustive smoke testing
+
+Adopted **Option B+** — a ~60 LOC wrapper around the existing switch that adds:
+
+1. **Observability** via `wp_option 'dinoco_postback_observations'`
+   - Schema: `action_name => count`
+   - Cap 500 entries, trim to top-400 by frequency on overflow
+   - Recorded **BEFORE** dispatch (Sprint 2 M18 lesson) so unknown/dead actions are captured for future cleanup decisions
+   - `autoload=false` so it doesn't bloat every WP request
+
+2. **Uniform 3-second dedup** via transient key `b2b_pb_dedup_` + md5(group_id + postback_data)
+   - Replaces per-handler advisory locks that had drifted across the codebase (`b2b_lock_$tid`, `b2b_lock_recv_$tid`, `b2b_lock_delivery_$tid` with varying 10–30s durations)
+   - Per-group isolation (same action in 2 different groups both fire)
+   - Handler-level locks stay as belt-and-suspenders
+
+**Handler logic is NOT modified.** `b2b_handle_postback()` is byte-for-byte unchanged.
+
+**Webhook callsite update** (1 line): `[B2B] Snippet 2:187-192` event loop now calls `b2b_dispatch_postback()` instead of `b2b_handle_postback()` directly.
+
+**Smoke test** `/tmp/dinoco-lint/test-m17-dispatch.php` — **9/9 PASS**:
+
+1. Happy path: `action=confirm_order` → handler fires once, obs incremented ✓
+2. Observability BEFORE dispatch: unknown `action=from_martians` → obs still captures it ✓
+3. Dedup within 3s: 2nd call suppressed, obs counts both attempts (1 dedup log entry) ✓
+4. Per-group isolation: same action in 2 different groups → both fire ✓
+5. Dedup TTL expiry: 2nd call after 3s → fires normally ✓
+6. Observation cap: 600 unique actions injected → obs size 499 (≤500, trim works) ✓
+7. Empty data: `''` → `__empty__` bucket ✓
+8. Colon-format outlier: `lead_accepted:42` → verb `lead_accepted` parsed ✓
+9. Accumulation across 5 groups → `obs[delivery_ok] = 5`, handler called 5x ✓
+
+Lint: `php -l` clean on `[B2B] Snippet 2` via temp `<?php` wrapper.
+
+**Data collection active**: every postback from this point forward feeds `dinoco_postback_observations`. After 2–4 weeks of production traffic, analysts can query the option to:
+- Confirm which of the 9 potentially-dead handlers (see L9 below) are truly unused
+- Identify any previously-unknown action strings (chatbot vocabulary drift from OpenClaw)
+- Revisit Option A refactor with data — if traffic is concentrated on a small subset of cases, the registry extraction becomes worthwhile
+
+## 🆕 L9 — Postback dead-handler cleanup (NEW 2026-04-12, observability-dependent)
+
+**Severity**: 🔵 Low
+**Status**: **Open** — observability data collection in progress
+**Effort**: ~2h (analysis after 2–4 weeks of data + removal + smoke test)
+**Priority**: P3 (blocks on data, not code)
+**Discovered by**: Sprint 3 Phase 0 reality check
+
+### Problem
+
+`b2b_handle_postback()` has **39 switch cases**, but Phase 0's Flex-emitter scan found only **26 matching action strings** in Flex bubble `'data' =>` definitions. After tracing references, **9 handler cases have no Flex emitter** found in the codebase:
+
+```
+bo_cancel_all, bo_extend, bo_wait_full, cancel_draft,
+change_request, change_shipping, delivery_no, pack_done, stock_partial
+```
+
+### Hypotheses (to verify with observability data)
+
+1. **Truly dead code** — handler exists from an old flow that was replaced. Safe to delete.
+2. **Emitted via LINE Quick Reply items** — not in Flex bubble `data` field, emitted via `quickReply.items[].action.data`. Scanner missed these.
+3. **Emitted via Rich Menu tap actions** — configured at LINE account level, not in code.
+4. **Emitted via older Button Template format** — pre-Flex message type that some admin flows still use.
+5. **Dynamically constructed** — action string built at runtime, not a regex-findable literal.
+
+### Data-enabled resolution
+
+After 2–4 weeks of `dinoco_postback_observations` collection, query the option:
+
+```php
+$obs = get_option( 'dinoco_postback_observations', [] );
+$suspected_dead = [ 'bo_cancel_all', 'bo_extend', 'bo_wait_full', 'cancel_draft',
+                    'change_request', 'change_shipping', 'delivery_no',
+                    'pack_done', 'stock_partial' ];
+foreach ( $suspected_dead as $a ) {
+    echo "$a: " . ( $obs[$a] ?? 'ZERO HITS (safe to remove)' ) . "\n";
+}
+```
+
+- **Zero hits over 2+ weeks** → high confidence dead, safe to delete the switch case.
+- **Non-zero hits** → emitted via an unscanned path; find it + update the wiki + keep the handler.
+
+### Why not resolve now
+
+Can't safely delete handlers without confidence that no emitter path exists. Removing a case that's actually hit from a Rich Menu would break production silently (user taps menu → dispatcher hits `default` → logs `Unknown postback action` → user gets nothing). Needs data.
+
+### Related
+
+- Sprint 3 M17 resolution (`724d0a5`) — provides the observability foundation
+- Full Loop Review v1 Phase 2.32 (M17 context)
+- ADR-M17-postback-dispatch.md — decision to defer dead-code cleanup
+
+---
 
 ### M16 + M18 resolution details — Sprint 2 (2026-04-12)
 
