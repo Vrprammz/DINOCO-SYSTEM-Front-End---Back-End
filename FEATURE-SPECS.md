@@ -2666,3 +2666,158 @@ Caller ทุกตัวต้องเรียก `dinoco_get_leaf_skus()` ex
 ### 🔜 Phase 2 (รอ commit ถัดไป)
 
 Manual Edit Product modal — แสดง **suggestion ราคาต่อหลาน** จากลูก (คำนวณตาม mode) ให้ admin เห็นแล้วกรอกเอง (ไม่ auto-apply)
+
+---
+
+# 13. Regression Guard System V.1.5 (OpenClaw)
+
+**Status**: Deployed 2026-04-11 | **Files**: `openclawminicrm/scripts/regression.js`, `seed-regression.js`, `proxy/index.js` (`runRegressionTurn`), `smltrackdashboard/src/app/train/components/RegressionTab.tsx` | **Spec**: `openclawminicrm/docs/regression-guard.md` | **Canonical Brain**: `openclawminicrm/docs/chatbot-rules.md`
+
+## 13.1 Problem & Goal
+
+**ปัญหา**: บอสแก้ bug chatbot ซ้ำๆ หลายรอบเพราะเวลาแก้ feature ใหม่ → rule เก่าหลุด → bug เดิมกลับมา เสียเวลา 8-16 ชม./เดือน
+
+**เป้าหมาย**:
+- Regression bug rate = 0% สำหรับ bugs ใน Fix History
+- Block deploy ถ้า critical scenarios fail
+- Scale ได้ — เจอ bug ใหม่ → เพิ่ม test (TDD for chatbots)
+
+## 13.2 Architecture — 3 Layer Defense
+
+```
+Layer 1: Core Prompt (shared.js)      — rules ที่ไม่เปลี่ยน
+Layer 2: Knowledge Base (MongoDB)     — dynamic rules, admin แก้ผ่าน Dashboard
+Layer 3: Regression Guard (new) ★     — hardcoded scenarios, block deploy ถ้า fail
+```
+
+## 13.3 Scenarios (25 active, REG-001..REG-025)
+
+| Category | Count | Examples |
+|----------|-------|----------|
+| product_knowledge | 8 | H2C ban, วัสดุ (กันล้ม=สแตนเลส, กล่อง=อลู), DINOCO Edition NX500 silver, X Travel Pro เลิกขาย, ADV160 ไม่มี, Side Rack ≠ มือจับ, ADV350 ไม่มีกล่องข้าง, ประกัน 5 ปี |
+| tone | 2 | ห้าม "ดิฉัน/พี่/น้อง", ห้าม "ยินดีให้บริการ" |
+| flow | 5 | Dealer coordination append, auto-lead, ราคาซ้ำเมื่อถามร้าน, "ตัวนี้" context, ขอรูปหลังคุยสินค้า |
+| intent | 3 | BULK → ตัวแทน, "สอบถามสินค้า" ≠ claim, ADV catch-all |
+| anti_hallucination | 4 | Claude review leak, AI reveal, PII masking, prompt injection |
+| tool_calling | 3 | create_claim, claim_status, ไม่ hallucinate tool call |
+
+## 13.4 Validation Layers (3-Layer)
+
+1. **Regex patterns** (0 token, 0ms) — `forbidden_patterns` + `required_patterns`
+   - Safe regex enforced by `safe-regex2` (ReDoS protection)
+   - Pattern length max 200 chars
+2. **Tool call check** — `expected_tools` + `forbidden_tools`
+   - Reads `aiChat._lastToolResults` (Array per sourceId)
+3. **Gemini semantic judge** (only if hard rules pass) — `expect_behavior` + `must_not_do`
+   - JSON-wrapped envelope (SEC-C3 prompt injection protection)
+   - Fail-closed on error (verdict "ERROR" = FAIL, not PASS)
+   - Model: Gemini 2.0 Flash (free tier)
+
+## 13.5 runRegressionTurn() Helper — V.1.5 Key Fix
+
+**Problem (before V.1.5)**: `/api/test-ai` + `/api/regression/run` เรียก `callDinocoAI` ตรง ไม่ save messages ระหว่าง turns → multi-turn test ไม่มี history → Gemini turn 2 ไม่มี context → ตอบมั่ว
+
+**Fix**: `runRegressionTurn(sourceId, message)` mirror `aiReplyToLine` core flow:
+1. `saveMsg` user message (context for next turn)
+2. Auto-lead pre-check (phone match + bot dealer cue → skip AI, return canned reply)
+3. `callDinocoAI(DEFAULT_PROMPT, cleanForAI(message), sourceId)` — reads history
+4. Dealer coordination append regex
+5. `saveMsg` assistant reply
+
+ทั้ง `/api/test-ai` + `/api/regression/run` loop ใช้ helper ใหม่ — cleanup messages หลัง run (`deleteMany({ sourceId })`).
+
+## 13.6 Test Mode Guard — Side Effect Mocking
+
+**File**: `dinoco-tools.js` V.5.1 — ก่อนทำ side effect ใน tools ที่เขียน DB จริง:
+
+```js
+const SIDE_EFFECT_TOOLS = new Set([
+  "dinoco_create_lead",
+  "dinoco_create_claim",
+  "dinoco_claim_status",
+]);
+if (SIDE_EFFECT_TOOLS.has(toolName) && sourceId?.startsWith("reg_")) {
+  return { success: true, mock: true, tool_called: toolName, params: args };
+}
+```
+
++ `notifyDealerDirect()` ใน `lead-pipeline.js` เช็ค `isRegressionMode(sourceId)` ก่อนส่ง LINE Flex จริง (ป้องกัน REG-005 ทำให้ dealer LINE group โดน spam ขณะ test)
+
+## 13.7 Deploy Gates — Multi-Layer
+
+**3 gates, fail fast near dev**:
+
+1. **Pre-push hook** (`scripts/git-hooks/pre-push` V.2.0) — block local push ถ้า chatbot files เปลี่ยน + critical fail
+   - Skip ถ้าไฟล์ chatbot ไม่เปลี่ยน (efficient)
+   - Fail-closed ถ้า agent container ไม่รัน (override: `REGRESSION_REQUIRE_AGENT=0`)
+   - Emergency: `git push --no-verify`
+
+2. **GitHub Actions** (`.github/workflows/regression-guard.yml`) — CI gate (critical + high) + Telegram alert on fail
+
+3. **Deploy script** (`scripts/deploy.sh` Step 0) — block production deploy
+   - Override: `SKIP_REGRESSION=1 ./scripts/deploy.sh`
+
+## 13.8 REST API (`/api/regression/*`)
+
+10 endpoints ใน `proxy/index.js` (requireAuth + aiLimiter):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/scenarios` | List + filter (category, severity, search) |
+| GET | `/scenarios/:bug_id` | Detail |
+| POST | `/scenarios` | Create (validateScenarioInput + safe-regex2) |
+| PATCH | `/scenarios/:bug_id` | Update (allowed fields only) |
+| DELETE | `/scenarios/:bug_id` | Soft delete |
+| POST | `/run` | Trigger regression run (in-memory lock) |
+| GET | `/runs` | History (paginated) |
+| GET | `/runs/:runId` | Run detail + all turn results |
+| GET | `/stats` | Dashboard cards (total, critical, pass_rate_7d) |
+| POST | `/auto-mine` | Gemini scan training_logs → draft scenarios (manual approve) |
+
+## 13.9 Dashboard UI — Tab "ระบบกันถอย"
+
+ใน `/dashboard/train` (new tab icon 🛡️):
+
+- **Stats cards**: Total scenarios, Critical count, Last run, Pass rate 7d (trend arrow)
+- **Filter**: category + severity + search box
+- **Table**: ID, title, category badge, severity badge (color), status badge, action menu
+- **Detail modal**: fields + last run results (turns + violations) + [Re-run] [Edit] [Delete]
+- **Add form**: Quick mode (paste conversation → AI auto-suggest) + Advanced mode (JSON editor)
+
+## 13.10 Cron Jobs (in `proxy/index.js` startup)
+
+| Time | Job | Action |
+|------|-----|--------|
+| 03:00 daily | Update `pass_rate_7d` | Rolling 7d from `regression_runs` |
+| 03:00 daily | Drift alert | ถ้า `pass_rate_7d < 0.9` × ≥3 runs → Telegram `regression_drift` |
+| 03:30 daily | Cleanup stale | Delete messages where `sourceId ^= "reg_"` AND `createdAt < 1h` |
+| Sun 04:00 | Archive inactive | Scenarios `active=false > 90 days` + summary to Telegram |
+
+## 13.11 Security Fixes (V.1.5)
+
+- **SEC-C1**: Dashboard proxy auth — ใช้ `proxy.ts` ของ Next.js 16 (ลบ conflicting `middleware.ts`)
+- **SEC-C2**: ReDoS protection — `safe-regex2` + pattern length caps (200 chars)
+- **SEC-C3**: Prompt injection — JSON-wrapped judge prompt + verdict allowlist + sanitize "ignore previous" patterns
+- **H3**: Rate limit `/api/regression/run` (in-memory lock `__REGRESSION_RUNNING__`)
+- **H5**: PII masking in auto-mine — `maskPII()` ก่อนส่ง Gemini
+- **M1**: MongoDB regex injection — `escapeRegex()` + length cap ใน search query
+- **M2**: Prototype pollution — `JSON.parse(JSON.stringify(body))` ใน POST/PATCH
+
+## 13.12 Key Fix History → Regression Test Mapping
+
+ดูใน `openclawminicrm/docs/chatbot-rules.md` Section 11 — Fix History table มี column **REG** ที่ map bug เดิมไป REG-NNN ที่ครอบคลุมแล้ว
+
+## 13.13 Telegram Alert Types
+
+เพิ่มใน `telegram-alert.js` V.2.0:
+- `regression_drift` — pass_rate_7d drop detected (📉 icon)
+- `regression_fail_gate` — deploy blocked (🚫 icon)
+
+## 13.14 Override Mechanisms
+
+| Gate | Override | Audit Log |
+|------|----------|-----------|
+| Pre-push hook | `git push --no-verify` | Git log (local) |
+| Pre-push (no agent) | `REGRESSION_REQUIRE_AGENT=0 git push` | — |
+| GitHub Actions | Merge directly via UI | GitHub audit |
+| Deploy script | `SKIP_REGRESSION=1 ./deploy.sh` | Deploy log |

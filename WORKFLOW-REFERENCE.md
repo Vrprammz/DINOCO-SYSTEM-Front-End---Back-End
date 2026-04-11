@@ -1222,3 +1222,125 @@ Frontend Fix Wave (V.42.5-42.8):
 | Snippet 5 | 1166 | Admin Dashboard Tabs (Orders + Makers + Credit tabs) |
 | Snippet 6 | 1161 | Order State Machine (`B2F_Order_FSM` class) |
 | Snippet 7 | 1162 | Credit Transaction Manager (atomic `b2f_payable_add/subtract()`) |
+
+---
+
+## Regression Guard Test Flow (OpenClaw V.1.5)
+
+### CLI Test Flow
+
+```
+node scripts/regression.js --mode=gate --severity=critical,high
+  ↓
+Load scenarios from MongoDB (regression_scenarios collection, active=true)
+  ↓
+For each scenario (sequential, 2s delay):
+  - sourceId = "reg_" + bug_id + "_" + timestamp (isolation)
+  - For each turn in scenario.turns:
+      - runRegressionTurn(sourceId, turn.message)  ← V.1.5
+        ├─ saveMsg(user)            [context persistence]
+        ├─ Auto-lead pre-check      [phone regex + bot cue]
+        ├─ callDinocoAI(prompt, message, sourceId)
+        ├─ Dealer coordination append
+        └─ saveMsg(assistant)
+      - Capture tools from aiChat._lastToolResults (Array per sourceId)
+      - Clear tool results before next turn
+  ↓
+Cleanup: deleteMany({ sourceId }) + deleteMany({ sourceId }) for ai_memory
+  ↓
+3-Layer Validation (Hard → Soft short-circuit):
+  Layer 1: Regex forbidden/required (0 token, safe-regex2 compiled)
+  Layer 2: Tool call check (expected_tools + forbidden_tools)
+  Layer 3: Gemini semantic judge (only if hard passes + expect_behavior set)
+           └─ JSON envelope prompt (SEC-C3) + fail-closed on error
+  ↓
+Write to regression_runs collection + console table
+  ↓
+Exit code: mode=gate → critical fail = 1 (blocks deploy), else 0
+```
+
+### Deploy Gate Flow (3-Layer Fail-Fast)
+
+```
+Dev: git push origin main
+  ↓
+Pre-push hook (scripts/git-hooks/pre-push V.2.0)
+  ├─ Read stdin refs (git hook spec)
+  ├─ Check chatbot files changed?
+  │   ├─ No → exit 0 (allow push)
+  │   └─ Yes → check agent container running
+  │       ├─ No → fail-closed (override: REGRESSION_REQUIRE_AGENT=0)
+  │       └─ Yes → docker exec agent regression.js --mode=gate --severity=critical
+  │           ├─ Pass → allow push
+  │           └─ Fail → block push (override: git push --no-verify)
+  ↓
+GitHub Actions (.github/workflows/regression-guard.yml)
+  ├─ Trigger: push to main (chatbot paths only)
+  ├─ Spin up mongodb + agent + seed minimal fixtures
+  ├─ Run regression --severity=critical,high (3 min)
+  └─ On fail: Telegram alert (regression_fail_gate)
+  ↓
+SSH deploy (scripts/deploy.sh Step 0)
+  ├─ Pre-check: docker compose up mongodb + agent (if not running)
+  ├─ Run regression --mode=gate --severity=critical
+  │   ├─ Pass → docker compose up -d --build (full deploy)
+  │   └─ Fail → abort (override: SKIP_REGRESSION=1 ./deploy.sh)
+```
+
+### Dashboard "ระบบกันถอย" Tab Flow
+
+```
+Admin opens /dashboard/train → Tab "ระบบกันถอย" (🛡️)
+  ↓
+GET /dashboard/api/regression/stats (protected via proxy.ts auth)
+  ↓ (proxy → agent)
+Stats cards: Total / Critical / Last run / Pass rate 7d (trend arrow)
+  ↓
+GET /dashboard/api/regression/scenarios?filter
+  ↓
+Table: ID / title / category badge / severity badge / status / action menu
+  ↓
+Row click → Detail modal
+  ├─ [Re-run] → POST /api/regression/run { bug_ids: [...] } (in-memory lock)
+  ├─ [Edit] → PATCH (safe-regex2 validation)
+  └─ [Delete] → DELETE (soft delete, active=false)
+  ↓
+[+ Add Scenario]
+  ├─ Quick mode: paste conversation → AI auto-suggest fields
+  └─ Advanced mode: JSON editor with live validation
+```
+
+### Cron Jobs (Nightly)
+
+| Time | Job | Action |
+|------|-----|--------|
+| 03:00 | Update `pass_rate_7d` | Rolling 7d aggregate from `regression_runs` |
+| 03:00 | Drift detection | Alert Telegram ถ้า `pass_rate_7d < 0.9` × ≥3 runs |
+| 03:30 | Cleanup stale | Delete `messages` where `sourceId ^= "reg_"` AND `createdAt < 1h` |
+| Sun 04:00 | Archive | Scenarios `active=false > 90 days` → summary Telegram |
+
+### Auto-Lead V.8.0 Flow (ในการ regression test)
+
+```
+Turn 1: "แถวลาดพร้าวติดตั้งที่ไหน"
+  → runRegressionTurn(sourceId, turn1)
+  → saveMsg(user)
+  → callDinocoAI → Gemini calls dinoco_dealer_lookup
+  → reply: "สำหรับ กทม. แอดมินแนะนำร้าน FOX RIDER SHOP..."
+  → Dealer append: "ถ้าสะดวกแจ้งชื่อและเบอร์โทร แอดมินจะประสาน..."
+  → saveMsg(assistant) ← context for turn 2
+
+Turn 2: "เปรม 0812345678"
+  → runRegressionTurn(sourceId, turn2)
+  → saveMsg(user)
+  → Auto-lead pre-check:
+      ├─ phoneMatch = "0812345678" ✓
+      ├─ recentMsgs → find lastBotCue "แจ้งชื่อและเบอร์" ✓
+      ├─ nameText = "เปรม"
+      ├─ dealerName = "FOX RIDER" (regex from dealerMsg)
+      ├─ skip callDinocoAI
+      └─ return "ขอบคุณค่ะคุณเปรม รับเรื่องแล้วนะคะ แอดมินจะประสานให้ร้าน FOX RIDER ติดต่อกลับ..."
+  → saveMsg(assistant)
+
+Cleanup: deleteMany({ sourceId: "reg_REG-005_...") })
+```

@@ -180,7 +180,7 @@
 
 | File | Location | Version | Description |
 |------|----------|---------|-------------|
-| index.js | `proxy/` | V.2.1 | Main Express server (~110K) + Telegram webhook route |
+| index.js | `proxy/` | V.2.2 | Main Express server + Telegram webhook + `/api/regression/*` (10 endpoints) + `runRegressionTurn()` helper V.1.5 (multi-turn context persistence) + Auto-lead + `/api/claims/:id/status` |
 | ai-chat.js | `proxy/modules/` | V.8.1 | AI providers + claudeSupervisor + PII masking + Claude review guard |
 | dinoco-tools.js | `proxy/modules/` | -- | 11 function-calling tools |
 | shared.js | `proxy/modules/` | -- | Prompt templates + config + product knowledge rules |
