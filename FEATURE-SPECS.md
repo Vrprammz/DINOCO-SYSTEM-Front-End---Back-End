@@ -2663,9 +2663,14 @@ Caller ทุกตัวต้องเรียก `dinoco_get_leaf_skus()` ex
 - Fix Auto-Split type check — `openAutoSplitDialog` เคย block `type !== 'child'` แต่ V.41.2 เพิ่มปุ่มให้ `single` แล้ว. V.42.8 allow `['single', 'child']`
 - Debug console log ใน `saveCatalogItem` → payload + response ของ `save_sku_relation` + SKIPPED reason (ช่วย debug production)
 
-### 🔜 Phase 2 (รอ commit ถัดไป)
+### ✅ Phase 2 (V.42.15 — Done 2026-04-10)
 
-Manual Edit Product modal — แสดง **suggestion ราคาต่อหลาน** จากลูก (คำนวณตาม mode) ให้ admin เห็นแล้วกรอกเอง (ไม่ auto-apply)
+Manual Edit Product modal — แสดง **suggestion ราคาต่อชิ้น** ใน Set Components list:
+- Child suggestion: `parent_price / N children` — badge สีม่วง 💡
+- Grandchild suggestion: `child_actual_price / M grandchildren` (fallback to parent /N×M ถ้าลูกไม่มีราคา) — badge สีเขียว
+- **เปรียบเทียบราคาจริง vs แนะนำ**: ถ้ามีราคาจริงแล้ว → แสดง "ราคาจริง X ฿ (+N%)" สีแดง/เขียว บอก diff%
+- **Live update**: bind `input` handler บน `#cat-price` (debounce 250ms) → re-render children list เมื่อราคาแม่เปลี่ยน
+- Display-only (ไม่ auto-apply) — admin เห็นเป็น hint แล้วกรอกราคาในแต่ละ child/grandchild modal เอง
 
 ---
 
@@ -2838,7 +2843,7 @@ Refactor จาก hardcoded 2 columns → dynamic 2-6 parts:
 - [x] Breadcrumb คลิกกลับไปที่ parent (V.42.12)
 - [x] `SET → [L, R]` flat 2 ชั้น → L/R = grandchild (V.42.13)
 - [x] Radio override → badge เปลี่ยน + ✋ indicator (V.42.14)
-- [ ] Manual Edit suggestion ราคาต่อหลาน (Phase 2 — pending)
+- [x] Manual Edit suggestion ราคาต่อหลาน (V.42.15 Phase 2)
 
 ---
 

@@ -1270,6 +1270,14 @@ V.42.14 Hybrid Override (Manual admin choice)
     - is_override=true → แสดง icon ✋ ต่อท้าย badge label
     - edge cases: override=child/gc/single บนสินค้าไม่มี parent (render ไม่มี breadcrumb)
   สำคัญ: UI layer only — ไม่กระทบ stock / orders / DD-2 (backend ใช้ structure จริง)
+
+V.42.15 Price Suggestion Phase 2 (Manual Edit suggestion per child/grandchild)
+  renderCatChildren แสดง suggestion badge ข้างแต่ละ child + grandchild
+    - Child: parent_price / N children (badge ม่วง 💡)
+    - Grandchild: child_actual_price / M grandchildren (fallback parent/N×M ถ้าลูกราคา 0)
+    - Diff% comparison: ถ้ามีราคาจริง + |diff| >= 1% → แสดง "ราคาจริง X฿ (+N%)" สีแดง/เขียว
+  Live update: input handler บน #cat-price debounced 250ms → re-render children list
+  Display-only — admin ไปกรอกราคาในแต่ละ child modal เอง (ไม่ auto-apply)
 ```
 
 ---
