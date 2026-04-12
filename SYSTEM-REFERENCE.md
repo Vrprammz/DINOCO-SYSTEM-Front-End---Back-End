@@ -138,7 +138,7 @@
 |------|---------|-------|-------------|
 | Snippet 1: Core Utilities & LINE Flex Builders | V.32.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers |
 | Snippet 2: LINE Webhook Gateway & Order Creator | V.34.0 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete, leaf-only stock deduct |
-| Snippet 3: LIFF E-Catalog REST API | V.39.2 | 52 | REST API (auth, catalog, orders, slip, flash) |
+| Snippet 3: LIFF E-Catalog REST API | V.40.8 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook) |
 | Snippet 4: LIFF E-Catalog Frontend | V.32.0 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) |
 | Snippet 5: Admin Dashboard | V.32.0 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash, leaf-only cancel restore |
 | Snippet 6: Admin Discount Mapping | V.31.1 | 55 | `[b2b_discount_mapping]` -- SKU pricing + rank tiers |
@@ -183,7 +183,7 @@
 | index.js | `proxy/` | V.2.2 | Main Express server + Telegram webhook + `/api/regression/*` (10 endpoints) + `runRegressionTurn()` helper V.1.5 (multi-turn context persistence) + Auto-lead + `/api/claims/:id/status` |
 | ai-chat.js | `proxy/modules/` | V.8.1 | AI providers + claudeSupervisor + PII masking + Claude review guard |
 | dinoco-tools.js | `proxy/modules/` | -- | 11 function-calling tools |
-| shared.js | `proxy/modules/` | -- | Prompt templates + config + product knowledge rules |
+| shared.js | `proxy/modules/` | V.5.4 | Prompt templates + config + product knowledge rules + CONFIRM_SELECTION/LIST_MANY_OPTIONS image rules |
 | claim-flow.js | `proxy/modules/` | -- | Claim workflow automation |
 | lead-pipeline.js | `proxy/modules/` | V.2.0 | Lead management (20 statuses incl. closed_won, waiting_decision, waiting_stock) + 5 Flex builders + notifyDealerDirect |
 | dinoco-cache.js | `proxy/modules/` | -- | Redis/memory cache layer |
@@ -705,7 +705,7 @@ Product catalog stored in custom table (separate from b2b_product CPT) — sourc
 | Option Key | Type | Description |
 |------------|------|-------------|
 | `b2b_warehouse_address` | array | Warehouse name, address, phone |
-| `b2b_manual_shipments_{YYYY_MM}` | array | Manual Flash shipment records (monthly) |
+| `b2b_manual_shipments_{YYYY_MM}` | array | Manual Flash shipment records (monthly). Status updated by `b2b_flash_manual_shipment_webhook()` (Snippet 3 V.40.8) when Flash webhook fires for a PNO not linked to any B2B ticket — maps Flash states 1-9 to manual statuses (picked_up, in_transit, delivering, delivered, cancelled, etc.) |
 | `b2b_sku_relations` | array | Parent-child-grandchild SKU relationships (3-level flat format: `{ parent: [children], child: [grandchildren] }`) |
 | `dinoco_sku_relations` | array | SKU relations for legacy migration |
 
@@ -791,6 +791,7 @@ Product catalog stored in custom table (separate from b2b_product CPT) — sourc
 | `b2f_maker_group_{group_id}_neg` | 5 min | Negative cache (group not found) |
 | `dinoco_limit_{user_id}_{action}` | 2 sec | Rate limiting |
 | `b2b_flash_courier_retry_{tid}` | varies | Flash retry state |
+| `manual_flash_status_{pno}` | 7 days | Cached manual shipment status from Flash webhook (set by `b2b_flash_manual_shipment_webhook()` in Snippet 3 V.40.8) |
 
 ### 5.4.5 MongoDB Collections (OpenClaw)
 

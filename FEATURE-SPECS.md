@@ -1756,6 +1756,8 @@ Mask เบอร์โทร/ชื่อจริงใน conversation histor
 - วัสดุตรงสินค้า: กันล้ม = สแตนเลส, กล่อง = อลูมิเนียม
 - DINOCO Edition NX500 = SKU DNCGND37LSPROS สีเงินเท่านั้น
 - Side Rack ไม่ใช่มือจับ (มือจับเกี่ยวกับ Rear Rack เท่านั้น)
+- **CONFIRM_SELECTION** (V.5.4): ลูกค้าตัดสินใจเลือกสินค้าแล้ว (ระบุ สี/รุ่น/ราคา) → บังคับเรียก product_lookup + แนบ URL รูปยืนยันก่อนถามจังหวัด
+- **LIST_MANY_OPTIONS** (V.5.4): list สินค้า ≥3 ตัว → ปิดท้ายถาม "ลูกค้าสนใจตัวไหน จะส่งรูปให้ดู" (proactive image offer)
 
 ---
 
