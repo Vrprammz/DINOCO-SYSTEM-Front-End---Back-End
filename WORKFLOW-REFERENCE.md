@@ -223,6 +223,7 @@ Trigger: Admin กด "จัดส่ง Flash" ใน Dashboard
 Manual Shipping:
   - Admin กด "จัดส่งเอง" → ใส่ tracking number → shipped
   - Manual Flash (/manual-ship): standalone (ไม่ต้องมี B2B order)
+  - Webhook Status Update (V.40.8): Flash webhook อัพเดทสถานะ manual shipment อัตโนมัติ (picked_up → in_transit → delivered). `b2b_flash_manual_shipment_webhook()` ใน Snippet 3 จับ PNO ที่ไม่ใช่ B2B ticket แล้วค้นหา+อัพเดทใน wp_options manual shipments
 
 End State: Order shipped → completed
 ```
