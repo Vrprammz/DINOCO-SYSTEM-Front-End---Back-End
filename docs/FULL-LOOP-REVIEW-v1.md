@@ -23,9 +23,9 @@
 | 5 | ✅ **Phase 1 done** | **M15** | Flex Card color tokens — Sprint 4 Phase 0 found color is the real chaos (52 hex codes, uniformity 0.16) while structure is clean (0.80). Option C+: 12 tokens + header update + 3 POC migrations (56 replacements). Full migration deferred to incremental adoption. | ADR in `docs/ADR-M15-flex-tokens.md`, tokens + POC in `7bf2649` |
 | 6 | ✅ **Resolved** | **M16** | FSM-bypass sites — Sprint 2 Phase 0 reality check found audit over-counted 8×. Only 2 B2B walk-in edit sites were genuine primary-path bypasses; all B2F sites are legitimate `function_exists` fallback patterns; claim sites overlapped with M18 and are resolved there | `[B2B] Snippet 3:718,720` V.40.7 → **fixed in `4fc4c16`**. Claim sites resolved via M18. B2F re-audited: 0 real bypasses. |
 | 7 | ✅ **Resolved** | **M17** | Postback dispatch — Sprint 3 Phase 0 found audit was wrong on premise (switch statements, not if/elseif; 27 unique actions, not 67; 3 dispatchers, not 2; fragmentation 1.04). Adopted Option B+: observability wrapper + uniform dedup, skipped the full $GLOBALS registry refactor. See ADR. | `[B2B] Snippet 2:454` V.34.3 → **fixed in `724d0a5`**, ADR in `docs/ADR-M17-postback-dispatch.md` (`e135eb3`) |
-| 8 | 🔵 **Low** | **L2** | 5 JS `innerHTML=` sites use string concatenation with server-returned fields without an escape helper (`esc()` missing) — low XSS risk since admin-only pages, but inconsistent with the `.innerHTML = esc(...)` pattern used everywhere else | `[Admin System] KB Trainer Bot v2.0:432`, `[B2B] Snippet 12:1965`, `[B2B] Snippet 9:1577,2040`, `[LIFF AI] Snippet 2:1732` |
-| 9 | 🔵 **Low** | **L3** | Capability model is binary — 76/78 `current_user_can()` checks use `manage_options`. No separate roles for finance / inventory / B2F admin → granting dashboard access requires full admin | global |
-| 10 | 🔵 **Low** | **L4** | ~733 inline `onclick="..."` handlers in PHP-emitted HTML → CSP incompatibility, tight HTML-JS coupling, and impossible to unit-test event wiring | global (admin dashboards + LIFF pages) |
+| 8 | ✅ **Resolved** | **L2** | innerHTML escape — 2 sites fixed (KB Trainer, Snippet 12); 3 sites verified safe-by-type (integer/hardcoded values, not user data) | **fixed in `7c233bc` (Sprint 6)** |
+| 9 | ❌ **WONTFIX** | **L3** | Binary capability model (76× manage_options) — custom roles = ~8h refactor for a 1-admin system. Risk > benefit. | Sprint 6 decision |
+| 10 | ❌ **WONTFIX** | **L4** | 733 inline onclick= — CSP refactor = multi-week project, no CSP policy in place. | Sprint 6 decision |
 
 ### Ship recommendation
 
@@ -1254,12 +1254,15 @@ Then replace `current_user_can('manage_options')` with granular caps per endpoin
 | v1-review P2 Sprint 3 (M17) | 1 | 1 | 0 |
 | v1-review P3 Sprint 3 (NEW L9) | 1 | 0 | 1 |
 | v1-review P3 Sprint 4 (M15 Phase 1) | 1 | 1 | 0 |
-| **Total** | **50** | **48** | **2** |
+| v1-review Sprint 6 (M19, L2-L8, warranty_claim) | 10 | 10 | 0 |
+| **Total** | **60** | **58** | **2** |
 
 ### Remaining non-blocking work (v1-review P2 + P3)
 
 - **P2** (0 items) — all closed as of Sprint 3
-- **P3** (12+ items, ~40h): **M15 Phase 2** (incremental builder migration — organic, as builders are touched for other reasons), M19 (debt recon UI), **M20 (claim state canonicalization — observability-dependent, ~8h)**, **L9 (postback dead-handler cleanup — observability-dependent, ~2h)**, L2–L8 (misc low), second-brain doc updates
+- **P3** (4 items, ~18h): **M15 Phase 2** (incremental builder migration — organic), **M20 (claim state canonicalization — observability-dependent, check ~2026-04-26, ~8h)**, **L9 (postback dead-handler cleanup — observability-dependent, check ~2026-04-26, ~2h)**, second-brain doc updates (~2h)
+- **WONTFIX** (4 items): L3 (binary capabilities — 1-admin system), L4 (733 onclick= — no CSP), L5 (JWT revocation — short-lived tokens), L6 (central audit helper — b2b_log suffices)
+- **Already resolved** (2 items): L7 (place-order idempotency — dedup transient already existed), L8 (invoice debounce — _invBusy + server lock already existed)
 
 ### M17 resolution details — Sprint 3 (2026-04-12)
 
