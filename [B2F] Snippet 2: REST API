@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
- * Version: V.8.6 — Audit C4 v2: stock verify BEFORE FSM transition (no rollback transition; FSM received→delivering illegal)
+ * Version: V.8.7 — Hierarchy: DD-7 tracks SET parent origin (poi_parent_sku/name) + po-detail returns hierarchy info
  * DB_ID: 1165
  * Kill Switch: define('B2F_DISABLED', true)
  *
@@ -948,7 +948,7 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาเลือกสินค้าอย่างน้อย 1 รายการ (จำนวนต้องมากกว่า 0)', 'code' => 'MISSING_ITEMS' ), 400 );
         }
 
-        // ── DD-7: Auto-expand SET/non-leaf SKUs → leaf items ──
+        // ── DD-7: Auto-expand SET/non-leaf SKUs → leaf items + track SET origin (V.8.7 Hierarchy) ──
         if ( function_exists( 'dinoco_get_leaf_skus' ) && function_exists( 'dinoco_is_leaf_sku' ) ) {
             $expanded = array();
             foreach ( $merged as $item ) {
@@ -956,11 +956,11 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 $qty = $item['qty'];
 
                 if ( dinoco_is_leaf_sku( $sku ) ) {
-                    // Leaf SKU → keep as-is
+                    // Leaf SKU → keep as-is (no SET parent)
                     if ( isset( $expanded[ $sku ] ) ) {
                         $expanded[ $sku ]['qty'] += $qty;
                     } else {
-                        $expanded[ $sku ] = array( 'sku' => $sku, 'qty' => $qty );
+                        $expanded[ $sku ] = array( 'sku' => $sku, 'qty' => $qty, 'parent_sku' => '', 'parent_name' => '' );
                     }
                 } else {
                     // SET/non-leaf → expand to leaf SKUs
@@ -971,6 +971,15 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                             'error'   => sprintf( 'SET SKU "%s" ไม่มี leaf items', esc_html( $sku ) ),
                             'code'    => 'EMPTY_SET',
                         ), 400 );
+                    }
+
+                    // V.8.7: Resolve SET parent name for hierarchy display
+                    $set_parent_name = $sku; // fallback = SKU
+                    if ( class_exists( 'DINOCO_Catalog' ) ) {
+                        $set_cat = DINOCO_Catalog::get_by_sku( $sku );
+                        if ( $set_cat && ! empty( $set_cat['product_name'] ) ) {
+                            $set_parent_name = $set_cat['product_name'];
+                        }
                     }
 
                     foreach ( $leaves as $leaf_sku ) {
@@ -994,16 +1003,22 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                             ), 400 );
                         }
 
-                        // ทุก leaf ได้ qty เท่ากับ SET qty ต้นทาง
+                        // ทุก leaf ได้ qty เท่ากับ SET qty ต้นทาง + track parent origin
                         if ( isset( $expanded[ $leaf_sku ] ) ) {
                             $expanded[ $leaf_sku ]['qty'] += $qty;
+                            // DD-3 shared child: เก็บ parent_sku ตัวแรก (MVP — rare case)
                         } else {
-                            $expanded[ $leaf_sku ] = array( 'sku' => $leaf_sku, 'qty' => $qty );
+                            $expanded[ $leaf_sku ] = array(
+                                'sku'         => $leaf_sku,
+                                'qty'         => $qty,
+                                'parent_sku'  => $sku,
+                                'parent_name' => $set_parent_name,
+                            );
                         }
                     }
 
                     if ( function_exists( 'b2f_log' ) ) {
-                        b2f_log( sprintf( 'DD-7: SET %s expanded → %s (qty=%d)', $sku, implode( ', ', $leaves ), $qty ) );
+                        b2f_log( sprintf( 'DD-7: SET %s (%s) expanded → %s (qty=%d)', $sku, $set_parent_name, implode( ', ', $leaves ), $qty ) );
                     }
                 }
             }
@@ -1049,6 +1064,9 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 'unit_cost'    => $unit_cost,
                 'subtotal'     => $subtotal,
                 'mp_post_id'   => $mp_post->ID,
+                // V.8.7 Hierarchy: SET origin tracking
+                'parent_sku'   => $item['parent_sku'] ?? '',
+                'parent_name'  => $item['parent_name'] ?? '',
             );
             $total += $subtotal;
 
@@ -1132,6 +1150,9 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 'poi_qty_received'      => 0,
                 'poi_qty_rejected'      => 0,
                 'poi_shipping_per_unit' => $ship_per,
+                // V.8.7 Hierarchy: SET origin for UI grouping
+                'poi_parent_sku'        => $pi['parent_sku'] ?? '',
+                'poi_parent_name'       => $pi['parent_name'] ?? '',
             );
         }
         update_field( 'po_items', $repeater, $po_id );
@@ -1360,6 +1381,10 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
                     $img = esc_url( $catalog_product['image_url'] );
                 }
             }
+            // V.8.7 Hierarchy: parent info for UI grouping (empty = standalone item)
+            $psku = esc_html( $item['poi_parent_sku'] ?? '' );
+            $pnam = esc_html( $item['poi_parent_name'] ?? '' );
+
             $formatted_items[] = array(
                 // V.4.7: ส่งทั้ง short name + poi_ prefix เพื่อ compat กับ Maker LIFF + Admin
                 'image_url' => $img, 'poi_image_url' => $img,
@@ -1371,6 +1396,9 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
                 'qty_received' => $qr, 'poi_qty_received' => $qr,
                 'qty_rejected' => $qj, 'poi_qty_rejected' => $qj,
                 'subtotal' => round( $uc * $qo, 2 ),
+                // V.8.7 Hierarchy
+                'parent_sku' => $psku, 'poi_parent_sku' => $psku,
+                'parent_name' => $pnam, 'poi_parent_name' => $pnam,
             );
         }
 
