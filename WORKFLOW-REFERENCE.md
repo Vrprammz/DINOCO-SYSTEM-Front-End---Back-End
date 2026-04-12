@@ -224,6 +224,15 @@ Manual Shipping:
   - Admin กด "จัดส่งเอง" → ใส่ tracking number → shipped
   - Manual Flash (/manual-ship): standalone (ไม่ต้องมี B2B order)
   - Webhook Status Update (V.40.8): Flash webhook อัพเดทสถานะ manual shipment อัตโนมัติ (picked_up → in_transit → delivered). `b2b_flash_manual_shipment_webhook()` ใน Snippet 3 จับ PNO ที่ไม่ใช่ B2B ticket แล้วค้นหา+อัพเดทใน wp_options manual shipments
+  - V.41.0 Features (9 items):
+    * Flash Label: ดึง label จาก Flash API + แสดง/print ผ่าน RPi (`manual-flash-label` + `manual-reprint`)
+    * Check Status: modal เช็คสถานะ Flash ตาม PNO (`manual-flash-status`) + Thai status labels
+    * Test Flash: ทดสอบ Flash API connectivity (`manual-flash-test`)
+    * Status Polling: cron `b2b_manual_flash_poll_cron` อัพเดทสถานะ active shipments อัตโนมัติ
+    * Tracking Links: PNO แสดงเป็น link ไป Flash tracking
+    * Export CSV: ดาวน์โหลดรายการ manual shipments เป็น CSV
+    * Multi-box fix: courier รองรับ all_pnos param (หลายกล่อง)
+    * Month helper: `b2b_manual_shipment_months()` ดึงเดือนที่มีข้อมูล
 
 End State: Order shipped → completed
 ```

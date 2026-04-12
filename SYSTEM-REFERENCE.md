@@ -138,7 +138,7 @@
 |------|---------|-------|-------------|
 | Snippet 1: Core Utilities & LINE Flex Builders | V.32.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers |
 | Snippet 2: LINE Webhook Gateway & Order Creator | V.34.0 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete, leaf-only stock deduct |
-| Snippet 3: LIFF E-Catalog REST API | V.40.8 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook) |
+| Snippet 3: LIFF E-Catalog REST API | V.41.0 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook + label/status/test/reprint) |
 | Snippet 4: LIFF E-Catalog Frontend | V.32.0 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) |
 | Snippet 5: Admin Dashboard | V.32.0 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash, leaf-only cancel restore |
 | Snippet 6: Admin Discount Mapping | V.31.1 | 55 | `[b2b_discount_mapping]` -- SKU pricing + rank tiers |
@@ -224,6 +224,10 @@
 | GET | `/discount-mapping` | Admin | Get/update discount data |
 | GET | `/invoice-image` | Admin | Generate invoice PNG |
 | GET | `/debug-flash/{id}` | Admin | Debug Flash tracking |
+| POST | `/manual-flash-label` | Admin | Get Flash label for manual shipment |
+| GET | `/manual-flash-status` | Admin | Check Flash status for manual shipment PNO |
+| POST | `/manual-flash-test` | Admin | Test Flash API connectivity |
+| POST | `/manual-reprint` | Admin | Reprint manual shipment label via RPi |
 | POST | `/slip-upload` | JWT | Upload payment slip |
 | POST | `/bo-notify` | Admin | Backorder notification |
 | GET | `/invoice-gen` | Admin | Generate invoice link |
@@ -705,7 +709,7 @@ Product catalog stored in custom table (separate from b2b_product CPT) — sourc
 | Option Key | Type | Description |
 |------------|------|-------------|
 | `b2b_warehouse_address` | array | Warehouse name, address, phone |
-| `b2b_manual_shipments_{YYYY_MM}` | array | Manual Flash shipment records (monthly). Status updated by `b2b_flash_manual_shipment_webhook()` (Snippet 3 V.40.8) when Flash webhook fires for a PNO not linked to any B2B ticket — maps Flash states 1-9 to manual statuses (picked_up, in_transit, delivering, delivered, cancelled, etc.) |
+| `b2b_manual_shipments_{YYYY_MM}` | array | Manual Flash shipment records (monthly, includes separate address fields + sender_key). Status updated by webhook + `b2b_manual_flash_poll_cron`. Helper: `b2b_manual_shipment_months()` lists months with data. |
 | `b2b_sku_relations` | array | Parent-child-grandchild SKU relationships (3-level flat format: `{ parent: [children], child: [grandchildren] }`) |
 | `dinoco_sku_relations` | array | SKU relations for legacy migration |
 
@@ -791,7 +795,7 @@ Product catalog stored in custom table (separate from b2b_product CPT) — sourc
 | `b2f_maker_group_{group_id}_neg` | 5 min | Negative cache (group not found) |
 | `dinoco_limit_{user_id}_{action}` | 2 sec | Rate limiting |
 | `b2b_flash_courier_retry_{tid}` | varies | Flash retry state |
-| `manual_flash_status_{pno}` | 7 days | Cached manual shipment status from Flash webhook (set by `b2b_flash_manual_shipment_webhook()` in Snippet 3 V.40.8) |
+| `manual_flash_status_{pno}` | 7 days | Cached manual shipment status from Flash webhook + `b2b_manual_flash_poll_cron` (Snippet 3 V.41.0) |
 
 ### 5.4.5 MongoDB Collections (OpenClaw)
 
