@@ -160,13 +160,13 @@
 | Snippet 1: Core Utilities & Flex Builders | V.6.1 | 1163 | LINE push, 22 Flex templates, LIFF URL (HMAC), i18n 3-lang, b2f_group_items_by_set() hierarchy helper |
 | Snippet 2: REST API | V.8.7 | 1165 | 20+ endpoints `/b2f/v1/*` + auth-admin JWT + hierarchy parent tracking |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
-| Snippet 4: Maker LIFF Pages | V.4.0 | 1167 | `[b2f_maker_liff]` -- LANG system (ENG for non-THB) |
+| Snippet 4: Maker LIFF Pages | V.4.2 | 1167 | `[b2f_maker_liff]` -- LANG system + hierarchy SET grouping |
 | Snippet 5: Admin Dashboard Tabs | V.3.3 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]`, `[b2f_admin_credit_tab]` |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
-| Snippet 8: Admin LIFF E-Catalog | V.3.0 | 1168 | LIFF ordering page (auth via JWT, no WP login) |
-| Snippet 9: PO Ticket View | V.3.3 | 1169 | PO detail page (status timeline, items, receiving, payment) |
-| Snippet 10: PO Image Generator | V.2.5 | 1170 | A4 PO PNG (GD Library), ENG template for CNY/USD |
+| Snippet 8: Admin LIFF E-Catalog | V.3.1 | 1168 | LIFF ordering page + hierarchy product badges |
+| Snippet 9: PO Ticket View | V.3.4 | 1169 | PO detail page + hierarchy SET grouping in items |
+| Snippet 10: PO Image Generator | V.2.6 | 1170 | A4 PO PNG + hierarchy SET header rows |
 | Snippet 11: Cron Jobs & Reminders | V.2.1 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
 
 ### 2.6 [LIFF AI] -- AI Command Center (2 Snippets)
