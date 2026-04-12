@@ -252,9 +252,10 @@ Trigger: Admin เปิด LIFF Catalog หรือ B2F Dashboard
 4. ถ้า foreign (CNY/USD): เลือก shipping method (land/sea) + exchange rate
 5. ระบบคำนวณ: total (สกุลโรงงาน), total_thb, shipping_total, grand_total_thb
 6. กด Submit → POST /b2f/v1/create-po
-7. สร้าง b2f_order (draft → submitted)
-8. ส่ง Flex "New PO" → กลุ่ม Maker (ENG ถ้า non-THB)
-9. ส่ง Flex "สร้าง PO สำเร็จ" → กลุ่ม Admin
+7. DD-7: Auto-expand SET → leaf items + snapshot poi_parent_sku/name (V.8.7)
+8. สร้าง b2f_order (draft → submitted)
+9. ส่ง Flex "New PO" → กลุ่ม Maker (ENG ถ้า non-THB) — items grouped by SET 🟣 (V.6.1)
+10. ส่ง Flex "สร้าง PO สำเร็จ" → กลุ่ม Admin — items grouped by SET 🟣 (V.6.1)
 
 End State: b2f_order สถานะ submitted
 ```

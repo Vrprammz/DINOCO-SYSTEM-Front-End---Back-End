@@ -156,9 +156,9 @@
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
-| Snippet 0: CPT & ACF Registration | V.3.0 | 1160 | 5 CPTs + ACF fields + helpers + group cache |
-| Snippet 1: Core Utilities & Flex Builders | V.6.0 | 1163 | LINE push, 18 Flex templates, LIFF URL (HMAC), i18n 3-lang (TH/EN/ZH) |
-| Snippet 2: REST API | V.8.2 | 1165 | 20+ endpoints `/b2f/v1/*` + auth-admin JWT |
+| Snippet 0: CPT & ACF Registration | V.3.2 | 1160 | 5 CPTs + ACF fields + helpers + group cache + poi_parent_sku/name |
+| Snippet 1: Core Utilities & Flex Builders | V.6.1 | 1163 | LINE push, 22 Flex templates, LIFF URL (HMAC), i18n 3-lang, b2f_group_items_by_set() hierarchy helper |
+| Snippet 2: REST API | V.8.7 | 1165 | 20+ endpoints `/b2f/v1/*` + auth-admin JWT + hierarchy parent tracking |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.0 | 1167 | `[b2f_maker_liff]` -- LANG system (ENG for non-THB) |
 | Snippet 5: Admin Dashboard Tabs | V.3.3 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]`, `[b2f_admin_credit_tab]` |
