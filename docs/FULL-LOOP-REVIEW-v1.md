@@ -20,7 +20,7 @@
 | 2 | ✅ **Resolved** | **H10** | `verify-member` endpoint has no rate limit — LINE Group enumeration + LINE API quota burn attack | `[B2B] Snippet 1:981-1042` → **fixed in `b1b8a30` (V.33.2)** |
 | 3 | ✅ **Resolved** | **M13** | Rate-limit pattern drift — 2 real holdouts migrated to `b2b_rate_limit()`; 1 site (god-mode PIN failure counter) documented as intentional exception; 1 audit false positive (`dnc_maker_rate_` is a data cache, not a rate limiter) | Brand Voice Pool V.2.9 + Inventory V.42.20 → **fixed in `403d6d4`** |
 | 4 | ✅ **Resolved** | **M14** | `wp_remote_*` timeout drift — re-scan with smart variable-tracing showed 54 total HTTP callers, 53 already OK, 1 real gap | `[System] LINE Callback:336` V.30.8 → **fixed in `c1fcd46`** |
-| 5 | 🟡 **Medium** | **M15** | Flex Card builder proliferation — **128 Flex builder functions**, 62 in `[B2B] Snippet 1` alone. No canonical base helper → altText defaults, color palette, header/footer style all duplicated | `[B2B] Snippet 1:281-2500` (spans ~2200 lines of builders) |
+| 5 | ✅ **Phase 1 done** | **M15** | Flex Card color tokens — Sprint 4 Phase 0 found color is the real chaos (52 hex codes, uniformity 0.16) while structure is clean (0.80). Option C+: 12 tokens + header update + 3 POC migrations (56 replacements). Full migration deferred to incremental adoption. | ADR in `docs/ADR-M15-flex-tokens.md`, tokens + POC in `7bf2649` |
 | 6 | ✅ **Resolved** | **M16** | FSM-bypass sites — Sprint 2 Phase 0 reality check found audit over-counted 8×. Only 2 B2B walk-in edit sites were genuine primary-path bypasses; all B2F sites are legitimate `function_exists` fallback patterns; claim sites overlapped with M18 and are resolved there | `[B2B] Snippet 3:718,720` V.40.7 → **fixed in `4fc4c16`**. Claim sites resolved via M18. B2F re-audited: 0 real bypasses. |
 | 7 | ✅ **Resolved** | **M17** | Postback dispatch — Sprint 3 Phase 0 found audit was wrong on premise (switch statements, not if/elseif; 27 unique actions, not 67; 3 dispatchers, not 2; fragmentation 1.04). Adopted Option B+: observability wrapper + uniform dedup, skipped the full $GLOBALS registry refactor. See ADR. | `[B2B] Snippet 2:454` V.34.3 → **fixed in `724d0a5`**, ADR in `docs/ADR-M17-postback-dispatch.md` (`e135eb3`) |
 | 8 | 🔵 **Low** | **L2** | 5 JS `innerHTML=` sites use string concatenation with server-returned fields without an escape helper (`esc()` missing) — low XSS risk since admin-only pages, but inconsistent with the `.innerHTML = esc(...)` pattern used everywhere else | `[Admin System] KB Trainer Bot v2.0:432`, `[B2B] Snippet 12:1965`, `[B2B] Snippet 9:1577,2040`, `[LIFF AI] Snippet 2:1732` |
@@ -1252,13 +1252,14 @@ Then replace `current_user_can('manage_options')` with granular caps per endpoin
 | v1-review P2 Sprint 2 (M16, M18) | 2 | 2 | 0 |
 | v1-review P2 Sprint 2 (NEW M20) | 1 | 0 | 1 |
 | v1-review P2 Sprint 3 (M17) | 1 | 1 | 0 |
-| v1-review P3 Sprint 3 (**NEW** L9) | 1 | 0 | 1 |
-| **Total** | **49** | **47** | **2** |
+| v1-review P3 Sprint 3 (NEW L9) | 1 | 0 | 1 |
+| v1-review P3 Sprint 4 (M15 Phase 1) | 1 | 1 | 0 |
+| **Total** | **50** | **48** | **2** |
 
 ### Remaining non-blocking work (v1-review P2 + P3)
 
 - **P2** (0 items) — all closed as of Sprint 3
-- **P3** (13+ items, ~48h): M15 (Flex consolidation), M19 (debt recon UI), **M20 (claim state canonicalization — NEW, observability-dependent, ~8h)**, **L9 (postback dead-handler cleanup — NEW, observability-dependent, ~2h)**, L2–L8 (misc low), second-brain doc updates
+- **P3** (12+ items, ~40h): **M15 Phase 2** (incremental builder migration — organic, as builders are touched for other reasons), M19 (debt recon UI), **M20 (claim state canonicalization — observability-dependent, ~8h)**, **L9 (postback dead-handler cleanup — observability-dependent, ~2h)**, L2–L8 (misc low), second-brain doc updates
 
 ### M17 resolution details — Sprint 3 (2026-04-12)
 
