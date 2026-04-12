@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.39.0
+DINOCO B2B -- RPi Print Server Dashboard  V.40.0
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
 
@@ -706,6 +706,138 @@ def api_manual_flash_ready():
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 502
+
+
+# ═══════════════════════════════════════════════════════════════
+# V.40.0: Flash label from Flash API (#1)
+# ═══════════════════════════════════════════════════════════════
+@app.route('/api/manual-flash-label', methods=['POST'])
+@require_auth
+def api_manual_flash_label():
+    """Get Flash's own label PDF + print it."""
+    config = load_config()
+    pno = (request.json or {}).get('pno', '')
+    if not pno:
+        return jsonify({'success': False, 'message': 'Missing PNO'}), 400
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        resp = http_requests.post(
+            f'{wp_url}/wp-json/b2b/v1/manual-flash-label',
+            json={'pno': pno},
+            headers={'X-Print-Key': api_key}, timeout=30,
+        )
+        data = resp.json()
+        if not data.get('success') or not data.get('pdf_base64'):
+            return jsonify(data), resp.status_code
+
+        # Decode + print
+        import tempfile
+        pdf_bytes = base64.b64decode(data['pdf_base64'])
+        pdf_tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+        pdf_tmp.write(pdf_bytes)
+        pdf_tmp.close()
+        printed = _print_label_pdf(pdf_tmp.name)
+        if os.path.exists(pdf_tmp.name):
+            os.unlink(pdf_tmp.name)
+        return jsonify({'success': True, 'printed': printed, 'message': 'Flash label printed' if printed else 'Label downloaded but print failed'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 502
+
+
+# ═══════════════════════════════════════════════════════════════
+# V.40.0: Check Flash status (#2)
+# ═══════════════════════════════════════════════════════════════
+@app.route('/api/manual-flash-status', methods=['POST'])
+@require_auth
+def api_manual_flash_status():
+    """Check PNO status from Flash routes API."""
+    config = load_config()
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        resp = http_requests.post(
+            f'{wp_url}/wp-json/b2b/v1/manual-flash-status',
+            json=request.json or {},
+            headers={'X-Print-Key': api_key}, timeout=15,
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 502
+
+
+# ═══════════════════════════════════════════════════════════════
+# V.40.0: Test Flash API connection (#8)
+# ═══════════════════════════════════════════════════════════════
+@app.route('/api/manual-flash-test', methods=['POST'])
+@require_auth
+def api_manual_flash_test():
+    """Test Flash API connection."""
+    config = load_config()
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        resp = http_requests.post(
+            f'{wp_url}/wp-json/b2b/v1/manual-flash-test',
+            json={},
+            headers={'X-Print-Key': api_key}, timeout=15,
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 502
+
+
+# ═══════════════════════════════════════════════════════════════
+# V.40.0: Reprint label from stored data (#3)
+# ═══════════════════════════════════════════════════════════════
+@app.route('/api/manual-reprint-label', methods=['POST'])
+@require_auth
+def api_manual_reprint_label():
+    """Re-render and print label from stored shipment data."""
+    body = request.json or {}
+    pno = body.get('pno', '')
+    if not pno:
+        return jsonify({'success': False, 'message': 'Missing PNO'}), 400
+
+    sender_key = body.get('sender_key', 'foxrider')
+    if sender_key == 'dinoco':
+        sender = SENDERS.get('dinoco', _get_sender_info())
+    else:
+        sender = SENDERS.get('foxrider', _get_sender_info())
+    use_logo = sender_key == 'dinoco'
+
+    recipient = {
+        'name': body.get('dst_name', ''),
+        'phone': body.get('dst_phone', ''),
+        'address': body.get('dst_address', ''),
+        'district': body.get('dst_district', ''),
+        'province': body.get('dst_province', ''),
+        'postcode': body.get('dst_postcode', ''),
+    }
+    flash_data = {
+        'pno': pno,
+        'sort_code': body.get('sort_code', ''),
+        'sorting_line_code': body.get('sorting_line', ''),
+        'dst_store_name': body.get('dst_store', ''),
+        'barcode_uri': _generate_barcode_uri(pno),
+        'qr_uri': _generate_qr_uri(pno),
+    }
+
+    try:
+        pdf_path = _render_manual_label(
+            flash_data, recipient, sender,
+            item_desc=body.get('item_desc', ''),
+            remark=body.get('remark', ''),
+            ref_no=body.get('out_trade_no', ''),
+            use_logo=use_logo,
+        )
+        printed = _print_label_pdf(pdf_path)
+        if os.path.exists(pdf_path):
+            os.unlink(pdf_path)
+        return jsonify({'success': True, 'printed': printed, 'message': 'Label reprinted' if printed else 'Render OK but print failed'})
+    except Exception as e:
+        logger.error(f'Reprint error: {e}')
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 
 if __name__ == '__main__':
