@@ -4,7 +4,7 @@
  * Shortcode: [dinoco_admin_finance]
  * Description: สรุปภาพรวมการเงิน - หนี้, รายได้, ชำระเงิน,
  *              ตัวแทนจำหน่าย, แผนที่ภาค, AI Risk Assessment
- * Version: V.3.19 — Audit M12: FormData auto-detect via entries scan (no undocumented _fin hint)
+ * Version: V.3.20 — M19: Debt Reconciliation tab (compare stored debt vs recalculated + force-recalc + CSV export)
  * DB_ID: 1158
  * ======================================================================
  *
@@ -172,6 +172,95 @@ add_action('init', function() {
     }
 
     $action = sanitize_text_field($_POST['dinoco_finance_action']);
+
+    // -----------------------------------------
+    // M19: debt_reconciliation — compare stored debt vs recalculated
+    // -----------------------------------------
+    if ( $action === 'debt_reconciliation' ) {
+        if (ob_get_length()) ob_clean();
+        header('Content-Type: application/json; charset=utf-8');
+        if ( ! current_user_can('manage_options') ) { echo json_encode(['error'=>'ACCESS DENIED']); exit; }
+
+        $sub_action = sanitize_text_field( $_POST['sub_action'] ?? 'list' );
+
+        // LIST: compare stored debt vs recalculated for all distributors
+        if ( $sub_action === 'list' ) {
+            $dists = get_posts([ 'post_type'=>'distributor', 'post_status'=>'publish', 'posts_per_page'=>-1 ]);
+            $rows = [];
+            $total_drift = 0;
+            $drift_count = 0;
+            foreach ( $dists as $d ) {
+                $stored = round( floatval( get_field('current_debt', $d->ID) ), 2 );
+                $recalc = function_exists('b2b_recalculate_debt')
+                    ? round( floatval( b2b_recalculate_debt( $d->ID ) ), 2 )
+                    : $stored;
+                $delta = round( $stored - $recalc, 2 );
+                $name = get_field('shop_name', $d->ID) ?: $d->post_title;
+                $rows[] = [
+                    'id'      => $d->ID,
+                    'name'    => $name,
+                    'stored'  => $stored,
+                    'recalc'  => $recalc,
+                    'delta'   => $delta,
+                    'hold'    => (bool) get_field('credit_hold', $d->ID),
+                ];
+                if ( abs($delta) >= 1 ) { $total_drift += $delta; $drift_count++; }
+            }
+            usort( $rows, function($a,$b){ return abs($b['delta']) <=> abs($a['delta']); } );
+            echo json_encode([
+                'success'     => true,
+                'rows'        => $rows,
+                'total'       => count($rows),
+                'drift_count' => $drift_count,
+                'total_drift' => round($total_drift, 2),
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        // FORCE_RECALC: recalculate a single distributor's debt
+        if ( $sub_action === 'force_recalc' ) {
+            $dist_id = intval( $_POST['dist_id'] ?? 0 );
+            if ( ! $dist_id ) { echo json_encode(['success'=>false,'error'=>'Missing dist_id']); exit; }
+            $old = round( floatval( get_field('current_debt', $dist_id) ), 2 );
+            $new = function_exists('b2b_recalculate_debt')
+                ? round( floatval( b2b_recalculate_debt( $dist_id ) ), 2 )
+                : $old;
+            if ( function_exists('b2b_log') ) {
+                b2b_log( sprintf('[Recon] Force recalc dist #%d: stored=%.2f → recalc=%.2f (delta=%.2f)', $dist_id, $old, $new, $old - $new) );
+            }
+            echo json_encode([ 'success'=>true, 'old'=>$old, 'new'=>$new, 'delta'=>round($old - $new, 2) ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        // CSV_EXPORT: same data as list but as CSV download
+        if ( $sub_action === 'csv_export' ) {
+            $dists = get_posts([ 'post_type'=>'distributor', 'post_status'=>'publish', 'posts_per_page'=>-1 ]);
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename=debt-reconciliation-' . date('Y-m-d') . '.csv');
+            $out = fopen('php://output', 'w');
+            fwrite($out, "\xEF\xBB\xBF"); // UTF-8 BOM
+            fputcsv($out, ['ID', 'ร้าน', 'หนี้ (stored)', 'หนี้ (recalc)', 'ส่วนต่าง', 'Credit Hold']);
+            foreach ( $dists as $d ) {
+                $stored = round( floatval( get_field('current_debt', $d->ID) ), 2 );
+                $recalc = function_exists('b2b_recalculate_debt')
+                    ? round( floatval( b2b_recalculate_debt( $d->ID ) ), 2 )
+                    : $stored;
+                fputcsv($out, [
+                    $d->ID,
+                    get_field('shop_name', $d->ID) ?: $d->post_title,
+                    $stored,
+                    $recalc,
+                    round($stored - $recalc, 2),
+                    get_field('credit_hold', $d->ID) ? 'Y' : 'N',
+                ]);
+            }
+            fclose($out);
+            exit;
+        }
+
+        echo json_encode(['error'=>'Unknown sub_action: '.$sub_action]);
+        exit;
+    }
 
     // -----------------------------------------
     // (debug) test_ai — ทดสอบ AI connection
@@ -3383,11 +3472,101 @@ function dinoco_render_finance_dashboard() {
     };
 
     // =======================================
+    // M19: Debt Reconciliation UI
+    // =======================================
+    window.finLoadRecon = function() {
+        var $body = $('#fin-recon-body');
+        $body.html('<div style="text-align:center;padding:20px;color:#64748b;"><i class="fa-solid fa-spinner fa-spin"></i> กำลังตรวจสอบหนี้ทุกตัวแทน...</div>');
+        $.post(window.location.href, {
+            dinoco_finance_action: 'debt_reconciliation',
+            sub_action: 'list',
+            fin_nonce: FIN_NONCE
+        }, function(resp) {
+            if (!resp || !resp.success) {
+                $body.html('<div style="color:#dc2626;padding:20px;">โหลดข้อมูลไม่สำเร็จ</div>');
+                return;
+            }
+            var h = '<div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">';
+            h += '<div style="background:#f0fdf4;border-radius:8px;padding:10px 16px;flex:1;min-width:120px;"><div style="font-size:11px;color:#16a34a;">ตรวจแล้ว</div><div style="font-size:20px;font-weight:bold;color:#15803d;">'+resp.total+'</div></div>';
+            h += '<div style="background:'+(resp.drift_count>0?'#fef2f2':'#f0fdf4')+';border-radius:8px;padding:10px 16px;flex:1;min-width:120px;"><div style="font-size:11px;color:'+(resp.drift_count>0?'#dc2626':'#16a34a')+';">ส่วนต่าง > ฿1</div><div style="font-size:20px;font-weight:bold;color:'+(resp.drift_count>0?'#dc2626':'#15803d')+';">'+resp.drift_count+'</div></div>';
+            h += '<div style="background:#eff6ff;border-radius:8px;padding:10px 16px;flex:1;min-width:120px;"><div style="font-size:11px;color:#2563eb;">drift รวม</div><div style="font-size:20px;font-weight:bold;color:#1e40af;">฿'+Number(resp.total_drift).toLocaleString('th-TH',{minimumFractionDigits:2})+'</div></div>';
+            h += '</div>';
+            h += '<div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">';
+            h += '<thead><tr style="background:#f8fafc;"><th style="padding:8px;text-align:left;">ร้าน</th><th style="padding:8px;text-align:right;">Stored</th><th style="padding:8px;text-align:right;">Recalc</th><th style="padding:8px;text-align:right;">Delta</th><th style="padding:8px;text-align:center;">Hold</th><th style="padding:8px;">Action</th></tr></thead><tbody>';
+            resp.rows.forEach(function(r) {
+                var dc = Math.abs(r.delta) >= 1 ? '#dc2626' : '#16a34a';
+                h += '<tr style="border-bottom:1px solid #f1f5f9;" id="recon-row-'+r.id+'">';
+                h += '<td style="padding:6px 8px;">'+((r.name||'').replace(/</g,'&lt;'))+'</td>';
+                h += '<td style="padding:6px 8px;text-align:right;">฿'+Number(r.stored).toLocaleString('th-TH',{minimumFractionDigits:2})+'</td>';
+                h += '<td style="padding:6px 8px;text-align:right;">฿'+Number(r.recalc).toLocaleString('th-TH',{minimumFractionDigits:2})+'</td>';
+                h += '<td style="padding:6px 8px;text-align:right;color:'+dc+';font-weight:bold;">'+( r.delta > 0 ? '+' : '' )+'฿'+Number(r.delta).toLocaleString('th-TH',{minimumFractionDigits:2})+'</td>';
+                h += '<td style="padding:6px 8px;text-align:center;">'+(r.hold ? '<span style="color:#dc2626;">⛔</span>' : '✅')+'</td>';
+                h += '<td style="padding:6px 8px;"><button style="font-size:11px;padding:2px 8px;border:1px solid #e2e8f0;border-radius:4px;cursor:pointer;background:#fff;" onclick="finForceRecalc('+r.id+')">Recalc</button></td>';
+                h += '</tr>';
+            });
+            h += '</tbody></table></div>';
+            $body.html(h);
+        }, 'json');
+    };
+
+    window.finForceRecalc = function(distId) {
+        if (!confirm('Force recalculate debt for distributor #' + distId + '?')) return;
+        $.post(window.location.href, {
+            dinoco_finance_action: 'debt_reconciliation',
+            sub_action: 'force_recalc',
+            dist_id: distId,
+            fin_nonce: FIN_NONCE
+        }, function(resp) {
+            if (resp && resp.success) {
+                alert('✅ Recalculated: ฿' + resp.old + ' → ฿' + resp.new + ' (delta: ฿' + resp.delta + ')');
+                finLoadRecon();
+            } else {
+                alert('❌ ' + (resp && resp.error || 'Error'));
+            }
+        }, 'json');
+    };
+
+    window.finExportReconCSV = function() {
+        var form = document.createElement('form');
+        form.method = 'POST';
+        form.action = window.location.href;
+        form.style.display = 'none';
+        var fields = {dinoco_finance_action:'debt_reconciliation', sub_action:'csv_export', fin_nonce: FIN_NONCE};
+        for (var k in fields) {
+            var inp = document.createElement('input');
+            inp.type = 'hidden'; inp.name = k; inp.value = fields[k];
+            form.appendChild(inp);
+        }
+        document.body.appendChild(form);
+        form.submit();
+        document.body.removeChild(form);
+    };
+
+    // =======================================
     // Init
     // =======================================
     finLoad();
 })();
 </script>
+
+<!-- M19: Debt Reconciliation expandable section (below main dashboard) -->
+<div class="dnc-fin" style="margin-top:24px;">
+    <div style="background:#fff;border-radius:12px;border:1px solid #e2e8f0;overflow:hidden;">
+        <div style="padding:16px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #f1f5f9;cursor:pointer;" onclick="var b=document.getElementById('fin-recon-body');if(b.style.display==='none'){b.style.display='';finLoadRecon();}else{b.style.display='none';}">
+            <div>
+                <span style="font-size:15px;font-weight:700;color:#0f172a;">🔍 Debt Reconciliation</span>
+                <span style="font-size:12px;color:#64748b;margin-left:8px;">เปรียบเทียบหนี้ stored vs recalculated</span>
+            </div>
+            <div style="display:flex;gap:8px;">
+                <button style="font-size:12px;padding:4px 12px;border:1px solid #e2e8f0;border-radius:6px;cursor:pointer;background:#fff;color:#2563eb;" onclick="event.stopPropagation();finExportReconCSV();">📥 CSV</button>
+                <button style="font-size:12px;padding:4px 12px;border:1px solid #e2e8f0;border-radius:6px;cursor:pointer;background:#fff;color:#16a34a;" onclick="event.stopPropagation();finLoadRecon();">🔄 Refresh</button>
+            </div>
+        </div>
+        <div id="fin-recon-body" style="display:none;padding:16px 20px;">
+            <div style="text-align:center;padding:20px;color:#94a3b8;">คลิกหัวข้อด้านบนเพื่อเริ่มตรวจสอบ</div>
+        </div>
+    </div>
+</div>
 
     <?php
     return ob_get_clean();
