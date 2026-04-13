@@ -113,7 +113,7 @@
 | File | Version | DB_ID | Shortcode | Description |
 |------|---------|-------|-----------|-------------|
 | [Admin System] DINOCO Admin Dashboard | V.32.1 | 21 | `[dinoco_admin_dashboard]` | Command Center: KPIs, charts, pipeline, AI Inbox |
-| [Admin System] DINOCO Global Inventory Database | V.39.1 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center, 3-level hierarchy UI, catalog filter bar + type cards + context-aware modal |
+| [Admin System] DINOCO Global Inventory Database | V.42.22 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center, 3-level hierarchy UI, catalog filter bar + type cards + context-aware modal, leaf-based classification (stock/list + dip-stock) |
 | [Admin System] DINOCO Legacy Migration Requests | V.30.2 | 23 | `[dinoco_admin_legacy]` | Admin legacy migration manager |
 | [Admin System] DINOCO User Management | V.30.2 | 25 | `[dinoco_admin_users]` | CRM + full analytics |
 | [Admin System] DINOCO Manual Transfer Tool | V.30.2 | 26 | `[dinoco_admin_transfer]` | Force transfer warranty ownership |
@@ -164,7 +164,7 @@
 | Snippet 5: Admin Dashboard Tabs | V.4.6 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + smart picker + missing children + currency-aware, `[b2f_admin_credit_tab]` |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
-| Snippet 8: Admin LIFF E-Catalog | V.4.1 | 1168 | LIFF ordering + SET Detail View + Model Filter + ชุด(แม่)/แยกชุด(ลูก)/แยกข้าง(หลาน) filter |
+| Snippet 8: Admin LIFF E-Catalog | V.4.2 | 1168 | LIFF ordering + SET Detail View + Model Filter + ชุด(แม่)/แยกชุด(ลูก)/แยกข้าง(หลาน) filter + Case-insensitive hierarchy lookups |
 | Snippet 9: PO Ticket View | V.3.4 | 1169 | PO detail page + hierarchy SET grouping in items |
 | Snippet 10: PO Image Generator | V.2.6 | 1170 | A4 PO PNG + hierarchy SET header rows |
 | Snippet 11: Cron Jobs & Reminders | V.2.1 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
