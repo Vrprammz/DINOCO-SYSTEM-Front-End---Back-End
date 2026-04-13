@@ -161,7 +161,7 @@
 | Snippet 2: REST API | V.8.7 | 1165 | 20+ endpoints `/b2f/v1/*` + auth-admin JWT + hierarchy parent tracking |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.2 | 1167 | `[b2f_maker_liff]` -- LANG system + hierarchy SET grouping |
-| Snippet 5: Admin Dashboard Tabs | V.3.6 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + hierarchy badges, `[b2f_admin_credit_tab]` |
+| Snippet 5: Admin Dashboard Tabs | V.3.7 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view, `[b2f_admin_credit_tab]` |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
 | Snippet 8: Admin LIFF E-Catalog | V.3.1 | 1168 | LIFF ordering page + hierarchy product badges |
