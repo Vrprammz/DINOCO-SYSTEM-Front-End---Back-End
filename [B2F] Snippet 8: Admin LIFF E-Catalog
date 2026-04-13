@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 8: Admin LIFF E-Catalog                     ║
- * ║  Version: V.4.2 — Fix: case-insensitive hierarchy lookup     ║
+ * ║  Version: V.4.3 — DD-3: forward-lookup SET detail + filter   ║
  * ║  DB_ID: 1168                                                ║
  * ║  Route: /b2f-catalog/ (template_redirect, standalone HTML)  ║
  * ║  Auth: LIFF + LINE UID verify (V.2.0) or WP Admin session   ║
@@ -661,6 +661,7 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
   var makers = [];
   var products = [];
   var hierarchyMeta = {};
+  var skuRelations = {}; // V.4.3: forward lookup map from API
   var motoCatalog = [];
   var cart = {};
   var selectedMaker = null;
@@ -825,29 +826,35 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
     return '';
   }
 
-  // ── V.4.2: Build hierarchy lookup (case-insensitive) ──
-  // Build children/grandchildren relationships from flat product list
+  // ── V.4.3: Build hierarchy lookup using forward lookup (DD-3 shared child fix) ──
   function buildHierarchyLookup() {
     var lookup = { bysku: {}, setSkus: [], childrenOf: {}, grandchildrenOf: {} };
-    // V.4.2: uppercase keys for case-insensitive matching (parent_sku from PHP = UPPERCASE)
     products.forEach(function(p) { lookup.bysku[(p.sku || '').toUpperCase()] = p; });
     products.forEach(function(p) {
       var at = p.auto_type || p.product_type || 'single';
       if (at === 'set') {
         lookup.setSkus.push((p.sku || '').toUpperCase());
       }
-      // Build children -> parent mapping (uppercase keys)
-      var parentU = (p.parent_sku || '').toUpperCase();
-      if (parentU && lookup.bysku[parentU]) {
-        if (!lookup.childrenOf[parentU]) lookup.childrenOf[parentU] = [];
-        lookup.childrenOf[parentU].push(p);
-      }
-      // Build grandchildren -> top_parent mapping (uppercase keys)
-      var topU = (p.top_parent_sku || '').toUpperCase();
-      if (topU && parentU && topU !== parentU) {
-        if (!lookup.grandchildrenOf[parentU]) lookup.grandchildrenOf[parentU] = [];
-        lookup.grandchildrenOf[parentU].push(p);
-      }
+    });
+    // V.4.3: Forward lookup จาก skuRelations แทน reverse lookup จาก parent_sku
+    // DD-3 shared child: product อาจเป็นลูกของหลาย parent → forward lookup ถูกเสมอ
+    Object.keys(skuRelations).forEach(function(parentSku) {
+      var childSkus = skuRelations[parentSku] || [];
+      childSkus.forEach(function(childSku) {
+        var cp = lookup.bysku[childSku];
+        if (!cp) return;
+        // ถ้า parent เป็น SET (top-level) → childrenOf
+        // ถ้า parent มี parent อีกที → grandchildrenOf
+        if (!lookup.childrenOf[parentSku]) lookup.childrenOf[parentSku] = [];
+        lookup.childrenOf[parentSku].push(cp);
+        // Check if parent has a grandparent (= this is grandchild relation)
+        Object.keys(skuRelations).forEach(function(gpSku) {
+          if ((skuRelations[gpSku] || []).indexOf(parentSku) !== -1) {
+            if (!lookup.grandchildrenOf[parentSku]) lookup.grandchildrenOf[parentSku] = [];
+            lookup.grandchildrenOf[parentSku].push(cp);
+          }
+        });
+      });
     });
     return lookup;
   }
@@ -869,12 +876,13 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
       if (res.success && res.data) {
         products = res.data.filter(function(p) { return p.status === 'active'; });
         hierarchyMeta = res.hierarchy_meta || {};
+        skuRelations = res.sku_relations || {}; // V.4.3: forward lookup
         motoCatalog = res.moto_catalog || [];
         renderModelFilter();
         renderTypeChips();
         renderFilteredProducts();
       } else {
-        products = []; hierarchyMeta = {}; motoCatalog = [];
+        products = []; hierarchyMeta = {}; skuRelations = {}; motoCatalog = [];
         $modelRow.style.display = 'none';
         $typeChips.style.display = 'none';
         $productArea.innerHTML = '<div class="b2f-cat-empty"><div class="b2f-cat-empty-icon">&#128230;</div><div>ยังไม่มีสินค้าในโรงงานนี้</div></div>';
@@ -964,13 +972,22 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
     var filtered = products.filter(function(p) {
       var at = p.auto_type || p.product_type || 'single';
 
-      // V.4.1: เมื่อไม่ได้ filter type เจาะจง → ซ่อน child/gc ที่ SET อยู่ใน list (แสดงใน SET detail แทน)
-      // แต่ถ้า filter เป็น 'child' หรือ 'grandchild' → แสดงเพื่อให้ Admin สั่งแยกได้
+      // V.4.3: เมื่อไม่ได้ filter type เจาะจง → ซ่อน child/gc ที่ SET อยู่ใน list (แสดงใน SET detail แทน)
+      // DD-3 fix: ใช้ parent_skus (array) เช็คทุก SET parent ไม่ใช่แค่ top_parent_sku
       if (!filterType || filterType === 'set') {
         if (at === 'child' || at === 'grandchild') {
-          var topP = (p.top_parent_sku || p.parent_sku || '').toUpperCase();
-          if (topP && setSkusInList[topP]) return false;
-          if (p.parent_sku && setSkusInList[(p.parent_sku||'').toUpperCase()]) return false;
+          var pskus = p.parent_skus || [];
+          var hiddenBySet = false;
+          for (var pi = 0; pi < pskus.length; pi++) {
+            if (setSkusInList[(pskus[pi]||'').toUpperCase()]) { hiddenBySet = true; break; }
+          }
+          // Fallback: เช็ค top_parent_sku + parent_sku เดิม
+          if (!hiddenBySet) {
+            var topP = (p.top_parent_sku || p.parent_sku || '').toUpperCase();
+            if (topP && setSkusInList[topP]) hiddenBySet = true;
+            if (!hiddenBySet && p.parent_sku && setSkusInList[(p.parent_sku||'').toUpperCase()]) hiddenBySet = true;
+          }
+          if (hiddenBySet) return false;
         }
       }
 
@@ -1158,19 +1175,28 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
     var parentSkuU = (parentSku || '').toUpperCase(); // V.4.2: case-insensitive
     var csym = getMakerSymbol();
 
-    // Find direct children of this SET (V.4.2: case-insensitive compare)
-    var children = products.filter(function(p) {
-      return (p.parent_sku || '').toUpperCase() === parentSkuU && (p.product_type === 'child' || p.product_type === 'grandchild');
+    // V.4.3: Forward lookup — ใช้ skuRelations หา children ของ SET (DD-3 shared child fix)
+    var setChildSkus = skuRelations[parentSkuU] || [];
+    var productBySku = {};
+    products.forEach(function(p) { productBySku[(p.sku || '').toUpperCase()] = p; });
+
+    var children = [];
+    setChildSkus.forEach(function(childSku) {
+      var cp = productBySku[childSku];
+      if (cp) children.push(cp);
     });
 
-    // Also include grandchildren whose top_parent is this SET but parent is a child
+    // Also include grandchildren via forward lookup (intermediate child -> grandchild)
     var grandchildrenByParent = {};
-    products.forEach(function(p) {
-      if (p.product_type === 'grandchild' && (p.top_parent_sku || '').toUpperCase() === parentSkuU && (p.parent_sku || '').toUpperCase() !== parentSkuU) {
-        var pk = (p.parent_sku || '').toUpperCase();
-        if (!grandchildrenByParent[pk]) grandchildrenByParent[pk] = [];
-        grandchildrenByParent[pk].push(p);
-      }
+    setChildSkus.forEach(function(midSku) {
+      var gcSkus = skuRelations[midSku] || [];
+      gcSkus.forEach(function(gcSku) {
+        var gp = productBySku[gcSku];
+        if (gp) {
+          if (!grandchildrenByParent[midSku]) grandchildrenByParent[midSku] = [];
+          grandchildrenByParent[midSku].push(gp);
+        }
+      });
     });
 
     if (!children.length && !Object.keys(grandchildrenByParent).length) {
@@ -1319,16 +1345,30 @@ html, body { font-family: var(--b2f-font); background: var(--b2f-bg); color: var
             }
           });
         }
-        // Also check children in product list
-        products.forEach(function(p) {
-          var skuU = (sku||'').toUpperCase();
-          if (((p.parent_sku||'').toUpperCase() === skuU || (p.top_parent_sku||'').toUpperCase() === skuU) && cart[p.sku] && p.sku !== sku) {
-            var already = warnings.some(function(w) { return w.indexOf(p.sku) >= 0 || w.indexOf(p.product_name) >= 0; });
+        // V.4.3: Also check children via forward lookup (skuRelations) — DD-3 safe
+        var setSkuU = (sku||'').toUpperCase();
+        function _checkChildDup(childSku) {
+          var lc = childSku.toUpperCase();
+          // Check the child itself
+          if (cart[childSku] && childSku !== sku) {
+            var cp = cart[childSku];
+            var already = warnings.some(function(w) { return w.indexOf(childSku) >= 0 || w.indexOf(cp.product_name) >= 0; });
             if (!already) {
-              warnings.push('ชุด "' + (item.product_name || sku) + '" กับ "' + (cart[p.sku].product_name || p.sku) + '" อยู่ในตะกร้าทั้งคู่ (อาจสั่งซ้ำ)');
+              warnings.push('ชุด "' + (item.product_name || sku) + '" กับ "' + (cp.product_name || childSku) + '" อยู่ในตะกร้าทั้งคู่ (อาจสั่งซ้ำ)');
             }
           }
-        });
+          // Check grandchildren of this child
+          (skuRelations[lc] || []).forEach(function(gcSku) {
+            if (cart[gcSku] && gcSku !== sku) {
+              var gp = cart[gcSku];
+              var already2 = warnings.some(function(w) { return w.indexOf(gcSku) >= 0 || w.indexOf(gp.product_name) >= 0; });
+              if (!already2) {
+                warnings.push('ชุด "' + (item.product_name || sku) + '" กับ "' + (gp.product_name || gcSku) + '" อยู่ในตะกร้าทั้งคู่ (อาจสั่งซ้ำ)');
+              }
+            }
+          });
+        }
+        (skuRelations[setSkuU] || []).forEach(_checkChildDup);
       }
     });
     return warnings;

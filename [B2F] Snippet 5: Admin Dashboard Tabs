@@ -1,6 +1,6 @@
 /**
  * [B2F] Snippet 5: Admin Dashboard Tabs
- * Version: V.4.6 — UX: smart picker hides SET + hides leaf whose ancestor already registered
+ * Version: V.4.7 — DD-3 fix: forward-lookup grouping via sku_relations (shared child แสดงใต้ทุก SET)
  * DB_ID: 1166
  * Shortcodes: [b2f_admin_orders_tab], [b2f_admin_makers_tab], [b2f_admin_credit_tab]
  * Kill Switch: define('B2F_DISABLED', true)
@@ -2226,39 +2226,151 @@ add_shortcode( 'b2f_admin_makers_tab', function() {
                 html += '<span style="width:30px;"></span>';
                 html += '</div>';
 
-                // V.4.1 Hierarchy: 3-level tree ตรงกับ stock/list + Inventory UI
-                // API V.9.2 returns: product_type, auto_type, parent_sku, parent_name, grandparent_sku, top_parent_sku, top_parent_name
+                // V.4.7 Hierarchy: Forward-lookup grouping via sku_relations (DD-3 shared child fix)
+                // เดิมใช้ reverse lookup (top_parent_sku = single value) → shared child อยู่ใต้ SET เดียว
+                // ใหม่ใช้ forward lookup จาก sku_relations → shared child แสดงใต้ทุก SET ที่เป็นเจ้าของ
                 var setGroups = {};
                 var standalone = [];
                 var hierarchyMeta = res.hierarchy_meta || {};
+                var skuRelations = res.sku_relations || {}; // V.9.9: forward lookup map { PARENT: [CHILD, ...] }
 
+                // Build product lookup by SKU (uppercase)
+                var productBySku = {};
                 products.forEach(function(p) {
-                    // V.9.2: ใช้ auto_type สำหรับ grouping (product_type อาจถูก override จาก ui_role_override)
+                    productBySku[(p.sku || '').toUpperCase()] = p;
+                });
+
+                // Helper: resolve name for a SKU from product data or catalog name
+                function resolveSetName(sku) {
+                    var p = productBySku[sku];
+                    if (p) return p.product_name || p.sku || sku;
+                    // ถ้า SET ไม่อยู่ใน maker products → ใช้จาก hierarchy_meta
+                    var hm = hierarchyMeta[sku];
+                    if (hm && hm.set_name) return hm.set_name;
+                    return sku;
+                }
+
+                // Helper: ensure SET group exists
+                function ensureGroup(setSku) {
+                    if (!setGroups[setSku]) {
+                        setGroups[setSku] = {
+                            name: resolveSetName(setSku), sku: setSku,
+                            midGroups: {}, directLeaves: [], setProduct: null,
+                            _placedSkus: {} // track which SKUs already placed in this group
+                        };
+                    }
+                    return setGroups[setSku];
+                }
+
+                // Helper: place a product into a SET group at the correct level
+                function placeInGroup(setSku, p) {
+                    var g = ensureGroup(setSku);
+                    var pSku = (p.sku || '').toUpperCase();
+                    if (g._placedSkus[pSku]) return; // dedup
+                    g._placedSkus[pSku] = true;
+
+                    // Check if this product is a direct child of the SET or a grandchild
+                    var setChildren = skuRelations[setSku] || [];
+                    if (setChildren.indexOf(pSku) !== -1) {
+                        // Direct child of this SET
+                        g.directLeaves.push(p);
+                    } else {
+                        // Grandchild: find which intermediate child owns this product
+                        var parentSku = '';
+                        for (var ci = 0; ci < setChildren.length; ci++) {
+                            var midSku = setChildren[ci];
+                            var midChildren = skuRelations[midSku] || [];
+                            if (midChildren.indexOf(pSku) !== -1) {
+                                parentSku = midSku;
+                                break;
+                            }
+                        }
+                        if (parentSku) {
+                            if (!g.midGroups[parentSku]) {
+                                var midProd = productBySku[parentSku];
+                                var midName = midProd ? (midProd.product_name || parentSku) : (p.parent_name || parentSku);
+                                g.midGroups[parentSku] = { name: midName, items: [] };
+                            }
+                            g.midGroups[parentSku].items.push(p);
+                        } else {
+                            // Fallback: ไม่พบ intermediate → ใส่ directLeaves
+                            g.directLeaves.push(p);
+                        }
+                    }
+                }
+
+                // Step 1: Identify all SET products + create groups
+                products.forEach(function(p) {
                     var pt = p.auto_type || p.product_type || 'single';
-                    var topSku = (p.top_parent_sku || '').trim().toUpperCase();
-                    var topName = p.top_parent_name || topSku || '';
+                    if (pt === 'set') {
+                        var sk = (p.sku || '').toUpperCase();
+                        var g = ensureGroup(sk);
+                        g.setProduct = p;
+                        g.name = p.product_name || p.sku || sk;
+                    }
+                });
+
+                // Step 2: Forward lookup — สำหรับแต่ละ SET ใน skuRelations, หา children/grandchildren ที่อยู่ใน products
+                // นี่คือ key fix: shared child ถูกเพิ่มเข้าทุก SET ที่เป็นเจ้าของ
+                var placedSkus = {}; // track globally placed SKUs (product can be in multiple groups)
+
+                Object.keys(skuRelations).forEach(function(parentSku) {
+                    // หา top-level SET ที่ parentSku สังกัด
+                    // ถ้า parentSku เป็น SET (มี children + ไม่มี parent เอง) → group = parentSku
+                    // ถ้า parentSku เป็น intermediate → หา grandparent
+                    var topSku = parentSku;
+                    // Walk up: ถ้า parent ของ parentSku มีอยู่ใน relations → นั่นคือ SET
+                    Object.keys(skuRelations).forEach(function(maybeGP) {
+                        var gpChildren = skuRelations[maybeGP];
+                        if (gpChildren.indexOf(parentSku) !== -1) {
+                            topSku = maybeGP;
+                        }
+                    });
+
+                    // เฉพาะ top-level SET เท่านั้นที่สร้าง group
+                    // intermediate nodes ถูกจัดการผ่าน placeInGroup
+                });
+
+                // Step 3: Place products into groups using forward lookup
+                products.forEach(function(p) {
+                    var pt = p.auto_type || p.product_type || 'single';
+                    var pSku = (p.sku || '').toUpperCase();
 
                     if (pt === 'set') {
-                        // SET ตัวเอง → สร้าง group header (Maker อาจลงทะเบียน SET ด้วย)
-                        var sk = (p.sku||'').toUpperCase();
-                        if (!setGroups[sk]) setGroups[sk] = { name: p.product_name||p.sku, sku: sk, midGroups: {}, directLeaves: [], setProduct: null };
-                        setGroups[sk].setProduct = p; // ตัว SET เอง (ถ้ามี)
-                    } else if (pt === 'child' && topSku) {
-                        // child: top_parent = SET parent
-                        if (!setGroups[topSku]) setGroups[topSku] = { name: topName, sku: topSku, midGroups: {}, directLeaves: [], setProduct: null };
-                        setGroups[topSku].directLeaves.push(p);
-                    } else if (pt === 'grandchild' && topSku) {
-                        // grandchild: group ใต้ parent (ลูก) ภายใน SET (แม่)
-                        if (!setGroups[topSku]) setGroups[topSku] = { name: topName, sku: topSku, midGroups: {}, directLeaves: [], setProduct: null };
-                        var parentSku = (p.parent_sku || '').trim().toUpperCase();
-                        if (parentSku && parentSku !== topSku) {
-                            if (!setGroups[topSku].midGroups[parentSku]) {
-                                var midName = p.parent_name || parentSku;
-                                setGroups[topSku].midGroups[parentSku] = { name: midName, items: [] };
-                            }
-                            setGroups[topSku].midGroups[parentSku].items.push(p);
+                        // Already handled in Step 1
+                        placedSkus[pSku] = true;
+                    } else if (pt === 'child' || pt === 'grandchild') {
+                        // DD-3 fix: ใช้ parent_skus (array) จาก API เพื่อหาทุก SET ที่เป็นเจ้าของ
+                        var parentSkus = p.parent_skus || [];
+                        if (!parentSkus.length && p.top_parent_sku) {
+                            parentSkus = [p.top_parent_sku.trim().toUpperCase()];
+                        }
+
+                        // สำหรับแต่ละ parent → หา top-level SET แล้ว place
+                        var topSets = {};
+                        parentSkus.forEach(function(ps) {
+                            ps = ps.trim().toUpperCase();
+                            // หา top-level SET ของ parent นี้
+                            var top = ps;
+                            // ถ้า ps มี parent อีกทีใน skuRelations → walk up
+                            Object.keys(skuRelations).forEach(function(maybeParent) {
+                                if ((skuRelations[maybeParent] || []).indexOf(ps) !== -1) {
+                                    top = maybeParent;
+                                }
+                            });
+                            topSets[top] = true;
+                        });
+
+                        var placed = false;
+                        Object.keys(topSets).forEach(function(tsk) {
+                            placeInGroup(tsk, p);
+                            placed = true;
+                        });
+
+                        if (placed) {
+                            placedSkus[pSku] = true;
                         } else {
-                            setGroups[topSku].directLeaves.push(p);
+                            standalone.push(p);
                         }
                     } else {
                         standalone.push(p);
