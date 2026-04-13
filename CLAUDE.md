@@ -206,10 +206,10 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **B2F Snippets** (DB_ID 1160-1171):
   - Snippet 0 (1160): CPT & ACF Registration — 5 CPTs + helpers + `b2f_get_maker_by_group()` (cached 5min/1hr)
   - Snippet 1 (1163): Core Utilities & Flex Builders V.6.0 — LINE push + 22 Flex templates + `b2f_liff_url()` (HMAC sig) + i18n ENG/TH/ZH (currency != THB = ENG/ZH)
-  - Snippet 2 (1165): REST API V.8.2 — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin) + concurrent locks (po-cancel, maker-deliver) + is_complete หัก rejected + payment fallback THB + `reject-resolve` endpoint + po-cancel ไม่ลบ PO (FSM transition + stock restore + audit trail)
+  - Snippet 2 (1165): REST API V.9.2 — 20+ endpoints namespace `/b2f/v1/` + `auth-admin` (LIFF auth for Admin) + concurrent locks (po-cancel, maker-deliver) + is_complete หัก rejected + payment fallback THB + `reject-resolve` endpoint + po-cancel ไม่ลบ PO (FSM transition + stock restore + audit trail) + V.9.2: `b2f_build_hierarchy_context()` pre-compute maps once, `auto_type` สำหรับ grouping (ui_role_override safe), `hierarchy_meta` return missing leaves per SET
   - Snippet 3 (1164): Webhook Handler & Bot Commands — Maker commands + Admin B2F commands + Flex menu (self-contained)
   - Snippet 4 (1167): Maker LIFF Pages V.4.0 — shortcode `[b2f_maker_liff]` route `/b2f-maker/` + LANG system (`_isEng` + `L()` for non-THB currency makers)
-  - Snippet 5 (1166): Admin Dashboard Tabs V.3.1 — 3 shortcodes embedded ใน Admin Dashboard + Bulk Cancel PO (V.2.0) + Multi-Currency UI (V.3.0) + Settings REST endpoint + receive form remaining fix (shipped-received)
+  - Snippet 5 (1166): Admin Dashboard Tabs V.4.1 — 3 shortcodes embedded ใน Admin Dashboard + Bulk Cancel PO (V.2.0) + Multi-Currency UI (V.3.0) + Settings REST endpoint + receive form remaining fix (shipped-received) + V.4.1: use `auto_type` for grouping (ui_role_override safe) + missing children warning badge + `addMissingLeaves()` quick-add
   - Snippet 6 (1161): Order State Machine — `B2F_Order_FSM` class
   - Snippet 7 (1162): Credit Transaction Manager — atomic `b2f_payable_add/subtract()`, credit เกิดตอน receive-goods เท่านั้น (ไม่หักตอน create-po), `b2f_recalculate_payable()` คำนวณจาก `rcv_total_value` ของ receiving records
   - Snippet 8 (1168): Admin LIFF E-Catalog — หน้าสั่งซื้อจาก LINE (LIFF auth V.2.0 ไม่ต้อง WP login) + Multi-Currency UI (V.3.0)

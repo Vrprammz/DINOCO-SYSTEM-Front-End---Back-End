@@ -539,7 +539,7 @@ $transitions = array(
 | GET | `/makers` | admin | รายชื่อ Maker ทั้งหมด |
 | POST | `/maker` | admin | สร้าง/แก้ไข Maker |
 | POST | `/maker/delete` | admin | ลบ Maker (soft delete) |
-| GET | `/maker-products/{maker_id}` | admin | SKU ที่ Maker ผลิต + ราคาทุน |
+| GET | `/maker-products/{maker_id}` | admin | SKU ที่ Maker ผลิต + ราคาทุน + `hierarchy_meta` (V.9.2: missing leaves per SET) |
 | POST | `/maker-product` | admin | สร้าง/แก้ไข Maker-SKU mapping |
 | POST | `/maker-product/delete` | admin | ลบ mapping |
 | POST | `/create-po` | admin | สร้าง Purchase Order |
