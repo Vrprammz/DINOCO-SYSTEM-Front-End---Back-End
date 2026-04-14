@@ -156,16 +156,16 @@
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
-| Snippet 0: CPT & ACF Registration | V.3.2 | 1160 | 5 CPTs + ACF fields + helpers + group cache + poi_parent_sku/name |
-| Snippet 1: Core Utilities & Flex Builders | V.6.2 | 1163 | LINE push, 22 Flex templates, LIFF URL (HMAC), i18n 3-lang, b2f_group_items_by_set() hierarchy helper (DRY) |
-| Snippet 2: REST API | V.9.7 | 1165 | 20+ endpoints `/b2f/v1/*` + auth-admin JWT + leaf-based classification (match JS computeProductTypes) + hierarchy_meta + direct_children_count + grandchildren_total |
+| Snippet 0: CPT & ACF Registration | V.3.3 | 1160 | 5 CPTs + ACF + poi_parent_sku/name + poi_parent_breakdown (DD-3 JSON) |
+| Snippet 1: Core Utilities & Flex Builders | V.6.4 | 1163 | 22 Flex templates + b2f_group_items_by_set (DD-3) + b2f_get_item_breakdown + b2f_compute_manufacturing_summary |
+| Snippet 2: REST API | V.9.10 | 1165 | 20+ endpoints + DD-7 breakdown collection + parent_breakdown JSON save/return |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.2 | 1167 | `[b2f_maker_liff]` -- LANG system + hierarchy SET grouping |
-| Snippet 5: Admin Dashboard Tabs | V.4.6 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + smart picker + missing children + currency-aware, `[b2f_admin_credit_tab]` |
+| Snippet 5: Admin Dashboard Tabs | V.5.0 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
-| Snippet 8: Admin LIFF E-Catalog | V.4.2 | 1168 | LIFF ordering + SET Detail View + Model Filter + ชุด(แม่)/แยกชุด(ลูก)/แยกข้าง(หลาน) filter + Case-insensitive hierarchy lookups |
-| Snippet 9: PO Ticket View | V.3.4 | 1169 | PO detail page + hierarchy SET grouping in items |
+| Snippet 8: Admin LIFF E-Catalog | V.5.0 | 1168 | LIFF ordering + SET Detail View + Model Filter + ชุด/แยกชุด/แยกข้าง filter + shared badge + cart manufacturing summary (DD-3) |
+| Snippet 9: PO Ticket View | V.3.5 | 1169 | PO detail + hierarchy SET grouping + view toggle (ตามชุด/ยอดรวมผลิต) (DD-3) |
 | Snippet 10: PO Image Generator | V.2.6 | 1170 | A4 PO PNG + hierarchy SET header rows |
 | Snippet 11: Cron Jobs & Reminders | V.2.1 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
 
