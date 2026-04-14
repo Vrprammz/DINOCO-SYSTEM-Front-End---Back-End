@@ -113,7 +113,7 @@
 | File | Version | DB_ID | Shortcode | Description |
 |------|---------|-------|-----------|-------------|
 | [Admin System] DINOCO Admin Dashboard | V.32.1 | 21 | `[dinoco_admin_dashboard]` | Command Center: KPIs, charts, pipeline, AI Inbox |
-| [Admin System] DINOCO Global Inventory Database | V.42.22 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center, 3-level hierarchy UI, catalog filter bar + type cards + context-aware modal, leaf-based classification (stock/list + dip-stock) |
+| [Admin System] DINOCO Global Inventory Database | V.42.25 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center, 3-level hierarchy UI, catalog filter bar + type cards + context-aware modal, leaf-based classification + DD-3 shared child duplicate DOM rows in Stock Mgmt (V.42.25) |
 | [Admin System] DINOCO Legacy Migration Requests | V.30.2 | 23 | `[dinoco_admin_legacy]` | Admin legacy migration manager |
 | [Admin System] DINOCO User Management | V.30.2 | 25 | `[dinoco_admin_users]` | CRM + full analytics |
 | [Admin System] DINOCO Manual Transfer Tool | V.30.2 | 26 | `[dinoco_admin_transfer]` | Force transfer warranty ownership |
@@ -161,7 +161,7 @@
 | Snippet 2: REST API | V.9.10 | 1165 | 20+ endpoints + DD-7 breakdown collection + parent_breakdown JSON save/return |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.2 | 1167 | `[b2f_maker_liff]` -- LANG system + hierarchy SET grouping |
-| Snippet 5: Admin Dashboard Tabs | V.5.0 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary |
+| Snippet 5: Admin Dashboard Tabs | V.5.1 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary + resolveSetName 4-level fallback (hotfix) |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
 | Snippet 8: Admin LIFF E-Catalog | V.5.0 | 1168 | LIFF ordering + SET Detail View + Model Filter + ชุด/แยกชุด/แยกข้าง filter + shared badge + cart manufacturing summary (DD-3) |
