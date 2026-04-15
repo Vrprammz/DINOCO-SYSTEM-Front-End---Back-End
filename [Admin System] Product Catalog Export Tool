@@ -1,0 +1,509 @@
+/*
+ * File: [Admin System] Product Catalog Export Tool
+ * Template Name: [Admin System] Product Catalog Export Tool
+ * Shortcode: (none — REST-only)
+ * Version: V.1.0 — Initial Export Tool (Phase 1 — baseline snapshot ก่อน architecture rework)
+ * DB_ID: (auto-assigned by WP after sync)
+ * Author: DINOCO Tech Lead
+ *
+ * PURPOSE
+ *   Baseline export ของ Product Catalog state ก่อนเปลี่ยน B2F maker architecture
+ *   ให้ทีม review ข้อมูลจริงก่อน decide (Option A vs C vs F)
+ *
+ * SCOPE
+ *   - ทุก SKU ใน wp_dinoco_products (ประมาณ ~153 rows)
+ *   - sku_relations (parent → children map)
+ *   - per-maker b2f_maker_product CPT (unit_cost, moq, lead_time, shipping, status)
+ *
+ * ENDPOINTS (namespace: dinoco-export/v1)
+ *   GET /wp-json/dinoco-export/v1/catalog?format=json|csv|tree&key=SECRET
+ *   GET /wp-json/dinoco-export/v1/makers?format=csv&key=SECRET
+ *   GET /wp-json/dinoco-export/v1/health
+ *
+ * AUTH
+ *   - ถ้า user logged-in + manage_options → pass
+ *   - ถ้าไม่ → ต้องส่ง ?key=<SECRET>
+ *     SECRET = constant DINOCO_EXPORT_KEY (ถ้า define) หรือ auto-gen wp_option 'dinoco_export_key' (32 bytes)
+ *   - rate limit 20 req/hour per IP (transient)
+ *
+ * SECURITY NOTES
+ *   - cost data (mp_unit_cost) = confidential — auth บังคับ
+ *   - secret key rotate ได้ผ่าน GET /health?rotate=1 (admin only)
+ *   - Content-Disposition: attachment → browser download
+ *   - ข้อมูลทั้งหมดส่งผ่าน HTTPS (WP config บังคับ)
+ */
+
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) {
+    // B2F disabled — export tool still useful for Product Catalog only.
+    // ไม่ early-return — ให้ /catalog ใช้ได้ แต่ /makers จะ return empty.
+}
+
+// ------------------------------------------------------------------
+// Helper: obtain or rotate secret key
+// ------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_export_get_secret' ) ) {
+    function dinoco_export_get_secret( $rotate = false ) {
+        if ( defined( 'DINOCO_EXPORT_KEY' ) && DINOCO_EXPORT_KEY ) {
+            return DINOCO_EXPORT_KEY; // constant wins — cannot rotate
+        }
+        $opt = get_option( 'dinoco_export_key', '' );
+        if ( $rotate || ! $opt ) {
+            $opt = bin2hex( random_bytes( 16 ) ); // 32 char hex
+            update_option( 'dinoco_export_key', $opt, false );
+        }
+        return $opt;
+    }
+}
+
+// ------------------------------------------------------------------
+// Helper: auth check (admin OR secret key)
+// ------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_export_auth_check' ) ) {
+    function dinoco_export_auth_check( $request ) {
+        // Rate limit per IP — 20 req / hour
+        $ip = isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : 'unknown';
+        $tk = 'dinoco_export_rl_' . md5( $ip );
+        $ct = (int) get_transient( $tk );
+        if ( $ct >= 20 ) {
+            return new WP_Error( 'rate_limited', 'Too many requests. Try later.', array( 'status' => 429 ) );
+        }
+        set_transient( $tk, $ct + 1, HOUR_IN_SECONDS );
+
+        // Admin path
+        if ( is_user_logged_in() && current_user_can( 'manage_options' ) ) return true;
+
+        // Secret key path
+        $provided = $request->get_param( 'key' );
+        if ( ! $provided ) return new WP_Error( 'no_auth', 'Missing auth (login or ?key=)', array( 'status' => 401 ) );
+
+        $expected = dinoco_export_get_secret();
+        if ( ! hash_equals( (string) $expected, (string) $provided ) ) {
+            return new WP_Error( 'bad_key', 'Invalid key', array( 'status' => 403 ) );
+        }
+        return true;
+    }
+}
+
+// ------------------------------------------------------------------
+// Helper: build full product catalog snapshot
+// ------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_export_build_catalog_snapshot' ) ) {
+    function dinoco_export_build_catalog_snapshot() {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_products';
+
+        $rows = $wpdb->get_results( "SELECT * FROM {$tbl} ORDER BY sku ASC", ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        $relations = get_option( 'dinoco_sku_relations', array() );
+        if ( ! is_array( $relations ) ) $relations = array();
+
+        // Build reverse index parent_of[child_sku][] = parent_sku
+        $parent_of = array();
+        foreach ( $relations as $parent_sku => $children ) {
+            if ( ! is_array( $children ) ) continue;
+            foreach ( $children as $c ) {
+                $cu = strtoupper( (string) $c );
+                $pu = strtoupper( (string) $parent_sku );
+                if ( ! isset( $parent_of[ $cu ] ) ) $parent_of[ $cu ] = array();
+                $parent_of[ $cu ][] = $pu;
+            }
+        }
+
+        // Decorate rows
+        $out = array();
+        foreach ( $rows as $r ) {
+            $sku_u   = strtoupper( (string) $r['sku'] );
+            $rel_u   = isset( $relations[ $sku_u ] ) ? $relations[ $sku_u ] : ( isset( $relations[ $r['sku'] ] ) ? $relations[ $r['sku'] ] : array() );
+            $parents = isset( $parent_of[ $sku_u ] ) ? array_values( array_unique( $parent_of[ $sku_u ] ) ) : array();
+
+            $children = is_array( $rel_u ) ? array_values( $rel_u ) : array();
+            $is_set   = ! empty( $children );
+            $is_leaf  = empty( $children );
+
+            // compatible_models parse
+            $cm = isset( $r['compatible_models'] ) ? (string) $r['compatible_models'] : '';
+            $cm_arr = array();
+            if ( $cm ) {
+                $decoded = json_decode( $cm, true );
+                if ( is_array( $decoded ) ) {
+                    $cm_arr = $decoded;
+                } else {
+                    $cm_arr = array_filter( array_map( 'trim', explode( ',', $cm ) ) );
+                }
+            }
+
+            $out[] = array(
+                'sku'                  => $r['sku'],
+                'name'                 => isset( $r['name'] ) ? $r['name'] : '',
+                'category'             => isset( $r['category'] ) ? $r['category'] : '',
+                'image_url'            => isset( $r['image_url'] ) ? $r['image_url'] : '',
+                'base_price'           => isset( $r['base_price'] ) ? (float) $r['base_price'] : 0,
+                'price_silver_pct'     => isset( $r['price_silver'] ) ? (float) $r['price_silver'] : 0,
+                'price_gold_pct'       => isset( $r['price_gold'] ) ? (float) $r['price_gold'] : 0,
+                'price_platinum_pct'   => isset( $r['price_platinum'] ) ? (float) $r['price_platinum'] : 0,
+                'price_diamond_pct'    => isset( $r['price_diamond'] ) ? (float) $r['price_diamond'] : 0,
+                'b2b_discount_percent' => isset( $r['b2b_discount_percent'] ) ? (float) $r['b2b_discount_percent'] : 0,
+                'boxes_per_unit'       => isset( $r['boxes_per_unit'] ) ? (int) $r['boxes_per_unit'] : 1,
+                'units_per_box'        => isset( $r['units_per_box'] ) ? (int) $r['units_per_box'] : 1,
+                'min_order_qty'        => isset( $r['min_order_qty'] ) ? (int) $r['min_order_qty'] : 1,
+                'stock_qty'            => isset( $r['stock_qty'] ) ? (int) $r['stock_qty'] : 0,
+                'stock_status'         => isset( $r['stock_status'] ) ? $r['stock_status'] : '',
+                'oos_timestamp'        => isset( $r['oos_timestamp'] ) ? ( $r['oos_timestamp'] ? (int) $r['oos_timestamp'] : null ) : null,
+                'oos_duration_hours'   => isset( $r['oos_duration_hours'] ) ? ( $r['oos_duration_hours'] !== null ? (int) $r['oos_duration_hours'] : null ) : null,
+                'oos_eta_date'         => isset( $r['oos_eta_date'] ) ? $r['oos_eta_date'] : null,
+                'is_active'            => isset( $r['is_active'] ) ? (int) $r['is_active'] : 1,
+                'b2b_visible'          => isset( $r['b2b_visible'] ) ? (int) $r['b2b_visible'] : 1,
+                'ui_role_override'     => isset( $r['ui_role_override'] ) ? $r['ui_role_override'] : 'auto',
+                'compatible_models'    => $cm_arr,
+                'last_dip_stock_qty'   => isset( $r['last_dip_stock_qty'] ) ? ( $r['last_dip_stock_qty'] !== null ? (int) $r['last_dip_stock_qty'] : null ) : null,
+                'children'             => $children,
+                'parents'              => $parents,
+                'is_set'               => $is_set,
+                'is_leaf'              => $is_leaf,
+                'shared_child'         => count( $parents ) > 1,
+            );
+        }
+
+        return array(
+            'snapshot_at'     => gmdate( 'c' ),
+            'total_products'  => count( $out ),
+            'total_relations' => count( $relations ),
+            'products'        => $out,
+            'sku_relations'   => $relations,
+        );
+    }
+}
+
+// ------------------------------------------------------------------
+// Helper: build b2f maker products snapshot
+// ------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_export_build_makers_snapshot' ) ) {
+    function dinoco_export_build_makers_snapshot() {
+        // Guard: if b2f_maker_product CPT not registered → return empty shell
+        if ( ! post_type_exists( 'b2f_maker_product' ) ) {
+            return array(
+                'snapshot_at' => gmdate( 'c' ),
+                'total'       => 0,
+                'items'       => array(),
+                'note'        => 'b2f_maker_product CPT not registered (B2F_DISABLED or Snippet 0 missing)',
+            );
+        }
+
+        // Fetch all b2f_maker_product posts + their parent maker info
+        $posts = get_posts( array(
+            'post_type'      => 'b2f_maker_product',
+            'posts_per_page' => -1,
+            'post_status'    => array( 'publish', 'draft', 'private' ),
+            'orderby'        => 'ID',
+            'order'          => 'ASC',
+            'fields'         => 'ids',
+        ) );
+
+        $items = array();
+        // Cache maker meta lookups
+        $maker_cache = array();
+
+        foreach ( $posts as $pid ) {
+            $maker_id   = (int) get_field( 'mp_maker_id', $pid );
+            $sku        = (string) get_field( 'mp_product_sku', $pid );
+            $unit_cost  = get_field( 'mp_unit_cost', $pid );
+            $moq        = get_field( 'mp_moq', $pid );
+            $lead_days  = get_field( 'mp_lead_time_days', $pid );
+            $ship_land  = get_field( 'mp_shipping_land', $pid );
+            $ship_sea   = get_field( 'mp_shipping_sea', $pid );
+            $status     = get_field( 'mp_status', $pid );
+
+            // Maker name/currency — cache
+            $maker_name = '';
+            $maker_cur  = '';
+            $maker_grp  = '';
+            if ( $maker_id ) {
+                if ( ! isset( $maker_cache[ $maker_id ] ) ) {
+                    $maker_post = get_post( $maker_id );
+                    $maker_cache[ $maker_id ] = array(
+                        'name'     => $maker_post ? $maker_post->post_title : '',
+                        'currency' => (string) get_field( 'maker_currency', $maker_id ),
+                        'group_id' => (string) get_field( 'maker_group_id', $maker_id ),
+                    );
+                }
+                $maker_name = $maker_cache[ $maker_id ]['name'];
+                $maker_cur  = $maker_cache[ $maker_id ]['currency'];
+                $maker_grp  = $maker_cache[ $maker_id ]['group_id'];
+            }
+
+            $items[] = array(
+                'mp_post_id'        => $pid,
+                'maker_id'          => $maker_id,
+                'maker_name'        => $maker_name,
+                'maker_currency'    => $maker_cur,
+                'maker_group_id'    => $maker_grp,
+                'sku'               => $sku,
+                'mp_unit_cost'      => $unit_cost !== '' && $unit_cost !== null ? (float) $unit_cost : null,
+                'mp_moq'            => $moq !== '' && $moq !== null ? (int) $moq : null,
+                'mp_lead_time_days' => $lead_days !== '' && $lead_days !== null ? (int) $lead_days : null,
+                'mp_shipping_land'  => $ship_land !== '' && $ship_land !== null ? (float) $ship_land : 0,
+                'mp_shipping_sea'   => $ship_sea  !== '' && $ship_sea  !== null ? (float) $ship_sea  : 0,
+                'mp_status'         => $status ? $status : 'active',
+                'post_status'       => get_post_status( $pid ),
+                'post_date'         => get_post_field( 'post_date_gmt', $pid ),
+                'post_modified'     => get_post_field( 'post_modified_gmt', $pid ),
+            );
+        }
+
+        return array(
+            'snapshot_at' => gmdate( 'c' ),
+            'total'       => count( $items ),
+            'items'       => $items,
+        );
+    }
+}
+
+// ------------------------------------------------------------------
+// Helper: build human-readable hierarchy tree (text)
+// ------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_export_build_hierarchy_tree' ) ) {
+    function dinoco_export_build_hierarchy_tree() {
+        $snap = dinoco_export_build_catalog_snapshot();
+        $by_sku = array();
+        foreach ( $snap['products'] as $p ) {
+            $by_sku[ strtoupper( $p['sku'] ) ] = $p;
+        }
+
+        // Find top-level SETs (is_set=true AND not a child of anyone)
+        $tops = array();
+        foreach ( $snap['products'] as $p ) {
+            if ( $p['is_set'] && empty( $p['parents'] ) ) {
+                $tops[] = strtoupper( $p['sku'] );
+            }
+        }
+        // Orphan singles (no parents + no children)
+        $singles = array();
+        foreach ( $snap['products'] as $p ) {
+            if ( empty( $p['parents'] ) && ! $p['is_set'] ) {
+                $singles[] = strtoupper( $p['sku'] );
+            }
+        }
+
+        $lines = array();
+        $lines[] = 'DINOCO Product Catalog — Hierarchy Tree';
+        $lines[] = 'Exported: ' . $snap['snapshot_at'];
+        $lines[] = 'Total products: ' . $snap['total_products'] . ' | SKU relations (parents): ' . $snap['total_relations'];
+        $lines[] = str_repeat( '=', 72 );
+        $lines[] = '';
+        $lines[] = '# TOP-LEVEL SETs (' . count( $tops ) . ')';
+        $lines[] = '';
+
+        $render = function( $sku_u, $depth, $visited ) use ( &$render, &$lines, $by_sku ) {
+            if ( in_array( $sku_u, $visited, true ) ) {
+                $lines[] = str_repeat( '  ', $depth ) . '[!CIRCULAR] ' . $sku_u;
+                return;
+            }
+            $visited[] = $sku_u;
+            $p = isset( $by_sku[ $sku_u ] ) ? $by_sku[ $sku_u ] : null;
+            $indent = str_repeat( '  ', $depth );
+            $marker = $depth === 0 ? '■' : ( $p && $p['is_set'] ? '▸' : '•' );
+            $tag = '';
+            if ( $p ) {
+                $type = $p['is_set'] ? 'SET' : ( ! empty( $p['parents'] ) ? 'LEAF' : 'SINGLE' );
+                $shared = $p['shared_child'] ? ' [SHARED×' . count( $p['parents'] ) . ']' : '';
+                $override = $p['ui_role_override'] !== 'auto' ? ' [override=' . $p['ui_role_override'] . ']' : '';
+                $price = '฿' . number_format( (float) $p['base_price'], 0 );
+                $tag = "  ({$type}, {$price}, stock={$p['stock_qty']}{$shared}{$override})";
+                $name = $p['name'] ? ' — ' . $p['name'] : '';
+            } else {
+                $tag = '  (MISSING from dinoco_products!)';
+                $name = '';
+            }
+            $lines[] = $indent . $marker . ' ' . $sku_u . $name . $tag;
+            if ( $p && ! empty( $p['children'] ) ) {
+                foreach ( $p['children'] as $c ) {
+                    $render( strtoupper( $c ), $depth + 1, $visited );
+                }
+            }
+        };
+
+        foreach ( $tops as $t ) {
+            $render( $t, 0, array() );
+            $lines[] = '';
+        }
+
+        $lines[] = '';
+        $lines[] = '# SINGLE SKUs (no hierarchy) — ' . count( $singles );
+        $lines[] = '';
+        foreach ( $singles as $s ) {
+            $p = isset( $by_sku[ $s ] ) ? $by_sku[ $s ] : null;
+            if ( ! $p ) continue;
+            $override = $p['ui_role_override'] !== 'auto' ? ' [override=' . $p['ui_role_override'] . ']' : '';
+            $lines[] = '• ' . $s . ' — ' . $p['name'] . '  (฿' . number_format( (float) $p['base_price'], 0 ) . ", stock={$p['stock_qty']}{$override})";
+        }
+
+        return implode( "\n", $lines ) . "\n";
+    }
+}
+
+// ------------------------------------------------------------------
+// Helper: catalog snapshot → CSV
+// ------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_export_catalog_to_csv' ) ) {
+    function dinoco_export_catalog_to_csv( $snap ) {
+        $fh = fopen( 'php://temp', 'r+' );
+        $cols = array(
+            'sku', 'name', 'category', 'image_url',
+            'base_price', 'price_silver_pct', 'price_gold_pct', 'price_platinum_pct', 'price_diamond_pct', 'b2b_discount_percent',
+            'stock_qty', 'stock_status', 'oos_timestamp', 'oos_duration_hours', 'oos_eta_date',
+            'boxes_per_unit', 'units_per_box', 'min_order_qty',
+            'is_active', 'b2b_visible', 'ui_role_override',
+            'compatible_models', 'children', 'parents', 'is_set', 'is_leaf', 'shared_child',
+        );
+        fputcsv( $fh, $cols );
+        foreach ( $snap['products'] as $p ) {
+            $row = array();
+            foreach ( $cols as $c ) {
+                $v = isset( $p[ $c ] ) ? $p[ $c ] : '';
+                if ( is_array( $v ) ) $v = implode( '|', $v );
+                if ( is_bool( $v ) ) $v = $v ? '1' : '0';
+                $row[] = $v;
+            }
+            fputcsv( $fh, $row );
+        }
+        rewind( $fh );
+        $out = stream_get_contents( $fh );
+        fclose( $fh );
+        return $out;
+    }
+}
+
+// ------------------------------------------------------------------
+// Helper: makers snapshot → CSV
+// ------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_export_makers_to_csv' ) ) {
+    function dinoco_export_makers_to_csv( $snap ) {
+        $fh = fopen( 'php://temp', 'r+' );
+        $cols = array(
+            'mp_post_id', 'maker_id', 'maker_name', 'maker_currency', 'maker_group_id',
+            'sku', 'mp_unit_cost', 'mp_moq', 'mp_lead_time_days',
+            'mp_shipping_land', 'mp_shipping_sea', 'mp_status',
+            'post_status', 'post_date', 'post_modified',
+        );
+        fputcsv( $fh, $cols );
+        foreach ( $snap['items'] as $i ) {
+            $row = array();
+            foreach ( $cols as $c ) {
+                $row[] = isset( $i[ $c ] ) ? $i[ $c ] : '';
+            }
+            fputcsv( $fh, $row );
+        }
+        rewind( $fh );
+        $out = stream_get_contents( $fh );
+        fclose( $fh );
+        return $out;
+    }
+}
+
+// ------------------------------------------------------------------
+// REST Routes
+// ------------------------------------------------------------------
+add_action( 'rest_api_init', function() {
+
+    register_rest_route( 'dinoco-export/v1', '/health', array(
+        'methods'             => 'GET',
+        'permission_callback' => function( $r ) {
+            if ( ! is_user_logged_in() || ! current_user_can( 'manage_options' ) ) {
+                return new WP_Error( 'admin_only', 'Admin only', array( 'status' => 403 ) );
+            }
+            return true;
+        },
+        'callback'            => function( $r ) {
+            $rotate = (bool) $r->get_param( 'rotate' );
+            $secret = dinoco_export_get_secret( $rotate );
+            global $wpdb;
+            $tbl   = $wpdb->prefix . 'dinoco_products';
+            $count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl}" );
+            $rel   = get_option( 'dinoco_sku_relations', array() );
+            $maker_cnt = post_type_exists( 'b2f_maker_product' )
+                ? (int) wp_count_posts( 'b2f_maker_product' )->publish
+                : 0;
+            return array(
+                'ok'                      => true,
+                'version'                 => 'V.1.0',
+                'products_in_table'       => $count,
+                'sku_relation_parents'    => is_array( $rel ) ? count( $rel ) : 0,
+                'b2f_maker_products_live' => $maker_cnt,
+                'b2f_disabled'            => defined( 'B2F_DISABLED' ) && B2F_DISABLED,
+                'secret_source'           => defined( 'DINOCO_EXPORT_KEY' ) ? 'constant' : 'wp_option',
+                'secret_preview'          => substr( $secret, 0, 6 ) . '...' . substr( $secret, -4 ),
+                'rotated'                 => $rotate,
+            );
+        },
+    ) );
+
+    register_rest_route( 'dinoco-export/v1', '/catalog', array(
+        'methods'             => 'GET',
+        'permission_callback' => 'dinoco_export_auth_check',
+        'callback'            => function( $r ) {
+            $format = strtolower( (string) ( $r->get_param( 'format' ) ?: 'json' ) );
+            $snap   = dinoco_export_build_catalog_snapshot();
+            $stamp  = gmdate( 'Ymd-His' );
+
+            if ( $format === 'csv' ) {
+                $body = dinoco_export_catalog_to_csv( $snap );
+                if ( ! headers_sent() ) {
+                    header( 'Content-Type: text/csv; charset=utf-8' );
+                    header( 'Content-Disposition: attachment; filename="product-catalog-' . $stamp . '.csv"' );
+                }
+                echo $body;
+                exit;
+            }
+            if ( $format === 'tree' ) {
+                $body = dinoco_export_build_hierarchy_tree();
+                if ( ! headers_sent() ) {
+                    header( 'Content-Type: text/plain; charset=utf-8' );
+                    header( 'Content-Disposition: attachment; filename="hierarchy-tree-' . $stamp . '.txt"' );
+                }
+                echo $body;
+                exit;
+            }
+
+            // JSON default
+            if ( ! headers_sent() ) {
+                header( 'Content-Type: application/json; charset=utf-8' );
+                if ( $r->get_param( 'download' ) ) {
+                    header( 'Content-Disposition: attachment; filename="product-catalog-' . $stamp . '.json"' );
+                }
+            }
+            echo wp_json_encode( $snap, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT );
+            exit;
+        },
+    ) );
+
+    register_rest_route( 'dinoco-export/v1', '/makers', array(
+        'methods'             => 'GET',
+        'permission_callback' => 'dinoco_export_auth_check',
+        'callback'            => function( $r ) {
+            $format = strtolower( (string) ( $r->get_param( 'format' ) ?: 'csv' ) );
+            $snap   = dinoco_export_build_makers_snapshot();
+            $stamp  = gmdate( 'Ymd-His' );
+
+            if ( $format === 'json' ) {
+                if ( ! headers_sent() ) {
+                    header( 'Content-Type: application/json; charset=utf-8' );
+                    if ( $r->get_param( 'download' ) ) {
+                        header( 'Content-Disposition: attachment; filename="b2f-maker-registrations-' . $stamp . '.json"' );
+                    }
+                }
+                echo wp_json_encode( $snap, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT );
+                exit;
+            }
+
+            $body = dinoco_export_makers_to_csv( $snap );
+            if ( ! headers_sent() ) {
+                header( 'Content-Type: text/csv; charset=utf-8' );
+                header( 'Content-Disposition: attachment; filename="b2f-maker-registrations-' . $stamp . '.csv"' );
+            }
+            echo $body;
+            exit;
+        },
+    ) );
+
+} );
