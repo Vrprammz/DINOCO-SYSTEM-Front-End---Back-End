@@ -1,5 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.9.13 — TEMP debug endpoint /debug/maker-catalog/{maker_id}?key=TEMP_DEBUG_KEY_dca1831 — NX500 filter diagnosis (remove after fix)
  * Version: V.9.12 — catalog_map: batch lookup ผ่าน DINOCO_Catalog::get_by_skus() (single SQL WHERE IN) — fix N+1 query pattern ของ V.9.11 (เดิม loop เรียก get_by_sku() ต่อ SKU → 200+ queries ต่อ call)
  * Version: V.9.11 — maker-products: expose catalog_map (sku→{compatible_models, name, image_url}) for ALL SKUs in hierarchy tree (รวม leaves ที่ Maker ไม่ได้ register) → LIFF filter NX500/model ใช้ data จาก source of truth (wp_dinoco_products) เหมือน Product Catalog
  * Version: V.9.10 — DD-3 Shared Child: DD-7 collect breakdown[] + save poi_parent_breakdown JSON + po-detail return parent_breakdown
@@ -92,6 +93,16 @@ add_action( 'rest_api_init', function () {
         'methods'             => 'POST',
         'callback'            => 'b2f_rest_delete_maker_product',
         'permission_callback' => $admin_perm,
+    ) );
+
+    // ── TEMP DEBUG (V.9.13) — NX500 filter diagnosis, key-gated, remove after fix ──
+    register_rest_route( $ns, '/debug/maker-catalog/(?P<maker_id>\d+)', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2f_rest_debug_maker_catalog',
+        'permission_callback' => function( WP_REST_Request $req ) {
+            $key = $req->get_param( 'key' );
+            return ( $key === 'TEMP_DEBUG_KEY_dca1831' );
+        },
     ) );
 
     // ── Maker Bot Toggle ──
@@ -4422,5 +4433,243 @@ if ( ! function_exists( 'b2f_rest_po_complete' ) ) {
         }
 
         return new WP_REST_Response( array( 'success' => true, 'po_id' => $po_id, 'status' => 'completed' ), 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// TEMP DEBUG (V.9.13) — NX500 filter diagnosis
+// REMOVE AFTER FIX VERIFIED
+// ════════════════════════════════════════════
+if ( ! function_exists( 'b2f_rest_debug_maker_catalog' ) ) {
+    function b2f_rest_debug_maker_catalog( WP_REST_Request $req ) {
+        $maker_id = intval( $req->get_param( 'maker_id' ) ?: 0 );
+        if ( ! $maker_id ) {
+            return new WP_REST_Response( array( 'success' => false, 'error' => 'no maker_id' ), 400 );
+        }
+
+        // Reuse maker-products logic
+        $q = new WP_Query( array(
+            'post_type'      => 'b2f_maker_product',
+            'posts_per_page' => -1,
+            'post_status'    => 'publish',
+            'meta_query'     => array( array(
+                'key'   => 'mp_maker_id',
+                'value' => $maker_id,
+                'type'  => 'NUMERIC',
+            ) ),
+            'orderby' => 'title', 'order' => 'ASC',
+        ) );
+
+        $sku_relations = get_option( 'dinoco_sku_relations', array() );
+        $hierarchy_ctx = b2f_build_hierarchy_context( $sku_relations );
+
+        $products = array();
+        foreach ( $q->posts as $p ) {
+            $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx );
+        }
+
+        // Build catalog_map identical to maker-products endpoint
+        $catalog_map = array();
+        $tree_skus = array();
+        foreach ( $products as $p ) {
+            $su = strtoupper( $p['sku'] ?? '' );
+            if ( ! empty( $su ) ) $tree_skus[ $su ] = true;
+        }
+        $rel_u = $hierarchy_ctx['rel_upper'];
+        $walk_descendants = function( $sku ) use ( &$walk_descendants, &$tree_skus, $rel_u ) {
+            $children = isset( $rel_u[ $sku ] ) ? $rel_u[ $sku ] : array();
+            foreach ( $children as $ch ) {
+                if ( ! isset( $tree_skus[ $ch ] ) ) {
+                    $tree_skus[ $ch ] = true;
+                    $walk_descendants( $ch );
+                }
+            }
+        };
+        foreach ( array_keys( $tree_skus ) as $seed ) $walk_descendants( $seed );
+        foreach ( $products as $p ) {
+            $tp = strtoupper( $p['top_parent_sku'] ?? '' );
+            if ( ! empty( $tp ) && ! isset( $tree_skus[ $tp ] ) ) {
+                $tree_skus[ $tp ] = true;
+                $walk_descendants( $tp );
+            }
+        }
+        if ( class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'get_by_skus' ) ) {
+            $batch_rows = DINOCO_Catalog::get_by_skus( array_keys( $tree_skus ) );
+            foreach ( $batch_rows as $sku_u => $cat ) {
+                $catalog_map[ $sku_u ] = array(
+                    'sku'               => $cat['sku'] ?? $sku_u,
+                    'name'              => $cat['name'] ?? $sku_u,
+                    'image_url'         => $cat['image_url'] ?? '',
+                    'compatible_models' => $cat['compatible_models'] ?? '[]',
+                    'category'          => $cat['category'] ?? '',
+                );
+            }
+        }
+
+        // ── Helper: parseModels like JS frontend ──
+        $parseModels = function( $raw ) {
+            if ( empty( $raw ) ) return array();
+            if ( is_string( $raw ) ) {
+                $decoded = json_decode( $raw, true );
+                if ( $decoded === null ) return array();
+                $raw = $decoded;
+            }
+            if ( ! is_array( $raw ) ) return array();
+            $out = array();
+            foreach ( $raw as $m ) {
+                if ( empty( $m ) ) continue;
+                if ( is_string( $m ) ) $out[] = $m;
+                elseif ( is_array( $m ) ) {
+                    $name = $m['name'] ?? $m['model_name'] ?? $m['slug'] ?? '';
+                    if ( $name !== '' ) $out[] = (string) $name;
+                }
+            }
+            return $out;
+        };
+
+        // ── Build products_by_sku lookup ──
+        $products_by_sku = array();
+        foreach ( $products as $p ) {
+            $products_by_sku[ strtoupper( $p['sku'] ?? '' ) ] = $p;
+        }
+
+        // ── Sample SETs: pick first 10 that are set OR match DNC4537SET / DNCGND / DNCSET ──
+        $sample_skus = array( 'DNC4537SETGNDPR0001', 'DNC4537SETGNDPR0002', 'DNC4537SETGNDSTD001', 'DNC4537SETGNDSTD002', 'DNCGND37LFULLPROB', 'DNCGND37LFULLPROS', 'DNCGND37FULLSTDB', 'DNCGND37FULLSTDS', 'DNCGNDSDPR0500B', 'DNCGNDSDPR0500S' );
+        $sample_sets = array();
+        foreach ( $sample_skus as $set_sku ) {
+            $set_u = strtoupper( $set_sku );
+            $from_maker = isset( $products_by_sku[ $set_u ] ) ? $products_by_sku[ $set_u ] : null;
+            $from_cat   = isset( $catalog_map[ $set_u ] ) ? $catalog_map[ $set_u ] : null;
+
+            // parseModels direct on maker product
+            $models_maker = $from_maker ? $parseModels( $from_maker['compatible_models'] ?? '' ) : array();
+            // parseModels on catalog
+            $models_cat = $from_cat ? $parseModels( $from_cat['compatible_models'] ?? '' ) : array();
+
+            // Walk descendants like JS collectModelsWithDescendants
+            $descendant_models = array();
+            $descendants_list = array();
+            $visited = array();
+            $queue = array( $set_u );
+            while ( ! empty( $queue ) ) {
+                $cur = array_shift( $queue );
+                if ( isset( $visited[ $cur ] ) ) continue;
+                $visited[ $cur ] = true;
+                $children = isset( $rel_u[ $cur ] ) ? $rel_u[ $cur ] : array();
+                foreach ( $children as $ch ) {
+                    $ch_u = strtoupper( $ch );
+                    $ch_info = array( 'sku' => $ch_u, 'in_maker_products' => isset( $products_by_sku[ $ch_u ] ), 'in_catalog_map' => isset( $catalog_map[ $ch_u ] ) );
+                    // Parse models
+                    $ch_models = array();
+                    if ( isset( $products_by_sku[ $ch_u ] ) ) {
+                        $ch_models = $parseModels( $products_by_sku[ $ch_u ]['compatible_models'] ?? '' );
+                    } elseif ( isset( $catalog_map[ $ch_u ] ) ) {
+                        $ch_models = $parseModels( $catalog_map[ $ch_u ]['compatible_models'] ?? '' );
+                    }
+                    $ch_info['models'] = $ch_models;
+                    $descendants_list[] = $ch_info;
+                    foreach ( $ch_models as $m ) $descendant_models[ $m ] = true;
+                    if ( ! isset( $visited[ $ch_u ] ) ) $queue[] = $ch_u;
+                }
+            }
+
+            $all_models = array_unique( array_merge( $models_maker, $models_cat, array_keys( $descendant_models ) ) );
+
+            $sample_sets[] = array(
+                'sku'                          => $set_u,
+                'in_maker_products'            => $from_maker ? true : false,
+                'from_maker_products'          => $from_maker ? array(
+                    '_jsType_auto'      => $from_maker['auto_type'] ?? null,
+                    'product_type'      => $from_maker['product_type'] ?? null,
+                    'compatible_models' => $from_maker['compatible_models'] ?? null,
+                    'top_parent_sku'    => $from_maker['top_parent_sku'] ?? null,
+                ) : null,
+                'in_catalog_map'               => $from_cat ? true : false,
+                'from_dinoco_catalog'          => $from_cat ? array(
+                    'name'              => $from_cat['name'] ?? null,
+                    'compatible_models' => $from_cat['compatible_models'] ?? null,
+                ) : null,
+                'parseModels_maker_product'    => $models_maker,
+                'parseModels_catalog'          => $models_cat,
+                'descendants_count'            => count( $descendants_list ),
+                'descendants_with_models'      => $descendants_list,
+                'all_models_combined'          => array_values( $all_models ),
+                'NX500_match'                  => in_array( 'NX500', $all_models, true ),
+                'NX500_eclutch_match'          => in_array( 'NX500 E-clutch', $all_models, true ),
+            );
+        }
+
+        // ── Count total NX500 + NX500 E-clutch matches across ALL products (set-type only) ──
+        $nx500_set_count = 0;
+        $nx500ec_set_count = 0;
+        $nx500_any_count = 0;
+        $nx500ec_any_count = 0;
+        $type_counts = array();
+        foreach ( $products as $p ) {
+            $jstype = $p['auto_type'] ?? $p['product_type'] ?? 'single';
+            if ( ! isset( $type_counts[ $jstype ] ) ) $type_counts[ $jstype ] = 0;
+            $type_counts[ $jstype ]++;
+
+            // Collect models like JS collectModelsWithDescendants
+            $models_bag = array();
+            foreach ( $parseModels( $p['compatible_models'] ?? '' ) as $m ) $models_bag[ $m ] = true;
+            $su = strtoupper( $p['sku'] ?? '' );
+            if ( isset( $catalog_map[ $su ] ) ) {
+                foreach ( $parseModels( $catalog_map[ $su ]['compatible_models'] ?? '' ) as $m ) $models_bag[ $m ] = true;
+            }
+            if ( $jstype === 'set' || $jstype === 'child' ) {
+                $visited2 = array();
+                $q2 = array( $su );
+                while ( ! empty( $q2 ) ) {
+                    $cur2 = array_shift( $q2 );
+                    if ( isset( $visited2[ $cur2 ] ) ) continue;
+                    $visited2[ $cur2 ] = true;
+                    $children2 = isset( $rel_u[ $cur2 ] ) ? $rel_u[ $cur2 ] : array();
+                    foreach ( $children2 as $ch ) {
+                        $ch_u = strtoupper( $ch );
+                        $cp = isset( $products_by_sku[ $ch_u ] ) ? $products_by_sku[ $ch_u ] : null;
+                        if ( $cp ) {
+                            foreach ( $parseModels( $cp['compatible_models'] ?? '' ) as $m ) $models_bag[ $m ] = true;
+                        } elseif ( isset( $catalog_map[ $ch_u ] ) ) {
+                            foreach ( $parseModels( $catalog_map[ $ch_u ]['compatible_models'] ?? '' ) as $m ) $models_bag[ $m ] = true;
+                        }
+                        if ( ! isset( $visited2[ $ch_u ] ) ) $q2[] = $ch_u;
+                    }
+                }
+            }
+
+            if ( isset( $models_bag['NX500'] ) ) $nx500_any_count++;
+            if ( isset( $models_bag['NX500 E-clutch'] ) ) $nx500ec_any_count++;
+            if ( $jstype === 'set' ) {
+                if ( isset( $models_bag['NX500'] ) ) $nx500_set_count++;
+                if ( isset( $models_bag['NX500 E-clutch'] ) ) $nx500ec_set_count++;
+            }
+        }
+
+        // ── Raw sample: dump first 3 rows of wp_dinoco_products for sample SET SKUs ──
+        global $wpdb;
+        $ct_table = $wpdb->prefix . 'dinoco_products';
+        $raw_rows = array();
+        $sample_upper = array_map( 'strtoupper', $sample_skus );
+        $ph = implode( ',', array_fill( 0, count( $sample_upper ), '%s' ) );
+        $rows = $wpdb->get_results( $wpdb->prepare( "SELECT sku, name, compatible_models FROM {$ct_table} WHERE UPPER(sku) IN ({$ph})", $sample_upper ), ARRAY_A );
+        foreach ( $rows as $r ) $raw_rows[ strtoupper( $r['sku'] ) ] = $r;
+
+        return new WP_REST_Response( array(
+            'success'          => true,
+            'maker_id'         => $maker_id,
+            'products_count'   => count( $products ),
+            'catalog_map_count'=> count( $catalog_map ),
+            'sku_relations_count' => count( $rel_u ),
+            'type_counts'      => $type_counts,
+            'totals'           => array(
+                'NX500_set_matches'          => $nx500_set_count,
+                'NX500_eclutch_set_matches'  => $nx500ec_set_count,
+                'NX500_any_matches'          => $nx500_any_count,
+                'NX500_eclutch_any_matches'  => $nx500ec_any_count,
+            ),
+            'sample_sets'      => $sample_sets,
+            'raw_db_rows'      => $raw_rows,
+        ), 200 );
     }
 }
