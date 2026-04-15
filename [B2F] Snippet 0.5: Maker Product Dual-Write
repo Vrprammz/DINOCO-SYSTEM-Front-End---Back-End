@@ -1,0 +1,216 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2F] Snippet 0.5: Maker Product Dual-Write                ║
+ * ║  Version: V.1.0 — Phase 2 Shadow-Write mode                  ║
+ * ║  DB_ID: (auto-assign after WP creates snippet)              ║
+ * ║  Purpose: Mirror b2f_maker_product CPT → junction table      ║
+ * ║           เมื่อ admin save/update/delete CPT ผ่าน ACF          ║
+ * ║  Kill Switch: B2F_DISABLED                                   ║
+ * ║  Feature Flag: b2f_flag_shadow_write (off by default)        ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * Hooks:
+ *   - save_post_b2f_maker_product → UPSERT junction row + observation
+ *   - before_delete_post         → soft-delete junction row (discontinued)
+ *
+ * Safety:
+ *   - เช็ค b2f_is_flag_enabled('b2f_flag_shadow_write') ก่อนทำงาน
+ *   - Skip revisions + autosaves
+ *   - Skip non-published (draft/trash handled by delete hook)
+ *   - Never throw — log + continue (dual-write ห้ามล้ม CPT save)
+ *
+ * DB Requirements:
+ *   - table wp_dinoco_product_makers (V10.1 schema)
+ *   - table wp_dinoco_maker_product_observations (V10.1 schema)
+ *   - option 'b2f_schema_v10_activated' = truthy
+ *
+ * Dependencies:
+ *   - Snippet 1 V.6.5+: b2f_is_flag_enabled()
+ *   - Snippet 0: CPT registration (priority 5)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 1: CORE DUAL-WRITE HELPER
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Read b2f_maker_product CPT (ACF) → UPSERT into wp_dinoco_product_makers
+ *
+ * @param int $mp_id post_id ของ b2f_maker_product
+ * @return bool|WP_Error true on success, WP_Error on failure (logged, not thrown)
+ */
+if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
+    function b2f_dual_write_to_junction( $mp_id ) {
+        global $wpdb;
+        $mp_id = intval( $mp_id );
+        if ( ! $mp_id ) return new WP_Error( 'invalid_id', 'Empty mp_id' );
+
+        // Schema guard
+        if ( ! get_option( 'b2f_schema_v10_activated' ) ) {
+            return new WP_Error( 'schema_not_activated', 'Schema V10 not activated' );
+        }
+
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $obs = $wpdb->prefix . 'dinoco_maker_product_observations';
+
+        // Read ACF fields (CORRECT names — mp_* prefix)
+        if ( ! function_exists( 'get_field' ) ) {
+            return new WP_Error( 'acf_missing', 'ACF not loaded' );
+        }
+        $sku       = get_field( 'mp_product_sku', $mp_id );
+        $maker_id  = intval( get_field( 'mp_maker_id', $mp_id ) );
+        $unit_cost = floatval( get_field( 'mp_unit_cost', $mp_id ) );
+        $moq       = intval( get_field( 'mp_moq', $mp_id ) );
+        $lead_time = intval( get_field( 'mp_lead_time_days', $mp_id ) );
+        $ship_land = floatval( get_field( 'mp_shipping_land', $mp_id ) );
+        $ship_sea  = floatval( get_field( 'mp_shipping_sea', $mp_id ) );
+        $notes     = (string) ( get_field( 'mp_notes', $mp_id ) ?: '' );
+        $status    = (string) ( get_field( 'mp_status', $mp_id ) ?: 'active' );
+
+        $sku = strtoupper( trim( (string) $sku ) );
+        if ( ! $sku || ! $maker_id ) {
+            return new WP_Error( 'missing_key', 'Missing sku or maker_id on mp_id=' . $mp_id );
+        }
+
+        if ( ! in_array( $status, array( 'active', 'discontinued', 'pending' ), true ) ) {
+            $status = 'active';
+        }
+        if ( $moq < 1 ) $moq = 1;
+        if ( $lead_time < 0 ) $lead_time = 7;
+
+        $uid = get_current_user_id();
+        $now = current_time( 'mysql' );
+
+        // UPSERT (ON DUPLICATE preserves id + created_at)
+        $sql = $wpdb->prepare(
+            "INSERT INTO {$tbl}
+                (product_sku, maker_id, unit_cost, moq, lead_time_days,
+                 shipping_land, shipping_sea, status, notes,
+                 legacy_cpt_id, created_by, updated_by, created_at, updated_at, deleted_at)
+             VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, %d, %d, %d, %s, %s, NULL)
+             ON DUPLICATE KEY UPDATE
+                unit_cost      = VALUES(unit_cost),
+                moq            = VALUES(moq),
+                lead_time_days = VALUES(lead_time_days),
+                shipping_land  = VALUES(shipping_land),
+                shipping_sea   = VALUES(shipping_sea),
+                status         = VALUES(status),
+                notes          = VALUES(notes),
+                legacy_cpt_id  = VALUES(legacy_cpt_id),
+                updated_by     = VALUES(updated_by),
+                updated_at     = VALUES(updated_at),
+                deleted_at     = NULL",
+            $sku, $maker_id, $unit_cost, $moq, $lead_time,
+            $ship_land, $ship_sea, $status, $notes,
+            $mp_id, $uid, $uid, $now, $now
+        );
+        $ok = $wpdb->query( $sql );
+        if ( $ok === false ) {
+            return new WP_Error( 'sql_error', 'UPSERT failed: ' . $wpdb->last_error );
+        }
+
+        // Log observation (source=cpt mirror → junction)
+        $fields_snapshot = wp_json_encode( array(
+            'unit_cost'      => $unit_cost,
+            'moq'            => $moq,
+            'lead_time_days' => $lead_time,
+            'shipping_land'  => $ship_land,
+            'shipping_sea'   => $ship_sea,
+            'status'         => $status,
+        ) );
+        $wpdb->insert( $obs, array(
+            'observed_at'    => $now,
+            'source'         => 'cpt',
+            'sku'            => $sku,
+            'maker_id'       => $maker_id,
+            'field_name'     => 'dual_write',
+            'cpt_value'      => $fields_snapshot,
+            'junction_value' => $fields_snapshot,
+            'diff_detected'  => 0,
+        ) );
+
+        return true;
+    }
+}
+
+/**
+ * Soft-delete junction row เมื่อ CPT ถูกลบ
+ */
+if ( ! function_exists( 'b2f_dual_soft_delete_junction' ) ) {
+    function b2f_dual_soft_delete_junction( $mp_id ) {
+        global $wpdb;
+        $mp_id = intval( $mp_id );
+        if ( ! $mp_id ) return false;
+        if ( ! get_option( 'b2f_schema_v10_activated' ) ) return false;
+
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $uid = get_current_user_id();
+        $now = current_time( 'mysql' );
+
+        $ok = $wpdb->query( $wpdb->prepare(
+            "UPDATE {$tbl}
+             SET deleted_at = %s, status = 'discontinued', updated_by = %d, updated_at = %s
+             WHERE legacy_cpt_id = %d AND deleted_at IS NULL",
+            $now, $uid, $now, $mp_id
+        ) );
+        return ( $ok !== false );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 2: WP HOOKS
+// ═══════════════════════════════════════════════════════════════════
+
+// Fire after ACF saves fields (priority 20 > ACF default 10)
+add_action( 'save_post_b2f_maker_product', function( $post_id, $post, $update ) {
+    // Flag gate
+    if ( ! function_exists( 'b2f_is_flag_enabled' ) || ! b2f_is_flag_enabled( 'b2f_flag_shadow_write' ) ) return;
+
+    // Skip revisions / autosaves / bulk edit
+    if ( wp_is_post_revision( $post_id ) ) return;
+    if ( wp_is_post_autosave( $post_id ) ) return;
+    if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) return;
+
+    // Only publish/draft
+    if ( ! in_array( $post->post_status, array( 'publish', 'draft' ), true ) ) return;
+
+    $res = b2f_dual_write_to_junction( $post_id );
+    if ( is_wp_error( $res ) && function_exists( 'b2f_log' ) ) {
+        b2f_log( '[DualWrite] save_post error mp_id=' . $post_id . ': ' . $res->get_error_message() );
+    }
+}, 20, 3 );
+
+// Soft-delete on trash/delete
+add_action( 'before_delete_post', function( $post_id ) {
+    if ( ! function_exists( 'b2f_is_flag_enabled' ) || ! b2f_is_flag_enabled( 'b2f_flag_shadow_write' ) ) return;
+
+    $post = get_post( $post_id );
+    if ( ! $post || $post->post_type !== 'b2f_maker_product' ) return;
+
+    $ok = b2f_dual_soft_delete_junction( $post_id );
+    if ( ! $ok && function_exists( 'b2f_log' ) ) {
+        b2f_log( '[DualWrite] soft-delete failed mp_id=' . $post_id );
+    }
+}, 10, 1 );
+
+// Restore on untrash (reactivate junction row)
+add_action( 'untrash_post', function( $post_id ) {
+    if ( ! function_exists( 'b2f_is_flag_enabled' ) || ! b2f_is_flag_enabled( 'b2f_flag_shadow_write' ) ) return;
+
+    $post = get_post( $post_id );
+    if ( ! $post || $post->post_type !== 'b2f_maker_product' ) return;
+
+    global $wpdb;
+    $tbl = $wpdb->prefix . 'dinoco_product_makers';
+    $wpdb->query( $wpdb->prepare(
+        "UPDATE {$tbl}
+         SET deleted_at = NULL, status = 'active', updated_at = %s
+         WHERE legacy_cpt_id = %d",
+        current_time( 'mysql' ), $post_id
+    ) );
+}, 10, 1 );
+
+// --- End of Snippet 0.5 ---

@@ -1,7 +1,8 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 11: Cron Jobs & Reminders                    ║
- * ║  Version: V.2.1 — Rejected PO escalation after 7 days                        ║
+ * ║  Version: V.2.2 — Phase 2: diff cron (hourly) + TTL cleanup (daily) + drift aggregator ║
+ * ║  Previous: V.2.1 — Rejected PO escalation after 7 days                        ║
  * ║  DB_ID: 1171                                                 ║
  * ║  Kill Switch: define('B2F_DISABLED', true)                   ║
  * ╚══════════════════════════════════════════════════════════════╝
@@ -53,6 +54,18 @@ add_action( 'init', function () {
     $retry_interval = isset( $avail['every_2min_b2f'] ) ? 'every_2min_b2f' : ( isset( $avail['every_1min_b2b'] ) ? 'every_1min_b2b' : 'hourly' );
     if ( ! wp_next_scheduled( 'b2f_flex_retry_cron' ) ) {
         wp_schedule_event( time() + 60, $retry_interval, 'b2f_flex_retry_cron' );
+    }
+
+    // V.2.2: Phase 2 diff detection cron — hourly
+    if ( ! wp_next_scheduled( 'b2f_diff_cron_hourly' ) ) {
+        wp_schedule_event( time() + 300, 'hourly', 'b2f_diff_cron_hourly' );
+    }
+
+    // V.2.2: Observations TTL cleanup — daily at 20:00 ICT (13:00 UTC)
+    if ( ! wp_next_scheduled( 'b2f_observations_ttl_cron' ) ) {
+        $next = strtotime( 'today 13:00:00 UTC' );
+        if ( $next < time() ) $next = strtotime( 'tomorrow 13:00:00 UTC' );
+        wp_schedule_event( $next, $daily, 'b2f_observations_ttl_cron' );
     }
 } );
 
@@ -578,6 +591,163 @@ if ( ! function_exists( 'b2f_run_flex_retry' ) ) {
         }
         if ( $ok + $retry + $failed > 0 && function_exists( 'b2f_log' ) ) {
             b2f_log( '[FlexRetry] Summary: ' . $ok . ' ok, ' . $retry . ' retry, ' . $failed . ' gave up' );
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// V.2.2 — PHASE 2: DIFF DETECTION CRON (HOURLY)
+// ════════════════════════════════════════════
+// เปรียบเทียบ CPT vs junction table field-by-field → เขียน observation
+// diff_detected=1 → drift alert (log + aggregate daily)
+
+add_action( 'b2f_diff_cron_hourly', 'b2f_run_diff_detection' );
+
+if ( ! function_exists( 'b2f_run_diff_detection' ) ) {
+    function b2f_run_diff_detection() {
+        global $wpdb;
+        if ( ! get_option( 'b2f_schema_v10_activated' ) ) return;
+
+        $tbl_jn = $wpdb->prefix . 'dinoco_product_makers';
+        $tbl_ob = $wpdb->prefix . 'dinoco_maker_product_observations';
+
+        // Load all active junction rows
+        $rows = $wpdb->get_results(
+            "SELECT id, product_sku, maker_id, unit_cost, moq, lead_time_days,
+                    shipping_land, shipping_sea, status, legacy_cpt_id
+             FROM {$tbl_jn}
+             WHERE deleted_at IS NULL
+             LIMIT 500",
+            ARRAY_A
+        );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        $now = current_time( 'mysql' );
+        $diff_count = 0;
+        $checked = 0;
+
+        $fields = array(
+            'unit_cost'      => 'mp_unit_cost',
+            'moq'            => 'mp_moq',
+            'lead_time_days' => 'mp_lead_time_days',
+            'shipping_land'  => 'mp_shipping_land',
+            'shipping_sea'   => 'mp_shipping_sea',
+            'status'         => 'mp_status',
+        );
+
+        foreach ( $rows as $r ) {
+            $mp_id = intval( $r['legacy_cpt_id'] );
+            if ( ! $mp_id ) continue;
+            // Verify CPT still exists
+            $post = get_post( $mp_id );
+            if ( ! $post || $post->post_type !== 'b2f_maker_product' ) continue;
+            if ( ! function_exists( 'get_field' ) ) continue;
+
+            $checked++;
+            foreach ( $fields as $jn_col => $acf_field ) {
+                $cpt_val = get_field( $acf_field, $mp_id );
+                $jn_val  = $r[ $jn_col ];
+
+                // Normalize numeric comparison (0.00 vs 0)
+                if ( in_array( $jn_col, array( 'unit_cost', 'shipping_land', 'shipping_sea' ), true ) ) {
+                    $diff = abs( floatval( $cpt_val ) - floatval( $jn_val ) ) > 0.001;
+                    $cpt_norm = number_format( floatval( $cpt_val ), 2, '.', '' );
+                    $jn_norm  = number_format( floatval( $jn_val ), 2, '.', '' );
+                } elseif ( in_array( $jn_col, array( 'moq', 'lead_time_days' ), true ) ) {
+                    $diff = intval( $cpt_val ) !== intval( $jn_val );
+                    $cpt_norm = (string) intval( $cpt_val );
+                    $jn_norm  = (string) intval( $jn_val );
+                } else {
+                    $diff = (string) $cpt_val !== (string) $jn_val;
+                    $cpt_norm = (string) $cpt_val;
+                    $jn_norm  = (string) $jn_val;
+                }
+
+                if ( $diff ) {
+                    $diff_count++;
+                    $wpdb->insert( $tbl_ob, array(
+                        'observed_at'    => $now,
+                        'source'         => 'diff',
+                        'sku'            => $r['product_sku'],
+                        'maker_id'       => $r['maker_id'],
+                        'field_name'     => $jn_col,
+                        'cpt_value'      => $cpt_norm,
+                        'junction_value' => $jn_norm,
+                        'diff_detected'  => 1,
+                    ) );
+                }
+            }
+        }
+
+        // Aggregate: update rolling 7-day history
+        b2f_aggregate_drift_history_7d();
+
+        if ( $diff_count > 0 && function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( '[DiffCron] checked=%d diffs=%d (drift detected)', $checked, $diff_count ) );
+        }
+    }
+}
+
+/**
+ * Rolling 7-day drift history — update wp_option 'b2f_drift_history_7d'
+ * Aggregation: observations per day (orphan/stale/diff counts)
+ */
+if ( ! function_exists( 'b2f_aggregate_drift_history_7d' ) ) {
+    function b2f_aggregate_drift_history_7d() {
+        global $wpdb;
+        $tbl_ob = $wpdb->prefix . 'dinoco_maker_product_observations';
+
+        $rows = $wpdb->get_results(
+            "SELECT DATE(observed_at) AS day,
+                    COUNT(DISTINCT CASE WHEN diff_detected = 1 THEN CONCAT(maker_id, '-', sku) END) AS stale_count,
+                    COUNT(CASE WHEN source = 'cpt' THEN 1 END) AS writes,
+                    COUNT(CASE WHEN diff_detected = 1 THEN 1 END) AS diff_rows
+             FROM {$tbl_ob}
+             WHERE observed_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+             GROUP BY DATE(observed_at)
+             ORDER BY day DESC",
+            ARRAY_A
+        );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // Attach orphan_count (point-in-time snapshot จาก audit helper)
+        $orphan_count_today = 0;
+        if ( function_exists( 'b2f_audit_get_orphan_sets' ) ) {
+            $orphans = b2f_audit_get_orphan_sets();
+            $orphan_count_today = is_array( $orphans ) ? count( $orphans ) : 0;
+        }
+        $today_key = wp_date( 'Y-m-d' );
+        $annotated = array();
+        foreach ( $rows as $row ) {
+            $annotated[] = array(
+                'date'         => $row['day'],
+                'stale_count'  => intval( $row['stale_count'] ),
+                'diff_rows'    => intval( $row['diff_rows'] ),
+                'writes'       => intval( $row['writes'] ),
+                'orphan_count' => ( $row['day'] === $today_key ) ? $orphan_count_today : null,
+            );
+        }
+        update_option( 'b2f_drift_history_7d', $annotated, false );
+    }
+}
+
+// ════════════════════════════════════════════
+// V.2.2 — PHASE 2: OBSERVATIONS TTL CLEANUP (DAILY)
+// ════════════════════════════════════════════
+
+add_action( 'b2f_observations_ttl_cron', 'b2f_run_observations_ttl' );
+
+if ( ! function_exists( 'b2f_run_observations_ttl' ) ) {
+    function b2f_run_observations_ttl() {
+        global $wpdb;
+        if ( ! get_option( 'b2f_schema_v10_activated' ) ) return;
+        $tbl_ob = $wpdb->prefix . 'dinoco_maker_product_observations';
+        $deleted = $wpdb->query(
+            "DELETE FROM {$tbl_ob}
+             WHERE observed_at < DATE_SUB(NOW(), INTERVAL 60 DAY)"
+        );
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( sprintf( '[TTL] Purged %d observation rows older than 60 days', intval( $deleted ) ) );
         }
     }
 }

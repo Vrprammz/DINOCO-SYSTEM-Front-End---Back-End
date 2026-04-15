@@ -1,33 +1,48 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.2.0 — Phase 2 Shadow-Write controls (activate-schema, backfill, flag toggler, junction/observations viewer)
  * Version: V.1.3 — tree_view column + nested grandchildren inline display
  * Version: V.1.2 — เพิ่ม compatible_models + category columns (Honda NX500, Honda CB500X, …)
  * Version: V.1.1 — STRICT orphan rule (ALL descendants covered) + CSV with leaves/children columns + disable bugged script path
  * Version: V.1.0 — Phase 1 observe-only audit + feature flags + dry-run trigger
  * DB_ID: (auto-assign after WP creates snippet)
- * Purpose: Audit dashboard + dry-run CSV export สำหรับ B2F Option F migration
+ * Purpose: Audit dashboard + Phase 2 Shadow-Write controls สำหรับ B2F Option F migration
  * Shortcode: [b2f_migration_audit]
  * REST namespace: /wp-json/dinoco-b2f-audit/v1/
  * Dependencies: B2B Snippet 1 (b2b_rate_limit, b2b_log), Snippet 15 (DINOCO_Catalog), B2F Snippet 0/1/2
  * Kill Switch: B2F_DISABLED
  *
- * PHASE 1 SCOPE (observe-only)
- *   - 5 REST endpoints (drift, stale, parity, dry-run, feature-flags)
- *   - Feature flag setter: 403 hardcoded (setter locked ใน Phase 1)
+ * PHASE 1 SCOPE (observe-only, Complete)
+ *   - 5 REST endpoints (drift, stale, parity, dry-run, feature-flags GET)
  *   - Shortcode UI: 6 dashboard sections
- *   - Dry-run trigger ผ่าน scripts/b2f-migrate-dry-run.php (ถ้ามี) หรือ inline logic
  *
- * FEATURE FLAGS (wp_options, default=false ทุกตัว, Phase 1 = อ่านอย่างเดียว)
- *   - b2f_flag_auto_sync_sets       — Phase 2 flip (auto-sync SET registration)
- *   - b2f_flag_shadow_write         — Phase 2 flip (dual-write CPT + canonical)
- *   - b2f_flag_read_from_junction   — Phase 3 flip (reads ไป canonical table)
+ * PHASE 2 SCOPE (V.2.0 — Shadow-Write, parallel กับ database-expert)
+ *   - 4 REST endpoints ใหม่:
+ *     - POST /activate-schema     — dbDelta canonical tables (confirm=1 required)
+ *     - POST /backfill            — เรียก scripts/b2f-phase2-backfill.php
+ *     - GET  /backfill-status     — read last run summary from wp_option
+ *     - POST /feature-flags/toggle — toggle b2f_flag_shadow_write (whitelist)
+ *     - GET  /junction-snapshot   — read recent rows จาก dinoco_product_makers
+ *     - GET  /observations        — read recent rows จาก dinoco_maker_product_observations
+ *   - Feature flag setter: `b2f_flag_shadow_write` toggleable (auto_sync/read_from_junction ยังล็อค)
+ *   - UI: Phase 2 Controls section (3 buttons), Junction snapshot viewer, Observations viewer
+ *
+ * DATABASE-EXPERT INTERFACE (parallel coordination)
+ *   - `b2f_audit_activate_schema_v10()` — database-expert deliverable (ถ้ายังไม่มี → endpoint return 501)
+ *   - `scripts/b2f-phase2-backfill.php` — database-expert deliverable (include via endpoint)
+ *   - `b2f_schema_v10_activated` wp_option — gate สำหรับ backfill + flag toggle UX
+ *
+ * FEATURE FLAGS (wp_options, default=false ทุกตัว)
+ *   - b2f_flag_auto_sync_sets       — Phase 2.5 flip (auto-sync SET registration) — LOCKED
+ *   - b2f_flag_shadow_write         — Phase 2 flip (dual-write CPT + canonical) — UNLOCKED V.2.0
+ *   - b2f_flag_read_from_junction   — Phase 3 flip (reads ไป canonical table) — LOCKED
  *
  * REFERENCE
  *   B2F-ARCHITECTURE-PLAN.md — Option F Hybrid Shadow-Write
- *   scripts/b2f-migrate-dry-run.php — database-expert deliverable V.1.0 (commit 7d23e50)
- *     Actions: ADD | FLAG_STALE | REMOVE_ORPHAN
- *     CSV cols: maker_id, maker_name, sku, action, current_cost, computed_cost, reason, notes
- *   scripts/b2f-audit-queries.sql — SQL reference queries (future refactor target)
+ *   B2F-SCHEMA-V10.sql — canonical schema (dinoco_product_makers + dinoco_maker_product_observations)
+ *   scripts/b2f-migrate-dry-run.php — Phase 1 dry-run script
+ *   scripts/b2f-phase2-backfill.php — Phase 2 backfill script (database-expert deliverable)
+ *   scripts/b2f-audit-queries.sql — SQL reference queries
  */
 
 if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
@@ -36,7 +51,7 @@ if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
 // SECTION 0: CONSTANTS + ALLOWED FLAG LIST
 // ═══════════════════════════════════════════════════════════════════
 
-if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.1.0' );
+if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.2.0' );
 if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
 
 if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
@@ -45,6 +60,154 @@ if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
             'b2f_flag_auto_sync_sets',
             'b2f_flag_shadow_write',
             'b2f_flag_read_from_junction',
+        );
+    }
+}
+
+/**
+ * V.2.0: Phase 2 toggleable flags whitelist
+ * Only `b2f_flag_shadow_write` is toggleable ใน Phase 2
+ * `auto_sync_sets` + `read_from_junction` ยังล็อคไว้ให้ Phase 2.5 + Phase 3 ตามลำดับ
+ */
+if ( ! function_exists( 'b2f_audit_phase2_toggleable_flags' ) ) {
+    function b2f_audit_phase2_toggleable_flags() {
+        return array( 'b2f_flag_shadow_write' );
+    }
+}
+
+/**
+ * V.2.0: Schema activation state helper
+ * database-expert's b2f_audit_activate_schema_v10() sets option `b2f_schema_v10_activated` = timestamp
+ * + `b2f_schema_version` = '10.1'
+ */
+if ( ! function_exists( 'b2f_audit_is_schema_activated' ) ) {
+    function b2f_audit_is_schema_activated() {
+        return (bool) get_option( 'b2f_schema_v10_activated', false );
+    }
+}
+
+/**
+ * V.2.0: Backfill state helper — last run summary stored in wp_option
+ * Shape: { ran_at, cpt_migrated, orphans_added, errors[], elapsed_ms, uid }
+ */
+if ( ! function_exists( 'b2f_audit_get_backfill_state' ) ) {
+    function b2f_audit_get_backfill_state() {
+        $state = get_option( 'b2f_phase2_backfill_state', array() );
+        if ( ! is_array( $state ) ) $state = array();
+        return $state;
+    }
+}
+
+if ( ! function_exists( 'b2f_audit_set_backfill_state' ) ) {
+    function b2f_audit_set_backfill_state( $state ) {
+        update_option( 'b2f_phase2_backfill_state', $state, false );
+    }
+}
+
+/**
+ * V.2.0: Junction table existence check (defensive guard for Phase 2 endpoints)
+ */
+if ( ! function_exists( 'b2f_audit_junction_table_exists' ) ) {
+    function b2f_audit_junction_table_exists() {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $tbl ) );
+        return $found === $tbl;
+    }
+}
+
+if ( ! function_exists( 'b2f_audit_observations_table_exists' ) ) {
+    function b2f_audit_observations_table_exists() {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_maker_product_observations';
+        $found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $tbl ) );
+        return $found === $tbl;
+    }
+}
+
+/**
+ * V.2.0: Phase 2 schema activation — dbDelta เพื่อสร้าง 2 canonical tables
+ *   - wp_dinoco_product_makers (junction table, UNIQUE sku+maker)
+ *   - wp_dinoco_maker_product_observations (shadow-write drift log)
+ *
+ * NOTE: dbDelta ไม่รองรับ COLLATE เจาะจงต่อคอลัมน์ดี (parser quirks). ใช้ default
+ * $charset_collate (utf8mb4_unicode_ci) กับทุกคอลัมน์ — case-sensitive matching
+ * enforce ที่ application layer (strtoupper() ก่อน query) ซึ่ง b2b_get_product_data()
+ * + dinoco_sku_relations ใช้ pattern นี้อยู่แล้ว
+ *
+ * Idempotent: dbDelta เช็ค schema diff → run CREATE / ALTER เฉพาะที่ต่าง
+ *
+ * @return array { junction_created, observations_created, dbdelta_log }
+ */
+if ( ! function_exists( 'b2f_audit_activate_schema_v10' ) ) {
+    function b2f_audit_activate_schema_v10() {
+        global $wpdb;
+        $charset = $wpdb->get_charset_collate();
+
+        // TABLE 1 — Junction
+        $tbl_main = $wpdb->prefix . 'dinoco_product_makers';
+        $sql_main = "CREATE TABLE {$tbl_main} (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            product_sku VARCHAR(50) NOT NULL,
+            maker_id BIGINT UNSIGNED NOT NULL,
+            unit_cost DECIMAL(12,2) NOT NULL DEFAULT 0,
+            moq INT UNSIGNED NOT NULL DEFAULT 1,
+            lead_time_days INT UNSIGNED NOT NULL DEFAULT 7,
+            shipping_land DECIMAL(10,2) NOT NULL DEFAULT 0,
+            shipping_sea DECIMAL(10,2) NOT NULL DEFAULT 0,
+            status VARCHAR(20) NOT NULL DEFAULT 'active',
+            notes TEXT DEFAULT NULL,
+            legacy_cpt_id BIGINT UNSIGNED DEFAULT NULL,
+            created_by BIGINT UNSIGNED DEFAULT NULL,
+            updated_by BIGINT UNSIGNED DEFAULT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            deleted_at DATETIME DEFAULT NULL,
+            UNIQUE KEY uq_sku_maker (product_sku, maker_id),
+            KEY idx_maker (maker_id),
+            KEY idx_sku (product_sku),
+            KEY idx_status (status),
+            KEY idx_maker_status (maker_id, status),
+            KEY idx_legacy_cpt (legacy_cpt_id),
+            KEY idx_deleted (deleted_at)
+        ) {$charset};";
+
+        // TABLE 2 — Observations
+        $tbl_obs = $wpdb->prefix . 'dinoco_maker_product_observations';
+        $sql_obs = "CREATE TABLE {$tbl_obs} (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            observed_at DATETIME NOT NULL,
+            source VARCHAR(20) NOT NULL,
+            sku VARCHAR(50) DEFAULT NULL,
+            maker_id BIGINT UNSIGNED DEFAULT NULL,
+            field_name VARCHAR(50) DEFAULT NULL,
+            cpt_value TEXT,
+            junction_value TEXT,
+            diff_detected TINYINT(1) DEFAULT 0,
+            KEY idx_observed (observed_at),
+            KEY idx_diff (diff_detected),
+            KEY idx_maker_sku (maker_id, sku)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $dbdelta_log = array();
+        $dbdelta_log['main'] = dbDelta( $sql_main );
+        $dbdelta_log['obs']  = dbDelta( $sql_obs );
+
+        $junction_ok = b2f_audit_junction_table_exists();
+        $obs_ok      = b2f_audit_observations_table_exists();
+
+        if ( $junction_ok && ! get_option( 'b2f_schema_v10_activated' ) ) {
+            update_option( 'b2f_schema_v10_activated', current_time( 'mysql' ), false );
+        }
+        if ( ! get_option( 'b2f_schema_version' ) ) {
+            update_option( 'b2f_schema_version', '10.1', false );
+        }
+
+        return array(
+            'junction_created'     => $junction_ok,
+            'observations_created' => $obs_ok,
+            'dbdelta_log'          => $dbdelta_log,
         );
     }
 }
@@ -650,8 +813,8 @@ add_action( 'rest_api_init', function () {
     ) );
 
     // ─────────────────────────────────────────────
-    // POST /feature-flags — Phase 1 LOCKED (403)
-    // GET /feature-flags — readable (flag state view)
+    // GET /feature-flags — readable (flag state + phase info)
+    // POST /feature-flags — DEPRECATED (ใช้ /feature-flags/toggle V.2.0 แทน)
     // ─────────────────────────────────────────────
     register_rest_route( B2F_AUDIT_NS, '/feature-flags', array(
         array(
@@ -659,16 +822,27 @@ add_action( 'rest_api_init', function () {
             'permission_callback' => $perm_admin,
             'callback'            => function () {
                 $flags = array();
+                $toggleable = b2f_audit_phase2_toggleable_flags();
                 foreach ( b2f_audit_allowed_flags() as $f ) {
-                    $flags[ $f ] = (bool) get_option( $f, false );
+                    $flags[ $f ] = array(
+                        'value'       => (bool) get_option( $f, false ),
+                        'toggleable'  => in_array( $f, $toggleable, true ),
+                        'lock_reason' => in_array( $f, $toggleable, true )
+                            ? null
+                            : ( $f === 'b2f_flag_auto_sync_sets'
+                                ? 'Phase 2.5 flag — auto-sync SETs ต้อง review baseline ก่อน'
+                                : 'Phase 3 flag — cut-over read path ต้อง dual-write stable ก่อน' ),
+                    );
                 }
                 return rest_ensure_response( array(
                     'success' => true,
                     'data'    => array(
-                        'flags'       => $flags,
-                        'phase'       => 1,
-                        'setter_locked' => true,
-                        'lock_reason' => 'Phase 1 = observe-only. Flag setter จะเปิดใน Phase 2 หลัง review baseline',
+                        'flags'              => $flags,
+                        'phase'              => 2,
+                        'schema_activated'   => b2f_audit_is_schema_activated(),
+                        'backfill_state'     => b2f_audit_get_backfill_state(),
+                        'junction_exists'    => b2f_audit_junction_table_exists(),
+                        'observations_exists'=> b2f_audit_observations_table_exists(),
                     ),
                 ) );
             },
@@ -677,20 +851,440 @@ add_action( 'rest_api_init', function () {
             'methods'             => 'POST',
             'permission_callback' => $perm_admin,
             'callback'            => function () {
-                // PHASE 1: HARDCODED 403 — setter ถูกล็อค
-                if ( function_exists( 'b2b_log' ) ) {
-                    b2b_log( sprintf(
-                        '[B2F Audit] Flag setter blocked (Phase 1 lock) — attempted by uid=%d',
-                        get_current_user_id()
-                    ) );
-                }
                 return new WP_Error(
-                    'phase1_locked',
-                    'Feature flag setter ล็อคใน Phase 1 (observe-only). จะเปิดใน Phase 2',
-                    array( 'status' => 403 )
+                    'deprecated',
+                    'ใช้ POST /feature-flags/toggle แทน (V.2.0)',
+                    array( 'status' => 410 )
                 );
             },
         ),
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /feature-flags/toggle — V.2.0 toggle whitelist flag
+    // Params: { flag_name, value (bool), confirm (true required) }
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/feature-flags/toggle', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'flag_toggle' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            $flag    = sanitize_key( (string) $req->get_param( 'flag_name' ) );
+            $value   = filter_var( $req->get_param( 'value' ), FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE );
+            $confirm = (bool) $req->get_param( 'confirm' );
+
+            if ( ! $confirm ) {
+                return new WP_Error( 'confirm_required', 'ต้องส่ง confirm=true เพื่อยืนยันการ toggle flag', array( 'status' => 400 ) );
+            }
+            if ( $value === null ) {
+                return new WP_Error( 'invalid_value', 'value ต้องเป็น boolean (true/false)', array( 'status' => 400 ) );
+            }
+            if ( ! in_array( $flag, b2f_audit_allowed_flags(), true ) ) {
+                return new WP_Error( 'invalid_flag', 'flag_name ไม่อยู่ใน allowed list', array( 'status' => 400 ) );
+            }
+            if ( ! in_array( $flag, b2f_audit_phase2_toggleable_flags(), true ) ) {
+                return new WP_Error(
+                    'flag_locked',
+                    sprintf( 'Flag %s ยังล็อคอยู่ (Phase 2.5 หรือ Phase 3 เท่านั้น)', $flag ),
+                    array( 'status' => 403 )
+                );
+            }
+
+            // Guard: shadow_write ต้องมี schema + backfill เสร็จก่อน
+            if ( $flag === 'b2f_flag_shadow_write' && $value === true ) {
+                if ( ! b2f_audit_is_schema_activated() ) {
+                    return new WP_Error(
+                        'schema_not_ready',
+                        'ต้อง Activate Schema ก่อนเปิด shadow_write',
+                        array( 'status' => 409 )
+                    );
+                }
+                $state = b2f_audit_get_backfill_state();
+                if ( empty( $state['ran_at'] ) ) {
+                    return new WP_Error(
+                        'backfill_not_ready',
+                        'ต้อง Run Backfill ก่อนเปิด shadow_write',
+                        array( 'status' => 409 )
+                    );
+                }
+            }
+
+            $old = (bool) get_option( $flag, false );
+            $new = (bool) $value;
+            update_option( $flag, $new, false );
+            if ( function_exists( 'b2f_log_flag_change' ) ) {
+                b2f_log_flag_change( $flag, $old, $new, get_current_user_id() );
+            } elseif ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[B2F Audit] flag toggle %s: %s → %s by uid=%d', $flag, var_export($old,true), var_export($new,true), get_current_user_id() ) );
+            }
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'flag_name' => $flag,
+                    'old_value' => $old,
+                    'new_value' => $new,
+                    'changed_at'=> current_time( 'mysql' ),
+                    'uid'       => get_current_user_id(),
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /activate-schema — V.2.0 dbDelta canonical tables
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/activate-schema', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            // destructive action — stricter rate limit (5/hr)
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_audit_activate_' . $uid, 5, HOUR_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            $confirm = (bool) $req->get_param( 'confirm' );
+            if ( ! $confirm ) {
+                return new WP_Error( 'confirm_required', 'ต้องส่ง confirm=true เพื่อยืนยัน schema activation (destructive action)', array( 'status' => 400 ) );
+            }
+
+            if ( b2f_audit_is_schema_activated() ) {
+                return rest_ensure_response( array(
+                    'success' => true,
+                    'data'    => array(
+                        'already_activated' => true,
+                        'activated_at'      => get_option( 'b2f_schema_v10_activated' ),
+                        'schema_version'    => get_option( 'b2f_schema_version', 'unknown' ),
+                        'junction_exists'   => b2f_audit_junction_table_exists(),
+                    ),
+                ) );
+            }
+
+            if ( ! function_exists( 'b2f_audit_activate_schema_v10' ) ) {
+                // database-expert ยังไม่ commit
+                return new WP_Error(
+                    'not_implemented',
+                    'b2f_audit_activate_schema_v10() ยังไม่ deploy (รอ database-expert commit). ตรวจสอบว่า Phase 2 schema snippet sync แล้วหรือยัง',
+                    array( 'status' => 501 )
+                );
+            }
+
+            try {
+                $started = microtime( true );
+                $result  = b2f_audit_activate_schema_v10();
+                $elapsed = round( ( microtime( true ) - $started ) * 1000, 1 );
+
+                $junction_ok = b2f_audit_junction_table_exists();
+                $obs_ok      = b2f_audit_observations_table_exists();
+
+                if ( $junction_ok ) {
+                    update_option( 'b2f_schema_v10_activated', current_time( 'mysql' ), false );
+                    if ( ! get_option( 'b2f_schema_version' ) ) {
+                        update_option( 'b2f_schema_version', '10.1', false );
+                    }
+                }
+
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( sprintf(
+                        '[B2F Audit] Schema activation: junction=%d obs=%d elapsed=%sms by uid=%d',
+                        $junction_ok ? 1 : 0, $obs_ok ? 1 : 0, $elapsed, get_current_user_id()
+                    ) );
+                }
+
+                return rest_ensure_response( array(
+                    'success' => true,
+                    'data'    => array(
+                        'junction_created'    => $junction_ok,
+                        'observations_created'=> $obs_ok,
+                        'schema_version'      => get_option( 'b2f_schema_version', '10.1' ),
+                        'activated_at'        => get_option( 'b2f_schema_v10_activated' ),
+                        'elapsed_ms'          => $elapsed,
+                        'raw_result'          => is_array( $result ) ? $result : array(),
+                    ),
+                ) );
+            } catch ( Throwable $e ) {
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[B2F Audit] Schema activation error: ' . $e->getMessage() );
+                }
+                return new WP_Error( 'activation_failed', 'Schema activation failed: ' . $e->getMessage(), array( 'status' => 500 ) );
+            }
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /backfill — V.2.0 run Phase 2 backfill script
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/backfill', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) {
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_audit_backfill_' . $uid, 5, HOUR_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            $confirm = (bool) $req->get_param( 'confirm' );
+            $dry_run = (bool) $req->get_param( 'dry_run' );
+            if ( ! $confirm && ! $dry_run ) {
+                return new WP_Error( 'confirm_required', 'ต้องส่ง confirm=true หรือ dry_run=1', array( 'status' => 400 ) );
+            }
+
+            if ( ! b2f_audit_is_schema_activated() ) {
+                return new WP_Error( 'schema_not_ready', 'ต้อง Activate Schema ก่อน run Backfill', array( 'status' => 409 ) );
+            }
+
+            // Resolve script path (database-expert deliverable)
+            $candidates = array(
+                ABSPATH . '../scripts/b2f-phase2-backfill.php',
+                ABSPATH . 'scripts/b2f-phase2-backfill.php',
+                dirname( ABSPATH ) . '/scripts/b2f-phase2-backfill.php',
+                WP_CONTENT_DIR . '/scripts/b2f-phase2-backfill.php',
+            );
+            $script_path = null;
+            foreach ( $candidates as $p ) {
+                if ( $p && file_exists( $p ) ) { $script_path = $p; break; }
+            }
+
+            if ( ! $script_path ) {
+                return new WP_Error(
+                    'not_implemented',
+                    'scripts/b2f-phase2-backfill.php ยังไม่ deploy (รอ database-expert commit)',
+                    array( 'status' => 501 )
+                );
+            }
+
+            $started = microtime( true );
+            $b2f_phase2_backfill_dry_run = $dry_run; // surfaced to included script
+            $b2f_phase2_backfill_confirm = $confirm;
+            $result = array();
+
+            try {
+                ob_start();
+                $returned = @include $script_path;
+                $stdout   = ob_get_clean();
+                if ( is_array( $returned ) ) $result = $returned;
+                elseif ( isset( $GLOBALS['b2f_phase2_backfill_result'] ) && is_array( $GLOBALS['b2f_phase2_backfill_result'] ) ) {
+                    $result = $GLOBALS['b2f_phase2_backfill_result'];
+                }
+            } catch ( Throwable $e ) {
+                @ob_end_clean();
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[B2F Audit] Backfill error: ' . $e->getMessage() );
+                }
+                return new WP_Error( 'backfill_failed', 'Backfill failed: ' . $e->getMessage(), array( 'status' => 500 ) );
+            }
+
+            $elapsed = round( ( microtime( true ) - $started ) * 1000, 1 );
+
+            // Normalize result keys
+            $summary = array(
+                'ran_at'        => current_time( 'mysql' ),
+                'dry_run'       => $dry_run,
+                'cpt_migrated'  => intval( $result['cpt_migrated'] ?? ( $result['migrated'] ?? 0 ) ),
+                'orphans_added' => intval( $result['orphans_added'] ?? 0 ),
+                'errors'        => is_array( $result['errors'] ?? null ) ? $result['errors'] : array(),
+                'skipped'       => intval( $result['skipped'] ?? 0 ),
+                'elapsed_ms'    => $elapsed,
+                'uid'           => get_current_user_id(),
+            );
+
+            // Persist state only for real runs
+            if ( ! $dry_run ) {
+                b2f_audit_set_backfill_state( $summary );
+            }
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf(
+                    '[B2F Audit] Backfill %s: migrated=%d orphans=%d errors=%d elapsed=%sms by uid=%d',
+                    $dry_run ? 'DRY' : 'LIVE',
+                    $summary['cpt_migrated'], $summary['orphans_added'], count( $summary['errors'] ),
+                    $elapsed, get_current_user_id()
+                ) );
+            }
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => $summary,
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // GET /backfill-status — V.2.0 read last run summary
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/backfill-status', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function () {
+            $state = b2f_audit_get_backfill_state();
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+            $junction_count = b2f_audit_junction_table_exists()
+                ? intval( $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl}" ) )
+                : null;
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'state'            => $state,
+                    'junction_count'   => $junction_count,
+                    'schema_activated' => b2f_audit_is_schema_activated(),
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // GET /junction-snapshot — V.2.0 read recent junction rows
+    // Params: maker_id (optional), status (optional), limit (default 50)
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/junction-snapshot', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'junction_snapshot' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                return new WP_Error( 'table_missing', 'junction table ยังไม่ถูกสร้าง (Activate Schema ก่อน)', array( 'status' => 404 ) );
+            }
+
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+
+            $maker_id = intval( $req->get_param( 'maker_id' ) );
+            $status   = sanitize_text_field( (string) $req->get_param( 'status' ) );
+            $limit    = max( 1, min( 500, intval( $req->get_param( 'limit' ) ) ?: 50 ) );
+
+            $where  = array( '1=1' );
+            $params = array();
+            if ( $maker_id > 0 ) { $where[] = 'maker_id = %d'; $params[] = $maker_id; }
+            if ( $status !== '' && in_array( $status, array('active','discontinued','pending'), true ) ) {
+                $where[] = 'status = %s'; $params[] = $status;
+            }
+            $where_sql = implode( ' AND ', $where );
+
+            $sql = "SELECT id, product_sku, maker_id, unit_cost, moq, lead_time_days, shipping_land, shipping_sea,
+                           status, notes, legacy_cpt_id, created_by, updated_by, created_at, updated_at, deleted_at
+                    FROM {$tbl}
+                    WHERE {$where_sql}
+                    ORDER BY updated_at DESC
+                    LIMIT %d";
+            $params[] = $limit;
+            $rows = $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
+            if ( ! is_array( $rows ) ) $rows = array();
+
+            // Enrich with maker names
+            $maker_ids = array_unique( array_map( 'intval', array_column( $rows, 'maker_id' ) ) );
+            $maker_names = array();
+            foreach ( $maker_ids as $mid ) {
+                if ( $mid ) $maker_names[ $mid ] = get_the_title( $mid );
+            }
+            foreach ( $rows as &$r ) {
+                $r['maker_name'] = $maker_names[ intval( $r['maker_id'] ) ] ?? '';
+            }
+            unset( $r );
+
+            // Summary counts
+            $total      = intval( $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl}" ) );
+            $active     = intval( $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl} WHERE status='active' AND deleted_at IS NULL" ) );
+            $discont    = intval( $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl} WHERE status='discontinued'" ) );
+
+            // CPT count for comparison
+            $cpt_count = intval( $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type=%s AND post_status IN ('publish','draft')",
+                'b2f_maker_product'
+            ) ) );
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'rows'        => $rows,
+                    'returned'    => count( $rows ),
+                    'limit'       => $limit,
+                    'summary'     => array(
+                        'total'        => $total,
+                        'active'       => $active,
+                        'discontinued' => $discont,
+                        'cpt_count'    => $cpt_count,
+                        'diff_vs_cpt'  => $total - $cpt_count,
+                    ),
+                    'generated_at'=> current_time( 'mysql' ),
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // GET /observations — V.2.0 read recent diff observations
+    // Params: diff_only (bool), maker_id, limit (default 50)
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/observations', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'observations' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            if ( ! b2f_audit_observations_table_exists() ) {
+                return new WP_Error( 'table_missing', 'observations table ยังไม่ถูกสร้าง (Activate Schema ก่อน)', array( 'status' => 404 ) );
+            }
+
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_maker_product_observations';
+
+            $diff_only = filter_var( $req->get_param( 'diff_only' ), FILTER_VALIDATE_BOOLEAN );
+            $maker_id  = intval( $req->get_param( 'maker_id' ) );
+            $limit     = max( 1, min( 500, intval( $req->get_param( 'limit' ) ) ?: 50 ) );
+
+            $where  = array( '1=1' );
+            $params = array();
+            if ( $diff_only )      { $where[] = 'diff_detected = 1'; }
+            if ( $maker_id > 0 )   { $where[] = 'maker_id = %d'; $params[] = $maker_id; }
+            $where_sql = implode( ' AND ', $where );
+
+            $sql = "SELECT id, observed_at, source, sku, maker_id, field_name, cpt_value, junction_value, diff_detected
+                    FROM {$tbl}
+                    WHERE {$where_sql}
+                    ORDER BY observed_at DESC
+                    LIMIT %d";
+            $params[] = $limit;
+            $rows = empty( $params ) || count( $params ) === 1
+                ? $wpdb->get_results( $wpdb->prepare( $sql, $limit ), ARRAY_A )
+                : $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
+            if ( ! is_array( $rows ) ) $rows = array();
+
+            $maker_ids = array_unique( array_map( 'intval', array_column( $rows, 'maker_id' ) ) );
+            $maker_names = array();
+            foreach ( $maker_ids as $mid ) { if ( $mid ) $maker_names[ $mid ] = get_the_title( $mid ); }
+            foreach ( $rows as &$r ) {
+                $r['maker_name'] = $maker_names[ intval( $r['maker_id'] ) ] ?? '';
+            }
+            unset( $r );
+
+            $total = intval( $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl}" ) );
+            $diffs = intval( $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl} WHERE diff_detected=1" ) );
+            $last24 = intval( $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl} WHERE observed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)" ) );
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'rows'        => $rows,
+                    'returned'    => count( $rows ),
+                    'limit'       => $limit,
+                    'summary'     => array(
+                        'total'       => $total,
+                        'diffs'       => $diffs,
+                        'last_24h'    => $last24,
+                    ),
+                    'generated_at'=> current_time( 'mysql' ),
+                ),
+            ) );
+        },
     ) );
 
 } );
@@ -714,9 +1308,59 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
         <div class="b2f-audit-root" data-nonce="<?php echo esc_attr( $nonce ); ?>" data-base="<?php echo esc_url( $base ); ?>">
 
             <div class="b2f-audit-header">
-                <h2 class="b2f-audit-title">📊 B2F Migration Audit <span class="b2f-audit-ver">V.1.0</span></h2>
-                <p class="b2f-audit-sub">Phase 1 — observe-only audit. Feature flag setter ล็อค 403 ใน Phase นี้</p>
+                <h2 class="b2f-audit-title">📊 B2F Migration Audit <span class="b2f-audit-ver">V.2.0</span></h2>
+                <p class="b2f-audit-sub">Phase 2 — Shadow-Write mode. Activate schema → backfill → enable shadow_write flag. Cost data = confidential.</p>
                 <a href="#" class="b2f-audit-refresh" data-action="refresh-all">🔄 Refresh ทั้งหมด</a>
+            </div>
+
+            <!-- PHASE 2 CONTROLS (V.2.0) -->
+            <div class="b2f-audit-section b2f-audit-phase2">
+                <h3>🚀 Phase 2 Controls — Shadow-Write Migration</h3>
+                <div class="b2f-audit-phase2-warning">
+                    ⚠️ <strong>คำเตือน</strong>: Phase 2 สร้าง schema ใหม่ + migrate ข้อมูล. Backup DB ก่อนดำเนินการ. ไม่มี undo button — rollback ต้องใช้ SQL manually.
+                </div>
+
+                <div class="b2f-audit-phase2-status" data-target="phase2-status">
+                    <span class="b2f-audit-phase2-state" data-k="state">⏳ กำลังตรวจสอบสถานะ…</span>
+                </div>
+
+                <div class="b2f-audit-phase2-steps">
+                    <div class="b2f-audit-phase2-step" data-step="1">
+                        <div class="b2f-audit-phase2-step-head">
+                            <span class="b2f-audit-phase2-step-num">1</span>
+                            <span class="b2f-audit-phase2-step-title">Activate Schema</span>
+                            <span class="b2f-audit-phase2-step-state" data-k="schema-state">–</span>
+                        </div>
+                        <p class="b2f-audit-phase2-step-desc">สร้าง canonical junction tables (`dinoco_product_makers` + `dinoco_maker_product_observations`) ผ่าน dbDelta</p>
+                        <button class="b2f-audit-btn" data-action="activate-schema">1️⃣ Activate Schema</button>
+                        <span class="b2f-audit-status" data-target="activate-status"></span>
+                    </div>
+
+                    <div class="b2f-audit-phase2-step" data-step="2">
+                        <div class="b2f-audit-phase2-step-head">
+                            <span class="b2f-audit-phase2-step-num">2</span>
+                            <span class="b2f-audit-phase2-step-title">Run Backfill</span>
+                            <span class="b2f-audit-phase2-step-state" data-k="backfill-state">–</span>
+                        </div>
+                        <p class="b2f-audit-phase2-step-desc">Migrate b2f_maker_product CPT → junction table (เก็บ legacy_cpt_id สำหรับ rollback)</p>
+                        <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="backfill" data-dry="1">🧪 Dry Run</button>
+                        <button class="b2f-audit-btn" data-action="backfill" data-dry="0">2️⃣ Run Backfill</button>
+                        <span class="b2f-audit-status" data-target="backfill-status"></span>
+                        <div class="b2f-audit-phase2-backfill-result" data-target="backfill-result"></div>
+                    </div>
+
+                    <div class="b2f-audit-phase2-step" data-step="3">
+                        <div class="b2f-audit-phase2-step-head">
+                            <span class="b2f-audit-phase2-step-num">3</span>
+                            <span class="b2f-audit-phase2-step-title">Enable Shadow-Write</span>
+                            <span class="b2f-audit-phase2-step-state" data-k="shadow-state">–</span>
+                        </div>
+                        <p class="b2f-audit-phase2-step-desc">เปิด `b2f_flag_shadow_write` → CPT saves จะ dual-write เข้า junction + บันทึก observations</p>
+                        <button class="b2f-audit-btn" data-action="toggle-shadow" data-value="1">3️⃣ Enable Shadow-Write</button>
+                        <button class="b2f-audit-btn b2f-audit-btn-danger" data-action="toggle-shadow" data-value="0">⏸ Disable</button>
+                        <span class="b2f-audit-status" data-target="shadow-status"></span>
+                    </div>
+                </div>
             </div>
 
             <!-- SECTION 1: Parity Overview Cards -->
@@ -749,13 +1393,51 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                 </div>
             </div>
 
-            <!-- SECTION 4: Feature Flags Panel -->
+            <!-- SECTION 4: Feature Flags Panel (V.2.0 — shadow_write toggleable) -->
             <div class="b2f-audit-section">
-                <h3>🚩 Feature Flags Panel <span class="b2f-audit-lock">🔒 LOCKED (Phase 1)</span></h3>
+                <h3>🚩 Feature Flags Panel <span class="b2f-audit-phase-badge">Phase 2</span></h3>
                 <div class="b2f-audit-flags" data-target="flags-panel">
                     <div class="b2f-audit-empty">กำลังโหลด…</div>
                 </div>
-                <p class="b2f-audit-note">Phase 1 = read-only. Setter endpoint จะ return 403 เสมอ. จะเปิดเมื่อเริ่ม Phase 2 (shadow-write).</p>
+                <p class="b2f-audit-note">
+                    <strong>shadow_write</strong> = toggleable (Phase 2). <strong>auto_sync_sets</strong> = locked (Phase 2.5). <strong>read_from_junction</strong> = locked (Phase 3).
+                </p>
+            </div>
+
+            <!-- SECTION 7: Junction Table Snapshot (V.2.0) -->
+            <div class="b2f-audit-section">
+                <h3>📊 Junction Table Snapshot <small>(dinoco_product_makers)</small></h3>
+                <div class="b2f-audit-junction-summary" data-target="junction-summary"></div>
+                <div class="b2f-audit-toolbar">
+                    <select class="b2f-audit-filter-select" data-target="junction-maker">
+                        <option value="">ทุก maker</option>
+                    </select>
+                    <select class="b2f-audit-filter-select" data-target="junction-status">
+                        <option value="">ทุก status</option>
+                        <option value="active">active</option>
+                        <option value="discontinued">discontinued</option>
+                        <option value="pending">pending</option>
+                    </select>
+                    <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="reload-junction">🔄 Reload</button>
+                </div>
+                <div class="b2f-audit-table-wrap" data-target="junction-table">
+                    <div class="b2f-audit-empty">ยังไม่ activate schema — กด "Activate Schema" ด้านบน</div>
+                </div>
+            </div>
+
+            <!-- SECTION 8: Observations / Diff Viewer (V.2.0) -->
+            <div class="b2f-audit-section">
+                <h3>🔍 Diff Observations <small>(dinoco_maker_product_observations)</small></h3>
+                <div class="b2f-audit-obs-summary" data-target="obs-summary"></div>
+                <div class="b2f-audit-toolbar">
+                    <label class="b2f-audit-checkbox">
+                        <input type="checkbox" data-target="obs-diff-only"> แสดงเฉพาะ drift (diff_detected=1)
+                    </label>
+                    <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="reload-obs">🔄 Reload</button>
+                </div>
+                <div class="b2f-audit-table-wrap" data-target="obs-table">
+                    <div class="b2f-audit-empty">ยังไม่ activate schema หรือ shadow_write ยังไม่เปิด</div>
+                </div>
             </div>
 
             <!-- SECTION 5: Dry-Run Export -->
@@ -815,6 +1497,40 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
             .b2f-audit-btn:disabled { opacity: .5; cursor: wait; }
             .b2f-audit-status { margin-left: 12px; font-size: 13px; color: #16a34a; }
             .b2f-audit-status.err { color: #dc2626; }
+            .b2f-audit-btn-ghost { background: #fff; color: #1a237e; border: 1px solid #1a237e; margin-right: 6px; }
+            .b2f-audit-btn-ghost:hover { background: #eef2ff; }
+            .b2f-audit-btn-danger { background: #dc2626; margin-left: 6px; }
+            .b2f-audit-btn-danger:hover { background: #b91c1c; }
+            /* Phase 2 controls */
+            .b2f-audit-phase2 { border-left: 4px solid #1a237e; }
+            .b2f-audit-phase2-warning { background: #fef3c7; border: 1px solid #fcd34d; color: #92400e; padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; }
+            .b2f-audit-phase2-status { margin-bottom: 16px; padding: 10px 14px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 6px; font-size: 13px; color: #075985; }
+            .b2f-audit-phase2-steps { display: flex; flex-direction: column; gap: 14px; }
+            .b2f-audit-phase2-step { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px; }
+            .b2f-audit-phase2-step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+            .b2f-audit-phase2-step-num { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 50%; background: #1a237e; color: #fff; font-weight: 700; font-size: 13px; }
+            .b2f-audit-phase2-step-title { font-weight: 700; font-size: 15px; color: #1f2937; }
+            .b2f-audit-phase2-step-state { margin-left: auto; font-size: 12px; padding: 3px 10px; border-radius: 4px; background: #e2e8f0; color: #475569; }
+            .b2f-audit-phase2-step-state.done { background: #dcfce7; color: #166534; }
+            .b2f-audit-phase2-step-state.pending { background: #fef3c7; color: #92400e; }
+            .b2f-audit-phase2-step-state.blocked { background: #fee2e2; color: #991b1b; }
+            .b2f-audit-phase2-step-desc { margin: 0 0 10px; font-size: 13px; color: #64748b; }
+            .b2f-audit-phase2-backfill-result { margin-top: 10px; font-family: ui-monospace, monospace; font-size: 12px; color: #334155; background: #fff; border: 1px solid #e2e8f0; border-radius: 4px; padding: 0; max-height: 0; overflow: hidden; transition: max-height .2s ease; }
+            .b2f-audit-phase2-backfill-result.shown { padding: 10px 12px; max-height: 400px; overflow-y: auto; }
+            .b2f-audit-phase-badge { font-size: 11px; background: #dbeafe; color: #1e40af; padding: 2px 8px; border-radius: 4px; margin-left: 8px; font-weight: 600; }
+            /* Junction/Obs viewer */
+            .b2f-audit-junction-summary, .b2f-audit-obs-summary { display: flex; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+            .b2f-audit-summary-pill { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 14px; font-size: 13px; color: #475569; }
+            .b2f-audit-summary-pill strong { color: #1a237e; font-size: 15px; }
+            .b2f-audit-summary-pill.warn strong { color: #dc2626; }
+            .b2f-audit-summary-pill.ok strong { color: #16a34a; }
+            .b2f-audit-filter-select { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; margin-right: 8px; }
+            .b2f-audit-checkbox { font-size: 13px; color: #475569; margin-right: 12px; }
+            .b2f-audit-row-diff td { background: #fef2f2 !important; }
+            .b2f-audit-row-match td { color: #94a3b8; }
+            .b2f-audit-flag-toggle { float: right; font-size: 12px; cursor: pointer; background: #fff; border: 1px solid #cbd5e1; border-radius: 4px; padding: 2px 10px; }
+            .b2f-audit-flag-toggle.locked { opacity: .5; cursor: not-allowed; }
+            .b2f-audit-flag-lockreason { margin-top: 6px; font-size: 11px; color: #94a3b8; }
         </style>
 
         <script>
@@ -908,12 +1624,157 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                 if (!data || !data.flags) { wrap.innerHTML = '<div class="b2f-audit-empty">โหลด flags ไม่สำเร็จ</div>'; return; }
                 var html = '';
                 Object.keys(data.flags).forEach(function(k){
-                    var on = !!data.flags[k];
+                    var f = data.flags[k];
+                    var on = !!f.value;
+                    var toggleable = !!f.toggleable;
+                    var btn = toggleable
+                        ? '<button class="b2f-audit-flag-toggle" data-action="flag-toggle" data-flag="' + esc(k) + '" data-value="' + (on ? '0' : '1') + '">' + (on ? '⏸ disable' : '▶ enable') + '</button>'
+                        : '<span class="b2f-audit-flag-toggle locked" title="' + esc(f.lock_reason || 'locked') + '">🔒 locked</span>';
                     html += '<div class="b2f-audit-flag ' + (on ? 'on' : 'off') + '">' +
-                        '<div class="b2f-audit-flag-name">🔒 ' + esc(k) + '</div>' +
+                        '<div class="b2f-audit-flag-name">' + (toggleable ? '🔓' : '🔒') + ' ' + esc(k) + btn + '</div>' +
                         '<div class="b2f-audit-flag-state">' + (on ? '✅ ENABLED' : '⬜ disabled') + '</div>' +
+                        (f.lock_reason ? '<div class="b2f-audit-flag-lockreason">' + esc(f.lock_reason) + '</div>' : '') +
                         '</div>';
                 });
+                wrap.innerHTML = html;
+            }
+
+            // V.2.0: Phase 2 status renderer
+            function renderPhase2Status(data) {
+                if (!data) return;
+                var schemaActivated = !!data.schema_activated;
+                var backfillState = data.backfill_state || {};
+                var backfillDone = !!backfillState.ran_at;
+                var shadowOn = !!(data.flags && data.flags.b2f_flag_shadow_write && data.flags.b2f_flag_shadow_write.value);
+
+                // Overall state
+                var statusEl = root.querySelector('[data-target="phase2-status"] [data-k="state"]');
+                if (statusEl) {
+                    if (shadowOn) {
+                        statusEl.innerHTML = '🟢 <strong>Phase 2 Active</strong> — Shadow-Write ON. CPT saves กำลัง dual-write เข้า junction.';
+                    } else if (backfillDone) {
+                        statusEl.innerHTML = '🟡 <strong>Phase 2 Ready</strong> — Backfill done. พร้อมเปิด shadow_write flag.';
+                    } else if (schemaActivated) {
+                        statusEl.innerHTML = '🔵 <strong>Schema Activated</strong> — รอ backfill. ยังไม่กระทบ production.';
+                    } else {
+                        statusEl.innerHTML = '⏳ <strong>Phase 1 Active</strong> — observe-only. กด "Activate Schema" เพื่อเริ่ม Phase 2.';
+                    }
+                }
+
+                // Step states
+                var s1 = root.querySelector('[data-step="1"] [data-k="schema-state"]');
+                if (s1) {
+                    s1.className = 'b2f-audit-phase2-step-state ' + (schemaActivated ? 'done' : 'pending');
+                    s1.textContent = schemaActivated ? '✓ activated' : 'pending';
+                }
+                var s2 = root.querySelector('[data-step="2"] [data-k="backfill-state"]');
+                if (s2) {
+                    if (!schemaActivated) {
+                        s2.className = 'b2f-audit-phase2-step-state blocked';
+                        s2.textContent = 'blocked (no schema)';
+                    } else if (backfillDone) {
+                        s2.className = 'b2f-audit-phase2-step-state done';
+                        s2.textContent = '✓ ' + (backfillState.cpt_migrated || 0) + ' migrated';
+                    } else {
+                        s2.className = 'b2f-audit-phase2-step-state pending';
+                        s2.textContent = 'pending';
+                    }
+                }
+                var s3 = root.querySelector('[data-step="3"] [data-k="shadow-state"]');
+                if (s3) {
+                    if (!backfillDone) {
+                        s3.className = 'b2f-audit-phase2-step-state blocked';
+                        s3.textContent = 'blocked (no backfill)';
+                    } else if (shadowOn) {
+                        s3.className = 'b2f-audit-phase2-step-state done';
+                        s3.textContent = '✓ enabled';
+                    } else {
+                        s3.className = 'b2f-audit-phase2-step-state pending';
+                        s3.textContent = 'pending';
+                    }
+                }
+
+                // Disable buttons accordingly
+                var btnActivate = root.querySelector('[data-action="activate-schema"]');
+                if (btnActivate) {
+                    btnActivate.disabled = schemaActivated;
+                    if (schemaActivated) btnActivate.textContent = '✅ Activated';
+                }
+                root.querySelectorAll('[data-action="backfill"]').forEach(function(b){
+                    b.disabled = !schemaActivated;
+                });
+                root.querySelectorAll('[data-action="toggle-shadow"]').forEach(function(b){
+                    b.disabled = !backfillDone;
+                });
+            }
+
+            function renderJunctionSnapshot(data) {
+                var wrap = root.querySelector('[data-target="junction-table"]');
+                var sumWrap = root.querySelector('[data-target="junction-summary"]');
+                if (!data) { wrap.innerHTML = '<div class="b2f-audit-empty">โหลดไม่สำเร็จ</div>'; return; }
+                var s = data.summary || {};
+                var diffClass = (s.diff_vs_cpt === 0) ? 'ok' : (Math.abs(s.diff_vs_cpt) > 5 ? 'warn' : '');
+                sumWrap.innerHTML =
+                    '<div class="b2f-audit-summary-pill">Total: <strong>' + (s.total||0) + '</strong></div>' +
+                    '<div class="b2f-audit-summary-pill ok">Active: <strong>' + (s.active||0) + '</strong></div>' +
+                    '<div class="b2f-audit-summary-pill">Discontinued: <strong>' + (s.discontinued||0) + '</strong></div>' +
+                    '<div class="b2f-audit-summary-pill">CPT count: <strong>' + (s.cpt_count||0) + '</strong></div>' +
+                    '<div class="b2f-audit-summary-pill ' + diffClass + '">Diff vs CPT: <strong>' + (s.diff_vs_cpt>=0?'+':'') + (s.diff_vs_cpt||0) + '</strong></div>';
+                if (!data.rows || !data.rows.length) {
+                    wrap.innerHTML = '<div class="b2f-audit-empty">ไม่มีข้อมูล (junction table ว่าง — กด "Run Backfill")</div>';
+                    return;
+                }
+                var html = '<table class="b2f-audit-table"><thead><tr>' +
+                    '<th>SKU</th><th>Maker</th><th>Unit Cost</th><th>MOQ</th><th>Status</th><th>Updated</th><th>Legacy ID</th>' +
+                    '</tr></thead><tbody>';
+                data.rows.forEach(function(r){
+                    html += '<tr>' +
+                        '<td><code>' + esc(r.product_sku) + '</code></td>' +
+                        '<td>' + esc(r.maker_name || '#' + r.maker_id) + '</td>' +
+                        '<td>' + parseFloat(r.unit_cost || 0).toFixed(2) + '</td>' +
+                        '<td>' + esc(r.moq) + '</td>' +
+                        '<td><span class="b2f-audit-badge b2f-audit-badge-' + (r.status === 'active' ? 'orphan' : 'stale') + '">' + esc(r.status) + '</span></td>' +
+                        '<td><small>' + esc(r.updated_at) + '</small></td>' +
+                        '<td>' + esc(r.legacy_cpt_id || '–') + '</td>' +
+                        '</tr>';
+                });
+                html += '</tbody></table>';
+                if (data.returned < s.total) {
+                    html += '<p class="b2f-audit-note">แสดง ' + data.returned + ' rows จาก ' + s.total + ' total (เพิ่ม ?limit= ใน endpoint หรือ filter)</p>';
+                }
+                wrap.innerHTML = html;
+            }
+
+            function renderObservations(data) {
+                var wrap = root.querySelector('[data-target="obs-table"]');
+                var sumWrap = root.querySelector('[data-target="obs-summary"]');
+                if (!data) { wrap.innerHTML = '<div class="b2f-audit-empty">โหลดไม่สำเร็จ</div>'; return; }
+                var s = data.summary || {};
+                sumWrap.innerHTML =
+                    '<div class="b2f-audit-summary-pill">Total: <strong>' + (s.total||0) + '</strong></div>' +
+                    '<div class="b2f-audit-summary-pill ' + ((s.diffs||0) > 0 ? 'warn' : 'ok') + '">Drifts: <strong>' + (s.diffs||0) + '</strong></div>' +
+                    '<div class="b2f-audit-summary-pill">Last 24h: <strong>' + (s.last_24h||0) + '</strong></div>';
+                if (!data.rows || !data.rows.length) {
+                    wrap.innerHTML = '<div class="b2f-audit-empty">ไม่มี observations (shadow_write ยังไม่เปิด หรือยังไม่มี CPT save หลัง Phase 2)</div>';
+                    return;
+                }
+                var html = '<table class="b2f-audit-table"><thead><tr>' +
+                    '<th>Observed</th><th>Source</th><th>Maker</th><th>SKU</th><th>Field</th><th>CPT Value</th><th>Junction Value</th><th>Diff</th>' +
+                    '</tr></thead><tbody>';
+                data.rows.forEach(function(r){
+                    var cls = r.diff_detected == 1 ? 'b2f-audit-row-diff' : 'b2f-audit-row-match';
+                    html += '<tr class="' + cls + '">' +
+                        '<td><small>' + esc(r.observed_at) + '</small></td>' +
+                        '<td>' + esc(r.source) + '</td>' +
+                        '<td>' + esc(r.maker_name || '#' + r.maker_id) + '</td>' +
+                        '<td><code>' + esc(r.sku) + '</code></td>' +
+                        '<td>' + esc(r.field_name) + '</td>' +
+                        '<td>' + esc(r.cpt_value) + '</td>' +
+                        '<td>' + esc(r.junction_value) + '</td>' +
+                        '<td>' + (r.diff_detected == 1 ? '🔴' : '⚪') + '</td>' +
+                        '</tr>';
+                });
+                html += '</tbody></table>';
                 wrap.innerHTML = html;
             }
 
