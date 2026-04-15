@@ -1,13 +1,12 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.10.1 — Code review fixes: (H1+M1) unified dual-write gate — call b2f_dual_write_to_junction() inline only when read_from_junction=ON AND shadow_write=OFF (avoid double UPSERT when both ON, since save_post hook in Snippet 0.5 already handles shadow_write case); (H2) b2f_list_maker_products_junction shows pending/discontinued (match CPT path which doesn't filter by status), ordered active→pending→discontinued; (M4) remove lowercase fallback in b2f_read_maker_product CPT path (sku already uppercase-normalized at entry — fallback was misleading + masked legacy data issues that need migration not runtime workaround).
  * Version: V.10.0 — Phase 3 cut-over: reads switch CPT → junction table (`wp_dinoco_product_makers`) gated by `b2f_flag_read_from_junction`. New helpers `b2f_read_maker_product()` + `b2f_list_maker_products_junction()`. Flag ON → list/format/create-po อ่านจาก junction (116 rows incl. 13 orphan SETs) + skip virtual SET inject (V.9.19) + skip auto-compute fallback (V.9.18). Flag OFF → CPT fallback (backward compat). save/delete dual-write ทั้ง CPT+junction. Response shape preserved. `function_exists()` guard ทุก helper (Snippet 0.5 dual-write + Snippet 1 flag helper)
- * Version: V.9.17 — REVERT virtual SET injection (V.9.14–V.9.16) — user บ่น "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย". B2F maker products = เฉพาะที่ admin register จริง ใน b2f_maker_product CPT. + เคารพ ui_role_override (badge-only — mirror Inventory V.42.14): เพิ่ม `ui_role_override` ใน format output + `auto_type` preserved สำหรับ grouping (DD-7 / cart / PO). Frontend badge ตรง Product Catalog 100% (e.g. DNCGNDPROT500 override=single → B2F แสดง "เดี่ยว")
- * Version: V.9.16 — Virtual SET cost: sum leaves' mp_unit_cost (not hardcoded 0). Adds `virtual_cost_breakdown[]` + `virtual_cost_complete`. Frontend shows accurate price instead of ฿0. Verified via temp debug-vset (removed in V.9.16.2)
- * Version: V.9.15 — Cleanup: remove TEMP debug endpoints (used to diagnose NX500 filter issue, root cause fixed in V.9.14)
  * Version: V.9.19 — Opt-in virtual SET injection (?include_virtual=1) → LIFF เห็น SETs ที่ maker ผลิตได้ (leaves registered ครบ) + cleanup temp debug endpoint
  * Version: V.9.18 — SET cost auto-compute: sum(leaves.mp_unit_cost) เมื่อ children registered
- * Version: V.9.17 — Revert V.9.14 virtual SET injection + respect ui_role_override (badge-only)
- * Version: V.9.14-V.9.16 — (REVERTED) virtual SET injection experiment [REVERTED in V.9.17]
+ * Version: V.9.17 — REVERT virtual SET injection (V.9.14–V.9.16) — user บ่น "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย". B2F maker products = เฉพาะที่ admin register จริง ใน b2f_maker_product CPT. + เคารพ ui_role_override (badge-only — mirror Inventory V.42.14): เพิ่ม `ui_role_override` ใน format output + `auto_type` preserved สำหรับ grouping (DD-7 / cart / PO). Frontend badge ตรง Product Catalog 100% (e.g. DNCGNDPROT500 override=single → B2F แสดง "เดี่ยว")
+ * Version: V.9.14-V.9.16 — (REVERTED in V.9.17) Virtual SET injection experiment + cost compute. Replaced by V.9.19 opt-in version.
+ * Version: V.9.15 — Cleanup: remove TEMP debug endpoints (used to diagnose NX500 filter issue, root cause fixed in V.9.14)
  * Version: V.9.12 — catalog_map: batch lookup ผ่าน DINOCO_Catalog::get_by_skus() (single SQL WHERE IN) — fix N+1 query pattern ของ V.9.11 (เดิม loop เรียก get_by_sku() ต่อ SKU → 200+ queries ต่อ call)
  * Version: V.9.11 — maker-products: expose catalog_map (sku→{compatible_models, name, image_url}) for ALL SKUs in hierarchy tree (รวม leaves ที่ Maker ไม่ได้ register) → LIFF filter NX500/model ใช้ data จาก source of truth (wp_dinoco_products) เหมือน Product Catalog
  * Version: V.9.10 — DD-3 Shared Child: DD-7 collect breakdown[] + save poi_parent_breakdown JSON + po-detail return parent_breakdown
@@ -737,19 +736,14 @@ if ( ! function_exists( 'b2f_read_maker_product' ) ) {
             ),
         ) );
         if ( empty( $mp ) ) {
-            // Try raw SKU (case-preserving) fallback
-            $mp = get_posts( array(
-                'post_type'      => 'b2f_maker_product',
-                'posts_per_page' => 1,
-                'post_status'    => 'publish',
-                'meta_query'     => array(
-                    'relation' => 'AND',
-                    array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
-                    array( 'key' => 'mp_product_sku', 'value' => strtolower( $sku ) ),
-                ),
-            ) );
+            // V.10.1: Removed lowercase retry block. SKU is normalized to uppercase
+            // at function entry (b2f_read_maker_product line 1: $sku = strtoupper(trim($sku))),
+            // so legacy data with mixed-case `mp_product_sku` postmeta indicates a
+            // data-integrity issue that must be fixed via migration (UPDATE postmeta
+            // SET meta_value = UPPER(meta_value) WHERE meta_key = 'mp_product_sku'),
+            // not papered over with runtime fallback that masked the bug.
+            return null;
         }
-        if ( empty( $mp ) ) return null;
         $mp_id = $mp[0]->ID;
         return array(
             'product_sku'    => (string) ( get_field( 'mp_product_sku', $mp_id ) ?: $sku ),
@@ -770,7 +764,14 @@ if ( ! function_exists( 'b2f_read_maker_product' ) ) {
 
 if ( ! function_exists( 'b2f_list_maker_products_junction' ) ) {
     /**
-     * V.10.0: List maker products from junction table (active, not soft-deleted).
+     * V.10.0: List maker products from junction table.
+     * V.10.1: Match CPT path behavior — show all non-deleted (active + pending +
+     *         discontinued). CPT path doesn't filter by mp_status, so admin uses
+     *         pending/discontinued as soft states (still visible in product list,
+     *         just labeled). Filtering to status='active' here was a silent
+     *         behavior change between Phase 2 (CPT) and Phase 3 (junction).
+     *         Order: active first, then pending, then discontinued (admin sees
+     *         active SKUs at top of list).
      *
      * @param int $maker_id
      * @return array rows from wp_dinoco_product_makers
@@ -784,8 +785,7 @@ if ( ! function_exists( 'b2f_list_maker_products_junction' ) ) {
             "SELECT * FROM {$tbl}
              WHERE maker_id = %d
                AND deleted_at IS NULL
-               AND status = 'active'
-             ORDER BY product_sku ASC",
+             ORDER BY FIELD(status, 'active', 'pending', 'discontinued'), product_sku ASC",
             $maker_id
         ), ARRAY_A );
         return is_array( $rows ) ? $rows : array();
@@ -1465,16 +1465,34 @@ if ( ! function_exists( 'b2f_rest_save_maker_product' ) ) {
             update_field( 'mp_status', sanitize_text_field( $mp_status ), $id );
         }
 
-        // V.10.0: Dual-write junction table when Phase 3 flag ON
-        // (Snippet 0.5 save_post hook also dual-writes when shadow_write ON,
-        //  but we call explicitly here to guarantee sync under read-from-junction
-        //  regardless of shadow_write state — read path depends on junction rows.)
+        // V.10.1 — Unified dual-write gate (H1 + M1)
+        //
+        // Truth table — when does junction get written?
+        //   shadow_write | read_from_junction | who writes?
+        //   -------------|--------------------|-------------------
+        //        OFF     |        OFF         | nobody (Phase 1, observe-only)
+        //        ON      |        OFF         | Snippet 0.5 save_post hook (Phase 2 shadow)
+        //        OFF     |        ON          | THIS BLOCK (Phase 3 no-shadow, unusual)
+        //        ON      |        ON          | Snippet 0.5 save_post hook (typical Phase 3)
+        //
+        // Gate: only call inline when read_from_junction=ON AND shadow_write=OFF.
+        // Rationale:
+        //   - update_field() writes postmeta synchronously → save_post fires DURING
+        //     update_field, so by the time we reach this point the hook has either
+        //     already run (shadow ON) or won't run (shadow OFF).
+        //   - Calling b2f_dual_write_to_junction() inline when shadow ON = double
+        //     UPSERT + double observation row (bloat + redundant writes).
+        //   - Skipping inline when shadow ON ALSO when junction ON is safe because
+        //     the hook already covered it.
+        $flag_shadow   = function_exists( 'b2f_is_flag_enabled' )
+            && b2f_is_flag_enabled( 'b2f_flag_shadow_write' );
         $flag_junction = function_exists( 'b2f_is_flag_enabled' )
             && b2f_is_flag_enabled( 'b2f_flag_read_from_junction' );
-        if ( $flag_junction && function_exists( 'b2f_dual_write_to_junction' ) ) {
+
+        if ( $flag_junction && ! $flag_shadow && function_exists( 'b2f_dual_write_to_junction' ) ) {
             $dw = b2f_dual_write_to_junction( $id );
             if ( is_wp_error( $dw ) && function_exists( 'b2f_log' ) ) {
-                b2f_log( '[V.10.0] save_maker_product dual-write failed mp_id=' . $id . ': ' . $dw->get_error_message() );
+                b2f_log( '[V.10.1] save_maker_product inline dual-write failed mp_id=' . $id . ': ' . $dw->get_error_message() );
             }
         }
 

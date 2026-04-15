@@ -1,5 +1,6 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.1 — Code review fixes: (C1) remove dead $candidates loop in b2f_audit_build_dry_run_csv (PHP 8.2 fatal); (H3) orphan backfill recomputes cost on re-run (was no-op `id=id`); (M2) cleanup dead ternary in /observations endpoint; (M3) pre-warm postmeta cache before backfill transaction (scaling); (L3) document collation decision in schema activation comment.
  * Version: V.3.0 — Phase 3 cut-over: unlock `b2f_flag_read_from_junction` toggle (guard = schema activated + backfill done + shadow_write ON) + Step 4 "Enable Read from Junction" button + phase3 status renderer. LIFF B2F read path switches CPT → junction when flag ON. Immediate rollback: toggle OFF. Paired with Snippet 2 V.10.0 + Snippet 0.5 V.1.0.
  * Version: V.2.0 — Phase 2 Shadow-Write controls (activate-schema, backfill, flag toggler, junction/observations viewer)
  * Version: V.2.1 — Inline b2f_phase2_run_backfill() (replaces scripts/b2f-phase2-backfill.php — WP Code Snippets ไม่ sync scripts/)
@@ -53,7 +54,7 @@ if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
 // SECTION 0: CONSTANTS + ALLOWED FLAG LIST
 // ═══════════════════════════════════════════════════════════════════
 
-if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.0' );
+if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.1' );
 if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
 
 if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
@@ -134,10 +135,22 @@ if ( ! function_exists( 'b2f_audit_observations_table_exists' ) ) {
  *   - wp_dinoco_product_makers (junction table, UNIQUE sku+maker)
  *   - wp_dinoco_maker_product_observations (shadow-write drift log)
  *
- * NOTE: dbDelta ไม่รองรับ COLLATE เจาะจงต่อคอลัมน์ดี (parser quirks). ใช้ default
- * $charset_collate (utf8mb4_unicode_ci) กับทุกคอลัมน์ — case-sensitive matching
- * enforce ที่ application layer (strtoupper() ก่อน query) ซึ่ง b2b_get_product_data()
- * + dinoco_sku_relations ใช้ pattern นี้อยู่แล้ว
+ * V.3.1: COLLATION DECISION (explicit, do not change without migration plan):
+ *   - dbDelta() ไม่ support per-column COLLATE clause well (parser quirks),
+ *     และ Codex docs แนะนำให้ใช้ table-default $wpdb->get_charset_collate()
+ *     ซึ่ง MySQL/MariaDB defaults = utf8mb4_unicode_ci (case-INSENSITIVE).
+ *   - ผลกระทบ: SQL query "WHERE product_sku = 'dncxxx'" จะ match row 'DNCXXX'
+ *     ที่ database layer. ถ้า business rule ต้องการ case-sensitive (DNCXXX ≠ dncxxx
+ *     เป็นคนละ SKU) ระบบนี้ "จะแตก".
+ *   - DECISION: case-sensitivity NOT required (DINOCO SKU ทุกตัว uppercase by convention).
+ *     Application layer (b2f_read_maker_product, b2f_audit_catalog_name) ยังบังคับ
+ *     `$sku = strtoupper( trim( $sku ) )` + UPPER(product_sku) ใน WHERE clause
+ *     เพื่อ defense-in-depth + ป้องกัน data ที่ legacy CPT บันทึก mixed case
+ *     (mp_product_sku stored verbatim ใน postmeta).
+ *   - ถ้า future requirement = case-sensitive SKUs:
+ *     ALTER TABLE wp_dinoco_product_makers MODIFY product_sku VARCHAR(50) COLLATE utf8mb4_bin;
+ *     ALTER TABLE wp_dinoco_maker_product_observations MODIFY sku VARCHAR(50) COLLATE utf8mb4_bin;
+ *     + remove all UPPER() / strtoupper() normalize calls.
  *
  * Idempotent: dbDelta เช็ค schema diff → run CREATE / ALTER เฉพาะที่ต่าง
  *
@@ -267,6 +280,14 @@ if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
             'no_found_rows'  => true,
         ) );
 
+        // V.3.1: Pre-warm postmeta cache BEFORE transaction begins.
+        // get_field()/get_post_meta() inside the loop become cache hits → no row-level
+        // SELECTs while the InnoDB transaction holds locks. Significant scaling win
+        // for makers with hundreds of products (avoids 8 SELECTs per CPT inside lock).
+        if ( ! empty( $maker_products ) && function_exists( 'update_postmeta_cache' ) ) {
+            update_postmeta_cache( $maker_products );
+        }
+
         if ( ! $dry_run ) $wpdb->query( 'START TRANSACTION' );
 
         $actor_uid = intval( $actor_uid );
@@ -368,13 +389,23 @@ if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
 
                 if ( $dry_run ) { $result['orphans_added']++; continue; }
 
+                // V.3.1: Recompute fields on re-run (was no-op `id = id` → re-running backfill
+                // after registering more leaves left orphan SET cost stale at first-run value).
+                // lead_time uses GREATEST() to honor newly-discovered slower leaves.
                 $sql = $wpdb->prepare(
                     "INSERT INTO {$tbl}
                         (product_sku, maker_id, unit_cost, moq, lead_time_days,
                          shipping_land, shipping_sea, status, notes,
                          legacy_cpt_id, created_by, updated_by, created_at, updated_at)
                      VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, NULL, %d, %d, %s, %s)
-                     ON DUPLICATE KEY UPDATE id = id",
+                     ON DUPLICATE KEY UPDATE
+                        unit_cost      = VALUES(unit_cost),
+                        lead_time_days = GREATEST(lead_time_days, VALUES(lead_time_days)),
+                        shipping_land  = VALUES(shipping_land),
+                        shipping_sea   = VALUES(shipping_sea),
+                        notes          = VALUES(notes),
+                        updated_by     = VALUES(updated_by),
+                        updated_at     = VALUES(updated_at)",
                     $sku, $maker_id, $sum_cost, 1, $max_lt,
                     $sum_land, $sum_sea, 'active', $auto_notes,
                     $actor_uid, $actor_uid, $now, $now
@@ -740,42 +771,8 @@ if ( ! function_exists( 'b2f_audit_catalog_meta' ) ) {
  */
 if ( ! function_exists( 'b2f_audit_build_dry_run_csv' ) ) {
     function b2f_audit_build_dry_run_csv() {
-        // V.1.1: Use inline fallback directly (script has bugged ACF field names — fix Phase 1.2)
-        // Strict rule now implemented in b2f_audit_get_orphan_sets() — skip script path
-        $script_path = null;
-        $_candidates_disabled = array(
-            ABSPATH . '../scripts/b2f-migrate-dry-run.php',
-            ABSPATH . 'scripts/b2f-migrate-dry-run.php',
-            dirname( ABSPATH ) . '/scripts/b2f-migrate-dry-run.php',
-            WP_CONTENT_DIR . '/scripts/b2f-migrate-dry-run.php',
-        );
-        foreach ( $candidates as $p ) {
-            if ( $p && file_exists( $p ) ) { $script_path = $p; break; }
-        }
-
-        if ( $script_path ) {
-            // Capture script's direct output (it streams fputcsv to php://output)
-            // WARNING: script also calls header() — acceptable เพราะ REST endpoint
-            // ยัง redirect header ของตัวเองทีหลัง (WordPress tolerant, buffer catches stray echo)
-            ob_start();
-            try {
-                // @include — script may echo or @set_time_limit
-                @include $script_path;
-            } catch ( Throwable $e ) {
-                if ( function_exists( 'b2b_log' ) ) {
-                    b2b_log( '[B2F Audit] dry-run script error: ' . $e->getMessage() );
-                }
-            }
-            $csv = ob_get_clean();
-            // Strip UTF-8 BOM if script added it (REST layer will add its own)
-            if ( is_string( $csv ) && substr( $csv, 0, 3 ) === "\xEF\xBB\xBF" ) {
-                $csv = substr( $csv, 3 );
-            }
-            if ( is_string( $csv ) && strlen( $csv ) > 50 ) return $csv;
-            // else fall through to inline fallback
-        }
-
-        // Fallback: inline drift + stale CSV
+        // V.3.1: Script path fully removed (was disabled in V.1.1, dead $candidates loop caused PHP 8.2 fatal).
+        // Strict rule implemented inline via b2f_audit_get_orphan_sets() + b2f_audit_get_stale_records().
         $orphans = b2f_audit_get_orphan_sets();
         $stale   = b2f_audit_get_stale_records( 90 );
 
@@ -1460,10 +1457,10 @@ add_action( 'rest_api_init', function () {
                     WHERE {$where_sql}
                     ORDER BY observed_at DESC
                     LIMIT %d";
+            // V.3.1: $params always ends with $limit (and may include maker_id) →
+            //        single prepare() call works either way (ternary was dead code).
             $params[] = $limit;
-            $rows = empty( $params ) || count( $params ) === 1
-                ? $wpdb->get_results( $wpdb->prepare( $sql, $limit ), ARRAY_A )
-                : $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
+            $rows = $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
             if ( ! is_array( $rows ) ) $rows = array();
 
             $maker_ids = array_unique( array_map( 'intval', array_column( $rows, 'maker_id' ) ) );
