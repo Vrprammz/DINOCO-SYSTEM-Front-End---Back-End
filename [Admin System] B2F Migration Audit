@@ -1,0 +1,851 @@
+/**
+ * [Admin System] B2F Migration Audit
+ * Version: V.1.0 — Phase 1 observe-only audit + feature flags + dry-run trigger
+ * DB_ID: (auto-assign after WP creates snippet)
+ * Purpose: Audit dashboard + dry-run CSV export สำหรับ B2F Option F migration
+ * Shortcode: [b2f_migration_audit]
+ * REST namespace: /wp-json/dinoco-b2f-audit/v1/
+ * Dependencies: B2B Snippet 1 (b2b_rate_limit, b2b_log), Snippet 15 (DINOCO_Catalog), B2F Snippet 0/1/2
+ * Kill Switch: B2F_DISABLED
+ *
+ * PHASE 1 SCOPE (observe-only)
+ *   - 5 REST endpoints (drift, stale, parity, dry-run, feature-flags)
+ *   - Feature flag setter: 403 hardcoded (setter locked ใน Phase 1)
+ *   - Shortcode UI: 6 dashboard sections
+ *   - Dry-run trigger ผ่าน scripts/b2f-migrate-dry-run.php (ถ้ามี) หรือ inline logic
+ *
+ * FEATURE FLAGS (wp_options, default=false ทุกตัว, Phase 1 = อ่านอย่างเดียว)
+ *   - b2f_flag_auto_sync_sets       — Phase 2 flip (auto-sync SET registration)
+ *   - b2f_flag_shadow_write         — Phase 2 flip (dual-write CPT + canonical)
+ *   - b2f_flag_read_from_junction   — Phase 3 flip (reads ไป canonical table)
+ *
+ * REFERENCE
+ *   B2F-ARCHITECTURE-PLAN.md — Option F Hybrid Shadow-Write
+ *   scripts/b2f-migrate-dry-run.php — database-expert deliverable V.1.0 (commit 7d23e50)
+ *     Actions: ADD | FLAG_STALE | REMOVE_ORPHAN
+ *     CSV cols: maker_id, maker_name, sku, action, current_cost, computed_cost, reason, notes
+ *   scripts/b2f-audit-queries.sql — SQL reference queries (future refactor target)
+ */
+
+if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 0: CONSTANTS + ALLOWED FLAG LIST
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.1.0' );
+if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
+
+if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
+    function b2f_audit_allowed_flags() {
+        return array(
+            'b2f_flag_auto_sync_sets',
+            'b2f_flag_shadow_write',
+            'b2f_flag_read_from_junction',
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 1: HELPERS — DRIFT / STALE / PARITY QUERIES
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * ดึง orphan SETs per maker — SET ที่ maker "แตะ" (มี child/leaf ของตัว SET
+ * registered ใน b2f_maker_product CPT) แต่ตัว SET เองไม่ถูก registered
+ *
+ * TODO (Phase 1 handoff): ถ้า database-expert commit scripts/b2f-audit-queries.sql
+ * ให้ refactor ใช้ SQL helper ของเขาแทน inline logic นี้
+ */
+if ( ! function_exists( 'b2f_audit_get_orphan_sets' ) ) {
+    function b2f_audit_get_orphan_sets() {
+        global $wpdb;
+
+        $relations = get_option( 'dinoco_sku_relations', array() );
+        if ( ! is_array( $relations ) || empty( $relations ) ) return array();
+
+        // สร้าง reverse map: leaf_sku → [parent_set_sku, ...]
+        // รวม grandchild ด้วย (walk full hierarchy up to depth 3)
+        $descendant_to_ancestors = array();
+        foreach ( $relations as $parent_sku => $children ) {
+            if ( ! is_array( $children ) ) continue;
+            $parent_u = strtoupper( (string) $parent_sku );
+            foreach ( $children as $child ) {
+                $child_u = strtoupper( (string) $child );
+                if ( ! isset( $descendant_to_ancestors[ $child_u ] ) ) {
+                    $descendant_to_ancestors[ $child_u ] = array();
+                }
+                $descendant_to_ancestors[ $child_u ][] = $parent_u;
+
+                // walk grandchildren
+                if ( isset( $relations[ $child_u ] ) && is_array( $relations[ $child_u ] ) ) {
+                    foreach ( $relations[ $child_u ] as $gc ) {
+                        $gc_u = strtoupper( (string) $gc );
+                        if ( ! isset( $descendant_to_ancestors[ $gc_u ] ) ) {
+                            $descendant_to_ancestors[ $gc_u ] = array();
+                        }
+                        $descendant_to_ancestors[ $gc_u ][] = $parent_u;
+                    }
+                }
+                // case-insensitive fallback key (legacy data may be mixed case)
+                if ( isset( $relations[ $child ] ) && is_array( $relations[ $child ] ) ) {
+                    foreach ( $relations[ $child ] as $gc ) {
+                        $gc_u = strtoupper( (string) $gc );
+                        if ( ! isset( $descendant_to_ancestors[ $gc_u ] ) ) {
+                            $descendant_to_ancestors[ $gc_u ] = array();
+                        }
+                        $descendant_to_ancestors[ $gc_u ][] = $parent_u;
+                    }
+                }
+            }
+        }
+
+        // ดึง maker products ทั้งหมด: (maker_id, sku)
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT p.ID AS post_id,
+                    mk.meta_value AS maker_id,
+                    sk.meta_value AS sku
+             FROM {$wpdb->posts} p
+             LEFT JOIN {$wpdb->postmeta} mk ON mk.post_id = p.ID AND mk.meta_key = %s
+             LEFT JOIN {$wpdb->postmeta} sk ON sk.post_id = p.ID AND sk.meta_key = %s
+             WHERE p.post_type = %s AND p.post_status IN ('publish','draft')",
+            'mp_maker_id', 'mp_product_sku', 'b2f_maker_product'
+        ), ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // จัดกลุ่ม sku per maker
+        $maker_skus = array();
+        foreach ( $rows as $r ) {
+            $mid = intval( $r['maker_id'] );
+            $sku = strtoupper( trim( (string) $r['sku'] ) );
+            if ( ! $mid || ! $sku ) continue;
+            if ( ! isset( $maker_skus[ $mid ] ) ) $maker_skus[ $mid ] = array();
+            $maker_skus[ $mid ][ $sku ] = true;
+        }
+
+        // สำหรับแต่ละ maker → หาดู descendant ที่ registered → หา SET ancestor → เช็ค SET registered ไหม
+        $orphans = array();
+        foreach ( $maker_skus as $mid => $sku_set ) {
+            $seen_sets = array(); // dedupe
+            foreach ( array_keys( $sku_set ) as $sku ) {
+                if ( ! isset( $descendant_to_ancestors[ $sku ] ) ) continue;
+                foreach ( $descendant_to_ancestors[ $sku ] as $set_sku ) {
+                    if ( isset( $seen_sets[ $set_sku ] ) ) continue;
+                    $seen_sets[ $set_sku ] = true;
+                    // ถ้า SET ไม่อยู่ใน maker_skus[$mid] = orphan
+                    if ( ! isset( $sku_set[ $set_sku ] ) ) {
+                        $orphans[] = array(
+                            'maker_id'     => $mid,
+                            'maker_name'   => get_the_title( $mid ),
+                            'orphan_sku'   => $set_sku,
+                            'orphan_name'  => b2f_audit_catalog_name( $set_sku ),
+                            'reason'       => 'SET not registered, but maker has ≥1 descendant leaf',
+                        );
+                    }
+                }
+            }
+        }
+        return $orphans;
+    }
+}
+
+/**
+ * หา stale mp_unit_cost — records ที่ไม่ถูก update นานเกิน threshold (90 วัน default)
+ * หรือ unit_cost ≤ 0 ทั้งที่ product อยู่ในระบบ
+ */
+if ( ! function_exists( 'b2f_audit_get_stale_records' ) ) {
+    function b2f_audit_get_stale_records( $days = 90 ) {
+        global $wpdb;
+        $threshold = gmdate( 'Y-m-d H:i:s', time() - ( $days * DAY_IN_SECONDS ) );
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT p.ID AS post_id,
+                    p.post_modified_gmt,
+                    mk.meta_value AS maker_id,
+                    sk.meta_value AS sku,
+                    uc.meta_value AS unit_cost,
+                    st.meta_value AS status
+             FROM {$wpdb->posts} p
+             LEFT JOIN {$wpdb->postmeta} mk ON mk.post_id = p.ID AND mk.meta_key = %s
+             LEFT JOIN {$wpdb->postmeta} sk ON sk.post_id = p.ID AND sk.meta_key = %s
+             LEFT JOIN {$wpdb->postmeta} uc ON uc.post_id = p.ID AND uc.meta_key = %s
+             LEFT JOIN {$wpdb->postmeta} st ON st.post_id = p.ID AND st.meta_key = %s
+             WHERE p.post_type = %s
+               AND p.post_status IN ('publish','draft')
+               AND ( p.post_modified_gmt < %s OR CAST(uc.meta_value AS DECIMAL(12,2)) <= 0 )
+             ORDER BY p.post_modified_gmt ASC",
+            'mp_maker_id', 'mp_product_sku', 'mp_unit_cost', 'mp_status',
+            'b2f_maker_product', $threshold
+        ), ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        $out = array();
+        foreach ( $rows as $r ) {
+            $unit = floatval( $r['unit_cost'] );
+            $out[] = array(
+                'post_id'      => intval( $r['post_id'] ),
+                'maker_id'     => intval( $r['maker_id'] ),
+                'maker_name'   => get_the_title( intval( $r['maker_id'] ) ),
+                'sku'          => strtoupper( (string) $r['sku'] ),
+                'unit_cost'    => $unit,
+                'status'       => (string) $r['status'],
+                'last_updated' => (string) $r['post_modified_gmt'],
+                'reason'       => $unit <= 0 ? 'unit_cost ≤ 0' : sprintf( 'no update > %d days', $days ),
+            );
+        }
+        return $out;
+    }
+}
+
+/**
+ * Per-maker parity snapshot — นับจำนวน products, orphan sets, stale records per maker
+ */
+if ( ! function_exists( 'b2f_audit_maker_parity' ) ) {
+    function b2f_audit_maker_parity( $maker_id ) {
+        global $wpdb;
+        $maker_id = intval( $maker_id );
+        if ( ! $maker_id ) return null;
+
+        $maker = get_post( $maker_id );
+        if ( ! $maker || $maker->post_type !== 'b2f_maker' ) return null;
+
+        // Product count
+        $count = intval( $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*)
+             FROM {$wpdb->posts} p
+             JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = %s AND pm.meta_value = %s
+             WHERE p.post_type = %s AND p.post_status IN ('publish','draft')",
+            'mp_maker_id', $maker_id, 'b2f_maker_product'
+        ) ) );
+
+        // Orphan SETs (filter from full list)
+        $all_orphans = b2f_audit_get_orphan_sets();
+        $my_orphans = array_values( array_filter( $all_orphans, function( $o ) use ( $maker_id ) {
+            return intval( $o['maker_id'] ) === $maker_id;
+        } ) );
+
+        // Stale records (filter)
+        $all_stale = b2f_audit_get_stale_records( 90 );
+        $my_stale = array_values( array_filter( $all_stale, function( $s ) use ( $maker_id ) {
+            return intval( $s['maker_id'] ) === $maker_id;
+        } ) );
+
+        return array(
+            'maker_id'        => $maker_id,
+            'maker_name'      => $maker->post_title,
+            'product_count'   => $count,
+            'orphan_sets'     => $my_orphans,
+            'orphan_count'    => count( $my_orphans ),
+            'stale_records'   => $my_stale,
+            'stale_count'     => count( $my_stale ),
+            'parity_score'    => b2f_audit_compute_parity_score( $count, count( $my_orphans ), count( $my_stale ) ),
+        );
+    }
+}
+
+if ( ! function_exists( 'b2f_audit_compute_parity_score' ) ) {
+    function b2f_audit_compute_parity_score( $total, $orphans, $stale ) {
+        if ( $total <= 0 ) return 100;
+        $deduction = ( ( $orphans + $stale ) / max( 1, $total ) ) * 100;
+        $score = max( 0, 100 - $deduction );
+        return round( $score, 1 );
+    }
+}
+
+/**
+ * ดึง catalog name สำหรับ SKU (best-effort จาก wp_dinoco_products)
+ */
+if ( ! function_exists( 'b2f_audit_catalog_name' ) ) {
+    function b2f_audit_catalog_name( $sku ) {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_products';
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT name FROM {$tbl} WHERE UPPER(sku) = %s LIMIT 1",
+            strtoupper( $sku )
+        ) );
+        return $row && $row->name ? $row->name : $sku;
+    }
+}
+
+/**
+ * Build dry-run CSV (in-memory)
+ *
+ * Delegates to `scripts/b2f-migrate-dry-run.php` (database-expert deliverable) ถ้ามี:
+ *   — script outputs CSV ไปที่ php://output ตรง → capture ด้วย ob_start
+ *   — columns ของ script: maker_id, maker_name, sku, action, current_cost, computed_cost, reason, notes
+ *   — actions: ADD | FLAG_STALE | REMOVE_ORPHAN
+ * Fallback: inline drift + stale CSV (columns: maker_id, maker_name, sku, issue_type, details)
+ *
+ * NOTE: script ยิง header() + echo BOM เมื่อ non-CLI — เรา capture ob แล้ว strip BOM
+ * REST endpoint จะตั้ง header เอง (ไม่ให้ซ้อน)
+ */
+if ( ! function_exists( 'b2f_audit_build_dry_run_csv' ) ) {
+    function b2f_audit_build_dry_run_csv() {
+        // Try database-expert script first (common paths)
+        $candidates = array(
+            ABSPATH . '../scripts/b2f-migrate-dry-run.php',
+            ABSPATH . 'scripts/b2f-migrate-dry-run.php',
+            dirname( ABSPATH ) . '/scripts/b2f-migrate-dry-run.php',
+            WP_CONTENT_DIR . '/scripts/b2f-migrate-dry-run.php',
+        );
+        $script_path = null;
+        foreach ( $candidates as $p ) {
+            if ( $p && file_exists( $p ) ) { $script_path = $p; break; }
+        }
+
+        if ( $script_path ) {
+            // Capture script's direct output (it streams fputcsv to php://output)
+            // WARNING: script also calls header() — acceptable เพราะ REST endpoint
+            // ยัง redirect header ของตัวเองทีหลัง (WordPress tolerant, buffer catches stray echo)
+            ob_start();
+            try {
+                // @include — script may echo or @set_time_limit
+                @include $script_path;
+            } catch ( Throwable $e ) {
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[B2F Audit] dry-run script error: ' . $e->getMessage() );
+                }
+            }
+            $csv = ob_get_clean();
+            // Strip UTF-8 BOM if script added it (REST layer will add its own)
+            if ( is_string( $csv ) && substr( $csv, 0, 3 ) === "\xEF\xBB\xBF" ) {
+                $csv = substr( $csv, 3 );
+            }
+            if ( is_string( $csv ) && strlen( $csv ) > 50 ) return $csv;
+            // else fall through to inline fallback
+        }
+
+        // Fallback: inline drift + stale CSV
+        $orphans = b2f_audit_get_orphan_sets();
+        $stale   = b2f_audit_get_stale_records( 90 );
+
+        $fh = fopen( 'php://temp', 'w+' );
+        fputcsv( $fh, array( 'maker_id', 'maker_name', 'sku', 'issue_type', 'details' ) );
+
+        foreach ( $orphans as $o ) {
+            fputcsv( $fh, array(
+                $o['maker_id'], $o['maker_name'], $o['orphan_sku'],
+                'orphan', $o['reason']
+            ) );
+        }
+        foreach ( $stale as $s ) {
+            fputcsv( $fh, array(
+                $s['maker_id'], $s['maker_name'], $s['sku'],
+                'stale', $s['reason'] . ' (last=' . $s['last_updated'] . ')'
+            ) );
+        }
+
+        rewind( $fh );
+        $csv = stream_get_contents( $fh );
+        fclose( $fh );
+        return $csv;
+    }
+}
+
+/**
+ * 7-day drift history (ดึงจาก wp_option snapshot)
+ */
+if ( ! function_exists( 'b2f_audit_get_drift_history' ) ) {
+    function b2f_audit_get_drift_history() {
+        $hist = get_option( 'b2f_drift_history_7d', array() );
+        if ( ! is_array( $hist ) ) $hist = array();
+        return $hist;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 2: REST API REGISTRATION
+// ═══════════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function () {
+
+    $perm_admin = function () {
+        return current_user_can( 'manage_options' );
+    };
+
+    // Rate limit wrapper — 20 req/hour per user per endpoint
+    $rl = function( $endpoint ) {
+        if ( ! function_exists( 'b2b_rate_limit' ) ) return true;
+        $uid = get_current_user_id();
+        $chk = b2b_rate_limit( 'b2f_audit_' . $endpoint . '_' . $uid, 20, HOUR_IN_SECONDS );
+        return $chk;
+    };
+
+    // ─────────────────────────────────────────────
+    // GET /drift — orphan SETs per maker
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/drift', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function () use ( $rl ) {
+            $check = $rl( 'drift' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            $orphans = b2f_audit_get_orphan_sets();
+            // group by maker for UI
+            $by_maker = array();
+            foreach ( $orphans as $o ) {
+                $mid = $o['maker_id'];
+                if ( ! isset( $by_maker[ $mid ] ) ) {
+                    $by_maker[ $mid ] = array(
+                        'maker_id'    => $mid,
+                        'maker_name'  => $o['maker_name'],
+                        'orphan_count'=> 0,
+                        'orphans'     => array(),
+                    );
+                }
+                $by_maker[ $mid ]['orphans'][] = array(
+                    'sku'    => $o['orphan_sku'],
+                    'name'   => $o['orphan_name'],
+                    'reason' => $o['reason'],
+                );
+                $by_maker[ $mid ]['orphan_count']++;
+            }
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'total_orphans' => count( $orphans ),
+                    'by_maker'      => array_values( $by_maker ),
+                    'generated_at'  => current_time( 'mysql' ),
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // GET /stale — stale mp_unit_cost records
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/stale', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'stale' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            $days = intval( $req->get_param( 'days' ) );
+            if ( $days <= 0 ) $days = 90;
+
+            $stale = b2f_audit_get_stale_records( $days );
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'threshold_days' => $days,
+                    'total_stale'    => count( $stale ),
+                    'records'        => $stale,
+                    'generated_at'   => current_time( 'mysql' ),
+                ),
+            ) );
+        },
+        'args' => array(
+            'days' => array( 'type' => 'integer', 'default' => 90 ),
+        ),
+    ) );
+
+    // ─────────────────────────────────────────────
+    // GET /parity/{maker_id} — per-maker parity
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/parity/(?P<maker_id>\d+)', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'parity' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            $mid = intval( $req->get_param( 'maker_id' ) );
+            $data = b2f_audit_maker_parity( $mid );
+            if ( ! $data ) {
+                return new WP_Error( 'not_found', 'Maker not found', array( 'status' => 404 ) );
+            }
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => $data,
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // GET /dry-run — trigger + CSV download
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/dry-run', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'dryrun' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            $csv = b2f_audit_build_dry_run_csv();
+            $stamp = gmdate( 'Ymd-His' );
+            $fname = "b2f-migration-dry-run-{$stamp}.csv";
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[B2F Audit] dry-run triggered by uid=%d', get_current_user_id() ) );
+            }
+
+            // ถ้า ?preview=1 → return JSON (for modal preview), ไม่ download
+            if ( $req->get_param( 'preview' ) ) {
+                $lines = array_slice( explode( "\n", $csv ), 0, 50 );
+                return rest_ensure_response( array(
+                    'success' => true,
+                    'data'    => array(
+                        'preview_lines' => $lines,
+                        'filename'      => $fname,
+                        'size_bytes'    => strlen( $csv ),
+                    ),
+                ) );
+            }
+
+            if ( ! headers_sent() ) {
+                header( 'Content-Type: text/csv; charset=utf-8' );
+                header( 'Content-Disposition: attachment; filename="' . $fname . '"' );
+                header( 'Cache-Control: no-store, no-cache, must-revalidate' );
+            }
+            echo $csv;
+            exit;
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /feature-flags — Phase 1 LOCKED (403)
+    // GET /feature-flags — readable (flag state view)
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/feature-flags', array(
+        array(
+            'methods'             => 'GET',
+            'permission_callback' => $perm_admin,
+            'callback'            => function () {
+                $flags = array();
+                foreach ( b2f_audit_allowed_flags() as $f ) {
+                    $flags[ $f ] = (bool) get_option( $f, false );
+                }
+                return rest_ensure_response( array(
+                    'success' => true,
+                    'data'    => array(
+                        'flags'       => $flags,
+                        'phase'       => 1,
+                        'setter_locked' => true,
+                        'lock_reason' => 'Phase 1 = observe-only. Flag setter จะเปิดใน Phase 2 หลัง review baseline',
+                    ),
+                ) );
+            },
+        ),
+        array(
+            'methods'             => 'POST',
+            'permission_callback' => $perm_admin,
+            'callback'            => function () {
+                // PHASE 1: HARDCODED 403 — setter ถูกล็อค
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( sprintf(
+                        '[B2F Audit] Flag setter blocked (Phase 1 lock) — attempted by uid=%d',
+                        get_current_user_id()
+                    ) );
+                }
+                return new WP_Error(
+                    'phase1_locked',
+                    'Feature flag setter ล็อคใน Phase 1 (observe-only). จะเปิดใน Phase 2',
+                    array( 'status' => 403 )
+                );
+            },
+        ),
+    ) );
+
+} );
+
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 3: SHORTCODE [b2f_migration_audit]
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
+    function b2f_migration_audit_shortcode( $atts = array() ) {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<div style="padding:24px;color:#dc2626;">ต้องเป็น Admin เท่านั้น</div>';
+        }
+
+        $nonce = wp_create_nonce( 'wp_rest' );
+        $base  = rest_url( B2F_AUDIT_NS . '/' );
+
+        ob_start();
+        ?>
+        <div class="b2f-audit-root" data-nonce="<?php echo esc_attr( $nonce ); ?>" data-base="<?php echo esc_url( $base ); ?>">
+
+            <div class="b2f-audit-header">
+                <h2 class="b2f-audit-title">📊 B2F Migration Audit <span class="b2f-audit-ver">V.1.0</span></h2>
+                <p class="b2f-audit-sub">Phase 1 — observe-only audit. Feature flag setter ล็อค 403 ใน Phase นี้</p>
+                <a href="#" class="b2f-audit-refresh" data-action="refresh-all">🔄 Refresh ทั้งหมด</a>
+            </div>
+
+            <!-- SECTION 1: Parity Overview Cards -->
+            <div class="b2f-audit-section">
+                <h3>📊 Parity Overview</h3>
+                <div class="b2f-audit-cards" data-target="parity-cards">
+                    <div class="b2f-audit-card"><div class="b2f-audit-card-num" data-k="makers">–</div><div class="b2f-audit-card-lbl">Makers</div></div>
+                    <div class="b2f-audit-card"><div class="b2f-audit-card-num" data-k="orphans">–</div><div class="b2f-audit-card-lbl">Orphan SETs</div></div>
+                    <div class="b2f-audit-card"><div class="b2f-audit-card-num" data-k="stale">–</div><div class="b2f-audit-card-lbl">Stale records</div></div>
+                    <div class="b2f-audit-card"><div class="b2f-audit-card-num" data-k="virtual">–</div><div class="b2f-audit-card-lbl">Virtual inject/day</div></div>
+                </div>
+            </div>
+
+            <!-- SECTION 2: Orphan SETs Table -->
+            <div class="b2f-audit-section">
+                <h3>🔍 Orphan SETs (SET ที่ maker แตะแต่ไม่ได้ register)</h3>
+                <div class="b2f-audit-toolbar">
+                    <input type="text" class="b2f-audit-filter" placeholder="🔍 กรอง maker / SKU…" data-target="orphans">
+                </div>
+                <div class="b2f-audit-table-wrap" data-target="orphans-table">
+                    <div class="b2f-audit-empty">กำลังโหลด…</div>
+                </div>
+            </div>
+
+            <!-- SECTION 3: Stale Data Alerts -->
+            <div class="b2f-audit-section">
+                <h3>⚠️ Stale Data Alerts (ไม่ update > 90 วัน หรือ cost ≤ 0)</h3>
+                <div class="b2f-audit-table-wrap" data-target="stale-table">
+                    <div class="b2f-audit-empty">กำลังโหลด…</div>
+                </div>
+            </div>
+
+            <!-- SECTION 4: Feature Flags Panel -->
+            <div class="b2f-audit-section">
+                <h3>🚩 Feature Flags Panel <span class="b2f-audit-lock">🔒 LOCKED (Phase 1)</span></h3>
+                <div class="b2f-audit-flags" data-target="flags-panel">
+                    <div class="b2f-audit-empty">กำลังโหลด…</div>
+                </div>
+                <p class="b2f-audit-note">Phase 1 = read-only. Setter endpoint จะ return 403 เสมอ. จะเปิดเมื่อเริ่ม Phase 2 (shadow-write).</p>
+            </div>
+
+            <!-- SECTION 5: Dry-Run Export -->
+            <div class="b2f-audit-section">
+                <h3>📥 Dry-Run Export</h3>
+                <p class="b2f-audit-desc">สร้าง CSV report รวม drift + stale ทุกรายการ สำหรับ offline review</p>
+                <button class="b2f-audit-btn b2f-audit-btn-primary" data-action="dry-run">📥 Download dry-run CSV</button>
+                <span class="b2f-audit-status" data-target="dry-run-status"></span>
+            </div>
+
+            <!-- SECTION 6: 7-day drift history -->
+            <div class="b2f-audit-section">
+                <h3>📈 7-day Drift History</h3>
+                <div class="b2f-audit-table-wrap" data-target="history-table">
+                    <div class="b2f-audit-empty">ยังไม่มีข้อมูล (cron จะเริ่มเก็บหลัง Phase 2 เปิดใช้ shadow-write)</div>
+                </div>
+            </div>
+
+        </div>
+
+        <style>
+            .b2f-audit-root { max-width: 1280px; margin: 24px auto; padding: 0 16px; font-family: -apple-system, BlinkMacSystemFont, "Sarabun", sans-serif; color: #1f2937; }
+            .b2f-audit-header { background: linear-gradient(135deg, #1a237e, #3949ab); color: #fff; padding: 24px 28px; border-radius: 12px; margin-bottom: 24px; }
+            .b2f-audit-title { margin: 0 0 6px; font-size: 24px; font-weight: 700; }
+            .b2f-audit-ver { font-size: 12px; background: rgba(255,255,255,.2); padding: 3px 8px; border-radius: 6px; vertical-align: middle; margin-left: 8px; }
+            .b2f-audit-sub { margin: 0 0 14px; opacity: .85; font-size: 14px; }
+            .b2f-audit-refresh { display: inline-block; background: rgba(255,255,255,.15); color: #fff; padding: 6px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; }
+            .b2f-audit-refresh:hover { background: rgba(255,255,255,.28); }
+            .b2f-audit-section { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 18px 20px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
+            .b2f-audit-section h3 { margin: 0 0 12px; font-size: 16px; color: #1f2937; }
+            .b2f-audit-lock { font-size: 11px; background: #fee2e2; color: #991b1b; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+            .b2f-audit-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+            .b2f-audit-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; text-align: center; }
+            .b2f-audit-card-num { font-size: 28px; font-weight: 700; color: #1a237e; line-height: 1.1; }
+            .b2f-audit-card-lbl { font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: .5px; margin-top: 4px; }
+            .b2f-audit-toolbar { margin-bottom: 10px; }
+            .b2f-audit-filter { width: 100%; max-width: 320px; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; }
+            .b2f-audit-table-wrap { overflow-x: auto; }
+            .b2f-audit-empty { padding: 24px; text-align: center; color: #94a3b8; font-size: 13px; }
+            table.b2f-audit-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+            table.b2f-audit-table th, table.b2f-audit-table td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; text-align: left; }
+            table.b2f-audit-table th { background: #f8fafc; font-weight: 600; color: #475569; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+            table.b2f-audit-table tr:hover td { background: #fafafa; }
+            .b2f-audit-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+            .b2f-audit-badge-orphan { background: #fef3c7; color: #92400e; }
+            .b2f-audit-badge-stale { background: #fee2e2; color: #991b1b; }
+            .b2f-audit-flags { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+            .b2f-audit-flag { background: #f1f5f9; border-left: 4px solid #cbd5e1; border-radius: 6px; padding: 12px 14px; }
+            .b2f-audit-flag.on { border-left-color: #16a34a; }
+            .b2f-audit-flag.off { border-left-color: #6b7280; }
+            .b2f-audit-flag-name { font-family: ui-monospace, monospace; font-size: 12px; color: #334155; }
+            .b2f-audit-flag-state { font-size: 14px; font-weight: 600; margin-top: 4px; }
+            .b2f-audit-note { margin: 10px 0 0; font-size: 12px; color: #64748b; }
+            .b2f-audit-desc { margin: 0 0 12px; font-size: 13px; color: #475569; }
+            .b2f-audit-btn { background: #1a237e; color: #fff; border: 0; padding: 10px 20px; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 600; }
+            .b2f-audit-btn:hover { background: #3949ab; }
+            .b2f-audit-btn:disabled { opacity: .5; cursor: wait; }
+            .b2f-audit-status { margin-left: 12px; font-size: 13px; color: #16a34a; }
+            .b2f-audit-status.err { color: #dc2626; }
+        </style>
+
+        <script>
+        (function(){
+            var root = document.querySelector('.b2f-audit-root');
+            if (!root) return;
+            var NONCE = root.getAttribute('data-nonce');
+            var BASE  = root.getAttribute('data-base');
+
+            function api(path, opts) {
+                opts = opts || {};
+                opts.headers = opts.headers || {};
+                opts.headers['X-WP-Nonce'] = NONCE;
+                opts.headers['Accept'] = 'application/json';
+                opts.credentials = 'same-origin';
+                return fetch(BASE + path, opts).then(function(r){
+                    var ct = r.headers.get('Content-Type') || '';
+                    if (ct.indexOf('application/json') >= 0) return r.json().then(function(j){ return { ok: r.ok, json: j, status: r.status }; });
+                    return r.text().then(function(t){ return { ok: r.ok, text: t, status: r.status }; });
+                });
+            }
+
+            function esc(s) {
+                return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+                    return ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+                });
+            }
+
+            function renderOrphans(data) {
+                var wrap = root.querySelector('[data-target="orphans-table"]');
+                if (!data || !data.by_maker || data.by_maker.length === 0) {
+                    wrap.innerHTML = '<div class="b2f-audit-empty">✅ ไม่มี orphan SET (parity 100%)</div>';
+                    return;
+                }
+                var html = '<table class="b2f-audit-table"><thead><tr>' +
+                    '<th>Maker</th><th>Count</th><th>Orphan SKUs</th>' +
+                    '</tr></thead><tbody>';
+                data.by_maker.forEach(function(m){
+                    var skus = m.orphans.map(function(o){
+                        return '<span class="b2f-audit-badge b2f-audit-badge-orphan">' + esc(o.sku) + '</span>';
+                    }).join(' ');
+                    html += '<tr data-filter="' + esc((m.maker_name||'') + ' ' + m.orphans.map(function(o){return o.sku;}).join(' ')) + '">' +
+                        '<td>' + esc(m.maker_name) + ' <small>#' + m.maker_id + '</small></td>' +
+                        '<td><strong>' + m.orphan_count + '</strong></td>' +
+                        '<td>' + skus + '</td>' +
+                        '</tr>';
+                });
+                html += '</tbody></table>';
+                wrap.innerHTML = html;
+
+                // attach filter
+                var f = root.querySelector('.b2f-audit-filter[data-target="orphans"]');
+                if (f) {
+                    f.oninput = function() {
+                        var q = this.value.toLowerCase();
+                        wrap.querySelectorAll('tr[data-filter]').forEach(function(tr){
+                            tr.style.display = tr.getAttribute('data-filter').toLowerCase().indexOf(q) >= 0 ? '' : 'none';
+                        });
+                    };
+                }
+            }
+
+            function renderStale(data) {
+                var wrap = root.querySelector('[data-target="stale-table"]');
+                if (!data || !data.records || data.records.length === 0) {
+                    wrap.innerHTML = '<div class="b2f-audit-empty">✅ ไม่มี stale records (ทุก record update ใน 90 วันและ cost > 0)</div>';
+                    return;
+                }
+                var html = '<table class="b2f-audit-table"><thead><tr>' +
+                    '<th>Maker</th><th>SKU</th><th>Cost</th><th>Status</th><th>Last Updated</th><th>Reason</th>' +
+                    '</tr></thead><tbody>';
+                data.records.slice(0, 100).forEach(function(r){
+                    html += '<tr>' +
+                        '<td>' + esc(r.maker_name) + '</td>' +
+                        '<td><code>' + esc(r.sku) + '</code></td>' +
+                        '<td>' + (r.unit_cost > 0 ? r.unit_cost.toFixed(2) : '<span class="b2f-audit-badge b2f-audit-badge-stale">0</span>') + '</td>' +
+                        '<td>' + esc(r.status) + '</td>' +
+                        '<td>' + esc(r.last_updated) + '</td>' +
+                        '<td>' + esc(r.reason) + '</td>' +
+                        '</tr>';
+                });
+                html += '</tbody></table>';
+                if (data.records.length > 100) {
+                    html += '<p class="b2f-audit-note">แสดง 100 records แรก (จากทั้งหมด ' + data.records.length + ')</p>';
+                }
+                wrap.innerHTML = html;
+            }
+
+            function renderFlags(data) {
+                var wrap = root.querySelector('[data-target="flags-panel"]');
+                if (!data || !data.flags) { wrap.innerHTML = '<div class="b2f-audit-empty">โหลด flags ไม่สำเร็จ</div>'; return; }
+                var html = '';
+                Object.keys(data.flags).forEach(function(k){
+                    var on = !!data.flags[k];
+                    html += '<div class="b2f-audit-flag ' + (on ? 'on' : 'off') + '">' +
+                        '<div class="b2f-audit-flag-name">🔒 ' + esc(k) + '</div>' +
+                        '<div class="b2f-audit-flag-state">' + (on ? '✅ ENABLED' : '⬜ disabled') + '</div>' +
+                        '</div>';
+                });
+                wrap.innerHTML = html;
+            }
+
+            function renderCards(drift, stale) {
+                var c = root.querySelector('[data-target="parity-cards"]');
+                if (!c) return;
+                var makers = (drift && drift.by_maker) ? drift.by_maker.length : 0;
+                var orphans = drift ? drift.total_orphans : 0;
+                var staleN = stale ? stale.total_stale : 0;
+                c.querySelector('[data-k="makers"]').textContent = makers;
+                c.querySelector('[data-k="orphans"]').textContent = orphans;
+                c.querySelector('[data-k="stale"]').textContent = staleN;
+                c.querySelector('[data-k="virtual"]').textContent = '—'; // Phase 2+ จะเริ่มเก็บ
+            }
+
+            function renderHistory() {
+                // Phase 1: no data yet — placeholder stays
+            }
+
+            function loadAll() {
+                var driftData = null, staleData = null;
+
+                api('drift').then(function(r){
+                    if (r.ok && r.json && r.json.success) {
+                        driftData = r.json.data;
+                        renderOrphans(driftData);
+                    } else {
+                        root.querySelector('[data-target="orphans-table"]').innerHTML = '<div class="b2f-audit-empty">❌ โหลด drift ไม่สำเร็จ</div>';
+                    }
+                    return api('stale');
+                }).then(function(r){
+                    if (r.ok && r.json && r.json.success) {
+                        staleData = r.json.data;
+                        renderStale(staleData);
+                    } else {
+                        root.querySelector('[data-target="stale-table"]').innerHTML = '<div class="b2f-audit-empty">❌ โหลด stale ไม่สำเร็จ</div>';
+                    }
+                    renderCards(driftData, staleData);
+                    return api('feature-flags');
+                }).then(function(r){
+                    if (r.ok && r.json && r.json.success) {
+                        renderFlags(r.json.data);
+                    }
+                });
+
+                renderHistory();
+            }
+
+            root.addEventListener('click', function(e){
+                var t = e.target;
+                if (t.matches('[data-action="refresh-all"]')) {
+                    e.preventDefault();
+                    loadAll();
+                }
+                if (t.matches('[data-action="dry-run"]')) {
+                    e.preventDefault();
+                    t.disabled = true;
+                    var s = root.querySelector('[data-target="dry-run-status"]');
+                    s.className = 'b2f-audit-status'; s.textContent = 'กำลังสร้าง CSV…';
+                    // Trigger download via a temporary <a> with nonce in query (REST cookie auth handles the rest)
+                    var url = BASE + 'dry-run?_wpnonce=' + encodeURIComponent(NONCE);
+                    var a = document.createElement('a');
+                    a.href = url; a.style.display = 'none';
+                    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                    setTimeout(function(){
+                        s.textContent = '✅ ส่ง request แล้ว (ตรวจ browser download)';
+                        t.disabled = false;
+                    }, 1500);
+                }
+            });
+
+            loadAll();
+        })();
+        </script>
+
+        <?php
+        return ob_get_clean();
+    }
+    add_shortcode( 'b2f_migration_audit', 'b2f_migration_audit_shortcode' );
+}

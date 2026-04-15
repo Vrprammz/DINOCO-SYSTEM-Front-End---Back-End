@@ -328,7 +328,29 @@ Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DI
 | POST | `/product/pricing` | Admin | Product tier pricing (dual-write catalog) |
 | POST | `/product/upload-image` | Admin | Upload product image |
 
-### 3.7 Infrastructure (`/wp-json/dinoco/v1/`)
+### 3.7 B2F Migration Audit (`/wp-json/dinoco-b2f-audit/v1/`)
+
+Namespace สำหรับ B2F Option F Phase 1 migration audit (observe-only). Registered ใน `[Admin System] B2F Migration Audit` V.1.0:
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/drift` | Admin | Orphan SETs per maker (SET ที่ maker มี descendant leaf registered แต่ตัว SET ไม่ได้ register) |
+| GET | `/stale?days=90` | Admin | Stale `mp_unit_cost` records (update > N วัน หรือ cost ≤ 0) |
+| GET | `/parity/{maker_id}` | Admin | Per-maker parity snapshot (product_count, orphan_count, stale_count, parity_score 0-100) |
+| GET | `/dry-run[?preview=1]` | Admin | Download CSV (drift + stale combined) — columns: maker_id, maker_name, sku, issue_type, details |
+| GET | `/feature-flags` | Admin | อ่าน flag state ปัจจุบัน (3 flags, whitelist) |
+| POST | `/feature-flags` | Admin | **403 HARDCODED ใน Phase 1** — setter จะเปิดเมื่อเข้า Phase 2 |
+
+**Rate limit**: 20 req/hour/user per endpoint (ผ่าน `b2b_rate_limit()`)
+
+**Allowed flags** (wp_options, default=false ทุกตัว):
+- `b2f_flag_auto_sync_sets` — Phase 2
+- `b2f_flag_shadow_write` — Phase 2
+- `b2f_flag_read_from_junction` — Phase 3
+
+Flag helpers ใน B2F Snippet 1 V.6.5: `b2f_is_flag_enabled($name)`, `b2f_get_all_flags()`, `b2f_log_flag_change($flag, $old, $new, $uid)`.
+
+### 3.8 Infrastructure (`/wp-json/dinoco/v1/`)
 
 github-sync (webhook), github-sync-manual, sync-status
 
@@ -1451,6 +1473,7 @@ sequenceDiagram
 | B2F Orders | `[b2f_admin_orders_tab]` | PO management |
 | B2F Makers | `[b2f_admin_makers_tab]` | Maker/product management |
 | B2F Credit | `[b2f_admin_credit_tab]` | Credit/payment tracking |
+| B2F Migration Audit | `[b2f_migration_audit]` | Phase 1 observe-only audit (drift/stale/parity/dry-run) |
 
 #### LIFF Pages (Admin)
 

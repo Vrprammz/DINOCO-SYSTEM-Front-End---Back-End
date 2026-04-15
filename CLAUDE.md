@@ -72,6 +72,26 @@ Under `/wp-json/b2b/v1/`: `confirm-order`, `flash-create`, `daily-summary`, `upd
 
 All under `/wp-json/b2f/v1/`: `makers`, `maker`, `maker-products`, `maker-product`, `create-po`, `po-detail`, `po-update`, `po-cancel`, `maker-confirm`, `maker-reject`, `maker-reschedule`, `maker-po-list`, `maker-deliver`, `approve-reschedule`, `receive-goods`, `record-payment`, `reject-lot`, `reject-resolve`, `po-complete`, `dashboard-stats`, `po-history`.
 
+## REST API Endpoints (B2F Migration Audit — Phase 1)
+
+All under `/wp-json/dinoco-b2f-audit/v1/` (V.1.0 Phase 1 observe-only):
+- `GET /drift` — orphan SETs per maker (SET ที่ maker แตะแต่ไม่ได้ register)
+- `GET /stale?days=90` — stale mp_unit_cost records
+- `GET /parity/{maker_id}` — per-maker parity snapshot
+- `GET /dry-run[?preview=1]` — trigger + CSV download (or preview JSON)
+- `GET /feature-flags` / `POST /feature-flags` — read flags (setter = 403 hardcoded Phase 1)
+
+### B2F Migration Audit (Phase 1 — observe-only)
+
+- **[Admin System] B2F Migration Audit** V.1.0 — shortcode `[b2f_migration_audit]`, REST namespace `/wp-json/dinoco-b2f-audit/v1/`
+- **Purpose**: Option F Hybrid Shadow-Write Phase 1 observability (ดู `B2F-ARCHITECTURE-PLAN.md`)
+- **Endpoints**: drift / stale / parity / dry-run / feature-flags (setter locked 403)
+- **Feature flags** (wp_options, all default=false): `b2f_flag_auto_sync_sets`, `b2f_flag_shadow_write`, `b2f_flag_read_from_junction`
+- **Flag helpers** (B2F Snippet 1 V.6.5): `b2f_is_flag_enabled($name)`, `b2f_get_all_flags()`, `b2f_log_flag_change($flag, $old, $new, $uid)` — whitelist enforced
+- **Dashboard sections**: Parity Overview cards / Orphan SETs table / Stale Alerts / Feature Flags Panel (readonly) / Dry-Run Export / 7-day drift history (placeholder)
+- **Export tool integration**: `[Admin System] Product Catalog Export Tool` V.1.2 เพิ่ม `migration-audit-report-YYYYMMDD.csv` ใน ZIP bundle (5 ไฟล์ → 6 ไฟล์ รวม README)
+- **Reference**: `B2F-ARCHITECTURE-PLAN.md` (Option F plan 4 phases)
+
 ## REST API Endpoints (LIFF AI)
 
 All under `/wp-json/liff-ai/v1/`: `auth`, `dashboard`, `dealer-dashboard`, `leads`, `lead/{id}`, `lead/{id}/accept`, `lead/{id}/note`, `lead/{id}/status`, `claims`, `claim/{id}`, `claim/{id}/status`, `agent-ask`.
