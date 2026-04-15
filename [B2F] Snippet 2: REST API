@@ -1,5 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.10.0 — Phase 3 cut-over: reads switch CPT → junction table (`wp_dinoco_product_makers`) gated by `b2f_flag_read_from_junction`. New helpers `b2f_read_maker_product()` + `b2f_list_maker_products_junction()`. Flag ON → list/format/create-po อ่านจาก junction (116 rows incl. 13 orphan SETs) + skip virtual SET inject (V.9.19) + skip auto-compute fallback (V.9.18). Flag OFF → CPT fallback (backward compat). save/delete dual-write ทั้ง CPT+junction. Response shape preserved. `function_exists()` guard ทุก helper (Snippet 0.5 dual-write + Snippet 1 flag helper)
  * Version: V.9.17 — REVERT virtual SET injection (V.9.14–V.9.16) — user บ่น "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย". B2F maker products = เฉพาะที่ admin register จริง ใน b2f_maker_product CPT. + เคารพ ui_role_override (badge-only — mirror Inventory V.42.14): เพิ่ม `ui_role_override` ใน format output + `auto_type` preserved สำหรับ grouping (DD-7 / cart / PO). Frontend badge ตรง Product Catalog 100% (e.g. DNCGNDPROT500 override=single → B2F แสดง "เดี่ยว")
  * Version: V.9.16 — Virtual SET cost: sum leaves' mp_unit_cost (not hardcoded 0). Adds `virtual_cost_breakdown[]` + `virtual_cost_complete`. Frontend shows accurate price instead of ฿0. Verified via temp debug-vset (removed in V.9.16.2)
  * Version: V.9.15 — Cleanup: remove TEMP debug endpoints (used to diagnose NX500 filter issue, root cause fixed in V.9.14)
@@ -671,6 +672,126 @@ if ( ! function_exists( 'b2f_rest_delete_maker' ) ) {
 // 6. MAKER PRODUCT CRUD ENDPOINTS
 // ════════════════════════════════════════════
 
+// ─────────────────────────────────────────────
+// V.10.0 — Phase 3 cut-over helpers
+// ─────────────────────────────────────────────
+
+if ( ! function_exists( 'b2f_read_maker_product' ) ) {
+    /**
+     * V.10.0: Read single maker-product record with flag-gated source switch.
+     *
+     * @param string $sku
+     * @param int    $maker_id
+     * @return array|null Shape: {
+     *     product_sku, maker_id, unit_cost, moq, lead_time_days,
+     *     shipping_land, shipping_sea, status, notes, legacy_cpt_id,
+     *     mp_post_id (alias of legacy_cpt_id for CPT-centric callers)
+     * } OR null if not found.
+     *
+     * Reads from junction table when `b2f_flag_read_from_junction` is ON
+     * (and row exists). Falls back to CPT (ACF) otherwise.
+     */
+    function b2f_read_maker_product( $sku, $maker_id ) {
+        global $wpdb;
+        $sku = strtoupper( trim( (string) $sku ) );
+        $maker_id = intval( $maker_id );
+        if ( ! $sku || ! $maker_id ) return null;
+
+        $flag_on = function_exists( 'b2f_is_flag_enabled' )
+            && b2f_is_flag_enabled( 'b2f_flag_read_from_junction' );
+
+        if ( $flag_on ) {
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$tbl} WHERE UPPER(product_sku) = %s AND maker_id = %d AND deleted_at IS NULL LIMIT 1",
+                $sku, $maker_id
+            ), ARRAY_A );
+            if ( $row ) {
+                return array(
+                    'product_sku'    => (string) ( $row['product_sku'] ?? $sku ),
+                    'maker_id'       => intval( $row['maker_id'] ?? $maker_id ),
+                    'unit_cost'      => floatval( $row['unit_cost'] ?? 0 ),
+                    'moq'            => intval( $row['moq'] ?? 1 ),
+                    'lead_time_days' => intval( $row['lead_time_days'] ?? 7 ),
+                    'shipping_land'  => floatval( $row['shipping_land'] ?? 0 ),
+                    'shipping_sea'   => floatval( $row['shipping_sea'] ?? 0 ),
+                    'status'         => (string) ( $row['status'] ?? 'active' ),
+                    'notes'          => (string) ( $row['notes'] ?? '' ),
+                    'legacy_cpt_id'  => intval( $row['legacy_cpt_id'] ?? 0 ),
+                    'mp_post_id'     => intval( $row['legacy_cpt_id'] ?? 0 ),
+                    '_source'        => 'junction',
+                );
+            }
+            // Fall through to CPT (edge case: junction row missing during transition)
+        }
+
+        // CPT fallback (V.9.x behavior)
+        $mp = get_posts( array(
+            'post_type'      => 'b2f_maker_product',
+            'posts_per_page' => 1,
+            'post_status'    => 'publish',
+            'meta_query'     => array(
+                'relation' => 'AND',
+                array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
+                array( 'key' => 'mp_product_sku', 'value' => $sku ),
+            ),
+        ) );
+        if ( empty( $mp ) ) {
+            // Try raw SKU (case-preserving) fallback
+            $mp = get_posts( array(
+                'post_type'      => 'b2f_maker_product',
+                'posts_per_page' => 1,
+                'post_status'    => 'publish',
+                'meta_query'     => array(
+                    'relation' => 'AND',
+                    array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
+                    array( 'key' => 'mp_product_sku', 'value' => strtolower( $sku ) ),
+                ),
+            ) );
+        }
+        if ( empty( $mp ) ) return null;
+        $mp_id = $mp[0]->ID;
+        return array(
+            'product_sku'    => (string) ( get_field( 'mp_product_sku', $mp_id ) ?: $sku ),
+            'maker_id'       => $maker_id,
+            'unit_cost'      => floatval( get_field( 'mp_unit_cost', $mp_id ) ?: 0 ),
+            'moq'            => intval( get_field( 'mp_moq', $mp_id ) ?: 1 ),
+            'lead_time_days' => intval( get_field( 'mp_lead_time_days', $mp_id ) ?: 7 ),
+            'shipping_land'  => floatval( get_field( 'mp_shipping_land', $mp_id ) ?: 0 ),
+            'shipping_sea'   => floatval( get_field( 'mp_shipping_sea', $mp_id ) ?: 0 ),
+            'status'         => (string) ( get_field( 'mp_status', $mp_id ) ?: 'active' ),
+            'notes'          => (string) ( get_field( 'mp_notes', $mp_id ) ?: '' ),
+            'legacy_cpt_id'  => $mp_id,
+            'mp_post_id'     => $mp_id,
+            '_source'        => 'cpt',
+        );
+    }
+}
+
+if ( ! function_exists( 'b2f_list_maker_products_junction' ) ) {
+    /**
+     * V.10.0: List maker products from junction table (active, not soft-deleted).
+     *
+     * @param int $maker_id
+     * @return array rows from wp_dinoco_product_makers
+     */
+    function b2f_list_maker_products_junction( $maker_id ) {
+        global $wpdb;
+        $maker_id = intval( $maker_id );
+        if ( ! $maker_id ) return array();
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$tbl}
+             WHERE maker_id = %d
+               AND deleted_at IS NULL
+               AND status = 'active'
+             ORDER BY product_sku ASC",
+            $maker_id
+        ), ARRAY_A );
+        return is_array( $rows ) ? $rows : array();
+    }
+}
+
 if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
     /**
      * GET /maker-products/{maker_id} — list SKUs for a maker
@@ -682,32 +803,44 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ maker_id', 'code' => 'MISSING_MAKER_ID' ), 400 );
         }
 
-        $q = new WP_Query( array(
-            'post_type'      => 'b2f_maker_product',
-            'posts_per_page' => -1,
-            'post_status'    => 'publish',
-            'meta_query'     => array( array(
-                'key'   => 'mp_maker_id',
-                'value' => $maker_id,
-                'type'  => 'NUMERIC',
-            ) ),
-            'orderby'        => 'title',
-            'order'          => 'ASC',
-        ) );
-
         // V.9.2: Pre-compute hierarchy maps ONCE (not N times per product)
         $sku_relations = get_option( 'dinoco_sku_relations', array() );
         $hierarchy_ctx = b2f_build_hierarchy_context( $sku_relations );
 
-        $products = array();
-        foreach ( $q->posts as $p ) {
-            $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx );
-        }
+        // V.10.0: Flag-gated source switch — junction table (Phase 3) vs CPT (legacy)
+        $flag_junction = function_exists( 'b2f_is_flag_enabled' )
+            && b2f_is_flag_enabled( 'b2f_flag_read_from_junction' );
 
-        // V.9.19: Opt-in virtual SET injection — LIFF E-Catalog ส่ง ?include_virtual=1 เพื่อเห็น SETs ที่ maker ผลิตได้
-        // Admin Makers tab ไม่ส่ง param → ได้ list เฉพาะ registered (V.9.17 stay)
-        if ( '1' === (string) $req->get_param( 'include_virtual' ) ) {
-            $products = b2f_inject_virtual_sets_v919( $products, $hierarchy_ctx['rel_upper'] );
+        $products = array();
+
+        if ( $flag_junction ) {
+            // ═══ Phase 3: read from junction table ═══
+            $rows = b2f_list_maker_products_junction( $maker_id );
+            foreach ( $rows as $row ) {
+                $products[] = b2f_format_maker_product( 0, $hierarchy_ctx, $row );
+            }
+        } else {
+            // ═══ Legacy: read from CPT (V.9.x behavior) ═══
+            $q = new WP_Query( array(
+                'post_type'      => 'b2f_maker_product',
+                'posts_per_page' => -1,
+                'post_status'    => 'publish',
+                'meta_query'     => array( array(
+                    'key'   => 'mp_maker_id',
+                    'value' => $maker_id,
+                    'type'  => 'NUMERIC',
+                ) ),
+                'orderby'        => 'title',
+                'order'          => 'ASC',
+            ) );
+            foreach ( $q->posts as $p ) {
+                $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx );
+            }
+
+            // V.9.19: Opt-in virtual SET injection — CPT path only (Phase 3 junction has real SET rows)
+            if ( '1' === (string) $req->get_param( 'include_virtual' ) ) {
+                $products = b2f_inject_virtual_sets_v919( $products, $hierarchy_ctx['rel_upper'] );
+            }
         }
 
         // V.9.2: Compute hierarchy_meta — which SET parents are referenced + missing children
@@ -801,13 +934,20 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             }
         }
 
+        // V.10.0: SET cost auto-compute fallback only when reading from CPT.
+        // Phase 3 junction has real SET records with proper costs → skip fallback.
+        $data_products = $flag_junction
+            ? $products
+            : b2f_compute_set_costs_v918( $products, $hierarchy_ctx['rel_upper'] );
+
         return new WP_REST_Response( array(
             'success'        => true,
-            'data'           => b2f_compute_set_costs_v918( $products, $hierarchy_ctx['rel_upper'] ),
+            'data'           => $data_products,
             'hierarchy_meta' => $hierarchy_meta,
             'sku_relations'  => $sku_relations_response,
             'moto_catalog'   => $moto_catalog,
             'catalog_map'    => $catalog_map, // V.9.12 (batch lookup)
+            '_source'        => $flag_junction ? 'junction' : 'cpt', // V.10.0 debug hint
         ), 200 );
     }
 }
@@ -1039,11 +1179,25 @@ if ( ! function_exists( 'b2f_collect_leaves_recursive' ) ) {
 if ( ! function_exists( 'b2f_format_maker_product' ) ) {
     /**
      * V.9.2: Accept pre-computed $hierarchy_ctx (optional, fallback builds own)
+     * V.10.0: Accept optional $junction_row (array) — when provided, read fields from
+     *         junction row instead of ACF/CPT. $mp_id may be 0 in that case
+     *         (falls back to legacy_cpt_id for ACF-only fields: mp_product_name,
+     *         mp_lead_land, mp_lead_sea, mp_last_order_date).
      * Fix: ui_role_override ใช้สำหรับ display badge เท่านั้น — ห้ามเปลี่ยน grouping fields
      * Fix: is_leaf ใช้ !$is_parent_node (accurate) แทน !$is_set
      */
-    function b2f_format_maker_product( $mp_id, $hierarchy_ctx = null ) {
-        $sku = get_field( 'mp_product_sku', $mp_id ) ?: '';
+    function b2f_format_maker_product( $mp_id, $hierarchy_ctx = null, $junction_row = null ) {
+        // V.10.0: resolve data source — junction row > ACF/CPT
+        $has_junction = is_array( $junction_row ) && ! empty( $junction_row );
+        if ( $has_junction ) {
+            $sku     = (string) ( $junction_row['product_sku'] ?? '' );
+            $eff_mp_id = intval( $junction_row['legacy_cpt_id'] ?? $mp_id );
+            $maker_id_src = intval( $junction_row['maker_id'] ?? 0 );
+        } else {
+            $sku = get_field( 'mp_product_sku', $mp_id ) ?: '';
+            $eff_mp_id = intval( $mp_id );
+            $maker_id_src = intval( get_field( 'mp_maker_id', $mp_id ) ?: 0 );
+        }
         // ดึงรูปจาก product catalog (DINOCO_Catalog) ถ้ามี
         $image_url = '';
         $product = null;
@@ -1148,23 +1302,56 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
             if ( in_array( $raw, $allowed, true ) ) $ui_role = $raw;
         }
 
+        // V.10.0: source-aware field resolution (junction vs CPT/ACF)
+        if ( $has_junction ) {
+            $f_product_name    = ( $eff_mp_id ? (string) ( get_field( 'mp_product_name', $eff_mp_id ) ?: '' ) : '' );
+            if ( $f_product_name === '' && $product && ! empty( $product['name'] ) ) $f_product_name = (string) $product['name'];
+            $f_unit_cost       = floatval( $junction_row['unit_cost'] ?? 0 );
+            $f_moq             = intval( $junction_row['moq'] ?? 1 );
+            $f_lead_time_days  = intval( $junction_row['lead_time_days'] ?? 7 );
+            $f_lead_land       = ( $eff_mp_id ? intval( get_field( 'mp_lead_land', $eff_mp_id ) ?: 7 ) : 7 );
+            $f_lead_sea        = ( $eff_mp_id ? intval( get_field( 'mp_lead_sea', $eff_mp_id ) ?: 14 ) : 14 );
+            $f_last_order_date = ( $eff_mp_id ? (string) ( get_field( 'mp_last_order_date', $eff_mp_id ) ?: '' ) : '' );
+            $f_notes           = (string) ( $junction_row['notes'] ?? '' );
+            $f_status          = (string) ( $junction_row['status'] ?? 'active' );
+            $f_ship_land       = floatval( $junction_row['shipping_land'] ?? 0 );
+            $f_ship_sea        = floatval( $junction_row['shipping_sea'] ?? 0 );
+            $maker_id_out      = $maker_id_src;
+            $out_id            = $eff_mp_id; // keep CPT id for backward compat
+        } else {
+            $f_product_name    = (string) ( get_field( 'mp_product_name', $mp_id ) ?: '' );
+            $f_unit_cost       = floatval( get_field( 'mp_unit_cost', $mp_id ) ?: 0 );
+            $f_moq             = intval( get_field( 'mp_moq', $mp_id ) ?: 1 );
+            $f_lead_time_days  = intval( get_field( 'mp_lead_time_days', $mp_id ) ?: 7 );
+            $f_lead_land       = intval( get_field( 'mp_lead_land', $mp_id ) ?: 7 );
+            $f_lead_sea        = intval( get_field( 'mp_lead_sea', $mp_id ) ?: 14 );
+            $f_last_order_date = (string) ( get_field( 'mp_last_order_date', $mp_id ) ?: '' );
+            $f_notes           = (string) ( get_field( 'mp_notes', $mp_id ) ?: '' );
+            $f_status          = (string) ( get_field( 'mp_status', $mp_id ) ?: 'active' );
+            $f_ship_land       = floatval( get_field( 'mp_shipping_land', $mp_id ) ?: 0 );
+            $f_ship_sea        = floatval( get_field( 'mp_shipping_sea', $mp_id ) ?: 0 );
+            $maker_id_out      = intval( get_field( 'mp_maker_id', $mp_id ) ?: 0 );
+            $out_id            = $mp_id;
+        }
+        $maker_currency = get_field( 'maker_currency', $maker_id_out ) ?: 'THB';
+
         return array(
-            'id'              => $mp_id,
-            'maker_id'        => intval( get_field( 'mp_maker_id', $mp_id ) ?: 0 ),
+            'id'              => $out_id,
+            'maker_id'        => $maker_id_out,
             'sku'             => esc_html( $sku ),
-            'product_name'    => esc_html( get_field( 'mp_product_name', $mp_id ) ?: '' ),
-            'unit_cost'       => floatval( get_field( 'mp_unit_cost', $mp_id ) ?: 0 ),
-            'moq'             => intval( get_field( 'mp_moq', $mp_id ) ?: 1 ),
-            'lead_time_days'  => intval( get_field( 'mp_lead_time_days', $mp_id ) ?: 7 ),
-            'lead_land'       => intval( get_field( 'mp_lead_land', $mp_id ) ?: 7 ),
-            'lead_sea'        => intval( get_field( 'mp_lead_sea', $mp_id ) ?: 14 ),
-            'last_order_date' => esc_html( get_field( 'mp_last_order_date', $mp_id ) ?: '' ),
-            'notes'           => esc_html( get_field( 'mp_notes', $mp_id ) ?: '' ),
-            'status'          => esc_html( get_field( 'mp_status', $mp_id ) ?: 'active' ),
+            'product_name'    => esc_html( $f_product_name ),
+            'unit_cost'       => $f_unit_cost,
+            'moq'             => $f_moq,
+            'lead_time_days'  => $f_lead_time_days,
+            'lead_land'       => $f_lead_land,
+            'lead_sea'        => $f_lead_sea,
+            'last_order_date' => esc_html( $f_last_order_date ),
+            'notes'           => esc_html( $f_notes ),
+            'status'          => esc_html( $f_status ),
             'image_url'       => esc_url( $image_url ),
-            'shipping_land'   => floatval( get_field( 'mp_shipping_land', $mp_id ) ?: 0 ),
-            'shipping_sea'    => floatval( get_field( 'mp_shipping_sea', $mp_id ) ?: 0 ),
-            'currency_symbol' => function_exists( 'b2f_currency_symbol' ) ? b2f_currency_symbol( get_field( 'maker_currency', intval( get_field( 'mp_maker_id', $mp_id ) ?: 0 ) ) ?: 'THB' ) : '฿',
+            'shipping_land'   => $f_ship_land,
+            'shipping_sea'    => $f_ship_sea,
+            'currency_symbol' => function_exists( 'b2f_currency_symbol' ) ? b2f_currency_symbol( $maker_currency ) : '฿',
             // V.9.7 Hierarchy — leaf-based classification ตรงกับ JS computeProductTypes()
             'is_set'           => $is_set,
             'is_leaf'          => ! $is_parent_node,
@@ -1278,6 +1465,19 @@ if ( ! function_exists( 'b2f_rest_save_maker_product' ) ) {
             update_field( 'mp_status', sanitize_text_field( $mp_status ), $id );
         }
 
+        // V.10.0: Dual-write junction table when Phase 3 flag ON
+        // (Snippet 0.5 save_post hook also dual-writes when shadow_write ON,
+        //  but we call explicitly here to guarantee sync under read-from-junction
+        //  regardless of shadow_write state — read path depends on junction rows.)
+        $flag_junction = function_exists( 'b2f_is_flag_enabled' )
+            && b2f_is_flag_enabled( 'b2f_flag_read_from_junction' );
+        if ( $flag_junction && function_exists( 'b2f_dual_write_to_junction' ) ) {
+            $dw = b2f_dual_write_to_junction( $id );
+            if ( is_wp_error( $dw ) && function_exists( 'b2f_log' ) ) {
+                b2f_log( '[V.10.0] save_maker_product dual-write failed mp_id=' . $id . ': ' . $dw->get_error_message() );
+            }
+        }
+
         if ( function_exists( 'b2f_log' ) ) {
             b2f_log( sprintf( 'Maker product saved: #%d SKU=%s Maker=#%d Cost=%.2f', $id, $sku, $maker_id, $cost ) );
         }
@@ -1293,6 +1493,9 @@ if ( ! function_exists( 'b2f_rest_delete_maker_product' ) ) {
     /**
      * POST /maker-product/delete — delete mapping
      * Body: { id }
+     * V.10.0: Soft-delete junction row (UPDATE deleted_at + status=discontinued)
+     *         in addition to CPT hard delete. Phase 3 read path will skip
+     *         soft-deleted rows (WHERE deleted_at IS NULL).
      */
     function b2f_rest_delete_maker_product( WP_REST_Request $req ) {
         $id = intval( $req->get_param( 'id' ) ?: 0 );
@@ -1305,7 +1508,15 @@ if ( ! function_exists( 'b2f_rest_delete_maker_product' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบรายการ', 'code' => 'NOT_FOUND' ), 404 );
         }
 
-        wp_delete_post( $id, true ); // permanent delete
+        // V.10.0: Soft-delete junction first (before CPT delete removes legacy_cpt_id linkage)
+        if ( function_exists( 'b2f_dual_soft_delete_junction' ) ) {
+            $soft_ok = b2f_dual_soft_delete_junction( $id );
+            if ( ! $soft_ok && function_exists( 'b2f_log' ) ) {
+                b2f_log( '[V.10.0] delete_maker_product soft-delete junction failed mp_id=' . $id );
+            }
+        }
+
+        wp_delete_post( $id, true ); // permanent delete (CPT)
 
         if ( function_exists( 'b2f_log' ) ) {
             b2f_log( sprintf( 'Maker product deleted: #%d', $id ) );
@@ -1462,19 +1673,10 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                     }
 
                     foreach ( $leaves as $leaf_sku ) {
-                        // Validate: leaf SKU ต้องมี maker product สำหรับ Maker นี้
-                        $leaf_mp_posts = get_posts( array(
-                            'post_type'      => 'b2f_maker_product',
-                            'posts_per_page' => 1,
-                            'post_status'    => 'publish',
-                            'meta_query'     => array(
-                                'relation' => 'AND',
-                                array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
-                                array( 'key' => 'mp_product_sku', 'value' => $leaf_sku ),
-                            ),
-                        ) );
+                        // V.10.0: Validate via flag-gated helper (junction when flag ON, CPT otherwise)
+                        $leaf_mp = b2f_read_maker_product( $leaf_sku, $maker_id );
 
-                        if ( empty( $leaf_mp_posts ) ) {
+                        if ( empty( $leaf_mp ) ) {
                             return new WP_REST_Response( array(
                                 'success' => false,
                                 'error'   => sprintf( 'สินค้า %s (จาก SET %s) ยังไม่ได้ลงทะเบียนกับโรงงาน', esc_html( $leaf_sku ), esc_html( $sku ) ),
@@ -1513,7 +1715,7 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             $merged = $expanded;
         }
 
-        // ── Snapshot ราคาทุนจาก b2f_maker_product ──
+        // ── Snapshot ราคาทุนจาก maker-product (V.10.0: junction OR CPT via helper) ──
         $po_items = array();
         $total    = 0;
 
@@ -1521,18 +1723,10 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             $sku = $item['sku'];
             $qty = $item['qty'];
 
-            $mp = new WP_Query( array(
-                'post_type'      => 'b2f_maker_product',
-                'posts_per_page' => 1,
-                'post_status'    => 'publish',
-                'meta_query'     => array(
-                    'relation' => 'AND',
-                    array( 'key' => 'mp_maker_id', 'value' => $maker_id, 'type' => 'NUMERIC' ),
-                    array( 'key' => 'mp_product_sku', 'value' => $sku ),
-                ),
-            ) );
+            // V.10.0: Flag-gated read (junction when ON, CPT fallback otherwise)
+            $mp_data = b2f_read_maker_product( $sku, $maker_id );
 
-            if ( ! $mp->have_posts() ) {
+            if ( empty( $mp_data ) ) {
                 return new WP_REST_Response( array(
                     'success' => false,
                     'error'   => sprintf( 'ไม่พบ SKU "%s" สำหรับโรงงานนี้', esc_html( $sku ) ),
@@ -1540,10 +1734,22 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 ), 400 );
             }
 
-            $mp_post      = $mp->posts[0];
-            $unit_cost    = floatval( get_field( 'mp_unit_cost', $mp_post->ID ) ?: 0 );
-            $product_name = get_field( 'mp_product_name', $mp_post->ID ) ?: $sku;
-            $subtotal     = round( $unit_cost * $qty, 2 );
+            $mp_post_id   = intval( $mp_data['legacy_cpt_id'] ?? 0 );
+            $unit_cost    = floatval( $mp_data['unit_cost'] ?? 0 );
+            // Prefer CPT mp_product_name (ACF-only field — junction ไม่มี column)
+            $product_name = '';
+            if ( $mp_post_id ) {
+                $product_name = (string) ( get_field( 'mp_product_name', $mp_post_id ) ?: '' );
+            }
+            if ( $product_name === '' ) {
+                // Fallback: catalog name → raw SKU
+                if ( class_exists( 'DINOCO_Catalog' ) ) {
+                    $cat_row = DINOCO_Catalog::get_by_sku( $sku );
+                    if ( $cat_row && ! empty( $cat_row['name'] ) ) $product_name = (string) $cat_row['name'];
+                }
+                if ( $product_name === '' ) $product_name = $sku;
+            }
+            $subtotal = round( $unit_cost * $qty, 2 );
 
             $po_items[] = array(
                 'sku'          => $sku,
@@ -1551,7 +1757,10 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 'qty'          => $qty,
                 'unit_cost'    => $unit_cost,
                 'subtotal'     => $subtotal,
-                'mp_post_id'   => $mp_post->ID,
+                'mp_post_id'   => $mp_post_id,
+                // V.10.0: snapshot shipping from helper (junction/CPT unified)
+                'shipping_land' => floatval( $mp_data['shipping_land'] ?? 0 ),
+                'shipping_sea'  => floatval( $mp_data['shipping_sea'] ?? 0 ),
                 // V.8.7 Hierarchy: SET origin tracking
                 'parent_sku'   => $item['parent_sku'] ?? '',
                 // V.9.9 DD-3: breakdown[] for shared child tracking
@@ -1560,8 +1769,10 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             );
             $total += $subtotal;
 
-            // Update last order date on maker product
-            update_field( 'mp_last_order_date', wp_date( 'Y-m-d' ), $mp_post->ID );
+            // Update last order date on maker product (CPT-only field, ACF)
+            if ( $mp_post_id ) {
+                update_field( 'mp_last_order_date', wp_date( 'Y-m-d' ), $mp_post_id );
+            }
         }
 
         // ── Duplicate check (same maker + SKUs + qty ภายใน 5 นาที) ──
@@ -1623,11 +1834,18 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
         $repeater       = array();
         $shipping_total = 0;
         foreach ( $po_items as $pi ) {
-            // Snapshot shipping cost per unit from maker product
+            // V.10.0: Snapshot shipping per unit — prefer pre-snapshotted value from b2f_read_maker_product(),
+            // fallback to ACF read if legacy caller didn't populate (defensive).
             $ship_per = 0;
-            if ( $shipping_method && ! empty( $pi['mp_post_id'] ) ) {
-                $ship_key = ( $shipping_method === 'sea' ) ? 'mp_shipping_sea' : 'mp_shipping_land';
-                $ship_per = floatval( get_field( $ship_key, $pi['mp_post_id'] ) ?: 0 );
+            if ( $shipping_method ) {
+                if ( isset( $pi['shipping_land'] ) || isset( $pi['shipping_sea'] ) ) {
+                    $ship_per = ( $shipping_method === 'sea' )
+                        ? floatval( $pi['shipping_sea'] ?? 0 )
+                        : floatval( $pi['shipping_land'] ?? 0 );
+                } elseif ( ! empty( $pi['mp_post_id'] ) ) {
+                    $ship_key = ( $shipping_method === 'sea' ) ? 'mp_shipping_sea' : 'mp_shipping_land';
+                    $ship_per = floatval( get_field( $ship_key, $pi['mp_post_id'] ) ?: 0 );
+                }
             }
             $shipping_total += round( $ship_per * $pi['qty'], 2 );
 
