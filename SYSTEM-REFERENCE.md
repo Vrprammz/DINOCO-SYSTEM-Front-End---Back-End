@@ -113,7 +113,7 @@
 | File | Version | DB_ID | Shortcode | Description |
 |------|---------|-------|-----------|-------------|
 | [Admin System] DINOCO Admin Dashboard | V.32.1 | 21 | `[dinoco_admin_dashboard]` | Command Center: KPIs, charts, pipeline, AI Inbox |
-| [Admin System] DINOCO Global Inventory Database | V.42.25 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center, 3-level hierarchy UI, catalog filter bar + type cards + context-aware modal, leaf-based classification + DD-3 shared child duplicate DOM rows in Stock Mgmt (V.42.25) |
+| [Admin System] DINOCO Global Inventory Database | V.43.6 | 22 | `[dinoco_admin_inventory]` | Inventory Command Center, 3-level hierarchy UI, catalog filter bar + type cards + context-aware modal, leaf-based classification + DD-3 shared child duplicate DOM rows + V.42.26 _renderParent tagging (cross-expand fix) + V.42.27 stock-grandchild-of subtree scope + V.43.0 anchor scroll/expanded state/pagination scroll + V.43.2 direct leaves JS + V.43.3 group-aware pagination + V.43.4 direct leaves PHP $sorted + V.43.5 search descendant expansion + V.43.6 DD-3 parent_skus array indexing |
 | [Admin System] DINOCO Legacy Migration Requests | V.30.2 | 23 | `[dinoco_admin_legacy]` | Admin legacy migration manager |
 | [Admin System] DINOCO User Management | V.30.2 | 25 | `[dinoco_admin_users]` | CRM + full analytics |
 | [Admin System] DINOCO Manual Transfer Tool | V.30.2 | 26 | `[dinoco_admin_transfer]` | Force transfer warranty ownership |
