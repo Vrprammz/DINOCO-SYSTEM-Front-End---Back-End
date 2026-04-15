@@ -3,7 +3,8 @@
  * Version: V.9.17 — REVERT virtual SET injection (V.9.14–V.9.16) — user บ่น "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย". B2F maker products = เฉพาะที่ admin register จริง ใน b2f_maker_product CPT. + เคารพ ui_role_override (badge-only — mirror Inventory V.42.14): เพิ่ม `ui_role_override` ใน format output + `auto_type` preserved สำหรับ grouping (DD-7 / cart / PO). Frontend badge ตรง Product Catalog 100% (e.g. DNCGNDPROT500 override=single → B2F แสดง "เดี่ยว")
  * Version: V.9.16 — Virtual SET cost: sum leaves' mp_unit_cost (not hardcoded 0). Adds `virtual_cost_breakdown[]` + `virtual_cost_complete`. Frontend shows accurate price instead of ฿0. Verified via temp debug-vset (removed in V.9.16.2)
  * Version: V.9.15 — Cleanup: remove TEMP debug endpoints (used to diagnose NX500 filter issue, root cause fixed in V.9.14)
- * Version: V.9.18 — SET cost auto-compute: sum(leaves.mp_unit_cost) เมื่อ children registered (Admin UI ไม่มี input ราคา SET → แก้ stale mp_unit_cost เช่น ฿666)
+ * Version: V.9.19 — Opt-in virtual SET injection (?include_virtual=1) → LIFF เห็น SETs ที่ maker ผลิตได้ (leaves registered ครบ) + cleanup temp debug endpoint
+ * Version: V.9.18 — SET cost auto-compute: sum(leaves.mp_unit_cost) เมื่อ children registered
  * Version: V.9.17 — Revert V.9.14 virtual SET injection + respect ui_role_override (badge-only)
  * Version: V.9.14-V.9.16 — (REVERTED) virtual SET injection experiment [REVERTED in V.9.17]
  * Version: V.9.12 — catalog_map: batch lookup ผ่าน DINOCO_Catalog::get_by_skus() (single SQL WHERE IN) — fix N+1 query pattern ของ V.9.11 (เดิม loop เรียก get_by_sku() ต่อ SKU → 200+ queries ต่อ call)
@@ -90,12 +91,6 @@ add_action( 'rest_api_init', function () {
         'permission_callback' => $admin_perm,
     ) );
 
-    // TEMP V.9.18.1: debug endpoint — dump HTP products with compatible_models (public with secret key, remove after diagnose)
-    register_rest_route( $ns, '/debug-models/(?P<maker_id>\d+)', array(
-        'methods'             => 'GET',
-        'callback'            => 'b2f_rest_debug_models_v918',
-        'permission_callback' => '__return_true',
-    ) );
     register_rest_route( $ns, '/maker-product', array(
         'methods'             => 'POST',
         'callback'            => 'b2f_rest_save_maker_product',
@@ -709,10 +704,11 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx );
         }
 
-        // V.9.17: REVERT V.9.14-V.9.16 virtual SET injection — user feedback: "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย"
-        // B2F maker products = เฉพาะที่ admin register จริงใน b2f_maker_product CPT
-        // ถ้า admin ต้องการให้ Maker มี SET → register SET ตรงใน Admin Makers tab
-        // (leaves อยู่ใน maker products แล้ว — SET ไม่ auto-inject)
+        // V.9.19: Opt-in virtual SET injection — LIFF E-Catalog ส่ง ?include_virtual=1 เพื่อเห็น SETs ที่ maker ผลิตได้
+        // Admin Makers tab ไม่ส่ง param → ได้ list เฉพาะ registered (V.9.17 stay)
+        if ( '1' === (string) $req->get_param( 'include_virtual' ) ) {
+            $products = b2f_inject_virtual_sets_v919( $products, $hierarchy_ctx['rel_upper'] );
+        }
 
         // V.9.2: Compute hierarchy_meta — which SET parents are referenced + missing children
         $hierarchy_meta = b2f_compute_hierarchy_meta( $products, $hierarchy_ctx );
@@ -4610,5 +4606,147 @@ if ( ! function_exists( "b2f_rest_debug_models_v918" ) ) {
             "total" => count( $out ),
             "products" => $out,
         ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_inject_virtual_sets_v919' ) ) {
+    /**
+     * V.9.19: Inject virtual SET entries เข้า products[]
+     *
+     * Rationale: Maker register เฉพาะ leaves (DNCNX500001B-L/R) แต่ top-level SET (DNCSETNX500002) ไม่ register
+     * → LIFF E-Catalog filter "ชุด SET" + "NX500" ไม่เห็น SET นี้
+     * Fix: walk sku_relations ขึ้นไปหา top-level SET (ไม่มี parent) ของ registered leaves → inject เข้า products[]
+     *
+     * Called เฉพาะเมื่อ ?include_virtual=1 (LIFF only — Admin Makers ไม่ส่ง param)
+     */
+    function b2f_inject_virtual_sets_v919( $products, $rel_upper ) {
+        if ( ! class_exists( 'DINOCO_Catalog' ) || empty( $rel_upper ) ) return $products;
+
+        // Build registered SKU set (uppercase)
+        $registered = array();
+        foreach ( $products as $p ) {
+            $sku_u = strtoupper( $p['sku'] ?? '' );
+            if ( $sku_u !== '' ) $registered[ $sku_u ] = true;
+        }
+
+        // Build reverse: child → parents (ทุก parent ที่มี DD-3)
+        $child_to_parents = array();
+        foreach ( $rel_upper as $parent_u => $children ) {
+            foreach ( $children as $ch_u ) {
+                if ( ! isset( $child_to_parents[ $ch_u ] ) ) $child_to_parents[ $ch_u ] = array();
+                $child_to_parents[ $ch_u ][] = $parent_u;
+            }
+        }
+
+        // Walk up: หา top-level SETs (ไม่มี parent ใน rel_upper) ของ registered leaves
+        $top_level_sets = array();
+        $walk_up = function( $sku_u, &$visited ) use ( &$walk_up, $child_to_parents, &$top_level_sets ) {
+            if ( isset( $visited[ $sku_u ] ) ) return;
+            $visited[ $sku_u ] = true;
+            $parents = isset( $child_to_parents[ $sku_u ] ) ? $child_to_parents[ $sku_u ] : array();
+            if ( empty( $parents ) ) {
+                // ไม่มี parent → นี่คือ top-level
+                $top_level_sets[ $sku_u ] = true;
+                return;
+            }
+            foreach ( $parents as $pu ) $walk_up( $pu, $visited );
+        };
+        foreach ( array_keys( $registered ) as $sku_u ) {
+            $visited = array();
+            $walk_up( $sku_u, $visited );
+        }
+
+        // Inject top-level SETs ที่ยังไม่ registered + มี children ใน sku_relations
+        $collect_leaves = function( $sku_u, &$visited ) use ( &$collect_leaves, $rel_upper ) {
+            if ( isset( $visited[ $sku_u ] ) ) return array();
+            $visited[ $sku_u ] = true;
+            $children = isset( $rel_upper[ $sku_u ] ) ? $rel_upper[ $sku_u ] : array();
+            if ( empty( $children ) ) return array( $sku_u );
+            $leaves = array();
+            foreach ( $children as $ch ) $leaves = array_merge( $leaves, $collect_leaves( $ch, $visited ) );
+            return $leaves;
+        };
+
+        $added = array();
+        foreach ( array_keys( $top_level_sets ) as $top_u ) {
+            if ( isset( $registered[ $top_u ] ) ) continue; // registered แล้ว skip
+            if ( empty( $rel_upper[ $top_u ] ) ) continue; // ไม่มี children — ไม่ใช่ SET
+
+            // ตรวจว่ามี leaf ไหน registered ไหม (ถ้าไม่มี ไม่ต้อง inject)
+            $visited = array();
+            $leaves = $collect_leaves( $top_u, $visited );
+            $has_registered_leaf = false;
+            $sum_cost = 0.0;
+            $sum_land = 0.0;
+            $sum_sea = 0.0;
+            $registered_leaves = 0;
+            $missing_leaves = array();
+            foreach ( $leaves as $leaf_u ) {
+                if ( isset( $registered[ $leaf_u ] ) ) {
+                    // หา product entry ของ leaf
+                    foreach ( $products as $p ) {
+                        if ( strtoupper( $p['sku'] ?? '' ) === $leaf_u ) {
+                            $lc = floatval( $p['unit_cost'] ?? 0 );
+                            $ll = floatval( $p['shipping_land'] ?? 0 );
+                            $ls = floatval( $p['shipping_sea'] ?? 0 );
+                            if ( $lc > 0 ) {
+                                $sum_cost += $lc;
+                                $sum_land += $ll;
+                                $sum_sea += $ls;
+                                $registered_leaves++;
+                                $has_registered_leaf = true;
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    $missing_leaves[] = $leaf_u;
+                }
+            }
+
+            if ( ! $has_registered_leaf ) continue;
+
+            // Fetch SET data จาก Product Catalog
+            $cat = DINOCO_Catalog::get_by_sku( $top_u );
+            if ( ! $cat ) continue;
+
+            $added[] = array(
+                'id'               => 0,
+                'maker_id'         => $products[0]['maker_id'] ?? 0,
+                'sku'              => $cat['sku'] ?? $top_u,
+                'name'             => $cat['name'] ?? $top_u,
+                'image_url'        => $cat['image_url'] ?? '',
+                'unit_cost'        => $sum_cost,
+                'unit_cost_computed' => true,
+                'unit_cost_complete' => empty( $missing_leaves ),
+                'unit_cost_leaf_count' => $registered_leaves,
+                'unit_cost_missing' => $missing_leaves,
+                'moq'              => 1,
+                'lead_time_days'   => 7,
+                'shipping_land'    => $sum_land,
+                'shipping_sea'     => $sum_sea,
+                'status'           => 'active',
+                'currency'         => $products[0]['currency'] ?? 'THB',
+                'currency_symbol'  => $products[0]['currency_symbol'] ?? '฿',
+                'is_set'           => true,
+                'is_leaf'          => false,
+                'product_type'     => 'set',
+                'auto_type'        => 'set',
+                'children_count'   => count( $rel_upper[ $top_u ] ?? array() ),
+                'direct_children_count' => count( $rel_upper[ $top_u ] ?? array() ),
+                'grandchildren_total' => 0,
+                'parent_sku'       => '',
+                'parent_skus'      => array(),
+                'parent_name'      => '',
+                'grandparent_sku'  => '',
+                'top_parent_sku'   => $cat['sku'] ?? $top_u,
+                'top_parent_name'  => $cat['name'] ?? '',
+                'compatible_models' => $cat['compatible_models'] ?? '[]',
+                'category'         => $cat['category'] ?? '',
+                'is_virtual'       => true, // V.9.19 marker
+            );
+        }
+
+        return array_merge( $products, $added );
     }
 }
