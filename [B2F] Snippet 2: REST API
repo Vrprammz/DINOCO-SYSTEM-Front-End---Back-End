@@ -3,7 +3,9 @@
  * Version: V.9.17 — REVERT virtual SET injection (V.9.14–V.9.16) — user บ่น "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย". B2F maker products = เฉพาะที่ admin register จริง ใน b2f_maker_product CPT. + เคารพ ui_role_override (badge-only — mirror Inventory V.42.14): เพิ่ม `ui_role_override` ใน format output + `auto_type` preserved สำหรับ grouping (DD-7 / cart / PO). Frontend badge ตรง Product Catalog 100% (e.g. DNCGNDPROT500 override=single → B2F แสดง "เดี่ยว")
  * Version: V.9.16 — Virtual SET cost: sum leaves' mp_unit_cost (not hardcoded 0). Adds `virtual_cost_breakdown[]` + `virtual_cost_complete`. Frontend shows accurate price instead of ฿0. Verified via temp debug-vset (removed in V.9.16.2)
  * Version: V.9.15 — Cleanup: remove TEMP debug endpoints (used to diagnose NX500 filter issue, root cause fixed in V.9.14)
- * Version: V.9.14 — Virtual SET injection: maker-products ส่ง SETs ที่ maker ไม่ได้ลงทะเบียน แต่มี leaves/children ของ maker ชี้ top_parent_sku ไปหา (orphan top parents) → LIFF filter NX500 E-clutch + SET → เห็น SETs ครบตาม Product Catalog. Virtual SETs: is_virtual=true, unit_cost=0, DD-7 expand ตอน create-po [REVERTED in V.9.17]
+ * Version: V.9.18 — SET cost auto-compute: sum(leaves.mp_unit_cost) เมื่อ children registered (Admin UI ไม่มี input ราคา SET → แก้ stale mp_unit_cost เช่น ฿666)
+ * Version: V.9.17 — Revert V.9.14 virtual SET injection + respect ui_role_override (badge-only)
+ * Version: V.9.14-V.9.16 — (REVERTED) virtual SET injection experiment [REVERTED in V.9.17]
  * Version: V.9.12 — catalog_map: batch lookup ผ่าน DINOCO_Catalog::get_by_skus() (single SQL WHERE IN) — fix N+1 query pattern ของ V.9.11 (เดิม loop เรียก get_by_sku() ต่อ SKU → 200+ queries ต่อ call)
  * Version: V.9.11 — maker-products: expose catalog_map (sku→{compatible_models, name, image_url}) for ALL SKUs in hierarchy tree (รวม leaves ที่ Maker ไม่ได้ register) → LIFF filter NX500/model ใช้ data จาก source of truth (wp_dinoco_products) เหมือน Product Catalog
  * Version: V.9.10 — DD-3 Shared Child: DD-7 collect breakdown[] + save poi_parent_breakdown JSON + po-detail return parent_breakdown
@@ -798,12 +800,106 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
 
         return new WP_REST_Response( array(
             'success'        => true,
-            'data'           => $products,
+            'data'           => b2f_compute_set_costs_v918( $products, $hierarchy_ctx['rel_upper'] ),
             'hierarchy_meta' => $hierarchy_meta,
             'sku_relations'  => $sku_relations_response,
             'moto_catalog'   => $moto_catalog,
             'catalog_map'    => $catalog_map, // V.9.12 (batch lookup)
         ), 200 );
+    }
+}
+
+if ( ! function_exists( 'b2f_compute_set_costs_v918' ) ) {
+    /**
+     * V.9.18: Auto-compute SET unit_cost = sum(leaves.mp_unit_cost) when registered children exist
+     *
+     * Rationale: Admin UI (Snippet 5 V.6.1) accordion ไม่มี input สำหรับ SET price →
+     * Admin ไม่ได้กรอก mp_unit_cost ของ SET ตรงๆ → ถ้า ACF ค้าง stale value (เช่น 666)
+     * LIFF read มาจะผิด. Design intent: SET cost = sum ของ leaves (ราคาชิ้นส่วนบวกกันมาเป็นแม่)
+     *
+     * Logic:
+     * - สำหรับแต่ละ product ที่ product_type='set' AND มี children ใน sku_relations
+     * - Walk descendants recursive → collect leaves → sum mp_unit_cost จาก registered leaves เท่านั้น
+     * - ถ้า computed > 0 → override unit_cost + flag unit_cost_computed=true + preserve unit_cost_stored
+     * - ถ้า computed = 0 (leaves ไม่ได้ register) → คง unit_cost เดิม (fallback)
+     */
+    function b2f_compute_set_costs_v918( $products, $rel_upper ) {
+        if ( empty( $products ) || empty( $rel_upper ) ) return $products;
+
+        // Build sku → product index (uppercase key)
+        $by_sku = array();
+        foreach ( $products as $idx => $p ) {
+            $sku_u = strtoupper( $p['sku'] ?? '' );
+            if ( $sku_u !== '' ) $by_sku[ $sku_u ] = $idx;
+        }
+
+        // Recursive leaf collector
+        $collect_leaves = function( $sku_u, &$visited ) use ( $rel_upper, &$collect_leaves ) {
+            if ( isset( $visited[ $sku_u ] ) ) return array();
+            $visited[ $sku_u ] = true;
+            $children = isset( $rel_upper[ $sku_u ] ) ? $rel_upper[ $sku_u ] : array();
+            if ( empty( $children ) ) return array( $sku_u ); // leaf
+            $leaves = array();
+            foreach ( $children as $ch ) {
+                $leaves = array_merge( $leaves, $collect_leaves( $ch, $visited ) );
+            }
+            return $leaves;
+        };
+
+        foreach ( $products as $idx => $p ) {
+            $is_set = ( ( $p['product_type'] ?? 'single' ) === 'set' );
+            if ( ! $is_set ) continue;
+
+            $sku_u = strtoupper( $p['sku'] ?? '' );
+            if ( $sku_u === '' || empty( $rel_upper[ $sku_u ] ) ) continue; // ไม่มี children
+
+            $visited = array();
+            $leaves = $collect_leaves( $sku_u, $visited );
+
+            $computed_cost  = 0.0;
+            $computed_land  = 0.0;
+            $computed_sea   = 0.0;
+            $registered_cnt = 0;
+            $missing_leaves = array();
+
+            foreach ( $leaves as $leaf_u ) {
+                if ( $leaf_u === $sku_u ) continue; // self-loop guard
+                if ( isset( $by_sku[ $leaf_u ] ) ) {
+                    $leaf_p = $products[ $by_sku[ $leaf_u ] ];
+                    $lc = floatval( $leaf_p['unit_cost'] ?? 0 );
+                    $ll = floatval( $leaf_p['shipping_land'] ?? 0 );
+                    $ls = floatval( $leaf_p['shipping_sea'] ?? 0 );
+                    if ( $lc > 0 ) {
+                        $computed_cost  += $lc;
+                        $computed_land  += $ll;
+                        $computed_sea   += $ls;
+                        $registered_cnt++;
+                    } else {
+                        $missing_leaves[] = $leaf_u;
+                    }
+                } else {
+                    $missing_leaves[] = $leaf_u;
+                }
+            }
+
+            if ( $registered_cnt > 0 && $computed_cost > 0 ) {
+                $products[ $idx ]['unit_cost_stored']    = floatval( $p['unit_cost'] ?? 0 );
+                $products[ $idx ]['unit_cost']           = $computed_cost;
+                $products[ $idx ]['unit_cost_computed']  = true;
+                $products[ $idx ]['unit_cost_complete']  = empty( $missing_leaves );
+                $products[ $idx ]['unit_cost_leaf_count'] = $registered_cnt;
+                $products[ $idx ]['unit_cost_missing']   = $missing_leaves;
+                // Override shipping ด้วย sum (ถ้า SET เดิมไม่ได้กำหนดค่าส่งแยก)
+                if ( $computed_land > 0 && empty( $p['shipping_land'] ) ) {
+                    $products[ $idx ]['shipping_land'] = $computed_land;
+                }
+                if ( $computed_sea > 0 && empty( $p['shipping_sea'] ) ) {
+                    $products[ $idx ]['shipping_sea'] = $computed_sea;
+                }
+            }
+        }
+
+        return $products;
     }
 }
 
