@@ -1,5 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.10.2 — Issue #3 fix: `b2f_inject_virtual_sets_v919` walked only top-level SETs (no parent in rel_upper) → intermediate sub-SETs (parent + has grandparent) were NOT injected → LIFF SET Detail (`renderSetDetailItems`) could not find intermediate child in `products[]` → UI showed "1 child + 2 grandchildren" instead of "2 children + 4 grandchildren" for 3-level hierarchies. New `b2f_inject_virtual_all_sets_v920()` walks ALL parent nodes in `rel_upper` (not just top_parents): for each parent that is (a) NOT already registered + (b) has ≥1 registered leaf descendant → inject as virtual SET entry (is_virtual=true). Top-level + intermediate both handled. Legacy helper `b2f_inject_virtual_sets_v919` preserved as thin wrapper calling v920. No schema changes. No breaking changes to Phase 3 read-from-junction flow (virtual inject runs on CPT path only when ?include_virtual=1).
  * Version: V.10.1 — Code review fixes: (H1+M1) unified dual-write gate — call b2f_dual_write_to_junction() inline only when read_from_junction=ON AND shadow_write=OFF (avoid double UPSERT when both ON, since save_post hook in Snippet 0.5 already handles shadow_write case); (H2) b2f_list_maker_products_junction shows pending/discontinued (match CPT path which doesn't filter by status), ordered active→pending→discontinued; (M4) remove lowercase fallback in b2f_read_maker_product CPT path (sku already uppercase-normalized at entry — fallback was misleading + masked legacy data issues that need migration not runtime workaround).
  * Version: V.10.0 — Phase 3 cut-over: reads switch CPT → junction table (`wp_dinoco_product_makers`) gated by `b2f_flag_read_from_junction`. New helpers `b2f_read_maker_product()` + `b2f_list_maker_products_junction()`. Flag ON → list/format/create-po อ่านจาก junction (116 rows incl. 13 orphan SETs) + skip virtual SET inject (V.9.19) + skip auto-compute fallback (V.9.18). Flag OFF → CPT fallback (backward compat). save/delete dual-write ทั้ง CPT+junction. Response shape preserved. `function_exists()` guard ทุก helper (Snippet 0.5 dual-write + Snippet 1 flag helper)
  * Version: V.9.19 — Opt-in virtual SET injection (?include_virtual=1) → LIFF เห็น SETs ที่ maker ผลิตได้ (leaves registered ครบ) + cleanup temp debug endpoint
@@ -837,9 +838,10 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
                 $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx );
             }
 
-            // V.9.19: Opt-in virtual SET injection — CPT path only (Phase 3 junction has real SET rows)
+            // V.10.2: Opt-in virtual SET injection — CPT path only (Phase 3 junction has real SET rows)
+            // Inject top-level AND intermediate SETs (Issue #3 fix) — see b2f_inject_virtual_all_sets_v920
             if ( '1' === (string) $req->get_param( 'include_virtual' ) ) {
-                $products = b2f_inject_virtual_sets_v919( $products, $hierarchy_ctx['rel_upper'] );
+                $products = b2f_inject_virtual_all_sets_v920( $products, $hierarchy_ctx['rel_upper'] );
             }
         }
 
@@ -4845,27 +4847,50 @@ if ( ! function_exists( "b2f_rest_debug_models_v918" ) ) {
     }
 }
 
-if ( ! function_exists( 'b2f_inject_virtual_sets_v919' ) ) {
+if ( ! function_exists( 'b2f_inject_virtual_all_sets_v920' ) ) {
     /**
-     * V.9.19: Inject virtual SET entries เข้า products[]
+     * V.10.2: Inject virtual SET entries (top-level AND intermediate) เข้า products[]
      *
-     * Rationale: Maker register เฉพาะ leaves (DNCNX500001B-L/R) แต่ top-level SET (DNCSETNX500002) ไม่ register
-     * → LIFF E-Catalog filter "ชุด SET" + "NX500" ไม่เห็น SET นี้
-     * Fix: walk sku_relations ขึ้นไปหา top-level SET (ไม่มี parent) ของ registered leaves → inject เข้า products[]
+     * Rationale (Issue #3):
+     *   V.9.19 walked up จาก registered leaves ไปหา top-level SET (parent ที่ไม่มี parent อีก) เท่านั้น
+     *   → intermediate sub-SETs (parent + has grandparent) ไม่ถูก inject
+     *   → LIFF SET Detail `renderSetDetailItems()` ใช้ `productBySku[childSku]` lookup → miss → UI แสดงแค่
+     *     "1 child + 2 grandchildren" แทน "2 children + 4 grandchildren" สำหรับ 3-level hierarchy
      *
-     * Called เฉพาะเมื่อ ?include_virtual=1 (LIFF only — Admin Makers ไม่ส่ง param)
+     *   Example: DNCSETNX500E002 → [DNCNX500001B, DNCNX500E002B] → each → [-L, -R]
+     *     HTP registered: DNCNX500001B + all L/R leaves (ไม่ register DNCNX500E002B intermediate)
+     *     V.9.19 inject: DNCSETNX500E002 เท่านั้น (top-level)
+     *     V.10.2 inject: DNCSETNX500E002 + DNCNX500E002B (ทุก non-registered parent ที่มี leaf descendant registered)
+     *
+     * Algorithm:
+     *   1. สร้าง registered set จาก products[] (uppercase)
+     *   2. สร้าง child→parents map (DD-3 shared child safe)
+     *   3. collect candidate parents = ทุก key ใน rel_upper ที่ไม่ได้ registered
+     *   4. For each candidate: walk descendants → ถ้ามี ≥1 leaf registered → inject virtual entry
+     *   5. Preserve guards: auto_type='set', is_virtual=true, unit_cost=sum(registered leaf costs)
+     *
+     * Backward compat:
+     *   - Called เฉพาะเมื่อ ?include_virtual=1 (LIFF only — Admin Makers ไม่ส่ง param)
+     *   - Phase 3 junction path skip virtual inject (unchanged)
+     *
+     * @param array $products Registered maker products
+     * @param array $rel_upper sku_relations ใน uppercase format
+     * @return array $products + injected virtual SETs (top-level + intermediate)
      */
-    function b2f_inject_virtual_sets_v919( $products, $rel_upper ) {
+    function b2f_inject_virtual_all_sets_v920( $products, $rel_upper ) {
         if ( ! class_exists( 'DINOCO_Catalog' ) || empty( $rel_upper ) ) return $products;
 
-        // Build registered SKU set (uppercase)
+        // Build registered SKU set (uppercase) + lookup index
         $registered = array();
+        $product_idx = array();
         foreach ( $products as $p ) {
             $sku_u = strtoupper( $p['sku'] ?? '' );
-            if ( $sku_u !== '' ) $registered[ $sku_u ] = true;
+            if ( $sku_u === '' ) continue;
+            $registered[ $sku_u ] = true;
+            $product_idx[ $sku_u ] = $p;
         }
 
-        // Build reverse: child → parents (ทุก parent ที่มี DD-3)
+        // Build reverse: child → parents (DD-3 shared child supported — ทุก parent ที่ pointer ไปหา child)
         $child_to_parents = array();
         foreach ( $rel_upper as $parent_u => $children ) {
             foreach ( $children as $ch_u ) {
@@ -4874,66 +4899,54 @@ if ( ! function_exists( 'b2f_inject_virtual_sets_v919' ) ) {
             }
         }
 
-        // Walk up: หา top-level SETs (ไม่มี parent ใน rel_upper) ของ registered leaves
-        $top_level_sets = array();
-        $walk_up = function( $sku_u, &$visited ) use ( &$walk_up, $child_to_parents, &$top_level_sets ) {
-            if ( isset( $visited[ $sku_u ] ) ) return;
-            $visited[ $sku_u ] = true;
-            $parents = isset( $child_to_parents[ $sku_u ] ) ? $child_to_parents[ $sku_u ] : array();
-            if ( empty( $parents ) ) {
-                // ไม่มี parent → นี่คือ top-level
-                $top_level_sets[ $sku_u ] = true;
-                return;
-            }
-            foreach ( $parents as $pu ) $walk_up( $pu, $visited );
-        };
-        foreach ( array_keys( $registered ) as $sku_u ) {
-            $visited = array();
-            $walk_up( $sku_u, $visited );
-        }
-
-        // Inject top-level SETs ที่ยังไม่ registered + มี children ใน sku_relations
-        $collect_leaves = function( $sku_u, &$visited ) use ( &$collect_leaves, $rel_upper ) {
+        // Helper: collect leaf descendants (value-copy visited per branch — DD-3 shared child safe)
+        $collect_leaves = function( $sku_u, $visited ) use ( &$collect_leaves, $rel_upper ) {
             if ( isset( $visited[ $sku_u ] ) ) return array();
             $visited[ $sku_u ] = true;
             $children = isset( $rel_upper[ $sku_u ] ) ? $rel_upper[ $sku_u ] : array();
             if ( empty( $children ) ) return array( $sku_u );
             $leaves = array();
-            foreach ( $children as $ch ) $leaves = array_merge( $leaves, $collect_leaves( $ch, $visited ) );
+            foreach ( $children as $ch ) {
+                $leaves = array_merge( $leaves, $collect_leaves( $ch, $visited ) );
+            }
             return $leaves;
         };
 
-        $added = array();
-        foreach ( array_keys( $top_level_sets ) as $top_u ) {
-            if ( isset( $registered[ $top_u ] ) ) continue; // registered แล้ว skip
-            if ( empty( $rel_upper[ $top_u ] ) ) continue; // ไม่มี children — ไม่ใช่ SET
+        // V.10.2 change: walk ALL parent keys (both top-level AND intermediate)
+        // - top-level: parent ที่ไม่มี key ใน $child_to_parents
+        // - intermediate: parent ที่มี entry ใน $child_to_parents (is child of another parent) AND มี entry ใน rel_upper (is parent of children)
+        // inject ถ้า parent NOT registered + มี ≥1 registered leaf descendant
+        $candidate_parents = array();
+        foreach ( array_keys( $rel_upper ) as $parent_u ) {
+            if ( empty( $rel_upper[ $parent_u ] ) ) continue; // no children → not a SET
+            if ( isset( $registered[ $parent_u ] ) ) continue; // already registered
+            $candidate_parents[ $parent_u ] = true;
+        }
 
-            // ตรวจว่ามี leaf ไหน registered ไหม (ถ้าไม่มี ไม่ต้อง inject)
-            $visited = array();
-            $leaves = $collect_leaves( $top_u, $visited );
+        $added = array();
+        foreach ( array_keys( $candidate_parents ) as $parent_u ) {
+            // Collect all leaf descendants
+            $leaves = array_unique( $collect_leaves( $parent_u, array() ) );
+
             $has_registered_leaf = false;
             $sum_cost = 0.0;
             $sum_land = 0.0;
             $sum_sea = 0.0;
             $registered_leaves = 0;
             $missing_leaves = array();
+
             foreach ( $leaves as $leaf_u ) {
-                if ( isset( $registered[ $leaf_u ] ) ) {
-                    // หา product entry ของ leaf
-                    foreach ( $products as $p ) {
-                        if ( strtoupper( $p['sku'] ?? '' ) === $leaf_u ) {
-                            $lc = floatval( $p['unit_cost'] ?? 0 );
-                            $ll = floatval( $p['shipping_land'] ?? 0 );
-                            $ls = floatval( $p['shipping_sea'] ?? 0 );
-                            if ( $lc > 0 ) {
-                                $sum_cost += $lc;
-                                $sum_land += $ll;
-                                $sum_sea += $ls;
-                                $registered_leaves++;
-                                $has_registered_leaf = true;
-                            }
-                            break;
-                        }
+                if ( isset( $product_idx[ $leaf_u ] ) ) {
+                    $p = $product_idx[ $leaf_u ];
+                    $lc = floatval( $p['unit_cost'] ?? 0 );
+                    $ll = floatval( $p['shipping_land'] ?? 0 );
+                    $ls = floatval( $p['shipping_sea'] ?? 0 );
+                    if ( $lc > 0 ) {
+                        $sum_cost += $lc;
+                        $sum_land += $ll;
+                        $sum_sea += $ls;
+                        $registered_leaves++;
+                        $has_registered_leaf = true;
                     }
                 } else {
                     $missing_leaves[] = $leaf_u;
@@ -4942,15 +4955,44 @@ if ( ! function_exists( 'b2f_inject_virtual_sets_v919' ) ) {
 
             if ( ! $has_registered_leaf ) continue;
 
-            // Fetch SET data จาก Product Catalog
-            $cat = DINOCO_Catalog::get_by_sku( $top_u );
+            // Fetch parent data จาก Product Catalog
+            $cat = DINOCO_Catalog::get_by_sku( $parent_u );
             if ( ! $cat ) continue;
+
+            // Determine top-level parent (walk up for hierarchy metadata)
+            // Support DD-3 shared child — ใช้ parent ตัวแรก (deterministic)
+            $top_sku = $parent_u;
+            $visited = array();
+            $walk_top = function( $sku_u ) use ( &$walk_top, $child_to_parents, &$visited, &$top_sku ) {
+                if ( isset( $visited[ $sku_u ] ) ) return;
+                $visited[ $sku_u ] = true;
+                $parents = isset( $child_to_parents[ $sku_u ] ) ? $child_to_parents[ $sku_u ] : array();
+                if ( empty( $parents ) ) {
+                    $top_sku = $sku_u;
+                    return;
+                }
+                $walk_top( $parents[0] );
+            };
+            $walk_top( $parent_u );
+            $top_cat = ( $top_sku !== $parent_u && class_exists( 'DINOCO_Catalog' ) )
+                ? DINOCO_Catalog::get_by_sku( $top_sku )
+                : $cat;
+
+            // parent_skus for intermediate = all immediate parents (DD-3 safe)
+            $my_parents = isset( $child_to_parents[ $parent_u ] ) ? $child_to_parents[ $parent_u ] : array();
+            $immediate_parent_sku = ! empty( $my_parents ) ? $my_parents[0] : '';
+            $immediate_parent_name = '';
+            if ( $immediate_parent_sku !== '' && class_exists( 'DINOCO_Catalog' ) ) {
+                $pcat = DINOCO_Catalog::get_by_sku( $immediate_parent_sku );
+                if ( $pcat && ! empty( $pcat['name'] ) ) $immediate_parent_name = $pcat['name'];
+            }
 
             $added[] = array(
                 'id'               => 0,
                 'maker_id'         => $products[0]['maker_id'] ?? 0,
-                'sku'              => $cat['sku'] ?? $top_u,
-                'name'             => $cat['name'] ?? $top_u,
+                'sku'              => $cat['sku'] ?? $parent_u,
+                'name'             => $cat['name'] ?? $parent_u,
+                'product_name'     => $cat['name'] ?? $parent_u,
                 'image_url'        => $cat['image_url'] ?? '',
                 'unit_cost'        => $sum_cost,
                 'unit_cost_computed' => true,
@@ -4966,23 +5008,34 @@ if ( ! function_exists( 'b2f_inject_virtual_sets_v919' ) ) {
                 'currency_symbol'  => $products[0]['currency_symbol'] ?? '฿',
                 'is_set'           => true,
                 'is_leaf'          => false,
-                'product_type'     => 'set',
-                'auto_type'        => 'set',
-                'children_count'   => count( $rel_upper[ $top_u ] ?? array() ),
-                'direct_children_count' => count( $rel_upper[ $top_u ] ?? array() ),
+                // V.10.2: classification — intermediate = 'child' (has parent), top-level = 'set' (no parent)
+                'product_type'     => empty( $my_parents ) ? 'set' : 'child',
+                'auto_type'        => empty( $my_parents ) ? 'set' : 'child',
+                'children_count'   => count( $rel_upper[ $parent_u ] ?? array() ),
+                'direct_children_count' => count( $rel_upper[ $parent_u ] ?? array() ),
                 'grandchildren_total' => 0,
-                'parent_sku'       => '',
-                'parent_skus'      => array(),
-                'parent_name'      => '',
+                'parent_sku'       => $immediate_parent_sku,
+                'parent_skus'      => $my_parents,
+                'parent_name'      => $immediate_parent_name,
                 'grandparent_sku'  => '',
-                'top_parent_sku'   => $cat['sku'] ?? $top_u,
-                'top_parent_name'  => $cat['name'] ?? '',
+                'top_parent_sku'   => $top_cat ? ( $top_cat['sku'] ?? $top_sku ) : $top_sku,
+                'top_parent_name'  => $top_cat ? ( $top_cat['name'] ?? '' ) : '',
                 'compatible_models' => $cat['compatible_models'] ?? '[]',
                 'category'         => $cat['category'] ?? '',
-                'is_virtual'       => true, // V.9.19 marker
+                'is_virtual'       => true, // V.9.19/V.10.2 marker
             );
         }
 
         return array_merge( $products, $added );
+    }
+}
+
+if ( ! function_exists( 'b2f_inject_virtual_sets_v919' ) ) {
+    /**
+     * V.9.19 legacy wrapper — delegates to V.10.2 `b2f_inject_virtual_all_sets_v920()`.
+     * Preserved for any external caller that may reference the old name.
+     */
+    function b2f_inject_virtual_sets_v919( $products, $rel_upper ) {
+        return b2f_inject_virtual_all_sets_v920( $products, $rel_upper );
     }
 }
