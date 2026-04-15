@@ -158,13 +158,13 @@
 |------|---------|-------|-------------|
 | Snippet 0: CPT & ACF Registration | V.3.3 | 1160 | 5 CPTs + ACF + poi_parent_sku/name + poi_parent_breakdown (DD-3 JSON) |
 | Snippet 1: Core Utilities & Flex Builders | V.6.4 | 1163 | 22 Flex templates + b2f_group_items_by_set (DD-3) + b2f_get_item_breakdown + b2f_compute_manufacturing_summary |
-| Snippet 2: REST API | V.9.10 | 1165 | 20+ endpoints + DD-7 breakdown collection + parent_breakdown JSON save/return |
+| Snippet 2: REST API | V.9.12 | 1165 | 20+ endpoints + DD-7 breakdown collection + parent_breakdown JSON save/return + `catalog_map` ใน maker-products (DINOCO_Catalog source of truth) สำหรับ LIFF filter (V.9.11) + **V.9.12: batch `DINOCO_Catalog::get_by_skus()` single SQL (fix N+1 query)** |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.2 | 1167 | `[b2f_maker_liff]` -- LANG system + hierarchy SET grouping |
 | Snippet 5: Admin Dashboard Tabs | V.5.1 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary + resolveSetName 4-level fallback (hotfix) |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
-| Snippet 8: Admin LIFF E-Catalog | V.5.3 | 1168 | LIFF ordering + SET Detail View + Model Filter (V.5.3 inherit descendants) + type tabs (mutually exclusive) + count badges + hide empty + labels ตรงกับ Inventory "ชุด SET"/"เดี่ยว"/"ลูกชิ้นส่วน"/"ชิ้นส่วนย่อย" + shared badge + cart manufacturing summary (DD-3) |
+| Snippet 8: Admin LIFF E-Catalog | V.5.4 | 1168 | LIFF ordering + SET Detail View + Model Filter (V.5.3 inherit descendants + V.5.4 fallback ผ่าน catalogMap เมื่อ leaf ไม่อยู่ใน maker list) + type tabs (mutually exclusive) + count badges + hide empty + labels ตรงกับ Inventory "ชุด SET"/"เดี่ยว"/"ลูกชิ้นส่วน"/"ชิ้นส่วนย่อย" + shared badge + cart manufacturing summary (DD-3) |
 | Snippet 9: PO Ticket View | V.3.5 | 1169 | PO detail + hierarchy SET grouping + view toggle (ตามชุด/ยอดรวมผลิต) (DD-3) |
 | Snippet 10: PO Image Generator | V.2.6 | 1170 | A4 PO PNG + hierarchy SET header rows |
 | Snippet 11: Cron Jobs & Reminders | V.2.1 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
