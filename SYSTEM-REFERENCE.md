@@ -120,7 +120,7 @@
 | [Admin System] DINOCO Service Center & Claims | V.30.3 | 27 | `[dinoco_admin_claims]` | Claims management + auto-close 3 statuses (30d) |
 | [Admin System] AI Control Module | V.30.2 | 35 | `[dinoco_admin_ai_control]` | AI Command Center (Gemini v22.0 function calling) |
 | [Admin System] KB Trainer Bot v2.0 | V.30.3 | 62 | -- | Knowledge Base trainer (Gemini, limit 200 entries) |
-| [Admin System] DINOCO Manual Invoice System | V.33.1 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
+| [Admin System] DINOCO Manual Invoice System | V.33.6 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
 | [Admin System] AI Provider Abstraction | V.1.2 | 1040 | -- | Multi-AI provider (Claude/Gemini/OpenAI) |
 | [Admin System] DINOCO Moto Manager | V.1.0 | 1157 | `[dinoco_admin_moto]` | Motorcycle brands & models CRUD |
 | [Admin System] DINOCO Admin Finance Dashboard | V.3.16 | 1158 | `[dinoco_admin_finance]` | Finance overview (debt, revenue, risk AI) |
@@ -297,6 +297,8 @@
 ### 3.5 Manual Invoice (`/wp-json/dinoco-inv/v1/`)
 
 invoice/list, invoice/get, invoice/init, invoice/create, invoice/update, invoice/issue, invoice/record-payment, invoice/verify-slip, invoice/verify-slip-combined, invoice/upload-slip, invoice/cancel, invoice/delete, invoice/send-reminder, invoice/send-overdue-notice, invoice/resend-line, invoice/pending-summary, invoice/send-summary, invoice/distributor-detail
+
+> **V.33.6**: Manual Invoice System re-registers `GET /b2b/v1/products` locally (ชี้ callback ไป `b2b_rest_list_products` ของ Snippet 9 ที่ยังเก็บเป็น dead code หลัง V.35.0) เพราะ frontend `invLoadProducts()` ยังต้องใช้ route เดิม. Guarded ด้วย `function_exists` → return 503 ถ้า Snippet 9 disabled.
 
 ### 3.6 Inventory / Stock Management (`/wp-json/dinoco-stock/v1/`)
 
