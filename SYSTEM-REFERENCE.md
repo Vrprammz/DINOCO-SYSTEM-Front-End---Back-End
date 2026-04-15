@@ -125,6 +125,8 @@
 | [Admin System] DINOCO Moto Manager | V.1.0 | 1157 | `[dinoco_admin_moto]` | Motorcycle brands & models CRUD |
 | [Admin System] DINOCO Admin Finance Dashboard | V.3.16 | 1158 | `[dinoco_admin_finance]` | Finance overview (debt, revenue, risk AI) |
 | [Admin System] DINOCO Brand Voice Pool | V.2.5 | 1159 | `[dinoco_brand_voice]` | Social listening + brand sentiment analysis |
+| [Admin System] B2F Migration Audit | V.3.1 | pending | `[b2f_migration_audit]` | **Option F Hybrid Shadow-Write audit** — 9 REST endpoints `/wp-json/dinoco-b2f-audit/v1/` (drift/stale/parity/dry-run/feature-flags/activate-schema/backfill/junction-snapshot/observations) + 6 dashboard sections. **Phase 3 ACTIVE** since 2026-04-16 — reads flipped to junction. Rate limit 20/hr read, 5/hr destructive. |
+| [Admin System] Product Catalog Export Tool | V.1.2 | pending | -- | 1-click ZIP bundle (5 CSVs incl. migration-audit-report) for offline analysis |
 
 ### 2.3 [AdminSystem-System] -- Infrastructure
 
@@ -139,7 +141,7 @@
 | Snippet 1: Core Utilities & LINE Flex Builders | V.32.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers |
 | Snippet 2: LINE Webhook Gateway & Order Creator | V.34.0 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete, leaf-only stock deduct |
 | Snippet 3: LIFF E-Catalog REST API | V.41.0 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook + label/status/test/reprint) |
-| Snippet 4: LIFF E-Catalog Frontend | V.32.0 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) |
+| Snippet 4: LIFF E-Catalog Frontend | V.32.4 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) + **V.32.2-V.32.4 UX overhaul**: qty stepper SET Detail (1-999) + back button ← กลับ + cart bar 64px green CTA z-index 600 + main SET stepper + cart thumbnails + sub-item stepper toggle + 🗑️ red remove |
 | Snippet 5: Admin Dashboard | V.32.0 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash, leaf-only cancel restore |
 | Snippet 6: Admin Discount Mapping | V.31.1 | 55 | `[b2b_discount_mapping]` -- SKU pricing + rank tiers |
 | Snippet 7: Cron Jobs - Dunning + Summary + Rank | V.30.5 | 56 | 9 cron jobs (dunning, summary, rank, flash, shipping) |
@@ -152,22 +154,23 @@
 | Snippet 14: Order State Machine | V.1.5 | 1038 | B2B_Order_FSM class (14 statuses) |
 | Snippet 15: Custom Tables & JWT Session | V.6.0 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class, 3-level SKU hierarchy helpers |
 
-### 2.5 [B2F] -- Factory Purchasing System (12 Snippets)
+### 2.5 [B2F] -- Factory Purchasing System (13 Snippets)
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
 | Snippet 0: CPT & ACF Registration | V.3.3 | 1160 | 5 CPTs + ACF + poi_parent_sku/name + poi_parent_breakdown (DD-3 JSON) |
+| Snippet 0.5: Maker Product Dual-Write | V.1.1 | pending | **NEW (Phase 2)** — `save_post_b2f_maker_product` hook flag-gated dual-write to junction. ACTIVE when `b2f_flag_shadow_write=true` (enabled 2026-04-16). CPT save → write junction mirror + observation entry. |
 | Snippet 1: Core Utilities & Flex Builders | V.6.4 | 1163 | 22 Flex templates + b2f_group_items_by_set (DD-3) + b2f_get_item_breakdown + b2f_compute_manufacturing_summary |
-| Snippet 2: REST API | V.9.12 | 1165 | 20+ endpoints + DD-7 breakdown collection + parent_breakdown JSON save/return + `catalog_map` ใน maker-products (DINOCO_Catalog source of truth) สำหรับ LIFF filter (V.9.11) + **V.9.12: batch `DINOCO_Catalog::get_by_skus()` single SQL (fix N+1 query)** |
+| Snippet 2: REST API | V.10.1 | 1165 | 20+ endpoints + DD-7 breakdown + `catalog_map` LIFF filter + batch SKU lookup + **V.10.0 (Phase 3 cut-over)**: maker-products + CRUD reads `wp_dinoco_product_makers` junction when `b2f_flag_read_from_junction=true` (CPT fallback) via `b2f_read_maker_products_from_junction()` + **V.10.1**: code review fixes (1 CRITICAL + 3 HIGH + 4 MEDIUM + 3 LOW) + SET `compatible_models` respect direct value |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.2 | 1167 | `[b2f_maker_liff]` -- LANG system + hierarchy SET grouping |
 | Snippet 5: Admin Dashboard Tabs | V.6.0 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary + resolveSetName 4-level fallback + **V.6.0: Product Picker refactor — filter chips (ทั้งหมด/ชุด SET/เดี่ยว/ลูกชิ้นส่วน/ชิ้นส่วนย่อย) + count badges + hide empty + type badges + accordion row type badges — labels ตรงกับ Inventory V.43.6 + Snippet 8 V.5.4 (source of truth = /dinoco-stock/v1/stock/list)** |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
-| Snippet 8: Admin LIFF E-Catalog | V.5.5 | 1168 | LIFF ordering + SET Detail View + Model Filter (V.5.3 inherit descendants + V.5.4 fallback ผ่าน catalogMap เมื่อ leaf ไม่อยู่ใน maker list) + type tabs (mutually exclusive) + count badges + hide empty + labels ตรงกับ Inventory "ชุด SET"/"เดี่ยว"/"ลูกชิ้นส่วน"/"ชิ้นส่วนย่อย" + shared badge + cart manufacturing summary (DD-3) + **V.5.5: removed window._b2fcat debug namespace (production cleanup)** |
+| Snippet 8: Admin LIFF E-Catalog | V.6.4 | 1168 | LIFF ordering + SET Detail View + Model Filter (V.5.3 inherit descendants + V.5.4 fallback ผ่าน catalogMap เมื่อ leaf ไม่อยู่ใน maker list) + type tabs (mutually exclusive) + count badges + hide empty + labels ตรงกับ Inventory "ชุด SET"/"เดี่ยว"/"ลูกชิ้นส่วน"/"ชิ้นส่วนย่อย" + shared badge + cart manufacturing summary (DD-3) + **V.5.5: removed window._b2fcat debug namespace (production cleanup)** + **V.5.7 Virtual SET display** (amber badge "ประกอบจากชิ้นส่วน" + is_virtual badge) + **V.5.10 Product Picker align Inventory V.43.6** + **V.6.0-V.6.4 UX overhaul**: qty stepper SET Detail (1-999) + back button redesign (← กลับ 44×44 dark) + cart bar black bg + green CTA z-index 600 + main SET stepper + cart thumbnails 56×56 + sub-item stepper toggle (`+ สั่งแยก` default) + 🗑️ red remove button |
 | Snippet 9: PO Ticket View | V.3.5 | 1169 | PO detail + hierarchy SET grouping + view toggle (ตามชุด/ยอดรวมผลิต) (DD-3) |
 | Snippet 10: PO Image Generator | V.2.6 | 1170 | A4 PO PNG + hierarchy SET header rows |
-| Snippet 11: Cron Jobs & Reminders | V.2.1 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
+| Snippet 11: Cron Jobs & Reminders | V.2.2 | 1171 | 7 cron เดิม + **V.2.2**: `b2f_junction_diff_cron` (hourly CPT vs junction drift log) + `b2f_observations_ttl_cron` (daily 60-day prune) |
 
 ### 2.6 [LIFF AI] -- AI Command Center (2 Snippets)
 
@@ -330,7 +333,7 @@ Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DI
 
 ### 3.7 B2F Migration Audit (`/wp-json/dinoco-b2f-audit/v1/`)
 
-Namespace สำหรับ B2F Option F migration audit (Phase 1 observe-only + Phase 2 Shadow-Write controls). Registered ใน `[Admin System] B2F Migration Audit` V.2.0:
+Namespace สำหรับ B2F Option F migration audit. **Phase 3 ACTIVE** (2026-04-16) — reads flipped to junction. Registered ใน `[Admin System] B2F Migration Audit` V.3.1:
 
 **Phase 1 (observe-only)**:
 
@@ -347,7 +350,7 @@ Namespace สำหรับ B2F Option F migration audit (Phase 1 observe-only 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | POST | `/activate-schema` | Admin | dbDelta canonical tables (`dinoco_product_makers` + `dinoco_maker_product_observations`). Params: `{confirm: true}`. Calls `b2f_audit_activate_schema_v10()` (database-expert). Returns 501 ถ้า helper ยังไม่ sync. Rate limit 5/hr. |
-| POST | `/backfill` | Admin | รัน `scripts/b2f-phase2-backfill.php`. Params: `{confirm: bool, dry_run: bool}`. Persists state to `b2f_phase2_backfill_state` option. Dry-run ไม่ save state. Returns 501 ถ้า script ยังไม่ sync. Rate limit 5/hr. |
+| POST | `/backfill` | Admin | V.2.1 — inlined `b2f_phase2_run_backfill()` (WP Code Snippets ไม่ sync `scripts/` folder). Params: `{confirm, dry_run}`. **Production result (2026-04-16)**: 103 CPT rows + 13 orphan SETs = 116 junction rows. Dry-run ไม่ save. Rate limit 5/hr. |
 | GET | `/backfill-status` | Admin | read last run summary + junction count + schema activation flag |
 | POST | `/feature-flags/toggle` | Admin | Toggle whitelist flag (Phase 2 = เฉพาะ `b2f_flag_shadow_write`). Params: `{flag_name, value, confirm}`. Guard: ต้องมี schema + backfill ก่อนเปิด shadow_write. |
 | GET | `/junction-snapshot` | Admin | Read recent junction rows. Params: `maker_id`, `status`, `limit` (default 50, max 500). Returns `{rows, summary: {total, active, discontinued, cpt_count, diff_vs_cpt}}` |
@@ -355,11 +358,11 @@ Namespace สำหรับ B2F Option F migration audit (Phase 1 observe-only 
 
 **Rate limit**: 20 req/hour/user per read endpoint (ผ่าน `b2b_rate_limit()`); 5/hour for destructive actions (activate-schema, backfill).
 
-**Allowed flags** (wp_options, default=false ทุกตัว):
+**Allowed flags** (wp_options, default=false ทุกตัว — whitelist):
 
-- `b2f_flag_auto_sync_sets` — Phase 2.5 (auto-sync SETs) — LOCKED
-- `b2f_flag_shadow_write` — Phase 2 (dual-write CPT + junction) — **TOGGLEABLE via V.2.0**
-- `b2f_flag_read_from_junction` — Phase 3 (cut-over reads) — LOCKED
+- `b2f_flag_auto_sync_sets` — Phase 2.5 (auto-sync SETs on leaf register) — **LOCKED** (future)
+- `b2f_flag_shadow_write` — Phase 2 dual-write CPT → junction — **ACTIVE** since 2026-04-16 (toggleable via V.2.0)
+- `b2f_flag_read_from_junction` — Phase 3 cut-over: LIFF/Admin reads junction — **ACTIVE** since 2026-04-16 (toggleable via V.3.0 post-backfill verify)
 
 **State helpers** (V.2.0, same snippet):
 
@@ -751,6 +754,51 @@ Product catalog stored in custom table (separate from b2b_product CPT) — sourc
 | `year_start` | INT | Production start year |
 | `year_end` | INT | Production end year |
 | `is_active` | TINYINT(1) | Active status |
+
+#### `dinoco_product_makers` (Phase 2 canonical junction — Option F Hybrid Shadow-Write)
+
+Created 2026-04-16 by `POST /dinoco-b2f-audit/v1/activate-schema`. Replaces `b2f_maker_product` CPT as source of truth. Row count (production): **116** (103 CPT migrations + 13 orphan SETs auto-synced).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | BIGINT AUTO_INCREMENT | PK |
+| `product_sku` | VARCHAR(50) COLLATE utf8mb4_bin | Case-sensitive UPPER — matches `dinoco_sku_relations` key pattern |
+| `maker_id` | BIGINT | FK → `b2f_maker` post ID |
+| `unit_cost` | DECIMAL(12,2) | NATIVE currency (THB/CNY/USD) — derive THB via `po_exchange_rate` snapshot at create-po |
+| `moq` | INT | Minimum order quantity |
+| `lead_time_days` | INT | Manufacturing lead time |
+| `shipping_land` / `shipping_sea` | DECIMAL(10,2) | Per-unit shipping (NATIVE currency) |
+| `status` | VARCHAR(20) | `active` / `discontinued` / `pending` |
+| `notes` | TEXT | Migrated from ACF `mp_notes` |
+| `legacy_cpt_id` | BIGINT NULL | Rollback reverse lookup (preserved until Phase 4) |
+| `created_by` / `updated_by` | BIGINT | Audit trail |
+| `created_at` / `updated_at` | DATETIME | Audit timestamps |
+| `deleted_at` | DATETIME NULL | Soft delete (preserves PO history refs) |
+
+**Indexes**: `UNIQUE (product_sku, maker_id)` (DD-3 per-maker), `idx_maker`, `idx_sku`, `idx_status`, `idx_maker_status` (hot path reads), `idx_legacy_cpt` (rollback), `idx_deleted`.
+
+#### `dinoco_maker_product_observations` (Phase 2 shadow-write diff log)
+
+Created 2026-04-16 alongside junction table. Drift log for CPT vs junction comparisons during dual-write era.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | BIGINT AUTO_INCREMENT | PK |
+| `observed_at` | DATETIME | Observation timestamp |
+| `source` | VARCHAR(20) | `cpt` / `junction` / `diff` |
+| `sku` / `maker_id` / `field_name` | — | Subject identifiers |
+| `cpt_value` / `junction_value` | TEXT | Captured values (for diff source) |
+| `diff_detected` | TINYINT(1) | 1 = drift alert |
+
+**Indexes**: `idx_observed` (TTL scan — 60 day prune), `idx_diff` (drift filter), `idx_maker_sku`.
+
+**TTL**: `b2f_observations_ttl_cron` (Snippet 11 V.2.2) runs daily, removes rows older than 60 days.
+
+**Schema markers** (wp_options):
+
+- `b2f_schema_version` = `'10.1'`
+- `b2f_schema_v10_activated` = unix timestamp (set after dbDelta success)
+- `b2f_phase2_backfill_state` = JSON `{ran_at, cpt_migrated, orphans_added, errors, elapsed_ms, uid}`
 
 ### 5.4 wp_options (Shared State)
 
@@ -1499,7 +1547,7 @@ sequenceDiagram
 | B2F Orders | `[b2f_admin_orders_tab]` | PO management |
 | B2F Makers | `[b2f_admin_makers_tab]` | Maker/product management |
 | B2F Credit | `[b2f_admin_credit_tab]` | Credit/payment tracking |
-| B2F Migration Audit | `[b2f_migration_audit]` | V.2.0 — Phase 1 observe (drift/stale/parity/dry-run) + Phase 2 Shadow-Write controls (activate-schema/backfill/toggle-shadow-write/junction snapshot/observations viewer) |
+| B2F Migration Audit | `[b2f_migration_audit]` | V.3.1 — Phase 1 observe + Phase 2 Shadow-Write + **Phase 3 ACTIVE** (reads junction since 2026-04-16) — 9 REST endpoints + Phase 3 flag toggle UI + code review fixes |
 
 #### LIFF Pages (Admin)
 
