@@ -1,5 +1,6 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.1.1 — STRICT orphan rule (ALL descendants covered) + CSV with leaves/children columns + disable bugged script path
  * Version: V.1.0 — Phase 1 observe-only audit + feature flags + dry-run trigger
  * DB_ID: (auto-assign after WP creates snippet)
  * Purpose: Audit dashboard + dry-run CSV export สำหรับ B2F Option F migration
@@ -58,49 +59,32 @@ if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
  * ให้ refactor ใช้ SQL helper ของเขาแทน inline logic นี้
  */
 if ( ! function_exists( 'b2f_audit_get_orphan_sets' ) ) {
+    /**
+     * V.1.1 STRICT RULE: SET orphan = SET ที่ maker ไม่ได้ register
+     *                    + children/descendants ทั้งหมดของ SET covered โดย maker (recursive)
+     *
+     * FIX: เดิมใช้ "≥1 descendant" → false positive ในกรณี multi-maker SET
+     * (เช่น Full Set Case = racks จาก HTP + boxes จาก maker อื่น → HTP ไม่ควร register SET)
+     *
+     * Coverage rule:
+     * - SKU covered ถ้า (a) registered ตรงๆ หรือ (b) เป็น SET + ทุก child covered recursive
+     * - leaf ที่ไม่ registered และไม่มี children → NOT covered
+     */
     function b2f_audit_get_orphan_sets() {
         global $wpdb;
 
         $relations = get_option( 'dinoco_sku_relations', array() );
         if ( ! is_array( $relations ) || empty( $relations ) ) return array();
 
-        // สร้าง reverse map: leaf_sku → [parent_set_sku, ...]
-        // รวม grandchild ด้วย (walk full hierarchy up to depth 3)
-        $descendant_to_ancestors = array();
-        foreach ( $relations as $parent_sku => $children ) {
+        // Normalize relations: UPPERCASE keys + children
+        $rel_upper = array();
+        foreach ( $relations as $parent => $children ) {
             if ( ! is_array( $children ) ) continue;
-            $parent_u = strtoupper( (string) $parent_sku );
-            foreach ( $children as $child ) {
-                $child_u = strtoupper( (string) $child );
-                if ( ! isset( $descendant_to_ancestors[ $child_u ] ) ) {
-                    $descendant_to_ancestors[ $child_u ] = array();
-                }
-                $descendant_to_ancestors[ $child_u ][] = $parent_u;
-
-                // walk grandchildren
-                if ( isset( $relations[ $child_u ] ) && is_array( $relations[ $child_u ] ) ) {
-                    foreach ( $relations[ $child_u ] as $gc ) {
-                        $gc_u = strtoupper( (string) $gc );
-                        if ( ! isset( $descendant_to_ancestors[ $gc_u ] ) ) {
-                            $descendant_to_ancestors[ $gc_u ] = array();
-                        }
-                        $descendant_to_ancestors[ $gc_u ][] = $parent_u;
-                    }
-                }
-                // case-insensitive fallback key (legacy data may be mixed case)
-                if ( isset( $relations[ $child ] ) && is_array( $relations[ $child ] ) ) {
-                    foreach ( $relations[ $child ] as $gc ) {
-                        $gc_u = strtoupper( (string) $gc );
-                        if ( ! isset( $descendant_to_ancestors[ $gc_u ] ) ) {
-                            $descendant_to_ancestors[ $gc_u ] = array();
-                        }
-                        $descendant_to_ancestors[ $gc_u ][] = $parent_u;
-                    }
-                }
-            }
+            $p_u = strtoupper( (string) $parent );
+            $rel_upper[ $p_u ] = array_map( function( $c ) { return strtoupper( (string) $c ); }, $children );
         }
 
-        // ดึง maker products ทั้งหมด: (maker_id, sku)
+        // ดึง maker products ทั้งหมด
         $rows = $wpdb->get_results( $wpdb->prepare(
             "SELECT p.ID AS post_id,
                     mk.meta_value AS maker_id,
@@ -123,25 +107,92 @@ if ( ! function_exists( 'b2f_audit_get_orphan_sets' ) ) {
             $maker_skus[ $mid ][ $sku ] = true;
         }
 
-        // สำหรับแต่ละ maker → หาดู descendant ที่ registered → หา SET ancestor → เช็ค SET registered ไหม
+        // Recursive coverage check — value-copy $visited per branch (V.7.1 pattern)
+        $is_sku_covered = function( $sku_u, $maker_sku_set, $visited = array() ) use ( &$is_sku_covered, $rel_upper ) {
+            if ( isset( $visited[ $sku_u ] ) ) return false; // circular guard
+            $visited[ $sku_u ] = true;
+
+            // (a) registered ตรงๆ → covered
+            if ( isset( $maker_sku_set[ $sku_u ] ) ) return true;
+
+            // (b) เป็น SET? ถ้ามี children ต้อง covered ทุกตัว
+            if ( ! isset( $rel_upper[ $sku_u ] ) || empty( $rel_upper[ $sku_u ] ) ) {
+                return false; // leaf + not registered → NOT covered
+            }
+
+            foreach ( $rel_upper[ $sku_u ] as $child_u ) {
+                if ( ! $is_sku_covered( $child_u, $maker_sku_set, $visited ) ) {
+                    return false; // any child not covered → SET not covered
+                }
+            }
+            return true; // all children covered
+        };
+
+        // Find top-level SETs
+        $all_children = array();
+        foreach ( $rel_upper as $parent_u => $children ) {
+            foreach ( $children as $c ) $all_children[ $c ] = true;
+        }
+        $top_level_sets = array();
+        foreach ( $rel_upper as $parent_u => $_ ) {
+            if ( ! isset( $all_children[ $parent_u ] ) ) $top_level_sets[] = $parent_u;
+        }
+
+        // Check each top-level SET per maker
         $orphans = array();
         foreach ( $maker_skus as $mid => $sku_set ) {
-            $seen_sets = array(); // dedupe
-            foreach ( array_keys( $sku_set ) as $sku ) {
-                if ( ! isset( $descendant_to_ancestors[ $sku ] ) ) continue;
-                foreach ( $descendant_to_ancestors[ $sku ] as $set_sku ) {
-                    if ( isset( $seen_sets[ $set_sku ] ) ) continue;
-                    $seen_sets[ $set_sku ] = true;
-                    // ถ้า SET ไม่อยู่ใน maker_skus[$mid] = orphan
-                    if ( ! isset( $sku_set[ $set_sku ] ) ) {
-                        $orphans[] = array(
-                            'maker_id'     => $mid,
-                            'maker_name'   => get_the_title( $mid ),
-                            'orphan_sku'   => $set_sku,
-                            'orphan_name'  => b2f_audit_catalog_name( $set_sku ),
-                            'reason'       => 'SET not registered, but maker has ≥1 descendant leaf',
+            foreach ( $top_level_sets as $set_sku ) {
+                // skip ถ้า SET registered แล้ว
+                if ( isset( $sku_set[ $set_sku ] ) ) continue;
+
+                // STRICT: ตรวจ children ของ SET ว่า covered ครบไหม
+                $all_children_covered = true;
+                foreach ( $rel_upper[ $set_sku ] as $child_u ) {
+                    if ( ! $is_sku_covered( $child_u, $sku_set ) ) {
+                        $all_children_covered = false;
+                        break;
+                    }
+                }
+
+                if ( $all_children_covered ) {
+                    // V.1.1: collect all leaves (grandchildren) recursively
+                    $collect_leaves = function( $sku_u, $visited = array() ) use ( &$collect_leaves, $rel_upper ) {
+                        if ( isset( $visited[ $sku_u ] ) ) return array();
+                        $visited[ $sku_u ] = true;
+                        if ( empty( $rel_upper[ $sku_u ] ) ) return array( $sku_u ); // leaf
+                        $leaves = array();
+                        foreach ( $rel_upper[ $sku_u ] as $child_u ) {
+                            $leaves = array_merge( $leaves, $collect_leaves( $child_u, $visited ) );
+                        }
+                        return array_values( array_unique( $leaves ) );
+                    };
+                    $leaves = $collect_leaves( $set_sku );
+
+                    // V.1.1: classify each descendant: registered | covered_by_intermediate
+                    $children_detail = array();
+                    foreach ( $rel_upper[ $set_sku ] as $child_u ) {
+                        $leaves_of_child = $collect_leaves( $child_u );
+                        $child_registered = isset( $sku_set[ $child_u ] );
+                        $children_detail[] = array(
+                            'sku'        => $child_u,
+                            'name'       => b2f_audit_catalog_name( $child_u ),
+                            'registered' => $child_registered,
+                            'leaves'     => $leaves_of_child,
+                            'is_set'     => ! empty( $rel_upper[ $child_u ] ),
                         );
                     }
+
+                    $orphans[] = array(
+                        'maker_id'        => $mid,
+                        'maker_name'      => get_the_title( $mid ),
+                        'orphan_sku'      => $set_sku,
+                        'orphan_name'     => b2f_audit_catalog_name( $set_sku ),
+                        'reason'          => 'Maker has ALL descendants registered — SET ควร sync',
+                        'leaves'          => $leaves, // all flat leaves (grandchildren)
+                        'leaves_count'    => count( $leaves ),
+                        'children'        => $children_detail, // direct children with details
+                        'children_count'  => count( $children_detail ),
+                    );
                 }
             }
         }
@@ -281,14 +332,15 @@ if ( ! function_exists( 'b2f_audit_catalog_name' ) ) {
  */
 if ( ! function_exists( 'b2f_audit_build_dry_run_csv' ) ) {
     function b2f_audit_build_dry_run_csv() {
-        // Try database-expert script first (common paths)
-        $candidates = array(
+        // V.1.1: Use inline fallback directly (script has bugged ACF field names — fix Phase 1.2)
+        // Strict rule now implemented in b2f_audit_get_orphan_sets() — skip script path
+        $script_path = null;
+        $_candidates_disabled = array(
             ABSPATH . '../scripts/b2f-migrate-dry-run.php',
             ABSPATH . 'scripts/b2f-migrate-dry-run.php',
             dirname( ABSPATH ) . '/scripts/b2f-migrate-dry-run.php',
             WP_CONTENT_DIR . '/scripts/b2f-migrate-dry-run.php',
         );
-        $script_path = null;
         foreach ( $candidates as $p ) {
             if ( $p && file_exists( $p ) ) { $script_path = $p; break; }
         }
@@ -320,18 +372,38 @@ if ( ! function_exists( 'b2f_audit_build_dry_run_csv' ) ) {
         $stale   = b2f_audit_get_stale_records( 90 );
 
         $fh = fopen( 'php://temp', 'w+' );
-        fputcsv( $fh, array( 'maker_id', 'maker_name', 'sku', 'issue_type', 'details' ) );
+        // V.1.1: extended columns with leaves + children details
+        fputcsv( $fh, array(
+            'maker_id', 'maker_name', 'sku', 'sku_name', 'issue_type',
+            'children_count', 'leaves_count', 'children_skus', 'leaves_skus', 'details'
+        ) );
 
         foreach ( $orphans as $o ) {
+            $children_skus = array();
+            if ( ! empty( $o['children'] ) ) {
+                foreach ( $o['children'] as $c ) {
+                    $mark = $c['registered'] ? '✓' : ( $c['is_set'] ? '(SET covered)' : '✗' );
+                    $children_skus[] = $c['sku'] . ' ' . $mark;
+                }
+            }
             fputcsv( $fh, array(
-                $o['maker_id'], $o['maker_name'], $o['orphan_sku'],
-                'orphan', $o['reason']
+                $o['maker_id'],
+                $o['maker_name'],
+                $o['orphan_sku'],
+                $o['orphan_name'] ?? '',
+                'orphan',
+                $o['children_count'] ?? 0,
+                $o['leaves_count'] ?? 0,
+                implode( ' | ', $children_skus ),
+                implode( ' | ', $o['leaves'] ?? array() ),
+                $o['reason']
             ) );
         }
         foreach ( $stale as $s ) {
             fputcsv( $fh, array(
-                $s['maker_id'], $s['maker_name'], $s['sku'],
-                'stale', $s['reason'] . ' (last=' . $s['last_updated'] . ')'
+                $s['maker_id'], $s['maker_name'], $s['sku'], '',
+                'stale', 0, 0, '', '',
+                $s['reason'] . ' (last=' . $s['last_updated'] . ')'
             ) );
         }
 
