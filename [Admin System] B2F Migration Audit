@@ -1,6 +1,7 @@
 /**
  * [Admin System] B2F Migration Audit
  * Version: V.2.0 — Phase 2 Shadow-Write controls (activate-schema, backfill, flag toggler, junction/observations viewer)
+ * Version: V.2.1 — Inline b2f_phase2_run_backfill() (replaces scripts/b2f-phase2-backfill.php — WP Code Snippets ไม่ sync scripts/)
  * Version: V.1.3 — tree_view column + nested grandchildren inline display
  * Version: V.1.2 — เพิ่ม compatible_models + category columns (Honda NX500, Honda CB500X, …)
  * Version: V.1.1 — STRICT orphan rule (ALL descendants covered) + CSV with leaves/children columns + disable bugged script path
@@ -217,11 +218,203 @@ if ( ! function_exists( 'b2f_audit_activate_schema_v10' ) ) {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
+ * V.2.1: Inline Phase 2 backfill (replaces external scripts/b2f-phase2-backfill.php)
+ * Reason: WP Code Snippets ไม่ sync scripts/ folder → file ไม่อยู่บน server
+ * Solution: embed เข้า audit snippet ตรงๆ → sync ผ่าน webhook ปกติ
+ */
+if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
+    function b2f_phase2_run_backfill( $dry_run = false, $actor_uid = 0 ) {
+        global $wpdb;
+
+        $result = array(
+            'success'        => false,
+            'dry_run'        => (bool) $dry_run,
+            'cpt_migrated'   => 0,
+            'orphans_added'  => 0,
+            'skipped'        => 0,
+            'errors'         => array(),
+            'started_at'     => current_time( 'mysql' ),
+            'finished_at'    => null,
+        );
+
+        // Guard 1: schema activated
+        if ( ! get_option( 'b2f_schema_v10_activated', 0 ) ) {
+            $result['errors'][] = 'Schema V10 ยังไม่ activate — กด Activate Schema ก่อน';
+            return $result;
+        }
+
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+
+        // Guard 2: table exists
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $tbl
+        ) );
+        if ( ! $exists ) {
+            $result['errors'][] = "Table {$tbl} ไม่มีอยู่จริง — run Activate Schema อีกครั้ง";
+            return $result;
+        }
+
+        // STEP 1: Load b2f_maker_product CPTs
+        $maker_products = get_posts( array(
+            'post_type'      => 'b2f_maker_product',
+            'post_status'    => array( 'publish', 'draft' ),
+            'posts_per_page' => -1,
+            'fields'         => 'ids',
+            'no_found_rows'  => true,
+        ) );
+
+        if ( ! $dry_run ) $wpdb->query( 'START TRANSACTION' );
+
+        $actor_uid = intval( $actor_uid );
+        $now = current_time( 'mysql' );
+
+        // STEP 2: Copy CPT → junction
+        foreach ( $maker_products as $mp_id ) {
+            try {
+                $sku       = function_exists( 'get_field' ) ? get_field( 'mp_product_sku', $mp_id ) : '';
+                $maker_id  = function_exists( 'get_field' ) ? get_field( 'mp_maker_id', $mp_id ) : 0;
+                $unit_cost = function_exists( 'get_field' ) ? floatval( get_field( 'mp_unit_cost', $mp_id ) ) : 0;
+                $moq       = function_exists( 'get_field' ) ? intval( get_field( 'mp_moq', $mp_id ) ) : 1;
+                $lead_time = function_exists( 'get_field' ) ? intval( get_field( 'mp_lead_time_days', $mp_id ) ) : 7;
+                $ship_land = function_exists( 'get_field' ) ? floatval( get_field( 'mp_shipping_land', $mp_id ) ) : 0;
+                $ship_sea  = function_exists( 'get_field' ) ? floatval( get_field( 'mp_shipping_sea', $mp_id ) ) : 0;
+                $notes     = function_exists( 'get_field' ) ? ( get_field( 'mp_notes', $mp_id ) ?: '' ) : '';
+                $status    = function_exists( 'get_field' ) ? ( get_field( 'mp_status', $mp_id ) ?: 'active' ) : 'active';
+
+                $sku = strtoupper( trim( (string) $sku ) );
+                $maker_id = intval( $maker_id );
+                if ( ! $sku || ! $maker_id ) { $result['skipped']++; continue; }
+                if ( ! in_array( $status, array( 'active', 'discontinued', 'pending' ), true ) ) $status = 'active';
+                if ( $moq < 1 ) $moq = 1;
+                if ( $lead_time < 0 ) $lead_time = 7;
+
+                if ( $dry_run ) { $result['cpt_migrated']++; continue; }
+
+                $sql = $wpdb->prepare(
+                    "INSERT INTO {$tbl}
+                        (product_sku, maker_id, unit_cost, moq, lead_time_days,
+                         shipping_land, shipping_sea, status, notes,
+                         legacy_cpt_id, created_by, updated_by, created_at, updated_at)
+                     VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, %d, %d, %d, %s, %s)
+                     ON DUPLICATE KEY UPDATE
+                        unit_cost=VALUES(unit_cost), moq=VALUES(moq),
+                        lead_time_days=VALUES(lead_time_days),
+                        shipping_land=VALUES(shipping_land), shipping_sea=VALUES(shipping_sea),
+                        status=VALUES(status), notes=VALUES(notes),
+                        legacy_cpt_id=VALUES(legacy_cpt_id),
+                        updated_by=VALUES(updated_by), updated_at=VALUES(updated_at)",
+                    $sku, $maker_id, $unit_cost, $moq, $lead_time,
+                    $ship_land, $ship_sea, $status, $notes,
+                    $mp_id, $actor_uid, $actor_uid, $now, $now
+                );
+                $ok = $wpdb->query( $sql );
+                if ( $ok === false ) throw new Exception( 'INSERT failed mp_id=' . $mp_id . ' — ' . $wpdb->last_error );
+                $result['cpt_migrated']++;
+            } catch ( Throwable $e ) {
+                $result['errors'][] = 'mp_id=' . $mp_id . ': ' . $e->getMessage();
+                if ( ! $dry_run ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $result['finished_at'] = current_time( 'mysql' );
+                    return $result;
+                }
+            }
+        }
+
+        // STEP 3: Inject orphan SETs (reuse strict rule)
+        if ( ! function_exists( 'b2f_audit_get_orphan_sets' ) ) {
+            if ( ! $dry_run ) $wpdb->query( 'ROLLBACK' );
+            $result['errors'][] = 'b2f_audit_get_orphan_sets() ไม่พบ';
+            $result['finished_at'] = current_time( 'mysql' );
+            return $result;
+        }
+
+        $orphans = b2f_audit_get_orphan_sets();
+        if ( ! is_array( $orphans ) ) $orphans = array();
+
+        foreach ( $orphans as $orphan ) {
+            $sku = ''; $maker_id = 0;
+            try {
+                $sku      = strtoupper( trim( (string) ( $orphan['orphan_sku'] ?? '' ) ) );
+                $maker_id = intval( $orphan['maker_id'] ?? 0 );
+                $leaves   = is_array( $orphan['leaves'] ?? null ) ? $orphan['leaves'] : array();
+
+                if ( ! $sku || ! $maker_id ) { $result['skipped']++; continue; }
+
+                // Compute SET cost = sum of registered leaves (from junction, just inserted)
+                $sum_cost = 0.0; $sum_land = 0.0; $sum_sea = 0.0; $max_lt = 7;
+                foreach ( $leaves as $leaf_sku ) {
+                    $leaf_u = strtoupper( trim( (string) $leaf_sku ) );
+                    $row = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT unit_cost, lead_time_days, shipping_land, shipping_sea
+                         FROM {$tbl}
+                         WHERE product_sku = %s AND maker_id = %d AND deleted_at IS NULL
+                         LIMIT 1",
+                        $leaf_u, $maker_id
+                    ), ARRAY_A );
+                    if ( $row ) {
+                        $sum_cost += floatval( $row['unit_cost'] );
+                        $sum_land += floatval( $row['shipping_land'] );
+                        $sum_sea  += floatval( $row['shipping_sea'] );
+                        $lt = intval( $row['lead_time_days'] );
+                        if ( $lt > $max_lt ) $max_lt = $lt;
+                    }
+                }
+
+                $auto_notes = 'Auto-added by Phase 2 migration ' . wp_date( 'Y-m-d' ) . ' — leaves=' . implode( ',', $leaves );
+
+                if ( $dry_run ) { $result['orphans_added']++; continue; }
+
+                $sql = $wpdb->prepare(
+                    "INSERT INTO {$tbl}
+                        (product_sku, maker_id, unit_cost, moq, lead_time_days,
+                         shipping_land, shipping_sea, status, notes,
+                         legacy_cpt_id, created_by, updated_by, created_at, updated_at)
+                     VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, NULL, %d, %d, %s, %s)
+                     ON DUPLICATE KEY UPDATE id = id",
+                    $sku, $maker_id, $sum_cost, 1, $max_lt,
+                    $sum_land, $sum_sea, 'active', $auto_notes,
+                    $actor_uid, $actor_uid, $now, $now
+                );
+                $ok = $wpdb->query( $sql );
+                if ( $ok === false ) throw new Exception( 'Orphan INSERT failed sku=' . $sku . ' — ' . $wpdb->last_error );
+                if ( $wpdb->rows_affected >= 1 ) $result['orphans_added']++;
+                else $result['skipped']++;
+
+            } catch ( Throwable $e ) {
+                $result['errors'][] = 'orphan sku=' . $sku . ' maker=' . $maker_id . ': ' . $e->getMessage();
+                if ( ! $dry_run ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $result['finished_at'] = current_time( 'mysql' );
+                    return $result;
+                }
+            }
+        }
+
+        // STEP 4: Commit
+        if ( ! $dry_run ) {
+            $wpdb->query( 'COMMIT' );
+            update_option( 'b2f_phase2_backfill_completed', time() );
+        }
+
+        $result['success'] = empty( $result['errors'] );
+        $result['finished_at'] = current_time( 'mysql' );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf(
+                '[B2F Phase2 Backfill] dry_run=%d success=%d cpt=%d orphans=%d skipped=%d errors=%d',
+                $result['dry_run'] ? 1 : 0, $result['success'] ? 1 : 0,
+                $result['cpt_migrated'], $result['orphans_added'], $result['skipped'], count( $result['errors'] )
+            ) );
+        }
+
+        return $result;
+    }
+}
+
+/**
  * ดึง orphan SETs per maker — SET ที่ maker "แตะ" (มี child/leaf ของตัว SET
  * registered ใน b2f_maker_product CPT) แต่ตัว SET เองไม่ถูก registered
- *
- * TODO (Phase 1 handoff): ถ้า database-expert commit scripts/b2f-audit-queries.sql
- * ให้ refactor ใช้ SQL helper ของเขาแทน inline logic นี้
  */
 if ( ! function_exists( 'b2f_audit_get_orphan_sets' ) ) {
     /**
@@ -1038,41 +1231,22 @@ add_action( 'rest_api_init', function () {
                 return new WP_Error( 'schema_not_ready', 'ต้อง Activate Schema ก่อน run Backfill', array( 'status' => 409 ) );
             }
 
-            // Resolve script path (database-expert deliverable)
-            $candidates = array(
-                ABSPATH . '../scripts/b2f-phase2-backfill.php',
-                ABSPATH . 'scripts/b2f-phase2-backfill.php',
-                dirname( ABSPATH ) . '/scripts/b2f-phase2-backfill.php',
-                WP_CONTENT_DIR . '/scripts/b2f-phase2-backfill.php',
-            );
-            $script_path = null;
-            foreach ( $candidates as $p ) {
-                if ( $p && file_exists( $p ) ) { $script_path = $p; break; }
-            }
-
-            if ( ! $script_path ) {
+            // V.2.1: inline backfill (ไม่ต้องใช้ script ภายนอก — WP Code Snippets ไม่ sync scripts/ folder)
+            if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
                 return new WP_Error(
                     'not_implemented',
-                    'scripts/b2f-phase2-backfill.php ยังไม่ deploy (รอ database-expert commit)',
+                    'b2f_phase2_run_backfill() ไม่พบ — audit snippet V.2.1 ต้อง activate',
                     array( 'status' => 501 )
                 );
             }
 
             $started = microtime( true );
-            $b2f_phase2_backfill_dry_run = $dry_run; // surfaced to included script
-            $b2f_phase2_backfill_confirm = $confirm;
             $result = array();
 
             try {
-                ob_start();
-                $returned = @include $script_path;
-                $stdout   = ob_get_clean();
-                if ( is_array( $returned ) ) $result = $returned;
-                elseif ( isset( $GLOBALS['b2f_phase2_backfill_result'] ) && is_array( $GLOBALS['b2f_phase2_backfill_result'] ) ) {
-                    $result = $GLOBALS['b2f_phase2_backfill_result'];
-                }
+                $result = b2f_phase2_run_backfill( $dry_run, get_current_user_id() );
+                if ( ! is_array( $result ) ) $result = array();
             } catch ( Throwable $e ) {
-                @ob_end_clean();
                 if ( function_exists( 'b2b_log' ) ) {
                     b2b_log( '[B2F Audit] Backfill error: ' . $e->getMessage() );
                 }
