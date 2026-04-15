@@ -1,5 +1,6 @@
 /**
  * [B2F] Snippet 1: Core Utilities & LINE Flex Builders
+ * Version: V.6.6 — Issue #1: 3-level hierarchy grouping (TOP SET → intermediate child → leaves). New `b2f_group_items_by_path($items)` parses `poi_parent_path` (slash-separated) per breakdown → nested tree {sets: {TOP: {children_nodes: {MID: {leaves: [...]}}, direct_leaves: [...]}}, standalone: [...], is_3level, fallback_used}. `b2f_build_item_breakdown_json()` preserves `parent_path` field. `b2f_flex_po_items_list()` auto-switches: 3-level render (purple TOP + blue MID + leaves indent 18px) ถ้า is_3level=true, else fallback to 2-level (b2f_group_items_by_set). Backward compat: PO เก่าไม่มี poi_parent_path → fallback path → UI เหมือนเดิม.
  * Version: V.6.5 — Phase 1 migration: feature flag helpers (b2f_is_flag_enabled, b2f_get_all_flags, b2f_log_flag_change)
  * Previous: V.6.4 — DD-3 Phase 4: b2f_group_items_by_set uses breakdown + b2f_compute_manufacturing_summary helper
  * DB_ID: 1163
@@ -481,6 +482,8 @@ if (!function_exists('b2f_build_item_breakdown_json')) {
             $clean[] = array(
                 'parent_sku'  => sanitize_text_field($b['parent_sku'] ?? '__standalone__'),
                 'parent_name' => sanitize_text_field($b['parent_name'] ?? ''),
+                // V.6.6 Issue #1: intermediate parent chain (e.g. "TOP/MID") — empty = 2-level fallback
+                'parent_path' => sanitize_text_field($b['parent_path'] ?? ''),
                 'qty'         => intval($b['qty'] ?? 0),
             );
         }
@@ -544,6 +547,143 @@ if (!function_exists('b2f_group_items_by_set')) {
     }
 
     /**
+     * V.6.6 Issue #1: 3-level hierarchy grouping (TOP SET → intermediate child → leaves)
+     *
+     * Parses `poi_parent_path` (slash-separated) per breakdown entry to build nested tree.
+     * PO เก่าไม่มี `poi_parent_path` → fallback เรียก `b2f_group_items_by_set()` (2-level)
+     *
+     * Output shape (3-level):
+     * {
+     *   sets: {
+     *     TOP_SKU: {
+     *       parent_name: "ชุด NX500",
+     *       children_nodes: {                    // intermediate children (path depth >= 2)
+     *         MID_SKU: {
+     *           parent_name: "Crash Bar บน",
+     *           leaves: [ item_copy, ... ]       // leaf items ใต้ intermediate
+     *         }
+     *       },
+     *       direct_leaves: [ item_copy, ... ]    // leaves ตรงใต้ TOP (path = "TOP" only)
+     *     }
+     *   },
+     *   standalone: [ item_copy, ... ],          // ไม่มี parent
+     *   is_3level: bool,                          // true ถ้ามี intermediate node
+     *   fallback_used: bool                       // true ถ้าใช้ b2f_group_items_by_set (no paths)
+     * }
+     *
+     * @param array $items PO items (repeater rows)
+     * @return array
+     */
+    function b2f_group_items_by_path($items) {
+        $result = array(
+            'sets'          => array(),
+            'standalone'    => array(),
+            'is_3level'     => false,
+            'fallback_used' => false,
+        );
+        if (empty($items) || !is_array($items)) return $result;
+
+        // Probe: มี poi_parent_path ที่ไม่ว่างไหม → ถ้าไม่มีเลย fallback to 2-level
+        $has_any_path = false;
+        foreach ($items as $it) {
+            $pp = isset($it['poi_parent_path']) ? trim((string)$it['poi_parent_path']) : '';
+            if ($pp !== '') { $has_any_path = true; break; }
+        }
+        if (!$has_any_path) {
+            // Backward compat: PO เก่า → fallback to 2-level grouping
+            $legacy = function_exists('b2f_group_items_by_set')
+                ? b2f_group_items_by_set($items)
+                : array('sets' => array(), 'standalone' => $items);
+            $result['sets']          = $legacy['sets'];
+            $result['standalone']    = $legacy['standalone'];
+            $result['fallback_used'] = true;
+            return $result;
+        }
+
+        // 3-level parse using breakdown entries
+        foreach ($items as $item) {
+            $breakdown = function_exists('b2f_get_item_breakdown')
+                ? b2f_get_item_breakdown($item)
+                : array();
+
+            if (empty($breakdown)) {
+                // Fallback: no breakdown → treat as standalone
+                $standalone_copy = $item;
+                $standalone_copy['_breakdown_origin'] = '__standalone__';
+                $result['standalone'][] = $standalone_copy;
+                continue;
+            }
+
+            foreach ($breakdown as $b) {
+                $psku      = $b['parent_sku'] ?? '__standalone__';
+                $pname     = $b['parent_name'] ?? $psku;
+                $ppath     = trim((string)($b['parent_path'] ?? ''));
+                $bqty      = intval($b['qty'] ?? 0);
+
+                if ($psku === '__standalone__' || empty($psku)) {
+                    $std_copy = $item;
+                    $std_copy['poi_qty_ordered'] = $bqty;
+                    $std_copy['_breakdown_origin'] = '__standalone__';
+                    $result['standalone'][] = $std_copy;
+                    continue;
+                }
+
+                // Parse parent_path — format "TOP/MID1/MID2..." or "TOP" or ""
+                // Fallback: if empty path, treat as direct leaf of $psku (2-level)
+                if ($ppath === '') {
+                    $chain = array($psku);
+                } else {
+                    $chain = array_values(array_filter(array_map('trim', explode('/', $ppath))));
+                    if (empty($chain)) $chain = array($psku);
+                }
+
+                $top_sku = $chain[0];
+
+                // Initialize TOP SET bucket
+                if (!isset($result['sets'][$top_sku])) {
+                    $result['sets'][$top_sku] = array(
+                        'parent_name'    => ($top_sku === $psku) ? $pname : $top_sku,
+                        'children_nodes' => array(),
+                        'direct_leaves'  => array(),
+                    );
+                }
+
+                // If only 1 node in chain (top only) → leaf is direct under top
+                if (count($chain) === 1) {
+                    $leaf_copy = $item;
+                    $leaf_copy['poi_qty_ordered'] = $bqty;
+                    $leaf_copy['_breakdown_origin'] = $psku;
+                    $leaf_copy['_parent_path'] = $ppath;
+                    $result['sets'][$top_sku]['direct_leaves'][] = $leaf_copy;
+                } else {
+                    // Chain >= 2 → intermediate node(s). Use LAST intermediate (closest to leaf) as grouping key
+                    $result['is_3level'] = true;
+                    $mid_sku = end($chain); // last is immediate parent of leaf
+                    reset($chain);
+
+                    // Resolve intermediate name — use $pname if $mid_sku === $psku, else fall back to $mid_sku
+                    $mid_name = ($mid_sku === $psku) ? $pname : $mid_sku;
+
+                    if (!isset($result['sets'][$top_sku]['children_nodes'][$mid_sku])) {
+                        $result['sets'][$top_sku]['children_nodes'][$mid_sku] = array(
+                            'parent_name' => $mid_name,
+                            'leaves'      => array(),
+                        );
+                    }
+
+                    $leaf_copy = $item;
+                    $leaf_copy['poi_qty_ordered'] = $bqty;
+                    $leaf_copy['_breakdown_origin'] = $psku;
+                    $leaf_copy['_parent_path'] = $ppath;
+                    $result['sets'][$top_sku]['children_nodes'][$mid_sku]['leaves'][] = $leaf_copy;
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * V.6.4 DD-3: Manufacturing summary — รวม qty ของ leaf ทุก SKU (flat list)
      * ใช้สำหรับ "ยอดรวมผลิต" section ใน PO ticket / image / flex
      *
@@ -583,7 +723,8 @@ if (!function_exists('b2f_group_items_by_set')) {
 if (!function_exists('b2f_flex_po_items_list')) {
     /**
      * V.6.1 Hierarchy: Group items by SET parent for Flex display
-     * PO เก่า (ไม่มี poi_parent_sku) → flat list เดิม (backward compat)
+     * V.6.6 Issue #1: 3-level render (SET → intermediate child → leaves) เมื่อ poi_parent_path มีข้อมูล
+     * PO เก่า (ไม่มี poi_parent_sku) → flat list เดิม (backward compat via b2f_group_items_by_set)
      */
     function b2f_flex_po_items_list($items, $currency = 'THB') {
         // Backward compat: old callers pass boolean $is_eng
@@ -602,14 +743,142 @@ if (!function_exists('b2f_flex_po_items_list')) {
             return $contents;
         }
 
-        // V.6.2: DRY — ใช้ helper แทน inline grouping
+        // V.6.6 Issue #1: try 3-level grouping first — fallback to 2-level if no paths present
+        $grouped_3 = function_exists('b2f_group_items_by_path')
+            ? b2f_group_items_by_path($items)
+            : array('sets' => array(), 'standalone' => $items, 'is_3level' => false, 'fallback_used' => true);
+
+        $sym    = function_exists('b2f_currency_symbol') ? b2f_currency_symbol($currency) : '฿';
+        $idx    = 0;
+        $is_first_group = true;
+
+        // If 3-level data present — use new render path
+        if (!empty($grouped_3['is_3level']) && !empty($grouped_3['sets'])) {
+            $top_sets   = $grouped_3['sets'];
+            $standalone = $grouped_3['standalone'];
+
+            foreach ($top_sets as $top_sku => $top_group) {
+                // Compute TOP SET total = sum(direct_leaves) + sum(children_nodes.leaves)
+                $top_total = 0;
+                foreach ($top_group['direct_leaves'] as $ch) {
+                    $top_total += (float)($ch['poi_unit_cost'] ?? 0) * (int)($ch['poi_qty_ordered'] ?? 0);
+                }
+                foreach ($top_group['children_nodes'] as $mid) {
+                    foreach ($mid['leaves'] as $leaf) {
+                        $top_total += (float)($leaf['poi_unit_cost'] ?? 0) * (int)($leaf['poi_qty_ordered'] ?? 0);
+                    }
+                }
+
+                // TOP SET header (purple)
+                $contents[] = array(
+                    'type'    => 'box',
+                    'layout'  => 'horizontal',
+                    'margin'  => $is_first_group ? 'none' : 'lg',
+                    'contents' => array(
+                        array('type'=>'text','text'=>'🟣 ' . mb_substr($top_group['parent_name'], 0, 25),'size'=>'sm','weight'=>'bold','color'=>'#7c3aed','flex'=>5,'wrap'=>true),
+                        array('type'=>'text','text'=>$sym . number_format($top_total, 0),'size'=>'xs','weight'=>'bold','color'=>'#333333','flex'=>3,'align'=>'end'),
+                    ),
+                );
+                $is_first_group = false;
+
+                // Direct leaves under TOP (2-level: TOP → leaf directly)
+                foreach ($top_group['direct_leaves'] as $item) {
+                    $idx++;
+                    $name     = isset($item['poi_product_name']) ? $item['poi_product_name'] : ($item['poi_sku'] ?? '');
+                    $qty      = (int)($item['poi_qty_ordered'] ?? 0);
+                    $cost     = (float)($item['poi_unit_cost'] ?? 0);
+                    $subtotal = $qty * $cost;
+
+                    $contents[] = array(
+                        'type'    => 'box',
+                        'layout'  => 'horizontal',
+                        'margin'  => 'xs',
+                        'paddingStart' => '8px',
+                        'contents' => array(
+                            array('type'=>'text','text'=>'  ' . $idx . '. ' . mb_substr($name, 0, 26),'size'=>'xs','color'=>'#555555','flex'=>5,'wrap'=>true),
+                            array('type'=>'text','text'=>'x' . number_format($qty) . ' @' . number_format($cost, 2),'size'=>'xxs','color'=>'#888888','flex'=>3),
+                            array('type'=>'text','text'=>number_format($subtotal, 0),'size'=>'xxs','weight'=>'bold','color'=>'#333333','flex'=>2,'align'=>'end'),
+                        ),
+                    );
+                }
+
+                // Intermediate children nodes (3-level: TOP → MID → leaves)
+                foreach ($top_group['children_nodes'] as $mid_sku => $mid) {
+                    // MID header (blue)
+                    $mid_total = 0;
+                    foreach ($mid['leaves'] as $leaf) {
+                        $mid_total += (float)($leaf['poi_unit_cost'] ?? 0) * (int)($leaf['poi_qty_ordered'] ?? 0);
+                    }
+                    $contents[] = array(
+                        'type'    => 'box',
+                        'layout'  => 'horizontal',
+                        'margin'  => 'sm',
+                        'paddingStart' => '8px',
+                        'contents' => array(
+                            array('type'=>'text','text'=>'🔵 ' . mb_substr($mid['parent_name'], 0, 23),'size'=>'xs','weight'=>'bold','color'=>'#2563eb','flex'=>5,'wrap'=>true),
+                            array('type'=>'text','text'=>$sym . number_format($mid_total, 0),'size'=>'xxs','weight'=>'bold','color'=>'#555555','flex'=>3,'align'=>'end'),
+                        ),
+                    );
+
+                    // Leaves under MID (indent 18px)
+                    foreach ($mid['leaves'] as $item) {
+                        $idx++;
+                        $name     = isset($item['poi_product_name']) ? $item['poi_product_name'] : ($item['poi_sku'] ?? '');
+                        $qty      = (int)($item['poi_qty_ordered'] ?? 0);
+                        $cost     = (float)($item['poi_unit_cost'] ?? 0);
+                        $subtotal = $qty * $cost;
+
+                        $contents[] = array(
+                            'type'    => 'box',
+                            'layout'  => 'horizontal',
+                            'margin'  => 'xs',
+                            'paddingStart' => '18px',
+                            'contents' => array(
+                                array('type'=>'text','text'=>'  ' . $idx . '. ' . mb_substr($name, 0, 24),'size'=>'xxs','color'=>'#666666','flex'=>5,'wrap'=>true),
+                                array('type'=>'text','text'=>'x' . number_format($qty) . ' @' . number_format($cost, 2),'size'=>'xxs','color'=>'#888888','flex'=>3),
+                                array('type'=>'text','text'=>number_format($subtotal, 0),'size'=>'xxs','weight'=>'bold','color'=>'#333333','flex'=>2,'align'=>'end'),
+                            ),
+                        );
+                    }
+                }
+            }
+
+            // Standalone items (ไม่มี parent = สินค้าเดี่ยว)
+            foreach ($standalone as $item) {
+                $idx++;
+                $name     = isset($item['poi_product_name']) ? $item['poi_product_name'] : ($item['poi_sku'] ?? '');
+                $qty      = (int)($item['poi_qty_ordered'] ?? 0);
+                $cost     = (float)($item['poi_unit_cost'] ?? 0);
+                $subtotal = $qty * $cost;
+
+                $contents[] = array(
+                    'type'   => 'text',
+                    'text'   => $idx . '. ' . mb_substr($name, 0, 30),
+                    'size'   => 'sm',
+                    'weight' => 'bold',
+                    'color'  => '#333333',
+                    'margin' => $idx > 1 ? 'md' : 'none',
+                );
+                $contents[] = array(
+                    'type'    => 'box',
+                    'layout'  => 'horizontal',
+                    'margin'  => 'xs',
+                    'contents' => array(
+                        array('type'=>'text','text'=>'x' . number_format($qty) . ' @' . number_format($cost, 2),'size'=>'xs','color'=>'#888888','flex'=>5),
+                        array('type'=>'text','text'=>number_format($subtotal, 2) . ' B','size'=>'xs','color'=>'#333333','weight'=>'bold','flex'=>5,'align'=>'end'),
+                    ),
+                );
+            }
+
+            return $contents;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Fallback: 2-level render (backward compat สำหรับ PO เก่า)
+        // ─────────────────────────────────────────────────────────────
         $grouped = function_exists('b2f_group_items_by_set') ? b2f_group_items_by_set($items) : array('sets'=>array(),'standalone'=>$items);
         $set_groups = $grouped['sets'];
         $standalone = $grouped['standalone'];
-
-        $idx    = 0;
-        $sym    = function_exists('b2f_currency_symbol') ? b2f_currency_symbol($currency) : '฿';
-        $is_first_group = true;
 
         // ── Render SET groups ──
         foreach ($set_groups as $parent_sku => $group) {

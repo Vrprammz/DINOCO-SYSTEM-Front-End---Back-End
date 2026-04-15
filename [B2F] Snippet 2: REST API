@@ -1,5 +1,6 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.10.3 — Issue #1 fix: DD-7 expansion ที่เดิมเก็บเฉพาะ top-level SET (`poi_parent_sku` + `poi_parent_name`) → Maker Flex, Admin Flex, PO Image, PO Ticket view แสดงแค่ 2 ระดับ (SET → leaves flat) ขาดชั้น "intermediate child" ใน 3-level hierarchy → user งงว่าสั่งอะไร. V.10.3 update: walk ancestors จาก leaf ถึง ordered SET ด้วย `dinoco_get_ancestor_skus()` → build `parent_path = "TOP/MID"` (slash-separated) → store per breakdown entry (DD-3 shared child safe: leaf อาจมี path ต่างกันต่อ occurrence) + top-level `poi_parent_path` ACF sub-field (first breakdown entry, mirror poi_parent_sku convention). `po-detail` REST response return `parent_path` per item. Backward compat: PO เก่าไม่มี poi_parent_path → empty string → renderer fallback ใช้ poi_parent_sku (2-level grouping) เหมือนเดิม. No breaking changes.
  * Version: V.10.2 — Issue #3 fix: `b2f_inject_virtual_sets_v919` walked only top-level SETs (no parent in rel_upper) → intermediate sub-SETs (parent + has grandparent) were NOT injected → LIFF SET Detail (`renderSetDetailItems`) could not find intermediate child in `products[]` → UI showed "1 child + 2 grandchildren" instead of "2 children + 4 grandchildren" for 3-level hierarchies. New `b2f_inject_virtual_all_sets_v920()` walks ALL parent nodes in `rel_upper` (not just top_parents): for each parent that is (a) NOT already registered + (b) has ≥1 registered leaf descendant → inject as virtual SET entry (is_virtual=true). Top-level + intermediate both handled. Legacy helper `b2f_inject_virtual_sets_v919` preserved as thin wrapper calling v920. No schema changes. No breaking changes to Phase 3 read-from-junction flow (virtual inject runs on CPT path only when ?include_virtual=1).
  * Version: V.10.1 — Code review fixes: (H1+M1) unified dual-write gate — call b2f_dual_write_to_junction() inline only when read_from_junction=ON AND shadow_write=OFF (avoid double UPSERT when both ON, since save_post hook in Snippet 0.5 already handles shadow_write case); (H2) b2f_list_maker_products_junction shows pending/discontinued (match CPT path which doesn't filter by status), ordered active→pending→discontinued; (M4) remove lowercase fallback in b2f_read_maker_product CPT path (sku already uppercase-normalized at entry — fallback was misleading + masked legacy data issues that need migration not runtime workaround).
  * Version: V.10.0 — Phase 3 cut-over: reads switch CPT → junction table (`wp_dinoco_product_makers`) gated by `b2f_flag_read_from_junction`. New helpers `b2f_read_maker_product()` + `b2f_list_maker_products_junction()`. Flag ON → list/format/create-po อ่านจาก junction (116 rows incl. 13 orphan SETs) + skip virtual SET inject (V.9.19) + skip auto-compute fallback (V.9.18). Flag OFF → CPT fallback (backward compat). save/delete dual-write ทั้ง CPT+junction. Response shape preserved. `function_exists()` guard ทุก helper (Snippet 0.5 dual-write + Snippet 1 flag helper)
@@ -1643,6 +1644,10 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
         }
 
         // ── DD-7: Auto-expand SET/non-leaf SKUs → leaf items + track SET origin (V.8.7 Hierarchy) ──
+        // V.10.3 Issue #1: also track intermediate parent chain via `parent_path` per breakdown
+        //   parent_path = "TOP_SKU/MID_SKU" (3-level) หรือ "TOP_SKU" (2-level) หรือ "" (standalone leaf)
+        //   stored per breakdown entry (DD-3 safe: shared leaf can have different paths per occurrence)
+        //   top-level repeater field poi_parent_path = first breakdown path (matches poi_parent_sku convention)
         if ( function_exists( 'dinoco_get_leaf_skus' ) && function_exists( 'dinoco_is_leaf_sku' ) ) {
             $expanded = array();
             foreach ( $merged as $item ) {
@@ -1657,6 +1662,7 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                         $expanded[ $sku ]['breakdown'][] = array(
                             'parent_sku'  => '__standalone__',
                             'parent_name' => '',
+                            'parent_path' => '', // V.10.3: standalone → no path
                             'qty'         => $qty,
                         );
                     } else {
@@ -1665,9 +1671,11 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                             'qty'         => $qty,
                             'parent_sku'  => '',
                             'parent_name' => '',
+                            'parent_path' => '',
                             'breakdown'   => array( array(
                                 'parent_sku'  => '__standalone__',
                                 'parent_name' => '',
+                                'parent_path' => '',
                                 'qty'         => $qty,
                             ) ),
                         );
@@ -1692,6 +1700,39 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                         }
                     }
 
+                    // V.10.3 Issue #1: for each leaf, compute intermediate parent chain within THIS SET
+                    //   walk ancestors from leaf upward → include only ancestors that are descendants of (or equal to) the ordered SET
+                    //   if leaf is direct child of ordered SET → path = "SET"
+                    //   if leaf has intermediate parent(s) under SET → path = "SET/MID1/MID2..."
+                    $ordered_sku_u = strtoupper( $sku );
+                    $leaf_path_map = array(); // leaf_sku_upper => path string
+                    if ( function_exists( 'dinoco_get_ancestor_skus' ) ) {
+                        foreach ( $leaves as $leaf_sku ) {
+                            $leaf_u = strtoupper( $leaf_sku );
+                            $ancestors = dinoco_get_ancestor_skus( $leaf_sku ); // [direct_parent, grandparent, ...]
+                            // Build path from top → bottom (top = ordered SET, then intermediates down to immediate parent)
+                            // Filter ancestors: keep only those between leaf and ordered SET (inclusive of SET at top)
+                            $chain = array();
+                            foreach ( $ancestors as $anc_u ) {
+                                $chain[] = $anc_u;
+                                if ( $anc_u === $ordered_sku_u ) break;
+                            }
+                            // Reverse: top → direct parent
+                            $chain = array_reverse( $chain );
+                            // Safety: if ordered SET not found in ancestors → fallback to just ordered SET (defensive)
+                            if ( empty( $chain ) || $chain[0] !== $ordered_sku_u ) {
+                                $chain = array( $ordered_sku_u );
+                            }
+                            // For path string, drop immediate-parent-only 2-level SETs → keep full chain joined
+                            $leaf_path_map[ $leaf_u ] = implode( '/', $chain );
+                        }
+                    } else {
+                        // Fallback: no ancestor helper → path = just ordered SET
+                        foreach ( $leaves as $leaf_sku ) {
+                            $leaf_path_map[ strtoupper( $leaf_sku ) ] = $ordered_sku_u;
+                        }
+                    }
+
                     foreach ( $leaves as $leaf_sku ) {
                         // V.10.0: Validate via flag-gated helper (junction when flag ON, CPT otherwise)
                         $leaf_mp = b2f_read_maker_product( $leaf_sku, $maker_id );
@@ -1704,12 +1745,17 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                             ), 400 );
                         }
 
+                        $leaf_u = strtoupper( $leaf_sku );
+                        $parent_path = isset( $leaf_path_map[ $leaf_u ] ) ? $leaf_path_map[ $leaf_u ] : $ordered_sku_u;
+
                         // V.9.9 DD-3: ทุก leaf ได้ qty เท่ากับ SET qty ต้นทาง + collect breakdown
+                        // V.10.3: include parent_path per breakdown entry
                         if ( isset( $expanded[ $leaf_sku ] ) ) {
                             $expanded[ $leaf_sku ]['qty'] += $qty;
                             $expanded[ $leaf_sku ]['breakdown'][] = array(
                                 'parent_sku'  => $sku,
                                 'parent_name' => $set_parent_name,
+                                'parent_path' => $parent_path,
                                 'qty'         => $qty,
                             );
                         } else {
@@ -1718,9 +1764,11 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                                 'qty'         => $qty,
                                 'parent_sku'  => $sku,
                                 'parent_name' => $set_parent_name,
+                                'parent_path' => $parent_path,
                                 'breakdown'   => array( array(
                                     'parent_sku'  => $sku,
                                     'parent_name' => $set_parent_name,
+                                    'parent_path' => $parent_path,
                                     'qty'         => $qty,
                                 ) ),
                             );
@@ -1786,6 +1834,8 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 // V.9.9 DD-3: breakdown[] for shared child tracking
                 'breakdown'    => $item['breakdown'] ?? array(),
                 'parent_name'  => $item['parent_name'] ?? '',
+                // V.10.3 Issue #1: intermediate parent chain (top/mid — empty for standalone)
+                'parent_path'  => $item['parent_path'] ?? '',
             );
             $total += $subtotal;
 
@@ -1895,6 +1945,8 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 'poi_parent_name'        => $pi['parent_name'] ?? '',
                 // V.9.9 DD-3: breakdown JSON (multi-parent tracking)
                 'poi_parent_breakdown'   => $breakdown_json,
+                // V.10.3 Issue #1: intermediate parent chain ("TOP/MID" or "TOP" or empty)
+                'poi_parent_path'        => $pi['parent_path'] ?? '',
             );
         }
         update_field( 'po_items', $repeater, $po_id );
@@ -2127,6 +2179,8 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
             // V.8.8: ไม่ esc_html() ใน REST response — escape ที่ output point (Flex/LIFF/Ticket ทำเอง)
             $psku = $item['poi_parent_sku'] ?? '';
             $pnam = $item['poi_parent_name'] ?? '';
+            // V.10.3 Issue #1: intermediate parent chain (slash-separated) — empty for PO เก่า
+            $ppath = $item['poi_parent_path'] ?? '';
 
             // V.9.9 DD-3: parent_breakdown (JSON or fallback single entry)
             $breakdown = function_exists( 'b2f_get_item_breakdown' )
@@ -2147,6 +2201,8 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
                 // V.8.7 Hierarchy (legacy single parent)
                 'parent_sku' => $psku, 'poi_parent_sku' => $psku,
                 'parent_name' => $pnam, 'poi_parent_name' => $pnam,
+                // V.10.3 Issue #1: intermediate parent chain ("TOP/MID" or "TOP" or "")
+                'parent_path' => $ppath, 'poi_parent_path' => $ppath,
                 // V.9.9 DD-3 Shared Child breakdown
                 'parent_breakdown' => $breakdown,
             );
