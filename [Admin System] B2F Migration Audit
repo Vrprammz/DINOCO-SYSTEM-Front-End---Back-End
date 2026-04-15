@@ -1795,7 +1795,7 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
             }
 
             function loadAll() {
-                var driftData = null, staleData = null;
+                var driftData = null, staleData = null, flagsData = null;
 
                 api('drift').then(function(r){
                     if (r.ok && r.json && r.json.success) {
@@ -1816,11 +1816,191 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                     return api('feature-flags');
                 }).then(function(r){
                     if (r.ok && r.json && r.json.success) {
-                        renderFlags(r.json.data);
+                        flagsData = r.json.data;
+                        renderFlags(flagsData);
+                        renderPhase2Status(flagsData);
+                        if (flagsData.schema_activated) {
+                            loadJunctionSnapshot();
+                            loadObservations();
+                        }
                     }
                 });
 
                 renderHistory();
+            }
+
+            function loadJunctionSnapshot() {
+                var maker = root.querySelector('[data-target="junction-maker"]').value;
+                var status = root.querySelector('[data-target="junction-status"]').value;
+                var qs = [];
+                if (maker) qs.push('maker_id=' + encodeURIComponent(maker));
+                if (status) qs.push('status=' + encodeURIComponent(status));
+                qs.push('limit=50');
+                var wrap = root.querySelector('[data-target="junction-table"]');
+                wrap.innerHTML = '<div class="b2f-audit-empty">กำลังโหลด…</div>';
+                api('junction-snapshot?' + qs.join('&')).then(function(r){
+                    if (r.ok && r.json && r.json.success) {
+                        renderJunctionSnapshot(r.json.data);
+                        var sel = root.querySelector('[data-target="junction-maker"]');
+                        if (sel && sel.options.length <= 1 && r.json.data.rows) {
+                            var seen = {};
+                            r.json.data.rows.forEach(function(row){
+                                if (row.maker_id && !seen[row.maker_id]) {
+                                    seen[row.maker_id] = true;
+                                    var opt = document.createElement('option');
+                                    opt.value = row.maker_id;
+                                    opt.textContent = (row.maker_name || '#' + row.maker_id);
+                                    sel.appendChild(opt);
+                                }
+                            });
+                        }
+                    } else {
+                        var msg = (r.json && r.json.message) ? r.json.message : 'โหลด junction ไม่สำเร็จ';
+                        wrap.innerHTML = '<div class="b2f-audit-empty">❌ ' + esc(msg) + '</div>';
+                    }
+                });
+            }
+
+            function loadObservations() {
+                var diffOnly = root.querySelector('[data-target="obs-diff-only"]').checked;
+                var qs = [ 'limit=50' ];
+                if (diffOnly) qs.push('diff_only=1');
+                var wrap = root.querySelector('[data-target="obs-table"]');
+                wrap.innerHTML = '<div class="b2f-audit-empty">กำลังโหลด…</div>';
+                api('observations?' + qs.join('&')).then(function(r){
+                    if (r.ok && r.json && r.json.success) {
+                        renderObservations(r.json.data);
+                    } else {
+                        var msg = (r.json && r.json.message) ? r.json.message : 'โหลด observations ไม่สำเร็จ';
+                        wrap.innerHTML = '<div class="b2f-audit-empty">❌ ' + esc(msg) + '</div>';
+                    }
+                });
+            }
+
+            function setStatus(selector, msg, isErr) {
+                var el = root.querySelector(selector);
+                if (!el) return;
+                el.className = 'b2f-audit-status' + (isErr ? ' err' : '');
+                el.textContent = msg;
+            }
+
+            function doActivateSchema(btn) {
+                if (!confirm(
+                    '⚠️ ยืนยันการ Activate Schema?\n\n' +
+                    'การกระทำนี้จะสร้าง 2 tables ใหม่:\n' +
+                    '  • dinoco_product_makers\n' +
+                    '  • dinoco_maker_product_observations\n\n' +
+                    'คุณได้ backup database แล้วใช่ไหม? (ไม่มี undo button)\n\n' +
+                    'กด OK เพื่อดำเนินการ'
+                )) return;
+                btn.disabled = true;
+                setStatus('[data-target="activate-status"]', '⏳ กำลัง activate schema…', false);
+                api('activate-schema', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: true })
+                }).then(function(r){
+                    btn.disabled = false;
+                    if (r.ok && r.json && r.json.success) {
+                        var d = r.json.data;
+                        if (d.already_activated) {
+                            setStatus('[data-target="activate-status"]', '✅ schema already activated (' + esc(d.activated_at) + ')', false);
+                        } else {
+                            setStatus('[data-target="activate-status"]', '✅ schema activated (junction=' + (d.junction_created?'✓':'✗') + ', obs=' + (d.observations_created?'✓':'✗') + ', ' + d.elapsed_ms + 'ms)', false);
+                        }
+                        loadAll();
+                    } else {
+                        var code = r.json && r.json.code || '';
+                        var msg = (r.json && r.json.message) ? r.json.message : ('HTTP ' + r.status);
+                        setStatus('[data-target="activate-status"]', '❌ ' + msg + (code === 'not_implemented' ? ' (database-expert ยังไม่ commit — รอ sync)' : ''), true);
+                    }
+                });
+            }
+
+            function doBackfill(btn, dryRun) {
+                var label = dryRun ? 'Dry Run' : 'Run Backfill (LIVE)';
+                if (!confirm(
+                    (dryRun ? '🧪 ' : '⚠️ ') + 'ยืนยัน ' + label + '?\n\n' +
+                    (dryRun ? 'Dry Run ไม่แก้ database — แค่ preview' : 'Live backfill จะ INSERT เข้า junction table จริง') + '.\n\n' +
+                    'Expected: ~103 CPT migrated + ~13 orphans added = ~116 rows.\n\n' +
+                    'กด OK เพื่อดำเนินการ'
+                )) return;
+                btn.disabled = true;
+                var resultEl = root.querySelector('[data-target="backfill-result"]');
+                resultEl.className = 'b2f-audit-phase2-backfill-result';
+                resultEl.innerHTML = '';
+                setStatus('[data-target="backfill-status"]', '⏳ กำลัง run backfill… (อาจใช้เวลา 10-30 วินาที)', false);
+                api('backfill', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: !dryRun, dry_run: dryRun })
+                }).then(function(r){
+                    btn.disabled = false;
+                    if (r.ok && r.json && r.json.success) {
+                        var d = r.json.data;
+                        setStatus('[data-target="backfill-status"]', '✅ ' + (d.dry_run ? 'dry run' : 'backfill') + ' complete — migrated ' + d.cpt_migrated + ', orphans ' + d.orphans_added + ', errors ' + (d.errors||[]).length + ' (' + d.elapsed_ms + 'ms)', false);
+                        resultEl.classList.add('shown');
+                        resultEl.innerHTML =
+                            '<div><strong>Summary:</strong></div>' +
+                            '<div>CPT migrated: ' + d.cpt_migrated + '</div>' +
+                            '<div>Orphans added: ' + d.orphans_added + '</div>' +
+                            '<div>Skipped: ' + (d.skipped||0) + '</div>' +
+                            '<div>Errors: ' + (d.errors||[]).length + '</div>' +
+                            ((d.errors||[]).length ? '<pre>' + esc(JSON.stringify(d.errors, null, 2)) + '</pre>' : '');
+                        loadAll();
+                    } else {
+                        var code = r.json && r.json.code || '';
+                        var msg = (r.json && r.json.message) ? r.json.message : ('HTTP ' + r.status);
+                        setStatus('[data-target="backfill-status"]', '❌ ' + msg + (code === 'not_implemented' ? ' (scripts/b2f-phase2-backfill.php ยังไม่ sync)' : ''), true);
+                    }
+                });
+            }
+
+            function doToggleShadow(btn, value) {
+                var want = value === '1';
+                if (!confirm(
+                    (want ? '▶ ' : '⏸ ') + 'ยืนยัน ' + (want ? 'Enable' : 'Disable') + ' shadow_write flag?\n\n' +
+                    (want
+                        ? 'หลังเปิดแล้ว: CPT saves จะ dual-write เข้า junction + บันทึก observations ทุกครั้ง.\nCPT ยังเป็น source of truth (Phase 3 ถึงจะ cut-over reads).'
+                        : 'หลังปิดแล้ว: dual-write จะหยุด. junction data จะ freeze.') + '\n\n' +
+                    'กด OK เพื่อดำเนินการ'
+                )) return;
+                btn.disabled = true;
+                setStatus('[data-target="shadow-status"]', '⏳ กำลัง toggle flag…', false);
+                api('feature-flags/toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ flag_name: 'b2f_flag_shadow_write', value: want, confirm: true })
+                }).then(function(r){
+                    btn.disabled = false;
+                    if (r.ok && r.json && r.json.success) {
+                        var d = r.json.data;
+                        setStatus('[data-target="shadow-status"]', '✅ flag ' + d.flag_name + ': ' + d.old_value + ' → ' + d.new_value + ' (uid=' + d.uid + ')', false);
+                        loadAll();
+                    } else {
+                        var msg = (r.json && r.json.message) ? r.json.message : ('HTTP ' + r.status);
+                        setStatus('[data-target="shadow-status"]', '❌ ' + msg, true);
+                    }
+                });
+            }
+
+            function doFlagToggle(btn) {
+                var flag = btn.getAttribute('data-flag');
+                var value = btn.getAttribute('data-value') === '1';
+                if (!confirm('ยืนยัน toggle ' + flag + ' → ' + (value ? 'ENABLED' : 'disabled') + '?')) return;
+                btn.disabled = true;
+                api('feature-flags/toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ flag_name: flag, value: value, confirm: true })
+                }).then(function(r){
+                    if (r.ok && r.json && r.json.success) {
+                        loadAll();
+                    } else {
+                        alert((r.json && r.json.message) || 'Toggle failed');
+                        btn.disabled = false;
+                    }
+                });
             }
 
             root.addEventListener('click', function(e){
@@ -1834,7 +2014,6 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                     t.disabled = true;
                     var s = root.querySelector('[data-target="dry-run-status"]');
                     s.className = 'b2f-audit-status'; s.textContent = 'กำลังสร้าง CSV…';
-                    // Trigger download via a temporary <a> with nonce in query (REST cookie auth handles the rest)
                     var url = BASE + 'dry-run?_wpnonce=' + encodeURIComponent(NONCE);
                     var a = document.createElement('a');
                     a.href = url; a.style.display = 'none';
@@ -1843,6 +2022,22 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                         s.textContent = '✅ ส่ง request แล้ว (ตรวจ browser download)';
                         t.disabled = false;
                     }, 1500);
+                }
+                if (t.matches('[data-action="activate-schema"]')) { e.preventDefault(); doActivateSchema(t); }
+                if (t.matches('[data-action="backfill"]')) { e.preventDefault(); doBackfill(t, t.getAttribute('data-dry') === '1'); }
+                if (t.matches('[data-action="toggle-shadow"]')) { e.preventDefault(); doToggleShadow(t, t.getAttribute('data-value')); }
+                if (t.matches('[data-action="flag-toggle"]')) { e.preventDefault(); doFlagToggle(t); }
+                if (t.matches('[data-action="reload-junction"]')) { e.preventDefault(); loadJunctionSnapshot(); }
+                if (t.matches('[data-action="reload-obs"]')) { e.preventDefault(); loadObservations(); }
+            });
+
+            root.addEventListener('change', function(e){
+                var t = e.target;
+                if (t.matches('[data-target="junction-maker"], [data-target="junction-status"]')) {
+                    loadJunctionSnapshot();
+                }
+                if (t.matches('[data-target="obs-diff-only"]')) {
+                    loadObservations();
                 }
             });
 

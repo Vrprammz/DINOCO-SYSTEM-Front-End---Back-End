@@ -330,7 +330,9 @@ Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DI
 
 ### 3.7 B2F Migration Audit (`/wp-json/dinoco-b2f-audit/v1/`)
 
-Namespace สำหรับ B2F Option F Phase 1 migration audit (observe-only). Registered ใน `[Admin System] B2F Migration Audit` V.1.0:
+Namespace สำหรับ B2F Option F migration audit (Phase 1 observe-only + Phase 2 Shadow-Write controls). Registered ใน `[Admin System] B2F Migration Audit` V.2.0:
+
+**Phase 1 (observe-only)**:
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
@@ -338,17 +340,41 @@ Namespace สำหรับ B2F Option F Phase 1 migration audit (observe-only)
 | GET | `/stale?days=90` | Admin | Stale `mp_unit_cost` records (update > N วัน หรือ cost ≤ 0) |
 | GET | `/parity/{maker_id}` | Admin | Per-maker parity snapshot (product_count, orphan_count, stale_count, parity_score 0-100) |
 | GET | `/dry-run[?preview=1]` | Admin | Download CSV (drift + stale combined) — columns: maker_id, maker_name, sku, issue_type, details |
-| GET | `/feature-flags` | Admin | อ่าน flag state ปัจจุบัน (3 flags, whitelist) |
-| POST | `/feature-flags` | Admin | **403 HARDCODED ใน Phase 1** — setter จะเปิดเมื่อเข้า Phase 2 |
+| GET | `/feature-flags` | Admin | อ่าน flag state + phase info (schema_activated, backfill_state, junction_exists, observations_exists) |
 
-**Rate limit**: 20 req/hour/user per endpoint (ผ่าน `b2b_rate_limit()`)
+**Phase 2 (V.2.0 Shadow-Write controls)**:
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/activate-schema` | Admin | dbDelta canonical tables (`dinoco_product_makers` + `dinoco_maker_product_observations`). Params: `{confirm: true}`. Calls `b2f_audit_activate_schema_v10()` (database-expert). Returns 501 ถ้า helper ยังไม่ sync. Rate limit 5/hr. |
+| POST | `/backfill` | Admin | รัน `scripts/b2f-phase2-backfill.php`. Params: `{confirm: bool, dry_run: bool}`. Persists state to `b2f_phase2_backfill_state` option. Dry-run ไม่ save state. Returns 501 ถ้า script ยังไม่ sync. Rate limit 5/hr. |
+| GET | `/backfill-status` | Admin | read last run summary + junction count + schema activation flag |
+| POST | `/feature-flags/toggle` | Admin | Toggle whitelist flag (Phase 2 = เฉพาะ `b2f_flag_shadow_write`). Params: `{flag_name, value, confirm}`. Guard: ต้องมี schema + backfill ก่อนเปิด shadow_write. |
+| GET | `/junction-snapshot` | Admin | Read recent junction rows. Params: `maker_id`, `status`, `limit` (default 50, max 500). Returns `{rows, summary: {total, active, discontinued, cpt_count, diff_vs_cpt}}` |
+| GET | `/observations` | Admin | Read recent diff observations. Params: `diff_only`, `maker_id`, `limit`. Returns `{rows, summary: {total, diffs, last_24h}}` |
+
+**Rate limit**: 20 req/hour/user per read endpoint (ผ่าน `b2b_rate_limit()`); 5/hour for destructive actions (activate-schema, backfill).
 
 **Allowed flags** (wp_options, default=false ทุกตัว):
-- `b2f_flag_auto_sync_sets` — Phase 2
-- `b2f_flag_shadow_write` — Phase 2
-- `b2f_flag_read_from_junction` — Phase 3
+
+- `b2f_flag_auto_sync_sets` — Phase 2.5 (auto-sync SETs) — LOCKED
+- `b2f_flag_shadow_write` — Phase 2 (dual-write CPT + junction) — **TOGGLEABLE via V.2.0**
+- `b2f_flag_read_from_junction` — Phase 3 (cut-over reads) — LOCKED
+
+**State helpers** (V.2.0, same snippet):
+
+- `b2f_audit_phase2_toggleable_flags()` — whitelist flags สำหรับ Phase 2 setter
+- `b2f_audit_is_schema_activated()` — reads `b2f_schema_v10_activated` option
+- `b2f_audit_get_backfill_state()` / `b2f_audit_set_backfill_state($state)` — persist last backfill run summary
+- `b2f_audit_junction_table_exists()` / `b2f_audit_observations_table_exists()` — defensive guards
 
 Flag helpers ใน B2F Snippet 1 V.6.5: `b2f_is_flag_enabled($name)`, `b2f_get_all_flags()`, `b2f_log_flag_change($flag, $old, $new, $uid)`.
+
+**Canonical tables** (Phase 2 — created by `/activate-schema`):
+
+- `wp_dinoco_product_makers` — canonical junction (product_sku × maker_id × pricing/MOQ/shipping/status/notes + legacy_cpt_id + audit columns + soft delete). utf8mb4_bin on product_sku (case-sensitive UPPER match). Composite unique `uq_sku_maker`, `idx_maker_status` hot path, `idx_legacy_cpt` rollback reverse.
+- `wp_dinoco_maker_product_observations` — shadow-write diff log (observed_at, source [cpt|junction|diff], sku, maker_id, field_name, cpt_value, junction_value, diff_detected). 60-day TTL via `b2f_observations_ttl_cron` (Snippet 11 V.2.2+).
+- Schema markers: `b2f_schema_version` = '10.1', `b2f_schema_v10_activated` = timestamp on successful activation.
 
 ### 3.8 Infrastructure (`/wp-json/dinoco/v1/`)
 
@@ -1473,7 +1499,7 @@ sequenceDiagram
 | B2F Orders | `[b2f_admin_orders_tab]` | PO management |
 | B2F Makers | `[b2f_admin_makers_tab]` | Maker/product management |
 | B2F Credit | `[b2f_admin_credit_tab]` | Credit/payment tracking |
-| B2F Migration Audit | `[b2f_migration_audit]` | Phase 1 observe-only audit (drift/stale/parity/dry-run) |
+| B2F Migration Audit | `[b2f_migration_audit]` | V.2.0 — Phase 1 observe (drift/stale/parity/dry-run) + Phase 2 Shadow-Write controls (activate-schema/backfill/toggle-shadow-write/junction snapshot/observations viewer) |
 
 #### LIFF Pages (Admin)
 
