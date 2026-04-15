@@ -164,7 +164,7 @@
 | Snippet 5: Admin Dashboard Tabs | V.5.1 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary + resolveSetName 4-level fallback (hotfix) |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
-| Snippet 8: Admin LIFF E-Catalog | V.5.1 | 1168 | LIFF ordering + SET Detail View + Model Filter + type tabs (mutually exclusive, V.5.1) + count badges + hide empty + relabel "สินค้าเป็นชุด"/"แยกชุด (แยกบน-ล่าง)"/"แยกชิ้น (เป็นข้าง)" + shared badge + cart manufacturing summary (DD-3) |
+| Snippet 8: Admin LIFF E-Catalog | V.5.2 | 1168 | LIFF ordering + SET Detail View + Model Filter + type tabs (mutually exclusive) + count badges + hide empty + **V.5.2: labels ตรงกับ Inventory Stock Management "ชุด SET" / "เดี่ยว" / "ลูกชิ้นส่วน" / "ชิ้นส่วนย่อย" + เพิ่ม chip "เดี่ยว"** + shared badge + cart manufacturing summary (DD-3) |
 | Snippet 9: PO Ticket View | V.3.5 | 1169 | PO detail + hierarchy SET grouping + view toggle (ตามชุด/ยอดรวมผลิต) (DD-3) |
 | Snippet 10: PO Image Generator | V.2.6 | 1170 | A4 PO PNG + hierarchy SET header rows |
 | Snippet 11: Cron Jobs & Reminders | V.2.1 | 1171 | 7 cron jobs (delivery, overdue, payment, no-response, summary) |
