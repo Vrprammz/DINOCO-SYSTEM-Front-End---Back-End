@@ -1,8 +1,9 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.9.17 — REVERT virtual SET injection (V.9.14–V.9.16) — user บ่น "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย". B2F maker products = เฉพาะที่ admin register จริง ใน b2f_maker_product CPT. + เคารพ ui_role_override (badge-only — mirror Inventory V.42.14): เพิ่ม `ui_role_override` ใน format output + `auto_type` preserved สำหรับ grouping (DD-7 / cart / PO). Frontend badge ตรง Product Catalog 100% (e.g. DNCGNDPROT500 override=single → B2F แสดง "เดี่ยว")
  * Version: V.9.16 — Virtual SET cost: sum leaves' mp_unit_cost (not hardcoded 0). Adds `virtual_cost_breakdown[]` + `virtual_cost_complete`. Frontend shows accurate price instead of ฿0. Verified via temp debug-vset (removed in V.9.16.2)
  * Version: V.9.15 — Cleanup: remove TEMP debug endpoints (used to diagnose NX500 filter issue, root cause fixed in V.9.14)
- * Version: V.9.14 — Virtual SET injection: maker-products ส่ง SETs ที่ maker ไม่ได้ลงทะเบียน แต่มี leaves/children ของ maker ชี้ top_parent_sku ไปหา (orphan top parents) → LIFF filter NX500 E-clutch + SET → เห็น SETs ครบตาม Product Catalog. Virtual SETs: is_virtual=true, unit_cost=0, DD-7 expand ตอน create-po
+ * Version: V.9.14 — Virtual SET injection: maker-products ส่ง SETs ที่ maker ไม่ได้ลงทะเบียน แต่มี leaves/children ของ maker ชี้ top_parent_sku ไปหา (orphan top parents) → LIFF filter NX500 E-clutch + SET → เห็น SETs ครบตาม Product Catalog. Virtual SETs: is_virtual=true, unit_cost=0, DD-7 expand ตอน create-po [REVERTED in V.9.17]
  * Version: V.9.12 — catalog_map: batch lookup ผ่าน DINOCO_Catalog::get_by_skus() (single SQL WHERE IN) — fix N+1 query pattern ของ V.9.11 (เดิม loop เรียก get_by_sku() ต่อ SKU → 200+ queries ต่อ call)
  * Version: V.9.11 — maker-products: expose catalog_map (sku→{compatible_models, name, image_url}) for ALL SKUs in hierarchy tree (รวม leaves ที่ Maker ไม่ได้ register) → LIFF filter NX500/model ใช้ data จาก source of truth (wp_dinoco_products) เหมือน Product Catalog
  * Version: V.9.10 — DD-3 Shared Child: DD-7 collect breakdown[] + save poi_parent_breakdown JSON + po-detail return parent_breakdown
@@ -699,174 +700,10 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx );
         }
 
-        // V.9.14: Inject VIRTUAL SET entries — SETs ที่ maker ไม่ได้ลงทะเบียน แต่ลูก/หลานของ maker
-        // มี top_parent_sku ชี้ไป (เช่น HTP มี leaf NX500 E-clutch ที่ top_parent=DNCSETNX500EX001
-        // แต่ DNCSETNX500EX001 ไม่อยู่ใน HTP's maker_products) → Admin filter "NX500 E-clutch + SET"
-        // → 0 ผล เพราะไม่มี SET ใน list. Fix: สร้าง virtual SET จาก DINOCO_Catalog (source of truth)
-        // + mark is_virtual=true. DD-7 ตอน create-po จะ expand เป็น leaves ของ maker อยู่แล้ว
-        $existing_skus = array();
-        foreach ( $products as $p ) $existing_skus[ strtoupper( $p['sku'] ?? '' ) ] = true;
-
-        $orphan_set_skus = array();
-        foreach ( $products as $p ) {
-            $tp = strtoupper( $p['top_parent_sku'] ?? '' );
-            if ( ! empty( $tp ) && ! isset( $existing_skus[ $tp ] ) ) {
-                $orphan_set_skus[ $tp ] = true;
-            }
-        }
-
-        if ( ! empty( $orphan_set_skus ) && class_exists( 'DINOCO_Catalog' ) ) {
-            $orphan_list = array_keys( $orphan_set_skus );
-            $orphan_rows = method_exists( 'DINOCO_Catalog', 'get_by_skus' )
-                ? DINOCO_Catalog::get_by_skus( $orphan_list )
-                : array();
-            if ( empty( $orphan_rows ) ) {
-                // Fallback per-SKU for older Snippet 15
-                foreach ( $orphan_list as $osku ) {
-                    $r = DINOCO_Catalog::get_by_sku( $osku );
-                    if ( ! $r ) $r = DINOCO_Catalog::get_by_sku( strtolower( $osku ) );
-                    if ( $r ) $orphan_rows[ strtoupper( $r['sku'] ?? $osku ) ] = $r;
-                }
-            }
-
-            $maker_currency = get_field( 'maker_currency', $maker_id ) ?: 'THB';
-            $currency_sym = function_exists( 'b2f_currency_symbol' ) ? b2f_currency_symbol( $maker_currency ) : '฿';
-
-            // V.9.16: Build maker's leaf → {cost, name, image, ship_land, ship_sea} index (single pass over $products)
-            // Virtual SET unit_cost = sum of leaves' mp_unit_cost (walk rel_upper recursively)
-            $maker_sku_map = array();
-            foreach ( $products as $mp ) {
-                $ksku = strtoupper( $mp['sku'] ?? '' );
-                if ( empty( $ksku ) ) continue;
-                $maker_sku_map[ $ksku ] = array(
-                    'unit_cost'     => floatval( $mp['unit_cost'] ?? 0 ),
-                    'product_name'  => $mp['product_name'] ?? $ksku,
-                    'image_url'     => $mp['image_url'] ?? '',
-                    'shipping_land' => floatval( $mp['shipping_land'] ?? 0 ),
-                    'shipping_sea'  => floatval( $mp['shipping_sea'] ?? 0 ),
-                );
-            }
-
-            $rel_upper_map = $hierarchy_ctx['rel_upper'];
-
-            // Recursive leaf collector (leaves = SKUs with no children in rel_upper)
-            $collect_leaves_v916 = function( $set_sku ) use ( $rel_upper_map, &$collect_leaves_v916 ) {
-                $children = isset( $rel_upper_map[ $set_sku ] ) ? $rel_upper_map[ $set_sku ] : array();
-                if ( empty( $children ) ) {
-                    return array( $set_sku );
-                }
-                $out = array();
-                foreach ( $children as $ch ) {
-                    $ch_u = strtoupper( $ch );
-                    $sub = $collect_leaves_v916( $ch_u );
-                    foreach ( $sub as $s ) $out[] = $s;
-                }
-                return $out;
-            };
-
-            foreach ( $orphan_list as $osku ) {
-                if ( ! isset( $orphan_rows[ $osku ] ) ) continue;
-                $cat = $orphan_rows[ $osku ];
-                $sku_upper = $osku;
-
-                // Verify it's actually a SET (has children in sku_relations)
-                $is_set = isset( $rel_upper_map[ $sku_upper ] ) && ! empty( $rel_upper_map[ $sku_upper ] );
-                if ( ! $is_set ) continue;
-
-                $children_count = count( $rel_upper_map[ $sku_upper ] );
-
-                // V.9.16: Compute virtual SET cost = sum(leaf.mp_unit_cost × 1 qty each)
-                // + ship totals = sum(leaf shipping fields)
-                // + breakdown = per-leaf detail for transparency
-                $all_leaves   = $collect_leaves_v916( $sku_upper );
-                $all_leaves   = array_values( array_unique( $all_leaves ) );
-                $virtual_cost = 0.0;
-                $virtual_ship_land = 0.0;
-                $virtual_ship_sea  = 0.0;
-                $breakdown    = array();
-                $missing_cost = array();
-
-                foreach ( $all_leaves as $leaf_u ) {
-                    $leaf_u = strtoupper( $leaf_u );
-                    if ( isset( $maker_sku_map[ $leaf_u ] ) ) {
-                        $l = $maker_sku_map[ $leaf_u ];
-                        $lc = floatval( $l['unit_cost'] );
-                        $virtual_cost      += $lc;
-                        $virtual_ship_land += floatval( $l['shipping_land'] );
-                        $virtual_ship_sea  += floatval( $l['shipping_sea'] );
-                        $breakdown[] = array(
-                            'sku'       => $leaf_u,
-                            'name'      => $l['product_name'],
-                            'qty'       => 1,
-                            'unit_cost' => $lc,
-                            'subtotal'  => $lc,
-                            'missing'   => false,
-                        );
-                        if ( $lc <= 0 ) $missing_cost[] = $leaf_u;
-                    } else {
-                        // Leaf not registered with this maker → cost = 0, mark as missing
-                        $leaf_name = $leaf_u;
-                        if ( class_exists( 'DINOCO_Catalog' ) ) {
-                            $lc_cat = DINOCO_Catalog::get_by_sku( $leaf_u );
-                            if ( $lc_cat && ! empty( $lc_cat['name'] ) ) $leaf_name = $lc_cat['name'];
-                        }
-                        $breakdown[] = array(
-                            'sku'       => $leaf_u,
-                            'name'      => $leaf_name,
-                            'qty'       => 1,
-                            'unit_cost' => 0,
-                            'subtotal'  => 0,
-                            'missing'   => true,
-                        );
-                        $missing_cost[] = $leaf_u;
-                    }
-                }
-
-                $virtual_cost_complete = empty( $missing_cost );
-
-                $products[] = array(
-                    'id'              => 0, // virtual — no WP post
-                    'maker_id'        => $maker_id,
-                    'sku'             => esc_html( $cat['sku'] ?? $sku_upper ),
-                    'product_name'    => esc_html( $cat['name'] ?? $sku_upper ),
-                    // V.9.16: unit_cost = sum of leaves' mp_unit_cost (was hardcoded 0)
-                    'unit_cost'       => round( $virtual_cost, 2 ),
-                    'moq'             => 1,
-                    'lead_time_days'  => 0,
-                    'lead_land'       => 0,
-                    'lead_sea'        => 0,
-                    'last_order_date' => '',
-                    'notes'           => '',
-                    'status'          => 'active',
-                    'image_url'       => esc_url( $cat['image_url'] ?? '' ),
-                    // V.9.16: shipping_* = sum of leaves' shipping costs
-                    'shipping_land'   => round( $virtual_ship_land, 2 ),
-                    'shipping_sea'    => round( $virtual_ship_sea, 2 ),
-                    'currency_symbol' => $currency_sym,
-                    'is_set'          => true,
-                    'is_leaf'         => false,
-                    'product_type'    => 'set',
-                    'auto_type'       => 'set',
-                    'children_count'  => $children_count,
-                    'direct_children_count' => $children_count,
-                    'grandchildren_total'   => 0,
-                    'parent_sku'      => '',
-                    'parent_skus'     => array(),
-                    'parent_name'     => '',
-                    'grandparent_sku' => '',
-                    'top_parent_sku'  => '',
-                    'top_parent_name' => '',
-                    'compatible_models' => isset( $cat['compatible_models'] ) ? $cat['compatible_models'] : '[]',
-                    'category'        => $cat['category'] ?? '',
-                    // V.9.14: Virtual marker — frontend แสดง badge "ประกอบจากชิ้นส่วน"
-                    'is_virtual'      => true,
-                    // V.9.16: Cost transparency — frontend แสดง breakdown ใน SET Detail
-                    'virtual_cost_breakdown' => $breakdown,
-                    'virtual_cost_complete'  => $virtual_cost_complete,
-                    'virtual_missing_leaves' => $missing_cost,
-                );
-            }
-        }
+        // V.9.17: REVERT V.9.14-V.9.16 virtual SET injection — user feedback: "เอาแร็คมาแสดงซ้ำๆ ไม่จำเป็นเลย"
+        // B2F maker products = เฉพาะที่ admin register จริงใน b2f_maker_product CPT
+        // ถ้า admin ต้องการให้ Maker มี SET → register SET ตรงใน Admin Makers tab
+        // (leaves อยู่ใน maker products แล้ว — SET ไม่ auto-inject)
 
         // V.9.2: Compute hierarchy_meta — which SET parents are referenced + missing children
         $hierarchy_meta = b2f_compute_hierarchy_meta( $products, $hierarchy_ctx );
@@ -921,6 +758,13 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
 
             // V.9.12: Batch fetch catalog rows — single SQL (WHERE UPPER(sku) IN ...) แทน N+1 loop เดิม
             // DINOCO_Catalog::get_by_skus() return map { UPPERCASE_SKU => row } case-insensitive
+            // V.9.17: helper — normalize ui_role_override with whitelist
+            $norm_role = function( $cat ) {
+                $raw = strtolower( (string) ( $cat['ui_role_override'] ?? 'auto' ) );
+                $allowed = array( 'auto', 'set', 'child', 'grandchild', 'single' );
+                return in_array( $raw, $allowed, true ) ? $raw : 'auto';
+            };
+
             if ( method_exists( 'DINOCO_Catalog', 'get_by_skus' ) ) {
                 $batch_rows = DINOCO_Catalog::get_by_skus( array_keys( $tree_skus ) );
                 foreach ( $batch_rows as $sku_u => $cat ) {
@@ -930,6 +774,8 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
                         'image_url'         => $cat['image_url'] ?? '',
                         'compatible_models' => $cat['compatible_models'] ?? '[]',
                         'category'          => $cat['category'] ?? '',
+                        // V.9.17: ui_role_override (badge-only, from Product Catalog source of truth)
+                        'ui_role_override'  => $norm_role( $cat ),
                     );
                 }
             } else {
@@ -944,6 +790,7 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
                         'image_url'         => $cat['image_url'] ?? '',
                         'compatible_models' => $cat['compatible_models'] ?? '[]',
                         'category'          => $cat['category'] ?? '',
+                        'ui_role_override'  => $norm_role( $cat ),
                     );
                 }
             }
@@ -1188,10 +1035,19 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
             }
         }
 
-        // V.9.6: auto_type = hierarchy จริงจาก dinoco_sku_relations (ไม่ override)
-        // เหมือน Inventory stock/list ที่ไม่ใช้ ui_role_override สำหรับ classification
-        // ui_role_override เป็น UI layer เท่านั้น — ไม่กระทบ grouping/parent_sku/stock
+        // V.9.17: auto_type = hierarchy จริงจาก dinoco_sku_relations (ไม่ override)
+        // ui_role_override จาก wp_dinoco_products ใช้สำหรับ BADGE เท่านั้น (ตรงกับ Inventory V.42.14 pattern)
+        // Grouping/DD-7/cart/PO ใช้ auto_type (hierarchy จริง) — ห้ามใช้ override สำหรับ grouping
+        // เช่น DNCGNDPROT500: relations = leaf under parent → auto_type='grandchild', ui_role_override='single' → badge "เดี่ยว" แต่ grouping ยัง under parent SET
         $auto_type = $product_type;
+
+        // V.9.17: ดึง ui_role_override จาก catalog (source of truth = wp_dinoco_products)
+        $ui_role = 'auto';
+        if ( $product && isset( $product['ui_role_override'] ) ) {
+            $raw = strtolower( (string) $product['ui_role_override'] );
+            $allowed = array( 'auto', 'set', 'child', 'grandchild', 'single' );
+            if ( in_array( $raw, $allowed, true ) ) $ui_role = $raw;
+        }
 
         return array(
             'id'              => $mp_id,
@@ -1215,6 +1071,8 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
             'is_leaf'          => ! $is_parent_node,
             'product_type'     => $product_type,
             'auto_type'        => $auto_type,
+            // V.9.17: ui_role_override (badge-only, mirror Inventory V.42.14) — frontend ใช้สำหรับ display badge
+            'ui_role_override' => $ui_role,
             'children_count'   => $children_count,
             'direct_children_count' => $children_count,
             'grandchildren_total'   => isset( $grand_total ) ? $grand_total : 0,
