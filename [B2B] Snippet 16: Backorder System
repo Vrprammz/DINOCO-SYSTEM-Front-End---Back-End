@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.1.6 — 4 CRITICAL + 6 HIGH + 2 MEDIUM feature-architect gap fixes ║
  * ║  Version: V.1.5 — Security Log viewer + C3 meta hardening + LIFF customer split view ║
  * ║  Version: V.1.4 — Clarify banner messages (ลด user confusion about flag ON/OFF) ║
  * ║  Version: V.1.3 — Fix pending review bug (WP REST meta filter ไม่ทำงาน → ใช้ custom endpoint) ║
@@ -468,7 +469,277 @@ add_action( 'rest_api_init', function() {
         'callback'            => 'b2b_rest_bo_pending_review',
         'permission_callback' => 'b2b_bo_permission_admin',
     ) );
+
+    // V.1.6 — H2: GET /bo-order-detail — single order (faster than list for split modal)
+    register_rest_route( 'b2b/v1', '/bo-order-detail', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2b_rest_bo_order_detail',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // V.1.6 — H3: POST /bo-update-eta — admin extend/change ETA
+    register_rest_route( 'b2b/v1', '/bo-update-eta', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_update_eta',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // V.1.6 — H4: POST /bo-bulk-fulfill + /bo-bulk-cancel
+    register_rest_route( 'b2b/v1', '/bo-bulk-fulfill', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_bulk_fulfill',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+    register_rest_route( 'b2b/v1', '/bo-bulk-cancel', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_bulk_cancel',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // V.1.6 — H1 badge count + enumeration flag management
+    register_rest_route( 'b2b/v1', '/bo-summary', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2b_rest_bo_summary',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+    register_rest_route( 'b2b/v1', '/bo-clear-enum-flag', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_clear_enum_flag',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
 } );
+
+if ( ! function_exists( 'b2b_rest_bo_order_detail' ) ) {
+    /**
+     * V.1.6 H2 — Return single pending_stock_review order + snapshot
+     * ใช้ใน Split Modal แทน pending-review list endpoint
+     */
+    function b2b_rest_bo_order_detail( $request ) {
+        $order_id = (int) $request->get_param( 'order_id' );
+        if ( ! $order_id ) return new WP_Error( 'invalid_input', 'order_id required', array( 'status' => 400 ) );
+
+        $status = get_field( 'order_status', $order_id );
+        if ( ! $status ) return new WP_Error( 'not_found', 'Order not found', array( 'status' => 404 ) );
+
+        $dist_id    = (int) get_field( 'distributor_id', $order_id );
+        $dist_name  = $dist_id ? get_the_title( $dist_id ) : '';
+        $order_text = get_field( 'order_items', $order_id ) ?: '';
+        $total      = (float) get_field( 'total_amount', $order_id );
+        $accepted_at = get_post_meta( $order_id, '_b2b_opaque_accept_at', true );
+        $age_hours   = $accepted_at ? ( time() - strtotime( $accepted_at ) ) / 3600 : 0;
+        $snapshot    = get_post_meta( $order_id, '_b2b_stock_snapshot', true );
+
+        // H2: Also return fresh snapshot (เผื่อ stock เปลี่ยนหลัง opaque accept)
+        $items   = b2b_bo_parse_order_items( $order_text );
+        $fresh   = array();
+        foreach ( $items as $it ) {
+            $sku = strtoupper( $it['sku'] );
+            $available = 0;
+            if ( function_exists( 'dinoco_compute_hierarchy_stock' ) && function_exists( 'dinoco_get_reserved_qty' ) ) {
+                $available = max( 0, (int) dinoco_compute_hierarchy_stock( $sku ) - (int) dinoco_get_reserved_qty( $sku ) );
+            }
+            $fresh[ $sku ] = array( 'available' => $available, 'requested' => (int) $it['qty'] );
+        }
+
+        return rest_ensure_response( array(
+            'success'          => true,
+            'id'               => $order_id,
+            'ticket_no'        => get_the_title( $order_id ),
+            'status'           => $status,
+            'distributor_id'   => $dist_id,
+            'distributor_name' => $dist_name,
+            'order_items'      => $order_text,
+            'total_amount'     => $total,
+            'accepted_at'      => $accepted_at,
+            'age_hours'        => round( $age_hours, 1 ),
+            'stock_snapshot'   => is_array( $snapshot ) ? $snapshot : array(),
+            'fresh_snapshot'   => $fresh,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'b2b_rest_bo_update_eta' ) ) {
+    /**
+     * V.1.6 H3 — Admin extend/change ETA on BO queue item
+     */
+    function b2b_rest_bo_update_eta( $request ) {
+        $bo_queue_id = (int) $request->get_param( 'bo_queue_id' );
+        $eta_days    = max( 0, (int) $request->get_param( 'eta_days' ) );
+        $notes       = sanitize_text_field( $request->get_param( 'notes' ) ?: '' );
+
+        if ( ! $bo_queue_id ) return new WP_Error( 'invalid_input', 'bo_queue_id required', array( 'status' => 400 ) );
+
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$bo_table} WHERE id = %d", $bo_queue_id ), ARRAY_A );
+        if ( ! $row ) return new WP_Error( 'not_found', 'BO row not found', array( 'status' => 404 ) );
+        if ( ! in_array( $row['status'], array( 'pending', 'ready' ), true ) ) {
+            return new WP_Error( 'invalid_status', 'Only pending/ready rows can update ETA', array( 'status' => 400 ) );
+        }
+
+        $new_eta = $eta_days > 0 ? date( 'Y-m-d', strtotime( "+{$eta_days} days" ) ) : null;
+        $new_notes = $notes ? ( $row['notes'] ? $row['notes'] . ' | ' . $notes : $notes ) : $row['notes'];
+
+        $wpdb->update( $bo_table, array(
+            'eta'   => $new_eta,
+            'notes' => $new_notes,
+        ), array( 'id' => $bo_queue_id ) );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[BO] ETA updated — bo_queue_id={$bo_queue_id} eta={$new_eta} by user=" . get_current_user_id() );
+        }
+
+        return rest_ensure_response( array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'eta' => $new_eta ) );
+    }
+}
+
+if ( ! function_exists( 'b2b_rest_bo_bulk_fulfill' ) ) {
+    /**
+     * V.1.6 H4 — Bulk fulfill multiple BO queue items
+     * Body: { items: [{bo_queue_id, qty}, ...] }
+     */
+    function b2b_rest_bo_bulk_fulfill( $request ) {
+        $items = $request->get_param( 'items' );
+        if ( ! is_array( $items ) || empty( $items ) ) {
+            return new WP_Error( 'invalid_input', 'items required', array( 'status' => 400 ) );
+        }
+
+        $results = array( 'success' => 0, 'failed' => 0, 'errors' => array() );
+
+        // Group by order_id to handle FSM transition batch
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $by_order = array();
+        foreach ( $items as $it ) {
+            $bo_queue_id = (int) ( $it['bo_queue_id'] ?? 0 );
+            if ( ! $bo_queue_id ) continue;
+            $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$bo_table} WHERE id = %d", $bo_queue_id ), ARRAY_A );
+            if ( ! $row ) continue;
+            $by_order[ $row['order_id'] ][] = array(
+                'bo_queue_id' => $bo_queue_id,
+                'sku'         => $row['sku'],
+                'qty'         => (int) ( $it['qty'] ?? $row['qty_bo'] ),
+            );
+        }
+
+        foreach ( $by_order as $order_id => $order_items ) {
+            $sub_req = new WP_REST_Request();
+            $sub_req->set_param( 'order_id', $order_id );
+            $sub_req->set_param( 'items', $order_items );
+            $res = b2b_rest_bo_fulfill( $sub_req );
+
+            if ( is_wp_error( $res ) ) {
+                $results['failed']++;
+                $results['errors'][] = "Order #{$order_id}: " . $res->get_error_message();
+            } else {
+                $data = $res->get_data();
+                if ( ! empty( $data['success'] ) ) {
+                    $results['success']++;
+                } else {
+                    $results['failed']++;
+                }
+            }
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'results' => $results,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'b2b_rest_bo_bulk_cancel' ) ) {
+    /**
+     * V.1.6 H4 — Bulk cancel BO items (e.g. SKU discontinued)
+     * Body: { bo_queue_ids: [1,2,3], reason: "string" }
+     */
+    function b2b_rest_bo_bulk_cancel( $request ) {
+        $ids    = $request->get_param( 'bo_queue_ids' );
+        $reason = sanitize_text_field( $request->get_param( 'reason' ) ?: 'bulk_cancel' );
+
+        if ( ! is_array( $ids ) || empty( $ids ) ) {
+            return new WP_Error( 'invalid_input', 'bo_queue_ids required', array( 'status' => 400 ) );
+        }
+
+        $results = array( 'success' => 0, 'failed' => 0 );
+        foreach ( $ids as $id ) {
+            $sub_req = new WP_REST_Request();
+            $sub_req->set_param( 'bo_queue_id', (int) $id );
+
+            // Get order_id first
+            global $wpdb;
+            $order_id = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT order_id FROM {$wpdb->prefix}dinoco_bo_queue WHERE id = %d",
+                (int) $id
+            ) );
+            if ( ! $order_id ) { $results['failed']++; continue; }
+
+            $sub_req->set_param( 'order_id', $order_id );
+            $sub_req->set_param( 'reason', $reason );
+
+            $res = b2b_rest_bo_cancel_item( $sub_req );
+            if ( is_wp_error( $res ) ) {
+                $results['failed']++;
+            } else {
+                $results['success']++;
+            }
+        }
+
+        return rest_ensure_response( array( 'success' => true, 'results' => $results ) );
+    }
+}
+
+if ( ! function_exists( 'b2b_rest_bo_summary' ) ) {
+    /**
+     * V.1.6 H1 — Summary counts for sidebar badge
+     */
+    function b2b_rest_bo_summary( $request ) {
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $pending_review = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->postmeta} pm
+             WHERE pm.meta_key = 'order_status' AND pm.meta_value = 'pending_stock_review'"
+        );
+        $bo_pending = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$bo_table} WHERE status='pending'" );
+        $bo_ready   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$bo_table} WHERE status='ready'" );
+
+        // Enumeration flags distributors
+        $flagged = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->postmeta}
+             WHERE meta_key='_b2b_enumeration_flags' AND meta_value > 0"
+        );
+
+        return rest_ensure_response( array(
+            'success'              => true,
+            'pending_review_count' => $pending_review,
+            'bo_pending_count'     => $bo_pending,
+            'bo_ready_count'       => $bo_ready,
+            'enumeration_flagged'  => $flagged,
+            'total_action_needed'  => $pending_review + $bo_ready + $flagged,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'b2b_rest_bo_clear_enum_flag' ) ) {
+    /**
+     * V.1.6 — Admin manual clear enumeration flag (false positive)
+     */
+    function b2b_rest_bo_clear_enum_flag( $request ) {
+        $dist_id = (int) $request->get_param( 'distributor_id' );
+        if ( ! $dist_id ) return new WP_Error( 'invalid_input', 'distributor_id required', array( 'status' => 400 ) );
+
+        delete_post_meta( $dist_id, '_b2b_enumeration_flags' );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[BO] Cleared enumeration flag — distributor=#{$dist_id} by user=" . get_current_user_id() );
+        }
+
+        return rest_ensure_response( array( 'success' => true, 'distributor_id' => $dist_id ) );
+    }
+}
 
 if ( ! function_exists( 'b2b_rest_bo_pending_review' ) ) {
     /**
@@ -652,12 +923,22 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
             $bo_total        += $qty_bo;
         }
 
-        // Update debt (confirmed qty only)
+        // V.1.6 M3 FIX: Debt precision — per-SKU compound (spec §5.2 step 5)
+        // เดิม: total_value * (fulfilled / total_qty) = ratio approximation → ไม่แม่นยำ
+        //       ถ้า SKU A = ฿1000 + SKU B = ฿100, fulfill A เต็ม + BO B → ratio คำนวณ debt เกินจริง
+        // ใหม่: loop splits + per-SKU price × qty_fulfill → exact
+        $confirmed_value = 0.0;
+        if ( function_exists( 'b2b_get_product_data' ) ) {
+            foreach ( $splits as $split ) {
+                $sku_d     = strtoupper( trim( $split['sku'] ?? '' ) );
+                $qty_f     = max( 0, (int) ( $split['qty_fulfill'] ?? 0 ) );
+                if ( $qty_f <= 0 ) continue;
+                $pd        = b2b_get_product_data( $sku_d );
+                $price     = $pd ? (float) ( $pd['base_price'] ?? 0 ) : 0;
+                $confirmed_value += $price * $qty_f;
+            }
+        }
         $total_value = (float) get_field( 'total_amount', $order_id );
-        $confirmed_ratio = $fulfilled_total > 0 && ( $fulfilled_total + $bo_total ) > 0
-            ? $fulfilled_total / ( $fulfilled_total + $bo_total )
-            : 0;
-        $confirmed_value = $total_value * $confirmed_ratio;
 
         if ( $dist_id && $confirmed_value > 0 && function_exists( 'b2b_debt_add' ) ) {
             b2b_debt_add( $dist_id, $confirmed_value, 'b2b_bo_split_confirm', $order_id );
@@ -976,6 +1257,14 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
             b2b_bo_notify_customer_bo_ready( $order_id, $items );
         }
 
+        // V.1.6 H5 + H6: Fire action hooks for Flash shipping + Print queue integration
+        // Snippet 3/5 listen and create secondary Flash order + print label
+        do_action( 'b2b_bo_items_fulfilled', $order_id, $items, array(
+            'total_qty'   => $total_fulfilled_qty,
+            'total_value' => $total_fulfilled_value,
+            'all_resolved'=> $pending_count === 0,
+        ) );
+
         return rest_ensure_response( array(
             'success'               => true,
             'order_id'              => $order_id,
@@ -985,6 +1274,96 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
         ) );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 16: H5 + H6 INTEGRATION HOOKS (V.1.6)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * H5 FIX: Flash shipping secondary order on BO fulfill (spec §9.2)
+ * เมื่อ BO fulfilled → เรียก Flash API สร้าง order แยกสำหรับ BO qty
+ * (cleaner tracking vs append existing order)
+ */
+add_action( 'b2b_bo_items_fulfilled', function( $order_id, $items, $meta ) {
+    // Only trigger Flash if helper exists (Snippet 5 or 3 defines this)
+    if ( ! function_exists( 'b2b_flash_create_order' ) && ! function_exists( 'b2b_flash_create_secondary' ) ) {
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[BO-H5] Flash helper not available — order #{$order_id} BO fulfill skipped secondary Flash creation" );
+        }
+        return;
+    }
+
+    // Prefer dedicated secondary helper if exists
+    if ( function_exists( 'b2b_flash_create_secondary' ) ) {
+        try {
+            $result = b2b_flash_create_secondary( $order_id, $items );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[BO-H5] Flash secondary order created — order #{$order_id} result=" . wp_json_encode( is_array( $result ) ? $result : array( 'raw' => (string) $result ) ) );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[BO-H5] Flash secondary error: " . $e->getMessage() );
+            }
+        }
+        return;
+    }
+
+    // Fallback: use generic b2b_flash_create_order + tag as BO secondary
+    if ( function_exists( 'b2b_flash_create_order' ) ) {
+        try {
+            $result = b2b_flash_create_order( $order_id, array(
+                'is_bo_secondary' => true,
+                'bo_items'        => $items,
+                'skip_duplicate_check' => true, // BO = expected duplicate parent order
+            ) );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[BO-H5] Flash fallback order — #{$order_id} result=" . wp_json_encode( is_array( $result ) ? $result : array( 'raw' => (string) $result ) ) );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[BO-H5] Flash fallback error: " . $e->getMessage() );
+            }
+        }
+    }
+}, 10, 3 );
+
+/**
+ * H6 FIX: Print queue secondary label on BO fulfill (spec §9.2)
+ * Enqueue new print job พร้อม metadata `_print_queued_bo` flag
+ */
+add_action( 'b2b_bo_items_fulfilled', function( $order_id, $items, $meta ) {
+    if ( ! function_exists( 'b2b_enqueue_print_job' ) ) {
+        // Fallback: flag order meta สำหรับ RPi dashboard manual reprint
+        update_post_meta( $order_id, '_print_queued_bo', array(
+            'queued_at' => current_time( 'mysql' ),
+            'items'     => $items,
+            'meta'      => $meta,
+        ) );
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[BO-H6] Print queue helper not found — meta flag only — order #{$order_id}" );
+        }
+        return;
+    }
+
+    try {
+        $job_id = b2b_enqueue_print_job( $order_id, array(
+            'source'     => 'bo_fulfill',
+            'bo_items'   => $items,
+            'is_secondary' => true,
+        ) );
+        update_post_meta( $order_id, '_print_queued_bo', array(
+            'queued_at' => current_time( 'mysql' ),
+            'job_id'    => $job_id,
+        ) );
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[BO-H6] Print job queued — order #{$order_id} job_id=" . wp_json_encode( $job_id ) );
+        }
+    } catch ( \Throwable $e ) {
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[BO-H6] Print queue error: " . $e->getMessage() );
+        }
+    }
+}, 20, 3 ); // Priority 20 — after H5 Flash (order doesn't matter much but H5 first)
 
 /**
  * 4.6 — POST /b2b/v1/bo-cancel-item
@@ -1549,6 +1928,11 @@ if ( ! function_exists( 'b2b_build_flex_partial_fulfill_customer' ) ) {
             'color' => '#6b7280',
         );
 
+        // M6 FIX: footer buttons (spec §6.5) — ดูออเดอร์ + ยืนยันบิล
+        $ticket_url = function_exists( 'b2b_liff_url' )
+            ? b2b_liff_url( 'b2b-ticket/', array( 'ticket_id' => $order_id ) )
+            : home_url( "/b2b-ticket/?ticket_id={$order_id}" );
+
         return array(
             'type'    => 'flex',
             'altText' => "📦 ออเดอร์ #{$ticket_no} ยืนยันแล้ว — จัดส่งบางส่วน",
@@ -1567,6 +1951,33 @@ if ( ! function_exists( 'b2b_build_flex_partial_fulfill_customer' ) ) {
                     'type' => 'box',
                     'layout' => 'vertical',
                     'contents' => $body_contents,
+                ),
+                'footer' => array(
+                    'type'    => 'box',
+                    'layout'  => 'vertical',
+                    'spacing' => 'sm',
+                    'contents' => array(
+                        array(
+                            'type'   => 'button',
+                            'style'  => 'primary',
+                            'color'  => '#10b981',
+                            'action' => array(
+                                'type'  => 'postback',
+                                'label' => '✅ ยืนยันบิล',
+                                'data'  => "action=confirm_bill&ticket_id={$order_id}",
+                                'displayText' => 'ยืนยันบิล',
+                            ),
+                        ),
+                        array(
+                            'type'   => 'button',
+                            'style'  => 'secondary',
+                            'action' => array(
+                                'type'  => 'uri',
+                                'label' => '📋 ดูออเดอร์',
+                                'uri'   => esc_url_raw( $ticket_url ),
+                            ),
+                        ),
+                    ),
                 ),
             ),
         );
@@ -1598,6 +2009,11 @@ if ( ! function_exists( 'b2b_build_flex_bo_ready_customer' ) ) {
             $total_val += $price * $qty;
         }
 
+        // M7 FIX: footer buttons (spec §6.6) — ยืนยันบิล BO + ดูออเดอร์
+        $ticket_url = function_exists( 'b2b_liff_url' )
+            ? b2b_liff_url( 'b2b-ticket/', array( 'ticket_id' => $order_id ) )
+            : home_url( "/b2b-ticket/?ticket_id={$order_id}" );
+
         return array(
             'type'    => 'flex',
             'altText' => "📦 BO พร้อมจัดส่ง #{$ticket_no}",
@@ -1627,6 +2043,33 @@ if ( ! function_exists( 'b2b_build_flex_bo_ready_customer' ) ) {
                                 'margin' => 'md',
                             ),
                         )
+                    ),
+                ),
+                'footer' => array(
+                    'type'    => 'box',
+                    'layout'  => 'vertical',
+                    'spacing' => 'sm',
+                    'contents' => array(
+                        array(
+                            'type'   => 'button',
+                            'style'  => 'primary',
+                            'color'  => '#10b981',
+                            'action' => array(
+                                'type'  => 'postback',
+                                'label' => '✅ ยืนยันบิล BO',
+                                'data'  => "action=confirm_bill&ticket_id={$order_id}",
+                                'displayText' => 'ยืนยันบิล BO',
+                            ),
+                        ),
+                        array(
+                            'type'   => 'button',
+                            'style'  => 'secondary',
+                            'action' => array(
+                                'type'  => 'uri',
+                                'label' => '📋 ดูออเดอร์',
+                                'uri'   => esc_url_raw( $ticket_url ),
+                            ),
+                        ),
                     ),
                 ),
             ),
@@ -2247,18 +2690,15 @@ add_shortcode( 'b2b_bo_admin', function() {
         };
 
         window.b2bBoOpenSplit = function(orderId, snapshotParam) {
-            // V.1.3: snapshot มาจาก /bo-pending-review response แล้ว (server-side) ไม่ต้อง fetch ซ้ำ
-            // แต่ fallback: ถ้าไม่มี snapshotParam → fetch จาก endpoint (เผื่อเรียกจากที่อื่น)
-            const useSnapshot = snapshotParam && typeof snapshotParam === 'object' ? snapshotParam : null;
-
-            apiCall('bo-pending-review').then(res => {
-                if (!res.success) { alert('❌ Load order detail failed'); return; }
-                const order = (res.data || []).find(o => o.id === orderId);
-                if (!order) { alert('❌ Order not found — อาจถูก admin action ไปแล้ว'); return; }
+            // V.1.6 H2 FIX: ใช้ /bo-order-detail endpoint (single record) แทน pending-review list
+            // (faster + ไม่มี limit=50 cap หายไป)
+            apiCall('bo-order-detail?order_id=' + orderId).then(order => {
+                if (!order.success) { alert('❌ Load order detail failed: ' + (order.message || 'unknown')); return; }
 
                 const title = order.ticket_no;
                 const orderItems = order.order_items;
-                const snapshot = useSnapshot || order.stock_snapshot || {};
+                // ใช้ fresh_snapshot (real-time compute) ถ้ามี, fallback stock_snapshot (from opaque accept time)
+                const snapshot = order.fresh_snapshot || order.stock_snapshot || {};
                 const items = parseOrderItems(orderItems);
 
                     currentSplitOrderId = orderId;
