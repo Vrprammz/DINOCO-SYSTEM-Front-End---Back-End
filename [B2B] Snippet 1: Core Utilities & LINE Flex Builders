@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.33.7 — b2b_rate_limit() atomic (GET_LOCK) — security C2 fix ║
  * ║  Version: V.33.6 — Phase 0 Hotfix polish: use b2b_get_product_data() helper + static cache caveat note ║
  * ║  DB_ID: 72                                                  ║
  * ║  DINOCO B2B Smart Order System                               ║
@@ -162,38 +163,66 @@ if ( ! function_exists( 'b2b_rate_limit' ) ) {
      * @param int    $window  Window in seconds
      * @return true|WP_Error  true on allow, WP_Error(429) on block
      */
+    /**
+     * V.33.7 — Atomic rate limiter ป้องกัน race condition (security-pentester C2 fix)
+     *
+     * เดิม: read transient → check count → write back = race window
+     *   (2 concurrent requests เห็น count=0 → increment 1 ทั้งคู่ → bypass limit 2×)
+     *
+     * ใหม่: wrap critical section ด้วย MySQL GET_LOCK() → atomic serialization
+     *   across all PHP workers + request timing
+     *
+     * Properties:
+     *   - No schema change (transient still = storage)
+     *   - Lock timeout 2s (fail closed → return 429 on contention)
+     *   - try/finally ensure RELEASE_LOCK
+     *   - Backward compat signature + return type
+     */
     function b2b_rate_limit( $key, $max = 10, $window = 60 ) {
-        $tkey = 'b2b_rl_' . md5( (string) $key );
-        $data = get_transient( $tkey );
+        global $wpdb;
+        $tkey      = 'b2b_rl_' . md5( (string) $key );
+        $lock_name = 'b2b_rl_' . md5( $tkey ); // 40 chars < 64 MySQL limit
 
-        // First request in window
-        if ( $data === false || ! is_array( $data ) ) {
-            set_transient( $tkey, array( 'count' => 1, 'start' => time() ), $window );
-            return true;
-        }
-
-        $count = intval( $data['count'] ?? 0 );
-        $start = intval( $data['start'] ?? 0 );
-
-        // Defensive: transient should auto-expire, but double-check window
-        if ( ( time() - $start ) >= $window ) {
-            set_transient( $tkey, array( 'count' => 1, 'start' => time() ), $window );
-            return true;
-        }
-
-        if ( $count >= $max ) {
+        $got_lock = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 2)", $lock_name ) );
+        if ( $got_lock !== '1' ) {
             return new WP_Error(
-                'rate_limited',
-                sprintf( 'คำขอมากเกินไป กรุณารอสักครู่ (สูงสุด %d ครั้ง / %d วินาที)', $max, $window ),
+                'rate_limit_contention',
+                'ระบบหนาแน่น กรุณาลองใหม่',
                 array( 'status' => 429 )
             );
         }
 
-        // Increment but preserve original window expiry
-        $data['count'] = $count + 1;
-        $remaining = max( 1, $window - ( time() - $start ) );
-        set_transient( $tkey, $data, $remaining );
-        return true;
+        try {
+            $data = get_transient( $tkey );
+
+            if ( $data === false || ! is_array( $data ) ) {
+                set_transient( $tkey, array( 'count' => 1, 'start' => time() ), $window );
+                return true;
+            }
+
+            $count = intval( $data['count'] ?? 0 );
+            $start = intval( $data['start'] ?? 0 );
+
+            if ( ( time() - $start ) >= $window ) {
+                set_transient( $tkey, array( 'count' => 1, 'start' => time() ), $window );
+                return true;
+            }
+
+            if ( $count >= $max ) {
+                return new WP_Error(
+                    'rate_limited',
+                    sprintf( 'คำขอมากเกินไป กรุณารอสักครู่ (สูงสุด %d ครั้ง / %d วินาที)', $max, $window ),
+                    array( 'status' => 429 )
+                );
+            }
+
+            $data['count'] = $count + 1;
+            $remaining     = max( 1, $window - ( time() - $start ) );
+            set_transient( $tkey, $data, $remaining );
+            return true;
+        } finally {
+            $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
     }
 }
 
