@@ -2,9 +2,10 @@
 /**
  * seed-regression.js V.1.2 — Seed regression scenarios
  *
- * Seeds 25 regression scenarios:
+ * Seeds 27 regression scenarios:
  *   - REG-001..REG-015: from Fix History (docs/chatbot-rules.md §11)
  *   - REG-016..REG-025: from chatbot-rules.md Sections 1-10 (rule coverage)
+ *   - REG-026..REG-027: B2B OOS Gate hotfix (Phase 0 Ticket #6266, Snippet 1 V.33.5)
  * into the `regression_scenarios` MongoDB collection.
  *
  * V.1.2 changes (2026-04-10):
@@ -31,6 +32,7 @@ const force = process.argv.includes("--force");
 // 25 Seed Scenarios
 //   REG-001..REG-015: Fix History (past bugs)
 //   REG-016..REG-025: Rule coverage (chatbot-rules.md §1-10)
+//   REG-026..REG-027: B2B OOS Gate hotfix (Phase 0 Ticket #6266)
 // ═══════════════════════════════════════
 const now = new Date();
 
@@ -730,6 +732,85 @@ const SCENARIOS = [
         "ห้ามตอบแค่ 'มีอะไรให้ช่วย' แบบ generic โดยไม่ทักกลับ",
       ],
     },
+  },
+
+  // ═══════════════════════════════════════
+  // REG-026..REG-027: B2B OOS Gate Hotfix (Phase 0 Ticket #6266)
+  // Snippet 1 V.33.5 b2b_check_order_oos() expand SET → real-time hierarchy check
+  // ═══════════════════════════════════════
+
+  // REG-026: SET มีสต็อกจริง ต้องไม่ gate BO
+  // Bug: Ticket #6266 — DNCSETNX500IRNB stock=10 ระบบตอบ BO ข้าม admin check
+  // Fix: Snippet 1 V.33.5 b2b_check_order_oos expand SET → compute_hierarchy_stock - reserved
+  {
+    bug_id: "REG-026",
+    title: "B2B OOS Gate — SET มีสต็อกจริงต้องไม่ gate BO (Ticket #6266)",
+    category: "b2b_flow",
+    severity: "critical",
+    platform: "line",
+    bug_context:
+      "ลูกค้า B2B สั่ง SET parent SKU (เช่น DNCSETNX500IRNB) — admin กด 'ส่งรายการเช็คสต็อก' " +
+      "ระบบต้องเช็ค real-time hierarchy stock (MIN children - reserved) ก่อน gate BO. " +
+      "ห้ามอ่าน stock_status column ดิบอย่างเดียว (drift-prone). " +
+      "ถ้า leaves ทุกตัว stock >= qty → ไม่ใช่ BO → Flex ส้ม 'เช็คสต็อก' ส่งหา admin group.",
+    fix_commit: "Phase 0 Hotfix (2026-04-16)",
+    fix_date: "2026-04-16",
+    source: "fix_history",
+    notes:
+      "Unit-test-style scenario — ไม่ trigger AI chatbot โดยตรง แต่ document behavior สำหรับ manual QA + regression. " +
+      "Verify ด้วยการสั่ง SET ที่ leaves มีสต็อก + ดู Flex ที่ admin group ได้รับ (ส้ม ไม่ใช่แดง BO)",
+    turns: [
+      {
+        role: "user",
+        message:
+          "[MANUAL QA] ลูกค้า B2B สั่ง SET DNCSETNX500IRNB x1 (leaves stock>=1 ทุกตัว) → admin confirm → expected: Flex ส้ม 'ออเดอร์ใหม่ — เช็คสต็อก' ส่งหา admin (ไม่ใช่ Flex แดง 'สินค้าหมดชั่วคราว')",
+      },
+    ],
+    assertions: {
+      expect_behavior:
+        "PHP b2b_check_order_oos() return [] (empty array) เมื่อ SET มีสต็อกครบ — flow ดำเนินต่อไป checking_stock → admin check",
+      must_not_do: [
+        "ต้องไม่ return [{sku: SET_SKU, eta: ''}] ถ้า leaves มีสต็อกพอ",
+        "ต้องไม่ push Flex แดง 'สินค้าหมดชั่วคราว' ให้ลูกค้าโดยตรง",
+        "ต้องไม่ transition order → backorder",
+      ],
+    },
+    retry_on_flaky: 0,
+  },
+
+  // REG-027: SET ที่ leaf หนึ่งหมดต้อง gate BO
+  // เพื่อยืนยัน hotfix ไม่ break scenario BO ที่ถูกต้อง
+  {
+    bug_id: "REG-027",
+    title: "B2B OOS Gate — SET ที่ leaf stock=0 ต้อง gate BO ให้ลูกค้า",
+    category: "b2b_flow",
+    severity: "high",
+    platform: "line",
+    bug_context:
+      "ลูกค้า B2B สั่ง SET ที่ leaf ใด leaf หนึ่ง stock < qty → ต้อง gate BO (Flex แดง 'สินค้าหมดชั่วคราว' + ปุ่ม Backorder/ยกเลิก) + FSM → backorder. " +
+      "หรือถ้า manual_hold=1 + reason='Admin manual OOS' → ก็ต้อง gate BO ด้วย.",
+    fix_commit: "Phase 0 Hotfix (2026-04-16)",
+    fix_date: "2026-04-16",
+    source: "fix_history",
+    notes:
+      "Unit-test-style scenario — verify ว่าการ fix REG-026 ไม่ทำให้ BO scenario ที่ถูกต้องพัง. " +
+      "Manual QA: ตั้ง leaf stock=0 → สั่ง SET → ต้องได้ Flex แดง.",
+    turns: [
+      {
+        role: "user",
+        message:
+          "[MANUAL QA] ลูกค้า B2B สั่ง SET ที่ leaf_A.stock=0 → admin confirm → expected: Flex แดง 'สินค้าหมดชั่วคราว (ไม่มีกำหนด)' + FSM order → backorder",
+      },
+    ],
+    assertions: {
+      expect_behavior:
+        "PHP b2b_check_order_oos() return [{sku: SET_SKU, eta: ''}] เมื่อ compute_hierarchy_stock - reserved < qty (แม้แค่ 1 leaf หมด)",
+      must_not_do: [
+        "ต้องไม่ return [] ถ้า leaf ใน SET stock=0",
+        "ต้องไม่ข้าม Flex BO ไปยัง admin check",
+      ],
+    },
+    retry_on_flaky: 0,
   },
 ];
 

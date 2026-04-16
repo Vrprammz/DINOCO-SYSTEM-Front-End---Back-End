@@ -138,7 +138,7 @@
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
-| Snippet 1: Core Utilities & LINE Flex Builders | V.32.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers |
+| Snippet 1: Core Utilities & LINE Flex Builders | V.33.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers + **V.33.5 Phase 0 Hotfix**: `b2b_check_order_oos()` hierarchy-aware (expand SET → real-time MIN - reserved + manual_hold from DB + flag `dinoco_oos_gate_hierarchy_compute`) — Ticket #6266 |
 | Snippet 2: LINE Webhook Gateway & Order Creator | V.34.0 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete, leaf-only stock deduct |
 | Snippet 3: LIFF E-Catalog REST API | V.41.0 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook + label/status/test/reprint) |
 | Snippet 4: LIFF E-Catalog Frontend | V.32.4 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) + **V.32.2-V.32.4 UX overhaul**: qty stepper SET Detail (1-999) + back button ← กลับ + cart bar 64px green CTA z-index 600 + main SET stepper + cart thumbnails + sub-item stepper toggle + 🗑️ red remove |
@@ -152,7 +152,7 @@
 | Snippet 12: Admin Dashboard LIFF | V.31.2 | 65 | `[b2b_dashboard]`, `[b2b_stock_manager]`, `[b2b_tracking_entry]` |
 | Snippet 13: Debt Transaction Manager | V.2.0 | 1036 | Atomic debt operations (MySQL transactions, FOR UPDATE) |
 | Snippet 14: Order State Machine | V.1.5 | 1038 | B2B_Order_FSM class (14 statuses) |
-| Snippet 15: Custom Tables & JWT Session | V.6.0 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class, 3-level SKU hierarchy helpers |
+| Snippet 15: Custom Tables & JWT Session | V.7.4 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class, 3-level SKU hierarchy helpers + **V.7.4 Phase 0 Hotfix**: `dinoco_stock_auto_status()` cascade auto-unlock manual_hold (whitelist reason + 72h buffer + flag `dinoco_auto_unlock_enabled`) |
 
 ### 2.5 [B2F] -- Factory Purchasing System (13 Snippets)
 

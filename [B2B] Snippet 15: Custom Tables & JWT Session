@@ -1,11 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.7.4 — Phase 0 Hotfix: cascade auto-unlock manual_hold (opt-in flag) ║
  * ║  Version: V.7.3 — DINOCO_Catalog::get_by_skus() batch helper (single SQL WHERE IN) — fix N+1 ║
  * ║  Version: V.7.2 — dinoco_get_wac_for_skus() per-SKU batch helper (for V.42.17 Margin Analysis)  ║
  * ║  DB_ID: 1039                                                ║
  * ║  Description: Custom DB tables + JWT + Moto Catalog          ║
  * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * V.7.4 (Phase 0 Hotfix — Ticket #6266):
+ *   - dinoco_stock_auto_status() cascade block เพิ่ม auto-unlock manual_hold
+ *   - Feature flag: dinoco_auto_unlock_enabled default OFF (opt-in canary)
+ *   - Whitelist reason: 'Admin manual OOS' + 'migrated from OOS timer'
+ *   - 72h buffer (admin ตั้งใจ hold รอ QC/campaign ได้)
+ *   - FOR UPDATE race safety + reuse b2b_unlock_product_oos() helper (dual-write ACF)
+ *   - Invalidate b2b_reserved_map_bulk ก่อน compute
+ *   - จะถูก supersede โดย FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md (opaque accept)
  *
  * 1. Product Catalog → custom MySQL table (แทน wp_options JSON)
  * 2. JWT Session → HMAC-based tokens (แทน transient-based tokens)
@@ -913,18 +923,65 @@ if ( ! function_exists( 'dinoco_stock_auto_status' ) ) {
         delete_transient( 'b2b_sku_data_map' );
 
         // V.7.0 [C-8]: Cascade ancestor ใช้ full status logic (threshold + manual_hold + reserved)
+        // V.7.4 Phase 0 Hotfix: auto-unlock manual_hold ถ้าของกลับมา + whitelist reason + 72h buffer
         if ( function_exists( 'dinoco_get_ancestor_skus' ) && function_exists( 'dinoco_compute_hierarchy_stock' ) ) {
-            $relations = get_option( 'dinoco_sku_relations', array() );
-            $ancestors = dinoco_get_ancestor_skus( $sku, $relations );
+            $relations         = get_option( 'dinoco_sku_relations', array() );
+            $ancestors         = dinoco_get_ancestor_skus( $sku, $relations );
+            $auto_unlock_flag  = (bool) get_option( 'dinoco_auto_unlock_enabled', false );
+            $reserved_invalidated = false;
+
             foreach ( $ancestors as $ancestor_sku ) {
+                // V.7.4: invalidate reserved cache ก่อน compute (ครั้งเดียวต่อ auto_status call)
+                if ( $auto_unlock_flag && ! $reserved_invalidated ) {
+                    delete_transient( 'b2b_reserved_map_bulk' );
+                    $reserved_invalidated = true;
+                }
+
                 $anc_stock     = dinoco_compute_hierarchy_stock( $ancestor_sku, $relations );
                 $anc_reserved  = function_exists( 'dinoco_get_reserved_qty' ) ? dinoco_get_reserved_qty( $ancestor_sku ) : 0;
                 $anc_available = max( 0, $anc_stock - $anc_reserved );
 
+                // V.7.4: SELECT manual_hold_reason + stock_updated_at เพิ่มสำหรับ auto-unlock logic
                 $anc_row = $wpdb->get_row( $wpdb->prepare(
-                    "SELECT low_stock_threshold, manual_hold FROM {$table} WHERE sku = %s", $ancestor_sku
+                    "SELECT low_stock_threshold, manual_hold, manual_hold_reason, stock_updated_at FROM {$table} WHERE sku = %s",
+                    $ancestor_sku
                 ) );
                 $anc_manual_hold = $anc_row ? (int) $anc_row->manual_hold : 0;
+
+                // V.7.4 Phase 0 Hotfix: auto-unlock manual_hold
+                // เงื่อนไขทั้งหมดต้องเป็น true:
+                //   1. flag dinoco_auto_unlock_enabled = true (opt-in canary)
+                //   2. anc_manual_hold = 1
+                //   3. reason ∈ whitelist (admin custom reason ไม่ clear)
+                //   4. anc_available > 0 (ของกลับมาแล้ว)
+                //   5. NOW() - stock_updated_at >= 72h (safety buffer admin ตั้งใจ hold ได้)
+                if ( $auto_unlock_flag
+                    && $anc_manual_hold === 1
+                    && $anc_row
+                    && in_array( $anc_row->manual_hold_reason, array( 'Admin manual OOS', 'migrated from OOS timer' ), true )
+                    && $anc_available > 0
+                ) {
+                    $hours_elapsed = $anc_row->stock_updated_at
+                        ? ( time() - strtotime( $anc_row->stock_updated_at ) ) / 3600
+                        : 0;
+
+                    if ( $hours_elapsed >= 72 && function_exists( 'b2b_unlock_product_oos' ) ) {
+                        // Reuse helper (dual-write custom table + ACF + recursive auto_status + cache invalidation)
+                        b2b_unlock_product_oos( $ancestor_sku );
+
+                        if ( function_exists( 'b2b_log' ) ) {
+                            b2b_log( sprintf(
+                                '[Stock] AUTO-UNLOCK %s reason=%s available=%d hours=%.1f',
+                                $ancestor_sku, $anc_row->manual_hold_reason, $anc_available, $hours_elapsed
+                            ) );
+                        }
+
+                        // b2b_unlock_product_oos() เรียก dinoco_stock_auto_status() อีกครั้ง
+                        // (recursive — ancestor ยังอยู่ใน outer loop แต่ manual_hold = 0 แล้ว)
+                        // continue ต่อ ancestor ตัวถัดไป (ข้าม update ตรง)
+                        continue;
+                    }
+                }
 
                 if ( $anc_manual_hold || $anc_available <= 0 ) {
                     $anc_status = 'out_of_stock';

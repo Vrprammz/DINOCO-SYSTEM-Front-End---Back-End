@@ -1,8 +1,10 @@
 # DINOCO Feature Specs -- Complete Wiki
 
-**Date:** 2026-04-07
+**Date:** 2026-04-07 (original) / 2026-04-16 (Phase 0 Hotfix entry)
 
 > Consolidated from: B2F-FEATURE-SPEC.md, INVENTORY-FEATURE-SPEC.md, FINANCE-DASHBOARD.md, BRAND-VOICE.md, MASTER-PLAN.md
+>
+> **2026-04-16 update:** Long-term B2B Backorder System spec lives in `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md` (opaque accept + admin split + 7-day dev + 3-week rollout). Phase 0 Hotfix (Snippet 1 V.33.5 + Snippet 15 V.7.4) deployed ก่อนเป็น band-aid สำหรับ Ticket #6266 — ดู CLAUDE.md "B2B OOS Gate Hotfix V.33.5 + V.7.4" สำหรับรายละเอียดการแก้.
 
 ---
 

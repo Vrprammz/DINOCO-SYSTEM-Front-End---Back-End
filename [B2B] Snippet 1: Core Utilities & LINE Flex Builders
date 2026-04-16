@@ -1,10 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
- * ║  Version: V.33.4 — Phase B: b2b_build_flex_dunning_summary() multi-invoice CI card ║
+ * ║  Version: V.33.5 — Phase 0 Hotfix: b2b_check_order_oos() expand SET → real-time hierarchy check (Ticket #6266) ║
  * ║  DB_ID: 72                                                  ║
  * ║  DINOCO B2B Smart Order System                               ║
  * ╚══════════════════════════════════════════════════════════════╝
+ * V.33.5: Phase 0 Hotfix — b2b_check_order_oos() non-leaf SET → real-time compute (hierarchy_stock - reserved)
+ *         + อ่าน manual_hold ตรงจาก DB (b2b_get_product_data ไม่ return reason)
+ *         + delete_transient('b2b_reserved_map_bulk') ก่อน compute (แก้ stale reserved 60s TTL)
+ *         + Feature flag: dinoco_oos_gate_hierarchy_compute default ON
+ *         + Fallback: ถ้า helpers ไม่ exist → behavior เดิม (backward compat)
+ *         Bug: Ticket #6266 — SET DNCSETNX500IRNB stock=10 ระบบตอบ BO ข้าม admin check
+ *         Cause: b2b_check_oos_memory อ่าน stock_status column ดิบ (stale) + ไม่ expand SET
+ *         จะถูก supersede ใน Phase B (FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md opaque accept)
  * V.10.0: BUG-COPY — clipboardText ครบ 3 อย่าง (ชื่อธนาคาร + เลขบัญชี + ชื่อบัญชี)
  *         Helper: b2b_get_bank_copy_text() สำหรับ clipboard ทุกที่
  *         Payment Invoice: คัดลอกข้อมูลบัญชีครบ
@@ -1621,20 +1629,90 @@ if ( ! function_exists( 'b2b_check_oos_memory' ) ) {
     }
 }
 if ( ! function_exists( 'b2b_check_order_oos' ) ) {
+    /**
+     * V.33.5 Phase 0 Hotfix — hierarchy-aware OOS gate
+     *
+     * เดิม (≤V.33.4) อ่าน stock_status column ดิบ + ไม่ expand SET → drift false-positive
+     * Bug reference: Ticket #6266 (DNCSETNX500IRNB stock=10 ระบบตอบ BO)
+     *
+     * Flow ใหม่:
+     *   1. Parse (SKU)xQTY — capture ทั้ง SKU + qty
+     *   2. Feature flag OFF หรือ helpers ไม่ exist → fallback behavior เดิม
+     *   3. Leaf SKU → เช็ค b2b_check_oos_memory() แบบเดิม (manual OOS flag ยังใช้งานบน leaf)
+     *   4. Non-leaf (SET) → real-time compute:
+     *      - delete_transient('b2b_reserved_map_bulk') ก่อน (แก้ 60s TTL stale)
+     *      - available = max(0, compute_hierarchy_stock - reserved)
+     *      - อ่าน manual_hold ตรงจาก DB (b2b_get_product_data ไม่ return manual_hold_reason)
+     *      - OOS ถ้า manual_hold=1 OR available < qty
+     *
+     * จะถูก supersede โดย FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md (opaque accept + admin split)
+     */
     function b2b_check_order_oos( $order_text ) {
         $oos_items = array();
-        if ( preg_match_all('/\(([A-Z0-9\-]+)\)\s*x\d+/i', $order_text, $matches) ) {
-            foreach ( $matches[1] as $sku ) {
+        $use_hierarchy = (bool) get_option( 'dinoco_oos_gate_hierarchy_compute', true );
+
+        if ( preg_match_all( '/\(([A-Z0-9\-]+)\)\s*x(\d+)/i', $order_text, $matches, PREG_SET_ORDER ) ) {
+            global $wpdb;
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            $reserved_invalidated = false;
+
+            foreach ( $matches as $m ) {
+                $sku = strtoupper( trim( $m[1] ) );
+                $qty = max( 1, intval( $m[2] ) );
+
+                // Path A — Hierarchy-aware (V.33.5 default)
+                if ( $use_hierarchy
+                    && function_exists( 'dinoco_is_leaf_sku' )
+                    && function_exists( 'dinoco_compute_hierarchy_stock' )
+                    && function_exists( 'dinoco_get_reserved_qty' )
+                ) {
+                    $is_leaf = dinoco_is_leaf_sku( $sku, $relations );
+
+                    if ( ! $is_leaf ) {
+                        // Non-leaf SET — real-time compute
+                        if ( ! $reserved_invalidated ) {
+                            delete_transient( 'b2b_reserved_map_bulk' );
+                            $reserved_invalidated = true;
+                        }
+
+                        $computed  = (int) dinoco_compute_hierarchy_stock( $sku, $relations );
+                        $reserved  = (int) dinoco_get_reserved_qty( $sku );
+                        $available = max( 0, $computed - $reserved );
+
+                        // อ่าน manual_hold ตรงจาก DB (b2b_get_product_data ไม่ return reason)
+                        $table    = $wpdb->prefix . 'dinoco_products';
+                        $hold_row = $wpdb->get_row( $wpdb->prepare(
+                            "SELECT manual_hold, oos_eta_date FROM {$table} WHERE sku = %s",
+                            $sku
+                        ) );
+                        $manual_hold = $hold_row ? (int) $hold_row->manual_hold : 0;
+
+                        if ( $manual_hold || $available < $qty ) {
+                            $eta = $hold_row && $hold_row->oos_eta_date ? $hold_row->oos_eta_date : '';
+                            $oos_items[] = array( 'sku' => $sku, 'eta' => $eta );
+                            if ( function_exists( 'b2b_log' ) ) {
+                                b2b_log( sprintf(
+                                    '[OOS_GATE] SET=%s computed=%d reserved=%d available=%d qty=%d manual_hold=%d → OOS',
+                                    $sku, $computed, $reserved, $available, $qty, $manual_hold
+                                ) );
+                            }
+                        }
+                        continue;
+                    }
+                    // Leaf → fall through to manual OOS flag check (Path B)
+                }
+
+                // Path B — Leaf หรือ fallback (behavior เดิม)
                 if ( b2b_check_oos_memory( $sku ) ) {
-                    // V.32.4: Read ETA from custom table
                     $eta = '';
                     if ( function_exists( 'b2b_get_product_data' ) ) {
-                        $pd = b2b_get_product_data( $sku );
+                        $pd  = b2b_get_product_data( $sku );
                         $eta = $pd ? $pd['oos_eta_date'] : '';
                     } else {
-                        $pid = b2b_find_product_by_sku( $sku ); $eta = $pid ? get_field('oos_eta_date', $pid) : '';
+                        $pid = b2b_find_product_by_sku( $sku );
+                        $eta = $pid ? get_field( 'oos_eta_date', $pid ) : '';
                     }
-                    $oos_items[] = array('sku' => $sku, 'eta' => $eta);
+                    $oos_items[] = array( 'sku' => $sku, 'eta' => $eta );
                 }
             }
         }
