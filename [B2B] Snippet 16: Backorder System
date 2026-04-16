@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.1.3 — Fix pending review bug (WP REST meta filter ไม่ทำงาน → ใช้ custom endpoint) ║
  * ║  Version: V.1.2 — Admin UI [b2b_bo_admin] + Flag Manager [b2b_bo_flags] ║
  * ║  DB_ID: pending                                              ║
  * ║  Description: Opaque Accept + Admin Split Backorder System   ║
@@ -457,7 +458,65 @@ add_action( 'rest_api_init', function() {
         'callback'            => 'b2b_rest_bo_restock_scan',
         'permission_callback' => 'b2b_bo_permission_admin',
     ) );
+
+    // V.1.3 — GET /bo-pending-review: list orders with status=pending_stock_review
+    // (แก้บัค V.1.2: WP REST /wp/v2/b2b_order?meta_key=X ไม่ filter meta จริง → โชว์ order ทั้งหมด)
+    register_rest_route( 'b2b/v1', '/bo-pending-review', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2b_rest_bo_pending_review',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
 } );
+
+if ( ! function_exists( 'b2b_rest_bo_pending_review' ) ) {
+    /**
+     * V.1.3 — Server-side filter orders with order_status = pending_stock_review
+     */
+    function b2b_rest_bo_pending_review( $request ) {
+        $limit = min( 200, (int) ( $request->get_param( 'limit' ) ?: 50 ) );
+
+        $orders = get_posts( array(
+            'post_type'      => 'b2b_order',
+            'posts_per_page' => $limit,
+            'meta_query'     => array(
+                array( 'key' => 'order_status', 'value' => 'pending_stock_review' ),
+            ),
+            'orderby'        => 'meta_value',
+            'meta_key'       => '_b2b_opaque_accept_at',
+            'order'          => 'ASC',
+            'fields'         => 'ids',
+        ) );
+
+        $data = array();
+        foreach ( $orders as $order_id ) {
+            $dist_id     = (int) get_field( 'distributor_id', $order_id );
+            $dist_name   = $dist_id ? get_the_title( $dist_id ) : '';
+            $order_text  = get_field( 'order_items', $order_id ) ?: '';
+            $total       = (float) get_field( 'total_amount', $order_id );
+            $accepted_at = get_post_meta( $order_id, '_b2b_opaque_accept_at', true );
+            $age_hours   = $accepted_at ? ( time() - strtotime( $accepted_at ) ) / 3600 : 0;
+            $snapshot    = get_post_meta( $order_id, '_b2b_stock_snapshot', true );
+
+            $data[] = array(
+                'id'              => $order_id,
+                'ticket_no'       => get_the_title( $order_id ),
+                'distributor_id'  => $dist_id,
+                'distributor_name' => $dist_name,
+                'order_items'     => $order_text,
+                'total_amount'    => $total,
+                'accepted_at'     => $accepted_at,
+                'age_hours'       => round( $age_hours, 1 ),
+                'stock_snapshot'  => is_array( $snapshot ) ? $snapshot : array(),
+            );
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'count'   => count( $data ),
+            'data'    => $data,
+        ) );
+    }
+}
 
 if ( ! function_exists( 'b2b_bo_permission_admin' ) ) {
     /**
@@ -2110,16 +2169,20 @@ add_shortcode( 'b2b_bo_admin', function() {
         }));
 
         // === Pending Review ===
+        // V.1.3 FIX: ใช้ custom endpoint /bo-pending-review ที่ filter server-side
+        // (เดิม V.1.2 ใช้ /wp/v2/b2b_order?meta_key=X แต่ WP REST ไม่ filter meta จริง → โชว์ order ทั้งหมด)
         function loadPending() {
             const container = document.getElementById('bo-pending-list');
             container.innerHTML = '<div class="bo-loading">Loading...</div>';
 
-            // Fetch b2b_order posts with status=pending_stock_review via WP REST
-            fetch('/wp-json/wp/v2/b2b_order?per_page=50&meta_key=order_status&meta_value=pending_stock_review&_embed', {
-                headers: { 'X-WP-Nonce': NONCE }
-            }).then(r => r.json()).then(orders => {
-                if (!Array.isArray(orders) || orders.length === 0) {
-                    container.innerHTML = '<div class="bo-empty">✨ ไม่มีออเดอร์รอ review</div>';
+            apiCall('bo-pending-review').then(res => {
+                if (!res.success) {
+                    container.innerHTML = '<div class="bo-empty">❌ Load error: ' + esc(res.message || 'unknown') + '</div>';
+                    return;
+                }
+                const orders = res.data || [];
+                if (orders.length === 0) {
+                    container.innerHTML = '<div class="bo-empty">✨ ไม่มีออเดอร์รอ review<br><span style="font-size:11px;color:#9ca3af;">(ออเดอร์จะเข้ามาเมื่อ b2b_flag_bo_system=ON แล้วมีลูกค้าสั่งใหม่)</span></div>';
                     document.getElementById('bo-pending-count').textContent = '';
                     return;
                 }
@@ -2127,18 +2190,16 @@ add_shortcode( 'b2b_bo_admin', function() {
 
                 let html = '<table><thead><tr><th>Ticket</th><th>ร้าน</th><th>รายการ</th><th>ยอด</th><th>อายุ</th><th>Actions</th></tr></thead><tbody>';
                 orders.forEach(o => {
-                    const title = (o.title && o.title.rendered) || '#' + o.id;
-                    const acc = o.meta && o.meta._b2b_opaque_accept_at ? o.meta._b2b_opaque_accept_at : '';
-                    const ageH = acc ? Math.floor((Date.now() - new Date(acc).getTime()) / 3600000) : 0;
+                    const itemsShort = (o.order_items || '').length > 60 ? (o.order_items || '').slice(0, 60) + '...' : (o.order_items || '-');
                     html += `<tr>
-                        <td>${esc(title)}</td>
-                        <td>${esc((o.meta && o.meta.distributor_name) || '-')}</td>
-                        <td>${esc((o.meta && o.meta.order_items) || '').slice(0, 60)}...</td>
-                        <td>${thb((o.meta && o.meta.total_amount) || 0)}</td>
-                        <td>${ageH}h</td>
+                        <td>${esc(o.ticket_no)}</td>
+                        <td>${esc(o.distributor_name || '-')}</td>
+                        <td>${esc(itemsShort)}</td>
+                        <td>${thb(o.total_amount)}</td>
+                        <td>${Math.floor(o.age_hours || 0)}h</td>
                         <td>
                             <button class="bo-btn bo-btn-success" onclick="b2bBoConfirmFull(${o.id})">✅ เต็ม</button>
-                            <button class="bo-btn bo-btn-warn" onclick="b2bBoOpenSplit(${o.id})">⚙️ Split</button>
+                            <button class="bo-btn bo-btn-warn" onclick="b2bBoOpenSplit(${o.id}, ${JSON.stringify(o.stock_snapshot).replace(/"/g,'&quot;')})">⚙️ Split</button>
                             <button class="bo-btn bo-btn-danger" onclick="b2bBoReject(${o.id})">❌</button>
                         </td>
                     </tr>`;
@@ -2169,14 +2230,20 @@ add_shortcode( 'b2b_bo_admin', function() {
                 });
         };
 
-        window.b2bBoOpenSplit = function(orderId) {
-            // Fetch order detail (items + stock delta)
-            fetch('/wp-json/wp/v2/b2b_order/' + orderId, { headers: { 'X-WP-Nonce': NONCE } })
-                .then(r => r.json()).then(order => {
-                    const title = (order.title && order.title.rendered) || '#' + orderId;
-                    const orderItems = (order.meta && order.meta.order_items) || '';
-                    const snapshot = (order.meta && order.meta._b2b_stock_snapshot) || {};
-                    const items = parseOrderItems(orderItems);
+        window.b2bBoOpenSplit = function(orderId, snapshotParam) {
+            // V.1.3: snapshot มาจาก /bo-pending-review response แล้ว (server-side) ไม่ต้อง fetch ซ้ำ
+            // แต่ fallback: ถ้าไม่มี snapshotParam → fetch จาก endpoint (เผื่อเรียกจากที่อื่น)
+            const useSnapshot = snapshotParam && typeof snapshotParam === 'object' ? snapshotParam : null;
+
+            apiCall('bo-pending-review').then(res => {
+                if (!res.success) { alert('❌ Load order detail failed'); return; }
+                const order = (res.data || []).find(o => o.id === orderId);
+                if (!order) { alert('❌ Order not found — อาจถูก admin action ไปแล้ว'); return; }
+
+                const title = order.ticket_no;
+                const orderItems = order.order_items;
+                const snapshot = useSnapshot || order.stock_snapshot || {};
+                const items = parseOrderItems(orderItems);
 
                     currentSplitOrderId = orderId;
                     currentSplitItems = items;
