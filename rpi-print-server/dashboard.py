@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.40.0
+DINOCO B2B -- RPi Print Server Dashboard  V.41.0
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
+
+V.41.0: Manual-ship แยก pickup (warehouse) ออกจาก label (registered).
+    - api_manual_flash_create: ใช้ label_sender จาก WP response render บน label
+    - api_manual_reprint_label: อ่าน label_sender_* จาก shipment record (แก้ NameError SENDERS)
 
 Usage:
     python3 dashboard.py                # Run on port 5555
@@ -588,11 +592,19 @@ def api_manual_flash_create():
     dst_store = data.get('dst_store_name', '')
 
     # 2. Render label with Flash data
-    # Use sender from request body (frontend dropdown), fallback to config
-    if body.get('src_name'):
+    # V.41: label_sender (registered address) มาจาก WP response — pickup (warehouse) handled server-side
+    label_sender = data.get('label_sender') or {}
+    if label_sender.get('name'):
         sender = {
-            'name': body['src_name'],
-            'phone': body.get('src_phone', ''),
+            'name':    label_sender['name'],
+            'phone':   label_sender.get('phone', ''),
+            'address': label_sender.get('address', ''),
+        }
+    elif body.get('src_name'):
+        # Backward compat: WP pre-V.41.1 ไม่มี label_sender
+        sender = {
+            'name':    body['src_name'],
+            'phone':   body.get('src_phone', ''),
             'address': body.get('src_address', ''),
         }
     else:
@@ -800,10 +812,22 @@ def api_manual_reprint_label():
         return jsonify({'success': False, 'message': 'Missing PNO'}), 400
 
     sender_key = body.get('sender_key', 'foxrider')
-    if sender_key == 'dinoco':
-        sender = SENDERS.get('dinoco', _get_sender_info())
+    # V.41: อ่าน label_sender snapshot จาก shipment record (ใส่ตอน create โดย b2b_rest_manual_flash_create)
+    # Fallback chain: shipment snapshot → body.src_* (pre-V.41 shipments) → config default
+    if body.get('label_sender_name'):
+        sender = {
+            'name':    body['label_sender_name'],
+            'phone':   body.get('label_sender_phone', ''),
+            'address': body.get('label_sender_address', ''),
+        }
+    elif body.get('src_name'):
+        sender = {
+            'name':    body['src_name'],
+            'phone':   body.get('src_phone', ''),
+            'address': body.get('src_address', ''),
+        }
     else:
-        sender = SENDERS.get('foxrider', _get_sender_info())
+        sender = _get_sender_info()
     use_logo = sender_key == 'dinoco'
 
     recipient = {
