@@ -93,9 +93,16 @@ Phase 2 (V.2.0 Shadow-Write controls):
 - `GET /junction-snapshot?maker_id=&status=&limit=50` — read recent rows + summary (total/active/discontinued/cpt_count/diff_vs_cpt)
 - `GET /observations?diff_only=1&maker_id=&limit=50` — read recent diff observations + summary (total/diffs/last_24h)
 
+Option F Hybrid Admin Control (V.3.2, 2026-04-16):
+
+- `GET /maker-products-with-source/{maker_id}` — junction rows enriched with `source` (`cpt` if `legacy_cpt_id > 0`, else `auto`) + `is_auto_synced` + `is_blacklisted`. Summary { total, cpt, auto, blacklisted }. Used by Admin Makers tab for source badges (📦 CPT / ✨ Auto)
+- `POST /junction-bulk-delete` — body `{ maker_id, skus[], add_to_blacklist, only_auto_synced, confirm }`. Soft-delete (status=discontinued, deleted_at=NOW). Default `only_auto_synced=true` → SQL WHERE guard `(legacy_cpt_id IS NULL OR legacy_cpt_id=0)` protects CPT rows even if FE bypassed. Rate limit 5/min/user. Returns { deleted, blacklisted, skipped_cpt_protected, errors, updated_blacklist_count }
+- `POST /autosync-blacklist` — body `{ maker_id, sku, action: 'add'|'remove' }`. Returns updated list + total count
+- `GET /autosync-blacklist` — full viewer. Returns { blacklist, enriched[] with maker_name, total_entries, size_bytes, cap_bytes=102400 }
+
 ### B2F Migration Audit (Phase 1 observe + Phase 2 Shadow-Write)
 
-- **[Admin System] B2F Migration Audit** V.2.0 — shortcode `[b2f_migration_audit]`, REST namespace `/wp-json/dinoco-b2f-audit/v1/`
+- **[Admin System] B2F Migration Audit** V.3.2 — shortcode `[b2f_migration_audit]`, REST namespace `/wp-json/dinoco-b2f-audit/v1/`. V.3.2 adds Option F Hybrid Admin Control (4 new endpoints + 5 blacklist helpers + `b2f_phase2_run_backfill()` STEP 3 blacklist gate)
 - **Purpose**: Option F Hybrid Shadow-Write — Phase 1 observability + Phase 2 schema activation/backfill/dual-write enable (ดู `B2F-ARCHITECTURE-PLAN.md`)
 - **Feature flags** (wp_options, all default=false): `b2f_flag_auto_sync_sets` (Phase 2.5 locked), `b2f_flag_shadow_write` (Phase 2 toggleable via V.2.0), `b2f_flag_read_from_junction` (Phase 3 locked)
 - **Flag helpers** (B2F Snippet 1 V.6.5): `b2f_is_flag_enabled($name)`, `b2f_get_all_flags()`, `b2f_log_flag_change($flag, $old, $new, $uid)` — whitelist enforced
@@ -366,6 +373,7 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
     - Rollback = Audit dashboard → Step 4 → "⏸ Disable (rollback)" → reads revert ไป CPT ทันที (junction ยัง intact)
     - SET compatible_models: Snippet 2 V.10.1+ **respect SET direct `compatible_models`** ถ้ามี explicit (ไม่ walk descendants) — SET บางตัว set เอง (V.6.1 fix commit `98ce323`)
   - **Code Review Remediation** (2026-04-16, commit `2fdfb35` — V.10.1/V.3.1/V.1.1): 11 issues closed — **1 CRITICAL** (PHP 8.2 fatal dead code removed), **3 HIGH** (dual-write timing race / maker-products status filter / orphan SET recompute on write), **4 MEDIUM** (polish: idempotent backfill, observation source enum guard, UPDATE retry loop, flag-gate helper shortcircuit), **3 LOW** (docs clarity). All files lint-passed.
+  - **Option F Hybrid Admin Control** (2026-04-16 — V.3.2 audit + V.6.3 Snippet 5, spec `FEATURE-SPEC-OPTION-F-HYBRID-ADMIN-CONTROL-2026-04-16.md`): Admin UI to review + selectively delete wrong auto-synced orphan SETs (Phase 2 strict rule was correct for HTP but wrong for Test Fac2). Adds source badges (📦 CPT blue / ✨ Auto amber) per row in Makers Products modal + filter chips (ทั้งหมด/CPT/Auto) + checkbox column + bulk-delete button + confirm modal + blacklist viewer. Backend: 4 REST endpoints (`maker-products-with-source/{id}`, `junction-bulk-delete`, `autosync-blacklist` POST/GET), 5 blacklist helpers (`b2f_autosync_blacklist_get/add/remove/is_blacklisted`), `b2f_phase2_run_backfill()` STEP 3 consults blacklist → `skipped_blacklisted[]` metric. Guards: `only_auto_synced=true` SQL WHERE clause protects CPT rows even if frontend bypassed + rate limit 5/min on bulk-delete + soft-delete (recoverable via SQL). Blacklist wp_option `b2f_autosync_blacklist` shape `{ "<maker_id>": ["SKU1", ...] }` cap 100KB.
 - **LIFF B2B + B2F UX Overhaul** (2026-04-15/16 — 4 iterations, 4 commits `96590ae`/`b55c8d7`/`1e2400c`/`98ce323`): user-driven UX rework ของ LIFF catalog ทั้ง B2B (Snippet 4) + B2F (Snippet 8).
   - **Qty Stepper in SET Detail** (V.32.2 / V.6.2, commit `96590ae`): sub-items ใน SET Detail overlay มีช่อง stepper `− [N] + เพิ่ม` — พิมพ์ qty ได้ 1-999 (เดิม 1-click add = 1 เท่านั้น). Apply ทั้ง B2B + B2F.
   - **Back Button Redesign** (V.32.2 / V.6.2, commit `96590ae`): SET Detail back `<` icon → text button `← กลับ` + dark bg (#1f2937) + 44×44 tap area (iOS HIG minimum). สำหรับผู้สูงวัยมองเห็นชัดขึ้น.

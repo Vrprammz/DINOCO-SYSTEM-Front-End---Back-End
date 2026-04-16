@@ -1,5 +1,6 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.2 — Option F Hybrid Admin Control: (1) `b2f_autosync_blacklist` wp_option + 5 helpers; (2) `b2f_phase2_run_backfill()` STEP 3 checks blacklist → skip orphan INSERT if SKU in list (result shape adds `skipped_blacklisted[]`); (3) 4 new REST endpoints — `GET /maker-products-with-source/{maker_id}` (CPT vs Auto source badges), `POST /junction-bulk-delete` (soft-delete + blacklist, protected by `only_auto_synced` server-side guard), `POST /autosync-blacklist` (add/remove), `GET /autosync-blacklist` (viewer).
  * Version: V.3.1 — Code review fixes: (C1) remove dead $candidates loop in b2f_audit_build_dry_run_csv (PHP 8.2 fatal); (H3) orphan backfill recomputes cost on re-run (was no-op `id=id`); (M2) cleanup dead ternary in /observations endpoint; (M3) pre-warm postmeta cache before backfill transaction (scaling); (L3) document collation decision in schema activation comment.
  * Version: V.3.0 — Phase 3 cut-over: unlock `b2f_flag_read_from_junction` toggle (guard = schema activated + backfill done + shadow_write ON) + Step 4 "Enable Read from Junction" button + phase3 status renderer. LIFF B2F read path switches CPT → junction when flag ON. Immediate rollback: toggle OFF. Paired with Snippet 2 V.10.0 + Snippet 0.5 V.1.0.
  * Version: V.2.0 — Phase 2 Shadow-Write controls (activate-schema, backfill, flag toggler, junction/observations viewer)
@@ -54,7 +55,7 @@ if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
 // SECTION 0: CONSTANTS + ALLOWED FLAG LIST
 // ═══════════════════════════════════════════════════════════════════
 
-if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.1' );
+if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.2' );
 if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
 
 if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
@@ -230,6 +231,110 @@ if ( ! function_exists( 'b2f_audit_activate_schema_v10' ) ) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// SECTION 0.5: AUTO-SYNC BLACKLIST (V.3.2 — Option F Hybrid Admin Control)
+// ═══════════════════════════════════════════════════════════════════
+// Purpose: Admin-curated list of (maker_id, sku) pairs that MUST NOT be
+// auto-injected by Phase 2 backfill's orphan-SET logic, even if they
+// pass the "all descendants covered" strict rule.
+//
+// Shape (wp_option `b2f_autosync_blacklist`):
+//   { "<maker_id>": ["SKU1", "SKU2", ...], "<maker_id2>": [...] }
+//
+// Write path: admin bulk-delete endpoint (POST /junction-bulk-delete) or
+// direct toggle (POST /autosync-blacklist).
+// Read path: b2f_phase2_run_backfill() STEP 3 — skips orphan INSERT when
+// b2f_autosync_is_blacklisted($maker_id, $sku) returns true.
+
+if ( ! function_exists( 'b2f_autosync_blacklist_get_all' ) ) {
+    function b2f_autosync_blacklist_get_all() {
+        $raw = get_option( 'b2f_autosync_blacklist', array() );
+        if ( is_string( $raw ) ) {
+            $decoded = json_decode( $raw, true );
+            $raw = is_array( $decoded ) ? $decoded : array();
+        }
+        if ( ! is_array( $raw ) ) $raw = array();
+        // Normalize: keys as string, values as uppercase SKU arrays
+        $out = array();
+        foreach ( $raw as $mid => $skus ) {
+            if ( ! is_array( $skus ) ) continue;
+            $mid_key = (string) intval( $mid );
+            if ( $mid_key === '0' ) continue;
+            $clean = array();
+            foreach ( $skus as $s ) {
+                $u = strtoupper( trim( (string) $s ) );
+                if ( $u !== '' && ! in_array( $u, $clean, true ) ) $clean[] = $u;
+            }
+            if ( ! empty( $clean ) ) $out[ $mid_key ] = $clean;
+        }
+        return $out;
+    }
+}
+
+if ( ! function_exists( 'b2f_autosync_blacklist_save' ) ) {
+    /**
+     * Internal — persist normalized blacklist. Warns if size > 100KB.
+     */
+    function b2f_autosync_blacklist_save( $blacklist ) {
+        $encoded = wp_json_encode( $blacklist );
+        if ( is_string( $encoded ) && strlen( $encoded ) > 102400 ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[B2F Autosync Blacklist] size=%d bytes > 100KB cap', strlen( $encoded ) ) );
+            }
+        }
+        return update_option( 'b2f_autosync_blacklist', $blacklist, false );
+    }
+}
+
+if ( ! function_exists( 'b2f_autosync_blacklist_get' ) ) {
+    function b2f_autosync_blacklist_get( $maker_id ) {
+        $all = b2f_autosync_blacklist_get_all();
+        $key = (string) intval( $maker_id );
+        return isset( $all[ $key ] ) ? $all[ $key ] : array();
+    }
+}
+
+if ( ! function_exists( 'b2f_autosync_blacklist_add' ) ) {
+    function b2f_autosync_blacklist_add( $maker_id, $sku ) {
+        $maker_id = intval( $maker_id );
+        $sku = strtoupper( trim( (string) $sku ) );
+        if ( ! $maker_id || $sku === '' ) return false;
+        $all = b2f_autosync_blacklist_get_all();
+        $key = (string) $maker_id;
+        if ( ! isset( $all[ $key ] ) || ! is_array( $all[ $key ] ) ) $all[ $key ] = array();
+        if ( ! in_array( $sku, $all[ $key ], true ) ) {
+            $all[ $key ][] = $sku;
+            b2f_autosync_blacklist_save( $all );
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'b2f_autosync_blacklist_remove' ) ) {
+    function b2f_autosync_blacklist_remove( $maker_id, $sku ) {
+        $maker_id = intval( $maker_id );
+        $sku = strtoupper( trim( (string) $sku ) );
+        if ( ! $maker_id || $sku === '' ) return false;
+        $all = b2f_autosync_blacklist_get_all();
+        $key = (string) $maker_id;
+        if ( ! isset( $all[ $key ] ) ) return true; // no-op
+        $all[ $key ] = array_values( array_filter( $all[ $key ], function( $s ) use ( $sku ) {
+            return $s !== $sku;
+        } ) );
+        if ( empty( $all[ $key ] ) ) unset( $all[ $key ] );
+        b2f_autosync_blacklist_save( $all );
+        return true;
+    }
+}
+
+if ( ! function_exists( 'b2f_autosync_is_blacklisted' ) ) {
+    function b2f_autosync_is_blacklisted( $maker_id, $sku ) {
+        $list = b2f_autosync_blacklist_get( $maker_id );
+        $u = strtoupper( trim( (string) $sku ) );
+        return in_array( $u, $list, true );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // SECTION 1: HELPERS — DRIFT / STALE / PARITY QUERIES
 // ═══════════════════════════════════════════════════════════════════
 
@@ -243,14 +348,15 @@ if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
         global $wpdb;
 
         $result = array(
-            'success'        => false,
-            'dry_run'        => (bool) $dry_run,
-            'cpt_migrated'   => 0,
-            'orphans_added'  => 0,
-            'skipped'        => 0,
-            'errors'         => array(),
-            'started_at'     => current_time( 'mysql' ),
-            'finished_at'    => null,
+            'success'              => false,
+            'dry_run'              => (bool) $dry_run,
+            'cpt_migrated'         => 0,
+            'orphans_added'        => 0,
+            'skipped'              => 0,
+            'skipped_blacklisted'  => array(), // V.3.2: SKUs skipped due to admin blacklist
+            'errors'               => array(),
+            'started_at'           => current_time( 'mysql' ),
+            'finished_at'          => null,
         );
 
         // Guard 1: schema activated
@@ -365,6 +471,15 @@ if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
 
                 if ( ! $sku || ! $maker_id ) { $result['skipped']++; continue; }
 
+                // V.3.2: Blacklist check — admin opted out of auto-sync for this (maker, sku)
+                // Takes effect BEFORE INSERT to prevent re-add on backfill re-run.
+                if ( function_exists( 'b2f_autosync_is_blacklisted' )
+                  && b2f_autosync_is_blacklisted( $maker_id, $sku ) ) {
+                    $result['skipped']++;
+                    $result['skipped_blacklisted'][] = $sku . '@' . $maker_id;
+                    continue;
+                }
+
                 // Compute SET cost = sum of registered leaves (from junction, just inserted)
                 $sum_cost = 0.0; $sum_land = 0.0; $sum_sea = 0.0; $max_lt = 7;
                 foreach ( $leaves as $leaf_sku ) {
@@ -436,9 +551,10 @@ if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
 
         if ( function_exists( 'b2b_log' ) ) {
             b2b_log( sprintf(
-                '[B2F Phase2 Backfill] dry_run=%d success=%d cpt=%d orphans=%d skipped=%d errors=%d',
+                '[B2F Phase2 Backfill] dry_run=%d success=%d cpt=%d orphans=%d skipped=%d blacklisted=%d errors=%d',
                 $result['dry_run'] ? 1 : 0, $result['success'] ? 1 : 0,
-                $result['cpt_migrated'], $result['orphans_added'], $result['skipped'], count( $result['errors'] )
+                $result['cpt_migrated'], $result['orphans_added'], $result['skipped'],
+                count( $result['skipped_blacklisted'] ), count( $result['errors'] )
             ) );
         }
 
@@ -1490,6 +1606,288 @@ add_action( 'rest_api_init', function () {
                 ),
             ) );
         },
+    ) );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // V.3.2: Option F Hybrid Admin Control — 4 endpoints
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ─────────────────────────────────────────────
+    // GET /maker-products-with-source/{maker_id}
+    //   — list junction rows for a maker with source = 'cpt' | 'auto'
+    //   — source derived from legacy_cpt_id (NOT NULL > 0 → cpt, else auto)
+    //   — includes is_blacklisted flag from b2f_autosync_blacklist
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/maker-products-with-source/(?P<maker_id>\d+)', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'mp_with_source' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                return new WP_Error( 'table_missing', 'junction table ยังไม่ถูกสร้าง (Activate Schema ก่อน)', array( 'status' => 404 ) );
+            }
+
+            $maker_id = intval( $req->get_param( 'maker_id' ) );
+            if ( ! $maker_id ) {
+                return new WP_Error( 'bad_maker', 'invalid maker_id', array( 'status' => 400 ) );
+            }
+
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, product_sku, maker_id, unit_cost, moq, lead_time_days,
+                        shipping_land, shipping_sea, status, notes, legacy_cpt_id,
+                        created_by, updated_by, created_at, updated_at, deleted_at
+                 FROM {$tbl}
+                 WHERE maker_id = %d AND deleted_at IS NULL
+                 ORDER BY (legacy_cpt_id IS NULL) ASC, product_sku ASC",
+                $maker_id
+            ), ARRAY_A );
+            if ( ! is_array( $rows ) ) $rows = array();
+
+            // Enrich with maker name + source + is_blacklisted
+            $maker_name = get_the_title( $maker_id ) ?: '';
+            $blacklist_for_maker = b2f_autosync_blacklist_get( $maker_id );
+
+            $cpt_count = 0;
+            $auto_count = 0;
+            $blacklisted_count = 0;
+
+            foreach ( $rows as &$r ) {
+                $lid = intval( $r['legacy_cpt_id'] ?? 0 );
+                $is_auto = ( $lid <= 0 );
+                $r['source'] = $is_auto ? 'auto' : 'cpt';
+                $r['is_auto_synced'] = $is_auto;
+                $sku_u = strtoupper( (string) ( $r['product_sku'] ?? '' ) );
+                $r['is_blacklisted'] = in_array( $sku_u, $blacklist_for_maker, true );
+                $r['maker_name'] = $maker_name;
+                if ( $is_auto ) $auto_count++; else $cpt_count++;
+                if ( $r['is_blacklisted'] ) $blacklisted_count++;
+            }
+            unset( $r );
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => $rows,
+                'summary' => array(
+                    'total'       => count( $rows ),
+                    'cpt'         => $cpt_count,
+                    'auto'        => $auto_count,
+                    'blacklisted' => $blacklisted_count,
+                ),
+                'maker'   => array(
+                    'id'   => $maker_id,
+                    'name' => $maker_name,
+                ),
+                'blacklist_for_maker' => $blacklist_for_maker,
+                'generated_at' => current_time( 'mysql' ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /junction-bulk-delete
+    //   Body: { maker_id, skus[], add_to_blacklist (bool), only_auto_synced (bool), confirm }
+    //   - Soft-delete via UPDATE (status='discontinued', deleted_at=NOW())
+    //   - Server-side guard: only_auto_synced=true → SQL AND (legacy_cpt_id IS NULL OR legacy_cpt_id=0)
+    //   - If add_to_blacklist=true → add each SKU to b2f_autosync_blacklist[maker_id]
+    //   Rate limit: 5/min/user
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/junction-bulk-delete', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) {
+            // Rate limit: 5/min/user (tighter than default 20/hour)
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_audit_bulk_delete_' . $uid, 5, MINUTE_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                return new WP_Error( 'table_missing', 'junction table ยังไม่ถูกสร้าง', array( 'status' => 404 ) );
+            }
+
+            $maker_id  = intval( $req->get_param( 'maker_id' ) );
+            $skus_raw  = $req->get_param( 'skus' );
+            $confirm   = filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN );
+            $add_bl    = filter_var( $req->get_param( 'add_to_blacklist' ), FILTER_VALIDATE_BOOLEAN );
+            $only_auto = ( $req->get_param( 'only_auto_synced' ) === null ) ? true : filter_var( $req->get_param( 'only_auto_synced' ), FILTER_VALIDATE_BOOLEAN );
+
+            if ( ! $maker_id ) {
+                return new WP_Error( 'bad_maker', 'maker_id required', array( 'status' => 400 ) );
+            }
+            if ( ! $confirm ) {
+                return new WP_Error( 'not_confirmed', 'confirm=true required', array( 'status' => 400 ) );
+            }
+            if ( ! is_array( $skus_raw ) || empty( $skus_raw ) ) {
+                return new WP_Error( 'no_skus', 'skus array required', array( 'status' => 400 ) );
+            }
+            if ( count( $skus_raw ) > 200 ) {
+                return new WP_Error( 'too_many', 'max 200 SKUs per request', array( 'status' => 400 ) );
+            }
+
+            // Normalize SKUs: uppercase + dedup + drop empty
+            $skus = array();
+            foreach ( $skus_raw as $s ) {
+                $u = strtoupper( trim( (string) $s ) );
+                if ( $u !== '' && ! in_array( $u, $skus, true ) ) $skus[] = $u;
+            }
+            if ( empty( $skus ) ) {
+                return new WP_Error( 'no_skus', 'no valid SKUs after normalization', array( 'status' => 400 ) );
+            }
+
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+            $uid = get_current_user_id();
+            $now = current_time( 'mysql' );
+
+            // Count CPT rows that WOULD be targeted (for skipped_cpt_protected metric)
+            $placeholders = implode( ',', array_fill( 0, count( $skus ), '%s' ) );
+            $params_cpt = array_merge( array( $maker_id ), $skus );
+            $cpt_would_match = 0;
+            if ( $only_auto ) {
+                $sql_cpt_probe = "SELECT COUNT(*) FROM {$tbl}
+                                   WHERE maker_id = %d
+                                     AND UPPER(product_sku) IN ({$placeholders})
+                                     AND deleted_at IS NULL
+                                     AND legacy_cpt_id IS NOT NULL
+                                     AND legacy_cpt_id > 0";
+                $cpt_would_match = intval( $wpdb->get_var( $wpdb->prepare( $sql_cpt_probe, $params_cpt ) ) );
+            }
+
+            // Build UPDATE
+            $sql = "UPDATE {$tbl}
+                       SET status = 'discontinued',
+                           deleted_at = %s,
+                           updated_by = %d,
+                           updated_at = %s
+                     WHERE maker_id = %d
+                       AND UPPER(product_sku) IN ({$placeholders})
+                       AND deleted_at IS NULL";
+            if ( $only_auto ) {
+                $sql .= " AND (legacy_cpt_id IS NULL OR legacy_cpt_id = 0)";
+            }
+
+            $params = array_merge( array( $now, $uid, $now, $maker_id ), $skus );
+            $affected = $wpdb->query( $wpdb->prepare( $sql, $params ) );
+
+            if ( $affected === false ) {
+                return new WP_Error( 'db_error', 'UPDATE failed: ' . $wpdb->last_error, array( 'status' => 500 ) );
+            }
+
+            // Blacklist add (best-effort — don't fail bulk-delete if blacklist write errors)
+            $blacklisted = 0;
+            if ( $add_bl ) {
+                foreach ( $skus as $sku_u ) {
+                    if ( b2f_autosync_blacklist_add( $maker_id, $sku_u ) ) $blacklisted++;
+                }
+            }
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf(
+                    '[B2F Autosync Bulk-Delete] uid=%d maker=%d skus=%d deleted=%d blacklisted=%d cpt_protected=%d',
+                    $uid, $maker_id, count( $skus ), intval( $affected ), $blacklisted, $cpt_would_match
+                ) );
+            }
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'deleted'               => intval( $affected ),
+                    'blacklisted'           => $blacklisted,
+                    'skipped_cpt_protected' => $cpt_would_match,
+                    'errors'                => array(),
+                    'updated_blacklist_count' => count( b2f_autosync_blacklist_get( $maker_id ) ),
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /autosync-blacklist
+    //   Body: { maker_id, sku, action: 'add' | 'remove' }
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/autosync-blacklist', array(
+        array(
+            'methods'             => 'POST',
+            'permission_callback' => $perm_admin,
+            'callback'            => function ( $req ) use ( $rl ) {
+                $check = $rl( 'blacklist_toggle' );
+                if ( is_wp_error( $check ) ) return $check;
+
+                $maker_id = intval( $req->get_param( 'maker_id' ) );
+                $sku      = strtoupper( trim( (string) $req->get_param( 'sku' ) ) );
+                $action   = strtolower( (string) $req->get_param( 'action' ) );
+
+                if ( ! $maker_id || $sku === '' ) {
+                    return new WP_Error( 'bad_input', 'maker_id + sku required', array( 'status' => 400 ) );
+                }
+                if ( ! in_array( $action, array( 'add', 'remove' ), true ) ) {
+                    return new WP_Error( 'bad_action', "action must be 'add' or 'remove'", array( 'status' => 400 ) );
+                }
+
+                if ( $action === 'add' ) {
+                    b2f_autosync_blacklist_add( $maker_id, $sku );
+                } else {
+                    b2f_autosync_blacklist_remove( $maker_id, $sku );
+                }
+
+                $list = b2f_autosync_blacklist_get( $maker_id );
+                $all  = b2f_autosync_blacklist_get_all();
+                $total = 0;
+                foreach ( $all as $arr ) { $total += is_array( $arr ) ? count( $arr ) : 0; }
+
+                return rest_ensure_response( array(
+                    'success' => true,
+                    'data'    => array(
+                        'blacklist_for_maker'  => $list,
+                        'total_blacklist_count' => $total,
+                    ),
+                ) );
+            },
+        ),
+        array(
+            // GET /autosync-blacklist — full viewer
+            'methods'             => 'GET',
+            'permission_callback' => $perm_admin,
+            'callback'            => function () use ( $rl ) {
+                $check = $rl( 'blacklist_view' );
+                if ( is_wp_error( $check ) ) return $check;
+
+                $all = b2f_autosync_blacklist_get_all();
+                $total = 0;
+                foreach ( $all as $arr ) { $total += is_array( $arr ) ? count( $arr ) : 0; }
+
+                $encoded = wp_json_encode( $all );
+                $size = is_string( $encoded ) ? strlen( $encoded ) : 0;
+
+                // Enrich with maker names
+                $enriched = array();
+                foreach ( $all as $mid => $skus ) {
+                    $enriched[] = array(
+                        'maker_id'   => intval( $mid ),
+                        'maker_name' => get_the_title( intval( $mid ) ) ?: '',
+                        'skus'       => $skus,
+                        'count'      => count( $skus ),
+                    );
+                }
+
+                return rest_ensure_response( array(
+                    'success' => true,
+                    'data'    => array(
+                        'blacklist'     => $all,
+                        'enriched'      => $enriched,
+                        'total_entries' => $total,
+                        'size_bytes'    => $size,
+                        'cap_bytes'     => 102400,
+                    ),
+                ) );
+            },
+        ),
     ) );
 
 } );
