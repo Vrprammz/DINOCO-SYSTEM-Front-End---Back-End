@@ -41,15 +41,29 @@ TEMPLATE_DIR = os.path.join(BASE_DIR, 'templates')
 SOUND_DIR = os.path.join(BASE_DIR, 'sounds')
 STATE_FILE = '/tmp/dinoco-print-state.json'
 
-# V.41: drop RotatingFileHandler — systemd journal เก็บ stdout อยู่แล้ว
-# (ก่อนหน้านี้บาง setup systemd v256+ default sandbox ทำให้ EROFS เขียนไฟล์ไม่ได้)
-# Log ดูผ่าน: journalctl -u dinoco-print -f
+# V.42: Defensive logging — log to logs/ subdir (whitelisted in systemd ReadWritePaths)
+# ก่อนหน้านี้ RotatingFileHandler ชี้ที่ rpi-print-server/ (root) → systemd v256+ sandbox
+# ทำให้ EROFS เขียนไม่ได้. ตอนนี้ใช้ logs/ subdir + try/except fallback
+# Log ดูผ่าน: journalctl -u dinoco-print -f  หรือ  tail -f logs/print_client.log
+_log_handlers = [logging.StreamHandler()]
+try:
+    _logs_dir = os.path.join(BASE_DIR, 'logs')
+    os.makedirs(_logs_dir, exist_ok=True)
+    _log_handlers.append(
+        RotatingFileHandler(
+            os.path.join(_logs_dir, 'print_client.log'),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=2,
+        )
+    )
+except (OSError, PermissionError) as _e:
+    # systemd sandbox หรือ SD card RO → fall back stdout เท่านั้น (systemd journal เก็บให้)
+    print(f"[WARN] File logging disabled ({_e}) — using stdout only")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-    ]
+    handlers=_log_handlers,
 )
 logger = logging.getLogger('dinoco-print')
 

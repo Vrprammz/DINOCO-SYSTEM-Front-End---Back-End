@@ -1,7 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-# DINOCO B2B — Raspberry Pi Print Server Installer
+# DINOCO B2B — Raspberry Pi Print Server Installer (V.42)
 # Run: sudo bash install.sh
+#
+# V.42 hardening:
+#   - Ensures logs/ and tmp/ dirs exist (in systemd ReadWritePaths)
+#   - Migrates old print_client.log from root → logs/ subdir
+#   - Service files enforce explicit systemd sandbox (future-proof)
 # ═══════════════════════════════════════════════════════════════
 
 set -e
@@ -125,9 +130,22 @@ sed -i "s|/home/dinocoth/rpi-print-server|$INSTALL_DIR|g" "$INSTALL_DIR/dinoco-d
 cp "$INSTALL_DIR/dinoco-print.service" /etc/systemd/system/
 cp "$INSTALL_DIR/dinoco-dashboard.service" /etc/systemd/system/
 
-# Create required directories
+# V.42: Create required dirs (must match systemd ReadWritePaths)
 mkdir -p "$INSTALL_DIR/logs" "$INSTALL_DIR/tmp"
 chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/logs" "$INSTALL_DIR/tmp"
+chmod 775 "$INSTALL_DIR/logs" "$INSTALL_DIR/tmp"
+
+# V.42: Migrate legacy log file from root → logs/ subdir (one-time upgrade step)
+# เดิม print_client.py V.41 ก่อนหน้า log ไปที่ root ของ rpi-print-server/ ซึ่งไม่อยู่ใน
+# systemd ReadWritePaths → EROFS crash. V.42 ย้ายไป logs/print_client.log
+if [ -f "$INSTALL_DIR/print_client.log" ]; then
+    echo "📦 Migrating legacy print_client.log → logs/"
+    mv "$INSTALL_DIR/print_client.log" "$INSTALL_DIR/logs/print_client.log" 2>/dev/null || \
+        rm -f "$INSTALL_DIR/print_client.log"
+    # Remove backup/rotation files from root
+    rm -f "$INSTALL_DIR/print_client.log."* 2>/dev/null || true
+fi
+chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/logs"
 
 systemctl daemon-reload
 systemctl enable dinoco-print.service

@@ -94,3 +94,45 @@ System deps (installed by `install.sh`): CUPS, poppler-utils (pdftoppm), Thai fo
 - API key must not be committed to git (`config.json` is gitignored)
 - Dashboard commands use `subprocess.run()` with explicit arg lists to avoid shell injection
 - Dashboard auth is via shared API key header — no per-user auth
+
+## systemd Sandbox Policy (V.42 — IMPORTANT)
+
+Both services run under strict sandbox (immune to systemd default changes):
+
+```ini
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/<user>/rpi-print-server/logs /home/<user>/rpi-print-server/tmp /tmp
+```
+
+**Writable dirs (whitelist)**:
+
+- `logs/` — use for all log files (RotatingFileHandler goes here)
+- `tmp/` — temp/scratch (service-scoped)
+- `/tmp` — system temp (PrivateTmp mapped per-service)
+
+**Read-only**:
+
+- Everything else under `rpi-print-server/` root
+- All of `/home/<user>/` outside whitelist
+- rootfs (`/etc`, `/usr`, `/var`, etc. — except `/var/log` in dashboard service)
+
+### Adding file I/O in new code
+
+```python
+# ❌ Wrong — root of rpi-print-server (EROFS in service)
+open(os.path.join(BASE_DIR, 'output.txt'), 'w')
+
+# ✅ Right — logs/ or tmp/ subdir
+open(os.path.join(BASE_DIR, 'logs', 'output.log'), 'w')
+open(os.path.join(BASE_DIR, 'tmp', 'scratch.dat'), 'w')
+open('/tmp/shared-state.json', 'w')       # PrivateTmp-mapped
+```
+
+### Diagnosing "EROFS" crashes
+
+1. Manual run works but service fails → **systemd sandbox issue**
+2. Check actual sandbox: `systemctl show dinoco-print | grep -iE "protect|readonly|readwrite"` (note: `systemctl cat` truncates — use `show`)
+3. Fix: add path to `ReadWritePaths` in `.service` file OR move I/O to whitelist subdir
+
+**Background**: Incident 2026-04-16 — print daemon crashed on `print_client.log` (root of rpi-print-server/) after systemd v256+ started enforcing sandbox defaults. Fix: V.42 moved log to `logs/` + defensive try/except fallback to stdout.
