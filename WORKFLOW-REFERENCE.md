@@ -233,6 +233,17 @@ Manual Shipping:
     * Export CSV: ดาวน์โหลดรายการ manual shipments เป็น CSV
     * Multi-box fix: courier รองรับ all_pnos param (หลายกล่อง)
     * Month helper: `b2b_manual_shipment_months()` ดึงเดือนที่มีข้อมูล
+  - V.41.1/V.41.2 (2026-04-16): แยก **pickup (warehouse)** ออกจาก **label (registered)** — mirror B2B ticket flow
+    * Bug ก่อนหน้า: sender_key='dinoco' → hardcode srcDetailAddress='21/106 ลาดพร้าว' ส่ง Flash → คูเรียไปที่ 21/106 (registered) แทนที่จะเป็นโกดัง
+    * Fix ใน `b2b_rest_manual_flash_create`:
+      - `srcDetailAddress` ไป Flash API = `b2b_warehouse_address` option (รามอินทรา 14) → คูเรียมารับที่โกดัง
+      - Response `label_sender` = `b2b_registered_address` option (21/106 ลาดพร้าว) → RPi render บน label
+      - V.41.2: concat `reg_address + reg_district + reg_province + reg_postcode` → ใบปะหน้าครบทุกส่วน
+    * Snapshot `label_sender_*` + `sender_key` ใน shipment record → reprint ได้ idempotent (ถึง option จะเปลี่ยน)
+    * RPi `dashboard.py` V.41.0: `api_manual_flash_create` ใช้ `data.label_sender`; `api_manual_reprint_label` แก้ NameError `SENDERS` undefined → ใช้ `label_sender_*` จาก shipment
+    * Frontend `manual_ship.html` V.41: ลบ hardcoded src_*, โชว์ 2 บรรทัด (รับของที่ / ใบแปะหน้า)
+    * Config: ตั้ง `b2b_warehouse_address` + `b2b_registered_address` ใน B2B Admin → Print Settings
+    * Isolation: B2B ticket flow (`b2b_flash_create_order` Snippet 1 + `shipping_label.html`) ไม่ถูกแตะ
 
 End State: Order shipped → completed
 ```

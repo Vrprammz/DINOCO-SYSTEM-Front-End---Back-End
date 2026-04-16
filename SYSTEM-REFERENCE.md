@@ -1,6 +1,6 @@
 # DINOCO System Reference -- Complete Wiki
 
-> Last updated: 2026-04-09 | Version: V.41.0 | 40+ files, ~55,000 lines
+> Last updated: 2026-04-16 | Version: V.41.2 | 40+ files, ~55,000 lines
 > Consolidated from: SYSTEM-ARCHITECTURE.md, DATA-MODEL.md, SYSTEM-DIAGRAMS.md, USER-JOURNEYS.md
 
 ---
@@ -140,7 +140,7 @@
 |------|---------|-------|-------------|
 | Snippet 1: Core Utilities & LINE Flex Builders | V.33.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers + **V.33.5 Phase 0 Hotfix**: `b2b_check_order_oos()` hierarchy-aware (expand SET → real-time MIN - reserved + manual_hold from DB + flag `dinoco_oos_gate_hierarchy_compute`) — Ticket #6266 |
 | Snippet 2: LINE Webhook Gateway & Order Creator | V.34.0 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete, leaf-only stock deduct |
-| Snippet 3: LIFF E-Catalog REST API | V.41.0 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook + label/status/test/reprint) |
+| Snippet 3: LIFF E-Catalog REST API | V.41.2 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook + label/status/test/reprint) + V.41.1/V.41.2: manual-flash-create แยก pickup (warehouse) จาก label (registered), concat reg_address parts |
 | Snippet 4: LIFF E-Catalog Frontend | V.32.4 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) + **V.32.2-V.32.4 UX overhaul**: qty stepper SET Detail (1-999) + back button ← กลับ + cart bar 64px green CTA z-index 600 + main SET stepper + cart thumbnails + sub-item stepper toggle + 🗑️ red remove |
 | Snippet 5: Admin Dashboard | V.32.0 | 54 | `[b2b_admin_dashboard]` -- Admin order management + Flash, leaf-only cancel restore |
 | Snippet 6: Admin Discount Mapping | V.31.1 | 55 | `[b2b_discount_mapping]` -- SKU pricing + rank tiers |
