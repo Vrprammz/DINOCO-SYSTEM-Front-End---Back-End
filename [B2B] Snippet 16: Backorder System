@@ -1,0 +1,1934 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.1.1 — Phase A-D + security/DB review fixes (11 issues) ║
+ * ║  DB_ID: pending                                              ║
+ * ║  Description: Opaque Accept + Admin Split Backorder System   ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * Spec: FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md V.1.0
+ *
+ * Master feature flag: b2b_flag_bo_system (default false)
+ *   → ถ้า OFF: ระบบทำงานแบบเดิม (b2b_check_order_oos hotfix V.33.5)
+ *   → ถ้า ON: opaque accept + admin split BO flow
+ *
+ * Architecture:
+ *   1. Custom tables: wp_dinoco_order_attempt_log (audit) + wp_dinoco_bo_queue (BO tracking)
+ *   2. FSM extension: pending_stock_review + partial_fulfilled states (ดู Snippet 14 V.1.6)
+ *   3. Helpers: b2b_log_attempt() + b2b_compute_bo_summary() + b2b_register_bo_transition()
+ *   4. Flex builders: 4 templates (stock_review_admin, partial_fulfill_customer, bo_ready, bo_cancelled)
+ *   5. REST API: 8 endpoints under /b2b/v1/bo-*
+ *   6. Place-order gate: rate limits + hard caps + opaque accept (hook priority 1)
+ *   7. Cron jobs: 6 crons (restock_scan, eta_warn, pending_review_expire, enumeration_scan, attempt_log_cleanup, daily_counter_reset)
+ *   8. Admin UI: Backorders tab (hook into Snippet 5)
+ *   9. Customer UI: split view (hook into Snippet 11 + Snippet 4)
+ *
+ * Rollback: update_option('b2b_flag_bo_system', false) — instant, no re-deploy
+ *
+ * ต้องใช้: Snippet 1 V.33.5+ (hotfix), Snippet 14 V.1.6 (new states), Snippet 15 V.7.4+ (db helpers)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 1: FEATURE FLAG + DEFAULTS
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_bo_flag_enabled' ) ) {
+    /**
+     * Master feature flag helper
+     * + Option: beta distributors whitelist (array of distributor post IDs)
+     */
+    function b2b_bo_flag_enabled( $distributor_id = 0 ) {
+        if ( ! get_option( 'b2b_flag_bo_system', false ) ) return false;
+
+        $beta_list = get_option( 'b2b_flag_bo_beta_distributors', array() );
+        if ( ! is_array( $beta_list ) || empty( $beta_list ) ) {
+            // Empty beta list = flag applies globally
+            return true;
+        }
+
+        // Whitelist mode
+        return $distributor_id && in_array( (int) $distributor_id, array_map( 'intval', $beta_list ), true );
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_get_config' ) ) {
+    /**
+     * Central config getter — wp_options with defaults
+     */
+    function b2b_bo_get_config( $key, $default = null ) {
+        $defaults = array(
+            'b2b_bo_max_qty_per_item'        => 500,
+            'b2b_bo_max_items_per_order'     => 50,
+            'b2b_bo_rate_place_per_hour'     => 10,
+            'b2b_bo_rate_place_per_day'      => 50,
+            'b2b_bo_rate_cancel_per_hour'    => 2,
+            'b2b_bo_rate_cancel_per_day'     => 10,
+            'b2b_bo_daily_qty_per_sku'       => 2000,
+            'b2b_bo_tier_value_caps'         => array(
+                'standard' => 50000,
+                'silver'   => 100000,
+                'gold'     => 200000,
+                'platinum' => 500000,
+                'diamond'  => 0, // unlimited
+            ),
+            'b2b_bo_pending_review_timeout_hours' => 72,
+            'b2b_bo_split_undo_window_minutes'    => 10,
+            'b2b_bo_eta_default_days'             => 7,
+            'b2b_bo_eta_warn_days'                => 14,
+            'b2b_bo_anomaly_cancel_24h'           => 5,
+            'b2b_bo_anomaly_qty_cap_24h'          => 3,
+            // Security H2: unique-SKU/day cap (normal dealers <10 SKU/day)
+            'b2b_bo_daily_unique_sku_cap'         => 20,
+            // Security H4: cancel grace period (first 5 min unlimited)
+            'b2b_bo_cancel_grace_minutes'         => 5,
+        );
+
+        if ( $default === null && isset( $defaults[ $key ] ) ) {
+            $default = $defaults[ $key ];
+        }
+        return get_option( $key, $default );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 2: CUSTOM TABLES MIGRATION (dbDelta)
+// ═══════════════════════════════════════════════════════════════
+
+add_action( 'init', function() {
+    $db_version = '1.0';
+    $current    = get_option( '_b2b_bo_table_version', '0' );
+    if ( version_compare( $current, $db_version, '>=' ) ) return;
+
+    global $wpdb;
+    $charset = $wpdb->get_charset_collate();
+
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+    // Table 1: order_attempt_log — audit trail (DB review fixes: idx_created + idx_dist_action_time + user_agent 128 + total_value DECIMAL(14,2))
+    $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
+    $sql_log   = "CREATE TABLE {$log_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        distributor_id BIGINT UNSIGNED NOT NULL,
+        group_id VARCHAR(64) NOT NULL,
+        action VARCHAR(20) NOT NULL,
+        order_id BIGINT UNSIGNED DEFAULT NULL,
+        items_hash VARCHAR(64) DEFAULT NULL,
+        total_qty INT UNSIGNED DEFAULT NULL,
+        total_value DECIMAL(14,2) DEFAULT NULL,
+        result VARCHAR(20) NOT NULL,
+        rejection_code VARCHAR(32) DEFAULT NULL,
+        ip VARCHAR(45) DEFAULT NULL,
+        user_agent VARCHAR(128) DEFAULT NULL,
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY  (id),
+        KEY idx_created (created_at),
+        KEY idx_dist_action_time (distributor_id, action, created_at),
+        KEY idx_action_time (action, created_at),
+        KEY idx_order (order_id)
+    ) {$charset};";
+    dbDelta( $sql_log );
+
+    // Table 2: bo_queue — backorder tracking (DB review fixes: sku utf8mb4_bin + idx_status_resolved)
+    $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+    $sql_bo   = "CREATE TABLE {$bo_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        order_id BIGINT UNSIGNED NOT NULL,
+        item_index INT UNSIGNED NOT NULL,
+        sku VARCHAR(50) NOT NULL,
+        qty_bo INT UNSIGNED NOT NULL,
+        eta DATE DEFAULT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        notes TEXT DEFAULT NULL,
+        created_at DATETIME NOT NULL,
+        resolved_at DATETIME DEFAULT NULL,
+        PRIMARY KEY  (id),
+        UNIQUE KEY uniq_order_item (order_id, item_index),
+        KEY idx_sku_status (sku, status),
+        KEY idx_status_created (status, created_at),
+        KEY idx_status_resolved (status, resolved_at)
+    ) {$charset};";
+    dbDelta( $sql_bo );
+
+    // Post-dbDelta: enforce utf8mb4_bin on sku column (case-sensitive match dinoco_products pattern)
+    $wpdb->query( "ALTER TABLE {$bo_table} MODIFY sku VARCHAR(50) COLLATE utf8mb4_bin NOT NULL" );
+
+    update_option( '_b2b_bo_table_version', $db_version );
+
+    if ( function_exists( 'b2b_log' ) ) {
+        b2b_log( '[BO] Custom tables created: dinoco_order_attempt_log + dinoco_bo_queue (V.1.0)' );
+    }
+}, 5 ); // Priority 5 — ทำงานก่อน default CPT registration
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 3: HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_log_attempt' ) ) {
+    /**
+     * บันทึก order/cancel/split attempt ลง audit log
+     *
+     * @param int    $distributor_id
+     * @param string $action          'place_order' | 'cancel' | 'split' | 'undo_split' | 'bo_fulfill'
+     * @param int    $order_id        0 ถ้าไม่มี order
+     * @param string $items_hash      md5(json_encode(items)) ป้องกัน duplicate
+     * @param string $result          'accepted' | 'rejected' | 'rate_limit' | 'dup' | 'error'
+     * @param string $rejection_code  'QTY_OVER_LIMIT' | 'RATE_LIMIT' | ... null ถ้า accepted
+     * @param array  $extra           ['total_qty', 'total_value', 'group_id']
+     * @return int|false              insert id หรือ false
+     */
+    function b2b_log_attempt( $distributor_id, $action, $order_id = 0, $items_hash = '', $result = 'accepted', $rejection_code = null, $extra = array() ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_order_attempt_log';
+
+        $data = array(
+            'distributor_id' => (int) $distributor_id,
+            'group_id'       => isset( $extra['group_id'] ) ? substr( $extra['group_id'], 0, 64 ) : '',
+            'action'         => substr( $action, 0, 32 ),
+            'order_id'       => $order_id ? (int) $order_id : null,
+            'items_hash'     => $items_hash ? substr( $items_hash, 0, 64 ) : null,
+            'total_qty'      => isset( $extra['total_qty'] ) ? (int) $extra['total_qty'] : null,
+            'total_value'    => isset( $extra['total_value'] ) ? (float) $extra['total_value'] : null,
+            'result'         => substr( $result, 0, 16 ),
+            'rejection_code' => $rejection_code ? substr( $rejection_code, 0, 32 ) : null,
+            'ip'             => isset( $_SERVER['REMOTE_ADDR'] ) ? substr( sanitize_text_field( $_SERVER['REMOTE_ADDR'] ), 0, 45 ) : null,
+            'user_agent'     => isset( $_SERVER['HTTP_USER_AGENT'] ) ? substr( sanitize_text_field( $_SERVER['HTTP_USER_AGENT'] ), 0, 255 ) : null,
+            'created_at'     => current_time( 'mysql' ),
+        );
+
+        $inserted = $wpdb->insert( $table, $data );
+        return $inserted ? $wpdb->insert_id : false;
+    }
+}
+
+if ( ! function_exists( 'b2b_compute_bo_summary' ) ) {
+    /**
+     * คำนวณ summary ของ order ที่ split แล้ว
+     *
+     * @param int $order_id
+     * @return array {
+     *   fulfilled_total: int (qty ที่ admin confirm),
+     *   fulfilled_value: float (baht),
+     *   bo_total: int (qty ที่ค้าง BO),
+     *   bo_value: float,
+     *   bo_pending_count: int,
+     *   bo_ready_count: int,
+     *   bo_fulfilled_count: int,
+     *   bo_cancelled_count: int,
+     *   items: array (per-item breakdown from bo_queue)
+     * }
+     */
+    function b2b_compute_bo_summary( $order_id ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE order_id = %d ORDER BY item_index ASC",
+            $order_id
+        ), ARRAY_A );
+
+        $summary = array(
+            'fulfilled_total'    => 0,
+            'fulfilled_value'    => 0.0,
+            'bo_total'           => 0,
+            'bo_value'           => 0.0,
+            'bo_pending_count'   => 0,
+            'bo_ready_count'     => 0,
+            'bo_fulfilled_count' => 0,
+            'bo_cancelled_count' => 0,
+            'items'              => array(),
+        );
+
+        if ( empty( $rows ) ) return $summary;
+
+        foreach ( $rows as $r ) {
+            $summary['items'][] = $r;
+            $qty = (int) $r['qty_bo'];
+
+            switch ( $r['status'] ) {
+                case 'pending':
+                    $summary['bo_pending_count']++;
+                    $summary['bo_total'] += $qty;
+                    break;
+                case 'ready':
+                    $summary['bo_ready_count']++;
+                    $summary['bo_total'] += $qty;
+                    break;
+                case 'fulfilled':
+                    $summary['bo_fulfilled_count']++;
+                    $summary['fulfilled_total'] += $qty;
+                    break;
+                case 'cancelled':
+                    $summary['bo_cancelled_count']++;
+                    break;
+            }
+        }
+
+        // Compute values (need price lookup per SKU)
+        if ( function_exists( 'b2b_get_product_data' ) ) {
+            foreach ( $summary['items'] as $item ) {
+                $pd    = b2b_get_product_data( $item['sku'] );
+                $price = $pd ? (float) ( $pd['base_price'] ?? 0 ) : 0;
+                $qty   = (int) $item['qty_bo'];
+
+                if ( $item['status'] === 'fulfilled' ) {
+                    $summary['fulfilled_value'] += $price * $qty;
+                } elseif ( in_array( $item['status'], array( 'pending', 'ready' ), true ) ) {
+                    $summary['bo_value'] += $price * $qty;
+                }
+            }
+        }
+
+        return $summary;
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_get_queue_rows' ) ) {
+    /**
+     * Query bo_queue แบบ flexible + batch-safe
+     *
+     * @param array $args [
+     *   'status' => 'pending' | 'ready' | 'fulfilled' | 'cancelled' | 'all',
+     *   'sku'    => 'SKU_X' | null,
+     *   'age_gt_hours' => int | 0,
+     *   'order_id' => int | 0,
+     *   'limit'  => int (default 100),
+     *   'offset' => int,
+     * ]
+     * @return array
+     */
+    function b2b_bo_get_queue_rows( $args = array() ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $defaults = array(
+            'status'       => 'all',
+            'sku'          => null,
+            'age_gt_hours' => 0,
+            'order_id'     => 0,
+            'limit'        => 100,
+            'offset'       => 0,
+        );
+        $args = wp_parse_args( $args, $defaults );
+
+        $where = array( '1=1' );
+        $params = array();
+
+        if ( $args['status'] !== 'all' ) {
+            $where[] = 'status = %s';
+            $params[] = $args['status'];
+        }
+        if ( $args['sku'] ) {
+            $where[] = 'sku = %s';
+            $params[] = strtoupper( trim( $args['sku'] ) );
+        }
+        if ( $args['order_id'] ) {
+            $where[] = 'order_id = %d';
+            $params[] = (int) $args['order_id'];
+        }
+        if ( $args['age_gt_hours'] > 0 ) {
+            $where[] = 'created_at <= DATE_SUB(NOW(), INTERVAL %d HOUR)';
+            $params[] = (int) $args['age_gt_hours'];
+        }
+
+        $params[] = (int) $args['limit'];
+        $params[] = (int) $args['offset'];
+
+        $sql = "SELECT * FROM {$table}
+                WHERE " . implode( ' AND ', $where ) . "
+                ORDER BY created_at ASC
+                LIMIT %d OFFSET %d";
+
+        return $wpdb->get_results( $wpdb->prepare( $sql, ...$params ), ARRAY_A );
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_compute_age_bucket' ) ) {
+    /**
+     * Classify BO row age: fresh (0-3d) | warn (3-7d) | old (>7d) | ready
+     */
+    function b2b_bo_compute_age_bucket( $row ) {
+        if ( $row['status'] === 'ready' ) return 'ready';
+
+        $age_h = ( time() - strtotime( $row['created_at'] ) ) / 3600;
+        if ( $age_h <= 72 ) return 'fresh';
+        if ( $age_h <= 168 ) return 'warn';
+        return 'old';
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_increment_daily_counters' ) ) {
+    /**
+     * เพิ่ม daily counters หลัง accept order (qty + value per SKU + distributor)
+     * Transients expire 86400s natural — cron cleanup ไม่จำเป็น
+     */
+    function b2b_bo_increment_daily_counters( $distributor_id, $items, $total_value ) {
+        $daily_value_key = 'b2b_daily_value_' . $distributor_id;
+        $used = (float) ( get_transient( $daily_value_key ) ?: 0 );
+        set_transient( $daily_value_key, $used + (float) $total_value, 86400 );
+
+        foreach ( $items as $it ) {
+            $sku = strtoupper( $it['sku'] );
+            $qty_key = 'b2b_daily_qty_' . $distributor_id . '_' . $sku;
+            $qty_used = (int) ( get_transient( $qty_key ) ?: 0 );
+            set_transient( $qty_key, $qty_used + (int) $it['qty'], 86400 );
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_decrement_daily_counters' ) ) {
+    /**
+     * ลด counters ตอน reject/cancel (revert)
+     */
+    function b2b_bo_decrement_daily_counters( $distributor_id, $items, $total_value ) {
+        $daily_value_key = 'b2b_daily_value_' . $distributor_id;
+        $used = (float) ( get_transient( $daily_value_key ) ?: 0 );
+        set_transient( $daily_value_key, max( 0, $used - (float) $total_value ), 86400 );
+
+        foreach ( $items as $it ) {
+            $sku = strtoupper( $it['sku'] );
+            $qty_key = 'b2b_daily_qty_' . $distributor_id . '_' . $sku;
+            $qty_used = (int) ( get_transient( $qty_key ) ?: 0 );
+            set_transient( $qty_key, max( 0, $qty_used - (int) $it['qty'] ), 86400 );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 4: REST API — 8 ENDPOINTS (/b2b/v1/bo-*)
+// ═══════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function() {
+    // All endpoints require admin or session distributor — per-endpoint permission_callback
+
+    // 4.1 — Admin split order
+    register_rest_route( 'b2b/v1', '/bo-split', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_split',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // 4.2 — Admin confirm full (no split needed)
+    register_rest_route( 'b2b/v1', '/bo-confirm-full', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_confirm_full',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // 4.3 — Admin reject order
+    register_rest_route( 'b2b/v1', '/bo-reject', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_reject',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // 4.4 — Admin undo split (10-min window)
+    register_rest_route( 'b2b/v1', '/bo-undo-split', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_undo_split',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // 4.5 — Admin fulfill BO items
+    register_rest_route( 'b2b/v1', '/bo-fulfill', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_fulfill',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // 4.6 — Admin cancel single BO item (discontinued)
+    register_rest_route( 'b2b/v1', '/bo-cancel-item', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_cancel_item',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // 4.7 — GET BO queue listing
+    register_rest_route( 'b2b/v1', '/bo-queue', array(
+        'methods'             => 'GET',
+        'callback'            => 'b2b_rest_bo_queue',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+
+    // 4.8 — Manual restock scan trigger
+    register_rest_route( 'b2b/v1', '/bo-restock-scan', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2b_rest_bo_restock_scan',
+        'permission_callback' => 'b2b_bo_permission_admin',
+    ) );
+} );
+
+if ( ! function_exists( 'b2b_bo_permission_admin' ) ) {
+    /**
+     * Security H1 FIX: CSRF scheme
+     *   - WP admin → X-WP-Nonce header + wp_verify_nonce('wp_rest') (standard WP REST)
+     *   - Admin LINE LIFF → JWT session token via b2b_verify_session_token + is_admin flag
+     * GET requests skip nonce (read-only) — POST/PUT/DELETE enforce
+     */
+    function b2b_bo_permission_admin( $request ) {
+        $method = $request->get_method();
+
+        // WP admin path
+        if ( current_user_can( 'manage_options' ) ) {
+            // Enforce nonce for write methods
+            if ( in_array( $method, array( 'POST', 'PUT', 'DELETE' ), true ) ) {
+                $nonce = $request->get_header( 'X-WP-Nonce' );
+                if ( ! $nonce || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+                    return new WP_Error( 'rest_csrf_failed', 'Nonce required for write ops', array( 'status' => 403 ) );
+                }
+            }
+            return true;
+        }
+
+        // Admin LINE LIFF path (session JWT)
+        if ( function_exists( 'b2b_verify_session_token' ) ) {
+            $session = b2b_verify_session_token( $request );
+            if ( $session && ! empty( $session['is_admin'] ) ) {
+                // Session token itself = CSRF defense (attacker can't forge)
+                return true;
+            }
+        }
+
+        return new WP_Error( 'rest_forbidden', 'Admin only', array( 'status' => 403 ) );
+    }
+}
+
+/**
+ * 4.1 — POST /b2b/v1/bo-split
+ * Admin splits order into fulfilled + BO items
+ *
+ * Request: { order_id, splits: [{sku, qty_fulfill, qty_bo, eta_days, notes}] }
+ */
+if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
+    function b2b_rest_bo_split( $request ) {
+        $order_id = (int) $request->get_param( 'order_id' );
+        $splits   = $request->get_param( 'splits' );
+
+        if ( ! $order_id || ! is_array( $splits ) || empty( $splits ) ) {
+            return new WP_Error( 'invalid_input', 'order_id + splits required', array( 'status' => 400 ) );
+        }
+
+        // Validate order status
+        $status = get_field( 'order_status', $order_id );
+        if ( $status !== 'pending_stock_review' ) {
+            return new WP_Error( 'invalid_status', "Order ต้องอยู่ใน pending_stock_review (current={$status})", array( 'status' => 400 ) );
+        }
+
+        // Load existing order items (from meta or order_text)
+        $order_items_text = get_field( 'order_items', $order_id ) ?: '';
+        $parsed_items     = b2b_bo_parse_order_items( $order_items_text );
+
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $wpdb->query( 'START TRANSACTION' );
+
+        $fulfilled_total = 0;
+        $bo_total        = 0;
+        $bo_queue_ids    = array();
+        $dist_id         = (int) get_field( 'distributor_id', $order_id );
+
+        foreach ( $splits as $idx => $split ) {
+            $sku          = strtoupper( trim( $split['sku'] ?? '' ) );
+            $qty_fulfill  = max( 0, (int) ( $split['qty_fulfill'] ?? 0 ) );
+            $qty_bo       = max( 0, (int) ( $split['qty_bo'] ?? 0 ) );
+            $eta_days     = max( 0, (int) ( $split['eta_days'] ?? b2b_bo_get_config( 'b2b_bo_eta_default_days' ) ) );
+            $notes        = sanitize_text_field( $split['notes'] ?? '' );
+
+            // Validate invariant: qty_fulfill + qty_bo === original_qty
+            $original_qty = 0;
+            foreach ( $parsed_items as $pi ) {
+                if ( $pi['sku'] === $sku ) {
+                    $original_qty = $pi['qty'];
+                    break;
+                }
+            }
+            if ( $qty_fulfill + $qty_bo !== $original_qty ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'invariant_violation',
+                    "SKU {$sku}: qty_fulfill({$qty_fulfill}) + qty_bo({$qty_bo}) ต้อง = original({$original_qty})",
+                    array( 'status' => 400 )
+                );
+            }
+
+            // Subtract stock for fulfilled qty (leaf-aware)
+            if ( $qty_fulfill > 0 && function_exists( 'dinoco_stock_subtract' ) && function_exists( 'dinoco_get_leaf_skus' ) ) {
+                $leaves = dinoco_get_leaf_skus( $sku );
+                foreach ( $leaves as $leaf ) {
+                    $result = dinoco_stock_subtract( $leaf, $qty_fulfill, 'b2b_reserved', 'b2b_order', $order_id );
+                    if ( is_wp_error( $result ) ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'stock_error',
+                            "Stock subtract failed for {$leaf}: " . $result->get_error_message(),
+                            array( 'status' => 500 )
+                        );
+                    }
+                }
+            }
+
+            // Insert bo_queue row (if qty_bo > 0)
+            if ( $qty_bo > 0 ) {
+                $eta_date = $eta_days > 0 ? date( 'Y-m-d', strtotime( "+{$eta_days} days" ) ) : null;
+                $inserted = $wpdb->insert( $bo_table, array(
+                    'order_id'   => $order_id,
+                    'item_index' => $idx,
+                    'sku'        => $sku,
+                    'qty_bo'     => $qty_bo,
+                    'eta'        => $eta_date,
+                    'status'     => 'pending',
+                    'notes'      => $notes,
+                    'created_at' => current_time( 'mysql' ),
+                ) );
+                if ( ! $inserted ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'db_error', 'bo_queue insert failed', array( 'status' => 500 ) );
+                }
+                $bo_queue_ids[] = $wpdb->insert_id;
+            }
+
+            $fulfilled_total += $qty_fulfill;
+            $bo_total        += $qty_bo;
+        }
+
+        // Update debt (confirmed qty only)
+        $total_value = (float) get_field( 'total_amount', $order_id );
+        $confirmed_ratio = $fulfilled_total > 0 && ( $fulfilled_total + $bo_total ) > 0
+            ? $fulfilled_total / ( $fulfilled_total + $bo_total )
+            : 0;
+        $confirmed_value = $total_value * $confirmed_ratio;
+
+        if ( $dist_id && $confirmed_value > 0 && function_exists( 'b2b_debt_add' ) ) {
+            b2b_debt_add( $dist_id, $confirmed_value, 'b2b_bo_split_confirm', $order_id );
+        }
+
+        // FSM transition: pending_stock_review → partial_fulfilled
+        if ( function_exists( 'b2b_transition_order' ) ) {
+            $transition = b2b_transition_order( $order_id, 'partial_fulfilled', 'admin', 'admin split BO' );
+            if ( is_wp_error( $transition ) ) {
+                $wpdb->query( 'ROLLBACK' );
+                return $transition;
+            }
+        }
+
+        // Meta: undo window + audit
+        $now_ts       = time();
+        $undo_minutes = (int) b2b_bo_get_config( 'b2b_bo_split_undo_window_minutes' );
+        update_post_meta( $order_id, '_b2b_split_at', $now_ts );
+        update_post_meta( $order_id, '_b2b_split_by', get_current_user_id() );
+        update_post_meta( $order_id, '_b2b_split_undo_deadline', $now_ts + ( $undo_minutes * 60 ) );
+
+        $wpdb->query( 'COMMIT' );
+
+        // Log attempt
+        b2b_log_attempt( $dist_id, 'split', $order_id, '', 'accepted', null, array( 'total_qty' => $fulfilled_total + $bo_total ) );
+
+        // Send customer notification Flex
+        if ( function_exists( 'b2b_bo_notify_customer_split' ) ) {
+            b2b_bo_notify_customer_split( $order_id );
+        }
+
+        return rest_ensure_response( array(
+            'success'         => true,
+            'order_id'        => $order_id,
+            'status'          => 'partial_fulfilled',
+            'fulfilled_total' => $fulfilled_total,
+            'bo_total'        => $bo_total,
+            'bo_queue_ids'    => $bo_queue_ids,
+            'undo_deadline'   => date( 'Y-m-d H:i:s', $now_ts + ( $undo_minutes * 60 ) ),
+        ) );
+    }
+}
+
+/**
+ * 4.2 — POST /b2b/v1/bo-confirm-full
+ * Admin confirms full stock (no split)
+ */
+if ( ! function_exists( 'b2b_rest_bo_confirm_full' ) ) {
+    function b2b_rest_bo_confirm_full( $request ) {
+        $order_id = (int) $request->get_param( 'order_id' );
+        if ( ! $order_id ) return new WP_Error( 'invalid_input', 'order_id required', array( 'status' => 400 ) );
+
+        $status = get_field( 'order_status', $order_id );
+        if ( $status !== 'pending_stock_review' ) {
+            return new WP_Error( 'invalid_status', "Order ต้องอยู่ใน pending_stock_review", array( 'status' => 400 ) );
+        }
+
+        // FSM: pending_stock_review → awaiting_confirm (triggers existing stock subtract hook)
+        if ( function_exists( 'b2b_transition_order' ) ) {
+            $transition = b2b_transition_order( $order_id, 'awaiting_confirm', 'admin', 'admin confirm full stock' );
+            if ( is_wp_error( $transition ) ) return $transition;
+        }
+
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+        b2b_log_attempt( $dist_id, 'split', $order_id, '', 'accepted', 'CONFIRM_FULL' );
+
+        return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'awaiting_confirm' ) );
+    }
+}
+
+/**
+ * 4.3 — POST /b2b/v1/bo-reject
+ * Admin rejects entire order
+ */
+if ( ! function_exists( 'b2b_rest_bo_reject' ) ) {
+    function b2b_rest_bo_reject( $request ) {
+        $order_id = (int) $request->get_param( 'order_id' );
+        $reason   = sanitize_text_field( $request->get_param( 'reason' ) ?: '' );
+
+        if ( ! $order_id ) return new WP_Error( 'invalid_input', 'order_id required', array( 'status' => 400 ) );
+
+        $status = get_field( 'order_status', $order_id );
+        if ( $status !== 'pending_stock_review' ) {
+            return new WP_Error( 'invalid_status', 'Order must be in pending_stock_review', array( 'status' => 400 ) );
+        }
+
+        // Revert daily counters
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+        $order_items_text = get_field( 'order_items', $order_id ) ?: '';
+        $parsed_items     = b2b_bo_parse_order_items( $order_items_text );
+        $total_value      = (float) get_field( 'total_amount', $order_id );
+
+        if ( $dist_id ) {
+            b2b_bo_decrement_daily_counters( $dist_id, $parsed_items, $total_value );
+        }
+
+        // FSM: pending_stock_review → cancelled
+        if ( function_exists( 'b2b_transition_order' ) ) {
+            $transition = b2b_transition_order( $order_id, 'cancelled', 'admin', "admin reject: {$reason}" );
+            if ( is_wp_error( $transition ) ) return $transition;
+        }
+
+        update_post_meta( $order_id, '_b2b_reject_reason', $reason );
+        b2b_log_attempt( $dist_id, 'cancel', $order_id, '', 'rejected', 'ADMIN_REJECT' );
+
+        // Notify customer
+        if ( function_exists( 'b2b_bo_notify_customer_rejected' ) ) {
+            b2b_bo_notify_customer_rejected( $order_id, $reason );
+        }
+
+        return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'cancelled' ) );
+    }
+}
+
+/**
+ * 4.4 — POST /b2b/v1/bo-undo-split
+ */
+if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
+    function b2b_rest_bo_undo_split( $request ) {
+        $order_id = (int) $request->get_param( 'order_id' );
+        if ( ! $order_id ) return new WP_Error( 'invalid_input', 'order_id required', array( 'status' => 400 ) );
+
+        $status = get_field( 'order_status', $order_id );
+        if ( $status !== 'partial_fulfilled' ) {
+            return new WP_Error( 'invalid_status', 'Order must be in partial_fulfilled', array( 'status' => 400 ) );
+        }
+
+        $deadline = (int) get_post_meta( $order_id, '_b2b_split_undo_deadline', true );
+        if ( time() > $deadline ) {
+            return new WP_Error( 'undo_window_expired', 'Undo window expired (10 min)', array( 'status' => 400 ) );
+        }
+
+        // Security H5 FIX: 1 undo per order max (prevent oscillation attack)
+        $undo_count = (int) get_post_meta( $order_id, '_b2b_undo_count', true );
+        if ( $undo_count >= 1 ) {
+            return new WP_Error( 'undo_limit_reached', 'Undo แล้ว 1 ครั้ง — ต้องติดต่อ admin เพื่อ reset', array( 'status' => 400 ) );
+        }
+
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        // Check no BO already fulfilled
+        $fulfilled = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$bo_table} WHERE order_id = %d AND status = 'fulfilled'",
+            $order_id
+        ) );
+        if ( $fulfilled > 0 ) {
+            return new WP_Error( 'bo_already_fulfilled', 'Cannot undo — some BO items already fulfilled', array( 'status' => 400 ) );
+        }
+
+        $wpdb->query( 'START TRANSACTION' );
+
+        // Restore stock (add back fulfilled qty)
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$bo_table} WHERE order_id = %d",
+            $order_id
+        ), ARRAY_A );
+
+        // Reverse: any item that had qty_fulfill > 0 needs stock restoration
+        // For simplicity: restore by re-subtracting debt + deleting bo_queue rows
+        $order_items_text = get_field( 'order_items', $order_id ) ?: '';
+        $parsed_items     = b2b_bo_parse_order_items( $order_items_text );
+
+        // Restore stock for fulfilled portions (recompute from parsed - bo qty)
+        foreach ( $parsed_items as $pi ) {
+            $bo_qty_for_sku = 0;
+            foreach ( $rows as $r ) {
+                if ( strtoupper( $r['sku'] ) === strtoupper( $pi['sku'] ) ) {
+                    $bo_qty_for_sku += (int) $r['qty_bo'];
+                }
+            }
+            $fulfilled_qty = $pi['qty'] - $bo_qty_for_sku;
+            if ( $fulfilled_qty > 0 && function_exists( 'dinoco_stock_add' ) && function_exists( 'dinoco_get_leaf_skus' ) ) {
+                $leaves = dinoco_get_leaf_skus( $pi['sku'] );
+                foreach ( $leaves as $leaf ) {
+                    dinoco_stock_add( $leaf, $fulfilled_qty, 'b2b_undo_split', 'b2b_order', $order_id );
+                }
+            }
+        }
+
+        // Delete bo_queue rows
+        $wpdb->delete( $bo_table, array( 'order_id' => $order_id ) );
+
+        // Reverse debt
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+        if ( $dist_id && function_exists( 'b2b_debt_subtract' ) ) {
+            // Reverse previous b2b_debt_add — compute from meta (or just use recalculate)
+            if ( function_exists( 'b2b_recalculate_debt' ) ) {
+                b2b_recalculate_debt( $dist_id );
+            }
+        }
+
+        // FSM: partial_fulfilled → pending_stock_review
+        if ( function_exists( 'b2b_transition_order' ) ) {
+            $transition = b2b_transition_order( $order_id, 'pending_stock_review', 'admin', 'admin undo split' );
+            if ( is_wp_error( $transition ) ) {
+                $wpdb->query( 'ROLLBACK' );
+                return $transition;
+            }
+        }
+
+        // Clean meta + increment undo count (Security H5 FIX)
+        delete_post_meta( $order_id, '_b2b_split_at' );
+        delete_post_meta( $order_id, '_b2b_split_by' );
+        delete_post_meta( $order_id, '_b2b_split_undo_deadline' );
+        update_post_meta( $order_id, '_b2b_undo_count', $undo_count + 1 );
+
+        $wpdb->query( 'COMMIT' );
+
+        b2b_log_attempt( $dist_id, 'undo_split', $order_id, '', 'accepted' );
+
+        return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'pending_stock_review' ) );
+    }
+}
+
+/**
+ * 4.5 — POST /b2b/v1/bo-fulfill
+ * Ship BO items after restock
+ */
+if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
+    function b2b_rest_bo_fulfill( $request ) {
+        $order_id = (int) $request->get_param( 'order_id' );
+        $items    = $request->get_param( 'items' );
+
+        if ( ! $order_id || ! is_array( $items ) || empty( $items ) ) {
+            return new WP_Error( 'invalid_input', 'order_id + items required', array( 'status' => 400 ) );
+        }
+
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $wpdb->query( 'START TRANSACTION' );
+
+        $total_fulfilled_qty = 0;
+        $total_fulfilled_value = 0;
+
+        foreach ( $items as $item ) {
+            $bo_queue_id = (int) ( $item['bo_queue_id'] ?? 0 );
+            $qty         = max( 1, (int) ( $item['qty'] ?? 0 ) );
+            $sku         = strtoupper( trim( $item['sku'] ?? '' ) );
+
+            if ( ! $bo_queue_id ) continue;
+
+            // Lock BO row
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$bo_table} WHERE id = %d AND order_id = %d FOR UPDATE",
+                $bo_queue_id, $order_id
+            ) );
+            if ( ! $row || $row->status !== 'pending' && $row->status !== 'ready' ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'invalid_bo_row', "BO row {$bo_queue_id} ไม่สามารถ fulfill ได้", array( 'status' => 400 ) );
+            }
+            if ( $qty > (int) $row->qty_bo ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'qty_exceeded', "qty({$qty}) > qty_bo({$row->qty_bo})", array( 'status' => 400 ) );
+            }
+
+            // Subtract stock
+            if ( function_exists( 'dinoco_stock_subtract' ) && function_exists( 'dinoco_get_leaf_skus' ) ) {
+                $leaves = dinoco_get_leaf_skus( $row->sku );
+                foreach ( $leaves as $leaf ) {
+                    $result = dinoco_stock_subtract( $leaf, $qty, 'b2b_bo_fulfilled', 'b2b_order', $order_id );
+                    if ( is_wp_error( $result ) ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'stock_error', "Stock subtract failed: {$leaf}", array( 'status' => 500 ) );
+                    }
+                }
+            }
+
+            // Update bo_queue
+            $remaining = (int) $row->qty_bo - $qty;
+            if ( $remaining <= 0 ) {
+                $wpdb->update( $bo_table, array(
+                    'status'      => 'fulfilled',
+                    'resolved_at' => current_time( 'mysql' ),
+                ), array( 'id' => $bo_queue_id ) );
+            } else {
+                $wpdb->update( $bo_table, array(
+                    'qty_bo' => $remaining,
+                ), array( 'id' => $bo_queue_id ) );
+            }
+
+            // Add debt for BO qty
+            $dist_id = (int) get_field( 'distributor_id', $order_id );
+            $pd      = function_exists( 'b2b_get_product_data' ) ? b2b_get_product_data( $row->sku ) : null;
+            $price   = $pd ? (float) ( $pd['base_price'] ?? 0 ) : 0;
+            if ( $dist_id && $price > 0 && function_exists( 'b2b_debt_add' ) ) {
+                b2b_debt_add( $dist_id, $price * $qty, 'b2b_bo_fulfilled', $order_id );
+            }
+
+            $total_fulfilled_qty   += $qty;
+            $total_fulfilled_value += $price * $qty;
+        }
+
+        // Check if all BO items resolved → transition to awaiting_confirm
+        $pending_count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$bo_table} WHERE order_id = %d AND status IN ('pending', 'ready')",
+            $order_id
+        ) );
+
+        if ( $pending_count === 0 ) {
+            if ( function_exists( 'b2b_transition_order' ) ) {
+                b2b_transition_order( $order_id, 'awaiting_confirm', 'admin', 'all BO resolved' );
+            }
+        }
+
+        $wpdb->query( 'COMMIT' );
+
+        // Log + notify
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+        b2b_log_attempt( $dist_id, 'bo_fulfill', $order_id, '', 'accepted', null, array(
+            'total_qty' => $total_fulfilled_qty, 'total_value' => $total_fulfilled_value
+        ) );
+
+        if ( function_exists( 'b2b_bo_notify_customer_bo_ready' ) ) {
+            b2b_bo_notify_customer_bo_ready( $order_id, $items );
+        }
+
+        return rest_ensure_response( array(
+            'success'               => true,
+            'order_id'              => $order_id,
+            'total_fulfilled_qty'   => $total_fulfilled_qty,
+            'total_fulfilled_value' => $total_fulfilled_value,
+            'all_resolved'          => $pending_count === 0,
+        ) );
+    }
+}
+
+/**
+ * 4.6 — POST /b2b/v1/bo-cancel-item
+ * Cancel discontinued BO item
+ */
+if ( ! function_exists( 'b2b_rest_bo_cancel_item' ) ) {
+    function b2b_rest_bo_cancel_item( $request ) {
+        $order_id    = (int) $request->get_param( 'order_id' );
+        $bo_queue_id = (int) $request->get_param( 'bo_queue_id' );
+        $reason      = sanitize_text_field( $request->get_param( 'reason' ) ?: 'discontinued' );
+
+        if ( ! $order_id || ! $bo_queue_id ) {
+            return new WP_Error( 'invalid_input', 'order_id + bo_queue_id required', array( 'status' => 400 ) );
+        }
+
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $updated = $wpdb->update( $bo_table, array(
+            'status'      => 'cancelled',
+            'notes'       => 'CANCELLED: ' . $reason,
+            'resolved_at' => current_time( 'mysql' ),
+        ), array( 'id' => $bo_queue_id, 'order_id' => $order_id ) );
+
+        if ( ! $updated ) {
+            return new WP_Error( 'update_failed', 'Cancel update failed', array( 'status' => 500 ) );
+        }
+
+        // Check all BO resolved → transition
+        $pending_count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$bo_table} WHERE order_id = %d AND status IN ('pending', 'ready')",
+            $order_id
+        ) );
+        if ( $pending_count === 0 ) {
+            if ( function_exists( 'b2b_transition_order' ) ) {
+                b2b_transition_order( $order_id, 'awaiting_confirm', 'admin', 'all BO resolved (some cancelled)' );
+            }
+        }
+
+        // Notify customer
+        if ( function_exists( 'b2b_bo_notify_customer_bo_cancelled' ) ) {
+            $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$bo_table} WHERE id = %d", $bo_queue_id ), ARRAY_A );
+            if ( $row ) b2b_bo_notify_customer_bo_cancelled( $order_id, $row, $reason );
+        }
+
+        return rest_ensure_response( array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'status' => 'cancelled' ) );
+    }
+}
+
+/**
+ * 4.7 — GET /b2b/v1/bo-queue
+ */
+if ( ! function_exists( 'b2b_rest_bo_queue' ) ) {
+    function b2b_rest_bo_queue( $request ) {
+        $args = array(
+            'status'       => $request->get_param( 'status' ) ?: 'all',
+            'sku'          => $request->get_param( 'sku' ) ?: null,
+            'age_gt_hours' => (int) ( $request->get_param( 'age_gt_hours' ) ?: 0 ),
+            'order_id'     => (int) ( $request->get_param( 'order_id' ) ?: 0 ),
+            'limit'        => min( 500, (int) ( $request->get_param( 'limit' ) ?: 100 ) ),
+            'offset'       => max( 0, (int) ( $request->get_param( 'offset' ) ?: 0 ) ),
+        );
+
+        $rows = b2b_bo_get_queue_rows( $args );
+
+        // Enrich with age_bucket + distributor_name
+        $data = array();
+        foreach ( $rows as $r ) {
+            $r['age_bucket'] = b2b_bo_compute_age_bucket( $r );
+            $r['age_hours']  = ( time() - strtotime( $r['created_at'] ) ) / 3600;
+            $dist_id         = (int) get_field( 'distributor_id', $r['order_id'] );
+            $r['distributor_name'] = $dist_id ? get_the_title( $dist_id ) : '';
+            $r['ticket_no']        = get_the_title( $r['order_id'] );
+            $data[] = $r;
+        }
+
+        // Summary
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+        $summary  = array(
+            'total_pending'  => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$bo_table} WHERE status='pending'" ),
+            'total_ready'    => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$bo_table} WHERE status='ready'" ),
+            'oldest_age_hours' => (int) $wpdb->get_var( "SELECT COALESCE(TIMESTAMPDIFF(HOUR, MIN(created_at), NOW()), 0) FROM {$bo_table} WHERE status='pending'" ),
+        );
+        $summary['needs_attention'] = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$bo_table} WHERE status='pending' AND TIMESTAMPDIFF(HOUR, created_at, NOW()) > 168" );
+
+        return rest_ensure_response( array( 'success' => true, 'data' => $data, 'summary' => $summary ) );
+    }
+}
+
+/**
+ * 4.8 — POST /b2b/v1/bo-restock-scan
+ * Manual trigger — cron also calls this
+ */
+if ( ! function_exists( 'b2b_rest_bo_restock_scan' ) ) {
+    function b2b_rest_bo_restock_scan( $request ) {
+        $sku = $request->get_param( 'sku' );
+        $marked_ready = b2b_bo_restock_scan( $sku ?: null );
+
+        return rest_ensure_response( array(
+            'success'      => true,
+            'marked_ready' => $marked_ready,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_restock_scan' ) ) {
+    /**
+     * Core restock scan — promote pending rows to ready if stock available
+     *
+     * @param string|null $specific_sku  null = scan all
+     * @return array  list of bo_queue IDs ที่ mark ready
+     */
+    function b2b_bo_restock_scan( $specific_sku = null ) {
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        $where = array( "status = 'pending'" );
+        $params = array();
+        if ( $specific_sku ) {
+            $where[] = 'sku = %s';
+            $params[] = strtoupper( trim( $specific_sku ) );
+        }
+
+        $sql = "SELECT * FROM {$bo_table}
+                WHERE " . implode( ' AND ', $where ) . "
+                ORDER BY created_at ASC
+                LIMIT 500";
+        $rows = $params
+            ? $wpdb->get_results( $wpdb->prepare( $sql, ...$params ), ARRAY_A )
+            : $wpdb->get_results( $sql, ARRAY_A );
+
+        $marked = array();
+        foreach ( $rows as $r ) {
+            $available = 0;
+            if ( function_exists( 'dinoco_compute_hierarchy_stock' ) && function_exists( 'dinoco_get_reserved_qty' ) ) {
+                $computed  = (int) dinoco_compute_hierarchy_stock( $r['sku'] );
+                $reserved  = (int) dinoco_get_reserved_qty( $r['sku'] );
+                $available = max( 0, $computed - $reserved );
+            }
+
+            if ( $available >= (int) $r['qty_bo'] ) {
+                $wpdb->update( $bo_table, array( 'status' => 'ready' ), array( 'id' => $r['id'] ) );
+                $marked[] = (int) $r['id'];
+            }
+        }
+
+        if ( ! empty( $marked ) && function_exists( 'b2b_log' ) ) {
+            b2b_log( '[BO] Restock scan: ' . count( $marked ) . ' rows marked ready — ' . implode( ',', $marked ) );
+        }
+
+        // Telegram alert if any marked ready
+        if ( ! empty( $marked ) && function_exists( 'b2b_send_telegram_alert' ) ) {
+            b2b_send_telegram_alert( 'bo_restock_ready', 'มี BO พร้อม fulfill: ' . count( $marked ) . ' รายการ' );
+        }
+
+        return $marked;
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_parse_order_items' ) ) {
+    /**
+     * Parse order_items text "(SKU_X)xQTY (SKU_Y)xQTY" → [['sku'=>X, 'qty'=>N], ...]
+     */
+    function b2b_bo_parse_order_items( $order_items_text ) {
+        $items = array();
+        if ( preg_match_all( '/\(([A-Z0-9\-]+)\)\s*x(\d+)/i', $order_items_text, $matches, PREG_SET_ORDER ) ) {
+            foreach ( $matches as $m ) {
+                $items[] = array(
+                    'sku' => strtoupper( trim( $m[1] ) ),
+                    'qty' => (int) $m[2],
+                );
+            }
+        }
+        return $items;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 5: CRON JOBS (6 jobs)
+// ═══════════════════════════════════════════════════════════════
+
+// 5.1 — Custom intervals
+add_filter( 'cron_schedules', function( $schedules ) {
+    if ( ! isset( $schedules['every_15min_b2b_bo'] ) ) {
+        $schedules['every_15min_b2b_bo'] = array( 'interval' => 900, 'display' => 'Every 15 min (B2B BO)' );
+    }
+    return $schedules;
+} );
+
+// 5.2 — Schedule on init
+add_action( 'init', function() {
+    if ( ! wp_next_scheduled( 'b2b_bo_restock_scan_cron' ) ) {
+        wp_schedule_event( time() + 60, 'every_15min_b2b_bo', 'b2b_bo_restock_scan_cron' );
+    }
+    if ( ! wp_next_scheduled( 'b2b_bo_eta_warn_cron' ) ) {
+        wp_schedule_event( strtotime( 'tomorrow 09:00' ), 'daily', 'b2b_bo_eta_warn_cron' );
+    }
+    if ( ! wp_next_scheduled( 'b2b_bo_pending_review_expire_cron' ) ) {
+        wp_schedule_event( time() + 120, 'hourly', 'b2b_bo_pending_review_expire_cron' );
+    }
+    if ( ! wp_next_scheduled( 'b2b_bo_enumeration_scan_cron' ) ) {
+        wp_schedule_event( time() + 180, 'hourly', 'b2b_bo_enumeration_scan_cron' );
+    }
+    if ( ! wp_next_scheduled( 'b2b_bo_attempt_log_cleanup_cron' ) ) {
+        wp_schedule_event( strtotime( 'tomorrow 03:00' ), 'daily', 'b2b_bo_attempt_log_cleanup_cron' );
+    }
+} );
+
+// 5.3 — Cron handlers
+
+add_action( 'b2b_bo_restock_scan_cron', function() {
+    b2b_bo_restock_scan( null );
+} );
+
+add_action( 'b2b_bo_eta_warn_cron', function() {
+    global $wpdb;
+    $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+    $warn_days = (int) b2b_bo_get_config( 'b2b_bo_eta_warn_days' );
+
+    $overdue = $wpdb->get_results( $wpdb->prepare(
+        "SELECT * FROM {$bo_table}
+         WHERE status IN ('pending', 'ready')
+         AND eta IS NOT NULL
+         AND eta < DATE_ADD(CURDATE(), INTERVAL %d DAY)",
+        $warn_days
+    ), ARRAY_A );
+
+    if ( ! empty( $overdue ) && function_exists( 'b2b_send_telegram_alert' ) ) {
+        b2b_send_telegram_alert( 'bo_eta_warn', 'BO ใกล้เกิน ETA: ' . count( $overdue ) . ' รายการ' );
+    }
+} );
+
+add_action( 'b2b_bo_pending_review_expire_cron', function() {
+    $timeout_hours = (int) b2b_bo_get_config( 'b2b_bo_pending_review_timeout_hours' );
+
+    $orders = get_posts( array(
+        'post_type'      => 'b2b_order',
+        'posts_per_page' => 50,
+        'meta_query'     => array(
+            array( 'key' => 'order_status', 'value' => 'pending_stock_review' ),
+            array( 'key' => '_b2b_opaque_accept_at', 'compare' => 'EXISTS' ),
+        ),
+        'fields' => 'ids',
+    ) );
+
+    foreach ( $orders as $order_id ) {
+        $accepted_at = get_post_meta( $order_id, '_b2b_opaque_accept_at', true );
+        if ( ! $accepted_at ) continue;
+        $age_h = ( time() - strtotime( $accepted_at ) ) / 3600;
+        if ( $age_h > $timeout_hours ) {
+            if ( function_exists( 'b2b_transition_order' ) ) {
+                b2b_transition_order( $order_id, 'cancelled', 'system', 'pending_stock_review timeout' );
+            }
+            $dist_id = (int) get_field( 'distributor_id', $order_id );
+            b2b_log_attempt( $dist_id, 'cancel', $order_id, '', 'error', 'PENDING_REVIEW_EXPIRED' );
+        }
+    }
+} );
+
+add_action( 'b2b_bo_enumeration_scan_cron', function() {
+    global $wpdb;
+    $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
+
+    // Find distributors with >5 cancels in 24h
+    $cancel_threshold = (int) b2b_bo_get_config( 'b2b_bo_anomaly_cancel_24h' );
+    $suspicious = $wpdb->get_results( $wpdb->prepare(
+        "SELECT distributor_id, COUNT(*) AS cnt
+         FROM {$log_table}
+         WHERE action = 'cancel' AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+         GROUP BY distributor_id
+         HAVING cnt >= %d",
+        $cancel_threshold
+    ) );
+
+    foreach ( $suspicious as $s ) {
+        update_post_meta( $s->distributor_id, '_b2b_enumeration_flags', 2 ); // cancel_abuse bit
+        if ( function_exists( 'b2b_send_telegram_alert' ) ) {
+            b2b_send_telegram_alert( 'enumeration_attempt', "Distributor #{$s->distributor_id}: {$s->cnt} cancels ใน 24h" );
+        }
+    }
+
+    // Find distributors with >3 qty=cap_max orders in 24h
+    $qty_threshold = (int) b2b_bo_get_config( 'b2b_bo_anomaly_qty_cap_24h' );
+    $max_qty       = (int) b2b_bo_get_config( 'b2b_bo_max_qty_per_item' );
+    $qty_suspicious = $wpdb->get_results( $wpdb->prepare(
+        "SELECT distributor_id, COUNT(*) AS cnt
+         FROM {$log_table}
+         WHERE action = 'place_order'
+         AND rejection_code = 'QTY_OVER_LIMIT'
+         AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+         GROUP BY distributor_id
+         HAVING cnt >= %d",
+        $qty_threshold
+    ) );
+
+    foreach ( $qty_suspicious as $s ) {
+        update_post_meta( $s->distributor_id, '_b2b_enumeration_flags', 4 ); // qty_cap_hit bit
+        if ( function_exists( 'b2b_send_telegram_alert' ) ) {
+            b2b_send_telegram_alert( 'enumeration_attempt', "Distributor #{$s->distributor_id}: {$s->cnt} qty-cap hits ใน 24h" );
+        }
+    }
+} );
+
+add_action( 'b2b_bo_attempt_log_cleanup_cron', function() {
+    global $wpdb;
+    $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
+
+    // DB review H1 FIX: chunked delete (prevent long-running single DELETE)
+    $total_deleted = 0;
+    $max_iterations = 20; // max 20k rows/run (safe limit)
+    do {
+        $affected = $wpdb->query(
+            "DELETE FROM {$log_table}
+             WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)
+             LIMIT 1000"
+        );
+        $total_deleted += (int) $affected;
+        $max_iterations--;
+        if ( $affected >= 1000 && $max_iterations > 0 ) {
+            usleep( 50000 ); // 50ms gap between chunks
+        }
+    } while ( $affected >= 1000 && $max_iterations > 0 );
+
+    if ( $total_deleted > 0 && function_exists( 'b2b_log' ) ) {
+        b2b_log( "[BO] attempt_log cleanup: {$total_deleted} rows deleted (>90d, chunked)" );
+    }
+} );
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 6: FLEX BUILDERS (4 templates)
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_build_flex_stock_review_admin' ) ) {
+    /**
+     * Admin Flex — stock review with delta (admin-only visibility)
+     */
+    function b2b_build_flex_stock_review_admin( $order_id ) {
+        $ticket_no    = get_the_title( $order_id );
+        $dist_id      = (int) get_field( 'distributor_id', $order_id );
+        $dist_name    = $dist_id ? get_the_title( $dist_id ) : 'ไม่ระบุ';
+        $order_text   = get_field( 'order_items', $order_id ) ?: '';
+        $parsed_items = b2b_bo_parse_order_items( $order_text );
+        $total_value  = (float) get_field( 'total_amount', $order_id );
+
+        // Per-item delta
+        $body_contents = array();
+        $insufficient  = 0;
+
+        // Security C1 FIX (security-pentester review): LINE group message มี insider risk
+        // → ไม่แสดง exact qty ใน Flex, ใช้ bucket indicator แทน
+        // → Exact qty เฉพาะใน Admin Dashboard UI (manage_options gate)
+        foreach ( $parsed_items as $pi ) {
+            $sku = $pi['sku'];
+            $qty = $pi['qty'];
+
+            $available = 0;
+            if ( function_exists( 'dinoco_compute_hierarchy_stock' ) && function_exists( 'dinoco_get_reserved_qty' ) ) {
+                $computed  = (int) dinoco_compute_hierarchy_stock( $sku );
+                $reserved  = (int) dinoco_get_reserved_qty( $sku );
+                $available = max( 0, $computed - $reserved );
+            }
+
+            $is_sufficient = $available >= $qty;
+            if ( ! $is_sufficient ) $insufficient++;
+
+            // Bucket indicator (no exact qty leak)
+            $bucket = $is_sufficient ? '✓ พอ' : ( $available === 0 ? '⚠️ หมด' : '⚠️ ไม่พอ (ต้อง split)' );
+
+            $body_contents[] = array(
+                'type'    => 'text',
+                'text'    => "SKU {$sku}",
+                'weight'  => 'bold',
+                'size'    => 'sm',
+                'margin'  => 'md',
+            );
+            $body_contents[] = array(
+                'type'   => 'text',
+                'text'   => "สั่ง {$qty} · {$bucket}",
+                'size'   => 'xs',
+                'color'  => $is_sufficient ? '#10b981' : '#dc2626',
+                'wrap'   => true,
+            );
+        }
+
+        $body_contents[] = array( 'type' => 'separator', 'margin' => 'lg' );
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => 'ยอดรวม: ฿' . number_format( $total_value, 2 ),
+            'weight' => 'bold',
+            'size' => 'sm',
+            'margin' => 'md',
+        );
+        if ( $insufficient > 0 ) {
+            $body_contents[] = array(
+                'type' => 'text',
+                'text' => "สต็อกไม่พอ: {$insufficient} รายการ",
+                'size' => 'xs',
+                'color' => '#dc2626',
+            );
+        }
+
+        // Action buttons
+        $footer_buttons = array();
+
+        $footer_buttons[] = array(
+            'type'   => 'button',
+            'style'  => $insufficient > 0 ? 'secondary' : 'primary',
+            'color'  => $insufficient > 0 ? null : '#10b981',
+            'action' => array(
+                'type'        => 'postback',
+                'label'       => '✅ ยืนยันเต็ม',
+                'data'        => "action=bo_confirm_full&order_id={$order_id}",
+                'displayText' => 'ยืนยันเต็ม',
+            ),
+        );
+
+        if ( $insufficient > 0 ) {
+            $footer_buttons[] = array(
+                'type'   => 'button',
+                'style'  => 'primary',
+                'color'  => '#f59e0b',
+                'action' => array(
+                    'type'  => 'uri',
+                    'label' => '⚙️ Split BO',
+                    'uri'   => function_exists( 'b2b_liff_url' )
+                        ? b2b_liff_url( 'admin-bo-split', array( 'order_id' => $order_id ) )
+                        : home_url( "/admin-bo-split/?order_id={$order_id}" ),
+                ),
+            );
+        }
+
+        $footer_buttons[] = array(
+            'type'   => 'button',
+            'style'  => 'secondary',
+            'action' => array(
+                'type'        => 'postback',
+                'label'       => '❌ ปฏิเสธ',
+                'data'        => "action=bo_reject&order_id={$order_id}",
+                'displayText' => 'ปฏิเสธ',
+            ),
+        );
+
+        return array(
+            'type'    => 'flex',
+            'altText' => "🔔 ตรวจสอบสต็อก #{$ticket_no}",
+            'contents' => array(
+                'type' => 'bubble',
+                'header' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'backgroundColor' => '#1e3a8a',
+                    'contents' => array(
+                        array( 'type' => 'text', 'text' => "🔔 ตรวจสอบสต็อก #{$ticket_no}", 'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md' ),
+                        array( 'type' => 'text', 'text' => "ร้าน: " . esc_html( $dist_name ), 'color' => '#e0e7ff', 'size' => 'xs', 'margin' => 'xs' ),
+                    ),
+                ),
+                'body' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'contents' => $body_contents,
+                ),
+                'footer' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'spacing' => 'sm',
+                    'contents' => $footer_buttons,
+                ),
+            ),
+        );
+    }
+}
+
+if ( ! function_exists( 'b2b_build_flex_partial_fulfill_customer' ) ) {
+    /**
+     * Customer Flex — combined split notification (no stock numbers)
+     */
+    function b2b_build_flex_partial_fulfill_customer( $order_id ) {
+        $ticket_no = get_the_title( $order_id );
+        $summary   = b2b_compute_bo_summary( $order_id );
+
+        $body_contents = array();
+
+        // Section 1: ส่งทันที
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => '✅ จัดส่งทันที',
+            'weight' => 'bold',
+            'size' => 'md',
+            'color' => '#10b981',
+        );
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => $summary['fulfilled_total'] . ' ชิ้น · ฿' . number_format( $summary['fulfilled_value'], 2 ),
+            'size' => 'sm',
+            'margin' => 'xs',
+        );
+
+        $body_contents[] = array( 'type' => 'separator', 'margin' => 'md' );
+
+        // Section 2: BO
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => '⏳ รอสต็อก',
+            'weight' => 'bold',
+            'size' => 'md',
+            'color' => '#f59e0b',
+            'margin' => 'md',
+        );
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => $summary['bo_total'] . ' ชิ้น',
+            'size' => 'sm',
+            'margin' => 'xs',
+        );
+
+        // ETA info (earliest)
+        $earliest_eta = '';
+        foreach ( $summary['items'] as $item ) {
+            if ( $item['status'] === 'pending' && $item['eta'] ) {
+                if ( ! $earliest_eta || $item['eta'] < $earliest_eta ) {
+                    $earliest_eta = $item['eta'];
+                }
+            }
+        }
+        if ( $earliest_eta ) {
+            $body_contents[] = array(
+                'type' => 'text',
+                'text' => "คาดว่ากลับมา: {$earliest_eta}",
+                'size' => 'xs',
+                'color' => '#6b7280',
+                'margin' => 'xs',
+            );
+        }
+
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => '(เรียกเก็บเมื่อของพร้อมจัดส่ง)',
+            'size' => 'xxs',
+            'color' => '#9ca3af',
+            'margin' => 'xs',
+        );
+
+        $body_contents[] = array( 'type' => 'separator', 'margin' => 'md' );
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => 'ยอดชำระครั้งแรก: ฿' . number_format( $summary['fulfilled_value'], 2 ),
+            'weight' => 'bold',
+            'size' => 'sm',
+            'margin' => 'md',
+        );
+        $body_contents[] = array(
+            'type' => 'text',
+            'text' => 'BO รอชำระภายหลัง: ฿' . number_format( $summary['bo_value'], 2 ),
+            'size' => 'xs',
+            'color' => '#6b7280',
+        );
+
+        return array(
+            'type'    => 'flex',
+            'altText' => "📦 ออเดอร์ #{$ticket_no} ยืนยันแล้ว — จัดส่งบางส่วน",
+            'contents' => array(
+                'type' => 'bubble',
+                'header' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'backgroundColor' => '#1e3a8a',
+                    'contents' => array(
+                        array( 'type' => 'text', 'text' => "📦 ออเดอร์ #{$ticket_no}", 'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md' ),
+                        array( 'type' => 'text', 'text' => 'ยืนยันแล้ว — จัดส่งบางส่วน', 'color' => '#e0e7ff', 'size' => 'xs', 'margin' => 'xs' ),
+                    ),
+                ),
+                'body' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'contents' => $body_contents,
+                ),
+            ),
+        );
+    }
+}
+
+if ( ! function_exists( 'b2b_build_flex_bo_ready_customer' ) ) {
+    function b2b_build_flex_bo_ready_customer( $order_id, $items = array() ) {
+        $ticket_no = get_the_title( $order_id );
+
+        $items_text = array();
+        $total_qty  = 0;
+        $total_val  = 0;
+
+        foreach ( $items as $item ) {
+            $sku = strtoupper( $item['sku'] ?? '' );
+            $qty = (int) ( $item['qty'] ?? 0 );
+            $pd  = function_exists( 'b2b_get_product_data' ) ? b2b_get_product_data( $sku ) : null;
+            $name = $pd ? $pd['name'] : $sku;
+            $price = $pd ? (float) ( $pd['base_price'] ?? 0 ) : 0;
+
+            $items_text[] = array(
+                'type' => 'text',
+                'text' => "• {$name} × {$qty} ชิ้น",
+                'size' => 'sm',
+                'wrap' => true,
+            );
+            $total_qty += $qty;
+            $total_val += $price * $qty;
+        }
+
+        return array(
+            'type'    => 'flex',
+            'altText' => "📦 BO พร้อมจัดส่ง #{$ticket_no}",
+            'contents' => array(
+                'type' => 'bubble',
+                'header' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'backgroundColor' => '#10b981',
+                    'contents' => array(
+                        array( 'type' => 'text', 'text' => '📦 BO พร้อมจัดส่งแล้ว', 'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md' ),
+                        array( 'type' => 'text', 'text' => "ออเดอร์ #{$ticket_no}", 'color' => '#d1fae5', 'size' => 'xs', 'margin' => 'xs' ),
+                    ),
+                ),
+                'body' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'contents' => array_merge(
+                        $items_text,
+                        array(
+                            array( 'type' => 'separator', 'margin' => 'md' ),
+                            array(
+                                'type' => 'text',
+                                'text' => 'ยอดชำระเพิ่ม: ฿' . number_format( $total_val, 2 ),
+                                'weight' => 'bold',
+                                'size' => 'sm',
+                                'margin' => 'md',
+                            ),
+                        )
+                    ),
+                ),
+            ),
+        );
+    }
+}
+
+if ( ! function_exists( 'b2b_build_flex_bo_cancelled_customer' ) ) {
+    function b2b_build_flex_bo_cancelled_customer( $order_id, $item, $reason = '' ) {
+        $ticket_no = get_the_title( $order_id );
+        $sku  = strtoupper( $item['sku'] ?? '' );
+        $pd   = function_exists( 'b2b_get_product_data' ) ? b2b_get_product_data( $sku ) : null;
+        $name = $pd ? $pd['name'] : $sku;
+
+        return array(
+            'type'    => 'flex',
+            'altText' => "⚠️ BO ยกเลิก #{$ticket_no}",
+            'contents' => array(
+                'type' => 'bubble',
+                'header' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'backgroundColor' => '#dc2626',
+                    'contents' => array(
+                        array( 'type' => 'text', 'text' => '⚠️ รายการ BO ถูกยกเลิก', 'color' => '#ffffff', 'weight' => 'bold', 'size' => 'md' ),
+                        array( 'type' => 'text', 'text' => "ออเดอร์ #{$ticket_no}", 'color' => '#fecaca', 'size' => 'xs', 'margin' => 'xs' ),
+                    ),
+                ),
+                'body' => array(
+                    'type' => 'box',
+                    'layout' => 'vertical',
+                    'contents' => array(
+                        array( 'type' => 'text', 'text' => "• {$name}", 'size' => 'sm', 'wrap' => true ),
+                        array( 'type' => 'text', 'text' => 'ขออภัยครับ รายการนี้ไม่สามารถจัดส่งได้', 'size' => 'xs', 'color' => '#6b7280', 'wrap' => true, 'margin' => 'md' ),
+                        array( 'type' => 'text', 'text' => $reason ? "เหตุผล: {$reason}" : '', 'size' => 'xs', 'color' => '#6b7280', 'wrap' => true, 'margin' => 'xs' ),
+                    ),
+                ),
+            ),
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 7: CUSTOMER NOTIFICATION HELPERS (push Flex to group)
+// ═══════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_bo_notify_customer_split' ) ) {
+    function b2b_bo_notify_customer_split( $order_id ) {
+        $dist_id  = (int) get_field( 'distributor_id', $order_id );
+        $group_id = $dist_id ? get_field( 'line_group_id', $dist_id ) : '';
+        if ( ! $group_id ) return;
+
+        $flex = b2b_build_flex_partial_fulfill_customer( $order_id );
+        if ( function_exists( 'b2b_push_guaranteed' ) ) {
+            b2b_push_guaranteed( $group_id, array( $flex ), $order_id, 'bo_partial' );
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_notify_customer_bo_ready' ) ) {
+    function b2b_bo_notify_customer_bo_ready( $order_id, $items ) {
+        $dist_id  = (int) get_field( 'distributor_id', $order_id );
+        $group_id = $dist_id ? get_field( 'line_group_id', $dist_id ) : '';
+        if ( ! $group_id ) return;
+
+        $flex = b2b_build_flex_bo_ready_customer( $order_id, $items );
+        if ( function_exists( 'b2b_push_guaranteed' ) ) {
+            b2b_push_guaranteed( $group_id, array( $flex ), $order_id, 'bo_ready' );
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_notify_customer_bo_cancelled' ) ) {
+    function b2b_bo_notify_customer_bo_cancelled( $order_id, $item, $reason ) {
+        $dist_id  = (int) get_field( 'distributor_id', $order_id );
+        $group_id = $dist_id ? get_field( 'line_group_id', $dist_id ) : '';
+        if ( ! $group_id ) return;
+
+        $flex = b2b_build_flex_bo_cancelled_customer( $order_id, $item, $reason );
+        if ( function_exists( 'b2b_push_guaranteed' ) ) {
+            b2b_push_guaranteed( $group_id, array( $flex ), $order_id, 'bo_cancelled' );
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_notify_customer_rejected' ) ) {
+    function b2b_bo_notify_customer_rejected( $order_id, $reason ) {
+        $dist_id  = (int) get_field( 'distributor_id', $order_id );
+        $group_id = $dist_id ? get_field( 'line_group_id', $dist_id ) : '';
+        if ( ! $group_id ) return;
+
+        $text = "❌ ออเดอร์ถูกปฏิเสธ\nTicket #" . get_the_title( $order_id ) . "\n" . ( $reason ? "เหตุผล: {$reason}" : '' );
+        if ( function_exists( 'b2b_line_push_text' ) ) {
+            b2b_line_push_text( $group_id, $text );
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_notify_admin_stock_review' ) ) {
+    /**
+     * Push stock review Flex to admin group (called after opaque accept)
+     */
+    function b2b_bo_notify_admin_stock_review( $order_id ) {
+        $flex = b2b_build_flex_stock_review_admin( $order_id );
+        if ( function_exists( 'b2b_push_raw_to_admin' ) ) {
+            b2b_push_raw_to_admin( array( $flex ) );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 8: POSTBACK HANDLERS (hook into Snippet 2)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Hook ให้ Snippet 2 route postback actions เข้า BO handlers
+ * Pattern: action=bo_confirm_full | bo_reject
+ */
+add_filter( 'b2b_webhook_postback_action', function( $handled, $action, $params, $user_id, $reply_token ) {
+    if ( $handled ) return $handled;
+
+    if ( $action === 'bo_confirm_full' ) {
+        $order_id = (int) ( $params['order_id'] ?? 0 );
+        if ( $order_id ) {
+            // Simulate REST call internally
+            $req = new WP_REST_Request();
+            $req->set_param( 'order_id', $order_id );
+            $result = b2b_rest_bo_confirm_full( $req );
+            if ( function_exists( 'b2b_line_reply' ) && ! is_wp_error( $result ) ) {
+                b2b_line_reply( $reply_token, "✅ ยืนยันเต็มแล้ว — ลูกค้าได้รับบิลยืนยัน" );
+            }
+        }
+        return true;
+    }
+
+    if ( $action === 'bo_reject' ) {
+        $order_id = (int) ( $params['order_id'] ?? 0 );
+        if ( $order_id ) {
+            $req = new WP_REST_Request();
+            $req->set_param( 'order_id', $order_id );
+            $req->set_param( 'reason', 'admin manual reject' );
+            $result = b2b_rest_bo_reject( $req );
+            if ( function_exists( 'b2b_line_reply' ) && ! is_wp_error( $result ) ) {
+                b2b_line_reply( $reply_token, "❌ ปฏิเสธแล้ว — ลูกค้าได้รับแจ้งเตือน" );
+            }
+        }
+        return true;
+    }
+
+    return false;
+}, 10, 5 );
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 9: PLACE-ORDER HARD CAPS (hook into Snippet 3 b2b_rest_place_order)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Hook ก่อน place-order process — validate caps + rate limits
+ * ใช้ filter hook 'b2b_place_order_pre_validate' (ถ้า Snippet 3 รองรับ)
+ * หรือ direct wrap ผ่าน add_action('rest_pre_dispatch', ...)
+ */
+add_filter( 'rest_pre_dispatch', function( $result, $server, $request ) {
+    $route = $request->get_route();
+    if ( $route !== '/b2b/v1/place-order' ) return $result;
+
+    $method = $request->get_method();
+    if ( $method !== 'POST' ) return $result;
+
+    // Only gate when feature flag ON
+    // Need session to identify distributor — check if session valid first
+    if ( ! function_exists( 'b2b_verify_session_token' ) ) return $result;
+    $session = b2b_verify_session_token( $request );
+    if ( ! $session ) return $result; // let existing handler reject
+
+    $group_id = $session['gid'] ?? '';
+    $dist_id  = 0;
+    if ( function_exists( 'b2b_get_dist_by_group' ) ) {
+        $dist = b2b_get_dist_by_group( $group_id );
+        if ( $dist ) $dist_id = (int) $dist->ID;
+    }
+
+    // Feature flag gate
+    if ( ! b2b_bo_flag_enabled( $dist_id ) ) return $result;
+
+    // Walk-in skip all caps (existing flow)
+    if ( $dist_id && get_field( 'is_walkin', $dist_id ) ) return $result;
+
+    $items = $request->get_param( 'items' );
+    if ( ! is_array( $items ) ) return $result;
+
+    // Hard cap 1: items count
+    $max_items = (int) b2b_bo_get_config( 'b2b_bo_max_items_per_order' );
+    if ( count( $items ) > $max_items ) {
+        b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rejected', 'ITEMS_OVER_LIMIT', array( 'group_id' => $group_id ) );
+        return new WP_Error( 'ITEMS_OVER_LIMIT', 'จำนวนรายการเกินที่สั่งได้', array( 'status' => 400 ) );
+    }
+
+    // Hard cap 2: qty per item + Security H2 suspicious qty flagger
+    // แจ้งเตือน Telegram ถ้าเจอ qty ที่เป็น typical binary search values (100, 500, 1000, 2000)
+    $max_qty = (int) b2b_bo_get_config( 'b2b_bo_max_qty_per_item' );
+    $suspicious_values = array( 100, 500, 1000, 2000 );
+    $has_suspicious = false;
+
+    foreach ( $items as $it ) {
+        $qty = (int) ( $it['qty'] ?? 0 );
+        if ( $qty > $max_qty ) {
+            b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rejected', 'QTY_OVER_LIMIT', array( 'group_id' => $group_id ) );
+            return new WP_Error( 'QTY_OVER_LIMIT', 'จำนวนเกินที่สั่งได้ต่อครั้ง', array( 'status' => 400 ) );
+        }
+        if ( $qty < 1 ) {
+            return new WP_Error( 'QTY_INVALID', 'จำนวนต้อง >= 1', array( 'status' => 400 ) );
+        }
+        if ( in_array( $qty, $suspicious_values, true ) ) {
+            $has_suspicious = true;
+        }
+    }
+
+    if ( $has_suspicious && function_exists( 'b2b_send_telegram_alert' ) ) {
+        b2b_send_telegram_alert( 'suspicious_qty',
+            "Distributor #{$dist_id}: order มี qty ใกล้ binary search (100/500/1000/2000) — monitor enumeration?" );
+    }
+
+    // Rate limit 1: 10/hour
+    if ( function_exists( 'b2b_rate_limit' ) ) {
+        $rate_hr = (int) b2b_bo_get_config( 'b2b_bo_rate_place_per_hour' );
+        if ( ! b2b_rate_limit( 'bo_place_hr_' . $dist_id, $rate_hr, 3600 ) ) {
+            b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rate_limit', 'RATE_LIMIT', array( 'group_id' => $group_id ) );
+            return new WP_Error( 'RATE_LIMIT', 'สั่งซื้อบ่อยเกินไป กรุณารอสักครู่', array( 'status' => 429, 'retry_after' => 3600 ) );
+        }
+
+        $rate_day = (int) b2b_bo_get_config( 'b2b_bo_rate_place_per_day' );
+        if ( ! b2b_rate_limit( 'bo_place_day_' . $dist_id, $rate_day, 86400 ) ) {
+            b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rate_limit', 'RATE_LIMIT_DAY', array( 'group_id' => $group_id ) );
+            return new WP_Error( 'RATE_LIMIT', 'เกินจำนวนครั้งต่อวัน กรุณาติดต่อทีมงาน', array( 'status' => 429 ) );
+        }
+    }
+
+    // Rate limit 2: daily qty per SKU
+    $daily_qty_limit = (int) b2b_bo_get_config( 'b2b_bo_daily_qty_per_sku' );
+    foreach ( $items as $it ) {
+        $sku = strtoupper( $it['sku'] );
+        $qty = (int) $it['qty'];
+        $key = 'b2b_daily_qty_' . $dist_id . '_' . $sku;
+        $used = (int) ( get_transient( $key ) ?: 0 );
+        if ( $used + $qty > $daily_qty_limit ) {
+            b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rejected', 'DAILY_QTY_LIMIT', array( 'group_id' => $group_id ) );
+            return new WP_Error( 'DAILY_QTY_LIMIT', 'เกินโควต้ารายวัน กรุณาติดต่อทีมงาน', array( 'status' => 429 ) );
+        }
+    }
+
+    // Security H2 FIX: unique-SKU/day cap (prevent cross-SKU enumeration)
+    $unique_sku_cap = (int) b2b_bo_get_config( 'b2b_bo_daily_unique_sku_cap' );
+    $order_skus = array_unique( array_map( function( $it ) { return strtoupper( $it['sku'] ); }, $items ) );
+    $unique_key = 'b2b_daily_unique_skus_' . $dist_id;
+    $existing_skus = get_transient( $unique_key );
+    if ( ! is_array( $existing_skus ) ) $existing_skus = array();
+    $combined_skus = array_unique( array_merge( $existing_skus, $order_skus ) );
+    if ( count( $combined_skus ) > $unique_sku_cap ) {
+        b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rejected', 'UNIQUE_SKU_CAP', array( 'group_id' => $group_id ) );
+        return new WP_Error( 'UNIQUE_SKU_CAP', 'สั่งหลาย SKU เกินโควต้ารายวัน กรุณาติดต่อทีมงาน', array( 'status' => 429 ) );
+    }
+    set_transient( $unique_key, $combined_skus, 86400 );
+
+    // Tier value cap (checked after existing handler computes total)
+    // — we store dist_id + items in request meta for post-handler check
+    // Simpler: compute rough estimate here using b2b_get_product_data
+    $total_value = 0;
+    if ( function_exists( 'b2b_get_product_data' ) ) {
+        foreach ( $items as $it ) {
+            $pd = b2b_get_product_data( strtoupper( $it['sku'] ) );
+            if ( $pd ) {
+                $price = (float) ( $pd['base_price'] ?? 0 );
+                $total_value += $price * (int) $it['qty'];
+            }
+        }
+    }
+
+    $tier_caps = b2b_bo_get_config( 'b2b_bo_tier_value_caps' );
+    $rank      = get_field( 'rank_system', $dist_id ) ?: 'standard';
+    $cap       = $tier_caps[ $rank ] ?? 50000;
+    if ( $cap > 0 ) {
+        $daily_value_key = 'b2b_daily_value_' . $dist_id;
+        $daily_used      = (float) ( get_transient( $daily_value_key ) ?: 0 );
+        if ( $daily_used + $total_value > $cap ) {
+            b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rejected', 'DAILY_VALUE_LIMIT', array( 'group_id' => $group_id ) );
+            return new WP_Error( 'DAILY_VALUE_LIMIT', 'เกินวงเงินรายวัน', array( 'status' => 429 ) );
+        }
+    }
+
+    // Security H3 FIX: artificial timing jitter ป้องกัน timing side-channel attack
+    // Real σ ใน WP >> 10ms — add random delay 50-150ms เพื่อ mask natural variance
+    usleep( random_int( 50000, 150000 ) );
+
+    return $result; // pass through to original handler
+}, 5, 3 ); // Priority 5 — before default handlers
+
+/**
+ * Hook post-handler — if order created successfully, transition to pending_stock_review
+ * instead of checking_stock
+ */
+add_filter( 'b2b_place_order_post_process', function( $order_id, $dist_id, $items, $total ) {
+    if ( ! b2b_bo_flag_enabled( $dist_id ) ) return $order_id;
+    if ( ! $order_id ) return $order_id;
+
+    // Walk-in skip
+    if ( $dist_id && get_field( 'is_walkin', $dist_id ) ) return $order_id;
+
+    // Override status: checking_stock → pending_stock_review
+    $status = get_field( 'order_status', $order_id );
+    if ( $status === 'checking_stock' || $status === 'draft' ) {
+        if ( function_exists( 'b2b_transition_order' ) ) {
+            // checking_stock → awaiting_confirm bypass: we need pending_stock_review
+            // Use direct set_order_status (if FSM doesn't allow)
+            if ( function_exists( 'b2b_set_order_status' ) ) {
+                b2b_set_order_status( $order_id, 'pending_stock_review' );
+            }
+        }
+        update_post_meta( $order_id, '_b2b_opaque_accept_at', current_time( 'mysql' ) );
+
+        // Snapshot stock delta for admin view
+        $snapshot = array();
+        foreach ( $items as $it ) {
+            $sku = strtoupper( $it['sku'] );
+            $available = 0;
+            if ( function_exists( 'dinoco_compute_hierarchy_stock' ) && function_exists( 'dinoco_get_reserved_qty' ) ) {
+                $computed  = (int) dinoco_compute_hierarchy_stock( $sku );
+                $reserved  = (int) dinoco_get_reserved_qty( $sku );
+                $available = max( 0, $computed - $reserved );
+            }
+            $snapshot[ $sku ] = array( 'available' => $available, 'requested' => (int) $it['qty'] );
+        }
+        update_post_meta( $order_id, '_b2b_stock_snapshot', $snapshot );
+
+        // Increment daily counters
+        b2b_bo_increment_daily_counters( $dist_id, $items, $total );
+
+        // Log + notify admin
+        $items_hash = md5( wp_json_encode( $items ) );
+        b2b_log_attempt( $dist_id, 'place_order', $order_id, $items_hash, 'accepted', null, array(
+            'total_qty' => array_sum( array_column( $items, 'qty' ) ),
+            'total_value' => $total,
+        ) );
+
+        b2b_bo_notify_admin_stock_review( $order_id );
+    }
+
+    return $order_id;
+}, 10, 4 );
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 10: REST RESPONSE FILTER — hide admin-only meta
+// ═══════════════════════════════════════════════════════════════
+
+add_filter( 'rest_prepare_post', function( $response, $post, $request ) {
+    if ( $post->post_type !== 'b2b_order' ) return $response;
+
+    // Only filter for non-admin requests
+    if ( current_user_can( 'manage_options' ) ) return $response;
+
+    $data = $response->get_data();
+    if ( isset( $data['meta'] ) ) {
+        unset( $data['meta']['_b2b_stock_snapshot'] );
+        unset( $data['meta']['_b2b_enumeration_flags'] );
+        $response->set_data( $data );
+    }
+
+    return $response;
+}, 10, 3 );
+
+// ═══════════════════════════════════════════════════════════════
+// EOF — [B2B] Snippet 16: Backorder System V.1.0
+// ═══════════════════════════════════════════════════════════════
