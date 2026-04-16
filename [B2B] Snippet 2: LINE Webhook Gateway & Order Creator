@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.4 — C2 FIX: BO system gate ใน confirm_order ก่อน OOS legacy path ║
  * ║  Version: V.34.3 — M17: b2b_dispatch_postback() wrapper (observability + uniform 3s dedup) ║
  * ║  DB_ID: 51                                                  ║
  * ║  DINOCO B2B Smart Order System                              ║
@@ -655,7 +656,60 @@ function b2b_action_confirm_order( $ticket_id, $group_id, $user_id, $reply_token
         return;
     }
 
-    // OOS Memory Check
+    // V.34.3 — C2 FIX: BO system gate (Phase A-D — opaque accept)
+    // ถ้า b2b_flag_bo_system=ON → route ไป pending_stock_review แทน checking_stock
+    // (ข้าม OOS gate แบบเก่าที่ leak SKU ให้ลูกค้า)
+    $dist_for_bo = function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($group_id) : null;
+    $dist_id_for_bo = $dist_for_bo ? (int) $dist_for_bo->ID : 0;
+
+    if ( function_exists('b2b_bo_flag_enabled') && b2b_bo_flag_enabled($dist_id_for_bo) ) {
+        $order_text_bo = get_field('order_items', $ticket_id) ?: '';
+        $items_parsed  = function_exists('b2b_bo_parse_order_items') ? b2b_bo_parse_order_items($order_text_bo) : array();
+        $total_bo      = floatval(get_field('total_amount', $ticket_id));
+
+        b2b_set_order_status($ticket_id, 'pending_stock_review', 'customer');
+        update_post_meta($ticket_id, '_b2b_opaque_accept_at', current_time('mysql'));
+
+        // Snapshot stock delta (admin-only meta — filtered from customer REST)
+        $snapshot = array();
+        foreach ( $items_parsed as $it ) {
+            $sku = strtoupper($it['sku']);
+            $available = 0;
+            if ( function_exists('dinoco_compute_hierarchy_stock') && function_exists('dinoco_get_reserved_qty') ) {
+                $available = max(0, (int)dinoco_compute_hierarchy_stock($sku) - (int)dinoco_get_reserved_qty($sku));
+            }
+            $snapshot[$sku] = array( 'available' => $available, 'requested' => (int)$it['qty'] );
+        }
+        update_post_meta($ticket_id, '_b2b_stock_snapshot', $snapshot);
+
+        // Daily counters (prevent bypass via confirm_order re-entry)
+        if ( function_exists('b2b_bo_increment_daily_counters') && $dist_id_for_bo ) {
+            b2b_bo_increment_daily_counters($dist_id_for_bo, $items_parsed, $total_bo);
+        }
+
+        // Log attempt
+        if ( function_exists('b2b_log_attempt') ) {
+            $items_hash = md5(wp_json_encode($items_parsed));
+            b2b_log_attempt($dist_id_for_bo, 'place_order', $ticket_id, $items_hash, 'accepted', null, array(
+                'total_qty'   => array_sum(array_column($items_parsed, 'qty')),
+                'total_value' => $total_bo,
+                'group_id'    => $group_id,
+            ));
+        }
+
+        // Notify admin stock review (Flex with bucket indicator — no exact qty leak)
+        if ( function_exists('b2b_bo_notify_admin_stock_review') ) {
+            b2b_bo_notify_admin_stock_review($ticket_id);
+        }
+
+        // Reply customer — opaque (no stock info)
+        b2b_line_reply($reply_token, "✅ รับคำสั่งซื้อ #{$ticket_id} เรียบร้อย\n⏳ แอดมินกำลังตรวจสอบ คาดการณ์ 2-4 ชั่วโมง");
+
+        delete_transient($lock_key);
+        return;
+    }
+
+    // OOS Memory Check (legacy — เมื่อ b2b_flag_bo_system=OFF)
     $order_text = get_field('order_items', $ticket_id) ?: '';
     $oos_items = b2b_check_order_oos($order_text);
     if ( !empty($oos_items) ) {
