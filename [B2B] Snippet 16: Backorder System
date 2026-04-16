@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.1.5 — Security Log viewer + C3 meta hardening + LIFF customer split view ║
  * ║  Version: V.1.4 — Clarify banner messages (ลด user confusion about flag ON/OFF) ║
  * ║  Version: V.1.3 — Fix pending review bug (WP REST meta filter ไม่ทำงาน → ใช้ custom endpoint) ║
  * ║  Version: V.1.2 — Admin UI [b2b_bo_admin] + Flag Manager [b2b_bo_flags] ║
@@ -2606,5 +2607,444 @@ add_shortcode( 'b2b_bo_flags', function() {
 } );
 
 // ═══════════════════════════════════════════════════════════════
-// EOF — [B2B] Snippet 16: Backorder System V.1.2
+// SECTION 13: SECURITY LOG VIEWER (V.1.5 — shortcode [b2b_bo_security_log])
+// ═══════════════════════════════════════════════════════════════
+
+add_shortcode( 'b2b_bo_security_log', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return '<p style="color:#dc2626;">⚠️ ต้องเป็น admin เท่านั้น</p>';
+    }
+
+    global $wpdb;
+    $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
+
+    // Filters via GET
+    $f_action   = isset( $_GET['bo_filter_action'] ) ? sanitize_key( $_GET['bo_filter_action'] ) : 'all';
+    $f_result   = isset( $_GET['bo_filter_result'] ) ? sanitize_key( $_GET['bo_filter_result'] ) : 'all';
+    $f_dist_id  = isset( $_GET['bo_filter_dist'] ) ? absint( $_GET['bo_filter_dist'] ) : 0;
+    $f_days     = isset( $_GET['bo_filter_days'] ) ? max( 1, min( 90, absint( $_GET['bo_filter_days'] ) ) ) : 7;
+    $page_num   = isset( $_GET['bo_page'] ) ? max( 1, absint( $_GET['bo_page'] ) ) : 1;
+    $per_page   = 50;
+    $offset     = ( $page_num - 1 ) * $per_page;
+
+    // CSV export (before render)
+    if ( isset( $_GET['bo_export'] ) && $_GET['bo_export'] === '1' && check_admin_referer( 'bo_security_log_csv' ) ) {
+        $where_csv = array( "created_at > DATE_SUB(NOW(), INTERVAL %d DAY)" );
+        $params_csv = array( $f_days );
+        if ( $f_action !== 'all' ) { $where_csv[] = 'action = %s'; $params_csv[] = $f_action; }
+        if ( $f_result !== 'all' ) { $where_csv[] = 'result = %s'; $params_csv[] = $f_result; }
+        if ( $f_dist_id )         { $where_csv[] = 'distributor_id = %d'; $params_csv[] = $f_dist_id; }
+
+        $sql_csv = "SELECT * FROM {$log_table} WHERE " . implode( ' AND ', $where_csv ) . " ORDER BY created_at DESC LIMIT 5000";
+        $rows_csv = $wpdb->get_results( $wpdb->prepare( $sql_csv, ...$params_csv ), ARRAY_A );
+
+        header( 'Content-Type: text/csv; charset=utf-8' );
+        header( 'Content-Disposition: attachment; filename=bo-security-log-' . date( 'Ymd-His' ) . '.csv' );
+        $out = fopen( 'php://output', 'w' );
+        fputs( $out, "\xEF\xBB\xBF" ); // UTF-8 BOM for Excel
+        fputcsv( $out, array( 'ID', 'Time', 'Distributor', 'Group', 'Action', 'Order ID', 'Result', 'Rejection Code', 'IP', 'UA', 'Total Qty', 'Total Value' ) );
+        foreach ( $rows_csv as $r ) {
+            $dist_name = $r['distributor_id'] ? get_the_title( $r['distributor_id'] ) : '';
+            fputcsv( $out, array(
+                $r['id'], $r['created_at'], $dist_name, $r['group_id'], $r['action'],
+                $r['order_id'], $r['result'], $r['rejection_code'],
+                $r['ip'], $r['user_agent'], $r['total_qty'], $r['total_value']
+            ) );
+        }
+        fclose( $out );
+        exit;
+    }
+
+    // Build query
+    $where  = array( "created_at > DATE_SUB(NOW(), INTERVAL %d DAY)" );
+    $params = array( $f_days );
+    if ( $f_action !== 'all' ) { $where[] = 'action = %s'; $params[] = $f_action; }
+    if ( $f_result !== 'all' ) { $where[] = 'result = %s'; $params[] = $f_result; }
+    if ( $f_dist_id )         { $where[] = 'distributor_id = %d'; $params[] = $f_dist_id; }
+
+    $where_sql = implode( ' AND ', $where );
+
+    $count_sql = "SELECT COUNT(*) FROM {$log_table} WHERE {$where_sql}";
+    $total_rows = (int) $wpdb->get_var( $wpdb->prepare( $count_sql, ...$params ) );
+
+    $list_params = array_merge( $params, array( $per_page, $offset ) );
+    $list_sql = "SELECT * FROM {$log_table} WHERE {$where_sql} ORDER BY created_at DESC LIMIT %d OFFSET %d";
+    $rows = $wpdb->get_results( $wpdb->prepare( $list_sql, ...$list_params ), ARRAY_A );
+
+    // Summary stats
+    $stat_rows = $wpdb->get_results( $wpdb->prepare(
+        "SELECT result, COUNT(*) AS cnt FROM {$log_table} WHERE {$where_sql} GROUP BY result",
+        ...$params
+    ), ARRAY_A );
+    $stats = array( 'accepted' => 0, 'rejected' => 0, 'rate_limit' => 0, 'error' => 0 );
+    foreach ( $stat_rows as $sr ) {
+        if ( isset( $stats[ $sr['result'] ] ) ) $stats[ $sr['result'] ] = (int) $sr['cnt'];
+    }
+
+    // Flagged distributors (enumeration detection)
+    $flagged = $wpdb->get_results(
+        "SELECT pm.post_id AS dist_id, pm.meta_value AS flags
+         FROM {$wpdb->postmeta} pm
+         WHERE pm.meta_key = '_b2b_enumeration_flags'
+         AND pm.meta_value > 0
+         ORDER BY pm.meta_value DESC
+         LIMIT 20",
+        ARRAY_A
+    );
+
+    $total_pages = (int) ceil( $total_rows / $per_page );
+    $csv_nonce = wp_create_nonce( 'bo_security_log_csv' );
+
+    ob_start();
+    ?>
+    <div class="b2b-bo-seclog">
+        <style>
+            .b2b-bo-seclog { max-width: 1200px; margin: 24px auto; font-family: 'Sarabun', sans-serif; color: #1f2937; }
+            .b2b-bo-seclog h1 { font-size: 22px; margin: 0 0 12px; }
+            .b2b-bo-seclog .seclog-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+            .b2b-bo-seclog .stat-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; }
+            .b2b-bo-seclog .stat-card .lbl { font-size: 11px; color: #6b7280; text-transform: uppercase; }
+            .b2b-bo-seclog .stat-card .val { font-size: 22px; font-weight: 700; }
+            .b2b-bo-seclog .stat-card.accepted .val { color: #10b981; }
+            .b2b-bo-seclog .stat-card.rejected .val { color: #dc2626; }
+            .b2b-bo-seclog .stat-card.rate_limit .val { color: #f59e0b; }
+            .b2b-bo-seclog .stat-card.error .val { color: #7c3aed; }
+            .b2b-bo-seclog .seclog-filter { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; background: #f3f4f6; padding: 12px; border-radius: 8px; }
+            .b2b-bo-seclog select, .b2b-bo-seclog input { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+            .b2b-bo-seclog .btn { padding: 6px 14px; background: #1e3a8a; color: white; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; text-decoration: none; display: inline-block; }
+            .b2b-bo-seclog .btn.csv { background: #10b981; }
+            .b2b-bo-seclog table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; font-size: 12px; }
+            .b2b-bo-seclog th { background: #f3f4f6; padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 600; color: #374151; }
+            .b2b-bo-seclog td { padding: 8px 10px; border-top: 1px solid #e5e7eb; }
+            .b2b-bo-seclog tr:hover td { background: #f9fafb; }
+            .b2b-bo-seclog .res-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+            .b2b-bo-seclog .res-accepted   { background: #d1fae5; color: #065f46; }
+            .b2b-bo-seclog .res-rejected   { background: #fee2e2; color: #991b1b; }
+            .b2b-bo-seclog .res-rate_limit { background: #fef3c7; color: #92400e; }
+            .b2b-bo-seclog .res-error      { background: #e9d5ff; color: #6b21a8; }
+            .b2b-bo-seclog .res-dup        { background: #f3f4f6; color: #6b7280; }
+            .b2b-bo-seclog .pager { margin-top: 12px; display: flex; gap: 4px; justify-content: center; }
+            .b2b-bo-seclog .pager a, .b2b-bo-seclog .pager span { padding: 4px 10px; background: white; border: 1px solid #e5e7eb; border-radius: 4px; font-size: 12px; text-decoration: none; color: #374151; }
+            .b2b-bo-seclog .pager .current { background: #1e3a8a; color: white; border-color: #1e3a8a; }
+            .b2b-bo-seclog .flagged-list { margin-bottom: 16px; }
+            .b2b-bo-seclog .flagged-list h3 { font-size: 14px; margin: 0 0 8px; color: #dc2626; }
+            .b2b-bo-seclog .flagged-card { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 10px 14px; font-size: 13px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+            .b2b-bo-seclog .flag-bits { font-size: 11px; color: #991b1b; }
+            .b2b-bo-seclog .empty { text-align: center; padding: 32px; color: #9ca3af; }
+        </style>
+
+        <h1>🛡️ Security Log</h1>
+
+        <div class="seclog-stats">
+            <div class="stat-card accepted"><div class="lbl">Accepted</div><div class="val"><?php echo number_format( $stats['accepted'] ); ?></div></div>
+            <div class="stat-card rejected"><div class="lbl">Rejected</div><div class="val"><?php echo number_format( $stats['rejected'] ); ?></div></div>
+            <div class="stat-card rate_limit"><div class="lbl">Rate Limit</div><div class="val"><?php echo number_format( $stats['rate_limit'] ); ?></div></div>
+            <div class="stat-card error"><div class="lbl">Error</div><div class="val"><?php echo number_format( $stats['error'] ); ?></div></div>
+        </div>
+
+        <?php if ( ! empty( $flagged ) ): ?>
+        <div class="flagged-list">
+            <h3>⚠️ Distributors ที่ถูก flag (enumeration detection)</h3>
+            <?php foreach ( $flagged as $f ):
+                $dist_name = get_the_title( $f['dist_id'] );
+                $bits = (int) $f['flags'];
+                $labels = array();
+                if ( $bits & 1 ) $labels[] = 'rate_hit';
+                if ( $bits & 2 ) $labels[] = 'cancel_abuse';
+                if ( $bits & 4 ) $labels[] = 'qty_cap_hit';
+                if ( $bits & 8 ) $labels[] = 'suspicious_pattern';
+            ?>
+            <div class="flagged-card">
+                <div>
+                    <strong><?php echo esc_html( $dist_name ?: 'Distributor #' . $f['dist_id'] ); ?></strong>
+                    <span class="flag-bits"> — flags: <?php echo esc_html( implode( ', ', $labels ) ); ?></span>
+                </div>
+                <a class="btn" href="?bo_filter_dist=<?php echo (int) $f['dist_id']; ?>">ดู log</a>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+
+        <form class="seclog-filter" method="GET">
+            <select name="bo_filter_action">
+                <option value="all" <?php selected( $f_action, 'all' ); ?>>ทุก action</option>
+                <option value="place_order" <?php selected( $f_action, 'place_order' ); ?>>place_order</option>
+                <option value="cancel" <?php selected( $f_action, 'cancel' ); ?>>cancel</option>
+                <option value="split" <?php selected( $f_action, 'split' ); ?>>split</option>
+                <option value="undo_split" <?php selected( $f_action, 'undo_split' ); ?>>undo_split</option>
+                <option value="bo_fulfill" <?php selected( $f_action, 'bo_fulfill' ); ?>>bo_fulfill</option>
+            </select>
+            <select name="bo_filter_result">
+                <option value="all" <?php selected( $f_result, 'all' ); ?>>ทุก result</option>
+                <option value="accepted" <?php selected( $f_result, 'accepted' ); ?>>accepted</option>
+                <option value="rejected" <?php selected( $f_result, 'rejected' ); ?>>rejected</option>
+                <option value="rate_limit" <?php selected( $f_result, 'rate_limit' ); ?>>rate_limit</option>
+                <option value="error" <?php selected( $f_result, 'error' ); ?>>error</option>
+                <option value="dup" <?php selected( $f_result, 'dup' ); ?>>dup</option>
+            </select>
+            <select name="bo_filter_days">
+                <?php foreach ( array( 1, 3, 7, 14, 30, 90 ) as $d ): ?>
+                    <option value="<?php echo $d; ?>" <?php selected( $f_days, $d ); ?>><?php echo $d; ?> วัน</option>
+                <?php endforeach; ?>
+            </select>
+            <input type="number" name="bo_filter_dist" placeholder="Distributor ID" value="<?php echo $f_dist_id ?: ''; ?>" style="width:140px;" />
+            <button type="submit" class="btn">🔍 กรอง</button>
+            <a class="btn csv" href="?<?php echo esc_attr( http_build_query( array_merge( $_GET, array( 'bo_export' => '1', '_wpnonce' => $csv_nonce ) ) ) ); ?>">📥 Export CSV</a>
+            <span style="margin-left:auto;font-size:12px;color:#6b7280;">พบ <?php echo number_format( $total_rows ); ?> record</span>
+        </form>
+
+        <?php if ( empty( $rows ) ): ?>
+        <div class="empty">✨ ไม่มี log ตรงกับ filter</div>
+        <?php else: ?>
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Distributor</th>
+                    <th>Action</th>
+                    <th>Order</th>
+                    <th>Result</th>
+                    <th>Code</th>
+                    <th>Qty / Value</th>
+                    <th>IP / UA</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ( $rows as $r ):
+                    $dist_name = $r['distributor_id'] ? get_the_title( $r['distributor_id'] ) : '';
+                ?>
+                <tr>
+                    <td style="white-space:nowrap;"><?php echo esc_html( $r['created_at'] ); ?></td>
+                    <td>
+                        <?php echo esc_html( $dist_name ?: '#' . $r['distributor_id'] ); ?>
+                        <?php if ( $r['group_id'] ): ?>
+                            <div style="font-size:10px;color:#9ca3af;"><?php echo esc_html( substr( $r['group_id'], 0, 20 ) ); ?></div>
+                        <?php endif; ?>
+                    </td>
+                    <td><code style="font-size:11px;background:#f3f4f6;padding:1px 6px;border-radius:4px;"><?php echo esc_html( $r['action'] ); ?></code></td>
+                    <td><?php echo $r['order_id'] ? '#' . (int) $r['order_id'] : '-'; ?></td>
+                    <td><span class="res-badge res-<?php echo esc_attr( $r['result'] ); ?>"><?php echo esc_html( $r['result'] ); ?></span></td>
+                    <td style="font-size:11px;"><?php echo $r['rejection_code'] ? esc_html( $r['rejection_code'] ) : '-'; ?></td>
+                    <td style="font-size:11px;">
+                        <?php if ( $r['total_qty'] ): ?>qty: <?php echo (int) $r['total_qty']; ?><br><?php endif; ?>
+                        <?php if ( $r['total_value'] ): ?>฿<?php echo number_format( $r['total_value'], 2 ); ?><?php endif; ?>
+                    </td>
+                    <td style="font-size:10px;color:#6b7280;">
+                        <?php echo esc_html( $r['ip'] ?: '-' ); ?>
+                        <?php if ( $r['user_agent'] ): ?>
+                            <div title="<?php echo esc_attr( $r['user_agent'] ); ?>" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><?php echo esc_html( substr( $r['user_agent'], 0, 50 ) ); ?></div>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+
+        <?php if ( $total_pages > 1 ):
+            $base_url = remove_query_arg( array( 'bo_page', 'bo_export', '_wpnonce' ) );
+        ?>
+        <div class="pager">
+            <?php
+            $range = 3;
+            for ( $p = 1; $p <= $total_pages; $p++ ) {
+                if ( $p == 1 || $p == $total_pages || abs( $p - $page_num ) <= $range ) {
+                    if ( $p == $page_num ) {
+                        echo '<span class="current">' . $p . '</span>';
+                    } else {
+                        echo '<a href="' . esc_url( add_query_arg( 'bo_page', $p, $base_url ) ) . '">' . $p . '</a>';
+                    }
+                } elseif ( abs( $p - $page_num ) == $range + 1 ) {
+                    echo '<span>…</span>';
+                }
+            }
+            ?>
+        </div>
+        <?php endif; ?>
+        <?php endif; ?>
+    </div>
+    <?php
+    return ob_get_clean();
+} );
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 14: C3 META FILTER HARDENING (V.1.5)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Ensure admin-only meta NEVER leaks through default WP REST.
+ * 2 layers:
+ *   (a) register_meta auth_callback = reject non-admin
+ *   (b) rest_prepare_b2b_order filter — strip meta from response
+ */
+add_action( 'init', function() {
+    $admin_only_meta = array(
+        '_b2b_stock_snapshot',
+        '_b2b_enumeration_flags',
+        '_b2b_opaque_accept_at',
+        '_b2b_split_at',
+        '_b2b_split_by',
+        '_b2b_split_undo_deadline',
+        '_b2b_undo_count',
+        '_b2b_reject_reason',
+    );
+
+    foreach ( $admin_only_meta as $meta_key ) {
+        register_post_meta( 'b2b_order', $meta_key, array(
+            'show_in_rest'   => false,  // BLANKET: hide from default REST
+            'single'         => true,
+            'type'           => 'string',
+            'auth_callback'  => function() { return current_user_can( 'manage_options' ); },
+        ) );
+    }
+}, 20 ); // Priority 20 — after CPT registered
+
+/**
+ * Defense-in-depth: strip meta from REST response too
+ * (in case show_in_rest override happens somewhere else)
+ */
+add_filter( 'rest_prepare_b2b_order', function( $response, $post, $request ) {
+    if ( current_user_can( 'manage_options' ) ) return $response;
+
+    $data = $response->get_data();
+    if ( isset( $data['meta'] ) && is_array( $data['meta'] ) ) {
+        $admin_only = array(
+            '_b2b_stock_snapshot', '_b2b_enumeration_flags', '_b2b_opaque_accept_at',
+            '_b2b_split_at', '_b2b_split_by', '_b2b_split_undo_deadline',
+            '_b2b_undo_count', '_b2b_reject_reason',
+        );
+        foreach ( $admin_only as $key ) {
+            unset( $data['meta'][ $key ] );
+        }
+        $response->set_data( $data );
+    }
+    return $response;
+}, 10, 3 );
+
+// ═══════════════════════════════════════════════════════════════
+// SECTION 15: LIFF CUSTOMER SPLIT VIEW HELPER (V.1.5)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Shortcode [b2b_bo_customer_order_detail order_id="123"] — embed in customer LIFF
+ * แสดง split view: ส่งแล้ว + BO items + ETA
+ * No stock numbers — customer-safe
+ */
+add_shortcode( 'b2b_bo_customer_order_detail', function( $atts ) {
+    $atts = shortcode_atts( array( 'order_id' => 0 ), $atts );
+    $order_id = (int) $atts['order_id'];
+    if ( ! $order_id ) return '<p>Order ID required</p>';
+
+    $status = get_field( 'order_status', $order_id );
+    if ( $status !== 'partial_fulfilled' && $status !== 'pending_stock_review' ) {
+        return ''; // only show for BO-relevant statuses
+    }
+
+    if ( $status === 'pending_stock_review' ) {
+        return '<div class="b2b-bo-cust-view" style="padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;margin:12px 0;">
+            <div style="font-size:14px;font-weight:600;color:#78350f;">⏳ รอตรวจสอบจากแอดมิน</div>
+            <div style="font-size:12px;color:#92400e;margin-top:4px;">คาดการณ์ 2-4 ชั่วโมง</div>
+        </div>';
+    }
+
+    // partial_fulfilled
+    $summary = b2b_compute_bo_summary( $order_id );
+
+    ob_start();
+    ?>
+    <div class="b2b-bo-cust-view" style="font-family:'Sarabun',sans-serif;color:#1f2937;margin:12px 0;">
+        <style>
+            .b2b-bo-cust-view .cv-section { margin-bottom: 16px; background: white; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
+            .b2b-bo-cust-view .cv-section .cv-header { padding: 12px 14px; font-weight: 600; font-size: 14px; color: white; display: flex; justify-content: space-between; align-items: center; }
+            .b2b-bo-cust-view .cv-section.confirmed .cv-header { background: #10b981; }
+            .b2b-bo-cust-view .cv-section.backorder .cv-header { background: #f59e0b; }
+            .b2b-bo-cust-view .cv-item { padding: 10px 14px; border-top: 1px solid #f3f4f6; font-size: 13px; }
+            .b2b-bo-cust-view .cv-item:first-child { border-top: none; }
+            .b2b-bo-cust-view .cv-item .sku-name { font-weight: 600; }
+            .b2b-bo-cust-view .cv-item .sub { font-size: 12px; color: #6b7280; margin-top: 2px; }
+            .b2b-bo-cust-view .cv-eta { background: #fef3c7; color: #78350f; padding: 2px 8px; border-radius: 10px; font-size: 11px; display: inline-block; margin-top: 4px; }
+            .b2b-bo-cust-view .cv-total { padding: 14px; background: #f9fafb; border-top: 1px solid #e5e7eb; font-size: 13px; }
+            .b2b-bo-cust-view .cv-total .cv-row { display: flex; justify-content: space-between; margin: 4px 0; }
+            .b2b-bo-cust-view .cv-total .cv-row.total { font-weight: 700; font-size: 14px; color: #1f2937; margin-top: 8px; padding-top: 8px; border-top: 1px dashed #d1d5db; }
+        </style>
+
+        <!-- Confirmed (ส่งทันที) -->
+        <?php if ( $summary['fulfilled_total'] > 0 ): ?>
+        <div class="cv-section confirmed">
+            <div class="cv-header">
+                <span>✅ จัดส่งทันที</span>
+                <span><?php echo (int) $summary['fulfilled_total']; ?> ชิ้น</span>
+            </div>
+            <?php
+            // Show fulfilled items — query from order_items that are NOT in bo_queue
+            $order_text = get_field( 'order_items', $order_id ) ?: '';
+            $items = b2b_bo_parse_order_items( $order_text );
+            foreach ( $items as $it ):
+                $bo_qty = 0;
+                foreach ( $summary['items'] as $sum_it ) {
+                    if ( strtoupper( $sum_it['sku'] ) === $it['sku'] && in_array( $sum_it['status'], array( 'pending', 'ready' ), true ) ) {
+                        $bo_qty += (int) $sum_it['qty_bo'];
+                    }
+                }
+                $fulfilled_qty = $it['qty'] - $bo_qty;
+                if ( $fulfilled_qty <= 0 ) continue;
+                $pd = b2b_get_product_data( $it['sku'] );
+                $name = $pd ? $pd['name'] : $it['sku'];
+            ?>
+            <div class="cv-item">
+                <div class="sku-name"><?php echo esc_html( $name ); ?> × <?php echo (int) $fulfilled_qty; ?></div>
+                <div class="sub">SKU: <?php echo esc_html( $it['sku'] ); ?></div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+
+        <!-- BO (รอสต็อก) -->
+        <?php if ( $summary['bo_total'] > 0 ): ?>
+        <div class="cv-section backorder">
+            <div class="cv-header">
+                <span>⏳ รอสต็อก (Backorder)</span>
+                <span><?php echo (int) $summary['bo_total']; ?> ชิ้น</span>
+            </div>
+            <?php foreach ( $summary['items'] as $bo_it ):
+                if ( ! in_array( $bo_it['status'], array( 'pending', 'ready' ), true ) ) continue;
+                $pd = b2b_get_product_data( $bo_it['sku'] );
+                $name = $pd ? $pd['name'] : $bo_it['sku'];
+            ?>
+            <div class="cv-item">
+                <div class="sku-name"><?php echo esc_html( $name ); ?> × <?php echo (int) $bo_it['qty_bo']; ?></div>
+                <div class="sub">SKU: <?php echo esc_html( $bo_it['sku'] ); ?></div>
+                <?php if ( $bo_it['eta'] ): ?>
+                <span class="cv-eta">📅 คาดว่ากลับมา: <?php echo esc_html( $bo_it['eta'] ); ?></span>
+                <?php endif; ?>
+                <?php if ( $bo_it['status'] === 'ready' ): ?>
+                <span class="cv-eta" style="background:#d1fae5;color:#065f46;">🟢 พร้อมจัดส่งแล้ว</span>
+                <?php endif; ?>
+            </div>
+            <?php endforeach; ?>
+            <div style="padding: 10px 14px; background: #fef3c7; font-size: 11px; color: #78350f; border-top: 1px solid #f3f4f6;">
+                ℹ️ BO ไม่เรียกเก็บจนกว่าของจะพร้อมจัดส่ง
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <!-- Total breakdown -->
+        <div class="cv-total">
+            <?php if ( $summary['fulfilled_value'] > 0 ): ?>
+            <div class="cv-row"><span>ชำระแล้ว (ส่งทันที):</span><span>฿<?php echo number_format( $summary['fulfilled_value'], 2 ); ?></span></div>
+            <?php endif; ?>
+            <?php if ( $summary['bo_value'] > 0 ): ?>
+            <div class="cv-row" style="color:#78350f;"><span>รอชำระ (BO):</span><span>฿<?php echo number_format( $summary['bo_value'], 2 ); ?></span></div>
+            <?php endif; ?>
+            <div class="cv-row total">
+                <span>ยอดรวมออเดอร์:</span>
+                <span>฿<?php echo number_format( $summary['fulfilled_value'] + $summary['bo_value'], 2 ); ?></span>
+            </div>
+        </div>
+    </div>
+    <?php
+    return ob_get_clean();
+} );
+
+// ═══════════════════════════════════════════════════════════════
+// EOF — [B2B] Snippet 16: Backorder System V.1.5
 // ═══════════════════════════════════════════════════════════════
