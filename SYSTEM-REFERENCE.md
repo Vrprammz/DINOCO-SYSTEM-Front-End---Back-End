@@ -125,7 +125,7 @@
 | [Admin System] DINOCO Moto Manager | V.1.0 | 1157 | `[dinoco_admin_moto]` | Motorcycle brands & models CRUD |
 | [Admin System] DINOCO Admin Finance Dashboard | V.3.16 | 1158 | `[dinoco_admin_finance]` | Finance overview (debt, revenue, risk AI) |
 | [Admin System] DINOCO Brand Voice Pool | V.2.5 | 1159 | `[dinoco_brand_voice]` | Social listening + brand sentiment analysis |
-| [Admin System] B2F Migration Audit | V.3.1 | pending | `[b2f_migration_audit]` | **Option F Hybrid Shadow-Write audit** — 9 REST endpoints `/wp-json/dinoco-b2f-audit/v1/` (drift/stale/parity/dry-run/feature-flags/activate-schema/backfill/junction-snapshot/observations) + 6 dashboard sections. **Phase 3 ACTIVE** since 2026-04-16 — reads flipped to junction. Rate limit 20/hr read, 5/hr destructive. |
+| [Admin System] B2F Migration Audit | V.3.3 | pending | `[b2f_migration_audit]` | **Option F Hybrid Shadow-Write audit** — 13 REST endpoints `/wp-json/dinoco-b2f-audit/v1/` (drift/stale/parity/dry-run/feature-flags/activate-schema/backfill/junction-snapshot/observations + **V.3.2 Option F**: maker-products-with-source/junction-bulk-delete/autosync-blacklist GET+POST) + 6 dashboard sections. **Phase 3 ACTIVE** since 2026-04-16 — reads flipped to junction. Rate limit 20/hr read, 5/hr destructive. **V.3.3 (housekeeping H-1)**: docs clarify backfill orphan INSERT `ON DUPLICATE KEY UPDATE` semantics — `status`+`deleted_at` preserved across re-runs (honors admin soft-delete). |
 | [Admin System] Product Catalog Export Tool | V.1.2 | pending | -- | 1-click ZIP bundle (5 CSVs incl. migration-audit-report) for offline analysis |
 
 ### 2.3 [AdminSystem-System] -- Infrastructure
@@ -138,7 +138,7 @@
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
-| Snippet 1: Core Utilities & LINE Flex Builders | V.33.5 | 72 | LINE push, Flex templates, HMAC URL, bank helpers + **V.33.5 Phase 0 Hotfix**: `b2b_check_order_oos()` hierarchy-aware (expand SET → real-time MIN - reserved + manual_hold from DB + flag `dinoco_oos_gate_hierarchy_compute`) — Ticket #6266 |
+| Snippet 1: Core Utilities & LINE Flex Builders | V.33.6 | 72 | LINE push, Flex templates, HMAC URL, bank helpers + **V.33.6 polish**: M3 refactor ใช้ `b2b_get_product_data()` helper + H1 caveat static cache. **V.33.5 Phase 0 Hotfix**: `b2b_check_order_oos()` hierarchy-aware (expand SET → real-time MIN - reserved + flag `dinoco_oos_gate_hierarchy_compute`) — Ticket #6266 |
 | Snippet 2: LINE Webhook Gateway & Order Creator | V.34.0 | 51 | Webhook endpoint, order lifecycle, walk-in auto-complete, leaf-only stock deduct |
 | Snippet 3: LIFF E-Catalog REST API | V.41.2 | 52 | REST API (auth, catalog, orders, slip, flash, manual shipment webhook + label/status/test/reprint) + V.41.1/V.41.2: manual-flash-create แยก pickup (warehouse) จาก label (registered), concat reg_address parts |
 | Snippet 4: LIFF E-Catalog Frontend | V.32.4 | 53 | LIFF SPA for distributors (catalog, cart, history, SET detail view) + **V.32.2-V.32.4 UX overhaul**: qty stepper SET Detail (1-999) + back button ← กลับ + cart bar 64px green CTA z-index 600 + main SET stepper + cart thumbnails + sub-item stepper toggle + 🗑️ red remove |
@@ -152,24 +152,24 @@
 | Snippet 12: Admin Dashboard LIFF | V.31.2 | 65 | `[b2b_dashboard]`, `[b2b_stock_manager]`, `[b2b_tracking_entry]` |
 | Snippet 13: Debt Transaction Manager | V.2.0 | 1036 | Atomic debt operations (MySQL transactions, FOR UPDATE) |
 | Snippet 14: Order State Machine | V.1.5 | 1038 | B2B_Order_FSM class (14 statuses) |
-| Snippet 15: Custom Tables & JWT Session | V.7.4 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class, 3-level SKU hierarchy helpers + **V.7.4 Phase 0 Hotfix**: `dinoco_stock_auto_status()` cascade auto-unlock manual_hold (whitelist reason + 72h buffer + flag `dinoco_auto_unlock_enabled`) |
+| Snippet 15: Custom Tables & JWT Session | V.7.5 | 1039 | Product catalog table, JWT, DINOCO_MotoDB class, 3-level SKU hierarchy helpers + **V.7.5 polish**: M1 header doc drift fix (ลบ "FOR UPDATE race safety" — idempotent unlock ไม่ต้อง lock) + H1 static cache caveat. **V.7.4 Phase 0 Hotfix**: `dinoco_stock_auto_status()` cascade auto-unlock manual_hold (whitelist reason + 72h buffer + flag `dinoco_auto_unlock_enabled`) |
 
 ### 2.5 [B2F] -- Factory Purchasing System (13 Snippets)
 
 | File | Version | DB_ID | Description |
 |------|---------|-------|-------------|
-| Snippet 0: CPT & ACF Registration | V.3.3 | 1160 | 5 CPTs + ACF + poi_parent_sku/name + poi_parent_breakdown (DD-3 JSON) |
+| Snippet 0: CPT & ACF Registration | V.3.4 | 1160 | 5 CPTs + ACF + poi_parent_sku/name + poi_parent_breakdown (DD-3 JSON) + **V.3.4**: poi_parent_path (slash-separated hierarchy chain) |
 | Snippet 0.5: Maker Product Dual-Write | V.1.1 | pending | **NEW (Phase 2)** — `save_post_b2f_maker_product` hook flag-gated dual-write to junction. ACTIVE when `b2f_flag_shadow_write=true` (enabled 2026-04-16). CPT save → write junction mirror + observation entry. |
-| Snippet 1: Core Utilities & Flex Builders | V.6.4 | 1163 | 22 Flex templates + b2f_group_items_by_set (DD-3) + b2f_get_item_breakdown + b2f_compute_manufacturing_summary |
-| Snippet 2: REST API | V.10.1 | 1165 | 20+ endpoints + DD-7 breakdown + `catalog_map` LIFF filter + batch SKU lookup + **V.10.0 (Phase 3 cut-over)**: maker-products + CRUD reads `wp_dinoco_product_makers` junction when `b2f_flag_read_from_junction=true` (CPT fallback) via `b2f_read_maker_products_from_junction()` + **V.10.1**: code review fixes (1 CRITICAL + 3 HIGH + 4 MEDIUM + 3 LOW) + SET `compatible_models` respect direct value |
+| Snippet 1: Core Utilities & Flex Builders | V.6.6 | 1163 | 22 Flex templates + b2f_group_items_by_set (DD-3) + b2f_get_item_breakdown + b2f_compute_manufacturing_summary + **V.6.5**: flag helpers (b2f_is_flag_enabled, b2f_get_all_flags, b2f_log_flag_change) + **V.6.6**: b2f_group_items_by_path (3-level TOP→CHILD→leaves) + b2f_flex_po_items_list auto-switch |
+| Snippet 2: REST API | V.10.5 | 1165 | 20+ endpoints + DD-7 breakdown + `catalog_map` LIFF filter + batch SKU lookup + **V.10.0 (Phase 3 cut-over)**: maker-products + CRUD reads `wp_dinoco_product_makers` junction when `b2f_flag_read_from_junction=true` (CPT fallback) via `b2f_read_maker_products_from_junction()` + **V.10.1**: code review fixes (1 CRITICAL + 3 HIGH + 4 MEDIUM + 3 LOW) + SET `compatible_models` respect direct value + **V.10.2**: virtual SET inject walks ALL parents (intermediate sub-SETs) + **V.10.3**: DD-7 track `parent_path` per breakdown + `poi_parent_path` + po-detail return parent_path + **V.10.4**: `virtual_reason` field (shared_parts_assembled / intermediate_sub_set) + **V.10.5 (housekeeping M-3)**: docs-only — `poi_parent_path` top-level = probe-only (authoritative path per DD-3 occurrence lives in `breakdown[]`) |
 | Snippet 3: Webhook Handler & Bot Commands | V.3.0 | 1164 | Maker/Admin bot commands (via B2B webhook routing) |
 | Snippet 4: Maker LIFF Pages | V.4.2 | 1167 | `[b2f_maker_liff]` -- LANG system + hierarchy SET grouping |
-| Snippet 5: Admin Dashboard Tabs | V.6.0 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary + resolveSetName 4-level fallback + **V.6.0: Product Picker refactor — filter chips (ทั้งหมด/ชุด SET/เดี่ยว/ลูกชิ้นส่วน/ชิ้นส่วนย่อย) + count badges + hide empty + type badges + accordion row type badges — labels ตรงกับ Inventory V.43.6 + Snippet 8 V.5.4 (source of truth = /dinoco-stock/v1/stock/list)** |
+| Snippet 5: Admin Dashboard Tabs | V.6.3 | 1166 | `[b2f_admin_orders_tab]`, `[b2f_admin_makers_tab]` + accordion tree view + Primary/Secondary lock (DD-3) + shared badge + jumpToPrimary + resolveSetName 4-level fallback + **V.6.0: Product Picker refactor — filter chips (ทั้งหมด/ชุด SET/เดี่ยว/ลูกชิ้นส่วน/ชิ้นส่วนย่อย) + count badges + hide empty + type badges + accordion row type badges — labels ตรงกับ Inventory V.43.6 + Snippet 8 V.5.4 (source of truth = /dinoco-stock/v1/stock/list)** + **V.6.1**: respect `ui_role_override` (badge-only) + **V.6.2**: defensively filter `p.is_virtual !== true` ในทุก maker-products call + **V.6.3 (Option F Hybrid Admin Control)**: source badge (📦 CPT / ✨ Auto) + filter chips + checkbox + bulk-delete + blacklist viewer (endpoints `maker-products-with-source`, `junction-bulk-delete`, `autosync-blacklist`) |
 | Snippet 6: Order State Machine | V.1.5 | 1161 | B2F_Order_FSM class (12 statuses) |
 | Snippet 7: Credit Transaction Manager | V.1.4 | 1162 | Atomic payable ops (DINOCO owes Maker) |
-| Snippet 8: Admin LIFF E-Catalog | V.6.4 | 1168 | LIFF ordering + SET Detail View + Model Filter (V.5.3 inherit descendants + V.5.4 fallback ผ่าน catalogMap เมื่อ leaf ไม่อยู่ใน maker list) + type tabs (mutually exclusive) + count badges + hide empty + labels ตรงกับ Inventory "ชุด SET"/"เดี่ยว"/"ลูกชิ้นส่วน"/"ชิ้นส่วนย่อย" + shared badge + cart manufacturing summary (DD-3) + **V.5.5: removed window._b2fcat debug namespace (production cleanup)** + **V.5.7 Virtual SET display** (amber badge "ประกอบจากชิ้นส่วน" + is_virtual badge) + **V.5.10 Product Picker align Inventory V.43.6** + **V.6.0-V.6.4 UX overhaul**: qty stepper SET Detail (1-999) + back button redesign (← กลับ 44×44 dark) + cart bar black bg + green CTA z-index 600 + main SET stepper + cart thumbnails 56×56 + sub-item stepper toggle (`+ สั่งแยก` default) + 🗑️ red remove button |
+| Snippet 8: Admin LIFF E-Catalog | V.6.6 | 1168 | LIFF ordering + SET Detail View + Model Filter (V.5.3 inherit descendants + V.5.4 fallback ผ่าน catalogMap เมื่อ leaf ไม่อยู่ใน maker list) + type tabs (mutually exclusive) + count badges + hide empty + labels ตรงกับ Inventory "ชุด SET"/"เดี่ยว"/"ลูกชิ้นส่วน"/"ชิ้นส่วนย่อย" + shared badge + cart manufacturing summary (DD-3) + **V.5.5: removed window._b2fcat debug namespace (production cleanup)** + **V.5.7 Virtual SET display** (amber badge "ประกอบจากชิ้นส่วน" + is_virtual badge) + **V.5.10 Product Picker align Inventory V.43.6** + **V.6.0-V.6.4 UX overhaul**: qty stepper SET Detail (1-999) + back button redesign (← กลับ 44×44 dark) + cart bar black bg + green CTA z-index 600 + main SET stepper + cart thumbnails 56×56 + sub-item stepper toggle (`+ สั่งแยก` default) + 🗑️ red remove button + **V.6.5**: toggle "รวมชุดประกอบจากชิ้นส่วน" (default OFF) ซ่อน virtual top-level SETs + **V.6.6 (housekeeping M-2)**: virtual toggle localStorage scoped per-maker (`b2f_show_virtual_sets_{makerId}`) |
 | Snippet 9: PO Ticket View | V.3.5 | 1169 | PO detail + hierarchy SET grouping + view toggle (ตามชุด/ยอดรวมผลิต) (DD-3) |
-| Snippet 10: PO Image Generator | V.2.6 | 1170 | A4 PO PNG + hierarchy SET header rows |
+| Snippet 10: PO Image Generator | V.2.7 | 1170 | A4 PO PNG + hierarchy SET header rows + **V.2.7**: 3-level hierarchy rows (purple SET + blue CHILD + leaf rows) via `b2f_group_items_by_path` |
 | Snippet 11: Cron Jobs & Reminders | V.2.2 | 1171 | 7 cron เดิม + **V.2.2**: `b2f_junction_diff_cron` (hourly CPT vs junction drift log) + `b2f_observations_ttl_cron` (daily 60-day prune) |
 
 ### 2.6 [LIFF AI] -- AI Command Center (2 Snippets)
@@ -333,7 +333,7 @@ Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DI
 
 ### 3.7 B2F Migration Audit (`/wp-json/dinoco-b2f-audit/v1/`)
 
-Namespace สำหรับ B2F Option F migration audit. **Phase 3 ACTIVE** (2026-04-16) — reads flipped to junction. Registered ใน `[Admin System] B2F Migration Audit` V.3.1:
+Namespace สำหรับ B2F Option F migration audit. **Phase 3 ACTIVE** (2026-04-16) — reads flipped to junction. Registered ใน `[Admin System] B2F Migration Audit` V.3.3:
 
 **Phase 1 (observe-only)**:
 
@@ -1547,7 +1547,7 @@ sequenceDiagram
 | B2F Orders | `[b2f_admin_orders_tab]` | PO management |
 | B2F Makers | `[b2f_admin_makers_tab]` | Maker/product management |
 | B2F Credit | `[b2f_admin_credit_tab]` | Credit/payment tracking |
-| B2F Migration Audit | `[b2f_migration_audit]` | V.3.1 — Phase 1 observe + Phase 2 Shadow-Write + **Phase 3 ACTIVE** (reads junction since 2026-04-16) — 9 REST endpoints + Phase 3 flag toggle UI + code review fixes |
+| B2F Migration Audit | `[b2f_migration_audit]` | V.3.3 — Phase 1 observe + Phase 2 Shadow-Write + **Phase 3 ACTIVE** (reads junction since 2026-04-16) — 13 REST endpoints (+ V.3.2 Option F Hybrid Admin Control: maker-products-with-source, junction-bulk-delete, autosync-blacklist GET+POST) + Phase 3 flag toggle UI + code review fixes + V.3.3 housekeeping H-1 docs |
 
 #### LIFF Pages (Admin)
 

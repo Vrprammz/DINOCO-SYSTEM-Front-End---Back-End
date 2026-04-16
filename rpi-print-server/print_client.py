@@ -41,12 +41,14 @@ TEMPLATE_DIR = os.path.join(BASE_DIR, 'templates')
 SOUND_DIR = os.path.join(BASE_DIR, 'sounds')
 STATE_FILE = '/tmp/dinoco-print-state.json'
 
+# V.41: drop RotatingFileHandler — systemd journal เก็บ stdout อยู่แล้ว
+# (ก่อนหน้านี้บาง setup systemd v256+ default sandbox ทำให้ EROFS เขียนไฟล์ไม่ได้)
+# Log ดูผ่าน: journalctl -u dinoco-print -f
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(),
-        RotatingFileHandler(os.path.join(BASE_DIR, 'print_client.log'), maxBytes=5*1024*1024, backupCount=2),
     ]
 )
 logger = logging.getLogger('dinoco-print')
