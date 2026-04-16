@@ -194,10 +194,22 @@ def create_white_logo(src_path):
 
     WeasyPrint doesn't support CSS filter:invert(), so we create the inverted image file.
 
+    V.42: ออกไปที่ tmp/ subdir (systemd ReadWritePaths whitelist) แทน assets/ (read-only
+    ใน sandbox) — ป้องกัน silent fail ที่ทำให้ logo หายไปจาก invoice
+
     Returns:
         str: path to the white logo file, or empty string on failure
     """
-    white_path = src_path.replace('.png', '_white.png')
+    if not src_path or not os.path.exists(src_path):
+        return ''
+    # Write to tmp/ subdir (in ReadWritePaths) — assets/ is read-only under systemd sandbox
+    tmp_dir = os.path.join(BASE_DIR, 'tmp')
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+    except OSError as e:
+        logger.warning(f'Cannot create tmp dir: {e}')
+        return ''
+    white_path = os.path.join(tmp_dir, 'logo_white.png')
     # Return cached version if already exists and newer than source
     if os.path.exists(white_path) and os.path.getmtime(white_path) >= os.path.getmtime(src_path):
         return white_path
