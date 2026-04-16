@@ -190,21 +190,73 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
 - **Security patterns**: WordPress nonce verification, honeypot fields, rate limiting via transients, `sanitize_text_field`/`esc_html`/`esc_url` for output.
 - **CSS scoping**: Styles are inline within each PHP file. Recent work has focused on scoping CSS to avoid cross-module conflicts.
 - **Inventory System** (V.6.0): `dinoco_stock_add/subtract()` ใน Snippet 15 — atomic `FOR UPDATE` lock per SKU + warehouse sync. ตัดสต็อกตอน `awaiting_confirm` (ไม่ใช่ shipped) ผ่าน hook `b2b_order_status_changed` priority 5. Auto-cancel 30 นาทีถ้าตัวแทนไม่ confirm (`dinoco_inv_auto_cancel` cron + lazy check). `dinoco_stock_auto_status()` compute `stock_display` = in_stock/low_stock/out_of_stock (low_stock เป็น computed ไม่เก็บ DB) + **cascade update ancestor ทุกระดับ** (grandchild→child→parent). Flag `dinoco_inv_initialized` ต้อง true ก่อน auto_status ทำงาน (Admin ทำ Dip Stock ครั้งแรก). **3-Level SKU Hierarchy** (V.6.0): รองรับแม่→ลูก→ชิ้นส่วนย่อย (max depth 3). ตัดสต็อกเฉพาะ leaf nodes เท่านั้น (DD-2). Parent stock = MIN(children computed stock) recursive. B2F receive → `dinoco_stock_add()`. Cancel → `dinoco_stock_add()` คืน leaf.
-- **B2B Backorder System V.1.1** (Phase A-D, 2026-04-16, commit `14ce7b4`): NEW `[B2B] Snippet 16` Opaque Accept + Admin Split BO per `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`. Master flag `b2b_flag_bo_system` **default OFF** — Phase 0 hotfix ยังทำงานต่อจนกว่าจะ canary rollout.
-  - **Custom tables**: `wp_dinoco_order_attempt_log` (audit 90d chunked cleanup) + `wp_dinoco_bo_queue` (BO tracking utf8mb4_bin sku + idx_status_resolved).
-  - **8 REST endpoints** `/b2b/v1/bo-*`: bo-split (invariant + leaf subtract + bo_queue + debt + FSM + 10min undo window), bo-confirm-full, bo-reject, bo-undo-split (1 max/order), bo-fulfill (FOR UPDATE + debt + transition), bo-cancel-item, bo-queue GET, bo-restock-scan.
-  - **Place-order gate**: hard caps (qty≤500 + items≤50) + rate limits (10/hr + 50/day + daily qty 2000/SKU + tier value cap + **unique-SKU/day 20** + **suspicious qty flagger** 100/500/1000/2000 → Telegram) + **artificial jitter 50-150ms**.
-  - **Opaque accept**: status → `pending_stock_review` + `_b2b_stock_snapshot` (admin-only) + admin Flex notification.
-  - **Security C1**: Admin Flex **bucket indicator** (`✓ พอ` / `⚠️ หมด` / `⚠️ ไม่พอ`) — ไม่เผย exact qty ใน LINE group (insider threat protection). Exact qty เฉพาะใน Admin Dashboard UI.
-  - **CSRF**: WP admin `X-WP-Nonce` + admin LINE LIFF JWT session token.
-  - **FSM V.1.6** (Snippet 14): `pending_stock_review` + `partial_fulfilled` states + transitions ครบ spec.
-  - **6 cron jobs**: restock_scan 15min + eta_warn daily + pending_review_expire hourly (72h timeout) + enumeration_scan (>5 cancels/24h + >3 qty-cap hits → Telegram) + attempt_log_cleanup (chunked 1000/iter + 50ms gap).
-  - **4 Flex builders**: stock_review_admin (bucket), partial_fulfill_customer (combined ส่งทันที + รอสต็อก + ETA), bo_ready_customer, bo_cancelled_customer.
-  - **Walk-in bypass**: `is_walkin=1` skip opaque accept (ใช้ awaiting_confirm เดิม).
-  - **REST response filter**: `rest_prepare_post` hide `_b2b_stock_snapshot` + `_b2b_enumeration_flags` จาก non-admin.
-  - **Deferred (Phase A Day 2)**: Admin Dashboard Backorders tab UI (~500 LOC, Snippet 5 edit) + LIFF customer split view (~150 LOC, Snippet 4/11) + Phase E gradual rollout (real-time canary 3 weeks).
-  - **Rollback**: `update_option('b2b_flag_bo_system', false)` → revert to Phase 0 hotfix — instant, no re-deploy.
-  - **Pending security/DB fixes**: C2 rate limit race (upstream `b2b_rate_limit()` helper), C3 full meta filter (needs CPT `show_in_rest: false`), C4 XSS in audit log viewer (admin UI deferred), H4 cancel grace period (cancel-request endpoint not yet refactored).
+- **B2B Backorder System V.1.6** (Phase A-D complete, 2026-04-16): NEW `[B2B] Snippet 16` (~3497 LOC) — **Opaque Accept + Admin Split BO** per `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`. Master flag `b2b_flag_bo_system` **default OFF** — canary rollout per distributor. Commits: `14ce7b4` (Phase A-D foundation) + `b535b90` (V.1.2 admin UI) + `8f1ce76` (V.1.3 pending review bug fix) + `a0d3f82` (V.1.4 banner clarity) + `c2565c3` (V.1.5 Security Log + C3 meta hardening + LIFF split view) + `f35f059` (C1-C4 architect CRITICAL fixes) + `d1a0e3e` (V.1.6 H1-H6 + M3 + M6/M7 architect HIGH/MEDIUM fixes).
+  - **Philosophy shift**: "realtime stock check on order" → "opaque accept + admin split review" — block **stock enumeration attack** (log₂(stock) probe) + enable partial fulfill workflow + eliminate `b2b_check_order_oos()` drift.
+  - **Custom tables** (`[B2B] Snippet 15` helpers): `wp_dinoco_order_attempt_log` (audit 90d chunked cleanup, idx_created + idx_dist_action_time) + `wp_dinoco_bo_queue` (BO tracking utf8mb4_bin sku + UNIQUE order_id+item_index + idx_status_resolved).
+  - **14 REST endpoints** `/b2b/v1/bo-*`:
+    - **Admin write**: `bo-split` (invariant validate + per-SKU leaf subtract + bo_queue insert + per-SKU compound debt + FSM → partial_fulfilled + 10min undo window), `bo-confirm-full`, `bo-reject`, `bo-undo-split` (1 max/order), `bo-fulfill` (FOR UPDATE + debt + transition awaiting_confirm ถ้า resolved ครบ + fire `b2b_bo_items_fulfilled` action), `bo-cancel-item`, `bo-update-eta`, `bo-bulk-fulfill`, `bo-bulk-cancel`
+    - **Admin read**: `bo-queue` (filter status/sku/age + summary), `bo-pending-review` (server-side meta_query — แก้ WP REST quirk), `bo-order-detail` (single record + fresh_snapshot real-time recompute), `bo-summary` (badge counts), `bo-restock-scan` (manual trigger)
+    - **Admin manage**: `bo-clear-enum-flag` (false-positive clear)
+    - Permission: `manage_options` OR admin LINE JWT session — POST endpoints require `X-WP-Nonce` (CSRF defense H1)
+  - **Place-order gate** (Snippet 16 hook `rest_pre_dispatch` priority 5): hard caps (qty ≤500/item + items ≤50/order) + rate limits (10/hr + 50/day via `b2b_rate_limit()` V.33.7 atomic GET_LOCK + daily qty 2000/SKU + tier value cap standard 50k → diamond unlimited + **unique-SKU/day 20** + **suspicious qty flagger** 100/500/1000/2000 → Telegram alert) + **artificial jitter 50-150ms** (timing side-channel defense H3).
+  - **Opaque accept flow** (Snippet 2 V.34.4 C2 FIX + Snippet 3 V.41.4 C1 FIX):
+    1. Customer `place-order` → Snippet 3 fires `do_action('b2b_place_order_post_process', $order_id, $dist_id, $items, $total)` (C1)
+    2. Customer `confirm_order` postback → Snippet 2 checks `b2b_bo_flag_enabled($dist_id)` BEFORE OOS check (C2): ถ้า ON → transition `draft → pending_stock_review` + `_b2b_stock_snapshot` meta (admin-only) + `_b2b_opaque_accept_at` timestamp + increment daily counters + `b2b_log_attempt('place_order', accepted)` + notify admin Flex bucket + reply customer opaque "รอแอดมินตรวจสอบ 2-4 ชม." — **ไม่เผย stock info**
+    3. Admin receive Flex stock review bucket (no exact qty) → กด **ยืนยันเต็ม** (bo-confirm-full → awaiting_confirm + debt full) / **Split BO** (deep-link Admin Dashboard → Backorders tab → modal + validate invariant `qty_fulfill + qty_bo = qty` + per-SKU compound debt + bo_queue insert) / **ปฏิเสธ** (cancelled + revert counters)
+    4. Customer ได้รับ combined Flex "✅ จัดส่งทันที N ชิ้น + ⏳ รอสต็อก M ชิ้น + ETA + [ยืนยันบิล] [ดูออเดอร์]" (M6 FIX)
+    5. Restock cron (15min) → scan bo_queue pending + check available → mark ready + Telegram alert
+    6. Admin `bo-fulfill` → stock subtract + debt add + FSM transition + fire `b2b_bo_items_fulfilled` action → H5 Flash secondary order + H6 print queue + notify customer BO ready Flex (M7 FIX with [ยืนยันบิล BO] [ดูออเดอร์] footer)
+  - **Security hardening** (4 CRIT + 5 HIGH + 3 MED จาก security-pentester review):
+    - **C1 Admin Flex bucket indicator**: แสดง `✓ พอ` / `⚠️ หมด` / `⚠️ ไม่พอ` ไม่เผย exact qty ใน LINE group (insider threat) — Admin Dashboard UI แสดง exact qty ได้ (gated manage_options)
+    - **C2 rate limit race**: `b2b_rate_limit()` V.33.7 atomic via MySQL `GET_LOCK/RELEASE_LOCK` 2s timeout + try/finally — wrap critical section serialize across PHP workers
+    - **C3 meta filter hardening**: `register_post_meta` ทั้ง 8 admin-only meta keys (`_b2b_stock_snapshot`, `_b2b_enumeration_flags`, `_b2b_opaque_accept_at`, etc.) with `show_in_rest=false` + `auth_callback=manage_options` + `rest_prepare_b2b_order` filter strip meta จาก non-admin response (defense-in-depth)
+    - **C4 XSS audit log**: Security Log viewer `esc_html()` ทุก user input (IP, UA) + UA truncated 50 chars
+    - **H1 CSRF**: WP admin X-WP-Nonce (wp_rest) + admin LINE LIFF JWT session token + GET read-only skip nonce
+    - **H2 unique-SKU/day cap 20** + suspicious qty flagger — block cross-SKU enumeration (Vector D)
+    - **H3 artificial jitter 50-150ms** — mask timing variance (σ <100ms realistic ใน WP)
+    - **H4 cancel grace period** (Snippet 3 V.41.3): first 5 min after order = unlimited (legitimate UX) + after grace = 2/hr + 10/day + log attempts for enumeration scan
+    - **H5 undo 1 max per order** — prevent oscillation attack (stock probe via split → undo → split loop)
+  - **DB schema hardening** (2 CRIT + 5 HIGH จาก database-expert review): dbDelta pattern correct (KEY syntax + $charset + PRIMARY KEY inside) + VARCHAR ไม่ใช่ ENUM (ALTER-friendly) + idx_created + idx_dist_action_time + idx_status_resolved + user_agent VARCHAR(128) + DECIMAL(14,2) + sku utf8mb4_bin + FOR UPDATE lock ใน bo-fulfill + chunked cleanup cron (1000/iter + 50ms gap).
+  - **FSM V.1.6** (Snippet 14): 2 new states `pending_stock_review` + `partial_fulfilled` + 8 new transitions:
+    - `draft → pending_stock_review` (customer, via confirm_order BO gate)
+    - `pending_stock_review → awaiting_confirm` (admin, bo-confirm-full)
+    - `pending_stock_review → partial_fulfilled` (admin, bo-split)
+    - `pending_stock_review → cancelled` (admin/customer/system — reject/cancel-request/timeout cron)
+    - `partial_fulfilled → awaiting_confirm` (any — all BO resolved = fulfilled + cancelled)
+    - `partial_fulfilled → pending_stock_review` (admin, bo-undo-split 10min + 1 max)
+    - `partial_fulfilled → cancelled` (admin, manual escalation)
+    - Legacy `checking_stock` ยังคงทำงาน — backward compat สำหรับ orders เก่าและ flag OFF path
+  - **6 cron jobs**: `b2b_bo_restock_scan_cron` (15min — promote pending → ready ถ้า available ≥ qty_bo) + `b2b_bo_eta_warn_cron` (daily 09:00 — ETA < +3d alert) + `b2b_bo_pending_review_expire_cron` (hourly — 72h auto-cancel) + `b2b_bo_enumeration_scan_cron` (hourly — >5 cancels/24h OR >3 qty_cap_hits/24h → Telegram `enumeration_attempt` + update `_b2b_enumeration_flags` bit field) + `b2b_bo_attempt_log_cleanup_cron` (daily 03:00 — chunked 1000/iter + 50ms gap + 20 max iterations).
+  - **4 Flex builders**:
+    - `b2b_build_flex_stock_review_admin` (bucket indicator, admin group, navy header + yellow split button + footer [ยืนยันเต็ม] [Split BO → Admin Dashboard] [ปฏิเสธ])
+    - `b2b_build_flex_partial_fulfill_customer` (navy header "ออเดอร์ #X ยืนยันแล้ว", 2 sections ✅ จัดส่งทันที + ⏳ รอสต็อก + ETA + total breakdown + footer [ยืนยันบิล] [ดูออเดอร์] M6 FIX)
+    - `b2b_build_flex_bo_ready_customer` (green header, items list + ยอดชำระเพิ่ม + footer [ยืนยันบิล BO] [ดูออเดอร์] M7 FIX)
+    - `b2b_build_flex_bo_cancelled_customer` (red header, single item cancel notification)
+  - **4 Admin shortcodes** (ฝังใน Admin Dashboard V.32.5 sidebar "ระบบ B2B"):
+    - `[b2b_bo_admin]` Backorder Management — 2 tabs (Pending Review ใช้ `/bo-pending-review` server-side filter + Backorders queue + Split Review modal live validation + action buttons + Restock Scan + filter + age buckets + scoped CSS `.b2b-bo-admin`)
+    - `[b2b_bo_flags]` Flag Manager — toggle 3 flags UI (dinoco_oos_gate_hierarchy_compute default ON + dinoco_auto_unlock_enabled OFF + b2b_flag_bo_system OFF) + config viewer (rate limits/qty caps/timeouts) + informational banner แยก "สถานะปัจจุบัน" vs "ก่อนเปิด Phase A-D"
+    - `[b2b_bo_security_log]` Security Log — attempt log viewer + 4 stat cards (accepted/rejected/rate_limit/error) + flagged distributors list (bit-field labels rate_hit/cancel_abuse/qty_cap_hit/suspicious_pattern) + filter action×result×days×dist + pagination 50/page + CSV export (UTF-8 BOM + 5000 rows cap + wp_nonce verify)
+    - `[b2b_bo_customer_order_detail order_id="N"]` LIFF customer split view (embedded in Snippet 11 V.30.3 `[b2b_orders]`) — 2 states: pending_stock_review "⏳ รอตรวจสอบ 2-4 ชม." / partial_fulfilled (2 sections ส่งทันที + BO items + ETA + total breakdown) — customer-safe ไม่มี stock numbers
+  - **Admin Dashboard V.32.5 integration**:
+    - 3 tabs sidebar "ระบบ B2B": Backorders (📋) + BO Flags (🚩) + Security Log (🛡️)
+    - Lazy-load ผ่าน `dnc_lazy_load_module` AJAX + transient cache
+    - Badge updater `fetchBoBadge()` poll `/bo-summary` ทุก 60s (H1 FIX) — badge = pending_review + bo_ready
+    - Breadcrumb + URL hash (#backorders) — refresh stay on tab
+  - **Integration hooks** (`b2b_bo_items_fulfilled` action fires on `bo-fulfill` success):
+    - **H5 Flash shipping secondary order**: Priority 10 listener prefer `b2b_flash_create_secondary()` helper (if exists) or fallback `b2b_flash_create_order() + is_bo_secondary: true` — graceful degradation ถ้า Flash helper ไม่พร้อม (log only)
+    - **H6 Print queue secondary label**: Priority 20 listener `b2b_enqueue_print_job($order_id, source: 'bo_fulfill')` + fallback meta flag `_print_queued_bo` สำหรับ RPi dashboard manual reprint
+    - **M3 debt precision**: bo-split compute `$confirmed_value = sum(price × qty_fulfill) per SKU` (spec §5.2 step 5) — ไม่ใช้ ratio approximation
+  - **Walk-in bypass**: `get_field('is_walkin', $dist_id) === true` → skip opaque accept gate — ใช้ `awaiting_confirm` เดิม + `allow_negative=true` for stock subtract
+  - **LINE bot integration** (Snippet 2 V.34.4):
+    - BO flag gate ก่อน OOS check ใน `b2b_action_confirm_order` — route ไป `pending_stock_review` + snapshot + notify admin Flex + opaque customer reply
+    - Postback handlers `bo_confirm_full` + `bo_reject` (hook into `b2b_webhook_postback_action` filter)
+  - **Feature flags** (wp_options):
+    - `b2b_flag_bo_system` (default OFF) — master switch
+    - `b2b_flag_bo_beta_distributors` (default empty array) — whitelist distributor IDs for canary
+    - 12 config keys: `b2b_bo_max_qty_per_item` 500, `b2b_bo_rate_place_per_hour` 10, `b2b_bo_rate_place_per_day` 50, `b2b_bo_rate_cancel_per_hour` 2, `b2b_bo_rate_cancel_per_day` 10, `b2b_bo_daily_qty_per_sku` 2000, `b2b_bo_daily_unique_sku_cap` 20, `b2b_bo_tier_value_caps`, `b2b_bo_pending_review_timeout_hours` 72, `b2b_bo_split_undo_window_minutes` 10, `b2b_bo_eta_default_days` 7, `b2b_bo_eta_warn_days` 14, `b2b_bo_cancel_grace_minutes` 5, `b2b_bo_anomaly_cancel_24h` 5, `b2b_bo_anomaly_qty_cap_24h` 3
+  - **Deferred (low priority)**: Bulk UI checkboxes ใน Backorders tab (endpoints พร้อม), Manual ETA button UI (endpoint พร้อม), Flag audit log, Beta distributor management UI, REG-028..034 regression scenarios, WORKFLOW-REFERENCE.md BO flow diagram
+  - **Rollback**: `update_option('b2b_flag_bo_system', false)` → revert to Phase 0 hotfix — instant, no re-deploy. Per-tier rollback = remove distributor IDs จาก `b2b_flag_bo_beta_distributors`.
+  - **Related files** (14 touched): `[B2B] Snippet 1` V.33.7 (rate limit atomic) + `[B2B] Snippet 2` V.34.4 (confirm_order BO gate) + `[B2B] Snippet 3` V.41.4 (place-order hook + cancel grace) + `[B2B] Snippet 11` V.30.3 (customer LIFF BO status + embed split view) + `[B2B] Snippet 14` V.1.6 (FSM 2 new states) + `[B2B] Snippet 16` V.1.6 (master 3497 LOC) + `[Admin System] DINOCO Admin Dashboard` V.32.5 (3 tabs + badge)
 - **B2B OOS Gate Hotfix V.33.5 + V.7.4** (Phase 0 Ticket #6266, 2026-04-16): Bug — ลูกค้าสั่ง SET `DNCSETNX500IRNB` (stock=10 จริง), ระบบตอบ "สินค้าหมดชั่วคราว" BO ข้าม admin check. Root cause: `b2b_check_order_oos()` อ่าน `stock_status` column ดิบ (drift-prone) + ไม่ expand SET → leaves + `manual_hold=1` ค้างจาก admin mark OOS เก่าโดยไม่มี auto-unlock.
   - **Snippet 1 V.33.5**: `b2b_check_order_oos()` hierarchy-aware — non-leaf SET → `delete_transient('b2b_reserved_map_bulk')` + real-time `compute_hierarchy_stock - reserved`, อ่าน manual_hold ตรงจาก DB (b2b_get_product_data ไม่ return reason), OOS ถ้า manual_hold=1 OR available < qty. Leaf ยังใช้ `b2b_check_oos_memory()` เดิม (backward compat). Feature flag `dinoco_oos_gate_hierarchy_compute` default ON.
   - **Snippet 15 V.7.4**: `dinoco_stock_auto_status()` cascade block เพิ่ม auto-unlock manual_hold (opt-in). Whitelist reason: `'Admin manual OOS'` + `'migrated from OOS timer'` (admin custom reason ไม่ clear). 72h buffer + FOR UPDATE + reuse `b2b_unlock_product_oos()` helper (dual-write ACF + cache invalidate). Feature flag `dinoco_auto_unlock_enabled` default OFF (canary).

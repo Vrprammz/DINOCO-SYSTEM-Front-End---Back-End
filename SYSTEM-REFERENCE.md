@@ -304,6 +304,32 @@ invoice/list, invoice/get, invoice/init, invoice/create, invoice/update, invoice
 
 > **V.33.6**: Manual Invoice System re-registers `GET /b2b/v1/products` locally (ชี้ callback ไป `b2b_rest_list_products` ของ Snippet 9 ที่ยังเก็บเป็น dead code หลัง V.35.0) เพราะ frontend `invLoadProducts()` ยังต้องใช้ route เดิม. Guarded ด้วย `function_exists` → return 503 ถ้า Snippet 9 disabled.
 
+### 3.5.1 Backorder System — Phase A-D (`/wp-json/b2b/v1/bo-*`) -- 14 endpoints
+
+Namespace สำหรับ B2B Backorder System ([B2B] Snippet 16 V.1.6). Master flag `b2b_flag_bo_system` default OFF — canary rollout per distributor. ทุก endpoint permission callback = `b2b_bo_permission_admin` (manage_options + X-WP-Nonce OR admin LINE JWT session).
+
+| Method | Endpoint | Purpose | Gates |
+|--------|----------|---------|-------|
+| POST | `/bo-split` | Split pending order → fulfilled + BO items | invariant check, per-SKU compound debt, 10min undo window |
+| POST | `/bo-confirm-full` | Admin confirms full stock (no split) | FSM pending_stock_review → awaiting_confirm |
+| POST | `/bo-reject` | Admin rejects entire order | revert counters + notify customer cancelled |
+| POST | `/bo-undo-split` | Undo split within 10min window | 1 max/order, must have no fulfilled BO |
+| POST | `/bo-fulfill` | Ship BO items after restock | FOR UPDATE lock, fire `b2b_bo_items_fulfilled` action (H5 Flash + H6 print) |
+| POST | `/bo-cancel-item` | Cancel discontinued BO line | soft mark, customer notify |
+| POST | `/bo-update-eta` | Admin extend/change ETA | whitelist pending/ready status only |
+| POST | `/bo-bulk-fulfill` | Batch fulfill multiple BO queue items | group by order_id + loop |
+| POST | `/bo-bulk-cancel` | Batch cancel BO items (discontinued SKU) | loop + per-item cancel |
+| POST | `/bo-restock-scan` | Manual trigger restock scan | also called by cron every 15min |
+| POST | `/bo-clear-enum-flag` | Admin clear false-positive enumeration flag | removes `_b2b_enumeration_flags` meta |
+| GET | `/bo-queue` | List BO queue (filter status/sku/age) | returns summary + age_bucket (fresh/warn/old/ready) |
+| GET | `/bo-pending-review` | List orders status=pending_stock_review | server-side meta_query (แก้ WP REST quirk) |
+| GET | `/bo-order-detail?order_id=N` | Single order + fresh_snapshot (real-time recompute) | fallback to stock_snapshot |
+| GET | `/bo-summary` | Badge counts for sidebar | pending_review + bo_pending + bo_ready + enumeration_flagged |
+
+**Supporting endpoints** (ใน Snippet 3 V.41.4): `do_action('b2b_place_order_post_process')` หลังสร้าง order → Snippet 16 listener ตรวจ flag + route ไป `pending_stock_review`.
+
+**Supporting endpoints** (ใน Snippet 3 V.41.3): `/cancel-request` — grace period 5 นาทีแรก (unlimited) + หลัง grace = 2/hr + 10/day + log attempts via `b2b_log_attempt`.
+
 ### 3.6 Inventory / Stock Management (`/wp-json/dinoco-stock/v1/`)
 
 Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DINOCO Global Inventory Database`):
@@ -979,13 +1005,15 @@ dinoco_moto_brands → dinoco_moto_models (1:N) -- Motorcycle catalog
 
 ## 6. FSM Statuses (B2B + B2F)
 
-### 6.1 B2B Order Statuses (FSM V.1.5)
+### 6.1 B2B Order Statuses (FSM V.1.6 — 16 statuses)
 
 | Status | Label (TH) | Next Possible |
 |--------|-----------|---------------|
-| draft | แบบร่าง | checking_stock, awaiting_confirm (walk-in), cancelled |
+| draft | แบบร่าง | checking_stock, awaiting_confirm (walk-in), **pending_stock_review (BO V.1.6)**, cancelled |
 | checking_stock | ตรวจสต็อก | awaiting_confirm, backorder, cancel_requested |
-| backorder | ของหมด | checking_stock, awaiting_confirm, cancelled |
+| backorder | ของหมด (legacy) | checking_stock, awaiting_confirm, cancelled |
+| **pending_stock_review** | **⏳ รอตรวจสอบ (BO opaque accept)** | awaiting_confirm (admin confirm-full), partial_fulfilled (admin split), cancelled (admin reject / customer cancel / cron 72h timeout) |
+| **partial_fulfilled** | **📦 บางส่วน + BO** | awaiting_confirm (all BO resolved — any actor), pending_stock_review (admin undo-split 10min + 1 max), cancelled (admin escalation) |
 | awaiting_confirm | รอยืนยันบิล | awaiting_payment, cancel_requested, change_requested |
 | awaiting_payment | รอชำระ | paid, cancel_requested |
 | paid | จ่ายแล้ว | packed, shipped, completed, claim_opened |
@@ -998,6 +1026,8 @@ dinoco_moto_brands → dinoco_moto_models (1:N) -- Motorcycle catalog
 | completed | เสร็จสิ้น | cancelled (walk-in only, admin) |
 | cancelled | ยกเลิก | (terminal) |
 
+> **V.1.6 Note (BO System):** 2 new states `pending_stock_review` + `partial_fulfilled` added for Opaque Accept + Admin Split BO workflow. เปิด via flag `b2b_flag_bo_system=ON`. Legacy `checking_stock` ยังคงทำงาน — backward compat สำหรับ orders เก่าและ flag OFF path.
+>
 > **V.1.5 Note:** `cancel_requested` now goes through FSM properly (V.39.2 REST API). All cancel request transitions are validated by `B2B_Order_FSM::can_transition()` instead of ad-hoc status checks.
 
 ### 6.2 B2F Order Statuses (FSM V.1.5)

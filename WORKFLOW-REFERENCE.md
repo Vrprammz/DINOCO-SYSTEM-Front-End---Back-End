@@ -248,6 +248,170 @@ Manual Shipping:
 End State: Order shipped → completed
 ```
 
+### 2.10 B2B Backorder System -- Opaque Accept + Admin Split BO (V.1.6, 2026-04-16)
+
+Phase A-D implementation per `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`. Master flag `b2b_flag_bo_system` default OFF.
+
+#### 2.10.1 Customer Opaque Accept Flow
+
+```
+Agent LIFF → เลือกสินค้า + qty → กด "สั่งซื้อ"
+    ↓
+POST /b2b/v1/place-order
+    ├─ Snippet 3 V.41.4: sanitize + price lookup server-side + duplicate dedup
+    ├─ Snippet 16 hook (rest_pre_dispatch priority 5): hard caps + rate limits
+    │     * qty ≤ 500/item + items ≤ 50/order
+    │     * 10/hr + 50/day + 2000 qty/SKU/day + tier value cap
+    │     * unique-SKU/day 20 + suspicious qty flagger (100/500/1000/2000 → Telegram)
+    │     * artificial jitter 50-150ms (timing side-channel)
+    ├─ สร้าง order status=draft + _b2b_order_draft_at
+    └─ fire do_action('b2b_place_order_post_process') — C1 hook
+         ↓
+Customer รับ Flex card draft → กด "ยืนยันสั่ง" postback
+    ↓
+Snippet 2 V.34.4 b2b_action_confirm_order:
+    ├─ lock + status check (draft)
+    ├─ Walk-in path → awaiting_confirm ตามเดิม (skip opaque accept)
+    └─ Non-walkin:
+         ├─ C2 GATE: if b2b_bo_flag_enabled($dist_id):
+         │     ├─ transition draft → pending_stock_review
+         │     ├─ snapshot _b2b_stock_snapshot (admin-only, filtered from REST)
+         │     ├─ _b2b_opaque_accept_at = now()
+         │     ├─ increment daily counters (qty + value per SKU)
+         │     ├─ b2b_log_attempt('place_order', accepted)
+         │     ├─ b2b_bo_notify_admin_stock_review() — Flex bucket indicator
+         │     └─ reply customer OPAQUE "✅ รับคำสั่งซื้อ รอ admin 2-4 ชม."
+         └─ else (flag OFF): legacy OOS check → checking_stock (existing flow)
+
+End State: order status=pending_stock_review, awaiting admin review
+```
+
+#### 2.10.2 Admin Split Review Flow
+
+```
+Admin LINE Group → Flex "🔔 ตรวจสอบสต็อก #ORDER"
+    ┌────────────────────────────────────┐
+    │ SKU A  สั่ง 10 · ⚠️ ไม่พอ           │ ← bucket only, ไม่มี exact qty
+    │ SKU B  สั่ง 5  · ✓ พอ               │
+    │ ───────                            │
+    │ ยอด: ฿X,XXX · สต็อกไม่พอ 1 รายการ │
+    └────────────────────────────────────┘
+    [✅ ยืนยันเต็ม]  [⚙️ Split BO]  [❌ ปฏิเสธ]
+
+Option A: [✅ ยืนยันเต็ม]
+    → POST /b2b/v1/bo-confirm-full
+    → FSM pending_stock_review → awaiting_confirm
+    → existing stock subtract + debt flow
+
+Option B: [⚙️ Split BO] → URI deep-link → Admin Dashboard
+    → Sidebar → ระบบ B2B → Backorders → Pending Review tab
+    → กด "Split" row → open modal:
+       ┌─────────────────────────────────┐
+       │ SKU A (สั่ง 10 · สต็อก 8)       │
+       │   ส่งทันที: [8]  BO: [2]  ETA: [7d] │
+       │ SKU B (สั่ง 5 · สต็อก 20)       │
+       │   ส่งทันที: [5]  BO: [0]        │
+       │ ───────                         │
+       │ สรุป: ส่ง 13 · BO 2             │
+       └─────────────────────────────────┘
+       [ยืนยัน Split]
+    → POST /b2b/v1/bo-split
+       ├─ validate invariant (qty_fulfill + qty_bo = order_qty per SKU)
+       ├─ per-SKU leaf stock subtract (DD-2 — dinoco_get_leaf_skus)
+       ├─ insert bo_queue rows (status=pending + eta_date)
+       ├─ per-SKU compound debt = Σ(price × qty_fulfill) — M3 FIX precision
+       ├─ FSM pending_stock_review → partial_fulfilled
+       ├─ set undo window (10 min + 1 max/order)
+       └─ notify customer combined Flex (M6 FIX footer [ยืนยันบิล] [ดูออเดอร์])
+
+Option C: [❌ ปฏิเสธ]
+    → POST /b2b/v1/bo-reject
+    → FSM → cancelled + revert daily counters + notify customer
+
+End State: order is partial_fulfilled (BO pending) OR awaiting_confirm (full) OR cancelled
+```
+
+#### 2.10.3 Restock + Fulfill Cycle
+
+```
+Cron b2b_bo_restock_scan_cron (every 15 min)
+    ↓
+SELECT bo_queue WHERE status='pending'
+    ↓
+ต่อแต่ละ row:
+    available = dinoco_compute_hierarchy_stock(sku) - dinoco_get_reserved_qty(sku)
+    IF available >= qty_bo:
+        UPDATE bo_queue SET status='ready'
+        Telegram alert bo_restock_ready
+    ↓
+Admin Dashboard → Backorders tab → filter status=ready
+    ↓
+ต่อแถว [ส่ง BO]
+    → POST /b2b/v1/bo-fulfill
+    ├─ FOR UPDATE lock bo_queue row (H4 DB race fix)
+    ├─ per-leaf stock_subtract($leaf, $qty, 'b2b_bo_fulfilled')
+    ├─ b2b_debt_add(dist_id, price × qty_bo)
+    ├─ IF all bo_queue of order resolved → FSM partial_fulfilled → awaiting_confirm
+    ├─ do_action('b2b_bo_items_fulfilled') — H5 + H6:
+    │     * H5 Flash secondary order (b2b_flash_create_secondary หรือ b2b_flash_create_order + is_bo_secondary)
+    │     * H6 print queue secondary label (b2b_enqueue_print_job source=bo_fulfill หรือ meta _print_queued_bo)
+    └─ notify customer Flex BO ready (M7 FIX footer [ยืนยันบิล BO] [ดูออเดอร์])
+
+End State: BO items shipped + debt updated + billing flow continues
+```
+
+#### 2.10.4 Cancel / Undo Flows
+
+```
+Customer cancel (LIFF) → POST /b2b/v1/cancel-request (Snippet 3 V.41.3)
+    ├─ grace period: first 5 min unlimited (legitimate UX)
+    ├─ after: 2/hr + 10/day (tighter H4)
+    ├─ allowed states: draft, pending, checking_stock, pending_stock_review,
+    │     awaiting_confirm, awaiting_payment
+    └─ transition → cancel_requested (admin approves/rejects)
+
+Admin undo split (within 10 min) → POST /b2b/v1/bo-undo-split
+    ├─ check _b2b_split_undo_deadline > now()
+    ├─ check _b2b_undo_count < 1 (H5 — 1 max per order to prevent oscillation)
+    ├─ restore stock + delete bo_queue rows + reverse debt
+    └─ FSM partial_fulfilled → pending_stock_review
+
+Cron b2b_bo_pending_review_expire_cron (hourly)
+    → orders with _b2b_opaque_accept_at > 72h old → auto-cancel + notify
+```
+
+#### 2.10.5 Security Alerts Flow
+
+```
+Cron b2b_bo_enumeration_scan_cron (hourly)
+    ├─ SELECT distributor_id, COUNT(*) FROM attempt_log
+    │     WHERE action='cancel' AND created_at > NOW() - INTERVAL 24 HOUR
+    │     GROUP BY distributor_id HAVING cnt >= 5
+    │     → update_post_meta _b2b_enumeration_flags = 2 (cancel_abuse bit)
+    │     → Telegram enumeration_attempt alert
+    └─ SELECT distributor_id, COUNT(*) FROM attempt_log
+          WHERE rejection_code='QTY_OVER_LIMIT' AND created_at > NOW() - 24 HOUR
+          HAVING cnt >= 3
+          → update_post_meta _b2b_enumeration_flags = 4 (qty_cap_hit bit)
+          → Telegram
+
+Admin Dashboard → Security Log tab
+    → filter action/result/days/distributor
+    → view flagged distributors list
+    → [ดู log] button filter automatic
+    → Admin review → [Clear flag] → POST /bo-clear-enum-flag
+```
+
+### 2.11 BO Cron Jobs Schedule
+
+| Cron | Interval | Purpose |
+|------|----------|---------|
+| `b2b_bo_restock_scan_cron` | every 15 min | pending → ready when available ≥ qty_bo |
+| `b2b_bo_eta_warn_cron` | daily 09:00 | ETA < +3d → admin reminder Telegram |
+| `b2b_bo_pending_review_expire_cron` | hourly | 72h timeout → auto-cancel |
+| `b2b_bo_enumeration_scan_cron` | hourly | detect abuse patterns + Telegram |
+| `b2b_bo_attempt_log_cleanup_cron` | daily 03:00 | 90d retention, chunked 1000/iter + 50ms gap |
+
 ---
 
 ## 3. B2F Factory Purchasing Workflows
