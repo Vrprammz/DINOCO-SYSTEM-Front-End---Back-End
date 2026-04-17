@@ -1542,9 +1542,9 @@ app.post("/api/km", requireAuth, express.json({ limit: "5mb" }), async (req, res
   const result = await db.collection(KB_COLL).insertOne(doc);
   res.json({ ok: true, id: result.insertedId });
 });
-app.patch("/api/km/:id", requireAuth, express.json(), async (req, res) => { const { ObjectId } = require("mongodb"); const db = await getDB(); const update = { updatedAt: new Date() }; Object.entries(req.body).forEach(([k, v]) => { if (v !== undefined) update[k] = v; }); await db.collection(KB_COLL).updateOne({ _id: new ObjectId(req.params.id) }, { $set: update }); res.json({ ok: true }); });
+app.patch("/api/km/:id", requireAuth, express.json({ limit: "5mb" }), async (req, res) => { const { ObjectId } = require("mongodb"); const db = await getDB(); const allowed = ["title", "content", "category", "tags", "active", "source", "status"]; const update = { updatedAt: new Date() }; for (const k of allowed) { if (req.body[k] !== undefined) update[k] = req.body[k]; } await db.collection(KB_COLL).updateOne({ _id: new ObjectId(req.params.id) }, { $set: update }); res.json({ ok: true }); }); // ★ S17: whitelist editable fields (prevent arbitrary key injection incl. _id/embedding)
 app.delete("/api/km/:id", requireAuth, express.json(), async (req, res) => { const { ObjectId } = require("mongodb"); const db = await getDB(); await db.collection(KB_COLL).deleteOne({ _id: new ObjectId(req.params.id) }); res.json({ ok: true }); });
-app.post("/api/km/search", aiLimiter, express.json(), async (req, res) => { if (!req.body.query) return res.status(400).json({ error: "query required" }); res.json(await searchKB(req.body.query)); });
+app.post("/api/km/search", requireAuth, aiLimiter, express.json({ limit: "5kb" }), async (req, res) => { if (!req.body.query) return res.status(400).json({ error: "query required" }); res.json(await searchKB(req.body.query)); }); // ★ S9: requireAuth (prevent anon Google API quota burn via KB search)
 app.get("/api/kb-suggestions", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json({ suggestions: [] }); const filter = {}; if (req.query.status) filter.status = req.query.status; res.json({ suggestions: await db.collection("kb_suggestions").find(filter).sort({ frequency: -1 }).limit(50).toArray() }); });
 app.post("/api/kb-suggestions/:id/resolve", requireAuth, async (req, res) => { const { ObjectId } = require("mongodb"); const db = await getDB(); await db.collection("kb_suggestions").updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: "resolved", resolvedAt: new Date() } }); res.json({ ok: true }); });
 
@@ -2726,7 +2726,7 @@ app.post("/api/test-ai", requireAuth, express.json(), async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-app.get("/api/free-models", (req, res) => { const now = Date.now(); const cooldowns = {}; for (const [k, v] of Object.entries(aiChat.lightAICooldown)) { if (v > now) cooldowns[k] = { until: new Date(v).toISOString() }; } res.json({ count: aiChat.discoveredFreeModels().length, models: aiChat.discoveredFreeModels(), cooldowns, paidAI: PAID_AI }); });
+app.get("/api/free-models", requireAuth, (req, res) => { const now = Date.now(); const cooldowns = {}; for (const [k, v] of Object.entries(aiChat.lightAICooldown)) { if (v > now) cooldowns[k] = { until: new Date(v).toISOString() }; } res.json({ count: aiChat.discoveredFreeModels().length, models: aiChat.discoveredFreeModels(), cooldowns, paidAI: PAID_AI }); }); // ★ S9: requireAuth (internal model config)
 
 // === Agent Command Center ===
 app.get("/api/agent-jobs", requireAuth, async (req, res) => {
@@ -2741,9 +2741,9 @@ app.get("/api/agent-jobs", requireAuth, async (req, res) => {
 });
 
 // === Costs / Advisor (simplified) ===
-app.get("/api/costs", async (req, res) => { const db = await getDB(); if (!db) return res.json({}); const todayStart = new Date(); todayStart.setHours(0,0,0,0); const todayResult = await db.collection("ai_costs").aggregate([{ $match: { createdAt: { $gte: todayStart } } }, { $group: { _id: null, totalTokens: { $sum: "$totalTokens" }, totalCost: { $sum: "$costUsd" }, calls: { $sum: 1 } } }]).toArray(); res.json({ today: todayResult[0] || { totalTokens: 0, totalCost: 0, calls: 0 } }); });
-app.get("/advice", async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("ai_advice").find({}).sort({ createdAt: -1 }).limit(5).toArray()); });
-app.get("/api/advisor/sources-changed", async (req, res) => { res.json({ sources: [], queriedAt: new Date().toISOString() }); }); // Simplified
+app.get("/api/costs", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json({}); const todayStart = new Date(); todayStart.setHours(0,0,0,0); const todayResult = await db.collection("ai_costs").aggregate([{ $match: { createdAt: { $gte: todayStart } } }, { $group: { _id: null, totalTokens: { $sum: "$totalTokens" }, totalCost: { $sum: "$costUsd" }, calls: { $sum: 1 } } }]).toArray(); res.json({ today: todayResult[0] || { totalTokens: 0, totalCost: 0, calls: 0 } }); }); // ★ S9: requireAuth (confidential financial data)
+app.get("/advice", requireAuth, async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("ai_advice").find({}).sort({ createdAt: -1 }).limit(5).toArray()); }); // ★ S9: requireAuth (advisor history)
+app.get("/api/advisor/sources-changed", requireAuth, async (req, res) => { res.json({ sources: [], queriedAt: new Date().toISOString() }); }); // ★ S9: requireAuth
 // ★ S3 (Phase 2 audit): requireAuth + body size limit 10kb + whitelist insert fields (no spread)
 app.post("/api/advisor/advice", requireAuth, express.json({ limit: "10kb" }), async (req, res) => {
   const db = await getDB();
