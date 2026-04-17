@@ -1,6 +1,26 @@
 /**
  * [Admin System] B2F Migration Audit
- * Version: V.3.3 — Housekeeping H-1 (docs only, no behavior change): clarify orphan INSERT `ON DUPLICATE KEY UPDATE` semantics — `status` + `deleted_at` intentionally PRESERVED across re-runs (not in UPDATE list), which honors admin soft-delete from Option F bulk-delete UI. Blacklist check `b2f_autosync_is_blacklisted()` runs BEFORE this INSERT path (L476-481), so blacklisted (maker, sku) pairs never reach INSERT. If admin wants to undelete an orphan SET, manual `UPDATE wp_dinoco_product_makers SET deleted_at=NULL, status='active' WHERE product_sku=? AND maker_id=?` required (intentional — forces conscious restore).
+ * Version: V.3.3 — V.7.0 Phase 4 Classification Migration (behavior change):
+ *   (A) Extend flag whitelist + toggleable list for 3 V.7.0 flags
+ *       (`b2f_flag_v11_explicit_mode`, `b2f_flag_order_intent`, `b2f_flag_ungroup_auto_hide`).
+ *       Dependency chain enforced: order_intent requires v11_explicit_mode;
+ *       ungroup_auto_hide requires finished Phase 4 migration.
+ *   (B) Phase 4 migration `b2f_phase4_run_classification_migration($dry_run)`:
+ *       STEP 0 set lock flag → STEP 1 MySQL capability probe → STEP 2 pre-migration
+ *       mysqldump (0700 + .htaccess) → STEP 3 idempotent ALTER via INFORMATION_SCHEMA
+ *       per-column check → STEP 4 classification loop (200/tx batch, 50ms gap,
+ *       cross_factory_assembly branch for missing_leaves > 0, guard confirmation_status
+ *       `auto_synced` OR confirmed_at IS NULL) → STEP 5 persist state (HIGH-6 shape)
+ *       → STEP 6 delete lock → STEP 7 fire replay action.
+ *   (C) 4 NEW REST endpoints (all rate-limited + central cache hook):
+ *       POST /junction-update-classification (per-SKU — delegates to Snippet 1 V.7.0 helper)
+ *       POST /junction-bulk-update-display (≤200 SKUs, idempotency_key, mixed_maker guard)
+ *       POST /junction-confirm-classification (idempotent, returns already_confirmed[])
+ *       POST /phase4-migration (5/hr rate limit, dry-run returns CSV)
+ *   (D) Dashboard Phase 4 Controls section (MySQL badge, dry-run/live buttons,
+ *       flag toggle panel with dependency warnings, last state card).
+ *   (E) G-H housekeeping H-1 comment retained (orphan INSERT semantics unchanged).
+ * Version: V.3.2 — Option F Hybrid Admin Control: (1) `b2f_autosync_blacklist` wp_option + 5 helpers; (2) `b2f_phase2_run_backfill()` STEP 3 checks blacklist → skip orphan INSERT if SKU in list (result shape adds `skipped_blacklisted[]`); (3) 4 new REST endpoints — `GET /maker-products-with-source/{maker_id}` (CPT vs Auto source badges), `POST /junction-bulk-delete` (soft-delete + blacklist, protected by `only_auto_synced` server-side guard), `POST /autosync-blacklist` (add/remove), `GET /autosync-blacklist` (viewer).
  * Version: V.3.2 — Option F Hybrid Admin Control: (1) `b2f_autosync_blacklist` wp_option + 5 helpers; (2) `b2f_phase2_run_backfill()` STEP 3 checks blacklist → skip orphan INSERT if SKU in list (result shape adds `skipped_blacklisted[]`); (3) 4 new REST endpoints — `GET /maker-products-with-source/{maker_id}` (CPT vs Auto source badges), `POST /junction-bulk-delete` (soft-delete + blacklist, protected by `only_auto_synced` server-side guard), `POST /autosync-blacklist` (add/remove), `GET /autosync-blacklist` (viewer).
  * Version: V.3.1 — Code review fixes: (C1) remove dead $candidates loop in b2f_audit_build_dry_run_csv (PHP 8.2 fatal); (H3) orphan backfill recomputes cost on re-run (was no-op `id=id`); (M2) cleanup dead ternary in /observations endpoint; (M3) pre-warm postmeta cache before backfill transaction (scaling); (L3) document collation decision in schema activation comment.
  * Version: V.3.0 — Phase 3 cut-over: unlock `b2f_flag_read_from_junction` toggle (guard = schema activated + backfill done + shadow_write ON) + Step 4 "Enable Read from Junction" button + phase3 status renderer. LIFF B2F read path switches CPT → junction when flag ON. Immediate rollback: toggle OFF. Paired with Snippet 2 V.10.0 + Snippet 0.5 V.1.0.
@@ -59,12 +79,25 @@ if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
 if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.3' );
 if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
 
+/**
+ * V.3.3: Extended whitelist — V.7.0 adds 3 flags
+ *   - b2f_flag_v11_explicit_mode  → backend returns production_mode + display_mode in API
+ *   - b2f_flag_order_intent       → accept poi_order_mode per item (LIFF UI gated)
+ *   - b2f_flag_ungroup_auto_hide  → migration missing_leaves → as_parts auto
+ *
+ * Whitelist is consulted by `POST /feature-flags/toggle` before persisting any flag.
+ * Unknown flags → 400 invalid_flag.
+ */
 if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
     function b2f_audit_allowed_flags() {
         return array(
             'b2f_flag_auto_sync_sets',
             'b2f_flag_shadow_write',
             'b2f_flag_read_from_junction',
+            // V.3.3 — V.7.0 Phase 4 additions
+            'b2f_flag_v11_explicit_mode',
+            'b2f_flag_order_intent',
+            'b2f_flag_ungroup_auto_hide',
         );
     }
 }
@@ -74,11 +107,84 @@ if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
  * V.3.0: Unlock `b2f_flag_read_from_junction` (Phase 3 cut-over)
  *        — guarded by schema_activated + backfill_done + shadow_write ON
  *          (checked in /feature-flags/toggle handler before flipping)
+ * V.3.3: Unlock 3 V.7.0 flags. Dependency chain (enforced inline ใน toggle handler):
+ *          - `b2f_flag_order_intent`       requires `b2f_flag_v11_explicit_mode` ON
+ *          - `b2f_flag_ungroup_auto_hide`  requires Phase 4 migration finished
  * `auto_sync_sets` ยังล็อคไว้ให้ Phase 2.5
  */
 if ( ! function_exists( 'b2f_audit_phase2_toggleable_flags' ) ) {
     function b2f_audit_phase2_toggleable_flags() {
-        return array( 'b2f_flag_shadow_write', 'b2f_flag_read_from_junction' );
+        return array(
+            'b2f_flag_shadow_write',
+            'b2f_flag_read_from_junction',
+            // V.3.3 — V.7.0
+            'b2f_flag_v11_explicit_mode',
+            'b2f_flag_order_intent',
+            'b2f_flag_ungroup_auto_hide',
+        );
+    }
+}
+
+/**
+ * V.3.3: Phase 4 migration state helper — shape per HIGH-6
+ *   {
+ *     started_at, finished_at, total_rows, processed,
+ *     classified_set_assembled, classified_sub_unit, classified_single,
+ *     classified_cross_factory, auto_hidden_count, confirmed_preserved,
+ *     errors[], elapsed_ms, uid, dry_run
+ *   }
+ */
+if ( ! function_exists( 'b2f_audit_get_phase4_state' ) ) {
+    function b2f_audit_get_phase4_state() {
+        $state = get_option( 'b2f_phase4_migration_state', array() );
+        if ( ! is_array( $state ) ) $state = array();
+        return $state;
+    }
+}
+
+if ( ! function_exists( 'b2f_audit_set_phase4_state' ) ) {
+    function b2f_audit_set_phase4_state( $state ) {
+        update_option( 'b2f_phase4_migration_state', $state, false );
+    }
+}
+
+/**
+ * V.3.3: Schema V11 activation check — used by Phase 4 migration idempotency guard
+ */
+if ( ! function_exists( 'b2f_audit_is_schema_v11_activated' ) ) {
+    function b2f_audit_is_schema_v11_activated() {
+        $ver = (string) get_option( 'b2f_schema_version', '0' );
+        return version_compare( $ver, '11.0', '>=' );
+    }
+}
+
+/**
+ * V.3.3: Check if a V11 column exists on junction table (idempotent ALTER guard)
+ */
+if ( ! function_exists( 'b2f_audit_column_exists' ) ) {
+    function b2f_audit_column_exists( $table, $column ) {
+        global $wpdb;
+        $found = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            DB_NAME, $table, $column
+        ) );
+        return (int) $found > 0;
+    }
+}
+
+/**
+ * V.3.3: Check if an index exists on junction table (idempotent ADD KEY guard)
+ */
+if ( ! function_exists( 'b2f_audit_index_exists' ) ) {
+    function b2f_audit_index_exists( $table, $index ) {
+        global $wpdb;
+        $found = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND INDEX_NAME = %s",
+            DB_NAME, $table, $index
+        ) );
+        return (int) $found > 0;
     }
 }
 
@@ -577,6 +683,637 @@ if ( ! function_exists( 'b2f_phase2_run_backfill' ) ) {
         }
 
         return $result;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 0.7: V.3.3 — PHASE 4 CLASSIFICATION MIGRATION
+// ═══════════════════════════════════════════════════════════════════
+//
+// Plan reference: .claude/plans/sunny-spinning-quill.md (Migration Logic lines ~450-540)
+//
+// Entry point: b2f_phase4_run_classification_migration( $dry_run = true )
+//
+// Pipeline (7 steps):
+//   STEP 0  update_option('b2f_phase4_migration_in_progress', true)  ← CRIT-4 lock
+//   STEP 1  b2f_audit_check_mysql_version()        ← non-blocking log
+//   STEP 2  Pre-migration mysqldump                ← 0700 perms + .htaccess deny
+//   STEP 3  Idempotent ALTER TABLE                 ← INFORMATION_SCHEMA per-column check
+//           (observations.source ENUM + junction 6 columns + 2 indexes + CHECK)
+//   STEP 4  Classification loop                    ← 200 rows/tx, 50ms gap
+//           Branching (CRIT-3 cross_factory branch):
+//             has_children AND missing_leaves > 0 → cross_factory_assembly + as_parts
+//             has_children AND has_parent         → sub_unit
+//             has_children                         → set_assembled
+//             else                                 → single
+//           Idempotent guard: only rows where
+//             (confirmation_status='auto_synced' OR confirmed_at IS NULL)
+//   STEP 5  Persist state JSON                     ← b2f_phase4_migration_state (HIGH-6)
+//   STEP 6  delete_option(lock)                    ← Snippet 0.5 V.1.2 resumes dual-write
+//   STEP 7  do_action('b2f_junction_updated', 0)   ← invalidate all maker transients
+//
+// Dry-run:
+//   - STEP 2/3/4 emit CSV to wp-content/b2f-backups/dry-run-{timestamp}.csv
+//   - No DB mutation (no ALTER, no UPDATE)
+//   - State NOT persisted (so live run still possible)
+
+/**
+ * V.3.3: Ensure `wp-content/b2f-backups/` exists with secure perms + .htaccess deny.
+ * Returns absolute path to the backup dir (or WP_Error on failure).
+ */
+if ( ! function_exists( 'b2f_phase4_ensure_backup_dir' ) ) {
+    function b2f_phase4_ensure_backup_dir() {
+        $base = WP_CONTENT_DIR . '/b2f-backups';
+        if ( ! is_dir( $base ) ) {
+            if ( ! wp_mkdir_p( $base ) ) {
+                return new WP_Error( 'backup_dir_failed', 'Cannot create ' . $base );
+            }
+        }
+        @chmod( $base, 0700 );
+        $htaccess = $base . '/.htaccess';
+        if ( ! file_exists( $htaccess ) ) {
+            @file_put_contents( $htaccess, "Require all denied\n<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n" );
+            @chmod( $htaccess, 0600 );
+        }
+        $index = $base . '/index.html';
+        if ( ! file_exists( $index ) ) {
+            @file_put_contents( $index, '' );
+        }
+        return $base;
+    }
+}
+
+/**
+ * V.3.3: Phase 4 — STEP 2 best-effort mysqldump snapshot.
+ *  - Tries shell_exec('mysqldump ...') — if unavailable or disabled, logs warning.
+ *  - Output file: wp-content/b2f-backups/b2f_v11_{timestamp}.sql (chmod 0600)
+ *  - Returns ['path' => ..., 'ok' => bool, 'message' => ...]
+ */
+if ( ! function_exists( 'b2f_phase4_dump_snapshot' ) ) {
+    function b2f_phase4_dump_snapshot() {
+        $dir = b2f_phase4_ensure_backup_dir();
+        if ( is_wp_error( $dir ) ) {
+            return array( 'ok' => false, 'path' => '', 'message' => $dir->get_error_message() );
+        }
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $ts  = gmdate( 'Ymd-His' );
+        $fname = "b2f_v11_{$ts}.sql";
+        $path  = $dir . '/' . $fname;
+
+        // Soft guard: if table doesn't exist yet → write "no-op" marker.
+        if ( ! b2f_audit_junction_table_exists() ) {
+            @file_put_contents( $path, "-- junction table missing at time of snapshot — fresh V11 schema expected\n" );
+            @chmod( $path, 0600 );
+            return array( 'ok' => true, 'path' => $path, 'message' => 'no_table_to_dump' );
+        }
+
+        $shell_ok = function_exists( 'shell_exec' );
+        if ( $shell_ok ) {
+            $disabled = explode( ',', (string) ini_get( 'disable_functions' ) );
+            $disabled = array_map( 'trim', $disabled );
+            if ( in_array( 'shell_exec', $disabled, true ) ) $shell_ok = false;
+        }
+        if ( ! $shell_ok ) {
+            // Fallback — dump structure + data via wpdb (slower, but portable).
+            $rows = $wpdb->get_results( "SELECT * FROM {$tbl}", ARRAY_A );
+            $lines = array( "-- fallback dump (shell_exec unavailable) " . wp_date( 'c' ), "-- table {$tbl}" );
+            foreach ( (array) $rows as $r ) {
+                $lines[] = '-- ' . wp_json_encode( $r );
+            }
+            @file_put_contents( $path, implode( "\n", $lines ) . "\n" );
+            @chmod( $path, 0600 );
+            return array( 'ok' => true, 'path' => $path, 'message' => 'fallback_wpdb_dump' );
+        }
+
+        // Best-effort mysqldump — host/user/password from DB_* constants
+        $host = defined( 'DB_HOST' ) ? DB_HOST : 'localhost';
+        $user = defined( 'DB_USER' ) ? DB_USER : '';
+        $pass = defined( 'DB_PASSWORD' ) ? DB_PASSWORD : '';
+        $name = defined( 'DB_NAME' ) ? DB_NAME : '';
+        $cmd = sprintf(
+            'mysqldump --single-transaction --skip-lock-tables -h %s -u %s %s %s %s > %s 2>&1',
+            escapeshellarg( $host ),
+            escapeshellarg( $user ),
+            $pass !== '' ? '-p' . escapeshellarg( $pass ) : '',
+            escapeshellarg( $name ),
+            escapeshellarg( $tbl ),
+            escapeshellarg( $path )
+        );
+        @shell_exec( $cmd );
+        if ( file_exists( $path ) && filesize( $path ) > 0 ) {
+            @chmod( $path, 0600 );
+            return array( 'ok' => true, 'path' => $path, 'message' => 'mysqldump_ok' );
+        }
+        return array( 'ok' => false, 'path' => $path, 'message' => 'mysqldump_failed' );
+    }
+}
+
+/**
+ * V.3.3: Idempotent STEP 3 — ALTER junction + observations to V11 schema.
+ * Uses INFORMATION_SCHEMA per-column check. Runs only missing pieces.
+ *
+ * Returns ['altered_columns' => [...], 'altered_indexes' => [...], 'check_added' => bool, 'errors' => [...]]
+ */
+if ( ! function_exists( 'b2f_phase4_activate_schema_v11' ) ) {
+    function b2f_phase4_activate_schema_v11() {
+        global $wpdb;
+        $out = array( 'altered_columns' => array(), 'altered_indexes' => array(), 'check_added' => false, 'errors' => array() );
+
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $obs = $wpdb->prefix . 'dinoco_maker_product_observations';
+
+        // STEP 3.0 — Extend observations.source ENUM (MED-1)
+        if ( b2f_audit_observations_table_exists() ) {
+            // Check current ENUM value set
+            $col = $wpdb->get_row( $wpdb->prepare(
+                "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                DB_NAME, $obs, 'source'
+            ) );
+            if ( $col && strpos( (string) $col->COLUMN_TYPE, 'classification_change' ) === false ) {
+                $sql = "ALTER TABLE {$obs} MODIFY COLUMN `source` ENUM('cpt','junction','diff','classification_change') NOT NULL";
+                $ok = $wpdb->query( $sql );
+                if ( $ok === false ) $out['errors'][] = 'obs ENUM ALTER failed: ' . $wpdb->last_error;
+                else $out['altered_columns'][] = 'observations.source';
+            }
+        }
+
+        // STEP 3.1 — junction V11 columns
+        $v11_columns = array(
+            'production_mode'      => "ADD COLUMN `production_mode` ENUM('set_assembled','sub_unit','single','cross_factory_assembly') NOT NULL DEFAULT 'single' AFTER `status`",
+            'confirmation_status'  => "ADD COLUMN `confirmation_status` ENUM('confirmed','auto_synced') NOT NULL DEFAULT 'auto_synced' AFTER `production_mode`",
+            'admin_display_mode'   => "ADD COLUMN `admin_display_mode` ENUM('auto','as_set','as_parts') NOT NULL DEFAULT 'auto' AFTER `confirmation_status`",
+            'missing_leaves_count' => "ADD COLUMN `missing_leaves_count` SMALLINT UNSIGNED NOT NULL DEFAULT 0 AFTER `admin_display_mode`",
+            'confirmed_by'         => "ADD COLUMN `confirmed_by` BIGINT UNSIGNED DEFAULT NULL",
+            'confirmed_at'         => "ADD COLUMN `confirmed_at` DATETIME DEFAULT NULL",
+        );
+        foreach ( $v11_columns as $col_name => $clause ) {
+            if ( b2f_audit_column_exists( $tbl, $col_name ) ) continue;
+            $sql = "ALTER TABLE {$tbl} {$clause}";
+            $ok = $wpdb->query( $sql );
+            if ( $ok === false ) $out['errors'][] = "ALTER {$col_name} failed: " . $wpdb->last_error;
+            else $out['altered_columns'][] = $col_name;
+        }
+
+        // STEP 3.2 — Composite indexes (HIGH-5)
+        $v11_indexes = array(
+            'idx_maker_prod_display' => "ADD KEY `idx_maker_prod_display` (`maker_id`, `production_mode`, `admin_display_mode`)",
+            'idx_maker_confirmation' => "ADD KEY `idx_maker_confirmation` (`maker_id`, `confirmation_status`)",
+        );
+        foreach ( $v11_indexes as $idx_name => $clause ) {
+            if ( b2f_audit_index_exists( $tbl, $idx_name ) ) continue;
+            $sql = "ALTER TABLE {$tbl} {$clause}";
+            $ok = $wpdb->query( $sql );
+            if ( $ok === false ) $out['errors'][] = "ADD INDEX {$idx_name} failed: " . $wpdb->last_error;
+            else $out['altered_indexes'][] = $idx_name;
+        }
+
+        // STEP 3.3 — CHECK constraints (MySQL 8.0.16+ / MariaDB 10.2.1+ only)
+        // We probe via INFORMATION_SCHEMA.CHECK_CONSTRAINTS — silent no-op on lower versions.
+        $cap = function_exists( 'b2f_audit_check_mysql_version' ) ? b2f_audit_check_mysql_version() : array();
+        $check_active = ! empty( $cap['check_constraints_active'] );
+        if ( $check_active ) {
+            // See if already present
+            $have = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS
+                 WHERE CONSTRAINT_SCHEMA = %s AND CONSTRAINT_NAME IN ('chk_mode_display','chk_confirmed_consistency')",
+                DB_NAME
+            ) );
+            if ( $have < 2 ) {
+                // Attempt ADD — individual ADD wrapped in try/catch since already-exists errors are non-fatal.
+                foreach ( array(
+                    'chk_mode_display'          => "ADD CONSTRAINT `chk_mode_display` CHECK (NOT (`production_mode` = 'single' AND `admin_display_mode` = 'as_parts'))",
+                    'chk_confirmed_consistency' => "ADD CONSTRAINT `chk_confirmed_consistency` CHECK (`confirmation_status` = 'auto_synced' OR (`confirmed_by` IS NOT NULL AND `confirmed_at` IS NOT NULL))",
+                ) as $cname => $clause ) {
+                    $sql = "ALTER TABLE {$tbl} {$clause}";
+                    $ok = @$wpdb->query( $sql );
+                    if ( $ok === false ) {
+                        // tolerate "Duplicate check constraint name"
+                        if ( stripos( (string) $wpdb->last_error, 'Duplicate' ) === false ) {
+                            $out['errors'][] = "ADD CONSTRAINT {$cname}: " . $wpdb->last_error;
+                        }
+                    }
+                }
+                $out['check_added'] = true;
+            }
+        }
+
+        // STEP 3.4 — Schema version markers
+        if ( empty( $out['errors'] ) ) {
+            update_option( 'b2f_schema_version', '11.0', false );
+            if ( ! get_option( 'b2f_schema_v11_activated' ) ) {
+                update_option( 'b2f_schema_v11_activated', current_time( 'mysql' ), false );
+            }
+        }
+
+        return $out;
+    }
+}
+
+/**
+ * V.3.3: Phase 4 classification decision — pure function (no DB writes).
+ * Mirrors Snippet 1 V.7.0 `b2f_infer_production_mode_from_relations()` branching,
+ * but returns ALL classification fields at once for bulk UPDATE.
+ *
+ * Input:  $sku, $maker_id, $has_children, $has_parent, $missing_leaves, $legacy_cpt_id
+ * Output: [ 'production_mode', 'admin_display_mode', 'confirmation_status', 'missing_leaves_count' ]
+ *
+ * CRIT-3: cross_factory_assembly branch is REACHABLE (was dead code in earlier plans).
+ */
+if ( ! function_exists( 'b2f_phase4_classify_row' ) ) {
+    function b2f_phase4_classify_row( $has_children, $has_parent, $missing_leaves, $legacy_cpt_id ) {
+        $missing_leaves = max( 0, (int) $missing_leaves );
+        $has_children   = (bool) $has_children;
+        $has_parent     = (bool) $has_parent;
+        $legacy_cpt     = (int) $legacy_cpt_id > 0;
+
+        // CRIT-3: cross_factory branch (must check FIRST before set_assembled)
+        if ( $has_children && $missing_leaves > 0 ) {
+            return array(
+                'production_mode'      => 'cross_factory_assembly',
+                'admin_display_mode'   => 'as_parts',
+                'confirmation_status'  => 'auto_synced',
+                'missing_leaves_count' => $missing_leaves,
+            );
+        }
+        if ( $has_children && $has_parent ) {
+            return array(
+                'production_mode'      => 'sub_unit',
+                'admin_display_mode'   => 'auto',
+                'confirmation_status'  => $legacy_cpt ? 'confirmed' : 'auto_synced',
+                'missing_leaves_count' => 0,
+            );
+        }
+        if ( $has_children ) {
+            return array(
+                'production_mode'      => 'set_assembled',
+                'admin_display_mode'   => 'auto',
+                'confirmation_status'  => $legacy_cpt ? 'confirmed' : 'auto_synced',
+                'missing_leaves_count' => 0,
+            );
+        }
+        return array(
+            'production_mode'      => 'single',
+            'admin_display_mode'   => 'auto',
+            'confirmation_status'  => $legacy_cpt ? 'confirmed' : 'auto_synced',
+            'missing_leaves_count' => 0,
+        );
+    }
+}
+
+/**
+ * V.3.3: Missing-leaves probe — count leaves of $sku that maker has NOT registered.
+ * Uses sku_relations + junction table (fast path) or CPT postmeta (cold path).
+ */
+if ( ! function_exists( 'b2f_phase4_count_missing_leaves' ) ) {
+    function b2f_phase4_count_missing_leaves( $sku, $maker_id, $maker_sku_set ) {
+        $sku = strtoupper( trim( (string) $sku ) );
+        if ( $sku === '' ) return 0;
+
+        // Resolve leaves (Snippet 15 helper if available; else walk sku_relations)
+        $leaves = array();
+        if ( function_exists( 'dinoco_get_leaf_skus' ) ) {
+            $leaves = dinoco_get_leaf_skus( $sku );
+        }
+        if ( ! is_array( $leaves ) || empty( $leaves ) ) {
+            // Walk relations manually
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) return 0;
+            $rel_upper = array();
+            foreach ( $relations as $p => $kids ) {
+                if ( ! is_array( $kids ) ) continue;
+                $rel_upper[ strtoupper( (string) $p ) ] = array_map( 'strtoupper', array_map( 'strval', $kids ) );
+            }
+            $stack = array( $sku ); $seen = array();
+            while ( ! empty( $stack ) ) {
+                $node = array_pop( $stack );
+                if ( isset( $seen[ $node ] ) ) continue;
+                $seen[ $node ] = true;
+                if ( empty( $rel_upper[ $node ] ) ) {
+                    if ( $node !== $sku ) $leaves[] = $node;
+                    continue;
+                }
+                foreach ( $rel_upper[ $node ] as $c ) $stack[] = $c;
+            }
+            $leaves = array_values( array_unique( array_map( 'strtoupper', $leaves ) ) );
+        } else {
+            $leaves = array_values( array_unique( array_map( 'strtoupper', array_map( 'strval', $leaves ) ) ) );
+        }
+        if ( empty( $leaves ) ) return 0;
+
+        // Count leaves NOT in maker_sku_set (fast in-memory check)
+        $missing = 0;
+        foreach ( $leaves as $leaf ) {
+            if ( ! isset( $maker_sku_set[ $leaf ] ) ) $missing++;
+        }
+        return $missing;
+    }
+}
+
+/**
+ * V.3.3: MAIN Phase 4 classification migration — returns result array (HIGH-6 shape).
+ *
+ * @param bool $dry_run  Preview only — no DB mutation, emits CSV.
+ * @param int  $batch    Rows per transaction (default 200).
+ * @return array state JSON
+ */
+if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
+    function b2f_phase4_run_classification_migration( $dry_run = true, $batch = 200 ) {
+        global $wpdb;
+        $started = microtime( true );
+        $started_at = current_time( 'mysql' );
+        $uid = get_current_user_id();
+
+        $state = array(
+            'started_at'                 => $started_at,
+            'finished_at'                => null,
+            'total_rows'                 => 0,
+            'processed'                  => 0,
+            'classified_set_assembled'   => 0,
+            'classified_sub_unit'        => 0,
+            'classified_single'          => 0,
+            'classified_cross_factory'   => 0,
+            'auto_hidden_count'          => 0,
+            'confirmed_preserved'        => 0,
+            'errors'                     => array(),
+            'elapsed_ms'                 => 0,
+            'uid'                        => $uid,
+            'dry_run'                    => (bool) $dry_run,
+            'mysql_check'                => array(),
+            'snapshot'                   => array(),
+            'schema_alter'               => array(),
+            'csv_path'                   => null,
+        );
+
+        // Normalize batch size
+        $batch = max( 50, min( 2000, (int) $batch ?: 200 ) );
+
+        // STEP 0 — lock flag (even for dry-run we set it, so concurrent CPT saves don't race)
+        if ( ! $dry_run ) {
+            update_option( 'b2f_phase4_migration_in_progress', true, false );
+        }
+
+        try {
+            // STEP 1 — MySQL capability probe (non-blocking)
+            if ( function_exists( 'b2f_audit_check_mysql_version' ) ) {
+                $state['mysql_check'] = b2f_audit_check_mysql_version();
+            }
+
+            // STEP 2 — Pre-migration snapshot (skipped in dry-run — no mutation to roll back)
+            if ( ! $dry_run ) {
+                if ( function_exists( 'b2f_phase4_dump_snapshot' ) ) {
+                    $state['snapshot'] = b2f_phase4_dump_snapshot();
+                }
+            }
+
+            // STEP 3 — Idempotent ALTER (skipped in dry-run — it's a mutation)
+            if ( ! $dry_run ) {
+                if ( ! b2f_audit_junction_table_exists() ) {
+                    $state['errors'][] = 'junction table missing — run Activate Schema (Phase 2) first';
+                    $state['finished_at'] = current_time( 'mysql' );
+                    $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
+                    return $state;
+                }
+                $state['schema_alter'] = b2f_phase4_activate_schema_v11();
+                if ( ! empty( $state['schema_alter']['errors'] ) ) {
+                    foreach ( $state['schema_alter']['errors'] as $se ) $state['errors'][] = $se;
+                    // Continue — columns likely already present
+                }
+            } else {
+                $state['schema_alter'] = array( 'note' => 'dry_run — ALTER skipped' );
+            }
+
+            // STEP 4 — Classification loop
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                $state['errors'][] = 'junction table still missing — classification loop aborted';
+                $state['finished_at'] = current_time( 'mysql' );
+                $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
+                return $state;
+            }
+
+            // Fetch all active junction rows (deleted_at IS NULL)
+            $rows = $wpdb->get_results(
+                "SELECT id, product_sku, maker_id, confirmation_status, confirmed_at, admin_display_mode, production_mode, legacy_cpt_id
+                 FROM {$tbl}
+                 WHERE deleted_at IS NULL
+                 ORDER BY maker_id ASC, id ASC",
+                ARRAY_A
+            );
+            if ( ! is_array( $rows ) ) $rows = array();
+            $state['total_rows'] = count( $rows );
+
+            // Build per-maker sku set (for missing-leaves probe — in-memory)
+            $maker_sku_sets = array();
+            foreach ( $rows as $r ) {
+                $mid = (int) $r['maker_id'];
+                $sku = strtoupper( trim( (string) $r['product_sku'] ) );
+                if ( ! $mid || $sku === '' ) continue;
+                if ( ! isset( $maker_sku_sets[ $mid ] ) ) $maker_sku_sets[ $mid ] = array();
+                $maker_sku_sets[ $mid ][ $sku ] = true;
+            }
+
+            // Build sku_relations forward map (UPPERCASE keys/values)
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( ! is_array( $relations ) ) $relations = array();
+            $rel_upper = array(); $all_children_map = array();
+            foreach ( $relations as $p => $kids ) {
+                if ( ! is_array( $kids ) ) continue;
+                $p_u = strtoupper( (string) $p );
+                $rel_upper[ $p_u ] = array_map( function( $c ) { return strtoupper( (string) $c ); }, $kids );
+                foreach ( $rel_upper[ $p_u ] as $c ) $all_children_map[ $c ] = true;
+            }
+
+            // CSV rows for dry-run export
+            $csv_rows = array();
+            if ( $dry_run ) {
+                $csv_rows[] = array(
+                    'id','product_sku','maker_id','has_children','has_parent','missing_leaves_count',
+                    'old_production_mode','new_production_mode',
+                    'old_admin_display_mode','new_admin_display_mode',
+                    'old_confirmation_status','new_confirmation_status',
+                    'legacy_cpt_id','action'
+                );
+            }
+
+            // Process in batches of $batch — START TRANSACTION per batch + 50ms gap
+            $chunks = array_chunk( $rows, $batch );
+            foreach ( $chunks as $chunk_idx => $chunk ) {
+                if ( ! $dry_run ) $wpdb->query( 'START TRANSACTION' );
+                $chunk_err = false;
+
+                foreach ( $chunk as $row ) {
+                    try {
+                        $id       = (int) $row['id'];
+                        $sku      = strtoupper( trim( (string) $row['product_sku'] ) );
+                        $maker_id = (int) $row['maker_id'];
+                        if ( ! $id || $sku === '' || ! $maker_id ) continue;
+
+                        $maker_sku_set = isset( $maker_sku_sets[ $maker_id ] ) ? $maker_sku_sets[ $maker_id ] : array();
+
+                        $has_children = isset( $rel_upper[ $sku ] ) && ! empty( $rel_upper[ $sku ] );
+                        $has_parent   = isset( $all_children_map[ $sku ] );
+                        $missing      = $has_children
+                            ? b2f_phase4_count_missing_leaves( $sku, $maker_id, $maker_sku_set )
+                            : 0;
+                        $legacy_cpt   = (int) ( $row['legacy_cpt_id'] ?? 0 );
+
+                        $decision = b2f_phase4_classify_row( $has_children, $has_parent, $missing, $legacy_cpt );
+
+                        // Idempotent guard: skip rows where admin already confirmed
+                        $old_conf = (string) ( $row['confirmation_status'] ?? 'auto_synced' );
+                        $old_confirmed_at = $row['confirmed_at'] ?? null;
+                        $is_admin_confirmed = ( $old_conf === 'confirmed' && ! empty( $old_confirmed_at ) );
+
+                        $action = 'classify';
+                        if ( $is_admin_confirmed ) {
+                            // Preserve admin choice — but still update missing_leaves_count (denormalized cache)
+                            $state['confirmed_preserved']++;
+                            $action = 'preserve_confirmed';
+                        }
+
+                        // Track classification counts (based on decision — NOT on whether we'll write)
+                        switch ( $decision['production_mode'] ) {
+                            case 'set_assembled':          $state['classified_set_assembled']++; break;
+                            case 'sub_unit':               $state['classified_sub_unit']++; break;
+                            case 'single':                 $state['classified_single']++; break;
+                            case 'cross_factory_assembly': $state['classified_cross_factory']++; break;
+                        }
+                        if ( $decision['admin_display_mode'] === 'as_parts' ) $state['auto_hidden_count']++;
+
+                        if ( $dry_run ) {
+                            $csv_rows[] = array(
+                                $id, $sku, $maker_id,
+                                $has_children ? 1 : 0,
+                                $has_parent ? 1 : 0,
+                                $missing,
+                                (string) ( $row['production_mode'] ?? '' ),
+                                $decision['production_mode'],
+                                (string) ( $row['admin_display_mode'] ?? '' ),
+                                $is_admin_confirmed ? (string) ( $row['admin_display_mode'] ?? '' ) : $decision['admin_display_mode'],
+                                $old_conf,
+                                $is_admin_confirmed ? $old_conf : $decision['confirmation_status'],
+                                $legacy_cpt,
+                                $is_admin_confirmed ? 'preserve_confirmed' : 'classify',
+                            );
+                            $state['processed']++;
+                            continue;
+                        }
+
+                        // LIVE — build UPDATE
+                        if ( $is_admin_confirmed ) {
+                            // Only update denormalized missing_leaves_count (do not touch classification)
+                            $ok = $wpdb->update(
+                                $tbl,
+                                array(
+                                    'missing_leaves_count' => $decision['missing_leaves_count'],
+                                    'updated_by'           => $uid,
+                                    'updated_at'           => current_time( 'mysql' ),
+                                ),
+                                array( 'id' => $id ),
+                                array( '%d', '%d', '%s' ),
+                                array( '%d' )
+                            );
+                        } else {
+                            // Full classification update (guarded WHERE to prevent double-flip)
+                            $sql = $wpdb->prepare(
+                                "UPDATE {$tbl}
+                                   SET production_mode      = %s,
+                                       admin_display_mode   = %s,
+                                       confirmation_status  = %s,
+                                       missing_leaves_count = %d,
+                                       updated_by           = %d,
+                                       updated_at           = %s
+                                 WHERE id = %d
+                                   AND (confirmation_status = 'auto_synced' OR confirmed_at IS NULL)",
+                                $decision['production_mode'],
+                                $decision['admin_display_mode'],
+                                $decision['confirmation_status'],
+                                $decision['missing_leaves_count'],
+                                $uid,
+                                current_time( 'mysql' ),
+                                $id
+                            );
+                            $ok = $wpdb->query( $sql );
+                        }
+                        if ( $ok === false ) {
+                            throw new Exception( 'UPDATE id=' . $id . ' failed: ' . $wpdb->last_error );
+                        }
+                        $state['processed']++;
+
+                    } catch ( Throwable $e ) {
+                        $state['errors'][] = 'row id=' . ( $row['id'] ?? '?' ) . ': ' . $e->getMessage();
+                        $chunk_err = true;
+                        break;
+                    }
+                } // end chunk rows
+
+                if ( ! $dry_run ) {
+                    if ( $chunk_err ) $wpdb->query( 'ROLLBACK' );
+                    else              $wpdb->query( 'COMMIT' );
+                }
+
+                // Inter-batch gap to relieve lock pressure (50ms)
+                if ( count( $chunks ) > 1 && $chunk_idx < count( $chunks ) - 1 ) {
+                    usleep( 50000 );
+                }
+            }
+
+            // Dry-run — emit CSV to b2f-backups/
+            if ( $dry_run && ! empty( $csv_rows ) ) {
+                $dir = b2f_phase4_ensure_backup_dir();
+                if ( ! is_wp_error( $dir ) ) {
+                    $ts = gmdate( 'Ymd-His' );
+                    $path = $dir . "/dry-run-{$ts}.csv";
+                    $fp = @fopen( $path, 'w' );
+                    if ( $fp ) {
+                        foreach ( $csv_rows as $line ) fputcsv( $fp, $line );
+                        fclose( $fp );
+                        @chmod( $path, 0600 );
+                        $state['csv_path'] = $path;
+                    } else {
+                        $state['errors'][] = 'CSV write failed: ' . $path;
+                    }
+                }
+            }
+
+            // STEP 5 — Persist state (only for LIVE run)
+            $state['finished_at'] = current_time( 'mysql' );
+            $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
+            if ( ! $dry_run ) {
+                b2f_audit_set_phase4_state( $state );
+            }
+
+        } catch ( Throwable $e ) {
+            $state['errors'][] = 'fatal: ' . $e->getMessage();
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[B2F Phase4] fatal exception: ' . $e->getMessage() );
+            }
+            $state['finished_at'] = current_time( 'mysql' );
+            $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
+        }
+
+        // STEP 6 — Clear lock (always — even if we threw)
+        if ( ! $dry_run ) {
+            delete_option( 'b2f_phase4_migration_in_progress' );
+        }
+
+        // STEP 7 — Fire central cache hook (maker_id=0 = global sweep)
+        if ( ! $dry_run ) {
+            do_action( 'b2f_junction_updated', 0 );
+        }
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf(
+                '[B2F Phase4] %s processed=%d errors=%d elapsed=%sms uid=%d',
+                $dry_run ? 'DRY-RUN' : 'LIVE',
+                $state['processed'], count( $state['errors'] ), $state['elapsed_ms'], $uid
+            ) );
+        }
+
+        return $state;
     }
 }
 
@@ -1269,6 +2006,39 @@ add_action( 'rest_api_init', function () {
                 }
             }
 
+            // V.3.3: Dependency chain — V.7.0 Phase 4 flags
+            //   order_intent requires v11_explicit_mode ON
+            //   ungroup_auto_hide requires Phase 4 migration finished_at
+            if ( $flag === 'b2f_flag_order_intent' && $value === true ) {
+                if ( ! (bool) get_option( 'b2f_flag_v11_explicit_mode', false ) ) {
+                    return new WP_Error(
+                        'dependency_missing',
+                        'ต้องเปิด v11_explicit_mode ก่อน (order_intent ใช้ production_mode จาก API)',
+                        array( 'status' => 400 )
+                    );
+                }
+            }
+            if ( $flag === 'b2f_flag_ungroup_auto_hide' && $value === true ) {
+                $p4 = b2f_audit_get_phase4_state();
+                if ( empty( $p4['finished_at'] ) ) {
+                    return new WP_Error(
+                        'migration_not_finished',
+                        'ต้อง run Phase 4 migration ให้เสร็จก่อน (ungroup_auto_hide อ่าน missing_leaves_count จาก junction)',
+                        array( 'status' => 400 )
+                    );
+                }
+            }
+            // Turning OFF v11_explicit_mode while order_intent still ON is unsafe — block
+            if ( $flag === 'b2f_flag_v11_explicit_mode' && $value === false ) {
+                if ( (bool) get_option( 'b2f_flag_order_intent', false ) ) {
+                    return new WP_Error(
+                        'dependent_flag_on',
+                        'ปิด v11_explicit_mode ไม่ได้ — order_intent ยัง ON (ปิด order_intent ก่อน)',
+                        array( 'status' => 400 )
+                    );
+                }
+            }
+
             $old = (bool) get_option( $flag, false );
             $new = (bool) $value;
             update_option( $flag, $new, false );
@@ -1908,6 +2678,575 @@ add_action( 'rest_api_init', function () {
         ),
     ) );
 
+    // ═══════════════════════════════════════════════════════════════════
+    // V.3.3: V.7.0 PHASE 4 CLASSIFICATION ENDPOINTS (4)
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // All 4 endpoints:
+    //   - Permission: manage_options (LIFF admin JWT via b2f_verify_admin_token
+    //     honored if helper exists — falls back to WP cap check)
+    //   - Audit trail: observations table (source='classification_change') — written
+    //     by Snippet 1 V.7.0 `b2f_junction_update_classification()` helper
+    //   - Cache: central hook `do_action('b2f_junction_updated', $maker_id)`
+    //   - Error codes: B2F_ERR_* registry in Snippet 1 V.7.0
+    //
+    // Helper: accept LIFF admin JWT (Snippet 2 V.10.x pattern). Admin manage_options
+    // on WP session overrides (covers dashboard calls).
+
+    $perm_admin_or_liff = function ( $req ) {
+        if ( current_user_can( 'manage_options' ) ) return true;
+        if ( function_exists( 'b2f_verify_admin_token' ) ) {
+            $verdict = b2f_verify_admin_token( $req );
+            if ( is_array( $verdict ) && ! empty( $verdict['is_admin'] ) ) return true;
+        }
+        return new WP_Error( 'rest_forbidden', 'Admin only', array( 'status' => 403 ) );
+    };
+
+    // ─────────────────────────────────────────────
+    // POST /junction-update-classification
+    //   Request: { maker_id, sku, production_mode, confirmation_status?,
+    //              admin_display_mode?, reason?, expected_updated_at? }
+    //   Delegates to Snippet 1 V.7.0 `b2f_junction_update_classification()`.
+    //   Errors: 400 invalid_field/invalid_enum_value, 404 row_not_found,
+    //           409 stale_write, 422 check_constraint_violation, 429 rate_limited
+    //   Rate limit: 5/min/user
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/junction-update-classification', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin_or_liff,
+        'callback'            => function ( $req ) {
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_classify_' . $uid, 5, MINUTE_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            if ( ! function_exists( 'b2f_junction_update_classification' ) ) {
+                return new WP_Error(
+                    'not_implemented',
+                    'b2f_junction_update_classification() ไม่พบ — Snippet 1 V.7.0 ต้อง active',
+                    array( 'status' => 501 )
+                );
+            }
+
+            $maker_id  = intval( $req->get_param( 'maker_id' ) );
+            $sku       = (string) $req->get_param( 'sku' );
+            $prod      = $req->get_param( 'production_mode' );
+            $conf      = $req->get_param( 'confirmation_status' );
+            $display   = $req->get_param( 'admin_display_mode' );
+            $expected  = $req->get_param( 'expected_updated_at' );
+
+            if ( ! $maker_id || trim( $sku ) === '' ) {
+                return new WP_Error( 'invalid_field', 'maker_id + sku required', array( 'status' => 400 ) );
+            }
+
+            // Optimistic concurrency (optional) — compare updated_at before delegating
+            if ( $expected ) {
+                global $wpdb;
+                $tbl = $wpdb->prefix . 'dinoco_product_makers';
+                $current = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT updated_at FROM {$tbl}
+                     WHERE BINARY UPPER(product_sku) = UPPER(%s) AND maker_id = %d AND deleted_at IS NULL
+                     LIMIT 1",
+                    $sku, $maker_id
+                ) );
+                if ( $current === null ) {
+                    return new WP_Error( 'row_not_found', 'junction row not found', array( 'status' => 404 ) );
+                }
+                // Compare as ISO strings (normalize both sides)
+                $exp_ts = strtotime( (string) $expected );
+                $cur_ts = strtotime( (string) $current );
+                if ( $exp_ts && $cur_ts && abs( $cur_ts - $exp_ts ) > 1 ) {
+                    return new WP_Error(
+                        defined( 'B2F_ERR_STALE_JUNCTION_WRITE' ) ? B2F_ERR_STALE_JUNCTION_WRITE : 'stale_junction_write',
+                        'row updated by another actor since ' . $expected . ' (current=' . $current . ')',
+                        array( 'status' => 409 )
+                    );
+                }
+            }
+
+            $fields = array();
+            if ( $prod !== null && $prod !== '' )        $fields['production_mode']     = (string) $prod;
+            if ( $conf !== null && $conf !== '' )        $fields['confirmation_status'] = (string) $conf;
+            if ( $display !== null && $display !== '' )  $fields['admin_display_mode']  = (string) $display;
+            if ( empty( $fields ) ) {
+                return new WP_Error( 'invalid_field', 'at least one classification field required', array( 'status' => 400 ) );
+            }
+
+            $uid = get_current_user_id();
+            $res = b2f_junction_update_classification( $sku, $maker_id, $fields, $uid );
+            if ( is_wp_error( $res ) ) return $res;
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf(
+                    '[B2F Audit] classification update uid=%d maker=%d sku=%s fields=%s',
+                    $uid, $maker_id, strtoupper( $sku ), implode( ',', array_keys( $fields ) )
+                ) );
+            }
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'row_id'          => $res['row_id'] ?? 0,
+                    'old_values'      => $res['old'] ?? array(),
+                    'new_values'      => $res['new'] ?? array(),
+                    'observations_id' => $res['observations_id'] ?? 0,
+                    'reason'          => sanitize_text_field( (string) $req->get_param( 'reason' ) ),
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /junction-bulk-update-display
+    //   Request: { maker_id, skus[] (max 200), admin_display_mode, confirm, idempotency_key? }
+    //   Atomic: START TRANSACTION + per-SKU FOR UPDATE
+    //   Errors: 400 bulk_limit_exceeded, 422 mixed_maker_error, 429 rate_limited
+    //   Rate limit: 5/min/user
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/junction-bulk-update-display', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin_or_liff,
+        'callback'            => function ( $req ) {
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_bulk_display_' . $uid, 5, MINUTE_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                return new WP_Error( 'table_missing', 'junction table ยังไม่ถูกสร้าง', array( 'status' => 404 ) );
+            }
+
+            $maker_id  = intval( $req->get_param( 'maker_id' ) );
+            $skus_raw  = $req->get_param( 'skus' );
+            $display   = (string) $req->get_param( 'admin_display_mode' );
+            $confirm   = filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN );
+            $idem_key  = sanitize_text_field( (string) $req->get_param( 'idempotency_key' ) );
+
+            if ( ! $maker_id ) {
+                return new WP_Error( 'bad_maker', 'maker_id required', array( 'status' => 400 ) );
+            }
+            if ( ! $confirm ) {
+                return new WP_Error( 'not_confirmed', 'confirm=true required', array( 'status' => 400 ) );
+            }
+            $enum_display = array( 'auto', 'as_set', 'as_parts' );
+            if ( ! in_array( $display, $enum_display, true ) ) {
+                return new WP_Error( 'invalid_enum_value',
+                    'admin_display_mode must be one of: auto/as_set/as_parts',
+                    array( 'status' => 400 ) );
+            }
+            if ( ! is_array( $skus_raw ) || empty( $skus_raw ) ) {
+                return new WP_Error( 'no_skus', 'skus array required', array( 'status' => 400 ) );
+            }
+            if ( count( $skus_raw ) > 200 ) {
+                return new WP_Error(
+                    defined( 'B2F_ERR_BULK_LIMIT_EXCEEDED' ) ? B2F_ERR_BULK_LIMIT_EXCEEDED : 'bulk_limit_exceeded',
+                    'max 200 SKUs per request',
+                    array( 'status' => 400 )
+                );
+            }
+
+            // Idempotency — transient 60s
+            if ( $idem_key !== '' ) {
+                $tkey = 'b2f_bulk_disp_' . get_current_user_id() . '_' . md5( $idem_key );
+                $prev = get_transient( $tkey );
+                if ( $prev !== false ) {
+                    return rest_ensure_response( array(
+                        'success' => true,
+                        'data'    => $prev,
+                        'cached'  => true,
+                    ) );
+                }
+            }
+
+            // Normalize SKUs
+            $skus = array();
+            foreach ( $skus_raw as $s ) {
+                $u = strtoupper( trim( (string) $s ) );
+                if ( $u !== '' && ! in_array( $u, $skus, true ) ) $skus[] = $u;
+            }
+            if ( empty( $skus ) ) {
+                return new WP_Error( 'no_skus', 'no valid SKUs after normalization', array( 'status' => 400 ) );
+            }
+
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+            $obs = $wpdb->prefix . 'dinoco_maker_product_observations';
+            $uid = get_current_user_id();
+            $now = current_time( 'mysql' );
+
+            // Server-side PHP validator (MED-2 CHECK equivalent): single + as_parts blocked
+            // We cannot know production_mode of each row yet — fetch first (inside transaction).
+
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                $placeholders = implode( ',', array_fill( 0, count( $skus ), '%s' ) );
+                $params = array_merge( array( $maker_id ), $skus );
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT id, product_sku, maker_id, production_mode, admin_display_mode, confirmation_status
+                     FROM {$tbl}
+                     WHERE maker_id = %d AND BINARY UPPER(product_sku) IN ({$placeholders}) AND deleted_at IS NULL
+                     FOR UPDATE",
+                    $params
+                ), ARRAY_A );
+
+                $seen_makers = array();
+                $updated = 0;
+                $skipped = array();
+                $rows_by_sku = array();
+                foreach ( (array) $rows as $row ) {
+                    $rows_by_sku[ strtoupper( $row['product_sku'] ) ] = $row;
+                    $seen_makers[ (int) $row['maker_id'] ] = true;
+                }
+
+                // Mixed maker guard (shouldn't happen since WHERE maker_id=%d, but defensive)
+                if ( count( $seen_makers ) > 1 ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'mixed_maker_error',
+                        'SKUs from multiple makers', array( 'status' => 422 ) );
+                }
+
+                foreach ( $skus as $sku_u ) {
+                    if ( ! isset( $rows_by_sku[ $sku_u ] ) ) {
+                        $skipped[] = array( 'sku' => $sku_u, 'reason' => 'not_found' );
+                        continue;
+                    }
+                    $row = $rows_by_sku[ $sku_u ];
+                    $old_display = (string) $row['admin_display_mode'];
+                    if ( $old_display === $display ) {
+                        $skipped[] = array( 'sku' => $sku_u, 'reason' => 'no_change' );
+                        continue;
+                    }
+                    // CHECK equivalent — production_mode='single' + display='as_parts' → invalid
+                    $prod = (string) $row['production_mode'];
+                    if ( $prod === 'single' && $display === 'as_parts' ) {
+                        $skipped[] = array( 'sku' => $sku_u, 'reason' => 'single_cannot_as_parts' );
+                        continue;
+                    }
+                    $ok = $wpdb->update(
+                        $tbl,
+                        array(
+                            'admin_display_mode' => $display,
+                            'updated_by'         => $uid,
+                            'updated_at'         => $now,
+                        ),
+                        array( 'id' => (int) $row['id'] ),
+                        array( '%s', '%d', '%s' ),
+                        array( '%d' )
+                    );
+                    if ( $ok === false ) {
+                        throw new Exception( 'UPDATE sku=' . $sku_u . ' failed: ' . $wpdb->last_error );
+                    }
+                    $updated++;
+
+                    // Audit
+                    if ( b2f_audit_observations_table_exists() ) {
+                        $wpdb->insert(
+                            $obs,
+                            array(
+                                'observed_at'    => $now,
+                                'source'         => 'classification_change',
+                                'sku'            => $sku_u,
+                                'maker_id'       => $maker_id,
+                                'field_name'     => 'admin_display_mode',
+                                'cpt_value'      => $old_display,
+                                'junction_value' => $display,
+                                'diff_detected'  => 1,
+                            ),
+                            array( '%s','%s','%s','%d','%s','%s','%s','%d' )
+                        );
+                    }
+                }
+
+                $wpdb->query( 'COMMIT' );
+            } catch ( Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[B2F Audit] bulk-update-display: ' . $e->getMessage() );
+                }
+                return new WP_Error( 'db_error', $e->getMessage(), array( 'status' => 500 ) );
+            }
+
+            // Fire central hook ONCE (not per SKU) — HIGH-4
+            do_action( 'b2f_junction_updated', $maker_id );
+
+            $payload = array(
+                'updated'         => $updated,
+                'skipped_invalid' => $skipped,
+                'rows_affected'   => $updated,
+                'admin_display_mode' => $display,
+            );
+            if ( isset( $idem_key ) && $idem_key !== '' ) {
+                set_transient( 'b2f_bulk_disp_' . $uid . '_' . md5( $idem_key ), $payload, 60 );
+            }
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf(
+                    '[B2F Audit] bulk-update-display uid=%d maker=%d updated=%d skipped=%d display=%s',
+                    $uid, $maker_id, $updated, count( $skipped ), $display
+                ) );
+            }
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => $payload,
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /junction-confirm-classification
+    //   Request: { maker_id, skus[] }
+    //   Idempotent — re-confirm returns 200 with already_confirmed[]
+    //   MED-2 CHECK: (confirmation_status='auto_synced') OR (confirmed_by+at NOT NULL)
+    //   Rate limit: 5/min/user
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/junction-confirm-classification', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin_or_liff,
+        'callback'            => function ( $req ) {
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_confirm_' . $uid, 5, MINUTE_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                return new WP_Error( 'table_missing', 'junction table ยังไม่ถูกสร้าง', array( 'status' => 404 ) );
+            }
+
+            $maker_id = intval( $req->get_param( 'maker_id' ) );
+            $skus_raw = $req->get_param( 'skus' );
+
+            if ( ! $maker_id ) {
+                return new WP_Error( 'bad_maker', 'maker_id required', array( 'status' => 400 ) );
+            }
+            if ( ! is_array( $skus_raw ) || empty( $skus_raw ) ) {
+                return new WP_Error( 'no_skus', 'skus array required', array( 'status' => 400 ) );
+            }
+            if ( count( $skus_raw ) > 200 ) {
+                return new WP_Error(
+                    defined( 'B2F_ERR_BULK_LIMIT_EXCEEDED' ) ? B2F_ERR_BULK_LIMIT_EXCEEDED : 'bulk_limit_exceeded',
+                    'max 200 SKUs per request',
+                    array( 'status' => 400 )
+                );
+            }
+
+            $skus = array();
+            foreach ( $skus_raw as $s ) {
+                $u = strtoupper( trim( (string) $s ) );
+                if ( $u !== '' && ! in_array( $u, $skus, true ) ) $skus[] = $u;
+            }
+            if ( empty( $skus ) ) {
+                return new WP_Error( 'no_skus', 'no valid SKUs after normalization', array( 'status' => 400 ) );
+            }
+
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+            $obs = $wpdb->prefix . 'dinoco_maker_product_observations';
+            $uid = get_current_user_id();
+            $now = current_time( 'mysql' );
+
+            $already = array();
+            $confirmed_count = 0;
+            $skipped = array();
+
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                $placeholders = implode( ',', array_fill( 0, count( $skus ), '%s' ) );
+                $params = array_merge( array( $maker_id ), $skus );
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT id, product_sku, confirmation_status, confirmed_by, confirmed_at
+                     FROM {$tbl}
+                     WHERE maker_id = %d AND BINARY UPPER(product_sku) IN ({$placeholders}) AND deleted_at IS NULL
+                     FOR UPDATE",
+                    $params
+                ), ARRAY_A );
+                $rows_by_sku = array();
+                foreach ( (array) $rows as $row ) $rows_by_sku[ strtoupper( $row['product_sku'] ) ] = $row;
+
+                foreach ( $skus as $sku_u ) {
+                    if ( ! isset( $rows_by_sku[ $sku_u ] ) ) {
+                        $skipped[] = array( 'sku' => $sku_u, 'reason' => 'not_found' );
+                        continue;
+                    }
+                    $row = $rows_by_sku[ $sku_u ];
+                    if ( (string) $row['confirmation_status'] === 'confirmed' ) {
+                        $already[] = $sku_u;
+                        continue; // idempotent — already confirmed
+                    }
+                    $ok = $wpdb->update(
+                        $tbl,
+                        array(
+                            'confirmation_status' => 'confirmed',
+                            'confirmed_by'        => $uid,
+                            'confirmed_at'        => $now,
+                            'updated_by'          => $uid,
+                            'updated_at'          => $now,
+                        ),
+                        array( 'id' => (int) $row['id'] ),
+                        array( '%s', '%d', '%s', '%d', '%s' ),
+                        array( '%d' )
+                    );
+                    if ( $ok === false ) {
+                        throw new Exception( 'UPDATE confirm sku=' . $sku_u . ' failed: ' . $wpdb->last_error );
+                    }
+                    $confirmed_count++;
+
+                    if ( b2f_audit_observations_table_exists() ) {
+                        $wpdb->insert(
+                            $obs,
+                            array(
+                                'observed_at'    => $now,
+                                'source'         => 'classification_change',
+                                'sku'            => $sku_u,
+                                'maker_id'       => $maker_id,
+                                'field_name'     => 'confirmation_status',
+                                'cpt_value'      => (string) $row['confirmation_status'],
+                                'junction_value' => 'confirmed',
+                                'diff_detected'  => 1,
+                            ),
+                            array( '%s','%s','%s','%d','%s','%s','%s','%d' )
+                        );
+                    }
+                }
+                $wpdb->query( 'COMMIT' );
+            } catch ( Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[B2F Audit] confirm-classification: ' . $e->getMessage() );
+                }
+                return new WP_Error( 'db_error', $e->getMessage(), array( 'status' => 500 ) );
+            }
+
+            do_action( 'b2f_junction_updated', $maker_id );
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf(
+                    '[B2F Audit] confirm uid=%d maker=%d confirmed=%d already=%d skipped=%d',
+                    $uid, $maker_id, $confirmed_count, count( $already ), count( $skipped )
+                ) );
+            }
+
+            return rest_ensure_response( array(
+                'success'         => true,
+                'confirmed_count' => $confirmed_count,
+                'already_confirmed' => $already,
+                'skipped'         => $skipped,
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // POST /phase4-migration
+    //   Request: { confirm, dry_run, batch_size? }
+    //   Rate limit: 5/HOUR (heavy op)
+    //   Delegates to b2f_phase4_run_classification_migration($dry_run, $batch)
+    //   dry_run=true → CSV emitted to wp-content/b2f-backups/dry-run-{ts}.csv
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/phase4-migration', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin_or_liff,
+        'callback'            => function ( $req ) {
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_phase4_' . $uid, 5, HOUR_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            $confirm = filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN );
+            $dry_run = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
+            $batch   = intval( $req->get_param( 'batch_size' ) );
+            if ( $batch <= 0 ) $batch = 200;
+
+            if ( ! $confirm && ! $dry_run ) {
+                return new WP_Error( 'confirm_required', 'confirm=true or dry_run=1 required', array( 'status' => 400 ) );
+            }
+
+            if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
+                return new WP_Error(
+                    'not_implemented',
+                    'b2f_phase4_run_classification_migration() missing — Audit V.3.3 active?',
+                    array( 'status' => 501 )
+                );
+            }
+
+            // Guard — migration already in progress (CRIT-4 lock)
+            if ( get_option( 'b2f_phase4_migration_in_progress' ) && ! $dry_run ) {
+                return new WP_Error(
+                    defined( 'B2F_ERR_MIGRATION_IN_PROGRESS' ) ? B2F_ERR_MIGRATION_IN_PROGRESS : 'migration_in_progress',
+                    'Phase 4 migration already running — wait for lock to clear',
+                    array( 'status' => 503 )
+                );
+            }
+
+            // Schema V10 prerequisite — Phase 4 ALTERs require junction table
+            if ( ! b2f_audit_is_schema_activated() ) {
+                return new WP_Error(
+                    'schema_not_ready',
+                    'Activate Schema (Phase 2) required before Phase 4 migration',
+                    array( 'status' => 409 )
+                );
+            }
+
+            $state = b2f_phase4_run_classification_migration( $dry_run, $batch );
+
+            // Build CSV URL (if present)
+            $csv_url = null;
+            if ( ! empty( $state['csv_path'] ) ) {
+                // Map WP_CONTENT_DIR path → content_url
+                $rel = str_replace( WP_CONTENT_DIR, '', (string) $state['csv_path'] );
+                $csv_url = content_url( $rel );
+            }
+
+            return rest_ensure_response( array(
+                'success' => empty( $state['errors'] ),
+                'data'    => array(
+                    'ran_at'                  => $state['started_at'] ?? current_time( 'mysql' ),
+                    'finished_at'             => $state['finished_at'] ?? null,
+                    'rows_updated'            => intval( $state['processed'] ?? 0 ),
+                    'rows_skipped_confirmed'  => intval( $state['confirmed_preserved'] ?? 0 ),
+                    'classified_set_assembled'=> intval( $state['classified_set_assembled'] ?? 0 ),
+                    'classified_sub_unit'     => intval( $state['classified_sub_unit'] ?? 0 ),
+                    'classified_single'       => intval( $state['classified_single'] ?? 0 ),
+                    'classified_cross_factory'=> intval( $state['classified_cross_factory'] ?? 0 ),
+                    'auto_hidden_count'       => intval( $state['auto_hidden_count'] ?? 0 ),
+                    'orphans_added'           => 0,
+                    'errors'                  => $state['errors'] ?? array(),
+                    'elapsed_ms'              => $state['elapsed_ms'] ?? 0,
+                    'dry_run'                 => (bool) ( $state['dry_run'] ?? false ),
+                    'csv_url'                 => $csv_url,
+                    'mysql_check'             => $state['mysql_check'] ?? array(),
+                    'schema_alter'            => $state['schema_alter'] ?? array(),
+                    'snapshot'                => $state['snapshot'] ?? array(),
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // GET /phase4-migration-state — read last run state
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/phase4-migration-state', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin_or_liff,
+        'callback'            => function () {
+            $state = b2f_audit_get_phase4_state();
+            $mysql = function_exists( 'b2f_audit_check_mysql_version' ) ? b2f_audit_check_mysql_version() : array();
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'state'           => $state,
+                    'in_progress'     => (bool) get_option( 'b2f_phase4_migration_in_progress' ),
+                    'schema_version'  => (string) get_option( 'b2f_schema_version', '0' ),
+                    'v11_activated'   => (bool) get_option( 'b2f_schema_v11_activated' ),
+                    'mysql_check'     => $mysql,
+                ),
+            ) );
+        },
+    ) );
+
 } );
 
 
@@ -1929,8 +3268,8 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
         <div class="b2f-audit-root" data-nonce="<?php echo esc_attr( $nonce ); ?>" data-base="<?php echo esc_url( $base ); ?>">
 
             <div class="b2f-audit-header">
-                <h2 class="b2f-audit-title">📊 B2F Migration Audit <span class="b2f-audit-ver">V.2.0</span></h2>
-                <p class="b2f-audit-sub">Phase 2 — Shadow-Write mode. Activate schema → backfill → enable shadow_write flag. Cost data = confidential.</p>
+                <h2 class="b2f-audit-title">📊 B2F Migration Audit <span class="b2f-audit-ver">V.3.3</span></h2>
+                <p class="b2f-audit-sub">Phase 2 (shadow-write) + Phase 3 (read cutover) + Phase 4 (V.7.0 classification). Cost data = confidential.</p>
                 <a href="#" class="b2f-audit-refresh" data-action="refresh-all">🔄 Refresh ทั้งหมด</a>
             </div>
 
@@ -1993,6 +3332,93 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                         <button class="b2f-audit-btn" data-action="toggle-junction-read" data-value="1">4️⃣ Enable Read from Junction</button>
                         <button class="b2f-audit-btn b2f-audit-btn-danger" data-action="toggle-junction-read" data-value="0">⏸ Disable (rollback)</button>
                         <span class="b2f-audit-status" data-target="junction-read-status"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- V.3.3: Phase 4 Controls — V.7.0 Classification Migration -->
+            <div class="b2f-audit-section b2f-audit-phase4">
+                <h3>🏗️ Phase 4 Controls — V.7.0 Classification Migration <span class="b2f-audit-phase-badge b2f-audit-phase4-badge">Phase 4</span></h3>
+                <div class="b2f-audit-phase4-warning">
+                    ⚠️ <strong>Phase 4 — Schema V11 + classification migration</strong>.
+                    เพิ่ม 6 columns (production_mode / admin_display_mode / confirmation_status / missing_leaves_count / confirmed_by / confirmed_at)
+                    + 2 composite indexes + 2 CHECK constraints ให้ `wp_dinoco_product_makers`.
+                    Classification loop จะ tag junction rows เป็น 🟣 set_assembled / 🟠 sub_unit / ⚪ single / 🟠 cross_factory_assembly.
+                    <strong>Prerequisite</strong>: Phase 2 schema + backfill เสร็จเรียบร้อย.
+                </div>
+
+                <!-- MySQL capability card -->
+                <div class="b2f-audit-phase4-mysql" data-target="phase4-mysql">
+                    <span>⏳ กำลังตรวจสอบ MySQL capability…</span>
+                </div>
+
+                <!-- Last run state card -->
+                <div class="b2f-audit-phase4-state" data-target="phase4-state-card">
+                    <span>⏳ กำลังโหลดสถานะ Phase 4…</span>
+                </div>
+
+                <div class="b2f-audit-phase4-steps">
+                    <!-- Step A: Dry-Run -->
+                    <div class="b2f-audit-phase2-step" data-step="p4-dry">
+                        <div class="b2f-audit-phase2-step-head">
+                            <span class="b2f-audit-phase2-step-num">A</span>
+                            <span class="b2f-audit-phase2-step-title">Dry-Run Phase 4 Migration</span>
+                            <span class="b2f-audit-phase2-step-state" data-k="p4-dry-state">–</span>
+                        </div>
+                        <p class="b2f-audit-phase2-step-desc">🧪 Preview classification — ไม่แก้ database. Output CSV เข้า `wp-content/b2f-backups/dry-run-{timestamp}.csv`</p>
+                        <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="phase4-run" data-dry="1">🧪 Dry-Run</button>
+                        <a class="b2f-audit-btn b2f-audit-btn-ghost" data-target="p4-csv-link" href="#" style="display:none;" target="_blank" rel="noopener">📥 Download Dry-Run CSV</a>
+                        <span class="b2f-audit-status" data-target="p4-dry-status"></span>
+                        <div class="b2f-audit-phase2-backfill-result" data-target="p4-dry-result"></div>
+                    </div>
+
+                    <!-- Step B: Live Migration -->
+                    <div class="b2f-audit-phase2-step" data-step="p4-live">
+                        <div class="b2f-audit-phase2-step-head">
+                            <span class="b2f-audit-phase2-step-num">B</span>
+                            <span class="b2f-audit-phase2-step-title">Run Live Migration</span>
+                            <span class="b2f-audit-phase2-step-state" data-k="p4-live-state">–</span>
+                        </div>
+                        <p class="b2f-audit-phase2-step-desc">🚀 ALTER + classify ทุก junction row. Idempotent — preserve admin-confirmed rows. Lock flag `b2f_phase4_migration_in_progress` ป้องกัน dual-write race.</p>
+                        <button class="b2f-audit-btn" data-action="phase4-run" data-dry="0">B️⃣ Run Live Migration</button>
+                        <span class="b2f-audit-status" data-target="p4-live-status"></span>
+                        <div class="b2f-audit-phase2-backfill-result" data-target="p4-live-result"></div>
+                    </div>
+
+                    <!-- Step C: V.7.0 Flag Toggle Panel (3 flags with dependency warnings) -->
+                    <div class="b2f-audit-phase2-step" data-step="p4-flags">
+                        <div class="b2f-audit-phase2-step-head">
+                            <span class="b2f-audit-phase2-step-num">C</span>
+                            <span class="b2f-audit-phase2-step-title">V.7.0 Feature Flags (dependency chain)</span>
+                            <span class="b2f-audit-phase2-step-state" data-k="p4-flags-state">–</span>
+                        </div>
+                        <p class="b2f-audit-phase2-step-desc">
+                            3 flags — <strong>เปิดตามลำดับ</strong>:
+                            (1) <code>v11_explicit_mode</code> — ให้ API return production_mode →
+                            (2) <code>order_intent</code> — accept poi_order_mode (ต้องเปิด v11 ก่อน) →
+                            (3) <code>ungroup_auto_hide</code> — ซ่อน cross-factory SET default (ต้อง Phase 4 เสร็จก่อน).
+                        </p>
+                        <div class="b2f-audit-phase4-flagrow" data-flag="b2f_flag_v11_explicit_mode">
+                            <span class="b2f-audit-phase4-flag-name"><code>b2f_flag_v11_explicit_mode</code></span>
+                            <span class="b2f-audit-phase4-flag-state" data-k="flag-v11-state">–</span>
+                            <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="phase4-flag-toggle" data-flag="b2f_flag_v11_explicit_mode" data-value="1">▶ Enable</button>
+                            <button class="b2f-audit-btn b2f-audit-btn-danger" data-action="phase4-flag-toggle" data-flag="b2f_flag_v11_explicit_mode" data-value="0">⏸ Disable</button>
+                            <span class="b2f-audit-status" data-target="flag-v11-status"></span>
+                        </div>
+                        <div class="b2f-audit-phase4-flagrow" data-flag="b2f_flag_order_intent">
+                            <span class="b2f-audit-phase4-flag-name"><code>b2f_flag_order_intent</code></span>
+                            <span class="b2f-audit-phase4-flag-state" data-k="flag-oi-state">–</span>
+                            <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="phase4-flag-toggle" data-flag="b2f_flag_order_intent" data-value="1">▶ Enable</button>
+                            <button class="b2f-audit-btn b2f-audit-btn-danger" data-action="phase4-flag-toggle" data-flag="b2f_flag_order_intent" data-value="0">⏸ Disable</button>
+                            <span class="b2f-audit-status" data-target="flag-oi-status"></span>
+                        </div>
+                        <div class="b2f-audit-phase4-flagrow" data-flag="b2f_flag_ungroup_auto_hide">
+                            <span class="b2f-audit-phase4-flag-name"><code>b2f_flag_ungroup_auto_hide</code></span>
+                            <span class="b2f-audit-phase4-flag-state" data-k="flag-uah-state">–</span>
+                            <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="phase4-flag-toggle" data-flag="b2f_flag_ungroup_auto_hide" data-value="1">▶ Enable</button>
+                            <button class="b2f-audit-btn b2f-audit-btn-danger" data-action="phase4-flag-toggle" data-flag="b2f_flag_ungroup_auto_hide" data-value="0">⏸ Disable</button>
+                            <span class="b2f-audit-status" data-target="flag-uah-status"></span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2165,6 +3591,23 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
             .b2f-audit-flag-toggle { float: right; font-size: 12px; cursor: pointer; background: #fff; border: 1px solid #cbd5e1; border-radius: 4px; padding: 2px 10px; }
             .b2f-audit-flag-toggle.locked { opacity: .5; cursor: not-allowed; }
             .b2f-audit-flag-lockreason { margin-top: 6px; font-size: 11px; color: #94a3b8; }
+            /* V.3.3 Phase 4 */
+            .b2f-audit-phase4 { border-left: 4px solid #7c3aed; }
+            .b2f-audit-phase4-badge { background: #ede9fe !important; color: #6d28d9 !important; }
+            .b2f-audit-phase4-warning { background: #ede9fe; border: 1px solid #c4b5fd; color: #5b21b6; padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; line-height: 1.55; }
+            .b2f-audit-phase4-mysql { padding: 10px 14px; margin-bottom: 12px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; font-size: 13px; color: #166534; }
+            .b2f-audit-phase4-mysql.warn { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+            .b2f-audit-phase4-state { padding: 10px 14px; margin-bottom: 14px; background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 13px; color: #334155; font-family: ui-monospace, monospace; }
+            .b2f-audit-phase4-state.ok { background: #ecfccb; border-color: #bef264; color: #365314; }
+            .b2f-audit-phase4-state.warn { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+            .b2f-audit-phase4-steps { display: flex; flex-direction: column; gap: 14px; }
+            .b2f-audit-phase4-flagrow { display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin: 6px 0; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; flex-wrap: wrap; }
+            .b2f-audit-phase4-flag-name { font-size: 13px; color: #334155; flex: 1 1 280px; }
+            .b2f-audit-phase4-flag-name code { font-family: ui-monospace, monospace; font-size: 12px; background: #f1f5f9; padding: 2px 6px; border-radius: 3px; }
+            .b2f-audit-phase4-flag-state { font-size: 12px; padding: 3px 10px; border-radius: 4px; background: #e2e8f0; color: #475569; font-weight: 600; }
+            .b2f-audit-phase4-flag-state.on { background: #dcfce7; color: #166534; }
+            .b2f-audit-phase4-flag-state.off { background: #f1f5f9; color: #64748b; }
+            .b2f-audit-phase4-flag-state.blocked { background: #fee2e2; color: #991b1b; }
         </style>
 
         <script>
@@ -2485,6 +3928,10 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                             loadObservations();
                         }
                     }
+                    // V.3.3: Phase 4 state card (depends on flagsData)
+                    return loadPhase4State();
+                }).then(function(p4){
+                    if (p4) renderPhase4State(p4, flagsData);
                 });
 
                 renderHistory();
@@ -2693,6 +4140,220 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                 });
             }
 
+            // ─────────────────────────────────────────────
+            // V.3.3: Phase 4 — V.7.0 Classification Migration UI
+            // ─────────────────────────────────────────────
+            function renderPhase4State(state, flagsData) {
+                var wrap = root.querySelector('[data-target="phase4-state-card"]');
+                var mysqlWrap = root.querySelector('[data-target="phase4-mysql"]');
+                if (!wrap) return;
+
+                // MySQL capability
+                var mysql = (state && state.mysql_check) || (flagsData && flagsData.mysql_check) || {};
+                if (mysqlWrap && mysql.version) {
+                    var active = !!mysql.check_constraints_active;
+                    mysqlWrap.className = 'b2f-audit-phase4-mysql' + (active ? '' : ' warn');
+                    mysqlWrap.innerHTML = (active
+                        ? '✅ MySQL <code>' + esc(mysql.version) + '</code> — CHECK constraints <strong>enforced</strong> ที่ DB layer'
+                        : '⚠️ MySQL <code>' + esc(mysql.version) + '</code> — CHECK constraints <strong>silently ignored</strong> (PHP validator เป็นกำแพงแทน)');
+                }
+
+                // Last run state
+                var s = (state && state.state) || {};
+                if (!s || !s.started_at) {
+                    wrap.className = 'b2f-audit-phase4-state';
+                    wrap.innerHTML = '<strong>📋 ยังไม่เคย run Phase 4 migration</strong> — กด Dry-Run ก่อนเพื่อ preview.';
+                } else {
+                    var done = !!s.finished_at && (!s.errors || !s.errors.length);
+                    var inProgress = !!(state.in_progress);
+                    wrap.className = 'b2f-audit-phase4-state ' + (done ? 'ok' : (inProgress ? 'warn' : ''));
+                    var lines = [];
+                    lines.push('<strong>' + (s.dry_run ? '🧪 Last Dry-Run' : (done ? '✅ Last Live Run' : '⚠️ Last Run')) + '</strong>' +
+                               ' · started ' + esc(s.started_at) +
+                               (s.finished_at ? ' · finished ' + esc(s.finished_at) : ' · in-progress') +
+                               ' · ' + (s.elapsed_ms || 0) + 'ms');
+                    lines.push('processed=' + (s.processed||0) + '/' + (s.total_rows||0) +
+                               ' · set=' + (s.classified_set_assembled||0) +
+                               ' · sub=' + (s.classified_sub_unit||0) +
+                               ' · single=' + (s.classified_single||0) +
+                               ' · cross=' + (s.classified_cross_factory||0) +
+                               ' · hidden=' + (s.auto_hidden_count||0) +
+                               ' · preserved=' + (s.confirmed_preserved||0));
+                    if (s.errors && s.errors.length) {
+                        lines.push('🔴 errors: ' + s.errors.length + ' — ' + esc(JSON.stringify(s.errors.slice(0,3))));
+                    }
+                    if (inProgress) lines.push('🔒 <strong>migration lock ACTIVE</strong> — dual-write deferred');
+                    wrap.innerHTML = lines.join('<br>');
+                }
+
+                // Step A state badge
+                var a = root.querySelector('[data-step="p4-dry"] [data-k="p4-dry-state"]');
+                if (a) {
+                    if (s && s.dry_run) {
+                        a.className = 'b2f-audit-phase2-step-state done';
+                        a.textContent = '✓ dry-run available';
+                    } else {
+                        a.className = 'b2f-audit-phase2-step-state pending';
+                        a.textContent = 'ready';
+                    }
+                }
+                // Step B state badge
+                var b = root.querySelector('[data-step="p4-live"] [data-k="p4-live-state"]');
+                if (b) {
+                    if (s && s.finished_at && !s.dry_run && (!s.errors || !s.errors.length)) {
+                        b.className = 'b2f-audit-phase2-step-state done';
+                        b.textContent = '✓ migrated ' + (s.processed||0);
+                    } else if (state && state.in_progress) {
+                        b.className = 'b2f-audit-phase2-step-state pending';
+                        b.textContent = 'running…';
+                    } else {
+                        b.className = 'b2f-audit-phase2-step-state pending';
+                        b.textContent = 'pending';
+                    }
+                }
+
+                // Flag rows (v11_explicit_mode / order_intent / ungroup_auto_hide)
+                var flags = (flagsData && flagsData.flags) || {};
+                var migrationDone = !!(s && s.finished_at && !s.dry_run);
+                renderPhase4FlagRow('b2f_flag_v11_explicit_mode', 'flag-v11-state', flags);
+                renderPhase4FlagRow('b2f_flag_order_intent',      'flag-oi-state',  flags, !flags['b2f_flag_v11_explicit_mode'] || !flags['b2f_flag_v11_explicit_mode'].value ? 'blocked (v11 OFF)' : null);
+                renderPhase4FlagRow('b2f_flag_ungroup_auto_hide', 'flag-uah-state', flags, !migrationDone ? 'blocked (Phase 4 not finished)' : null);
+
+                // Step C badge summary
+                var c = root.querySelector('[data-step="p4-flags"] [data-k="p4-flags-state"]');
+                if (c) {
+                    var onCount = 0;
+                    ['b2f_flag_v11_explicit_mode','b2f_flag_order_intent','b2f_flag_ungroup_auto_hide'].forEach(function(k){
+                        if (flags[k] && flags[k].value) onCount++;
+                    });
+                    c.className = 'b2f-audit-phase2-step-state ' + (onCount === 3 ? 'done' : (onCount > 0 ? 'pending' : ''));
+                    c.textContent = onCount + '/3 ON';
+                }
+            }
+
+            function renderPhase4FlagRow(flag, stateKey, allFlags, blockedReason) {
+                var el = root.querySelector('[data-k="' + stateKey + '"]');
+                if (!el) return;
+                var f = allFlags[flag];
+                var on = !!(f && f.value);
+                if (blockedReason) {
+                    el.className = 'b2f-audit-phase4-flag-state blocked';
+                    el.textContent = '🔒 ' + blockedReason;
+                } else {
+                    el.className = 'b2f-audit-phase4-flag-state ' + (on ? 'on' : 'off');
+                    el.textContent = on ? '✅ ENABLED' : '⬜ disabled';
+                }
+                // Disable enable-button if blocked or already ON; enable disable-button only when ON
+                var row = root.querySelector('[data-flag="' + flag + '"]');
+                if (!row) return;
+                var btnEn = row.querySelector('[data-action="phase4-flag-toggle"][data-value="1"]');
+                var btnDi = row.querySelector('[data-action="phase4-flag-toggle"][data-value="0"]');
+                if (btnEn) btnEn.disabled = !!blockedReason || on;
+                if (btnDi) btnDi.disabled = !on;
+            }
+
+            function loadPhase4State() {
+                return api('phase4-migration-state').then(function(r){
+                    if (r.ok && r.json && r.json.success) return r.json.data;
+                    return null;
+                });
+            }
+
+            function doPhase4Run(btn, dryRun) {
+                var label = dryRun ? 'Dry-Run Phase 4' : 'LIVE Phase 4 Migration';
+                if (!confirm(
+                    (dryRun ? '🧪 ' : '⚠️ ') + 'ยืนยัน ' + label + '?\n\n' +
+                    (dryRun
+                        ? 'Dry-Run ไม่แก้ database — preview CSV.\nExpected: classify ทุก junction row ตาม sku_relations.'
+                        : '⚠️ LIVE MIGRATION\n' +
+                          '  • ALTER TABLE — เพิ่ม 6 columns + 2 indexes + 2 CHECK\n' +
+                          '  • UPDATE ทุก junction row (auto_synced หรือ unconfirmed)\n' +
+                          '  • Preserve admin-confirmed rows (idempotent)\n' +
+                          '  • Lock flag ป้องกัน dual-write race\n' +
+                          '  • Pre-migration mysqldump → wp-content/b2f-backups/\n\n' +
+                          'กดยืนยันเท่านั้นถ้าผ่าน dry-run แล้ว.'
+                    ) + '\n\nกด OK เพื่อดำเนินการ'
+                )) return;
+
+                btn.disabled = true;
+                var resKey = dryRun ? 'p4-dry' : 'p4-live';
+                var resultEl = root.querySelector('[data-target="' + resKey + '-result"]');
+                resultEl.className = 'b2f-audit-phase2-backfill-result';
+                resultEl.innerHTML = '';
+                setStatus('[data-target="' + resKey + '-status"]',
+                          '⏳ ' + (dryRun ? 'กำลัง dry-run…' : 'กำลัง run LIVE migration… (30-60 sec)'), false);
+
+                api('phase4-migration', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: !dryRun, dry_run: !!dryRun })
+                }).then(function(r){
+                    btn.disabled = false;
+                    if (r.ok && r.json && r.json.success) {
+                        var d = r.json.data;
+                        setStatus('[data-target="' + resKey + '-status"]',
+                                  '✅ ' + (d.dry_run ? 'dry-run' : 'migration') + ' complete — ' +
+                                  'processed ' + d.rows_updated + ', preserved ' + d.rows_skipped_confirmed +
+                                  ', errors ' + ((d.errors||[]).length) + ' (' + d.elapsed_ms + 'ms)', false);
+                        resultEl.classList.add('shown');
+                        resultEl.innerHTML =
+                            '<div><strong>Summary:</strong></div>' +
+                            '<div>set_assembled: ' + d.classified_set_assembled + '</div>' +
+                            '<div>sub_unit: ' + d.classified_sub_unit + '</div>' +
+                            '<div>single: ' + d.classified_single + '</div>' +
+                            '<div>cross_factory_assembly: ' + d.classified_cross_factory + '</div>' +
+                            '<div>auto_hidden (as_parts): ' + d.auto_hidden_count + '</div>' +
+                            '<div>confirmed preserved: ' + d.rows_skipped_confirmed + '</div>' +
+                            ((d.errors||[]).length ? '<pre>' + esc(JSON.stringify(d.errors, null, 2)) + '</pre>' : '');
+
+                        // Expose CSV link for dry-run
+                        if (d.dry_run && d.csv_url) {
+                            var link = root.querySelector('[data-target="p4-csv-link"]');
+                            if (link) {
+                                link.href = d.csv_url;
+                                link.style.display = '';
+                                link.textContent = '📥 Download Dry-Run CSV';
+                            }
+                        }
+                        loadAll();
+                    } else {
+                        var code = (r.json && r.json.code) || '';
+                        var msg = (r.json && r.json.message) ? r.json.message : ('HTTP ' + r.status);
+                        setStatus('[data-target="' + resKey + '-status"]', '❌ ' + msg +
+                                  (code === 'not_implemented' ? ' (Audit V.3.3 ยังไม่ sync)' : ''), true);
+                    }
+                });
+            }
+
+            function doPhase4FlagToggle(btn) {
+                var flag = btn.getAttribute('data-flag');
+                var value = btn.getAttribute('data-value') === '1';
+                if (!confirm('ยืนยัน ' + (value ? 'ENABLE' : 'DISABLE') + ' ' + flag + '?\n\n' +
+                            'Dependency chain:\n' +
+                            '  order_intent → ต้องเปิด v11_explicit_mode ก่อน\n' +
+                            '  ungroup_auto_hide → ต้อง Phase 4 finished_at\n\n' +
+                            'ถ้าปิด v11_explicit_mode ขณะที่ order_intent ยัง ON → backend จะ block')) return;
+                btn.disabled = true;
+                var statusKey = btn.closest('.b2f-audit-phase4-flagrow').querySelector('.b2f-audit-status').getAttribute('data-target');
+                setStatus('[data-target="' + statusKey + '"]', '⏳ toggling…', false);
+                api('feature-flags/toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ flag_name: flag, value: value, confirm: true })
+                }).then(function(r){
+                    if (r.ok && r.json && r.json.success) {
+                        var d = r.json.data;
+                        setStatus('[data-target="' + statusKey + '"]',
+                                  '✅ ' + d.flag_name + ': ' + d.old_value + ' → ' + d.new_value, false);
+                        loadAll();
+                    } else {
+                        var msg = (r.json && r.json.message) ? r.json.message : ('HTTP ' + r.status);
+                        setStatus('[data-target="' + statusKey + '"]', '❌ ' + msg, true);
+                        btn.disabled = false;
+                    }
+                });
+            }
+
             root.addEventListener('click', function(e){
                 var t = e.target;
                 if (t.matches('[data-action="refresh-all"]')) {
@@ -2720,6 +4381,9 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                 if (t.matches('[data-action="flag-toggle"]')) { e.preventDefault(); doFlagToggle(t); }
                 if (t.matches('[data-action="reload-junction"]')) { e.preventDefault(); loadJunctionSnapshot(); }
                 if (t.matches('[data-action="reload-obs"]')) { e.preventDefault(); loadObservations(); }
+                // V.3.3: Phase 4 actions
+                if (t.matches('[data-action="phase4-run"]')) { e.preventDefault(); doPhase4Run(t, t.getAttribute('data-dry') === '1'); }
+                if (t.matches('[data-action="phase4-flag-toggle"]')) { e.preventDefault(); doPhase4FlagToggle(t); }
             });
 
             root.addEventListener('change', function(e){

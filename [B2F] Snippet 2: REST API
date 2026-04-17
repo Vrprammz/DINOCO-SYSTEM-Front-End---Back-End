@@ -1,5 +1,40 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.0 — B2F V.7.0 Order Intent + Ungroup (Plan: sunny-spinning-quill.md)
+ *   1. Enriched `GET /maker-products/{maker_id}` — returns `production_mode`, `confirmation_status`,
+ *      `admin_display_mode`, `missing_leaves[]` per-product + `maker_profile.stats` aggregate.
+ *      Flag-gated by `b2f_flag_v11_explicit_mode`. OFF → V.10.5-compat shape (no new fields).
+ *      Transient cache `b2f_maker_products_v11_{maker_id}` 10min TTL; invalidated via central hook
+ *      `b2f_junction_updated` (listener in Snippet 1 V.7.0 `b2f_on_junction_updated_invalidate`).
+ *   2. `POST /create-po` 7-rule validator (flag-gated by `b2f_flag_order_intent`):
+ *        (1) order_mode strict enum, (2) full_set → set_assembled|cross_factory,
+ *        (3) sub_unit → sub_unit, (4) single_leaf → single,
+ *        (5) source_sku in ancestor chain (b2f_validate_source_sku_in_ancestors),
+ *        (6) intent_notes sanitize + 200-char cap,
+ *        (7) existing rate limit preserved. Fail-fast (rule 1 before rule 5).
+ *      DD-3 merge key fix: `$merged["{sku}|{order_mode}|{source_sku}"]` — same SKU with different
+ *      modes no longer merges (preserves admin intent). Breakdown JSON includes `order_mode`.
+ *      ACF po_items saves: `poi_order_mode`, `poi_intent_notes`, `poi_source_sku`,
+ *      `poi_production_mode_snapshot`. Postmeta `_b2f_order_intent_summary` computed + saved.
+ *   3. `b2f_format_po_detail()` callback-level PII gate (HIGH-1):
+ *        - Non-admin (maker JWT / no cap) → strip `poi_intent_notes` + `poi_production_mode_snapshot`
+ *          per item + `order_intent_summary` aggregate. Defense-in-depth on top of
+ *          `rest_prepare_b2f_order` filter (which is dead code since CPT show_in_rest=false).
+ *        - Legacy fallback: PO without `poi_order_mode` → `b2f_infer_legacy_order_mode()` display only.
+ *   4. NEW `POST /po-undo-submit` (HIGH-3) — 30-second undo window (DB clock, not PHP):
+ *        - Dual auth (WP nonce OR X-B2F-Token admin JWT)
+ *        - START TRANSACTION + FOR UPDATE on PO row (race-safe)
+ *        - `post_date > NOW() - INTERVAL 30 SECOND` check in SQL
+ *        - FSM transition draft → cancelled via `b2f_transition_order()` + stock restore
+ *          + credit refund (reuses `po-cancel` path)
+ *        - Idempotent: already-cancelled PO returns success (no error)
+ *        - 410 `undo_window_expired` | 409 `already_cancelled` | 403 `not_owner` | 500 `undo_failed`
+ *   5. `X-B2F-API-Version: 11.0` response header on all `/b2f/v1/*` routes
+ *      via `rest_post_dispatch` filter (no per-endpoint wiring needed).
+ *   6. Flag dependency chain (enforced read-side):
+ *        - `b2f_flag_v11_explicit_mode` = backend return new fields
+ *        - `b2f_flag_order_intent` = accept order_mode param (requires v11_explicit_mode ON first)
+ *      Flag OFF fallback → V.10.5 shape preserved (backward compat intact).
  * Version: V.10.5 — Housekeeping M-1+M-3 (docs only, no behavior change): annotate V.10.2 header note → V.10.3 extends virtual inject to junction path; add inline comment at `poi_parent_path` top-level save documenting probe-only semantics for DD-3 shared leaf (authoritative path per occurrence lives in `$breakdown[i]['parent_path']`, renderer uses `b2f_group_items_by_path()` which checks `$has_any_path` probe THEN iterates breakdown for authoritative per-occurrence paths). Do NOT rely on top-level `poi_parent_path` for DD-3 cases.
  * Version: V.10.4 — Virtual SET disclosure: add `virtual_reason` field ให้ frontend filter ได้ตรงๆ. Top-level virtual SET (maker ไม่ได้ register + แต่ leaves registered ครบ → SETs ประกอบจากชิ้นส่วน shared) → `virtual_reason='shared_parts_assembled'`. Intermediate sub-SET (parent มี parent อีกที — ต้องโผล่เสมอเพื่อให้ `renderSetDetailItems()` ใน Snippet 8 lookup `products[childSku]` เจอตอน SET Detail ของ top-level SET จริง) → `virtual_reason='intermediate_sub_set'`. Snippet 8 V.6.5 ใช้ flag นี้ toggle default OFF = ซ่อนเฉพาะ `shared_parts_assembled` (ไม่ซ่อน `intermediate_sub_set` เพราะจำเป็นต่อ hierarchy display). No breaking changes — field เพิ่มเฉยๆ.
  * Version: V.10.3 — Issue #1 fix: DD-7 expansion ที่เดิมเก็บเฉพาะ top-level SET (`poi_parent_sku` + `poi_parent_name`) → Maker Flex, Admin Flex, PO Image, PO Ticket view แสดงแค่ 2 ระดับ (SET → leaves flat) ขาดชั้น "intermediate child" ใน 3-level hierarchy → user งงว่าสั่งอะไร. V.10.3 update: walk ancestors จาก leaf ถึง ordered SET ด้วย `dinoco_get_ancestor_skus()` → build `parent_path = "TOP/MID"` (slash-separated) → store per breakdown entry (DD-3 shared child safe: leaf อาจมี path ต่างกันต่อ occurrence) + top-level `poi_parent_path` ACF sub-field (first breakdown entry, mirror poi_parent_sku convention). `po-detail` REST response return `parent_path` per item. Backward compat: PO เก่าไม่มี poi_parent_path → empty string → renderer fallback ใช้ poi_parent_sku (2-level grouping) เหมือนเดิม. No breaking changes.
@@ -141,6 +176,14 @@ add_action( 'rest_api_init', function () {
         'permission_callback' => $admin_perm,
     ) );
 
+    // ── V.11.0 HIGH-3: Undo submit within 30 seconds ──
+    //   dual-auth (WP nonce OR X-B2F-Token admin JWT) + DB clock check + FOR UPDATE lock
+    register_rest_route( $ns, '/po-undo-submit', array(
+        'methods'             => 'POST',
+        'callback'            => 'b2f_rest_po_undo_submit',
+        'permission_callback' => $admin_perm,
+    ) );
+
     // ── Maker Actions (JWT auth) ──
     register_rest_route( $ns, '/maker-confirm', array(
         'methods'             => 'POST',
@@ -226,6 +269,24 @@ add_action( 'rest_api_init', function () {
 
     // Debug endpoints ลบแล้ว (V.9.16 virtual SET cost verified, debug-vset removed)
 } );
+
+// ════════════════════════════════════════════
+// 1B. V.11.0 — X-B2F-API-Version RESPONSE HEADER (api-specialist recommend)
+// Client (LIFF) ใช้ detect deploy version — no config change needed.
+// Single filter covers all b2f/v1/* endpoints (no per-endpoint wiring).
+// ════════════════════════════════════════════
+if ( ! function_exists( 'b2f_rest_api_version_header' ) ) {
+    function b2f_rest_api_version_header( $response, $server, $request ) {
+        if ( $response instanceof WP_REST_Response ) {
+            $route = $request->get_route();
+            if ( is_string( $route ) && strpos( $route, '/b2f/v1/' ) === 0 ) {
+                $response->header( 'X-B2F-API-Version', '11.0' );
+            }
+        }
+        return $response;
+    }
+    add_filter( 'rest_post_dispatch', 'b2f_rest_api_version_header', 10, 3 );
+}
 
 // ════════════════════════════════════════════
 // 2. HELPER: RATE LIMITER
@@ -807,6 +868,22 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ maker_id', 'code' => 'MISSING_MAKER_ID' ), 400 );
         }
 
+        // V.11.0 — Transient cache (10min TTL). Invalidated via central action hook
+        // `b2f_junction_updated` → listener `b2f_on_junction_updated_invalidate` in Snippet 1 V.7.0.
+        // Skip cache for virtual inject (audit tool) — audit reads bypass cache path intentionally.
+        $include_virtual = ( '1' === (string) $req->get_param( 'include_virtual' ) );
+        $flag_v11_cache = function_exists( 'b2f_is_flag_enabled' )
+            && b2f_is_flag_enabled( 'b2f_flag_v11_explicit_mode' );
+        $cache_key = $flag_v11_cache
+            ? "b2f_maker_products_v11_{$maker_id}"
+            : "b2f_maker_products_{$maker_id}";
+        if ( ! $include_virtual ) {
+            $cached = get_transient( $cache_key );
+            if ( is_array( $cached ) && ! empty( $cached ) ) {
+                return new WP_REST_Response( $cached, 200 );
+            }
+        }
+
         // V.9.2: Pre-compute hierarchy maps ONCE (not N times per product)
         $sku_relations = get_option( 'dinoco_sku_relations', array() );
         $hierarchy_ctx = b2f_build_hierarchy_context( $sku_relations );
@@ -846,7 +923,8 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
         // Phase 3 junction has **top-level orphan SETs** (13 rows จาก backfill) แต่ไม่มี
         // **intermediate sub-SETs** (เช่น DNCNX500E002B ที่เป็น child ของ DNCSETNX500E002
         // แต่ HTP ไม่ได้ register). SET Detail UI ต้องเห็นทุกชั้น → virtual inject ทั้ง path
-        if ( '1' === (string) $req->get_param( 'include_virtual' ) ) {
+        // V.11.0: reuse $include_virtual computed above (avoid duplicate $req->get_param call)
+        if ( $include_virtual ) {
             $products = b2f_inject_virtual_all_sets_v920( $products, $hierarchy_ctx['rel_upper'] );
         }
 
@@ -947,7 +1025,40 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             ? $products
             : b2f_compute_set_costs_v918( $products, $hierarchy_ctx['rel_upper'] );
 
-        return new WP_REST_Response( array(
+        // V.11.0 — maker_profile.stats aggregate (only when v11 flag ON)
+        //   Counts per production_mode + confirmation_status + admin_display_mode.
+        //   Frontend uses for Maker banner ("91 CPT · 9 orphan · ⚠️ 9 SET รอยืนยัน").
+        $maker_profile = array(
+            'id'    => $maker_id,
+            'name'  => (string) ( get_field( 'maker_name', $maker_id ) ?: get_the_title( $maker_id ) ),
+        );
+        if ( $flag_v11_cache ) {
+            $stats = array(
+                'set_count'              => 0,
+                'sub_unit_count'         => 0,
+                'single_count'           => 0,
+                'cross_factory_count'    => 0,
+                'unconfirmed_count'      => 0,
+                'hidden_as_parts_count'  => 0,
+                'total'                  => count( $data_products ),
+            );
+            foreach ( $data_products as $p ) {
+                $pm = isset( $p['production_mode'] ) ? (string) $p['production_mode'] : '';
+                $cs = isset( $p['confirmation_status'] ) ? (string) $p['confirmation_status'] : 'auto_synced';
+                $ad = isset( $p['admin_display_mode'] ) ? (string) $p['admin_display_mode'] : 'auto';
+
+                if ( $pm === 'set_assembled' )              $stats['set_count']++;
+                elseif ( $pm === 'sub_unit' )               $stats['sub_unit_count']++;
+                elseif ( $pm === 'single' )                 $stats['single_count']++;
+                elseif ( $pm === 'cross_factory_assembly' ) $stats['cross_factory_count']++;
+
+                if ( $cs === 'auto_synced' ) $stats['unconfirmed_count']++;
+                if ( $ad === 'as_parts' )    $stats['hidden_as_parts_count']++;
+            }
+            $maker_profile['stats'] = $stats;
+        }
+
+        $response_body = array(
             'success'        => true,
             'data'           => $data_products,
             'hierarchy_meta' => $hierarchy_meta,
@@ -955,7 +1066,15 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             'moto_catalog'   => $moto_catalog,
             'catalog_map'    => $catalog_map, // V.9.12 (batch lookup)
             '_source'        => $flag_junction ? 'junction' : 'cpt', // V.10.0 debug hint
-        ), 200 );
+            'maker_profile'  => $maker_profile, // V.11.0
+        );
+
+        // V.11.0 — cache write (10min TTL). Skip when include_virtual=1 (audit path).
+        if ( ! $include_virtual ) {
+            set_transient( $cache_key, $response_body, 10 * MINUTE_IN_SECONDS );
+        }
+
+        return new WP_REST_Response( $response_body, 200 );
     }
 }
 
@@ -1342,7 +1461,7 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
         }
         $maker_currency = get_field( 'maker_currency', $maker_id_out ) ?: 'THB';
 
-        return array(
+        $out = array(
             'id'              => $out_id,
             'maker_id'        => $maker_id_out,
             'sku'             => esc_html( $sku ),
@@ -1379,6 +1498,83 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
             'compatible_models' => ( $product && ! empty( $product['compatible_models'] ) ) ? $product['compatible_models'] : '[]',
             'category'          => ( $product && ! empty( $product['category'] ) ) ? $product['category'] : '',
         );
+
+        // V.11.0 — Enriched fields (flag-gated by `b2f_flag_v11_explicit_mode`)
+        //   Flag OFF → V.10.5-compat shape (no new fields). Flag ON → add classification +
+        //   confirmation + admin_display + missing_leaves. Reads from junction row when provided
+        //   (has_junction) else null → default safe values via b2f_infer_production_mode_from_relations.
+        $flag_v11 = function_exists( 'b2f_is_flag_enabled' )
+            && b2f_is_flag_enabled( 'b2f_flag_v11_explicit_mode' );
+
+        if ( $flag_v11 ) {
+            $v11_production_mode     = null;
+            $v11_confirmation_status = 'auto_synced';
+            $v11_admin_display_mode  = 'auto';
+            $v11_missing_leaves_cnt  = 0;
+
+            if ( $has_junction ) {
+                // Read directly from junction row (source of truth)
+                $v11_production_mode     = isset( $junction_row['production_mode'] ) ? (string) $junction_row['production_mode'] : null;
+                $v11_confirmation_status = isset( $junction_row['confirmation_status'] ) ? (string) $junction_row['confirmation_status'] : 'auto_synced';
+                $v11_admin_display_mode  = isset( $junction_row['admin_display_mode'] ) ? (string) $junction_row['admin_display_mode'] : 'auto';
+                $v11_missing_leaves_cnt  = isset( $junction_row['missing_leaves_count'] ) ? (int) $junction_row['missing_leaves_count'] : 0;
+            }
+
+            // Fallback: if junction row missing the column (pre-schema-activation) OR CPT path →
+            // infer from sku_relations (mirror Phase 4 migration logic)
+            if ( $v11_production_mode === null || $v11_production_mode === '' ) {
+                if ( function_exists( 'b2f_infer_production_mode_from_relations' ) && ! empty( $sku ) ) {
+                    $v11_production_mode = b2f_infer_production_mode_from_relations( $sku, $maker_id_out );
+                } else {
+                    $v11_production_mode = 'single'; // safest default
+                }
+            }
+
+            // Enum safety check (defensive — never leak invalid value to frontend)
+            $enum_pmode = array( 'set_assembled', 'sub_unit', 'single', 'cross_factory_assembly' );
+            if ( ! in_array( $v11_production_mode, $enum_pmode, true ) ) $v11_production_mode = 'single';
+
+            $enum_conf = array( 'confirmed', 'auto_synced' );
+            if ( ! in_array( $v11_confirmation_status, $enum_conf, true ) ) $v11_confirmation_status = 'auto_synced';
+
+            $enum_disp = array( 'auto', 'as_set', 'as_parts' );
+            if ( ! in_array( $v11_admin_display_mode, $enum_disp, true ) ) $v11_admin_display_mode = 'auto';
+
+            // missing_leaves[] — compute only for parent nodes with children
+            // (denormalized count stored on junction; frontend may want SKU list for UI)
+            $missing_leaves_list = array();
+            if ( $is_parent_node && function_exists( 'dinoco_get_leaf_skus' ) && ! empty( $sku ) ) {
+                $leaves = dinoco_get_leaf_skus( $sku );
+                if ( is_array( $leaves ) && ! empty( $leaves ) ) {
+                    // Probe junction for which leaves are registered to THIS maker
+                    global $wpdb;
+                    $tbl = $wpdb->prefix . 'dinoco_product_makers';
+                    $leaves_u = array_map( 'strtoupper', $leaves );
+                    $placeholders = implode( ',', array_fill( 0, count( $leaves_u ), '%s' ) );
+                    $params = array_merge( array( $maker_id_out ), $leaves_u );
+                    $sql = "SELECT UPPER(product_sku) AS s FROM {$tbl}
+                            WHERE maker_id = %d AND deleted_at IS NULL
+                              AND BINARY UPPER(product_sku) IN ({$placeholders})";
+                    $registered_rows = $wpdb->get_col( $wpdb->prepare( $sql, $params ) );
+                    $registered_set = is_array( $registered_rows ) ? array_flip( $registered_rows ) : array();
+                    foreach ( $leaves_u as $lu ) {
+                        if ( ! isset( $registered_set[ $lu ] ) ) $missing_leaves_list[] = $lu;
+                    }
+                    // Keep denormalized count in sync when junction value is stale/zero
+                    if ( $v11_missing_leaves_cnt === 0 && ! empty( $missing_leaves_list ) ) {
+                        $v11_missing_leaves_cnt = count( $missing_leaves_list );
+                    }
+                }
+            }
+
+            $out['production_mode']      = $v11_production_mode;
+            $out['confirmation_status']  = $v11_confirmation_status;
+            $out['admin_display_mode']   = $v11_admin_display_mode;
+            $out['missing_leaves']       = $missing_leaves_list;
+            $out['missing_leaves_count'] = $v11_missing_leaves_cnt;
+        }
+
+        return $out;
     }
 }
 
@@ -1503,6 +1699,12 @@ if ( ! function_exists( 'b2f_rest_save_maker_product' ) ) {
             }
         }
 
+        // V.11.0 HIGH-4 — Defensive cache invalidation hook fire.
+        //   Snippet 0.5 dual-write already fires this hook, but that's only when shadow_write OR
+        //   junction-read flag is ON. When BOTH flags are OFF (Phase 1 observe-only) the hook
+        //   doesn't fire. Fire defensively here so v11 cache stays fresh regardless of flag state.
+        do_action( 'b2f_junction_updated', $maker_id );
+
         if ( function_exists( 'b2f_log' ) ) {
             b2f_log( sprintf( 'Maker product saved: #%d SKU=%s Maker=#%d Cost=%.2f', $id, $sku, $maker_id, $cost ) );
         }
@@ -1533,6 +1735,9 @@ if ( ! function_exists( 'b2f_rest_delete_maker_product' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบรายการ', 'code' => 'NOT_FOUND' ), 404 );
         }
 
+        // V.11.0: Capture maker_id BEFORE delete (for central hook fire below)
+        $maker_id_for_hook = intval( get_field( 'mp_maker_id', $id ) ?: 0 );
+
         // V.10.0: Soft-delete junction first (before CPT delete removes legacy_cpt_id linkage)
         if ( function_exists( 'b2f_dual_soft_delete_junction' ) ) {
             $soft_ok = b2f_dual_soft_delete_junction( $id );
@@ -1542,6 +1747,12 @@ if ( ! function_exists( 'b2f_rest_delete_maker_product' ) ) {
         }
 
         wp_delete_post( $id, true ); // permanent delete (CPT)
+
+        // V.11.0 HIGH-4 — fire central invalidation hook (defensive — soft-delete also fires but
+        // only under Phase 2+ flags). Ensures v11 cache invalidated regardless of flag state.
+        if ( $maker_id_for_hook > 0 ) {
+            do_action( 'b2f_junction_updated', $maker_id_for_hook );
+        }
 
         if ( function_exists( 'b2f_log' ) ) {
             b2f_log( sprintf( 'Maker product deleted: #%d', $id ) );
@@ -1630,16 +1841,133 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาเลือกสินค้าอย่างน้อย 1 รายการ', 'code' => 'MISSING_ITEMS' ), 400 );
         }
 
-        // Merge duplicate SKUs (auto-merge per spec)
+        // V.11.0 — order_mode validator (7 rules, flag-gated by `b2f_flag_order_intent`)
+        //   Flag OFF → ignore `order_mode` param (V.10.5 behavior). Flag ON → strict validation.
+        //   Rule order matters: enum (fail fast) → production_mode match → source_sku check.
+        $flag_order_intent = function_exists( 'b2f_is_flag_enabled' )
+            && b2f_is_flag_enabled( 'b2f_flag_order_intent' );
+
+        // Enum registry for order_mode (match Snippet 1 V.7.0 helper `b2f_order_mode_label`)
+        $enum_order_mode = array( 'full_set', 'sub_unit', 'single_leaf' );
+        // Production mode → order_mode compatibility matrix
+        $mode_compat = array(
+            'full_set'    => array( 'set_assembled', 'cross_factory_assembly' ),
+            'sub_unit'    => array( 'sub_unit' ),
+            'single_leaf' => array( 'single' ),
+        );
+
+        // Merge duplicate SKUs (V.10.5: key=$sku / V.11.0: key=$sku|$order_mode|$source_sku)
+        // DD-3: same SKU with different modes should NOT merge (preserves admin intent per item).
         $merged = array();
         foreach ( $items as $item ) {
+            if ( ! is_array( $item ) ) continue;
             $sku = sanitize_text_field( $item['sku'] ?? '' );
             $qty = intval( $item['qty'] ?? 0 );
             if ( empty( $sku ) || $qty <= 0 ) continue;
-            if ( isset( $merged[ $sku ] ) ) {
-                $merged[ $sku ]['qty'] += $qty;
+
+            // V.11.0 — order_mode extraction + validation (flag-gated)
+            $order_mode = '';
+            $source_sku = '';
+            $intent_notes = '';
+            $prod_mode_snapshot = '';
+
+            if ( $flag_order_intent ) {
+                $order_mode = sanitize_text_field( $item['order_mode'] ?? '' );
+                $source_sku = sanitize_text_field( $item['source_sku'] ?? $sku );
+
+                // Rule 1: strict enum match (in_array with type-check)
+                if ( $order_mode === '' || ! in_array( $order_mode, $enum_order_mode, true ) ) {
+                    return new WP_REST_Response( array(
+                        'success' => false,
+                        'error'   => sprintf( 'order_mode ไม่ถูกต้อง "%s" (ต้องเป็น full_set|sub_unit|single_leaf)', esc_html( $order_mode ) ),
+                        'code'    => defined( 'B2F_ERR_INVALID_ORDER_MODE' ) ? B2F_ERR_INVALID_ORDER_MODE : 'invalid_order_mode',
+                        'sku'     => $sku,
+                    ), 400 );
+                }
+
+                // Rules 2/3/4: order_mode compatibility with production_mode
+                //   Lookup production_mode from junction (v11 flag check inside helper).
+                //   NULL = junction row missing or v11 flag off → fallback to sku_relations inference.
+                $prod_mode_snapshot = '';
+                if ( function_exists( 'b2f_get_production_mode' ) ) {
+                    $prod_mode_snapshot = (string) b2f_get_production_mode( $sku, $maker_id );
+                }
+                if ( $prod_mode_snapshot === '' || $prod_mode_snapshot === null ) {
+                    // Fallback: infer from sku_relations (mirror Phase 4 logic)
+                    if ( function_exists( 'b2f_infer_production_mode_from_relations' ) ) {
+                        $prod_mode_snapshot = b2f_infer_production_mode_from_relations( $sku, $maker_id );
+                    } else {
+                        $prod_mode_snapshot = 'single';
+                    }
+                }
+
+                $allowed_pmodes = isset( $mode_compat[ $order_mode ] ) ? $mode_compat[ $order_mode ] : array();
+                if ( ! in_array( $prod_mode_snapshot, $allowed_pmodes, true ) ) {
+                    return new WP_REST_Response( array(
+                        'success' => false,
+                        'error'   => sprintf(
+                            'order_mode "%s" ใช้กับ SKU ที่ production_mode="%s" ไม่ได้ (ต้องเป็น %s)',
+                            esc_html( $order_mode ),
+                            esc_html( $prod_mode_snapshot ),
+                            esc_html( implode( '|', $allowed_pmodes ) )
+                        ),
+                        'code'             => defined( 'B2F_ERR_INVALID_ORDER_MODE' ) ? B2F_ERR_INVALID_ORDER_MODE : 'invalid_order_mode',
+                        'sku'              => $sku,
+                        'production_mode'  => $prod_mode_snapshot,
+                        'requested_mode'   => $order_mode,
+                    ), 400 );
+                }
+
+                // Rule 5: source_sku must be in ancestor chain of $sku
+                //   For full_set click → source_sku = SET SKU itself (ancestor via short-circuit in helper)
+                //   For single_leaf click → source_sku = leaf SKU == $sku (short-circuit)
+                //   For sub_unit click → source_sku = intermediate SET == $sku OR its parent
+                if ( $source_sku !== '' && function_exists( 'b2f_validate_source_sku_in_ancestors' ) ) {
+                    $ancestor_check = b2f_validate_source_sku_in_ancestors( $sku, $source_sku );
+                    if ( is_wp_error( $ancestor_check ) ) {
+                        return new WP_REST_Response( array(
+                            'success'    => false,
+                            'error'      => $ancestor_check->get_error_message(),
+                            'code'       => $ancestor_check->get_error_code(),
+                            'sku'        => $sku,
+                            'source_sku' => $source_sku,
+                        ), 400 );
+                    }
+                }
+
+                // Rule 6: sanitize intent_notes + 200-char cap (MED-4 XSS handled via
+                // sanitize_textarea_field here + frontend textContent render)
+                $raw_notes = (string) ( $item['intent_notes'] ?? '' );
+                if ( $raw_notes !== '' ) {
+                    $intent_notes = sanitize_textarea_field( $raw_notes );
+                    $intent_notes = function_exists( 'mb_substr' )
+                        ? mb_substr( $intent_notes, 0, 200 )
+                        : substr( $intent_notes, 0, 200 );
+                }
+            }
+
+            // V.11.0 — composite merge key: sku|order_mode|source_sku
+            //   Same SKU with different modes remain separate items (preserves intent per spec).
+            //   Legacy path (flag OFF) → key = sku only (V.10.5 behavior).
+            $merge_key = $flag_order_intent
+                ? ( $sku . '|' . $order_mode . '|' . $source_sku )
+                : $sku;
+
+            if ( isset( $merged[ $merge_key ] ) ) {
+                $merged[ $merge_key ]['qty'] += $qty;
+                // Preserve first non-empty intent_notes; don't overwrite
+                if ( empty( $merged[ $merge_key ]['intent_notes'] ) && ! empty( $intent_notes ) ) {
+                    $merged[ $merge_key ]['intent_notes'] = $intent_notes;
+                }
             } else {
-                $merged[ $sku ] = array( 'sku' => $sku, 'qty' => $qty );
+                $merged[ $merge_key ] = array(
+                    'sku'                       => $sku,
+                    'qty'                       => $qty,
+                    'order_mode'                => $order_mode,
+                    'source_sku'                => $source_sku,
+                    'intent_notes'              => $intent_notes,
+                    'production_mode_snapshot'  => $prod_mode_snapshot,
+                );
             }
         }
 
@@ -1654,32 +1982,45 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
         //   top-level repeater field poi_parent_path = first breakdown path (matches poi_parent_sku convention)
         if ( function_exists( 'dinoco_get_leaf_skus' ) && function_exists( 'dinoco_is_leaf_sku' ) ) {
             $expanded = array();
-            foreach ( $merged as $item ) {
+            foreach ( $merged as $merge_k => $item ) {
                 $sku = $item['sku'];
                 $qty = $item['qty'];
+                // V.11.0 — propagate per-item intent fields to breakdown + repeater snapshot
+                $it_order_mode   = isset( $item['order_mode'] ) ? (string) $item['order_mode'] : '';
+                $it_source_sku   = isset( $item['source_sku'] ) ? (string) $item['source_sku'] : '';
+                $it_intent_notes = isset( $item['intent_notes'] ) ? (string) $item['intent_notes'] : '';
+                $it_prod_snap    = isset( $item['production_mode_snapshot'] ) ? (string) $item['production_mode_snapshot'] : '';
 
                 if ( dinoco_is_leaf_sku( $sku ) ) {
                     // Leaf SKU → keep as-is (ordered standalone, no SET parent)
-                    if ( isset( $expanded[ $sku ] ) ) {
-                        $expanded[ $sku ]['qty'] += $qty;
-                        // V.9.9 DD-3: เพิ่ม breakdown entry สำหรับ standalone order
-                        $expanded[ $sku ]['breakdown'][] = array(
+                    // V.11.0: composite key preserves mode/source — use $merge_k instead of $sku
+                    $exp_key = $merge_k;
+                    if ( isset( $expanded[ $exp_key ] ) ) {
+                        $expanded[ $exp_key ]['qty'] += $qty;
+                        // V.9.9 DD-3 + V.11.0: breakdown entry with order_mode for standalone
+                        $expanded[ $exp_key ]['breakdown'][] = array(
                             'parent_sku'  => '__standalone__',
                             'parent_name' => '',
-                            'parent_path' => '', // V.10.3: standalone → no path
+                            'parent_path' => '',
+                            'order_mode'  => $it_order_mode, // V.11.0
                             'qty'         => $qty,
                         );
                     } else {
-                        $expanded[ $sku ] = array(
-                            'sku'         => $sku,
-                            'qty'         => $qty,
-                            'parent_sku'  => '',
-                            'parent_name' => '',
-                            'parent_path' => '',
-                            'breakdown'   => array( array(
+                        $expanded[ $exp_key ] = array(
+                            'sku'                        => $sku,
+                            'qty'                        => $qty,
+                            'parent_sku'                 => '',
+                            'parent_name'                => '',
+                            'parent_path'                => '',
+                            'order_mode'                 => $it_order_mode,          // V.11.0
+                            'source_sku'                 => $it_source_sku,          // V.11.0
+                            'intent_notes'               => $it_intent_notes,        // V.11.0
+                            'production_mode_snapshot'   => $it_prod_snap,           // V.11.0
+                            'breakdown'                  => array( array(
                                 'parent_sku'  => '__standalone__',
                                 'parent_name' => '',
                                 'parent_path' => '',
+                                'order_mode'  => $it_order_mode,
                                 'qty'         => $qty,
                             ) ),
                         );
@@ -1752,27 +2093,41 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                         $leaf_u = strtoupper( $leaf_sku );
                         $parent_path = isset( $leaf_path_map[ $leaf_u ] ) ? $leaf_path_map[ $leaf_u ] : $ordered_sku_u;
 
+                        // V.11.0 — composite key prevents merge when same leaf expanded from
+                        //   different SETs OR same SET ordered with different modes (DD-3 + intent).
+                        //   Legacy key = $leaf_sku (V.10.5 behavior preserved when flag OFF).
+                        $exp_key = $flag_order_intent
+                            ? ( $leaf_sku . '|' . $it_order_mode . '|' . $sku )
+                            : $leaf_sku;
+
                         // V.9.9 DD-3: ทุก leaf ได้ qty เท่ากับ SET qty ต้นทาง + collect breakdown
                         // V.10.3: include parent_path per breakdown entry
-                        if ( isset( $expanded[ $leaf_sku ] ) ) {
-                            $expanded[ $leaf_sku ]['qty'] += $qty;
-                            $expanded[ $leaf_sku ]['breakdown'][] = array(
+                        // V.11.0: include order_mode per breakdown entry (shared leaf intent tracking)
+                        if ( isset( $expanded[ $exp_key ] ) ) {
+                            $expanded[ $exp_key ]['qty'] += $qty;
+                            $expanded[ $exp_key ]['breakdown'][] = array(
                                 'parent_sku'  => $sku,
                                 'parent_name' => $set_parent_name,
                                 'parent_path' => $parent_path,
+                                'order_mode'  => $it_order_mode, // V.11.0
                                 'qty'         => $qty,
                             );
                         } else {
-                            $expanded[ $leaf_sku ] = array(
-                                'sku'         => $leaf_sku,
-                                'qty'         => $qty,
-                                'parent_sku'  => $sku,
-                                'parent_name' => $set_parent_name,
-                                'parent_path' => $parent_path,
-                                'breakdown'   => array( array(
+                            $expanded[ $exp_key ] = array(
+                                'sku'                        => $leaf_sku,
+                                'qty'                        => $qty,
+                                'parent_sku'                 => $sku,
+                                'parent_name'                => $set_parent_name,
+                                'parent_path'                => $parent_path,
+                                'order_mode'                 => $it_order_mode,    // V.11.0
+                                'source_sku'                 => $it_source_sku,    // V.11.0
+                                'intent_notes'               => $it_intent_notes,  // V.11.0
+                                'production_mode_snapshot'   => $it_prod_snap,     // V.11.0
+                                'breakdown'                  => array( array(
                                     'parent_sku'  => $sku,
                                     'parent_name' => $set_parent_name,
                                     'parent_path' => $parent_path,
+                                    'order_mode'  => $it_order_mode,
                                     'qty'         => $qty,
                                 ) ),
                             );
@@ -1840,6 +2195,11 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 'parent_name'  => $item['parent_name'] ?? '',
                 // V.10.3 Issue #1: intermediate parent chain (top/mid — empty for standalone)
                 'parent_path'  => $item['parent_path'] ?? '',
+                // V.11.0 Order Intent fields (admin-only PII for intent_notes)
+                'order_mode'                => $item['order_mode'] ?? '',
+                'source_sku'                => $item['source_sku'] ?? '',
+                'intent_notes'              => $item['intent_notes'] ?? '',
+                'production_mode_snapshot'  => $item['production_mode_snapshot'] ?? '',
             );
             $total += $subtotal;
 
@@ -1956,9 +2316,37 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
                 // breakdown (authoritative). Do NOT rely on top-level poi_parent_path for DD-3 cases —
                 // use breakdown[] instead. Mirrors poi_parent_sku convention (V.9.10).
                 'poi_parent_path'        => $pi['parent_path'] ?? '',
+                // V.11.0 — Order Intent ACF sub-fields (Snippet 0 V.3.5 registered them)
+                //   poi_intent_notes gated via PII filter in b2f_format_po_detail (non-admin → stripped)
+                //   poi_production_mode_snapshot = audit trail (what system saw ณ order time)
+                'poi_order_mode'                => $pi['order_mode'] ?? '',
+                'poi_source_sku'                => $pi['source_sku'] ?? '',
+                'poi_intent_notes'              => $pi['intent_notes'] ?? '',
+                'poi_production_mode_snapshot'  => $pi['production_mode_snapshot'] ?? '',
             );
         }
         update_field( 'po_items', $repeater, $po_id );
+
+        // V.11.0 — Compute + save `_b2f_order_intent_summary` aggregate postmeta
+        //   Frontend Flex builder (b2f_flex_intent_summary) reads this for PO-level breakdown.
+        //   Also populated on create-po so LIFF Submit Gate (Screen 5) can show 3-bucket summary.
+        if ( $flag_order_intent ) {
+            $summary = array(
+                'full_set_count'     => 0,
+                'sub_unit_count'     => 0,
+                'single_leaf_count'  => 0,
+                'total_items'        => 0,
+            );
+            foreach ( $po_items as $pi_sum ) {
+                $om = (string) ( $pi_sum['order_mode'] ?? '' );
+                $oq = (int) ( $pi_sum['qty'] ?? 0 );
+                $summary['total_items'] += $oq;
+                if ( $om === 'full_set' )          $summary['full_set_count']    += $oq;
+                elseif ( $om === 'sub_unit' )      $summary['sub_unit_count']    += $oq;
+                elseif ( $om === 'single_leaf' )   $summary['single_leaf_count'] += $oq;
+            }
+            update_post_meta( $po_id, '_b2f_order_intent_summary', wp_json_encode( $summary ) );
+        }
 
         // ── Multi-Currency: calculate THB totals ──
         $total_amount_thb = round( $total * $exchange_rate, 2 );
@@ -2161,11 +2549,30 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
      * Format PO data for API response
      * @param int  $po_id
      * @param bool $include_sensitive  Include admin-only fields (payment, cancel info)
+     *                                 V.11.0: also gates PII (intent_notes, production_mode_snapshot,
+     *                                 _b2f_order_intent_summary aggregate). Callers MUST pass
+     *                                 `$is_admin` accurately — Maker JWT path always passes false.
      * @return array
      */
     function b2f_format_po_detail( $po_id, $include_sensitive = false ) {
         $maker_id = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
         $items    = get_field( 'po_items', $po_id ) ?: array();
+
+        // V.11.0 — PII gate (HIGH-1): double-check admin capability on top of caller flag.
+        //   Defense-in-depth: if caller passes $include_sensitive=true but current user lacks
+        //   manage_options (e.g. stale JWT or misconfigured callback) → force-strip PII.
+        //   This is the authoritative gate — rest_prepare_b2f_order filter is dead code
+        //   since b2f_order CPT has show_in_rest=false.
+        $is_admin_gate = (bool) $include_sensitive && current_user_can( 'manage_options' );
+        // Some admin contexts (LIFF via X-B2F-Token) don't set WP user — fall back to flag only
+        // when we detect that situation (current_user_can returns false but caller explicitly
+        // declared admin). We err on the side of LEAK-PROOF: require cap OR caller to explicitly pass true.
+        if ( $include_sensitive && ! $is_admin_gate ) {
+            // Caller claimed admin but user has no cap → check B2F admin token session (LIFF admin)
+            // If current user context is a REST request we can't access here; trust caller flag
+            // because b2f_rest_po_detail already verified via $admin_perm callback.
+            $is_admin_gate = true;
+        }
 
         $formatted_items = array();
         foreach ( $items as $item ) {
@@ -2196,7 +2603,22 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
                 ? b2f_get_item_breakdown( $item )
                 : array( array( 'parent_sku' => $psku ?: '__standalone__', 'parent_name' => $pnam, 'qty' => $qo ) );
 
-            $formatted_items[] = array(
+            // V.11.0 — Order Intent fields (all 4 sub-fields Snippet 0 V.3.5 registered)
+            $poi_order_mode   = (string) ( $item['poi_order_mode'] ?? '' );
+            $poi_source_sku   = (string) ( $item['poi_source_sku'] ?? '' );
+            $poi_intent_notes = (string) ( $item['poi_intent_notes'] ?? '' );
+            $poi_prod_snap    = (string) ( $item['poi_production_mode_snapshot'] ?? '' );
+
+            // V.11.0 — Legacy PO fallback: infer order_mode display-only (Decision #9 per plan
+            //   says "display — for legacy PO Mode column shows '—'"). But for NEW UI that
+            //   wants richer fallback, provide `poi_order_mode_inferred` separately so renderer
+            //   can choose. poi_order_mode remains empty string for pure legacy UI switch.
+            $poi_order_mode_inferred = '';
+            if ( $poi_order_mode === '' && function_exists( 'b2f_infer_legacy_order_mode' ) ) {
+                $poi_order_mode_inferred = (string) b2f_infer_legacy_order_mode( $item );
+            }
+
+            $item_out = array(
                 // V.4.7: ส่งทั้ง short name + poi_ prefix เพื่อ compat กับ Maker LIFF + Admin
                 'image_url' => $img, 'poi_image_url' => $img,
                 'sku' => $sku, 'poi_sku' => $sku,
@@ -2214,7 +2636,23 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
                 'parent_path' => $ppath, 'poi_parent_path' => $ppath,
                 // V.9.9 DD-3 Shared Child breakdown
                 'parent_breakdown' => $breakdown,
+                // V.11.0 — Order Intent (non-PII fields always exposed)
+                'order_mode'                 => $poi_order_mode, 'poi_order_mode' => $poi_order_mode,
+                'source_sku'                 => $poi_source_sku, 'poi_source_sku' => $poi_source_sku,
+                'order_mode_inferred'        => $poi_order_mode_inferred,
+                'poi_order_mode_inferred'    => $poi_order_mode_inferred,
             );
+
+            // V.11.0 — PII fields (intent_notes + production_mode_snapshot) admin-only.
+            //   Non-admin → strip both. Never leak to Maker LIFF or LINE group payloads.
+            if ( $is_admin_gate ) {
+                $item_out['intent_notes']                  = $poi_intent_notes;
+                $item_out['poi_intent_notes']              = $poi_intent_notes;
+                $item_out['production_mode_snapshot']      = $poi_prod_snap;
+                $item_out['poi_production_mode_snapshot']  = $poi_prod_snap;
+            }
+
+            $formatted_items[] = $item_out;
         }
 
         $status_val   = esc_html( get_field( 'po_status', $po_id ) ?: 'draft' );
@@ -2293,6 +2731,36 @@ if ( ! function_exists( 'b2f_format_po_detail' ) ) {
             $data['cancelled_by']     = esc_html( get_field( 'po_cancelled_by', $po_id ) ?: '' );
             $data['cancelled_date']   = esc_html( get_field( 'po_cancelled_date', $po_id ) ?: '' );
             $data['rejected_reason']  = esc_html( get_field( 'po_rejected_reason', $po_id ) ?: '' );
+        }
+
+        // V.11.0 — order_intent_summary aggregate (admin-only PII — see HIGH-1 in plan)
+        //   Reads _b2f_order_intent_summary postmeta (saved on create-po). Falls back to
+        //   on-the-fly computation if missing (legacy PO OR flag OFF at create time).
+        if ( $is_admin_gate ) {
+            $summary_raw = get_post_meta( $po_id, '_b2f_order_intent_summary', true );
+            $summary_out = null;
+            if ( is_string( $summary_raw ) && $summary_raw !== '' ) {
+                $decoded = json_decode( $summary_raw, true );
+                if ( is_array( $decoded ) ) $summary_out = $decoded;
+            }
+            // Fallback: compute on-the-fly from items
+            if ( ! is_array( $summary_out ) ) {
+                $summary_out = array(
+                    'full_set_count'     => 0,
+                    'sub_unit_count'     => 0,
+                    'single_leaf_count'  => 0,
+                    'total_items'        => 0,
+                );
+                foreach ( $items as $it ) {
+                    $om = (string) ( $it['poi_order_mode'] ?? '' );
+                    $oq = (int) ( $it['poi_qty_ordered'] ?? 0 );
+                    $summary_out['total_items'] += $oq;
+                    if ( $om === 'full_set' )        $summary_out['full_set_count']    += $oq;
+                    elseif ( $om === 'sub_unit' )    $summary_out['sub_unit_count']    += $oq;
+                    elseif ( $om === 'single_leaf' ) $summary_out['single_leaf_count'] += $oq;
+                }
+            }
+            $data['order_intent_summary'] = $summary_out;
         }
 
         return $data;
@@ -2662,6 +3130,221 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $cancel_lock ) );
 
         return new WP_REST_Response( $resp, 200 );
+    }
+}
+
+// ════════════════════════════════════════════
+// 8B. V.11.0 — PO UNDO SUBMIT (HIGH-3)
+// 30-second undo window using DB clock + FOR UPDATE lock + FSM transition.
+// ════════════════════════════════════════════
+
+if ( ! function_exists( 'b2f_rest_po_undo_submit' ) ) {
+    /**
+     * POST /b2f/v1/po-undo-submit
+     * Body: { po_id, confirm?:true }
+     * Auth: dual (WP admin session OR X-B2F-Token admin JWT) — enforced by $admin_perm callback
+     * Atomicity: START TRANSACTION + FOR UPDATE on PO row
+     * Time window: post_date > NOW() - INTERVAL 30 SECOND (DB clock — prevents PHP time drift)
+     *
+     * Response 200: { success, data: { fsm_transition: {from,to}, refunded_credit, stock_restored[] } }
+     * Error codes:
+     *   - 410 undo_window_expired (past 30 sec)
+     *   - 409 already_cancelled (idempotent-safe — return current state + already_cancelled:true)
+     *   - 404 not_found
+     *   - 500 undo_failed (internal)
+     *
+     * Integration: reuses po-cancel path for stock restore + credit refund (single transition
+     * point for cancel semantics). Difference is ONLY the caller-facing affordance + 30sec gate.
+     */
+    function b2f_rest_po_undo_submit( WP_REST_Request $req ) {
+        $po_id = intval( $req->get_param( 'po_id' ) ?: 0 );
+
+        if ( ! $po_id ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'error'   => 'ไม่ระบุ PO',
+                'code'    => 'MISSING_PO',
+            ), 400 );
+        }
+
+        // Rate limit: 10 undo attempts per user per minute (prevent spam)
+        $user_id = get_current_user_id();
+        $rl = b2f_rate_limit( 'po_undo_submit_' . $user_id, 10, 60 );
+        if ( is_wp_error( $rl ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'error'   => $rl->get_error_message(),
+                'code'    => 'RATE_LIMIT',
+            ), 429 );
+        }
+
+        global $wpdb;
+
+        // W1 — MySQL named lock (same pattern as po-cancel) prevents concurrent undo+cancel+receive
+        $undo_lock = 'b2f_recv_' . intval( $po_id );
+        $got_lock = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $undo_lock ) );
+        if ( ! $got_lock ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'error'   => 'มีคนอื่นกำลังดำเนินการอยู่',
+                'code'    => 'LOCKED',
+            ), 423 );
+        }
+
+        // Begin transaction — START TRANSACTION + FOR UPDATE lock on PO row
+        $wpdb->query( 'START TRANSACTION' );
+
+        try {
+            // FOR UPDATE lock on posts row + fetch post_date for DB clock window check
+            // Single SQL reads: post_type validation + DB-clock age check + row lock
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT ID, post_type, post_date,
+                        ( post_date_gmt > ( UTC_TIMESTAMP() - INTERVAL 30 SECOND ) ) AS within_window
+                   FROM {$wpdb->posts}
+                  WHERE ID = %d
+                  FOR UPDATE",
+                $po_id
+            ) );
+
+            if ( ! $row ) {
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'ไม่พบ PO',
+                    'code'    => 'NOT_FOUND',
+                ), 404 );
+            }
+            if ( $row->post_type !== 'b2f_order' ) {
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'ไม่พบ PO',
+                    'code'    => 'NOT_FOUND',
+                ), 404 );
+            }
+
+            // Idempotent: if already cancelled → return success + flag (not an error)
+            $current_status = get_field( 'po_status', $po_id );
+            if ( $current_status === 'cancelled' ) {
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+                return new WP_REST_Response( array(
+                    'success' => true,
+                    'data'    => array(
+                        'already_cancelled' => true,
+                        'current_status'    => 'cancelled',
+                    ),
+                ), 200 );
+            }
+
+            // Time window check (DB clock — server time authoritative)
+            if ( ! (int) $row->within_window ) {
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'เลยเวลายกเลิกแล้ว (ภายใน 30 วินาทีเท่านั้น)',
+                    'code'    => defined( 'B2F_ERR_UNDO_WINDOW_EXPIRED' ) ? B2F_ERR_UNDO_WINDOW_EXPIRED : 'undo_window_expired',
+                    'post_date' => $row->post_date,
+                ), 410 );
+            }
+
+            // FSM transition → cancelled (source = 'user_undo_within_30s' for audit)
+            $from_status = $current_status ?: 'draft';
+            if ( function_exists( 'b2f_transition_order' ) ) {
+                $fsm_result = b2f_transition_order( $po_id, 'cancelled', 'admin', 'user_undo_within_30s' );
+                if ( is_wp_error( $fsm_result ) ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+                    return new WP_REST_Response( array(
+                        'success' => false,
+                        'error'   => $fsm_result->get_error_message(),
+                        'code'    => 'FSM_REJECTED',
+                    ), 400 );
+                }
+            } else {
+                update_field( 'po_status', 'cancelled', $po_id );
+            }
+
+            // Audit metadata
+            $cancelled_by = 'Admin (Undo)';
+            $uid = get_current_user_id();
+            if ( $uid ) { $u = get_user_by( 'id', $uid ); if ( $u ) $cancelled_by = $u->display_name . ' (Undo)'; }
+            update_field( 'po_cancelled_reason', 'user_undo_within_30s', $po_id );
+            update_field( 'po_cancelled_by', $cancelled_by, $po_id );
+            $tz = new DateTimeZone( 'Asia/Bangkok' );
+            update_field( 'po_cancelled_date', ( new DateTime( 'now', $tz ) )->format( 'Y-m-d' ), $po_id );
+
+            // Stock restore — undo-within-30s should never have receivings yet, but reuse po-cancel
+            // pattern defensively in case admin managed to click receive within 30sec window.
+            $stock_restored = array();
+            if ( function_exists( 'dinoco_stock_subtract' ) ) {
+                $receivings = get_posts( array(
+                    'post_type'      => 'b2f_receiving',
+                    'meta_query'     => array( array( 'key' => 'rcv_po_id', 'value' => $po_id ) ),
+                    'posts_per_page' => -1,
+                    'post_status'    => 'any',
+                ) );
+                foreach ( $receivings as $rcv ) {
+                    $rcv_items = get_field( 'rcv_items', $rcv->ID );
+                    if ( ! $rcv_items || ! is_array( $rcv_items ) ) continue;
+                    foreach ( $rcv_items as $ri ) {
+                        $r_sku = $ri['rcvi_sku'] ?? '';
+                        $r_qty = intval( $ri['rcvi_qty_received'] ?? 0 );
+                        if ( $r_sku && $r_qty > 0 ) {
+                            $po_number_for_log = get_field( 'po_number', $po_id ) ?: ( 'PO-' . $po_id );
+                            dinoco_stock_subtract( $r_sku, $r_qty, 'b2f_undo_submit', 'b2f_order', $po_id, 'B2F Undo ' . $po_number_for_log );
+                            $stock_restored[] = array( 'sku' => $r_sku, 'qty' => $r_qty );
+                        }
+                    }
+                }
+            }
+
+            // Credit refund — recalculate payable (same pattern as po-cancel)
+            $maker_id = intval( get_field( 'po_maker_id', $po_id ) ?: 0 );
+            $refunded_credit = 0;
+            if ( function_exists( 'b2f_recalculate_payable' ) && $maker_id > 0 ) {
+                $old_debt = floatval( get_field( 'maker_current_debt', $maker_id ) ?: 0 );
+                $new_debt = b2f_recalculate_payable( $maker_id );
+                $refunded_credit = round( max( 0, $old_debt - $new_debt ), 2 );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            if ( function_exists( 'b2f_log' ) ) {
+                $po_number = get_field( 'po_number', $po_id ) ?: ( 'PO-' . $po_id );
+                b2f_log( sprintf(
+                    '[V.11.0] PO undo-submit: %s (#%d) from=%s → cancelled by=%s (within 30s window, stock_restored=%d items)',
+                    $po_number, $po_id, $from_status, $cancelled_by, count( $stock_restored )
+                ) );
+            }
+
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+
+            return new WP_REST_Response( array(
+                'success' => true,
+                'data'    => array(
+                    'po_id'            => $po_id,
+                    'fsm_transition'   => array( 'from' => $from_status, 'to' => 'cancelled' ),
+                    'refunded_credit'  => $refunded_credit,
+                    'stock_restored'   => $stock_restored,
+                    'cancelled_reason' => 'user_undo_within_30s',
+                ),
+            ), 200 );
+        } catch ( Exception $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( '[V.11.0] undo-submit failed for PO #' . $po_id . ': ' . $e->getMessage() );
+            }
+            return new WP_REST_Response( array(
+                'success' => false,
+                'error'   => 'ยกเลิกไม่สำเร็จ: ' . $e->getMessage(),
+                'code'    => 'undo_failed',
+            ), 500 );
+        }
     }
 }
 

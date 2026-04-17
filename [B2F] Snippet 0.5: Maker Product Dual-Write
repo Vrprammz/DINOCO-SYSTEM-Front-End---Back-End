@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 0.5: Maker Product Dual-Write                ║
+ * ║  Version: V.1.2 — CRIT-4 Migration lock flag + V11 columns   ║
+ * ║    * Check b2f_phase4_migration_in_progress flag → defer     ║
+ * ║      dual-write via wp_schedule_single_event (post-migration ║
+ * ║      replay)                                                 ║
+ * ║    * INSERT 4 new V11 columns (production_mode + confirmation║
+ * ║      _status + admin_display_mode + missing_leaves_count)    ║
+ * ║    * ON DUPLICATE KEY UPDATE **EXCLUDES** V11 columns        ║
+ * ║      → preserve admin classification choice                  ║
  * ║  Version: V.1.1 — Doc-only: clarify DB_ID auto-assign +     ║
  * ║                   sync filename fallback behavior            ║
  * ║  Version: V.1.0 — Phase 2 Shadow-Write mode                  ║
@@ -17,20 +25,23 @@
  * Hooks:
  *   - save_post_b2f_maker_product → UPSERT junction row + observation
  *   - before_delete_post         → soft-delete junction row (discontinued)
+ *   - b2f_replay_queued_dual_write → cron replay post-migration (V.1.2)
  *
  * Safety:
  *   - เช็ค b2f_is_flag_enabled('b2f_flag_shadow_write') ก่อนทำงาน
+ *   - V.1.2: เช็ค b2f_phase4_migration_in_progress → skip + enqueue replay
  *   - Skip revisions + autosaves
  *   - Skip non-published (draft/trash handled by delete hook)
  *   - Never throw — log + continue (dual-write ห้ามล้ม CPT save)
  *
  * DB Requirements:
- *   - table wp_dinoco_product_makers (V10.1 schema)
+ *   - table wp_dinoco_product_makers (V10.1 + V11.0 columns)
  *   - table wp_dinoco_maker_product_observations (V10.1 schema)
  *   - option 'b2f_schema_v10_activated' = truthy
  *
  * Dependencies:
  *   - Snippet 1 V.6.5+: b2f_is_flag_enabled()
+ *   - Snippet 1 V.7.0+: b2f_infer_production_mode_from_relations() (optional helper)
  *   - Snippet 0: CPT registration (priority 5)
  */
 
@@ -52,6 +63,17 @@ if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
         global $wpdb;
         $mp_id = intval( $mp_id );
         if ( ! $mp_id ) return new WP_Error( 'invalid_id', 'Empty mp_id' );
+
+        // V.1.2 CRIT-4: Migration lock guard
+        // ถ้า Phase 4 migration กำลังทำงาน → skip dual-write ทันที + enqueue via cron
+        // ป้องกัน race condition ที่ migration UPDATE overwrite fresh INSERT
+        if ( get_option( 'b2f_phase4_migration_in_progress' ) ) {
+            wp_schedule_single_event( time() + 10, 'b2f_replay_queued_dual_write', array( $mp_id ) );
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( '[DualWrite V.1.2] migration lock active — deferred mp_id=' . $mp_id );
+            }
+            return new WP_Error( 'migration_in_progress', 'Phase 4 migration active — deferred to cron' );
+        }
 
         // Schema guard
         if ( ! get_option( 'b2f_schema_v10_activated' ) ) {
@@ -86,16 +108,30 @@ if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
         if ( $moq < 1 ) $moq = 1;
         if ( $lead_time < 0 ) $lead_time = 7;
 
+        // V.1.2: Infer V11 classification defaults (only used for fresh INSERT)
+        // ON DUPLICATE KEY UPDATE จะ EXCLUDE fields เหล่านี้ (preserve admin choice)
+        $classification = b2f_dualwrite_infer_classification( $sku, $maker_id );
+        $production_mode      = $classification['production_mode'];      // default 'single'
+        $confirmation_status  = $classification['confirmation_status'];  // default 'confirmed' (CPT = admin-confirmed)
+        $admin_display_mode   = $classification['admin_display_mode'];   // default 'auto'
+        $missing_leaves_count = $classification['missing_leaves_count']; // default 0
+
         $uid = get_current_user_id();
         $now = current_time( 'mysql' );
 
         // UPSERT (ON DUPLICATE preserves id + created_at)
+        // CRITICAL V.1.2: ON DUPLICATE KEY UPDATE **EXCLUDES** 4 V11 classification columns
+        //   → admin-chosen production_mode / confirmation_status / admin_display_mode / missing_leaves_count
+        //     จะถูก preserve (ไม่ overwrite จาก CPT dual-write subsequent saves)
+        //   → V11 columns จะ update ผ่าน 4 new endpoints ใน /dinoco-b2f-audit/v1/ (V.3.3) เท่านั้น
+        //   → missing_leaves_count ถูก recompute โดย Phase 4 migration + Snippet 15 V.7.0 hook
         $sql = $wpdb->prepare(
             "INSERT INTO {$tbl}
                 (product_sku, maker_id, unit_cost, moq, lead_time_days,
                  shipping_land, shipping_sea, status, notes,
+                 production_mode, confirmation_status, admin_display_mode, missing_leaves_count,
                  legacy_cpt_id, created_by, updated_by, created_at, updated_at, deleted_at)
-             VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, %d, %d, %d, %s, %s, NULL)
+             VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, %s, %s, %s, %d, %d, %d, %d, %s, %s, NULL)
              ON DUPLICATE KEY UPDATE
                 unit_cost      = VALUES(unit_cost),
                 moq            = VALUES(moq),
@@ -110,6 +146,7 @@ if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
                 deleted_at     = NULL",
             $sku, $maker_id, $unit_cost, $moq, $lead_time,
             $ship_land, $ship_sea, $status, $notes,
+            $production_mode, $confirmation_status, $admin_display_mode, $missing_leaves_count,
             $mp_id, $uid, $uid, $now, $now
         );
         $ok = $wpdb->query( $sql );
@@ -137,7 +174,106 @@ if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
             'diff_detected'  => 0,
         ) );
 
+        // V.1.2: Fire central cache invalidation hook (HIGH-4 — Snippet 1 V.7.0 listener)
+        if ( function_exists( 'do_action' ) ) {
+            do_action( 'b2f_junction_updated', $maker_id );
+        }
+
         return true;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// V.1.2: CLASSIFICATION INFERENCE HELPER (local to Snippet 0.5)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Infer V11 classification defaults for fresh INSERT (ON DUPLICATE excludes these).
+// Prefers Snippet 1 V.7.0 helper `b2f_infer_production_mode_from_relations()` ถ้ามี,
+// ไม่มีก็ inline fallback logic (Snippet 1 V.7.0 จะ consolidate ภายหลัง).
+//
+// Classification logic (mirror Phase 4 migration pseudocode):
+//   has_children AND missing_leaves > 0 → cross_factory_assembly + as_parts
+//   has_children AND has_parent         → sub_unit + auto
+//   has_children AND NOT has_parent     → set_assembled + auto
+//   NO children (leaf)                  → single + auto
+//
+// CPT save = admin-edited → confirmation_status = 'confirmed'
+//   (CPT registered manually by admin, ไม่ใช่ auto-sync orphan)
+
+if ( ! function_exists( 'b2f_dualwrite_infer_classification' ) ) {
+    function b2f_dualwrite_infer_classification( $sku, $maker_id ) {
+        // Prefer Snippet 1 V.7.0+ helper when available (single source of truth)
+        if ( function_exists( 'b2f_infer_production_mode_from_relations' ) ) {
+            $inferred = b2f_infer_production_mode_from_relations( $sku, $maker_id );
+            if ( is_array( $inferred ) && isset( $inferred['production_mode'] ) ) {
+                // CPT save = admin-confirmed (not auto-synced orphan)
+                $inferred['confirmation_status'] = 'confirmed';
+                return $inferred;
+            }
+        }
+
+        // Inline fallback (Snippet 1 helper not yet synced)
+        $relations = get_option( 'dinoco_sku_relations', array() );
+        if ( ! is_array( $relations ) ) $relations = array();
+
+        // Normalize keys to uppercase for case-insensitive lookup
+        $sku_upper = strtoupper( (string) $sku );
+        $rel_upper = array();
+        foreach ( $relations as $parent_sku => $children ) {
+            $rel_upper[ strtoupper( $parent_sku ) ] = is_array( $children ) ? array_map( 'strtoupper', $children ) : array();
+        }
+
+        $children     = isset( $rel_upper[ $sku_upper ] ) ? $rel_upper[ $sku_upper ] : array();
+        $has_children = ! empty( $children );
+
+        // has_parent: walk relations to find SKU in any parent's children array
+        $has_parent = false;
+        foreach ( $rel_upper as $parent_sku => $parent_children ) {
+            if ( in_array( $sku_upper, $parent_children, true ) ) {
+                $has_parent = true;
+                break;
+            }
+        }
+
+        // missing_leaves count (maker-scoped): children ที่ maker นี้ไม่ได้ register ใน junction
+        $missing_count = 0;
+        if ( $has_children ) {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+            // Flatten children (walk 1 level — DD-2 leaf guard handles deeper recursion elsewhere)
+            $placeholders = implode( ',', array_fill( 0, count( $children ), '%s' ) );
+            $args = array_merge( array( $maker_id ), $children );
+            $registered = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$tbl}
+                 WHERE maker_id = %d
+                   AND BINARY UPPER(product_sku) IN ({$placeholders})
+                   AND deleted_at IS NULL",
+                $args
+            ) );
+            $missing_count = max( 0, count( $children ) - $registered );
+        }
+
+        // Classification matrix
+        if ( $has_children && $missing_count > 0 ) {
+            $production_mode    = 'cross_factory_assembly';
+            $admin_display_mode = 'as_parts'; // auto-hide cross-factory SET default
+        } elseif ( $has_children && $has_parent ) {
+            $production_mode    = 'sub_unit';
+            $admin_display_mode = 'auto';
+        } elseif ( $has_children ) {
+            $production_mode    = 'set_assembled';
+            $admin_display_mode = 'auto';
+        } else {
+            $production_mode    = 'single';
+            $admin_display_mode = 'auto';
+        }
+
+        return array(
+            'production_mode'      => $production_mode,
+            'confirmation_status'  => 'confirmed', // CPT = admin-confirmed by default
+            'admin_display_mode'   => $admin_display_mode,
+            'missing_leaves_count' => $missing_count,
+        );
     }
 }
 
@@ -216,6 +352,54 @@ add_action( 'untrash_post', function( $post_id ) {
          WHERE legacy_cpt_id = %d",
         current_time( 'mysql' ), $post_id
     ) );
+}, 10, 1 );
+
+// ═══════════════════════════════════════════════════════════════════
+// V.1.2 CRIT-4: CRON HANDLER — REPLAY QUEUED DUAL-WRITE
+// ═══════════════════════════════════════════════════════════════════
+//
+// Triggered by wp_schedule_single_event in b2f_dual_write_to_junction when
+// migration lock flag was active. Re-runs dual-write 10 seconds later —
+// loop-safe because migration flag cleared on Phase 4 finish (Audit V.3.3).
+//
+// If migration still active after N retries → give up + log (migration stuck).
+
+add_action( 'b2f_replay_queued_dual_write', function( $mp_id ) {
+    $mp_id = intval( $mp_id );
+    if ( ! $mp_id ) return;
+
+    // Bail if CPT was deleted between schedule + replay
+    $post = get_post( $mp_id );
+    if ( ! $post || $post->post_type !== 'b2f_maker_product' ) {
+        if ( function_exists( 'b2f_log' ) ) {
+            b2f_log( '[DualWrite V.1.2] replay cancelled — mp_id=' . $mp_id . ' deleted' );
+        }
+        return;
+    }
+
+    // If flag still active → re-schedule once more (max 6 retries = 1 minute total)
+    if ( get_option( 'b2f_phase4_migration_in_progress' ) ) {
+        $retry_count = (int) get_post_meta( $mp_id, '_b2f_replay_retry_count', true );
+        if ( $retry_count >= 6 ) {
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( '[DualWrite V.1.2] replay gave up after 6 retries mp_id=' . $mp_id . ' — migration stuck?' );
+            }
+            delete_post_meta( $mp_id, '_b2f_replay_retry_count' );
+            return;
+        }
+        update_post_meta( $mp_id, '_b2f_replay_retry_count', $retry_count + 1 );
+        wp_schedule_single_event( time() + 10, 'b2f_replay_queued_dual_write', array( $mp_id ) );
+        return;
+    }
+
+    // Lock cleared — run dual-write
+    delete_post_meta( $mp_id, '_b2f_replay_retry_count' );
+    $res = b2f_dual_write_to_junction( $mp_id );
+    if ( is_wp_error( $res ) && function_exists( 'b2f_log' ) ) {
+        b2f_log( '[DualWrite V.1.2] replay failed mp_id=' . $mp_id . ': ' . $res->get_error_message() );
+    } elseif ( function_exists( 'b2f_log' ) ) {
+        b2f_log( '[DualWrite V.1.2] replay success mp_id=' . $mp_id );
+    }
 }, 10, 1 );
 
 // --- End of Snippet 0.5 ---
