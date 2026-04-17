@@ -4,7 +4,26 @@
  * All-in-One: Multi-channel + RAG + AI Agent + MCP + Analytics
  *
  * V.2.0 — Modular refactor: split into modules/ and middleware/
+ * V.2.1 — Optional Sentry integration via SENTRY_DSN env var (defensive require)
  */
+
+// === Observability: optional Sentry init (zero-effect when env unset) ===
+// Env-gated. Install with `npm install @sentry/node` on the server when ready.
+// Missing module or missing DSN → silent no-op; never blocks startup.
+if (process.env.SENTRY_DSN) {
+  try {
+    const Sentry = require("@sentry/node");
+    Sentry.init({
+      dsn: process.env.SENTRY_DSN,
+      environment: process.env.SENTRY_ENV || "production",
+      tracesSampleRate: parseFloat(process.env.SENTRY_SAMPLE_RATE || "0.1"),
+    });
+    console.log("[Obs] Sentry initialized (env=" + (process.env.SENTRY_ENV || "production") + ")");
+  } catch (err) {
+    console.warn("[Obs] Sentry init skipped — @sentry/node module missing or failed:", err.message);
+  }
+}
+
 const express = require("express");
 const http = require("http");
 const { MongoClient } = require("mongodb");
