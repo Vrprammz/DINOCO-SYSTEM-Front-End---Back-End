@@ -7,6 +7,19 @@
 
 ---
 
+## 🏁 Remediation Status (updated 2026-04-17)
+
+- **Phase 1 COMPLETE** (6 commits `e10249a..96e4072`) — 12 quick-win + safe ship-blockers closed:
+  BUG-C1, BUG-C4, BUG-H1, BUG-H2, DB-C3, S4, UX-C3, PERF-H1, PERF-H7, PERF-M15, S6/S8, BUG-H8
+- **Phase 2 COMPLETE** (9 commits `1f81271..9d9b4b3` + this commit) — 11 ship-blockers + high-risk closed:
+  S1 (LIFF AI admin allowlist), S2 (B2F auth HMAC bind uid), S3 (OpenClaw unauth writes), S5 (B2F Audit CSRF nonce),
+  S9 + S17 (OpenClaw read + PATCH whitelist), BUG-C2 + C3 + C5 + C6 + C7 + H3 + H4 (BO stock/postback/debt),
+  DB-C1 (Snippet 0.5 CHECK consistency), DB-C2 (SARGable UPPER), DB-H7 + H8 (B2F cron flag gate + TTL chunking),
+  DB-H6 (Phase 4 lock self-heal — this commit)
+- **Phase 3+ pending** (user decision): remaining ~60 High + ~60 Medium/Low + UX polish + Next review cycle initiatives
+
+---
+
 ## 📊 Executive Summary
 
 **Verdict**: ระบบโดยรวม **mature** + audit trails แข็งแรงบน financial ops แต่มี **13 ship-blockers (🔴)** ที่ต้องปิดก่อน deploy รอบต่อไป — ส่วนใหญ่อยู่ใน **code ใหม่หลัง 2026-04-11**: BO System V.1.6, B2F V.7.0 Order Intent, Option F Phase 3 migration

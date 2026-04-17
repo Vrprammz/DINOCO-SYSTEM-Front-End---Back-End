@@ -1,5 +1,14 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.11 — Phase 2 audit DB-H6: Phase 4 migration lock auto-expire (self-heal).
+ *   Prior bug: `b2f_phase4_migration_in_progress` option set at STEP 0 + deleted at STEP 6
+ *   (or on SELECT failure). If PHP OOM / fatal / Apache kill occurred mid-run → lock persists
+ *   forever → Snippet 0.5 dual-write + Snippet 1 cron defer all writes until admin manual-clear.
+ *   Fix: set companion timestamp `b2f_phase4_migration_started_at` = time() alongside lock.
+ *   New helper `b2f_audit_phase4_stale_lock_autoclear($max_age=3600)` checks age + self-clears
+ *   if stale (> 1hr) + logs WARN. Called at (a) Phase 4 start — recovers from prior crash,
+ *   (b) `/phase4-migration-state` GET — recovers when admin opens dashboard post-crash.
+ *   Release paths (STEP 6 + SELECT failure) now delete both options atomically.
  * Version: V.3.10 — code-reviewer fixes on commit 9e70b4c: (doc + flag-whitelist only)
  *   document that `POST /sync-missing-intermediates` + `POST /feature-flags/toggle`
  *   now benefit from Snippet 1 V.7.3 improvements (HIGH-1 fail-fast pre-check, HIGH-2
@@ -261,6 +270,41 @@ if ( ! function_exists( 'b2f_audit_index_exists' ) ) {
 if ( ! function_exists( 'b2f_audit_is_schema_activated' ) ) {
     function b2f_audit_is_schema_activated() {
         return (bool) get_option( 'b2f_schema_v10_activated', false );
+    }
+}
+
+/**
+ * V.3.11 (DB-H6) — Phase 4 migration lock self-heal.
+ * If the lock option is set but the companion timestamp is > $max_age seconds old,
+ * assume the prior run crashed (PHP OOM / fatal / Apache kill) and clear both options.
+ * Returns true if a stale lock was cleared, false otherwise.
+ */
+if ( ! function_exists( 'b2f_audit_phase4_stale_lock_autoclear' ) ) {
+    function b2f_audit_phase4_stale_lock_autoclear( $max_age = 3600 ) {
+        if ( ! get_option( 'b2f_phase4_migration_in_progress' ) ) {
+            return false;
+        }
+        $started = (int) get_option( 'b2f_phase4_migration_started_at', 0 );
+        // No timestamp (lock set by pre-V.3.11 code) — trust age 0 means unknown, clear
+        // only if older than max_age relative to a safety ceiling (1hr default).
+        if ( $started <= 0 ) {
+            // Unknown age — do NOT auto-clear immediately; set timestamp NOW to start
+            // the clock. Next call in max_age seconds will clear if still set.
+            update_option( 'b2f_phase4_migration_started_at', time(), false );
+            return false;
+        }
+        $age = time() - $started;
+        if ( $age > (int) $max_age ) {
+            delete_option( 'b2f_phase4_migration_in_progress' );
+            delete_option( 'b2f_phase4_migration_started_at' );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[B2F Phase4] Stale lock auto-cleared (age=%ds > max=%ds)', $age, $max_age ) );
+            } else {
+                error_log( sprintf( '[B2F Phase4] Stale lock auto-cleared (age=%ds > max=%ds)', $age, $max_age ) );
+            }
+            return true;
+        }
+        return false;
     }
 }
 
@@ -1115,8 +1159,11 @@ if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
         $batch = max( 50, min( 2000, (int) $batch ?: 200 ) );
 
         // STEP 0 — lock flag (even for dry-run we set it, so concurrent CPT saves don't race)
+        // V.3.11 (DB-H6): auto-clear stale lock from prior crashed run before acquiring new lock
+        b2f_audit_phase4_stale_lock_autoclear( 3600 );
         if ( ! $dry_run ) {
             update_option( 'b2f_phase4_migration_in_progress', true, false );
+            update_option( 'b2f_phase4_migration_started_at', time(), false );
         }
 
         try {
@@ -1171,7 +1218,10 @@ if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
                 $state['errors'][] = 'SELECT junction failed: ' . $wpdb->last_error;
                 $state['finished_at'] = current_time( 'mysql' );
                 $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
-                if ( ! $dry_run ) delete_option( 'b2f_phase4_migration_in_progress' );
+                if ( ! $dry_run ) {
+                    delete_option( 'b2f_phase4_migration_in_progress' );
+                    delete_option( 'b2f_phase4_migration_started_at' );
+                }
                 return $state;
             }
             if ( ! is_array( $rows ) ) $rows = array();
@@ -1399,6 +1449,7 @@ if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
         // STEP 6 — Clear lock (always — even if we threw)
         if ( ! $dry_run ) {
             delete_option( 'b2f_phase4_migration_in_progress' );
+            delete_option( 'b2f_phase4_migration_started_at' );
         }
 
         // STEP 7 — Fire central cache hook (maker_id=0 = global sweep)
@@ -3465,13 +3516,19 @@ add_action( 'rest_api_init', function () {
         'methods'             => 'GET',
         'permission_callback' => $perm_admin_or_liff,
         'callback'            => function () {
+            // V.3.11 (DB-H6): self-heal stale lock on admin dashboard open
+            $stale_cleared = b2f_audit_phase4_stale_lock_autoclear( 3600 );
             $state = b2f_audit_get_phase4_state();
             $mysql = function_exists( 'b2f_audit_check_mysql_version' ) ? b2f_audit_check_mysql_version() : array();
+            $in_progress = (bool) get_option( 'b2f_phase4_migration_in_progress' );
+            $lock_age    = $in_progress ? ( time() - (int) get_option( 'b2f_phase4_migration_started_at', 0 ) ) : null;
             return rest_ensure_response( array(
                 'success' => true,
                 'data'    => array(
                     'state'           => $state,
-                    'in_progress'     => (bool) get_option( 'b2f_phase4_migration_in_progress' ),
+                    'in_progress'     => $in_progress,
+                    'lock_age_sec'    => $lock_age,
+                    'stale_cleared'   => (bool) $stale_cleared,
                     'schema_version'  => (string) get_option( 'b2f_schema_version', '0' ),
                     'v11_activated'   => (bool) get_option( 'b2f_schema_v11_activated' ),
                     'mysql_check'     => $mysql,
