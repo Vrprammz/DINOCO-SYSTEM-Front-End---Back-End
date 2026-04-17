@@ -1,5 +1,20 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.5 — Phase 2 audit DB-C2 FIX + S2 FIX:
+ *   (DB-C2) `b2f_read_maker_product` junction SELECT dropped `UPPER(product_sku)=%s` wrap
+ *   — non-SARGable pattern prevented uq_sku_maker + idx_sku from firing → seq scan on hot
+ *   path (create-po leaf validation N× per request). Column is utf8mb4_bin + stored
+ *   uppercase by all writers (Snippet 0.5, audit backfill, junction_upsert); $sku is
+ *   normalized at function entry. Direct compare is exact + index-eligible.
+ *   (S2) `/auth-admin` HMAC sig now binds to `line_user_id` (when `b2f_flag_sig_bind_uid`
+ *   ON — default ON per sprint). Signed data = `path|_ts=TS` + `|_uid=UID` → URL forward
+ *   no longer authenticates as admin. Full 64-char HMAC compare (was 16 hex = 64-bit).
+ *   id_token verify now REQUIRED (was silent-fallback). `$verified_uid` (from LINE
+ *   `verify.sub`) compared to `$uid_param` — mismatch = reject (URL hijack defense).
+ *   `b2f_is_admin_line_uid()` allowlist check before JWT issue. Max-age tightened 4hr → 30min.
+ *   Backward-compat: flag OFF → old behavior (transition window; Audit dashboard exposes
+ *   toggle). Paired with Snippet 1 V.7.4 (`b2f_liff_url()` emits _uid + full 64-char sig
+ *   + flag-gated format).
  * Version: V.11.4 — Phase 1 audit BUG-C4 FIX: removed PII gate self-revert in b2f_format_po_detail().
  *   The legacy block re-enabled $is_admin_gate whenever caller passed $include_sensitive=true
  *   without verifying current_user_can, defeating defense-in-depth. Now gate is authoritative
@@ -367,6 +382,28 @@ if ( ! function_exists( 'b2f_rate_limit' ) ) {
  * POST /b2f/v1/auth-admin
  * LIFF จาก LINE browser → verify HMAC sig + LINE ID Token → issue session token
  * Pattern เหมือน B2B /auth-group แต่ verify เฉพาะ admin
+ *
+ * V.11.5 S2 FIX (Phase 2 audit): four-part hardening paired with Snippet 1 V.7.4
+ *   `b2f_liff_url()` uid-binding emitter:
+ *   (a) When `b2f_flag_sig_bind_uid` ON (default) + `_uid` param present → expected sig
+ *       = hash_hmac('sha256', path|_ts=TS|_uid=UID, secret) full 64-char. `hash_equals`
+ *       compares full hex → timing-safe + 2^256 collision space (was 2^64).
+ *   (b) id_token verify REQUIRED (not silent-fallback). Empty or LINE-API reject →
+ *       authorized=false. Previously id_token optional → trivial impersonation via
+ *       client-supplied line_user_id.
+ *   (c) Post-verify UID check: `$verified_uid` (LINE `verify.sub`) must equal
+ *       `$uid_param` from query. Mismatch = URL was forwarded to a different user →
+ *       reject. Defeats "screenshot URL → auth as original admin" attack.
+ *   (d) `b2f_is_admin_line_uid($verified_uid)` allowlist check BEFORE JWT issuance.
+ *       Only LINE UIDs linked to administrator WP users (user_meta.line_user_id + role)
+ *       can obtain admin JWT. Previously: any LINE user whose URL passed HMAC became
+ *       admin.
+ *   (e) Max-age tightened 4hr → 30 min. URL is consumed on LIFF open in typical flow;
+ *       30 min margin more than adequate and shrinks stolen-URL reuse window.
+ *   Rollback: flip `b2f_flag_sig_bind_uid=false` → falls back to 16-char sig +
+ *   skips uid cross-check + keeps id_token optional. Lets older Flex cards authenticate
+ *   while new cards roll out. Admin allowlist (d) + 30-min TTL (e) remain unconditional
+ *   (no legacy behavior — they are strict-upgrade).
  */
 if ( ! function_exists( 'b2f_rest_auth_admin' ) ) {
     function b2f_rest_auth_admin( WP_REST_Request $request ) {
@@ -385,67 +422,121 @@ if ( ! function_exists( 'b2f_rest_auth_admin' ) ) {
         if ( empty( $sig ) || $ts <= 0 ) {
             return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ลิงก์ไม่ถูกต้อง' ), 200 );
         }
-        // Max age: 4 hours
-        if ( abs( time() - $ts ) > 14400 ) {
+
+        // V.11.5 S2(e): Max age tightened 4hr → 30 min (LIFF URLs are one-shot in practice).
+        if ( abs( time() - $ts ) > 1800 ) {
             return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ลิงก์หมดอายุ กรุณากดลิงก์ใหม่' ), 200 );
         }
-        // Reconstruct HMAC (match b2f_liff_url format: path + params)
+
+        // V.11.5 S2(a): Reconstruct HMAC — uid-bound (V.7.4) or legacy (V.7.3).
         $path = 'b2f-catalog/';
         $secret = defined( 'B2B_LINE_CHANNEL_SECRET' ) ? B2B_LINE_CHANNEL_SECRET : wp_salt( 'auth' );
-        $sig_data = $path . '|_ts=' . $ts;
-        $expected = substr( hash_hmac( 'sha256', $sig_data, $secret ), 0, 16 );
-        if ( ! hash_equals( $expected, $sig ) ) {
-            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ลิงก์ไม่ถูกต้อง (sig)' ), 200 );
-        }
+        $uid_param = sanitize_text_field( $request->get_param( '_uid' ) ?: '' );
+        $bind_uid_flag = function_exists( 'b2f_is_flag_enabled' )
+            ? b2f_is_flag_enabled( 'b2f_flag_sig_bind_uid' )
+            : true; // default ON if helper unavailable
 
-        // Verify LINE ID Token
-        $line_uid = sanitize_text_field( $request->get_param( 'line_user_id' ) );
-        $id_token = sanitize_text_field( $request->get_param( 'id_token' ) );
-        if ( empty( $line_uid ) ) {
-            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ต้องเปิดผ่าน LINE เท่านั้น' ), 200 );
+        $sig_ok = false;
+        if ( $bind_uid_flag && ! empty( $uid_param ) ) {
+            // V.7.4 secure path: full 64-char sig + uid bound
+            $sig_data = $path . '|_ts=' . $ts . '|_uid=' . $uid_param;
+            $expected = hash_hmac( 'sha256', $sig_data, $secret );
+            $sig_ok = ( strlen( $sig ) === 64 && hash_equals( $expected, $sig ) );
         }
-
-        // Best-effort verify LINE ID Token (เหมือน B2B)
-        if ( ! empty( $id_token ) ) {
-            $liff_channel_id = defined( 'B2B_LIFF_ID' ) ? preg_replace( '/-.*$/', '', B2B_LIFF_ID ) : '';
-            if ( $liff_channel_id ) {
-                $verify_resp = wp_remote_post( 'https://api.line.me/oauth2/v2.1/verify', array(
-                    'body'    => array( 'id_token' => $id_token, 'client_id' => $liff_channel_id ),
-                    'timeout' => 10,
-                ) );
-                if ( ! is_wp_error( $verify_resp ) ) {
-                    $verify_body = json_decode( wp_remote_retrieve_body( $verify_resp ), true );
-                    if ( ! empty( $verify_body['sub'] ) ) {
-                        $line_uid = sanitize_text_field( $verify_body['sub'] );
-                    }
+        if ( ! $sig_ok ) {
+            // Legacy path (V.7.3 — 16-char sig over path+_ts) for backward compat during rollout
+            $legacy_sig_data = $path . '|_ts=' . $ts;
+            $legacy_expected = substr( hash_hmac( 'sha256', $legacy_sig_data, $secret ), 0, 16 );
+            if ( strlen( $sig ) === 16 && hash_equals( $legacy_expected, $sig ) ) {
+                // Accept legacy sig only when flag is OFF (transition window).
+                // When flag ON, reject legacy sigs — forces re-generation of admin Flex URLs.
+                if ( ! $bind_uid_flag ) {
+                    $sig_ok = true;
                 }
             }
         }
+        if ( ! $sig_ok ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ลิงก์ไม่ถูกต้อง (sig)' ), 200 );
+        }
 
-        // Verify admin:
-        // 1) HMAC sig ถูกต้อง = URL สร้างจาก Bot ใน Admin group = trusted
-        // 2) Fallback: ตรวจ WP user ที่ link LINE UID + role administrator
-        // (HMAC sig ผ่านมาถึงตรงนี้แล้ว = verified → ถือว่าเป็น admin จาก LINE group)
-        // ไม่บังคับ WP user เพราะ Admin ใน LINE อาจไม่มี WP account
+        // V.11.5 S2(b): id_token verify REQUIRED. Previously optional (silent fallback to
+        // client-supplied line_user_id = trivial impersonation). Now missing/invalid → reject.
+        $line_uid_param = sanitize_text_field( $request->get_param( 'line_user_id' ) );
+        $id_token       = sanitize_text_field( $request->get_param( 'id_token' ) );
+        if ( empty( $line_uid_param ) ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ต้องเปิดผ่าน LINE เท่านั้น' ), 200 );
+        }
+        if ( empty( $id_token ) ) {
+            return new WP_REST_Response( array(
+                'authorized' => false,
+                'code'       => 'missing_id_token',
+                'message'    => 'ต้องแนบ id_token จาก LIFF',
+            ), 400 );
+        }
+
+        // Verify LINE ID Token against LINE API. Non-blocking network issues (wp_remote_post
+        // WP_Error) are treated as verify-fail (reject) — prior behavior silently accepted.
+        $liff_channel_id = defined( 'B2B_LIFF_ID' ) ? preg_replace( '/-.*$/', '', B2B_LIFF_ID ) : '';
+        if ( empty( $liff_channel_id ) ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'code' => 'liff_not_configured', 'message' => 'LIFF ไม่ได้ตั้งค่า' ), 500 );
+        }
+        $verify_resp = wp_remote_post( 'https://api.line.me/oauth2/v2.1/verify', array(
+            'body'    => array( 'id_token' => $id_token, 'client_id' => $liff_channel_id ),
+            'timeout' => 10,
+        ) );
+        if ( is_wp_error( $verify_resp ) ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'code' => 'id_token_verify_fail', 'message' => 'ไม่สามารถยืนยัน LINE ID Token' ), 401 );
+        }
+        $verify_body = json_decode( wp_remote_retrieve_body( $verify_resp ), true );
+        if ( empty( $verify_body['sub'] ) ) {
+            return new WP_REST_Response( array( 'authorized' => false, 'code' => 'id_token_invalid', 'message' => 'LINE ID Token ไม่ถูกต้อง' ), 401 );
+        }
+        $verified_uid = sanitize_text_field( $verify_body['sub'] );
+
+        // V.11.5 S2(c): URL hijack defense — if sig bound to `_uid`, the id_token's `sub`
+        // (verified) must equal that `_uid`. If a different user opened the URL, their
+        // id_token.sub won't match. Only applies when bind flag ON + uid was bound.
+        if ( $bind_uid_flag && ! empty( $uid_param ) && $verified_uid !== $uid_param ) {
+            if ( function_exists( 'b2f_log' ) ) {
+                b2f_log( sprintf( '[Auth-Admin] S2(c) URL-hijack reject: bound_uid=%s verified_uid=%s', $uid_param, $verified_uid ) );
+            }
+            return new WP_REST_Response( array( 'authorized' => false, 'code' => 'uid_mismatch', 'message' => 'ลิงก์นี้ไม่ได้สร้างสำหรับคุณ' ), 403 );
+        }
+
+        // V.11.5 S2(d): Admin allowlist check. b2f_is_admin_line_uid() looks up WP users
+        // with user_meta.line_user_id = $verified_uid + role=administrator. No match → reject.
+        // Previously: HMAC sig pass = admin (sig-only trust). Now: sig + id_token +
+        // allowlist triple-gate.
+        if ( function_exists( 'b2f_is_admin_line_uid' ) ) {
+            if ( ! b2f_is_admin_line_uid( $verified_uid ) ) {
+                if ( function_exists( 'b2f_log' ) ) {
+                    b2f_log( sprintf( '[Auth-Admin] S2(d) allowlist reject: uid=%s', $verified_uid ) );
+                }
+                return new WP_REST_Response( array( 'authorized' => false, 'code' => 'not_admin', 'message' => 'ผู้ใช้ไม่ได้รับสิทธิ์แอดมิน' ), 403 );
+            }
+        } else {
+            // Helper unavailable — fail closed (safer than permissive fallback).
+            return new WP_REST_Response( array( 'authorized' => false, 'code' => 'allowlist_helper_missing', 'message' => 'ระบบตรวจสิทธิ์ไม่พร้อม' ), 500 );
+        }
 
         // Issue session token (reuse B2B JWT if available)
         $token = '';
         if ( class_exists( 'DINOCO_JWT' ) ) {
-            $token = DINOCO_JWT::create( array( 'role' => 'b2f_admin', 'uid' => $line_uid, 'is_admin' => true ), 7200 );
+            $token = DINOCO_JWT::create( array( 'role' => 'b2f_admin', 'uid' => $verified_uid, 'is_admin' => true ), 7200 );
         } else {
             // Fallback: transient
             $token = bin2hex( random_bytes( 32 ) );
-            set_transient( 'b2f_admin_sess_' . $token, array( 'uid' => $line_uid, 'is_admin' => true, 'created' => time() ), 7200 );
+            set_transient( 'b2f_admin_sess_' . $token, array( 'uid' => $verified_uid, 'is_admin' => true, 'created' => time() ), 7200 );
         }
 
         if ( function_exists( 'b2f_log' ) ) {
-            b2f_log( sprintf( '[Auth-Admin] OK uid=%s', $line_uid ) );
+            b2f_log( sprintf( '[Auth-Admin] OK uid=%s (bound=%s)', $verified_uid, ( $bind_uid_flag && ! empty( $uid_param ) ) ? 'yes' : 'no' ) );
         }
 
         return new WP_REST_Response( array(
             'authorized' => true,
             'token'      => $token,
-            'line_uid'   => $line_uid,
+            'line_uid'   => $verified_uid,
         ), 200 );
     }
 }
@@ -795,8 +886,17 @@ if ( ! function_exists( 'b2f_read_maker_product' ) ) {
 
         if ( $flag_on ) {
             $tbl = $wpdb->prefix . 'dinoco_product_makers';
+            // V.11.5 DB-C2 FIX: drop non-SARGable `UPPER(product_sku)` wrap — blocks
+            // uq_sku_maker composite unique + idx_sku (utf8mb4_bin column) from being
+            // used → seq scan on a hot path (create-po leaf validation N times).
+            // Column is stored uppercase by all writers (Snippet 0.5 strtoupper() at
+            // INSERT, Audit backfill uppercase on transfer, junction_upsert uppercase),
+            // and $sku is normalized to uppercase at function entry (line above — `$sku
+            // = strtoupper(trim($sku))`). Direct compare on utf8mb4_bin is exact +
+            // index-eligible. Callers that bypass the normalization still safe because
+            // we self-uppercase at entry.
             $row = $wpdb->get_row( $wpdb->prepare(
-                "SELECT * FROM {$tbl} WHERE UPPER(product_sku) = %s AND maker_id = %d AND deleted_at IS NULL LIMIT 1",
+                "SELECT * FROM {$tbl} WHERE product_sku = %s AND maker_id = %d AND deleted_at IS NULL LIMIT 1",
                 $sku, $maker_id
             ), ARRAY_A );
             if ( $row ) {
