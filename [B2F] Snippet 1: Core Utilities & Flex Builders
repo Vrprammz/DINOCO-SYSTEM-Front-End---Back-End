@@ -1,5 +1,7 @@
 /**
  * [B2F] Snippet 1: Core Utilities & LINE Flex Builders
+ * Version: V.7.2 — Phase 1 audit BUG-H8: removed orphan flag `b2f_flag_ungroup_auto_hide` from whitelist + b2f_is_flag_enabled + b2f_get_all_flags + b2f_log_flag_change. The flag was declared, UI-toggleable, and dependency-checked but never consumed by any business logic. Auto-hide behavior is driven by the `admin_display_mode='as_parts'` junction column (set by Phase 4 migration when missing_leaves>0), not by a runtime flag.
+ * Version: V.7.1 — Coverage rule auto-sync helpers: b2f_get_parents_for_sku, b2f_is_sku_registered_for_maker, b2f_is_coverage_complete, b2f_insert_auto_sync_junction_row, b2f_auto_sync_parent_coverage (reactive, used by Snippet 0.5 after dual-write), b2f_detect_missing_intermediates (used by Audit /sync-missing-intermediates endpoint). Philosophy: admin maintains only leaves; intermediates + top SETs auto-derive when all descendants covered. Skips blacklisted SKUs (via b2f_autosync_is_blacklisted). ON DUPLICATE KEY UPDATE id=id makes insert idempotent. unit_cost=0 since LIFF computes SET cost from leaves via b2f_compute_set_costs_v918.
  * Version: V.7.0 — Order Intent Helpers (3 axes: production_mode / admin_display_mode / order_mode). Section 100 adds 8 helpers: `b2f_get_production_mode()` (per-request static cache read junction), `b2f_infer_legacy_order_mode()` (display-only fallback for pre-V.7.0 PO), `b2f_validate_source_sku_in_ancestors()` (anti-malicious guard), `b2f_junction_update_classification()` (atomic UPDATE FOR UPDATE + auto-flip + audit + central hook fire), `b2f_order_mode_label()` (3-lang), `b2f_flex_intent_summary()` (PII-guarded mode breakdown), `b2f_audit_check_mysql_version()` (non-blocking CHECK capability probe), `b2f_infer_production_mode_from_relations()` (Snippet 0.5 dual-write helper). Error code registry (7 constants) + 3 new flags in whitelist (v11_explicit_mode / order_intent / ungroup_auto_hide) + central cache listener on `b2f_junction_updated` action (HIGH-4) + `b2f_flex_po_items_list()` optional `$show_mode_badge` param with PII guard (never forward poi_intent_notes).
  * Version: V.6.6 — Issue #1: 3-level hierarchy grouping (TOP SET → intermediate child → leaves). New `b2f_group_items_by_path($items)` parses `poi_parent_path` (slash-separated) per breakdown → nested tree {sets: {TOP: {children_nodes: {MID: {leaves: [...]}}, direct_leaves: [...]}}, standalone: [...], is_3level, fallback_used}. `b2f_build_item_breakdown_json()` preserves `parent_path` field. `b2f_flex_po_items_list()` auto-switches: 3-level render (purple TOP + blue MID + leaves indent 18px) ถ้า is_3level=true, else fallback to 2-level (b2f_group_items_by_set). Backward compat: PO เก่าไม่มี poi_parent_path → fallback path → UI เหมือนเดิม.
  * Version: V.6.5 — Phase 1 migration: feature flag helpers (b2f_is_flag_enabled, b2f_get_all_flags, b2f_log_flag_change)
@@ -3395,11 +3397,14 @@ if (!function_exists('b2f_build_flex_slip_rejected')) {
 //   - b2f_flag_read_from_junction   : Phase 3 — reads ใช้ canonical table
 //   - b2f_flag_v11_explicit_mode    : V.7.0 — backend return production_mode in API response
 //   - b2f_flag_order_intent         : V.7.0 — accept order_mode per item + LIFF UI gated
-//   - b2f_flag_ungroup_auto_hide    : V.7.0 — migration missing_leaves → as_parts auto
 //
 // Dependency chain (enforce at flag setter endpoint in Audit):
 //   - order_intent=ON ต้องมี v11_explicit_mode=ON ก่อน
-//   - ungroup_auto_hide=ON ต้องมี b2f_phase4_migration_state.finished_at
+//
+// V.7.1 (Phase 1 audit BUG-H8): removed orphan flag `b2f_flag_ungroup_auto_hide`.
+//   It was declared + UI-toggleable + dependency-checked but never consumed by any business
+//   logic. Auto-hide behavior is driven by `admin_display_mode='as_parts'` set by the Phase 4
+//   migration when missing_leaves>0 — not a runtime flag.
 //
 // Usage:
 //   if (b2f_is_flag_enabled('b2f_flag_shadow_write')) { ... dual-write ... }
@@ -3417,7 +3422,6 @@ if (!function_exists('b2f_is_flag_enabled')) {
             // V.7.0 (NEW — Order Intent)
             'b2f_flag_v11_explicit_mode',
             'b2f_flag_order_intent',
-            'b2f_flag_ungroup_auto_hide',
         );
         if (!in_array($flag_name, $allowed, true)) return false;
         return (bool) get_option($flag_name, false);
@@ -3434,7 +3438,6 @@ if (!function_exists('b2f_get_all_flags')) {
             // V.7.0 (NEW — Order Intent)
             'b2f_flag_v11_explicit_mode'  => b2f_is_flag_enabled('b2f_flag_v11_explicit_mode'),
             'b2f_flag_order_intent'       => b2f_is_flag_enabled('b2f_flag_order_intent'),
-            'b2f_flag_ungroup_auto_hide'  => b2f_is_flag_enabled('b2f_flag_ungroup_auto_hide'),
         );
     }
 }
@@ -3448,7 +3451,6 @@ if (!function_exists('b2f_log_flag_change')) {
             'b2f_flag_read_from_junction',
             'b2f_flag_v11_explicit_mode',
             'b2f_flag_order_intent',
-            'b2f_flag_ungroup_auto_hide',
         );
         if (!in_array($flag, $allowed, true)) return;
         if (function_exists('b2b_log')) {
@@ -4066,5 +4068,270 @@ if (!function_exists('b2f_on_junction_updated_invalidate')) {
     }
     add_action('b2f_junction_updated', 'b2f_on_junction_updated_invalidate', 10, 1);
 }
+
+
+// ═════════════════════════════════════════════════════════════════════
+// V.7.1 — HIERARCHY COVERAGE AUTO-SYNC HELPERS
+// ═════════════════════════════════════════════════════════════════════
+//
+// Philosophy — "Coverage Rule":
+//   SKU X registered for Maker M ⇔
+//     explicit junction row OR (X has children AND ALL children covered for M).
+//   Leaves = source of truth. Intermediate sub-units + top SETs auto-derive.
+//
+// Three consumers:
+//   1. b2f_auto_sync_parent_coverage()   — reactive: called by Snippet 0.5 after
+//      every dual-write. Walks UP from $child_sku to re-evaluate ancestor coverage.
+//   2. b2f_detect_missing_intermediates() — batch: scans entire junction, returns
+//      all SKUs that SHOULD be registered per the coverage rule. Used by the
+//      /sync-missing-intermediates endpoint for both dry-run + live.
+//   3. b2f_insert_auto_sync_junction_row() — primitive: idempotent INSERT via
+//      ON DUPLICATE KEY UPDATE id=id. unit_cost=0 (LIFF auto-computes SET cost).
+//
+// Blacklist: respects b2f_autosync_is_blacklisted() (V.3.2 helper from Audit snippet).
+// Migration lock: inserts skipped when b2f_phase4_migration_in_progress option set.
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Return array of parent SKUs (uppercase) for $sku based on dinoco_sku_relations.
+ * DD-3 safe: one SKU may have multiple parents.
+ */
+if (!function_exists('b2f_get_parents_for_sku')) {
+    function b2f_get_parents_for_sku($sku) {
+        $sku_u = strtoupper(trim((string) $sku));
+        if ($sku_u === '') return array();
+        $relations = get_option('dinoco_sku_relations', array());
+        if (!is_array($relations)) return array();
+        $parents = array();
+        foreach ($relations as $parent => $children) {
+            if (!is_array($children)) continue;
+            $parent_u = strtoupper((string) $parent);
+            foreach ($children as $child) {
+                if (strtoupper((string) $child) === $sku_u) {
+                    $parents[] = $parent_u;
+                    break;
+                }
+            }
+        }
+        return array_values(array_unique($parents));
+    }
+}
+
+/**
+ * Check if a SKU has a non-deleted junction row for this maker.
+ */
+if (!function_exists('b2f_is_sku_registered_for_maker')) {
+    function b2f_is_sku_registered_for_maker($sku, $maker_id) {
+        global $wpdb;
+        $sku = strtoupper(trim((string) $sku));
+        $maker_id = intval($maker_id);
+        if (!$sku || !$maker_id) return false;
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        return (bool) $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$tbl} WHERE UPPER(product_sku) = %s AND maker_id = %d AND deleted_at IS NULL LIMIT 1",
+            $sku, $maker_id
+        ));
+    }
+}
+
+/**
+ * Check if $sku's children are ALL covered for $maker_id.
+ * Coverage: leaf must be explicitly registered; non-leaf covered if all children covered (recursive).
+ */
+if (!function_exists('b2f_is_coverage_complete')) {
+    function b2f_is_coverage_complete($sku, $maker_id, $visited = null) {
+        if ($visited === null) $visited = array();
+        $sku_u = strtoupper(trim((string) $sku));
+        if (!$sku_u || !$maker_id) return false;
+        if (isset($visited[$sku_u])) return false;
+        $visited[$sku_u] = true;
+        $relations = get_option('dinoco_sku_relations', array());
+        if (!is_array($relations)) return false;
+        $children = null;
+        foreach ($relations as $p => $kids) {
+            if (strtoupper((string) $p) === $sku_u && is_array($kids)) {
+                $children = array_map(function($c) { return strtoupper((string) $c); }, $kids);
+                break;
+            }
+        }
+        if ($children === null || empty($children)) {
+            // Leaf — covered iff registered
+            return b2f_is_sku_registered_for_maker($sku_u, $maker_id);
+        }
+        foreach ($children as $ch) {
+            if (b2f_is_sku_registered_for_maker($ch, $maker_id)) continue;
+            $sub_visited = $visited;
+            if (!b2f_is_coverage_complete($ch, $maker_id, $sub_visited)) return false;
+        }
+        return true;
+    }
+}
+
+/**
+ * INSERT a junction row for a coverage-derived SKU. unit_cost=0 (LIFF auto-computes
+ * from leaves via b2f_compute_set_costs_v918). confirmation_status='auto_synced'.
+ * Fires b2f_junction_updated hook. Returns bool success.
+ *
+ * Note: b2f_infer_production_mode_from_relations() returns STRING (not array), so we
+ * derive admin_display_mode locally — 'as_parts' when production_mode is cross_factory
+ * (missing leaves implied), else 'auto'.
+ */
+if (!function_exists('b2f_insert_auto_sync_junction_row')) {
+    function b2f_insert_auto_sync_junction_row($sku, $maker_id) {
+        global $wpdb;
+        $sku = strtoupper(trim((string) $sku));
+        $maker_id = intval($maker_id);
+        if (!$sku || !$maker_id) return false;
+        if (!get_option('b2f_schema_v10_activated')) return false;
+        if (get_option('b2f_phase4_migration_in_progress')) return false;
+
+        $pm = 'single';
+        $ad = 'auto';
+        if (function_exists('b2f_infer_production_mode_from_relations')) {
+            $inferred = b2f_infer_production_mode_from_relations($sku, $maker_id);
+            if (is_string($inferred) && $inferred !== '') {
+                $pm = $inferred;
+                if ($pm === 'cross_factory_assembly') $ad = 'as_parts';
+            } elseif (is_array($inferred)) {
+                // Forward-compat: if helper later returns array
+                if (isset($inferred['production_mode']))    $pm = $inferred['production_mode'];
+                if (isset($inferred['admin_display_mode'])) $ad = $inferred['admin_display_mode'];
+            }
+        }
+
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $uid = get_current_user_id();
+        $now = current_time('mysql');
+
+        $ok = $wpdb->query($wpdb->prepare(
+            "INSERT INTO {$tbl}
+                (product_sku, maker_id, unit_cost, moq, lead_time_days,
+                 shipping_land, shipping_sea, status, notes,
+                 production_mode, confirmation_status, admin_display_mode, missing_leaves_count,
+                 legacy_cpt_id, created_by, updated_by, created_at, updated_at, deleted_at)
+             VALUES (%s, %d, 0, 1, 7, 0, 0, 'active', 'auto-synced (coverage rule)', %s, 'auto_synced', %s, 0, 0, %d, %d, %s, %s, NULL)
+             ON DUPLICATE KEY UPDATE id = id",
+            $sku, $maker_id, $pm, $ad, $uid, $uid, $now, $now
+        ));
+        if ($ok === false) return false;
+
+        do_action('b2f_junction_updated', $maker_id);
+        do_action('b2f_auto_sync_parent_added', $maker_id, $sku);
+        if (function_exists('b2f_log')) {
+            b2f_log('[AutoSync Coverage] added ' . $sku . ' for maker=' . $maker_id);
+        }
+        return true;
+    }
+}
+
+/**
+ * Reactive: called after any maker-product save. Walks up from $child_sku. For each
+ * ancestor not yet registered AND with all-children-covered AND not blacklisted →
+ * INSERT. Continues walking until an ancestor fails coverage. Returns array of added SKUs.
+ *
+ * Depth cap 10 prevents runaway on malformed relations.
+ */
+if (!function_exists('b2f_auto_sync_parent_coverage')) {
+    function b2f_auto_sync_parent_coverage($maker_id, $child_sku, $depth = 0) {
+        $added = array();
+        if ($depth > 10) return $added;
+        $maker_id = intval($maker_id);
+        $child_sku = strtoupper(trim((string) $child_sku));
+        if (!$maker_id || !$child_sku) return $added;
+        $parents = b2f_get_parents_for_sku($child_sku);
+        foreach ($parents as $parent_sku) {
+            if (function_exists('b2f_autosync_is_blacklisted')
+                && b2f_autosync_is_blacklisted($maker_id, $parent_sku)) {
+                continue;
+            }
+            if (b2f_is_sku_registered_for_maker($parent_sku, $maker_id)) {
+                // Already there — continue walking up (grandparent may now be coverable)
+                $sub = b2f_auto_sync_parent_coverage($maker_id, $parent_sku, $depth + 1);
+                $added = array_merge($added, $sub);
+                continue;
+            }
+            if (!b2f_is_coverage_complete($parent_sku, $maker_id)) continue;
+            if (b2f_insert_auto_sync_junction_row($parent_sku, $maker_id)) {
+                $added[] = $parent_sku;
+                $sub = b2f_auto_sync_parent_coverage($maker_id, $parent_sku, $depth + 1);
+                $added = array_merge($added, $sub);
+            }
+        }
+        return array_values(array_unique($added));
+    }
+}
+
+/**
+ * Scan all junction data and return list of [{maker_id, sku}] that SHOULD be registered
+ * per the coverage rule but currently aren't. Used by /sync-missing-intermediates
+ * endpoint for both dry-run preview and live add.
+ *
+ * $filter_maker_id (int, optional): limit scan to one maker.
+ *
+ * Loops until stable — adding one ancestor may enable grandparent coverage.
+ */
+if (!function_exists('b2f_detect_missing_intermediates')) {
+    function b2f_detect_missing_intermediates($filter_maker_id = 0) {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $filter_maker_id = intval($filter_maker_id);
+        $where = $filter_maker_id > 0 ? $wpdb->prepare("AND maker_id = %d", $filter_maker_id) : '';
+        $rows = $wpdb->get_results("SELECT maker_id, product_sku FROM {$tbl} WHERE deleted_at IS NULL {$where}", ARRAY_A);
+        if (!is_array($rows)) return array();
+
+        // maker_id → { SKU_upper: true }
+        $maker_skus = array();
+        foreach ($rows as $r) {
+            $mid = intval($r['maker_id']);
+            $sku_u = strtoupper((string) $r['product_sku']);
+            if (!isset($maker_skus[$mid])) $maker_skus[$mid] = array();
+            $maker_skus[$mid][$sku_u] = true;
+        }
+
+        $relations = get_option('dinoco_sku_relations', array());
+        if (!is_array($relations)) return array();
+        $rel_upper = array();
+        $all_parents = array();
+        foreach ($relations as $p => $kids) {
+            if (!is_array($kids)) continue;
+            $p_u = strtoupper((string) $p);
+            $rel_upper[$p_u] = array_map(function($c) { return strtoupper((string) $c); }, $kids);
+            $all_parents[] = $p_u;
+        }
+
+        // Closure: is $sku_u covered given the current $set?
+        $is_covered = function($sku_u, $set, $visited = array()) use (&$is_covered, $rel_upper) {
+            if (isset($set[$sku_u])) return true;
+            if (isset($visited[$sku_u])) return false;
+            $visited[$sku_u] = true;
+            if (!isset($rel_upper[$sku_u]) || empty($rel_upper[$sku_u])) return false;
+            foreach ($rel_upper[$sku_u] as $ch) {
+                if (!$is_covered($ch, $set, $visited)) return false;
+            }
+            return true;
+        };
+
+        $out = array();
+        foreach ($maker_skus as $mid => $set) {
+            // Loop until stable — ancestor additions may enable grandparent coverage
+            $stable = false;
+            while (!$stable) {
+                $stable = true;
+                foreach ($all_parents as $p_u) {
+                    if (isset($set[$p_u])) continue;
+                    if (function_exists('b2f_autosync_is_blacklisted')
+                        && b2f_autosync_is_blacklisted($mid, $p_u)) continue;
+                    if ($is_covered($p_u, $set)) {
+                        $out[] = array('maker_id' => $mid, 'sku' => $p_u);
+                        $set[$p_u] = true;
+                        $stable = false;
+                    }
+                }
+            }
+        }
+        return $out;
+    }
+}
+
 
 // ── End of [B2F] Snippet 1 ──────────────────────────────────
