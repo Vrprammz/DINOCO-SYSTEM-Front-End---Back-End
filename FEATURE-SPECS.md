@@ -3523,12 +3523,15 @@ STEP 7: Enqueue replay queued dual-writes
 ```
 b2f_flag_v11_explicit_mode   — backend returns production_mode in API (default OFF)
 b2f_flag_order_intent        — LIFF UI + order_mode validator (requires v11)
-b2f_flag_ungroup_auto_hide   — migration missing_leaves → as_parts auto (requires Phase 4 finished_at)
+
+# V.3.8 (Phase 1 audit BUG-H8, 2026-04-17): removed orphan flag b2f_flag_ungroup_auto_hide.
+# It was declared + UI-toggleable + dependency-checked, but never consumed by any business
+# logic. Auto-hide behavior is handled by `admin_display_mode='as_parts'` column set
+# directly by Phase 4 migration when missing_leaves > 0 — no runtime flag needed.
 ```
 
-**Dependency chain enforced** ใน flag setter (Audit V.3.3):
+**Dependency chain enforced** ใน flag setter (Audit V.3.3, updated V.3.8):
 - `order_intent=ON` requires `v11_explicit_mode=ON`
-- `ungroup_auto_hide=ON` requires `b2f_phase4_migration_state.finished_at`
 - `v11_explicit_mode=OFF` requires `order_intent=OFF` (downstream safety)
 
 **Rollback**: `update_option(flag, false)` → instant revert ไม่ต้อง re-deploy

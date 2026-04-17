@@ -583,8 +583,11 @@ Maker does NOT see: intent_notes (admin-only per PII gate)
 b2f_flag_v11_explicit_mode   — enable first (backend returns new fields)
   ↓
 b2f_flag_order_intent        — LIFF UI + validator (requires v11)
-  ↓
-b2f_flag_ungroup_auto_hide   — migration as_parts auto (requires Phase 4 finished_at)
+
+# V.3.8 (Phase 1 audit BUG-H8): `b2f_flag_ungroup_auto_hide` removed.
+# Declared + UI-toggleable + dependency-checked but never consumed by business logic.
+# Auto-hide is driven by `admin_display_mode='as_parts'` column set by Phase 4 migration
+# when `missing_leaves>0` — not by a runtime flag.
 ```
 
 **Rollback**: `update_option(flag, false)` → instant revert ไม่ต้อง re-deploy
