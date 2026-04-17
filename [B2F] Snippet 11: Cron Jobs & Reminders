@@ -1,6 +1,15 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 11: Cron Jobs & Reminders                    ║
+ * ║  Version: V.2.3 — Phase 2 audit DB-H7 + DB-H8:                                ║
+ * ║    (DB-H7) `b2f_run_diff_detection` now gated on                              ║
+ * ║    `b2f_flag_shadow_write`. When Phase 3 cut-over is live                     ║
+ * ║    + shadow_write disabled, cron early-exits — avoids ~3K                     ║
+ * ║    ACF reads/hr on Phase 3+ systems where CPT ≈ junction.                     ║
+ * ║    (DB-H8) `b2f_run_observations_ttl` chunks DELETE — 1000                    ║
+ * ║    rows/iter + 50ms gap × 20 max iterations (mirror Snippet                   ║
+ * ║    16 attempt-log cleanup pattern). Prevents table lock minutes                ║
+ * ║    when observations > 110K rows (60-day TTL peak).                           ║
  * ║  Version: V.2.2 — Phase 2: diff cron (hourly) + TTL cleanup (daily) + drift aggregator ║
  * ║  Previous: V.2.1 — Rejected PO escalation after 7 days                        ║
  * ║  DB_ID: 1171                                                 ║
@@ -608,6 +617,15 @@ if ( ! function_exists( 'b2f_run_diff_detection' ) ) {
         global $wpdb;
         if ( ! get_option( 'b2f_schema_v10_activated' ) ) return;
 
+        // V.2.3 DB-H7 FIX: gate on shadow_write flag. When Phase 3 cut-over is active and
+        // shadow_write is disabled, junction is the source of truth and CPT is frozen (or
+        // being retired) — running this hourly diff is wasted work (~500 rows × 6 ACF
+        // reads/hr ≈ 3K uncached reads/hr) and produces noise observations. Only useful
+        // while dual-write is live.
+        if ( ! function_exists( 'b2f_is_flag_enabled' ) || ! b2f_is_flag_enabled( 'b2f_flag_shadow_write' ) ) {
+            return;
+        }
+
         $tbl_jn = $wpdb->prefix . 'dinoco_product_makers';
         $tbl_ob = $wpdb->prefix . 'dinoco_maker_product_observations';
 
@@ -742,12 +760,37 @@ if ( ! function_exists( 'b2f_run_observations_ttl' ) ) {
         global $wpdb;
         if ( ! get_option( 'b2f_schema_v10_activated' ) ) return;
         $tbl_ob = $wpdb->prefix . 'dinoco_maker_product_observations';
-        $deleted = $wpdb->query(
-            "DELETE FROM {$tbl_ob}
-             WHERE observed_at < DATE_SUB(NOW(), INTERVAL 60 DAY)"
-        );
+
+        // V.2.3 DB-H8 FIX: chunked DELETE (mirror Snippet 16 attempt-log cleanup pattern).
+        // Observations can peak ~110K rows (60-day TTL × diff cron hourly × 500 junction rows
+        // × up to 6 fields). A bulk DELETE holds a table-level write lock minutes on that
+        // volume → blocks Phase 3 reads + concurrent diff-cron inserts. Chunk 1000 rows/iter
+        // + 50ms cooperation gap + hard cap 20 iterations/run (≤20K rows purged per day —
+        // steady-state is only ~1.8K rows/day from diff cron, so cap is comfortable).
+        // Cutoff computed in PHP to use GMT consistently (DATE_SUB(NOW(), ...) depends on
+        // server TZ which is unreliable; current_time('mysql', true) = UTC).
+        $cutoff     = date( 'Y-m-d H:i:s', time() - ( 60 * DAY_IN_SECONDS ) );
+        $total_del  = 0;
+        $max_iter   = 20;
+        $chunk_size = 1000;
+
+        for ( $i = 0; $i < $max_iter; $i++ ) {
+            $affected = $wpdb->query( $wpdb->prepare(
+                "DELETE FROM {$tbl_ob}
+                 WHERE observed_at < %s
+                 ORDER BY observed_at ASC
+                 LIMIT %d",
+                $cutoff, $chunk_size
+            ) );
+            if ( $affected === false || $affected < 1 ) break;
+            $total_del += intval( $affected );
+            // 50ms cooperative gap — let concurrent inserts proceed, avoid lock escalation.
+            usleep( 50000 );
+        }
+
         if ( function_exists( 'b2f_log' ) ) {
-            b2f_log( sprintf( '[TTL] Purged %d observation rows older than 60 days', intval( $deleted ) ) );
+            b2f_log( sprintf( '[TTL V.2.3] Purged %d observation rows older than 60 days (cutoff=%s, chunks=%d)',
+                $total_del, $cutoff, min( $i, $max_iter ) ) );
         }
     }
 }
