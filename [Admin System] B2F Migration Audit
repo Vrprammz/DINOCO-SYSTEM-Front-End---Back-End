@@ -1,5 +1,13 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.6 — `POST /purge-stale-prices` utility endpoint. User reported LIFF showing
+ *   DNCSETNX500X001 = ฿666 — stale bug value migrated from ACF era via Phase 2 backfill.
+ *   Design intent post-Phase-3: `unit_cost` = ราคาที่ admin ตั้งใน Makers tab (junction is
+ *   source of truth, `b2f_flag_read_from_junction=ON` skips compute fallback). Endpoint
+ *   zeros-out `unit_cost = <sentinel>` (default 666) in junction → admin must re-enter
+ *   correct price via Makers tab. Guards: manage_options, rate limit 3/hr, confirm OR
+ *   dry_run required. Response includes affected rows preview (id/sku/maker_id/old_cost).
+ *   Fires `b2f_junction_updated` per affected maker → cache invalidation.
  * Version: V.3.5 — CHECK constraint chk_confirmed_consistency fix (MariaDB 10.6.20 enforces):
  *   When classification decides `confirmation_status='confirmed'` (legacy_cpt_id > 0 rows),
  *   CHECK constraint requires confirmed_by AND confirmed_at NOT NULL. Previous migration UPDATE
@@ -95,7 +103,7 @@ if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
 // SECTION 0: CONSTANTS + ALLOWED FLAG LIST
 // ═══════════════════════════════════════════════════════════════════
 
-if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.5' );
+if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.6' );
 if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
 
 /**
@@ -3189,6 +3197,99 @@ add_action( 'rest_api_init', function () {
                 'confirmed_count' => $confirmed_count,
                 'already_confirmed' => $already,
                 'skipped'         => $skipped,
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // V.3.6: POST /purge-stale-prices
+    //   User reported bug: LIFF แสดง DNCSETNX500X001 = ฿666 — stale bug value
+    //   migrated from ACF era via Phase 2 backfill. Design intent: unit_cost = ราคาที่
+    //   admin ตั้งใน Makers tab. Utility to zero-out junction.unit_cost = <sentinel>
+    //   so admin MUST re-enter correct price via Makers tab (Snippet 5).
+    //   Body: { sentinel_value (default 666), confirm, dry_run }
+    //   Response: { updated_count, affected_rows[{id,sku,maker_id,old_cost}] }
+    //   Guards: confirm=true required for live; rate limit 3/hr (destructive)
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/purge-stale-prices', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) {
+            global $wpdb;
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $chk = b2b_rate_limit( 'b2f_audit_purge_prices_' . $uid, 3, HOUR_IN_SECONDS );
+                if ( is_wp_error( $chk ) ) return $chk;
+            }
+
+            $confirm  = filter_var( $req->get_param( 'confirm' ), FILTER_VALIDATE_BOOLEAN );
+            $dry_run  = filter_var( $req->get_param( 'dry_run' ), FILTER_VALIDATE_BOOLEAN );
+            $sentinel = floatval( $req->get_param( 'sentinel_value' ) );
+            if ( $sentinel <= 0 ) $sentinel = 666;
+
+            if ( ! $confirm && ! $dry_run ) {
+                return new WP_Error( 'confirm_required', 'confirm=true or dry_run=1 required', array( 'status' => 400 ) );
+            }
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                return new WP_Error( 'table_missing', 'junction table ยังไม่ถูกสร้าง', array( 'status' => 404 ) );
+            }
+
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+
+            // Preview affected rows (always run — even for live, so caller sees what changed)
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, product_sku, maker_id, unit_cost
+                 FROM {$tbl}
+                 WHERE unit_cost = %f AND deleted_at IS NULL
+                 ORDER BY maker_id ASC, product_sku ASC",
+                $sentinel
+            ), ARRAY_A );
+            if ( ! is_array( $rows ) ) $rows = array();
+
+            $affected = array();
+            foreach ( $rows as $r ) {
+                $affected[] = array(
+                    'id'       => intval( $r['id'] ),
+                    'sku'      => (string) $r['product_sku'],
+                    'maker_id' => intval( $r['maker_id'] ),
+                    'old_cost' => floatval( $r['unit_cost'] ),
+                );
+            }
+
+            $updated = 0;
+            if ( ! $dry_run && ! empty( $rows ) ) {
+                $uid_update = get_current_user_id();
+                $now        = current_time( 'mysql' );
+                $ok = $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tbl}
+                     SET unit_cost = 0,
+                         updated_by = %d,
+                         updated_at = %s
+                     WHERE unit_cost = %f AND deleted_at IS NULL",
+                    $uid_update, $now, $sentinel
+                ) );
+                $updated = ( $ok !== false ) ? intval( $ok ) : 0;
+
+                // Fire cache invalidation (affected makers)
+                $maker_ids = array_unique( array_map( function( $a ) { return $a['maker_id']; }, $affected ) );
+                foreach ( $maker_ids as $mid ) {
+                    do_action( 'b2f_junction_updated', $mid );
+                }
+            }
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'message' => $dry_run
+                    ? sprintf( 'preview: %d row(s) would have unit_cost=%.2f cleared to 0', count( $affected ), $sentinel )
+                    : sprintf( 'cleared %d row(s) with unit_cost=%.2f → admin must re-enter via Makers tab', $updated, $sentinel ),
+                'data'    => array(
+                    'sentinel_value'  => $sentinel,
+                    'dry_run'         => $dry_run,
+                    'updated_count'   => $updated,
+                    'preview_count'   => count( $affected ),
+                    'affected_rows'   => $affected,
+                ),
             ) );
         },
     ) );
