@@ -1,5 +1,18 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.4 — Phase 4 migration bug fixes (reported via dry-run 0-rows + HTTP 200 X UI):
+ *   (1) Schema ALTER now runs in BOTH dry-run + live (ALTER is additive + INFORMATION_SCHEMA-guarded,
+ *       so idempotent. Previously dry-run skipped ALTER, then SELECT referenced V.11 columns that
+ *       didn't exist yet → $wpdb->get_results silently returned empty → total_rows=0.)
+ *   (2) SELECT now checks $wpdb->last_error and surfaces it as a state error + early return
+ *       (was silently returning 0 rows with no error logged).
+ *   (3) REST response now includes top-level `message` field summarizing error count +
+ *       first 3 errors (frontend was falling back to "HTTP 200" when success=false but no
+ *       top-level message existed).
+ *   (4) REST response now includes `total_rows` (previously only `rows_updated`) so UI can
+ *       distinguish "scanned 0 rows" (schema issue) from "scanned 116 but updated 0" (all preserved).
+ *   (5) Frontend error branch now renders errors[] + schema_alter + mysql_check in result panel
+ *       (was hiding the details when success=false).
  * Version: V.3.3 — V.7.0 Phase 4 Classification Migration (behavior change):
  *   (A) Extend flag whitelist + toggleable list for 3 V.7.0 flags
  *       (`b2f_flag_v11_explicit_mode`, `b2f_flag_order_intent`, `b2f_flag_ungroup_auto_hide`).
@@ -76,7 +89,7 @@ if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
 // SECTION 0: CONSTANTS + ALLOWED FLAG LIST
 // ═══════════════════════════════════════════════════════════════════
 
-if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.3' );
+if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.4' );
 if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
 
 /**
@@ -1067,21 +1080,19 @@ if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
                 }
             }
 
-            // STEP 3 — Idempotent ALTER (skipped in dry-run — it's a mutation)
-            if ( ! $dry_run ) {
-                if ( ! b2f_audit_junction_table_exists() ) {
-                    $state['errors'][] = 'junction table missing — run Activate Schema (Phase 2) first';
-                    $state['finished_at'] = current_time( 'mysql' );
-                    $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
-                    return $state;
-                }
-                $state['schema_alter'] = b2f_phase4_activate_schema_v11();
-                if ( ! empty( $state['schema_alter']['errors'] ) ) {
-                    foreach ( $state['schema_alter']['errors'] as $se ) $state['errors'][] = $se;
-                    // Continue — columns likely already present
-                }
-            } else {
-                $state['schema_alter'] = array( 'note' => 'dry_run — ALTER skipped' );
+            // STEP 3 — Idempotent ALTER (runs ALWAYS, even in dry-run — ALTER is additive
+            // + INFORMATION_SCHEMA-guarded, so it's safe and makes dry-run's SELECT work
+            // without errors. Dry-run still skips row UPDATEs; only schema is made consistent.)
+            if ( ! b2f_audit_junction_table_exists() ) {
+                $state['errors'][] = 'junction table missing — run Activate Schema (Phase 2) first';
+                $state['finished_at'] = current_time( 'mysql' );
+                $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
+                return $state;
+            }
+            $state['schema_alter'] = b2f_phase4_activate_schema_v11();
+            if ( ! empty( $state['schema_alter']['errors'] ) ) {
+                foreach ( $state['schema_alter']['errors'] as $se ) $state['errors'][] = 'schema_alter: ' . $se;
+                // Continue — columns likely already present; SELECT will fail below if truly broken
             }
 
             // STEP 4 — Classification loop
@@ -1095,6 +1106,8 @@ if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
             }
 
             // Fetch all active junction rows (deleted_at IS NULL)
+            // V.3.4 FIX: detect silent SELECT failure (missing V11 columns) + surface last_error
+            $wpdb->last_error = '';
             $rows = $wpdb->get_results(
                 "SELECT id, product_sku, maker_id, confirmation_status, confirmed_at, admin_display_mode, production_mode, legacy_cpt_id
                  FROM {$tbl}
@@ -1102,6 +1115,13 @@ if ( ! function_exists( 'b2f_phase4_run_classification_migration' ) ) {
                  ORDER BY maker_id ASC, id ASC",
                 ARRAY_A
             );
+            if ( ! empty( $wpdb->last_error ) ) {
+                $state['errors'][] = 'SELECT junction failed: ' . $wpdb->last_error;
+                $state['finished_at'] = current_time( 'mysql' );
+                $state['elapsed_ms']  = round( ( microtime( true ) - $started ) * 1000, 1 );
+                if ( ! $dry_run ) delete_option( 'b2f_phase4_migration_in_progress' );
+                return $state;
+            }
             if ( ! is_array( $rows ) ) $rows = array();
             $state['total_rows'] = count( $rows );
 
@@ -3200,11 +3220,20 @@ add_action( 'rest_api_init', function () {
                 $csv_url = content_url( $rel );
             }
 
+            $has_errors = ! empty( $state['errors'] );
+            $msg = $has_errors
+                ? ( 'migration reported ' . count( $state['errors'] ) . ' error(s): ' . implode( ' | ', array_slice( (array) $state['errors'], 0, 3 ) ) )
+                : ( $state['dry_run']
+                    ? 'dry-run complete'
+                    : 'migration complete' );
+
             return rest_ensure_response( array(
-                'success' => empty( $state['errors'] ),
+                'success' => ! $has_errors,
+                'message' => $msg,
                 'data'    => array(
                     'ran_at'                  => $state['started_at'] ?? current_time( 'mysql' ),
                     'finished_at'             => $state['finished_at'] ?? null,
+                    'total_rows'              => intval( $state['total_rows'] ?? 0 ),
                     'rows_updated'            => intval( $state['processed'] ?? 0 ),
                     'rows_skipped_confirmed'  => intval( $state['confirmed_preserved'] ?? 0 ),
                     'classified_set_assembled'=> intval( $state['classified_set_assembled'] ?? 0 ),
@@ -4321,6 +4350,19 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                         var msg = (r.json && r.json.message) ? r.json.message : ('HTTP ' + r.status);
                         setStatus('[data-target="' + resKey + '-status"]', '❌ ' + msg +
                                   (code === 'not_implemented' ? ' (Audit V.3.3 ยังไม่ sync)' : ''), true);
+                        // V.3.4 FIX: surface error details + partial summary in result panel
+                        var d = (r.json && r.json.data) || {};
+                        var errs = d.errors || [];
+                        if (errs.length || d.schema_alter) {
+                            resultEl.classList.add('shown');
+                            resultEl.innerHTML =
+                                '<div><strong>❌ Details:</strong></div>' +
+                                (d.total_rows !== undefined ? '<div>total_rows scanned: ' + d.total_rows + '</div>' : '') +
+                                (d.rows_updated !== undefined ? '<div>rows_updated: ' + d.rows_updated + '</div>' : '') +
+                                (errs.length ? '<div><strong>errors[' + errs.length + ']:</strong></div><pre>' + esc(JSON.stringify(errs, null, 2)) + '</pre>' : '') +
+                                (d.schema_alter ? '<div><strong>schema_alter:</strong></div><pre>' + esc(JSON.stringify(d.schema_alter, null, 2)) + '</pre>' : '') +
+                                (d.mysql_check ? '<div><strong>mysql_check:</strong></div><pre>' + esc(JSON.stringify(d.mysql_check, null, 2)) + '</pre>' : '');
+                        }
                     }
                 });
             }
