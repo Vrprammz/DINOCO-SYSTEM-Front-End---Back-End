@@ -1,5 +1,22 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.7 — Phase 3 Group I remaining code fixes:
+ *   (DB-H1) `b2f_rest_receive_goods` po_cost_map SKU key was raw case-dependent. Build
+ *     uses `strtoupper(trim($poi_sku))`; lookup also normalizes. Fixes unit_cost_thb NULL
+ *     (WAC silent miss) when rcv_items $sku case differs from po_items $poi_sku.
+ *   (BUG-H5) `b2f_rest_po_undo_submit` now returns `post_date_gmt` (UTC ISO-8601) plus
+ *     `_tz_hint: 'UTC'` instead of non-GMT `post_date`. SELECT column switched to
+ *     `post_date_gmt`. Defensive fallback to `current_time('mysql', true)` if row value
+ *     is `0000-00-00 00:00:00` (shouldn't happen for b2f_order publish).
+ *   (DB-M1) `b2f_format_maker_product` accepts 4th optional `$maker_currency` param.
+ *     `b2f_rest_list_maker_products` primes once before the product loop — avoids N×
+ *     `get_field('maker_currency', $maker_id)` per product on maker-products response.
+ *   (M-16) `b2f_rest_save_maker` name uniqueness switched from WP_Query meta_query
+ *     (postmeta scan) to direct indexed SELECT on $wpdb->posts.post_title (since name is
+ *     written as post_title on create/update).
+ *   Paired: Snippet 16 V.1.11 (DB-H4 batch product lookup + BUG-H11 doc + BUG-M1/M5/M7),
+ *   Snippet 5 V.7.6 (UX-H19 confirm-pill mobile tap target),
+ *   LIFF AI Snippet 2 V.3.5 (UX-H12 try/catch on lead accept + note).
  * Version: V.11.6 — Phase 3 Group F perf + bug fixes:
  *   (PERF-H2) `/dashboard-stats` — 12 COUNT queries + N×2 per-maker loop collapsed
  *     to 2 GROUP BY queries + 1 transient (`b2f_dashboard_stats_cache`, 120s TTL).
@@ -888,18 +905,25 @@ if ( ! function_exists( 'b2f_rest_save_maker' ) ) {
         }
 
         // Check name uniqueness
-        $name_check = new WP_Query( array(
-            'post_type'      => 'b2f_maker',
-            'posts_per_page' => 1,
-            'fields'         => 'ids',
-            'post_status'    => 'publish',
-            'post__not_in'   => $id ? array( $id ) : array(),
-            'meta_query'     => array( array(
-                'key'   => 'maker_name',
-                'value' => $name,
-            ) ),
+        // V.11.7 M-16: avoid WP_Query meta_query (full postmeta scan). Since we store $name
+        //   as `post_title` when creating/updating the maker CPT, direct indexed SELECT on
+        //   $wpdb->posts.post_title is cheaper (idx uses posts table title column directly,
+        //   or at worst file-sort on 100s of rows vs postmeta JOIN on 1000s of meta rows).
+        //   Uses $wpdb->prepare (avoids deprecated get_page_by_title in WP 6.2+).
+        global $wpdb;
+        $dup_id = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT ID FROM {$wpdb->posts}
+              WHERE post_type = %s
+                AND post_status = %s
+                AND post_title = %s
+                AND ID != %d
+              LIMIT 1",
+            'b2f_maker',
+            'publish',
+            $name,
+            (int) $id
         ) );
-        if ( $name_check->found_posts > 0 ) {
+        if ( $dup_id > 0 ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ชื่อโรงงานนี้มีอยู่แล้ว', 'code' => 'DUPLICATE_NAME' ), 400 );
         }
 
@@ -1156,13 +1180,18 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
         $flag_junction = function_exists( 'b2f_is_flag_enabled' )
             && b2f_is_flag_enabled( 'b2f_flag_read_from_junction' );
 
+        // V.11.7 DB-M1: prime maker_currency ONCE outside product loop.
+        //   Legacy per-product get_field('maker_currency', $maker_id) = N× ACF cache hits for
+        //   identical data. Fetch once, pass as param (new 4th arg on b2f_format_maker_product).
+        $primed_currency = (string) ( get_field( 'maker_currency', $maker_id ) ?: 'THB' );
+
         $products = array();
 
         if ( $flag_junction ) {
             // ═══ Phase 3: read from junction table ═══
             $rows = b2f_list_maker_products_junction( $maker_id );
             foreach ( $rows as $row ) {
-                $products[] = b2f_format_maker_product( 0, $hierarchy_ctx, $row );
+                $products[] = b2f_format_maker_product( 0, $hierarchy_ctx, $row, $primed_currency );
             }
         } else {
             // ═══ Legacy: read from CPT (V.9.x behavior) ═══
@@ -1179,7 +1208,7 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
                 'order'          => 'ASC',
             ) );
             foreach ( $q->posts as $p ) {
-                $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx );
+                $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx, null, $primed_currency );
             }
         }
 
@@ -1601,10 +1630,13 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
      *         junction row instead of ACF/CPT. $mp_id may be 0 in that case
      *         (falls back to legacy_cpt_id for ACF-only fields: mp_product_name,
      *         mp_lead_land, mp_lead_sea, mp_last_order_date).
+     * V.11.7 DB-M1: Accept optional $maker_currency (string) — when caller primes once
+     *         outside the product loop, avoids N× get_field('maker_currency', $maker_id)
+     *         per product. Falls back to per-product get_field() if null (backward compat).
      * Fix: ui_role_override ใช้สำหรับ display badge เท่านั้น — ห้ามเปลี่ยน grouping fields
      * Fix: is_leaf ใช้ !$is_parent_node (accurate) แทน !$is_set
      */
-    function b2f_format_maker_product( $mp_id, $hierarchy_ctx = null, $junction_row = null ) {
+    function b2f_format_maker_product( $mp_id, $hierarchy_ctx = null, $junction_row = null, $maker_currency = null ) {
         // V.10.0: resolve data source — junction row > ACF/CPT
         $has_junction = is_array( $junction_row ) && ! empty( $junction_row );
         if ( $has_junction ) {
@@ -1751,7 +1783,11 @@ if ( ! function_exists( 'b2f_format_maker_product' ) ) {
             $maker_id_out      = intval( get_field( 'mp_maker_id', $mp_id ) ?: 0 );
             $out_id            = $mp_id;
         }
-        $maker_currency = get_field( 'maker_currency', $maker_id_out ) ?: 'THB';
+        // V.11.7 DB-M1: use primed currency if caller provided (avoid per-product get_field).
+        //   Null → fallback to per-call lookup (backward compat for legacy callers).
+        if ( $maker_currency === null || $maker_currency === '' ) {
+            $maker_currency = get_field( 'maker_currency', $maker_id_out ) ?: 'THB';
+        }
 
         $out = array(
             'id'              => $out_id,
@@ -3490,10 +3526,15 @@ if ( ! function_exists( 'b2f_rest_po_undo_submit' ) ) {
         $wpdb->query( 'START TRANSACTION' );
 
         try {
-            // FOR UPDATE lock on posts row + fetch post_date for DB clock window check
+            // FOR UPDATE lock on posts row + fetch post_date_gmt for DB clock window check
             // Single SQL reads: post_type validation + DB-clock age check + row lock
+            // V.11.7 BUG-H5: SELECT post_date_gmt (UTC) instead of post_date (non-GMT)
+            //   post_date = WP server-local TZ (may be Asia/Bangkok or whatever admin set) →
+            //   exposing it in error response caused TZ confusion ("30-second window" feels wrong
+            //   when client-side JS compares against UTC clock). post_date_gmt is ISO-8601 UTC,
+            //   pairs cleanly with the DB-clock check (UTC_TIMESTAMP()) + `_tz_hint: 'UTC'` flag.
             $row = $wpdb->get_row( $wpdb->prepare(
-                "SELECT ID, post_type, post_date,
+                "SELECT ID, post_type, post_date_gmt,
                         ( post_date_gmt > ( UTC_TIMESTAMP() - INTERVAL 30 SECOND ) ) AS within_window
                    FROM {$wpdb->posts}
                   WHERE ID = %d
@@ -3535,14 +3576,23 @@ if ( ! function_exists( 'b2f_rest_po_undo_submit' ) ) {
             }
 
             // Time window check (DB clock — server time authoritative)
+            // V.11.7 BUG-H5: expose post_date_gmt (UTC ISO-8601) + _tz_hint instead of non-GMT post_date.
+            //   post_date_gmt is guaranteed populated by wp_insert_post() for b2f_order CPT
+            //   (WP core inserts GMT timestamp when post_status in [publish, private, future]).
+            //   Fallback: if somehow NULL (shouldn't happen for b2f_order), emit current_time UTC
+            //   to keep client parser happy rather than exposing null.
             if ( ! (int) $row->within_window ) {
                 $wpdb->query( 'ROLLBACK' );
                 $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
+                $post_date_gmt = ! empty( $row->post_date_gmt ) && $row->post_date_gmt !== '0000-00-00 00:00:00'
+                    ? $row->post_date_gmt
+                    : current_time( 'mysql', true );
                 return new WP_REST_Response( array(
-                    'success' => false,
-                    'error'   => 'เลยเวลายกเลิกแล้ว (ภายใน 30 วินาทีเท่านั้น)',
-                    'code'    => defined( 'B2F_ERR_UNDO_WINDOW_EXPIRED' ) ? B2F_ERR_UNDO_WINDOW_EXPIRED : 'undo_window_expired',
-                    'post_date' => $row->post_date,
+                    'success'       => false,
+                    'error'         => 'เลยเวลายกเลิกแล้ว (ภายใน 30 วินาทีเท่านั้น)',
+                    'code'          => defined( 'B2F_ERR_UNDO_WINDOW_EXPIRED' ) ? B2F_ERR_UNDO_WINDOW_EXPIRED : 'undo_window_expired',
+                    'post_date_gmt' => $post_date_gmt,
+                    '_tz_hint'      => 'UTC',
                 ), 410 );
             }
 
@@ -4618,6 +4668,11 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
         // Why: FSM `received → delivering` is illegal (Snippet 6 FSM table) → rollback transition
         //      would silently fail, leaving PO in `received` with no stock rows.
         // ดึง unit_cost จาก PO items + exchange_rate สำหรับ Valuation
+        // V.11.7 DB-H1 FIX: SKU key case-insensitive — build + lookup ทั้งคู่ใช้ strtoupper(trim())
+        //   ทั้ง rcv_items ($sku) และ po_items ($poi_sku) เก็บมาจากหลาย source (LIFF, admin form,
+        //   legacy PO) → case อาจต่างกัน → isset($po_cost_map[$sku]) miss → unit_cost_thb NULL →
+        //   dinoco_stock_add() skip valuation write → WAC silent drift เมื่อ PO ต่าง case ชนกัน.
+        //   Both maps/keys now uppercase-normalized (matches utf8mb4_bin + DINOCO_Catalog convention).
         $po_items_raw = get_field( 'po_items', $po_id ) ?: [];
         $po_exchange  = floatval( get_field( 'po_exchange_rate', $po_id ) ?: 1 );
         $po_cost_map  = [];
@@ -4626,7 +4681,7 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
                 $poi_sku  = $poi['poi_sku'] ?? ($poi['sku'] ?? '');
                 $poi_cost = floatval( $poi['poi_unit_cost'] ?? ($poi['unit_cost'] ?? 0) );
                 if ( $poi_sku && $poi_cost > 0 ) {
-                    $po_cost_map[ $poi_sku ] = $poi_cost * $po_exchange; // THB
+                    $po_cost_map[ strtoupper( trim( $poi_sku ) ) ] = $poi_cost * $po_exchange; // THB
                 }
             }
         }
@@ -4641,7 +4696,9 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             $qty = intval( $ri['rcvi_qty_received'] ?? 0 );
             if ( ! $sku || $qty <= 0 ) continue;
 
-            $unit_cost_thb = isset( $po_cost_map[ $sku ] ) ? $po_cost_map[ $sku ] : null;
+            // V.11.7 DB-H1: lookup also uppercase-normalized (paired with build above)
+            $sku_cost_key  = strtoupper( trim( $sku ) );
+            $unit_cost_thb = isset( $po_cost_map[ $sku_cost_key ] ) ? $po_cost_map[ $sku_cost_key ] : null;
 
             if ( function_exists( 'dinoco_stock_add' ) ) {
                 $stock_result = dinoco_stock_add( $sku, $qty, 'b2f_receive', 'b2f_receiving', $rcv_id, 'B2F receive PO ' . ( get_field( 'po_number', $po_id ) ?: $po_id ), '', null, $unit_cost_thb );
