@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.7.7 — Phase 3+ audit PERF-M7 + PERF-M12:                                              ║
+ * ║                   M7: rest_post_dispatch filter adds `Cache-Control: private, no-store` on        ║
+ * ║                       private REST namespaces (b2b, b2f, liff-ai, dinoco-stock, dinoco-b2f-audit) ║
+ * ║                       — stops intermediaries caching per-user auth-gated payloads.                ║
+ * ║                   M12: DINOCO_Catalog::get_by_skus() now SARGable — dropped UPPER() wrapper,      ║
+ * ║                        normalizes inputs to UPPERCASE before binding (CI collation on sku col).   ║
  * ║  Version: V.7.6 — Phase 1 audit PERF-H1: static per-request memo in DINOCO_Catalog::get_by_sku() ║
  * ║                   — save 50-150ms on endpoints that format items 3x per product × N products.     ║
  * ║                   Invalidation caveat documented; flush_memo() is best-effort (static vars are    ║
@@ -387,26 +393,36 @@ class DINOCO_Catalog {
      * V.7.3: Batch lookup by SKUs — single SQL query (WHERE sku IN (...))
      * แก้ N+1 query pattern ใน callers เดิม (เช่น B2F Snippet 2 V.9.11 catalog_map)
      *
-     * @param array $skus Array of SKUs (mixed case okay — case-insensitive match via uppercase index)
+     * V.7.7 PERF-M12 FIX: SARGable sku lookup — removed UPPER(sku) wrapper so MySQL
+     *   can use UNIQUE idx_sku. Column uses default collation (utf8mb4_unicode_ci,
+     *   case-insensitive) so literal `sku IN (...)` matches regardless of case and
+     *   engine can seek the index. Inputs normalized to UPPERCASE defensively before
+     *   binding (SKUs are stored uppercase per convention — see Snippet 15:341 +
+     *   b2b_get_sku_data_map map keys).
+     *
+     * @param array $skus Array of SKUs (mixed case okay — normalized to UPPER before binding)
      * @return array Map: { UPPERCASE_SKU => row(ARRAY_A) } — missing SKUs absent from map
      */
     public static function get_by_skus( array $skus ) {
         global $wpdb;
         if ( empty( $skus ) ) return array();
 
-        // Sanitize + dedupe (case-insensitive uppercase normalization)
+        // Sanitize + dedupe + UPPERCASE normalize (SARGable — no UPPER() in SQL)
         $normalized = array();
         foreach ( $skus as $s ) {
             if ( ! is_string( $s ) ) continue;
             $s = trim( $s );
             if ( $s === '' ) continue;
-            $normalized[ strtoupper( $s ) ] = $s;
+            $up = strtoupper( $s );
+            $normalized[ $up ] = $up; // store uppercase as the value bound to %s
         }
         if ( empty( $normalized ) ) return array();
 
         $unique_skus = array_values( $normalized );
         $placeholders = implode( ',', array_fill( 0, count( $unique_skus ), '%s' ) );
-        $sql = "SELECT * FROM " . self::table() . " WHERE is_active = 1 AND UPPER(sku) IN ($placeholders)";
+        // V.7.7: `sku IN (...)` — column collation is CI by default → case-insensitive
+        // match while still able to use the UNIQUE idx_sku index (SARGable).
+        $sql = "SELECT * FROM " . self::table() . " WHERE is_active = 1 AND sku IN ($placeholders)";
         $rows = $wpdb->get_results( $wpdb->prepare( $sql, $unique_skus ), ARRAY_A );
 
         $map = array();
@@ -2808,4 +2824,50 @@ if (!function_exists('dinoco_get_ai_aliases')) {
     function dinoco_get_ai_aliases() {
         return class_exists('DINOCO_MotoDB') ? DINOCO_MotoDB::get_ai_aliases() : [];
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// V.7.7 PERF-M7: private Cache-Control on internal REST namespaces
+// ────────────────────────────────────────────────────────────────────
+// Private, auth-gated endpoints must NEVER be cached by intermediaries
+// (shared proxies, Cloudflare, CDN). Responses often contain per-distributor
+// pricing, PII, stock, debt, and session tokens — any cross-user cache
+// contamination = privacy/financial-data leak.
+//
+// Applied only to internal namespaces (WordPress core + public WP REST
+// untouched to preserve WP defaults):
+//   /wp-json/b2b/v1/          — B2B distributor (LIFF + admin)
+//   /wp-json/b2f/v1/          — B2F factory PO
+//   /wp-json/liff-ai/v1/      — LIFF AI lead/claim center
+//   /wp-json/dinoco-stock/v1/ — Inventory admin
+//   /wp-json/dinoco-b2f-audit/v1/ — Migration audit
+//
+// Header chosen: `private, no-store, max-age=0` + `Pragma: no-cache`
+//   - `no-store` = neither client nor intermediaries may store copy
+//   - `private`  = belt-and-suspenders for legacy CDNs honoring private-only
+//   - Pragma    = HTTP/1.0 back-compat
+// ════════════════════════════════════════════════════════════════════
+if ( ! function_exists( 'dinoco_rest_private_cache_control' ) ) {
+    function dinoco_rest_private_cache_control( $response, $server, $request ) {
+        if ( ! ( $response instanceof WP_REST_Response ) ) return $response;
+        $route = $request->get_route();
+        if ( ! is_string( $route ) || $route === '' ) return $response;
+        static $private_ns = array(
+            '/b2b/v1/',
+            '/b2f/v1/',
+            '/liff-ai/v1/',
+            '/dinoco-stock/v1/',
+            '/dinoco-b2f-audit/v1/',
+        );
+        foreach ( $private_ns as $ns ) {
+            if ( strpos( $route, $ns ) === 0 ) {
+                $response->header( 'Cache-Control', 'private, no-store, max-age=0' );
+                $response->header( 'Pragma', 'no-cache' );
+                break;
+            }
+        }
+        return $response;
+    }
+    // Priority 99 so it runs after any per-endpoint header writer (e.g. b2f_rest_api_version_header)
+    add_filter( 'rest_post_dispatch', 'dinoco_rest_private_cache_control', 99, 3 );
 }
