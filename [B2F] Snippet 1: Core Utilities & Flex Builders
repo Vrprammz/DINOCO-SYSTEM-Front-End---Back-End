@@ -1,5 +1,21 @@
 /**
  * [B2F] Snippet 1: Core Utilities & LINE Flex Builders
+ * Version: V.7.5 — Phase 3 Group F BUG-H7 FIX: enum mismatch normalization across
+ *   order_mode ↔ production_mode axes. Two helpers added:
+ *     (1) `b2f_normalize_production_mode($raw)` — maps either-axis string to
+ *         production_mode enum (`set_assembled|sub_unit|single|cross_factory_assembly`).
+ *         Accepts `full_set→set_assembled`, `single_leaf→single`, identity for 4
+ *         production values. Returns null on unknown → caller rejects.
+ *     (2) `b2f_normalize_order_mode($raw)` — maps either-axis string to order_mode
+ *         enum (`full_set|sub_unit|single_leaf`). Accepts `set_assembled→full_set`,
+ *         `cross_factory_assembly→full_set`, `single→single_leaf`. Returns null on unknown.
+ *   `b2f_junction_update_classification` now funnels `production_mode` param through the
+ *   normalize helper (so `single_leaf` from frontend no longer rejected with
+ *   `invalid_enum_value`). Legacy inference `b2f_infer_legacy_order_mode` now returns
+ *   only order_mode enum values (`raw_parts→single_leaf`, `partial_replenish→sub_unit`)
+ *   — `b2f_order_mode_label` still maps both legacy strings for display-only back-compat
+ *   but the function itself no longer emits those tokens. Paired with Snippet 2 V.11.6
+ *   (create-po accepts either axis) + Snippet 0.5 V.1.7 (3-level classification).
  * Version: V.7.4 — Phase 2 audit S2 FIX: `b2f_liff_url()` signs with `line_user_id`
  *   when available (and emits `_uid` query param) + full 64-char HMAC (was truncated to
  *   16 hex = 64-bit = halved safety margin). Paired with Snippet 2 V.11.5 `/auth-admin`
@@ -3585,6 +3601,65 @@ if (!defined('B2F_ERR_INVALID_ORDER_MODE')) {
 
 
 // ─────────────────────────────────────────────────────────────
+// V.7.5 BUG-H7 — Cross-axis mode normalization helpers
+// Two axes, 2 enums. Callers historically mixed them up.
+//   production_mode = { set_assembled | sub_unit | single | cross_factory_assembly }
+//                     (junction table column — "how maker makes it")
+//   order_mode      = { full_set | sub_unit | single_leaf }
+//                     (po_items row column — "what admin picked at order time")
+// Mapping table (the ONE source of truth, used by both normalizers below):
+//   full_set   ↔ set_assembled | cross_factory_assembly
+//   sub_unit   ↔ sub_unit
+//   single_leaf ↔ single
+// Legacy display tokens (pre-V.7.0 inference output) re-mapped too:
+//   raw_parts          → single_leaf  (pre-V.7.0 single-SKU with no parent)
+//   partial_replenish  → sub_unit     (pre-V.7.0 partial SET fulfillment)
+// Returns null on unknown string → caller must reject with 400.
+// ─────────────────────────────────────────────────────────────
+if (!function_exists('b2f_normalize_production_mode')) {
+    function b2f_normalize_production_mode($raw) {
+        $raw = trim((string) $raw);
+        if ($raw === '') return null;
+        $map = array(
+            // order_mode → production_mode
+            'full_set'               => 'set_assembled',
+            'sub_unit'               => 'sub_unit',
+            'single_leaf'            => 'single',
+            // production_mode identity
+            'set_assembled'          => 'set_assembled',
+            'single'                 => 'single',
+            'cross_factory_assembly' => 'cross_factory_assembly',
+            // Legacy inference tokens
+            'raw_parts'              => 'single',
+            'partial_replenish'      => 'sub_unit',
+        );
+        return isset($map[$raw]) ? $map[$raw] : null;
+    }
+}
+
+if (!function_exists('b2f_normalize_order_mode')) {
+    function b2f_normalize_order_mode($raw) {
+        $raw = trim((string) $raw);
+        if ($raw === '') return null;
+        $map = array(
+            // order_mode identity
+            'full_set'               => 'full_set',
+            'sub_unit'               => 'sub_unit',
+            'single_leaf'            => 'single_leaf',
+            // production_mode → order_mode (both full-set variants collapse to full_set)
+            'set_assembled'          => 'full_set',
+            'cross_factory_assembly' => 'full_set',
+            'single'                 => 'single_leaf',
+            // Legacy inference tokens
+            'raw_parts'              => 'single_leaf',
+            'partial_replenish'      => 'sub_unit',
+        );
+        return isset($map[$raw]) ? $map[$raw] : null;
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────
 // 100.1 — Read production_mode from junction table
 // Per-request static cache; reads wp_dinoco_product_makers.
 // Returns NULL if row missing, v11 flag off, or table not yet activated.
@@ -3635,7 +3710,18 @@ if (!function_exists('b2f_get_production_mode')) {
 // ─────────────────────────────────────────────────────────────
 // 100.2 — Infer legacy order_mode (display-only fallback)
 // For PO created before V.7.0 with no poi_order_mode sub-field.
-// NEVER writes DB. Returns best-guess string for UI label.
+// NEVER writes DB. Returns order_mode enum string for UI label.
+//
+// V.7.5 BUG-H7: always returns order_mode enum (full_set|sub_unit|single_leaf).
+//   Previous versions returned legacy display tokens (raw_parts|partial_replenish)
+//   that aren't in either order_mode or production_mode enum → callers that fed
+//   this back into validators got 400. Mapping is now:
+//     no parent + qty>=2     → single_leaf  (was: raw_parts)
+//     has parent + qty<leaves → sub_unit     (was: partial_replenish)
+//     otherwise              → full_set
+//   `b2f_order_mode_label` still recognises raw_parts / partial_replenish for
+//   back-compat with any stored legacy strings in postmeta, but new code paths
+//   only see order_mode enum values.
 // ─────────────────────────────────────────────────────────────
 if (!function_exists('b2f_infer_legacy_order_mode')) {
     function b2f_infer_legacy_order_mode($item) {
@@ -3644,19 +3730,19 @@ if (!function_exists('b2f_infer_legacy_order_mode')) {
         $parent_sku = trim((string) ($item['poi_parent_sku'] ?? ''));
         $qty        = (int) ($item['poi_qty_ordered'] ?? 0);
 
-        // No parent → legacy raw_parts (kept as label-only; V.7.0 calls this sub_unit)
+        // No parent + bulk qty → standalone leaf order (was: raw_parts)
         if ($parent_sku === '' && $qty >= 2) {
-            return 'raw_parts';
+            return 'single_leaf';
         }
 
-        // Has parent + qty lower than expected leaves → partial_replenish (legacy)
+        // Has parent + qty less than parent's leaves → sub-unit partial (was: partial_replenish)
         if ($parent_sku !== '' && $qty >= 1) {
-            // Best-effort: if the parent has >1 leaf and this row's qty < leaves_count → partial
+            // Best-effort: if the parent has >1 leaf and this row's qty < leaves_count → sub_unit
             if (function_exists('dinoco_get_leaf_skus')) {
                 $leaves = dinoco_get_leaf_skus($parent_sku);
                 $leaves_count = is_array($leaves) ? count($leaves) : 0;
                 if ($leaves_count > 1 && $qty < $leaves_count) {
-                    return 'partial_replenish';
+                    return 'sub_unit';
                 }
             }
             return 'full_set';
@@ -3744,12 +3830,18 @@ if (!function_exists('b2f_junction_update_classification')) {
         foreach ($fields as $k => $v) {
             switch ($k) {
                 case 'production_mode':
-                    if (!in_array($v, $enum_production_mode, true)) {
+                    // V.7.5 BUG-H7: normalize cross-axis input (full_set/single_leaf from
+                    // frontend deriveOrderMode) → production_mode enum. Legacy tokens
+                    // (raw_parts, partial_replenish) also accepted. Unknown → 400.
+                    $normalized = function_exists('b2f_normalize_production_mode')
+                        ? b2f_normalize_production_mode($v)
+                        : (in_array($v, $enum_production_mode, true) ? (string) $v : null);
+                    if ($normalized === null || !in_array($normalized, $enum_production_mode, true)) {
                         return new WP_Error('invalid_enum_value',
                             'production_mode invalid: ' . (string) $v,
                             array('status' => 400, 'field' => 'production_mode'));
                     }
-                    $set['production_mode'] = (string) $v;
+                    $set['production_mode'] = $normalized;
                     break;
                 case 'admin_display_mode':
                     if (!in_array($v, $enum_admin_display, true)) {
