@@ -1,0 +1,338 @@
+/**
+ * File: [Admin System] DINOCO Observability
+ * Version: V.1.0 — Sentry + correlation ID + structured logging scaffold
+ * DB_ID: (auto-assign after WP creates snippet)
+ * ใช้กับ: Code Snippets plugin → Execute Everywhere
+ *
+ * PURPOSE
+ * -------
+ * Additive observability scaffold. Zero behavior change until admin:
+ *   1) defines DINOCO_SENTRY_DSN in wp-config.php, AND
+ *   2) flips `dinoco_obs_*` wp_options to '1'.
+ *
+ * All existing logging paths (b2b_log / error_log / liff_ai_log) continue to
+ * work unchanged. This snippet only augments output — never replaces it.
+ *
+ * FEATURE FLAGS (wp_options — all default '0' = OFF)
+ *   dinoco_obs_sentry_enabled       — forward captured events to Sentry PHP SDK
+ *   dinoco_obs_correlation_enabled  — inject X-Request-ID header on all REST responses
+ *   dinoco_obs_structured_log       — emit JSON-formatted log lines alongside plain text
+ *
+ * CONSTANTS (define in wp-config.php)
+ *   DINOCO_SENTRY_DSN          — Sentry project DSN (required if flag ON)
+ *   DINOCO_SENTRY_ENV          — 'production' | 'staging' | 'dev' (default 'production')
+ *   DINOCO_SENTRY_SAMPLE_RATE  — float 0.0-1.0 (default 0.1 = 10%)
+ *
+ * PRODUCTION INSTALL (admin step-by-step)
+ *   a) composer require sentry/sentry (on server; requires vendor/autoload.php loaded)
+ *   b) wp-config.php: define('DINOCO_SENTRY_DSN', 'https://xxx@sentry.io/PROJECT_ID');
+ *   c) update_option('dinoco_obs_sentry_enabled', '1');
+ *   d) (optional) update_option('dinoco_obs_correlation_enabled', '1');
+ *   e) (optional) update_option('dinoco_obs_structured_log', '1');
+ *
+ * DEFENSIVE GUARANTEES
+ *   - If Sentry SDK class missing → skipped silently (one-time notice to error_log)
+ *   - If DSN constant missing   → skipped silently (one-time notice to error_log)
+ *   - If flag OFF                → all new code paths short-circuit at top
+ *   - No fatal errors if vendor/autoload.php never loaded
+ */
+
+if ( ! defined( 'ABSPATH' ) ) return;
+
+/* ========================================================================
+ * 1. FLAG + ENV HELPERS
+ * ====================================================================== */
+
+if ( ! function_exists( 'dinoco_obs_is_enabled' ) ) {
+    /**
+     * Check if an observability flag is active.
+     * Flag must be '1' in wp_options; returns false otherwise.
+     *
+     * @param string $flag_name One of 'sentry_enabled', 'correlation_enabled', 'structured_log'.
+     * @return bool
+     */
+    function dinoco_obs_is_enabled( $flag_name ) {
+        $allowed = array( 'sentry_enabled', 'correlation_enabled', 'structured_log' );
+        if ( ! in_array( $flag_name, $allowed, true ) ) return false;
+        $opt_key = 'dinoco_obs_' . $flag_name;
+        return get_option( $opt_key, '0' ) === '1';
+    }
+}
+
+if ( ! function_exists( 'dinoco_obs_get_config' ) ) {
+    /**
+     * Return Sentry config snapshot (DSN, env, sample rate) with sane defaults.
+     * Caller must check for empty DSN before using.
+     *
+     * @return array{dsn:string,env:string,sample_rate:float}
+     */
+    function dinoco_obs_get_config() {
+        return array(
+            'dsn'         => defined( 'DINOCO_SENTRY_DSN' ) ? (string) DINOCO_SENTRY_DSN : '',
+            'env'         => defined( 'DINOCO_SENTRY_ENV' ) ? (string) DINOCO_SENTRY_ENV : 'production',
+            'sample_rate' => defined( 'DINOCO_SENTRY_SAMPLE_RATE' ) ? (float) DINOCO_SENTRY_SAMPLE_RATE : 0.1,
+        );
+    }
+}
+
+/* ========================================================================
+ * 2. SENTRY LAZY INIT
+ * ====================================================================== */
+
+if ( ! function_exists( 'dinoco_obs_init_sentry' ) ) {
+    /**
+     * Lazy-initialize Sentry SDK once per request.
+     * Safe to call many times — uses a static guard.
+     * Skips silently if SDK unavailable, flag off, or DSN empty.
+     *
+     * @return bool true if Sentry is ready to capture, false otherwise.
+     */
+    function dinoco_obs_init_sentry() {
+        static $initialized = null;
+        if ( $initialized !== null ) return $initialized;
+
+        // Flag gate — zero cost if OFF.
+        if ( ! dinoco_obs_is_enabled( 'sentry_enabled' ) ) {
+            $initialized = false;
+            return false;
+        }
+
+        // SDK present? (Composer autoload normally exposes \Sentry\Client.)
+        if ( ! class_exists( '\\Sentry\\Client' ) || ! function_exists( '\\Sentry\\init' ) ) {
+            // One-time notice — avoid flooding error_log.
+            if ( ! get_transient( 'dinoco_obs_sdk_missing_logged' ) ) {
+                error_log( '[DINOCO_OBS] Sentry SDK not found — run `composer require sentry/sentry` on server. Skipping.' );
+                set_transient( 'dinoco_obs_sdk_missing_logged', 1, HOUR_IN_SECONDS );
+            }
+            $initialized = false;
+            return false;
+        }
+
+        $cfg = dinoco_obs_get_config();
+        if ( empty( $cfg['dsn'] ) ) {
+            if ( ! get_transient( 'dinoco_obs_dsn_missing_logged' ) ) {
+                error_log( '[DINOCO_OBS] DINOCO_SENTRY_DSN constant not defined — cannot initialize Sentry.' );
+                set_transient( 'dinoco_obs_dsn_missing_logged', 1, HOUR_IN_SECONDS );
+            }
+            $initialized = false;
+            return false;
+        }
+
+        try {
+            \Sentry\init( array(
+                'dsn'                => $cfg['dsn'],
+                'environment'        => $cfg['env'],
+                'sample_rate'        => max( 0.0, min( 1.0, $cfg['sample_rate'] ) ),
+                'traces_sample_rate' => 0.0, // Disable performance tracing by default.
+            ) );
+
+            // Tag every event with the current correlation ID.
+            if ( function_exists( '\\Sentry\\configureScope' ) ) {
+                \Sentry\configureScope( function ( $scope ) {
+                    $rid = dinoco_obs_get_request_id();
+                    if ( $rid && method_exists( $scope, 'setTag' ) ) {
+                        $scope->setTag( 'request_id', $rid );
+                    }
+                } );
+            }
+
+            $initialized = true;
+            return true;
+        } catch ( \Throwable $e ) {
+            error_log( '[DINOCO_OBS] Sentry init failed: ' . $e->getMessage() );
+            $initialized = false;
+            return false;
+        }
+    }
+}
+
+/* ========================================================================
+ * 3. CORRELATION ID
+ * ====================================================================== */
+
+if ( ! function_exists( 'dinoco_obs_get_request_id' ) ) {
+    /**
+     * Return the per-request correlation ID.
+     * Priority: incoming X-Request-ID header → generated hex(8).
+     * Cached in $GLOBALS so every call in the same request agrees.
+     *
+     * @return string 16-char hex (or sanitized incoming header value, max 64 chars).
+     */
+    function dinoco_obs_get_request_id() {
+        if ( ! empty( $GLOBALS['_dinoco_req_id'] ) ) {
+            return (string) $GLOBALS['_dinoco_req_id'];
+        }
+
+        $incoming = '';
+        if ( isset( $_SERVER['HTTP_X_REQUEST_ID'] ) ) {
+            $incoming = (string) $_SERVER['HTTP_X_REQUEST_ID'];
+        }
+
+        if ( $incoming !== '' ) {
+            // Sanitize — hex/dash/underscore only, max 64 chars (prevent header injection).
+            $incoming = preg_replace( '/[^A-Za-z0-9_\-]/', '', $incoming );
+            $incoming = substr( $incoming, 0, 64 );
+        }
+
+        if ( $incoming === '' ) {
+            try {
+                $incoming = bin2hex( random_bytes( 8 ) );
+            } catch ( \Throwable $e ) {
+                // random_bytes can throw on very broken systems — fall back to mt_rand.
+                $incoming = substr( md5( uniqid( (string) mt_rand(), true ) ), 0, 16 );
+            }
+        }
+
+        $GLOBALS['_dinoco_req_id'] = $incoming;
+        return $incoming;
+    }
+}
+
+if ( ! function_exists( 'dinoco_obs_inject_request_id_header' ) ) {
+    /**
+     * Filter callback — attach X-Request-ID to outgoing REST responses.
+     * Registered on `rest_post_dispatch` when correlation flag is ON.
+     *
+     * @param WP_REST_Response|WP_HTTP_Response $response
+     * @param WP_REST_Server                   $server
+     * @param WP_REST_Request                  $request
+     * @return mixed untouched response (headers mutated in place)
+     */
+    function dinoco_obs_inject_request_id_header( $response, $server = null, $request = null ) {
+        if ( ! dinoco_obs_is_enabled( 'correlation_enabled' ) ) return $response;
+        if ( ! is_object( $response ) || ! method_exists( $response, 'header' ) ) return $response;
+
+        $rid = dinoco_obs_get_request_id();
+        if ( $rid ) {
+            try {
+                $response->header( 'X-Request-ID', $rid );
+            } catch ( \Throwable $e ) {
+                // Header set can fail mid-flush — swallow silently.
+            }
+        }
+        return $response;
+    }
+}
+
+// Register filter unconditionally — the callback itself flag-checks,
+// so a flag flip takes effect immediately without snippet re-deploy.
+add_filter( 'rest_post_dispatch', 'dinoco_obs_inject_request_id_header', 10, 3 );
+
+/* ========================================================================
+ * 4. CAPTURE WRAPPER
+ * ====================================================================== */
+
+if ( ! function_exists( 'dinoco_obs_capture' ) ) {
+    /**
+     * Unified log/capture entry point.
+     *
+     * Always:
+     *   - Calls b2b_log() if defined (backward compat with existing B2B logging).
+     *   - Writes to error_log() as plain text (with optional JSON structure).
+     *
+     * Additionally, if Sentry flag ON + SDK available:
+     *   - Forwards to \Sentry\captureMessage() with the mapped severity.
+     *
+     * @param string $level   One of 'debug','info','warning','error','fatal'. Defaults to 'info'.
+     * @param string $message Human-readable message. Keep short — put variables in $context.
+     * @param array  $context Arbitrary structured data (avoid secrets/PII).
+     * @return void
+     */
+    function dinoco_obs_capture( $level, $message, $context = array() ) {
+        $level   = is_string( $level ) ? strtolower( $level ) : 'info';
+        $message = is_string( $message ) ? $message : (string) wp_json_encode( $message );
+        $context = is_array( $context ) ? $context : array();
+
+        $valid_levels = array( 'debug', 'info', 'warning', 'error', 'fatal' );
+        if ( ! in_array( $level, $valid_levels, true ) ) $level = 'info';
+
+        $request_id = dinoco_obs_get_request_id();
+
+        // 1. Backward-compat — call b2b_log if registered.
+        if ( function_exists( 'b2b_log' ) ) {
+            try {
+                b2b_log( '[OBS][' . $level . '] ' . $message . ' rid=' . $request_id );
+            } catch ( \Throwable $e ) { /* swallow */ }
+        }
+
+        // 2. Always write to error_log (structured or plain).
+        if ( dinoco_obs_is_enabled( 'structured_log' ) ) {
+            $payload = array(
+                'ts'         => gmdate( 'c' ),
+                'level'      => $level,
+                'msg'        => $message,
+                'request_id' => $request_id,
+                'context'    => $context,
+            );
+            $json = wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+            if ( $json === false ) $json = '[DINOCO_OBS] json_encode failed for: ' . $message;
+            error_log( $json );
+        } else {
+            $suffix = $context ? ' ctx=' . wp_json_encode( $context ) : '';
+            error_log( '[DINOCO_OBS][' . strtoupper( $level ) . '][rid=' . $request_id . '] ' . $message . $suffix );
+        }
+
+        // 3. Forward to Sentry if enabled + initialized.
+        if ( dinoco_obs_is_enabled( 'sentry_enabled' ) && dinoco_obs_init_sentry() ) {
+            try {
+                if ( function_exists( '\\Sentry\\captureMessage' ) && class_exists( '\\Sentry\\Severity' ) ) {
+                    // Map our level string to a \Sentry\Severity instance.
+                    $severity_map = array(
+                        'debug'   => 'debug',
+                        'info'    => 'info',
+                        'warning' => 'warning',
+                        'error'   => 'error',
+                        'fatal'   => 'fatal',
+                    );
+                    $sentry_level_str = $severity_map[ $level ];
+                    $severity = null;
+                    if ( method_exists( '\\Sentry\\Severity', $sentry_level_str ) ) {
+                        $severity = call_user_func( array( '\\Sentry\\Severity', $sentry_level_str ) );
+                    }
+                    \Sentry\captureMessage( $message, $severity );
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[DINOCO_OBS] Sentry captureMessage failed: ' . $e->getMessage() );
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_obs_capture_exception' ) ) {
+    /**
+     * Convenience wrapper for exceptions.
+     * Always error_log + optionally forward to Sentry.
+     *
+     * @param \Throwable $exception
+     * @param array      $context
+     * @return void
+     */
+    function dinoco_obs_capture_exception( $exception, $context = array() ) {
+        if ( ! ( $exception instanceof \Throwable ) ) return;
+
+        $msg = get_class( $exception ) . ': ' . $exception->getMessage();
+        dinoco_obs_capture( 'error', $msg, array_merge( $context, array(
+            'file' => $exception->getFile(),
+            'line' => $exception->getLine(),
+        ) ) );
+
+        if ( dinoco_obs_is_enabled( 'sentry_enabled' ) && dinoco_obs_init_sentry() ) {
+            try {
+                if ( function_exists( '\\Sentry\\captureException' ) ) {
+                    \Sentry\captureException( $exception );
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[DINOCO_OBS] Sentry captureException failed: ' . $e->getMessage() );
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * 5. EARLY REQUEST-ID BOOT (ensures ID exists before any REST work)
+ * ====================================================================== */
+
+// Generate the correlation ID as early as possible so that all downstream
+// logging in this request sees the same ID. `init` fires before rest_api_init
+// but after WP core is loaded — perfectly placed.
+add_action( 'init', 'dinoco_obs_get_request_id', 1 );
