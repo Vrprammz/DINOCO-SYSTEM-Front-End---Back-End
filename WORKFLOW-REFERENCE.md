@@ -592,6 +592,139 @@ b2f_flag_order_intent        — LIFF UI + validator (requires v11)
 
 **Rollback**: `update_option(flag, false)` → instant revert ไม่ต้อง re-deploy
 
+### 3.1.8 Hierarchy Coverage Auto-Sync (Coverage Rule — 2026-04-17)
+
+**Problem solved**: Admin Makers tab (Snippet 5) render hierarchy inconsistent — some SETs มีทุก level เป็น full row (CPT era register ครบ), บางอัน intermediate sub-units ขาด (Phase 2 backfill auto-sync เฉพาะ top-level orphan SETs) → render เป็น label separator แทน full row
+
+**Example case**: DNCSETNX500EX001 (E-clutch Silver) vs DNCSETNX500X001 (Silver):
+
+- DNCSETNX500X001 — CPT era register ครบ → 001 (ชุดบน) + 002 (ชุดล่าง) + L/R ทุกตัว = full rows
+- DNCSETNX500EX001 — Phase 2 orphan auto-sync top SET + admin register leaves (001 shared + E002-L/R) — **DNCNX500E002 (ชุดล่าง E-clutch) ไม่ได้ register** → render แค่ "(2 ชิ้น)" label
+
+**Coverage Rule** (decided 2026-04-17):
+
+```
+SKU X registered for Maker M
+⇔ explicit junction row
+OR (X has children AND ALL children covered for M recursively)
+```
+
+**Leaves = source of truth**. Intermediate + top SETs **auto-derive** เมื่อลูกครบ. Admin maintain แค่ leaves — ส่วน aggregate layer ขึ้นมาเอง
+
+#### 3-Layer Implementation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 1 — REACTIVE (Snippet 0.5 V.1.5 + Snippet 1 V.7.3)       │
+├─────────────────────────────────────────────────────────────────┤
+│  Trigger: Every dual-write UPSERT to junction                   │
+│  Flow:                                                          │
+│    admin saves leaf DNCNX500E002-L for HTP                      │
+│      ↓ b2f_dual_write_to_junction UPSERT succeeds               │
+│      ↓ b2f_auto_sync_parent_coverage($maker_id, $child_sku)     │
+│      ↓ walk UP via b2f_get_parents_for_sku                      │
+│         for each parent:                                        │
+│           blacklist? → skip                                     │
+│           already registered? → recurse up                      │
+│           coverage complete? → INSERT row + recurse up          │
+│           else → stop                                           │
+│      ↓ fire b2f_junction_updated ONCE per maker                 │
+│        (batched via b2f_defer_junction_updates_state)           │
+│                                                                 │
+│  Gate: b2f_flag_coverage_autosync wp_option (default '1')       │
+│  Kill-switch: update_option(..., '0') → instant revert          │
+│  Lock-aware: migration_in_progress → defer via cron             │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 2 — BULK CLEANUP (Audit V.3.7)                           │
+├─────────────────────────────────────────────────────────────────┤
+│  Endpoint: POST /dinoco-b2f-audit/v1/sync-missing-intermediates │
+│  UI: "🔗 Sync Missing Intermediates (Coverage Rule)" card       │
+│                                                                 │
+│  Admin flow:                                                    │
+│    1. Click "🧪 Dry-Run" → scan + preview grouped by maker      │
+│    2. Review list                                               │
+│    3. Click "⚡ Sync จริง" → INSERT all detected rows           │
+│    4. Makers tab reload → intermediate rows visible             │
+│                                                                 │
+│  Backend: b2f_detect_missing_intermediates($filter_maker_id=0)  │
+│    - Build {SKU_upper: true} set per maker (in-memory)          │
+│    - Iterate all parents in dinoco_sku_relations                │
+│    - Walk until stable (iteration cap 100)                      │
+│    - Return flat list + grouped-by-maker                        │
+│                                                                 │
+│  Rate limit: 5/hr                                               │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 3 — RENDER CONSISTENCY                                   │
+├─────────────────────────────────────────────────────────────────┤
+│  Auto-added rows defaults:                                      │
+│    unit_cost = 0 (LIFF compute via V.11.3 unconditional)        │
+│    confirmation_status = 'auto_synced' (admin review later)     │
+│    notes = 'auto-synced (coverage rule)' (audit trail)          │
+│    legacy_cpt_id = 0 (not CPT era)                              │
+│    production_mode + admin_display_mode = inferred              │
+│                                                                 │
+│  Snippet 5 Makers tab renders full row (was label separator).   │
+│  Admin can confirm via "ยืนยัน" button per SKU or bulk.          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### SET Price Design (V.11.3 permanent)
+
+SET **ไม่มี manual price input**. `unit_cost` คำนวณจาก leaves ตลอด:
+
+```
+LIFF + Admin read /maker-products/{maker_id}
+  ↓ Snippet 2 V.11.3 always runs b2f_compute_set_costs_v918($products, $rel_upper)
+  ↓ For each SET: walk to leaves → sum(leaf.unit_cost) → override SET.unit_cost
+  ↓ Set flags: unit_cost_computed, unit_cost_complete, unit_cost_leaf_count, unit_cost_missing[]
+```
+
+Consequences:
+
+- Stale junction `unit_cost` (e.g. 666 จาก ACF backfill era) = dead data — LIFF ignore
+- Makers tab shows read-only badge `.b2f-set-price-ro`:
+  - ✓ เขียว — `unit_cost_complete=true` (ลูกครบ)
+  - ⚠ อำพัน — partial (missing leaves in tooltip)
+  - ⚠ แดง — `unit_cost_computed=false` (ยังไม่มี leaf ลงราคา)
+- MOQ + lead_time ยังแก้ได้ (ไม่ derivable)
+- Optional cleanup: `POST /purge-stale-prices` zero-out stale junction values (cosmetic)
+
+#### Example Run (HTP first-time, 2026-04-17)
+
+Dry-run result: **5 missing intermediates added**
+
+| SKU | ประเภท | Parent SET |
+| --- | --- | --- |
+| DNCNX500E002 | ชุดล่าง E-clutch Silver | DNCSETNX500EX001 |
+| DNCNX500E002B | ชุดล่าง E-clutch Black | DNCSETNX500E002 |
+| DNCNX500E002IRONB | ชุดล่าง E-clutch IronBlack | DNCSETNX500EIRNB |
+| DNCXL7500X001H | ชุดบน XL750 | DNCSETXL7500X001H |
+| DNCXL7500X002H | ชุดล่าง XL750 | DNCSETXL7500X001H |
+
+หลัง sync — DNCSETNX500EX001 structure เหมือน DNCSETNX500X001 (ทุก hierarchy level มี full row + color-coded price badge)
+
+#### Rollback Procedure
+
+```
+# Disable reactive only (bulk still usable)
+update_option('b2f_flag_coverage_autosync', '0');
+
+# Delete specific auto-sync row
+UPDATE wp_dinoco_product_makers
+SET status='discontinued', deleted_at=NOW()
+WHERE product_sku='DNCNX500E002' AND maker_id=5865;
+
+# Undo bulk sync (if needed)
+# → use Option F blacklist + soft-delete flow:
+POST /junction-bulk-delete {maker_id, skus:[...], only_auto_synced:true, add_to_blacklist:true}
+```
+
+Blacklist (V.3.2 Option F) respected — `b2f_autosync_is_blacklisted($maker_id, $sku)` check ทั้ง reactive และ bulk path
+
 ### 3.2 Maker Confirm/Reject PO -- Text
 
 ```

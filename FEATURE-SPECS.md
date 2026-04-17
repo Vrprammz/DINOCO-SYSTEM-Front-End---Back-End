@@ -3663,6 +3663,7 @@ POST /create-po → Success Toast "ยกเลิกได้ 30 วิ" →
 ### 1.17.18 Multi-Agent Audit Resolved
 
 **8 agents × 2 rounds = 48+ issues integrated**:
+
 - ux-ui-expert: 7 priority fixes
 - tech-lead × 2: 15 critical gaps + cross-system isolation verified
 - fullstack-developer × 2: security + performance + helpers + code-level bugs
@@ -3670,6 +3671,224 @@ POST /create-po → Success Toast "ยกเลิกได้ 30 วิ" →
 - api-specialist: endpoint specs + validator gaps
 - security-pentester: PII filter + injection risks
 - Explore: docs/wiki/config gaps
+
+---
+
+## 1.18 V.7.0 Post-Deploy Fixes + Coverage Rule (2026-04-17)
+
+Section 1.17 deploy แล้ว เจอ bug series + user feedback → ~12 commits + 1 major design extension ใน ~4 ชั่วโมง
+
+### 1.18.1 Bug Sweep — 6 Categories
+
+| # | Bug | Commit | Version | Root Cause | Fix |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Dry-run 0 rows, ไม่มี error | `c0f05aa` | Audit V.3.4 | ALTER guarded `if(!$dry_run)` แต่ SELECT อ้าง V.11 cols → `$wpdb->get_results` silent fail | ALTER รันตลอด (idempotent INFORMATION_SCHEMA-guarded) + `$wpdb->last_error` check + REST top-level `message` |
+| 2 | Live migration CHECK rejection | `119d1f3` | Audit V.3.5 | `chk_confirmed_consistency` ต้อง `confirmed_by`+`confirmed_at` NOT NULL เมื่อ `confirmation_status='confirmed'` | Branch UPDATE: confirmed → populate both + uid + now |
+| 3 | LIFF chips label เก่า | `55a0a27` | Snippet 8 V.7.1 | chips ยังใช้ V.5.2 taxonomy (ชุด SET/ลูกชิ้นส่วน) | 3 chips V.7.0 (🟣/🟠/⚪) from `production_mode` |
+| 4 | "13 SET รอยืนยัน" inflation | `6b2666a` | Snippet 2 V.11.1 | `unconfirmed_count` นับทุก product type + virtual SETs | Count SETs only (set_assembled+cross_factory) + skip virtual |
+| 5 | Chips counts ไม่ follow model | `1e24488` | Snippet 8 V.7.2 | `renderTypeChips()` นับก่อน model filter | Count หลัง search+model filter + re-render on model click |
+| 6 | Model cards emoji 🚕 | `51e70c7` | Snippet 8 V.7.3 | `getModelImage()` 3 bugs: keyed object read as array, `model_name` vs `name`, `image_url` vs `image` | Align กับ B2B Snippet 4 pattern + lazy `_modelImageMap` |
+| 7 | SET Detail mode toggle หาย | `51e70c7` | Snippet 8 V.7.3 | Toggle อยู่กลาง page → scroll หายไป | Insert หลัง hero + `position:sticky; top:56px` |
+| 8 | SET price 666 stuck | `4b11c97`+`d8ba9e8` | Snippet 2 V.11.2 + 0.5 V.1.3 | (a) V.10.1 gate skip dual_write เมื่อ shadow=ON (hook อ่าน stale) (b) ACF `get_field` cache per-request ไม่ invalidate | (a) ยกเลิก gate call ตลอด (b) `get_post_meta` แทน `get_field` in dual_write |
+| 9 | SET ควรเป็น sum ลูก | `7e6b726` | Snippet 2 V.11.3 + Snippet 5 V.7.3 | SET ไม่มี UI input price → pure compute design, stale junction = dead data | `b2f_compute_set_costs_v918` รันไม่ sneak `$flag_junction` gate + read-only badge with color status |
+
+### 1.18.2 Coverage Rule (Long-term Design)
+
+**Problem statement**: Admin Makers tab render hierarchy ระดับไม่ consistent — CPT-era SETs (admin register ครบ) vs Phase 2 orphan SETs (auto-sync เฉพาะ top-level, ขาด intermediate sub-units) → UI แสดง full row vs label separator
+
+**Design principle**:
+
+```
+SKU X registered for Maker M
+⇔ explicit junction row
+OR (X has children AND ALL children covered for M, recursively)
+```
+
+**Leaves = source of truth**. Intermediate + top SETs = derived
+
+### 1.18.3 3-Layer Implementation
+
+#### Layer 1 — Reactive (Snippet 0.5 V.1.5 + Snippet 1 V.7.3)
+
+After every dual-write UPSERT:
+
+```
+admin saves leaf DNCNX500E002-L for HTP
+  ↓ b2f_dual_write_to_junction UPSERT OK
+  ↓ b2f_auto_sync_parent_coverage($maker_id, $child_sku)
+  ↓ walk UP via b2f_get_parents_for_sku
+    for each parent ancestor:
+      blacklist? → skip
+      already registered? → recurse up (check grandparent)
+      coverage complete? → INSERT + recurse up
+      partial coverage? → stop
+  ↓ fire b2f_junction_updated ONCE per maker (batched)
+```
+
+**Helpers added** (Snippet 1 V.7.1→V.7.3):
+
+- `b2f_get_parents_for_sku($sku)` — DD-3 safe parent lookup
+- `b2f_is_sku_registered_for_maker($sku, $maker_id)` — single SELECT
+- `b2f_load_maker_sku_set($maker_id)` — batch load all registered SKUs (eliminates N+1)
+- `b2f_is_coverage_complete($sku, $maker_id, $visited, $known_set)` — recursive with `$known_set` cache
+- `b2f_insert_auto_sync_junction_row($sku, $maker_id)` — INSERT with sensible defaults + pre-check (HIGH-1)
+- `b2f_auto_sync_parent_coverage($maker_id, $child_sku, $depth, $known_set)` — main walk
+- `b2f_detect_missing_intermediates($filter_maker_id)` — bulk detection
+- `b2f_defer_junction_updates_state()` — static accumulator for batched hook fire (HIGH-3)
+
+**Gate**: `b2f_flag_coverage_autosync` wp_option (default '1'). Kill-switch = `update_option(..., '0')`
+
+**Lock-aware**: `b2f_phase4_migration_in_progress` → defer via `wp_schedule_single_event('b2f_replay_coverage_autosync', [$sku, $mid])` (MEDIUM-2 fix mirrors Snippet 0.5 V.1.2 pattern)
+
+**Safety**: depth cap 10 + `$visited` cycle guard
+
+#### Layer 2 — Bulk Cleanup (Audit V.3.7)
+
+**Endpoint**: `POST /dinoco-b2f-audit/v1/sync-missing-intermediates`
+
+**Body**: `{confirm, dry_run, maker_id?}`
+
+**Flow**:
+
+1. Scan junction rows (all makers or filtered)
+2. `b2f_detect_missing_intermediates()` — build in-memory `{SKU_upper: true}` set per maker + iterate all parents in `dinoco_sku_relations` until stable (iteration cap 100 LOW-2)
+3. Return flat list + grouped-by-maker preview
+4. If not dry-run → INSERT via `b2f_insert_auto_sync_junction_row()` for each
+5. Fire `b2f_junction_updated` per affected maker
+
+**Rate limit**: 5/hr. **CSRF**: `X-WP-Nonce: wp_rest` required (V.3.9)
+
+**UI card**: "🔗 Sync Missing Intermediates (Coverage Rule)" ใน Audit dashboard — Dry-Run + Sync buttons + result panel grouped by maker
+
+#### Layer 3 — Render Consistency
+
+Auto-added rows defaults:
+
+| Field | Value | Reason |
+| --- | --- | --- |
+| `unit_cost` | `0` | LIFF auto-computes from leaves via V.11.3 |
+| `confirmation_status` | `'auto_synced'` | Admin review later |
+| `notes` | `'auto-synced (coverage rule)'` | Audit trail |
+| `legacy_cpt_id` | `0` | Not CPT era |
+| `production_mode` | inferred | Via `b2f_infer_production_mode_from_relations` |
+| `admin_display_mode` | inferred | cross_factory→as_parts, else auto |
+
+Makers tab (Snippet 5) renders full row (was label separator). Admin can confirm via "ยืนยัน" button per SKU or bulk.
+
+### 1.18.4 SET Price Design (V.11.3 permanent)
+
+SET **ไม่มี manual price input**. `unit_cost` computed on every response:
+
+**Snippet 2 V.11.3**:
+
+```php
+// Removed gate — always compute
+$data_products = b2f_compute_set_costs_v918( $products, $hierarchy_ctx['rel_upper'] );
+```
+
+**Snippet 5 V.7.3** — read-only badge `.b2f-set-price-ro`:
+
+- ✓ เขียว (`unit_cost_complete=true`) — ลูกครบ
+- ⚠ อำพัน (partial) — tooltip lists missing leaves
+- ⚠ แดง (`unit_cost_computed=false`) — ยังไม่มี leaf ลงราคา
+
+MOQ + lead_time ยังแก้ได้ (ไม่ derivable จากลูก)
+
+### 1.18.5 Code-Reviewer Fixes Applied (a5d44ea)
+
+**0 CRITICAL, 3 HIGH + 3 MEDIUM + 2 LOW** addressed:
+
+| Item | File | Change |
+| --- | --- | --- |
+| HIGH-1 | Snippet 1 V.7.3 | `b2f_is_sku_registered_for_maker()` pre-check before INSERT — defense-in-depth vs schema drift |
+| HIGH-2 | Snippet 1 V.7.3 | `b2f_load_maker_sku_set()` loads once at top-level + `$known_set` param through recursion — eliminates N+1 |
+| HIGH-3 | Snippet 1 V.7.3 | `b2f_defer_junction_updates_state()` accumulator → single `b2f_junction_updated` fire per maker per walk (was N) |
+| MEDIUM-1 | Snippet 0.5 V.1.5 | `b2f_flag_coverage_autosync` wp_option gate — kill-switch default ON |
+| MEDIUM-2 | Snippet 1 V.7.3 | Migration lock → `wp_schedule_single_event('b2f_replay_coverage_autosync')` defer (match Snippet 0.5 V.1.2 pattern) |
+| LOW-1 | Snippet 1 V.7.3 | Version header cleanup |
+| LOW-2 | Snippet 1 V.7.3 | `$max_iter=100` hard cap in `b2f_detect_missing_intermediates` while loop + log |
+
+### 1.18.6 Post-Deploy Utility Endpoints (Audit V.3.6+)
+
+#### `POST /dinoco-b2f-audit/v1/purge-stale-prices` (V.3.6)
+
+Cleanup for stale `unit_cost` values (e.g. 666 จาก ACF backfill era). With V.11.3 these are dead data — cleanup is cosmetic, not blocking
+
+Body: `{sentinel_value?, confirm, dry_run}`. Rate 3/hr. Dry-run returns `affected_rows` preview. Fires `b2f_junction_updated` per affected maker
+
+#### `POST /dinoco-b2f-audit/v1/sync-missing-intermediates` (V.3.7)
+
+Layer 2 bulk cleanup (see §1.18.3). Rate 5/hr
+
+### 1.18.7 Flags + Options Summary
+
+| wp_option | Default | Introduced | Purpose |
+| --- | --- | --- | --- |
+| `b2f_flag_coverage_autosync` | `'1'` | Snippet 0.5 V.1.5 | Reactive kill-switch |
+| `b2f_autosync_blacklist` | `{}` | Audit V.3.2 | Per-maker SKU exclusion (Option F) |
+| `b2f_phase4_migration_in_progress` | unset | Audit V.3.3 | Migration lock (reactive defers) |
+
+### 1.18.8 Rollback Procedures
+
+**Reactive kill-switch**:
+
+```php
+update_option('b2f_flag_coverage_autosync', '0');
+```
+
+Instant disable auto-sync on every save. Bulk endpoint still works manually
+
+**Delete auto-sync row**:
+
+```sql
+UPDATE wp_dinoco_product_makers
+SET status='discontinued', deleted_at=NOW(), updated_by=<uid>, updated_at=NOW()
+WHERE product_sku='DNCNX500E002' AND maker_id=<id>;
+```
+
+**Bulk undo**:
+
+Use Option F soft-delete + blacklist:
+
+```json
+POST /junction-bulk-delete
+{
+  "maker_id": 5865,
+  "skus": ["DNCNX500E002", "..."],
+  "only_auto_synced": true,
+  "add_to_blacklist": true
+}
+```
+
+### 1.18.9 Example Run (HTP 2026-04-17)
+
+**Dry-run result**: 5 intermediate SKUs would be added for maker_id=5865:
+
+- `DNCNX500E002` (ชุดล่าง E-clutch Silver under DNCSETNX500EX001)
+- `DNCNX500E002B` (ชุดล่าง E-clutch Black under DNCSETNX500E002)
+- `DNCNX500E002IRONB` (ชุดล่าง E-clutch IronBlack under DNCSETNX500EIRNB)
+- `DNCXL7500X001H` (ชุดบน XL750 under DNCSETXL7500X001H)
+- `DNCXL7500X002H` (ชุดล่าง XL750 under DNCSETXL7500X001H)
+
+หลัง sync — DNCSETNX500EX001 structure ≡ DNCSETNX500X001 (ทุก hierarchy level มี full row + color-coded price badge)
+
+### 1.18.10 Commit Trail
+
+| Commit | Description |
+| --- | --- |
+| `c0f05aa` | V.3.4 dry-run ALTER + last_error + REST message |
+| `119d1f3` | V.3.5 CHECK constraint fix + confirmed_by/at populate |
+| `55a0a27` | Snippet 8 V.7.1 chip taxonomy V.7.0 |
+| `6b2666a` | Snippet 2 V.11.1 stats inflation fix (13→9) |
+| `1e24488` | Snippet 8 V.7.2 chip counts + transparent cards |
+| `51e70c7` | Snippet 8 V.7.3 model image + sticky toggle + purge endpoint |
+| `2e20e71` | Snippet 5 V.7.2 SET inputs (walked back in V.7.3) |
+| `4b11c97` | Snippet 2 V.11.2 dual-write timing fix |
+| `d8ba9e8` | Snippet 0.5 V.1.3 ACF cache bypass |
+| `7e6b726` | Snippet 2 V.11.3 + Snippet 5 V.7.3 SET auto-compute |
+| `9e70b4c` | Coverage Rule 3-layer implementation |
+| `a5d44ea` | Code-reviewer fixes HIGH+MEDIUM+LOW |
+| `deb70a2` | V.3.11 Phase 4 lock auto-expire |
 
 ---
 
