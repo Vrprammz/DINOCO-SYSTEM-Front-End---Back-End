@@ -2744,9 +2744,32 @@ app.get("/api/agent-jobs", requireAuth, async (req, res) => {
 app.get("/api/costs", async (req, res) => { const db = await getDB(); if (!db) return res.json({}); const todayStart = new Date(); todayStart.setHours(0,0,0,0); const todayResult = await db.collection("ai_costs").aggregate([{ $match: { createdAt: { $gte: todayStart } } }, { $group: { _id: null, totalTokens: { $sum: "$totalTokens" }, totalCost: { $sum: "$costUsd" }, calls: { $sum: 1 } } }]).toArray(); res.json({ today: todayResult[0] || { totalTokens: 0, totalCost: 0, calls: 0 } }); });
 app.get("/advice", async (req, res) => { const db = await getDB(); if (!db) return res.json([]); res.json(await db.collection("ai_advice").find({}).sort({ createdAt: -1 }).limit(5).toArray()); });
 app.get("/api/advisor/sources-changed", async (req, res) => { res.json({ sources: [], queriedAt: new Date().toISOString() }); }); // Simplified
-app.post("/api/advisor/advice", express.json(), async (req, res) => { const db = await getDB(); if (!db) return res.status(500).json({ error: "DB" }); await db.collection("ai_advice").insertOne({ advice: req.body.advice, createdAt: new Date() }); res.json({ ok: true }); });
-app.post("/api/advisor/update-pulled", express.json(), async (req, res) => { res.json({ ok: true }); });
-app.post("/api/advisor/cost", express.json(), async (req, res) => { const db = await getDB(); if (!db) return res.status(500).json({ error: "DB" }); await db.collection("ai_costs").insertOne({ ...req.body, createdAt: new Date() }); res.json({ ok: true }); });
+// ★ S3 (Phase 2 audit): requireAuth + body size limit 10kb + whitelist insert fields (no spread)
+app.post("/api/advisor/advice", requireAuth, express.json({ limit: "10kb" }), async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB" });
+  const cleanAdvice = {
+    advice: String(req.body.advice || "").slice(0, 5000),
+    createdAt: new Date(),
+  };
+  await db.collection("ai_advice").insertOne(cleanAdvice);
+  res.json({ ok: true });
+});
+app.post("/api/advisor/update-pulled", requireAuth, express.json({ limit: "10kb" }), async (req, res) => { res.json({ ok: true }); });
+app.post("/api/advisor/cost", requireAuth, express.json({ limit: "10kb" }), async (req, res) => {
+  const db = await getDB();
+  if (!db) return res.status(500).json({ error: "DB" });
+  const cleanCost = {
+    model: String(req.body.model || "").slice(0, 100),
+    input_tokens: Number(req.body.input_tokens) || 0,
+    output_tokens: Number(req.body.output_tokens) || 0,
+    total_usd: Number(req.body.total_usd) || 0,
+    request_type: String(req.body.request_type || "unknown").slice(0, 50),
+    createdAt: new Date(),
+  };
+  await db.collection("ai_costs").insertOne(cleanCost);
+  res.json({ ok: true });
+});
 
 // === Agent Ask — Admin ถาม Agent ตอบจากข้อมูลจริง (Phase 2) ===
 function classifyQuestion(q) {
