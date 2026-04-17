@@ -1,5 +1,23 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.10 — code-reviewer fixes on commit 9e70b4c: (doc + flag-whitelist only)
+ *   document that `POST /sync-missing-intermediates` + `POST /feature-flags/toggle`
+ *   now benefit from Snippet 1 V.7.3 improvements (HIGH-1 fail-fast pre-check, HIGH-2
+ *   single-SELECT maker SKU set caching, HIGH-3 batched `b2f_junction_updated` hook
+ *   fire, MEDIUM-2 migration-lock cron defer). Registers new kill-switch flag
+ *   `b2f_flag_coverage_autosync` (default ON) in the audit allowed + toggleable
+ *   whitelists — admin can disable Snippet 0.5 V.1.5 reactive coverage propagation
+ *   without a code redeploy. UI card for "Sync Missing Intermediates" gains a note
+ *   pointing to the flag control (wp_option `b2f_flag_coverage_autosync`).
+ * Version: V.3.9 — Phase 2 Group A S5: CSRF nonce enforcement on destructive POST endpoints.
+ *   Split `$perm_admin` closure into `$perm_admin_read` (cap only, GETs) and
+ *   `$perm_admin_write` (cap + X-WP-Nonce `wp_rest` verify). Applied write-perm to 10 POST
+ *   endpoints: activate-schema, backfill, phase4-migration, feature-flags/toggle,
+ *   junction-bulk-delete, junction-update-classification, junction-bulk-update-display,
+ *   junction-confirm-classification, autosync-blacklist POST, purge-stale-prices,
+ *   sync-missing-intermediates. GET routes stay on read-perm. Dashboard JS already injects
+ *   nonce (line 3886) — no FE change needed. `$perm_admin_or_liff` closure also wraps
+ *   write-perm nonce check for WP-admin path (LIFF JWT path skips nonce, uses X-B2F-Token).
  * Version: V.3.8 — Phase 1 audit BUG-H8: removed orphan flag `b2f_flag_ungroup_auto_hide`
  *   from whitelist + toggleable list + dependency check + UI toggle row + JS renderer.
  *   Auto-hide behavior already handled via `admin_display_mode='as_parts'` column set by
@@ -117,7 +135,7 @@ if ( defined( 'B2F_DISABLED' ) && B2F_DISABLED ) return;
 // SECTION 0: CONSTANTS + ALLOWED FLAG LIST
 // ═══════════════════════════════════════════════════════════════════
 
-if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.8' );
+if ( ! defined( 'B2F_AUDIT_VERSION' ) ) define( 'B2F_AUDIT_VERSION', 'V.3.10' );
 if ( ! defined( 'B2F_AUDIT_NS' ) )       define( 'B2F_AUDIT_NS', 'dinoco-b2f-audit/v1' );
 
 /**
@@ -142,6 +160,8 @@ if ( ! function_exists( 'b2f_audit_allowed_flags' ) ) {
             // V.3.3 — V.7.0 Phase 4 additions (V.3.8 removed ungroup_auto_hide)
             'b2f_flag_v11_explicit_mode',
             'b2f_flag_order_intent',
+            // V.3.10 — coverage auto-sync kill-switch (default ON — opt-out)
+            'b2f_flag_coverage_autosync',
         );
     }
 }
@@ -164,6 +184,8 @@ if ( ! function_exists( 'b2f_audit_phase2_toggleable_flags' ) ) {
             // V.3.3 — V.7.0 (V.3.8 removed ungroup_auto_hide)
             'b2f_flag_v11_explicit_mode',
             'b2f_flag_order_intent',
+            // V.3.10 — coverage auto-sync kill-switch (default ON — can be toggled OFF)
+            'b2f_flag_coverage_autosync',
         );
     }
 }
@@ -1810,9 +1832,31 @@ if ( ! function_exists( 'b2f_audit_get_drift_history' ) ) {
 
 add_action( 'rest_api_init', function () {
 
-    $perm_admin = function () {
+    // V.3.9 (S5): split perm closure into read (GET) vs write (POST/DELETE).
+    // READ — cap only. Safe GETs don't need CSRF (browser won't leak JSON cross-origin).
+    $perm_admin_read = function () {
         return current_user_can( 'manage_options' );
     };
+
+    // WRITE — cap + X-WP-Nonce `wp_rest` verify. Dashboard JS sends nonce already.
+    // Missing/invalid nonce → 403 (CSRF defense).
+    $perm_admin_write = function ( $request ) {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'rest_forbidden', 'Admin only', array( 'status' => 403 ) );
+        }
+        $nonce = $request instanceof WP_REST_Request ? $request->get_header( 'X-WP-Nonce' ) : '';
+        if ( empty( $nonce ) ) {
+            return new WP_Error( 'rest_missing_nonce', 'Missing X-WP-Nonce header', array( 'status' => 403 ) );
+        }
+        if ( ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+            return new WP_Error( 'rest_invalid_nonce', 'Invalid or expired nonce', array( 'status' => 403 ) );
+        }
+        return true;
+    };
+
+    // Back-compat alias — existing GET routes below reference `$perm_admin` (read-only).
+    // Closure copies PHP ≥5.4 safe via direct assignment — does not rewrap.
+    $perm_admin = $perm_admin_read;
 
     // Rate limit wrapper — 20 req/hour per user per endpoint
     $rl = function( $endpoint ) {
@@ -1997,7 +2041,7 @@ add_action( 'rest_api_init', function () {
         ),
         array(
             'methods'             => 'POST',
-            'permission_callback' => $perm_admin,
+            'permission_callback' => $perm_admin_write,
             'callback'            => function () {
                 return new WP_Error(
                     'deprecated',
@@ -2014,7 +2058,7 @@ add_action( 'rest_api_init', function () {
     // ─────────────────────────────────────────────
     register_rest_route( B2F_AUDIT_NS, '/feature-flags/toggle', array(
         'methods'             => 'POST',
-        'permission_callback' => $perm_admin,
+        'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) use ( $rl ) {
             $check = $rl( 'flag_toggle' );
             if ( is_wp_error( $check ) ) return $check;
@@ -2137,7 +2181,7 @@ add_action( 'rest_api_init', function () {
     // ─────────────────────────────────────────────
     register_rest_route( B2F_AUDIT_NS, '/activate-schema', array(
         'methods'             => 'POST',
-        'permission_callback' => $perm_admin,
+        'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) use ( $rl ) {
             // destructive action — stricter rate limit (5/hr)
             if ( function_exists( 'b2b_rate_limit' ) ) {
@@ -2219,7 +2263,7 @@ add_action( 'rest_api_init', function () {
     // ─────────────────────────────────────────────
     register_rest_route( B2F_AUDIT_NS, '/backfill', array(
         'methods'             => 'POST',
-        'permission_callback' => $perm_admin,
+        'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) {
             if ( function_exists( 'b2b_rate_limit' ) ) {
                 $uid = get_current_user_id();
@@ -2557,7 +2601,7 @@ add_action( 'rest_api_init', function () {
     // ─────────────────────────────────────────────
     register_rest_route( B2F_AUDIT_NS, '/junction-bulk-delete', array(
         'methods'             => 'POST',
-        'permission_callback' => $perm_admin,
+        'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) {
             // Rate limit: 5/min/user (tighter than default 20/hour)
             if ( function_exists( 'b2b_rate_limit' ) ) {
@@ -2673,7 +2717,7 @@ add_action( 'rest_api_init', function () {
     register_rest_route( B2F_AUDIT_NS, '/autosync-blacklist', array(
         array(
             'methods'             => 'POST',
-            'permission_callback' => $perm_admin,
+            'permission_callback' => $perm_admin_write,
             'callback'            => function ( $req ) use ( $rl ) {
                 $check = $rl( 'blacklist_toggle' );
                 if ( is_wp_error( $check ) ) return $check;
@@ -2765,7 +2809,23 @@ add_action( 'rest_api_init', function () {
     // on WP session overrides (covers dashboard calls).
 
     $perm_admin_or_liff = function ( $req ) {
-        if ( current_user_can( 'manage_options' ) ) return true;
+        // V.3.9 (S5): WP admin path → cap + X-WP-Nonce. LIFF JWT path uses X-B2F-Token
+        // (orthogonal credential, not browser cookie-based → CSRF-immune by design).
+        if ( current_user_can( 'manage_options' ) ) {
+            $nonce = $req instanceof WP_REST_Request ? $req->get_header( 'X-WP-Nonce' ) : '';
+            if ( empty( $nonce ) ) {
+                // Fallback: if caller also supplied X-B2F-Token, let the LIFF branch try
+                if ( function_exists( 'b2f_verify_admin_token' ) ) {
+                    $verdict = b2f_verify_admin_token( $req );
+                    if ( is_array( $verdict ) && ! empty( $verdict['is_admin'] ) ) return true;
+                }
+                return new WP_Error( 'rest_missing_nonce', 'Missing X-WP-Nonce header', array( 'status' => 403 ) );
+            }
+            if ( ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+                return new WP_Error( 'rest_invalid_nonce', 'Invalid or expired nonce', array( 'status' => 403 ) );
+            }
+            return true;
+        }
         if ( function_exists( 'b2f_verify_admin_token' ) ) {
             $verdict = b2f_verify_admin_token( $req );
             if ( is_array( $verdict ) && ! empty( $verdict['is_admin'] ) ) return true;
@@ -3221,7 +3281,7 @@ add_action( 'rest_api_init', function () {
     // ─────────────────────────────────────────────
     register_rest_route( B2F_AUDIT_NS, '/purge-stale-prices', array(
         'methods'             => 'POST',
-        'permission_callback' => $perm_admin,
+        'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) {
             global $wpdb;
             if ( function_exists( 'b2b_rate_limit' ) ) {
@@ -3433,7 +3493,7 @@ add_action( 'rest_api_init', function () {
     // ─────────────────────────────────────────────
     register_rest_route( B2F_AUDIT_NS, '/sync-missing-intermediates', array(
         'methods'             => 'POST',
-        'permission_callback' => $perm_admin,
+        'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) {
             if ( function_exists( 'b2b_rate_limit' ) ) {
                 $uid = get_current_user_id();
@@ -3518,7 +3578,7 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
         <div class="b2f-audit-root" data-nonce="<?php echo esc_attr( $nonce ); ?>" data-base="<?php echo esc_url( $base ); ?>">
 
             <div class="b2f-audit-header">
-                <h2 class="b2f-audit-title">📊 B2F Migration Audit <span class="b2f-audit-ver">V.3.3</span></h2>
+                <h2 class="b2f-audit-title">📊 B2F Migration Audit <span class="b2f-audit-ver">V.3.9</span></h2>
                 <p class="b2f-audit-sub">Phase 2 (shadow-write) + Phase 3 (read cutover) + Phase 4 (V.7.0 classification). Cost data = confidential.</p>
                 <a href="#" class="b2f-audit-refresh" data-action="refresh-all">🔄 Refresh ทั้งหมด</a>
             </div>
@@ -3754,6 +3814,12 @@ if ( ! function_exists( 'b2f_migration_audit_shortcode' ) ) {
                     เพิ่มเข้าไปด้วย unit_cost=0 (LIFF auto-compute จากลูก). ใช้เมื่อต้องการแก้
                     inconsistency ครั้งเดียว — หลังแก้ <code>dinoco_sku_relations</code> ย้อนหลัง หรือ
                     หลัง Phase 2 backfill ที่ยังไม่ได้ auto-add intermediate ระดับกลาง.
+                </p>
+                <p class="b2f-audit-desc" style="font-size:12px;color:#64748b;background:#f8fafc;border-left:3px solid #94a3b8;padding:8px 10px;margin:8px 0 10px;">
+                    <strong>V.3.10:</strong> reactive coverage auto-sync (Snippet 0.5 V.1.5+) ทำงานทุกครั้ง
+                    ที่ admin บันทึก maker-product — ปุ่มนี้ใช้เฉพาะเคสที่แก้ relations ย้อนหลัง.
+                    ปิด/เปิด reactive mode ได้ที่ <strong>Feature Flags</strong> panel ด้านล่าง →
+                    <code>b2f_flag_coverage_autosync</code> (default ON).
                 </p>
                 <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
                     <button class="b2f-audit-btn b2f-audit-btn-ghost" data-action="sync-intermediates" data-dry="1">🧪 Dry-Run</button>

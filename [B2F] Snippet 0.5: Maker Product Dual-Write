@@ -1,6 +1,26 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 0.5: Maker Product Dual-Write                ║
+ * ║  Version: V.1.6 — Phase 2 audit DB-C1 FIX: CHECK constraint  ║
+ * ║    chk_confirmed_consistency on MySQL 8.0.16+ rejects        ║
+ * ║    INSERTs that set confirmation_status='confirmed' without  ║
+ * ║    confirmed_by + confirmed_at. We always set confirmation   ║
+ * ║    = 'confirmed' in dual-write (CPT = admin-edited), but the ║
+ * ║    V.1.5 SQL omitted the two audit columns — silent INSERT  ║
+ * ║    fail → junction stale. Now: add `confirmed_by` +          ║
+ * ║    `confirmed_at` to INSERT VALUES when classification       ║
+ * ║    status=confirmed, mirror into ON DUPLICATE KEY UPDATE so  ║
+ * ║    the initial row backfills if it was previously NULL.      ║
+ * ║    Idempotent re-runs preserve existing values via           ║
+ * ║    COALESCE(existing, VALUES()).                             ║
+ * ║  Version: V.1.5 — MEDIUM-1 from code-reviewer (commit 9e70b4c):║
+ * ║    kill-switch feature flag gate `b2f_flag_coverage_autosync`║
+ * ║    (whitelisted in Snippet 1 V.7.3, default ON). Gate wraps   ║
+ * ║    the b2f_auto_sync_parent_coverage() call in                ║
+ * ║    b2f_dual_write_to_junction() so admin can disable reactive ║
+ * ║    coverage propagation without redeploy (wp_option toggle).  ║
+ * ║    Audit UI Step 4 flag panel + /feature-flags/toggle endpoint║
+ * ║    already handle this via the shared whitelist helpers.      ║
  * ║  Version: V.1.4 — Reactive hierarchy coverage auto-sync. After every successful UPSERT, call b2f_auto_sync_parent_coverage() (Snippet 1 V.7.1) to walk UP from this SKU and register any ancestor whose coverage is now complete (all children covered for this maker). Philosophy: admin only maintains leaves; intermediates + top SETs auto-derive. Skips blacklisted SKUs (respects b2f_autosync_is_blacklisted). Non-fatal — logs only on failure (primary UPSERT already committed). Works together with Audit V.3.7 /sync-missing-intermediates cleanup endpoint for bulk remediation. ║
  * ║  Version: V.1.3 — Bypass ACF cache: use get_post_meta() instead of get_field() in dual_write_to_junction. Bug: ACF's acf_get_value caches values per-request. When save_post hook fires from wp_update_post() BEFORE update_field() in the save endpoint, stale values get cached. Second explicit dual_write call then returned cached stale value → junction stuck at old price (e.g. 666). get_post_meta reads WP's object cache which update_post_meta (called inside update_field) reliably invalidates. ║
  * ║  Version: V.1.2 — CRIT-4 Migration lock flag + V11 columns   ║
@@ -129,19 +149,41 @@ if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
         $uid = get_current_user_id();
         $now = current_time( 'mysql' );
 
+        // V.1.6 DB-C1 FIX: V11 schema CHECK constraint chk_confirmed_consistency requires
+        // confirmed_by + confirmed_at be non-NULL whenever confirmation_status='confirmed'.
+        // MySQL 8.0.16+ silently rejects the INSERT otherwise → junction stays stale.
+        // Classification.confirmation_status defaults to 'confirmed' for CPT-initiated
+        // saves (admin edited → implicit confirmation), so we must populate the audit
+        // columns. For 'auto_synced' rows (unusual via dual-write path) leave NULL.
+        $confirmed_by_val = null;
+        $confirmed_at_val = null;
+        if ( $confirmation_status === 'confirmed' ) {
+            $confirmed_by_val = $uid ?: 0;
+            $confirmed_at_val = current_time( 'mysql', true ); // GMT for audit precision
+        }
+
         // UPSERT (ON DUPLICATE preserves id + created_at)
         // CRITICAL V.1.2: ON DUPLICATE KEY UPDATE **EXCLUDES** 4 V11 classification columns
         //   → admin-chosen production_mode / confirmation_status / admin_display_mode / missing_leaves_count
         //     จะถูก preserve (ไม่ overwrite จาก CPT dual-write subsequent saves)
         //   → V11 columns จะ update ผ่าน 4 new endpoints ใน /dinoco-b2f-audit/v1/ (V.3.3) เท่านั้น
         //   → missing_leaves_count ถูก recompute โดย Phase 4 migration + Snippet 15 V.7.0 hook
+        //
+        // V.1.6: confirmed_by / confirmed_at ON DUPLICATE uses COALESCE(existing, VALUES()) so
+        // subsequent dual-writes do NOT overwrite an admin's real confirmation audit trail,
+        // but DO backfill NULLs that pre-date this fix (migrating old rows into CHECK compliance).
+        // %s bound with literal 'NULL' string won't work, so we build the SQL with format spec.
+        $confirmed_by_sql = is_null( $confirmed_by_val ) ? 'NULL' : $wpdb->prepare( '%d', $confirmed_by_val );
+        $confirmed_at_sql = is_null( $confirmed_at_val ) ? 'NULL' : $wpdb->prepare( '%s', $confirmed_at_val );
+
         $sql = $wpdb->prepare(
             "INSERT INTO {$tbl}
                 (product_sku, maker_id, unit_cost, moq, lead_time_days,
                  shipping_land, shipping_sea, status, notes,
                  production_mode, confirmation_status, admin_display_mode, missing_leaves_count,
+                 confirmed_by, confirmed_at,
                  legacy_cpt_id, created_by, updated_by, created_at, updated_at, deleted_at)
-             VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, %s, %s, %s, %d, %d, %d, %d, %s, %s, NULL)
+             VALUES (%s, %d, %f, %d, %d, %f, %f, %s, %s, %s, %s, %s, %d, {$confirmed_by_sql}, {$confirmed_at_sql}, %d, %d, %d, %s, %s, NULL)
              ON DUPLICATE KEY UPDATE
                 unit_cost      = VALUES(unit_cost),
                 moq            = VALUES(moq),
@@ -151,6 +193,8 @@ if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
                 status         = VALUES(status),
                 notes          = VALUES(notes),
                 legacy_cpt_id  = VALUES(legacy_cpt_id),
+                confirmed_by   = COALESCE(confirmed_by, VALUES(confirmed_by)),
+                confirmed_at   = COALESCE(confirmed_at, VALUES(confirmed_at)),
                 updated_by     = VALUES(updated_by),
                 updated_at     = VALUES(updated_at),
                 deleted_at     = NULL",
@@ -189,15 +233,24 @@ if ( ! function_exists( 'b2f_dual_write_to_junction' ) ) {
             do_action( 'b2f_junction_updated', $maker_id );
         }
 
+        // V.1.5 MEDIUM-1: Kill-switch gate. Default ON (opt-out) — admin can disable via
+        // wp_option `b2f_flag_coverage_autosync` = '0' (or via Audit dashboard flag panel)
+        // if reactive propagation causes issues, without needing a code redeploy.
+        //
         // V.1.4: Reactive coverage auto-sync. After writing this SKU's junction row,
         // walk UP the hierarchy — if this save now makes an ancestor's coverage complete,
         // auto-register the ancestor. Migration lock + blacklist checks handled inside
         // helper. Non-fatal: primary UPSERT already succeeded.
-        if ( function_exists( 'b2f_auto_sync_parent_coverage' ) ) {
+        $coverage_enabled = function_exists( 'b2f_is_flag_enabled' )
+            ? b2f_is_flag_enabled( 'b2f_flag_coverage_autosync' )
+            : ( get_option( 'b2f_flag_coverage_autosync', '1' ) !== '0' );
+        if ( $coverage_enabled && function_exists( 'b2f_auto_sync_parent_coverage' ) ) {
             $auto_added = b2f_auto_sync_parent_coverage( $maker_id, $sku );
             if ( ! empty( $auto_added ) && function_exists( 'b2f_log' ) ) {
-                b2f_log( '[DualWrite V.1.4] coverage auto-sync added ' . count( $auto_added ) . ' ancestor(s): ' . implode( ',', $auto_added ) );
+                b2f_log( '[DualWrite V.1.5] coverage auto-sync added ' . count( $auto_added ) . ' ancestor(s): ' . implode( ',', $auto_added ) );
             }
+        } elseif ( ! $coverage_enabled && function_exists( 'b2f_log' ) ) {
+            b2f_log( '[DualWrite V.1.5] coverage auto-sync skipped — b2f_flag_coverage_autosync=OFF (sku=' . $sku . ' maker=' . $maker_id . ')' );
         }
 
         return true;

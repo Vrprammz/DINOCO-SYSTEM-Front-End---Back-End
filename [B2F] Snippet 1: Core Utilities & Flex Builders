@@ -1,5 +1,20 @@
 /**
  * [B2F] Snippet 1: Core Utilities & LINE Flex Builders
+ * Version: V.7.4 — Phase 2 audit S2 FIX: `b2f_liff_url()` signs with `line_user_id`
+ *   when available (and emits `_uid` query param) + full 64-char HMAC (was truncated to
+ *   16 hex = 64-bit = halved safety margin). Paired with Snippet 2 V.11.5 `/auth-admin`
+ *   verifier that recomputes using the same format and compares with `hash_equals`.
+ *   Rollout gate: `b2f_flag_sig_bind_uid` (whitelist default ON). OFF → legacy
+ *   behavior (16-char sig, no uid in sig) for transition window. Function signature
+ *   now accepts an optional 3rd parameter `$line_user_id`; all 2-arg callsites
+ *   remain backward-compatible (uid empty → behaves like old path except full-length
+ *   sig when flag ON). All pre-existing callers in Snippet 1 Flex builders + Snippet 3
+ *   webhook pass `$line_user_id` where available (admin group push = no single uid,
+ *   skips binding; direct push = binds).
+ *   Also: whitelist new flag `b2f_flag_sig_bind_uid` (default ON = secure). Admins can
+ *   flip OFF via Audit /feature-flags/toggle endpoint during migration if user reports
+ *   "ลิงก์ไม่ถูกต้อง" on older Flex cards still using the 16-char sig.
+ * Version: V.7.3 — code-reviewer fixes on commit 9e70b4c (HIGH + MEDIUM + LOW). (HIGH-1) defense-in-depth pre-check in `b2f_insert_auto_sync_junction_row()` — fail-fast via `b2f_is_sku_registered_for_maker()` BEFORE INSERT, don't rely solely on ON DUPLICATE KEY (explicit caller intent + dead-code safe if schema drifts to partial unique index). (HIGH-2) N+1 refactor on `b2f_is_coverage_complete()` — accept optional `$known_set` map (SKU_upper => true) to skip per-child SELECT. New loader `b2f_load_maker_sku_set($maker_id)` = single SELECT. `b2f_auto_sync_parent_coverage()` pre-loads once at $depth=0 + passes through recursion + mutates in-place after successful insert so grandparent check sees fresh state. (HIGH-3) Batched `b2f_junction_updated` hook fire via `b2f_defer_junction_updates_state()` static — a single top-level walk deduplicates to 1 fire per maker (was N per inserted ancestor). (MEDIUM-2) Migration lock defer in `b2f_insert_auto_sync_junction_row()` — mirror Snippet 0.5 V.1.2 pattern: wp_schedule_single_event(+15s, 'b2f_replay_coverage_autosync') + cron handler re-tries every 30s until lock clears, then inserts + walks up. (LOW-1) header version history cleanup — collapse duplicate V.7.2 entries. (LOW-2) iteration cap in `b2f_detect_missing_intermediates()` while loop — $max_iter=100 hard safety + log on hit. New flag whitelist entry `b2f_flag_coverage_autosync` (default ON) — kill-switch for Snippet 0.5 V.1.5 dual-write coverage reactive sync.
  * Version: V.7.2 — Phase 1 audit BUG-H8: removed orphan flag `b2f_flag_ungroup_auto_hide` from whitelist + b2f_is_flag_enabled + b2f_get_all_flags + b2f_log_flag_change. The flag was declared, UI-toggleable, and dependency-checked but never consumed by any business logic. Auto-hide behavior is driven by the `admin_display_mode='as_parts'` junction column (set by Phase 4 migration when missing_leaves>0), not by a runtime flag.
  * Version: V.7.1 — Coverage rule auto-sync helpers: b2f_get_parents_for_sku, b2f_is_sku_registered_for_maker, b2f_is_coverage_complete, b2f_insert_auto_sync_junction_row, b2f_auto_sync_parent_coverage (reactive, used by Snippet 0.5 after dual-write), b2f_detect_missing_intermediates (used by Audit /sync-missing-intermediates endpoint). Philosophy: admin maintains only leaves; intermediates + top SETs auto-derive when all descendants covered. Skips blacklisted SKUs (via b2f_autosync_is_blacklisted). ON DUPLICATE KEY UPDATE id=id makes insert idempotent. unit_cost=0 since LIFF computes SET cost from leaves via b2f_compute_set_costs_v918.
  * Version: V.7.0 — Order Intent Helpers (3 axes: production_mode / admin_display_mode / order_mode). Section 100 adds 8 helpers: `b2f_get_production_mode()` (per-request static cache read junction), `b2f_infer_legacy_order_mode()` (display-only fallback for pre-V.7.0 PO), `b2f_validate_source_sku_in_ancestors()` (anti-malicious guard), `b2f_junction_update_classification()` (atomic UPDATE FOR UPDATE + auto-flip + audit + central hook fire), `b2f_order_mode_label()` (3-lang), `b2f_flex_intent_summary()` (PII-guarded mode breakdown), `b2f_audit_check_mysql_version()` (non-blocking CHECK capability probe), `b2f_infer_production_mode_from_relations()` (Snippet 0.5 dual-write helper). Error code registry (7 constants) + 3 new flags in whitelist (v11_explicit_mode / order_intent / ungroup_auto_hide) + central cache listener on `b2f_junction_updated` action (HIGH-4) + `b2f_flex_po_items_list()` optional `$show_mode_badge` param with PII guard (never forward poi_intent_notes).
@@ -203,12 +218,38 @@ if (!function_exists('b2f_liff_url')) {
     /**
      * สร้าง LIFF URL สำหรับ B2F — ใช้ HMAC sig เหมือน b2b_liff_url()
      * ไม่พึ่ง DINOCO_JWT (ที่เคย crash)
+     *
+     * V.7.4 S2 FIX (Phase 2 audit): optional 3rd arg `$line_user_id` binds signature
+     * to recipient. When `b2f_flag_sig_bind_uid` flag is ON (default) AND uid supplied:
+     *   - signed data includes `|_uid=<line_user_id>`
+     *   - full 64-char HMAC (not truncated 16)
+     *   - query string carries `_uid=<line_user_id>` so verifier can reconstruct
+     * Verifier (Snippet 2 V.11.5 `/auth-admin`) cross-checks LINE id_token `sub` against
+     * `_uid` param → URL forwarded to a different LINE user authenticates as THAT user,
+     * not the original recipient. Defeats "screenshot URL → anyone authenticates" attack.
+     *
+     * Backward compat: when flag OFF or `$line_user_id` empty, behaves like V.7.3 path
+     * (16-char sig, no uid bind). Audit dashboard Flag Panel can toggle for rollback.
+     *
+     * @param string $path         LIFF sub-path (e.g. 'b2f-catalog/', 'b2f-maker/')
+     * @param array  $params       additional query params
+     * @param string $line_user_id optional — recipient LINE UID to bind signature to
      */
-    function b2f_liff_url($path = '', $params = array()) {
+    function b2f_liff_url($path = '', $params = array(), $line_user_id = '') {
         $liff_id = B2F_LIFF_ID;
         if (empty($liff_id)) {
             error_log('[B2F] B2F_LIFF_ID not configured');
             return '#';
+        }
+
+        // V.7.4: determine if uid-binding mode should be used for this URL.
+        // Flag defaults ON; empty uid falls back to legacy (can't bind without it).
+        $bind_uid = false;
+        if (!empty($line_user_id) && function_exists('b2f_is_flag_enabled')) {
+            $bind_uid = b2f_is_flag_enabled('b2f_flag_sig_bind_uid');
+        } elseif (!empty($line_user_id)) {
+            // Helper missing (should not happen — Snippet 1 registers it), default ON
+            $bind_uid = true;
         }
 
         // HMAC signature (เหมือน b2b_liff_url pattern)
@@ -216,8 +257,24 @@ if (!function_exists('b2f_liff_url')) {
         $sig_path = ltrim($path, '/');
         $params['_ts'] = time();
         $secret = defined('B2B_LINE_CHANNEL_SECRET') ? B2B_LINE_CHANNEL_SECRET : wp_salt('auth');
-        $sig_data = $sig_path . '|' . implode('|', array_map(function($k, $v) { return $k . '=' . $v; }, array_keys($params), $params));
-        $params['_sig'] = substr(hash_hmac('sha256', $sig_data, $secret), 0, 16);
+
+        if ($bind_uid) {
+            // V.7.4 secure path: full 64-char sig + uid bound.
+            // Signed data = path|_ts=TS|_uid=UID  (deterministic stable ordering —
+            // verifier reconstructs same string). Extra `$params` are NOT part of
+            // signed data (matches V.7.3 simple model — verifier only checks path+ts).
+            $sig_data = $sig_path . '|_ts=' . $params['_ts'] . '|_uid=' . $line_user_id;
+            $params['_sig'] = hash_hmac('sha256', $sig_data, $secret); // full 64-char hex
+            $params['_uid'] = $line_user_id;
+        } else {
+            // V.7.3 legacy path — truncated 16-char sig over path+params (includes _ts).
+            // Kept for backward compat when flag OFF or uid unavailable.
+            $sig_data = $sig_path . '|' . implode('|', array_map(
+                function($k, $v) { return $k . '=' . $v; },
+                array_keys($params), $params
+            ));
+            $params['_sig'] = substr(hash_hmac('sha256', $sig_data, $secret), 0, 16);
+        }
 
         $url = 'https://liff.line.me/' . $liff_id . '/' . ltrim($path, '/');
         $url .= '?' . http_build_query($params);
@@ -3397,6 +3454,13 @@ if (!function_exists('b2f_build_flex_slip_rejected')) {
 //   - b2f_flag_read_from_junction   : Phase 3 — reads ใช้ canonical table
 //   - b2f_flag_v11_explicit_mode    : V.7.0 — backend return production_mode in API response
 //   - b2f_flag_order_intent         : V.7.0 — accept order_mode per item + LIFF UI gated
+//   - b2f_flag_coverage_autosync    : V.7.3 — kill-switch for Snippet 0.5 V.1.5 reactive
+//                                     coverage auto-sync (default ON — opt-out).
+//   - b2f_flag_sig_bind_uid         : V.7.4 — (S2 FIX) bind HMAC sig in b2f_liff_url() to
+//                                     line_user_id + full 64-char sig + id_token cross-
+//                                     check in /auth-admin. Default ON (secure). Flip OFF
+//                                     only for transition — lets old Flex cards with
+//                                     16-char sig still authenticate.
 //
 // Dependency chain (enforce at flag setter endpoint in Audit):
 //   - order_intent=ON ต้องมี v11_explicit_mode=ON ก่อน
@@ -3422,9 +3486,21 @@ if (!function_exists('b2f_is_flag_enabled')) {
             // V.7.0 (NEW — Order Intent)
             'b2f_flag_v11_explicit_mode',
             'b2f_flag_order_intent',
+            // V.7.3 (NEW — Coverage auto-sync kill-switch, default ON)
+            'b2f_flag_coverage_autosync',
+            // V.7.4 (NEW — S2 FIX: HMAC sig uid-binding, default ON)
+            'b2f_flag_sig_bind_uid',
         );
         if (!in_array($flag_name, $allowed, true)) return false;
-        return (bool) get_option($flag_name, false);
+        // V.7.3 MEDIUM-1 / V.7.4 S2: two flags default ON (opt-out for safety).
+        $default_on_flags = array('b2f_flag_coverage_autosync', 'b2f_flag_sig_bind_uid');
+        $default = in_array($flag_name, $default_on_flags, true) ? '1' : false;
+        $val = get_option($flag_name, $default);
+        if (in_array($flag_name, $default_on_flags, true)) {
+            // Treat any non-'0', non-false value as enabled (option may be stored as '1' or '0')
+            return ($val !== '0' && $val !== 0 && $val !== false);
+        }
+        return (bool) $val;
     }
 }
 
@@ -3438,6 +3514,10 @@ if (!function_exists('b2f_get_all_flags')) {
             // V.7.0 (NEW — Order Intent)
             'b2f_flag_v11_explicit_mode'  => b2f_is_flag_enabled('b2f_flag_v11_explicit_mode'),
             'b2f_flag_order_intent'       => b2f_is_flag_enabled('b2f_flag_order_intent'),
+            // V.7.3 (NEW — Coverage auto-sync kill-switch)
+            'b2f_flag_coverage_autosync'  => b2f_is_flag_enabled('b2f_flag_coverage_autosync'),
+            // V.7.4 (NEW — S2 FIX: HMAC sig uid binding)
+            'b2f_flag_sig_bind_uid'       => b2f_is_flag_enabled('b2f_flag_sig_bind_uid'),
         );
     }
 }
@@ -3451,6 +3531,10 @@ if (!function_exists('b2f_log_flag_change')) {
             'b2f_flag_read_from_junction',
             'b2f_flag_v11_explicit_mode',
             'b2f_flag_order_intent',
+            // V.7.3
+            'b2f_flag_coverage_autosync',
+            // V.7.4 (S2 FIX)
+            'b2f_flag_sig_bind_uid',
         );
         if (!in_array($flag, $allowed, true)) return;
         if (function_exists('b2b_log')) {
@@ -4137,9 +4221,14 @@ if (!function_exists('b2f_is_sku_registered_for_maker')) {
 /**
  * Check if $sku's children are ALL covered for $maker_id.
  * Coverage: leaf must be explicitly registered; non-leaf covered if all children covered (recursive).
+ *
+ * V.7.3 HIGH-2: Added optional $known_set parameter — pre-loaded { SKU_upper: true } map
+ * of maker's registered SKUs. Callers doing many checks per maker should pre-load once via
+ * b2f_load_maker_sku_set() to avoid N+1 SELECTs (one per child per walk). Backward compat:
+ * null = slow path (per-child SELECT, original behavior).
  */
 if (!function_exists('b2f_is_coverage_complete')) {
-    function b2f_is_coverage_complete($sku, $maker_id, $visited = null) {
+    function b2f_is_coverage_complete($sku, $maker_id, $visited = null, $known_set = null) {
         if ($visited === null) $visited = array();
         $sku_u = strtoupper(trim((string) $sku));
         if (!$sku_u || !$maker_id) return false;
@@ -4156,14 +4245,72 @@ if (!function_exists('b2f_is_coverage_complete')) {
         }
         if ($children === null || empty($children)) {
             // Leaf — covered iff registered
+            if (is_array($known_set)) return isset($known_set[$sku_u]);
             return b2f_is_sku_registered_for_maker($sku_u, $maker_id);
         }
         foreach ($children as $ch) {
-            if (b2f_is_sku_registered_for_maker($ch, $maker_id)) continue;
+            $child_registered = is_array($known_set)
+                ? isset($known_set[$ch])
+                : b2f_is_sku_registered_for_maker($ch, $maker_id);
+            if ($child_registered) continue;
             $sub_visited = $visited;
-            if (!b2f_is_coverage_complete($ch, $maker_id, $sub_visited)) return false;
+            if (!b2f_is_coverage_complete($ch, $maker_id, $sub_visited, $known_set)) return false;
         }
         return true;
+    }
+}
+
+/**
+ * V.7.3 HIGH-2: Load all registered SKUs for a maker as { SKU_upper: true } map.
+ * Use with b2f_is_coverage_complete()'s $known_set parameter to avoid per-child SELECT.
+ * Single SELECT — safe to call once per top-level walk.
+ */
+if (!function_exists('b2f_load_maker_sku_set')) {
+    function b2f_load_maker_sku_set($maker_id) {
+        global $wpdb;
+        $maker_id = intval($maker_id);
+        if (!$maker_id) return array();
+        $tbl = $wpdb->prefix . 'dinoco_product_makers';
+        $rows = $wpdb->get_col($wpdb->prepare(
+            "SELECT UPPER(product_sku) FROM {$tbl} WHERE maker_id = %d AND deleted_at IS NULL",
+            $maker_id
+        ));
+        $out = array();
+        if (is_array($rows)) {
+            foreach ($rows as $s) {
+                if ($s !== null && $s !== '') $out[strtoupper($s)] = true;
+            }
+        }
+        return $out;
+    }
+}
+
+/**
+ * V.7.3 HIGH-3: Static state for batching `b2f_junction_updated` hook fires during a
+ * single reactive walk. A top-level walk that inserts N ancestors would otherwise fire
+ * the hook N times (cache invalidation × N). Instead we queue maker_id during the walk
+ * and fire once at end.
+ *
+ * Usage:
+ *   b2f_defer_junction_updates_state('begin');
+ *   // ... during walk, insert helpers check state() and queue maker_id instead of firing
+ *   $deferred = b2f_defer_junction_updates_state('end');
+ *   foreach (array_keys($deferred) as $mid) { if ($mid !== '_active') do_action('b2f_junction_updated', $mid); }
+ *
+ *   b2f_defer_junction_updates_state()       → bool: active?
+ *   b2f_defer_junction_updates_state($mid)   → queue maker_id
+ */
+if (!function_exists('b2f_defer_junction_updates_state')) {
+    function b2f_defer_junction_updates_state($set = null) {
+        static $deferred = array();
+        if ($set === 'begin') { $deferred = array('_active' => true); return true; }
+        if ($set === 'end') {
+            $out = $deferred;
+            $deferred = array();
+            return $out;
+        }
+        if (is_int($set)) { $deferred[$set] = true; return true; }
+        return isset($deferred['_active']);
     }
 }
 
@@ -4183,7 +4330,24 @@ if (!function_exists('b2f_insert_auto_sync_junction_row')) {
         $maker_id = intval($maker_id);
         if (!$sku || !$maker_id) return false;
         if (!get_option('b2f_schema_v10_activated')) return false;
-        if (get_option('b2f_phase4_migration_in_progress')) return false;
+
+        // V.7.3 MEDIUM-2: Migration lock defer (mirrors Snippet 0.5 V.1.2 pattern).
+        // Previously returned false silently → caller walk stopped. Now schedule cron
+        // replay that re-attempts every 30s until lock clears.
+        if (get_option('b2f_phase4_migration_in_progress')) {
+            wp_schedule_single_event(time() + 15, 'b2f_replay_coverage_autosync', array($sku, $maker_id));
+            if (function_exists('b2f_log')) {
+                b2f_log('[AutoSync Coverage V.7.3] migration lock — deferred sku=' . $sku . ' maker=' . $maker_id);
+            }
+            return false;
+        }
+
+        // V.7.3 HIGH-1: Defense-in-depth fail-fast. Makes caller intent explicit
+        // + dead-code-safe if schema drifts (e.g. partial unique index). ON DUPLICATE
+        // KEY below is still the last line of defense.
+        if (b2f_is_sku_registered_for_maker($sku, $maker_id)) {
+            return true; // already present — treat as success (caller loop continues walking up)
+        }
 
         $pm = 'single';
         $ad = 'auto';
@@ -4215,7 +4379,13 @@ if (!function_exists('b2f_insert_auto_sync_junction_row')) {
         ));
         if ($ok === false) return false;
 
-        do_action('b2f_junction_updated', $maker_id);
+        // V.7.3 HIGH-3: Batch hook fire. If inside a deferred walk (begin..end),
+        // queue the maker_id for a single fire at walk end. Otherwise fire immediately.
+        if (b2f_defer_junction_updates_state()) {
+            b2f_defer_junction_updates_state($maker_id);
+        } else {
+            do_action('b2f_junction_updated', $maker_id);
+        }
         do_action('b2f_auto_sync_parent_added', $maker_id, $sku);
         if (function_exists('b2f_log')) {
             b2f_log('[AutoSync Coverage] added ' . $sku . ' for maker=' . $maker_id);
@@ -4225,38 +4395,97 @@ if (!function_exists('b2f_insert_auto_sync_junction_row')) {
 }
 
 /**
+ * V.7.3 MEDIUM-2: Cron handler — replay coverage auto-sync after migration lock clears.
+ * Loop-safe: re-queues every 30s while lock active; on clear, inserts the target SKU +
+ * walks up from it (ancestors may now be covered).
+ */
+if (!has_action('b2f_replay_coverage_autosync', 'b2f_replay_coverage_autosync_handler')) {
+    add_action('b2f_replay_coverage_autosync', 'b2f_replay_coverage_autosync_handler', 10, 2);
+}
+if (!function_exists('b2f_replay_coverage_autosync_handler')) {
+    function b2f_replay_coverage_autosync_handler($sku, $maker_id) {
+        $sku = strtoupper(trim((string) $sku));
+        $maker_id = intval($maker_id);
+        if (!$sku || !$maker_id) return;
+
+        if (get_option('b2f_phase4_migration_in_progress')) {
+            // Still locked — re-queue for later (simple tail-recursion via cron)
+            wp_schedule_single_event(time() + 30, 'b2f_replay_coverage_autosync', array($sku, $maker_id));
+            return;
+        }
+        if (function_exists('b2f_insert_auto_sync_junction_row')) {
+            b2f_insert_auto_sync_junction_row($sku, $maker_id);
+            // Also walk up — ancestors may now be covered after this insert
+            if (function_exists('b2f_auto_sync_parent_coverage')) {
+                b2f_auto_sync_parent_coverage($maker_id, $sku);
+            }
+        }
+    }
+}
+
+/**
  * Reactive: called after any maker-product save. Walks up from $child_sku. For each
  * ancestor not yet registered AND with all-children-covered AND not blacklisted →
  * INSERT. Continues walking until an ancestor fails coverage. Returns array of added SKUs.
  *
  * Depth cap 10 prevents runaway on malformed relations.
+ *
+ * V.7.3 HIGH-2: Pre-loads maker SKU set once at $depth=0, passes through recursion.
+ *   Updates set in-place after each successful insert so grandparent check sees fresh
+ *   state without another SELECT.
+ * V.7.3 HIGH-3: Wraps top-level walk with begin/end deferred hook state so the
+ *   b2f_junction_updated action fires ONCE per walk per maker (not once per insert).
  */
 if (!function_exists('b2f_auto_sync_parent_coverage')) {
-    function b2f_auto_sync_parent_coverage($maker_id, $child_sku, $depth = 0) {
+    function b2f_auto_sync_parent_coverage($maker_id, $child_sku, $depth = 0, $known_set = null) {
         $added = array();
         if ($depth > 10) return $added;
         $maker_id = intval($maker_id);
         $child_sku = strtoupper(trim((string) $child_sku));
         if (!$maker_id || !$child_sku) return $added;
+
+        // HIGH-2: Load maker SKU set once at top-level; pass through recursion.
+        $is_top = ($depth === 0);
+        if ($known_set === null) {
+            $known_set = b2f_load_maker_sku_set($maker_id);
+        }
+
+        // HIGH-3: Start deferred hook batching at top level.
+        if ($is_top) b2f_defer_junction_updates_state('begin');
+
         $parents = b2f_get_parents_for_sku($child_sku);
         foreach ($parents as $parent_sku) {
             if (function_exists('b2f_autosync_is_blacklisted')
                 && b2f_autosync_is_blacklisted($maker_id, $parent_sku)) {
                 continue;
             }
-            if (b2f_is_sku_registered_for_maker($parent_sku, $maker_id)) {
+            if (isset($known_set[$parent_sku])) {
                 // Already there — continue walking up (grandparent may now be coverable)
-                $sub = b2f_auto_sync_parent_coverage($maker_id, $parent_sku, $depth + 1);
+                $sub = b2f_auto_sync_parent_coverage($maker_id, $parent_sku, $depth + 1, $known_set);
                 $added = array_merge($added, $sub);
                 continue;
             }
-            if (!b2f_is_coverage_complete($parent_sku, $maker_id)) continue;
+            if (!b2f_is_coverage_complete($parent_sku, $maker_id, null, $known_set)) continue;
             if (b2f_insert_auto_sync_junction_row($parent_sku, $maker_id)) {
                 $added[] = $parent_sku;
-                $sub = b2f_auto_sync_parent_coverage($maker_id, $parent_sku, $depth + 1);
+                // HIGH-2: update in-place so grandparent check sees fresh state
+                $known_set[$parent_sku] = true;
+                $sub = b2f_auto_sync_parent_coverage($maker_id, $parent_sku, $depth + 1, $known_set);
                 $added = array_merge($added, $sub);
             }
         }
+
+        // HIGH-3: End deferred batch at top level — fire queued hooks once.
+        if ($is_top) {
+            $deferred = b2f_defer_junction_updates_state('end');
+            if (is_array($deferred)) {
+                unset($deferred['_active']);
+                foreach (array_keys($deferred) as $mid) {
+                    do_action('b2f_junction_updated', intval($mid));
+                }
+            }
+        }
+
         return array_values(array_unique($added));
     }
 }
@@ -4313,9 +4542,14 @@ if (!function_exists('b2f_detect_missing_intermediates')) {
 
         $out = array();
         foreach ($maker_skus as $mid => $set) {
-            // Loop until stable — ancestor additions may enable grandparent coverage
+            // Loop until stable — ancestor additions may enable grandparent coverage.
+            // V.7.3 LOW-2: hard safety cap. Bounded by count($all_parents) in theory, but
+            // defensive cap prevents runaway if relations contain an unexpected cycle.
             $stable = false;
-            while (!$stable) {
+            $max_iter = 100;
+            $iter = 0;
+            while (!$stable && $iter < $max_iter) {
+                $iter++;
                 $stable = true;
                 foreach ($all_parents as $p_u) {
                     if (isset($set[$p_u])) continue;
@@ -4327,6 +4561,9 @@ if (!function_exists('b2f_detect_missing_intermediates')) {
                         $stable = false;
                     }
                 }
+            }
+            if ($iter >= $max_iter && function_exists('b2f_log')) {
+                b2f_log('[DetectMissing V.7.3] hit iteration cap max_iter=' . $max_iter . ' maker_id=' . $mid);
             }
         }
         return $out;
