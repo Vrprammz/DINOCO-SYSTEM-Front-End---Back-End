@@ -107,6 +107,7 @@
 | [System] Dashboard - Header & Forms | V.30.3 | 28 | `[dinoco_dashboard_header]` | Sidebar, profile card, PDPA, registration forms |
 | [System] Dashboard - Assets List | V.30.2 | 29 | `[dinoco_dashboard_assets]` | Assets list with bundle support |
 | [System] DINOCO MCP Bridge | V.2.2 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints, per-lead storage) |
+| [System] DINOCO GDPR Data Requests | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — Thai PDPA compliance stubs. 3 endpoints `/wp-json/dinoco-gdpr/v1/{my-data-export,my-data-delete,my-data-status}`. Flag `dinoco_gdpr_enabled` default OFF → returns 503. Schema `wp_dinoco_gdpr_requests` (id, user_id, type, status, created_at, processed_at, notes) lazy-install via `dbDelta` on first use. Data scope: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE messages (via agent:3000). Full impl + admin review UI deferred to Phase 6. |
 
 ### 2.2 [Admin System] -- Admin/Management
 
@@ -127,6 +128,8 @@
 | [Admin System] DINOCO Brand Voice Pool | V.2.5 | 1159 | `[dinoco_brand_voice]` | Social listening + brand sentiment analysis |
 | [Admin System] B2F Migration Audit | V.3.3 | pending | `[b2f_migration_audit]` | **Option F Hybrid Shadow-Write audit** — 13 REST endpoints `/wp-json/dinoco-b2f-audit/v1/` (drift/stale/parity/dry-run/feature-flags/activate-schema/backfill/junction-snapshot/observations + **V.3.2 Option F**: maker-products-with-source/junction-bulk-delete/autosync-blacklist GET+POST) + 6 dashboard sections. **Phase 3 ACTIVE** since 2026-04-16 — reads flipped to junction. Rate limit 20/hr read, 5/hr destructive. **V.3.3 (housekeeping H-1)**: docs clarify backfill orphan INSERT `ON DUPLICATE KEY UPDATE` semantics — `status`+`deleted_at` preserved across re-runs (honors admin soft-delete). |
 | [Admin System] Product Catalog Export Tool | V.1.2 | pending | -- | 1-click ZIP bundle (5 CSVs incl. migration-audit-report) for offline analysis |
+| [Admin System] DINOCO Modal Helpers | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — shared `window.dinocoModal.{confirm,alert,prompt}({})` API replacing native blocking dialogs. Scoped `.dnc-modal-*` CSS + ESC/focus-trap/backdrop-click/native-fallback. 6 destructive admin sites migrated (BO confirm/reject/cancel-item/split-bo + B2F rejectLot + Phase 4 LIVE). 67 sites remaining for Phase 6 bulk migration. |
+| [Admin System] DINOCO Observability | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — Sentry + correlation ID + structured logs. 5 functions (`is_enabled`, `init_sentry`, `capture`, `get_request_id`, `rest_post_dispatch` correlation filter). 3 wp_option flags default=0: `dinoco_obs_sentry_enabled`, `dinoco_obs_correlation_enabled`, `dinoco_obs_structured_log`. Defensive `class_exists('\Sentry\Client')` — zero behavior change if SDK missing. Activate via `composer require sentry/sentry` + flag flip. |
 
 ### 2.3 [AdminSystem-System] -- Infrastructure
 
@@ -450,6 +453,16 @@ Flag helpers ใน B2F Snippet 1 V.6.5: `b2f_is_flag_enabled($name)`, `b2f_get_
 ### 3.8 Infrastructure (`/wp-json/dinoco/v1/`)
 
 github-sync (webhook), github-sync-manual, sync-status
+
+### 3.9 GDPR (`/wp-json/dinoco-gdpr/v1/`) -- V.1.0 stubs, flag-gated OFF
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/my-data-export` | WP login | User requests data export → queue for admin review |
+| POST | `/my-data-delete` | WP login | User requests account deletion → queue + anonymize decision |
+| GET | `/my-data-status` | WP login | Check status of active request |
+
+**Status**: Phase 5 scaffold (2026-04-17). All 3 return 503 until `dinoco_gdpr_enabled=1`. Schema `wp_dinoco_gdpr_requests` lazy-install on first activation. Admin review UI deferred to Phase 6.
 
 ---
 

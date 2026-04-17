@@ -250,7 +250,15 @@ End State: Order shipped → completed
 
 ### 2.10 B2B Backorder System -- Opaque Accept + Admin Split BO (V.1.6, 2026-04-16)
 
-Phase A-D implementation per `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`. Master flag `b2b_flag_bo_system` default OFF.
+Phase A-D implementation per `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`.
+
+**Flag state**: `b2b_flag_bo_system=1` **ON globally** (activated 2026-04-17 via phpMyAdmin after Phase 1-4 audit remediation closed all ship-blockers). Whitelist `b2b_flag_bo_beta_distributors` empty = applies to **all distributors**.
+
+**Rollback (instant, no re-deploy)**:
+```sql
+UPDATE wp_options SET option_value='0' WHERE option_name='b2b_flag_bo_system';
+```
+Or via UI: Admin Dashboard → ระบบ B2B → BO Flags → กด "ปิด (OFF)". Reverts to Phase 0 hotfix (Snippet 1 V.33.7 + Snippet 15 V.7.5) — `b2b_check_order_oos()` hierarchy-aware still protects against Ticket #6266.
 
 #### 2.10.1 Customer Opaque Accept Flow
 
@@ -411,6 +419,62 @@ Admin Dashboard → Security Log tab
 | `b2b_bo_pending_review_expire_cron` | hourly | 72h timeout → auto-cancel |
 | `b2b_bo_enumeration_scan_cron` | hourly | detect abuse patterns + Telegram |
 | `b2b_bo_attempt_log_cleanup_cron` | daily 03:00 | 90d retention, chunked 1000/iter + 50ms gap |
+
+### 2.13 Modal Pattern (V.1.0 — 2026-04-17)
+
+Native `confirm/alert/prompt` replaced with `window.dinocoModal.*` API on destructive admin actions. Migration pattern for callers:
+
+```javascript
+// Before (blocking, no styling, inconsistent UX)
+if (!confirm('ยืนยันลบข้อมูล?')) return;
+
+// After (async, scoped CSS, ESC/focus-trap, native fallback)
+try {
+  const ok = await window.dinocoModal.confirm({
+    title: 'ยืนยันการลบ',
+    message: 'ข้อมูลจะถูกลบถาวร ไม่สามารถกู้คืนได้',
+    confirmText: 'ลบ', confirmVariant: 'danger',
+    cancelText: 'ยกเลิก'
+  });
+  if (!ok) return;
+} catch (e) {
+  // Fallback to native if snippet not loaded
+  if (!confirm('ยืนยันการลบ?')) return;
+}
+```
+
+**Migrated sites (Phase 5)**: BO `bo_confirm_full`, `bo_reject`, `bo_cancel_item`, Split BO final confirm, B2F `rejectLot`, Phase 4 LIVE migration.
+
+**Remaining (Phase 6 sprint, ~67 sites)**: bulk modal migration planned as dedicated sprint. Snippet `[Admin System] DINOCO Modal Helpers` V.1.0.
+
+### 3.5 GDPR/PDPA Self-Service (V.1.0 stubs — 2026-04-17)
+
+**Current status**: Flag `dinoco_gdpr_enabled=0` → endpoints return 503. Users directed to email support for manual handling until Phase 6 full implementation.
+
+**Future workflow (when flag flipped ON)**:
+
+```
+User → LIFF member dashboard → "ส่งออกข้อมูลของฉัน"
+    ↓
+POST /dinoco-gdpr/v1/my-data-export (WP login required)
+    ├─ Validate user session
+    ├─ INSERT wp_dinoco_gdpr_requests (user_id, type=export, status=queued)
+    └─ Return { request_id, eta_days }
+    ↓
+Admin Dashboard → GDPR Requests tab (future UI) → review queue
+    ↓
+Admin approves → cron job generates ZIP bundle:
+    ├─ wp_users + wp_usermeta export
+    ├─ distributor CPT + warranties + claims (if linked)
+    ├─ B2B orders history (if distributor)
+    └─ LINE messages export (via openclaw agent:3000 bridge)
+    ↓
+Email user with download link (expires 7d) OR hard-delete on type=delete
+    ↓
+Update status=done + processed_at
+```
+
+**Data scope**: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE conversation logs (via OpenClaw agent).
 
 ---
 

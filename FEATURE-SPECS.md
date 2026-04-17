@@ -8,11 +8,20 @@
 
 ---
 
-## 5. B2B Backorder System (Phase A-D Complete)
+## 5. B2B Backorder System (Phase A-D Complete — LIVE in Production 2026-04-17)
 
-**Version:** V.1.6 | **Snippet:** [B2B] Snippet 16 (~3497 LOC) | **Spec:** `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`
+**Version:** V.1.6+ (patches V.1.7-V.1.11 during audit remediation) | **Snippet:** [B2B] Snippet 16 (~3497 LOC) | **Spec:** `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`
 
 **Philosophy shift:** "realtime stock check on order" → **"opaque accept + admin split review"**
+
+**Production status (2026-04-17)**: Master flag `b2b_flag_bo_system=1` ON globally via phpMyAdmin after Phase 1-4 audit remediation closed all ship-blockers. Whitelist empty = applies to all distributors. 7+ bugs fixed during audit: BUG-C1 (rate-limit semantic), BUG-C2 (stock double-subtract via `_stock_deducted` flag), BUG-C3/C5/C6/C7 (postback dispatcher wire-up + tier-price debt + fail-loud on missing product), BUG-H3/H4 (additional BO edge cases). 6 Modal Helper migrations complete (bo_confirm_full, bo_reject, bo_cancel_item, split_bo final, rejectLot, Phase 4 LIVE).
+
+**Production monitoring checklist (first 72h after flip)**:
+- Stock negative anomalies (`dinoco_stock_transactions` WHERE qty_after < 0)
+- BO queue health: pending volume vs ready promoted (cron `b2b_bo_restock_scan_cron` every 15min)
+- Enumeration flags: `_b2b_enumeration_flags` distributor meta bit field (rate_hit / cancel_abuse / qty_cap_hit / suspicious_pattern)
+- Pending review aging: orders stuck > 24h in `pending_stock_review` (72h auto-cancel cron catches edge cases)
+- Admin Dashboard → Backorders tab badge count + Security Log tab
 
 ### 5.1 Problem & Goal
 

@@ -151,6 +151,15 @@ All under `/wp-json/dinoco-mcp/v1/` (32 endpoints, V.2.0):
 - **Phase 2**: `warranty-registered`, `member-motorcycle`, `member-assets`, `customer-link`, `dealer-sla-report`, `distributor-get/{id}`, `product-compatibility`
 - **Phase 3**: `kb-updated`, `inventory-changed`, `moto-catalog`, `dashboard-inject-metrics`, `lead-attribution`
 
+## REST API Endpoints (GDPR)
+
+All under `/wp-json/dinoco-gdpr/v1/` (V.1.0 stubs, flag `dinoco_gdpr_enabled` default=0 → returns 503):
+- `POST /my-data-export` — logged-in user requests data export (queue + admin review)
+- `POST /my-data-delete` — logged-in user requests account deletion (queue + anonymize/hard-delete decision)
+- `GET /my-data-status` — check status of active request
+
+Schema `wp_dinoco_gdpr_requests` (id, user_id, type, status, created_at, processed_at, notes) lazy-install via `dbDelta` on first activation. Data scope: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE messages (via agent:3000). Full implementation + admin review UI deferred to Phase 6.
+
 ## Required WordPress Constants
 
 - `DINOCO_LINE_CHANNEL_ID` — LINE OAuth app ID
@@ -169,6 +178,9 @@ All under `/wp-json/dinoco-mcp/v1/` (32 endpoints, V.2.0):
 - `DINOCO_JWT` — HMAC secret for God Mode margin-analysis JWT (V.42.17)
 - `B2F_DISABLED` — kill switch for B2F module (optional boolean)
 - `B2B_WALKIN_BANK_*` — optional walk-in bank override (BANK_NAME, BANK_NAME_EN, BANK_ACCOUNT, BANK_HOLDER, BANK_CODE, BANK_LOGO_URL, PROMPTPAY_ID) — falls back to `B2B_BANK_*` if undefined
+- `DINOCO_SENTRY_DSN` — optional Sentry DSN for Observability snippet (V.1.0). Requires `composer require sentry/sentry` + `dinoco_obs_sentry_enabled=1` to activate
+- `DINOCO_SENTRY_ENV` — optional Sentry environment tag (default `production`)
+- `DINOCO_SENTRY_SAMPLE_RATE` — optional transaction sample rate 0.0-1.0 (default 0.1)
 
 ## File Organization
 
@@ -531,6 +543,10 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - **Lead Pipeline V.2.0** (8 เม.ย.): 3 statuses ใหม่ (`closed_won`, `waiting_decision`, `waiting_stock`) + Auto-lead V.8.0 (ชื่อ+เบอร์ → lead + Flex ไปตัวแทน) + `notifyDealerDirect()` centralized + `lookupProductForLead()` enrich รูป+ราคา + 5 Flex builders + postback ใช้ FSM (`updateLeadStatus`) + normalize field `history`.
   - **AI Chat V.8.1** (8 เม.ย.): Claude review text leak filter + PII masking in conversation history + FB image URL robust extraction + false hallucination alert fix + Product Knowledge Rules (H2C/materials/Side Rack/DINOCO Edition silver/BULK → ตัวแทน/"ยินดีให้บริการ" ban).
   - **Dashboard Critical Fixes** (8-10 เม.ย.): basepath fix (`dealer-sla`, `claims` → `/dashboard/api/proxy/*`), duplicate "ที่อยู่" removed, silent fallback → 503 error response (11 files), Claim actions Case A/B/Reject buttons + REST API `/api/proxy/claims/[id]/status`, Auth ใช้ `proxy.ts` ของ Next.js 16 (ลบ `middleware.ts` — conflict), TypeScript cast for MongoDB `$push`.
+- **Modal Helpers (V.1.0, 2026-04-17)**: `[Admin System] DINOCO Modal Helpers` snippet. `window.dinocoModal.{confirm,alert,prompt}({})` API replacing native blocking dialogs. Scoped `.dnc-modal-*` CSS with ESC/focus-trap/backdrop-click support + native `confirm()/alert()/prompt()` fallback when snippet not loaded (defensive pattern via try/catch in callers). 6 destructive admin sites migrated in Phase 5: BO admin `bo_confirm_full`, `bo_reject`, `bo_cancel_item`, Split BO final confirm, B2F `rejectLot`, Phase 4 LIVE migration. ~67 `confirm/alert/prompt` sites remaining documented for Phase 6 bulk migration sprint.
+- **Observability (V.1.0, 2026-04-17)**: `[Admin System] DINOCO Observability` snippet. 5 functions: `dinoco_obs_is_enabled($channel)`, `dinoco_obs_init_sentry()`, `dinoco_obs_capture($ex, $ctx)`, `dinoco_obs_get_request_id()`, + `rest_post_dispatch` filter injecting `X-Request-ID` correlation header on all DINOCO REST responses. 3 wp_option flags default=0: `dinoco_obs_sentry_enabled`, `dinoco_obs_correlation_enabled`, `dinoco_obs_structured_log`. Defensive `class_exists('\Sentry\Client')` check — zero behavior change if SDK missing. Activation: `composer require sentry/sentry` + `DINOCO_SENTRY_DSN` env + flag flip. OpenClaw proxy V.2.1 adds optional `require('@sentry/node')` init gated by `process.env.SENTRY_DSN` (try/catch defensive).
+- **GDPR Compliance (V.1.0 stubs, 2026-04-17)**: `[System] DINOCO GDPR Data Requests` snippet. Thai PDPA compliance scaffolding. Endpoints `POST /dinoco-gdpr/v1/my-data-export`, `POST /my-data-delete`, `GET /my-data-status` return 503 until `dinoco_gdpr_enabled=1`. Schema `wp_dinoco_gdpr_requests` (id, user_id, type [export|delete], status [queued|processing|done|rejected], created_at, processed_at, notes) lazy-install via `dbDelta` on first activation. Data scope documented: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE messages (via openclaw agent). Full implementation + admin review UI + legal review deferred to Phase 6.
+- **Audit Remediation 2026-04-17** (59 commits, 5 phases): Full repo audit closed 70+ findings (41% of ~170 unique). **Phase 1** (6 commits `e10249a..96e4072`) — 12 quick wins: BUG-C1 rate-limit semantic, BUG-C4 PII gate, DB-C3 VARCHAR, S4 Telegram, UX-C3 amber contrast, PERF-H1 static memo, etc. **Phase 2** (9 commits, 4 parallel agents) — S1/S2/S3/S5/S9/S17 auth/CSRF hardening, BUG-C2/C3/C5/C6/C7 BO stock double-subtract, DB-C1/C2 CHECK + SARGable. **Phase 3** (15 commits, 4 parallel agents) — PERF-H2/H3/H5/H8/H9/H10 + UX a11y bundle (ESC/focus-trap/touch/media queries) + BUG-H7/H10 enum+dualwrite 3-level. **Phase 4** (10 commits, 3 agents + orchestrator) — DB-H1/H4, BUG-H5/H11, UX-H9/H10/H12/H19 + UI polish + DOC drift + LICENSE. **Hotfixes** (3 commits): LIFF AI V.3.6/V.3.7 PHP 8 + echo, B2B Snippet 2 V.34.6 `ขอไอดีฉัน/myuid` command. **Phase 5 post-flip** (9 commits `1404b85..d2cf413`): Modal Helpers + Observability + GDPR + OpenClaw Sentry + phpunit + OpenAPI 3.1 spec + Vite LIFF foundation. **Production provisioning 2026-04-17**: `b2b_flag_bo_system=1` ON globally (BO system live), `dinoco_line_uid` meta for 1 admin (LIFF AI strict mode active). Full details: `AUDIT-REPORT-2026-04-17.md` Remediation Status.
 
 ## Reference Documentation
 

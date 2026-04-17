@@ -22,11 +22,34 @@
   PERF-H8 (flash cron), BUG-H7 (enum), BUG-H10 (dualwrite 3-level),
   UX-H1 (media queries), UX-H5 (alt text), UX-H6/H7/H8 (touch + ESC + focus trap),
   UX-H11 (flags indicator), UX-H14/H15/H16/H17 (polish)
-- **Phase 4 IN PROGRESS** (this commit) — docs drift + LICENSE + env docs:
+- **Phase 4 COMPLETE** (10 commits `259d24d..550818d`) — remaining High + Medium + docs:
+  DB-H1/H4, BUG-H5/H11, UX-H9/H10/H12/H19, UI polish P1-P18 + M-bundle,
   DOC-1 (cron name `b2f_diff_cron_hourly`), DOC-2 (Slip2Go PULL-only clarification),
   DOC-3 (125+ endpoints), CONFIG-1 (LICENSE GPL-2.0+), CONFIG-2 (.env.example WordPress),
   CONFIG-3 (openclawminicrm/.env.example augment)
-- **Phase 3+ pending** (user decision): remaining ~45 High + ~60 Medium/Low + UX polish + Next review cycle initiatives
+- **Hotfixes during session** (3 commits):
+  `b072f74` LIFF AI V.3.6 PHP 8 ArgumentCountError fix (template_redirect default $atts);
+  `4576d9e` LIFF AI V.3.7 echo render_page return value (buffered HTML);
+  `80b7cc7` B2B Snippet 2 V.34.6 — new `ขอไอดีฉัน / myuid / whoami` command (returns LINE UID for `dinoco_line_uid` provisioning)
+- **Production provisioning** (2026-04-17, via phpMyAdmin):
+  `dinoco_line_uid` meta inserted for DINOCO admin (UID `Uc67c8594bad94cd1b059db742f467c2d`) → LIFF AI strict mode active;
+  `b2b_flag_bo_system=1` flipped ON globally (empty whitelist = all distributors) — BO system live production
+- **Phase 5 POST-FLIP COMPLETE** (9 commits `1404b85..d2cf413`) — foundation scaffolds for future sprints:
+  - Modal helper V.1.0 snippet (`window.dinocoModal.{confirm,alert,prompt}` + ESC/focus-trap/backdrop/native-fallback) + 6 top destructive admin sites migrated (bo_confirm_full, bo_reject, bo_cancel_item, split_bo final, rejectLot, Phase 4 LIVE migration). 67 remaining sites documented for future sprints.
+  - Observability V.1.0 snippet (Sentry + correlation ID + structured logs, flag-gated OFF, `composer require sentry/sentry` + env setup to activate)
+  - OpenClaw Sentry init (defensive `require('@sentry/node')` in try/catch — zero behavior change if SDK missing)
+  - GDPR/PDPA scaffold V.1.0 snippet: 3 endpoints `/wp-json/dinoco-gdpr/v1/{my-data-export,my-data-delete,my-data-status}` + `wp_dinoco_gdpr_requests` table schema (stubs, flag `dinoco_gdpr_enabled` default OFF, returns 503 until activated)
+  - phpunit scaffold: `tests/helpers/{CurrencyTest,FSMValidationTest}.php` + `phpunit.xml.dist` + `composer.json` (28 assertions, <5s runtime)
+  - OpenAPI 3.1 spec: `docs/api/openapi.yaml` (2052 lines, 61 operations, 27 schemas, 6 auth schemes)
+  - Vite LIFF pipeline foundation: `liff-src/*` tree (b2b/catalog, b2f/catalog+maker, liff-ai/frontend + shared/{liff-init,api-client,modal}.js) + `vite.liff.config.js` (no migration yet)
+  - `11c8558` remove sidebar FLAGS indicator + Export Catalog FAB (clutter after BO activation)
+- **Phase 6 FUTURE** (deferred sprints):
+  - Bulk modal migration (67 remaining `confirm/alert/prompt` sites)
+  - LIFF bundle migration pilot (B2B Snippet 4 → liff-src/b2b/catalog)
+  - GDPR full implementation + admin review UI + legal review
+  - Sentry activation + team onboarding (composer require + npm install + flag flip)
+  - B2F Phase 4 CPT retirement (2-4 weeks staged observation)
+  - `wp_postmeta` compound index (destructive DB ALTER — staging test first)
 
 ---
 
