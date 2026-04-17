@@ -16,7 +16,17 @@
   S9 + S17 (OpenClaw read + PATCH whitelist), BUG-C2 + C3 + C5 + C6 + C7 + H3 + H4 (BO stock/postback/debt),
   DB-C1 (Snippet 0.5 CHECK consistency), DB-C2 (SARGable UPPER), DB-H7 + H8 (B2F cron flag gate + TTL chunking),
   DB-H6 (Phase 4 lock self-heal — this commit)
-- **Phase 3+ pending** (user decision): remaining ~60 High + ~60 Medium/Low + UX polish + Next review cycle initiatives
+- **Phase 3 COMPLETE** (15 commits `c0417bb..aa92f2d`) — 14 perf + UX + infra items closed:
+  S10 (RPi auth), API-H1 (merge routes), API-H2 (MCP TOCTOU), API-H3 (Flash nonce),
+  PERF-H2 (dashboard-stats), PERF-H3 (makers list), PERF-H5 (Inventory auto-sync),
+  PERF-H8 (flash cron), BUG-H7 (enum), BUG-H10 (dualwrite 3-level),
+  UX-H1 (media queries), UX-H5 (alt text), UX-H6/H7/H8 (touch + ESC + focus trap),
+  UX-H11 (flags indicator), UX-H14/H15/H16/H17 (polish)
+- **Phase 4 IN PROGRESS** (this commit) — docs drift + LICENSE + env docs:
+  DOC-1 (cron name `b2f_diff_cron_hourly`), DOC-2 (Slip2Go PULL-only clarification),
+  DOC-3 (125+ endpoints), CONFIG-1 (LICENSE GPL-2.0+), CONFIG-2 (.env.example WordPress),
+  CONFIG-3 (openclawminicrm/.env.example augment)
+- **Phase 3+ pending** (user decision): remaining ~45 High + ~60 Medium/Low + UX polish + Next review cycle initiatives
 
 ---
 
@@ -429,13 +439,13 @@ WordPress (60 snippets, 1 DB)
 
 | Item | Doc says | Code reality | Action |
 |------|----------|--------------|--------|
-| Cron name `b2f_junction_diff_cron` | CLAUDE.md references this hook | Snippet 11:60,604 registers `b2f_diff_cron_hourly` | Rename or fix docs |
-| Slip2Go webhook | CLAUDE.md claims webhook integration | No webhook registered — slip verification is **PULL** (WP → Slip2Go) | Update CLAUDE.md |
-| REST endpoint count | CLAUDE.md claims 73+ | Actual ~125 (includes MCP namespace) | Update CLAUDE.md |
+| Cron name `b2f_junction_diff_cron` | CLAUDE.md references this hook | Snippet 11:60,604 registers `b2f_diff_cron_hourly` | ✅ **CLOSED Phase 4** — CLAUDE.md + SYSTEM-REFERENCE.md updated to use registered name `b2f_diff_cron_hourly` |
+| Slip2Go webhook | CLAUDE.md claims webhook integration | No webhook registered — slip verification is **PULL** (WP → Slip2Go) | ✅ **CLOSED Phase 4** — CLAUDE.md + SYSTEM-REFERENCE.md clarified as "PULL only, no webhook registered" |
+| REST endpoint count | CLAUDE.md claims 73+ | Actual ~125 (includes MCP namespace) | ✅ **CLOSED Phase 4** — CLAUDE.md now states "125+ REST endpoints across 7 namespaces" with per-namespace breakdown |
 | MCP Bridge endpoint count | CLAUDE.md claims 32 | ~32 confirmed (matches) | ✅ OK |
-| V.7.0 Order Intent rollout | CLAUDE.md says "flags OFF default, no canary" | Flag `b2f_flag_ungroup_auto_hide` **orphan** (never consumed) | Either implement or remove |
+| V.7.0 Order Intent rollout | CLAUDE.md says "flags OFF default, no canary" | Flag `b2f_flag_ungroup_auto_hide` **orphan** (never consumed) | ✅ **CLOSED Phase 1** — orphan flag removed in upstream `9e70b4c`; docs synced `96e4072` |
 | Sprint 4 M15 "12 color tokens + 3 POC" | CLAUDE.md claims adopted | 60+ inline hex still across snippets; 2 fonts (Noto + Sarabun) coexist | Partial adoption — continue |
-| LICENSE | Not specified anywhere | No LICENSE file | Add (GPL v2+ implied by WordPress) |
+| LICENSE | Not specified anywhere | No LICENSE file | ✅ **CLOSED Phase 4** — GPL-2.0-or-later added at repo root |
 | GDPR/PDPA | No mentions | No data export/deletion endpoints | Add per PDPA requirements |
 
 ---

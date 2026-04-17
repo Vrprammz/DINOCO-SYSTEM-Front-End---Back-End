@@ -36,7 +36,7 @@
 | **AI (Chatbot)** | OpenClaw Mini CRM | Node.js + Express, Gemini Flash + Claude Sonnet, MongoDB Atlas |
 | **Messaging** | LINE Messaging API | Flex Messages, Push/Reply, Rich Menu |
 | **Shipping** | Flash Express API | Create order, print label, track, notify courier |
-| **Payment Verify** | Slip2Go API | Bank slip OCR verification |
+| **Payment Verify** | Slip2Go API (PULL only) | Bank slip OCR verification — WP calls Slip2Go on-demand (no webhook registered) |
 | **PDF** | PHP GD Library | Invoice/PO images as PNG (A4 format) |
 | **Deployment** | GitHub Webhook Sync | Push to main -> auto-sync to WordPress wp_snippets |
 | **Timezone** | Asia/Bangkok (ICT) | Hardcoded throughout |
@@ -171,7 +171,7 @@
 | Snippet 8: Admin LIFF E-Catalog | V.6.6 | 1168 | LIFF ordering + SET Detail View + Model Filter (V.5.3 inherit descendants + V.5.4 fallback ผ่าน catalogMap เมื่อ leaf ไม่อยู่ใน maker list) + type tabs (mutually exclusive) + count badges + hide empty + labels ตรงกับ Inventory "ชุด SET"/"เดี่ยว"/"ลูกชิ้นส่วน"/"ชิ้นส่วนย่อย" + shared badge + cart manufacturing summary (DD-3) + **V.5.5: removed window._b2fcat debug namespace (production cleanup)** + **V.5.7 Virtual SET display** (amber badge "ประกอบจากชิ้นส่วน" + is_virtual badge) + **V.5.10 Product Picker align Inventory V.43.6** + **V.6.0-V.6.4 UX overhaul**: qty stepper SET Detail (1-999) + back button redesign (← กลับ 44×44 dark) + cart bar black bg + green CTA z-index 600 + main SET stepper + cart thumbnails 56×56 + sub-item stepper toggle (`+ สั่งแยก` default) + 🗑️ red remove button + **V.6.5**: toggle "รวมชุดประกอบจากชิ้นส่วน" (default OFF) ซ่อน virtual top-level SETs + **V.6.6 (housekeeping M-2)**: virtual toggle localStorage scoped per-maker (`b2f_show_virtual_sets_{makerId}`) + **V.7.0 (Order Intent System)**: 3 card variants (🟣 ชุดเต็ม set_assembled / 🟠 แยกชุด sub_unit / ⚪ ชิ้นเดี่ยว single) + 🟠 DINOCO ประกอบ cross_factory_assembly (hidden default). Maker banner with stats (hide if unconfirmed=0). SET Detail mode toggle (ครบชุด vs แยก) z=500 overlay. **Dual-section cart** (🟣 full_set vs 🟠+⚪ parts). **Cart localStorage persistence** `b2f_cart_v7_{maker_id}` schema v7 (persists across reloads, clears on submit success). Submit Review Gate 3-bucket accordion (no mixed-mode warn). Mode badge = read-only (no override chip). Feature flag `b2f_flag_order_intent` gates ALL V.7.0 UI (OFF = V.6.6 fallback). XSS-safe intent_notes render via `textContent`. Submit payload `POST /create-po` with `{sku, qty, order_mode, source_sku, intent_notes}` per item. Post-submit toast "ยกเลิกได้ 30 วิ" → calls `POST /po-undo-submit`. `_version='V.7.0'` |
 | Snippet 9: PO Ticket View | V.3.6 | 1169 | PO detail + hierarchy SET grouping + view toggle (ตามชุด/ยอดรวมผลิต) (DD-3) + **V.3.6 (V.7.0)**: Intent Summary Box top (🟣🟠⚪ 3-bucket breakdown from `_b2f_order_intent_summary` postmeta) + Mode column per item (Thai label via `b2f_order_mode_label()`) + intent_notes display admin-only (XSS-safe `textContent`) + legacy PO fallback "—" + CSS `.b2f-mode-badge` classes |
 | Snippet 10: PO Image Generator | V.3.0 | 1170 | A4 PO PNG + hierarchy SET header rows + **V.2.7**: 3-level hierarchy rows (purple SET + blue CHILD + leaf rows) via `b2f_group_items_by_path` + **V.3.0 (V.7.0)**: GD mode badge per item (colored rectangle + 7pt label) + 3-lang labels via `b2f_order_mode_label($mode, $currency)` (THB/USD/CNY) + Intent Summary header box on page 0 (light blue bordered box with 3-bucket breakdown). NO intent_notes in image (PII protection) |
-| Snippet 11: Cron Jobs & Reminders | V.2.2 | 1171 | 7 cron เดิม + **V.2.2**: `b2f_junction_diff_cron` (hourly CPT vs junction drift log) + `b2f_observations_ttl_cron` (daily 60-day prune) |
+| Snippet 11: Cron Jobs & Reminders | V.2.2 | 1171 | 7 cron เดิม + **V.2.2**: `b2f_diff_cron_hourly` (hourly CPT vs junction drift log — registered hook name; earlier docs said `b2f_junction_diff_cron` which was never registered) + `b2f_observations_ttl_cron` (daily 60-day prune) |
 
 ### 2.6 [LIFF AI] -- AI Command Center (2 Snippets)
 
@@ -1839,7 +1839,7 @@ sequenceDiagram
 | LINE Platform | WordPress (B2B Snippet 2) | Webhook POST | Chat messages, postbacks |
 | WordPress | LINE Platform | REST API (Push) | Flex messages, notifications |
 | WordPress | Flash Express | REST API | Create shipment, labels, tracking |
-| WordPress | Slip2Go | REST API | Bank slip verification |
+| WordPress | Slip2Go | REST API (PULL only, no webhook) | Bank slip verification on-demand |
 | WordPress | Google Gemini | REST API | AI responses, KB training |
 | WordPress | Claude API | REST API | AI Provider Abstraction |
 | OpenClaw Agent | WordPress MCP Bridge | REST API | Product lookup, claims, leads |
