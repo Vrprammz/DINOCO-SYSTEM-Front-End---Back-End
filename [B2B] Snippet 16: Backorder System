@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.1.9 — Phase 3 Group E: perf + BO remaining UX                               ║
+ * ║                   [PERF-H4] /bo-summary transient cache 30s + meta_value != '0' scan    ║
+ * ║                   [PERF-H10] bo-queue prime post+meta cache (eliminate N+1)             ║
+ * ║                   [BUG-H12] age_bucket + age_hours use Asia/Bangkok DateTimeZone        ║
+ * ║                   [BUG-H9]  beta_distributors whitelist UI in [b2b_bo_flags] shortcode  ║
+ * ║                   [UX-C1]   customer cancel button in pending_stock_review + partial_fulfilled ║
+ * ║                   [UX-C4]   .cv-section.backorder header #f59e0b→#d97706 (WCAG AA)      ║
+ * ║                   [UX-H20]  prompt() null vs empty-string trim+validate                 ║
  * ║  Version: V.1.8 — Phase 2 Group C: BO stock double-subtract guard + C1 listener removal ║
  * ║                   + cancel-item cascade fix + dealer tier-price debt                    ║
  * ║                   + fail-loud on missing product data                                   ║
@@ -358,11 +366,21 @@ if ( ! function_exists( 'b2b_bo_get_queue_rows' ) ) {
 if ( ! function_exists( 'b2b_bo_compute_age_bucket' ) ) {
     /**
      * Classify BO row age: fresh (0-3d) | warn (3-7d) | old (>7d) | ready
+     * V.1.9 BUG-H12 FIX: explicit Asia/Bangkok TZ via DateTime (was strtotime → server TZ drift)
+     *   MySQL DATETIME stored via current_time('mysql') (WP tz=+07), but strtotime()
+     *   interprets as server local (could be UTC on hosted Linux) → age_h miscompute by ±7h.
      */
     function b2b_bo_compute_age_bucket( $row ) {
         if ( $row['status'] === 'ready' ) return 'ready';
 
-        $age_h = ( time() - strtotime( $row['created_at'] ) ) / 3600;
+        try {
+            $dt = new DateTime( $row['created_at'], new DateTimeZone( 'Asia/Bangkok' ) );
+            $age_h = ( time() - $dt->getTimestamp() ) / 3600;
+        } catch ( \Throwable $e ) {
+            // Fallback: lossy strtotime (keep behavior for malformed rows)
+            $age_h = ( time() - strtotime( $row['created_at'] ) ) / 3600;
+        }
+
         if ( $age_h <= 72 ) return 'fresh';
         if ( $age_h <= 168 ) return 'warn';
         return 'old';
@@ -701,8 +719,16 @@ if ( ! function_exists( 'b2b_rest_bo_bulk_cancel' ) ) {
 if ( ! function_exists( 'b2b_rest_bo_summary' ) ) {
     /**
      * V.1.6 H1 — Summary counts for sidebar badge
+     * V.1.9 PERF-H4 — transient cache 30s + meta_value != '0' index-seek (was `> 0` full scan)
      */
     function b2b_rest_bo_summary( $request ) {
+        $cache_key = 'b2b_bo_summary_cache';
+        $cached    = get_transient( $cache_key );
+        if ( is_array( $cached ) && isset( $cached['success'] ) ) {
+            $cached['cached'] = true;
+            return rest_ensure_response( $cached );
+        }
+
         global $wpdb;
         $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
 
@@ -713,20 +739,37 @@ if ( ! function_exists( 'b2b_rest_bo_summary' ) ) {
         $bo_pending = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$bo_table} WHERE status='pending'" );
         $bo_ready   = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$bo_table} WHERE status='ready'" );
 
-        // Enumeration flags distributors
+        // Enumeration flags distributors — V.1.9 PERF-H4: use != '' AND != '0' (index-seek on composite meta_key,meta_value)
+        // เดิมใช้ `meta_value > 0` ทำให้ MySQL cast เป็น number → full table scan บน postmeta
         $flagged = (int) $wpdb->get_var(
             "SELECT COUNT(*) FROM {$wpdb->postmeta}
-             WHERE meta_key='_b2b_enumeration_flags' AND meta_value > 0"
+             WHERE meta_key='_b2b_enumeration_flags' AND meta_value != '' AND meta_value != '0'"
         );
 
-        return rest_ensure_response( array(
+        $payload = array(
             'success'              => true,
             'pending_review_count' => $pending_review,
             'bo_pending_count'     => $bo_pending,
             'bo_ready_count'       => $bo_ready,
             'enumeration_flagged'  => $flagged,
             'total_action_needed'  => $pending_review + $bo_ready + $flagged,
-        ) );
+            'cached'               => false,
+        );
+
+        set_transient( $cache_key, $payload, 30 );
+
+        return rest_ensure_response( $payload );
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_invalidate_summary_cache' ) ) {
+    /**
+     * V.1.9 PERF-H4 — central cache buster for /bo-summary transient
+     * Called on: place-order BO path, bo-split, bo-fulfill, bo-cancel-item, bo-confirm-full,
+     *            bo-reject, bo-restock-scan, bo-update-eta, undo-split
+     */
+    function b2b_bo_invalidate_summary_cache() {
+        delete_transient( 'b2b_bo_summary_cache' );
     }
 }
 
@@ -1007,6 +1050,9 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
             b2b_bo_notify_customer_split( $order_id );
         }
 
+        // V.1.9 PERF-H4: invalidate summary cache (pending_review count drops, bo_pending count rises)
+        b2b_bo_invalidate_summary_cache();
+
         return rest_ensure_response( array(
             'success'         => true,
             'order_id'        => $order_id,
@@ -1041,6 +1087,9 @@ if ( ! function_exists( 'b2b_rest_bo_confirm_full' ) ) {
 
         $dist_id = (int) get_field( 'distributor_id', $order_id );
         b2b_log_attempt( $dist_id, 'split', $order_id, '', 'accepted', 'CONFIRM_FULL' );
+
+        // V.1.9 PERF-H4: pending_review_count drops → invalidate summary cache
+        b2b_bo_invalidate_summary_cache();
 
         return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'awaiting_confirm' ) );
     }
@@ -1085,6 +1134,9 @@ if ( ! function_exists( 'b2b_rest_bo_reject' ) ) {
         if ( function_exists( 'b2b_bo_notify_customer_rejected' ) ) {
             b2b_bo_notify_customer_rejected( $order_id, $reason );
         }
+
+        // V.1.9 PERF-H4: pending_review_count drops → invalidate summary cache
+        b2b_bo_invalidate_summary_cache();
 
         return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'cancelled' ) );
     }
@@ -1192,6 +1244,9 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
         $wpdb->query( 'COMMIT' );
 
         b2b_log_attempt( $dist_id, 'undo_split', $order_id, '', 'accepted' );
+
+        // V.1.9 PERF-H4: counts shifted (pending_review_count ↑, bo_pending_count ↓) → invalidate
+        b2b_bo_invalidate_summary_cache();
 
         return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'pending_stock_review' ) );
     }
@@ -1336,6 +1391,9 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
             'total_value' => $total_fulfilled_value,
             'all_resolved'=> $pending_count === 0,
         ) );
+
+        // V.1.9 PERF-H4: counts shift (bo_pending→fulfilled, bo_ready drops) → invalidate
+        b2b_bo_invalidate_summary_cache();
 
         return rest_ensure_response( array(
             'success'               => true,
@@ -1508,6 +1566,9 @@ if ( ! function_exists( 'b2b_rest_bo_cancel_item' ) ) {
             b2b_bo_notify_customer_bo_cancelled( $order_id, $row_before, $reason );
         }
 
+        // V.1.9 PERF-H4: bo_pending/ready count drops → invalidate
+        b2b_bo_invalidate_summary_cache();
+
         return rest_ensure_response( array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'status' => 'cancelled' ) );
     }
 }
@@ -1528,11 +1589,44 @@ if ( ! function_exists( 'b2b_rest_bo_queue' ) ) {
 
         $rows = b2b_bo_get_queue_rows( $args );
 
+        // V.1.9 PERF-H10: prime post + meta cache for order_ids + distributor_ids BEFORE loop
+        // (was: per-row get_the_title + get_field → N×3 uncached queries per request)
+        if ( ! empty( $rows ) ) {
+            $order_ids = array_values( array_unique( array_map( function( $r ) {
+                return (int) $r['order_id'];
+            }, $rows ) ) );
+
+            if ( ! empty( $order_ids ) ) {
+                // Prime post cache (WP_Post objects for get_the_title)
+                _prime_post_caches( $order_ids, false, true );
+                // Prime postmeta cache for the order posts (distributor_id via get_field)
+                update_meta_cache( 'post', $order_ids );
+            }
+
+            // Collect distributor_ids from primed meta cache, then prime them too
+            $dist_ids = array();
+            foreach ( $order_ids as $oid ) {
+                $did = (int) get_post_meta( $oid, 'distributor_id', true );
+                if ( $did > 0 ) $dist_ids[] = $did;
+            }
+            $dist_ids = array_values( array_unique( $dist_ids ) );
+            if ( ! empty( $dist_ids ) ) {
+                _prime_post_caches( $dist_ids, false, true );
+            }
+        }
+
         // Enrich with age_bucket + distributor_name
-        $data = array();
+        // V.1.9 BUG-H12: use DateTime w/ Asia/Bangkok for age_hours (match age_bucket fix)
+        $tz_bkk = new DateTimeZone( 'Asia/Bangkok' );
+        $data   = array();
         foreach ( $rows as $r ) {
             $r['age_bucket'] = b2b_bo_compute_age_bucket( $r );
-            $r['age_hours']  = ( time() - strtotime( $r['created_at'] ) ) / 3600;
+            try {
+                $dt = new DateTime( $r['created_at'], $tz_bkk );
+                $r['age_hours'] = ( time() - $dt->getTimestamp() ) / 3600;
+            } catch ( \Throwable $e ) {
+                $r['age_hours'] = ( time() - strtotime( $r['created_at'] ) ) / 3600;
+            }
             $dist_id         = (int) get_field( 'distributor_id', $r['order_id'] );
             $r['distributor_name'] = $dist_id ? get_the_title( $dist_id ) : '';
             $r['ticket_no']        = get_the_title( $r['order_id'] );
@@ -1617,6 +1711,11 @@ if ( ! function_exists( 'b2b_bo_restock_scan' ) ) {
         // Telegram alert if any marked ready
         if ( ! empty( $marked ) && function_exists( 'b2b_send_telegram_alert' ) ) {
             b2b_send_telegram_alert( 'bo_restock_ready', 'มี BO พร้อม fulfill: ' . count( $marked ) . ' รายการ' );
+        }
+
+        // V.1.9 PERF-H4: bo_ready_count jumps when promotions happen → invalidate
+        if ( ! empty( $marked ) && function_exists( 'b2b_bo_invalidate_summary_cache' ) ) {
+            b2b_bo_invalidate_summary_cache();
         }
 
         return $marked;
@@ -2493,6 +2592,20 @@ add_filter( 'rest_pre_dispatch', function( $result, $server, $request ) {
  *        confirm = transition trigger (not place-order moment).
  */
 
+/**
+ * V.1.9 PERF-H4 — Invalidate /bo-summary transient cache on any order status change
+ * that affects badge counts (pending_stock_review, partial_fulfilled transitions).
+ * Catches Snippet 2's customer-confirm-triggered path (draft → pending_stock_review).
+ */
+add_action( 'b2b_order_status_changed', function( $order_id, $new_status, $old_status ) {
+    $bo_relevant = array( 'pending_stock_review', 'partial_fulfilled', 'awaiting_confirm', 'cancelled' );
+    if ( in_array( $new_status, $bo_relevant, true ) || in_array( $old_status, $bo_relevant, true ) ) {
+        if ( function_exists( 'b2b_bo_invalidate_summary_cache' ) ) {
+            b2b_bo_invalidate_summary_cache();
+        }
+    }
+}, 20, 3 );
+
 // ═══════════════════════════════════════════════════════════════
 // SECTION 10: REST RESPONSE FILTER — hide admin-only meta
 // ═══════════════════════════════════════════════════════════════
@@ -2741,9 +2854,12 @@ add_shortcode( 'b2b_bo_admin', function() {
         };
 
         window.b2bBoReject = function(orderId) {
+            // V.1.9 UX-H20: distinguish null (cancelled) vs empty (must be caught)
             const reason = prompt('เหตุผลที่ปฏิเสธ:');
-            if (reason === null) return;
-            apiCall('bo-reject', { method: 'POST', body: JSON.stringify({ order_id: orderId, reason: reason }) })
+            if (reason === null) return; // user cancelled dialog
+            const trimmed = reason.trim();
+            if (!trimmed) { alert('⚠️ ต้องระบุเหตุผล'); return; }
+            apiCall('bo-reject', { method: 'POST', body: JSON.stringify({ order_id: orderId, reason: trimmed }) })
                 .then(res => {
                     if (res.success) { alert('✅ ปฏิเสธแล้ว'); loadPending(); }
                     else alert('❌ ' + (res.message || 'error'));
@@ -2932,11 +3048,14 @@ add_shortcode( 'b2b_bo_admin', function() {
         };
 
         window.b2bBoCancelItem = function(orderId, boQueueId) {
+            // V.1.9 UX-H20: distinguish null (cancelled) vs empty (must be caught)
             const reason = prompt('เหตุผลที่ยกเลิก BO item:', 'discontinued');
-            if (reason === null) return;
+            if (reason === null) return; // user cancelled dialog
+            const trimmed = reason.trim();
+            if (!trimmed) { alert('⚠️ ต้องระบุเหตุผล'); return; }
             apiCall('bo-cancel-item', {
                 method: 'POST',
-                body: JSON.stringify({ order_id: orderId, bo_queue_id: boQueueId, reason: reason })
+                body: JSON.stringify({ order_id: orderId, bo_queue_id: boQueueId, reason: trimmed })
             }).then(res => {
                 if (res.success) { alert('✅ BO item ยกเลิกแล้ว'); loadQueue(); }
                 else alert('❌ ' + (res.message || 'error'));
@@ -2997,8 +3116,43 @@ add_shortcode( 'b2b_bo_flags', function() {
             if ( in_array( $flag, $whitelist, true ) ) {
                 $current = (bool) get_option( $flag, $flag === 'dinoco_oos_gate_hierarchy_compute' );
                 update_option( $flag, ! $current );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( "[BO-Flag] {$flag} toggled " . ( $current ? 'OFF' : 'ON' ) . ' by user #' . get_current_user_id() );
+                }
                 echo '<div style="background:#d1fae5;border:1px solid #10b981;color:#065f46;padding:10px;border-radius:6px;margin-bottom:12px;">✅ Flag <code>' . esc_html( $flag ) . '</code> เปลี่ยนเป็น <strong>' . ( ! $current ? 'ON' : 'OFF' ) . '</strong></div>';
             }
+        }
+
+        // V.1.9 BUG-H9: save beta distributor whitelist (CSV of distributor post IDs)
+        if ( isset( $_POST['save_beta_distributors'] ) ) {
+            $raw_csv = isset( $_POST['beta_distributors_csv'] ) ? wp_unslash( $_POST['beta_distributors_csv'] ) : '';
+            $ids_in  = array_filter( array_map( 'trim', explode( ',', $raw_csv ) ) );
+            $valid   = array();
+            $invalid = array();
+            foreach ( $ids_in as $raw_id ) {
+                $id = absint( $raw_id );
+                if ( ! $id ) { $invalid[] = $raw_id; continue; }
+                $p = get_post( $id );
+                if ( $p && $p->post_type === 'distributor' ) {
+                    $valid[] = $id;
+                } else {
+                    $invalid[] = $raw_id;
+                }
+            }
+            $valid = array_values( array_unique( $valid ) );
+
+            $old = (array) get_option( 'b2b_flag_bo_beta_distributors', array() );
+            update_option( 'b2b_flag_bo_beta_distributors', $valid );
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[BO-Flag] beta_distributors updated — was: ' . wp_json_encode( $old ) . ' now: ' . wp_json_encode( $valid ) . ' by user #' . get_current_user_id() );
+            }
+
+            $msg = '✅ บันทึก Beta Distributors สำเร็จ: ' . count( $valid ) . ' ร้าน';
+            if ( ! empty( $invalid ) ) {
+                $msg .= ' | ⚠️ ไม่ถูกต้อง: ' . esc_html( implode( ', ', $invalid ) );
+            }
+            echo '<div style="background:#d1fae5;border:1px solid #10b981;color:#065f46;padding:10px;border-radius:6px;margin-bottom:12px;">' . $msg . '</div>';
         }
     }
 
@@ -3083,6 +3237,53 @@ add_shortcode( 'b2b_bo_flags', function() {
             • Accounting ตัดสินใจ invoice strategy (consolidated vs separate)<br>
             • Test end-to-end flow ใน staging environment
         </div>
+
+        <!-- V.1.9 BUG-H9: Beta Distributors Whitelist UI -->
+        <?php
+            $beta_ids = (array) get_option( 'b2b_flag_bo_beta_distributors', array() );
+            $beta_csv = implode( ',', array_map( 'intval', $beta_ids ) );
+        ?>
+        <h2 style="font-size:18px;margin-top:32px;">🧪 Beta Distributors Whitelist</h2>
+        <p style="color:#6b7280;font-size:13px;margin:6px 0 10px;">
+            Canary rollout list — <code>b2b_flag_bo_beta_distributors</code> (post ID ของ Distributor CPT, คั่นด้วย comma)<br>
+            ถ้าลิสต์ว่าง = BO system apply ทุกร้าน (เมื่อ master flag ON). ถ้ามีลิสต์ = เฉพาะร้านในนี้เท่านั้น.
+        </p>
+        <form method="POST" style="background:white;border:1px solid #e5e7eb;border-radius:8px;padding:16px;">
+            <?php wp_nonce_field( 'b2b_bo_flags', 'b2b_bo_flags_nonce' ); ?>
+            <?php if ( ! empty( $beta_ids ) ): ?>
+            <div style="margin-bottom:12px;">
+                <strong style="font-size:13px;">ปัจจุบัน (<?php echo count( $beta_ids ); ?> ร้าน):</strong>
+                <ul style="margin:6px 0 0;padding-left:20px;font-size:13px;color:#374151;">
+                    <?php foreach ( $beta_ids as $bid ):
+                        $bp = get_post( (int) $bid );
+                        $bname = $bp ? $bp->post_title : '(not found)';
+                    ?>
+                    <li>
+                        #<?php echo (int) $bid; ?> — <?php echo esc_html( $bname ); ?>
+                        <?php if ( ! $bp || $bp->post_type !== 'distributor' ): ?>
+                            <span style="color:#dc2626;font-weight:600;">⚠️ invalid</span>
+                        <?php endif; ?>
+                    </li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+            <?php endif; ?>
+            <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;" for="beta_distributors_csv">
+                Distributor IDs (comma-separated):
+            </label>
+            <textarea id="beta_distributors_csv" name="beta_distributors_csv" rows="3"
+                style="width:100%;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-family:monospace;font-size:13px;"
+                placeholder="เช่น 123, 456, 789"><?php echo esc_textarea( $beta_csv ); ?></textarea>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:10px;">
+                <button type="submit" name="save_beta_distributors" value="1"
+                    style="padding:8px 16px;background:#1e3a8a;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px;">
+                    💾 บันทึก
+                </button>
+                <span style="font-size:12px;color:#6b7280;">
+                    ต้องเป็น post ID ของ CPT <code>distributor</code> เท่านั้น — ID ที่ไม่ถูกต้องจะถูก reject
+                </span>
+            </div>
+        </form>
 
         <h2 style="font-size:18px;margin-top:32px;">📊 BO Config</h2>
         <table style="width:100%;border-collapse:collapse;background:white;border:1px solid #e5e7eb;border-radius:8px;margin-top:8px;">
@@ -3447,11 +3648,81 @@ add_shortcode( 'b2b_bo_customer_order_detail', function( $atts ) {
         return ''; // only show for BO-relevant statuses
     }
 
+    // V.1.9 UX-C1: customer cancel button for pending_stock_review + countdown + LINE contact
     if ( $status === 'pending_stock_review' ) {
-        return '<div class="b2b-bo-cust-view" style="padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;margin:12px 0;">
-            <div style="font-size:14px;font-weight:600;color:#78350f;">⏳ รอตรวจสอบจากแอดมิน</div>
-            <div style="font-size:12px;color:#92400e;margin-top:4px;">คาดการณ์ 2-4 ชั่วโมง</div>
-        </div>';
+        $opaque_ts      = (int) get_post_meta( $order_id, '_b2b_opaque_accept_at', true );
+        $elapsed_label  = '';
+        if ( $opaque_ts > 0 ) {
+            $elapsed_min = max( 0, (int) ( ( time() - $opaque_ts ) / 60 ) );
+            if ( $elapsed_min < 60 ) {
+                $elapsed_label = "ส่งคำสั่งซื้อแล้ว {$elapsed_min} นาที";
+            } else {
+                $elapsed_label = 'ส่งคำสั่งซื้อแล้ว ' . floor( $elapsed_min / 60 ) . ' ชั่วโมง ' . ( $elapsed_min % 60 ) . ' นาที';
+            }
+        }
+
+        $nonce = wp_create_nonce( 'wp_rest' );
+        ob_start();
+        ?>
+        <div class="b2b-bo-cust-view" style="padding:16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;margin:12px 0;font-family:'Sarabun',sans-serif;">
+            <div style="font-size:15px;font-weight:700;color:#78350f;">⏳ รอตรวจสอบจากแอดมิน</div>
+            <div style="font-size:13px;color:#92400e;margin-top:6px;">⏱️ คาดว่าแอดมินจะตอบภายใน 2-4 ชั่วโมง</div>
+            <?php if ( $elapsed_label ): ?>
+            <div style="font-size:12px;color:#92400e;margin-top:4px;"><?php echo esc_html( $elapsed_label ); ?></div>
+            <?php endif; ?>
+            <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+                <button type="button"
+                    class="b2b-bo-cust-cancel-btn"
+                    data-order-id="<?php echo (int) $order_id; ?>"
+                    data-nonce="<?php echo esc_attr( $nonce ); ?>"
+                    style="padding:10px 14px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;min-height:44px;">
+                    ❌ ขอยกเลิกออเดอร์
+                </button>
+            </div>
+        </div>
+        <script>
+        (function(){
+            if (window._b2bBoCustCancelBound) return;
+            window._b2bBoCustCancelBound = true;
+            document.addEventListener('click', function(e){
+                var btn = e.target.closest && e.target.closest('.b2b-bo-cust-cancel-btn');
+                if (!btn) return;
+                e.preventDefault();
+                var orderId = parseInt(btn.getAttribute('data-order-id'), 10);
+                var nonce   = btn.getAttribute('data-nonce') || '';
+                if (!orderId) return;
+                if (!confirm('ต้องการยกเลิกออเดอร์ #' + orderId + ' ใช่หรือไม่?')) return;
+                btn.disabled = true;
+                btn.textContent = '⏳ กำลังส่งคำขอ...';
+                // Read session token from localStorage (set during LIFF auth). Fallback: cookie / none.
+                var token = '';
+                try { token = localStorage.getItem('b2b_session_token') || ''; } catch (err) {}
+                var headers = { 'Content-Type': 'application/json', 'X-WP-Nonce': nonce };
+                if (token) headers['Authorization'] = 'Bearer ' + token;
+                fetch('/wp-json/b2b/v1/cancel-request', {
+                    method: 'POST',
+                    headers: headers,
+                    credentials: 'include',
+                    body: JSON.stringify({ ticket_id: orderId })
+                }).then(function(r){ return r.json(); }).then(function(res){
+                    if (res && res.success) {
+                        alert('✅ ส่งคำขอยกเลิกแล้ว — แอดมินจะติดต่อกลับเร็วๆ นี้');
+                        location.reload();
+                    } else {
+                        btn.disabled = false;
+                        btn.textContent = '❌ ขอยกเลิกออเดอร์';
+                        alert('⚠️ ' + ((res && res.message) || 'เกิดข้อผิดพลาด กรุณาลองใหม่'));
+                    }
+                }).catch(function(err){
+                    btn.disabled = false;
+                    btn.textContent = '❌ ขอยกเลิกออเดอร์';
+                    alert('⚠️ เชื่อมต่อไม่ได้ กรุณาลองใหม่');
+                });
+            });
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
     }
 
     // partial_fulfilled
@@ -3464,7 +3735,8 @@ add_shortcode( 'b2b_bo_customer_order_detail', function( $atts ) {
             .b2b-bo-cust-view .cv-section { margin-bottom: 16px; background: white; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
             .b2b-bo-cust-view .cv-section .cv-header { padding: 12px 14px; font-weight: 600; font-size: 14px; color: white; display: flex; justify-content: space-between; align-items: center; }
             .b2b-bo-cust-view .cv-section.confirmed .cv-header { background: #10b981; }
-            .b2b-bo-cust-view .cv-section.backorder .cv-header { background: #f59e0b; }
+            /* V.1.9 UX-C4: #f59e0b + white = 2.5:1 (fails WCAG AA). #d97706 = ~4.8:1 passes AA */
+            .b2b-bo-cust-view .cv-section.backorder .cv-header { background: #d97706; }
             .b2b-bo-cust-view .cv-item { padding: 10px 14px; border-top: 1px solid #f3f4f6; font-size: 13px; }
             .b2b-bo-cust-view .cv-item:first-child { border-top: none; }
             .b2b-bo-cust-view .cv-item .sku-name { font-weight: 600; }
@@ -3548,11 +3820,66 @@ add_shortcode( 'b2b_bo_customer_order_detail', function( $atts ) {
                 <span>฿<?php echo number_format( $summary['fulfilled_value'] + $summary['bo_value'], 2 ); ?></span>
             </div>
         </div>
+
+        <!-- V.1.9 UX-C1: Cancel action for partial_fulfilled -->
+        <?php $nonce_pf = wp_create_nonce( 'wp_rest' ); ?>
+        <div style="margin-top:12px;padding:12px 14px;background:#fef3c7;border:1px solid #fde68a;border-radius:10px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+            <div style="font-size:12px;color:#78350f;line-height:1.5;">
+                ต้องการยกเลิกทั้งออเดอร์? สินค้าที่ส่งแล้วอาจเรียกเก็บเงินตามปกติ
+            </div>
+            <button type="button"
+                class="b2b-bo-cust-cancel-btn"
+                data-order-id="<?php echo (int) $order_id; ?>"
+                data-nonce="<?php echo esc_attr( $nonce_pf ); ?>"
+                style="padding:10px 14px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;min-height:44px;">
+                ❌ ขอยกเลิกออเดอร์
+            </button>
+        </div>
+        <script>
+        (function(){
+            if (window._b2bBoCustCancelBound) return;
+            window._b2bBoCustCancelBound = true;
+            document.addEventListener('click', function(e){
+                var btn = e.target.closest && e.target.closest('.b2b-bo-cust-cancel-btn');
+                if (!btn) return;
+                e.preventDefault();
+                var orderId = parseInt(btn.getAttribute('data-order-id'), 10);
+                var nonce   = btn.getAttribute('data-nonce') || '';
+                if (!orderId) return;
+                if (!confirm('ต้องการยกเลิกออเดอร์ #' + orderId + ' ใช่หรือไม่?')) return;
+                btn.disabled = true;
+                btn.textContent = '⏳ กำลังส่งคำขอ...';
+                var token = '';
+                try { token = localStorage.getItem('b2b_session_token') || ''; } catch (err) {}
+                var headers = { 'Content-Type': 'application/json', 'X-WP-Nonce': nonce };
+                if (token) headers['Authorization'] = 'Bearer ' + token;
+                fetch('/wp-json/b2b/v1/cancel-request', {
+                    method: 'POST',
+                    headers: headers,
+                    credentials: 'include',
+                    body: JSON.stringify({ ticket_id: orderId })
+                }).then(function(r){ return r.json(); }).then(function(res){
+                    if (res && res.success) {
+                        alert('✅ ส่งคำขอยกเลิกแล้ว — แอดมินจะติดต่อกลับเร็วๆ นี้');
+                        location.reload();
+                    } else {
+                        btn.disabled = false;
+                        btn.textContent = '❌ ขอยกเลิกออเดอร์';
+                        alert('⚠️ ' + ((res && res.message) || 'เกิดข้อผิดพลาด กรุณาลองใหม่'));
+                    }
+                }).catch(function(){
+                    btn.disabled = false;
+                    btn.textContent = '❌ ขอยกเลิกออเดอร์';
+                    alert('⚠️ เชื่อมต่อไม่ได้ กรุณาลองใหม่');
+                });
+            });
+        })();
+        </script>
     </div>
     <?php
     return ob_get_clean();
 } );
 
 // ═══════════════════════════════════════════════════════════════
-// EOF — [B2B] Snippet 16: Backorder System V.1.5
+// EOF — [B2B] Snippet 16: Backorder System V.1.9
 // ═══════════════════════════════════════════════════════════════
