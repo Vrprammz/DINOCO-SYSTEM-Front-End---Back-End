@@ -1,0 +1,2052 @@
+openapi: 3.1.0
+info:
+  title: DINOCO REST API
+  description: |
+    Complete REST API specification for the DINOCO System — a WordPress-based
+    motorcycle warranty management platform serving B2C members and B2B distributors.
+
+    ## Coverage
+    - **B2B** (`/b2b/v1/`) — distributor portal, LIFF e-catalog, Backorder System (V.1.6), Flash shipping
+    - **B2F** (`/b2f/v1/`) — Maker (factory) purchasing, multi-currency PO lifecycle, credit system
+    - **LIFF AI** (`/liff-ai/v1/`) — dealer lead/claim management inside LINE LIFF
+    - **Inventory** (`/dinoco-stock/v1/`) — multi-warehouse, dip-stock, valuation, forecasting
+    - **MCP Bridge** (`/dinoco-mcp/v1/`) — OpenClaw agent integration (subset of 32 endpoints)
+    - **GDPR** (`/dinoco-gdpr/v1/`) — data subject request scaffold (if activated)
+
+    ## Known Gaps
+    - Only main production endpoints covered — edge cases and admin-only endpoints partial
+    - MCP Bridge full 32 endpoints documented as subset (5-10 most-used)
+    - B2F Migration Audit (`/dinoco-b2f-audit/v1/`) not documented (admin-only)
+    - Error response shapes reflect WP_Error convention (data.status + code + message)
+
+    ## Auth Convention
+    | Scheme | Where | Namespaces |
+    |---|---|---|
+    | `wpNonce` (X-WP-Nonce header) | WP admin REST | all admin writes |
+    | `liffAiBearer` (Authorization: Bearer JWT) | X-LIFF-AI-Token also accepted | `/liff-ai/v1/` |
+    | `b2fAdminToken` (X-B2F-Token header) | HMAC-signed session | `/b2f/v1/` admin LIFF |
+    | `b2bSessionToken` (body.session_token) | HMAC + rate-limit | `/b2b/v1/` customer LIFF |
+    | `basicAuth` | RPi print daemon | `/b2b/v1/print-*` |
+
+    ## Timezone
+    All timestamps are `Asia/Bangkok`. ISO-8601 format `YYYY-MM-DDTHH:MM:SS+07:00`.
+  version: "1.0.0-2026-04-17"
+  contact:
+    name: DINOCO Engineering
+    url: https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End
+  license:
+    name: Proprietary
+    identifier: Proprietary
+
+servers:
+  - url: https://dinoco.in.th/wp-json
+    description: Production WordPress REST root
+  - url: https://staging.dinoco.in.th/wp-json
+    description: Staging
+
+tags:
+  - name: B2B-Orders
+    description: B2B distributor order lifecycle (place, confirm, cancel, track)
+  - name: B2B-Backorder
+    description: Backorder System V.1.6 (admin split review + opaque accept)
+  - name: B2B-Flash
+    description: Flash Express shipping integration
+  - name: B2B-Print
+    description: RPi print daemon endpoints (Basic Auth)
+  - name: B2F-Makers
+    description: Factory (Maker) CRUD + product mapping
+  - name: B2F-PO
+    description: Purchase Order lifecycle (12-state FSM)
+  - name: B2F-Receive
+    description: Goods receipt, payment recording, credit ledger
+  - name: LIFF-AI
+    description: Dealer/admin lead + claim management inside LINE
+  - name: Inventory
+    description: Multi-warehouse stock, dip stock, valuation, forecast
+  - name: MCP
+    description: MCP Bridge for OpenClaw agent (subset documented)
+  - name: GDPR
+    description: Data Subject Access Request scaffold
+
+security:
+  - wpNonce: []
+  - liffAiBearer: []
+  - b2fAdminToken: []
+
+paths:
+  #
+  # B2B — Orders
+  #
+  /b2b/v1/catalog:
+    get:
+      tags: [B2B-Orders]
+      summary: Get product catalog for distributor LIFF
+      description: Returns products filtered by distributor tier (discount auto-applied). Requires session token.
+      security:
+        - b2bSessionToken: []
+      parameters:
+        - name: session_token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: q
+          in: query
+          description: Search SKU or product name
+          schema: { type: string }
+        - name: category
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Catalog list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Product" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /b2b/v1/place-order:
+    post:
+      tags: [B2B-Orders]
+      summary: Create draft order (customer LIFF)
+      description: |
+        Creates `b2b_order` CPT in `draft` status. If distributor has
+        `b2b_flag_bo_system=true` (V.1.6), fires `b2b_place_order_post_process`
+        action for opaque accept routing. Rate-limited 10/hr + 50/day per distributor.
+      security:
+        - b2bSessionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaceOrderRequest" }
+      responses:
+        "200":
+          description: Order created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  order_id: { type: integer }
+                  total: { type: number }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /b2b/v1/confirm-order:
+    post:
+      tags: [B2B-Orders]
+      summary: Customer confirms order (postback from LINE bot)
+      description: |
+        Transitions draft → awaiting_confirm (or pending_stock_review if BO flag ON).
+        Performs stock gate check + reserves inventory. V.33.5 hierarchy-aware.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id]
+              properties:
+                order_id: { type: integer }
+      responses:
+        "200":
+          description: Order confirmed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  status: { type: string, enum: [awaiting_confirm, pending_stock_review, cancelled] }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /b2b/v1/cancel-request:
+    post:
+      tags: [B2B-Orders]
+      summary: Customer cancel request
+      description: |
+        V.39.2 routes through FSM. First 5 min = unlimited (legitimate UX),
+        after grace = 2/hr + 10/day. Logs attempts for enumeration scan.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, reason]
+              properties:
+                order_id: { type: integer }
+                reason: { type: string }
+      responses:
+        "200": { description: Cancel request submitted }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /b2b/v1/daily-summary:
+    get:
+      tags: [B2B-Orders]
+      summary: Daily summary for admin
+      description: Aggregated stats for orders placed today (count, revenue, debt delta).
+      parameters:
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: Daily aggregated stats
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DailySummary" }
+
+  /b2b/v1/update-status:
+    post:
+      tags: [B2B-Orders]
+      summary: Admin change order status (FSM-validated)
+      description: Must pass through `b2b_transition_order()` — direct status writes rejected.
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, new_status]
+              properties:
+                order_id: { type: integer }
+                new_status:
+                  type: string
+                  enum:
+                    [
+                      draft,
+                      pending_stock_review,
+                      awaiting_confirm,
+                      partial_fulfilled,
+                      shipped,
+                      completed,
+                      cancelled,
+                    ]
+                note: { type: string }
+      responses:
+        "200": { description: Status changed }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: FSM transition not allowed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /b2b/v1/order-history:
+    get:
+      tags: [B2B-Orders]
+      summary: Customer order history (LIFF)
+      security:
+        - b2bSessionToken: []
+      parameters:
+        - name: session_token
+          in: query
+          required: true
+          schema: { type: string }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+      responses:
+        "200":
+          description: List of orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Order" }
+
+  /b2b/v1/order-detail:
+    get:
+      tags: [B2B-Orders]
+      summary: Customer order detail
+      security:
+        - b2bSessionToken: []
+      parameters:
+        - name: order_id
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: session_token
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Order detail including items + BO split view
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+
+  /b2b/v1/slip-upload:
+    post:
+      tags: [B2B-Orders]
+      summary: Upload payment slip for verification
+      description: Calls Slip2Go API + attaches to order. Supports walk-in alternate bank.
+      security:
+        - b2bSessionToken: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [order_id, slip]
+              properties:
+                order_id: { type: integer }
+                slip: { type: string, format: binary }
+      responses:
+        "200": { description: Slip verified }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  #
+  # B2B — Backorder System V.1.6
+  #
+  /b2b/v1/bo-split:
+    post:
+      tags: [B2B-Backorder]
+      summary: Admin splits order into fulfilled + backorder items
+      description: |
+        Validates invariant `qty_fulfill + qty_bo = qty` per SKU. Performs
+        per-SKU leaf stock subtract + bo_queue insert + per-SKU compound debt +
+        FSM → partial_fulfilled + 10min undo window.
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BOSplitRequest" }
+      responses:
+        "200":
+          description: Split applied
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BOSplitResponse" }
+        "422":
+          description: Invariant violation (sum mismatch)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /b2b/v1/bo-confirm-full:
+    post:
+      tags: [B2B-Backorder]
+      summary: Admin confirms full order (no BO split)
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id]
+              properties:
+                order_id: { type: integer }
+      responses:
+        "200": { description: Order fully confirmed, stock subtracted }
+
+  /b2b/v1/bo-reject:
+    post:
+      tags: [B2B-Backorder]
+      summary: Admin rejects order at stock review
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, reason]
+              properties:
+                order_id: { type: integer }
+                reason: { type: string }
+      responses:
+        "200": { description: Order cancelled + counters reverted }
+
+  /b2b/v1/bo-fulfill:
+    post:
+      tags: [B2B-Backorder]
+      summary: Admin marks BO item as fulfilled
+      description: |
+        FOR UPDATE lock + debt add + FSM transition to awaiting_confirm if all
+        BO items resolved. Fires `b2b_bo_items_fulfilled` action → H5 Flash
+        secondary order + H6 print queue.
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bo_queue_id]
+              properties:
+                bo_queue_id: { type: integer }
+                eta_date: { type: string, format: date }
+      responses:
+        "200": { description: BO item fulfilled }
+
+  /b2b/v1/bo-queue:
+    get:
+      tags: [B2B-Backorder]
+      summary: List BO queue items (admin)
+      security:
+        - wpNonce: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, ready, fulfilled, cancelled]
+        - name: sku
+          in: query
+          schema: { type: string }
+        - name: age_days
+          in: query
+          schema: { type: integer }
+      responses:
+        "200":
+          description: BO queue list with summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/BOQueueItem" }
+                  summary: { type: object }
+
+  /b2b/v1/bo-pending-review:
+    get:
+      tags: [B2B-Backorder]
+      summary: List orders awaiting admin stock review
+      security:
+        - wpNonce: []
+      responses:
+        "200":
+          description: Orders in pending_stock_review status
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Order" }
+
+  /b2b/v1/bo-summary:
+    get:
+      tags: [B2B-Backorder]
+      summary: Badge counts (pending_review + bo_ready)
+      responses:
+        "200":
+          description: Counts for dashboard badge
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pending_review: { type: integer }
+                  bo_ready: { type: integer }
+
+  /b2b/v1/bo-restock-scan:
+    post:
+      tags: [B2B-Backorder]
+      summary: Manual trigger restock scan (normally cron 15min)
+      security:
+        - wpNonce: []
+      responses:
+        "200":
+          description: Scan result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  promoted: { type: integer, description: Pending BO items promoted to ready }
+
+  /b2b/v1/bo-undo-split:
+    post:
+      tags: [B2B-Backorder]
+      summary: Admin undo split (10min window, max 1/order)
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id]
+              properties:
+                order_id: { type: integer }
+      responses:
+        "200": { description: Split reverted to pending_stock_review }
+        "410":
+          description: Undo window expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  #
+  # B2B — Flash shipping
+  #
+  /b2b/v1/flash-create:
+    post:
+      tags: [B2B-Flash]
+      summary: Create Flash Express shipment for ticket
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ticket_id]
+              properties:
+                ticket_id: { type: integer }
+      responses:
+        "200":
+          description: Shipment created with PNO(s)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pno: { type: string }
+                  pnos: { type: array, items: { type: string } }
+
+  /b2b/v1/flash-tracking:
+    get:
+      tags: [B2B-Flash]
+      summary: Get Flash tracking events
+      parameters:
+        - name: pno
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Tracking events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FlashEvent" }
+
+  /b2b/v1/manual-flash-create:
+    post:
+      tags: [B2B-Flash]
+      summary: Manual Flash shipping (V.41.2 — no B2B order required)
+      description: Standalone shipping with split pickup (warehouse) vs registered address on label.
+      security:
+        - basicAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ManualFlashRequest" }
+      responses:
+        "200":
+          description: Flash shipment created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pno: { type: string }
+                  label_sender: { type: object }
+
+  #
+  # B2B — Print (RPi)
+  #
+  /b2b/v1/print-queue:
+    get:
+      tags: [B2B-Print]
+      summary: RPi print daemon polls for new jobs
+      security:
+        - basicAuth: []
+      responses:
+        "200":
+          description: Queued print jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PrintJob" }
+
+  /b2b/v1/print-ack:
+    post:
+      tags: [B2B-Print]
+      summary: RPi acknowledges print job completion
+      security:
+        - basicAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [job_id, status]
+              properties:
+                job_id: { type: integer }
+                status: { type: string, enum: [success, failed] }
+                error: { type: string }
+      responses:
+        "200": { description: Ack recorded }
+
+  /b2b/v1/print-heartbeat:
+    post:
+      tags: [B2B-Print]
+      summary: RPi daemon heartbeat (every 60s)
+      security:
+        - basicAuth: []
+      responses:
+        "200": { description: Heartbeat recorded }
+
+  #
+  # B2F — Makers
+  #
+  /b2f/v1/makers:
+    get:
+      tags: [B2F-Makers]
+      summary: List all Makers
+      security:
+        - wpNonce: []
+      responses:
+        "200":
+          description: Maker list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Maker" }
+
+  /b2f/v1/maker:
+    post:
+      tags: [B2F-Makers]
+      summary: Create or update Maker
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Maker" }
+      responses:
+        "200": { description: Maker saved }
+
+  /b2f/v1/maker-products/{maker_id}:
+    get:
+      tags: [B2F-Makers]
+      summary: List products registered to a Maker
+      description: |
+        V.11.0 returns enriched fields (`production_mode`, `confirmation_status`,
+        `admin_display_mode`, `missing_leaves[]`) when flag
+        `b2f_flag_v11_explicit_mode=true`. Phase 3 reads from junction table
+        when `b2f_flag_read_from_junction=true`.
+      security:
+        - wpNonce: []
+      parameters:
+        - name: maker_id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: include_virtual
+          in: query
+          description: V.9.19 opt-in virtual SET injection
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Maker product list with hierarchy context
+          headers:
+            X-B2F-API-Version:
+              schema: { type: string, example: "11.0" }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/MakerProduct" }
+                  sku_relations: { type: object }
+                  catalog_map: { type: object }
+                  maker_profile: { type: object }
+
+  /b2f/v1/maker-product:
+    post:
+      tags: [B2F-Makers]
+      summary: Save a maker × product mapping
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MakerProduct" }
+      responses:
+        "200": { description: Saved }
+
+  #
+  # B2F — Purchase Orders
+  #
+  /b2f/v1/create-po:
+    post:
+      tags: [B2F-PO]
+      summary: Create Purchase Order
+      description: |
+        DD-7 auto-expands SETs into leaves + tracks `parent_breakdown[]`.
+        V.7.0 accepts `order_mode` (full_set/sub_unit/single_leaf) +
+        `source_sku` + `intent_notes` per item. Currency immutable after submit.
+      security:
+        - wpNonce: []
+        - b2fAdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePORequest" }
+      responses:
+        "200":
+          description: PO created in draft status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  po_id: { type: integer }
+                  status: { type: string, enum: [draft] }
+        "400":
+          description: Validation failure (invariant / enum / source_sku not ancestor)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /b2f/v1/po-detail/{po_id}:
+    get:
+      tags: [B2F-PO]
+      summary: Get PO detail
+      description: |
+        PII callback gate strips `poi_intent_notes` +
+        `poi_production_mode_snapshot` + `order_intent_summary` for non-admin.
+      security:
+        - wpNonce: []
+        - b2fAdminToken: []
+      parameters:
+        - name: po_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: PO detail with items + receiving + payment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PO" }
+
+  /b2f/v1/po-update:
+    post:
+      tags: [B2F-PO]
+      summary: Update draft PO (only if status=draft)
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePORequest" }
+      responses:
+        "200": { description: Updated }
+        "409":
+          description: PO not in draft state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /b2f/v1/po-cancel:
+    post:
+      tags: [B2F-PO]
+      summary: Cancel PO with reason
+      description: |
+        V.8.2 uses FSM transition (no delete). Restores stock + keeps audit
+        trail (`_b2f_cancel_reason`, `_b2f_cancelled_by`, `_b2f_cancelled_at`).
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [po_id, reason]
+              properties:
+                po_id: { type: integer }
+                reason: { type: string }
+      responses:
+        "200": { description: PO cancelled }
+
+  /b2f/v1/po-undo-submit:
+    post:
+      tags: [B2F-PO]
+      summary: Undo submit within 30s window (V.11.0)
+      description: DB-clock window + dual auth + FOR UPDATE + FSM draft→cancelled.
+      security:
+        - wpNonce: []
+        - b2fAdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [po_id]
+              properties:
+                po_id: { type: integer }
+      responses:
+        "200": { description: Submit reverted }
+        "410":
+          description: 30-second undo window expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /b2f/v1/maker-confirm:
+    post:
+      tags: [B2F-PO]
+      summary: Maker confirms PO (from LIFF)
+      security:
+        - b2fAdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [po_id]
+              properties:
+                po_id: { type: integer }
+      responses:
+        "200": { description: PO transitioned submitted → confirmed }
+
+  /b2f/v1/maker-deliver:
+    post:
+      tags: [B2F-PO]
+      summary: Maker marks PO as delivered
+      security:
+        - b2fAdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [po_id]
+              properties:
+                po_id: { type: integer }
+                tracking_number: { type: string }
+      responses:
+        "200": { description: PO → delivering }
+
+  /b2f/v1/receive-goods:
+    post:
+      tags: [B2F-Receive]
+      summary: Admin records goods received (triggers credit + stock add)
+      description: |
+        Per-item receive with `rcv_qty` + `rcv_unit_price` (in PO currency).
+        Persists `unit_cost_thb = unit_price × exchange_rate` to stock
+        transactions for WAC valuation. Adds `rcv_total_value` to payable ledger.
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReceiveGoodsRequest" }
+      responses:
+        "200":
+          description: Goods received
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  receipt_id: { type: integer }
+                  total_thb: { type: number }
+                  new_payable: { type: number }
+
+  /b2f/v1/record-payment:
+    post:
+      tags: [B2F-Receive]
+      summary: Admin records payment to Maker (subtracts payable)
+      description: ≠THB currency skips slip verify (admin_approved).
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [po_id, amount, method]
+              properties:
+                po_id: { type: integer }
+                amount: { type: number }
+                method: { type: string, enum: [bank_transfer, cash, wire] }
+                slip_url: { type: string }
+      responses:
+        "200": { description: Payment recorded }
+
+  /b2f/v1/dashboard-stats:
+    get:
+      tags: [B2F-PO]
+      summary: Admin dashboard aggregated stats
+      security:
+        - wpNonce: []
+      responses:
+        "200":
+          description: Aggregated counts + payables
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_pos: { type: integer }
+                  awaiting_confirmation: { type: integer }
+                  total_payable_thb: { type: number }
+                  by_currency: { type: object }
+
+  #
+  # LIFF AI
+  #
+  /liff-ai/v1/auth:
+    post:
+      tags: [LIFF-AI]
+      summary: Exchange LINE ID token for JWT session
+      description: Verifies LINE ID Token → matches dealer/admin → issues JWT (8h TTL).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token: { type: string }
+      responses:
+        "200":
+          description: JWT issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: JWT Bearer }
+                  role: { type: string, enum: [dealer, admin] }
+                  dealer: { $ref: "#/components/schemas/Dealer" }
+        "401":
+          description: LINE token invalid
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /liff-ai/v1/dashboard:
+    get:
+      tags: [LIFF-AI]
+      summary: Admin dashboard aggregated stats
+      security:
+        - liffAiBearer: []
+      responses:
+        "200":
+          description: Lead + claim counts by status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leads: { type: object }
+                  claims: { type: object }
+
+  /liff-ai/v1/leads:
+    get:
+      tags: [LIFF-AI]
+      summary: List leads (filtered by role — dealer sees own, admin sees all)
+      security:
+        - liffAiBearer: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                new,
+                assigned,
+                contacted,
+                qualified,
+                quoted,
+                closed_won,
+                closed_lost,
+                waiting_stock,
+                waiting_decision,
+              ]
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+      responses:
+        "200":
+          description: Lead list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leads:
+                    type: array
+                    items: { $ref: "#/components/schemas/Lead" }
+
+  /liff-ai/v1/lead/{id}:
+    get:
+      tags: [LIFF-AI]
+      summary: Lead detail (MongoDB via agent proxy)
+      security:
+        - liffAiBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[a-f0-9]{24}$" }
+      responses:
+        "200":
+          description: Lead detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Lead" }
+
+  /liff-ai/v1/lead/{id}/status:
+    post:
+      tags: [LIFF-AI]
+      summary: Update lead status (FSM-validated)
+      security:
+        - liffAiBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string }
+                note: { type: string }
+      responses:
+        "200": { description: Status updated }
+
+  /liff-ai/v1/claims:
+    get:
+      tags: [LIFF-AI]
+      summary: List warranty claims
+      security:
+        - liffAiBearer: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                pending,
+                reviewing,
+                approved,
+                in_progress,
+                waiting_parts,
+                repairing,
+                quality_check,
+                completed,
+                rejected,
+                cancelled,
+                closed,
+              ]
+      responses:
+        "200":
+          description: Claim list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Claim" }
+
+  /liff-ai/v1/claim/{id}:
+    get:
+      tags: [LIFF-AI]
+      summary: Claim detail
+      security:
+        - liffAiBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Claim with photos + ai_analysis + status_history
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Claim" }
+
+  /liff-ai/v1/claim/{id}/status:
+    post:
+      tags: [LIFF-AI]
+      summary: Change claim status (admin only)
+      security:
+        - liffAiBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string }
+                note: { type: string }
+      responses:
+        "200": { description: Claim status updated + history appended }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /liff-ai/v1/agent-ask:
+    post:
+      tags: [LIFF-AI]
+      summary: Proxy to OpenClaw agent (Gemini/Claude)
+      description: Forwards to LIFF_AI_AGENT_URL with LIFF_AI_AGENT_KEY bearer.
+      security:
+        - liffAiBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt: { type: string }
+                context: { type: object }
+      responses:
+        "200":
+          description: Agent response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  text: { type: string }
+                  tools_called: { type: array, items: { type: string } }
+        "503":
+          description: Agent proxy unreachable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  #
+  # Inventory
+  #
+  /dinoco-stock/v1/stock/list:
+    get:
+      tags: [Inventory]
+      summary: List stock per warehouse
+      security:
+        - wpNonce: []
+      parameters:
+        - name: warehouse_id
+          in: query
+          schema: { type: integer }
+        - name: q
+          in: query
+          schema: { type: string }
+        - name: low_stock_only
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Stock list with hierarchy relations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/StockItem" }
+                  sku_relations: { type: object }
+
+  /dinoco-stock/v1/stock/adjust:
+    post:
+      tags: [Inventory]
+      summary: Manual stock adjustment (admin only)
+      description: |
+        Uses atomic `dinoco_stock_add/subtract()` with FOR UPDATE lock +
+        warehouse sync. Records transaction with type=manual_adjust + reason.
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StockAdjustRequest" }
+      responses:
+        "200":
+          description: Adjustment recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  new_qty: { type: integer }
+                  transaction_id: { type: integer }
+        "422":
+          description: Not a leaf SKU (hierarchy DD-2 guard)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /dinoco-stock/v1/valuation:
+    get:
+      tags: [Inventory]
+      summary: Inventory valuation (WAC)
+      description: |
+        Weighted Average Cost from `dinoco_stock_transactions.unit_cost_thb`
+        populated on B2F receive. Always THB.
+      security:
+        - wpNonce: []
+      responses:
+        "200":
+          description: Per-SKU valuation + grand total THB
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sku: { type: string }
+                        qty: { type: integer }
+                        wac_thb: { type: number }
+                        total_thb: { type: number }
+                  grand_total_thb: { type: number }
+
+  /dinoco-stock/v1/forecast:
+    get:
+      tags: [Inventory]
+      summary: Stock forecast + reorder suggestions
+      description: |
+        Calculates avg daily usage over last 30-90 days from outbound
+        transactions. Returns days_of_stock + suggested_order_qty.
+      security:
+        - wpNonce: []
+      parameters:
+        - name: days
+          in: query
+          description: Analysis window
+          schema: { type: integer, default: 30, minimum: 7, maximum: 180 }
+      responses:
+        "200":
+          description: Forecast per SKU
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ForecastItem" }
+
+  /dinoco-stock/v1/product/pricing:
+    post:
+      tags: [Inventory]
+      summary: Update product pricing (dual-write)
+      description: |
+        Writes to `wp_dinoco_products` custom table AND ACF postmeta for
+        backward compat. Invalidates `b2b_sku_data_map` transient.
+      security:
+        - wpNonce: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProductPricingRequest" }
+      responses:
+        "200": { description: Pricing updated }
+
+  /dinoco-stock/v1/warehouses:
+    get:
+      tags: [Inventory]
+      summary: List warehouses
+      security:
+        - wpNonce: []
+      responses:
+        "200":
+          description: Warehouse list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Warehouse" }
+
+  #
+  # MCP Bridge (subset — 5 most-used)
+  #
+  /dinoco-mcp/v1/product-lookup:
+    post:
+      tags: [MCP]
+      summary: Lookup product by SKU or name (agent tool)
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sku: { type: string }
+                query: { type: string }
+      responses:
+        "200":
+          description: Product with stock_status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+
+  /dinoco-mcp/v1/warranty-check:
+    post:
+      tags: [MCP]
+      summary: Check warranty status by phone or serial
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                phone: { type: string }
+                serial: { type: string }
+      responses:
+        "200":
+          description: Warranty status + registered products
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_registered: { type: boolean }
+                  registrations: { type: array }
+
+  /dinoco-mcp/v1/kb-search:
+    post:
+      tags: [MCP]
+      summary: Semantic KB search
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                top_k: { type: integer, default: 5 }
+      responses:
+        "200":
+          description: Top-k KB matches with score
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    title: { type: string }
+                    content: { type: string }
+                    score: { type: number }
+
+  /dinoco-mcp/v1/dealer-lookup:
+    post:
+      tags: [MCP]
+      summary: Lookup distributor by province/district or name
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                province: { type: string }
+                district: { type: string }
+                query: { type: string }
+      responses:
+        "200":
+          description: Matching dealers
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Dealer" }
+
+  /dinoco-mcp/v1/lead-create:
+    post:
+      tags: [MCP]
+      summary: Create lead from agent conversation
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Lead" }
+      responses:
+        "200":
+          description: Lead created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lead_id: { type: string }
+
+  #
+  # GDPR (scaffold)
+  #
+  /dinoco-gdpr/v1/dsr/export:
+    post:
+      tags: [GDPR]
+      summary: Data subject access request — export
+      description: |
+        Scaffold endpoint. User requests all data DINOCO holds about them
+        (warranty registrations, claims, LINE UID mapping, chat logs).
+        Returns job_id — async export.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject_id, verification_token]
+              properties:
+                subject_id: { type: string, description: LINE UID or phone or email }
+                verification_token: { type: string }
+      responses:
+        "202":
+          description: Export job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  estimated_ready_at: { type: string, format: date-time }
+
+  /dinoco-gdpr/v1/dsr/delete:
+    post:
+      tags: [GDPR]
+      summary: Data subject access request — erasure
+      description: |
+        Scaffold endpoint. Queues asynchronous data deletion with
+        reversible soft-delete + 30-day final purge. Audit-logged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject_id, verification_token, confirm]
+              properties:
+                subject_id: { type: string }
+                verification_token: { type: string }
+                confirm: { type: boolean, enum: [true] }
+      responses:
+        "202": { description: Erasure scheduled (30-day grace) }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /dinoco-gdpr/v1/dsr/status:
+    get:
+      tags: [GDPR]
+      summary: Check DSR job status
+      parameters:
+        - name: job_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Job progress
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  status:
+                    type: string
+                    enum: [queued, running, completed, failed, cancelled]
+                  download_url: { type: string, nullable: true }
+
+components:
+  securitySchemes:
+    wpNonce:
+      type: apiKey
+      in: header
+      name: X-WP-Nonce
+      description: |
+        WordPress nonce generated via `wp_create_nonce('wp_rest')`. Required
+        for all admin writes. GET reads are nonce-less for public catalogs.
+
+    liffAiBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT issued by `/liff-ai/v1/auth`. Signed with `LIFF_AI_JWT_SECRET`.
+        8-hour TTL. Also accepted as `X-LIFF-AI-Token` header.
+
+    b2fAdminToken:
+      type: apiKey
+      in: header
+      name: X-B2F-Token
+      description: |
+        HMAC-signed session token from `/b2f/v1/auth-admin`. Used by B2F
+        Admin LIFF frontend.
+
+    b2bSessionToken:
+      type: apiKey
+      in: query
+      name: session_token
+      description: |
+        HMAC token from `/b2b/v1/auth-group`. Rate-limited per distributor.
+        Contains encoded `group_id` + TTL.
+
+    basicAuth:
+      type: http
+      scheme: basic
+      description: |
+        Used by RPi print daemon + Manual Flash shipping. Credentials stored
+        in `config.json` on Pi side.
+
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: MCP Bridge API key (OpenClaw agent only)
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid authentication
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Authenticated but lacks capability
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadRequest:
+      description: Validation failure
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Rate limit exceeded (see `Retry-After` header)
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: invalid_status_transition
+        message:
+          type: string
+          example: "Cannot transition from completed to draft"
+        data:
+          type: object
+          properties:
+            status: { type: integer, example: 409 }
+
+    #
+    # Orders + BO
+    #
+    Order:
+      type: object
+      properties:
+        id: { type: integer }
+        distributor_id: { type: integer }
+        status:
+          type: string
+          enum:
+            [
+              draft,
+              pending_stock_review,
+              awaiting_confirm,
+              partial_fulfilled,
+              checking_stock,
+              shipped,
+              completed,
+              cancelled,
+            ]
+        total: { type: number }
+        created_at: { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OrderItem" }
+        is_walkin: { type: boolean }
+        bo_items:
+          type: array
+          description: BO queue items if partial_fulfilled
+          items: { $ref: "#/components/schemas/BOQueueItem" }
+
+    OrderItem:
+      type: object
+      properties:
+        sku: { type: string }
+        qty: { type: integer }
+        unit_price: { type: number }
+        subtotal: { type: number }
+        qty_fulfill: { type: integer, description: BO split — immediate ship }
+        qty_bo: { type: integer, description: BO split — waiting stock }
+
+    PlaceOrderRequest:
+      type: object
+      required: [session_token, items]
+      properties:
+        session_token: { type: string }
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku, qty]
+            properties:
+              sku: { type: string }
+              qty: { type: integer, minimum: 1, maximum: 500 }
+        note: { type: string }
+
+    BOSplitRequest:
+      type: object
+      required: [order_id, items]
+      properties:
+        order_id: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku, qty_fulfill, qty_bo]
+            properties:
+              sku: { type: string }
+              qty_fulfill: { type: integer }
+              qty_bo: { type: integer }
+              eta_date: { type: string, format: date }
+
+    BOSplitResponse:
+      type: object
+      properties:
+        order_id: { type: integer }
+        bo_queue_ids: { type: array, items: { type: integer } }
+        confirmed_value: { type: number }
+        bo_value: { type: number }
+        undo_expires_at: { type: string, format: date-time }
+
+    BOQueueItem:
+      type: object
+      properties:
+        id: { type: integer }
+        order_id: { type: integer }
+        sku: { type: string }
+        qty_bo: { type: integer }
+        status:
+          type: string
+          enum: [pending, ready, fulfilled, cancelled]
+        eta_date: { type: string, format: date }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
+
+    DailySummary:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        total_orders: { type: integer }
+        total_revenue: { type: number }
+        total_boxes: { type: integer }
+        pending_review: { type: integer }
+
+    #
+    # Flash / Print
+    #
+    FlashEvent:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time }
+        status_code: { type: string }
+        status_label: { type: string }
+        location: { type: string }
+
+    ManualFlashRequest:
+      type: object
+      required: [receiver_name, receiver_phone, receiver_address, weight_kg]
+      properties:
+        sender_key: { type: string, enum: [dinoco, foxrider] }
+        receiver_name: { type: string }
+        receiver_phone: { type: string }
+        receiver_address: { type: string }
+        receiver_province: { type: string }
+        receiver_district: { type: string }
+        receiver_postcode: { type: string }
+        weight_kg: { type: number }
+        cod_amount: { type: number }
+        items_desc: { type: string }
+
+    PrintJob:
+      type: object
+      properties:
+        job_id: { type: integer }
+        ticket_id: { type: integer }
+        type:
+          type: string
+          enum: [shipping_label, invoice, manual_label]
+        payload_url: { type: string, format: uri }
+        queued_at: { type: string, format: date-time }
+
+    #
+    # Products / Stock
+    #
+    Product:
+      type: object
+      properties:
+        sku: { type: string }
+        name: { type: string }
+        base_price: { type: number }
+        b2b_discount_percent: { type: number }
+        stock_qty: { type: integer }
+        stock_status:
+          type: string
+          enum: [in_stock, low_stock, out_of_stock]
+        category: { type: string }
+        image_url: { type: string, format: uri }
+        boxes_per_unit: { type: integer, default: 1 }
+        units_per_box: { type: integer, default: 1 }
+        min_order_qty: { type: integer, default: 1 }
+        ui_role_override:
+          type: string
+          enum: [auto, set, child, grandchild, single]
+        compatible_models: { type: array, items: { type: string } }
+
+    StockItem:
+      allOf:
+        - $ref: "#/components/schemas/Product"
+        - type: object
+          properties:
+            warehouse_id: { type: integer }
+            warehouse_stock: { type: integer }
+            total_stock: { type: integer, description: Sum across all warehouses }
+            is_leaf: { type: boolean }
+
+    StockAdjustRequest:
+      type: object
+      required: [sku, delta, reason]
+      properties:
+        sku: { type: string }
+        delta: { type: integer, description: Positive=add, negative=subtract }
+        reason: { type: string }
+        warehouse_id: { type: integer }
+        allow_negative: { type: boolean, default: false }
+
+    Warehouse:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        code: { type: string }
+        address: { type: string }
+        is_default: { type: boolean }
+
+    ForecastItem:
+      type: object
+      properties:
+        sku: { type: string }
+        current_qty: { type: integer }
+        avg_daily_usage: { type: number }
+        days_of_stock: { type: integer }
+        reorder_in_days: { type: integer }
+        suggested_order_qty: { type: integer }
+
+    ProductPricingRequest:
+      type: object
+      required: [sku]
+      properties:
+        sku: { type: string }
+        base_price: { type: number }
+        b2b_discount_percent: { type: number, minimum: 0, maximum: 100 }
+        price_silver: { type: number, minimum: 0, maximum: 100 }
+        price_gold: { type: number, minimum: 0, maximum: 100 }
+        price_platinum: { type: number, minimum: 0, maximum: 100 }
+        price_diamond: { type: number, minimum: 0, maximum: 100 }
+        min_order_qty: { type: integer }
+        boxes_per_unit: { type: integer }
+        units_per_box: { type: integer }
+
+    #
+    # B2F
+    #
+    Maker:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        currency:
+          type: string
+          enum: [THB, CNY, USD]
+        group_id: { type: string, description: LINE group_id, unique }
+        bank_code: { type: string }
+        is_bot_enabled: { type: boolean }
+        credit_limit: { type: number }
+        current_payable: { type: number }
+
+    MakerProduct:
+      type: object
+      properties:
+        maker_id: { type: integer }
+        sku: { type: string }
+        unit_cost: { type: number, description: Native currency }
+        moq: { type: integer }
+        lead_time_days: { type: integer }
+        shipping_land: { type: number }
+        shipping_sea: { type: number }
+        status:
+          type: string
+          enum: [active, discontinued, pending]
+        production_mode:
+          type: string
+          enum:
+            [set_assembled, sub_unit, single, cross_factory_assembly]
+          description: V.11.0 — physical production intent
+        confirmation_status:
+          type: string
+          enum: [confirmed, auto_synced]
+        admin_display_mode:
+          type: string
+          enum: [auto, as_set, as_parts]
+          description: UI override
+        missing_leaves: { type: array, items: { type: string } }
+
+    PO:
+      type: object
+      properties:
+        id: { type: integer }
+        maker_id: { type: integer }
+        status:
+          type: string
+          enum:
+            [
+              draft,
+              submitted,
+              confirmed,
+              delivering,
+              received,
+              paid,
+              completed,
+              cancelled,
+            ]
+        currency: { type: string, enum: [THB, CNY, USD] }
+        exchange_rate: { type: number }
+        shipping_method: { type: string, enum: [land, sea] }
+        total_amount: { type: number }
+        total_amount_thb: { type: number }
+        shipping_total: { type: number }
+        grand_total_thb: { type: number }
+        created_at: { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/POItem" }
+        order_intent_summary:
+          type: object
+          description: V.11.0 — 3-bucket breakdown (admin-only, stripped for non-admin)
+
+    POItem:
+      type: object
+      properties:
+        sku: { type: string }
+        qty_ordered: { type: integer }
+        qty_received: { type: integer }
+        unit_price: { type: number }
+        parent_sku: { type: string, nullable: true }
+        parent_name: { type: string, nullable: true }
+        parent_breakdown:
+          type: array
+          description: DD-3 multi-parent attribution
+          items:
+            type: object
+            properties:
+              parent_sku: { type: string }
+              parent_name: { type: string }
+              qty: { type: integer }
+        order_mode:
+          type: string
+          enum: [full_set, sub_unit, single_leaf]
+          description: V.11.0 admin intent
+        source_sku: { type: string, description: Ancestor SKU (validated) }
+
+    CreatePORequest:
+      type: object
+      required: [maker_id, items]
+      properties:
+        maker_id: { type: integer }
+        currency: { type: string, enum: [THB, CNY, USD] }
+        exchange_rate: { type: number }
+        shipping_method: { type: string, enum: [land, sea] }
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku, qty]
+            properties:
+              sku: { type: string }
+              qty: { type: integer, minimum: 1 }
+              unit_price: { type: number }
+              order_mode:
+                type: string
+                enum: [full_set, sub_unit, single_leaf]
+              source_sku: { type: string }
+              intent_notes: { type: string, maxLength: 200 }
+        notes: { type: string }
+
+    ReceiveGoodsRequest:
+      type: object
+      required: [po_id, items]
+      properties:
+        po_id: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku, rcv_qty, rcv_unit_price]
+            properties:
+              sku: { type: string }
+              rcv_qty: { type: integer, minimum: 0 }
+              rcv_unit_price: { type: number }
+              rcv_notes: { type: string }
+
+    #
+    # LIFF AI
+    #
+    Lead:
+      type: object
+      properties:
+        id: { type: string, pattern: "^[a-f0-9]{24}$" }
+        customer_name: { type: string }
+        customer_phone: { type: string }
+        status: { type: string }
+        assigned_dealer_id: { type: integer }
+        product_interest: { type: string }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
+        history: { type: array, items: { type: object } }
+
+    Claim:
+      type: object
+      properties:
+        id: { type: string }
+        ticket_number: { type: string }
+        customer_name: { type: string }
+        product_sku: { type: string }
+        ticket_status:
+          type: string
+          enum:
+            [
+              pending,
+              reviewing,
+              approved,
+              in_progress,
+              waiting_parts,
+              repairing,
+              quality_check,
+              completed,
+              rejected,
+              cancelled,
+              closed,
+            ]
+        photos: { type: array, items: { type: string, format: uri } }
+        ai_analysis: { type: object, nullable: true }
+        status_history:
+          type: array
+          items:
+            type: object
+            properties:
+              status: { type: string }
+              changed_by: { type: string }
+              changed_at: { type: string, format: date-time }
+              note: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Dealer:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        phone: { type: string }
+        province: { type: string }
+        district: { type: string }
+        line_uid: { type: string, nullable: true }
+        linked_wp_user: { type: integer, nullable: true }
+
+    Distributor:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        rank:
+          type: string
+          enum: [standard, silver, gold, platinum, diamond]
+        current_debt: { type: number }
+        credit_limit: { type: number }
+        is_walkin: { type: boolean }
+        owner_line_uid: { type: string }
