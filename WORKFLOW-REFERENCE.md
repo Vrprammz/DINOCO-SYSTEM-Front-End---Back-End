@@ -435,6 +435,160 @@ Trigger: Admin เปิด LIFF Catalog หรือ B2F Dashboard
 End State: b2f_order สถานะ submitted
 ```
 
+### 3.1.7 Create PO V.7.0 — Order Intent System (2026-04-17)
+
+**Context**: Admin LIFF B2F E-Catalog V.7.0 rework — admin สั่งของจากโรงงานได้ 3 ระดับ ชัดเจน แทน SET-centric แบบเดิม
+
+#### 3 Order Modes
+
+```
+🟣 ชุดเต็ม (full_set)     — สั่ง SET ครบชุด (เช่น DNCCBSET500X001 กันล้ม 4 ชิ้น)
+🟠 แยกชุด (sub_unit)      — สั่งชุดย่อยที่มีลูก (เช่น Pannier Rack L+R pair)
+⚪ ชิ้นเดี่ยว (single_leaf) — สั่ง 1 ชิ้น (เช่น Top Rack เดี่ยว)
+🟠 DINOCO ประกอบ          — cross-factory (hidden default — admin สั่ง parts แต่ละโรงงาน)
+```
+
+#### 4 Use Cases
+
+**Case A — สั่งชุดเต็มให้ร้าน**:
+```
+1. Admin เปิด LIFF → เลือก Maker (HTP)
+2. Tap 🟣 DNCCBSET500X001 card
+3. Qty stepper: "+ สั่งครบชุด" × 5
+4. Cart: 🟣 ชุดเต็ม section (purple)
+5. Submit Review Gate: 🟣 ชุดเต็ม 5 ชุด ₿19,510
+6. POST /create-po with order_mode='full_set'
+7. DD-7 expand: 5 SETs × 4 parts = 20 leaves
+```
+
+**Case B — สั่งแยกชุด (sub-unit)**:
+```
+1. Tap 🟠 DNCGNDPROS500 (Pannier Rack pair)
+2. Info strip: "⚡ สั่ง 1 ชุด = ผลิต 2 ชิ้น (L+R)"
+3. Qty stepper × 10 → preview "L × 10 + R × 10"
+4. Cart: 🟠 แยกชุด section (amber)
+5. POST with order_mode='sub_unit'
+6. DD-7 expand: L × 10 + R × 10 = 20 leaves
+```
+
+**Case C — สั่งชิ้นเดี่ยว**:
+```
+1. Tap ⚪ DNCGNDPROT500 (Top Rack)
+2. Qty × 3
+3. Cart: ⚪ ชิ้นเดี่ยว section (amber combined with sub_unit)
+4. POST with order_mode='single_leaf'
+5. No DD-7 expand — 3 pieces direct
+```
+
+**Case D — Cross-factory (DINOCO assembly)**:
+```
+1. DNCGNDSDPRO500S = Set Top Case + Rack (กล่องโรงงานอื่น + rack HTP)
+2. Card hidden default (admin_display_mode='as_parts')
+3. Admin toggle "แสดง SET ที่ซ่อนไว้" → card appears with amber dashed border
+4. Info: "ต้อง parts หลายโรงงาน — นี้ (HTP): PROS500 + PROT500"
+5. Admin สั่งเฉพาะ parts HTP → ไปสั่งกล่องที่ LIFF โรงงานอื่นเอง
+6. Stock DD-2 assemble SET ให้เองเมื่อ parts เข้าครบ
+```
+
+#### Ungroup System (3 Ways)
+
+```
+1. Auto-detect (migration default)
+   missing_leaves > 0 → admin_display_mode='as_parts' (SET hidden)
+
+2. Bulk action (Admin Makers tab V.7.1)
+   Select 200+ SKUs → "📁 ซ่อน SET → สั่งแค่ parts"
+
+3. Per-SKU manual (edit modal)
+   auto (default) / as_set (force show) / as_parts (hide SET)
+```
+
+#### Submit Flow
+
+```
+Cart (dual section):
+  🟣 ชุดเต็ม: 5 ชุด ₿19,510
+  🟠+⚪ แยกชุด+ชิ้นเดี่ยว: 13 ชิ้น ₿36,000
+
+↓ tap "ตรวจสอบก่อนส่ง"
+
+Submit Review Gate (3-bucket accordion):
+  ▼ 🟣 ชุดเต็ม: 5 ชุด ₿19,510
+    DNCCBSET500X001 × 5 ₿19,510
+  ▼ 🟠 แยกชุด: 10 ชุด ₿30,600
+    DNCGNDPROS500 × 10 ₿30,600
+  ▶ ⚪ ชิ้นเดี่ยว: 3 ชิ้น ₿5,400 (collapsed)
+  ─────────────────────
+  รวม: ₿55,510
+  [กลับไปแก้] [ยืนยันส่ง]
+
+↓ tap "ยืนยันส่ง" (no warn for mixed mode)
+
+POST /b2f/v1/create-po:
+{
+  "maker_id": 5865,
+  "items": [
+    {"sku":"DNCCBSET500X001", "qty":5, "order_mode":"full_set", "source_sku":"DNCCBSET500X001"},
+    {"sku":"DNCGNDPROS500", "qty":10, "order_mode":"sub_unit", "source_sku":"DNCGNDPROS500"},
+    {"sku":"DNCGNDPROT500", "qty":3, "order_mode":"single_leaf", "source_sku":"DNCGNDPROT500",
+     "intent_notes":"PO พิเศษสำหรับ event X"}
+  ]
+}
+
+↓ server 7-rule validator
+
+Backend saves:
+- ACF po_items repeater: poi_order_mode + poi_intent_notes + poi_source_sku + poi_production_mode_snapshot
+- Postmeta: _b2f_order_intent_summary = {full_set_count:5, sub_unit_count:10, single_leaf_count:3}
+
+↓ 30s undo window
+
+Post-submit toast: "ส่ง PO สำเร็จ [ยกเลิกภายใน 30 วิ]"
+If admin tap → POST /po-undo-submit (FSM draft→cancelled + stock restore + credit refund)
+```
+
+#### Confirmation Flow (Admin Makers tab)
+
+```
+Auto-synced SETs (Phase 2 backfill) default confirmation_status='auto_synced'
+Admin Makers tab shows:
+  ⚠️ "มี 9 SET รอยืนยัน"  [รีวิว]
+
+↓ Admin reviews → tap "ยืนยัน" per SKU OR "ยืนยันทั้งหมด"
+
+POST /junction-confirm-classification {maker_id, skus[]}
+Sets confirmation_status='confirmed' + confirmed_by=$uid + confirmed_at=NOW()
+
+Warning banner hides when unconfirmed_count=0 (clean UI per Decision #12)
+```
+
+#### Maker Perspective (Snippet 4 V.4.3)
+
+```
+Maker opens LIFF → PO detail:
+  Items:
+    🟣 ชุดเต็ม: DNCCBSET500X001 × 5  ₿19,510
+    🟠 แยกชุด: DNCGNDPROS500 × 10  ₿30,600
+    ⚪ ชิ้นเดี่ยว: DNCGNDPROT500 × 3   ₿5,400
+  Total: ₿55,510
+  [ยืนยัน] [ปฏิเสธ]
+
+Maker sees: mode badge (3-lang)
+Maker does NOT see: intent_notes (admin-only per PII gate)
+```
+
+#### Feature Flags (Dependency Chain)
+
+```
+b2f_flag_v11_explicit_mode   — enable first (backend returns new fields)
+  ↓
+b2f_flag_order_intent        — LIFF UI + validator (requires v11)
+  ↓
+b2f_flag_ungroup_auto_hide   — migration as_parts auto (requires Phase 4 finished_at)
+```
+
+**Rollback**: `update_option(flag, false)` → instant revert ไม่ต้อง re-deploy
+
 ### 3.2 Maker Confirm/Reject PO -- Text
 
 ```

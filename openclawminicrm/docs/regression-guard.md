@@ -287,3 +287,51 @@ docker exec smltrack-agent node /app/scripts/regression.js --mode=report
 - **CI workflow:** `.github/workflows/regression-guard.yml`
 - **Dashboard tab:** `openclawminicrm/smltrackdashboard/src/app/train/components/RegressionTab.tsx`
 - **Fix History:** `openclawminicrm/docs/chatbot-rules.md` §11 (REG-NNN column)
+
+---
+
+## 10. B2F V.7.0 Order Intent Regression Scenarios (API/DB, non-chatbot)
+
+> 8 scenarios ตรวจ backend API + DB invariants ของ B2F V.7.0 — รันก่อน flip feature flag `b2f_flag_order_intent`. ไม่ใช่ chatbot conversation test — เป็น HTTP/SQL assertion.
+
+### Seed location (pending)
+
+- ใช้ `scripts/regression.js --category=b2f_order_intent` (กำหนดใหม่)
+- Scenario fixture ใน MongoDB `regression_scenarios` category=`b2f_order_intent`, severity=critical
+- HTTP driver ใช้ WordPress REST API (`/wp-json/b2f/v1/*` + `/wp-json/dinoco-b2f-audit/v1/*`) + admin token
+
+### 10.1 Scenarios
+
+| ID | Scenario | Expected | Severity |
+| --- | --- | --- | --- |
+| REG-B2F-V7-01 | `POST /create-po` with `order_mode=full_set` on SKU with `production_mode=single` | HTTP 400 `invalid_order_mode` | critical |
+| REG-B2F-V7-02 | `POST /po-undo-submit` 31 วินาทีหลัง submit | HTTP 410 `undo_window_expired` | critical |
+| REG-B2F-V7-03 | `POST /junction-bulk-update-display` กับ 201 SKUs | HTTP 400 `bulk_limit_exceeded` | high |
+| REG-B2F-V7-04 | CHECK constraint `production_mode=single + admin_display_mode=as_parts` (MySQL 8.0.16+) OR PHP validator (all versions) | HTTP 422 `check_constraint_violation` | critical |
+| REG-B2F-V7-05 | Flag `b2f_flag_v11_explicit_mode=OFF` → `GET /maker-products/{id}` response | 200 with V.10.5-compatible shape (no new fields) | high |
+| REG-B2F-V7-06 | Concurrent toggle `admin_display_mode` + `create-po` on same SKU | FOR UPDATE prevents stale write — second request retries cleanly | high |
+| REG-B2F-V7-07 | Legacy PO without `poi_order_mode` → PO Ticket view | UI displays "—" (no DB infer per Decision #9) | medium |
+| REG-B2F-V7-08 | `intent_notes` with 201 characters → create-po | Stored 200 chars + log warning `intent_notes_truncated` | medium |
+
+### 10.2 Execution
+
+```bash
+# Dry-run API tests against staging
+node scripts/regression.js --category=b2f_order_intent --mode=report
+
+# Gate before flipping flag (requires all pass)
+node scripts/regression.js --category=b2f_order_intent --mode=gate --severity=critical,high
+```
+
+### 10.3 PII-Aware Assertions
+
+REG-B2F-V7-05 ต้อง assert response body ไม่มี `production_mode` / `confirmation_status` / `admin_display_mode` / `missing_leaves` / `maker_profile.stats` เมื่อ flag OFF (V.10.5 backward compat).
+
+REG-B2F-V7-07 ต้อง assert `poi_intent_notes` + `poi_production_mode_snapshot` + `order_intent_summary` ถูก strip สำหรับ non-admin token (callback-level PII gate ใน `b2f_format_po_detail()`).
+
+### 10.4 Reference
+
+- **Plan:** `.claude/plans/sunny-spinning-quill.md` §Regression Scenarios
+- **FEATURE-SPECS:** §1.17.16 V.7.0 Regression Scenarios
+- **Error codes:** Snippet 1 V.7.0 lines 3489-3499 (8 constants)
+- **Deploy gate:** เพิ่ม `SKIP_B2F_V7_GATE=1` env override สำหรับ emergency rollout

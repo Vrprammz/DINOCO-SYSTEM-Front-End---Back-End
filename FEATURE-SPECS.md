@@ -3324,6 +3324,350 @@ color: profit > 0 → เขียว, profit < 0 → แดง, 0 → เทา
 
 **Data integrity**: V.42.17 ไม่แก้ database schema เลย — rollback safe 100%. Cache transient หายเองใน 1 ชม
 
+## 1.17 V.7.0 Order Intent System + Ungroup (2026-04-17 — Deployed)
+
+**Status**: Deployed 2026-04-17 | **Commits**: `512542e` (UI) + `2a99e85` (backend+schema) + `2a15431` (docs) | **Plan**: `/Users/pavornthavornchan/.claude/plans/sunny-spinning-quill.md`
+
+### 1.17.1 Problem & Goal
+
+**ปัญหา**: LIFF B2F E-Catalog เดิม บังคับ SET-centric layout เดียว แต่ admin สั่งของจากโรงงานได้หลายระดับต่างกัน — ไม่แยกระดับให้ชัด → admin งง + Maker ไม่รู้ว่าสั่งอะไร
+
+**เป้าหมาย**:
+- Admin สั่งของได้ 3 ระดับชัดเจน: ชุดเต็ม / แยกชุด / ชิ้นเดี่ยว
+- Backend tag intent per item (trace ได้ใน PO)
+- Cross-factory SETs (ต้องใช้ parts หลายโรงงาน) auto-hide — admin จัดการผ่าน parts โดยตรง + stock DD-2 assemble ให้เอง
+- Cart persist across reloads + undo submit window 30 วิ
+
+### 1.17.2 Taxonomy (3 Cards + 1 Hidden)
+
+| Card | production_mode | Color | ตัวอย่าง | จำนวนชิ้นต่อ order |
+|------|-----------------|-------|----------|-------------------|
+| 🟣 ชุดเต็ม | `set_assembled` | #7c3aed purple | DNCCBSET500X001 (กันล้ม) | 4+ ชิ้น |
+| 🟠 แยกชุด | `sub_unit` | #f59e0b amber | DNCGNDPROS500 (Pannier L+R) | 2 ชิ้น |
+| ⚪ ชิ้นเดี่ยว | `single` | #9ca3af gray | DNCGNDPROT500 (Top Rack) | 1 ชิ้น |
+| 🟠 DINOCO ประกอบ (hidden) | `cross_factory_assembly` | amber dashed | DNCGNDSDPRO500S (box+rack) | ซ่อน default |
+
+### 1.17.3 Data Model — 3 Axes Orthogonal
+
+```
+Axis 1 — production_mode (physical reality)
+  4 values: set_assembled | sub_unit | single | cross_factory_assembly
+
+Axis 2 — confirmation_status (admin review state)
+  2 values: confirmed | auto_synced
+
+Axis 3 — admin_display_mode (UI override)
+  3 values: auto | as_set | as_parts
+```
+
+**Card variant decision** (frontend — no heuristic):
+
+| production_mode | confirmation_status | admin_display_mode default | LIFF behavior |
+|-----------------|---------------------|----------------------------|---------------|
+| set_assembled | confirmed | auto | 🟣 ชุดเต็ม card |
+| set_assembled | auto_synced | auto | 🟣 + ⚠️ "ยังไม่ยืนยัน" |
+| sub_unit | — | auto | 🟠 แยกชุด card |
+| single | — | — | ⚪ ชิ้นเดี่ยว card |
+| cross_factory_assembly | — | `as_parts` (default!) | ซ่อน SET → parts เท่านั้น |
+| any | — | `as_parts` (manual) | hide parent, render children flat |
+
+### 1.17.4 Schema V.11.0
+
+**File**: `B2F-SCHEMA-V11.sql` (root-level — reference spec, Audit V.3.3 inline DDL)
+
+```sql
+-- STEP 0: Extend observations ENUM
+ALTER TABLE wp_dinoco_maker_product_observations
+  MODIFY COLUMN source ENUM('cpt','junction','diff','classification_change') NOT NULL;
+
+-- STEP 1: Junction +6 columns
+ALTER TABLE wp_dinoco_product_makers
+  ADD COLUMN production_mode ENUM(
+      'set_assembled','sub_unit','single','cross_factory_assembly'
+  ) NOT NULL DEFAULT 'single' AFTER status,
+  ADD COLUMN confirmation_status ENUM('confirmed','auto_synced')
+      NOT NULL DEFAULT 'auto_synced' AFTER production_mode,
+  ADD COLUMN admin_display_mode ENUM('auto','as_set','as_parts')
+      NOT NULL DEFAULT 'auto' AFTER confirmation_status,
+  ADD COLUMN missing_leaves_count SMALLINT UNSIGNED NOT NULL DEFAULT 0
+      AFTER admin_display_mode COMMENT 'denormalized cache',
+  ADD COLUMN confirmed_by BIGINT UNSIGNED DEFAULT NULL,
+  ADD COLUMN confirmed_at DATETIME DEFAULT NULL,
+  ADD KEY idx_maker_prod_display (maker_id, production_mode, admin_display_mode),
+  ADD KEY idx_maker_confirmation (maker_id, confirmation_status);
+
+-- STEP 2: CHECK constraints (MySQL 8.0.16+ enforces; lower: PHP validator = primary)
+ALTER TABLE wp_dinoco_product_makers
+  ADD CONSTRAINT chk_mode_display
+  CHECK (NOT (production_mode='single' AND admin_display_mode='as_parts')),
+  ADD CONSTRAINT chk_confirmed_consistency
+  CHECK (confirmation_status='auto_synced' OR 
+         (confirmed_by IS NOT NULL AND confirmed_at IS NOT NULL));
+
+-- STEP 3: Schema markers
+UPDATE wp_options SET option_value='11.0' WHERE option_name='b2f_schema_version';
+INSERT INTO wp_options (option_name, option_value) VALUES
+  ('b2f_schema_v11_activated', CURRENT_TIMESTAMP);
+```
+
+### 1.17.5 ACF — Snippet 0 V.3.5
+
+`po_items` repeater +4 sub-fields:
+
+```
+poi_order_mode: select ['full_set','sub_unit','single_leaf']  required
+poi_intent_notes: textarea  optional (general note)  max 200 chars
+poi_source_sku: text  optional (SKU ที่ admin click ก่อน DD-7 expand)
+poi_production_mode_snapshot: text (snapshot — audit trail)
+```
+
+Postmeta PO-level:
+```
+_b2f_order_intent_summary: JSON
+  { full_set_count, sub_unit_count, single_leaf_count, total_items }
+  show_in_rest=false + auth_callback=manage_options
+```
+
+### 1.17.6 REST API — Snippet 2 V.11.0
+
+**Enriched `GET /b2f/v1/maker-products/{maker_id}`** (flag-gated `b2f_flag_v11_explicit_mode`):
+
+Per-product enriched fields: `production_mode`, `confirmation_status`, `admin_display_mode`, `missing_leaves[]`, `missing_leaves_count`
+
+Response-level `maker_profile.stats`: `{set_count, sub_unit_count, single_count, cross_factory_count, unconfirmed_count, hidden_as_parts_count}`
+
+Transient cache: `b2f_maker_products_v11_{maker_id}` 10min TTL + invalidation via `do_action('b2f_junction_updated', $maker_id)` central hook
+
+**7-Rule Validator `POST /b2f/v1/create-po`**:
+1. `order_mode` strict enum match (in_array strict)
+2. `full_set` → SKU `production_mode` ∈ {set_assembled, cross_factory_assembly}
+3. `sub_unit` → SKU `production_mode='sub_unit'`
+4. `single_leaf` → SKU `production_mode='single'`
+5. `source_sku` ใน ancestor chain (via `dinoco_get_ancestor_skus()`)
+6. `intent_notes` sanitize + mb_substr max 200 chars
+7. Rate limit `b2f_rate_limit($user_id, 5, 60)`
+
+**DD-3 composite merge key**: `$merged["{$sku}|{$order_mode}|{$source_sku}"]` — same SKU + different mode preserved as separate PO items
+
+**PII Callback Gate** `b2f_format_po_detail()`:
+```php
+$is_admin = current_user_can('manage_options') || 
+            (b2f_verify_admin_token($req)['is_admin'] ?? false);
+if (!$is_admin) {
+    // Strip: poi_intent_notes, poi_production_mode_snapshot, order_intent_summary
+}
+```
+
+**NEW `POST /b2f/v1/po-undo-submit`**:
+- 30s DB-clock window (`post_date > NOW() - INTERVAL 30 SECOND`)
+- Dual auth (WP nonce OR X-B2F-Token admin JWT)
+- FOR UPDATE + GET_LOCK (concurrent safety)
+- FSM draft→cancelled + stock restore + credit refund
+- Errors: 410 undo_window_expired, 409 already_cancelled (idempotent)
+
+**4 New Audit REST Endpoints** (namespace `/dinoco-b2f-audit/v1/`):
+- `POST /junction-update-classification` — atomic single-row update
+- `POST /junction-bulk-update-display` (max 200 SKUs + idempotency_key)
+- `POST /junction-confirm-classification` (idempotent re-confirm)
+- `POST /phase4-migration` (5/hr rate limit + CSV dry-run export)
+- `GET /phase4-migration-state` (dashboard UI)
+
+### 1.17.7 Migration — Phase 4 Inline
+
+**Function**: `b2f_phase4_run_classification_migration($dry_run, $batch)` in Audit V.3.3
+
+**7-step pipeline**:
+```
+STEP 0: Set lock flag (CRIT-4 — prevent dual-write race)
+STEP 1: MySQL version check (non-blocking log)
+STEP 2: Pre-migration mysqldump → wp-content/b2f-backups/b2f_v11_{ts}.sql (0700)
+STEP 3: ALTER TABLE idempotent (INFORMATION_SCHEMA check per column)
+STEP 4: Classification loop — batch 200 rows + 50ms gap
+  IF has_children AND missing_leaves>0:
+    production_mode = 'cross_factory_assembly'
+    admin_display_mode = 'as_parts'
+  ELIF has_children AND has_parent:
+    production_mode = 'sub_unit'
+  ELIF has_children:
+    production_mode = 'set_assembled'
+  ELSE:
+    production_mode = 'single'
+  
+  # Idempotent guard — preserve admin choice
+  UPDATE ... WHERE confirmation_status='auto_synced' OR confirmed_at IS NULL
+STEP 5: Update progress state JSON
+STEP 6: Clear lock flag
+STEP 7: Enqueue replay queued dual-writes
+```
+
+**Expected HTP result** (from catalog CSV):
+- 9 orphan SETs → `set_assembled` + `auto_synced` + `auto`
+- 7+ cross-factory SETs (missing boxes) → `cross_factory_assembly` + `as_parts` auto-hidden
+- Parts (PROS500, etc.) → `sub_unit`
+- Leaves (PROT500) → `single`
+
+### 1.17.8 Ungroup System (3 Ways)
+
+**1. Auto-detect (migration default)**:
+`missing_leaves > 0` → `admin_display_mode='as_parts'` (SET hidden)
+
+**2. Bulk action (Admin Makers tab V.7.1)**:
+- Filter "⚠️ ยังไม่ยืนยัน" → select 200+ SKUs
+- `POST /junction-bulk-update-display` (max 200 + idempotency_key)
+- Atomic START TRANSACTION + per-SKU FOR UPDATE
+
+**3. Per-SKU manual**: edit modal radio `auto | as_set | as_parts`
+
+### 1.17.9 Feature Flags
+
+```
+b2f_flag_v11_explicit_mode   — backend returns production_mode in API (default OFF)
+b2f_flag_order_intent        — LIFF UI + order_mode validator (requires v11)
+b2f_flag_ungroup_auto_hide   — migration missing_leaves → as_parts auto (requires Phase 4 finished_at)
+```
+
+**Dependency chain enforced** ใน flag setter (Audit V.3.3):
+- `order_intent=ON` requires `v11_explicit_mode=ON`
+- `ungroup_auto_hide=ON` requires `b2f_phase4_migration_state.finished_at`
+- `v11_explicit_mode=OFF` requires `order_intent=OFF` (downstream safety)
+
+**Rollback**: `update_option(flag, false)` → instant revert ไม่ต้อง re-deploy
+
+### 1.17.10 Error Code Registry (Snippet 1 V.7.0)
+
+```php
+const B2F_ERR_INVALID_ORDER_MODE        = 'invalid_order_mode';         // 400
+const B2F_ERR_SOURCE_SKU_NOT_ANCESTOR   = 'source_sku_not_ancestor';    // 400
+const B2F_ERR_UNDO_WINDOW_EXPIRED       = 'undo_window_expired';        // 410
+const B2F_ERR_CHECK_CONSTRAINT          = 'check_constraint_violation'; // 422
+const B2F_ERR_STALE_JUNCTION_WRITE      = 'stale_junction_write';       // 409
+const B2F_ERR_BULK_LIMIT_EXCEEDED       = 'bulk_limit_exceeded';        // 400
+const B2F_ERR_MYSQL_VERSION_TOO_LOW     = 'mysql_version_too_low';      // warning log only
+const B2F_ERR_MIGRATION_IN_PROGRESS     = 'migration_in_progress';      // 503
+```
+
+### 1.17.11 PII Protection
+
+**`poi_intent_notes`** = admin-only (may contain PII like "คุณมานะ เคลม #1234")
+
+**Defense layers**:
+1. CPT `show_in_rest=false` (Snippet 0) — blocks `/wp/v2/b2f_order/{id}`
+2. Postmeta `show_in_rest=false` + `auth_callback=manage_options` (Snippet 0)
+3. `b2f_format_po_detail()` callback-level gate (Snippet 2) — strips for non-admin
+4. Maker LIFF V.4.3 defensively ignores `poi_intent_notes`
+5. PO Image V.3.0 does NOT read intent_notes (GD renderer)
+6. Flex builders (Snippet 1 V.7.0) defensive `unset()` before render
+
+### 1.17.12 Cart Persistence
+
+**localStorage key**: `b2f_cart_v7_{maker_id}`
+
+**Schema v7**:
+```json
+{
+  "_schema": 7,
+  "items": {
+    "DNCCBSET500X001": {
+      "qty": 5,
+      "price": 3902,
+      "name": "Crash Bar SET",
+      "image": "https://...",
+      "order_mode": "full_set",
+      "source_sku": "DNCCBSET500X001",
+      "intent_notes": null
+    }
+  },
+  "updated_at": "2026-04-17T14:30:00+07:00"
+}
+```
+
+**Lifecycle**:
+- Save on every qty change (debounced)
+- Restore on LIFF init
+- Clear after successful submit
+- Backward compat: V.6.6 code ignores new keys gracefully
+
+### 1.17.13 Submit Flow
+
+```
+Cart (dual section) → Submit Review Gate (3-bucket accordion) → 
+POST /create-po → Success Toast "ยกเลิกได้ 30 วิ" → 
+[Optional] POST /po-undo-submit (FSM draft→cancelled)
+```
+
+**NO warn modal for mixed mode** (per user decision — สั่งผสม 3 โหมดได้เลย)
+
+### 1.17.14 Rollout Plan (No Canary)
+
+1. Deploy Snippet 0.5 V.1.2 + Snippet 1 V.7.0 (flag helpers + whitelist)
+2. Schema ALTER + Phase 4 migration via Audit V.3.3 dashboard
+3. Deploy Snippet 2 V.11.0 (enriched API)
+4. Deploy Snippet 4/5/8/9/10 UI
+5. Flip all 3 flags ON ทันที (testing phase — no canary per user decision)
+6. Monitor 1 week → rollback instant ถ้าพบ issue
+
+### 1.17.15 Regression Scenarios (REG-B2F-V7-01 to 08)
+
+ต้องเพิ่มเข้า `openclawminicrm/docs/regression-guard.md`:
+
+| ID | Scenario | Expected |
+|----|----------|----------|
+| REG-B2F-V7-01 | create-po `full_set` on SKU production_mode=`single` | 400 `invalid_order_mode` |
+| REG-B2F-V7-02 | po-undo-submit after 31s | 410 `undo_window_expired` |
+| REG-B2F-V7-03 | bulk-update-display 201 SKUs | 400 `bulk_limit_exceeded` |
+| REG-B2F-V7-04 | CHECK constraint single→as_parts (MySQL 8.0.16+) OR PHP validator | 422 `check_constraint_violation` |
+| REG-B2F-V7-05 | Flag `v11_explicit_mode=OFF` → API strips new fields | 200 V.10.5-compat shape |
+| REG-B2F-V7-06 | Concurrent toggle + create-po race | FOR UPDATE prevents stale |
+| REG-B2F-V7-07 | Legacy PO no `poi_order_mode` → display "—" | UI fallback per Decision #9 |
+| REG-B2F-V7-08 | `intent_notes` 201 chars → auto-truncate | Stored 200 chars |
+
+### 1.17.16 Files Changed (11 total + 2 docs)
+
+| File | Version | LOC+ | Commit |
+|------|---------|------|--------|
+| B2F-SCHEMA-V11.sql | NEW | +299 | 2a99e85 |
+| [B2F] Snippet 0 | V.3.4 → V.3.5 | +65 | 2a99e85 |
+| [B2F] Snippet 0.5 | V.1.1 → V.1.2 | +183 | 2a99e85 |
+| [B2F] Snippet 1 | V.6.6 → V.7.0 | +677 | 2a99e85 |
+| [B2F] Snippet 2 | V.10.5 → V.11.0 | +683 | 2a99e85 |
+| [B2F] Snippet 4 | V.4.2 → V.4.3 | +24 | 512542e |
+| [B2F] Snippet 5 | V.6.6 → V.7.1 | +285 | 512542e |
+| [B2F] Snippet 8 | V.6.6 → V.7.0 | +600 | 2a99e85 |
+| [B2F] Snippet 9 | V.3.5 → V.3.6 | +157 | 512542e |
+| [B2F] Snippet 10 | V.2.7 → V.3.0 | +93 | 512542e |
+| Audit | V.3.2 → V.3.3 | +1664 | 2a99e85 |
+| CLAUDE.md + SYSTEM-REFERENCE.md | — | +68 | 2a15431 |
+
+**Total code**: ~4,730 LOC | **Total docs**: ~500 LOC
+
+### 1.17.17 User Decisions Applied (14 total)
+
+1. ✅ Cart persistence (localStorage)
+2. ✅ Color raw_parts merged into 🟠 แยกชุด
+3. ✅ Maker LIFF Tier 1 (show mode badge, no intent_notes)
+4. ❌ No pair-derive helper (admin register L/R separately)
+5. ❌ No canary (deploy all immediately)
+6. ❌ No dry-run wait period
+7. ✅ intent_notes optional general note
+8. ❌ No warn modal mixed mode
+9. ✅ Legacy PO = display "—"
+10. ✅ Reuse observations table
+11. ❌ No override chip (admin ลบ+สั่งใหม่)
+12. ✅ Hide banner when unconfirmed=0
+13. ❌ No MySQL upgrade (PHP validator primary)
+14. ❌ No "เคลม/เติมสต็อก/อะไหล่" terminology
+
+### 1.17.18 Multi-Agent Audit Resolved
+
+**8 agents × 2 rounds = 48+ issues integrated**:
+- ux-ui-expert: 7 priority fixes
+- tech-lead × 2: 15 critical gaps + cross-system isolation verified
+- fullstack-developer × 2: security + performance + helpers + code-level bugs
+- database-expert × 2: schema refinements + migration idempotency
+- api-specialist: endpoint specs + validator gaps
+- security-pentester: PII filter + injection risks
+- Explore: docs/wiki/config gaps
+
 ---
 
 # 13. Regression Guard System V.1.5 (OpenClaw)
