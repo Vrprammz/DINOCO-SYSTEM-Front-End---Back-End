@@ -1,6 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 0.5: Maker Product Dual-Write                ║
+ * ║  Version: V.1.8 — Phase 3 Group F (DB-M2):                      ║
+ * ║    `b2f_dualwrite_infer_classification` previously executed a   ║
+ * ║    per-call COUNT(DISTINCT) query against                        ║
+ * ║    `wp_dinoco_product_makers` to determine missing_leaves_count. ║
+ * ║    Phase 2 backfill + admin-driven saves fire this path per mp_id║
+ * ║    so an admin "Save All" of 100 products = 100 COUNT queries.   ║
+ * ║    Now prefers Snippet 1 V.7.3 helper `b2f_load_maker_sku_set()`  ║
+ * ║    (single SELECT returning a set-of-SKUs hashmap) with a static ║
+ * ║    in-request memo — only one SELECT per maker_id per request,  ║
+ * ║    regardless of how many classifications we resolve. Falls back ║
+ * ║    to the legacy COUNT when the helper is unavailable (defensive);║
+ * ║    so behavior is fully backward compatible.                      ║
  * ║  Version: V.1.7 — Phase 3 Group F BUG-H10 FIX:                ║
  * ║    `b2f_dualwrite_infer_classification` missing_leaves count  ║
  * ║    previously walked children 1 level only (flatten loop) →   ║
@@ -334,11 +346,12 @@ if ( ! function_exists( 'b2f_dualwrite_infer_classification' ) ) {
         // `dinoco_get_leaf_skus()` (Snippet 15 PART 1.35 V.6.0) does the recursive walk
         // + handles shared leaves (DD-3). We also `array_unique` defensively — one leaf
         // shared across 2 children of the same SET must only count once toward coverage.
+        //
+        // V.1.8 DB-M2: membership probe uses cached maker_sku_set (single SELECT per
+        // maker_id per request via static memo) instead of per-call COUNT(DISTINCT).
+        // Batch callers (Phase 2 backfill, admin bulk save) avoid the N×COUNT pattern.
         $missing_count = 0;
         if ( $has_children ) {
-            global $wpdb;
-            $tbl = $wpdb->prefix . 'dinoco_product_makers';
-
             // Prefer recursive leaf resolver (Snippet 15). Fall back to flat children
             // if Snippet 15 not loaded (defensive — dual-write still produces a number,
             // just less accurate. Phase 4 migration recomputes later.)
@@ -351,17 +364,35 @@ if ( ! function_exists( 'b2f_dualwrite_infer_classification' ) ) {
             $leaves = array_values( array_unique( array_map( 'strtoupper', array_filter( $leaves, 'strlen' ) ) ) );
 
             if ( ! empty( $leaves ) ) {
-                $placeholders = implode( ',', array_fill( 0, count( $leaves ), '%s' ) );
-                $args = array_merge( array( $maker_id ), $leaves );
-                // COUNT DISTINCT to be safe in case a row appears twice for some reason.
-                $registered = (int) $wpdb->get_var( $wpdb->prepare(
-                    "SELECT COUNT(DISTINCT BINARY UPPER(product_sku)) FROM {$tbl}
-                     WHERE maker_id = %d
-                       AND BINARY UPPER(product_sku) IN ({$placeholders})
-                       AND deleted_at IS NULL",
-                    $args
-                ) );
-                $missing_count = max( 0, count( $leaves ) - $registered );
+                if ( function_exists( 'b2f_load_maker_sku_set' ) ) {
+                    // V.1.8: static memo — keyed by maker_id, populated on first call
+                    // per request. Subsequent classifications for the same maker reuse
+                    // the set without touching the DB.
+                    static $sku_set_memo = array();
+                    if ( ! isset( $sku_set_memo[ $maker_id ] ) ) {
+                        $sku_set_memo[ $maker_id ] = b2f_load_maker_sku_set( $maker_id );
+                    }
+                    $sku_set = $sku_set_memo[ $maker_id ];
+                    $registered = 0;
+                    foreach ( $leaves as $leaf_u ) {
+                        if ( isset( $sku_set[ $leaf_u ] ) ) $registered++;
+                    }
+                    $missing_count = max( 0, count( $leaves ) - $registered );
+                } else {
+                    // Fallback: legacy per-call COUNT (Snippet 1 V.7.3 helper missing)
+                    global $wpdb;
+                    $tbl = $wpdb->prefix . 'dinoco_product_makers';
+                    $placeholders = implode( ',', array_fill( 0, count( $leaves ), '%s' ) );
+                    $args = array_merge( array( $maker_id ), $leaves );
+                    $registered = (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT COUNT(DISTINCT BINARY UPPER(product_sku)) FROM {$tbl}
+                         WHERE maker_id = %d
+                           AND BINARY UPPER(product_sku) IN ({$placeholders})
+                           AND deleted_at IS NULL",
+                        $args
+                    ) );
+                    $missing_count = max( 0, count( $leaves ) - $registered );
+                }
             }
         }
 
