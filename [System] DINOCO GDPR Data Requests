@@ -1,0 +1,360 @@
+/**
+ * File: [System] DINOCO GDPR Data Requests
+ * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.1.0 — stub endpoints (flag-gated OFF)
+ * DB_ID: (new — auto-assigned on sync)
+ * Author: DINOCO Dev Team
+ *
+ * Endpoints (namespace: dinoco-gdpr/v1):
+ *   POST /my-data-export — logged-in user requests export of own data (ZIP link email)
+ *   POST /my-data-delete — logged-in user requests account + data deletion
+ *   GET  /my-data-status — check status of active request
+ *
+ * Feature flag: dinoco_gdpr_enabled (wp_option, default '0' = OFF)
+ * When OFF: endpoints return 503 service_unavailable — compliance not yet activated.
+ * When ON: queue request → admin reviews manually → processes via future admin UI.
+ *
+ * Data scope (what gets exported when activated):
+ *   - wp_users row (self)
+ *   - wp_usermeta (self)
+ *   - distributor CPT (if linked via linked_distributor_id meta)
+ *   - member warranties (dinoco_warranty CPT — post_author = user)
+ *   - claims (claim_ticket CPT — post_author = user)
+ *   - B2B orders (b2b_order CPT where dist = user's distributor)
+ *   - LINE messages (openclaw MongoDB via agent:3000 — optional, not implemented)
+ *
+ * Schema:
+ *   wp_dinoco_gdpr_requests (id, user_id, type, status, ticket_id, created_at,
+ *                            processed_at, notes, request_ip, request_ua)
+ *
+ * Schema install trigger: lazy on first REST request + admin_init guard
+ * (WP Code Snippets doesn't support register_activation_hook reliably)
+ *
+ * Dependency: WP 5.9+
+ * Legal reference: Thailand PDPA (พ.ร.บ. คุ้มครองข้อมูลส่วนบุคคล 2562) Section 30-35
+ * GDPR reference: EU 2016/679 Article 15 (Access) + Article 17 (Erasure)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ═══════════════════════════════════════════════════════════════════
+// Feature Flag
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_gdpr_is_enabled' ) ) {
+    /**
+     * Check if GDPR/PDPA compliance endpoints are activated.
+     * Default OFF — admin must flip wp_option 'dinoco_gdpr_enabled' to '1'.
+     *
+     * @return bool
+     */
+    function dinoco_gdpr_is_enabled() {
+        return get_option( 'dinoco_gdpr_enabled', '0' ) === '1';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Schema Install
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
+    /**
+     * Install wp_dinoco_gdpr_requests table via dbDelta (idempotent).
+     * Tracks schema version in wp_option 'dinoco_gdpr_schema_version'.
+     *
+     * @return void
+     */
+    function dinoco_gdpr_schema_install() {
+        global $wpdb;
+
+        $current_version = get_option( 'dinoco_gdpr_schema_version', '0' );
+        $target_version  = '1.0';
+        if ( $current_version === $target_version ) return;
+
+        $table   = $wpdb->prefix . 'dinoco_gdpr_requests';
+        $charset = $wpdb->get_charset_collate();
+
+        $sql = "CREATE TABLE {$table} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id BIGINT(20) UNSIGNED NOT NULL,
+            type VARCHAR(20) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            ticket_id VARCHAR(40) NOT NULL,
+            request_ip VARCHAR(45) DEFAULT NULL,
+            request_ua VARCHAR(255) DEFAULT NULL,
+            notes TEXT DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            processed_at DATETIME DEFAULT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uq_ticket (ticket_id),
+            KEY idx_user_status (user_id, status),
+            KEY idx_status_created (status, created_at)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta( $sql );
+
+        update_option( 'dinoco_gdpr_schema_version', $target_version, false );
+    }
+}
+
+// Lazy install on admin_init (safe: runs once per admin page load, dbDelta is idempotent)
+add_action( 'admin_init', function() {
+    if ( get_option( 'dinoco_gdpr_schema_version', '0' ) !== '1.0' ) {
+        dinoco_gdpr_schema_install();
+    }
+} );
+
+// ═══════════════════════════════════════════════════════════════════
+// Request Queue
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_gdpr_queue_request' ) ) {
+    /**
+     * Queue a GDPR/PDPA request.
+     *
+     * @param int    $user_id WP user ID (must be logged in)
+     * @param string $type    'export' | 'delete'
+     * @return array|WP_Error { ticket_id, request_id, created_at } on success
+     */
+    function dinoco_gdpr_queue_request( $user_id, $type ) {
+        global $wpdb;
+
+        $user_id = absint( $user_id );
+        $type    = strtolower( sanitize_key( $type ) );
+
+        if ( $user_id <= 0 ) {
+            return new WP_Error( 'invalid_user', 'User ID required', array( 'status' => 400 ) );
+        }
+        if ( ! in_array( $type, array( 'export', 'delete' ), true ) ) {
+            return new WP_Error( 'invalid_type', 'Type must be export or delete', array( 'status' => 400 ) );
+        }
+
+        // Ensure schema is ready
+        dinoco_gdpr_schema_install();
+
+        $table = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        // Block duplicate pending requests (per-user per-type)
+        $existing = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, ticket_id, status, created_at FROM {$table}
+             WHERE user_id = %d AND type = %s AND status IN ('pending','processing')
+             LIMIT 1",
+            $user_id, $type
+        ), ARRAY_A );
+        if ( $existing ) {
+            return new WP_Error(
+                'duplicate_request',
+                'You already have an active request of this type',
+                array( 'status' => 409, 'existing' => $existing )
+            );
+        }
+
+        $ticket_id = 'GDPR-' . strtoupper( substr( md5( $user_id . $type . microtime( true ) . wp_generate_password( 8, false ) ), 0, 12 ) );
+        $now       = current_time( 'mysql' );
+        $ip        = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( $_SERVER['REMOTE_ADDR'] ) : '';
+        $ua        = isset( $_SERVER['HTTP_USER_AGENT'] ) ? substr( sanitize_text_field( $_SERVER['HTTP_USER_AGENT'] ), 0, 255 ) : '';
+
+        $inserted = $wpdb->insert(
+            $table,
+            array(
+                'user_id'    => $user_id,
+                'type'       => $type,
+                'status'     => 'pending',
+                'ticket_id'  => $ticket_id,
+                'request_ip' => $ip,
+                'request_ua' => $ua,
+                'created_at' => $now,
+            ),
+            array( '%d', '%s', '%s', '%s', '%s', '%s', '%s' )
+        );
+
+        if ( false === $inserted ) {
+            return new WP_Error( 'db_error', 'Failed to queue request', array( 'status' => 500 ) );
+        }
+
+        return array(
+            'ticket_id'  => $ticket_id,
+            'request_id' => $wpdb->insert_id,
+            'created_at' => $now,
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// REST Routes
+// ═══════════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function() {
+
+    $auth_logged_in = function() {
+        if ( ! is_user_logged_in() ) {
+            return new WP_Error( 'not_logged_in', 'Login required', array( 'status' => 401 ) );
+        }
+        return true;
+    };
+
+    // POST /my-data-export
+    register_rest_route( 'dinoco-gdpr/v1', '/my-data-export', array(
+        'methods'             => 'POST',
+        'permission_callback' => $auth_logged_in,
+        'callback'            => 'dinoco_gdpr_rest_export',
+    ) );
+
+    // POST /my-data-delete
+    register_rest_route( 'dinoco-gdpr/v1', '/my-data-delete', array(
+        'methods'             => 'POST',
+        'permission_callback' => $auth_logged_in,
+        'callback'            => 'dinoco_gdpr_rest_delete',
+    ) );
+
+    // GET /my-data-status
+    register_rest_route( 'dinoco-gdpr/v1', '/my-data-status', array(
+        'methods'             => 'GET',
+        'permission_callback' => $auth_logged_in,
+        'callback'            => 'dinoco_gdpr_rest_status',
+    ) );
+} );
+
+// ═══════════════════════════════════════════════════════════════════
+// Helpers — Flag-gated stub response
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_gdpr_disabled_response' ) ) {
+    /**
+     * Standard 503 response when flag is OFF.
+     *
+     * @return WP_REST_Response
+     */
+    function dinoco_gdpr_disabled_response() {
+        return new WP_REST_Response( array(
+            'success'       => false,
+            'code'          => 'service_unavailable',
+            'message'       => 'Feature pending activation. Contact admin at support@dinoco.in.th with subject "PDPA Request" for manual handling.',
+            'contact_email' => 'support@dinoco.in.th',
+            'legal_ref'     => 'Thailand PDPA Section 30-35 / GDPR Articles 15, 17',
+        ), 503 );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Callbacks
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_gdpr_rest_export' ) ) {
+    function dinoco_gdpr_rest_export( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+
+        $user_id = get_current_user_id();
+        $queued  = dinoco_gdpr_queue_request( $user_id, 'export' );
+        if ( is_wp_error( $queued ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => $queued->get_error_code(),
+                'message' => $queued->get_error_message(),
+                'data'    => $queued->get_error_data(),
+            ), isset( $queued->get_error_data()['status'] ) ? $queued->get_error_data()['status'] : 400 );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'code'    => 'queued',
+            'message' => 'Export request received. You will receive a download link via email within 30 days (PDPA Section 30).',
+            'data'    => $queued,
+        ), 202 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_delete' ) ) {
+    function dinoco_gdpr_rest_delete( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+
+        // Require explicit confirmation (defense against accidental calls)
+        $confirm = $request->get_param( 'confirm' );
+        if ( $confirm !== 'DELETE_MY_ACCOUNT' ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'confirmation_required',
+                'message' => 'Pass confirm=DELETE_MY_ACCOUNT to proceed. This action is irreversible.',
+            ), 400 );
+        }
+
+        $user_id = get_current_user_id();
+        $queued  = dinoco_gdpr_queue_request( $user_id, 'delete' );
+        if ( is_wp_error( $queued ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => $queued->get_error_code(),
+                'message' => $queued->get_error_message(),
+                'data'    => $queued->get_error_data(),
+            ), isset( $queued->get_error_data()['status'] ) ? $queued->get_error_data()['status'] : 400 );
+        }
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'code'    => 'queued',
+            'message' => 'Deletion request received. Admin will review within 30 days (PDPA Section 33). Account remains active until processed.',
+            'data'    => $queued,
+        ), 202 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_status' ) ) {
+    function dinoco_gdpr_rest_status( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+
+        global $wpdb;
+        $user_id = get_current_user_id();
+        $table   = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        // Ensure schema exists before query
+        dinoco_gdpr_schema_install();
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, type, status, ticket_id, created_at, processed_at, notes
+             FROM {$table}
+             WHERE user_id = %d
+             ORDER BY created_at DESC
+             LIMIT 20",
+            $user_id
+        ), ARRAY_A );
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'data'    => array(
+                'requests' => $rows ?: array(),
+                'user_id'  => $user_id,
+            ),
+        ), 200 );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Implementation Gaps (documented for future sprint)
+// ═══════════════════════════════════════════════════════════════════
+//
+// 1. Export ZIP generation — not implemented. Requires:
+//    - Background job (wp-cron) to gather CPT posts + meta
+//    - ZIP archive via ZipArchive class
+//    - Secure token-based download link (expires 7 days)
+//    - Email notification to user
+//
+// 2. Delete execution — not implemented. Requires:
+//    - Admin review UI
+//    - Cascade delete: user → usermeta → CPT posts → postmeta
+//    - Anonymize option (replace PII with hash) vs full delete
+//    - Audit log (who approved, what was deleted)
+//
+// 3. MongoDB export (LINE messages via openclaw) — not implemented.
+//    Requires agent:3000 API + cross-system correlation.
+//
+// 4. Admin review UI — not implemented. Future shortcode: [dinoco_admin_gdpr].
+//
+// When activating this feature: flip wp_option 'dinoco_gdpr_enabled' to '1'
+// AND implement items 1-4 above BEFORE handling any requests.
