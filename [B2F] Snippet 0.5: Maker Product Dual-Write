@@ -1,6 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 0.5: Maker Product Dual-Write                ║
+ * ║  Version: V.1.7 — Phase 3 Group F BUG-H10 FIX:                ║
+ * ║    `b2f_dualwrite_infer_classification` missing_leaves count  ║
+ * ║    previously walked children 1 level only (flatten loop) →   ║
+ * ║    DD-3 deep hierarchies (3-level: SET → sub-SET → leaf)      ║
+ * ║    miscounted: a sub-SET was treated as a leaf when counting   ║
+ * ║    coverage. Now uses `dinoco_get_leaf_skus($sku)` recursive   ║
+ * ║    resolver (Snippet 15 V.6.0 helper) + falls back to flat     ║
+ * ║    walk when helper unavailable. Deduplicates leaves via        ║
+ * ║    `array_unique` (DD-3 shared leaf safe). Same leaf IN()       ║
+ * ║    check but now scoped to the true leaf set — cross-factory    ║
+ * ║    assembly classification now triggers correctly when a        ║
+ * ║    grandchild leaf is unregistered. Existing junction rows are ║
+ * ║    NOT rebadged (ON DUPLICATE KEY UPDATE excludes classification║
+ * ║    columns). Only fresh INSERTs + Phase 4 migration recomputes. ║
  * ║  Version: V.1.6 — Phase 2 audit DB-C1 FIX: CHECK constraint  ║
  * ║    chk_confirmed_consistency on MySQL 8.0.16+ rejects        ║
  * ║    INSERTs that set confirmation_status='confirmed' without  ║
@@ -309,22 +323,46 @@ if ( ! function_exists( 'b2f_dualwrite_infer_classification' ) ) {
             }
         }
 
-        // missing_leaves count (maker-scoped): children ที่ maker นี้ไม่ได้ register ใน junction
+        // V.1.7 BUG-H10 FIX: 3-level leaf resolution.
+        // missing_leaves count (maker-scoped): LEAVES (not just direct children) that
+        // aren't registered in the junction. Previously walked 1 level only — in DD-3
+        // deep hierarchies (SET → sub-SET → leaf), a sub-SET child would be counted as
+        // a direct child even if the actual manufacturing atoms (leaves under it) were
+        // missing → classification stuck at `set_assembled` instead of correctly flipping
+        // to `cross_factory_assembly + as_parts`.
+        //
+        // `dinoco_get_leaf_skus()` (Snippet 15 PART 1.35 V.6.0) does the recursive walk
+        // + handles shared leaves (DD-3). We also `array_unique` defensively — one leaf
+        // shared across 2 children of the same SET must only count once toward coverage.
         $missing_count = 0;
         if ( $has_children ) {
             global $wpdb;
             $tbl = $wpdb->prefix . 'dinoco_product_makers';
-            // Flatten children (walk 1 level — DD-2 leaf guard handles deeper recursion elsewhere)
-            $placeholders = implode( ',', array_fill( 0, count( $children ), '%s' ) );
-            $args = array_merge( array( $maker_id ), $children );
-            $registered = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$tbl}
-                 WHERE maker_id = %d
-                   AND BINARY UPPER(product_sku) IN ({$placeholders})
-                   AND deleted_at IS NULL",
-                $args
-            ) );
-            $missing_count = max( 0, count( $children ) - $registered );
+
+            // Prefer recursive leaf resolver (Snippet 15). Fall back to flat children
+            // if Snippet 15 not loaded (defensive — dual-write still produces a number,
+            // just less accurate. Phase 4 migration recomputes later.)
+            if ( function_exists( 'dinoco_get_leaf_skus' ) ) {
+                $leaves = dinoco_get_leaf_skus( $sku_upper );
+                $leaves = is_array( $leaves ) ? $leaves : array();
+            } else {
+                $leaves = $children; // legacy 1-level fallback
+            }
+            $leaves = array_values( array_unique( array_map( 'strtoupper', array_filter( $leaves, 'strlen' ) ) ) );
+
+            if ( ! empty( $leaves ) ) {
+                $placeholders = implode( ',', array_fill( 0, count( $leaves ), '%s' ) );
+                $args = array_merge( array( $maker_id ), $leaves );
+                // COUNT DISTINCT to be safe in case a row appears twice for some reason.
+                $registered = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(DISTINCT BINARY UPPER(product_sku)) FROM {$tbl}
+                     WHERE maker_id = %d
+                       AND BINARY UPPER(product_sku) IN ({$placeholders})
+                       AND deleted_at IS NULL",
+                    $args
+                ) );
+                $missing_count = max( 0, count( $leaves ) - $registered );
+            }
         }
 
         // Classification matrix
