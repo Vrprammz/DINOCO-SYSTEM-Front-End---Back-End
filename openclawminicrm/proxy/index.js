@@ -1135,13 +1135,9 @@ app.post(`/webhook/telegram/${TELEGRAM_WEBHOOK_SECRET}`, express.json(), async (
     handleTelegramMessage(req.body.message).catch(e => console.error("[Telegram] Handler error:", e.message));
   }
 });
-// Fallback: accept requests without secret for easy testing (still checks chat_id inside handler)
-app.post("/webhook/telegram", express.json(), async (req, res) => {
-  res.sendStatus(200);
-  if (req.body.message) {
-    handleTelegramMessage(req.body.message).catch(e => console.error("[Telegram] Handler error:", e.message));
-  }
-});
+// Phase 1 audit fix [S4]: removed unsecured `/webhook/telegram` fallback route.
+// Secret-path is the sole auth gate; chat_id is not a secret (leaks via screenshots/error logs).
+// If local testing requires a secret-less path, use an env-gated dev flag — never commit that to main.
 
 // === Config API ===
 app.get("/config/:sourceId", requireAuth, async (req, res) => { res.json(await getBotConfig(req.params.sourceId)); });
