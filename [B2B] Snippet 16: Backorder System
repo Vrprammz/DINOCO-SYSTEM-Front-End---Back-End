@@ -1,6 +1,10 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.1.8 — Phase 2 Group C: BO stock double-subtract guard + C1 listener removal ║
+ * ║                   + cancel-item cascade fix + dealer tier-price debt                    ║
+ * ║                   + fail-loud on missing product data                                   ║
+ * ║                   [BUG-C2 + C3 + C6 + C7 + H3 + H4]                                     ║
  * ║  Version: V.1.7 — Phase 1 audit remediation: BUG-C1 rate-limit return-value fix (is_wp_error) ║
  * ║                   + BUG-H1 dup rest_prepare_post filter removed + BUG-H2 enum-flags OR-combine ║
  * ║                   + DB-C3 user_agent VARCHAR(128) align with schema                            ║
@@ -927,17 +931,38 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
         }
 
         // V.1.6 M3 FIX: Debt precision — per-SKU compound (spec §5.2 step 5)
+        // V.1.8 BUG-H3 FIX: dealer tier price (b2b_compute_dealer_price) — เดิมใช้ retail (base_price)
+        // V.1.8 BUG-H4 FIX: fail-loud ถ้า b2b_get_product_data missing (ไม่ silent skip debt)
         // เดิม: total_value * (fulfilled / total_qty) = ratio approximation → ไม่แม่นยำ
         //       ถ้า SKU A = ฿1000 + SKU B = ฿100, fulfill A เต็ม + BO B → ratio คำนวณ debt เกินจริง
-        // ใหม่: loop splits + per-SKU price × qty_fulfill → exact
+        // ใหม่: loop splits + per-SKU dealer-price × qty_fulfill → exact + tier-aware
         $confirmed_value = 0.0;
+        $dealer_rank     = $dist_id ? ( get_field( 'rank_system', $dist_id ) ?: 'standard' ) : 'standard';
         if ( function_exists( 'b2b_get_product_data' ) ) {
             foreach ( $splits as $split ) {
-                $sku_d     = strtoupper( trim( $split['sku'] ?? '' ) );
-                $qty_f     = max( 0, (int) ( $split['qty_fulfill'] ?? 0 ) );
+                $sku_d = strtoupper( trim( $split['sku'] ?? '' ) );
+                $qty_f = max( 0, (int) ( $split['qty_fulfill'] ?? 0 ) );
                 if ( $qty_f <= 0 ) continue;
-                $pd        = b2b_get_product_data( $sku_d );
-                $price     = $pd ? (float) ( $pd['base_price'] ?? 0 ) : 0;
+                $pd = b2b_get_product_data( $sku_d );
+                if ( ! $pd ) {
+                    // V.1.8 BUG-H4: fail-loud instead of silent skip — missing SKU = accounting hole
+                    $wpdb->query( 'ROLLBACK' );
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( "[BO] CRITICAL: product_data missing for SKU {$sku_d}, order {$order_id} (bo-split)" );
+                    }
+                    if ( function_exists( 'b2b_send_telegram_alert' ) ) {
+                        b2b_send_telegram_alert( 'bo_critical',
+                            "BO SPLIT: missing product_data SKU={$sku_d} order=#{$order_id} — admin กรุณาตรวจสอบ (ROLLBACK แล้ว)" );
+                    }
+                    return new WP_Error( 'product_data_missing',
+                        "ไม่พบข้อมูลสินค้า SKU: {$sku_d} — กรุณาติดต่อ admin",
+                        array( 'status' => 500 )
+                    );
+                }
+                $base  = (float) ( $pd['base_price'] ?? 0 );
+                $price = function_exists( 'b2b_compute_dealer_price' )
+                    ? (float) b2b_compute_dealer_price( $base, $dealer_rank, $pd )
+                    : $base;
                 $confirmed_value += $price * $qty_f;
             }
         }
@@ -945,6 +970,15 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
 
         if ( $dist_id && $confirmed_value > 0 && function_exists( 'b2b_debt_add' ) ) {
             b2b_debt_add( $dist_id, $confirmed_value, 'b2b_bo_split_confirm', $order_id );
+        }
+
+        // V.1.8 BUG-C2 FIX: set _stock_deducted=1 BEFORE FSM transition
+        // Reason: bo-split subtracted stock manual (lines 891-903); when all BO resolves later,
+        //         FSM transition partial_fulfilled → awaiting_confirm fires hook
+        //         `dinoco_inv_on_status_change` (Snippet 2:3682) which parses order_items and
+        //         subtracts full qty AGAIN → inventory double-cut. Flag blocks the hook.
+        if ( $fulfilled_total > 0 ) {
+            update_post_meta( $order_id, '_stock_deducted', 1 );
         }
 
         // FSM transition: pending_stock_review → partial_fulfilled
@@ -1149,6 +1183,12 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
         delete_post_meta( $order_id, '_b2b_split_undo_deadline' );
         update_post_meta( $order_id, '_b2b_undo_count', $undo_count + 1 );
 
+        // V.1.8 BUG-C2/C7 FIX: un-set _stock_deducted flag — bo-split's manual subtract has been
+        // reversed above (dinoco_stock_add to restore fulfilled_qty). Keeping flag=1 would cause
+        // re-split + fulfill path to skip hook on awaiting_confirm transition, but stock was
+        // already restored — invariant says flag must match "stock currently subtracted" reality.
+        delete_post_meta( $order_id, '_stock_deducted' );
+
         $wpdb->query( 'COMMIT' );
 
         b2b_log_attempt( $dist_id, 'undo_split', $order_id, '', 'accepted' );
@@ -1225,9 +1265,29 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
             }
 
             // Add debt for BO qty
+            // V.1.8 BUG-H3 FIX: dealer tier price (was retail base_price)
+            // V.1.8 BUG-H4 FIX: fail-loud on missing product_data
             $dist_id = (int) get_field( 'distributor_id', $order_id );
             $pd      = function_exists( 'b2b_get_product_data' ) ? b2b_get_product_data( $row->sku ) : null;
-            $price   = $pd ? (float) ( $pd['base_price'] ?? 0 ) : 0;
+            if ( ! $pd ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( "[BO] CRITICAL: product_data missing for SKU {$row->sku}, order {$order_id} (bo-fulfill)" );
+                }
+                if ( function_exists( 'b2b_send_telegram_alert' ) ) {
+                    b2b_send_telegram_alert( 'bo_critical',
+                        "BO FULFILL: missing product_data SKU={$row->sku} order=#{$order_id} — admin กรุณาตรวจสอบ (ROLLBACK แล้ว)" );
+                }
+                return new WP_Error( 'product_data_missing',
+                    "ไม่พบข้อมูลสินค้า SKU: {$row->sku} — กรุณาติดต่อ admin",
+                    array( 'status' => 500 )
+                );
+            }
+            $base  = (float) ( $pd['base_price'] ?? 0 );
+            $rank  = $dist_id ? ( get_field( 'rank_system', $dist_id ) ?: 'standard' ) : 'standard';
+            $price = function_exists( 'b2b_compute_dealer_price' )
+                ? (float) b2b_compute_dealer_price( $base, $rank, $pd )
+                : $base;
             if ( $dist_id && $price > 0 && function_exists( 'b2b_debt_add' ) ) {
                 b2b_debt_add( $dist_id, $price * $qty, 'b2b_bo_fulfilled', $order_id );
             }
@@ -1241,6 +1301,15 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
             "SELECT COUNT(*) FROM {$bo_table} WHERE order_id = %d AND status IN ('pending', 'ready')",
             $order_id
         ) );
+
+        // V.1.8 BUG-C2 FIX: set _stock_deducted=1 BEFORE FSM transition
+        // Stock ถูก subtract manual ใน loop ข้างบน (lines 1202-1212). ถ้า all BO resolve →
+        // FSM transition partial_fulfilled → awaiting_confirm ยิง hook
+        // `dinoco_inv_on_status_change` (Snippet 2:3682) ซึ่งจะ parse order_items แล้ว
+        // subtract stock ทั้งออเดอร์ซ้ำ. flag block hook ทัน.
+        if ( $total_fulfilled_qty > 0 ) {
+            update_post_meta( $order_id, '_stock_deducted', 1 );
+        }
 
         if ( $pending_count === 0 ) {
             if ( function_exists( 'b2b_transition_order' ) ) {
@@ -1385,6 +1454,14 @@ if ( ! function_exists( 'b2b_rest_bo_cancel_item' ) ) {
         global $wpdb;
         $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
 
+        // V.1.8 BUG-C3 FIX: snapshot row BEFORE update for customer notify (row after update
+        // will show status='cancelled' which customer-notify expects, but qty_bo field
+        // is identical so pre/post snapshot is equivalent — we snapshot pre for clarity)
+        $row_before = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$bo_table} WHERE id = %d AND order_id = %d",
+            $bo_queue_id, $order_id
+        ), ARRAY_A );
+
         $updated = $wpdb->update( $bo_table, array(
             'status'      => 'cancelled',
             'notes'       => 'CANCELLED: ' . $reason,
@@ -1401,15 +1478,34 @@ if ( ! function_exists( 'b2b_rest_bo_cancel_item' ) ) {
             $order_id
         ) );
         if ( $pending_count === 0 ) {
+            // V.1.8 BUG-C3 FIX: cascade guard — กันไม่ให้ awaiting_confirm transition
+            // ตัด stock ซ้ำ (hook `dinoco_inv_on_status_change` parse order_items เต็ม qty
+            // รวมถึง cancelled SKUs). Stock ถูกตัด manual ใน bo-split (fulfilled portion) +
+            // bo-fulfill (BO ที่ถูก fulfill) แล้ว — cancelled BO ไม่ควรตัดอีก.
+            // ถ้า flag ยังไม่ได้ set (edge case: bo-split ไม่ถูกเรียก — เฉพาะ bo-cancel-item
+            // บน pending_stock_review → partial_fulfilled path) → set now.
+            if ( ! get_post_meta( $order_id, '_stock_deducted', true ) ) {
+                update_post_meta( $order_id, '_stock_deducted', 1 );
+            }
+
             if ( function_exists( 'b2b_transition_order' ) ) {
                 b2b_transition_order( $order_id, 'awaiting_confirm', 'admin', 'all BO resolved (some cancelled)' );
+            }
+
+            // V.1.8 BUG-C3 FIX: recompute debt via b2b_recalculate_debt source-of-truth
+            // เดิม total_amount ไม่ถูก recompute → ลูกค้าอาจถูกเรียกเก็บยอดเดิม.
+            // Note: b2b_debt_add ถูกเรียกไปแล้วใน bo-split (confirmed_value) + bo-fulfill
+            //       (per BO row). Cancelled BO rows ไม่ถูก b2b_debt_add → debt ถูกต้องอยู่แล้ว.
+            //       recalculate เพื่อ reconcile กรณี edge (partial payment, manual adjustment).
+            $dist_id = (int) get_field( 'distributor_id', $order_id );
+            if ( $dist_id && function_exists( 'b2b_recalculate_debt' ) ) {
+                b2b_recalculate_debt( $dist_id );
             }
         }
 
         // Notify customer
-        if ( function_exists( 'b2b_bo_notify_customer_bo_cancelled' ) ) {
-            $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$bo_table} WHERE id = %d", $bo_queue_id ), ARRAY_A );
-            if ( $row ) b2b_bo_notify_customer_bo_cancelled( $order_id, $row, $reason );
+        if ( function_exists( 'b2b_bo_notify_customer_bo_cancelled' ) && $row_before ) {
+            b2b_bo_notify_customer_bo_cancelled( $order_id, $row_before, $reason );
         }
 
         return rest_ensure_response( array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'status' => 'cancelled' ) );
@@ -2376,58 +2472,26 @@ add_filter( 'rest_pre_dispatch', function( $result, $server, $request ) {
 }, 5, 3 ); // Priority 5 — before default handlers
 
 /**
- * Hook post-handler — if order created successfully, transition to pending_stock_review
- * instead of checking_stock
+ * V.1.8 BUG-C6 FIX: Removed C1 place-order post-process listener
+ * ─────────────────────────────────────────────────────────────────
+ * เดิม: hook `b2b_place_order_post_process` transition draft → pending_stock_review
+ *        ทันทีที่ place-order (ก่อน customer confirm Flex)
+ * ปัญหา: ลูกค้าเห็น draft Flex แล้วกด "ยืนยัน" → Snippet 2 b2b_action_confirm_order
+ *        เห็น status ≠ 'draft' (เป็น pending_stock_review ไปแล้ว) → reply "ส่งรายการ
+ *        ไปแล้ว" แทน opaque "รอตรวจสอบ 2-4 ชม." + counters + admin-notify fire
+ *        ก่อน customer confirm จริง
+ * Fix  : Snippet 2 V.34.4+ b2b_action_confirm_order BO block (status==='draft' branch)
+ *        เป็น single transition point — driven by customer confirm. ครบทุก step:
+ *        - check b2b_bo_flag_enabled($dist_id)
+ *        - b2b_set_order_status($ticket_id, 'pending_stock_review', 'customer')
+ *        - set _b2b_stock_snapshot + _b2b_opaque_accept_at meta
+ *        - b2b_bo_increment_daily_counters()
+ *        - b2b_log_attempt('place_order', 'accepted')
+ *        - b2b_bo_notify_admin_stock_review()
+ *        - b2b_line_reply opaque customer message
+ * Note : spec FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md §3.1 flow confirms customer
+ *        confirm = transition trigger (not place-order moment).
  */
-// V.1.6 C1 FIX: use add_action (Snippet 3 fires do_action for this hook)
-add_action( 'b2b_place_order_post_process', function( $order_id, $dist_id, $items, $total ) {
-    if ( ! b2b_bo_flag_enabled( $dist_id ) ) return $order_id;
-    if ( ! $order_id ) return $order_id;
-
-    // Walk-in skip
-    if ( $dist_id && get_field( 'is_walkin', $dist_id ) ) return $order_id;
-
-    // Override status: checking_stock → pending_stock_review
-    $status = get_field( 'order_status', $order_id );
-    if ( $status === 'checking_stock' || $status === 'draft' ) {
-        if ( function_exists( 'b2b_transition_order' ) ) {
-            // checking_stock → awaiting_confirm bypass: we need pending_stock_review
-            // Use direct set_order_status (if FSM doesn't allow)
-            if ( function_exists( 'b2b_set_order_status' ) ) {
-                b2b_set_order_status( $order_id, 'pending_stock_review' );
-            }
-        }
-        update_post_meta( $order_id, '_b2b_opaque_accept_at', current_time( 'mysql' ) );
-
-        // Snapshot stock delta for admin view
-        $snapshot = array();
-        foreach ( $items as $it ) {
-            $sku = strtoupper( $it['sku'] );
-            $available = 0;
-            if ( function_exists( 'dinoco_compute_hierarchy_stock' ) && function_exists( 'dinoco_get_reserved_qty' ) ) {
-                $computed  = (int) dinoco_compute_hierarchy_stock( $sku );
-                $reserved  = (int) dinoco_get_reserved_qty( $sku );
-                $available = max( 0, $computed - $reserved );
-            }
-            $snapshot[ $sku ] = array( 'available' => $available, 'requested' => (int) $it['qty'] );
-        }
-        update_post_meta( $order_id, '_b2b_stock_snapshot', $snapshot );
-
-        // Increment daily counters
-        b2b_bo_increment_daily_counters( $dist_id, $items, $total );
-
-        // Log + notify admin
-        $items_hash = md5( wp_json_encode( $items ) );
-        b2b_log_attempt( $dist_id, 'place_order', $order_id, $items_hash, 'accepted', null, array(
-            'total_qty' => array_sum( array_column( $items, 'qty' ) ),
-            'total_value' => $total,
-        ) );
-
-        b2b_bo_notify_admin_stock_review( $order_id );
-    }
-
-    return $order_id;
-}, 10, 4 );
 
 // ═══════════════════════════════════════════════════════════════
 // SECTION 10: REST RESPONSE FILTER — hide admin-only meta
