@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.41.0
+DINOCO B2B -- RPi Print Server Dashboard  V.42.0
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
+
+V.42.0 [S10]: require_auth added on /api/ticket-lookup + /api/pno-lookup —
+    prevents LAN/VPN enumeration of customer orders. Auth via X-Print-Key
+    header or ?key= query arg (matches existing require_auth decorator pattern).
 
 V.41.0: Manual-ship แยก pickup (warehouse) ออกจาก label (registered).
     - api_manual_flash_create: ใช้ label_sender จาก WP response render บน label
@@ -341,8 +345,13 @@ def api_accept_order():
 
 
 @app.route('/api/ticket-lookup/<int:ticket_id>')
+@require_auth
 def api_ticket_lookup(ticket_id):
-    """Lookup ticket info from WordPress for scanner QR code."""
+    """Lookup ticket info from WordPress for scanner QR code.
+
+    V.42.0 [S10]: require_auth added — prevents LAN/VPN enumeration of customer
+    orders by ticket_id. Auth via X-Print-Key header or ?key= query arg.
+    """
     config = load_config()
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
@@ -355,8 +364,13 @@ def api_ticket_lookup(ticket_id):
 
 
 @app.route('/api/pno-lookup/<pno>')
+@require_auth
 def api_pno_lookup(pno):
-    """Lookup ticket by Flash PNO tracking number."""
+    """Lookup ticket by Flash PNO tracking number.
+
+    V.42.0 [S10]: require_auth added — prevents LAN/VPN enumeration of customer
+    orders by Flash PNO. Auth via X-Print-Key header or ?key= query arg.
+    """
     config = load_config()
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
