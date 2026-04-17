@@ -1,5 +1,16 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.8 — Phase 3 Group F polish (PERF-M5):
+ *   (PERF-M5) `b2f_rest_list_maker_products` — stats aggregation (per production_mode /
+ *     confirmation_status / admin_display_mode) previously ran as a second O(N) pass
+ *     over `$data_products` AFTER `b2f_compute_set_costs_v918()`. Merged into the
+ *     single format loop (CPT + junction paths) — counters now accumulate per product
+ *     as it is formatted. `b2f_compute_set_costs_v918()` does NOT mutate the counted
+ *     fields (`production_mode`, `confirmation_status`, `admin_display_mode`, `is_virtual`)
+ *     so pre-computed stats remain correct. Virtual products injected via
+ *     `b2f_inject_virtual_all_sets_v920()` run AFTER the format loop — previous logic
+ *     already skipped virtuals, and this change preserves that (never counted).
+ *     Net: one pass instead of two over N products (N ≈ 16-120 per maker).
  * Version: V.11.7 — Phase 3 Group I remaining code fixes:
  *   (DB-H1) `b2f_rest_receive_goods` po_cost_map SKU key was raw case-dependent. Build
  *     uses `strtoupper(trim($poi_sku))`; lookup also normalizes. Fixes unit_cost_thb NULL
@@ -1185,13 +1196,51 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
         //   identical data. Fetch once, pass as param (new 4th arg on b2f_format_maker_product).
         $primed_currency = (string) ( get_field( 'maker_currency', $maker_id ) ?: 'THB' );
 
+        // V.11.8 PERF-M5: accumulate stats during format loop (single pass instead of two).
+        //   Only accumulate when the V11 flag is on (matches existing condition below).
+        //   `b2f_compute_set_costs_v918()` + virtual-SET injection do NOT change the fields
+        //   we count (production_mode / confirmation_status / admin_display_mode / is_virtual)
+        //   — virtuals are injected AFTER format loop and were already skipped in the old
+        //   stats pass, so keeping count in-loop preserves behavior.
+        $stats_accum = array(
+            'set_count'                => 0,
+            'sub_unit_count'           => 0,
+            'single_count'             => 0,
+            'cross_factory_count'      => 0,
+            'unconfirmed_count'        => 0,
+            'unconfirmed_items_count'  => 0,
+            'hidden_as_parts_count'    => 0,
+            'total'                    => 0,
+        );
+        $stats_collect = function( $p ) use ( &$stats_accum ) {
+            // Skip virtual synthesized entries (parity with pre-V.11.8 stats pass)
+            if ( ! empty( $p['is_virtual'] ) ) return;
+            $stats_accum['total']++;
+            $pm = isset( $p['production_mode'] ) ? (string) $p['production_mode'] : '';
+            $cs = isset( $p['confirmation_status'] ) ? (string) $p['confirmation_status'] : 'auto_synced';
+            $ad = isset( $p['admin_display_mode'] ) ? (string) $p['admin_display_mode'] : 'auto';
+            if ( $pm === 'set_assembled' )              $stats_accum['set_count']++;
+            elseif ( $pm === 'sub_unit' )               $stats_accum['sub_unit_count']++;
+            elseif ( $pm === 'single' )                 $stats_accum['single_count']++;
+            elseif ( $pm === 'cross_factory_assembly' ) $stats_accum['cross_factory_count']++;
+            if ( $cs === 'auto_synced' ) {
+                $stats_accum['unconfirmed_items_count']++;
+                if ( $pm === 'set_assembled' || $pm === 'cross_factory_assembly' ) {
+                    $stats_accum['unconfirmed_count']++;
+                }
+            }
+            if ( $ad === 'as_parts' ) $stats_accum['hidden_as_parts_count']++;
+        };
+
         $products = array();
 
         if ( $flag_junction ) {
             // ═══ Phase 3: read from junction table ═══
             $rows = b2f_list_maker_products_junction( $maker_id );
             foreach ( $rows as $row ) {
-                $products[] = b2f_format_maker_product( 0, $hierarchy_ctx, $row, $primed_currency );
+                $fp = b2f_format_maker_product( 0, $hierarchy_ctx, $row, $primed_currency );
+                if ( $flag_v11_cache ) $stats_collect( $fp );
+                $products[] = $fp;
             }
         } else {
             // ═══ Legacy: read from CPT (V.9.x behavior) ═══
@@ -1207,8 +1256,15 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
                 'orderby'        => 'title',
                 'order'          => 'ASC',
             ) );
+            // V.11.8 PERF-M5 bonus: prime postmeta cache for the CPT batch so per-product
+            //   ACF reads inside `b2f_format_maker_product` hit warm cache.
+            if ( ! empty( $q->posts ) ) {
+                update_meta_cache( 'post', wp_list_pluck( $q->posts, 'ID' ) );
+            }
             foreach ( $q->posts as $p ) {
-                $products[] = b2f_format_maker_product( $p->ID, $hierarchy_ctx, null, $primed_currency );
+                $fp = b2f_format_maker_product( $p->ID, $hierarchy_ctx, null, $primed_currency );
+                if ( $flag_v11_cache ) $stats_collect( $fp );
+                $products[] = $fp;
             }
         }
 
@@ -1335,48 +1391,18 @@ if ( ! function_exists( 'b2f_rest_list_maker_products' ) ) {
             'name'  => (string) ( get_field( 'maker_name', $maker_id ) ?: get_the_title( $maker_id ) ),
         );
         if ( $flag_v11_cache ) {
-            // V.11.1 stats — fixes two bugs reported via LIFF banner showing "13 SET รอยืนยัน"
-            //   when only 9 orphans exist:
-            //   (1) `unconfirmed_count` now counts ONLY SETs (set_assembled + cross_factory_assembly)
-            //       matching banner text "N SET รอยืนยัน". Legacy V.11.0 counted all product types.
-            //   (2) Virtual products (is_virtual=true — synthesized intermediate sub-SETs for SET
-            //       Detail lookup) are excluded from all counts — they are not real junction rows.
-            //   Also adds `unconfirmed_items_count` for the all-types count (used for "รีวิว" flow).
-            $stats = array(
-                'set_count'                => 0,
-                'sub_unit_count'           => 0,
-                'single_count'             => 0,
-                'cross_factory_count'      => 0,
-                'unconfirmed_count'        => 0, // V.11.1: SETs only (matches banner text)
-                'unconfirmed_items_count'  => 0, // V.11.1: all product types
-                'hidden_as_parts_count'    => 0,
-                'total'                    => 0,
-            );
-            foreach ( $data_products as $p ) {
-                // V.11.1: skip virtual synthesized entries
-                if ( ! empty( $p['is_virtual'] ) ) continue;
-
-                $stats['total']++;
-
-                $pm = isset( $p['production_mode'] ) ? (string) $p['production_mode'] : '';
-                $cs = isset( $p['confirmation_status'] ) ? (string) $p['confirmation_status'] : 'auto_synced';
-                $ad = isset( $p['admin_display_mode'] ) ? (string) $p['admin_display_mode'] : 'auto';
-
-                if ( $pm === 'set_assembled' )              $stats['set_count']++;
-                elseif ( $pm === 'sub_unit' )               $stats['sub_unit_count']++;
-                elseif ( $pm === 'single' )                 $stats['single_count']++;
-                elseif ( $pm === 'cross_factory_assembly' ) $stats['cross_factory_count']++;
-
-                if ( $cs === 'auto_synced' ) {
-                    $stats['unconfirmed_items_count']++;
-                    // V.11.1: SETs only for banner "N SET รอยืนยัน"
-                    if ( $pm === 'set_assembled' || $pm === 'cross_factory_assembly' ) {
-                        $stats['unconfirmed_count']++;
-                    }
-                }
-                if ( $ad === 'as_parts' ) $stats['hidden_as_parts_count']++;
-            }
-            $maker_profile['stats'] = $stats;
+            // V.11.8 PERF-M5: stats accumulated during format loop above (single-pass).
+            //   Counters skip virtual synthesized entries (parity with V.11.1 behavior —
+            //   virtuals are injected AFTER format loop, so they were never in the tally).
+            //   `b2f_compute_set_costs_v918()` does NOT mutate the counted fields, so the
+            //   pre-computed counts remain valid at this point.
+            //
+            // V.11.1 semantics preserved:
+            //   - `unconfirmed_count` = SETs only (set_assembled + cross_factory_assembly)
+            //     matching LIFF banner text "N SET รอยืนยัน"
+            //   - `unconfirmed_items_count` = all product types (for future "รีวิว" flow)
+            //   - virtual products excluded from all counts
+            $maker_profile['stats'] = $stats_accum;
         }
 
         $response_body = array(
