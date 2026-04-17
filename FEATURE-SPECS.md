@@ -4053,3 +4053,173 @@ if (SIDE_EFFECT_TOOLS.has(toolName) && sourceId?.startsWith("reg_")) {
 | Pre-push (no agent) | `REGRESSION_REQUIRE_AGENT=0 git push` | — |
 | GitHub Actions | Merge directly via UI | GitHub audit |
 | Deploy script | `SKIP_REGRESSION=1 ./deploy.sh` | Deploy log |
+
+---
+
+## 14. Modal Helpers (V.1.0 — 2026-04-17)
+
+### 14.1 API
+
+```javascript
+// Confirm — returns Promise<boolean>
+const ok = await window.dinocoModal.confirm({
+  title: 'ยืนยันการลบ',
+  message: 'ข้อมูลจะถูกลบถาวร',
+  confirmText: 'ลบ',
+  confirmVariant: 'danger',  // primary | danger | warning
+  cancelText: 'ยกเลิก',
+  allowBackdropClose: true    // default: true
+});
+
+// Alert — returns Promise<void>
+await window.dinocoModal.alert({
+  title: 'สำเร็จ',
+  message: 'บันทึกข้อมูลเรียบร้อย',
+  variant: 'success'  // info | success | warning | error
+});
+
+// Prompt — returns Promise<string|null>
+const value = await window.dinocoModal.prompt({
+  title: 'กรอกเหตุผล',
+  message: 'กรุณาระบุเหตุผลการยกเลิก',
+  placeholder: 'เหตุผล...',
+  defaultValue: '',
+  required: true
+});
+```
+
+**Callsite pattern** (mandatory try/catch for native fallback):
+
+```javascript
+try {
+  const ok = await window.dinocoModal.confirm({ title, message });
+  if (!ok) return;
+} catch (e) {
+  if (!confirm(message)) return;  // fallback if snippet not loaded
+}
+```
+
+### 14.2 Migration Status
+
+**100% of audit's in-scope sites migrated (75/75)** — Phase 5 foundation (6 sites) + Phase 6 bulk (69 additional sites). See `WORKFLOW-REFERENCE.md` §2.13 for per-file breakdown.
+
+**Per-file helpers**: `_b2bCfm/_b2bAlert` (Snippet 5), `_cpCfm/_cpAlert` (Snippet 9), `_scCfm/_scAlert/_scPrompt` (Service Center), `_liffCfm/_liffAlert` (Snippet 12). Extracted for concise callsites + consistent UX across large files.
+
+**File**: `[Admin System] DINOCO Modal Helpers` V.1.0 (pending DB_ID).
+
+---
+
+## 15. Observability (V.1.0 Scaffold — 2026-04-17)
+
+### 15.1 Components
+
+| Component | Status | Activation |
+|-----------|--------|------------|
+| WP Sentry SDK | Installed flag-gated OFF | `composer require sentry/sentry` + `DINOCO_SENTRY_DSN` env + flag flip |
+| OpenClaw Sentry SDK | Installed flag-gated OFF | `npm install @sentry/node` + `SENTRY_DSN` env + docker rebuild |
+| Correlation ID | Code live, flag gated | `dinoco_obs_correlation_enabled=1` |
+| Structured logs | Code live, flag gated | `dinoco_obs_structured_log=1` |
+
+### 15.2 Correlation ID
+
+`rest_post_dispatch` filter injects `X-Request-ID` header (UUID v4) into all DINOCO REST responses when `dinoco_obs_correlation_enabled=1`. OpenClaw agent reads incoming `X-Request-ID` and propagates into log context. Client-side fetch shim echoes back as `request_id` field on error responses — enables end-to-end tracing from LIFF → WP → OpenClaw.
+
+### 15.3 Activation Runbook
+
+See `docs/runbooks/SENTRY-ACTIVATION.md` (145 lines) for step-by-step:
+
+1. Backup WP composer state
+2. `composer require sentry/sentry` (production server only)
+3. Set `DINOCO_SENTRY_DSN` env
+4. Flip `dinoco_obs_sentry_enabled=1` → monitor 30 min error budget
+5. Repeat for OpenClaw (`npm install @sentry/node`)
+6. 7-day monitoring + budget thresholds (100 errors/day soft cap)
+7. Rollback procedure (flag flip OFF → instant)
+
+### 15.4 File
+
+`[Admin System] DINOCO Observability` V.1.0 (pending DB_ID). Defensive `class_exists('\Sentry\Client')` check — zero behavior change if SDK missing.
+
+---
+
+## 16. GDPR / Thai PDPA (V.1.0 Stubs — 2026-04-17)
+
+### 16.1 Scope
+
+Thai PDPA (Personal Data Protection Act B.E. 2562/2019) — **not** EU GDPR full compliance. Sections 30-35 (data subject rights) + Section 39 (retention) addressed.
+
+### 16.2 REST Endpoints
+
+All under `/wp-json/dinoco-gdpr/v1/` — **return 503 until `dinoco_gdpr_enabled=1`**:
+
+- `POST /my-data-export` — authenticated user requests data export
+- `POST /my-data-delete` — authenticated user requests deletion (anonymize default per Section 39 retention conflict)
+- `GET /my-data-status` — check request status
+
+### 16.3 Data Scope Matrix
+
+| Source | Type | Handling |
+|--------|------|----------|
+| `wp_users` + `wp_usermeta` | Core account | Export JSON / anonymize on delete |
+| Distributor CPT | B2B shop info | Export if linked / preserve if orders active |
+| Warranty CPT | Product registrations | Export / preserve (legal retention) |
+| Claim CPT | Service tickets | Export / preserve (6-year retention) |
+| B2B Orders CPT | Financial records | Export / preserve (7-year tax law) |
+| LINE messages | Conversation logs | Export via OpenClaw agent proxy:3000 |
+
+### 16.4 Current Status
+
+Schema + endpoints scaffold only. Full implementation + admin review UI + legal review deferred to 2-3 week sprint with Thai legal counsel.
+
+**File**: `[System] DINOCO GDPR Data Requests` V.1.0 (pending DB_ID). **Doc**: `docs/compliance/PDPA-BASICS.md` (140 lines).
+
+---
+
+## 17. LIFF Build Pipeline (V.0.1 Foundation — 2026-04-17)
+
+### 17.1 Goal
+
+Address **PERF-H6** — 155KB inline JavaScript in B2B Snippet 4 (E-Catalog LIFF) forces fresh parse on every page load. Move to hashed chunks that browsers can cache.
+
+### 17.2 Tree Structure
+
+```
+liff-src/
+├── b2b/catalog/
+│   ├── entry.js         # Bundle entry (smoke-test imports + opt-in bootstrap)
+│   ├── tokens.css       # CSS variables (colors, spacing, typography)
+│   └── base.css         # Reset + shared layout
+├── b2f/                 # Future: catalog + maker LIFF
+├── liff-ai/             # Future: AI Command Center
+└── shared/
+    ├── liff-init.js     # LINE LIFF SDK bootstrap
+    ├── api-client.js    # createB2BApi() with 6 named methods
+    ├── liff-auth.js     # Backend auth exchange (id_token + group_id)
+    └── cart.js          # Pure cart state machine + localStorage
+```
+
+### 17.3 Build
+
+```bash
+npm run build:liff
+# Output:
+#   dist/liff/b2b-catalog.XP478u-U.js    (3.53KB, gzip 1.64KB)
+#   dist/liff/assets/b2b-catalog.BtoKv9ov.css  (0.74KB, gzip 0.44KB)
+#   dist/liff/manifest.json               # entry → hashed filename map
+```
+
+### 17.4 Enqueue Helper
+
+`[System] DINOCO LIFF Asset Loader` V.1.0 — `dinoco_liff_enqueue($entry_name)` reads manifest and enqueues via `wp_enqueue_script/style`. **Scaffold only** — no active call yet. Inline rendering in Snippet 4 remains source of truth.
+
+### 17.5 Migration Plan
+
+1. **Next sprint — Phase 1**: B2B Snippet 4 pilot migration
+   - Extract inline `<script>` → `entry.js`
+   - Call `dinoco_liff_enqueue('b2b-catalog')` behind flag `dinoco_liff_use_bundle` (default OFF)
+   - Test on LINE iOS + Android → flip flag ON → measure TTFB
+2. **Phase 2**: B2F Snippet 8 + Snippet 4
+3. **Phase 3**: LIFF AI Snippet 2
+4. **Phase 4**: Cleanup — drop inline blocks + fallback flag
+
+**Rollback**: flip flag OFF → instant revert to inline rendering.

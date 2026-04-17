@@ -43,9 +43,15 @@
   - OpenAPI 3.1 spec: `docs/api/openapi.yaml` (2052 lines, 61 operations, 27 schemas, 6 auth schemes)
   - Vite LIFF pipeline foundation: `liff-src/*` tree (b2b/catalog, b2f/catalog+maker, liff-ai/frontend + shared/{liff-init,api-client,modal}.js) + `vite.liff.config.js` (no migration yet)
   - `11c8558` remove sidebar FLAGS indicator + Export Catalog FAB (clutter after BO activation)
-- **Phase 6 FUTURE** (deferred sprints):
-  - Bulk modal migration (67 remaining `confirm/alert/prompt` sites)
-  - LIFF bundle migration pilot (B2B Snippet 4 → liff-src/b2b/catalog)
+- **Phase 6 BULK MIGRATION + PILOT COMPLETE** (2026-04-17, 12 commits `7a9e90d..3e2634a`):
+  - **75 `confirm/alert/prompt` sites migrated → modal helper** (8 commits, 9 files — 100% of audit's in-scope sites):
+    `[B2B] Snippet 16` V.1.15 (6 sites), `[B2F] Snippet 5` V.7.8 (9 functions / 13+ calls), `[Admin System] B2F Migration Audit` V.3.14 (7 sites), `[Admin System] DINOCO Global Inventory Database` V.43.8 (4 sites), `[Admin System] DINOCO Manual Invoice System` V.33.7 (6 functions), `[B2B] Snippet 5` V.32.4 (14 sites via `_b2bCfm/_b2bAlert`), `[B2B] Snippet 9` V.33.8 (9 sites via `_cpCfm/_cpAlert`), `[Admin System] DINOCO Service Center & Claims` V.30.6 (16 sites via `_scCfm/_scAlert/_scPrompt`), `[B2B] Snippet 12` V.31.4 (9 sites via `_liffCfm/_liffAlert`).
+    Pattern: try/catch with native `confirm/alert/prompt` fallback → zero regression risk.
+  - **LIFF pilot foundation** (4 commits `7357c08..8a58152`): Vite build artifact live at `dist/liff/b2b-catalog.*.js` (3.53KB gzip 1.64KB) + CSS 0.74KB. `liff-src/b2b/catalog/{tokens,base}.css` + `liff-src/shared/{liff-init,api-client,liff-auth,cart}.js`. NEW snippet `[System] DINOCO LIFF Asset Loader` V.1.0 — manifest-based `dinoco_liff_enqueue($entry_name)` helper (scaffold). Parallel rendering — inline rendering in Snippet 4 INTACT.
+  - **Runbooks** (1 commit `3e2634a`): `docs/runbooks/SENTRY-ACTIVATION.md` (145 lines, step-by-step activation) + `docs/compliance/PDPA-BASICS.md` (140 lines skeleton). Complement Phase 5 V.1.0 scaffolds.
+- **SESSION COMPLETE 2026-04-17 21:00** — **62+ commits total**, 6 phases, 14 parallel agent dispatches, 1 local phpunit run (33 tests pass), zero production breaks.
+- **Phase 7 FUTURE** (deferred sprints):
+  - LIFF bundle migration — actual Snippet 4 inline `<script>` → entry.js + `dinoco_liff_enqueue('b2b-catalog')` + iOS/Android test (pilot)
   - GDPR full implementation + admin review UI + legal review
   - Sentry activation + team onboarding (composer require + npm install + flag flip)
   - B2F Phase 4 CPT retirement (2-4 weeks staged observation)

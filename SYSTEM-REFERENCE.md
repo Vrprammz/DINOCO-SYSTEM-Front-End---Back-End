@@ -108,6 +108,7 @@
 | [System] Dashboard - Assets List | V.30.2 | 29 | `[dinoco_dashboard_assets]` | Assets list with bundle support |
 | [System] DINOCO MCP Bridge | V.2.2 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints, per-lead storage) |
 | [System] DINOCO GDPR Data Requests | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — Thai PDPA compliance stubs. 3 endpoints `/wp-json/dinoco-gdpr/v1/{my-data-export,my-data-delete,my-data-status}`. Flag `dinoco_gdpr_enabled` default OFF → returns 503. Schema `wp_dinoco_gdpr_requests` (id, user_id, type, status, created_at, processed_at, notes) lazy-install via `dbDelta` on first use. Data scope: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE messages (via agent:3000). Full impl + admin review UI deferred to Phase 6. |
+| [System] DINOCO LIFF Asset Loader | V.1.0 | pending | -- | **NEW (Phase 6, 2026-04-17)** — Manifest-based Vite build enqueue helper. `dinoco_liff_enqueue($entry_name)` reads `dist/liff/manifest.json` and enqueues the hashed JS + CSS assets. **Scaffold only** — no active call yet (inline rendering in Snippet 4 intact as fallback). Future: Snippet 4 migration will call `dinoco_liff_enqueue('b2b-catalog')` + drop inline blocks. Goal: address PERF-H6 (155KB inline → <10KB shell). |
 
 ### 2.2 [Admin System] -- Admin/Management
 
@@ -2014,3 +2015,68 @@ sequenceDiagram
 - `B2B_SLIP2GO_SECRET_KEY` -- shared slip verification
 - `DINOCO_JWT` class -- shared JWT implementation
 - `b2b_log()` function -- shared logging
+
+---
+
+## 12. Frontend Build Pipeline (V.0.1 — LIFF Pilot, 2026-04-17)
+
+**Status**: Foundation complete; migration pending. Currently **parallel artifact** — inline rendering in Snippet 4 remains the source of truth for runtime; Vite build is future target.
+
+**Tree structure** (`liff-src/`):
+```
+liff-src/
+├── b2b/
+│   └── catalog/
+│       ├── entry.js       # Bundle entry (smoke-test imports)
+│       ├── tokens.css     # CSS variables (colors, spacing, typography)
+│       └── base.css       # Reset + shared layout
+├── b2f/                   # (future) B2F catalog + maker LIFF
+├── liff-ai/               # (future) LIFF AI frontend
+└── shared/
+    ├── liff-init.js       # LINE LIFF SDK bootstrap
+    ├── api-client.js      # createB2BApi() + named methods (catalog, history, placeOrder, modifyOrder, cancelRequest)
+    ├── liff-auth.js       # Backend auth exchange (id_token + group_id → JWT)
+    ├── cart.js            # Pure cart state machine + localStorage persistence
+    └── modal.js           # (future) Modal helper wrapper
+```
+
+**Build command**: `npm run build:liff` → `dist/liff/*` (hashed output)
+
+**Current artifact** (2026-04-17):
+- `dist/liff/b2b-catalog.XP478u-U.js` — **3.53KB** (gzip 1.64KB)
+- `dist/liff/assets/b2b-catalog.BtoKv9ov.css` — **0.74KB** (gzip 0.44KB)
+- `dist/liff/manifest.json` — entry → hashed filename map
+
+**Enqueue helper**: `dinoco_liff_enqueue($entry_name)` in `[System] DINOCO LIFF Asset Loader` V.1.0 reads manifest and enqueues assets via `wp_enqueue_script/style`. Scaffold only — no active call yet.
+
+**Next sprint — pilot migration**:
+1. Extract inline `<script>` block from B2B Snippet 4 → `liff-src/b2b/catalog/entry.js`
+2. Call `dinoco_liff_enqueue('b2b-catalog')` from shortcode handler
+3. Inline fallback intact (feature flag `dinoco_liff_use_bundle`, default OFF initially)
+4. Test on LINE iOS + Android → flip flag ON → measure TTFB
+5. Rollback = flip flag OFF → instant revert to inline
+
+**Goal**: Address PERF-H6 (155KB inline JS in Snippet 4 → <10KB shell + hashed chunks → cacheable CDN output).
+
+---
+
+## 13. Runbooks + Compliance Docs
+
+### 13.1 Runbooks (`docs/runbooks/`)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `SENTRY-ACTIVATION.md` | 145 | Step-by-step activation — WP `composer require sentry/sentry` + `DINOCO_SENTRY_DSN` env + 3 flag flips; OpenClaw `npm install @sentry/node` + env + docker rebuild; 7-day monitoring + budget thresholds + rollback procedure |
+| `ACTIVATION-MASTER.md` | pending | Master activation runbook consolidating all flag flips for production go-live (being drafted by orchestrator) |
+
+### 13.2 Compliance (`docs/compliance/`)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `PDPA-BASICS.md` | 140 | Thai PDPA compliance skeleton — sections 30-35 data subject rights mapped to existing data + section 39 retention conflict resolved via anonymize-default + data scope matrix + activation checklist + legal review deferred items |
+
+### 13.3 API Specs (`docs/api/`)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `openapi.yaml` | 2052 | OpenAPI 3.1 spec — 61 operations across 6 namespaces (b2b/v1, b2f/v1, liff-ai/v1, dinoco-stock/v1, dinoco-mcp/v1, dinoco-gdpr/v1), 27 schemas, 6 auth schemes |

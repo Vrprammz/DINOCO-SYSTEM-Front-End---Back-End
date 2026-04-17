@@ -443,9 +443,23 @@ try {
 }
 ```
 
-**Migrated sites (Phase 5)**: BO `bo_confirm_full`, `bo_reject`, `bo_cancel_item`, Split BO final confirm, B2F `rejectLot`, Phase 4 LIVE migration.
+**Migration status (2026-04-17)**: **75/75 in-scope sites migrated (100%)** — Phase 5 foundation + Phase 6 bulk migration complete. Snippet `[Admin System] DINOCO Modal Helpers` V.1.0.
 
-**Remaining (Phase 6 sprint, ~67 sites)**: bulk modal migration planned as dedicated sprint. Snippet `[Admin System] DINOCO Modal Helpers` V.1.0.
+**Migrated by file** (Phase 6, 8 commits `7a9e90d..cfc453f`):
+
+- `[B2B] Snippet 16` V.1.15 — 6 BO admin sites + flag-toggle refactor (inline onclick → event delegation)
+- `[B2F] Snippet 5` V.7.8 — 13+ calls (cancel PO, resubmit, complete, delete auto-set, add missing leaves, quick shipping, delete product/maker, confirm unconfirmed, credit unlock/hold)
+- `[Admin System] B2F Migration Audit` V.3.14 — 7 sites (activate schema, backfill, shadow toggle, junction read toggle, flag toggles, phase4 flag, sync intermediates)
+- `[Admin System] DINOCO Global Inventory Database` V.43.8 — 4 sites (God Mode activate, category delete)
+- `[Admin System] DINOCO Manual Invoice System` V.33.7 — 6 functions (cancel builder/list, confirm issue, refund, delete)
+- `[B2B] Snippet 5` V.32.4 — 14 sites (Flash ops, reprint, bulk confirm/cancel/flash-ready, delete)
+- `[B2B] Snippet 9` V.33.8 — 9 sites (reprint job, bulk reprint errors, save settings, regen key, rpi command, ft switch/cancel)
+- `[Admin System] DINOCO Service Center & Claims` V.30.6 — 16 sites (submit return, close job, add custom part, approval, inline update, delete ticket)
+- `[B2B] Snippet 12` V.31.4 — 9 sites (cancel pno, reship pno, unlock, tracking submit)
+
+**Per-file helpers** (extracted for concise callsites + consistent UX): `_b2bCfm/_b2bAlert` (Snippet 5), `_cpCfm/_cpAlert` (Snippet 9), `_scCfm/_scAlert/_scPrompt` (Service Center), `_liffCfm/_liffAlert` (Snippet 12). Pattern: try/catch with native `confirm/alert/prompt` fallback → zero regression risk. Multiple async function conversions — inline `onclick=` handlers are fire-and-forget compatible (no upstream changes needed).
+
+**Guidance for future code**: Any new native `confirm/alert/prompt` added after 2026-04-17 should use `dinocoModal` helper from the start. Auditor patterns look for `window.confirm\|window.alert\|window.prompt\|\bconfirm(\|\balert(\|\bprompt(` — allowlist existing fallback `catch` blocks only.
 
 ### 3.5 GDPR/PDPA Self-Service (V.1.0 stubs — 2026-04-17)
 
@@ -1996,3 +2010,33 @@ Turn 2: "เปรม 0812345678"
 
 Cleanup: deleteMany({ sourceId: "reg_REG-005_...") })
 ```
+
+---
+
+## 12. Frontend Build Pipeline (V.0.1 — LIFF Pilot Status, 2026-04-17)
+
+**Current**: Vite scaffold + shared helpers extracted. Inline rendering in Snippet 4 INTACT — Vite artifact is future migration target (parallel only).
+
+**Artifact** (`dist/liff/`):
+
+- `b2b-catalog.*.js` — 3.53KB (gzip 1.64KB)
+- `assets/b2b-catalog.*.css` — 0.74KB (gzip 0.44KB)
+- `manifest.json` — hashed filename map for WP enqueue helper
+
+**Build**: `npm run build:liff`
+
+**Shared modules** (`liff-src/shared/`):
+
+- `liff-init.js` — LINE LIFF SDK bootstrap
+- `api-client.js` — `createB2BApi()` (catalog, history, placeOrder, modifyOrder, cancelRequest)
+- `liff-auth.js` — backend auth exchange (id_token → JWT)
+- `cart.js` — pure cart state machine + localStorage persistence
+
+**Phase roadmap**:
+
+1. **Phase 1 (next sprint)**: B2B Snippet 4 pilot migration — extract inline `<script>` → `entry.js`, call `dinoco_liff_enqueue('b2b-catalog')`, feature flag guard, test on LINE iOS/Android
+2. **Phase 2**: B2F Snippet 8 (Admin E-Catalog) + Snippet 4 (Maker LIFF) migration
+3. **Phase 3**: LIFF AI Snippet 2 (Command Center) migration
+4. **Phase 4**: Cleanup — drop inline blocks, remove fallback flag
+
+**Goal**: Address PERF-H6 (155KB inline → <10KB shell + cacheable hashed chunks).
