@@ -1,0 +1,174 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [System] DINOCO LIFF Asset Loader                           ║
+ * ║  Version: V.1.0 — scaffold, no assets enqueued by default    ║
+ * ║  DB_ID: (assign on first sync)                               ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * Purpose
+ * ─────────
+ * Provide a single conditional helper `dinoco_liff_enqueue($entry_name)`
+ * that LIFF shortcode handlers can call to load Vite-built assets from
+ * `dist/liff/` (see `vite.liff.config.js`).
+ *
+ * Status (V.1.0)
+ * ─────────
+ *   - Function defined, NOT auto-mounted on any action. Nothing changes
+ *     for production rendering.
+ *   - Addresses PERF-H6 scaffold prerequisite — LIFF snippets (B2B
+ *     Snippet 4, B2F Snippet 8, LIFF AI Snippet 2) will call this helper
+ *     in Phase 1 migration, with inline fallback if the manifest/bundle
+ *     is absent.
+ *
+ * Asset resolution path
+ * ─────────
+ *   Manifest:  WP_CONTENT_DIR . '/uploads/dinoco-liff/manifest.json'
+ *              (or ABSPATH . 'dist/liff/.vite/manifest.json' if deployed
+ *              via file sync from CI)
+ *
+ *   URL base:  content_url('uploads/dinoco-liff/') by default
+ *              — override via filter `dinoco_liff_base_url`
+ *
+ *   Caller pattern (future Phase 1 usage):
+ *     if ( function_exists('dinoco_liff_enqueue')
+ *          && dinoco_liff_enqueue('b2b-catalog') ) {
+ *         // built bundle enqueued — skip inline <style>/<script>
+ *     } else {
+ *         // fallback: emit legacy inline CSS + JS (current path)
+ *     }
+ *
+ * Security
+ * ─────────
+ *   - Uses `content_url()` → respects HTTPS + CDN offload filters.
+ *   - Registered handles prefixed with `dinoco-liff-` to avoid collision
+ *     with other plugins / themes.
+ *   - No user input touches filesystem calls — $entry_name is
+ *     whitelisted against manifest keys.
+ *
+ * ⚠️ Not wired to wp_enqueue_scripts yet — caller decides when to load.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+if ( ! function_exists( 'dinoco_liff_enqueue' ) ) {
+    /**
+     * Enqueue a Vite-built LIFF entry + its CSS siblings.
+     *
+     * @param string $entry_name Entry key as defined in vite.liff.config.js
+     *                           (e.g. 'b2b-catalog', 'b2f-catalog',
+     *                           'b2f-maker', 'liff-ai')
+     * @param array  $deps       Optional script deps (default: ['liff-sdk']
+     *                           — LIFF snippets already emit SDK inline
+     *                           in <head>, so empty [] is also valid)
+     *
+     * @return bool true if enqueued (manifest present + entry found),
+     *              false if caller should fall back to inline rendering.
+     */
+    function dinoco_liff_enqueue( $entry_name, $deps = array() ) {
+        $entry_name = sanitize_key( $entry_name );
+        if ( empty( $entry_name ) ) {
+            return false;
+        }
+
+        // Resolve manifest path — configurable via filter for custom deploy paths
+        $default_manifest = WP_CONTENT_DIR . '/uploads/dinoco-liff/manifest.json';
+        $manifest_path    = apply_filters(
+            'dinoco_liff_manifest_path',
+            $default_manifest,
+            $entry_name
+        );
+
+        if ( ! file_exists( $manifest_path ) ) {
+            return false; // no bundle yet — caller falls back to inline
+        }
+
+        // Read + parse manifest (micro-cache via static to avoid repeated IO)
+        static $manifest_cache = null;
+        static $cache_path     = null;
+        if ( $manifest_cache === null || $cache_path !== $manifest_path ) {
+            $raw = @file_get_contents( $manifest_path );
+            if ( $raw === false ) {
+                return false;
+            }
+            $manifest_cache = json_decode( $raw, true );
+            $cache_path     = $manifest_path;
+            if ( ! is_array( $manifest_cache ) ) {
+                $manifest_cache = array();
+                return false;
+            }
+        }
+
+        // Vite manifest keys may use either 'entry_name' or full relative path.
+        // Try both (the vite.config rollupOptions.input names map to
+        // 'b2b/catalog/entry.js' OR 'b2b-catalog' depending on version).
+        $candidate_keys = array(
+            $entry_name,
+            $entry_name . '.js',
+            'b2b/catalog/entry.js',
+            'b2f/catalog/entry.js',
+            'b2f/maker/entry.js',
+            'liff-ai/frontend/entry.js',
+        );
+        $entry = null;
+        foreach ( $candidate_keys as $key ) {
+            if ( isset( $manifest_cache[ $key ] ) ) {
+                $entry = $manifest_cache[ $key ];
+                break;
+            }
+        }
+        if ( ! $entry || ! isset( $entry['file'] ) ) {
+            return false;
+        }
+
+        $default_base = content_url( 'uploads/dinoco-liff/' );
+        $base_url     = apply_filters(
+            'dinoco_liff_base_url',
+            $default_base,
+            $entry_name
+        );
+        $base_url = trailingslashit( $base_url );
+
+        $handle_prefix = 'dinoco-liff-' . $entry_name;
+
+        // Enqueue the JS entry (type=module — Vite outputs ESM)
+        wp_enqueue_script(
+            $handle_prefix,
+            $base_url . ltrim( $entry['file'], '/' ),
+            is_array( $deps ) ? $deps : array(),
+            null, // version=null → hash is in filename (immutable cache)
+            true  // in_footer
+        );
+        // Ensure script tag is emitted as <script type="module">
+        add_filter( 'script_loader_tag', 'dinoco_liff_filter_module_tag', 10, 3 );
+
+        // Enqueue CSS siblings
+        if ( ! empty( $entry['css'] ) && is_array( $entry['css'] ) ) {
+            foreach ( $entry['css'] as $i => $css ) {
+                wp_enqueue_style(
+                    $handle_prefix . '-css-' . $i,
+                    $base_url . ltrim( $css, '/' ),
+                    array(),
+                    null
+                );
+            }
+        }
+
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_liff_filter_module_tag' ) ) {
+    /**
+     * Rewrite <script> → <script type="module"> for our LIFF handles.
+     * (WordPress has no built-in way to mark an enqueued script as ESM.)
+     */
+    function dinoco_liff_filter_module_tag( $tag, $handle, $src ) {
+        if ( strpos( $handle, 'dinoco-liff-' ) !== 0 ) {
+            return $tag;
+        }
+        if ( strpos( $tag, 'type="module"' ) !== false ) {
+            return $tag;
+        }
+        return str_replace( '<script ', '<script type="module" ', $tag );
+    }
+}
