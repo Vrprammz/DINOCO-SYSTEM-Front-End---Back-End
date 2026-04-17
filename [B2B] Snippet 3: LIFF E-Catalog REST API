@@ -1,6 +1,10 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.41.6 — [PERF-M1] b2b_get_sku_data_map stampede protection via wp_cache_add lock ║
+ * ║                    — prevents N concurrent rebuilds when transient expires (thundering herd) ║
+ * ║                    — 5s lock TTL + 250ms wait+retry; fallback-rebuild on lock timeout       ║
+ * ║                    — try/finally guarantees lock release on exception                        ║
  * ║  Version: V.41.5 — [PERF-H9] order-history primes post meta cache (update_meta_cache) ║
  * ║  Version: V.41.4 — C1 FIX: do_action('b2b_place_order_post_process') สำหรับ BO system hook ║
  * ║  Version: V.41.3 — cancel-request grace period 5 นาที + tighter rate limit (H4 fix) ║
@@ -283,78 +287,114 @@ if ( ! function_exists('b2b_unauthorized_response') ) {
 // SHARED SKU DATA CACHE
 // ═══════════════════════════════════════
 
-/** Cached SKU data map — V.39.1: batch query from custom table (source of truth) */
+/** Cached SKU data map — V.39.1: batch query from custom table (source of truth)
+ *  V.41.6 PERF-M1: stampede protection — when the 5-minute transient expires, N
+ *  concurrent requests would race to rebuild the map (thundering herd). A
+ *  wp_cache_add() sentinel grants a short-lived rebuild lock to one worker; losers
+ *  briefly wait + re-check the transient so they return fresh data without running
+ *  a redundant full-catalog scan.
+ *
+ *  Safety contract:
+ *    - Lock TTL is SHORT (5s) so a crashed/slow rebuilder can't block other workers
+ *      for long. If lock acquisition fails AND transient is still empty after the
+ *      retry, we rebuild anyway (last-resort — still correct, just not optimal).
+ *    - wp_cache_add() is atomic per WordPress Object Cache API contract (transient
+ *      fallback would ALSO satisfy atomicity via DB-level INSERT ON DUPLICATE — but
+ *      we prefer wp_cache_add for performance).
+ *    - Sentinel is always deleted in finally {} so a PHP fatal doesn't wedge the lock.
+ */
 function b2b_get_sku_data_map() {
     $cache_key = 'b2b_sku_data_map';
     $data = get_transient($cache_key);
     if ( false !== $data ) return $data;
 
-    $data = array();
+    // V.41.6 stampede guard — only one worker rebuilds; others retry briefly.
+    $lock_key = 'b2b_sku_data_map_lock';
+    $acquired_lock = wp_cache_add( $lock_key, 1, '', 5 );
+    if ( ! $acquired_lock ) {
+        // Another worker is rebuilding. Wait briefly then re-check the transient.
+        // usleep is cheap + avoids the 1s granularity of sleep() for a snappier retry.
+        usleep( 250000 ); // 250ms
+        $data = get_transient( $cache_key );
+        if ( false !== $data ) return $data;
+        // Lock-holder didn't complete in 250ms (cold cache / slow query) — fall through
+        // and rebuild anyway. Correctness > perfection: better to double-query the DB
+        // once than block the user-facing endpoint.
+    }
 
-    // Source 1: Custom table (batch query — 1 SQL)
-    if ( class_exists( 'DINOCO_Catalog' ) ) {
-        $all = DINOCO_Catalog::get_all();
-        if ( ! empty( $all ) ) {
-            // Also build pid map for backward compat
-            $pid_map = array();
-            $ids = get_posts(array('post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish','fields'=>'ids'));
-            if ( !empty($ids) ) update_meta_cache('post', $ids);
-            foreach ( $ids as $pid ) {
-                $s = get_post_meta($pid, 'product_sku', true);
-                if ($s) $pid_map[strtoupper(trim($s))] = $pid;
+    try {
+        $data = array();
+
+        // Source 1: Custom table (batch query — 1 SQL)
+        if ( class_exists( 'DINOCO_Catalog' ) ) {
+            $all = DINOCO_Catalog::get_all();
+            if ( ! empty( $all ) ) {
+                // Also build pid map for backward compat
+                $pid_map = array();
+                $ids = get_posts(array('post_type'=>'b2b_product','posts_per_page'=>-1,'post_status'=>'publish','fields'=>'ids'));
+                if ( !empty($ids) ) update_meta_cache('post', $ids);
+                foreach ( $ids as $pid ) {
+                    $s = get_post_meta($pid, 'product_sku', true);
+                    if ($s) $pid_map[strtoupper(trim($s))] = $pid;
+                }
+                foreach ( $all as $p ) {
+                    $sku = $p['sku'];
+                    $data[$sku] = array(
+                        'pid'            => isset($pid_map[$sku]) ? $pid_map[$sku] : 0,
+                        'discount'       => floatval( $p['b2b_discount_percent'] ?? 0 ),
+                        'b2b_discount_percent' => floatval( $p['b2b_discount_percent'] ?? 0 ),
+                        'stock_status'   => $p['stock_status'] ?: 'in_stock',
+                        'oos_eta'        => $p['oos_eta_date'] ?: '',
+                        'oos_timestamp'  => intval( $p['oos_timestamp'] ?? 0 ),
+                        'oos_duration'   => intval( $p['oos_duration_hours'] ?? 0 ),
+                        'boxes_per_unit' => max( 1, intval( $p['boxes_per_unit'] ?? 1 ) ),
+                        'units_per_box'  => max( 1, intval( $p['units_per_box'] ?? 1 ) ),
+                        'price_standard' => floatval( $p['base_price'] ?? 0 ),
+                        'price_silver'   => floatval( $p['price_silver'] ?? 0 ),  // V.39.3: now % discount
+                        'price_gold'     => floatval( $p['price_gold'] ?? 0 ),    // V.39.3: now % discount
+                        'price_platinum' => floatval( $p['price_platinum'] ?? 0 ), // V.39.3: now % discount
+                        'price_diamond'  => floatval( $p['price_diamond'] ?? 0 ),  // V.39.3: now % discount
+                        'min_order_qty'  => max( 1, intval( $p['min_order_qty'] ?? 1 ) ),
+                        'category'       => $p['category'] ?? '',
+                        'b2b_visible'    => isset($p['b2b_visible']) ? intval($p['b2b_visible']) : 1,
+                    );
+                }
+                set_transient($cache_key, $data, 300);
+                return $data;
             }
-            foreach ( $all as $p ) {
-                $sku = $p['sku'];
-                $data[$sku] = array(
-                    'pid'            => isset($pid_map[$sku]) ? $pid_map[$sku] : 0,
-                    'discount'       => floatval( $p['b2b_discount_percent'] ?? 0 ),
-                    'b2b_discount_percent' => floatval( $p['b2b_discount_percent'] ?? 0 ),
-                    'stock_status'   => $p['stock_status'] ?: 'in_stock',
-                    'oos_eta'        => $p['oos_eta_date'] ?: '',
-                    'oos_timestamp'  => intval( $p['oos_timestamp'] ?? 0 ),
-                    'oos_duration'   => intval( $p['oos_duration_hours'] ?? 0 ),
-                    'boxes_per_unit' => max( 1, intval( $p['boxes_per_unit'] ?? 1 ) ),
-                    'units_per_box'  => max( 1, intval( $p['units_per_box'] ?? 1 ) ),
-                    'price_standard' => floatval( $p['base_price'] ?? 0 ),
-                    'price_silver'   => floatval( $p['price_silver'] ?? 0 ),  // V.39.3: now % discount
-                    'price_gold'     => floatval( $p['price_gold'] ?? 0 ),    // V.39.3: now % discount
-                    'price_platinum' => floatval( $p['price_platinum'] ?? 0 ), // V.39.3: now % discount
-                    'price_diamond'  => floatval( $p['price_diamond'] ?? 0 ),  // V.39.3: now % discount
-                    'min_order_qty'  => max( 1, intval( $p['min_order_qty'] ?? 1 ) ),
-                    'category'       => $p['category'] ?? '',
-                    'b2b_visible'    => isset($p['b2b_visible']) ? intval($p['b2b_visible']) : 1,
-                );
-            }
-            set_transient($cache_key, $data, 300);
-            return $data;
+        }
+
+        // Source 2: Fallback ACF
+        $ids = get_posts(array(
+            'post_type'      => 'b2b_product',
+            'posts_per_page' => -1,
+            'post_status'    => 'publish',
+            'fields'         => 'ids',
+        ));
+        if ( !empty($ids) ) update_meta_cache('post', $ids);
+
+        foreach ( $ids as $pid ) {
+            $sku = get_post_meta($pid, 'product_sku', true);
+            if ( !$sku ) continue;
+            $data[$sku] = array(
+                'pid'            => $pid,
+                'discount'       => floatval(get_post_meta($pid, 'b2b_discount_percent', true)),
+                'stock_status'   => get_post_meta($pid, 'stock_status', true) ?: 'in_stock',
+                'oos_eta'        => get_post_meta($pid, 'oos_eta_date', true) ?: '',
+                'oos_timestamp'  => intval(get_post_meta($pid, 'oos_timestamp', true)),
+                'oos_duration'   => intval(get_post_meta($pid, 'oos_duration_hours', true)),
+                'boxes_per_unit' => function_exists('b2b_get_boxes_per_unit') ? b2b_get_boxes_per_unit($sku, $pid) : max(1, intval(get_post_meta($pid, 'boxes_per_unit', true) ?: 1)),
+                'units_per_box'  => function_exists('b2b_get_units_per_box') ? b2b_get_units_per_box($sku, $pid) : 1,
+            );
+        }
+        set_transient($cache_key, $data, 300);
+        return $data;
+    } finally {
+        // Always release the lock, even on exception — prevents wedged sentinel.
+        if ( $acquired_lock ) {
+            wp_cache_delete( $lock_key );
         }
     }
-
-    // Source 2: Fallback ACF
-    $ids = get_posts(array(
-        'post_type'      => 'b2b_product',
-        'posts_per_page' => -1,
-        'post_status'    => 'publish',
-        'fields'         => 'ids',
-    ));
-    if ( !empty($ids) ) update_meta_cache('post', $ids);
-
-    foreach ( $ids as $pid ) {
-        $sku = get_post_meta($pid, 'product_sku', true);
-        if ( !$sku ) continue;
-        $data[$sku] = array(
-            'pid'            => $pid,
-            'discount'       => floatval(get_post_meta($pid, 'b2b_discount_percent', true)),
-            'stock_status'   => get_post_meta($pid, 'stock_status', true) ?: 'in_stock',
-            'oos_eta'        => get_post_meta($pid, 'oos_eta_date', true) ?: '',
-            'oos_timestamp'  => intval(get_post_meta($pid, 'oos_timestamp', true)),
-            'oos_duration'   => intval(get_post_meta($pid, 'oos_duration_hours', true)),
-            'boxes_per_unit' => function_exists('b2b_get_boxes_per_unit') ? b2b_get_boxes_per_unit($sku, $pid) : max(1, intval(get_post_meta($pid, 'boxes_per_unit', true) ?: 1)),
-            'units_per_box'  => function_exists('b2b_get_units_per_box') ? b2b_get_units_per_box($sku, $pid) : 1,
-        );
-    }
-    set_transient($cache_key, $data, 300);
-    return $data;
 }
 
 /** Invalidate SKU cache on product save */
