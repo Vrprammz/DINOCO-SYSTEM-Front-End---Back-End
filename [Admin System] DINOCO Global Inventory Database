@@ -2,6 +2,7 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.43.7 — PERF-H5: stock/list auto-sync moved to write-trigger hooks + daily cron + manual REST endpoint
  * Version: V.43.6 — DD-3: child/gc map indexed by ALL parent_skus (array) — shared leaves under all parent SETs
  * DB_ID: 22
  * Author: DINOCO Senior Architect
@@ -956,6 +957,112 @@ if (!function_exists('dinoco_get_current_catalog')) {
     }
 }
 
+/**
+ * V.43.7 [PERF-H5]: Auto-sync missing products (catalog + sku_relations) into
+ * wp_dinoco_products. Extracted from GET /stock/list endpoint (which previously
+ * did INSERTs during a GET → write-lock contention + violated REST idempotency).
+ *
+ * Now called from:
+ *   - update_option('dinoco_product_catalog', ...) hook
+ *   - update_option('dinoco_sku_relations', ...) hook
+ *   - daily cron `dinoco_inv_sync_missing_cron` (safety net)
+ *   - manual admin sync via POST /dinoco-stock/v1/stock/sync-missing
+ *
+ * Returns: ['inserted' => int, 'errors' => int]
+ */
+if (!function_exists('dinoco_inv_sync_missing_products')) {
+    function dinoco_inv_sync_missing_products() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_products';
+
+        $existing = $wpdb->get_col("SELECT UPPER(sku) FROM {$table}");
+        $existing_skus = is_array($existing) ? array_flip($existing) : [];
+
+        $catalog = function_exists('dinoco_get_current_catalog') ? dinoco_get_current_catalog() : [];
+        $inserted = 0;
+        $errors = 0;
+
+        // 1) catalog entries
+        if (is_array($catalog) && !empty($catalog)) {
+            foreach ($catalog as $csku => $citem) {
+                $csku_u = strtoupper($csku);
+                if (isset($existing_skus[$csku_u])) continue;
+                $ins_ok = $wpdb->insert($table, [
+                    'sku'          => $csku_u,
+                    'name'         => $citem['name'] ?? $csku_u,
+                    'image_url'    => $citem['img'] ?? '',
+                    'base_price'   => floatval(str_replace(',', '', $citem['price'] ?? '0')),
+                    'stock_qty'    => 0,
+                    'stock_status' => 'out_of_stock',
+                    'is_active'    => 1,
+                ]);
+                if ($ins_ok === false) {
+                    $errors++;
+                    error_log('[Inventory][sync-missing] catalog fail sku=' . $csku_u . ' error=' . $wpdb->last_error);
+                } else {
+                    $inserted++;
+                    $existing_skus[$csku_u] = true;
+                }
+            }
+        }
+
+        // 2) sku_relations descendants
+        $relations = get_option('dinoco_sku_relations', []);
+        if (is_array($relations)) {
+            foreach ($relations as $p_sku => $ch_arr) {
+                if (!is_array($ch_arr)) continue;
+                foreach ($ch_arr as $ch_sku) {
+                    $ch_u = strtoupper($ch_sku);
+                    if (isset($existing_skus[$ch_u])) continue;
+                    $cat_item = isset($catalog[$ch_u]) ? $catalog[$ch_u] : (isset($catalog[$ch_sku]) ? $catalog[$ch_sku] : null);
+                    $ins_ok = $wpdb->insert($table, [
+                        'sku'          => $ch_u,
+                        'name'         => $cat_item ? ($cat_item['name'] ?? $ch_u) : $ch_u,
+                        'image_url'    => $cat_item ? ($cat_item['img'] ?? '') : '',
+                        'base_price'   => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
+                        'stock_qty'    => 0,
+                        'stock_status' => 'out_of_stock',
+                        'is_active'    => 1,
+                    ]);
+                    if ($ins_ok === false) {
+                        $errors++;
+                        error_log('[Inventory][sync-missing] relations fail sku=' . $ch_u . ' error=' . $wpdb->last_error);
+                    } else {
+                        $inserted++;
+                        $existing_skus[$ch_u] = true;
+                    }
+                }
+            }
+        }
+
+        return ['inserted' => $inserted, 'errors' => $errors];
+    }
+}
+
+// V.43.7 [PERF-H5]: Write-triggered auto-sync — run when catalog or relations change
+// (update_option hooks fire AFTER the DB update completes, so dinoco_get_current_catalog()
+// sees the new value). Throttled via transient to prevent storm when admin bulk-updates.
+add_action('update_option_dinoco_product_catalog', function($old, $new) {
+    if (get_transient('dinoco_inv_sync_throttle')) return;
+    set_transient('dinoco_inv_sync_throttle', 1, 10);
+    dinoco_inv_sync_missing_products();
+}, 10, 2);
+
+add_action('update_option_dinoco_sku_relations', function($old, $new) {
+    if (get_transient('dinoco_inv_sync_throttle')) return;
+    set_transient('dinoco_inv_sync_throttle', 1, 10);
+    dinoco_inv_sync_missing_products();
+}, 10, 2);
+
+// V.43.7 [PERF-H5]: Daily safety-net cron — catches drift from direct DB writes
+// or admin-panel updates that bypass the update_option hook chain.
+add_action('dinoco_inv_sync_missing_cron', 'dinoco_inv_sync_missing_products');
+add_action('init', function() {
+    if ( ! wp_next_scheduled('dinoco_inv_sync_missing_cron') ) {
+        wp_schedule_event(time() + 3600, 'daily', 'dinoco_inv_sync_missing_cron');
+    }
+}, 20);
+
 if (!function_exists('dinoco_get_current_sku_relations')) {
     function dinoco_get_current_sku_relations() {
         $db_relations = get_option('dinoco_sku_relations', []);
@@ -1424,64 +1531,36 @@ add_action('rest_api_init', function() {
                     FROM {$table} WHERE {$where_sql} ORDER BY name ASC";
             $all_rows = empty($params) ? $wpdb->get_results($sql) : $wpdb->get_results($wpdb->prepare($sql, ...$params));
 
-            // V.40.6: Auto-sync missing products จาก catalog + sku_relations → dinoco_products table
+            // V.43.7 [PERF-H5]: Auto-sync moved OUT of GET path (was INSERT during GET → write
+            // lock contention + broke REST idempotency). Sync now fires on write events:
+            //   1) update_option_dinoco_product_catalog hook (catalog changes)
+            //   2) update_option_dinoco_sku_relations hook (SKU relations changes)
+            //   3) Daily cron `dinoco_inv_sync_missing_cron` (safety net)
+            //   4) Manual POST /dinoco-stock/v1/stock/sync-missing (admin button)
+            // Here we only DETECT missing rows (cheap, no INSERT) and log a WARN for
+            // monitoring + hint admins to trigger a manual sync.
             if (empty($search) && $status === 'all') {
                 $catalog = function_exists('dinoco_get_current_catalog') ? dinoco_get_current_catalog() : [];
-                $existing_skus = array_map(function($r) { return strtoupper($r->sku); }, $all_rows);
-                $missing = [];
+                $existing_skus_flip = [];
+                foreach ($all_rows as $r) { $existing_skus_flip[strtoupper($r->sku)] = true; }
 
-                // 1. Sync จาก catalog (เดิม) — V.42.0 [C-1 FIX]: base_price + log
-                if (!empty($catalog)) {
-                    foreach ($catalog as $csku => $citem) {
-                        $csku_u = strtoupper($csku);
-                        if (!in_array($csku_u, $existing_skus)) {
-                            $missing[] = $csku_u;
-                            $existing_skus[] = $csku_u; // prevent double insert
-                            $ins_ok = $wpdb->insert($table, [
-                                'sku' => $csku_u,
-                                'name' => $citem['name'] ?? $csku_u,
-                                'image_url' => $citem['img'] ?? '',
-                                'base_price' => floatval(str_replace(',', '', $citem['price'] ?? '0')),
-                                'stock_qty' => 0,
-                                'stock_status' => 'out_of_stock',
-                                'is_active' => 1,
-                            ]);
-                            if ($ins_ok === false) error_log('[Inventory] auto-sync catalog fail sku=' . $csku_u . ' error=' . $wpdb->last_error);
-                        }
+                $missing_detected = 0;
+                if (is_array($catalog)) {
+                    foreach ($catalog as $csku => $_citem) {
+                        if (!isset($existing_skus_flip[strtoupper($csku)])) { $missing_detected++; }
                     }
                 }
-
-                // 2. V.40.6: Sync จาก sku_relations — child/grandchild ที่อยู่ใน relations แต่ไม่มี row ใน dinoco_products
                 $sku_rel_sync = get_option('dinoco_sku_relations', []);
                 if (is_array($sku_rel_sync)) {
-                    foreach ($sku_rel_sync as $p_sku => $ch_arr) {
+                    foreach ($sku_rel_sync as $_p => $ch_arr) {
                         if (!is_array($ch_arr)) continue;
                         foreach ($ch_arr as $ch_sku) {
-                            $ch_u = strtoupper($ch_sku);
-                            if (!in_array($ch_u, $existing_skus)) {
-                                $missing[] = $ch_u;
-                                $existing_skus[] = $ch_u;
-                                // ดึงชื่อ+รูปจาก catalog ถ้ามี
-                                $cat_item = isset($catalog[$ch_u]) ? $catalog[$ch_u] : (isset($catalog[$ch_sku]) ? $catalog[$ch_sku] : null);
-                                // V.42.0 [C-1 FIX]: base_price + log
-                                $ins_ok2 = $wpdb->insert($table, [
-                                    'sku' => $ch_u,
-                                    'name' => $cat_item ? ($cat_item['name'] ?? $ch_u) : $ch_u,
-                                    'image_url' => $cat_item ? ($cat_item['img'] ?? '') : '',
-                                    'base_price' => $cat_item ? floatval(str_replace(',', '', $cat_item['price'] ?? '0')) : 0,
-                                    'stock_qty' => 0,
-                                    'stock_status' => 'out_of_stock',
-                                    'is_active' => 1,
-                                ]);
-                                if ($ins_ok2 === false) error_log('[Inventory] auto-sync relations fail sku=' . $ch_u . ' error=' . $wpdb->last_error);
-                            }
+                            if (!isset($existing_skus_flip[strtoupper($ch_sku)])) { $missing_detected++; }
                         }
                     }
                 }
-
-                if (!empty($missing)) {
-                    // Re-query เพื่อรวม rows ใหม่
-                    $all_rows = $wpdb->get_results("SELECT sku, name, image_url, stock_qty, low_stock_threshold, reorder_point, manual_hold, manual_hold_reason, stock_status, stock_updated_at FROM {$table} WHERE is_active = 1 ORDER BY name ASC");
+                if ($missing_detected > 0) {
+                    error_log('[Inventory][stock/list] WARN: ' . $missing_detected . ' missing rows detected (sync via POST /dinoco-stock/v1/stock/sync-missing or wait for daily cron)');
                 }
             }
 
@@ -2029,6 +2108,25 @@ add_action('rest_api_init', function() {
         'callback' => function() {
             update_option('dinoco_inv_initialized', true);
             return rest_ensure_response(['success' => true]);
+        },
+        'permission_callback' => $inv_perm,
+    ]);
+
+    // --- POST /dinoco-stock/v1/stock/sync-missing (V.43.7 [PERF-H5]) ---
+    // Manual trigger for admin UI — replaces the auto-sync that used to run on every
+    // GET /stock/list. Run after bulk catalog import or if WARN log shows drift.
+    register_rest_route('dinoco-stock/v1', '/stock/sync-missing', [
+        'methods'  => 'POST',
+        'callback' => function() {
+            if ( ! function_exists('dinoco_inv_sync_missing_products') ) {
+                return new WP_REST_Response(['success' => false, 'message' => 'helper not loaded'], 500);
+            }
+            $result = dinoco_inv_sync_missing_products();
+            return rest_ensure_response([
+                'success'  => true,
+                'inserted' => (int) ($result['inserted'] ?? 0),
+                'errors'   => (int) ($result['errors'] ?? 0),
+            ]);
         },
         'permission_callback' => $inv_perm,
     ]);
