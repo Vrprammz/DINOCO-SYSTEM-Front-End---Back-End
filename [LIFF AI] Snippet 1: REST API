@@ -1,6 +1,15 @@
 /**
  * File: [LIFF AI] Snippet 1: REST API
  * Description: REST API + Auth สำหรับ LIFF AI Command Center
+ * Version: V.1.7 — Phase 2 Group A S1: (a) require `id_token` non-empty + reject ถ้า LINE
+ *   verify fail (no silent fallback). (b) bind admin role to LINE UID allowlist via new
+ *   helper `liff_ai_is_admin_line_uid()` (scans WP administrator users with meta
+ *   `dinoco_line_uid` or legacy `line_user_id`, cached per-request). admin role granted
+ *   only when group_id matches B2B_ADMIN_GROUP_ID AND verified LINE UID is in allowlist.
+ *   ถ้า allowlist ว่าง (legacy transition — ยังไม่ได้ provision `dinoco_line_uid` meta)
+ *   → log WARN + yield admin role from group_id match (backward compat). Once admins link
+ *   LINE accounts, allowlist populates → strict mode auto-activates.
+ *   Migration step needed: provision `dinoco_line_uid` meta for WP administrator users.
  * Version: V.1.6 — M18: register claim-state vocabulary filter + migrate /claim/status to dinoco_set_claim_status()
  * DB_ID: 1173
  *
@@ -74,6 +83,42 @@ if ( ! defined( 'LIFF_AI_AGENT_KEY' ) ) {
         define( 'LIFF_AI_AGENT_KEY', '' );
     }
 }
+
+// ══════════════════════════════════════════════════════════════
+// 0.5. ADMIN ALLOWLIST HELPER — V.1.7 (S1)
+// ══════════════════════════════════════════════════════════════
+// Returns true if $line_uid is bound to a WP administrator account via either
+// `dinoco_line_uid` (preferred, V.1.7 convention) OR legacy `line_user_id` meta.
+// Cached per-request. Returns false when allowlist is empty (legacy mode — no admins
+// have linked LINE UID yet) AND sets a flag caller can inspect to decide backward-compat
+// fallback. This is a transition-period safeguard: once ANY administrator has
+// `dinoco_line_uid` (or `line_user_id`) meta populated, allowlist becomes non-empty →
+// strict mode auto-activates — unregistered UIDs cannot claim admin role via group_id alone.
+if ( ! function_exists( 'liff_ai_is_admin_line_uid' ) ) {
+    function liff_ai_is_admin_line_uid( $line_uid ) {
+        static $cache = null;
+        if ( $cache === null ) {
+            $cache = array();
+            $admin_users = get_users( array(
+                'role__in' => array( 'administrator' ),
+                'fields'   => array( 'ID' ),
+                'number'   => 200,
+            ) );
+            foreach ( $admin_users as $u ) {
+                $uid_new = get_user_meta( $u->ID, 'dinoco_line_uid', true );
+                if ( ! empty( $uid_new ) ) $cache[] = (string) $uid_new;
+                $uid_legacy = get_user_meta( $u->ID, 'line_user_id', true );
+                if ( ! empty( $uid_legacy ) ) $cache[] = (string) $uid_legacy;
+            }
+            $cache = array_values( array_unique( array_filter( $cache ) ) );
+        }
+        // Expose empty-state flag so caller can decide backward-compat behavior
+        $GLOBALS['_liff_ai_admin_allowlist_empty'] = empty( $cache );
+        if ( empty( $cache ) ) return false;
+        return in_array( (string) $line_uid, $cache, true );
+    }
+}
+
 
 // ══════════════════════════════════════════════════════════════
 // 1. REGISTER REST ROUTES — /wp-json/liff-ai/v1/
@@ -214,42 +259,86 @@ if ( ! function_exists( 'liff_ai_rest_auth' ) ) {
             return new WP_REST_Response( array( 'authorized' => false, 'message' => 'ต้องเปิดผ่าน LINE เท่านั้น' ), 200 );
         }
 
-        // ── Verify LINE ID Token (primary auth layer) ──
-        if ( ! empty( $id_token ) ) {
-            $liff_channel_id = '';
-            if ( defined( 'B2B_LIFF_ID' ) ) {
-                $liff_channel_id = preg_replace( '/-.*$/', '', B2B_LIFF_ID );
-            }
-            if ( $liff_channel_id ) {
-                $verify_resp = wp_remote_post( 'https://api.line.me/oauth2/v2.1/verify', array(
-                    'body'    => array( 'id_token' => $id_token, 'client_id' => $liff_channel_id ),
-                    'timeout' => 10,
-                ) );
-                if ( ! is_wp_error( $verify_resp ) ) {
-                    $verify_body = json_decode( wp_remote_retrieve_body( $verify_resp ), true );
-                    if ( ! empty( $verify_body['sub'] ) ) {
-                        $line_uid = sanitize_text_field( $verify_body['sub'] );
-                    } else {
-                        return new WP_REST_Response( array(
-                            'authorized' => false,
-                            'message'    => 'ยืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่',
-                        ), 200 );
-                    }
-                }
-            }
+        // ── V.1.7 (S1) — require id_token non-empty ──
+        if ( empty( $id_token ) ) {
+            return new WP_Error(
+                'missing_id_token',
+                'ต้องส่ง id_token (LINE verify required)',
+                array( 'status' => 400 )
+            );
         }
+
+        // ── Verify LINE ID Token (primary auth layer) — V.1.7: required, no silent fallback ──
+        $liff_channel_id = '';
+        if ( defined( 'B2B_LIFF_ID' ) ) {
+            $liff_channel_id = preg_replace( '/-.*$/', '', B2B_LIFF_ID );
+        }
+        if ( empty( $liff_channel_id ) ) {
+            liff_ai_log( '[Auth] ERROR — B2B_LIFF_ID not defined, cannot verify id_token' );
+            return new WP_Error(
+                'server_misconfigured',
+                'เซิร์ฟเวอร์ยังไม่พร้อมใช้งาน (missing LIFF channel ID)',
+                array( 'status' => 500 )
+            );
+        }
+
+        $verify_resp = wp_remote_post( 'https://api.line.me/oauth2/v2.1/verify', array(
+            'body'    => array( 'id_token' => $id_token, 'client_id' => $liff_channel_id ),
+            'timeout' => 10,
+        ) );
+        if ( is_wp_error( $verify_resp ) ) {
+            liff_ai_log( '[Auth] LINE verify transport error: ' . $verify_resp->get_error_message() );
+            return new WP_Error(
+                'id_token_verify_failed',
+                'ไม่สามารถยืนยันกับ LINE ได้ กรุณาลองใหม่',
+                array( 'status' => 502 )
+            );
+        }
+        $verify_body = json_decode( wp_remote_retrieve_body( $verify_resp ), true );
+        if ( empty( $verify_body['sub'] ) ) {
+            return new WP_Error(
+                'id_token_invalid',
+                'ยืนยันตัวตนไม่สำเร็จ กรุณาลองใหม่',
+                array( 'status' => 401 )
+            );
+        }
+        // Authoritative LINE UID = $verify_body['sub'] (overrides client-supplied line_user_id)
+        $line_uid = sanitize_text_field( $verify_body['sub'] );
 
         // ── Determine role ──
         $role      = '';
         $dealer_id = 0;
         $name      = '';
 
-        // 1a) Check Admin by B2B_ADMIN_GROUP_ID — ถ้า group_id ตรงกับห้อง Admin = เป็น Admin
+        // 1a) Check Admin by B2B_ADMIN_GROUP_ID + LINE UID allowlist — V.1.7 (S1)
+        //     group_id ไม่ใช่ secret (เปิดใน Flex URL/screenshot ได้) — must bind to verified LINE UID.
         $group_id = sanitize_text_field( $request->get_param( 'group_id' ) );
         $admin_group = defined( 'B2B_ADMIN_GROUP_ID' ) ? B2B_ADMIN_GROUP_ID : '';
         if ( ! empty( $group_id ) && ! empty( $admin_group ) && $group_id === $admin_group ) {
-            $role = 'admin';
-            $name = 'DINOCO Admin';
+            $in_allowlist = liff_ai_is_admin_line_uid( $line_uid );
+            $allowlist_empty = ! empty( $GLOBALS['_liff_ai_admin_allowlist_empty'] );
+
+            if ( $in_allowlist ) {
+                // Strict path — UID ∈ allowlist
+                $role = 'admin';
+                $name = 'DINOCO Admin';
+            } elseif ( $allowlist_empty ) {
+                // Backward compat transition — no admin has linked LINE UID yet.
+                // Yield admin from group match + log WARN so migration can be tracked.
+                $role = 'admin';
+                $name = 'DINOCO Admin';
+                liff_ai_log( sprintf(
+                    '[Auth][WARN] admin role granted via group_id fallback (allowlist empty) — '
+                    . 'uid=%s — provision wp_user_meta dinoco_line_uid to enable strict mode',
+                    $line_uid
+                ) );
+            } else {
+                // Allowlist populated but UID not in it — refuse admin, fall through to dealer check
+                liff_ai_log( sprintf(
+                    '[Auth][DENY] admin group matched but uid=%s not in allowlist',
+                    $line_uid
+                ) );
+            }
         }
 
         // 1b) Fallback: Check WP admin user by LINE UID (user_meta line_user_id)
