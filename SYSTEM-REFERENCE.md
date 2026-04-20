@@ -759,7 +759,7 @@ sequenceDiagram
 | `source_group_id` | text | LINE Group ID of ordering distributor |
 | `order_items` | repeater | Ordered items (sku, qty, price, etc.) |
 | `customer_note` | textarea | Customer notes |
-| `_order_source` | meta | manual_invoice / line_bot / liff_catalog |
+| `_order_source` | meta | Source tag — currently only `manual_invoice` written (by `[Admin System] DINOCO Manual Invoice System`). Absent for B2B orders from LINE bot/LIFF (default = legacy/null). Used by Snippet 7/12/3/5 queries to exclude manual invoices from shipping/payment/dashboard counters. |
 | `_b2b_is_walkin` | meta | Walk-in order stamp (1) |
 | `is_billed` | true_false | Has been billed (invoice issued) |
 | `tracking_number` | text | Shipping tracking number |
