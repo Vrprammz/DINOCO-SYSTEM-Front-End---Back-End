@@ -1,7 +1,7 @@
 /**
  * File: [Admin System] DINOCO Observability
- * Version: V.1.0 — Sentry + correlation ID + structured logging scaffold
- * DB_ID: (auto-assign after WP creates snippet)
+ * Version: V.1.1 — Sprint Fix B: M2 flag-gated X-Request-ID + M4 DB_ID header + L2 redact ctx + L6 vendor autoload
+ * DB_ID: (pending — populate after first WP Code Snippets sync)
  * ใช้กับ: Code Snippets plugin → Execute Everywhere
  *
  * PURPOSE
@@ -97,6 +97,16 @@ if ( ! function_exists( 'dinoco_obs_init_sentry' ) ) {
             return false;
         }
 
+        // L6 FIX: explicit vendor/autoload.php require with file_exists guard —
+        // don't rely on another snippet having loaded Composer autoload. Silent
+        // fail if vendor dir absent; transient-guarded warning on missing SDK.
+        if ( ! class_exists( '\\Sentry\\Client' ) ) {
+            $vendor = WP_CONTENT_DIR . '/vendor/autoload.php';
+            if ( file_exists( $vendor ) ) {
+                require_once $vendor;
+            }
+        }
+
         // SDK present? (Composer autoload normally exposes \Sentry\Client.)
         if ( ! class_exists( '\\Sentry\\Client' ) || ! function_exists( '\\Sentry\\init' ) ) {
             // One-time notice — avoid flooding error_log.
@@ -163,8 +173,13 @@ if ( ! function_exists( 'dinoco_obs_get_request_id' ) ) {
             return (string) $GLOBALS['_dinoco_req_id'];
         }
 
+        // M2 FIX: only accept client-provided X-Request-ID when correlation flag is ON.
+        // Otherwise generate fresh to prevent log-injection / correlation-confusion
+        // via attacker-controlled header manipulation when operator opted out.
         $incoming = '';
-        if ( isset( $_SERVER['HTTP_X_REQUEST_ID'] ) ) {
+        $use_client_header = function_exists( 'dinoco_obs_is_enabled' )
+            && dinoco_obs_is_enabled( 'correlation_enabled' );
+        if ( $use_client_header && isset( $_SERVER['HTTP_X_REQUEST_ID'] ) ) {
             $incoming = (string) $_SERVER['HTTP_X_REQUEST_ID'];
         }
 
@@ -222,6 +237,48 @@ add_filter( 'rest_post_dispatch', 'dinoco_obs_inject_request_id_header', 10, 3 )
  * 4. CAPTURE WRAPPER
  * ====================================================================== */
 
+if ( ! function_exists( 'dinoco_obs_redact_context' ) ) {
+    /**
+     * L2 FIX: Scrub secrets/PII from log context before encoding.
+     *
+     * Keys matching (case-insensitive): token, secret, key, password,
+     * authorization, api_key, bearer. Plus PII keys: phone, email,
+     * line_uid, line_user_id, national_id, credit_card.
+     *
+     * Recurses into nested arrays so that nested tokens in structured
+     * payloads (e.g. `['headers' => ['Authorization' => ...]]`) are also
+     * redacted.
+     *
+     * @param mixed $ctx Arbitrary value. Only arrays are scrubbed; scalars
+     *                   returned as-is (callers still pass arrays; type-safe
+     *                   no-op for defensive mis-use).
+     * @return mixed Same shape with sensitive values replaced by '[REDACTED]'.
+     */
+    function dinoco_obs_redact_context( $ctx ) {
+        if ( ! is_array( $ctx ) ) return $ctx;
+        $sensitive = array(
+            'token', 'secret', 'key', 'password', 'authorization', 'api_key', 'bearer',
+            'phone', 'email', 'line_uid', 'line_user_id', 'national_id', 'credit_card',
+        );
+        $out = array();
+        foreach ( $ctx as $k => $v ) {
+            $k_lower = strtolower( (string) $k );
+            $is_sensitive = false;
+            foreach ( $sensitive as $needle ) {
+                if ( strpos( $k_lower, $needle ) !== false ) { $is_sensitive = true; break; }
+            }
+            if ( $is_sensitive ) {
+                $out[ $k ] = '[REDACTED]';
+            } elseif ( is_array( $v ) ) {
+                $out[ $k ] = dinoco_obs_redact_context( $v ); // recurse
+            } else {
+                $out[ $k ] = $v;
+            }
+        }
+        return $out;
+    }
+}
+
 if ( ! function_exists( 'dinoco_obs_capture' ) ) {
     /**
      * Unified log/capture entry point.
@@ -256,19 +313,21 @@ if ( ! function_exists( 'dinoco_obs_capture' ) ) {
         }
 
         // 2. Always write to error_log (structured or plain).
+        // L2 FIX: redact secrets/PII from context before encoding.
+        $safe_context = dinoco_obs_redact_context( $context );
         if ( dinoco_obs_is_enabled( 'structured_log' ) ) {
             $payload = array(
                 'ts'         => gmdate( 'c' ),
                 'level'      => $level,
                 'msg'        => $message,
                 'request_id' => $request_id,
-                'context'    => $context,
+                'context'    => $safe_context,
             );
             $json = wp_json_encode( $payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
             if ( $json === false ) $json = '[DINOCO_OBS] json_encode failed for: ' . $message;
             error_log( $json );
         } else {
-            $suffix = $context ? ' ctx=' . wp_json_encode( $context ) : '';
+            $suffix = $safe_context ? ' ctx=' . wp_json_encode( $safe_context ) : '';
             error_log( '[DINOCO_OBS][' . strtoupper( $level ) . '][rid=' . $request_id . '] ' . $message . $suffix );
         }
 
