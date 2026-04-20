@@ -1,6 +1,26 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.0 — Flash Shipping Metadata V.42 Phase 1                                            ║
+ * ║                   (see FEATURE-SPEC-FLASH-SHIPPING-META-2026-04-17.md):                           ║
+ * ║                   • 5 NEW tables: wp_dinoco_box_templates (5 seed rows S/M/L/XL/AL37),            ║
+ * ║                     wp_dinoco_pack_slots, wp_dinoco_warehouse_mapping (F4 — 2 seed rows),         ║
+ * ║                     wp_dinoco_flash_audit (F2), wp_dinoco_flash_dead_letter (F7 — 30d retention)  ║
+ * ║                   • +16 columns on wp_dinoco_products: pack_mode/packaging_source/                ║
+ * ║                     box_template_id/weight_per_unit_g/article_category/express_category_override  ║
+ * ║                     + plain dims (B1 fix) + template-overrides + audit (shipping_updated_*)        ║
+ * ║                   • CHECK constraints gated by MySQL 8.0.16+ INFORMATION_SCHEMA probe             ║
+ * ║                     (PHP validator = primary defense on older MySQL/MariaDB)                       ║
+ * ║                   • warehouse_staff role + scan_shipping capability                                ║
+ * ║                   • wp_option dinoco_shipping_defaults + dinoco_shipping_meta_enabled (default OFF) ║
+ * ║                   • 19 NEW helpers: resolve_pno_shipping / aggregate_children_shipping (P3 memo) / ║
+ * ║                     resolve_manifest_shipping / snapshot_ticket_shipping (M1) / smart_detect_     ║
+ * ║                     pack_mode (M3) / get_shipping_data_map (P1 batch) / api_retry (F7 classifier) ║
+ * ║                     / estimate_weight_from_leaves / suggest_express_category (5kg/45cm/150cm sum) ║
+ * ║                     / get_box_template (cached) / get_pack_slot / get_warehouse_no / + more        ║
+ * ║                   • Priority chain: ticket_meta → SKU_template_override → box_template →          ║
+ * ║                     SKU_plain_dims → recursive_aggregate → global_defaults                         ║
+ * ║                   • DB version bump 5.16 → 8.0 (idempotent dbDelta + ALTER fallback patterns)     ║
  * ║  Version: V.7.7 — Phase 3+ audit PERF-M7 + PERF-M12:                                              ║
  * ║                   M7: rest_post_dispatch filter adds `Cache-Control: private, no-store` on        ║
  * ║                       private REST namespaces (b2b, b2f, liff-ai, dinoco-stock, dinoco-b2f-audit) ║
@@ -52,7 +72,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '5.16'; // V.7.0: extra indexes (H-3)
+    $db_version = '8.0'; // V.8.0: Flash Shipping Metadata V.42 Phase 1 (5 new tables + 16 cols on dinoco_products)
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -2871,3 +2891,956 @@ if ( ! function_exists( 'dinoco_rest_private_cache_control' ) ) {
     // Priority 99 so it runs after any per-endpoint header writer (e.g. b2f_rest_api_version_header)
     add_filter( 'rest_post_dispatch', 'dinoco_rest_private_cache_control', 99, 3 );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// V.8.0 — FLASH SHIPPING METADATA V.42 PHASE 1
+// ────────────────────────────────────────────────────────────────────────────
+// 5 new tables + 16 cols on wp_dinoco_products + 19 helpers
+// Feature flag: dinoco_shipping_meta_enabled (default OFF — soft launch per order)
+// Parent spec: FEATURE-SPEC-FLASH-SHIPPING-META-2026-04-17.md
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Phase 1 Schema Migration — runs on init priority 7 (after main catalog @ 5,
+ * before OOS migration @ 20). Idempotent via _dinoco_shipping_v42_schema_version flag.
+ */
+add_action( 'init', function() {
+    $schema_version = '1.0';  // bump when adding more cols/tables
+    $current = get_option( '_dinoco_shipping_v42_schema_version', '0' );
+    if ( version_compare( $current, $schema_version, '>=' ) ) return;
+
+    global $wpdb;
+    $charset = $wpdb->get_charset_collate();
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+    // ─────────────────────────────────────────────────────────────
+    // 1. wp_dinoco_box_templates — reusable box sizes (S/M/L/XL/AL37)
+    // ─────────────────────────────────────────────────────────────
+    $tpl_table = $wpdb->prefix . 'dinoco_box_templates';
+    $sql_tpl = "CREATE TABLE {$tpl_table} (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+        name VARCHAR(50) NOT NULL,
+        code VARCHAR(20) NOT NULL,
+        length_cm SMALLINT UNSIGNED NOT NULL,
+        width_cm SMALLINT UNSIGNED NOT NULL,
+        height_cm SMALLINT UNSIGNED NOT NULL,
+        tare_weight_g SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+        max_weight_g INT UNSIGNED NOT NULL DEFAULT 30000,
+        owner_type VARCHAR(20) NOT NULL DEFAULT 'warehouse',
+        is_active TINYINT UNSIGNED NOT NULL DEFAULT 1,
+        sort_order SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY idx_code (code),
+        KEY idx_owner_active (owner_type, is_active)
+    ) {$charset};";
+    dbDelta( $sql_tpl );
+
+    // ─────────────────────────────────────────────────────────────
+    // 2. wp_dinoco_pack_slots — multi_box pack_mode per-slot data
+    // ─────────────────────────────────────────────────────────────
+    // BLK-2: product_sku = VARCHAR(50) utf8mb4_bin (matches wp_dinoco_products.sku)
+    $slots_table = $wpdb->prefix . 'dinoco_pack_slots';
+    $sql_slots = "CREATE TABLE {$slots_table} (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+        product_sku VARCHAR(50) NOT NULL,
+        slot_index TINYINT UNSIGNED NOT NULL,
+        slot_label VARCHAR(50) DEFAULT NULL,
+        box_template_id INT UNSIGNED NOT NULL,
+        content_weight_g INT UNSIGNED DEFAULT NULL,
+        length_cm_override SMALLINT UNSIGNED DEFAULT NULL,
+        width_cm_override SMALLINT UNSIGNED DEFAULT NULL,
+        height_cm_override SMALLINT UNSIGNED DEFAULT NULL,
+        tare_weight_override_g SMALLINT UNSIGNED DEFAULT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_sku_slot (product_sku, slot_index),
+        KEY idx_template (box_template_id)
+    ) {$charset};";
+    dbDelta( $sql_slots );
+
+    // ─────────────────────────────────────────────────────────────
+    // 3. wp_dinoco_warehouse_mapping — F4 expressCategory → warehouseNo
+    // ─────────────────────────────────────────────────────────────
+    $wm_table = $wpdb->prefix . 'dinoco_warehouse_mapping';
+    $sql_wm = "CREATE TABLE {$wm_table} (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+        express_category TINYINT UNSIGNED NOT NULL,
+        warehouse_no VARCHAR(50) NOT NULL,
+        is_primary TINYINT UNSIGNED NOT NULL DEFAULT 0,
+        is_fallback_to_method1 TINYINT UNSIGNED NOT NULL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_ec_primary (express_category, is_primary)
+    ) {$charset};";
+    dbDelta( $sql_wm );
+
+    // ─────────────────────────────────────────────────────────────
+    // 4. wp_dinoco_flash_audit — F2 audit trail (Flash req/resp + bumps)
+    // ─────────────────────────────────────────────────────────────
+    $audit_table = $wpdb->prefix . 'dinoco_flash_audit';
+    $sql_audit = "CREATE TABLE {$audit_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        ticket_id BIGINT UNSIGNED NOT NULL,
+        event_type VARCHAR(32) NOT NULL,
+        pno_index TINYINT UNSIGNED DEFAULT NULL,
+        expected_ec TINYINT UNSIGNED DEFAULT NULL,
+        actual_ec TINYINT UNSIGNED DEFAULT NULL,
+        request_summary TEXT DEFAULT NULL,
+        response_summary TEXT DEFAULT NULL,
+        user_id BIGINT UNSIGNED DEFAULT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_ticket (ticket_id),
+        KEY idx_event_created (event_type, created_at)
+    ) {$charset};";
+    dbDelta( $sql_audit );
+
+    // ─────────────────────────────────────────────────────────────
+    // 5. wp_dinoco_flash_dead_letter — F7 DLQ for Flash create failures
+    // ─────────────────────────────────────────────────────────────
+    $dlq_table = $wpdb->prefix . 'dinoco_flash_dead_letter';
+    $sql_dlq = "CREATE TABLE {$dlq_table} (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+        ticket_id BIGINT UNSIGNED NOT NULL,
+        endpoint VARCHAR(64) NOT NULL,
+        request_body LONGTEXT NOT NULL,
+        last_error_code VARCHAR(32) DEFAULT NULL,
+        last_error_message TEXT DEFAULT NULL,
+        retry_count TINYINT UNSIGNED NOT NULL DEFAULT 0,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        resolved_at DATETIME DEFAULT NULL,
+        resolved_by BIGINT UNSIGNED DEFAULT NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_ticket_endpoint (ticket_id, endpoint),
+        KEY idx_status_created (status, created_at)
+    ) {$charset};";
+    dbDelta( $sql_dlq );
+
+    // ─────────────────────────────────────────────────────────────
+    // 6. ALTER wp_dinoco_products — add 16 shipping columns
+    //    (idempotent via SHOW COLUMNS LIKE loop — matches Snippet 15:111-125 pattern)
+    // ─────────────────────────────────────────────────────────────
+    $products_table = $wpdb->prefix . 'dinoco_products';
+    $shipping_cols = array(
+        // CORE 6
+        'pack_mode'                 => "VARCHAR(24) NOT NULL DEFAULT 'auto'",
+        'packaging_source'          => "VARCHAR(20) NOT NULL DEFAULT 'unknown'",
+        'box_template_id'           => "INT UNSIGNED NULL",
+        'weight_per_unit_g'         => "INT UNSIGNED DEFAULT NULL",
+        'article_category'          => "TINYINT UNSIGNED DEFAULT 6",
+        'express_category_override' => "TINYINT UNSIGNED DEFAULT NULL",
+        // PLAIN DIMS 4 (B1 fix — for SKU without box_template: ad-hoc/unknown/legacy)
+        'weight_grams'              => "INT UNSIGNED DEFAULT NULL",
+        'length_cm'                 => "SMALLINT UNSIGNED DEFAULT NULL",
+        'width_cm'                  => "SMALLINT UNSIGNED DEFAULT NULL",
+        'height_cm'                 => "SMALLINT UNSIGNED DEFAULT NULL",
+        // TEMPLATE-OVERRIDE 4 (optional — override template per SKU)
+        'length_cm_override'        => "SMALLINT UNSIGNED DEFAULT NULL",
+        'width_cm_override'         => "SMALLINT UNSIGNED DEFAULT NULL",
+        'height_cm_override'        => "SMALLINT UNSIGNED DEFAULT NULL",
+        'tare_weight_override_g'    => "SMALLINT UNSIGNED DEFAULT NULL",
+        // AUDIT 2 (M8)
+        'shipping_updated_by'       => "BIGINT UNSIGNED DEFAULT NULL",
+        'shipping_updated_at'       => "DATETIME DEFAULT NULL",
+    );
+    foreach ( $shipping_cols as $col => $def ) {
+        $exists = $wpdb->get_var( "SHOW COLUMNS FROM {$products_table} LIKE '{$col}'" );
+        if ( ! $exists ) {
+            $wpdb->query( "ALTER TABLE {$products_table} ADD COLUMN {$col} {$def}" );
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[Shipping V.8.0] ALTER: added {$col} to dinoco_products" );
+        }
+    }
+
+    // Index for coverage widget (box_template_id + pack_mode query)
+    $idx_exists = $wpdb->get_var( "SHOW INDEX FROM {$products_table} WHERE Key_name = 'idx_shipping_coverage'" );
+    if ( ! $idx_exists ) {
+        $wpdb->query( "ALTER TABLE {$products_table} ADD INDEX idx_shipping_coverage (box_template_id, pack_mode)" );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 7. CHECK constraints (MySQL 8.0.16+ only — probe via INFORMATION_SCHEMA)
+    //    B4/B5 fix: PHP validator = primary defense. CHECK = defense-in-depth.
+    // ─────────────────────────────────────────────────────────────
+    $mysql_version = $wpdb->get_var( "SELECT VERSION()" );
+    $is_mysql_8016 = ( is_string( $mysql_version ) && version_compare( preg_replace( '/[^0-9.].*/', '', $mysql_version ), '8.0.16', '>=' ) );
+    if ( $is_mysql_8016 ) {
+        $checks = array(
+            'chk_pack_mode'        => "CHECK (pack_mode IN ('auto','single_box','multi_box','bulk_pack','assembled_set'))",
+            'chk_packaging_source' => "CHECK (packaging_source IN ('warehouse_packed','factory_packed','unknown'))",
+            'chk_express_override' => "CHECK (express_category_override IS NULL OR express_category_override IN (1,4))",
+        );
+        foreach ( $checks as $name => $clause ) {
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND CONSTRAINT_NAME = %s",
+                DB_NAME, $products_table, $name
+            ) );
+            if ( ! $exists ) {
+                @$wpdb->query( "ALTER TABLE {$products_table} ADD CONSTRAINT {$name} {$clause}" );
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 8. Seed box templates (INSERT IGNORE — idempotent)
+    // ─────────────────────────────────────────────────────────────
+    $seed_flag = get_option( '_dinoco_box_templates_seeded', '0' );
+    if ( $seed_flag !== '1' ) {
+        $seeds = array(
+            array( 'code' => 'S',    'name' => 'กล่องเล็ก S',         'length_cm' => 20, 'width_cm' => 15, 'height_cm' => 10, 'tare_weight_g' =>   50, 'max_weight_g' =>  1000, 'owner_type' => 'warehouse', 'sort_order' => 10 ),
+            array( 'code' => 'M',    'name' => 'กล่องกลาง M',         'length_cm' => 30, 'width_cm' => 25, 'height_cm' => 20, 'tare_weight_g' =>  150, 'max_weight_g' =>  3000, 'owner_type' => 'warehouse', 'sort_order' => 20 ),
+            array( 'code' => 'L',    'name' => 'กล่องใหญ่ L',         'length_cm' => 50, 'width_cm' => 40, 'height_cm' => 35, 'tare_weight_g' =>  400, 'max_weight_g' => 10000, 'owner_type' => 'warehouse', 'sort_order' => 30 ),
+            array( 'code' => 'XL',   'name' => 'กล่องยาว XL',         'length_cm' => 80, 'width_cm' => 20, 'height_cm' => 15, 'tare_weight_g' =>  250, 'max_weight_g' =>  5000, 'owner_type' => 'warehouse', 'sort_order' => 40 ),
+            array( 'code' => 'AL37', 'name' => 'กล่องอลูมิเนียม 37L',  'length_cm' => 50, 'width_cm' => 40, 'height_cm' => 30, 'tare_weight_g' => 1500, 'max_weight_g' => 15000, 'owner_type' => 'factory',   'sort_order' => 50 ),
+        );
+        foreach ( $seeds as $s ) {
+            $exists = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$tpl_table} WHERE code = %s", $s['code'] ) );
+            if ( ! $exists ) {
+                $wpdb->insert( $tpl_table, array_merge( $s, array(
+                    'is_active'  => 1,
+                    'created_at' => current_time( 'mysql' ),
+                    'updated_at' => current_time( 'mysql' ),
+                ) ) );
+            }
+        }
+        update_option( '_dinoco_box_templates_seeded', '1' );
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[Shipping V.8.0] Seeded 5 box templates (S/M/L/XL/AL37)' );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 9. Seed warehouse mapping (F4 — Flash Q6-Q8 confirmed routing)
+    // ─────────────────────────────────────────────────────────────
+    $wm_seed_flag = get_option( '_dinoco_warehouse_mapping_seeded', '0' );
+    if ( $wm_seed_flag !== '1' ) {
+        $wm_seeds = array(
+            array( 'express_category' => 1, 'warehouse_no' => 'BKN_SP-บางเขน',   'is_primary' => 1 ),  // bike
+            array( 'express_category' => 4, 'warehouse_no' => '5BKN_PDC-บางเขน', 'is_primary' => 1 ),  // truck
+        );
+        foreach ( $wm_seeds as $row ) {
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT id FROM {$wm_table} WHERE express_category = %d AND is_primary = %d",
+                $row['express_category'], $row['is_primary']
+            ) );
+            if ( ! $exists ) {
+                $wpdb->insert( $wm_table, array_merge( $row, array( 'created_at' => current_time( 'mysql' ) ) ) );
+            }
+        }
+        update_option( '_dinoco_warehouse_mapping_seeded', '1' );
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[Shipping V.8.0] Seeded 2 warehouse mappings' );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 10. Init wp_option: dinoco_shipping_defaults
+    // ─────────────────────────────────────────────────────────────
+    if ( ! get_option( 'dinoco_shipping_defaults' ) ) {
+        update_option( 'dinoco_shipping_defaults', array(
+            'weight_grams'        => 1000,
+            'length_cm'           => 30,
+            'width_cm'            => 20,
+            'height_cm'           => 10,
+            'article_category'    => 6,
+            'default_box_template_id' => null,  // caller looks up 'M' code
+            'express_threshold'   => array(
+                'weight_g'    => 5000,   // Grab threshold + buffer vs Flash 6kg auto-bump
+                'max_dim_cm'  => 45,     // Grab single-side
+                'sum_dim_cm'  => 150,    // DR-1: Flash Label Condition alignment
+            ),
+        ) );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 11. Init feature flag: dinoco_shipping_meta_enabled (default OFF)
+    // ─────────────────────────────────────────────────────────────
+    if ( get_option( 'dinoco_shipping_meta_enabled', null ) === null ) {
+        update_option( 'dinoco_shipping_meta_enabled', '0' );
+    }
+
+    update_option( '_dinoco_shipping_v42_schema_version', $schema_version );
+    if ( function_exists( 'b2b_log' ) ) b2b_log( '[Shipping V.8.0] Phase 1 schema complete — 5 tables + 16 cols + seeds' );
+}, 7 );
+
+/**
+ * Register warehouse_staff role + scan_shipping capability (D-11)
+ * Idempotent — checks if role exists before add_role.
+ */
+add_action( 'init', function() {
+    if ( ! get_role( 'warehouse_staff' ) ) {
+        add_role( 'warehouse_staff', 'Warehouse Staff', array(
+            'read'            => true,
+            'scan_shipping'   => true,   // new cap for /sku-shipping-scanner/{sku}
+            'edit_shipments'  => true,
+            'view_shipments'  => true,
+        ) );
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[Shipping V.8.0] Registered warehouse_staff role' );
+    }
+    // Ensure admin has scan_shipping capability too (defense-in-depth)
+    $admin = get_role( 'administrator' );
+    if ( $admin && ! $admin->has_cap( 'scan_shipping' ) ) {
+        $admin->add_cap( 'scan_shipping' );
+        $admin->add_cap( 'edit_shipments' );
+        $admin->add_cap( 'view_shipments' );
+    }
+}, 8 );
+
+// ════════════════════════════════════════════════════════════════════════════
+// V.8.0 HELPERS — Shipping Resolvers + Batch + Snapshot + Auto-detect + Retry
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get default shipping values from wp_option.
+ */
+if ( ! function_exists( 'dinoco_shipping_defaults' ) ) {
+    function dinoco_shipping_defaults() {
+        static $cached = null;
+        if ( $cached !== null ) return $cached;
+        $opt = get_option( 'dinoco_shipping_defaults', array() );
+        $cached = is_array( $opt ) ? $opt : array();
+        return $cached;
+    }
+}
+
+/**
+ * Get box template by ID (cached 1hr via transient).
+ */
+if ( ! function_exists( 'dinoco_get_box_template' ) ) {
+    function dinoco_get_box_template( $id ) {
+        if ( ! $id ) return null;
+        $id = absint( $id );
+        $cache_key = 'dinoco_box_tpl_' . $id;
+        $cached = wp_cache_get( $cache_key, 'dinoco_shipping' );
+        if ( $cached !== false ) return $cached;
+
+        global $wpdb;
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}dinoco_box_templates WHERE id = %d AND is_active = 1",
+            $id
+        ), ARRAY_A );
+        wp_cache_set( $cache_key, $row ?: null, 'dinoco_shipping', 3600 );
+        return $row ?: null;
+    }
+}
+
+/**
+ * Get all active box templates, optionally filtered by owner_type.
+ */
+if ( ! function_exists( 'dinoco_get_all_box_templates' ) ) {
+    function dinoco_get_all_box_templates( $owner_type = null ) {
+        $cache_key = 'dinoco_box_tpls_' . ( $owner_type ?: 'all' );
+        $cached = wp_cache_get( $cache_key, 'dinoco_shipping' );
+        if ( $cached !== false ) return $cached;
+
+        global $wpdb;
+        if ( $owner_type ) {
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT * FROM {$wpdb->prefix}dinoco_box_templates WHERE is_active = 1 AND owner_type IN (%s, 'either') ORDER BY sort_order, code",
+                $owner_type
+            ), ARRAY_A );
+        } else {
+            $rows = $wpdb->get_results(
+                "SELECT * FROM {$wpdb->prefix}dinoco_box_templates WHERE is_active = 1 ORDER BY sort_order, code",
+                ARRAY_A
+            );
+        }
+        wp_cache_set( $cache_key, $rows ?: array(), 'dinoco_shipping', 3600 );
+        return $rows ?: array();
+    }
+}
+
+/**
+ * Get single pack slot for a SKU at given index.
+ */
+if ( ! function_exists( 'dinoco_get_pack_slot' ) ) {
+    function dinoco_get_pack_slot( $sku, $slot_index ) {
+        if ( ! $sku ) return null;
+        global $wpdb;
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}dinoco_pack_slots WHERE product_sku = %s AND slot_index = %d",
+            strtoupper( trim( $sku ) ), absint( $slot_index )
+        ), ARRAY_A ) ?: null;
+    }
+}
+
+/**
+ * Get all pack slots for a SKU (ordered by slot_index).
+ */
+if ( ! function_exists( 'dinoco_get_pack_slots' ) ) {
+    function dinoco_get_pack_slots( $sku ) {
+        if ( ! $sku ) return array();
+        global $wpdb;
+        return $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}dinoco_pack_slots WHERE product_sku = %s ORDER BY slot_index ASC",
+            strtoupper( trim( $sku ) )
+        ), ARRAY_A ) ?: array();
+    }
+}
+
+/**
+ * Get warehouseNo for a given expressCategory (F4 — Method 2 routing).
+ * Cached — fallback to hardcoded mapping if DB empty.
+ */
+if ( ! function_exists( 'dinoco_get_warehouse_no' ) ) {
+    function dinoco_get_warehouse_no( $express_category ) {
+        $ec = absint( $express_category );
+        if ( $ec !== 1 && $ec !== 4 ) return null;
+
+        $cache_key = 'dinoco_warehouse_no_' . $ec;
+        $cached = wp_cache_get( $cache_key, 'dinoco_shipping' );
+        if ( $cached !== false ) return $cached;
+
+        global $wpdb;
+        $no = $wpdb->get_var( $wpdb->prepare(
+            "SELECT warehouse_no FROM {$wpdb->prefix}dinoco_warehouse_mapping WHERE express_category = %d AND is_primary = 1 LIMIT 1",
+            $ec
+        ) );
+
+        // Fallback to hardcoded (Flash Q6-Q8 confirmed mapping)
+        if ( ! $no ) {
+            $no = ( $ec === 4 ) ? '5BKN_PDC-บางเขน' : 'BKN_SP-บางเขน';
+        }
+
+        wp_cache_set( $cache_key, $no, 'dinoco_shipping', 3600 );
+        return $no;
+    }
+}
+
+/**
+ * Suggest expressCategory from weight/dims (DR-1: +sum_dim_cm threshold).
+ * Returns 1 (bike) or 4 (truck).
+ */
+if ( ! function_exists( 'dinoco_suggest_express_category' ) ) {
+    function dinoco_suggest_express_category( $weight_g, $dims ) {
+        $defaults = dinoco_shipping_defaults();
+        $thr = isset( $defaults['express_threshold'] ) ? $defaults['express_threshold'] : array();
+        $wt_thr  = isset( $thr['weight_g'] )   ? intval( $thr['weight_g'] )   : 5000;
+        $dim_thr = isset( $thr['max_dim_cm'] ) ? intval( $thr['max_dim_cm'] ) : 45;
+        $sum_thr = isset( $thr['sum_dim_cm'] ) ? intval( $thr['sum_dim_cm'] ) : 150;
+
+        $L = isset( $dims['length_cm'] ) ? intval( $dims['length_cm'] ) : 0;
+        $W = isset( $dims['width_cm'] )  ? intval( $dims['width_cm'] )  : 0;
+        $H = isset( $dims['height_cm'] ) ? intval( $dims['height_cm'] ) : 0;
+        $max_dim = max( $L, $W, $H );
+        $sum_dim = $L + $W + $H;
+
+        if ( intval( $weight_g ) > $wt_thr ) return 4;
+        if ( $max_dim > $dim_thr ) return 4;
+        if ( $sum_dim > $sum_thr ) return 4;
+        return 1;
+    }
+}
+
+/**
+ * Log missing shipping data (rate-limited via transient — max 1 log/sku/hour).
+ */
+if ( ! function_exists( 'dinoco_log_missing_shipping_data' ) ) {
+    function dinoco_log_missing_shipping_data( $sku ) {
+        if ( ! $sku ) return;
+        $sku_u = strtoupper( trim( $sku ) );
+        $key = 'dinoco_missing_ship_' . md5( $sku_u );
+        if ( get_transient( $key ) ) return;
+        set_transient( $key, 1, HOUR_IN_SECONDS );
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[Shipping V.8.0] Missing data for SKU {$sku_u} — falling back to defaults" );
+        }
+    }
+}
+
+/**
+ * Estimate weight from leaves (FR-3 — for assembled_set pack_mode).
+ * Sum weight_per_unit_g of leaves (content-only, no tare — caller adds parent tare).
+ */
+if ( ! function_exists( 'dinoco_estimate_weight_from_leaves' ) ) {
+    function dinoco_estimate_weight_from_leaves( $sku ) {
+        if ( ! $sku ) return 0;
+        if ( function_exists( 'dinoco_is_leaf_sku' ) && dinoco_is_leaf_sku( $sku ) ) {
+            $cat = DINOCO_Catalog::get_by_sku( $sku );
+            return intval( $cat['weight_per_unit_g'] ?? 0 );
+        }
+        $leaves = function_exists( 'dinoco_get_leaf_skus' ) ? dinoco_get_leaf_skus( $sku ) : array();
+        if ( empty( $leaves ) ) return 0;
+        $total = 0;
+        foreach ( $leaves as $leaf ) {
+            $cat = DINOCO_Catalog::get_by_sku( $leaf );
+            $total += intval( $cat['weight_per_unit_g'] ?? 0 );
+        }
+        return $total;
+    }
+}
+
+/**
+ * API retry wrapper with exp backoff + jitter (FR-2).
+ * Retryable: 1003/500/502/504/timeout. Non-retryable (400/401/403/409/422) → abandon.
+ * Caller inserts DLQ on retry_exhausted or retry_abandoned.
+ */
+if ( ! function_exists( 'dinoco_api_retry' ) ) {
+    function dinoco_api_retry( $callback, $max = 3, $delays = array( 1, 2, 5 ) ) {
+        $attempt = 0;
+        $last_result = null;
+        while ( $attempt < $max ) {
+            $last_result = call_user_func( $callback );
+            if ( is_array( $last_result ) && ! empty( $last_result['ok'] ) ) return $last_result;
+
+            $code = is_array( $last_result ) && isset( $last_result['error_code'] )
+                ? (string) $last_result['error_code'] : '';
+
+            // Non-retryable → straight to DLQ via caller
+            if ( in_array( $code, array( '400', '401', '403', '409', '422' ), true ) ) {
+                if ( is_array( $last_result ) ) $last_result['retry_abandoned'] = true;
+                return $last_result;
+            }
+
+            // Retryable: exp backoff + jitter 50-150ms
+            if ( $attempt < $max - 1 ) {
+                $delay_sec = isset( $delays[ $attempt ] ) ? intval( $delays[ $attempt ] ) : 5;
+                $jitter_us = mt_rand( 50, 150 ) * 1000;
+                usleep( $delay_sec * 1000000 + $jitter_us );
+            }
+            $attempt++;
+        }
+        if ( is_array( $last_result ) ) $last_result['retry_exhausted'] = true;
+        return $last_result;
+    }
+}
+
+/**
+ * P1 batch helper — loads catalog + templates + slots for multiple SKUs in 3 queries.
+ * Caller passes list of SKUs (mixed case), returns map keyed by UPPERCASE SKU.
+ * Each entry: { catalog: ARRAY_A|null, template: ARRAY_A|null, slots: array }
+ */
+if ( ! function_exists( 'dinoco_get_shipping_data_map' ) ) {
+    function dinoco_get_shipping_data_map( array $skus ) {
+        if ( empty( $skus ) ) return array();
+        global $wpdb;
+
+        $normalized = array();
+        foreach ( $skus as $s ) {
+            if ( ! is_string( $s ) ) continue;
+            $u = strtoupper( trim( $s ) );
+            if ( $u !== '' ) $normalized[ $u ] = $u;
+        }
+        if ( empty( $normalized ) ) return array();
+
+        $sku_list = array_values( $normalized );
+        $cache_key = 'dinoco_shipping_map_' . md5( implode( ',', $sku_list ) );
+        $cached = wp_cache_get( $cache_key, 'dinoco_shipping' );
+        if ( $cached !== false ) return $cached;
+
+        // Query 1: catalogs (reuse existing batch helper)
+        $catalogs = DINOCO_Catalog::get_by_skus( $sku_list );
+
+        // Query 2: box templates referenced by catalogs
+        $template_ids = array();
+        foreach ( $catalogs as $row ) {
+            if ( ! empty( $row['box_template_id'] ) ) $template_ids[ (int) $row['box_template_id'] ] = (int) $row['box_template_id'];
+        }
+        $templates = array();
+        if ( ! empty( $template_ids ) ) {
+            $ids = array_values( $template_ids );
+            $ph  = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT * FROM {$wpdb->prefix}dinoco_box_templates WHERE id IN ({$ph})",
+                $ids
+            ), ARRAY_A );
+            foreach ( (array) $rows as $r ) {
+                $templates[ (int) $r['id'] ] = $r;
+            }
+        }
+
+        // Query 3: pack slots for all SKUs
+        $ph_sku = implode( ',', array_fill( 0, count( $sku_list ), '%s' ) );
+        $slot_rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}dinoco_pack_slots WHERE product_sku IN ({$ph_sku}) ORDER BY product_sku, slot_index",
+            $sku_list
+        ), ARRAY_A );
+        $slots_map = array();
+        foreach ( (array) $slot_rows as $r ) {
+            $slots_map[ strtoupper( $r['product_sku'] ) ][] = $r;
+        }
+
+        // Build final map
+        $map = array();
+        foreach ( $sku_list as $sku ) {
+            $cat = $catalogs[ $sku ] ?? null;
+            $tpl = ( $cat && ! empty( $cat['box_template_id'] ) ) ? ( $templates[ (int) $cat['box_template_id'] ] ?? null ) : null;
+            $map[ $sku ] = array(
+                'catalog'  => $cat,
+                'template' => $tpl,
+                'slots'    => $slots_map[ $sku ] ?? array(),
+            );
+        }
+
+        wp_cache_set( $cache_key, $map, 'dinoco_shipping', 300 );
+        return $map;
+    }
+}
+
+/**
+ * Smart pack_mode auto-detect (M3) — derive from bpu/upb + hierarchy.
+ * Used by migration tool to suggest pack_mode for legacy SKUs.
+ */
+if ( ! function_exists( 'dinoco_smart_detect_pack_mode' ) ) {
+    function dinoco_smart_detect_pack_mode( $sku ) {
+        $cat = DINOCO_Catalog::get_by_sku( $sku );
+        if ( ! $cat ) return 'auto';
+
+        $bpu = intval( $cat['boxes_per_unit'] ?? 1 );
+        $upb = intval( $cat['units_per_box'] ?? 1 );
+        $is_leaf = function_exists( 'dinoco_is_leaf_sku' ) ? dinoco_is_leaf_sku( $sku ) : true;
+        $has_children = ! $is_leaf;
+
+        if ( $upb > 1 ) return 'bulk_pack';
+        if ( $bpu > 1 ) return 'multi_box';  // SET แยกหลายกล่อง or leaf with 1 item split
+        if ( $has_children && $bpu === 1 ) return 'assembled_set';  // SET ประกอบแล้ว 1 กล่อง
+        if ( $is_leaf && $bpu === 1 ) return 'single_box';
+        return 'auto';
+    }
+}
+
+/**
+ * Recursive SET aggregate (C-A3 fix — tare counted once, not per-leaf).
+ * Static memo for DD-3 shared leaf (P3). Return content weight only; caller adds parent tare.
+ */
+if ( ! function_exists( 'dinoco_aggregate_children_shipping' ) ) {
+    function dinoco_aggregate_children_shipping( $leaves, $parent_sku ) {
+        static $memo = array();
+        $memo_key = md5( serialize( $leaves ) . '|' . $parent_sku );
+        if ( isset( $memo[ $memo_key ] ) ) return $memo[ $memo_key ];
+
+        $total_content_g = 0;
+        $max_L = 0; $max_W = 0; $sum_H = 0;
+        foreach ( (array) $leaves as $leaf ) {
+            $cat = DINOCO_Catalog::get_by_sku( $leaf );
+            if ( ! $cat ) continue;
+            // content weight only (leaf content, no tare)
+            $w = intval( $cat['weight_per_unit_g'] ?? $cat['weight_grams'] ?? 0 );
+            $total_content_g += $w;
+            // bounding box heuristic: max L, max W, sum H (vertical stacking)
+            $max_L = max( $max_L, intval( $cat['length_cm'] ?? 0 ) );
+            $max_W = max( $max_W, intval( $cat['width_cm']  ?? 0 ) );
+            $sum_H += intval( $cat['height_cm'] ?? 0 );
+        }
+
+        $result = array(
+            'weight_g'         => $total_content_g,
+            'length_cm'        => $max_L,
+            'width_cm'         => $max_W,
+            'height_cm'        => $sum_H,
+            'article_category' => 6,
+            'express_category' => dinoco_suggest_express_category(
+                $total_content_g,
+                array( 'length_cm' => $max_L, 'width_cm' => $max_W, 'height_cm' => $sum_H )
+            ),
+            'source' => 'aggregated_from_' . count( (array) $leaves ) . '_leaves',
+        );
+        $memo[ $memo_key ] = $result;
+        return $result;
+    }
+}
+
+/**
+ * Core resolver — weight/dims/category for a single PNO (or manifest entry).
+ * Priority chain: pack_mode-based resolution → fallback to defaults.
+ *
+ * @param array $manifest_entry { sku, slot_index?, total_qty?, box_index?, num_boxes? }
+ * @param int   $qty_in_box     Qty packed in THIS box (for bulk_pack partial box)
+ * @return array { weight_g, length_cm, width_cm, height_cm, article_category, express_category, source }
+ */
+if ( ! function_exists( 'dinoco_resolve_pno_shipping' ) ) {
+    function dinoco_resolve_pno_shipping( $manifest_entry, $qty_in_box = 1 ) {
+        $sku = strtoupper( trim( $manifest_entry['sku'] ?? '' ) );
+        if ( $sku === '' ) return dinoco_shipping_defaults();
+
+        $catalog = DINOCO_Catalog::get_by_sku( $sku );
+        $defaults = dinoco_shipping_defaults();
+
+        if ( ! $catalog ) {
+            dinoco_log_missing_shipping_data( $sku );
+            return array_merge( $defaults, array( 'source' => 'no_catalog', 'express_category' => 1, 'article_category' => 6 ) );
+        }
+
+        $mode = isset( $catalog['pack_mode'] ) ? $catalog['pack_mode'] : 'auto';
+
+        // Helper: resolve effective dims from template + SKU overrides
+        $resolve_dims = function( $tpl, $overrides ) use ( $defaults ) {
+            $L = ( isset( $overrides['length_cm_override'] ) && $overrides['length_cm_override'] !== null )
+                ? intval( $overrides['length_cm_override'] )
+                : ( $tpl ? intval( $tpl['length_cm'] ) : intval( $defaults['length_cm'] ?? 30 ) );
+            $W = ( isset( $overrides['width_cm_override'] ) && $overrides['width_cm_override'] !== null )
+                ? intval( $overrides['width_cm_override'] )
+                : ( $tpl ? intval( $tpl['width_cm'] ) : intval( $defaults['width_cm'] ?? 20 ) );
+            $H = ( isset( $overrides['height_cm_override'] ) && $overrides['height_cm_override'] !== null )
+                ? intval( $overrides['height_cm_override'] )
+                : ( $tpl ? intval( $tpl['height_cm'] ) : intval( $defaults['height_cm'] ?? 10 ) );
+            $tare = ( isset( $overrides['tare_weight_override_g'] ) && $overrides['tare_weight_override_g'] !== null )
+                ? intval( $overrides['tare_weight_override_g'] )
+                : ( $tpl ? intval( $tpl['tare_weight_g'] ) : 0 );
+            return array( 'L' => $L, 'W' => $W, 'H' => $H, 'tare' => $tare );
+        };
+
+        switch ( $mode ) {
+            case 'single_box':
+            case 'assembled_set': {
+                $tpl = ! empty( $catalog['box_template_id'] ) ? dinoco_get_box_template( $catalog['box_template_id'] ) : null;
+                if ( ! $tpl ) {
+                    // fall through to plain dims below if no template
+                    break;
+                }
+                $content_weight = intval( $catalog['weight_per_unit_g'] ?? 0 );
+                if ( $content_weight === 0 && $mode === 'assembled_set' ) {
+                    $content_weight = dinoco_estimate_weight_from_leaves( $sku );
+                }
+                $d = $resolve_dims( $tpl, $catalog );
+                $weight_g = $content_weight + $d['tare'];
+                return array(
+                    'weight_g'         => $weight_g,
+                    'length_cm'        => $d['L'],
+                    'width_cm'         => $d['W'],
+                    'height_cm'        => $d['H'],
+                    'article_category' => intval( $catalog['article_category'] ?? 6 ) ?: 6,
+                    'express_category' => ! empty( $catalog['express_category_override'] )
+                        ? intval( $catalog['express_category_override'] )
+                        : dinoco_suggest_express_category( $weight_g, array( 'length_cm' => $d['L'], 'width_cm' => $d['W'], 'height_cm' => $d['H'] ) ),
+                    'source' => "sku_{$mode}_tpl_{$tpl['code']}",
+                );
+            }
+
+            case 'multi_box': {
+                $slot_idx = isset( $manifest_entry['slot_index'] ) ? intval( $manifest_entry['slot_index'] ) : 0;
+                $slot = dinoco_get_pack_slot( $sku, $slot_idx );
+                if ( ! $slot ) {
+                    return array_merge( $defaults, array( 'source' => "multi_box_slot_{$slot_idx}_missing" ) );
+                }
+                $tpl = dinoco_get_box_template( $slot['box_template_id'] );
+                if ( ! $tpl ) {
+                    return array_merge( $defaults, array( 'source' => "multi_box_slot_{$slot_idx}_no_tpl" ) );
+                }
+                // C-A4 fix: read slot-level overrides
+                $d = $resolve_dims( $tpl, $slot );
+                $content = intval( $slot['content_weight_g'] ?? 0 );
+                $weight_g = $content + $d['tare'];
+                return array(
+                    'weight_g'         => $weight_g,
+                    'length_cm'        => $d['L'],
+                    'width_cm'         => $d['W'],
+                    'height_cm'        => $d['H'],
+                    'article_category' => intval( $catalog['article_category'] ?? 6 ) ?: 6,
+                    'express_category' => ! empty( $catalog['express_category_override'] )
+                        ? intval( $catalog['express_category_override'] )
+                        : dinoco_suggest_express_category( $weight_g, array( 'length_cm' => $d['L'], 'width_cm' => $d['W'], 'height_cm' => $d['H'] ) ),
+                    'source' => "multi_box_slot_{$slot_idx}_tpl_{$tpl['code']}",
+                );
+            }
+
+            case 'bulk_pack': {
+                $tpl = ! empty( $catalog['box_template_id'] ) ? dinoco_get_box_template( $catalog['box_template_id'] ) : null;
+                if ( ! $tpl ) break;  // fall through
+                $wpu = intval( $catalog['weight_per_unit_g'] ?? 50 );
+                $qib = max( 1, intval( $qty_in_box ) );
+                $d = $resolve_dims( $tpl, $catalog );
+                $weight_g = ( $qib * $wpu ) + $d['tare'];
+                return array(
+                    'weight_g'         => $weight_g,
+                    'length_cm'        => $d['L'],
+                    'width_cm'         => $d['W'],
+                    'height_cm'        => $d['H'],
+                    'article_category' => intval( $catalog['article_category'] ?? 6 ) ?: 6,
+                    'express_category' => ! empty( $catalog['express_category_override'] )
+                        ? intval( $catalog['express_category_override'] )
+                        : dinoco_suggest_express_category( $weight_g, array( 'length_cm' => $d['L'], 'width_cm' => $d['W'], 'height_cm' => $d['H'] ) ),
+                    'source' => "bulk_pack_qty{$qib}_tpl_{$tpl['code']}",
+                );
+            }
+
+            case 'unknown': {
+                // C-A1 fix: pack_mode=unknown = ad-hoc SKU via manual-ship save-back
+                // Use plain dims columns (B1 fix) or fall back to defaults
+                $weight_g = intval( $catalog['weight_grams'] ?? 0 ) ?: intval( $defaults['weight_grams'] ?? 1000 );
+                $L = intval( $catalog['length_cm'] ?? 0 ) ?: intval( $defaults['length_cm'] ?? 30 );
+                $W = intval( $catalog['width_cm']  ?? 0 ) ?: intval( $defaults['width_cm']  ?? 20 );
+                $H = intval( $catalog['height_cm'] ?? 0 ) ?: intval( $defaults['height_cm'] ?? 10 );
+                return array(
+                    'weight_g'         => $weight_g,
+                    'length_cm'        => $L,
+                    'width_cm'         => $W,
+                    'height_cm'        => $H,
+                    'article_category' => intval( $catalog['article_category'] ?? 6 ) ?: 6,
+                    'express_category' => ! empty( $catalog['express_category_override'] )
+                        ? intval( $catalog['express_category_override'] )
+                        : dinoco_suggest_express_category( $weight_g, array( 'length_cm' => $L, 'width_cm' => $W, 'height_cm' => $H ) ),
+                    'source' => 'plain_dims_unknown_mode',
+                );
+            }
+
+            case 'auto':
+            default:
+                // SET → aggregate from leaves; leaf with no pack_mode → defaults + log
+                $leaves = function_exists( 'dinoco_get_leaf_skus' ) ? dinoco_get_leaf_skus( $sku ) : array( $sku );
+                if ( count( $leaves ) === 1 && $leaves[0] === $sku ) {
+                    // leaf with no explicit pack_mode → fall through to plain dims
+                    break;
+                }
+                return dinoco_aggregate_children_shipping( $leaves, $sku );
+        }
+
+        // ── Fallback: plain dims columns (B1 fix — when no template or auto-leaf no data)
+        $weight_g = intval( $catalog['weight_grams'] ?? 0 );
+        $L = intval( $catalog['length_cm'] ?? 0 );
+        $W = intval( $catalog['width_cm']  ?? 0 );
+        $H = intval( $catalog['height_cm'] ?? 0 );
+        if ( $weight_g === 0 && $L === 0 && $W === 0 && $H === 0 ) {
+            dinoco_log_missing_shipping_data( $sku );
+            return array_merge( $defaults, array( 'source' => 'defaults_fallback', 'express_category' => 1, 'article_category' => 6 ) );
+        }
+        $weight_g = $weight_g ?: intval( $defaults['weight_grams'] ?? 1000 );
+        $L = $L ?: intval( $defaults['length_cm'] ?? 30 );
+        $W = $W ?: intval( $defaults['width_cm']  ?? 20 );
+        $H = $H ?: intval( $defaults['height_cm'] ?? 10 );
+        return array(
+            'weight_g'         => $weight_g,
+            'length_cm'        => $L,
+            'width_cm'         => $W,
+            'height_cm'        => $H,
+            'article_category' => intval( $catalog['article_category'] ?? 6 ) ?: 6,
+            'express_category' => ! empty( $catalog['express_category_override'] )
+                ? intval( $catalog['express_category_override'] )
+                : dinoco_suggest_express_category( $weight_g, array( 'length_cm' => $L, 'width_cm' => $W, 'height_cm' => $H ) ),
+            'source' => 'plain_dims_fallback',
+        );
+    }
+}
+
+/**
+ * Resolve shipping per manifest entry (per-PNO) for a full ticket manifest.
+ * Tracks slot_index per SKU for multi_box, qty_in_box for bulk_pack.
+ * Applies ticket-level override (legacy _flash_weight_grams escape hatch per decision #16).
+ *
+ * @param array $manifest Array of entries { sku, total_qty?, box_index?, num_boxes? }
+ * @param int   $ticket_id Optional — for ticket-level override lookup
+ * @return array Per-index map: [ 0 => { weight_g, L, W, H, article_cat, express_cat, source }, ... ]
+ */
+if ( ! function_exists( 'dinoco_resolve_manifest_shipping' ) ) {
+    function dinoco_resolve_manifest_shipping( $manifest, $ticket_id = 0 ) {
+        $per_pno = array();
+        $sku_counter = array();
+        $sku_remaining = array();  // for bulk_pack
+
+        foreach ( (array) $manifest as $i => $entry ) {
+            $sku = strtoupper( trim( $entry['sku'] ?? '' ) );
+            if ( $sku === '' ) {
+                $per_pno[ $i ] = dinoco_shipping_defaults();
+                continue;
+            }
+            // track slot_index for multi_box
+            $sku_counter[ $sku ] = ( $sku_counter[ $sku ] ?? -1 ) + 1;
+            $entry['slot_index'] = $sku_counter[ $sku ];
+
+            // bulk_pack: compute qty_in_this_box
+            $qty_in_box = 1;
+            $cat = DINOCO_Catalog::get_by_sku( $sku );
+            if ( $cat && ( $cat['pack_mode'] ?? '' ) === 'bulk_pack' ) {
+                $upb = intval( $cat['units_per_box'] ?? 1 );
+                $total_qty = intval( $entry['total_qty'] ?? $upb );
+                $remaining = $sku_remaining[ $sku ] ?? $total_qty;
+                $qty_in_box = $upb > 0 ? min( $upb, $remaining ) : $total_qty;
+                $sku_remaining[ $sku ] = $remaining - $qty_in_box;
+            }
+
+            $per_pno[ $i ] = dinoco_resolve_pno_shipping( $entry, $qty_in_box );
+        }
+
+        // Ticket-level legacy override (decision #16: keep as escape hatch)
+        if ( $ticket_id ) {
+            $override_weight = get_post_meta( $ticket_id, '_flash_weight_grams', true );
+            $override_ec     = get_post_meta( $ticket_id, '_flash_express_category', true );
+            if ( $override_weight !== '' && $override_weight !== null ) {
+                $ow = intval( $override_weight );
+                foreach ( $per_pno as &$p ) $p['weight_g'] = $ow;
+                unset( $p );
+            }
+            if ( $override_ec !== '' && $override_ec !== null ) {
+                $oe = intval( $override_ec );
+                foreach ( $per_pno as &$p ) $p['express_category'] = $oe;
+                unset( $p );
+            }
+        }
+
+        return $per_pno;
+    }
+}
+
+/**
+ * M1 snapshot — immutable ticket-level snapshot at confirm_bill.
+ * Prevents edge cases E1/E2/E5 (admin flip flag/pack_mode mid-order, BO fulfill race).
+ */
+if ( ! function_exists( 'dinoco_snapshot_ticket_shipping' ) ) {
+    function dinoco_snapshot_ticket_shipping( $ticket_id, $manifest ) {
+        $ticket_id = absint( $ticket_id );
+        if ( ! $ticket_id ) return null;
+        $per_pno = dinoco_resolve_manifest_shipping( $manifest, $ticket_id );
+        update_post_meta( $ticket_id, '_flash_shipping_snapshot', array(
+            'version'       => '42.0',
+            'snapshotted_at'=> current_time( 'mysql' ),
+            'flag_state'    => (bool) get_option( 'dinoco_shipping_meta_enabled', '0' ),
+            'per_pno'       => $per_pno,
+            'manifest_hash' => md5( serialize( $manifest ) ),
+        ) );
+        return $per_pno;
+    }
+}
+
+/**
+ * Read ticket snapshot (if exists) — returns null if never snapshotted.
+ */
+if ( ! function_exists( 'dinoco_get_ticket_shipping_snapshot' ) ) {
+    function dinoco_get_ticket_shipping_snapshot( $ticket_id ) {
+        $snap = get_post_meta( absint( $ticket_id ), '_flash_shipping_snapshot', true );
+        return is_array( $snap ) ? $snap : null;
+    }
+}
+
+/**
+ * Convenience: get single SKU shipping (for UI display, REST response).
+ */
+if ( ! function_exists( 'dinoco_get_sku_shipping' ) ) {
+    function dinoco_get_sku_shipping( $sku ) {
+        return dinoco_resolve_pno_shipping( array( 'sku' => $sku ) );
+    }
+}
+
+/**
+ * Compute total shipping for a SET (expand leaves × qty).
+ */
+if ( ! function_exists( 'dinoco_compute_set_shipping' ) ) {
+    function dinoco_compute_set_shipping( $sku, $qty = 1 ) {
+        $qty = max( 1, intval( $qty ) );
+        $shipping = dinoco_resolve_pno_shipping( array( 'sku' => $sku ) );
+        // scale by qty for bulk_pack or multi-unit orders
+        if ( $qty > 1 ) {
+            $shipping['weight_g'] = intval( $shipping['weight_g'] ) * $qty;
+        }
+        return $shipping;
+    }
+}
+
+/**
+ * Compute shipping for an order (list of {sku, qty}).
+ */
+if ( ! function_exists( 'dinoco_compute_order_shipping' ) ) {
+    function dinoco_compute_order_shipping( $items ) {
+        $manifest = array();
+        foreach ( (array) $items as $it ) {
+            $manifest[] = array(
+                'sku'       => $it['sku'] ?? '',
+                'total_qty' => intval( $it['qty'] ?? 1 ),
+            );
+        }
+        return dinoco_resolve_manifest_shipping( $manifest );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// END V.8.0 Flash Shipping Metadata V.42 Phase 1
+// ════════════════════════════════════════════════════════════════════════════
