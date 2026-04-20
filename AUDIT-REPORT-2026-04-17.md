@@ -27,6 +27,11 @@
   DOC-1 (cron name `b2f_diff_cron_hourly`), DOC-2 (Slip2Go PULL-only clarification),
   DOC-3 (125+ endpoints), CONFIG-1 (LICENSE GPL-2.0+), CONFIG-2 (.env.example WordPress),
   CONFIG-3 (openclawminicrm/.env.example augment)
+- **Phase 3+ COMPLETE** (3 parallel commits `b89d2c8 / 30df5bd / 4288fd1`, 2026-04-20) — 13 items from post-session Deep Full Review:
+  **Sprint A** (Node/Python security): S7 multer 1.4.5→2.1.1 (CVE-2023-52221 closed, 0 vulns), H1 hmac.compare_digest timing-safe bearer token (dashboard.py + bonus require_basic_auth), L4 isFinite guard on SENTRY_SAMPLE_RATE, L7 correlation-ID middleware flag-gated CORRELATION_ID_ENABLED.
+  **Sprint B** (WP snippets security): Observability V.1.1 M2 HTTP_X_REQUEST_ID flag-gate + M4 header + L2 dinoco_obs_redact_context + L6 vendor/autoload guard; LIFF Asset Loader V.1.1 M1 path-traversal + SRI sha384; Modal Helpers V.1.1 L3 CSP-ready registered handles.
+  **Sprint C** (GDPR + cart + invoice): GDPR V.1.1 M3 Cloudflare-aware IP + 90d retention cron (PDPA §17) + L1 FOR UPDATE dedup; Snippet 8 V.7.8 L5 cart schema envelope + 30d TTL; Manual Invoice V.33.8 M5 helper shims (5 call sites).
+  **OWASP closed**: A01/A03/A04/A05/A06/A07/A08/A09. **PDPA**: Art. 5(1)(e) + §17 compliance.
 - **Hotfixes during session** (3 commits):
   `b072f74` LIFF AI V.3.6 PHP 8 ArgumentCountError fix (template_redirect default $atts);
   `4576d9e` LIFF AI V.3.7 echo render_page return value (buffered HTML);
@@ -387,7 +392,7 @@ WordPress (60 snippets, 1 DB)
 ### Security High
 - **S5** — B2F Migration Audit destructive POST (`activate-schema`, `backfill`, `phase4-migration`, `junction-bulk-delete`, `junction-*-classification`, `autosync-blacklist POST`, `feature-flags/toggle`, `purge-stale-prices`) ขาด CSRF nonce verification [`[Admin System] B2F Migration Audit:1797-1799`]. Dashboard ส่ง `X-WP-Nonce` แต่ permission_callback ignore
 - **S6** — `npm audit` high: path-to-regexp 8.0.0-8.3.0 ReDoS (via express 5.2.1) — openclawminicrm/proxy
-- **S7** — multer 1.4.x **EOL Dec 2024** + CVE-2023-52221 — bump to v2.x
+- **S7** — ✅ **APPLIED 2026-04-20 (`b89d2c8`)** — multer 1.4.5-lts.2 → 2.1.1, 0 vulns, API backward-compatible (diskStorage + fileFilter + limits pattern unchanged)
 - **S8** — vite 8.0.0-8.0.4: 3 high CVEs (path traversal + server.fs.deny bypass + WebSocket file read) — root + brand-voice-extension
 - **S9** — OpenClaw 5 routes missing requireAuth: `/api/costs`, `/api/free-models`, `/advice`, `/api/advisor/sources-changed`, `/api/km/search`
 - **S10** — RPi `/api/ticket-lookup/{id}` + `/api/pno-lookup/{pno}` unauth — enumeration vector
