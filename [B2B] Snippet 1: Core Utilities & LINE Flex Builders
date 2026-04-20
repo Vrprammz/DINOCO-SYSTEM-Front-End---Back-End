@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.1 — Flash Shipping V.42 Phase 5 (Launch Infra): ║
+ * ║    • cron_schedules: ten_minutes + fifteen_minutes intervals   ║
+ * ║    • 3 NEW cron jobs:                                          ║
+ * ║      flash_category_verify_cron (15min, F2 bump detection)     ║
+ * ║      dinoco_shipping_auto_rollback_cron (10min)                ║
+ * ║      dinoco_flash_dlq_cleanup_cron (daily 03:00, 30d retain)   ║
+ * ║    • Auto-rollback logic: error rate>5% AND abs_count>20/hr    ║
+ * ║      → flip dinoco_shipping_meta_enabled OFF + Telegram+Flex   ║
+ * ║    • S25 webhook replay: sig → nonce 24h → idempotent update   ║
+ * ║    • S28 Telegram replay dedup 1/min per tid                   ║
+ * ║    • wp_cache_add lock on auto-rollback (prevent dup flip)     ║
  * ║  Version: V.34.0 — Flash Shipping V.42 Phase 3.5:            ║
  * ║    • 7 NEW Flex builders for Admin group:                     ║
  * ║      flash_truck_pickup_called / flash_pickup_upgraded /      ║
@@ -5815,4 +5826,224 @@ add_action( 'rest_api_init', function() {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // END V.34.0 Flash Shipping V.42 Phase 3.5
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V.34.1 — FLASH SHIPPING METADATA V.42 PHASE 5 (LAUNCH INFRA)
+// ──────────────────────────────────────────────────────────────────────────────
+// Custom cron intervals + 3 cron jobs + auto-rollback + DLQ cleanup + F2 verify
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * FR-4: Custom cron intervals — 10min + 15min
+ * Under DISABLE_WP_CRON=true + system cron cadence, 10-min is safer than 5-min
+ * (5-min interval sometimes misses triggers when system cron runs every 5-10 min).
+ */
+add_filter( 'cron_schedules', function( $s ) {
+    if ( ! isset( $s['ten_minutes'] ) ) {
+        $s['ten_minutes'] = array( 'interval' => 600, 'display' => __( '10 minutes', 'dinoco' ) );
+    }
+    if ( ! isset( $s['fifteen_minutes'] ) ) {
+        $s['fifteen_minutes'] = array( 'interval' => 900, 'display' => __( '15 minutes', 'dinoco' ) );
+    }
+    return $s;
+} );
+
+/**
+ * S28 Telegram escape — per-tid replay dedup 1/min
+ * Used by webhook handlers to avoid alert spam on Flash replay attacks.
+ */
+if ( ! function_exists( 'b2b_tg_send_dedup' ) ) {
+    function b2b_tg_send_dedup( $tid, $message, $ttl = 60 ) {
+        if ( ! $tid ) return false;
+        $key = 'b2b_tg_dedup_' . md5( (string) $tid );
+        if ( get_transient( $key ) ) return 'deduped';
+        set_transient( $key, 1, max( 60, (int) $ttl ) );
+        if ( function_exists( 'sendTelegramAlert' ) ) {
+            return sendTelegramAlert( 'flash_event', $message );
+        }
+        return false;
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// CRON 1: flash_category_verify_cron — F2 bump detection (15-min)
+// ───────────────────────────────────────────────────────────────────
+// Checks recent Flash-created tickets (last 2hr) → fetch Flash Routes API →
+// compare expected EC vs actual EC → if bumped (1→4) fire admin Flex alert.
+if ( ! wp_next_scheduled( 'flash_category_verify_cron' ) ) {
+    wp_schedule_event( time() + 300, 'fifteen_minutes', 'flash_category_verify_cron' );
+}
+add_action( 'flash_category_verify_cron', function() {
+    if ( ! function_exists( 'b2b_flash_request' ) ) return;
+    global $wpdb;
+
+    // Only run if V.42 flag is ON — save cycles when feature off
+    if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
+
+    // Find tickets with Flash PNO created in last 2hr + not yet verified
+    $recent = $wpdb->get_results(
+        "SELECT p.ID, pm.meta_value AS pno
+         FROM {$wpdb->posts} p
+         JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = '_flash_tracking_numbers'
+         WHERE p.post_type = 'b2b_order'
+           AND p.post_date > DATE_SUB(NOW(), INTERVAL 2 HOUR)
+           AND NOT EXISTS (SELECT 1 FROM {$wpdb->postmeta} WHERE post_id = p.ID AND meta_key = '_flash_ec_verified_at')
+         LIMIT 20",
+        ARRAY_A
+    );
+
+    if ( empty( $recent ) ) return;
+
+    foreach ( $recent as $r ) {
+        $ticket_id = (int) $r['ID'];
+        $pnos = maybe_unserialize( $r['pno'] );
+        if ( ! is_array( $pnos ) || empty( $pnos ) ) continue;
+        $expected_ec = (int) get_post_meta( $ticket_id, '_flash_express_category', true ) ?: 1;
+
+        // Query Flash Routes API for first PNO
+        $first_pno = reset( $pnos );
+        if ( ! $first_pno ) continue;
+        $resp = @b2b_flash_request( 'open/v1/routes/' . $first_pno, array(), 'GET' );
+
+        // Parse actual EC from response (shape varies per Flash API version)
+        $actual_ec = null;
+        if ( is_array( $resp ) ) {
+            if ( isset( $resp['data']['expressCategory'] ) ) $actual_ec = (int) $resp['data']['expressCategory'];
+            elseif ( isset( $resp['expressCategory'] ) ) $actual_ec = (int) $resp['expressCategory'];
+        }
+
+        update_post_meta( $ticket_id, '_flash_ec_verified_at', current_time( 'mysql' ) );
+        update_post_meta( $ticket_id, '_flash_ec_actual', $actual_ec ?: 0 );
+
+        // Audit log
+        $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+        if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
+            $wpdb->insert( $audit_tbl, array(
+                'ticket_id'       => $ticket_id,
+                'event_type'      => ( $actual_ec && $actual_ec !== $expected_ec ) ? 'ec_bumped' : 'ec_verified',
+                'expected_ec'     => $expected_ec,
+                'actual_ec'       => $actual_ec ?: 0,
+                'request_summary' => wp_json_encode( array( 'pno' => $first_pno ) ),
+                'response_summary'=> wp_json_encode( is_array( $resp ) ? array_slice( $resp, 0, 5, true ) : array( 'raw' => substr( (string) $resp, 0, 500 ) ) ),
+                'created_at'      => current_time( 'mysql' ),
+            ) );
+        }
+
+        // If bumped → push Flex alert to admin (dedup per ticket per hour)
+        if ( $actual_ec && $actual_ec !== $expected_ec && $actual_ec === 4 && function_exists( 'b2b_build_flex_flash_category_bumped' ) ) {
+            $weight_g = (int) get_post_meta( $ticket_id, '_flash_weight_grams', true );
+            $flex = b2b_build_flex_flash_category_bumped( $ticket_id, $expected_ec, $actual_ec, $weight_g );
+            b2b_push_admin_flex_dedup( 'flash_bumped_' . $ticket_id, HOUR_IN_SECONDS, $flex );
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[FlashVerify] ticket={$ticket_id} EC bumped {$expected_ec}→{$actual_ec}" );
+        }
+    }
+} );
+
+// ───────────────────────────────────────────────────────────────────
+// CRON 2: dinoco_shipping_auto_rollback_cron — 10-min (FR-4 relaxed)
+// ───────────────────────────────────────────────────────────────────
+// If error rate > 5% AND absolute count > 20/hr → flip flag OFF + alert
+if ( ! wp_next_scheduled( 'dinoco_shipping_auto_rollback_cron' ) ) {
+    wp_schedule_event( time() + 600, 'ten_minutes', 'dinoco_shipping_auto_rollback_cron' );
+}
+add_action( 'dinoco_shipping_auto_rollback_cron', function() {
+    // Skip if flag already off
+    if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
+
+    // Prevent concurrent rollback via wp_cache_add lock (1-min TTL)
+    $lock_key = 'dinoco_rollback_lock';
+    $lock_acquired = wp_cache_add( $lock_key, 1, 'dinoco_shipping', 60 );
+    if ( ! $lock_acquired ) return;
+
+    global $wpdb;
+    $dlq_tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
+    $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+    if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$dlq_tbl}'" ) ) return;
+
+    // Count Flash create attempts in last hour (from audit)
+    $total_attempts = 0;
+    $errors = 0;
+    if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
+        $total_attempts = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$audit_tbl}
+             WHERE event_type IN ('flash_create','flash_create_fail')
+               AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
+        );
+        $errors = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$audit_tbl}
+             WHERE event_type = 'flash_create_fail'
+               AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
+        );
+    }
+    // DLQ inserts in last hour as another signal
+    $dlq_recent = (int) $wpdb->get_var(
+        "SELECT COUNT(*) FROM {$dlq_tbl}
+         WHERE status = 'pending'
+           AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
+    );
+    $errors = max( $errors, $dlq_recent );
+
+    // Rollback condition: (error_rate > 5%) AND (absolute_count > 20)
+    $rate = $total_attempts > 0 ? ( 100.0 * $errors / $total_attempts ) : 0;
+    if ( $rate > 5.0 && $errors > 20 ) {
+        update_option( 'dinoco_shipping_meta_enabled', '0' );
+        $msg = sprintf(
+            '🚨 AUTO-ROLLBACK: V.42 flag disabled — error rate %.1f%% (%d/%d) in last hour. Check Admin Dashboard → Flash Shipping → DLQ + Audit',
+            $rate, $errors, $total_attempts
+        );
+        if ( function_exists( 'b2b_push_to_admin' ) ) b2b_push_to_admin( $msg );
+        if ( function_exists( 'sendTelegramAlert' ) ) {
+            $tg_msg = '🚨 *DINOCO V\\.42 auto\\-rollback* — error rate `' . b2b_tg_escape( number_format( $rate, 1 ) ) . '%` \\(' . $errors . '/' . $total_attempts . '\\) last hour';
+            sendTelegramAlert( 'flash_rollback', $tg_msg );
+        }
+        if ( function_exists( 'b2b_log' ) ) b2b_log( "[AutoRollback] V.42 flag disabled: rate={$rate}% errors={$errors} total={$total_attempts}" );
+
+        // Audit the rollback event itself
+        if ( $audit_tbl && $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
+            $wpdb->insert( $audit_tbl, array(
+                'ticket_id'        => 0,
+                'event_type'       => 'auto_rollback',
+                'request_summary'  => wp_json_encode( array( 'rate_pct' => $rate, 'errors' => $errors, 'total' => $total_attempts ) ),
+                'response_summary' => 'flag_disabled',
+                'user_id'          => 0,
+                'created_at'       => current_time( 'mysql' ),
+            ) );
+        }
+    }
+} );
+
+// ───────────────────────────────────────────────────────────────────
+// CRON 3: dinoco_flash_dlq_cleanup_cron — daily 03:00 (F7 30d retention)
+// ───────────────────────────────────────────────────────────────────
+if ( ! wp_next_scheduled( 'dinoco_flash_dlq_cleanup_cron' ) ) {
+    // Next 03:00 in Asia/Bangkok
+    $now = current_time( 'timestamp' );
+    $next = strtotime( 'today 03:00', $now );
+    if ( $next <= $now ) $next = strtotime( 'tomorrow 03:00', $now );
+    wp_schedule_event( $next, 'daily', 'dinoco_flash_dlq_cleanup_cron' );
+}
+add_action( 'dinoco_flash_dlq_cleanup_cron', function() {
+    global $wpdb;
+    $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
+    if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$tbl}'" ) ) return;
+    $deleted = $wpdb->query( "DELETE FROM {$tbl} WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)" );
+    if ( $deleted && function_exists( 'b2b_log' ) ) b2b_log( "[DLQCleanup] deleted {$deleted} rows > 30 days old" );
+
+    // Also cleanup old audit rows > 90 days (DR-4 PDPA hygiene)
+    $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+    if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
+        $d2 = $wpdb->query( "DELETE FROM {$audit_tbl} WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)" );
+        if ( $d2 && function_exists( 'b2b_log' ) ) b2b_log( "[AuditCleanup] deleted {$d2} audit rows > 90 days old" );
+    }
+
+    // Warn if DLQ pending > 1000
+    $pending = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl} WHERE status = 'pending'" );
+    if ( $pending > 1000 && function_exists( 'b2b_push_to_admin' ) ) {
+        b2b_push_to_admin( "⚠️ DINOCO DLQ: pending rows = {$pending} (>1000) — investigate Flash stability + admin review queue" );
+    }
+} );
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END V.34.1 Flash Shipping V.42 Phase 5 (Launch Infra)
 // ══════════════════════════════════════════════════════════════════════════════
