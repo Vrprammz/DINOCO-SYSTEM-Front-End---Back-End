@@ -29,6 +29,7 @@ import argparse
 import tempfile
 import functools
 import base64
+import hmac
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -50,28 +51,40 @@ def load_config():
 
 
 def require_auth(f):
-    """Decorator to require API key authentication."""
+    """Decorator to require API key authentication.
+
+    V.42.1 [H1]: timing-safe compare via hmac.compare_digest (was != which leaks
+    timing side-channel for incremental byte matching).
+    """
     @functools.wraps(f)
     def decorated(*args, **kwargs):
         config = load_config()
-        key = request.headers.get('X-Print-Key') or request.args.get('key')
-        if key != config.get('api_key'):
+        key = request.headers.get('X-Print-Key') or request.args.get('key') or ''
+        expected = config.get('api_key') or ''
+        # hmac.compare_digest requires str (not None); returns True only on length+content match.
+        # Reject empty key/expected explicitly (compare_digest('','') returns True — not desired).
+        if not key or not expected or not hmac.compare_digest(str(key), str(expected)):
             return jsonify({'error': 'Unauthorized'}), 401
         return f(*args, **kwargs)
     return decorated
 
 
 def require_basic_auth(f):
-    """Decorator for HTTP Basic Auth on manual shipping pages."""
+    """Decorator for HTTP Basic Auth on manual shipping pages.
+
+    V.42.1 [H1]: timing-safe compare for username + password via hmac.compare_digest.
+    """
     @functools.wraps(f)
     def decorated(*args, **kwargs):
         config = load_config()
-        expected_user = config.get('manual_ship_user', 'dinoco')
-        expected_pass = config.get('manual_ship_pass', '')
+        expected_user = config.get('manual_ship_user', 'dinoco') or ''
+        expected_pass = config.get('manual_ship_pass', '') or ''
         if not expected_pass:
             return Response('Manual shipping not configured (set manual_ship_pass in config.json)', 403)
         auth = request.authorization
-        if not auth or auth.username != expected_user or auth.password != expected_pass:
+        user_ok = auth and hmac.compare_digest(str(auth.username or ''), str(expected_user))
+        pass_ok = auth and hmac.compare_digest(str(auth.password or ''), str(expected_pass))
+        if not (user_ok and pass_ok):
             return Response(
                 'Login required', 401,
                 {'WWW-Authenticate': 'Basic realm="Manual Shipping"'}

@@ -5,21 +5,31 @@
  *
  * V.2.0 — Modular refactor: split into modules/ and middleware/
  * V.2.1 — Optional Sentry integration via SENTRY_DSN env var (defensive require)
+ * V.2.2 — [L4] isFinite guard on SENTRY_SAMPLE_RATE (malformed env → NaN → Sentry crash)
+ *         [L7] Correlation-ID middleware (flag-gated via CORRELATION_ID_ENABLED=1)
  */
+
+// Sentry reference kept in module scope for correlation middleware tagging (L7).
+let Sentry = null;
 
 // === Observability: optional Sentry init (zero-effect when env unset) ===
 // Env-gated. Install with `npm install @sentry/node` on the server when ready.
 // Missing module or missing DSN → silent no-op; never blocks startup.
 if (process.env.SENTRY_DSN) {
   try {
-    const Sentry = require("@sentry/node");
+    Sentry = require("@sentry/node");
+    // [L4] parseFloat returns NaN on malformed input (e.g., "abc", "") → Sentry rejects.
+    // Guard: accept only finite [0, 1] values; fallback 0.1 otherwise.
+    const traceRaw = parseFloat(process.env.SENTRY_SAMPLE_RATE || "0.1");
+    const traceRate = (Number.isFinite(traceRaw) && traceRaw >= 0 && traceRaw <= 1) ? traceRaw : 0.1;
     Sentry.init({
       dsn: process.env.SENTRY_DSN,
       environment: process.env.SENTRY_ENV || "production",
-      tracesSampleRate: parseFloat(process.env.SENTRY_SAMPLE_RATE || "0.1"),
+      tracesSampleRate: traceRate,
     });
-    console.log("[Obs] Sentry initialized (env=" + (process.env.SENTRY_ENV || "production") + ")");
+    console.log("[Obs] Sentry initialized (env=" + (process.env.SENTRY_ENV || "production") + ", traceRate=" + traceRate + ")");
   } catch (err) {
+    Sentry = null;
     console.warn("[Obs] Sentry init skipped — @sentry/node module missing or failed:", err.message);
   }
 }
@@ -31,7 +41,28 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const { randomUUID } = crypto;
 const app = express();
+
+// === [L7] Correlation-ID middleware (flag-gated: CORRELATION_ID_ENABLED=1) ===
+// Accept client-supplied X-Request-ID (strictly validated) or generate via randomUUID().
+// Echo in response header X-Request-ID for cross-service trace correlation.
+// Default disabled — zero effect unless env flag set.
+app.use((req, res, next) => {
+  if (process.env.CORRELATION_ID_ENABLED !== "1") return next();
+  const incoming = (req.headers["x-request-id"] || "").toString();
+  // Strict validation: 8-64 chars, alphanumeric + hyphen/underscore only (defeats injection + log forging).
+  const valid = /^[A-Za-z0-9_-]{8,64}$/.test(incoming) ? incoming : null;
+  const reqId = valid || randomUUID();
+  req.id = reqId;
+  res.setHeader("X-Request-ID", reqId);
+  // Tag Sentry scope (if Sentry loaded) for auto-correlated exception grouping.
+  try {
+    if (Sentry && typeof Sentry.setTag === "function") Sentry.setTag("request_id", reqId);
+  } catch (_) { /* never let tagging crash request */ }
+  console.log("[req " + reqId + "] " + req.method + " " + req.path);
+  next();
+});
 
 // === Modules ===
 const shared = require("./modules/shared");
