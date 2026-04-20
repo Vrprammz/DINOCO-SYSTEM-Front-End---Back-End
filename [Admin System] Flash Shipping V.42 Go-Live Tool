@@ -1,0 +1,1030 @@
+/*
+ * File: [Admin System] Flash Shipping V.42 Go-Live Tool
+ * Template Name: [Admin System] Flash Shipping V.42 Go-Live Tool
+ * Shortcode: [dinoco_flash_v42_golive]
+ * Version: V.1.0 (2026-04-20) — Go-Live Wizard สำหรับ Flash Shipping Metadata V.42
+ * DB_ID: (auto-assigned by WP after sync)
+ * Author: DINOCO Tech Lead
+ *
+ * PURPOSE
+ *   One-stop wizard ให้บอส/admin เปิดใช้ V.42 ง่ายๆ 5 ขั้นตอน — ไม่ต้องรู้ curl/SQL
+ *
+ *   Step 1: Pre-Flight Check      — MySQL version, schema tables, seeds, warehouse mapping
+ *   Step 2: Migrate SKUs          — auto-detect pack_mode + bulk assign default box + coverage widget
+ *   Step 3: Smoke Tests           — run resolver dry-runs, verify output
+ *   Step 4: Flip Flag ON          — 3-step confirm, audit log
+ *   Step 5: Monitor (Post-Flip)   — DLQ count, F2 bumps, auto-rollback state
+ *
+ * ENDPOINTS (namespace: dinoco-flash-golive/v1, all admin-only + nonce)
+ *   GET  /preflight
+ *   GET  /coverage
+ *   POST /auto-detect-all
+ *   POST /bulk-assign-defaults
+ *   POST /smoke-test
+ *   GET  /monitor
+ *   POST /flip-flag          body: {direction: 'on'|'off', reason?}
+ *
+ * AUTH
+ *   - manage_options capability required
+ *   - X-WP-Nonce: wp_rest on all POST
+ *   - Rate limit 30 req/min/user on POST (transient)
+ *
+ * SAFETY
+ *   - Flag flip ON ต้องผ่าน pre-flight pass 100% + coverage >= 95%
+ *   - Flag flip เก็บ audit log ใน wp_dinoco_flash_audit (event_type=golive_flip_*)
+ *   - Rollback ปุ่มเดียว — flip OFF ทันที ไม่ต้อง confirm
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ==================================================================
+// Helper: permission callback
+// ==================================================================
+if ( ! function_exists( 'dinoco_fsv42_perm' ) ) {
+    function dinoco_fsv42_perm( $request ) {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'forbidden', 'admin only', array( 'status' => 403 ) );
+        }
+        // Nonce check for mutating requests
+        $method = $request->get_method();
+        if ( in_array( $method, array( 'POST', 'PUT', 'DELETE' ), true ) ) {
+            $nonce = $request->get_header( 'x_wp_nonce' );
+            if ( ! $nonce || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+                return new WP_Error( 'bad_nonce', 'invalid nonce', array( 'status' => 403 ) );
+            }
+            // Rate limit 30/min/user
+            $uid = get_current_user_id();
+            $tk  = 'fsv42_rl_' . $uid;
+            $ct  = (int) get_transient( $tk );
+            if ( $ct >= 30 ) {
+                return new WP_Error( 'rate_limited', 'too many requests', array( 'status' => 429 ) );
+            }
+            set_transient( $tk, $ct + 1, 60 );
+        }
+        return true;
+    }
+}
+
+// ==================================================================
+// Helper: pre-flight check
+// ==================================================================
+if ( ! function_exists( 'dinoco_fsv42_preflight_check' ) ) {
+    function dinoco_fsv42_preflight_check() {
+        global $wpdb;
+        $checks = array();
+
+        // 1. MySQL version >= 8.0.16 OR MariaDB >= 10.3
+        $version = (string) $wpdb->get_var( 'SELECT VERSION()' );
+        $is_mariadb = ( stripos( $version, 'mariadb' ) !== false );
+        $numeric = preg_replace( '/[^0-9.]/', '', strtok( $version, '-' ) );
+        if ( $is_mariadb ) {
+            $pass_version = version_compare( $numeric, '10.3.0', '>=' );
+        } else {
+            $pass_version = version_compare( $numeric, '8.0.16', '>=' );
+        }
+        $checks[] = array(
+            'id'      => 'mysql_version',
+            'label'   => 'MySQL/MariaDB version',
+            'pass'    => $pass_version,
+            'value'   => $version,
+            'note'    => $pass_version ? 'CHECK constraints รองรับ' : 'PHP validator เป็น primary defense (ok)',
+            'blocker' => false, // not a blocker, just warning
+        );
+
+        // 2. Schema tables exist
+        $required_tables = array(
+            'dinoco_box_templates'        => 'Box Templates',
+            'dinoco_pack_slots'           => 'Pack Slots',
+            'dinoco_warehouse_mapping'    => 'Warehouse Mapping',
+            'dinoco_flash_audit'          => 'Flash Audit',
+            'dinoco_flash_dead_letter'    => 'Flash DLQ',
+        );
+        foreach ( $required_tables as $tbl_suffix => $label ) {
+            $tbl   = $wpdb->prefix . $tbl_suffix;
+            $exist = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $tbl ) ) ) === $tbl;
+            $checks[] = array(
+                'id'      => 'table_' . $tbl_suffix,
+                'label'   => "Table: {$label}",
+                'pass'    => $exist,
+                'value'   => $exist ? 'exists' : 'missing',
+                'note'    => $exist ? '' : 'Schema activation needed — hit any /dinoco-stock/v1 endpoint',
+                'blocker' => true,
+            );
+        }
+
+        // 3. Box templates seeded
+        $tpl_count = $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->prefix}dinoco_box_templates WHERE is_active=1" );
+        $checks[] = array(
+            'id'      => 'box_templates_seed',
+            'label'   => 'Box Templates seeded',
+            'pass'    => (int) $tpl_count >= 5,
+            'value'   => "{$tpl_count} active templates",
+            'note'    => $tpl_count >= 5 ? 'S/M/L/XL/AL37 พร้อม' : 'รอ seed (ต้อง >= 5)',
+            'blocker' => true,
+        );
+
+        // 4. Warehouse mapping seeded
+        $wh_count = $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->prefix}dinoco_warehouse_mapping" );
+        $checks[] = array(
+            'id'      => 'warehouse_mapping',
+            'label'   => 'Warehouse mapping (F4)',
+            'pass'    => (int) $wh_count >= 2,
+            'value'   => "{$wh_count} mappings",
+            'note'    => $wh_count >= 2 ? 'bike + truck mappings พร้อม' : 'ขาด mapping BKN_SP/5BKN_PDC',
+            'blocker' => true,
+        );
+
+        // 5. Shipping defaults option
+        $defaults = get_option( 'dinoco_shipping_defaults', array() );
+        $has_defaults = is_array( $defaults ) && ! empty( $defaults['weight_grams'] );
+        $checks[] = array(
+            'id'      => 'shipping_defaults',
+            'label'   => 'Global shipping defaults',
+            'pass'    => $has_defaults,
+            'value'   => $has_defaults ? 'configured' : 'not set',
+            'note'    => $has_defaults ? "default weight = {$defaults['weight_grams']}g" : 'ตั้ง defaults ก่อน (weight/L/W/H/threshold)',
+            'blocker' => true,
+        );
+
+        // 6. Helper functions loaded (Snippet 15 active)
+        $helper_ok = function_exists( 'dinoco_resolve_pno_shipping' )
+            && function_exists( 'dinoco_smart_detect_pack_mode' )
+            && function_exists( 'dinoco_snapshot_ticket_shipping' );
+        $checks[] = array(
+            'id'      => 'helpers_loaded',
+            'label'   => 'Core helpers (Snippet 15 V.8.0+)',
+            'pass'    => $helper_ok,
+            'value'   => $helper_ok ? 'loaded' : 'missing',
+            'note'    => $helper_ok ? '' : 'Snippet 15 ยังไม่ sync — ตรวจ GitHub sync dashboard',
+            'blocker' => true,
+        );
+
+        // 7. Dispatcher (Snippet 1 V.34.2+)
+        $dispatcher_ok = function_exists( 'b2b_flash_dispatch_create_all' )
+            && function_exists( 'b2b_flash_create_all_boxes_v42' );
+        $checks[] = array(
+            'id'      => 'dispatcher_loaded',
+            'label'   => 'Flash V.42 dispatcher (Snippet 1 V.34.2+)',
+            'pass'    => $dispatcher_ok,
+            'value'   => $dispatcher_ok ? 'loaded' : 'missing',
+            'note'    => $dispatcher_ok ? '' : 'Snippet 1 V.34.2 ยังไม่ sync',
+            'blocker' => true,
+        );
+
+        // 8. Current flag state (info only)
+        $flag = (string) get_option( 'dinoco_shipping_meta_enabled', '0' );
+        $checks[] = array(
+            'id'      => 'flag_state',
+            'label'   => 'Current flag state',
+            'pass'    => true, // info only
+            'value'   => $flag === '1' ? '🟢 ON (V.42 active)' : '⚪ OFF (V.41 legacy)',
+            'note'    => '',
+            'blocker' => false,
+        );
+
+        $total    = count( $checks );
+        $passing  = count( array_filter( $checks, function( $c ) { return $c['pass']; } ) );
+        $blockers = count( array_filter( $checks, function( $c ) { return ! $c['pass'] && $c['blocker']; } ) );
+        $ready    = ( $blockers === 0 );
+
+        return array(
+            'checks'   => $checks,
+            'total'    => $total,
+            'passing'  => $passing,
+            'blockers' => $blockers,
+            'ready'    => $ready,
+        );
+    }
+}
+
+// ==================================================================
+// Helper: coverage calculator
+// ==================================================================
+if ( ! function_exists( 'dinoco_fsv42_coverage' ) ) {
+    function dinoco_fsv42_coverage() {
+        global $wpdb;
+        $products_tbl = $wpdb->prefix . 'dinoco_products';
+
+        // Total active SKUs
+        $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$products_tbl} WHERE is_active=1" );
+
+        // Complete = has pack_mode != 'auto' OR has box_template_id OR has plain dims
+        $complete = (int) $wpdb->get_var( "
+            SELECT COUNT(*) FROM {$products_tbl}
+            WHERE is_active=1 AND (
+                (pack_mode IS NOT NULL AND pack_mode != 'auto')
+                OR box_template_id IS NOT NULL
+                OR (weight_grams > 0 AND length_cm > 0 AND width_cm > 0 AND height_cm > 0)
+            )
+        " );
+
+        $pct = $total > 0 ? round( ( $complete / $total ) * 100, 1 ) : 0;
+
+        // Breakdown by pack_mode
+        $by_mode = $wpdb->get_results( "
+            SELECT pack_mode, COUNT(*) as n
+            FROM {$products_tbl}
+            WHERE is_active=1
+            GROUP BY pack_mode
+        ", ARRAY_A );
+
+        // Sample of incomplete (for fix list)
+        $incomplete = $wpdb->get_results( "
+            SELECT sku, name, pack_mode, box_template_id, weight_grams
+            FROM {$products_tbl}
+            WHERE is_active=1
+              AND (pack_mode IS NULL OR pack_mode = 'auto')
+              AND box_template_id IS NULL
+              AND (weight_grams IS NULL OR weight_grams = 0)
+            ORDER BY sku ASC
+            LIMIT 50
+        ", ARRAY_A );
+
+        return array(
+            'total'      => $total,
+            'complete'   => $complete,
+            'incomplete' => max( 0, $total - $complete ),
+            'pct'        => $pct,
+            'by_mode'    => $by_mode,
+            'incomplete_sample' => $incomplete,
+        );
+    }
+}
+
+// ==================================================================
+// Helper: default box template by weight heuristic
+// ==================================================================
+if ( ! function_exists( 'dinoco_fsv42_suggest_template_by_weight' ) ) {
+    function dinoco_fsv42_suggest_template_by_weight( $weight_g ) {
+        global $wpdb;
+        $weight_g = (int) $weight_g;
+        if ( $weight_g <= 0 ) $weight_g = 1000;
+        // Find smallest active template where max_weight_g >= weight_g
+        $tpl = $wpdb->get_row( $wpdb->prepare( "
+            SELECT id, code, max_weight_g FROM {$wpdb->prefix}dinoco_box_templates
+            WHERE is_active=1 AND max_weight_g >= %d
+            ORDER BY max_weight_g ASC LIMIT 1
+        ", $weight_g ) );
+        return $tpl ? (int) $tpl->id : null;
+    }
+}
+
+// ==================================================================
+// REST Endpoints
+// ==================================================================
+add_action( 'rest_api_init', function() {
+
+    // GET /preflight
+    register_rest_route( 'dinoco-flash-golive/v1', '/preflight', array(
+        'methods'  => 'GET',
+        'callback' => function() {
+            return rest_ensure_response( dinoco_fsv42_preflight_check() );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // GET /coverage
+    register_rest_route( 'dinoco-flash-golive/v1', '/coverage', array(
+        'methods'  => 'GET',
+        'callback' => function() {
+            return rest_ensure_response( dinoco_fsv42_coverage() );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // POST /auto-detect-all
+    register_rest_route( 'dinoco-flash-golive/v1', '/auto-detect-all', array(
+        'methods'  => 'POST',
+        'callback' => function( $req ) {
+            global $wpdb;
+            if ( ! function_exists( 'dinoco_smart_detect_pack_mode' ) ) {
+                return new WP_Error( 'no_helper', 'dinoco_smart_detect_pack_mode missing', array( 'status' => 500 ) );
+            }
+            $dry_run = (bool) $req->get_param( 'dry_run' );
+            $products_tbl = $wpdb->prefix . 'dinoco_products';
+            $rows = $wpdb->get_results( "
+                SELECT sku, pack_mode FROM {$products_tbl}
+                WHERE is_active=1 AND (pack_mode IS NULL OR pack_mode = 'auto')
+            " );
+            $updated = 0;
+            $samples = array();
+            foreach ( $rows as $r ) {
+                $suggested = dinoco_smart_detect_pack_mode( $r->sku );
+                if ( ! $suggested || $suggested === 'auto' ) continue;
+                if ( count( $samples ) < 20 ) {
+                    $samples[] = array( 'sku' => $r->sku, 'was' => $r->pack_mode, 'now' => $suggested );
+                }
+                if ( ! $dry_run ) {
+                    $wpdb->update(
+                        $products_tbl,
+                        array(
+                            'pack_mode'           => $suggested,
+                            'shipping_updated_by' => get_current_user_id(),
+                            'shipping_updated_at' => current_time( 'mysql' ),
+                        ),
+                        array( 'sku' => $r->sku )
+                    );
+                }
+                $updated++;
+            }
+            if ( ! $dry_run && function_exists( 'DINOCO_Catalog::flush_memo' ) ) {
+                DINOCO_Catalog::flush_memo();
+            }
+            return rest_ensure_response( array(
+                'ok'          => true,
+                'dry_run'     => $dry_run,
+                'scanned'     => count( $rows ),
+                'updated'     => $updated,
+                'samples'     => $samples,
+            ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // POST /bulk-assign-defaults
+    register_rest_route( 'dinoco-flash-golive/v1', '/bulk-assign-defaults', array(
+        'methods'  => 'POST',
+        'callback' => function( $req ) {
+            global $wpdb;
+            $dry_run = (bool) $req->get_param( 'dry_run' );
+            $products_tbl = $wpdb->prefix . 'dinoco_products';
+            // Target: SKUs without box_template_id, pack_mode ∈ (single_box/bulk_pack/assembled_set)
+            $rows = $wpdb->get_results( "
+                SELECT sku, pack_mode, weight_per_unit_g FROM {$products_tbl}
+                WHERE is_active=1
+                  AND box_template_id IS NULL
+                  AND pack_mode IN ('single_box', 'bulk_pack', 'assembled_set')
+            " );
+            $updated = 0;
+            $samples = array();
+            foreach ( $rows as $r ) {
+                $weight = (int) ( $r->weight_per_unit_g ?: 1000 );
+                $tpl_id = dinoco_fsv42_suggest_template_by_weight( $weight );
+                if ( ! $tpl_id ) continue;
+                if ( count( $samples ) < 20 ) {
+                    $samples[] = array( 'sku' => $r->sku, 'pack_mode' => $r->pack_mode, 'weight_g' => $weight, 'tpl_id' => $tpl_id );
+                }
+                if ( ! $dry_run ) {
+                    $wpdb->update(
+                        $products_tbl,
+                        array(
+                            'box_template_id'     => $tpl_id,
+                            'shipping_updated_by' => get_current_user_id(),
+                            'shipping_updated_at' => current_time( 'mysql' ),
+                        ),
+                        array( 'sku' => $r->sku )
+                    );
+                }
+                $updated++;
+            }
+            if ( ! $dry_run ) {
+                // invalidate caches
+                wp_cache_flush_group( 'dinoco_shipping' );
+                if ( class_exists( 'DINOCO_Catalog' ) ) DINOCO_Catalog::flush_memo();
+            }
+            return rest_ensure_response( array(
+                'ok'      => true,
+                'dry_run' => $dry_run,
+                'scanned' => count( $rows ),
+                'updated' => $updated,
+                'samples' => $samples,
+            ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // POST /smoke-test — resolver dry-runs
+    register_rest_route( 'dinoco-flash-golive/v1', '/smoke-test', array(
+        'methods'  => 'POST',
+        'callback' => function() {
+            global $wpdb;
+            if ( ! function_exists( 'dinoco_resolve_pno_shipping' ) ) {
+                return new WP_Error( 'no_helper', 'resolver missing', array( 'status' => 500 ) );
+            }
+            // Pick 1 SKU per pack_mode for smoke test
+            $products_tbl = $wpdb->prefix . 'dinoco_products';
+            $modes = array( 'single_box', 'multi_box', 'bulk_pack', 'assembled_set', 'auto', 'unknown' );
+            $results = array();
+            foreach ( $modes as $mode ) {
+                $sku = $wpdb->get_var( $wpdb->prepare( "
+                    SELECT sku FROM {$products_tbl}
+                    WHERE is_active=1 AND pack_mode = %s
+                    LIMIT 1
+                ", $mode ) );
+                if ( ! $sku ) {
+                    $results[] = array( 'mode' => $mode, 'status' => 'skip', 'reason' => 'no SKU with this pack_mode' );
+                    continue;
+                }
+                try {
+                    $out = dinoco_resolve_pno_shipping( array( 'sku' => $sku ), 1 );
+                    $ok = isset( $out['weight_g'] ) && $out['weight_g'] > 0
+                       && isset( $out['length_cm'] ) && $out['length_cm'] > 0
+                       && isset( $out['express_category'] ) && in_array( (int) $out['express_category'], array( 1, 4 ), true );
+                    $results[] = array(
+                        'mode'   => $mode,
+                        'sku'    => $sku,
+                        'status' => $ok ? 'pass' : 'fail',
+                        'output' => $out,
+                    );
+                } catch ( Exception $e ) {
+                    $results[] = array( 'mode' => $mode, 'sku' => $sku, 'status' => 'error', 'error' => $e->getMessage() );
+                }
+            }
+            $passed = count( array_filter( $results, function( $r ) { return $r['status'] === 'pass'; } ) );
+            $failed = count( array_filter( $results, function( $r ) { return $r['status'] === 'fail' || $r['status'] === 'error'; } ) );
+            return rest_ensure_response( array(
+                'ok'      => $failed === 0,
+                'passed'  => $passed,
+                'failed'  => $failed,
+                'skipped' => count( $results ) - $passed - $failed,
+                'results' => $results,
+            ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // GET /monitor
+    register_rest_route( 'dinoco-flash-golive/v1', '/monitor', array(
+        'methods'  => 'GET',
+        'callback' => function() {
+            global $wpdb;
+            $flag = (string) get_option( 'dinoco_shipping_meta_enabled', '0' );
+            // DLQ stats
+            $dlq_tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
+            $dlq_exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $dlq_tbl ) ) ) === $dlq_tbl;
+            $dlq_pending = $dlq_exists ? (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$dlq_tbl} WHERE status='pending'" ) : 0;
+            $dlq_resolved = $dlq_exists ? (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$dlq_tbl} WHERE status='resolved'" ) : 0;
+            $dlq_recent = $dlq_exists ? $wpdb->get_results( "
+                SELECT id, ticket_id, endpoint, last_error_code, retry_count, status, created_at
+                FROM {$dlq_tbl}
+                ORDER BY created_at DESC LIMIT 10
+            ", ARRAY_A ) : array();
+
+            // Audit stats last 24h
+            $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+            $audit_exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $audit_tbl ) ) ) === $audit_tbl;
+            $audit_24h = $audit_exists ? (int) $wpdb->get_var( "
+                SELECT COUNT(*) FROM {$audit_tbl}
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+            " ) : 0;
+            $bumps_24h = $audit_exists ? (int) $wpdb->get_var( "
+                SELECT COUNT(*) FROM {$audit_tbl}
+                WHERE event_type='bump_detected'
+                  AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+            " ) : 0;
+            $audit_recent = $audit_exists ? $wpdb->get_results( "
+                SELECT id, ticket_id, event_type, expected_ec, actual_ec, created_at
+                FROM {$audit_tbl}
+                ORDER BY created_at DESC LIMIT 10
+            ", ARRAY_A ) : array();
+
+            return rest_ensure_response( array(
+                'flag_state'  => $flag === '1' ? 'on' : 'off',
+                'dlq_pending' => $dlq_pending,
+                'dlq_resolved' => $dlq_resolved,
+                'dlq_recent'  => $dlq_recent,
+                'audit_24h'   => $audit_24h,
+                'bumps_24h'   => $bumps_24h,
+                'audit_recent' => $audit_recent,
+            ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // POST /flip-flag
+    register_rest_route( 'dinoco-flash-golive/v1', '/flip-flag', array(
+        'methods'  => 'POST',
+        'callback' => function( $req ) {
+            global $wpdb;
+            $direction = sanitize_text_field( $req->get_param( 'direction' ) );
+            if ( ! in_array( $direction, array( 'on', 'off' ), true ) ) {
+                return new WP_Error( 'bad_direction', 'direction must be on|off', array( 'status' => 400 ) );
+            }
+            $reason = sanitize_text_field( $req->get_param( 'reason' ) ?: '' );
+            $new_val = $direction === 'on' ? '1' : '0';
+            $old_val = (string) get_option( 'dinoco_shipping_meta_enabled', '0' );
+
+            // Safety: flip ON requires preflight pass + coverage >= 95%
+            if ( $direction === 'on' ) {
+                $pre = dinoco_fsv42_preflight_check();
+                if ( ! $pre['ready'] ) {
+                    return new WP_Error( 'preflight_blocked', 'pre-flight has blockers — fix first', array(
+                        'status' => 400,
+                        'blockers' => $pre['blockers'],
+                    ) );
+                }
+                $cov = dinoco_fsv42_coverage();
+                if ( $cov['pct'] < 95.0 ) {
+                    return new WP_Error( 'coverage_low', "coverage {$cov['pct']}% < 95% threshold", array(
+                        'status' => 400,
+                        'coverage' => $cov,
+                    ) );
+                }
+            }
+
+            update_option( 'dinoco_shipping_meta_enabled', $new_val );
+
+            // Audit
+            $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+            if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $audit_tbl ) ) ) === $audit_tbl ) {
+                $wpdb->insert( $audit_tbl, array(
+                    'ticket_id'    => 0,
+                    'event_type'   => 'golive_flip_' . $direction,
+                    'payload_json' => wp_json_encode( array(
+                        'old'     => $old_val,
+                        'new'     => $new_val,
+                        'user_id' => get_current_user_id(),
+                        'reason'  => $reason,
+                        'source'  => 'golive_wizard',
+                    ) ),
+                    'created_at'   => current_time( 'mysql' ),
+                ) );
+            }
+
+            return rest_ensure_response( array(
+                'ok'          => true,
+                'direction'   => $direction,
+                'old'         => $old_val,
+                'new'         => $new_val,
+                'flipped_at'  => current_time( 'mysql' ),
+            ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+} );
+
+// ==================================================================
+// Shortcode: [dinoco_flash_v42_golive]
+// ==================================================================
+if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
+    function dinoco_fsv42_render() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p style="padding:20px;color:#dc2626;">Admin access required</p>';
+        }
+        $nonce = wp_create_nonce( 'wp_rest' );
+        ob_start();
+        ?>
+<style>
+.fsv42-wrap { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1100px; margin: 20px auto; padding: 0 16px; color: #1f2937; }
+.fsv42-wrap h1 { font-size: 28px; margin: 0 0 8px; color: #0f172a; }
+.fsv42-wrap .fsv42-sub { color: #64748b; margin-bottom: 24px; }
+.fsv42-progress { display: flex; gap: 8px; margin: 16px 0 24px; }
+.fsv42-progress .fsv42-step { flex: 1; padding: 10px 12px; background: #f1f5f9; border-radius: 8px; text-align: center; font-size: 13px; color: #64748b; border: 2px solid transparent; }
+.fsv42-progress .fsv42-step.active { background: #e0e7ff; color: #4338ca; border-color: #6366f1; font-weight: 600; }
+.fsv42-progress .fsv42-step.done { background: #dcfce7; color: #166534; border-color: #16a34a; }
+.fsv42-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+.fsv42-card h2 { margin: 0 0 12px; font-size: 18px; color: #0f172a; display: flex; align-items: center; gap: 8px; }
+.fsv42-card .fsv42-badge { font-size: 11px; padding: 3px 8px; border-radius: 6px; font-weight: 600; }
+.fsv42-badge-pass { background: #dcfce7; color: #166534; }
+.fsv42-badge-fail { background: #fee2e2; color: #991b1b; }
+.fsv42-badge-warn { background: #fef3c7; color: #92400e; }
+.fsv42-badge-info { background: #dbeafe; color: #1e40af; }
+.fsv42-btn { padding: 10px 18px; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer; border: 1px solid transparent; transition: all 0.15s; }
+.fsv42-btn-primary { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+.fsv42-btn-primary:hover { background: #4338ca; }
+.fsv42-btn-danger { background: #dc2626; color: #fff; border-color: #dc2626; }
+.fsv42-btn-danger:hover { background: #b91c1c; }
+.fsv42-btn-ghost { background: #f8fafc; color: #475569; border-color: #e2e8f0; }
+.fsv42-btn-ghost:hover { background: #f1f5f9; }
+.fsv42-btn-success { background: #16a34a; color: #fff; border-color: #16a34a; }
+.fsv42-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.fsv42-checklist { list-style: none; padding: 0; margin: 0; }
+.fsv42-checklist li { padding: 10px 12px; border-radius: 8px; margin-bottom: 6px; display: flex; align-items: center; gap: 12px; background: #f8fafc; }
+.fsv42-checklist li.ok { background: #f0fdf4; }
+.fsv42-checklist li.fail { background: #fef2f2; }
+.fsv42-checklist li .fsv42-icon { width: 24px; height: 24px; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; flex-shrink: 0; }
+.fsv42-checklist li.ok .fsv42-icon { background: #16a34a; }
+.fsv42-checklist li.fail .fsv42-icon { background: #dc2626; }
+.fsv42-checklist li.info .fsv42-icon { background: #3b82f6; }
+.fsv42-checklist li .fsv42-info { flex: 1; }
+.fsv42-checklist li .fsv42-info-label { font-weight: 600; color: #0f172a; }
+.fsv42-checklist li .fsv42-info-note { font-size: 12px; color: #64748b; margin-top: 2px; }
+.fsv42-checklist li .fsv42-info-value { font-size: 12px; color: #475569; font-family: ui-monospace, monospace; }
+.fsv42-coverage { display: flex; align-items: center; gap: 16px; margin: 16px 0; }
+.fsv42-coverage-ring { width: 100px; height: 100px; border-radius: 50%; background: conic-gradient(#16a34a var(--pct, 0%), #e2e8f0 0); display: flex; align-items: center; justify-content: center; position: relative; }
+.fsv42-coverage-ring::before { content: ''; width: 75px; height: 75px; background: #fff; border-radius: 50%; position: absolute; }
+.fsv42-coverage-ring span { position: relative; font-size: 22px; font-weight: 700; color: #0f172a; }
+.fsv42-coverage-stats { flex: 1; }
+.fsv42-coverage-stats .fsv42-big { font-size: 24px; font-weight: 700; color: #0f172a; }
+.fsv42-coverage-stats .fsv42-small { color: #64748b; font-size: 13px; }
+.fsv42-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+.fsv42-table th { text-align: left; padding: 8px 12px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; font-weight: 600; color: #475569; }
+.fsv42-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; color: #1f2937; }
+.fsv42-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+.fsv42-alert { padding: 12px 16px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; }
+.fsv42-alert-info { background: #dbeafe; color: #1e40af; border-left: 4px solid #3b82f6; }
+.fsv42-alert-warn { background: #fef3c7; color: #92400e; border-left: 4px solid #f59e0b; }
+.fsv42-alert-danger { background: #fee2e2; color: #991b1b; border-left: 4px solid #dc2626; }
+.fsv42-alert-success { background: #dcfce7; color: #166534; border-left: 4px solid #16a34a; }
+.fsv42-loading { opacity: 0.6; pointer-events: none; }
+.fsv42-flag-state { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 20px; font-weight: 600; font-size: 14px; }
+.fsv42-flag-on { background: #dcfce7; color: #166534; }
+.fsv42-flag-off { background: #f1f5f9; color: #64748b; }
+.fsv42-stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0; }
+.fsv42-stat-box { background: #f8fafc; padding: 14px; border-radius: 8px; text-align: center; }
+.fsv42-stat-box .fsv42-stat-val { font-size: 24px; font-weight: 700; color: #0f172a; }
+.fsv42-stat-box .fsv42-stat-lbl { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+.fsv42-confirm-box { background: #fff7ed; border: 2px solid #f97316; border-radius: 12px; padding: 20px; margin: 16px 0; }
+.fsv42-confirm-box h3 { margin: 0 0 10px; color: #9a3412; }
+.fsv42-confirm-box p { margin: 6px 0; color: #7c2d12; }
+.fsv42-confirm-box input { width: 100%; padding: 10px 12px; border: 1px solid #fed7aa; border-radius: 6px; font-size: 14px; margin: 8px 0; }
+@media (max-width: 640px) {
+    .fsv42-progress { flex-wrap: wrap; }
+    .fsv42-progress .fsv42-step { flex: 1 1 45%; font-size: 11px; padding: 8px; }
+    .fsv42-coverage { flex-direction: column; align-items: flex-start; }
+}
+</style>
+
+<div class="fsv42-wrap" data-nonce="<?php echo esc_attr( $nonce ); ?>">
+    <h1>🚚 Flash Shipping V.42 Go-Live Wizard</h1>
+    <p class="fsv42-sub">ปรับระบบส่ง Flash ให้ส่งน้ำหนัก/ขนาดต่อกล่องถูกต้อง + auto vehicle routing (bike/truck)</p>
+
+    <div class="fsv42-progress" id="fsv42-progress">
+        <div class="fsv42-step" data-step="1">1. Pre-Flight</div>
+        <div class="fsv42-step" data-step="2">2. Migrate SKUs</div>
+        <div class="fsv42-step" data-step="3">3. Smoke Test</div>
+        <div class="fsv42-step" data-step="4">4. Flip Flag</div>
+        <div class="fsv42-step" data-step="5">5. Monitor</div>
+    </div>
+
+    <!-- Step 1: Pre-Flight -->
+    <div class="fsv42-card" id="fsv42-card-preflight">
+        <h2>Step 1: Pre-Flight Check <span class="fsv42-badge fsv42-badge-info" id="fsv42-pf-badge">pending</span></h2>
+        <p style="color:#64748b;margin:0 0 12px;">ตรวจว่าระบบพร้อมเปิด V.42 หรือยัง (schema, seeds, helpers)</p>
+        <ul class="fsv42-checklist" id="fsv42-pf-list">
+            <li class="info"><div class="fsv42-icon">…</div><div class="fsv42-info"><div class="fsv42-info-label">กำลังโหลด...</div></div></li>
+        </ul>
+        <div class="fsv42-actions">
+            <button class="fsv42-btn fsv42-btn-primary" onclick="FSV42.runPreflight()">🔄 ตรวจใหม่</button>
+        </div>
+    </div>
+
+    <!-- Step 2: Migrate SKUs -->
+    <div class="fsv42-card" id="fsv42-card-migrate">
+        <h2>Step 2: Migrate SKUs <span class="fsv42-badge fsv42-badge-info" id="fsv42-mg-badge">ยังไม่เริ่ม</span></h2>
+        <p style="color:#64748b;margin:0 0 12px;">ใส่ข้อมูลจัดส่งให้ SKU ทุกชิ้น (pack_mode + box template)</p>
+        <div class="fsv42-coverage">
+            <div class="fsv42-coverage-ring" id="fsv42-cov-ring" style="--pct:0%"><span id="fsv42-cov-pct">0%</span></div>
+            <div class="fsv42-coverage-stats">
+                <div class="fsv42-big"><span id="fsv42-cov-complete">0</span> / <span id="fsv42-cov-total">0</span> SKUs complete</div>
+                <div class="fsv42-small" id="fsv42-cov-incomplete">ยังต้องกรอกอีก N ชิ้น</div>
+                <div class="fsv42-small" id="fsv42-cov-bymode" style="margin-top:6px;font-family:ui-monospace,monospace;"></div>
+            </div>
+        </div>
+        <div class="fsv42-actions">
+            <button class="fsv42-btn fsv42-btn-primary" onclick="FSV42.autoDetect(true)">🔍 Dry-run auto-detect</button>
+            <button class="fsv42-btn fsv42-btn-success" onclick="FSV42.autoDetect(false)">⚡ Apply auto-detect</button>
+            <button class="fsv42-btn fsv42-btn-primary" onclick="FSV42.bulkAssign(true)">🔍 Dry-run bulk-assign box</button>
+            <button class="fsv42-btn fsv42-btn-success" onclick="FSV42.bulkAssign(false)">📦 Apply bulk-assign</button>
+            <button class="fsv42-btn fsv42-btn-ghost" onclick="FSV42.refreshCoverage()">🔄 Refresh</button>
+        </div>
+        <div id="fsv42-mg-result" style="margin-top:12px;"></div>
+        <details style="margin-top:12px;">
+            <summary style="cursor:pointer;color:#4f46e5;font-weight:600;">📝 SKU ที่ยังขาดข้อมูล (click to expand)</summary>
+            <div id="fsv42-mg-incomplete-list" style="margin-top:10px;"></div>
+        </details>
+    </div>
+
+    <!-- Step 3: Smoke Test -->
+    <div class="fsv42-card" id="fsv42-card-smoke">
+        <h2>Step 3: Smoke Test <span class="fsv42-badge fsv42-badge-info" id="fsv42-st-badge">ยังไม่รัน</span></h2>
+        <p style="color:#64748b;margin:0 0 12px;">รัน resolver test 1 SKU ต่อ pack_mode ดูว่า output ถูกไหม</p>
+        <div class="fsv42-actions">
+            <button class="fsv42-btn fsv42-btn-primary" onclick="FSV42.runSmoke()">🧪 รัน Smoke Test</button>
+        </div>
+        <div id="fsv42-st-result" style="margin-top:12px;"></div>
+    </div>
+
+    <!-- Step 4: Flip Flag -->
+    <div class="fsv42-card" id="fsv42-card-flip">
+        <h2>Step 4: Flip Flag <span class="fsv42-flag-state" id="fsv42-flag-current">loading...</span></h2>
+        <p style="color:#64748b;margin:0 0 12px;">เปิด/ปิด V.42 — ต้องผ่าน pre-flight + coverage ≥ 95% ก่อนเปิด ON</p>
+        <div id="fsv42-flip-ui"></div>
+    </div>
+
+    <!-- Step 5: Monitor -->
+    <div class="fsv42-card" id="fsv42-card-monitor">
+        <h2>Step 5: Monitor <span class="fsv42-badge fsv42-badge-info">live</span></h2>
+        <p style="color:#64748b;margin:0 0 12px;">สถานะ V.42 หลังเปิด ON — เช็ค DLQ + Flash bumps + audit trail</p>
+        <div class="fsv42-stats-grid" id="fsv42-mon-stats">
+            <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-mon-dlq">–</div><div class="fsv42-stat-lbl">DLQ Pending</div></div>
+            <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-mon-bumps">–</div><div class="fsv42-stat-lbl">Bumps 24h</div></div>
+            <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-mon-audit">–</div><div class="fsv42-stat-lbl">Audit 24h</div></div>
+            <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-mon-resolved">–</div><div class="fsv42-stat-lbl">DLQ Resolved</div></div>
+        </div>
+        <div class="fsv42-actions">
+            <button class="fsv42-btn fsv42-btn-ghost" onclick="FSV42.refreshMonitor()">🔄 Refresh</button>
+            <button class="fsv42-btn fsv42-btn-danger" onclick="FSV42.emergencyOff()">🚨 EMERGENCY ROLLBACK</button>
+        </div>
+        <details style="margin-top:12px;">
+            <summary style="cursor:pointer;color:#4f46e5;font-weight:600;">📋 Recent audit events</summary>
+            <div id="fsv42-mon-audit-list" style="margin-top:10px;"></div>
+        </details>
+        <details style="margin-top:8px;">
+            <summary style="cursor:pointer;color:#4f46e5;font-weight:600;">⚠️ Recent DLQ entries</summary>
+            <div id="fsv42-mon-dlq-list" style="margin-top:10px;"></div>
+        </details>
+    </div>
+</div>
+
+<script>
+(function(){
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const nonce = document.querySelector('.fsv42-wrap').dataset.nonce;
+    const base = '/wp-json/dinoco-flash-golive/v1';
+
+    async function api(path, method='GET', body=null) {
+        const opts = { method, headers: { 'X-WP-Nonce': nonce, 'Content-Type': 'application/json' }, credentials: 'same-origin' };
+        if (body) opts.body = JSON.stringify(body);
+        const r = await fetch(base + path, opts);
+        const txt = await r.text();
+        let data; try { data = JSON.parse(txt); } catch(e) { throw new Error('bad json: ' + txt.slice(0, 200)); }
+        if (!r.ok) throw new Error(data.message || data.code || ('HTTP ' + r.status));
+        return data;
+    }
+
+    function markStep(n, state) {
+        document.querySelectorAll('.fsv42-progress .fsv42-step').forEach(el => {
+            const s = parseInt(el.dataset.step);
+            el.classList.remove('active', 'done');
+            if (s < n || (s === n && state === 'done')) el.classList.add('done');
+            else if (s === n) el.classList.add('active');
+        });
+    }
+
+    window.FSV42 = {
+        async runPreflight() {
+            markStep(1, 'active');
+            const ul = document.getElementById('fsv42-pf-list');
+            const badge = document.getElementById('fsv42-pf-badge');
+            ul.innerHTML = '<li class="info"><div class="fsv42-icon">…</div><div class="fsv42-info"><div class="fsv42-info-label">กำลังตรวจ...</div></div></li>';
+            try {
+                const r = await api('/preflight');
+                ul.innerHTML = '';
+                r.checks.forEach(c => {
+                    const li = document.createElement('li');
+                    li.className = c.pass ? 'ok' : (c.blocker ? 'fail' : 'info');
+                    const icon = document.createElement('div'); icon.className = 'fsv42-icon';
+                    icon.textContent = c.pass ? '✓' : (c.blocker ? '✗' : 'i');
+                    const info = document.createElement('div'); info.className = 'fsv42-info';
+                    const lbl = document.createElement('div'); lbl.className = 'fsv42-info-label'; lbl.textContent = c.label;
+                    const val = document.createElement('div'); val.className = 'fsv42-info-value'; val.textContent = c.value;
+                    info.appendChild(lbl); info.appendChild(val);
+                    if (c.note) { const note = document.createElement('div'); note.className = 'fsv42-info-note'; note.textContent = c.note; info.appendChild(note); }
+                    li.appendChild(icon); li.appendChild(info);
+                    ul.appendChild(li);
+                });
+                badge.className = 'fsv42-badge ' + (r.ready ? 'fsv42-badge-pass' : 'fsv42-badge-fail');
+                badge.textContent = r.ready ? `${r.passing}/${r.total} pass` : `${r.blockers} blocker${r.blockers > 1 ? 's' : ''}`;
+                if (r.ready) markStep(1, 'done');
+            } catch (e) {
+                ul.innerHTML = '';
+                const li = document.createElement('li'); li.className = 'fail';
+                const icon = document.createElement('div'); icon.className = 'fsv42-icon'; icon.textContent = '!';
+                const info = document.createElement('div'); info.className = 'fsv42-info';
+                const lbl = document.createElement('div'); lbl.className = 'fsv42-info-label'; lbl.textContent = 'Error';
+                const note = document.createElement('div'); note.className = 'fsv42-info-note'; note.textContent = e.message;
+                info.appendChild(lbl); info.appendChild(note);
+                li.appendChild(icon); li.appendChild(info);
+                ul.appendChild(li);
+            }
+        },
+
+        async refreshCoverage() {
+            try {
+                const r = await api('/coverage');
+                document.getElementById('fsv42-cov-pct').textContent = r.pct + '%';
+                document.getElementById('fsv42-cov-ring').style.setProperty('--pct', r.pct + '%');
+                document.getElementById('fsv42-cov-complete').textContent = r.complete;
+                document.getElementById('fsv42-cov-total').textContent = r.total;
+                document.getElementById('fsv42-cov-incomplete').textContent = r.incomplete > 0 ? `ยังต้องกรอกอีก ${r.incomplete} ชิ้น` : '🎉 ครบแล้ว';
+                const modes = (r.by_mode || []).map(m => `${m.pack_mode || 'null'}: ${m.n}`).join(' · ');
+                document.getElementById('fsv42-cov-bymode').textContent = modes;
+                const badge = document.getElementById('fsv42-mg-badge');
+                badge.className = 'fsv42-badge ' + (r.pct >= 95 ? 'fsv42-badge-pass' : (r.pct >= 50 ? 'fsv42-badge-warn' : 'fsv42-badge-fail'));
+                badge.textContent = r.pct + '% coverage';
+                if (r.pct >= 95) markStep(2, 'done');
+
+                const list = document.getElementById('fsv42-mg-incomplete-list');
+                list.innerHTML = '';
+                if (!r.incomplete_sample || !r.incomplete_sample.length) {
+                    list.innerHTML = '<p style="color:#16a34a;">🎉 ครบทุก SKU</p>';
+                } else {
+                    const tbl = document.createElement('table'); tbl.className = 'fsv42-table';
+                    tbl.innerHTML = '<thead><tr><th>SKU</th><th>Name</th><th>pack_mode</th></tr></thead>';
+                    const tb = document.createElement('tbody');
+                    r.incomplete_sample.forEach(row => {
+                        const tr = document.createElement('tr');
+                        ['sku', 'name', 'pack_mode'].forEach(k => {
+                            const td = document.createElement('td'); td.textContent = row[k] || '-'; tr.appendChild(td);
+                        });
+                        tb.appendChild(tr);
+                    });
+                    tbl.appendChild(tb); list.appendChild(tbl);
+                }
+            } catch (e) { alert('Coverage load failed: ' + e.message); }
+        },
+
+        async autoDetect(dry) {
+            markStep(2, 'active');
+            const result = document.getElementById('fsv42-mg-result');
+            result.innerHTML = '<div class="fsv42-alert fsv42-alert-info">⏳ กำลัง ' + (dry ? 'dry-run' : 'apply') + '...</div>';
+            try {
+                const r = await api('/auto-detect-all', 'POST', { dry_run: dry });
+                const msg = dry ?
+                    `Dry-run: ${r.updated} / ${r.scanned} SKUs จะถูก update (ยังไม่บันทึก)` :
+                    `✅ อัปเดตแล้ว ${r.updated} / ${r.scanned} SKUs`;
+                const samples = (r.samples || []).map(s => `${esc(s.sku)}: ${esc(s.was || 'null')} → <strong>${esc(s.now)}</strong>`).join('<br>');
+                result.innerHTML = '<div class="fsv42-alert fsv42-alert-success">' + esc(msg) +
+                    (samples ? '<div style="margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;">' + samples + '</div>' : '') + '</div>';
+                if (!dry) await FSV42.refreshCoverage();
+            } catch (e) {
+                result.innerHTML = '<div class="fsv42-alert fsv42-alert-danger">Error: ' + esc(e.message) + '</div>';
+            }
+        },
+
+        async bulkAssign(dry) {
+            markStep(2, 'active');
+            const result = document.getElementById('fsv42-mg-result');
+            result.innerHTML = '<div class="fsv42-alert fsv42-alert-info">⏳ กำลัง ' + (dry ? 'dry-run' : 'apply') + ' bulk-assign...</div>';
+            try {
+                const r = await api('/bulk-assign-defaults', 'POST', { dry_run: dry });
+                const msg = dry ?
+                    `Dry-run: ${r.updated} / ${r.scanned} SKUs จะได้ box template` :
+                    `✅ Assign box template แล้ว ${r.updated} / ${r.scanned} SKUs`;
+                const samples = (r.samples || []).map(s => `${esc(s.sku)} (${esc(s.pack_mode)}, ${s.weight_g}g) → tpl#${s.tpl_id}`).join('<br>');
+                result.innerHTML = '<div class="fsv42-alert fsv42-alert-success">' + esc(msg) +
+                    (samples ? '<div style="margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;">' + samples + '</div>' : '') + '</div>';
+                if (!dry) await FSV42.refreshCoverage();
+            } catch (e) {
+                result.innerHTML = '<div class="fsv42-alert fsv42-alert-danger">Error: ' + esc(e.message) + '</div>';
+            }
+        },
+
+        async runSmoke() {
+            markStep(3, 'active');
+            const result = document.getElementById('fsv42-st-result');
+            const badge = document.getElementById('fsv42-st-badge');
+            result.innerHTML = '<div class="fsv42-alert fsv42-alert-info">⏳ กำลังรัน resolver...</div>';
+            try {
+                const r = await api('/smoke-test', 'POST');
+                badge.className = 'fsv42-badge ' + (r.ok ? 'fsv42-badge-pass' : 'fsv42-badge-fail');
+                badge.textContent = `${r.passed} pass / ${r.failed} fail / ${r.skipped} skip`;
+                const tbl = document.createElement('table'); tbl.className = 'fsv42-table';
+                tbl.innerHTML = '<thead><tr><th>pack_mode</th><th>SKU</th><th>Status</th><th>Output</th></tr></thead>';
+                const tb = document.createElement('tbody');
+                r.results.forEach(x => {
+                    const tr = document.createElement('tr');
+                    const td1 = document.createElement('td'); td1.textContent = x.mode; tr.appendChild(td1);
+                    const td2 = document.createElement('td'); td2.textContent = x.sku || '—'; tr.appendChild(td2);
+                    const td3 = document.createElement('td');
+                    const span = document.createElement('span');
+                    span.className = 'fsv42-badge ' + (x.status === 'pass' ? 'fsv42-badge-pass' : (x.status === 'skip' ? 'fsv42-badge-info' : 'fsv42-badge-fail'));
+                    span.textContent = x.status;
+                    td3.appendChild(span); tr.appendChild(td3);
+                    const td4 = document.createElement('td');
+                    td4.style.fontFamily = 'ui-monospace, monospace'; td4.style.fontSize = '11px';
+                    td4.textContent = x.output ? `${x.output.weight_g}g / ${x.output.length_cm}×${x.output.width_cm}×${x.output.height_cm} / ec=${x.output.express_category}` : (x.error || x.reason || '');
+                    tr.appendChild(td4);
+                    tb.appendChild(tr);
+                });
+                tbl.appendChild(tb);
+                result.innerHTML = '';
+                result.appendChild(tbl);
+                if (r.ok) markStep(3, 'done');
+            } catch (e) {
+                result.innerHTML = '<div class="fsv42-alert fsv42-alert-danger">Error: ' + esc(e.message) + '</div>';
+                badge.className = 'fsv42-badge fsv42-badge-fail'; badge.textContent = 'error';
+            }
+        },
+
+        async refreshFlip() {
+            try {
+                const r = await api('/monitor');
+                const el = document.getElementById('fsv42-flag-current');
+                el.className = 'fsv42-flag-state ' + (r.flag_state === 'on' ? 'fsv42-flag-on' : 'fsv42-flag-off');
+                el.textContent = r.flag_state === 'on' ? '🟢 ON (V.42 active)' : '⚪ OFF (V.41 legacy)';
+                const ui = document.getElementById('fsv42-flip-ui');
+                if (r.flag_state === 'on') {
+                    ui.innerHTML = '<div class="fsv42-alert fsv42-alert-success">V.42 ทำงานอยู่ — ไปดู Monitor ด้านล่าง</div>' +
+                        '<div class="fsv42-actions"><button class="fsv42-btn fsv42-btn-danger" onclick="FSV42.flipOff()">⏪ Flip OFF (rollback)</button></div>';
+                    markStep(5, 'active');
+                } else {
+                    ui.innerHTML = `<div class="fsv42-confirm-box">
+                        <h3>⚠️ เปิด V.42 (irreversible without rollback)</h3>
+                        <p>ก่อนกดเปิด ตรวจว่า:</p>
+                        <ul style="margin:8px 0 12px 20px;color:#7c2d12;">
+                            <li>Step 1 Pre-flight ผ่านทั้งหมด (✓ ไม่มี blocker)</li>
+                            <li>Step 2 Coverage ≥ 95%</li>
+                            <li>Step 3 Smoke test pass</li>
+                            <li>บอส approve แล้ว</li>
+                        </ul>
+                        <p><strong>พิมพ์ "FLIP ON" เพื่อยืนยัน:</strong></p>
+                        <input type="text" id="fsv42-flip-confirm" placeholder="FLIP ON" />
+                        <p style="font-size:12px;">เหตุผล (optional):</p>
+                        <input type="text" id="fsv42-flip-reason" placeholder="เช่น ลงมือ migrate ครบแล้ว" />
+                        <div class="fsv42-actions" style="margin-top:10px;">
+                            <button class="fsv42-btn fsv42-btn-success" onclick="FSV42.flipOn()">🚀 FLIP ON</button>
+                        </div>
+                    </div>`;
+                }
+            } catch (e) { console.error(e); }
+        },
+
+        async flipOn() {
+            const confirm = document.getElementById('fsv42-flip-confirm').value.trim();
+            const reason = document.getElementById('fsv42-flip-reason').value.trim();
+            if (confirm !== 'FLIP ON') { alert('พิมพ์ "FLIP ON" ให้ถูก'); return; }
+            try {
+                const r = await api('/flip-flag', 'POST', { direction: 'on', reason });
+                alert('✅ Flag flipped ON: ' + r.flipped_at);
+                await FSV42.refreshFlip();
+                await FSV42.refreshMonitor();
+                markStep(4, 'done');
+            } catch (e) {
+                alert('❌ Flip failed: ' + e.message);
+            }
+        },
+
+        async flipOff() {
+            if (!confirm('Rollback V.42 → V.41 legacy?')) return;
+            const reason = prompt('เหตุผล (optional):') || 'admin manual rollback';
+            try {
+                const r = await api('/flip-flag', 'POST', { direction: 'off', reason });
+                alert('⏪ Flag flipped OFF: ' + r.flipped_at);
+                await FSV42.refreshFlip();
+            } catch (e) {
+                alert('❌ Rollback failed: ' + e.message);
+            }
+        },
+
+        async emergencyOff() {
+            if (!confirm('🚨 EMERGENCY ROLLBACK — หยุด V.42 ทันที?\nกด OK = ปิด flag + log audit')) return;
+            try {
+                const r = await api('/flip-flag', 'POST', { direction: 'off', reason: 'EMERGENCY_ROLLBACK_FROM_MONITOR' });
+                alert('🚨 Rolled back: ' + r.flipped_at);
+                await FSV42.refreshFlip();
+                await FSV42.refreshMonitor();
+            } catch (e) { alert('Failed: ' + e.message); }
+        },
+
+        async refreshMonitor() {
+            try {
+                const r = await api('/monitor');
+                document.getElementById('fsv42-mon-dlq').textContent = r.dlq_pending;
+                document.getElementById('fsv42-mon-bumps').textContent = r.bumps_24h;
+                document.getElementById('fsv42-mon-audit').textContent = r.audit_24h;
+                document.getElementById('fsv42-mon-resolved').textContent = r.dlq_resolved;
+
+                const auditList = document.getElementById('fsv42-mon-audit-list');
+                auditList.innerHTML = '';
+                if (!r.audit_recent || !r.audit_recent.length) { auditList.innerHTML = '<p style="color:#64748b;">ไม่มี audit events</p>'; }
+                else {
+                    const tbl = document.createElement('table'); tbl.className = 'fsv42-table';
+                    tbl.innerHTML = '<thead><tr><th>Time</th><th>Event</th><th>Ticket</th><th>EC exp→act</th></tr></thead>';
+                    const tb = document.createElement('tbody');
+                    r.audit_recent.forEach(x => {
+                        const tr = document.createElement('tr');
+                        [x.created_at, x.event_type, x.ticket_id, (x.expected_ec && x.actual_ec ? `${x.expected_ec}→${x.actual_ec}` : '-')].forEach(v => {
+                            const td = document.createElement('td'); td.textContent = v; tr.appendChild(td);
+                        });
+                        tb.appendChild(tr);
+                    });
+                    tbl.appendChild(tb); auditList.appendChild(tbl);
+                }
+
+                const dlqList = document.getElementById('fsv42-mon-dlq-list');
+                dlqList.innerHTML = '';
+                if (!r.dlq_recent || !r.dlq_recent.length) { dlqList.innerHTML = '<p style="color:#16a34a;">✅ DLQ ว่าง</p>'; }
+                else {
+                    const tbl = document.createElement('table'); tbl.className = 'fsv42-table';
+                    tbl.innerHTML = '<thead><tr><th>Time</th><th>Ticket</th><th>Endpoint</th><th>Error</th><th>Retry</th><th>Status</th></tr></thead>';
+                    const tb = document.createElement('tbody');
+                    r.dlq_recent.forEach(x => {
+                        const tr = document.createElement('tr');
+                        [x.created_at, x.ticket_id, x.endpoint, x.last_error_code, x.retry_count, x.status].forEach(v => {
+                            const td = document.createElement('td'); td.textContent = v; tr.appendChild(td);
+                        });
+                        tb.appendChild(tr);
+                    });
+                    tbl.appendChild(tb); dlqList.appendChild(tbl);
+                }
+            } catch (e) { console.error(e); }
+        },
+    };
+
+    // Auto-load on mount
+    document.addEventListener('DOMContentLoaded', async () => {
+        await FSV42.runPreflight();
+        await FSV42.refreshCoverage();
+        await FSV42.refreshFlip();
+        await FSV42.refreshMonitor();
+    });
+})();
+</script>
+        <?php
+        return ob_get_clean();
+    }
+    add_shortcode( 'dinoco_flash_v42_golive', 'dinoco_fsv42_render' );
+}
