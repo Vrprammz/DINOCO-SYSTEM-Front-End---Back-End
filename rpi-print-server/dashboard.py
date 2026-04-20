@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.42.0
+DINOCO B2B -- RPi Print Server Dashboard  V.43.0
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
+
+V.43.0: Flash Shipping V.42 Phase 4.5 — manual_ship.html V.43 support:
+    - 3 NEW proxy routes for shipping metadata scanner integration:
+      * /api/box-templates — list box templates (cached 1hr in tmp/)
+      * /api/sku-shipping-scanner/<sku> — warehouse_staff stripped endpoint
+      * /api/sku-shipping/<sku> — admin full (includes slots + catalog)
+    - Native _auto_fill_from_sku(sku) helper — scanner → fetch → return
+      {weight_g, length_cm, width_cm, height_cm, express_category,
+       article_category, pack_mode, box_template_id}
+    - Cache via tmp/ (systemd ReadWritePaths whitelist — see CLAUDE.md)
+    - Timing-safe HMAC bearer reuse (V.42.1 pattern b89d2c8)
 
 V.42.0 [S10]: require_auth added on /api/ticket-lookup + /api/pno-lookup —
     prevents LAN/VPN enumeration of customer orders. Auth via X-Print-Key
@@ -891,12 +902,197 @@ def api_manual_reprint_label():
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# V.43.0 — FLASH SHIPPING V.42 PHASE 4.5 (RPi proxy routes for scanner)
+# ═════════════════════════════════════════════════════════════════════════
+# systemd sandbox compliance: cache writes go to tmp/ (ReadWritePaths whitelist)
+
+# In-memory cache for box templates (short-lived) + file cache (1hr TTL)
+_v43_box_tpl_cache = {'ts': 0, 'data': None}
+_v43_tpl_cache_file = os.path.join(BASE_DIR, 'tmp', 'box-templates.json')
+
+
+def _ensure_tmp_dir():
+    """Ensure tmp/ exists (systemd ReadWritePaths whitelist)."""
+    tmp_dir = os.path.join(BASE_DIR, 'tmp')
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+    except OSError:
+        pass  # best-effort — readable-only envs fall through to /tmp
+    return tmp_dir
+
+
+def _fetch_box_templates_from_wp():
+    """Fetch box templates from WP, cache 1hr in tmp/ + in-memory.
+
+    Returns list of templates or empty list on failure.
+    Falls back to stale cache if WP unreachable.
+    """
+    config = load_config()
+    ttl_sec = int(config.get('cache_ttl_templates_sec', 3600))
+    now_ts = time.time()
+
+    # In-memory cache hit
+    if _v43_box_tpl_cache['data'] is not None and (now_ts - _v43_box_tpl_cache['ts']) < ttl_sec:
+        return _v43_box_tpl_cache['data']
+
+    # File cache hit (survives restart)
+    if os.path.exists(_v43_tpl_cache_file):
+        try:
+            age = now_ts - os.path.getmtime(_v43_tpl_cache_file)
+            if age < ttl_sec:
+                with open(_v43_tpl_cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                _v43_box_tpl_cache['ts'] = now_ts
+                _v43_box_tpl_cache['data'] = data
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass  # fall through to WP fetch
+
+    # Fetch from WP
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/dinoco-stock/v1/box-templates'
+        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=10)
+        body = resp.json() if resp.ok else {}
+        tpls = body.get('templates', []) if isinstance(body, dict) else []
+        # Persist cache
+        _ensure_tmp_dir()
+        try:
+            with open(_v43_tpl_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(tpls, f, ensure_ascii=False)
+        except OSError:
+            pass  # cache persistence is best-effort
+        _v43_box_tpl_cache['ts'] = now_ts
+        _v43_box_tpl_cache['data'] = tpls
+        return tpls
+    except Exception as e:
+        logger.warning(f'[V.43] box templates fetch failed: {e}')
+        # Return stale cache if available
+        return _v43_box_tpl_cache['data'] or []
+
+
+@app.route('/api/box-templates')
+@require_auth
+def api_box_templates():
+    """Proxy GET /dinoco-stock/v1/box-templates with tmp/ file cache 1hr.
+
+    Returns {templates: [...]} compatible with WP response shape.
+    Falls back to stale cache on WP failure (logged).
+    """
+    tpls = _fetch_box_templates_from_wp()
+    return jsonify({'ok': True, 'templates': tpls, 'cached': _v43_box_tpl_cache['ts'] > 0})
+
+
+@app.route('/api/sku-shipping-scanner/<sku>')
+@require_auth
+def api_sku_shipping_scanner(sku):
+    """Proxy GET /dinoco-stock/v1/sku-shipping-scanner/{sku}.
+
+    Stripped response for warehouse_staff role — no pricing/WAC.
+    Called by manual_ship.html V.43 on SKU scan.
+    """
+    config = load_config()
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/dinoco-stock/v1/sku-shipping-scanner/{sku}'
+        # Note: scanner endpoint uses scan_shipping cap but our RPi uses X-Print-Key
+        # so WP accepts via scanner_perm's current_user_can('manage_options') fallback
+        # when X-Print-Key matches admin nonce flow. See Snippet Inventory V.44.0 scanner_perm.
+        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        logger.warning(f'[V.43] sku-shipping-scanner fetch failed for {sku}: {e}')
+        return jsonify({'ok': False, 'error': str(e)}), 502
+
+
+@app.route('/api/sku-shipping/<sku>')
+@require_auth
+def api_sku_shipping_full(sku):
+    """Proxy GET /dinoco-stock/v1/sku-shipping/{sku} — admin full response.
+
+    Includes catalog + slots + auto-suggest. Used by manual-ship admin/dealer.
+    """
+    config = load_config()
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/dinoco-stock/v1/sku-shipping/{sku}'
+        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        logger.warning(f'[V.43] sku-shipping fetch failed for {sku}: {e}')
+        return jsonify({'ok': False, 'error': str(e)}), 502
+
+
+def _auto_fill_from_sku(sku):
+    """Native helper — used by manual_ship form auto-fill on scan.
+
+    Returns: {weight_g, length_cm, width_cm, height_cm, express_category,
+             article_category, pack_mode, box_template_id, found: bool}
+    """
+    if not sku:
+        return {'found': False}
+    config = load_config()
+    sku = str(sku).strip().upper()
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/dinoco-stock/v1/sku-shipping-scanner/{sku}'
+        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
+        if not resp.ok:
+            return {'found': False, 'http_status': resp.status_code}
+        body = resp.json() or {}
+        if not body.get('ok'):
+            return {'found': False, 'reason': body.get('reason', 'not_in_catalog')}
+        ship = body.get('shipping', {})
+        return {
+            'found': True,
+            'sku': sku,
+            'name': body.get('name', ''),
+            'weight_g': ship.get('weight_g'),
+            'length_cm': ship.get('length_cm'),
+            'width_cm': ship.get('width_cm'),
+            'height_cm': ship.get('height_cm'),
+            'express_category': ship.get('express_category', 1),
+            'article_category': ship.get('article_category', 6),
+            'pack_mode': body.get('pack_mode', 'auto'),
+            'packaging_source': body.get('packaging_source', 'unknown'),
+            'box_template_id': body.get('box_template_id'),
+            'source': ship.get('source', ''),
+        }
+    except Exception as e:
+        logger.warning(f'[V.43] _auto_fill_from_sku error for {sku}: {e}')
+        return {'found': False, 'error': str(e)}
+
+
+@app.route('/api/sku-auto-fill/<sku>')
+@require_auth
+def api_sku_auto_fill(sku):
+    """Scanner-friendly auto-fill endpoint — wraps _auto_fill_from_sku.
+
+    UI calls this on scan; gets compact response for form population.
+    """
+    result = _auto_fill_from_sku(sku)
+    return jsonify(result), (200 if result.get('found') else 404)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# END V.43.0 — Flash Shipping V.42 Phase 4.5
+# ═════════════════════════════════════════════════════════════════════════
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DINOCO Print Dashboard')
     parser.add_argument('--port', type=int, default=5555)
     parser.add_argument('--host', default='0.0.0.0')
     args = parser.parse_args()
 
-    print(f'DINOCO Print Dashboard: http://0.0.0.0:{args.port}')
+    # V.43.0: ensure tmp/ cache dir exists
+    _ensure_tmp_dir()
+
+    print(f'DINOCO Print Dashboard V.43.0: http://0.0.0.0:{args.port}')
     print(f'Manual Shipping: http://0.0.0.0:{args.port}/manual-ship')
     app.run(host=args.host, port=args.port, debug=False)
