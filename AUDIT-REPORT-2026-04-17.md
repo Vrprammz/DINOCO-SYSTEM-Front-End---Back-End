@@ -50,12 +50,21 @@
   - **LIFF pilot foundation** (4 commits `7357c08..8a58152`): Vite build artifact live at `dist/liff/b2b-catalog.*.js` (3.53KB gzip 1.64KB) + CSS 0.74KB. `liff-src/b2b/catalog/{tokens,base}.css` + `liff-src/shared/{liff-init,api-client,liff-auth,cart}.js`. NEW snippet `[System] DINOCO LIFF Asset Loader` V.1.0 — manifest-based `dinoco_liff_enqueue($entry_name)` helper (scaffold). Parallel rendering — inline rendering in Snippet 4 INTACT.
   - **Runbooks** (1 commit `3e2634a`): `docs/runbooks/SENTRY-ACTIVATION.md` (145 lines, step-by-step activation) + `docs/compliance/PDPA-BASICS.md` (140 lines skeleton). Complement Phase 5 V.1.0 scaffolds.
 - **SESSION COMPLETE 2026-04-17 21:00** — **62+ commits total**, 6 phases, 14 parallel agent dispatches, 1 local phpunit run (33 tests pass), zero production breaks.
-- **Phase 7 FUTURE** (deferred sprints):
+- **Phase 4 B2F Migration EXECUTED 2026-04-18** (production activation):
+  - Dry-run: processed 121, preserved 112, errors 0 (28ms) — MariaDB 10.6.20 CHECK constraints enforced
+  - Live run: processed 121, preserved 112, errors 0 (60.9ms)
+  - Final distribution: `confirmed set_assembled`=24, `confirmed sub_unit`=18, `confirmed single`=70, `auto_synced set_assembled`=4, `auto_synced cross_factory_assembly`=5 — **all 121 rows have `production_mode` non-NULL**
+  - Earlier Live run 2026-04-17 11:21 migrated 116 rows; Coverage Rule auto-sync added 5 more rows before 2026-04-18 re-run which classified the remaining 9 unconfirmed
+  - V.7.0 feature flags already ON: `b2f_flag_v11_explicit_mode` + `b2f_flag_order_intent` (2/2)
+  - Badge in Audit Dashboard: ✓ migrated 121 (was ✓ migrated 116)
+- **2026-04-20 — 72h MONITORING WINDOW CLOSED** — BO production live for 72h+ post-flip, zero regressions reported. System production-ready.
+- **Phase 7 FUTURE** (deferred sprints — all optional, no urgency):
   - LIFF bundle migration — actual Snippet 4 inline `<script>` → entry.js + `dinoco_liff_enqueue('b2b-catalog')` + iOS/Android test (pilot)
   - GDPR full implementation + admin review UI + legal review
   - Sentry activation + team onboarding (composer require + npm install + flag flip)
-  - B2F Phase 4 CPT retirement (2-4 weeks staged observation)
+  - Admin confirm remaining 9 `auto_synced` B2F junction rows (optional — system works fine as-is)
   - `wp_postmeta` compound index (destructive DB ALTER — staging test first)
+  - RPi restart (S10 deploy — close last attack surface on lookup endpoints)
 
 ---
 
