@@ -1,6 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.0 — Flash Shipping V.42 Phase 3.5:            ║
+ * ║    • 7 NEW Flex builders for Admin group:                     ║
+ * ║      flash_truck_pickup_called / flash_pickup_upgraded /      ║
+ * ║      flash_bulky_order_created / flash_subparcel_partial_fail ║
+ * ║      / flash_shipping_data_missing / flash_category_bumped /  ║
+ * ║      flash_dlq_alert                                          ║
+ * ║    • b2b_push_admin_flex_dedup() primitive — dedup via 1hr    ║
+ * ║      transient + 20/hr global rate cap (coalesce digest)      ║
+ * ║    • b2b_flex_mask_address() S18 — first3+last3+province      ║
+ * ║    • b2b_tg_escape() S26 — Telegram Markdown escape           ║
+ * ║    • 6 NEW REST endpoints under /b2b/v1/:                     ║
+ * ║      POST /flash-override-vehicle (BLK-5 post-pickup 409)     ║
+ * ║      POST /flash-cancel-pickup                                ║
+ * ║      GET  /flash-audit?ticket_id={id}  (F2 trail)             ║
+ * ║      GET  /flash-dlq                                          ║
+ * ║      POST /flash-dlq/{id}/retry                               ║
+ * ║      POST /flash-dlq/{id}/abandon                             ║
+ * ║    • All Flex builders use b2b_esc() for S14 XSS defense      ║
  * ║  Version: V.33.8 — API-H3: Flash webhook nonceStr dedup via transient (replay defense) ║
  * ║  Version: V.33.7 — b2b_rate_limit() atomic (GET_LOCK) — security C2 fix ║
  * ║  Version: V.33.6 — Phase 0 Hotfix polish: use b2b_get_product_data() helper + static cache caveat note ║
@@ -5141,3 +5159,660 @@ if ( ! function_exists( 'b2b_build_flex_partial_cancel' ) ) {
     }
 }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V.34.0 — FLASH SHIPPING METADATA V.42 PHASE 3.5
+// ──────────────────────────────────────────────────────────────────────────────
+// 7 Flex builders + dedup push primitive + address masking + 6 REST endpoints
+// Parent spec: FEATURE-SPEC-FLASH-SHIPPING-META-2026-04-17.md
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * S18 Address masking for Flex display (admin-facing).
+ * Mask phone/address to prevent insider leak — show first 3 + last 3 + province only.
+ */
+if ( ! function_exists( 'b2b_flex_mask_phone' ) ) {
+    function b2b_flex_mask_phone( $phone ) {
+        $p = preg_replace( '/[^0-9]/', '', (string) $phone );
+        if ( strlen( $p ) < 7 ) return $phone;
+        return substr( $p, 0, 3 ) . '-XXX-' . substr( $p, -3 );
+    }
+}
+if ( ! function_exists( 'b2b_flex_mask_address' ) ) {
+    function b2b_flex_mask_address( $address, $province = '' ) {
+        $addr = trim( (string) $address );
+        if ( $addr === '' ) return '—';
+        $first = mb_substr( $addr, 0, 10, 'UTF-8' );
+        $suffix = $province ? ' · จ.' . $province : '';
+        return $first . '...' . $suffix;
+    }
+}
+
+/**
+ * S26 Telegram Markdown V2 escape — escape special chars for safe rendering.
+ */
+if ( ! function_exists( 'b2b_tg_escape' ) ) {
+    function b2b_tg_escape( $str ) {
+        $special = array( '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!' );
+        foreach ( $special as $ch ) {
+            $str = str_replace( $ch, '\\' . $ch, (string) $str );
+        }
+        return $str;
+    }
+}
+
+/**
+ * b2b_push_admin_flex_dedup($key, $ttl, $flex)
+ * ────────────────────────────────────────────────────────────────
+ * Push Flex to admin group with deduplication + global 20/hr rate cap.
+ * - Dedup: same $key within $ttl seconds → silent skip (prevents spam loops)
+ * - Rate cap: global 20 Flex/hour across all keys → beyond → coalesce to digest
+ *
+ * Usage:
+ *   b2b_push_admin_flex_dedup(
+ *       'flash_dlq_' . $ticket_id,
+ *       HOUR_IN_SECONDS,
+ *       b2b_build_flex_flash_dlq_alert( $ticket_id, $err_code )
+ *   );
+ */
+if ( ! function_exists( 'b2b_push_admin_flex_dedup' ) ) {
+    function b2b_push_admin_flex_dedup( $key, $ttl, $flex, $alt_text = '' ) {
+        if ( ! defined( 'B2B_ADMIN_GROUP_ID' ) ) return false;
+
+        $dedup_key = 'b2b_flex_dedup_' . md5( $key );
+        if ( get_transient( $dedup_key ) ) {
+            // Already pushed within TTL window — skip
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[FlexDedup] skip key={$key}" );
+            return 'deduped';
+        }
+
+        // Global rate cap: 20 pushes/hour
+        $rate_key = 'b2b_flex_admin_rate';
+        $count = (int) get_transient( $rate_key );
+        if ( $count >= 20 ) {
+            // Coalesce: increment overflow counter, push digest only once per hour
+            $overflow_key = 'b2b_flex_admin_overflow';
+            $overflow = (int) get_transient( $overflow_key );
+            set_transient( $overflow_key, $overflow + 1, HOUR_IN_SECONDS );
+
+            // Push digest only if not already sent this hour
+            $digest_sent = get_transient( 'b2b_flex_admin_digest_sent' );
+            if ( ! $digest_sent ) {
+                set_transient( 'b2b_flex_admin_digest_sent', 1, HOUR_IN_SECONDS );
+                $digest = "📊 [Rate cap reached] Flex alerts suppressed — " . ( $overflow + 1 ) . " additional alerts this hour. เช็ค Admin Dashboard → Flash Shipping → DLQ / Audit";
+                if ( function_exists( 'b2b_push_to_admin' ) ) b2b_push_to_admin( $digest );
+            }
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[FlexDedup] rate-capped key={$key} (overflow=" . ( $overflow + 1 ) . ")" );
+            return 'rate_capped';
+        }
+
+        // Push Flex to admin
+        set_transient( $dedup_key, 1, $ttl );
+        set_transient( $rate_key, $count + 1, HOUR_IN_SECONDS );
+
+        if ( is_array( $flex ) && function_exists( 'b2b_line_push_flex' ) ) {
+            return b2b_line_push_flex( B2B_ADMIN_GROUP_ID, $alt_text ?: ( $flex['altText'] ?? 'Admin Alert' ), $flex );
+        } elseif ( is_array( $flex ) && function_exists( 'b2b_line_push' ) ) {
+            // Fallback: serialize to text if no flex push helper
+            $text = $alt_text ?: ( $flex['altText'] ?? 'Admin Alert' );
+            return b2b_line_push( B2B_ADMIN_GROUP_ID, $text );
+        } elseif ( is_string( $flex ) && function_exists( 'b2b_push_to_admin' ) ) {
+            return b2b_push_to_admin( $flex );
+        }
+        return false;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 7 FLEX BUILDERS (V.34.0) — Admin Group Flash Shipping Alerts
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * P0-18 — Truck Pickup Called Flex (admin notification when 5BKN_PDC pickup fires)
+ */
+if ( ! function_exists( 'b2b_build_flex_flash_truck_pickup_called' ) ) {
+    function b2b_build_flex_flash_truck_pickup_called( $ticket_id, $pno_count, $total_weight_g ) {
+        $color = defined( 'B2B_FLEX_COLOR_HEADER_ADMIN' ) ? B2B_FLEX_COLOR_HEADER_ADMIN : '#1e3a5f';
+        $body = array(
+            array( 'type' => 'text', 'text' => '🚚 เรียกคูเรียรถกระบะแล้ว', 'weight' => 'bold', 'size' => 'md', 'color' => '#b45309', 'wrap' => true ),
+            array( 'type' => 'separator', 'margin' => 'md' ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Ticket:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => '#' . b2b_esc( $ticket_id ), 'size' => 'sm', 'weight' => 'bold', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'PNO:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => b2b_esc( $pno_count ) . ' กล่อง', 'size' => 'sm', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'น้ำหนัก:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => number_format( (int) $total_weight_g ) . 'g (' . number_format( $total_weight_g / 1000, 2 ) . 'kg)', 'size' => 'sm', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Warehouse:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => '5BKN_PDC-บางเขน', 'size' => 'sm', 'flex' => 5, 'weight' => 'bold', 'color' => '#b45309' ),
+            ) ),
+        );
+        $bubble = array( 'type' => 'bubble',
+            'header' => b2b_flex_header( '🚚 Truck Pickup', 'Flash เรียกคูเรียรถใหญ่', $color ),
+            'body'   => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+        );
+        return array( 'type' => 'flex', 'altText' => '🚚 #' . $ticket_id . ' Truck pickup called', 'contents' => $bubble );
+    }
+}
+
+/**
+ * P0-19 — Pickup Upgraded (bike→truck same-day, Flash Q11 allows multi-pickup)
+ */
+if ( ! function_exists( 'b2b_build_flex_flash_pickup_upgraded' ) ) {
+    function b2b_build_flex_flash_pickup_upgraded( $ticket_id, $bike_tid, $truck_tid ) {
+        $color = defined( 'B2B_FLEX_COLOR_HEADER_ADMIN' ) ? B2B_FLEX_COLOR_HEADER_ADMIN : '#1e3a5f';
+        $body = array(
+            array( 'type' => 'text', 'text' => '⬆️ เรียก truck เพิ่มสำหรับของใหญ่', 'weight' => 'bold', 'size' => 'md', 'color' => '#b45309', 'wrap' => true ),
+            array( 'type' => 'text', 'text' => 'รอบ bike เดิมยังเดินต่อได้ ไม่ต้องยกเลิก (Flash Q11)', 'size' => 'xs', 'color' => '#64748b', 'margin' => 'sm', 'wrap' => true ),
+            array( 'type' => 'separator', 'margin' => 'md' ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Trigger ticket:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 3 ),
+                array( 'type' => 'text', 'text' => '#' . b2b_esc( $ticket_id ), 'size' => 'sm', 'weight' => 'bold', 'flex' => 4 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => '🏍️ Bike pickup:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 3 ),
+                array( 'type' => 'text', 'text' => $bike_tid ? b2b_esc( $bike_tid ) : '—', 'size' => 'sm', 'flex' => 4 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => '🚚 Truck pickup:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 3 ),
+                array( 'type' => 'text', 'text' => $truck_tid ? b2b_esc( $truck_tid ) : '—', 'size' => 'sm', 'flex' => 4, 'weight' => 'bold', 'color' => '#b45309' ),
+            ) ),
+        );
+        $bubble = array( 'type' => 'bubble',
+            'header' => b2b_flex_header( '⬆️ Pickup Upgrade', 'Bike active + Truck added', $color ),
+            'body'   => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+        );
+        return array( 'type' => 'flex', 'altText' => '⬆️ #' . $ticket_id . ' Pickup upgraded to include truck', 'contents' => $bubble );
+    }
+}
+
+/**
+ * P0-20 — Bulky Order Created (new order auto-classified truck, admin awareness)
+ */
+if ( ! function_exists( 'b2b_build_flex_flash_bulky_order_created' ) ) {
+    function b2b_build_flex_flash_bulky_order_created( $ticket_id, $dist_name, $weight_g, $dims, $reason = 'auto' ) {
+        $color = defined( 'B2B_FLEX_COLOR_HEADER_ADMIN' ) ? B2B_FLEX_COLOR_HEADER_ADMIN : '#1e3a5f';
+        $dim_text = sprintf( '%d×%d×%d cm', (int) ( $dims['length_cm'] ?? 0 ), (int) ( $dims['width_cm'] ?? 0 ), (int) ( $dims['height_cm'] ?? 0 ) );
+        $reason_label = ( $reason === 'override' ) ? 'admin override' : 'auto (threshold เกิน)';
+        $body = array(
+            array( 'type' => 'text', 'text' => '📦 Order ของใหญ่ (truck)', 'weight' => 'bold', 'size' => 'md', 'color' => '#b45309', 'wrap' => true ),
+            array( 'type' => 'separator', 'margin' => 'md' ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Ticket:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => '#' . b2b_esc( $ticket_id ) . ' — ' . b2b_esc( $dist_name ), 'size' => 'sm', 'weight' => 'bold', 'flex' => 5, 'wrap' => true ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'น้ำหนัก:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => number_format( (int) $weight_g ) . 'g', 'size' => 'sm', 'flex' => 5, 'weight' => 'bold' ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Dims:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => $dim_text, 'size' => 'sm', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Reason:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => $reason_label, 'size' => 'sm', 'flex' => 5, 'color' => '#6d28d9' ),
+            ) ),
+        );
+        $bubble = array( 'type' => 'bubble',
+            'header' => b2b_flex_header( '📦 Bulky Order', 'expressCategory=4 truck', $color ),
+            'body'   => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+        );
+        return array( 'type' => 'flex', 'altText' => '📦 #' . $ticket_id . ' Bulky order (truck) created', 'contents' => $bubble );
+    }
+}
+
+/**
+ * P0-17 / D-7 — Sub-parcel Partial Fail (multi-box subParcel create had partial failure)
+ */
+if ( ! function_exists( 'b2b_build_flex_flash_subparcel_partial_fail' ) ) {
+    function b2b_build_flex_flash_subparcel_partial_fail( $ticket_id, $total_sub, $failed_sub, $errors = array() ) {
+        $color = '#991b1b';
+        $err_preview = array_slice( (array) $errors, 0, 3 );
+        $err_text = empty( $err_preview ) ? 'ไม่มีรายละเอียด' : implode( '; ', array_map( function( $e ) { return b2b_esc( $e ); }, $err_preview ) );
+        $body = array(
+            array( 'type' => 'text', 'text' => '⚠️ Sub-parcel สร้างไม่ครบ', 'weight' => 'bold', 'size' => 'md', 'color' => '#991b1b', 'wrap' => true ),
+            array( 'type' => 'separator', 'margin' => 'md' ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Ticket:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => '#' . b2b_esc( $ticket_id ), 'size' => 'sm', 'weight' => 'bold', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'สำเร็จ/ทั้งหมด:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => ( $total_sub - $failed_sub ) . '/' . $total_sub, 'size' => 'sm', 'weight' => 'bold', 'color' => '#991b1b', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'vertical', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Errors:', 'size' => 'xs', 'color' => '#64748b' ),
+                array( 'type' => 'text', 'text' => $err_text, 'size' => 'xs', 'color' => '#991b1b', 'wrap' => true, 'margin' => 'xs' ),
+            ) ),
+        );
+        $bubble = array( 'type' => 'bubble',
+            'header' => b2b_flex_header( '⚠️ SubParcel Partial', 'Flash API ล้มเหลวบางกล่อง', $color ),
+            'body'   => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+        );
+        return array( 'type' => 'flex', 'altText' => '⚠️ #' . $ticket_id . ' sub-parcel partial fail ' . $failed_sub . '/' . $total_sub, 'contents' => $bubble );
+    }
+}
+
+/**
+ * NEW — Shipping Data Missing (order contains SKU with no shipping metadata)
+ */
+if ( ! function_exists( 'b2b_build_flex_flash_shipping_data_missing' ) ) {
+    function b2b_build_flex_flash_shipping_data_missing( $ticket_id, $missing_skus = array() ) {
+        $color = '#78350f';
+        $skus_preview = array_slice( (array) $missing_skus, 0, 5 );
+        $skus_text = empty( $skus_preview ) ? '—' : implode( ', ', array_map( function( $s ) { return b2b_esc( $s ); }, $skus_preview ) );
+        if ( count( $missing_skus ) > 5 ) $skus_text .= ' ...+' . ( count( $missing_skus ) - 5 ) . ' อื่น';
+        $body = array(
+            array( 'type' => 'text', 'text' => '📋 SKU ไม่มีข้อมูล shipping', 'weight' => 'bold', 'size' => 'md', 'color' => '#78350f', 'wrap' => true ),
+            array( 'type' => 'text', 'text' => 'ระบบใช้ default fallback — กรุณาไป Admin Dashboard → Flash Shipping → SKU Manager ใส่ dims', 'size' => 'xs', 'color' => '#78350f', 'margin' => 'sm', 'wrap' => true ),
+            array( 'type' => 'separator', 'margin' => 'md' ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Ticket:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => '#' . b2b_esc( $ticket_id ), 'size' => 'sm', 'weight' => 'bold', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'vertical', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'SKU ที่ขาด:', 'size' => 'xs', 'color' => '#64748b' ),
+                array( 'type' => 'text', 'text' => $skus_text, 'size' => 'sm', 'wrap' => true, 'margin' => 'xs' ),
+            ) ),
+        );
+        $bubble = array( 'type' => 'bubble',
+            'header' => b2b_flex_header( '📋 Missing Data', 'Flash fallback to defaults', $color ),
+            'body'   => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+        );
+        return array( 'type' => 'flex', 'altText' => '📋 #' . $ticket_id . ' missing shipping data for ' . count( $missing_skus ) . ' SKUs', 'contents' => $bubble );
+    }
+}
+
+/**
+ * F2 — Category Bumped (Flash auto-upgraded bike→truck at pickup, detected via verify cron)
+ */
+if ( ! function_exists( 'b2b_build_flex_flash_category_bumped' ) ) {
+    function b2b_build_flex_flash_category_bumped( $ticket_id, $expected_ec, $actual_ec, $weight_g = 0 ) {
+        $color = '#b45309';
+        $body = array(
+            array( 'type' => 'text', 'text' => '📈 Flash upgrade category เอง', 'weight' => 'bold', 'size' => 'md', 'color' => '#b45309', 'wrap' => true ),
+            array( 'type' => 'text', 'text' => 'Flash ตรวจพบว่าของใหญ่กว่าที่เราส่ง → bump เป็น truck. บิลอาจแพงขึ้น', 'size' => 'xs', 'color' => '#78350f', 'margin' => 'sm', 'wrap' => true ),
+            array( 'type' => 'separator', 'margin' => 'md' ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Ticket:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => '#' . b2b_esc( $ticket_id ), 'size' => 'sm', 'weight' => 'bold', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'ส่งไป:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => 'EC=' . (int) $expected_ec . ( $expected_ec === 1 ? ' (🏍️ bike)' : ' (🚚 truck)' ), 'size' => 'sm', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'จริง:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => 'EC=' . (int) $actual_ec . ( $actual_ec === 4 ? ' (🚚 truck bumped)' : ' (' . $actual_ec . ')' ), 'size' => 'sm', 'flex' => 5, 'weight' => 'bold', 'color' => '#b45309' ),
+            ) ),
+        );
+        if ( $weight_g > 0 ) {
+            $body[] = array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'น้ำหนัก:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => number_format( (int) $weight_g ) . 'g', 'size' => 'sm', 'flex' => 5 ),
+            ) );
+        }
+        $bubble = array( 'type' => 'bubble',
+            'header' => b2b_flex_header( '📈 Category Bumped', 'Flash auto-upgrade at pickup', $color ),
+            'body'   => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+        );
+        return array( 'type' => 'flex', 'altText' => '📈 #' . $ticket_id . ' Flash bumped EC ' . $expected_ec . '→' . $actual_ec, 'contents' => $bubble );
+    }
+}
+
+/**
+ * F7 — DLQ Alert (Flash create exhausted retries, manual intervention needed)
+ */
+if ( ! function_exists( 'b2b_build_flex_flash_dlq_alert' ) ) {
+    function b2b_build_flex_flash_dlq_alert( $ticket_id, $endpoint, $error_code, $error_message, $retry_count, $dlq_id = 0 ) {
+        $color = '#991b1b';
+        $body = array(
+            array( 'type' => 'text', 'text' => '💀 Flash create fail → DLQ', 'weight' => 'bold', 'size' => 'md', 'color' => '#991b1b', 'wrap' => true ),
+            array( 'type' => 'text', 'text' => 'Retry ครบ ' . (int) $retry_count . ' ครั้งแล้วไม่สำเร็จ — ต้อง admin intervene', 'size' => 'xs', 'color' => '#7f1d1d', 'margin' => 'sm', 'wrap' => true ),
+            array( 'type' => 'separator', 'margin' => 'md' ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Ticket:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => '#' . b2b_esc( $ticket_id ), 'size' => 'sm', 'weight' => 'bold', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Endpoint:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => b2b_esc( $endpoint ), 'size' => 'xs', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'baseline', 'margin' => 'sm', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Error code:', 'size' => 'sm', 'color' => '#64748b', 'flex' => 2 ),
+                array( 'type' => 'text', 'text' => b2b_esc( $error_code ) ?: '—', 'size' => 'sm', 'weight' => 'bold', 'color' => '#991b1b', 'flex' => 5 ),
+            ) ),
+            array( 'type' => 'box', 'layout' => 'vertical', 'margin' => 'md', 'contents' => array(
+                array( 'type' => 'text', 'text' => 'Message:', 'size' => 'xs', 'color' => '#64748b' ),
+                array( 'type' => 'text', 'text' => b2b_esc( $error_message ?: '—' ), 'size' => 'xs', 'wrap' => true, 'margin' => 'xs', 'color' => '#991b1b' ),
+            ) ),
+        );
+        $footer_contents = array();
+        if ( $dlq_id > 0 && defined( 'B2B_LIFF_ID' ) && function_exists( 'b2b_liff_url' ) ) {
+            $dlq_url = b2b_liff_url( 'b2b-dashboard/', array( 'tab' => 'shipping', 'sub' => 'dlq', 'focus' => (string) $dlq_id ) );
+            $footer_contents[] = array( 'type' => 'button', 'style' => 'primary', 'height' => 'sm', 'color' => '#991b1b',
+                'action' => array( 'type' => 'uri', 'label' => '🔧 เปิด DLQ #' . $dlq_id, 'uri' => $dlq_url ) );
+        }
+        $bubble = array( 'type' => 'bubble',
+            'header' => b2b_flex_header( '💀 DLQ Alert', 'Flash create abandoned', $color ),
+            'body'   => array( 'type' => 'box', 'layout' => 'vertical', 'paddingAll' => '16px', 'spacing' => 'sm', 'contents' => $body ),
+        );
+        if ( ! empty( $footer_contents ) ) {
+            $bubble['footer'] = array( 'type' => 'box', 'layout' => 'vertical', 'spacing' => 'sm', 'paddingAll' => '12px', 'contents' => $footer_contents );
+        }
+        return array( 'type' => 'flex', 'altText' => '💀 #' . $ticket_id . ' Flash DLQ ' . $error_code, 'contents' => $bubble );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// V.34.0 REST ENDPOINTS — Flash Override / Cancel / Audit / DLQ
+// ──────────────────────────────────────────────────────────────
+
+add_action( 'rest_api_init', function() {
+
+    // Shared permission callback — admin only + X-WP-Nonce
+    $admin_perm = function( WP_REST_Request $req ) {
+        $nonce = $req->get_header( 'X-WP-Nonce' );
+        if ( ! $nonce || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) return false;
+        return current_user_can( 'manage_options' );
+    };
+
+    // ═════════════════════════════════════════════════════════════
+    // POST /b2b/v1/flash-override-vehicle
+    // Admin overrides expressCategory on ticket before/after create
+    // BLK-5: post-pickup-called → return 409 (require cancel+recreate)
+    // ═════════════════════════════════════════════════════════════
+    register_rest_route( 'b2b/v1', '/flash-override-vehicle', array(
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            $ticket_id = absint( $req->get_param( 'ticket_id' ) );
+            $new_ec    = absint( $req->get_param( 'express_category' ) );
+            $reason    = sanitize_text_field( $req->get_param( 'reason' ) ) ?: 'admin override';
+
+            if ( ! $ticket_id ) return new WP_Error( 'bad_input', 'ticket_id required', array( 'status' => 400 ) );
+            if ( ! in_array( $new_ec, array( 1, 4 ), true ) ) return new WP_Error( 'bad_input', 'express_category must be 1 or 4', array( 'status' => 400 ) );
+
+            $post = get_post( $ticket_id );
+            if ( ! $post ) return new WP_Error( 'not_found', 'ticket not found', array( 'status' => 404 ) );
+
+            // BLK-5: if pickup already called → reject (Flash Q5 allows multi-pickup but override
+            // on already-called pickup is undefined; admin must cancel + recreate)
+            $pickup_called = get_post_meta( $ticket_id, '_flash_pickup_called_at', true );
+            if ( $pickup_called ) {
+                return new WP_Error( 'pickup_already_called',
+                    'Pickup ถูกเรียกแล้ว — ต้อง cancel pickup ก่อน แล้ว recreate ด้วย EC ใหม่ (Flash Q5)',
+                    array( 'status' => 409, 'pickup_called_at' => $pickup_called )
+                );
+            }
+
+            // Update meta + audit log
+            $old_ec = (int) get_post_meta( $ticket_id, '_flash_express_category', true );
+            update_post_meta( $ticket_id, '_flash_express_category', $new_ec );
+            update_post_meta( $ticket_id, '_flash_ec_override_by', get_current_user_id() );
+            update_post_meta( $ticket_id, '_flash_ec_override_at', current_time( 'mysql' ) );
+            update_post_meta( $ticket_id, '_flash_ec_override_reason', $reason );
+
+            // Insert audit row
+            global $wpdb;
+            $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+            if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
+                $wpdb->insert( $audit_tbl, array(
+                    'ticket_id'        => $ticket_id,
+                    'event_type'       => 'ec_override',
+                    'expected_ec'      => $old_ec,
+                    'actual_ec'        => $new_ec,
+                    'request_summary'  => wp_json_encode( array( 'reason' => $reason ) ),
+                    'response_summary' => '',
+                    'user_id'          => get_current_user_id(),
+                    'created_at'       => current_time( 'mysql' ),
+                ) );
+            }
+
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[FlashOverride] ticket={$ticket_id} EC {$old_ec}→{$new_ec} reason={$reason}" );
+
+            return rest_ensure_response( array(
+                'ok' => true,
+                'ticket_id' => $ticket_id,
+                'express_category' => $new_ec,
+                'previous' => $old_ec,
+            ) );
+        },
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ═════════════════════════════════════════════════════════════
+    // POST /b2b/v1/flash-cancel-pickup
+    // Admin cancels scheduled pickup (Flash notify request)
+    // ═════════════════════════════════════════════════════════════
+    register_rest_route( 'b2b/v1', '/flash-cancel-pickup', array(
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            $pickup_tid = sanitize_text_field( $req->get_param( 'pickup_tid' ) );
+            $warehouse_no = sanitize_text_field( $req->get_param( 'warehouse_no' ) );
+            $reason    = sanitize_text_field( $req->get_param( 'reason' ) ) ?: 'admin cancel';
+
+            if ( ! $pickup_tid && ! $warehouse_no ) {
+                return new WP_Error( 'bad_input', 'pickup_tid หรือ warehouse_no อย่างน้อย 1 ตัว', array( 'status' => 400 ) );
+            }
+
+            // Clear active_pickup transient (both keys — bike + truck)
+            if ( $warehouse_no ) {
+                $key = 'b2b_flash_pickup_' . md5( $warehouse_no );
+                delete_transient( $key );
+            }
+
+            // Try Flash API cancel endpoint (if exists in b2b_flash_request)
+            $result = array( 'cancelled_local' => true );
+            if ( function_exists( 'b2b_flash_request' ) && $pickup_tid ) {
+                // Flash API: POST /open/v1/notify/cancel (hypothetical — actual endpoint per Flash docs)
+                $resp = @b2b_flash_request( 'open/v1/notify/cancel', array( 'tid' => $pickup_tid ) );
+                $result['flash_response'] = $resp;
+            }
+
+            // Audit log
+            global $wpdb;
+            $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+            if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
+                $wpdb->insert( $audit_tbl, array(
+                    'ticket_id'        => 0,
+                    'event_type'       => 'pickup_cancel',
+                    'request_summary'  => wp_json_encode( array( 'pickup_tid' => $pickup_tid, 'warehouse_no' => $warehouse_no, 'reason' => $reason ) ),
+                    'response_summary' => wp_json_encode( $result ),
+                    'user_id'          => get_current_user_id(),
+                    'created_at'       => current_time( 'mysql' ),
+                ) );
+            }
+
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[FlashCancelPickup] pickup_tid={$pickup_tid} wh={$warehouse_no} reason={$reason}" );
+
+            return rest_ensure_response( array_merge( array( 'ok' => true ), $result ) );
+        },
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ═════════════════════════════════════════════════════════════
+    // GET /b2b/v1/flash-audit?ticket_id={id}
+    // Admin view Flash audit trail for a ticket
+    // ═════════════════════════════════════════════════════════════
+    register_rest_route( 'b2b/v1', '/flash-audit', array(
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $req ) {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_flash_audit';
+            if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$tbl}'" ) ) {
+                return rest_ensure_response( array( 'ok' => true, 'items' => array(), 'note' => 'audit table not yet created (run Snippet 15 V.8.0)' ) );
+            }
+            $ticket_id = absint( $req->get_param( 'ticket_id' ) );
+            $limit = min( 100, max( 10, absint( $req->get_param( 'limit' ) ) ?: 50 ) );
+
+            if ( $ticket_id ) {
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT * FROM {$tbl} WHERE ticket_id = %d ORDER BY created_at DESC LIMIT %d",
+                    $ticket_id, $limit
+                ), ARRAY_A );
+            } else {
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT * FROM {$tbl} ORDER BY created_at DESC LIMIT %d",
+                    $limit
+                ), ARRAY_A );
+            }
+            return rest_ensure_response( array( 'ok' => true, 'items' => $rows ?: array(), 'total' => count( $rows ?: array() ) ) );
+        },
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ═════════════════════════════════════════════════════════════
+    // GET /b2b/v1/flash-dlq — list pending DLQ entries (F7)
+    // ═════════════════════════════════════════════════════════════
+    register_rest_route( 'b2b/v1', '/flash-dlq', array(
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $req ) {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
+            if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$tbl}'" ) ) {
+                return rest_ensure_response( array( 'ok' => true, 'items' => array(), 'note' => 'DLQ table not yet created' ) );
+            }
+            $status = sanitize_text_field( $req->get_param( 'status' ) ) ?: 'pending';
+            $limit = min( 100, max( 10, absint( $req->get_param( 'limit' ) ) ?: 50 ) );
+
+            if ( in_array( $status, array( 'pending', 'resolved', 'abandoned' ), true ) ) {
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT * FROM {$tbl} WHERE status = %s ORDER BY created_at DESC LIMIT %d",
+                    $status, $limit
+                ), ARRAY_A );
+            } else {
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT * FROM {$tbl} ORDER BY created_at DESC LIMIT %d", $limit
+                ), ARRAY_A );
+            }
+            $counts = $wpdb->get_results( "SELECT status, COUNT(*) as cnt FROM {$tbl} GROUP BY status", ARRAY_A );
+            $summary = array();
+            foreach ( (array) $counts as $c ) $summary[ $c['status'] ] = (int) $c['cnt'];
+            return rest_ensure_response( array(
+                'ok' => true,
+                'items' => $rows ?: array(),
+                'total' => count( $rows ?: array() ),
+                'summary' => $summary,
+            ) );
+        },
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ═════════════════════════════════════════════════════════════
+    // POST /b2b/v1/flash-dlq/{id}/retry — manual retry
+    // ═════════════════════════════════════════════════════════════
+    register_rest_route( 'b2b/v1', '/flash-dlq/(?P<id>\d+)/retry', array(
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
+            $id = absint( $req['id'] );
+            $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
+            if ( ! $row ) return new WP_Error( 'not_found', 'DLQ entry not found', array( 'status' => 404 ) );
+            if ( $row['status'] !== 'pending' ) return new WP_Error( 'bad_state', 'status=' . $row['status'], array( 'status' => 400 ) );
+
+            // Re-execute via b2b_flash_request
+            $body = json_decode( $row['request_body'], true );
+            if ( ! is_array( $body ) ) return new WP_Error( 'bad_data', 'cannot parse request body', array( 'status' => 400 ) );
+
+            $result = null;
+            if ( function_exists( 'b2b_flash_request' ) ) {
+                $result = b2b_flash_request( $row['endpoint'], $body );
+            } else {
+                return new WP_Error( 'no_helper', 'b2b_flash_request not available', array( 'status' => 500 ) );
+            }
+
+            $is_ok = is_array( $result ) && ! empty( $result['ok'] );
+            if ( $is_ok ) {
+                $wpdb->update( $tbl, array(
+                    'status' => 'resolved',
+                    'resolved_at' => current_time( 'mysql' ),
+                    'resolved_by' => get_current_user_id(),
+                ), array( 'id' => $id ) );
+            } else {
+                $wpdb->update( $tbl, array(
+                    'retry_count' => (int) $row['retry_count'] + 1,
+                    'last_error_code' => isset( $result['error_code'] ) ? (string) $result['error_code'] : 'unknown',
+                    'last_error_message' => isset( $result['message'] ) ? (string) $result['message'] : '',
+                ), array( 'id' => $id ) );
+            }
+
+            return rest_ensure_response( array(
+                'ok' => $is_ok,
+                'dlq_id' => $id,
+                'result' => $result,
+                'status' => $is_ok ? 'resolved' : 'still_failing',
+            ) );
+        },
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ═════════════════════════════════════════════════════════════
+    // POST /b2b/v1/flash-dlq/{id}/abandon — admin gives up
+    // ═════════════════════════════════════════════════════════════
+    register_rest_route( 'b2b/v1', '/flash-dlq/(?P<id>\d+)/abandon', array(
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
+            $id = absint( $req['id'] );
+            $reason = sanitize_text_field( $req->get_param( 'reason' ) ) ?: 'admin abandon';
+            $updated = $wpdb->update( $tbl, array(
+                'status' => 'abandoned',
+                'resolved_at' => current_time( 'mysql' ),
+                'resolved_by' => get_current_user_id(),
+                'last_error_message' => $reason,
+            ), array( 'id' => $id ) );
+            if ( $updated === false ) return new WP_Error( 'db_error', 'update failed', array( 'status' => 500 ) );
+            return rest_ensure_response( array( 'ok' => true, 'dlq_id' => $id, 'status' => 'abandoned' ) );
+        },
+        'permission_callback' => $admin_perm,
+    ) );
+
+    // ═════════════════════════════════════════════════════════════
+    // POST /b2b/v1/flash-test-payload
+    // Admin dry-run helper (M6) — calls resolver without Flash side-effect
+    // Mirrors /dinoco-stock/v1/shipping-compute but kept under b2b/v1 for namespace clarity
+    // ═════════════════════════════════════════════════════════════
+    register_rest_route( 'b2b/v1', '/flash-test-payload', array(
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            $items = $req->get_param( 'items' );
+            if ( ! is_array( $items ) ) return new WP_Error( 'bad_input', 'items array required', array( 'status' => 400 ) );
+
+            $manifest = array();
+            foreach ( $items as $it ) {
+                $manifest[] = array(
+                    'sku'       => strtoupper( sanitize_text_field( $it['sku'] ?? '' ) ),
+                    'total_qty' => absint( $it['qty'] ?? 1 ),
+                );
+            }
+
+            if ( ! function_exists( 'dinoco_resolve_manifest_shipping' ) ) {
+                return new WP_Error( 'no_resolver', 'Snippet 15 V.8.0 helpers not loaded', array( 'status' => 500 ) );
+            }
+            $per_pno = dinoco_resolve_manifest_shipping( $manifest );
+
+            return rest_ensure_response( array(
+                'ok' => true,
+                'manifest' => $manifest,
+                'per_pno'  => $per_pno,
+                'total_weight_g' => array_sum( array_column( $per_pno, 'weight_g' ) ),
+                'pno_count' => count( $per_pno ),
+            ) );
+        },
+        'permission_callback' => $admin_perm,
+    ) );
+
+} );
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END V.34.0 Flash Shipping V.42 Phase 3.5
+// ══════════════════════════════════════════════════════════════════════════════
