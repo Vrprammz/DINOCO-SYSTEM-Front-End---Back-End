@@ -2,6 +2,11 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.44.1 (2026-04-20) — code review fixes:
+ *   - H3: escape res.message in ShippingManager JS (XSS defense)
+ *   - H6: transaction wrap on product + pack_slots cleanup
+ *   - M6: audit row on flag toggle
+ *   - M7: cap items[] at 500 on shipping-compute
  * Version: V.44.0 — Flash Shipping Metadata V.42 Phase 2:
  *                   + 14 REST endpoints (/box-template CRUD, /sku-shipping* admin + scanner,
  *                     /shipping-coverage, /shipping-defaults, /shipping-compute, /product/shipping + /bulk,
@@ -3470,35 +3475,50 @@ add_action('rest_api_init', function() {
             $update['shipping_updated_by'] = $uid;
             $update['shipping_updated_at'] = current_time( 'mysql' );
 
-            // Handle pack_slots (multi_box pack_mode) — if slots array provided, replace
+            // H6 fix (V.44.1): wrap product UPDATE + pack_slots mutation in transaction
             $slots_input = $req->get_param( 'pack_slots' );
-            if ( is_array( $slots_input ) && ( $update['pack_mode'] ?? '' ) === 'multi_box' ) {
-                $slots_tbl = $wpdb->prefix . 'dinoco_pack_slots';
-                // Delete all existing slots for this SKU then re-insert
-                $wpdb->delete( $slots_tbl, array( 'product_sku' => $sku ) );
-                foreach ( $slots_input as $idx => $slot ) {
-                    if ( ! is_array( $slot ) || empty( $slot['box_template_id'] ) ) continue;
-                    $wpdb->insert( $slots_tbl, array(
-                        'product_sku'        => $sku,
-                        'slot_index'         => absint( $idx ),
-                        'slot_label'         => sanitize_text_field( $slot['slot_label'] ?? '' ),
-                        'box_template_id'    => absint( $slot['box_template_id'] ),
-                        'content_weight_g'   => isset( $slot['content_weight_g'] ) ? absint( $slot['content_weight_g'] ) : null,
-                        'length_cm_override' => isset( $slot['length_cm_override'] ) && $slot['length_cm_override'] !== '' ? absint( $slot['length_cm_override'] ) : null,
-                        'width_cm_override'  => isset( $slot['width_cm_override'] )  && $slot['width_cm_override']  !== '' ? absint( $slot['width_cm_override'] )  : null,
-                        'height_cm_override' => isset( $slot['height_cm_override'] ) && $slot['height_cm_override'] !== '' ? absint( $slot['height_cm_override'] ) : null,
-                        'tare_weight_override_g' => isset( $slot['tare_weight_override_g'] ) && $slot['tare_weight_override_g'] !== '' ? absint( $slot['tare_weight_override_g'] ) : null,
-                        'created_at'         => current_time( 'mysql' ),
-                        'updated_at'         => current_time( 'mysql' ),
-                    ) );
+            $slots_tbl = $wpdb->prefix . 'dinoco_pack_slots';
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                // UPDATE product first — if this fails we rollback before touching slots
+                $update_result = $wpdb->update( $tbl, $update, array( 'sku' => $sku ) );
+                if ( $update_result === false ) {
+                    throw new Exception( 'product update failed: ' . $wpdb->last_error );
                 }
-            } elseif ( ( $update['pack_mode'] ?? '' ) !== 'multi_box' && isset( $update['pack_mode'] ) ) {
-                // C-B2 fix: pack_mode changed away from multi_box → cleanup orphan slots
-                $slots_tbl = $wpdb->prefix . 'dinoco_pack_slots';
-                $wpdb->delete( $slots_tbl, array( 'product_sku' => $sku ) );
-            }
 
-            $wpdb->update( $tbl, $update, array( 'sku' => $sku ) );
+                // Handle pack_slots (multi_box pack_mode) — if slots array provided, replace
+                if ( is_array( $slots_input ) && ( $update['pack_mode'] ?? '' ) === 'multi_box' ) {
+                    // Delete all existing slots for this SKU then re-insert
+                    $wpdb->delete( $slots_tbl, array( 'product_sku' => $sku ) );
+                    foreach ( $slots_input as $idx => $slot ) {
+                        if ( ! is_array( $slot ) || empty( $slot['box_template_id'] ) ) continue;
+                        $ins = $wpdb->insert( $slots_tbl, array(
+                            'product_sku'        => $sku,
+                            'slot_index'         => absint( $idx ),
+                            'slot_label'         => sanitize_text_field( $slot['slot_label'] ?? '' ),
+                            'box_template_id'    => absint( $slot['box_template_id'] ),
+                            'content_weight_g'   => isset( $slot['content_weight_g'] ) ? absint( $slot['content_weight_g'] ) : null,
+                            'length_cm_override' => isset( $slot['length_cm_override'] ) && $slot['length_cm_override'] !== '' ? absint( $slot['length_cm_override'] ) : null,
+                            'width_cm_override'  => isset( $slot['width_cm_override'] )  && $slot['width_cm_override']  !== '' ? absint( $slot['width_cm_override'] )  : null,
+                            'height_cm_override' => isset( $slot['height_cm_override'] ) && $slot['height_cm_override'] !== '' ? absint( $slot['height_cm_override'] ) : null,
+                            'tare_weight_override_g' => isset( $slot['tare_weight_override_g'] ) && $slot['tare_weight_override_g'] !== '' ? absint( $slot['tare_weight_override_g'] ) : null,
+                            'created_at'         => current_time( 'mysql' ),
+                            'updated_at'         => current_time( 'mysql' ),
+                        ) );
+                        if ( $ins === false ) {
+                            throw new Exception( 'pack_slot insert failed: ' . $wpdb->last_error );
+                        }
+                    }
+                } elseif ( ( $update['pack_mode'] ?? '' ) !== 'multi_box' && isset( $update['pack_mode'] ) ) {
+                    // C-B2 fix: pack_mode changed away from multi_box → cleanup orphan slots
+                    $wpdb->delete( $slots_tbl, array( 'product_sku' => $sku ) );
+                }
+
+                $wpdb->query( 'COMMIT' );
+            } catch ( Exception $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'shipping_update_failed', $e->getMessage(), array( 'status' => 500 ) );
+            }
 
             // Invalidate caches (P2 matrix)
             DINOCO_Catalog::flush_memo();
@@ -3660,9 +3680,28 @@ add_action('rest_api_init', function() {
             }
             // Flag toggle (admin critical action)
             if ( isset( $input['flag_enabled'] ) ) {
-                update_option( 'dinoco_shipping_meta_enabled', $input['flag_enabled'] ? '1' : '0' );
-                if ( function_exists( 'b2b_log' ) ) {
-                    b2b_log( '[Shipping V.44] Flag toggled: ' . ( $input['flag_enabled'] ? 'ON' : 'OFF' ) . ' by user ' . get_current_user_id() );
+                global $wpdb;
+                $new_val = $input['flag_enabled'] ? '1' : '0';
+                $old_val = (string) get_option( 'dinoco_shipping_meta_enabled', '0' );
+                if ( $new_val !== $old_val ) {
+                    update_option( 'dinoco_shipping_meta_enabled', $new_val );
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( '[Shipping V.44] Flag toggled: ' . ( $new_val === '1' ? 'ON' : 'OFF' ) . ' by user ' . get_current_user_id() );
+                    }
+                    // M6 (V.44.1): audit row on flag toggle
+                    $wpdb->insert(
+                        $wpdb->prefix . 'dinoco_flash_audit',
+                        array(
+                            'ticket_id'    => 0,
+                            'event_type'   => 'flag_toggle_ui',
+                            'payload_json' => wp_json_encode( array(
+                                'old'     => $old_val,
+                                'new'     => $new_val,
+                                'user_id' => get_current_user_id(),
+                            ) ),
+                            'created_at'   => current_time( 'mysql' ),
+                        )
+                    );
                 }
             }
             update_option( 'dinoco_shipping_defaults', $defaults );
@@ -3680,6 +3719,10 @@ add_action('rest_api_init', function() {
         'callback' => function( WP_REST_Request $req ) {
             $items = $req->get_param( 'items' );
             if ( ! is_array( $items ) ) return new WP_Error( 'bad_input', 'items array required', array( 'status' => 400 ) );
+            // M7 (V.44.1): cap dry-run payload to prevent resource exhaustion
+            if ( count( $items ) > 500 ) {
+                return new WP_Error( 'too_many_items', 'max 500 items per dry-run', array( 'status' => 400 ) );
+            }
             $manifest = array();
             foreach ( $items as $it ) {
                 $manifest[] = array(
@@ -9905,11 +9948,20 @@ function dinoco_render_ui_v99() {
                             $('#sm-csv-preview').hide(); $('#sm-csv-file').val('');
                             self.loadCoverage();
                         } else {
-                            result.html('<div style="padding:14px;background:#fee2e2;border-left:3px solid #dc2626;border-radius:4px;">❌ ' + (res.message || 'Unknown error') + '</div>');
+                            // H3 (V.44.1): escape server message via .text() to prevent XSS
+                            result.empty().append(
+                                $('<div>').css({padding:'14px',background:'#fee2e2',borderLeft:'3px solid #dc2626',borderRadius:'4px'})
+                                    .text('❌ ' + (res.message || 'Unknown error'))
+                            );
                         }
                     },
                     error: function(xhr) {
-                        $('#sm-csv-result').html('<div style="padding:14px;background:#fee2e2;border-left:3px solid #dc2626;border-radius:4px;">❌ ' + ((xhr.responseJSON && xhr.responseJSON.message) || xhr.status) + '</div>');
+                        // H3 (V.44.1): escape server message via .text() to prevent XSS
+                        const msg = (xhr.responseJSON && xhr.responseJSON.message) ? String(xhr.responseJSON.message) : String(xhr.status);
+                        $('#sm-csv-result').empty().append(
+                            $('<div>').css({padding:'14px',background:'#fee2e2',borderLeft:'3px solid #dc2626',borderRadius:'4px'})
+                                .text('❌ ' + msg)
+                        );
                     }});
             },
 

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.43.0
+DINOCO B2B -- RPi Print Server Dashboard  V.43.1
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
+
+V.43.1 (2026-04-20) — code review fixes:
+    - M1: thread-safety lock on _v43_box_tpl_cache (read/write under _v43_tpl_lock)
+    - M2: atomic write for tmp/box-templates.json via tempfile + os.replace
+    - M4: redact exception messages in WP proxy error responses (502 wp_unreachable)
+    - M5: api_sku_auto_fill always 200 (client checks data.found)
 
 V.43.0: Flash Shipping V.42 Phase 4.5 — manual_ship.html V.43 support:
     - 3 NEW proxy routes for shipping metadata scanner integration:
@@ -42,6 +48,7 @@ import functools
 import base64
 import hmac
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
 
 import requests as http_requests
@@ -618,8 +625,10 @@ def api_manual_flash_create():
             timeout=35,
         )
         data = resp.json()
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'WordPress API error: {e}'}), 502
+    except Exception:
+        # V.43.1 M4: redact exception detail — log server-side, return generic code
+        logger.exception('manual-flash-create WP proxy error')
+        return jsonify({'success': False, 'error': 'wp_unreachable'}), 502
 
     if not data.get('success'):
         return jsonify(data), resp.status_code
@@ -908,8 +917,10 @@ def api_manual_reprint_label():
 # systemd sandbox compliance: cache writes go to tmp/ (ReadWritePaths whitelist)
 
 # In-memory cache for box templates (short-lived) + file cache (1hr TTL)
+# V.43.1 M1: threading.Lock() guards all read/write of _v43_box_tpl_cache
 _v43_box_tpl_cache = {'ts': 0, 'data': None}
 _v43_tpl_cache_file = os.path.join(BASE_DIR, 'tmp', 'box-templates.json')
+_v43_tpl_lock = threading.Lock()
 
 
 def _ensure_tmp_dir():
@@ -932,24 +943,26 @@ def _fetch_box_templates_from_wp():
     ttl_sec = int(config.get('cache_ttl_templates_sec', 3600))
     now_ts = time.time()
 
-    # In-memory cache hit
-    if _v43_box_tpl_cache['data'] is not None and (now_ts - _v43_box_tpl_cache['ts']) < ttl_sec:
-        return _v43_box_tpl_cache['data']
+    # V.43.1 M1: in-memory cache hit under lock
+    with _v43_tpl_lock:
+        if _v43_box_tpl_cache['data'] is not None and (now_ts - _v43_box_tpl_cache['ts']) < ttl_sec:
+            return _v43_box_tpl_cache['data']
 
-    # File cache hit (survives restart)
+    # File cache hit (survives restart) — read outside lock
     if os.path.exists(_v43_tpl_cache_file):
         try:
             age = now_ts - os.path.getmtime(_v43_tpl_cache_file)
             if age < ttl_sec:
                 with open(_v43_tpl_cache_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                _v43_box_tpl_cache['ts'] = now_ts
-                _v43_box_tpl_cache['data'] = data
+                with _v43_tpl_lock:
+                    _v43_box_tpl_cache['ts'] = now_ts
+                    _v43_box_tpl_cache['data'] = data
                 return data
         except (OSError, json.JSONDecodeError):
             pass  # fall through to WP fetch
 
-    # Fetch from WP
+    # Fetch from WP (network call outside lock — don't block other readers)
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
         api_key = config.get('api_key', '')
@@ -957,20 +970,31 @@ def _fetch_box_templates_from_wp():
         resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=10)
         body = resp.json() if resp.ok else {}
         tpls = body.get('templates', []) if isinstance(body, dict) else []
-        # Persist cache
+        # V.43.1 M2: atomic persist — write to sibling .tmp then os.replace
         _ensure_tmp_dir()
         try:
-            with open(_v43_tpl_cache_file, 'w', encoding='utf-8') as f:
-                json.dump(tpls, f, ensure_ascii=False)
+            tmpdir = os.path.dirname(_v43_tpl_cache_file) or '.'
+            with tempfile.NamedTemporaryFile('w', dir=tmpdir, delete=False, suffix='.tmp', encoding='utf-8') as tf:
+                json.dump(tpls, tf, ensure_ascii=False)
+                tmp_path = tf.name
+            try:
+                os.replace(tmp_path, _v43_tpl_cache_file)  # atomic on POSIX
+            except OSError:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
         except OSError:
             pass  # cache persistence is best-effort
-        _v43_box_tpl_cache['ts'] = now_ts
-        _v43_box_tpl_cache['data'] = tpls
+        with _v43_tpl_lock:
+            _v43_box_tpl_cache['ts'] = now_ts
+            _v43_box_tpl_cache['data'] = tpls
         return tpls
     except Exception as e:
         logger.warning(f'[V.43] box templates fetch failed: {e}')
-        # Return stale cache if available
-        return _v43_box_tpl_cache['data'] or []
+        # Return stale cache if available (lock protects concurrent read)
+        with _v43_tpl_lock:
+            return _v43_box_tpl_cache['data'] or []
 
 
 @app.route('/api/box-templates')
@@ -982,7 +1006,10 @@ def api_box_templates():
     Falls back to stale cache on WP failure (logged).
     """
     tpls = _fetch_box_templates_from_wp()
-    return jsonify({'ok': True, 'templates': tpls, 'cached': _v43_box_tpl_cache['ts'] > 0})
+    # V.43.1 M1: read cache ts under lock
+    with _v43_tpl_lock:
+        cached = _v43_box_tpl_cache['ts'] > 0
+    return jsonify({'ok': True, 'templates': tpls, 'cached': cached})
 
 
 @app.route('/api/sku-shipping-scanner/<sku>')
@@ -1003,9 +1030,10 @@ def api_sku_shipping_scanner(sku):
         # when X-Print-Key matches admin nonce flow. See Snippet Inventory V.44.0 scanner_perm.
         resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
         return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        logger.warning(f'[V.43] sku-shipping-scanner fetch failed for {sku}: {e}')
-        return jsonify({'ok': False, 'error': str(e)}), 502
+    except Exception:
+        # V.43.1 M4: redact exception detail to client
+        logger.exception(f'[V.43] sku-shipping-scanner fetch failed for {sku}')
+        return jsonify({'ok': False, 'error': 'wp_unreachable'}), 502
 
 
 @app.route('/api/sku-shipping/<sku>')
@@ -1022,9 +1050,10 @@ def api_sku_shipping_full(sku):
         url = f'{wp_url}/wp-json/dinoco-stock/v1/sku-shipping/{sku}'
         resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
         return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        logger.warning(f'[V.43] sku-shipping fetch failed for {sku}: {e}')
-        return jsonify({'ok': False, 'error': str(e)}), 502
+    except Exception:
+        # V.43.1 M4: redact exception detail to client
+        logger.exception(f'[V.43] sku-shipping fetch failed for {sku}')
+        return jsonify({'ok': False, 'error': 'wp_unreachable'}), 502
 
 
 def _auto_fill_from_sku(sku):
@@ -1063,9 +1092,10 @@ def _auto_fill_from_sku(sku):
             'box_template_id': body.get('box_template_id'),
             'source': ship.get('source', ''),
         }
-    except Exception as e:
-        logger.warning(f'[V.43] _auto_fill_from_sku error for {sku}: {e}')
-        return {'found': False, 'error': str(e)}
+    except Exception:
+        # V.43.1 M4: redact exception detail
+        logger.exception(f'[V.43] _auto_fill_from_sku error for {sku}')
+        return {'found': False, 'error': 'wp_unreachable'}
 
 
 @app.route('/api/sku-auto-fill/<sku>')
@@ -1076,7 +1106,8 @@ def api_sku_auto_fill(sku):
     UI calls this on scan; gets compact response for form population.
     """
     result = _auto_fill_from_sku(sku)
-    return jsonify(result), (200 if result.get('found') else 404)
+    # V.43.1 M5: always 200 — client checks data.found (avoid 404 triggering browser error UX)
+    return jsonify(result), 200
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1093,6 +1124,6 @@ if __name__ == '__main__':
     # V.43.0: ensure tmp/ cache dir exists
     _ensure_tmp_dir()
 
-    print(f'DINOCO Print Dashboard V.43.0: http://0.0.0.0:{args.port}')
+    print(f'DINOCO Print Dashboard V.43.1: http://0.0.0.0:{args.port}')
     print(f'Manual Shipping: http://0.0.0.0:{args.port}/manual-ship')
     app.run(host=args.host, port=args.port, debug=False)
