@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.3 — Flash Shipping V.42 Phase 4 (BO secondary):       ║
+ * ║    • b2b_flash_create_secondary($order_id, $bo_items):                ║
+ * ║      * Builds mini-manifest from BO items subset (NOT full order)     ║
+ * ║      * Resolves shipping via dinoco_resolve_manifest_shipping         ║
+ * ║      * Creates separate Flash order with _flash_tracking_numbers_bo   ║
+ * ║        meta (distinct from primary _flash_tracking_numbers)           ║
+ * ║      * Fires bulky / shipping_data_missing Flex alerts as needed      ║
+ * ║      * Snippet 16 V.1.15 already prefers this helper if exists        ║
  * ║  Version: V.34.2 — Flash Shipping V.42 Phase 3 (B2B Flash refactor per-PNO): ║
  * ║    • b2b_flash_create_order_v42() — V.42-aware Flash order creator:  ║
  * ║      * accepts $shipping_override (per-PNO resolver output)           ║
@@ -6525,4 +6533,128 @@ if ( ! function_exists( 'b2b_flash_dispatch_create_all' ) ) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // END V.34.2 Flash Shipping V.42 Phase 3 (B2B Flash refactor per-PNO)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V.34.3 — FLASH SHIPPING METADATA V.42 PHASE 4 (BO SECONDARY)
+// ──────────────────────────────────────────────────────────────────────────────
+// b2b_flash_create_secondary — creates Flash order for BO fulfillment.
+// Uses BO items subset only (NOT full primary order manifest).
+// Snippet 16 V.1.15 listener already prefers this helper when available.
+// ══════════════════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'b2b_flash_create_secondary' ) ) {
+    /**
+     * Create Flash secondary order for BO fulfillment.
+     *
+     * @param int   $order_id  Original order ID
+     * @param array $bo_items  BO items subset: [{sku, qty, qty_fulfilled, ...}, ...]
+     * @return array { ok, pno?, pno_count?, error? }
+     */
+    function b2b_flash_create_secondary( $order_id, $bo_items ) {
+        $order_id = intval( $order_id );
+        if ( ! $order_id || empty( $bo_items ) || ! is_array( $bo_items ) ) {
+            return array( 'ok' => false, 'error' => 'bad_input' );
+        }
+
+        // Walk-in bypass (decision #15)
+        if ( (int) get_post_meta( $order_id, '_b2b_is_walkin', true ) === 1 ) {
+            return array( 'ok' => false, 'error' => 'walk_in_skipped' );
+        }
+
+        // Check V.42 helpers available
+        if ( ! function_exists( 'dinoco_resolve_manifest_shipping' ) ) {
+            // Helpers missing → signal caller to fallback (Snippet 16 listener will try generic b2b_flash_create_order)
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[FlashSecondary] V.42 helpers missing — order #{$order_id} will use fallback" );
+            return array( 'ok' => false, 'error' => 'v42_helpers_missing' );
+        }
+
+        // Feature flag gate — if OFF, skip V.42 secondary (let generic fallback fire)
+        if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) {
+            return array( 'ok' => false, 'error' => 'flag_off_fallback' );
+        }
+
+        // Build mini-manifest from BO items subset (NOT full order_items)
+        $mini_manifest = array();
+        foreach ( $bo_items as $it ) {
+            if ( ! is_array( $it ) ) continue;
+            $sku = strtoupper( (string) ( $it['sku'] ?? '' ) );
+            if ( $sku === '' ) continue;
+            $qty = intval( $it['qty_fulfilled'] ?? $it['qty'] ?? 1 );
+            if ( $qty < 1 ) continue;
+            $mini_manifest[] = array(
+                'sku'       => $sku,
+                'name'      => (string) ( $it['name'] ?? '' ),
+                'children'  => isset( $it['children'] ) && is_array( $it['children'] ) ? $it['children'] : array(),
+                'total_qty' => $qty,
+            );
+        }
+        if ( empty( $mini_manifest ) ) return array( 'ok' => false, 'error' => 'empty_bo_manifest' );
+
+        // Resolve shipping for BO items subset — fresh (not from primary snapshot)
+        $per_pno = dinoco_resolve_manifest_shipping( $mini_manifest );
+        if ( empty( $per_pno ) ) return array( 'ok' => false, 'error' => 'no_shipping_resolved' );
+
+        // Aggregate (single order + sub-parcels if > 1)
+        $primary = $per_pno[0];
+        $sub_parcels = array();
+        for ( $i = 1; $i < count( $per_pno ); $i++ ) {
+            $sub_parcels[] = array(
+                'weight_g'  => $per_pno[ $i ]['weight_g']  ?? $primary['weight_g'],
+                'length_cm' => $per_pno[ $i ]['length_cm'] ?? 0,
+                'width_cm'  => $per_pno[ $i ]['width_cm']  ?? 0,
+                'height_cm' => $per_pno[ $i ]['height_cm'] ?? 0,
+            );
+        }
+        // Mixed-vehicle → always truck
+        foreach ( $per_pno as $p ) {
+            if ( intval( $p['express_category'] ?? 1 ) === 4 ) { $primary['express_category'] = 4; break; }
+        }
+
+        // BO marker in remark for admin + operator clarity
+        $primary['__bo_marker'] = '#' . $order_id . ' BO fulfill (' . count( $bo_items ) . ' items)';
+
+        // Call V.42 order creator
+        $result = b2b_flash_create_order_v42( $order_id, $primary, $sub_parcels );
+
+        if ( $result['ok'] ) {
+            $pno = $result['pno'];
+            // Persist BO tracking separately from primary (accumulates across multiple BO fulfills)
+            $existing_bo_pnos = get_post_meta( $order_id, '_flash_tracking_numbers_bo', true );
+            if ( ! is_array( $existing_bo_pnos ) ) $existing_bo_pnos = array();
+            $existing_bo_pnos[] = $pno;
+            update_post_meta( $order_id, '_flash_tracking_numbers_bo', $existing_bo_pnos );
+            update_post_meta( $order_id, '_flash_bo_secondary_created_at', current_time( 'mysql' ) );
+
+            // Bulky alert for BO secondary
+            if ( intval( $primary['express_category'] ) === 4 && function_exists( 'b2b_push_admin_flex_dedup' ) && function_exists( 'b2b_build_flex_flash_bulky_order_created' ) ) {
+                $dist_name = get_field( 'dist_name', $order_id ) ?: get_the_title( $order_id );
+                $flex = b2b_build_flex_flash_bulky_order_created(
+                    $order_id,
+                    $dist_name . ' [BO]',
+                    intval( $primary['weight_g'] ),
+                    array( 'length_cm' => $primary['length_cm'], 'width_cm' => $primary['width_cm'], 'height_cm' => $primary['height_cm'] ),
+                    'BO secondary'
+                );
+                // Shorter TTL — BO fulfills may happen multiple times per order
+                b2b_push_admin_flex_dedup( 'flash_bo_bulky_' . $order_id . '_' . md5( (string) $pno ), 3 * HOUR_IN_SECONDS, $flex );
+            }
+
+            b2b_log( "[FlashSecondary] BO order #{$order_id} → pno={$pno} (" . count( $bo_items ) . " items, " . count( $per_pno ) . " sub-parcels)" );
+            return array(
+                'ok'          => true,
+                'pno'         => $pno,
+                'pno_count'   => count( $per_pno ),
+                'sub_parcels' => count( $sub_parcels ),
+                'path'        => 'v42_bo_secondary',
+            );
+        }
+
+        if ( function_exists( 'b2b_log' ) ) b2b_log( "[FlashSecondary] BO order #{$order_id} failed: " . ( $result['error'] ?? 'unknown' ) );
+        return array( 'ok' => false, 'error' => $result['error'] ?? 'unknown', 'path' => 'v42_bo_failed' );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END V.34.3 Flash Shipping V.42 Phase 4 (BO Secondary)
 // ══════════════════════════════════════════════════════════════════════════════

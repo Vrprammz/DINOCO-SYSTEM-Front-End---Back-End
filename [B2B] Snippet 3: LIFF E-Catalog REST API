@@ -1,6 +1,15 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.0 — Flash Shipping V.42 Phase 4 (Manual-Ship backend):                     ║
+ * ║    • b2b_rest_manual_flash_create: accept sku + length_cm/width_cm/height_cm +            ║
+ * ║      express_category + article_category + box_template_id + save_sku_data flag           ║
+ * ║    • D-12: articleCategory 1→6 migration gated by dinoco_shipping_meta_enabled flag       ║
+ * ║    • Auto-suggest expressCategory from dims when flag ON (uses dinoco_suggest_express_*)  ║
+ * ║    • Ad-hoc SKU save-back: if save_sku_data=1 + SKU not in catalog → UPSERT to            ║
+ * ║      wp_dinoco_products with pack_mode='unknown' (admin classify via V.44 /classify EP)   ║
+ * ║    • Send length/width/height to Flash API params (V.41 only sent weight)                 ║
+ * ║    • Snapshot V.42 params in shipment record for reprint + audit                          ║
  * ║  Version: V.41.7 — exclude manual_invoice from /admin-shipping-queue (BUG follow-up V.30.8/V.30.9/V.31.5) ║
  * ║  Version: V.41.6 — [PERF-M1] b2b_get_sku_data_map stampede protection via wp_cache_add lock ║
  * ║                    — prevents N concurrent rebuilds when transient expires (thundering herd) ║
@@ -4440,6 +4449,65 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
         $weight       = intval( $r->get_param( 'weight' ) ) ?: 1000;
         $remark       = sanitize_text_field( $r->get_param( 'remark' ) );
 
+        // V.42.0 PHASE 4: Accept per-PNO dims + SKU + ad-hoc save-back
+        $req_sku         = strtoupper( sanitize_text_field( $r->get_param( 'sku' ) ) );
+        $req_length_cm   = intval( $r->get_param( 'length_cm' ) );
+        $req_width_cm    = intval( $r->get_param( 'width_cm' ) );
+        $req_height_cm   = intval( $r->get_param( 'height_cm' ) );
+        $req_ec          = intval( $r->get_param( 'express_category' ) );  // 1 or 4, empty=auto
+        $req_article_cat = intval( $r->get_param( 'article_category' ) );
+        $save_sku_data   = (int) $r->get_param( 'save_sku_data' ) === 1;  // ad-hoc save-back flag
+        $req_box_tpl_id  = intval( $r->get_param( 'box_template_id' ) );
+
+        // D-12: articleCategory 1→6 migration gated by V.42 feature flag
+        $v42_flag_on = function_exists( 'get_option' ) && get_option( 'dinoco_shipping_meta_enabled', '0' ) === '1';
+        if ( $req_article_cat < 1 || $req_article_cat > 99 ) {
+            $req_article_cat = $v42_flag_on ? 6 : 1;  // V.42 default=6 (อะไหล่รถยนต์), legacy=1
+        }
+
+        // Auto-suggest expressCategory from dims if not provided + V.42 flag ON + helper available
+        if ( ! in_array( $req_ec, array( 1, 4 ), true ) && $v42_flag_on && function_exists( 'dinoco_suggest_express_category' ) ) {
+            $req_ec = dinoco_suggest_express_category( $weight, array(
+                'length_cm' => $req_length_cm,
+                'width_cm'  => $req_width_cm,
+                'height_cm' => $req_height_cm,
+            ) );
+        } elseif ( ! in_array( $req_ec, array( 1, 4 ), true ) ) {
+            $req_ec = 1;  // legacy default
+        }
+
+        // V.42 ad-hoc SKU save-back — UPSERT to wp_dinoco_products with pack_mode='unknown'
+        //   Only if: SKU provided + save_sku_data flag + SKU not already in catalog
+        //   Guard: only saves dims + weight (not pack_mode/box_template — admin classifies later)
+        if ( $save_sku_data && $req_sku && class_exists( 'DINOCO_Catalog' ) ) {
+            $existing = DINOCO_Catalog::get_by_sku( $req_sku );
+            if ( ! $existing && $req_length_cm && $req_width_cm && $req_height_cm && $weight ) {
+                global $wpdb;
+                $tbl = $wpdb->prefix . 'dinoco_products';
+                // Minimal upsert — name defaults to item_desc, everything else nullable
+                $wpdb->insert( $tbl, array(
+                    'sku'                 => $req_sku,
+                    'name'                => $item_desc,
+                    'is_active'           => 1,
+                    'b2b_visible'         => 0,  // hidden until admin classifies
+                    'pack_mode'           => 'unknown',
+                    'packaging_source'    => 'unknown',
+                    'weight_grams'        => $weight,
+                    'length_cm'           => $req_length_cm,
+                    'width_cm'            => $req_width_cm,
+                    'height_cm'           => $req_height_cm,
+                    'article_category'    => $req_article_cat,
+                    'shipping_updated_by' => get_current_user_id(),
+                    'shipping_updated_at' => current_time( 'mysql' ),
+                    'created_at'          => current_time( 'mysql' ),
+                    'updated_at'          => current_time( 'mysql' ),
+                ) );
+                if ( function_exists( 'b2b_log' ) ) b2b_log( "[ManualFlash V.42] ad-hoc save-back: SKU={$req_sku} added with pack_mode=unknown (admin review queue)" );
+                if ( method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();
+                if ( function_exists( 'wp_cache_flush_group' ) ) @wp_cache_flush_group( 'dinoco_shipping' );
+            }
+        }
+
         $missing = array();
         if ( empty( $dst_name ) )     $missing[] = 'ชื่อผู้รับ';
         if ( empty( $dst_phone ) )    $missing[] = 'เบอร์โทร';
@@ -4513,8 +4581,8 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
 
         $params = array(
             'outTradeNo'       => $out_trade_no,
-            'expressCategory'  => 1,
-            'articleCategory'  => 1,
+            'expressCategory'  => $req_ec,                // V.42: auto-suggest or admin override
+            'articleCategory'  => $req_article_cat,       // V.42: D-12 flag-gated (6 if flag ON)
             'srcName'          => $src_name,
             'srcPhone'         => $src_phone,
             'srcDetailAddress' => $src_address,
@@ -4534,6 +4602,10 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
             'codEnabled'       => 0,
             'remark'           => $remark ?: $item_desc,
         );
+        // V.42 PHASE 4: Add dimensions if provided (Flash per-PNO routing)
+        if ( $req_length_cm > 0 ) $params['length'] = $req_length_cm;
+        if ( $req_width_cm > 0 )  $params['width']  = $req_width_cm;
+        if ( $req_height_cm > 0 ) $params['height'] = $req_height_cm;
 
         $result = b2b_flash_request( 'open/v3/orders', $params );
 
@@ -4574,6 +4646,15 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
             'label_sender_name'    => $reg_name,
             'label_sender_phone'   => $reg_phone,
             'label_sender_address' => $reg_address,
+            // V.42.0 PHASE 4: snapshot V.42 shipping params
+            'sku'              => $req_sku,
+            'length_cm'        => $req_length_cm,
+            'width_cm'         => $req_width_cm,
+            'height_cm'        => $req_height_cm,
+            'express_category' => $req_ec,
+            'article_category' => $req_article_cat,
+            'box_template_id'  => $req_box_tpl_id,
+            'adhoc_saved'      => $save_sku_data ? 1 : 0,
         );
         update_option( $month_key, $shipments, false );
 
