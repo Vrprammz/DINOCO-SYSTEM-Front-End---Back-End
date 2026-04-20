@@ -2,6 +2,19 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.44.0 — Flash Shipping Metadata V.42 Phase 2:
+ *                   + 14 REST endpoints (/box-template CRUD, /sku-shipping* admin + scanner,
+ *                     /shipping-coverage, /shipping-defaults, /shipping-compute, /product/shipping + /bulk,
+ *                     /shipping/ad-hoc-pending + /classify, /shipping/bulk-import-template CSV)
+ *                   + warehouse_staff scanner perm callback (BLK-3 — scan_shipping cap)
+ *                   + S7 PHP validator (primary defense): weight 1-60000g, dim 1-200cm, enum checks
+ *                   + S22 compound rate limit (per-user + per-IP) on bulk import
+ *                   + S8 CSV injection guard (prefix ' on =+-@ leading chars, both import + output)
+ *                   + B-4 idempotency key + 100KB size cap + 500 row cap on bulk
+ *                   + C-B2 orphan pack_slots cleanup when pack_mode changes away from multi_box
+ *                   + P2 cache invalidation matrix (flush_memo + dinoco_shipping group) on every mutation
+ *                   + Admin UI sections: Box Templates tab + Edit Product Modal shipping section
+ *                     + Coverage Widget + Ad-hoc Review Queue + Bulk CSV tooling (Phase 2 frontend)
  * Version: V.43.8 — UX-C2: migrate God Mode PIN prompt + alerts + category delete confirm to dinocoModal (fallback to native)
  * Version: V.43.7 — PERF-H5: stock/list auto-sync moved to write-trigger hooks + daily cron + manual REST endpoint
  * Version: V.43.6 — DD-3: child/gc map indexed by ALL parent_skus (array) — shared leaves under all parent SETs
@@ -235,6 +248,11 @@ add_action('init', function() {
                     if ($has_cat)     $cols .= ', category';
                     if ($has_compat)  $cols .= ', compatible_models';
                     if ($has_role)    $cols .= ', ui_role_override';
+                    // V.44.0 PHASE 2: include Flash Shipping V.42 columns (best-effort, columns may not exist on fresh installs before Snippet 15 V.8.0 migration runs)
+                    $has_pack_mode   = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'pack_mode'");
+                    $has_ec_override = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'express_category_override'");
+                    if ($has_pack_mode)   $cols .= ', pack_mode, packaging_source, box_template_id, weight_per_unit_g, weight_grams';
+                    if ($has_ec_override) $cols .= ', express_category_override';
 
                     $ct_rows = $wpdb->get_results("SELECT {$cols} FROM {$ct_table} WHERE is_active = 1", ARRAY_A);
                     if ($ct_rows) {
@@ -298,6 +316,15 @@ add_action('init', function() {
                     }
                     // V.38.0: Compatible models from custom table
                     $item['compatible_models'] = isset($ct_map[$sku]) ? ($ct_map[$sku]['compatible_models'] ?: '[]') : '[]';
+                    // V.44.0 PHASE 2: Flash Shipping V.42 fields → grid badge decision
+                    if (isset($ct_map[$sku])) {
+                        $item['pack_mode']                 = $ct_map[$sku]['pack_mode'] ?? null;
+                        $item['packaging_source']          = $ct_map[$sku]['packaging_source'] ?? null;
+                        $item['box_template_id']           = isset($ct_map[$sku]['box_template_id']) ? intval($ct_map[$sku]['box_template_id']) : null;
+                        $item['weight_per_unit_g']         = isset($ct_map[$sku]['weight_per_unit_g']) ? intval($ct_map[$sku]['weight_per_unit_g']) : null;
+                        $item['weight_grams']              = isset($ct_map[$sku]['weight_grams']) ? intval($ct_map[$sku]['weight_grams']) : null;
+                        $item['express_category_override'] = isset($ct_map[$sku]['express_category_override']) ? intval($ct_map[$sku]['express_category_override']) : null;
+                    }
                 }
                 echo json_encode(['success' => true, 'data' => $catalog, 'relations' => $relations]); exit;
             }
@@ -3035,6 +3062,719 @@ add_action('rest_api_init', function() {
         'permission_callback' => $inv_perm,
     ]);
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // V.44.0 — FLASH SHIPPING METADATA V.42 PHASE 2 (13 REST endpoints)
+    // ─────────────────────────────────────────────────────────────────────────
+    // Endpoints:
+    //   1. GET    /box-templates                    — list (admin)
+    //   2. POST   /box-template                     — create
+    //   3. POST   /box-template/{id}                — update
+    //   4. DELETE /box-template/{id}                — soft delete
+    //   5. GET    /sku-shipping/{sku}               — admin full read
+    //   6. GET    /sku-shipping-scanner/{sku}       — warehouse_staff stripped
+    //   7. GET    /sku-shipping                     — paginated list
+    //   8. POST   /product/shipping                 — per-SKU upsert
+    //   9. POST   /product/shipping/bulk            — CSV bulk import
+    //  10. GET    /shipping-coverage                — coverage widget %
+    //  11. GET    /shipping-defaults + POST         — wp_option CRUD
+    //  12. POST   /shipping-compute                 — dry-run resolver preview
+    //  13. GET    /shipping/ad-hoc-pending + POST   — M2 ad-hoc review queue
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // BLK-3: Scanner perm — warehouse_staff OR admin; nonce still required for POST.
+    $scanner_perm = function( WP_REST_Request $req ) {
+        $nonce = $req->get_header( 'X-WP-Nonce' );
+        $nonce_ok = $nonce && wp_verify_nonce( $nonce, 'wp_rest' );
+        return $nonce_ok && ( current_user_can( 'scan_shipping' ) || current_user_can( 'manage_options' ) );
+    };
+
+    // ─── Helper: validate + sanitize shipping input ───────────────
+    // S7 primary defense — PHP validator before DB write
+    $validate_shipping = function( $input ) {
+        $errors = array();
+        $out = array();
+
+        // pack_mode enum
+        if ( isset( $input['pack_mode'] ) ) {
+            $valid_modes = array( 'auto', 'single_box', 'multi_box', 'bulk_pack', 'assembled_set', 'unknown' );
+            if ( ! in_array( $input['pack_mode'], $valid_modes, true ) ) {
+                $errors[] = 'invalid pack_mode';
+            } else $out['pack_mode'] = $input['pack_mode'];
+        }
+        // packaging_source enum
+        if ( isset( $input['packaging_source'] ) ) {
+            $valid_sources = array( 'warehouse_packed', 'factory_packed', 'unknown' );
+            if ( ! in_array( $input['packaging_source'], $valid_sources, true ) ) {
+                $errors[] = 'invalid packaging_source';
+            } else $out['packaging_source'] = $input['packaging_source'];
+        }
+        // box_template_id
+        if ( isset( $input['box_template_id'] ) ) {
+            $out['box_template_id'] = $input['box_template_id'] === null ? null : absint( $input['box_template_id'] );
+        }
+        // Weight fields: 1-60000g range
+        foreach ( array( 'weight_per_unit_g', 'weight_grams' ) as $wf ) {
+            if ( isset( $input[ $wf ] ) ) {
+                $v = $input[ $wf ];
+                if ( $v === null || $v === '' ) { $out[ $wf ] = null; continue; }
+                $v = absint( $v );
+                if ( $v < 1 || $v > 60000 ) $errors[] = "$wf out of range 1-60000g";
+                else $out[ $wf ] = $v;
+            }
+        }
+        if ( isset( $input['tare_weight_override_g'] ) ) {
+            $v = $input['tare_weight_override_g'];
+            if ( $v === null || $v === '' ) { $out['tare_weight_override_g'] = null; }
+            else {
+                $v = absint( $v );
+                if ( $v > 5000 ) $errors[] = 'tare_weight_override_g out of range 0-5000g';
+                else $out['tare_weight_override_g'] = $v;
+            }
+        }
+        // Dim fields: 1-200cm
+        foreach ( array( 'length_cm', 'width_cm', 'height_cm', 'length_cm_override', 'width_cm_override', 'height_cm_override' ) as $df ) {
+            if ( isset( $input[ $df ] ) ) {
+                $v = $input[ $df ];
+                if ( $v === null || $v === '' ) { $out[ $df ] = null; continue; }
+                $v = absint( $v );
+                if ( $v < 1 || $v > 200 ) $errors[] = "$df out of range 1-200cm";
+                else $out[ $df ] = $v;
+            }
+        }
+        // article_category 1-99
+        if ( isset( $input['article_category'] ) ) {
+            $v = absint( $input['article_category'] );
+            if ( $v < 1 || $v > 99 ) $errors[] = 'article_category out of range';
+            else $out['article_category'] = $v;
+        }
+        // express_category_override: NULL, 1, or 4
+        if ( array_key_exists( 'express_category_override', $input ) ) {
+            $v = $input['express_category_override'];
+            if ( $v === null || $v === '' ) $out['express_category_override'] = null;
+            elseif ( in_array( absint( $v ), array( 1, 4 ), true ) ) $out['express_category_override'] = absint( $v );
+            else $errors[] = 'express_category_override must be 1, 4, or null';
+        }
+        return array( 'ok' => empty( $errors ), 'data' => $out, 'errors' => $errors );
+    };
+
+    // ═══════════════════════════════════════════════════
+    // 1. GET /box-templates — list all active templates
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/box-templates', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $req ) {
+            $owner = sanitize_text_field( $req->get_param( 'owner_type' ) );
+            $list = dinoco_get_all_box_templates( $owner ?: null );
+            return rest_ensure_response( array( 'ok' => true, 'templates' => $list ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 2. POST /box-template — create new template
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/box-template', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) use ( $validate_shipping ) {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_box_templates';
+
+            // Rate limit (S22)
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $uid = get_current_user_id();
+                $rl = b2b_rate_limit( 'box_tpl_create_u' . $uid, 10, HOUR_IN_SECONDS );
+                if ( is_wp_error( $rl ) ) return $rl;
+            }
+
+            $code = sanitize_text_field( $req->get_param( 'code' ) );
+            $name = sanitize_text_field( $req->get_param( 'name' ) );
+            $L    = absint( $req->get_param( 'length_cm' ) );
+            $W    = absint( $req->get_param( 'width_cm' ) );
+            $H    = absint( $req->get_param( 'height_cm' ) );
+            $tare = absint( $req->get_param( 'tare_weight_g' ) );
+            $maxw = absint( $req->get_param( 'max_weight_g' ) ) ?: 30000;
+            $owner= sanitize_text_field( $req->get_param( 'owner_type' ) );
+            $sort = absint( $req->get_param( 'sort_order' ) );
+
+            // Validation
+            if ( ! $code || ! $name ) return new WP_Error( 'bad_input', 'code + name required', array( 'status' => 400 ) );
+            if ( $L < 1 || $L > 200 ) return new WP_Error( 'bad_input', 'length_cm 1-200', array( 'status' => 400 ) );
+            if ( $W < 1 || $W > 200 ) return new WP_Error( 'bad_input', 'width_cm 1-200', array( 'status' => 400 ) );
+            if ( $H < 1 || $H > 200 ) return new WP_Error( 'bad_input', 'height_cm 1-200', array( 'status' => 400 ) );
+            if ( $tare > 5000 ) return new WP_Error( 'bad_input', 'tare_weight_g 0-5000', array( 'status' => 400 ) );
+            if ( ! in_array( $owner, array( 'warehouse', 'factory', 'either' ), true ) ) $owner = 'warehouse';
+
+            // Duplicate code check
+            $exists = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$tbl} WHERE code = %s", $code ) );
+            if ( $exists ) return new WP_Error( 'duplicate_code', 'รหัสกล่องซ้ำกับของเดิม', array( 'status' => 409 ) );
+
+            $wpdb->insert( $tbl, array(
+                'code'          => $code,
+                'name'          => $name,
+                'length_cm'     => $L,
+                'width_cm'      => $W,
+                'height_cm'     => $H,
+                'tare_weight_g' => $tare,
+                'max_weight_g'  => $maxw,
+                'owner_type'    => $owner,
+                'sort_order'    => $sort,
+                'is_active'     => 1,
+                'created_at'    => current_time( 'mysql' ),
+                'updated_at'    => current_time( 'mysql' ),
+            ) );
+            $new_id = $wpdb->insert_id;
+
+            // Invalidate cache
+            wp_cache_delete( 'dinoco_box_tpls_all', 'dinoco_shipping' );
+            wp_cache_delete( 'dinoco_box_tpls_warehouse', 'dinoco_shipping' );
+            wp_cache_delete( 'dinoco_box_tpls_factory', 'dinoco_shipping' );
+
+            return rest_ensure_response( array( 'ok' => true, 'id' => $new_id ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 3. POST /box-template/{id} — update existing
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/box-template/(?P<id>\d+)', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            global $wpdb;
+            $id = absint( $req['id'] );
+            $tbl = $wpdb->prefix . 'dinoco_box_templates';
+
+            $existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
+            if ( ! $existing ) return new WP_Error( 'not_found', 'template ไม่พบ', array( 'status' => 404 ) );
+
+            $update = array( 'updated_at' => current_time( 'mysql' ) );
+            foreach ( array( 'name', 'owner_type' ) as $f ) {
+                $v = $req->get_param( $f );
+                if ( $v !== null ) $update[ $f ] = sanitize_text_field( $v );
+            }
+            foreach ( array( 'length_cm', 'width_cm', 'height_cm', 'tare_weight_g', 'max_weight_g', 'sort_order' ) as $f ) {
+                $v = $req->get_param( $f );
+                if ( $v !== null ) $update[ $f ] = absint( $v );
+            }
+            // validate dims 1-200, tare 0-5000
+            foreach ( array( 'length_cm', 'width_cm', 'height_cm' ) as $df ) {
+                if ( isset( $update[ $df ] ) && ( $update[ $df ] < 1 || $update[ $df ] > 200 ) ) {
+                    return new WP_Error( 'bad_input', "$df 1-200cm", array( 'status' => 400 ) );
+                }
+            }
+            if ( isset( $update['tare_weight_g'] ) && $update['tare_weight_g'] > 5000 ) {
+                return new WP_Error( 'bad_input', 'tare 0-5000g', array( 'status' => 400 ) );
+            }
+
+            $wpdb->update( $tbl, $update, array( 'id' => $id ) );
+
+            // Invalidate caches
+            wp_cache_delete( 'dinoco_box_tpl_' . $id, 'dinoco_shipping' );
+            wp_cache_delete( 'dinoco_box_tpls_all', 'dinoco_shipping' );
+            wp_cache_delete( 'dinoco_box_tpls_warehouse', 'dinoco_shipping' );
+            wp_cache_delete( 'dinoco_box_tpls_factory', 'dinoco_shipping' );
+
+            return rest_ensure_response( array( 'ok' => true ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 4. DELETE /box-template/{id} — soft delete (is_active=0)
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/box-template/(?P<id>\d+)', [
+        'methods'  => 'DELETE',
+        'callback' => function( WP_REST_Request $req ) {
+            global $wpdb;
+            $id = absint( $req['id'] );
+            $tbl = $wpdb->prefix . 'dinoco_box_templates';
+
+            // Check if SKUs reference this template
+            $products_tbl = $wpdb->prefix . 'dinoco_products';
+            $ref_count = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$products_tbl} WHERE box_template_id = %d",
+                $id
+            ) );
+            $slots_tbl = $wpdb->prefix . 'dinoco_pack_slots';
+            $slot_count = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$slots_tbl} WHERE box_template_id = %d",
+                $id
+            ) );
+
+            $wpdb->update( $tbl, array( 'is_active' => 0, 'updated_at' => current_time( 'mysql' ) ), array( 'id' => $id ) );
+
+            wp_cache_delete( 'dinoco_box_tpl_' . $id, 'dinoco_shipping' );
+            wp_cache_delete( 'dinoco_box_tpls_all', 'dinoco_shipping' );
+
+            return rest_ensure_response( array(
+                'ok' => true,
+                'referenced_by' => array(
+                    'products' => $ref_count,
+                    'pack_slots' => $slot_count,
+                ),
+                'note' => ( $ref_count + $slot_count > 0 )
+                    ? 'Soft-deleted. SKUs ที่อ้างยังใช้ได้ (fallback to plain dims ถ้าไม่มี template)'
+                    : 'Deleted cleanly.',
+            ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 5. GET /sku-shipping/{sku} — admin full (includes cost fields if god mode)
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/sku-shipping/(?P<sku>[a-zA-Z0-9_\-]+)', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $req ) {
+            $sku = strtoupper( sanitize_text_field( $req['sku'] ) );
+            $cat = DINOCO_Catalog::get_by_sku( $sku );
+            if ( ! $cat ) return new WP_Error( 'not_found', 'SKU ไม่พบ', array( 'status' => 404 ) );
+
+            $ship = dinoco_get_sku_shipping( $sku );
+            $tpl = ! empty( $cat['box_template_id'] ) ? dinoco_get_box_template( $cat['box_template_id'] ) : null;
+            $slots = dinoco_get_pack_slots( $sku );
+            $auto_suggest = dinoco_smart_detect_pack_mode( $sku );
+
+            return rest_ensure_response( array(
+                'ok' => true,
+                'sku' => $sku,
+                'name' => $cat['name'] ?? '',
+                'shipping' => $ship,
+                'catalog' => array(
+                    'pack_mode'                 => $cat['pack_mode'] ?? 'auto',
+                    'packaging_source'          => $cat['packaging_source'] ?? 'unknown',
+                    'box_template_id'           => $cat['box_template_id'] ?? null,
+                    'weight_per_unit_g'         => $cat['weight_per_unit_g'] ?? null,
+                    'weight_grams'              => $cat['weight_grams'] ?? null,
+                    'length_cm'                 => $cat['length_cm'] ?? null,
+                    'width_cm'                  => $cat['width_cm'] ?? null,
+                    'height_cm'                 => $cat['height_cm'] ?? null,
+                    'length_cm_override'        => $cat['length_cm_override'] ?? null,
+                    'width_cm_override'         => $cat['width_cm_override'] ?? null,
+                    'height_cm_override'        => $cat['height_cm_override'] ?? null,
+                    'tare_weight_override_g'    => $cat['tare_weight_override_g'] ?? null,
+                    'article_category'          => $cat['article_category'] ?? 6,
+                    'express_category_override' => $cat['express_category_override'] ?? null,
+                    'boxes_per_unit'            => $cat['boxes_per_unit'] ?? 1,
+                    'units_per_box'             => $cat['units_per_box'] ?? 1,
+                    'shipping_updated_at'       => $cat['shipping_updated_at'] ?? null,
+                    'shipping_updated_by'       => $cat['shipping_updated_by'] ?? null,
+                ),
+                'template' => $tpl,
+                'slots' => $slots,
+                'auto_suggest_pack_mode' => $auto_suggest,
+            ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 6. GET /sku-shipping-scanner/{sku} — warehouse_staff stripped (S1/S15 B-10)
+    //    Excludes: cost fields (price_*, b2b_discount_percent, WAC), admin-only meta
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/sku-shipping-scanner/(?P<sku>[a-zA-Z0-9_\-]+)', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $req ) {
+            $sku = strtoupper( sanitize_text_field( $req['sku'] ) );
+            $cat = DINOCO_Catalog::get_by_sku( $sku );
+            if ( ! $cat ) {
+                return rest_ensure_response( array(
+                    'ok' => false,
+                    'sku' => $sku,
+                    'reason' => 'not_in_catalog',
+                    'shipping' => dinoco_shipping_defaults(),
+                ) );
+            }
+            $ship = dinoco_get_sku_shipping( $sku );
+            return rest_ensure_response( array(
+                'ok' => true,
+                'sku' => $sku,
+                'name' => $cat['name'] ?? '',
+                'shipping' => $ship,
+                // Stripped: no pricing, no WAC, no admin meta
+                'pack_mode' => $cat['pack_mode'] ?? 'auto',
+                'packaging_source' => $cat['packaging_source'] ?? 'unknown',
+                'box_template_id' => $cat['box_template_id'] ?? null,
+            ) );
+        },
+        'permission_callback' => $scanner_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 7. GET /sku-shipping — paginated list (for bulk admin UI)
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/sku-shipping', [
+        'methods'  => 'GET',
+        'callback' => function( WP_REST_Request $req ) {
+            global $wpdb;
+            $page = max( 1, absint( $req->get_param( 'page' ) ) );
+            $per_page = min( 100, max( 1, absint( $req->get_param( 'per_page' ) ) ?: 50 ) );
+            $offset = ( $page - 1 ) * $per_page;
+            $filter_status = sanitize_text_field( $req->get_param( 'status' ) );
+
+            $tbl = $wpdb->prefix . 'dinoco_products';
+            $where = 'is_active = 1';
+            if ( $filter_status === 'missing' ) {
+                // SKU ที่ pack_mode=auto/unknown AND box_template_id IS NULL AND weight_grams IS NULL
+                $where .= " AND (pack_mode IN ('auto','unknown')) AND box_template_id IS NULL AND weight_grams IS NULL";
+            } elseif ( $filter_status === 'complete' ) {
+                $where .= " AND pack_mode NOT IN ('auto','unknown') AND (box_template_id IS NOT NULL OR weight_grams IS NOT NULL)";
+            } elseif ( $filter_status === 'unknown' ) {
+                $where .= " AND pack_mode = 'unknown'";
+            }
+
+            $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl} WHERE {$where}" );
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sku, name, category, pack_mode, packaging_source, box_template_id,
+                 weight_grams, weight_per_unit_g, length_cm, width_cm, height_cm,
+                 article_category, express_category_override, shipping_updated_at
+                 FROM {$tbl} WHERE {$where} ORDER BY name ASC LIMIT %d OFFSET %d",
+                $per_page, $offset
+            ), ARRAY_A );
+
+            return rest_ensure_response( array(
+                'ok' => true,
+                'page' => $page,
+                'per_page' => $per_page,
+                'total' => $total,
+                'items' => $rows ?: array(),
+            ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 8. POST /product/shipping — per-SKU upsert
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/product/shipping', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) use ( $validate_shipping ) {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_products';
+            $uid = get_current_user_id();
+
+            $sku = strtoupper( sanitize_text_field( $req->get_param( 'sku' ) ) );
+            if ( ! $sku ) return new WP_Error( 'bad_input', 'sku required', array( 'status' => 400 ) );
+
+            $cat = DINOCO_Catalog::get_by_sku( $sku );
+            if ( ! $cat ) return new WP_Error( 'not_found', 'SKU ไม่พบใน catalog', array( 'status' => 404 ) );
+
+            $input = $req->get_json_params() ?: $req->get_params();
+            $validated = $validate_shipping( $input );
+            if ( ! $validated['ok'] ) {
+                return new WP_Error( 'validation', implode( '; ', $validated['errors'] ), array( 'status' => 400 ) );
+            }
+            $update = $validated['data'];
+            if ( empty( $update ) ) return new WP_Error( 'bad_input', 'no fields to update', array( 'status' => 400 ) );
+
+            $update['shipping_updated_by'] = $uid;
+            $update['shipping_updated_at'] = current_time( 'mysql' );
+
+            // Handle pack_slots (multi_box pack_mode) — if slots array provided, replace
+            $slots_input = $req->get_param( 'pack_slots' );
+            if ( is_array( $slots_input ) && ( $update['pack_mode'] ?? '' ) === 'multi_box' ) {
+                $slots_tbl = $wpdb->prefix . 'dinoco_pack_slots';
+                // Delete all existing slots for this SKU then re-insert
+                $wpdb->delete( $slots_tbl, array( 'product_sku' => $sku ) );
+                foreach ( $slots_input as $idx => $slot ) {
+                    if ( ! is_array( $slot ) || empty( $slot['box_template_id'] ) ) continue;
+                    $wpdb->insert( $slots_tbl, array(
+                        'product_sku'        => $sku,
+                        'slot_index'         => absint( $idx ),
+                        'slot_label'         => sanitize_text_field( $slot['slot_label'] ?? '' ),
+                        'box_template_id'    => absint( $slot['box_template_id'] ),
+                        'content_weight_g'   => isset( $slot['content_weight_g'] ) ? absint( $slot['content_weight_g'] ) : null,
+                        'length_cm_override' => isset( $slot['length_cm_override'] ) && $slot['length_cm_override'] !== '' ? absint( $slot['length_cm_override'] ) : null,
+                        'width_cm_override'  => isset( $slot['width_cm_override'] )  && $slot['width_cm_override']  !== '' ? absint( $slot['width_cm_override'] )  : null,
+                        'height_cm_override' => isset( $slot['height_cm_override'] ) && $slot['height_cm_override'] !== '' ? absint( $slot['height_cm_override'] ) : null,
+                        'tare_weight_override_g' => isset( $slot['tare_weight_override_g'] ) && $slot['tare_weight_override_g'] !== '' ? absint( $slot['tare_weight_override_g'] ) : null,
+                        'created_at'         => current_time( 'mysql' ),
+                        'updated_at'         => current_time( 'mysql' ),
+                    ) );
+                }
+            } elseif ( ( $update['pack_mode'] ?? '' ) !== 'multi_box' && isset( $update['pack_mode'] ) ) {
+                // C-B2 fix: pack_mode changed away from multi_box → cleanup orphan slots
+                $slots_tbl = $wpdb->prefix . 'dinoco_pack_slots';
+                $wpdb->delete( $slots_tbl, array( 'product_sku' => $sku ) );
+            }
+
+            $wpdb->update( $tbl, $update, array( 'sku' => $sku ) );
+
+            // Invalidate caches (P2 matrix)
+            DINOCO_Catalog::flush_memo();
+            global $wp_object_cache;
+            wp_cache_flush_group( 'dinoco_shipping' );
+
+            return rest_ensure_response( array( 'ok' => true, 'sku' => $sku, 'updated_fields' => array_keys( $update ) ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 9. POST /product/shipping/bulk — CSV bulk import (hardened B-4)
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/product/shipping/bulk', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) use ( $validate_shipping ) {
+            global $wpdb;
+            $uid = get_current_user_id();
+
+            // S22 compound rate limit — per-user + per-IP
+            if ( function_exists( 'b2b_rate_limit' ) ) {
+                $rl_u = b2b_rate_limit( 'shipping_bulk_u' . $uid, 5, HOUR_IN_SECONDS );
+                if ( is_wp_error( $rl_u ) ) return $rl_u;
+                $ip = isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : '0.0.0.0';
+                $rl_ip = b2b_rate_limit( 'shipping_bulk_ip' . md5( $ip ), 5, HOUR_IN_SECONDS );
+                if ( is_wp_error( $rl_ip ) ) return $rl_ip;
+            }
+
+            // Idempotency
+            $idem_key = $req->get_header( 'X-Idempotency-Key' );
+            if ( $idem_key ) {
+                $cached = get_transient( 'shipping_bulk_idem_' . md5( $idem_key ) );
+                if ( $cached !== false ) return rest_ensure_response( $cached );
+            }
+
+            $csv = $req->get_param( 'csv' );
+            if ( ! $csv || ! is_string( $csv ) ) return new WP_Error( 'bad_input', 'csv string required', array( 'status' => 400 ) );
+            if ( strlen( $csv ) > 100 * 1024 ) return new WP_Error( 'too_large', 'CSV > 100KB', array( 'status' => 413 ) );
+
+            $lines = preg_split( '/\r\n|\n|\r/', trim( $csv ) );
+            if ( count( $lines ) > 501 ) return new WP_Error( 'too_many', 'CSV > 500 rows', array( 'status' => 413 ) );
+
+            // Parse header
+            $header = str_getcsv( array_shift( $lines ) );
+            $header = array_map( 'trim', $header );
+
+            $tbl = $wpdb->prefix . 'dinoco_products';
+            $ok_count = 0; $errors = array();
+            foreach ( $lines as $i => $line ) {
+                if ( trim( $line ) === '' ) continue;
+                $fields = str_getcsv( $line );
+                $row = array();
+                foreach ( $header as $hi => $h ) {
+                    $val = $fields[ $hi ] ?? '';
+                    // S8 CSV injection guard — prefix single quote if leading =+-@ or tab/newline
+                    if ( is_string( $val ) && preg_match( '/^[=+\-@\t\r\n]/', $val ) ) {
+                        $val = "'" . $val;
+                    }
+                    $row[ $h ] = trim( $val );
+                }
+                if ( empty( $row['sku'] ) ) { $errors[] = "line " . ( $i + 2 ) . ": missing sku"; continue; }
+                $sku = strtoupper( $row['sku'] );
+                $cat = DINOCO_Catalog::get_by_sku( $sku );
+                if ( ! $cat ) { $errors[] = "line " . ( $i + 2 ) . " [$sku]: not in catalog"; continue; }
+
+                $validated = $validate_shipping( $row );
+                if ( ! $validated['ok'] ) { $errors[] = "line " . ( $i + 2 ) . " [$sku]: " . implode( ',', $validated['errors'] ); continue; }
+                $update = $validated['data'];
+                if ( empty( $update ) ) continue;
+                $update['shipping_updated_by'] = $uid;
+                $update['shipping_updated_at'] = current_time( 'mysql' );
+                $wpdb->update( $tbl, $update, array( 'sku' => $sku ) );
+                $ok_count++;
+            }
+
+            // Single transient invalidation AFTER loop (not per-row) — per REG-P02
+            DINOCO_Catalog::flush_memo();
+            wp_cache_flush_group( 'dinoco_shipping' );
+
+            $result = array( 'ok' => true, 'processed' => $ok_count, 'errors' => $errors );
+            if ( $idem_key ) {
+                set_transient( 'shipping_bulk_idem_' . md5( $idem_key ), $result, DAY_IN_SECONDS );
+            }
+            return rest_ensure_response( $result );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 10. GET /shipping-coverage — widget % of SKUs with complete data
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/shipping-coverage', [
+        'methods'  => 'GET',
+        'callback' => function() {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_products';
+            $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl} WHERE is_active = 1" );
+            $complete = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$tbl}
+                 WHERE is_active = 1
+                   AND pack_mode NOT IN ('auto','unknown')
+                   AND (box_template_id IS NOT NULL OR weight_grams IS NOT NULL)"
+            );
+            $missing = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$tbl}
+                 WHERE is_active = 1
+                   AND (pack_mode IN ('auto','unknown') OR (box_template_id IS NULL AND weight_grams IS NULL))"
+            );
+            $unknown = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$tbl} WHERE is_active = 1 AND pack_mode = 'unknown'"
+            );
+            $pct = $total > 0 ? round( 100.0 * $complete / $total, 1 ) : 0;
+            return rest_ensure_response( array(
+                'ok' => true,
+                'total' => $total,
+                'complete' => $complete,
+                'missing' => $missing,
+                'unknown_adhoc' => $unknown,
+                'coverage_pct' => $pct,
+                'flag_enabled' => (bool) get_option( 'dinoco_shipping_meta_enabled', '0' ),
+            ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 11a. GET /shipping-defaults — read wp_option
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/shipping-defaults', [
+        'methods'  => 'GET',
+        'callback' => function() {
+            return rest_ensure_response( array(
+                'ok' => true,
+                'defaults' => dinoco_shipping_defaults(),
+                'flag_enabled' => (bool) get_option( 'dinoco_shipping_meta_enabled', '0' ),
+            ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 11b. POST /shipping-defaults — update
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/shipping-defaults', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            $defaults = get_option( 'dinoco_shipping_defaults', array() );
+            $input = $req->get_json_params() ?: array();
+            foreach ( array( 'weight_grams', 'length_cm', 'width_cm', 'height_cm', 'article_category' ) as $f ) {
+                if ( isset( $input[ $f ] ) ) $defaults[ $f ] = absint( $input[ $f ] );
+            }
+            if ( isset( $input['express_threshold'] ) && is_array( $input['express_threshold'] ) ) {
+                foreach ( array( 'weight_g', 'max_dim_cm', 'sum_dim_cm' ) as $f ) {
+                    if ( isset( $input['express_threshold'][ $f ] ) ) {
+                        $defaults['express_threshold'][ $f ] = absint( $input['express_threshold'][ $f ] );
+                    }
+                }
+            }
+            // Flag toggle (admin critical action)
+            if ( isset( $input['flag_enabled'] ) ) {
+                update_option( 'dinoco_shipping_meta_enabled', $input['flag_enabled'] ? '1' : '0' );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[Shipping V.44] Flag toggled: ' . ( $input['flag_enabled'] ? 'ON' : 'OFF' ) . ' by user ' . get_current_user_id() );
+                }
+            }
+            update_option( 'dinoco_shipping_defaults', $defaults );
+            wp_cache_flush_group( 'dinoco_shipping' );
+            return rest_ensure_response( array( 'ok' => true, 'defaults' => $defaults ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 12. POST /shipping-compute — dry-run resolver preview (M6 test-flash-payload)
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/shipping-compute', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) {
+            $items = $req->get_param( 'items' );
+            if ( ! is_array( $items ) ) return new WP_Error( 'bad_input', 'items array required', array( 'status' => 400 ) );
+            $manifest = array();
+            foreach ( $items as $it ) {
+                $manifest[] = array(
+                    'sku' => strtoupper( sanitize_text_field( $it['sku'] ?? '' ) ),
+                    'total_qty' => absint( $it['qty'] ?? 1 ),
+                );
+            }
+            $per_pno = dinoco_resolve_manifest_shipping( $manifest );
+            return rest_ensure_response( array(
+                'ok' => true,
+                'manifest' => $manifest,
+                'per_pno'  => $per_pno,
+                'total_weight_g' => array_sum( array_column( $per_pno, 'weight_g' ) ),
+                'pno_count' => count( $per_pno ),
+            ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 13a. GET /shipping/ad-hoc-pending — M2 review queue
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/shipping/ad-hoc-pending', [
+        'methods'  => 'GET',
+        'callback' => function() {
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_products';
+            $rows = $wpdb->get_results(
+                "SELECT sku, name, category, weight_grams, length_cm, width_cm, height_cm,
+                 shipping_updated_at, shipping_updated_by
+                 FROM {$tbl}
+                 WHERE is_active = 1 AND pack_mode = 'unknown'
+                 ORDER BY shipping_updated_at DESC LIMIT 200",
+                ARRAY_A
+            );
+            return rest_ensure_response( array( 'ok' => true, 'items' => $rows ?: array(), 'total' => count( $rows ?: array() ) ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // 13b. POST /shipping/classify/{sku} — M2 admin classify ad-hoc
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/shipping/classify/(?P<sku>[a-zA-Z0-9_\-]+)', [
+        'methods'  => 'POST',
+        'callback' => function( WP_REST_Request $req ) use ( $validate_shipping ) {
+            global $wpdb;
+            $sku = strtoupper( sanitize_text_field( $req['sku'] ) );
+            $cat = DINOCO_Catalog::get_by_sku( $sku );
+            if ( ! $cat ) return new WP_Error( 'not_found', 'SKU ไม่พบ', array( 'status' => 404 ) );
+
+            $input = $req->get_json_params() ?: array();
+            $validated = $validate_shipping( $input );
+            if ( ! $validated['ok'] ) return new WP_Error( 'validation', implode( '; ', $validated['errors'] ), array( 'status' => 400 ) );
+            $update = $validated['data'];
+            if ( empty( $update['pack_mode'] ) || $update['pack_mode'] === 'unknown' ) {
+                return new WP_Error( 'bad_input', 'pack_mode must be != unknown', array( 'status' => 400 ) );
+            }
+            $update['shipping_updated_by'] = get_current_user_id();
+            $update['shipping_updated_at'] = current_time( 'mysql' );
+            $wpdb->update( $wpdb->prefix . 'dinoco_products', $update, array( 'sku' => $sku ) );
+            DINOCO_Catalog::flush_memo();
+            wp_cache_flush_group( 'dinoco_shipping' );
+            return rest_ensure_response( array( 'ok' => true, 'sku' => $sku, 'classified_as' => $update['pack_mode'] ) );
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
+    // ═══════════════════════════════════════════════════
+    // EXTRA: GET /shipping/bulk-import-template — M5 CSV template download
+    // ═══════════════════════════════════════════════════
+    register_rest_route( 'dinoco-stock/v1', '/shipping/bulk-import-template', [
+        'methods'  => 'GET',
+        'callback' => function() {
+            $header = array(
+                'sku', 'pack_mode', 'packaging_source', 'box_template_id',
+                'weight_per_unit_g', 'weight_grams',
+                'length_cm', 'width_cm', 'height_cm',
+                'length_cm_override', 'width_cm_override', 'height_cm_override', 'tare_weight_override_g',
+                'article_category', 'express_category_override',
+            );
+            $example = array(
+                array( 'DNCGND37LS', 'single_box', 'factory_packed', '5', '', '', '', '', '', '', '', '', '', '6', '' ),
+                array( 'DNCBOLT_M6', 'bulk_pack', 'factory_packed', '1', '20', '', '', '', '', '', '', '', '', '6', '' ),
+            );
+            $csv = implode( ',', $header ) . "\n";
+            foreach ( $example as $row ) $csv .= implode( ',', $row ) . "\n";
+            $response = new WP_REST_Response( $csv );
+            $response->header( 'Content-Type', 'text/csv; charset=utf-8' );
+            $response->header( 'Content-Disposition', 'attachment; filename="shipping-bulk-template.csv"' );
+            return $response;
+        },
+        'permission_callback' => $inv_perm,
+    ] );
+
 });
 
 // =========================================================================================
@@ -3325,6 +4065,35 @@ function dinoco_render_ui_v99() {
         .stock-filter-pill { padding: 6px 16px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; cursor: pointer; border: 1px solid #e2e8f0; background: white; color: #64748b; transition: 0.2s; }
         .stock-filter-pill:hover { background: #f8fafc; border-color: #94a3b8; }
         .stock-filter-pill.active { background: #1e293b; color: white; border-color: #1e293b; }
+
+        /* V.44.0 — Flash Shipping V.42 UI */
+        .sm-subtab { padding: 10px 18px; font-weight: 600; color: #64748b; cursor: pointer; border: 1px solid transparent; background: transparent; border-radius: 8px 8px 0 0; transition: 0.2s; font-size: 0.88rem; display: inline-flex; align-items: center; gap: 7px; }
+        .sm-subtab:hover { background: #f1f5f9; color: #334155; }
+        .sm-subtab.active { background: white; color: #0f172a; border-color: #e2e8f0; border-bottom-color: white; margin-bottom: -2px; box-shadow: 0 -2px 0 #10b981 inset; }
+        .sm-badge-count { display: inline-block; min-width: 20px; padding: 2px 7px; background: #dc2626; color: white; font-size: 0.7rem; font-weight: 700; border-radius: 10px; text-align: center; margin-left: 4px; }
+        .sm-badge-count[data-count="0"] { background: #94a3b8; }
+        .sm-tab-panel { animation: fadeIn 0.2s; }
+        .sm-input { width: 100%; padding: 9px 12px; border: 1px solid #cbd5e1; border-radius: 7px; font-size: 0.9rem; background: #fff; transition: 0.2s; }
+        .sm-input:focus { outline: none; border-color: #10b981; box-shadow: 0 0 0 3px rgba(16,185,129,0.12); }
+        .sm-input:disabled { background: #f1f5f9; color: #94a3b8; cursor: not-allowed; }
+        .sm-toggle input:checked + #sm-flag-label { color: #059669 !important; }
+        .sm-shipping-badge { display: inline-block; padding: 3px 9px; border-radius: 12px; font-size: 0.7rem; font-weight: 700; }
+        .sm-shipping-badge.bike { background: #dbeafe; color: #1e40af; }
+        .sm-shipping-badge.truck { background: #fef3c7; color: #b45309; }
+        .sm-shipping-badge.missing { background: #fee2e2; color: #991b1b; }
+        .sm-shipping-badge.complete { background: #dcfce7; color: #166534; }
+        .sm-shipping-badge.unknown { background: #f3e8ff; color: #7e22ce; }
+        .sm-pack-mode-pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; }
+        .sm-pack-mode-pill.single_box { background: #e0e7ff; color: #3730a3; }
+        .sm-pack-mode-pill.multi_box { background: #fef3c7; color: #92400e; }
+        .sm-pack-mode-pill.bulk_pack { background: #d1fae5; color: #065f46; }
+        .sm-pack-mode-pill.assembled_set { background: #ede9fe; color: #6d28d9; }
+        .sm-pack-mode-pill.auto { background: #e2e8f0; color: #475569; }
+        .sm-pack-mode-pill.unknown { background: #fecaca; color: #991b1b; }
+        .sm-adhoc-card { background: #fff; border: 1px solid #e2e8f0; border-left: 4px solid #dc2626; border-radius: 8px; padding: 14px; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; }
+        .sm-adhoc-card:hover { box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
+        .sm-test-row { display: grid; grid-template-columns: 2fr 100px auto; gap: 8px; align-items: center; padding: 8px; background: #f8fafc; border-radius: 7px; }
+        .sm-payload-preview { background: #1e293b; color: #e2e8f0; font-family: ui-monospace, Menlo, monospace; font-size: 0.78rem; padding: 14px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }
 
         .stock-kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 20px; }
         .stock-kpi-card { background: white; padding: 18px; border-radius: 12px; border: 1px solid #e2e8f0; text-align: center; cursor: pointer; transition: 0.2s; }
@@ -3634,6 +4403,7 @@ function dinoco_render_ui_v99() {
             <div class="main-tab" onclick="switchMainTab('stock')"><i class="fa-solid fa-warehouse"></i> Stock Management</div>
             <div class="main-tab" onclick="switchMainTab('warehouses')"><i class="fa-solid fa-building-columns"></i> คลังสินค้า</div>
             <div class="main-tab" onclick="switchMainTab('dipstock')"><i class="fa-solid fa-clipboard-check"></i> นับสต็อก (Dip Stock)</div>
+            <div class="main-tab" onclick="switchMainTab('shipping')"><i class="fa-solid fa-truck-fast"></i> Flash Shipping V.42</div>
         </div>
 
         <!-- 1. DASHBOARD -->
@@ -3983,6 +4753,167 @@ function dinoco_render_ui_v99() {
                 </div>
             </div>
         </div>
+
+        <!-- ═══════════════════════════════════════════════════════════════════ -->
+        <!-- V.44.0 PHASE 2 — FLASH SHIPPING V.42 ADMIN CENTER                   -->
+        <!-- ═══════════════════════════════════════════════════════════════════ -->
+        <div id="view-shipping" class="view-section">
+            <!-- Header + Flag Control Strip -->
+            <div class="content-box" style="margin-bottom:18px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                    <div>
+                        <h3 style="font-weight:800;color:#0f172a;font-size:1.35rem;margin:0;"><i class="fa-solid fa-truck-fast" style="color:#10b981;"></i> Flash Shipping Metadata V.42</h3>
+                        <div style="font-size:0.82rem;color:#64748b;margin-top:4px;">ระบบจัดการ weight/dims/category ต่อ SKU — ส่งข้อมูลถูกต้องไป Flash API (per-PNO)</div>
+                    </div>
+                    <div style="display:flex;gap:10px;align-items:center;">
+                        <div style="font-size:0.8rem;color:#64748b;">Feature Flag:</div>
+                        <label class="sm-toggle" style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none;padding:8px 14px;border-radius:8px;background:#f1f5f9;">
+                            <input type="checkbox" id="sm-flag-toggle" style="margin:0;transform:scale(1.3);">
+                            <span id="sm-flag-label" style="font-weight:700;font-size:0.85rem;color:#475569;">OFF</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Coverage Widget -->
+            <div class="content-box" style="margin-bottom:18px;">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:16px;">
+                    <div style="flex:1;min-width:240px;">
+                        <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;">Data Coverage (SKU ที่กรอก shipping ครบ)</div>
+                        <div style="display:flex;align-items:baseline;gap:12px;margin-top:8px;">
+                            <div style="font-size:2.6rem;font-weight:800;color:#0f172a;line-height:1;" id="sm-coverage-pct">—%</div>
+                            <div style="font-size:0.82rem;color:#64748b;" id="sm-coverage-fraction">...</div>
+                        </div>
+                        <div style="margin-top:10px;background:#e2e8f0;height:8px;border-radius:4px;overflow:hidden;"><div id="sm-coverage-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#10b981,#059669);transition:width 0.4s ease;"></div></div>
+                    </div>
+                    <div style="display:grid;grid-template-columns:repeat(3,auto);gap:14px;">
+                        <div style="text-align:center;"><div style="font-size:1.4rem;font-weight:800;color:#059669;" id="sm-cov-complete">—</div><div style="font-size:0.72rem;color:#64748b;text-transform:uppercase;font-weight:600;">Complete</div></div>
+                        <div style="text-align:center;"><div style="font-size:1.4rem;font-weight:800;color:#f59e0b;" id="sm-cov-missing">—</div><div style="font-size:0.72rem;color:#64748b;text-transform:uppercase;font-weight:600;">Missing</div></div>
+                        <div style="text-align:center;"><div style="font-size:1.4rem;font-weight:800;color:#dc2626;" id="sm-cov-unknown">—</div><div style="font-size:0.72rem;color:#64748b;text-transform:uppercase;font-weight:600;">Ad-hoc</div></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sub-tabs: Box Templates / SKU List / Ad-hoc Queue / Bulk CSV / Defaults / Test -->
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;border-bottom:2px solid #e2e8f0;padding-bottom:8px;">
+                <button class="sm-subtab active" data-sm-tab="templates" onclick="ShippingManager.switchSubtab('templates')"><i class="fa-solid fa-box-archive"></i> กล่องมาตรฐาน</button>
+                <button class="sm-subtab" data-sm-tab="skus" onclick="ShippingManager.switchSubtab('skus')"><i class="fa-solid fa-list"></i> SKU Manager</button>
+                <button class="sm-subtab" data-sm-tab="adhoc" onclick="ShippingManager.switchSubtab('adhoc')"><i class="fa-solid fa-clipboard-question"></i> Ad-hoc Queue <span id="sm-adhoc-badge" class="sm-badge-count">0</span></button>
+                <button class="sm-subtab" data-sm-tab="bulk" onclick="ShippingManager.switchSubtab('bulk')"><i class="fa-solid fa-file-csv"></i> Bulk CSV</button>
+                <button class="sm-subtab" data-sm-tab="defaults" onclick="ShippingManager.switchSubtab('defaults')"><i class="fa-solid fa-gear"></i> Defaults / Threshold</button>
+                <button class="sm-subtab" data-sm-tab="test" onclick="ShippingManager.switchSubtab('test')"><i class="fa-solid fa-flask"></i> Test Flash Payload</button>
+            </div>
+
+            <!-- Sub-tab: Box Templates CRUD -->
+            <div id="sm-tab-templates" class="sm-tab-panel">
+                <div class="content-box">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+                        <div>
+                            <h4 style="font-weight:700;color:#0f172a;margin:0;font-size:1.1rem;">📦 กล่องมาตรฐาน (Box Templates)</h4>
+                            <div style="font-size:0.78rem;color:#64748b;margin-top:3px;">จัดการขนาดกล่อง + น้ำหนักกล่องเปล่า — SKU link ไปยัง template แทนกรอก dims ซ้ำ</div>
+                        </div>
+                        <button class="btn btn-primary btn-sm rounded-lg" onclick="ShippingManager.openTemplateModal()"><i class="fa-solid fa-plus"></i> เพิ่มกล่องใหม่</button>
+                    </div>
+                    <table class="inv-table" id="sm-templates-table">
+                        <thead><tr><th>Code</th><th>ชื่อ</th><th>ขนาด (L×W×H cm)</th><th>กล่องเปล่า (g)</th><th>น้ำหนักสูงสุด</th><th>Owner</th><th>Sort</th><th>Actions</th></tr></thead>
+                        <tbody id="sm-templates-tbody"><tr><td colspan="8" style="text-align:center;padding:24px;color:#94a3b8;">กำลังโหลด...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Sub-tab: SKU Manager (list + filter) -->
+            <div id="sm-tab-skus" class="sm-tab-panel" style="display:none;">
+                <div class="content-box">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:12px;">
+                        <div>
+                            <h4 style="font-weight:700;color:#0f172a;margin:0;font-size:1.1rem;">🏷️ SKU Shipping Manager</h4>
+                            <div style="font-size:0.78rem;color:#64748b;margin-top:3px;">แสดง SKU ทั้งหมด + สถานะ shipping data</div>
+                        </div>
+                        <div style="display:flex;gap:8px;">
+                            <select id="sm-sku-filter" onchange="ShippingManager.loadSkus()" class="filter-select">
+                                <option value="">ทั้งหมด</option>
+                                <option value="complete">✓ ครบข้อมูล</option>
+                                <option value="missing">⚠️ ขาดข้อมูล</option>
+                                <option value="unknown">⚡ Ad-hoc (unknown)</option>
+                            </select>
+                            <button class="btn btn-outline btn-sm" onclick="ShippingManager.loadSkus()"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                        </div>
+                    </div>
+                    <table class="inv-table">
+                        <thead><tr><th>SKU</th><th>ชื่อ</th><th>Pack Mode</th><th>Source</th><th>Box Template</th><th>Weight</th><th>Dims</th><th>EC Override</th><th>Updated</th><th></th></tr></thead>
+                        <tbody id="sm-skus-tbody"><tr><td colspan="10" style="text-align:center;padding:24px;color:#94a3b8;">เลือกฟิลเตอร์แล้วกด Refresh</td></tr></tbody>
+                    </table>
+                    <div id="sm-skus-pagination" style="margin-top:12px;text-align:center;"></div>
+                </div>
+            </div>
+
+            <!-- Sub-tab: Ad-hoc Review Queue (M2) -->
+            <div id="sm-tab-adhoc" class="sm-tab-panel" style="display:none;">
+                <div class="content-box">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+                        <div>
+                            <h4 style="font-weight:700;color:#0f172a;margin:0;font-size:1.1rem;">⚡ Ad-hoc SKU Review Queue</h4>
+                            <div style="font-size:0.78rem;color:#64748b;margin-top:3px;">SKU ที่ warehouse staff สแกน + save-back — admin ต้อง classify pack_mode + link template</div>
+                        </div>
+                        <button class="btn btn-outline btn-sm" onclick="ShippingManager.loadAdhoc()"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                    </div>
+                    <div id="sm-adhoc-list" style="display:grid;gap:10px;"><div style="padding:24px;text-align:center;color:#94a3b8;">กำลังโหลด...</div></div>
+                </div>
+            </div>
+
+            <!-- Sub-tab: Bulk CSV (M5) -->
+            <div id="sm-tab-bulk" class="sm-tab-panel" style="display:none;">
+                <div class="content-box">
+                    <h4 style="font-weight:700;color:#0f172a;margin:0 0 14px 0;font-size:1.1rem;">📁 Bulk CSV Import</h4>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
+                        <a href="/wp-json/dinoco-stock/v1/shipping/bulk-import-template" class="btn btn-outline btn-sm" target="_blank"><i class="fa-solid fa-download"></i> ดาวน์โหลด Template CSV</a>
+                        <button class="btn btn-primary btn-sm" onclick="document.getElementById('sm-csv-file').click()"><i class="fa-solid fa-upload"></i> อัพโหลด CSV</button>
+                        <input type="file" id="sm-csv-file" accept=".csv" style="display:none;" onchange="ShippingManager.handleCsvUpload(event)">
+                    </div>
+                    <div id="sm-csv-preview" style="display:none;border:1px solid #e2e8f0;border-radius:8px;padding:14px;background:#f8fafc;"></div>
+                    <div id="sm-csv-result" style="margin-top:14px;"></div>
+                    <div style="margin-top:18px;padding:12px;background:#eff6ff;border-left:3px solid #3b82f6;font-size:0.8rem;color:#1e40af;border-radius:4px;">
+                        <strong>⚠️ ข้อจำกัด:</strong> ≤500 rows, ≤100KB. Rate limit 5/ชม (per user + IP). CSV injection auto-strip ({{=|+|@|-}} prefix)
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sub-tab: Defaults / Threshold -->
+            <div id="sm-tab-defaults" class="sm-tab-panel" style="display:none;">
+                <div class="content-box">
+                    <h4 style="font-weight:700;color:#0f172a;margin:0 0 14px 0;font-size:1.1rem;">⚙️ Global Defaults + Express Threshold</h4>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:20px;">
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Default Weight (g)</label><input id="sm-def-weight" type="number" class="sm-input" min="1" max="60000"></div>
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Default Length (cm)</label><input id="sm-def-length" type="number" class="sm-input" min="1" max="200"></div>
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Default Width (cm)</label><input id="sm-def-width" type="number" class="sm-input" min="1" max="200"></div>
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Default Height (cm)</label><input id="sm-def-height" type="number" class="sm-input" min="1" max="200"></div>
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Article Category (Flash enum)</label><input id="sm-def-ac" type="number" class="sm-input" min="1" max="99"></div>
+                    </div>
+                    <h5 style="font-weight:700;color:#0f172a;margin:0 0 10px 0;font-size:0.95rem;border-top:1px solid #e2e8f0;padding-top:14px;">🚚 Vehicle Threshold (expressCategory=4 trigger)</h5>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;">
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Weight &gt; (g) → Truck</label><input id="sm-thr-w" type="number" class="sm-input" min="1000" max="30000"></div>
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Any dim &gt; (cm)</label><input id="sm-thr-d" type="number" class="sm-input" min="20" max="100"></div>
+                        <div><label style="font-size:0.8rem;color:#64748b;font-weight:600;">Sum L+W+H &gt; (cm)</label><input id="sm-thr-s" type="number" class="sm-input" min="60" max="300"></div>
+                    </div>
+                    <button class="btn btn-primary" style="margin-top:16px;" onclick="ShippingManager.saveDefaults()"><i class="fa-solid fa-check"></i> บันทึก Defaults</button>
+                </div>
+            </div>
+
+            <!-- Sub-tab: Test Flash Payload (M6) -->
+            <div id="sm-tab-test" class="sm-tab-panel" style="display:none;">
+                <div class="content-box">
+                    <h4 style="font-weight:700;color:#0f172a;margin:0 0 14px 0;font-size:1.1rem;">🧪 Test Flash Payload Preview</h4>
+                    <div style="font-size:0.82rem;color:#64748b;margin-bottom:12px;">กรอก SKU + จำนวน → preview per-PNO shipping (weight/dims/category) ที่จะส่งให้ Flash API</div>
+                    <div id="sm-test-rows" style="display:grid;gap:8px;"></div>
+                    <button class="btn btn-outline btn-sm" onclick="ShippingManager.addTestRow()" style="margin-top:10px;"><i class="fa-solid fa-plus"></i> เพิ่ม SKU</button>
+                    <button class="btn btn-primary" style="margin-top:10px;margin-left:6px;" onclick="ShippingManager.computeTestPayload()"><i class="fa-solid fa-play"></i> Compute Preview</button>
+                    <div id="sm-test-result" style="margin-top:16px;"></div>
+                </div>
+            </div>
+        </div>
+        <!-- ═══════════════════════════════════════════════════════════════════ -->
+        <!-- END V.44.0 PHASE 2 — FLASH SHIPPING ADMIN CENTER                    -->
+        <!-- ═══════════════════════════════════════════════════════════════════ -->
     </div>
 
     <!-- Modals -->
@@ -4111,6 +5042,115 @@ function dinoco_render_ui_v99() {
                                 <div id="cedit-box-preview-lines" style="font-size:12px;color:#15803d;line-height:1.6;"></div>
                             </div>
                         </div>
+
+                        <!-- V.44.0 PHASE 2 — Flash Shipping V.42 Section -->
+                        <div id="cat-shipping-v42" style="margin:14px 0;padding:16px;background:linear-gradient(135deg,#f0fdf4,#ecfeff);border-radius:10px;border:1px solid #86efac;">
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;justify-content:space-between;flex-wrap:wrap;">
+                                <div style="display:flex;align-items:center;gap:8px;">
+                                    <i class="fa-solid fa-truck-fast" style="color:#10b981;font-size:18px;"></i>
+                                    <span style="font-size:14px;font-weight:800;color:#065f46;">Flash Shipping V.42 (ขนาด + น้ำหนักพัสดุ)</span>
+                                    <span id="cat-ship-auto-hint" style="font-size:11px;padding:2px 8px;border-radius:10px;background:#d1fae5;color:#065f46;font-weight:600;">auto: —</span>
+                                </div>
+                                <button type="button" class="btn btn-outline btn-sm" style="font-size:11px;padding:4px 10px;" onclick="catApplySmartPackMode()"><i class="fa-solid fa-wand-magic-sparkles"></i> Suggest from bpu/upb</button>
+                            </div>
+
+                            <!-- Row 1: pack_mode + packaging_source -->
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                                <div>
+                                    <label class="cedit-label" style="font-size:11px;">รูปแบบการบรรจุ (pack_mode)</label>
+                                    <select id="cat-pack-mode" class="cedit-input" onchange="catTogglePackModeUI()">
+                                        <option value="auto">auto — คำนวณจาก leaves (SET)</option>
+                                        <option value="single_box">single_box — 1 ชิ้น = 1 กล่อง</option>
+                                        <option value="multi_box">multi_box — 1 ชิ้น = N กล่องคนละขนาด</option>
+                                        <option value="bulk_pack">bulk_pack — N ชิ้น = 1 กล่อง (น็อต/สกรู)</option>
+                                        <option value="assembled_set">assembled_set — SET ประกอบแล้ว 1 กล่อง</option>
+                                        <option value="unknown">unknown — ad-hoc (admin classify ทีหลัง)</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="cedit-label" style="font-size:11px;">ที่มาของกล่อง (packaging_source)</label>
+                                    <select id="cat-pkg-source" class="cedit-input">
+                                        <option value="unknown">unknown — ยังไม่ระบุ</option>
+                                        <option value="warehouse_packed">warehouse_packed — แพ็คที่โกดัง</option>
+                                        <option value="factory_packed">factory_packed — กล่องโรงงาน</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- Row 2: Box Template picker -->
+                            <div id="cat-ship-tpl-row" style="margin-bottom:10px;">
+                                <label class="cedit-label" style="font-size:11px;">กล่องมาตรฐาน (Box Template)</label>
+                                <select id="cat-box-tpl" class="cedit-input">
+                                    <option value="">— ไม่ใช้ template (กรอก dims เอง) —</option>
+                                </select>
+                                <div id="cat-tpl-info" style="font-size:11px;color:#065f46;margin-top:4px;display:none;"></div>
+                            </div>
+
+                            <!-- Row 3: Weight -->
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+                                <div>
+                                    <label class="cedit-label" style="font-size:11px;">น้ำหนักเนื้อสินค้า/ชิ้น (g) <span style="color:#94a3b8;">weight_per_unit_g</span></label>
+                                    <input type="number" id="cat-weight-per-unit" class="cedit-input" min="1" max="60000" placeholder="ไม่รวมกล่อง">
+                                </div>
+                                <div>
+                                    <label class="cedit-label" style="font-size:11px;">น้ำหนักรวม (g) <span style="color:#94a3b8;">weight_grams — ใช้เมื่อไม่มี template</span></label>
+                                    <input type="number" id="cat-weight-gross" class="cedit-input" min="1" max="60000" placeholder="gross (content + box)">
+                                </div>
+                            </div>
+
+                            <!-- Row 4: Plain dims (if no template) -->
+                            <div id="cat-plain-dims-row" style="margin-bottom:10px;">
+                                <label class="cedit-label" style="font-size:11px;">ขนาดกล่อง (cm) — ใช้เมื่อไม่มี template</label>
+                                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+                                    <input type="number" id="cat-len" class="cedit-input" placeholder="L" min="1" max="200">
+                                    <input type="number" id="cat-wid" class="cedit-input" placeholder="W" min="1" max="200">
+                                    <input type="number" id="cat-hei" class="cedit-input" placeholder="H" min="1" max="200">
+                                </div>
+                            </div>
+
+                            <!-- Row 5: Override (collapsible — if template selected) -->
+                            <details id="cat-override-block" style="margin-bottom:10px;">
+                                <summary style="cursor:pointer;font-size:12px;font-weight:600;color:#065f46;padding:6px 0;">⚙️ ปรับ dims override (กรอกเฉพาะถ้า template ไม่พอดี)</summary>
+                                <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:6px;">
+                                    <input type="number" id="cat-len-ov" class="cedit-input" placeholder="L (cm)" min="1" max="200">
+                                    <input type="number" id="cat-wid-ov" class="cedit-input" placeholder="W (cm)" min="1" max="200">
+                                    <input type="number" id="cat-hei-ov" class="cedit-input" placeholder="H (cm)" min="1" max="200">
+                                    <input type="number" id="cat-tare-ov" class="cedit-input" placeholder="Tare (g)" min="0" max="5000">
+                                </div>
+                                <div style="font-size:10px;color:#64748b;margin-top:4px;">ว่าง = ใช้ค่า template. กรอก = override เฉพาะ SKU นี้</div>
+                            </details>
+
+                            <!-- Row 6: Express category -->
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                                <div>
+                                    <label class="cedit-label" style="font-size:11px;">Article Category (Flash enum)</label>
+                                    <input type="number" id="cat-article-cat" class="cedit-input" min="1" max="99" value="6" placeholder="6 = อะไหล่รถยนต์">
+                                </div>
+                                <div>
+                                    <label class="cedit-label" style="font-size:11px;">Express Category (vehicle)</label>
+                                    <select id="cat-ec-override" class="cedit-input">
+                                        <option value="">auto — ระบบเลือกตามน้ำหนัก/ขนาด</option>
+                                        <option value="1">🏍️ 1 — มอเตอร์ไซค์ (บังคับ)</option>
+                                        <option value="4">🚚 4 — รถกระบะ (บังคับ)</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- Preview strip -->
+                            <div id="cat-ship-preview" style="display:none;margin-top:10px;padding:10px 14px;background:#ecfdf5;border-radius:8px;border:1px solid #6ee7b7;font-size:12px;color:#065f46;">
+                                <strong>📦 Flash Preview:</strong> <span id="cat-ship-preview-text">—</span>
+                            </div>
+
+                            <!-- Multi-box pack_slots editor (hidden until pack_mode=multi_box) -->
+                            <div id="cat-multi-box-slots" style="display:none;margin-top:10px;padding:12px;background:#fef3c7;border-radius:8px;border:1px solid #fcd34d;">
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                                    <strong style="font-size:12px;color:#92400e;">🗂️ Multi-box Pack Slots (N กล่องคนละขนาด)</strong>
+                                    <button type="button" class="btn btn-outline btn-sm" style="font-size:11px;" onclick="catAddPackSlot()"><i class="fa-solid fa-plus"></i> เพิ่ม slot</button>
+                                </div>
+                                <div id="cat-pack-slots-list"></div>
+                            </div>
+                        </div>
+
                         <!-- B2B Visible Toggle -->
                         <div style="margin:12px 0;padding:12px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;">
                             <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;font-weight:600;color:#334155;">
@@ -4519,6 +5559,7 @@ function dinoco_render_ui_v99() {
             if(t==='stock') { $('#view-stock').show().addClass('active'); $('.main-tab:eq(4)').addClass('active'); StockManager.loadStock(); }
             if(t==='warehouses') { $('#view-warehouses').show().addClass('active'); $('.main-tab:eq(5)').addClass('active'); WarehouseManager.loadWarehouses(); }
             if(t==='dipstock') { $('#view-dipstock').show().addClass('active'); $('.main-tab:eq(6)').addClass('active'); DipStockManager.checkSession(); }
+            if(t==='shipping') { $('#view-shipping').show().addClass('active'); $('.main-tab:eq(7)').addClass('active'); if (window.ShippingManager) { ShippingManager.init(); } }
         };
 
         window.goToInventory = function(filter) { switchMainTab('list'); $('#inv-filter').val(filter); executeGlobalSearch(); };
@@ -5176,6 +6217,192 @@ function dinoco_render_ui_v99() {
             });
         };
 
+        // ═════════════════════════════════════════════════════════════════════
+        // V.44.0 PHASE 2 — Flash Shipping V.42 helpers for Edit Product Modal
+        // ═════════════════════════════════════════════════════════════════════
+        var _catBoxTemplates = [];  // cache of templates (loaded once)
+
+        window.catLoadBoxTemplates = function(callback) {
+            if (_catBoxTemplates.length) { if (callback) callback(_catBoxTemplates); return; }
+            $.ajax({ url: STOCK_API_EARLY + '/box-templates', method: 'GET',
+                headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY },
+                success: function(res) {
+                    _catBoxTemplates = (res.templates || []).filter(function(t) { return t.is_active == 1; });
+                    var sel = $('#cat-box-tpl');
+                    sel.empty().append('<option value="">— ไม่ใช้ template (กรอก dims เอง) —</option>');
+                    _catBoxTemplates.forEach(function(t) {
+                        sel.append('<option value="' + t.id + '" data-L="' + t.length_cm + '" data-W="' + t.width_cm + '" data-H="' + t.height_cm + '" data-tare="' + t.tare_weight_g + '">' + t.code + ' — ' + t.name + ' (' + t.length_cm + '×' + t.width_cm + '×' + t.height_cm + 'cm, tare ' + t.tare_weight_g + 'g)</option>');
+                    });
+                    if (callback) callback(_catBoxTemplates);
+                }});
+        };
+
+        window.catResetShipping = function() {
+            catLoadBoxTemplates();
+            $('#cat-pack-mode').val('auto');
+            $('#cat-pkg-source').val('unknown');
+            $('#cat-box-tpl').val('');
+            $('#cat-weight-per-unit').val('');
+            $('#cat-weight-gross').val('');
+            $('#cat-len').val(''); $('#cat-wid').val(''); $('#cat-hei').val('');
+            $('#cat-len-ov').val(''); $('#cat-wid-ov').val(''); $('#cat-hei-ov').val(''); $('#cat-tare-ov').val('');
+            $('#cat-article-cat').val(6);
+            $('#cat-ec-override').val('');
+            $('#cat-ship-preview').hide();
+            $('#cat-ship-auto-hint').text('auto: —');
+            $('#cat-multi-box-slots').hide();
+            $('#cat-pack-slots-list').empty();
+            catTogglePackModeUI();
+        };
+
+        window.catLoadShipping = function(sku) {
+            if (!sku) return;
+            catLoadBoxTemplates(function() {
+                $.ajax({ url: STOCK_API_EARLY + '/sku-shipping/' + encodeURIComponent(sku), method: 'GET',
+                    headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY },
+                    success: function(res) {
+                        if (!res.ok) { catResetShipping(); return; }
+                        var cat = res.catalog || {};
+                        $('#cat-pack-mode').val(cat.pack_mode || 'auto');
+                        $('#cat-pkg-source').val(cat.packaging_source || 'unknown');
+                        $('#cat-box-tpl').val(cat.box_template_id || '');
+                        $('#cat-weight-per-unit').val(cat.weight_per_unit_g || '');
+                        $('#cat-weight-gross').val(cat.weight_grams || '');
+                        $('#cat-len').val(cat.length_cm || '');
+                        $('#cat-wid').val(cat.width_cm || '');
+                        $('#cat-hei').val(cat.height_cm || '');
+                        $('#cat-len-ov').val(cat.length_cm_override || '');
+                        $('#cat-wid-ov').val(cat.width_cm_override || '');
+                        $('#cat-hei-ov').val(cat.height_cm_override || '');
+                        $('#cat-tare-ov').val(cat.tare_weight_override_g || '');
+                        $('#cat-article-cat').val(cat.article_category || 6);
+                        $('#cat-ec-override').val(cat.express_category_override || '');
+                        $('#cat-ship-auto-hint').text('auto: ' + (res.auto_suggest_pack_mode || '—'));
+                        catTogglePackModeUI();
+                        catRenderShipPreview(res);
+                        // Render multi_box slots if applicable
+                        if ((cat.pack_mode === 'multi_box') && (res.slots || []).length) {
+                            $('#cat-pack-slots-list').empty();
+                            res.slots.forEach(function(s, idx) {
+                                catAddPackSlot(s, idx);
+                            });
+                        }
+                    },
+                    error: function() { catResetShipping(); }
+                });
+            });
+        };
+
+        window.catRenderShipPreview = function(res) {
+            var ship = res && res.shipping ? res.shipping : null;
+            if (!ship) { $('#cat-ship-preview').hide(); return; }
+            var ec = ship.express_category === 4 ? '🚚 รถกระบะ (truck)' : '🏍️ มอเตอร์ไซค์ (bike)';
+            var line = (ship.weight_g || 0) + 'g · ' + (ship.length_cm || 0) + '×' + (ship.width_cm || 0) + '×' + (ship.height_cm || 0) + 'cm · ' + ec + ' <span style="opacity:0.6;">(source: ' + (ship.source || '—') + ')</span>';
+            $('#cat-ship-preview-text').html(line);
+            $('#cat-ship-preview').show();
+        };
+
+        window.catTogglePackModeUI = function() {
+            var mode = $('#cat-pack-mode').val();
+            // Show/hide plain dims row based on mode + template
+            var hasTpl = !!$('#cat-box-tpl').val();
+            if (mode === 'multi_box') {
+                $('#cat-multi-box-slots').show();
+                $('#cat-ship-tpl-row').hide();
+                $('#cat-plain-dims-row').hide();
+                $('#cat-override-block').hide();
+            } else {
+                $('#cat-multi-box-slots').hide();
+                $('#cat-ship-tpl-row').show();
+                // Plain dims shown only if no template
+                if (hasTpl) {
+                    $('#cat-plain-dims-row').hide();
+                    $('#cat-override-block').show();
+                } else {
+                    $('#cat-plain-dims-row').show();
+                    $('#cat-override-block').hide();
+                }
+            }
+        };
+
+        window.catApplySmartPackMode = function() {
+            var sku = $('#cat-sku').val();
+            if (!sku) { Swal.fire({icon:'warning', title:'บันทึก SKU ก่อน'}); return; }
+            var bpu = parseInt($('#cat-bpu').val()) || 1;
+            var upb = parseInt($('#cat-upb').val()) || 1;
+            var hasChildren = (skuRelations[sku] && skuRelations[sku].length > 0);
+            var suggested = 'auto';
+            if (upb > 1) suggested = 'bulk_pack';
+            else if (bpu > 1) suggested = 'multi_box';
+            else if (hasChildren && bpu === 1) suggested = 'assembled_set';
+            else if (!hasChildren && bpu === 1) suggested = 'single_box';
+            $('#cat-pack-mode').val(suggested);
+            catTogglePackModeUI();
+            Swal.fire({icon:'success', title:'Suggested: ' + suggested, text:'bpu=' + bpu + ', upb=' + upb + ', has children=' + hasChildren, timer: 2000});
+        };
+
+        window.catAddPackSlot = function(existing, idx) {
+            var i = (idx !== undefined) ? idx : $('#cat-pack-slots-list .sm-pack-slot-row').length;
+            var tplOpts = '<option value="">— เลือก template —</option>';
+            _catBoxTemplates.forEach(function(t) { tplOpts += '<option value="' + t.id + '"' + (existing && existing.box_template_id == t.id ? ' selected' : '') + '>' + t.code + ' (' + t.length_cm + '×' + t.width_cm + '×' + t.height_cm + ')</option>'; });
+            var row = $('<div class="sm-pack-slot-row" style="display:grid;grid-template-columns:30px 1fr 2fr 100px auto;gap:6px;align-items:center;margin-bottom:6px;padding:6px;background:white;border-radius:6px;">');
+            row.append('<div style="font-weight:700;color:#92400e;">#' + i + '</div>');
+            row.append('<input placeholder="ชื่อ slot" class="sm-input slot-label" value="' + (existing && existing.slot_label ? existing.slot_label : '') + '">');
+            row.append('<select class="sm-input slot-tpl">' + tplOpts + '</select>');
+            row.append('<input type="number" min="0" max="60000" placeholder="เนื้อ g" class="sm-input slot-content" value="' + (existing && existing.content_weight_g ? existing.content_weight_g : '') + '">');
+            row.append('<button type="button" class="btn btn-outline btn-sm" style="color:#dc2626;" onclick="$(this).closest(\'.sm-pack-slot-row\').remove();"><i class="fa-solid fa-trash"></i></button>');
+            $('#cat-pack-slots-list').append(row);
+        };
+
+        window.catBuildShippingPayload = function(sku) {
+            // Only build if user touched something in the V.42 section
+            var mode = $('#cat-pack-mode').val();
+            if (!mode) return null;
+            var payload = {
+                sku: sku,
+                pack_mode: mode,
+                packaging_source: $('#cat-pkg-source').val() || 'unknown',
+                box_template_id: $('#cat-box-tpl').val() || null,
+                weight_per_unit_g: $('#cat-weight-per-unit').val() || null,
+                weight_grams: $('#cat-weight-gross').val() || null,
+                length_cm: $('#cat-len').val() || null,
+                width_cm: $('#cat-wid').val() || null,
+                height_cm: $('#cat-hei').val() || null,
+                length_cm_override: $('#cat-len-ov').val() || null,
+                width_cm_override: $('#cat-wid-ov').val() || null,
+                height_cm_override: $('#cat-hei-ov').val() || null,
+                tare_weight_override_g: $('#cat-tare-ov').val() || null,
+                article_category: $('#cat-article-cat').val() || 6,
+                express_category_override: $('#cat-ec-override').val() || null
+            };
+            // Handle multi_box slots
+            if (mode === 'multi_box') {
+                payload.pack_slots = [];
+                $('#cat-pack-slots-list .sm-pack-slot-row').each(function(idx) {
+                    var $row = $(this);
+                    var tplId = $row.find('.slot-tpl').val();
+                    if (!tplId) return;
+                    payload.pack_slots.push({
+                        slot_label: $row.find('.slot-label').val() || '',
+                        box_template_id: tplId,
+                        content_weight_g: $row.find('.slot-content').val() || null
+                    });
+                });
+            }
+            return payload;
+        };
+
+        // Wire template dropdown onchange to re-toggle UI + populate overrides placeholders
+        $(document).on('change', '#cat-box-tpl', function() {
+            var tpl = $(this).find('option:selected');
+            if (tpl.val()) {
+                $('#cat-tpl-info').text('Template ' + tpl.text() + ' — dims จะใช้ตาม template. กรอก override เฉพาะช่องที่ต้องการต่าง').show();
+            } else {
+                $('#cat-tpl-info').hide();
+            }
+            catTogglePackModeUI();
+        });
+
         window.openEditCatalogModal = function(sku = null) {
             // Ensure catalogData is loaded (may be empty if opened from Stock tab)
             function _openModal() {
@@ -5312,6 +6539,8 @@ function dinoco_render_ui_v99() {
                     // V.41.2: Show auto-split button สำหรับ child + single ที่ยังไม่มี children
                     var _canSplit = (typeInfo.type === 'child' || typeInfo.type === 'single') && (!skuRelations[sku] || skuRelations[sku].length === 0);
                     $('#cedit-auto-split').toggle(_canSplit);
+                    // V.44.0 PHASE 2: Load Flash Shipping V.42 data
+                    catLoadShipping(sku);
                 } else {
                     $('#cat-modal-title').text('เพิ่มสินค้าใหม่');
                     $('#cat-modal-sku-badge').text('NEW').show();
@@ -5335,6 +6564,8 @@ function dinoco_render_ui_v99() {
                     $('#cedit-set-section').show();
                     // V.40.9: Hide auto-split (only for existing child with no grandchildren)
                     $('#cedit-auto-split').hide();
+                    // V.44.0 PHASE 2: Reset Flash Shipping V.42 fields + preload templates
+                    catResetShipping();
                 }
                 document.body.style.overflow = 'hidden';
                 $('#modal-catalog-editor').fadeIn(150).css('display','flex');
@@ -5884,6 +7115,17 @@ function dinoco_render_ui_v99() {
                 requests.push(
                     $.ajax({ url: STOCK_API_EARLY + '/product/pricing', method: 'POST', contentType: 'application/json', headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY }, data: JSON.stringify(pricingData) }).done(function(pr) { console.log('[Pricing] response:', pr); })
                 );
+
+                // V.44.0 PHASE 2: save Flash shipping V.42 data in parallel
+                var shipPayload = catBuildShippingPayload(sku);
+                if (shipPayload) {
+                    requests.push(
+                        $.ajax({ url: STOCK_API_EARLY + '/product/shipping', method: 'POST', contentType: 'application/json', headers: { 'X-WP-Nonce': STOCK_NONCE_EARLY }, data: JSON.stringify(shipPayload) })
+                            .done(function(sr) { console.log('[Shipping V.42] response:', sr); })
+                            .fail(function(xhr) { console.warn('[Shipping V.42] save failed:', xhr.responseJSON || xhr.statusText); })
+                    );
+                }
+
                 $.when.apply($, requests).done(function() {
                     // V.42.6: inspect save_sku_relation response — HTTP 200 แต่ success:false = error (เช่น parent_has_stock)
                     if (relationResponse && relationResponse.success === false) {
@@ -6819,8 +8061,24 @@ function dinoco_render_ui_v99() {
                             }
                         } catch(e) {}
                         // V.42.12: childCountHtml removed — hierarchySubtitle ครอบคลุมแล้ว
+                        // V.44.0 PHASE 2: Flash Shipping V.42 badge
+                        let shipBadge = '';
+                        let pm = item.pack_mode || '';
+                        let ec = parseInt(item.express_category_override || 0);
+                        let hasShipData = (item.box_template_id || item.weight_grams || item.weight_per_unit_g);
+                        if (ec === 4) {
+                            shipBadge = '<span class="sm-shipping-badge truck" style="position:absolute;top:10px;left:10px;z-index:4;" title="Flash truck (expressCategory=4)">🚚</span>';
+                        } else if (ec === 1) {
+                            shipBadge = '<span class="sm-shipping-badge bike" style="position:absolute;top:10px;left:10px;z-index:4;" title="Flash bike (expressCategory=1)">🏍️</span>';
+                        } else if (pm === 'unknown') {
+                            shipBadge = '<span class="sm-shipping-badge unknown" style="position:absolute;top:10px;left:10px;z-index:4;" title="pack_mode=unknown — รอ admin classify">⚡</span>';
+                        } else if (pm && pm !== 'auto' && hasShipData) {
+                            shipBadge = '<span class="sm-shipping-badge complete" style="position:absolute;top:10px;left:10px;z-index:4;" title="Shipping data ครบ">✓</span>';
+                        } else if (!hasShipData && pm !== 'auto') {
+                            shipBadge = '<span class="sm-shipping-badge missing" style="position:absolute;top:10px;left:10px;z-index:4;" title="Shipping data ยังไม่ครบ">⚠️</span>';
+                        }
                         // V.42.0 [C-4 FIX]: esc() all dynamic values to prevent stored XSS
-                        html += `<div class="catalog-item" ${typeAttr} style="${cardOpacity}" onclick="searchCatalogItem('${esc(sku)}')">${deleteBtn}${editBtn}${badge}${hierarchyBadge}${hiddenBadge}<div class="catalog-img-wrap">${imgHtml}</div><div class="catalog-body"><span class="catalog-sku">${esc(sku)}</span><div class="catalog-title">${esc(item.name)}</div><div class="text-xs text-slate-400 mb-1">Warranty: ${esc(String(item.years||''))} Years</div><div class="catalog-price">${esc(String(item.price||''))} ฿${discBadge}</div>${stdPrice}${hierarchySubtitle}${compatHtml}</div></div>`;
+                        html += `<div class="catalog-item" ${typeAttr} style="${cardOpacity}" onclick="searchCatalogItem('${esc(sku)}')">${deleteBtn}${editBtn}${badge}${hierarchyBadge}${hiddenBadge}${shipBadge}<div class="catalog-img-wrap">${imgHtml}</div><div class="catalog-body"><span class="catalog-sku">${esc(sku)}</span><div class="catalog-title">${esc(item.name)}</div><div class="text-xs text-slate-400 mb-1">Warranty: ${esc(String(item.years||''))} Years</div><div class="catalog-price">${esc(String(item.price||''))} ฿${discBadge}</div>${stdPrice}${hierarchySubtitle}${compatHtml}</div></div>`;
                     });
                     $('#catalog-container').html(html);
                     updateFilterCounts();
@@ -8320,6 +9578,427 @@ function dinoco_render_ui_v99() {
                 });
             }
         };
+
+        /* =======================================================
+         * ShippingManager — Flash Shipping V.42 (V.44.0 Phase 2)
+         * Manages box templates, SKU shipping, ad-hoc queue,
+         * bulk CSV, defaults, test payload preview.
+         * ======================================================= */
+        window.ShippingManager = {
+            _loaded: false,
+            _currentSubtab: 'templates',
+            _testRows: [],
+
+            init: function() {
+                const self = this;
+                self.loadCoverage();
+                self.loadTemplates();
+                self.loadDefaults();
+                // Pre-count ad-hoc queue for badge
+                $.ajax({ url: STOCK_API + '/shipping/ad-hoc-pending', method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const n = (res.items || []).length;
+                        $('#sm-adhoc-badge').text(n).attr('data-count', n);
+                    }});
+                self._loaded = true;
+            },
+
+            switchSubtab: function(tab) {
+                this._currentSubtab = tab;
+                $('.sm-subtab').removeClass('active');
+                $('.sm-subtab[data-sm-tab="' + tab + '"]').addClass('active');
+                $('.sm-tab-panel').hide();
+                $('#sm-tab-' + tab).show();
+                if (tab === 'skus') this.loadSkus();
+                else if (tab === 'adhoc') this.loadAdhoc();
+                else if (tab === 'test') { if (!this._testRows.length) this.addTestRow(); }
+            },
+
+            loadCoverage: function() {
+                $.ajax({ url: STOCK_API + '/shipping-coverage', method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        if (!res.ok) return;
+                        $('#sm-coverage-pct').text(res.coverage_pct + '%');
+                        $('#sm-coverage-fraction').text(res.complete + ' / ' + res.total + ' SKUs');
+                        $('#sm-coverage-bar').css('width', res.coverage_pct + '%');
+                        $('#sm-cov-complete').text(res.complete);
+                        $('#sm-cov-missing').text(res.missing);
+                        $('#sm-cov-unknown').text(res.unknown_adhoc);
+                        // Flag state
+                        $('#sm-flag-toggle').prop('checked', !!res.flag_enabled);
+                        $('#sm-flag-label').text(res.flag_enabled ? 'ON' : 'OFF').css('color', res.flag_enabled ? '#059669' : '#475569');
+                    }});
+            },
+
+            loadTemplates: function() {
+                $.ajax({ url: STOCK_API + '/box-templates', method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const tbody = $('#sm-templates-tbody');
+                        if (!res.ok || !(res.templates || []).length) {
+                            tbody.html('<tr><td colspan="8" style="text-align:center;padding:24px;color:#94a3b8;">ไม่มี template</td></tr>');
+                            return;
+                        }
+                        tbody.empty();
+                        res.templates.forEach(function(t) {
+                            const row = $('<tr>');
+                            row.append('<td><strong style="color:#0f172a;">' + $('<div>').text(t.code).html() + '</strong></td>');
+                            row.append('<td>' + $('<div>').text(t.name).html() + '</td>');
+                            row.append('<td>' + t.length_cm + '×' + t.width_cm + '×' + t.height_cm + '</td>');
+                            row.append('<td>' + (t.tare_weight_g || 0) + 'g</td>');
+                            row.append('<td>' + ((t.max_weight_g || 0) / 1000).toFixed(1) + 'kg</td>');
+                            row.append('<td><span class="sm-shipping-badge ' + (t.owner_type === 'factory' ? 'truck' : 'bike') + '">' + t.owner_type + '</span></td>');
+                            row.append('<td>' + (t.sort_order || 0) + '</td>');
+                            const actions = $('<td>');
+                            actions.append('<button class="btn btn-outline btn-sm" onclick="ShippingManager.editTemplate(' + t.id + ')"><i class="fa-solid fa-pen"></i></button>');
+                            actions.append(' <button class="btn btn-outline btn-sm" style="color:#dc2626;" onclick="ShippingManager.deleteTemplate(' + t.id + ',\'' + t.code + '\')"><i class="fa-solid fa-trash"></i></button>');
+                            row.append(actions);
+                            tbody.append(row);
+                        });
+                    }});
+            },
+
+            openTemplateModal: function(id) {
+                const self = this;
+                const title = id ? 'แก้ไขกล่อง' : 'เพิ่มกล่องใหม่';
+                Swal.fire({
+                    title: title,
+                    html: '<div style="display:grid;gap:10px;text-align:left;">' +
+                        '<label>รหัส (unique) <input id="tpl-code" class="sm-input" ' + (id ? 'disabled' : '') + '></label>' +
+                        '<label>ชื่อ <input id="tpl-name" class="sm-input"></label>' +
+                        '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">' +
+                        '<label>L (cm)<input id="tpl-L" type="number" class="sm-input" min="1" max="200"></label>' +
+                        '<label>W (cm)<input id="tpl-W" type="number" class="sm-input" min="1" max="200"></label>' +
+                        '<label>H (cm)<input id="tpl-H" type="number" class="sm-input" min="1" max="200"></label>' +
+                        '</div>' +
+                        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">' +
+                        '<label>น้ำหนักกล่องเปล่า (g)<input id="tpl-tare" type="number" class="sm-input" min="0" max="5000"></label>' +
+                        '<label>น้ำหนักสูงสุด (g)<input id="tpl-max" type="number" class="sm-input" min="500" value="30000"></label>' +
+                        '</div>' +
+                        '<label>Owner <select id="tpl-owner" class="sm-input"><option value="warehouse">warehouse (โกดัง)</option><option value="factory">factory (โรงงาน)</option><option value="either">either</option></select></label>' +
+                        '<label>Sort order<input id="tpl-sort" type="number" class="sm-input" min="0" value="0"></label>' +
+                        '</div>',
+                    showCancelButton: true, confirmButtonText: 'บันทึก', cancelButtonText: 'ยกเลิก',
+                    width: 520,
+                    didOpen: function() {
+                        if (id) self._loadTemplateIntoForm(id);
+                    },
+                    preConfirm: function() {
+                        const data = {
+                            code: document.getElementById('tpl-code').value,
+                            name: document.getElementById('tpl-name').value,
+                            length_cm: +document.getElementById('tpl-L').value,
+                            width_cm: +document.getElementById('tpl-W').value,
+                            height_cm: +document.getElementById('tpl-H').value,
+                            tare_weight_g: +document.getElementById('tpl-tare').value,
+                            max_weight_g: +document.getElementById('tpl-max').value,
+                            owner_type: document.getElementById('tpl-owner').value,
+                            sort_order: +document.getElementById('tpl-sort').value
+                        };
+                        if (!data.code || !data.name) { Swal.showValidationMessage('code + name required'); return false; }
+                        return data;
+                    }
+                }).then(function(r) {
+                    if (!r.isConfirmed || !r.value) return;
+                    const url = id ? STOCK_API + '/box-template/' + id : STOCK_API + '/box-template';
+                    $.ajax({ url: url, method: 'POST',
+                        beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                        data: r.value,
+                        success: function(res) {
+                            if (res.ok) { Swal.fire({icon:'success', title:'บันทึกสำเร็จ', timer:1200, showConfirmButton:false}); self.loadTemplates(); self.loadCoverage(); }
+                            else Swal.fire({icon:'error', title:'ผิดพลาด', text: res.message || 'Unknown'});
+                        },
+                        error: function(xhr) { Swal.fire({icon:'error', title:'ผิดพลาด', text: (xhr.responseJSON && xhr.responseJSON.message) || xhr.status}); }
+                    });
+                });
+            },
+            _loadTemplateIntoForm: function(id) {
+                // fetch via loadTemplates cache or direct
+                $.ajax({ url: STOCK_API + '/box-templates', method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const t = (res.templates || []).find(function(x){return x.id == id;});
+                        if (!t) return;
+                        document.getElementById('tpl-code').value = t.code;
+                        document.getElementById('tpl-name').value = t.name;
+                        document.getElementById('tpl-L').value = t.length_cm;
+                        document.getElementById('tpl-W').value = t.width_cm;
+                        document.getElementById('tpl-H').value = t.height_cm;
+                        document.getElementById('tpl-tare').value = t.tare_weight_g;
+                        document.getElementById('tpl-max').value = t.max_weight_g;
+                        document.getElementById('tpl-owner').value = t.owner_type;
+                        document.getElementById('tpl-sort').value = t.sort_order;
+                    }});
+            },
+            editTemplate: function(id) { this.openTemplateModal(id); },
+            deleteTemplate: function(id, code) {
+                const self = this;
+                Swal.fire({
+                    title: 'ลบ template ' + code + '?',
+                    text: 'SKU ที่อ้าง template นี้จะ fallback ไป plain dims (soft delete)',
+                    icon: 'warning', showCancelButton: true, confirmButtonText: 'ลบ', cancelButtonText: 'ยกเลิก',
+                    confirmButtonColor: '#dc2626'
+                }).then(function(r) {
+                    if (!r.isConfirmed) return;
+                    $.ajax({ url: STOCK_API + '/box-template/' + id, method: 'DELETE',
+                        beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                        success: function(res) {
+                            const ref = res.referenced_by || {};
+                            Swal.fire({
+                                icon: 'success',
+                                title: 'ลบสำเร็จ',
+                                text: 'อ้างโดย ' + (ref.products || 0) + ' SKUs + ' + (ref.pack_slots || 0) + ' slots',
+                                timer: 2500
+                            });
+                            self.loadTemplates(); self.loadCoverage();
+                        }
+                    });
+                });
+            },
+
+            loadSkus: function(page) {
+                page = page || 1;
+                const filter = $('#sm-sku-filter').val() || '';
+                $.ajax({ url: STOCK_API + '/sku-shipping?page=' + page + '&per_page=50&status=' + filter, method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const tbody = $('#sm-skus-tbody'); tbody.empty();
+                        if (!res.ok || !(res.items || []).length) { tbody.html('<tr><td colspan="10" style="text-align:center;padding:24px;color:#94a3b8;">ไม่มีข้อมูล</td></tr>'); $('#sm-skus-pagination').empty(); return; }
+                        res.items.forEach(function(it) {
+                            const tr = $('<tr>');
+                            tr.append('<td><strong>' + $('<div>').text(it.sku).html() + '</strong></td>');
+                            tr.append('<td style="max-width:220px;">' + $('<div>').text(it.name || '').html() + '</td>');
+                            tr.append('<td><span class="sm-pack-mode-pill ' + (it.pack_mode || 'auto') + '">' + (it.pack_mode || 'auto') + '</span></td>');
+                            tr.append('<td>' + (it.packaging_source || '—') + '</td>');
+                            tr.append('<td>' + (it.box_template_id ? '#' + it.box_template_id : '<span style="color:#94a3b8;">—</span>') + '</td>');
+                            const w = it.weight_per_unit_g || it.weight_grams;
+                            tr.append('<td>' + (w ? w + 'g' : '<span style="color:#dc2626;">missing</span>') + '</td>');
+                            const L = it.length_cm || 0, W = it.width_cm || 0, H = it.height_cm || 0;
+                            tr.append('<td>' + (L || W || H ? (L + '×' + W + '×' + H) : '—') + '</td>');
+                            tr.append('<td>' + (it.express_category_override ? (it.express_category_override === 4 ? '🚚' : '🏍️') : 'auto') + '</td>');
+                            tr.append('<td style="font-size:0.75rem;color:#64748b;">' + (it.shipping_updated_at || '—') + '</td>');
+                            tr.append('<td><button class="btn btn-outline btn-sm" onclick="openEditCatalogModal(\'' + it.sku.replace(/'/g,'') + '\')"><i class="fa-solid fa-pen"></i></button></td>');
+                            tbody.append(tr);
+                        });
+                        // Pagination
+                        const totalPages = Math.ceil((res.total || 0) / (res.per_page || 50));
+                        const pag = $('#sm-skus-pagination'); pag.empty();
+                        if (totalPages > 1) {
+                            pag.append('<span style="font-size:0.85rem;color:#64748b;margin:0 8px;">Page ' + page + ' / ' + totalPages + ' — Total ' + res.total + '</span>');
+                            if (page > 1) pag.append('<button class="btn btn-outline btn-sm" onclick="ShippingManager.loadSkus(' + (page-1) + ')"><i class="fa-solid fa-chevron-left"></i></button>');
+                            if (page < totalPages) pag.append(' <button class="btn btn-outline btn-sm" onclick="ShippingManager.loadSkus(' + (page+1) + ')"><i class="fa-solid fa-chevron-right"></i></button>');
+                        }
+                    }});
+            },
+
+            loadAdhoc: function() {
+                const self = this;
+                $.ajax({ url: STOCK_API + '/shipping/ad-hoc-pending', method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const list = $('#sm-adhoc-list'); list.empty();
+                        const items = res.items || [];
+                        $('#sm-adhoc-badge').text(items.length).attr('data-count', items.length);
+                        if (!items.length) { list.html('<div style="padding:24px;text-align:center;color:#94a3b8;">✓ ไม่มี SKU รอ classify</div>'); return; }
+                        items.forEach(function(it) {
+                            const card = $('<div class="sm-adhoc-card">');
+                            const left = $('<div>');
+                            left.append('<div style="font-weight:700;color:#0f172a;font-size:0.95rem;">' + $('<div>').text(it.sku).html() + ' — <span style="font-weight:400;color:#475569;">' + $('<div>').text(it.name || '').html() + '</span></div>');
+                            const dims = (it.length_cm && it.width_cm && it.height_cm) ? (it.length_cm + '×' + it.width_cm + '×' + it.height_cm + 'cm') : '—';
+                            left.append('<div style="font-size:0.82rem;color:#64748b;margin-top:3px;">Saved: ' + (it.weight_grams || '?') + 'g · ' + dims + ' · หมวด: ' + (it.category || '—') + ' · ' + (it.shipping_updated_at || '') + '</div>');
+                            card.append(left);
+                            const actions = $('<div style="display:flex;gap:6px;">');
+                            actions.append('<button class="btn btn-primary btn-sm" onclick="ShippingManager.classifyAdhoc(\'' + it.sku.replace(/'/g,'') + '\')"><i class="fa-solid fa-check"></i> Classify</button>');
+                            actions.append('<button class="btn btn-outline btn-sm" onclick="openEditCatalogModal(\'' + it.sku.replace(/'/g,'') + '\')"><i class="fa-solid fa-pen"></i> Edit</button>');
+                            card.append(actions);
+                            list.append(card);
+                        });
+                    }});
+            },
+            classifyAdhoc: function(sku) {
+                const self = this;
+                $.ajax({ url: STOCK_API + '/box-templates', method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const tpls = (res.templates || []).filter(function(t){return t.is_active == 1;});
+                        let tplOpts = '<option value="">— ไม่ใช้ template —</option>';
+                        tpls.forEach(function(t){ tplOpts += '<option value="' + t.id + '">' + t.code + ' — ' + t.name + ' (' + t.length_cm + '×' + t.width_cm + '×' + t.height_cm + ')</option>'; });
+                        Swal.fire({
+                            title: 'Classify SKU: ' + sku,
+                            html: '<div style="display:grid;gap:10px;text-align:left;">' +
+                                '<label>Pack Mode<select id="ac-pm" class="sm-input">' +
+                                '<option value="single_box">single_box — 1 ชิ้น 1 กล่อง</option>' +
+                                '<option value="multi_box">multi_box — 1 ชิ้นแยก N กล่อง</option>' +
+                                '<option value="bulk_pack">bulk_pack — N ชิ้น 1 กล่อง</option>' +
+                                '<option value="assembled_set">assembled_set — SET ประกอบแล้ว</option>' +
+                                '<option value="auto">auto — ให้ระบบคำนวณจาก leaves</option>' +
+                                '</select></label>' +
+                                '<label>Packaging Source<select id="ac-ps" class="sm-input">' +
+                                '<option value="warehouse_packed">warehouse_packed — แพ็คที่โกดัง</option>' +
+                                '<option value="factory_packed">factory_packed — กล่องโรงงาน</option>' +
+                                '<option value="unknown">unknown</option>' +
+                                '</select></label>' +
+                                '<label>Box Template<select id="ac-tpl" class="sm-input">' + tplOpts + '</select></label>' +
+                                '<label>Weight/Unit (g) — ถ้าว่างใช้ weight_grams เดิม<input id="ac-wpu" type="number" class="sm-input" min="1" max="60000"></label>' +
+                                '</div>',
+                            showCancelButton: true, confirmButtonText: 'บันทึก', width: 540,
+                            preConfirm: function() {
+                                return {
+                                    pack_mode: document.getElementById('ac-pm').value,
+                                    packaging_source: document.getElementById('ac-ps').value,
+                                    box_template_id: document.getElementById('ac-tpl').value || null,
+                                    weight_per_unit_g: document.getElementById('ac-wpu').value || undefined
+                                };
+                            }
+                        }).then(function(r) {
+                            if (!r.isConfirmed) return;
+                            $.ajax({ url: STOCK_API + '/shipping/classify/' + sku, method: 'POST',
+                                beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); xhr.setRequestHeader('Content-Type','application/json'); },
+                                data: JSON.stringify(r.value),
+                                success: function(res) {
+                                    if (res.ok) { Swal.fire({icon:'success', title:'Classified!', timer:1200, showConfirmButton:false}); self.loadAdhoc(); self.loadCoverage(); }
+                                    else Swal.fire({icon:'error', title:'ผิดพลาด', text: res.message || 'Unknown'});
+                                },
+                                error: function(xhr) { Swal.fire({icon:'error', title:'ผิดพลาด', text: (xhr.responseJSON && xhr.responseJSON.message) || xhr.status}); }
+                            });
+                        });
+                    }});
+            },
+
+            handleCsvUpload: function(e) {
+                const self = this;
+                const file = e.target.files[0];
+                if (!file) return;
+                if (file.size > 100 * 1024) { Swal.fire({icon:'error', title:'File ใหญ่เกิน 100KB'}); return; }
+                const reader = new FileReader();
+                reader.onload = function(ev) {
+                    const csv = ev.target.result;
+                    const preview = csv.split('\n').slice(0, 6).join('\n');
+                    $('#sm-csv-preview').html('<strong>Preview (first 5 rows):</strong><pre style="font-size:0.75rem;margin:8px 0;white-space:pre;overflow-x:auto;">' + $('<div>').text(preview).html() + '</pre><button class="btn btn-primary btn-sm" onclick="ShippingManager.submitCsv()"><i class="fa-solid fa-rocket"></i> ส่งไปประมวลผล</button> <button class="btn btn-outline btn-sm" onclick="$(\'#sm-csv-preview\').hide(); $(\'#sm-csv-file\').val(\'\');">ยกเลิก</button>').show();
+                    self._pendingCsv = csv;
+                };
+                reader.readAsText(file);
+            },
+            submitCsv: function() {
+                const self = this;
+                if (!self._pendingCsv) return;
+                const idemKey = 'csv-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6);
+                $.ajax({ url: STOCK_API + '/product/shipping/bulk', method: 'POST',
+                    beforeSend: function(xhr) {
+                        xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE);
+                        xhr.setRequestHeader('X-Idempotency-Key', idemKey);
+                    },
+                    data: { csv: self._pendingCsv },
+                    success: function(res) {
+                        const result = $('#sm-csv-result');
+                        if (res.ok) {
+                            let html = '<div style="padding:14px;background:#dcfce7;border-left:3px solid #10b981;border-radius:4px;"><strong style="color:#065f46;">✓ สำเร็จ</strong> — ประมวลผล ' + res.processed + ' rows</div>';
+                            if ((res.errors || []).length) {
+                                html += '<div style="margin-top:8px;padding:14px;background:#fee2e2;border-left:3px solid #dc2626;border-radius:4px;"><strong style="color:#991b1b;">⚠️ Errors (' + res.errors.length + '):</strong><ul style="margin:6px 0 0 20px;font-size:0.82rem;color:#7f1d1d;">';
+                                res.errors.slice(0, 20).forEach(function(e) { html += '<li>' + $('<div>').text(e).html() + '</li>'; });
+                                if (res.errors.length > 20) html += '<li>...+' + (res.errors.length - 20) + ' more</li>';
+                                html += '</ul></div>';
+                            }
+                            result.html(html);
+                            $('#sm-csv-preview').hide(); $('#sm-csv-file').val('');
+                            self.loadCoverage();
+                        } else {
+                            result.html('<div style="padding:14px;background:#fee2e2;border-left:3px solid #dc2626;border-radius:4px;">❌ ' + (res.message || 'Unknown error') + '</div>');
+                        }
+                    },
+                    error: function(xhr) {
+                        $('#sm-csv-result').html('<div style="padding:14px;background:#fee2e2;border-left:3px solid #dc2626;border-radius:4px;">❌ ' + ((xhr.responseJSON && xhr.responseJSON.message) || xhr.status) + '</div>');
+                    }});
+            },
+
+            loadDefaults: function() {
+                $.ajax({ url: STOCK_API + '/shipping-defaults', method: 'GET',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); },
+                    success: function(res) {
+                        const d = res.defaults || {};
+                        $('#sm-def-weight').val(d.weight_grams || 1000);
+                        $('#sm-def-length').val(d.length_cm || 30);
+                        $('#sm-def-width').val(d.width_cm || 20);
+                        $('#sm-def-height').val(d.height_cm || 10);
+                        $('#sm-def-ac').val(d.article_category || 6);
+                        const thr = d.express_threshold || {};
+                        $('#sm-thr-w').val(thr.weight_g || 5000);
+                        $('#sm-thr-d').val(thr.max_dim_cm || 45);
+                        $('#sm-thr-s').val(thr.sum_dim_cm || 150);
+                    }});
+            },
+            saveDefaults: function() {
+                const payload = {
+                    weight_grams: +$('#sm-def-weight').val(),
+                    length_cm: +$('#sm-def-length').val(),
+                    width_cm: +$('#sm-def-width').val(),
+                    height_cm: +$('#sm-def-height').val(),
+                    article_category: +$('#sm-def-ac').val(),
+                    express_threshold: {
+                        weight_g: +$('#sm-thr-w').val(),
+                        max_dim_cm: +$('#sm-thr-d').val(),
+                        sum_dim_cm: +$('#sm-thr-s').val()
+                    }
+                };
+                $.ajax({ url: STOCK_API + '/shipping-defaults', method: 'POST',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); xhr.setRequestHeader('Content-Type','application/json'); },
+                    data: JSON.stringify(payload),
+                    success: function(res) {
+                        if (res.ok) Swal.fire({icon:'success', title:'บันทึก Defaults สำเร็จ', timer:1200, showConfirmButton:false});
+                        else Swal.fire({icon:'error', title:'ผิดพลาด', text: res.message || 'Unknown'});
+                    }});
+            },
+
+            addTestRow: function() {
+                const idx = this._testRows.length;
+                const row = $('<div class="sm-test-row">');
+                row.append('<input placeholder="SKU เช่น DNCGND37LS" class="sm-input sm-test-sku" data-idx="' + idx + '">');
+                row.append('<input type="number" value="1" min="1" max="999" class="sm-input sm-test-qty" data-idx="' + idx + '">');
+                row.append('<button class="btn btn-outline btn-sm" onclick="$(this).closest(\'.sm-test-row\').remove();"><i class="fa-solid fa-xmark"></i></button>');
+                $('#sm-test-rows').append(row);
+                this._testRows.push(idx);
+            },
+            computeTestPayload: function() {
+                const items = [];
+                $('#sm-test-rows .sm-test-row').each(function() {
+                    const sku = $(this).find('.sm-test-sku').val().trim();
+                    const qty = +$(this).find('.sm-test-qty').val();
+                    if (sku) items.push({ sku: sku, qty: qty || 1 });
+                });
+                if (!items.length) { Swal.fire({icon:'warning', title:'กรอก SKU อย่างน้อย 1 ตัว'}); return; }
+                $.ajax({ url: STOCK_API + '/shipping-compute', method: 'POST',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); xhr.setRequestHeader('Content-Type','application/json'); },
+                    data: JSON.stringify({ items: items }),
+                    success: function(res) {
+                        if (!res.ok) { $('#sm-test-result').html('<div style="color:#dc2626;">❌ error</div>'); return; }
+                        let html = '<div class="content-box" style="background:#f8fafc;"><strong>📊 Flash Payload Preview:</strong>';
+                        html += '<div style="margin:8px 0;font-size:0.85rem;color:#475569;">PNO count: <strong>' + res.pno_count + '</strong> · Total weight: <strong>' + res.total_weight_g + 'g</strong> (' + (res.total_weight_g / 1000).toFixed(2) + 'kg)</div>';
+                        html += '<pre class="sm-payload-preview">' + JSON.stringify(res.per_pno, null, 2) + '</pre></div>';
+                        $('#sm-test-result').html(html);
+                    }});
+            }
+        };
+        // Flag toggle wiring
+        $(document).on('change', '#sm-flag-toggle', function() {
+            const enabled = this.checked;
+            Swal.fire({
+                title: enabled ? 'เปิดใช้งาน V.42?' : 'ปิด V.42?',
+                text: enabled ? 'Flash orders จะใช้ per-PNO shipping resolver' : 'กลับไปใช้ V.41.2 behavior (weight default)',
+                icon: 'warning', showCancelButton: true, confirmButtonText: 'ยืนยัน'
+            }).then(function(r) {
+                if (!r.isConfirmed) { $('#sm-flag-toggle').prop('checked', !enabled); return; }
+                $.ajax({ url: STOCK_API + '/shipping-defaults', method: 'POST',
+                    beforeSend: function(xhr) { xhr.setRequestHeader('X-WP-Nonce', STOCK_NONCE); xhr.setRequestHeader('Content-Type','application/json'); },
+                    data: JSON.stringify({ flag_enabled: enabled }),
+                    success: function(res) {
+                        if (res.ok) { Swal.fire({icon:'success', title:(enabled?'Enabled':'Disabled'), timer:1200, showConfirmButton:false}); ShippingManager.loadCoverage(); }
+                        else { $('#sm-flag-toggle').prop('checked', !enabled); Swal.fire({icon:'error', title:'ผิดพลาด'}); }
+                    }
+                });
+            });
+        });
 
         /* =======================================================
          * DipStockManager — Dip Stock Tab (V.32.0 — Phase 3)
