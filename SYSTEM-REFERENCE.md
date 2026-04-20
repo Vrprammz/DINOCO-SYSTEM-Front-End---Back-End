@@ -35,7 +35,7 @@
 | **AI (WordPress)** | Google Gemini API + Claude API | Function calling (v22.0), AI Provider Abstraction Layer |
 | **AI (Chatbot)** | OpenClaw Mini CRM | Node.js + Express, Gemini Flash + Claude Sonnet, MongoDB Atlas |
 | **Messaging** | LINE Messaging API | Flex Messages, Push/Reply, Rich Menu |
-| **Shipping** | Flash Express API | Create order, print label, track, notify courier |
+| **Shipping** | Flash Express API | Create order, print label, track, notify courier. V.42 Flash Shipping Metadata: per-PNO weight/dims + auto vehicle routing (bike/truck) + subParcel Pattern B + DLQ + retry classifier + warehouseNo Method 2 routing |
 | **Payment Verify** | Slip2Go API (PULL only) | Bank slip OCR verification — WP calls Slip2Go on-demand (no webhook registered) |
 | **PDF** | PHP GD Library | Invoice/PO images as PNG (A4 format) |
 | **Deployment** | GitHub Webhook Sync | Push to main -> auto-sync to WordPress wp_snippets |
@@ -383,6 +383,35 @@ Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DI
 | GET | `/forecast` | Admin | Stock forecasting |
 | POST | `/product/pricing` | Admin | Product tier pricing (dual-write catalog) |
 | POST | `/product/upload-image` | Admin | Upload product image |
+| GET | `/sku-shipping/{sku}` | Admin | **V.42** Full shipping meta (include cost fields) |
+| GET | `/sku-shipping-scanner/{sku}` | `scan_shipping` cap | **V.42** Stripped shipping meta for warehouse_staff (no cost_price/WAC) |
+| GET | `/sku-shipping` | Admin | **V.42** Paginated list + coverage filter |
+| GET | `/shipping-coverage` | Admin | **V.42** % SKU complete widget |
+| POST | `/product/shipping` | Admin | **V.42** Per-SKU shipping meta update (pack_mode/box_template/weight/dims) |
+| POST | `/product/shipping/bulk` | Admin | **V.42** CSV bulk import (rate limit + idempotency + CSV injection guard) |
+| GET | `/bulk-import-template` | Admin | **V.42 M5** CSV template download |
+| POST | `/validate-csv` | Admin | **V.42 M5** Dry-run validate before import |
+| GET/POST | `/box-templates` | Admin | **V.42** Box template CRUD (list + create) |
+| POST/DELETE | `/box-template/{id}` | Admin | **V.42** Update/soft-delete (is_active=0) |
+| GET/POST | `/shipping-defaults` | Admin | **V.42** Read/update `dinoco_shipping_defaults` option |
+| POST | `/shipping-compute` | Admin | **V.42 M6** Dry-run resolver test |
+| GET | `/shipping/ad-hoc-pending` | Admin | **V.42 M2** Ad-hoc SKU review queue |
+| POST | `/shipping/classify/{id}` | Admin | **V.42 M2** Classify ad-hoc SKU |
+| POST | `/shipping/manual-rollback` | Admin | **V.42 M4** Admin-intentional flag revert |
+
+### 3.6.1 Flash Shipping V.42 (`/wp-json/b2b/v1/`)
+
+เพิ่มจาก Phase 3.5/3/5 ของ Flash Shipping Metadata V.42 (flag-gated `dinoco_shipping_meta_enabled`):
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| POST | `/flash-override-vehicle` | Admin | **V.42 F2** Override expressCategory (bike/truck) pre-create |
+| POST | `/flash-cancel-pickup` | Admin | **V.42** Cancel pickup (409 if called post-pickup — cancel+recreate required) |
+| GET | `/flash-audit?ticket_id=X` | Admin | **V.42 F2** Audit trail (create req/resp + bump events) |
+| GET | `/flash-dlq` | Admin | **V.42 F7** Dead letter queue list |
+| POST | `/flash-dlq/{id}/retry` | Admin | **V.42 F7** Manual retry DLQ entry |
+| POST | `/flash-dlq/{id}/abandon` | Admin | **V.42 F7** Mark abandoned |
+| GET | `/shipping/test-flash-payload/{ticket_id}` | Admin | **V.42 M6** Preview Flash payload before create |
 
 ### 3.7 B2F Migration Audit (`/wp-json/dinoco-b2f-audit/v1/`)
 
@@ -812,6 +841,95 @@ Product catalog stored in custom table (separate from b2b_product CPT) — sourc
 | `compatible_models` | TEXT | JSON array of compatible moto models |
 | `is_active` | TINYINT(1) | Soft delete |
 | `ui_role_override` | VARCHAR(20) DEFAULT `'auto'` | **V.42.14** Manual UI classification override (`auto` / `set` / `child` / `grandchild` / `single`). Admin เลือกเองใน Edit Product modal เพื่อ override leaf-based auto classification. UI layer only — ไม่กระทบ stock / orders / DD-2 |
+| `pack_mode` | VARCHAR(24) DEFAULT `'auto'` | **V.42** `auto`/`single_box`/`multi_box`/`bulk_pack`/`assembled_set`/`unknown` — drives resolver branch |
+| `packaging_source` | VARCHAR(20) DEFAULT `'unknown'` | **V.42** `warehouse_packed`/`factory_packed`/`unknown` |
+| `box_template_id` | INT UNSIGNED NULL | **V.42** FK → `wp_dinoco_box_templates.id` — primary dim source |
+| `weight_per_unit_g` | INT UNSIGNED NULL | **V.42** Content weight per unit (g) |
+| `article_category` | TINYINT UNSIGNED DEFAULT 6 | **V.42** Flash articleCategory (6 = อะไหล่รถยนต์) |
+| `express_category_override` | TINYINT UNSIGNED NULL | **V.42** NULL=auto threshold, 1=bike, 4=truck |
+| `weight_grams` / `length_cm` / `width_cm` / `height_cm` | (UN)SIGNED | **V.42** Plain dims for SKU without box_template (ad-hoc/unknown/legacy) |
+| `length_cm_override` / `width_cm_override` / `height_cm_override` / `tare_weight_override_g` | UNSIGNED NULL | **V.42** Per-SKU template-override fields (fill specific field to override template) |
+| `shipping_updated_by` / `shipping_updated_at` | BIGINT / DATETIME | **V.42 M8** Audit who/when last touched shipping fields |
+
+#### `dinoco_box_templates` (V.42 NEW — Phase 1)
+
+กล่องมาตรฐาน (S/M/L/XL/AL37) + custom. Seeded 5 rows on schema activation via `INSERT IGNORE` + wp_option flag `dinoco_box_templates_seeded` (C-B4 fix).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT UNSIGNED AUTO_INCREMENT | PK |
+| `code` | VARCHAR(20) UNIQUE | S / M / L / XL / AL37 / CUSTOM |
+| `name` | VARCHAR(50) | "กล่องเล็ก S" / "กล่องอลูมิเนียม 37L" |
+| `length_cm` / `width_cm` / `height_cm` | SMALLINT UNSIGNED | Internal dims |
+| `tare_weight_g` | SMALLINT UNSIGNED | น้ำหนักกล่องเปล่า |
+| `max_weight_g` | INT UNSIGNED | Weight cap |
+| `owner_type` | VARCHAR(20) | `warehouse` / `factory` / `either` |
+| `is_active` | TINYINT UNSIGNED | Soft delete (1=active) |
+| `sort_order` | SMALLINT UNSIGNED | Display order |
+
+#### `dinoco_pack_slots` (V.42 NEW — Phase 1, multi_box mode)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT UNSIGNED AUTO_INCREMENT | PK |
+| `product_sku` | VARCHAR(50) COLLATE utf8mb4_bin | Matches `dinoco_products.sku` collation |
+| `slot_index` | TINYINT UNSIGNED | 0..bpu-1 |
+| `slot_label` | VARCHAR(50) | "Rack" / "Case" (optional) |
+| `box_template_id` | INT UNSIGNED | FK → `dinoco_box_templates.id` |
+| `content_weight_g` | INT UNSIGNED | Content weight in this slot |
+| `length_cm_override` / `width_cm_override` / `height_cm_override` / `tare_weight_override_g` | UNSIGNED NULL | Per-slot dim override |
+
+**Indexes**: `UNIQUE (product_sku, slot_index)`, `idx_template`.
+
+#### `dinoco_warehouse_mapping` (V.42 F4 NEW — Phase 1)
+
+Flash warehouseNo Method 2 routing (express_category → warehouseNo).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT UNSIGNED AUTO_INCREMENT | PK |
+| `express_category` | TINYINT UNSIGNED | 1 (bike) or 4 (truck) |
+| `warehouse_no` | VARCHAR(50) | `BKN_SP-บางเขน` (bike) / `5BKN_PDC-บางเขน` (truck) |
+| `is_primary` | TINYINT UNSIGNED | 1=primary mapping per EC |
+| `is_fallback_to_method1` | TINYINT UNSIGNED | Allow srcXXX fallback on reject |
+
+**Indexes**: `UNIQUE (express_category, is_primary)`.
+
+#### `dinoco_flash_audit` (V.42 F2 NEW — Phase 3)
+
+Per-ticket Flash API audit trail + auto-bump detection (verify cron `flash_category_verify_cron`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT UNSIGNED AUTO_INCREMENT | PK |
+| `ticket_id` | BIGINT UNSIGNED | FK → WP post |
+| `pno` | VARCHAR(64) NULL | Flash PNO (after create) |
+| `event_type` | VARCHAR(32) | `create_req` / `create_resp` / `bump_detected` / `override` |
+| `expected_ec` / `actual_ec` | TINYINT UNSIGNED NULL | Expected vs actual vehicle after Flash bump |
+| `payload_json` | LONGTEXT | Request/response snapshot |
+| `created_at` | DATETIME | Event time |
+
+**Retention**: 90 days (daily cleanup cron 03:15).
+
+#### `dinoco_flash_dead_letter` (V.42 F7 NEW — Phase 3)
+
+Flash API transient-fail queue. 3 retries exhausted → INSERT + Flex alert admin.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT UNSIGNED AUTO_INCREMENT | PK |
+| `ticket_id` | BIGINT UNSIGNED | FK → WP post |
+| `endpoint` | VARCHAR(64) | `open/v3/orders` / `open/v1/notify` |
+| `request_body` | LONGTEXT | Full request payload |
+| `last_error_code` | VARCHAR(32) | Flash error code (1003/500/502/504/etc) |
+| `last_error_message` | TEXT | Error detail |
+| `retry_count` | TINYINT UNSIGNED | Attempts made (0-3) |
+| `status` | VARCHAR(20) DEFAULT `'pending'` | `pending` / `resolved` / `abandoned` |
+| `created_at` / `resolved_at` | DATETIME | Timestamps |
+| `resolved_by` | BIGINT UNSIGNED NULL | wp_users.ID admin who resolved |
+
+**Indexes**: `UNIQUE (ticket_id, endpoint)`, `idx_status_created`.
+**Retention**: 30 days (daily cleanup cron 03:00).
 
 #### `dinoco_moto_brands` (B2B Snippet 15, DINOCO_MotoDB class)
 
@@ -890,6 +1008,9 @@ Created 2026-04-16 alongside junction table. Drift log for CPT vs junction compa
 |------------|------|-------------|
 | `b2b_warehouse_address` | array | Warehouse name, address, phone |
 | `b2b_manual_shipments_{YYYY_MM}` | array | Manual Flash shipment records (monthly, includes separate address fields + sender_key). Status updated by webhook + `b2b_manual_flash_poll_cron`. Helper: `b2b_manual_shipment_months()` lists months with data. |
+| `dinoco_shipping_meta_enabled` | bool | **V.42** Master flag for Flash Shipping Metadata (default `false`). Auto-rollback cron flips OFF at >5% errors AND ≥20/hr count |
+| `dinoco_shipping_defaults` | array | **V.42** Global fallback dims `{weight_grams, length_cm, width_cm, height_cm, article_category, express_threshold, default_box_template_id}` |
+| `dinoco_box_templates_seeded` | bool | **V.42** Idempotent seed marker (prevents duplicate INSERT on re-run) |
 | `b2b_sku_relations` | array | Parent-child-grandchild SKU relationships (3-level flat format: `{ parent: [children], child: [grandchildren] }`) |
 | `dinoco_sku_relations` | array | SKU relations for legacy migration |
 

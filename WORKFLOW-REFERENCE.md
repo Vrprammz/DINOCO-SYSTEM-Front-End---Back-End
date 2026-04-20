@@ -248,6 +248,81 @@ Manual Shipping:
 End State: Order shipped → completed
 ```
 
+### 2.4.1 Flash Shipping V.42 (Per-PNO Metadata — flag-gated)
+
+**Flag**: `dinoco_shipping_meta_enabled` (default OFF). Walk-in orders bypass V.42 entirely (decision #15).
+
+```
+Trigger: Admin confirm_bill → status transitions awaiting_shipping / shipping_scheduled
+
+1. b2b_order_status_changed hook fires (priority 9, before Flash create listener):
+   a. dinoco_snapshot_ticket_shipping($ticket_id, $manifest) — M1 immutable snapshot
+   b. Writes `_flash_shipping_snapshot` post meta (idempotent, version=42.0)
+   c. Contains per-PNO {weight_g, length_cm, width_cm, height_cm, article_category, express_category, source}
+
+2. b2b_flash_dispatch_create_all($ticket_id) router:
+   - Walk-in OR flag OFF OR V.42 unavailable → b2b_flash_create_all_boxes (legacy V.41)
+   - Flag ON + non-walk-in → b2b_flash_create_all_boxes_v42:
+     a. Read _flash_shipping_snapshot (or resolve now if missing)
+     b. Pattern B: 1 Flash order with subParcelQuantity + subParcel[] (up to 99)
+     c. Each sub-parcel has own weight/dims from resolver
+     d. Single parent tracking for customer (save ~30-50 THB/order)
+     e. F4 Method 2 routing: warehouseNo from `dinoco_warehouse_mapping`
+        * EC=1 (bike) → BKN_SP-บางเขน
+        * EC=4 (truck) → 5BKN_PDC-บางเขน
+        * Flash reject → fallback Method 1 (srcXXX) + admin Flex
+     f. Wrap with dinoco_api_retry (exp backoff 3 tries 1s/2s/5s + jitter 50-150ms)
+     g. Retryable: 1003/500/502/504/timeout; abandon: 400/401/403/409/422
+
+3. V.42 failure branches:
+   - Retry exhausted → INSERT `dinoco_flash_dead_letter` + b2b_build_flex_flash_dlq_alert
+   - Non-retryable → straight to DLQ
+   - V.42 code path error → fall back to legacy b2b_flash_create_all_boxes (graceful)
+
+4. F2 Post-create verify (flash_category_verify_cron every 15min):
+   a. Poll Flash Routes API per recent ticket
+   b. Compare expected_ec (from snapshot) vs actual_ec (Flash response)
+   c. Flash auto-bumped → fire b2b_build_flex_flash_category_bumped alert
+   d. Log event in `dinoco_flash_audit` (90-day retention)
+
+5. Resolver priority chain (dinoco_resolve_pno_shipping):
+   1. Ticket meta `_flash_weight_grams` / `_flash_express_category` (legacy escape hatch)
+   2. SKU template-override (length_cm_override / tare_weight_override_g / etc)
+   3. Box template via box_template_id (primary for most SKUs)
+   4. SKU plain dims (weight_grams / length_cm / etc) — ad-hoc/unknown/legacy
+   5. Recursive aggregate from leaves (pack_mode=auto, DD-3 safe via static $memo)
+   6. Global defaults (`dinoco_shipping_defaults` option)
+
+6. Pack mode branches (dinoco_resolve_pno_shipping):
+   - single_box / assembled_set → content + box_template.tare (+ override)
+   - multi_box → per-slot via `dinoco_pack_slots` table
+   - bulk_pack → qty_in_box × weight_per_unit + box.tare
+   - unknown → plain dims (ad-hoc save-back) / defaults
+   - auto → aggregate from leaves recursive
+
+7. BO secondary flow (b2b_flash_create_secondary):
+   - On `b2b_bo_items_fulfilled` action (Phase 4)
+   - Build mini-manifest from BO items subset only (not full order)
+   - Resolve via dinoco_resolve_manifest_shipping → own PNO with BO-specific dims
+   - Separate snapshot meta `_flash_shipping_snapshot_bo` from primary
+
+Manual-Ship V.43 (RPi /manual-ship):
+  - Scanner reads SKU → GET /api/sku-auto-fill/<sku> → fills L/W/H/weight from box template
+  - Ad-hoc SKU (not in catalog) → warehouse_staff enters dims + checks 💾 save → POST save_sku_data=1
+  - Ad-hoc save-back creates `wp_dinoco_products` row with pack_mode='unknown' (admin classifies later via M2 queue)
+  - D-12 articleCategory: flag ON → default 6 (อะไหล่รถยนต์), flag OFF → 1 (legacy)
+
+Auto-rollback (Phase 5):
+  - Cron `dinoco_shipping_auto_rollback_cron` (ten_minutes interval)
+  - Trigger: error rate >5% AND absolute count ≥20/hr (both conditions)
+  - Action: update_option('dinoco_shipping_meta_enabled', false) + Telegram alert
+
+Rollback (instant):
+  update_option('dinoco_shipping_meta_enabled', false)
+  → b2b_flash_dispatch_create_all routes to legacy V.41 path
+  → byte-identical behavior (REG-029 guarantee)
+```
+
 ### 2.10 B2B Backorder System -- Opaque Accept + Admin Split BO (V.1.6, 2026-04-16)
 
 Phase A-D implementation per `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`.
@@ -1475,6 +1550,10 @@ Source: Snippet 7, DB_ID: 56
 | `b2b_flash_tracking_cron` | Every 2 hours | -- | Poll Flash API tracking |
 | `b2b_flex_retry_cron` | Every 1 min | -- | Retry failed Flex sends |
 | `b2b_rpi_heartbeat_check` | Every 5 min | -- | RPi heartbeat check |
+| `dinoco_shipping_auto_rollback_cron` | `ten_minutes` | -- | **V.42 Phase 5** Auto-flip `dinoco_shipping_meta_enabled=false` on error rate >5% AND ≥20/hr count |
+| `flash_category_verify_cron` | `fifteen_minutes` | -- | **V.42 F2** Post-create verify expected vs actual expressCategory → Flex alert if Flash auto-bumped |
+| `dinoco_flash_dlq_cleanup_cron` | Daily | 03:00 | **V.42 F7** Prune `dinoco_flash_dead_letter` rows > 30 days |
+| `dinoco_flash_audit_cleanup_cron` | Daily | 03:15 | **V.42** Prune `dinoco_flash_audit` rows > 90 days |
 
 ### 9.2 B2B Single Events (Dynamic)
 
