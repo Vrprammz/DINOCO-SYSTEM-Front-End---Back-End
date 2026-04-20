@@ -1,6 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.2 — Flash Shipping V.42 Phase 3 (B2B Flash refactor per-PNO): ║
+ * ║    • b2b_flash_create_order_v42() — V.42-aware Flash order creator:  ║
+ * ║      * accepts $shipping_override (per-PNO resolver output)           ║
+ * ║      * accepts $sub_parcels array (subParcel Pattern B per Flash Q)   ║
+ * ║      * F4 warehouseNo routing (Method 2 — drop srcXXX if warehouseNo) ║
+ * ║      * A-3: 7 returnXXX fields (returnName/Phone/Province/City/       ║
+ * ║              District/PostalCode/DetailAddress) — Ramintra 14         ║
+ * ║      * wrapped with dinoco_api_retry() — 1003/500/502 retry + DLQ    ║
+ * ║      * writes dinoco_flash_audit row (flash_create / flash_create_fail)║
+ * ║    • b2b_flash_create_all_boxes_v42() — subParcel Pattern B           ║
+ * ║      * single Flash order + subParcelQuantity + subParcel[] array    ║
+ * ║      * M1 snapshot read (immutable — prevents edge cases E1/E2/E5)   ║
+ * ║      * walk-in bypass guard (decision #15 — skip V.42 entirely)       ║
+ * ║    • b2b_flash_dispatch_create_all() — flag router:                   ║
+ * ║      * dinoco_shipping_meta_enabled=1 → _v42 path                     ║
+ * ║      * else / walk-in / missing deps → legacy b2b_flash_create_all    ║
+ * ║    • M1 snapshot hook on b2b_order_status_changed priority 9          ║
+ * ║      (awaiting_shipping / shipping_scheduled transitions)             ║
  * ║  Version: V.34.1 — Flash Shipping V.42 Phase 5 (Launch Infra): ║
  * ║    • cron_schedules: ten_minutes + fifteen_minutes intervals   ║
  * ║    • 3 NEW cron jobs:                                          ║
@@ -6046,4 +6064,465 @@ add_action( 'dinoco_flash_dlq_cleanup_cron', function() {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // END V.34.1 Flash Shipping V.42 Phase 5 (Launch Infra)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V.34.2 — FLASH SHIPPING METADATA V.42 PHASE 3 (B2B FLASH REFACTOR PER-PNO)
+// ──────────────────────────────────────────────────────────────────────────────
+// Adds V.42-aware Flash order creator + subParcel Pattern B (single order + N
+// sub-parcels). Gates via feature flag dinoco_shipping_meta_enabled. Existing
+// b2b_flash_create_order / b2b_flash_create_all_boxes remain untouched (REG-029
+// backward-compat). Consumers use b2b_flash_dispatch_create_all() to auto-route.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────
+// M1: Snapshot hook — immutable shipping metadata at confirm_bill
+// ───────────────────────────────────────────────────────────────────
+// Fires when ticket transitions to awaiting_shipping or shipping_scheduled.
+// Idempotent — skips if _flash_shipping_snapshot meta already exists.
+// Priority 9 — before Flash create listener at priority 10.
+add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_status ) {
+    if ( $new_status !== 'awaiting_shipping' && $new_status !== 'shipping_scheduled' ) return;
+    if ( ! function_exists( 'dinoco_snapshot_ticket_shipping' ) ) return;
+    // Feature flag gate
+    if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
+    // Walk-in bypass (decision #15)
+    if ( (int) get_post_meta( $order_id, '_b2b_is_walkin', true ) === 1 ) return;
+    // Idempotent
+    if ( get_post_meta( $order_id, '_flash_shipping_snapshot', true ) ) return;
+
+    // Build manifest from calculate_box_manifest helper
+    if ( ! function_exists( 'b2b_calculate_box_manifest' ) ) return;
+    $manifest = b2b_calculate_box_manifest( $order_id );
+    if ( empty( $manifest ) ) return;
+
+    // Enrich each entry with total_qty for bulk_pack partial box handling
+    $manifest_enriched = array();
+    foreach ( $manifest as $entry ) {
+        if ( ! is_array( $entry ) ) continue;
+        $sku = isset( $entry['sku'] ) ? strtoupper( (string) $entry['sku'] ) : '';
+        $manifest_enriched[] = array(
+            'sku'       => $sku,
+            'name'      => $entry['name'] ?? '',
+            'children'  => $entry['children'] ?? array(),
+            'total_qty' => $entry['total_qty'] ?? 1,
+        );
+    }
+
+    dinoco_snapshot_ticket_shipping( $order_id, $manifest_enriched );
+    if ( function_exists( 'b2b_log' ) ) b2b_log( "[V42 Snapshot] ticket={$order_id} snapshotted " . count( $manifest_enriched ) . " manifest entries" );
+}, 9, 3 );
+
+// ───────────────────────────────────────────────────────────────────
+// b2b_flash_create_order_v42() — V.42-aware order creator
+// ───────────────────────────────────────────────────────────────────
+/**
+ * V.42 Flash order creator. Supports:
+ *   - Per-PNO shipping override (from resolver)
+ *   - subParcel Pattern B (single order + sub_parcels array)
+ *   - F4 warehouseNo routing (Method 2 — drop srcXXX)
+ *   - A-3: 7 returnXXX fields
+ *   - Retry + DLQ via dinoco_api_retry
+ *
+ * @param int   $ticket_id
+ * @param array $shipping Per-order shipping array (from dinoco_resolve_pno_shipping or snapshot)
+ *                        { weight_g, length_cm, width_cm, height_cm, article_category, express_category }
+ * @param array $sub_parcels Optional sub-parcels for multi-box Pattern B
+ *                        Each: { weight_g, length_cm, width_cm, height_cm, item_desc? }
+ * @return array { ok, pno, sortCode?, data?, error?, retry_exhausted? }
+ */
+if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
+    function b2b_flash_create_order_v42( $ticket_id, $shipping, $sub_parcels = array() ) {
+        $ticket_id = intval( $ticket_id );
+        if ( ! $ticket_id || ! is_array( $shipping ) ) {
+            return array( 'ok' => false, 'error' => 'bad_input' );
+        }
+
+        // Address resolution
+        $wh = get_option( 'b2b_warehouse_address', array() );
+        $reg = get_option( 'b2b_registered_address', array() );  // Return address = Ramintra 14 registered
+
+        // Destination from ticket
+        $dst_name     = get_field( 'dist_name', $ticket_id )     ?: '';
+        $dst_phone    = get_field( 'dist_phone', $ticket_id )    ?: '';
+        $dst_address  = get_field( 'dist_address', $ticket_id )  ?: '';
+        $dst_district = get_field( 'dist_district', $ticket_id ) ?: '';
+        $dst_city     = get_field( 'dist_city', $ticket_id )     ?: '';
+        $dst_province = get_field( 'dist_province', $ticket_id ) ?: '';
+        $dst_postcode = get_field( 'dist_postcode', $ticket_id ) ?: '';
+
+        // Address backfill (legacy)
+        if ( empty( $dst_name ) || empty( $dst_phone ) || empty( $dst_address ) ) {
+            $gid = get_field( 'source_group_id', $ticket_id );
+            if ( $gid && function_exists( 'b2b_get_dist_by_group' ) ) {
+                $dist = b2b_get_dist_by_group( $gid );
+                if ( $dist ) {
+                    if ( empty( $dst_name ) )     $dst_name     = get_field( 'shop_name', $dist->ID ) ?: get_the_title( $dist->ID );
+                    if ( empty( $dst_phone ) )    $dst_phone    = get_field( 'dist_phone', $dist->ID ) ?: '';
+                    if ( empty( $dst_address ) )  $dst_address  = get_field( 'dist_address', $dist->ID ) ?: '';
+                    if ( empty( $dst_district ) ) $dst_district = get_field( 'dist_district', $dist->ID ) ?: '';
+                    if ( empty( $dst_city ) )     $dst_city     = get_field( 'dist_city', $dist->ID ) ?: '';
+                    if ( empty( $dst_province ) ) $dst_province = get_field( 'dist_province', $dist->ID ) ?: '';
+                    if ( empty( $dst_postcode ) ) $dst_postcode = get_field( 'dist_postcode', $dist->ID ) ?: '';
+                }
+            }
+        }
+
+        // Validate destination
+        $missing = array();
+        if ( empty( $dst_name ) )     $missing[] = 'dst_name';
+        if ( empty( $dst_phone ) )    $missing[] = 'dst_phone';
+        if ( empty( $dst_address ) )  $missing[] = 'dst_address';
+        if ( empty( $dst_province ) ) $missing[] = 'dst_province';
+        if ( empty( $dst_city ) )     $missing[] = 'dst_city';
+        if ( empty( $dst_postcode ) ) $missing[] = 'dst_postcode';
+        if ( ! empty( $missing ) ) {
+            return array( 'ok' => false, 'error' => 'missing_dst: ' . implode( ',', $missing ) );
+        }
+
+        // Shipping resolver output
+        $ec = intval( $shipping['express_category'] ?? 1 );
+        $ec = in_array( $ec, array( 1, 4 ), true ) ? $ec : 1;
+        $ac = intval( $shipping['article_category'] ?? 6 ) ?: 6;
+        $weight_g = intval( $shipping['weight_g'] ?? 1000 ) ?: 1000;
+        $L = intval( $shipping['length_cm'] ?? 0 );
+        $W = intval( $shipping['width_cm'] ?? 0 );
+        $H = intval( $shipping['height_cm'] ?? 0 );
+
+        $items_text = get_field( 'order_items', $ticket_id ) ?: 'DINOCO Products';
+        $item_desc  = mb_substr( wp_strip_all_tags( $items_text ), 0, 100 );
+        $insured_satang = b2b_flash_get_insured_value( $ticket_id );
+        $is_cod = function_exists( 'b2b_flash_is_cod' ) ? b2b_flash_is_cod( $ticket_id ) : false;
+
+        // Build base params
+        $params = array(
+            'outTradeNo'       => (string) $ticket_id,
+            'expressCategory'  => $ec,
+            'articleCategory'  => $ac,
+            'dstName'          => $dst_name,
+            'dstPhone'         => $dst_phone,
+            'dstDetailAddress' => $dst_address,
+            'dstDistrictName'  => $dst_district,
+            'dstCityName'      => $dst_city,
+            'dstProvinceName'  => $dst_province,
+            'dstPostalCode'    => $dst_postcode,
+            'weight'           => $weight_g,
+            'insured'          => $insured_satang > 0 ? 1 : 0,
+            'insureDeclareValue' => $insured_satang > 0 ? $insured_satang : '',
+            'codEnabled'       => $is_cod ? 1 : 0,
+            'remark'           => '#' . $ticket_id . ' ' . $item_desc,
+        );
+        if ( $L > 0 ) $params['length'] = $L;
+        if ( $W > 0 ) $params['width']  = $W;
+        if ( $H > 0 ) $params['height'] = $H;
+        if ( $params['codEnabled'] ) {
+            $cod_baht = floatval( get_field( 'total_amount', $ticket_id ) );
+            $params['codAmount'] = intval( $cod_baht * 100 );
+        }
+
+        // F4: Method 2 (warehouseNo routing) — drop srcXXX if warehouseNo available
+        $warehouse_no = function_exists( 'dinoco_get_warehouse_no' ) ? dinoco_get_warehouse_no( $ec ) : '';
+        if ( $warehouse_no ) {
+            $params['warehouseNo'] = $warehouse_no;
+        } else {
+            // Fallback Method 1 — srcXXX from warehouse option
+            $params['srcName']          = ! empty( $wh['wh_name'] )     ? $wh['wh_name']     : 'DINOCO THAILAND';
+            $params['srcPhone']         = ! empty( $wh['wh_phone'] )    ? $wh['wh_phone']    : '0616399994';
+            $params['srcDetailAddress'] = ! empty( $wh['wh_address'] )  ? $wh['wh_address']  : '';
+            $params['srcDistrictName']  = ! empty( $wh['wh_district'] ) ? $wh['wh_district'] : '';
+            $params['srcCityName']      = ! empty( $wh['wh_city'] )     ? $wh['wh_city']     : '';
+            $params['srcProvinceName']  = ! empty( $wh['wh_province'] ) ? $wh['wh_province'] : '';
+            $params['srcPostalCode']    = ! empty( $wh['wh_postcode'] ) ? $wh['wh_postcode'] : '';
+        }
+
+        // A-3: 7 returnXXX fields (registered address Ramintra 14 — different from warehouse pickup)
+        if ( ! empty( $reg ) && is_array( $reg ) ) {
+            $params['returnName']           = ! empty( $reg['reg_name'] )     ? $reg['reg_name']     : ( $params['srcName']  ?? 'DINOCO THAILAND' );
+            $params['returnPhone']          = ! empty( $reg['reg_phone'] )    ? $reg['reg_phone']    : ( $params['srcPhone'] ?? '0616399994' );
+            $params['returnDetailAddress'] = ! empty( $reg['reg_address'] )  ? $reg['reg_address']  : '';
+            $params['returnDistrictName']  = ! empty( $reg['reg_district'] ) ? $reg['reg_district'] : '';
+            $params['returnCityName']      = ! empty( $reg['reg_city'] )     ? $reg['reg_city']     : '';
+            $params['returnProvinceName']  = ! empty( $reg['reg_province'] ) ? $reg['reg_province'] : '';
+            $params['returnPostalCode']    = ! empty( $reg['reg_postcode'] ) ? $reg['reg_postcode'] : '';
+        }
+
+        // subParcel Pattern B (Flash Q: single order + N sub-parcels)
+        if ( ! empty( $sub_parcels ) && is_array( $sub_parcels ) ) {
+            $count = min( 99, count( $sub_parcels ) );  // Flash max 99 sub-parcels per order
+            $params['subParcelQuantity'] = $count;
+            $sp_array = array();
+            foreach ( array_slice( $sub_parcels, 0, $count ) as $idx => $sp ) {
+                if ( ! is_array( $sp ) ) continue;
+                $sp_row = array(
+                    'outTradeNo' => $ticket_id . '-' . ( $idx + 1 ),
+                    'weight'     => intval( $sp['weight_g'] ?? $weight_g ) ?: $weight_g,
+                );
+                if ( ! empty( $sp['length_cm'] ) ) $sp_row['length'] = intval( $sp['length_cm'] );
+                if ( ! empty( $sp['width_cm'] ) )  $sp_row['width']  = intval( $sp['width_cm'] );
+                if ( ! empty( $sp['height_cm'] ) ) $sp_row['height'] = intval( $sp['height_cm'] );
+                // A-2: subItemTypes for COD
+                if ( $is_cod && ! empty( $sp['item_desc'] ) ) {
+                    $sp_row['subItemTypes'] = array( array(
+                        'itemName'      => mb_substr( (string) $sp['item_desc'], 0, 50 ),
+                        'itemQuantity'  => 1,
+                    ) );
+                }
+                $sp_array[] = $sp_row;
+            }
+            $params['subParcel'] = $sp_array;
+        }
+
+        // Audit log: flash_create attempt
+        global $wpdb;
+        $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+        $audit_supported = (bool) $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" );
+
+        // Execute with retry + DLQ
+        $execute = function() use ( $params ) {
+            $r = b2b_flash_request( 'open/v3/orders', $params );
+            // Normalize result to { ok, error_code, ... } for dinoco_api_retry
+            if ( is_array( $r ) && ! empty( $r['ok'] ) && ! empty( $r['data']['pno'] ) ) return $r;
+            // extract error code for retry classifier
+            if ( is_array( $r ) ) {
+                $code = isset( $r['error_code'] ) ? (string) $r['error_code'] : '';
+                if ( ! $code && isset( $r['data']['code'] ) ) $code = (string) $r['data']['code'];
+                if ( ! $code && isset( $r['error'] ) && preg_match( '/(\d{3,4})/', (string) $r['error'], $m ) ) $code = $m[1];
+                $r['error_code'] = $code;
+            }
+            return $r;
+        };
+
+        $result = function_exists( 'dinoco_api_retry' )
+            ? dinoco_api_retry( $execute, 3, array( 1, 2, 5 ) )
+            : $execute();
+
+        $is_ok = is_array( $result ) && ! empty( $result['ok'] ) && ! empty( $result['data']['pno'] );
+
+        // Audit row
+        if ( $audit_supported ) {
+            $wpdb->insert( $audit_tbl, array(
+                'ticket_id'        => $ticket_id,
+                'event_type'       => $is_ok ? 'flash_create' : 'flash_create_fail',
+                'expected_ec'      => $ec,
+                'actual_ec'        => $ec,
+                'request_summary'  => wp_json_encode( array_intersect_key( $params, array_flip( array( 'outTradeNo', 'expressCategory', 'articleCategory', 'weight', 'length', 'width', 'height', 'warehouseNo', 'subParcelQuantity' ) ) ) ),
+                'response_summary' => wp_json_encode( is_array( $result ) ? array_slice( $result, 0, 5, true ) : array( 'raw' => substr( (string) $result, 0, 500 ) ) ),
+                'user_id'          => get_current_user_id(),
+                'created_at'       => current_time( 'mysql' ),
+            ) );
+        }
+
+        // DLQ insert on exhaustion (F7)
+        if ( ! $is_ok && is_array( $result ) && ( ! empty( $result['retry_exhausted'] ) || ! empty( $result['retry_abandoned'] ) ) ) {
+            $dlq_tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
+            if ( $wpdb->get_var( "SHOW TABLES LIKE '{$dlq_tbl}'" ) ) {
+                $wpdb->insert( $dlq_tbl, array(
+                    'ticket_id'           => $ticket_id,
+                    'endpoint'            => 'open/v3/orders',
+                    'request_body'        => wp_json_encode( $params ),
+                    'last_error_code'     => isset( $result['error_code'] ) ? (string) $result['error_code'] : 'unknown',
+                    'last_error_message'  => isset( $result['error'] ) ? (string) $result['error'] : ( isset( $result['message'] ) ? (string) $result['message'] : '' ),
+                    'retry_count'         => 3,
+                    'status'              => 'pending',
+                    'created_at'          => current_time( 'mysql' ),
+                ) );
+                // Fire DLQ Flex alert (deduped per ticket per day)
+                if ( function_exists( 'b2b_push_admin_flex_dedup' ) && function_exists( 'b2b_build_flex_flash_dlq_alert' ) ) {
+                    $flex = b2b_build_flex_flash_dlq_alert(
+                        $ticket_id,
+                        'open/v3/orders',
+                        $result['error_code'] ?? 'unknown',
+                        $result['error'] ?? ( $result['message'] ?? '' ),
+                        3,
+                        $wpdb->insert_id
+                    );
+                    b2b_push_admin_flex_dedup( 'flash_dlq_' . $ticket_id, DAY_IN_SECONDS, $flex );
+                }
+            }
+        }
+
+        if ( $is_ok ) {
+            b2b_log( '[Flash V.42] Created ' . $ticket_id . ' -> pno=' . $result['data']['pno'] );
+            return array(
+                'ok'       => true,
+                'pno'      => $result['data']['pno'],
+                'sortCode' => isset( $result['data']['sortCode'] ) ? $result['data']['sortCode'] : '',
+                'data'     => $result['data'],
+            );
+        }
+
+        $err = isset( $result['error'] ) ? $result['error'] : 'Unknown error';
+        b2b_log( '[Flash V.42] Create failed ' . $ticket_id . ': ' . $err );
+        return array(
+            'ok'              => false,
+            'error'           => $err,
+            'error_code'      => $result['error_code'] ?? '',
+            'retry_exhausted' => ! empty( $result['retry_exhausted'] ),
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// b2b_flash_create_all_boxes_v42() — subParcel Pattern B
+// ───────────────────────────────────────────────────────────────────
+/**
+ * V.42 single-order-with-subParcel approach (Flash Q decision):
+ *   - 1 Flash order per ticket (not N orders)
+ *   - If manifest has N boxes → use subParcelQuantity + subParcel[]
+ *   - Reads M1 snapshot if exists (immutable), else resolves live
+ */
+if ( ! function_exists( 'b2b_flash_create_all_boxes_v42' ) ) {
+    function b2b_flash_create_all_boxes_v42( $ticket_id ) {
+        $ticket_id = intval( $ticket_id );
+        if ( ! $ticket_id ) return array( 'ok' => false, 'error' => 'bad_ticket_id' );
+
+        // Walk-in bypass (decision #15)
+        if ( (int) get_post_meta( $ticket_id, '_b2b_is_walkin', true ) === 1 ) {
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[Flash V.42] walk-in bypass ticket={$ticket_id}" );
+            return array( 'ok' => false, 'error' => 'walk_in_skipped' );
+        }
+
+        // Try to read M1 snapshot first (immutable)
+        $snapshot = function_exists( 'dinoco_get_ticket_shipping_snapshot' ) ? dinoco_get_ticket_shipping_snapshot( $ticket_id ) : null;
+        $per_pno = null;
+
+        if ( $snapshot && isset( $snapshot['per_pno'] ) && is_array( $snapshot['per_pno'] ) ) {
+            $per_pno = $snapshot['per_pno'];
+            if ( function_exists( 'b2b_log' ) ) b2b_log( "[Flash V.42] using snapshot ticket={$ticket_id} (" . count( $per_pno ) . " PNOs)" );
+        } else {
+            // No snapshot → resolve live
+            if ( ! function_exists( 'dinoco_resolve_manifest_shipping' ) || ! function_exists( 'b2b_calculate_box_manifest' ) ) {
+                return array( 'ok' => false, 'error' => 'v42_helpers_missing' );
+            }
+            $manifest = b2b_calculate_box_manifest( $ticket_id );
+            if ( empty( $manifest ) ) {
+                return array( 'ok' => false, 'error' => 'empty_manifest' );
+            }
+            // Enrich with total_qty for bulk_pack
+            $enriched = array();
+            foreach ( $manifest as $entry ) {
+                if ( ! is_array( $entry ) ) continue;
+                $enriched[] = array(
+                    'sku'       => strtoupper( (string) ( $entry['sku'] ?? '' ) ),
+                    'name'      => $entry['name'] ?? '',
+                    'children'  => $entry['children'] ?? array(),
+                    'total_qty' => $entry['total_qty'] ?? 1,
+                );
+            }
+            $per_pno = dinoco_resolve_manifest_shipping( $enriched, $ticket_id );
+        }
+
+        if ( empty( $per_pno ) ) return array( 'ok' => false, 'error' => 'no_shipping_resolved' );
+
+        // Build primary shipping (uses first PNO as primary) + sub-parcels array for rest
+        $primary = $per_pno[0];
+        $sub_parcels = array();
+        for ( $i = 1; $i < count( $per_pno ); $i++ ) {
+            $sub_parcels[] = array(
+                'weight_g'  => $per_pno[ $i ]['weight_g']  ?? $primary['weight_g'],
+                'length_cm' => $per_pno[ $i ]['length_cm'] ?? 0,
+                'width_cm'  => $per_pno[ $i ]['width_cm']  ?? 0,
+                'height_cm' => $per_pno[ $i ]['height_cm'] ?? 0,
+            );
+        }
+
+        // If aggregate EC is mixed (some 1, some 4) → escalate to 4 (decision P0-16)
+        $has_truck = false;
+        foreach ( $per_pno as $p ) {
+            if ( intval( $p['express_category'] ?? 1 ) === 4 ) { $has_truck = true; break; }
+        }
+        if ( $has_truck ) $primary['express_category'] = 4;
+
+        // Persist expected_ec on ticket for F2 verify cron
+        update_post_meta( $ticket_id, '_flash_express_category', intval( $primary['express_category'] ) );
+        update_post_meta( $ticket_id, '_flash_weight_grams_v42', intval( $primary['weight_g'] ) );
+
+        // Create the Flash order (single order + sub-parcels)
+        $result = b2b_flash_create_order_v42( $ticket_id, $primary, $sub_parcels );
+
+        if ( $result['ok'] ) {
+            $pno = $result['pno'];
+            update_post_meta( $ticket_id, '_flash_tracking_numbers', array( $pno ) );
+            if ( function_exists( 'update_field' ) ) {
+                update_field( 'tracking_number', $pno, $ticket_id );
+                update_field( 'shipping_provider', 'Flash', $ticket_id );
+                update_field( 'shipped_date', b2b_date(), $ticket_id );
+            }
+            update_post_meta( $ticket_id, '_flash_sort_code', $result['sortCode'] ?? '' );
+            update_post_meta( $ticket_id, '_flash_packing_status', 'flash_created' );
+            update_post_meta( $ticket_id, '_flash_status', 'created' );
+            update_post_meta( $ticket_id, '_flash_create_error', '' );
+            update_post_meta( $ticket_id, '_flash_pno_count', count( $per_pno ) );
+
+            // Admin alert for bulky orders (expressCategory=4)
+            if ( $has_truck && function_exists( 'b2b_push_admin_flex_dedup' ) && function_exists( 'b2b_build_flex_flash_bulky_order_created' ) ) {
+                $dist_name = get_field( 'dist_name', $ticket_id ) ?: get_the_title( $ticket_id );
+                $flex = b2b_build_flex_flash_bulky_order_created(
+                    $ticket_id,
+                    $dist_name,
+                    intval( $primary['weight_g'] ),
+                    array( 'length_cm' => $primary['length_cm'], 'width_cm' => $primary['width_cm'], 'height_cm' => $primary['height_cm'] ),
+                    ! empty( $primary['express_category_override'] ) ? 'override' : 'auto'
+                );
+                b2b_push_admin_flex_dedup( 'flash_bulky_' . $ticket_id, HOUR_IN_SECONDS, $flex );
+            }
+
+            return array(
+                'ok'          => true,
+                'pno'         => $pno,
+                'pno_count'   => count( $per_pno ),
+                'sub_parcels' => count( $sub_parcels ),
+                'path'        => 'v42_subparcel',
+            );
+        }
+
+        update_post_meta( $ticket_id, '_flash_packing_status', 'flash_create_error' );
+        update_post_meta( $ticket_id, '_flash_create_error', $result['error'] ?? 'unknown' );
+        return array( 'ok' => false, 'error' => $result['error'] ?? 'unknown', 'path' => 'v42_failed' );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// b2b_flash_dispatch_create_all() — flag router
+// ───────────────────────────────────────────────────────────────────
+/**
+ * Feature-flag router for Flash order creation.
+ * Callers (Snippet 2/5/etc) should use this instead of b2b_flash_create_all_boxes
+ * directly to benefit from V.42 auto-routing + walk-in bypass.
+ *
+ * Route logic:
+ *   - dinoco_shipping_meta_enabled=1 AND not walk-in AND v42 helpers loaded
+ *     → b2b_flash_create_all_boxes_v42()
+ *   - else → b2b_flash_create_all_boxes() (legacy V.41 behavior)
+ *
+ * Backward compat: if V.42 fails (e.g., helpers missing), auto-falls back to legacy.
+ */
+if ( ! function_exists( 'b2b_flash_dispatch_create_all' ) ) {
+    function b2b_flash_dispatch_create_all( $ticket_id ) {
+        $ticket_id = intval( $ticket_id );
+        if ( ! $ticket_id ) return array( 'ok' => false, 'error' => 'bad_ticket_id' );
+
+        $flag_on = get_option( 'dinoco_shipping_meta_enabled', '0' ) === '1';
+        $is_walkin = (int) get_post_meta( $ticket_id, '_b2b_is_walkin', true ) === 1;
+        $v42_available = function_exists( 'b2b_flash_create_all_boxes_v42' ) && function_exists( 'dinoco_resolve_manifest_shipping' );
+
+        if ( $flag_on && ! $is_walkin && $v42_available ) {
+            $res = b2b_flash_create_all_boxes_v42( $ticket_id );
+            if ( $res['ok'] ) return $res;
+            // V.42 failed → log and fall back to legacy for safety
+            $err = $res['error'] ?? 'v42_failed';
+            if ( $err !== 'walk_in_skipped' ) {  // walk-in is intentional skip, not a failure
+                b2b_log( "[Flash Dispatch] V.42 failed ({$err}), falling back to legacy for ticket={$ticket_id}" );
+                return b2b_flash_create_all_boxes( $ticket_id );
+            }
+            return $res;
+        }
+
+        // Legacy path (V.41 behavior)
+        return b2b_flash_create_all_boxes( $ticket_id );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END V.34.2 Flash Shipping V.42 Phase 3 (B2B Flash refactor per-PNO)
 // ══════════════════════════════════════════════════════════════════════════════
