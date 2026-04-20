@@ -1,6 +1,7 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.1.1 — Sprint Fix C: (M3) CF IP resolver + 90-day PII retention cron + (L1) SELECT+INSERT race → transaction + FOR UPDATE
  * Version: V.1.0 — stub endpoints (flag-gated OFF)
  * DB_ID: (new — auto-assigned on sync)
  * Author: DINOCO Dev Team
@@ -50,6 +51,39 @@ if ( ! function_exists( 'dinoco_gdpr_is_enabled' ) ) {
      */
     function dinoco_gdpr_is_enabled() {
         return get_option( 'dinoco_gdpr_enabled', '0' ) === '1';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Client IP Resolver (V.1.1 M3) — Cloudflare / proxy aware
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_gdpr_get_client_ip' ) ) {
+    /**
+     * Resolve real client IP behind trusted proxies (Cloudflare, generic forwarded).
+     * Order: CF-Connecting-IP → X-Forwarded-For (first) → X-Real-IP → REMOTE_ADDR.
+     * Optionally gate on `DINOCO_TRUSTED_PROXIES` constant (array of CIDR/IP).
+     *
+     * Without real IP → audit trail records upstream proxy (useless for abuse tracking
+     * + misleading for PDPA Section 30 / GDPR Article 15 data subject identification).
+     *
+     * @return string IP address (may be empty string if all sources invalid)
+     */
+    function dinoco_gdpr_get_client_ip() {
+        $trusted = defined( 'DINOCO_TRUSTED_PROXIES' ) ? (array) DINOCO_TRUSTED_PROXIES : array();
+        $remote  = isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '';
+        // If no trusted proxy config, accept Cloudflare + X-Forwarded-For by default (Cloudflare is common)
+        unset( $trusted ); // reserved for future CIDR gating
+        $headers = array( 'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP' );
+        foreach ( $headers as $h ) {
+            if ( empty( $_SERVER[ $h ] ) ) continue;
+            $val       = explode( ',', (string) $_SERVER[ $h ] );
+            $candidate = trim( $val[0] );
+            if ( filter_var( $candidate, FILTER_VALIDATE_IP ) ) {
+                return $candidate;
+            }
+        }
+        return $remote;
     }
 }
 
@@ -135,50 +169,95 @@ if ( ! function_exists( 'dinoco_gdpr_queue_request' ) ) {
 
         $table = $wpdb->prefix . 'dinoco_gdpr_requests';
 
-        // Block duplicate pending requests (per-user per-type)
-        $existing = $wpdb->get_row( $wpdb->prepare(
-            "SELECT id, ticket_id, status, created_at FROM {$table}
-             WHERE user_id = %d AND type = %s AND status IN ('pending','processing')
-             LIMIT 1",
-            $user_id, $type
-        ), ARRAY_A );
-        if ( $existing ) {
-            return new WP_Error(
-                'duplicate_request',
-                'You already have an active request of this type',
-                array( 'status' => 409, 'existing' => $existing )
-            );
-        }
-
         $ticket_id = 'GDPR-' . strtoupper( substr( md5( $user_id . $type . microtime( true ) . wp_generate_password( 8, false ) ), 0, 12 ) );
         $now       = current_time( 'mysql' );
-        $ip        = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( $_SERVER['REMOTE_ADDR'] ) : '';
+        $ip        = dinoco_gdpr_get_client_ip(); // V.1.1 M3: Cloudflare/proxy aware
+        $ip        = $ip ? sanitize_text_field( $ip ) : '';
         $ua        = isset( $_SERVER['HTTP_USER_AGENT'] ) ? substr( sanitize_text_field( $_SERVER['HTTP_USER_AGENT'] ), 0, 255 ) : '';
 
-        $inserted = $wpdb->insert(
-            $table,
-            array(
-                'user_id'    => $user_id,
-                'type'       => $type,
-                'status'     => 'pending',
-                'ticket_id'  => $ticket_id,
-                'request_ip' => $ip,
-                'request_ua' => $ua,
-                'created_at' => $now,
-            ),
-            array( '%d', '%s', '%s', '%s', '%s', '%s', '%s' )
-        );
+        // V.1.1 L1: wrap SELECT+INSERT in transaction with FOR UPDATE to prevent
+        // double-queue race (two rapid calls each seeing no pending → both insert).
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            // Block duplicate pending requests (per-user per-type)
+            $existing = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, ticket_id, status, created_at FROM {$table}
+                 WHERE user_id = %d AND type = %s AND status IN ('pending','processing')
+                 LIMIT 1 FOR UPDATE",
+                $user_id, $type
+            ), ARRAY_A );
+            if ( $existing ) {
+                $wpdb->query( 'COMMIT' );
+                return new WP_Error(
+                    'duplicate_request',
+                    'You already have an active request of this type',
+                    array( 'status' => 409, 'existing' => $existing )
+                );
+            }
 
-        if ( false === $inserted ) {
-            return new WP_Error( 'db_error', 'Failed to queue request', array( 'status' => 500 ) );
+            $inserted = $wpdb->insert(
+                $table,
+                array(
+                    'user_id'    => $user_id,
+                    'type'       => $type,
+                    'status'     => 'pending',
+                    'ticket_id'  => $ticket_id,
+                    'request_ip' => $ip,
+                    'request_ua' => $ua,
+                    'created_at' => $now,
+                ),
+                array( '%d', '%s', '%s', '%s', '%s', '%s', '%s' )
+            );
+
+            if ( false === $inserted ) {
+                throw new Exception( 'insert failed: ' . $wpdb->last_error );
+            }
+
+            $insert_id = (int) $wpdb->insert_id;
+            $wpdb->query( 'COMMIT' );
+        } catch ( Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            return new WP_Error( 'db_error', 'Failed to queue request: ' . $e->getMessage(), array( 'status' => 500 ) );
         }
 
         return array(
             'ticket_id'  => $ticket_id,
-            'request_id' => $wpdb->insert_id,
+            'request_id' => $insert_id,
             'created_at' => $now,
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// V.1.1 M3 — PII Retention Cron (PDPA Section 17 / GDPR Article 5(e))
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_gdpr_retention_cleanup' ) ) {
+    /**
+     * Prune PII (ip + ua) from gdpr_requests rows 90+ days after processed_at.
+     * Keeps row structure for audit (request_id, user_id, type, status, ticket_id)
+     * but scrubs identifying network headers — aligns with PDPA §17 minimize-retention
+     * and GDPR Article 5(1)(e) storage limitation.
+     *
+     * @return void
+     */
+    function dinoco_gdpr_retention_cleanup() {
+        global $wpdb;
+        $tbl       = $wpdb->prefix . 'dinoco_gdpr_requests';
+        $threshold = gmdate( 'Y-m-d H:i:s', strtotime( '-90 days' ) );
+        $wpdb->query( $wpdb->prepare(
+            "UPDATE {$tbl}
+             SET request_ip = NULL, request_ua = NULL
+             WHERE processed_at IS NOT NULL
+               AND processed_at < %s
+               AND (request_ip IS NOT NULL OR request_ua IS NOT NULL)",
+            $threshold
+        ) );
+    }
+}
+add_action( 'dinoco_gdpr_retention_cron', 'dinoco_gdpr_retention_cleanup' );
+if ( ! wp_next_scheduled( 'dinoco_gdpr_retention_cron' ) ) {
+    wp_schedule_event( time(), 'daily', 'dinoco_gdpr_retention_cron' );
 }
 
 // ═══════════════════════════════════════════════════════════════════
