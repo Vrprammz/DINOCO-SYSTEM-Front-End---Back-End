@@ -2,6 +2,15 @@
  * File: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Template Name: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Shortcode: [dinoco_flash_v42_golive]
+ * Version: V.1.2 (2026-04-20) — Phase 3+ audit fixes:
+ *                                • H-D1: coverage excludes multi_box without pack_slots
+ *                                • C-Conc-H3: GET_LOCK serialize on bulk UPDATE endpoints
+ *                                • C-JS-1: markStep state machine rewrite (per-step memory)
+ *                                • H-J1: nonce expiry detection → reload prompt
+ *                                • H-J2: FLIP ON input normalization (NBSP + case)
+ *                                • H-J3: null/undefined "—" vs explicit 0g in smoke test
+ *                                • L12: flip-flag idempotency (skip no-change audit)
+ *                                • H-R1: cron heartbeat cards in /monitor
  * Version: V.1.1 (2026-04-21) — DEEP REVIEW FIX C4: function_exists('Class::method')
  *                                always returns false (PHP semantics — checks free
  *                                functions, not methods). Replaced with class_exists +
@@ -212,13 +221,18 @@ if ( ! function_exists( 'dinoco_fsv42_coverage' ) ) {
         // Total active SKUs
         $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$products_tbl} WHERE is_active=1" );
 
-        // Complete = has pack_mode != 'auto' OR has box_template_id OR has plain dims
+        // V.1.2 H-D1: Complete must have concrete data per pack_mode
+        //   - single_box / bulk_pack / assembled_set → must have box_template_id
+        //   - multi_box → must have at least 1 pack_slots row (NOT default fallback)
+        //   - unknown → must have weight_grams > 0
+        //   - any mode → plain dims (L/W/H + weight) also counts as complete
         $complete = (int) $wpdb->get_var( "
-            SELECT COUNT(*) FROM {$products_tbl}
-            WHERE is_active=1 AND (
-                (pack_mode IS NOT NULL AND pack_mode != 'auto')
-                OR box_template_id IS NOT NULL
-                OR (weight_grams > 0 AND length_cm > 0 AND width_cm > 0 AND height_cm > 0)
+            SELECT COUNT(*) FROM {$products_tbl} p
+            WHERE p.is_active=1 AND (
+                (p.pack_mode IN ('single_box','bulk_pack','assembled_set') AND p.box_template_id IS NOT NULL)
+                OR (p.pack_mode = 'multi_box' AND EXISTS (SELECT 1 FROM {$wpdb->prefix}dinoco_pack_slots s WHERE s.product_sku = p.sku))
+                OR (p.pack_mode = 'unknown' AND p.weight_grams > 0)
+                OR (p.weight_grams > 0 AND p.length_cm > 0 AND p.width_cm > 0 AND p.height_cm > 0)
             )
         " );
 
@@ -305,44 +319,55 @@ add_action( 'rest_api_init', function() {
                 return new WP_Error( 'no_helper', 'dinoco_smart_detect_pack_mode missing', array( 'status' => 500 ) );
             }
             $dry_run = (bool) $req->get_param( 'dry_run' );
-            $products_tbl = $wpdb->prefix . 'dinoco_products';
-            $rows = $wpdb->get_results( "
-                SELECT sku, pack_mode FROM {$products_tbl}
-                WHERE is_active=1 AND (pack_mode IS NULL OR pack_mode = 'auto')
-            " );
-            $updated = 0;
-            $samples = array();
-            foreach ( $rows as $r ) {
-                $suggested = dinoco_smart_detect_pack_mode( $r->sku );
-                if ( ! $suggested || $suggested === 'auto' ) continue;
-                if ( count( $samples ) < 20 ) {
-                    $samples[] = array( 'sku' => $r->sku, 'was' => $r->pack_mode, 'now' => $suggested );
-                }
-                if ( ! $dry_run ) {
-                    $wpdb->update(
-                        $products_tbl,
-                        array(
-                            'pack_mode'           => $suggested,
-                            'shipping_updated_by' => get_current_user_id(),
-                            'shipping_updated_at' => current_time( 'mysql' ),
-                        ),
-                        array( 'sku' => $r->sku )
-                    );
-                }
-                $updated++;
+
+            // V.1.2 C-Conc-H3: serialize bulk UPDATE across PHP workers via MySQL advisory lock
+            $lock_name = 'fsv42_bulk_op';
+            $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 2)", $lock_name ) );
+            if ( $got_lock !== 1 ) {
+                return new WP_Error( 'busy', 'another bulk op in progress — try again in a moment', array( 'status' => 423 ) );
             }
-            // V.1.1 FIX C4: function_exists('Class::method') always returns false
-            // (checks free functions, not methods). Use class_exists + method_exists.
-            if ( ! $dry_run && class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) {
-                DINOCO_Catalog::flush_memo();
+            try {
+                $products_tbl = $wpdb->prefix . 'dinoco_products';
+                $rows = $wpdb->get_results( "
+                    SELECT sku, pack_mode FROM {$products_tbl}
+                    WHERE is_active=1 AND (pack_mode IS NULL OR pack_mode = 'auto')
+                " );
+                $updated = 0;
+                $samples = array();
+                foreach ( $rows as $r ) {
+                    $suggested = dinoco_smart_detect_pack_mode( $r->sku );
+                    if ( ! $suggested || $suggested === 'auto' ) continue;
+                    if ( count( $samples ) < 20 ) {
+                        $samples[] = array( 'sku' => $r->sku, 'was' => $r->pack_mode, 'now' => $suggested );
+                    }
+                    if ( ! $dry_run ) {
+                        $wpdb->update(
+                            $products_tbl,
+                            array(
+                                'pack_mode'           => $suggested,
+                                'shipping_updated_by' => get_current_user_id(),
+                                'shipping_updated_at' => current_time( 'mysql' ),
+                            ),
+                            array( 'sku' => $r->sku )
+                        );
+                    }
+                    $updated++;
+                }
+                // V.1.1 FIX C4: function_exists('Class::method') always returns false
+                // (checks free functions, not methods). Use class_exists + method_exists.
+                if ( ! $dry_run && class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) {
+                    DINOCO_Catalog::flush_memo();
+                }
+                return rest_ensure_response( array(
+                    'ok'          => true,
+                    'dry_run'     => $dry_run,
+                    'scanned'     => count( $rows ),
+                    'updated'     => $updated,
+                    'samples'     => $samples,
+                ) );
+            } finally {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
             }
-            return rest_ensure_response( array(
-                'ok'          => true,
-                'dry_run'     => $dry_run,
-                'scanned'     => count( $rows ),
-                'updated'     => $updated,
-                'samples'     => $samples,
-            ) );
         },
         'permission_callback' => 'dinoco_fsv42_perm',
     ) );
@@ -353,48 +378,59 @@ add_action( 'rest_api_init', function() {
         'callback' => function( $req ) {
             global $wpdb;
             $dry_run = (bool) $req->get_param( 'dry_run' );
-            $products_tbl = $wpdb->prefix . 'dinoco_products';
-            // Target: SKUs without box_template_id, pack_mode ∈ (single_box/bulk_pack/assembled_set)
-            $rows = $wpdb->get_results( "
-                SELECT sku, pack_mode, weight_per_unit_g FROM {$products_tbl}
-                WHERE is_active=1
-                  AND box_template_id IS NULL
-                  AND pack_mode IN ('single_box', 'bulk_pack', 'assembled_set')
-            " );
-            $updated = 0;
-            $samples = array();
-            foreach ( $rows as $r ) {
-                $weight = (int) ( $r->weight_per_unit_g ?: 1000 );
-                $tpl_id = dinoco_fsv42_suggest_template_by_weight( $weight );
-                if ( ! $tpl_id ) continue;
-                if ( count( $samples ) < 20 ) {
-                    $samples[] = array( 'sku' => $r->sku, 'pack_mode' => $r->pack_mode, 'weight_g' => $weight, 'tpl_id' => $tpl_id );
+
+            // V.1.2 C-Conc-H3: serialize bulk UPDATE across PHP workers via MySQL advisory lock
+            $lock_name = 'fsv42_bulk_op';
+            $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 2)", $lock_name ) );
+            if ( $got_lock !== 1 ) {
+                return new WP_Error( 'busy', 'another bulk op in progress — try again in a moment', array( 'status' => 423 ) );
+            }
+            try {
+                $products_tbl = $wpdb->prefix . 'dinoco_products';
+                // Target: SKUs without box_template_id, pack_mode ∈ (single_box/bulk_pack/assembled_set)
+                $rows = $wpdb->get_results( "
+                    SELECT sku, pack_mode, weight_per_unit_g FROM {$products_tbl}
+                    WHERE is_active=1
+                      AND box_template_id IS NULL
+                      AND pack_mode IN ('single_box', 'bulk_pack', 'assembled_set')
+                " );
+                $updated = 0;
+                $samples = array();
+                foreach ( $rows as $r ) {
+                    $weight = (int) ( $r->weight_per_unit_g ?: 1000 );
+                    $tpl_id = dinoco_fsv42_suggest_template_by_weight( $weight );
+                    if ( ! $tpl_id ) continue;
+                    if ( count( $samples ) < 20 ) {
+                        $samples[] = array( 'sku' => $r->sku, 'pack_mode' => $r->pack_mode, 'weight_g' => $weight, 'tpl_id' => $tpl_id );
+                    }
+                    if ( ! $dry_run ) {
+                        $wpdb->update(
+                            $products_tbl,
+                            array(
+                                'box_template_id'     => $tpl_id,
+                                'shipping_updated_by' => get_current_user_id(),
+                                'shipping_updated_at' => current_time( 'mysql' ),
+                            ),
+                            array( 'sku' => $r->sku )
+                        );
+                    }
+                    $updated++;
                 }
                 if ( ! $dry_run ) {
-                    $wpdb->update(
-                        $products_tbl,
-                        array(
-                            'box_template_id'     => $tpl_id,
-                            'shipping_updated_by' => get_current_user_id(),
-                            'shipping_updated_at' => current_time( 'mysql' ),
-                        ),
-                        array( 'sku' => $r->sku )
-                    );
+                    // invalidate caches
+                    wp_cache_flush_group( 'dinoco_shipping' );
+                    if ( class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();
                 }
-                $updated++;
+                return rest_ensure_response( array(
+                    'ok'      => true,
+                    'dry_run' => $dry_run,
+                    'scanned' => count( $rows ),
+                    'updated' => $updated,
+                    'samples' => $samples,
+                ) );
+            } finally {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
             }
-            if ( ! $dry_run ) {
-                // invalidate caches
-                wp_cache_flush_group( 'dinoco_shipping' );
-                if ( class_exists( 'DINOCO_Catalog' ) ) DINOCO_Catalog::flush_memo();
-            }
-            return rest_ensure_response( array(
-                'ok'      => true,
-                'dry_run' => $dry_run,
-                'scanned' => count( $rows ),
-                'updated' => $updated,
-                'samples' => $samples,
-            ) );
         },
         'permission_callback' => 'dinoco_fsv42_perm',
     ) );
@@ -484,6 +520,22 @@ add_action( 'rest_api_init', function() {
                 ORDER BY created_at DESC LIMIT 10
             ", ARRAY_A ) : array();
 
+            // V.1.2 H-R1: cron heartbeat — read last_run options (wired by Snippet 1 cron agent).
+            // Returns seconds since last run; null if never ran (or helper not present).
+            $last_verify   = (int) get_option( 'dinoco_cron_flash_category_verify_last_run', 0 );
+            $last_rollback = (int) get_option( 'dinoco_cron_shipping_auto_rollback_last_run', 0 );
+            $last_dlq      = (int) get_option( 'dinoco_cron_flash_dlq_cleanup_last_run', 0 );
+            $now           = time();
+            $cron_health   = array(
+                'verify_age_sec'   => $last_verify   ? ( $now - $last_verify )   : null,
+                'rollback_age_sec' => $last_rollback ? ( $now - $last_rollback ) : null,
+                'dlq_age_sec'      => $last_dlq      ? ( $now - $last_dlq )      : null,
+                // Expected intervals (sec): verify=15min, rollback=10min, dlq=daily
+                'verify_expected_sec'   => 15 * 60,
+                'rollback_expected_sec' => 10 * 60,
+                'dlq_expected_sec'      => 24 * 60 * 60,
+            );
+
             return rest_ensure_response( array(
                 'flag_state'  => $flag === '1' ? 'on' : 'off',
                 'dlq_pending' => $dlq_pending,
@@ -492,6 +544,7 @@ add_action( 'rest_api_init', function() {
                 'audit_24h'   => $audit_24h,
                 'bumps_24h'   => $bumps_24h,
                 'audit_recent' => $audit_recent,
+                'cron_health' => $cron_health,
             ) );
         },
         'permission_callback' => 'dinoco_fsv42_perm',
@@ -509,6 +562,18 @@ add_action( 'rest_api_init', function() {
             $reason = sanitize_text_field( $req->get_param( 'reason' ) ?: '' );
             $new_val = $direction === 'on' ? '1' : '0';
             $old_val = (string) get_option( 'dinoco_shipping_meta_enabled', '0' );
+
+            // V.1.2 L12: idempotency — if new value matches current, skip update + audit
+            if ( $new_val === $old_val ) {
+                return rest_ensure_response( array(
+                    'ok'         => true,
+                    'direction'  => $direction,
+                    'old'        => $old_val,
+                    'new'        => $new_val,
+                    'no_change'  => true,
+                    'flipped_at' => (string) get_option( 'dinoco_shipping_flag_flipped_at', '' ),
+                ) );
+            }
 
             // Safety: flip ON requires preflight pass + coverage >= 95%
             if ( $direction === 'on' ) {
@@ -529,6 +594,7 @@ add_action( 'rest_api_init', function() {
             }
 
             update_option( 'dinoco_shipping_meta_enabled', $new_val );
+            update_option( 'dinoco_shipping_flag_flipped_at', current_time( 'mysql' ) ); // L12 companion: track last-flipped timestamp
 
             // Audit
             $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
@@ -719,6 +785,12 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
             <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-mon-audit">–</div><div class="fsv42-stat-lbl">Audit 24h</div></div>
             <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-mon-resolved">–</div><div class="fsv42-stat-lbl">DLQ Resolved</div></div>
         </div>
+        <!-- V.1.2 H-R1: cron heartbeat cards -->
+        <div class="fsv42-stats-grid" id="fsv42-mon-cron" style="margin-top:4px;">
+            <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-cron-verify" style="font-size:16px;">–</div><div class="fsv42-stat-lbl">Cron: Category Verify (15m)</div></div>
+            <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-cron-rollback" style="font-size:16px;">–</div><div class="fsv42-stat-lbl">Cron: Auto-Rollback (10m)</div></div>
+            <div class="fsv42-stat-box"><div class="fsv42-stat-val" id="fsv42-cron-dlq" style="font-size:16px;">–</div><div class="fsv42-stat-lbl">Cron: DLQ Cleanup (24h)</div></div>
+        </div>
         <div class="fsv42-actions">
             <button class="fsv42-btn fsv42-btn-ghost" onclick="FSV42.refreshMonitor()">🔄 Refresh</button>
             <button class="fsv42-btn fsv42-btn-danger" onclick="FSV42.emergencyOff()">🚨 EMERGENCY ROLLBACK</button>
@@ -746,16 +818,31 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
         const r = await fetch(base + path, opts);
         const txt = await r.text();
         let data; try { data = JSON.parse(txt); } catch(e) { throw new Error('bad json: ' + txt.slice(0, 200)); }
+        // V.1.2 H-J1: detect expired nonce → reload prompt (WP REST nonce lifetime = 12h)
+        if (r.status === 403 && data && (data.code === 'rest_cookie_invalid_nonce' || data.code === 'bad_nonce')) {
+            alert('Session หมดอายุ — กด OK เพื่อ reload หน้า');
+            window.location.reload();
+            throw new Error('session_expired');
+        }
         if (!r.ok) throw new Error(data.message || data.code || ('HTTP ' + r.status));
         return data;
     }
 
+    // V.1.2 C-JS-1: markStep state machine rewrite — per-step memory prevents
+    //   done states from being overwritten when later steps become active.
+    const stepState = {}; // { '1': 'done', '2': 'done', '3': 'active', ... }
     function markStep(n, state) {
+        stepState[String(n)] = state;
+        // implicit: earlier un-set steps become done when a later step goes active
+        if (state === 'active') {
+            for (let i = 1; i < n; i++) {
+                if (stepState[String(i)] !== 'done') stepState[String(i)] = 'done';
+            }
+        }
         document.querySelectorAll('.fsv42-progress .fsv42-step').forEach(el => {
-            const s = parseInt(el.dataset.step);
+            const s = String(el.dataset.step);
             el.classList.remove('active', 'done');
-            if (s < n || (s === n && state === 'done')) el.classList.add('done');
-            else if (s === n) el.classList.add('active');
+            if (stepState[s]) el.classList.add(stepState[s]);
         });
     }
 
@@ -891,7 +978,11 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
                     td3.appendChild(span); tr.appendChild(td3);
                     const td4 = document.createElement('td');
                     td4.style.fontFamily = 'ui-monospace, monospace'; td4.style.fontSize = '11px';
-                    td4.textContent = x.output ? `${x.output.weight_g}g / ${x.output.length_cm}×${x.output.width_cm}×${x.output.height_cm} / ec=${x.output.express_category}` : (x.error || x.reason || '');
+                    // V.1.2 H-J3: disambiguate 0 vs null/undefined — "—" for missing, "0g" for explicit zero
+                    const fmtNum = v => (v === null || v === undefined) ? '—' : String(v);
+                    td4.textContent = x.output ?
+                        `${fmtNum(x.output.weight_g)}g / ${fmtNum(x.output.length_cm)}×${fmtNum(x.output.width_cm)}×${fmtNum(x.output.height_cm)} / ec=${fmtNum(x.output.express_category)}` :
+                        (x.error || x.reason || '');
                     tr.appendChild(td4);
                     tb.appendChild(tr);
                 });
@@ -939,9 +1030,14 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
         },
 
         async flipOn() {
-            const confirm = document.getElementById('fsv42-flip-confirm').value.trim();
+            // V.1.2 H-J2: normalize input — remove NBSP (U+00A0) + trim + case-insensitive compare
+            const raw = document.getElementById('fsv42-flip-confirm').value;
+            const normalized = raw.replace(/\u00A0/g, ' ').trim().toUpperCase();
             const reason = document.getElementById('fsv42-flip-reason').value.trim();
-            if (confirm !== 'FLIP ON') { alert('พิมพ์ "FLIP ON" ให้ถูก'); return; }
+            if (normalized !== 'FLIP ON') {
+                alert('พิมพ์ "FLIP ON" ให้ถูก (ตัวพิมพ์ใหญ่หรือเล็กก็ได้)');
+                return;
+            }
             try {
                 const r = await api('/flip-flag', 'POST', { direction: 'on', reason });
                 alert('✅ Flag flipped ON: ' + r.flipped_at);
@@ -960,6 +1056,8 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
                 const r = await api('/flip-flag', 'POST', { direction: 'off', reason });
                 alert('⏪ Flag flipped OFF: ' + r.flipped_at);
                 await FSV42.refreshFlip();
+                // V.1.2 C-JS-1 companion: after flipOff, step 4 is the current step again (not "done")
+                markStep(4, 'active');
             } catch (e) {
                 alert('❌ Rollback failed: ' + e.message);
             }
@@ -982,6 +1080,27 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
                 document.getElementById('fsv42-mon-bumps').textContent = r.bumps_24h;
                 document.getElementById('fsv42-mon-audit').textContent = r.audit_24h;
                 document.getElementById('fsv42-mon-resolved').textContent = r.dlq_resolved;
+
+                // V.1.2 H-R1: cron heartbeat — red if age > expected × 2, amber if > expected, else green
+                const renderCron = (elId, ageSec, expectedSec) => {
+                    const el = document.getElementById(elId);
+                    if (!el) return;
+                    if (ageSec === null || ageSec === undefined) {
+                        el.textContent = 'never';
+                        el.style.color = '#64748b';
+                        return;
+                    }
+                    const mins = Math.round(ageSec / 60);
+                    const human = mins < 60 ? `${mins}m ago` : `${Math.round(mins / 60)}h ago`;
+                    el.textContent = human;
+                    if (expectedSec && ageSec > expectedSec * 2)       el.style.color = '#dc2626'; // red
+                    else if (expectedSec && ageSec > expectedSec)      el.style.color = '#f59e0b'; // amber
+                    else                                               el.style.color = '#16a34a'; // green
+                };
+                const ch = r.cron_health || {};
+                renderCron('fsv42-cron-verify',   ch.verify_age_sec,   ch.verify_expected_sec);
+                renderCron('fsv42-cron-rollback', ch.rollback_age_sec, ch.rollback_expected_sec);
+                renderCron('fsv42-cron-dlq',      ch.dlq_age_sec,      ch.dlq_expected_sec);
 
                 const auditList = document.getElementById('fsv42-mon-audit-list');
                 auditList.innerHTML = '';

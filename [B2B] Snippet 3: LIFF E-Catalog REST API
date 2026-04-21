@@ -1,6 +1,13 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.3 — ROUND 2 DEEP REVIEW FIXES (2026-04-21):                                ║
+ * ║    • M3: ad-hoc SKU uses mb_strtoupper (UTF-8 safe) + ASCII pattern validator             ║
+ * ║          (rejects CJK/Thai chars — prevents catalog pollution).                            ║
+ * ║    • M4: ad-hoc SKU INSERT collision → detect soft-deleted row → UPDATE + re-activate     ║
+ * ║          so admin re-scan with updated dims actually learns (was silent log-and-drop).    ║
+ * ║    • H-C3: b2b_flash_wh_status dedup — transient key pno|state|ts-prefix, 60s TTL.        ║
+ * ║          Blocks duplicate webhook replays (Flash occasionally retries within window).     ║
  * ║  Version: V.42.2 — DEEP REVIEW CRITICAL FIX (2026-04-21):                                 ║
  * ║    • C2: b2b_flash_find_ticket_by_pno now searches BOTH                                   ║
  * ║          _flash_tracking_numbers AND _flash_tracking_numbers_bo.                          ║
@@ -3649,6 +3656,18 @@ function b2b_flash_check_cod_refunded( $ticket_id, $pno, $data ) {
  */
 function b2b_flash_wh_status( $ticket_id, $pno, $data ) {
     $state = isset( $data['state'] ) ? intval( $data['state'] ) : 0;
+
+    // V.42.3 H-C3: replay dedup — Flash occasionally retries same webhook within seconds.
+    //   Key = pno|state|stateDate-prefix (13 chars = seconds precision). 60s TTL.
+    //   Skip duplicate early — avoids double-notify to admin + double-ack side effects.
+    $event_ts = isset( $data['stateDate'] ) ? (string) $data['stateDate'] : '';
+    $dedup_key = 'flash_wh_' . md5( $pno . '|' . $state . '|' . substr( $event_ts, 0, 13 ) );
+    if ( get_transient( $dedup_key ) ) {
+        b2b_log( '[Flash WH] Status DEDUPED: pno=' . $pno . ' state=' . $state . ' ticket=#' . $ticket_id );
+        return;
+    }
+    set_transient( $dedup_key, 1, 60 );
+
     b2b_log( '[Flash WH] Status: pno=' . $pno . ' state=' . $state . ' ticket=#' . $ticket_id );
 
     $state_labels_fallback = array( 0=>'อัปเดตสถานะ', 1=>'รับพัสดุแล้ว', 2=>'ระหว่างขนส่ง', 3=>'กำลังนำส่ง', 4=>'คงคลัง', 5=>'เซ็นรับแล้ว', 6=>'มีปัญหา', 7=>'ตีกลับ', 8=>'ปิดงาน(ปัญหา)', 9=>'ยกเลิก' );
@@ -4466,7 +4485,14 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
 
         // V.42.0 PHASE 4: Accept per-PNO dims + SKU + ad-hoc save-back
         // V.42.1 M3: server-side clamp dims 1-200cm (0 = not set, preserved)
-        $req_sku         = strtoupper( sanitize_text_field( $r->get_param( 'sku' ) ) );
+        // V.42.3 M3: mb_strtoupper (UTF-8 safe) + ASCII pattern validator — block CJK/Thai to prevent catalog pollution
+        $req_sku = trim( sanitize_text_field( $r->get_param( 'sku' ) ) );
+        if ( $req_sku !== '' ) {
+            $req_sku = function_exists( 'mb_strtoupper' ) ? mb_strtoupper( $req_sku, 'UTF-8' ) : strtoupper( $req_sku );
+            if ( ! preg_match( '/^[A-Z0-9._\/-]+$/', $req_sku ) ) {
+                return new WP_Error( 'bad_sku', 'SKU must be ASCII alphanumeric + . _ / -', array( 'status' => 400 ) );
+            }
+        }
         $req_length_cm   = intval( $r->get_param( 'length_cm' ) );
         $req_length_cm   = $req_length_cm > 0 ? max( 1, min( 200, $req_length_cm ) ) : 0;
         $req_width_cm    = intval( $r->get_param( 'width_cm' ) );
@@ -4503,8 +4529,7 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
             if ( ! $existing && $req_length_cm && $req_width_cm && $req_height_cm && $weight ) {
                 global $wpdb;
                 $tbl = $wpdb->prefix . 'dinoco_products';
-                // Minimal upsert — name defaults to item_desc, everything else nullable
-                $insert_result = $wpdb->insert( $tbl, array(
+                $new_row = array(
                     'sku'                 => $req_sku,
                     'name'                => $item_desc,
                     'is_active'           => 1,
@@ -4520,17 +4545,41 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
                     'shipping_updated_at' => current_time( 'mysql' ),
                     'created_at'          => current_time( 'mysql' ),
                     'updated_at'          => current_time( 'mysql' ),
-                ) );
-                // V.42.1 H1: handle soft-deleted SKU UNIQUE collision gracefully.
-                // DINOCO_Catalog::get_by_sku() filters is_active=1, so a soft-deleted row passes
-                // the "doesn't exist" guard above. The INSERT then fails silently on UNIQUE(sku).
-                // Log the collision + continue (don't fail the shipment — save-back is opportunistic).
+                );
+                // Minimal upsert — name defaults to item_desc, everything else nullable
+                $insert_result = $wpdb->insert( $tbl, $new_row );
+                // V.42.3 M4: on INSERT collision → check if row is soft-deleted (is_active=0)
+                //   DINOCO_Catalog::get_by_sku() filters is_active=1, so soft-deleted rows pass
+                //   the "doesn't exist" guard above + INSERT fails on UNIQUE(sku). Previously
+                //   V.42.1 H1 just logged + continued — admin re-scan with updated dims never
+                //   learned. Fix: re-activate soft-deleted row + update dims so next lookup works.
                 if ( $insert_result === false ) {
-                    if ( function_exists( 'b2b_log' ) ) {
-                        $err = isset( $wpdb->last_error ) ? $wpdb->last_error : 'unknown';
-                        b2b_log( "[ManualFlash V.42.1] ad-hoc SKU insert failed (possible soft-delete collision): sku={$req_sku} err={$err}", 'error' );
+                    $existing_row = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT id, is_active FROM {$tbl} WHERE sku = %s LIMIT 1",
+                        $req_sku
+                    ) );
+                    if ( $existing_row && intval( $existing_row->is_active ) === 0 ) {
+                        // Soft-deleted — re-activate + update dims
+                        $update_data = array_merge( $new_row, array( 'is_active' => 1 ) );
+                        unset( $update_data['sku'], $update_data['created_at'] ); // PK + creation audit immutable
+                        $update_result = $wpdb->update( $tbl, $update_data, array( 'sku' => $req_sku ) );
+                        if ( $update_result !== false ) {
+                            if ( function_exists( 'b2b_log' ) ) b2b_log( "[ManualFlash V.42.3] ad-hoc re-activated soft-deleted SKU: {$req_sku} (dims/weight refreshed)", 'info' );
+                            if ( method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();
+                            if ( function_exists( 'wp_cache_flush_group' ) ) @wp_cache_flush_group( 'dinoco_shipping' );
+                        } else {
+                            if ( function_exists( 'b2b_log' ) ) {
+                                $err = isset( $wpdb->last_error ) ? $wpdb->last_error : 'unknown';
+                                b2b_log( "[ManualFlash V.42.3] ad-hoc re-activation failed: sku={$req_sku} err={$err}", 'error' );
+                            }
+                        }
+                    } else {
+                        // Genuinely duplicate active row — log only (no-op to avoid clobbering admin edits)
+                        if ( function_exists( 'b2b_log' ) ) {
+                            $err = isset( $wpdb->last_error ) ? $wpdb->last_error : 'unknown';
+                            b2b_log( "[ManualFlash V.42.1] ad-hoc SKU insert collision (active): sku={$req_sku} err={$err}", 'warn' );
+                        }
                     }
-                    // Don't flush cache on failure — nothing changed
                 } else {
                     if ( function_exists( 'b2b_log' ) ) b2b_log( "[ManualFlash V.42] ad-hoc save-back: SKU={$req_sku} added with pack_mode=unknown (admin review queue)" );
                     if ( method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();

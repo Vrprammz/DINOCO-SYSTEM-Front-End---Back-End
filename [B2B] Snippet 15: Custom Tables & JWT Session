@@ -1,6 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.2 (2026-04-21) — Round 2 deep review fixes:                                         ║
+ * ║    • C-Data-3: _flash_weight_grams override semantics fixed — total (divided),                    ║
+ * ║                not per-PNO. Prevents 10x overbilling on multi-box orders.                         ║
+ * ║    • C-Data-1: Aggregate memo versioned + dinoco_flush_aggregate_memo() helper,                   ║
+ * ║                wired into DINOCO_Catalog::flush_memo() for staleness invalidation.                ║
+ * ║    • H-D2: bulk_pack missing weight_per_unit_g returns defaults_fallback + log                    ║
+ * ║            (was silent 50g default → massive under-declaration).                                   ║
+ * ║    • H-D4: wp_dinoco_flash_audit.payload_json TEXT → MEDIUMTEXT (prevents truncation              ║
+ * ║            on large subParcel payloads during incident flood).                                     ║
+ * ║    • H-R6: dinoco_invalidate_box_template_cache() helper (callers will wire).                     ║
  * ║  Version: V.8.1 — Fix resolver fallback schema bug (Go-Live smoke test caught)                    ║
  * ║                   Bug: fallback paths used raw dinoco_shipping_defaults() with plain-dims keys    ║
  * ║                   (weight_grams/length_cm/...) merged into resolver return shape (weight_g/...)   ║
@@ -413,6 +423,12 @@ class DINOCO_Catalog {
         // invoke get_by_skus([$sku]) which bypasses the memo.
         // For most call-sites (format items → render) the memo is safe because writes and
         // reads are separated by HTTP round-trips. This documentation codifies the contract.
+        //
+        // V.8.2 C-Data-1: Also flush aggregate shipping memo so downstream resolvers
+        // don't return stale leaf data after catalog writes.
+        if ( function_exists( 'dinoco_flush_aggregate_memo' ) ) {
+            dinoco_flush_aggregate_memo();
+        }
         return true;
     }
 
@@ -2987,6 +3003,10 @@ add_action( 'init', function() {
     // ─────────────────────────────────────────────────────────────
     // 4. wp_dinoco_flash_audit — F2 audit trail (Flash req/resp + bumps)
     // ─────────────────────────────────────────────────────────────
+    // V.8.2 H-D4 FIX: request_summary/response_summary TEXT → MEDIUMTEXT (TEXT max 64KB,
+    // MEDIUMTEXT max 16MB) — prevents truncation on large subParcel payloads during
+    // incident floods. dbDelta is idempotent for new tables; ALTER migration below
+    // upgrades existing TEXT columns on older installs.
     $audit_table = $wpdb->prefix . 'dinoco_flash_audit';
     $sql_audit = "CREATE TABLE {$audit_table} (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -2995,8 +3015,8 @@ add_action( 'init', function() {
         pno_index TINYINT UNSIGNED DEFAULT NULL,
         expected_ec TINYINT UNSIGNED DEFAULT NULL,
         actual_ec TINYINT UNSIGNED DEFAULT NULL,
-        request_summary TEXT DEFAULT NULL,
-        response_summary TEXT DEFAULT NULL,
+        request_summary MEDIUMTEXT DEFAULT NULL,
+        response_summary MEDIUMTEXT DEFAULT NULL,
         user_id BIGINT UNSIGNED DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -3004,6 +3024,18 @@ add_action( 'init', function() {
         KEY idx_event_created (event_type, created_at)
     ) {$charset};";
     dbDelta( $sql_audit );
+
+    // V.8.2 H-D4 migration: upgrade existing TEXT columns to MEDIUMTEXT (idempotent —
+    // uses SHOW COLUMNS + stripos check; ALTER only runs if not already MEDIUMTEXT).
+    if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $audit_table ) ) ) === $audit_table ) {
+        $cols = $wpdb->get_results( "SHOW COLUMNS FROM {$audit_table}", OBJECT_K );
+        foreach ( array( 'request_summary', 'response_summary' ) as $col_name ) {
+            if ( isset( $cols[ $col_name ] ) && stripos( $cols[ $col_name ]->Type, 'mediumtext' ) === false ) {
+                $wpdb->query( "ALTER TABLE {$audit_table} MODIFY COLUMN {$col_name} MEDIUMTEXT" );
+                if ( function_exists( 'b2b_log' ) ) b2b_log( "[V.8.2] ALTER flash_audit.{$col_name} TEXT → MEDIUMTEXT" );
+            }
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────
     // 5. wp_dinoco_flash_dead_letter — F7 DLQ for Flash create failures
@@ -3260,6 +3292,29 @@ if ( ! function_exists( 'dinoco_get_box_template' ) ) {
 }
 
 /**
+ * V.8.2 H-R6 FIX: Invalidate box template cache — callers (Admin Inventory REST
+ * endpoints on soft-delete / edit) should invoke this after mutations so the 3600s
+ * cached entry doesn't serve stale data. If $id is null, flushes the entire
+ * dinoco_shipping group (covers dinoco_box_tpls_* listing caches too).
+ */
+if ( ! function_exists( 'dinoco_invalidate_box_template_cache' ) ) {
+    function dinoco_invalidate_box_template_cache( $id = null ) {
+        if ( $id ) {
+            wp_cache_delete( 'dinoco_box_tpl_' . absint( $id ), 'dinoco_shipping' );
+        } else {
+            if ( function_exists( 'wp_cache_flush_group' ) ) {
+                wp_cache_flush_group( 'dinoco_shipping' );
+            }
+        }
+        // Always nuke the "all templates" list caches since any per-id mutation affects them.
+        wp_cache_delete( 'dinoco_box_tpls_all', 'dinoco_shipping' );
+        wp_cache_delete( 'dinoco_box_tpls_distributor', 'dinoco_shipping' );
+        wp_cache_delete( 'dinoco_box_tpls_maker', 'dinoco_shipping' );
+        wp_cache_delete( 'dinoco_box_tpls_either', 'dinoco_shipping' );
+    }
+}
+
+/**
  * Get all active box templates, optionally filtered by owner_type.
  */
 if ( ! function_exists( 'dinoco_get_all_box_templates' ) ) {
@@ -3418,8 +3473,11 @@ if ( ! function_exists( 'dinoco_api_retry' ) ) {
             $last_result = call_user_func( $callback );
             if ( is_array( $last_result ) && ! empty( $last_result['ok'] ) ) return $last_result;
 
-            $code = is_array( $last_result ) && isset( $last_result['error_code'] )
-                ? (string) $last_result['error_code'] : '';
+            $code = '';
+            if ( is_array( $last_result ) ) {
+                if ( isset( $last_result['status_code'] ) ) $code = (string) $last_result['status_code'];
+                elseif ( isset( $last_result['error_code'] ) ) $code = (string) $last_result['error_code'];
+            }
 
             // Non-retryable → straight to DLQ via caller
             if ( in_array( $code, array( '400', '401', '403', '409', '422' ), true ) ) {
@@ -3427,9 +3485,14 @@ if ( ! function_exists( 'dinoco_api_retry' ) ) {
                 return $last_result;
             }
 
+            // V.8.2 H-R3: 429 rate limit needs much longer backoff (10s/30s/60s)
+            // to avoid hammering Flash API during rate-limit enforcement.
+            $is_rate_limit = ( $code === '429' );
+            $effective_delays = $is_rate_limit ? array( 10, 30, 60 ) : $delays;
+
             // Retryable: exp backoff + jitter 50-150ms
             if ( $attempt < $max - 1 ) {
-                $delay_sec = isset( $delays[ $attempt ] ) ? intval( $delays[ $attempt ] ) : 5;
+                $delay_sec = isset( $effective_delays[ $attempt ] ) ? intval( $effective_delays[ $attempt ] ) : 5;
                 $jitter_us = mt_rand( 50, 150 ) * 1000;
                 usleep( $delay_sec * 1000000 + $jitter_us );
             }
@@ -3538,10 +3601,25 @@ if ( ! function_exists( 'dinoco_smart_detect_pack_mode' ) ) {
  * Recursive SET aggregate (C-A3 fix — tare counted once, not per-leaf).
  * Static memo for DD-3 shared leaf (P3). Return content weight only; caller adds parent tare.
  */
+/**
+ * V.8.2 C-Data-1 FIX: Flush aggregate memo — bumps global version key so existing
+ * memo entries become unreachable (cache-busted on next read). Call after any write
+ * that affects leaf SKU shipping data within a single request. DINOCO_Catalog::flush_memo()
+ * also calls this so catalog mutations invalidate aggregate caches transitively.
+ */
+if ( ! function_exists( 'dinoco_flush_aggregate_memo' ) ) {
+    function dinoco_flush_aggregate_memo() {
+        $GLOBALS['__dinoco_agg_memo_v'] = ( isset( $GLOBALS['__dinoco_agg_memo_v'] ) ? intval( $GLOBALS['__dinoco_agg_memo_v'] ) : 0 ) + 1;
+    }
+}
+
 if ( ! function_exists( 'dinoco_aggregate_children_shipping' ) ) {
     function dinoco_aggregate_children_shipping( $leaves, $parent_sku ) {
         static $memo = array();
-        $memo_key = md5( serialize( $leaves ) . '|' . $parent_sku );
+        // V.8.2 C-Data-1 FIX: include global version in memo key so dinoco_flush_aggregate_memo()
+        // can invalidate stale entries mid-request after catalog mutations.
+        $version  = isset( $GLOBALS['__dinoco_agg_memo_v'] ) ? intval( $GLOBALS['__dinoco_agg_memo_v'] ) : 0;
+        $memo_key = md5( serialize( $leaves ) . '|' . $parent_sku . '|v' . $version );
         if ( isset( $memo[ $memo_key ] ) ) return $memo[ $memo_key ];
 
         $total_content_g = 0;
@@ -3673,7 +3751,13 @@ if ( ! function_exists( 'dinoco_resolve_pno_shipping' ) ) {
             case 'bulk_pack': {
                 $tpl = ! empty( $catalog['box_template_id'] ) ? dinoco_get_box_template( $catalog['box_template_id'] ) : null;
                 if ( ! $tpl ) break;  // fall through
-                $wpu = intval( $catalog['weight_per_unit_g'] ?? 50 );
+                // V.8.2 H-D2 FIX: bulk_pack requires explicit weight_per_unit_g.
+                // Previous silent 50g default caused massive under-declaration for heavy parts.
+                $wpu = intval( $catalog['weight_per_unit_g'] ?? 0 );
+                if ( $wpu <= 0 ) {
+                    dinoco_log_missing_shipping_data( $sku . ' [bulk_pack missing weight_per_unit_g]' );
+                    return array_merge( $defaults_resolved, array( 'source' => 'bulk_pack_weight_missing' ) );
+                }
                 $qib = max( 1, intval( $qty_in_box ) );
                 $d = $resolve_dims( $tpl, $catalog );
                 $weight_g = ( $qib * $wpu ) + $d['tare'];
@@ -3788,13 +3872,32 @@ if ( ! function_exists( 'dinoco_resolve_manifest_shipping' ) ) {
         }
 
         // Ticket-level legacy override (decision #16: keep as escape hatch)
+        // V.8.2 C-Data-3 FIX: _flash_weight_grams is TOTAL weight, not per-PNO.
+        // Divide evenly across PNOs (floor division + remainder to first PNO) to prevent
+        // 10x overbilling on multi-box orders (e.g. 5000g override on 10 PNOs should be
+        // 500g/PNO = 5kg total, NOT 5000g × 10 = 50kg declared).
         if ( $ticket_id ) {
             $override_weight = get_post_meta( $ticket_id, '_flash_weight_grams', true );
             $override_ec     = get_post_meta( $ticket_id, '_flash_express_category', true );
-            if ( $override_weight !== '' && $override_weight !== null ) {
-                $ow = intval( $override_weight );
-                foreach ( $per_pno as &$p ) $p['weight_g'] = $ow;
+
+            if ( $override_weight !== '' && $override_weight !== null && ! empty( $per_pno ) ) {
+                $ow             = intval( $override_weight );
+                $pno_count      = count( $per_pno );
+                $per_pno_weight = intval( $ow / $pno_count );
+                // Floor division — leftover grams added to first PNO for integrity
+                $remainder      = $ow - ( $per_pno_weight * $pno_count );
+                $first_key      = array_key_first( $per_pno );
+                foreach ( $per_pno as $key => &$p ) {
+                    $p['weight_g'] = $per_pno_weight + ( $key === $first_key ? $remainder : 0 );
+                    $p['source']   = ( isset( $p['source'] ) ? $p['source'] : 'unknown' ) . '_weight_overridden';
+                }
                 unset( $p );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( sprintf(
+                        '[V42] _flash_weight_grams=%d override applied as TOTAL, divided %d ways = %dg/PNO (ticket #%d)',
+                        $ow, $pno_count, $per_pno_weight, $ticket_id
+                    ), 'info' );
+                }
             }
             if ( $override_ec !== '' && $override_ec !== null ) {
                 $oe = intval( $override_ec );

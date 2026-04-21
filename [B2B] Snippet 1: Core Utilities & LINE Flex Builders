@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.6 (2026-04-21) — Round 2 deep review fixes:            ║
+ * ║    • C-Conc-1: Snapshot hook GET_LOCK (replaces non-atomic transient) ║
+ * ║    • C-Conc-2: Dispatcher GET_LOCK + idempotency (no duplicate        ║
+ * ║      Flash orders under race)                                          ║
+ * ║    • C-Data-2: BO secondary passes ticket_id for override             ║
+ * ║    • C-Resil-1: Snapshot failure try/catch + audit + Flex alert       ║
+ * ║    • C-Conc-11/H-C1: Auto-rollback window filter by flag_flipped_at   ║
+ * ║      + 5min cooldown after manual flip                                 ║
+ * ║    • H-C2: DLQ INSERT ON DUPLICATE KEY UPDATE (preserves resolved)    ║
+ * ║    • H-R3: 429 retryable + longer backoff 10s/30s/60s                 ║
+ * ║    • track dinoco_shipping_flag_flipped_at on every flag flip         ║
  * ║  Version: V.34.5 (2026-04-21) — DEEP REVIEW CRITICAL FIXES:            ║
  * ║    • C1: M1 snapshot hook was listening on FSM states that don't      ║
  * ║           exist (awaiting_shipping/shipping_scheduled) — DEAD CODE     ║
@@ -5878,6 +5889,8 @@ add_action( 'rest_api_init', function() {
 
             update_option( 'dinoco_shipping_meta_enabled', '0' );
             $rolled_back_at = current_time( 'mysql' );
+            // Track flip timestamp for auto-rollback cron window filter (H-C1)
+            update_option( 'dinoco_shipping_flag_flipped_at', $rolled_back_at );
 
             $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
             if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
@@ -6058,6 +6071,12 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
     // Skip if flag already off
     if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
 
+    // C-Conc-11 / H-C1: 5-minute cooldown after manual flip — avoids
+    // race at flip moment where stale audit rows from prior session trigger
+    // immediate rollback.
+    $flipped_at = (string) get_option( 'dinoco_shipping_flag_flipped_at', '' );
+    if ( $flipped_at && ( time() - strtotime( $flipped_at ) ) < 300 ) return;
+
     // M4: Prevent concurrent rollback via MySQL GET_LOCK (cross-process, 2s timeout)
     global $wpdb;
     $lock_name = 'dinoco_shipping_rollback_lock';
@@ -6069,33 +6088,44 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
         $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
         if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$dlq_tbl}'" ) ) return;
 
-        // Count Flash create attempts in last hour (from audit)
+        // C-Conc-11 / H-C1: Window start = max(flag_flipped_at, now - 1h).
+        // Prevents counting pre-flag-flip errors against current flag session.
+        $window_start_q = ( $flipped_at && strtotime( $flipped_at ) > strtotime( '-1 hour' ) )
+            ? $flipped_at
+            : date( 'Y-m-d H:i:s', strtotime( '-1 hour' ) );
+
+        // Count Flash create attempts in window (from audit)
         $total_attempts = 0;
         $errors = 0;
         if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
-            $total_attempts = (int) $wpdb->get_var(
+            $total_attempts = (int) $wpdb->get_var( $wpdb->prepare(
                 "SELECT COUNT(*) FROM {$audit_tbl}
                  WHERE event_type IN ('flash_create','flash_create_fail')
-                   AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
-            );
-            $errors = (int) $wpdb->get_var(
+                   AND created_at > %s",
+                $window_start_q
+            ) );
+            $errors = (int) $wpdb->get_var( $wpdb->prepare(
                 "SELECT COUNT(*) FROM {$audit_tbl}
                  WHERE event_type = 'flash_create_fail'
-                   AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
-            );
+                   AND created_at > %s",
+                $window_start_q
+            ) );
         }
-        // DLQ inserts in last hour as another signal
-        $dlq_recent = (int) $wpdb->get_var(
+        // DLQ inserts in window as another signal
+        $dlq_recent = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$dlq_tbl}
              WHERE status = 'pending'
-               AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
-        );
+               AND created_at > %s",
+            $window_start_q
+        ) );
         $errors = max( $errors, $dlq_recent );
 
         // Rollback condition: (error_rate > 5%) AND (absolute_count > 20)
         $rate = $total_attempts > 0 ? ( 100.0 * $errors / $total_attempts ) : 0;
         if ( $rate > 5.0 && $errors > 20 ) {
             update_option( 'dinoco_shipping_meta_enabled', '0' );
+            // Track flip for next rollback cycle + H-C1 window filter
+            update_option( 'dinoco_shipping_flag_flipped_at', current_time( 'mysql' ) );
             $msg = sprintf(
                 '🚨 AUTO-ROLLBACK: V.42 flag disabled — error rate %.1f%% (%d/%d) in last hour. Check Admin Dashboard → Flash Shipping → DLQ + Audit',
                 $rate, $errors, $total_attempts
@@ -6186,27 +6216,22 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
     // Walk-in bypass (decision #15)
     if ( (int) get_post_meta( $order_id, '_b2b_is_walkin', true ) === 1 ) return;
 
-    // H1: Acquire 30-second transient lock to prevent concurrent snapshot writes
-    $lock_key = 'flash_snapshot_lock_' . $order_id;
-    if ( false !== get_transient( $lock_key ) ) return; // another worker is writing
-    set_transient( $lock_key, 1, 30 );
+    // C-Conc-1: Atomic MySQL GET_LOCK (replaces check-then-set transient pattern).
+    // Two workers can both pass `get_transient → false` milliseconds apart — only
+    // GET_LOCK serializes across PHP processes.
+    global $wpdb;
+    $lock_name = 'flash_snap_' . (int) $order_id;
+    $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 0)", $lock_name ) );
+    if ( $got_lock !== 1 ) return; // another worker holds it
+
     try {
-        // Idempotent — already snapshotted (re-check inside lock)
-        if ( get_post_meta( $order_id, '_flash_shipping_snapshot', true ) ) {
-            delete_transient( $lock_key );
-            return;
-        }
+        // Idempotency check INSIDE lock
+        if ( get_post_meta( $order_id, '_flash_shipping_snapshot', true ) ) return;
 
         // Build manifest from calculate_box_manifest helper
-        if ( ! function_exists( 'b2b_calculate_box_manifest' ) ) {
-            delete_transient( $lock_key );
-            return;
-        }
+        if ( ! function_exists( 'b2b_calculate_box_manifest' ) ) return;
         $manifest = b2b_calculate_box_manifest( $order_id );
-        if ( empty( $manifest ) ) {
-            delete_transient( $lock_key );
-            return;
-        }
+        if ( empty( $manifest ) ) return;
 
         // Enrich each entry with total_qty for bulk_pack partial box handling
         $manifest_enriched = array();
@@ -6223,8 +6248,30 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
 
         dinoco_snapshot_ticket_shipping( $order_id, $manifest_enriched );
         if ( function_exists( 'b2b_log' ) ) b2b_log( "[V42 Snapshot] ticket={$order_id} snapshotted " . count( $manifest_enriched ) . " manifest entries" );
+    } catch ( Exception $e ) {
+        // C-Resil-1: log + audit + Flex alert on snapshot failure
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[V42 snapshot] FAILED order=' . $order_id . ' err=' . $e->getMessage(), 'error' );
+        $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+        if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $audit_tbl ) ) ) === $audit_tbl ) {
+            $wpdb->insert( $audit_tbl, array(
+                'ticket_id'        => $order_id,
+                'event_type'       => 'snapshot_failure',
+                'request_summary'  => wp_json_encode( array( 'error' => $e->getMessage() ) ),
+                'response_summary' => 'exception',
+                'user_id'          => 0,
+                'created_at'       => current_time( 'mysql' ),
+            ) );
+        }
+        if ( function_exists( 'b2b_push_admin_flex_dedup' ) && function_exists( 'b2b_build_flex_flash_shipping_data_missing' ) ) {
+            // Best-effort admin alert — don't crash if Flex helper missing
+            @b2b_push_admin_flex_dedup(
+                'snapshot_fail_' . $order_id,
+                3600,
+                b2b_build_flex_flash_shipping_data_missing( $order_id, array( 'error:' . substr( $e->getMessage(), 0, 80 ) ) )
+            );
+        }
     } finally {
-        delete_transient( $lock_key );
+        $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
     }
 }, 9, 3 );
 
@@ -6437,8 +6484,11 @@ if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
             ) );
         }
 
-        // H5: DLQ REPLACE INTO on exhaustion (F7) — handles 2nd retry on same ticket+endpoint
-        // without silent UNIQUE constraint failure.
+        // H-C2: DLQ INSERT ON DUPLICATE KEY UPDATE — preserves resolved rows.
+        // Prior REPLACE INTO would DELETE+INSERT, wiping resolved_at/resolved_by
+        // for any row already processed by admin. ON DUPLICATE KEY UPDATE
+        // preserves status='resolved' rows untouched (IF guard) while still
+        // updating retry metadata for pending ones.
         if ( ! $is_ok && is_array( $result ) && ( ! empty( $result['retry_exhausted'] ) || ! empty( $result['retry_abandoned'] ) ) ) {
             $dlq_tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
             if ( $wpdb->get_var( "SHOW TABLES LIKE '{$dlq_tbl}'" ) ) {
@@ -6449,13 +6499,27 @@ if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
                 $retry_count = 3;
 
                 $wpdb->query( $wpdb->prepare(
-                    "REPLACE INTO {$dlq_tbl} (ticket_id, endpoint, request_body, last_error_code, last_error_message, retry_count, status, created_at)
-                     VALUES (%d, %s, %s, %s, %s, %d, %s, %s)",
+                    "INSERT INTO {$dlq_tbl} (ticket_id, endpoint, request_body, last_error_code, last_error_message, retry_count, status, created_at)
+                     VALUES (%d, %s, %s, %s, %s, %d, %s, %s)
+                     ON DUPLICATE KEY UPDATE
+                       request_body = VALUES(request_body),
+                       last_error_code = VALUES(last_error_code),
+                       last_error_message = VALUES(last_error_message),
+                       retry_count = VALUES(retry_count),
+                       status = IF(status='resolved', status, VALUES(status)),
+                       created_at = IF(status='resolved', created_at, VALUES(created_at))",
                     $ticket_id, $endpoint, $request_body, $last_error_code, $last_error_message, $retry_count, 'pending', current_time( 'mysql' )
                 ) );
+                // insert_id is 0 on UPDATE path; fall back to SELECT for dedup key
                 $dlq_id = $wpdb->insert_id;
                 if ( ! $dlq_id ) {
-                    error_log( 'DINOCO V.42 DLQ: REPLACE failed for ticket=' . $ticket_id );
+                    $dlq_id = (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT id FROM {$dlq_tbl} WHERE ticket_id=%d AND endpoint=%s ORDER BY id DESC LIMIT 1",
+                        $ticket_id, $endpoint
+                    ) );
+                }
+                if ( ! $dlq_id ) {
+                    error_log( 'DINOCO V.42 DLQ: INSERT/UPDATE failed for ticket=' . $ticket_id );
                 } else {
                     // Fire DLQ Flex alert (deduped per ticket per day)
                     if ( function_exists( 'b2b_push_admin_flex_dedup' ) && function_exists( 'b2b_build_flex_flash_dlq_alert' ) ) {
@@ -6641,24 +6705,44 @@ if ( ! function_exists( 'b2b_flash_dispatch_create_all' ) ) {
         $ticket_id = intval( $ticket_id );
         if ( ! $ticket_id ) return array( 'ok' => false, 'error' => 'bad_ticket_id' );
 
-        $flag_on = get_option( 'dinoco_shipping_meta_enabled', '0' ) === '1';
-        $is_walkin = (int) get_post_meta( $ticket_id, '_b2b_is_walkin', true ) === 1;
-        $v42_available = function_exists( 'b2b_flash_create_all_boxes_v42' ) && function_exists( 'dinoco_resolve_manifest_shipping' );
-
-        if ( $flag_on && ! $is_walkin && $v42_available ) {
-            $res = b2b_flash_create_all_boxes_v42( $ticket_id );
-            if ( $res['ok'] ) return $res;
-            // V.42 failed → log and fall back to legacy for safety
-            $err = $res['error'] ?? 'v42_failed';
-            if ( $err !== 'walk_in_skipped' ) {  // walk-in is intentional skip, not a failure
-                b2b_log( "[Flash Dispatch] V.42 failed ({$err}), falling back to legacy for ticket={$ticket_id}" );
-                return b2b_flash_create_all_boxes( $ticket_id );
-            }
-            return $res;
+        // C-Conc-2: Atomic GET_LOCK to prevent duplicate Flash order creation
+        // when 4 call sites race (e.g., FSM hook + manual admin action + cron).
+        global $wpdb;
+        $lock_name = 'flash_create_' . $ticket_id;
+        $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $lock_name ) );
+        if ( $got_lock !== 1 ) {
+            return array( 'ok' => false, 'error' => 'dispatch_locked', 'locked_by_other_worker' => true );
         }
 
-        // Legacy path (V.41 behavior)
-        return b2b_flash_create_all_boxes( $ticket_id );
+        try {
+            // Idempotency check INSIDE lock — ticket already has PNOs means
+            // another worker finished before us; return existing result.
+            $existing = get_post_meta( $ticket_id, '_flash_tracking_numbers', true );
+            if ( is_array( $existing ) && ! empty( $existing ) ) {
+                return array( 'ok' => true, 'already_created' => true, 'pnos' => $existing );
+            }
+
+            $flag_on = get_option( 'dinoco_shipping_meta_enabled', '0' ) === '1';
+            $is_walkin = (int) get_post_meta( $ticket_id, '_b2b_is_walkin', true ) === 1;
+            $v42_available = function_exists( 'b2b_flash_create_all_boxes_v42' ) && function_exists( 'dinoco_resolve_manifest_shipping' );
+
+            if ( $flag_on && ! $is_walkin && $v42_available ) {
+                $res = b2b_flash_create_all_boxes_v42( $ticket_id );
+                if ( $res['ok'] ) return $res;
+                // V.42 failed → log and fall back to legacy for safety
+                $err = $res['error'] ?? 'v42_failed';
+                if ( $err !== 'walk_in_skipped' ) {  // walk-in is intentional skip, not a failure
+                    b2b_log( "[Flash Dispatch] V.42 failed ({$err}), falling back to legacy for ticket={$ticket_id}" );
+                    return b2b_flash_create_all_boxes( $ticket_id );
+                }
+                return $res;
+            }
+
+            // Legacy path (V.41 behavior)
+            return b2b_flash_create_all_boxes( $ticket_id );
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
     }
 }
 
@@ -6722,8 +6806,10 @@ if ( ! function_exists( 'b2b_flash_create_secondary' ) ) {
         }
         if ( empty( $mini_manifest ) ) return array( 'ok' => false, 'error' => 'empty_bo_manifest' );
 
-        // Resolve shipping for BO items subset — fresh (not from primary snapshot)
-        $per_pno = dinoco_resolve_manifest_shipping( $mini_manifest );
+        // Resolve shipping for BO items subset — fresh (not from primary snapshot).
+        // C-Data-2: pass $order_id so _flash_weight_grams ticket override is honored
+        // (priority chain: ticket meta > SKU override > box_template > ...).
+        $per_pno = dinoco_resolve_manifest_shipping( $mini_manifest, $order_id );
         if ( empty( $per_pno ) ) return array( 'ok' => false, 'error' => 'no_shipping_resolved' );
 
         // Aggregate (single order + sub-parcels if > 1)
