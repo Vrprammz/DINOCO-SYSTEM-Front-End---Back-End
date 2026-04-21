@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.3 (2026-04-21) — Round 3 cleanup fixes:                                             ║
+ * ║    • R3 weight floor: _flash_weight_grams override clamps to 100g minimum per-PNO                 ║
+ * ║          (prevents Flash 0g rejection on small overrides or many PNOs)                            ║
+ * ║    • R5 set_time_limit(120): 429 backoff can total 100s — survive PHP-FPM 30s default             ║
+ * ║    • M-1 box_templates.name VARCHAR(50) → VARCHAR(100) (Thai chars 3 bytes each)                 ║
+ * ║    • M-11 manifest_hash uses wp_json_encode (stable vs serialize w/ class state)                 ║
  * ║  Version: V.8.2 (2026-04-21) — Round 2 deep review fixes:                                         ║
  * ║    • C-Data-3: _flash_weight_grams override semantics fixed — total (divided),                    ║
  * ║                not per-PNO. Prevents 10x overbilling on multi-box orders.                         ║
@@ -2942,7 +2948,7 @@ add_action( 'init', function() {
     $tpl_table = $wpdb->prefix . 'dinoco_box_templates';
     $sql_tpl = "CREATE TABLE {$tpl_table} (
         id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-        name VARCHAR(50) NOT NULL,
+        name VARCHAR(100) NOT NULL,
         code VARCHAR(20) NOT NULL,
         length_cm SMALLINT UNSIGNED NOT NULL,
         width_cm SMALLINT UNSIGNED NOT NULL,
@@ -3034,6 +3040,17 @@ add_action( 'init', function() {
                 $wpdb->query( "ALTER TABLE {$audit_table} MODIFY COLUMN {$col_name} MEDIUMTEXT" );
                 if ( function_exists( 'b2b_log' ) ) b2b_log( "[V.8.2] ALTER flash_audit.{$col_name} TEXT → MEDIUMTEXT" );
             }
+        }
+    }
+
+    // V.8.3 M-1 migration: box_templates.name VARCHAR(50) → VARCHAR(100) — Thai chars
+    // at 3 bytes/char utf8mb4 could truncate names like "กล่องกันล้มใหญ่พิเศษสำหรับ NX500".
+    $box_tpl_table = $wpdb->prefix . 'dinoco_box_templates';
+    if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $box_tpl_table ) ) ) === $box_tpl_table ) {
+        $cols = $wpdb->get_results( "SHOW COLUMNS FROM {$box_tpl_table}", OBJECT_K );
+        if ( isset( $cols['name'] ) && stripos( $cols['name']->Type, 'varchar(50)' ) !== false ) {
+            $wpdb->query( "ALTER TABLE {$box_tpl_table} MODIFY COLUMN name VARCHAR(100) NOT NULL" );
+            if ( function_exists( 'b2b_log' ) ) b2b_log( '[V.8.3] ALTER box_templates.name VARCHAR(50) → VARCHAR(100)' );
         }
     }
 
@@ -3467,6 +3484,9 @@ if ( ! function_exists( 'dinoco_estimate_weight_from_leaves' ) ) {
  */
 if ( ! function_exists( 'dinoco_api_retry' ) ) {
     function dinoco_api_retry( $callback, $max = 3, $delays = array( 1, 2, 5 ) ) {
+        // R5 FIX: 429 backoff can total 100s. Bump execution time to survive
+        // PHP-FPM default 30s timeout (best-effort; some hosts ignore).
+        if ( function_exists( 'set_time_limit' ) ) @set_time_limit( 120 );
         $attempt = 0;
         $last_result = null;
         while ( $attempt < $max ) {
@@ -3884,9 +3904,24 @@ if ( ! function_exists( 'dinoco_resolve_manifest_shipping' ) ) {
                 $ow             = intval( $override_weight );
                 $pno_count      = count( $per_pno );
                 $per_pno_weight = intval( $ow / $pno_count );
-                // Floor division — leftover grams added to first PNO for integrity
-                $remainder      = $ow - ( $per_pno_weight * $pno_count );
-                $first_key      = array_key_first( $per_pno );
+                // R3 FIX: Flash rejects 0g parcels. Enforce 100g minimum per PNO.
+                // If override too small to distribute, scale total up to ensure all
+                // PNOs get >= 100g (admin's override was clearly wrong — log + clamp).
+                $MIN_PNO_WEIGHT = 100;
+                if ( $per_pno_weight < $MIN_PNO_WEIGHT ) {
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( sprintf(
+                            '[V42] _flash_weight_grams=%d too small for %d PNOs (each=%dg < %dg min). Clamped to %dg/PNO.',
+                            $ow, $pno_count, $per_pno_weight, $MIN_PNO_WEIGHT, $MIN_PNO_WEIGHT
+                        ), 'warn' );
+                    }
+                    $per_pno_weight = $MIN_PNO_WEIGHT;
+                    $remainder      = 0;  // no remainder when we clamped up
+                } else {
+                    // Floor division — leftover grams added to first PNO for integrity
+                    $remainder = $ow - ( $per_pno_weight * $pno_count );
+                }
+                $first_key = array_key_first( $per_pno );
                 foreach ( $per_pno as $key => &$p ) {
                     $p['weight_g'] = $per_pno_weight + ( $key === $first_key ? $remainder : 0 );
                     $p['source']   = ( isset( $p['source'] ) ? $p['source'] : 'unknown' ) . '_weight_overridden';
@@ -3924,7 +3959,9 @@ if ( ! function_exists( 'dinoco_snapshot_ticket_shipping' ) ) {
             'snapshotted_at'=> current_time( 'mysql' ),
             'flag_state'    => (bool) get_option( 'dinoco_shipping_meta_enabled', '0' ),
             'per_pno'       => $per_pno,
-            'manifest_hash' => md5( serialize( $manifest ) ),
+            // M-11 FIX: use wp_json_encode (stable across PHP versions + order-independent
+            // for associative arrays) instead of serialize() which embeds class names.
+            'manifest_hash' => md5( (string) wp_json_encode( $manifest ) ),
         ) );
         return $per_pno;
     }

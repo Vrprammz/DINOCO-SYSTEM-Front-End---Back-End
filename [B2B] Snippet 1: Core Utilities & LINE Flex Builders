@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.7 (2026-04-21) — Round 3 cleanup:                       ║
+ * ║    • H-1: DLQ retry endpoint GET_LOCK (prevents double-retry          ║
+ * ║          race = double Flash order from concurrent admin panic clicks)║
+ * ║    • H-3: F2 verify cron + DLQ/audit cleanup use current_time('mysql')║
+ * ║          instead of NOW() — WP TZ Asia/Bangkok vs MySQL UTC = 7hr     ║
+ * ║          drift. DLQ rows were deleted 7hr too early.                  ║
  * ║  Version: V.34.6 (2026-04-21) — Round 2 deep review fixes:            ║
  * ║    • C-Conc-1: Snapshot hook GET_LOCK (replaces non-atomic transient) ║
  * ║    • C-Conc-2: Dispatcher GET_LOCK + idempotency (no duplicate        ║
@@ -5778,42 +5784,54 @@ add_action( 'rest_api_init', function() {
             global $wpdb;
             $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
             $id = absint( $req['id'] );
-            $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
-            if ( ! $row ) return new WP_Error( 'not_found', 'DLQ entry not found', array( 'status' => 404 ) );
-            if ( $row['status'] !== 'pending' ) return new WP_Error( 'bad_state', 'status=' . $row['status'], array( 'status' => 400 ) );
 
-            // Re-execute via b2b_flash_request
-            $body = json_decode( $row['request_body'], true );
-            if ( ! is_array( $body ) ) return new WP_Error( 'bad_data', 'cannot parse request body', array( 'status' => 400 ) );
-
-            $result = null;
-            if ( function_exists( 'b2b_flash_request' ) ) {
-                $result = b2b_flash_request( $row['endpoint'], $body );
-            } else {
-                return new WP_Error( 'no_helper', 'b2b_flash_request not available', array( 'status' => 500 ) );
+            // H-1 FIX: GET_LOCK prevents 2 admins clicking retry simultaneously
+            // → 2 parallel Flash orders + double billing. 5s timeout.
+            $lock_name = 'dlq_retry_' . $id;
+            $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_name ) );
+            if ( $got_lock !== 1 ) {
+                return new WP_Error( 'busy', 'Another admin is retrying this entry', array( 'status' => 423 ) );
             }
+            try {
+                $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
+                if ( ! $row ) return new WP_Error( 'not_found', 'DLQ entry not found', array( 'status' => 404 ) );
+                if ( $row['status'] !== 'pending' ) return new WP_Error( 'bad_state', 'status=' . $row['status'], array( 'status' => 400 ) );
 
-            $is_ok = is_array( $result ) && ! empty( $result['ok'] );
-            if ( $is_ok ) {
-                $wpdb->update( $tbl, array(
-                    'status' => 'resolved',
-                    'resolved_at' => current_time( 'mysql' ),
-                    'resolved_by' => get_current_user_id(),
-                ), array( 'id' => $id ) );
-            } else {
-                $wpdb->update( $tbl, array(
-                    'retry_count' => (int) $row['retry_count'] + 1,
-                    'last_error_code' => isset( $result['error_code'] ) ? (string) $result['error_code'] : 'unknown',
-                    'last_error_message' => isset( $result['message'] ) ? (string) $result['message'] : '',
-                ), array( 'id' => $id ) );
+                // Re-execute via b2b_flash_request
+                $body = json_decode( $row['request_body'], true );
+                if ( ! is_array( $body ) ) return new WP_Error( 'bad_data', 'cannot parse request body', array( 'status' => 400 ) );
+
+                $result = null;
+                if ( function_exists( 'b2b_flash_request' ) ) {
+                    $result = b2b_flash_request( $row['endpoint'], $body );
+                } else {
+                    return new WP_Error( 'no_helper', 'b2b_flash_request not available', array( 'status' => 500 ) );
+                }
+
+                $is_ok = is_array( $result ) && ! empty( $result['ok'] );
+                if ( $is_ok ) {
+                    $wpdb->update( $tbl, array(
+                        'status' => 'resolved',
+                        'resolved_at' => current_time( 'mysql' ),
+                        'resolved_by' => get_current_user_id(),
+                    ), array( 'id' => $id ) );
+                } else {
+                    $wpdb->update( $tbl, array(
+                        'retry_count' => (int) $row['retry_count'] + 1,
+                        'last_error_code' => isset( $result['error_code'] ) ? (string) $result['error_code'] : 'unknown',
+                        'last_error_message' => isset( $result['message'] ) ? (string) $result['message'] : '',
+                    ), array( 'id' => $id ) );
+                }
+
+                return rest_ensure_response( array(
+                    'ok' => $is_ok,
+                    'dlq_id' => $id,
+                    'result' => $result,
+                    'status' => $is_ok ? 'resolved' : 'still_failing',
+                ) );
+            } finally {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
             }
-
-            return rest_ensure_response( array(
-                'ok' => $is_ok,
-                'dlq_id' => $id,
-                'result' => $result,
-                'status' => $is_ok ? 'resolved' : 'still_failing',
-            ) );
         },
         'permission_callback' => $admin_perm,
     ) );
@@ -5975,17 +5993,19 @@ add_action( 'flash_category_verify_cron', function() {
     // Only run if V.42 flag is ON — save cycles when feature off
     if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
 
-    // Find tickets with Flash PNO created in last 2hr + not yet verified
-    $recent = $wpdb->get_results(
+    // Find tickets with Flash PNO created in last 2hr + not yet verified.
+    // V.34.7 H-3 FIX: use current_time('mysql') instead of NOW() — WP TZ is
+    // Asia/Bangkok but MySQL server TZ often UTC → 7-hour drift.
+    $recent = $wpdb->get_results( $wpdb->prepare(
         "SELECT p.ID, pm.meta_value AS pno
          FROM {$wpdb->posts} p
          JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = '_flash_tracking_numbers'
          WHERE p.post_type = 'b2b_order'
-           AND p.post_date > DATE_SUB(NOW(), INTERVAL 2 HOUR)
+           AND p.post_date > DATE_SUB(%s, INTERVAL 2 HOUR)
            AND NOT EXISTS (SELECT 1 FROM {$wpdb->postmeta} WHERE post_id = p.ID AND meta_key = '_flash_ec_verified_at')
          LIMIT 20",
-        ARRAY_A
-    );
+        current_time( 'mysql' )
+    ), ARRAY_A );
 
     if ( empty( $recent ) ) return;
 
@@ -6168,13 +6188,21 @@ add_action( 'dinoco_flash_dlq_cleanup_cron', function() {
     global $wpdb;
     $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
     if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$tbl}'" ) ) return;
-    $deleted = $wpdb->query( "DELETE FROM {$tbl} WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)" );
+    // V.34.7 H-3: use current_time('mysql') not NOW() — prevents 7hr TZ drift
+    // (WP is Asia/Bangkok, MySQL server typically UTC — DELETE was 7hr too early)
+    $deleted = $wpdb->query( $wpdb->prepare(
+        "DELETE FROM {$tbl} WHERE created_at < DATE_SUB(%s, INTERVAL 30 DAY)",
+        current_time( 'mysql' )
+    ) );
     if ( $deleted && function_exists( 'b2b_log' ) ) b2b_log( "[DLQCleanup] deleted {$deleted} rows > 30 days old" );
 
     // Also cleanup old audit rows > 90 days (DR-4 PDPA hygiene)
     $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
     if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
-        $d2 = $wpdb->query( "DELETE FROM {$audit_tbl} WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)" );
+        $d2 = $wpdb->query( $wpdb->prepare(
+            "DELETE FROM {$audit_tbl} WHERE created_at < DATE_SUB(%s, INTERVAL 90 DAY)",
+            current_time( 'mysql' )
+        ) );
         if ( $d2 && function_exists( 'b2b_log' ) ) b2b_log( "[AuditCleanup] deleted {$d2} audit rows > 90 days old" );
     }
 
