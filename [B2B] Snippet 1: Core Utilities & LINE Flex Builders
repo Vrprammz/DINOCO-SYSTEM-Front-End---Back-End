@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.5 (2026-04-21) — DEEP REVIEW CRITICAL FIXES:            ║
+ * ║    • C1: M1 snapshot hook was listening on FSM states that don't      ║
+ * ║           exist (awaiting_shipping/shipping_scheduled) — DEAD CODE     ║
+ * ║           since V.34.2. Changed to 'paid' (real FSM state, fires      ║
+ * ║           AFTER confirm_bill + payment verified, BEFORE Flash create).║
+ * ║    • C3: flash_category_verify_cron called b2b_flash_request(...,'GET')║
+ * ║           but 3rd arg is $expect_pdf bool. F2 bump detection silently  ║
+ * ║           failed. Replaced with inline wp_remote_get + HMAC auth.     ║
  * ║  Version: V.34.4 (2026-04-20) — code review fixes:                    ║
  * ║    • H1: transient lock on snapshot idempotency                       ║
  * ║    • H2: POST /b2b/v1/shipping/manual-rollback endpoint               ║
@@ -5975,9 +5983,35 @@ add_action( 'flash_category_verify_cron', function() {
         $expected_ec = (int) get_post_meta( $ticket_id, '_flash_express_category', true ) ?: 1;
 
         // Query Flash Routes API for first PNO
+        // V.34.5 CRITICAL FIX C3: was @b2b_flash_request('...', [], 'GET') — 3rd arg is
+        // $expect_pdf bool (not HTTP method). 'GET' coerced to true → treated as PDF
+        // expected → silently failed. Flash Routes API requires GET. Use wp_remote_get
+        // with same HMAC auth pattern as b2b_flash_request.
         $first_pno = reset( $pnos );
         if ( ! $first_pno ) continue;
-        $resp = @b2b_flash_request( 'open/v1/routes/' . $first_pno, array(), 'GET' );
+        $resp = array( 'ok' => false );
+        if ( defined( 'B2B_FLASH_MCH_ID' ) && defined( 'B2B_FLASH_SECRET_KEY' ) && defined( 'B2B_FLASH_API_URL' ) ) {
+            $params = array(
+                'mchId'    => trim( B2B_FLASH_MCH_ID ),
+                'nonceStr' => b2b_flash_nonce_str(),
+            );
+            $params['sign'] = b2b_flash_sign( $params );
+            $url = rtrim( B2B_FLASH_API_URL, '/' ) . '/open/v1/routes/' . rawurlencode( $first_pno ) . '?' . http_build_query( $params );
+            $wp_resp = wp_remote_get( $url, array( 'timeout' => 15, 'headers' => array( 'Accept-Language' => 'th' ) ) );
+            if ( ! is_wp_error( $wp_resp ) ) {
+                $code = wp_remote_retrieve_response_code( $wp_resp );
+                $body = wp_remote_retrieve_body( $wp_resp );
+                $decoded = json_decode( $body, true );
+                if ( is_array( $decoded ) ) {
+                    $flash_code = isset( $decoded['code'] ) ? intval( $decoded['code'] ) : -1;
+                    $resp = array(
+                        'ok'          => ( $flash_code === 1 ),
+                        'data'        => $decoded['data'] ?? $decoded,
+                        'status_code' => $code,
+                    );
+                }
+            }
+        }
 
         // Parse actual EC from response (shape varies per Flash API version)
         $actual_ec = null;
@@ -6137,11 +6171,15 @@ add_action( 'dinoco_flash_dlq_cleanup_cron', function() {
 // ───────────────────────────────────────────────────────────────────
 // M1: Snapshot hook — immutable shipping metadata at confirm_bill
 // ───────────────────────────────────────────────────────────────────
-// Fires when ticket transitions to awaiting_shipping or shipping_scheduled.
+// V.34.5 CRITICAL FIX C1: snapshot hook fires on 'paid' (confirm_bill complete +
+// payment verified — last stable state BEFORE Flash create).
+// Original spec said 'awaiting_shipping'/'shipping_scheduled' but those states
+// don't exist in FSM (Snippet 14) — hook was dead code from V.34.2 until now.
+// FSM flow: awaiting_confirm → paid → packed (Flash create) → shipped → completed
 // Idempotent — skips if _flash_shipping_snapshot meta already exists.
 // Priority 9 — before Flash create listener at priority 10.
 add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_status ) {
-    if ( $new_status !== 'awaiting_shipping' && $new_status !== 'shipping_scheduled' ) return;
+    if ( $new_status !== 'paid' ) return;
     if ( ! function_exists( 'dinoco_snapshot_ticket_shipping' ) ) return;
     // Feature flag gate
     if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
