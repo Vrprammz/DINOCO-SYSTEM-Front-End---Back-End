@@ -1,6 +1,15 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.9 (2026-04-21) — Round 5 LOW+MED cleanup:              ║
+ * ║    • M-1: Snapshot hook catch \Throwable (covers PHP 7+ Error/TypeError)║
+ * ║    • M-2: error_log fallback when audit INSERT fails (DB outage)      ║
+ * ║    • M-3: Dispatcher idempotency also checks _flash_tracking_numbers_bo║
+ * ║    • M-4: Dispatcher lock timeout 3s → 15s (Flash API p99 latency)    ║
+ * ║    • M-6: Auto-rollback fallback to absolute DLQ count when audit     ║
+ * ║           table unavailable (zero-denominator edge)                    ║
+ * ║    • NEW: dinoco_cron_{name}_last_run heartbeat writes — Go-Live UI   ║
+ * ║           cron health indicator now accurate                           ║
  * ║  Version: V.34.8 (2026-04-24) — Round 4 deep review fixes +           ║
  * ║                                   Slip Resilience helpers:             ║
  * ║    • M-8: DLQ preserves 'abandoned' status (was clobbered to pending) ║
@@ -6180,6 +6189,10 @@ if ( ! wp_next_scheduled( 'flash_category_verify_cron' ) ) {
     wp_schedule_event( time() + 300, 'fifteen_minutes', 'flash_category_verify_cron' );
 }
 add_action( 'flash_category_verify_cron', function() {
+    // V.34.9 NEW: cron heartbeat — Go-Live Tool monitor reads this option
+    // to display cron health ("last run" timestamp). Without this write,
+    // UI shows "never" perpetually.
+    update_option( 'dinoco_cron_flash_category_verify_last_run', time() );
     if ( ! function_exists( 'b2b_flash_request' ) ) return;
     global $wpdb;
 
@@ -6336,6 +6349,8 @@ if ( ! wp_next_scheduled( 'dinoco_shipping_auto_rollback_cron' ) ) {
     wp_schedule_event( time() + 600, 'ten_minutes', 'dinoco_shipping_auto_rollback_cron' );
 }
 add_action( 'dinoco_shipping_auto_rollback_cron', function() {
+    // V.34.9 NEW: cron heartbeat for Go-Live Tool monitor
+    update_option( 'dinoco_cron_dinoco_shipping_auto_rollback_last_run', time() );
     // Skip if flag already off
     if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
 
@@ -6400,8 +6415,20 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
         $errors = max( $errors, $dlq_recent );
 
         // Rollback condition: (error_rate > 5%) AND (absolute_count > 20)
-        $rate = $total_attempts > 0 ? ( 100.0 * $errors / $total_attempts ) : 0;
-        if ( $rate > 5.0 && $errors > 20 ) {
+        // V.34.9 M-6: if audit table missing/empty, fall back to absolute DLQ
+        // count threshold alone (prevents rollback from failing to fire due to
+        // zero denominator — e.g. audit table dropped but DLQ still piling up).
+        $rate = 0.0;
+        $should_rollback = false;
+        if ( $total_attempts === 0 && $errors >= 20 ) {
+            // Audit unavailable but DLQ shows real damage — trigger rollback
+            if ( function_exists( 'b2b_log' ) ) b2b_log( '[V42 auto-rollback] AUDIT table unavailable; triggering based on absolute DLQ count=' . $errors, 'warn' );
+            $should_rollback = true;
+        } else {
+            $rate = $total_attempts > 0 ? ( 100.0 * $errors / $total_attempts ) : 0.0;
+            $should_rollback = ( $rate > 5.0 && $errors > 20 );
+        }
+        if ( $should_rollback ) {
             update_option( 'dinoco_shipping_meta_enabled', '0' );
             // Track flip for next rollback cycle + H-C1 window filter
             update_option( 'dinoco_shipping_flag_flipped_at', current_time( 'mysql' ) );
@@ -6444,6 +6471,8 @@ if ( ! wp_next_scheduled( 'dinoco_flash_dlq_cleanup_cron' ) ) {
     wp_schedule_event( $next, 'daily', 'dinoco_flash_dlq_cleanup_cron' );
 }
 add_action( 'dinoco_flash_dlq_cleanup_cron', function() {
+    // V.34.9 NEW: cron heartbeat for Go-Live Tool monitor
+    update_option( 'dinoco_cron_dinoco_flash_dlq_cleanup_last_run', time() );
     global $wpdb;
     $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
     if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$tbl}'" ) ) return;
@@ -6535,12 +6564,19 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
 
         dinoco_snapshot_ticket_shipping( $order_id, $manifest_enriched );
         if ( function_exists( 'b2b_log' ) ) b2b_log( "[V42 Snapshot] ticket={$order_id} snapshotted " . count( $manifest_enriched ) . " manifest entries" );
-    } catch ( Exception $e ) {
+    } catch ( \Throwable $e ) {
+        // V.34.9 M-1: catch Throwable (covers PHP 7+ Error + TypeError) —
+        // malformed manifest from b2b_calculate_box_manifest can throw TypeError
+        // (e.g. array_map on non-iterable) which Exception wouldn't catch.
+        // V.34.9 M-2: error_log fallback — if audit DB INSERT also fails (DB
+        // outage), at least the error reaches PHP error log so ops sees it.
         // C-Resil-1: log + audit + Flex alert on snapshot failure
         if ( function_exists( 'b2b_log' ) ) b2b_log( '[V42 snapshot] FAILED order=' . $order_id . ' err=' . $e->getMessage(), 'error' );
+        error_log( 'DINOCO V42 snapshot failure order=' . $order_id . ' err=' . $e->getMessage() );
         $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
-        if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $audit_tbl ) ) ) === $audit_tbl ) {
-            $wpdb->insert( $audit_tbl, array(
+        $audit_exists = ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $audit_tbl ) ) ) === $audit_tbl );
+        if ( $audit_exists ) {
+            $audit_insert_result = $wpdb->insert( $audit_tbl, array(
                 'ticket_id'        => $order_id,
                 'event_type'       => 'snapshot_failure',
                 'request_summary'  => wp_json_encode( array( 'error' => $e->getMessage() ) ),
@@ -6548,14 +6584,22 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
                 'user_id'          => 0,
                 'created_at'       => current_time( 'mysql' ),
             ) );
+            if ( $audit_insert_result === false ) {
+                // Audit insert ALSO failed — log to PHP error log as last resort
+                error_log( 'DINOCO V42 snapshot audit INSERT failed order=' . $order_id . ' wpdb_err=' . $wpdb->last_error );
+            }
         }
         if ( function_exists( 'b2b_push_admin_flex_dedup' ) && function_exists( 'b2b_build_flex_flash_shipping_data_missing' ) ) {
             // Best-effort admin alert — don't crash if Flex helper missing
-            @b2b_push_admin_flex_dedup(
-                'snapshot_fail_' . $order_id,
-                3600,
-                b2b_build_flex_flash_shipping_data_missing( $order_id, array( 'error:' . substr( $e->getMessage(), 0, 80 ) ) )
-            );
+            try {
+                b2b_push_admin_flex_dedup(
+                    'snapshot_fail_' . $order_id,
+                    3600,
+                    b2b_build_flex_flash_shipping_data_missing( $order_id, array( 'error:' . substr( $e->getMessage(), 0, 80 ) ) )
+                );
+            } catch ( \Throwable $flex_err ) {
+                error_log( 'DINOCO V42 snapshot Flex alert failed: ' . $flex_err->getMessage() );
+            }
         }
     } finally {
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
@@ -7000,9 +7044,11 @@ if ( ! function_exists( 'b2b_flash_dispatch_create_all' ) ) {
 
         // C-Conc-2: Atomic GET_LOCK to prevent duplicate Flash order creation
         // when 4 call sites race (e.g., FSM hook + manual admin action + cron).
+        // V.34.9 M-4: 15s timeout matches Flash API latency tail (p99 ~25s).
+        // Reduces false "locked_by_other_worker" when caller A is mid-flight.
         global $wpdb;
         $lock_name = 'flash_create_' . $ticket_id;
-        $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $lock_name ) );
+        $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 15)", $lock_name ) );
         if ( $got_lock !== 1 ) {
             return array( 'ok' => false, 'error' => 'dispatch_locked', 'locked_by_other_worker' => true );
         }
@@ -7010,9 +7056,26 @@ if ( ! function_exists( 'b2b_flash_dispatch_create_all' ) ) {
         try {
             // Idempotency check INSIDE lock — ticket already has PNOs means
             // another worker finished before us; return existing result.
-            $existing = get_post_meta( $ticket_id, '_flash_tracking_numbers', true );
-            if ( is_array( $existing ) && ! empty( $existing ) ) {
-                return array( 'ok' => true, 'already_created' => true, 'pnos' => $existing );
+            $existing_primary = get_post_meta( $ticket_id, '_flash_tracking_numbers', true );
+            if ( is_array( $existing_primary ) && ! empty( $existing_primary ) ) {
+                return array(
+                    'ok'              => true,
+                    'already_created' => true,
+                    'pnos'            => $existing_primary,
+                    'source'          => 'idempotent_primary',
+                );
+            }
+            // V.34.9 M-3: also check BO secondary meta — if this dispatcher is
+            // (unexpectedly) re-entered for an order that only had BO Flash
+            // create, treat as already-created to prevent duplicate primary.
+            $existing_bo = get_post_meta( $ticket_id, '_flash_tracking_numbers_bo', true );
+            if ( is_array( $existing_bo ) && ! empty( $existing_bo ) ) {
+                return array(
+                    'ok'              => true,
+                    'already_created' => true,
+                    'pnos'            => $existing_bo,
+                    'source'          => 'idempotent_bo_only',
+                );
             }
 
             $flag_on = get_option( 'dinoco_shipping_meta_enabled', '0' ) === '1';
