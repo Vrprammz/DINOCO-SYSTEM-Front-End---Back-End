@@ -1,6 +1,22 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.12 (2026-04-24) — Slip Replay Pool helpers (CNX regression):           ║
+ * ║    • NEW b2b_slip_compute_image_hash($binary) — SHA-256 of raw slip bytes             ║
+ * ║    • NEW b2b_slip_find_prior_payment($image_hash) — row ที่ใช้ hash เดียวกันและตัดหนี้ ║
+ * ║           สำเร็จแล้ว (result_status in paid/paid_overpayment/manual_admin_paid)        ║
+ * ║    • NEW b2b_slip_find_cached_response($image_hash) — row ล่าสุดที่ slip2go_response   ║
+ * ║           NOT NULL + status เป็น failure เรา (slip2go_error/line_api_error/            ║
+ * ║           data_missing/unregistered_group/unknown_slip_code/fatal_exception)           ║
+ * ║           ใช้ replay flow (รันผ่าน cached JSON โดยไม่เรียก Slip2Go ใหม่)                 ║
+ * ║    • NEW b2b_slip_find_prior_rejection($image_hash) — row ที่ Slip2Go reject           ║
+ * ║           (receiver_mismatch/amount_mismatch/amount_no_pending/duplicate/not_slip)    ║
+ * ║           → admin review ห้าม auto-replay                                              ║
+ * ║    • Schema companion: Snippet 15 V.8.6 (new columns image_hash/slip2go_response/      ║
+ * ║           replayed_from_log_id + indexes idx_image_hash / idx_hash_status)             ║
+ * ║    • b2b_slip_log_insert() extended: รู้จัก fields ใหม่ (image_hash/image_mime/         ║
+ * ║           slip2go_response/replayed_from_log_id) — backward compat ถ้าไม่ส่งมา          ║
+ * ║    • Companion: Snippet 2 V.34.10 (handler integration — hash cascade lookup)          ║
  * ║  Version: V.34.11 (2026-04-21) — Round 8 MED/LOW cleanup:              ║
  * ║    • MED-1: F2 cron strict code=1 check (was processing data on error) ║
  * ║    • MED-2: JSON fallback for _flash_tracking_numbers unserialize     ║
@@ -1062,6 +1078,11 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             'http_code'          => null,
             'processing_time_ms' => null,
             'retry_count'        => 0,
+            // V.34.12: Slip Replay Pool fields (nullable — legacy callers omit = NULL)
+            'image_hash'           => null,
+            'image_mime'           => null,
+            'slip2go_response'     => null,
+            'replayed_from_log_id' => null,
             'created_at'         => current_time( 'mysql' ),
         );
         $row = array_merge( $defaults, is_array( $row ) ? $row : array() );
@@ -1082,11 +1103,30 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             $row['error_msg'] = $_em;
         }
 
+        // V.34.12: Slip Replay Pool — normalize new fields
+        if ( $row['image_hash'] !== null ) {
+            $row['image_hash'] = substr( (string) $row['image_hash'], 0, 64 );
+            if ( $row['image_hash'] === '' ) $row['image_hash'] = null;
+        }
+        if ( $row['image_mime'] !== null ) {
+            $row['image_mime'] = substr( (string) $row['image_mime'], 0, 20 );
+            if ( $row['image_mime'] === '' ) $row['image_mime'] = null;
+        }
+        // slip2go_response: accept array/object → json_encode, or pass-through string,
+        // or NULL. MEDIUMTEXT cap 16MB — realistic Slip2Go payload is <10KB so no cap needed.
+        if ( $row['slip2go_response'] !== null && ! is_string( $row['slip2go_response'] ) ) {
+            $row['slip2go_response'] = wp_json_encode( $row['slip2go_response'] );
+            if ( $row['slip2go_response'] === false ) $row['slip2go_response'] = null;
+        }
+        if ( $row['replayed_from_log_id'] !== null ) {
+            $row['replayed_from_log_id'] = (int) $row['replayed_from_log_id'];
+            if ( $row['replayed_from_log_id'] <= 0 ) $row['replayed_from_log_id'] = null;
+        }
+
         // V.34.9 M-7: explicit $format array matching schema (prevents STRICT-mode write failures
         // + ensures nullable fields serialize correctly)
-        // Column order must match $defaults order above: group_id, message_id, user_id,
-        //   dist_id, slip_code, amount, trans_ref, sender_name, result_status,
-        //   error_code, error_msg, http_code, processing_time_ms, retry_count, created_at
+        // V.34.12: format extended to match 4 new trailing columns before created_at
+        // Column order must match $defaults order above
         $format = array(
             '%s', // group_id
             '%s', // message_id
@@ -1102,6 +1142,10 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             '%d', // http_code (nullable)
             '%d', // processing_time_ms (nullable)
             '%d', // retry_count
+            '%s', // image_hash (V.34.12, nullable)
+            '%s', // image_mime (V.34.12, nullable)
+            '%s', // slip2go_response (V.34.12, nullable — MEDIUMTEXT)
+            '%d', // replayed_from_log_id (V.34.12, nullable)
             '%s', // created_at (MySQL datetime)
         );
 
@@ -1292,6 +1336,169 @@ if ( ! function_exists( 'b2b_slip_is_trans_ref_seen' ) ) {
             $trans_ref
         ) );
         return ! empty( $hit2 );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.34.12: SLIP REPLAY POOL helpers (CNX regression — Snippet 2 V.34.10 companion)
+// Purpose: re-upload of an identical slip binary should not spam Slip2Go quota —
+//          reuse the cached response to either (a) confirm prior payment,
+//          (b) replay our processing if we failed mid-flow, or (c) defer to admin.
+// ═══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_slip_compute_image_hash' ) ) {
+    /**
+     * Normalized SHA-256 hash of slip binary. Used as dedup key for replay cascade.
+     * @param string $binary raw image bytes from LINE Content API
+     * @return string lowercase hex SHA-256 (64 chars) or '' on empty input
+     */
+    function b2b_slip_compute_image_hash( $binary ) {
+        if ( empty( $binary ) || ! is_string( $binary ) ) return '';
+        return hash( 'sha256', $binary );
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_find_prior_payment' ) ) {
+    /**
+     * Find a PRIOR successfully-processed slip row by image hash.
+     * If hit → caller replies "already paid" + skips Slip2Go + skips debt mutation.
+     *
+     * @param string $image_hash SHA-256 hex
+     * @return array|null row assoc array (id, created_at, amount, trans_ref, dist_id, sender_name, result_status) or null
+     */
+    function b2b_slip_find_prior_payment( $image_hash ) {
+        if ( empty( $image_hash ) ) return null;
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        static $table_exists = null;
+        if ( $table_exists === null ) {
+            $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        }
+        if ( ! $table_exists ) return null;
+        // Guard: column may not exist on legacy installs pre-V.8.6
+        static $col_exists = null;
+        if ( $col_exists === null ) {
+            $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'image_hash'",
+                $table
+            ) );
+        }
+        if ( ! $col_exists ) return null;
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, created_at, amount, trans_ref, dist_id, sender_name, result_status
+             FROM {$table}
+             WHERE image_hash = %s
+               AND result_status IN ('paid','paid_overpayment','manual_admin_paid')
+             ORDER BY id DESC
+             LIMIT 1",
+            $image_hash
+        ), ARRAY_A );
+        return $row ? $row : null;
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_find_cached_response' ) ) {
+    /**
+     * Find a PRIOR slip attempt that errored on our side but captured a valid Slip2Go response.
+     * If hit → caller can REPLAY the decision branches against that cached JSON without
+     * re-hitting Slip2Go API (respects quota + dedupes cache-sticky 200501 deadlock).
+     *
+     * Failure statuses that indicate "we got data but flow failed downstream":
+     *   line_api_error  — LINE content download died
+     *   slip2go_error   — API 5xx/0 (response WILL be null in this case, skip)
+     *   data_missing    — 200000/200200 but data.amount was missing
+     *   unregistered_group — group not mapped yet (cached data valid if admin adds dist later)
+     *   fatal_exception — PHP crash mid-processing
+     *   unknown_slip_code — Slip2Go returned a code we don't handle
+     *
+     * NOTE: slip2go_error without response is still excluded via WHERE slip2go_response IS NOT NULL.
+     *
+     * @param string $image_hash SHA-256 hex
+     * @return array|null { id, slip2go_response (decoded array), result_status, created_at } or null
+     */
+    function b2b_slip_find_cached_response( $image_hash ) {
+        if ( empty( $image_hash ) ) return null;
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        static $table_exists = null;
+        if ( $table_exists === null ) {
+            $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        }
+        if ( ! $table_exists ) return null;
+        static $col_exists = null;
+        if ( $col_exists === null ) {
+            $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'slip2go_response'",
+                $table
+            ) );
+        }
+        if ( ! $col_exists ) return null;
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, slip2go_response, result_status, created_at
+             FROM {$table}
+             WHERE image_hash = %s
+               AND slip2go_response IS NOT NULL
+               AND result_status IN (
+                   'line_api_error','data_missing','unregistered_group',
+                   'fatal_exception','unknown_slip_code','no_distributor'
+               )
+             ORDER BY id DESC
+             LIMIT 1",
+            $image_hash
+        ), ARRAY_A );
+        if ( ! $row ) return null;
+
+        $decoded = json_decode( (string) $row['slip2go_response'], true );
+        if ( ! is_array( $decoded ) ) return null; // corrupted — treat as miss
+        $row['slip2go_response'] = $decoded;
+        return $row;
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_find_prior_rejection' ) ) {
+    /**
+     * Find a PRIOR rejected slip by image hash — includes Slip2Go-side rejections
+     * (receiver_mismatch / amount_mismatch / amount_no_pending / duplicate / not_slip).
+     * Used to gate replay: if prior rejection exists and local debt still > 0, REQUIRE
+     * admin manual review (a resent slip after rejection is ambiguous — fraud vs. fix).
+     *
+     * @param string $image_hash SHA-256 hex
+     * @return array|null row { id, result_status, created_at, amount, trans_ref, dist_id } or null
+     */
+    function b2b_slip_find_prior_rejection( $image_hash ) {
+        if ( empty( $image_hash ) ) return null;
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        static $table_exists = null;
+        if ( $table_exists === null ) {
+            $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        }
+        if ( ! $table_exists ) return null;
+        static $col_exists = null;
+        if ( $col_exists === null ) {
+            $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'image_hash'",
+                $table
+            ) );
+        }
+        if ( ! $col_exists ) return null;
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, result_status, created_at, amount, trans_ref, dist_id
+             FROM {$table}
+             WHERE image_hash = %s
+               AND result_status IN (
+                   'receiver_mismatch','amount_mismatch','amount_no_pending','duplicate','not_slip'
+               )
+             ORDER BY id DESC
+             LIMIT 1",
+            $image_hash
+        ), ARRAY_A );
+        return $row ? $row : null;
     }
 }
 

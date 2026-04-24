@@ -1,6 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.6 (2026-04-24) — Slip Replay Pool (CNX regression):                                  ║
+ * ║    • NEW columns on wp_dinoco_slip_log (idempotent ALTER + dbDelta):                               ║
+ * ║        image_hash VARCHAR(64) NULL        — SHA-256 of slip binary (normalized to hex)             ║
+ * ║        image_mime VARCHAR(20) NULL        — content-type cache for admin preview                   ║
+ * ║        slip2go_response MEDIUMTEXT NULL   — full JSON response from Slip2Go (ANY outcome)          ║
+ * ║        replayed_from_log_id BIGINT UNSIGNED NULL — FK to original log row (replay provenance)      ║
+ * ║    • NEW indexes: idx_image_hash (hash lookup), idx_hash_status (replay cascade cache lookup)      ║
+ * ║    • DB version bump 8.4 → 8.6 (idempotent — re-run safe across legacy installs)                   ║
+ * ║    • Purpose: enables Snippet 1 V.34.12 + Snippet 2 V.34.10 replay cascade:                        ║
+ * ║        (a) already-paid slip re-upload  → friendly "ชำระแล้ว" reply, no Slip2Go call               ║
+ * ║        (b) previously-errored slip      → replay cached Slip2Go response (our-side failure)        ║
+ * ║        (c) previously-rejected slip     → admin-only manual review                                 ║
+ * ║        (d) never-seen slip              → fresh Slip2Go call (normal path)                         ║
+ * ║    • Admin Manual Process Tool (Slip Monitor V.1.3) — bypass Slip2Go for CNX-class incidents       ║
  * ║  Version: V.8.5 (2026-04-21) — HIGH-1: wp_cache_flush_group guard helper:                          ║
  * ║    • NEW dinoco_cache_flush_group($group) — guarded wrapper around                                 ║
  * ║      wp_cache_flush_group() (WP 6.1+). Older object cache drop-ins                                 ║
@@ -115,7 +129,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '8.4'; // V.8.4: Slip Resilience audit trail (wp_dinoco_slip_log)
+    $db_version = '8.6'; // V.8.6: Slip Replay Pool (image_hash + slip2go_response + replayed_from_log_id)
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -354,6 +368,8 @@ add_action( 'init', function() {
     // V.8.4: Slip Resilience audit trail (wp_dinoco_slip_log)
     // บันทึก slip processing ทุกใบ เพื่อ observability + debug + forensic sweep
     // Schema: one row per slip attempt (ไม่ใช่ 1 row per slip — retry/queue ก็นับเพิ่ม)
+    // V.8.6: +image_hash / +image_mime / +slip2go_response / +replayed_from_log_id
+    //        สำหรับ Slip Replay Pool (re-upload same slip = reuse cached response)
     $slip_log_table = $wpdb->prefix . 'dinoco_slip_log';
     $sql_sl = "CREATE TABLE {$slip_log_table} (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -371,16 +387,59 @@ add_action( 'init', function() {
         http_code SMALLINT UNSIGNED DEFAULT NULL,
         processing_time_ms INT UNSIGNED DEFAULT NULL,
         retry_count TINYINT UNSIGNED DEFAULT 0,
+        image_hash VARCHAR(64) DEFAULT NULL,
+        image_mime VARCHAR(20) DEFAULT NULL,
+        slip2go_response MEDIUMTEXT DEFAULT NULL,
+        replayed_from_log_id BIGINT UNSIGNED DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         KEY idx_group_created (group_id, created_at),
         KEY idx_created (created_at),
         KEY idx_result_created (result_status, created_at),
         KEY idx_transref (trans_ref),
-        KEY idx_dist_created (dist_id, created_at)
+        KEY idx_dist_created (dist_id, created_at),
+        KEY idx_image_hash (image_hash),
+        KEY idx_hash_status (image_hash, result_status)
     ) {$charset};";
     dbDelta( $sql_sl );
     if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] V.8.4: Ensured wp_dinoco_slip_log table' );
+
+    // V.8.6: Idempotent ALTER for legacy installs (slip_log exists pre-V.8.6).
+    // dbDelta handles new columns for fresh installs, but pre-existing installs need explicit
+    // ADD COLUMN guards. INFORMATION_SCHEMA probe + ALTER on miss.
+    $sl_table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $slip_log_table ) );
+    if ( $sl_table_exists ) {
+        $sl_cols = $wpdb->get_col( "DESCRIBE {$slip_log_table}", 0 );
+        $sl_cols = is_array( $sl_cols ) ? array_flip( $sl_cols ) : array();
+        $sl_alters = array(
+            'image_hash'           => "ALTER TABLE {$slip_log_table} ADD COLUMN image_hash VARCHAR(64) DEFAULT NULL AFTER retry_count",
+            'image_mime'           => "ALTER TABLE {$slip_log_table} ADD COLUMN image_mime VARCHAR(20) DEFAULT NULL AFTER image_hash",
+            'slip2go_response'     => "ALTER TABLE {$slip_log_table} ADD COLUMN slip2go_response MEDIUMTEXT DEFAULT NULL AFTER image_mime",
+            'replayed_from_log_id' => "ALTER TABLE {$slip_log_table} ADD COLUMN replayed_from_log_id BIGINT UNSIGNED DEFAULT NULL AFTER slip2go_response",
+        );
+        foreach ( $sl_alters as $col_name => $sql_alter ) {
+            if ( ! isset( $sl_cols[ $col_name ] ) ) {
+                $wpdb->query( $sql_alter );
+                if ( function_exists( 'b2b_log' ) ) b2b_log( "[DB] V.8.6: Added slip_log column {$col_name}" );
+            }
+        }
+        // Idempotent index creation
+        $sl_idx_map = array(
+            'idx_image_hash'  => "ALTER TABLE {$slip_log_table} ADD INDEX idx_image_hash (image_hash)",
+            'idx_hash_status' => "ALTER TABLE {$slip_log_table} ADD INDEX idx_hash_status (image_hash, result_status)",
+        );
+        foreach ( $sl_idx_map as $idx_name => $sql_idx ) {
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(1) FROM INFORMATION_SCHEMA.STATISTICS
+                 WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s",
+                $slip_log_table, $idx_name
+            ) );
+            if ( ! $exists ) {
+                $wpdb->query( $sql_idx );
+                if ( function_exists( 'b2b_log' ) ) b2b_log( "[DB] V.8.6: Added slip_log index {$idx_name}" );
+            }
+        }
+    }
 
     update_option( '_dinoco_catalog_table_version', $db_version );
     if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated tables v' . $db_version . ' (Phase 5 + oos_timestamp/oos_duration_hours + slip_log V.8.4)' );

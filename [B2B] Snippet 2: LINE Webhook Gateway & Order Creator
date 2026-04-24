@@ -1,6 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.10 (2026-04-24) — Slip Replay Pool integration (CNX regression):        ║
+ * ║    Incident recap: CNX ส่งสลิป KKP 069 ยอด 2,280 THB ช่วง V.34.7 routing bug →           ║
+ * ║                   บอทเงียบ แต่สลิป submit ไป Slip2Go แล้ว → cache 7d → V.34.9 ส่งซ้ำ →     ║
+ * ║                   Slip2Go คืน 200501 duplicate (ไม่มี trans_ref+amount) → ตัดหนี้ไม่ได้    ║
+ * ║    Fix (4 layers):                                                                     ║
+ * ║      1. Image SHA-256 hash คำนวณหลังดาวน์โหลดรูป (ก่อนเรียก Slip2Go)                    ║
+ * ║      2. Replay cascade lookup (ในลำดับนี้):                                              ║
+ * ║         (a) hash match + prior paid   → reply "ชำระแล้วเมื่อ..." + no Slip2Go + no debt  ║
+ * ║         (b) hash match + our failure  → REPLAY cached Slip2Go JSON ผ่าน branches เดิม    ║
+ * ║         (c) hash match + prior reject → admin Flex alert (manual review required)       ║
+ * ║         (d) no match                  → fresh Slip2Go call (normal path)                ║
+ * ║      3. slip2go_response JSON บันทึก ทุก response จาก API (success + error branches)    ║
+ * ║         → ครั้งหน้าถ้าระบบพังกลาง flow ยังมี data ให้ replay                                 ║
+ * ║      4. Admin Manual Process Tool ใน Slip Monitor V.1.3 — rescue CNX วันนี้             ║
+ * ║         (bypass Slip2Go, ตัดหนี้ตรง, log result_status=manual_admin_paid)                ║
+ * ║    Companion: Snippet 1 V.34.12 (helpers) + Snippet 15 V.8.6 (schema)                   ║
+ * ║    Rollback: ถ้าพบ bug ใน replay path → set wp_option b2b_slip_replay_pool_enabled=0    ║
+ * ║              → ข้าม cascade lookup ไปทำ fresh call ทุกครั้ง (fallback เดิม)                ║
  * ║  Version: V.34.9 (2026-04-24) — Slip Review Round (4H+7M+3L):           ║
  * ║    • H-1 Finally recursion → iterative loop w/ 8s time budget          ║
  * ║           + overflow to b2b_slip_drain_cron (wp_schedule_single_event) ║
@@ -2523,6 +2541,12 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
     $_slip_final_transref = '';
     $_slip_final_sender = '';
     $_slip_final_dist_id = null;
+    // V.34.10: Slip Replay Pool state (used in finally block + cascade short-circuits)
+    $_slip_image_hash       = null;   // SHA-256 hex of binary (computed post-download)
+    $_slip_image_mime       = null;   // image/jpeg / image/png / etc.
+    $_slip_api_response_raw = null;   // cached JSON string of slip2go response (any outcome)
+    $_slip_replayed_from    = null;   // original log id if this run is a replay
+    $_slip_replay_pool_enabled = (bool) get_option( 'b2b_slip_replay_pool_enabled', 1 ); // default ON
 
     // Helper: ถ้า reply_token ว่าง (queued slip) ใช้ push แทน
     $_slip_reply = function($msgs) use ($reply_token, $group_id) {
@@ -2597,6 +2621,109 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
     $slip_mime = in_array($slip_content_type, array('image/jpeg','image/png','image/webp')) ? $slip_content_type : 'image/jpeg';
     $image_base64 = 'data:'.$slip_mime.';base64,' . base64_encode($image_binary);
 
+    // ═══════════════════════════════════════════════════════════════
+    // V.34.10: SLIP REPLAY POOL — cascade lookup BEFORE hitting Slip2Go
+    // Goal: the same slip binary should not re-consume Slip2Go quota. Three hit paths:
+    //   (a) prior payment  → friendly reply + NO debt mutation (idempotent re-send)
+    //   (b) prior our-side failure with cached response → REPLAY through branches
+    //   (c) prior Slip2Go rejection → admin manual review (never auto-process)
+    //   (d) no prior → fresh Slip2Go call (normal path)
+    // Kill switch: wp_option b2b_slip_replay_pool_enabled=0 → skip cascade, always fresh
+    // ═══════════════════════════════════════════════════════════════
+    if ( $_slip_replay_pool_enabled && function_exists( 'b2b_slip_compute_image_hash' ) ) {
+        $_slip_image_hash = b2b_slip_compute_image_hash( $image_binary );
+        $_slip_image_mime = $slip_mime;
+    }
+
+    if ( ! empty( $_slip_image_hash ) ) {
+        // Path (a): prior successful payment — reply "already paid" + short-circuit
+        if ( function_exists( 'b2b_slip_find_prior_payment' ) ) {
+            $prior_paid = b2b_slip_find_prior_payment( $_slip_image_hash );
+            if ( $prior_paid ) {
+                $when = isset( $prior_paid['created_at'] ) ? (string) $prior_paid['created_at'] : '';
+                $prior_amt = isset( $prior_paid['amount'] ) ? floatval( $prior_paid['amount'] ) : 0;
+                $prior_ref = isset( $prior_paid['trans_ref'] ) ? (string) $prior_paid['trans_ref'] : '';
+                $when_display = $when ? preg_replace( '/:\d{2}$/', '', $when ) : '-';
+                $msg = "✅ สลิปนี้เคยตัดหนี้แล้วเมื่อ " . $when_display . "\n"
+                     . "ยอด: ฿" . number_format( $prior_amt, 2 );
+                if ( $prior_ref !== '' ) $msg .= "\nRef: " . $prior_ref;
+                $msg .= "\n\nไม่ต้องส่งซ้ำครับ — ระบบจดไว้แล้ว 👍";
+                $_slip_reply_text( $msg );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[Slip Replay] path=a prior_paid id=' . (int) $prior_paid['id']
+                        . ' hash=' . substr( $_slip_image_hash, 0, 12 ) . '... group=' . $group_id );
+                }
+                $_slip_final_status    = 'replay_after_paid';
+                $_slip_final_error_code = 'REPLAY_A';
+                $_slip_final_error_msg = 'Prior paid at ' . $when . ' (log id=' . (int) $prior_paid['id'] . ')';
+                $_slip_final_amount    = $prior_amt;
+                $_slip_final_transref  = $prior_ref;
+                $_slip_replayed_from   = (int) $prior_paid['id'];
+                $_slip_final_dist_id   = isset( $prior_paid['dist_id'] ) && $prior_paid['dist_id'] > 0 ? (int) $prior_paid['dist_id'] : null;
+                return;
+            }
+        }
+
+        // Path (c): prior Slip2Go rejection — defer to admin (never auto-replay rejected)
+        // Check BEFORE path (b) so ambiguous resends don't auto-process.
+        if ( function_exists( 'b2b_slip_find_prior_rejection' ) ) {
+            $prior_rej = b2b_slip_find_prior_rejection( $_slip_image_hash );
+            if ( $prior_rej ) {
+                $rej_status = isset( $prior_rej['result_status'] ) ? (string) $prior_rej['result_status'] : '';
+                $_slip_reply_text( "⚠️ สลิปนี้ถูกตรวจแล้วและต้องรอแอดมินยืนยัน\nกรุณารอสักครู่ครับ 🙏" );
+                if ( function_exists( 'b2b_push_to_admin' ) ) {
+                    b2b_push_to_admin(
+                        "🟠 Slip resend detected (prior rejected)\n"
+                        . "Group: " . $group_id . "\n"
+                        . "Hash: " . substr( $_slip_image_hash, 0, 16 ) . "...\n"
+                        . "Prior status: " . $rej_status . " @ " . ( $prior_rej['created_at'] ?? '-' ) . "\n"
+                        . "Prior log id: #" . (int) $prior_rej['id'] . "\n\n"
+                        . "ตรวจที่ Slip Monitor → Replay Candidates"
+                    );
+                }
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[Slip Replay] path=c prior_reject status=' . $rej_status
+                        . ' id=' . (int) $prior_rej['id'] . ' hash=' . substr( $_slip_image_hash, 0, 12 )
+                        . '... group=' . $group_id );
+                }
+                $_slip_final_status    = 'replay_blocked_rejected';
+                $_slip_final_error_code = 'REPLAY_C';
+                $_slip_final_error_msg = 'Prior rejection=' . $rej_status . ' id=' . (int) $prior_rej['id'];
+                $_slip_replayed_from   = (int) $prior_rej['id'];
+                return;
+            }
+        }
+
+        // Path (b): prior our-side failure with cached Slip2Go response — REPLAY it.
+        // We reuse the cached JSON to avoid a fresh API call. All branches below
+        // that process $slip will still execute — they don't care where $slip came from.
+        // We pre-populate $slip/$http_code/$raw_body + set $_slip_skip_fetch flag.
+        $_slip_skip_fetch = false;
+        if ( function_exists( 'b2b_slip_find_cached_response' ) ) {
+            $cached = b2b_slip_find_cached_response( $_slip_image_hash );
+            $cached_resp = $cached && isset( $cached['slip2go_response'] ) ? $cached['slip2go_response'] : null;
+            if ( is_array( $cached_resp ) && ! empty( $cached_resp ) ) {
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[Slip Replay] path=b reusing cached response from log id=' . (int) $cached['id']
+                        . ' prior_status=' . ( $cached['result_status'] ?? '-' )
+                        . ' hash=' . substr( $_slip_image_hash, 0, 12 ) . '... group=' . $group_id );
+                }
+                // Materialize $slip + $http_code + $raw_body as if Slip2Go just answered
+                $slip                   = $cached_resp;
+                $http_code              = 200; // must be 200 to enter branches below
+                $raw_body               = wp_json_encode( $slip );
+                $_slip_http_code        = 200;
+                $_slip_retry            = 0;
+                $_slip_replayed_from    = (int) $cached['id'];
+                $_slip_api_response_raw = $raw_body;
+                $_slip_skip_fetch       = true;
+            }
+        }
+    } else {
+        $_slip_skip_fetch = false;
+    }
+    // ───────── end replay cascade (path d falls through to fresh Slip2Go call) ─────────
+
     $check_condition = array('checkDuplicate' => true);
     $bank_info = function_exists('b2b_get_bank_info') ? b2b_get_bank_info() : null;
     if ( $bank_info && !empty($bank_info['account']) ) {
@@ -2628,6 +2755,12 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
     // V.34.8: Slip2Go API call with retry (2 extra attempts on transient errors)
     // Retryable: HTTP 500/502/503/504 (server errors) + wp_error (network)
     // Terminal:  HTTP 200 (success), 400/401/403 (auth/bad req), 429 (rate limit — wait cron)
+    // V.34.10: $_slip_skip_fetch from replay cascade path (b) → $slip/$http_code already set
+    if ( ! empty( $_slip_skip_fetch ) ) {
+        // Replay from cache — $slip, $http_code, $raw_body, $_slip_http_code already populated above
+        $last_error_msg = '';
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[Slip] REPLAY skipped Slip2Go fetch (cached response)' );
+    } else {
     $slip_response = null;
     $http_code = 0;
     $raw_body = '';
@@ -2686,6 +2819,13 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         $last_error_msg = 'HTTP ' . $http_code;
         b2b_log( '[Slip2Go HTTP ' . $http_code . ' retryable attempt=' . $attempt_idx . '] body=' . mb_substr( $raw_body, 0, 200 ) );
     }
+
+    // V.34.10: snapshot raw Slip2Go body for replay pool (even on non-200 errors if we have
+    // any body — skipped only for empty body / pure network failures)
+    if ( ! empty( $raw_body ) ) {
+        $_slip_api_response_raw = $raw_body;
+    }
+    } // close `if ( ! empty( $_slip_skip_fetch ) ) { ... } else { (Slip2Go fetch) }`
 
     b2b_log( '[Slip] Final HTTP=' . $http_code . ' retries=' . $_slip_retry . ' Body=' . mb_substr( (string) $raw_body, 0, 500 ) );
 
@@ -3123,6 +3263,11 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
                     'http_code'          => $_slip_http_code,
                     'processing_time_ms' => $elapsed_ms,
                     'retry_count'        => $_slip_retry,
+                    // V.34.10: Slip Replay Pool persistence
+                    'image_hash'           => $_slip_image_hash,
+                    'image_mime'           => $_slip_image_mime,
+                    'slip2go_response'     => $_slip_api_response_raw, // string (JSON) or null
+                    'replayed_from_log_id' => $_slip_replayed_from,
                 ) );
             }
         } catch ( \Throwable $e ) { /* silent */ }

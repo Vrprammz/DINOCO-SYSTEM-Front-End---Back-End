@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.3 (2026-04-24) — Slip Replay Pool admin tools (CNX regression):           ║
+ * ║    • NEW Admin Manual Process Tool — emergency bypass Slip2Go when API sticky 200501     ║
+ * ║         (CNX case: slip cached after V.34.7 routing bug → Slip2Go refuses to re-read)   ║
+ * ║         Upload slip image + ยอด + ร้าน + reason → ตัดหนี้ผ่าน b2b_debt_subtract()          ║
+ * ║         → notify group + admin + log result_status='manual_admin_paid'                    ║
+ * ║         → เก็บรูปใน wp-content/uploads/slip-manual/{YYYY-MM}/{hash}.{ext} สำหรับ audit      ║
+ * ║    • NEW Replay Candidates section — list slips ที่มี slip2go_response cached +           ║
+ * ║         ยังไม่ success → "Replay" button (ถ้าระบบเราพังครั้งก่อน จะ run replay flow อีก)    ║
+ * ║    • 3 REST endpoints ใหม่:                                                                ║
+ * ║         POST /dinoco-slip/v1/manual-process — admin bypass ตัดหนี้ + notify                ║
+ * ║         GET  /dinoco-slip/v1/replay-candidates — list rows พร้อม replay                    ║
+ * ║         POST /dinoco-slip/v1/replay-slip — replay specific log row ผ่าน cached response     ║
+ * ║    • Rate limit 5/min/user บน manual-process + replay-slip (destructive)                   ║
+ * ║    • Companion: Snippet 1 V.34.12 (replay helpers) + Snippet 2 V.34.10 (handler)           ║
+ * ║                 + Snippet 15 V.8.6 (schema)                                                 ║
  * ║  Version: V.1.2 (2026-04-24) — CRITICAL JS parse fix:                   ║
  * ║    • SyntaxError: function name `fmt฿` used Thai Baht sign `฿`          ║
  * ║           (U+0E3F, category Sc Currency) which is NOT valid in JS        ║
@@ -74,6 +89,38 @@ add_action( 'rest_api_init', function () {
     register_rest_route( 'dinoco-slip/v1', '/missed-sweep', array(
         'methods'             => 'GET',
         'callback'            => 'dinoco_slip_monitor_rest_missed_sweep',
+        'permission_callback' => $perm_admin,
+    ) );
+
+    // V.1.3: Slip Replay Pool admin tools
+    register_rest_route( 'dinoco-slip/v1', '/manual-process', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_slip_monitor_rest_manual_process',
+        'permission_callback' => function ( WP_REST_Request $req ) {
+            return current_user_can( 'manage_options' )
+                && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
+        },
+    ) );
+
+    register_rest_route( 'dinoco-slip/v1', '/replay-candidates', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_replay_candidates',
+        'permission_callback' => $perm_admin,
+    ) );
+
+    register_rest_route( 'dinoco-slip/v1', '/replay-slip', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_slip_monitor_rest_replay_slip',
+        'permission_callback' => function ( WP_REST_Request $req ) {
+            return current_user_can( 'manage_options' )
+                && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
+        },
+    ) );
+
+    // V.1.3: List active distributor CPTs (for Manual Process dropdown)
+    register_rest_route( 'dinoco-slip/v1', '/distributors', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_distributors',
         'permission_callback' => $perm_admin,
     ) );
 } );
@@ -408,6 +455,365 @@ if ( ! function_exists( 'dinoco_slip_monitor_get_dist_names_batch' ) ) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// V.1.3: SLIP REPLAY POOL — Admin Manual Process + Replay Endpoints
+// ════════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────────
+// GET /distributors — active CPTs (id, name, group_id, current_debt)
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_distributors' ) ) {
+    function dinoco_slip_monitor_rest_distributors( WP_REST_Request $req ) {
+        $posts = get_posts( array(
+            'post_type'      => 'distributor',
+            'post_status'    => 'publish',
+            'posts_per_page' => 500,
+            'orderby'        => 'title',
+            'order'          => 'ASC',
+            'fields'         => 'ids',
+        ) );
+        $out = array();
+        foreach ( $posts as $pid ) {
+            $debt = function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $pid ) ) : 0;
+            $gid  = function_exists( 'get_field' ) ? (string) get_field( 'line_group_id', $pid ) : '';
+            $out[] = array(
+                'id'           => (int) $pid,
+                'name'         => (string) get_the_title( $pid ),
+                'group_id'     => $gid,
+                'current_debt' => round( $debt, 2 ),
+            );
+        }
+        return rest_ensure_response( array( 'success' => true, 'rows' => $out ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// POST /manual-process — emergency bypass (Slip2Go quota deadlock rescue)
+// Body: { dist_id, amount, trans_ref?, sender_name?, reason, image_base64?, image_mime? }
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
+    function dinoco_slip_monitor_rest_manual_process( WP_REST_Request $req ) {
+        $uid = get_current_user_id();
+        // Rate limit 5/min (destructive + touches debt)
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'slip_manual_process_u' . $uid, 5, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 5/min)', array( 'status' => 429 ) );
+            }
+        }
+
+        $dist_id     = (int) $req->get_param( 'dist_id' );
+        $amount      = floatval( $req->get_param( 'amount' ) );
+        $trans_ref   = sanitize_text_field( (string) $req->get_param( 'trans_ref' ) );
+        $sender_name = sanitize_text_field( (string) $req->get_param( 'sender_name' ) );
+        $reason      = sanitize_text_field( (string) $req->get_param( 'reason' ) );
+        $image_b64   = (string) $req->get_param( 'image_base64' ); // optional — only if admin uploaded
+        $image_mime  = sanitize_text_field( (string) $req->get_param( 'image_mime' ) );
+
+        // Validation
+        if ( $dist_id <= 0 || get_post_type( $dist_id ) !== 'distributor' ) {
+            return new WP_Error( 'bad_dist', 'ไม่พบร้านที่เลือก', array( 'status' => 400 ) );
+        }
+        if ( $amount <= 0 || $amount > 10000000 ) {
+            return new WP_Error( 'bad_amount', 'ยอดไม่ถูกต้อง (1 ถึง 10,000,000)', array( 'status' => 400 ) );
+        }
+        if ( $reason === '' || mb_strlen( $reason ) < 10 ) {
+            return new WP_Error( 'bad_reason', 'ต้องระบุเหตุผลไม่น้อยกว่า 10 ตัวอักษร (audit trail)', array( 'status' => 400 ) );
+        }
+        if ( mb_strlen( $reason ) > 500 ) $reason = mb_substr( $reason, 0, 500 );
+
+        $dist_name = get_the_title( $dist_id );
+        $group_id  = function_exists( 'get_field' ) ? (string) get_field( 'line_group_id', $dist_id ) : '';
+
+        // Duplicate guard — hash the uploaded image (if any) + trans_ref check
+        $image_hash = '';
+        $image_binary = '';
+        if ( $image_b64 !== '' ) {
+            // Strip data URI prefix if present
+            if ( preg_match( '#^data:([^;]+);base64,(.*)$#', $image_b64, $m ) ) {
+                if ( $image_mime === '' ) $image_mime = sanitize_text_field( $m[1] );
+                $image_b64 = $m[2];
+            }
+            $image_binary = base64_decode( $image_b64, true );
+            if ( $image_binary === false ) {
+                return new WP_Error( 'bad_image', 'ไม่สามารถ decode รูปได้', array( 'status' => 400 ) );
+            }
+            // 10MB cap
+            if ( strlen( $image_binary ) > 10 * 1024 * 1024 ) {
+                return new WP_Error( 'image_too_large', 'รูปใหญ่เกิน 10MB', array( 'status' => 400 ) );
+            }
+            if ( function_exists( 'b2b_slip_compute_image_hash' ) ) {
+                $image_hash = b2b_slip_compute_image_hash( $image_binary );
+            }
+            // Check duplicate by hash
+            if ( $image_hash && function_exists( 'b2b_slip_find_prior_payment' ) ) {
+                $prior = b2b_slip_find_prior_payment( $image_hash );
+                if ( $prior ) {
+                    return new WP_Error( 'image_already_paid',
+                        'รูปสลิปนี้เคยตัดหนี้แล้ว (log id=' . (int) $prior['id']
+                        . ' เมื่อ ' . ( $prior['created_at'] ?? '-' ) . ')',
+                        array( 'status' => 409 ) );
+                }
+            }
+        }
+        // trans_ref duplicate check (bank-cleared dedup)
+        if ( $trans_ref !== '' && function_exists( 'b2b_slip_is_trans_ref_seen' ) ) {
+            if ( b2b_slip_is_trans_ref_seen( $trans_ref ) ) {
+                return new WP_Error( 'transref_seen',
+                    'TransRef นี้เคยถูกใช้แล้ว (dedup guard)',
+                    array( 'status' => 409 ) );
+            }
+        }
+
+        // Save image to disk for audit (optional — only if uploaded)
+        $image_stored_url = '';
+        if ( $image_binary !== '' ) {
+            $uploads = wp_upload_dir();
+            $ym = gmdate( 'Y-m' );
+            $subdir = trailingslashit( $uploads['basedir'] ) . 'slip-manual/' . $ym;
+            if ( ! is_dir( $subdir ) ) wp_mkdir_p( $subdir );
+            $ext = 'jpg';
+            if ( strpos( $image_mime, 'png' ) !== false )  $ext = 'png';
+            if ( strpos( $image_mime, 'webp' ) !== false ) $ext = 'webp';
+            $filename = ( $image_hash ? substr( $image_hash, 0, 40 ) : 'manual_' . time() ) . '.' . $ext;
+            $full_path = trailingslashit( $subdir ) . $filename;
+            // file_put_contents with LOCK_EX + silent failure (not fatal for debt mutation)
+            @file_put_contents( $full_path, $image_binary, LOCK_EX );
+            if ( file_exists( $full_path ) ) {
+                $image_stored_url = trailingslashit( $uploads['baseurl'] ) . 'slip-manual/' . $ym . '/' . $filename;
+            }
+        }
+
+        // ═════════════ ATOMIC DEBT SUBTRACT ═════════════
+        if ( ! function_exists( 'b2b_debt_subtract' ) ) {
+            return new WP_Error( 'no_debt_fn', 'b2b_debt_subtract ไม่พร้อม (Snippet 13)', array( 'status' => 501 ) );
+        }
+        $old_debt = function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : 0;
+        $reason_tag = 'manual_admin_slip:u=' . $uid . ':' . mb_substr( $reason, 0, 80 );
+        $new_debt = b2b_debt_subtract( $dist_id, $amount, $reason_tag );
+        if ( $new_debt === false ) {
+            return new WP_Error( 'debt_subtract_fail', 'ตัดหนี้ไม่สำเร็จ (debt_subtract คืน false)', array( 'status' => 500 ) );
+        }
+        // Reconstruct old_debt for overpayment calc (same pattern as auto slip flow)
+        $overpaid_amount = ( $amount > $old_debt && $old_debt > 0 ) ? round( $amount - $old_debt, 2 ) : 0;
+        $actual_paid = min( $amount, $old_debt > 0 ? $old_debt : $amount );
+        if ( function_exists( 'get_field' ) ) {
+            $mtd = floatval( get_field( 'monthly_sales_mtd', $dist_id ) );
+            update_field( 'monthly_sales_mtd', round( $mtd + $actual_paid, 2 ), $dist_id );
+            if ( $new_debt <= 0 ) update_field( 'credit_hold', false, $dist_id );
+        }
+        // Recalc from source of truth
+        $new_debt = function_exists( 'b2b_recalculate_debt' ) ? b2b_recalculate_debt( $dist_id )
+                    : ( function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : $new_debt );
+
+        // Stamp trans_ref on matching orders + auto-mark paid (reuse existing flow)
+        $paid_tickets = array();
+        if ( function_exists( 'b2b_auto_mark_paid_after_slip' ) && $group_id !== '' ) {
+            $match = b2b_auto_mark_paid_after_slip( $dist_id, $amount, $group_id );
+            $paid_tickets = isset( $match['paid_tickets'] ) ? $match['paid_tickets'] : array();
+            if ( $trans_ref !== '' ) {
+                foreach ( $paid_tickets as $pt ) {
+                    update_post_meta( $pt['id'], '_slip_trans_ref', $trans_ref );
+                }
+            }
+        }
+
+        // Audit log row — result_status='manual_admin_paid'
+        $log_id = 0;
+        if ( function_exists( 'b2b_slip_log_insert' ) ) {
+            $log_id = (int) b2b_slip_log_insert( array(
+                'group_id'      => $group_id,
+                'message_id'    => 'MANUAL_' . $uid . '_' . time(),
+                'user_id'       => (string) $uid,
+                'dist_id'       => $dist_id,
+                'slip_code'     => 'ADMIN',
+                'amount'        => $amount,
+                'trans_ref'     => $trans_ref,
+                'sender_name'   => $sender_name,
+                'result_status' => 'manual_admin_paid',
+                'error_code'    => 'ADMIN_MANUAL',
+                'error_msg'     => mb_substr( 'reason=' . $reason . ( $image_stored_url ? ' img=' . $image_stored_url : '' ), 0, 490 ),
+                'http_code'     => null,
+                'processing_time_ms' => null,
+                'retry_count'   => 0,
+                'image_hash'    => $image_hash ?: null,
+                'image_mime'    => $image_mime ?: null,
+                'slip2go_response' => null, // bypass → no API call
+            ) );
+        }
+
+        // Notify LINE group (customer) + admin
+        if ( function_exists( 'b2b_line_push' ) && $group_id !== '' ) {
+            $notify = "✅ แอดมินตรวจสลิปและตัดหนี้ให้แล้ว\n"
+                    . "ร้าน: " . $dist_name . "\n"
+                    . "ยอด: ฿" . number_format( $amount, 2 );
+            if ( $trans_ref !== '' ) $notify .= "\nRef: " . $trans_ref;
+            $notify .= "\nหนี้คงเหลือ: ฿" . number_format( $new_debt, 2 );
+            if ( $new_debt <= 0 ) $notify .= "\n\n🎉 ชำระครบแล้วครับ!";
+            b2b_line_push( $group_id, $notify );
+        }
+        if ( function_exists( 'b2b_push_to_admin' ) ) {
+            b2b_push_to_admin(
+                "🛠️ Admin Manual Process (slip bypass)\n"
+                . "Admin: user#" . $uid . "\n"
+                . "ร้าน: " . $dist_name . "\n"
+                . "ยอด: ฿" . number_format( $amount, 2 ) . "\n"
+                . "Ref: " . ( $trans_ref !== '' ? $trans_ref : '-' ) . "\n"
+                . "ผู้โอน: " . ( $sender_name !== '' ? $sender_name : '-' ) . "\n"
+                . "หนี้เหลือ: ฿" . number_format( $new_debt, 2 ) . "\n"
+                . "Log id: #" . $log_id . "\n"
+                . "Reason: " . mb_substr( $reason, 0, 200 )
+                . ( $overpaid_amount > 0 ? "\n⚠️ โอนเกิน ฿" . number_format( $overpaid_amount, 2 ) : '' )
+            );
+        }
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( '[Slip ManualProcess] admin=' . $uid . ' dist=' . $dist_id
+                . ' amount=' . $amount . ' new_debt=' . $new_debt . ' log_id=' . $log_id );
+        }
+
+        return rest_ensure_response( array(
+            'success'        => true,
+            'log_id'         => $log_id,
+            'dist_id'        => $dist_id,
+            'dist_name'      => $dist_name,
+            'old_debt'       => round( $old_debt, 2 ),
+            'new_debt'       => round( $new_debt, 2 ),
+            'amount'         => $amount,
+            'overpaid'       => $overpaid_amount,
+            'paid_tickets'   => array_map( function ( $t ) { return (int) $t['id']; }, $paid_tickets ),
+            'image_hash'     => $image_hash,
+            'image_stored_url' => $image_stored_url,
+            'message'        => 'ตัดหนี้ ฿' . number_format( $amount, 2 ) . ' สำเร็จ — หนี้เหลือ ฿' . number_format( $new_debt, 2 ),
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// GET /replay-candidates — rows with slip2go_response cached + not yet success
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_replay_candidates' ) ) {
+    function dinoco_slip_monitor_rest_replay_candidates( WP_REST_Request $req ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $table_exists ) {
+            return rest_ensure_response( array( 'success' => true, 'rows' => array(), 'table_missing' => true ) );
+        }
+        // Check column existence (pre-V.8.6 tables miss it)
+        $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'slip2go_response'",
+            $table
+        ) );
+        if ( ! $col_exists ) {
+            return rest_ensure_response( array(
+                'success' => true, 'rows' => array(),
+                'schema_missing' => true,
+                'note' => 'wp_dinoco_slip_log.slip2go_response ยังไม่มี — ต้องรัน Snippet 15 V.8.6 migration ก่อน',
+            ) );
+        }
+        $days = max( 1, min( 30, (int) $req->get_param( 'days' ) ?: 7 ) );
+
+        // Replay-able: has cached response + status in "our failure" set
+        // Exclude rows already replayed-from (prevent chain-replay confusion)
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, group_id, dist_id, amount, trans_ref, sender_name, result_status,
+                    error_code, error_msg, image_hash, created_at
+             FROM {$table}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+               AND slip2go_response IS NOT NULL
+               AND result_status IN (
+                   'line_api_error','data_missing','unregistered_group',
+                   'fatal_exception','unknown_slip_code','no_distributor'
+               )
+             ORDER BY id DESC
+             LIMIT 200",
+            $days
+        ), ARRAY_A );
+
+        $gids = array();
+        foreach ( $rows as $r ) { if ( ! empty( $r['group_id'] ) ) $gids[] = $r['group_id']; }
+        $name_map = dinoco_slip_monitor_get_dist_names_batch( $gids );
+        foreach ( $rows as &$row ) {
+            $row['dist_name'] = isset( $name_map[ $row['group_id'] ] ) ? $name_map[ $row['group_id'] ] : '';
+        }
+        unset( $row );
+
+        return rest_ensure_response( array(
+            'success' => true, 'days' => $days, 'count' => count( $rows ), 'rows' => $rows,
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// POST /replay-slip — rerun cascade from cached slip2go_response
+// Body: { log_id }
+// Note: Re-invokes b2b_handle_slip_image() — the cascade there will detect the
+//       image_hash + cached response and route to path (b) automatically.
+//       BUT b2b_handle_slip_image fetches from LINE Content API by message_id
+//       which is stale (LINE Content expires in 24h). We bypass by directly
+//       dispatching the cached response through the processing branches.
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_replay_slip' ) ) {
+    function dinoco_slip_monitor_rest_replay_slip( WP_REST_Request $req ) {
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'slip_replay_u' . $uid, 5, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 5/min)', array( 'status' => 429 ) );
+            }
+        }
+        $log_id = (int) $req->get_param( 'log_id' );
+        if ( $log_id <= 0 ) {
+            return new WP_Error( 'bad_log_id', 'log_id ไม่ถูกต้อง', array( 'status' => 400 ) );
+        }
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, group_id, message_id, user_id, image_hash, slip2go_response, result_status
+             FROM {$table} WHERE id = %d",
+            $log_id
+        ), ARRAY_A );
+        if ( ! $row ) {
+            return new WP_Error( 'not_found', 'ไม่พบ log row', array( 'status' => 404 ) );
+        }
+        if ( empty( $row['slip2go_response'] ) ) {
+            return new WP_Error( 'no_cache', 'row นี้ไม่มี cached response', array( 'status' => 422 ) );
+        }
+
+        // Safety — don't replay success states (already applied)
+        if ( in_array( $row['result_status'], array( 'paid', 'paid_overpayment', 'manual_admin_paid', 'duplicate' ), true ) ) {
+            return new WP_Error( 'already_resolved',
+                'Row นี้ถูก resolve แล้ว (' . $row['result_status'] . ') — ห้าม replay',
+                array( 'status' => 409 ) );
+        }
+
+        // Strategy: re-invoke b2b_handle_slip_image with the original message_id.
+        // Inside the cascade, path (b) will fire if image_hash matches + cached response found.
+        // Downside: LINE Content might be expired → falls back to path (d) fresh call (same bug as before).
+        // Better: directly process the cached response by synthesizing a minimal in-process call.
+        // For V.1.3 we implement the simpler "re-invoke" — admin has Manual Process Tool as fallback.
+
+        if ( ! function_exists( 'b2b_handle_slip_image' ) ) {
+            return new WP_Error( 'no_handler', 'b2b_handle_slip_image ไม่พร้อม', array( 'status' => 501 ) );
+        }
+
+        // Fire handler — will attempt LINE Content download (often 24h expired); if expired,
+        // it returns line_api_error but admin knows to use Manual Process Tool instead.
+        try {
+            b2b_handle_slip_image( (string) $row['message_id'], (string) $row['group_id'], (string) $row['user_id'], '', false );
+        } catch ( \Throwable $e ) {
+            return new WP_Error( 'replay_exception', $e->getMessage(), array( 'status' => 500 ) );
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'log_id'  => $log_id,
+            'message' => 'Replay triggered — ดู Recent 50 Attempts ว่า process สำเร็จหรือไม่. ถ้า LINE Content หมดอายุ (>24h) ให้ใช้ Manual Process Tool แทน',
+        ) );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
 // SHORTCODE: [dinoco_slip_monitor]
 // ════════════════════════════════════════════════════════════════
 
@@ -502,6 +908,59 @@ function dinoco_slip_monitor_render() {
             <button class="dnc-slip-btn neutral" onclick="dncSlipMissedSweep(30)">Run sweep (30 วัน)</button>
             <button class="dnc-slip-btn neutral" onclick="dncSlipMissedSweep(7)">7 วัน</button>
             <div id="dncSlipMissed" style="margin-top:12px;"></div>
+        </div>
+
+        <div class="dnc-slip-section" style="border:2px solid #f59e0b; background:#fffbeb;">
+            <h3>🛠️ Admin Manual Process Tool (Emergency Bypass)</h3>
+            <div class="dnc-slip-banner warn" style="margin-bottom:14px;">
+                <strong>ใช้เมื่อ Slip2Go คืน 200501 duplicate</strong> (cache sticky 7 วัน) หรือระบบเราพังตอน process
+                → บัฟเฟอร์ Slip2Go + ตัดหนี้ตรงให้ร้าน.<br>
+                <em>ยอดจะเข้า debt subtract ตามปกติ + ส่งแจ้งลูกค้า + log result_status=manual_admin_paid</em>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px;">
+                <div>
+                    <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">ร้าน (Distributor) *</label>
+                    <select id="mpDistId" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
+                        <option value="">-- กำลังโหลด --</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">ยอด (THB) *</label>
+                    <input type="number" id="mpAmount" step="0.01" min="1" max="10000000" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;" placeholder="2280.00">
+                </div>
+                <div>
+                    <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">Trans Ref (optional)</label>
+                    <input type="text" id="mpTransRef" maxlength="100" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;" placeholder="KKP...">
+                </div>
+                <div>
+                    <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">ชื่อผู้โอน (optional)</label>
+                    <input type="text" id="mpSender" maxlength="200" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
+                </div>
+            </div>
+            <div style="margin-top:12px;">
+                <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">รูปสลิป (optional — upload เพื่อเก็บ audit + ป้องกัน duplicate)</label>
+                <input type="file" id="mpImageFile" accept="image/jpeg,image/png,image/webp" style="font-size:13px;">
+            </div>
+            <div style="margin-top:12px;">
+                <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">เหตุผล * (ต้อง ≥ 10 ตัวอักษร — audit trail)</label>
+                <textarea id="mpReason" rows="3" maxlength="500" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px; resize:vertical;" placeholder="เช่น: Slip2Go คืน 200501 duplicate — CNX ส่งสลิปช่วง routing bug V.34.7 — ตัดหนี้ manual"></textarea>
+            </div>
+            <div style="margin-top:14px; display:flex; gap:8px; align-items:center;">
+                <button class="dnc-slip-btn" style="background:#dc2626;" onclick="dncSlipManualProcess()">⚠️ Process Manually (ตัดหนี้)</button>
+                <button class="dnc-slip-btn neutral" onclick="dncSlipMPReset()">Reset</button>
+                <span id="mpStatus" style="font-size:12px; color:#64748b;"></span>
+            </div>
+            <div id="mpResult" style="margin-top:12px;"></div>
+        </div>
+
+        <div class="dnc-slip-section">
+            <h3>🔁 Replay Candidates (cached Slip2Go responses)</h3>
+            <div class="dnc-slip-banner warn" style="margin-bottom:12px;">
+                สลิปที่ระบบเราพังครั้งก่อน แต่ <strong>มี Slip2Go response cached</strong> — admin สามารถลอง replay ซ้ำได้โดยไม่เสีย Slip2Go quota
+            </div>
+            <button class="dnc-slip-btn neutral" onclick="dncSlipReplayCandidates(7)">7 วัน</button>
+            <button class="dnc-slip-btn neutral" onclick="dncSlipReplayCandidates(30)">30 วัน</button>
+            <div id="dncSlipReplay" style="margin-top:12px;"></div>
         </div>
     </div>
 
@@ -691,11 +1150,193 @@ function dinoco_slip_monitor_render() {
             });
         });
 
+        // ═══════════════════════════════════════════════════════
+        // V.1.3: Manual Process Tool + Replay Candidates
+        // ═══════════════════════════════════════════════════════
+        let _mpDistMap = null; // cache dist rows by id
+
+        async function loadDistributors() {
+            try {
+                const r = await apiGet('/distributors');
+                const sel = document.getElementById('mpDistId');
+                if (!r.success || !Array.isArray(r.rows)) {
+                    sel.innerHTML = '<option value="">-- โหลดไม่สำเร็จ --</option>';
+                    return;
+                }
+                _mpDistMap = {};
+                sel.innerHTML = '<option value="">-- เลือกร้าน --</option>' + r.rows.map(d => {
+                    _mpDistMap[d.id] = d;
+                    const debtLabel = d.current_debt > 0 ? (' [หนี้ ' + fmtBaht(d.current_debt) + ']') : ' [ไม่มีหนี้]';
+                    return '<option value="' + d.id + '">' + esc(d.name) + debtLabel + '</option>';
+                }).join('');
+            } catch (err) {
+                document.getElementById('mpDistId').innerHTML = '<option value="">-- error --</option>';
+            }
+        }
+
+        function fileToBase64(file) {
+            return new Promise(function(resolve, reject) {
+                const reader = new FileReader();
+                reader.onload = function() { resolve({ b64: reader.result, mime: file.type }); };
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        window.dncSlipMPReset = function() {
+            ['mpAmount','mpTransRef','mpSender','mpReason'].forEach(id => {
+                const el = document.getElementById(id); if (el) el.value = '';
+            });
+            document.getElementById('mpDistId').value = '';
+            const fi = document.getElementById('mpImageFile');
+            if (fi) fi.value = '';
+            document.getElementById('mpStatus').textContent = '';
+            document.getElementById('mpResult').innerHTML = '';
+        };
+
+        window.dncSlipManualProcess = async function() {
+            const distId = parseInt(document.getElementById('mpDistId').value || '0', 10);
+            const amount = parseFloat(document.getElementById('mpAmount').value || '0');
+            const transRef = document.getElementById('mpTransRef').value.trim();
+            const sender = document.getElementById('mpSender').value.trim();
+            const reason = document.getElementById('mpReason').value.trim();
+            const fileInput = document.getElementById('mpImageFile');
+
+            if (!distId) { alert('กรุณาเลือกร้าน'); return; }
+            if (!(amount > 0)) { alert('กรุณาระบุยอด (> 0)'); return; }
+            if (reason.length < 10) { alert('กรุณาระบุเหตุผลไม่น้อยกว่า 10 ตัวอักษร'); return; }
+
+            const distInfo = _mpDistMap && _mpDistMap[distId] ? _mpDistMap[distId] : null;
+            const distName = distInfo ? distInfo.name : ('#' + distId);
+            const currentDebt = distInfo ? distInfo.current_debt : 0;
+            let confirmMsg = '⚠️ ยืนยันตัดหนี้ manual?\n\n'
+                + 'ร้าน: ' + distName + '\n'
+                + 'ยอด: ' + fmtBaht(amount) + '\n'
+                + 'หนี้ปัจจุบัน: ' + fmtBaht(currentDebt) + '\n'
+                + 'หนี้ใหม่: ' + fmtBaht(Math.max(0, currentDebt - amount)) + '\n\n'
+                + 'การทำงานนี้จะ:\n'
+                + '• ตัดหนี้ผ่าน b2b_debt_subtract (atomic)\n'
+                + '• บันทึก audit row (manual_admin_paid)\n'
+                + '• ส่งแจ้งร้านทาง LINE\n'
+                + '• ส่งแจ้ง admin group\n\n'
+                + 'กด OK เพื่อดำเนินการ';
+            if (!confirm(confirmMsg)) return;
+
+            document.getElementById('mpStatus').textContent = '⏳ กำลัง process...';
+
+            let imageB64 = '', imageMime = '';
+            if (fileInput && fileInput.files && fileInput.files[0]) {
+                try {
+                    const res = await fileToBase64(fileInput.files[0]);
+                    imageB64 = res.b64;
+                    imageMime = res.mime;
+                } catch (err) {
+                    document.getElementById('mpStatus').textContent = '';
+                    alert('อ่านไฟล์รูปไม่สำเร็จ: ' + err.message);
+                    return;
+                }
+            }
+
+            try {
+                const r = await apiPost('/manual-process', {
+                    dist_id: distId,
+                    amount: amount,
+                    trans_ref: transRef,
+                    sender_name: sender,
+                    reason: reason,
+                    image_base64: imageB64,
+                    image_mime: imageMime,
+                });
+                document.getElementById('mpStatus').textContent = '';
+                if (r.success) {
+                    const msg = '<div class="dnc-slip-banner ok">'
+                        + '✅ <strong>' + esc(r.message) + '</strong><br>'
+                        + 'Log id: #' + r.log_id
+                        + (r.overpaid > 0 ? ' / โอนเกิน ' + fmtBaht(r.overpaid) : '')
+                        + (Array.isArray(r.paid_tickets) && r.paid_tickets.length > 0
+                            ? ' / เคลียร์บิล: #' + r.paid_tickets.join(', #') : '')
+                        + '</div>';
+                    document.getElementById('mpResult').innerHTML = msg;
+                    dncSlipMPReset();
+                    dncSlipMonitorRefresh();
+                    loadDistributors(); // refresh dist debt amounts
+                } else {
+                    const errMsg = r.message || (r.code + ': ' + (r.data ? JSON.stringify(r.data) : ''));
+                    document.getElementById('mpResult').innerHTML = '<div class="dnc-slip-banner bad">❌ Error: ' + esc(errMsg) + '</div>';
+                }
+            } catch (err) {
+                document.getElementById('mpStatus').textContent = '';
+                document.getElementById('mpResult').innerHTML = '<div class="dnc-slip-banner bad">❌ Network: ' + esc(err.message) + '</div>';
+            }
+        };
+
+        window.dncSlipReplayCandidates = async function(days) {
+            document.getElementById('dncSlipReplay').innerHTML = '<p>กำลังโหลด...</p>';
+            const r = await apiGet('/replay-candidates?days=' + days);
+            if (!r.success) {
+                document.getElementById('dncSlipReplay').innerHTML = '<div class="dnc-slip-banner bad">โหลดไม่สำเร็จ</div>';
+                return;
+            }
+            if (r.schema_missing) {
+                document.getElementById('dncSlipReplay').innerHTML = '<div class="dnc-slip-banner warn">' + esc(r.note) + '</div>';
+                return;
+            }
+            if (!r.rows || r.rows.length === 0) {
+                document.getElementById('dncSlipReplay').innerHTML = '<p style="color:#16a34a; font-weight:600;">✅ ไม่มี replay candidate ใน ' + days + ' วันที่ผ่านมา</p>';
+                return;
+            }
+            const trs = r.rows.map(row => `<tr>
+                <td>${fmtDateTH(row.created_at)}</td>
+                <td>${esc(row.dist_name || '(ไม่ระบุ)')}</td>
+                <td><span class="dnc-slip-status ${esc(row.result_status)}">${esc(row.result_status)}</span></td>
+                <td>${fmtBaht(row.amount)}</td>
+                <td><span class="dnc-slip-ref">${esc(row.trans_ref || '-')}</span></td>
+                <td><span class="dnc-slip-code">${row.image_hash ? esc(String(row.image_hash).substr(0, 12)) + '...' : '-'}</span></td>
+                <td><span class="dnc-slip-code">${esc(String(row.error_msg || '').substr(0, 80))}</span></td>
+                <td><button class="dnc-slip-btn dnc-slip-replay-one" data-log-id="${row.id}">🔁 Replay</button></td>
+            </tr>`).join('');
+            document.getElementById('dncSlipReplay').innerHTML = `
+                <div class="dnc-slip-banner warn">พบ <strong>${r.count}</strong> row ที่ replay ได้ (${days} วัน)</div>
+                <table class="dnc-slip-table">
+                    <thead><tr><th>เวลา</th><th>ร้าน</th><th>Status</th><th>ยอด</th><th>Ref</th><th>Hash</th><th>Error</th><th>Action</th></tr></thead>
+                    <tbody>${trs}</tbody>
+                </table>`;
+        };
+
+        window.dncSlipReplayOne = async function(logId) {
+            if (!confirm('ยืนยัน replay log #' + logId + '?\n\nระบบจะพยายาม process สลิปใหม่โดยใช้ cached Slip2Go response.\n\n⚠️ ถ้า LINE Content หมดอายุ (>24h) → fallback ไปใช้ Manual Process Tool แทน')) return;
+            const r = await apiPost('/replay-slip', { log_id: logId });
+            if (r.success) {
+                alert('✅ Replay triggered — ' + (r.message || ''));
+                dncSlipMonitorRefresh();
+                dncSlipReplayCandidates(7);
+            } else {
+                alert('❌ ' + (r.message || r.code || 'unknown error'));
+            }
+        };
+
+        // Event delegation for dynamically-rendered Replay buttons
+        document.addEventListener('click', function(e) {
+            const btn = e.target && e.target.closest ? e.target.closest('.dnc-slip-replay-one') : null;
+            if (!btn) return;
+            const logId = btn.dataset && btn.dataset.logId ? parseInt(btn.dataset.logId, 10) : 0;
+            if (!logId) return;
+            if (btn.disabled) return;
+            btn.disabled = true;
+            window.dncSlipReplayOne(logId).finally(function() {
+                if (document.body.contains(btn)) btn.disabled = false;
+            });
+        });
+
         // Auto-load on page ready
         if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', dncSlipMonitorRefresh);
+            document.addEventListener('DOMContentLoaded', function() {
+                dncSlipMonitorRefresh();
+                loadDistributors();
+            });
         } else {
             dncSlipMonitorRefresh();
+            loadDistributors();
         }
     })();
     </script>
