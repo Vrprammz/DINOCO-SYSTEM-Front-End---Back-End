@@ -413,6 +413,23 @@ Namespace สำหรับ Inventory Command Center (ใน `[Admin System] DI
 | POST | `/flash-dlq/{id}/abandon` | Admin | **V.42 F7** Mark abandoned |
 | GET | `/shipping/test-flash-payload/{ticket_id}` | Admin | **V.42 M6** Preview Flash payload before create |
 
+### 3.6.2 Flash V.42 Go-Live Wizard (`/wp-json/dinoco-flash-golive/v1/`)
+
+NEW namespace in `[Admin System] Flash Shipping V.42 Go-Live Tool` V.1.3 (2026-04-21). All endpoints `manage_options` + nonce + rate limit 30/min/user. Temporary — tool to be retired after V.42 stable.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/preflight` | 8 readiness checks (MySQL version, 5 schema tables, seeds, helpers, dispatcher, flag state) |
+| GET | `/coverage` | SKU migration % + breakdown by pack_mode + top 50 incomplete sample |
+| POST | `/auto-detect-all` | Bulk apply `dinoco_smart_detect_pack_mode` (dry-run or apply). `GET_LOCK('fsv42_bulk_op',2s)` serialize. |
+| POST | `/bulk-assign-defaults` | Bulk assign smallest box template matching weight (dry-run or apply) |
+| POST | `/smoke-test` | Run resolver on 1 SKU per pack_mode — returns pass/fail/skip per mode |
+| GET | `/monitor` | DLQ pending/resolved count + 24h bumps + audit recent 10 + cron heartbeat ages |
+| POST | `/flip-flag` | Body direction=on/off + optional reason. ON requires preflight ready + coverage≥95%. Audit row `golive_flip_*` + writes `dinoco_shipping_flag_flipped_at`. No-op short-circuit if same state. |
+| GET | `/multi-box-pending` | List multi_box SKUs where `slot_count != bpu` (coverage blocker) |
+| GET | `/box-templates-list` | Active templates for slot dropdown (Multi-Box Configurator) |
+| POST | `/save-pack-slots` | Body: `{sku, slots[]}`. Transaction: DELETE + N INSERT + audit update. Invalidates caches. Max 20 slots/SKU. |
+
 ### 3.7 B2F Migration Audit (`/wp-json/dinoco-b2f-audit/v1/`)
 
 Namespace สำหรับ B2F Option F migration audit. **Phase 3 ACTIVE** (2026-04-16) — reads flipped to junction. Registered ใน `[Admin System] B2F Migration Audit` V.3.3:
@@ -1736,6 +1753,7 @@ sequenceDiagram
 | Brand Voice | `[dinoco_brand_voice]` | Social listening |
 | Manual Invoice | `[dinoco_manual_invoice]` | Manual billing system |
 | GitHub Sync | `[dinoco_sync_dashboard]` | Deploy status |
+| Flash V.42 Go-Live | `[dinoco_flash_v42_golive]` | 5-step wizard: Pre-Flight / Migrate SKUs (incl. Multi-Box Configurator) / Smoke Test / Flip Flag / Monitor. Temporary tool — delete after V.42 stable. |
 
 #### Admin Dashboard Sidebar Tabs
 
