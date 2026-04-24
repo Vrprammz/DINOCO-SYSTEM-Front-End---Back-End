@@ -16,6 +16,22 @@
  * ║    • Rate limit 5/min/user บน manual-process + replay-slip (destructive)                   ║
  * ║    • Companion: Snippet 1 V.34.12 (replay helpers) + Snippet 2 V.34.10 (handler)           ║
  * ║                 + Snippet 15 V.8.6 (schema)                                                 ║
+ * ║  Version: V.1.4 (2026-04-24) — CRITICAL Manual Process bugs (3 fixes):  ║
+ * ║    • BUG-A Stale $new_debt in Flex: recalculate ran BEFORE              ║
+ * ║           b2b_auto_mark_paid_after_slip → order still awaiting_payment  ║
+ * ║           at recalc time → debt read returned ฿amount (stale) instead   ║
+ * ║           of ฿0 (real). Flex showed wrong หนี้คงเหลือ. Fixed by moving  ║
+ * ║           recalc AFTER auto_mark_paid (mirror Snippet 2 line 3051→3062) ║
+ * ║    • BUG-B Double subtract race: 2 REST calls within 200ms both passed  ║
+ * ║           trans_ref dedup (first log_insert hadn't committed yet) →     ║
+ * ║           double debt subtract + duplicate Flex. Fixed with MySQL       ║
+ * ║           GET_LOCK('dnc_mp_{dist}_{hash(amount+transref)}', 3) + in-    ║
+ * ║           lock re-check. RELEASE_LOCK on every exit path (incl fatal).  ║
+ * ║    • BUG-C Frontend double-click: button not disabled during async →    ║
+ * ║           user could click twice before first response. Added module-   ║
+ * ║           level _mpInFlight guard + button.disabled on click + finally  ║
+ * ║           block to restore state on error.                              ║
+ * ║  Version: V.1.3 (2026-04-24) — Slip Replay Pool + Manual Process Tool:  ║
  * ║  Version: V.1.2 (2026-04-24) — CRITICAL JS parse fix:                   ║
  * ║    • SyntaxError: function name `fmt฿` used Thai Baht sign `฿`          ║
  * ║           (U+0E3F, category Sc Currency) which is NOT valid in JS        ║
@@ -587,35 +603,82 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
         if ( ! function_exists( 'b2b_debt_subtract' ) ) {
             return new WP_Error( 'no_debt_fn', 'b2b_debt_subtract ไม่พร้อม (Snippet 13)', array( 'status' => 501 ) );
         }
-        $old_debt = function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : 0;
-        $reason_tag = 'manual_admin_slip:u=' . $uid . ':' . mb_substr( $reason, 0, 80 );
-        $new_debt = b2b_debt_subtract( $dist_id, $amount, $reason_tag );
-        if ( $new_debt === false ) {
-            return new WP_Error( 'debt_subtract_fail', 'ตัดหนี้ไม่สำเร็จ (debt_subtract คืน false)', array( 'status' => 500 ) );
-        }
-        // Reconstruct old_debt for overpayment calc (same pattern as auto slip flow)
-        $overpaid_amount = ( $amount > $old_debt && $old_debt > 0 ) ? round( $amount - $old_debt, 2 ) : 0;
-        $actual_paid = min( $amount, $old_debt > 0 ? $old_debt : $amount );
-        if ( function_exists( 'get_field' ) ) {
-            $mtd = floatval( get_field( 'monthly_sales_mtd', $dist_id ) );
-            update_field( 'monthly_sales_mtd', round( $mtd + $actual_paid, 2 ), $dist_id );
-            if ( $new_debt <= 0 ) update_field( 'credit_hold', false, $dist_id );
-        }
-        // Recalc from source of truth
-        $new_debt = function_exists( 'b2b_recalculate_debt' ) ? b2b_recalculate_debt( $dist_id )
-                    : ( function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : $new_debt );
 
-        // Stamp trans_ref on matching orders + auto-mark paid (reuse existing flow)
-        $paid_tickets = array();
-        if ( function_exists( 'b2b_auto_mark_paid_after_slip' ) && $group_id !== '' ) {
-            $match = b2b_auto_mark_paid_after_slip( $dist_id, $amount, $group_id );
-            $paid_tickets = isset( $match['paid_tickets'] ) ? $match['paid_tickets'] : array();
-            if ( $trans_ref !== '' ) {
-                foreach ( $paid_tickets as $pt ) {
-                    update_post_meta( $pt['id'], '_slip_trans_ref', $trans_ref );
+        // V.1.4 BUG-B FIX: MySQL GET_LOCK — guarantees ONE manual_process per dist+amount+trans_ref
+        // at a time. Prevents double-click race where 2 REST calls arrive within 200ms before the
+        // first b2b_slip_log_insert commits trans_ref → b2b_slip_is_trans_ref_seen() dedup miss →
+        // double debt subtract + double Flex. Lock scoped to (dist_id, amount, trans_ref hash) so
+        // different operations in parallel are not blocked.
+        global $wpdb;
+        $lock_key = 'dnc_mp_' . $dist_id . '_' . md5( (string) $amount . '|' . $trans_ref );
+        // Lock names >64 chars are rejected by MySQL silently — md5 gives us ~60 chars max
+        $lock_acquired = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $lock_key ) );
+        if ( $lock_acquired !== 1 ) {
+            return new WP_Error( 'concurrent_process',
+                'มีคนกำลังทำ manual process อันเดียวกันอยู่ — กรุณารอสักครู่แล้วรีเฟรชดู',
+                array( 'status' => 409 ) );
+        }
+
+        try {
+            // Re-check dedup INSIDE the lock — first call wrote trans_ref, second call sees it
+            if ( $trans_ref !== '' && function_exists( 'b2b_slip_is_trans_ref_seen' ) ) {
+                if ( b2b_slip_is_trans_ref_seen( $trans_ref ) ) {
+                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+                    return new WP_Error( 'transref_seen_inlock',
+                        'TransRef นี้เพิ่งถูก process ไปแล้ว (dedup in-lock)',
+                        array( 'status' => 409 ) );
                 }
             }
+
+            $old_debt = function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : 0;
+            $reason_tag = 'manual_admin_slip:u=' . $uid . ':' . mb_substr( $reason, 0, 80 );
+            $new_debt = b2b_debt_subtract( $dist_id, $amount, $reason_tag );
+            if ( $new_debt === false ) {
+                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+                return new WP_Error( 'debt_subtract_fail', 'ตัดหนี้ไม่สำเร็จ (debt_subtract คืน false)', array( 'status' => 500 ) );
+            }
+
+            // Reconstruct old_debt for overpayment calc (same pattern as auto slip flow)
+            $overpaid_amount = ( $amount > $old_debt && $old_debt > 0 ) ? round( $amount - $old_debt, 2 ) : 0;
+            $actual_paid = min( $amount, $old_debt > 0 ? $old_debt : $amount );
+            if ( function_exists( 'get_field' ) ) {
+                $mtd = floatval( get_field( 'monthly_sales_mtd', $dist_id ) );
+                update_field( 'monthly_sales_mtd', round( $mtd + $actual_paid, 2 ), $dist_id );
+                if ( $new_debt <= 0 ) update_field( 'credit_hold', false, $dist_id );
+            }
+
+            // Stamp trans_ref on matching orders + auto-mark paid (reuse existing flow)
+            // V.1.4 BUG-A FIX: auto_mark_paid marks orders → changes order_status → affects
+            // b2b_recalculate_debt result. MUST run BEFORE recalculate to get accurate $new_debt.
+            // Previous order (recalc → auto_mark) returned stale debt = amount (since order was
+            // still awaiting_payment at recalc time) → Flex showed "หนี้คงเหลือ = ฿amount" even
+            // when actual debt was ฿0. Mirror b2b_handle_slip_image at Snippet 2 line 3051→3062.
+            $paid_tickets = array();
+            if ( function_exists( 'b2b_auto_mark_paid_after_slip' ) && $group_id !== '' ) {
+                $match = b2b_auto_mark_paid_after_slip( $dist_id, $amount, $group_id );
+                $paid_tickets = isset( $match['paid_tickets'] ) ? $match['paid_tickets'] : array();
+                if ( $trans_ref !== '' ) {
+                    foreach ( $paid_tickets as $pt ) {
+                        update_post_meta( $pt['id'], '_slip_trans_ref', $trans_ref );
+                    }
+                }
+            }
+
+            // Recalc from source of truth AFTER auto_mark_paid — otherwise still reads awaiting_payment orders
+            $new_debt = function_exists( 'b2b_recalculate_debt' ) ? b2b_recalculate_debt( $dist_id )
+                        : ( function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : $new_debt );
+        } catch ( \Throwable $e ) {
+            $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip ManualProcess] FATAL dist=' . $dist_id . ' err=' . $e->getMessage() );
+            }
+            return new WP_Error( 'fatal', 'เกิด error ระหว่างประมวลผล: ' . mb_substr( $e->getMessage(), 0, 200 ),
+                array( 'status' => 500 ) );
         }
+
+        // Release lock BEFORE side-effects (log insert + LINE push) — those are idempotent-ish and
+        // taking ~1-2s to complete LINE API calls, blocking retry window unnecessarily
+        $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
 
         // Audit log row — result_status='manual_admin_paid'
         $log_id = 0;
@@ -1194,7 +1257,18 @@ function dinoco_slip_monitor_render() {
             document.getElementById('mpResult').innerHTML = '';
         };
 
+        // V.1.4 BUG-C FIX: module-level guard against concurrent invocations. A single admin
+        // double-clicking the button within 200ms fired 2 REST calls that both passed the trans_ref
+        // dedup check (race before first log_insert committed) → double debt subtract + duplicate
+        // Flex messages. Backend GET_LOCK (V.1.4 BUG-B fix in dinoco_slip_monitor_rest_manual_process)
+        // now also protects this, but the frontend guard prevents the second confirm dialog from
+        // even appearing, giving cleaner UX + reducing server round-trips.
+        let _mpInFlight = false;
         window.dncSlipManualProcess = async function() {
+            if (_mpInFlight) {
+                console.warn('[SlipMonitor] Manual Process already in flight — ignoring double-click');
+                return;
+            }
             const distId = parseInt(document.getElementById('mpDistId').value || '0', 10);
             const amount = parseFloat(document.getElementById('mpAmount').value || '0');
             const transRef = document.getElementById('mpTransRef').value.trim();
@@ -1222,6 +1296,14 @@ function dinoco_slip_monitor_render() {
                 + 'กด OK เพื่อดำเนินการ';
             if (!confirm(confirmMsg)) return;
 
+            // Disable button + set in-flight guard atomically BEFORE any async work
+            _mpInFlight = true;
+            const processBtn = document.querySelector('button[onclick="dncSlipManualProcess()"]');
+            if (processBtn) {
+                processBtn.disabled = true;
+                processBtn.style.opacity = '0.5';
+                processBtn.style.cursor = 'not-allowed';
+            }
             document.getElementById('mpStatus').textContent = '⏳ กำลัง process...';
 
             let imageB64 = '', imageMime = '';
@@ -1267,6 +1349,14 @@ function dinoco_slip_monitor_render() {
             } catch (err) {
                 document.getElementById('mpStatus').textContent = '';
                 document.getElementById('mpResult').innerHTML = '<div class="dnc-slip-banner bad">❌ Network: ' + esc(err.message) + '</div>';
+            } finally {
+                // ALWAYS re-enable button + clear in-flight guard — even on error/network fail
+                _mpInFlight = false;
+                if (processBtn) {
+                    processBtn.disabled = false;
+                    processBtn.style.opacity = '';
+                    processBtn.style.cursor = '';
+                }
             }
         };
 
