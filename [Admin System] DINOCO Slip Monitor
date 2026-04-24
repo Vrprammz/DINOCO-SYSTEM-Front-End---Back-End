@@ -1,0 +1,588 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.0 (2026-04-24) — Slip Resilience (regression fix) ║
+ * ║  DB_ID: 1190                                                 ║
+ * ║  Description: Admin UI + REST endpoints for slip processing  ║
+ * ║    observability + emergency force-unlock                    ║
+ * ║  Shortcode: [dinoco_slip_monitor]                            ║
+ * ║  REST namespace: /wp-json/dinoco-slip/v1/                    ║
+ * ║                                                              ║
+ * ║  Companion snippets:                                         ║
+ * ║    • [B2B] Snippet 1 V.34.8 (helpers)                        ║
+ * ║    • [B2B] Snippet 2 V.34.8 (resilient handler + crons)      ║
+ * ║    • [B2B] Snippet 15 V.8.4 (wp_dinoco_slip_log schema)      ║
+ * ║                                                              ║
+ * ║  Features:                                                   ║
+ * ║    • Recent 50 slip attempts table (from wp_dinoco_slip_log) ║
+ * ║    • Stats cards: 24h total / success rate / errors / locks  ║
+ * ║    • Active locks + queue depth per group                    ║
+ * ║    • Force-clear individual group or ALL slip locks          ║
+ * ║    • Slip2Go quota health indicator                          ║
+ * ║    • Audit sweep: missed slips last 30 days (no debt match)  ║
+ * ║                                                              ║
+ * ║  All endpoints require manage_options capability             ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// ════════════════════════════════════════════════════════════════
+// REST API ENDPOINTS — /wp-json/dinoco-slip/v1/
+// ════════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function () {
+    $perm_admin = function () {
+        return current_user_can( 'manage_options' );
+    };
+
+    register_rest_route( 'dinoco-slip/v1', '/monitor', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_get',
+        'permission_callback' => $perm_admin,
+    ) );
+
+    register_rest_route( 'dinoco-slip/v1', '/recent', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_recent',
+        'permission_callback' => $perm_admin,
+    ) );
+
+    register_rest_route( 'dinoco-slip/v1', '/clear-locks', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_slip_monitor_rest_clear_locks',
+        'permission_callback' => function ( WP_REST_Request $req ) {
+            return current_user_can( 'manage_options' )
+                && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
+        },
+    ) );
+
+    register_rest_route( 'dinoco-slip/v1', '/missed-sweep', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_missed_sweep',
+        'permission_callback' => $perm_admin,
+    ) );
+} );
+
+// ────────────────────────────────────────────────────────────────
+// GET /monitor — Dashboard summary (stats + active locks + queues)
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_get' ) ) {
+    function dinoco_slip_monitor_rest_get( WP_REST_Request $req ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+
+        // Stats 24h
+        $stats_24h = array(
+            'total' => 0, 'paid' => 0, 'duplicate' => 0,
+            'receiver_mismatch' => 0, 'amount_mismatch' => 0, 'amount_no_pending' => 0,
+            'slip2go_error' => 0, 'line_api_error' => 0,
+            'queued' => 0, 'not_slip' => 0, 'unregistered_group' => 0,
+            'other' => 0,
+        );
+        $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( $table_exists ) {
+            $results = $wpdb->get_results(
+                "SELECT result_status, COUNT(*) AS cnt FROM {$table}
+                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                 GROUP BY result_status"
+            );
+            foreach ( $results as $r ) {
+                $status = $r->result_status;
+                $cnt = (int) $r->cnt;
+                $stats_24h['total'] += $cnt;
+                if ( array_key_exists( $status, $stats_24h ) ) {
+                    $stats_24h[ $status ] += $cnt;
+                } else {
+                    $stats_24h['other'] += $cnt;
+                }
+            }
+        }
+
+        // Active locks + queues
+        $locks = array();
+        $lock_rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+            $wpdb->esc_like( '_transient_timeout_b2b_slip_lock_' ) . '%'
+        ) );
+        $now = time();
+        foreach ( $lock_rows as $r ) {
+            $gid = substr( $r->option_name, strlen( '_transient_timeout_b2b_slip_lock_' ) );
+            if ( $gid === '' ) continue;
+            $expires_at = (int) $r->option_value;
+            $dist_name = dinoco_slip_monitor_get_dist_name( $gid );
+            $locks[] = array(
+                'group_id'     => $gid,
+                'dist_name'    => $dist_name,
+                'expires_at'   => $expires_at,
+                'remaining_s'  => max( 0, $expires_at - $now ),
+                'is_stuck'     => ( $expires_at > 0 && ( $now - $expires_at ) > 120 ),
+            );
+        }
+
+        $queues = array();
+        $queue_rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+            $wpdb->esc_like( 'b2b_slip_queue_' ) . '%'
+        ) );
+        foreach ( $queue_rows as $r ) {
+            $gid = substr( $r->option_name, strlen( 'b2b_slip_queue_' ) );
+            if ( $gid === '' ) continue;
+            $queue = maybe_unserialize( $r->option_value );
+            if ( ! is_array( $queue ) || empty( $queue ) ) continue;
+            $oldest = PHP_INT_MAX;
+            foreach ( $queue as $q ) {
+                $t = (int) ( $q['time'] ?? 0 );
+                if ( $t > 0 && $t < $oldest ) $oldest = $t;
+            }
+            $queues[] = array(
+                'group_id'       => $gid,
+                'dist_name'      => dinoco_slip_monitor_get_dist_name( $gid ),
+                'size'           => count( $queue ),
+                'oldest_age_min' => $oldest < PHP_INT_MAX ? (int) round( ( $now - $oldest ) / 60 ) : 0,
+            );
+        }
+
+        // Slip2Go health
+        $s2g_health = array(
+            'err_count_10min' => (int) get_transient( 'b2b_slip2go_err_count' ),
+            'admin_alerted'   => (bool) get_transient( 'b2b_slip2go_alerted' ),
+        );
+
+        // Success rate
+        $success_rate = 0;
+        if ( $stats_24h['total'] > 0 ) {
+            $success_rate = round( 100 * ( $stats_24h['paid'] + $stats_24h['duplicate'] ) / $stats_24h['total'], 1 );
+        }
+
+        return rest_ensure_response( array(
+            'success'       => true,
+            'table_exists'  => $table_exists,
+            'stats_24h'     => $stats_24h,
+            'success_rate'  => $success_rate,
+            'active_locks'  => $locks,
+            'active_queues' => $queues,
+            'slip2go'       => $s2g_health,
+            'now'           => $now,
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// GET /recent?limit=50&status=&group_id=
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_recent' ) ) {
+    function dinoco_slip_monitor_rest_recent( WP_REST_Request $req ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $table_exists ) {
+            return rest_ensure_response( array( 'success' => true, 'rows' => array(), 'table_missing' => true ) );
+        }
+
+        $limit = max( 1, min( 200, (int) $req->get_param( 'limit' ) ?: 50 ) );
+        $status = sanitize_text_field( (string) $req->get_param( 'status' ) );
+        $group_id = sanitize_text_field( (string) $req->get_param( 'group_id' ) );
+
+        $where = array( '1=1' );
+        $params = array();
+        if ( $status !== '' ) {
+            $where[] = 'result_status = %s';
+            $params[] = $status;
+        }
+        if ( $group_id !== '' ) {
+            $where[] = 'group_id = %s';
+            $params[] = $group_id;
+        }
+        $params[] = $limit;
+
+        $sql = "SELECT id, group_id, message_id, user_id, dist_id, slip_code, amount, trans_ref, sender_name,
+                       result_status, error_code, error_msg, http_code, processing_time_ms, retry_count, created_at
+                FROM {$table}
+                WHERE " . implode( ' AND ', $where ) . "
+                ORDER BY id DESC
+                LIMIT %d";
+        $rows = $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
+
+        // Enrich with dist_name
+        foreach ( $rows as &$row ) {
+            $row['dist_name'] = dinoco_slip_monitor_get_dist_name( $row['group_id'] );
+        }
+        unset( $row );
+
+        return rest_ensure_response( array( 'success' => true, 'rows' => $rows ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// POST /clear-locks — force-unlock specific group or all
+// Body: { group_id: '', reason: '' }
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_clear_locks' ) ) {
+    function dinoco_slip_monitor_rest_clear_locks( WP_REST_Request $req ) {
+        // Rate limit 5/min per user (reuse b2b_rate_limit if available)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'slip_clear_locks_u' . $uid, 5, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 5/min)', array( 'status' => 429 ) );
+            }
+        }
+
+        if ( ! function_exists( 'b2b_slip_clear_locks' ) ) {
+            return new WP_Error( 'missing_helper', 'ต้อง Snippet 1 V.34.8+ ก่อน', array( 'status' => 501 ) );
+        }
+
+        $group_id = sanitize_text_field( (string) $req->get_param( 'group_id' ) );
+        $reason   = sanitize_text_field( (string) $req->get_param( 'reason' ) ?: 'admin_manual' );
+
+        $result = b2b_slip_clear_locks( $group_id, 'admin:' . $uid . ':' . $reason );
+        return rest_ensure_response( array( 'success' => true, 'data' => $result ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// GET /missed-sweep — Forensic audit: สลิปที่ process แล้วไม่เจอ order match ในช่วง 30d
+// ใช้ตรวจย้อนหลังว่ามีสลิปหายก่อนหน้านี้ที่บอสไม่รู้มั้ย
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_missed_sweep' ) ) {
+    function dinoco_slip_monitor_rest_missed_sweep( WP_REST_Request $req ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $table_exists ) {
+            return rest_ensure_response( array( 'success' => true, 'rows' => array(), 'table_missing' => true ) );
+        }
+
+        $days = max( 1, min( 90, (int) $req->get_param( 'days' ) ?: 30 ) );
+
+        // สลิปที่:
+        //   • result_status = 'slip2go_error' หรือ 'line_api_error' หรือ 'unregistered_group'
+        //     (= สลิปที่ระบบไม่ประมวลผลสำเร็จ)
+        //   • result_status = 'amount_no_pending' (= match ผิดร้าน admin ต้อง manual)
+        //   • result_status = 'no_distributor' (= Slip2Go OK แต่ไม่มี dist CPT)
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, group_id, message_id, user_id, dist_id, slip_code, amount, trans_ref,
+                    sender_name, result_status, error_code, error_msg, http_code, created_at
+             FROM {$table}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+               AND result_status IN ('slip2go_error','line_api_error','unregistered_group','amount_no_pending','no_distributor','data_missing','unknown_slip_code')
+             ORDER BY created_at DESC
+             LIMIT 500",
+            $days
+        ), ARRAY_A );
+
+        foreach ( $rows as &$row ) {
+            $row['dist_name'] = dinoco_slip_monitor_get_dist_name( $row['group_id'] );
+        }
+        unset( $row );
+
+        // Breakdown
+        $breakdown = array();
+        foreach ( $rows as $r ) {
+            $s = $r['result_status'];
+            if ( ! isset( $breakdown[ $s ] ) ) $breakdown[ $s ] = 0;
+            $breakdown[ $s ]++;
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'days' => $days,
+            'count' => count( $rows ),
+            'breakdown' => $breakdown,
+            'rows' => $rows,
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Helper: get distributor name (cached per-request)
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_get_dist_name' ) ) {
+    function dinoco_slip_monitor_get_dist_name( $group_id ) {
+        static $cache = array();
+        if ( ! $group_id ) return '';
+        if ( isset( $cache[ $group_id ] ) ) return $cache[ $group_id ];
+        $posts = get_posts( array(
+            'post_type' => 'distributor', 'posts_per_page' => 1, 'post_status' => 'any',
+            'meta_query' => array( array( 'key' => 'line_group_id', 'value' => $group_id ) ),
+            'fields' => 'ids',
+        ) );
+        $name = ! empty( $posts ) ? get_the_title( $posts[0] ) : '';
+        $cache[ $group_id ] = $name;
+        return $name;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// SHORTCODE: [dinoco_slip_monitor]
+// ════════════════════════════════════════════════════════════════
+
+add_shortcode( 'dinoco_slip_monitor', 'dinoco_slip_monitor_render' );
+
+function dinoco_slip_monitor_render() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return '<p>คุณไม่มีสิทธิ์ดูหน้านี้</p>';
+    }
+
+    $nonce = wp_create_nonce( 'wp_rest' );
+
+    ob_start();
+    ?>
+    <div class="dnc-slip-monitor-wrap">
+        <style>
+            .dnc-slip-monitor-wrap { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1400px; margin: 0 auto; padding: 20px; color: #0f172a; }
+            .dnc-slip-monitor-wrap h2 { margin: 0 0 16px; font-size: 22px; }
+            .dnc-slip-monitor-wrap .dnc-slip-refresh { background: #3b82f6; color: #fff; border: 0; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+            .dnc-slip-monitor-wrap .dnc-slip-refresh:hover { background: #2563eb; }
+            .dnc-slip-monitor-wrap .dnc-slip-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+            .dnc-slip-monitor-wrap .dnc-slip-stat-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; }
+            .dnc-slip-monitor-wrap .dnc-slip-stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }
+            .dnc-slip-monitor-wrap .dnc-slip-stat-value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+            .dnc-slip-monitor-wrap .dnc-slip-stat-value.ok { color: #16a34a; }
+            .dnc-slip-monitor-wrap .dnc-slip-stat-value.warn { color: #d97706; }
+            .dnc-slip-monitor-wrap .dnc-slip-stat-value.bad { color: #dc2626; }
+            .dnc-slip-monitor-wrap .dnc-slip-section { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+            .dnc-slip-monitor-wrap .dnc-slip-section h3 { margin: 0 0 12px; font-size: 16px; color: #1e293b; }
+            .dnc-slip-monitor-wrap table.dnc-slip-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+            .dnc-slip-monitor-wrap table.dnc-slip-table th, .dnc-slip-monitor-wrap table.dnc-slip-table td { padding: 8px 10px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: top; }
+            .dnc-slip-monitor-wrap table.dnc-slip-table th { background: #f8fafc; color: #64748b; font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; }
+            .dnc-slip-monitor-wrap .dnc-slip-status { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.paid { background: #dcfce7; color: #166534; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.paid_overpayment { background: #dbeafe; color: #1e40af; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.duplicate { background: #fef3c7; color: #92400e; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.receiver_mismatch,
+            .dnc-slip-monitor-wrap .dnc-slip-status.amount_mismatch,
+            .dnc-slip-monitor-wrap .dnc-slip-status.amount_no_pending { background: #fef3c7; color: #92400e; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.slip2go_error,
+            .dnc-slip-monitor-wrap .dnc-slip-status.line_api_error,
+            .dnc-slip-monitor-wrap .dnc-slip-status.data_missing { background: #fee2e2; color: #991b1b; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.unregistered_group,
+            .dnc-slip-monitor-wrap .dnc-slip-status.no_distributor { background: #f3e8ff; color: #6b21a8; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.queued,
+            .dnc-slip-monitor-wrap .dnc-slip-status.not_slip,
+            .dnc-slip-monitor-wrap .dnc-slip-status.unknown_slip_code { background: #f1f5f9; color: #475569; }
+            .dnc-slip-monitor-wrap .dnc-slip-btn { background: #dc2626; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600; }
+            .dnc-slip-monitor-wrap .dnc-slip-btn:hover { background: #b91c1c; }
+            .dnc-slip-monitor-wrap .dnc-slip-btn.neutral { background: #64748b; }
+            .dnc-slip-monitor-wrap .dnc-slip-btn.neutral:hover { background: #475569; }
+            .dnc-slip-monitor-wrap .dnc-slip-banner { padding: 12px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
+            .dnc-slip-monitor-wrap .dnc-slip-banner.warn { background: #fef3c7; color: #78350f; border: 1px solid #fcd34d; }
+            .dnc-slip-monitor-wrap .dnc-slip-banner.ok { background: #dcfce7; color: #14532d; border: 1px solid #86efac; }
+            .dnc-slip-monitor-wrap .dnc-slip-banner.bad { background: #fee2e2; color: #7f1d1d; border: 1px solid #fca5a5; }
+            .dnc-slip-monitor-wrap .dnc-slip-code { font-family: ui-monospace, 'SF Mono', monospace; font-size: 10px; color: #64748b; }
+            .dnc-slip-monitor-wrap .dnc-slip-ref { font-family: ui-monospace, monospace; font-size: 11px; color: #475569; }
+        </style>
+
+        <h2>📸 Slip Monitor — ระบบตรวจสลิป (B2B)</h2>
+
+        <div id="dncSlipBanner"></div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <button class="dnc-slip-refresh" onclick="dncSlipMonitorRefresh()">🔄 Refresh</button>
+            <div style="display:flex; gap:8px;">
+                <button class="dnc-slip-btn neutral" onclick="dncSlipClearAll()">🔓 Force Clear ALL Slip Locks</button>
+            </div>
+        </div>
+
+        <div class="dnc-slip-stats" id="dncSlipStats">
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">ทั้งหมด 24h</div><div class="dnc-slip-stat-value" id="statTotal">—</div></div>
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">สำเร็จ</div><div class="dnc-slip-stat-value ok" id="statPaid">—</div></div>
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">ซ้ำ</div><div class="dnc-slip-stat-value warn" id="statDup">—</div></div>
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Error (API)</div><div class="dnc-slip-stat-value bad" id="statErr">—</div></div>
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Unregistered</div><div class="dnc-slip-stat-value warn" id="statUnreg">—</div></div>
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Success rate</div><div class="dnc-slip-stat-value ok" id="statRate">—</div></div>
+        </div>
+
+        <div class="dnc-slip-section">
+            <h3>🔐 Active Locks + Queues</h3>
+            <div id="dncSlipLocks">Loading...</div>
+        </div>
+
+        <div class="dnc-slip-section">
+            <h3>📋 Recent 50 Slip Attempts</h3>
+            <div id="dncSlipRecent">Loading...</div>
+        </div>
+
+        <div class="dnc-slip-section">
+            <h3>🔍 Forensic Audit (missed slips last 30 days)</h3>
+            <button class="dnc-slip-btn neutral" onclick="dncSlipMissedSweep(30)">Run sweep (30 วัน)</button>
+            <button class="dnc-slip-btn neutral" onclick="dncSlipMissedSweep(7)">7 วัน</button>
+            <div id="dncSlipMissed" style="margin-top:12px;"></div>
+        </div>
+    </div>
+
+    <script>
+    (function(){
+        const NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+        const REST = '<?php echo esc_js( rest_url( 'dinoco-slip/v1' ) ); ?>';
+
+        function fmtDateTH(iso) {
+            if (!iso) return '-';
+            const d = new Date(iso.replace(' ', 'T') + '+07:00');
+            return d.getDate().toString().padStart(2, '0') + '/' + (d.getMonth() + 1).toString().padStart(2, '0') + ' ' + d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+        }
+        function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+        function fmt฿(n) { if (n == null || n === '') return '-'; return '฿' + Number(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+
+        async function apiGet(path) {
+            const r = await fetch(REST + path, { headers: { 'X-WP-Nonce': NONCE } });
+            return r.json();
+        }
+        async function apiPost(path, body) {
+            const r = await fetch(REST + path, {
+                method: 'POST',
+                headers: { 'X-WP-Nonce': NONCE, 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}),
+            });
+            return r.json();
+        }
+
+        window.dncSlipMonitorRefresh = async function() {
+            const resp = await apiGet('/monitor');
+            if (!resp.success) {
+                document.getElementById('dncSlipBanner').innerHTML = '<div class="dnc-slip-banner bad">โหลดข้อมูลไม่ได้</div>';
+                return;
+            }
+            const s = resp.stats_24h;
+            document.getElementById('statTotal').textContent = s.total;
+            document.getElementById('statPaid').textContent = (s.paid + s.paid_overpayment);
+            document.getElementById('statDup').textContent = s.duplicate;
+            document.getElementById('statErr').textContent = (s.slip2go_error + s.line_api_error + s.data_missing);
+            document.getElementById('statUnreg').textContent = s.unregistered_group;
+            document.getElementById('statRate').textContent = resp.success_rate + '%';
+
+            // Banner
+            let banner = '';
+            if (!resp.table_exists) {
+                banner = '<div class="dnc-slip-banner bad">⚠️ wp_dinoco_slip_log table ยังไม่ถูกสร้าง — ไปที่ wp-admin แล้วกด refresh เพื่อ trigger init hook (Snippet 15 V.8.4+)</div>';
+            } else if (resp.slip2go.admin_alerted) {
+                banner = '<div class="dnc-slip-banner bad">🚨 Slip2Go API มีปัญหา — Error ' + resp.slip2go.err_count_10min + ' ครั้งใน 10 นาทีล่าสุด (Admin ถูกแจ้งเตือนแล้ว)</div>';
+            } else if (resp.active_locks.some(l => l.is_stuck)) {
+                banner = '<div class="dnc-slip-banner warn">⚠️ เจอ lock ค้าง ' + resp.active_locks.filter(l => l.is_stuck).length + ' รายการ — ระบบจะ auto-clear ใน cron รอบถัดไป (หรือกด Force Clear เพื่อล้างทันที)</div>';
+            } else if (s.total === 0) {
+                banner = '<div class="dnc-slip-banner warn">ℹ️ ไม่มี slip activity ใน 24 ชม. ที่ผ่านมา — ถ้าลูกค้าส่งสลิปมาจริง ตรวจสอบ LINE webhook</div>';
+            } else {
+                banner = '<div class="dnc-slip-banner ok">✅ ระบบทำงานปกติ — success rate ' + resp.success_rate + '% (24h)</div>';
+            }
+            document.getElementById('dncSlipBanner').innerHTML = banner;
+
+            // Locks + queues table
+            const locks = resp.active_locks || [];
+            const queues = resp.active_queues || [];
+            if (locks.length === 0 && queues.length === 0) {
+                document.getElementById('dncSlipLocks').innerHTML = '<p style="color:#64748b; font-size:13px;">— ไม่มี active lock หรือ queue —</p>';
+            } else {
+                const rows = [];
+                locks.forEach(l => {
+                    const statusBadge = l.is_stuck ? '<span class="dnc-slip-status slip2go_error">ค้าง ' + Math.abs(l.remaining_s) + 's</span>' :
+                        '<span class="dnc-slip-status queued">เหลือ ' + l.remaining_s + 's</span>';
+                    rows.push(`<tr>
+                        <td>🔐 Lock</td>
+                        <td>${esc(l.dist_name || '(ไม่ระบุร้าน)')}</td>
+                        <td><span class="dnc-slip-code">${esc(l.group_id)}</span></td>
+                        <td>${statusBadge}</td>
+                        <td>—</td>
+                        <td><button class="dnc-slip-btn" onclick="dncSlipClearOne('${esc(l.group_id)}')">Force Clear</button></td>
+                    </tr>`);
+                });
+                queues.forEach(q => {
+                    const stale = q.oldest_age_min >= 60;
+                    const statusBadge = stale ? '<span class="dnc-slip-status slip2go_error">ค้าง ' + q.oldest_age_min + 'min</span>' :
+                        '<span class="dnc-slip-status queued">pending</span>';
+                    rows.push(`<tr>
+                        <td>📋 Queue</td>
+                        <td>${esc(q.dist_name || '(ไม่ระบุร้าน)')}</td>
+                        <td><span class="dnc-slip-code">${esc(q.group_id)}</span></td>
+                        <td>${statusBadge}</td>
+                        <td>size=${q.size}, oldest=${q.oldest_age_min}min</td>
+                        <td><button class="dnc-slip-btn" onclick="dncSlipClearOne('${esc(q.group_id)}')">Force Clear</button></td>
+                    </tr>`);
+                });
+                document.getElementById('dncSlipLocks').innerHTML = `<table class="dnc-slip-table">
+                    <thead><tr><th>Type</th><th>ร้าน</th><th>Group ID</th><th>Status</th><th>ข้อมูล</th><th>Action</th></tr></thead>
+                    <tbody>${rows.join('')}</tbody>
+                </table>`;
+            }
+
+            // Recent slips
+            const recent = await apiGet('/recent?limit=50');
+            if (!recent.success || !recent.rows || recent.rows.length === 0) {
+                document.getElementById('dncSlipRecent').innerHTML = '<p style="color:#64748b; font-size:13px;">— ยังไม่มีข้อมูล slip log —</p>';
+            } else {
+                const trs = recent.rows.map(r => `<tr>
+                    <td>${fmtDateTH(r.created_at)}</td>
+                    <td>${esc(r.dist_name || '(ไม่ระบุ)')}</td>
+                    <td><span class="dnc-slip-status ${esc(r.result_status)}">${esc(r.result_status)}</span></td>
+                    <td>${fmt฿(r.amount)}</td>
+                    <td><span class="dnc-slip-ref">${esc(r.trans_ref || '-')}</span></td>
+                    <td>${esc(r.sender_name || '-')}</td>
+                    <td><span class="dnc-slip-code">HTTP ${r.http_code || '-'} / ${r.processing_time_ms || '-'}ms / retry=${r.retry_count || 0}</span></td>
+                    <td><span class="dnc-slip-code">${esc(r.error_msg || '')}</span></td>
+                </tr>`).join('');
+                document.getElementById('dncSlipRecent').innerHTML = `<table class="dnc-slip-table">
+                    <thead><tr><th>เวลา</th><th>ร้าน</th><th>Status</th><th>ยอด</th><th>Ref</th><th>ผู้โอน</th><th>Tech</th><th>Error</th></tr></thead>
+                    <tbody>${trs}</tbody>
+                </table>`;
+            }
+        };
+
+        window.dncSlipClearOne = async function(groupId) {
+            if (!confirm('ยืนยัน force-clear lock สำหรับ group นี้?\n\nGroup: ' + groupId + '\n\nSlip ถัดไปในกลุ่มนี้จะ process ตามปกติ')) return;
+            const r = await apiPost('/clear-locks', { group_id: groupId, reason: 'ui_per_group' });
+            if (r.success) {
+                alert('ล้างเรียบร้อย: lock=' + r.data.cleared_locks + ' queue=' + r.data.cleared_queues);
+                dncSlipMonitorRefresh();
+            } else {
+                alert('Error: ' + (r.message || 'unknown'));
+            }
+        };
+
+        window.dncSlipClearAll = async function() {
+            if (!confirm('⚠️ ยืนยัน force-clear ALL slip locks + queues?\n\nใช้เมื่อระบบค้าง/มี lock stuck จำนวนมาก\n\nการทำงานปกติหลังจากนี้ไม่กระทบ')) return;
+            const r = await apiPost('/clear-locks', { group_id: '', reason: 'ui_clear_all' });
+            if (r.success) {
+                alert('ล้างเรียบร้อย: lock=' + r.data.cleared_locks + ' queue=' + r.data.cleared_queues + ' (' + (r.data.groups || []).length + ' groups)');
+                dncSlipMonitorRefresh();
+            } else {
+                alert('Error: ' + (r.message || 'unknown'));
+            }
+        };
+
+        window.dncSlipMissedSweep = async function(days) {
+            document.getElementById('dncSlipMissed').innerHTML = '<p>กำลังสแกน...</p>';
+            const r = await apiGet('/missed-sweep?days=' + days);
+            if (!r.success || !r.rows || r.rows.length === 0) {
+                document.getElementById('dncSlipMissed').innerHTML = '<p style="color:#16a34a; font-weight:600;">✅ ไม่พบ slip หาย ใน ' + days + ' วันที่ผ่านมา</p>';
+                return;
+            }
+            const bdParts = Object.keys(r.breakdown).map(k => '<strong>' + esc(k) + '</strong>: ' + r.breakdown[k]);
+            const trs = r.rows.slice(0, 100).map(row => `<tr>
+                <td>${fmtDateTH(row.created_at)}</td>
+                <td>${esc(row.dist_name || '(ไม่ระบุ)')}</td>
+                <td><span class="dnc-slip-status ${esc(row.result_status)}">${esc(row.result_status)}</span></td>
+                <td>${fmt฿(row.amount)}</td>
+                <td><span class="dnc-slip-ref">${esc(row.trans_ref || '-')}</span></td>
+                <td>${esc(row.sender_name || '-')}</td>
+                <td><span class="dnc-slip-code">${esc(row.error_msg || '')}</span></td>
+            </tr>`).join('');
+            document.getElementById('dncSlipMissed').innerHTML = `
+                <div class="dnc-slip-banner warn">พบ slip ที่ไม่ประมวลผลสำเร็จ <strong>${r.count}</strong> รายการ ใน ${days} วัน<br>
+                ${bdParts.join(' / ')}</div>
+                <table class="dnc-slip-table">
+                    <thead><tr><th>เวลา</th><th>ร้าน</th><th>Status</th><th>ยอด</th><th>Ref</th><th>ผู้โอน</th><th>Error</th></tr></thead>
+                    <tbody>${trs}</tbody>
+                </table>`;
+        };
+
+        // Auto-load on page ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', dncSlipMonitorRefresh);
+        } else {
+            dncSlipMonitorRefresh();
+        }
+    })();
+    </script>
+    <?php
+    return ob_get_clean();
+}

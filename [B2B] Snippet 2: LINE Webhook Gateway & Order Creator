@@ -1,6 +1,25 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.8 (2026-04-24) — SLIP RESILIENCE + OBSERVABILITY (regression fix): ║
+ * ║    Incident: CNX MotoGear ส่งสลิป KKP 069 ยอด 2,280 THB → บอทเงียบ + หนี้ไม่ตัด    ║
+ * ║    Root cause candidates (observability ใหม่จะระบุใน production):                  ║
+ * ║      • Lock/queue stuck (persistent cache misconfig TTL)                           ║
+ * ║      • Slip2Go HTTP non-200 silent return (no retry)                               ║
+ * ║      • Unregistered group silent drop (ไม่มี admin alert)                          ║
+ * ║    Fixes:                                                                          ║
+ * ║      • Full try/finally wrapper — lock + slip_log ALWAYS written                   ║
+ * ║      • Lock TTL 30s → 60s (Slip2Go 45s timeout + buffer)                           ║
+ * ║      • Queue recursion fix — drain stale entries จนกว่าจะเจอ valid หรือ empty      ║
+ * ║      • Slip2Go retry 2 ครั้ง exponential backoff (200ms/800ms) เมื่อ HTTP non-200   ║
+ * ║        (ยกเว้น 429/401/403 — terminal errors)                                      ║
+ * ║      • Unregistered group ที่รับรูป → push admin Flex alert (group_id + user_id)   ║
+ * ║      • Slip2Go error threshold → push admin Flex "API มีปัญหา"                     ║
+ * ║      • ทุก decision point เขียน slip_log row (observability)                       ║
+ * ║      • NEW cron b2b_slip_lock_cleanup_cron (hourly — lock ค้าง >120s force clear)  ║
+ * ║      • NEW cron b2b_slip_queue_recovery_cron (twicedaily — queue เก่า >1hr alert + clear) ║
+ * ║    Companion: Snippet 1 V.34.8 (helpers) + Snippet 15 V.8.4 (schema)               ║
+ * ║    Companion: Admin Dashboard V.33.1 (Slip Monitor UI)                             ║
  * ║  Version: V.34.7 — Flash V.42 Phase 6 M7 compat audit: all b2b_flash_create_all_boxes ║
  * ║    calls routed through b2b_flash_dispatch_create_all() (Snippet 1 V.34.2).           ║
  * ║    Flag OFF / walk-in / missing helpers → falls back to legacy automatically.         ║
@@ -167,6 +186,38 @@ function b2b_process_line_webhook( WP_REST_Request $request ) {
                 $t = trim($event['message']['text'] ?? '');
                 if ( strpos($t, 'ขอไอดีกลุ่ม') !== false || strpos($t, 'ไอดีกลุ่ม') !== false || strtolower($t) === 'groupid' ) {
                     b2b_route_bot_command($t, $group_id, $user_id, $reply_token);
+                }
+            }
+            // V.34.8: Slip image from unregistered group → alert admin (ไม่ silent drop อีก)
+            // Rate-limit 1 alert/group/hour กัน spam (group_id หลายกลุ่ม broadcast)
+            elseif ( $type === 'message' && isset($event['message']['type']) && $event['message']['type'] === 'image' ) {
+                $alert_key = 'b2b_unreg_slip_alert_' . md5( (string) $group_id );
+                if ( ! get_transient( $alert_key ) ) {
+                    set_transient( $alert_key, 1, HOUR_IN_SECONDS );
+                    if ( function_exists( 'b2b_push_to_admin' ) ) {
+                        b2b_push_to_admin(
+                            "⚠️ สลิป/รูป มาจากกลุ่มที่ยังไม่ลงทะเบียน\n"
+                            . "Group ID: " . $group_id . "\n"
+                            . "User ID: " . ( $user_id ?: '-' ) . "\n"
+                            . "เวลา: " . ( function_exists('b2b_date') ? b2b_date('Y-m-d H:i:s') : date('Y-m-d H:i:s') ) . "\n\n"
+                            . "ตรวจสอบ:\n"
+                            . "• มี distributor CPT ที่ผูก group_id นี้หรือไม่?\n"
+                            . "• post_status ต้องเป็น 'publish' เท่านั้น (draft/pending/trash = ไม่เจอ)\n"
+                            . "• ถ้าเป็น B2F Maker → เช็ค maker group_id ใน ACF\n\n"
+                            . "ตอบกลับในกลุ่มผ่าน Admin Dashboard → Slip Monitor หรือ manual invoice"
+                        );
+                    }
+                    if ( function_exists( 'b2b_slip_log_insert' ) ) {
+                        b2b_slip_log_insert( array(
+                            'group_id'      => $group_id,
+                            'message_id'    => $msg_id,
+                            'user_id'       => $user_id,
+                            'result_status' => 'unregistered_group',
+                            'error_code'    => 'NO_DIST_MATCH',
+                            'error_msg'     => 'Group ไม่มี distributor CPT (หรือ B2F Maker) ผูกอยู่',
+                        ) );
+                    }
+                    b2b_log( '[Webhook] Unregistered group slip image — admin alerted group=' . $group_id );
                 }
             }
             continue;
@@ -2399,11 +2450,39 @@ function b2b_help_admin() {
 }
 
 // ════════════════════════════════════════════════════════════════
-// SLIP IMAGE HANDLER (V.7.4 API + V.7.5 Flex Output)
+// SLIP IMAGE HANDLER
+// V.34.8 (2026-04-24): RESILIENCE + OBSERVABILITY OVERHAUL
+//   - try/finally wrapper — lock + slip_log ALWAYS written (even on fatal)
+//   - Lock TTL 30s → 60s (Slip2Go 45s timeout + buffer)
+//   - Slip2Go retry 2x exponential backoff on HTTP non-200 (except 401/403/429)
+//   - slip_log row written at EVERY decision point (observability)
+//   - Queue recursion drains stale entries (was: stop on first stale → leak)
+//   - Slip2Go error threshold check → admin "API degraded" alert
+// V.7.4 API + V.7.5 Flex Output (preserved business logic)
 // ════════════════════════════════════════════════════════════════
 function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, $manual_mode = false ) {
     if ( !defined('B2B_ADMIN_GROUP_ID') || $group_id === B2B_ADMIN_GROUP_ID ) return;
-    if ( !defined('B2B_SLIP2GO_SECRET_KEY') ) return;
+    if ( !defined('B2B_SLIP2GO_SECRET_KEY') ) {
+        if ( function_exists( 'b2b_slip_log_insert' ) ) b2b_slip_log_insert( array(
+            'group_id'=>$group_id,'message_id'=>$message_id,'user_id'=>$user_id,
+            'result_status'=>'config_missing','error_code'=>'NO_SLIP2GO_KEY',
+            'error_msg'=>'B2B_SLIP2GO_SECRET_KEY ไม่ได้ define',
+        ) );
+        return;
+    }
+
+    // V.34.8: track timing + retry count + error state for slip_log
+    $_slip_t0         = microtime( true );
+    $_slip_retry      = 0;
+    $_slip_http_code  = null;
+    $_slip_final_status = 'unknown'; // จะถูกเขียนใน finally block
+    $_slip_final_error_code = '';
+    $_slip_final_error_msg  = '';
+    $_slip_final_code   = ''; // slip2go code
+    $_slip_final_amount = null;
+    $_slip_final_transref = '';
+    $_slip_final_sender = '';
+    $_slip_final_dist_id = null;
 
     // Helper: ถ้า reply_token ว่าง (queued slip) ใช้ push แทน
     $_slip_reply = function($msgs) use ($reply_token, $group_id) {
@@ -2425,12 +2504,26 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         // มีสลิปกำลังตรวจอยู่ → เก็บเข้า queue แล้ว cron ตรวจต่อ
         $queue = get_option('b2b_slip_queue_' . $group_id, array());
         $queue[] = array('message_id' => $message_id, 'user_id' => $user_id, 'time' => time());
+        // V.34.8: Cap queue size ป้องกัน unbounded growth (DoS defense)
+        if ( count( $queue ) > 50 ) {
+            // Keep only most recent 20 entries (drop oldest)
+            $queue = array_slice( $queue, -20 );
+            b2b_log( '[Slip] Queue trimmed to 20 (was >50) group=' . $group_id );
+        }
         update_option('b2b_slip_queue_' . $group_id, $queue, false);
         b2b_log('[Slip] Queued slip ' . $message_id . ' for group ' . $group_id . ' (queue size: ' . count($queue) . ')');
+        if ( function_exists( 'b2b_slip_log_insert' ) ) b2b_slip_log_insert( array(
+            'group_id'=>$group_id,'message_id'=>$message_id,'user_id'=>$user_id,
+            'result_status'=>'queued','error_code'=>'LOCK_HELD',
+            'error_msg'=>'มีสลิปกำลังตรวจอยู่ queue size=' . count( $queue ),
+        ) );
         return;
     }
-    set_transient($lock_key, 1, 30);
+    // V.34.8: lock TTL 30s → 60s (Slip2Go timeout 45s + buffer for retries)
+    set_transient($lock_key, 1, 60);
 
+    // V.34.8: try/finally wrapper — GUARANTEE lock release + audit row เสมอ
+    try {
     // B3: try/catch around LINE Content API
     try {
         $response = wp_remote_get('https://api-data.line.me/v2/bot/message/'.$message_id.'/content', array(
@@ -2439,12 +2532,25 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
     } catch ( Exception $e ) {
         b2b_log('[Slip LINE API Error] ' . $e->getMessage());
         $_slip_reply_text("⚠️ ระบบไม่สามารถดาวน์โหลดรูปได้ กรุณาลองใหม่ครับ");
-        delete_transient($lock_key);
+        $_slip_final_status = 'line_api_error';
+        $_slip_final_error_code = 'LINE_CONTENT_EXCEPTION';
+        $_slip_final_error_msg = $e->getMessage();
         return;
     }
-    if ( is_wp_error($response) ) { b2b_log('[Slip LINE API] wp_error: '.$response->get_error_message()); delete_transient($lock_key); return; }
+    if ( is_wp_error($response) ) {
+        b2b_log('[Slip LINE API] wp_error: '.$response->get_error_message());
+        $_slip_final_status = 'line_api_error';
+        $_slip_final_error_code = 'LINE_CONTENT_WP_ERROR';
+        $_slip_final_error_msg = $response->get_error_message();
+        return;
+    }
     $image_binary = wp_remote_retrieve_body($response);
-    if ( empty($image_binary) ) { delete_transient($lock_key); return; }
+    if ( empty($image_binary) ) {
+        $_slip_final_status = 'line_api_error';
+        $_slip_final_error_code = 'LINE_CONTENT_EMPTY';
+        $_slip_final_error_msg = 'LINE Content API คืน empty body';
+        return;
+    }
 
     // V.30.0: Detect actual MIME type instead of hardcoding jpeg
     $slip_content_type = wp_remote_retrieve_header($response, 'content-type');
@@ -2479,57 +2585,122 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         ? B2B_SLIP2GO_API_URL
         : 'https://connect.slip2go.com/api/verify-slip/qr-base64/info';
 
-    // B3: try/catch around Slip2Go API
-    try {
-        $slip_response = wp_remote_post($api_url, array(
-            'headers' => array(
-                'Authorization' => 'Bearer ' . B2B_SLIP2GO_SECRET_KEY,
-                'Content-Type'  => 'application/json',
-            ),
-            'body' => wp_json_encode(array(
-                'payload' => array(
-                    'imageBase64'    => $image_base64,
-                    'checkCondition' => $check_condition,
+    // V.34.8: Slip2Go API call with retry (2 extra attempts on transient errors)
+    // Retryable: HTTP 500/502/503/504 (server errors) + wp_error (network)
+    // Terminal:  HTTP 200 (success), 400/401/403 (auth/bad req), 429 (rate limit — wait cron)
+    $slip_response = null;
+    $http_code = 0;
+    $raw_body = '';
+    $slip = null;
+    $retry_schedule = array( 0, 200000, 800000 ); // μs (0 for first attempt, 200ms, 800ms)
+    $last_error_msg = '';
+
+    foreach ( $retry_schedule as $attempt_idx => $sleep_us ) {
+        if ( $sleep_us > 0 ) usleep( $sleep_us );
+        $_slip_retry = $attempt_idx;
+
+        try {
+            $slip_response = wp_remote_post( $api_url, array(
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . B2B_SLIP2GO_SECRET_KEY,
+                    'Content-Type'  => 'application/json',
                 ),
-            )),
-            'timeout' => 45,
-        ));
-    } catch ( Exception $e ) {
-        b2b_log('[Slip2Go API Error] ' . $e->getMessage());
-        $_slip_reply_text("⚠️ ระบบตรวจสลิปมีปัญหาชั่วคราว แอดมินจะตรวจสอบ Manual ครับ");
-        b2b_push_to_admin("⚠️ Slip2Go Exception: " . $e->getMessage() . "\nGroup: " . $group_id);
-        delete_transient($lock_key);
+                'body' => wp_json_encode( array(
+                    'payload' => array(
+                        'imageBase64'    => $image_base64,
+                        'checkCondition' => $check_condition,
+                    ),
+                ) ),
+                'timeout' => 45,
+            ) );
+        } catch ( Exception $e ) {
+            $last_error_msg = 'Exception: ' . $e->getMessage();
+            b2b_log( '[Slip2Go API Exception attempt=' . $attempt_idx . '] ' . $e->getMessage() );
+            continue; // retry
+        }
+
+        if ( is_wp_error( $slip_response ) ) {
+            $last_error_msg = 'wp_error: ' . $slip_response->get_error_message();
+            b2b_log( '[Slip2Go API wp_error attempt=' . $attempt_idx . '] ' . $slip_response->get_error_message() );
+            continue; // retry
+        }
+
+        $http_code = (int) wp_remote_retrieve_response_code( $slip_response );
+        $raw_body  = wp_remote_retrieve_body( $slip_response );
+        $_slip_http_code = $http_code;
+
+        // Terminal codes — ไม่ retry
+        if ( $http_code === 200 ) {
+            $slip = json_decode( $raw_body, true );
+            if ( is_array( $slip ) ) break; // success
+            $last_error_msg = 'HTTP 200 แต่ body ไม่ใช่ JSON valid';
+            b2b_log( '[Slip2Go invalid JSON attempt=' . $attempt_idx . '] body=' . mb_substr( $raw_body, 0, 200 ) );
+            break; // ไม่ retry (body corrupt — ไม่ transient)
+        }
+        if ( in_array( $http_code, array( 400, 401, 403, 429 ), true ) ) {
+            $last_error_msg = 'HTTP ' . $http_code . ' (terminal)';
+            b2b_log( '[Slip2Go HTTP ' . $http_code . ' terminal — no retry] body=' . mb_substr( $raw_body, 0, 200 ) );
+            break;
+        }
+        // Retryable 5xx
+        $last_error_msg = 'HTTP ' . $http_code;
+        b2b_log( '[Slip2Go HTTP ' . $http_code . ' retryable attempt=' . $attempt_idx . '] body=' . mb_substr( $raw_body, 0, 200 ) );
+    }
+
+    b2b_log( '[Slip] Final HTTP=' . $http_code . ' retries=' . $_slip_retry . ' Body=' . mb_substr( (string) $raw_body, 0, 500 ) );
+
+    // V.34.8: track Slip2Go health metric (admin alert if threshold exceeded)
+    if ( $http_code !== 200 || ! is_array( $slip ) ) {
+        // เพิ่ม error counter + alert admin ถ้าเจอ error ≥3 ครั้งใน 10 นาที
+        $err_count_key = 'b2b_slip2go_err_count';
+        $err_count = (int) get_transient( $err_count_key );
+        $err_count++;
+        set_transient( $err_count_key, $err_count, 10 * MINUTE_IN_SECONDS );
+        if ( $err_count >= 3 ) {
+            $alerted = get_transient( 'b2b_slip2go_alerted' );
+            if ( ! $alerted ) {
+                set_transient( 'b2b_slip2go_alerted', 1, HOUR_IN_SECONDS );
+                if ( function_exists( 'b2b_push_to_admin' ) ) {
+                    b2b_push_to_admin(
+                        "🚨 Slip2Go API มีปัญหา\n"
+                        . "Error ≥3 ครั้งใน 10 นาทีล่าสุด\n"
+                        . "HTTP code ล่าสุด: " . $http_code . "\n"
+                        . "ข้อความ: " . mb_substr( $last_error_msg, 0, 200 ) . "\n\n"
+                        . "เช็ค: Slip2Go dashboard (quota/status)\n"
+                        . "ระบบจะใช้ manual mode จนกว่า API จะกลับมา"
+                    );
+                }
+            }
+        }
+
+        // แจ้ง user ถ้ายังไม่ได้ reply
+        if ( $http_code === 0 || in_array( $http_code, array( 500, 502, 503, 504 ), true ) ) {
+            $_slip_reply_text( "⚠️ ระบบตรวจสลิปมีปัญหาชั่วคราว แอดมินจะตรวจสอบ Manual ครับ" );
+        }
+        // http 404 / 422 / etc. — เงียบ (อาจไม่ใช่สลิป)
+
+        $_slip_final_status = 'slip2go_error';
+        $_slip_final_error_code = 'HTTP_' . $http_code;
+        $_slip_final_error_msg  = $last_error_msg;
         return;
     }
 
-    if ( is_wp_error($slip_response) ) {
-        b2b_log('[Slip] wp_error: '.$slip_response->get_error_message());
-        $_slip_reply_text("⚠️ ระบบตรวจสลิปมีปัญหาชั่วคราว แอดมินจะตรวจสอบ Manual ครับ");
-        delete_transient($lock_key);
-        return;
-    }
-
-    $http_code = wp_remote_retrieve_response_code($slip_response);
-    $raw_body = wp_remote_retrieve_body($slip_response);
-    $slip = json_decode($raw_body, true);
-    b2b_log('[Slip] HTTP='.$http_code.' Body='.mb_substr($raw_body, 0, 500));
-
-    if ( $http_code !== 200 || !is_array($slip) ) {
-        // ไม่ตอบในห้อง — อาจไม่ใช่สลิป หรือ API มีปัญหา
-        b2b_log('[Slip] API error HTTP=' . $http_code . ' group=' . $group_id);
-        delete_transient($lock_key);
-        return;
-    }
+    // V.34.8: reset Slip2Go error counter on success
+    delete_transient( 'b2b_slip2go_err_count' );
+    delete_transient( 'b2b_slip2go_alerted' );
 
     $slip_code = isset($slip['code']) ? $slip['code'] : '';
+    $_slip_final_code = $slip_code;
 
     if ( $slip_code === '200501' ) {
         $data = isset($slip['data']) ? $slip['data'] : array();
         $paid = floatval($data['amount'] ?? 0);
         $trans_ref = sanitize_text_field($data['transRef'] ?? '');
+        $_slip_final_amount = $paid;
+        $_slip_final_transref = $trans_ref;
         $_slip_reply_text("⚠️ สลิปนี้เคยใช้แล้ว!\nTransRef: ".$trans_ref."\nยอด: ฿".number_format($paid,2)."\n\nกรุณาส่งสลิปใหม่ครับ");
         b2b_push_to_admin("🔴 สลิปซ้ำ! TransRef: ".$trans_ref."\nยอด: ฿".number_format($paid,2)."\nGroup: ".$group_id);
-        delete_transient($lock_key);
+        $_slip_final_status = 'duplicate';
         return;
     }
 
@@ -2538,9 +2709,11 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         $paid = floatval($data['amount'] ?? 0);
         $sender = sanitize_text_field($data['sender']['account']['name'] ?? 'ไม่ระบุ');
         $recv   = sanitize_text_field($data['receiver']['account']['name'] ?? '');
+        $_slip_final_amount = $paid;
+        $_slip_final_sender = $sender;
         $_slip_reply_text("⚠️ สลิปนี้โอนไปบัญชีอื่น ไม่ใช่บัญชี DINOCO\nผู้รับ: ".$recv."\nยอด: ฿".number_format($paid,2)."\n\nกรุณาตรวจสอบและส่งสลิปที่ถูกต้องครับ");
         b2b_push_to_admin("🟡 สลิปบัญชีไม่ตรง\nผู้โอน: ".$sender."\nผู้รับ: ".$recv."\nยอด: ฿".number_format($paid,2)."\nGroup: ".$group_id);
-        delete_transient($lock_key);
+        $_slip_final_status = 'receiver_mismatch';
         return;
     }
 
@@ -2548,9 +2721,11 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         $data = isset($slip['data']) ? $slip['data'] : array();
         $paid = floatval($data['amount'] ?? 0);
         $sender = sanitize_text_field($data['sender']['account']['name'] ?? 'ไม่ระบุ');
+        $_slip_final_amount = $paid;
+        $_slip_final_sender = $sender;
         $_slip_reply_text("⚠️ ยอดโอนไม่ตรงเงื่อนไข\nผู้โอน: ".$sender."\nยอด: ฿".number_format($paid,2)."\n\nกรุณาตรวจสอบครับ");
         b2b_push_to_admin("🟡 ยอดโอนไม่ตรง\nผู้โอน: ".$sender."\nยอด: ฿".number_format($paid,2)."\nGroup: ".$group_id);
-        delete_transient($lock_key);
+        $_slip_final_status = 'amount_mismatch';
         return;
     }
 
@@ -2558,7 +2733,7 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         // ไม่ตอบในห้อง — รูปอาจไม่ใช่สลิป (รูปสินค้า, ใบเสร็จ, รูปแชท, etc.)
         // ถ้า reply จะทำให้คนส่งรูปอื่นๆ สับสน
         b2b_log('[Slip] 200404 — ไม่ใช่สลิปหรือสลิปปลอม, group=' . $group_id);
-        delete_transient($lock_key);
+        $_slip_final_status = 'not_slip';
         return;
     }
 
@@ -2567,40 +2742,50 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         if ( empty($data) || !isset($data['amount']) ) {
             $_slip_reply_text("⚠️ ระบบตรวจสลิปมีปัญหาชั่วคราว กรุณารอแอดมินตรวจสอบครับ 🙏");
             b2b_push_to_admin("⚠️ Slip2go data missing (code=".$slip_code.")\nGroup: ".$group_id);
-            delete_transient($lock_key);
+            $_slip_final_status = 'data_missing';
+            $_slip_final_error_msg = 'Slip2Go code=' . $slip_code . ' แต่ data หาย';
             return;
         }
         $paid   = floatval($data['amount']);
         $sender = sanitize_text_field($data['sender']['account']['name'] ?? 'ไม่ระบุ');
         $recv   = sanitize_text_field($data['receiver']['account']['name'] ?? '');
         $trans_ref = sanitize_text_field($data['transRef'] ?? '');
+        $_slip_final_amount = $paid;
+        $_slip_final_sender = $sender;
+        $_slip_final_transref = $trans_ref;
 
         $cond = isset($slip['conditionResult']) ? $slip['conditionResult'] : null;
         $is_dup = ($cond && isset($cond['isDuplicate']) && $cond['isDuplicate'] === true);
         $recv_valid = ($cond && isset($cond['isReceiverValid']) && $cond['isReceiverValid'] === true);
 
         // FIX H-5: Local trans_ref duplicate check (don't rely on API alone)
+        // V.34.8: expand check ไปครอบ wp_dinoco_slip_log (forensic dedup สำหรับ slip ที่ process สำเร็จแล้วแต่ไม่ได้ผูก order)
         if ($trans_ref) {
-            $local_dup = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>1,'post_status'=>'publish',
-                'meta_query'=>array(array('key'=>'_slip_trans_ref','value'=>$trans_ref)),
-                'fields'=>'ids'));
-            if (!empty($local_dup)) { $is_dup = true; }
+            if ( function_exists( 'b2b_slip_is_trans_ref_seen' ) && b2b_slip_is_trans_ref_seen( $trans_ref ) ) {
+                $is_dup = true;
+            } else {
+                $local_dup = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>1,'post_status'=>'publish',
+                    'meta_query'=>array(array('key'=>'_slip_trans_ref','value'=>$trans_ref)),
+                    'fields'=>'ids'));
+                if (!empty($local_dup)) { $is_dup = true; }
+            }
         }
         if ($is_dup) {
             $_slip_reply_text("⚠️ สลิปนี้เคยใช้แล้ว!\nTransRef: ".$trans_ref."\nยอด: ฿".number_format($paid,2)."\n\nกรุณาส่งสลิปใหม่ครับ");
             b2b_push_to_admin("🔴 สลิปซ้ำ! TransRef: ".$trans_ref."\nยอด: ฿".number_format($paid,2)."\nGroup: ".$group_id);
-            delete_transient($lock_key);
+            $_slip_final_status = 'duplicate';
             return;
         }
         if ($cond && isset($cond['isReceiverValid']) && !$recv_valid) {
             $_slip_reply_text("⚠️ สลิปนี้โอนไปบัญชีอื่น ไม่ใช่บัญชี DINOCO\nผู้รับ: ".$recv."\nยอด: ฿".number_format($paid,2)."\n\nกรุณาตรวจสอบและส่งสลิปที่ถูกต้องครับ");
             b2b_push_to_admin("🟡 สลิปบัญชีไม่ตรง\nผู้โอน: ".$sender."\nผู้รับ: ".$recv."\nยอด: ฿".number_format($paid,2)."\nGroup: ".$group_id);
-            delete_transient($lock_key);
+            $_slip_final_status = 'receiver_mismatch';
             return;
         }
 
         $dist = b2b_get_dist_by_group($group_id);
         if ($dist) {
+            $_slip_final_dist_id = (int) $dist->ID;
             // FIX S-1: Pre-validate — เช็คว่ายอดสลิป match กับบิลค้างชำระของร้านนี้หรือไม่
             // ป้องกันกรณีเจ้าของหลายร้านส่งสลิปผิดห้อง (เช่น ร้าน A ส่งสลิปของร้าน B)
             $old_debt = floatval(get_field('current_debt', $dist->ID));
@@ -2638,14 +2823,9 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
                     b2b_push_to_admin("⚠️ สลิปไม่ match กับบิลของร้าน\nร้าน: " . $dist_name_warn . "\nยอดสลิป: ฿" . number_format($paid, 2) . "\nยอดค้างร้านนี้: ฿" . number_format($total_pending, 2) . "\nผู้โอน: " . $sender . "\nRef: " . $trans_ref . "\nGroup: " . $group_id);
                 }
                 b2b_log('[Slip] BLOCKED — amount ฿' . number_format($paid, 2) . ' does not match pending ฿' . number_format($total_pending, 2) . ' for dist=' . $dist->ID . ' group=' . $group_id);
-                delete_transient($lock_key);
-                // ── Process queued slips ──
-                $queue = get_option('b2b_slip_queue_' . $group_id, array());
-                if (!empty($queue)) {
-                    $next = array_shift($queue);
-                    update_option('b2b_slip_queue_' . $group_id, $queue, false);
-                    b2b_handle_slip_image($next['message_id'], $group_id, $next['user_id'], '', $manual_mode);
-                }
+                // V.34.8: ไม่ recurse queue ที่นี่อีกต่อไป — finally block จะ drain queue (ลบ dup code)
+                $_slip_final_status = 'amount_no_pending';
+                $_slip_final_error_msg = 'paid=' . $paid . ' pending=' . $total_pending;
                 return;
             }
 
@@ -2679,6 +2859,9 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
 
             $dist_name = get_the_title($dist->ID);
             $credit_limit = floatval(get_field('credit_limit', $dist->ID));
+
+            // V.34.8: mark slip as paid in audit log (track success)
+            $_slip_final_status = ( $overpaid_amount > 0 ) ? 'paid_overpayment' : 'paid';
 
             $match_result = b2b_auto_mark_paid_after_slip($dist->ID, $paid, $group_id);
             $paid_tickets = $match_result['paid_tickets'];
@@ -2843,28 +3026,76 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
             }
         } else {
             $_slip_reply_text("✅ สลิปถูกต้อง ฿".number_format($paid,2)."\nแต่ไม่พบร้านค้าในระบบ แอดมินจะตรวจสอบครับ");
+            $_slip_final_status = 'no_distributor';
+            $_slip_final_error_msg = 'Slip2Go คืนยอด ฿' . $paid . ' แต่ไม่เจอ distributor CPT';
         }
     } else {
         // Unknown slip code — เงียบ ไม่ตอบในห้อง (อาจไม่ใช่สลิป)
         $code = isset($slip['code']) ? $slip['code'] : 'UNKNOWN';
         b2b_log('[Slip] Unknown code=' . $code . ' group=' . $group_id);
+        $_slip_final_status = 'unknown_slip_code';
+        $_slip_final_error_code = 'SLIP2GO_UNKNOWN_CODE';
+        $_slip_final_error_msg  = 'slip2go.code=' . $code;
     }
 
-    // Release lock แล้วตรวจ queue ต่อ
-    delete_transient($lock_key);
+    } finally {
+        // V.34.8: GUARANTEED cleanup — run ไม่ว่าอะไรจะเกิดขึ้น (success, return, exception)
+        //   1. Release lock ก่อนเสมอ (ป้องกัน lock ค้าง)
+        //   2. Write slip_log audit row (observability + forensic)
+        //   3. Drain queue (loop + skip stale — was bug: stop on first stale)
+        try {
+            delete_transient( $lock_key );
+        } catch ( \Throwable $e ) { /* silent */ }
 
-    // Process queued slips (ส่งมาตอนกำลังตรวจอันก่อนหน้า)
-    $queue = get_option('b2b_slip_queue_' . $group_id, array());
-    if (!empty($queue)) {
-        $next = array_shift($queue);
-        update_option('b2b_slip_queue_' . $group_id, $queue, false);
-        if (!empty($next['message_id']) && (time() - $next['time']) < 300) {
-            b2b_log('[Slip] Processing queued slip ' . $next['message_id'] . ' for group ' . $group_id);
-            b2b_handle_slip_image($next['message_id'], $group_id, $next['user_id'], '', $manual_mode);
+        // Write audit row
+        try {
+            if ( function_exists( 'b2b_slip_log_insert' ) ) {
+                $elapsed_ms = (int) round( ( microtime( true ) - $_slip_t0 ) * 1000 );
+                b2b_slip_log_insert( array(
+                    'group_id'           => $group_id,
+                    'message_id'         => $message_id,
+                    'user_id'            => $user_id,
+                    'dist_id'            => $_slip_final_dist_id,
+                    'slip_code'          => $_slip_final_code,
+                    'amount'             => $_slip_final_amount,
+                    'trans_ref'          => $_slip_final_transref,
+                    'sender_name'        => $_slip_final_sender,
+                    'result_status'      => $_slip_final_status,
+                    'error_code'         => $_slip_final_error_code,
+                    'error_msg'          => $_slip_final_error_msg,
+                    'http_code'          => $_slip_http_code,
+                    'processing_time_ms' => $elapsed_ms,
+                    'retry_count'        => $_slip_retry,
+                ) );
+            }
+        } catch ( \Throwable $e ) { /* silent */ }
+
+        // Drain queue — loop + skip stale (V.34.8 bug fix H-A1)
+        // Bug เดิม: ถ้า top of queue เป็น stale (>300s) → return ไม่ recurse → stale items ค้าง forever
+        // Fix: loop shift + skip stale จนกว่าจะเจอ valid entry หรือ queue empty
+        try {
+            $queue = get_option( 'b2b_slip_queue_' . $group_id, array() );
+            $next_valid = null;
+            while ( ! empty( $queue ) ) {
+                $candidate = array_shift( $queue );
+                if ( ! empty( $candidate['message_id'] ) && ( time() - (int) ( $candidate['time'] ?? 0 ) ) < 300 ) {
+                    $next_valid = $candidate;
+                    break;
+                }
+                b2b_log( '[Slip] Skipped stale queue entry msg=' . ( $candidate['message_id'] ?? '-' ) . ' age=' . ( time() - (int) ( $candidate['time'] ?? 0 ) ) . 's' );
+            }
+            update_option( 'b2b_slip_queue_' . $group_id, $queue, false );
+            if ( empty( $queue ) ) delete_option( 'b2b_slip_queue_' . $group_id );
+
+            if ( $next_valid ) {
+                b2b_log( '[Slip] Processing queued slip ' . $next_valid['message_id'] . ' for group ' . $group_id );
+                // Recurse (note: lock already released → next call will acquire fresh lock)
+                b2b_handle_slip_image( $next_valid['message_id'], $group_id, $next_valid['user_id'], '', $manual_mode );
+            }
+        } catch ( \Throwable $e ) {
+            b2b_log( '[Slip] Queue drain exception: ' . $e->getMessage() );
         }
     }
-    // ลบ queue ว่าง
-    if (empty($queue)) delete_option('b2b_slip_queue_' . $group_id);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -3920,3 +4151,128 @@ function b2b_walkin_auto_complete( $order_id, $from_status, $to_status, $actor )
     unset($processing[$order_id]);
 }
 }
+
+// ════════════════════════════════════════════════════════════════
+// V.34.8: SLIP RESILIENCE CRONS
+// Self-healing: lock cleanup (hourly) + queue recovery (twicedaily)
+// ════════════════════════════════════════════════════════════════
+
+if ( ! wp_next_scheduled( 'b2b_slip_lock_cleanup_cron' ) ) {
+    wp_schedule_event( time() + 300, 'hourly', 'b2b_slip_lock_cleanup_cron' );
+}
+if ( ! wp_next_scheduled( 'b2b_slip_queue_recovery_cron' ) ) {
+    wp_schedule_event( time() + 600, 'twicedaily', 'b2b_slip_queue_recovery_cron' );
+}
+
+if ( ! function_exists( 'b2b_slip_lock_cleanup_handler' ) ) {
+    /**
+     * Hourly — ล้าง slip_lock transient ที่ค้างเกิน 120s (ไม่ควรเกิน 60s + buffer)
+     * ถ้าเจอ lock ค้าง = daemon crash กลางคัน หรือ persistent cache misconfig
+     * Alert admin + force-unlock
+     */
+    function b2b_slip_lock_cleanup_handler() {
+        global $wpdb;
+        if ( ! $wpdb ) return;
+
+        // Scan wp_options สำหรับ _transient_timeout_b2b_slip_lock_* ที่ expired มากกว่า 120s
+        $now = time();
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT option_name, option_value FROM {$wpdb->options}
+             WHERE option_name LIKE %s",
+            $wpdb->esc_like( '_transient_timeout_b2b_slip_lock_' ) . '%'
+        ) );
+
+        if ( empty( $rows ) ) return;
+
+        $cleared = 0;
+        $groups = array();
+        foreach ( $rows as $r ) {
+            $expires_at = (int) $r->option_value;
+            // Lock ที่ expired มาแล้ว >120s = ค้าง (persistent cache misconfig)
+            if ( $expires_at > 0 && ( $now - $expires_at ) > 120 ) {
+                $gid = substr( $r->option_name, strlen( '_transient_timeout_b2b_slip_lock_' ) );
+                if ( $gid === '' ) continue;
+                delete_transient( 'b2b_slip_lock_' . $gid );
+                $cleared++;
+                $groups[] = $gid;
+            }
+        }
+
+        if ( $cleared > 0 ) {
+            b2b_log( '[SlipCron] Lock cleanup: cleared ' . $cleared . ' stuck locks (groups=' . implode( ',', array_slice( $groups, 0, 5 ) ) . ')' );
+            if ( function_exists( 'b2b_push_to_admin' ) ) {
+                b2b_push_to_admin(
+                    "🔧 Slip Lock Recovery (auto)\n"
+                    . "เจอ lock ค้าง " . $cleared . " groups → force-unlock แล้ว\n"
+                    . "สาเหตุที่เป็นไปได้: persistent cache misconfig (Redis TTL) หรือ daemon crash"
+                );
+            }
+        }
+    }
+}
+add_action( 'b2b_slip_lock_cleanup_cron', 'b2b_slip_lock_cleanup_handler' );
+
+if ( ! function_exists( 'b2b_slip_queue_recovery_handler' ) ) {
+    /**
+     * Twicedaily — ล้าง slip_queue options ที่มี entry เก่า >1hr
+     * Alert admin ถ้าเจอ queue ที่มีรายการตกค้าง (bug หรือ user spam)
+     */
+    function b2b_slip_queue_recovery_handler() {
+        global $wpdb;
+        if ( ! $wpdb ) return;
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT option_name, option_value FROM {$wpdb->options}
+             WHERE option_name LIKE %s",
+            $wpdb->esc_like( 'b2b_slip_queue_' ) . '%'
+        ) );
+
+        if ( empty( $rows ) ) return;
+
+        $now = time();
+        $stale_groups = array();
+        $cleared = 0;
+        foreach ( $rows as $r ) {
+            $gid = substr( $r->option_name, strlen( 'b2b_slip_queue_' ) );
+            if ( $gid === '' ) continue;
+            $queue = maybe_unserialize( $r->option_value );
+            if ( ! is_array( $queue ) || empty( $queue ) ) {
+                delete_option( $r->option_name ); // empty array → clean up
+                continue;
+            }
+            // Check if oldest entry is >1hr stale
+            $oldest = PHP_INT_MAX;
+            foreach ( $queue as $q ) {
+                $t = (int) ( $q['time'] ?? 0 );
+                if ( $t > 0 && $t < $oldest ) $oldest = $t;
+            }
+            if ( $oldest < PHP_INT_MAX && ( $now - $oldest ) > 3600 ) {
+                $stale_groups[] = array(
+                    'group_id' => $gid,
+                    'queue_size' => count( $queue ),
+                    'oldest_age_min' => round( ( $now - $oldest ) / 60 ),
+                );
+                // Auto-clear (stale queue = bug or abandoned)
+                delete_option( $r->option_name );
+                $cleared++;
+            }
+        }
+
+        if ( ! empty( $stale_groups ) ) {
+            $lines = array();
+            foreach ( array_slice( $stale_groups, 0, 5 ) as $g ) {
+                $lines[] = '• group=' . substr( $g['group_id'], 0, 15 ) . '... size=' . $g['queue_size'] . ' age=' . $g['oldest_age_min'] . 'min';
+            }
+            b2b_log( '[SlipCron] Queue recovery: cleared ' . $cleared . ' stale queues' );
+            if ( function_exists( 'b2b_push_to_admin' ) ) {
+                b2b_push_to_admin(
+                    "🔧 Slip Queue Recovery (auto)\n"
+                    . "เจอ queue ค้าง " . $cleared . " groups (เก่า >1hr)\n"
+                    . implode( "\n", $lines ) . "\n\n"
+                    . "Queue ถูกล้างแล้ว — ถ้าบ่อย อาจเป็นเพราะ Slip2Go degraded นาน"
+                );
+            }
+        }
+    }
+}
+add_action( 'b2b_slip_queue_recovery_cron', 'b2b_slip_queue_recovery_handler' );

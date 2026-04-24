@@ -1,6 +1,15 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.8 (2026-04-24) — Slip Resilience helpers:               ║
+ * ║    • NEW b2b_slip_log_insert() — single-call audit row writer         ║
+ * ║      (non-throwing, best-effort, graceful degrade if table missing)   ║
+ * ║    • NEW b2b_slip_clear_locks($group_id) — admin force-unlock helper  ║
+ * ║      (release transient + truncate queue option + log reason)         ║
+ * ║    • NEW b2b_slip_is_trans_ref_seen($trans_ref) — forensic dedup      ║
+ * ║      (checks both slip_log + postmeta _slip_trans_ref)                ║
+ * ║    • Purpose: support Snippet 2 V.34.8 slip handler hardening         ║
+ * ║      (regression 2026-04-24 — CNX MotoGear slip silent drop)          ║
  * ║  Version: V.34.7 (2026-04-21) — Round 3 cleanup:                       ║
  * ║    • H-1: DLQ retry endpoint GET_LOCK (prevents double-retry          ║
  * ║          race = double Flash order from concurrent admin panic clicks)║
@@ -960,6 +969,176 @@ if ( ! function_exists( 'b2b_push_to_admin' ) ) {
 if ( ! function_exists( 'b2b_push_raw_to_admin' ) ) {
     function b2b_push_raw_to_admin( $messages ) { if ( defined('B2B_ADMIN_GROUP_ID') ) b2b_line_push_raw( B2B_ADMIN_GROUP_ID, $messages ); }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// V.34.8: SLIP RESILIENCE HELPERS (Snippet 2 V.34.8 companion)
+// ═══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
+    /**
+     * Insert audit row ใน wp_dinoco_slip_log — best-effort (ไม่ throw)
+     * เรียกจากทุก decision point ใน b2b_handle_slip_image
+     *
+     * @param array $row assoc array: group_id, message_id, user_id, dist_id,
+     *                   slip_code, amount, trans_ref, sender_name,
+     *                   result_status, error_code, error_msg,
+     *                   http_code, processing_time_ms, retry_count
+     * @return int|false insert id หรือ false ถ้า fail
+     */
+    function b2b_slip_log_insert( $row ) {
+        global $wpdb;
+        if ( ! $wpdb ) return false;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+
+        // Defensive: ถ้า table ยังไม่ถูกสร้าง (Snippet 15 init ยังไม่ fire) — ข้าม ไม่ fatal
+        static $table_exists = null;
+        if ( $table_exists === null ) {
+            $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        }
+        if ( ! $table_exists ) return false;
+
+        $defaults = array(
+            'group_id'           => '',
+            'message_id'         => '',
+            'user_id'            => '',
+            'dist_id'            => null,
+            'slip_code'          => '',
+            'amount'             => null,
+            'trans_ref'          => '',
+            'sender_name'        => '',
+            'result_status'      => '',
+            'error_code'         => '',
+            'error_msg'          => '',
+            'http_code'          => null,
+            'processing_time_ms' => null,
+            'retry_count'        => 0,
+            'created_at'         => current_time( 'mysql' ),
+        );
+        $row = array_merge( $defaults, is_array( $row ) ? $row : array() );
+
+        // Truncate long fields เพื่อกัน error
+        $row['group_id']    = substr( (string) $row['group_id'], 0, 100 );
+        $row['message_id']  = substr( (string) $row['message_id'], 0, 64 );
+        $row['user_id']     = substr( (string) $row['user_id'], 0, 64 );
+        $row['slip_code']   = substr( (string) $row['slip_code'], 0, 16 );
+        $row['trans_ref']   = substr( (string) $row['trans_ref'], 0, 100 );
+        $row['sender_name'] = substr( (string) $row['sender_name'], 0, 200 );
+        $row['result_status'] = substr( (string) $row['result_status'], 0, 32 );
+        $row['error_code']  = substr( (string) $row['error_code'], 0, 32 );
+        $row['error_msg']   = substr( (string) $row['error_msg'], 0, 500 );
+
+        $ok = $wpdb->insert( $table, $row );
+        if ( $ok === false ) {
+            if ( function_exists( 'b2b_log' ) ) b2b_log( '[SlipLog] INSERT fail: ' . $wpdb->last_error );
+            return false;
+        }
+        return (int) $wpdb->insert_id;
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_clear_locks' ) ) {
+    /**
+     * Force-unlock + drain queue สำหรับ 1 group หรือ all groups
+     * เรียกจาก Admin Slip Monitor button / emergency cron recovery
+     *
+     * @param string $group_id '' = clear all, otherwise specific group
+     * @param string $reason  audit trail reason (default 'admin_manual')
+     * @return array { cleared_locks: int, cleared_queues: int, groups: array }
+     */
+    function b2b_slip_clear_locks( $group_id = '', $reason = 'admin_manual' ) {
+        global $wpdb;
+        $cleared_locks = 0;
+        $cleared_queues = 0;
+        $groups = array();
+
+        if ( $group_id !== '' ) {
+            if ( get_transient( 'b2b_slip_lock_' . $group_id ) ) {
+                delete_transient( 'b2b_slip_lock_' . $group_id );
+                $cleared_locks++;
+            }
+            $q = get_option( 'b2b_slip_queue_' . $group_id, array() );
+            if ( ! empty( $q ) ) {
+                delete_option( 'b2b_slip_queue_' . $group_id );
+                $cleared_queues++;
+            }
+            $groups[] = $group_id;
+        } else {
+            // Clear all groups — scan wp_options for slip_queue_* + transients
+            $prefix = $wpdb->esc_like( 'b2b_slip_queue_' );
+            $rows = $wpdb->get_col( $wpdb->prepare(
+                "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
+                $prefix . '%'
+            ) );
+            foreach ( $rows as $opt_name ) {
+                $gid = substr( $opt_name, strlen( 'b2b_slip_queue_' ) );
+                if ( $gid === '' ) continue;
+                delete_option( $opt_name );
+                $cleared_queues++;
+                if ( get_transient( 'b2b_slip_lock_' . $gid ) ) {
+                    delete_transient( 'b2b_slip_lock_' . $gid );
+                    $cleared_locks++;
+                }
+                $groups[] = $gid;
+            }
+            // Also scan transients table for orphan locks (queue เคลียร์แล้วแต่ lock ค้าง)
+            $lock_prefix = $wpdb->esc_like( '_transient_b2b_slip_lock_' );
+            $lock_rows = $wpdb->get_col( $wpdb->prepare(
+                "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
+                $lock_prefix . '%'
+            ) );
+            foreach ( $lock_rows as $opt_name ) {
+                $gid = substr( $opt_name, strlen( '_transient_b2b_slip_lock_' ) );
+                if ( $gid === '' ) continue;
+                if ( ! in_array( $gid, $groups, true ) ) {
+                    delete_transient( 'b2b_slip_lock_' . $gid );
+                    $cleared_locks++;
+                    $groups[] = $gid;
+                }
+            }
+        }
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( '[Slip] ClearLocks reason=' . $reason . ' locks=' . $cleared_locks . ' queues=' . $cleared_queues . ' groups=' . implode( ',', $groups ) );
+        }
+        return array( 'cleared_locks' => $cleared_locks, 'cleared_queues' => $cleared_queues, 'groups' => $groups );
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_is_trans_ref_seen' ) ) {
+    /**
+     * Forensic dedup check: trans_ref เคยถูก process แล้วหรือยัง
+     * ตรวจ 2 sources: wp_dinoco_slip_log + postmeta _slip_trans_ref
+     *
+     * @param string $trans_ref
+     * @return bool
+     */
+    function b2b_slip_is_trans_ref_seen( $trans_ref ) {
+        if ( empty( $trans_ref ) ) return false;
+        global $wpdb;
+        $trans_ref = (string) $trans_ref;
+
+        // Check slip_log (any successful/paid row within 30 days)
+        $log_table = $wpdb->prefix . 'dinoco_slip_log';
+        static $log_table_exists = null;
+        if ( $log_table_exists === null ) {
+            $log_table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $log_table ) );
+        }
+        if ( $log_table_exists ) {
+            $hit = $wpdb->get_var( $wpdb->prepare(
+                "SELECT id FROM {$log_table} WHERE trans_ref = %s AND result_status IN ('paid','paid_overpayment','duplicate') LIMIT 1",
+                $trans_ref
+            ) );
+            if ( $hit ) return true;
+        }
+
+        // Check postmeta (orders that stamped trans_ref)
+        $hit2 = $wpdb->get_var( $wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_slip_trans_ref' AND meta_value = %s LIMIT 1",
+            $trans_ref
+        ) );
+        return ! empty( $hit2 );
+    }
+}
+
 if ( ! function_exists( 'b2b_get_bank_info' ) ) {
     /**
      * V.32.0: รองรับ walk-in bank account — ถ้า order เป็น walk-in + มี B2B_WALKIN_BANK_ACCOUNT จะใช้บัญชี walk-in
