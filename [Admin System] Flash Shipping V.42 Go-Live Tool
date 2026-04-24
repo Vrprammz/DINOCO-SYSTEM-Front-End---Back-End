@@ -2,6 +2,13 @@
  * File: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Template Name: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Shortcode: [dinoco_flash_v42_golive]
+ * Version: V.1.4 (2026-04-21) — Round 4 deep review fixes:
+ *   • H-NEW-1: _inflight Set includes body.sku discriminator — save-pack-slots
+ *              for SKU_A no longer blocks parallel save for SKU_B
+ *   • H-NEW-2: /save-pack-slots validates count(slots) === boxes_per_unit
+ *              (prevents partial coverage from malicious/broken client)
+ *   • M-NEW-1: Coverage SQL — bulk_pack requires weight_per_unit_g > 0
+ *              (matches V.8.2 H-D2 resolver semantics)
  * Version: V.1.3 (2026-04-21) — Round 3 cleanup:
  *                                • H-2: in-flight guard (_inflight Set) prevents
  *                                  double-POST from panic clicks on flip/apply buttons
@@ -236,15 +243,18 @@ if ( ! function_exists( 'dinoco_fsv42_coverage' ) ) {
         // Total active SKUs
         $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$products_tbl} WHERE is_active=1" );
 
-        // V.1.2 H-D1: Complete must have concrete data per pack_mode
-        //   - single_box / bulk_pack / assembled_set → must have box_template_id
+        // V.1.2 H-D1 + V.1.4 M-NEW-1: Complete must have concrete data per pack_mode
+        //   - single_box / assembled_set → must have box_template_id
+        //   - bulk_pack → must have box_template_id AND weight_per_unit_g > 0
+        //     (matches V.8.2 H-D2 resolver: bulk_pack falls back to defaults when missing)
         //   - multi_box → must have at least 1 pack_slots row (NOT default fallback)
         //   - unknown → must have weight_grams > 0
         //   - any mode → plain dims (L/W/H + weight) also counts as complete
         $complete = (int) $wpdb->get_var( "
             SELECT COUNT(*) FROM {$products_tbl} p
             WHERE p.is_active=1 AND (
-                (p.pack_mode IN ('single_box','bulk_pack','assembled_set') AND p.box_template_id IS NOT NULL)
+                (p.pack_mode IN ('single_box','assembled_set') AND p.box_template_id IS NOT NULL)
+                OR (p.pack_mode = 'bulk_pack' AND p.box_template_id IS NOT NULL AND p.weight_per_unit_g > 0)
                 OR (p.pack_mode = 'multi_box' AND EXISTS (SELECT 1 FROM {$wpdb->prefix}dinoco_pack_slots s WHERE s.product_sku = p.sku))
                 OR (p.pack_mode = 'unknown' AND p.weight_grams > 0)
                 OR (p.weight_grams > 0 AND p.length_cm > 0 AND p.width_cm > 0 AND p.height_cm > 0)
@@ -527,6 +537,22 @@ add_action( 'rest_api_init', function() {
                 $sku
             ) );
             if ( ! $prod ) return new WP_Error( 'sku_not_found', 'SKU not found or inactive', array( 'status' => 404 ) );
+
+            // V.1.4 H-NEW-2: slot count MUST equal boxes_per_unit (prevents partial
+            // coverage from malicious/broken client that submits fewer slots than needed).
+            $expected_bpu = max( 2, intval( $prod->boxes_per_unit ) );
+            $actual_slots = count( $slots );
+            if ( $actual_slots !== $expected_bpu ) {
+                return new WP_Error(
+                    'slot_count_mismatch',
+                    sprintf( 'SKU bpu=%d แต่ส่งมา %d slots — ต้องตรงกัน', $expected_bpu, $actual_slots ),
+                    array(
+                        'status'       => 400,
+                        'expected_bpu' => $expected_bpu,
+                        'got_slots'    => $actual_slots,
+                    )
+                );
+            }
 
             // Transaction wrap: replace all slots
             $wpdb->query( 'START TRANSACTION' );
@@ -975,15 +1001,18 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
     const base = '/wp-json/dinoco-flash-golive/v1';
 
     // V.1.3 H-2 FIX: in-flight guard prevents duplicate POSTs from double-click.
-    // Keyed by path+method so different ops can run in parallel but same op serializes.
+    // V.1.4 H-NEW-1: key includes body.sku discriminator when present so save-pack-slots
+    //   for SKU_A doesn't block parallel save for SKU_B. Endpoints without SKU in body
+    //   (flip-flag, auto-detect-all, bulk-assign-defaults) still serialize on method+path.
     const _inflight = new Set();
     const fmtNum = v => (v === null || v === undefined) ? '—' : String(v);  // M-6
     const fmtVal = v => (v === null || v === undefined || v === '') ? '—' : String(v);  // M-6
 
     async function api(path, method='GET', body=null) {
-        const key = method + ' ' + path;
+        const bodyHint = (body && typeof body === 'object' && body.sku) ? '|' + body.sku : '';
+        const key = method + ' ' + path + bodyHint;
         if (method !== 'GET' && _inflight.has(key)) {
-            throw new Error('already_running');
+            throw new Error('กำลังดำเนินการอยู่ — โปรดรอ');
         }
         _inflight.add(key);
         const opts = { method, headers: { 'X-WP-Nonce': nonce, 'Content-Type': 'application/json' }, credentials: 'same-origin' };

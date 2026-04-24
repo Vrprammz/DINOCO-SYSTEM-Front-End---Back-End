@@ -1,7 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
- * ║  Version: V.34.8 (2026-04-24) — Slip Resilience helpers:               ║
+ * ║  Version: V.34.8 (2026-04-24) — Round 4 deep review fixes +           ║
+ * ║                                   Slip Resilience helpers:             ║
+ * ║    • M-8: DLQ preserves 'abandoned' status (was clobbered to pending) ║
+ * ║    • M-9: DLQ created_at preserved always (30d retention restored)    ║
+ * ║    • H-2: Auto-rollback cooldown timezone-safe (strtotime on Bangkok  ║
+ * ║           literal compared with UTC epoch had 7hr drift)               ║
+ * ║    • H-1: DLQ retry_count hard cap 10 (prevent runaway panic-click)   ║
+ * ║    • NEW: dinoco_set_shipping_flag() single-gate wrapper helper       ║
  * ║    • NEW b2b_slip_log_insert() — single-call audit row writer         ║
  * ║      (non-throwing, best-effort, graceful degrade if table missing)   ║
  * ║    • NEW b2b_slip_clear_locks($group_id) — admin force-unlock helper  ║
@@ -5976,6 +5983,13 @@ add_action( 'rest_api_init', function() {
                 if ( ! $row ) return new WP_Error( 'not_found', 'DLQ entry not found', array( 'status' => 404 ) );
                 if ( $row['status'] !== 'pending' ) return new WP_Error( 'bad_state', 'status=' . $row['status'], array( 'status' => 400 ) );
 
+                // V.34.8 Round 4 H-1: hard cap retry_count at 10 to prevent
+                // runaway panic-click by admin — V.34.6 added GET_LOCK for
+                // concurrency but didn't bound the retry growth per entry.
+                if ( (int) $row['retry_count'] >= 10 ) {
+                    return new WP_Error( 'max_retries', 'retry_count ' . $row['retry_count'] . ' exceeds max 10 — abandon instead', array( 'status' => 429 ) );
+                }
+
                 // Re-execute via b2b_flash_request
                 $body = json_decode( $row['request_body'], true );
                 if ( ! is_array( $body ) ) return new WP_Error( 'bad_data', 'cannot parse request body', array( 'status' => 400 ) );
@@ -6260,6 +6274,61 @@ add_action( 'flash_category_verify_cron', function() {
 } );
 
 // ───────────────────────────────────────────────────────────────────
+// V.34.8 Round 4 NEW — dinoco_set_shipping_flag() single-mutation gate
+// ───────────────────────────────────────────────────────────────────
+// Single source of truth for toggling dinoco_shipping_meta_enabled.
+// Auto-writes dinoco_shipping_flag_flipped_at (used by auto-rollback cooldown)
+// and inserts a flash_audit row for forensic trace. OPTIONAL wiring — existing
+// callers (Go-Live Wizard, manual-rollback endpoint, auto-rollback cron) don't
+// need migration. Future callers should prefer this helper.
+if ( ! function_exists( 'dinoco_set_shipping_flag' ) ) {
+    /**
+     * @param string|int|bool $new_val  '1'|'0', 1|0, true|false
+     * @param string          $reason   free-text audit reason
+     * @param string          $source   'golive_wizard'|'auto_rollback'|'manual_rollback'|'cli'|'other'
+     * @return array { ok, old, new, flipped_at?, no_change? }
+     */
+    function dinoco_set_shipping_flag( $new_val, $reason = '', $source = 'other' ) {
+        $new_val = ( $new_val === '1' || $new_val === 1 || $new_val === true ) ? '1' : '0';
+        $old_val = (string) get_option( 'dinoco_shipping_meta_enabled', '0' );
+        if ( $new_val === $old_val ) {
+            return array(
+                'ok'        => true,
+                'old'       => $old_val,
+                'new'       => $new_val,
+                'no_change' => true,
+            );
+        }
+        $flipped_at = current_time( 'mysql' );
+        update_option( 'dinoco_shipping_meta_enabled', $new_val );
+        update_option( 'dinoco_shipping_flag_flipped_at', $flipped_at );
+        // Audit row if table exists (defensive — table created by Snippet 15 V.8.0)
+        global $wpdb;
+        $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
+        if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $audit_tbl ) ) ) === $audit_tbl ) {
+            $wpdb->insert( $audit_tbl, array(
+                'ticket_id'    => 0,
+                'event_type'   => 'flag_flip_' . ( $new_val === '1' ? 'on' : 'off' ),
+                'payload_json' => wp_json_encode( array(
+                    'old'     => $old_val,
+                    'new'     => $new_val,
+                    'user_id' => get_current_user_id(),
+                    'reason'  => $reason,
+                    'source'  => $source,
+                ) ),
+                'created_at'   => $flipped_at,
+            ) );
+        }
+        return array(
+            'ok'         => true,
+            'old'        => $old_val,
+            'new'        => $new_val,
+            'flipped_at' => $flipped_at,
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
 // CRON 2: dinoco_shipping_auto_rollback_cron — 10-min (FR-4 relaxed)
 // ───────────────────────────────────────────────────────────────────
 // If error rate > 5% AND absolute count > 20/hr → flip flag OFF + alert
@@ -6273,8 +6342,15 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
     // C-Conc-11 / H-C1: 5-minute cooldown after manual flip — avoids
     // race at flip moment where stale audit rows from prior session trigger
     // immediate rollback.
+    // V.34.8 Round 4 H-2: stay in Bangkok TZ on both sides — $flipped_at was
+    // written via current_time('mysql') (Bangkok literal, no TZ suffix).
+    // strtotime() parses as server TZ (often UTC) → 7hr drift on cooldown window.
+    // Simpler fix: compare ISO strings lexically, both in local time.
     $flipped_at = (string) get_option( 'dinoco_shipping_flag_flipped_at', '' );
-    if ( $flipped_at && ( time() - strtotime( $flipped_at ) ) < 300 ) return;
+    if ( $flipped_at ) {
+        $cooldown_threshold = date( 'Y-m-d H:i:s', current_time( 'timestamp' ) - 300 );
+        if ( $flipped_at > $cooldown_threshold ) return; // within 5-min cooldown
+    }
 
     // M4: Prevent concurrent rollback via MySQL GET_LOCK (cross-process, 2s timeout)
     global $wpdb;
@@ -6289,9 +6365,13 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
 
         // C-Conc-11 / H-C1: Window start = max(flag_flipped_at, now - 1h).
         // Prevents counting pre-flag-flip errors against current flag session.
-        $window_start_q = ( $flipped_at && strtotime( $flipped_at ) > strtotime( '-1 hour' ) )
+        // V.34.8 Round 4 H-2: both sides in Bangkok TZ — strtotime on stored
+        // Bangkok literal vs strtotime('-1 hour') (which uses server TZ) had
+        // 7hr drift. Now uses current_time('timestamp') for the reference.
+        $one_hour_ago_local = date( 'Y-m-d H:i:s', current_time( 'timestamp' ) - 3600 );
+        $window_start_q = ( $flipped_at && $flipped_at > $one_hour_ago_local )
             ? $flipped_at
-            : date( 'Y-m-d H:i:s', strtotime( '-1 hour' ) );
+            : $one_hour_ago_local;
 
         // Count Flash create attempts in window (from audit)
         $total_attempts = 0;
@@ -6705,6 +6785,12 @@ if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
                 $last_error_message = isset( $result['error'] ) ? (string) $result['error'] : ( isset( $result['message'] ) ? (string) $result['message'] : '' );
                 $retry_count = 3;
 
+                // V.34.8 Round 4 M-8: preserve both 'resolved' AND 'abandoned' —
+                // admin-abandoned rows would re-appear as pending under old IF guard.
+                // V.34.8 Round 4 M-9: created_at preserved ALWAYS (no-op self-assign
+                // on UPDATE) — pending rows kept refreshing created_at → never aged
+                // out by 30d DLQ cleanup cron. Now the column is set once on first
+                // INSERT and never touched on subsequent dedup UPDATEs.
                 $wpdb->query( $wpdb->prepare(
                     "INSERT INTO {$dlq_tbl} (ticket_id, endpoint, request_body, last_error_code, last_error_message, retry_count, status, created_at)
                      VALUES (%d, %s, %s, %s, %s, %d, %s, %s)
@@ -6713,8 +6799,8 @@ if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
                        last_error_code = VALUES(last_error_code),
                        last_error_message = VALUES(last_error_message),
                        retry_count = VALUES(retry_count),
-                       status = IF(status='resolved', status, VALUES(status)),
-                       created_at = IF(status='resolved', created_at, VALUES(created_at))",
+                       status = IF(status IN ('resolved','abandoned'), status, VALUES(status)),
+                       created_at = created_at",
                     $ticket_id, $endpoint, $request_body, $last_error_code, $last_error_message, $retry_count, 'pending', current_time( 'mysql' )
                 ) );
                 // insert_id is 0 on UPDATE path; fall back to SELECT for dedup key
