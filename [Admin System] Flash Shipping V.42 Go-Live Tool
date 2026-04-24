@@ -9,6 +9,14 @@
  *                                  ('fsv42_reloaded_once') — fails loud on persistent 403
  *                                • M-6: fmtVal() helper renders '—' for null/undefined
  *                                  instead of "undefined" string in audit + DLQ tables
+ * Version: V.1.3 (2026-04-21) — Multi-Box Configurator inline in Step 2:
+ *                                • NEW GET /multi-box-pending — list SKUs needing pack_slots
+ *                                • NEW GET /box-templates-list — template dropdown data
+ *                                • NEW POST /save-pack-slots — transaction save w/ validation
+ *                                • UI: yellow section expands when multi_box SKUs pending,
+ *                                  per-SKU slot form (dropdown + weight) + "⚡ Fill same" quick-fill
+ *                                  + auto-refresh coverage after save. No need to visit
+ *                                  Admin Inventory modal for multi_box setup.
  * Version: V.1.2 (2026-04-20) — Phase 3+ audit fixes:
  *                                • H-D1: coverage excludes multi_box without pack_slots
  *                                • C-Conc-H3: GET_LOCK serialize on bulk UPDATE endpoints
@@ -442,6 +450,143 @@ add_action( 'rest_api_init', function() {
         'permission_callback' => 'dinoco_fsv42_perm',
     ) );
 
+    // V.1.3 NEW: GET /multi-box-pending — list multi_box SKUs needing pack_slots
+    register_rest_route( 'dinoco-flash-golive/v1', '/multi-box-pending', array(
+        'methods'  => 'GET',
+        'callback' => function() {
+            global $wpdb;
+            $products_tbl = $wpdb->prefix . 'dinoco_products';
+            $slots_tbl    = $wpdb->prefix . 'dinoco_pack_slots';
+            // SKUs with pack_mode=multi_box but no pack_slots rows
+            $rows = $wpdb->get_results( "
+                SELECT p.sku, p.name, p.boxes_per_unit, p.box_template_id, p.weight_per_unit_g,
+                       (SELECT COUNT(*) FROM {$slots_tbl} s WHERE s.product_sku = p.sku) AS slot_count
+                FROM {$products_tbl} p
+                WHERE p.is_active = 1 AND p.pack_mode = 'multi_box'
+                ORDER BY p.sku ASC
+            ", ARRAY_A );
+            // Only return those with mismatched slot count
+            $pending = array();
+            foreach ( $rows as $r ) {
+                $bpu       = max( 2, intval( $r['boxes_per_unit'] ) );
+                $slot_cnt  = intval( $r['slot_count'] );
+                if ( $slot_cnt !== $bpu ) {
+                    $pending[] = array(
+                        'sku'                  => $r['sku'],
+                        'name'                 => $r['name'],
+                        'bpu'                  => $bpu,
+                        'slot_count'           => $slot_cnt,
+                        'box_template_id'      => intval( $r['box_template_id'] ) ?: null,
+                        'weight_per_unit_g'    => intval( $r['weight_per_unit_g'] ) ?: null,
+                    );
+                }
+            }
+            return rest_ensure_response( array( 'ok' => true, 'pending' => $pending, 'total' => count( $pending ) ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // V.1.3 NEW: GET /box-templates-list — for slot template dropdown
+    register_rest_route( 'dinoco-flash-golive/v1', '/box-templates-list', array(
+        'methods'  => 'GET',
+        'callback' => function() {
+            global $wpdb;
+            $rows = $wpdb->get_results(
+                "SELECT id, code, name, length_cm, width_cm, height_cm, tare_weight_g, max_weight_g
+                 FROM {$wpdb->prefix}dinoco_box_templates
+                 WHERE is_active = 1
+                 ORDER BY sort_order ASC, id ASC",
+                ARRAY_A
+            );
+            return rest_ensure_response( array( 'ok' => true, 'templates' => $rows ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
+    // V.1.3 NEW: POST /save-pack-slots — save slots for a SKU (replace all)
+    register_rest_route( 'dinoco-flash-golive/v1', '/save-pack-slots', array(
+        'methods'  => 'POST',
+        'callback' => function( $req ) {
+            global $wpdb;
+            $sku   = strtoupper( trim( sanitize_text_field( $req->get_param( 'sku' ) ?: '' ) ) );
+            $slots = $req->get_param( 'slots' );
+            if ( empty( $sku ) ) return new WP_Error( 'bad_sku', 'sku required', array( 'status' => 400 ) );
+            if ( ! is_array( $slots ) || empty( $slots ) ) {
+                return new WP_Error( 'no_slots', 'slots[] required', array( 'status' => 400 ) );
+            }
+            if ( count( $slots ) > 20 ) {
+                return new WP_Error( 'too_many_slots', 'max 20 slots per SKU', array( 'status' => 400 ) );
+            }
+
+            $products_tbl = $wpdb->prefix . 'dinoco_products';
+            $slots_tbl    = $wpdb->prefix . 'dinoco_pack_slots';
+
+            // Verify SKU exists + is multi_box
+            $prod = $wpdb->get_row( $wpdb->prepare(
+                "SELECT sku, pack_mode, boxes_per_unit FROM {$products_tbl} WHERE sku = %s AND is_active = 1 LIMIT 1",
+                $sku
+            ) );
+            if ( ! $prod ) return new WP_Error( 'sku_not_found', 'SKU not found or inactive', array( 'status' => 404 ) );
+
+            // Transaction wrap: replace all slots
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                $wpdb->query( $wpdb->prepare(
+                    "DELETE FROM {$slots_tbl} WHERE product_sku = %s", $sku
+                ) );
+                $inserted = 0;
+                foreach ( $slots as $idx => $slot ) {
+                    if ( ! is_array( $slot ) ) continue;
+                    $tpl_id  = intval( $slot['box_template_id'] ?? 0 );
+                    $content = intval( $slot['content_weight_g'] ?? 0 );
+                    if ( $tpl_id <= 0 ) {
+                        throw new Exception( "slot {$idx}: box_template_id required" );
+                    }
+                    // Validate template exists + active
+                    $tpl_ok = (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT COUNT(*) FROM {$wpdb->prefix}dinoco_box_templates WHERE id = %d AND is_active = 1",
+                        $tpl_id
+                    ) );
+                    if ( ! $tpl_ok ) throw new Exception( "slot {$idx}: template_id {$tpl_id} not found" );
+                    $ok = $wpdb->insert( $slots_tbl, array(
+                        'product_sku'      => $sku,
+                        'slot_index'       => intval( $idx ),
+                        'box_template_id'  => $tpl_id,
+                        'content_weight_g' => $content > 0 ? $content : null,
+                        'created_at'       => current_time( 'mysql' ),
+                        'updated_at'       => current_time( 'mysql' ),
+                    ) );
+                    if ( $ok === false ) throw new Exception( "slot {$idx} insert failed: " . $wpdb->last_error );
+                    $inserted++;
+                }
+                // Update shipping_updated_by + at on the product
+                $wpdb->update(
+                    $products_tbl,
+                    array(
+                        'shipping_updated_by' => get_current_user_id(),
+                        'shipping_updated_at' => current_time( 'mysql' ),
+                    ),
+                    array( 'sku' => $sku )
+                );
+                $wpdb->query( 'COMMIT' );
+            } catch ( Exception $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'save_failed', $e->getMessage(), array( 'status' => 500 ) );
+            }
+
+            // Invalidate caches
+            wp_cache_flush_group( 'dinoco_shipping' );
+            if ( class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();
+
+            return rest_ensure_response( array(
+                'ok'       => true,
+                'sku'      => $sku,
+                'inserted' => $inserted,
+            ) );
+        },
+        'permission_callback' => 'dinoco_fsv42_perm',
+    ) );
+
     // POST /smoke-test — resolver dry-runs
     register_rest_route( 'dinoco-flash-golive/v1', '/smoke-test', array(
         'methods'  => 'POST',
@@ -763,6 +908,16 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
             <summary style="cursor:pointer;color:#4f46e5;font-weight:600;">📝 SKU ที่ยังขาดข้อมูล (click to expand)</summary>
             <div id="fsv42-mg-incomplete-list" style="margin-top:10px;"></div>
         </details>
+
+        <!-- V.1.3 NEW: Multi-Box Configurator (inline — no need to go to Admin Inventory) -->
+        <div id="fsv42-mbox-section" style="margin-top:16px;padding:14px;background:#fef3c7;border-radius:10px;border:1px solid #fcd34d;display:none;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <strong style="font-size:14px;color:#92400e;">🗂️ Multi-box Configurator <span id="fsv42-mbox-count" style="font-size:12px;font-weight:500;color:#78350f;">(0 SKUs)</span></strong>
+                <button class="fsv42-btn fsv42-btn-ghost" style="font-size:12px;padding:6px 12px;" onclick="FSV42.refreshMultiBox()">🔄 Refresh</button>
+            </div>
+            <p style="font-size:12px;color:#78350f;margin:0 0 10px;">ตั้งค่า pack_slots สำหรับ multi_box SKUs ที่ยังขาด (bpu > 1 ต้องมี slots ให้ครบ)</p>
+            <div id="fsv42-mbox-list"></div>
+        </div>
     </div>
 
     <!-- Step 3: Smoke Test -->
@@ -963,7 +1118,7 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
                 const samples = (r.samples || []).map(s => `${esc(s.sku)}: ${esc(s.was || 'null')} → <strong>${esc(s.now)}</strong>`).join('<br>');
                 result.innerHTML = '<div class="fsv42-alert fsv42-alert-success">' + esc(msg) +
                     (samples ? '<div style="margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;">' + samples + '</div>' : '') + '</div>';
-                if (!dry) await FSV42.refreshCoverage();
+                if (!dry) { await FSV42.refreshCoverage(); await FSV42.refreshMultiBox(); }
             } catch (e) {
                 result.innerHTML = '<div class="fsv42-alert fsv42-alert-danger">Error: ' + esc(e.message) + '</div>';
             }
@@ -981,9 +1136,179 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
                 const samples = (r.samples || []).map(s => `${esc(s.sku)} (${esc(s.pack_mode)}, ${s.weight_g}g) → tpl#${s.tpl_id}`).join('<br>');
                 result.innerHTML = '<div class="fsv42-alert fsv42-alert-success">' + esc(msg) +
                     (samples ? '<div style="margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;">' + samples + '</div>' : '') + '</div>';
-                if (!dry) await FSV42.refreshCoverage();
+                if (!dry) { await FSV42.refreshCoverage(); await FSV42.refreshMultiBox(); }
             } catch (e) {
                 result.innerHTML = '<div class="fsv42-alert fsv42-alert-danger">Error: ' + esc(e.message) + '</div>';
+            }
+        },
+
+        // V.1.3 NEW: Multi-box configurator
+        _boxTemplates: null,
+
+        async _loadBoxTemplates() {
+            if (FSV42._boxTemplates) return FSV42._boxTemplates;
+            const r = await api('/box-templates-list');
+            FSV42._boxTemplates = r.templates || [];
+            return FSV42._boxTemplates;
+        },
+
+        async refreshMultiBox() {
+            const section = document.getElementById('fsv42-mbox-section');
+            const list = document.getElementById('fsv42-mbox-list');
+            const counter = document.getElementById('fsv42-mbox-count');
+            list.innerHTML = '<p style="color:#78350f;font-size:13px;">⏳ กำลังโหลด...</p>';
+            try {
+                const [pending, tpls] = await Promise.all([
+                    api('/multi-box-pending'),
+                    FSV42._loadBoxTemplates(),
+                ]);
+                if (!pending.pending || !pending.pending.length) {
+                    section.style.display = 'none';
+                    return;
+                }
+                section.style.display = 'block';
+                counter.textContent = `(${pending.total} SKUs)`;
+                list.innerHTML = '';
+                pending.pending.forEach(sku => {
+                    list.appendChild(FSV42._buildMboxRow(sku, tpls));
+                });
+            } catch (e) {
+                list.innerHTML = `<div class="fsv42-alert fsv42-alert-danger">Error: ${esc(e.message)}</div>`;
+            }
+        },
+
+        _buildMboxRow(skuData, tpls) {
+            const bpu = Math.max(2, skuData.bpu || 2);
+            const defaultTplId = skuData.box_template_id || '';
+            const defaultWeight = skuData.weight_per_unit_g || '';
+            const row = document.createElement('div');
+            row.style.cssText = 'background:white;border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid #fcd34d;';
+            row.dataset.sku = skuData.sku;
+
+            // Header
+            const header = document.createElement('div');
+            header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
+            const left = document.createElement('div');
+            const skuEl = document.createElement('strong'); skuEl.style.fontSize='13px'; skuEl.textContent = skuData.sku;
+            const nameEl = document.createElement('div'); nameEl.style.cssText='font-size:11px;color:#64748b;'; nameEl.textContent = skuData.name || '';
+            const metaEl = document.createElement('div'); metaEl.style.cssText='font-size:11px;color:#f59e0b;margin-top:2px;';
+            metaEl.textContent = `bpu=${bpu} · slots ${skuData.slot_count}/${bpu}`;
+            left.appendChild(skuEl); left.appendChild(nameEl); left.appendChild(metaEl);
+            header.appendChild(left);
+
+            // Quick-fill button
+            const quickBtn = document.createElement('button');
+            quickBtn.className = 'fsv42-btn fsv42-btn-ghost';
+            quickBtn.style.cssText = 'font-size:11px;padding:6px 10px;';
+            quickBtn.textContent = `⚡ Fill ${bpu} slots (same template)`;
+            quickBtn.onclick = () => FSV42._quickFillMbox(row, bpu, defaultTplId, defaultWeight);
+            header.appendChild(quickBtn);
+            row.appendChild(header);
+
+            // Slot rows
+            const slotsContainer = document.createElement('div');
+            slotsContainer.className = 'fsv42-mbox-slots';
+            for (let i = 0; i < bpu; i++) {
+                slotsContainer.appendChild(FSV42._buildSlotRow(i, tpls, defaultTplId, defaultWeight));
+            }
+            row.appendChild(slotsContainer);
+
+            // Save button
+            const saveBtn = document.createElement('button');
+            saveBtn.className = 'fsv42-btn fsv42-btn-success';
+            saveBtn.style.cssText = 'margin-top:10px;width:100%;';
+            saveBtn.textContent = '💾 Save slots';
+            saveBtn.onclick = () => FSV42._saveMbox(row, saveBtn);
+            row.appendChild(saveBtn);
+
+            // Status
+            const status = document.createElement('div');
+            status.className = 'fsv42-mbox-status';
+            status.style.cssText = 'font-size:12px;margin-top:8px;';
+            row.appendChild(status);
+
+            return row;
+        },
+
+        _buildSlotRow(idx, tpls, defaultTplId, defaultWeight) {
+            const slotRow = document.createElement('div');
+            slotRow.className = 'fsv42-slot-row';
+            slotRow.style.cssText = 'display:grid;grid-template-columns:40px 1fr 100px;gap:8px;align-items:center;margin-bottom:6px;';
+            const label = document.createElement('span');
+            label.style.cssText = 'font-size:12px;color:#64748b;font-weight:600;';
+            label.textContent = `#${idx}`;
+            slotRow.appendChild(label);
+
+            const sel = document.createElement('select');
+            sel.className = 'fsv42-slot-tpl';
+            sel.style.cssText = 'padding:6px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;';
+            const opt0 = document.createElement('option'); opt0.value=''; opt0.textContent='— เลือก template —'; sel.appendChild(opt0);
+            tpls.forEach(t => {
+                const o = document.createElement('option');
+                o.value = t.id;
+                o.textContent = `${t.code} — ${t.name} (${t.length_cm}×${t.width_cm}×${t.height_cm}, tare ${t.tare_weight_g}g)`;
+                if (String(t.id) === String(defaultTplId)) o.selected = true;
+                sel.appendChild(o);
+            });
+            slotRow.appendChild(sel);
+
+            const wInput = document.createElement('input');
+            wInput.type = 'number';
+            wInput.className = 'fsv42-slot-weight';
+            wInput.placeholder = 'weight (g)';
+            wInput.min = '0'; wInput.max = '60000';
+            wInput.style.cssText = 'padding:6px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;';
+            if (defaultWeight) wInput.value = defaultWeight;
+            slotRow.appendChild(wInput);
+
+            return slotRow;
+        },
+
+        _quickFillMbox(row, bpu, tplId, weight) {
+            const sels = row.querySelectorAll('.fsv42-slot-tpl');
+            const ins = row.querySelectorAll('.fsv42-slot-weight');
+            sels.forEach(s => { if (tplId) s.value = String(tplId); });
+            ins.forEach(i => { if (weight) i.value = weight; });
+        },
+
+        async _saveMbox(row, btn) {
+            const sku = row.dataset.sku;
+            const status = row.querySelector('.fsv42-mbox-status');
+            const slotRows = row.querySelectorAll('.fsv42-slot-row');
+            const slots = [];
+            for (const sr of slotRows) {
+                const tplId = parseInt(sr.querySelector('.fsv42-slot-tpl').value) || 0;
+                const weight = parseInt(sr.querySelector('.fsv42-slot-weight').value) || 0;
+                if (!tplId) {
+                    status.textContent = '⚠️ ทุก slot ต้องเลือก template';
+                    status.style.color = '#dc2626';
+                    return;
+                }
+                slots.push({ box_template_id: tplId, content_weight_g: weight });
+            }
+            btn.disabled = true;
+            btn.textContent = '⏳ Saving...';
+            status.textContent = '';
+            try {
+                const r = await api('/save-pack-slots', 'POST', { sku, slots });
+                status.textContent = `✅ บันทึกแล้ว ${r.inserted} slots`;
+                status.style.color = '#16a34a';
+                btn.textContent = '✅ Saved';
+                // Remove row after 1s + refresh coverage
+                setTimeout(() => {
+                    row.style.opacity = '0.5';
+                    row.style.transition = 'opacity 0.3s';
+                    setTimeout(() => {
+                        row.remove();
+                        FSV42.refreshCoverage();
+                        FSV42.refreshMultiBox();
+                    }, 300);
+                }, 1000);
+            } catch (e) {
+                status.textContent = `❌ Error: ${e.message}`;
+                status.style.color = '#dc2626';
+                btn.disabled = false;
+                btn.textContent = '💾 Save slots';
             }
         },
 
@@ -1179,6 +1504,7 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
         await FSV42.refreshCoverage();
         await FSV42.refreshFlip();
         await FSV42.refreshMonitor();
+        await FSV42.refreshMultiBox(); // V.1.3
     });
 })();
 </script>
