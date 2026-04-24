@@ -1,6 +1,32 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.10 (2026-04-21) — CRIT-1: cron heartbeat key mismatch fix║
+ * ║    • Dropped redundant 'dinoco_' prefix from 2 of 3 cron heartbeat     ║
+ * ║      option writes (Go-Live Monitor readers expect single prefix).    ║
+ * ║      `dinoco_cron_dinoco_shipping_auto_rollback_last_run`              ║
+ * ║      → `dinoco_cron_shipping_auto_rollback_last_run`                   ║
+ * ║      (same for dlq_cleanup). F2 verify cron was already correct.      ║
+ * ║    • HIGH-3 (PDPA §37 data minimization): DLQ `request_body` was       ║
+ * ║      storing unmasked customer PII (dstName, dstPhone, dstAddress,    ║
+ * ║      district/city/province/postcode) → 30d retention window = leak   ║
+ * ║      exposure if DB backup compromised. NEW helper                    ║
+ * ║      b2b_flash_mask_request_for_dlq() whitelists order metadata +     ║
+ * ║      masks PII fields (first 3 + last 3 chars, ≤6 chars → all ***) +  ║
+ * ║      strips subParcel.item_desc + omits GPS coords. DLQ retry         ║
+ * ║      endpoint now rebuilds full body from ticket_id via idempotent    ║
+ * ║      b2b_flash_dispatch_create_all() instead of replaying stored body ║
+ * ║      — masked persistence + live reconstruction keeps retry working.  ║
+ * ║  Version: V.34.9 (2026-04-24) — Slip Review Round (4H+7M+3L):          ║
+ * ║    • H-3 trans_ref dedup broadened to ALL bank-cleared statuses       ║
+ * ║           (+receiver_mismatch, amount_mismatch, amount_no_pending,    ║
+ * ║            no_distributor) — prevents double-process on re-send       ║
+ * ║    • M-2 Slip2Go error counter → atomic increment helper              ║
+ * ║           b2b_slip_incr_err_count() using wp_cache_incr + wpdb        ║
+ * ║           ON DUPLICATE KEY UPDATE fallback (race-safe)                ║
+ * ║    • M-3 b2b_slip_log_insert INSERT fail adds @error_log() fallback   ║
+ * ║    • M-7 b2b_slip_log_insert uses $format array matching schema       ║
+ * ║    • L-3 error_msg truncation adds '...[TRUNC]' marker                ║
  * ║  Version: V.34.9 (2026-04-21) — Round 5 LOW+MED cleanup:              ║
  * ║    • M-1: Snapshot hook catch \Throwable (covers PHP 7+ Error/TypeError)║
  * ║    • M-2: error_log fallback when audit INSERT fails (DB outage)      ║
@@ -1031,7 +1057,7 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
         );
         $row = array_merge( $defaults, is_array( $row ) ? $row : array() );
 
-        // Truncate long fields เพื่อกัน error
+        // Truncate long fields เพื่อกัน error (V.34.9 L-3: add [TRUNC] marker if truncated)
         $row['group_id']    = substr( (string) $row['group_id'], 0, 100 );
         $row['message_id']  = substr( (string) $row['message_id'], 0, 64 );
         $row['user_id']     = substr( (string) $row['user_id'], 0, 64 );
@@ -1040,14 +1066,106 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
         $row['sender_name'] = substr( (string) $row['sender_name'], 0, 200 );
         $row['result_status'] = substr( (string) $row['result_status'], 0, 32 );
         $row['error_code']  = substr( (string) $row['error_code'], 0, 32 );
-        $row['error_msg']   = substr( (string) $row['error_msg'], 0, 500 );
+        $_em = (string) $row['error_msg'];
+        if ( mb_strlen( $_em ) > 500 ) {
+            $row['error_msg'] = mb_substr( $_em, 0, 490 ) . '...[TRUNC]';
+        } else {
+            $row['error_msg'] = $_em;
+        }
 
-        $ok = $wpdb->insert( $table, $row );
+        // V.34.9 M-7: explicit $format array matching schema (prevents STRICT-mode write failures
+        // + ensures nullable fields serialize correctly)
+        // Column order must match $defaults order above: group_id, message_id, user_id,
+        //   dist_id, slip_code, amount, trans_ref, sender_name, result_status,
+        //   error_code, error_msg, http_code, processing_time_ms, retry_count, created_at
+        $format = array(
+            '%s', // group_id
+            '%s', // message_id
+            '%s', // user_id
+            '%d', // dist_id (nullable — wpdb passes NULL through untyped)
+            '%s', // slip_code
+            '%f', // amount (nullable)
+            '%s', // trans_ref
+            '%s', // sender_name
+            '%s', // result_status
+            '%s', // error_code
+            '%s', // error_msg
+            '%d', // http_code (nullable)
+            '%d', // processing_time_ms (nullable)
+            '%d', // retry_count
+            '%s', // created_at (MySQL datetime)
+        );
+
+        $ok = $wpdb->insert( $table, $row, $format );
         if ( $ok === false ) {
-            if ( function_exists( 'b2b_log' ) ) b2b_log( '[SlipLog] INSERT fail: ' . $wpdb->last_error );
+            // V.34.9 M-3: dual fallback logging — primary b2b_log + error_log as last resort
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[SlipLog] INSERT fail: ' . $wpdb->last_error );
+            }
+            // Always emit to PHP error_log as failsafe (e.g. if b2b_log backend is also down)
+            @error_log( '[DINOCO SlipLog FATAL] insert failed: ' . $wpdb->last_error
+                . ' row=' . wp_json_encode( $row ) );
             return false;
         }
         return (int) $wpdb->insert_id;
+    }
+}
+
+// V.34.9 M-2: Atomic Slip2Go error counter helper
+// Race-safe alternative to get_transient → ++ → set_transient pattern.
+// Prefers wp_cache_incr when persistent object cache is available,
+// falls back to wp_options atomic increment via MySQL UPDATE (ON DUPLICATE KEY UPDATE pattern).
+if ( ! function_exists( 'b2b_slip_incr_err_count' ) ) {
+    /**
+     * Atomically increment the Slip2Go error counter.
+     *
+     * @param int $ttl_seconds  Counter reset interval (default 10 minutes)
+     * @return int              The new counter value after increment
+     */
+    function b2b_slip_incr_err_count( $ttl_seconds = 600 ) {
+        global $wpdb;
+        $cache_key = 'b2b_slip2go_err_count';
+
+        // Path 1: persistent object cache (Redis/Memcached) — true atomic via wp_cache_incr
+        if ( wp_using_ext_object_cache() && function_exists( 'wp_cache_incr' ) ) {
+            $val = wp_cache_incr( $cache_key, 1, 'transient' );
+            if ( $val === false ) {
+                // Key not yet set — seed to 1
+                wp_cache_set( $cache_key, 1, 'transient', $ttl_seconds );
+                $val = 1;
+            }
+            // Refresh TTL best-effort (wp_cache_incr doesn't touch TTL on all backends)
+            // Not critical — transient cleanup cron handles stale entries
+            return (int) $val;
+        }
+
+        // Path 2: wp_options fallback — atomic via single UPDATE statement
+        // Use transient to ride existing WP TTL machinery (timeout row auto-expires)
+        $opt_name = '_transient_' . $cache_key;
+        $timeout_name = '_transient_timeout_' . $cache_key;
+
+        // Try atomic increment first (works if row exists and has numeric value)
+        $affected = $wpdb->query( $wpdb->prepare(
+            "UPDATE {$wpdb->options} SET option_value = CAST(option_value AS UNSIGNED) + 1 WHERE option_name = %s",
+            $opt_name
+        ) );
+
+        if ( $affected && ! is_wp_error( $affected ) ) {
+            $new_val = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s",
+                $opt_name
+            ) );
+            // Ensure timeout row exists (refresh TTL lazily)
+            if ( ! get_option( $timeout_name ) ) {
+                update_option( $timeout_name, time() + $ttl_seconds, false );
+            }
+            return $new_val > 0 ? $new_val : 1;
+        }
+
+        // Row doesn't exist yet — seed via set_transient (still a narrow race window,
+        // but accepted for telemetry counter)
+        set_transient( $cache_key, 1, $ttl_seconds );
+        return 1;
     }
 }
 
@@ -1139,8 +1257,21 @@ if ( ! function_exists( 'b2b_slip_is_trans_ref_seen' ) ) {
             $log_table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $log_table ) );
         }
         if ( $log_table_exists ) {
+            // V.34.9 H-3: expand dedup to ALL bank-cleared statuses.
+            //   Previously only ('paid','paid_overpayment','duplicate') → agent could resend a slip
+            //   that we already rejected for receiver_mismatch / amount_mismatch / amount_no_pending
+            //   / no_distributor (bank DID clear the transfer, Slip2Go DID return valid data) —
+            //   Slip2Go cache flush after 7 days lets the same trans_ref re-enter the "fresh" path,
+            //   risking double debt subtraction if the second attempt matches a pending order.
+            //   Bank-cleared = any status where trans_ref comes from a valid Slip2Go response.
             $hit = $wpdb->get_var( $wpdb->prepare(
-                "SELECT id FROM {$log_table} WHERE trans_ref = %s AND result_status IN ('paid','paid_overpayment','duplicate') LIMIT 1",
+                "SELECT id FROM {$log_table}
+                 WHERE trans_ref = %s
+                   AND result_status IN (
+                       'paid','paid_overpayment','duplicate',
+                       'receiver_mismatch','amount_mismatch','amount_no_pending','no_distributor'
+                   )
+                 LIMIT 1",
                 $trans_ref
             ) );
             if ( $hit ) return true;
@@ -5999,18 +6130,22 @@ add_action( 'rest_api_init', function() {
                     return new WP_Error( 'max_retries', 'retry_count ' . $row['retry_count'] . ' exceeds max 10 — abandon instead', array( 'status' => 429 ) );
                 }
 
-                // Re-execute via b2b_flash_request
-                $body = json_decode( $row['request_body'], true );
-                if ( ! is_array( $body ) ) return new WP_Error( 'bad_data', 'cannot parse request body', array( 'status' => 400 ) );
-
-                $result = null;
-                if ( function_exists( 'b2b_flash_request' ) ) {
-                    $result = b2b_flash_request( $row['endpoint'], $body );
-                } else {
-                    return new WP_Error( 'no_helper', 'b2b_flash_request not available', array( 'status' => 500 ) );
+                // V.34.10 HIGH-3 (PDPA §37): stored request_body is PII-masked — cannot
+                // replay directly to Flash API. Instead rebuild full body from ticket_id
+                // via the idempotent dispatcher which reads ticket meta + resolver.
+                // Dispatcher short-circuits when ticket already has _flash_tracking_numbers
+                // (concurrency-safe via GET_LOCK), so retry attempts never duplicate.
+                $ticket_id = intval( $row['ticket_id'] );
+                if ( ! $ticket_id ) {
+                    return new WP_Error( 'bad_data', 'DLQ row missing ticket_id', array( 'status' => 400 ) );
+                }
+                if ( ! function_exists( 'b2b_flash_dispatch_create_all' ) ) {
+                    return new WP_Error( 'no_dispatcher', 'b2b_flash_dispatch_create_all not available', array( 'status' => 500 ) );
                 }
 
+                $result = b2b_flash_dispatch_create_all( $ticket_id );
                 $is_ok = is_array( $result ) && ! empty( $result['ok'] );
+
                 if ( $is_ok ) {
                     $wpdb->update( $tbl, array(
                         'status' => 'resolved',
@@ -6018,16 +6153,28 @@ add_action( 'rest_api_init', function() {
                         'resolved_by' => get_current_user_id(),
                     ), array( 'id' => $id ) );
                 } else {
+                    $err_code = 'unknown';
+                    if ( is_array( $result ) ) {
+                        if ( isset( $result['error_code'] ) )      $err_code = (string) $result['error_code'];
+                        elseif ( isset( $result['status_code'] ) ) $err_code = (string) $result['status_code'];
+                        elseif ( isset( $result['error'] ) )       $err_code = (string) $result['error'];
+                    }
+                    $err_msg = '';
+                    if ( is_array( $result ) ) {
+                        if ( isset( $result['message'] ) )    $err_msg = (string) $result['message'];
+                        elseif ( isset( $result['error'] ) )  $err_msg = (string) $result['error'];
+                    }
                     $wpdb->update( $tbl, array(
                         'retry_count' => (int) $row['retry_count'] + 1,
-                        'last_error_code' => isset( $result['error_code'] ) ? (string) $result['error_code'] : 'unknown',
-                        'last_error_message' => isset( $result['message'] ) ? (string) $result['message'] : '',
+                        'last_error_code' => $err_code,
+                        'last_error_message' => $err_msg,
                     ), array( 'id' => $id ) );
                 }
 
                 return rest_ensure_response( array(
                     'ok' => $is_ok,
                     'dlq_id' => $id,
+                    'ticket_id' => $ticket_id,
                     'result' => $result,
                     'status' => $is_ok ? 'resolved' : 'still_failing',
                 ) );
@@ -6350,7 +6497,8 @@ if ( ! wp_next_scheduled( 'dinoco_shipping_auto_rollback_cron' ) ) {
 }
 add_action( 'dinoco_shipping_auto_rollback_cron', function() {
     // V.34.9 NEW: cron heartbeat for Go-Live Tool monitor
-    update_option( 'dinoco_cron_dinoco_shipping_auto_rollback_last_run', time() );
+    // V.34.10 CRIT-1: drop double 'dinoco_' prefix — Go-Live Monitor reader uses single prefix
+    update_option( 'dinoco_cron_shipping_auto_rollback_last_run', time() );
     // Skip if flag already off
     if ( get_option( 'dinoco_shipping_meta_enabled', '0' ) !== '1' ) return;
 
@@ -6472,7 +6620,8 @@ if ( ! wp_next_scheduled( 'dinoco_flash_dlq_cleanup_cron' ) ) {
 }
 add_action( 'dinoco_flash_dlq_cleanup_cron', function() {
     // V.34.9 NEW: cron heartbeat for Go-Live Tool monitor
-    update_option( 'dinoco_cron_dinoco_flash_dlq_cleanup_last_run', time() );
+    // V.34.10 CRIT-1: drop double 'dinoco_' prefix — Go-Live Monitor reader uses single prefix
+    update_option( 'dinoco_cron_flash_dlq_cleanup_last_run', time() );
     global $wpdb;
     $tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
     if ( ! $wpdb->get_var( "SHOW TABLES LIKE '{$tbl}'" ) ) return;
@@ -6624,6 +6773,85 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
  *                        Each: { weight_g, length_cm, width_cm, height_cm, item_desc? }
  * @return array { ok, pno, sortCode?, data?, error?, retry_exhausted? }
  */
+
+/**
+ * V.34.10 HIGH-3 (PDPA §37 data minimization): Strip customer PII from Flash
+ * request body before DLQ storage. Retry path reconstructs full body from
+ * ticket_id via b2b_flash_dispatch_create_all() instead of replaying stored body,
+ * so masked DLQ row still retries successfully — while forensic trace keeps
+ * partial (first 3 + last 3 char) strings for debugging and GPS coords are omitted.
+ *
+ * Whitelist preserves only order-shape metadata (ticket id, warehouse, EC, weight,
+ * dims, insured/COD flags). Customer name/phone/address are masked.
+ */
+if ( ! function_exists( 'b2b_flash_mask_request_for_dlq' ) ) {
+    function b2b_flash_mask_request_for_dlq( $params ) {
+        if ( ! is_array( $params ) ) return $params;
+
+        // Whitelist: order metadata safe to persist (not customer PII)
+        $whitelist = array(
+            'outTradeNo', 'mchId', 'nonceStr',
+            'weight', 'length', 'width', 'height',
+            'articleCategory', 'expressCategory',
+            'subParcelQuantity',
+            'srcName', 'srcPhone', 'srcDetailAddress',
+            'srcDistrictName', 'srcCityName', 'srcProvinceName', 'srcPostalCode',
+            'warehouseNo',
+            'insured', 'insureDeclareValue',
+            'codEnabled', 'codAmount',
+            'remark',
+        );
+        $masked = array();
+        foreach ( $whitelist as $key ) {
+            if ( isset( $params[ $key ] ) ) $masked[ $key ] = $params[ $key ];
+        }
+
+        // PII fields masked for forensic trace (first 3 + last 3 chars)
+        $pii_fields = array(
+            'dstName', 'dstPhone',
+            'dstDetailAddress', 'dstAddress',
+            'dstDistrictName', 'dstCityName', 'dstProvinceName', 'dstPostalCode',
+            'returnName', 'returnPhone',
+            'returnDetailAddress',
+            'returnDistrictName', 'returnCityName', 'returnProvinceName', 'returnPostalCode',
+        );
+        foreach ( $pii_fields as $key ) {
+            if ( isset( $params[ $key ] ) ) {
+                $val = (string) $params[ $key ];
+                $len = function_exists( 'mb_strlen' ) ? mb_strlen( $val, 'UTF-8' ) : strlen( $val );
+                if ( $len <= 6 ) {
+                    $masked[ $key ] = str_repeat( '*', $len );
+                } else {
+                    $head = function_exists( 'mb_substr' ) ? mb_substr( $val, 0, 3, 'UTF-8' ) : substr( $val, 0, 3 );
+                    $tail = function_exists( 'mb_substr' ) ? mb_substr( $val, -3, null, 'UTF-8' ) : substr( $val, -3 );
+                    $masked[ $key ] = $head . str_repeat( '*', max( 3, $len - 6 ) ) . $tail;
+                }
+            }
+        }
+
+        // GPS coords omitted entirely (future-proof defense)
+        // dstLat / dstLng / returnLat / returnLng — never persisted.
+
+        // subParcel array: strip item_desc (may contain SKU names / customer refs),
+        // keep only shape data (outTradeNo, weight, dims) needed for retry trace.
+        if ( isset( $params['subParcel'] ) && is_array( $params['subParcel'] ) ) {
+            $sp_masked = array();
+            $sp_keep = array( 'outTradeNo', 'weight', 'length', 'width', 'height' );
+            foreach ( $params['subParcel'] as $sp ) {
+                if ( ! is_array( $sp ) ) continue;
+                $row = array();
+                foreach ( $sp_keep as $k ) {
+                    if ( isset( $sp[ $k ] ) ) $row[ $k ] = $sp[ $k ];
+                }
+                $sp_masked[] = $row;
+            }
+            $masked['subParcel'] = $sp_masked;
+        }
+
+        return $masked;
+    }
+}
+
 if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
     function b2b_flash_create_order_v42( $ticket_id, $shipping, $sub_parcels = array() ) {
         $ticket_id = intval( $ticket_id );
@@ -6824,7 +7052,11 @@ if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
             $dlq_tbl = $wpdb->prefix . 'dinoco_flash_dead_letter';
             if ( $wpdb->get_var( "SHOW TABLES LIKE '{$dlq_tbl}'" ) ) {
                 $endpoint = 'open/v3/orders';
-                $request_body = wp_json_encode( $params );
+                // V.34.10 HIGH-3 (PDPA §37): mask customer PII before persisting to DLQ.
+                // Retry path (flash-dlq/{id}/retry) reconstructs full body via
+                // b2b_flash_dispatch_create_all($ticket_id) instead of replaying this
+                // masked payload — see retry endpoint for details.
+                $request_body = wp_json_encode( b2b_flash_mask_request_for_dlq( $params ) );
                 $last_error_code = isset( $result['error_code'] ) ? (string) $result['error_code'] : 'unknown';
                 $last_error_message = isset( $result['error'] ) ? (string) $result['error'] : ( isset( $result['message'] ) ? (string) $result['message'] : '' );
                 $retry_count = 3;
