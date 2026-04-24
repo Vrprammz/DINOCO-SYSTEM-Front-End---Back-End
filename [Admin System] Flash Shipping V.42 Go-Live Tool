@@ -2,6 +2,15 @@
  * File: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Template Name: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Shortcode: [dinoco_flash_v42_golive]
+ * Version: V.1.7 (2026-04-21) — Round 8 MED/LOW cleanup:
+ *   • MED-6: Per-endpoint rate limit (60/min; flip-flag special 10/min)
+ *            replaces shared per-user 30/min bucket — go-live migration
+ *            workload no longer rate-limited during legitimate work
+ *   • LOW-2: Chunked queries for auto-detect-all + bulk-assign-defaults
+ *            (500 SKUs/chunk with has_more/next_offset pagination); JS
+ *            wizard loops until complete
+ *   • LOW-3: Nonce header 'x_wp_nonce' → 'X-WP-Nonce' (cosmetic, WP
+ *            get_header is case-insensitive; matches WP convention)
  * Version: V.1.6 (2026-04-21) — HIGH-1: wp_cache_flush_group guard:
  *   • wp_cache_flush_group() requires WP 6.1+ + compatible object cache drop-in.
  *     Older Redis/Memcached plugins lack the method → PHP fatal on call.
@@ -100,16 +109,24 @@ if ( ! function_exists( 'dinoco_fsv42_perm' ) ) {
         // Nonce check for mutating requests
         $method = $request->get_method();
         if ( in_array( $method, array( 'POST', 'PUT', 'DELETE' ), true ) ) {
-            $nonce = $request->get_header( 'x_wp_nonce' );
+            // V.1.7 LOW-3: 'X-WP-Nonce' matches WP convention (get_header is case-insensitive).
+            $nonce = $request->get_header( 'X-WP-Nonce' );
             if ( ! $nonce || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
                 return new WP_Error( 'bad_nonce', 'invalid nonce', array( 'status' => 403 ) );
             }
-            // Rate limit 30/min/user
+            // V.1.7 MED-6: rate limit per-endpoint instead of shared bucket.
+            // Previous shared bucket hit during legitimate go-live migration
+            // (auto-detect + bulk-assign + 12 save-pack-slots in quick succession).
             $uid = get_current_user_id();
-            $tk  = 'fsv42_rl_' . $uid;
+            $route = (string) $request->get_route();
+            $route_hash = substr( md5( $route ), 0, 8 );
+            $tk  = 'fsv42_rl_' . $uid . '_' . $route_hash;
             $ct  = (int) get_transient( $tk );
-            if ( $ct >= 30 ) {
-                return new WP_Error( 'rate_limited', 'too many requests', array( 'status' => 429 ) );
+            // Flip-flag critical — tighter limit to prevent flip-flap abuse
+            $is_flip_flag = ( strpos( $route, '/flip-flag' ) !== false );
+            $limit = $is_flip_flag ? 10 : 60;
+            if ( $ct >= $limit ) {
+                return new WP_Error( 'rate_limited', 'too many requests to this endpoint', array( 'status' => 429 ) );
             }
             set_transient( $tk, $ct + 1, 60 );
         }
@@ -369,11 +386,17 @@ add_action( 'rest_api_init', function() {
                 return new WP_Error( 'busy', 'another bulk op in progress — try again in a moment', array( 'status' => 423 ) );
             }
             try {
+                // V.1.7 LOW-2: chunked processing to prevent OOM on large catalogs.
+                $chunk_size = 500;
+                $offset = intval( $req->get_param( 'offset' ) ?: 0 );
+                if ( $offset < 0 ) $offset = 0;
                 $products_tbl = $wpdb->prefix . 'dinoco_products';
-                $rows = $wpdb->get_results( "
+                $rows = $wpdb->get_results( $wpdb->prepare( "
                     SELECT sku, pack_mode FROM {$products_tbl}
                     WHERE is_active=1 AND (pack_mode IS NULL OR pack_mode = 'auto')
-                " );
+                    ORDER BY sku ASC
+                    LIMIT %d OFFSET %d
+                ", $chunk_size, $offset ) );
                 $updated = 0;
                 $samples = array();
                 foreach ( $rows as $r ) {
@@ -400,12 +423,15 @@ add_action( 'rest_api_init', function() {
                 if ( ! $dry_run && class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) {
                     DINOCO_Catalog::flush_memo();
                 }
+                $has_more = count( $rows ) === $chunk_size;
                 return rest_ensure_response( array(
                     'ok'          => true,
                     'dry_run'     => $dry_run,
                     'scanned'     => count( $rows ),
                     'updated'     => $updated,
                     'samples'     => $samples,
+                    'has_more'    => $has_more,
+                    'next_offset' => $has_more ? $offset + $chunk_size : null,
                 ) );
             } finally {
                 $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
@@ -428,14 +454,20 @@ add_action( 'rest_api_init', function() {
                 return new WP_Error( 'busy', 'another bulk op in progress — try again in a moment', array( 'status' => 423 ) );
             }
             try {
+                // V.1.7 LOW-2: chunked processing to prevent OOM on large catalogs.
+                $chunk_size = 500;
+                $offset = intval( $req->get_param( 'offset' ) ?: 0 );
+                if ( $offset < 0 ) $offset = 0;
                 $products_tbl = $wpdb->prefix . 'dinoco_products';
                 // Target: SKUs without box_template_id, pack_mode ∈ (single_box/bulk_pack/assembled_set)
-                $rows = $wpdb->get_results( "
+                $rows = $wpdb->get_results( $wpdb->prepare( "
                     SELECT sku, pack_mode, weight_per_unit_g FROM {$products_tbl}
                     WHERE is_active=1
                       AND box_template_id IS NULL
                       AND pack_mode IN ('single_box', 'bulk_pack', 'assembled_set')
-                " );
+                    ORDER BY sku ASC
+                    LIMIT %d OFFSET %d
+                ", $chunk_size, $offset ) );
                 $updated = 0;
                 $samples = array();
                 foreach ( $rows as $r ) {
@@ -469,12 +501,15 @@ add_action( 'rest_api_init', function() {
                     }
                     if ( class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();
                 }
+                $has_more = count( $rows ) === $chunk_size;
                 return rest_ensure_response( array(
-                    'ok'      => true,
-                    'dry_run' => $dry_run,
-                    'scanned' => count( $rows ),
-                    'updated' => $updated,
-                    'samples' => $samples,
+                    'ok'          => true,
+                    'dry_run'     => $dry_run,
+                    'scanned'     => count( $rows ),
+                    'updated'     => $updated,
+                    'samples'     => $samples,
+                    'has_more'    => $has_more,
+                    'next_offset' => $has_more ? $offset + $chunk_size : null,
                 ) );
             } finally {
                 $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
@@ -1222,16 +1257,37 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
             } catch (e) { alert('Coverage load failed: ' + e.message); }
         },
 
+        // V.1.7 LOW-2: loop chunked calls until has_more=false
         async autoDetect(dry) {
             markStep(2, 'active');
             const result = document.getElementById('fsv42-mg-result');
             result.innerHTML = '<div class="fsv42-alert fsv42-alert-info">⏳ กำลัง ' + (dry ? 'dry-run' : 'apply') + '...</div>';
             try {
-                const r = await api('/auto-detect-all', 'POST', { dry_run: dry });
+                let offset = 0;
+                let totalScanned = 0;
+                let totalUpdated = 0;
+                const allSamples = [];
+                let safetyGuard = 0;
+                while (true) {
+                    if (++safetyGuard > 200) { break; } // cap at 100k SKUs (200 chunks × 500)
+                    const r = await api('/auto-detect-all', 'POST', { dry_run: dry, offset: offset });
+                    totalScanned += (r.scanned || 0);
+                    totalUpdated += (r.updated || 0);
+                    if (r.samples && r.samples.length && allSamples.length < 20) {
+                        allSamples.push(...r.samples.slice(0, 20 - allSamples.length));
+                    }
+                    // UI feedback during long-running batch
+                    if (r.has_more) {
+                        result.innerHTML = '<div class="fsv42-alert fsv42-alert-info">⏳ ' + (dry ? 'Dry-run' : 'Apply') +
+                            ' chunked: scanned ' + totalScanned + ', updated ' + totalUpdated + '... (continuing)</div>';
+                    }
+                    if (!r.has_more) break;
+                    offset = r.next_offset;
+                }
                 const msg = dry ?
-                    `Dry-run: ${r.updated} / ${r.scanned} SKUs จะถูก update (ยังไม่บันทึก)` :
-                    `✅ อัปเดตแล้ว ${r.updated} / ${r.scanned} SKUs`;
-                const samples = (r.samples || []).map(s => `${esc(s.sku)}: ${esc(s.was || 'null')} → <strong>${esc(s.now)}</strong>`).join('<br>');
+                    `Dry-run: ${totalUpdated} / ${totalScanned} SKUs จะถูก update (ยังไม่บันทึก)` :
+                    `✅ อัปเดตแล้ว ${totalUpdated} / ${totalScanned} SKUs`;
+                const samples = allSamples.map(s => `${esc(s.sku)}: ${esc(s.was || 'null')} → <strong>${esc(s.now)}</strong>`).join('<br>');
                 result.innerHTML = '<div class="fsv42-alert fsv42-alert-success">' + esc(msg) +
                     (samples ? '<div style="margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;">' + samples + '</div>' : '') + '</div>';
                 if (!dry) { await FSV42.refreshCoverage(); await FSV42.refreshMultiBox(); }
@@ -1240,16 +1296,36 @@ if ( ! function_exists( 'dinoco_fsv42_render' ) ) {
             }
         },
 
+        // V.1.7 LOW-2: loop chunked calls until has_more=false
         async bulkAssign(dry) {
             markStep(2, 'active');
             const result = document.getElementById('fsv42-mg-result');
             result.innerHTML = '<div class="fsv42-alert fsv42-alert-info">⏳ กำลัง ' + (dry ? 'dry-run' : 'apply') + ' bulk-assign...</div>';
             try {
-                const r = await api('/bulk-assign-defaults', 'POST', { dry_run: dry });
+                let offset = 0;
+                let totalScanned = 0;
+                let totalUpdated = 0;
+                const allSamples = [];
+                let safetyGuard = 0;
+                while (true) {
+                    if (++safetyGuard > 200) { break; } // cap at 100k SKUs (200 chunks × 500)
+                    const r = await api('/bulk-assign-defaults', 'POST', { dry_run: dry, offset: offset });
+                    totalScanned += (r.scanned || 0);
+                    totalUpdated += (r.updated || 0);
+                    if (r.samples && r.samples.length && allSamples.length < 20) {
+                        allSamples.push(...r.samples.slice(0, 20 - allSamples.length));
+                    }
+                    if (r.has_more) {
+                        result.innerHTML = '<div class="fsv42-alert fsv42-alert-info">⏳ ' + (dry ? 'Dry-run' : 'Apply') +
+                            ' bulk-assign chunked: scanned ' + totalScanned + ', updated ' + totalUpdated + '... (continuing)</div>';
+                    }
+                    if (!r.has_more) break;
+                    offset = r.next_offset;
+                }
                 const msg = dry ?
-                    `Dry-run: ${r.updated} / ${r.scanned} SKUs จะได้ box template` :
-                    `✅ Assign box template แล้ว ${r.updated} / ${r.scanned} SKUs`;
-                const samples = (r.samples || []).map(s => `${esc(s.sku)} (${esc(s.pack_mode)}, ${s.weight_g}g) → tpl#${s.tpl_id}`).join('<br>');
+                    `Dry-run: ${totalUpdated} / ${totalScanned} SKUs จะได้ box template` :
+                    `✅ Assign box template แล้ว ${totalUpdated} / ${totalScanned} SKUs`;
+                const samples = allSamples.map(s => `${esc(s.sku)} (${esc(s.pack_mode)}, ${s.weight_g}g) → tpl#${s.tpl_id}`).join('<br>');
                 result.innerHTML = '<div class="fsv42-alert fsv42-alert-success">' + esc(msg) +
                     (samples ? '<div style="margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;">' + samples + '</div>' : '') + '</div>';
                 if (!dry) { await FSV42.refreshCoverage(); await FSV42.refreshMultiBox(); }

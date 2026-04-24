@@ -71,6 +71,43 @@
 | REG-067 | F7 DLQ lifecycle | 3 retries fail → DLQ insert + Flex alert. Admin hits /retry → resolved/abandoned | Row status transitions |
 | REG-068 | F7 DLQ 30-day cleanup | `dinoco_flash_dlq_cleanup_cron` daily 03:00 → rows > 30d deleted | Row count stable long-term |
 
+## Round 4-7 Post-Ship Regression Scenarios (2026-04-21)
+
+### Round 4 (commit dd66123)
+
+| ID | Category | Scenario | Verify |
+|---|---|---|---|
+| REG-069 | Concurrency | Dispatcher double-click — 2 concurrent admin clicks on Flash Create button → GET_LOCK serializes → only 1 Flash order created | `b2b_flash_dispatch_create_all` uses `GET_LOCK` + only 1 PNO inserted |
+| REG-070 | Concurrency | `_inflight` Set with SKU discriminator — Save SKU_A + Save SKU_B in parallel → both succeed (not blocked) | Go-Live Multi-Box save; SKU_A + SKU_B rows present |
+| REG-071 | Validation | save-pack-slots count mismatch — Send 2 slots for bpu=3 SKU → 400 `slot_count_mismatch` | REST returns 400 + error code; no DB write |
+| REG-072 | Coverage | `bulk_pack` SKU with `box_template_id=NOT NULL` + `weight_per_unit_g=0` → NOT counted complete | `/coverage` breakdown excludes row |
+
+### Round 5 (commit e10ff0d)
+
+| ID | Category | Scenario | Verify |
+|---|---|---|---|
+| REG-073 | Resilience | `\Throwable` catch — simulate TypeError in resolver → `snapshot_failure` audit row created | `wp_dinoco_flash_audit` row with source=`snapshot_failure` |
+| REG-074 | Resilience | `error_log` fallback — audit INSERT fail scenario → PHP error log written | PHP error log grep `[flash-audit]` |
+| REG-075 | Idempotency | Dispatcher BO meta check — ticket with only `_flash_tracking_numbers_bo` set → dispatcher returns `idempotent_bo_only` | Response code `idempotent_bo_only`; no duplicate Flash order |
+| REG-076 | Concurrency | Lock timeout 15s — Worker A holds 10s, Worker B waits successfully | Both workers complete; no early `GET_LOCK=0` abort |
+| REG-077 | Resilience | Zero-denominator rollback — audit table truncated + DLQ 25 rows → auto-rollback triggers on absolute count | Flag auto-flips OFF; Telegram fires |
+| REG-078 | Observability | Cron heartbeats — each cron fires + writes `dinoco_cron_{name}_last_run` | 3 wp_options present with recent timestamps |
+| REG-079 | Schema | DLQ UNIQUE migration — legacy DB without constraint → migration adds it + dedups | SHOW CREATE TABLE has UNIQUE KEY on `(ticket_id, action)` |
+| REG-080 | XSS | jQuery DOM — slot_label with `<script>alert(1)</script>` → rendered as text, not executed | Browser DOM shows literal string; no alert fired |
+
+### Round 6/7 (commit b3faa05)
+
+| ID | Category | Scenario | Verify |
+|---|---|---|---|
+| REG-081 | Observability | Cron heartbeat key match — Go-Live Monitor reads correct option name → shows actual age | Monitor card shows "last run N min ago" (not "never") for all 3 crons |
+| REG-082 | Resilience | `wp_cache_flush_group` guard — simulate old object cache (function_exists=false) → falls to `wp_cache_flush`, no fatal | No PHP fatal; cache clears fully (coarser grain) |
+| REG-083 | Security | DLQ PII masking — INSERT row → `request_body` stored with masked `dstName` (first 3 + last 3 chars) | DLQ row `request_body.dstName` = `"สมช***นทร์"` not full name |
+| REG-084 | Resilience | DLQ retry via dispatcher — retry endpoint → rebuilds params from ticket_id, not stored body | Flash request fresh (not stored body replay); uses current ticket state |
+
+### Round 8 (if applicable — pending)
+
+Rounds 8+ scenarios to be added as commits land.
+
 ## Running tests manually
 
 **Backend logic tests** (until PHPUnit exists):

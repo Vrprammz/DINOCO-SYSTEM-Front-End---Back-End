@@ -1025,9 +1025,13 @@ Created 2026-04-16 alongside junction table. Drift log for CPT vs junction compa
 |------------|------|-------------|
 | `b2b_warehouse_address` | array | Warehouse name, address, phone |
 | `b2b_manual_shipments_{YYYY_MM}` | array | Manual Flash shipment records (monthly, includes separate address fields + sender_key). Status updated by webhook + `b2b_manual_flash_poll_cron`. Helper: `b2b_manual_shipment_months()` lists months with data. |
-| `dinoco_shipping_meta_enabled` | bool | **V.42** Master flag for Flash Shipping Metadata (default `false`). Auto-rollback cron flips OFF at >5% errors AND ≥20/hr count |
+| `dinoco_shipping_meta_enabled` | string ('0'\|'1') | **V.42** Master flag for Flash Shipping Metadata (default `'0'`). Auto-rollback cron flips OFF at >5% errors AND ≥20/hr count |
+| `dinoco_shipping_flag_flipped_at` | string (mysql datetime) | **V.42 Round 2** Timestamp of last flip (set by Go-Live `flip-flag` endpoint). Auto-rollback 5-min cooldown filters windowing on this timestamp |
 | `dinoco_shipping_defaults` | array | **V.42** Global fallback dims `{weight_grams, length_cm, width_cm, height_cm, article_category, express_threshold, default_box_template_id}` |
 | `dinoco_box_templates_seeded` | bool | **V.42** Idempotent seed marker (prevents duplicate INSERT on re-run) |
+| `dinoco_cron_flash_category_verify_last_run` | int (Unix timestamp) | **V.42 Round 5/7** Heartbeat written by `flash_category_verify_cron` (F2 EC bump detect, 15min). Go-Live Monitor reads for "last run N min ago" card |
+| `dinoco_cron_shipping_auto_rollback_last_run` | int (Unix timestamp) | **V.42 Round 5/7** Heartbeat written by `dinoco_shipping_auto_rollback_cron` (10min). Round 7 CRIT-1 fixed double-prefix key mismatch bug |
+| `dinoco_cron_flash_dlq_cleanup_last_run` | int (Unix timestamp) | **V.42 Round 5/7** Heartbeat written by `dinoco_flash_dlq_cleanup_cron` (daily 03:00). 30d DLQ + 90d audit retention |
 | `b2b_sku_relations` | array | Parent-child-grandchild SKU relationships (3-level flat format: `{ parent: [children], child: [grandchildren] }`) |
 | `dinoco_sku_relations` | array | SKU relations for legacy migration |
 

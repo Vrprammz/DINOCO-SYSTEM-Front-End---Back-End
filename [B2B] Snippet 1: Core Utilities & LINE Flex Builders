@@ -1,6 +1,15 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.11 (2026-04-21) — Round 8 MED/LOW cleanup:              ║
+ * ║    • MED-1: F2 cron strict code=1 check (was processing data on error) ║
+ * ║    • MED-2: JSON fallback for _flash_tracking_numbers unserialize     ║
+ * ║    • MED-3: Wire dinoco_set_shipping_flag() to auto-rollback cron +   ║
+ * ║             manual-rollback endpoint (helper no longer dead code)     ║
+ * ║    • MED-4: current_time('timestamp') → current_time('U') or time()   ║
+ * ║             (deprecated WP 5.3+)                                       ║
+ * ║    • MED-5: Heartbeat write for b2b_flash_tracking_cron (if in file)  ║
+ * ║    • LOW-1: DLQ retry reads status_code + error_code defensively      ║
  * ║  Version: V.34.10 (2026-04-21) — CRIT-1: cron heartbeat key mismatch fix║
  * ║    • Dropped redundant 'dinoco_' prefix from 2 of 3 cron heartbeat     ║
  * ║      option writes (Go-Live Monitor readers expect single prefix).    ║
@@ -6153,11 +6162,22 @@ add_action( 'rest_api_init', function() {
                         'resolved_by' => get_current_user_id(),
                     ), array( 'id' => $id ) );
                 } else {
+                    // V.34.11 LOW-1: read status_code + error_code defensively.
+                    // b2b_flash_request() V.34.4+ returns 'status_code' (HTTP)
+                    // reliably; 'error_code' (Flash business code) is populated
+                    // by the $execute wrapper in create-v42. Prefer non-empty
+                    // status_code first (always present on failure), fall back
+                    // to error_code, then generic error. Using !empty() skips
+                    // empty strings so we never bury a real code behind ''.
                     $err_code = 'unknown';
                     if ( is_array( $result ) ) {
-                        if ( isset( $result['error_code'] ) )      $err_code = (string) $result['error_code'];
-                        elseif ( isset( $result['status_code'] ) ) $err_code = (string) $result['status_code'];
-                        elseif ( isset( $result['error'] ) )       $err_code = (string) $result['error'];
+                        if ( ! empty( $result['status_code'] ) ) {
+                            $err_code = (string) $result['status_code'];
+                        } elseif ( ! empty( $result['error_code'] ) ) {
+                            $err_code = (string) $result['error_code'];
+                        } elseif ( ! empty( $result['error'] ) ) {
+                            $err_code = (string) $result['error'];
+                        }
                     }
                     $err_msg = '';
                     if ( is_array( $result ) ) {
@@ -6250,25 +6270,25 @@ add_action( 'rest_api_init', function() {
     register_rest_route( 'b2b/v1', '/shipping/manual-rollback', array(
         'methods'  => 'POST',
         'callback' => function( WP_REST_Request $req ) {
-            global $wpdb;
             $reason = sanitize_text_field( $req->get_param( 'reason' ) ) ?: 'admin manual rollback';
             $uid = get_current_user_id();
 
-            update_option( 'dinoco_shipping_meta_enabled', '0' );
+            // V.34.11 MED-3: route through dinoco_set_shipping_flag() — helper
+            // handles flipped_at + audit row (source='manual_rollback') in one
+            // transaction. Replaces 3 inline calls (update_option x2 + $wpdb->insert).
+            // NOTE: audit event_type is now 'flag_flip_off' (vs prior
+            // 'manual_rollback_flag') — dashboards reading audit table should
+            // filter on source='manual_rollback' inside payload_json.
             $rolled_back_at = current_time( 'mysql' );
-            // Track flip timestamp for auto-rollback cron window filter (H-C1)
-            update_option( 'dinoco_shipping_flag_flipped_at', $rolled_back_at );
-
-            $audit_tbl = $wpdb->prefix . 'dinoco_flash_audit';
-            if ( $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
-                $wpdb->insert( $audit_tbl, array(
-                    'ticket_id'        => 0,
-                    'event_type'       => 'manual_rollback_flag',
-                    'request_summary'  => wp_json_encode( array( 'user_id' => $uid, 'reason' => $reason ) ),
-                    'response_summary' => 'flag_disabled',
-                    'user_id'          => $uid,
-                    'created_at'       => $rolled_back_at,
-                ) );
+            if ( function_exists( 'dinoco_set_shipping_flag' ) ) {
+                $flip_result = dinoco_set_shipping_flag( '0', $reason, 'manual_rollback' );
+                if ( is_array( $flip_result ) && ! empty( $flip_result['flipped_at'] ) ) {
+                    $rolled_back_at = $flip_result['flipped_at'];
+                }
+            } else {
+                // Fallback — preserve legacy behavior if helper unavailable
+                update_option( 'dinoco_shipping_meta_enabled', '0' );
+                update_option( 'dinoco_shipping_flag_flipped_at', $rolled_back_at );
             }
 
             if ( function_exists( 'b2b_log' ) ) {
@@ -6364,8 +6384,21 @@ add_action( 'flash_category_verify_cron', function() {
 
     foreach ( $recent as $r ) {
         $ticket_id = (int) $r['ID'];
-        $pnos = maybe_unserialize( $r['pno'] );
-        if ( ! is_array( $pnos ) || empty( $pnos ) ) continue;
+        // V.34.11 MED-2: defensive JSON fallback — if future migration stores
+        // _flash_tracking_numbers as JSON string, maybe_unserialize() returns
+        // the string unchanged → is_array() filters it out silently. Try JSON
+        // decode as a second chance before giving up.
+        $pnos_raw = $r['pno'];
+        $pnos = maybe_unserialize( $pnos_raw );
+        if ( ! is_array( $pnos ) ) {
+            $json_decoded = json_decode( (string) $pnos_raw, true );
+            if ( is_array( $json_decoded ) ) {
+                $pnos = $json_decoded;
+            } else {
+                continue; // truly not an array
+            }
+        }
+        if ( empty( $pnos ) ) continue;
         $expected_ec = (int) get_post_meta( $ticket_id, '_flash_express_category', true ) ?: 1;
 
         // Query Flash Routes API for first PNO
@@ -6399,11 +6432,24 @@ add_action( 'flash_category_verify_cron', function() {
             }
         }
 
+        // V.34.11 MED-1: Only process if Flash API returned success (code=1).
+        // Previously we parsed $resp['data']['expressCategory'] even when
+        // flash_code !== 1 — Flash error responses carry 'data' with unrelated
+        // fields → actual_ec read stale/wrong → false ec_bumped alerts.
+        // $resp['ok'] is TRUE only when code === 1 (see builder above).
+        if ( empty( $resp['ok'] ) || empty( $resp['data'] ) ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[F2 verify] Flash API not-ok for pno=' . $first_pno . ' code=' . ( $resp['status_code'] ?? '?' ), 'warn' );
+            }
+            continue; // skip this ticket — retry next cycle
+        }
+
         // Parse actual EC from response (shape varies per Flash API version)
         $actual_ec = null;
-        if ( is_array( $resp ) ) {
-            if ( isset( $resp['data']['expressCategory'] ) ) $actual_ec = (int) $resp['data']['expressCategory'];
-            elseif ( isset( $resp['expressCategory'] ) ) $actual_ec = (int) $resp['expressCategory'];
+        if ( isset( $resp['data']['expressCategory'] ) ) {
+            $actual_ec = (int) $resp['data']['expressCategory'];
+        } elseif ( isset( $resp['expressCategory'] ) ) {
+            $actual_ec = (int) $resp['expressCategory'];
         }
 
         update_post_meta( $ticket_id, '_flash_ec_verified_at', current_time( 'mysql' ) );
@@ -6511,7 +6557,11 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
     // Simpler fix: compare ISO strings lexically, both in local time.
     $flipped_at = (string) get_option( 'dinoco_shipping_flag_flipped_at', '' );
     if ( $flipped_at ) {
-        $cooldown_threshold = date( 'Y-m-d H:i:s', current_time( 'timestamp' ) - 300 );
+        // V.34.11 MED-4: current_time('timestamp') is deprecated since WP 5.3.
+        // Use current_time('U') — same semantic (WP local time as Unix epoch)
+        // without deprecation warning. Comparison is lexical ISO strings so both
+        // sides must remain in Bangkok TZ (H-2 invariant preserved).
+        $cooldown_threshold = date( 'Y-m-d H:i:s', (int) current_time( 'U' ) - 300 );
         if ( $flipped_at > $cooldown_threshold ) return; // within 5-min cooldown
     }
 
@@ -6530,8 +6580,9 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
         // Prevents counting pre-flag-flip errors against current flag session.
         // V.34.8 Round 4 H-2: both sides in Bangkok TZ — strtotime on stored
         // Bangkok literal vs strtotime('-1 hour') (which uses server TZ) had
-        // 7hr drift. Now uses current_time('timestamp') for the reference.
-        $one_hour_ago_local = date( 'Y-m-d H:i:s', current_time( 'timestamp' ) - 3600 );
+        // 7hr drift. Now uses current_time('U') for the reference.
+        // V.34.11 MED-4: 'timestamp' arg deprecated in WP 5.3+ → use 'U' instead.
+        $one_hour_ago_local = date( 'Y-m-d H:i:s', (int) current_time( 'U' ) - 3600 );
         $window_start_q = ( $flipped_at && $flipped_at > $one_hour_ago_local )
             ? $flipped_at
             : $one_hour_ago_local;
@@ -6577,9 +6628,19 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
             $should_rollback = ( $rate > 5.0 && $errors > 20 );
         }
         if ( $should_rollback ) {
-            update_option( 'dinoco_shipping_meta_enabled', '0' );
-            // Track flip for next rollback cycle + H-C1 window filter
-            update_option( 'dinoco_shipping_flag_flipped_at', current_time( 'mysql' ) );
+            // V.34.11 MED-3: route through dinoco_set_shipping_flag() — single
+            // source of truth for flag mutation + writes flipped_at + audit row
+            // (event_type=flag_flip_off). Removes duplicate inline audit insert
+            // below (helper handles it). Helper is defined same-file so always
+            // loaded; defensive function_exists just in case of partial loads.
+            $reason = sprintf( 'auto-rollback: error rate %.1f%% (%d/%d) in last hour', $rate, $errors, $total_attempts );
+            if ( function_exists( 'dinoco_set_shipping_flag' ) ) {
+                dinoco_set_shipping_flag( '0', $reason, 'auto_rollback' );
+            } else {
+                // Fallback — keep legacy path if helper somehow unavailable
+                update_option( 'dinoco_shipping_meta_enabled', '0' );
+                update_option( 'dinoco_shipping_flag_flipped_at', current_time( 'mysql' ) );
+            }
             $msg = sprintf(
                 '🚨 AUTO-ROLLBACK: V.42 flag disabled — error rate %.1f%% (%d/%d) in last hour. Check Admin Dashboard → Flash Shipping → DLQ + Audit',
                 $rate, $errors, $total_attempts
@@ -6590,18 +6651,8 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
                 sendTelegramAlert( 'flash_rollback', $tg_msg );
             }
             if ( function_exists( 'b2b_log' ) ) b2b_log( "[AutoRollback] V.42 flag disabled: rate={$rate}% errors={$errors} total={$total_attempts}" );
-
-            // Audit the rollback event itself
-            if ( $audit_tbl && $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" ) ) {
-                $wpdb->insert( $audit_tbl, array(
-                    'ticket_id'        => 0,
-                    'event_type'       => 'auto_rollback',
-                    'request_summary'  => wp_json_encode( array( 'rate_pct' => $rate, 'errors' => $errors, 'total' => $total_attempts ) ),
-                    'response_summary' => 'flag_disabled',
-                    'user_id'          => 0,
-                    'created_at'       => current_time( 'mysql' ),
-                ) );
-            }
+            // Inline audit row removed — dinoco_set_shipping_flag() writes
+            // event_type='flag_flip_off' row with reason + source='auto_rollback'
         }
     } finally {
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
@@ -6613,7 +6664,8 @@ add_action( 'dinoco_shipping_auto_rollback_cron', function() {
 // ───────────────────────────────────────────────────────────────────
 if ( ! wp_next_scheduled( 'dinoco_flash_dlq_cleanup_cron' ) ) {
     // Next 03:00 in Asia/Bangkok
-    $now = current_time( 'timestamp' );
+    // V.34.11 MED-4: 'timestamp' arg deprecated in WP 5.3+ → use 'U' instead.
+    $now = (int) current_time( 'U' );
     $next = strtotime( 'today 03:00', $now );
     if ( $next <= $now ) $next = strtotime( 'tomorrow 03:00', $now );
     wp_schedule_event( $next, 'daily', 'dinoco_flash_dlq_cleanup_cron' );
