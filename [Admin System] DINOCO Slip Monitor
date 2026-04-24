@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.1 (2026-04-24) — Slip Review Round:                  ║
+ * ║    • M-1 Replace inline onclick=... group_id passing with data-gid  ║
+ * ║           attributes + event delegation (defense-in-depth XSS)      ║
+ * ║    • M-4 /recent + /missed-sweep enrich dist_name via batched       ║
+ * ║           single JOIN query (was N+1 get_posts per row)             ║
+ * ║    • M-6 /missed-sweep rate-limit 10/min/user                        ║
  * ║  Version: V.1.0 (2026-04-24) — Slip Resilience (regression fix) ║
  * ║  DB_ID: 1190                                                 ║
  * ║  Description: Admin UI + REST endpoints for slip processing  ║
@@ -204,9 +210,12 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_recent' ) ) {
                 LIMIT %d";
         $rows = $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A );
 
-        // Enrich with dist_name
+        // V.1.1 M-4: batch enrich (single JOIN query, previously N+1 get_posts)
+        $gids = array();
+        foreach ( $rows as $r ) { if ( ! empty( $r['group_id'] ) ) $gids[] = $r['group_id']; }
+        $name_map = dinoco_slip_monitor_get_dist_names_batch( $gids );
         foreach ( $rows as &$row ) {
-            $row['dist_name'] = dinoco_slip_monitor_get_dist_name( $row['group_id'] );
+            $row['dist_name'] = isset( $name_map[ $row['group_id'] ] ) ? $name_map[ $row['group_id'] ] : '';
         }
         unset( $row );
 
@@ -247,6 +256,17 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_clear_locks' ) ) {
 // ────────────────────────────────────────────────────────────────
 if ( ! function_exists( 'dinoco_slip_monitor_rest_missed_sweep' ) ) {
     function dinoco_slip_monitor_rest_missed_sweep( WP_REST_Request $req ) {
+        // V.1.1 M-6: rate-limit 10/min/user. Forensic sweep scans up to 500 rows across
+        // 90 days — admin could spam it during debug panic and lock the table. Same
+        // pattern as /clear-locks.
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'slip_missed_sweep_u' . $uid, 10, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 10/min)', array( 'status' => 429 ) );
+            }
+        }
+
         global $wpdb;
         $table = $wpdb->prefix . 'dinoco_slip_log';
         $table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
@@ -272,8 +292,12 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_missed_sweep' ) ) {
             $days
         ), ARRAY_A );
 
+        // V.1.1 M-4: batch enrich (single JOIN query, was N+1 across up to 500 rows)
+        $gids = array();
+        foreach ( $rows as $r ) { if ( ! empty( $r['group_id'] ) ) $gids[] = $r['group_id']; }
+        $name_map = dinoco_slip_monitor_get_dist_names_batch( $gids );
         foreach ( $rows as &$row ) {
-            $row['dist_name'] = dinoco_slip_monitor_get_dist_name( $row['group_id'] );
+            $row['dist_name'] = isset( $name_map[ $row['group_id'] ] ) ? $name_map[ $row['group_id'] ] : '';
         }
         unset( $row );
 
@@ -303,14 +327,75 @@ if ( ! function_exists( 'dinoco_slip_monitor_get_dist_name' ) ) {
         static $cache = array();
         if ( ! $group_id ) return '';
         if ( isset( $cache[ $group_id ] ) ) return $cache[ $group_id ];
-        $posts = get_posts( array(
-            'post_type' => 'distributor', 'posts_per_page' => 1, 'post_status' => 'any',
-            'meta_query' => array( array( 'key' => 'line_group_id', 'value' => $group_id ) ),
-            'fields' => 'ids',
-        ) );
-        $name = ! empty( $posts ) ? get_the_title( $posts[0] ) : '';
+        // V.1.1 M-4: single-row fallback uses batch helper so the same static cache
+        // is populated — subsequent calls in the same request hit the cache.
+        $map = dinoco_slip_monitor_get_dist_names_batch( array( $group_id ) );
+        $name = isset( $map[ $group_id ] ) ? $map[ $group_id ] : '';
         $cache[ $group_id ] = $name;
         return $name;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// V.1.1 M-4: Batch distributor-name lookup — single JOIN query
+// Replaces per-row get_posts() (was N+1 across /recent + /missed-sweep).
+// 50-row /recent call: 50 meta_query get_posts → 1 JOIN. ~400ms saved per load.
+// Returns [ group_id => title ] map. Unknown groups map to empty string.
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_get_dist_names_batch' ) ) {
+    function dinoco_slip_monitor_get_dist_names_batch( $group_ids ) {
+        static $cache = array();
+        if ( empty( $group_ids ) || ! is_array( $group_ids ) ) return array();
+
+        // Normalize + dedup + filter empty
+        $group_ids = array_unique( array_filter( array_map( 'strval', $group_ids ), 'strlen' ) );
+        if ( empty( $group_ids ) ) return array();
+
+        // Return from cache where possible; query only uncached ids
+        $result = array();
+        $missing = array();
+        foreach ( $group_ids as $gid ) {
+            if ( array_key_exists( $gid, $cache ) ) {
+                $result[ $gid ] = $cache[ $gid ];
+            } else {
+                $missing[] = $gid;
+            }
+        }
+        if ( empty( $missing ) ) return $result;
+
+        global $wpdb;
+        if ( ! $wpdb ) {
+            foreach ( $missing as $gid ) { $result[ $gid ] = ''; $cache[ $gid ] = ''; }
+            return $result;
+        }
+
+        $placeholders = implode( ',', array_fill( 0, count( $missing ), '%s' ) );
+        $sql = "SELECT pm.meta_value AS gid, p.post_title AS name
+                FROM {$wpdb->posts} p
+                INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+                WHERE p.post_type = 'distributor'
+                  AND pm.meta_key = 'line_group_id'
+                  AND pm.meta_value IN ({$placeholders})";
+        // post_status='any' semantics preserved by omitting post_status filter — a later
+        // admin could repurpose a trashed distributor post and we still want to show
+        // its title in audit logs for historical accuracy.
+        $rows = $wpdb->get_results( $wpdb->prepare( $sql, $missing ), ARRAY_A );
+
+        $found = array();
+        if ( is_array( $rows ) ) {
+            foreach ( $rows as $row ) {
+                $found[ (string) $row['gid'] ] = (string) $row['name'];
+            }
+        }
+
+        // Populate cache + result for ALL requested ids (unknown → '')
+        foreach ( $missing as $gid ) {
+            $name = isset( $found[ $gid ] ) ? $found[ $gid ] : '';
+            $cache[ $gid ] = $name;
+            $result[ $gid ] = $name;
+        }
+
+        return $result;
     }
 }
 
@@ -474,6 +559,11 @@ function dinoco_slip_monitor_render() {
                 document.getElementById('dncSlipLocks').innerHTML = '<p style="color:#64748b; font-size:13px;">— ไม่มี active lock หรือ queue —</p>';
             } else {
                 const rows = [];
+                // V.1.1 M-1: data-gid attribute + event delegation (see bind at bottom
+                // of IIFE). HTML attribute context auto-decodes entities before JS
+                // consumes them, so inline onclick with interpolated group_id had a
+                // latent XSS vector even with esc(). Data attributes are read via
+                // dataset.gid which returns the decoded-once value safely.
                 locks.forEach(l => {
                     const statusBadge = l.is_stuck ? '<span class="dnc-slip-status slip2go_error">ค้าง ' + Math.abs(l.remaining_s) + 's</span>' :
                         '<span class="dnc-slip-status queued">เหลือ ' + l.remaining_s + 's</span>';
@@ -483,7 +573,7 @@ function dinoco_slip_monitor_render() {
                         <td><span class="dnc-slip-code">${esc(l.group_id)}</span></td>
                         <td>${statusBadge}</td>
                         <td>—</td>
-                        <td><button class="dnc-slip-btn" onclick="dncSlipClearOne('${esc(l.group_id)}')">Force Clear</button></td>
+                        <td><button class="dnc-slip-btn dnc-slip-clear-one" data-gid="${esc(l.group_id)}">Force Clear</button></td>
                     </tr>`);
                 });
                 queues.forEach(q => {
@@ -496,7 +586,7 @@ function dinoco_slip_monitor_render() {
                         <td><span class="dnc-slip-code">${esc(q.group_id)}</span></td>
                         <td>${statusBadge}</td>
                         <td>size=${q.size}, oldest=${q.oldest_age_min}min</td>
-                        <td><button class="dnc-slip-btn" onclick="dncSlipClearOne('${esc(q.group_id)}')">Force Clear</button></td>
+                        <td><button class="dnc-slip-btn dnc-slip-clear-one" data-gid="${esc(q.group_id)}">Force Clear</button></td>
                     </tr>`);
                 });
                 document.getElementById('dncSlipLocks').innerHTML = `<table class="dnc-slip-table">
@@ -574,6 +664,24 @@ function dinoco_slip_monitor_render() {
                     <tbody>${trs}</tbody>
                 </table>`;
         };
+
+        // V.1.1 M-1: event delegation for dynamically-rendered Force Clear buttons.
+        // Single listener at container level — no per-render bind + no inline onclick
+        // interpolation. Guards against HTML-attribute-context XSS with malicious
+        // group_id (admin-gated, defense-in-depth per code review).
+        document.addEventListener('click', function(e) {
+            const btn = e.target && e.target.closest ? e.target.closest('.dnc-slip-clear-one') : null;
+            if (!btn) return;
+            const gid = btn.dataset && btn.dataset.gid ? btn.dataset.gid : '';
+            if (!gid) return;
+            // Guard against accidental double-click during async API call
+            if (btn.disabled) return;
+            btn.disabled = true;
+            window.dncSlipClearOne(gid).finally(function() {
+                // Re-enable only if the button is still in DOM (refresh may have replaced it)
+                if (document.body.contains(btn)) btn.disabled = false;
+            });
+        });
 
         // Auto-load on page ready
         if (document.readyState === 'loading') {

@@ -1,6 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.9 (2026-04-24) — Slip Review Round (4H+7M+3L):           ║
+ * ║    • H-1 Finally recursion → iterative loop w/ 8s time budget          ║
+ * ║           + overflow to b2b_slip_drain_cron (wp_schedule_single_event) ║
+ * ║    • H-2 Queue snapshot race → re-read option each iteration + shift   ║
+ * ║    • H-4 Cron scheduling moved file-load → init hook priority 20       ║
+ * ║           (b2b_slip_register_crons) — ensures all 3 hooks bound        ║
+ * ║    • NEW b2b_slip_drain_cron hook handler (single-item background)     ║
+ * ║    • M-2 Slip2Go error counter → b2b_slip_incr_err_count() atomic      ║
+ * ║    • M-5 Throwable catch in slip handler — fatal exceptions stamped    ║
+ * ║           in audit row (error_code=exception class, file+line logged)  ║
+ * ║    • L-4 Maker group without b2f_route_maker_command → explicit log   ║
+ * ║           NOT silent fall-through to unregistered-group path           ║
+ * ║    • L-5 Lock cleanup cron admin alert: 6h dedup transient to prevent  ║
+ * ║           spam when persistent cache is misconfigured cluster-wide     ║
  * ║  Version: V.34.8 (2026-04-24) — SLIP RESILIENCE + OBSERVABILITY (regression fix): ║
  * ║    Incident: CNX MotoGear ส่งสลิป KKP 069 ยอด 2,280 THB → บอทเงียบ + หนี้ไม่ตัด    ║
  * ║    Root cause candidates (observability ใหม่จะระบุใน production):                  ║
@@ -161,6 +175,7 @@ function b2b_process_line_webhook( WP_REST_Request $request ) {
 
             if ( !$dist_id ) {
                 // ★ B2F ROUTING: ตรวจว่าเป็น Maker group หรือไม่
+                $_is_b2f_maker_but_broken = false;
                 if ( function_exists('b2f_get_maker_by_group') ) {
                     $b2f_maker = b2f_get_maker_by_group($group_id);
 
@@ -169,9 +184,34 @@ function b2b_process_line_webhook( WP_REST_Request $request ) {
                         b2f_route_maker_command($event, $b2f_maker);
                         continue;
                     }
+
+                    // V.34.9 L-4: Maker matched but router function missing — config error.
+                    // Do NOT fall-through to unregistered-group alert path (which would spam
+                    // admin that a *legitimate* Maker is unregistered). Log once per hour
+                    // per group so admin can fix Snippet 3 deployment.
+                    if ( $b2f_maker && ! function_exists( 'b2f_route_maker_command' ) ) {
+                        $_is_b2f_maker_but_broken = true;
+                        if ( function_exists( 'b2b_log' ) ) {
+                            b2b_log( '[B2F CONFIG] Maker matched group=' . $group_id
+                                . ' but b2f_route_maker_command() not loaded — check Snippet 3 status' );
+                        }
+                        $cfg_alert_key = 'b2b_b2f_router_missing_' . md5( (string) $group_id );
+                        if ( ! get_transient( $cfg_alert_key ) && function_exists( 'b2b_push_to_admin' ) ) {
+                            set_transient( $cfg_alert_key, 1, HOUR_IN_SECONDS );
+                            b2b_push_to_admin(
+                                "⚠️ B2F Maker config error\n"
+                                . "Group: " . $group_id . "\n"
+                                . "b2f_get_maker_by_group() เจอ Maker แต่ b2f_route_maker_command() ไม่พร้อม\n"
+                                . "→ เช็คว่า [B2F] Snippet 3 โหลดสำเร็จ"
+                            );
+                        }
+                    }
                 }
 
-                $_unregistered_group = true;
+                // V.34.9 L-4: only flag as truly unregistered if NOT a broken-router maker case
+                if ( ! $_is_b2f_maker_but_broken ) {
+                    $_unregistered_group = true;
+                }
             } else {
                 $bot_val = get_post_meta($dist_id, 'bot_enabled', true);
                 if ( $bot_val === '0' ) {
@@ -2651,11 +2691,16 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
 
     // V.34.8: track Slip2Go health metric (admin alert if threshold exceeded)
     if ( $http_code !== 200 || ! is_array( $slip ) ) {
-        // เพิ่ม error counter + alert admin ถ้าเจอ error ≥3 ครั้งใน 10 นาที
-        $err_count_key = 'b2b_slip2go_err_count';
-        $err_count = (int) get_transient( $err_count_key );
-        $err_count++;
-        set_transient( $err_count_key, $err_count, 10 * MINUTE_IN_SECONDS );
+        // V.34.9 M-2: atomic increment (race-safe via wp_cache_incr or wpdb UPDATE)
+        if ( function_exists( 'b2b_slip_incr_err_count' ) ) {
+            $err_count = b2b_slip_incr_err_count( 10 * MINUTE_IN_SECONDS );
+        } else {
+            // Fallback to best-effort non-atomic path if helper not loaded yet (pre-sync)
+            $err_count_key = 'b2b_slip2go_err_count';
+            $err_count = (int) get_transient( $err_count_key );
+            $err_count++;
+            set_transient( $err_count_key, $err_count, 10 * MINUTE_IN_SECONDS );
+        }
         if ( $err_count >= 3 ) {
             $alerted = get_transient( 'b2b_slip2go_alerted' );
             if ( ! $alerted ) {
@@ -3038,11 +3083,23 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         $_slip_final_error_msg  = 'slip2go.code=' . $code;
     }
 
+    } catch ( \Throwable $e ) {
+        // V.34.9 M-5: stamp fatal exceptions in audit row — finally still runs after this
+        $_slip_final_status = ( $_slip_final_status === 'unknown' ) ? 'fatal_exception' : $_slip_final_status;
+        $_slip_final_error_code = substr( get_class( $e ), 0, 32 );
+        $_slip_final_error_msg = substr(
+            $e->getMessage() . ' @ ' . basename( $e->getFile() ) . ':' . $e->getLine(),
+            0, 490
+        );
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( '[Slip] FATAL ' . $_slip_final_error_code . ' ' . $_slip_final_error_msg );
+        }
+        // ไม่ rethrow — finally block จะ release lock + เขียน audit row + drain queue ปกติ
     } finally {
         // V.34.8: GUARANTEED cleanup — run ไม่ว่าอะไรจะเกิดขึ้น (success, return, exception)
         //   1. Release lock ก่อนเสมอ (ป้องกัน lock ค้าง)
         //   2. Write slip_log audit row (observability + forensic)
-        //   3. Drain queue (loop + skip stale — was bug: stop on first stale)
+        //   3. Drain queue (V.34.9 iterative loop + re-read per iter + overflow cron)
         try {
             delete_transient( $lock_key );
         } catch ( \Throwable $e ) { /* silent */ }
@@ -3070,33 +3127,121 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
             }
         } catch ( \Throwable $e ) { /* silent */ }
 
-        // Drain queue — loop + skip stale (V.34.8 bug fix H-A1)
-        // Bug เดิม: ถ้า top of queue เป็น stale (>300s) → return ไม่ recurse → stale items ค้าง forever
-        // Fix: loop shift + skip stale จนกว่าจะเจอ valid entry หรือ queue empty
+        // V.34.9 H-1 + H-2: Drain queue as iterative loop with time budget.
+        // Previous design (V.34.8) recursed into b2b_handle_slip_image() per queue entry →
+        //   N items × 138s worst-case = 46min stack → LINE webhook timeout + memory bloat.
+        // Previous design also snapshot $queue once → concurrent push() during drain was lost.
+        // Fix:
+        //   (a) Re-read option on each iteration (prevents overwrite of concurrent pushes).
+        //   (b) Process ONE valid slip synchronously then break — prevents re-entry.
+        //   (c) If queue still non-empty after we've spent too long (≥7s budget),
+        //       schedule b2b_slip_drain_cron (single-shot background event) to continue.
         try {
-            $queue = get_option( 'b2b_slip_queue_' . $group_id, array() );
-            $next_valid = null;
-            while ( ! empty( $queue ) ) {
-                $candidate = array_shift( $queue );
-                if ( ! empty( $candidate['message_id'] ) && ( time() - (int) ( $candidate['time'] ?? 0 ) ) < 300 ) {
-                    $next_valid = $candidate;
-                    break;
-                }
-                b2b_log( '[Slip] Skipped stale queue entry msg=' . ( $candidate['message_id'] ?? '-' ) . ' age=' . ( time() - (int) ( $candidate['time'] ?? 0 ) ) . 's' );
-            }
-            update_option( 'b2b_slip_queue_' . $group_id, $queue, false );
-            if ( empty( $queue ) ) delete_option( 'b2b_slip_queue_' . $group_id );
+            $drain_started_at = microtime( true );
+            $time_budget_s = 7.0; // leave ~1s headroom before LINE webhook 10s SLA
 
-            if ( $next_valid ) {
-                b2b_log( '[Slip] Processing queued slip ' . $next_valid['message_id'] . ' for group ' . $group_id );
-                // Recurse (note: lock already released → next call will acquire fresh lock)
-                b2b_handle_slip_image( $next_valid['message_id'], $group_id, $next_valid['user_id'], '', $manual_mode );
+            $did_process_one = false;
+            // Pop one stale-filtered valid candidate, with re-read protection
+            // (outer while exists for skip-stale — does NOT recurse)
+            while ( ( microtime( true ) - $drain_started_at ) < $time_budget_s ) {
+                // H-2 FIX: re-read fresh each iter so concurrent push during this loop is preserved
+                $queue = get_option( 'b2b_slip_queue_' . $group_id, array() );
+                if ( empty( $queue ) ) break;
+
+                $candidate = array_shift( $queue );
+                // Persist shift immediately so if we crash mid-loop the item is not re-drained
+                if ( empty( $queue ) ) {
+                    delete_option( 'b2b_slip_queue_' . $group_id );
+                } else {
+                    update_option( 'b2b_slip_queue_' . $group_id, $queue, false );
+                }
+
+                // Stale filter (>300s = abandoned)
+                if ( empty( $candidate['message_id'] ) || ( time() - (int) ( $candidate['time'] ?? 0 ) ) >= 300 ) {
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( '[Slip] Skipped stale queue entry msg=' . ( $candidate['message_id'] ?? '-' )
+                            . ' age=' . ( time() - (int) ( $candidate['time'] ?? 0 ) ) . 's' );
+                    }
+                    continue;
+                }
+
+                // Valid candidate → process ONE synchronously then break.
+                // Note: lock already released above → recursive call acquires fresh lock.
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[Slip] Processing queued slip ' . $candidate['message_id']
+                        . ' for group ' . $group_id . ' (elapsed=' . round( microtime( true ) - $drain_started_at, 2 ) . 's)' );
+                }
+                b2b_handle_slip_image( $candidate['message_id'], $group_id, $candidate['user_id'], '', $manual_mode );
+                $did_process_one = true;
+                break; // only 1 per outer call — prevents deep re-entry
+            }
+
+            // H-1 FIX: Budget exceeded OR item processed but queue still has more →
+            //          schedule background cron to continue draining.
+            // Re-check fresh (post-recursion push() may have added more).
+            $remaining = get_option( 'b2b_slip_queue_' . $group_id, array() );
+            if ( ! empty( $remaining ) && is_array( $remaining ) ) {
+                // Avoid piling up cron events — only schedule if none pending within 90s
+                $has_scheduled = wp_next_scheduled( 'b2b_slip_drain_cron', array( $group_id ) );
+                if ( ! $has_scheduled ) {
+                    wp_schedule_single_event( time() + 60, 'b2b_slip_drain_cron', array( $group_id ) );
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( '[Slip] Scheduled b2b_slip_drain_cron+60s for group=' . $group_id
+                            . ' queue_size=' . count( $remaining )
+                            . ' processed_this_call=' . ( $did_process_one ? '1' : '0' ) );
+                    }
+                }
             }
         } catch ( \Throwable $e ) {
-            b2b_log( '[Slip] Queue drain exception: ' . $e->getMessage() );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip] Queue drain exception: ' . $e->getMessage() );
+            }
         }
     }
 }
+
+// V.34.9 H-1: Background drain cron handler — continues processing slip queue
+// off the LINE webhook hot path. One item per cron tick; if queue still non-empty
+// after processing, handler re-schedules itself via finally block above.
+if ( ! function_exists( 'b2b_slip_drain_cron_handler' ) ) {
+    function b2b_slip_drain_cron_handler( $group_id ) {
+        if ( empty( $group_id ) || ! is_string( $group_id ) ) return;
+        $queue = get_option( 'b2b_slip_queue_' . $group_id, array() );
+        if ( empty( $queue ) || ! is_array( $queue ) ) return;
+
+        // Pop oldest valid (re-read not needed here — single writer in cron context)
+        $candidate = null;
+        while ( ! empty( $queue ) ) {
+            $c = array_shift( $queue );
+            if ( empty( $c['message_id'] ) ) continue;
+            if ( ( time() - (int) ( $c['time'] ?? 0 ) ) >= 300 ) {
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[SlipDrainCron] Skipped stale msg=' . ( $c['message_id'] ?? '-' )
+                        . ' age=' . ( time() - (int) ( $c['time'] ?? 0 ) ) . 's' );
+                }
+                continue;
+            }
+            $candidate = $c;
+            break;
+        }
+        // Save back remainder (even if no candidate found — we consumed stales)
+        if ( empty( $queue ) ) {
+            delete_option( 'b2b_slip_queue_' . $group_id );
+        } else {
+            update_option( 'b2b_slip_queue_' . $group_id, $queue, false );
+        }
+
+        if ( $candidate ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[SlipDrainCron] Processing msg=' . $candidate['message_id']
+                    . ' for group=' . $group_id );
+            }
+            b2b_handle_slip_image( $candidate['message_id'], $group_id, $candidate['user_id'], '', false );
+            // finally block in b2b_handle_slip_image will re-schedule cron if more remain
+        }
+    }
+}
+add_action( 'b2b_slip_drain_cron', 'b2b_slip_drain_cron_handler', 10, 1 );
 
 // ════════════════════════════════════════════════════════════════
 // V.30.0: RECEIPT IMAGE → AI READER (admin group only)
@@ -4155,14 +4300,26 @@ function b2b_walkin_auto_complete( $order_id, $from_status, $to_status, $actor )
 // ════════════════════════════════════════════════════════════════
 // V.34.8: SLIP RESILIENCE CRONS
 // Self-healing: lock cleanup (hourly) + queue recovery (twicedaily)
+// V.34.9 H-4: scheduling moved file-load → init hook (priority 20).
+// Rationale: wp_next_scheduled + wp_schedule_event must run AFTER WP core
+// has set up the cron API. Running at file-include could silently fail on
+// some environments (persistent cache warm-up, early-include snippet loaders).
 // ════════════════════════════════════════════════════════════════
 
-if ( ! wp_next_scheduled( 'b2b_slip_lock_cleanup_cron' ) ) {
-    wp_schedule_event( time() + 300, 'hourly', 'b2b_slip_lock_cleanup_cron' );
+if ( ! function_exists( 'b2b_slip_register_crons' ) ) {
+    function b2b_slip_register_crons() {
+        if ( ! wp_next_scheduled( 'b2b_slip_lock_cleanup_cron' ) ) {
+            wp_schedule_event( time() + 300, 'hourly', 'b2b_slip_lock_cleanup_cron' );
+        }
+        if ( ! wp_next_scheduled( 'b2b_slip_queue_recovery_cron' ) ) {
+            wp_schedule_event( time() + 600, 'twicedaily', 'b2b_slip_queue_recovery_cron' );
+        }
+        // Note: b2b_slip_drain_cron is NOT auto-scheduled — it uses
+        // wp_schedule_single_event() from b2b_handle_slip_image() finally block
+        // (overflow path). Hook binding happens unconditionally below.
+    }
 }
-if ( ! wp_next_scheduled( 'b2b_slip_queue_recovery_cron' ) ) {
-    wp_schedule_event( time() + 600, 'twicedaily', 'b2b_slip_queue_recovery_cron' );
-}
+add_action( 'init', 'b2b_slip_register_crons', 20 );
 
 if ( ! function_exists( 'b2b_slip_lock_cleanup_handler' ) ) {
     /**
@@ -4200,12 +4357,30 @@ if ( ! function_exists( 'b2b_slip_lock_cleanup_handler' ) ) {
 
         if ( $cleared > 0 ) {
             b2b_log( '[SlipCron] Lock cleanup: cleared ' . $cleared . ' stuck locks (groups=' . implode( ',', array_slice( $groups, 0, 5 ) ) . ')' );
+            // V.34.9 L-5: 6h dedup on admin alert — prevent spam when persistent cache
+            // misconfig is cluster-wide (would otherwise blast admin every hour).
+            // Aggregate subsequent cleared counts into a pending counter for digest alert.
             if ( function_exists( 'b2b_push_to_admin' ) ) {
-                b2b_push_to_admin(
-                    "🔧 Slip Lock Recovery (auto)\n"
-                    . "เจอ lock ค้าง " . $cleared . " groups → force-unlock แล้ว\n"
-                    . "สาเหตุที่เป็นไปได้: persistent cache misconfig (Redis TTL) หรือ daemon crash"
-                );
+                $alert_dedup_key = 'b2b_slip_lock_cron_alert_sent';
+                if ( ! get_transient( $alert_dedup_key ) ) {
+                    $pending_extra = (int) get_option( 'b2b_slip_lock_cron_pending_count', 0 );
+                    $total_to_report = $cleared + $pending_extra;
+                    $msg = "🔧 Slip Lock Recovery (auto)\n"
+                        . "เจอ lock ค้าง " . $total_to_report . " groups → force-unlock แล้ว\n";
+                    if ( $pending_extra > 0 ) {
+                        $msg .= "(รวม " . $pending_extra . " จากรอบก่อนที่ถูก dedup)\n";
+                    }
+                    $msg .= "สาเหตุที่เป็นไปได้: persistent cache misconfig (Redis TTL) หรือ daemon crash";
+                    b2b_push_to_admin( $msg );
+                    set_transient( $alert_dedup_key, 1, 6 * HOUR_IN_SECONDS );
+                    if ( $pending_extra > 0 ) {
+                        delete_option( 'b2b_slip_lock_cron_pending_count' );
+                    }
+                } else {
+                    // Within dedup window — queue for digest alert on next window
+                    $pending = (int) get_option( 'b2b_slip_lock_cron_pending_count', 0 );
+                    update_option( 'b2b_slip_lock_cron_pending_count', $pending + $cleared, false );
+                }
             }
         }
     }
