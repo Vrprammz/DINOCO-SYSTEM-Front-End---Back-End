@@ -14,8 +14,9 @@
 | `liff-src/shared/liff-init.js` | 7 | LIFF SDK init flow, login redirect, profile fallback, closeLiff |
 | `liff-src/shared/liff-auth.js` | 9 | Backend auth handshake, payload contract, error surface |
 | `liff-src/shared/modal.js` | 9 | Bridge to `window.dinocoModal` + native confirm/alert fallback |
+| `docs/api/openapi.yaml` | 9 | OpenAPI 3.1 spec validation — YAML parse, structural correctness, $ref resolution, security scheme integrity |
 
-Total: **95 tests, < 1s**. Coverage: **95.8% stmts / 84.8% branches / 90.9% funcs**.
+Total: **104 tests, < 1s**. Code coverage: **95.8% stmts / 84.8% branches / 90.9% funcs**.
 
 ---
 

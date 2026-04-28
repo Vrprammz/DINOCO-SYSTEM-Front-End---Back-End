@@ -59,8 +59,8 @@ Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-fun
 |---|---|---|---|
 | PHPUnit Unit | 110 | < 5s | Pure-logic helpers (math/policy) |
 | PHPUnit Integration | 51 | ~1 min | DB-coupled (FOR UPDATE, GET_LOCK, FSM, REST) |
-| Jest | 95 | < 1s | LIFF foundation modules |
-| **Total** | **256** | | |
+| Jest | 104 | < 1s | LIFF foundation modules + OpenAPI spec validation |
+| **Total** | **265** | | |
 
 ## Deployment
 
