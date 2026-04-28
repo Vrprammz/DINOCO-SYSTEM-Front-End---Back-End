@@ -144,8 +144,13 @@ abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
 
     /**
      * Convenience: assert that a value is a WP_Error with optional code match.
+     *
+     * NOT named `assertWPError` — that clashes with WP_UnitTestCase_Base's own
+     * static helper (different signature: $actual, $message). Use this when
+     * you want to match a specific error code; for plain instance checks,
+     * call WP's `static::assertWPError($result)` directly.
      */
-    protected function assertWPError( $thing, ?string $expected_code = null, string $message = '' ): void {
+    protected function assertDinocoWPError( $thing, ?string $expected_code = null, string $message = '' ): void {
         $this->assertInstanceOf( \WP_Error::class, $thing, $message ?: 'Expected WP_Error' );
         if ( $expected_code !== null ) {
             $this->assertSame(

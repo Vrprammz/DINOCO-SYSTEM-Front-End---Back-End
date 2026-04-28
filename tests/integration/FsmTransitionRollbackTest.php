@@ -91,7 +91,7 @@ final class FsmTransitionRollbackTest extends DinocoIntegrationTestCase {
 
         // draft → completed is NOT in the transitions table (must go via paid+packed+shipped first)
         $result = \B2B_Order_FSM::transition( $this->order_id, 'completed', 'admin', 'should-fail' );
-        $this->assertWPError( $result, 'invalid_transition' );
+        $this->assertDinocoWPError( $result, 'invalid_transition' );
 
         $this->assertSame(
             'draft',
@@ -105,7 +105,7 @@ final class FsmTransitionRollbackTest extends DinocoIntegrationTestCase {
 
         // pending_stock_review → awaiting_confirm is admin-only
         $result = \B2B_Order_FSM::transition( $this->order_id, 'awaiting_confirm', 'customer', 'wrong-role' );
-        $this->assertWPError( $result );
+        $this->assertDinocoWPError( $result );
 
         $this->assertSame(
             'pending_stock_review',
@@ -119,7 +119,7 @@ final class FsmTransitionRollbackTest extends DinocoIntegrationTestCase {
 
         // cancelled is terminal (only completed→cancelled allowed for walk-in admin override)
         $result = \B2B_Order_FSM::transition( $this->order_id, 'paid', 'admin', 'attempt-revive' );
-        $this->assertWPError( $result, 'terminal_state' );
+        $this->assertDinocoWPError( $result, 'terminal_state' );
 
         $this->assertSame( 'cancelled', $this->current_status() );
     }
