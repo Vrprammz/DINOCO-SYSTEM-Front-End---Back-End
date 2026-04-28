@@ -1,11 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 10: Invoice Image Generator                 ║
- * ║  Version: V.30.6 — 3-Level hierarchy: safe SET children resolve (DD-7)    ║
+ * ║  Version: V.30.7 — Image push failure observability + GD probe          ║
  * ║  DB_ID: 61                                                  ║
  * ║  Multi-page | Logo | 7-col table | Digital Signature       ║
  * ║  Font: Sarabun (Google Fonts gstatic CDN)                  ║
  * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * V.30.7 Changes (2026-04-28 — pairs with Manual Invoice V.34.8 [InvNotify] log):
+ * - b2b_send_invoice_image() now logs every false-return path with reason:
+ *     [InvImg] inv=<id> fail=missing_args (group/ticket missing)
+ *     [InvImg] inv=<id> fail=no_pages (b2b_generate_invoice_pages returned false)
+ *     [InvImg] inv=<id> push batch=N/M code=<http>
+ * - LINE batch push captures HTTP code from b2b_line_push_raw return array.
+ *   If any batch returns code != 200 → log as failure, include URL count.
+ * - b2b_generate_invoice_pages() logs early-exit reasons (GD missing already logged;
+ *   font missing now logged with [InvImg] tag for grep consistency).
+ * - admin_notice() on admin_init when GD/FreeType missing — proactive admin alert
+ *   instead of waiting for first invoice issue to fail silently.
+ * No business logic change.
  *
  * V.10.0 Changes:
  * - BUG-INV: ?format=json → JSON, default → redirect 302 (1 หน้า) หรือ HTML gallery (หลายหน้า)
@@ -606,10 +619,14 @@ function b2b_inv_colors( $img ) {
 // ════════════════════════════════════════════
 function b2b_generate_invoice_pages( $ticket_id ) {
     if (!function_exists('imagecreatetruecolor') || !function_exists('imagettftext')) {
-        b2b_log('[InvImg] GD/FreeType not available'); return false;
+        if (function_exists('b2b_log')) b2b_log('[InvImg] inv='.$ticket_id.' fail=gd_missing — GD/FreeType not available on this server (php -m | grep -i gd)');
+        return false;
     }
     $font = b2b_inv_get_font(false); $fontB = b2b_inv_get_font(true);
-    if (!$font) return false;
+    if (!$font) {
+        if (function_exists('b2b_log')) b2b_log('[InvImg] inv='.$ticket_id.' fail=font_missing — b2b_inv_get_font(false) returned false (see [Font] logs above)');
+        return false;
+    }
     if (!$fontB) $fontB = $font;
 
     $upload = wp_upload_dir();
@@ -815,19 +832,32 @@ function b2b_generate_invoice_image( $ticket_id ) {
 // PUSH: Send invoice pages via LINE
 // ════════════════════════════════════════════
 function b2b_send_invoice_image( $group_id, $ticket_id ) {
-    if (!$group_id || !$ticket_id) return false;
+    if (!$group_id || !$ticket_id) {
+        if (function_exists('b2b_log')) b2b_log('[InvImg] inv='.$ticket_id.' fail=missing_args group='.var_export($group_id,true));
+        return false;
+    }
     $urls = b2b_generate_invoice_pages($ticket_id);
-    if (!$urls) return false;
+    if (!$urls) {
+        if (function_exists('b2b_log')) b2b_log('[InvImg] inv='.$ticket_id.' fail=no_pages (b2b_generate_invoice_pages returned false — see [InvImg]/[Font]/[GD] logs above for cause)');
+        return false;
+    }
     $msgs = array();
     foreach ($urls as $url) {
         $url = str_replace('http://','https://',$url);
         $msgs[] = array('type'=>'image','originalContentUrl'=>$url,'previewImageUrl'=>$url);
     }
     $results = array();
-    foreach (array_chunk($msgs, 5) as $batch) {
-        $results[] = b2b_line_push_raw($group_id, $batch);
+    $batches = array_chunk($msgs, 5);
+    $total_batches = count($batches);
+    $any_fail = false;
+    foreach ($batches as $batch_idx => $batch) {
+        $batch_result = b2b_line_push_raw($group_id, $batch);
+        $batch_code = is_array($batch_result) && isset($batch_result['code']) ? intval($batch_result['code']) : 0;
+        if ($batch_code !== 200) $any_fail = true;
+        if (function_exists('b2b_log')) b2b_log('[InvImg] inv='.$ticket_id.' push batch='.($batch_idx+1).'/'.$total_batches.' images='.count($batch).' code='.$batch_code.' group='.$group_id);
+        $results[] = $batch_result;
     }
-    b2b_log('[InvImg] Pushed '.count($urls).' pages to '.$group_id);
+    if (function_exists('b2b_log')) b2b_log('[InvImg] inv='.$ticket_id.' '.($any_fail ? 'PARTIAL/FAIL' : 'OK').' pages='.count($urls).' batches='.$total_batches.' group='.$group_id);
     return $results;
 }
 
@@ -1059,4 +1089,23 @@ function b2b_cleanup_old_invoices() {
         if (filemtime($f) < time() - (30 * 86400)) { @unlink($f); $c++; }
     }
     if ($c > 0) b2b_log('[InvImg] Cleaned '.$c.' old files');
+}
+
+// ════════════════════════════════════════════
+// V.30.7: PROACTIVE GD/FreeType ADMIN NOTICE
+// — surface server-side dependency issue before first invoice fail silently
+// ════════════════════════════════════════════
+add_action('admin_notices', 'b2b_inv_gd_admin_notice');
+function b2b_inv_gd_admin_notice() {
+    if (!current_user_can('manage_options')) return;
+    if (function_exists('imagecreatetruecolor') && function_exists('imagettftext')) return;
+    $missing = [];
+    if (!function_exists('imagecreatetruecolor')) $missing[] = 'GD library (imagecreatetruecolor)';
+    if (!function_exists('imagettftext')) $missing[] = 'FreeType (imagettftext)';
+    echo '<div class="notice notice-error"><p><strong>[B2B Invoice Image Generator]</strong> '
+        . 'PHP module ที่จำเป็นสำหรับสร้างรูปใบแจ้งหนี้ขาด: <code>' . esc_html(implode(', ', $missing)) . '</code>. '
+        . 'ระบบจะส่ง LINE Flex card สำเร็จแต่<strong>ไม่ส่งรูป invoice</strong>เข้ากลุ่มลูกค้า. '
+        . 'แก้ไข: ติดตั้ง <code>php-gd</code> + <code>php-freetype</code> บน server '
+        . '(<code>apt install php-gd</code> หรือ Plesk/cPanel → PHP extensions → enable gd) แล้ว restart php-fpm.'
+        . '</p></div>';
 }
