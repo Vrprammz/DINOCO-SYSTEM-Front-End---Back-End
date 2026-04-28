@@ -16,8 +16,9 @@
 | `liff-src/shared/modal.js` | 9 | Bridge to `window.dinocoModal` + native confirm/alert fallback |
 | `docs/api/openapi.yaml` | 9 | OpenAPI 3.1 spec validation — YAML parse, structural correctness, $ref resolution, security scheme integrity |
 | Markdown internal links | 2 | Scans all 99 .md files for `[text](rel-path)` and verifies targets exist (catches link rot after rename/delete) |
+| Secrets scanner | 2 | Scans repo for committed credentials (LINE tokens, Telegram bot tokens, GitHub PATs, AWS keys, JWTs). Allowlist for false positives in `tests/jest/secrets-scan.test.js` |
 
-Total: **106 tests, < 1s**. Code coverage: **95.8% stmts / 84.8% branches / 90.9% funcs**.
+Total: **108 tests, < 1s**. Code coverage: **95.8% stmts / 84.8% branches / 90.9% funcs**.
 
 ---
 
