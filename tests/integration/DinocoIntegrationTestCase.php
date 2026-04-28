@@ -124,6 +124,11 @@ abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
     /**
      * Load a .sql fixture from tests/integration/fixtures/.
      *
+     * Splitter is line-aware: only treats `;` as a statement terminator when
+     * followed by whitespace + newline (or end of file). This avoids breaking
+     * INSERTs whose VALUES contain PHP-serialized data that uses `;` internally
+     * (e.g. `'a:1:{i:0;i:9007;}'`).
+     *
      * @param string $filename e.g. 'seed-distributors.sql'
      */
     protected function load_fixture( string $filename ): void {
@@ -137,9 +142,24 @@ abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
         $sql = str_replace( '{PREFIX}', $wpdb->prefix, $sql );
         $sql = (string) preg_replace( '/^--.*$/m', '', $sql );
 
-        foreach ( array_filter( array_map( 'trim', explode( ';', $sql ) ) ) as $stmt ) {
+        foreach ( self::split_sql_statements( $sql ) as $stmt ) {
             $wpdb->query( $stmt );
         }
+    }
+
+    /**
+     * Split a SQL blob into individual statements without breaking on
+     * semicolons inside string literals. Heuristic: a `;` followed by
+     * optional whitespace and a newline (or end of input) is a separator.
+     *
+     * @return string[] non-empty statements, trimmed
+     */
+    public static function split_sql_statements( string $sql ): array {
+        // `;\s*\R` = literal ; + spaces + newline. `\R` matches CRLF/LF/CR.
+        // Tail-anchor `;\s*$` catches a trailing statement-terminator at EOF.
+        $parts = preg_split( '/;\s*(?:\R|$)/', $sql );
+        if ( $parts === false ) return array();
+        return array_values( array_filter( array_map( 'trim', $parts ), fn( $s ) => $s !== '' ) );
     }
 
     /**
@@ -168,25 +188,44 @@ abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
      * Must be PUBLIC (not protected) — WP_UnitTestCase_Base declares it public
      * via phpunit-polyfills set_up/tear_down camelCase shim and PHP enforces
      * matching visibility on overrides.
+     *
+     * Suppresses wpdb error reporting around best-effort cleanup queries —
+     * a missing table (e.g. wp_snippets when Code Snippets plugin not in CI's
+     * minimal WP install) shouldn't pollute test output with red ERROR
+     * messages. Real test assertions bring back error reporting via setUp().
      */
     public function tear_down(): void {
         global $wpdb;
+        $prev_show     = $wpdb->show_errors;
+        $prev_suppress = $wpdb->suppress_errors;
+        $wpdb->show_errors     = false;
+        $wpdb->suppress_errors = true;
 
         foreach ( $this->dinoco_tables as $t ) {
             $tbl = $wpdb->prefix . $t;
-            // Best-effort — TRUNCATE will fail silently if the table doesn't exist
-            // in this test's universe. Custom-table tests opt-in via setUp().
+            // Best-effort — TRUNCATE will fail silently if the table doesn't exist.
             $wpdb->query( "TRUNCATE TABLE {$tbl}" );
         }
 
         // Clean test-range snippets only (preserve any prod snippets if seeded).
-        $wpdb->query(
-            $wpdb->prepare(
-                "DELETE FROM {$wpdb->prefix}snippets WHERE id BETWEEN %d AND %d",
-                self::TEST_SNIPPET_ID_MIN,
-                self::TEST_SNIPPET_ID_MAX
-            )
+        // Skip if wp_snippets table doesn't exist (Code Snippets plugin not
+        // installed in the CI's minimal core WP — expected).
+        $snip_table   = $wpdb->prefix . 'snippets';
+        $table_exists = (bool) $wpdb->get_var(
+            $wpdb->prepare( 'SHOW TABLES LIKE %s', $snip_table )
         );
+        if ( $table_exists ) {
+            $wpdb->query(
+                $wpdb->prepare(
+                    "DELETE FROM {$snip_table} WHERE id BETWEEN %d AND %d",
+                    self::TEST_SNIPPET_ID_MIN,
+                    self::TEST_SNIPPET_ID_MAX
+                )
+            );
+        }
+
+        $wpdb->show_errors     = $prev_show;
+        $wpdb->suppress_errors = $prev_suppress;
 
         parent::tear_down();
     }

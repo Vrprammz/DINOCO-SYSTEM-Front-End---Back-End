@@ -71,11 +71,15 @@ tests_add_filter(
         $schema = file_get_contents( $schema_path );
         $schema = str_replace( '{PREFIX}', $wpdb->prefix, $schema );
 
-        // Strip line comments + split on `;` line endings.
+        // Strip line comments + split on `;` line endings (same line-aware
+        // splitter as DinocoIntegrationTestCase::split_sql_statements; we
+        // can't reference that class here because muplugins_loaded fires
+        // before our base case is autoloaded).
         $schema = preg_replace( '/^--.*$/m', '', $schema );
-        $stmts  = array_filter( array_map( 'trim', explode( ';', $schema ) ) );
+        $stmts  = preg_split( '/;\s*(?:\R|$)/', $schema );
 
         foreach ( $stmts as $stmt ) {
+            $stmt = trim( $stmt );
             if ( $stmt === '' ) {
                 continue;
             }
