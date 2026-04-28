@@ -188,6 +188,10 @@ final class AuditDualWriteTest extends DinocoIntegrationTestCase {
         $this->assertGreaterThanOrEqual( 2, count( $chain ), 'Chain must include all rows for target order #888' );
 
         foreach ( $chain as $row ) {
+            // dinoco_audit_chain may return associative arrays OR stdClass
+            // depending on $wpdb->get_results() output mode. Normalize via
+            // (object) cast so either shape works.
+            $row = is_array( $row ) ? (object) $row : $row;
             $this->assertSame( '888', (string) $row->target_id, 'Chain rows must filter by target_id' );
         }
     }
