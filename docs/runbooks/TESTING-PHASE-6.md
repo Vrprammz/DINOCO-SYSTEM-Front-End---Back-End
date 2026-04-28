@@ -11,8 +11,11 @@
 |---|---|---|
 | `liff-src/shared/cart.js` | 38 | All 13 exports — pure-function cart state machine |
 | `liff-src/shared/api-client.js` | 33 | `createApi` factory + `createB2BApi` wrapper, fetch mocked |
+| `liff-src/shared/liff-init.js` | 7 | LIFF SDK init flow, login redirect, profile fallback, closeLiff |
+| `liff-src/shared/liff-auth.js` | 9 | Backend auth handshake, payload contract, error surface |
+| `liff-src/shared/modal.js` | 9 | Bridge to `window.dinocoModal` + native confirm/alert fallback |
 
-Total: **71 tests, < 1s**.
+Total: **95 tests, < 1s**. Coverage: **95.8% stmts / 84.8% branches / 90.9% funcs**.
 
 ---
 

@@ -19,7 +19,6 @@ module.exports = {
     moduleFileExtensions: ["js", "json"],
     collectCoverageFrom: [
         "liff-src/shared/**/*.js",
-        "!liff-src/shared/liff-init.js",
     ],
     coverageDirectory: "coverage/jest",
     coverageReporters: ["text", "html", "clover"],
