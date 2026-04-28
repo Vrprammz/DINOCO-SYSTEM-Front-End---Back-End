@@ -4,6 +4,11 @@
  * Shortcode: [dinoco_admin_finance]
  * Description: สรุปภาพรวมการเงิน - หนี้, รายได้, ชำระเงิน,
  *              ตัวแทนจำหน่าย, แผนที่ภาค, AI Risk Assessment
+ * Version: V.3.22 (2026-04-24) — Cleanup batch L4: wrap `force_recalc` action in
+ *   b2b_financial_lock() with 3s timeout to prevent race with concurrent order paid /
+ *   debt subtract on same distributor (last-writer-wins risk eliminated). Returns 409-style
+ *   busy message if another op is in progress. try/finally ensures unlock on exit. Skipped
+ *   if helper missing (graceful degradation).
  * Version: V.3.21 (2026-04-24) — Phase 4e Module Registry adoption (Pillar 1):
  *   • Self-register via dinoco_register_admin_module() at init priority 30.
  *     key=finance, shortcode=dinoco_admin_finance, section=finance, cache_ttl=120.
@@ -222,17 +227,36 @@ add_action('init', function() {
         }
 
         // FORCE_RECALC: recalculate a single distributor's debt
+        // V.3.22 L4: wrap in b2b_financial_lock() short timeout (3s) to prevent
+        // last-writer-wins race with concurrent order paid / debt subtract on same dist.
         if ( $sub_action === 'force_recalc' ) {
             $dist_id = intval( $_POST['dist_id'] ?? 0 );
             if ( ! $dist_id ) { echo json_encode(['success'=>false,'error'=>'Missing dist_id']); exit; }
-            $old = round( floatval( get_field('current_debt', $dist_id) ), 2 );
-            $new = function_exists('b2b_recalculate_debt')
-                ? round( floatval( b2b_recalculate_debt( $dist_id ) ), 2 )
-                : $old;
-            if ( function_exists('b2b_log') ) {
-                b2b_log( sprintf('[Recon] Force recalc dist #%d: stored=%.2f → recalc=%.2f (delta=%.2f)', $dist_id, $old, $new, $old - $new) );
+            $lock_acquired = false;
+            if ( function_exists('b2b_financial_lock') ) {
+                $lock_acquired = b2b_financial_lock( $dist_id, 3 );
+                if ( ! $lock_acquired ) {
+                    echo json_encode([
+                        'success' => false,
+                        'error'   => 'มีการคำนวณหนี้ของตัวแทนนี้กำลังดำเนินการอยู่ — กรุณารอสักครู่แล้วลองใหม่',
+                    ], JSON_UNESCAPED_UNICODE);
+                    exit;
+                }
             }
-            echo json_encode([ 'success'=>true, 'old'=>$old, 'new'=>$new, 'delta'=>round($old - $new, 2) ], JSON_UNESCAPED_UNICODE);
+            try {
+                $old = round( floatval( get_field('current_debt', $dist_id) ), 2 );
+                $new = function_exists('b2b_recalculate_debt')
+                    ? round( floatval( b2b_recalculate_debt( $dist_id ) ), 2 )
+                    : $old;
+                if ( function_exists('b2b_log') ) {
+                    b2b_log( sprintf('[Recon] Force recalc dist #%d: stored=%.2f → recalc=%.2f (delta=%.2f)', $dist_id, $old, $new, $old - $new) );
+                }
+                echo json_encode([ 'success'=>true, 'old'=>$old, 'new'=>$new, 'delta'=>round($old - $new, 2) ], JSON_UNESCAPED_UNICODE);
+            } finally {
+                if ( $lock_acquired && function_exists('b2b_financial_unlock' ) ) {
+                    b2b_financial_unlock( $dist_id );
+                }
+            }
             exit;
         }
 
