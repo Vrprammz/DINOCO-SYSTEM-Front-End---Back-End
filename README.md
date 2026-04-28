@@ -19,6 +19,7 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 
 | Doc | Purpose |
 |---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Workflow guide for contributors (local setup, hooks, quality gates) |
 | [CLAUDE.md](CLAUDE.md) | Architecture overview + conventions + ~7000 lines of accumulated wisdom for AI assistants |
 | [SYSTEM-REFERENCE.md](SYSTEM-REFERENCE.md) | Snippet mapping, REST endpoints, DB schema, constants |
 | [WORKFLOW-REFERENCE.md](WORKFLOW-REFERENCE.md) | Business workflows (B2B order, B2F PO, claims, inventory) |
