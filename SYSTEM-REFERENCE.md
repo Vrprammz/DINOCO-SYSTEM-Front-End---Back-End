@@ -151,7 +151,7 @@
 | Snippet 7: Cron Jobs - Dunning + Summary + Rank | V.30.5 | 56 | 9 cron jobs (dunning, summary, rank, flash, shipping) |
 | Snippet 8: Distributor Ticket View | V.30.4 | 57 | `/b2b-ticket/` -- Order detail page (admin/customer split) |
 | Snippet 9: Admin Control Panel | V.33.2 | 58 | `[b2b_admin_control]` -- Distributors, products, settings, Flash |
-| Snippet 10: Invoice Image Generator | V.30.4 | 61 | A4 invoice PNG (GD Library) |
+| Snippet 10: Invoice Image Generator | V.30.7 | 61 | A4 invoice PNG (GD Library) — V.30.7 image push observability + GD admin notice |
 | Snippet 11: Customer LIFF Pages | V.30.2 | 64 | `[b2b_commands]`, `[b2b_orders]`, `[b2b_account]` |
 | Snippet 12: Admin Dashboard LIFF | V.31.2 | 65 | `[b2b_dashboard]`, `[b2b_stock_manager]`, `[b2b_tracking_entry]` |
 | Snippet 13: Debt Transaction Manager | V.2.0 | 1036 | Atomic debt operations (MySQL transactions, FOR UPDATE) |
