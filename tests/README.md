@@ -28,12 +28,29 @@ Total: ~28 assertions across ~20 test methods.
 - Tests MUST pass without a real database, without WordPress bootstrap,
   without network calls
 
+## Phase 5 (Applied — M1 Foundation, 2026-04-28)
+
+Integration layer added at `tests/integration/`. Boots wordpress-develop +
+real MySQL via `yoast/wp-test-utils`. Runbook: `docs/runbooks/TESTING-PHASE-5.md`.
+
+- M1 (DONE): bootstrap, base test case, snippet-loader, schema/seed fixtures,
+  PHPUnit config split, smoke test, CI installer script, schema parity checker
+- M2 (NEXT): first 5 integration tests (stock atomic, FSM rollback, REST nonce,
+  DD-3 hierarchy, audit dual-write)
+- M3: GitHub Actions workflow + green CI build
+- M4: top-10 + concurrent-worker harness
+- M5: coverage report + badge
+
+Run integration tests via:
+
+```bash
+composer test:integration
+```
+
+(Requires `WP_TESTS_DIR` env var + MySQL — see runbook.)
+
 ## Future Phases
 
-- **Phase 5 (next sprint)**: WP integration via `wp-env` + wordpress-develop
-  - REST endpoint smoke tests
-  - CPT + ACF field validation
-  - FSM execution tests (real `B2B_Order_FSM::transition()` with in-memory DB)
 - **Phase 6**: Frontend JS tests (Jest) for LIFF pages
 - **Phase 7**: End-to-end (Playwright) covering LIFF flows
 
