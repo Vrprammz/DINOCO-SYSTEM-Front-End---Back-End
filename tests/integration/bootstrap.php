@@ -121,6 +121,23 @@ tests_add_filter(
             }
         }
 
+        // ── DINOCO logger stub ─────────────────────────────────────────
+        // b2b_log() lives in Snippet 1 (8000+ LOC, too many side effects to
+        // eval in tests). Other DINOCO snippets call b2b_log() defensively —
+        // stub it as no-op so they can load without Snippet 1.
+
+        if ( ! function_exists( 'b2b_log' ) ) {
+            function b2b_log( $message, $level = 'INFO' ) {
+                // No-op in tests. Real production logger writes to debug.log.
+            }
+        }
+
+        if ( ! function_exists( 'b2f_log' ) ) {
+            function b2f_log( $message, $level = 'INFO' ) {
+                // No-op in tests.
+            }
+        }
+
         // Create DINOCO custom tables (idempotent via CREATE TABLE IF NOT EXISTS).
         global $wpdb;
 

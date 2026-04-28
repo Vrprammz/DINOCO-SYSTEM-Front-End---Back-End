@@ -73,59 +73,82 @@ final class StockSubtractAtomicTest extends DinocoIntegrationTestCase {
         );
     }
 
+    /**
+     * Helper: call dinoco_stock_subtract with named args to avoid the 9-arg
+     * positional minefield. Real signature is:
+     *   ($sku, $qty, $type, $ref_type, $ref_id, $reason, $batch_id,
+     *    $warehouse_id, $allow_negative)
+     */
+    private function subtract( string $sku, int $qty, bool $allow_negative = false ) {
+        return dinoco_stock_subtract(
+            $sku,
+            $qty,
+            'integration-test', // type
+            '',                 // ref_type
+            0,                  // ref_id
+            '',                 // reason
+            '',                 // batch_id
+            null,               // warehouse_id
+            $allow_negative
+        );
+    }
+
     public function test_basic_subtract_decrements_stock(): void {
         $this->assertSame( 10, $this->get_stock( 'LEAF-X' ) );
 
-        $result = dinoco_stock_subtract( 'LEAF-X', 3, 'integration-test', null, false );
+        $result = $this->subtract( 'LEAF-X', 3 );
         $this->assertNotInstanceOf( \WP_Error::class, $result );
 
         $this->assertSame( 7, $this->get_stock( 'LEAF-X' ) );
     }
 
     public function test_subtract_writes_ledger_row(): void {
-        dinoco_stock_subtract( 'LEAF-X', 2, 'integration-test', null, false );
+        $this->subtract( 'LEAF-X', 2 );
 
-        $count = $this->ledger_count( 'LEAF-X', 'manual_subtract' );
-        // The exact `type` value depends on Snippet 15's reason→type mapping.
-        // We just assert SOMETHING was written (the row exists).
         $any = (int) $GLOBALS['wpdb']->get_var(
             "SELECT COUNT(*) FROM {$GLOBALS['wpdb']->prefix}dinoco_stock_transactions WHERE sku = 'LEAF-X'"
         );
         $this->assertGreaterThan( 0, $any, 'Stock subtract must write a ledger row' );
     }
 
-    public function test_subtract_below_zero_returns_wp_error_by_default(): void {
+    /**
+     * Snippet 15 dinoco_stock_subtract semantics (reviewed source line 1238):
+     *   - $allow_negative=false (default) → caps at max(0, old_qty - qty),
+     *     does NOT return WP_Error, just clamps and logs a WARNING.
+     *   - $allow_negative=true → permits negative stock (DD-5 walk-in case).
+     * WP_Error returned only for: invalid_qty, not_leaf, sku_not_found, db_error.
+     */
+    public function test_subtract_below_available_clamps_to_zero(): void {
         $this->assertSame( 4, $this->get_stock( 'LEAF-SHARED' ) );
 
-        $result = dinoco_stock_subtract( 'LEAF-SHARED', 10, 'oversell-test', null, false );
-        $this->assertInstanceOf(
-            \WP_Error::class,
-            $result,
-            'Subtracting more than available without allow_negative must fail'
+        $result = $this->subtract( 'LEAF-SHARED', 10, /* allow_negative */ false );
+
+        // Function does NOT WP_Error on underflow without allow_negative —
+        // it clamps stock to 0 and continues.
+        $this->assertNotInstanceOf( \WP_Error::class, $result );
+        $this->assertSame(
+            0,
+            $this->get_stock( 'LEAF-SHARED' ),
+            'allow_negative=false floors stock at 0 (matches Snippet 15 V.7.1 line 1238)'
         );
-
-        // Stock unchanged — failed subtract must NOT mutate
-        $this->assertSame( 4, $this->get_stock( 'LEAF-SHARED' ) );
     }
 
     public function test_subtract_allows_negative_when_flagged(): void {
         $this->assertSame( 10, $this->get_stock( 'LEAF-X' ) );
 
-        $result = dinoco_stock_subtract( 'LEAF-X', 15, 'walkin-DD5', null, true );
-        $this->assertNotInstanceOf( \WP_Error::class, $result, 'allow_negative=true must permit negative stock' );
+        $result = $this->subtract( 'LEAF-X', 15, /* allow_negative */ true );
+        $this->assertNotInstanceOf( \WP_Error::class, $result, 'allow_negative=true must permit subtract' );
 
-        // Stock should be -5 (or whatever Snippet 15 produces — 10 - 15)
         $stock = $this->get_stock( 'LEAF-X' );
-        $this->assertLessThanOrEqual(
+        $this->assertSame(
             -5,
             $stock,
-            'Stock should decrement past zero when allow_negative=true (DD-5 walk-in case)'
+            'Stock should be -5 (10 - 15) when allow_negative=true (DD-5 walk-in case)'
         );
     }
 
     public function test_non_leaf_sku_blocked_by_dd2_guard(): void {
-        // SET-A has children → not a leaf → should be rejected
-        $result = dinoco_stock_subtract( 'SET-A', 1, 'should-fail-not-leaf', null, false );
+        $result = $this->subtract( 'SET-A', 1 );
         $this->assertInstanceOf(
             \WP_Error::class,
             $result,
@@ -133,26 +156,22 @@ final class StockSubtractAtomicTest extends DinocoIntegrationTestCase {
         );
 
         $code = $result->get_error_code();
-        $this->assertContains(
-            $code,
-            array( 'not_leaf', 'invalid_sku', 'DD-2' ),
-            "DD-2 guard error code unexpected: '{$code}'"
-        );
+        $this->assertSame( 'not_leaf', $code, "DD-2 guard error code expected 'not_leaf', got '{$code}'" );
     }
 
     public function test_sequential_subtracts_compose_without_drift(): void {
         $this->assertSame( 10, $this->get_stock( 'LEAF-X' ) );
 
-        dinoco_stock_subtract( 'LEAF-X', 3, 'seq-1', null, false );
-        dinoco_stock_subtract( 'LEAF-X', 2, 'seq-2', null, false );
-        dinoco_stock_subtract( 'LEAF-X', 1, 'seq-3', null, false );
+        $this->subtract( 'LEAF-X', 3 );
+        $this->subtract( 'LEAF-X', 2 );
+        $this->subtract( 'LEAF-X', 1 );
 
         $this->assertSame( 4, $this->get_stock( 'LEAF-X' ), '10 - 3 - 2 - 1 = 4 (no drift)' );
 
-        // Second-tier sanity: a 4th subtract that would go below 0 must fail
-        $result = dinoco_stock_subtract( 'LEAF-X', 5, 'seq-4-fails', null, false );
-        $this->assertInstanceOf( \WP_Error::class, $result );
-        $this->assertSame( 4, $this->get_stock( 'LEAF-X' ), 'Failed subtract must not mutate' );
+        // 4th subtract of 5 from stock=4 → clamps at 0 (no WP_Error)
+        $result = $this->subtract( 'LEAF-X', 5 );
+        $this->assertNotInstanceOf( \WP_Error::class, $result );
+        $this->assertSame( 0, $this->get_stock( 'LEAF-X' ), 'Subtract clamps at 0 floor' );
     }
 
     public function test_add_then_subtract_roundtrip(): void {
@@ -161,7 +180,7 @@ final class StockSubtractAtomicTest extends DinocoIntegrationTestCase {
         dinoco_stock_add( 'LEAF-Y', 5, 'add-5' );
         $this->assertSame( $start + 5, $this->get_stock( 'LEAF-Y' ) );
 
-        dinoco_stock_subtract( 'LEAF-Y', 5, 'subtract-5', null, false );
+        $this->subtract( 'LEAF-Y', 5 );
         $this->assertSame( $start, $this->get_stock( 'LEAF-Y' ), 'Add+subtract must restore original' );
     }
 }
