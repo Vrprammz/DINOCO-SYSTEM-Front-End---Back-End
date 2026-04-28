@@ -526,7 +526,7 @@ try {
 - `[B2F] Snippet 5` V.7.8 — 13+ calls (cancel PO, resubmit, complete, delete auto-set, add missing leaves, quick shipping, delete product/maker, confirm unconfirmed, credit unlock/hold)
 - `[Admin System] B2F Migration Audit` V.3.14 — 7 sites (activate schema, backfill, shadow toggle, junction read toggle, flag toggles, phase4 flag, sync intermediates)
 - `[Admin System] DINOCO Global Inventory Database` V.43.8 — 4 sites (God Mode activate, category delete)
-- `[Admin System] DINOCO Manual Invoice System` V.33.7 — 6 functions (cancel builder/list, confirm issue, refund, delete) *(later bumped V.33.8 → V.34.6 — V.33.8 helper shims, V.34.0-V.34.3 debt/transaction wrappers + module registry, V.34.4-V.34.6 picker price contract fix series)*
+- `[Admin System] DINOCO Manual Invoice System` V.33.7 — 6 functions (cancel builder/list, confirm issue, refund, delete) *(later bumped V.33.8 → V.34.10 — V.33.8 helper shims, V.34.0-V.34.3 debt/transaction wrappers + module registry, V.34.4-V.34.6 picker price contract fix series, V.34.8 image push observability, V.34.9 stale nonce auto-reload, V.34.10 code-reviewer remediation 1 HIGH + 3 MED + 2 LOW)*
 - `[B2B] Snippet 5` V.32.4 — 14 sites (Flash ops, reprint, bulk confirm/cancel/flash-ready, delete)
 - `[B2B] Snippet 9` V.33.8 — 9 sites (reprint job, bulk reprint errors, save settings, regen key, rpi command, ft switch/cancel)
 - `[Admin System] DINOCO Service Center & Claims` V.30.6 — 16 sites (submit return, close job, add custom part, approval, inline update, delete ticket)
