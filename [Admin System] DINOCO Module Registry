@@ -1,0 +1,334 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Module Registry                       ║
+ * ║  Version: V.1.0 (2026-04-24) — Phase 1 Architecture Refactor ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
+ * ║  Description: Single source of truth for Admin Dashboard tabs.║
+ * ║    Closes "wire 5 places + miss one = silent fail" cascade   ║
+ * ║    pattern (V.33.0 → V.33.3 cost 4 commits in 2 days).       ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * What it does:
+ *   - dinoco_register_admin_module([...]) — register a module ONCE
+ *   - dinoco_get_registered_modules() — Admin Dashboard reads this
+ *   - dinoco_get_admin_module($key) — single lookup
+ *   - admin_init validator — fail-loud admin notice if shortcode missing
+ *
+ * Why a separate snippet (not inside Snippet 1):
+ *   - Concern isolation — registry is admin-only, not used by REST/cron
+ *   - Mirrors [Admin System] DINOCO Modal Helpers + Observability pattern
+ *   - Easier rollback — disable snippet → registry empty → existing
+ *     hardcoded $module_map in Admin Dashboard still works (additive)
+ *
+ * Backward compat:
+ *   - Admin Dashboard V.33.5 MERGES hardcoded arrays + registry result
+ *   - Existing 19 modules stay hardcoded — no migration in Phase 1
+ *   - Future modules use registry → auto-wired without touching Dashboard
+ *
+ * Storage:
+ *   - In-memory PHP array $GLOBALS['_dinoco_admin_modules'] (per-request)
+ *   - Modules register on `init` priority 20 (after Snippet 1 + 15 boot)
+ *   - NO wp_options write — registry is code-driven, not DB-driven
+ *     (rationale: WP Code Snippets evaluate every request; registration
+ *      is cheap; persistence would lose `registered_by` snippet provenance
+ *      when a snippet is disabled.)
+ *
+ * Example usage (in a new snippet):
+ *
+ *   add_action('init', function() {
+ *       if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+ *       dinoco_register_admin_module( array(
+ *           'key'         => 'slip_monitor',
+ *           'shortcode'   => 'dinoco_slip_monitor',  // no brackets
+ *           'label'       => 'Slip Monitor',
+ *           'section'     => 'b2b',                  // b2b|b2f|inventory|finance|ai|system
+ *           'icon'        => 'fa-receipt',
+ *           'color'       => '#06b6d4',
+ *           'cache_ttl'   => 30,
+ *           'subtabs'     => array(),
+ *           'capability'  => 'manage_options',
+ *           'order'       => 50,
+ *           'source'      => '[Admin System] DINOCO Slip Monitor V.1.6',
+ *       ) );
+ *   }, 20);
+ *
+ * Validation rules (fail loud):
+ *   - Required: key, shortcode, label, section
+ *   - key:        ^[a-z0-9_]+$
+ *   - shortcode:  ^[a-z0-9_]+$  (without brackets)
+ *   - section:    in {b2b, b2f, inventory, finance, ai, system, dashboard}
+ *   - cache_ttl:  int >= 0
+ *   - capability: non-empty string
+ *   - Duplicate key → admin notice + skip overwrite (first-wins to prevent
+ *     silent override; explicit re-register requires unregister first)
+ *
+ * Validator (admin_init):
+ *   - For each registered module, check `shortcode_exists($shortcode)`
+ *   - If missing → admin_notice yellow "Module 'X' shortcode '[Y]' not found
+ *     — feature may be disabled or snippet not synced"
+ *   - This catches AI Control orphan H12 class (Wave 3 audit, V.33.4)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ============================================================
+ * 1. CORE REGISTRATION
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_register_admin_module' ) ) {
+    /**
+     * Register an admin module — single source of truth.
+     *
+     * @param array $args See file header for full schema.
+     * @return true|WP_Error true on success, WP_Error on validation fail.
+     */
+    function dinoco_register_admin_module( $args ) {
+        if ( ! is_array( $args ) ) {
+            return new WP_Error( 'dnc_module_invalid_args', 'args must be array' );
+        }
+
+        $defaults = array(
+            'key'        => '',
+            'shortcode'  => '',
+            'label'      => '',
+            'section'    => 'system',
+            'icon'       => 'fa-circle',
+            'color'      => '#64748b',
+            'cache_ttl'  => 0,
+            'subtabs'    => array(),
+            'hidden'     => false,
+            'capability' => 'manage_options',
+            'order'      => 100,
+            'source'     => '',
+        );
+        $args = array_merge( $defaults, $args );
+
+        // ---- Validation (fail loud, no silent skip) ----
+        $errors = array();
+
+        foreach ( array( 'key', 'shortcode', 'label', 'section' ) as $field ) {
+            if ( ! is_string( $args[ $field ] ) || $args[ $field ] === '' ) {
+                $errors[] = "missing_required_field:{$field}";
+            }
+        }
+
+        if ( ! empty( $args['key'] ) && ! preg_match( '/^[a-z0-9_]+$/', $args['key'] ) ) {
+            $errors[] = 'invalid_key_format (allowed: a-z 0-9 _)';
+        }
+        if ( ! empty( $args['shortcode'] ) && ! preg_match( '/^[a-z0-9_]+$/', $args['shortcode'] ) ) {
+            $errors[] = 'invalid_shortcode_format (no brackets, a-z 0-9 _ only)';
+        }
+
+        $allowed_sections = array( 'b2b', 'b2f', 'inventory', 'finance', 'ai', 'system', 'dashboard' );
+        if ( ! empty( $args['section'] ) && ! in_array( $args['section'], $allowed_sections, true ) ) {
+            $errors[] = 'invalid_section (allowed: ' . implode( '|', $allowed_sections ) . ')';
+        }
+
+        if ( ! is_int( $args['cache_ttl'] ) && ! ctype_digit( (string) $args['cache_ttl'] ) ) {
+            $errors[] = 'cache_ttl_not_int';
+        } else {
+            $args['cache_ttl'] = max( 0, (int) $args['cache_ttl'] );
+        }
+
+        if ( ! is_array( $args['subtabs'] ) ) {
+            $errors[] = 'subtabs_not_array';
+        }
+
+        if ( ! empty( $errors ) ) {
+            $msg = sprintf(
+                "dinoco_register_admin_module FAILED for key='%s' shortcode='%s' source='%s': %s",
+                $args['key'], $args['shortcode'], $args['source'], implode( ', ', $errors )
+            );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[ModuleRegistry] ' . $msg );
+            } else {
+                error_log( '[DINOCO] ' . $msg );
+            }
+            // Queue admin notice (rendered later via admin_notices hook).
+            $queue = isset( $GLOBALS['_dinoco_module_registry_errors'] )
+                ? $GLOBALS['_dinoco_module_registry_errors'] : array();
+            $queue[] = $msg;
+            $GLOBALS['_dinoco_module_registry_errors'] = $queue;
+            return new WP_Error( 'dnc_module_validation_fail', $msg, $errors );
+        }
+
+        // ---- Insert into in-memory registry ----
+        if ( ! isset( $GLOBALS['_dinoco_admin_modules'] ) || ! is_array( $GLOBALS['_dinoco_admin_modules'] ) ) {
+            $GLOBALS['_dinoco_admin_modules'] = array();
+        }
+        $registry =& $GLOBALS['_dinoco_admin_modules'];
+
+        // Duplicate guard: first-wins (prevent silent override)
+        if ( isset( $registry[ $args['key'] ] ) ) {
+            $existing_source = isset( $registry[ $args['key'] ]['source'] )
+                ? $registry[ $args['key'] ]['source'] : '(unknown)';
+            $msg = sprintf(
+                "Module '%s' already registered by '%s' — skipping duplicate from '%s'",
+                $args['key'], $existing_source, $args['source']
+            );
+            if ( function_exists( 'b2b_log' ) ) b2b_log( '[ModuleRegistry] ' . $msg );
+            $queue = isset( $GLOBALS['_dinoco_module_registry_errors'] )
+                ? $GLOBALS['_dinoco_module_registry_errors'] : array();
+            $queue[] = $msg;
+            $GLOBALS['_dinoco_module_registry_errors'] = $queue;
+            return new WP_Error( 'dnc_module_duplicate', $msg );
+        }
+
+        // Add convenience field for Admin Dashboard merge step.
+        $args['shortcode_with_brackets'] = '[' . $args['shortcode'] . ']';
+        $args['registered_at']           = current_time( 'mysql' );
+
+        $registry[ $args['key'] ] = $args;
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_unregister_admin_module' ) ) {
+    /**
+     * Remove a module from the registry (rare — used for testing or hot reload).
+     */
+    function dinoco_unregister_admin_module( $key ) {
+        if ( isset( $GLOBALS['_dinoco_admin_modules'][ $key ] ) ) {
+            unset( $GLOBALS['_dinoco_admin_modules'][ $key ] );
+            return true;
+        }
+        return false;
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_registered_modules' ) ) {
+    /**
+     * Get all registered modules sorted by section then order.
+     * Admin Dashboard calls this to merge with hardcoded $module_map.
+     *
+     * @param string $section Optional filter by section.
+     * @return array<string, array>
+     */
+    function dinoco_get_registered_modules( $section = '' ) {
+        $registry = isset( $GLOBALS['_dinoco_admin_modules'] ) && is_array( $GLOBALS['_dinoco_admin_modules'] )
+            ? $GLOBALS['_dinoco_admin_modules'] : array();
+
+        if ( $section !== '' ) {
+            $registry = array_filter( $registry, function( $m ) use ( $section ) {
+                return isset( $m['section'] ) && $m['section'] === $section;
+            } );
+        }
+
+        // Sort: section_priority then order
+        $section_order = array(
+            'dashboard' => 0,
+            'b2b'       => 10,
+            'b2f'       => 20,
+            'inventory' => 30,
+            'finance'   => 40,
+            'ai'        => 50,
+            'system'    => 90,
+        );
+        uasort( $registry, function( $a, $b ) use ( $section_order ) {
+            $sa = isset( $section_order[ $a['section'] ] ) ? $section_order[ $a['section'] ] : 99;
+            $sb = isset( $section_order[ $b['section'] ] ) ? $section_order[ $b['section'] ] : 99;
+            if ( $sa !== $sb ) return $sa - $sb;
+            $oa = isset( $a['order'] ) ? (int) $a['order'] : 100;
+            $ob = isset( $b['order'] ) ? (int) $b['order'] : 100;
+            return $oa - $ob;
+        } );
+
+        return $registry;
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_admin_module' ) ) {
+    /**
+     * Get a single module by key.
+     *
+     * @return array|null
+     */
+    function dinoco_get_admin_module( $key ) {
+        if ( ! is_string( $key ) || $key === '' ) return null;
+        if ( ! isset( $GLOBALS['_dinoco_admin_modules'][ $key ] ) ) return null;
+        return $GLOBALS['_dinoco_admin_modules'][ $key ];
+    }
+}
+
+/* ============================================================
+ * 2. ADMIN VALIDATOR — fail-loud orphan detection (H12 class)
+ * ============================================================
+ *
+ * Runs on admin_init for users with manage_options.
+ * Checks every registered module's shortcode exists.
+ * Catches: registered module whose snippet got disabled.
+ * Catches: typos in shortcode field at registration site.
+ *
+ * Note: legacy hardcoded modules in Admin Dashboard V.33.5 are NOT
+ * validated here — those are checked by Admin Dashboard's own logic.
+ * Phase 4 will migrate them to registry, then this validator covers all.
+ */
+
+add_action( 'admin_init', function() {
+    if ( ! current_user_can( 'manage_options' ) ) return;
+
+    static $checked_this_request = false;
+    if ( $checked_this_request ) return;
+    $checked_this_request = true;
+
+    $registry = dinoco_get_registered_modules();
+    if ( empty( $registry ) ) return;
+
+    $orphans = array();
+    foreach ( $registry as $key => $m ) {
+        if ( empty( $m['shortcode'] ) ) continue;
+        if ( ! shortcode_exists( $m['shortcode'] ) ) {
+            $orphans[] = sprintf(
+                "Module '%s' (label='%s') — shortcode [%s] not registered (source: %s)",
+                $key, $m['label'], $m['shortcode'], $m['source'] ?: '(unknown)'
+            );
+        }
+    }
+
+    if ( ! empty( $orphans ) ) {
+        $existing = isset( $GLOBALS['_dinoco_module_registry_errors'] )
+            ? $GLOBALS['_dinoco_module_registry_errors'] : array();
+        $GLOBALS['_dinoco_module_registry_errors'] = array_merge( $existing, $orphans );
+    }
+}, 50 );
+
+add_action( 'admin_notices', function() {
+    if ( ! current_user_can( 'manage_options' ) ) return;
+    if ( empty( $GLOBALS['_dinoco_module_registry_errors'] ) ) return;
+    if ( ! is_array( $GLOBALS['_dinoco_module_registry_errors'] ) ) return;
+
+    $errors = array_unique( $GLOBALS['_dinoco_module_registry_errors'] );
+
+    echo '<div class="notice notice-warning is-dismissible"><p><strong>DINOCO Module Registry — issues detected:</strong></p><ul style="margin-left:20px;list-style:disc;">';
+    foreach ( $errors as $err ) {
+        echo '<li>' . esc_html( $err ) . '</li>';
+    }
+    echo '</ul><p style="font-size:12px;color:#666">Action: ตรวจ snippet ที่เรียก <code>dinoco_register_admin_module()</code> หรือเช็คว่า shortcode snippet ยังเปิดอยู่.</p></div>';
+} );
+
+/* ============================================================
+ * 3. REST ENDPOINT — registry inspector (admin only)
+ * ============================================================ */
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco/v1', '/admin-modules', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_module_registry_rest_list',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_module_registry_rest_list' ) ) {
+    function dinoco_module_registry_rest_list() {
+        $modules = dinoco_get_registered_modules();
+        $errors  = isset( $GLOBALS['_dinoco_module_registry_errors'] ) && is_array( $GLOBALS['_dinoco_module_registry_errors'] )
+            ? array_values( array_unique( $GLOBALS['_dinoco_module_registry_errors'] ) )
+            : array();
+        return array(
+            'count'    => count( $modules ),
+            'modules'  => array_values( $modules ),
+            'errors'   => $errors,
+            'request_id' => function_exists( 'dinoco_obs_get_request_id' ) ? dinoco_obs_get_request_id() : '',
+        );
+    }
+}

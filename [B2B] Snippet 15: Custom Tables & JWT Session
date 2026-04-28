@@ -1,6 +1,25 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.9 (2026-04-24) — Phase 1 Architecture Refactor — Pillar 3 Audit Log table:           ║
+ * ║    • NEW wp_dinoco_audit_log table — unified forensic index (cross-system)                         ║
+ * ║      columns: id, event_type, actor_type, actor_id, target_type, target_id, amount,                ║
+ * ║               delta_before, delta_after, related_log_id, context_json, error_msg, success,         ║
+ * ║               request_id, ip, created_at                                                            ║
+ * ║      indexes: idx_event_created (event_type, created_at), idx_target (target_type, target_id,      ║
+ * ║               created_at), idx_actor (actor_type, actor_id, created_at), idx_related,              ║
+ * ║               idx_request, idx_created                                                              ║
+ * ║    • DB version bump 8.6 → 8.9 (idempotent dbDelta — additive, no schema break)                    ║
+ * ║    • Companion: NEW [Admin System] DINOCO Audit Log V.1.0 (helper API + REST endpoints)            ║
+ * ║                 NEW [Admin System] DINOCO Module Registry V.1.0 (Pillar 1)                         ║
+ * ║                 [Admin System] DINOCO Admin Dashboard V.33.5 (registry consumer)                   ║
+ * ║    • Purpose: enable dual-write audit pattern in Phase 1.5 — debt/credit/stock/slip/FSM            ║
+ * ║      mutations gain a single forensic chain queryable via                                          ║
+ * ║      dinoco_audit_chain($target_type, $target_id) — replaces 30-min "join across 6 tables"         ║
+ * ║      forensic process from MASTER-FINDINGS-ROUND-2 with 1 query.                                   ║
+ * ║    • Backward compat: existing audit sources (debt postmeta, slip_log, stock_transactions,         ║
+ * ║      flash_audit, B2F payable audit) UNCHANGED — this is an INDEX overlay, not a replacement.      ║
+ * ║      Phase 4 will retire legacy audit; Phase 1 just creates the table + helper.                    ║
  * ║  Version: V.8.8 (2026-04-24) — Wave 4 MED-M7 stock invariant monitoring cron:                      ║
  * ║    NEW `dinoco_stock_invariant_cron` (twicedaily) compares master                                  ║
  * ║         `wp_dinoco_products.stock_qty` vs SUM(warehouse_stock) per SKU.                            ║
@@ -149,7 +168,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '8.6'; // V.8.6: Slip Replay Pool (image_hash + slip2go_response + replayed_from_log_id)
+    $db_version = '8.9'; // V.8.9: Phase 1 — wp_dinoco_audit_log unified forensic index
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -461,8 +480,68 @@ add_action( 'init', function() {
         }
     }
 
+    // V.8.9: Phase 1 Architecture Refactor — wp_dinoco_audit_log (Pillar 3)
+    // Unified forensic audit trail. INDEX overlay — does NOT replace existing
+    // audit sources (debt postmeta, slip_log, stock_transactions, flash_audit
+    // stay intact). Helper API: [Admin System] DINOCO Audit Log V.1.0.
+    // Schema: see docs/audit/phase-1-applied.md.
+    $audit_log_table = $wpdb->prefix . 'dinoco_audit_log';
+    $sql_al = "CREATE TABLE {$audit_log_table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        event_type VARCHAR(64) NOT NULL DEFAULT '',
+        actor_type VARCHAR(32) NOT NULL DEFAULT '',
+        actor_id VARCHAR(64) NOT NULL DEFAULT '',
+        target_type VARCHAR(32) NOT NULL DEFAULT '',
+        target_id VARCHAR(64) NOT NULL DEFAULT '',
+        amount DECIMAL(14,2) DEFAULT NULL,
+        delta_before VARCHAR(255) DEFAULT NULL,
+        delta_after VARCHAR(255) DEFAULT NULL,
+        related_log_id BIGINT UNSIGNED DEFAULT NULL,
+        context_json TEXT DEFAULT NULL,
+        error_msg VARCHAR(500) DEFAULT NULL,
+        success TINYINT(1) NOT NULL DEFAULT 1,
+        request_id VARCHAR(64) NOT NULL DEFAULT '',
+        ip VARCHAR(45) NOT NULL DEFAULT '',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_event_created (event_type, created_at),
+        KEY idx_target (target_type, target_id, created_at),
+        KEY idx_actor (actor_type, actor_id, created_at),
+        KEY idx_related (related_log_id),
+        KEY idx_request (request_id),
+        KEY idx_created (created_at)
+    ) {$charset};";
+    dbDelta( $sql_al );
+    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] V.8.9: Ensured wp_dinoco_audit_log table' );
+
+    // V.8.9: Idempotent index guards for legacy installs (table existed pre-V.8.9
+    // would only happen via manual SQL — but harmless to verify). dbDelta handles
+    // KEY definitions on fresh install; INFORMATION_SCHEMA probe re-runs are no-op.
+    $al_table_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $audit_log_table ) );
+    if ( $al_table_exists ) {
+        $al_idx_map = array(
+            'idx_event_created' => "ALTER TABLE {$audit_log_table} ADD INDEX idx_event_created (event_type, created_at)",
+            'idx_target'        => "ALTER TABLE {$audit_log_table} ADD INDEX idx_target (target_type, target_id, created_at)",
+            'idx_actor'         => "ALTER TABLE {$audit_log_table} ADD INDEX idx_actor (actor_type, actor_id, created_at)",
+            'idx_related'       => "ALTER TABLE {$audit_log_table} ADD INDEX idx_related (related_log_id)",
+            'idx_request'       => "ALTER TABLE {$audit_log_table} ADD INDEX idx_request (request_id)",
+            'idx_created'       => "ALTER TABLE {$audit_log_table} ADD INDEX idx_created (created_at)",
+        );
+        foreach ( $al_idx_map as $idx_name => $sql_idx ) {
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(1) FROM INFORMATION_SCHEMA.STATISTICS
+                 WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s",
+                $audit_log_table, $idx_name
+            ) );
+            if ( ! $exists ) {
+                $wpdb->query( $sql_idx );
+                if ( function_exists( 'b2b_log' ) ) b2b_log( "[DB] V.8.9: Added audit_log index {$idx_name}" );
+            }
+        }
+    }
+
     update_option( '_dinoco_catalog_table_version', $db_version );
-    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated tables v' . $db_version . ' (Phase 5 + oos_timestamp/oos_duration_hours + slip_log V.8.4)' );
+    if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] Updated tables v' . $db_version . ' (Phase 5 + slip_log V.8.4 + audit_log V.8.9)' );
 }, 5 );
 
 // OOS Migration: ย้าย OOS timer data → manual_hold (DD-2)

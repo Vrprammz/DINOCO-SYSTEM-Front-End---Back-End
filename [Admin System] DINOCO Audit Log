@@ -1,0 +1,398 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Audit Log                             ║
+ * ║  Version: V.1.0 (2026-04-24) — Phase 1 Architecture Refactor ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
+ * ║  Description: Unified forensic audit log helper (Pillar 3).  ║
+ * ║    Single API to write across-system audit trails for debt,  ║
+ * ║    credit, stock, slip, FSM transitions etc — replaces the   ║
+ * ║    "audit scattered across 6 places" anti-pattern that made  ║
+ * ║    forensic queries take 30+ minutes.                         ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * Companion: Snippet 15 V.8.9 creates wp_dinoco_audit_log table.
+ *
+ * Design principles:
+ *   - DUAL-WRITE — never replaces existing audit (debt postmeta,
+ *     slip_log, stock_transactions stay) — this is an INDEX overlay.
+ *   - NON-THROWING — best-effort insert; failure logs to error_log
+ *     and returns false. Callers SHOULD NOT branch on result.
+ *   - PII REDACTION — phone, email, line_uid, national_id auto-masked
+ *     before storage (uses dinoco_obs_redact_context if available).
+ *   - REQUEST CORRELATION — auto-fills request_id from
+ *     dinoco_obs_get_request_id() (Observability snippet V.1.1).
+ *
+ * Public API:
+ *   dinoco_audit_log( array $args ) : int|false
+ *   dinoco_audit_request_id() : string
+ *   dinoco_audit_chain( $target_type, $target_id, $limit = 50 ) : array
+ *   dinoco_audit_chain_by_request( $request_id ) : array
+ *
+ * Schema (wp_dinoco_audit_log — see Snippet 15 V.8.9):
+ *   id, event_type, actor_type, actor_id, target_type, target_id,
+ *   amount, delta_before, delta_after, related_log_id, context_json,
+ *   error_msg, success, request_id, ip, created_at
+ *
+ * Example wiring (caller pattern — to be added in Phase 1.5):
+ *
+ *   // Inside b2b_debt_subtract() after successful UPDATE:
+ *   if ( function_exists( 'dinoco_audit_log' ) ) {
+ *       dinoco_audit_log( array(
+ *           'event_type'   => 'debt_subtract',
+ *           'actor_type'   => 'admin',
+ *           'target_type'  => 'distributor',
+ *           'target_id'    => (string) $dist_id,
+ *           'amount'       => $amount,
+ *           'delta_before' => (string) $old_debt,
+ *           'delta_after'  => (string) $new_debt,
+ *           'context'      => array( 'reason' => $reason ),
+ *           'related_log_id' => $slip_log_id ?: null,
+ *       ) );
+ *   }
+ *
+ * Backward compat:
+ *   - Existing callers untouched. Existing audit sources untouched.
+ *   - If table missing (V.8.9 not synced yet) → silent fail-soft.
+ *   - Snippet disabled → callers using function_exists() skip cleanly.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ============================================================
+ * 1. CORE WRITE API
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_audit_request_id' ) ) {
+    /**
+     * Get/generate the per-request correlation ID.
+     * Prefer Observability snippet's request_id if available — that one is
+     * already wired into REST X-Request-ID response headers (full chain trace).
+     * Fallback: generate a random hex if Observability is disabled.
+     *
+     * @return string 16-char hex (or up to 64 chars from upstream).
+     */
+    function dinoco_audit_request_id() {
+        if ( function_exists( 'dinoco_obs_get_request_id' ) ) {
+            $rid = dinoco_obs_get_request_id();
+            if ( is_string( $rid ) && $rid !== '' ) return $rid;
+        }
+        if ( ! empty( $GLOBALS['_dinoco_audit_req_id'] ) ) {
+            return (string) $GLOBALS['_dinoco_audit_req_id'];
+        }
+        try {
+            $id = bin2hex( random_bytes( 8 ) );
+        } catch ( \Throwable $e ) {
+            $id = substr( md5( uniqid( (string) mt_rand(), true ) ), 0, 16 );
+        }
+        $GLOBALS['_dinoco_audit_req_id'] = $id;
+        return $id;
+    }
+}
+
+if ( ! function_exists( 'dinoco_audit_redact_context' ) ) {
+    /**
+     * Best-effort PII redaction before persisting context_json.
+     * Delegates to dinoco_obs_redact_context if that snippet's helper
+     * is loaded; otherwise applies a minimal in-place mask.
+     *
+     * @param mixed $ctx
+     * @return mixed sanitized
+     */
+    function dinoco_audit_redact_context( $ctx ) {
+        if ( function_exists( 'dinoco_obs_redact_context' ) ) {
+            return dinoco_obs_redact_context( $ctx );
+        }
+        if ( ! is_array( $ctx ) ) return $ctx;
+        $sensitive_keys = array(
+            'phone', 'mobile', 'email', 'line_uid', 'lineUid',
+            'token', 'secret', 'key', 'password', 'authorization',
+            'api_key', 'bearer', 'national_id', 'credit_card',
+            'idtoken', 'access_token',
+        );
+        $out = array();
+        foreach ( $ctx as $k => $v ) {
+            $lk = strtolower( (string) $k );
+            $masked = false;
+            foreach ( $sensitive_keys as $sk ) {
+                if ( strpos( $lk, $sk ) !== false ) { $masked = true; break; }
+            }
+            if ( $masked ) {
+                $out[ $k ] = '[REDACTED]';
+            } elseif ( is_array( $v ) ) {
+                $out[ $k ] = dinoco_audit_redact_context( $v );
+            } else {
+                $out[ $k ] = $v;
+            }
+        }
+        return $out;
+    }
+}
+
+if ( ! function_exists( 'dinoco_audit_log' ) ) {
+    /**
+     * Insert one row into wp_dinoco_audit_log. Best-effort.
+     *
+     * @param array $args {
+     *   @type string  $event_type      Required. e.g. 'debt_subtract'.
+     *   @type string  $actor_type      Optional. 'admin'|'system'|'cron'|'webhook'|'liff_user' (default 'admin' if user logged in, else 'system').
+     *   @type string  $actor_id        Optional. WP user_id, LINE UID, cron name (default current user_id or '').
+     *   @type string  $target_type     Optional. 'distributor'|'order'|'po'|'sku' etc.
+     *   @type string  $target_id       Optional.
+     *   @type float   $amount          Optional.
+     *   @type string  $delta_before    Optional. Before value snippet (truncated to 255 chars).
+     *   @type string  $delta_after     Optional.
+     *   @type int     $related_log_id  Optional. FK to slip_log / stock_txn / etc.
+     *   @type array   $context         Optional. Auto-redacted + JSON-encoded.
+     *   @type string  $error_msg       Optional. Truncated to 500 chars.
+     *   @type bool    $success         Optional. Default true (false if error_msg present).
+     *   @type string  $request_id      Optional. Auto-fills from dinoco_audit_request_id().
+     *   @type string  $ip              Optional. Auto-fills from $_SERVER.
+     * }
+     * @return int|false log row id, or false on failure
+     */
+    function dinoco_audit_log( $args ) {
+        global $wpdb;
+
+        if ( ! is_array( $args ) || empty( $args['event_type'] ) ) {
+            return false;
+        }
+
+        $table = $wpdb->prefix . 'dinoco_audit_log';
+
+        // Defensive: silent skip if table missing (Snippet 15 V.8.9 not synced yet).
+        // Cache table existence for the request to avoid repeated SHOW TABLES queries.
+        static $table_exists_cache = null;
+        if ( $table_exists_cache === null ) {
+            $table_exists_cache = (bool) $wpdb->get_var(
+                $wpdb->prepare( "SHOW TABLES LIKE %s", $table )
+            );
+        }
+        if ( ! $table_exists_cache ) return false;
+
+        // ---- Auto-fill defaults ----
+        $defaults = array(
+            'event_type'     => '',
+            'actor_type'     => '',
+            'actor_id'       => '',
+            'target_type'    => '',
+            'target_id'      => '',
+            'amount'         => null,
+            'delta_before'   => null,
+            'delta_after'    => null,
+            'related_log_id' => null,
+            'context'        => null,
+            'error_msg'      => null,
+            'success'        => 1,
+            'request_id'     => '',
+            'ip'             => '',
+        );
+        $args = array_merge( $defaults, $args );
+
+        // Actor auto-detection
+        if ( $args['actor_type'] === '' ) {
+            $cur_uid = get_current_user_id();
+            if ( $cur_uid > 0 ) {
+                $args['actor_type'] = 'admin';
+                if ( $args['actor_id'] === '' ) $args['actor_id'] = (string) $cur_uid;
+            } else {
+                $args['actor_type'] = 'system';
+            }
+        }
+        if ( $args['actor_id'] === '' && $args['actor_type'] === 'admin' ) {
+            $cur_uid = get_current_user_id();
+            if ( $cur_uid > 0 ) $args['actor_id'] = (string) $cur_uid;
+        }
+
+        // Request ID
+        if ( empty( $args['request_id'] ) ) {
+            $args['request_id'] = dinoco_audit_request_id();
+        }
+
+        // IP auto-detect (forensic — best-effort, not auth-grade)
+        if ( $args['ip'] === '' ) {
+            if ( ! empty( $_SERVER['HTTP_CF_CONNECTING_IP'] ) ) {
+                $args['ip'] = (string) $_SERVER['HTTP_CF_CONNECTING_IP'];
+            } elseif ( ! empty( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) {
+                $xff = (string) $_SERVER['HTTP_X_FORWARDED_FOR'];
+                $first = trim( explode( ',', $xff )[0] );
+                $args['ip'] = $first;
+            } elseif ( ! empty( $_SERVER['REMOTE_ADDR'] ) ) {
+                $args['ip'] = (string) $_SERVER['REMOTE_ADDR'];
+            }
+        }
+
+        // success/error coupling
+        if ( ! empty( $args['error_msg'] ) ) {
+            $args['success'] = 0;
+        }
+        $args['success'] = $args['success'] ? 1 : 0;
+
+        // PII redact + JSON encode context
+        $context_json = null;
+        if ( $args['context'] !== null ) {
+            $redacted = dinoco_audit_redact_context( $args['context'] );
+            $context_json = wp_json_encode( $redacted );
+            // Cap at 64KB-ish (TEXT column safe headroom)
+            if ( is_string( $context_json ) && strlen( $context_json ) > 60000 ) {
+                $context_json = substr( $context_json, 0, 60000 ) . '...[TRUNC]';
+            }
+        }
+
+        // Truncate strings to schema bounds
+        $row = array(
+            'event_type'     => substr( (string) $args['event_type'], 0, 64 ),
+            'actor_type'     => substr( (string) $args['actor_type'], 0, 32 ),
+            'actor_id'       => substr( (string) $args['actor_id'], 0, 64 ),
+            'target_type'    => substr( (string) $args['target_type'], 0, 32 ),
+            'target_id'      => substr( (string) $args['target_id'], 0, 64 ),
+            'amount'         => $args['amount'] !== null ? (float) $args['amount'] : null,
+            'delta_before'   => $args['delta_before'] !== null ? substr( (string) $args['delta_before'], 0, 255 ) : null,
+            'delta_after'    => $args['delta_after'] !== null ? substr( (string) $args['delta_after'], 0, 255 ) : null,
+            'related_log_id' => $args['related_log_id'] !== null ? (int) $args['related_log_id'] : null,
+            'context_json'   => $context_json,
+            'error_msg'      => $args['error_msg'] !== null ? substr( (string) $args['error_msg'], 0, 500 ) : null,
+            'success'        => (int) $args['success'],
+            'request_id'     => substr( (string) $args['request_id'], 0, 64 ),
+            'ip'             => substr( (string) $args['ip'], 0, 45 ),
+            'created_at'     => current_time( 'mysql' ),
+        );
+
+        // wpdb->insert format must match column types
+        $fmt = array( '%s','%s','%s','%s','%s','%f','%s','%s','%d','%s','%s','%d','%s','%s','%s' );
+
+        // Drop NULL columns from format mapping (wpdb->insert handles NULLs fine if we omit type cast).
+        // Easier: use direct query to allow real NULLs without %d coercing to 0.
+        $columns      = array_keys( $row );
+        $placeholders = array();
+        $values       = array();
+        foreach ( $row as $k => $v ) {
+            if ( $v === null ) {
+                $placeholders[] = 'NULL';
+            } else {
+                $placeholders[] = '%s';
+                $values[] = $v;
+            }
+        }
+
+        $sql = sprintf(
+            "INSERT INTO %s (%s) VALUES (%s)",
+            $table,
+            '`' . implode( '`,`', $columns ) . '`',
+            implode( ',', $placeholders )
+        );
+        // Only prepare if we have at least one value to bind.
+        $prepared = empty( $values ) ? $sql : $wpdb->prepare( $sql, $values );
+
+        $result = $wpdb->query( $prepared );
+        if ( $result === false ) {
+            $err = $wpdb->last_error;
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[AuditLog] insert failed: ' . $err . ' event=' . $row['event_type'] );
+            } else {
+                @error_log( '[DINOCO Audit] insert failed: ' . $err );
+            }
+            return false;
+        }
+
+        return (int) $wpdb->insert_id;
+    }
+}
+
+/* ============================================================
+ * 2. FORENSIC QUERY HELPERS
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_audit_chain' ) ) {
+    /**
+     * Get audit events for a target (e.g. order:6266 or distributor:1234).
+     *
+     * @param string $target_type
+     * @param string $target_id
+     * @param int    $limit (default 50, max 500)
+     * @return array<int, array> rows in chronological order (oldest first)
+     */
+    function dinoco_audit_chain( $target_type, $target_id, $limit = 50 ) {
+        global $wpdb;
+        if ( ! is_string( $target_type ) || $target_type === '' ) return array();
+        if ( ! is_string( $target_id ) && ! is_numeric( $target_id ) ) return array();
+        $limit = max( 1, min( 500, (int) $limit ) );
+
+        $table = $wpdb->prefix . 'dinoco_audit_log';
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE target_type = %s AND target_id = %s ORDER BY id ASC LIMIT %d",
+            $target_type, (string) $target_id, $limit
+        ), ARRAY_A );
+
+        return is_array( $rows ) ? $rows : array();
+    }
+}
+
+if ( ! function_exists( 'dinoco_audit_chain_by_request' ) ) {
+    /**
+     * Get all audit events sharing the same request_id (full chain across
+     * services within a single HTTP request — most useful forensic view).
+     *
+     * @param string $request_id
+     * @return array
+     */
+    function dinoco_audit_chain_by_request( $request_id ) {
+        global $wpdb;
+        if ( ! is_string( $request_id ) || $request_id === '' ) return array();
+        $table = $wpdb->prefix . 'dinoco_audit_log';
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE request_id = %s ORDER BY id ASC LIMIT 200",
+            $request_id
+        ), ARRAY_A );
+        return is_array( $rows ) ? $rows : array();
+    }
+}
+
+/* ============================================================
+ * 3. REST ENDPOINTS — admin forensic UI hooks
+ * ============================================================ */
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco/v1', '/audit/chain', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_audit_rest_chain',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+        'args'                => array(
+            'target_type' => array( 'required' => true,  'sanitize_callback' => 'sanitize_text_field' ),
+            'target_id'   => array( 'required' => true,  'sanitize_callback' => 'sanitize_text_field' ),
+            'limit'       => array( 'default'  => 50,    'sanitize_callback' => 'absint' ),
+        ),
+    ) );
+
+    register_rest_route( 'dinoco/v1', '/audit/request', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_audit_rest_request',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+        'args'                => array(
+            'request_id' => array( 'required' => true, 'sanitize_callback' => 'sanitize_text_field' ),
+        ),
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_audit_rest_chain' ) ) {
+    function dinoco_audit_rest_chain( $request ) {
+        $tt = (string) $request->get_param( 'target_type' );
+        $ti = (string) $request->get_param( 'target_id' );
+        $lim = (int) $request->get_param( 'limit' );
+        return array(
+            'count' => 0,
+            'rows'  => dinoco_audit_chain( $tt, $ti, $lim ),
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_audit_rest_request' ) ) {
+    function dinoco_audit_rest_request( $request ) {
+        $rid = (string) $request->get_param( 'request_id' );
+        $rows = dinoco_audit_chain_by_request( $rid );
+        return array(
+            'count'      => count( $rows ),
+            'rows'       => $rows,
+            'request_id' => $rid,
+        );
+    }
+}
