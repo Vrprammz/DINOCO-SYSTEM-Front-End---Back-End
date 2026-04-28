@@ -163,6 +163,75 @@ abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
     }
 
     /**
+     * @var \mysqli|null Lazy-opened second connection for concurrent-transaction tests.
+     */
+    private ?\mysqli $concurrent_conn = null;
+
+    /**
+     * Open a second mysqli connection sharing the same test database. Used by
+     * concurrent-transaction tests (M4) to prove FOR UPDATE / GET_LOCK
+     * serialization without `pcntl_fork` (CI runners disable it).
+     *
+     * Connection mirrors $wpdb credentials from wordpress-develop bootstrap,
+     * so the test DB schema seen by both connections is identical.
+     *
+     * Test flow:
+     *   $a = $wpdb;                              // primary connection
+     *   $b = $this->concurrent_conn();           // secondary
+     *   $a->query('START TRANSACTION');
+     *   $a->query("SELECT ... FOR UPDATE");      // takes row lock
+     *   $b->query('SET innodb_lock_wait_timeout=2');  // fail-fast
+     *   $b->query('START TRANSACTION');
+     *   $result = $b->query("SELECT ... FOR UPDATE"); // blocks → timeout
+     *   // → second connection's query returns false, error 1205 (lock timeout)
+     */
+    protected function concurrent_conn(): \mysqli {
+        if ( $this->concurrent_conn !== null ) {
+            return $this->concurrent_conn;
+        }
+
+        // wordpress-develop bootstrap defines DB_HOST, DB_USER, DB_PASSWORD, DB_NAME
+        // from wp-tests-config.php. Parse host:port if needed.
+        $host = defined( 'DB_HOST' ) ? DB_HOST : '127.0.0.1';
+        $user = defined( 'DB_USER' ) ? DB_USER : 'root';
+        $pass = defined( 'DB_PASSWORD' ) ? DB_PASSWORD : '';
+        $name = defined( 'DB_NAME' ) ? DB_NAME : 'wordpress_test';
+
+        $port = null;
+        $sock = null;
+        if ( strpos( $host, ':' ) !== false ) {
+            list( $host, $tail ) = explode( ':', $host, 2 );
+            if ( ctype_digit( $tail ) ) {
+                $port = (int) $tail;
+            } else {
+                $sock = $tail;
+            }
+        }
+
+        // Use mysqli_init + real_connect so we can set timeout options.
+        $conn = mysqli_init();
+        if ( ! $conn ) {
+            $this->fail( 'mysqli_init() failed' );
+        }
+
+        // Short connect timeout — CI failures should be surfaced fast.
+        $conn->options( MYSQLI_OPT_CONNECT_TIMEOUT, 5 );
+
+        $ok = $conn->real_connect( $host, $user, $pass, $name, $port, $sock );
+        if ( ! $ok ) {
+            $this->fail( 'mysqli concurrent connection failed: ' . mysqli_connect_error() );
+        }
+        $conn->set_charset( 'utf8mb4' );
+
+        // Default lock-wait timeout for the SECOND connection — keeps test fast
+        // if the first connection holds the lock indefinitely (test bug).
+        $conn->query( 'SET SESSION innodb_lock_wait_timeout = 3' );
+
+        $this->concurrent_conn = $conn;
+        return $conn;
+    }
+
+    /**
      * Convenience: assert that a value is a WP_Error with optional code match.
      *
      * NOT named `assertWPError` — that clashes with WP_UnitTestCase_Base's own
@@ -195,6 +264,15 @@ abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
      * messages. Real test assertions bring back error reporting via setUp().
      */
     public function tear_down(): void {
+        // Close the concurrent connection if any test opened one. Do this BEFORE
+        // wpdb cleanup so any open transaction on the secondary is rolled back.
+        if ( $this->concurrent_conn !== null ) {
+            // Best-effort — if the connection is dead, mysqli_close is a no-op.
+            @$this->concurrent_conn->query( 'ROLLBACK' );
+            @$this->concurrent_conn->close();
+            $this->concurrent_conn = null;
+        }
+
         global $wpdb;
         $prev_show     = $wpdb->show_errors;
         $prev_suppress = $wpdb->suppress_errors;
