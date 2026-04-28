@@ -36,6 +36,18 @@ final class ConcurrentStockSubtractTest extends DinocoIntegrationTestCase {
     public function set_up(): void {
         parent::set_up();
         $this->load_fixture( 'seed-products-hierarchy.sql' );
+
+        // Concurrent tests need fixtures COMMITTED so the secondary mysqli
+        // connection can see them. WP_UnitTestCase wraps each test in its
+        // own transaction and rolls back at tear_down — fixtures inserted
+        // via $wpdb during set_up are otherwise invisible to other
+        // connections.
+        //
+        // Explicit COMMIT here loses WP's automatic rollback for THIS test,
+        // but our parent tear_down() truncates dinoco_* custom tables
+        // unconditionally so cleanup is still correct.
+        global $wpdb;
+        $wpdb->query( 'COMMIT' );
     }
 
     /**
