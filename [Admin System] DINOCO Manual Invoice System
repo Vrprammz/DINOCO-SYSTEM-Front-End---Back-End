@@ -2,6 +2,26 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.8 (2026-04-28) — Observability fix for invoice image push silent failure.
+ *   User reported: ลูกค้าได้รับ Flex card หลัง issue invoice แต่ไม่ได้รูป invoice ตามมา.
+ *   Root cause hypothesis (3 paths converge in notify phase):
+ *     • Notify phase wrapped in try/catch by [Admin System] DINOCO Transaction Wrapper
+ *       (line 202-211) — exceptions swallowed silently to prevent LINE timeouts blocking
+ *       finance lock. Flex push succeeds + b2b_send_invoice_image throws OR returns
+ *       false (GD missing / font download failed / b2b_generate_invoice_pages aborts) →
+ *       admin sees nothing, only [InvImg]/[Font] traces in debug.log.
+ *     • Symptom matches H1+H2+H3+H4 from bug report — actual root cause requires log
+ *       inspection on production.
+ *   Fix: instrument 3 notify sites (wrapper / legacy / resend_line) with structured
+ *   b2b_log entries before+after each call so root cause is traceable on next failure:
+ *     • [InvNotify] inv=<id> flex_push code=<http>  group=<gid>
+ *     • [InvNotify] inv=<id> calling b2b_send_invoice_image fn_exists=<0|1>
+ *     • [InvNotify] inv=<id> image push result=<FALSE|OK pages=N>
+ *   Also: resend_line endpoint now reports actual HTTP code in response message
+ *   (was: "ส่ง LINE สำเร็จ/ล้มเหลว" boolean; now: "ส่ง LINE ล้มเหลว (HTTP 401)")
+ *   and decouples image push from flex success (was gated on truthy $sent which was
+ *   always truthy due to b2b_line_push_raw returning array even on WP_Error path).
+ *   No business logic change — only adds observability + decouples resend image gate.
  * Version: V.34.7 (2026-04-24) — Cleanup batch L2 verification: confirmed all slip/payment
  *   timestamp sites use `b2b_date('Y-m-d H:i:s')` (lines 1900, 2003, 2096, 2107, 2194,
  *   2280, 2472) — addressed by V.34.1 Wave 2. Remaining `Y-m-d`-only calls (1350, 1439,
@@ -1738,11 +1758,21 @@ function _dinoco_inv_do_issue_notify($post_id, $dist_id, $total, $dist_name) {
             'created_by'      => intval(get_post_meta($post_id, '_inv_created_by', true)),
         ];
         $flex = dinoco_inv_build_flex_card($inv_data, $settings);
-        b2b_line_push_raw($line_group, $flex);
+        $flex_result = b2b_line_push_raw($line_group, $flex);
+        $flex_code = is_array($flex_result) && isset($flex_result['code']) ? intval($flex_result['code']) : 0;
+        if (function_exists('b2b_log')) b2b_log('[InvNotify] inv=' . $post_id . ' flex_push code=' . $flex_code . ' group=' . $line_group);
         // Send invoice as image (uses Snippet 10 GD generator if available)
-        if (function_exists('b2b_send_invoice_image')) {
-            b2b_send_invoice_image($line_group, $post_id);
+        $img_fn_exists = function_exists('b2b_send_invoice_image');
+        if (function_exists('b2b_log')) b2b_log('[InvNotify] inv=' . $post_id . ' calling b2b_send_invoice_image fn_exists=' . ($img_fn_exists ? '1' : '0'));
+        if ($img_fn_exists) {
+            $img_result = b2b_send_invoice_image($line_group, $post_id);
+            if (function_exists('b2b_log')) {
+                $summary = $img_result === false ? 'FALSE (gen/push failed — see [InvImg]/[Font]/[GD] logs above)' : (is_array($img_result) ? 'OK pages=' . count($img_result) : var_export($img_result, true));
+                b2b_log('[InvNotify] inv=' . $post_id . ' image push result=' . $summary);
+            }
         }
+    } else {
+        if (function_exists('b2b_log')) b2b_log('[InvNotify] inv=' . $post_id . ' SKIP — distributor has no line_group_id (dist=' . $dist_id . ')');
     }
 }
 
@@ -1813,7 +1843,7 @@ function _dinoco_inv_do_issue_legacy($post_id, $dist_id, $total, $dist_name) {
     b2b_set_order_status($post_id, 'awaiting_payment');
     b2b_add_audit_log($post_id, 'invoice_issued', 'ออกใบแจ้งหนี้/วางบิล ฿' . number_format($total, 0) . ' เพิ่มหนี้ตัวแทน ' . $dist_name);
 
-    // Send LINE Flex Card + Invoice Image
+    // Send LINE Flex Card + Invoice Image (legacy path — same observability as wrapper notify)
     $line_group = get_field('line_group_id', $dist_id);
     if ($line_group) {
         $settings = dinoco_inv_get_settings();
@@ -1828,11 +1858,20 @@ function _dinoco_inv_do_issue_legacy($post_id, $dist_id, $total, $dist_name) {
             'created_by'      => intval(get_post_meta($post_id, '_inv_created_by', true)),
         ];
         $flex = dinoco_inv_build_flex_card($inv_data, $settings);
-        b2b_line_push_raw($line_group, $flex);
-        // Send invoice as image (uses Snippet 10 GD generator if available)
-        if (function_exists('b2b_send_invoice_image')) {
-            b2b_send_invoice_image($line_group, $post_id);
+        $flex_result = b2b_line_push_raw($line_group, $flex);
+        $flex_code = is_array($flex_result) && isset($flex_result['code']) ? intval($flex_result['code']) : 0;
+        if (function_exists('b2b_log')) b2b_log('[InvNotify-legacy] inv=' . $post_id . ' flex_push code=' . $flex_code . ' group=' . $line_group);
+        $img_fn_exists = function_exists('b2b_send_invoice_image');
+        if (function_exists('b2b_log')) b2b_log('[InvNotify-legacy] inv=' . $post_id . ' calling b2b_send_invoice_image fn_exists=' . ($img_fn_exists ? '1' : '0'));
+        if ($img_fn_exists) {
+            $img_result = b2b_send_invoice_image($line_group, $post_id);
+            if (function_exists('b2b_log')) {
+                $summary = $img_result === false ? 'FALSE (gen/push failed — see [InvImg]/[Font]/[GD] logs above)' : (is_array($img_result) ? 'OK pages=' . count($img_result) : var_export($img_result, true));
+                b2b_log('[InvNotify-legacy] inv=' . $post_id . ' image push result=' . $summary);
+            }
         }
+    } else {
+        if (function_exists('b2b_log')) b2b_log('[InvNotify-legacy] inv=' . $post_id . ' SKIP — distributor has no line_group_id (dist=' . $dist_id . ')');
     }
     return true;
 }
@@ -2665,12 +2704,23 @@ function dinoco_inv_rest_resend_line(WP_REST_Request $req) {
         'created_by'       => intval(get_post_meta($id, '_inv_created_by', true)),
     ];
     $flex = dinoco_inv_build_flex_card($inv_data, dinoco_inv_get_settings());
-    $sent = b2b_line_push_raw($line_gid, $flex);
-    if ($sent && function_exists('b2b_send_invoice_image')) {
-        b2b_send_invoice_image($line_gid, $id);
+    $sent_result = b2b_line_push_raw($line_gid, $flex);
+    $sent_code = is_array($sent_result) && isset($sent_result['code']) ? intval($sent_result['code']) : 0;
+    $sent_ok = ($sent_code === 200);
+    if (function_exists('b2b_log')) b2b_log('[InvNotify-resend] inv=' . $id . ' flex_push code=' . $sent_code . ' group=' . $line_gid);
+    // V.34.8: send image regardless of Flex push status (image is independent — sometimes
+    // Flex fails but image succeeds, or vice versa). Old behaviour gated image on $sent
+    // truthy which incorrectly treated array(['code'=>0,'body'=>'']) from WP_Error path
+    // as truthy "success" — fine, but masked Flex failures. Now log both outcomes.
+    if (function_exists('b2b_send_invoice_image')) {
+        $img_result = b2b_send_invoice_image($line_gid, $id);
+        if (function_exists('b2b_log')) {
+            $summary = $img_result === false ? 'FALSE (gen/push failed — see [InvImg]/[Font]/[GD] logs above)' : (is_array($img_result) ? 'OK pages=' . count($img_result) : var_export($img_result, true));
+            b2b_log('[InvNotify-resend] inv=' . $id . ' image push result=' . $summary);
+        }
     }
     b2b_add_audit_log($id, 'resend_line', 'ส่ง LINE Flex Card ซ้ำ โดย ' . wp_get_current_user()->user_login);
-    return rest_ensure_response(['success' => $sent, 'message' => $sent ? 'ส่ง LINE สำเร็จ' : 'ส่ง LINE ล้มเหลว']);
+    return rest_ensure_response(['success' => $sent_ok, 'message' => $sent_ok ? 'ส่ง LINE สำเร็จ' : 'ส่ง LINE ล้มเหลว (HTTP ' . $sent_code . ')']);
 }
 
 // --- PENDING SUMMARY: Preview (GET) ---
