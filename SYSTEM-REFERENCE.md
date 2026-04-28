@@ -122,7 +122,7 @@
 | [Admin System] DINOCO Service Center & Claims | V.30.3 | 27 | `[dinoco_admin_claims]` | Claims management + auto-close 3 statuses (30d) |
 | [Admin System] AI Control Module | V.30.2 | 35 | `[dinoco_admin_ai_control]` | AI Command Center (Gemini v22.0 function calling) |
 | [Admin System] KB Trainer Bot v2.0 | V.30.3 | 62 | -- | Knowledge Base trainer (Gemini, limit 200 entries) |
-| [Admin System] DINOCO Manual Invoice System | V.34.9 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
+| [Admin System] DINOCO Manual Invoice System | V.34.10 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
 | [Admin System] AI Provider Abstraction | V.1.2 | 1040 | -- | Multi-AI provider (Claude/Gemini/OpenAI) |
 | [Admin System] DINOCO Moto Manager | V.1.0 | 1157 | `[dinoco_admin_moto]` | Motorcycle brands & models CRUD |
 | [Admin System] DINOCO Admin Finance Dashboard | V.3.16 | 1158 | `[dinoco_admin_finance]` | Finance overview (debt, revenue, risk AI) |
@@ -151,7 +151,7 @@
 | Snippet 7: Cron Jobs - Dunning + Summary + Rank | V.30.5 | 56 | 9 cron jobs (dunning, summary, rank, flash, shipping) |
 | Snippet 8: Distributor Ticket View | V.30.4 | 57 | `/b2b-ticket/` -- Order detail page (admin/customer split) |
 | Snippet 9: Admin Control Panel | V.33.2 | 58 | `[b2b_admin_control]` -- Distributors, products, settings, Flash |
-| Snippet 10: Invoice Image Generator | V.30.7 | 61 | A4 invoice PNG (GD Library) — V.30.7 image push observability + GD admin notice |
+| Snippet 10: Invoice Image Generator | V.30.8 | 61 | A4 invoice PNG (GD Library) — V.30.7 push observability, V.30.8 admin notice scoped + dismissible |
 | Snippet 11: Customer LIFF Pages | V.30.2 | 64 | `[b2b_commands]`, `[b2b_orders]`, `[b2b_account]` |
 | Snippet 12: Admin Dashboard LIFF | V.31.2 | 65 | `[b2b_dashboard]`, `[b2b_stock_manager]`, `[b2b_tracking_entry]` |
 | Snippet 13: Debt Transaction Manager | V.2.0 | 1036 | Atomic debt operations (MySQL transactions, FOR UPDATE) |
@@ -329,6 +329,8 @@
 invoice/list, invoice/get, invoice/init, invoice/create, invoice/update, invoice/issue, invoice/record-payment, invoice/verify-slip, invoice/verify-slip-combined, invoice/upload-slip, invoice/cancel, invoice/delete, invoice/send-reminder, invoice/send-overdue-notice, invoice/resend-line, invoice/pending-summary, invoice/send-summary, invoice/distributor-detail
 
 > **V.33.6**: Manual Invoice System re-registers `GET /b2b/v1/products` locally (ชี้ callback ไป `b2b_rest_list_products` ของ Snippet 9 ที่ยังเก็บเป็น dead code หลัง V.35.0) เพราะ frontend `invLoadProducts()` ยังต้องใช้ route เดิม. Guarded ด้วย `function_exists` → return 503 ถ้า Snippet 9 disabled.
+>
+> **V.34.10 (2026-04-28)** — Code-reviewer remediation post-V.34.9 (1 HIGH + 3 MED + 4 LOW). HIGH-1: V.34.9 ดัก 403 ทุกตัว → non-nonce 403 (rate_limited, bo_locked, capability fail) ก็ redirect to wp-login → admin force-logout เสีย unsaved draft. Fix: whitelist `_INV_AUTH_RELOAD_CODES = {rest_cookie_invalid_nonce, rest_forbidden, rest_user_cannot_access, rest_not_logged_in}`. รหัสอื่น fall through to normal toast. MED-1: infinite reload loop guard — เช็ค `content-type: application/json` ก่อนเรียก auth handler. Non-JSON 403/5xx (Cloudflare WAF / PHP fatal HTML page) → preview body 80 chars แรกใน toast. MED-2: 2 callers `invResendLineBuilder` + `invResendLine` ใช้ `data.message` (V.34.8 server return "(HTTP 429)" etc.) แทน generic 'ส่ง LINE ล้มเหลว'. LOW-1+LOW-2: doc comments clarified (multi-prompt guard ไม่ใช่ retry loop, setTimeout ordering intentional). LOW-3+LOW-4: reviewer-verified safe (math precision + WP open-redirect protection). Commit `25d6f5e`.
 >
 > **V.34.9 (2026-04-28)** — Fix "Cookie check failed" 403 บน stale nonce. Bug: `INV_NONCE = wp_create_nonce('wp_rest')` generated ครั้งเดียวตอน shortcode render → embedded JS static. WP nonce TTL default 24h. Tab opened > 24h → REST 18 endpoints + bo-summary polling 60s ทุกตัว return 403 `rest_cookie_invalid_nonce`. UI toast "บันทึกล้มเหลว: Cookie check failed" + admin ออกบิลไม่ได้. Fix: `invApi()` ดัก 403 + nonce-related code/message → confirm prompt + auto-reload (`window.location.reload()`) → page render ใหม่ได้ nonce ใหม่. Single-handler ครอบคลุม 18 endpoints (no per-call retry loop). 401/403-capability (different code) → redirect `/wp-login.php?redirect_to=<current>`. One-shot guard `_invNonceReloadShown` กัน prompt spam ตอน parallel calls fail พร้อมกัน. Commit `90aafe5`.
 >
