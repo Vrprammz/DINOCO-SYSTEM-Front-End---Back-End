@@ -127,17 +127,11 @@
 | **4e** | 18 admin tabs → Module Registry self-registration | ✅ SHIPPED | `phase-4e-applied.md` |
 | **4f** | Cron registry heartbeat tracking (~25 crons) | ✅ SHIPPED | `phase-4f-applied.md` |
 
-## 📋 Phase 5 Roadmap (Optional Cleanup)
+## 📋 Phase 5 Applied ✅ (2026-04-28)
 
-Once Module Registry is hardened as a **required** dependency, drop the hardcoded fallback arrays in `[Admin System] DINOCO Admin Dashboard`:
+`[Admin System] DINOCO Admin Dashboard` V.33.6 → **V.34.0** — Module Registry promoted to PRIMARY source for 4 wiring points (`$module_map`, `$cacheable_modules`, `$modules[]`, `TAB_LABELS`). Hardcoded literals extracted to `_dnc_emergency_*()` helper functions used **only when registry returns empty** (snippet disabled / load-order race). `b2b_log` warning emitted on fallback path so missing snippet is detected, not silent. Doc: `phase-5-applied.md`.
 
-1. Drop hardcoded `$module_map` (lines 717-737) — pure registry merge
-2. Drop hardcoded `$cacheable_modules` (lines 752-771) — pure registry merge
-3. Drop hardcoded `$modules[]` placeholder array (line 3968) — loop registry
-4. Drop hardcoded `TAB_LABELS` JS literal (line 4041) — emit from registry via `wp_json_encode`
-5. Refactor sidebar nav-item HTML (line ~3490) to render from registry (Phase 1 known limitation)
-
-**Risk**: Disabling Module Registry snippet → dashboard breaks. Currently safe because hardcoded arrays act as fallback. Phase 5 makes registry the **sole** source of truth — same blast radius as making Snippet 1 required.
+Sidebar nav-item HTML still hardcoded (Phase 1 known limitation — out of Phase 5 scope; nav structure groups multiple shortcodes per section + carries Thai labels different from registry labels).
 
 **Out-of-scope deferrals (acceptable)**:
 
