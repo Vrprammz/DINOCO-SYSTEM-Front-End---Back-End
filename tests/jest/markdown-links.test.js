@@ -69,18 +69,35 @@ function findMarkdownFiles(dir, results = []) {
 }
 
 /**
+ * Strip fenced code blocks + inline code spans before link extraction.
+ * Markdown examples like `[text](rel-path)` inside backticks are syntax
+ * documentation, not real links, and must not trigger validation.
+ *
+ * Replaces stripped regions with same-length spaces to preserve line
+ * numbering for error reporting.
+ */
+function stripCodeRegions(content) {
+    // Fenced code blocks: ```lang\n...\n```
+    let out = content.replace(/```[\s\S]*?```/g, (m) =>
+        m.replace(/[^\n]/g, " ")
+    );
+    // Inline code spans: `...` (non-greedy, single line)
+    out = out.replace(/`[^`\n]+`/g, (m) => " ".repeat(m.length));
+    return out;
+}
+
+/**
  * Extract markdown link targets `[text](target)` from content.
  * Returns array of `{ target, line }` for relative-path targets only.
  *
  * Skips:
- *   - http://, https://, mailto:, tel:, ftp://
+ *   - URI schemes (http://, mailto:, computer://, etc.)
  *   - Anchor-only (`#section`)
  *   - Empty targets
- *   - `<...>` autolinks (only `[text](url)` form is captured)
- *
- * Handles escaped parens inside link text (rare).
+ *   - Code-region content (fenced + inline)
  */
 function extractRelativeLinks(content) {
+    content = stripCodeRegions(content);
     // Match [text](target). Non-greedy on text + target. Stop target at first
     // unescaped paren or whitespace (markdown link spec).
     const linkRe = /\[([^\]]*)\]\(([^)\s]+?)(?:\s+"[^"]*")?\)/g;

@@ -4,7 +4,6 @@
  */
 
 let config = { siteUrl: '', apiKey: '' };
-let pageData = {};
 
 const PLAT_ICONS = {
   facebook_group: '📘', facebook_page: '📘', youtube: '▶️',
@@ -89,7 +88,7 @@ async function showMain() {
     let resp;
     try {
       resp = await chrome.tabs.sendMessage(tab.id, { action: 'getPageData' });
-    } catch (e) {
+    } catch (_e) {
       // Content script ยังไม่ inject (FB SPA navigate / เพิ่งติดตั้ง) — inject ใหม่
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
       // รอ script โหลด
@@ -98,7 +97,6 @@ async function showMain() {
     }
 
     if (resp) {
-      pageData = resp;
       const icon = PLAT_ICONS[resp.platform] || '🌐';
       const name = PLAT_NAMES[resp.platform] || resp.platform;
       document.getElementById('source-plat').textContent = icon + ' ' + (resp.sourceName || name);
@@ -107,7 +105,7 @@ async function showMain() {
         : 'กดปุ่มเพื่อเก็บ Post + Comments ทั้งหมด';
       document.getElementById('source-info').textContent = info;
     }
-  } catch (e) {
+  } catch (_e) {
     document.getElementById('source-plat').textContent = '🌐 หน้านี้ไม่รองรับ';
     document.getElementById('source-info').textContent = 'เปิด Facebook/YouTube/TikTok/Pantip แล้วลองใหม่';
     document.getElementById('btn-collect').disabled = true;
@@ -134,13 +132,13 @@ async function collectAll() {
 
     try {
       fullData = await chrome.tabs.sendMessage(tab.id, { action: 'getFullPost' });
-    } catch (e) {
+    } catch (_e) {
       // Content script ไม่ตอบ — inject ใหม่แล้วลองอีกครั้ง
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
       await new Promise(r => setTimeout(r, 500));
       fullData = await chrome.tabs.sendMessage(tab.id, { action: 'getFullPost' });
     }
-  } catch (e) {
+  } catch (_e) {
     return showError('ไม่สามารถอ่านหน้าเว็บได้ — ลอง refresh หน้าแล้วกดใหม่');
   }
 
@@ -187,7 +185,7 @@ async function collectAll() {
     let data;
     try {
       data = await resp.json();
-    } catch (e) {
+    } catch (_e) {
       return showError('Server ตอบกลับไม่ใช่ JSON — อาจ timeout หรือ server error');
     }
 

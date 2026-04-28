@@ -49,6 +49,35 @@ module.exports = [
         },
     },
 
+    // Chrome extension (manifest v3) — popup + content script
+    // Files use plain script context (no ES modules) and access chrome.* APIs.
+    {
+        files: ["brand-voice-extension/**/*.js"],
+        languageOptions: {
+            ecmaVersion: 2022,
+            sourceType: "script",
+            globals: {
+                ...globals.browser,
+                chrome: "readonly",
+            },
+        },
+        rules: {
+            eqeqeq: ["error", "smart"],
+            "no-unused-vars": [
+                "error",
+                {
+                    argsIgnorePattern: "^_",
+                    varsIgnorePattern: "^_",
+                    caughtErrorsIgnorePattern: "^_",
+                },
+            ],
+            "no-implicit-globals": "off", // popup.js / content.js are top-level scripts
+            "prefer-const": "warn",
+            "no-var": "warn",
+            "no-console": "off", // diagnostics expected in a content script
+        },
+    },
+
     // Jest test files — Node CommonJS + jsdom + jest globals
     {
         files: ["tests/jest/**/*.js"],

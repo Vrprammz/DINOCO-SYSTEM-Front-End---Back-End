@@ -124,8 +124,8 @@ function extractFacebookFull(result) {
       if (authorEl) author = authorEl.textContent.trim();
 
       // หา text — ใช้ innerText ของ article ทั้งก้อน แล้วตัด noise + author ออก
-      let rawArticle = el.innerText || '';
-      let lines = rawArticle.split('\n')
+      const rawArticle = el.innerText || '';
+      const lines = rawArticle.split('\n')
         .map(l => l.trim())
         .filter(l => {
           if (l.length < 2) return false;
@@ -148,7 +148,7 @@ function extractFacebookFull(result) {
         }
       }
 
-      let text = lines.join('\n').trim();
+      const text = lines.join('\n').trim();
       if (!text || text.length < 2) return;
 
       // Dedup — ใช้ author + text เพื่อไม่ตัดข้อความสั้นที่ต่างคนพูด
