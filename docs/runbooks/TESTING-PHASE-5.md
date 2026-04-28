@@ -180,7 +180,48 @@ Manual trigger: `workflow_dispatch` is enabled — you can run it from the Actio
 
 ## What's NOT covered yet
 
-- **M4**: BO scenarios + concurrent-worker harness via second mysqli connection
-- **M5**: Coverage report + CI badge
+### M4 — Top-10 + concurrent-worker harness (deferred)
+
+Five more integration tests covering the BO + slip + Flash hook scenarios from the original top-10 list:
+
+- BO Split + debt compound invariant (Snippet 16 `bo-split` REST endpoint)
+- Slip apply + dedup multi-invoice (B2F Snippet 7 `b2f_payable_add` + B2B Snippet 13)
+- Place-order rate limit `GET_LOCK` atomic (Snippet 1 V.33.7 `b2b_rate_limit`)
+- Opaque accept stock snapshot immutability (Snippet 2 V.34.4 confirm_order BO gate)
+- BO fulfill → Flash secondary + print queue chain graceful degradation (Snippet 1 + 16 hooks)
+
+For real concurrency tests (#1, #2, #5), implement **2-connection harness**: open a second `mysqli` connection in the same test process, run both transactions in interleaved order — proves FOR UPDATE / GET_LOCK serialization without `pcntl_fork` (CI runners disable it).
+
+Pattern:
+
+```php
+final class BoSplitDebtInvariantTest extends DinocoIntegrationTestCase {
+    private \mysqli $second_conn;
+
+    public function set_up(): void {
+        parent::set_up();
+        global $wpdb;
+        $this->second_conn = mysqli_connect( DB_HOST, DB_USER, DB_PASSWORD, DB_NAME );
+    }
+
+    public function test_concurrent_bo_split_serializes_via_get_lock(): void {
+        // Tx1 (default $wpdb): START + lock + first split
+        // Tx2 (second_conn):   START + same lock acquire (blocks)
+        // Tx1 commits → Tx2 unblocks → second split sees updated state
+        // Assert: total fulfilled qty == initial qty (no double-credit)
+    }
+}
+```
+
+### M5 — Coverage report + CI badge (deferred)
+
+Steps:
+
+1. Add `xdebug` extension + `coverage: xdebug` to `setup-php` step in unit job
+2. Add `--coverage-clover=clover.xml` to `phpunit -c phpunit.xml.dist` invocation
+3. Upload to Codecov via `codecov/codecov-action@v4`
+4. Add coverage badge to README.md (after CI green for 3+ runs)
+
+PHP 8.1 + xdebug 3.x adds ~30s overhead — keep coverage on Unit job only (Integration runs against real WP, not useful as a coverage signal for our snippets).
 
 Frontend / E2E tests (Jest, Playwright) are separate phases (Phase 6 / 7) and not in scope here.

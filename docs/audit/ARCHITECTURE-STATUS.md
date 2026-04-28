@@ -129,7 +129,32 @@
 
 ## 📋 Phase 5 Applied ✅ (2026-04-28)
 
+### Phase 5a — Module Registry promoted to PRIMARY (Admin Dashboard refactor)
+
 `[Admin System] DINOCO Admin Dashboard` V.33.6 → **V.34.0** — Module Registry promoted to PRIMARY source for 4 wiring points (`$module_map`, `$cacheable_modules`, `$modules[]`, `TAB_LABELS`). Hardcoded literals extracted to `_dnc_emergency_*()` helper functions used **only when registry returns empty** (snippet disabled / load-order race). `b2b_log` warning emitted on fallback path so missing snippet is detected, not silent. Doc: `phase-5-applied.md`.
+
+### Phase 5b — Test Infrastructure (M1-M3 ✅, M4-M5 deferred)
+
+Two-tier PHPUnit test stack with CI integration:
+
+- **Unit suite** (`tests/helpers/`, 110 tests / 177 assertions, < 5s) — pure-logic helpers (registry, picker, hierarchy, audit redact, dealer price, box calc, currency, FSM validation table).
+- **Integration suite** (`tests/integration/`, 42 tests / 115 assertions, ~1 min) — real WordPress runtime via `wordpress-develop` + MySQL service. Covers stock atomic, FSM transition, REST nonce gates, hierarchy DD-3, audit log dual-write.
+
+**M1-M3 milestones complete**:
+
+- M1: composer + bootstrap + base case + snippet-loader + 10-table schema fixture + 3 seed fixtures + smoke test + install-wp-tests.sh + schema parity check + runbook
+- M2: 5 first integration tests (StockSubtractAtomic, FsmTransitionRollback, RestNonceGate, HierarchyDD3SharedChild, AuditDualWrite)
+- M3: GitHub Actions workflow GREEN ✅ — both jobs pass on PR + push to main, JUnit XML uploaded, retention 14d
+
+**CI iteration story**: 12 commits to first GREEN. Each fix peeled back another env layer (composer.lock drift → yoast wrapper PHPUnit 10 incompat → svn missing → set_up/tear_down visibility → assertWPError name clash → PHPUnit 10 incompat with WP test suite → ACF Pro stubs → b2b_log stub → stock test signature errors → audit row shape → hierarchy cache quirk).
+
+**Deferred to future work**:
+
+- M4 (concurrent-worker harness via 2nd mysqli connection — for true FOR UPDATE / GET_LOCK race testing)
+- M5 (coverage badge — DINOCO snippets lack `<?php` tag at line 1 so PHPUnit coverage tooling can't parse them. Defer until snippets migrate to composer packages.)
+- 1 incomplete test (`HierarchyDD3SharedChildTest::cascade_after_subtract` — production has per-process static cache that doesn't invalidate; production semantics fine but PHPUnit reuses process)
+
+**Runbook**: `docs/runbooks/TESTING-PHASE-5.md`.
 
 Sidebar nav-item HTML still hardcoded (Phase 1 known limitation — out of Phase 5 scope; nav structure groups multiple shortcodes per section + carries Thai labels different from registry labels).
 
