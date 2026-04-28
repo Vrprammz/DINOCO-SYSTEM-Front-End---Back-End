@@ -59,6 +59,68 @@ if ( ! defined( 'DINOCO_INTEGRATION_TESTING' ) ) {
 tests_add_filter(
     'muplugins_loaded',
     static function (): void {
+
+        // ── ACF Pro function stubs ────────────────────────────────────
+        // ACF Pro is license-gated and not installed in CI. Stub the
+        // handful of ACF functions that DINOCO snippets call, mirroring
+        // how ACF Pro stores values internally (postmeta key=name with
+        // a `_field` companion key for field group reference).
+
+        if ( ! function_exists( 'get_field' ) ) {
+            /**
+             * Read an ACF field value via direct postmeta read.
+             * Returns null for empty/missing (matches ACF Pro behavior closer than '').
+             */
+            function get_field( $selector, $post_id = false, $format_value = true ) {
+                if ( $post_id === false ) {
+                    $post_id = get_the_ID();
+                }
+                if ( $post_id === false || $post_id === 0 ) {
+                    // option pages: ACF stores at options key — DINOCO doesn't use option pages in tested paths
+                    return null;
+                }
+                $val = get_post_meta( $post_id, $selector, true );
+                return $val === '' ? null : $val;
+            }
+        }
+
+        if ( ! function_exists( 'update_field' ) ) {
+            function update_field( $selector, $value, $post_id = false ) {
+                if ( $post_id === false ) {
+                    $post_id = get_the_ID();
+                }
+                return update_post_meta( $post_id, $selector, $value );
+            }
+        }
+
+        if ( ! function_exists( 'have_rows' ) ) {
+            // Minimal stub — DINOCO test paths don't exercise nested ACF repeaters.
+            // Returning false short-circuits any have_rows() loops cleanly.
+            function have_rows( $selector, $post_id = false ) {
+                return false;
+            }
+        }
+
+        if ( ! function_exists( 'the_row' ) ) {
+            function the_row() {
+                return array();
+            }
+        }
+
+        if ( ! function_exists( 'get_sub_field' ) ) {
+            function get_sub_field( $selector, $format_value = true ) {
+                return null;
+            }
+        }
+
+        if ( ! function_exists( 'acf_add_local_field_group' ) ) {
+            // Snippets that register field groups expect this to exist.
+            // No-op in tests — we don't validate field group definitions.
+            function acf_add_local_field_group( $field_group ) {
+                return true;
+            }
+        }
+
         // Create DINOCO custom tables (idempotent via CREATE TABLE IF NOT EXISTS).
         global $wpdb;
 
