@@ -1,6 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.20 (2026-04-24) — AI accuracy hookups (3 ground-truth signals):       ║
+ * ║    Derive ai_correct + ai_correctness_source in finally block (BEFORE log_insert)   ║
+ * ║    based on terminal _slip_final_status. Pattern:                                   ║
+ * ║      • Slip2Go OK (200000/200200/200501) → AI predicted is_slip → correct=1         ║
+ * ║      • Slip2Go OCR fail (200500/200502/200503) → AI predicted is_slip → correct=0   ║
+ * ║      • Slip2Go duplicate (200501) → AI was correct (was indeed a slip) → correct=1  ║
+ * ║      • Slip2Go not_slip (200404) → AI predicted not_slip → correct=1                ║
+ * ║      • Slip2Go not_slip (200404) → AI predicted is_slip → correct=0 (overcalled)    ║
+ * ║      • prior_payment / replay_after_paid → AI was correct (real slip)               ║
+ * ║      • not_slip_heuristic → AI didn't run (heuristic caught) — leave NULL            ║
+ * ║      • not_slip_ai → AI made the call (no ground truth yet — leave NULL until admin) ║
+ * ║      • slip2go_error / fatal_exception → no ground truth — leave NULL                ║
+ * ║    Schema-aware: cols missing → log_insert silently drops (existing pattern).        ║
+ * ║    Companion: Snippet 1 V.34.20 (3 helpers), Snippet 15 V.8.16 (cols + idx).         ║
  * ║  Version: V.34.18 (2026-04-24) — Phase 4b: outer dinoco_transaction() wrapper around ║
  * ║    b2b_handle_slip_image() (LINE bot path). Inner body extracted verbatim to        ║
  * ║    _b2b_handle_slip_image_inner() — V.34.17 behavior byte-identical preserved.      ║
@@ -3612,6 +3626,73 @@ function _b2b_handle_slip_image_inner( $message_id, $group_id, $user_id, $reply_
             delete_transient( $lock_key );
         } catch ( \Throwable $e ) { /* silent */ }
 
+        // V.34.20: AI accuracy ground-truth derivation (BEFORE log_insert).
+        // Maps terminal _slip_final_status → ai_correct/source columns (Snippet 15 V.8.16).
+        // NULL semantics: AI didn't run, OR ground truth not yet known (admin review pending).
+        $_slip_ai_correct = null;
+        $_slip_ai_correctness_source = null;
+        if ( in_array( (string) $_slip_ai_decision, array( 'is_slip', 'not_slip' ), true ) ) {
+            $ai_says_slip = ( $_slip_ai_decision === 'is_slip' );
+            switch ( (string) $_slip_final_status ) {
+                // ─── Ground truth: WAS a slip ───
+                case 'paid':
+                case 'paid_overpayment':
+                    $_slip_ai_correct = $ai_says_slip ? 1 : 0;
+                    $_slip_ai_correctness_source = 'slip2go_success';
+                    break;
+                case 'duplicate':
+                    $_slip_ai_correct = $ai_says_slip ? 1 : 0;
+                    $_slip_ai_correctness_source = 'slip2go_duplicate';
+                    break;
+                case 'receiver_mismatch':
+                case 'amount_mismatch':
+                case 'amount_no_pending':
+                    // It WAS a slip (Slip2Go parsed it) — just receiver/amount wrong
+                    $_slip_ai_correct = $ai_says_slip ? 1 : 0;
+                    $_slip_ai_correctness_source = ( $_slip_final_status === 'receiver_mismatch' )
+                        ? 'slip2go_receiver_mismatch'
+                        : 'slip2go_amount_mismatch';
+                    break;
+                case 'replay_after_paid':
+                case 'manual_admin_paid':
+                    $_slip_ai_correct = $ai_says_slip ? 1 : 0;
+                    $_slip_ai_correctness_source = 'duplicate_detect';
+                    break;
+                // ─── Ground truth: NOT a slip ───
+                case 'not_slip':
+                    // Slip2Go 200404 explicit not-a-slip → AI correct iff it said not_slip
+                    $_slip_ai_correct = $ai_says_slip ? 0 : 1;
+                    $_slip_ai_correctness_source = 'slip2go_not_slip';
+                    break;
+                // ─── OCR fail / API problem — Slip2Go couldn't decide ───
+                case 'needs_review':
+                case 'unknown_slip_code':
+                    // OCR failed (200500/200502/200503) → if AI said is_slip, it's wrong;
+                    // if AI said not_slip but Slip2Go got far enough to reject → still no ground truth.
+                    // Conservative: count is_slip prediction as FP only when OCR fail occurred
+                    // (admin will move it via Review Pool which calls apply_review_correction).
+                    if ( $ai_says_slip ) {
+                        $_slip_ai_correct = 0;
+                        $_slip_ai_correctness_source = 'slip2go_ocr_fail';
+                    }
+                    // else: leave NULL — admin Review Pool decision will fill in
+                    break;
+                // ─── No ground truth yet (system error / heuristic-caught / AI-caught) ───
+                case 'slip2go_error':
+                case 'line_api_error':
+                case 'data_missing':
+                case 'fatal_exception':
+                case 'helper_missing':
+                case 'no_distributor':
+                case 'replay_blocked_rejected':
+                case 'not_slip_heuristic':
+                case 'not_slip_ai':
+                default:
+                    // Leave NULL — uncertain ground truth (system errors / pending review)
+                    break;
+            }
+        }
+
         // Write audit row
         try {
             if ( function_exists( 'b2b_slip_log_insert' ) ) {
@@ -3643,6 +3724,10 @@ function _b2b_handle_slip_image_inner( $message_id, $group_id, $user_id, $reply_
                     'ai_classifier_confidence' => $_slip_ai_confidence,
                     'ai_classifier_reason'     => $_slip_ai_reason,
                     'ai_classifier_at'         => $_slip_ai_at,
+                    // V.34.20: AI accuracy ground-truth columns (Snippet 15 V.8.16)
+                    // NULL when no ground truth yet — review-decision fills in later.
+                    'ai_correct'             => $_slip_ai_correct,
+                    'ai_correctness_source'  => $_slip_ai_correctness_source,
                 ) );
             }
         } catch ( \Throwable $e ) { /* silent */ }

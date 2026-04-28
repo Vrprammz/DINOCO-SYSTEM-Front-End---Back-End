@@ -1,0 +1,665 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Audit Retention                        ║
+ * ║  Version: V.1.0 (2026-04-24) — Audit log lifecycle manager.   ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
+ * ║                                                                ║
+ * ║  Purpose: prevent unbounded growth of wp_dinoco_audit_log     ║
+ * ║    (Phase 1 V.8.9 / commit 9264de2 ships table without TTL).  ║
+ * ║    Default policy keeps recent 90d full fidelity, archives    ║
+ * ║    next 90d to compressed CSV, hard-deletes >180d (or >365d   ║
+ * ║    for critical events: debt/credit/slip success).             ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * What it does:
+ *   - Daily cron `dinoco_audit_retention_cron` (registered via
+ *     dinoco_register_cron — heartbeat + Health Monitor visibility)
+ *   - Helper API: dinoco_audit_retention_run( $dry_run = false )
+ *   - Archive: CSV (gzip) → wp-content/uploads/audit-archive/YYYY-MM/
+ *   - Stats persisted to wp_options `_dinoco_audit_retention_last_run`
+ *     (JSON: { ran_at, archived, deleted, kept, errors, elapsed_ms })
+ *   - Self-audit row: writes event_type=retention_run to audit_log
+ *     itself (so retention runs are forensic-visible)
+ *
+ * Config keys (registered via dinoco_register_config — Config Layer):
+ *   audit.retention_days        int  default 90   — events older = archive candidate
+ *   audit.archive_days          int  default 180  — events older = hard-delete candidate
+ *   audit.critical_retention_days int default 365 — keep critical 1y minimum
+ *   audit.batch_size            int  default 5000 — rows per archive/delete batch
+ *
+ * Critical event types (long-retention whitelist):
+ *   debt_subtract, debt_add, credit_subtract, credit_add,
+ *   slip_apply, slip_review_decision, manual_admin_paid,
+ *   stock_add, stock_subtract, stock_transfer, fsm_transition,
+ *   po_create, po_complete, config_change, retention_run
+ *
+ * Backward compat:
+ *   - Disabling this snippet → cron stops; existing rows untouched
+ *   - Schema unchanged (no ALTER) — pure read/archive/delete
+ *   - dry_run mode = inspect counts only, NO mutation
+ *
+ * Security:
+ *   - Manual run requires manage_options + nonce
+ *   - Archive folder protected via .htaccess deny + index.php placeholder
+ *   - Path traversal defense: archive subdir generated server-side only
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ============================================================
+ * 1. CONFIG REGISTRATION (Config Layer integration)
+ * ============================================================ */
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_config' ) ) return;
+
+    dinoco_register_config( array(
+        'key'         => 'audit.retention_days',
+        'type'        => 'int',
+        'default'     => 90,
+        'min'         => 30,
+        'max'         => 365,
+        'label'       => 'Audit Retention (วัน)',
+        'description' => 'เก็บ rows full fidelity ก่อน archive (default 90d)',
+        'section'     => 'observability',
+    ) );
+    dinoco_register_config( array(
+        'key'         => 'audit.archive_days',
+        'type'        => 'int',
+        'default'     => 180,
+        'min'         => 90,
+        'max'         => 730,
+        'label'       => 'Audit Archive Window (วัน)',
+        'description' => 'rows อายุระหว่าง retention_days ถึง archive_days → CSV ก่อนลบ',
+        'section'     => 'observability',
+    ) );
+    dinoco_register_config( array(
+        'key'         => 'audit.critical_retention_days',
+        'type'        => 'int',
+        'default'     => 365,
+        'min'         => 90,
+        'max'         => 2555,
+        'label'       => 'Critical Event Retention (วัน)',
+        'description' => 'event_type ที่เป็น debt/credit/slip success เก็บ 1 ปี (compliance)',
+        'section'     => 'observability',
+    ) );
+    dinoco_register_config( array(
+        'key'         => 'audit.batch_size',
+        'type'        => 'int',
+        'default'     => 5000,
+        'min'         => 100,
+        'max'         => 50000,
+        'label'       => 'Audit Retention Batch Size',
+        'description' => 'rows per archive/delete batch (กัน lock + memory)',
+        'section'     => 'observability',
+    ) );
+}, 25 );
+
+/* ============================================================
+ * 2. CRITICAL EVENT WHITELIST
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_audit_critical_event_types' ) ) {
+    /**
+     * Event types that MUST keep audit.critical_retention_days minimum
+     * (compliance — financial mutations + legal review trail).
+     *
+     * @return array<string>
+     */
+    function dinoco_audit_critical_event_types() {
+        return array(
+            'debt_subtract', 'debt_add',
+            'credit_subtract', 'credit_add', 'b2f_credit_add', 'b2f_credit_subtract',
+            'slip_apply', 'slip_review_decision', 'manual_admin_paid',
+            'stock_add', 'stock_subtract', 'stock_transfer',
+            'fsm_transition',
+            'po_create', 'po_complete', 'po_cancel',
+            'config_change',
+            'retention_run',
+        );
+    }
+}
+
+/* ============================================================
+ * 3. ARCHIVE DIR HELPERS
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_audit_retention_archive_dir' ) ) {
+    /**
+     * Resolve archive dir for a given month bucket. Creates dir + .htaccess
+     * deny + index.php placeholder on first call.
+     *
+     * @param string $ym 'YYYY-MM'
+     * @return string|false absolute dir path or false on fail
+     */
+    function dinoco_audit_retention_archive_dir( $ym = '' ) {
+        $uploads = wp_upload_dir();
+        if ( empty( $uploads['basedir'] ) ) return false;
+
+        $base = trailingslashit( $uploads['basedir'] ) . 'audit-archive';
+        if ( ! is_dir( $base ) ) {
+            if ( ! wp_mkdir_p( $base ) ) return false;
+            // Lock the folder from public access (defense-in-depth)
+            @file_put_contents( $base . '/.htaccess',
+                "Order deny,allow\nDeny from all\n" );
+            @file_put_contents( $base . '/index.php', "<?php // silence is golden\n" );
+        }
+
+        if ( $ym === '' ) $ym = wp_date( 'Y-m' );
+        if ( ! preg_match( '/^\d{4}-\d{2}$/', $ym ) ) return false; // path traversal guard
+
+        $sub = trailingslashit( $base ) . $ym;
+        if ( ! is_dir( $sub ) ) {
+            if ( ! wp_mkdir_p( $sub ) ) return false;
+        }
+        return $sub;
+    }
+}
+
+if ( ! function_exists( 'dinoco_audit_retention_archive_size' ) ) {
+    /**
+     * Sum file sizes across archive dir (for Health Dashboard card).
+     * Bounded scan: max 500 files, max 5 levels, defensive.
+     *
+     * @return array { size_bytes, file_count }
+     */
+    function dinoco_audit_retention_archive_size() {
+        $uploads = wp_upload_dir();
+        if ( empty( $uploads['basedir'] ) ) return array( 'size_bytes' => 0, 'file_count' => 0 );
+        $base = trailingslashit( $uploads['basedir'] ) . 'audit-archive';
+        if ( ! is_dir( $base ) ) return array( 'size_bytes' => 0, 'file_count' => 0 );
+
+        $total = 0; $count = 0; $scanned = 0;
+        try {
+            $iter = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator( $base, FilesystemIterator::SKIP_DOTS ),
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
+            foreach ( $iter as $file ) {
+                if ( ++$scanned > 500 ) break;
+                if ( $file->isFile() ) {
+                    $total += $file->getSize();
+                    $count++;
+                }
+            }
+        } catch ( \Throwable $e ) { /* silent */ }
+        return array( 'size_bytes' => (int) $total, 'file_count' => (int) $count );
+    }
+}
+
+/* ============================================================
+ * 4. CORE RETENTION RUNNER
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_audit_retention_run' ) ) {
+    /**
+     * Run one retention pass. Idempotent — safe to call repeatedly.
+     *
+     * Two phases:
+     *   PHASE A — Archive: SELECT rows aged retention_days..archive_days
+     *             grouped by month, write to YYYY-MM/audit_<bucket>_<ts>.csv.gz
+     *   PHASE B — Delete:  rows older than archive_days OR critical_retention_days
+     *             (whichever applies per event_type)
+     *
+     * @param bool $dry_run if true, count only (no archive/delete writes)
+     * @return array { ran_at, archived, deleted, kept, errors, elapsed_ms, dry_run, archive_files }
+     */
+    function dinoco_audit_retention_run( $dry_run = false ) {
+        global $wpdb;
+        $start = microtime( true );
+        $stats = array(
+            'ran_at'         => current_time( 'mysql' ),
+            'archived'       => 0,
+            'deleted'        => 0,
+            'kept'           => 0,
+            'errors'         => array(),
+            'elapsed_ms'     => 0,
+            'dry_run'        => (bool) $dry_run,
+            'archive_files'  => array(),
+        );
+
+        $table = $wpdb->prefix . 'dinoco_audit_log';
+
+        // Defensive: table missing → no-op
+        $exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $exists ) {
+            $stats['errors'][] = 'audit_log_table_missing';
+            $stats['elapsed_ms'] = (int) round( ( microtime( true ) - $start ) * 1000 );
+            return $stats;
+        }
+
+        // Read config
+        $retention_days = function_exists( 'dinoco_config' )
+            ? (int) dinoco_config( 'audit.retention_days', 90 )
+            : 90;
+        $archive_days = function_exists( 'dinoco_config' )
+            ? (int) dinoco_config( 'audit.archive_days', 180 )
+            : 180;
+        $critical_days = function_exists( 'dinoco_config' )
+            ? (int) dinoco_config( 'audit.critical_retention_days', 365 )
+            : 365;
+        $batch = function_exists( 'dinoco_config' )
+            ? (int) dinoco_config( 'audit.batch_size', 5000 )
+            : 5000;
+
+        // Sanity: archive_days must be > retention_days; critical_days >= archive_days
+        if ( $archive_days <= $retention_days ) $archive_days = $retention_days + 30;
+        if ( $critical_days < $archive_days )    $critical_days = $archive_days;
+        if ( $batch < 100 )    $batch = 100;
+        if ( $batch > 50000 )  $batch = 50000;
+
+        // Build critical event_type list as SQL placeholders
+        $critical_types = dinoco_audit_critical_event_types();
+        // Defensive: if list empty (shouldn't happen) → skip critical guard
+        $critical_in_sql = '';
+        $critical_in_args = array();
+        if ( ! empty( $critical_types ) ) {
+            $ph = implode( ',', array_fill( 0, count( $critical_types ), '%s' ) );
+            $critical_in_sql = "AND event_type NOT IN ({$ph})";
+            $critical_in_args = $critical_types;
+        }
+
+        // ─── Pre-flight count (for stats — useful in dry_run too) ───
+        $age_archive = (int) $retention_days;       // archive zone start
+        $age_delete  = (int) $archive_days;         // delete zone start (non-critical)
+        $age_crit_del = (int) $critical_days;       // delete zone start (critical)
+
+        // Total rows + age buckets
+        $total_rows = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
+        $stats['kept'] = $total_rows;
+
+        // Archive zone count
+        $archive_count_sql = $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+               AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)",
+            $age_archive, $age_delete
+        );
+        $stats['archive_zone_count'] = (int) $wpdb->get_var( $archive_count_sql );
+
+        // Delete zone count (non-critical, older than archive_days)
+        if ( ! empty( $critical_in_args ) ) {
+            $del_sql = $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+                   {$critical_in_sql}",
+                array_merge( array( $age_delete ), $critical_in_args )
+            );
+        } else {
+            $del_sql = $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)",
+                $age_delete
+            );
+        }
+        $stats['delete_zone_count_non_critical'] = (int) $wpdb->get_var( $del_sql );
+
+        // Delete zone count (critical, older than critical_retention_days)
+        if ( ! empty( $critical_in_args ) ) {
+            $crit_in_sql_pos = "AND event_type IN (" . implode( ',', array_fill( 0, count( $critical_types ), '%s' ) ) . ")";
+            $crit_del_sql = $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+                   {$crit_in_sql_pos}",
+                array_merge( array( $age_crit_del ), $critical_types )
+            );
+            $stats['delete_zone_count_critical'] = (int) $wpdb->get_var( $crit_del_sql );
+        } else {
+            $stats['delete_zone_count_critical'] = 0;
+        }
+
+        if ( $dry_run ) {
+            $stats['elapsed_ms'] = (int) round( ( microtime( true ) - $start ) * 1000 );
+            return $stats;
+        }
+
+        // ═══ PHASE A — ARCHIVE (read + CSV.gz + delete) ═══
+        // Strategy: select up to $batch rows in archive zone, group by YYYY-MM
+        // of created_at, write each group to a separate file, then DELETE the
+        // archived ids in one DELETE statement. Repeat until no more rows
+        // (max 20 iterations as safety cap).
+        $iter_cap = 20;
+        $iter = 0;
+        while ( $iter < $iter_cap ) {
+            $iter++;
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT * FROM {$table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+                   AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+                 ORDER BY id ASC
+                 LIMIT %d",
+                $age_archive, $age_delete, $batch
+            ), ARRAY_A );
+            if ( empty( $rows ) ) break;
+
+            $by_month = array();
+            $row_ids = array();
+            foreach ( $rows as $row ) {
+                $month_key = substr( (string) $row['created_at'], 0, 7 );
+                if ( ! isset( $by_month[ $month_key ] ) ) $by_month[ $month_key ] = array();
+                $by_month[ $month_key ][] = $row;
+                $row_ids[] = (int) $row['id'];
+            }
+
+            // Write per-month files
+            foreach ( $by_month as $ym => $month_rows ) {
+                $dir = dinoco_audit_retention_archive_dir( $ym );
+                if ( $dir === false ) {
+                    $stats['errors'][] = 'archive_dir_create_fail:' . $ym;
+                    continue;
+                }
+                $filename = sprintf( 'audit_%s_%d.csv.gz', $ym, time() );
+                $abs_path = trailingslashit( $dir ) . $filename;
+                $written = dinoco_audit_retention_write_csv_gz( $abs_path, $month_rows );
+                if ( ! $written ) {
+                    $stats['errors'][] = 'archive_write_fail:' . $ym;
+                    continue;
+                }
+                $stats['archived'] += count( $month_rows );
+                $stats['archive_files'][] = array(
+                    'ym'    => $ym,
+                    'file'  => $filename,
+                    'rows'  => count( $month_rows ),
+                    'size'  => @filesize( $abs_path ),
+                );
+            }
+
+            // Delete archived rows ONLY if we actually wrote files for ALL months in this batch.
+            // Safety: if any month write failed, DON'T delete its rows (will retry next run).
+            // Compute "writable" = ids whose month matched a successful archive file.
+            $writable_ym = array();
+            foreach ( $stats['archive_files'] as $af ) {
+                $writable_ym[ $af['ym'] ] = true;
+            }
+            $deletable_ids = array();
+            foreach ( $rows as $row ) {
+                $month_key = substr( (string) $row['created_at'], 0, 7 );
+                if ( isset( $writable_ym[ $month_key ] ) ) {
+                    $deletable_ids[] = (int) $row['id'];
+                }
+            }
+            if ( ! empty( $deletable_ids ) ) {
+                $ids_csv = implode( ',', array_map( 'intval', $deletable_ids ) );
+                $del_ok = $wpdb->query( "DELETE FROM {$table} WHERE id IN ({$ids_csv})" );
+                if ( $del_ok === false ) {
+                    $stats['errors'][] = 'archive_delete_fail:' . $wpdb->last_error;
+                    break; // bail iter — DB issue
+                }
+            }
+
+            // Time budget guard: max 30s per run
+            if ( ( microtime( true ) - $start ) > 30 ) {
+                $stats['errors'][] = 'time_budget_exceeded_iter_' . $iter;
+                break;
+            }
+        }
+
+        // ═══ PHASE B — HARD DELETE old rows (no archive — already-archived OR critical-aged) ═══
+        // B.1: non-critical rows older than archive_days (any leftover not archived in earlier runs)
+        if ( ! empty( $critical_in_args ) ) {
+            $del_sql_b1 = $wpdb->prepare(
+                "DELETE FROM {$table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+                   {$critical_in_sql}
+                 LIMIT %d",
+                array_merge( array( $age_delete ), $critical_in_args, array( $batch ) )
+            );
+        } else {
+            $del_sql_b1 = $wpdb->prepare(
+                "DELETE FROM {$table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+                 LIMIT %d",
+                $age_delete, $batch
+            );
+        }
+        $deleted_b1 = $wpdb->query( $del_sql_b1 );
+        if ( $deleted_b1 === false ) {
+            $stats['errors'][] = 'phase_b1_delete_fail:' . $wpdb->last_error;
+        } else {
+            $stats['deleted'] += (int) $deleted_b1;
+        }
+
+        // B.2: critical rows older than critical_retention_days
+        if ( ! empty( $critical_in_args ) ) {
+            $crit_in_sql_pos = "AND event_type IN (" . implode( ',', array_fill( 0, count( $critical_types ), '%s' ) ) . ")";
+            $del_sql_b2 = $wpdb->prepare(
+                "DELETE FROM {$table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL %d DAY)
+                   {$crit_in_sql_pos}
+                 LIMIT %d",
+                array_merge( array( $age_crit_del ), $critical_types, array( $batch ) )
+            );
+            $deleted_b2 = $wpdb->query( $del_sql_b2 );
+            if ( $deleted_b2 === false ) {
+                $stats['errors'][] = 'phase_b2_delete_fail:' . $wpdb->last_error;
+            } else {
+                $stats['deleted'] += (int) $deleted_b2;
+            }
+        }
+
+        // Final stats
+        $stats['kept']       = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
+        $stats['elapsed_ms'] = (int) round( ( microtime( true ) - $start ) * 1000 );
+
+        // Persist run summary (autoload=no — observability only)
+        update_option( '_dinoco_audit_retention_last_run', wp_json_encode( $stats ), false );
+
+        // Self-audit row (so retention runs are forensic-visible)
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            try {
+                dinoco_audit_log( array(
+                    'event_type'  => 'retention_run',
+                    'actor_type'  => 'cron',
+                    'target_type' => 'audit_log',
+                    'target_id'   => 'wp_dinoco_audit_log',
+                    'amount'      => null,
+                    'context'     => array(
+                        'archived'      => $stats['archived'],
+                        'deleted'       => $stats['deleted'],
+                        'kept'          => $stats['kept'],
+                        'errors_count'  => count( $stats['errors'] ),
+                        'archive_files' => count( $stats['archive_files'] ),
+                        'elapsed_ms'    => $stats['elapsed_ms'],
+                    ),
+                    'success'     => empty( $stats['errors'] ) ? 1 : 0,
+                ) );
+            } catch ( \Throwable $e ) { /* silent */ }
+        }
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf(
+                '[AuditRetention] archived=%d deleted=%d kept=%d errors=%d elapsed=%dms',
+                $stats['archived'], $stats['deleted'], $stats['kept'],
+                count( $stats['errors'] ), $stats['elapsed_ms']
+            ) );
+        }
+
+        return $stats;
+    }
+}
+
+if ( ! function_exists( 'dinoco_audit_retention_write_csv_gz' ) ) {
+    /**
+     * Write rows to gzip-compressed CSV at $abs_path.
+     * UTF-8 BOM + CRLF line endings (Excel-friendly).
+     *
+     * @param string $abs_path
+     * @param array  $rows array<int,array> from $wpdb->get_results( ARRAY_A )
+     * @return bool
+     */
+    function dinoco_audit_retention_write_csv_gz( $abs_path, $rows ) {
+        if ( empty( $rows ) ) return false;
+        if ( ! function_exists( 'gzopen' ) ) {
+            // Fallback: plain CSV (no compression) — strip .gz extension
+            $abs_path = preg_replace( '/\.gz$/', '', $abs_path );
+            $fh = @fopen( $abs_path, 'w' );
+            if ( ! $fh ) return false;
+            // BOM
+            @fwrite( $fh, "\xEF\xBB\xBF" );
+            $headers = array_keys( $rows[0] );
+            @fwrite( $fh, implode( ',', $headers ) . "\r\n" );
+            foreach ( $rows as $r ) {
+                $cells = array();
+                foreach ( $headers as $h ) {
+                    $val = isset( $r[ $h ] ) ? (string) $r[ $h ] : '';
+                    // CSV escape: wrap with " and double existing "
+                    $val = str_replace( '"', '""', $val );
+                    if ( strpbrk( $val, ",\"\r\n" ) !== false ) $val = '"' . $val . '"';
+                    $cells[] = $val;
+                }
+                @fwrite( $fh, implode( ',', $cells ) . "\r\n" );
+            }
+            @fclose( $fh );
+            return file_exists( $abs_path ) && filesize( $abs_path ) > 0;
+        }
+
+        $gz = @gzopen( $abs_path, 'wb9' );
+        if ( ! $gz ) return false;
+        // BOM (helps Excel detect UTF-8 after un-gzip)
+        @gzwrite( $gz, "\xEF\xBB\xBF" );
+        $headers = array_keys( $rows[0] );
+        @gzwrite( $gz, implode( ',', $headers ) . "\r\n" );
+        foreach ( $rows as $r ) {
+            $cells = array();
+            foreach ( $headers as $h ) {
+                $val = isset( $r[ $h ] ) ? (string) $r[ $h ] : '';
+                $val = str_replace( '"', '""', $val );
+                if ( strpbrk( $val, ",\"\r\n" ) !== false ) $val = '"' . $val . '"';
+                $cells[] = $val;
+            }
+            @gzwrite( $gz, implode( ',', $cells ) . "\r\n" );
+        }
+        @gzclose( $gz );
+        return file_exists( $abs_path ) && filesize( $abs_path ) > 0;
+    }
+}
+
+/* ============================================================
+ * 5. STATUS / METRICS HELPERS (for Health Dashboard)
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_audit_retention_get_stats' ) ) {
+    /**
+     * Return current audit_log table size + last run summary.
+     *
+     * @return array
+     */
+    function dinoco_audit_retention_get_stats() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_audit_log';
+
+        $exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $exists ) {
+            return array(
+                'table_exists' => false,
+                'row_count'    => 0,
+                'size_bytes'   => 0,
+                'last_run'     => null,
+                'archive'      => array( 'size_bytes' => 0, 'file_count' => 0 ),
+            );
+        }
+
+        $row_count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
+        // Approximate size via INFORMATION_SCHEMA (data + index)
+        $size_bytes = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT (data_length + index_length)
+             FROM INFORMATION_SCHEMA.TABLES
+             WHERE table_schema = DATABASE() AND table_name = %s",
+            $table
+        ) );
+
+        $last_run_raw = get_option( '_dinoco_audit_retention_last_run', null );
+        $last_run = null;
+        if ( $last_run_raw ) {
+            $decoded = json_decode( $last_run_raw, true );
+            if ( is_array( $decoded ) ) $last_run = $decoded;
+        }
+
+        $archive = function_exists( 'dinoco_audit_retention_archive_size' )
+            ? dinoco_audit_retention_archive_size()
+            : array( 'size_bytes' => 0, 'file_count' => 0 );
+
+        return array(
+            'table_exists' => true,
+            'row_count'    => $row_count,
+            'size_bytes'   => $size_bytes,
+            'last_run'     => $last_run,
+            'archive'      => $archive,
+        );
+    }
+}
+
+/* ============================================================
+ * 6. CRON REGISTRATION
+ * ============================================================ */
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_cron' ) ) {
+        // Health Monitor not loaded — fall back to vanilla wp_schedule_event
+        if ( ! wp_next_scheduled( 'dinoco_audit_retention_cron' ) ) {
+            wp_schedule_event( time() + 300, 'daily', 'dinoco_audit_retention_cron' );
+        }
+        add_action( 'dinoco_audit_retention_cron', 'dinoco_audit_retention_handler' );
+        return;
+    }
+
+    dinoco_register_cron(
+        'dinoco_audit_retention_cron',
+        'daily',
+        'dinoco_audit_retention_handler'
+    );
+}, 30 );
+
+if ( ! function_exists( 'dinoco_audit_retention_handler' ) ) {
+    /**
+     * Cron handler — invokes runner with dry_run=false.
+     */
+    function dinoco_audit_retention_handler() {
+        if ( function_exists( 'dinoco_audit_retention_run' ) ) {
+            dinoco_audit_retention_run( false );
+        }
+    }
+}
+
+/* ============================================================
+ * 7. REST ENDPOINTS — admin manual trigger + status
+ * ============================================================ */
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco/v1', '/audit/retention/status', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_audit_retention_rest_status',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+    ) );
+
+    register_rest_route( 'dinoco/v1', '/audit/retention/run', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_audit_retention_rest_run',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+        'args'                => array(
+            'dry_run' => array( 'default' => false, 'sanitize_callback' => 'rest_sanitize_boolean' ),
+        ),
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_audit_retention_rest_status' ) ) {
+    function dinoco_audit_retention_rest_status( $request ) {
+        return rest_ensure_response( dinoco_audit_retention_get_stats() );
+    }
+}
+
+if ( ! function_exists( 'dinoco_audit_retention_rest_run' ) ) {
+    function dinoco_audit_retention_rest_run( $request ) {
+        $uid = get_current_user_id();
+        // Rate limit 3/min/user (destructive — DELETEs from audit_log)
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'audit_retention_u' . $uid, 3, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 3/min)', array( 'status' => 429 ) );
+            }
+        }
+        $dry_run = (bool) $request->get_param( 'dry_run' );
+        $result = dinoco_audit_retention_run( $dry_run );
+        return rest_ensure_response( $result );
+    }
+}

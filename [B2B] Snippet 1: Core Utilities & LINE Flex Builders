@@ -1,6 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.20 (2026-04-24) — AI accuracy metrics helpers (cost-saver tracking):    ║
+ * ║    • NEW b2b_slip_ai_update_correctness($log_id, $correct, $source) — atomic UPDATE     ║
+ * ║      `wp_dinoco_slip_log.ai_correct + ai_correctness_source` (Snippet 15 V.8.16 cols).  ║
+ * ║      Called post-hoc when ground truth becomes available (Slip2Go success / OCR fail /   ║
+ * ║      duplicate detected / admin Review Pool decision). Schema-aware (silent skip when   ║
+ * ║      cols missing — pre-V.8.16 install).                                                  ║
+ * ║    • NEW b2b_slip_ai_get_accuracy($days=7) — precision/recall/F1/accuracy aggregation   ║
+ * ║      over last N days. Returns full classification matrix (TP/TN/FP/FN) + percentages.   ║
+ * ║      Source data = wp_dinoco_slip_log filtered on ai_correct IS NOT NULL.                 ║
+ * ║    • NEW b2b_slip_ai_apply_review_correction($log_id) — wrapper for Slip Monitor         ║
+ * ║      review-decision endpoint to call post-decision (does nothing if AI didn't classify   ║
+ * ║      or if admin agreed with AI). Slip Monitor file untouched — wires later.              ║
+ * ║    • Companion: Snippet 2 V.34.20 (3 hookup points), Snippet 15 V.8.16 (2 cols + idx),   ║
+ * ║      Health Monitor V.1.3 (AI Accuracy + Audit Retention dashboard cards).                ║
  * ║  Version: V.34.19 (2026-04-24) — Phase 4c: migrate 6 flag get_option → dinoco_config(): ║
  * ║    inventory.oos_gate_hierarchy_compute (×1) + inventory.shipping_meta_enabled (×5).   ║
  * ║    Backward compat preserved via function_exists guard + legacy_option mapping.        ║
@@ -1154,6 +1168,9 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             'ai_classifier_confidence' => null, // 0.0-1.0
             'ai_classifier_reason'     => null, // short Thai sentence
             'ai_classifier_at'         => null, // datetime when AI ran
+            // V.34.20: AI accuracy metrics (Snippet 15 V.8.16 schema)
+            'ai_correct'             => null,   // 1 | 0 | NULL — ground truth flag
+            'ai_correctness_source'  => null,   // 'slip2go_success'|'slip2go_ocr_fail'|... (32 chars)
             'created_at'         => current_time( 'mysql' ),
         );
         $row = array_merge( $defaults, is_array( $row ) ? $row : array() );
@@ -1230,6 +1247,15 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
         }
         // ai_classifier_at: pass-through string datetime, NULL on empty
 
+        // V.34.20: AI accuracy metrics — normalize new fields
+        if ( $row['ai_correct'] !== null ) {
+            $row['ai_correct'] = (int) ( $row['ai_correct'] ? 1 : 0 );
+        }
+        if ( $row['ai_correctness_source'] !== null ) {
+            $row['ai_correctness_source'] = substr( (string) $row['ai_correctness_source'], 0, 32 );
+            if ( $row['ai_correctness_source'] === '' ) $row['ai_correctness_source'] = null;
+        }
+
         // Schema-aware INSERT — wpdb->insert tolerates extra keys ONLY if they match
         // existing columns. Schema bump V.8.11 (Snippet 15) adds image_path / review_decision /
         // reviewed_at / reviewed_by — but if Snippet 15 hasn't synced yet, we need to drop
@@ -1261,6 +1287,21 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
         }
         if ( ! $sl_ai_cols_exist ) {
             unset( $row['ai_classifier_decision'], $row['ai_classifier_confidence'], $row['ai_classifier_reason'], $row['ai_classifier_at'] );
+        }
+
+        // V.34.20: AI accuracy metrics columns probe (Snippet 15 V.8.16)
+        static $sl_ai_correct_cols_exist = null;
+        if ( $sl_ai_correct_cols_exist === null ) {
+            $cor_cols_check = $wpdb->get_col( $wpdb->prepare(
+                "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s
+                   AND column_name IN ('ai_correct','ai_correctness_source')",
+                $table
+            ) );
+            $sl_ai_correct_cols_exist = is_array( $cor_cols_check ) && count( $cor_cols_check ) === 2;
+        }
+        if ( ! $sl_ai_correct_cols_exist ) {
+            unset( $row['ai_correct'], $row['ai_correctness_source'] );
         }
 
         // V.34.9 M-7: explicit $format array matching schema (prevents STRICT-mode write failures
@@ -1301,6 +1342,11 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             $format[] = '%f'; // ai_classifier_confidence (V.34.17, nullable float)
             $format[] = '%s'; // ai_classifier_reason (V.34.17, nullable string)
             $format[] = '%s'; // ai_classifier_at (V.34.17, nullable datetime)
+        }
+        // V.34.20: AI accuracy metrics columns (only when Snippet 15 V.8.16 schema present)
+        if ( $sl_ai_correct_cols_exist ) {
+            $format[] = '%d'; // ai_correct (V.34.20, nullable TINYINT)
+            $format[] = '%s'; // ai_correctness_source (V.34.20, nullable VARCHAR(32))
         }
         $format[] = '%s'; // created_at (MySQL datetime — always last)
 
@@ -1928,6 +1974,256 @@ if ( ! function_exists( 'b2b_slip_ai_classify_image' ) ) {
         }
 
         return $result;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.34.20: AI ACCURACY METRICS HELPERS (Snippet 15 V.8.16 companion)
+// ═══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_slip_ai_update_correctness' ) ) {
+    /**
+     * Update AI correctness on a slip_log row when ground truth becomes
+     * available downstream (Slip2Go success/fail/duplicate, admin review).
+     *
+     * @param int    $log_id  wp_dinoco_slip_log.id (must exist + ai_classifier_decision NOT NULL to be meaningful)
+     * @param bool   $correct true = AI prediction matched ground truth
+     * @param string $source  one of: 'slip2go_success'|'slip2go_ocr_fail'|'slip2go_duplicate'|
+     *                        'slip2go_receiver_mismatch'|'slip2go_amount_mismatch'|
+     *                        'admin_review_override'|'admin_review_confirm'|
+     *                        'duplicate_detect'|'manual_admin_paid'|'replay_after_paid'
+     * @return bool true on UPDATE success (or silent skip if cols missing); false on DB error
+     */
+    function b2b_slip_ai_update_correctness( $log_id, $correct, $source ) {
+        global $wpdb;
+        if ( ! $wpdb ) return false;
+        $log_id = (int) $log_id;
+        if ( $log_id <= 0 ) return false;
+
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+
+        // Schema probe (cached per-request) — silent skip if Snippet 15 V.8.16 not synced
+        static $cols_exist = null;
+        if ( $cols_exist === null ) {
+            $check = $wpdb->get_col( $wpdb->prepare(
+                "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s
+                   AND column_name IN ('ai_correct','ai_correctness_source')",
+                $table
+            ) );
+            $cols_exist = is_array( $check ) && count( $check ) === 2;
+        }
+        if ( ! $cols_exist ) return true; // best-effort silent skip — not an error
+
+        $source = substr( (string) $source, 0, 32 );
+        if ( $source === '' ) $source = 'unknown';
+
+        $ok = $wpdb->update(
+            $table,
+            array(
+                'ai_correct'            => $correct ? 1 : 0,
+                'ai_correctness_source' => $source,
+            ),
+            array( 'id' => $log_id ),
+            array( '%d', '%s' ),
+            array( '%d' )
+        );
+
+        if ( $ok === false ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip AI Metrics] update fail id=' . $log_id . ' err=' . $wpdb->last_error );
+            }
+            return false;
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_ai_get_accuracy' ) ) {
+    /**
+     * Compute AI classifier accuracy stats over the last N days.
+     *
+     * Definitions (in slip_log terms):
+     *   true_positive  — ai='is_slip'  AND ai_correct=1 (Slip2Go validated as real slip)
+     *   true_negative  — ai='not_slip' AND ai_correct=1 (admin / heuristic did not contradict)
+     *   false_positive — ai='is_slip'  AND ai_correct=0 (Slip2Go OCR fail / receiver / amount mismatch)
+     *   false_negative — ai='not_slip' AND ai_correct=0 (admin Review Pool found it WAS a slip)
+     *
+     * Rows where ai_correct IS NULL are EXCLUDED from precision/recall (unknown ground truth).
+     *
+     * @param int $days lookback window (default 7, max 90)
+     * @return array {
+     *   period_days, total_classified (decisions made), total_with_ground_truth,
+     *   true_positives, true_negatives, false_positives, false_negatives,
+     *   precision, recall, f1_score, accuracy,
+     *   correctness_unknown (count where ai_correct is NULL)
+     * }
+     */
+    function b2b_slip_ai_get_accuracy( $days = 7 ) {
+        global $wpdb;
+        $days = max( 1, min( 90, (int) $days ) );
+
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $stats = array(
+            'period_days'              => $days,
+            'total_classified'         => 0,
+            'total_with_ground_truth'  => 0,
+            'true_positives'           => 0,
+            'true_negatives'           => 0,
+            'false_positives'          => 0,
+            'false_negatives'          => 0,
+            'precision'                => 0.0,
+            'recall'                   => 0.0,
+            'f1_score'                 => 0.0,
+            'accuracy'                 => 0.0,
+            'correctness_unknown'      => 0,
+            'cols_exist'               => false,
+        );
+
+        // Schema probe
+        static $cols_exist = null;
+        if ( $cols_exist === null ) {
+            $check = $wpdb->get_col( $wpdb->prepare(
+                "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s
+                   AND column_name IN ('ai_correct','ai_classifier_decision')",
+                $table
+            ) );
+            $cols_exist = is_array( $check ) && count( $check ) === 2;
+        }
+        if ( ! $cols_exist ) return $stats;
+        $stats['cols_exist'] = true;
+
+        // Total classified (ai_classifier_decision NOT NULL — excludes 'error' for accuracy fairness)
+        $stats['total_classified'] = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+               AND ai_classifier_decision IN ('is_slip','not_slip','uncertain')",
+            $days
+        ) );
+
+        // Total with ground truth (ai_correct NOT NULL, decision was is_slip|not_slip)
+        $stats['total_with_ground_truth'] = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+               AND ai_classifier_decision IN ('is_slip','not_slip')
+               AND ai_correct IS NOT NULL",
+            $days
+        ) );
+
+        // Confusion matrix in 1 query for cache locality
+        $matrix = $wpdb->get_results( $wpdb->prepare(
+            "SELECT ai_classifier_decision, ai_correct, COUNT(*) AS n
+             FROM {$table}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+               AND ai_classifier_decision IN ('is_slip','not_slip')
+               AND ai_correct IS NOT NULL
+             GROUP BY ai_classifier_decision, ai_correct",
+            $days
+        ), ARRAY_A );
+
+        if ( is_array( $matrix ) ) {
+            foreach ( $matrix as $row ) {
+                $dec = (string) $row['ai_classifier_decision'];
+                $cor = (int)    $row['ai_correct'];
+                $n   = (int)    $row['n'];
+                if ( $dec === 'is_slip' && $cor === 1 ) $stats['true_positives']  = $n;
+                elseif ( $dec === 'is_slip' && $cor === 0 ) $stats['false_positives'] = $n;
+                elseif ( $dec === 'not_slip' && $cor === 1 ) $stats['true_negatives'] = $n;
+                elseif ( $dec === 'not_slip' && $cor === 0 ) $stats['false_negatives'] = $n;
+            }
+        }
+
+        // Unknown count (decisions made but no ground truth yet)
+        $stats['correctness_unknown'] = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+               AND ai_classifier_decision IN ('is_slip','not_slip','uncertain')
+               AND ai_correct IS NULL",
+            $days
+        ) );
+
+        // Compute metrics (defensive against /0)
+        $tp = $stats['true_positives'];
+        $tn = $stats['true_negatives'];
+        $fp = $stats['false_positives'];
+        $fn = $stats['false_negatives'];
+        $total_truth = $tp + $tn + $fp + $fn;
+
+        if ( ( $tp + $fp ) > 0 ) {
+            $stats['precision'] = round( $tp / ( $tp + $fp ), 4 );
+        }
+        if ( ( $tp + $fn ) > 0 ) {
+            $stats['recall'] = round( $tp / ( $tp + $fn ), 4 );
+        }
+        if ( ( $stats['precision'] + $stats['recall'] ) > 0 ) {
+            $stats['f1_score'] = round(
+                2 * $stats['precision'] * $stats['recall']
+                  / ( $stats['precision'] + $stats['recall'] ),
+                4
+            );
+        }
+        if ( $total_truth > 0 ) {
+            $stats['accuracy'] = round( ( $tp + $tn ) / $total_truth, 4 );
+        }
+
+        return $stats;
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_ai_apply_review_correction' ) ) {
+    /**
+     * Wrapper for Slip Monitor's /review-decision endpoint to call post-decision.
+     * Reads the slip_log row → if AI made a decision and the admin's review
+     * disagrees → mark ai_correct=0; if agrees → ai_correct=1.
+     *
+     * Idempotent: safe to call multiple times for same log_id (re-stamps from
+     * latest review_decision).
+     *
+     * @param int $log_id slip_log row id
+     * @return bool true on update or no-op (no AI decision) ; false on DB error
+     */
+    function b2b_slip_ai_apply_review_correction( $log_id ) {
+        global $wpdb;
+        if ( ! $wpdb ) return false;
+        $log_id = (int) $log_id;
+        if ( $log_id <= 0 ) return false;
+
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+
+        // Schema probe — bail silently if cols missing
+        static $cols_exist = null;
+        if ( $cols_exist === null ) {
+            $check = $wpdb->get_col( $wpdb->prepare(
+                "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s
+                   AND column_name IN ('ai_correct','ai_classifier_decision','review_decision')",
+                $table
+            ) );
+            $cols_exist = is_array( $check ) && count( $check ) === 3;
+        }
+        if ( ! $cols_exist ) return true;
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, ai_classifier_decision, review_decision FROM {$table} WHERE id = %d",
+            $log_id
+        ), ARRAY_A );
+        if ( ! $row ) return false;
+
+        $ai_dec     = isset( $row['ai_classifier_decision'] ) ? (string) $row['ai_classifier_decision'] : '';
+        $review_dec = isset( $row['review_decision'] ) ? (string) $row['review_decision'] : '';
+
+        // No-op if AI didn't make a definitive decision
+        if ( ! in_array( $ai_dec, array( 'is_slip', 'not_slip' ), true ) ) return true;
+        // No-op if admin hasn't decided yet
+        if ( ! in_array( $review_dec, array( 'is_slip', 'not_slip', 'manual_process' ), true ) ) return true;
+
+        // 'manual_process' = admin treats it as a slip (uses Manual Process Tool)
+        $admin_says_slip = ( $review_dec === 'is_slip' || $review_dec === 'manual_process' );
+        $ai_says_slip    = ( $ai_dec === 'is_slip' );
+        $correct = ( $admin_says_slip === $ai_says_slip );
+        $source  = $correct ? 'admin_review_confirm' : 'admin_review_override';
+
+        return b2b_slip_ai_update_correctness( $log_id, $correct, $source );
     }
 }
 
