@@ -2,6 +2,14 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.4 (2026-04-28) — Fix double-discount bug in product picker (single + multi).
+ *   • Bug: `invPickProduct` / `invPickSingleFromMulti` / `invSubmitMultiPicker` ส่ง
+ *     `unit_price = invGetRankPrice(p)` ซึ่งเป็น **ราคาดีลเลอร์ (หลังหักส่วนลดแล้ว)**
+ *     พร้อม `discount_raw = disc%` → invRecalc คิดส่วนลดซ้ำ → 8800 × 0.8 × 0.8 = 5,632 ❌
+ *   • Fix: ใช้ helper ใหม่ `invGetRankPriceInfo(p)` คืน {base, disc, effective}.
+ *     ส่ง unit_price = base (catalog/retail = 8,800) + discount_raw = disc% (20%)
+ *     → invRecalc: 8,800 × (1 - 0.20) = 7,040 ✓
+ *   • Display ใน picker modal ยังโชว์ effective price (ราคาดีลเลอร์) เหมือนเดิม.
  * Version: V.34.3 (2026-04-24) — Phase 4e Module Registry adoption (Pillar 1):
  *   • Self-register via dinoco_register_admin_module() at init priority 30.
  *     key=invoice, shortcode=dinoco_manual_invoice, section=finance, cache_ttl=120.
@@ -4234,26 +4242,34 @@ window.invClosePicker = function() {
     document.getElementById('inv-prod-picker').classList.remove('open');
 };
 
-// Helper: get rank-based price for a product object
+// Helper: get rank-based price info for a product object
 // V.33.2: tier fields now store discount % (0-100), not absolute prices
-function invGetRankPrice(p) {
+// V.34.4: returns {base, disc, effective} so callers can split base + discount %
+function invGetRankPriceInfo(p) {
     var dist = invDistributors.find(function(d){ return d.id == document.getElementById('inv-f-dist').value; });
     var rank = dist ? (dist.rank_system || 'standard') : 'standard';
     var basePrice = parseFloat(p.catalog_price || p.base_price || 0);
-    var discKey = 'price_' + rank; // now stores discount %
+    var discKey = 'price_' + rank;
     var discPct = parseFloat(p[discKey] || 0);
 
     // tier values are % discount (0-100). If > 100 = unmigrated price, fallback
-    if (discPct > 0 && discPct <= 100) {
-        return Math.round(basePrice * (1 - discPct / 100) * 100) / 100;
+    if (!(discPct > 0 && discPct <= 100)) {
+        discPct = parseFloat(p.b2b_discount_percent || p.discount || 0);
     }
-    // fallback: use b2b_discount_percent (default discount)
-    var defaultDisc = parseFloat(p.b2b_discount_percent || p.discount || 0);
-    if (defaultDisc > 0 && defaultDisc <= 100) {
-        return Math.round(basePrice * (1 - defaultDisc / 100) * 100) / 100;
+    if (!(discPct > 0 && discPct <= 100)) discPct = 0;
+
+    var effective;
+    if (discPct > 0 && basePrice > 0) {
+        effective = Math.round(basePrice * (1 - discPct / 100) * 100) / 100;
+    } else {
+        // last fallback: dealer_price from API or base
+        effective = parseFloat(p.dealer_price || basePrice) || basePrice;
     }
-    // last fallback: dealer_price from API
-    return parseFloat(p.dealer_price || basePrice);
+    return { base: basePrice, disc: discPct, effective: effective };
+}
+
+function invGetRankPrice(p) {
+    return invGetRankPriceInfo(p).effective;
 }
 
 window.invFilterPicker = function() {
@@ -4365,12 +4381,16 @@ window.invPickSingleFromMulti = function(p, price, btn) {
         var descVal = r.querySelector('[data-field="description"]').value.trim();
         if (!skuVal && !descVal) tbody.removeChild(r);
     }
+    // V.34.4: use base price + disc% (not dealer price) to avoid double-discount
+    var info = invGetRankPriceInfo(p);
+    var u_price = info.base > 0 ? info.base : (info.effective || price);
+    var u_disc  = info.base > 0 && info.disc > 0 ? info.disc + '%' : '';
     invAddRow({
         type:        (p.children && p.children.length) ? 'set' : 'product',
         sku:         p.product_sku || '',
         description: p.title || '',
-        unit_price:  price || 0,
-        discount_raw: _invDiscRaw(p, price),
+        unit_price:  u_price || 0,
+        discount_raw: u_disc,
         qty:         1,
         img_url:     p.img || '',
         children:    p.children || [],
@@ -4393,13 +4413,17 @@ window.invSubmitMultiPicker = function() {
         var sku = cb.dataset.sku || '';
         var p   = invProducts.find(function(prod){ return prod.product_sku === sku; });
         if (!p) return;
-        var price = invGetRankPrice(p);
+        // V.34.4: use base price + disc% (not dealer price) to avoid double-discount
+        var info = invGetRankPriceInfo(p);
+        // Fallback: if catalog_price missing → use effective dealer price + 0% disc
+        var u_price = info.base > 0 ? info.base : info.effective;
+        var u_disc  = info.base > 0 && info.disc > 0 ? info.disc + '%' : '';
         invAddRow({
             type:        (p.children && p.children.length) ? 'set' : 'product',
             sku:         p.product_sku || '',
             description: p.title || '',
-            unit_price:  price || 0,
-            discount_raw: _invDiscRaw(p, price),
+            unit_price:  u_price || 0,
+            discount_raw: u_disc,
             qty:         1,
             img_url:     p.img || '',
             children:    p.children || [],
@@ -5289,17 +5313,17 @@ window.invSkuAcSearch = function(input) {
 };
 
 // Shared: apply product data to a row (used by both picker and autocomplete)
+// V.34.4: ignore caller `price` (was dealer price → caused double-discount).
+//         Use rank info: unit_price = base, discount_raw = disc%.
 function invApplyProductToRow(tr, p, price) {
+    var info = invGetRankPriceInfo(p);
+    var u_price = info.base > 0 ? info.base : (info.effective || price);
+    var u_disc  = info.base > 0 && info.disc > 0 ? info.disc + '%' : '';
     tr.querySelector('[data-field="sku"]').value         = p.product_sku || '';
     tr.querySelector('[data-field="description"]').value = p.title || '';
-    tr.querySelector('[data-field="unit_price"]').value  = price || 0;
+    tr.querySelector('[data-field="unit_price"]').value  = u_price || 0;
     tr.querySelector('[data-field="type"]').value        = (p.children && p.children.length) ? 'set' : 'product';
-    var discPct = parseFloat(p.discount_pct) || 0;
-    var catPrice = parseFloat(p.catalog_price) || 0;
-    if (discPct === 0 && catPrice > 0 && price < catPrice) {
-        discPct = Math.round((1 - price / catPrice) * 10000) / 100;
-    }
-    tr.querySelector('[data-field="discount_raw"]').value = discPct > 0 ? discPct + '%' : '';
+    tr.querySelector('[data-field="discount_raw"]').value = u_disc;
     var childSkus = (p.children && p.children.length) ? p.children : [];
     var childInput = tr.querySelector('[data-field="children"]');
     if (childInput) childInput.value = JSON.stringify(childSkus);
