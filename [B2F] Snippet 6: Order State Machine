@@ -1,13 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2F] Snippet 6: Order State Machine (FSM)                  ║
- * ║  Version: V.1.6 (2026-04-24) — Phase 1.5 unified audit hookup:                  ║
- * ║    • Wire dinoco_audit_log() AFTER status update inside B2F_Order_FSM::transition.║
- * ║      event_type=fsm_transition, target=po, delta_before/after=old/new status.  ║
- * ║      Existing _b2f_status_history postmeta unchanged (dual-write — INDEX overlay).║
- * ║    • Defensive function_exists guard — silent skip if Audit Log snippet disabled.║
- * ║    • Failed transitions (terminal_state / invalid_transition / permission_denied)║
- * ║      also logged success=0 for forensic queries on REJECTED transitions.        ║
+ * ║  Version: V.1.7 (2026-04-24) — Phase 4d Transaction Wrapper hookup:             ║
+ * ║    • Route B2F_Order_FSM::transition() through dinoco_transaction() when         ║
+ * ║      wrapper helper is available — adds parent audit row event=b2f_fsm_transition║
+ * ║      with correlation_id linkage to Phase 1.5 child rows + per-PO GET_LOCK       ║
+ * ║      (b2f_fsm_po_<id>) preventing concurrent transitions on same PO.             ║
+ * ║    • Phase 1.5 in-body audit_log calls preserved (dual-write index overlay).    ║
+ * ║    • function_exists('dinoco_transaction') guard — falls back to legacy path     ║
+ * ║      (renamed _transition_legacy) when wrapper snippet disabled.                 ║
+ * ║    • No compensation closure needed — mutate is single update_field, atomic.    ║
+ * ║  Version: V.1.6 — Phase 1.5 unified audit hookup (dinoco_audit_log)             ║
  * ║  Version: V.1.5 — Cancel ได้ทุกสถานะยกเว้น completed/cancelled  ║
  * ║  DB_ID: 1161                                                 ║
  * ║  Description: ป้องกัน invalid PO status transitions          ║
@@ -127,6 +130,10 @@ class B2F_Order_FSM {
     /**
      * ทำ status transition พร้อม validation
      *
+     * V.1.7: Route through dinoco_transaction() wrapper when available — adds
+     * parent audit row + per-PO GET_LOCK + correlation_id linkage. Falls
+     * back to legacy path if wrapper snippet disabled.
+     *
      * @param int    $po_id      b2f_order post ID
      * @param string $new_status Target status
      * @param string $actor      'admin' | 'maker' | 'system'
@@ -134,6 +141,59 @@ class B2F_Order_FSM {
      * @return bool|WP_Error     true ถ้าสำเร็จ
      */
     public static function transition( $po_id, $new_status, $actor = 'system', $reason = '' ) {
+        // V.1.7 Phase 4d: route via Transaction Wrapper if available
+        if ( function_exists( 'dinoco_transaction' ) && (int) $po_id > 0 ) {
+            return self::_transition_via_wrapper( $po_id, $new_status, $actor, $reason );
+        }
+        // Legacy path (Wrapper snippet disabled or invalid po_id)
+        return self::_transition_legacy( $po_id, $new_status, $actor, $reason );
+    }
+
+    /**
+     * V.1.7 Phase 4d: Wrapper-routed transition.
+     * - Acquires per-PO GET_LOCK (b2f_fsm_po_<id>) to serialize concurrent transitions
+     * - Emits parent audit row event=b2f_fsm_transition (Phase 1.5 child rows still emit
+     *   inside _transition_legacy via dinoco_audit_log calls — same request_id chains them)
+     * - Mutate phase delegates to _transition_legacy (preserves all body behavior + history postmeta)
+     * - No compensation needed: mutate is single update_field; failure = no partial state
+     */
+    private static function _transition_via_wrapper( $po_id, $new_status, $actor, $reason ) {
+        $txn_ctx = array(
+            'audit_event_type' => 'b2f_fsm_transition',
+            'actor_type'       => (string) $actor,
+            'target_type'      => 'po',
+            'target_id'        => (string) $po_id,
+            'lock_key'         => 'b2f_fsm_po_' . (int) $po_id,
+            'lock_timeout'     => 3,
+            'audit_context'    => array(
+                'new_status' => (string) $new_status,
+                'reason'     => (string) $reason,
+                'fsm'        => 'b2f',
+            ),
+        );
+        $txn_phases = array(
+            'mutate' => function( $ctx ) use ( $po_id, $new_status, $actor, $reason ) {
+                $res = self::_transition_legacy( $po_id, $new_status, $actor, $reason );
+                // Wrapper expects array|WP_Error. Map bool true → array for parity.
+                if ( $res === true ) {
+                    return array( 'ok' => true, 'po_id' => (int) $po_id, 'new_status' => (string) $new_status );
+                }
+                return $res; // WP_Error passthrough
+            },
+        );
+        $result = dinoco_transaction( 'b2f_fsm_transition', $txn_phases, $txn_ctx );
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+        return true; // preserve legacy bool return contract
+    }
+
+    /**
+     * V.1.7: legacy body — invoked directly when wrapper disabled,
+     * OR via wrapper's mutate phase (lock owned by wrapper in that case).
+     * Phase 1.5 in-body dinoco_audit_log calls preserved (dual-write).
+     */
+    private static function _transition_legacy( $po_id, $new_status, $actor = 'system', $reason = '' ) {
         $current = get_field( 'po_status', $po_id );
         if ( empty( $current ) ) $current = get_post_meta( $po_id, 'po_status', true );
         if ( empty( $current ) ) $current = 'draft';
