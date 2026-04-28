@@ -1,0 +1,321 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Transaction Wrapper                   ║
+ * ║  Version: V.1.0 (2026-04-24) — Phase 2 Architecture Refactor ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
+ * ║  Description: Standardized transaction boundary helper        ║
+ * ║    (Pillar 2). Enforces 5-phase pattern across mutations:     ║
+ * ║      VALIDATE → LOCK → MUTATE → RECALCULATE → NOTIFY          ║
+ * ║                                                               ║
+ * ║    Replaces ad-hoc try/catch/lock/audit boilerplate scattered ║
+ * ║    across slip apply, BO split/fulfill, debt mutations, etc.  ║
+ * ║    Audit + correlation_id + lock release + compensation       ║
+ * ║    handled uniformly. Round 2 audit (CRIT C1-C6) found this   ║
+ * ║    pattern violated repeatedly (recalc-before-mutate, missing ║
+ * ║    lock release on exception, audit row drift).               ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * Companion snippets:
+ *   - [Admin System] DINOCO Audit Log V.1.0 — dinoco_audit_log()
+ *   - [Admin System] DINOCO Observability V.1.1 — dinoco_obs_get_request_id()
+ *   - [B2B] Snippet 13 V.2.0 — b2b_financial_lock() (lower-level helper, kept)
+ *
+ * Public API:
+ *   dinoco_transaction( string $name, array $phases, array $context = [] )
+ *
+ * Phase callbacks (all optional except 'mutate'):
+ *   - validate(ctx)    : return WP_Error|array — pre-checks (no mutation)
+ *   - mutate(ctx)      : return WP_Error|array — atomic state changes
+ *   - recalculate(ctx) : return mixed — post-mutate source-of-truth recalc
+ *   - notify(ctx)      : return mixed — post-COMMIT side effects (LINE push etc)
+ *   - compensate(ctx)  : invoked on mutate WP_Error or thrown exception
+ *
+ * Context keys consumed:
+ *   - lock_key (string|null)        — MySQL GET_LOCK name; null = no DB-level lock
+ *   - lock_timeout (int)            — seconds (default 5)
+ *   - audit_event_type (string)     — passed to dinoco_audit_log
+ *   - actor_type / target_type / target_id / amount — audit row fields
+ *   - audit_context (array)         — extra payload for audit_log context_json
+ *
+ * Backward compat:
+ *   - Existing callers untouched. Helper guarded by function_exists in callers.
+ *   - Legacy inline lock+try/catch pattern in `b2b_slip_apply_to_invoices` and
+ *     `b2b_rest_bo_split` is preserved as fallback when this snippet is disabled.
+ *
+ * Phase 2 design rules:
+ *   1. Wrapper is ADDITIVE — never breaks happy path of existing helpers.
+ *   2. MUTATE phase composes existing atomic helpers (b2b_debt_subtract,
+ *      dinoco_stock_subtract, b2b_set_order_status etc.) — wrapper does NOT
+ *      do START TRANSACTION (those helpers manage their own atomicity).
+ *   3. NOTIFY phase runs OUTSIDE the lock so LINE/Telegram side effects
+ *      cannot block other admin actions.
+ *   4. Audit log is best-effort post-COMMIT (Phase 1.5 pattern preserved).
+ *   5. Lock release in finally{} — guaranteed even on uncaught throw.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ============================================================
+ * 1. CORE WRAPPER
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_transaction' ) ) {
+    /**
+     * Execute a transaction with 5-phase pattern + auto audit + auto lock release.
+     *
+     * @param string $name     Unique txn name (e.g. 'slip_apply', 'bo_split')
+     * @param array  $phases   ['validate'=>fn, 'mutate'=>fn(req), 'recalculate'=>fn,
+     *                          'notify'=>fn, 'compensate'=>fn]
+     * @param array  $context  Initial context — see header for keys
+     *
+     * @return array|WP_Error  result from mutate phase (WP_Error or array { ok:bool, ... })
+     */
+    function dinoco_transaction( $name, array $phases, array $context = array() ) {
+        global $wpdb;
+
+        if ( empty( $phases['mutate'] ) || ! is_callable( $phases['mutate'] ) ) {
+            return new WP_Error(
+                'txn_no_mutate',
+                "dinoco_transaction({$name}): missing required 'mutate' phase callback",
+                array( 'status' => 500 )
+            );
+        }
+
+        $started_at  = microtime( true );
+        $name        = preg_replace( '/[^a-z0-9_\.\-]/i', '', (string) $name );
+        $context     = is_array( $context ) ? $context : array();
+
+        // ─────────────────────────────────────────────────────
+        // 1. VALIDATE phase — pre-checks, may enrich context
+        // ─────────────────────────────────────────────────────
+        if ( ! empty( $phases['validate'] ) && is_callable( $phases['validate'] ) ) {
+            try {
+                $validation = call_user_func( $phases['validate'], $context );
+            } catch ( \Throwable $e ) {
+                _dinoco_txn_log_error( $name, 'validate_throw', $e );
+                return new WP_Error(
+                    'txn_validate_fatal',
+                    "{$name}: validate phase threw: " . $e->getMessage(),
+                    array( 'status' => 500 )
+                );
+            }
+            if ( is_wp_error( $validation ) ) {
+                // Don't audit validation rejection unless caller wants — quiet path
+                return $validation;
+            }
+            if ( is_array( $validation ) ) {
+                // Allow validate to enrich context (e.g. resolved $dist_id, $price)
+                $context = array_merge( $context, $validation );
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // 2. LOCK phase — MySQL GET_LOCK (optional)
+        // ─────────────────────────────────────────────────────
+        $lock_key      = isset( $context['lock_key'] ) ? (string) $context['lock_key'] : '';
+        $lock_timeout  = isset( $context['lock_timeout'] ) ? max( 1, (int) $context['lock_timeout'] ) : 5;
+        $lock_acquired = false;
+
+        if ( $lock_key !== '' ) {
+            $lock_result = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT GET_LOCK(%s, %d)", $lock_key, $lock_timeout
+            ) );
+            if ( $lock_result !== 1 ) {
+                _dinoco_txn_audit( $name, $context, false, 'lock_timeout', null );
+                return new WP_Error(
+                    'txn_lock_busy',
+                    'ระบบกำลังประมวลผลรายการอื่น กรุณาลองใหม่อีกครั้ง',
+                    array( 'status' => 429 )
+                );
+            }
+            $lock_acquired = true;
+        }
+
+        // Generate txn-scoped correlation id for forensic chain (audit_request_id reused)
+        $context['_txn_name']   = $name;
+        $context['_txn_req_id'] = function_exists( 'dinoco_audit_request_id' )
+            ? dinoco_audit_request_id() : '';
+
+        $mutate_result = null;
+        $caught        = null;
+
+        try {
+            // ─────────────────────────────────────────────────
+            // 3. MUTATE phase
+            // ─────────────────────────────────────────────────
+            $mutate_result = call_user_func( $phases['mutate'], $context );
+
+            if ( is_wp_error( $mutate_result ) ) {
+                _dinoco_txn_compensate_safe( $phases, $context, $mutate_result, $name );
+                _dinoco_txn_audit(
+                    $name, $context, false,
+                    $mutate_result->get_error_code(),
+                    $mutate_result->get_error_message()
+                );
+                // Lock released in finally — return the error to caller
+                return $mutate_result;
+            }
+
+            // Pass mutate result into recalculate ctx
+            $context['mutate_result'] = $mutate_result;
+
+            // ─────────────────────────────────────────────────
+            // 4. RECALCULATE phase — source-of-truth recalc
+            // ─────────────────────────────────────────────────
+            if ( ! empty( $phases['recalculate'] ) && is_callable( $phases['recalculate'] ) ) {
+                try {
+                    $recalc_result = call_user_func( $phases['recalculate'], $context );
+                    $context['recalc_result'] = $recalc_result;
+                } catch ( \Throwable $e ) {
+                    // Recalc failure is non-fatal for the mutation but flag it loudly
+                    _dinoco_txn_log_error( $name, 'recalculate_throw', $e );
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( "[Txn {$name}] recalculate phase failed (non-fatal): " . $e->getMessage() );
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) {
+            $caught = $e;
+            _dinoco_txn_compensate_safe( $phases, $context, $e, $name );
+            _dinoco_txn_audit( $name, $context, false, 'mutate_throw', $e->getMessage() );
+        } finally {
+            // ─────────────────────────────────────────────────
+            // 6. RELEASE LOCK — always
+            // ─────────────────────────────────────────────────
+            if ( $lock_acquired ) {
+                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+            }
+        }
+
+        if ( $caught instanceof \Throwable ) {
+            return new WP_Error(
+                'txn_fatal',
+                $name . ': ' . $caught->getMessage(),
+                array( 'status' => 500 )
+            );
+        }
+
+        // ─────────────────────────────────────────────────
+        // 5. NOTIFY phase — post-lock side effects
+        //    (LINE/Telegram pushes don't block lock + don't roll back)
+        // ─────────────────────────────────────────────────
+        if ( ! empty( $phases['notify'] ) && is_callable( $phases['notify'] ) ) {
+            try {
+                call_user_func( $phases['notify'], $context );
+            } catch ( \Throwable $e ) {
+                _dinoco_txn_log_error( $name, 'notify_throw', $e );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( "[Txn {$name}] notify phase failed (non-fatal): " . $e->getMessage() );
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────
+        // Audit row (success path)
+        // ─────────────────────────────────────────────────
+        _dinoco_txn_audit( $name, $context, true, null, null );
+
+        // Optional perf log when slow
+        $elapsed_ms = (int) round( ( microtime( true ) - $started_at ) * 1000 );
+        if ( $elapsed_ms > 2000 && function_exists( 'b2b_log' ) ) {
+            b2b_log( "[Txn {$name}] slow: {$elapsed_ms}ms (lock=" . ( $lock_acquired ? 'y' : 'n' ) . ')' );
+        }
+
+        return $mutate_result;
+    }
+}
+
+/* ============================================================
+ * 2. INTERNAL HELPERS (single-underscore = private to wrapper)
+ * ============================================================ */
+
+if ( ! function_exists( '_dinoco_txn_audit' ) ) {
+    /**
+     * Best-effort audit log emit. Does NOT throw. Skipped silently if
+     * dinoco_audit_log helper missing (Audit Log snippet disabled).
+     *
+     * @param string      $name     txn name
+     * @param array       $context  ctx (read: actor_type, target_type, target_id, amount, audit_*)
+     * @param bool        $success
+     * @param string|null $err_code
+     * @param string|null $err_msg
+     */
+    function _dinoco_txn_audit( $name, $context, $success, $err_code = null, $err_msg = null ) {
+        if ( ! function_exists( 'dinoco_audit_log' ) ) return;
+
+        $event_type = isset( $context['audit_event_type'] ) && $context['audit_event_type'] !== ''
+            ? (string) $context['audit_event_type']
+            : 'txn_' . $name;
+
+        $payload = array( 'txn_name' => $name );
+        if ( ! empty( $context['audit_context'] ) && is_array( $context['audit_context'] ) ) {
+            $payload = array_merge( $payload, $context['audit_context'] );
+        }
+
+        $args = array(
+            'event_type'  => $event_type,
+            'actor_type'  => isset( $context['actor_type'] ) ? (string) $context['actor_type'] : '',
+            'target_type' => isset( $context['target_type'] ) ? (string) $context['target_type'] : '',
+            'target_id'   => isset( $context['target_id'] ) ? (string) $context['target_id'] : '',
+            'amount'      => isset( $context['amount'] ) ? (float) $context['amount'] : null,
+            'context'     => $payload,
+            'success'     => $success ? 1 : 0,
+        );
+
+        if ( ! $success ) {
+            $args['error_msg'] = $err_msg ?: ( $err_code ?: 'unknown_error' );
+        }
+
+        try {
+            dinoco_audit_log( $args );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[Txn {$name}] audit_log throw: " . $e->getMessage() );
+            }
+        }
+    }
+}
+
+if ( ! function_exists( '_dinoco_txn_compensate_safe' ) ) {
+    /**
+     * Run compensation closure, swallow any throws (compensation MUST
+     * not break the error response chain — best-effort cleanup only).
+     *
+     * @param array  $phases
+     * @param array  $context
+     * @param mixed  $error  WP_Error|Throwable
+     * @param string $name
+     */
+    function _dinoco_txn_compensate_safe( $phases, $context, $error, $name ) {
+        if ( empty( $phases['compensate'] ) || ! is_callable( $phases['compensate'] ) ) return;
+        try {
+            call_user_func( $phases['compensate'], $context, $error );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[Txn {$name}] compensate threw (swallowed): " . $e->getMessage() );
+            }
+        }
+    }
+}
+
+if ( ! function_exists( '_dinoco_txn_log_error' ) ) {
+    /**
+     * @param string     $name
+     * @param string     $phase   'validate_throw'|'recalculate_throw'|'notify_throw'|'mutate_throw'
+     * @param \Throwable $e
+     */
+    function _dinoco_txn_log_error( $name, $phase, $e ) {
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[Txn {$name}] {$phase}: " . $e->getMessage() );
+        }
+        if ( function_exists( 'dinoco_obs_capture_exception' ) ) {
+            try {
+                dinoco_obs_capture_exception( $e, array( 'txn' => $name, 'phase' => $phase ) );
+            } catch ( \Throwable $e2 ) { /* ignore */ }
+        }
+    }
+}
+
+/* ============================================================
+ * 3. (No REST endpoints — wrapper is internal helper)
+ * ============================================================ */

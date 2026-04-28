@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.2.2 — Phase 2 Pillar 2 transaction wrapper showcase:                        ║
+ * ║                   • bo-split: outer orchestration migrated to dinoco_transaction()      ║
+ * ║                     when [Admin System] DINOCO Transaction Wrapper snippet is loaded.   ║
+ * ║                     validate phase = order status + dist resolution. mutate phase =     ║
+ * ║                     existing two-phase validate+mutate body (compensation closure       ║
+ * ║                     unchanged). lock_key = b2b_fin_<dist_id> — wrapper acquires lock    ║
+ * ║                     identically to b2b_financial_lock(). audit row emitted at wrapper   ║
+ * ║                     level (event=bo_split, target=order:<id>).                          ║
+ * ║                   • Backward compat: if dinoco_transaction missing → falls back to      ║
+ * ║                     legacy inline flow (b2b_financial_lock kept as inner helper).       ║
+ * ║                     bo-fulfill + bo-undo-split unchanged this commit (Phase 4 batch).   ║
  * ║  Version: V.2.1 — Wave 4 MED-M1 atomic counter race fix:                                ║
  * ║                   • b2b_bo_increment_daily_counters() / decrement: replace                ║
  * ║                     get_transient → mutate → set_transient (read-modify-write race)      ║
@@ -1052,6 +1063,12 @@ if ( ! function_exists( 'b2b_bo_permission_admin' ) ) {
  */
 if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
     function b2b_rest_bo_split( $request ) {
+        // V.2.2 Phase 2 Pillar 2: route through dinoco_transaction() if Transaction Wrapper
+        // snippet is loaded. Wrapper handles GET_LOCK (lock_key=b2b_fin_<dist_id> mirrors
+        // b2b_financial_lock()), audit row, correlation_id propagation, slow-path log, and
+        // uniform lock_busy → 429 response. Inner body unchanged from V.2.1 (compensation
+        // closure + validate-then-mutate phases). Backward compat: function_exists guard
+        // falls through to legacy path if Transaction Wrapper snippet disabled.
         $order_id = (int) $request->get_param( 'order_id' );
         $splits   = $request->get_param( 'splits' );
 
@@ -1059,26 +1076,54 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
             return new WP_Error( 'invalid_input', 'order_id + splits required', array( 'status' => 400 ) );
         }
 
-        // Validate order status
+        // Validate order status (cheap pre-flight before lock acquire)
         $status = get_field( 'order_status', $order_id );
         if ( $status !== 'pending_stock_review' ) {
             return new WP_Error( 'invalid_status', "Order ต้องอยู่ใน pending_stock_review (current={$status})", array( 'status' => 400 ) );
         }
 
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+
+        if ( function_exists( 'dinoco_transaction' ) && $dist_id ) {
+            $txn_ctx = array(
+                'audit_event_type' => 'bo_split',
+                'actor_type'       => 'admin',
+                'target_type'      => 'order',
+                'target_id'        => (string) $order_id,
+                'lock_key'         => 'b2b_fin_' . $dist_id,
+                'lock_timeout'     => 5,
+                'audit_context'    => array(
+                    'dist_id'      => $dist_id,
+                    'split_count'  => count( $splits ),
+                ),
+            );
+            $txn_phases = array(
+                'mutate' => function( $ctx ) use ( $request, $order_id, $splits, $dist_id ) {
+                    return _b2b_rest_bo_split_inner( $request, $order_id, $splits, $dist_id );
+                },
+            );
+            $res = dinoco_transaction( 'bo_split', $txn_phases, $txn_ctx );
+            return $res;
+        }
+
+        // Legacy path — Transaction Wrapper not loaded
+        return _b2b_rest_bo_split_legacy( $request, $order_id, $splits );
+    }
+}
+
+if ( ! function_exists( '_b2b_rest_bo_split_legacy' ) ) {
+    /**
+     * V.2.2: extracted legacy path (V.2.1 inline body) — used when Transaction Wrapper
+     * snippet is disabled so behavior matches pre-V.2.2 exactly.
+     */
+    function _b2b_rest_bo_split_legacy( $request, $order_id, $splits ) {
         // V.2.0 CRIT-C1 FIX: replace nested START TRANSACTION (which MySQL flattens — outer ROLLBACK was no-op
         // when inner helpers like dinoco_stock_subtract / b2b_debt_add COMMITted) with serialize-by-financial-lock
         // + validate-then-mutate pattern. Validation phase computes invariants & verifies all SKUs have product_data.
         // Mutation phase runs sequentially; on mid-mutation failure we run best-effort compensation (cannot perfect
         // rollback inner-COMMITted ops, but invariant pre-check shrinks the failure window dramatically).
 
-        // Load existing order items (from meta or order_text)
-        $order_items_text = get_field( 'order_items', $order_id ) ?: '';
-        $parsed_items     = b2b_bo_parse_order_items( $order_items_text );
-
-        global $wpdb;
-        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
-
-        $dist_id         = (int) get_field( 'distributor_id', $order_id );
+        $dist_id       = (int) get_field( 'distributor_id', $order_id );
 
         // V.2.0 CRIT-C1: serialize concurrent admin actions (debt+stock+queue mutations) per distributor
         $lock_acquired = false;
@@ -1091,6 +1136,39 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
                 );
             }
         }
+        // Delegate to inner — inner doesn't try to acquire lock again
+        $res = _b2b_rest_bo_split_inner( $request, $order_id, $splits, $dist_id );
+        if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) {
+            b2b_financial_unlock( $dist_id );
+        }
+        return $res;
+    }
+}
+
+if ( ! function_exists( '_b2b_rest_bo_split_inner' ) ) {
+    /**
+     * V.2.2 Phase 2: extracted inner body of b2b_rest_bo_split. Lock acquisition is
+     * caller's responsibility (dinoco_transaction wrapper OR legacy path). Compensation
+     * closure remains intact (best-effort: stock restore + debt reverse + bo_queue delete).
+     *
+     * @param WP_REST_Request $request
+     * @param int             $order_id  pre-validated > 0
+     * @param array           $splits    pre-validated non-empty array
+     * @param int             $dist_id   pre-resolved distributor id (may be 0 for legacy data)
+     * @return WP_REST_Response|WP_Error
+     */
+    function _b2b_rest_bo_split_inner( $request, $order_id, $splits, $dist_id ) {
+        // Load existing order items (from meta or order_text)
+        $order_items_text = get_field( 'order_items', $order_id ) ?: '';
+        $parsed_items     = b2b_bo_parse_order_items( $order_items_text );
+
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+
+        // Lock acquisition handled by caller (wrapper OR legacy path) — flag consumed
+        // by exit-path branches. Set false so existing branches that conditionally call
+        // b2b_financial_unlock() become no-ops (lock is owned by caller).
+        $lock_acquired = false;
 
         // ────────────────────────────────────────────────────────────────
         // PHASE 1: VALIDATE ALL SPLITS (read-only — no mutations yet)
