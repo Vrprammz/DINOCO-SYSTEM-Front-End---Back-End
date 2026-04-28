@@ -1,6 +1,6 @@
 # DINOCO Backend Architecture — Current Status
 
-**Last Updated**: 2026-04-28 | **Session**: Round 2 Audit + Architecture Refactor
+**Last Updated**: 2026-04-28 (refresh) | **Session**: Round 2 Audit + Architecture Refactor — All Phase 4 sub-phases applied
 
 ## 🎯 Achievement Summary
 
@@ -41,14 +41,27 @@
 - ✅ `b2b_rest_bo_confirm_full` (Backorder confirm)
 - ✅ `_dinoco_inv_do_issue` (Manual Invoice issue)
 - ✅ `b2b_handle_slip_image` LINE bot path (Phase 4b)
-- ⏸️ FSM transitions (Phase 4d)
+- ✅ B2B FSM `B2B_Order_FSM::transition()` (Phase 4d, Snippet 14 V.1.8)
+- ✅ B2F FSM `B2F_Order_FSM::transition()` (Phase 4d, Snippet 6 V.1.7)
 
 ### Module Registry Adoption
 - ✅ Slip Monitor (`slip_monitor`)
 - ✅ B2F Migration Audit (`migration_audit`)
 - ✅ Health Dashboard (`health_dashboard`)
 - ✅ Config Viewer (`config_viewer`)
-- ⏸️ 16 hardcoded modules in Admin Dashboard (Phase 4b)
+- ✅ 18 admin tabs migrated (Phase 4e — `claims`, `legacy`, `inventory`, `users`, `transfer`, `b2b_dnc`, `b2b_admin`, `finance`, `invoice`, `moto_catalog`, `brand_voice`, `b2f_orders`/`b2f_makers`/`b2f_credit`, `backorders`/`bo_flags`/`bo_security_log`, `ai_control`)
+- ⏸️ Drop hardcoded `$module_map` + `$cacheable_modules` + `$modules[]` + `TAB_LABELS` arrays (Phase 5 — see "Phase 5 Roadmap" below)
+
+### Cron Registry Adoption (Phase 4f, applied 2026-04-24)
+
+- ✅ B2B Snippet 7 (Dunning + Daily Summary): 4 hooks
+- ✅ B2B Snippet 1 (Flash V.42): 3 hooks
+- ✅ B2B Snippet 2 (slip lock cleanup + queue recovery): 2 hooks
+- ✅ B2B Snippet 3 (manual flash poll): 1 hook
+- ✅ B2B Snippet 15 (stock_low_alert / dip_stock_*  / stock_invariant / slip_pool_cleanup): 5 hooks
+- ✅ B2B Snippet 16 (BO crons): 5 hooks
+- ✅ B2F Snippet 11: 5 hooks (loop registration)
+- ✅ Manual Invoice + Service Center + Inventory + Audit Retention + GDPR retention: 5 hooks
 
 ### Audit Log Dual-Write
 - ✅ B2B Debt (Snippet 13)
@@ -103,25 +116,33 @@
 - **Per-commit**: `git revert <hash>` ทุก commit เป็น isolated change
 - **No data loss**: ทุก new table additive (audit_log, etc.) — drop ปลอดภัย
 
-## 📋 Phase 4 Remaining Work (Roadmap)
+## 📋 Phase 4 — All Sub-Phases Applied ✅
 
-### ~~Phase 4b — Slip Handler Hot Path~~ ✅ SHIPPED
+| Phase | Scope | Status | Doc |
+|-------|-------|--------|-----|
+| **4a** | Backorder + Manual Invoice transaction-wrap | ✅ SHIPPED | `phase-4a-applied.md` |
+| **4b** | Slip Handler hot path (LINE bot) | ✅ SHIPPED | `phase-4b-applied.md` |
+| **4c** | Selective `get_option` → `dinoco_config()` (~30 keys) | ✅ SHIPPED | `phase-4c-applied.md` |
+| **4d** | B2B + B2F FSM transitions wrapped | ✅ SHIPPED | `phase-4d-applied.md` |
+| **4e** | 18 admin tabs → Module Registry self-registration | ✅ SHIPPED | `phase-4e-applied.md` |
+| **4f** | Cron registry heartbeat tracking (~25 crons) | ✅ SHIPPED | `phase-4f-applied.md` |
 
-Migrated `b2b_handle_slip_image()` (LINE bot) outer wrapper. Inner body extracted verbatim to `_b2b_handle_slip_image_inner()`. See `phase-4b-applied.md`.
+## 📋 Phase 5 Roadmap (Optional Cleanup)
 
-### Phase 4c — Config Migration (~4h)
-Migrate raw `get_option('b2b_flag_*')` calls (132+ sites) ไปใช้ `dinoco_config('namespace.key')`. Mostly mechanical
+Once Module Registry is hardened as a **required** dependency, drop the hardcoded fallback arrays in `[Admin System] DINOCO Admin Dashboard`:
 
-### Phase 4d — FSM Migration (~3h)
-Migrate FSM transitions ไปใช้ `dinoco_transaction` wrapper. Validate edge cases (rollback on transition fail)
+1. Drop hardcoded `$module_map` (lines 717-737) — pure registry merge
+2. Drop hardcoded `$cacheable_modules` (lines 752-771) — pure registry merge
+3. Drop hardcoded `$modules[]` placeholder array (line 3968) — loop registry
+4. Drop hardcoded `TAB_LABELS` JS literal (line 4041) — emit from registry via `wp_json_encode`
+5. Refactor sidebar nav-item HTML (line ~3490) to render from registry (Phase 1 known limitation)
 
-### Phase 4e — Module Registry Migration (~6h)
-Migrate 16 remaining hardcoded admin tabs to use `dinoco_register_admin_module()`. Eventually remove from Admin Dashboard hardcoded arrays
+**Risk**: Disabling Module Registry snippet → dashboard breaks. Currently safe because hardcoded arrays act as fallback. Phase 5 makes registry the **sole** source of truth — same blast radius as making Snippet 1 required.
 
-### Phase 4f — Cron Registry Migration (~3h)
-Migrate 30+ raw `wp_schedule_event` calls to `dinoco_register_cron`. Get heartbeat tracking on all crons
+**Out-of-scope deferrals (acceptable)**:
 
-**Total Phase 4 remaining**: ~20h ongoing maintenance
+- Round 2 audit M4 (recursive MIN per row stock list) — defer until SKU count > 1000
+- 4 LOW cosmetic findings — non-blocking
 
 ## 🎯 ROI Realized
 
