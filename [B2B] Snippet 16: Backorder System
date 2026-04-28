@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.2.1 — Wave 4 MED-M1 atomic counter race fix:                                ║
+ * ║                   • b2b_bo_increment_daily_counters() / decrement: replace                ║
+ * ║                     get_transient → mutate → set_transient (read-modify-write race)      ║
+ * ║                     with b2b_bo_atomic_incr_option() helper. Pattern mirrors              ║
+ * ║                     Snippet 1 V.34.9 b2b_slip_incr_err_count (atomic UPDATE on            ║
+ * ║                     wp_options + wp_cache_incr fast-path). Two concurrent admins/         ║
+ * ║                     bots calling place-order or rate-limit cancel paths can no            ║
+ * ║                     longer undercount 50-100 units per second. Self-contained             ║
+ * ║                     helper inside Snippet 16 (Wave 2 may touch Snippet 1 — avoid          ║
+ * ║                     merge conflict). Float values (daily_value) stored as integer         ║
+ * ║                     "satang" cents internally (×100) so atomic UPDATE works.              ║
  * ║  Version: V.2.0 — Wave 1 atomic-boundary hardening (audit Round 2 CRIT-C1):              ║
  * ║                   • bo-split: removed nested START TRANSACTION (MySQL flattens to inner ║
  * ║                     COMMIT → outer ROLLBACK was no-op, partial mutations persisted on   ║
@@ -444,21 +455,103 @@ if ( ! function_exists( 'b2b_bo_compute_age_bucket' ) ) {
     }
 }
 
+// V.2.1 (Wave 4 MED-M1) — Atomic counter helper
+// Race-safe replacement for get_transient → ++ → set_transient pattern.
+// Pattern mirrors Snippet 1 V.34.9 `b2b_slip_incr_err_count`:
+//   Path 1: persistent object cache — wp_cache_incr (true atomic)
+//   Path 2: wp_options fallback — single UPDATE statement (atomic at row-level)
+// Stored as integer (counter or satang cents). For float values (daily_value)
+// callers convert THB → satang (×100) before calling and convert back on read.
+if ( ! function_exists( 'b2b_bo_atomic_incr_option' ) ) {
+    /**
+     * Atomically increment a transient-backed integer counter.
+     *
+     * @param string $cache_key      Transient key (without `_transient_` prefix)
+     * @param int    $delta          Delta to add (negative allowed for decrement)
+     * @param int    $ttl_seconds    TTL when seeding new key (default 86400 = 1 day)
+     * @param int    $floor          Floor value after add (default 0 — counters can't go negative)
+     * @return int                   New counter value after delta applied
+     */
+    function b2b_bo_atomic_incr_option( $cache_key, $delta, $ttl_seconds = 86400, $floor = 0 ) {
+        global $wpdb;
+        $delta = intval( $delta );
+
+        // Path 1: persistent object cache (Redis/Memcached) — true atomic via wp_cache_incr/decr
+        if ( wp_using_ext_object_cache() && function_exists( 'wp_cache_incr' ) ) {
+            if ( $delta >= 0 ) {
+                $val = wp_cache_incr( $cache_key, $delta, 'transient' );
+            } else {
+                $val = function_exists( 'wp_cache_decr' )
+                    ? wp_cache_decr( $cache_key, abs( $delta ), 'transient' )
+                    : wp_cache_incr( $cache_key, $delta, 'transient' );
+            }
+            if ( $val === false ) {
+                // Key not yet set — seed
+                $seed = max( $floor, $delta );
+                wp_cache_set( $cache_key, $seed, 'transient', $ttl_seconds );
+                return (int) $seed;
+            }
+            $vi = intval( $val );
+            if ( $vi < $floor ) {
+                wp_cache_set( $cache_key, $floor, 'transient', $ttl_seconds );
+                return $floor;
+            }
+            return $vi;
+        }
+
+        // Path 2: wp_options fallback — atomic via single UPDATE statement
+        $opt_name     = '_transient_' . $cache_key;
+        $timeout_name = '_transient_timeout_' . $cache_key;
+
+        // Try atomic UPDATE first (works if row exists with numeric value)
+        // GREATEST() clamps to floor in same statement — race-safe
+        $sql = $wpdb->prepare(
+            "UPDATE {$wpdb->options}
+             SET option_value = GREATEST( CAST(option_value AS SIGNED) + %d, %d )
+             WHERE option_name = %s",
+            $delta, intval( $floor ), $opt_name
+        );
+        $affected = $wpdb->query( $sql );
+
+        if ( $affected ) {
+            $new_val = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s",
+                $opt_name
+            ) );
+            // Ensure timeout row exists (refresh TTL lazily)
+            if ( ! get_option( $timeout_name ) ) {
+                update_option( $timeout_name, time() + intval( $ttl_seconds ), false );
+            }
+            return $new_val;
+        }
+
+        // Row doesn't exist yet — seed via set_transient
+        // Narrow race window between concurrent seeds is acceptable
+        // (counter aggregates over 24h — single-event undercount tolerable)
+        $seed = max( $floor, $delta );
+        set_transient( $cache_key, $seed, $ttl_seconds );
+        return (int) $seed;
+    }
+}
+
 if ( ! function_exists( 'b2b_bo_increment_daily_counters' ) ) {
     /**
      * เพิ่ม daily counters หลัง accept order (qty + value per SKU + distributor)
+     * V.2.1 (Wave 4 MED-M1): atomic increment via b2b_bo_atomic_incr_option().
+     *   daily_value stored as satang cents (×100) so atomic INT UPDATE works.
      * Transients expire 86400s natural — cron cleanup ไม่จำเป็น
      */
     function b2b_bo_increment_daily_counters( $distributor_id, $items, $total_value ) {
-        $daily_value_key = 'b2b_daily_value_' . $distributor_id;
-        $used = (float) ( get_transient( $daily_value_key ) ?: 0 );
-        set_transient( $daily_value_key, $used + (float) $total_value, 86400 );
+        $daily_value_key = 'b2b_daily_value_' . intval( $distributor_id );
+        // Convert THB → satang (×100) for integer atomic ops; on read divide /100
+        $delta_satang = (int) round( floatval( $total_value ) * 100 );
+        b2b_bo_atomic_incr_option( $daily_value_key, $delta_satang, 86400, 0 );
 
-        foreach ( $items as $it ) {
-            $sku = strtoupper( $it['sku'] );
-            $qty_key = 'b2b_daily_qty_' . $distributor_id . '_' . $sku;
-            $qty_used = (int) ( get_transient( $qty_key ) ?: 0 );
-            set_transient( $qty_key, $qty_used + (int) $it['qty'], 86400 );
+        foreach ( (array) $items as $it ) {
+            $sku = strtoupper( (string) ( $it['sku'] ?? '' ) );
+            if ( $sku === '' ) continue;
+            $qty_key = 'b2b_daily_qty_' . intval( $distributor_id ) . '_' . $sku;
+            b2b_bo_atomic_incr_option( $qty_key, intval( $it['qty'] ?? 0 ), 86400, 0 );
         }
     }
 }
@@ -466,17 +559,20 @@ if ( ! function_exists( 'b2b_bo_increment_daily_counters' ) ) {
 if ( ! function_exists( 'b2b_bo_decrement_daily_counters' ) ) {
     /**
      * ลด counters ตอน reject/cancel (revert)
+     * V.2.1 (Wave 4 MED-M1): atomic decrement via b2b_bo_atomic_incr_option().
+     *   GREATEST(...,0) clamp inside SQL prevents negative values race-safely.
      */
     function b2b_bo_decrement_daily_counters( $distributor_id, $items, $total_value ) {
-        $daily_value_key = 'b2b_daily_value_' . $distributor_id;
-        $used = (float) ( get_transient( $daily_value_key ) ?: 0 );
-        set_transient( $daily_value_key, max( 0, $used - (float) $total_value ), 86400 );
+        $daily_value_key = 'b2b_daily_value_' . intval( $distributor_id );
+        $delta_satang = -1 * (int) round( floatval( $total_value ) * 100 );
+        b2b_bo_atomic_incr_option( $daily_value_key, $delta_satang, 86400, 0 );
 
-        foreach ( $items as $it ) {
-            $sku = strtoupper( $it['sku'] );
-            $qty_key = 'b2b_daily_qty_' . $distributor_id . '_' . $sku;
-            $qty_used = (int) ( get_transient( $qty_key ) ?: 0 );
-            set_transient( $qty_key, max( 0, $qty_used - (int) $it['qty'] ), 86400 );
+        foreach ( (array) $items as $it ) {
+            $sku = strtoupper( (string) ( $it['sku'] ?? '' ) );
+            if ( $sku === '' ) continue;
+            $qty_key = 'b2b_daily_qty_' . intval( $distributor_id ) . '_' . $sku;
+            $delta_qty = -1 * intval( $it['qty'] ?? 0 );
+            b2b_bo_atomic_incr_option( $qty_key, $delta_qty, 86400, 0 );
         }
     }
 }
@@ -2832,8 +2928,11 @@ add_filter( 'rest_pre_dispatch', function( $result, $server, $request ) {
     $rank      = get_field( 'rank_system', $dist_id ) ?: 'standard';
     $cap       = $tier_caps[ $rank ] ?? 50000;
     if ( $cap > 0 ) {
+        // V.2.1 (Wave 4 MED-M1): daily_value counter stored as satang cents (×100)
+        // for atomic INT UPDATE; convert back to THB on read.
         $daily_value_key = 'b2b_daily_value_' . $dist_id;
-        $daily_used      = (float) ( get_transient( $daily_value_key ) ?: 0 );
+        $daily_used_satang = (int) ( get_transient( $daily_value_key ) ?: 0 );
+        $daily_used        = $daily_used_satang / 100.0;
         if ( $daily_used + $total_value > $cap ) {
             b2b_log_attempt( $dist_id, 'place_order', 0, '', 'rejected', 'DAILY_VALUE_LIMIT', array( 'group_id' => $group_id ) );
             return new WP_Error( 'DAILY_VALUE_LIMIT', 'เกินวงเงินรายวัน', array( 'status' => 429 ) );

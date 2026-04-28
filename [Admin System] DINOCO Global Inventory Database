@@ -2,6 +2,19 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.44.5 (2026-04-24) — Wave 4 MED M5 + M6:
+ *   M5 — dip-stock/current DD-3 array consistency: previously used "first parent wins"
+ *        single-value $dip_child_to_parent map → diverged from stock/list V.43.6 which
+ *        exposes `parent_skus[]` array. Fix: build $dip_child_to_parents (array of all
+ *        parents) + keep $dip_child_to_parent compat single-value. Items now expose
+ *        `parent_skus[]` + `grandparent_skus[]` for shared-leaf (DD-3) UIs.
+ *   M6 — get_catalog SHOW COLUMNS + ALTER TABLE thrashing eliminated: per-request
+ *        $_get_catalog_schema_ok static memo + DINOCO_INVENTORY_SCHEMA_VERSION gate.
+ *        When schema_version is current → skip 5-7 SHOW COLUMNS + 4 ALTER TABLE
+ *        (~10-30ms hot-path saving per request). Falls back to slow path on schema
+ *        mismatch + bumps schema version 20260411 → 20260424 to track V.44.0 cols
+ *        (pack_mode, packaging_source, box_template_id, weight_per_unit_g,
+ *        express_category_override).
  * Version: V.44.4 (2026-04-21) — HIGH-1: wp_cache_flush_group guard:
  *   - 4 REST endpoints (product/shipping + bulk, shipping-defaults, shipping/classify)
  *     now route through dinoco_cache_flush_group() helper (Snippet 15 V.8.5).
@@ -63,8 +76,10 @@ add_action('init', function() {
 
 // V.42.18 — Audit I9: schema version tracking for dinoco_products.
 // Current expected version. Bump whenever a NEW column is added to dinoco_products.
+// V.44.5 (Wave 4 MED-M6): bumped 20260411 → 20260424 to ensure get_catalog
+// fast-path schema check honors V.44.0 Flash Shipping columns (pack_mode etc.).
 if ( ! defined('DINOCO_INVENTORY_SCHEMA_VERSION') ) {
-    define('DINOCO_INVENTORY_SCHEMA_VERSION', 20260411);
+    define('DINOCO_INVENTORY_SCHEMA_VERSION', 20260424);
 }
 add_action('admin_init', function() {
     $installed = (int) get_option('dinoco_inventory_schema_version', 0);
@@ -231,53 +246,78 @@ add_action('init', function() {
                 $b2b_map = null; // deferred
 
                 // Batch load b2b_visible + category จาก custom table (1 query แทน N)
+                // V.44.5 (Wave 4 MED-M6): fast-path skip — when schema_version is current,
+                //   trust admin_init migration + V.42.0/V.44.0 column probe (already done).
+                //   Saves 5-7 SHOW COLUMNS + 4 ALTER TABLE per request (~10-30ms hot path).
+                //   Static $schema_ok memo persists for the full request lifecycle.
                 $ct_map = [];
                 global $wpdb;
                 $ct_table = $wpdb->prefix . 'dinoco_products';
+                static $_get_catalog_schema_ok = null;
+                if ($_get_catalog_schema_ok === null) {
+                    $installed_ver = (int) get_option('dinoco_inventory_schema_version', 0);
+                    $expected_ver  = defined('DINOCO_INVENTORY_SCHEMA_VERSION') ? (int) DINOCO_INVENTORY_SCHEMA_VERSION : 0;
+                    $_get_catalog_schema_ok = ($expected_ver > 0 && $installed_ver >= $expected_ver);
+                }
                 $ct_check = $wpdb->get_var("SHOW TABLES LIKE '{$ct_table}'");
                 if ($ct_check) {
-                    // ตรวจว่า columns ที่ต้องการมีจริงไหม
-                    $has_b2b_vis = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'b2b_visible'");
-                    $has_compat  = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'compatible_models'");
-                    $has_cat     = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'category'");
-                    $has_upb     = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'units_per_box'");
-                    // V.42.14: Manual UI role override (admin เลือกเอง: auto / set / child / grandchild / single)
-                    $has_role    = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'ui_role_override'");
+                    // FAST PATH — schema migrated → skip column probes + ALTERs entirely
+                    if ($_get_catalog_schema_ok) {
+                        $cols = 'sku, boxes_per_unit, units_per_box, base_price, price_silver, price_gold, price_platinum, price_diamond, b2b_discount_percent, min_order_qty, stock_status, oos_eta_date, oos_timestamp, oos_duration_hours, b2b_visible, category, compatible_models, ui_role_override, pack_mode, packaging_source, box_template_id, weight_per_unit_g, weight_grams, express_category_override';
+                        $ct_rows = $wpdb->get_results("SELECT {$cols} FROM {$ct_table} WHERE is_active = 1", ARRAY_A);
+                        if ($ct_rows) {
+                            foreach ($ct_rows as $r) { $ct_map[$r['sku']] = $r; }
+                        } elseif ($wpdb->last_error) {
+                            // Schema-mismatch fallback — flag stale → next request retries the slow path
+                            $_get_catalog_schema_ok = false;
+                            error_log('[DINOCO Inventory] get_catalog fast-path SELECT failed err=' . $wpdb->last_error . ' — falling back to slow path');
+                        }
+                    }
+                    // SLOW PATH — schema not yet at expected version (legacy installs / migration pending)
+                    if (!$_get_catalog_schema_ok) {
+                        // ตรวจว่า columns ที่ต้องการมีจริงไหม
+                        $has_b2b_vis = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'b2b_visible'");
+                        $has_compat  = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'compatible_models'");
+                        $has_cat     = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'category'");
+                        $has_upb     = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'units_per_box'");
+                        // V.42.14: Manual UI role override (admin เลือกเอง: auto / set / child / grandchild / single)
+                        $has_role    = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'ui_role_override'");
 
-                    // สร้าง columns ที่ขาดทันที
-                    if (!$has_b2b_vis) {
-                        $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN b2b_visible TINYINT(1) NOT NULL DEFAULT 1 AFTER is_active");
-                        $has_b2b_vis = true;
-                    }
-                    if (!$has_compat) {
-                        $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN compatible_models TEXT DEFAULT NULL");
-                        $has_compat = true;
-                    }
-                    if (!$has_upb) {
-                        $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN units_per_box INT DEFAULT 1 AFTER boxes_per_unit");
-                        $has_upb = true;
-                    }
-                    if (!$has_role) {
-                        $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN ui_role_override VARCHAR(20) NOT NULL DEFAULT 'auto'");
-                        $has_role = true;
-                    }
+                        // สร้าง columns ที่ขาดทันที
+                        if (!$has_b2b_vis) {
+                            $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN b2b_visible TINYINT(1) NOT NULL DEFAULT 1 AFTER is_active");
+                            $has_b2b_vis = true;
+                        }
+                        if (!$has_compat) {
+                            $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN compatible_models TEXT DEFAULT NULL");
+                            $has_compat = true;
+                        }
+                        if (!$has_upb) {
+                            $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN units_per_box INT DEFAULT 1 AFTER boxes_per_unit");
+                            $has_upb = true;
+                        }
+                        if (!$has_role) {
+                            $wpdb->query("ALTER TABLE {$ct_table} ADD COLUMN ui_role_override VARCHAR(20) NOT NULL DEFAULT 'auto'");
+                            $has_role = true;
+                        }
 
-                    // V.38.4: Build SELECT — include pricing + oos columns
-                    $cols = 'sku, boxes_per_unit, units_per_box, base_price, price_silver, price_gold, price_platinum, price_diamond, b2b_discount_percent, min_order_qty, stock_status, oos_eta_date, oos_timestamp, oos_duration_hours';
-                    if ($has_b2b_vis) $cols .= ', b2b_visible';
-                    if ($has_cat)     $cols .= ', category';
-                    if ($has_compat)  $cols .= ', compatible_models';
-                    if ($has_role)    $cols .= ', ui_role_override';
-                    // V.44.0 PHASE 2: include Flash Shipping V.42 columns (best-effort, columns may not exist on fresh installs before Snippet 15 V.8.0 migration runs)
-                    $has_pack_mode   = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'pack_mode'");
-                    $has_ec_override = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'express_category_override'");
-                    if ($has_pack_mode)   $cols .= ', pack_mode, packaging_source, box_template_id, weight_per_unit_g, weight_grams';
-                    if ($has_ec_override) $cols .= ', express_category_override';
+                        // V.38.4: Build SELECT — include pricing + oos columns
+                        $cols = 'sku, boxes_per_unit, units_per_box, base_price, price_silver, price_gold, price_platinum, price_diamond, b2b_discount_percent, min_order_qty, stock_status, oos_eta_date, oos_timestamp, oos_duration_hours';
+                        if ($has_b2b_vis) $cols .= ', b2b_visible';
+                        if ($has_cat)     $cols .= ', category';
+                        if ($has_compat)  $cols .= ', compatible_models';
+                        if ($has_role)    $cols .= ', ui_role_override';
+                        // V.44.0 PHASE 2: include Flash Shipping V.42 columns (best-effort, columns may not exist on fresh installs before Snippet 15 V.8.0 migration runs)
+                        $has_pack_mode   = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'pack_mode'");
+                        $has_ec_override = (bool) $wpdb->get_var("SHOW COLUMNS FROM {$ct_table} LIKE 'express_category_override'");
+                        if ($has_pack_mode)   $cols .= ', pack_mode, packaging_source, box_template_id, weight_per_unit_g, weight_grams';
+                        if ($has_ec_override) $cols .= ', express_category_override';
 
-                    $ct_rows = $wpdb->get_results("SELECT {$cols} FROM {$ct_table} WHERE is_active = 1", ARRAY_A);
-                    if ($ct_rows) {
-                        foreach ($ct_rows as $r) {
-                            $ct_map[$r['sku']] = $r;
+                        $ct_rows = $wpdb->get_results("SELECT {$cols} FROM {$ct_table} WHERE is_active = 1", ARRAY_A);
+                        if ($ct_rows) {
+                            foreach ($ct_rows as $r) {
+                                $ct_map[$r['sku']] = $r;
+                            }
                         }
                     }
                 }
@@ -2325,9 +2365,13 @@ add_action('rest_api_init', function() {
             $sku_rel = get_option('dinoco_sku_relations', []);
 
             // V.42.22: Pre-build maps (O(1) lookup) — leaf-based classification ตรงกับ stock/list + JS computeProductTypes
+            // V.44.5 (Wave 4 MED-M5): DD-3 shared child consistent with stock/list V.43.6 —
+            //   build $dip_child_to_parents (array of all parents) instead of "first parent wins".
+            //   Compat: $dip_child_to_parent[x] = parents[0] kept for downstream code that
+            //   only needs primary parent (matches JS myParents[0] convention).
             $dip_parent_skus = [];
-            $dip_child_to_parent = [];
-            // V.42.23: DD-3 shared child safe — เก็บ first parent (เหมือน stock/list)
+            $dip_child_to_parents = []; // child_sku → [parent1, parent2, ...] (DD-3 array)
+            $dip_child_to_parent  = []; // child_sku → parents[0] (compat single value)
             if (is_array($sku_rel)) {
                 foreach ($sku_rel as $p => $ch_arr) {
                     if (!is_array($ch_arr)) continue;
@@ -2335,8 +2379,15 @@ add_action('rest_api_init', function() {
                     $dip_parent_skus[] = $p_upper;
                     foreach ($ch_arr as $ch) {
                         $cu = strtoupper($ch);
-                        if (!isset($dip_child_to_parent[$cu])) $dip_child_to_parent[$cu] = $p_upper; // first parent wins
+                        if (!isset($dip_child_to_parents[$cu])) $dip_child_to_parents[$cu] = [];
+                        if (!in_array($p_upper, $dip_child_to_parents[$cu], true)) {
+                            $dip_child_to_parents[$cu][] = $p_upper;
+                        }
                     }
+                }
+                // Build single-value compat map (first parent — same convention as stock/list)
+                foreach ($dip_child_to_parents as $ch_u => $parents) {
+                    $dip_child_to_parent[$ch_u] = $parents[0];
                 }
             }
 
@@ -2351,15 +2402,20 @@ add_action('rest_api_init', function() {
                 if ( $item['actual_qty'] !== null ) $counted++;
 
                 // V.42.22: Leaf-based classification (ตรงกับ stock/list V.42.21 + JS computeProductTypes V.42.13)
+                // V.44.5 (Wave 4 MED-M5): DD-3 array exposure — parent_skus[] aligns with stock/list V.43.6.
                 $item['parent_sku'] = null;
                 $item['parent_name'] = null;
+                $item['parent_skus'] = []; // DD-3: all parents (shared child support)
                 $item['grandparent_sku'] = null;
                 $item['grandparent_name'] = null;
+                $item['grandparent_skus'] = []; // DD-3: all grandparents
                 $item['product_type'] = 'single';
 
                 $sku_upper = strtoupper($item['sku']);
                 $is_parent = in_array($sku_upper, $dip_parent_skus);
                 $my_parent = isset($dip_child_to_parent[$sku_upper]) ? $dip_child_to_parent[$sku_upper] : null;
+                $all_parents = isset($dip_child_to_parents[$sku_upper]) ? $dip_child_to_parents[$sku_upper] : [];
+                $item['parent_skus'] = $all_parents;
 
                 if ($my_parent && !$is_parent) {
                     // leaf ใต้ parent = grandchild (แยกขายเป็นอะไหล่ได้)
@@ -2371,6 +2427,14 @@ add_action('rest_api_init', function() {
                         $item['grandparent_sku'] = $gp;
                         $item['grandparent_name'] = isset($all_product_names[$gp]) ? $all_product_names[$gp] : $gp;
                     }
+                    // DD-3: collect grandparents across ALL parent paths
+                    $gp_skus = [];
+                    foreach ($all_parents as $ap) {
+                        if (isset($dip_child_to_parent[$ap]) && !in_array($dip_child_to_parent[$ap], $gp_skus, true)) {
+                            $gp_skus[] = $dip_child_to_parent[$ap];
+                        }
+                    }
+                    $item['grandparent_skus'] = $gp_skus;
                 } elseif ($my_parent && $is_parent) {
                     // non-leaf + มี parent = child (sub-SET)
                     $item['product_type'] = 'child';

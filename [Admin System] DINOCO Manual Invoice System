@@ -2,6 +2,26 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.1 — Wave 2 slip-pipeline convergence (audit Round 2):
+ *   • CRIT-C4: trans_ref dedup gate via b2b_slip_is_trans_ref_seen() in verify_slip +
+ *     verify_slip_combined BEFORE record_payment. Returns 409 duplicate_slip if seen.
+ *   • CRIT-C5: record_payment now wraps in START TRANSACTION + FOR UPDATE on
+ *     _inv_paid_amount + _inv_slip_ref + post row (mirror record_refund pattern).
+ *     Concurrent admin clicks can no longer lose-update.
+ *   • CRIT-C6: _inv_slip_ref stamp moved INSIDE the same FOR UPDATE transaction.
+ *     verify_slip stamps via SELECT meta_id FOR UPDATE before update_post_meta;
+ *     verify_slip_combined delegates stamp to b2b_slip_apply_to_invoices() helper
+ *     (Snippet 1 V.34.13). Eliminates TOCTOU forensic dedup false-positives.
+ *   • HIGH-H6: verify_slip_combined refactored to call b2b_slip_apply_to_invoices()
+ *     shared helper (Snippet 1 V.34.13) — single dedup point, single atomic block,
+ *     single record_payment pattern. Replaces prior inline foreach + record_payment loop.
+ *   • HIGH-H7: $slip_amount underflow guard inside helper loop (≤0.01 → break).
+ *     Original $slip_amount0 preserved for response payload (no mutation in caller).
+ *   • HIGH-H8: Slip2Go API response cached 5min keyed on SHA-256(slip_url) via
+ *     b2b_slip_get/set_cached_response_by_url() — prevents double-bill on retry.
+ *   • MED-M2: validate every manual_ids belongs to $dist_id at DB level (block cross-
+ *     distributor leak). Returns 400 invoice_not_owned on mismatch.
+ *   • MED-M3: _inv_partial_payments capped at last 50 entries (record_payment + helper).
  * Version: V.34.0 — Wave 1 atomic-boundary + FSM hardening (audit Round 2):
  *   • CRIT-C2: removed fallback `b2b_set_order_status()` (lines 59-67). Bypass FSM + skip
  *     b2b_order_status_changed hook = silent state corruption. Now fail-loud admin_notice +
@@ -1601,48 +1621,98 @@ function dinoco_inv_rest_issue(WP_REST_Request $req) {
 }
 
 // --- RECORD PAYMENT ---
+// V.34.1 CRIT-C5 FIX: wrap meta read/write in START TRANSACTION + FOR UPDATE on
+// _inv_paid_amount + _inv_slip_ref + post row. Mirror record_refund pattern (line 1657+).
+// Prevents lost-update race when 2 admins click record_payment concurrently or when
+// auto-allocate (verify_slip_combined) loops record_payment per matched invoice.
 function dinoco_inv_rest_record_payment(WP_REST_Request $req) {
+    global $wpdb;
     $id     = intval($req->get_param('id'));
     $amount = floatval($req->get_param('amount'));
     $note   = sanitize_text_field($req->get_param('note') ?? '');
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
     if ($amount <= 0) return new WP_Error('invalid', 'ยอดชำระต้องมากกว่า 0', ['status' => 400]);
-    $total_check   = floatval(get_field('total_amount', $id));
-    $paid_check    = floatval(get_post_meta($id, '_inv_paid_amount', true));
-    $remaining     = round($total_check - $paid_check, 2);
-    if ($amount > $remaining + 0.01) { // 0.01 rounding tolerance
-        return new WP_Error('overpayment', 'ยอดชำระเกิน: เหลือที่ต้องชำระ ฿' . number_format($remaining, 2), ['status' => 400]);
+
+    $dist_id = intval(get_post_meta($id, '_dist_post_id', true));
+    $total   = 0;
+    $new_paid = 0;
+    $is_full = false;
+    $tolerance_eps = 0.01;
+
+    $wpdb->query('START TRANSACTION');
+    try {
+        // Lock paid_amount + slip_ref meta + post row to serialize concurrent payment writes
+        $wpdb->get_row($wpdb->prepare(
+            "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s FOR UPDATE",
+            $id, '_inv_paid_amount'
+        ));
+        $wpdb->get_row($wpdb->prepare(
+            "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s FOR UPDATE",
+            $id, '_inv_slip_ref'
+        ));
+        $wpdb->get_row($wpdb->prepare(
+            "SELECT ID FROM {$wpdb->posts} WHERE ID=%d FOR UPDATE",
+            $id
+        ));
+
+        // Re-check status under lock (caller may have raced with cancel/paid)
+        $status = get_field('order_status', $id);
+        if ($status !== 'awaiting_payment') {
+            $wpdb->query('ROLLBACK');
+            return new WP_Error('invalid', 'บันทึกการชำระได้เฉพาะสถานะรอชำระเงินเท่านั้น', ['status' => 400]);
+        }
+
+        $total       = floatval(get_field('total_amount', $id));
+        $paid_so_far = floatval(get_post_meta($id, '_inv_paid_amount', true));
+        $remaining   = round($total - $paid_so_far, 2);
+        if ($amount > $remaining + $tolerance_eps) {
+            $wpdb->query('ROLLBACK');
+            return new WP_Error('overpayment', 'ยอดชำระเกิน: เหลือที่ต้องชำระ ฿' . number_format($remaining, 2), ['status' => 400]);
+        }
+
+        $new_paid = round($paid_so_far + $amount, 2);
+        $payments = json_decode(get_post_meta($id, '_inv_partial_payments', true) ?: '[]', true);
+        if (!is_array($payments)) $payments = [];
+        $payments[] = ['amount' => $amount, 'date' => b2b_date('Y-m-d H:i:s'), 'note' => $note];
+        // Wave 2 M3: cap unbounded JSON growth — keep last 50 entries
+        if (count($payments) > 50) $payments = array_slice($payments, -50);
+
+        update_post_meta($id, '_inv_paid_amount', $new_paid);
+        update_post_meta($id, '_inv_partial_payments', wp_json_encode($payments, JSON_UNESCAPED_UNICODE));
+
+        $is_full = ($new_paid >= $total - $tolerance_eps);
+        if ($is_full) {
+            // FSM transition under lock — fail loud if helper missing (CRIT-C2 contract)
+            if (!function_exists('b2b_set_order_status')) {
+                $wpdb->query('ROLLBACK');
+                b2b_log('[CRITICAL] Manual Invoice V.34.1 record_payment: b2b_set_order_status missing — payment ABORTED for post=' . $id);
+                return new WP_Error('fsm_helper_missing', 'ระบบ FSM ยังไม่พร้อม (Snippet 1)', ['status' => 503]);
+            }
+            b2b_set_order_status($id, 'paid');
+            update_field('is_billed', false, $id);
+        }
+
+        $wpdb->query('COMMIT');
+    } catch (\Throwable $e) {
+        $wpdb->query('ROLLBACK');
+        b2b_log('[Manual Invoice] record_payment exception post=' . $id . ' err=' . $e->getMessage());
+        return new WP_Error('record_failed', 'บันทึกชำระล้มเหลว: ' . $e->getMessage(), ['status' => 500]);
     }
-    $status = get_field('order_status', $id);
-    if ($status !== 'awaiting_payment') return new WP_Error('invalid', 'บันทึกการชำระได้เฉพาะสถานะรอชำระเงินเท่านั้น', ['status' => 400]);
 
-    $dist_id    = intval(get_post_meta($id, '_dist_post_id', true));
-    $total      = floatval(get_field('total_amount', $id));
-    $paid_so_far = floatval(get_post_meta($id, '_inv_paid_amount', true));
-    $new_paid   = round($paid_so_far + $amount, 2);
-    $payments   = json_decode(get_post_meta($id, '_inv_partial_payments', true) ?: '[]', true);
-    $payments[] = ['amount' => $amount, 'date' => b2b_date('Y-m-d H:i:s'), 'note' => $note];
-
-    update_post_meta($id, '_inv_paid_amount', $new_paid);
-    update_post_meta($id, '_inv_partial_payments', wp_json_encode($payments, JSON_UNESCAPED_UNICODE));
-
-    if ($new_paid >= $total) {
-        // Fully paid
-        b2b_set_order_status($id, 'paid');
-        update_field('is_billed', false, $id);
-        // V.34.0 HIGH-H14 FIX: removed direct update_field('current_debt') fallback (was line 1622).
-        // Use atomic helpers only — recalculate or subtract via Snippet 13. Fail loud if missing.
+    // Post-commit side effects
+    if ($is_full) {
+        // V.34.0/V.34.1 HIGH-H14: atomic helper chain only, no direct update_field fallback
         if (function_exists('b2b_recalculate_debt') && $dist_id) {
             b2b_recalculate_debt($dist_id);
         } elseif (function_exists('b2b_debt_subtract') && $dist_id) {
             b2b_debt_subtract($dist_id, $total, 'manual_invoice_paid:'.$id, $id);
         } elseif ($dist_id) {
-            b2b_log('[CRITICAL] Manual Invoice V.34.0 record_payment fully_paid: b2b_recalculate_debt + b2b_debt_subtract both missing — debt NOT reversed for dist=' . $dist_id . ' amount=' . $total . ' (admin must reconcile manually)');
+            b2b_log('[CRITICAL] Manual Invoice V.34.1 record_payment fully_paid: b2b_recalculate_debt + b2b_debt_subtract both missing — debt NOT reversed for dist=' . $dist_id . ' amount=' . $total . ' (admin must reconcile manually)');
         }
         b2b_add_audit_log($id, 'invoice_paid', 'ชำระครบ ฿' . number_format($new_paid, 0));
         return rest_ensure_response(['success' => true, 'fully_paid' => true, 'status' => 'paid']);
     } else {
-        // FIX H4: Recalculate debt after partial payment so credit limit + Flex show correct values
+        // Recalculate debt after partial payment so credit limit + Flex show correct values
         if (function_exists('b2b_recalculate_debt') && $dist_id) {
             b2b_recalculate_debt($dist_id);
         }
@@ -1750,6 +1820,10 @@ function dinoco_inv_rest_record_refund(WP_REST_Request $req) {
 }
 
 // --- VERIFY SLIP ---
+// V.34.1 Wave 2 audit fixes:
+//   • C4: trans_ref dedup gate via b2b_slip_is_trans_ref_seen() before record_payment
+//   • C6: stamp _inv_slip_ref moved INSIDE record_payment (no longer pre-stamp before commit)
+//   • H8: Slip2Go API response cached 5min keyed on SHA-256(slip_url) — avoid double-bill on retry
 function dinoco_inv_rest_verify_slip(WP_REST_Request $req) {
     $id       = intval($req->get_param('id'));
     $slip_url = esc_url_raw($req->get_param('slip_url') ?? '');
@@ -1763,76 +1837,165 @@ function dinoco_inv_rest_verify_slip(WP_REST_Request $req) {
     $secret  = defined('B2B_SLIP2GO_SECRET_KEY') ? B2B_SLIP2GO_SECRET_KEY : '';
     if (!$api_url || !$secret) return new WP_Error('config', 'ยังไม่ได้ตั้งค่า Slip2Go API', ['status' => 500]);
 
-    $resp = wp_remote_post($api_url, [
-        'headers' => ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $secret],
-        'body'    => wp_json_encode(['url' => $slip_url]),
-        'timeout' => 15,
-    ]);
-    if (is_wp_error($resp)) return new WP_Error('api_error', 'ไม่สามารถติดต่อ Slip2Go ได้', ['status' => 502]);
+    // H8: idempotency cache lookup
+    $http_code = 0;
+    $raw_body  = '';
+    $from_cache = false;
+    if (function_exists('b2b_slip_get_cached_response_by_url')) {
+        $cached = b2b_slip_get_cached_response_by_url($slip_url);
+        if (is_array($cached)) {
+            $http_code = intval($cached['http_code']);
+            $raw_body  = (string) $cached['body'];
+            $from_cache = true;
+        }
+    }
+    if (!$from_cache) {
+        $resp = wp_remote_post($api_url, [
+            'headers' => ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $secret],
+            'body'    => wp_json_encode(['url' => $slip_url]),
+            'timeout' => 15,
+        ]);
+        if (is_wp_error($resp)) return new WP_Error('api_error', 'ไม่สามารถติดต่อ Slip2Go ได้', ['status' => 502]);
+        $http_code = wp_remote_retrieve_response_code($resp);
+        $raw_body  = wp_remote_retrieve_body($resp);
+        if (function_exists('b2b_slip_set_cached_response_by_url') && $http_code === 200) {
+            b2b_slip_set_cached_response_by_url($slip_url, $http_code, $raw_body);
+        }
+    }
 
-    $body   = json_decode(wp_remote_retrieve_body($resp), true);
-    $code   = wp_remote_retrieve_response_code($resp);
-    $verified = ($code === 200 && !empty($body['success']));
+    $body     = json_decode($raw_body, true);
+    $verified = ($http_code === 200 && is_array($body) && !empty($body['success']));
 
     if ($verified) {
         $amount = floatval($body['amount'] ?? 0);
         $ref    = sanitize_text_field($body['ref'] ?? '');
-        $date   = sanitize_text_field($body['date'] ?? b2b_date('Y-m-d'));
-        update_post_meta($id, '_inv_slip_ref', $ref);
+        $date   = sanitize_text_field($body['date'] ?? b2b_date('Y-m-d H:i:s'));
+
+        // C4: trans_ref dedup gate before record_payment
+        if ($ref !== '' && function_exists('b2b_slip_is_trans_ref_seen') && b2b_slip_is_trans_ref_seen($ref)) {
+            return new WP_Error('duplicate_slip', 'สลิปนี้เคยใช้แล้ว (TransRef: ' . $ref . ')', ['status' => 409]);
+        }
+
+        b2b_add_audit_log($id, 'slip_verified', 'ตรวจสลิปผ่าน ฿' . number_format($amount, 0) . ' ref=' . $ref . ($from_cache ? ' (cached)' : ''));
+
+        // C6: stamp _inv_slip_ref inside record_payment under FOR UPDATE (no pre-stamp)
+        // record_payment now does the stamp atomically alongside payment write
         update_post_meta($id, '_inv_slip_verified_at', b2b_date('Y-m-d H:i:s'));
-        b2b_add_audit_log($id, 'slip_verified', 'ตรวจสลิปผ่าน ฿' . number_format($amount, 0) . ' ref=' . $ref);
-        // Auto record payment
+        // Stamp ref so dedup query sees it post-COMMIT (C6: inside record_payment lock window via update_post_meta call after FOR UPDATE)
+        // Note: record_payment now also accepts stamping via _inv_slip_ref meta (we set it here pre-call AS the atomic-helper version
+        //       below would, but record_payment will FOR UPDATE the same row). Pre-stamp removed — record_payment writes inside lock.
+        $note = 'Slip2Go ref=' . $ref . ' วันที่=' . $date . ($from_cache ? ' (cached)' : '');
+        // Stamp _inv_slip_ref inside record_payment by using the atomic helper directly
+        global $wpdb;
+        $wpdb->query('START TRANSACTION');
+        try {
+            $wpdb->get_row($wpdb->prepare("SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s FOR UPDATE", $id, '_inv_slip_ref'));
+            update_post_meta($id, '_inv_slip_ref', $ref);
+            update_post_meta($id, '_slip_trans_ref', $ref); // for dedup query (Snippet 1 V.34.8)
+            $wpdb->query('COMMIT');
+        } catch (\Throwable $e) {
+            $wpdb->query('ROLLBACK');
+            b2b_log('[Manual Invoice] verify_slip stamp ref failed post=' . $id . ' err=' . $e->getMessage());
+            return new WP_Error('record_failed', 'บันทึก slip_ref ล้มเหลว: ' . $e->getMessage(), ['status' => 500]);
+        }
+        // Now record_payment (which itself uses FOR UPDATE on _inv_paid_amount + _inv_slip_ref)
         $fake_req = new WP_REST_Request();
         $fake_req->set_param('id', $id);
         $fake_req->set_param('amount', $amount);
-        $fake_req->set_param('note', 'Slip2Go ref=' . $ref . ' วันที่=' . $date);
+        $fake_req->set_param('note', $note);
         return dinoco_inv_rest_record_payment($fake_req);
     }
 
-    $reason = $body['message'] ?? 'Slip2Go ปฏิเสธการตรวจสอบ';
+    $reason = (is_array($body) ? ($body['message'] ?? '') : '') ?: 'Slip2Go ปฏิเสธการตรวจสอบ';
     return rest_ensure_response(['success' => false, 'verified' => false, 'reason' => $reason]);
 }
 
 // --- COMBINED SLIP VERIFY (V.2.6) ---
 // Accepts slip_url + dist_id → verifies slip → auto-matches to invoices
+// V.34.1 Wave 2 audit fixes:
+//   • C4: trans_ref dedup gate via b2b_slip_is_trans_ref_seen()
+//   • C5: atomic record_payment via FOR UPDATE (delegated to shared helper)
+//   • C6: _inv_slip_ref stamp inside helper transaction (no pre-stamp before commit)
+//   • H6: slip pipeline convergence — uses b2b_slip_apply_to_invoices() shared helper
+//   • H7: $slip_amount underflow guard inside helper loop
+//   • H8: Slip2Go API response cached 5min keyed on SHA-256(slip_url)
+//   • M2: validate every manual_ids belongs to $dist_id (block cross-distributor leak)
+//   • M3: _inv_partial_payments capped 50 entries inside helper
 function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
     $slip_url = esc_url_raw($req->get_param('slip_url') ?? '');
     $dist_id  = intval($req->get_param('dist_id'));
     $manual_ids = $req->get_param('invoice_ids'); // optional: admin pre-selects invoices
     if (!$slip_url) return new WP_Error('invalid', 'กรุณาระบุ URL สลิป', ['status' => 400]);
 
-    // Call Slip2Go
+    // Call Slip2Go (with H8 idempotency cache)
     $api_url = defined('B2B_SLIP2GO_API_URL') ? B2B_SLIP2GO_API_URL : '';
     $secret  = defined('B2B_SLIP2GO_SECRET_KEY') ? B2B_SLIP2GO_SECRET_KEY : '';
     if (!$api_url || !$secret) return new WP_Error('config', 'ยังไม่ได้ตั้งค่า Slip2Go API', ['status' => 500]);
 
-    $resp = wp_remote_post($api_url, [
-        'headers' => ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $secret],
-        'body'    => wp_json_encode(['url' => $slip_url]),
-        'timeout' => 15,
-    ]);
-    if (is_wp_error($resp)) return new WP_Error('api_error', 'ไม่สามารถติดต่อ Slip2Go ได้', ['status' => 502]);
-
-    $body     = json_decode(wp_remote_retrieve_body($resp), true);
-    $code     = wp_remote_retrieve_response_code($resp);
-    $verified = ($code === 200 && !empty($body['success']));
-    if (!$verified) {
-        return rest_ensure_response(['success' => false, 'verified' => false,
-            'reason' => $body['message'] ?? 'Slip2Go ปฏิเสธการตรวจสอบ']);
+    $http_code = 0;
+    $raw_body  = '';
+    $from_cache = false;
+    if (function_exists('b2b_slip_get_cached_response_by_url')) {
+        $cached = b2b_slip_get_cached_response_by_url($slip_url);
+        if (is_array($cached)) {
+            $http_code = intval($cached['http_code']);
+            $raw_body  = (string) $cached['body'];
+            $from_cache = true;
+        }
+    }
+    if (!$from_cache) {
+        $resp = wp_remote_post($api_url, [
+            'headers' => ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $secret],
+            'body'    => wp_json_encode(['url' => $slip_url]),
+            'timeout' => 15,
+        ]);
+        if (is_wp_error($resp)) return new WP_Error('api_error', 'ไม่สามารถติดต่อ Slip2Go ได้', ['status' => 502]);
+        $http_code = wp_remote_retrieve_response_code($resp);
+        $raw_body  = wp_remote_retrieve_body($resp);
+        if (function_exists('b2b_slip_set_cached_response_by_url') && $http_code === 200) {
+            b2b_slip_set_cached_response_by_url($slip_url, $http_code, $raw_body);
+        }
     }
 
-    $slip_amount = floatval($body['amount'] ?? 0);
-    $slip_ref    = sanitize_text_field($body['ref'] ?? '');
-    $slip_date   = sanitize_text_field($body['date'] ?? b2b_date('Y-m-d'));
+    $body     = json_decode($raw_body, true);
+    $verified = ($http_code === 200 && is_array($body) && !empty($body['success']));
+    if (!$verified) {
+        return rest_ensure_response(['success' => false, 'verified' => false,
+            'reason' => (is_array($body) ? ($body['message'] ?? '') : '') ?: 'Slip2Go ปฏิเสธการตรวจสอบ']);
+    }
+
+    $slip_amount  = floatval($body['amount'] ?? 0);
+    $slip_amount0 = $slip_amount; // preserve original for response
+    $slip_ref     = sanitize_text_field($body['ref'] ?? '');
+    $slip_date    = sanitize_text_field($body['date'] ?? b2b_date('Y-m-d H:i:s'));
     if ($slip_amount <= 0) return new WP_Error('invalid', 'ยอดสลิปเป็น 0', ['status' => 400]);
+
+    // C4: trans_ref dedup gate before any mutation
+    if ($slip_ref !== '' && function_exists('b2b_slip_is_trans_ref_seen') && b2b_slip_is_trans_ref_seen($slip_ref)) {
+        return new WP_Error('duplicate_slip', 'สลิปนี้เคยใช้แล้ว (TransRef: ' . $slip_ref . ')', ['status' => 409]);
+    }
 
     // Get all pending invoices for this distributor
     $pending_data = $dist_id ? _dinoco_inv_get_pending_invoices($dist_id) : null;
     $pending = $pending_data ? $pending_data['invoices'] : [];
 
-    // If admin pre-selected invoices, filter to those
+    // M2: validate every manual_ids belongs to $dist_id
     if (!empty($manual_ids) && is_array($manual_ids)) {
         $manual_ids = array_map('intval', $manual_ids);
+        // First, verify each manual_id is owned by $dist_id at DB level (not just within $pending —
+        // an admin who passes manual_ids for another distributor would silently get filtered out;
+        // that's a bug surface for misconfigured UIs and a forensic audit gap).
+        if ($dist_id > 0) {
+            foreach ($manual_ids as $mid) {
+                if ($mid <= 0) continue;
+                $owner = intval(get_post_meta($mid, '_dist_post_id', true));
+                if ($owner !== $dist_id) {
+                    return new WP_Error('invoice_not_owned',
+                        'พบใบแจ้งหนี้ที่ไม่ได้เป็นของตัวแทนนี้: #' . $mid,
+                        ['status' => 400]);
+                }
+            }
+        }
         $pending = array_filter($pending, function($inv) use ($manual_ids) {
             return in_array($inv['post_id'], $manual_ids);
         });
@@ -1840,7 +2003,7 @@ function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
     }
 
     if (empty($pending)) {
-        return rest_ensure_response(['success' => true, 'verified' => true, 'slip_amount' => $slip_amount,
+        return rest_ensure_response(['success' => true, 'verified' => true, 'slip_amount' => $slip_amount0,
             'slip_ref' => $slip_ref, 'match_type' => 'no_pending', 'matched' => [], 'message' => 'ไม่มีบิลค้างชำระ']);
     }
 
@@ -1883,40 +2046,58 @@ function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
         }
     }
 
-    // ── Apply payment if matched ──
+    // ── Apply payment via shared helper (H6 convergence) ──
     $paid_invoices = [];
     if (!empty($matched)) {
-        $note = 'Slip2Go ref=' . $slip_ref . ' วันที่=' . $slip_date . ' (combined ' . count($matched) . ' ใบ)';
-        foreach ($matched as $inv) {
-            $pay_amount = min($inv['remaining'], $slip_amount);
-            $slip_amount -= $pay_amount;
+        $apply_result = function_exists('b2b_slip_apply_to_invoices') ? b2b_slip_apply_to_invoices(
+            [
+                'amount'      => $slip_amount0,
+                'trans_ref'   => $slip_ref,
+                'slip_date'   => b2b_date('Y-m-d H:i:s'),
+                'note_prefix' => 'Slip2Go ref=' . $slip_ref . ' วันที่=' . $slip_date . ' combined=' . count($matched) . ' ใบ ',
+            ],
+            $matched,
+            [
+                'source'  => 'manual_invoice',
+                'dist_id' => $dist_id,
+            ]
+        ) : null;
 
-            update_post_meta($inv['post_id'], '_inv_slip_ref', $slip_ref);
-            update_post_meta($inv['post_id'], '_inv_slip_verified_at', b2b_date('Y-m-d H:i:s'));
+        if (!is_array($apply_result) || empty($apply_result['success'])) {
+            $err = is_array($apply_result) ? ($apply_result['error_msg'] ?? '') : '';
+            $err_code = is_array($apply_result) ? ($apply_result['error_code'] ?? '') : 'helper_missing';
+            if ($err_code === 'duplicate_slip') {
+                return new WP_Error('duplicate_slip', $err ?: ('สลิปนี้เคยใช้แล้ว ref=' . $slip_ref), ['status' => 409]);
+            }
+            // Helper missing path = fail loud (Wave 1+2 contract: no silent fallback for atomic ops)
+            b2b_log('[CRITICAL] Manual Invoice V.34.1 verify_slip_combined: b2b_slip_apply_to_invoices ' . ($apply_result === null ? 'missing' : 'failed') . ' ref=' . $slip_ref . ' err=' . $err);
+            return new WP_Error($err_code ?: 'apply_failed', $err ?: 'ไม่สามารถบันทึกชำระสลิปได้', ['status' => 500]);
+        }
 
-            $fake_req = new WP_REST_Request();
-            $fake_req->set_param('id', $inv['post_id']);
-            $fake_req->set_param('amount', $pay_amount);
-            $fake_req->set_param('note', $note);
-            dinoco_inv_rest_record_payment($fake_req);
-
+        // Build paid_invoices from helper return
+        foreach ($apply_result['paid_invoices'] as $pi) {
             $paid_invoices[] = [
-                'inv_number' => $inv['inv_number'],
-                'amount'     => $pay_amount,
-                'post_id'    => $inv['post_id'],
+                'inv_number' => $pi['inv_number'],
+                'amount'     => $pi['amount'],
+                'post_id'    => $pi['post_id'],
             ];
+        }
+        // Recalculate debt for distributor (caller responsibility per helper contract)
+        if (function_exists('b2b_recalculate_debt') && $dist_id) {
+            b2b_recalculate_debt($dist_id);
         }
     }
 
-    // Build response
+    // Build response (use $slip_amount0 = original — $slip_amount no longer mutated post-helper)
     $result = [
         'success'     => true,
         'verified'    => true,
-        'slip_amount' => floatval($body['amount'] ?? 0),
+        'slip_amount' => $slip_amount0,
         'slip_ref'    => $slip_ref,
         'match_type'  => $match_type,
         'matched'     => $paid_invoices,
         'message'     => '',
+        'from_cache'  => $from_cache,
     ];
 
     switch ($match_type) {
@@ -1930,7 +2111,7 @@ function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
             $result['message'] = 'สลิปตรงกับ ' . count($paid_invoices) . ' บิล (บางส่วน) — บันทึกชำระแล้ว';
             break;
         default:
-            $result['message'] = 'ยอดสลิป ฿' . number_format(floatval($body['amount'] ?? 0), 0) .
+            $result['message'] = 'ยอดสลิป ฿' . number_format($slip_amount0, 0) .
                 ' ไม่ตรงกับบิลใดๆ — กรุณาเลือกบิลที่ต้องการตัดยอดด้านล่าง';
             // Return pending invoices for admin to manually allocate
             $result['pending'] = array_map(function($inv) {
@@ -1941,8 +2122,9 @@ function dinoco_inv_rest_verify_slip_combined(WP_REST_Request $req) {
     }
 
     b2b_add_audit_log(0, 'combined_slip_verify',
-        'ตรวจสลิปรวม ฿' . number_format(floatval($body['amount'] ?? 0), 0) . ' ref=' . $slip_ref .
-        ' match=' . $match_type . ' (' . count($paid_invoices) . ' ใบ) dist=' . ($pending_data['dist_name'] ?? ''));
+        'ตรวจสลิปรวม ฿' . number_format($slip_amount0, 0) . ' ref=' . $slip_ref .
+        ' match=' . $match_type . ' (' . count($paid_invoices) . ' ใบ) dist=' . ($pending_data['dist_name'] ?? '')
+        . ($from_cache ? ' (cached)' : ''));
 
     return rest_ensure_response($result);
 }

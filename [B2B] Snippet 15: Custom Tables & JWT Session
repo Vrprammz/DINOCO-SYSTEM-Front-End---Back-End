@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.8 (2026-04-24) — Wave 4 MED-M7 stock invariant monitoring cron:                      ║
+ * ║    NEW `dinoco_stock_invariant_cron` (twicedaily) compares master                                  ║
+ * ║         `wp_dinoco_products.stock_qty` vs SUM(warehouse_stock) per SKU.                            ║
+ * ║         When drift detected (Wave 3 V.8.7 fixed known sources but new bugs may slip):              ║
+ * ║         (a) push admin alert (Telegram + LINE — 6h dedup transient)                                ║
+ * ║         (b) persist last 50 violations to `_dinoco_stock_invariant_violations` wp_option           ║
+ * ║         (c) log to `b2b_log()`. Bounded LIMIT 100 query, COUNT(*) probe before alert.              ║
+ * ║         Helper `dinoco_run_stock_invariant_check()` callable for ad-hoc audits.                    ║
  * ║  Version: V.8.7 (2026-04-24) — Wave 3 HIGH H9+H10 inventory invariant:                             ║
  * ║    H9 — `dinoco_stock_subtract()` warehouse_stock asymmetry: existing code only                    ║
  * ║         updated row when row existed; missing-row case silently skipped → drift between            ║
@@ -2594,6 +2602,128 @@ add_action( 'dinoco_dip_stock_expire_cron', function () {
         }
     }
 } );
+
+// ════════════════════════════════════════════════════════════
+// PART 1.55: STOCK INVARIANT MONITORING CRON (V.8.8 — Wave 4 MED-M7)
+// ════════════════════════════════════════════════════════════
+//
+// Goal: detect drift between master stock (`wp_dinoco_products.stock_qty`)
+// and warehouse sum (`SUM(wp_dinoco_warehouse_stock.stock_qty)`). Wave 3
+// V.8.7 fixed the two known drift sources (subtract asymmetry + transfer
+// reconcile), but new bugs may slip in. This cron runs twice a day,
+// flags any rows where master != SUM(warehouse), pushes Telegram/LINE
+// alert (deduplicated per 6h transient), and stores the last 50 violation
+// snapshots to `_dinoco_stock_invariant_violations` for admin review.
+//
+// Hook: dinoco_stock_invariant_cron (twicedaily)
+// Dedup: transient `dinoco_stock_invariant_alerted` (6h TTL)
+// Storage: wp_options `_dinoco_stock_invariant_violations` (last 50)
+
+add_action( 'init', function () {
+    if ( ! wp_next_scheduled( 'dinoco_stock_invariant_cron' ) ) {
+        wp_schedule_event( time(), 'twicedaily', 'dinoco_stock_invariant_cron' );
+    }
+} );
+
+add_action( 'dinoco_stock_invariant_cron', 'dinoco_run_stock_invariant_check' );
+
+if ( ! function_exists( 'dinoco_run_stock_invariant_check' ) ) {
+    /**
+     * Compare master stock vs SUM(warehouse_stock) and flag drift.
+     * Idempotent — safe to invoke manually for ad-hoc audits.
+     *
+     * @return array { checked: int, violations: array, alerted: bool }
+     */
+    function dinoco_run_stock_invariant_check() {
+        global $wpdb;
+        $prod_table = $wpdb->prefix . 'dinoco_products';
+        $whs_table  = $wpdb->prefix . 'dinoco_warehouse_stock';
+
+        // Guard: tables must exist (fresh install pre-migration)
+        $prod_exists = $wpdb->get_var( "SHOW TABLES LIKE '{$prod_table}'" );
+        $whs_exists  = $wpdb->get_var( "SHOW TABLES LIKE '{$whs_table}'" );
+        if ( ! $prod_exists || ! $whs_exists ) {
+            return array( 'checked' => 0, 'violations' => array(), 'alerted' => false );
+        }
+
+        // Single SQL: detect drift rows. Limit 100 to bound memory + alert size.
+        // utf8mb4_bin collation on sku — JOIN by exact case match.
+        $rows = $wpdb->get_results(
+            "SELECT p.sku,
+                    p.stock_qty AS master_qty,
+                    COALESCE( SUM( w.stock_qty ), 0 ) AS warehouse_sum
+             FROM {$prod_table} p
+             LEFT JOIN {$whs_table} w ON w.sku = p.sku
+             WHERE p.is_active = 1
+             GROUP BY p.sku, p.stock_qty
+             HAVING master_qty != warehouse_sum
+             LIMIT 100",
+            ARRAY_A
+        );
+
+        $checked    = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$prod_table} WHERE is_active = 1" );
+        $violations = array();
+        if ( is_array( $rows ) ) {
+            foreach ( $rows as $r ) {
+                $violations[] = array(
+                    'sku'          => (string) $r['sku'],
+                    'master_qty'   => (int) $r['master_qty'],
+                    'warehouse_sum'=> (int) $r['warehouse_sum'],
+                    'diff'         => (int) $r['master_qty'] - (int) $r['warehouse_sum'],
+                    'detected_at'  => current_time( 'mysql' ),
+                );
+            }
+        }
+
+        // Persist last 50 violations (rolling) for admin review
+        if ( ! empty( $violations ) ) {
+            $existing = get_option( '_dinoco_stock_invariant_violations', array() );
+            if ( ! is_array( $existing ) ) $existing = array();
+            $merged = array_merge( $violations, $existing );
+            $merged = array_slice( $merged, 0, 50 );
+            update_option( '_dinoco_stock_invariant_violations', $merged, false );
+        }
+
+        // Dedup alert: transient 6h
+        $alerted = false;
+        if ( ! empty( $violations ) && ! get_transient( 'dinoco_stock_invariant_alerted' ) ) {
+            $count = count( $violations );
+            $sample_lines = array();
+            $sample_count = min( 5, $count );
+            for ( $i = 0; $i < $sample_count; $i++ ) {
+                $v = $violations[ $i ];
+                $sign = $v['diff'] > 0 ? '+' : '';
+                $sample_lines[] = "- {$v['sku']}: master={$v['master_qty']} sum={$v['warehouse_sum']} ({$sign}{$v['diff']})";
+            }
+            $extras = $count > 5 ? "\n...อีก " . ( $count - 5 ) . " SKU" : '';
+            $msg = "⚠️ Stock Invariant Drift\n"
+                 . "พบ {$count} SKU ที่ master_qty ≠ SUM(warehouse_stock):\n"
+                 . implode( "\n", $sample_lines )
+                 . $extras
+                 . "\nดูทั้งหมดใน Admin → Inventory (V.8.8 audit log)";
+
+            // Prefer b2b_push_to_admin (Telegram + LINE multiplex when available)
+            if ( function_exists( 'b2b_push_to_admin' ) ) {
+                b2b_push_to_admin( $msg );
+            } elseif ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_line_push' ) ) {
+                b2b_line_push( B2B_ADMIN_GROUP_ID, $msg );
+            }
+
+            set_transient( 'dinoco_stock_invariant_alerted', 1, 6 * HOUR_IN_SECONDS );
+            $alerted = true;
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Stock Invariant] DRIFT detected count=' . $count . ' first_sku=' . $violations[0]['sku'] );
+            }
+        }
+
+        return array(
+            'checked'    => $checked,
+            'violations' => $violations,
+            'alerted'    => $alerted,
+        );
+    }
+}
 
 // ════════════════════════════════════════════
 // PART 2: JWT-LIKE SESSION TOKENS (HMAC-based)

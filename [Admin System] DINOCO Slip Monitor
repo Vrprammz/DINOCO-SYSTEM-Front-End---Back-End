@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.6 (2026-04-28) — Wave 2 audit Round 2 H3:                ║
+ * ║    • H3: log_insert moved INSIDE the GET_LOCK window (was line 715      ║
+ * ║      AFTER RELEASE_LOCK at 711). Concurrent manual-process call could    ║
+ * ║      pass dedup check before the first call's slip_log row was committed,║
+ * ║      causing a small race window for double debt subtract on identical   ║
+ * ║      (dist_id, amount, trans_ref) tuples even with the GET_LOCK guard    ║
+ * ║      since dedup query reads slip_log table outside the named lock.      ║
+ * ║      Now: lock → debt_subtract → auto_mark_paid → recalc → log_insert →  ║
+ * ║      RELEASE_LOCK. log_insert commits its own atomic INSERT before       ║
+ * ║      release so any concurrent caller's dedup query sees committed       ║
+ * ║      trans_ref.                                                          ║
  * ║  Version: V.1.3 (2026-04-24) — Slip Replay Pool admin tools (CNX regression):           ║
  * ║    • NEW Admin Manual Process Tool — emergency bypass Slip2Go when API sticky 200501     ║
  * ║         (CNX case: slip cached after V.34.7 routing bug → Slip2Go refuses to re-read)   ║
@@ -649,6 +660,9 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
                 array( 'status' => 409 ) );
         }
 
+        // V.1.6 H3 FIX: $log_id declared outside try-block so post-release LINE notify can reference it
+        $log_id = 0;
+
         try {
             // Re-check dedup INSIDE the lock — first call wrote trans_ref, second call sees it
             if ( $trans_ref !== '' && function_exists( 'b2b_slip_is_trans_ref_seen' ) ) {
@@ -697,6 +711,33 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
             // Recalc from source of truth AFTER auto_mark_paid — otherwise still reads awaiting_payment orders
             $new_debt = function_exists( 'b2b_recalculate_debt' ) ? b2b_recalculate_debt( $dist_id )
                         : ( function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : $new_debt );
+
+            // V.1.6 H3 FIX (Wave 2 audit): log_insert MUST happen INSIDE the lock window so that
+            // a concurrent call's dedup check (b2b_slip_is_trans_ref_seen via slip_log table)
+            // sees this row. Previous order: lock release → log_insert → next call dedup miss.
+            // Now: log_insert → release. Log row commits its own transaction (atomic INSERT)
+            // before RELEASE_LOCK so dedup query in any concurrent caller sees committed trans_ref.
+            if ( function_exists( 'b2b_slip_log_insert' ) ) {
+                $log_id = (int) b2b_slip_log_insert( array(
+                    'group_id'      => $group_id,
+                    'message_id'    => 'MANUAL_' . $uid . '_' . time(),
+                    'user_id'       => (string) $uid,
+                    'dist_id'       => $dist_id,
+                    'slip_code'     => 'ADMIN',
+                    'amount'        => $amount,
+                    'trans_ref'     => $trans_ref,
+                    'sender_name'   => $sender_name,
+                    'result_status' => 'manual_admin_paid',
+                    'error_code'    => 'ADMIN_MANUAL',
+                    'error_msg'     => mb_substr( 'reason=' . $reason . ( $image_stored_url ? ' img=' . $image_stored_url : '' ), 0, 490 ),
+                    'http_code'     => null,
+                    'processing_time_ms' => null,
+                    'retry_count'   => 0,
+                    'image_hash'    => $image_hash ?: null,
+                    'image_mime'    => $image_mime ?: null,
+                    'slip2go_response' => null, // bypass → no API call
+                ) );
+            }
         } catch ( \Throwable $e ) {
             $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
             if ( function_exists( 'b2b_log' ) ) {
@@ -706,33 +747,10 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
                 array( 'status' => 500 ) );
         }
 
-        // Release lock BEFORE side-effects (log insert + LINE push) — those are idempotent-ish and
-        // taking ~1-2s to complete LINE API calls, blocking retry window unnecessarily
+        // V.1.6 H3 FIX: log_insert moved INSIDE try-block above (committed before RELEASE_LOCK).
+        // Release lock AFTER log_insert so dedup query sees the trans_ref. LINE side-effects below
+        // are still post-release (idempotent network calls — blocking retry window not justified).
         $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
-
-        // Audit log row — result_status='manual_admin_paid'
-        $log_id = 0;
-        if ( function_exists( 'b2b_slip_log_insert' ) ) {
-            $log_id = (int) b2b_slip_log_insert( array(
-                'group_id'      => $group_id,
-                'message_id'    => 'MANUAL_' . $uid . '_' . time(),
-                'user_id'       => (string) $uid,
-                'dist_id'       => $dist_id,
-                'slip_code'     => 'ADMIN',
-                'amount'        => $amount,
-                'trans_ref'     => $trans_ref,
-                'sender_name'   => $sender_name,
-                'result_status' => 'manual_admin_paid',
-                'error_code'    => 'ADMIN_MANUAL',
-                'error_msg'     => mb_substr( 'reason=' . $reason . ( $image_stored_url ? ' img=' . $image_stored_url : '' ), 0, 490 ),
-                'http_code'     => null,
-                'processing_time_ms' => null,
-                'retry_count'   => 0,
-                'image_hash'    => $image_hash ?: null,
-                'image_mime'    => $image_mime ?: null,
-                'slip2go_response' => null, // bypass → no API call
-            ) );
-        }
 
         // Notify LINE group (customer) + admin
         if ( function_exists( 'b2b_line_push' ) && $group_id !== '' ) {

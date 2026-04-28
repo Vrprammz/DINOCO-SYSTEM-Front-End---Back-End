@@ -1,6 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.13 (2026-04-28) — Wave 2 audit Round 2 — Slip Pipeline Convergence:    ║
+ * ║    • H6 NEW b2b_slip_apply_to_invoices($slip_data, $invoices, $context) — shared      ║
+ * ║         atomic helper used by Manual Invoice (verify_slip_combined) + future Snippet 2║
+ * ║         migration path. Single dedup point + single FOR UPDATE transaction per invoice║
+ * ║         + single record_payment pattern. Returns { success, paid_invoices, remaining, ║
+ * ║         overpaid, error_code }.                                                        ║
+ * ║    • C4 trans_ref dedup gate enforced INSIDE helper (was missing in Manual Invoice    ║
+ * ║         path — Snippet 2 already had it).                                              ║
+ * ║    • C5 atomic record_payment via FOR UPDATE on _inv_paid_amount + _inv_slip_ref      ║
+ * ║         meta rows + post row → mirror record_refund pattern. Concurrent admin clicks  ║
+ * ║         no longer race.                                                                ║
+ * ║    • C6 _inv_slip_ref stamp moved INSIDE the same transaction (post-FOR UPDATE) →     ║
+ * ║         no more TOCTOU forensic dedup false-positives.                                 ║
+ * ║    • H7 $slip_amount underflow guard inside loop (`if (rem ≤ 0.01) break`)            ║
+ * ║    • M3 _inv_partial_payments capped at last 50 entries inside helper                 ║
+ * ║    • H8 NEW b2b_slip_get/set_cached_response_by_url($slip_url, ...) — Slip2Go         ║
+ * ║         idempotency cache (5-min TTL transient keyed on SHA-256 of slip_url).         ║
+ * ║         Caller checks cache before wp_remote_post; populates after success.            ║
  * ║  Version: V.34.12 (2026-04-24) — Slip Replay Pool helpers (CNX regression):           ║
  * ║    • NEW b2b_slip_compute_image_hash($binary) — SHA-256 of raw slip bytes             ║
  * ║    • NEW b2b_slip_find_prior_payment($image_hash) — row ที่ใช้ hash เดียวกันและตัดหนี้ ║
@@ -1499,6 +1517,276 @@ if ( ! function_exists( 'b2b_slip_find_prior_rejection' ) ) {
             $image_hash
         ), ARRAY_A );
         return $row ? $row : null;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.34.13: WAVE 2 — SLIP PIPELINE CONVERGENCE (audit Round 2 H6)
+// Shared helper that BOTH the LINE-bot slip handler (Snippet 2) and the
+// Manual Invoice combined-slip endpoint can call. Single dedup point +
+// single atomic transaction wrapper + single record_payment pattern.
+//
+// Goals:
+//   • CRIT-C4: trans_ref dedup gate (currently only Snippet 2 + Slip Monitor honour it)
+//   • CRIT-C5: atomic record_payment via FOR UPDATE on _inv_paid_amount meta row
+//   • CRIT-C6: stamp _inv_slip_ref INSIDE the same transaction (post-FOR-UPDATE)
+//   • H6:   converge two parallel slip pipelines into one helper
+//   • H7:   $slip_amount underflow guard inside loop
+//
+// Behavioural contract:
+//   - Returns array { success, paid_invoices[], remaining_slip_amount, overpaid, error_code, error_msg }
+//   - On dedup hit → { success:false, error_code:'duplicate_slip', error_msg:'...' }
+//   - On invariant fail (no invoices) → { success:false, error_code:'no_invoices' }
+//   - Transaction wraps stamp + record_payment per invoice; failures roll back single invoice.
+//   - Caller is responsible for: Slip2Go API call, debt recalc post-helper, LINE notifications.
+// ═══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_slip_apply_to_invoices' ) ) {
+    /**
+     * Apply a verified slip to one or more invoices atomically.
+     * Replaces inline record_payment + stamp logic in Manual Invoice + (future) Snippet 2 paths.
+     *
+     * @param array $slip_data {
+     *     @type float  $amount        Slip amount THB (verified by caller via Slip2Go)
+     *     @type string $trans_ref     Bank trans_ref (used for dedup gate + stamp)
+     *     @type string $slip_date     YYYY-MM-DD H:i:s — defaults to now() Bangkok if empty
+     *     @type string $sender_name   Optional, for audit log
+     *     @type string $note_prefix   Audit note prefix (e.g., "Slip2Go ref=")
+     * }
+     * @param array $invoices  Array of invoice rows: [ { post_id, inv_number, total, paid, remaining }, ... ]
+     *                         Caller resolves these via _dinoco_inv_get_pending_invoices() or equivalent.
+     * @param array $context   Optional metadata for logging: { source: 'manual_invoice'|'line_bot'|'admin', dist_id, group_id }
+     *
+     * @return array {
+     *     @type bool    $success
+     *     @type string  $error_code      'duplicate_slip' | 'no_invoices' | 'no_dedup_helper' | 'record_failed'
+     *     @type string  $error_msg
+     *     @type array[] $paid_invoices   List of invoice rows with applied amount: { post_id, inv_number, amount }
+     *     @type float   $remaining       Slip amount left after applying to all matched invoices (≥ 0)
+     *     @type float   $overpaid        amount > sum(invoice remainings) → overpayment
+     * }
+     */
+    function b2b_slip_apply_to_invoices( $slip_data, $invoices, $context = array() ) {
+        global $wpdb;
+        $slip_amount = floatval( $slip_data['amount'] ?? 0 );
+        $trans_ref   = sanitize_text_field( $slip_data['trans_ref'] ?? '' );
+        $slip_date   = sanitize_text_field( $slip_data['slip_date'] ?? '' );
+        $note_prefix = sanitize_text_field( $slip_data['note_prefix'] ?? '' );
+        $source      = sanitize_text_field( $context['source'] ?? 'unknown' );
+
+        $result = array(
+            'success'        => false,
+            'error_code'     => '',
+            'error_msg'      => '',
+            'paid_invoices'  => array(),
+            'remaining'      => $slip_amount,
+            'overpaid'       => 0.0,
+        );
+
+        if ( $slip_amount <= 0 ) {
+            $result['error_code'] = 'invalid_amount';
+            $result['error_msg']  = 'ยอดสลิปต้องมากกว่า 0';
+            return $result;
+        }
+        if ( empty( $invoices ) || ! is_array( $invoices ) ) {
+            $result['error_code'] = 'no_invoices';
+            $result['error_msg']  = 'ไม่มีบิลค้างชำระ';
+            return $result;
+        }
+
+        // CRIT-C4: trans_ref dedup gate BEFORE any mutation
+        if ( $trans_ref !== '' ) {
+            if ( ! function_exists( 'b2b_slip_is_trans_ref_seen' ) ) {
+                $result['error_code'] = 'no_dedup_helper';
+                $result['error_msg']  = 'ระบบ dedup ยังไม่พร้อม (Snippet 1 helper missing)';
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[CRITICAL] b2b_slip_apply_to_invoices: b2b_slip_is_trans_ref_seen missing — refused to apply slip ref=' . $trans_ref . ' source=' . $source );
+                }
+                return $result;
+            }
+            if ( b2b_slip_is_trans_ref_seen( $trans_ref ) ) {
+                $result['error_code'] = 'duplicate_slip';
+                $result['error_msg']  = 'สลิปนี้เคยใช้แล้ว ref=' . $trans_ref;
+                return $result;
+            }
+        }
+
+        if ( $slip_date === '' && function_exists( 'b2b_date' ) ) {
+            $slip_date = b2b_date( 'Y-m-d H:i:s' );
+        }
+
+        $remaining_slip = $slip_amount;
+        $paid_log       = array();
+        $tolerance_eps  = 0.01; // 1 satang underflow guard (H7)
+
+        // CRIT-C5+C6: atomic per-invoice transaction. Wrap stamp + record_payment in single block.
+        foreach ( $invoices as $inv ) {
+            // H7: bound the loop — stop if remaining slip exhausted
+            if ( $remaining_slip <= $tolerance_eps ) break;
+
+            $post_id      = isset( $inv['post_id'] ) ? intval( $inv['post_id'] ) : 0;
+            $inv_number   = isset( $inv['inv_number'] ) ? (string) $inv['inv_number'] : '#' . $post_id;
+            $inv_remaining = floatval( $inv['remaining'] ?? 0 );
+            if ( $post_id <= 0 || $inv_remaining <= 0 ) continue;
+
+            $pay_amount = round( min( $inv_remaining, $remaining_slip ), 2 );
+            if ( $pay_amount <= 0 ) continue;
+
+            $applied = false;
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                // Lock the paid_amount + slip_ref meta rows + post row to serialize concurrent admins
+                $wpdb->get_row( $wpdb->prepare(
+                    "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s FOR UPDATE",
+                    $post_id, '_inv_paid_amount'
+                ) );
+                $wpdb->get_row( $wpdb->prepare(
+                    "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id=%d AND meta_key=%s FOR UPDATE",
+                    $post_id, '_inv_slip_ref'
+                ) );
+                $wpdb->get_row( $wpdb->prepare(
+                    "SELECT ID FROM {$wpdb->posts} WHERE ID=%d FOR UPDATE",
+                    $post_id
+                ) );
+
+                // Re-check status under lock (status may have flipped between caller's resolve and now)
+                $cur_status = function_exists( 'get_field' ) ? get_field( 'order_status', $post_id ) : '';
+                if ( $cur_status !== 'awaiting_payment' ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( '[Slip] apply_to_invoices: skip post=' . $post_id . ' status=' . $cur_status . ' (was awaiting_payment when caller resolved) ref=' . $trans_ref );
+                    }
+                    continue;
+                }
+
+                // CRIT-C6: stamp slip_ref FIRST inside lock (atomic with payment)
+                if ( $trans_ref !== '' ) {
+                    update_post_meta( $post_id, '_inv_slip_ref', $trans_ref );
+                    update_post_meta( $post_id, '_inv_slip_verified_at', $slip_date );
+                    update_post_meta( $post_id, '_slip_trans_ref', $trans_ref ); // for dedup query (Snippet 1 V.34.8)
+                }
+
+                // CRIT-C5: record_payment via direct meta update under lock (no callback to non-atomic path)
+                $paid_so_far = floatval( get_post_meta( $post_id, '_inv_paid_amount', true ) );
+                $new_paid    = round( $paid_so_far + $pay_amount, 2 );
+                $payments    = json_decode( get_post_meta( $post_id, '_inv_partial_payments', true ) ?: '[]', true );
+                if ( ! is_array( $payments ) ) $payments = array();
+                $payments[]  = array(
+                    'amount'    => $pay_amount,
+                    'date'      => function_exists( 'b2b_date' ) ? b2b_date( 'Y-m-d H:i:s' ) : current_time( 'mysql' ),
+                    'note'      => trim( $note_prefix . $trans_ref . ' (' . $source . ')' ),
+                    'trans_ref' => $trans_ref,
+                    'source'    => $source,
+                );
+                // M3: cap partial_payments at last 50 entries to bound JSON growth
+                if ( count( $payments ) > 50 ) $payments = array_slice( $payments, -50 );
+
+                update_post_meta( $post_id, '_inv_paid_amount', $new_paid );
+                update_post_meta( $post_id, '_inv_partial_payments', wp_json_encode( $payments, JSON_UNESCAPED_UNICODE ) );
+
+                // Status transition if fully paid
+                $inv_total = floatval( function_exists( 'get_field' ) ? get_field( 'total_amount', $post_id ) : 0 );
+                $is_full   = ( $inv_total > 0 && $new_paid >= $inv_total - $tolerance_eps );
+                if ( $is_full ) {
+                    if ( function_exists( 'b2b_set_order_status' ) ) {
+                        b2b_set_order_status( $post_id, 'paid' );
+                    } else {
+                        // Fail loud — FSM bypass forbidden
+                        $wpdb->query( 'ROLLBACK' );
+                        if ( function_exists( 'b2b_log' ) ) {
+                            b2b_log( '[CRITICAL] b2b_slip_apply_to_invoices: b2b_set_order_status missing — payment NOT applied for post=' . $post_id . ' ref=' . $trans_ref );
+                        }
+                        continue;
+                    }
+                    if ( function_exists( 'update_field' ) ) {
+                        update_field( 'is_billed', false, $post_id );
+                        update_field( 'paid_date', function_exists( 'b2b_date' ) ? b2b_date( 'Y-m-d H:i:s' ) : current_time( 'mysql' ), $post_id );
+                    }
+                }
+
+                $wpdb->query( 'COMMIT' );
+                $applied = true;
+
+                if ( function_exists( 'b2b_add_audit_log' ) ) {
+                    b2b_add_audit_log( $post_id,
+                        $is_full ? 'slip_payment_full' : 'slip_payment_partial',
+                        sprintf( '%s ฿%s (ref=%s, source=%s)',
+                            $is_full ? 'ชำระครบจากสลิป' : 'รับชำระจากสลิปบางส่วน',
+                            number_format( $pay_amount, 2 ), $trans_ref, $source
+                        )
+                    );
+                }
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[Slip] apply_to_invoices: post=' . $post_id . ' ref=' . $trans_ref . ' err=' . $e->getMessage() );
+                }
+                continue;
+            }
+
+            if ( $applied ) {
+                // H7: subtract AFTER successful apply, before next iteration
+                $remaining_slip = round( $remaining_slip - $pay_amount, 2 );
+                $paid_log[] = array(
+                    'post_id'    => $post_id,
+                    'inv_number' => $inv_number,
+                    'amount'     => $pay_amount,
+                );
+                // H7 underflow guard (paranoid — already covered by loop-top check)
+                if ( $remaining_slip <= $tolerance_eps ) break;
+            }
+        }
+
+        $result['success']       = ! empty( $paid_log );
+        $result['paid_invoices'] = $paid_log;
+        $result['remaining']     = max( 0.0, $remaining_slip );
+        $result['overpaid']      = max( 0.0, round( $remaining_slip, 2 ) ); // remaining = overpayment when caller's invoices exhausted
+        if ( ! $result['success'] && $result['error_code'] === '' ) {
+            $result['error_code'] = 'record_failed';
+            $result['error_msg']  = 'ไม่สามารถบันทึกชำระสลิปลงบิลใดๆ ได้';
+        }
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_get_cached_response_by_url' ) ) {
+    /**
+     * H8: Idempotency cache for Slip2Go API calls.
+     * Keyed on SHA-256(slip_url) — if the same URL is verified twice within 5 min,
+     * return cached response without re-billing Slip2Go quota.
+     *
+     * Uses transients (auto-expire), best-effort. Stores raw response body so
+     * caller can re-decode without losing fidelity.
+     *
+     * @param string $slip_url
+     * @return array|null { http_code:int, body:string } or null on miss
+     */
+    function b2b_slip_get_cached_response_by_url( $slip_url ) {
+        if ( empty( $slip_url ) ) return null;
+        $key = 'b2b_s2g_url_' . substr( hash( 'sha256', $slip_url ), 0, 32 );
+        $cached = get_transient( $key );
+        if ( ! is_array( $cached ) ) return null;
+        return $cached;
+    }
+}
+
+if ( ! function_exists( 'b2b_slip_set_cached_response_by_url' ) ) {
+    /**
+     * Companion of b2b_slip_get_cached_response_by_url. 5-min TTL.
+     * Caller passes the raw response (http_code + body string) — cache stores both.
+     *
+     * @param string $slip_url
+     * @param int    $http_code
+     * @param string $body
+     * @return void
+     */
+    function b2b_slip_set_cached_response_by_url( $slip_url, $http_code, $body ) {
+        if ( empty( $slip_url ) ) return;
+        $key = 'b2b_s2g_url_' . substr( hash( 'sha256', $slip_url ), 0, 32 );
+        set_transient( $key, array(
+            'http_code' => intval( $http_code ),
+            'body'      => (string) $body,
+            'cached_at' => time(),
+        ), 5 * MINUTE_IN_SECONDS );
     }
 }
 

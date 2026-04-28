@@ -1,5 +1,12 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.16 (2026-04-24) — Wave 4 MED-M9: idempotency_key on
+ *   /junction-confirm-classification. Mirrors /junction-bulk-update-display
+ *   pattern (5min TTL transient keyed by user + md5(key)). Frontend
+ *   `confirmAllUnconfirmed()` (B2F Snippet 5 V.7.9) generates UUID-like key
+ *   on click → double-click returns cached result instead of re-running
+ *   transaction (which would silently no-op due to row-level confirmation_status
+ *   short-circuit, but burned a DB roundtrip + counted toward 5/min rate limit).
  * Version: V.3.15 — Wave 3 HIGH-H13: mysqldump password leak via -p<value>.
  *   shell_exec mysqldump command embedded DB_PASSWORD as `-p<password>`, exposing it
  *   to any system user via `ps`/auditd/shell history. Fix: write credentials to a
@@ -3262,6 +3269,12 @@ add_action( 'rest_api_init', function () {
 
             $maker_id = intval( $req->get_param( 'maker_id' ) );
             $skus_raw = $req->get_param( 'skus' );
+            // V.3.16 (Wave 4 MED-M9): idempotency_key — mirror /junction-bulk-update-display.
+            //   Double-click on confirmAllUnconfirmed within 5min returns cached result
+            //   instead of running second transaction (which would be safe due to row-level
+            //   `confirmation_status='confirmed'` short-circuit, but the audit log + DB roundtrip
+            //   are wasteful and could trigger 429 rate limit).
+            $idem_key = sanitize_text_field( (string) $req->get_param( 'idempotency_key' ) );
 
             if ( ! $maker_id ) {
                 return new WP_Error( 'bad_maker', 'maker_id required', array( 'status' => 400 ) );
@@ -3284,6 +3297,21 @@ add_action( 'rest_api_init', function () {
             }
             if ( empty( $skus ) ) {
                 return new WP_Error( 'no_skus', 'no valid SKUs after normalization', array( 'status' => 400 ) );
+            }
+
+            // Idempotency check — 5min TTL transient keyed by user + key hash
+            if ( $idem_key !== '' ) {
+                $tkey = 'b2f_confirm_idem_' . get_current_user_id() . '_' . md5( $idem_key );
+                $prev = get_transient( $tkey );
+                if ( $prev !== false ) {
+                    return rest_ensure_response( array(
+                        'success'           => true,
+                        'confirmed_count'   => isset( $prev['confirmed_count'] ) ? (int) $prev['confirmed_count'] : 0,
+                        'already_confirmed' => isset( $prev['already_confirmed'] ) ? (array) $prev['already_confirmed'] : array(),
+                        'skipped'           => isset( $prev['skipped'] ) ? (array) $prev['skipped'] : array(),
+                        'cached'            => true,
+                    ) );
+                }
             }
 
             global $wpdb;
@@ -3373,12 +3401,20 @@ add_action( 'rest_api_init', function () {
                 ) );
             }
 
-            return rest_ensure_response( array(
+            $result = array(
                 'success'         => true,
                 'confirmed_count' => $confirmed_count,
                 'already_confirmed' => $already,
                 'skipped'         => $skipped,
-            ) );
+            );
+
+            // V.3.16 (Wave 4 MED-M9): cache result for idempotency replay (5min TTL)
+            if ( $idem_key !== '' ) {
+                $tkey = 'b2f_confirm_idem_' . get_current_user_id() . '_' . md5( $idem_key );
+                set_transient( $tkey, $result, 5 * MINUTE_IN_SECONDS );
+            }
+
+            return rest_ensure_response( $result );
         },
     ) );
 
