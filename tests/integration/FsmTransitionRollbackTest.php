@@ -33,7 +33,7 @@ final class FsmTransitionRollbackTest extends DinocoIntegrationTestCase {
     /** @var int test order post ID */
     private int $order_id;
 
-    protected function set_up(): void {
+    public function set_up(): void {
         parent::set_up();
         $this->load_fixture( 'seed-distributors.sql' );
 

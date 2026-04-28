@@ -158,9 +158,13 @@ abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
 
     /**
      * tear_down — TRUNCATE DINOCO custom tables + clean test snippets.
-     * WordPress core tables are rolled back automatically by Yoast TestCase.
+     * WordPress core tables are rolled back automatically by WP_UnitTestCase_Base.
+     *
+     * Must be PUBLIC (not protected) — WP_UnitTestCase_Base declares it public
+     * via phpunit-polyfills set_up/tear_down camelCase shim and PHP enforces
+     * matching visibility on overrides.
      */
-    protected function tear_down(): void {
+    public function tear_down(): void {
         global $wpdb;
 
         foreach ( $this->dinoco_tables as $t ) {

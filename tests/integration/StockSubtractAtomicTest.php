@@ -31,7 +31,7 @@ namespace DinocoTests\Integration;
 
 final class StockSubtractAtomicTest extends DinocoIntegrationTestCase {
 
-    protected function set_up(): void {
+    public function set_up(): void {
         parent::set_up();
         $this->load_fixture( 'seed-products-hierarchy.sql' );
 

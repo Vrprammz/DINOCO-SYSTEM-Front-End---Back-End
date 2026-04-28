@@ -29,7 +29,7 @@ namespace DinocoTests\Integration;
 
 final class RestNonceGateTest extends DinocoIntegrationTestCase {
 
-    protected function set_up(): void {
+    public function set_up(): void {
         parent::set_up();
         $this->load_fixture( 'seed-distributors.sql' );
 
