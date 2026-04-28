@@ -29,7 +29,7 @@ Each has its own PHPUnit config:
 composer install
 ```
 
-This pulls `yoast/wp-test-utils`, `yoast/phpunit-polyfills`, and `brain/monkey` (dev-only).
+This pulls `phpunit/phpunit ^10.0` and `yoast/phpunit-polyfills ^2.0` (dev-only). The base test case extends `WP_UnitTestCase` from wordpress-develop directly — no yoast/wp-test-utils wrapper needed (and that package only supports PHPUnit ≤ 9 anyway).
 
 ### 2. Create the test database
 

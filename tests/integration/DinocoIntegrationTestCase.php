@@ -2,11 +2,15 @@
 /**
  * DinocoIntegrationTestCase — base class for Phase 5 integration tests.
  *
- * Extends Yoast WPIntegration\TestCase (which extends WP_UnitTestCase from
- * wordpress-develop) so each test gets:
+ * Extends WP_UnitTestCase from wordpress-develop directly so each test gets:
  *   - Real WordPress runtime with database
  *   - Per-test transaction rollback (no manual cleanup needed for core tables)
  *   - WP factory helpers ($this->factory->user, $this->factory->post, etc.)
+ *
+ * Why not yoast/wp-test-utils: that wrapper requires PHPUnit ^9.0 which
+ * conflicts with our PHPUnit ^10.0. WP_UnitTestCase from wordpress-develop
+ * is the underlying class anyway and works directly with PHPUnit 10 + the
+ * phpunit-polyfills shim that ships with the WP test suite.
  *
  * Adds DINOCO-specific helpers:
  *   - seed_snippet()        — INSERT a snippet body into wp_snippets
@@ -20,9 +24,10 @@ declare( strict_types=1 );
 
 namespace DinocoTests\Integration;
 
-use Yoast\WPTestUtils\WPIntegration\TestCase;
-
-abstract class DinocoIntegrationTestCase extends TestCase {
+// WP_UnitTestCase lives in the global namespace and is loaded by
+// wordpress-develop's includes/bootstrap.php (required from
+// tests/integration/bootstrap.php BEFORE this file is autoloaded).
+abstract class DinocoIntegrationTestCase extends \WP_UnitTestCase {
 
     /**
      * Tables truncated in tear_down(). Matches DINOCO custom tables defined in
