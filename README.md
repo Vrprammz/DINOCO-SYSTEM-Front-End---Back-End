@@ -29,6 +29,15 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 
 ## Testing
 
+### Quick start — run everything locally
+
+```bash
+npm run test:all              # alias for ci:local
+npm run test:all -- --skip-php   # frontend only (no PHP/MySQL needed)
+```
+
+Runs the same gates GitHub Actions runs (ESLint → typecheck → Jest → Vite build → bundle-size → npm audit → PHPUnit if available). Fail-fast, ~3s for frontend-only.
+
 ### Backend (PHP / WordPress)
 
 ```bash
