@@ -14,7 +14,6 @@ import { initLiff, closeLiff } from "../../liff-src/shared/liff-init.js";
 
 describe("initLiff", () => {
     let originalLiff;
-    let originalLocation;
 
     beforeEach(() => {
         originalLiff = window.liff;

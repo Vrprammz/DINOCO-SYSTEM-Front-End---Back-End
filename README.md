@@ -46,12 +46,16 @@ See [docs/runbooks/TESTING-PHASE-5.md](docs/runbooks/TESTING-PHASE-5.md) for set
 ### Frontend (LIFF / JavaScript)
 
 ```bash
-# Jest unit tests for liff-src/shared/ (95 tests, < 1s)
+# ESLint (catches undefined refs, unused vars, eq inconsistency)
+npm run lint
+npm run lint:fix             # auto-fix where possible
+
+# Jest unit tests for liff-src/shared/ + OpenAPI spec validation (104 tests, < 1s)
 npm test
 npm run test:jest:coverage   # generate coverage/jest/
 ```
 
-Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-function modules with mocked fetch + window.liff. See [docs/runbooks/TESTING-PHASE-6.md](docs/runbooks/TESTING-PHASE-6.md).
+Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-function modules with mocked fetch + window.liff. ESLint also runs on every push via the same CI workflow. See [docs/runbooks/TESTING-PHASE-6.md](docs/runbooks/TESTING-PHASE-6.md).
 
 ### Test counts
 

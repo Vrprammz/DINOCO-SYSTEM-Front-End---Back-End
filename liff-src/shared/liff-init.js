@@ -13,7 +13,7 @@
  * (LINE strips query string from deep-links otherwise — see
  * B2B Snippet 4 V.30.4 for original fix).
  */
-export async function initLiff(liffId, { withLoginState = true } = {}) {
+export async function initLiff(liffId) {
     if (typeof window === "undefined") {
         throw new Error("LIFF init called in non-browser context");
     }
@@ -26,8 +26,8 @@ export async function initLiff(liffId, { withLoginState = true } = {}) {
     await window.liff.init({ liffId });
 
     if (!window.liff.isLoggedIn()) {
-        const params = new URLSearchParams(window.location.search);
-        const state = withLoginState ? params.toString() : "";
+        // window.location.href carries the full URL including query string,
+        // so LINE preserves params on redirect-back (B2B Snippet 4 V.30.4 pattern).
         window.liff.login({ redirectUri: window.location.href });
         // login() redirects — caller code beyond here does not execute
         return null;

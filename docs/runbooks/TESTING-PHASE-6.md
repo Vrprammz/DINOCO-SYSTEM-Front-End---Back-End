@@ -23,8 +23,12 @@ Total: **104 tests, < 1s**. Code coverage: **95.8% stmts / 84.8% branches / 90.9
 ## Local development
 
 ```bash
-# One-time install (Jest + jsdom + Babel)
+# One-time install (ESLint + Jest + jsdom + Babel)
 npm install
+
+# Lint (catches undefined refs, unused vars, eq inconsistency)
+npm run lint
+npm run lint:fix               # auto-fix where possible
 
 # Run all tests
 npm test                       # alias for `jest`
@@ -35,6 +39,8 @@ npm run test:jest:coverage     # generate coverage/jest/
 # Run a specific file
 npx jest tests/jest/cart.test.js
 ```
+
+ESLint config: `eslint.config.js` (flat config, ESLint 9+). Scopes to `liff-src/` + `tests/jest/` only — does NOT lint inline JS in WP snippets (PHP files; not parseable as JS).
 
 Test files live in `tests/jest/*.test.js`. The Jest matcher is configured in `jest.config.js`:
 
