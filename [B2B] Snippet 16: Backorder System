@@ -1,6 +1,10 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.2.5 (2026-04-24) — Phase 4f: 5 BO crons (restock_scan, eta_warn,            ║
+ * ║                   pending_review_expire, enumeration_scan, attempt_log_cleanup) hoisted ║
+ * ║                   from inline closures to named handlers + registered via               ║
+ * ║                   dinoco_register_cron heartbeat tracking.                              ║
  * ║  Version: V.2.4 (2026-04-24) — Phase 4e Module Registry adoption (Pillar 1):            ║
  * ║                   Self-register 3 admin tabs via dinoco_register_admin_module():        ║
  * ║                     - backorders      → [b2b_bo_admin]        section=b2b cache_ttl=120 ║
@@ -2396,7 +2400,9 @@ add_filter( 'cron_schedules', function( $schedules ) {
     return $schedules;
 } );
 
-// 5.2 — Schedule on init
+// 5.2 — Schedule on init + register heartbeat tracking
+// V.2.5 Phase 4f: closures hoisted to named handlers (b2b_bo_run_*) + registered via
+// dinoco_register_cron when Health Monitor available; legacy add_action fallback otherwise.
 add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'b2b_bo_restock_scan_cron' ) ) {
         wp_schedule_event( time() + 60, 'every_15min_b2b_bo', 'b2b_bo_restock_scan_cron' );
@@ -2413,131 +2419,158 @@ add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'b2b_bo_attempt_log_cleanup_cron' ) ) {
         wp_schedule_event( strtotime( 'tomorrow 03:00' ), 'daily', 'b2b_bo_attempt_log_cleanup_cron' );
     }
-} );
 
-// 5.3 — Cron handlers
-
-add_action( 'b2b_bo_restock_scan_cron', function() {
-    b2b_bo_restock_scan( null );
-} );
-
-add_action( 'b2b_bo_eta_warn_cron', function() {
-    global $wpdb;
-    $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
-    $warn_days = (int) b2b_bo_get_config( 'b2b_bo_eta_warn_days' );
-
-    $overdue = $wpdb->get_results( $wpdb->prepare(
-        "SELECT * FROM {$bo_table}
-         WHERE status IN ('pending', 'ready')
-         AND eta IS NOT NULL
-         AND eta < DATE_ADD(CURDATE(), INTERVAL %d DAY)",
-        $warn_days
-    ), ARRAY_A );
-
-    if ( ! empty( $overdue ) && function_exists( 'b2b_send_telegram_alert' ) ) {
-        b2b_send_telegram_alert( 'bo_eta_warn', 'BO ใกล้เกิน ETA: ' . count( $overdue ) . ' รายการ' );
+    $bo_cron_map = array(
+        'b2b_bo_restock_scan_cron'         => array( 'every_15min_b2b_bo', 'b2b_bo_run_restock_scan' ),
+        'b2b_bo_eta_warn_cron'             => array( 'daily',              'b2b_bo_run_eta_warn' ),
+        'b2b_bo_pending_review_expire_cron'=> array( 'hourly',             'b2b_bo_run_pending_review_expire' ),
+        'b2b_bo_enumeration_scan_cron'     => array( 'hourly',             'b2b_bo_run_enumeration_scan' ),
+        'b2b_bo_attempt_log_cleanup_cron'  => array( 'daily',              'b2b_bo_run_attempt_log_cleanup' ),
+    );
+    foreach ( $bo_cron_map as $hook => $cfg ) {
+        list( $sched, $handler ) = $cfg;
+        if ( ! function_exists( $handler ) ) continue;
+        if ( function_exists( 'dinoco_register_cron' ) ) {
+            dinoco_register_cron( $hook, $sched, $handler );
+        } else {
+            add_action( $hook, $handler );
+        }
     }
 } );
 
-add_action( 'b2b_bo_pending_review_expire_cron', function() {
-    $timeout_hours = (int) b2b_bo_get_config( 'b2b_bo_pending_review_timeout_hours' );
+// 5.3 — Cron handlers (named for dinoco_register_cron compatibility)
 
-    $orders = get_posts( array(
-        'post_type'      => 'b2b_order',
-        'posts_per_page' => 50,
-        'meta_query'     => array(
-            array( 'key' => 'order_status', 'value' => 'pending_stock_review' ),
-            array( 'key' => '_b2b_opaque_accept_at', 'compare' => 'EXISTS' ),
-        ),
-        'fields' => 'ids',
-    ) );
+if ( ! function_exists( 'b2b_bo_run_restock_scan' ) ) {
+    function b2b_bo_run_restock_scan() {
+        b2b_bo_restock_scan( null );
+    }
+}
 
-    foreach ( $orders as $order_id ) {
-        $accepted_at = get_post_meta( $order_id, '_b2b_opaque_accept_at', true );
-        if ( ! $accepted_at ) continue;
-        $age_h = ( time() - strtotime( $accepted_at ) ) / 3600;
-        if ( $age_h > $timeout_hours ) {
-            if ( function_exists( 'b2b_transition_order' ) ) {
-                b2b_transition_order( $order_id, 'cancelled', 'system', 'pending_stock_review timeout' );
+if ( ! function_exists( 'b2b_bo_run_eta_warn' ) ) {
+    function b2b_bo_run_eta_warn() {
+        global $wpdb;
+        $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
+        $warn_days = (int) b2b_bo_get_config( 'b2b_bo_eta_warn_days' );
+
+        $overdue = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$bo_table}
+             WHERE status IN ('pending', 'ready')
+             AND eta IS NOT NULL
+             AND eta < DATE_ADD(CURDATE(), INTERVAL %d DAY)",
+            $warn_days
+        ), ARRAY_A );
+
+        if ( ! empty( $overdue ) && function_exists( 'b2b_send_telegram_alert' ) ) {
+            b2b_send_telegram_alert( 'bo_eta_warn', 'BO ใกล้เกิน ETA: ' . count( $overdue ) . ' รายการ' );
+        }
+    }
+}
+
+if ( ! function_exists( 'b2b_bo_run_pending_review_expire' ) ) {
+    function b2b_bo_run_pending_review_expire() {
+        $timeout_hours = (int) b2b_bo_get_config( 'b2b_bo_pending_review_timeout_hours' );
+
+        $orders = get_posts( array(
+            'post_type'      => 'b2b_order',
+            'posts_per_page' => 50,
+            'meta_query'     => array(
+                array( 'key' => 'order_status', 'value' => 'pending_stock_review' ),
+                array( 'key' => '_b2b_opaque_accept_at', 'compare' => 'EXISTS' ),
+            ),
+            'fields' => 'ids',
+        ) );
+
+        foreach ( $orders as $order_id ) {
+            $accepted_at = get_post_meta( $order_id, '_b2b_opaque_accept_at', true );
+            if ( ! $accepted_at ) continue;
+            $age_h = ( time() - strtotime( $accepted_at ) ) / 3600;
+            if ( $age_h > $timeout_hours ) {
+                if ( function_exists( 'b2b_transition_order' ) ) {
+                    b2b_transition_order( $order_id, 'cancelled', 'system', 'pending_stock_review timeout' );
+                }
+                $dist_id = (int) get_field( 'distributor_id', $order_id );
+                b2b_log_attempt( $dist_id, 'cancel', $order_id, '', 'error', 'PENDING_REVIEW_EXPIRED' );
             }
-            $dist_id = (int) get_field( 'distributor_id', $order_id );
-            b2b_log_attempt( $dist_id, 'cancel', $order_id, '', 'error', 'PENDING_REVIEW_EXPIRED' );
         }
     }
-} );
+}
 
-add_action( 'b2b_bo_enumeration_scan_cron', function() {
-    global $wpdb;
-    $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
+if ( ! function_exists( 'b2b_bo_run_enumeration_scan' ) ) {
+    function b2b_bo_run_enumeration_scan() {
+        global $wpdb;
+        $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
 
-    // Find distributors with >5 cancels in 24h
-    $cancel_threshold = (int) b2b_bo_get_config( 'b2b_bo_anomaly_cancel_24h' );
-    $suspicious = $wpdb->get_results( $wpdb->prepare(
-        "SELECT distributor_id, COUNT(*) AS cnt
-         FROM {$log_table}
-         WHERE action = 'cancel' AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-         GROUP BY distributor_id
-         HAVING cnt >= %d",
-        $cancel_threshold
-    ) );
+        // Find distributors with >5 cancels in 24h
+        $cancel_threshold = (int) b2b_bo_get_config( 'b2b_bo_anomaly_cancel_24h' );
+        $suspicious = $wpdb->get_results( $wpdb->prepare(
+            "SELECT distributor_id, COUNT(*) AS cnt
+             FROM {$log_table}
+             WHERE action = 'cancel' AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             GROUP BY distributor_id
+             HAVING cnt >= %d",
+            $cancel_threshold
+        ) );
 
-    foreach ( $suspicious as $s ) {
-        // V.1.7 BUG-H2 FIX: OR-combine bit field — preserve existing flags (rate_hit=1, qty_cap_hit=4, suspicious_pattern=8)
-        $cur = (int) get_post_meta( $s->distributor_id, '_b2b_enumeration_flags', true );
-        update_post_meta( $s->distributor_id, '_b2b_enumeration_flags', $cur | 2 ); // cancel_abuse bit
-        if ( function_exists( 'b2b_send_telegram_alert' ) ) {
-            b2b_send_telegram_alert( 'enumeration_attempt', "Distributor #{$s->distributor_id}: {$s->cnt} cancels ใน 24h" );
+        foreach ( $suspicious as $s ) {
+            // V.1.7 BUG-H2 FIX: OR-combine bit field — preserve existing flags (rate_hit=1, qty_cap_hit=4, suspicious_pattern=8)
+            $cur = (int) get_post_meta( $s->distributor_id, '_b2b_enumeration_flags', true );
+            update_post_meta( $s->distributor_id, '_b2b_enumeration_flags', $cur | 2 ); // cancel_abuse bit
+            if ( function_exists( 'b2b_send_telegram_alert' ) ) {
+                b2b_send_telegram_alert( 'enumeration_attempt', "Distributor #{$s->distributor_id}: {$s->cnt} cancels ใน 24h" );
+            }
+        }
+
+        // Find distributors with >3 qty=cap_max orders in 24h
+        $qty_threshold = (int) b2b_bo_get_config( 'b2b_bo_anomaly_qty_cap_24h' );
+        $qty_suspicious = $wpdb->get_results( $wpdb->prepare(
+            "SELECT distributor_id, COUNT(*) AS cnt
+             FROM {$log_table}
+             WHERE action = 'place_order'
+             AND rejection_code = 'QTY_OVER_LIMIT'
+             AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             GROUP BY distributor_id
+             HAVING cnt >= %d",
+            $qty_threshold
+        ) );
+
+        foreach ( $qty_suspicious as $s ) {
+            // V.1.7 BUG-H2 FIX: OR-combine bit field
+            $cur = (int) get_post_meta( $s->distributor_id, '_b2b_enumeration_flags', true );
+            update_post_meta( $s->distributor_id, '_b2b_enumeration_flags', $cur | 4 ); // qty_cap_hit bit
+            if ( function_exists( 'b2b_send_telegram_alert' ) ) {
+                b2b_send_telegram_alert( 'enumeration_attempt', "Distributor #{$s->distributor_id}: {$s->cnt} qty-cap hits ใน 24h" );
+            }
         }
     }
+}
 
-    // Find distributors with >3 qty=cap_max orders in 24h
-    $qty_threshold = (int) b2b_bo_get_config( 'b2b_bo_anomaly_qty_cap_24h' );
-    $max_qty       = (int) b2b_bo_get_config( 'b2b_bo_max_qty_per_item' );
-    $qty_suspicious = $wpdb->get_results( $wpdb->prepare(
-        "SELECT distributor_id, COUNT(*) AS cnt
-         FROM {$log_table}
-         WHERE action = 'place_order'
-         AND rejection_code = 'QTY_OVER_LIMIT'
-         AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-         GROUP BY distributor_id
-         HAVING cnt >= %d",
-        $qty_threshold
-    ) );
+if ( ! function_exists( 'b2b_bo_run_attempt_log_cleanup' ) ) {
+    function b2b_bo_run_attempt_log_cleanup() {
+        global $wpdb;
+        $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
 
-    foreach ( $qty_suspicious as $s ) {
-        // V.1.7 BUG-H2 FIX: OR-combine bit field
-        $cur = (int) get_post_meta( $s->distributor_id, '_b2b_enumeration_flags', true );
-        update_post_meta( $s->distributor_id, '_b2b_enumeration_flags', $cur | 4 ); // qty_cap_hit bit
-        if ( function_exists( 'b2b_send_telegram_alert' ) ) {
-            b2b_send_telegram_alert( 'enumeration_attempt', "Distributor #{$s->distributor_id}: {$s->cnt} qty-cap hits ใน 24h" );
+        // DB review H1 FIX: chunked delete (prevent long-running single DELETE)
+        $total_deleted = 0;
+        $max_iterations = 20; // max 20k rows/run (safe limit)
+        $affected = 0;
+        do {
+            $affected = $wpdb->query(
+                "DELETE FROM {$log_table}
+                 WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)
+                 LIMIT 1000"
+            );
+            $total_deleted += (int) $affected;
+            $max_iterations--;
+            if ( $affected >= 1000 && $max_iterations > 0 ) {
+                usleep( 50000 ); // 50ms gap between chunks
+            }
+        } while ( $affected >= 1000 && $max_iterations > 0 );
+
+        if ( $total_deleted > 0 && function_exists( 'b2b_log' ) ) {
+            b2b_log( "[BO] attempt_log cleanup: {$total_deleted} rows deleted (>90d, chunked)" );
         }
     }
-} );
-
-add_action( 'b2b_bo_attempt_log_cleanup_cron', function() {
-    global $wpdb;
-    $log_table = $wpdb->prefix . 'dinoco_order_attempt_log';
-
-    // DB review H1 FIX: chunked delete (prevent long-running single DELETE)
-    $total_deleted = 0;
-    $max_iterations = 20; // max 20k rows/run (safe limit)
-    do {
-        $affected = $wpdb->query(
-            "DELETE FROM {$log_table}
-             WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)
-             LIMIT 1000"
-        );
-        $total_deleted += (int) $affected;
-        $max_iterations--;
-        if ( $affected >= 1000 && $max_iterations > 0 ) {
-            usleep( 50000 ); // 50ms gap between chunks
-        }
-    } while ( $affected >= 1000 && $max_iterations > 0 );
-
-    if ( $total_deleted > 0 && function_exists( 'b2b_log' ) ) {
-        b2b_log( "[BO] attempt_log cleanup: {$total_deleted} rows deleted (>90d, chunked)" );
-    }
-} );
+}
 
 // ═══════════════════════════════════════════════════════════════
 // SECTION 6: FLEX BUILDERS (4 templates)

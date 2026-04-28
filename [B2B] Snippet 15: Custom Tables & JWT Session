@@ -1,6 +1,9 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.13 (2026-04-24) — Phase 4f: 5 inventory crons (low_alert, dip_reminder, ║
+ * ║    dip_expire, stock_invariant, slip_pool_cleanup) registered via dinoco_register_cron ║
+ * ║    heartbeat. Inline closures (dip_reminder/dip_expire) hoisted to named handlers.    ║
  * ║  Version: V.8.12 (2026-04-24) — AI Vision Slip Pre-Classifier schema:                ║
  * ║    • NEW columns on wp_dinoco_slip_log (idempotent ALTER + dbDelta):                 ║
  * ║        ai_classifier_decision   VARCHAR(16) NULL  — 'is_slip'|'not_slip'|             ║
@@ -2621,9 +2624,15 @@ add_action( 'init', function () {
     if ( ! wp_next_scheduled( 'dinoco_stock_low_alert_cron' ) ) {
         wp_schedule_event( time(), 'daily', 'dinoco_stock_low_alert_cron' );
     }
+    // V.8.13 Phase 4f: register heartbeat tracking + add_action via registry wrapper.
+    if ( function_exists( 'dinoco_register_cron' ) && function_exists( 'dinoco_run_stock_low_alert' ) ) {
+        dinoco_register_cron( 'dinoco_stock_low_alert_cron', 'daily', 'dinoco_run_stock_low_alert' );
+    } elseif ( function_exists( 'dinoco_run_stock_low_alert' ) ) {
+        add_action( 'dinoco_stock_low_alert_cron', 'dinoco_run_stock_low_alert' );
+    }
 } );
 
-add_action( 'dinoco_stock_low_alert_cron', 'dinoco_run_stock_low_alert' );
+// V.8.13 Phase 4f: add_action moved into init scheduling block (registry wrapper or fallback).
 
 if ( ! function_exists( 'dinoco_run_stock_low_alert' ) ) {
     function dinoco_run_stock_low_alert() {
@@ -2728,6 +2737,8 @@ if ( ! function_exists( 'dinoco_run_stock_low_alert' ) ) {
 /**
  * Cron 1: Reminder — ทุก 30 วันหลังนับครั้งล่าสุด → LINE push "ถึงรอบนับสต็อก"
  * Cron 2: Expire — session in_progress > 48 ชม. → auto set expired
+ * V.8.13 Phase 4f: schedule + register heartbeat tracking via dinoco_register_cron.
+ *                 Closures hoisted to named functions (dinoco_run_dip_stock_reminder + _expire).
  */
 add_action( 'init', function () {
     if ( ! wp_next_scheduled( 'dinoco_dip_stock_reminder_cron' ) ) {
@@ -2736,74 +2747,92 @@ add_action( 'init', function () {
     if ( ! wp_next_scheduled( 'dinoco_dip_stock_expire_cron' ) ) {
         wp_schedule_event( time(), 'twicedaily', 'dinoco_dip_stock_expire_cron' );
     }
+    if ( function_exists( 'dinoco_register_cron' ) ) {
+        if ( function_exists( 'dinoco_run_dip_stock_reminder' ) ) {
+            dinoco_register_cron( 'dinoco_dip_stock_reminder_cron', 'daily', 'dinoco_run_dip_stock_reminder' );
+        }
+        if ( function_exists( 'dinoco_run_dip_stock_expire' ) ) {
+            dinoco_register_cron( 'dinoco_dip_stock_expire_cron', 'twicedaily', 'dinoco_run_dip_stock_expire' );
+        }
+    } else {
+        if ( function_exists( 'dinoco_run_dip_stock_reminder' ) ) {
+            add_action( 'dinoco_dip_stock_reminder_cron', 'dinoco_run_dip_stock_reminder' );
+        }
+        if ( function_exists( 'dinoco_run_dip_stock_expire' ) ) {
+            add_action( 'dinoco_dip_stock_expire_cron', 'dinoco_run_dip_stock_expire' );
+        }
+    }
 } );
 
-// Cron 1: Reminder
-add_action( 'dinoco_dip_stock_reminder_cron', function () {
-    if ( ! get_option( 'dinoco_inv_initialized', false ) ) return;
+if ( ! function_exists( 'dinoco_run_dip_stock_reminder' ) ) {
+    function dinoco_run_dip_stock_reminder() {
+        if ( ! get_option( 'dinoco_inv_initialized', false ) ) return;
 
-    $interval = (int) get_option( 'dinoco_stock_dip_interval', 30 );
-    if ( $interval <= 0 ) $interval = 30;
+        $interval = (int) get_option( 'dinoco_stock_dip_interval', 30 );
+        if ( $interval <= 0 ) $interval = 30;
 
-    global $wpdb;
-    $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
+        global $wpdb;
+        $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
 
-    // หา session สำเร็จครั้งล่าสุด
-    $last = $wpdb->get_var( "SELECT MAX(session_date) FROM {$dip_table} WHERE status = 'completed'" );
+        // หา session สำเร็จครั้งล่าสุด
+        $last = $wpdb->get_var( "SELECT MAX(session_date) FROM {$dip_table} WHERE status = 'completed'" );
 
-    $should_remind = false;
-    if ( ! $last ) {
-        // ยังไม่เคยนับเลย → remind
-        $should_remind = true;
-    } else {
-        $days_ago = (int) ( ( time() - strtotime( $last ) ) / DAY_IN_SECONDS );
-        if ( $days_ago >= $interval ) {
+        $should_remind = false;
+        $days_ago = 0;
+        if ( ! $last ) {
+            // ยังไม่เคยนับเลย → remind
             $should_remind = true;
+        } else {
+            $days_ago = (int) ( ( time() - strtotime( $last ) ) / DAY_IN_SECONDS );
+            if ( $days_ago >= $interval ) {
+                $should_remind = true;
+            }
         }
-    }
 
-    if ( ! $should_remind ) return;
+        if ( ! $should_remind ) return;
 
-    // Guard ไม่ส่งซ้ำภายใน 24 ชม.
-    if ( get_transient( 'dinoco_dip_stock_reminder_sent' ) ) return;
+        // Guard ไม่ส่งซ้ำภายใน 24 ชม.
+        if ( get_transient( 'dinoco_dip_stock_reminder_sent' ) ) return;
 
-    $msg = "ถึงรอบนับสต็อก (Dip Stock)\n";
-    if ( $last ) {
-        $msg .= "นับล่าสุด: " . wp_date( 'd/m/Y', strtotime( $last ) ) . " (" . $days_ago . " วันที่แล้ว)\n";
-    } else {
-        $msg .= "ยังไม่เคยนับสต็อก\n";
-    }
-    $msg .= "กรุณาเข้าหน้า Inventory > นับสต็อก เพื่อเริ่มนับ";
+        $msg = "ถึงรอบนับสต็อก (Dip Stock)\n";
+        if ( $last ) {
+            $msg .= "นับล่าสุด: " . wp_date( 'd/m/Y', strtotime( $last ) ) . " (" . $days_ago . " วันที่แล้ว)\n";
+        } else {
+            $msg .= "ยังไม่เคยนับสต็อก\n";
+        }
+        $msg .= "กรุณาเข้าหน้า Inventory > นับสต็อก เพื่อเริ่มนับ";
 
-    if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_line_push' ) ) {
-        b2b_line_push( B2B_ADMIN_GROUP_ID, $msg );
-    }
-
-    set_transient( 'dinoco_dip_stock_reminder_sent', 1, 24 * HOUR_IN_SECONDS );
-} );
-
-// Cron 2: Expire stuck sessions (> 48 ชม.)
-add_action( 'dinoco_dip_stock_expire_cron', function () {
-    global $wpdb;
-    $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
-
-    $cutoff = wp_date( 'Y-m-d H:i:s', time() - ( 48 * HOUR_IN_SECONDS ) ); // WARN-06: Asia/Bangkok
-
-    $expired = $wpdb->query( $wpdb->prepare(
-        "UPDATE {$dip_table} SET status = 'expired', updated_at = %s WHERE status = 'in_progress' AND created_at < %s",
-        current_time( 'mysql' ),
-        $cutoff
-    ) );
-
-    if ( $expired > 0 && function_exists( 'b2b_log' ) ) {
-        b2b_log( "[DipStock] Auto-expired {$expired} stuck sessions (>48h)" );
-
-        // แจ้ง Admin
         if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_line_push' ) ) {
-            b2b_line_push( B2B_ADMIN_GROUP_ID, "Dip Stock: มี {$expired} session หมดอายุอัตโนมัติ (เกิน 48 ชม.)" );
+            b2b_line_push( B2B_ADMIN_GROUP_ID, $msg );
+        }
+
+        set_transient( 'dinoco_dip_stock_reminder_sent', 1, 24 * HOUR_IN_SECONDS );
+    }
+}
+
+if ( ! function_exists( 'dinoco_run_dip_stock_expire' ) ) {
+    function dinoco_run_dip_stock_expire() {
+        global $wpdb;
+        $dip_table = $wpdb->prefix . 'dinoco_dip_stock';
+
+        $cutoff = wp_date( 'Y-m-d H:i:s', time() - ( 48 * HOUR_IN_SECONDS ) ); // WARN-06: Asia/Bangkok
+
+        $expired = $wpdb->query( $wpdb->prepare(
+            "UPDATE {$dip_table} SET status = 'expired', updated_at = %s WHERE status = 'in_progress' AND created_at < %s",
+            current_time( 'mysql' ),
+            $cutoff
+        ) );
+
+        if ( $expired > 0 && function_exists( 'b2b_log' ) ) {
+            b2b_log( "[DipStock] Auto-expired {$expired} stuck sessions (>48h)" );
+
+            // แจ้ง Admin
+            if ( defined( 'B2B_ADMIN_GROUP_ID' ) && function_exists( 'b2b_line_push' ) ) {
+                b2b_line_push( B2B_ADMIN_GROUP_ID, "Dip Stock: มี {$expired} session หมดอายุอัตโนมัติ (เกิน 48 ชม.)" );
+            }
         }
     }
-} );
+}
 
 // ════════════════════════════════════════════════════════════
 // PART 1.55: STOCK INVARIANT MONITORING CRON (V.8.8 — Wave 4 MED-M7)
@@ -2825,9 +2854,15 @@ add_action( 'init', function () {
     if ( ! wp_next_scheduled( 'dinoco_stock_invariant_cron' ) ) {
         wp_schedule_event( time(), 'twicedaily', 'dinoco_stock_invariant_cron' );
     }
+    // V.8.13 Phase 4f: register heartbeat tracking + add_action via registry wrapper.
+    if ( function_exists( 'dinoco_register_cron' ) && function_exists( 'dinoco_run_stock_invariant_check' ) ) {
+        dinoco_register_cron( 'dinoco_stock_invariant_cron', 'twicedaily', 'dinoco_run_stock_invariant_check' );
+    } elseif ( function_exists( 'dinoco_run_stock_invariant_check' ) ) {
+        add_action( 'dinoco_stock_invariant_cron', 'dinoco_run_stock_invariant_check' );
+    }
 } );
 
-add_action( 'dinoco_stock_invariant_cron', 'dinoco_run_stock_invariant_check' );
+// V.8.13 Phase 4f: add_action moved into init scheduling block (registry wrapper or fallback).
 
 if ( ! function_exists( 'dinoco_run_stock_invariant_check' ) ) {
     /**
@@ -4578,9 +4613,15 @@ add_action( 'init', function () {
         if ( $next === false ) $next = time() + DAY_IN_SECONDS; // defensive
         wp_schedule_event( $next, 'daily', 'dinoco_slip_pool_cleanup_cron' );
     }
+    // V.8.13 Phase 4f: register heartbeat tracking + add_action via registry wrapper.
+    if ( function_exists( 'dinoco_register_cron' ) && function_exists( 'dinoco_run_slip_pool_cleanup' ) ) {
+        dinoco_register_cron( 'dinoco_slip_pool_cleanup_cron', 'daily', 'dinoco_run_slip_pool_cleanup' );
+    } elseif ( function_exists( 'dinoco_run_slip_pool_cleanup' ) ) {
+        add_action( 'dinoco_slip_pool_cleanup_cron', 'dinoco_run_slip_pool_cleanup' );
+    }
 } );
 
-add_action( 'dinoco_slip_pool_cleanup_cron', 'dinoco_run_slip_pool_cleanup' );
+// V.8.13 Phase 4f: add_action moved into init scheduling block (registry wrapper or fallback).
 
 if ( ! function_exists( 'dinoco_run_slip_pool_cleanup' ) ) {
     /**
