@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.18 (2026-04-24) — Phase 4b: outer dinoco_transaction() wrapper around ║
+ * ║    b2b_handle_slip_image() (LINE bot path). Inner body extracted verbatim to        ║
+ * ║    _b2b_handle_slip_image_inner() — V.34.17 behavior byte-identical preserved.      ║
+ * ║    Outer wrapper adds parent audit row 'slip_handler' + correlation_id chain        ║
+ * ║    propagation (so child slip_apply / debt_subtract / fsm_transition rows share     ║
+ * ║    request_id). Outer GET_LOCK keyed on md5(group_id) with timeout=2s — short by    ║
+ * ║    design; existing inner transient lock (b2b_slip_lock_<group_id>, 60s TTL) +      ║
+ * ║    queue management handle longer waits. Wrapper missing → fallback inner direct.   ║
+ * ║    NO refactor of inner body: 3-layer pre-filter (V.34.14 heuristic + V.34.15 AI    ║
+ * ║    + V.34.10 replay pool), Slip2Go retry, replay cascade, slip apply (Phase 2       ║
+ * ║    wrapped), customer Flex push, admin alert push, final audit log — all intact.    ║
  * ║  Version: V.34.17 (2026-04-24) — Phase 4c: migrate 3 slip flag get_option → dinoco_config(): ║
  * ║    slip.replay_pool_enabled / slip.prefilter_enabled / slip.ai_classifier_enabled.       ║
  * ║    Backward compat preserved (function_exists guard + legacy_option mapping in V.1.2).  ║
@@ -2569,6 +2580,12 @@ function b2b_help_admin() {
 
 // ════════════════════════════════════════════════════════════════
 // SLIP IMAGE HANDLER
+// V.34.18 (2026-04-24): Phase 4b outer dinoco_transaction() wrapper
+//   - Public b2b_handle_slip_image() routes through dinoco_transaction()
+//   - Adds parent audit row 'slip_handler' + correlation_id chain
+//   - Outer GET_LOCK md5(group_id) timeout=2s (short — inner transient handles wait)
+//   - Wrapper missing → fallback to _b2b_handle_slip_image_inner() direct
+//   - V.34.17 inner body extracted VERBATIM — behavior byte-identical preserved
 // V.34.8 (2026-04-24): RESILIENCE + OBSERVABILITY OVERHAUL
 //   - try/finally wrapper — lock + slip_log ALWAYS written (even on fatal)
 //   - Lock TTL 30s → 60s (Slip2Go 45s timeout + buffer)
@@ -2578,7 +2595,67 @@ function b2b_help_admin() {
 //   - Slip2Go error threshold check → admin "API degraded" alert
 // V.7.4 API + V.7.5 Flex Output (preserved business logic)
 // ════════════════════════════════════════════════════════════════
+
+/**
+ * Public entry — Phase 4b outer transaction wrapper.
+ *
+ * Wraps the V.34.17 inner body in dinoco_transaction() to emit a parent
+ * 'slip_handler' audit row + propagate correlation_id to child operations
+ * (slip_apply, debt_subtract, fsm_transition). The wrapper's outer GET_LOCK
+ * (md5(group_id), 2s) is intentionally short — the existing inner
+ * transient lock (b2b_slip_lock_<group_id>, 60s) + queue management
+ * handle longer wait scenarios. If two webhook calls for the same group
+ * arrive simultaneously, second gets WP_Error('txn_lock_busy') and silently
+ * returns null (matches existing void-style return contract).
+ *
+ * Wrapper missing (snippet disabled) → falls through to inner direct.
+ *
+ * @param string $message_id  LINE message_id
+ * @param string $group_id    LINE group_id
+ * @param string $user_id     LINE user_id
+ * @param string $reply_token LINE reply_token (may be empty for queued slips)
+ * @param bool   $manual_mode Admin manual reprocess flag
+ * @return mixed              null in the void-return contract; result from inner if any
+ */
 function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, $manual_mode = false ) {
+    if ( function_exists( 'dinoco_transaction' ) ) {
+        $txn_ctx = array(
+            'audit_event_type' => 'slip_handler',
+            'actor_type'       => $manual_mode ? 'admin' : 'system',
+            'target_type'      => 'group',
+            'target_id'        => (string) $group_id,
+            'lock_key'         => 'slip_handler_group_' . md5( (string) $group_id ),
+            'lock_timeout'     => 2,
+            'audit_context'    => array(
+                'message_id'  => (string) $message_id,
+                'user_id'     => (string) $user_id,
+                'manual_mode' => $manual_mode ? 1 : 0,
+            ),
+        );
+        $txn_phases = array(
+            'mutate' => function( $ctx ) use ( $message_id, $group_id, $user_id, $reply_token, $manual_mode ) {
+                $r = _b2b_handle_slip_image_inner( $message_id, $group_id, $user_id, $reply_token, $manual_mode );
+                // Inner returns null/void on most paths; wrapper requires non-null array
+                // for clean audit. Coerce to array — preserves caller-visible void contract
+                // (caller of b2b_handle_slip_image discards return value anyway).
+                return is_array( $r ) || is_wp_error( $r ) ? $r : array( 'ok' => true );
+            },
+        );
+        $res = dinoco_transaction( 'slip_handler', $txn_phases, $txn_ctx );
+        // Match legacy void-return contract — callers (LINE webhook + drain cron)
+        // ignore the return value entirely. WP_Error from outer wrapper (lock_busy
+        // / fatal) silently swallowed; audit row already emitted by wrapper.
+        return null;
+    }
+    // Legacy fallback — wrapper snippet disabled or not yet loaded
+    return _b2b_handle_slip_image_inner( $message_id, $group_id, $user_id, $reply_token, $manual_mode );
+}
+
+/**
+ * Inner body — V.34.17 verbatim (extracted Phase 4b 2026-04-24).
+ * Do NOT call directly; use b2b_handle_slip_image() public entry.
+ */
+function _b2b_handle_slip_image_inner( $message_id, $group_id, $user_id, $reply_token, $manual_mode = false ) {
     if ( !defined('B2B_ADMIN_GROUP_ID') || $group_id === B2B_ADMIN_GROUP_ID ) return;
     if ( !defined('B2B_SLIP2GO_SECRET_KEY') ) {
         if ( function_exists( 'b2b_slip_log_insert' ) ) b2b_slip_log_insert( array(

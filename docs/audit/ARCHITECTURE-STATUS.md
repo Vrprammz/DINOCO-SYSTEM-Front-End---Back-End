@@ -40,7 +40,7 @@
 - ✅ `b2b_rest_bo_undo_split` (Backorder undo)
 - ✅ `b2b_rest_bo_confirm_full` (Backorder confirm)
 - ✅ `_dinoco_inv_do_issue` (Manual Invoice issue)
-- ⏸️ `b2b_handle_slip_image` LINE bot path (Phase 4b)
+- ✅ `b2b_handle_slip_image` LINE bot path (Phase 4b)
 - ⏸️ FSM transitions (Phase 4d)
 
 ### Module Registry Adoption
@@ -78,7 +78,7 @@
 - `01-b2b-core.md` / `02-b2b-finance.md` / `03-inventory-catalog.md` / `04-b2f-ai-users-ux.md` — per-page audit
 - `wave-1-applied.md` / `wave-2-applied.md` / `wave-3-applied.md` / `wave-4-applied.md` — fix summaries
 - `FINAL-QA-REPORT.md` — verification matrix (29/29 verified)
-- `phase-1-applied.md` / `phase-1.5-applied.md` / `phase-2-applied.md` / `phase-3-applied.md` / `phase-4a-applied.md` — architecture refactor reports
+- `phase-1-applied.md` / `phase-1.5-applied.md` / `phase-2-applied.md` / `phase-3-applied.md` / `phase-4a-applied.md` / `phase-4b-applied.md` / `phase-4c-applied.md` / `phase-4d-applied.md` / `phase-4e-applied.md` / `phase-4f-applied.md` — architecture refactor reports
 - `BACKEND-ARCHITECTURE-REFACTOR-PLAN.md` — original plan (50KB)
 - `round-1-archived/` — Round 1 audit reports (reference)
 
@@ -105,8 +105,9 @@
 
 ## 📋 Phase 4 Remaining Work (Roadmap)
 
-### Phase 4b — Slip Handler Hot Path (~4h)
-Migrate `b2b_handle_slip_image()` (LINE bot) ไปใช้ `dinoco_transaction`. **High caution** — heavily-trafficked path
+### ~~Phase 4b — Slip Handler Hot Path~~ ✅ SHIPPED
+
+Migrated `b2b_handle_slip_image()` (LINE bot) outer wrapper. Inner body extracted verbatim to `_b2b_handle_slip_image_inner()`. See `phase-4b-applied.md`.
 
 ### Phase 4c — Config Migration (~4h)
 Migrate raw `get_option('b2b_flag_*')` calls (132+ sites) ไปใช้ `dinoco_config('namespace.key')`. Mostly mechanical
