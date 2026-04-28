@@ -140,18 +140,24 @@ Two-tier PHPUnit test stack with CI integration:
 - **Unit suite** (`tests/helpers/`, 110 tests / 177 assertions, < 5s) — pure-logic helpers (registry, picker, hierarchy, audit redact, dealer price, box calc, currency, FSM validation table).
 - **Integration suite** (`tests/integration/`, 42 tests / 115 assertions, ~1 min) — real WordPress runtime via `wordpress-develop` + MySQL service. Covers stock atomic, FSM transition, REST nonce gates, hierarchy DD-3, audit log dual-write.
 
-**M1-M3 milestones complete**:
+**M1-M4 milestones complete**:
 
-- M1: composer + bootstrap + base case + snippet-loader + 10-table schema fixture + 3 seed fixtures + smoke test + install-wp-tests.sh + schema parity check + runbook
-- M2: 5 first integration tests (StockSubtractAtomic, FsmTransitionRollback, RestNonceGate, HierarchyDD3SharedChild, AuditDualWrite)
-- M3: GitHub Actions workflow GREEN ✅ — both jobs pass on PR + push to main, JUnit XML uploaded, retention 14d
+- **M1** Foundation: composer + bootstrap + base case + snippet-loader + 10-table schema fixture + 3 seed fixtures + smoke test + install-wp-tests.sh + schema parity check + runbook
+- **M2** First 5 integration tests: StockSubtractAtomic, FsmTransitionRollback, RestNonceGate, HierarchyDD3SharedChild, AuditDualWrite
+- **M3** GitHub Actions workflow GREEN ✅ — both jobs pass on PR + push to main, JUnit XML uploaded, retention 14d
+- **M4** Concurrent harness + 2 race-condition tests:
+  - `concurrent_conn()` helper opens 2nd mysqli connection sharing test DB
+  - `ConcurrentStockSubtractTest` (3 cases) — proves Snippet 15 V.7.1 FOR UPDATE row lock serializes concurrent stock subtracts (no oversell)
+  - `RateLimitGetLockTest` (3 cases) — proves Snippet 1 V.33.7 b2b_rate_limit GET_LOCK serializes concurrent place-order rate-limit checks across PHP workers
 
-**CI iteration story**: 12 commits to first GREEN. Each fix peeled back another env layer (composer.lock drift → yoast wrapper PHPUnit 10 incompat → svn missing → set_up/tear_down visibility → assertWPError name clash → PHPUnit 10 incompat with WP test suite → ACF Pro stubs → b2b_log stub → stock test signature errors → audit row shape → hierarchy cache quirk).
+**Final test count**: **158 tests / 309 assertions** in CI per push (110 unit + 48 integration).
 
-**Deferred to future work**:
+**CI iteration story**: 14 commits to GREEN across M3-M4. Each fix peeled back another env layer (composer.lock drift → yoast wrapper PHPUnit 10 incompat → svn missing → set_up/tear_down visibility → assertWPError name clash → PHPUnit 10 incompat with WP test suite → ACF Pro stubs → b2b_log stub → stock test signature errors → audit row shape → hierarchy cache quirk → fixture transaction visibility for concurrent tests).
 
-- M4 (concurrent-worker harness via 2nd mysqli connection — for true FOR UPDATE / GET_LOCK race testing)
+**Deferred**:
+
 - M5 (coverage badge — DINOCO snippets lack `<?php` tag at line 1 so PHPUnit coverage tooling can't parse them. Defer until snippets migrate to composer packages.)
+- 5 more BO/slip/Flash integration tests from original top-10 list (BO Split + Slip apply + Opaque accept + BO fulfill chain) — substantial setup; revisit if specific scenarios surface as production regressions
 - 1 incomplete test (`HierarchyDD3SharedChildTest::cascade_after_subtract` — production has per-process static cache that doesn't invalidate; production semantics fine but PHPUnit reuses process)
 
 **Runbook**: `docs/runbooks/TESTING-PHASE-5.md`.
