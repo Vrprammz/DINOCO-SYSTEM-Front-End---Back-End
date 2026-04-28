@@ -1,6 +1,27 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.2.0 — Wave 1 atomic-boundary hardening (audit Round 2 CRIT-C1):              ║
+ * ║                   • bo-split: removed nested START TRANSACTION (MySQL flattens to inner ║
+ * ║                     COMMIT → outer ROLLBACK was no-op, partial mutations persisted on   ║
+ * ║                     mid-loop failure). Replaced with b2b_financial_lock(dist_id, 5)     ║
+ * ║                     serialize-by-distributor + validate-then-mutate phases. Phase 1 =   ║
+ * ║                     read-only invariant + product_data check across ALL splits. Phase 2 ║
+ * ║                     = sequential atomic helpers (dinoco_stock_subtract → bo_queue insert║
+ * ║                     → b2b_debt_add). On mid-mutation fail → run compensation closure    ║
+ * ║                     (best-effort: dinoco_stock_add restore, b2b_debt_subtract reverse,  ║
+ * ║                     bo_queue row delete).                                              ║
+ * ║                   • bo-fulfill: same pattern — Phase 1 validates rows + product_data    ║
+ * ║                     up-front, Phase 2 takes FOR UPDATE per row (short-held), runs       ║
+ * ║                     stock subtract + bo_queue update + atomic debt add. Compensation    ║
+ * ║                     closure restores prev bo_queue state, reverses stock + debt.       ║
+ * ║                   • bo-undo-split: removed nested START TRANSACTION + fixed broken      ║
+ * ║                     fallback (was wrapped in `function_exists('b2b_debt_subtract')`     ║
+ * ║                     but never called the function — silent debt skip). Now requires    ║
+ * ║                     b2b_recalculate_debt(); fail loud (503) if missing instead of      ║
+ * ║                     stock-restored-debt-untouched corruption.                           ║
+ * ║                   • All 3 endpoints acquire b2b_financial_lock(dist_id) at entry +      ║
+ * ║                     release on every exit path (success, error, compensation).         ║
  * ║  Version: V.1.15 — Phase 3 UX-C2 batch: migrate remaining confirm/alert sites to       ║
  * ║                    dinocoModal — b2bBoFulfill confirm + Fulfill/Restock/OrderDetail     ║
  * ║                    alerts + flag-toggle form submit (inline confirm → JS handler) +    ║
@@ -948,6 +969,12 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
             return new WP_Error( 'invalid_status', "Order ต้องอยู่ใน pending_stock_review (current={$status})", array( 'status' => 400 ) );
         }
 
+        // V.2.0 CRIT-C1 FIX: replace nested START TRANSACTION (which MySQL flattens — outer ROLLBACK was no-op
+        // when inner helpers like dinoco_stock_subtract / b2b_debt_add COMMITted) with serialize-by-financial-lock
+        // + validate-then-mutate pattern. Validation phase computes invariants & verifies all SKUs have product_data.
+        // Mutation phase runs sequentially; on mid-mutation failure we run best-effort compensation (cannot perfect
+        // rollback inner-COMMITted ops, but invariant pre-check shrinks the failure window dramatically).
+
         // Load existing order items (from meta or order_text)
         $order_items_text = get_field( 'order_items', $order_id ) ?: '';
         $parsed_items     = b2b_bo_parse_order_items( $order_items_text );
@@ -955,12 +982,28 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
         global $wpdb;
         $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
 
-        $wpdb->query( 'START TRANSACTION' );
+        $dist_id         = (int) get_field( 'distributor_id', $order_id );
 
+        // V.2.0 CRIT-C1: serialize concurrent admin actions (debt+stock+queue mutations) per distributor
+        $lock_acquired = false;
+        if ( $dist_id && function_exists( 'b2b_financial_lock' ) ) {
+            $lock_acquired = b2b_financial_lock( $dist_id, 5 );
+            if ( ! $lock_acquired ) {
+                return new WP_Error( 'lock_busy',
+                    'ระบบกำลังประมวลผลรายการอื่นของตัวแทนนี้ กรุณาลองใหม่อีกครั้ง',
+                    array( 'status' => 429 )
+                );
+            }
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // PHASE 1: VALIDATE ALL SPLITS (read-only — no mutations yet)
+        // ────────────────────────────────────────────────────────────────
         $fulfilled_total = 0;
         $bo_total        = 0;
-        $bo_queue_ids    = array();
-        $dist_id         = (int) get_field( 'distributor_id', $order_id );
+        $confirmed_value = 0.0;
+        $dealer_rank     = $dist_id ? ( get_field( 'rank_system', $dist_id ) ?: 'standard' ) : 'standard';
+        $validated       = array();   // [{sku, qty_fulfill, qty_bo, eta_days, notes, leaves[], price, idx}]
 
         foreach ( $splits as $idx => $split ) {
             $sku          = strtoupper( trim( $split['sku'] ?? '' ) );
@@ -969,7 +1012,7 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
             $eta_days     = max( 0, (int) ( $split['eta_days'] ?? b2b_bo_get_config( 'b2b_bo_eta_default_days' ) ) );
             $notes        = sanitize_text_field( $split['notes'] ?? '' );
 
-            // Validate invariant: qty_fulfill + qty_bo === original_qty
+            // Invariant: qty_fulfill + qty_bo === original_qty
             $original_qty = 0;
             foreach ( $parsed_items as $pi ) {
                 if ( $pi['sku'] === $sku ) {
@@ -978,78 +1021,35 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
                 }
             }
             if ( $qty_fulfill + $qty_bo !== $original_qty ) {
-                $wpdb->query( 'ROLLBACK' );
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
                 return new WP_Error( 'invariant_violation',
                     "SKU {$sku}: qty_fulfill({$qty_fulfill}) + qty_bo({$qty_bo}) ต้อง = original({$original_qty})",
                     array( 'status' => 400 )
                 );
             }
 
-            // Subtract stock for fulfilled qty (leaf-aware)
-            if ( $qty_fulfill > 0 && function_exists( 'dinoco_stock_subtract' ) && function_exists( 'dinoco_get_leaf_skus' ) ) {
-                $leaves = dinoco_get_leaf_skus( $sku );
-                foreach ( $leaves as $leaf ) {
-                    $result = dinoco_stock_subtract( $leaf, $qty_fulfill, 'b2b_reserved', 'b2b_order', $order_id );
-                    if ( is_wp_error( $result ) ) {
-                        $wpdb->query( 'ROLLBACK' );
-                        return new WP_Error( 'stock_error',
-                            "Stock subtract failed for {$leaf}: " . $result->get_error_message(),
-                            array( 'status' => 500 )
-                        );
-                    }
+            // Resolve leaves up-front (DD-2 leaf-aware) — fail loud if helper missing
+            $leaves = ( function_exists( 'dinoco_get_leaf_skus' ) ) ? dinoco_get_leaf_skus( $sku ) : array( $sku );
+
+            // Verify product_data exists (V.1.8 BUG-H4: fail-loud instead of silent skip)
+            $price = 0.0;
+            if ( $qty_fulfill > 0 ) {
+                if ( ! function_exists( 'b2b_get_product_data' ) ) {
+                    if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                    return new WP_Error( 'helper_missing', 'b2b_get_product_data not loaded', array( 'status' => 503 ) );
                 }
-            }
-
-            // Insert bo_queue row (if qty_bo > 0)
-            if ( $qty_bo > 0 ) {
-                $eta_date = $eta_days > 0 ? date( 'Y-m-d', strtotime( "+{$eta_days} days" ) ) : null;
-                $inserted = $wpdb->insert( $bo_table, array(
-                    'order_id'   => $order_id,
-                    'item_index' => $idx,
-                    'sku'        => $sku,
-                    'qty_bo'     => $qty_bo,
-                    'eta'        => $eta_date,
-                    'status'     => 'pending',
-                    'notes'      => $notes,
-                    'created_at' => current_time( 'mysql' ),
-                ) );
-                if ( ! $inserted ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    return new WP_Error( 'db_error', 'bo_queue insert failed', array( 'status' => 500 ) );
-                }
-                $bo_queue_ids[] = $wpdb->insert_id;
-            }
-
-            $fulfilled_total += $qty_fulfill;
-            $bo_total        += $qty_bo;
-        }
-
-        // V.1.6 M3 FIX: Debt precision — per-SKU compound (spec §5.2 step 5)
-        // V.1.8 BUG-H3 FIX: dealer tier price (b2b_compute_dealer_price) — เดิมใช้ retail (base_price)
-        // V.1.8 BUG-H4 FIX: fail-loud ถ้า b2b_get_product_data missing (ไม่ silent skip debt)
-        // เดิม: total_value * (fulfilled / total_qty) = ratio approximation → ไม่แม่นยำ
-        //       ถ้า SKU A = ฿1000 + SKU B = ฿100, fulfill A เต็ม + BO B → ratio คำนวณ debt เกินจริง
-        // ใหม่: loop splits + per-SKU dealer-price × qty_fulfill → exact + tier-aware
-        $confirmed_value = 0.0;
-        $dealer_rank     = $dist_id ? ( get_field( 'rank_system', $dist_id ) ?: 'standard' ) : 'standard';
-        if ( function_exists( 'b2b_get_product_data' ) ) {
-            foreach ( $splits as $split ) {
-                $sku_d = strtoupper( trim( $split['sku'] ?? '' ) );
-                $qty_f = max( 0, (int) ( $split['qty_fulfill'] ?? 0 ) );
-                if ( $qty_f <= 0 ) continue;
-                $pd = b2b_get_product_data( $sku_d );
+                $pd = b2b_get_product_data( $sku );
                 if ( ! $pd ) {
-                    // V.1.8 BUG-H4: fail-loud instead of silent skip — missing SKU = accounting hole
-                    $wpdb->query( 'ROLLBACK' );
                     if ( function_exists( 'b2b_log' ) ) {
-                        b2b_log( "[BO] CRITICAL: product_data missing for SKU {$sku_d}, order {$order_id} (bo-split)" );
+                        b2b_log( "[BO] CRITICAL: product_data missing for SKU {$sku}, order {$order_id} (bo-split phase 1)" );
                     }
                     if ( function_exists( 'b2b_send_telegram_alert' ) ) {
                         b2b_send_telegram_alert( 'bo_critical',
-                            "BO SPLIT: missing product_data SKU={$sku_d} order=#{$order_id} — admin กรุณาตรวจสอบ (ROLLBACK แล้ว)" );
+                            "BO SPLIT: missing product_data SKU={$sku} order=#{$order_id} — admin กรุณาตรวจสอบ (no mutation, validation-phase reject)" );
                     }
+                    if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
                     return new WP_Error( 'product_data_missing',
-                        "ไม่พบข้อมูลสินค้า SKU: {$sku_d} — กรุณาติดต่อ admin",
+                        "ไม่พบข้อมูลสินค้า SKU: {$sku} — กรุณาติดต่อ admin",
                         array( 'status' => 500 )
                     );
                 }
@@ -1057,29 +1057,119 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
                 $price = function_exists( 'b2b_compute_dealer_price' )
                     ? (float) b2b_compute_dealer_price( $base, $dealer_rank, $pd )
                     : $base;
-                $confirmed_value += $price * $qty_f;
+                $confirmed_value += $price * $qty_fulfill;
             }
+
+            $validated[] = array(
+                'sku'         => $sku,
+                'qty_fulfill' => $qty_fulfill,
+                'qty_bo'      => $qty_bo,
+                'eta_days'    => $eta_days,
+                'notes'       => $notes,
+                'leaves'      => $leaves,
+                'price'       => $price,
+                'idx'         => $idx,
+            );
+
+            $fulfilled_total += $qty_fulfill;
+            $bo_total        += $qty_bo;
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // PHASE 2: MUTATE (sequential atomic helpers, with compensation on failure)
+        // ────────────────────────────────────────────────────────────────
+        $bo_queue_ids       = array();
+        $stock_subtractions = array();   // [{leaf, qty}] — for compensation
+        $debt_added         = 0.0;       // for compensation
+
+        $compensate = function() use ( &$stock_subtractions, &$debt_added, $dist_id, $order_id, $bo_table, &$bo_queue_ids, $wpdb ) {
+            // Best-effort compensation: restore stock, reverse debt, delete bo_queue rows
+            if ( ! empty( $stock_subtractions ) && function_exists( 'dinoco_stock_add' ) ) {
+                foreach ( $stock_subtractions as $sub ) {
+                    @dinoco_stock_add( $sub['leaf'], $sub['qty'], 'b2b_split_compensate', 'b2b_order', $order_id );
+                }
+            }
+            if ( $debt_added > 0 && $dist_id && function_exists( 'b2b_debt_subtract' ) ) {
+                @b2b_debt_subtract( $dist_id, $debt_added, 'b2b_split_compensate', $order_id );
+            }
+            if ( ! empty( $bo_queue_ids ) ) {
+                foreach ( $bo_queue_ids as $bid ) {
+                    $wpdb->delete( $bo_table, array( 'id' => $bid ) );
+                }
+            }
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[BO] bo-split compensation triggered for order #{$order_id}: stock_returns=" . count( $stock_subtractions ) . " debt_returned={$debt_added} bo_rows_deleted=" . count( $bo_queue_ids ) );
+            }
+        };
+
+        // Step 1: subtract stock per fulfilled qty
+        foreach ( $validated as $v ) {
+            if ( $v['qty_fulfill'] <= 0 ) continue;
+            if ( ! function_exists( 'dinoco_stock_subtract' ) ) continue;
+            foreach ( $v['leaves'] as $leaf ) {
+                $result = dinoco_stock_subtract( $leaf, $v['qty_fulfill'], 'b2b_reserved', 'b2b_order', $order_id );
+                if ( is_wp_error( $result ) ) {
+                    $compensate();
+                    if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                    return new WP_Error( 'stock_error',
+                        "Stock subtract failed for {$leaf}: " . $result->get_error_message(),
+                        array( 'status' => 500 )
+                    );
+                }
+                $stock_subtractions[] = array( 'leaf' => $leaf, 'qty' => $v['qty_fulfill'] );
+            }
+        }
+
+        // Step 2: insert bo_queue rows (BO portion)
+        foreach ( $validated as $v ) {
+            if ( $v['qty_bo'] <= 0 ) continue;
+            $eta_date = $v['eta_days'] > 0 ? date( 'Y-m-d', strtotime( "+{$v['eta_days']} days" ) ) : null;
+            $inserted = $wpdb->insert( $bo_table, array(
+                'order_id'   => $order_id,
+                'item_index' => $v['idx'],
+                'sku'        => $v['sku'],
+                'qty_bo'     => $v['qty_bo'],
+                'eta'        => $eta_date,
+                'status'     => 'pending',
+                'notes'      => $v['notes'],
+                'created_at' => current_time( 'mysql' ),
+            ) );
+            if ( ! $inserted ) {
+                $compensate();
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                return new WP_Error( 'db_error', 'bo_queue insert failed', array( 'status' => 500 ) );
+            }
+            $bo_queue_ids[] = $wpdb->insert_id;
+        }
+
+        // Step 3: debt add (atomic per Snippet 13)
+        if ( $dist_id && $confirmed_value > 0 && function_exists( 'b2b_debt_add' ) ) {
+            $debt_result = b2b_debt_add( $dist_id, $confirmed_value, 'b2b_bo_split_confirm', $order_id );
+            if ( $debt_result === false ) {
+                $compensate();
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                return new WP_Error( 'debt_add_failed',
+                    'เกินวงเครดิต หรือไม่สามารถเพิ่มหนี้ได้',
+                    array( 'status' => 403 )
+                );
+            }
+            $debt_added = $confirmed_value;
         }
         $total_value = (float) get_field( 'total_amount', $order_id );
 
-        if ( $dist_id && $confirmed_value > 0 && function_exists( 'b2b_debt_add' ) ) {
-            b2b_debt_add( $dist_id, $confirmed_value, 'b2b_bo_split_confirm', $order_id );
-        }
-
         // V.1.8 BUG-C2 FIX: set _stock_deducted=1 BEFORE FSM transition
-        // Reason: bo-split subtracted stock manual (lines 891-903); when all BO resolves later,
-        //         FSM transition partial_fulfilled → awaiting_confirm fires hook
-        //         `dinoco_inv_on_status_change` (Snippet 2:3682) which parses order_items and
-        //         subtracts full qty AGAIN → inventory double-cut. Flag blocks the hook.
         if ( $fulfilled_total > 0 ) {
             update_post_meta( $order_id, '_stock_deducted', 1 );
         }
 
-        // FSM transition: pending_stock_review → partial_fulfilled
+        // Step 4: FSM transition (pending_stock_review → partial_fulfilled)
         if ( function_exists( 'b2b_transition_order' ) ) {
             $transition = b2b_transition_order( $order_id, 'partial_fulfilled', 'admin', 'admin split BO' );
             if ( is_wp_error( $transition ) ) {
-                $wpdb->query( 'ROLLBACK' );
+                // Compensate + unset _stock_deducted
+                $compensate();
+                delete_post_meta( $order_id, '_stock_deducted' );
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
                 return $transition;
             }
         }
@@ -1091,7 +1181,7 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
         update_post_meta( $order_id, '_b2b_split_by', get_current_user_id() );
         update_post_meta( $order_id, '_b2b_split_undo_deadline', $now_ts + ( $undo_minutes * 60 ) );
 
-        $wpdb->query( 'COMMIT' );
+        if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
 
         // Log attempt
         b2b_log_attempt( $dist_id, 'split', $order_id, '', 'accepted', null, array( 'total_qty' => $fulfilled_total + $bo_total ) );
@@ -1229,7 +1319,22 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
             return new WP_Error( 'bo_already_fulfilled', 'Cannot undo — some BO items already fulfilled', array( 'status' => 400 ) );
         }
 
-        $wpdb->query( 'START TRANSACTION' );
+        // V.2.0 CRIT-C1 FIX: replace nested START TRANSACTION (which MySQL flattens) with
+        // financial lock + sequential atomic helpers. b2b_recalculate_debt() is the source of truth
+        // for debt restoration — single-SQL recompute is idempotent + race-safe under FOR UPDATE.
+
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+
+        $lock_acquired = false;
+        if ( $dist_id && function_exists( 'b2b_financial_lock' ) ) {
+            $lock_acquired = b2b_financial_lock( $dist_id, 5 );
+            if ( ! $lock_acquired ) {
+                return new WP_Error( 'lock_busy',
+                    'ระบบกำลังประมวลผลรายการอื่นของตัวแทนนี้ กรุณาลองใหม่อีกครั้ง',
+                    array( 'status' => 429 )
+                );
+            }
+        }
 
         // Restore stock (add back fulfilled qty)
         $rows = $wpdb->get_results( $wpdb->prepare(
@@ -1237,8 +1342,6 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
             $order_id
         ), ARRAY_A );
 
-        // Reverse: any item that had qty_fulfill > 0 needs stock restoration
-        // For simplicity: restore by re-subtracting debt + deleting bo_queue rows
         $order_items_text = get_field( 'order_items', $order_id ) ?: '';
         $parsed_items     = b2b_bo_parse_order_items( $order_items_text );
 
@@ -1259,15 +1362,24 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
             }
         }
 
-        // Delete bo_queue rows
+        // Delete bo_queue rows (best effort — already counted as restored above)
         $wpdb->delete( $bo_table, array( 'order_id' => $order_id ) );
 
-        // Reverse debt
-        $dist_id = (int) get_field( 'distributor_id', $order_id );
-        if ( $dist_id && function_exists( 'b2b_debt_subtract' ) ) {
-            // Reverse previous b2b_debt_add — compute from meta (or just use recalculate)
+        // Reverse debt — single-SQL recalculate is source of truth (V.2.0: restored from broken
+        // function_exists guard that previously silently skipped subtract on missing helper)
+        if ( $dist_id ) {
             if ( function_exists( 'b2b_recalculate_debt' ) ) {
                 b2b_recalculate_debt( $dist_id );
+            } else {
+                // Fail loud instead of silent skip — V.2.0 H5 fix
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( "[BO] CRITICAL: b2b_recalculate_debt missing — cannot reverse debt for undo-split order #{$order_id} dist={$dist_id}" );
+                }
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                return new WP_Error( 'debt_helper_missing',
+                    'ระบบบัญชีหนี้ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 1/13 (admin: stock คืนแล้วแต่หนี้ยังไม่ปรับ)',
+                    array( 'status' => 503 )
+                );
             }
         }
 
@@ -1275,7 +1387,7 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
         if ( function_exists( 'b2b_transition_order' ) ) {
             $transition = b2b_transition_order( $order_id, 'pending_stock_review', 'admin', 'admin undo split' );
             if ( is_wp_error( $transition ) ) {
-                $wpdb->query( 'ROLLBACK' );
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
                 return $transition;
             }
         }
@@ -1292,7 +1404,7 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
         // already restored — invariant says flag must match "stock currently subtracted" reality.
         delete_post_meta( $order_id, '_stock_deducted' );
 
-        $wpdb->query( 'COMMIT' );
+        if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
 
         b2b_log_attempt( $dist_id, 'undo_split', $order_id, '', 'accepted' );
 
@@ -1319,87 +1431,179 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
         global $wpdb;
         $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
 
-        $wpdb->query( 'START TRANSACTION' );
+        // V.2.0 CRIT-C1 FIX: replace nested START TRANSACTION (which MySQL flattens) with
+        // financial lock + validate-then-mutate. PHASE 1 validates all items + product_data
+        // up-front; PHASE 2 mutates sequentially. On mid-mutation failure run best-effort
+        // compensation (cannot perfect rollback inner-COMMITted helpers, but pre-validation
+        // shrinks the failure window dramatically).
 
-        $total_fulfilled_qty = 0;
-        $total_fulfilled_value = 0;
+        $dist_id = (int) get_field( 'distributor_id', $order_id );
+        $rank    = $dist_id ? ( get_field( 'rank_system', $dist_id ) ?: 'standard' ) : 'standard';
 
+        $lock_acquired = false;
+        if ( $dist_id && function_exists( 'b2b_financial_lock' ) ) {
+            $lock_acquired = b2b_financial_lock( $dist_id, 5 );
+            if ( ! $lock_acquired ) {
+                return new WP_Error( 'lock_busy',
+                    'ระบบกำลังประมวลผลรายการอื่นของตัวแทนนี้ กรุณาลองใหม่อีกครั้ง',
+                    array( 'status' => 429 )
+                );
+            }
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // PHASE 1: VALIDATE — read-only (no FOR UPDATE because that would hold lock too long)
+        // ────────────────────────────────────────────────────────────────
+        $validated = array();   // [{bo_queue_id, qty, sku, leaves[], price, row, remaining}]
         foreach ( $items as $item ) {
             $bo_queue_id = (int) ( $item['bo_queue_id'] ?? 0 );
             $qty         = max( 1, (int) ( $item['qty'] ?? 0 ) );
-            $sku         = strtoupper( trim( $item['sku'] ?? '' ) );
 
             if ( ! $bo_queue_id ) continue;
 
-            // Lock BO row
             $row = $wpdb->get_row( $wpdb->prepare(
-                "SELECT * FROM {$bo_table} WHERE id = %d AND order_id = %d FOR UPDATE",
+                "SELECT * FROM {$bo_table} WHERE id = %d AND order_id = %d",
                 $bo_queue_id, $order_id
             ) );
-            if ( ! $row || $row->status !== 'pending' && $row->status !== 'ready' ) {
-                $wpdb->query( 'ROLLBACK' );
+            if ( ! $row || ( $row->status !== 'pending' && $row->status !== 'ready' ) ) {
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
                 return new WP_Error( 'invalid_bo_row', "BO row {$bo_queue_id} ไม่สามารถ fulfill ได้", array( 'status' => 400 ) );
             }
             if ( $qty > (int) $row->qty_bo ) {
-                $wpdb->query( 'ROLLBACK' );
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
                 return new WP_Error( 'qty_exceeded', "qty({$qty}) > qty_bo({$row->qty_bo})", array( 'status' => 400 ) );
             }
 
-            // Subtract stock
-            if ( function_exists( 'dinoco_stock_subtract' ) && function_exists( 'dinoco_get_leaf_skus' ) ) {
-                $leaves = dinoco_get_leaf_skus( $row->sku );
-                foreach ( $leaves as $leaf ) {
-                    $result = dinoco_stock_subtract( $leaf, $qty, 'b2b_bo_fulfilled', 'b2b_order', $order_id );
-                    if ( is_wp_error( $result ) ) {
-                        $wpdb->query( 'ROLLBACK' );
-                        return new WP_Error( 'stock_error', "Stock subtract failed: {$leaf}", array( 'status' => 500 ) );
-                    }
-                }
+            // Pre-validate product_data (V.1.8 BUG-H4 → moved to phase 1)
+            if ( ! function_exists( 'b2b_get_product_data' ) ) {
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                return new WP_Error( 'helper_missing', 'b2b_get_product_data not loaded', array( 'status' => 503 ) );
             }
-
-            // Update bo_queue
-            $remaining = (int) $row->qty_bo - $qty;
-            if ( $remaining <= 0 ) {
-                $wpdb->update( $bo_table, array(
-                    'status'      => 'fulfilled',
-                    'resolved_at' => current_time( 'mysql' ),
-                ), array( 'id' => $bo_queue_id ) );
-            } else {
-                $wpdb->update( $bo_table, array(
-                    'qty_bo' => $remaining,
-                ), array( 'id' => $bo_queue_id ) );
-            }
-
-            // Add debt for BO qty
-            // V.1.8 BUG-H3 FIX: dealer tier price (was retail base_price)
-            // V.1.8 BUG-H4 FIX: fail-loud on missing product_data
-            $dist_id = (int) get_field( 'distributor_id', $order_id );
-            $pd      = function_exists( 'b2b_get_product_data' ) ? b2b_get_product_data( $row->sku ) : null;
+            $pd = b2b_get_product_data( $row->sku );
             if ( ! $pd ) {
-                $wpdb->query( 'ROLLBACK' );
                 if ( function_exists( 'b2b_log' ) ) {
-                    b2b_log( "[BO] CRITICAL: product_data missing for SKU {$row->sku}, order {$order_id} (bo-fulfill)" );
+                    b2b_log( "[BO] CRITICAL: product_data missing for SKU {$row->sku}, order {$order_id} (bo-fulfill phase 1)" );
                 }
                 if ( function_exists( 'b2b_send_telegram_alert' ) ) {
                     b2b_send_telegram_alert( 'bo_critical',
-                        "BO FULFILL: missing product_data SKU={$row->sku} order=#{$order_id} — admin กรุณาตรวจสอบ (ROLLBACK แล้ว)" );
+                        "BO FULFILL: missing product_data SKU={$row->sku} order=#{$order_id} — admin กรุณาตรวจสอบ (validation reject, no mutation)" );
                 }
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
                 return new WP_Error( 'product_data_missing',
                     "ไม่พบข้อมูลสินค้า SKU: {$row->sku} — กรุณาติดต่อ admin",
                     array( 'status' => 500 )
                 );
             }
+
             $base  = (float) ( $pd['base_price'] ?? 0 );
-            $rank  = $dist_id ? ( get_field( 'rank_system', $dist_id ) ?: 'standard' ) : 'standard';
             $price = function_exists( 'b2b_compute_dealer_price' )
                 ? (float) b2b_compute_dealer_price( $base, $rank, $pd )
                 : $base;
-            if ( $dist_id && $price > 0 && function_exists( 'b2b_debt_add' ) ) {
-                b2b_debt_add( $dist_id, $price * $qty, 'b2b_bo_fulfilled', $order_id );
+
+            $leaves = ( function_exists( 'dinoco_get_leaf_skus' ) ) ? dinoco_get_leaf_skus( $row->sku ) : array( $row->sku );
+
+            $validated[] = array(
+                'bo_queue_id' => $bo_queue_id,
+                'qty'         => $qty,
+                'sku'         => $row->sku,
+                'leaves'      => $leaves,
+                'price'       => $price,
+                'row'         => $row,
+                'remaining'   => (int) $row->qty_bo - $qty,
+            );
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // PHASE 2: MUTATE — sequential, with compensation
+        // ────────────────────────────────────────────────────────────────
+        $total_fulfilled_qty   = 0;
+        $total_fulfilled_value = 0;
+        $stock_subtractions    = array();   // for compensation
+        $debt_added            = 0.0;
+        $bo_row_updates        = array();   // [{id, prev_status, prev_qty}] for compensation
+
+        $compensate_fulfill = function() use ( &$stock_subtractions, &$debt_added, &$bo_row_updates, $dist_id, $order_id, $bo_table, $wpdb ) {
+            if ( ! empty( $stock_subtractions ) && function_exists( 'dinoco_stock_add' ) ) {
+                foreach ( $stock_subtractions as $sub ) {
+                    @dinoco_stock_add( $sub['leaf'], $sub['qty'], 'b2b_fulfill_compensate', 'b2b_order', $order_id );
+                }
+            }
+            if ( $debt_added > 0 && $dist_id && function_exists( 'b2b_debt_subtract' ) ) {
+                @b2b_debt_subtract( $dist_id, $debt_added, 'b2b_fulfill_compensate', $order_id );
+            }
+            // Restore bo_queue rows to pre-mutation state
+            foreach ( $bo_row_updates as $u ) {
+                $wpdb->update( $bo_table, array(
+                    'status'      => $u['prev_status'],
+                    'qty_bo'      => $u['prev_qty'],
+                    'resolved_at' => $u['prev_resolved_at'],
+                ), array( 'id' => $u['id'] ) );
+            }
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( "[BO] bo-fulfill compensation triggered for order #{$order_id}: stock_returns=" . count( $stock_subtractions ) . " debt_returned={$debt_added} bo_rows_restored=" . count( $bo_row_updates ) );
+            }
+        };
+
+        foreach ( $validated as $v ) {
+            // Step A: Lock BO row + verify still mutable (FOR UPDATE, short-held)
+            $row_lock = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$bo_table} WHERE id = %d AND order_id = %d FOR UPDATE",
+                $v['bo_queue_id'], $order_id
+            ) );
+            if ( ! $row_lock || ( $row_lock->status !== 'pending' && $row_lock->status !== 'ready' ) ) {
+                $compensate_fulfill();
+                if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                return new WP_Error( 'invalid_bo_row_phase2', "BO row {$v['bo_queue_id']} state changed concurrently", array( 'status' => 409 ) );
             }
 
-            $total_fulfilled_qty   += $qty;
-            $total_fulfilled_value += $price * $qty;
+            // Step B: Subtract stock per leaf
+            if ( function_exists( 'dinoco_stock_subtract' ) ) {
+                foreach ( $v['leaves'] as $leaf ) {
+                    $result = dinoco_stock_subtract( $leaf, $v['qty'], 'b2b_bo_fulfilled', 'b2b_order', $order_id );
+                    if ( is_wp_error( $result ) ) {
+                        $compensate_fulfill();
+                        if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                        return new WP_Error( 'stock_error', "Stock subtract failed: {$leaf}", array( 'status' => 500 ) );
+                    }
+                    $stock_subtractions[] = array( 'leaf' => $leaf, 'qty' => $v['qty'] );
+                }
+            }
+
+            // Step C: Update bo_queue row (track prev state for compensation)
+            $bo_row_updates[] = array(
+                'id'               => $v['bo_queue_id'],
+                'prev_status'      => $row_lock->status,
+                'prev_qty'         => (int) $row_lock->qty_bo,
+                'prev_resolved_at' => $row_lock->resolved_at,
+            );
+            if ( $v['remaining'] <= 0 ) {
+                $wpdb->update( $bo_table, array(
+                    'status'      => 'fulfilled',
+                    'resolved_at' => current_time( 'mysql' ),
+                ), array( 'id' => $v['bo_queue_id'] ) );
+            } else {
+                $wpdb->update( $bo_table, array(
+                    'qty_bo' => $v['remaining'],
+                ), array( 'id' => $v['bo_queue_id'] ) );
+            }
+
+            // Step D: Add debt (atomic via Snippet 13)
+            $line_value = $v['price'] * $v['qty'];
+            if ( $dist_id && $line_value > 0 && function_exists( 'b2b_debt_add' ) ) {
+                $debt_result = b2b_debt_add( $dist_id, $line_value, 'b2b_bo_fulfilled', $order_id );
+                if ( $debt_result === false ) {
+                    $compensate_fulfill();
+                    if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
+                    return new WP_Error( 'debt_add_failed',
+                        'เกินวงเครดิต หรือไม่สามารถเพิ่มหนี้ได้',
+                        array( 'status' => 403 )
+                    );
+                }
+                $debt_added += $line_value;
+            }
+
+            $total_fulfilled_qty   += $v['qty'];
+            $total_fulfilled_value += $line_value;
         }
 
         // Check if all BO items resolved → transition to awaiting_confirm
@@ -1409,10 +1613,6 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
         ) );
 
         // V.1.8 BUG-C2 FIX: set _stock_deducted=1 BEFORE FSM transition
-        // Stock ถูก subtract manual ใน loop ข้างบน (lines 1202-1212). ถ้า all BO resolve →
-        // FSM transition partial_fulfilled → awaiting_confirm ยิง hook
-        // `dinoco_inv_on_status_change` (Snippet 2:3682) ซึ่งจะ parse order_items แล้ว
-        // subtract stock ทั้งออเดอร์ซ้ำ. flag block hook ทัน.
         if ( $total_fulfilled_qty > 0 ) {
             update_post_meta( $order_id, '_stock_deducted', 1 );
         }
@@ -1423,7 +1623,7 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
             }
         }
 
-        $wpdb->query( 'COMMIT' );
+        if ( $lock_acquired && function_exists( 'b2b_financial_unlock' ) ) b2b_financial_unlock( $dist_id );
 
         // Log + notify
         $dist_id = (int) get_field( 'distributor_id', $order_id );

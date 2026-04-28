@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 5: Admin Dashboard                          ║
+ * ║  Version: V.33.0 — Wave 1 atomic-boundary + FSM hardening (audit Round 2):              ║
+ * ║                   • CRIT-C2: removed fallback `b2b_set_order_status()` definition       ║
+ * ║                     (line 49-53). Bare update_field bypassed FSM + skipped              ║
+ * ║                     `b2b_order_status_changed` hook → stock cut at awaiting_confirm     ║
+ * ║                     never fired. Now fail-loud admin_notice + b2b_log if Snippet 1 not  ║
+ * ║                     loaded. Snippet 1 = canonical source.                                ║
+ * ║                   • HIGH-H1: replaced shadow FSM transition table in                    ║
+ * ║                     b2b_rest_update_status() with B2B_Order_FSM::can_transition()       ║
+ * ║                     (Snippet 14 canonical). Old table missing pending_stock_review +    ║
+ * ║                     partial_fulfilled, included non-existent ready_to_ship + pending.   ║
+ * ║                   • HIGH-H2: b2b_rest_confirm_order() now whitelists $st against        ║
+ * ║                     b2b_allowed_statuses() + FSM can_transition gate before delegating ║
+ * ║                     to b2b_set_order_status(). Previously: any string accepted.         ║
  * ║  Version: V.32.5 — exclude manual_invoice from main dashboard stats SQL (manual ไม่ยุ่งเรื่องจัดส่ง) ║
  * ║  Version: V.32.4 — UX-C2: migrate 14 inline confirm()/alert() to dinocoModal helper via _b2bCfm/_b2bAlertErr (native fallback) ║
  * ║  Version: V.32.3 — H9 fix: Flash auto-update routes through b2b_set_order_status() (FSM + hooks) ║
@@ -46,9 +59,21 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 if (!function_exists('b2b_log')) {
     function b2b_log($msg) { error_log('[B2B] ' . $msg); }
 }
-if (!function_exists('b2b_set_order_status')) {
-    function b2b_set_order_status($tid, $st) {
-        update_field('order_status', $st, $tid);
+// V.33.0 CRIT-C2 FIX: REMOVED fallback `b2b_set_order_status()` definition.
+// Reason: bare `update_field('order_status', ...)` bypasses FSM (Snippet 14) + skips
+// status history + skips `b2b_order_status_changed` action hook → stock cut at
+// awaiting_confirm doesn't fire, audit trail empty, FSM permission checks skipped.
+// Snippet 1 V.34.x is the canonical source — if it fails to load, this admin notice
+// surfaces the misconfiguration loudly instead of silently corrupting state.
+if ( ! function_exists( 'b2b_set_order_status' ) ) {
+    add_action( 'admin_notices', function() {
+        if ( ! current_user_can( 'manage_options' ) ) return;
+        echo '<div class="notice notice-error"><p><strong>[B2B] Snippet 5:</strong> '
+            . 'canonical <code>b2b_set_order_status()</code> not loaded — Snippet 1 (Core Utilities) is missing or failed to register. '
+            . 'Status mutations are blocked until this is fixed. (V.33.0 hardening)</p></div>';
+    } );
+    if ( function_exists( 'b2b_log' ) ) {
+        b2b_log( '[CRITICAL] Snippet 5 V.33.0: b2b_set_order_status() canonical not loaded — refusing to register fallback. Activate Snippet 1 first.' );
     }
 }
 if (!function_exists('b2b_date')) {
@@ -231,7 +256,31 @@ function b2b_rest_confirm_order( WP_REST_Request $r ) {
         update_field('total_amount',$total,$tid);
     }
     if($note) update_field('admin_note',$note,$tid);
-    if($st) b2b_set_order_status($tid,$st);
+    if($st) {
+        // V.33.0 HIGH-H2 FIX: validate $st against allowed statuses + FSM transition before applying.
+        // Previously $st was applied via b2b_set_order_status() with no whitelist, no FSM gate.
+        if ( function_exists( 'b2b_allowed_statuses' ) && ! in_array( $st, b2b_allowed_statuses(), true ) ) {
+            return new WP_REST_Response( array( 'success' => false,
+                'message' => 'สถานะไม่ถูกต้อง: ' . $st
+            ), 400 );
+        }
+        if ( class_exists( 'B2B_Order_FSM' ) ) {
+            if ( ! B2B_Order_FSM::can_transition( $tid, $st, 'admin' ) ) {
+                $cur = get_field( 'order_status', $tid ) ?: 'unknown';
+                return new WP_REST_Response( array( 'success' => false,
+                    'message' => 'ไม่สามารถเปลี่ยนจาก ' . $cur . ' เป็น ' . $st . ' ได้ (FSM block)'
+                ), 400 );
+            }
+        } else {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[CRITICAL] Snippet 5 V.33.0 b2b_rest_confirm_order: B2B_Order_FSM not loaded' );
+            }
+            return new WP_REST_Response( array( 'success' => false,
+                'message' => 'FSM ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 14'
+            ), 503 );
+        }
+        b2b_set_order_status($tid,$st);
+    }
     if($st==='awaiting_confirm'&&$total>0){
         $gid=get_field('source_group_id',$tid);
         if($gid&&function_exists('b2b_build_flex_bill_confirm')){
@@ -609,25 +658,25 @@ function b2b_rest_update_status( WP_REST_Request $r ) {
     if(!$tid||get_post_type($tid)!=='b2b_order') return new WP_REST_Response(array('success'=>false,'message'=>'Ticket ไม่ถูกต้อง'),400);
     if(function_exists('b2b_allowed_statuses')&&!in_array($st,b2b_allowed_statuses(),true)) return new WP_REST_Response(array('success'=>false,'message'=>'สถานะไม่ถูกต้อง'),400);
     $old_st = get_field('order_status',$tid) ?: 'unknown';
-    // Status transition validation — prevent illegal transitions (relaxed for admin flexibility)
-    $valid_transitions = array(
-        'draft'=>array('checking_stock','awaiting_confirm','cancelled'),
-        'pending'=>array('checking_stock','awaiting_confirm','cancelled'),
-        'checking_stock'=>array('backorder','awaiting_confirm','awaiting_payment','ready_to_ship','cancelled'),
-        'backorder'=>array('checking_stock','awaiting_confirm','awaiting_payment','cancelled'),
-        'awaiting_confirm'=>array('awaiting_payment','checking_stock','ready_to_ship','cancelled'),
-        'awaiting_payment'=>array('paid','ready_to_ship','cancelled'),
-        'paid'=>array('ready_to_ship','shipped','cancelled'),
-        'ready_to_ship'=>array('shipped','cancelled'),
-        'shipped'=>array('completed','claim_opened','cancelled'),
-        'completed'=>array('claim_opened','cancelled'),
-        'claim_opened'=>array('claim_resolved','shipped'),
-        'claim_resolved'=>array('completed'),
-        'cancel_requested'=>array('cancelled','pending','checking_stock'),
-        'change_requested'=>array('pending','checking_stock','cancelled'),
-    );
-    if (isset($valid_transitions[$old_st]) && !in_array($st, $valid_transitions[$old_st], true))
-        return new WP_REST_Response(array('success'=>false,'message'=>'ไม่สามารถเปลี่ยนจาก '.$old_st.' เป็น '.$st.' ได้'),400);
+    // V.33.0 HIGH-H1 FIX: removed shadow FSM transition table (was duplicate of Snippet 14, with drift —
+    // included `ready_to_ship` & `pending` which don't exist in canonical FSM, missing
+    // `pending_stock_review` + `partial_fulfilled` BO states). Now defers to canonical FSM
+    // via B2B_Order_FSM::can_transition() so we have one source of truth for state graph.
+    if ( class_exists( 'B2B_Order_FSM' ) ) {
+        if ( ! B2B_Order_FSM::can_transition( $tid, $st, 'admin' ) ) {
+            return new WP_REST_Response( array( 'success' => false,
+                'message' => 'ไม่สามารถเปลี่ยนจาก ' . $old_st . ' เป็น ' . $st . ' ได้ (FSM block)'
+            ), 400 );
+        }
+    } else {
+        // Snippet 14 missing — fail loud rather than silently allow any transition
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( '[CRITICAL] Snippet 5 V.33.0 b2b_rest_update_status: B2B_Order_FSM not loaded — Snippet 14 missing' );
+        }
+        return new WP_REST_Response( array( 'success' => false,
+            'message' => 'FSM ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 14'
+        ), 503 );
+    }
     // V.31.3: completed→cancelled เฉพาะ walk-in เท่านั้น
     if ($old_st === 'completed' && $st === 'cancelled') {
         $is_walkin = function_exists('b2b_is_walkin_order') && b2b_is_walkin_order($tid);

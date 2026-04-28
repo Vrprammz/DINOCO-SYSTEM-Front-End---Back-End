@@ -2,6 +2,21 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.0 — Wave 1 atomic-boundary + FSM hardening (audit Round 2):
+ *   • CRIT-C2: removed fallback `b2b_set_order_status()` (lines 59-67). Bypass FSM + skip
+ *     b2b_order_status_changed hook = silent state corruption. Now fail-loud admin_notice +
+ *     log if Snippet 1 not loaded.
+ *   • HIGH-H4: `_dinoco_inv_do_issue()` REORDERED — call b2b_debt_add() FIRST (atomic
+ *     credit gate). Only if debt_add succeeds → set is_billed=true + transition status.
+ *     Previously: is_billed=true → set_status → debt_add → if fail rollback both. Race
+ *     window allowed double-issue if concurrent process read stale debt between is_billed
+ *     write and debt_add.
+ *   • HIGH-H5: `dinoco_inv_reverse_debt()` removed direct update_field('current_debt')
+ *     fallback (line 607). Now uses b2b_recalculate_debt → b2b_debt_subtract → WP_Error 503
+ *     fail-loud chain.
+ *   • HIGH-H14: removed 3 more direct update_field('current_debt') fallbacks (lines 1433
+ *     invoice_edit, 1525 _do_issue, 1599 record_payment fully_paid). All replaced with
+ *     atomic helper chain or fail-loud b2b_log.
  * Version: V.33.8 — Sprint Fix C M5: extract 5 inline dinocoModal try/catch sites to _miCfm/_miAlert/_miPrompt helper shims (mirrors Service Center _scCfm pattern) for consistency — behavior unchanged
  * Version: V.33.7 — UX-C2: migrate 6 confirm() dialogs (invoice cancel/create/delete/refund) to dinocoModal (fallback to native)
  * Version: V.33.6 — re-register /b2b/v1/products route (Snippet 9 removed it in V.35.0 — frontend invLoadProducts still needs it)
@@ -56,13 +71,19 @@ if (!function_exists('b2b_add_audit_log')) {
     }
 }
 
-if (!function_exists('b2b_set_order_status')) {
-    function b2b_set_order_status($post_id, $status) {
-        $old = get_field('order_status', $post_id);
-        update_field('order_status', $status, $post_id);
-        $hist = get_post_meta($post_id, '_b2b_status_history', true) ?: [];
-        $hist[] = ['from' => $old, 'to' => $status, 'at' => b2b_date('Y-m-d H:i:s')];
-        update_post_meta($post_id, '_b2b_status_history', $hist);
+// V.34.0 CRIT-C2 FIX: REMOVED fallback `b2b_set_order_status()` definition.
+// Reason: bare `update_field('order_status', ...)` bypasses FSM (Snippet 14) + skips
+// `b2b_order_status_changed` action hook → side-effects (stock cut, debt audit) skipped.
+// Snippet 1 V.34.x is canonical. If missing → fail loud via admin_notice + log.
+if ( ! function_exists( 'b2b_set_order_status' ) ) {
+    add_action( 'admin_notices', function() {
+        if ( ! current_user_can( 'manage_options' ) ) return;
+        echo '<div class="notice notice-error"><p><strong>[Admin] Manual Invoice System:</strong> '
+            . 'canonical <code>b2b_set_order_status()</code> not loaded — Snippet 1 (Core Utilities) is missing or failed to register. '
+            . 'Invoice issue/cancel/refund are blocked until this is fixed. (V.34.0 hardening)</p></div>';
+    } );
+    if ( function_exists( 'b2b_log' ) ) {
+        b2b_log( '[CRITICAL] Manual Invoice V.34.0: b2b_set_order_status() canonical not loaded — refusing to register fallback. Activate Snippet 1 first.' );
     }
 }
 
@@ -599,13 +620,20 @@ function dinoco_inv_reverse_debt($post_id) {
     if (!$dist_id || get_post_type($dist_id) !== 'distributor') return;
     $total = floatval(get_field('total_amount', $post_id));
     if ($total <= 0) return;
+    // V.34.0 HIGH-H5 FIX: removed direct update_field('current_debt') fallback (line 607).
+    // Bypassing Snippet 13 = no FOR UPDATE lock + no audit + no credit_hold reset.
+    // If atomic helpers missing → return WP_Error to caller; admin reconciles manually.
     if (function_exists('b2b_recalculate_debt')) {
         update_field('is_billed', false, $post_id);
         b2b_recalculate_debt($dist_id);
-    } else {
-        $debt = floatval(get_field('current_debt', $dist_id));
-        update_field('current_debt', round(max(0, $debt - $total), 2), $dist_id);
+    } elseif (function_exists('b2b_debt_subtract')) {
         update_field('is_billed', false, $post_id);
+        b2b_debt_subtract($dist_id, $total, 'manual_invoice_reverse:'.$post_id, $post_id);
+    } else {
+        b2b_log('[CRITICAL] Manual Invoice V.34.0 reverse_debt: b2b_recalculate_debt + b2b_debt_subtract both missing — debt NOT reversed for dist=' . $dist_id . ' amount=' . $total . ' (admin must reconcile manually)');
+        return new WP_Error('debt_helper_missing',
+            'ระบบบัญชีหนี้ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 1/13 (admin: หนี้ยังไม่ปรับ)',
+            ['status' => 503]);
     }
     b2b_add_audit_log($post_id, 'debt_reversed', 'ยกเลิกบิล ฿' . number_format($total, 0) . ' — หักหนี้ตัวแทนแล้ว');
 }
@@ -1429,8 +1457,13 @@ function dinoco_inv_rest_update(WP_REST_Request $req) {
             } elseif (function_exists('b2b_recalculate_debt')) {
                 b2b_recalculate_debt($dist_id);
             } else {
-                $debt = floatval(get_field('current_debt', $dist_id));
-                update_field('current_debt', round($debt + $delta, 2), $dist_id);
+                // V.34.0 HIGH-H14 FIX: removed direct update_field('current_debt') fallback.
+                // No atomic helper available → revert total + fail loud (ไม่ corrupt debt data).
+                update_field('total_amount', $old_total, $id);
+                b2b_log('[CRITICAL] Manual Invoice V.34.0 invoice_edit: b2b_debt_add/subtract/recalculate ALL missing for dist=' . $dist_id . ' delta=' . $delta);
+                return new WP_Error('debt_helper_missing',
+                    'ระบบบัญชีหนี้ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 1/13 (revert total)',
+                    ['status' => 503]);
             }
             b2b_add_audit_log($id, 'debt_adjusted', 'ปรับหนี้ ' . ($delta > 0 ? '+' : '') . number_format($delta, 2) . ' (แก้ไขบิล)');
         }
@@ -1503,27 +1536,32 @@ function _dinoco_inv_do_issue($post_id, $dist_id, $total, $dist_name) {
         update_field('due_date', $due, $post_id);
     }
 
-    b2b_set_order_status($post_id, 'awaiting_payment');
-    update_field('is_billed', true, $post_id);
-    // FIX C3: Add debt atomically (prevents race condition with concurrent operations)
-    if (function_exists('b2b_debt_add')) {
-        $result = b2b_debt_add($dist_id, $total, 'manual_invoice_issue:' . $post_id, $post_id);
-        if ($result === false) {
-            // Credit limit exceeded inside atomic check — rollback
-            update_field('is_billed', false, $post_id);
-            b2b_set_order_status($post_id, 'draft');
-            delete_transient('inv_issue_' . $post_id);
-            $limit = floatval(get_field('credit_limit', $dist_id));
-            $debt = floatval(get_field('current_debt', $dist_id));
-            $avail = max(0, $limit - $debt);
-            return new WP_Error('credit_exceeded',
-                'เกินวงเครดิต (atomic check): เหลือ ฿' . number_format($avail, 0) . ' แต่ต้องการ ฿' . number_format($total, 0),
-                ['status' => 403]);
-        }
-    } else {
-        $debt = floatval(get_field('current_debt', $dist_id));
-        update_field('current_debt', round($debt + $total, 2), $dist_id);
+    // V.34.0 HIGH-H4 FIX: reordered — call b2b_debt_add() FIRST (atomic credit gate),
+    // then mark is_billed + transition status only if debt_add succeeds.
+    // Previously: is_billed=true → b2b_set_order_status → b2b_debt_add → if fail rollback both.
+    // Race risk: between is_billed=true and debt_add another process could read stale debt
+    // and double-issue. Now atomic gate happens first; status mutation only on success.
+    // V.34.0 HIGH-H14 FIX: removed direct update_field('current_debt') fallback (line 1542-1543).
+    if (!function_exists('b2b_debt_add')) {
+        delete_transient('inv_issue_' . $post_id);
+        b2b_log('[CRITICAL] Manual Invoice V.34.0 _do_issue: b2b_debt_add() missing — refusing to issue invoice for dist=' . $dist_id . ' total=' . $total);
+        return new WP_Error('debt_helper_missing',
+            'ระบบบัญชีหนี้ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 1/13 (invoice not issued)',
+            ['status' => 503]);
     }
+    $result = b2b_debt_add($dist_id, $total, 'manual_invoice_issue:' . $post_id, $post_id);
+    if ($result === false) {
+        delete_transient('inv_issue_' . $post_id);
+        $limit = floatval(get_field('credit_limit', $dist_id));
+        $debt = floatval(get_field('current_debt', $dist_id));
+        $avail = max(0, $limit - $debt);
+        return new WP_Error('credit_exceeded',
+            'เกินวงเครดิต (atomic check): เหลือ ฿' . number_format($avail, 0) . ' แต่ต้องการ ฿' . number_format($total, 0),
+            ['status' => 403]);
+    }
+    // Debt added successfully → now safe to mark issued + transition status
+    update_field('is_billed', true, $post_id);
+    b2b_set_order_status($post_id, 'awaiting_payment');
     b2b_add_audit_log($post_id, 'invoice_issued', 'ออกใบแจ้งหนี้/วางบิล ฿' . number_format($total, 0) . ' เพิ่มหนี้ตัวแทน ' . $dist_name);
 
     // Send LINE Flex Card + Invoice Image
@@ -1592,11 +1630,14 @@ function dinoco_inv_rest_record_payment(WP_REST_Request $req) {
         // Fully paid
         b2b_set_order_status($id, 'paid');
         update_field('is_billed', false, $id);
+        // V.34.0 HIGH-H14 FIX: removed direct update_field('current_debt') fallback (was line 1622).
+        // Use atomic helpers only — recalculate or subtract via Snippet 13. Fail loud if missing.
         if (function_exists('b2b_recalculate_debt') && $dist_id) {
             b2b_recalculate_debt($dist_id);
+        } elseif (function_exists('b2b_debt_subtract') && $dist_id) {
+            b2b_debt_subtract($dist_id, $total, 'manual_invoice_paid:'.$id, $id);
         } elseif ($dist_id) {
-            $debt = floatval(get_field('current_debt', $dist_id));
-            update_field('current_debt', round(max(0, $debt - $total), 2), $dist_id);
+            b2b_log('[CRITICAL] Manual Invoice V.34.0 record_payment fully_paid: b2b_recalculate_debt + b2b_debt_subtract both missing — debt NOT reversed for dist=' . $dist_id . ' amount=' . $total . ' (admin must reconcile manually)');
         }
         b2b_add_audit_log($id, 'invoice_paid', 'ชำระครบ ฿' . number_format($new_paid, 0));
         return rest_ensure_response(['success' => true, 'fully_paid' => true, 'status' => 'paid']);
