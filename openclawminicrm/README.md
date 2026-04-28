@@ -311,7 +311,7 @@ docker compose -f docker-compose.caddy.yml up -d --build
 
 ## License
 
-[MIT License](LICENSE)
+Proprietary — see [root LICENSE](../LICENSE). Part of the DINOCO System monorepo.
 
 ---
 
