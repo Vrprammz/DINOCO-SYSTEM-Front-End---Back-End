@@ -1,0 +1,734 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Health Monitor                        ║
+ * ║  Version: V.1.0 (2026-04-24) — Phase 3 Architecture Refactor ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
+ * ║  Description: Health endpoint + Cron registry (Pillar 5).     ║
+ * ║    Closes "30+ crons scattered, no last_run, no heartbeat —   ║
+ * ║    cron dies silently till customer complains" pain.          ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * What it does:
+ *   - dinoco_register_health_check($key, $callback, $args)
+ *   - dinoco_get_health_status() → ['overall' => ok|warn|fail, 'checks' => […]]
+ *   - dinoco_register_cron($hook, $schedule, $callback) — wraps to update
+ *     `_dinoco_cron_<hook>_last_run` option after each run + auto wp_schedule_event
+ *   - REST GET /dinoco/v1/health (public — top-level only)
+ *   - REST GET /dinoco/v1/health?detail=1 (admin only — full breakdown)
+ *   - REST POST /dinoco/v1/health/run-check (admin only — manual trigger)
+ *   - REST GET  /dinoco/v1/cron/heartbeat (admin only)
+ *   - shortcode [dinoco_admin_health_dashboard] — auto-refresh 30s
+ *
+ * Backward compat:
+ *   - 30+ existing wp_schedule_event calls REMAIN (additive — Pillar 5
+ *     does NOT replace WP cron; it tracks last_run via option-write
+ *     wrapper that any snippet may opt-into)
+ *   - Disabling this snippet → callers using function_exists guard
+ *     skip cleanly; existing crons keep running; no monitor only
+ *
+ * Storage:
+ *   - Health checks: in-memory $GLOBALS['_dinoco_health_checks']
+ *   - Cron last_run: wp_options key `_dinoco_cron_<hook>_last_run` (autoload no)
+ *
+ * Initial built-in health checks (registered on init priority 30):
+ *   1. cron_heartbeat — registered crons run within expected interval
+ *   2. db_invariants  — DB connectivity smoke test
+ *   3. flag_consistency — Module Registry orphan count
+ *   4. audit_log_health — recent rows + write rate
+ *
+ * Per spec: 'disk_space' + 'slip_pipeline' deferred — out of scope of
+ * Phase 3 minimum (require additional metrics not yet available).
+ *
+ * Security:
+ *   - GET /health (no auth) returns ONLY {overall, timestamp, checks_count}
+ *   - GET /health?detail=1 requires manage_options
+ *   - POST /health/run-check requires manage_options + nonce
+ *   - 200 always returned even on fail — let monitoring decide alerting
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ============================================================
+ * 1. HEALTH CHECK REGISTRY
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_register_health_check' ) ) {
+    /**
+     * Register a health check.
+     *
+     * @param string   $key Unique slug (^[a-z0-9_]+$).
+     * @param callable $callback Returns ['status'=>'ok|warn|fail', 'detail'=>'...', 'metric'=>scalar?]
+     * @param array    $args { critical: bool default false, label: string }
+     * @return true|WP_Error
+     */
+    function dinoco_register_health_check( $key, $callback, $args = array() ) {
+        if ( ! is_string( $key ) || ! preg_match( '/^[a-z0-9_]+$/', $key ) ) {
+            return new WP_Error( 'dnc_health_invalid_key', 'invalid key (a-z 0-9 _)' );
+        }
+        if ( ! is_callable( $callback ) ) {
+            return new WP_Error( 'dnc_health_invalid_callback', 'callback not callable' );
+        }
+        $defaults = array(
+            'critical' => false,
+            'label'    => $key,
+        );
+        $args = array_merge( $defaults, is_array( $args ) ? $args : array() );
+
+        if ( ! isset( $GLOBALS['_dinoco_health_checks'] ) ) $GLOBALS['_dinoco_health_checks'] = array();
+        $GLOBALS['_dinoco_health_checks'][ $key ] = array(
+            'key'       => $key,
+            'callback'  => $callback,
+            'critical'  => (bool) $args['critical'],
+            'label'     => (string) $args['label'],
+        );
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_health_checks' ) ) {
+    function dinoco_get_health_checks() {
+        return isset( $GLOBALS['_dinoco_health_checks'] ) && is_array( $GLOBALS['_dinoco_health_checks'] )
+            ? $GLOBALS['_dinoco_health_checks'] : array();
+    }
+}
+
+if ( ! function_exists( 'dinoco_run_health_check' ) ) {
+    /**
+     * Run a single check by key with try/catch protection.
+     */
+    function dinoco_run_health_check( $key ) {
+        $checks = dinoco_get_health_checks();
+        if ( ! isset( $checks[ $key ] ) ) {
+            return array( 'status' => 'fail', 'detail' => 'check_not_registered' );
+        }
+        $start = microtime( true );
+        try {
+            $result = call_user_func( $checks[ $key ]['callback'] );
+            if ( ! is_array( $result ) ) {
+                $result = array( 'status' => 'fail', 'detail' => 'callback_returned_non_array' );
+            }
+            if ( ! isset( $result['status'] ) ) $result['status'] = 'fail';
+            if ( ! in_array( $result['status'], array( 'ok', 'warn', 'fail' ), true ) ) {
+                $result['status'] = 'fail';
+            }
+        } catch ( \Throwable $e ) {
+            $result = array( 'status' => 'fail', 'detail' => 'exception: ' . $e->getMessage() );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( 'error', '[health] check exception', array(
+                    'check' => $key, 'message' => $e->getMessage(),
+                ) );
+            }
+        }
+        $result['key']         = $key;
+        $result['label']       = $checks[ $key ]['label'];
+        $result['critical']    = $checks[ $key ]['critical'];
+        $result['elapsed_ms']  = (int) round( ( microtime( true ) - $start ) * 1000 );
+        $result['checked_at']  = current_time( 'mysql' );
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_health_status' ) ) {
+    /**
+     * Run all registered checks and aggregate to overall status.
+     *
+     * Aggregation rules:
+     *   - any critical=true check status fail → overall fail
+     *   - any check fail → overall warn (non-critical)
+     *   - any check warn → overall warn
+     *   - all ok → overall ok
+     */
+    function dinoco_get_health_status() {
+        $checks  = dinoco_get_health_checks();
+        $results = array();
+        $overall = 'ok';
+        foreach ( $checks as $key => $def ) {
+            $r = dinoco_run_health_check( $key );
+            $results[] = $r;
+            if ( $r['status'] === 'fail' ) {
+                $overall = ( $def['critical'] || $overall === 'fail' ) ? 'fail' : 'warn';
+            } elseif ( $r['status'] === 'warn' && $overall === 'ok' ) {
+                $overall = 'warn';
+            }
+        }
+        return array(
+            'overall'     => $overall,
+            'checks'      => $results,
+            'checks_count'=> count( $results ),
+            'timestamp'   => current_time( 'mysql' ),
+        );
+    }
+}
+
+/* ============================================================
+ * 2. CRON REGISTRY (heartbeat tracking)
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_register_cron' ) ) {
+    /**
+     * Register a cron with auto heartbeat tracking.
+     *
+     * Wraps the callback so each run writes:
+     *   _dinoco_cron_<hook>_last_run = unix timestamp
+     *   _dinoco_cron_<hook>_last_status = 'ok' | 'error'
+     *   _dinoco_cron_<hook>_last_duration_ms = int
+     *   _dinoco_cron_<hook>_last_error = string (if any)
+     *
+     * Idempotent — multiple calls in same request are no-op for action add.
+     * wp_schedule_event called only if hook not already scheduled.
+     *
+     * @param string   $hook
+     * @param string   $schedule WP cron schedule slug (hourly|daily|twicedaily|custom)
+     * @param callable $callback
+     * @param array    $args { interval_seconds: int (override expected interval) }
+     * @return true|WP_Error
+     */
+    function dinoco_register_cron( $hook, $schedule, $callback, $args = array() ) {
+        if ( ! is_string( $hook ) || $hook === '' ) {
+            return new WP_Error( 'dnc_cron_invalid_hook', 'hook required' );
+        }
+        if ( ! is_string( $schedule ) || $schedule === '' ) {
+            return new WP_Error( 'dnc_cron_invalid_schedule', 'schedule required' );
+        }
+        if ( ! is_callable( $callback ) ) {
+            return new WP_Error( 'dnc_cron_invalid_callback', 'callback not callable' );
+        }
+
+        // Track in registry
+        if ( ! isset( $GLOBALS['_dinoco_cron_registry'] ) ) $GLOBALS['_dinoco_cron_registry'] = array();
+        $intervals      = wp_get_schedules();
+        $expected_secs  = isset( $args['interval_seconds'] ) ? (int) $args['interval_seconds']
+                          : ( isset( $intervals[ $schedule ]['interval'] ) ? (int) $intervals[ $schedule ]['interval'] : 3600 );
+        $GLOBALS['_dinoco_cron_registry'][ $hook ] = array(
+            'hook'             => $hook,
+            'schedule'         => $schedule,
+            'expected_seconds' => $expected_secs,
+            'registered_at'    => current_time( 'mysql' ),
+        );
+
+        // Wrap callback for heartbeat — only add once
+        $wrapper_action_key = '_dinoco_cron_wrapper_added_' . md5( $hook );
+        if ( empty( $GLOBALS[ $wrapper_action_key ] ) ) {
+            $GLOBALS[ $wrapper_action_key ] = true;
+            add_action( $hook, function() use ( $hook, $callback ) {
+                $start  = microtime( true );
+                $status = 'ok';
+                $err    = '';
+                try {
+                    call_user_func( $callback );
+                } catch ( \Throwable $e ) {
+                    $status = 'error';
+                    $err    = mb_substr( $e->getMessage(), 0, 500 );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( 'error', '[cron] ' . $hook . ' exception', array(
+                            'hook' => $hook, 'message' => $e->getMessage(),
+                        ) );
+                    }
+                }
+                $elapsed_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
+                update_option( '_dinoco_cron_' . $hook . '_last_run', time(), false );
+                update_option( '_dinoco_cron_' . $hook . '_last_status', $status, false );
+                update_option( '_dinoco_cron_' . $hook . '_last_duration_ms', $elapsed_ms, false );
+                update_option( '_dinoco_cron_' . $hook . '_last_error', $err, false );
+                if ( function_exists( 'dinoco_audit_log' ) && $status === 'error' ) {
+                    dinoco_audit_log( array(
+                        'event_type'  => 'cron_error',
+                        'actor_type'  => 'cron',
+                        'actor_id'    => $hook,
+                        'target_type' => 'cron',
+                        'target_id'   => $hook,
+                        'error_msg'   => $err,
+                        'success'     => 0,
+                        'context'     => array( 'duration_ms' => $elapsed_ms ),
+                    ) );
+                }
+            } );
+        }
+
+        // Schedule if not yet
+        if ( ! wp_next_scheduled( $hook ) ) {
+            wp_schedule_event( time() + 60, $schedule, $hook );
+        }
+
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_cron_registry' ) ) {
+    function dinoco_get_cron_registry() {
+        return isset( $GLOBALS['_dinoco_cron_registry'] ) && is_array( $GLOBALS['_dinoco_cron_registry'] )
+            ? $GLOBALS['_dinoco_cron_registry'] : array();
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_cron_heartbeat' ) ) {
+    /**
+     * Get full heartbeat snapshot for all registered crons.
+     */
+    function dinoco_get_cron_heartbeat() {
+        $registry = dinoco_get_cron_registry();
+        $now      = time();
+        $rows     = array();
+        foreach ( $registry as $hook => $def ) {
+            $last_run    = (int) get_option( '_dinoco_cron_' . $hook . '_last_run', 0 );
+            $last_status = (string) get_option( '_dinoco_cron_' . $hook . '_last_status', '' );
+            $duration    = (int) get_option( '_dinoco_cron_' . $hook . '_last_duration_ms', 0 );
+            $error       = (string) get_option( '_dinoco_cron_' . $hook . '_last_error', '' );
+            $next_sched  = (int) ( wp_next_scheduled( $hook ) ?: 0 );
+            $secs_since  = $last_run > 0 ? ( $now - $last_run ) : null;
+            $expected    = (int) $def['expected_seconds'];
+
+            // Stale: never run, OR last_run > 2× expected interval
+            if ( $last_run === 0 ) {
+                $health = 'warn';
+                $detail = 'never_ran';
+            } elseif ( $expected > 0 && $secs_since > $expected * 2 ) {
+                $health = 'warn';
+                $detail = 'stale_' . $secs_since . 's';
+            } elseif ( $last_status === 'error' ) {
+                $health = 'warn';
+                $detail = 'last_run_error';
+            } else {
+                $health = 'ok';
+                $detail = '';
+            }
+
+            $rows[] = array(
+                'hook'                => $hook,
+                'schedule'            => $def['schedule'],
+                'expected_seconds'    => $expected,
+                'last_run'            => $last_run,
+                'last_run_human'      => $last_run > 0 ? wp_date( 'Y-m-d H:i:s', $last_run ) : '(never)',
+                'seconds_since'       => $secs_since,
+                'last_status'         => $last_status,
+                'last_duration_ms'    => $duration,
+                'last_error'          => $error,
+                'next_scheduled'      => $next_sched,
+                'next_scheduled_human'=> $next_sched > 0 ? wp_date( 'Y-m-d H:i:s', $next_sched ) : '(none)',
+                'health'              => $health,
+                'detail'              => $detail,
+            );
+        }
+        return $rows;
+    }
+}
+
+/* ============================================================
+ * 3. BUILT-IN HEALTH CHECKS
+ * ============================================================ */
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_health_check' ) ) return;
+
+    // 1. Cron heartbeat — any registered cron stale or last-run-error
+    dinoco_register_health_check( 'cron_heartbeat', function() {
+        $rows = dinoco_get_cron_heartbeat();
+        if ( empty( $rows ) ) {
+            return array( 'status' => 'ok', 'detail' => 'no_crons_registered' );
+        }
+        $stale = array();
+        $err   = array();
+        foreach ( $rows as $r ) {
+            if ( $r['health'] === 'warn' ) {
+                if ( $r['detail'] === 'last_run_error' ) {
+                    $err[] = $r['hook'];
+                } else {
+                    $stale[] = $r['hook'];
+                }
+            }
+        }
+        if ( ! empty( $err ) ) {
+            return array(
+                'status' => 'warn',
+                'detail' => 'crons_with_errors: ' . implode( ', ', $err ),
+                'metric' => count( $err ),
+            );
+        }
+        if ( ! empty( $stale ) ) {
+            return array(
+                'status' => 'warn',
+                'detail' => 'stale_crons: ' . implode( ', ', $stale ),
+                'metric' => count( $stale ),
+            );
+        }
+        return array(
+            'status' => 'ok',
+            'detail' => count( $rows ) . '_crons_healthy',
+            'metric' => count( $rows ),
+        );
+    }, array( 'critical' => false, 'label' => 'Cron Heartbeat' ) );
+
+    // 2. DB invariants — basic connectivity smoke test
+    dinoco_register_health_check( 'db_invariants', function() {
+        global $wpdb;
+        $val = $wpdb->get_var( "SELECT 1" );
+        if ( $val !== '1' && $val !== 1 ) {
+            return array( 'status' => 'fail', 'detail' => 'db_select_1_failed' );
+        }
+        // Count dinoco_audit_log rows in last 24h (smoke test that audit infra is alive)
+        $table = $wpdb->prefix . 'dinoco_audit_log';
+        $tbl_exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $tbl_exists ) {
+            return array(
+                'status' => 'warn',
+                'detail' => 'audit_log_table_missing (Snippet 15 V.8.9 not synced?)',
+            );
+        }
+        return array( 'status' => 'ok', 'detail' => 'db_responsive' );
+    }, array( 'critical' => true, 'label' => 'Database Smoke Test' ) );
+
+    // 3. Flag consistency — Module Registry orphans (snippet disabled but module registered)
+    dinoco_register_health_check( 'flag_consistency', function() {
+        $errors = isset( $GLOBALS['_dinoco_module_registry_errors'] ) && is_array( $GLOBALS['_dinoco_module_registry_errors'] )
+            ? array_unique( $GLOBALS['_dinoco_module_registry_errors'] ) : array();
+        if ( ! empty( $errors ) ) {
+            return array(
+                'status' => 'warn',
+                'detail' => 'module_registry_orphans: ' . count( $errors ),
+                'metric' => count( $errors ),
+            );
+        }
+        $modules = function_exists( 'dinoco_get_registered_modules' ) ? dinoco_get_registered_modules() : array();
+        return array(
+            'status' => 'ok',
+            'detail' => count( $modules ) . '_modules_clean',
+            'metric' => count( $modules ),
+        );
+    }, array( 'critical' => false, 'label' => 'Module Registry Health' ) );
+
+    // 4. Audit log health — recent write activity (last 24h)
+    dinoco_register_health_check( 'audit_log_health', function() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_audit_log';
+        $exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $exists ) {
+            return array(
+                'status' => 'warn',
+                'detail' => 'audit_table_missing',
+            );
+        }
+        $count_24h = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$table} WHERE created_at >= NOW() - INTERVAL 1 DAY"
+        );
+        $err_24h = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$table} WHERE created_at >= NOW() - INTERVAL 1 DAY AND success=0"
+        );
+        $total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
+        if ( $count_24h > 0 && ( $err_24h / max( 1, $count_24h ) ) > 0.2 ) {
+            return array(
+                'status' => 'warn',
+                'detail' => sprintf( 'high_error_rate_24h: %d/%d', $err_24h, $count_24h ),
+                'metric' => $err_24h,
+            );
+        }
+        return array(
+            'status' => 'ok',
+            'detail' => sprintf( '24h=%d total=%d errors=%d', $count_24h, $total, $err_24h ),
+            'metric' => $count_24h,
+        );
+    }, array( 'critical' => false, 'label' => 'Audit Log Health' ) );
+
+}, 30 ); // priority 30 = after Module Registry (20) + Audit Log (defaults)
+
+/* ============================================================
+ * 4. ADMIN DASHBOARD SHORTCODE — [dinoco_admin_health_dashboard]
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_admin_health_dashboard_shortcode' ) ) {
+    function dinoco_admin_health_dashboard_shortcode() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p>คุณไม่มีสิทธิ์เข้าถึงหน้านี้</p>';
+        }
+        $status = dinoco_get_health_status();
+        $crons  = dinoco_get_cron_heartbeat();
+        $nonce  = wp_create_nonce( 'wp_rest' );
+        $rest   = esc_url_raw( rest_url( 'dinoco/v1/' ) );
+
+        ob_start();
+        ?>
+        <div class="dnc-health">
+            <style>
+                .dnc-health { max-width: 1100px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+                .dnc-health h2 { font-size: 22px; margin: 0 0 8px; color: #111827; }
+                .dnc-health .dnc-h-sub { color: #6b7280; margin: 0 0 16px; font-size: 14px; }
+                .dnc-h-overall { display: flex; gap: 12px; align-items: center; padding: 16px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; }
+                .dnc-h-overall.ok { background: #d1fae5; color: #065f46; }
+                .dnc-h-overall.warn { background: #fef3c7; color: #92400e; }
+                .dnc-h-overall.fail { background: #fee2e2; color: #991b1b; }
+                .dnc-h-overall .dot { width: 14px; height: 14px; border-radius: 50%; }
+                .dnc-h-overall.ok .dot { background: #10b981; }
+                .dnc-h-overall.warn .dot { background: #f59e0b; }
+                .dnc-h-overall.fail .dot { background: #ef4444; }
+                .dnc-h-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-bottom: 24px; }
+                .dnc-h-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }
+                .dnc-h-card .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+                .dnc-h-card .head .lbl { font-weight: 600; color: #111827; }
+                .dnc-h-card .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+                .dnc-h-card .badge.ok { background: #d1fae5; color: #065f46; }
+                .dnc-h-card .badge.warn { background: #fef3c7; color: #92400e; }
+                .dnc-h-card .badge.fail { background: #fee2e2; color: #991b1b; }
+                .dnc-h-card .detail { font-size: 12px; color: #6b7280; word-break: break-word; }
+                .dnc-h-card .meta { font-size: 11px; color: #9ca3af; margin-top: 6px; }
+                .dnc-h-card button { margin-top: 8px; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
+                .dnc-h-tbl { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+                .dnc-h-tbl th, .dnc-h-tbl td { padding: 8px 10px; text-align: left; font-size: 13px; border-bottom: 1px solid #f3f4f6; }
+                .dnc-h-tbl th { background: #f9fafb; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #374151; }
+                .dnc-h-tbl tr:last-child td { border-bottom: 0; }
+                .dnc-h-tbl .pill { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+                .dnc-h-tbl .pill.ok { background: #d1fae5; color: #065f46; }
+                .dnc-h-tbl .pill.warn { background: #fef3c7; color: #92400e; }
+                .dnc-h-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+                .dnc-h-btn { padding: 8px 14px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
+                .dnc-h-btn.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+                .dnc-h-spinner { display: none; color: #6b7280; font-size: 12px; }
+                .dnc-h-spinner.show { display: inline; }
+            </style>
+
+            <h2>DINOCO Health Monitor</h2>
+            <p class="dnc-h-sub">เช็คสุขภาพ subsystem ทั้งหมดในที่เดียว — auto-refresh ทุก 30 วิ</p>
+
+            <div class="dnc-h-toolbar">
+                <button type="button" class="dnc-h-btn primary" onclick="window._dnchRefresh && window._dnchRefresh();">↻ Refresh</button>
+                <span class="dnc-h-spinner" id="dnch-spin">กำลังโหลด...</span>
+                <span style="color:#9ca3af;font-size:12px;margin-left:auto" id="dnch-last">last: <?php echo esc_html( $status['timestamp'] ); ?></span>
+            </div>
+
+            <div class="dnc-h-overall <?php echo esc_attr( $status['overall'] ); ?>" id="dnch-overall">
+                <span class="dot"></span>
+                <span>Overall Status: <strong style="text-transform:uppercase"><?php echo esc_html( $status['overall'] ); ?></strong></span>
+                <span style="margin-left:auto;font-weight:400;font-size:13px"><?php echo (int) $status['checks_count']; ?> checks</span>
+            </div>
+
+            <h3 style="margin:8px 0 12px;font-size:16px;color:#374151">Health Checks</h3>
+            <div class="dnc-h-grid" id="dnch-checks">
+                <?php foreach ( $status['checks'] as $chk ) : ?>
+                    <div class="dnc-h-card" data-check="<?php echo esc_attr( $chk['key'] ); ?>">
+                        <div class="head">
+                            <span class="lbl"><?php echo esc_html( $chk['label'] ); ?></span>
+                            <span class="badge <?php echo esc_attr( $chk['status'] ); ?>"><?php echo esc_html( $chk['status'] ); ?></span>
+                        </div>
+                        <div class="detail"><?php echo esc_html( isset( $chk['detail'] ) ? $chk['detail'] : '' ); ?></div>
+                        <div class="meta"><?php echo esc_html( $chk['key'] ); ?>
+                            <?php if ( isset( $chk['elapsed_ms'] ) ) : ?>
+                                · <?php echo (int) $chk['elapsed_ms']; ?>ms
+                            <?php endif; ?>
+                            <?php if ( ! empty( $chk['critical'] ) ) : ?>
+                                · <span style="color:#b45309">critical</span>
+                            <?php endif; ?>
+                        </div>
+                        <button type="button" onclick="window._dnchRunCheck && window._dnchRunCheck('<?php echo esc_js( $chk['key'] ); ?>');">▶ Run check now</button>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+
+            <h3 style="margin:24px 0 12px;font-size:16px;color:#374151">Cron Heartbeat (<?php echo count( $crons ); ?>)</h3>
+            <?php if ( empty( $crons ) ) : ?>
+                <div style="padding:24px;text-align:center;color:#6b7280;background:#f9fafb;border-radius:8px">
+                    ยังไม่มี cron ที่ลงทะเบียนผ่าน <code>dinoco_register_cron()</code> — Phase 4 จะ migrate ทีละตัว
+                </div>
+            <?php else : ?>
+                <table class="dnc-h-tbl" id="dnch-crons">
+                    <thead><tr>
+                        <th>Hook</th>
+                        <th>Schedule</th>
+                        <th>Last Run</th>
+                        <th>Time Since</th>
+                        <th>Duration</th>
+                        <th>Status</th>
+                    </tr></thead>
+                    <tbody>
+                    <?php foreach ( $crons as $r ) : ?>
+                        <tr>
+                            <td><code style="font-size:12px"><?php echo esc_html( $r['hook'] ); ?></code></td>
+                            <td><?php echo esc_html( $r['schedule'] ); ?></td>
+                            <td><?php echo esc_html( $r['last_run_human'] ); ?></td>
+                            <td><?php echo $r['seconds_since'] !== null ? (int) $r['seconds_since'] . 's' : '—'; ?></td>
+                            <td><?php echo (int) $r['last_duration_ms']; ?>ms</td>
+                            <td><span class="pill <?php echo esc_attr( $r['health'] ); ?>"><?php echo esc_html( $r['health'] ); ?></span>
+                                <?php if ( ! empty( $r['detail'] ) ) : ?>
+                                    <div style="font-size:11px;color:#6b7280;margin-top:2px"><?php echo esc_html( $r['detail'] ); ?></div>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php endif; ?>
+        </div>
+        <script>
+        (function(){
+            var REST = <?php echo wp_json_encode( $rest ); ?>;
+            var NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+            var spin = document.getElementById('dnch-spin');
+            var last = document.getElementById('dnch-last');
+            var refreshTimer = null;
+
+            function spinOn(){ spin && spin.classList.add('show'); }
+            function spinOff(){ spin && spin.classList.remove('show'); }
+
+            function fetchJSON(url, opts){
+                opts = opts || {};
+                opts.headers = opts.headers || {};
+                opts.headers['X-WP-Nonce'] = NONCE;
+                opts.credentials = 'same-origin';
+                return fetch(url, opts).then(function(r){ return r.json(); });
+            }
+
+            window._dnchRefresh = function(){
+                spinOn();
+                fetchJSON(REST + 'health?detail=1').then(function(data){
+                    spinOff();
+                    if (!data || !data.overall) return;
+                    var ov = document.getElementById('dnch-overall');
+                    ov.className = 'dnc-h-overall ' + data.overall;
+                    ov.innerHTML = '<span class="dot"></span><span>Overall Status: <strong style="text-transform:uppercase">' + data.overall + '</strong></span><span style="margin-left:auto;font-weight:400;font-size:13px">' + data.checks_count + ' checks</span>';
+                    last.textContent = 'last: ' + data.timestamp;
+                    var grid = document.getElementById('dnch-checks');
+                    if (grid && Array.isArray(data.checks)) {
+                        grid.innerHTML = data.checks.map(function(c){
+                            return '<div class="dnc-h-card" data-check="' + c.key + '">' +
+                                '<div class="head"><span class="lbl">' + (c.label || c.key) + '</span><span class="badge ' + c.status + '">' + c.status + '</span></div>' +
+                                '<div class="detail">' + (c.detail || '') + '</div>' +
+                                '<div class="meta">' + c.key + ' · ' + (c.elapsed_ms || 0) + 'ms' + (c.critical ? ' · <span style="color:#b45309">critical</span>' : '') + '</div>' +
+                                '<button type="button" onclick="window._dnchRunCheck && window._dnchRunCheck(\'' + c.key + '\');">▶ Run check now</button>' +
+                                '</div>';
+                        }).join('');
+                    }
+                }).catch(function(e){ spinOff(); console.warn('[health] refresh fail', e); });
+            };
+
+            window._dnchRunCheck = function(key){
+                spinOn();
+                fetchJSON(REST + 'health/run-check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key: key })
+                }).then(function(){
+                    window._dnchRefresh();
+                }).catch(function(e){ spinOff(); console.warn('[health] run-check fail', e); });
+            };
+
+            // Auto-refresh every 30s
+            refreshTimer = setInterval(window._dnchRefresh, 30000);
+
+            // Pause when tab hidden (PERF-H3 pattern from Phase 1 audit)
+            document.addEventListener('visibilitychange', function(){
+                if (document.visibilityState === 'hidden') {
+                    if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+                } else if (!refreshTimer) {
+                    refreshTimer = setInterval(window._dnchRefresh, 30000);
+                }
+            });
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+}
+add_shortcode( 'dinoco_admin_health_dashboard', 'dinoco_admin_health_dashboard_shortcode' );
+
+/* ============================================================
+ * 5. REGISTER AS ADMIN MODULE
+ * ============================================================ */
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+    dinoco_register_admin_module( array(
+        'key'        => 'health_dashboard',
+        'shortcode'  => 'dinoco_admin_health_dashboard',
+        'label'      => 'Health Monitor',
+        'section'    => 'system',
+        'icon'       => 'fa-heartbeat',
+        'color'      => '#10b981',
+        'cache_ttl'  => 0,
+        'capability' => 'manage_options',
+        'order'      => 80,
+        'source'     => '[Admin System] DINOCO Health Monitor V.1.0',
+    ) );
+}, 35 ); // priority 35 = after health checks register (30)
+
+/* ============================================================
+ * 6. REST ENDPOINTS
+ * ============================================================ */
+
+add_action( 'rest_api_init', function() {
+
+    // Public top-level health (no auth) — only overall + counts, no internal detail
+    register_rest_route( 'dinoco/v1', '/health', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_health_rest',
+        'permission_callback' => '__return_true',
+        'args'                => array(
+            'detail' => array( 'sanitize_callback' => 'absint' ),
+        ),
+    ) );
+
+    // Manual run a single check (admin only + nonce)
+    register_rest_route( 'dinoco/v1', '/health/run-check', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_health_rest_run_check',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+        'args'                => array(
+            'key' => array( 'required' => true, 'sanitize_callback' => 'sanitize_text_field' ),
+        ),
+    ) );
+
+    // Cron heartbeat (admin only)
+    register_rest_route( 'dinoco/v1', '/cron/heartbeat', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_cron_rest_heartbeat',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_health_rest' ) ) {
+    function dinoco_health_rest( $request ) {
+        $detail = (int) $request->get_param( 'detail' );
+        $status = dinoco_get_health_status();
+
+        if ( $detail !== 1 ) {
+            // Public response — no internal details (security: don't leak system topology)
+            return array(
+                'overall'      => $status['overall'],
+                'checks_count' => $status['checks_count'],
+                'timestamp'    => $status['timestamp'],
+            );
+        }
+
+        // Detail mode — admin only
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'forbidden', 'detail=1 requires manage_options', array( 'status' => 403 ) );
+        }
+        return $status;
+    }
+}
+
+if ( ! function_exists( 'dinoco_health_rest_run_check' ) ) {
+    function dinoco_health_rest_run_check( $request ) {
+        $key = (string) $request->get_param( 'key' );
+        if ( $key === '' ) {
+            return new WP_Error( 'invalid_key', 'key required', array( 'status' => 400 ) );
+        }
+        $result = dinoco_run_health_check( $key );
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            dinoco_audit_log( array(
+                'event_type'  => 'health_check_manual',
+                'target_type' => 'health_check',
+                'target_id'   => $key,
+                'context'     => array( 'status' => $result['status'], 'detail' => $result['detail'] ?? '' ),
+                'success'     => $result['status'] === 'fail' ? 0 : 1,
+            ) );
+        }
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'dinoco_cron_rest_heartbeat' ) ) {
+    function dinoco_cron_rest_heartbeat() {
+        $rows = dinoco_get_cron_heartbeat();
+        return array(
+            'count' => count( $rows ),
+            'rows'  => $rows,
+        );
+    }
+}

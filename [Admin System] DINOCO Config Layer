@@ -1,0 +1,782 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Config Layer                          ║
+ * ║  Version: V.1.0 (2026-04-24) — Phase 3 Architecture Refactor ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
+ * ║  Description: Schema-driven config layer (Pillar 4).          ║
+ * ║    Replaces the "132+ raw get_option() calls scatter" pain    ║
+ * ║    that produced silent flag-drift + typo bugs (e.g. typo     ║
+ * ║    "b2b_flag_bo_systmem" → default OFF silently).             ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * What it does:
+ *   - dinoco_register_config([...])  — declare schema (type/default/section)
+ *   - dinoco_config($key, $default)  — read with type-coerce + cache + legacy mapping
+ *   - dinoco_config_set($key, $val)  — write with validation + audit log + cache bust
+ *   - dinoco_get_config_schema()     — full schema grouped by section (admin viewer)
+ *   - shortcode [dinoco_admin_config_viewer] — section-grouped tab UI
+ *   - REST GET /dinoco/v1/config/list?section=slip  (admin only)
+ *
+ * Backward compat (CRITICAL):
+ *   - 132+ existing `get_option('b2b_flag_*')` calls remain UNTOUCHED
+ *   - dinoco_config('bo.flag_enabled') with `legacy_option` schema field
+ *     transparently reads/writes `b2b_flag_bo_system` — both APIs see
+ *     the same value
+ *   - Disabling this snippet → no fatals, just lose the typed accessor
+ *
+ * Storage:
+ *   - Schema: in-memory $GLOBALS['_dinoco_config_schema'] (per-request)
+ *   - Values: standard wp_options (legacy mapping or `dinoco_config_<dotted>`)
+ *
+ * Why a separate snippet (not inside Snippet 1):
+ *   - Mirrors Module Registry / Audit Log / Modal Helpers / Observability
+ *   - Admin UI is concern-isolated (no REST/cron coupling)
+ *   - Easier kill-switch — disable snippet to revert to raw get_option()
+ *
+ * Schema field reference (passed to dinoco_register_config):
+ *   key            string  required  dot-notation 'namespace.key' (^[a-z0-9_.]+$)
+ *   type           string  required  int|float|string|bool|array
+ *   default        mixed   required  fallback when option unset / invalid
+ *   label          string  optional  human-readable label for UI
+ *   description    string  optional  helper text
+ *   section        string  optional  group key (default = first segment of $key)
+ *   legacy_option  string  optional  existing wp_option key (backward compat)
+ *   choices        array   optional  for type=string with fixed enum
+ *   min/max        number  optional  for type=int|float (clamps / falls back on out-of-range)
+ *   validate       callable optional return true|WP_Error
+ *   sensitive      bool    optional  hide value in viewer (mask as ********)
+ *
+ * Audit hookup:
+ *   dinoco_config_set() calls dinoco_audit_log() if available
+ *   event_type = 'config_change'
+ *   target_type = 'config' / target_id = the dotted key
+ *   delta_before / delta_after = stringified old/new values
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ============================================================
+ * 1. SCHEMA REGISTRATION
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_register_config' ) ) {
+    /**
+     * Register a config schema entry. Idempotent — same key re-registered
+     * overrides the previous registration (snippet hot-reload friendly).
+     *
+     * @param array $args see header for full schema.
+     * @return true|WP_Error
+     */
+    function dinoco_register_config( $args ) {
+        if ( ! is_array( $args ) ) {
+            return new WP_Error( 'dnc_cfg_invalid_args', 'args must be array' );
+        }
+
+        $defaults = array(
+            'key'           => '',
+            'type'          => 'string',
+            'default'       => null,
+            'label'         => '',
+            'description'   => '',
+            'section'       => '',
+            'legacy_option' => '',
+            'choices'       => null,
+            'min'           => null,
+            'max'           => null,
+            'validate'      => null,
+            'sensitive'     => false,
+        );
+        $args = array_merge( $defaults, $args );
+
+        // ---- Validation ----
+        $errors = array();
+
+        if ( ! is_string( $args['key'] ) || $args['key'] === '' ) {
+            $errors[] = 'missing_key';
+        } elseif ( ! preg_match( '/^[a-z0-9_]+\.[a-z0-9_.]+$/', $args['key'] ) ) {
+            $errors[] = 'invalid_key_format (expected: namespace.key, lowercase a-z 0-9 _ .)';
+        }
+
+        $allowed_types = array( 'int', 'float', 'string', 'bool', 'array' );
+        if ( ! in_array( $args['type'], $allowed_types, true ) ) {
+            $errors[] = 'invalid_type (allowed: ' . implode( '|', $allowed_types ) . ')';
+        }
+
+        if ( $args['choices'] !== null && ! is_array( $args['choices'] ) ) {
+            $errors[] = 'choices_not_array';
+        }
+
+        if ( $args['validate'] !== null && ! is_callable( $args['validate'] ) ) {
+            $errors[] = 'validate_not_callable';
+        }
+
+        if ( ! empty( $errors ) ) {
+            $msg = sprintf(
+                "dinoco_register_config FAILED for key='%s': %s",
+                $args['key'], implode( ', ', $errors )
+            );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[ConfigLayer] ' . $msg );
+            } else {
+                error_log( '[DINOCO] ' . $msg );
+            }
+            return new WP_Error( 'dnc_cfg_validation_fail', $msg, $errors );
+        }
+
+        // Default section = first segment of key
+        if ( $args['section'] === '' ) {
+            $parts = explode( '.', $args['key'] );
+            $args['section'] = $parts[0];
+        }
+
+        if ( ! isset( $GLOBALS['_dinoco_config_schema'] ) || ! is_array( $GLOBALS['_dinoco_config_schema'] ) ) {
+            $GLOBALS['_dinoco_config_schema'] = array();
+        }
+        $GLOBALS['_dinoco_config_schema'][ $args['key'] ] = $args;
+
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_config_schema' ) ) {
+    /**
+     * Get full schema grouped by section, sorted alphabetically within each.
+     *
+     * @return array<string, array<string, array>> section => key => def
+     */
+    function dinoco_get_config_schema() {
+        $schema = isset( $GLOBALS['_dinoco_config_schema'] ) && is_array( $GLOBALS['_dinoco_config_schema'] )
+            ? $GLOBALS['_dinoco_config_schema'] : array();
+
+        $grouped = array();
+        foreach ( $schema as $key => $def ) {
+            $section = isset( $def['section'] ) ? $def['section'] : 'misc';
+            if ( ! isset( $grouped[ $section ] ) ) $grouped[ $section ] = array();
+            $grouped[ $section ][ $key ] = $def;
+        }
+
+        ksort( $grouped );
+        foreach ( $grouped as &$entries ) {
+            ksort( $entries );
+        }
+        unset( $entries );
+
+        return $grouped;
+    }
+}
+
+if ( ! function_exists( 'dinoco_get_config_def' ) ) {
+    /**
+     * Get a single schema entry, or null if not registered.
+     */
+    function dinoco_get_config_def( $key ) {
+        if ( ! is_string( $key ) || $key === '' ) return null;
+        if ( ! isset( $GLOBALS['_dinoco_config_schema'][ $key ] ) ) return null;
+        return $GLOBALS['_dinoco_config_schema'][ $key ];
+    }
+}
+
+/* ============================================================
+ * 2. READ / WRITE API
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_config_option_key' ) ) {
+    /**
+     * Translate a dotted config key to a wp_option key.
+     * If schema declares legacy_option → use that (backward compat).
+     * Else → 'dinoco_config_' + dot-replaced-with-underscore.
+     */
+    function dinoco_config_option_key( $key ) {
+        $def = dinoco_get_config_def( $key );
+        if ( $def && ! empty( $def['legacy_option'] ) ) {
+            return (string) $def['legacy_option'];
+        }
+        return 'dinoco_config_' . str_replace( '.', '_', $key );
+    }
+}
+
+if ( ! function_exists( 'dinoco_config_coerce' ) ) {
+    /**
+     * Apply type coercion + min/max + choices validation. Returns the
+     * sanitized value, or the schema default if validation fails.
+     *
+     * @param mixed $raw   value as read from wp_options
+     * @param array $def   schema entry
+     * @param mixed $fallback caller-supplied default (used if schema default missing)
+     * @return mixed
+     */
+    function dinoco_config_coerce( $raw, $def, $fallback = null ) {
+        $default = isset( $def['default'] ) ? $def['default'] : $fallback;
+
+        // Empty string from get_option means truly unset → use default
+        if ( $raw === false || $raw === null ) {
+            return $default;
+        }
+
+        $type = isset( $def['type'] ) ? $def['type'] : 'string';
+
+        switch ( $type ) {
+            case 'int':
+                if ( ! is_numeric( $raw ) ) return $default;
+                $val = (int) $raw;
+                if ( isset( $def['min'] ) && $val < (int) $def['min'] ) return $default;
+                if ( isset( $def['max'] ) && $val > (int) $def['max'] ) return $default;
+                return $val;
+
+            case 'float':
+                if ( ! is_numeric( $raw ) ) return $default;
+                $val = (float) $raw;
+                if ( isset( $def['min'] ) && $val < (float) $def['min'] ) return $default;
+                if ( isset( $def['max'] ) && $val > (float) $def['max'] ) return $default;
+                return $val;
+
+            case 'bool':
+                if ( is_bool( $raw ) ) return $raw;
+                if ( $raw === '1' || $raw === 1 || $raw === 'true' || $raw === true ) return true;
+                if ( $raw === '0' || $raw === 0 || $raw === 'false' || $raw === '' || $raw === false ) return false;
+                return (bool) $default;
+
+            case 'array':
+                if ( is_array( $raw ) ) return $raw;
+                if ( is_string( $raw ) ) {
+                    $decoded = json_decode( $raw, true );
+                    if ( is_array( $decoded ) ) return $decoded;
+                }
+                return is_array( $default ) ? $default : array();
+
+            case 'string':
+            default:
+                $val = is_scalar( $raw ) ? (string) $raw : $default;
+                if ( ! empty( $def['choices'] ) && is_array( $def['choices'] )
+                     && ! in_array( $val, $def['choices'], true ) ) {
+                    return $default;
+                }
+                return $val;
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_config' ) ) {
+    /**
+     * Read a config value with type coercion + per-request cache.
+     *
+     * If key NOT registered → fall back to raw get_option of legacy-style
+     * 'dinoco_config_<dotted>' key, returning $default.
+     *
+     * @param string $key dot-notation
+     * @param mixed  $default caller fallback (overridden by schema default if registered)
+     * @return mixed
+     */
+    function dinoco_config( $key, $default = null ) {
+        if ( ! is_string( $key ) || $key === '' ) return $default;
+
+        // Per-request cache
+        if ( ! isset( $GLOBALS['_dinoco_config_cache'] ) ) $GLOBALS['_dinoco_config_cache'] = array();
+        if ( array_key_exists( $key, $GLOBALS['_dinoco_config_cache'] ) ) {
+            return $GLOBALS['_dinoco_config_cache'][ $key ];
+        }
+
+        $def        = dinoco_get_config_def( $key );
+        $option_key = dinoco_config_option_key( $key );
+        $raw        = get_option( $option_key, null );
+
+        if ( $def ) {
+            $value = dinoco_config_coerce( $raw, $def, $default );
+        } else {
+            // Unregistered key — return raw (string) value or caller default
+            $value = ( $raw === false || $raw === null ) ? $default : $raw;
+        }
+
+        $GLOBALS['_dinoco_config_cache'][ $key ] = $value;
+        return $value;
+    }
+}
+
+if ( ! function_exists( 'dinoco_config_set' ) ) {
+    /**
+     * Persist a config value (admin only — caller must capability-check
+     * separately for REST flows; helper itself does NOT enforce caps).
+     * Validates against schema, writes to wp_options, busts cache, audits.
+     *
+     * @param string $key
+     * @param mixed  $value
+     * @return true|WP_Error
+     */
+    function dinoco_config_set( $key, $value ) {
+        if ( ! is_string( $key ) || $key === '' ) {
+            return new WP_Error( 'dnc_cfg_invalid_key', 'key required' );
+        }
+
+        $def        = dinoco_get_config_def( $key );
+        $option_key = dinoco_config_option_key( $key );
+        $old_raw    = get_option( $option_key, null );
+
+        // Coerce input through schema (also validates)
+        if ( $def ) {
+            // Type cast input first to detect "invalid → coerce returns default" cases
+            $coerced = dinoco_config_coerce( $value, $def, $def['default'] ?? null );
+
+            // Custom validate callback
+            if ( ! empty( $def['validate'] ) && is_callable( $def['validate'] ) ) {
+                $check = call_user_func( $def['validate'], $coerced );
+                if ( is_wp_error( $check ) ) return $check;
+                if ( $check === false ) {
+                    return new WP_Error( 'dnc_cfg_validate_fail', 'validate callback returned false' );
+                }
+            }
+
+            $to_store = $coerced;
+        } else {
+            // Unregistered — store raw scalar / array as-is
+            $to_store = $value;
+        }
+
+        // For 'array' type, JSON-encode for option storage to keep schema simple
+        // (legacy options that already store arrays directly remain unaffected)
+        $store_value = $to_store;
+        if ( $def && $def['type'] === 'array' && is_array( $to_store ) ) {
+            // wp_options can store arrays directly — leave as PHP array
+            $store_value = $to_store;
+        }
+        if ( $def && $def['type'] === 'bool' ) {
+            // Store as '1' / '0' strings (WP idiom for boolean flags)
+            $store_value = $to_store ? '1' : '0';
+        }
+
+        $ok = update_option( $option_key, $store_value );
+
+        // Bust cache
+        if ( isset( $GLOBALS['_dinoco_config_cache'][ $key ] ) ) {
+            unset( $GLOBALS['_dinoco_config_cache'][ $key ] );
+        }
+
+        // Audit (best-effort)
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            $old_str = is_scalar( $old_raw ) ? (string) $old_raw : wp_json_encode( $old_raw );
+            $new_str = is_scalar( $store_value ) ? (string) $store_value : wp_json_encode( $store_value );
+            $ctx     = array( 'option_key' => $option_key );
+            if ( $def ) {
+                $ctx['type']    = $def['type'];
+                $ctx['section'] = $def['section'];
+                if ( ! empty( $def['legacy_option'] ) ) $ctx['legacy_option'] = $def['legacy_option'];
+                if ( ! empty( $def['sensitive'] ) ) {
+                    $old_str = '[REDACTED]';
+                    $new_str = '[REDACTED]';
+                }
+            }
+            dinoco_audit_log( array(
+                'event_type'   => 'config_change',
+                'target_type'  => 'config',
+                'target_id'    => $key,
+                'delta_before' => $old_str,
+                'delta_after'  => $new_str,
+                'context'      => $ctx,
+                'success'      => $ok ? 1 : 0,
+            ) );
+        }
+
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_config_reset' ) ) {
+    /**
+     * Reset a config to its schema default (delete the wp_option row so
+     * subsequent reads re-coerce from default).
+     */
+    function dinoco_config_reset( $key ) {
+        $def        = dinoco_get_config_def( $key );
+        if ( ! $def ) {
+            return new WP_Error( 'dnc_cfg_unknown_key', 'key not registered' );
+        }
+        $option_key = dinoco_config_option_key( $key );
+        $old_raw    = get_option( $option_key, null );
+        delete_option( $option_key );
+        if ( isset( $GLOBALS['_dinoco_config_cache'][ $key ] ) ) {
+            unset( $GLOBALS['_dinoco_config_cache'][ $key ] );
+        }
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            dinoco_audit_log( array(
+                'event_type'   => 'config_reset',
+                'target_type'  => 'config',
+                'target_id'    => $key,
+                'delta_before' => is_scalar( $old_raw ) ? (string) $old_raw : wp_json_encode( $old_raw ),
+                'delta_after'  => '(default)',
+                'context'      => array( 'option_key' => $option_key ),
+            ) );
+        }
+        return true;
+    }
+}
+
+/* ============================================================
+ * 3. SEED REGISTRATIONS — register existing flags as Phase 3 examples
+ *
+ * These registrations are intentionally a SMALL seed set. Per the spec,
+ * "register key flags ที่ใช้บ่อย (ไม่ต้องครบทุก option)" — additional
+ * snippets can register their own configs at boot. Backward compat is
+ * preserved: legacy_option points to the existing wp_option key so
+ * raw get_option() callers continue to work.
+ * ============================================================ */
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_config' ) ) return;
+
+    // ---- Slip system ----
+    dinoco_register_config( array(
+        'key'         => 'slip.lock_ttl_seconds',
+        'type'        => 'int',
+        'default'     => 60,
+        'min'         => 1,
+        'max'         => 3600,
+        'label'       => 'Slip Lock TTL (วินาที)',
+        'description' => 'ระยะเวลา MySQL GET_LOCK ของ slip pipeline ก่อน timeout',
+        'section'     => 'slip',
+    ) );
+    dinoco_register_config( array(
+        'key'         => 'slip.replay_pool_enabled',
+        'type'        => 'bool',
+        'default'     => true,
+        'label'       => 'Slip Replay Pool',
+        'description' => 'เปิด replay pool กัน slip ซ้ำใน 24 ชม.',
+        'section'     => 'slip',
+    ) );
+
+    // ---- BO system (legacy mapping) ----
+    dinoco_register_config( array(
+        'key'           => 'bo.flag_enabled',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'b2b_flag_bo_system',
+        'label'         => 'B2B Backorder System',
+        'description'   => 'master switch — Opaque Accept + Admin Split BO. ปิด = revert ไป Phase 0',
+        'section'       => 'bo',
+    ) );
+    dinoco_register_config( array(
+        'key'         => 'bo.daily_qty_per_sku',
+        'type'        => 'int',
+        'default'     => 2000,
+        'min'         => 1,
+        'max'         => 100000,
+        'legacy_option' => 'b2b_bo_daily_qty_per_sku',
+        'label'       => 'BO Daily Qty Cap per SKU',
+        'section'     => 'bo',
+    ) );
+
+    // ---- Inventory ----
+    dinoco_register_config( array(
+        'key'           => 'inventory.oos_gate_hierarchy_compute',
+        'type'          => 'bool',
+        'default'       => true,
+        'legacy_option' => 'dinoco_oos_gate_hierarchy_compute',
+        'label'         => 'OOS Gate (Hierarchy)',
+        'description'   => 'ใช้ hierarchy-aware OOS check (V.33.5 hotfix). ปิด = ใช้ b2b_check_oos_memory เดิม',
+        'section'       => 'inventory',
+    ) );
+    dinoco_register_config( array(
+        'key'           => 'inventory.auto_unlock_enabled',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'dinoco_auto_unlock_enabled',
+        'label'         => 'Auto-Unlock Manual Hold',
+        'description'   => '72hr auto-unlock manual_hold (canary OFF default)',
+        'section'       => 'inventory',
+    ) );
+    dinoco_register_config( array(
+        'key'           => 'inventory.shipping_meta_enabled',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'dinoco_shipping_meta_enabled',
+        'label'         => 'Flash Shipping V.42 metadata',
+        'description'   => 'เปิด per-SKU weight/dims/article_category สำหรับ Flash API',
+        'section'       => 'inventory',
+    ) );
+
+    // ---- B2F ----
+    dinoco_register_config( array(
+        'key'           => 'b2f.flag_shadow_write',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'b2f_flag_shadow_write',
+        'label'         => 'B2F Shadow-Write',
+        'description'   => 'Phase 2 dual-write CPT → junction',
+        'section'       => 'b2f',
+    ) );
+    dinoco_register_config( array(
+        'key'           => 'b2f.flag_read_from_junction',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'b2f_flag_read_from_junction',
+        'label'         => 'B2F Read From Junction',
+        'description'   => 'Phase 3 cut-over — LIFF/Admin reads junction',
+        'section'       => 'b2f',
+    ) );
+    dinoco_register_config( array(
+        'key'           => 'b2f.flag_coverage_autosync',
+        'type'          => 'bool',
+        'default'       => true,
+        'legacy_option' => 'b2f_flag_coverage_autosync',
+        'label'         => 'B2F Coverage Auto-Sync',
+        'description'   => 'reactive auto-sync parent SET เมื่อ leaf coverage ครบ',
+        'section'       => 'b2f',
+    ) );
+
+    // ---- Observability ----
+    dinoco_register_config( array(
+        'key'           => 'observability.sentry_enabled',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'dinoco_obs_sentry_enabled',
+        'label'         => 'Sentry forwarding',
+        'section'       => 'observability',
+    ) );
+    dinoco_register_config( array(
+        'key'           => 'observability.correlation_enabled',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'dinoco_obs_correlation_enabled',
+        'label'         => 'X-Request-ID correlation',
+        'section'       => 'observability',
+    ) );
+
+    // ---- GDPR ----
+    dinoco_register_config( array(
+        'key'           => 'gdpr.enabled',
+        'type'          => 'bool',
+        'default'       => false,
+        'legacy_option' => 'dinoco_gdpr_enabled',
+        'label'         => 'GDPR/PDPA Endpoints',
+        'description'   => 'เปิด /my-data-export + /my-data-delete (default 503 ถ้าปิด)',
+        'section'       => 'gdpr',
+    ) );
+
+    // ---- System ----
+    dinoco_register_config( array(
+        'key'           => 'system.timezone',
+        'type'          => 'string',
+        'default'       => 'Asia/Bangkok',
+        'label'         => 'Timezone (display only)',
+        'description'   => 'hardcoded ทุก subsystem; เปลี่ยนค่าตรงนี้ไม่กระทบโค้ด',
+        'section'       => 'system',
+    ) );
+
+}, 25 ); // priority 25 = after Module Registry (20) so Audit Log helpers ready
+
+/* ============================================================
+ * 4. ADMIN VIEWER SHORTCODE — [dinoco_admin_config_viewer]
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_admin_config_viewer_shortcode' ) ) {
+    function dinoco_admin_config_viewer_shortcode() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p>คุณไม่มีสิทธิ์เข้าถึงหน้านี้</p>';
+        }
+
+        // Handle POST (save) — single-form per row, in-place UI
+        $notice = '';
+        if ( isset( $_POST['_dnc_cfg_nonce'] ) && wp_verify_nonce( $_POST['_dnc_cfg_nonce'], 'dnc_cfg_save' ) ) {
+            $action = isset( $_POST['_dnc_cfg_action'] ) ? sanitize_text_field( $_POST['_dnc_cfg_action'] ) : '';
+            $key    = isset( $_POST['_dnc_cfg_key'] ) ? sanitize_text_field( $_POST['_dnc_cfg_key'] ) : '';
+            if ( $action === 'set' && $key !== '' ) {
+                $val = isset( $_POST['_dnc_cfg_value'] ) ? wp_unslash( $_POST['_dnc_cfg_value'] ) : '';
+                $res = dinoco_config_set( $key, $val );
+                $notice = is_wp_error( $res )
+                    ? '<div class="dnc-cfg-notice dnc-cfg-err">บันทึกไม่สำเร็จ: ' . esc_html( $res->get_error_message() ) . '</div>'
+                    : '<div class="dnc-cfg-notice dnc-cfg-ok">บันทึก ' . esc_html( $key ) . ' เรียบร้อย</div>';
+            } elseif ( $action === 'reset' && $key !== '' ) {
+                $res = dinoco_config_reset( $key );
+                $notice = is_wp_error( $res )
+                    ? '<div class="dnc-cfg-notice dnc-cfg-err">รีเซ็ตไม่สำเร็จ: ' . esc_html( $res->get_error_message() ) . '</div>'
+                    : '<div class="dnc-cfg-notice dnc-cfg-ok">รีเซ็ต ' . esc_html( $key ) . ' กลับเป็นค่า default แล้ว</div>';
+            }
+        }
+
+        $grouped = dinoco_get_config_schema();
+
+        ob_start();
+        ?>
+        <div class="dnc-cfg-viewer">
+            <style>
+                .dnc-cfg-viewer { max-width: 1100px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+                .dnc-cfg-viewer h2 { font-size: 22px; margin: 0 0 8px; color: #111827; }
+                .dnc-cfg-viewer .dnc-cfg-sub { color: #6b7280; margin: 0 0 16px; font-size: 14px; }
+                .dnc-cfg-section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 16px; overflow: hidden; }
+                .dnc-cfg-section h3 { margin: 0; padding: 12px 16px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em; color: #374151; }
+                .dnc-cfg-row { display: flex; flex-wrap: wrap; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #f3f4f6; align-items: center; }
+                .dnc-cfg-row:last-child { border-bottom: 0; }
+                .dnc-cfg-meta { flex: 1 1 280px; min-width: 220px; }
+                .dnc-cfg-meta .dnc-cfg-key { font-family: monospace; font-size: 13px; color: #111827; }
+                .dnc-cfg-meta .dnc-cfg-label { font-size: 14px; font-weight: 600; color: #111827; margin-top: 2px; }
+                .dnc-cfg-meta .dnc-cfg-desc { font-size: 12px; color: #6b7280; margin-top: 4px; line-height: 1.5; }
+                .dnc-cfg-input { flex: 1 1 240px; min-width: 180px; }
+                .dnc-cfg-input input[type="text"], .dnc-cfg-input input[type="number"], .dnc-cfg-input textarea, .dnc-cfg-input select {
+                    width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; font-family: inherit;
+                }
+                .dnc-cfg-input textarea { font-family: monospace; font-size: 12px; min-height: 56px; }
+                .dnc-cfg-actions { display: flex; gap: 8px; }
+                .dnc-cfg-btn { padding: 8px 14px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
+                .dnc-cfg-btn-primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+                .dnc-cfg-btn-warn { color: #b45309; border-color: #fcd34d; background: #fffbeb; }
+                .dnc-cfg-bool { display: inline-flex; gap: 8px; align-items: center; font-size: 13px; }
+                .dnc-cfg-tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-family: monospace; background: #eef2ff; color: #4338ca; }
+                .dnc-cfg-tag-legacy { background: #fef3c7; color: #92400e; margin-left: 6px; }
+                .dnc-cfg-notice { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 14px; }
+                .dnc-cfg-ok { background: #d1fae5; color: #065f46; }
+                .dnc-cfg-err { background: #fee2e2; color: #991b1b; }
+                .dnc-cfg-empty { padding: 24px; text-align: center; color: #6b7280; background: #f9fafb; border-radius: 8px; }
+            </style>
+            <h2>DINOCO Config Layer</h2>
+            <p class="dnc-cfg-sub">Schema-driven configuration viewer — schemas registered โดย snippets ตอน boot. ค่า fallback ไป default ของ schema ถ้า wp_option ไม่ตั้ง.</p>
+            <?php echo $notice; // already escaped ?>
+
+            <?php if ( empty( $grouped ) ) : ?>
+                <div class="dnc-cfg-empty">ยังไม่มี config schema ที่ลงทะเบียน — เรียก <code>dinoco_register_config()</code> จาก snippet ของคุณ</div>
+            <?php else : ?>
+                <?php foreach ( $grouped as $section => $entries ) : ?>
+                    <div class="dnc-cfg-section">
+                        <h3><?php echo esc_html( $section ); ?> <span style="float:right;font-weight:400;text-transform:none;color:#9ca3af"><?php echo count( $entries ); ?> keys</span></h3>
+                        <?php foreach ( $entries as $key => $def ) :
+                            $cur = dinoco_config( $key );
+                            $is_sensitive = ! empty( $def['sensitive'] );
+                            ?>
+                            <div class="dnc-cfg-row">
+                                <div class="dnc-cfg-meta">
+                                    <div class="dnc-cfg-key"><?php echo esc_html( $key ); ?>
+                                        <span class="dnc-cfg-tag"><?php echo esc_html( $def['type'] ); ?></span>
+                                        <?php if ( ! empty( $def['legacy_option'] ) ) : ?>
+                                            <span class="dnc-cfg-tag dnc-cfg-tag-legacy">legacy: <?php echo esc_html( $def['legacy_option'] ); ?></span>
+                                        <?php endif; ?>
+                                    </div>
+                                    <?php if ( ! empty( $def['label'] ) ) : ?>
+                                        <div class="dnc-cfg-label"><?php echo esc_html( $def['label'] ); ?></div>
+                                    <?php endif; ?>
+                                    <?php if ( ! empty( $def['description'] ) ) : ?>
+                                        <div class="dnc-cfg-desc"><?php echo esc_html( $def['description'] ); ?></div>
+                                    <?php endif; ?>
+                                </div>
+                                <form method="post" class="dnc-cfg-input" style="display:flex;gap:8px;align-items:center;flex:1 1 320px">
+                                    <?php wp_nonce_field( 'dnc_cfg_save', '_dnc_cfg_nonce' ); ?>
+                                    <input type="hidden" name="_dnc_cfg_action" value="set" />
+                                    <input type="hidden" name="_dnc_cfg_key" value="<?php echo esc_attr( $key ); ?>" />
+                                    <?php if ( $is_sensitive ) : ?>
+                                        <input type="text" name="_dnc_cfg_value" value="********" disabled style="flex:1" />
+                                    <?php elseif ( $def['type'] === 'bool' ) : ?>
+                                        <select name="_dnc_cfg_value" style="flex:1">
+                                            <option value="0" <?php selected( ! $cur ); ?>>OFF</option>
+                                            <option value="1" <?php selected( $cur ); ?>>ON</option>
+                                        </select>
+                                    <?php elseif ( ! empty( $def['choices'] ) && is_array( $def['choices'] ) ) : ?>
+                                        <select name="_dnc_cfg_value" style="flex:1">
+                                            <?php foreach ( $def['choices'] as $c ) : ?>
+                                                <option value="<?php echo esc_attr( $c ); ?>" <?php selected( $cur === $c ); ?>><?php echo esc_html( $c ); ?></option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    <?php elseif ( $def['type'] === 'int' || $def['type'] === 'float' ) : ?>
+                                        <input type="number"
+                                            name="_dnc_cfg_value"
+                                            value="<?php echo esc_attr( (string) $cur ); ?>"
+                                            <?php if ( isset( $def['min'] ) ) echo ' min="' . esc_attr( $def['min'] ) . '"'; ?>
+                                            <?php if ( isset( $def['max'] ) ) echo ' max="' . esc_attr( $def['max'] ) . '"'; ?>
+                                            <?php if ( $def['type'] === 'float' ) echo ' step="0.01"'; ?>
+                                            style="flex:1"
+                                        />
+                                    <?php elseif ( $def['type'] === 'array' ) : ?>
+                                        <textarea name="_dnc_cfg_value" style="flex:1"><?php echo esc_textarea( wp_json_encode( $cur, JSON_UNESCAPED_UNICODE ) ); ?></textarea>
+                                    <?php else : ?>
+                                        <input type="text" name="_dnc_cfg_value" value="<?php echo esc_attr( (string) $cur ); ?>" style="flex:1" />
+                                    <?php endif; ?>
+                                    <?php if ( ! $is_sensitive ) : ?>
+                                        <button type="submit" class="dnc-cfg-btn dnc-cfg-btn-primary">บันทึก</button>
+                                    <?php endif; ?>
+                                </form>
+                                <form method="post" class="dnc-cfg-actions">
+                                    <?php wp_nonce_field( 'dnc_cfg_save', '_dnc_cfg_nonce' ); ?>
+                                    <input type="hidden" name="_dnc_cfg_action" value="reset" />
+                                    <input type="hidden" name="_dnc_cfg_key" value="<?php echo esc_attr( $key ); ?>" />
+                                    <button type="submit" class="dnc-cfg-btn dnc-cfg-btn-warn"
+                                        onclick="return confirm('รีเซ็ต <?php echo esc_js( $key ); ?> เป็น default?');">↺ default</button>
+                                </form>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+}
+add_shortcode( 'dinoco_admin_config_viewer', 'dinoco_admin_config_viewer_shortcode' );
+
+/* ============================================================
+ * 5. REGISTER AS ADMIN MODULE (Phase 1 integration)
+ * ============================================================ */
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+    dinoco_register_admin_module( array(
+        'key'        => 'config_viewer',
+        'shortcode'  => 'dinoco_admin_config_viewer',
+        'label'      => 'Config Layer',
+        'section'    => 'system',
+        'icon'       => 'fa-sliders-h',
+        'color'      => '#2563eb',
+        'cache_ttl'  => 0,
+        'capability' => 'manage_options',
+        'order'      => 70,
+        'source'     => '[Admin System] DINOCO Config Layer V.1.0',
+    ) );
+}, 30 ); // priority 30 = after schema registration (25)
+
+/* ============================================================
+ * 6. REST ENDPOINT — config inspection (admin only)
+ * ============================================================ */
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco/v1', '/config/list', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_config_rest_list',
+        'permission_callback' => function() { return current_user_can( 'manage_options' ); },
+        'args'                => array(
+            'section' => array( 'sanitize_callback' => 'sanitize_text_field' ),
+        ),
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_config_rest_list' ) ) {
+    function dinoco_config_rest_list( $request ) {
+        $section = (string) $request->get_param( 'section' );
+        $grouped = dinoco_get_config_schema();
+        if ( $section !== '' ) {
+            $grouped = isset( $grouped[ $section ] ) ? array( $section => $grouped[ $section ] ) : array();
+        }
+        // Materialize current values for the response
+        $out = array();
+        foreach ( $grouped as $sec => $entries ) {
+            $out[ $sec ] = array();
+            foreach ( $entries as $key => $def ) {
+                $cur = dinoco_config( $key );
+                $row = array(
+                    'key'         => $key,
+                    'type'        => $def['type'],
+                    'default'     => $def['default'],
+                    'value'       => $cur,
+                    'label'       => $def['label'],
+                    'description' => $def['description'],
+                    'section'     => $def['section'],
+                );
+                if ( ! empty( $def['legacy_option'] ) ) $row['legacy_option'] = $def['legacy_option'];
+                if ( ! empty( $def['choices'] ) )       $row['choices']       = $def['choices'];
+                if ( ! empty( $def['sensitive'] ) ) {
+                    $row['value'] = '********';
+                    $row['sensitive'] = true;
+                }
+                $out[ $sec ][] = $row;
+            }
+        }
+        return array(
+            'count'    => array_sum( array_map( 'count', $out ) ),
+            'sections' => $out,
+        );
+    }
+}
