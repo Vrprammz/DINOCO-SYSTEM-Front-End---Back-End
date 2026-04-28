@@ -2,6 +2,18 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.9 (2026-04-28) — Fix "Cookie check failed" 403 on stale nonce.
+ *   Bug: ผู้ใช้รายงาน "ออกบิลไม่ได้" + console error: POST /b2b/v1/invoice/update 403,
+ *   bo-summary polling 403 spam, UI toast "บันทึกล้มเหลว: Cookie check failed".
+ *   Root cause: `INV_NONCE = wp_create_nonce('wp_rest')` generated ONCE at shortcode
+ *   render → embedded in JS as static. WP nonce default TTL = 24h. Tab opened > 24h
+ *   → all REST calls return 403 (`rest_cookie_invalid_nonce`). Page never refreshes
+ *   nonce → permanent failure until manual F5.
+ *   Fix: `invApi` detects 403 + nonce-related message → confirm prompt + auto-reload.
+ *   Single-handler covers all 18 invoice endpoints (no per-call retry loop needed —
+ *   reload restarts from clean state, simpler than nonce-refresh + retry).
+ *   Also: detect generic 403 (not nonce-related — capability change) with different
+ *   message ("ไม่มีสิทธิ์ — กรุณา login ใหม่") → reload to wp-login.
  * Version: V.34.8 (2026-04-28) — Observability fix for invoice image push silent failure.
  *   User reported: ลูกค้าได้รับ Flex card หลัง issue invoice แต่ไม่ได้รูป invoice ตามมา.
  *   Root cause hypothesis (3 paths converge in notify phase):
@@ -3784,6 +3796,35 @@ function invToast(type, msg) {
 }
 
 // ========= API helper =========
+// V.34.9: stale nonce auto-detect + reload (one-shot per session — guards against retry loop)
+var _invNonceReloadShown = false;
+function _invHandleAuthError(status, errCode, errMsg) {
+    if (_invNonceReloadShown) return; // already prompted — don't spam
+    var isNonce = (status === 403) && (
+        errCode === 'rest_cookie_invalid_nonce' ||
+        (typeof errMsg === 'string' && (errMsg.toLowerCase().indexOf('cookie') !== -1 || errMsg.toLowerCase().indexOf('nonce') !== -1))
+    );
+    var isForbidden = (status === 403) && !isNonce; // capability change / logged out
+    var isUnauth = (status === 401);
+    if (!isNonce && !isForbidden && !isUnauth) return;
+    _invNonceReloadShown = true;
+    var msg = isNonce
+        ? '🔄 หน้านี้เปิดทิ้งไว้นานเกินไป (Session หมดอายุ)\n\nกด OK เพื่อโหลดหน้าใหม่ — ข้อมูลที่ยังไม่ได้บันทึกจะหายไป'
+        : '⛔ ไม่มีสิทธิ์เข้าถึง — กรุณา login ใหม่\n\nกด OK เพื่อไปหน้า Login';
+    setTimeout(function() {
+        if (confirm(msg)) {
+            if (isNonce) {
+                window.location.reload();
+            } else {
+                window.location.href = '/wp-login.php?redirect_to=' + encodeURIComponent(window.location.href);
+            }
+        } else {
+            // user cancelled — allow retry attempt later
+            _invNonceReloadShown = false;
+        }
+    }, 100);
+}
+
 function invApi(method, path, body, cb) {
     var opts = {
         method: method,
@@ -3793,7 +3834,13 @@ function invApi(method, path, body, cb) {
     fetch(INV_REST + path + (method === 'GET' && body ? '?' + new URLSearchParams(body) : ''), opts)
         .then(function(r){
             if (!r.ok) return r.json().then(function(err){
-                cb(null, {success:false, message:err.message||'เกิดข้อผิดพลาด'});
+                // V.34.9: detect stale nonce / capability / logout → auto-reload
+                _invHandleAuthError(r.status, err && err.code, err && err.message);
+                cb(null, {success:false, message:err.message||'เกิดข้อผิดพลาด', _http_status: r.status, _err_code: err && err.code});
+            }).catch(function() {
+                // r.json() failed (e.g. HTML error page) — still surface status
+                _invHandleAuthError(r.status, null, null);
+                cb(null, {success:false, message:'HTTP ' + r.status, _http_status: r.status});
             });
             return r.json().then(function(d){ cb(null, d); });
         })
