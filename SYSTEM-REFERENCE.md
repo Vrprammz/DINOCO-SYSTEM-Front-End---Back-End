@@ -122,7 +122,7 @@
 | [Admin System] DINOCO Service Center & Claims | V.30.3 | 27 | `[dinoco_admin_claims]` | Claims management + auto-close 3 statuses (30d) |
 | [Admin System] AI Control Module | V.30.2 | 35 | `[dinoco_admin_ai_control]` | AI Command Center (Gemini v22.0 function calling) |
 | [Admin System] KB Trainer Bot v2.0 | V.30.3 | 62 | -- | Knowledge Base trainer (Gemini, limit 200 entries) |
-| [Admin System] DINOCO Manual Invoice System | V.33.6 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
+| [Admin System] DINOCO Manual Invoice System | V.34.6 | 598 | `[dinoco_manual_invoice]` | Manual billing for B2B distributors |
 | [Admin System] AI Provider Abstraction | V.1.2 | 1040 | -- | Multi-AI provider (Claude/Gemini/OpenAI) |
 | [Admin System] DINOCO Moto Manager | V.1.0 | 1157 | `[dinoco_admin_moto]` | Motorcycle brands & models CRUD |
 | [Admin System] DINOCO Admin Finance Dashboard | V.3.16 | 1158 | `[dinoco_admin_finance]` | Finance overview (debt, revenue, risk AI) |
@@ -329,6 +329,10 @@
 invoice/list, invoice/get, invoice/init, invoice/create, invoice/update, invoice/issue, invoice/record-payment, invoice/verify-slip, invoice/verify-slip-combined, invoice/upload-slip, invoice/cancel, invoice/delete, invoice/send-reminder, invoice/send-overdue-notice, invoice/resend-line, invoice/pending-summary, invoice/send-summary, invoice/distributor-detail
 
 > **V.33.6**: Manual Invoice System re-registers `GET /b2b/v1/products` locally (ชี้ callback ไป `b2b_rest_list_products` ของ Snippet 9 ที่ยังเก็บเป็น dead code หลัง V.35.0) เพราะ frontend `invLoadProducts()` ยังต้องใช้ route เดิม. Guarded ด้วย `function_exists` → return 503 ถ้า Snippet 9 disabled.
+>
+> **V.34.6 (2026-04-28)** — Picker หน้าค้นหา (single + multi) แสดงราคา **catalog (ก่อนส่วนลด)** แทน `effective` (ดีลเลอร์) ตาม user feedback — ตรงกับตาราง row ที่แสดง `unit_price=8,800 + disc=20%`. Tooltip เปลี่ยนจาก "catalog ฿X (-Y%)" → "หลังส่วนลด ฿X (-Y%)" เพื่อยืนยัน dealer price. `onclick price` arg ส่ง `info.base` แทน `info.effective` แต่ `_invPickerVals` re-derive จาก `p` object — `price` arg เป็น last-resort fallback เมื่อ catalog + dealer_price ทั้งคู่ = 0.
+>
+> **V.34.4/V.34.5 (2026-04-28)** — Picker double-discount bug fix. Bug: `invPickProduct` / `invPickSingleFromMulti` / `invSubmitMultiPicker` (+ `invApplyProductToRow` ใช้ใน autocomplete path) ส่ง `unit_price = invGetRankPrice(p)` (ราคาดีลเลอร์ = retail × (1-disc%)) **พร้อม** `discount_raw = disc%` → `invRecalc` คิดส่วนลดซ้ำชั้นที่สอง → SET ฿8,800 -20% ออกมาเป็น ฿5,632 (ควร ฿7,040). Fix V.34.4: helper `invGetRankPriceInfo(p)` คืน `{base, disc, effective}` + 4 call-sites ใช้ `info.base` เป็น `unit_price` + `info.disc + '%'` เป็น `discount_raw`. Fix V.34.5 (post-review remediation): HIGH-1 derive implicit `disc%` จาก ratio `(1 - effective/base)` เมื่อ `disc=0 && effective<base` (handles legacy unmigrated tier prices `price_<rank> > 100` + `b2b_discount_percent=0` — without this branch picker emits `8,800, disc=''` showing catalog instead of dealer). MED-2 ลบ `_invDiscRaw()` orphan. LOW-4 unified `_invPickerVals(p, fallback)` helper. LOW-5 picker chip + cell `title` attr "catalog ฿X (-Y%)" hover tooltip.
 
 ### 3.5.1 Backorder System — Phase A-D (`/wp-json/b2b/v1/bo-*`) -- 14 endpoints
 
