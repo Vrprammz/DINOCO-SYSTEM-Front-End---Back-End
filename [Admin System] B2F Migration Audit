@@ -1,5 +1,11 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.15 — Wave 3 HIGH-H13: mysqldump password leak via -p<value>.
+ *   shell_exec mysqldump command embedded DB_PASSWORD as `-p<password>`, exposing it
+ *   to any system user via `ps`/auditd/shell history. Fix: write credentials to a
+ *   temp file with mode 0600 and pass via `--defaults-extra-file=`. Wrap unlink in
+ *   try/finally so the credential file is always removed even if shell_exec throws.
+ *   Threat: low — requires shell access to the WP host. Defense-in-depth fix.
  * Version: V.3.14 — Phase 3 UX-C2 batch: migrate remaining 9 confirm/alert sites —
  *   Activate Schema, Run Backfill, Toggle Shadow-Write, Toggle Flag (generic),
  *   Toggle Phase 4 flags, Phase 4 migration (legacy site). Each wrapped in try/catch
@@ -905,25 +911,72 @@ if ( ! function_exists( 'b2f_phase4_dump_snapshot' ) ) {
         }
 
         // Best-effort mysqldump — host/user/password from DB_* constants
+        // V.3.15 [Wave 3 H13 FIX]: write credentials to a tempfile with mode 0600 and pass
+        // via --defaults-extra-file=. This avoids exposing DB_PASSWORD via `ps`/auditd/shell
+        // history (the previous `-p<password>` argument was visible to other system users).
         $host = defined( 'DB_HOST' ) ? DB_HOST : 'localhost';
         $user = defined( 'DB_USER' ) ? DB_USER : '';
         $pass = defined( 'DB_PASSWORD' ) ? DB_PASSWORD : '';
         $name = defined( 'DB_NAME' ) ? DB_NAME : '';
-        $cmd = sprintf(
-            'mysqldump --single-transaction --skip-lock-tables -h %s -u %s %s %s %s > %s 2>&1',
-            escapeshellarg( $host ),
-            escapeshellarg( $user ),
-            $pass !== '' ? '-p' . escapeshellarg( $pass ) : '',
-            escapeshellarg( $name ),
-            escapeshellarg( $tbl ),
-            escapeshellarg( $path )
+
+        // Parse host:port if DB_HOST contains a port (e.g. "db:3306")
+        $host_only = $host;
+        $port      = '';
+        if ( strpos( $host, ':' ) !== false ) {
+            list( $host_only, $port ) = explode( ':', $host, 2 );
+        }
+
+        $cred_file = wp_tempnam( 'b2f-mysqldump-cred-' . $ts );
+        if ( ! $cred_file ) {
+            // wp_tempnam may return false on rare filesystem failures
+            return array( 'ok' => false, 'path' => $path, 'message' => 'mysqldump_cred_tempfile_failed' );
+        }
+
+        // Build [client] credentials section (mysqldump reads [client] + [mysqldump])
+        $cred_lines = array(
+            '[client]',
+            'user=' . $user,
+            'password=' . $pass,
+            'host=' . $host_only,
         );
-        @shell_exec( $cmd );
-        if ( file_exists( $path ) && filesize( $path ) > 0 ) {
-            @chmod( $path, 0600 );
+        if ( $port !== '' ) {
+            $cred_lines[] = 'port=' . $port;
+        }
+        $cred_content = implode( "\n", $cred_lines ) . "\n";
+
+        $write_ok = (bool) @file_put_contents( $cred_file, $cred_content );
+        @chmod( $cred_file, 0600 );
+
+        $exec_msg = 'mysqldump_failed';
+
+        try {
+            if ( ! $write_ok ) {
+                $exec_msg = 'mysqldump_cred_write_failed';
+            } else {
+                $cmd = sprintf(
+                    'mysqldump --defaults-extra-file=%s --single-transaction --skip-lock-tables %s %s > %s 2>&1',
+                    escapeshellarg( $cred_file ),
+                    escapeshellarg( $name ),
+                    escapeshellarg( $tbl ),
+                    escapeshellarg( $path )
+                );
+                @shell_exec( $cmd );
+                if ( file_exists( $path ) && filesize( $path ) > 0 ) {
+                    @chmod( $path, 0600 );
+                    $exec_msg = 'mysqldump_ok';
+                }
+            }
+        } finally {
+            // Guarantee credential cleanup even if shell_exec threw or filesystem op failed
+            if ( file_exists( $cred_file ) ) {
+                @unlink( $cred_file );
+            }
+        }
+
+        if ( $exec_msg === 'mysqldump_ok' ) {
             return array( 'ok' => true, 'path' => $path, 'message' => 'mysqldump_ok' );
         }
-        return array( 'ok' => false, 'path' => $path, 'message' => 'mysqldump_failed' );
+        return array( 'ok' => false, 'path' => $path, 'message' => $exec_msg );
     }
 }
 

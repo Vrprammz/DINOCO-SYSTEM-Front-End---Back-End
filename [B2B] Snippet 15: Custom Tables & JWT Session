@@ -1,6 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.7 (2026-04-24) — Wave 3 HIGH H9+H10 inventory invariant:                             ║
+ * ║    H9 — `dinoco_stock_subtract()` warehouse_stock asymmetry: existing code only                    ║
+ * ║         updated row when row existed; missing-row case silently skipped → drift between            ║
+ * ║         master `wp_dinoco_products.stock_qty` (decremented) and SUM(warehouse_stock).              ║
+ * ║         Fix: mirror INSERT branch from `dinoco_stock_add()` — INSERT row with                      ║
+ * ║         qty = (allow_negative ? -qty : 0) when wh_row missing, inside FOR UPDATE txn.              ║
+ * ║    H10 — `dinoco_transfer_stock()` did not reconcile master `wp_dinoco_products.stock_qty`         ║
+ * ║         after warehouse-level UPDATE → master stale → `dinoco_stock_auto_status()` reads           ║
+ * ║         stale value → status badge wrong. Fix: after both warehouse rows committed (still          ║
+ * ║         inside txn), recompute master via `SELECT SUM(stock_qty) FROM warehouse_stock`             ║
+ * ║         and UPDATE master `stock_qty`. Then COMMIT, then call `dinoco_stock_auto_status($sku)`     ║
+ * ║         outside txn (DD-2 cascade compute). Cache invalidate `b2b_sku_data_map` transient.         ║
  * ║  Version: V.8.6 (2026-04-24) — Slip Replay Pool (CNX regression):                                  ║
  * ║    • NEW columns on wp_dinoco_slip_log (idempotent ALTER + dbDelta):                               ║
  * ║        image_hash VARCHAR(64) NULL        — SHA-256 of slip binary (normalized to hex)             ║
@@ -1033,6 +1045,8 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
         ) );
 
         // Phase 5: Update warehouse_stock — CRIT-02: track wh_ok
+        // V.8.7 [H9 FIX]: mirror INSERT branch from dinoco_stock_add() when wh_row missing
+        // (previously silently skipped → master decremented but SUM(warehouse_stock) unchanged → drift).
         $wh_ok = true;
         if ( $warehouse_id && $whs_exists_sub ) {
             $wh_row = $wpdb->get_row( $wpdb->prepare(
@@ -1043,6 +1057,19 @@ if ( ! function_exists( 'dinoco_stock_subtract' ) ) {
                 // V.7.1 [C3 FIX]: honor allow_negative บน warehouse_stock ด้วย
                 $new_wh_qty = $allow_negative ? ( (int) $wh_row->stock_qty - (int) $qty ) : max( 0, (int) $wh_row->stock_qty - (int) $qty );
                 $wpdb->update( $whs_table, array( 'stock_qty' => $new_wh_qty ), array( 'id' => $wh_row->id ) );
+            } else {
+                // V.8.7 [H9 FIX]: row missing → INSERT to maintain invariant
+                // master.stock_qty == SUM(warehouse_stock.stock_qty WHERE sku=X).
+                // walk-in (allow_negative=true) → seed -qty; else → seed 0 (cap at zero floor).
+                $seed_qty = $allow_negative ? -1 * (int) $qty : 0;
+                $wpdb->insert( $whs_table, array(
+                    'warehouse_id' => $warehouse_id,
+                    'sku'          => $sku,
+                    'stock_qty'    => $seed_qty,
+                ) );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( sprintf( '[Stock] H9 FIX: subtract on missing warehouse_stock row → seeded sku=%s wh=%d qty=%d (allow_neg=%s)', $sku, $warehouse_id, $seed_qty, $allow_negative ? 'yes' : 'no' ) );
+                }
             }
             if ( $wpdb->last_error ) $wh_ok = false;
         }
@@ -1907,10 +1934,36 @@ if ( ! function_exists( 'dinoco_transfer_stock' ) ) {
             'warehouse_id' => $to_wh, 'created_at' => current_time( 'mysql' ),
         ) );
 
+        // V.8.7 [H10 FIX]: reconcile master `wp_dinoco_products.stock_qty` from SUM(warehouse_stock).
+        // Without this, transfer left master stale → `dinoco_stock_auto_status()` reads wrong qty
+        // → stock_status badge desync. Single SQL inside txn keeps it atomic.
+        $prod_table = $wpdb->prefix . 'dinoco_products';
+        $reconciled = $wpdb->query( $wpdb->prepare(
+            "UPDATE {$prod_table}
+             SET stock_qty = COALESCE((SELECT SUM(stock_qty) FROM {$whs_table} WHERE sku = %s), 0),
+                 stock_updated_at = %s
+             WHERE sku = %s",
+            $sku, current_time( 'mysql' ), $sku
+        ) );
+
+        if ( $reconciled === false ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[Stock] H10 FIX: transfer reconcile FAILED sku=%s err=%s', $sku, $wpdb->last_error ) );
+            }
+            return new WP_Error( 'reconcile_failed', 'Transfer reconcile master failed' );
+        }
+
         $wpdb->query( 'COMMIT' );
 
+        // V.8.7 [H10 FIX]: refresh stock_status (computed cascade) + invalidate batch cache.
+        delete_transient( 'b2b_sku_data_map' );
+        if ( function_exists( 'dinoco_stock_auto_status' ) ) {
+            dinoco_stock_auto_status( $sku );
+        }
+
         if ( function_exists( 'b2b_log' ) ) {
-            b2b_log( sprintf( '[Stock] TRANSFER %s qty=%d wh:%d->%d batch=%s', $sku, $qty, $from_wh, $to_wh, $batch_id ) );
+            b2b_log( sprintf( '[Stock] TRANSFER %s qty=%d wh:%d->%d batch=%s (master reconciled)', $sku, $qty, $from_wh, $to_wh, $batch_id ) );
         }
 
         return array( 'sku' => $sku, 'qty' => $qty, 'from_wh' => $from_wh, 'to_wh' => $to_wh, 'batch_id' => $batch_id );
