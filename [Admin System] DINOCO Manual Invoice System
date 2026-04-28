@@ -2,6 +2,19 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.10 (2026-04-28) — Code-reviewer remediation post-V.34.9 (1 HIGH + 2 MED).
+ *   • HIGH-1: V.34.9 ดัก 403 ทุกตัว → non-nonce 403 (rate_limit, BO tier mismatch, per-endpoint
+ *     capability fail) ก็ redirect to wp-login → admin โดน force-logout ทั้งที่ session ยังดี.
+ *     Fix: tighten detection — only reload เมื่อ code ∈ ['rest_cookie_invalid_nonce',
+ *     'rest_forbidden', 'rest_user_cannot_access']. รหัสอื่น (rate_limited, bo_locked, etc.)
+ *     fall through to normal toast — admin ตัดสินใจเอง.
+ *   • MED-1: `r.json()` reject บน HTML response (Cloudflare 403 challenge / WAF) → V.34.9 fall
+ *     through ไป auth handler → infinite reload loop. Fix: เช็ค `content-type:
+ *     application/json` ก่อนเรียก `_invHandleAuthError` ใน .catch path. Non-JSON 403 =
+ *     infrastructure issue → cb error ปกติ ไม่ trigger reload.
+ *   • MED-3: `b2b_inv_gd_admin_notice` (Snippet 10 V.30.7) fires ทุกหน้า admin (edit.php,
+ *     users.php, etc.) → banner fatigue. Fix: Snippet 10 V.30.8 — gate `get_current_screen()`
+ *     แสดงเฉพาะ Dashboard + Plugins + admin pages ที่เกี่ยวกับ DINOCO + dismissible flag.
  * Version: V.34.9 (2026-04-28) — Fix "Cookie check failed" 403 on stale nonce.
  *   Bug: ผู้ใช้รายงาน "ออกบิลไม่ได้" + console error: POST /b2b/v1/invoice/update 403,
  *   bo-summary polling 403 spam, UI toast "บันทึกล้มเหลว: Cookie check failed".
@@ -3796,31 +3809,48 @@ function invToast(type, msg) {
 }
 
 // ========= API helper =========
-// V.34.9: stale nonce auto-detect + reload (one-shot per session — guards against retry loop)
+// V.34.10: tightened auth-error detection — only known auth codes trigger reload.
+// `_invNonceReloadShown` is a one-shot guard for **multiple parallel prompts** in the same
+// JS tick (NOT retry loop — JS event loop is single-threaded so flag set is synchronous
+// before next dispatch). User cancel resets flag → next call can re-prompt.
 var _invNonceReloadShown = false;
+
+// V.34.10 HIGH-1: whitelist of auth-related WP REST error codes that warrant auto-reload.
+// All other 403s (rate_limited, bo_locked, custom capability checks) fall through to
+// normal toast — admin sees actual error + decides action without forced logout.
+var _INV_AUTH_RELOAD_CODES = {
+    'rest_cookie_invalid_nonce': 'nonce',  // expired wp_rest nonce → reload page (refresh nonce)
+    'rest_forbidden':            'logout', // generic WP REST 403 → typically logged out
+    'rest_user_cannot_access':   'logout', // user lost capability / role removed
+    'rest_not_logged_in':        'logout', // 401 equivalent
+};
+
 function _invHandleAuthError(status, errCode, errMsg) {
-    if (_invNonceReloadShown) return; // already prompted — don't spam
-    var isNonce = (status === 403) && (
-        errCode === 'rest_cookie_invalid_nonce' ||
-        (typeof errMsg === 'string' && (errMsg.toLowerCase().indexOf('cookie') !== -1 || errMsg.toLowerCase().indexOf('nonce') !== -1))
-    );
-    var isForbidden = (status === 403) && !isNonce; // capability change / logged out
-    var isUnauth = (status === 401);
-    if (!isNonce && !isForbidden && !isUnauth) return;
+    if (_invNonceReloadShown) return;
+    // V.34.10: tighten detection — only known auth codes (whitelist), not bare 403.
+    // Fallback: 403 with literal "cookie check failed" message string (legacy WP < 5.0
+    // fallback path that doesn't return code) → treat as nonce.
+    var authType = errCode && _INV_AUTH_RELOAD_CODES[errCode] ? _INV_AUTH_RELOAD_CODES[errCode] : null;
+    if (!authType && status === 403 && typeof errMsg === 'string') {
+        var msgLower = errMsg.toLowerCase();
+        if (msgLower.indexOf('cookie check failed') !== -1) authType = 'nonce';
+    }
+    if (!authType) return; // not an auth error → fall through to normal toast (rate_limited etc.)
     _invNonceReloadShown = true;
-    var msg = isNonce
+    var msg = authType === 'nonce'
         ? '🔄 หน้านี้เปิดทิ้งไว้นานเกินไป (Session หมดอายุ)\n\nกด OK เพื่อโหลดหน้าใหม่ — ข้อมูลที่ยังไม่ได้บันทึกจะหายไป'
         : '⛔ ไม่มีสิทธิ์เข้าถึง — กรุณา login ใหม่\n\nกด OK เพื่อไปหน้า Login';
+    // V.34.10 LOW-2: setTimeout 100ms ensures cb() completes first → toast/UI updates show
+    // before confirm() blocks. Intentional ordering: result surface → user sees it → prompt.
     setTimeout(function() {
         if (confirm(msg)) {
-            if (isNonce) {
+            if (authType === 'nonce') {
                 window.location.reload();
             } else {
                 window.location.href = '/wp-login.php?redirect_to=' + encodeURIComponent(window.location.href);
             }
         } else {
-            // user cancelled — allow retry attempt later
-            _invNonceReloadShown = false;
+            _invNonceReloadShown = false; // user cancelled — allow re-prompt next call
         }
     }, 100);
 }
@@ -3833,15 +3863,31 @@ function invApi(method, path, body, cb) {
     if (body && (method === 'POST' || method === 'PUT')) opts.body = JSON.stringify(body);
     fetch(INV_REST + path + (method === 'GET' && body ? '?' + new URLSearchParams(body) : ''), opts)
         .then(function(r){
-            if (!r.ok) return r.json().then(function(err){
-                // V.34.9: detect stale nonce / capability / logout → auto-reload
-                _invHandleAuthError(r.status, err && err.code, err && err.message);
-                cb(null, {success:false, message:err.message||'เกิดข้อผิดพลาด', _http_status: r.status, _err_code: err && err.code});
-            }).catch(function() {
-                // r.json() failed (e.g. HTML error page) — still surface status
-                _invHandleAuthError(r.status, null, null);
-                cb(null, {success:false, message:'HTTP ' + r.status, _http_status: r.status});
-            });
+            if (!r.ok) {
+                // V.34.10 MED-1: only invoke auth handler on JSON responses (WP REST API).
+                // HTML responses (Cloudflare WAF challenge, server error page) → infrastructure
+                // issue, not stale nonce → skip handler to avoid infinite reload loop.
+                var ct = r.headers.get('content-type') || '';
+                var isJson = ct.indexOf('application/json') !== -1;
+                if (isJson) {
+                    return r.json().then(function(err){
+                        _invHandleAuthError(r.status, err && err.code, err && err.message);
+                        cb(null, {success:false, message:err.message||'เกิดข้อผิดพลาด', _http_status: r.status, _err_code: err && err.code});
+                    }).catch(function() {
+                        // JSON parse failed despite content-type → malformed response
+                        cb(null, {success:false, message:'HTTP ' + r.status + ' (malformed JSON)', _http_status: r.status});
+                    });
+                } else {
+                    // Non-JSON 403/5xx (Cloudflare/WAF/PHP fatal HTML page) → surface status
+                    // without auth handler. User sees "HTTP 403" toast and can investigate.
+                    return r.text().then(function(t) {
+                        var preview = t ? t.substring(0, 80).replace(/\s+/g, ' ') : '';
+                        cb(null, {success:false, message:'HTTP ' + r.status + (preview ? ' — ' + preview : ''), _http_status: r.status, _non_json: true});
+                    }).catch(function() {
+                        cb(null, {success:false, message:'HTTP ' + r.status, _http_status: r.status});
+                    });
+                }
+            }
             return r.json().then(function(d){ cb(null, d); });
         })
         .catch(function(e){ cb(e, null); });
@@ -4096,7 +4142,13 @@ window.invResendLineBuilder = function() {
     var id = document.getElementById('inv-edit-id').value;
     if (!id) return;
     invApi('POST', '/invoice/resend-line', {id: parseInt(id)}, function(err, data) {
-        if (err || !data || !data.success) { invToast('error', 'ส่ง LINE ล้มเหลว'); return; }
+        if (err || !data || !data.success) {
+            // V.34.10 MED-2: surface actual HTTP code/message (V.34.8 server returns
+            // "ส่ง LINE ล้มเหลว (HTTP 429)" for rate-limit etc.) — admin sees real error
+            // instead of generic. No auto-retry — admin decides next action.
+            invToast('error', (data && data.message) ? data.message : 'ส่ง LINE ล้มเหลว');
+            return;
+        }
         invToast('success', 'ส่ง LINE ซ้ำแล้ว');
     });
 };
@@ -4771,7 +4823,11 @@ window.invDeleteFromList = async function(id) {
 
 window.invResendLine = function(id) {
     invApi('POST', '/invoice/resend-line', {id: id}, function(err, data) {
-        if (err || !data.success) { invToast('error', 'ส่ง LINE ล้มเหลว'); return; }
+        if (err || !data || !data.success) {
+            // V.34.10 MED-2: surface actual HTTP code/message — no auto-retry
+            invToast('error', (data && data.message) ? data.message : 'ส่ง LINE ล้มเหลว');
+            return;
+        }
         invToast('success', 'ส่ง LINE + ภาพบิลสำเร็จ');
     });
 };
