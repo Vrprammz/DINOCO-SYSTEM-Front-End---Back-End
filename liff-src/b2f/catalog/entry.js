@@ -17,6 +17,9 @@ import { modal } from "../../shared/modal.js";
 
 console.info("[b2f-catalog] foundation stub V.0.1");
 
+/**
+ * @param {{ liffId?: string, adminToken?: string, makerId?: number|string }} [opts]
+ */
 export async function bootstrap({ liffId, adminToken, makerId } = {}) {
     if (!liffId) {
         console.warn("[b2f-catalog] liffId not provided — skipping");

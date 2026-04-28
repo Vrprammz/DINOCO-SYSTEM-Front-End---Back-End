@@ -18,6 +18,7 @@ import { modal } from "../../shared/modal.js";
 
 console.info("[liff-ai] foundation stub V.0.1");
 
+/** @param {{ liffId?: string }} [opts] */
 export async function bootstrap({ liffId } = {}) {
     if (!liffId) return null;
     const ctx = await initLiff(liffId);

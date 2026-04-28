@@ -17,6 +17,7 @@ import { createApi, wpRestUrl } from "../../shared/api-client.js";
 
 console.info("[b2f-maker] foundation stub V.0.1");
 
+/** @param {{ liffId?: string, makerToken?: string }} [opts] */
 export async function bootstrap({ liffId, makerToken } = {}) {
     if (!liffId) return null;
     const ctx = await initLiff(liffId);

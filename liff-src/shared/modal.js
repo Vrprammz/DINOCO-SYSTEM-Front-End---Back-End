@@ -19,9 +19,18 @@ export const modal =
     typeof window !== "undefined" && window.dinocoModal
         ? window.dinocoModal
         : {
+              /** @param {{ title?: string, message?: string }} [opts] */
               alert: ({ title = "Alert", message = "" } = {}) => {
                   window.alert(`${title}\n\n${message}`);
               },
+              /**
+               * @param {{
+               *   title?: string,
+               *   message?: string,
+               *   onConfirm?: () => void,
+               *   onCancel?: () => void,
+               * }} [opts]
+               */
               confirm: ({
                   title = "Confirm",
                   message = "",
@@ -32,6 +41,7 @@ export const modal =
                   if (ok && typeof onConfirm === "function") onConfirm();
                   if (!ok && typeof onCancel === "function") onCancel();
               },
+              /** @param {{ message?: string, type?: string }} [opts] */
               toast: ({ message = "", type = "info" } = {}) => {
                   // eslint-disable-next-line no-console
                   console.log(`[toast:${type}]`, message);

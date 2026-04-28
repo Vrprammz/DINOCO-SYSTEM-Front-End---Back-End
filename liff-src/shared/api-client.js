@@ -20,6 +20,15 @@
  *   const created = await api("POST", "/lead/abc123/status", { status: "qualified" });
  */
 
+/**
+ * @param {{
+ *   base?: string,
+ *   token?: string|null,
+ *   tokenHeader?: string,
+ *   nonce?: string|null,
+ *   timeoutMs?: number,
+ * }} [options]
+ */
 export function createApi({
     base,
     token,
@@ -47,6 +56,7 @@ export function createApi({
             headers["X-WP-Nonce"] = nonce;
         }
 
+        /** @type {RequestInit} */
         const init = {
             method: method.toUpperCase(),
             headers,

@@ -34,12 +34,13 @@ import { initLiff } from "./liff-init.js";
  * Returns `null` if LIFF redirected to login (caller code should not
  * continue past this). Throws on network / verification failures.
  *
- * @param {Object}  options
- * @param {string}  options.liffId        LIFF application ID
- * @param {string}  options.authEndpoint  Full or absolute auth URL
- * @param {Object}  [options.extra]       Extra body fields (distributor_id, etc.)
- * @param {boolean} [options.withContext] Pass liff.getContext() to backend (default true)
- * @param {number}  [options.timeoutMs]   Fetch timeout (default 20s)
+ * @param {{
+ *   liffId?: string,
+ *   authEndpoint?: string,
+ *   extra?: Record<string, any>,
+ *   withContext?: boolean,
+ *   timeoutMs?: number,
+ * }} [options]
  */
 export async function liffAuth({
     liffId,
@@ -58,6 +59,7 @@ export async function liffAuth({
     const ctx = await initLiff(liffId);
     if (!ctx) return null; // redirected to LINE login
 
+    /** @type {Record<string, any>} */
     const payload = {
         id_token: ctx.idToken,
         line_user_id: ctx.profile?.userId || "",

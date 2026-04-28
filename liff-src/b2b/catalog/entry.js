@@ -52,6 +52,8 @@ console.info(BOOT_MARKER);
 /**
  * Full bootstrap (Phase 1 target — currently gated behind explicit flag
  * to avoid clashing with inline renderer in Snippet 4).
+ *
+ * @param {{ liffId?: string, sessionToken?: string, authEndpoint?: string }} [opts]
  */
 export async function bootstrap({ liffId, sessionToken, authEndpoint } = {}) {
     if (!liffId) {
