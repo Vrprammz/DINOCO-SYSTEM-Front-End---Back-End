@@ -105,6 +105,24 @@ Customer place-order → confirm → pay covers Snippet 4 + Snippet 2 + Snippet 
 
 ---
 
+## Local pre-push hook (optional)
+
+Install once to catch frontend regressions before push:
+
+```bash
+bash scripts/install-hooks.sh
+```
+
+The hook (`scripts/git-hooks/pre-push`) checks the diff against upstream and runs Jest only when `liff-src/`, `tests/jest/`, or Jest config files have changed. Backend-only pushes pass through silently.
+
+Override:
+- `git push --no-verify` — emergency bypass
+- `SKIP_JEST=1 git push` — when `node_modules/` is missing
+
+The hook bails gracefully (exit 0 with warning) if Jest isn't installed locally — CI is the authoritative gate.
+
+---
+
 ## Adding a new test file
 
 1. Create `tests/jest/your-module.test.js`
