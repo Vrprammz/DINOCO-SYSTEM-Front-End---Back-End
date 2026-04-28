@@ -2,6 +2,27 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.2 — Phase 4a Pillar 2 transaction wrapper migration (issue flow):
+ *   • `_dinoco_inv_do_issue()` outer orchestration routes through dinoco_transaction()
+ *     when [Admin System] DINOCO Transaction Wrapper snippet is loaded.
+ *     - validate phase = is_billed guard + transient dedup + credit_hold + credit_limit
+ *       pre-check (existing checks moved here, atomic credit gate still in mutate).
+ *     - mutate phase = b2b_debt_add (atomic credit gate via Snippet 13 FOR UPDATE) →
+ *       update_field('is_billed', true) → b2b_set_order_status → audit log.
+ *       V.34.0 HIGH-H4 ordering preserved: debt_add FIRST (atomic gate), then mark
+ *       is_billed + transition status only if debt_add succeeds.
+ *     - notify phase = LINE Flex push + send invoice image (runs OUTSIDE lock so
+ *       LINE side effects cannot block other admin issue actions).
+ *   • lock_key = b2b_fin_<dist_id> (mirrors b2b_financial_lock primitive). Wrapper
+ *     adds standardized audit row (event=inv_issue, target=order:<id>) +
+ *     correlation_id (chain to debt_add via shared request_id) +
+ *     uniform lock_busy → 429 envelope.
+ *   • Backward compat: function_exists('dinoco_transaction') guard. If wrapper
+ *     missing → falls through to legacy path that preserves V.34.1 inline behavior
+ *     byte-for-byte (transient lock + sequential debt_add → is_billed → notify).
+ *   • _legacy + _inner extracted as private helpers. Inner is also called by
+ *     wrapper's mutate phase. Notify decoupled to its own helper for outside-lock
+ *     execution (LINE timeout cannot stall other admin actions on same dist_id).
  * Version: V.34.1 — Wave 2 slip-pipeline convergence (audit Round 2):
  *   • CRIT-C4: trans_ref dedup gate via b2b_slip_is_trans_ref_seen() in verify_slip +
  *     verify_slip_combined BEFORE record_payment. Returns 409 duplicate_slip if seen.
@@ -1518,7 +1539,173 @@ function dinoco_inv_rest_update(WP_REST_Request $req) {
 }
 
 // --- ISSUE ---
+// V.34.2 Phase 4a Pillar 2: outer orchestration routes through dinoco_transaction()
+// when [Admin System] DINOCO Transaction Wrapper snippet is loaded. Validate phase
+// holds is_billed/dedup/credit guards. Mutate phase holds the V.34.0 HIGH-H4 ordering
+// (debt_add atomic gate FIRST → is_billed flip → status transition → audit log).
+// Notify phase holds LINE Flex + invoice image push (runs OUTSIDE lock per Pillar 2 spec).
+// Backward compat: function_exists guard falls through to _legacy V.34.1 inline path.
 function _dinoco_inv_do_issue($post_id, $dist_id, $total, $dist_name) {
+    if ( function_exists('dinoco_transaction') && $dist_id ) {
+        $txn_ctx = array(
+            'audit_event_type' => 'inv_issue',
+            'actor_type'       => 'admin',
+            'target_type'      => 'order',
+            'target_id'        => (string) $post_id,
+            'amount'           => floatval($total),
+            'lock_key'         => 'b2b_fin_' . intval($dist_id),
+            'lock_timeout'     => 5,
+            'audit_context'    => array(
+                'dist_id'   => intval($dist_id),
+                'dist_name' => (string) $dist_name,
+                'inv_number'=> get_post_meta($post_id, '_inv_number', true),
+            ),
+        );
+        $txn_phases = array(
+            'validate' => function( $ctx ) use ( $post_id, $dist_id, $total ) {
+                return _dinoco_inv_do_issue_validate( $post_id, $dist_id, $total );
+            },
+            'mutate' => function( $ctx ) use ( $post_id, $dist_id, $total, $dist_name ) {
+                return _dinoco_inv_do_issue_mutate( $post_id, $dist_id, $total, $dist_name );
+            },
+            'notify' => function( $ctx ) use ( $post_id, $dist_id, $total, $dist_name ) {
+                _dinoco_inv_do_issue_notify( $post_id, $dist_id, $total, $dist_name );
+            },
+        );
+        $res = dinoco_transaction( 'inv_issue', $txn_phases, $txn_ctx );
+        if ( is_wp_error($res) ) {
+            // Wrapper-level failure (lock_busy etc) — release transient before returning so
+            // the caller can retry. Validate-phase failures already release transient inline.
+            delete_transient('inv_issue_' . $post_id);
+            return $res;
+        }
+        return $res;  // true on success
+    }
+    // Legacy path — Transaction Wrapper not loaded (preserves V.34.1 byte-for-byte)
+    return _dinoco_inv_do_issue_legacy($post_id, $dist_id, $total, $dist_name);
+}
+
+/**
+ * V.34.2: validate phase — pre-checks before lock acquire. Holds existing transient
+ * dedup + credit_hold + credit_limit guards. Returns WP_Error to abort or array() to
+ * proceed (wrapper merges array into context — currently empty).
+ */
+function _dinoco_inv_do_issue_validate($post_id, $dist_id, $total) {
+    // Guard: already issued
+    if (get_field('is_billed', $post_id)) {
+        return new WP_Error('already_issued', 'บิลนี้ออกแล้ว ไม่สามารถออกซ้ำได้', ['status' => 400]);
+    }
+
+    // Guard: race condition dedup (transient lock — different layer than GET_LOCK,
+    // catches same-post double-click within 10s window)
+    $lock_key = 'inv_issue_' . $post_id;
+    if (get_transient($lock_key)) {
+        return new WP_Error('duplicate', 'กำลังดำเนินการ กรุณารอสักครู่', ['status' => 429]);
+    }
+    set_transient($lock_key, 1, 10);
+
+    // Guard: credit_hold
+    if ($dist_id && get_field('credit_hold', $dist_id)) {
+        delete_transient($lock_key);
+        return new WP_Error('credit_hold', 'ระงับเครดิต: ไม่สามารถออกบิลได้', ['status' => 403]);
+    }
+    // Guard: credit limit (pre-check — atomic check happens inside b2b_debt_add)
+    if ($dist_id) {
+        $limit = floatval(get_field('credit_limit', $dist_id));
+        $debt  = floatval(get_field('current_debt', $dist_id));
+        if ($limit > 0 && ($debt + $total) > $limit) {
+            delete_transient($lock_key);
+            $avail = max(0, $limit - $debt);
+            return new WP_Error('credit_exceeded',
+                'เกินวงเครดิต: เหลือ ฿' . number_format($avail, 0) . ' แต่ต้องการ ฿' . number_format($total, 0),
+                ['status' => 403]);
+        }
+    }
+    return array();  // proceed — wrapper continues to LOCK + MUTATE
+}
+
+/**
+ * V.34.2: mutate phase — V.34.0 HIGH-H4 ordering preserved exactly. b2b_debt_add()
+ * atomic credit gate FIRST → is_billed flip → status transition → audit log.
+ * Returns true on success or WP_Error to abort (wrapper handles compensation if defined).
+ */
+function _dinoco_inv_do_issue_mutate($post_id, $dist_id, $total, $dist_name) {
+    // Ensure due_date is set — calculate from credit_term_days if empty
+    $due = get_field('due_date', $post_id);
+    if (empty($due)) {
+        $term = intval(get_field('credit_term_days', $dist_id) ?: 30);
+        $inv_date = get_post_meta($post_id, '_inv_date', true) ?: b2b_date('Y-m-d');
+        $due = b2b_date('Y-m-d', strtotime($inv_date . ' +' . $term . ' days'));
+        update_field('due_date', $due, $post_id);
+    }
+
+    // V.34.0 HIGH-H4 FIX: reordered — call b2b_debt_add() FIRST (atomic credit gate),
+    // then mark is_billed + transition status only if debt_add succeeds.
+    // V.34.0 HIGH-H14 FIX: no direct update_field('current_debt') fallback.
+    if (!function_exists('b2b_debt_add')) {
+        delete_transient('inv_issue_' . $post_id);
+        b2b_log('[CRITICAL] Manual Invoice V.34.2 _do_issue_mutate: b2b_debt_add() missing — refusing to issue invoice for dist=' . $dist_id . ' total=' . $total);
+        return new WP_Error('debt_helper_missing',
+            'ระบบบัญชีหนี้ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 1/13 (invoice not issued)',
+            ['status' => 503]);
+    }
+    $result = b2b_debt_add($dist_id, $total, 'manual_invoice_issue:' . $post_id, $post_id);
+    if ($result === false) {
+        delete_transient('inv_issue_' . $post_id);
+        $limit = floatval(get_field('credit_limit', $dist_id));
+        $debt = floatval(get_field('current_debt', $dist_id));
+        $avail = max(0, $limit - $debt);
+        return new WP_Error('credit_exceeded',
+            'เกินวงเครดิต (atomic check): เหลือ ฿' . number_format($avail, 0) . ' แต่ต้องการ ฿' . number_format($total, 0),
+            ['status' => 403]);
+    }
+    // Debt added successfully → now safe to mark issued + transition status
+    update_field('is_billed', true, $post_id);
+    b2b_set_order_status($post_id, 'awaiting_payment');
+    b2b_add_audit_log($post_id, 'invoice_issued', 'ออกใบแจ้งหนี้/วางบิล ฿' . number_format($total, 0) . ' เพิ่มหนี้ตัวแทน ' . $dist_name);
+
+    // Transient released on success too — keeps callers' `delete_transient('inv_issue_' . $id)`
+    // call sites idempotent (no harm in re-deleting an already-deleted transient).
+    delete_transient('inv_issue_' . $post_id);
+    return true;
+}
+
+/**
+ * V.34.2: notify phase — LINE Flex Card + Invoice Image push. Runs OUTSIDE the
+ * MySQL GET_LOCK so LINE API timeout cannot block other admin issue actions on same
+ * distributor. Failure is non-fatal (wrapper swallows exceptions and logs) — invoice
+ * row + debt are already committed by mutate phase. Same body as V.34.1 inline send.
+ */
+function _dinoco_inv_do_issue_notify($post_id, $dist_id, $total, $dist_name) {
+    // Send LINE Flex Card + Invoice Image
+    $line_group = get_field('line_group_id', $dist_id);
+    if ($line_group) {
+        $settings = dinoco_inv_get_settings();
+        $inv_data = [
+            'inv_number'      => get_post_meta($post_id, '_inv_number', true),
+            'dist_name'       => $dist_name,
+            'total_amount'    => $total,
+            'due_date'        => get_field('due_date', $post_id),
+            'issue_date'      => get_post_meta($post_id, '_inv_date', true) ?: get_the_date('Y-m-d', $post_id),
+            'items_json'      => get_post_meta($post_id, '_inv_items', true),
+            'credit_term_days'=> intval(get_field('credit_term_days', $dist_id)),
+            'created_by'      => intval(get_post_meta($post_id, '_inv_created_by', true)),
+        ];
+        $flex = dinoco_inv_build_flex_card($inv_data, $settings);
+        b2b_line_push_raw($line_group, $flex);
+        // Send invoice as image (uses Snippet 10 GD generator if available)
+        if (function_exists('b2b_send_invoice_image')) {
+            b2b_send_invoice_image($line_group, $post_id);
+        }
+    }
+}
+
+/**
+ * V.34.2: legacy fallback — used when [Admin System] DINOCO Transaction Wrapper
+ * snippet is disabled OR $dist_id missing (no lock target). Body preserved
+ * byte-for-byte from V.34.1 (sequential validate → debt_add → mark issued → notify).
+ */
+function _dinoco_inv_do_issue_legacy($post_id, $dist_id, $total, $dist_name) {
     // Guard: already issued
     if (get_field('is_billed', $post_id)) {
         return new WP_Error('already_issued', 'บิลนี้ออกแล้ว ไม่สามารถออกซ้ำได้', ['status' => 400]);
@@ -1558,13 +1745,9 @@ function _dinoco_inv_do_issue($post_id, $dist_id, $total, $dist_name) {
 
     // V.34.0 HIGH-H4 FIX: reordered — call b2b_debt_add() FIRST (atomic credit gate),
     // then mark is_billed + transition status only if debt_add succeeds.
-    // Previously: is_billed=true → b2b_set_order_status → b2b_debt_add → if fail rollback both.
-    // Race risk: between is_billed=true and debt_add another process could read stale debt
-    // and double-issue. Now atomic gate happens first; status mutation only on success.
-    // V.34.0 HIGH-H14 FIX: removed direct update_field('current_debt') fallback (line 1542-1543).
     if (!function_exists('b2b_debt_add')) {
         delete_transient('inv_issue_' . $post_id);
-        b2b_log('[CRITICAL] Manual Invoice V.34.0 _do_issue: b2b_debt_add() missing — refusing to issue invoice for dist=' . $dist_id . ' total=' . $total);
+        b2b_log('[CRITICAL] Manual Invoice V.34.2 _do_issue_legacy: b2b_debt_add() missing — refusing to issue invoice for dist=' . $dist_id . ' total=' . $total);
         return new WP_Error('debt_helper_missing',
             'ระบบบัญชีหนี้ไม่พร้อมใช้งาน — กรุณาตรวจสอบ Snippet 1/13 (invoice not issued)',
             ['status' => 503]);
