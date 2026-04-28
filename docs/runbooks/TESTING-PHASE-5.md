@@ -160,10 +160,26 @@ If you need an ID outside these ranges, check no other fixture is using it first
 
 ---
 
+## CI workflow (M3, applied)
+
+`.github/workflows/phpunit.yml` runs both suites on every push to `main` + every PR (excluding pure docs / OpenClaw / RPi changes via `paths-ignore`).
+
+Two parallel jobs:
+
+1. **Unit suite** (~1 min): plain PHPUnit + composer install. No DB needed.
+2. **Integration suite** (~3-5 min on cache hit): MySQL 8 service container + cached wordpress-develop checkout + Composer cache.
+
+Caching strategy:
+
+- `~/.cache/composer` keyed by `composer.lock` hash
+- `/tmp/wordpress` + `/tmp/wordpress-tests-lib` cached together (both required for bootstrap)
+
+JUnit XML is uploaded as artifact (14d retention) AND surfaced in GitHub Checks UI via `mikepenz/action-junit-report@v4`.
+
+Manual trigger: `workflow_dispatch` is enabled — you can run it from the Actions tab.
+
 ## What's NOT covered yet
 
-- **M2 (next)**: 5 first integration tests (stock atomic, FSM rollback, REST nonce, DD-3 hierarchy, audit dual-write)
-- **M3**: GitHub Actions workflow (`.github/workflows/phpunit.yml`)
 - **M4**: BO scenarios + concurrent-worker harness via second mysqli connection
 - **M5**: Coverage report + CI badge
 
