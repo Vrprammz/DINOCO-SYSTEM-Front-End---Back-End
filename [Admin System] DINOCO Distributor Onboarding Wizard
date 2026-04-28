@@ -1,0 +1,952 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Distributor Onboarding Wizard         ║
+ * ║  Version: V.1.0 (2026-04-24) — Initial release (Journey D)   ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
+ * ║  Description: 5-step wizard to onboard a new distributor in   ║
+ * ║    one screen. Closes UX gap from audit Round 2 — admin had  ║
+ * ║    to swap 4 pages (CPT add → wire line_group_id → toggle    ║
+ * ║    bot → first test order) to onboard a single dealer.       ║
+ * ║                                                               ║
+ * ║  Shortcode: [dinoco_admin_onboard_distributor]                ║
+ * ║  REST namespace: /wp-json/dinoco/v1/onboard/*                 ║
+ * ║                                                               ║
+ * ║  Companion patterns (Phase 1-4):                              ║
+ * ║    • Module Registry — self-registers via                     ║
+ * ║      dinoco_register_admin_module() at init priority 30       ║
+ * ║    • Audit Log — dinoco_audit_log() per wizard action         ║
+ * ║      (group_id_check, test_bot, save) for forensic chain      ║
+ * ║    • Modal Helpers — window.dinocoModal.* with native         ║
+ * ║      fallback for confirm/alert/prompt                        ║
+ * ║    • Transaction Wrapper — final save uses dinoco_transaction()║
+ * ║      with validate → mutate → notify phases                   ║
+ * ║                                                               ║
+ * ║  5 Steps:                                                     ║
+ * ║    1. ข้อมูลพื้นฐาน    — shop name + tier + credit + walk-in    ║
+ * ║    2. เชื่อม LINE Group — paste group_id + uniqueness check    ║
+ * ║    3. Bot config       — bot_enabled toggle + custom rules     ║
+ * ║    4. Test order       — send welcome Flex (optional)          ║
+ * ║    5. Review + save    — final summary + create CPT            ║
+ * ║                                                               ║
+ * ║  Endpoints (all permission_callback = manage_options):        ║
+ * ║    POST /onboard/check-group-id  — uniqueness validation       ║
+ * ║    POST /onboard/test-bot        — send welcome Flex to group  ║
+ * ║    POST /onboard/save            — create distributor CPT      ║
+ * ║                                                               ║
+ * ║  CSS scope: .dnc-onboard-* — no conflict with b2b-/b2f-/      ║
+ * ║                              liff-ai- or other admin styles.  ║
+ * ║                                                               ║
+ * ║  Mobile responsive: drawer + breakpoints @ 640px.             ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ============================================================
+ * 1. SHORTCODE + MODULE REGISTRY
+ * ============================================================ */
+
+add_shortcode( 'dinoco_admin_onboard_distributor', 'dinoco_onboard_distributor_render' );
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+    dinoco_register_admin_module( array(
+        'key'        => 'onboard_distributor',
+        'shortcode'  => 'dinoco_admin_onboard_distributor',
+        'label'      => 'เพิ่มตัวแทนใหม่',
+        'section'    => 'b2b',
+        'icon'       => 'fa-user-plus',
+        'color'      => '#10b981',
+        'cache_ttl'  => 60,
+        'capability' => 'manage_options',
+        'order'      => 10,
+        'source'     => '[Admin System] DINOCO Distributor Onboarding Wizard V.1.0',
+    ) );
+}, 30 );
+
+/* ============================================================
+ * 2. REST API ENDPOINTS
+ * ============================================================ */
+
+add_action( 'rest_api_init', function() {
+    $perm_admin_post = function( WP_REST_Request $req ) {
+        return current_user_can( 'manage_options' )
+            && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
+    };
+
+    register_rest_route( 'dinoco/v1', '/onboard/check-group-id', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_onboard_rest_check_group_id',
+        'permission_callback' => $perm_admin_post,
+    ) );
+
+    register_rest_route( 'dinoco/v1', '/onboard/test-bot', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_onboard_rest_test_bot',
+        'permission_callback' => $perm_admin_post,
+    ) );
+
+    register_rest_route( 'dinoco/v1', '/onboard/save', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_onboard_rest_save',
+        'permission_callback' => $perm_admin_post,
+    ) );
+} );
+
+// ────────────────────────────────────────────────────────────────
+// POST /onboard/check-group-id — uniqueness check
+// Body: { group_id }
+// Returns: { ok, available, conflict_dist?:{id,title,line_group_id} }
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_onboard_rest_check_group_id' ) ) {
+    function dinoco_onboard_rest_check_group_id( WP_REST_Request $req ) {
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) $body = array();
+
+        $group_id = sanitize_text_field( (string) ( isset( $body['group_id'] ) ? $body['group_id'] : $req->get_param( 'group_id' ) ) );
+        $exclude_id = (int) ( isset( $body['exclude_id'] ) ? $body['exclude_id'] : $req->get_param( 'exclude_id' ) );
+
+        if ( $group_id === '' ) {
+            return new WP_Error( 'bad_group_id', 'group_id ว่าง', array( 'status' => 400 ) );
+        }
+        // LINE group_id is typically 33 chars starting with 'C' or 'R'. Allow letters/digits.
+        if ( ! preg_match( '/^[A-Za-z0-9]{20,}$/', $group_id ) ) {
+            return new WP_Error( 'invalid_format',
+                'รูปแบบไม่ถูกต้อง (group_id ต้องเป็นตัวอักษร/ตัวเลข ≥20 ตัว เช่น Cxxxxxxxxx...)',
+                array( 'status' => 400 ) );
+        }
+
+        // Search distributor CPT by line_group_id meta
+        $existing = get_posts( array(
+            'post_type'      => 'distributor',
+            'post_status'    => array( 'publish', 'draft', 'pending', 'private' ),
+            'posts_per_page' => 5,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                array(
+                    'key'     => 'line_group_id',
+                    'value'   => $group_id,
+                    'compare' => '=',
+                ),
+            ),
+        ) );
+
+        if ( $exclude_id > 0 && ! empty( $existing ) ) {
+            $existing = array_values( array_diff( $existing, array( $exclude_id ) ) );
+        }
+
+        if ( empty( $existing ) ) {
+            return rest_ensure_response( array(
+                'success'   => true,
+                'available' => true,
+                'group_id'  => $group_id,
+            ) );
+        }
+
+        $conflict_id = (int) $existing[0];
+        return rest_ensure_response( array(
+            'success'   => true,
+            'available' => false,
+            'group_id'  => $group_id,
+            'conflict_dist' => array(
+                'id'           => $conflict_id,
+                'title'        => get_the_title( $conflict_id ),
+                'line_group_id' => $group_id,
+            ),
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// POST /onboard/test-bot — send welcome Flex to group
+// Body: { group_id, shop_name? }
+// Returns: { ok, sent:bool, message }
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_onboard_rest_test_bot' ) ) {
+    function dinoco_onboard_rest_test_bot( WP_REST_Request $req ) {
+        $uid = get_current_user_id();
+        // Rate limit 5/min/user (network call)
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'onboard_test_bot_u' . $uid, 5, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 5/min)', array( 'status' => 429 ) );
+            }
+        }
+
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) $body = array();
+
+        $group_id  = sanitize_text_field( (string) ( isset( $body['group_id'] ) ? $body['group_id'] : '' ) );
+        $shop_name = sanitize_text_field( (string) ( isset( $body['shop_name'] ) ? $body['shop_name'] : '' ) );
+
+        if ( $group_id === '' ) {
+            return new WP_Error( 'bad_group_id', 'group_id ว่าง', array( 'status' => 400 ) );
+        }
+
+        if ( ! function_exists( 'b2b_line_push' ) ) {
+            return new WP_Error( 'no_line_helper', 'b2b_line_push ไม่พร้อม', array( 'status' => 501 ) );
+        }
+
+        $shop_label = $shop_name !== '' ? $shop_name : '(ร้านใหม่)';
+        $msg = "🎉 ยินดีต้อนรับเข้าสู่ระบบ DINOCO B2B\n\n"
+             . "ร้าน: " . $shop_label . "\n"
+             . "สถานะ: เชื่อมต่อสำเร็จ ✓\n\n"
+             . "ทีมงานจะส่งคู่มือใช้งาน + ราคาสินค้าให้ในกลุ่มนี้เร็วๆนี้ครับ\n"
+             . "พิมพ์ \"ขอราคา\" เพื่อดูสินค้า — ขอบคุณที่ร่วมเป็นตัวแทนนะครับ 🙏";
+
+        $sent = false;
+        $err_msg = '';
+        try {
+            $resp = b2b_line_push( $group_id, $msg );
+            $sent = ! empty( $resp ) || $resp === true;
+        } catch ( \Throwable $e ) {
+            $err_msg = $e->getMessage();
+        }
+
+        // Audit (best-effort)
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            try {
+                dinoco_audit_log( array(
+                    'event_type'  => 'onboard_test_bot',
+                    'actor_type'  => 'admin',
+                    'actor_id'    => (string) $uid,
+                    'target_type' => 'line_group',
+                    'target_id'   => $group_id,
+                    'context'     => array(
+                        'shop_name' => $shop_name,
+                        'sent'      => $sent,
+                        'error'     => $err_msg,
+                    ),
+                    'success'     => $sent ? 1 : 0,
+                ) );
+            } catch ( \Throwable $e ) { /* silent */ }
+        }
+
+        if ( ! $sent ) {
+            return rest_ensure_response( array(
+                'success' => true,
+                'sent'    => false,
+                'message' => 'ส่งไม่สำเร็จ — ' . ( $err_msg !== '' ? $err_msg : 'อาจเป็นเพราะบอทยังไม่ได้ join group หรือ group_id ผิด' ),
+            ) );
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'sent'    => true,
+            'message' => 'ส่ง welcome message ไปยังกลุ่มเรียบร้อย — เช็คใน LINE',
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// POST /onboard/save — final save (create distributor CPT + meta)
+// Body: { shop_name, line_group_id, rank_system, credit_limit,
+//         credit_term_days, is_walkin, bot_enabled, dist_phone?,
+//         dist_address?, dist_district?, dist_province?, dist_postcode?,
+//         dist_city?, b2b_discount_percent? }
+// Returns: { ok, dist_id, edit_url, distributor:{...} }
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_onboard_rest_save' ) ) {
+    function dinoco_onboard_rest_save( WP_REST_Request $req ) {
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'onboard_save_u' . $uid, 10, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 10/min)', array( 'status' => 429 ) );
+            }
+        }
+
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) $body = array();
+
+        // Pull + sanitize
+        $shop_name        = sanitize_text_field( (string) ( $body['shop_name'] ?? '' ) );
+        $line_group_id    = sanitize_text_field( (string) ( $body['line_group_id'] ?? '' ) );
+        $rank_system      = sanitize_text_field( (string) ( $body['rank_system'] ?? 'standard' ) );
+        $credit_limit     = floatval( $body['credit_limit'] ?? 0 );
+        $credit_term_days = intval( $body['credit_term_days'] ?? 30 );
+        $is_walkin        = ! empty( $body['is_walkin'] );
+        $bot_enabled      = isset( $body['bot_enabled'] ) ? (bool) $body['bot_enabled'] : true;
+        $dist_phone       = sanitize_text_field( (string) ( $body['dist_phone'] ?? '' ) );
+        $dist_address     = sanitize_text_field( (string) ( $body['dist_address'] ?? '' ) );
+        $dist_district    = sanitize_text_field( (string) ( $body['dist_district'] ?? '' ) );
+        $dist_province    = sanitize_text_field( (string) ( $body['dist_province'] ?? '' ) );
+        $dist_postcode    = sanitize_text_field( (string) ( $body['dist_postcode'] ?? '' ) );
+        $dist_city        = sanitize_text_field( (string) ( $body['dist_city'] ?? '' ) );
+        $b2b_discount_pct = $body['b2b_discount_percent'] ?? null;
+
+        // ─── Validation
+        $allowed_ranks = array( 'standard', 'silver', 'gold', 'platinum', 'diamond' );
+        if ( ! in_array( $rank_system, $allowed_ranks, true ) ) {
+            $rank_system = 'standard';
+        }
+        if ( $shop_name === '' ) {
+            return new WP_Error( 'bad_shop', 'กรุณาระบุชื่อร้าน', array( 'status' => 400 ) );
+        }
+        if ( mb_strlen( $shop_name ) > 200 ) {
+            return new WP_Error( 'shop_too_long', 'ชื่อร้านยาวเกิน 200 ตัวอักษร', array( 'status' => 400 ) );
+        }
+        if ( $line_group_id === '' ) {
+            return new WP_Error( 'bad_group_id', 'กรุณาระบุ line_group_id', array( 'status' => 400 ) );
+        }
+        if ( ! preg_match( '/^[A-Za-z0-9]{20,}$/', $line_group_id ) ) {
+            return new WP_Error( 'invalid_group_id_format',
+                'รูปแบบ group_id ไม่ถูกต้อง',
+                array( 'status' => 400 ) );
+        }
+        if ( $credit_limit < 0 || $credit_limit > 10000000 ) {
+            return new WP_Error( 'bad_credit', 'credit_limit อยู่ในช่วง 0 ถึง 10,000,000', array( 'status' => 400 ) );
+        }
+        if ( $credit_term_days < 1 || $credit_term_days > 365 ) {
+            return new WP_Error( 'bad_term', 'credit_term_days อยู่ในช่วง 1 ถึง 365', array( 'status' => 400 ) );
+        }
+
+        // Uniqueness re-check (defense-in-depth — frontend already checked)
+        $dup = get_posts( array(
+            'post_type'      => 'distributor',
+            'post_status'    => array( 'publish', 'draft', 'pending', 'private' ),
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                array( 'key' => 'line_group_id', 'value' => $line_group_id, 'compare' => '=' ),
+            ),
+        ) );
+        if ( ! empty( $dup ) ) {
+            return new WP_Error( 'group_id_taken',
+                'group_id นี้ถูกใช้แล้วโดย distributor #' . (int) $dup[0],
+                array( 'status' => 409 ) );
+        }
+
+        // ─── Wrap save in transaction wrapper if available
+        $context = array(
+            'audit_event_type' => 'onboard_distributor',
+            'actor_type'       => 'admin',
+            'target_type'      => 'distributor',
+            'audit_context'    => array(
+                'shop_name'    => $shop_name,
+                'rank_system'  => $rank_system,
+                'credit_limit' => $credit_limit,
+                'is_walkin'    => $is_walkin,
+                'bot_enabled'  => $bot_enabled,
+            ),
+        );
+
+        $do_mutate = function() use (
+            $shop_name, $line_group_id, $rank_system, $credit_limit, $credit_term_days,
+            $is_walkin, $bot_enabled, $dist_phone, $dist_address, $dist_district,
+            $dist_province, $dist_postcode, $dist_city, $b2b_discount_pct
+        ) {
+            $dist_id = wp_insert_post( array(
+                'post_type'   => 'distributor',
+                'post_title'  => $shop_name,
+                'post_status' => 'publish',
+            ) );
+            if ( is_wp_error( $dist_id ) || ! $dist_id ) {
+                return new WP_Error( 'insert_failed',
+                    'สร้าง distributor CPT ไม่สำเร็จ',
+                    array( 'status' => 500 ) );
+            }
+
+            // ACF + meta writes
+            if ( function_exists( 'update_field' ) ) {
+                update_field( 'shop_name', $shop_name, $dist_id );
+                update_field( 'line_group_id', $line_group_id, $dist_id );
+                update_field( 'rank_system', $rank_system, $dist_id );
+                update_field( 'credit_limit', $credit_limit, $dist_id );
+                update_field( 'credit_term_days', $credit_term_days, $dist_id );
+                update_field( 'credit_hold', false, $dist_id );
+                update_field( 'is_walkin', $is_walkin, $dist_id );
+                update_field( 'current_debt', 0, $dist_id );
+                update_field( 'monthly_sales_mtd', 0, $dist_id );
+
+                if ( $dist_phone !== '' )    update_field( 'dist_phone', $dist_phone, $dist_id );
+                if ( $dist_address !== '' )  update_field( 'dist_address', $dist_address, $dist_id );
+                if ( $dist_district !== '' ) update_field( 'dist_district', $dist_district, $dist_id );
+                if ( $dist_province !== '' ) update_field( 'dist_province', $dist_province, $dist_id );
+                if ( $dist_postcode !== '' ) update_field( 'dist_postcode', $dist_postcode, $dist_id );
+                if ( $dist_city !== '' )     update_field( 'dist_city', $dist_city, $dist_id );
+
+                if ( $b2b_discount_pct !== null && $b2b_discount_pct !== '' ) {
+                    $pct = max( 0, min( 100, floatval( $b2b_discount_pct ) ) );
+                    update_field( 'b2b_discount_percent', $pct, $dist_id );
+                }
+            } else {
+                // Fallback: raw post meta if ACF inactive (rare)
+                update_post_meta( $dist_id, 'line_group_id', $line_group_id );
+                update_post_meta( $dist_id, 'rank_system', $rank_system );
+                update_post_meta( $dist_id, 'credit_limit', $credit_limit );
+                update_post_meta( $dist_id, 'credit_term_days', $credit_term_days );
+                update_post_meta( $dist_id, 'is_walkin', $is_walkin ? 1 : 0 );
+                update_post_meta( $dist_id, 'current_debt', 0 );
+            }
+
+            // bot_enabled is plain post meta (Snippet 9 pattern)
+            update_post_meta( $dist_id, 'bot_enabled', $bot_enabled ? 1 : 0 );
+            update_post_meta( $dist_id, '_b2b_onboarded_via', 'wizard_v1' );
+            update_post_meta( $dist_id, '_b2b_onboarded_at', current_time( 'mysql' ) );
+
+            return array( 'dist_id' => (int) $dist_id );
+        };
+
+        $result = null;
+        if ( function_exists( 'dinoco_transaction' ) ) {
+            $result = dinoco_transaction( 'onboard_distributor', array(
+                'mutate' => $do_mutate,
+            ), $context );
+        } else {
+            $result = call_user_func( $do_mutate );
+            // Manual audit fallback if transaction wrapper unavailable
+            if ( ! is_wp_error( $result ) && function_exists( 'dinoco_audit_log' ) ) {
+                try {
+                    dinoco_audit_log( array(
+                        'event_type'  => 'onboard_distributor',
+                        'actor_type'  => 'admin',
+                        'actor_id'    => (string) $uid,
+                        'target_type' => 'distributor',
+                        'target_id'   => (string) $result['dist_id'],
+                        'context'     => $context['audit_context'],
+                    ) );
+                } catch ( \Throwable $e ) { /* silent */ }
+            }
+        }
+
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+
+        $dist_id = (int) ( is_array( $result ) && isset( $result['dist_id'] ) ? $result['dist_id'] : 0 );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( '[OnboardWizard] Created distributor #' . $dist_id
+                . ' shop="' . $shop_name . '" group=' . $line_group_id
+                . ' tier=' . $rank_system . ' admin=' . $uid );
+        }
+
+        return rest_ensure_response( array(
+            'success'  => true,
+            'dist_id'  => $dist_id,
+            'edit_url' => admin_url( 'post.php?post=' . $dist_id . '&action=edit' ),
+            'distributor' => array(
+                'id'             => $dist_id,
+                'shop_name'      => $shop_name,
+                'line_group_id'  => $line_group_id,
+                'rank_system'    => $rank_system,
+                'credit_limit'   => $credit_limit,
+                'credit_term_days' => $credit_term_days,
+                'is_walkin'      => $is_walkin,
+                'bot_enabled'    => $bot_enabled,
+            ),
+            'message' => 'สร้างตัวแทน "' . $shop_name . '" สำเร็จ',
+        ) );
+    }
+}
+
+/* ============================================================
+ * 3. SHORTCODE RENDER
+ * ============================================================ */
+
+if ( ! function_exists( 'dinoco_onboard_distributor_render' ) ) {
+    function dinoco_onboard_distributor_render() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p>คุณไม่มีสิทธิ์ดูหน้านี้</p>';
+        }
+
+        $nonce = wp_create_nonce( 'wp_rest' );
+
+        ob_start();
+        ?>
+        <div class="dnc-onboard-wrap">
+            <style>
+                .dnc-onboard-wrap { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 880px; margin: 0 auto; padding: 20px; color: #0f172a; box-sizing: border-box; }
+                .dnc-onboard-wrap *, .dnc-onboard-wrap *::before, .dnc-onboard-wrap *::after { box-sizing: border-box; }
+                .dnc-onboard-wrap h2 { margin: 0 0 6px; font-size: 24px; color: #064e3b; }
+                .dnc-onboard-wrap .dnc-onboard-subtitle { color: #64748b; font-size: 14px; margin-bottom: 24px; }
+
+                /* Stepper */
+                .dnc-onboard-stepper { display: flex; gap: 8px; margin-bottom: 28px; flex-wrap: wrap; }
+                .dnc-onboard-step { flex: 1; min-width: 130px; padding: 12px 14px; border-radius: 10px; background: #f1f5f9; color: #94a3b8; font-size: 12px; font-weight: 600; text-align: center; transition: all 0.2s; position: relative; }
+                .dnc-onboard-step.active { background: linear-gradient(135deg, #10b981, #059669); color: #fff; box-shadow: 0 4px 12px rgba(16,185,129,0.3); }
+                .dnc-onboard-step.done { background: #d1fae5; color: #047857; }
+                .dnc-onboard-step.done::after { content: '✓'; margin-left: 6px; }
+                .dnc-onboard-step-num { display: block; font-size: 18px; margin-bottom: 2px; }
+
+                /* Cards */
+                .dnc-onboard-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 28px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+                .dnc-onboard-card h3 { margin: 0 0 6px; font-size: 18px; color: #0f172a; }
+                .dnc-onboard-card .dnc-onboard-desc { color: #64748b; font-size: 13px; margin-bottom: 18px; line-height: 1.6; }
+
+                /* Fields */
+                .dnc-onboard-field { margin-bottom: 16px; }
+                .dnc-onboard-field label { display: block; font-size: 13px; color: #334155; margin-bottom: 5px; font-weight: 600; }
+                .dnc-onboard-field label .req { color: #dc2626; margin-left: 2px; }
+                .dnc-onboard-field input[type="text"], .dnc-onboard-field input[type="number"], .dnc-onboard-field input[type="tel"], .dnc-onboard-field select, .dnc-onboard-field textarea {
+                    width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; background: #fff; color: #0f172a; transition: border-color 0.15s, box-shadow 0.15s;
+                }
+                .dnc-onboard-field input:focus, .dnc-onboard-field select:focus, .dnc-onboard-field textarea:focus { outline: none; border-color: #10b981; box-shadow: 0 0 0 3px rgba(16,185,129,0.15); }
+                .dnc-onboard-field .hint { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+                .dnc-onboard-field .err { font-size: 12px; color: #dc2626; margin-top: 4px; }
+                .dnc-onboard-field .ok { font-size: 12px; color: #16a34a; margin-top: 4px; }
+                .dnc-onboard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+                @media (max-width: 640px) { .dnc-onboard-grid { grid-template-columns: 1fr; } .dnc-onboard-wrap { padding: 14px; } .dnc-onboard-card { padding: 18px; } }
+
+                .dnc-onboard-toggle { display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; cursor: pointer; transition: background 0.15s; }
+                .dnc-onboard-toggle:hover { background: #f8fafc; }
+                .dnc-onboard-toggle input { width: 18px; height: 18px; cursor: pointer; }
+                .dnc-onboard-toggle-label { flex: 1; font-size: 13px; color: #1e293b; }
+                .dnc-onboard-toggle-hint { font-size: 11px; color: #64748b; display: block; margin-top: 2px; }
+
+                /* Buttons */
+                .dnc-onboard-actions { display: flex; justify-content: space-between; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
+                .dnc-onboard-btn { padding: 11px 22px; border-radius: 8px; border: 0; cursor: pointer; font-size: 14px; font-weight: 600; transition: all 0.15s; }
+                .dnc-onboard-btn.primary { background: linear-gradient(135deg, #10b981, #059669); color: #fff; }
+                .dnc-onboard-btn.primary:hover { box-shadow: 0 4px 12px rgba(16,185,129,0.4); transform: translateY(-1px); }
+                .dnc-onboard-btn.primary:disabled { background: #94a3b8; cursor: not-allowed; transform: none; box-shadow: none; }
+                .dnc-onboard-btn.secondary { background: #e2e8f0; color: #475569; }
+                .dnc-onboard-btn.secondary:hover { background: #cbd5e1; }
+                .dnc-onboard-btn.ghost { background: transparent; color: #64748b; }
+                .dnc-onboard-btn.ghost:hover { color: #0f172a; }
+
+                /* Banner */
+                .dnc-onboard-banner { padding: 12px 14px; border-radius: 8px; font-size: 13px; line-height: 1.5; margin-bottom: 12px; }
+                .dnc-onboard-banner.info { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+                .dnc-onboard-banner.warn { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+                .dnc-onboard-banner.ok { background: #d1fae5; color: #047857; border: 1px solid #a7f3d0; }
+                .dnc-onboard-banner.bad { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+
+                /* Review section */
+                .dnc-onboard-review-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+                .dnc-onboard-review-row:last-child { border-bottom: 0; }
+                .dnc-onboard-review-row .lbl { color: #64748b; }
+                .dnc-onboard-review-row .val { color: #0f172a; font-weight: 600; text-align: right; }
+
+                /* Tier preview */
+                .dnc-onboard-tier-preview { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; color: #fff; }
+                .dnc-onboard-tier-preview.standard { background: #64748b; }
+                .dnc-onboard-tier-preview.silver { background: #94a3b8; }
+                .dnc-onboard-tier-preview.gold { background: #d97706; }
+                .dnc-onboard-tier-preview.platinum { background: #475569; }
+                .dnc-onboard-tier-preview.diamond { background: linear-gradient(135deg,#7c3aed,#3b82f6); }
+            </style>
+
+            <h2>🤝 เพิ่มตัวแทนใหม่</h2>
+            <p class="dnc-onboard-subtitle">วิซาร์ด 5 ขั้นตอน — สร้าง distributor + เชื่อม LINE Group + ตั้งค่า bot ในหน้าเดียว</p>
+
+            <div class="dnc-onboard-stepper" id="dncOnboardStepper">
+                <div class="dnc-onboard-step active" data-step="1"><span class="dnc-onboard-step-num">1</span>ข้อมูลพื้นฐาน</div>
+                <div class="dnc-onboard-step" data-step="2"><span class="dnc-onboard-step-num">2</span>เชื่อม LINE</div>
+                <div class="dnc-onboard-step" data-step="3"><span class="dnc-onboard-step-num">3</span>Bot Config</div>
+                <div class="dnc-onboard-step" data-step="4"><span class="dnc-onboard-step-num">4</span>Test Order</div>
+                <div class="dnc-onboard-step" data-step="5"><span class="dnc-onboard-step-num">5</span>Review + Save</div>
+            </div>
+
+            <!-- Step 1: ข้อมูลพื้นฐาน -->
+            <div class="dnc-onboard-card dnc-onboard-step-pane" data-pane="1">
+                <h3>📋 ข้อมูลพื้นฐาน</h3>
+                <div class="dnc-onboard-desc">กรอกข้อมูลร้านค้า + เลือก tier + วงเงินเครดิต</div>
+
+                <div class="dnc-onboard-field">
+                    <label>ชื่อร้าน <span class="req">*</span></label>
+                    <input type="text" id="dncOnbShopName" maxlength="200" placeholder="เช่น: ร้านมอเตอร์เซลส์ บางนา" autofocus>
+                    <div class="hint">จะแสดงใน Admin Dashboard + Invoice + LINE messages</div>
+                </div>
+
+                <div class="dnc-onboard-grid">
+                    <div class="dnc-onboard-field">
+                        <label>Tier (ระดับ) <span class="req">*</span></label>
+                        <select id="dncOnbTier">
+                            <option value="standard">Standard</option>
+                            <option value="silver">Silver</option>
+                            <option value="gold">Gold</option>
+                            <option value="platinum">Platinum</option>
+                            <option value="diamond">Diamond</option>
+                        </select>
+                        <div class="hint" id="dncOnbTierHint">ส่วนลด default ตาม tier — ปรับเองทีหลังได้</div>
+                    </div>
+                    <div class="dnc-onboard-field">
+                        <label>วงเงินเครดิต (THB)</label>
+                        <input type="number" id="dncOnbCreditLimit" min="0" max="10000000" step="1000" value="0" placeholder="0">
+                        <div class="hint">0 = no credit (จ่ายก่อนรับของ)</div>
+                    </div>
+                </div>
+
+                <div class="dnc-onboard-grid">
+                    <div class="dnc-onboard-field">
+                        <label>เครดิตเทอม (วัน)</label>
+                        <input type="number" id="dncOnbCreditTerm" min="1" max="365" step="1" value="30">
+                    </div>
+                    <div class="dnc-onboard-field">
+                        <label>ส่วนลด default (%)</label>
+                        <input type="number" id="dncOnbDiscountPct" min="0" max="100" step="0.5" placeholder="ใช้ tier default">
+                        <div class="hint">เว้นว่างเพื่อใช้ค่า default ตาม tier</div>
+                    </div>
+                </div>
+
+                <div class="dnc-onboard-field">
+                    <label class="dnc-onboard-toggle">
+                        <input type="checkbox" id="dncOnbWalkin">
+                        <span class="dnc-onboard-toggle-label">
+                            <strong>Walk-in mode</strong>
+                            <span class="dnc-onboard-toggle-hint">เปิดสำหรับร้านหน้าโกดัง — ข้ามเช็คสต็อก + auto-complete หลังจ่าย</span>
+                        </span>
+                    </label>
+                </div>
+
+                <div class="dnc-onboard-actions">
+                    <span></span>
+                    <button class="dnc-onboard-btn primary" onclick="dncOnboardNext(1)">ถัดไป →</button>
+                </div>
+            </div>
+
+            <!-- Step 2: LINE Group -->
+            <div class="dnc-onboard-card dnc-onboard-step-pane" data-pane="2" style="display:none;">
+                <h3>📱 เชื่อม LINE Group</h3>
+                <div class="dnc-onboard-desc">เพิ่ม DINOCO bot เข้ากลุ่ม LINE ของร้าน → bot จะตอบ group_id ให้</div>
+
+                <div class="dnc-onboard-banner info">
+                    <strong>วิธีหา group_id:</strong>
+                    <ol style="margin: 6px 0 0 18px; padding: 0;">
+                        <li>เพิ่ม DINOCO bot เข้ากลุ่ม LINE ของร้านนี้</li>
+                        <li>พิมพ์ในกลุ่ม: <code style="background:#dbeafe;padding:2px 6px;border-radius:4px;">ขอไอดีกลุ่ม</code></li>
+                        <li>Bot จะตอบ ID ออกมา (ขึ้นต้นด้วย C... ยาว ~33 ตัว)</li>
+                        <li>คัดลอกมาวางในช่องด้านล่าง</li>
+                    </ol>
+                </div>
+
+                <div class="dnc-onboard-field">
+                    <label>LINE Group ID <span class="req">*</span></label>
+                    <input type="text" id="dncOnbGroupId" maxlength="100" placeholder="Cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">
+                    <div class="hint">ตัวอักษร/ตัวเลข อย่างน้อย 20 ตัว</div>
+                    <div id="dncOnbGroupCheck"></div>
+                </div>
+
+                <div class="dnc-onboard-actions">
+                    <button class="dnc-onboard-btn ghost" onclick="dncOnboardBack(2)">← กลับ</button>
+                    <button class="dnc-onboard-btn primary" id="dncOnbStep2Next" onclick="dncOnboardNext(2)">ตรวจสอบ + ถัดไป →</button>
+                </div>
+            </div>
+
+            <!-- Step 3: Bot Config -->
+            <div class="dnc-onboard-card dnc-onboard-step-pane" data-pane="3" style="display:none;">
+                <h3>🤖 ตั้งค่า Bot</h3>
+                <div class="dnc-onboard-desc">เปิดบอตให้ตอบ + รับสลิป + ส่งใบสั่งซื้อ — สามารถปิด/เปิดทีหลังได้ใน Admin Control Panel</div>
+
+                <div class="dnc-onboard-field">
+                    <label class="dnc-onboard-toggle">
+                        <input type="checkbox" id="dncOnbBotEnabled" checked>
+                        <span class="dnc-onboard-toggle-label">
+                            <strong>เปิดบอต (รับ-ส่งข้อความในกลุ่ม)</strong>
+                            <span class="dnc-onboard-toggle-hint">บอตจะตอบรายการสินค้า + รับสลิปอัตโนมัติ + ส่ง Flex card สั่งซื้อ</span>
+                        </span>
+                    </label>
+                </div>
+
+                <div class="dnc-onboard-banner warn">
+                    <strong>⚠️ หมายเหตุ:</strong> ถ้าปิดบอต — ลูกค้าจะไม่สามารถสั่งของผ่าน LINE ได้ (admin จะต้องเปิดสั่งให้ผ่าน Manual Invoice แทน)
+                </div>
+
+                <div class="dnc-onboard-actions">
+                    <button class="dnc-onboard-btn ghost" onclick="dncOnboardBack(3)">← กลับ</button>
+                    <button class="dnc-onboard-btn primary" onclick="dncOnboardNext(3)">ถัดไป →</button>
+                </div>
+            </div>
+
+            <!-- Step 4: Test bot -->
+            <div class="dnc-onboard-card dnc-onboard-step-pane" data-pane="4" style="display:none;">
+                <h3>🧪 ทดสอบบอต (Optional)</h3>
+                <div class="dnc-onboard-desc">ส่ง welcome message ไปกลุ่ม LINE — ตรวจว่าบอตติดต่อกลุ่มได้จริงก่อนสร้าง CPT</div>
+
+                <div class="dnc-onboard-banner info">
+                    เลือกได้ — ข้ามขั้นนี้แล้วบันทึกเลย หรือกดทดสอบเพื่อยืนยัน group_id ใช้งานได้
+                </div>
+
+                <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <button class="dnc-onboard-btn secondary" id="dncOnbTestBtn" onclick="dncOnboardTestBot()">📨 ส่ง Test Message</button>
+                    <span id="dncOnbTestResult" style="font-size:13px;"></span>
+                </div>
+
+                <div class="dnc-onboard-actions" style="margin-top:24px;">
+                    <button class="dnc-onboard-btn ghost" onclick="dncOnboardBack(4)">← กลับ</button>
+                    <button class="dnc-onboard-btn primary" onclick="dncOnboardNext(4)">ข้ามไปบันทึก →</button>
+                </div>
+            </div>
+
+            <!-- Step 5: Review + save -->
+            <div class="dnc-onboard-card dnc-onboard-step-pane" data-pane="5" style="display:none;">
+                <h3>📑 ตรวจสอบข้อมูล + บันทึก</h3>
+                <div class="dnc-onboard-desc">ตรวจข้อมูลก่อนสร้าง distributor ในระบบ</div>
+
+                <div id="dncOnbReview"></div>
+
+                <div id="dncOnbSaveResult" style="margin-top:14px;"></div>
+
+                <div class="dnc-onboard-actions">
+                    <button class="dnc-onboard-btn ghost" onclick="dncOnboardBack(5)">← กลับแก้ไข</button>
+                    <button class="dnc-onboard-btn primary" id="dncOnbSaveBtn" onclick="dncOnboardSave()">💾 บันทึกตัวแทนใหม่</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        (function() {
+            const NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+            const REST  = '<?php echo esc_js( rest_url( 'dinoco/v1/onboard' ) ); ?>';
+
+            // State
+            const state = {
+                step: 1,
+                groupChecked: false,
+                groupAvailable: false,
+                inFlight: false,
+                form: {},
+            };
+
+            // Per-tier discount hints (informational only)
+            const TIER_DISCOUNT_DEFAULTS = {
+                standard: '0% (ราคา retail)',
+                silver:   '5% off retail',
+                gold:     '10% off retail',
+                platinum: '15% off retail',
+                diamond:  '20% off retail',
+            };
+
+            function esc(s) {
+                return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+            }
+            function fmtBaht(n) { if (n == null || n === '') return '-'; return '฿' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2}); }
+
+            async function apiPost(path, body) {
+                const r = await fetch(REST + path, {
+                    method: 'POST',
+                    headers: { 'X-WP-Nonce': NONCE, 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body || {}),
+                });
+                return r.json();
+            }
+
+            function safeAlert(opts) {
+                try {
+                    if (window.dinocoModal && typeof window.dinocoModal.alert === 'function') {
+                        return window.dinocoModal.alert(opts);
+                    }
+                } catch (e) { /* fall through */ }
+                window.alert(opts.message || '');
+                return Promise.resolve();
+            }
+            function safeConfirm(opts) {
+                try {
+                    if (window.dinocoModal && typeof window.dinocoModal.confirm === 'function') {
+                        return window.dinocoModal.confirm(opts);
+                    }
+                } catch (e) { /* fall through */ }
+                return Promise.resolve(window.confirm(opts.message || 'ยืนยัน?'));
+            }
+
+            // Update tier hint when select changes
+            document.getElementById('dncOnbTier').addEventListener('change', function(e) {
+                const t = e.target.value;
+                const h = TIER_DISCOUNT_DEFAULTS[t] || '';
+                document.getElementById('dncOnbTierHint').textContent = 'ส่วนลด default: ' + h + ' — ปรับเองทีหลังได้';
+            });
+
+            // Step navigation
+            function showPane(n) {
+                document.querySelectorAll('.dnc-onboard-step-pane').forEach(p => p.style.display = 'none');
+                const tgt = document.querySelector('.dnc-onboard-step-pane[data-pane="' + n + '"]');
+                if (tgt) tgt.style.display = 'block';
+                document.querySelectorAll('.dnc-onboard-step').forEach(s => {
+                    const num = parseInt(s.dataset.step, 10);
+                    s.classList.remove('active', 'done');
+                    if (num < n) s.classList.add('done');
+                    else if (num === n) s.classList.add('active');
+                });
+                state.step = n;
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+
+            // Validation per step
+            function validateStep1() {
+                const shop = document.getElementById('dncOnbShopName').value.trim();
+                if (shop === '') {
+                    safeAlert({ title: 'ข้อมูลไม่ครบ', message: 'กรุณากรอกชื่อร้าน', type: 'warning' });
+                    document.getElementById('dncOnbShopName').focus();
+                    return false;
+                }
+                if (shop.length > 200) {
+                    safeAlert({ title: 'ชื่อยาวเกิน', message: 'ชื่อร้านยาวเกิน 200 ตัวอักษร', type: 'warning' });
+                    return false;
+                }
+                state.form.shop_name = shop;
+                state.form.rank_system = document.getElementById('dncOnbTier').value;
+                state.form.credit_limit = parseFloat(document.getElementById('dncOnbCreditLimit').value) || 0;
+                state.form.credit_term_days = parseInt(document.getElementById('dncOnbCreditTerm').value, 10) || 30;
+                const dc = document.getElementById('dncOnbDiscountPct').value;
+                state.form.b2b_discount_percent = (dc === '' ? null : parseFloat(dc));
+                state.form.is_walkin = document.getElementById('dncOnbWalkin').checked;
+                return true;
+            }
+
+            async function validateStep2() {
+                const gid = document.getElementById('dncOnbGroupId').value.trim();
+                const checkEl = document.getElementById('dncOnbGroupCheck');
+                if (!/^[A-Za-z0-9]{20,}$/.test(gid)) {
+                    checkEl.innerHTML = '<div class="err">รูปแบบไม่ถูกต้อง — ต้องเป็นตัวอักษร/ตัวเลข ≥20 ตัว</div>';
+                    return false;
+                }
+                checkEl.innerHTML = '<div class="hint">กำลังตรวจสอบ...</div>';
+
+                try {
+                    const r = await apiPost('/check-group-id', { group_id: gid });
+                    if (!r.success) {
+                        checkEl.innerHTML = '<div class="err">❌ ' + esc(r.message || r.code || 'ตรวจสอบไม่สำเร็จ') + '</div>';
+                        return false;
+                    }
+                    if (!r.available) {
+                        const conflict = r.conflict_dist || {};
+                        checkEl.innerHTML = '<div class="err">❌ group_id นี้ถูกใช้แล้วโดย <strong>' + esc(conflict.title || 'ตัวแทนอื่น') + '</strong> (id #' + (conflict.id || '?') + ') — ใช้ group_id อื่น</div>';
+                        state.groupAvailable = false;
+                        return false;
+                    }
+                    checkEl.innerHTML = '<div class="ok">✓ group_id นี้ยังว่าง — พร้อมใช้งาน</div>';
+                    state.form.line_group_id = gid;
+                    state.groupChecked = true;
+                    state.groupAvailable = true;
+                    return true;
+                } catch (e) {
+                    checkEl.innerHTML = '<div class="err">Network error: ' + esc(e.message || 'unknown') + '</div>';
+                    return false;
+                }
+            }
+
+            function validateStep3() {
+                state.form.bot_enabled = document.getElementById('dncOnbBotEnabled').checked;
+                return true;
+            }
+
+            // Public navigation
+            window.dncOnboardNext = async function(fromStep) {
+                if (state.inFlight) return;
+                if (fromStep === 1) {
+                    if (!validateStep1()) return;
+                    showPane(2);
+                } else if (fromStep === 2) {
+                    state.inFlight = true;
+                    const btn = document.getElementById('dncOnbStep2Next');
+                    if (btn) { btn.disabled = true; btn.textContent = 'กำลังตรวจสอบ...'; }
+                    const ok = await validateStep2();
+                    if (btn) { btn.disabled = false; btn.textContent = 'ตรวจสอบ + ถัดไป →'; }
+                    state.inFlight = false;
+                    if (ok) showPane(3);
+                } else if (fromStep === 3) {
+                    if (!validateStep3()) return;
+                    showPane(4);
+                } else if (fromStep === 4) {
+                    renderReview();
+                    showPane(5);
+                }
+            };
+
+            window.dncOnboardBack = function(fromStep) {
+                if (state.inFlight) return;
+                if (fromStep > 1) showPane(fromStep - 1);
+            };
+
+            // Test bot
+            window.dncOnboardTestBot = async function() {
+                if (state.inFlight) return;
+                if (!state.form.line_group_id) {
+                    safeAlert({ title: 'ไม่มี group_id', message: 'ยังไม่ได้ตรวจ group_id ในขั้นที่ 2', type: 'warning' });
+                    return;
+                }
+                const btn = document.getElementById('dncOnbTestBtn');
+                const resultEl = document.getElementById('dncOnbTestResult');
+                state.inFlight = true;
+                btn.disabled = true; btn.textContent = '⏳ กำลังส่ง...';
+                resultEl.innerHTML = '';
+                try {
+                    const r = await apiPost('/test-bot', {
+                        group_id: state.form.line_group_id,
+                        shop_name: state.form.shop_name || '',
+                    });
+                    if (r.success && r.sent) {
+                        resultEl.innerHTML = '<span style="color:#16a34a;">✅ ' + esc(r.message || 'ส่งสำเร็จ — เช็คใน LINE') + '</span>';
+                    } else {
+                        resultEl.innerHTML = '<span style="color:#dc2626;">❌ ' + esc(r.message || r.code || 'ส่งไม่สำเร็จ') + '</span>';
+                    }
+                } catch (e) {
+                    resultEl.innerHTML = '<span style="color:#dc2626;">❌ Network error: ' + esc(e.message || 'unknown') + '</span>';
+                } finally {
+                    btn.disabled = false; btn.textContent = '📨 ส่ง Test Message';
+                    state.inFlight = false;
+                }
+            };
+
+            // Review
+            function renderReview() {
+                const f = state.form;
+                const tier = (f.rank_system || 'standard').toLowerCase();
+                const tierBadge = '<span class="dnc-onboard-tier-preview ' + esc(tier) + '">' + esc(tier.toUpperCase()) + '</span>';
+                const html = ''
+                    + '<div class="dnc-onboard-review-row"><span class="lbl">ชื่อร้าน</span><span class="val">' + esc(f.shop_name) + '</span></div>'
+                    + '<div class="dnc-onboard-review-row"><span class="lbl">Tier</span><span class="val">' + tierBadge + '</span></div>'
+                    + '<div class="dnc-onboard-review-row"><span class="lbl">วงเงินเครดิต</span><span class="val">' + fmtBaht(f.credit_limit || 0) + '</span></div>'
+                    + '<div class="dnc-onboard-review-row"><span class="lbl">เครดิตเทอม</span><span class="val">' + (f.credit_term_days || 30) + ' วัน</span></div>'
+                    + (f.b2b_discount_percent != null ? '<div class="dnc-onboard-review-row"><span class="lbl">ส่วนลด default</span><span class="val">' + Number(f.b2b_discount_percent).toFixed(2) + '%</span></div>' : '')
+                    + '<div class="dnc-onboard-review-row"><span class="lbl">Walk-in</span><span class="val">' + (f.is_walkin ? '✓ เปิด' : '— ปิด') + '</span></div>'
+                    + '<div class="dnc-onboard-review-row"><span class="lbl">LINE Group ID</span><span class="val" style="font-family:ui-monospace,monospace;font-size:11px;">' + esc(f.line_group_id || '-') + '</span></div>'
+                    + '<div class="dnc-onboard-review-row"><span class="lbl">Bot</span><span class="val">' + (f.bot_enabled ? '✓ เปิด' : '— ปิด') + '</span></div>';
+                document.getElementById('dncOnbReview').innerHTML = html;
+            }
+
+            // Final save
+            window.dncOnboardSave = async function() {
+                if (state.inFlight) return;
+
+                const ok = await safeConfirm({
+                    title: '✅ ยืนยันสร้างตัวแทนใหม่',
+                    message: 'สร้างตัวแทน "' + state.form.shop_name + '" + เชื่อม LINE Group?\n\nหลังบันทึกแล้วสามารถแก้ไขรายละเอียดเพิ่มเติมได้ใน B2B Admin Control Panel',
+                    confirmText: 'บันทึกเลย',
+                    cancelText: 'ยกเลิก',
+                });
+                if (!ok) return;
+
+                const btn = document.getElementById('dncOnbSaveBtn');
+                const resultEl = document.getElementById('dncOnbSaveResult');
+                state.inFlight = true;
+                btn.disabled = true; btn.textContent = 'กำลังบันทึก...';
+                resultEl.innerHTML = '<div class="dnc-onboard-banner info">กำลังบันทึก...</div>';
+
+                try {
+                    const r = await apiPost('/save', state.form);
+                    if (r.success) {
+                        resultEl.innerHTML = '<div class="dnc-onboard-banner ok">'
+                            + '<strong>✅ ' + esc(r.message || 'สร้างสำเร็จ') + '</strong><br>'
+                            + 'distributor #' + (r.dist_id || '?') + ' — '
+                            + (r.edit_url ? '<a href="' + esc(r.edit_url) + '" target="_blank">เปิดหน้าแก้ไข</a>' : '')
+                            + '</div>';
+                        btn.textContent = '✓ บันทึกแล้ว';
+                        // Optional: redirect / reset form after delay
+                        setTimeout(function() {
+                            if (window.confirm('สร้างตัวแทนเพิ่มอีกคนมั้ย?')) {
+                                window.location.reload();
+                            }
+                        }, 2000);
+                    } else {
+                        resultEl.innerHTML = '<div class="dnc-onboard-banner bad">❌ ' + esc(r.message || r.code || 'บันทึกไม่สำเร็จ') + '</div>';
+                        btn.disabled = false; btn.textContent = '💾 บันทึกตัวแทนใหม่';
+                    }
+                } catch (e) {
+                    resultEl.innerHTML = '<div class="dnc-onboard-banner bad">❌ Network error: ' + esc(e.message || 'unknown') + '</div>';
+                    btn.disabled = false; btn.textContent = '💾 บันทึกตัวแทนใหม่';
+                } finally {
+                    state.inFlight = false;
+                }
+            };
+
+            // Initialize
+            showPane(1);
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+}

@@ -1,6 +1,34 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.13 (2026-04-24) — Refund/Credit-Note workflow (Journey A):         ║
+ * ║    Closes UX gap: admin had to swap 4 pages (Slip Monitor → Manual Invoice →     ║
+ * ║      Finance Dashboard → LINE manual) to refund overpayment. Now: inline action  ║
+ * ║      button on result_status='paid_overpayment' rows → modal → debt subtract +   ║
+ * ║      LINE notify + audit row + slip_log link. Single click, single screen.       ║
+ * ║                                                                                  ║
+ * ║    NEW REST endpoint:                                                            ║
+ * ║      POST /dinoco-slip/v1/issue-credit-note — body { log_id, amount, reason,     ║
+ * ║        notify_dist?, sender_name? } — guards: log exists + status                ║
+ * ║        paid_overpayment + amount ≤ overpaid + reason ≥10 chars + not already     ║
+ * ║        credited + GET_LOCK on (log_id) + b2b_debt_subtract atomic + slip_log     ║
+ * ║        UPDATE credit_note_* columns + audit_log row + LINE notify.               ║
+ * ║      GET  /dinoco-slip/v1/credit-note-eligible?log_id=N — return eligibility     ║
+ * ║        + suggested overpaid_amount + dist info (for modal pre-fill).             ║
+ * ║                                                                                  ║
+ * ║    NEW UI elements:                                                              ║
+ * ║      • Recent 50 table — Action column with 💰 button on paid_overpayment rows.  ║
+ * ║          Issued rows show greyed badge "credit_issued" + amount + tooltip.       ║
+ * ║      • Modal #dncSlipCreditNoteModal — distributor + amount + reason + notify    ║
+ * ║          checkbox + confirm button. Uses dinocoModal.confirm fallback.           ║
+ * ║                                                                                  ║
+ * ║    Architecture patterns reused (Phase 1-4):                                     ║
+ * ║      • dinoco_audit_log() dual-write (event_type='credit_note_issued')          ║
+ * ║      • Rate limit 5/min/user via b2b_rate_limit (destructive)                    ║
+ * ║      • dinocoModal.{confirm,alert} with native fallback                          ║
+ * ║      • Module Registry — already registered V.1.8                                ║
+ * ║                                                                                  ║
+ * ║    Companion: Snippet 15 V.8.15 — slip_log credit_note_* columns + index.        ║
  * ║  Version: V.1.12 (2026-04-24) — Cleanup batch L1: fix misleading comment on      ║
  * ║    GET_LOCK key length. MySQL 5.7+ truncates lock names >64 chars (not rejects). ║
  * ║    Our `dnc_mp_<dist_id>_<md5>` naming (~50 chars) well under limit. Doc only.   ║
@@ -272,6 +300,22 @@ add_action( 'rest_api_init', function () {
                 && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
         },
     ) );
+
+    // V.1.13: Refund / Credit-Note workflow (Journey A)
+    register_rest_route( 'dinoco-slip/v1', '/credit-note-eligible', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_credit_note_eligible',
+        'permission_callback' => $perm_admin,
+    ) );
+
+    register_rest_route( 'dinoco-slip/v1', '/issue-credit-note', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_slip_monitor_rest_issue_credit_note',
+        'permission_callback' => function ( WP_REST_Request $req ) {
+            return current_user_can( 'manage_options' )
+                && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
+        },
+    ) );
 } );
 
 // ────────────────────────────────────────────────────────────────
@@ -445,9 +489,14 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_recent' ) ) {
             ? ', ai_classifier_decision, ai_classifier_confidence, ai_classifier_reason'
             : '';
 
+        // V.1.13: Schema-aware credit_note columns probe (silent on pre-V.8.15 installs)
+        $cn_cols_select = function_exists( 'dinoco_slip_monitor_credit_note_cols_exist' ) && dinoco_slip_monitor_credit_note_cols_exist()
+            ? ', credit_note_amount, credit_note_issued_at, credit_note_by'
+            : '';
+
         $sql = "SELECT id, group_id, message_id, user_id, dist_id, slip_code, amount, trans_ref, sender_name,
                        result_status, error_code, error_msg, http_code, processing_time_ms, retry_count, created_at
-                       {$ai_cols_select}
+                       {$ai_cols_select}{$cn_cols_select}
                 FROM {$table}
                 WHERE " . implode( ' AND ', $where ) . "
                 ORDER BY id DESC
@@ -1458,6 +1507,360 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_ai_toggle' ) ) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// V.1.13: Refund / Credit-Note workflow (Journey A)
+// ════════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────────
+// Helper: probe credit_note_* schema columns once per request
+// (silent on legacy installs — Snippet 15 V.8.15 must be synced first)
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_credit_note_cols_exist' ) ) {
+    function dinoco_slip_monitor_credit_note_cols_exist() {
+        static $exists = null;
+        if ( $exists !== null ) return $exists;
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $cols  = $wpdb->get_col( $wpdb->prepare(
+            "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE table_schema = DATABASE() AND table_name = %s
+               AND column_name IN ('credit_note_amount','credit_note_issued_at','credit_note_reason','credit_note_by','credit_note_audit_id')",
+            $table
+        ) );
+        $exists = ( is_array( $cols ) && count( $cols ) === 5 );
+        return $exists;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// GET /credit-note-eligible?log_id=N
+// Returns: { eligible:bool, log_id, dist_id, dist_name, group_id, amount,
+//            current_debt, suggested_overpaid, already_issued:bool, issued_info?:{} }
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_credit_note_eligible' ) ) {
+    function dinoco_slip_monitor_rest_credit_note_eligible( WP_REST_Request $req ) {
+        if ( ! dinoco_slip_monitor_credit_note_cols_exist() ) {
+            return new WP_Error(
+                'schema_missing',
+                'Snippet 15 V.8.15+ ต้อง sync ก่อน (credit_note_* columns ยังไม่มี)',
+                array( 'status' => 501 )
+            );
+        }
+
+        $log_id = (int) $req->get_param( 'log_id' );
+        if ( $log_id <= 0 ) {
+            return new WP_Error( 'bad_log_id', 'log_id ไม่ถูกต้อง', array( 'status' => 400 ) );
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, group_id, dist_id, amount, sender_name, trans_ref, result_status,
+                    credit_note_amount, credit_note_issued_at, credit_note_reason, credit_note_by
+             FROM {$table} WHERE id = %d LIMIT 1",
+            $log_id
+        ), ARRAY_A );
+
+        if ( ! $row ) {
+            return new WP_Error( 'not_found', 'ไม่พบ log row', array( 'status' => 404 ) );
+        }
+
+        $dist_id   = (int) $row['dist_id'];
+        $dist_name = $dist_id > 0 ? get_the_title( $dist_id ) : '';
+        $group_id  = $row['group_id'] ?: ( $dist_id > 0 && function_exists( 'get_field' )
+                        ? (string) get_field( 'line_group_id', $dist_id ) : '' );
+
+        $current_debt = ( $dist_id > 0 && function_exists( 'b2b_recalculate_debt' ) )
+            ? floatval( b2b_recalculate_debt( $dist_id ) )
+            : ( ( $dist_id > 0 && function_exists( 'get_field' ) ) ? floatval( get_field( 'current_debt', $dist_id ) ) : 0 );
+
+        // Eligibility: status must be paid_overpayment + not already credited
+        $is_overpayment   = ( $row['result_status'] === 'paid_overpayment' );
+        $already_issued   = ! empty( $row['credit_note_issued_at'] );
+        $eligible         = $is_overpayment && ! $already_issued;
+
+        // Suggested overpaid amount = the slip amount minus what was outstanding before.
+        // We approximate: if current_debt is 0 (fully paid), the entire over-amount is excess
+        // beyond the closing debt. Admin will confirm exact amount in modal — this is just hint.
+        // Spec uses overpaid recorded by handler when row was inserted; we re-derive here as a
+        // best-effort cap: max suggested = slip amount itself (admin clamps further if needed).
+        $suggested_overpaid = floatval( $row['amount'] );
+        // Heuristic: if debt < amount AND debt >= 0, overpaid = (amount - debt_at_insert).
+        // We don't have debt-at-insert snapshot, so use min(amount, amount) — admin enters exact.
+        // We instead report a safer ceiling: amount - max(0, current_debt) ≈ what's still credit.
+        $approx_credit_remaining = max( 0, $suggested_overpaid - max( 0, $current_debt ) );
+        if ( $approx_credit_remaining > 0 && $approx_credit_remaining <= $suggested_overpaid ) {
+            $suggested_overpaid = round( $approx_credit_remaining, 2 );
+        }
+
+        $resp = array(
+            'success'         => true,
+            'eligible'        => $eligible,
+            'log_id'          => (int) $row['id'],
+            'dist_id'         => $dist_id,
+            'dist_name'       => $dist_name,
+            'group_id'        => $group_id,
+            'amount'          => floatval( $row['amount'] ),
+            'sender_name'     => $row['sender_name'] ?: '',
+            'trans_ref'       => $row['trans_ref'] ?: '',
+            'result_status'   => $row['result_status'],
+            'current_debt'    => round( $current_debt, 2 ),
+            'suggested_overpaid' => round( $suggested_overpaid, 2 ),
+            'already_issued'  => $already_issued,
+        );
+
+        if ( ! $is_overpayment ) {
+            $resp['reason_blocked'] = 'row นี้ไม่ใช่ paid_overpayment (status=' . $row['result_status'] . ')';
+        }
+        if ( $already_issued ) {
+            $resp['issued_info'] = array(
+                'amount'    => floatval( $row['credit_note_amount'] ),
+                'issued_at' => $row['credit_note_issued_at'],
+                'reason'    => $row['credit_note_reason'],
+                'by_user'   => (int) $row['credit_note_by'],
+            );
+        }
+
+        return rest_ensure_response( $resp );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// POST /issue-credit-note
+// Body: { log_id, amount, reason, notify_dist?:bool }
+// Logic: validate → GET_LOCK(log_id) → b2b_debt_subtract → UPDATE slip_log →
+//        audit_log → LINE notify (post-lock) → response
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_issue_credit_note' ) ) {
+    function dinoco_slip_monitor_rest_issue_credit_note( WP_REST_Request $req ) {
+        if ( ! dinoco_slip_monitor_credit_note_cols_exist() ) {
+            return new WP_Error(
+                'schema_missing',
+                'Snippet 15 V.8.15+ ต้อง sync ก่อน',
+                array( 'status' => 501 )
+            );
+        }
+
+        $uid = get_current_user_id();
+        // Rate limit 5/min/user (destructive — mutates debt)
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'slip_credit_note_u' . $uid, 5, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 5/min)', array( 'status' => 429 ) );
+            }
+        }
+
+        if ( ! function_exists( 'b2b_debt_subtract' ) ) {
+            return new WP_Error( 'no_debt_fn', 'b2b_debt_subtract ไม่พร้อม (Snippet 13)', array( 'status' => 501 ) );
+        }
+
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) $body = array();
+
+        $log_id      = (int) ( isset( $body['log_id'] ) ? $body['log_id'] : $req->get_param( 'log_id' ) );
+        $amount_raw  = isset( $body['amount'] ) ? $body['amount'] : $req->get_param( 'amount' );
+        $amount      = floatval( $amount_raw );
+        $reason      = sanitize_text_field( (string) ( isset( $body['reason'] ) ? $body['reason'] : $req->get_param( 'reason' ) ) );
+        $notify_dist = isset( $body['notify_dist'] ) ? (bool) $body['notify_dist'] : true;
+
+        // Validation
+        if ( $log_id <= 0 ) {
+            return new WP_Error( 'bad_log_id', 'log_id ไม่ถูกต้อง', array( 'status' => 400 ) );
+        }
+        if ( $amount <= 0 || $amount > 10000000 ) {
+            return new WP_Error( 'bad_amount', 'ยอดไม่ถูกต้อง (1 ถึง 10,000,000)', array( 'status' => 400 ) );
+        }
+        if ( $reason === '' || mb_strlen( $reason ) < 10 ) {
+            return new WP_Error( 'bad_reason', 'ต้องระบุเหตุผลไม่น้อยกว่า 10 ตัวอักษร (audit trail)', array( 'status' => 400 ) );
+        }
+        if ( mb_strlen( $reason ) > 500 ) $reason = mb_substr( $reason, 0, 500 );
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+
+        // Pre-lock load + eligibility
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, group_id, dist_id, amount, sender_name, trans_ref, result_status,
+                    credit_note_issued_at
+             FROM {$table} WHERE id = %d LIMIT 1",
+            $log_id
+        ), ARRAY_A );
+
+        if ( ! $row ) {
+            return new WP_Error( 'not_found', 'ไม่พบ log row', array( 'status' => 404 ) );
+        }
+        if ( $row['result_status'] !== 'paid_overpayment' ) {
+            return new WP_Error( 'not_overpayment',
+                'row นี้ไม่ใช่ paid_overpayment (status=' . $row['result_status'] . ')',
+                array( 'status' => 422 ) );
+        }
+        if ( ! empty( $row['credit_note_issued_at'] ) ) {
+            return new WP_Error( 'already_credited',
+                'row นี้เคยออก credit note แล้วเมื่อ ' . $row['credit_note_issued_at'],
+                array( 'status' => 409 ) );
+        }
+
+        $dist_id = (int) $row['dist_id'];
+        if ( $dist_id <= 0 || get_post_type( $dist_id ) !== 'distributor' ) {
+            return new WP_Error( 'bad_dist', 'log row ไม่มี distributor ที่ valid', array( 'status' => 422 ) );
+        }
+        $slip_amount = floatval( $row['amount'] );
+        if ( $amount > $slip_amount ) {
+            return new WP_Error( 'amount_exceeds_slip',
+                'จำนวน credit note (฿' . number_format( $amount, 2 ) . ') มากกว่ายอดสลิป (฿' . number_format( $slip_amount, 2 ) . ')',
+                array( 'status' => 422 ) );
+        }
+
+        $dist_name = get_the_title( $dist_id );
+        $group_id  = (string) ( $row['group_id'] ?: ( function_exists( 'get_field' ) ? get_field( 'line_group_id', $dist_id ) : '' ) );
+
+        // GET_LOCK on log_id — prevents double-issue race when admin clicks twice
+        $lock_key      = 'dnc_cn_' . $log_id;
+        $lock_acquired = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $lock_key ) );
+        if ( $lock_acquired !== 1 ) {
+            return new WP_Error( 'concurrent_issue',
+                'มีคนกำลังออก credit note สำหรับ log นี้อยู่ — รอสักครู่',
+                array( 'status' => 409 ) );
+        }
+
+        $audit_id = 0;
+        $new_debt = 0;
+        $old_debt = 0;
+
+        try {
+            // Re-check inside lock (defense in depth)
+            $still_eligible = $wpdb->get_row( $wpdb->prepare(
+                "SELECT credit_note_issued_at FROM {$table} WHERE id = %d LIMIT 1",
+                $log_id
+            ), ARRAY_A );
+            if ( $still_eligible && ! empty( $still_eligible['credit_note_issued_at'] ) ) {
+                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+                return new WP_Error( 'already_credited_inlock',
+                    'row นี้เพิ่งถูกออก credit note ไปแล้ว',
+                    array( 'status' => 409 ) );
+            }
+
+            // Atomic debt subtract
+            $old_debt = function_exists( 'get_field' ) ? floatval( get_field( 'current_debt', $dist_id ) ) : 0;
+            $reason_tag = 'credit_note:slip_log#' . $log_id . ':u=' . $uid . ':' . mb_substr( $reason, 0, 60 );
+            $new_debt   = b2b_debt_subtract( $dist_id, $amount, $reason_tag );
+
+            if ( $new_debt === false ) {
+                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+                return new WP_Error( 'debt_subtract_fail',
+                    'ตัดหนี้ไม่สำเร็จ (debt_subtract คืน false)',
+                    array( 'status' => 500 ) );
+            }
+
+            // Audit log dual-write FIRST (before slip_log UPDATE) so we can
+            // store the audit_id back into slip_log for forensic chain
+            if ( function_exists( 'dinoco_audit_log' ) ) {
+                $audit_id = (int) dinoco_audit_log( array(
+                    'event_type'    => 'credit_note_issued',
+                    'actor_type'    => 'admin',
+                    'actor_id'      => (string) $uid,
+                    'target_type'   => 'distributor',
+                    'target_id'     => (string) $dist_id,
+                    'amount'        => (float) $amount,
+                    'delta_before'  => (string) round( $old_debt, 2 ),
+                    'delta_after'   => (string) round( $new_debt, 2 ),
+                    'related_log_id' => $log_id,
+                    'context'       => array(
+                        'reason'      => $reason,
+                        'slip_amount' => $slip_amount,
+                        'trans_ref'   => $row['trans_ref'],
+                        'sender_name' => $row['sender_name'],
+                        'group_id'    => $group_id,
+                    ),
+                ) );
+            }
+
+            // UPDATE slip_log to mark issued
+            $now_mysql = current_time( 'mysql' );
+            $upd = $wpdb->update(
+                $table,
+                array(
+                    'credit_note_amount'    => $amount,
+                    'credit_note_issued_at' => $now_mysql,
+                    'credit_note_reason'    => $reason,
+                    'credit_note_by'        => $uid,
+                    'credit_note_audit_id'  => $audit_id ?: null,
+                ),
+                array( 'id' => $log_id ),
+                array( '%f', '%s', '%s', '%d', '%d' ),
+                array( '%d' )
+            );
+            if ( $upd === false ) {
+                // slip_log update failed — debt already subtracted; log loud but don't reverse
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[CreditNote] WARN slip_log UPDATE failed log_id=' . $log_id
+                        . ' err=' . $wpdb->last_error . ' — debt subtract already committed' );
+                }
+            }
+
+            // Recalc from source of truth
+            $new_debt = function_exists( 'b2b_recalculate_debt' )
+                ? floatval( b2b_recalculate_debt( $dist_id ) )
+                : $new_debt;
+        } catch ( \Throwable $e ) {
+            $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[CreditNote] FATAL log_id=' . $log_id . ' err=' . $e->getMessage() );
+            }
+            return new WP_Error( 'fatal',
+                'เกิด error ระหว่างประมวลผล: ' . mb_substr( $e->getMessage(), 0, 200 ),
+                array( 'status' => 500 ) );
+        }
+
+        // Release lock BEFORE LINE side effects (idempotent network calls)
+        $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+
+        // LINE notify customer (best-effort)
+        if ( $notify_dist && function_exists( 'b2b_line_push' ) && $group_id !== '' ) {
+            $msg = "💰 ออก Credit Note (คืนเครดิต)\n"
+                 . "ร้าน: " . $dist_name . "\n"
+                 . "ยอดที่คืน: ฿" . number_format( $amount, 2 ) . "\n"
+                 . "หนี้คงเหลือ: ฿" . number_format( $new_debt, 2 ) . "\n"
+                 . "เหตุผล: " . mb_substr( $reason, 0, 200 );
+            if ( ! empty( $row['trans_ref'] ) ) {
+                $msg .= "\nอ้างอิงสลิป Ref: " . $row['trans_ref'];
+            }
+            b2b_line_push( $group_id, $msg );
+        }
+
+        // Notify admin group
+        if ( function_exists( 'b2b_push_to_admin' ) ) {
+            b2b_push_to_admin(
+                "💰 Credit Note Issued\n"
+                . "Admin: user#" . $uid . "\n"
+                . "ร้าน: " . $dist_name . "\n"
+                . "ยอด: ฿" . number_format( $amount, 2 ) . "\n"
+                . "Slip log id: #" . $log_id . "\n"
+                . "หนี้เหลือ: ฿" . number_format( $new_debt, 2 ) . "\n"
+                . "Reason: " . mb_substr( $reason, 0, 200 )
+            );
+        }
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( '[CreditNote] log_id=' . $log_id . ' admin=' . $uid
+                . ' dist=' . $dist_id . ' amount=' . $amount . ' new_debt=' . $new_debt
+                . ' audit_id=' . $audit_id );
+        }
+
+        return rest_ensure_response( array(
+            'success'    => true,
+            'log_id'     => $log_id,
+            'dist_id'    => $dist_id,
+            'dist_name'  => $dist_name,
+            'amount'     => round( $amount, 2 ),
+            'old_debt'   => round( $old_debt, 2 ),
+            'new_debt'   => round( $new_debt, 2 ),
+            'audit_id'   => $audit_id,
+            'message'    => 'ออก Credit Note ฿' . number_format( $amount, 2 ) . ' สำเร็จ — หนี้เหลือ ฿' . number_format( $new_debt, 2 ),
+        ) );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
 // SHORTCODE: [dinoco_slip_monitor]
 // ════════════════════════════════════════════════════════════════
 
@@ -1481,7 +1884,7 @@ add_action( 'init', function() {
         'cache_ttl'  => 30,
         'capability' => 'manage_options',
         'order'      => 50,
-        'source'     => '[Admin System] DINOCO Slip Monitor V.1.9',
+        'source'     => '[Admin System] DINOCO Slip Monitor V.1.13',
     ) );
 }, 30 );
 
@@ -1606,6 +2009,45 @@ function dinoco_slip_monitor_render() {
         <!-- Lightbox modal for full-size pool image -->
         <div id="dncSlipLightbox" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:9999; justify-content:center; align-items:center; cursor:zoom-out;" onclick="dncSlipLightboxClose()">
             <img id="dncSlipLightboxImg" src="" alt="" style="max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,0.5);">
+        </div>
+
+        <!-- V.1.13: Credit Note modal -->
+        <div id="dncSlipCreditNoteModal" class="dnc-credit-note-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(15,23,42,0.6); z-index:9998; justify-content:center; align-items:center; padding:20px; box-sizing:border-box;">
+            <div class="dnc-credit-note-card" style="background:#fff; border-radius:12px; padding:24px; max-width:560px; width:100%; max-height:90vh; overflow-y:auto; box-shadow:0 20px 50px rgba(0,0,0,0.3); box-sizing:border-box;">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:16px;">
+                    <h3 style="margin:0; font-size:18px; color:#1e293b;">💰 ออก Credit Note (คืนเครดิต)</h3>
+                    <button type="button" class="dnc-credit-note-close" onclick="dncSlipCreditNoteClose()" style="background:transparent; border:0; font-size:22px; cursor:pointer; color:#64748b; line-height:1; padding:0 4px;">×</button>
+                </div>
+
+                <div id="dncSlipCreditNoteSummary" style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px; margin-bottom:14px; font-size:13px; color:#334155;">
+                    <em>กำลังโหลดข้อมูล...</em>
+                </div>
+
+                <div style="margin-bottom:14px;">
+                    <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">จำนวน Credit (THB) *</label>
+                    <input type="number" id="dncSlipCnAmount" step="0.01" min="0.01" max="10000000" style="width:100%; padding:10px; border:1px solid #d1d5db; border-radius:6px; font-size:14px; box-sizing:border-box;" placeholder="500.00">
+                    <div style="font-size:11px; color:#64748b; margin-top:4px;">ระบุยอดที่ต้องการคืนให้ร้าน (สูงสุด = ยอดสลิป)</div>
+                </div>
+
+                <div style="margin-bottom:14px;">
+                    <label style="display:block; font-size:12px; color:#475569; margin-bottom:4px; font-weight:600;">เหตุผล * (ต้อง ≥ 10 ตัวอักษร — audit trail)</label>
+                    <textarea id="dncSlipCnReason" rows="3" maxlength="500" style="width:100%; padding:10px; border:1px solid #d1d5db; border-radius:6px; font-size:13px; resize:vertical; box-sizing:border-box;" placeholder="เช่น: ร้านโอนเกินยอดบิล 500 บาท — ออก credit note คืนเครดิตให้"></textarea>
+                </div>
+
+                <div style="margin-bottom:18px;">
+                    <label style="display:flex; align-items:center; gap:8px; font-size:13px; color:#334155; cursor:pointer;">
+                        <input type="checkbox" id="dncSlipCnNotify" checked style="width:16px; height:16px; cursor:pointer;">
+                        <span>📱 แจ้งร้านทาง LINE (ส่งข้อความแจ้งคืนเครดิต)</span>
+                    </label>
+                </div>
+
+                <div id="dncSlipCnResult" style="margin-bottom:12px;"></div>
+
+                <div style="display:flex; gap:8px; justify-content:flex-end;">
+                    <button type="button" onclick="dncSlipCreditNoteClose()" style="background:#e2e8f0; color:#475569; border:0; padding:10px 18px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600;">ยกเลิก</button>
+                    <button type="button" id="dncSlipCnConfirmBtn" onclick="dncSlipCreditNoteConfirm()" style="background:#7c3aed; color:#fff; border:0; padding:10px 18px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600;">💰 ยืนยันออก Credit Note</button>
+                </div>
+            </div>
         </div>
 
         <div class="dnc-slip-section" style="border:2px solid #f59e0b; background:#fffbeb;">
@@ -1838,6 +2280,18 @@ function dinoco_slip_monitor_render() {
                     const m = map[d] || { emoji: '·', bg: '#f1f5f9', fg: '#475569' };
                     return '<span title="' + esc(tipText) + '" style="display:inline-block; padding:2px 8px; background:' + m.bg + '; color:' + m.fg + '; border-radius:10px; font-size:11px; font-weight:600;">' + m.emoji + ' ' + d + ' ' + conf + '</span>';
                 };
+                // V.1.13: action column — credit-note button on paid_overpayment rows
+                const cnAction = (r) => {
+                    if (r.result_status !== 'paid_overpayment') {
+                        return '<span style="color:#cbd5e1; font-size:11px;">—</span>';
+                    }
+                    if (r.credit_note_issued_at) {
+                        const amt = (r.credit_note_amount != null) ? Number(r.credit_note_amount).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2}) : '?';
+                        const tip = 'Credit Note ออกแล้ว ฿' + amt + '\n' + (r.credit_note_issued_at || '');
+                        return '<span title="' + esc(tip) + '" style="display:inline-block; padding:2px 8px; background:#e0e7ff; color:#3730a3; border-radius:10px; font-size:11px; font-weight:600;">✓ credit_issued</span>';
+                    }
+                    return '<button class="dnc-slip-cn-btn" data-log-id="' + r.id + '" title="ออก Credit Note (คืนเครดิต/refund)" style="background:#7c3aed; color:#fff; border:0; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:11px; font-weight:600;">💰 Credit Note</button>';
+                };
                 const trs = recent.rows.map(r => `<tr>
                     <td>${fmtDateTH(r.created_at)}</td>
                     <td>${esc(r.dist_name || '(ไม่ระบุ)')}</td>
@@ -1846,11 +2300,12 @@ function dinoco_slip_monitor_render() {
                     <td>${fmtBaht(r.amount)}</td>
                     <td><span class="dnc-slip-ref">${esc(r.trans_ref || '-')}</span></td>
                     <td>${esc(r.sender_name || '-')}</td>
+                    <td>${cnAction(r)}</td>
                     <td><span class="dnc-slip-code">HTTP ${r.http_code || '-'} / ${r.processing_time_ms || '-'}ms / retry=${r.retry_count || 0}</span></td>
                     <td><span class="dnc-slip-code">${esc(r.error_msg || '')}</span></td>
                 </tr>`).join('');
                 document.getElementById('dncSlipRecent').innerHTML = `<table class="dnc-slip-table">
-                    <thead><tr><th>เวลา</th><th>ร้าน</th><th>Status</th><th>AI</th><th>ยอด</th><th>Ref</th><th>ผู้โอน</th><th>Tech</th><th>Error</th></tr></thead>
+                    <thead><tr><th>เวลา</th><th>ร้าน</th><th>Status</th><th>AI</th><th>ยอด</th><th>Ref</th><th>ผู้โอน</th><th>Action</th><th>Tech</th><th>Error</th></tr></thead>
                     <tbody>${trs}</tbody>
                 </table>`;
             }
@@ -2301,6 +2756,188 @@ function dinoco_slip_monitor_render() {
             })().finally(function() {
                 if (document.body.contains(btn)) btn.disabled = false;
             });
+        });
+
+        // ═════════════ V.1.13: Credit Note Modal ═════════════
+        const cnState = { logId: 0, eligible: null, inFlight: false };
+
+        function cnSafeConfirm(opts) {
+            // dinocoModal.confirm wrapper with native fallback
+            try {
+                if (window.dinocoModal && typeof window.dinocoModal.confirm === 'function') {
+                    return window.dinocoModal.confirm(opts);
+                }
+            } catch (e) { /* fall through */ }
+            return Promise.resolve(window.confirm(opts.message || 'ยืนยัน?'));
+        }
+        function cnSafeAlert(opts) {
+            try {
+                if (window.dinocoModal && typeof window.dinocoModal.alert === 'function') {
+                    return window.dinocoModal.alert(opts);
+                }
+            } catch (e) { /* fall through */ }
+            window.alert(opts.message || '');
+            return Promise.resolve();
+        }
+
+        window.dncSlipCreditNoteOpen = async function(logId) {
+            cnState.logId = parseInt(logId, 10) || 0;
+            cnState.eligible = null;
+            cnState.inFlight = false;
+
+            const modal = document.getElementById('dncSlipCreditNoteModal');
+            const summary = document.getElementById('dncSlipCreditNoteSummary');
+            const amountEl = document.getElementById('dncSlipCnAmount');
+            const reasonEl = document.getElementById('dncSlipCnReason');
+            const notifyEl = document.getElementById('dncSlipCnNotify');
+            const result = document.getElementById('dncSlipCnResult');
+            const confirmBtn = document.getElementById('dncSlipCnConfirmBtn');
+
+            if (!modal) return;
+            modal.style.display = 'flex';
+            summary.innerHTML = '<em>กำลังโหลดข้อมูล...</em>';
+            amountEl.value = '';
+            reasonEl.value = '';
+            notifyEl.checked = true;
+            result.innerHTML = '';
+            confirmBtn.disabled = false;
+
+            try {
+                const r = await apiGet('/credit-note-eligible?log_id=' + cnState.logId);
+                if (!r.success) {
+                    summary.innerHTML = '<div style="color:#dc2626;">❌ ' + esc(r.message || r.code || 'โหลดข้อมูลไม่ได้') + '</div>';
+                    confirmBtn.disabled = true;
+                    return;
+                }
+                cnState.eligible = r;
+                let info = '<div><strong>ร้าน:</strong> ' + esc(r.dist_name || '(ไม่ระบุ)') + '</div>'
+                    + '<div><strong>ยอดสลิปเดิม:</strong> ' + fmtBaht(r.amount) + '</div>'
+                    + '<div><strong>ผู้โอน:</strong> ' + esc(r.sender_name || '-') + '</div>';
+                if (r.trans_ref) info += '<div><strong>Trans Ref:</strong> <span style="font-family:ui-monospace,monospace;font-size:11px;">' + esc(r.trans_ref) + '</span></div>';
+                info += '<div><strong>หนี้ปัจจุบัน:</strong> ' + fmtBaht(r.current_debt) + '</div>';
+                if (r.suggested_overpaid > 0) {
+                    info += '<div style="color:#7c3aed; margin-top:6px;"><strong>📌 แนะนำคืน:</strong> ' + fmtBaht(r.suggested_overpaid) + ' (ยอดที่โอนเกินจากหนี้ปัจจุบัน)</div>';
+                    amountEl.value = Number(r.suggested_overpaid).toFixed(2);
+                }
+                if (!r.eligible) {
+                    if (r.already_issued && r.issued_info) {
+                        info += '<div style="color:#dc2626; margin-top:6px;"><strong>⚠️ ออก Credit Note แล้ว</strong> ฿' + Number(r.issued_info.amount || 0).toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2}) + ' เมื่อ ' + esc(r.issued_info.issued_at || '-') + '</div>';
+                    } else if (r.reason_blocked) {
+                        info += '<div style="color:#dc2626; margin-top:6px;"><strong>⚠️ ไม่สามารถออก Credit Note:</strong> ' + esc(r.reason_blocked) + '</div>';
+                    }
+                    confirmBtn.disabled = true;
+                }
+                summary.innerHTML = info;
+            } catch (e) {
+                summary.innerHTML = '<div style="color:#dc2626;">❌ Error: ' + esc(e.message || 'unknown') + '</div>';
+                confirmBtn.disabled = true;
+            }
+        };
+
+        window.dncSlipCreditNoteClose = function() {
+            const modal = document.getElementById('dncSlipCreditNoteModal');
+            if (modal) modal.style.display = 'none';
+            cnState.logId = 0;
+            cnState.inFlight = false;
+        };
+
+        window.dncSlipCreditNoteConfirm = async function() {
+            if (cnState.inFlight) return;
+            if (!cnState.logId || !cnState.eligible || !cnState.eligible.eligible) return;
+
+            const amountEl = document.getElementById('dncSlipCnAmount');
+            const reasonEl = document.getElementById('dncSlipCnReason');
+            const notifyEl = document.getElementById('dncSlipCnNotify');
+            const result = document.getElementById('dncSlipCnResult');
+            const confirmBtn = document.getElementById('dncSlipCnConfirmBtn');
+
+            const amount = parseFloat(amountEl.value);
+            const reason = (reasonEl.value || '').trim();
+            const notify = !!notifyEl.checked;
+
+            if (!Number.isFinite(amount) || amount <= 0) {
+                result.innerHTML = '<div style="color:#dc2626; font-size:12px;">❌ กรุณาระบุยอดที่ถูกต้อง</div>';
+                amountEl.focus();
+                return;
+            }
+            if (amount > Number(cnState.eligible.amount)) {
+                result.innerHTML = '<div style="color:#dc2626; font-size:12px;">❌ ยอด credit note (฿' + amount.toFixed(2) + ') มากกว่ายอดสลิป (฿' + Number(cnState.eligible.amount).toFixed(2) + ')</div>';
+                amountEl.focus();
+                return;
+            }
+            if (reason.length < 10) {
+                result.innerHTML = '<div style="color:#dc2626; font-size:12px;">❌ ต้องระบุเหตุผลไม่น้อยกว่า 10 ตัวอักษร</div>';
+                reasonEl.focus();
+                return;
+            }
+
+            const ok = await cnSafeConfirm({
+                title: '💰 ยืนยันออก Credit Note',
+                message: 'ร้าน: ' + cnState.eligible.dist_name + '\n'
+                       + 'ยอด: ฿' + amount.toFixed(2) + '\n'
+                       + 'หนี้ปัจจุบัน: ฿' + Number(cnState.eligible.current_debt).toFixed(2) + '\n'
+                       + 'หนี้ใหม่ (ประมาณ): ฿' + Math.max(0, Number(cnState.eligible.current_debt) - amount).toFixed(2) + '\n\n'
+                       + 'การกระทำนี้ตัดเครดิตจากร้านโดยตรง — กดยืนยันเพื่อดำเนินการ',
+                confirmText: 'ยืนยันออก Credit Note',
+                cancelText: 'ยกเลิก',
+                danger: true,
+            });
+            if (!ok) return;
+
+            cnState.inFlight = true;
+            confirmBtn.disabled = true;
+            confirmBtn.textContent = 'กำลังประมวลผล...';
+            result.innerHTML = '<div style="color:#64748b; font-size:12px;">กำลังประมวลผล...</div>';
+
+            try {
+                const r = await apiPost('/issue-credit-note', {
+                    log_id: cnState.logId,
+                    amount: amount,
+                    reason: reason,
+                    notify_dist: notify,
+                });
+                if (r.success) {
+                    result.innerHTML = '<div style="background:#dcfce7; color:#166534; padding:10px; border-radius:6px; font-size:12px;">✅ ' + esc(r.message || 'OK') + '</div>';
+                    setTimeout(function() {
+                        dncSlipCreditNoteClose();
+                        dncSlipMonitorRefresh();
+                    }, 900);
+                } else {
+                    result.innerHTML = '<div style="background:#fee2e2; color:#991b1b; padding:10px; border-radius:6px; font-size:12px;">❌ ' + esc(r.message || r.code || 'unknown error') + '</div>';
+                    confirmBtn.disabled = false;
+                    confirmBtn.textContent = '💰 ยืนยันออก Credit Note';
+                }
+            } catch (e) {
+                result.innerHTML = '<div style="background:#fee2e2; color:#991b1b; padding:10px; border-radius:6px; font-size:12px;">❌ Error: ' + esc(e.message || 'unknown') + '</div>';
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = '💰 ยืนยันออก Credit Note';
+            } finally {
+                cnState.inFlight = false;
+            }
+        };
+
+        // Event delegation — credit note button on Recent rows
+        document.addEventListener('click', function(e) {
+            const btn = e.target && e.target.closest ? e.target.closest('.dnc-slip-cn-btn') : null;
+            if (!btn) return;
+            const logId = btn.dataset && btn.dataset.logId ? parseInt(btn.dataset.logId, 10) : 0;
+            if (!logId) return;
+            window.dncSlipCreditNoteOpen(logId);
+        });
+
+        // Backdrop click closes modal
+        const _cnModalEl = document.getElementById('dncSlipCreditNoteModal');
+        if (_cnModalEl) {
+            _cnModalEl.addEventListener('click', function(e) {
+                if (e.target === _cnModalEl) dncSlipCreditNoteClose();
+            });
+        }
+        // ESC closes modal
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                const m = document.getElementById('dncSlipCreditNoteModal');
+                if (m && m.style.display !== 'none') dncSlipCreditNoteClose();
+            }
         });
 
         // Auto-load on page ready
