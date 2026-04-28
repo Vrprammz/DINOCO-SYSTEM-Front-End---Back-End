@@ -1,6 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.17 (2026-04-24) — AI Vision Slip Pre-Classifier (cost-saver):             ║
+ * ║    • NEW b2b_slip_ai_classify_image($binary, $mime, $hash) — Claude Haiku 4.5 vision    ║
+ * ║      classifier ตัดสินก่อนเรียก Slip2Go. Cost ~$0.001/call (~50-100x ถูกกว่า Slip2Go).    ║
+ * ║      Cache by image SHA-256 (30d) → รูปซ้ำไม่เรียก AI อีก. Fall through ถ้า AI fail/   ║
+ * ║      uncertain → Slip2Go decide (graceful degrade). Returns                              ║
+ * ║      ['decision'=>is_slip|not_slip|uncertain|error, 'confidence'=>0.0-1.0,              ║
+ * ║       'reason'=>str, 'cached'=>bool, 'tokens_used'=>int].                                ║
+ * ║      Defensive: B2B_ANTHROPIC_API_KEY undefined → return decision='error' silent skip.   ║
+ * ║      Companion: Snippet 2 V.34.15 (handler integration), Snippet 15 V.8.12 (4 cols),     ║
+ * ║                 Slip Monitor V.1.10 (stats card + AI badge + toggle), Config Layer V.1.1.║
  * ║  Version: V.34.16 (2026-04-26) — Image Pre-Filter Heuristic (slip classifier):           ║
  * ║    • NEW b2b_slip_image_likely_slip($binary, $mime) — zero-cost heuristic to detect     ║
  * ║      whether an image is likely a payment slip BEFORE calling Slip2Go API. Returns       ║
@@ -1132,6 +1142,11 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             'review_decision'      => null,    // 'is_slip' | 'not_slip' | 'manual_process' | NULL
             'reviewed_at'          => null,
             'reviewed_by'          => null,
+            // V.34.17: AI Vision pre-classifier decision (Snippet 15 V.8.12 schema)
+            'ai_classifier_decision'   => null, // 'is_slip' | 'not_slip' | 'uncertain' | 'error' | NULL
+            'ai_classifier_confidence' => null, // 0.0-1.0
+            'ai_classifier_reason'     => null, // short Thai sentence
+            'ai_classifier_at'         => null, // datetime when AI ran
             'created_at'         => current_time( 'mysql' ),
         );
         $row = array_merge( $defaults, is_array( $row ) ? $row : array() );
@@ -1189,6 +1204,25 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
         }
         // reviewed_at: pass-through string, NULL on empty
 
+        // V.34.17: AI classifier — normalize new fields
+        if ( $row['ai_classifier_decision'] !== null ) {
+            $aid = (string) $row['ai_classifier_decision'];
+            $allowed_ai = array( 'is_slip', 'not_slip', 'uncertain', 'error' );
+            if ( ! in_array( $aid, $allowed_ai, true ) ) $aid = '';
+            $row['ai_classifier_decision'] = ( $aid === '' ) ? null : $aid;
+        }
+        if ( $row['ai_classifier_confidence'] !== null ) {
+            $aic = (float) $row['ai_classifier_confidence'];
+            if ( $aic < 0 ) $aic = 0.0;
+            if ( $aic > 1 ) $aic = 1.0;
+            $row['ai_classifier_confidence'] = round( $aic, 4 );
+        }
+        if ( $row['ai_classifier_reason'] !== null ) {
+            $row['ai_classifier_reason'] = mb_substr( (string) $row['ai_classifier_reason'], 0, 255 );
+            if ( $row['ai_classifier_reason'] === '' ) $row['ai_classifier_reason'] = null;
+        }
+        // ai_classifier_at: pass-through string datetime, NULL on empty
+
         // Schema-aware INSERT — wpdb->insert tolerates extra keys ONLY if they match
         // existing columns. Schema bump V.8.11 (Snippet 15) adds image_path / review_decision /
         // reviewed_at / reviewed_by — but if Snippet 15 hasn't synced yet, we need to drop
@@ -1205,6 +1239,21 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
         }
         if ( ! $sl_extra_cols_exist ) {
             unset( $row['image_path'], $row['review_decision'], $row['reviewed_at'], $row['reviewed_by'] );
+        }
+
+        // V.34.17: AI classifier columns probe (Snippet 15 V.8.12)
+        static $sl_ai_cols_exist = null;
+        if ( $sl_ai_cols_exist === null ) {
+            $ai_cols_check = $wpdb->get_col( $wpdb->prepare(
+                "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s
+                   AND column_name IN ('ai_classifier_decision','ai_classifier_confidence','ai_classifier_reason','ai_classifier_at')",
+                $table
+            ) );
+            $sl_ai_cols_exist = is_array( $ai_cols_check ) && count( $ai_cols_check ) === 4;
+        }
+        if ( ! $sl_ai_cols_exist ) {
+            unset( $row['ai_classifier_decision'], $row['ai_classifier_confidence'], $row['ai_classifier_reason'], $row['ai_classifier_at'] );
         }
 
         // V.34.9 M-7: explicit $format array matching schema (prevents STRICT-mode write failures
@@ -1238,6 +1287,13 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             $format[] = '%s'; // review_decision (V.34.16, nullable enum-like)
             $format[] = '%s'; // reviewed_at (V.34.16, nullable datetime)
             $format[] = '%d'; // reviewed_by (V.34.16, nullable user_id)
+        }
+        // V.34.17: AI classifier columns (only when Snippet 15 V.8.12 schema present)
+        if ( $sl_ai_cols_exist ) {
+            $format[] = '%s'; // ai_classifier_decision (V.34.17, nullable enum)
+            $format[] = '%f'; // ai_classifier_confidence (V.34.17, nullable float)
+            $format[] = '%s'; // ai_classifier_reason (V.34.17, nullable string)
+            $format[] = '%s'; // ai_classifier_at (V.34.17, nullable datetime)
         }
         $format[] = '%s'; // created_at (MySQL datetime — always last)
 
@@ -1596,6 +1652,274 @@ if ( ! function_exists( 'b2b_slip_image_likely_slip' ) ) {
 
         $result['confidence'] = round( $score, 2 );
         $result['reason']     = implode( ', ', $reasons );
+        return $result;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.34.17: AI VISION SLIP CLASSIFIER (Claude Haiku 4.5)
+// Purpose: cost-effective second-line classifier AFTER heuristic pre-filter
+//          (V.34.16) and BEFORE Slip2Go API call. Slip2Go costs ~3-5 บาท
+//          per call, AI costs ~$0.001 (~0.04 บาท) = 50-100x cheaper.
+//          Cache by SHA-256 image hash (30 day TTL via slip_log.ai_classifier_at)
+//          → repeat images do not re-call AI.
+//
+// Decision contract:
+//   'is_slip' / 'not_slip'  — high confidence (>=0.7) → caller acts
+//   'uncertain'              — AI not sure (0.5-0.7) → caller falls through to Slip2Go
+//   'error'                  — API failure / SDK missing → caller falls through silent
+//
+// SAFETY: false negatives (real slip → "not_slip") are catastrophic
+//         (lost payment). Confidence threshold deliberately HIGH (≥0.7) +
+//         on any uncertainty/error → defer to Slip2Go (existing cascade).
+// ═══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_slip_ai_classify_image' ) ) {
+    /**
+     * AI Vision classifier — is this image a Thai bank payment slip?
+     *
+     * Uses Anthropic Claude Haiku 4.5 vision via wp_remote_post. Caches decision
+     * keyed on image SHA-256 hash via wp_dinoco_slip_log.ai_classifier_* columns
+     * (Snippet 15 V.8.12 schema). Cache TTL 30 days.
+     *
+     * @param string $binary     raw image bytes
+     * @param string $mime       MIME type (image/jpeg|png|webp)
+     * @param string $image_hash optional pre-computed SHA-256 hex (else recomputed)
+     * @return array {
+     *     @type string $decision    'is_slip' | 'not_slip' | 'uncertain' | 'error'
+     *     @type float  $confidence  0.0-1.0
+     *     @type string $reason      short Thai string (1 sentence) or error msg
+     *     @type bool   $cached      true if served from slip_log cache
+     *     @type int    $tokens_used 0 if cached/error, else input+output tokens
+     * }
+     */
+    function b2b_slip_ai_classify_image( $binary, $mime, $image_hash = '' ) {
+        $result = array(
+            'decision'    => 'error',
+            'confidence'  => 0.0,
+            'reason'      => '',
+            'cached'      => false,
+            'tokens_used' => 0,
+        );
+
+        // Defensive: empty binary or missing API key → error (caller falls through)
+        if ( empty( $binary ) || ! is_string( $binary ) ) {
+            $result['reason'] = 'empty_binary';
+            return $result;
+        }
+        if ( ! defined( 'B2B_ANTHROPIC_API_KEY' ) || B2B_ANTHROPIC_API_KEY === '' ) {
+            $result['reason'] = 'api_key_missing';
+            return $result;
+        }
+
+        // Normalize hash + mime
+        if ( empty( $image_hash ) && function_exists( 'b2b_slip_compute_image_hash' ) ) {
+            $image_hash = b2b_slip_compute_image_hash( $binary );
+        }
+        $mime = in_array( $mime, array( 'image/jpeg', 'image/png', 'image/webp' ), true )
+            ? $mime : 'image/jpeg';
+
+        // ─── Cache lookup ────────────────────────────────────────
+        // Reuse decision from prior slip_log row with same hash if recent (<30d).
+        // Schema: ai_classifier_decision / ai_classifier_confidence / ai_classifier_reason / ai_classifier_at
+        if ( ! empty( $image_hash ) ) {
+            global $wpdb;
+            $table = $wpdb->prefix . 'dinoco_slip_log';
+            // Probe column existence (cached per request)
+            static $ai_cols_exist = null;
+            if ( $ai_cols_exist === null ) {
+                $cols_check = $wpdb->get_col( $wpdb->prepare(
+                    "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                     WHERE table_schema = DATABASE() AND table_name = %s
+                       AND column_name IN ('ai_classifier_decision','ai_classifier_confidence','ai_classifier_reason','ai_classifier_at')",
+                    $table
+                ) );
+                $ai_cols_exist = is_array( $cols_check ) && count( $cols_check ) === 4;
+            }
+            if ( $ai_cols_exist ) {
+                $cached_row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT ai_classifier_decision, ai_classifier_confidence, ai_classifier_reason, ai_classifier_at
+                     FROM {$table}
+                     WHERE image_hash = %s
+                       AND ai_classifier_decision IS NOT NULL
+                       AND ai_classifier_decision IN ('is_slip','not_slip','uncertain')
+                       AND ai_classifier_at IS NOT NULL
+                       AND ai_classifier_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                     ORDER BY id DESC
+                     LIMIT 1",
+                    $image_hash
+                ), ARRAY_A );
+                if ( $cached_row && ! empty( $cached_row['ai_classifier_decision'] ) ) {
+                    $result['decision']   = (string) $cached_row['ai_classifier_decision'];
+                    $result['confidence'] = isset( $cached_row['ai_classifier_confidence'] )
+                        ? (float) $cached_row['ai_classifier_confidence'] : 0.0;
+                    $result['reason']     = 'cached: ' . (string) $cached_row['ai_classifier_reason'];
+                    $result['cached']     = true;
+                    return $result;
+                }
+            }
+        }
+
+        // ─── Live AI call ────────────────────────────────────────
+        $system_prompt = 'คุณเป็น classifier ตัดสินว่ารูปที่ส่งมาคือ "สลิปโอนเงินธนาคาร" (Thai bank transfer slip) หรือไม่ '
+                       . 'สลิปโอนเงินจะมี: ยอดเงิน + ชื่อผู้โอน + ชื่อผู้รับ + วันที่/เวลา + รหัสอ้างอิง (ref). '
+                       . 'รูปที่ไม่ใช่สลิป: โปสเตอร์ ป้ายประกาศ รูปสินค้า รูปคน รูปลายเซ็น screenshot ทั่วไป รูปคำถาม. '
+                       . 'ตอบเฉพาะ JSON object: {"is_slip": true|false, "confidence": 0.0-1.0, "reason": "1 ประโยคสั้นภาษาไทย"} '
+                       . 'ห้ามอธิบายเพิ่ม ห้ามใส่ markdown code fence. ตอบ JSON ตรงๆ.';
+
+        $payload = array(
+            'model'      => 'claude-haiku-4-5-20251001', // CLAUDE.md: latest Haiku 4.5
+            'max_tokens' => 100,
+            'system'     => $system_prompt,
+            'messages'   => array(
+                array(
+                    'role'    => 'user',
+                    'content' => array(
+                        array(
+                            'type'   => 'image',
+                            'source' => array(
+                                'type'       => 'base64',
+                                'media_type' => $mime,
+                                'data'       => base64_encode( $binary ),
+                            ),
+                        ),
+                        array(
+                            'type' => 'text',
+                            'text' => 'Classify this image. Is it a Thai bank transfer slip (สลิปโอนเงิน)?',
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        $t0 = microtime( true );
+        try {
+            $response = wp_remote_post( 'https://api.anthropic.com/v1/messages', array(
+                'headers' => array(
+                    'x-api-key'         => B2B_ANTHROPIC_API_KEY,
+                    'anthropic-version' => '2023-06-01',
+                    'content-type'      => 'application/json',
+                ),
+                'body'    => wp_json_encode( $payload ),
+                'timeout' => 8, // hard cap — fall through fast on hang
+            ) );
+        } catch ( \Throwable $e ) {
+            $result['reason'] = 'exception: ' . substr( $e->getMessage(), 0, 200 );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip AI] Exception: ' . $result['reason'] );
+            }
+            return $result;
+        }
+
+        if ( is_wp_error( $response ) ) {
+            $result['reason'] = 'wp_error: ' . substr( $response->get_error_message(), 0, 200 );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip AI] ' . $result['reason'] );
+            }
+            return $result;
+        }
+
+        $http_code = (int) wp_remote_retrieve_response_code( $response );
+        $raw_body  = (string) wp_remote_retrieve_body( $response );
+
+        if ( $http_code !== 200 ) {
+            $result['reason'] = 'http_' . $http_code . ': ' . substr( $raw_body, 0, 150 );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip AI] HTTP ' . $http_code . ' body=' . mb_substr( $raw_body, 0, 200 ) );
+            }
+            return $result;
+        }
+
+        $body = json_decode( $raw_body, true );
+        if ( ! is_array( $body ) ) {
+            $result['reason'] = 'invalid_json_response';
+            return $result;
+        }
+
+        // Extract token usage (Anthropic returns input_tokens + output_tokens)
+        $tokens_in  = isset( $body['usage']['input_tokens'] )  ? (int) $body['usage']['input_tokens']  : 0;
+        $tokens_out = isset( $body['usage']['output_tokens'] ) ? (int) $body['usage']['output_tokens'] : 0;
+        $result['tokens_used'] = $tokens_in + $tokens_out;
+
+        // Extract text content
+        $text_content = '';
+        if ( isset( $body['content'] ) && is_array( $body['content'] ) ) {
+            foreach ( $body['content'] as $block ) {
+                if ( isset( $block['type'], $block['text'] ) && $block['type'] === 'text' ) {
+                    $text_content .= $block['text'];
+                }
+            }
+        }
+
+        if ( $text_content === '' ) {
+            $result['reason'] = 'empty_content';
+            return $result;
+        }
+
+        // Strip optional markdown fence
+        $json_text = trim( $text_content );
+        if ( preg_match( '/\{[\s\S]*\}/u', $json_text, $jm ) ) {
+            $json_text = $jm[0];
+        }
+        $parsed = json_decode( $json_text, true );
+        if ( ! is_array( $parsed ) || ! isset( $parsed['is_slip'] ) ) {
+            $result['reason'] = 'parse_fail: ' . substr( $text_content, 0, 100 );
+            return $result;
+        }
+
+        $is_slip    = (bool) $parsed['is_slip'];
+        $confidence = isset( $parsed['confidence'] ) ? (float) $parsed['confidence'] : 0.0;
+        $reason_str = isset( $parsed['reason'] ) ? (string) $parsed['reason'] : '';
+        if ( $confidence < 0 ) $confidence = 0.0;
+        if ( $confidence > 1 ) $confidence = 1.0;
+
+        // Map to decision (high-confidence threshold 0.7)
+        // SAFETY: thresholds asymmetric — false negative (real slip → not_slip)
+        //         is catastrophic, so 'not_slip' requires HIGH confidence (>=0.7).
+        //         'is_slip' simply means "let Slip2Go validate" → safe at 0.7 too.
+        if ( $is_slip && $confidence >= 0.7 ) {
+            $decision = 'is_slip';
+        } elseif ( ! $is_slip && $confidence >= 0.7 ) {
+            $decision = 'not_slip';
+        } else {
+            $decision = 'uncertain';
+        }
+
+        $elapsed_ms = (int) round( ( microtime( true ) - $t0 ) * 1000 );
+
+        $result['decision']   = $decision;
+        $result['confidence'] = round( $confidence, 2 );
+        $result['reason']     = mb_substr( $reason_str, 0, 250 );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf(
+                '[Slip AI] decision=%s conf=%.2f tokens=%d elapsed=%dms hash=%s reason=%s',
+                $decision, $confidence, $result['tokens_used'], $elapsed_ms,
+                substr( $image_hash, 0, 12 ), substr( $reason_str, 0, 80 )
+            ) );
+        }
+
+        // Audit log (best-effort)
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            try {
+                dinoco_audit_log( array(
+                    'event_type'  => 'ai_slip_classify',
+                    'actor_type'  => 'system',
+                    'target_type' => 'image_hash',
+                    'target_id'   => substr( (string) $image_hash, 0, 64 ),
+                    'context'     => array(
+                        'decision'    => $decision,
+                        'confidence'  => $result['confidence'],
+                        'tokens'      => $result['tokens_used'],
+                        'tokens_in'   => $tokens_in,
+                        'tokens_out'  => $tokens_out,
+                        'elapsed_ms'  => $elapsed_ms,
+                        'mime'        => $mime,
+                    ),
+                    'success'     => 1,
+                ) );
+            } catch ( \Throwable $e ) { /* silent */ }
+        }
+
         return $result;
     }
 }

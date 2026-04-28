@@ -1,6 +1,25 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.10 (2026-04-24) — AI Vision Slip Pre-Classifier UI:               ║
+ * ║    Companion to Snippet 1 V.34.17 + Snippet 2 V.34.15 + Snippet 15 V.8.12.       ║
+ * ║                                                                                  ║
+ * ║    NEW stat card: "AI Filtered (24h)" — count of result_status='not_slip_ai' +   ║
+ * ║      Slip2Go-quota saved estimate (count × 5 บาท).                                 ║
+ * ║                                                                                  ║
+ * ║    NEW column "AI" in Recent 50 table — decision badge:                          ║
+ * ║      ✅ slip / ❌ not slip / ❓ uncertain / ⚠️ error / — none                      ║
+ * ║      Tooltip: AI confidence + reason.                                            ║
+ * ║                                                                                  ║
+ * ║    NEW REST endpoint:                                                            ║
+ * ║      GET /dinoco-slip/v1/ai-stats?days=1 — { count_not_slip_ai, total_ai_runs,   ║
+ * ║        cached_hit_rate, estimated_savings_baht }                                 ║
+ * ║                                                                                  ║
+ * ║    NEW toggle button in header — disable AI classifier (sets wp_option           ║
+ * ║      b2b_slip_ai_classifier_enabled to 0). Falls back to heuristic + Slip2Go.    ║
+ * ║                                                                                  ║
+ * ║    /recent endpoint extended to return ai_classifier_decision/confidence/reason  ║
+ * ║      (schema-aware via INFORMATION_SCHEMA probe — silent on legacy installs).    ║
  * ║  Version: V.1.9 (2026-04-26) — Slip Needs Review Pool UI:                       ║
  * ║    Production incident (post-V.34.11 LINE bot deploy): customer reply for OCR-fail║
  * ║    Slip2Go codes (200500/502/503) accidentally hit non-slip images (posters,     ║
@@ -230,6 +249,23 @@ add_action( 'rest_api_init', function () {
         'callback'            => 'dinoco_slip_monitor_rest_pool_image',
         'permission_callback' => $perm_admin,
     ) );
+
+    // V.1.10: AI Vision classifier stats (count + savings estimate)
+    register_rest_route( 'dinoco-slip/v1', '/ai-stats', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_ai_stats',
+        'permission_callback' => $perm_admin,
+    ) );
+
+    // V.1.10: AI Vision classifier toggle (set wp_option b2b_slip_ai_classifier_enabled)
+    register_rest_route( 'dinoco-slip/v1', '/ai-toggle', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_slip_monitor_rest_ai_toggle',
+        'permission_callback' => function ( WP_REST_Request $req ) {
+            return current_user_can( 'manage_options' )
+                && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
+        },
+    ) );
 } );
 
 // ────────────────────────────────────────────────────────────────
@@ -259,6 +295,8 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_get' ) ) {
             'unknown_slip_code' => 0, 'fatal_exception' => 0, 'empty_binary' => 0,
             // V.1.9: classifier bucket — pre-filter heuristic + needs_review pool
             'needs_review' => 0, 'not_slip_heuristic' => 0,
+            // V.1.10: AI classifier bucket — Slip2Go quota saved
+            'not_slip_ai' => 0,
             // queue / routing
             'queued' => 0, 'not_slip' => 0, 'unregistered_group' => 0,
             'other' => 0,
@@ -386,8 +424,24 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_recent' ) ) {
         }
         $params[] = $limit;
 
+        // V.1.10: Schema-aware AI columns probe (silent on legacy installs)
+        static $_recent_ai_cols_exist = null;
+        if ( $_recent_ai_cols_exist === null ) {
+            $cols_check = $wpdb->get_col( $wpdb->prepare(
+                "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s
+                   AND column_name IN ('ai_classifier_decision','ai_classifier_confidence','ai_classifier_reason')",
+                $table
+            ) );
+            $_recent_ai_cols_exist = is_array( $cols_check ) && count( $cols_check ) === 3;
+        }
+        $ai_cols_select = $_recent_ai_cols_exist
+            ? ', ai_classifier_decision, ai_classifier_confidence, ai_classifier_reason'
+            : '';
+
         $sql = "SELECT id, group_id, message_id, user_id, dist_id, slip_code, amount, trans_ref, sender_name,
                        result_status, error_code, error_msg, http_code, processing_time_ms, retry_count, created_at
+                       {$ai_cols_select}
                 FROM {$table}
                 WHERE " . implode( ' AND ', $where ) . "
                 ORDER BY id DESC
@@ -1278,6 +1332,121 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_pool_image' ) ) {
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+// V.1.10: GET /ai-stats?days=1 — AI classifier metrics + savings estimate
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_ai_stats' ) ) {
+    function dinoco_slip_monitor_rest_ai_stats( WP_REST_Request $req ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $days = max( 1, min( 90, (int) $req->get_param( 'days' ) ?: 1 ) );
+
+        $enabled = (bool) get_option( 'b2b_slip_ai_classifier_enabled', 1 );
+        $api_key_set = defined( 'B2B_ANTHROPIC_API_KEY' ) && B2B_ANTHROPIC_API_KEY !== '';
+
+        // Probe AI columns exist (silent on legacy installs)
+        $ai_cols_exist = (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'ai_classifier_decision'",
+            $table
+        ) );
+
+        $count_not_slip_ai = 0;
+        $total_ai_runs    = 0;
+        $cache_hits       = 0;
+        $cache_misses     = 0;
+
+        if ( $ai_cols_exist ) {
+            // count_not_slip_ai = how many slips were AI-blocked (Slip2Go quota saved)
+            $count_not_slip_ai = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                 WHERE result_status = 'not_slip_ai'
+                   AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)",
+                $days
+            ) );
+
+            // total_ai_runs = how many slip_log rows have ai_classifier_at populated
+            $total_ai_runs = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                 WHERE ai_classifier_at IS NOT NULL
+                   AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)",
+                $days
+            ) );
+
+            // cache_hits — rows whose ai_classifier_reason starts with 'cached:' (Snippet 1 marker)
+            $cache_hits = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                 WHERE ai_classifier_reason LIKE 'cached:%%'
+                   AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)",
+                $days
+            ) );
+            $cache_misses = max( 0, $total_ai_runs - $cache_hits );
+        }
+
+        // Savings estimate: each AI-blocked slip saved a Slip2Go call (~5 baht avg)
+        $estimated_savings_baht = $count_not_slip_ai * 5;
+        $cached_hit_rate = $total_ai_runs > 0 ? round( 100 * $cache_hits / $total_ai_runs, 1 ) : 0;
+
+        return rest_ensure_response( array(
+            'success'                => true,
+            'ai_enabled'             => $enabled,
+            'api_key_set'            => $api_key_set,
+            'ai_cols_exist'          => $ai_cols_exist,
+            'days'                   => $days,
+            'count_not_slip_ai'      => $count_not_slip_ai,
+            'total_ai_runs'          => $total_ai_runs,
+            'cache_hits'             => $cache_hits,
+            'cache_misses'           => $cache_misses,
+            'cached_hit_rate'        => $cached_hit_rate,
+            'estimated_savings_baht' => $estimated_savings_baht,
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// V.1.10: POST /ai-toggle — set b2b_slip_ai_classifier_enabled wp_option
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_ai_toggle' ) ) {
+    function dinoco_slip_monitor_rest_ai_toggle( WP_REST_Request $req ) {
+        $body = $req->get_json_params();
+        if ( ! is_array( $body ) ) $body = array();
+
+        $enabled = isset( $body['enabled'] ) ? (bool) $body['enabled'] : null;
+        if ( $enabled === null ) {
+            // Toggle current value
+            $enabled = ! (bool) get_option( 'b2b_slip_ai_classifier_enabled', 1 );
+        }
+
+        $new_val = $enabled ? '1' : '0';
+        update_option( 'b2b_slip_ai_classifier_enabled', $new_val, false );
+
+        if ( function_exists( 'b2b_log' ) ) {
+            $uid = get_current_user_id();
+            b2b_log( '[SlipMonitor] AI classifier toggle → ' . $new_val . ' by user_id=' . $uid );
+        }
+
+        // Audit log
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            try {
+                dinoco_audit_log( array(
+                    'event_type'   => 'config_change',
+                    'target_type'  => 'config',
+                    'target_id'    => 'slip.ai_classifier_enabled',
+                    'delta_after'  => $new_val,
+                    'context'      => array( 'source' => 'slip_monitor_ui' ),
+                    'success'      => 1,
+                ) );
+            } catch ( \Throwable $e ) { /* silent */ }
+        }
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'enabled' => (bool) $enabled,
+            'message' => $enabled ? 'เปิด AI classifier' : 'ปิด AI classifier (fallback ไป heuristic + Slip2Go)',
+        ) );
+    }
+}
+
 // ════════════════════════════════════════════════════════════════
 // SHORTCODE: [dinoco_slip_monitor]
 // ════════════════════════════════════════════════════════════════
@@ -1369,7 +1538,9 @@ function dinoco_slip_monitor_render() {
 
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
             <button class="dnc-slip-refresh" onclick="dncSlipMonitorRefresh()">🔄 Refresh</button>
-            <div style="display:flex; gap:8px;">
+            <div style="display:flex; gap:8px; align-items:center;">
+                <span id="dncSlipAiToggleStatus" style="font-size:12px; color:#64748b;">AI: …</span>
+                <button class="dnc-slip-btn neutral" id="dncSlipAiToggleBtn" onclick="dncSlipAiToggle()" title="เปิด/ปิด AI Vision pre-classifier">🤖 Toggle AI</button>
                 <button class="dnc-slip-btn neutral" onclick="dncSlipClearAll()">🔓 Force Clear ALL Slip Locks</button>
             </div>
         </div>
@@ -1380,6 +1551,7 @@ function dinoco_slip_monitor_render() {
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">ซ้ำ</div><div class="dnc-slip-stat-value warn" id="statDup">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Error (API)</div><div class="dnc-slip-stat-value bad" id="statErr">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">รอ Review (30d)</div><div class="dnc-slip-stat-value warn" id="statReview">—</div></div>
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">AI Filtered 24h</div><div class="dnc-slip-stat-value ok" id="statAi">—</div><div style="font-size:11px; color:#16a34a; margin-top:4px;" id="statAiSavings">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Unregistered</div><div class="dnc-slip-stat-value warn" id="statUnreg">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Success rate</div><div class="dnc-slip-stat-value ok" id="statRate">—</div></div>
         </div>
@@ -1541,6 +1713,40 @@ function dinoco_slip_monitor_render() {
                 document.getElementById('statReview').textContent = '—';
             }
 
+            // V.1.10: AI classifier stats (count + savings estimate)
+            try {
+                const ai = await apiGet('/ai-stats?days=1');
+                if (ai && ai.success) {
+                    const cnt = Number.isFinite(ai.count_not_slip_ai) ? ai.count_not_slip_ai : 0;
+                    const savings = Number.isFinite(ai.estimated_savings_baht) ? ai.estimated_savings_baht : 0;
+                    document.getElementById('statAi').textContent = cnt;
+                    document.getElementById('statAiSavings').textContent = '~ประหยัด ฿' + savings.toLocaleString('en-US') + ' (Slip2Go)';
+                    // Toggle button label
+                    const toggleStatus = document.getElementById('dncSlipAiToggleStatus');
+                    if (toggleStatus) {
+                        if (!ai.api_key_set) {
+                            toggleStatus.textContent = 'AI: ไม่มี API key';
+                            toggleStatus.style.color = '#dc2626';
+                        } else if (!ai.ai_cols_exist) {
+                            toggleStatus.textContent = 'AI: schema รอ sync (V.8.12)';
+                            toggleStatus.style.color = '#d97706';
+                        } else if (ai.ai_enabled) {
+                            toggleStatus.textContent = 'AI: เปิด (cache hit ' + ai.cached_hit_rate + '%)';
+                            toggleStatus.style.color = '#16a34a';
+                        } else {
+                            toggleStatus.textContent = 'AI: ปิด';
+                            toggleStatus.style.color = '#64748b';
+                        }
+                    }
+                } else {
+                    document.getElementById('statAi').textContent = 0;
+                    document.getElementById('statAiSavings').textContent = '—';
+                }
+            } catch (e) {
+                document.getElementById('statAi').textContent = '—';
+                document.getElementById('statAiSavings').textContent = '—';
+            }
+
             // Banner
             let banner = '';
             if (!resp.table_exists) {
@@ -1604,10 +1810,29 @@ function dinoco_slip_monitor_render() {
             if (!recent.success || !recent.rows || recent.rows.length === 0) {
                 document.getElementById('dncSlipRecent').innerHTML = '<p style="color:#64748b; font-size:13px;">— ยังไม่มีข้อมูล slip log —</p>';
             } else {
+                // V.1.10: AI badge helper — colored badge per decision with tooltip
+                const aiBadge = (r) => {
+                    const d = r.ai_classifier_decision;
+                    if (!d) return '<span style="color:#94a3b8;">—</span>';
+                    const conf = Number.isFinite(parseFloat(r.ai_classifier_confidence))
+                        ? (parseFloat(r.ai_classifier_confidence) * 100).toFixed(0) + '%'
+                        : '?';
+                    const reason = r.ai_classifier_reason || '';
+                    const tipText = 'AI: ' + d + ' (conf=' + conf + ')\n' + reason;
+                    const map = {
+                        'is_slip':   { emoji: '✅', bg: '#dcfce7', fg: '#166534' },
+                        'not_slip':  { emoji: '❌', bg: '#fee2e2', fg: '#991b1b' },
+                        'uncertain': { emoji: '❓', bg: '#fef3c7', fg: '#854d0e' },
+                        'error':     { emoji: '⚠️', bg: '#f1f5f9', fg: '#475569' },
+                    };
+                    const m = map[d] || { emoji: '·', bg: '#f1f5f9', fg: '#475569' };
+                    return '<span title="' + esc(tipText) + '" style="display:inline-block; padding:2px 8px; background:' + m.bg + '; color:' + m.fg + '; border-radius:10px; font-size:11px; font-weight:600;">' + m.emoji + ' ' + d + ' ' + conf + '</span>';
+                };
                 const trs = recent.rows.map(r => `<tr>
                     <td>${fmtDateTH(r.created_at)}</td>
                     <td>${esc(r.dist_name || '(ไม่ระบุ)')}</td>
                     <td><span class="dnc-slip-status ${esc(r.result_status)}">${esc(r.result_status)}</span></td>
+                    <td>${aiBadge(r)}</td>
                     <td>${fmtBaht(r.amount)}</td>
                     <td><span class="dnc-slip-ref">${esc(r.trans_ref || '-')}</span></td>
                     <td>${esc(r.sender_name || '-')}</td>
@@ -1615,9 +1840,31 @@ function dinoco_slip_monitor_render() {
                     <td><span class="dnc-slip-code">${esc(r.error_msg || '')}</span></td>
                 </tr>`).join('');
                 document.getElementById('dncSlipRecent').innerHTML = `<table class="dnc-slip-table">
-                    <thead><tr><th>เวลา</th><th>ร้าน</th><th>Status</th><th>ยอด</th><th>Ref</th><th>ผู้โอน</th><th>Tech</th><th>Error</th></tr></thead>
+                    <thead><tr><th>เวลา</th><th>ร้าน</th><th>Status</th><th>AI</th><th>ยอด</th><th>Ref</th><th>ผู้โอน</th><th>Tech</th><th>Error</th></tr></thead>
                     <tbody>${trs}</tbody>
                 </table>`;
+            }
+        };
+
+        // V.1.10: AI classifier toggle
+        window.dncSlipAiToggle = async function() {
+            const cur = document.getElementById('dncSlipAiToggleStatus').textContent || '';
+            const nowOn = cur.indexOf('เปิด') >= 0;
+            const target = !nowOn;
+            const msg = target
+                ? '⚠️ เปิด AI Vision pre-classifier?\n\nรูปทุกใบจะถูกส่งไป Anthropic API ก่อน Slip2Go (ค่า ~$0.001/รูป)\nDefault ON ใน config — กดยืนยันเพื่อ override'
+                : '⚠️ ปิด AI Vision pre-classifier?\n\nรูปทุกใบจะข้ามไป Slip2Go ตรงๆ (เสีย quota สูงขึ้น)';
+            if (!confirm(msg)) return;
+            try {
+                const r = await apiPost('/ai-toggle', { enabled: target });
+                if (r.success) {
+                    alert(r.message || 'OK');
+                    dncSlipMonitorRefresh();
+                } else {
+                    alert('Error: ' + (r.message || 'unknown'));
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
             }
         };
 

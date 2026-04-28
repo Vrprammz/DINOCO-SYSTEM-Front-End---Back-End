@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.15 (2026-04-24) — AI Vision Slip Pre-Classifier integration:               ║
+ * ║    Production incident (post-V.34.14): heuristic alone (aspect/size/dims) ผ่าน threshold ║
+ * ║    กับรูปที่ไม่ใช่สลิป (PPT receipt, Portrait poster, screenshot) → ยังเสีย Slip2Go quota. ║
+ * ║                                                                                          ║
+ * ║    Fix: AFTER heuristic + BEFORE Slip2Go → call b2b_slip_ai_classify_image() (Snippet 1   ║
+ * ║      V.34.17) — Claude Haiku 4.5 vision (cost ~$0.001 = ~50-100x ถูกกว่า Slip2Go).       ║
+ * ║      Cache by image SHA-256 30d. AI 'not_slip' high-conf → SILENT skip + slip_log status ║
+ * ║      'not_slip_ai'. AI 'is_slip'/'uncertain'/'error' → fall through to Slip2Go (existing ║
+ * ║      cascade unchanged). Defensive: B2B_ANTHROPIC_API_KEY undefined → skip AI silent.    ║
+ * ║      Kill switch: wp_option b2b_slip_ai_classifier_enabled=0.                            ║
+ * ║      Companion: Snippet 15 V.8.12 (4 cols), Slip Monitor V.1.10 (UI), Config Layer V.1.1.║
  * ║  Version: V.34.14 (2026-04-26) — Image Pre-Filter + Needs Review Pool:                    ║
  * ║    Production incident (post-V.34.11 deploy 2026-04-26): adding customer reply for      ║
  * ║    Slip2Go codes 200500/200502/200503 ("รูปไม่ชัด ส่งใหม่") caused unintended UX —      ║
@@ -2593,6 +2604,11 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
     // V.34.14: Needs Review Pool — when Slip2Go returns OCR-fail or unknown codes,
     // image is saved to disk so admin can view thumbnail in Slip Monitor pool UI.
     $_slip_image_path       = null;   // relative path under wp-content/uploads/ (e.g. "slip-pool/2026-04/{hash}.jpg")
+    // V.34.15: AI Vision Pre-Classifier decision (saved to slip_log audit row)
+    $_slip_ai_decision      = null;   // 'is_slip' | 'not_slip' | 'uncertain' | 'error' | null
+    $_slip_ai_confidence    = null;   // 0.0-1.0 float
+    $_slip_ai_reason        = null;   // short Thai explanation
+    $_slip_ai_at            = null;   // ISO datetime when AI ran
 
     // Helper: ถ้า reply_token ว่าง (queued slip) ใช้ push แทน
     $_slip_reply = function($msgs) use ($reply_token, $group_id) {
@@ -2712,6 +2728,74 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
         if ( function_exists( 'b2b_log' ) && is_array( $pre_filter ) ) {
             b2b_log( '[Slip] PRE-FILTER pass: confidence=' . $pre_filter['confidence']
                 . ' reason=' . ( $pre_filter['reason'] ?? '-' ) );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // V.34.15: AI VISION CLASSIFIER — second-line pre-filter BEFORE Slip2Go
+    // Goal: Slip2Go ~3-5 บาท/call vs Claude Haiku ~0.04 บาท/call (50-100x cheaper).
+    //       Heuristic catches obvious non-slips (landscape banners) but mid-range
+    //       images (PPT receipts, portrait posters, screenshots) still pass to
+    //       Slip2Go → wasted quota. AI classifier disambiguates cheaply.
+    // Cache: by image SHA-256 30d (slip_log.ai_classifier_*) → repeat = free.
+    // SAFETY: only act on HIGH confidence 'not_slip' (≥0.7). Anything else
+    //         (is_slip / uncertain / error) → fall through to Slip2Go.
+    // Kill switch: wp_option b2b_slip_ai_classifier_enabled=0
+    // ═══════════════════════════════════════════════════════════════
+    $_slip_ai_enabled = (bool) get_option( 'b2b_slip_ai_classifier_enabled', 1 ); // default ON
+    if ( $_slip_ai_enabled
+         && function_exists( 'b2b_slip_ai_classify_image' )
+         && defined( 'B2B_ANTHROPIC_API_KEY' )
+         && B2B_ANTHROPIC_API_KEY !== '' ) {
+
+        // Compute hash NOW so cache lookup works (replay cascade also computes — idempotent)
+        $_pre_ai_hash = $_slip_image_hash;
+        if ( empty( $_pre_ai_hash ) && function_exists( 'b2b_slip_compute_image_hash' ) ) {
+            $_pre_ai_hash = b2b_slip_compute_image_hash( $image_binary );
+        }
+
+        $ai_result = b2b_slip_ai_classify_image( $image_binary, $slip_mime, $_pre_ai_hash );
+
+        if ( is_array( $ai_result ) ) {
+            // Persist decision into slip_log audit row regardless of outcome
+            $_slip_ai_decision   = isset( $ai_result['decision'] )   ? (string) $ai_result['decision']   : 'error';
+            $_slip_ai_confidence = isset( $ai_result['confidence'] ) ? (float)  $ai_result['confidence'] : 0.0;
+            $_slip_ai_reason     = isset( $ai_result['reason'] )     ? (string) $ai_result['reason']     : '';
+            $_slip_ai_at         = current_time( 'mysql' );
+            // Ensure hash + mime saved if we computed them here (replay cascade may skip)
+            if ( ! empty( $_pre_ai_hash ) ) {
+                $_slip_image_hash = $_pre_ai_hash;
+                $_slip_image_mime = $slip_mime;
+            }
+
+            $is_cached = ! empty( $ai_result['cached'] );
+            $tokens    = isset( $ai_result['tokens_used'] ) ? (int) $ai_result['tokens_used'] : 0;
+
+            if ( $_slip_ai_decision === 'not_slip' && $_slip_ai_confidence >= 0.7 ) {
+                // High-confidence non-slip → SILENT skip (don't burn Slip2Go quota or reply customer)
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[Slip] AI classifier=not_slip conf=' . $_slip_ai_confidence
+                        . ' cached=' . ( $is_cached ? '1' : '0' )
+                        . ' tokens=' . $tokens
+                        . ' reason=' . substr( $_slip_ai_reason, 0, 80 )
+                        . ' group=' . $group_id );
+                }
+                $_slip_final_status     = 'not_slip_ai';
+                $_slip_final_error_code = 'AI_NOT_SLIP';
+                $_slip_final_error_msg  = 'AI conf=' . $_slip_ai_confidence
+                    . ( $is_cached ? ' (cached)' : '' )
+                    . ' reason=' . substr( $_slip_ai_reason, 0, 380 );
+                return; // finally block writes audit row + releases lock
+            }
+
+            // is_slip / uncertain / error → continue to Slip2Go cascade
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip] AI classifier=' . $_slip_ai_decision
+                    . ' conf=' . $_slip_ai_confidence
+                    . ' cached=' . ( $is_cached ? '1' : '0' )
+                    . ' tokens=' . $tokens
+                    . ' → fall through to Slip2Go' );
+            }
         }
     }
 
@@ -3462,6 +3546,11 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
                     'replayed_from_log_id' => $_slip_replayed_from,
                     // V.34.14: Needs Review Pool — relative path to saved image (or null)
                     'image_path'           => $_slip_image_path,
+                    // V.34.15: AI classifier decision (Snippet 15 V.8.12 columns)
+                    'ai_classifier_decision'   => $_slip_ai_decision,
+                    'ai_classifier_confidence' => $_slip_ai_confidence,
+                    'ai_classifier_reason'     => $_slip_ai_reason,
+                    'ai_classifier_at'         => $_slip_ai_at,
                 ) );
             }
         } catch ( \Throwable $e ) { /* silent */ }
