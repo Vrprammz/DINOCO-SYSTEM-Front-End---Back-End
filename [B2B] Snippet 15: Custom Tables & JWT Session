@@ -1,6 +1,22 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 15: Custom Tables & JWT Session              ║
+ * ║  Version: V.8.11 (2026-04-26) — Slip Needs Review Pool schema:                       ║
+ * ║    • NEW columns on wp_dinoco_slip_log (idempotent ALTER + dbDelta):                 ║
+ * ║        image_path VARCHAR(255) NULL          — relative path under uploads/          ║
+ * ║                                                  (wp-content/uploads/slip-pool/)     ║
+ * ║        review_decision VARCHAR(32) NULL      — 'is_slip' | 'not_slip' |              ║
+ * ║                                                  'manual_process' | NULL              ║
+ * ║        reviewed_at DATETIME NULL              — timestamp of admin decision           ║
+ * ║        reviewed_by BIGINT UNSIGNED NULL       — WP user id of reviewing admin         ║
+ * ║    • NEW index idx_review (review_decision, created_at) — needs_review pool query   ║
+ * ║    • NEW cron `dinoco_slip_pool_cleanup_cron` (daily 03:30 ICT) — deletes pool      ║
+ * ║      images >30d after admin review OR >90d regardless (PDPA hygiene). Bounded      ║
+ * ║      LIMIT 200/run.                                                                  ║
+ * ║    • DB version bump 8.9 → 8.11 (idempotent — safe re-run on legacy installs).       ║
+ * ║    • Companion: Snippet 1 V.34.16 (heuristic helper + log_insert schema-aware),     ║
+ * ║                 Snippet 2 V.34.12 (pre-filter + pool image save),                    ║
+ * ║                 Slip Monitor V.1.9 (review pool UI + 2 REST endpoints).              ║
  * ║  Version: V.8.10 (2026-04-24) — Phase 1.5 unified audit hookup (stock writers):     ║
  * ║    • Wire dinoco_audit_log() AFTER COMMIT in dinoco_stock_add, dinoco_stock_subtract,║
  * ║      dinoco_transfer_stock. event_type=stock_add|stock_subtract|stock_transfer       ║
@@ -178,7 +194,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Run ครั้งเดียว — ตรวจ version ก่อนสร้าง
  */
 add_action( 'init', function() {
-    $db_version = '8.9'; // V.8.9: Phase 1 — wp_dinoco_audit_log unified forensic index
+    $db_version = '8.11'; // V.8.11: Slip Needs Review Pool — image_path/review_decision/reviewed_at/reviewed_by + idx_review
     $current = get_option( '_dinoco_catalog_table_version', '0' );
     if ( version_compare( $current, $db_version, '>=' ) ) return;
 
@@ -440,6 +456,10 @@ add_action( 'init', function() {
         image_mime VARCHAR(20) DEFAULT NULL,
         slip2go_response MEDIUMTEXT DEFAULT NULL,
         replayed_from_log_id BIGINT UNSIGNED DEFAULT NULL,
+        image_path VARCHAR(255) DEFAULT NULL,
+        review_decision VARCHAR(32) DEFAULT NULL,
+        reviewed_at DATETIME DEFAULT NULL,
+        reviewed_by BIGINT UNSIGNED DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
         KEY idx_group_created (group_id, created_at),
@@ -448,7 +468,8 @@ add_action( 'init', function() {
         KEY idx_transref (trans_ref),
         KEY idx_dist_created (dist_id, created_at),
         KEY idx_image_hash (image_hash),
-        KEY idx_hash_status (image_hash, result_status)
+        KEY idx_hash_status (image_hash, result_status),
+        KEY idx_review (review_decision, created_at)
     ) {$charset};";
     dbDelta( $sql_sl );
     if ( function_exists( 'b2b_log' ) ) b2b_log( '[DB] V.8.4: Ensured wp_dinoco_slip_log table' );
@@ -465,17 +486,24 @@ add_action( 'init', function() {
             'image_mime'           => "ALTER TABLE {$slip_log_table} ADD COLUMN image_mime VARCHAR(20) DEFAULT NULL AFTER image_hash",
             'slip2go_response'     => "ALTER TABLE {$slip_log_table} ADD COLUMN slip2go_response MEDIUMTEXT DEFAULT NULL AFTER image_mime",
             'replayed_from_log_id' => "ALTER TABLE {$slip_log_table} ADD COLUMN replayed_from_log_id BIGINT UNSIGNED DEFAULT NULL AFTER slip2go_response",
+            // V.8.11: Needs Review Pool columns
+            'image_path'           => "ALTER TABLE {$slip_log_table} ADD COLUMN image_path VARCHAR(255) DEFAULT NULL AFTER replayed_from_log_id",
+            'review_decision'      => "ALTER TABLE {$slip_log_table} ADD COLUMN review_decision VARCHAR(32) DEFAULT NULL AFTER image_path",
+            'reviewed_at'          => "ALTER TABLE {$slip_log_table} ADD COLUMN reviewed_at DATETIME DEFAULT NULL AFTER review_decision",
+            'reviewed_by'          => "ALTER TABLE {$slip_log_table} ADD COLUMN reviewed_by BIGINT UNSIGNED DEFAULT NULL AFTER reviewed_at",
         );
         foreach ( $sl_alters as $col_name => $sql_alter ) {
             if ( ! isset( $sl_cols[ $col_name ] ) ) {
                 $wpdb->query( $sql_alter );
-                if ( function_exists( 'b2b_log' ) ) b2b_log( "[DB] V.8.6: Added slip_log column {$col_name}" );
+                if ( function_exists( 'b2b_log' ) ) b2b_log( "[DB] V.8.6+: Added slip_log column {$col_name}" );
             }
         }
         // Idempotent index creation
         $sl_idx_map = array(
             'idx_image_hash'  => "ALTER TABLE {$slip_log_table} ADD INDEX idx_image_hash (image_hash)",
             'idx_hash_status' => "ALTER TABLE {$slip_log_table} ADD INDEX idx_hash_status (image_hash, result_status)",
+            // V.8.11: review pool query (needs_review filter + ORDER BY created_at)
+            'idx_review'      => "ALTER TABLE {$slip_log_table} ADD INDEX idx_review (review_decision, created_at)",
         );
         foreach ( $sl_idx_map as $idx_name => $sql_idx ) {
             $exists = $wpdb->get_var( $wpdb->prepare(
@@ -4507,3 +4535,106 @@ if ( ! function_exists( 'dinoco_compute_order_shipping' ) ) {
 // ════════════════════════════════════════════════════════════════════════════
 // END V.8.0 Flash Shipping Metadata V.42 Phase 1
 // ════════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════════
+// V.8.11: Slip Needs Review Pool — image cleanup cron
+// ────────────────────────────────────────────────────────────────────────────
+// Pool images live in wp-content/uploads/slip-pool/{YYYY-MM}/{hash}.{ext}.
+// Retention rules (PDPA hygiene + disk hygiene):
+//   - reviewed (review_decision IS NOT NULL) AND >30d after reviewed_at → DELETE
+//   - any age >90d (regardless of decision) → DELETE
+// Bounded LIMIT 200/run prevents long-running cron on legacy data.
+// Hook: dinoco_slip_pool_cleanup_cron (daily 03:30 ICT)
+// ════════════════════════════════════════════════════════════════════════════
+
+add_action( 'init', function () {
+    if ( ! wp_next_scheduled( 'dinoco_slip_pool_cleanup_cron' ) ) {
+        // 03:30 Bangkok = 20:30 UTC previous day
+        $next = strtotime( 'tomorrow 03:30:00 +0700' );
+        if ( $next === false ) $next = time() + DAY_IN_SECONDS; // defensive
+        wp_schedule_event( $next, 'daily', 'dinoco_slip_pool_cleanup_cron' );
+    }
+} );
+
+add_action( 'dinoco_slip_pool_cleanup_cron', 'dinoco_run_slip_pool_cleanup' );
+
+if ( ! function_exists( 'dinoco_run_slip_pool_cleanup' ) ) {
+    /**
+     * Delete pool images per retention policy. Idempotent — safe to invoke manually.
+     *
+     * @return array { checked: int, deleted_files: int, deleted_rows: int, errors: int }
+     */
+    function dinoco_run_slip_pool_cleanup() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $stats = array( 'checked' => 0, 'deleted_files' => 0, 'deleted_rows' => 0, 'errors' => 0 );
+
+        // Guard: schema check
+        $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $exists ) return $stats;
+        $col_check = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'image_path'",
+            $table
+        ) );
+        if ( ! $col_check ) return $stats; // schema not migrated yet
+
+        $uploads = wp_upload_dir();
+        if ( empty( $uploads['basedir'] ) ) return $stats;
+        $basedir = trailingslashit( $uploads['basedir'] );
+
+        // Find rows eligible for cleanup — bounded LIMIT 200
+        // Eligibility:
+        //   (a) reviewed >30d ago (review_decision IS NOT NULL AND reviewed_at < NOW() - 30d), OR
+        //   (b) any row >90d old regardless of decision
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, image_path
+             FROM {$table}
+             WHERE image_path IS NOT NULL
+               AND image_path != ''
+               AND (
+                    ( review_decision IS NOT NULL AND reviewed_at IS NOT NULL
+                      AND reviewed_at < DATE_SUB(NOW(), INTERVAL %d DAY) )
+                 OR ( created_at < DATE_SUB(NOW(), INTERVAL %d DAY) )
+               )
+             ORDER BY created_at ASC
+             LIMIT 200",
+            30, 90
+        ) );
+
+        if ( empty( $rows ) ) return $stats;
+
+        foreach ( $rows as $r ) {
+            $stats['checked']++;
+            $rel = (string) $r->image_path;
+            // Defensive: reject paths with .. or absolute components
+            if ( strpos( $rel, '..' ) !== false || strpos( $rel, ':' ) !== false ) {
+                $stats['errors']++;
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[SlipPoolCleanup] reject suspicious path id=' . (int) $r->id . ' path=' . $rel );
+                }
+                continue;
+            }
+            $abs = $basedir . ltrim( $rel, '/' );
+            if ( file_exists( $abs ) ) {
+                if ( @unlink( $abs ) ) {
+                    $stats['deleted_files']++;
+                } else {
+                    $stats['errors']++;
+                }
+            }
+            // Null out image_path in DB (preserves slip_log audit trail, releases disk)
+            $upd = $wpdb->update( $table, array( 'image_path' => null ), array( 'id' => (int) $r->id ),
+                array( '%s' ), array( '%d' ) );
+            if ( $upd !== false ) $stats['deleted_rows']++;
+        }
+
+        if ( function_exists( 'b2b_log' ) && $stats['checked'] > 0 ) {
+            b2b_log( '[SlipPoolCleanup] checked=' . $stats['checked']
+                . ' files_deleted=' . $stats['deleted_files']
+                . ' rows_nulled=' . $stats['deleted_rows']
+                . ' errors=' . $stats['errors'] );
+        }
+        return $stats;
+    }
+}

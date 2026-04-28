@@ -1,6 +1,29 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.9 (2026-04-26) — Slip Needs Review Pool UI:                       ║
+ * ║    Production incident (post-V.34.11 LINE bot deploy): customer reply for OCR-fail║
+ * ║    Slip2Go codes (200500/502/503) accidentally hit non-slip images (posters,     ║
+ * ║    holiday announcements, customer questions). Snippet 2 V.34.12 changes those   ║
+ * ║    paths to silent + add to needs_review pool. This version adds the admin UI.   ║
+ * ║                                                                                  ║
+ * ║    NEW UI section "🔍 Needs Review Pool" — recent 50 entries, grouped by age:    ║
+ * ║      • Thumbnail (click → fullsize lightbox via REST proxy)                      ║
+ * ║      • Group name + dist name + slip_code + age + reason                         ║
+ * ║      • 3 actions per row:                                                        ║
+ * ║          ✅ "เป็นสลิป — ตัดหนี้" → opens manual-process modal pre-filled         ║
+ * ║          ❌ "ไม่ใช่สลิป" → mark dismissed (silent, no customer reply)            ║
+ * ║          🔄 "Replay" → reuse existing /replay-slip endpoint (cached resp path)   ║
+ * ║                                                                                  ║
+ * ║    NEW REST endpoints:                                                           ║
+ * ║      GET  /dinoco-slip/v1/needs-review?days=30 — list pool entries               ║
+ * ║      POST /dinoco-slip/v1/review-decision      — mark is_slip|not_slip|deferred  ║
+ * ║      GET  /dinoco-slip/v1/pool-image?id={log_id} — image proxy (admin-only)      ║
+ * ║                                                                                  ║
+ * ║    NEW stat card: "รอ Review (30d)" between dup + err.                            ║
+ * ║                                                                                  ║
+ * ║    Companion: Snippet 1 V.34.16 (heuristic helper), Snippet 2 V.34.12 (pool      ║
+ * ║                save), Snippet 15 V.8.11 (schema + cleanup cron).                  ║
  * ║  Version: V.1.8 (2026-04-24) — Phase 4a registry adoption (Pillar 1):           ║
  * ║    • Self-register via `dinoco_register_admin_module()` at init priority 30.     ║
  * ║      key=slip_monitor, shortcode=dinoco_slip_monitor, section=b2b, cache_ttl=30. ║
@@ -180,6 +203,33 @@ add_action( 'rest_api_init', function () {
         'callback'            => 'dinoco_slip_monitor_rest_distributors',
         'permission_callback' => $perm_admin,
     ) );
+
+    // V.1.9: Needs Review Pool — list recent entries
+    register_rest_route( 'dinoco-slip/v1', '/needs-review', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_needs_review',
+        'permission_callback' => $perm_admin,
+    ) );
+
+    // V.1.9: Needs Review Pool — admin marks decision
+    register_rest_route( 'dinoco-slip/v1', '/review-decision', array(
+        'methods'             => 'POST',
+        'callback'            => 'dinoco_slip_monitor_rest_review_decision',
+        'permission_callback' => function ( WP_REST_Request $req ) {
+            return current_user_can( 'manage_options' )
+                && wp_verify_nonce( $req->get_header( 'X-WP-Nonce' ), 'wp_rest' );
+        },
+    ) );
+
+    // V.1.9: Needs Review Pool — image proxy (admin-only, admin reviews thumbnail)
+    // Pool images live under wp-content/uploads/slip-pool/ which is .htaccess-blocked
+    // for direct web access (PII protection). REST proxy verifies admin cap +
+    // streams file with original mime type.
+    register_rest_route( 'dinoco-slip/v1', '/pool-image', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_slip_monitor_rest_pool_image',
+        'permission_callback' => $perm_admin,
+    ) );
 } );
 
 // ────────────────────────────────────────────────────────────────
@@ -207,6 +257,8 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_get' ) ) {
             // error bucket (our system failure)
             'slip2go_error' => 0, 'line_api_error' => 0, 'data_missing' => 0,
             'unknown_slip_code' => 0, 'fatal_exception' => 0, 'empty_binary' => 0,
+            // V.1.9: classifier bucket — pre-filter heuristic + needs_review pool
+            'needs_review' => 0, 'not_slip_heuristic' => 0,
             // queue / routing
             'queued' => 0, 'not_slip' => 0, 'unregistered_group' => 0,
             'other' => 0,
@@ -969,6 +1021,263 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_replay_slip' ) ) {
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+// V.1.9: GET /needs-review?days=30 — list pool entries
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_needs_review' ) ) {
+    function dinoco_slip_monitor_rest_needs_review( WP_REST_Request $req ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $exists = (bool) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $table ) );
+        if ( ! $exists ) {
+            return rest_ensure_response( array( 'success' => true, 'rows' => array(), 'count' => 0, 'table_missing' => true ) );
+        }
+        // Schema check — image_path column may not exist on legacy installs
+        $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE table_schema = DATABASE() AND table_name = %s AND column_name = 'image_path'",
+            $table
+        ) );
+        if ( ! $col_exists ) {
+            return rest_ensure_response( array(
+                'success'        => true,
+                'rows'           => array(),
+                'count'          => 0,
+                'schema_missing' => true,
+                'note'           => 'Snippet 15 V.8.11+ ต้อง sync ก่อน — schema ยังไม่มี image_path/review_decision columns',
+            ) );
+        }
+
+        $days = max( 1, min( 90, (int) $req->get_param( 'days' ) ?: 30 ) );
+
+        // Pending (not yet reviewed) entries with image_path or status in needs_review/unknown_slip_code
+        // Bounded LIMIT 50 — pool UI is decisional, not analytical (use /recent for full audit).
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, group_id, message_id, user_id, dist_id, slip_code, amount, trans_ref, sender_name,
+                    result_status, error_code, error_msg, image_hash, image_mime, image_path,
+                    review_decision, reviewed_at, reviewed_by, created_at
+             FROM {$table}
+             WHERE result_status IN ('needs_review','unknown_slip_code')
+               AND review_decision IS NULL
+               AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+             ORDER BY id DESC
+             LIMIT 50",
+            $days
+        ), ARRAY_A );
+
+        // Enrich with dist_name (batch JOIN — not N+1)
+        $gids = array();
+        foreach ( $rows as $r ) { if ( ! empty( $r['group_id'] ) ) $gids[] = $r['group_id']; }
+        $name_map = function_exists( 'dinoco_slip_monitor_get_dist_names_batch' )
+            ? dinoco_slip_monitor_get_dist_names_batch( $gids )
+            : array();
+        foreach ( $rows as &$row ) {
+            $row['dist_name'] = isset( $name_map[ $row['group_id'] ] ) ? $name_map[ $row['group_id'] ] : '';
+            // Image proxy URL (admin-only via REST permission_callback)
+            if ( ! empty( $row['image_path'] ) ) {
+                $row['image_url'] = rest_url( 'dinoco-slip/v1/pool-image' ) . '?id=' . (int) $row['id'];
+            } else {
+                $row['image_url'] = '';
+            }
+        }
+        unset( $row );
+
+        // Total count for stat card
+        $count_30d = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$table}
+             WHERE result_status IN ('needs_review','unknown_slip_code')
+               AND review_decision IS NULL
+               AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
+        );
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'rows'    => $rows,
+            'count'   => count( $rows ),
+            'total_30d' => $count_30d,
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// V.1.9: POST /review-decision
+// Body: { log_id, decision: 'is_slip'|'not_slip', delete_image?: bool }
+// Note: 'is_slip' decision = informational only (admin still uses Manual Process tool
+//        separately to actually subtract debt). This endpoint is the audit-trail step.
+//        For not_slip: image is deleted from disk to free PII.
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_review_decision' ) ) {
+    function dinoco_slip_monitor_rest_review_decision( WP_REST_Request $req ) {
+        $uid = get_current_user_id();
+        // Rate limit 10/min/user (review actions are bursty during admin pool sweep)
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( 'slip_review_u' . $uid, 10, 60 );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error( 'rate_limit', 'เรียกบ่อยเกินไป (max 10/min)', array( 'status' => 429 ) );
+            }
+        }
+
+        $log_id   = (int) $req->get_param( 'log_id' );
+        $decision = sanitize_text_field( (string) $req->get_param( 'decision' ) );
+        $delete_image = (bool) $req->get_param( 'delete_image' );
+
+        if ( $log_id <= 0 ) {
+            return new WP_Error( 'bad_log_id', 'log_id ไม่ถูกต้อง', array( 'status' => 400 ) );
+        }
+        $allowed_decisions = array( 'is_slip', 'not_slip', 'manual_process' );
+        if ( ! in_array( $decision, $allowed_decisions, true ) ) {
+            return new WP_Error( 'bad_decision',
+                'decision ต้องเป็น is_slip|not_slip|manual_process',
+                array( 'status' => 400 ) );
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, image_path, review_decision FROM {$table} WHERE id = %d",
+            $log_id
+        ), ARRAY_A );
+        if ( ! $row ) {
+            return new WP_Error( 'not_found', 'ไม่พบ log row', array( 'status' => 404 ) );
+        }
+        if ( ! empty( $row['review_decision'] ) ) {
+            return new WP_Error( 'already_reviewed',
+                'รายการนี้ถูก review แล้วเมื่อ — ไม่สามารถเปลี่ยน decision ได้ (audit lock)',
+                array( 'status' => 409 ) );
+        }
+
+        // For 'not_slip' decision → delete image from disk (PII hygiene, no further use)
+        $image_deleted = false;
+        if ( $decision === 'not_slip' || $delete_image ) {
+            if ( ! empty( $row['image_path'] ) ) {
+                $uploads = wp_upload_dir();
+                if ( ! empty( $uploads['basedir'] ) ) {
+                    $rel = (string) $row['image_path'];
+                    // Defensive: reject path traversal
+                    if ( strpos( $rel, '..' ) === false && strpos( $rel, ':' ) === false ) {
+                        $abs = trailingslashit( $uploads['basedir'] ) . ltrim( $rel, '/' );
+                        if ( file_exists( $abs ) ) {
+                            $image_deleted = (bool) @unlink( $abs );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update DB row — atomic UPDATE
+        $upd_data = array(
+            'review_decision' => $decision,
+            'reviewed_at'     => current_time( 'mysql' ),
+            'reviewed_by'     => $uid,
+        );
+        $upd_fmt = array( '%s', '%s', '%d' );
+        // Null out image_path if file deleted
+        if ( $image_deleted ) {
+            $upd_data['image_path'] = null;
+            $upd_fmt[] = '%s';
+        }
+        $ok = $wpdb->update( $table, $upd_data, array( 'id' => $log_id ), $upd_fmt, array( '%d' ) );
+        if ( $ok === false ) {
+            return new WP_Error( 'db_error',
+                'อัพเดท DB ไม่สำเร็จ: ' . $wpdb->last_error,
+                array( 'status' => 500 ) );
+        }
+
+        // Forensic log via b2b_log + audit_log overlay (Phase 1.5)
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( '[SlipReview] decision=' . $decision . ' log_id=' . $log_id
+                . ' admin_uid=' . $uid . ' image_deleted=' . ( $image_deleted ? '1' : '0' ) );
+        }
+        if ( function_exists( 'dinoco_audit_log' ) ) {
+            dinoco_audit_log( array(
+                'event_type'     => 'slip_review_decision',
+                'actor_type'     => 'admin',
+                'actor_id'       => (string) $uid,
+                'target_type'    => 'slip_log',
+                'target_id'      => (string) $log_id,
+                'context_json'   => wp_json_encode( array(
+                    'decision' => $decision,
+                    'image_deleted' => $image_deleted,
+                ) ),
+                'success'        => 1,
+            ) );
+        }
+
+        return rest_ensure_response( array(
+            'success'       => true,
+            'log_id'        => $log_id,
+            'decision'      => $decision,
+            'image_deleted' => $image_deleted,
+            'message'       => $decision === 'is_slip'
+                ? 'บันทึกแล้ว — ใช้ Manual Process Tool เพื่อตัดหนี้จริง'
+                : ( $decision === 'manual_process'
+                    ? 'บันทึกแล้ว — ลิงก์กับ manual_process แล้ว'
+                    : 'บันทึกแล้ว — รูปถูกลบแล้ว (ไม่ใช่สลิป)' ),
+        ) );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// V.1.9: GET /pool-image?id={log_id} — image proxy (admin-only)
+// Streams pool image from wp-content/uploads/slip-pool/ (which is
+// .htaccess-blocked from public web access) with admin-only cap check.
+// ────────────────────────────────────────────────────────────────
+if ( ! function_exists( 'dinoco_slip_monitor_rest_pool_image' ) ) {
+    function dinoco_slip_monitor_rest_pool_image( WP_REST_Request $req ) {
+        $log_id = (int) $req->get_param( 'id' );
+        if ( $log_id <= 0 ) {
+            return new WP_Error( 'bad_id', 'id ต้องเป็นเลข log_id', array( 'status' => 400 ) );
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_slip_log';
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT image_path, image_mime FROM {$table} WHERE id = %d",
+            $log_id
+        ), ARRAY_A );
+        if ( ! $row || empty( $row['image_path'] ) ) {
+            return new WP_Error( 'no_image', 'ไม่พบรูปสำหรับ log นี้', array( 'status' => 404 ) );
+        }
+
+        $uploads = wp_upload_dir();
+        if ( empty( $uploads['basedir'] ) ) {
+            return new WP_Error( 'uploads_unset', 'wp_upload_dir basedir ไม่ตั้ง', array( 'status' => 500 ) );
+        }
+
+        $rel = (string) $row['image_path'];
+        // Defensive: reject path traversal + absolute paths
+        if ( strpos( $rel, '..' ) !== false || strpos( $rel, ':' ) !== false ) {
+            return new WP_Error( 'bad_path', 'path น่าสงสัย', array( 'status' => 400 ) );
+        }
+        $abs = trailingslashit( $uploads['basedir'] ) . ltrim( $rel, '/' );
+
+        // Ensure file is inside uploads/ (defense-in-depth — realpath check)
+        $real_uploads = realpath( $uploads['basedir'] );
+        $real_target  = realpath( $abs );
+        if ( ! $real_target || ! $real_uploads || strpos( $real_target, $real_uploads ) !== 0 ) {
+            return new WP_Error( 'bad_path', 'file path นอก uploads/', array( 'status' => 403 ) );
+        }
+        if ( ! file_exists( $abs ) ) {
+            return new WP_Error( 'file_missing', 'file ไม่อยู่บน disk แล้ว (อาจถูก cleanup cron ลบ)', array( 'status' => 410 ) );
+        }
+
+        $mime = $row['image_mime'] ?: 'image/jpeg';
+        // Whitelist mime types
+        if ( ! in_array( $mime, array( 'image/jpeg', 'image/png', 'image/webp' ), true ) ) {
+            $mime = 'image/jpeg';
+        }
+
+        // Stream file with caching headers (admin-only — short cache OK)
+        nocache_headers();
+        header( 'Content-Type: ' . $mime );
+        header( 'Content-Length: ' . filesize( $abs ) );
+        header( 'X-Content-Type-Options: nosniff' );
+        header( 'Content-Disposition: inline; filename="slip-pool-' . $log_id . '"' );
+        readfile( $abs );
+        exit;
+    }
+}
+
 // ════════════════════════════════════════════════════════════════
 // SHORTCODE: [dinoco_slip_monitor]
 // ════════════════════════════════════════════════════════════════
@@ -993,7 +1302,7 @@ add_action( 'init', function() {
         'cache_ttl'  => 30,
         'capability' => 'manage_options',
         'order'      => 50,
-        'source'     => '[Admin System] DINOCO Slip Monitor V.1.8',
+        'source'     => '[Admin System] DINOCO Slip Monitor V.1.9',
     ) );
 }, 30 );
 
@@ -1038,7 +1347,10 @@ function dinoco_slip_monitor_render() {
             .dnc-slip-monitor-wrap .dnc-slip-status.no_distributor { background: #f3e8ff; color: #6b21a8; }
             .dnc-slip-monitor-wrap .dnc-slip-status.queued,
             .dnc-slip-monitor-wrap .dnc-slip-status.not_slip,
+            .dnc-slip-monitor-wrap .dnc-slip-status.not_slip_heuristic,
             .dnc-slip-monitor-wrap .dnc-slip-status.unknown_slip_code { background: #f1f5f9; color: #475569; }
+            .dnc-slip-monitor-wrap .dnc-slip-status.needs_review { background: #cffafe; color: #155e75; }
+            .dnc-slip-monitor-wrap .dnc-slip-thumb:hover { box-shadow: 0 0 0 2px #06b6d4; }
             .dnc-slip-monitor-wrap .dnc-slip-btn { background: #dc2626; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600; }
             .dnc-slip-monitor-wrap .dnc-slip-btn:hover { background: #b91c1c; }
             .dnc-slip-monitor-wrap .dnc-slip-btn.neutral { background: #64748b; }
@@ -1067,6 +1379,7 @@ function dinoco_slip_monitor_render() {
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">สำเร็จ</div><div class="dnc-slip-stat-value ok" id="statPaid">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">ซ้ำ</div><div class="dnc-slip-stat-value warn" id="statDup">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Error (API)</div><div class="dnc-slip-stat-value bad" id="statErr">—</div></div>
+            <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">รอ Review (30d)</div><div class="dnc-slip-stat-value warn" id="statReview">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Unregistered</div><div class="dnc-slip-stat-value warn" id="statUnreg">—</div></div>
             <div class="dnc-slip-stat-card"><div class="dnc-slip-stat-label">Success rate</div><div class="dnc-slip-stat-value ok" id="statRate">—</div></div>
         </div>
@@ -1086,6 +1399,31 @@ function dinoco_slip_monitor_render() {
             <button class="dnc-slip-btn neutral" onclick="dncSlipMissedSweep(30)">Run sweep (30 วัน)</button>
             <button class="dnc-slip-btn neutral" onclick="dncSlipMissedSweep(7)">7 วัน</button>
             <div id="dncSlipMissed" style="margin-top:12px;"></div>
+        </div>
+
+        <div class="dnc-slip-section" style="border:2px solid #06b6d4; background:#ecfeff;">
+            <h3>🔍 Needs Review Pool — รูปที่ระบบไม่แน่ใจว่าเป็นสลิปหรือไม่</h3>
+            <div class="dnc-slip-banner" style="background:#cffafe; color:#155e75; border:1px solid #67e8f9; margin-bottom:12px;">
+                <strong>เกิดจาก:</strong> Slip2Go คืน code 200500/502/503 (OCR ไม่อ่าน) — รูปนี้อาจเป็นสลิปจริง
+                แต่ <em>หรืออาจเป็นรูปอื่น</em> เช่น โปสเตอร์ประกาศวันหยุด รูปคำถาม รูปสวัสดี<br>
+                <strong>วิธีใช้:</strong> ดูรูปแล้วเลือก
+                <span style="display:inline-block; padding:1px 6px; background:#16a34a; color:#fff; border-radius:3px; font-size:11px;">✅ เป็นสลิป</span>
+                (เปิด Manual Process แล้ว) /
+                <span style="display:inline-block; padding:1px 6px; background:#dc2626; color:#fff; border-radius:3px; font-size:11px;">❌ ไม่ใช่สลิป</span>
+                (ลบรูป + dismiss) /
+                <span style="display:inline-block; padding:1px 6px; background:#6366f1; color:#fff; border-radius:3px; font-size:11px;">🔄 Replay</span>
+                (ลองส่ง Slip2Go ใหม่)
+            </div>
+            <div style="display:flex; gap:8px; margin-bottom:8px;">
+                <button class="dnc-slip-btn neutral" onclick="dncSlipNeedsReview(7)">7 วัน</button>
+                <button class="dnc-slip-btn neutral" onclick="dncSlipNeedsReview(30)">30 วัน</button>
+            </div>
+            <div id="dncSlipNeedsReview" style="margin-top:12px;">Loading...</div>
+        </div>
+
+        <!-- Lightbox modal for full-size pool image -->
+        <div id="dncSlipLightbox" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:9999; justify-content:center; align-items:center; cursor:zoom-out;" onclick="dncSlipLightboxClose()">
+            <img id="dncSlipLightboxImg" src="" alt="" style="max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,0.5);">
         </div>
 
         <div class="dnc-slip-section" style="border:2px solid #f59e0b; background:#fffbeb;">
@@ -1189,6 +1527,19 @@ function dinoco_slip_monitor_render() {
             document.getElementById('statErr').textContent = errSum;
             document.getElementById('statUnreg').textContent = num(s.unregistered_group);
             document.getElementById('statRate').textContent = (Number.isFinite(resp.success_rate) ? resp.success_rate : 0) + '%';
+
+            // V.1.9: needs_review stat — fetch separately (small endpoint, cheap)
+            try {
+                const nr = await apiGet('/needs-review?days=30');
+                if (nr && nr.success) {
+                    const total = Number.isFinite(nr.total_30d) ? nr.total_30d : 0;
+                    document.getElementById('statReview').textContent = total;
+                } else {
+                    document.getElementById('statReview').textContent = 0;
+                }
+            } catch (e) {
+                document.getElementById('statReview').textContent = '—';
+            }
 
             // Banner
             let banner = '';
@@ -1541,15 +1892,171 @@ function dinoco_slip_monitor_render() {
             });
         });
 
+        // ═══════════════════════════════════════════════════════
+        // V.1.9: Needs Review Pool
+        // ═══════════════════════════════════════════════════════
+        window.dncSlipNeedsReview = async function(days) {
+            const container = document.getElementById('dncSlipNeedsReview');
+            container.innerHTML = '<p style="color:#64748b;">กำลังโหลด...</p>';
+            const r = await apiGet('/needs-review?days=' + days);
+            if (!r.success) {
+                container.innerHTML = '<div class="dnc-slip-banner bad">โหลดไม่สำเร็จ</div>';
+                return;
+            }
+            if (r.schema_missing) {
+                container.innerHTML = '<div class="dnc-slip-banner warn">' + esc(r.note || 'schema ยังไม่ migrate') + '</div>';
+                return;
+            }
+            if (!r.rows || r.rows.length === 0) {
+                container.innerHTML = '<p style="color:#16a34a; font-weight:600;">✅ ไม่มี รูปรอ Review ใน ' + days + ' วันที่ผ่านมา</p>';
+                return;
+            }
+            const trs = r.rows.map(row => {
+                const ageStr = row.created_at || '';
+                const codeBadge = row.slip_code ? '<span class="dnc-slip-code">code=' + esc(row.slip_code) + '</span>' : '';
+                const thumb = row.image_url
+                    ? '<img class="dnc-slip-thumb" data-img-url="' + esc(row.image_url) + '" src="' + esc(row.image_url) + '" alt="slip" style="width:64px; height:64px; object-fit:cover; border:1px solid #cbd5e1; border-radius:4px; cursor:zoom-in;" loading="lazy">'
+                    : '<span style="color:#94a3b8;">— ไม่มีรูป —</span>';
+                return '<tr>'
+                    + '<td>' + thumb + '</td>'
+                    + '<td>' + fmtDateTH(ageStr) + '</td>'
+                    + '<td>' + esc(row.dist_name || '<span style="color:#94a3b8;">(ไม่ระบุร้าน)</span>') + '</td>'
+                    + '<td><span class="dnc-slip-status ' + esc(row.result_status) + '">' + esc(row.result_status) + '</span><br>' + codeBadge + '</td>'
+                    + '<td><span class="dnc-slip-code">' + esc(String(row.error_msg || '').substr(0, 80)) + '</span></td>'
+                    + '<td style="white-space:nowrap;">'
+                        + '<button class="dnc-slip-btn dnc-slip-review-yes" data-log-id="' + row.id + '" style="background:#16a34a; margin-right:4px;">✅ เป็นสลิป</button>'
+                        + '<button class="dnc-slip-btn dnc-slip-review-no" data-log-id="' + row.id + '" style="margin-right:4px;">❌ ไม่ใช่</button>'
+                        + '<button class="dnc-slip-btn dnc-slip-review-replay" data-log-id="' + row.id + '" style="background:#6366f1;">🔄 Replay</button>'
+                    + '</td>'
+                + '</tr>';
+            }).join('');
+            container.innerHTML = ''
+                + '<div class="dnc-slip-banner warn">พบ <strong>' + r.count + '</strong> รายการ รอ Review (' + days + ' วัน)</div>'
+                + '<table class="dnc-slip-table">'
+                    + '<thead><tr><th>รูป</th><th>เวลา</th><th>ร้าน</th><th>Status</th><th>Reason</th><th>Action</th></tr></thead>'
+                    + '<tbody>' + trs + '</tbody>'
+                + '</table>';
+        };
+
+        window.dncSlipLightboxOpen = function(url) {
+            if (!url) return;
+            document.getElementById('dncSlipLightboxImg').src = url;
+            document.getElementById('dncSlipLightbox').style.display = 'flex';
+        };
+        window.dncSlipLightboxClose = function() {
+            document.getElementById('dncSlipLightbox').style.display = 'none';
+            document.getElementById('dncSlipLightboxImg').src = '';
+        };
+
+        // Click thumbnail → open lightbox
+        document.addEventListener('click', function(e) {
+            const img = e.target && e.target.closest ? e.target.closest('.dnc-slip-thumb') : null;
+            if (!img) return;
+            const url = img.dataset && img.dataset.imgUrl ? img.dataset.imgUrl : '';
+            window.dncSlipLightboxOpen(url);
+        });
+
+        // ESC to close lightbox
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape' && document.getElementById('dncSlipLightbox').style.display === 'flex') {
+                window.dncSlipLightboxClose();
+            }
+        });
+
+        // Submit review decision (is_slip / not_slip / manual_process)
+        async function submitReviewDecision(logId, decision, btn) {
+            const r = await apiPost('/review-decision', { log_id: logId, decision: decision });
+            if (r.success) {
+                if (btn && btn.closest('tr')) {
+                    btn.closest('tr').style.opacity = '0.4';
+                    btn.closest('tr').style.transition = 'opacity 0.4s';
+                }
+                // Refresh dashboard + pool list
+                setTimeout(function() {
+                    dncSlipMonitorRefresh();
+                    // Refresh active range — try 7d first, fall back to 30d
+                    dncSlipNeedsReview(30);
+                }, 500);
+                return true;
+            } else {
+                alert('❌ ' + (r.message || r.code || 'unknown error'));
+                return false;
+            }
+        }
+
+        // ✅ "เป็นสลิป" — pre-fill Manual Process Tool + scroll to it
+        document.addEventListener('click', function(e) {
+            const btn = e.target && e.target.closest ? e.target.closest('.dnc-slip-review-yes') : null;
+            if (!btn) return;
+            const logId = btn.dataset && btn.dataset.logId ? parseInt(btn.dataset.logId, 10) : 0;
+            if (!logId) return;
+            if (btn.disabled) return;
+            if (!confirm('✅ ยืนยันว่ารูปนี้เป็นสลิป?\n\nระบบจะ:\n• Mark log นี้ว่า is_slip (audit trail)\n• Scroll ไปที่ Manual Process Tool ด้านล่าง\n• คุณต้องกรอกยอด + ร้าน + เหตุผล แล้ว submit เพื่อตัดหนี้จริง\n\nกด OK เพื่อดำเนินการ')) return;
+            btn.disabled = true;
+            submitReviewDecision(logId, 'is_slip', btn).finally(function() {
+                if (document.body.contains(btn)) btn.disabled = false;
+                // Scroll to Manual Process Tool
+                const mp = document.querySelector('.dnc-slip-section h3');
+                const sections = document.querySelectorAll('.dnc-slip-section');
+                let target = null;
+                sections.forEach(function(sec) {
+                    const h = sec.querySelector('h3');
+                    if (h && h.textContent && h.textContent.indexOf('Manual Process') !== -1) target = sec;
+                });
+                if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            });
+        });
+
+        // ❌ "ไม่ใช่สลิป" — mark dismissed + delete image
+        document.addEventListener('click', function(e) {
+            const btn = e.target && e.target.closest ? e.target.closest('.dnc-slip-review-no') : null;
+            if (!btn) return;
+            const logId = btn.dataset && btn.dataset.logId ? parseInt(btn.dataset.logId, 10) : 0;
+            if (!logId) return;
+            if (btn.disabled) return;
+            if (!confirm('❌ ยืนยันว่ารูปนี้ไม่ใช่สลิป?\n\nระบบจะ:\n• Mark log นี้ว่า not_slip\n• ลบรูปออกจาก disk (PII hygiene)\n• ลูกค้าจะ ไม่ ได้รับ message อะไรเพิ่ม\n\nกด OK เพื่อดำเนินการ')) return;
+            btn.disabled = true;
+            submitReviewDecision(logId, 'not_slip', btn).finally(function() {
+                if (document.body.contains(btn)) btn.disabled = false;
+            });
+        });
+
+        // 🔄 Replay — reuse existing replay-slip endpoint
+        document.addEventListener('click', function(e) {
+            const btn = e.target && e.target.closest ? e.target.closest('.dnc-slip-review-replay') : null;
+            if (!btn) return;
+            const logId = btn.dataset && btn.dataset.logId ? parseInt(btn.dataset.logId, 10) : 0;
+            if (!logId) return;
+            if (btn.disabled) return;
+            if (!confirm('🔄 ยืนยัน replay log #' + logId + '?\n\nระบบจะส่ง Slip2Go ใหม่ (ใช้ cached response ถ้ามี).\n\nUseful เมื่อ Slip2Go ตอนแรก timeout/error และตอนนี้กลับมา normal แล้ว.')) return;
+            btn.disabled = true;
+            (async function() {
+                const r = await apiPost('/replay-slip', { log_id: logId });
+                if (r.success) {
+                    alert('✅ Replay triggered — ' + (r.message || ''));
+                    setTimeout(function() {
+                        dncSlipMonitorRefresh();
+                        dncSlipNeedsReview(30);
+                    }, 500);
+                } else {
+                    alert('❌ ' + (r.message || r.code || 'unknown error'));
+                }
+            })().finally(function() {
+                if (document.body.contains(btn)) btn.disabled = false;
+            });
+        });
+
         // Auto-load on page ready
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', function() {
                 dncSlipMonitorRefresh();
                 loadDistributors();
+                dncSlipNeedsReview(30); // V.1.9
             });
         } else {
             dncSlipMonitorRefresh();
             loadDistributors();
+            dncSlipNeedsReview(30); // V.1.9
         }
     })();
     </script>

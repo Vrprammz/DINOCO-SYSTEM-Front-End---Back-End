@@ -1,6 +1,31 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 2: LINE Webhook Gateway & Order System       ║
+ * ║  Version: V.34.14 (2026-04-26) — Image Pre-Filter + Needs Review Pool:                    ║
+ * ║    Production incident (post-V.34.11 deploy 2026-04-26): adding customer reply for      ║
+ * ║    Slip2Go codes 200500/200502/200503 ("รูปไม่ชัด ส่งใหม่") caused unintended UX —      ║
+ * ║    LINE groups receive ALL images, not just slips. Posters/banners/holiday              ║
+ * ║    announcements/customer question photos all triggered Slip2Go → 200500 → bot replied  ║
+ * ║    "รูปไม่ชัด ส่งใหม่" → confused customers (e.g. ClubMoto saw bot reply to a holiday    ║
+ * ║    announcement saying "ระบบตรวจสลิปไม่ผ่าน รูปอาจไม่ชัด...").                          ║
+ * ║                                                                                          ║
+ * ║    Fix (multi-layer slip detection):                                                     ║
+ * ║      1. PRE-FILTER (cost-free heuristic) — call b2b_slip_image_likely_slip() AFTER       ║
+ * ║         LINE Content download but BEFORE Slip2Go. confidence < 0.3 → silent skip         ║
+ * ║         (status=not_slip_heuristic, no customer reply, no Slip2Go quota burn).           ║
+ * ║         Permissive threshold = false negatives (real slips that fail) go to admin pool.  ║
+ * ║      2. SLIP2GO unchanged for confidence ≥ 0.3 — all existing branches intact.           ║
+ * ║      3. UNKNOWN CODE handling RECLASSIFIED: 200500/200502/200503 + unknown codes        ║
+ * ║         no longer reply customer. Instead: stash image_binary for admin review pool      ║
+ * ║         (status=needs_review for OCR-fail codes, unknown_slip_code for others) +        ║
+ * ║         dedup admin alert 1/hr/group + image saved to wp-content/uploads/slip-pool/.    ║
+ * ║      4. NEEDS REVIEW POOL UI (Slip Monitor V.1.9) — admin reviews thumbnails +          ║
+ * ║         3 actions per row: "✅ เป็นสลิป — ตัดหนี้" / "❌ ไม่ใช่สลิป" / "🔄 Replay".         ║
+ * ║                                                                                          ║
+ * ║    Companion: Snippet 1 V.34.16 (heuristic helper), Snippet 15 V.8.11 (schema +         ║
+ * ║                cleanup cron), Slip Monitor V.1.9 (review pool UI + 2 REST endpoints).    ║
+ * ║    Backward compat: REG-029-style — codes 200000/200200/200401/200402/200404/200501       ║
+ * ║      branches BYTE-IDENTICAL. Only `else` branch + new pre-filter added.                 ║
  * ║  Version: V.34.13 (2026-04-28) — Wave 2 audit Round 2 H6 (slip pipeline convergence): ║
  * ║    • Doc-only annotation on b2b_auto_mark_paid_after_slip(): slip pipeline drift       ║
  * ║      reduced at dedup + debt mutation layer (both paths now share                      ║
@@ -2565,6 +2590,9 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
     $_slip_api_response_raw = null;   // cached JSON string of slip2go response (any outcome)
     $_slip_replayed_from    = null;   // original log id if this run is a replay
     $_slip_replay_pool_enabled = (bool) get_option( 'b2b_slip_replay_pool_enabled', 1 ); // default ON
+    // V.34.14: Needs Review Pool — when Slip2Go returns OCR-fail or unknown codes,
+    // image is saved to disk so admin can view thumbnail in Slip Monitor pool UI.
+    $_slip_image_path       = null;   // relative path under wp-content/uploads/ (e.g. "slip-pool/2026-04/{hash}.jpg")
 
     // Helper: ถ้า reply_token ว่าง (queued slip) ใช้ push แทน
     $_slip_reply = function($msgs) use ($reply_token, $group_id) {
@@ -2638,6 +2666,54 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
     $slip_content_type = wp_remote_retrieve_header($response, 'content-type');
     $slip_mime = in_array($slip_content_type, array('image/jpeg','image/png','image/webp')) ? $slip_content_type : 'image/jpeg';
     $image_base64 = 'data:'.$slip_mime.';base64,' . base64_encode($image_binary);
+
+    // ═══════════════════════════════════════════════════════════════
+    // V.34.14: IMAGE PRE-FILTER — heuristic classifier BEFORE Slip2Go
+    // Goal: skip Slip2Go quota burn + avoid confusing customer replies for
+    //       obvious non-slip images (posters, banners, holiday announcements,
+    //       group chat screenshots). Cost-free — single getimagesize call.
+    // Threshold ≥ 0.3 → proceed (deliberately permissive — false negatives
+    //       go to admin pool via needs_review path below).
+    // Kill switch: wp_option b2b_slip_prefilter_enabled=0 → skip heuristic
+    // ═══════════════════════════════════════════════════════════════
+    $_slip_prefilter_enabled = (bool) get_option( 'b2b_slip_prefilter_enabled', 1 ); // default ON
+    if ( $_slip_prefilter_enabled && function_exists( 'b2b_slip_image_likely_slip' ) ) {
+        $pre_filter = b2b_slip_image_likely_slip( $image_binary, $slip_mime );
+        if ( is_array( $pre_filter ) && isset( $pre_filter['confidence'] )
+             && $pre_filter['confidence'] < 0.3 ) {
+            // Definitely not a slip — silent skip, no customer reply, no Slip2Go.
+            // Image still flows to slip_log for admin observability ("did we drop a real slip?").
+            if ( function_exists( 'b2b_log' ) ) {
+                $meta = isset( $pre_filter['metadata'] ) && is_array( $pre_filter['metadata'] )
+                    ? $pre_filter['metadata'] : array();
+                b2b_log( '[Slip] PRE-FILTER reject (silent): confidence='
+                    . $pre_filter['confidence']
+                    . ' reason=' . ( $pre_filter['reason'] ?? '-' )
+                    . ' w=' . ( $meta['width'] ?? '?' )
+                    . ' h=' . ( $meta['height'] ?? '?' )
+                    . ' size=' . ( $meta['size_bytes'] ?? '?' )
+                    . ' group=' . $group_id );
+            }
+            $_slip_final_status     = 'not_slip_heuristic';
+            $_slip_final_error_code = 'PREFILTER_REJECT';
+            $reason_str = isset( $pre_filter['reason'] ) ? (string) $pre_filter['reason'] : '';
+            $_slip_final_error_msg  = 'confidence=' . $pre_filter['confidence']
+                . ' reason=' . substr( $reason_str, 0, 400 );
+            // Compute hash + mime if helper available — keeps slip_log consistent
+            // with the rest of the pipeline (and lets future "false-positive prefilter"
+            // forensic queries find the row by hash).
+            if ( function_exists( 'b2b_slip_compute_image_hash' ) ) {
+                $_slip_image_hash = b2b_slip_compute_image_hash( $image_binary );
+                $_slip_image_mime = $slip_mime;
+            }
+            return; // finally block writes audit row + releases lock
+        }
+        // confidence ≥ 0.3 → proceed to replay cascade + Slip2Go
+        if ( function_exists( 'b2b_log' ) && is_array( $pre_filter ) ) {
+            b2b_log( '[Slip] PRE-FILTER pass: confidence=' . $pre_filter['confidence']
+                . ' reason=' . ( $pre_filter['reason'] ?? '-' ) );
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // V.34.10: SLIP REPLAY POOL — cascade lookup BEFORE hitting Slip2Go
@@ -3238,44 +3314,105 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
             $_slip_final_error_msg = 'Slip2Go คืนยอด ฿' . $paid . ' แต่ไม่เจอ distributor CPT';
         }
     } else {
-        // V.34.11: Unknown slip codes — กรณีที่เจอ:
-        //   200500 = "ตรวจสลิปไม่ผ่าน" (server-side OCR fail / image quality issue)
-        //   200502 = OCR ไม่อ่าน QR code ได้
-        //   200503 = ไม่พบสลิปใน metadata
-        //   อื่นๆ = unknown (แต่อย่างน้อยให้รู้ว่าระบบเจอ + แอดมินจะตรวจ)
-        // ก่อน V.34.11: เงียบ — ลูกค้าส่งสลิปแล้วงงไม่รู้สถานะ (KORAT case 25/04 ส่ง 2 ครั้ง = บัค UX)
+        // V.34.14: Unknown slip codes → NEEDS REVIEW POOL (no customer reply)
+        // Why: V.34.11 added customer reply for 200500/200502/200503 ("รูปไม่ชัด ส่งใหม่")
+        //      but in production, ALL images sent to a LINE group hit Slip2Go (posters,
+        //      banners, holiday announcements, customer questions, group greetings).
+        //      Slip2Go returns 200500 for all of those → bot replied "รูปไม่ชัด ส่งใหม่" →
+        //      confused customers (ClubMoto saw bot reply to a holiday poster!).
+        //
+        // Code semantics:
+        //   200500 = OCR fail / image quality issue   → could be slip OR not — REVIEW
+        //   200502 = QR code unreadable               → could be slip OR not — REVIEW
+        //   200503 = no slip metadata found           → could be slip OR not — REVIEW
+        //   other  = future Slip2Go behavior           → admin alert (no review needed yet)
+        //
+        // Action:
+        //   1. NO customer reply (silent) — admin reviews instead
+        //   2. Save image binary to wp-content/uploads/slip-pool/{YYYY-MM}/{hash}.{ext}
+        //      → Slip Monitor V.1.9 pool UI shows thumbnail + admin decides
+        //   3. Mark status = 'needs_review' (200500/502/503) or 'unknown_slip_code' (other)
+        //   4. Admin alert dedup 1/hr per group + code (avoid spam — pool is the workflow)
         $code = isset($slip['code']) ? $slip['code'] : 'UNKNOWN';
-        b2b_log('[Slip] Unknown code=' . $code . ' group=' . $group_id);
-        $_slip_final_status = 'unknown_slip_code';
-        $_slip_final_error_code = 'SLIP2GO_UNKNOWN_CODE';
-        $_slip_final_error_msg  = 'slip2go.code=' . $code;
+        $is_ocr_fail = ( $code === '200500' || $code === '200502' || $code === '200503' );
+        b2b_log('[Slip] Unknown code=' . $code . ' group=' . $group_id . ' → adding to review pool');
 
-        // Customer-facing message — bucket by code prefix
-        $customer_msg = '';
-        if ( $code === '200500' || $code === '200502' || $code === '200503' ) {
-            $customer_msg = "⚠️ ระบบตรวจสลิปไม่ผ่าน (รูปอาจไม่ชัด หรือ QR code อ่านไม่ได้)\n\n"
-                          . "กรุณาส่งรูปสลิปฉบับที่:\n"
-                          . "• คมชัด ไม่เบลอ\n"
-                          . "• เห็น QR code ครบ ไม่โดนตัด\n"
-                          . "• ไม่ใช่ภาพ screenshot ของ screenshot\n\n"
-                          . "หากยังไม่ได้ — แอดมินจะตรวจ manual ครับ";
+        if ( $is_ocr_fail ) {
+            $_slip_final_status     = 'needs_review';
+            $_slip_final_error_code = 'SLIP2GO_' . $code;
+            $_slip_final_error_msg  = 'slip2go.code=' . $code . ' (OCR fail — added to needs_review pool)';
         } else {
-            // Unknown code class — แจ้ง admin ทราบ ไม่ตอบลูกค้า (อาจไม่ใช่สลิปจริง)
-            $customer_msg = '';
+            $_slip_final_status     = 'unknown_slip_code';
+            $_slip_final_error_code = 'SLIP2GO_UNKNOWN_CODE';
+            $_slip_final_error_msg  = 'slip2go.code=' . $code . ' (added to needs_review pool)';
         }
-        if ( $customer_msg !== '' ) {
-            $_slip_reply_text( $customer_msg );
+
+        // Save image binary to disk for admin pool review (best-effort, never fatal)
+        // Path: wp-content/uploads/slip-pool/{YYYY-MM}/{first40_of_hash}.{ext}
+        // - hash-based naming = idempotent (same image re-sent = same file = no dup writes)
+        // - .htaccess in slip-pool/ blocks direct access (admin reviews via REST proxy
+        //   that escalates from REST nonce to file_get_contents)
+        try {
+            if ( ! empty( $image_binary ) && function_exists( 'wp_upload_dir' ) ) {
+                $uploads = wp_upload_dir();
+                if ( ! empty( $uploads['basedir'] ) ) {
+                    $ym = gmdate( 'Y-m' );
+                    $subdir = trailingslashit( $uploads['basedir'] ) . 'slip-pool/' . $ym;
+                    if ( ! is_dir( $subdir ) ) wp_mkdir_p( $subdir );
+
+                    // Auto-write .htaccess on first creation (deny direct access)
+                    $ht_path = trailingslashit( $uploads['basedir'] ) . 'slip-pool/.htaccess';
+                    if ( ! file_exists( $ht_path ) ) {
+                        @file_put_contents( $ht_path, "Order deny,allow\nDeny from all\n", LOCK_EX );
+                    }
+
+                    $ext = 'jpg';
+                    if ( strpos( (string) $slip_mime, 'png' ) !== false )  $ext = 'png';
+                    if ( strpos( (string) $slip_mime, 'webp' ) !== false ) $ext = 'webp';
+
+                    // Need image hash for filename — compute now if replay cascade didn't
+                    $local_hash = $_slip_image_hash;
+                    if ( empty( $local_hash ) && function_exists( 'b2b_slip_compute_image_hash' ) ) {
+                        $local_hash = b2b_slip_compute_image_hash( $image_binary );
+                        $_slip_image_hash = $local_hash;
+                        $_slip_image_mime = $slip_mime;
+                    }
+                    $filename = ( $local_hash ? substr( $local_hash, 0, 40 ) : 'pool_' . time() ) . '.' . $ext;
+                    $full_path = trailingslashit( $subdir ) . $filename;
+                    if ( ! file_exists( $full_path ) ) {
+                        @file_put_contents( $full_path, $image_binary, LOCK_EX );
+                    }
+                    if ( file_exists( $full_path ) ) {
+                        $_slip_image_path = 'slip-pool/' . $ym . '/' . $filename; // relative under uploads
+                        if ( function_exists( 'b2b_log' ) ) {
+                            b2b_log( '[Slip] Pool image saved: ' . $_slip_image_path . ' (' . strlen( $image_binary ) . ' bytes)' );
+                        }
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[Slip] Pool image save FAILED: ' . $e->getMessage() );
+            }
+            // continue — disk write fail is not fatal; admin can still see hash + code in slip_log
         }
-        // แจ้ง admin ทุก unknown code เพื่อ catch new Slip2Go behavior
+
+        // Admin alert dedup — 1/hr per (group, code) to avoid spam
+        // Pool itself is the workflow; alert is just a heads-up on first occurrence
         if ( function_exists( 'b2b_push_to_admin' ) ) {
-            b2b_push_to_admin(
-                "🔍 Slip2Go return code ที่ระบบไม่รู้จัก\n"
-                . "Code: " . $code . "\n"
-                . "Group: " . $group_id . "\n"
-                . "Time: " . current_time( 'mysql' ) . "\n"
-                . ( $customer_msg !== '' ? '(ตอบลูกค้าไปแล้ว)' : '(ไม่ตอบลูกค้า — ตรวจว่าเป็นสลิปจริงไหม)' )
-            );
+            $alert_key = 'b2b_slip_pool_alert_' . md5( $group_id . '|' . $code );
+            if ( ! get_transient( $alert_key ) ) {
+                set_transient( $alert_key, 1, HOUR_IN_SECONDS );
+                b2b_push_to_admin(
+                    "🔍 รูปจากกลุ่มลูกค้าที่ Slip2Go ไม่อ่าน (อาจเป็นสลิป OR ไม่ใช่สลิป)\n"
+                    . "Code: " . $code . "\n"
+                    . "Group: " . $group_id . "\n"
+                    . "Time: " . current_time( 'mysql' ) . "\n\n"
+                    . "→ ตรวจ Slip Monitor → 🔍 Needs Review Pool"
+                );
+            }
         }
+        // NO customer reply — pool workflow is the resolution path
     }
 
     } catch ( \Throwable $e ) {
@@ -3323,6 +3460,8 @@ function b2b_handle_slip_image( $message_id, $group_id, $user_id, $reply_token, 
                     'image_mime'           => $_slip_image_mime,
                     'slip2go_response'     => $_slip_api_response_raw, // string (JSON) or null
                     'replayed_from_log_id' => $_slip_replayed_from,
+                    // V.34.14: Needs Review Pool — relative path to saved image (or null)
+                    'image_path'           => $_slip_image_path,
                 ) );
             }
         } catch ( \Throwable $e ) { /* silent */ }

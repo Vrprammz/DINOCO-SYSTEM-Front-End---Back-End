@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.16 (2026-04-26) — Image Pre-Filter Heuristic (slip classifier):           ║
+ * ║    • NEW b2b_slip_image_likely_slip($binary, $mime) — zero-cost heuristic to detect     ║
+ * ║      whether an image is likely a payment slip BEFORE calling Slip2Go API. Returns       ║
+ * ║      ['confidence'=>0.0-1.0, 'reason'=>diagnostic_string, 'metadata'=>{w,h,ratio,size}]. ║
+ * ║      Caller skips Slip2Go (saves quota + prevents confusing customer reply for          ║
+ * ║      Slip2Go OCR-fail codes 200500/200502/200503 on non-slip images like posters,        ║
+ * ║      banners, holiday announcements). Threshold ≥0.3 = proceed to Slip2Go.               ║
+ * ║      Heuristics: aspect ratio (mobile screenshot 1.4-2.7 portrait), file size            ║
+ * ║      (typical slip 50KB-800KB), dimensions (600-1200 wide), landscape penalty.           ║
+ * ║      Companion: Snippet 2 V.34.12 (pre-filter call site) + Slip Monitor V.1.9            ║
+ * ║      (needs_review pool UI when classifier is uncertain post-Slip2Go).                   ║
  * ║  Version: V.34.15 (2026-04-24) — Phase 2 Pillar 2 transaction wrapper showcase:        ║
  * ║    • b2b_slip_apply_to_invoices: outer orchestration migrated to dinoco_transaction()  ║
  * ║      when [Admin System] DINOCO Transaction Wrapper snippet is loaded. validate phase  ║
@@ -1116,6 +1127,11 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             'image_mime'           => null,
             'slip2go_response'     => null,
             'replayed_from_log_id' => null,
+            // V.34.16: Needs Review Pool field (nullable — relative path under wp-uploads/)
+            'image_path'           => null,
+            'review_decision'      => null,    // 'is_slip' | 'not_slip' | 'manual_process' | NULL
+            'reviewed_at'          => null,
+            'reviewed_by'          => null,
             'created_at'         => current_time( 'mysql' ),
         );
         $row = array_merge( $defaults, is_array( $row ) ? $row : array() );
@@ -1156,10 +1172,47 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             if ( $row['replayed_from_log_id'] <= 0 ) $row['replayed_from_log_id'] = null;
         }
 
+        // V.34.16: Needs Review Pool — normalize new fields (defensive truncation)
+        if ( $row['image_path'] !== null ) {
+            $row['image_path'] = substr( (string) $row['image_path'], 0, 255 );
+            if ( $row['image_path'] === '' ) $row['image_path'] = null;
+        }
+        if ( $row['review_decision'] !== null ) {
+            $rd = (string) $row['review_decision'];
+            $allowed = array( 'is_slip', 'not_slip', 'manual_process' );
+            if ( ! in_array( $rd, $allowed, true ) ) $rd = '';
+            $row['review_decision'] = ( $rd === '' ) ? null : $rd;
+        }
+        if ( $row['reviewed_by'] !== null ) {
+            $row['reviewed_by'] = (int) $row['reviewed_by'];
+            if ( $row['reviewed_by'] <= 0 ) $row['reviewed_by'] = null;
+        }
+        // reviewed_at: pass-through string, NULL on empty
+
+        // Schema-aware INSERT — wpdb->insert tolerates extra keys ONLY if they match
+        // existing columns. Schema bump V.8.11 (Snippet 15) adds image_path / review_decision /
+        // reviewed_at / reviewed_by — but if Snippet 15 hasn't synced yet, we need to drop
+        // those keys to avoid INSERT fail. Probe column existence once per request.
+        static $sl_extra_cols_exist = null;
+        if ( $sl_extra_cols_exist === null ) {
+            $cols_check = $wpdb->get_col( $wpdb->prepare(
+                "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE table_schema = DATABASE() AND table_name = %s
+                   AND column_name IN ('image_path','review_decision','reviewed_at','reviewed_by')",
+                $table
+            ) );
+            $sl_extra_cols_exist = is_array( $cols_check ) && count( $cols_check ) === 4;
+        }
+        if ( ! $sl_extra_cols_exist ) {
+            unset( $row['image_path'], $row['review_decision'], $row['reviewed_at'], $row['reviewed_by'] );
+        }
+
         // V.34.9 M-7: explicit $format array matching schema (prevents STRICT-mode write failures
         // + ensures nullable fields serialize correctly)
         // V.34.12: format extended to match 4 new trailing columns before created_at
-        // Column order must match $defaults order above
+        // V.34.16: +4 columns (image_path / review_decision / reviewed_at / reviewed_by) — only
+        //          included when schema is bumped (sl_extra_cols_exist=true).
+        // Column order must match $defaults order above (keys MUST be sequential per insert call)
         $format = array(
             '%s', // group_id
             '%s', // message_id
@@ -1179,8 +1232,14 @@ if ( ! function_exists( 'b2b_slip_log_insert' ) ) {
             '%s', // image_mime (V.34.12, nullable)
             '%s', // slip2go_response (V.34.12, nullable — MEDIUMTEXT)
             '%d', // replayed_from_log_id (V.34.12, nullable)
-            '%s', // created_at (MySQL datetime)
         );
+        if ( $sl_extra_cols_exist ) {
+            $format[] = '%s'; // image_path (V.34.16, nullable)
+            $format[] = '%s'; // review_decision (V.34.16, nullable enum-like)
+            $format[] = '%s'; // reviewed_at (V.34.16, nullable datetime)
+            $format[] = '%d'; // reviewed_by (V.34.16, nullable user_id)
+        }
+        $format[] = '%s'; // created_at (MySQL datetime — always last)
 
         $ok = $wpdb->insert( $table, $row, $format );
         if ( $ok === false ) {
@@ -1387,6 +1446,157 @@ if ( ! function_exists( 'b2b_slip_compute_image_hash' ) ) {
     function b2b_slip_compute_image_hash( $binary ) {
         if ( empty( $binary ) || ! is_string( $binary ) ) return '';
         return hash( 'sha256', $binary );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.34.16: IMAGE PRE-FILTER — heuristic slip classifier (zero-cost)
+// Purpose: skip Slip2Go API call for obvious non-slip images.
+//          Saves quota + prevents confusing customer reply on Slip2Go
+//          OCR-fail codes (200500/200502/200503) when image is actually
+//          a poster, banner, screenshot, holiday announcement, etc.
+//
+// Tuning rationale:
+//   - Real Thai bank slips are mobile screenshots (KKP/SCB/KBANK etc)
+//     → ratio = h/w typically 1.4-2.7 (portrait), w typically 720-1080
+//     → file size typically 50KB-800KB (PNG/JPEG/WebP screenshot)
+//   - False positives we want to catch:
+//     * Landscape posters/banners (ratio < 1.0) → -0.5 penalty
+//     * Tiny thumbnails (<30KB) → -0.3 penalty
+//     * High-res DSLR photos (>2MB) → -0.2 penalty
+//     * Group chat screenshots showing cropped images
+//   - False negatives we MUST avoid (real slips that fail heuristic):
+//     * Some banks generate slip ratio = 1.3-1.5 (wider) → still pass at 0.3
+//     * Tightly-cropped slips with file size <30KB → -0.3 penalty acceptable
+//       (Slip2Go would also fail on those — admin pool catches them anyway)
+//
+// Threshold contract: caller proceeds to Slip2Go if confidence >= 0.3
+//                     (deliberate low bar — false negatives go to admin pool)
+// ═══════════════════════════════════════════════════════════════
+if ( ! function_exists( 'b2b_slip_image_likely_slip' ) ) {
+    /**
+     * Heuristic check — is this image likely a payment slip?
+     *
+     * @param string $binary raw image bytes
+     * @param string $mime   detected MIME type (image/jpeg|png|webp)
+     * @return array {
+     *     @type float  $confidence  0.0-1.0 score (>= 0.3 → proceed to Slip2Go)
+     *     @type string $reason      human-readable diagnostic
+     *     @type array  $metadata    { width, height, ratio, size_bytes, mime }
+     * }
+     */
+    function b2b_slip_image_likely_slip( $binary, $mime = '' ) {
+        $size_bytes = is_string( $binary ) ? strlen( $binary ) : 0;
+        $result = array(
+            'confidence' => 0.0,
+            'reason'     => '',
+            'metadata'   => array(
+                'width'      => 0,
+                'height'     => 0,
+                'ratio'      => 0,
+                'size_bytes' => $size_bytes,
+                'mime'       => (string) $mime,
+            ),
+        );
+
+        if ( $size_bytes === 0 ) {
+            $result['reason'] = 'empty binary';
+            return $result;
+        }
+
+        // Probe dimensions via getimagesizefromstring (PHP 5.4+, ~5ms typical).
+        // Defensive: function may be missing in stripped PHP builds.
+        if ( ! function_exists( 'getimagesizefromstring' ) ) {
+            // No GD/getimagesize → cannot probe → default permissive (let Slip2Go decide)
+            $result['confidence'] = 0.5;
+            $result['reason']     = 'getimagesizefromstring unavailable (permissive)';
+            return $result;
+        }
+
+        // Suppress warnings — corrupted images return false silently
+        $img_info = @getimagesizefromstring( $binary );
+        if ( ! is_array( $img_info ) || empty( $img_info[0] ) || empty( $img_info[1] ) ) {
+            $result['reason'] = 'cannot decode image dimensions';
+            // Could be corrupt/non-image bytes — confidence very low
+            $result['confidence'] = 0.1;
+            return $result;
+        }
+
+        $w = (int) $img_info[0];
+        $h = (int) $img_info[1];
+        if ( $w <= 0 || $h <= 0 ) {
+            $result['reason'] = 'invalid dimensions';
+            return $result;
+        }
+        $ratio = $h / $w;
+        $result['metadata']['width']  = $w;
+        $result['metadata']['height'] = $h;
+        $result['metadata']['ratio']  = round( $ratio, 3 );
+
+        // ═══ Scoring ═══
+        $score   = 0.0;
+        $reasons = array();
+
+        // (1) Aspect ratio — typical mobile slip screenshot is portrait 1.4-2.7
+        if ( $ratio >= 1.4 && $ratio <= 2.7 ) {
+            $score += 0.4;
+            $reasons[] = 'portrait_ok(' . $result['metadata']['ratio'] . ')';
+        } elseif ( $ratio >= 1.1 && $ratio < 1.4 ) {
+            // Slightly wider portrait (some bank apps) — partial credit
+            $score += 0.2;
+            $reasons[] = 'portrait_borderline';
+        } elseif ( $ratio < 1.0 ) {
+            // Landscape — almost certainly poster/banner/photo
+            $score -= 0.5;
+            $reasons[] = 'landscape(-0.5)';
+        } else {
+            // ratio between 1.0 and 1.1 = nearly square — weak signal
+            $reasons[] = 'square_weak';
+        }
+
+        // (2) File size — typical screenshot 50KB-800KB
+        if ( $size_bytes >= 50 * 1024 && $size_bytes <= 800 * 1024 ) {
+            $score += 0.3;
+            $reasons[] = 'size_ok(' . round( $size_bytes / 1024 ) . 'KB)';
+        } elseif ( $size_bytes < 30 * 1024 ) {
+            // Very small — likely thumbnail
+            $score -= 0.3;
+            $reasons[] = 'tiny(' . round( $size_bytes / 1024 ) . 'KB,-0.3)';
+        } elseif ( $size_bytes > 2 * 1024 * 1024 ) {
+            // Very large — likely DSLR photo not screenshot
+            $score -= 0.2;
+            $reasons[] = 'huge(' . round( $size_bytes / 1024 / 1024, 1 ) . 'MB,-0.2)';
+        } else {
+            // 30-50KB or 800KB-2MB = borderline
+            $score += 0.1;
+            $reasons[] = 'size_borderline';
+        }
+
+        // (3) Width range — typical mobile screenshot 600-1300 px wide
+        if ( $w >= 600 && $w <= 1300 ) {
+            $score += 0.3;
+            $reasons[] = 'width_ok(' . $w . 'px)';
+        } elseif ( $w < 400 ) {
+            // Tiny image — likely thumbnail
+            $score -= 0.2;
+            $reasons[] = 'narrow(' . $w . 'px,-0.2)';
+        } elseif ( $w > 2400 ) {
+            // Very wide — likely DSLR photo or desktop screenshot
+            $score -= 0.2;
+            $reasons[] = 'extra_wide(' . $w . 'px,-0.2)';
+        } else {
+            // 400-600 or 1300-2400 = borderline
+            $score += 0.1;
+            $reasons[] = 'width_borderline';
+        }
+
+        // Clamp 0.0-1.0
+        if ( $score < 0 ) $score = 0;
+        if ( $score > 1 ) $score = 1;
+
+        $result['confidence'] = round( $score, 2 );
+        $result['reason']     = implode( ', ', $reasons );
+        return $result;
     }
 }
 
