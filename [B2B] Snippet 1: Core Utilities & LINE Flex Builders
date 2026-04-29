@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.23 (2026-04-29) — Flash V.42 G4: async snapshot defer (HIGH-2 close):  ║
+ * ║    • b2b_order_status_changed listener at priority 9 now does cheap precheck only      ║
+ * ║      (flag/walk-in/snapshot exists?) + schedules wp_schedule_single_event(              ║
+ * ║      'dinoco_v42_snapshot_async', $order_id) — returns instantly.                       ║
+ * ║    • New named function dinoco_v42_run_snapshot($order_id) executes heavy work          ║
+ * ║      (b2b_calculate_box_manifest + dinoco_snapshot_ticket_shipping) in separate         ║
+ * ║      WP-Cron request. GET_LOCK + idempotency preserved inside async handler.            ║
+ * ║    • `paid` transition no longer blocked on 100+ item orders (Round 4-8 HIGH-2).        ║
+ * ║      If admin races Flash create before async fires, dispatcher falls back to live      ║
+ * ║      resolver dinoco_resolve_manifest_shipping() — same end result.                     ║
+ * ║    • Snapshot still immutable — used by /manual-reprint + priority chain (spec §4.3).   ║
  * ║  Version: V.34.22 (2026-04-29) — G2 follow-up B5: enrich audit row for 1003 trace:    ║
  * ║    • wp_dinoco_flash_audit.request_summary now includes 3 G2-specific fields:           ║
  * ║      original_out_trade_no (pre-mutation), g2_attempts (closure invocation count),      ║
@@ -8188,7 +8199,16 @@ if ( function_exists( 'dinoco_register_cron' ) ) {
 // don't exist in FSM (Snippet 14) — hook was dead code from V.34.2 until now.
 // FSM flow: awaiting_confirm → paid → packed (Flash create) → shipped → completed
 // Idempotent — skips if _flash_shipping_snapshot meta already exists.
-// Priority 9 — before Flash create listener at priority 10.
+//
+// G4 (V.34.23 / 2026-04-29) — ASYNC DEFER:
+//   Sync listener now ONLY does cheap precheck (flag/walk-in/helper presence) +
+//   schedules wp_schedule_single_event('dinoco_v42_snapshot_async', $order_id).
+//   Heavy work (b2b_calculate_box_manifest + dinoco_snapshot_ticket_shipping)
+//   runs in separate WP-Cron request — `paid` transition no longer blocked
+//   by 100+ item orders (HIGH-2 from Round 4-8 audit).
+//   Idempotency + GET_LOCK preserved inside async handler.
+//   If admin races Flash create before async fires, dispatcher falls back to
+//   live resolver (dinoco_resolve_manifest_shipping) — same end result.
 add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_status ) {
     if ( $new_status !== 'paid' ) return;
     if ( ! function_exists( 'dinoco_snapshot_ticket_shipping' ) ) return;
@@ -8200,12 +8220,45 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
     if ( ! $_v42_on ) return;
     // Walk-in bypass (decision #15)
     if ( (int) get_post_meta( $order_id, '_b2b_is_walkin', true ) === 1 ) return;
+    // Skip if snapshot already exists (cheap meta read — saves cron schedule overhead)
+    if ( get_post_meta( $order_id, '_flash_shipping_snapshot', true ) ) return;
+
+    // G4: schedule async snapshot — args MUST be array for wp_schedule_single_event.
+    // Use 0 delay so WP-Cron picks up on next request (typically ~5-30s).
+    // wp_next_scheduled returns false if not scheduled yet — prevents duplicate
+    // events when paid transition fires multiple times (e.g. retry).
+    if ( ! wp_next_scheduled( 'dinoco_v42_snapshot_async', array( (int) $order_id ) ) ) {
+        wp_schedule_single_event( time(), 'dinoco_v42_snapshot_async', array( (int) $order_id ) );
+        if ( function_exists( 'b2b_log' ) ) {
+            b2b_log( "[V42 Snapshot] ticket={$order_id} scheduled async snapshot (paid transition)" );
+        }
+    }
+}, 9, 3 );
+
+// G4: async handler — heavy snapshot work runs in separate WP-Cron request.
+// Idempotency + GET_LOCK preserved (multiple cron workers safe). Same error
+// handling as previous synchronous version.
+add_action( 'dinoco_v42_snapshot_async', 'dinoco_v42_run_snapshot', 10, 1 );
+
+if ( ! function_exists( 'dinoco_v42_run_snapshot' ) ) {
+function dinoco_v42_run_snapshot( $order_id ) {
+    $order_id = (int) $order_id;
+    if ( ! $order_id ) return;
+    if ( ! function_exists( 'dinoco_snapshot_ticket_shipping' ) ) return;
+
+    // Re-check feature flag (could have been disabled between schedule + execute)
+    $_v42_on = function_exists( 'dinoco_config' )
+        ? (bool) dinoco_config( 'inventory.shipping_meta_enabled', false )
+        : ( get_option( 'dinoco_shipping_meta_enabled', '0' ) === '1' );
+    if ( ! $_v42_on ) return;
+    // Re-check walk-in (defensive — meta could change theoretically)
+    if ( (int) get_post_meta( $order_id, '_b2b_is_walkin', true ) === 1 ) return;
 
     // C-Conc-1: Atomic MySQL GET_LOCK (replaces check-then-set transient pattern).
     // Two workers can both pass `get_transient → false` milliseconds apart — only
     // GET_LOCK serializes across PHP processes.
     global $wpdb;
-    $lock_name = 'flash_snap_' . (int) $order_id;
+    $lock_name = 'flash_snap_' . $order_id;
     $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 0)", $lock_name ) );
     if ( $got_lock !== 1 ) return; // another worker holds it
 
@@ -8232,7 +8285,7 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
         }
 
         dinoco_snapshot_ticket_shipping( $order_id, $manifest_enriched );
-        if ( function_exists( 'b2b_log' ) ) b2b_log( "[V42 Snapshot] ticket={$order_id} snapshotted " . count( $manifest_enriched ) . " manifest entries" );
+        if ( function_exists( 'b2b_log' ) ) b2b_log( "[V42 Snapshot] ticket={$order_id} snapshotted " . count( $manifest_enriched ) . " manifest entries (async)" );
     } catch ( \Throwable $e ) {
         // V.34.9 M-1: catch Throwable (covers PHP 7+ Error + TypeError) —
         // malformed manifest from b2b_calculate_box_manifest can throw TypeError
@@ -8273,7 +8326,8 @@ add_action( 'b2b_order_status_changed', function( $order_id, $old_status, $new_s
     } finally {
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
     }
-}, 9, 3 );
+}
+} // end function_exists guard for dinoco_v42_run_snapshot
 
 // ───────────────────────────────────────────────────────────────────
 // b2b_flash_create_order_v42() — V.42-aware order creator
