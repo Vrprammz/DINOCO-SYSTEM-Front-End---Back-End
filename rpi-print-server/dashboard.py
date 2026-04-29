@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.44.0
+DINOCO B2B -- RPi Print Server Dashboard  V.44.2
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
+
+V.44.2 (2026-04-29) — SKU auto-fill diagnostics:
+    - _auto_fill_from_sku now logs HTTP status + WP reason field to journalctl
+      so admin can diagnose 401 (auth) vs not_in_catalog vs inventory_not_loaded
+    - Returns richer diagnostic fields (http_status, reason, error) — frontend
+      manual_ship.html V.44.2 surfaces these in warning banner with hint copy
+    - Pairs with Snippet 3 V.42.9 (rpi-sku-shipping endpoint) + V.44.1 client switch.
+
+V.44.1 (2026-04-29) — RPi SKU shipping resolver via X-Print-Key proxy:
+    - Switched _auto_fill_from_sku, api_sku_shipping_scanner, api_sku_shipping_full
+      from /dinoco-stock/v1/sku-shipping-scanner/{sku} (nonce-strict) to new
+      /b2b/v1/rpi-sku-shipping/{sku} (X-Print-Key auth via Snippet 3 V.42.9).
+    - Old path silently failed (X-WP-Nonce: api_key spoof rejected by wp_verify_nonce).
 
 V.44.0 (2026-04-29) — Manual Shipping full redesign + product picker:
     - NEW /api/product-search proxy → /b2b/v1/rpi-products (X-Print-Key auth, slim
@@ -1311,7 +1324,11 @@ def api_sku_shipping_full(sku):
 def _auto_fill_from_sku(sku):
     """Native helper — used by manual_ship form auto-fill on scan.
 
-    V.44.1 (2026-04-29): switched to /b2b/v1/rpi-sku-shipping/{sku} (X-Print-Key auth)
+    V.44.2 (2026-04-29): richer diagnostic — log HTTP status + WP reason field
+    so journalctl shows exactly which failure mode (auth vs not_in_catalog vs
+    inventory_not_loaded). Frontend (manual_ship.html V.44.2) surfaces these
+    fields in the warning banner so admin can self-diagnose.
+    V.44.1: switched to /b2b/v1/rpi-sku-shipping/{sku} (X-Print-Key auth)
     instead of /dinoco-stock/v1/sku-shipping-scanner/{sku} (nonce-strict via $scanner_perm).
     Old path spoofed `X-WP-Nonce: api_key` → wp_verify_nonce() rejected → silent 403
     → manual_ship form ไม่ auto-fill. New rpi-sku-shipping proxy ใน Snippet 3 V.42.9
@@ -1319,22 +1336,41 @@ def _auto_fill_from_sku(sku):
     See CLAUDE.md "RPi → WP namespace pattern" — V.44.0 lesson + V.42.9 fix.
 
     Returns: {weight_g, length_cm, width_cm, height_cm, express_category,
-             article_category, pack_mode, box_template_id, found: bool}
+             article_category, pack_mode, box_template_id, found: bool,
+             http_status, reason, error, name}
     """
     if not sku:
-        return {'found': False}
+        return {'found': False, 'reason': 'empty_sku'}
     config = load_config()
     sku = str(sku).strip().upper()
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
         api_key = config.get('api_key', '')
+        if not wp_url or not api_key:
+            logger.warning(f'[V.44.2] _auto_fill_from_sku: missing wp_url or api_key in config')
+            return {'found': False, 'reason': 'config_missing', 'error': 'missing_wp_url_or_api_key'}
         url = f'{wp_url}/wp-json/b2b/v1/rpi-sku-shipping/{sku}'
         resp = http_requests.get(url, headers={'X-Print-Key': api_key}, timeout=8)
         if not resp.ok:
-            return {'found': False, 'http_status': resp.status_code}
+            # V.44.2: log full status + first 200 chars of body for diagnosis
+            try:
+                body_preview = (resp.text or '')[:200]
+            except Exception:
+                body_preview = '<unreadable>'
+            logger.warning(f'[V.44.2] _auto_fill_from_sku non-OK sku={sku} http={resp.status_code} body={body_preview}')
+            # Try to parse reason from JSON error response
+            reason = None
+            try:
+                err = resp.json() or {}
+                reason = err.get('code') or err.get('reason') or err.get('message')
+            except Exception:
+                pass
+            return {'found': False, 'http_status': resp.status_code, 'reason': reason or f'http_{resp.status_code}'}
         body = resp.json() or {}
         if not body.get('ok'):
-            return {'found': False, 'reason': body.get('reason', 'not_in_catalog')}
+            reason = body.get('reason', 'not_in_catalog')
+            logger.info(f'[V.44.2] _auto_fill_from_sku not_found sku={sku} reason={reason}')
+            return {'found': False, 'reason': reason, 'http_status': 200}
         ship = body.get('shipping', {})
         return {
             'found': True,
