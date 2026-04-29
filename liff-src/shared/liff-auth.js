@@ -6,23 +6,45 @@
  * auth endpoint → backend verifies via LINE's `/oauth2/v2.1/verify` →
  * backend returns a short-lived session token (JWT or HMAC).
  *
- * Endpoints by surface:
- *   - B2B      → POST /wp-json/b2b/v1/auth             (X-B2B-Session)
- *   - B2F      → POST /wp-json/b2f/v1/auth-admin       (X-B2F-Token)
- *   - LIFF AI  → POST /wp-json/liff-ai/v1/auth         (X-LIFF-AI-Token)
+ * Endpoints by surface (verified against production register_rest_route):
+ *   - B2B      → POST /wp-json/b2b/v1/auth-group       (X-B2B-Token header)
+ *                Requires HMAC params (_sig, _ts, group_id) from LIFF URL.
+ *                Caller must pull these from window.location.search and
+ *                pass via `extra`. See [B2B] Snippet 3 line 460+ for the
+ *                full param list. Without _sig+_ts the endpoint returns
+ *                `authorized:false`.
+ *   - B2F      → POST /wp-json/b2f/v1/auth-admin       (X-B2F-Token header)
+ *                Requires HMAC params (_sig, _ts, optionally _uid) from
+ *                LIFF URL. Same pattern as B2B — pass via `extra`.
+ *                See [B2F] Snippet 2 line 455+ for handler.
+ *   - LIFF AI  → POST /wp-json/liff-ai/v1/auth         (X-LIFF-AI-Token header)
+ *                NO HMAC required. id_token + line_user_id is enough.
+ *                LIFF AI relies on LINE id_token verify as primary auth.
+ *                See [LIFF AI] Snippet 1 line 255+.
  *
- * Usage:
- *   import { liffAuth } from "../../shared/liff-auth.js";
+ * Default payload (always sent):
+ *   id_token, line_user_id, display_name, picture_url
+ *   + group_id, context_type when withContext=true (default)
  *
+ * Usage (LIFF AI — simple case):
+ *   const session = await liffAuth({
+ *       liffId: window.LIFF_AI_ID,
+ *       authEndpoint: "/wp-json/liff-ai/v1/auth",
+ *   });
+ *
+ * Usage (B2B / B2F — HMAC case, caller forwards URL params):
+ *   const url = new URL(window.location.href);
  *   const session = await liffAuth({
  *       liffId: window.B2B_LIFF_ID,
- *       authEndpoint: "/wp-json/b2b/v1/auth",
+ *       authEndpoint: "/wp-json/b2b/v1/auth-group",
+ *       extra: {
+ *           _sig: url.searchParams.get("_sig"),
+ *           _ts:  url.searchParams.get("_ts"),
+ *           group_id: url.searchParams.get("group_id"),
+ *       },
  *   });
- *   if (!session?.authorized) {
- *       showAuthError();
- *       return;
- *   }
- *   // pass session.token to subsequent API calls
+ *
+ * Then pass `session.token` to createB2BApi / createApi as `sessionToken`.
  */
 
 import { initLiff } from "./liff-init.js";
