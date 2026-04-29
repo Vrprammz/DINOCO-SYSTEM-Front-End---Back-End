@@ -493,6 +493,96 @@ Admin Dashboard → Security Log tab
     → Admin review → [Clear flag] → POST /bo-clear-enum-flag
 ```
 
+#### 2.10.6 BO Queue Bulk Operations + Manual ETA (V.3.0, 2026-04-29)
+
+Closes 2 deferred-low-priority items from FEATURE-SPEC-B2B-BACKORDER-2026-04-16. Backend endpoints existed since V.1.6 — V.3.0 ships the Admin Dashboard UI.
+
+```
+Admin Dashboard → ระบบ B2B → Backorders tab
+    ├─ Filter status=pending|ready (cancelled/fulfilled rows = readonly, no checkbox)
+    ├─ ☑ select-all in <thead> + ☐ per-row checkbox in <tbody>
+    │     ↓ selection state = Set<bo_queue_id> preserved across loadQueue() refresh
+    │     ↓ cleared when filter changes (status/age/sku)
+    └─ Sticky bulk-action bar appears when ≥1 row selected:
+
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ เลือกแล้ว N รายการ   [✅ จัดส่ง]  [❌ ยกเลิก]  [ล้างการเลือก]   │
+    └──────────────────────────────────────────────────────────────────┘
+
+Bulk Fulfill flow:
+    POST /b2b/v1/bo-bulk-fulfill body { items: [{ bo_queue_id, qty }, ...] }
+    ├─ groups by order_id internally (b2b_rest_bo_bulk_fulfill)
+    ├─ delegates to b2b_rest_bo_fulfill per order (FOR UPDATE per row + atomic)
+    └─ returns { results: { success, failed, errors[] } }
+       → admin sees aggregated toast: ✅ N succeeded · ❌ M failed
+       → first 5 errors shown inline + count for remainder
+
+Bulk Cancel flow:
+    Reason prompt → POST /b2b/v1/bo-bulk-cancel body { bo_queue_ids: [], reason }
+    ├─ per-row delegates to b2b_rest_bo_cancel_item
+    ├─ debt restore + cancellation note
+    └─ returns same { success, failed, errors[] } shape
+
+Manual ETA inline button (per pending/ready row):
+    [📅 ETA] button → dinocoModal.prompt for days (0-90)
+    ├─ days=0 → clears ETA (server-side: $new_eta = null)
+    ├─ days>0 → eta = today + Ndays
+    ├─ optional admin note → appended to bo_queue.notes via "|" separator
+    └─ POST /b2b/v1/bo-update-eta { bo_queue_id, eta_days, notes }
+       → success toast + loadQueue() refresh
+
+End State: bulk ops eliminate manual N×ส่งBO clicking + ETA edits don't require modal navigation
+```
+
+**Server-side guards** (already validated since V.1.6):
+
+- `bo-update-eta`: only `pending` or `ready` rows accept ETA changes (other states return `invalid_status` 400)
+- `bo-bulk-fulfill`: per-order FOR UPDATE lock + compensation closure (V.2.0/V.2.3 atomic-boundary)
+- `bo-bulk-cancel`: each cancel goes through `b2b_rest_bo_cancel_item` (debt reverse + audit row)
+
+### 2.10.7 BO FSM State Diagram (Mermaid)
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft: place_order
+    draft --> pending_stock_review: confirm_order (BO flag ON, non-walkin)
+    draft --> checking_stock: confirm_order (legacy / flag OFF)
+    draft --> awaiting_confirm: confirm_order (walk-in)
+    draft --> cancelled: cancel_request
+
+    pending_stock_review --> awaiting_confirm: bo-confirm-full (admin)
+    pending_stock_review --> partial_fulfilled: bo-split (admin)
+    pending_stock_review --> cancelled: bo-reject / cancel_request / 72h timeout cron
+
+    partial_fulfilled --> pending_stock_review: bo-undo-split (10min, 1 max)
+    partial_fulfilled --> awaiting_confirm: bo-fulfill (last BO resolved)
+    partial_fulfilled --> cancelled: admin manual escalation
+
+    checking_stock --> awaiting_confirm: stock OK (legacy path)
+    checking_stock --> cancelled: OOS denial / cancel_request
+
+    awaiting_confirm --> awaiting_payment: confirm_bill
+    awaiting_confirm --> cancelled: cancel_request
+
+    awaiting_payment --> paid: payment verified
+    awaiting_payment --> cancelled: cancel_request / payment refused
+
+    paid --> shipped: tracking submitted
+    paid --> cancelled: admin walk-in cancel only
+
+    shipped --> completed: delivery confirmed
+    completed --> cancelled: admin walk-in cancel only
+
+    cancelled --> [*]
+```
+
+**Transition guards** (Snippet 14 V.1.6 FSM):
+
+- `pending_stock_review → partial_fulfilled` requires invariant `Σ qty_fulfill + Σ qty_bo = Σ order_qty` per SKU
+- `partial_fulfilled → pending_stock_review` requires `now() < _b2b_split_undo_deadline` AND `_b2b_undo_count < 1` (H5 oscillation guard)
+- `partial_fulfilled → awaiting_confirm` only when ALL bo_queue rows status IN (fulfilled, cancelled) — `b2b_bo_check_all_resolved($order_id)`
+- Walk-in path bypasses BO entirely — direct `draft → awaiting_confirm` regardless of `b2b_flag_bo_system` state
+
 ### 2.11 BO Cron Jobs Schedule
 
 | Cron | Interval | Purpose |
