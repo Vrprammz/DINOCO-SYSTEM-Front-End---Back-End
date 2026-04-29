@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.8 — PERF cache priming sweep (2026-04-29): /admin-shipping-queue and     ║
+ * ║                   /admin-bo-tickets now prime post object + meta cache for both order    ║
+ * ║                   set + distributor set before loop iteration. _prime_post_caches +      ║
+ * ║                   update_meta_cache pattern (mirrors Snippet 16 V.2.9). Eliminates ~5-6  ║
+ * ║                   SQL queries per row (50-order shipping queue = ~300 saved queries).    ║
+ * ║                   Pure additive — no API contract change.                                ║
  * ║  Version: V.42.7 — manual_ship V.44.0 support (2026-04-29): added 2 RPi-proxy GET       ║
  * ║                   endpoints with X-Print-Key auth so dashboard.py can populate the       ║
  * ║                   product picker + box template dropdown without forging admin nonce.    ║
@@ -1599,6 +1605,9 @@ function b2b_rest_admin_stock_list( WP_REST_Request $request ) {
 
 /**
  * GET /admin-bo-tickets?sku=XXX — BO tickets containing a specific SKU
+ *
+ * V.42.8 PERF: prime ticket meta + distributor meta cache before loop
+ *              (loop reads source_group_id + total_amount + shop_name + post_title per ticket).
  */
 function b2b_rest_admin_bo_tickets( WP_REST_Request $request ) {
     $session = b2b_rest_verify_admin($request);
@@ -1615,10 +1624,34 @@ function b2b_rest_admin_bo_tickets( WP_REST_Request $request ) {
         ),
     ));
 
+    // V.42.8 PERF: prime ticket post + meta cache (loop reads 2× get_field per ticket)
+    if ( ! empty( $tickets ) ) {
+        $ticket_ids = wp_list_pluck( $tickets, 'ID' );
+        if ( function_exists( '_prime_post_caches' ) ) _prime_post_caches( $ticket_ids, false, true );
+        update_meta_cache( 'post', $ticket_ids );
+    }
+
+    // V.42.8 PERF: pre-resolve distributors + prime post + meta cache (shop_name + title lookup)
+    $dist_map = array();
+    if ( ! empty( $tickets ) && function_exists( 'b2b_get_dist_by_group' ) ) {
+        $dist_ids = array();
+        foreach ( $tickets as $t ) {
+            $gid = get_field( 'source_group_id', $t->ID );
+            if ( ! $gid || isset( $dist_map[ $gid ] ) ) continue;
+            $d = b2b_get_dist_by_group( $gid );
+            $dist_map[ $gid ] = $d;
+            if ( $d && ! in_array( $d->ID, $dist_ids, true ) ) $dist_ids[] = $d->ID;
+        }
+        if ( ! empty( $dist_ids ) ) {
+            if ( function_exists( '_prime_post_caches' ) ) _prime_post_caches( $dist_ids, false, false );
+            update_meta_cache( 'post', $dist_ids );
+        }
+    }
+
     $result = array();
     foreach ($tickets as $t) {
         $gid = get_field('source_group_id', $t->ID);
-        $dist = $gid && function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($gid) : null;
+        $dist = isset( $dist_map[ $gid ] ) ? $dist_map[ $gid ] : ( $gid && function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($gid) : null );
         $shop = $dist ? (get_field('shop_name', $dist->ID) ?: get_the_title($dist->ID)) : '-';
         $total = floatval(get_field('total_amount', $t->ID));
         $result[] = array(
@@ -1701,6 +1734,10 @@ function b2b_rest_admin_stock_mark_oos( WP_REST_Request $request ) {
 
 /**
  * GET /admin-shipping-queue — orders that need tracking numbers
+ *
+ * V.42.8 PERF: prime post meta cache for both pending + recent shipped order sets,
+ * AND prime distributor post meta cache (loop reads shop_name + post_title per dist).
+ * Eliminates ~6 SQL queries per order in the loops (300+ for typical 50-order pending list).
  */
 function b2b_rest_admin_shipping_queue( WP_REST_Request $request ) {
     $session = b2b_rest_verify_admin($request);
@@ -1722,6 +1759,33 @@ function b2b_rest_admin_shipping_queue( WP_REST_Request $request ) {
         'orderby'=>'date','order'=>'ASC',
     ));
 
+    // V.42.8 PERF: prime order post + meta cache once (loop calls get_field 5×/order)
+    if ( ! empty( $orders ) ) {
+        $order_ids = wp_list_pluck( $orders, 'ID' );
+        if ( function_exists( '_prime_post_caches' ) ) _prime_post_caches( $order_ids, false, true );
+        update_meta_cache( 'post', $order_ids );
+    }
+
+    // V.42.8 PERF: pre-resolve distributors + prime post + meta cache.
+    // b2b_get_dist_by_group has a static cache so calling it inside the loop is OK,
+    // but distributor post object (get_the_title fallback) + meta (shop_name) still trigger
+    // per-row queries on first hit. Build $dist_map up front + prime caches on unique IDs.
+    $dist_map = array();          // group_id => WP_Post|null
+    $dist_ids = array();           // unique distributor IDs to prime
+    if ( ! empty( $orders ) && function_exists( 'b2b_get_dist_by_group' ) ) {
+        foreach ( $orders as $o ) {
+            $gid = get_field( 'source_group_id', $o->ID );
+            if ( ! $gid || isset( $dist_map[ $gid ] ) ) continue;
+            $d = b2b_get_dist_by_group( $gid );
+            $dist_map[ $gid ] = $d;
+            if ( $d && ! in_array( $d->ID, $dist_ids, true ) ) $dist_ids[] = $d->ID;
+        }
+        if ( ! empty( $dist_ids ) ) {
+            if ( function_exists( '_prime_post_caches' ) ) _prime_post_caches( $dist_ids, false, false );
+            update_meta_cache( 'post', $dist_ids );
+        }
+    }
+
     $pending = array();
     foreach ($orders as $o) {
         // Skip orders that already have tracking
@@ -1729,7 +1793,7 @@ function b2b_rest_admin_shipping_queue( WP_REST_Request $request ) {
         if (!empty($tracking)) continue;
 
         $gid = get_field('source_group_id', $o->ID);
-        $dist = $gid && function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($gid) : null;
+        $dist = isset( $dist_map[ $gid ] ) ? $dist_map[ $gid ] : ( $gid && function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($gid) : null );
         $shop = $dist ? (get_field('shop_name', $dist->ID) ?: get_the_title($dist->ID)) : '-';
         $total = floatval(get_field('total_amount', $o->ID));
         $days = floor((time() - get_post_time('U', true, $o->ID)) / 86400);
@@ -1768,10 +1832,33 @@ function b2b_rest_admin_shipping_queue( WP_REST_Request $request ) {
         'orderby'=>'date','order'=>'DESC',
     ));
 
+    // V.42.8 PERF: prime shipped orders post + meta + their distributors (separate set from pending).
+    if ( ! empty( $shipped ) ) {
+        $shipped_ids = wp_list_pluck( $shipped, 'ID' );
+        if ( function_exists( '_prime_post_caches' ) ) _prime_post_caches( $shipped_ids, false, true );
+        update_meta_cache( 'post', $shipped_ids );
+        if ( function_exists( 'b2b_get_dist_by_group' ) ) {
+            $shipped_dist_ids = array();
+            foreach ( $shipped as $o ) {
+                $gid = get_field( 'source_group_id', $o->ID );
+                if ( ! $gid || isset( $dist_map[ $gid ] ) ) continue;
+                $d = b2b_get_dist_by_group( $gid );
+                $dist_map[ $gid ] = $d;
+                if ( $d && ! in_array( $d->ID, $shipped_dist_ids, true ) && ! in_array( $d->ID, $dist_ids, true ) ) {
+                    $shipped_dist_ids[] = $d->ID;
+                }
+            }
+            if ( ! empty( $shipped_dist_ids ) ) {
+                if ( function_exists( '_prime_post_caches' ) ) _prime_post_caches( $shipped_dist_ids, false, false );
+                update_meta_cache( 'post', $shipped_dist_ids );
+            }
+        }
+    }
+
     $recent = array();
     foreach ($shipped as $o) {
         $gid = get_field('source_group_id', $o->ID);
-        $dist = $gid && function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($gid) : null;
+        $dist = isset( $dist_map[ $gid ] ) ? $dist_map[ $gid ] : ( $gid && function_exists('b2b_get_dist_by_group') ? b2b_get_dist_by_group($gid) : null );
         $shop = $dist ? (get_field('shop_name', $dist->ID) ?: get_the_title($dist->ID)) : '-';
         $recent[] = array(
             'ticket_id' => $o->ID,

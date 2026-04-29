@@ -10,6 +10,40 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Performance — PERF cache priming sweep (2026-04-29) — Snippet 3 V.42.8
+
+Round 2 sprint follow-up to Snippet 16 V.2.9 cache priming pattern.
+
+**`[B2B] Snippet 3` V.42.8** (Round 2 sprint):
+
+- `b2b_rest_admin_shipping_queue` — primes order post + meta cache for both
+  pending list (paid/awaiting_payment) and recent shipped (today × 20). Pre-resolves
+  unique distributors via `b2b_get_dist_by_group` static cache + primes their post
+  object + meta cache. Loop body uses `$dist_map` lookup with original-call fallback.
+  Eliminates ~5-6 SQL queries per row (~330 queries saved on typical 50-order pending,
+  20-order recent payload).
+- `b2b_rest_admin_bo_tickets` — same priming pattern for backorder tickets list.
+  ~40-80 SQL queries saved on typical 10-20 row response.
+- Pattern: `_prime_post_caches` and `update_meta_cache` (mirrors Snippet 16 V.2.9,
+  Snippet 3 V.41.5 `/order-history` priming). Both patterns gated with
+  `function_exists` guard (defensive — always exists in WP core).
+- **Pure additive** — no API contract change, no behavior change. Original
+  null-safety chain preserved for empty `$gid` and `Private_Chat` edge cases.
+
+### Audit — Phase 6 Modal Migration (2026-04-29) — comprehensive grep
+
+- Round 2 sprint comprehensive grep of `confirm()`/`alert()`/`prompt()` sites in
+  `*.php` + `*.html` (excluding `node_modules`, `.second-brain`, `dist`, `venv`,
+  `presentation`, `liff-src`, `tests/e2e`, `rpi-print-server`):
+- **0 production sites remaining** — Phase 5 (commits `1404b85..d2cf413`) +
+  Phase 6 (commits `7a9e90d..cfc453f`) closed 75 sites already.
+- 4 confirm + 2 alert hits = `tests/e2e/fixtures/modal.html` (intentional test
+  fixture validating modal API itself).
+- 2 confirm hits = `rpi-print-server/templates/manual_ship.html` (out-of-scope:
+  RPi flask+jinja runtime, no `dinocoModal` helper, warehouse touchscreen native
+  confirm acceptable).
+- Earlier estimate "~67 sites remaining" was stale; queue is closed.
+
 ### Added — BO Queue UX V.3.0 (2026-04-29) — Bulk ops + Manual ETA + docs
 
 Closes 2 deferred-low-priority items from `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`.
