@@ -20,8 +20,10 @@ Usage from dashboard.py:
                                     scenario='mixed', target_pages=2, dry_run=False)
 """
 
+import copy
 import os
 import random
+import shutil
 import time
 import logging
 
@@ -187,8 +189,9 @@ MOCKUP_COMPANY = {
 
 
 def _clone(p):
-    """Deep enough copy for our needs."""
-    return dict(p, children=list(p.get('children', [])))
+    """V.4 MED-3 fix: deep copy — prevents cross-test child dict mutation contamination
+    (was: dict() shallow + list() outer only — child dict refs shared)."""
+    return copy.deepcopy(p)
 
 
 def _pick_items_for_scenario(scenario):
@@ -214,7 +217,8 @@ def _pick_items_for_scenario(scenario):
 
 
 def _add_qty_pricing(items):
-    """Add realistic qty + price per item."""
+    """Add realistic qty + price per item.
+    V.4 LOW-2/LOW-3: diversified — production prices range 290-8990 + discount 0-30%."""
     for it in items:
         pm = it['pack_mode']
         if pm == 'bulk_pack':
@@ -225,10 +229,11 @@ def _add_qty_pricing(items):
             it['qty'] = random.choice([1, 2])
         else:
             it['qty'] = random.choice([1, 2, 5])
-        price = random.choice([590, 890, 1290, 1890, 2590])
+        # Diversified price range — round to 10s for realistic THB pricing
+        price = random.randint(29, 899) * 10  # 290-8990 THB
         it['price'] = price
         it['retail_price'] = price
-        it['discount_pct'] = '20%'
+        it['discount_pct'] = random.choice(['0%', '10%', '15%', '20%', '25%', '30%'])
     return items
 
 
@@ -412,8 +417,9 @@ def run_test_picking_print(
     # 7. Cleanup PDFs unless dry-run (keep for inspection)
     saved_paths = []
     if dry_run:
-        # Keep PDFs in tmp/ for review
-        import shutil
+        # Keep PDFs in tmp/ for review.
+        # V.4 MED-1 fix: shutil.move() (atomic on same fs) — prevents data loss
+        # if copy succeeded but unlink failed (was: copy+unlink → silent loss on copy fail).
         tmp_dir = os.path.join(base_dir, 'tmp')
         os.makedirs(tmp_dir, exist_ok=True)
         timestamp = int(time.time())
@@ -422,14 +428,15 @@ def run_test_picking_print(
                 continue
             new_name = os.path.join(tmp_dir, f'test_picking_{timestamp}_{idx:02d}.pdf')
             try:
-                shutil.copy(p, new_name)
+                shutil.move(p, new_name)
                 saved_paths.append(new_name)
             except Exception as e:
-                logger.warning('[TestPrint] copy %s failed: %s', p, e)
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
+                logger.warning('[TestPrint] move %s failed: %s', p, e)
+                # Original may still exist — best-effort cleanup
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
     else:
         for p in pdf_paths:
             try:

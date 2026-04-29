@@ -249,6 +249,14 @@ def api_logs():
     return jsonify({'logs': raw, 'source': source})
 
 
+# V.4 (2026-04-29 HIGH-3 fix) — module-level lock prevents concurrent test prints
+# (admin spam click → multiple USB session writes → printer state corruption / drift).
+# Acquired non-blocking; second concurrent caller gets 409 immediately.
+_test_print_lock = threading.Lock()
+# V.4 (MED-4 fix) — module-level logger (was: inline logging.getLogger() per request)
+_test_logger = logging.getLogger('rpi.dashboard.test')
+
+
 @app.route('/api/test-picking-list', methods=['POST'])
 @require_auth
 def api_test_picking_list():
@@ -257,6 +265,8 @@ def api_test_picking_list():
     Mirrors production pipeline (picking pages + shipping labels in single TSPL batch
     via USB session). Uses test_picking.MOCKUP_PRODUCTS (Thai motorcycle parts) +
     safety markers (ticket_id 999000-999999, "🧪 TEST" banner, TEST-PNO prefix).
+
+    V.4: HIGH-3 concurrency lock + HIGH-4 graceful int() + MED-2 dry-run skips PrinterManager.
 
     Body: {scenario: str, target_pages: int, dry_run: bool}
       scenario: 'quick'|'mixed'|'bulk-heavy'|'set-heavy'|'worst-case'
@@ -276,22 +286,34 @@ def api_test_picking_list():
 
     body = request.json or {}
     scenario = body.get('scenario', 'mixed')
-    target_pages = int(body.get('target_pages', 2) or 2)
-    target_pages = max(1, min(5, target_pages))  # clamp 1-5
+
+    # V.4 HIGH-4 fix: graceful 400 on non-int target_pages (was: ValueError → 500 traceback leak)
+    try:
+        target_pages = int(body.get('target_pages') or 2)
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'invalid_target_pages — must be integer 1-5'}), 400
+    target_pages = max(1, min(5, target_pages))
+
     dry_run = bool(body.get('dry_run', False))
 
     if scenario not in SCENARIOS:
         return jsonify({'ok': False, 'error': f'invalid_scenario: {scenario}', 'allowed': list(SCENARIOS.keys())}), 400
 
-    # Create PrinterManager on-demand (matches existing dashboard pattern at line 590)
-    try:
-        pm = PrinterManager(config)
-    except Exception as e:
-        if not dry_run:
-            return jsonify({'ok': False, 'error': f'printer_init_failed: {e}'}), 500
-        pm = None  # dry-run can proceed without printer
+    # V.4 HIGH-3 fix: non-blocking lock — admin spam click returns 409 immediately
+    # (prevent concurrent USB session writes / WeasyPrint queue overload on Pi).
+    if not _test_print_lock.acquire(blocking=False):
+        return jsonify({'ok': False, 'error': 'test_print_in_flight — กำลังประมวลผล test ก่อนหน้านี้อยู่ รอสักครู่'}), 409
 
     try:
+        # V.4 MED-2 fix: skip PrinterManager allocation in dry_run path
+        # (no printer interaction needed; faster + avoids unnecessary CUPS/USB connection).
+        pm = None
+        if not dry_run:
+            try:
+                pm = PrinterManager(config)
+            except Exception as e:
+                return jsonify({'ok': False, 'error': f'printer_init_failed: {e}'}), 500
+
         result = run_test_picking_print(
             printer_mgr=pm,
             render_template_fn=pc_render_template,
@@ -302,8 +324,10 @@ def api_test_picking_list():
         )
         return jsonify(result)
     except Exception as e:
-        logging.getLogger('test-picking').error(f'[test-picking-list] failed: {e}', exc_info=True)
+        _test_logger.error('[test-picking-list] failed: %s', e, exc_info=True)
         return jsonify({'ok': False, 'error': str(e)}), 500
+    finally:
+        _test_print_lock.release()
 
 
 @app.route('/api/test-print', methods=['POST'])

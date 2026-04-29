@@ -630,18 +630,11 @@ def process_job(job, config, printer_mgr):
                 box_num = 0
                 box_items = []
                 for item in order.get('items', []):
-                    bpu = item.get('boxes_per_unit', 1)
-                    upb = item.get('units_per_box', 1)
+                    # V.42.2 V.4 (HIGH-2 fix): use single-source helper from picking_layout.
+                    # Was: inline pack_mode logic duplicated here (CUPS fallback path) — drift risk
+                    # if formula changes in helper. Now matches USB session path (line 526).
+                    item_boxes = pick_count_boxes_for_item(item)
                     pm = item.get('pack_mode', 'auto')
-                    # V.42.8 Phase 2: pack_mode-aware box count (matches picking_list logic)
-                    if pm == 'bulk_pack' and upb > 1:
-                        item_boxes = (item['qty'] + upb - 1) // upb
-                    elif pm == 'multi_box' and bpu > 1:
-                        item_boxes = item['qty'] * bpu
-                    elif pm == 'assembled_set':
-                        item_boxes = item['qty']
-                    else:
-                        item_boxes = item['qty'] * bpu
                     for _ in range(item_boxes):
                         box_num += 1
                         box_items.append({
