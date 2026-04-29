@@ -529,7 +529,17 @@ def process_job(job, config, printer_mgr):
                     box_items = []
                     for item in order.get('items', []):
                         bpu = item.get('boxes_per_unit', 1)
-                        item_boxes = item['qty'] * bpu
+                        upb = item.get('units_per_box', 1)
+                        pm = item.get('pack_mode', 'auto')
+                        # V.42.8 Phase 2: pack_mode-aware box count (matches picking_list logic)
+                        if pm == 'bulk_pack' and upb > 1:
+                            item_boxes = (item['qty'] + upb - 1) // upb  # ceil division
+                        elif pm == 'multi_box' and bpu > 1:
+                            item_boxes = item['qty'] * bpu
+                        elif pm == 'assembled_set':
+                            item_boxes = item['qty']
+                        else:
+                            item_boxes = item['qty'] * bpu
                         for _ in range(item_boxes):
                             box_num += 1
                             box_items.append({
@@ -537,6 +547,10 @@ def process_job(job, config, printer_mgr):
                                 'total_boxes': total_boxes,
                                 'item_name': item['name'],
                                 'item_sku': item['sku'],
+                                # V.42.8 Phase 2: enrich for shipping_label.html template
+                                'pack_mode': pm,
+                                'box_template_code': item.get('box_template_code', ''),
+                                'box_template_dims': item.get('box_template_dims', ''),
                             })
 
                     if len(box_items) != total_boxes:
@@ -665,7 +679,17 @@ def process_job(job, config, printer_mgr):
                 box_items = []
                 for item in order.get('items', []):
                     bpu = item.get('boxes_per_unit', 1)
-                    item_boxes = item['qty'] * bpu
+                    upb = item.get('units_per_box', 1)
+                    pm = item.get('pack_mode', 'auto')
+                    # V.42.8 Phase 2: pack_mode-aware box count (matches picking_list logic)
+                    if pm == 'bulk_pack' and upb > 1:
+                        item_boxes = (item['qty'] + upb - 1) // upb
+                    elif pm == 'multi_box' and bpu > 1:
+                        item_boxes = item['qty'] * bpu
+                    elif pm == 'assembled_set':
+                        item_boxes = item['qty']
+                    else:
+                        item_boxes = item['qty'] * bpu
                     for _ in range(item_boxes):
                         box_num += 1
                         box_items.append({
@@ -673,6 +697,9 @@ def process_job(job, config, printer_mgr):
                             'total_boxes': total_boxes,
                             'item_name': item['name'],
                             'item_sku': item['sku'],
+                            'pack_mode': pm,
+                            'box_template_code': item.get('box_template_code', ''),
+                            'box_template_dims': item.get('box_template_dims', ''),
                         })
 
                 if len(box_items) != total_boxes:
