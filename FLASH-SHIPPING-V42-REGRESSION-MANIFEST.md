@@ -70,6 +70,8 @@
 | REG-066 | F4 warehouseNo fallback | Invalid warehouseNo → Flash 4xx → Method 1 (srcXXX) retry | Audit logs `warehouseNo_fallback` |
 | REG-067 | F7 DLQ lifecycle | 3 retries fail → DLQ insert + Flex alert. Admin hits /retry → resolved/abandoned | Row status transitions |
 | REG-068 | F7 DLQ 30-day cleanup | `dinoco_flash_dlq_cleanup_cron` daily 03:00 → rows > 30d deleted | Row count stable long-term |
+| REG-069 | G2 1003 idempotent recovery — mock Flash returns code=1003 on first try + `b2b_flash_get_order_by_mch_pno` returns ok=true with existing PNO | Retry stops on attempt 1 (no regenerate). `_flash_tracking_numbers` populated with recovered PNO. No DLQ insert. b2b_log shows `[V42-G2] 1003 recovered`. `wp_dinoco_flash_audit.g2_outcome='recovered'` + `g2_attempts=1` |
+| REG-070 | G2 1003 regenerate fallback — mock Flash 1003 + mchPno query returns ok=false → fix mutates outTradeNo to `{tid}-r1` + syncs subParcel.outTradeNo + 2nd attempt success | Closure attempts=2. `wp_dinoco_flash_audit.g2_outcome='regenerated'` + `original_out_trade_no={tid}` + `request_summary.outTradeNo={tid}-r1`. b2b_log shows `[V42-G2] 1003 regenerate`. No DLQ |
 
 ## Round 4-7 Post-Ship Regression Scenarios (2026-04-21)
 
