@@ -81,8 +81,8 @@ Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-fun
 | PHPUnit Unit | 110 | < 5s | Pure-logic helpers (math/policy) |
 | PHPUnit Integration | 51 | ~1 min | DB-coupled (FOR UPDATE, GET_LOCK, FSM, REST) |
 | Jest | 114 | < 1s | LIFF foundation + OpenAPI + links + secrets + dangerous-APIs + PHP security |
-| Playwright E2E | 8 × 2 projects | ~6s | Cart flow + API client in real Chromium + mobile-chrome |
-| **Total** | **291** | | |
+| Playwright E2E | 12 × 2 projects | ~6s | Cart + API client + full place-order flow (auth→cart→submit) in real Chromium + mobile-chrome |
+| **Total** | **299** | | |
 
 ## Deployment
 
