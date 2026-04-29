@@ -1,6 +1,16 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 1: Core Utilities & LINE Flex Builders        ║
+ * ║  Version: V.34.21 (2026-04-29) — Flash V.42 G2: 1003 (duplicate outTradeNo) recovery: ║
+ * ║    • b2b_flash_create_order_v42 $execute closure: on Flash error_code=1003,             ║
+ * ║      try idempotent recovery via /open/v3/ordersByMchPno first — if Flash already has   ║
+ * ║      the order (network-lost previous success), return existing PNO as success.         ║
+ * ║    • Recovery fail → mutate outTradeNo to "{ticket_id}-r{attempt}" + sync subParcel.    ║
+ * ║      outTradeNo so dedup passes on next retry. Closure captures $params by reference   ║
+ * ║      + $attempt counter for suffix numbering. Logs both recovery + regenerate paths.   ║
+ * ║    • Closes audit P0 G2 — pre-fix 1003 retry guaranteed fail (same outTradeNo)         ║
+ * ║      → DLQ insert every 1003 + zero recovery for network-lost ACKs.                     ║
+ * ║    • Spec ref: FEATURE-SPEC-FLASH-SHIPPING-META-2026-04-17.md §3 Error Matrix.          ║
  * ║  Version: V.34.20 (2026-04-24) — AI accuracy metrics helpers (cost-saver tracking):    ║
  * ║    • NEW b2b_slip_ai_update_correctness($log_id, $correct, $source) — atomic UPDATE     ║
  * ║      `wp_dinoco_slip_log.ai_correct + ai_correctness_source` (Snippet 15 V.8.16 cols).  ║
@@ -8505,7 +8515,20 @@ if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
         $audit_supported = (bool) $wpdb->get_var( "SHOW TABLES LIKE '{$audit_tbl}'" );
 
         // Execute with retry + DLQ
-        $execute = function() use ( $params ) {
+        // G2 (V.34.12): 1003 (duplicate outTradeNo) recovery + regenerate.
+        // Spec FEATURE-SPEC-FLASH-SHIPPING-META §3 Error Matrix: 1003 = retryable
+        // but retrying with same outTradeNo guarantees another 1003. Two-step fix:
+        //   (1) On 1003, query Flash via /open/v3/ordersByMchPno — if Flash already
+        //       has an order for this outTradeNo (network-lost previous success),
+        //       return existing PNO as success (idempotent recovery).
+        //   (2) If recovery fails, mutate outTradeNo with `-r{attempt}` suffix +
+        //       sync subParcel.outTradeNo so next retry passes Flash dedup.
+        // $params captured by reference so mutations persist across retries.
+        // $attempt counter tracks retry iterations for suffix numbering.
+        $attempt = 0;
+        $base_out_trade_no = (string) $ticket_id;
+        $execute = function() use ( &$params, &$attempt, $base_out_trade_no ) {
+            $attempt++;
             $r = b2b_flash_request( 'open/v3/orders', $params );
             // Normalize result to { ok, error_code, ... } for dinoco_api_retry
             if ( is_array( $r ) && ! empty( $r['ok'] ) && ! empty( $r['data']['pno'] ) ) return $r;
@@ -8523,6 +8546,33 @@ if ( ! function_exists( 'b2b_flash_create_order_v42' ) ) {
                     $code = (string) $r['code'];
                 }
                 $r['error_code'] = $code;
+                // G2: handle 1003 (duplicate outTradeNo) before next retry
+                if ( $code === '1003' && function_exists( 'b2b_flash_get_order_by_mch_pno' ) ) {
+                    // Step 1: try idempotent recovery — Flash may already have the order
+                    $lookup = b2b_flash_get_order_by_mch_pno( $params['outTradeNo'] );
+                    if ( is_array( $lookup ) && ! empty( $lookup['ok'] ) && ! empty( $lookup['data']['pno'] ) ) {
+                        if ( function_exists( 'b2b_log' ) ) {
+                            b2b_log( '[V42-G2] 1003 recovered via mchPno query — outTradeNo=' . $params['outTradeNo'] . ' pno=' . $lookup['data']['pno'] );
+                        }
+                        // Return as success so dinoco_api_retry stops retrying
+                        return $lookup;
+                    }
+                    // Step 2: recovery failed — mutate outTradeNo for next retry attempt
+                    $new_otn = $base_out_trade_no . '-r' . $attempt;
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( '[V42-G2] 1003 regenerate — outTradeNo ' . $params['outTradeNo'] . ' → ' . $new_otn );
+                    }
+                    $params['outTradeNo'] = $new_otn;
+                    // Sync subParcel.outTradeNo so Flash dedup passes consistently
+                    if ( ! empty( $params['subParcel'] ) && is_array( $params['subParcel'] ) ) {
+                        foreach ( $params['subParcel'] as $idx => &$sp ) {
+                            if ( is_array( $sp ) ) {
+                                $sp['outTradeNo'] = $new_otn . '-' . ( $idx + 1 );
+                            }
+                        }
+                        unset( $sp );
+                    }
+                }
             }
             return $r;
         };
