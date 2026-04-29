@@ -7,11 +7,12 @@ Workflow guide for contributors. Read this before your first PR.
 ## TL;DR
 
 ```bash
-npm install                              # one-time
-bash scripts/install-hooks.sh            # one-time, installs pre-push gate
+npm install                              # one-time — also auto-installs pre-push hook
 npm run test:all -- --skip-php           # before every push (3s)
 git push                                 # pre-push hook runs gates again
 ```
+
+The pre-push hook (`scripts/git-hooks/pre-push`) installs automatically via npm's `prepare` lifecycle script. CI bypasses it via `CI=true` env. To opt out manually: `SKIP_HOOKS_INSTALL=1 npm install`.
 
 ---
 
@@ -64,7 +65,7 @@ Installs the pre-push hook that runs ESLint + TypeScript + Jest when frontend fi
 
 | Change type | Goes in |
 |---|---|
-| New REST endpoint | Existing `[B2B|B2F|Admin System|System|LIFF AI] Snippet N: …` file (look up the right namespace) |
+| New REST endpoint | Existing `[B2B]` / `[B2F]` / `[Admin System]` / `[System]` / `[LIFF AI]` snippet (look up the right namespace) |
 | New shared frontend logic | `liff-src/shared/*.js` with JSDoc + Jest test |
 | New LIFF page | `liff-src/<surface>/<page>/entry.js` (Phase 2 migration target) |
 | Helper function used by snippets | Add to nearest snippet, expose via `function_exists` guards |
