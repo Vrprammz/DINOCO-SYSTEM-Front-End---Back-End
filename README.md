@@ -2,6 +2,7 @@
 
 [![PHPUnit](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/phpunit.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/phpunit.yml)
 [![Jest](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/jest.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/jest.yml)
+[![Playwright](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/playwright.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/playwright.yml)
 [![Security Audit](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/security-audit.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/security-audit.yml)
 [![Regression Guard](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml)
 
@@ -27,6 +28,7 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 | [docs/audit/ARCHITECTURE-STATUS.md](docs/audit/ARCHITECTURE-STATUS.md) | Refactor pillar deployment status |
 | [docs/runbooks/TESTING-PHASE-5.md](docs/runbooks/TESTING-PHASE-5.md) | PHPUnit unit + integration test setup |
 | [docs/runbooks/TESTING-PHASE-6.md](docs/runbooks/TESTING-PHASE-6.md) | Jest frontend test setup |
+| [docs/runbooks/TESTING-PHASE-7.md](docs/runbooks/TESTING-PHASE-7.md) | Playwright E2E test setup |
 
 ## Testing
 
@@ -64,9 +66,13 @@ npm run lint:fix             # auto-fix where possible
 # Jest unit tests for liff-src/shared/ + OpenAPI spec validation (104 tests, < 1s)
 npm test
 npm run test:jest:coverage   # generate coverage/jest/
+
+# Playwright E2E (real Chromium + mobile Chrome, ~6s)
+npm run test:e2e
+npm run test:e2e:ui          # interactive Playwright UI mode
 ```
 
-Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-function modules with mocked fetch + window.liff. ESLint also runs on every push via the same CI workflow. See [docs/runbooks/TESTING-PHASE-6.md](docs/runbooks/TESTING-PHASE-6.md).
+Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-function modules with mocked fetch + window.liff. ESLint also runs on every push via the same CI workflow. See [docs/runbooks/TESTING-PHASE-6.md](docs/runbooks/TESTING-PHASE-6.md) (Jest) and [docs/runbooks/TESTING-PHASE-7.md](docs/runbooks/TESTING-PHASE-7.md) (Playwright).
 
 ### Test counts
 
@@ -74,8 +80,9 @@ Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-fun
 |---|---|---|---|
 | PHPUnit Unit | 110 | < 5s | Pure-logic helpers (math/policy) |
 | PHPUnit Integration | 51 | ~1 min | DB-coupled (FOR UPDATE, GET_LOCK, FSM, REST) |
-| Jest | 110 | < 1s | LIFF foundation + OpenAPI + links + secrets + dangerous-APIs |
-| **Total** | **271** | | |
+| Jest | 114 | < 1s | LIFF foundation + OpenAPI + links + secrets + dangerous-APIs + PHP security |
+| Playwright E2E | 8 × 2 projects | ~6s | Cart flow + API client in real Chromium + mobile-chrome |
+| **Total** | **291** | | |
 
 ## Deployment
 
