@@ -287,9 +287,12 @@ def api_test_picking_list():
     """
     try:
         from test_picking import run_test_picking_print, SCENARIOS
-        # Reuse print_client.py helpers (render_template + html_to_pdf — same Jinja env + WeasyPrint setup)
-        from print_client import render_template as pc_render_template
-        from print_client import html_to_pdf as pc_html_to_pdf
+        # V.6.2 (2026-04-29 hotfix): import from pdf_render (NEW module) — was print_client
+        # but print_client registers signal.signal() at module top → fails in Flask worker
+        # thread with "signal only works in main thread of the main interpreter".
+        # pdf_render has no signal handlers — safe to import from any thread.
+        from pdf_render import render_template as pc_render_template
+        from pdf_render import html_to_pdf as pc_html_to_pdf
         from printer import PrinterManager
     except Exception as e:
         return jsonify({'ok': False, 'error': f'import_failed: {e}'}), 500

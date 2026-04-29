@@ -333,41 +333,13 @@ def generate_barcode_data_uri(text, barcode_type='code128', width=650, height=12
 
 # ── Template Rendering ──────────────────────────────────────────────
 
-_jinja_env = None
-
-def _get_jinja_env():
-    """Get or create a cached Jinja2 Environment (singleton)."""
-    global _jinja_env
-    if _jinja_env is None:
-        _jinja_env = Environment(loader=FileSystemLoader(TEMPLATE_DIR))
-        _jinja_env.filters['number_format'] = lambda v: f'{v:,.0f}' if v else '0'
-        _jinja_env.filters['number_format_2'] = lambda v: f'{v:,.2f}' if v else '0.00'
-    return _jinja_env
-
-
-def render_template(template_name, context):
-    """Render a Jinja2 template to HTML string."""
-    env = _get_jinja_env()
-    template = env.get_template(template_name)
-    return template.render(**context)
-
-
-def html_to_pdf(html_string, width_mm=None, height_mm=None, margin_mm=0):
-    """Convert HTML string to a temporary PDF file path."""
-    from weasyprint import CSS
-
-    page_css = None
-    if width_mm and height_mm:
-        page_css = CSS(string=f'@page {{ size: {width_mm}mm {height_mm}mm; margin: {margin_mm}mm; }}')
-
-    tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-    tmp.close()
-
-    HTML(string=html_string).write_pdf(
-        tmp.name,
-        stylesheets=[page_css] if page_css else None
-    )
-    return tmp.name
+# V.42.3 (2026-04-29): render_template + html_to_pdf moved to pdf_render module.
+# Reason: dashboard.py (Flask request handler thread) imports print_client.py for these
+# helpers but `signal.signal()` calls at module top (line 103-104) raise
+# "signal only works in main thread" when imported from worker thread.
+# Solution: extract to pdf_render.py (no signal handlers) — safe to import from any thread.
+# Backward compat: re-export here for any existing callers.
+from pdf_render import render_template, html_to_pdf, _get_jinja_env
 
 
 # ── Print Job Processing ────────────────────────────────────────────
