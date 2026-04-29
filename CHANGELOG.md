@@ -10,6 +10,51 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fixed — Flash V.42 deep audit (2026-04-29) — 8 findings closed
+
+api-specialist + feature-architect agents dispatched for full audit of Flash V.42
+implementation vs `FEATURE-SPEC-FLASH-SHIPPING-META-2026-04-17.md`.
+
+**P0 (commit `41ddc5d`)**:
+- **G1** — admin "Flash Create" REST routed via `b2b_flash_dispatch_create_all()`
+  instead of bypassing dispatcher (Snippet 5 V.33.2 + Snippet 9 V.34.0)
+- **G2** — 1003 (duplicate outTradeNo) idempotent recovery via `mchPno` query +
+  regenerate fallback (Snippet 1 V.34.21)
+
+**P1 follow-ups (commit `0a28359`)**:
+- **B5** — audit row trace fields `original_out_trade_no` + `g2_attempts` +
+  `g2_outcome` for 1003 post-mortem
+- **D3** — REG-069 + REG-070 regression scenarios
+
+**P1 (commit `7f49c0d`)**:
+- **G3** — removed broken BO secondary fallback that called
+  `b2b_flash_create_order($order_id, array(...))` with array→int(1) coercion
+  (Snippet 16 V.2.8)
+- **G4** — async snapshot defer via `wp_schedule_single_event` (HIGH-2 closed
+  from Round 4-8 audit; Snippet 1 V.34.23)
+
+**Deep audit (commit `ae60b47`, Snippet 1 V.34.24)**:
+- **BUG-2 CRITICAL** — `subParcel` JSON encoding (multi-box ticket signature
+  mismatch). Pre-fix sent PHP nested array → `b2b_flash_sign()` cast `(string)$v`
+  = literal `"Array"` while wp_remote_post serialized actual structure → Flash
+  hash mismatch on every multi-box order. Fix: `wp_json_encode($sp_array)` per
+  Flash spec line 209
+- **BUG-1 CRITICAL** — `insureDeclareValue=''` undefined behavior. Fix: omit
+  field when not insured (V.42 + V.41 paths)
+- **ISSUE-5 HIGH** — V.41 path missing 7 returnXXX fields (walk-in tickets
+  ตีกลับไปโกดังแทนบริษัท). Fix: added `b2b_registered_address` 7 fields
+- **ISSUE-6 HIGH** — V.41 articleCategory default 99 → 6 (align V.42 default)
+
+**Tests**: REG-069..079 added (11 new scenarios) in
+FLASH-SHIPPING-V42-REGRESSION-MANIFEST.md.
+
+### Documentation — Flag name drift fix (2026-04-29)
+
+Synced `FEATURE-SPEC-FLASH-SHIPPING-META-2026-04-17.md` flag references from
+incorrect `dinoco_flag_shipping_meta_enabled` to actual `dinoco_shipping_meta_enabled`
+(matches code in CLAUDE.md line 318 + Snippet 1 + dispatcher). 10 occurrences
+across spec sections §10/§17.2/§22.
+
 ### Added — OpenAPI spec coverage expansion (2026-04-28 → 2026-04-29)
 
 ขยาย `docs/api/openapi.yaml` จาก ~50% → ~70% ของ 125+ production endpoints.

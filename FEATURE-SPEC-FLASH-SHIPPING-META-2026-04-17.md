@@ -606,7 +606,7 @@ DNCSETX001,,,,,1,4
 | 5 | No rollback needed (docs/monitoring) | — |
 
 ### Feature flag (Phase 2-4 safety)
-- `dinoco_flag_shipping_meta_enabled` (wp_option, default `false` during beta)
+- `dinoco_shipping_meta_enabled` (wp_option, default `false` during beta)
 - When `false`: helpers return default, Admin UI hidden, B2B/Manual use fallback behavior (current V.41 code path)
 - When `true`: full new behavior active
 
@@ -880,7 +880,7 @@ stock_updated_at, created_at, updated_at
 | `b2b_shipping_mode` | string | existing (S9 line 400) | `manual` \| `flash` — master switch |
 | `b2b_manual_shipments_YYYY_MM` | array | existing (S3 line 2549, 4496) | Monthly log of manual shipments (per-month partitioning) |
 | `dinoco_shipping_defaults` | array (JSON) | **NEW** | Global fallback: weight_grams, L/W/H/cm, article_category, express_category, vehicle_threshold{weight_g, max_dim_cm} |
-| `dinoco_flag_shipping_meta_enabled` | bool | **NEW** | Feature flag (default=false during beta; true after canary) |
+| `dinoco_shipping_meta_enabled` | bool | **NEW** | Feature flag (default=false during beta; true after canary) |
 | `dinoco_flash_warehouse_map` | array | **NEW (D9)** | `{ "BKN_SP": {desc,address,vehicles:['bike']}, "5BKN_PDC": {desc,address,vehicles:['truck']} }` mapping expressCategory → warehouseNo |
 | `dinoco_shipping_scanner_config` | array | **NEW** | Scanner preferences (beep, auto-focus, flash on success) |
 | `dinoco_flash_vehicle_override_log` | array | **NEW** (optional Q2) | Audit of admin manual vehicle overrides |
@@ -1069,7 +1069,7 @@ Step 1 — Schema migration (2 min, off-peak window)
 
 Step 2 — Global defaults seed
 ├─ update_option('dinoco_shipping_defaults', {weight:1000, L:30, W:20, H:10, article:6, express:1, threshold:{w:20000, d:60}})
-├─ update_option('dinoco_flag_shipping_meta_enabled', false)  -- feature flag OFF
+├─ update_option('dinoco_shipping_meta_enabled', false)  -- feature flag OFF
 └─ update_option('dinoco_flash_warehouse_map', {BKN_SP:{...bike}, 5BKN_PDC:{...truck}})
 
 Step 3 — Helper functions deploy
@@ -1082,13 +1082,13 @@ Step 4 — Admin UI deploy (flag still OFF)
 └─ Verify: no visible change to admin
 
 Step 5 — Canary (flag ON for 1 admin user via conditional)
-├─ update_option('dinoco_flag_shipping_meta_enabled_users', [1])  -- admin user ID 1
+├─ update_option('dinoco_shipping_meta_enabled_users', [1])  -- admin user ID 1
 ├─ Helpers check flag per user context
 ├─ Manual-ship test: scan 5 SKUs → verify Flash API accepts payload
 └─ B2B test: create 3 test tickets → verify weight/dims sent
 
 Step 6 — Full rollout
-├─ update_option('dinoco_flag_shipping_meta_enabled', true)
+├─ update_option('dinoco_shipping_meta_enabled', true)
 ├─ Monitor Flash error rate (target: 0% increase)
 └─ If error_rate > 5% within 1 hour → auto-rollback (flag OFF)
 
@@ -1187,7 +1187,7 @@ FROM wp_dinoco_products WHERE is_active=1;
 
 - [ ] Flash answers received for Q1-Q11 (warehouseNo routing, multi-pickup)
 - [ ] D1-D9 decisions signed off by user
-- [ ] Feature flag `dinoco_flag_shipping_meta_enabled` defined + default=false
+- [ ] Feature flag `dinoco_shipping_meta_enabled` defined + default=false
 - [ ] Backup wp_dinoco_products + wp_options snapshot
 - [ ] Global defaults seeded in dev+staging
 - [ ] Warehouse mapping seeded (BKN_SP, 5BKN_PDC)
@@ -1456,7 +1456,7 @@ function b2b_flash_get_order_weight($ticket_id) {
     $override = get_post_meta($ticket_id, '_flash_weight_grams', true);
     if ($override && intval($override) > 0) return intval($override);
     // 2. V.34 NEW: auto-compute from items
-    if (get_option('dinoco_flag_shipping_meta_enabled')) {
+    if (get_option('dinoco_shipping_meta_enabled')) {
         $items = b2b_get_order_items_structured($ticket_id);
         $ship = dinoco_compute_order_shipping($items);
         if (!empty($ship['weight_grams'])) return $ship['weight_grams'];
@@ -1525,7 +1525,7 @@ ALTER TABLE wp_dinoco_products
 ```php
 // Already spec'd — OK as-is
 'dinoco_shipping_defaults'        => [...],     // §4.2 JSON blob
-'dinoco_flag_shipping_meta_enabled' => false,   // §10 feature flag
+'dinoco_shipping_meta_enabled' => false,   // §10 feature flag
 'dinoco_flash_warehouse_map'      => [...],     // §18.2 D9 routing
 'dinoco_shipping_scanner_config'  => [...],     // §18.2 scanner prefs
 
@@ -1665,7 +1665,7 @@ Identified gaps mapped to Mission request list + new findings. Severity: **P0** 
 | C18 *(new)* | **Pickup split — one ticket with mixed bike + truck parcels** | P1 | Multi-PNO ticket where box A = small, box B = large → two pickups required for ONE order. Current code assumes single vehicle per ticket |
 | C19 *(new)* | **warehouseNo config drift** | P1 | Flash API returns wrong warehouse → currently silent. Add Flex when `_flash_warehouse_no` differs from config |
 | C20 *(new)* | **Subparcel rejection** (multi-box Flash API partial failure) | P0 | §24 tracks rate >1% but no Flex. Needs immediate admin visibility |
-| C21 *(new)* | **Feature flag toggle audit** (`dinoco_flag_shipping_meta_enabled` ON/OFF) | P2 | Security/audit — admin changes should fire confirmation Flex to group so all admins see it |
+| C21 *(new)* | **Feature flag toggle audit** (`dinoco_shipping_meta_enabled` ON/OFF) | P2 | Security/audit — admin changes should fire confirmation Flex to group so all admins see it |
 
 ### 28.3 New Flex Card Designs
 
@@ -1965,7 +1965,7 @@ Flagged during audit — not in original 17-scenario list but equally important:
 - **FIND-1 (C18)**: **Mixed-vehicle ticket** — a single order can have box A = small and box B = large. Current code assumes ONE vehicle per ticket. V.42 Phase 3 must handle split. Severity **P0**.
 - **FIND-2 (C19)**: **warehouseNo config drift** — Flash may silently remap warehouseNo. Spec §20 mentions but no notification. Added as 28.3.9. Severity **P1**.
 - **FIND-3 (C20)**: **Subparcel rejection** — Flash multi-box API can partial-fail. Currently logged only (S1:4834 comment "FIX S-6: no Flex from helper"). Admin only sees via `flash_create_error` generic which doesn't convey partial success. Severity **P0**.
-- **FIND-4 (C21)**: **Feature-flag audit** — enabling `dinoco_flag_shipping_meta_enabled` mid-day changes every Flash call immediately. Admins should see notification so they know why behavior changed. Severity **P2**.
+- **FIND-4 (C21)**: **Feature-flag audit** — enabling `dinoco_shipping_meta_enabled` mid-day changes every Flash call immediately. Admins should see notification so they know why behavior changed. Severity **P2**.
 - **FIND-5**: **Rate limit protection missing** — no cap on admin-group push volume. LINE free tier = 500 msg/month/group; at scale this overruns. Added global 20/hr cap + batch-into-summary fallback in §28.4. Severity **P1**.
 - **FIND-6**: **No "cancel pickup" admin action from LINE** — admin can only cancel via Flash app directly. Added A5 + REST `/flash-cancel-pickup`. Severity **P2**.
 - **FIND-7**: **Dedup helper not centralized** — each builder re-implements own transient dedup. Proposed `b2b_push_admin_flex_dedup()` helper unifies pattern + enforces rate limit. Severity **P2** (refactor).
