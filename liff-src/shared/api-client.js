@@ -141,7 +141,10 @@ export function createB2BApi({
     const api = createApi({
         base,
         token: sessionToken,
-        tokenHeader: "X-B2B-Session",
+        // Production [B2B] Snippet 3 b2b_verify_session_token reads
+        // X-B2B-Token header (line 288). Body fallback is `_token` query
+        // param. createB2BApi uses header form.
+        tokenHeader: "X-B2B-Token",
         nonce,
         timeoutMs,
     });

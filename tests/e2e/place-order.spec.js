@@ -83,8 +83,9 @@ test.describe("B2B place-order full flow", () => {
         await expect(page.locator("#status")).toHaveText("ok");
         await expect(page.locator("#result")).toContainText("order_id=99001");
 
-        // Verify session header propagated through createB2BApi
-        expect(capturedHeaders["x-b2b-session"]).toBe("session-jwt-abc123");
+        // Verify session header propagated through createB2BApi.
+        // Production b2b_verify_session_token reads X-B2B-Token (not Session).
+        expect(capturedHeaders["x-b2b-token"]).toBe("session-jwt-abc123");
 
         // Verify cart payload made it intact through toOrderItems()
         expect(capturedBody).toEqual({

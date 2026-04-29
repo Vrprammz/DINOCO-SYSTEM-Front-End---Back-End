@@ -17,7 +17,7 @@ test.describe("API client (mocked fetch)", () => {
         await expect(page.locator("#status")).toHaveText("idle");
     });
 
-    test("GET /catalog returns JSON, headers include X-B2B-Session", async ({
+    test("GET /catalog returns JSON, headers include X-B2B-Token", async ({
         page,
     }) => {
         let capturedHeaders = null;
@@ -39,7 +39,7 @@ test.describe("API client (mocked fetch)", () => {
         await expect(page.locator("#status")).toHaveText("getCatalog: ok");
         await expect(page.locator("#result")).toContainText("SKU-A");
 
-        expect(capturedHeaders["x-b2b-session"]).toBe("test-session-99");
+        expect(capturedHeaders["x-b2b-token"]).toBe("test-session-99");
     });
 
     test("POST /place-order serializes body + content-type", async ({

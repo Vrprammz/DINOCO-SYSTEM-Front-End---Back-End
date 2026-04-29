@@ -218,7 +218,10 @@ describe("createB2BApi", () => {
         global.fetch = originalFetch;
     });
 
-    test("getCatalog hits /catalog with X-B2B-Session header", async () => {
+    test("getCatalog hits /catalog with X-B2B-Token header", async () => {
+        // Production b2b_verify_session_token reads X-B2B-Token, not
+        // X-B2B-Session. Asserting the WIRE header name catches future
+        // accidental rename.
         const fetchMock = jest.fn(async () => ({
             ok: true,
             status: 200,
@@ -235,7 +238,7 @@ describe("createB2BApi", () => {
         const [url, init] = fetchMock.mock.calls[0];
         expect(url).toBe("/wp-json/b2b/v1/catalog");
         expect(init.method).toBe("GET");
-        expect(init.headers["X-B2B-Session"]).toBe("sess-99");
+        expect(init.headers["X-B2B-Token"]).toBe("sess-99");
     });
 
     test("getHistory builds query string against /order-history", async () => {
