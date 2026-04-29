@@ -13,12 +13,16 @@
  *     LIFF AI lead update)
  *   - Optional: real WP env via wp-env Docker for full end-to-end
  *
- * Why Chromium-only at Phase 7:
- *   - LIFF runs inside LINE's WebView which is Chromium-based on Android
- *     and Safari/WebKit on iOS. WebKit coverage is value-add but doubles
- *     CI time + bin install. Defer until concrete iOS-specific bugs
- *     surface.
- *   - Firefox: zero LIFF user share, skip.
+ * Browser project decisions:
+ *   - chromium (Desktop Chrome) — baseline + closest to LIFF Android
+ *     WebView engine.
+ *   - mobile-chrome (Pixel 5 emulation) — touch viewport + mobile UA
+ *     for LIFF Android-side validation.
+ *   - webkit (Desktop Safari) — covers iOS LINE LIFF (LINE's iOS WebView
+ *     is Safari/WebKit). Catches Safari-only bugs (date parsing, regex
+ *     lookbehind support, IndexedDB transaction quirks, fetch behavior).
+ *   - mobile-safari (iPhone 14 emulation) — touch viewport on WebKit.
+ *   - Firefox skipped: zero LIFF user share.
  */
 
 const { defineConfig, devices } = require("@playwright/test");
@@ -52,10 +56,20 @@ module.exports = defineConfig({
             name: "chromium",
             use: { ...devices["Desktop Chrome"] },
         },
-        // Mobile Chrome — closer to LIFF (WebView on Android)
+        // Mobile Chrome — LIFF Android WebView (Chromium-based)
         {
             name: "mobile-chrome",
             use: { ...devices["Pixel 5"] },
+        },
+        // WebKit — LIFF iOS WebView (Safari engine)
+        {
+            name: "webkit",
+            use: { ...devices["Desktop Safari"] },
+        },
+        // Mobile Safari — closest to actual iOS LINE LIFF environment
+        {
+            name: "mobile-safari",
+            use: { ...devices["iPhone 14"] },
         },
     ],
 

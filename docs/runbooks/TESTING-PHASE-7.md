@@ -67,8 +67,8 @@ Failing tests automatically capture screenshot + video + trace under `test-resul
 
 ## Architecture decisions
 
-**Why Chromium + mobile-chrome only (not WebKit/Firefox)?**
-LINE LIFF runs inside a Chromium WebView on Android and Safari/WebKit on iOS. Mobile-chrome covers the Android side. WebKit is value-add but doubles CI time + browser binary install. Defer until concrete iOS-specific bugs surface.
+**Why Chromium + WebKit (not Firefox)?**
+LINE LIFF runs inside a Chromium WebView on Android and Safari/WebKit on iOS. We cover both engines via 4 projects: `chromium` (Desktop Chrome) + `mobile-chrome` (Pixel 5 — Android touch viewport) + `webkit` (Desktop Safari) + `mobile-safari` (iPhone 14 — iOS touch viewport). Firefox skipped — zero LIFF user share.
 
 **Why source modules, not Vite-built bundles?**
 Bundle hashes change every build (`b2b-catalog.XP478u-U.js`). Stable test fixtures need stable URLs. Importing source modules directly via `<script type="module">` works because Chromium handles native ES module resolution. Phase 7 V.1.0+ will swap to bundles once a Vite manifest plugin emits `b2b-catalog.json` mapping entry → hashed file.
@@ -136,7 +136,6 @@ MODIFIED (1 file):
 ### Phase 7 V.1.0+
 - Real LIFF SDK initialization (currently mocked at HTML fixture level)
 - Full place-order user flow once Phase 2 Vite migration extracts inline JS
-- WebKit project for iOS/Safari coverage
 - Visual regression (Playwright snapshots) — premature without stable UI
 
 ### Phase 8+ (future sprints)
