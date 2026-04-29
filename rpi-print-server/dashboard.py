@@ -152,11 +152,10 @@ def run_cmd(args, timeout=5):
 
 @app.route('/')
 def index():
-    # V.6 (2026-04-29): inject api_key from config.json into template (matches kiosk.html
-    # pattern at line 401). Solves "Unauthorized" UX — admin opens dashboard and it just
-    # works without needing ?key= URL param. Security note: index route is on LAN-only
-    # admin port (5555); api_key embedded in HTML is acceptable trade-off matching
-    # existing kiosk.html precedent. JS still falls back to URL/sessionStorage if needed.
+    # V.6.1 (2026-04-29 hotfix): config is NOT global — must call load_config() per request
+    # (mirrors pattern at lines 90, 108, 166, 401, 405, 415, etc.). V.6 missed this → 500
+    # Internal Server Error on every dashboard load. kiosk handler (line 401) does it right.
+    config = load_config()
     return render_template('dashboard.html', api_key=config.get('api_key', ''))
 
 
