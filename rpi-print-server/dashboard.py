@@ -239,7 +239,13 @@ def api_queue():
 @require_auth
 def api_logs():
     """Read recent log lines."""
-    lines = min(int(request.args.get('lines', 50)), 500)
+    # V.5 HIGH-B fix: graceful int() — was ValueError on "?lines=abc" → 500 traceback leak.
+    # Mirror HIGH-4 pattern from api_test_picking_list.
+    try:
+        lines = int(request.args.get('lines') or 50)
+    except (TypeError, ValueError):
+        return jsonify({'logs': '', 'source': 'error', 'error': 'invalid_lines — must be integer'}), 400
+    lines = max(1, min(lines, 500))
     if os.path.exists(LOG_PATH):
         raw = run_cmd(['tail', '-n', str(lines), LOG_PATH])
         source = 'file'
@@ -302,7 +308,8 @@ def api_test_picking_list():
     # V.4 HIGH-3 fix: non-blocking lock — admin spam click returns 409 immediately
     # (prevent concurrent USB session writes / WeasyPrint queue overload on Pi).
     if not _test_print_lock.acquire(blocking=False):
-        return jsonify({'ok': False, 'error': 'test_print_in_flight — กำลังประมวลผล test ก่อนหน้านี้อยู่ รอสักครู่'}), 409
+        # V.5 LOW-D fix: clearer wait estimate
+        return jsonify({'ok': False, 'error': 'test_print_in_flight — กำลังประมวลผล test ก่อนหน้านี้อยู่ ลองอีกครั้งใน ~30 วินาที'}), 409
 
     try:
         # V.4 MED-2 fix: skip PrinterManager allocation in dry_run path

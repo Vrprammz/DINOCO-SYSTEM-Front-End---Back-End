@@ -208,21 +208,72 @@ body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; background:#0f
 <script>
 const API = '';
 
-// V.4 (2026-04-29) — auth helper: extract api_key จาก URL ?key= แล้ว reuse บน X-Print-Key header
-// ของทุก fetch ที่ต้อง @require_auth (test-print, test-picking-list, logs, service control, reprint).
-// Without this, fetch() doesn't inherit the ?key= query param → all auth-gated endpoints return 401.
-const _API_KEY = (function() {
+// V.5 (2026-04-29) — auth resolution chain: URL ?key= → sessionStorage → inline prompt banner.
+// Solves "Unauthorized" cascade when admin opens dashboard without ?key= in URL.
+// Strategy:
+//   1. URL ?key= → save to sessionStorage + scrub URL bar (safer for screenshots)
+//   2. sessionStorage fallback (returning visit, no URL key)
+//   3. If still empty → show inline banner with input → save → reload
+let _API_KEY = (function() {
   try {
     const u = new URL(window.location.href);
-    return u.searchParams.get('key') || '';
+    const fromUrl = u.searchParams.get('key');
+    if (fromUrl) {
+      sessionStorage.setItem('rpi_api_key', fromUrl);
+      // Scrub ?key= from address bar — admin can screenshot/share without leaking key
+      try {
+        const clean = u.origin + u.pathname + u.hash;
+        window.history.replaceState({}, document.title, clean);
+      } catch (e) {}
+      return fromUrl;
+    }
+    return sessionStorage.getItem('rpi_api_key') || '';
   } catch (e) { return ''; }
 })();
 
+// V.5 MED-C fix: clone full options object (defensive — caller's options not mutated)
 async function _authedFetch(url, options) {
-  options = options || {};
-  options.headers = Object.assign({}, options.headers || {});
-  if (_API_KEY) options.headers['X-Print-Key'] = _API_KEY;
-  return fetch(url, options);
+  const opts = Object.assign({}, options || {});
+  opts.headers = Object.assign({}, opts.headers || {});
+  if (_API_KEY) opts.headers['X-Print-Key'] = _API_KEY;
+  return fetch(url, opts);
+}
+
+// V.5 LOW-B fix: _escHtml moved up — used by both loadPrinters/loadQueue (HIGH-A) +
+// testPickingPrint result render. Keep close to _authedFetch for visual locality.
+function _escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+  });
+}
+
+// V.5 (NEW) — show inline banner if API key missing (replaces silent 401 cascade)
+function _renderApiKeyBanner() {
+  if (_API_KEY) return;  // already authenticated
+  const banner = document.createElement('div');
+  banner.id = 'api-key-banner';
+  banner.style.cssText = 'position:sticky;top:0;z-index:1000;background:#fbbf24;color:#000;padding:10px 16px;font-size:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:2px solid #d97706';
+  banner.innerHTML = '<span><b>⚠️ ต้องใส่ API Key</b> — ดูจาก <code style="background:#fff7ed;padding:2px 6px;border-radius:3px">config.json</code> field <code style="background:#fff7ed;padding:2px 6px;border-radius:3px">api_key</code></span>' +
+    '<input type="password" id="api-key-input" placeholder="paste api_key" style="flex:1;min-width:200px;padding:6px 10px;border:1px solid #92400e;border-radius:4px;font-size:13px;background:#fff;color:#000">' +
+    '<button id="api-key-save" style="padding:6px 14px;background:#000;color:#fbbf24;border:none;border-radius:4px;cursor:pointer;font-weight:700;font-size:13px">บันทึก</button>';
+  document.body.insertBefore(banner, document.body.firstChild);
+  document.getElementById('api-key-save').addEventListener('click', function() {
+    const v = document.getElementById('api-key-input').value.trim();
+    if (!v) { alert('กรอก api_key ก่อน'); return; }
+    sessionStorage.setItem('rpi_api_key', v);
+    _API_KEY = v;
+    banner.remove();
+    toast('บันทึก API key — โหลดข้อมูลใหม่', true);
+    // Reload all data with new key
+    if (typeof loadStatus === 'function') loadStatus();
+    if (typeof loadPrinters === 'function') loadPrinters();
+    if (typeof loadQueue === 'function') loadQueue();
+    if (typeof loadLogs === 'function') loadLogs();
+  });
+  // Allow Enter key to submit
+  document.getElementById('api-key-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') document.getElementById('api-key-save').click();
+  });
 }
 
 function toast(msg, ok) {
@@ -277,17 +328,21 @@ async function loadPrinters() {
       return;
     }
 
+    // V.5 HIGH-A fix: escape printer name + status (defense-in-depth — CUPS printer names
+    // are sysadmin-controlled but defensive coding is consistent across innerHTML usage)
     el.innerHTML = d.printers.map(p => {
       const bc = p.status === 'idle' ? 'badge-green' : p.status === 'printing' ? 'badge-yellow' : 'badge-red';
+      const name = _escHtml(p.name);
+      const status = _escHtml(p.status);
       return `<div class="printer-card">
-        <div><div class="printer-name">${p.name}</div></div>
-        <span class="badge ${bc}">${p.status}</span>
+        <div><div class="printer-name">${name}</div></div>
+        <span class="badge ${bc}">${status}</span>
       </div>`;
     }).join('');
 
-    // Update test-print select
+    // Update test-print select — escape value attr + display text
     sel.innerHTML = '<option value="">-- select printer --</option>' +
-      d.printers.map(p => `<option value="${p.name}">${p.name} (${p.status})</option>`).join('');
+      d.printers.map(p => `<option value="${_escHtml(p.name)}">${_escHtml(p.name)} (${_escHtml(p.status)})</option>`).join('');
   } catch(e) {
     document.getElementById('printer-list').innerHTML = '<div class="empty">Cannot load printers</div>';
   }
@@ -303,7 +358,8 @@ async function loadQueue() {
       el.innerHTML = '<div class="empty">Queue is empty</div>';
       return;
     }
-    el.innerHTML = d.jobs.map(j => `<div class="queue-item">${j}</div>`).join('');
+    // V.5 HIGH-A fix: escape job IDs (server-supplied)
+    el.innerHTML = d.jobs.map(j => `<div class="queue-item">${_escHtml(j)}</div>`).join('');
   } catch(e) {
     document.getElementById('queue-list').innerHTML = '<div class="empty">Cannot load queue</div>';
   }
@@ -422,6 +478,9 @@ async function svcAction(action) {
     toast('Error: ' + e.message, false);
   }
 }
+
+// V.5: Show API key banner if missing — admin can paste key inline (no need to construct URL)
+_renderApiKeyBanner();
 
 // Initial load
 loadStatus();

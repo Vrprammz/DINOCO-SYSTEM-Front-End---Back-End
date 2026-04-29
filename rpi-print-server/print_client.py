@@ -630,7 +630,7 @@ def process_job(job, config, printer_mgr):
                 box_num = 0
                 box_items = []
                 for item in order.get('items', []):
-                    # V.42.2 V.4 (HIGH-2 fix): use single-source helper from picking_layout.
+                    # V.42.2 + V.4 HIGH-2 fix: use single-source helper from picking_layout.
                     # Was: inline pack_mode logic duplicated here (CUPS fallback path) — drift risk
                     # if formula changes in helper. Now matches USB session path (line 526).
                     item_boxes = pick_count_boxes_for_item(item)

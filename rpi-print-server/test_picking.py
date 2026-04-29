@@ -418,8 +418,11 @@ def run_test_picking_print(
     saved_paths = []
     if dry_run:
         # Keep PDFs in tmp/ for review.
-        # V.4 MED-1 fix: shutil.move() (atomic on same fs) — prevents data loss
-        # if copy succeeded but unlink failed (was: copy+unlink → silent loss on copy fail).
+        # V.4 MED-1 / V.5 doc-fix: shutil.move() — atomic ON SAME filesystem.
+        # Cross-fs (e.g. /tmp tmpfs → SD card tmp/): falls back internally to copy + unlink.
+        # Best-effort cleanup of source on move() failure (try/except below).
+        # Improvement vs V3: V3 did `copy + unconditional unlink` → silent data loss on copy fail.
+        # V4+: failure path logged + src cleanup attempted = no silent loss.
         tmp_dir = os.path.join(base_dir, 'tmp')
         os.makedirs(tmp_dir, exist_ok=True)
         timestamp = int(time.time())
