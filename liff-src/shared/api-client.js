@@ -160,9 +160,12 @@ export function createB2BApi({
         /** POST /modify-order — admin-only edit of pending order */
         modifyOrder: (orderId, payload) =>
             api("POST", `/modify-order/${encodeURIComponent(orderId)}`, payload),
-        /** POST /cancel-request — customer-initiated cancel (FSM transition) */
+        /** POST /cancel-request — customer-initiated cancel (FSM transition).
+         *  Production endpoint takes `order_id` in body, not path (V.41.3
+         *  per [B2B] Snippet 3 line 116). */
         cancelRequest: (orderId, reason = "") =>
-            api("POST", `/cancel-request/${encodeURIComponent(orderId)}`, {
+            api("POST", "/cancel-request", {
+                order_id: orderId,
                 reason,
             }),
         /** GET /ticket/{id} — single order detail */

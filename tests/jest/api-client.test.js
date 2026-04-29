@@ -287,7 +287,9 @@ describe("createB2BApi", () => {
         expect(JSON.parse(init.body)).toEqual(payload);
     });
 
-    test("cancelRequest URL-encodes orderId", async () => {
+    test("cancelRequest sends order_id + reason in body (no path param)", async () => {
+        // Production [B2B] Snippet 3 V.41.3 registers /cancel-request
+        // (no {id} path param) and reads order_id from request body.
         const fetchMock = jest.fn(async () => ({
             ok: true,
             status: 200,
@@ -296,13 +298,15 @@ describe("createB2BApi", () => {
         global.fetch = fetchMock;
 
         const api = createB2BApi({ base: "/wp-json/b2b/v1" });
-        await api.cancelRequest("order/with/slashes", "ลูกค้าขอยกเลิก");
+        await api.cancelRequest(12345, "ลูกค้าขอยกเลิก");
 
         const [url, init] = fetchMock.mock.calls[0];
-        expect(url).toBe(
-            "/wp-json/b2b/v1/cancel-request/order%2Fwith%2Fslashes"
-        );
-        expect(JSON.parse(init.body)).toEqual({ reason: "ลูกค้าขอยกเลิก" });
+        expect(url).toBe("/wp-json/b2b/v1/cancel-request");
+        expect(init.method).toBe("POST");
+        expect(JSON.parse(init.body)).toEqual({
+            order_id: 12345,
+            reason: "ลูกค้าขอยกเลิก",
+        });
     });
 
     test("getTicket URL-encodes orderId", async () => {
