@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B -- RPi Print Server Dashboard  V.43.1
+DINOCO B2B -- RPi Print Server Dashboard  V.44.0
 Web UI for monitoring printers, testing prints, viewing logs,
 and Manual Flash Shipping (standalone label creation).
+
+V.44.0 (2026-04-29) — Manual Shipping full redesign + product picker:
+    - NEW /api/product-search proxy → /b2b/v1/rpi-products (X-Print-Key auth, slim
+      payload). Powers manual_ship.html V.44.0 product picker modal. 5min cache
+      in tmp/products_cache.json (~500 SKUs typical).
+    - FIX box-templates empty dropdown — switch from /dinoco-stock/v1/box-templates
+      (required wp_rest nonce → 403 with X-Print-Key) to new /b2b/v1/rpi-box-templates
+      proxy that accepts X-Print-Key. Pre-existing tmp/box-templates.json caches
+      remain compatible (same JSON shape).
+    - Manual cache invalidation via ?nocache=1 query param on both endpoints (admin
+      can refresh after WP catalog edit without waiting for TTL).
 
 V.43.1 (2026-04-20) — code review fixes:
     - M1: thread-safety lock on _v43_box_tpl_cache (read/write under _v43_tpl_lock)
@@ -933,43 +944,52 @@ def _ensure_tmp_dir():
     return tmp_dir
 
 
-def _fetch_box_templates_from_wp():
+def _fetch_box_templates_from_wp(force_refresh=False):
     """Fetch box templates from WP, cache 1hr in tmp/ + in-memory.
+
+    V.44.0: switched WP endpoint from /dinoco-stock/v1/box-templates (required
+    wp_rest nonce — failed 403 with X-Print-Key) to /b2b/v1/rpi-box-templates
+    (Snippet 3 V.42.7 — accepts X-Print-Key).
 
     Returns list of templates or empty list on failure.
     Falls back to stale cache if WP unreachable.
+    Pass force_refresh=True to bypass all caches (admin nocache flow).
     """
     config = load_config()
     ttl_sec = int(config.get('cache_ttl_templates_sec', 3600))
     now_ts = time.time()
 
-    # V.43.1 M1: in-memory cache hit under lock
-    with _v43_tpl_lock:
-        if _v43_box_tpl_cache['data'] is not None and (now_ts - _v43_box_tpl_cache['ts']) < ttl_sec:
-            return _v43_box_tpl_cache['data']
+    # V.43.1 M1: in-memory cache hit under lock (skip if force_refresh)
+    if not force_refresh:
+        with _v43_tpl_lock:
+            if _v43_box_tpl_cache['data'] is not None and (now_ts - _v43_box_tpl_cache['ts']) < ttl_sec:
+                return _v43_box_tpl_cache['data']
 
-    # File cache hit (survives restart) — read outside lock
-    if os.path.exists(_v43_tpl_cache_file):
-        try:
-            age = now_ts - os.path.getmtime(_v43_tpl_cache_file)
-            if age < ttl_sec:
-                with open(_v43_tpl_cache_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                with _v43_tpl_lock:
-                    _v43_box_tpl_cache['ts'] = now_ts
-                    _v43_box_tpl_cache['data'] = data
-                return data
-        except (OSError, json.JSONDecodeError):
-            pass  # fall through to WP fetch
+        # File cache hit (survives restart) — read outside lock
+        if os.path.exists(_v43_tpl_cache_file):
+            try:
+                age = now_ts - os.path.getmtime(_v43_tpl_cache_file)
+                if age < ttl_sec:
+                    with open(_v43_tpl_cache_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    with _v43_tpl_lock:
+                        _v43_box_tpl_cache['ts'] = now_ts
+                        _v43_box_tpl_cache['data'] = data
+                    return data
+            except (OSError, json.JSONDecodeError):
+                pass  # fall through to WP fetch
 
     # Fetch from WP (network call outside lock — don't block other readers)
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
         api_key = config.get('api_key', '')
-        url = f'{wp_url}/wp-json/dinoco-stock/v1/box-templates'
-        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=10)
+        # V.44.0: use new b2b/v1/rpi-box-templates (X-Print-Key authenticated)
+        url = f'{wp_url}/wp-json/b2b/v1/rpi-box-templates'
+        resp = http_requests.get(url, headers={'X-Print-Key': api_key}, timeout=10)
         body = resp.json() if resp.ok else {}
         tpls = body.get('templates', []) if isinstance(body, dict) else []
+        if not resp.ok:
+            logger.warning(f'[V.44] box-templates HTTP {resp.status_code} — body={str(body)[:200]}')
         # V.43.1 M2: atomic persist — write to sibling .tmp then os.replace
         _ensure_tmp_dir()
         try:
@@ -1000,16 +1020,136 @@ def _fetch_box_templates_from_wp():
 @app.route('/api/box-templates')
 @require_auth
 def api_box_templates():
-    """Proxy GET /dinoco-stock/v1/box-templates with tmp/ file cache 1hr.
+    """Proxy GET /b2b/v1/rpi-box-templates with tmp/ file cache 1hr.
 
-    Returns {templates: [...]} compatible with WP response shape.
+    V.44.0: backend switched from /dinoco-stock/v1/* (nonce-gated) to
+    /b2b/v1/rpi-box-templates (X-Print-Key auth). Pass ?nocache=1 to bypass
+    cache after admin edits the catalog.
+
+    Returns {ok, templates: [...], cached: bool} compatible with WP response shape.
     Falls back to stale cache on WP failure (logged).
     """
-    tpls = _fetch_box_templates_from_wp()
+    force_refresh = request.args.get('nocache', '') in ('1', 'true', 'yes')
+    tpls = _fetch_box_templates_from_wp(force_refresh=force_refresh)
     # V.43.1 M1: read cache ts under lock
     with _v43_tpl_lock:
-        cached = _v43_box_tpl_cache['ts'] > 0
-    return jsonify({'ok': True, 'templates': tpls, 'cached': cached})
+        cached = _v43_box_tpl_cache['ts'] > 0 and not force_refresh
+    return jsonify({'ok': True, 'templates': tpls, 'cached': cached, 'count': len(tpls)})
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# V.44.0 — Product Picker proxy (manual_ship.html V.44.0)
+# ═════════════════════════════════════════════════════════════════════════
+
+# In-memory + file cache for product list (5min TTL — catalog edits propagate)
+_v44_products_cache = {'ts': 0, 'data': None}
+_v44_products_cache_file = os.path.join(BASE_DIR, 'tmp', 'products_cache.json')
+_v44_products_lock = threading.Lock()
+
+
+def _fetch_products_from_wp(force_refresh=False):
+    """Fetch product catalog (slim payload) from /b2b/v1/rpi-products.
+
+    Returns list of {product_sku, title, img, catalog_price, dealer_price,
+    children, stock_status, category}. Cached 5 min (catalog edits propagate
+    fast for picker UX).
+
+    Falls back to stale cache if WP unreachable.
+    """
+    config = load_config()
+    ttl_sec = int(config.get('cache_ttl_products_sec', 300))  # 5 min default
+    now_ts = time.time()
+
+    if not force_refresh:
+        with _v44_products_lock:
+            if _v44_products_cache['data'] is not None and (now_ts - _v44_products_cache['ts']) < ttl_sec:
+                return _v44_products_cache['data']
+
+        if os.path.exists(_v44_products_cache_file):
+            try:
+                age = now_ts - os.path.getmtime(_v44_products_cache_file)
+                if age < ttl_sec:
+                    with open(_v44_products_cache_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    with _v44_products_lock:
+                        _v44_products_cache['ts'] = now_ts
+                        _v44_products_cache['data'] = data
+                    return data
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    try:
+        wp_url = config.get('wp_url', '').rstrip('/')
+        api_key = config.get('api_key', '')
+        url = f'{wp_url}/wp-json/b2b/v1/rpi-products'
+        resp = http_requests.get(url, headers={'X-Print-Key': api_key}, timeout=15)
+        if not resp.ok:
+            logger.warning(f'[V.44] rpi-products HTTP {resp.status_code} — body={resp.text[:200]}')
+            with _v44_products_lock:
+                return _v44_products_cache['data'] or []
+        body = resp.json() if resp.ok else {}
+        products = body.get('products', []) if isinstance(body, dict) else []
+
+        # Atomic persist (V.43.1 M2 pattern)
+        _ensure_tmp_dir()
+        try:
+            tmpdir = os.path.dirname(_v44_products_cache_file) or '.'
+            with tempfile.NamedTemporaryFile('w', dir=tmpdir, delete=False, suffix='.tmp', encoding='utf-8') as tf:
+                json.dump(products, tf, ensure_ascii=False)
+                tmp_path = tf.name
+            try:
+                os.replace(tmp_path, _v44_products_cache_file)
+            except OSError:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        with _v44_products_lock:
+            _v44_products_cache['ts'] = now_ts
+            _v44_products_cache['data'] = products
+        return products
+    except Exception as e:
+        logger.warning(f'[V.44] product fetch failed: {e}')
+        with _v44_products_lock:
+            return _v44_products_cache['data'] or []
+
+
+@app.route('/api/product-search')
+@require_auth
+def api_product_search():
+    """Proxy GET /b2b/v1/rpi-products with tmp/ file cache 5 min.
+
+    Query params:
+      - q       : search keyword (filtered client-side from cached list)
+      - nocache : '1' bypasses all caches + re-fetches from WP
+
+    Returns: {ok, products: [...], total, cached}
+    """
+    force_refresh = request.args.get('nocache', '') in ('1', 'true', 'yes')
+    q = (request.args.get('q', '') or '').strip().lower()
+    products = _fetch_products_from_wp(force_refresh=force_refresh)
+
+    if q:
+        # Client-side filter (catalog small, ~500 SKUs)
+        filtered = []
+        for p in products:
+            sku = (p.get('product_sku') or '').lower()
+            title = (p.get('title') or '').lower()
+            if q in sku or q in title:
+                filtered.append(p)
+        products = filtered
+
+    with _v44_products_lock:
+        cached = _v44_products_cache['ts'] > 0 and not force_refresh
+    return jsonify({
+        'ok': True,
+        'products': products,
+        'total': len(products),
+        'cached': cached,
+    })
 
 
 @app.route('/api/sku-shipping-scanner/<sku>')
@@ -1124,6 +1264,6 @@ if __name__ == '__main__':
     # V.43.0: ensure tmp/ cache dir exists
     _ensure_tmp_dir()
 
-    print(f'DINOCO Print Dashboard V.43.1: http://0.0.0.0:{args.port}')
+    print(f'DINOCO Print Dashboard V.44.0: http://0.0.0.0:{args.port}')
     print(f'Manual Shipping: http://0.0.0.0:{args.port}/manual-ship')
     app.run(host=args.host, port=args.port, debug=False)

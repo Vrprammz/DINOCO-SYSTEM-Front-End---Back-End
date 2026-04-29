@@ -1,6 +1,13 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.7 — manual_ship V.44.0 support (2026-04-29): added 2 RPi-proxy GET       ║
+ * ║                   endpoints with X-Print-Key auth so dashboard.py can populate the       ║
+ * ║                   product picker + box template dropdown without forging admin nonce.    ║
+ * ║                   `/b2b/v1/rpi-products` (delegates to b2b_rest_list_products + slim     ║
+ * ║                   payload + ?search=KW) + `/b2b/v1/rpi-box-templates` (proxies            ║
+ * ║                   dinoco_get_all_box_templates). Fixes empty-dropdown bug on RPi UI      ║
+ * ║                   where /dinoco-stock/v1/box-templates required wp_rest nonce.           ║
  * ║  Version: V.42.6 — Phase 4c (2026-04-24): migrate 1 flag get_option → dinoco_config():  ║
  * ║    inventory.shipping_meta_enabled (manual-ship endpoint D-12 articleCategory gate).    ║
  * ║    Backward compat preserved via function_exists guard + legacy_option mapping.         ║
@@ -245,6 +252,17 @@ add_action( 'rest_api_init', function () {
     // V.40.1: Distributor list for RPi manual shipping
     register_rest_route( 'b2b/v1', '/rpi-distributors', array(
         'methods'=>'GET','callback'=>'b2b_rest_rpi_distributors','permission_callback'=>$print_perm,
+    ));
+    // V.42.7 (manual_ship V.44.0): RPi product picker — proxies b2b_rest_list_products()
+    //   reuses Snippet 9 helper (still loaded as dead code) so RPi UI doesn't need to
+    //   forge admin nonce for /b2b/v1/products. read-only, X-Print-Key auth.
+    register_rest_route( 'b2b/v1', '/rpi-products', array(
+        'methods'=>'GET','callback'=>'b2b_rest_rpi_products','permission_callback'=>$print_perm,
+    ));
+    // V.42.7 (manual_ship V.44.0): RPi box templates — proxies dinoco_get_all_box_templates()
+    //   so RPi /api/box-templates can populate the dropdown. read-only, X-Print-Key auth.
+    register_rest_route( 'b2b/v1', '/rpi-box-templates', array(
+        'methods'=>'GET','callback'=>'b2b_rest_rpi_box_templates','permission_callback'=>$print_perm,
     ));
 });
 
@@ -5051,6 +5069,89 @@ function b2b_rest_rpi_distributors( WP_REST_Request $r ) {
     }
 
     return new WP_REST_Response( array( 'success' => true, 'data' => $results ), 200 );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.42.7 (manual_ship V.44.0): RPi Product Picker — read-only proxy
+//   Replicates /b2b/v1/products shape but accepts X-Print-Key auth so the
+//   RPi manual-ship UI can render a search-and-pick modal without needing
+//   admin WP nonce. delegates to b2b_rest_list_products() (Snippet 9 dead-
+//   code helper still loaded — same source of truth as Manual Invoice).
+//   Optional ?search=KW filters server-side (paginate client-side <500 SKUs).
+// ═══════════════════════════════════════════════════════════════
+function b2b_rest_rpi_products( WP_REST_Request $r ) {
+    try {
+        if ( ! function_exists( 'b2b_rest_list_products' ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'b2b_rest_list_products() not loaded — check Snippet 9 Admin Control Panel'
+            ), 503 );
+        }
+        $resp = b2b_rest_list_products( $r );
+        $body = $resp instanceof WP_REST_Response ? $resp->get_data() : (array) $resp;
+        if ( empty( $body['success'] ) ) return new WP_REST_Response( $body, 500 );
+        $products = isset( $body['products'] ) && is_array( $body['products'] ) ? $body['products'] : array();
+        $search   = trim( (string) $r->get_param( 'search' ) );
+        if ( $search !== '' ) {
+            $q = function_exists('mb_strtolower') ? mb_strtolower( $search, 'UTF-8' ) : strtolower( $search );
+            $products = array_values( array_filter( $products, function( $p ) use ( $q ) {
+                $sku = isset($p['product_sku']) ? (string) $p['product_sku'] : '';
+                $title = isset($p['title']) ? (string) $p['title'] : '';
+                $sku_l = function_exists('mb_strtolower') ? mb_strtolower( $sku, 'UTF-8' ) : strtolower( $sku );
+                $title_l = function_exists('mb_strtolower') ? mb_strtolower( $title, 'UTF-8' ) : strtolower( $title );
+                return ( strpos( $sku_l, $q ) !== false ) || ( strpos( $title_l, $q ) !== false );
+            } ) );
+        }
+        // Trim payload — manual-ship picker only needs core fields (no tier prices for shipping flow)
+        $slim = array_map( function( $p ) {
+            return array(
+                'product_sku'    => isset($p['product_sku']) ? $p['product_sku'] : '',
+                'title'          => isset($p['title']) ? $p['title'] : '',
+                'img'            => isset($p['img']) ? $p['img'] : '',
+                'catalog_price'  => isset($p['catalog_price']) ? floatval($p['catalog_price']) : 0,
+                'dealer_price'   => isset($p['dealer_price']) ? floatval($p['dealer_price']) : 0,
+                'children'       => isset($p['children']) ? $p['children'] : array(),
+                'stock_status'   => isset($p['stock_status']) ? $p['stock_status'] : 'in_stock',
+                'category'       => isset($p['product_category']) ? $p['product_category'] : '',
+            );
+        }, $products );
+        return new WP_REST_Response( array(
+            'success'  => true,
+            'products' => $slim,
+            'total'    => count( $slim ),
+        ), 200 );
+    } catch ( \Throwable $e ) {
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[RPi Products] ' . $e->getMessage() );
+        return new WP_REST_Response( array( 'success' => false, 'message' => 'Internal error' ), 500 );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// V.42.7 (manual_ship V.44.0): RPi Box Templates — read-only proxy
+//   Same shape as /dinoco-stock/v1/box-templates but X-Print-Key auth.
+//   Fixes the "empty dropdown" bug — Inventory snippet's $inv_perm requires
+//   valid wp_rest nonce which RPi proxy can't forge with its api_key.
+// ═══════════════════════════════════════════════════════════════
+function b2b_rest_rpi_box_templates( WP_REST_Request $r ) {
+    try {
+        if ( ! function_exists( 'dinoco_get_all_box_templates' ) ) {
+            return new WP_REST_Response( array(
+                'ok' => false,
+                'error' => 'dinoco_get_all_box_templates() not loaded — check Inventory snippet'
+            ), 503 );
+        }
+        $owner = sanitize_text_field( $r->get_param( 'owner_type' ) );
+        $list  = dinoco_get_all_box_templates( $owner ?: null );
+        if ( ! is_array( $list ) ) $list = array();
+        return new WP_REST_Response( array(
+            'ok'        => true,
+            'templates' => $list,
+            'count'     => count( $list ),
+        ), 200 );
+    } catch ( \Throwable $e ) {
+        if ( function_exists( 'b2b_log' ) ) b2b_log( '[RPi BoxTpl] ' . $e->getMessage() );
+        return new WP_REST_Response( array( 'ok' => false, 'error' => 'Internal error' ), 500 );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
