@@ -10,6 +10,38 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Added — BO Queue UX V.3.0 (2026-04-29) — Bulk ops + Manual ETA + docs
+
+Closes 2 deferred-low-priority items from `FEATURE-SPEC-B2B-BACKORDER-2026-04-16.md`.
+Backend endpoints existed since V.1.6 — V.3.0 ships the missing Admin Dashboard UI.
+
+**Snippet 16 V.3.0** (`0542230`):
+- Per-row checkbox column + select-all in `<thead>` + sticky bulk-action bar
+  (✅ จัดส่ง / ❌ ยกเลิก / ล้างการเลือก) shown only when ≥1 row selected
+- `📅 ETA` button per pending/ready row → `dinocoModal.prompt` for days (0-90) +
+  optional admin note appended via `|` separator
+- Selection state preserved via `Set<bo_queue_id>` across `loadQueue()` refresh,
+  cleared on filter change
+- Pattern reuse: `dinocoModal.confirm/alert/prompt` with try/catch native fallback
+  (V.1.14/V.1.15 modal migration); `esc()` XSS-safe interpolation; scoped CSS
+  `.b2b-bo-admin` namespace + mobile `@media (max-width: 768px)` breakpoint
+- Per-item error reporting via `results.errors[]` (V.1.11 contract)
+
+**Docs** (`a0b4dc7`):
+
+- `WORKFLOW-REFERENCE.md` § 2.10.6 V.3.0 Bulk Operations + Manual ETA flow
+- `WORKFLOW-REFERENCE.md` § 2.10.7 BO FSM State Diagram (Mermaid stateDiagram-v2)
+  visualizing 2 new states (pending_stock_review, partial_fulfilled) + 8 new
+  transitions + transition guards (invariant, undo deadline, walk-in bypass)
+- NEW `B2B-BACKORDER-REGRESSION-MANIFEST.md` — 75 scenarios across 8 sections:
+  Core opaque accept (10) + Admin split (10) + Restock cycle (10) + Bulk ops
+  V.3.0 (8) + FSM transitions (5) + Security (8) + Performance (5) + Config +
+  Modal + DB schema (15)
+
+**Backend**: zero changes — endpoints `/bo-bulk-fulfill`, `/bo-bulk-cancel`,
+`/bo-update-eta` validated since V.1.6. cancelled/fulfilled rows omit checkbox
+and ETA button (readonly state — backend status guard returns invalid_status).
+
 ### Fixed — Flash V.42 deep audit (2026-04-29) — 8 findings closed
 
 api-specialist + feature-architect agents dispatched for full audit of Flash V.42
