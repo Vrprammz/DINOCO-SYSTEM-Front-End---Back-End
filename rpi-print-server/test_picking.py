@@ -218,18 +218,20 @@ def _pick_items_for_scenario(scenario):
 
 def _add_qty_pricing(items):
     """Add realistic qty + price per item.
-    V.4 LOW-2/LOW-3: diversified — production prices range 290-8990 + discount 0-30%."""
+    V.6.5 (2026-04-29): qty ranges ลดลง — เพื่อกัน TSPL batch ใหญ่เกิน USB buffer (เคย 4MB → timeout)
+    + ลดกระดาษเปลืองตอน live print. Picking list ยัง simulate production hierarchy ได้
+    แต่ total boxes ลดลง ~50%. label_sample_count ใน run_test_picking_print() override
+    การพิมพ์ใบปะหน้าจริงให้น้อยลงอีก (default 2 sample)."""
     for it in items:
         pm = it['pack_mode']
         if pm == 'bulk_pack':
-            it['qty'] = random.choice([20, 50, 100])
+            it['qty'] = random.choice([20, 30])  # 1 box always (was 1-2)
         elif pm == 'multi_box':
-            it['qty'] = random.choice([1, 2, 3])
+            it['qty'] = 1  # 2 boxes always (was 2-6)
         elif pm == 'assembled_set':
-            it['qty'] = random.choice([1, 2])
+            it['qty'] = 1  # 1 box always (was 1-2)
         else:
-            it['qty'] = random.choice([1, 2, 5])
-        # Diversified price range — round to 10s for realistic THB pricing
+            it['qty'] = random.choice([1, 2])  # 1-2 boxes (was 1-5)
         price = random.randint(29, 899) * 10  # 290-8990 THB
         it['price'] = price
         it['retail_price'] = price
@@ -281,8 +283,15 @@ def run_test_picking_print(
     scenario='mixed',
     target_pages=2,
     dry_run=False,
+    label_sample_count=2,
 ):
     """Execute test print mirroring production: picking pages + shipping labels via batch USB.
+
+    V.6.5 (2026-04-29) — label_sample_count default 2:
+    Picking list shows ALL items + total_boxes (full production simulation), but only
+    first N shipping labels are rendered/printed (saves paper + prevents 4MB+ USB
+    buffer overflow that caused Errno 110 timeout). Admin can opt-in via UI checkbox
+    to print all labels (label_sample_count=999) for stress test.
 
     Args:
         printer_mgr: PrinterManager instance (for create_usb_session + convert_to_tspl)
@@ -292,10 +301,11 @@ def run_test_picking_print(
         scenario: one of SCENARIOS keys
         target_pages: 1-5 (informational; actual pages determined by content)
         dry_run: if True, render PDFs but don't send to printer
+        label_sample_count: max shipping labels to print (default 2 — saves paper)
 
     Returns:
         dict: {ok, scenario, target_pages, actual_pages, items_count, total_boxes,
-               bytes_sent, dry_run, pdf_paths, duration_ms}
+               labels_printed, labels_total, bytes_sent, dry_run, pdf_paths, duration_ms}
     """
     start_ms = int(time.time() * 1000)
 
@@ -375,9 +385,16 @@ def run_test_picking_print(
                 'box_template_dims': it.get('box_template_dims', ''),
             })
 
-    for i, bi in enumerate(box_items):
+    # V.6.5: only render first `label_sample_count` shipping labels — saves paper
+    # + prevents USB write timeout from 4MB+ TSPL batch (real total_boxes shown in
+    # picking list, but actual labels printed = sample only).
+    labels_to_render = box_items[:max(0, int(label_sample_count or 0))]
+    for i, bi in enumerate(labels_to_render):
+        # Mark sample labels distinctively so admin doesn't confuse with full set
+        bi_marked = dict(bi)
+        bi_marked['item_name'] = '[SAMPLE %d/%d] %s' % (i + 1, len(labels_to_render), bi.get('item_name', ''))
         label_ctx = {**base_context,
-                     'box': bi,
+                     'box': bi_marked,
                      'flash': {
                          'pno': 'TEST%07d%02d' % (tid, i + 1),
                          'sort_code': 'TEST',
@@ -458,7 +475,10 @@ def run_test_picking_print(
         'actual_pages': actual_pages,
         'items_count': len(items),
         'total_boxes': total_boxes,
-        'shipping_labels': len(box_items),
+        # V.6.5: distinguish between simulated total + actually-printed sample
+        'shipping_labels': len(box_items),         # full simulation count (production would print all these)
+        'labels_printed': len(labels_to_render),   # sample actually rendered/sent
+        'labels_sample_mode': len(labels_to_render) < len(box_items),
         'bytes_sent': len(all_tspl) if sent else 0,
         'bytes_total': len(all_tspl),
         'segments': bytes_per_segment,

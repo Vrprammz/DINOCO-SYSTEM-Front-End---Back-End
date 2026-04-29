@@ -309,6 +309,14 @@ def api_test_picking_list():
 
     dry_run = bool(body.get('dry_run', False))
 
+    # V.6.5: label_sample_count default 2 — saves paper + prevents 4MB+ USB write timeout.
+    # Admin can override via checkbox "ปริ้นใบปะหน้าทุกกล่อง" → sends 999 = print all.
+    try:
+        label_sample_count = int(body.get('label_sample_count') or 2)
+    except (TypeError, ValueError):
+        label_sample_count = 2
+    label_sample_count = max(0, min(999, label_sample_count))
+
     if scenario not in SCENARIOS:
         return jsonify({'ok': False, 'error': f'invalid_scenario: {scenario}', 'allowed': list(SCENARIOS.keys())}), 400
 
@@ -338,6 +346,7 @@ def api_test_picking_list():
             scenario=scenario,
             target_pages=target_pages,
             dry_run=dry_run,
+            label_sample_count=label_sample_count,
         )
         return jsonify(result)
     except Exception as e:
