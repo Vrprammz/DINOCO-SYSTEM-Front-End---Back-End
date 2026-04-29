@@ -1262,20 +1262,20 @@ def api_product_search():
 @app.route('/api/sku-shipping-scanner/<sku>')
 @require_auth
 def api_sku_shipping_scanner(sku):
-    """Proxy GET /dinoco-stock/v1/sku-shipping-scanner/{sku}.
+    """Proxy GET /b2b/v1/rpi-sku-shipping/{sku} — X-Print-Key auth.
 
-    Stripped response for warehouse_staff role — no pricing/WAC.
-    Called by manual_ship.html V.43 on SKU scan.
+    V.44.1 (2026-04-29): switched from /dinoco-stock/v1/sku-shipping-scanner/
+    (nonce-strict $scanner_perm) to /b2b/v1/rpi-sku-shipping/ (X-Print-Key auth).
+    Old comment claimed 'X-Print-Key matches admin nonce flow' — incorrect; nonce
+    spoof always failed silently. New rpi-sku-shipping proxy in Snippet 3 V.42.9
+    returns same response shape but actually authenticates.
     """
     config = load_config()
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
         api_key = config.get('api_key', '')
-        url = f'{wp_url}/wp-json/dinoco-stock/v1/sku-shipping-scanner/{sku}'
-        # Note: scanner endpoint uses scan_shipping cap but our RPi uses X-Print-Key
-        # so WP accepts via scanner_perm's current_user_can('manage_options') fallback
-        # when X-Print-Key matches admin nonce flow. See Snippet Inventory V.44.0 scanner_perm.
-        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
+        url = f'{wp_url}/wp-json/b2b/v1/rpi-sku-shipping/{sku}'
+        resp = http_requests.get(url, headers={'X-Print-Key': api_key}, timeout=8)
         return jsonify(resp.json()), resp.status_code
     except Exception:
         # V.43.1 M4: redact exception detail to client
@@ -1286,16 +1286,21 @@ def api_sku_shipping_scanner(sku):
 @app.route('/api/sku-shipping/<sku>')
 @require_auth
 def api_sku_shipping_full(sku):
-    """Proxy GET /dinoco-stock/v1/sku-shipping/{sku} — admin full response.
+    """Proxy GET /b2b/v1/rpi-sku-shipping/{sku} — admin full response (X-Print-Key auth).
 
-    Includes catalog + slots + auto-suggest. Used by manual-ship admin/dealer.
+    V.44.1 (2026-04-29): same fix as api_sku_shipping_scanner — switched away from
+    nonce-strict /dinoco-stock/v1/sku-shipping/ to X-Print-Key proxy in Snippet 3.
+    Note: 'full' admin endpoint with catalog+slots+auto-suggest is currently NOT
+    implemented in /b2b/v1/rpi-* family. For now mirror scanner endpoint (same
+    stripped data). If admin needs full data → expand b2b_rest_rpi_sku_shipping
+    handler with ?full=1 query param + slots + auto_suggest fields.
     """
     config = load_config()
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
         api_key = config.get('api_key', '')
-        url = f'{wp_url}/wp-json/dinoco-stock/v1/sku-shipping/{sku}'
-        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
+        url = f'{wp_url}/wp-json/b2b/v1/rpi-sku-shipping/{sku}'
+        resp = http_requests.get(url, headers={'X-Print-Key': api_key}, timeout=8)
         return jsonify(resp.json()), resp.status_code
     except Exception:
         # V.43.1 M4: redact exception detail to client
@@ -1305,6 +1310,13 @@ def api_sku_shipping_full(sku):
 
 def _auto_fill_from_sku(sku):
     """Native helper — used by manual_ship form auto-fill on scan.
+
+    V.44.1 (2026-04-29): switched to /b2b/v1/rpi-sku-shipping/{sku} (X-Print-Key auth)
+    instead of /dinoco-stock/v1/sku-shipping-scanner/{sku} (nonce-strict via $scanner_perm).
+    Old path spoofed `X-WP-Nonce: api_key` → wp_verify_nonce() rejected → silent 403
+    → manual_ship form ไม่ auto-fill. New rpi-sku-shipping proxy ใน Snippet 3 V.42.9
+    returns identical response shape via b2b_verify_print_key().
+    See CLAUDE.md "RPi → WP namespace pattern" — V.44.0 lesson + V.42.9 fix.
 
     Returns: {weight_g, length_cm, width_cm, height_cm, express_category,
              article_category, pack_mode, box_template_id, found: bool}
@@ -1316,8 +1328,8 @@ def _auto_fill_from_sku(sku):
     try:
         wp_url = config.get('wp_url', '').rstrip('/')
         api_key = config.get('api_key', '')
-        url = f'{wp_url}/wp-json/dinoco-stock/v1/sku-shipping-scanner/{sku}'
-        resp = http_requests.get(url, headers={'X-WP-Nonce': api_key, 'X-Print-Key': api_key}, timeout=8)
+        url = f'{wp_url}/wp-json/b2b/v1/rpi-sku-shipping/{sku}'
+        resp = http_requests.get(url, headers={'X-Print-Key': api_key}, timeout=8)
         if not resp.ok:
             return {'found': False, 'http_status': resp.status_code}
         body = resp.json() or {}
