@@ -238,7 +238,7 @@ describe("createB2BApi", () => {
         expect(init.headers["X-B2B-Session"]).toBe("sess-99");
     });
 
-    test("getHistory builds query string", async () => {
+    test("getHistory builds query string against /order-history", async () => {
         const fetchMock = jest.fn(async () => ({
             ok: true,
             status: 200,
@@ -247,14 +247,14 @@ describe("createB2BApi", () => {
         global.fetch = fetchMock;
 
         const api = createB2BApi({ base: "/wp-json/b2b/v1" });
-        await api.getHistory({ status: "paid", limit: 20 });
+        await api.getHistory({ status: "paid", per_page: 20 });
 
         expect(fetchMock.mock.calls[0][0]).toBe(
-            "/wp-json/b2b/v1/history?status=paid&limit=20"
+            "/wp-json/b2b/v1/order-history?status=paid&per_page=20"
         );
     });
 
-    test("getHistory without params omits ?", async () => {
+    test("getHistory without params omits ? — hits /order-history", async () => {
         const fetchMock = jest.fn(async () => ({
             ok: true,
             status: 200,
@@ -265,7 +265,9 @@ describe("createB2BApi", () => {
         const api = createB2BApi({ base: "/wp-json/b2b/v1" });
         await api.getHistory();
 
-        expect(fetchMock.mock.calls[0][0]).toBe("/wp-json/b2b/v1/history");
+        expect(fetchMock.mock.calls[0][0]).toBe(
+            "/wp-json/b2b/v1/order-history"
+        );
     });
 
     test("placeOrder POSTs payload", async () => {
@@ -309,7 +311,10 @@ describe("createB2BApi", () => {
         });
     });
 
-    test("getTicket URL-encodes orderId", async () => {
+    test("getTicket sends ticket_id as query param to /order-detail", async () => {
+        // Production [B2B] Snippet 3 line 103 routes /order-detail and
+        // reads ticket_id via $request->get_param('ticket_id') (query
+        // string), not as a path param. Verified against b2b_rest_order_detail.
         const fetchMock = jest.fn(async () => ({
             ok: true,
             status: 200,
@@ -318,8 +323,10 @@ describe("createB2BApi", () => {
         global.fetch = fetchMock;
 
         const api = createB2BApi({ base: "/wp-json/b2b/v1" });
-        await api.getTicket("12345");
+        await api.getTicket(12345);
 
-        expect(fetchMock.mock.calls[0][0]).toBe("/wp-json/b2b/v1/ticket/12345");
+        expect(fetchMock.mock.calls[0][0]).toBe(
+            "/wp-json/b2b/v1/order-detail?ticket_id=12345"
+        );
     });
 });

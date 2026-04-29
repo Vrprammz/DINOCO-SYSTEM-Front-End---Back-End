@@ -44,9 +44,10 @@ const OPENAPI = path.join(REPO_ROOT, "docs/api/openapi.yaml");
  * will satisfy the assertion.
  */
 const KNOWN_UNDOCUMENTED = new Set([
-    "GET /b2b/v1/history",
-    "POST /b2b/v1/modify-order/{id}",
-    "GET /b2b/v1/ticket/{id}",
+    // (none currently — every api-client.js method maps to a documented
+    // OpenAPI endpoint. Add entries here ONLY when introducing a method
+    // whose endpoint is intentionally not yet documented in the spec,
+    // and add a comment with [Snippet N line X] reference.)
 ]);
 
 /**

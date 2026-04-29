@@ -150,16 +150,14 @@ export function createB2BApi({
         _api: api,
         /** GET /catalog — product list + pricing tier resolved server-side */
         getCatalog: () => api("GET", "/catalog"),
-        /** GET /history — order history for current distributor */
+        /** GET /order-history — paginated order history for current distributor.
+         *  Production [B2B] Snippet 3 V.41.5 supports page, per_page, status. */
         getHistory: (params = {}) => {
             const qs = new URLSearchParams(params).toString();
-            return api("GET", "/history" + (qs ? `?${qs}` : ""));
+            return api("GET", "/order-history" + (qs ? `?${qs}` : ""));
         },
         /** POST /place-order — create new order (FSM draft state) */
         placeOrder: (payload) => api("POST", "/place-order", payload),
-        /** POST /modify-order — admin-only edit of pending order */
-        modifyOrder: (orderId, payload) =>
-            api("POST", `/modify-order/${encodeURIComponent(orderId)}`, payload),
         /** POST /cancel-request — customer-initiated cancel (FSM transition).
          *  Production endpoint takes `order_id` in body, not path (V.41.3
          *  per [B2B] Snippet 3 line 116). */
@@ -168,8 +166,12 @@ export function createB2BApi({
                 order_id: orderId,
                 reason,
             }),
-        /** GET /ticket/{id} — single order detail */
-        getTicket: (orderId) =>
-            api("GET", `/ticket/${encodeURIComponent(orderId)}`),
+        /** GET /order-detail?ticket_id=X — single order detail with ownership
+         *  check. Production [B2B] Snippet 3 line 103 uses query param, not
+         *  path param (verified against b2b_rest_order_detail handler). */
+        getTicket: (orderId) => {
+            const qs = new URLSearchParams({ ticket_id: orderId }).toString();
+            return api("GET", `/order-detail?${qs}`);
+        },
     };
 }
