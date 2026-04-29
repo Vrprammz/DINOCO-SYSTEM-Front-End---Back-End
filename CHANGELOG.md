@@ -55,6 +55,65 @@ incorrect `dinoco_flag_shipping_meta_enabled` to actual `dinoco_shipping_meta_en
 (matches code in CLAUDE.md line 318 + Snippet 1 + dispatcher). 10 occurrences
 across spec sections §10/§17.2/§22.
 
+### Fixed — Manual Ship V.44.3 defensive UX patch (2026-04-29, commit `14fc1e1`)
+
+User reported: "ขึ้น 1/1 → ไม่มี PNO → ไม่เกิดอะไรขึ้น" (silent failure).
+fullstack-developer diagnosed `if (data.success)` accepted truthy values
+without `pno` field → JS pushed undefined to `createdPnos` array → "1/1 สำเร็จ"
+banner with empty PNO area + no print fired → button reset silently.
+
+- Strict success check: `data.success === true && data.pno` (was loose truthy)
+- Catch-all UI when both `createdPnos` + `errors` arrays empty (3-step
+  troubleshoot hint: RPi pull, WP endpoint reachable, dashboard.py log)
+- try/catch fall-through writes to result-box (was just toast which can be
+  missed/dismissed)
+
+File: `rpi-print-server/templates/manual_ship.html` V.44.2 → V.44.3.
+Pure UX hardening — no API contract change.
+
+### Fixed — Snippet 1 V.34.25 — code-reviewer audit (G2 + PII mask dead code)
+
+code-reviewer post-`ae60b47` audit found 1 CRITICAL + 1 HIGH issue. Both
+stem from BUG-2 fix changing `$params['subParcel']` from PHP nested array
+to JSON string — but 2 downstream sites still checked `is_array()` →
+silent dead-code paths.
+
+- **CRITICAL** — G2 1003 retry subParcel sync (line 8682-8702): `is_array()`
+  check became false-always after BUG-2 → sub-parcels' outTradeNo never
+  synced with regenerated parent suffix on retry → Flash sub-parcel-level
+  dedup fail. Fix: `json_decode` → mutate → `wp_json_encode` roundtrip
+  preserves BUG-2 contract.
+- **HIGH** — `b2b_flash_mask_request_for_dlq()` subParcel branch
+  (line 8450-8470): same dead-code pattern → DLQ rows stripped of subParcel
+  for V.42 multi-box failures → forensic debugging harder. Fix: same
+  decode-if-string pattern.
+
+File: `[B2B] Snippet 1` V.34.24 → V.34.25.
+**Insight**: dead-code-after-encoding-change pattern — when modifying field
+encoding (array→string/JSON), grep ALL `is_array($field)` checks in same
+scope. Today's BUG-2 fix introduced 2 dead-code sites caught by code-reviewer
+but missed by feature-architect verify-pass. Future agent dispatch must
+cross-check encoding boundaries.
+
+### Added — Days 5 GDPR Phase 6 design + Days 2-4 deploy runbook (commit `86a62e1`)
+
+NEW `docs/compliance/GDPR-PHASE-6-DESIGN.md` (284 lines):
+- Full implementation design for Thai PDPA / GDPR data subject rights
+- Builds on V.1.3 stubs (V.1.1 90-day retention shipped Phase 5)
+- Queue worker + admin review UI + email templates + erasure decision matrix
+  (anonymize vs hard-delete per record type)
+- 7 open questions for legal/boss review
+- Effort estimate: 5.5 days dev + external legal review
+
+NEW `docs/runbooks/WEEK-LONG-SPRINT-2026-04-29.md` (310 lines):
+- Day 2 — Sentry activation: composer install + DSN provision + flag flip
+- Day 3 — B2F CPT final drop: pre-flight queries + mysqldump backup +
+  2-phase trash→delete + smoke test + rollback (wait until 2026-05-02 day 14)
+- Day 4 — Vite LIFF production migration: staging-first + 10% canary +
+  24h soak + 50% → 100% rollout (REG-029 byte-identical inline preserved)
+- Day 5 — GDPR design review (this commit's design doc)
+- Verification schedule + emergency rollback quick-reference
+
 ### Added — OpenAPI spec coverage expansion (2026-04-28 → 2026-04-29)
 
 ขยาย `docs/api/openapi.yaml` จาก ~50% → ~70% ของ 125+ production endpoints.
