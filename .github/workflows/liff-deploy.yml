@@ -1,0 +1,139 @@
+name: LIFF bundle deploy
+
+# Phase 2 Step 3 — copy `dist/liff/` to production WP `uploads/dinoco-liff/`
+# after every push to main that touches LIFF source.
+#
+# ⚠️ DISABLED BY DEFAULT — workflow_dispatch only until user provisions
+# secrets + verifies staging path. Once secrets present, change trigger
+# to `push: branches: [main]` to auto-deploy on every LIFF source change.
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#
+#   LIFF_DEPLOY_SSH_KEY         Private key (ssh-ed25519 preferred)
+#                               — public key in production server's
+#                               ~/.ssh/authorized_keys
+#   LIFF_DEPLOY_SSH_HOST        e.g. dinoco.in.th or 5.223.95.236
+#   LIFF_DEPLOY_SSH_USER        e.g. dinocoth or wp-deploy
+#   LIFF_DEPLOY_SSH_PORT        Default 22 (override if non-standard)
+#   LIFF_DEPLOY_TARGET_PATH     Absolute path on server, e.g.
+#                               /home/dinocoth/public_html/wp-content/uploads/dinoco-liff
+#                               (must be writable by SSH_USER, owned by
+#                               www-data or php-fpm user)
+#   LIFF_DEPLOY_KNOWN_HOSTS     Output of `ssh-keyscan -t ed25519,rsa <host>`
+#                               (prevents man-in-middle on first connect)
+#
+# Verification after first successful run:
+#   ssh dinocoth@<host> 'ls -la <TARGET_PATH>/manifest.json'
+#   curl -I https://<host>/wp-content/uploads/dinoco-liff/manifest.json
+#   → expects 200 + application/json
+#
+# Then in Asset Loader snippet, dinoco_liff_enqueue() will start finding
+# the manifest. Snippets that gate on `dinoco_liff_use_vite_<surface>`
+# flag (default false) remain inline until flag flipped per-surface.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview rsync output without writing"
+        required: false
+        type: boolean
+        default: true
+
+# ── Once secrets configured + first manual run verified, uncomment: ──
+# on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - "liff-src/**"
+#       - "vite.liff.config.js"
+#       - "package.json"
+#       - "package-lock.json"
+#       - ".github/workflows/liff-deploy.yml"
+#   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build + rsync to production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Build LIFF bundles
+        run: npm run build:liff
+
+      - name: Verify manifest emit
+        # Sanity gate — refuses to deploy if manifest missing.
+        # Catches build pipeline regressions before they hit prod.
+        run: |
+          if [ ! -f dist/liff/.vite/manifest.json ]; then
+            echo "::error::dist/liff/.vite/manifest.json missing — build broken"
+            exit 1
+          fi
+          echo "Manifest entries:"
+          cat dist/liff/.vite/manifest.json | python3 -c "import json,sys; m=json.load(sys.stdin); [print(f'  {k}') for k in m.keys() if not k.startswith('_')]"
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.LIFF_DEPLOY_SSH_KEY }}
+
+      - name: Trust production host
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.LIFF_DEPLOY_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Rsync bundles to production
+        # --delete-after removes orphaned old hashed bundles AFTER
+        # successful new-file transfer (atomic from in-flight LIFF
+        # users' perspective — old bundles still served until refresh,
+        # then replaced).
+        # --chmod=ug+rw,o+r ensures www-data can read.
+        # Excludes .vite/ subdirectory contents EXCEPT manifest.json
+        # (Asset Loader reads manifest; doesn't need internal Vite metadata).
+        run: |
+          DRY="${{ github.event.inputs.dry_run }}"
+          RSYNC_FLAGS="-avz --delete-after --chmod=ug+rw,o+r"
+          if [ "$DRY" = "true" ]; then
+            RSYNC_FLAGS="$RSYNC_FLAGS --dry-run"
+            echo "::notice::Dry-run mode — no files written"
+          fi
+
+          rsync $RSYNC_FLAGS \
+            -e "ssh -p ${{ secrets.LIFF_DEPLOY_SSH_PORT || '22' }}" \
+            --exclude="*.map" \
+            dist/liff/ \
+            "${{ secrets.LIFF_DEPLOY_SSH_USER }}@${{ secrets.LIFF_DEPLOY_SSH_HOST }}:${{ secrets.LIFF_DEPLOY_TARGET_PATH }}/"
+
+      - name: Verify manifest accessible (skip on dry-run)
+        if: github.event.inputs.dry_run != 'true'
+        # HEAD request to public URL — confirms bundle path resolvable
+        # for end users. Failure here = misconfigured nginx/apache
+        # rewrite rules or wrong target path.
+        run: |
+          PUBLIC_URL="https://${{ secrets.LIFF_DEPLOY_SSH_HOST }}/wp-content/uploads/dinoco-liff/manifest.json"
+          echo "Verifying $PUBLIC_URL"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -I "$PUBLIC_URL" || echo "000")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Manifest URL returned HTTP $STATUS — public access broken"
+            exit 1
+          fi
+          echo "::notice::Manifest accessible at $PUBLIC_URL"

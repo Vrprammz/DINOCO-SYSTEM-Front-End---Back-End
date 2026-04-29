@@ -120,16 +120,77 @@ Each migration is an independent commit + flag flip. Don't migrate multiple at o
 
 ---
 
-## Step 3 — Production deploy of bundles (NOT YET DONE)
+## Step 3 — Production deploy of bundles (TEMPLATE READY ⏸ DISABLED)
 
-CI must copy `dist/liff/` to `WP_CONTENT/uploads/dinoco-liff/` on the production WP server.
+`.github/workflows/liff-deploy.yml` ready. **Disabled by default** — `workflow_dispatch` only until secrets provisioned + first manual dry-run verified.
 
-Options:
-1. **Add deploy step to GitHub Actions** — rsync bundles via SSH after build
-2. **Snippet auto-fetch from GitHub Releases** — Asset Loader fetches via HTTPS on first call (cache 24h)
-3. **Manual upload via WP admin** — SFTP `dist/liff/*` once per release
+### Activation steps (when ready)
 
-Option 1 is most automated. Requires SSH key in GitHub Secrets + production server path config.
+1. **Generate SSH keypair** on local machine:
+
+   ```bash
+   ssh-keygen -t ed25519 -f ~/.ssh/dinoco-liff-deploy -C "github-actions-liff-deploy"
+   ```
+
+2. **Add public key to production server**:
+
+   ```bash
+   ssh dinocoth@<host> 'cat >> ~/.ssh/authorized_keys' < ~/.ssh/dinoco-liff-deploy.pub
+   ```
+
+3. **Capture host fingerprint**:
+
+   ```bash
+   ssh-keyscan -t ed25519,rsa <host>
+   ```
+
+4. **Provision GitHub Secrets** (Settings → Secrets and variables → Actions):
+
+   | Secret | Value |
+   |---|---|
+   | `LIFF_DEPLOY_SSH_KEY` | Contents of `~/.ssh/dinoco-liff-deploy` (private key) |
+   | `LIFF_DEPLOY_SSH_HOST` | e.g. `dinoco.in.th` |
+   | `LIFF_DEPLOY_SSH_USER` | e.g. `dinocoth` |
+   | `LIFF_DEPLOY_SSH_PORT` | `22` (or custom) |
+   | `LIFF_DEPLOY_TARGET_PATH` | `/home/dinocoth/public_html/wp-content/uploads/dinoco-liff` |
+   | `LIFF_DEPLOY_KNOWN_HOSTS` | Output from step 3 |
+
+5. **Verify target dir exists + writable**:
+
+   ```bash
+   ssh dinocoth@<host> 'mkdir -p <TARGET_PATH> && chown www-data:www-data <TARGET_PATH>'
+   ```
+
+6. **First run — dry-run mode**:
+   - GitHub Actions → LIFF bundle deploy → Run workflow → `dry_run: true`
+   - Reviews planned rsync output without writing
+   - Verifies SSH connection, target path, file list
+
+7. **Live run** — Run workflow with `dry_run: false`. Watches:
+   - Bundles appear in `<TARGET_PATH>/` (`*.js`, `assets/*.css`, `chunks/*`)
+   - `manifest.json` at `<TARGET_PATH>/.vite/manifest.json`
+   - `curl -I https://<host>/wp-content/uploads/dinoco-liff/manifest.json` → 200
+
+8. **Enable auto-deploy** — uncomment the `push: branches: [main]` block in workflow file. From this point, every LIFF source change triggers deploy.
+
+### What the workflow does
+
+- Builds `dist/liff/` via `npm run build:liff`
+- Sanity-gates: refuses deploy if `manifest.json` missing
+- rsync `-avz --delete-after` (atomic — old hashed bundles cleared only after new ones land)
+- `--chmod=ug+rw,o+r` so www-data can read
+- `--exclude="*.map"` to skip sourcemaps (saves bandwidth, avoids leaking source structure)
+- Post-deploy verification: HEAD request to public manifest URL → expects 200
+- `concurrency.cancel-in-progress: false` — never interrupt mid-deploy
+
+### Why workflow_dispatch only (initial)
+
+Auto-deploy on every push = blast radius. First runs need human verification:
+- Wrong target path could overwrite unrelated WP files
+- Misconfigured permissions could leave bundles unreadable
+- Cache headers from nginx might serve stale manifest
+
+Once one full live run succeeds + `dinoco_liff_enqueue()` returns true in production (verified via test snippet flag), promote to `push:` trigger.
 
 ---
 
