@@ -17,6 +17,11 @@ export default defineConfig({
     build: {
         outDir: "../dist/liff",
         emptyOutDir: true,
+        // Phase 2 — emit Vite manifest so [System] DINOCO LIFF Asset Loader
+        // can resolve hashed entry filenames (b2b-catalog.<hash>.js) at
+        // PHP enqueue time. Manifest emits at dist/liff/.vite/manifest.json
+        // by default; copied to uploads/dinoco-liff/manifest.json by deploy.
+        manifest: true,
         rollupOptions: {
             input: {
                 "b2b-catalog": resolve(__dirname, "liff-src/b2b/catalog/entry.js"),
