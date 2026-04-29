@@ -57,6 +57,7 @@ The dashboard reads job state from a shared `/tmp/dinoco-print-state.json` file 
 - `picking_list.html` / `picking_list_thermal.html` — A4 and thermal picking lists (V.2.1: pagination fixed, QR code on last page, 180mm fixed height)
 - `dashboard.html` — Admin web UI
 - `kiosk.html` — 480×320 touchscreen UI (3 tabs: Packing KPIs, Pipeline, System)
+- `manual_ship.html` — V.44.0 full redesign (2026-04-29): 4-step section flow + product picker modal + box template dropdown + scoped `.dnc-ship-*` CSS. Mobile-first 560px breakpoint, touch ≥44px.
 
 ### Key Dashboard API Routes
 
@@ -69,6 +70,14 @@ All routes require `X-Print-Key` header or `?key=` query param matching `config.
 - `POST /api/flash-box-packed` — mark box packed
 - `POST /api/flash-ship-packed` — ship packed boxes
 - `GET /api/wp-summary` — cached WordPress dashboard data
+- `GET /api/box-templates?nocache=1` — box templates list (V.44.0: now proxies `/b2b/v1/rpi-box-templates` X-Print-Key auth instead of nonce-gated `/dinoco-stock/v1/`). Cache 1hr in `tmp/box-templates.json`.
+- `GET /api/product-search?q=KW&nocache=1` — V.44.0 NEW: product picker for Manual Shipping. Proxies `/b2b/v1/rpi-products`. Slim payload (sku/title/img/catalog_price/dealer_price/children/stock_status/category). Cache 5min in `tmp/products_cache.json` + thread-safe lock + atomic write.
+- `GET /api/sku-shipping-scanner/<sku>` — warehouse_staff stripped Flash V.42 metadata
+- `GET /api/sku-shipping/<sku>` — admin full Flash V.42 metadata (slots + catalog)
+
+### RPi → WP namespace pattern (CRITICAL — V.44.0 lesson)
+
+`/dinoco-stock/v1/*` endpoints use `$inv_perm`/`$scanner_perm` (nonce-strict by design). RPi context only has X-Print-Key — **must** use `/b2b/v1/rpi-*` proxy endpoints in Snippet 3 with `b2b_verify_print_key()` auth instead. Never spoof X-WP-Nonce with api_key (silent 403 → empty cache).
 
 ## Configuration
 

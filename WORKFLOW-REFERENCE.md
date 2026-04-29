@@ -306,8 +306,16 @@ Trigger: Admin confirm_bill → status transitions awaiting_shipping / shipping_
    - Resolve via dinoco_resolve_manifest_shipping → own PNO with BO-specific dims
    - Separate snapshot meta `_flash_shipping_snapshot_bo` from primary
 
-Manual-Ship V.43 (RPi /manual-ship):
-  - Scanner reads SKU → GET /api/sku-auto-fill/<sku> → fills L/W/H/weight from box template
+Manual-Ship V.44.0 (RPi /manual-ship):
+  - **NEW V.44.0 (2026-04-29)**: Full visual redesign + product picker modal + box-template fix
+    * 4-step section flow (Sender → Recipient → Parcel → Submit) with gradient step badges
+    * Product picker modal (🔍 ค้นหาสินค้า): search debounce 250ms + filter chips (ทั้งหมด/SET/เดี่ยว) + 52×52 thumbnails + tap-to-pick auto-fills SKU + triggers existing v43AutoFillFromSku()
+    * Box Templates dropdown FIX: was empty since V.43.0 — root cause `$inv_perm` requires WP nonce, RPi only has X-Print-Key. NEW endpoint `/b2b/v1/rpi-box-templates` (X-Print-Key auth) replaces broken `/dinoco-stock/v1/box-templates` proxy. ↻ refresh button + count badge added.
+    * NEW endpoint `/b2b/v1/rpi-products?search=KW` (slim payload: sku/title/img/catalog_price/dealer_price/children/stock_status/category) ~500 SKUs typical
+    * NEW dashboard.py route `/api/product-search?q=KW&nocache=1` (5min cache, thread-safe, atomic write)
+    * CSS scoped `.dnc-ship-*` (RPi-specific), mobile-first 560px breakpoint, touch ≥44px
+  - V.43 (preserved): Scanner reads SKU → GET /api/sku-auto-fill/<sku> → fills L/W/H/weight from box template
+  - V.43.2 safety logic preserved: _dimsDirty tracking, scanner ASCII validate, template confirm-before-overwrite, ad-hoc save-back
   - Ad-hoc SKU (not in catalog) → warehouse_staff enters dims + checks 💾 save → POST save_sku_data=1
   - Ad-hoc save-back creates `wp_dinoco_products` row with pack_mode='unknown' (admin classifies later via M2 queue)
   - D-12 articleCategory: flag ON → default 6 (อะไหล่รถยนต์), flag OFF → 1 (legacy)
