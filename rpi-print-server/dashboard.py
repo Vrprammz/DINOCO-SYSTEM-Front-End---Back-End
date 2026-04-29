@@ -321,10 +321,13 @@ def api_test_picking_list():
     try:
         # V.4 MED-2 fix: skip PrinterManager allocation in dry_run path
         # (no printer interaction needed; faster + avoids unnecessary CUPS/USB connection).
+        # V.6.3 hotfix: load_config() per request — same pattern as kiosk handler / index().
+        # `config` is NOT global in dashboard.py.
         pm = None
         if not dry_run:
             try:
-                pm = PrinterManager(config)
+                cfg = load_config()
+                pm = PrinterManager(cfg)
             except Exception as e:
                 return jsonify({'ok': False, 'error': f'printer_init_failed: {e}'}), 500
 
