@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-DINOCO B2B — Print Client Daemon V.3.5 (Raspberry Pi)
+DINOCO B2B — Print Client Daemon (Raspberry Pi)
+
+V.42.2 (2026-04-29) — Phase 2.1 V3: XP-420B safety zones + content-aware pagination.
+  - Pagination logic extracted to picking_layout.py (shared with test_picking.py).
+  - TOP_SAFETY_MM=4 + BOTTOM_SAFETY_MM=5 reserved per page (prevent paper drop +
+    cumulative drift on XP-420B feed roller).
+  - estimate_item_mm() content-aware (replaces fixed ROW_MM=13) — accounts for
+    pack_mode badge + box_template chip + DD-3 children.
+  - pick_count_boxes_for_item() pack_mode-aware (was: always qty*bpu — wrong
+    for bulk_pack which over-counted by upb factor).
+V.42.1 (2026-04-29) — Phase 2: pack_mode + box_template enrichment in box_items[].
+V.2.0 — Picking List prints FIRST (before labels), auto-cut between each page
+
 Supports two modes:
   1. WebSocket (Pusher) — real-time, instant print triggers
   2. Polling fallback   — if Pusher unavailable, polls every 10s
@@ -11,8 +23,6 @@ Usage:
     python3 print_client.py --poll-only  # Force polling mode (no WebSocket)
 
 systemd runs this with --daemon flag.
-
-V.2.0 — Picking List prints FIRST (before labels), auto-cut between each page
 """
 
 import json
@@ -32,6 +42,22 @@ import io
 import requests
 from jinja2 import Environment, FileSystemLoader
 from weasyprint import HTML
+
+# V.42.2 (2026-04-29): pagination + XP-420B safety zones extracted to picking_layout.
+# Shared with test_picking.py (test print harness) so test mirrors production exactly.
+from picking_layout import (
+    PAGE_H as PICK_PAGE_H,
+    HEADER_MM as PICK_HEADER_MM,
+    FOOTER_NORMAL_MM as PICK_FOOTER_NORMAL_MM,
+    FOOTER_LAST_MM as PICK_FOOTER_LAST_MM,
+    TOP_SAFETY_MM as PICK_TOP_SAFETY_MM,
+    BOTTOM_SAFETY_MM as PICK_BOTTOM_SAFETY_MM,
+    USABLE_NORMAL as PICK_USABLE_NORMAL,
+    USABLE_LAST as PICK_USABLE_LAST,
+    estimate_item_mm as pick_estimate_item_mm,
+    paginate as pick_paginate,
+    count_boxes_for_item as pick_count_boxes_for_item,
+)
 
 # ── Setup ──────────────────────────────────────────────────────────
 
@@ -447,50 +473,18 @@ def process_job(job, config, printer_mgr):
             temp_pdfs = []
 
             # 2. Picking List — pagination per-item group
+            # V.42.2: pagination delegated to picking_layout.paginate() — content-aware
+            # (replaces fixed ROW_MM=13). XP-420B safety zones (4mm top + 5mm bottom)
+            # included in USABLE_* constants to prevent paper drop / cumulative drift.
             try:
                 logger.info(f'  Rendering picking list #{tid}...')
                 pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
 
                 all_items = order.get('items', [])
-
-                ROW_MM = 13
-                HEADER_MM = 38
-                FOOTER_LAST_MM = 45
-                FOOTER_NORMAL_MM = 12
-                PAGE_H = 180
-                MARGIN_MM = 0
-
-                usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
-                usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
-
-                pages = []
-                current_page = []
-                current_mm = 0
-
-                for it in all_items:
-                    n_children = len(it.get('children', []))
-                    item_mm = (1 + n_children) * ROW_MM
-
-                    if current_page and (current_mm + item_mm) > usable_normal:
-                        pages.append(current_page)
-                        current_page = []
-                        current_mm = 0
-
-                    current_page.append(it)
-                    current_mm += item_mm
-
-                if current_page:
-                    pages.append(current_page)
-
-                if len(pages) >= 1:
-                    last = pages[-1]
-                    last_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in last)
-                    if last_mm > usable_last and len(last) > 1:
-                        overflow = last.pop()
-                        pages.append([overflow])
-
+                pages = pick_paginate(all_items)
                 total_pages = len(pages)
-                logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_pages} pages')
+                PAGE_H = PICK_PAGE_H  # for pick_pdf height below
+                logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_pages} pages (XP-420B safety: top={PICK_TOP_SAFETY_MM}mm bottom={PICK_BOTTOM_SAFETY_MM}mm)')
 
                 for page_idx, page_items in enumerate(pages):
                     page_num = page_idx + 1
@@ -528,18 +522,9 @@ def process_job(job, config, printer_mgr):
                     box_num = 0
                     box_items = []
                     for item in order.get('items', []):
-                        bpu = item.get('boxes_per_unit', 1)
-                        upb = item.get('units_per_box', 1)
+                        # V.42.2: pack_mode-aware box count via picking_layout helper (single source of truth)
+                        item_boxes = pick_count_boxes_for_item(item)
                         pm = item.get('pack_mode', 'auto')
-                        # V.42.8 Phase 2: pack_mode-aware box count (matches picking_list logic)
-                        if pm == 'bulk_pack' and upb > 1:
-                            item_boxes = (item['qty'] + upb - 1) // upb  # ceil division
-                        elif pm == 'multi_box' and bpu > 1:
-                            item_boxes = item['qty'] * bpu
-                        elif pm == 'assembled_set':
-                            item_boxes = item['qty']
-                        else:
-                            item_boxes = item['qty'] * bpu
                         for _ in range(item_boxes):
                             box_num += 1
                             box_items.append({
@@ -547,7 +532,6 @@ def process_job(job, config, printer_mgr):
                                 'total_boxes': total_boxes,
                                 'item_name': item['name'],
                                 'item_sku': item['sku'],
-                                # V.42.8 Phase 2: enrich for shipping_label.html template
                                 'pack_mode': pm,
                                 'box_template_code': item.get('box_template_code', ''),
                                 'box_template_dims': item.get('box_template_dims', ''),
@@ -597,48 +581,16 @@ def process_job(job, config, printer_mgr):
             usb_session.close()
     else:
         # ═══ Non-USB fallback — use existing CUPS print methods ═══
-        # 2. Picking List (CUPS)
+        # 2. Picking List (CUPS) — V.42.2: same pagination as USB path via picking_layout
         try:
             logger.info(f'  Rendering picking list #{tid} (CUPS)...')
             pick_tpl = 'picking_list_thermal.html' if printer_mgr.label_thermal else 'picking_list.html'
 
             all_items = order.get('items', [])
-            ROW_MM = 13
-            HEADER_MM = 38
-            FOOTER_LAST_MM = 45     # ตรงกับ USB path (totals + address + footer)
-            FOOTER_NORMAL_MM = 12
-            PAGE_H = 180
-            MARGIN_MM = 0           # margin 0 — template จัดการ spacing เอง
-
-            usable_normal = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_NORMAL_MM
-            usable_last   = PAGE_H - MARGIN_MM - HEADER_MM - FOOTER_LAST_MM
-
-            pages = []
-            current_page = []
-            current_mm = 0
-
-            for it in all_items:
-                n_children = len(it.get('children', []))
-                item_mm = (1 + n_children) * ROW_MM
-                if current_page and (current_mm + item_mm) > usable_normal:
-                    pages.append(current_page)
-                    current_page = []
-                    current_mm = 0
-                current_page.append(it)
-                current_mm += item_mm
-
-            if current_page:
-                pages.append(current_page)
-
-            if len(pages) >= 1:
-                last = pages[-1]
-                last_mm = sum((1 + len(it.get('children', []))) * ROW_MM for it in last)
-                if last_mm > usable_last and len(last) > 1:
-                    overflow = last.pop()
-                    pages.append([overflow])
-
+            pages = pick_paginate(all_items)
             total_pages = len(pages)
             total_rows = sum(1 + len(it.get('children', [])) for it in all_items)
+            PAGE_H = PICK_PAGE_H
             logger.info(f'  Picking list #{tid}: {len(all_items)} items, {total_rows} rows, {total_pages} pages')
 
             for page_idx, page_items in enumerate(pages):

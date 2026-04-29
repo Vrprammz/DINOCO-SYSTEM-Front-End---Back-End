@@ -249,6 +249,63 @@ def api_logs():
     return jsonify({'logs': raw, 'source': source})
 
 
+@app.route('/api/test-picking-list', methods=['POST'])
+@require_auth
+def api_test_picking_list():
+    """V.42.2 (2026-04-29) — Mockup picking list + shipping label print test.
+
+    Mirrors production pipeline (picking pages + shipping labels in single TSPL batch
+    via USB session). Uses test_picking.MOCKUP_PRODUCTS (Thai motorcycle parts) +
+    safety markers (ticket_id 999000-999999, "🧪 TEST" banner, TEST-PNO prefix).
+
+    Body: {scenario: str, target_pages: int, dry_run: bool}
+      scenario: 'quick'|'mixed'|'bulk-heavy'|'set-heavy'|'worst-case'
+      target_pages: 1-5 (informational; actual pages determined by content)
+      dry_run: if true, generate PDFs but don't send to printer (preview mode)
+
+    Returns: full result dict with safety_zones + drift check + bytes_sent
+    """
+    try:
+        from test_picking import run_test_picking_print, SCENARIOS
+        # Reuse print_client.py helpers (render_template + html_to_pdf — same Jinja env + WeasyPrint setup)
+        from print_client import render_template as pc_render_template
+        from print_client import html_to_pdf as pc_html_to_pdf
+        from printer import PrinterManager
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'import_failed: {e}'}), 500
+
+    body = request.json or {}
+    scenario = body.get('scenario', 'mixed')
+    target_pages = int(body.get('target_pages', 2) or 2)
+    target_pages = max(1, min(5, target_pages))  # clamp 1-5
+    dry_run = bool(body.get('dry_run', False))
+
+    if scenario not in SCENARIOS:
+        return jsonify({'ok': False, 'error': f'invalid_scenario: {scenario}', 'allowed': list(SCENARIOS.keys())}), 400
+
+    # Create PrinterManager on-demand (matches existing dashboard pattern at line 590)
+    try:
+        pm = PrinterManager(config)
+    except Exception as e:
+        if not dry_run:
+            return jsonify({'ok': False, 'error': f'printer_init_failed: {e}'}), 500
+        pm = None  # dry-run can proceed without printer
+
+    try:
+        result = run_test_picking_print(
+            printer_mgr=pm,
+            render_template_fn=pc_render_template,
+            html_to_pdf_fn=pc_html_to_pdf,
+            scenario=scenario,
+            target_pages=target_pages,
+            dry_run=dry_run,
+        )
+        return jsonify(result)
+    except Exception as e:
+        logging.getLogger('test-picking').error(f'[test-picking-list] failed: {e}', exc_info=True)
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 @app.route('/api/test-print', methods=['POST'])
 @require_auth
 def api_test_print():
