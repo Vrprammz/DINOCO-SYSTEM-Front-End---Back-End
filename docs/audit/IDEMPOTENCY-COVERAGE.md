@@ -17,11 +17,11 @@
 
 | Metric | Count |
 |--------|-------|
-| Total integrated endpoints | **59** ⭐ **30% MILESTONE REACHED Round 34** (+5 new — bo-clear-enum-flag, kb-suggest, brand-voice-submit, distributor/delete, distributor/toggle-bot) |
+| Total integrated endpoints | **64** (+5 new — Round 35 batch 13: dashboard-inject-metrics, lead-attribution, inventory-changed, kb-updated, product-compatibility — all `/dinoco-mcp/v1/*` OpenClaw retry-prone) |
 | **Total POST endpoints (Round 33 fresh census)** | **196** (+3 since Round 30 — natural growth, see [REST-ENDPOINT-CENSUS-2026-04-30.md](./REST-ENDPOINT-CENSUS-2026-04-30.md)) |
-| Coverage | **59 / 196 = 30.1%** ⭐ **30% MILESTONE** of POST endpoints — first sustained crossing past 30% TRUE coverage against authoritative Round 30 census |
-| Cumulative test cases | 236 (Round 19-34 — Round 34 added 18) |
-| Body-shape distinct hashes asserted | 58 (Round 34: +5 new — all unique; cross-namespace distributor-delete vs distributor-toggle-bot + kb-suggest vs brand-voice-submit pair guards added) |
+| Coverage | **64 / 196 = 32.7%** of POST endpoints — sustained progress past 30% milestone after Round 34. MCP cluster coverage = **13/17 = ~76%** (high-coverage cluster — see "MCP Cluster Coverage" section below) |
+| Cumulative test cases | 254 (Round 19-35 — Round 35 added 18) |
+| Body-shape distinct hashes asserted | 63 (Round 35: +5 new — all unique; 2 cross-namespace pair guards added — dashboard-inject-metrics vs lead-attribution + inventory-changed vs kb-updated) |
 
 > **Round 30 note**: Earlier rounds reported coverage against a conservative
 > "~75 POST endpoints" estimate. The Round 30 REST endpoint census
@@ -65,7 +65,8 @@
 | 🎯 **25.4% (Round 32 — TRUE 25% milestone)** | **32** | **2026-04-30** | +5 endpoints (49/193) — maker-reschedule + manual-flash-test + bo-update-eta + bo-restock-scan + reject-lot. **First milestone past 1/4 of POST endpoints AGAINST AUTHORITATIVE Round 30 census denominator** (earlier "25%" entries above were against stale ~75 estimate). 16 B2F endpoints + 22 B2B + 8 inventory + 3 MCP. |
 | **27.6% (Round 33)** | **33** | **2026-04-30** | +5 endpoints (54/196 — denominator refreshed Round 33 to 196 from 193, +3 natural growth). Batch 11: maker-product + maker + po-undo-submit (B2F CRUD/admin) + distributor-notify + customer-link (MCP OpenClaw retry-prone). 19 B2F + 22 B2B + 8 inventory + 5 MCP. Drift detector extended (4 → 5 tests) — POST-only assertion guards against accidentally adding read-only endpoints to tracker. |
 | 🎯 **30.1% (Round 34 — TRUE 30% milestone)** ⭐ | **34** | **2026-04-30** | +5 endpoints (59/196). Batch 12: bo-clear-enum-flag (B2B admin flag reset) + kb-suggest + brand-voice-submit (MCP chatbot signals) + distributor/delete + distributor/toggle-bot (B2B admin distributor management). 19 B2F + 24 B2B + 8 inventory + 7 MCP. **First sustained 30% milestone against authoritative Round 30 census denominator** — past 3/10 of POST surface. 5 distinct patterns observed across Rounds 18-34 (single / bulk / bulk-of-targets / state-machine / boolean-discriminator + enum-discriminator) — see [`docs/patterns/IDEMPOTENCY-KEY.md`](../patterns/IDEMPOTENCY-KEY.md) "Round 18-34 case study patterns". |
-| Target: 35% | future | TBD | Need +10 more endpoints (~69/196). Realistic timeline: Rounds 35-37. |
+| **32.7% (Round 35 — MCP cluster ~76%)** | **35** | **2026-04-30** | +5 endpoints (64/196). Batch 13 — all `/dinoco-mcp/v1/*` retry-prone OpenClaw signals: dashboard-inject-metrics (FB/IG metrics — inflated KPI guard) + lead-attribution (revenue double-count guard, event enum discriminator) + inventory-changed (stock webhook, action enum) + kb-updated (Qdrant rebuild webhook, trigger_source discriminator) + product-compatibility (catalog query — chatbot retry compute saver, brand+model normalized). 19 B2F + 24 B2B + 8 inventory + **12 MCP** (13/17 POST = 76% MCP namespace coverage). Pattern: 4× "compute-only/log-only" cache + 1× analytics signature hash. |
+| Target: 35% | future | TBD | Need +5 more endpoints (~69/196). Realistic timeline: Rounds 36-37 (B2B/B2F long tail). |
 | Target: 50% | future | TBD | ~98 endpoints — major sustained effort across 10+ rounds. Realistic timeline: Round 50+ |
 
 > **Why no 50% milestone in Round 30**: User-facing milestone celebration in the
@@ -77,7 +78,7 @@
 
 ---
 
-## Integrated endpoints (59)
+## Integrated endpoints (64)
 
 | # | Endpoint | Snippet | Pattern | Round | Status |
 |---|----------|---------|---------|-------|--------|
@@ -141,12 +142,17 @@
 | 58 | `POST /dinoco-mcp/v1/brand-voice-submit` | `[System] DINOCO MCP Bridge` V.2.7 | single (sentiment edits between retries → 409 — ML signal integrity) | **34** ⭐ | **integrated** |
 | 59 | `POST /b2b/v1/distributor/delete` | `[B2B] Snippet 9` V.34.2 | single (id — log/alert spam guard; wp_delete_post idempotent) | **34** ⭐ | **integrated** |
 | 60 | `POST /b2b/v1/distributor/toggle-bot` | `[B2B] Snippet 9` V.34.2 | **boolean-discriminator** (bot_enabled flip caught by hash; complements 5s transient dedup) | **34** ⭐ | **integrated** |
+| 61 | `POST /dinoco-mcp/v1/dashboard-inject-metrics` | `[System] DINOCO MCP Bridge` V.2.8 | single (metrics_signature = sha1 of sorted name=>value pairs — order-stable) | **35** | **integrated** |
+| 62 | `POST /dinoco-mcp/v1/lead-attribution` | `[System] DINOCO MCP Bridge` V.2.8 | single (event enum + lead_id discriminate; revenue double-count guard) | **35** | **integrated** |
+| 63 | `POST /dinoco-mcp/v1/inventory-changed` | `[System] DINOCO MCP Bridge` V.2.8 | single (action enum in/out/hold/release + UPPER sku) | **35** | **integrated** |
+| 64 | `POST /dinoco-mcp/v1/kb-updated` | `[System] DINOCO MCP Bridge` V.2.8 | single (trigger_source admin_save vs bulk_import — Qdrant rebuild scope) | **35** | **integrated** |
+| 65 | `POST /dinoco-mcp/v1/product-compatibility` | `[System] DINOCO MCP Bridge` V.2.8 | single (brand+model normalized via mb_strtolower + trim — catalog query cache) | **35** | **integrated** |
 
-> Note: numbering goes to 60 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
+> Note: numbering goes to 65 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
 > delete-ticket (32) + recalculate-total (33) share body shape — all namespace-discriminated. Total
-> integrated endpoint count = 59 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
+> integrated endpoint count = 64 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
 > for bo-fulfill which had no actual wrapper despite tracker entry + Round 31: +5 + Round 32: +5
-> + Round 33: +5 + Round 34: +5).
+> + Round 33: +5 + Round 34: +5 + Round 35: +5).
 >
 > **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1) — RESOLVED in Round 30**: `bo-fulfill`
 > (#14, Round 19) was listed as "integrated" but actual code had NO wrapper. **Round 30 fixed**:
@@ -167,17 +173,22 @@
 
 ---
 
-## Pending POST endpoints (Round 35+ candidates)
+## Pending POST endpoints (Round 36+ candidates)
 
-### High priority (next 5 picks — Round 35 candidates to push toward 33% interim)
+### High priority (next 5 picks — Round 36 candidates to push toward 35% milestone)
+
+> **MCP namespace nearly exhausted** — 13/17 POST endpoints integrated (Rounds 19-35). Remaining
+> 4 MCP POST routes are either GET in disguise (returning data without side-effects) or already
+> have natural dedup (e.g. claim-manual-list returns existing rows). Future rounds should pivot
+> to **B2B/B2F long tail** (admin print/RPi/finance flows) where retry-prone hot paths remain.
 
 | Endpoint | Snippet | Risk if double-fired | Round candidate |
 |----------|---------|----------------------|-----------------|
-| `POST /dinoco-mcp/v1/dashboard-inject-metrics` | `[System] DINOCO MCP Bridge` | FB/IG metrics inject — frequent retries; double-fire = inflated metrics in admin dashboard | Round 35 |
-| `POST /dinoco-mcp/v1/lead-attribution` | `[System] DINOCO MCP Bridge` | Lead conversion measurement — small dedup risk; double-fire = double-counted attribution | Round 35 |
-| `POST /dinoco-mcp/v1/inventory-changed` | `[System] DINOCO MCP Bridge` | Webhook trigger — Qdrant re-sync may double-fire = wasted compute + race | Round 35 |
-| `POST /dinoco-mcp/v1/kb-updated` | `[System] DINOCO MCP Bridge` | KB cache invalidation — double-fire = wasted cache rebuild but no data corruption | Round 35 |
-| `POST /dinoco-mcp/v1/product-compatibility` | `[System] DINOCO MCP Bridge` | Product-bike compatibility check — double-fire = redundant compute | Round 35 |
+| `POST /b2b/v1/manual-reprint` | `[B2B] Snippet 3` | Reprint job dispatch — print queue idempotent at job_id but spam alerts | Round 36 |
+| `POST /b2b/v1/admin-bo-tickets` | `[B2B] Snippet 3` | Admin BO bulk action — already in Snippet 16 cluster but tracker double-check | Round 36 |
+| `POST /b2b/v1/system-check` | `[B2B] Snippet 9` | Ops health probe — log spam guard | Round 36 |
+| `POST /b2f/v1/po-image` | `[B2F] Snippet 10` | PO Image gen — wasted GD compute on retry | Round 36 |
+| `POST /dinoco-stock/v1/stock/hold` | `[Admin System] DINOCO Global Inventory Database` | Stock hold timer — sku × duration discriminator | Round 36 |
 
 ### Medium priority (Round 36+)
 
@@ -196,6 +207,49 @@
 | `POST /b2b/v1/flash-webhook` | Flash → DINOCO direction (Flash retry handled by Flash side) |
 | `POST /b2b/v1/test-push` | Admin test endpoint |
 | `POST /dinoco-stock/v1/god-mode/verify` | PIN verify — natural rate-limit + JWT TTL = effective dedup |
+
+---
+
+## MCP Cluster Coverage
+
+> **Round 35 milestone**: MCP namespace `/wp-json/dinoco-mcp/v1/*` reaches **13/17 = ~76%
+> POST endpoint coverage** — highest namespace cluster coverage in the project. The MCP
+> Bridge serves OpenClaw chatbot retry-prone signal hot paths, so prioritization made
+> sense; remaining 4 routes are either ack-only or have natural dedup.
+
+### MCP integrated POST endpoints (13 total)
+
+| # | Endpoint | Round | Pattern note |
+|---|----------|-------|--------------|
+| 1 | `POST /dinoco-mcp/v1/distributor-notify` | 33 | lead_id primary discriminator + type Flex vs follow_up — caches HTTP 200 only |
+| 2 | `POST /dinoco-mcp/v1/customer-link` | 33 | source_id + platform discriminates FB vs IG namespaces |
+| 3 | `POST /dinoco-mcp/v1/claim-manual-create` | 30 | source_id primary discriminator |
+| 4 | `POST /dinoco-mcp/v1/claim-manual-update` | 31 | status enum + case_type + tracking |
+| 5 | `POST /dinoco-mcp/v1/lead-create` | 30 | source_id + phone identity |
+| 6 | `POST /dinoco-mcp/v1/lead-update` | 31 | status enum + updated_by + followup_at |
+| 7 | `POST /dinoco-mcp/v1/kb-suggest` | 34 | question normalized via mb_strtolower + trim |
+| 8 | `POST /dinoco-mcp/v1/brand-voice-submit` | 34 | sentiment edits between retries → 409 (ML signal integrity) |
+| 9 | `POST /dinoco-mcp/v1/dashboard-inject-metrics` | **35** | metrics_signature = sha1 of sorted name=>value pairs (order-stable) |
+| 10 | `POST /dinoco-mcp/v1/lead-attribution` | **35** | event enum discriminates conversion path; revenue double-count guard |
+| 11 | `POST /dinoco-mcp/v1/inventory-changed` | **35** | action enum (in/out/hold/release) + UPPER sku |
+| 12 | `POST /dinoco-mcp/v1/kb-updated` | **35** | trigger_source admin_save vs bulk_import — Qdrant rebuild scope |
+| 13 | `POST /dinoco-mcp/v1/product-compatibility` | **35** | brand+model normalized; cache-only (compute saver, no side effect) |
+
+### MCP POST endpoints NOT integrated (4 — low priority)
+
+| Endpoint | Reason |
+|----------|--------|
+| `POST /dinoco-mcp/v1/product-lookup` | Read-only catalog query — no side effect, idempotent by design (compute-only; very lightweight) |
+| `POST /dinoco-mcp/v1/dealer-lookup` | Read-only — geo-search returns existing distributors without write |
+| `POST /dinoco-mcp/v1/warranty-check` | Read-only — serial-number lookup |
+| `POST /dinoco-mcp/v1/kb-search` | Read-only — Qdrant query without write |
+
+> **Coverage commentary**: After Round 35, the MCP cluster is effectively saturated for
+> retry-prone WRITE endpoints. The remaining 4 are read-only POST routes (POST chosen
+> only because of body size — search queries with multiple filters wouldn't fit in a GET
+> URL). Naturally idempotent at the database layer. **Other namespaces still have larger
+> tail to cover**: B2B (24 integrated, ~30 remaining), B2F (19 integrated, ~10 remaining),
+> Inventory (8 integrated, ~5 remaining). Round 36+ should pivot away from MCP.
 
 ---
 
@@ -233,10 +287,11 @@ Each integrated endpoint has 3-9 contract tests in
 | **32** | **5** | **17** | **48** (Round 32: +5 new — all unique; cross-namespace maker-reschedule vs reject-lot collision guard added) |
 | **33** | **5** | **18** | **53** (Round 33: +5 new — all unique; 2 cross-namespace pair guards added — maker-product vs maker + distributor-notify vs customer-link) |
 | 🎯 **34** ⭐ | **5** | **18** | **58** (Round 34: +5 new — all unique; 2 cross-namespace pair guards added — distributor-delete vs distributor-toggle-bot + kb-suggest vs brand-voice-submit) |
+| **35** | **5** | **18** | **63** (Round 35: +5 new — all unique; 2 cross-namespace pair guards added — dashboard-inject-metrics vs lead-attribution + inventory-changed vs kb-updated; MCP cluster ~76%) |
 
-Total: **236 contract tests** across 12 rounds (Rounds 19-34). Round 29 introduced
+Total: **254 contract tests** across 13 rounds (Rounds 19-35). Round 29 introduced
 `IdempotencyTestFixture` base class — Round 30+ fully adopt it
-(`IdempotencyRound34Test.php` averages ~5 LOC/test).
+(`IdempotencyRound35Test.php` averages ~5 LOC/test).
 
 ### Fixture refactor (Round 29) {#fixture-refactor}
 
