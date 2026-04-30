@@ -3420,3 +3420,246 @@ Cleanup: deleteMany({ sourceId: "reg_REG-005_...") })
 4. **Phase 4**: Cleanup — drop inline blocks, remove fallback flag
 
 **Goal**: Address PERF-H6 (155KB inline → <10KB shell + cacheable hashed chunks).
+
+---
+
+## 13. MCP Bridge Architecture (Round 17, 2026-04-29)
+
+**Source**: `[System] DINOCO MCP Bridge` V.2.3 (DB_ID 1050) — 32 endpoints under `/wp-json/dinoco-mcp/v1/`.
+
+**Auth**: Single shared API key — `X-API-Key` header verified via `hash_equals()` against `wp_options['dinoco_mcp_api_key']` (atomic auto-generate via `add_option()` per V.2.3 API-H2 fix). All 32 routes share the same `permission_callback => 'dinoco_mcp_verify_key'`.
+
+**Recent**: OpenAPI spec ขยายจาก 5 → 32 endpoints (commit `9d2fb97`). Endpoint inventory below mirrors spec + snippet header (lines 9-44).
+
+### 13.1 Endpoint Categories (32 total)
+
+| Category | Count | Endpoints |
+| --- | --- | --- |
+| **Core lookup** (V.1.0) | 8 | product-lookup, dealer-lookup, warranty-check, kb-search, kb-export, catalog-full, distributor-notify, distributor-list |
+| **Manual claims** | 4 | claim-manual-create, claim-manual-update, claim-manual-status, claim-manual-list |
+| **KB + Brand Voice** | 2 | kb-suggest, brand-voice-submit |
+| **Lead Pipeline P1** | 5 | lead-create, lead-update, lead-list, lead-get/{id}, lead-followup-schedule |
+| **Phase 2 reads** | 7 | warranty-registered, member-motorcycle, member-assets, claim-status, customer-link, dealer-sla-report, distributor-get/{id}, product-compatibility |
+| **Phase 3 webhooks** | 5 | kb-updated, inventory-changed, moto-catalog, dashboard-inject-metrics, lead-attribution |
+
+### 13.2 Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "External Clients"
+        OC[OpenClaw Mini CRM<br/>chatbot proxy:3000]
+        CD[Claude Desktop<br/>MCP plugin]
+        TG[Telegram Bot<br/>nong-gung]
+        ADMIN[Admin Dashboard<br/>FB/IG inject]
+    end
+
+    subgraph "MCP Bridge V.2.3 — 32 Endpoints"
+        AUTH[X-API-Key Verify<br/>hash_equals + add_option atomic]
+        AUTH --> CAT1[Core Lookup x8]
+        AUTH --> CAT2[Manual Claims x4]
+        AUTH --> CAT3[KB + Brand Voice x2]
+        AUTH --> CAT4[Lead Pipeline P1 x5]
+        AUTH --> CAT5[Phase 2 Reads x7]
+        AUTH --> CAT6[Phase 3 Webhooks x5]
+    end
+
+    subgraph "DINOCO Subsystems"
+        SN15[Snippet 15<br/>wp_dinoco_products<br/>+ moto catalog]
+        CPT_LEAD[wp_options<br/>dinoco_mcp_lead_NNN<br/>per-row V.2.2]
+        CPT_CLAIM[CPT claim_ticket<br/>+ ticket_status]
+        CPT_DIST[CPT distributor<br/>+ owner_line_uid]
+        CPT_BV[CPT brand_voice<br/>+ AI sentiment]
+        WARR[CPT warranty<br/>+ wp_users]
+        AGENT[OpenClaw Agent<br/>MongoDB Atlas]
+    end
+
+    subgraph "Cache Layer"
+        TR1[Transients<br/>per endpoint TTL]
+        TR2[bv_stats_v1_30 5min]
+        TR3[bv_dup_md5 1day]
+    end
+
+    OC -->|X-API-Key| AUTH
+    CD -->|X-API-Key| AUTH
+    TG -->|X-API-Key| AUTH
+    ADMIN -->|X-API-Key| AUTH
+
+    CAT1 --> SN15
+    CAT1 --> CPT_DIST
+    CAT2 --> CPT_CLAIM
+    CAT3 --> CPT_BV
+    CAT3 --> AGENT
+    CAT4 --> CPT_LEAD
+    CAT5 --> WARR
+    CAT5 --> CPT_DIST
+    CAT5 --> CPT_CLAIM
+    CAT6 --> SN15
+    CAT6 --> AGENT
+
+    CAT1 -.->|read-through| TR1
+    CAT3 -.-> TR2
+    CAT3 -.-> TR3
+
+    style AUTH fill:#fef3c7,stroke:#f59e0b
+    style SN15 fill:#dbeafe,stroke:#3b82f6
+    style AGENT fill:#fce7f3,stroke:#ec4899
+```
+
+### 13.3 Auth + Rate Limit Flow
+
+```mermaid
+sequenceDiagram
+    participant Client as External Client<br/>(OpenClaw / Claude)
+    participant WP as MCP Bridge<br/>permission_callback
+    participant DB as wp_options
+    participant Endpoint as Endpoint Callback
+    participant Subsys as Subsystem<br/>(Snippet 15 / CPT / Agent)
+
+    Client->>WP: POST /dinoco-mcp/v1/lead-create<br/>X-API-Key: abc123...
+    WP->>WP: get_header('X-API-Key')
+    alt Empty header
+        WP-->>Client: 401 no_key
+    else Has header
+        WP->>DB: get_option('dinoco_mcp_api_key')
+        alt First-touch (race)
+            DB-->>WP: empty
+            WP->>DB: add_option(64-char) atomic
+            Note over WP,DB: V.2.3 API-H2:<br/>add_option fails if exists<br/>→ re-read persisted value
+            DB-->>WP: persisted key
+        else Cached
+            DB-->>WP: stored key
+        end
+        WP->>WP: hash_equals(stored, provided)
+        alt Mismatch
+            WP-->>Client: 403 invalid_key
+        else Match
+            WP->>Endpoint: invoke callback
+            Endpoint->>Subsys: read/write
+            Subsys-->>Endpoint: result
+            Endpoint-->>Client: 200 + JSON
+        end
+    end
+```
+
+### 13.4 Integration Points
+
+- **Snippet 15** (`wp_dinoco_products` + moto catalog) — `product-lookup`, `catalog-full`, `product-compatibility`, `inventory-changed`, `moto-catalog`
+- **CPT `claim_ticket`** (Service Center) — `claim-manual-*` (4 endpoints) + `claim-status`
+- **CPT `distributor`** + ACF `owner_line_uid` — `dealer-lookup`, `distributor-list`, `distributor-get/{id}`, `dealer-sla-report`
+- **CPT `warranty`** + `wp_users` — `warranty-check`, `warranty-registered`, `member-motorcycle`, `member-assets`
+- **CPT `brand_voice`** — `brand-voice-submit` (cross-namespace bridge to `/brand-voice/v1/entries`)
+- **OpenClaw Agent (MongoDB)** — `lead-*` endpoints persist to `wp_options` (per-row V.2.2) but agent reads/writes via `customer-link` + `dealer-sla-report`
+
+### 13.5 Gotchas
+
+- Single shared API key — rotation = `delete_option('dinoco_mcp_api_key')` then re-fetch via any endpoint
+- Lead storage migrated from flat array → per-row `wp_options` (V.2.2) — scalable but no cross-row index
+- `X-API-Key` ≠ `X-MCP-Key` (legacy doc typo — actual header name is `X-API-Key`)
+- `permission_callback` returns `WP_Error` (not bool) → REST adds `status` from error data (401/403/503)
+- OpenClaw uses separate key in `dinoco_openclaw_api_key` for `kb-suggest` + `claim-manual-*` overrides
+
+---
+
+## 14. Brand Voice Pool Flow (Round 17, 2026-04-29)
+
+**Source**: `[Admin System] DINOCO Brand Voice Pool` V.2.11 (DB_ID 1159) — Social listening + brand sentiment analysis. Shortcode `[dinoco_brand_voice]`.
+
+**Purpose**: เก็บ comment จากโซเชียล (FB/IG/TikTok) → AI Vision classify → Admin review → action (respond/escalate/dismiss). Stats cache 5-min transient (V.2.11 MED-3 fix — eliminates 219K cache lookups per stats request).
+
+### 14.1 Entry Lifecycle Diagram
+
+```mermaid
+sequenceDiagram
+    participant Social as Social Listener<br/>(FB/IG/TikTok)
+    participant API as REST<br/>brand-voice/v1/entries
+    participant CPT as CPT brand_voice<br/>+ postmeta
+    participant AI as Gemini AI<br/>(ai-bulk endpoint)
+    participant Admin as Admin Dashboard<br/>[dinoco_brand_voice]
+    participant Cache as Transient<br/>bv_stats_v1_30
+    participant Cron as Cleanup Cron<br/>(daily)
+
+    Note over Social,API: Phase 1 — Ingest
+
+    Social->>API: POST /entries<br/>{author, text, source_url}
+    API->>API: api_permission rate limit<br/>(b2b_rate_limit)
+    API->>API: bv_dup_md5 check<br/>(1-day TTL)
+    alt Duplicate
+        API-->>Social: 200 dup_skipped
+    else New entry
+        API->>CPT: bv_create_entry()<br/>wp_insert_post(brand_voice)
+        CPT->>CPT: update_post_meta<br/>(bv_brands, bv_sentiment='', etc.)
+        CPT->>Cache: bv_invalidate_stats_cache()
+        CPT-->>API: post_id
+    end
+
+    Note over Admin,AI: Phase 2 — AI Classify
+
+    Admin->>API: POST /entries/ai-bulk<br/>(uncategorized batch)
+    API->>AI: Gemini system prompt<br/>"นักวิเคราะห์ brand sentiment"
+    AI-->>API: [{i, brands, sentiment,<br/>intensity, categories,<br/>summary, is_relevant}]
+    API->>CPT: update_post_meta per entry<br/>(bv_sentiment, bv_categories)
+    API->>Cache: bv_invalidate_stats_cache()
+
+    Note over Admin,Cron: Phase 3 — Review + Action
+
+    Admin->>API: GET /entries (filter)
+    API->>Cache: bv_get_stats_cached(30)
+    alt Cache hit
+        Cache-->>API: stats (5-min TTL)
+    else Cache miss
+        API->>CPT: bv_get_stats() aggregate<br/>(9999 posts × 22 meta)
+        CPT-->>API: counts<br/>{sentiment, brands, supporters}
+        API->>Cache: set_transient bv_stats_v1_30
+    end
+    API-->>Admin: dashboard cards
+
+    Admin->>API: POST /entries (update)<br/>review_status='actioned'<br/>action_taken='responded'
+    API->>CPT: update_post_meta
+    API->>Cache: bv_invalidate_stats_cache()
+
+    Note over Cron: Phase 4 — Daily expire
+
+    Cron->>CPT: bv_get_stats_cached(90)<br/>weekly digest
+    Note over Cron,Cache: Auto-purge transients<br/>per WP options cleanup
+```
+
+### 14.2 V.2.11 Stats Cache Strategy
+
+```mermaid
+graph LR
+    A[Admin opens<br/>dashboard] --> B{Cache valid?}
+    B -->|Hit| C[Return cached<br/>5-min TTL]
+    B -->|Miss| D[bv_get_stats]
+    D --> E[Aggregate 9999<br/>posts × 22 meta]
+    E --> F[set_transient<br/>bv_stats_v1_30]
+    F --> C
+
+    G[Mutation:<br/>create/update/delete] --> H[bv_invalidate_<br/>stats_cache]
+    H --> I[delete_transient<br/>bv_stats_v1_*<br/>all $days keys]
+
+    style D fill:#fee2e2,stroke:#dc2626
+    style E fill:#fee2e2,stroke:#dc2626
+    style C fill:#d1fae5,stroke:#10b981
+    style I fill:#fef3c7,stroke:#f59e0b
+```
+
+### 14.3 Endpoint Inventory (7 routes)
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/brand-voice/v1/entries` | GET / POST | List + create entry (single) |
+| `/brand-voice/v1/entries/batch` | POST | Bulk create (social listener bulk dump) |
+| `/brand-voice/v1/meta` | GET | Brands + categories enum |
+| `/brand-voice/v1/entries/ai-bulk` | POST | Trigger Gemini classify on uncategorized |
+| `/brand-voice/v1/api-keys/generate` | POST | API key issuance (manage_options) |
+| `/brand-voice/v1/api-keys/revoke` | POST | API key revoke |
+| `/brand-voice/v1/api-keys` | GET | List active keys |
+
+### 14.4 Gotchas
+
+- Stats cache is **per-$days** — `bv_stats_v1_30` ≠ `bv_stats_v1_90`. Invalidate clears ALL keys.
+- AI classifier uses Gemini direct (not OpenClaw agent) — separate API key in `bv_api_keys` option
+- Duplicate guard `bv_dup_md5_*` keyed on `source_url + content_hash` — re-ingest same URL silently dropped
+- `bv_get_stats()` raw helper preserved as low-level (used by AI summary generator) — only stats endpoint + AI summary route through cached wrapper
+- Brands enum hardcoded: `DINOCO, SRC, F2MOTO, BMMOTO, MOTOSkill, H2C` (line 52) — adding new requires code change
+- `is_relevant=false` entries persisted but excluded from stats aggregation (filter via `bv_relevant=1` meta)
