@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.7 (2026-04-30) — Round 32 batch 10: Idempotency-Key support on 2 BO endpoints: ║
+ * ║    • POST /b2b/v1/bo-update-eta — body hash {bo_queue_id, eta_days, notes}. Admin clicks      ║
+ * ║      "📅 ETA" button → modal prompts for days/notes → POST. Slow LINE/network double-fire     ║
+ * ║      already protected by row state guard (status IN pending/ready), but notes append uses    ║
+ * ║      "|" separator — replay would silently double-append the SAME note twice. Wrapper         ║
+ * ║      returns cached 200 + skips append. Different notes (admin edits between retries) → 409.  ║
+ * ║    • POST /b2b/v1/bo-restock-scan — body hash {sku} (or empty for full-scan).                 ║
+ * ║      Admin double-click "🔍 Restock Scan" + manual cron also fires this endpoint; concurrent  ║
+ * ║      runs can mark same row "ready" twice + send 2x Telegram alert (b2b_send_telegram_alert    ║
+ * ║      'bo_restock_ready') + 2x cache invalidation. Wrapper returns cached 200 in 24h replay.    ║
+ * ║      Empty body (full scan) hashes consistently — admin retries always get cached result.    ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.          ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical to V.3.6 behavior.   ║
  * ║  Version: V.3.6 (2026-04-30) — Round 30 F1 HIGH FIX: bo-fulfill drift remediation:           ║
  * ║    • POST /b2b/v1/bo-fulfill — body hash {order_id, items[sort by bo_queue_id, qty]}.        ║
  * ║      Round 29 drift sweep flagged tracker entry #14 as "integrated" since Round 19 but       ║
@@ -922,6 +935,37 @@ if ( ! function_exists( 'b2b_rest_bo_update_eta' ) ) {
 
         if ( ! $bo_queue_id ) return new WP_Error( 'invalid_input', 'bo_queue_id required', array( 'status' => 400 ) );
 
+        // ── V.3.7 Round 32: Idempotency-Key support ──
+        // Admin clicks "📅 ETA" → modal prompts days/notes → POST. Slow LINE/network double-fire
+        // bypasses status guard (after first call status still pending/ready) → notes append uses
+        // "|" separator → 2x same note silently appended. Hash {bo_queue_id, eta_days, notes}.
+        // Different notes mid-retry surfaces 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-update-eta';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'bo_queue_id' => $bo_queue_id,
+                'eta_days'    => $eta_days,
+                'notes'       => $notes,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         global $wpdb;
         $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
 
@@ -943,7 +987,13 @@ if ( ! function_exists( 'b2b_rest_bo_update_eta' ) ) {
             b2b_log( "[BO] ETA updated — bo_queue_id={$bo_queue_id} eta={$new_eta} by user=" . get_current_user_id() );
         }
 
-        return rest_ensure_response( array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'eta' => $new_eta ) );
+        $resp = array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'eta' => $new_eta );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -2790,12 +2840,47 @@ if ( ! function_exists( 'b2b_rest_bo_queue' ) ) {
 if ( ! function_exists( 'b2b_rest_bo_restock_scan' ) ) {
     function b2b_rest_bo_restock_scan( $request ) {
         $sku = $request->get_param( 'sku' );
+
+        // ── V.3.7 Round 32: Idempotency-Key support ──
+        // Admin double-click "🔍 Restock Scan" + manual cron also fires this endpoint; concurrent
+        // runs can mark same row "ready" twice + send 2x Telegram alert + 2x cache invalidation.
+        // Empty body (full scan) hashes consistently — admin retry returns cached result in 24h.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-restock-scan';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'sku' => $sku ? strtoupper( trim( (string) $sku ) ) : '',
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         $marked_ready = b2b_bo_restock_scan( $sku ?: null );
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success'      => true,
             'marked_ready' => $marked_ready,
-        ) );
+        );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 

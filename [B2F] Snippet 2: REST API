@@ -1,5 +1,14 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.18 (2026-04-30) — Round 32 batch 10: Idempotency-Key support on 2 endpoints:
+ *   maker-reschedule (Maker LIFF retry on slow LINE — date update double-fire causes duplicate
+ *   reschedule history rows + 2x admin Flex push). Body hash = {po_id, maker_id, new_date, reason}.
+ *   maker_id pulled from JWT (cross-maker poison guard). new_date IS in hash — admin retry with
+ *   different date = different intent. reject-lot (admin "ปฏิเสธทั้ง lot" double-click — 2nd request
+ *   fails at FSM "already confirmed" but admin Flex push re-fires to Maker → 2x rejection notice).
+ *   Body hash = {po_id, reason}. reason IS in hash — admin editing reason between retries surfaces 409.
+ *   Backward compat: missing X-Idempotency-Key = byte-identical V.11.17 behavior. Pattern proven
+ *   across 16 B2F endpoints now (Round 19/23/25/26/27/28/31/32).
  * Version: V.11.17 (2026-04-30) — Round 31 batch 9: Idempotency-Key support on maker-reject.
  *   Pair กับ maker-confirm (Round 25). Maker LIFF "ปฏิเสธ PO" double-click on slow LINE response
  *   → 2nd request hits FSM "already cancelled/rejected" guard → confusing 400 TRANSITION_FAILED.
@@ -4234,6 +4243,39 @@ if ( ! function_exists( 'b2f_rest_maker_reschedule' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => b2f_t('ไม่มีสิทธิ์เข้าถึง PO นี้', 'You do not have access to this PO', '您无权访问此订单', $cur), 'code' => 'FORBIDDEN' ), 403 );
         }
 
+        // ── V.11.18 Round 32: Idempotency-Key support ──
+        // Maker LIFF "ขอเลื่อนวันส่ง" double-fire on slow LINE network → 2x reschedule history
+        // rows + 2x admin Flex push. Hash {po_id, maker_id, new_date, reason}. maker_id from JWT
+        // prevents cross-maker poison (MR Round 31 maker-reject pattern). new_date IS in hash —
+        // maker editing date between retries = different intent → 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker-reschedule';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'po_id'    => $po_id,
+                'maker_id' => $maker_id,
+                'new_date' => $new_date,
+                'reason'   => $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => b2f_t('Idempotency-Key ซ้ำกับคำขอเก่าที่มีข้อมูลต่างกัน', 'Idempotency-Key conflicts with previous request', '幂等键与之前请求冲突', $cur),
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // Save reschedule request as post meta (pending approval)
         $reschedule_data = array(
             'new_date'     => $new_date,
@@ -4260,11 +4302,17 @@ if ( ! function_exists( 'b2f_rest_maker_reschedule' ) ) {
             b2f_log( sprintf( 'Maker reschedule request: %s (#%d) new_date=%s reason=%s', $po_number, $po_id, $new_date, $reason ) );
         }
 
-        return new WP_REST_Response( array(
+        $resp = array(
             'success' => true,
             'po_id'   => $po_id,
             'message' => b2f_t('ส่งคำขอเลื่อนวันส่งแล้ว รอ Admin อนุมัติ', 'Reschedule request submitted. Pending admin approval.', '延期申请已提交，等待管理员批准。', $cur),
-        ), 200 );
+        );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 
@@ -6203,6 +6251,37 @@ if ( ! function_exists( 'b2f_rest_reject_lot' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
         }
 
+        // ── V.11.18 Round 32: Idempotency-Key support ──
+        // Admin "ปฏิเสธทั้ง lot" double-click on slow Flex push → 2nd request fails at FSM
+        // INVALID_STATUS (already 'confirmed' after first call) but admin Flex push to Maker
+        // re-fires (Maker sees 2x rejection notice). Hash {po_id, reason}. reason IS in hash —
+        // admin editing rejection reason between retries = different intent → 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::reject-lot';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'po_id'  => $po_id,
+                'reason' => $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         $current_status = get_field( 'po_status', $po_id );
         if ( $current_status !== 'delivering' ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'PO ไม่อยู่ในสถานะ delivering', 'code' => 'INVALID_STATUS' ), 400 );
@@ -6232,7 +6311,13 @@ if ( ! function_exists( 'b2f_rest_reject_lot' ) ) {
             b2f_log( sprintf( 'Reject lot: PO #%d reason=%s', $po_id, $reason ) );
         }
 
-        return new WP_REST_Response( array( 'success' => true, 'po_id' => $po_id, 'status' => 'confirmed' ), 200 );
+        $resp = array( 'success' => true, 'po_id' => $po_id, 'status' => 'confirmed' );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 
