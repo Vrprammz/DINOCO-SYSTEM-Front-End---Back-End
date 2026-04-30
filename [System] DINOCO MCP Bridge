@@ -1,6 +1,20 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.2.7 (2026-04-30) — Round 34 batch 12: Idempotency-Key support on 2 chatbot signal MCP endpoints:
+ *   • POST /dinoco-mcp/v1/kb-suggest         — body hash {question[lowercased+trimmed], source, frequency}.
+ *     Chatbot retry on Gemini timeout → 2x suggestion entries with same lowercase question (frequency
+ *     bumped twice → stale "asked 4x" when actually 2x). Wrapper returns cached 200 — frequency
+ *     incremented once. question normalized via mb_strtolower + trim before hashing (matches handler
+ *     dedup logic). Different `source` (fb_chat vs ig_chat) with same question = legitimate distinct
+ *     intent (admin needs to know which platform asks more) → 409 if same key reused.
+ *   • POST /dinoco-mcp/v1/brand-voice-submit — body hash {content, sentiment, platform, source_url}.
+ *     OpenClaw → bv_create_entry inserts CPT row. Retry duplicates entry → sentiment ML training
+ *     data poisoned by 2x identical row (over-weights this signal). Wrapper returns cached
+ *     {success, id} → 1 CPT row only. content+platform+source_url uniquely identifies signal;
+ *     sentiment edits between retries (positive → negative) = different intent → 409.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key = byte-identical V.2.6 behavior.
  * Version: V.2.6 (2026-04-30) — Round 33 batch 11: Idempotency-Key support on 2 retry-prone MCP endpoints:
  *   • POST /dinoco-mcp/v1/distributor-notify — body hash {distributor_id, lead_id, type,
  *     customer_name, product, province, phone, message}. OpenClaw lead notification retry
@@ -1113,6 +1127,38 @@ function dinoco_mcp_kb_suggest( $request ) {
         return new WP_REST_Response( array( 'success' => false ), 400 );
     }
 
+    // ── V.2.7 Round 34 batch 12: Idempotency-Key support ──
+    // Chatbot retry on Gemini timeout → 2x kb-suggest with same question. Without wrapper,
+    // frequency increments twice (stale "asked 4x" when actually 2x). Wrapper returns cached 200.
+    // Body hash normalizes question via mb_strtolower + trim (matches handler dedup logic line ~1122).
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.6 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::kb-suggest';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'question'  => trim( mb_strtolower( $question ) ),
+            'source'    => $source ?: 'unknown',
+            'frequency' => max( $frequency, 1 ),
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // เก็บใน wp_options (simple queue ไม่ต้อง CPT)
     $suggestions = get_option( 'dinoco_kb_suggestions', array() );
 
@@ -1143,7 +1189,20 @@ function dinoco_mcp_kb_suggest( $request ) {
 
     update_option( 'dinoco_kb_suggestions', $suggestions );
 
-    return new WP_REST_Response( array( 'success' => true, 'total_suggestions' => count( $suggestions ) ), 200 );
+    $resp_data = array( 'success' => true, 'total_suggestions' => count( $suggestions ) );
+
+    // V.2.7 Round 34: store cached response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
     // Brand Voice Submit
@@ -1286,6 +1345,40 @@ function dinoco_mcp_brand_voice_submit( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'content required' ), 400 );
     }
 
+    // ── V.2.7 Round 34 batch 12: Idempotency-Key support ──
+    // OpenClaw retry on bv_create_entry timeout → 2x sentiment ML training rows. Wrapper returns
+    // cached 200 → 1 CPT row only. Body hash = {content, sentiment, platform, source_url} —
+    // sentiment edits between retries (positive → negative) = different intent → 409.
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.6 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::brand-voice-submit';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'content'    => $content,
+            'sentiment'  => $sentiment ?: 'neutral',
+            'platform'   => $platform ?: 'facebook_page',
+            'source_url' => $source_url,
+            'intensity'  => $intensity ?: 3,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // ใช้ bv_create_entry ถ้ามี (จาก Brand Voice Pool snippet)
     if ( function_exists( 'bv_create_entry' ) ) {
         $entry_id = bv_create_entry( array(
@@ -1301,7 +1394,20 @@ function dinoco_mcp_brand_voice_submit( $request ) {
             'bv_admin_notes'  => $context ? "บริบทโพสต์: {$context}" : '',
         ) );
 
-        return new WP_REST_Response( array( 'success' => (bool) $entry_id, 'id' => $entry_id ), 200 );
+        $resp_data = array( 'success' => (bool) $entry_id, 'id' => $entry_id );
+
+        // V.2.7 Round 34: store cached response for replay (success only — entry_id > 0)
+        if ( $entry_id && $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return new WP_REST_Response( $resp_data, 200 );
     }
 
     return new WP_REST_Response( array( 'success' => false, 'message' => 'Brand Voice Pool not active' ), 200 );

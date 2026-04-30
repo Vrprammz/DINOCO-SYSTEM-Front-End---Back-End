@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 9: Admin Control Panel                      ║
+ * ║  Version: V.34.2 (2026-04-30) — Round 34 batch 12: Idempotency-Key support on 2 distributor admin endpoints: ║
+ * ║    • POST /b2b/v1/distributor/delete       — body hash {id}.                                  ║
+ * ║      Admin double-click "ลบตัวแทน" → wp_delete_post is no-op on 2nd call (post already gone) ║
+ * ║      but Telegram/LINE alert (if wired downstream) + b2b_log line spam. Wrapper returns       ║
+ * ║      cached 200 → 1 alert + 1 log entry. Different `id` reuse same key = different intent → 409.║
+ * ║    • POST /b2b/v1/distributor/toggle-bot   — body hash {dist_id, bot_enabled}.                ║
+ * ║      Existing 5-second transient dedup (b2b_toggle_bot_{id}) protects against rapid double-   ║
+ * ║      click but DOES NOT protect against retry > 5s OR network drop replay. Without wrapper,   ║
+ * ║      replay flips bot to opposite state silently (admin lost intent). bot_enabled in hash →   ║
+ * ║      replay returns cached 200 → idempotent within 24h. Different bot_enabled (admin changed  ║
+ * ║      mind between retries) = different intent → 409 instead of silent flip.                   ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.          ║
+ * ║    • Backward compat: missing X-Idempotency-Key = byte-identical V.34.1 behavior.            ║
  * ║  Version: V.34.1 (2026-04-30) — Round 29: Idempotency-Key support on import-distributors    ║
  * ║    (bulk CSV up to 500 rows). Body hash = {rows[normalized: sort by gid + sanitize per-     ║
  * ║    row], dry_run}. dry_run=true vs false → distinct cache slots so admin previewing then    ║
@@ -160,6 +173,38 @@ function b2b_rest_toggle_bot( WP_REST_Request $req ) {
         if (!$id || get_post_type($id) !== 'distributor') {
             return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบตัวแทน'), 400);
         }
+
+        // ── V.34.2 Round 34 batch 12: Idempotency-Key support ──
+        // Existing 5s transient dedup protects rapid double-click but NOT cross-window replay.
+        // Body hash = {dist_id, bot_enabled} — bot_enabled discriminates intent: replay with
+        // same value returns cached 200 instead of silent flip; admin changing value between
+        // retries = different intent → 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2b/v1::distributor-toggle-bot';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'dist_id'     => $id,
+                'bot_enabled' => $val ? 1 : 0,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key conflict — body differs from prior request',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // Dedup guard — ป้องกัน double call (5 วินาที)
         $dedup_key = 'b2b_toggle_bot_' . $id;
         if (get_transient($dedup_key)) {
@@ -169,7 +214,21 @@ function b2b_rest_toggle_bot( WP_REST_Request $req ) {
         update_post_meta($id, 'bot_enabled', $val ? '1' : '0');
         $shop = get_field('shop_name', $id) ?: '#'.$id;
         b2b_log('[Bot Toggle] dist=' . $id . ' enabled=' . ($val ? 'YES' : 'NO'));
-        return new WP_REST_Response(array('success'=>true,'bot_enabled'=>$val,'shop_name'=>$shop,'message'=>($val ? '✅ เปิดบอท' : '⛔ ปิดบอท') . ' ' . $shop . ' แล้ว'), 200);
+
+        $resp_data = array('success'=>true,'bot_enabled'=>$val,'shop_name'=>$shop,'message'=>($val ? '✅ เปิดบอท' : '⛔ ปิดบอท') . ' ' . $shop . ' แล้ว');
+
+        // V.34.2 Round 34: store cached response for replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return new WP_REST_Response( $resp_data, 200 );
     } catch (\Throwable $e) {
         b2b_log('[Snippet9] toggle-bot error: ' . $e->getMessage());
         return new WP_REST_Response(array('success'=>false,'message'=>'Internal error'), 500);
@@ -177,8 +236,52 @@ function b2b_rest_toggle_bot( WP_REST_Request $req ) {
 }
 function b2b_rest_delete_distributor( WP_REST_Request $req ) {
     try {
-    $id=intval($req->get_param('id'));if(!$id||get_post_type($id)!=='distributor')return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบตัวแทน'),400);
-    wp_delete_post($id,true);return new WP_REST_Response(array('success'=>true,'message'=>'ลบตัวแทนสำเร็จ'),200);
+        $id=intval($req->get_param('id'));
+        if(!$id||get_post_type($id)!=='distributor')return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบตัวแทน'),400);
+
+        // ── V.34.2 Round 34 batch 12: Idempotency-Key support ──
+        // Admin double-click "ลบตัวแทน" → wp_delete_post no-op on 2nd call but log + alert spam.
+        // Body hash = {id}. Different id with same key = different intent → 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2b/v1::distributor-delete';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'id' => $id,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key conflict — body differs from prior request',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
+        wp_delete_post($id,true);
+        $resp_data = array('success'=>true,'message'=>'ลบตัวแทนสำเร็จ');
+
+        // V.34.2 Round 34: store cached response for replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return new WP_REST_Response( $resp_data, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
