@@ -1,5 +1,13 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.17 (2026-04-30) — Round 31 batch 9: Idempotency-Key support on maker-reject.
+ *   Pair กับ maker-confirm (Round 25). Maker LIFF "ปฏิเสธ PO" double-click on slow LINE response
+ *   → 2nd request hits FSM "already cancelled/rejected" guard → confusing 400 TRANSITION_FAILED.
+ *   Body hash = {po_id, maker_id (JWT), reason}. reason IS in hash — different rejection reason =
+ *   different intent. JWT-scoped maker_id prevents cross-maker poison. Admin Flex push side-effect
+ *   not re-fired on cached replay (single notification per replay window). Backward compat:
+ *   missing X-Idempotency-Key = byte-identical V.11.16 behavior. Pattern proven across 14 B2F
+ *   endpoints now (Round 19/23/25/26/27/28/31).
  * Version: V.11.16 (2026-04-30) — Round 28: Extend Idempotency-Key support to 2 admin endpoints:
  *   approve-reschedule + reject-resolve. approve-reschedule body hash = {po_id, approved, note} —
  *   approved flag discriminates approve vs reject (different intents on same PO). reject-resolve body
@@ -4103,6 +4111,40 @@ if ( ! function_exists( 'b2f_rest_maker_reject' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => b2f_t('ใบสั่งซื้อนี้ถูกยกเลิกแล้ว', 'This PO has been cancelled', '此订单已取消', $cur), 'code' => 'PO_CANCELLED' ), 400 );
         }
 
+        // ── V.11.17 Round 31 batch 9: Idempotency-Key support ──
+        // Pair กับ maker-confirm (Round 25). Maker LIFF "ปฏิเสธ" double-click on slow LINE
+        // response → 2nd request hits FSM "rejected → rejected" invalid transition. Wrapper
+        // returns cached 200. Body hash = {po_id, maker_id from JWT, reason}. reason IS in hash
+        // — typing different rejection reason is a different intent (admin should see 409).
+        // Admin Flex push (b2f_build_flex_maker_rejected) only fires on first call — replays
+        // skip via cached return.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker-reject';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'po_id'    => (int) $po_id,
+                'maker_id' => (int) $maker_id,
+                'reason'   => (string) $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => b2f_t( 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน', 'Idempotency-Key conflict — body differs from previous request', 'Idempotency-Key 冲突 — 数据与先前请求不一致', $cur ),
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // Transition
         if ( function_exists( 'b2f_transition_order' ) ) {
             $trans = b2f_transition_order( $po_id, 'rejected', 'maker', $reason );
@@ -4126,11 +4168,24 @@ if ( ! function_exists( 'b2f_rest_maker_reject' ) ) {
             b2f_log( sprintf( 'Maker rejected: %s (#%d) reason=%s', $po_number, $po_id, $reason ) );
         }
 
-        return new WP_REST_Response( array(
+        $resp_data = array(
             'success' => true,
             'po_id'   => $po_id,
             'status'  => 'rejected',
-        ), 200 );
+        );
+
+        // V.11.17 Round 31 batch 9: store cached response for replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return new WP_REST_Response( $resp_data, 200 );
     }
 }
 

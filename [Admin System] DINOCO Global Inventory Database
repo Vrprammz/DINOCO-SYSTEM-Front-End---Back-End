@@ -2,6 +2,18 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.45.5 (2026-04-30) — Round 31 batch 9: Idempotency-Key support on 2 inventory POSTs:
+ *   • POST /product/pricing — tier price + discount dual-write. Body hash = {sku, discount_percent,
+ *     price_silver, price_gold, price_platinum, price_diamond, category, moq, boxes_per_unit,
+ *     units_per_box, b2b_visible}. Admin double-click "Save" → dual-write fires twice (custom
+ *     table + ACF) → no functional bug but verbose audit + 2x cache invalidation. Wrapper returns
+ *     cached 200 instantly. compatible_models excluded (admin tweaks model assignment between
+ *     retries — different shapes shouldn't replay-match).
+ *   • POST /warehouse — warehouse CRUD (create/update). Body hash = {id, name, code, address,
+ *     is_default, is_active}. Double-click on "เพิ่มคลัง" → 2x INSERT with same code → unique
+ *     constraint violation OR (worse) duplicate row if no constraint. Wrapper returns cached 200.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.45.4.
  * Version: V.45.4 (2026-04-30) — Round 30 batch 8: Idempotency-Key support on 3 inventory POSTs:
  *   • POST /stock/initialize — admin Dip Stock first-run flag flip. Body hash = {action: 'init'}
  *     (constant marker since endpoint takes no params). Double-click harmless functionally but
@@ -2962,6 +2974,7 @@ add_action('rest_api_init', function() {
     ]);
 
     // POST /dinoco-stock/v1/warehouse — create or update
+    // V.45.5 Round 31 batch 9: Idempotency-Key support — admin "เพิ่มคลัง" double-click protection
     register_rest_route('dinoco-stock/v1', '/warehouse', [
         'methods'  => 'POST',
         'callback' => function( WP_REST_Request $request ) {
@@ -2977,6 +2990,40 @@ add_action('rest_api_init', function() {
 
             if (empty($name) || empty($code)) {
                 return new WP_Error('missing_fields', 'ต้องระบุชื่อและรหัสคลัง', ['status' => 400]);
+            }
+
+            // ── V.45.5 Round 31 batch 9: Idempotency-Key support ──
+            // Body hash = {id, name, code, address, is_default, is_active}. id discriminates
+            // create (id=0) vs update (id>0) — same code+name on different id = different intent.
+            // Double-click "บันทึก" on create → 2x INSERT same code → unique-constraint failure
+            // OR (worse) silent duplicate. Wrapper returns cached 200 instantly.
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::warehouse';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'id'         => $id,
+                    'name'       => $name,
+                    'code'       => $code,
+                    'address'    => $address,
+                    'is_default' => $default ? 1 : 0,
+                    'is_active'  => $active ? 1 : 0,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
             }
 
             // Code unique check
@@ -3004,7 +3051,20 @@ add_action('rest_api_init', function() {
                 $id = $wpdb->insert_id;
             }
 
-            return rest_ensure_response([ 'success' => true, 'id' => $id ]);
+            $resp_data = [ 'success' => true, 'id' => $id ];
+
+            // V.45.5 Round 31 batch 9: store cached response for replay
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp_data );
         },
         'permission_callback' => $inv_perm,
     ]);
@@ -3114,6 +3174,7 @@ add_action('rest_api_init', function() {
     ]);
 
     // --- POST /dinoco-stock/v1/product/pricing --- V.35.0: Save discount + tier prices (dual-write)
+    // V.45.5 Round 31 batch 9: Idempotency-Key support — admin pricing form double-click protection
     register_rest_route('dinoco-stock/v1', '/product/pricing', [
         'methods'  => 'POST',
         'callback' => function( WP_REST_Request $request ) {
@@ -3128,6 +3189,60 @@ add_action('rest_api_init', function() {
             // V.38.1: Selective update — only update fields that were actually sent
             $params = $request->get_json_params();
             if (!is_array($params)) $params = [];
+
+            // ── V.45.5 Round 31 batch 9: Idempotency-Key support ──
+            // Body hash includes pricing-relevant fields only. compatible_models excluded
+            // (large array, admin tweaks between retries — collision = false 409). Hash uses
+            // normalized values (max(0,min(100,float)) for percents) — same as save logic.
+            // Why critical: pricing dual-write fires custom table UPDATE + ACF update_field +
+            // delete_transient('b2b_sku_data_map'). Double-click → 2x dual-write → cache thrash.
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::product/pricing';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $hash_fields = array( 'sku' => strtoupper( $sku ) );
+                // Only hash fields actually present (selective save semantics)
+                if ( array_key_exists( 'discount_percent', $params ) ) {
+                    $hash_fields['discount_percent'] = max( 0, min( 100, floatval( $params['discount_percent'] ) ) );
+                }
+                foreach ( array( 'price_silver', 'price_gold', 'price_platinum', 'price_diamond' ) as $tier_key ) {
+                    if ( array_key_exists( $tier_key, $params ) ) {
+                        $hash_fields[ $tier_key ] = max( 0, min( 100, floatval( $params[ $tier_key ] ) ) );
+                    }
+                }
+                if ( array_key_exists( 'category', $params ) ) {
+                    $hash_fields['category'] = sanitize_text_field( $params['category'] ?: '' );
+                }
+                if ( array_key_exists( 'moq', $params ) ) {
+                    $hash_fields['moq'] = max( 1, intval( $params['moq'] ?: 1 ) );
+                }
+                if ( array_key_exists( 'boxes_per_unit', $params ) ) {
+                    $hash_fields['boxes_per_unit'] = max( 1, intval( $params['boxes_per_unit'] ?: 1 ) );
+                }
+                if ( array_key_exists( 'units_per_box', $params ) ) {
+                    $hash_fields['units_per_box'] = max( 1, intval( $params['units_per_box'] ?: 1 ) );
+                }
+                if ( array_key_exists( 'b2b_visible', $params ) ) {
+                    $hash_fields['b2b_visible'] = intval( $params['b2b_visible'] ) ? 1 : 0;
+                }
+                $idem_body = $hash_fields;
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_REST_Response( array(
+                        'success' => false,
+                        'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        'code'    => 'idempotency_conflict',
+                    ), $status_code );
+                }
+                if ( is_array( $cached ) ) {
+                    $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                    unset( $cached['_idem_code'] );
+                    return new WP_REST_Response( $cached, $cached_code );
+                }
+            }
 
             $custom_data = [];
             $acf_data = [];
@@ -3302,7 +3417,20 @@ add_action('rest_api_init', function() {
             // 3) Clear transient cache
             delete_transient('b2b_sku_data_map');
 
-            return new WP_REST_Response(['success' => true, 'message' => 'Pricing saved for ' . $sku, 'b2b_post_id' => isset($b2b_id) ? $b2b_id : 0, 'debug' => $debug], 200);
+            $resp_data = ['success' => true, 'message' => 'Pricing saved for ' . $sku, 'b2b_post_id' => isset($b2b_id) ? $b2b_id : 0, 'debug' => $debug];
+
+            // V.45.5 Round 31 batch 9: store cached response for replay
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return new WP_REST_Response( $resp_data, 200 );
         },
         'permission_callback' => $inv_perm,
     ]);

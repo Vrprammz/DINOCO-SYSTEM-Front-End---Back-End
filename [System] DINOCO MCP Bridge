@@ -1,6 +1,14 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.2.5 (2026-04-30) — Round 31 batch 9: Idempotency-Key support on 2 status-update MCP endpoints:
+ *   • POST /dinoco-mcp/v1/claim-manual-update — body hash {claim_id, status, case_type, tracking_number}.
+ *     Pair กับ claim-manual-create (Round 30). OpenClaw retry บน slow WP response → status update ซ้ำ
+ *     → admin notes ทับ + tracking history สับสน. Wrapper return cached 200 instantly.
+ *   • POST /dinoco-mcp/v1/lead-update — body hash {lead_id, status, updated_by, followup_at}.
+ *     Pair กับ lead-create (Round 30). Status double-fire → notes append ซ้ำ + followup_at สับสน.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.2.4 behavior.
  * Version: V.2.4 (2026-04-30) — Round 30 batch 8: Idempotency-Key support on 2 retry-prone MCP endpoints:
  *   • POST /dinoco-mcp/v1/claim-manual-create — body hash {serial, symptoms, source_id, platform, customer, phone}.
  *     OpenClaw chatbot Gemini function-call retry path → duplicate claim CPT records cleaned in Service Center.
@@ -846,6 +854,42 @@ function dinoco_mcp_claim_manual_update( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'Claim not found' ), 404 );
     }
 
+    // ── V.2.5 Round 31 batch 9: Idempotency-Key support ──
+    // Pair กับ claim-manual-create (Round 30). Status update from chatbot/admin retry path:
+    //   - OpenClaw retry บน slow WP → status_history append ซ้ำ + admin notes ทับ
+    //   - Body hash {claim_id, status, case_type, tracking_number} — notes excluded (chatbot
+    //     อาจตัด whitespace/newline สั้นๆ ระหว่าง retries → false 409). Status enum + case_type
+    //     + tracking are the discriminators that matter (different status = different intent).
+    //   - Webhook to OpenClaw (notify status changed) is fire-and-forget non-blocking — replay
+    //     re-fires webhook but OpenClaw side dedupes via claim_id+new_status combo.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::claim-manual-update';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'claim_id'        => $claim_id,
+            'status'          => $status,
+            'case_type'       => $case,
+            'tracking_number' => $tracking,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // M18: route through canonical helper for allowlist + hook + history + observability.
     // Chatbot-driven status changes come from OpenClaw agent, which may use state strings
     // that haven't been registered in the filter yet. In that case the helper records the
@@ -894,7 +938,20 @@ function dinoco_mcp_claim_manual_update( $request ) {
         ) );
     }
 
-    return new WP_REST_Response( array( 'success' => true, 'claim_id' => $claim_id, 'status' => $status ), 200 );
+    $resp_data = array( 'success' => true, 'claim_id' => $claim_id, 'status' => $status );
+
+    // V.2.5 Round 31 batch 9: store cached response for replay (24h TTL via helper default)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // === Claim Manual Status Check ===
@@ -1392,6 +1449,41 @@ function dinoco_mcp_lead_update( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'Lead not found' ), 404 );
     }
 
+    // ── V.2.5 Round 31 batch 9: Idempotency-Key support ──
+    // Pair กับ lead-create (Round 30). Status update retry from chatbot/admin/dealer:
+    //   - Body hash {lead_id, status, updated_by, followup_at} — notes excluded (each retry
+    //     would APPEND notes with new timestamp — which is the bug we want to prevent on retry,
+    //     so wrapper-cached replay = single notes append, retry → return cached without re-append).
+    //   - status enum is primary discriminator (qualified vs converted = different transition).
+    //   - updated_by + followup_at also matter — agent vs admin attribution divergence.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::lead-update';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'lead_id'     => $lead_id,
+            'status'      => $status,
+            'updated_by'  => $updated_by,
+            'followup_at' => $followup,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     if ( ! empty( $status ) )     $lead['status']      = $status;
     if ( ! empty( $notes ) )      $lead['notes']       = ( $lead['notes'] ?? '' ) . "\n[" . current_time( 'Y-m-d H:i' ) . '] ' . $notes;
     if ( ! empty( $updated_by ) ) $lead['updated_by']  = $updated_by;
@@ -1399,7 +1491,20 @@ function dinoco_mcp_lead_update( $request ) {
 
     dinoco_mcp_save_lead( $lead );
 
-    return new WP_REST_Response( array( 'success' => true, 'lead_id' => $lead_id, 'status' => $lead['status'] ), 200 );
+    $resp_data = array( 'success' => true, 'lead_id' => $lead_id, 'status' => $lead['status'] );
+
+    // V.2.5 Round 31 batch 9: store cached response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
