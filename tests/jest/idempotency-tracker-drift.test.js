@@ -24,6 +24,13 @@
  *     accuracy).
  *
  * Round 31 ITEM 3 (2026-04-30) — extends 8 → 9 drift detectors.
+ *
+ * Round 33 (2026-04-30) — 4 → 5 tests in this suite. Adds METHOD assertion:
+ * every tracker row MUST have `POST` HTTP method. Read-only endpoints (GET)
+ * accidentally added to the tracker = bug class — they don't need idempotency
+ * wrappers (replay-safe by definition). DELETE/PUT/PATCH endpoints belong on
+ * the tracker if the operation is mutational, but the tracker schema today
+ * only documents POST endpoints. This guard prevents accidental scope creep.
  */
 
 const fs = require("fs");
@@ -198,6 +205,48 @@ describe("Idempotency tracker drift", () => {
         }
 
         expect(drifted).toEqual([]);
+    });
+
+    test("every integrated tracker row uses POST HTTP method (not GET/DELETE/PUT/PATCH)", () => {
+        // Round 33: defense against accidentally adding read-only endpoints to the tracker.
+        // GET endpoints are replay-safe by definition (no side effects → idempotent for free).
+        // DELETE/PUT/PATCH MAY warrant idempotency wrappers but the current tracker schema
+        // documents POST only. This guard prevents scope creep + catches typos like accidentally
+        // pasting "GET /b2b/v1/foo" into a row instead of "POST /b2b/v1/foo".
+        const nonPostRows = [];
+        for (const row of integratedRows) {
+            // Endpoint format must start with HTTP method: "POST /b2b/v1/place-order"
+            const methodMatch = row.endpoint.match(/^([A-Z]+)\s+\//);
+            if (!methodMatch) {
+                nonPostRows.push({
+                    endpoint: row.endpoint,
+                    reason: "endpoint string missing HTTP method prefix (expected: 'POST /...')",
+                });
+                continue;
+            }
+            const method = methodMatch[1];
+            if (method !== "POST") {
+                nonPostRows.push({
+                    endpoint: row.endpoint,
+                    reason: `tracker schema is POST-only, found method='${method}' — read-only endpoints don't need idempotency`,
+                });
+            }
+        }
+
+        if (nonPostRows.length > 0) {
+            const detail = nonPostRows
+                .map((r) => `  - ${r.endpoint}: ${r.reason}`)
+                .join("\n");
+            throw new Error(
+                `Idempotency tracker has non-POST rows:\n${detail}\n\n` +
+                    `Tracker schema documents POST endpoints only. Either:\n` +
+                    `  1. Remove the row if it's a read-only endpoint (idempotent for free)\n` +
+                    `  2. Fix the endpoint string to use POST if it's a mutation endpoint\n` +
+                    `  3. Update tracker schema design if DELETE/PUT/PATCH support is intended.`
+            );
+        }
+
+        expect(nonPostRows).toEqual([]);
     });
 
     test("every integrated endpoint's namespace appears in a wrapper namespace string", () => {
