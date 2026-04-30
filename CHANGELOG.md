@@ -10,6 +10,109 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 24 (GDPR Phase 7 admin review UI + 6 REST endpoints + audit log) (2026-04-29)
+
+Phase 7 closes the GDPR/PDPA admin workflow on top of Round 23's foundation. ALL features remain flag-gated `dinoco_gdpr_enabled=0` default — endpoints return 503 + admin UI shows "FLAG OFF" badge until explicit activation.
+
+#### Schema V.3.0 (additive dbDelta)
+
+- `wp_dinoco_gdpr_requests` +3 columns (`reviewed_by`, `reviewed_at`, `cancellation_window_at`) + `idx_reviewed_by`
+- NEW `wp_dinoco_gdpr_audit_log` — immutable append-only decision trail (id, request_id, actor_user_id, actor_login, action, from_status, to_status, reason, note, actor_ip, created_at + 3 indexes). Per PDPA §39 documentation requirement + GDPR Article 30 records of processing.
+
+#### 7 admin REST endpoints (`/wp-json/dinoco-gdpr/v1/admin/*`)
+
+- `GET /admin/requests` — list with filters (status, type, age_days, user) + bucket counts + per-row enrichment (user identity + record_summary stats: warranties/claims/orders/has_open_debt for legal-hold detection)
+- `GET /admin/request/{id}` — single + audit trail (last 50) + auto-logs view action
+- `POST /admin/request/{id}/approve` — typed `confirm_text=APPROVE` literal + FOR UPDATE lock + state transition + 30s undo window via `wp_schedule_single_event(now+30s, 'dinoco_gdpr_process_request')`
+- `POST /admin/request/{id}/reject` — reason enum (legal_hold|fraud|cooling_off|other) + 'other' requires note ≥5 chars + auto-emails user
+- `POST /admin/request/{id}/manual-export` — typed `confirm_text=PROCESS` + synchronous worker run (admin retry path for failed)
+- `POST /admin/request/{id}/undo` — 30-second window cancellation + `wp_unschedule_event` best-effort cancel
+- `GET /admin/audit-log` — filterable + Thai-friendly UTF-8 BOM CSV export (5000-row cap)
+
+Permission: `manage_options` + WP cookie auth + `X-WP-Nonce` CSRF on POST + 60/min/user rate limit (transient bucket).
+
+#### State machine helper (PURE, testable)
+
+`dinoco_gdpr_is_valid_status_transition($from, $to)`:
+
+```text
+pending    → processing | rejected | cancelled
+processing → ready | failed | cancelled
+failed     → processing | cancelled
+ready      → expired                            (TERMINAL)
+rejected/cancelled/expired → ZERO outgoing      (TERMINAL)
+```
+
+CRITICAL safety: ready→processing IMPOSSIBLE (would re-trigger duplicate worker = double email + double ZIP + irreversible side effects).
+
+#### Admin shortcode `[dinoco_admin_gdpr]` (~700 LOC additive)
+
+5 tabs (Pending Review / Processing / Ready / Failed / Audit Log) embedded in V.3.0 snippet. Per-card user identity + record_summary stats + age badge color-coded for PDPA 30-day SLA. Legal-hold warning banner auto-detects distributor open debt → suggests `reason=legal_hold`. Action buttons via `window.dinocoModal.confirm/prompt` with native `confirm/alert/prompt` fallback (defensive try/catch). Typed confirmation gates: APPROVE for /approve, PROCESS for /manual-export — both case-strict + boolean-truthy rejected. Audit Log tab: filter (actor_user_id, action enum, date range) + CSV export. Scoped CSS `.dnc-gdpr-*` (no conflict with b2b/b2f/liff-ai prefixes). Mobile responsive (<640px stacks card actions).
+
+#### Module Registry self-register + Sidebar nav
+
+- Self-register at init priority 30 (key='gdpr', section='system', order=80, cache_ttl=0 — never cache dynamic admin review)
+- NEW Section "ระบบกลาง" in Admin Dashboard sidebar (V.34.1 → V.34.2) with 1 nav-item `data-tab="gdpr"`
+- Emergency fallback maps updated for snippet-disable resilience (3 maps: module_map, cache_ttl_map, tab_labels)
+- Modal Helpers V.1.1 → V.1.2 — whitelist `dinoco_admin_gdpr` for auto-enqueue
+
+#### Tests
+
+- NEW `tests/helpers/GdprAdminPermissionTest.php` — 28 pure-logic cases (mirror IdempotencyTest pattern):
+  - 8 valid state transitions
+  - 10 invalid + invariants (ready cannot regress, terminal zero outgoing, unknown rejected, case+whitespace, non-string PHP 8.1 safe)
+  - 5 reject reason matrix (enum + 'other' note requirement)
+  - 4 typed confirmation gate (literal match, truthy NEVER bypasses)
+- Suite: 419 → 447 tests pass (+28 new, 0 regressions)
+
+#### Risk Assessment
+
+LOW-MEDIUM — admin UI for irreversible operations. Default flag-gated OFF. CRITICAL safety enforced:
+
+- Typed confirmation gates (case-strict literal match — boolean truthy rejected by tests)
+- Audit log row INSERT BEFORE every state transition (immutable trail)
+- 30-second undo window for approve action
+- State machine REJECTS regression (ready cannot return to processing — prevents duplicate worker)
+- FOR UPDATE locks prevent concurrent admin double-click race conditions
+
+#### Files (4)
+
+- `[System] DINOCO GDPR Data Requests` V.2.0 → V.3.0 (+1567 LOC additive: 7 endpoints + 8 helpers + admin shortcode)
+- `[Admin System] DINOCO Modal Helpers` V.1.1 → V.1.2 (whitelist +1)
+- `[Admin System] DINOCO Admin Dashboard` V.34.1 → V.34.2 (sidebar +1 section + 3 emergency fallback maps)
+- `tests/helpers/GdprAdminPermissionTest.php` NEW (28 cases, ~290 LOC)
+
+#### Activation Checklist
+
+```bash
+# 1. Verify schema migrated (V.3.0 cols present)
+mysql> SHOW COLUMNS FROM wp_dinoco_gdpr_requests LIKE 'reviewed_%';
+mysql> SHOW TABLES LIKE 'wp_dinoco_gdpr_audit_log';
+
+# 2. Verify ZipArchive (Round 23 prereq)
+php -m | grep -i zip
+
+# 3. Smoke-test admin REST (expect 503)
+curl -X GET https://dinoco.in.th/wp-json/dinoco-gdpr/v1/admin/requests \
+     -H "X-WP-Nonce: ..." -H "Cookie: wordpress_logged_in_xxx=..."
+
+# 4. Flip flag
+wp option update dinoco_gdpr_enabled '1'
+
+# 5. Re-test (expect 200 with bucket_counts)
+# 6. Update docs/compliance/PDPA-BASICS.md activation status section
+```
+
+#### Deferred (Phase 6.1+)
+
+- LINE message export from OpenClaw MongoDB (cross-system correlation)
+- Bilingual email templates richer formatting (basic Thai+ENG already shipped in V.2.0)
+- Appeal mechanism / DPO contact route (requires legal review)
+- 25-day SLA reminder cron + Telegram alert
+- PHPUnit integration tests (full DB worker round-trip)
+
+---
+
 ### Feature — Round 23 (Idempotency expansion + GDPR Phase 6 foundation + Phase 5+ deferred sweep) (2026-04-29)
 
 3-phase mega-round per user override of Round 19's "defer until canary observed" recommendation. User explicitly chose to continue parallel infrastructure work.
