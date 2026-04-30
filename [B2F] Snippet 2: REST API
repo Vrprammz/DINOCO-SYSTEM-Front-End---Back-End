@@ -1,5 +1,20 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.19 (2026-04-30) — Round 33 batch 11: Idempotency-Key support on 3 B2F endpoints:
+ *   maker-product (admin "บันทึกสินค้า" double-click → DUPLICATE_SKU 400 confusion or rare race
+ *   = 2 b2f_maker_product CPT rows + 2x junction observation log noise). Body hash =
+ *   {id, mp_maker_id, mp_product_sku, mp_product_name, mp_unit_cost, mp_moq, mp_lead_*,
+ *   mp_shipping_*, mp_status, mp_notes}. id IS in hash — admin editing existing row vs creating
+ *   new row is different intent. maker (admin "บันทึกโรงงาน" double-click → DUPLICATE_NAME /
+ *   DUPLICATE_GROUP_ID race → 2 maker CPT records). Body hash includes sensitive bank fields
+ *   so admin retry with edited bank info surfaces 409. po-undo-submit (admin "ยกเลิก 30 วินาที"
+ *   double-click within DB-clock window → 2 attempts. 1st commits FSM + stock restore + payable
+ *   recalc; 2nd hits already_cancelled idempotent branch with lossy 200. Wrapper now caches 1st
+ *   full response — slow-client retry across 24h returns full undo result (fsm_transition +
+ *   refunded_credit + stock_restored) instead of stale already_cancelled stub). Body hash =
+ *   {po_id, user_id}. user_id from get_current_user_id (auth-scoped). Backward compat: missing
+ *   X-Idempotency-Key = byte-identical V.11.18 behavior. Pattern proven across 19 B2F endpoints
+ *   now (Round 19/23/25/26/27/28/31/32/33).
  * Version: V.11.18 (2026-04-30) — Round 32 batch 10: Idempotency-Key support on 2 endpoints:
  *   maker-reschedule (Maker LIFF retry on slow LINE — date update double-fire causes duplicate
  *   reschedule history rows + 2x admin Flex push). Body hash = {po_id, maker_id, new_date, reason}.
@@ -1029,6 +1044,57 @@ if ( ! function_exists( 'b2f_rest_save_maker' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ชื่อโรงงานนี้มีอยู่แล้ว', 'code' => 'DUPLICATE_NAME' ), 400 );
         }
 
+        // ── V.11.19 Round 33 batch 11: Idempotency-Key support ──
+        // Admin "บันทึกโรงงาน" double-click → 2 attempts. 1st may pass dup checks; 2nd hits
+        // DUPLICATE_NAME / DUPLICATE_GROUP_ID 400 (confusing UX) OR slips through if 1st was
+        // still in-flight → 2 maker CPT records with same name. Body hash = {id, maker_name,
+        // maker_line_group_id, maker_currency, maker_status, maker_credit_limit,
+        // maker_credit_term_days, maker_contact, maker_phone, maker_email, maker_address,
+        // maker_tax_id, maker_bank_*}. id IS in hash — admin editing existing maker vs creating
+        // new one is different intent. Sensitive bank fields included so admin retry with
+        // edited bank info surfaces 409.
+        // Backward compat: missing X-Idempotency-Key = byte-identical V.11.18 behavior.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'id'                     => $id,
+                'maker_name'             => $name,
+                'maker_line_group_id'    => $group_id,
+                'maker_contact'          => sanitize_text_field( $req->get_param( 'maker_contact' ) ?: '' ),
+                'maker_phone'            => sanitize_text_field( $req->get_param( 'maker_phone' ) ?: '' ),
+                'maker_email'            => sanitize_text_field( $req->get_param( 'maker_email' ) ?: '' ),
+                'maker_address'          => sanitize_text_field( $req->get_param( 'maker_address' ) ?: '' ),
+                'maker_tax_id'           => sanitize_text_field( $req->get_param( 'maker_tax_id' ) ?: '' ),
+                'maker_bank_name'        => sanitize_text_field( $req->get_param( 'maker_bank_name' ) ?: '' ),
+                'maker_bank_account'     => sanitize_text_field( $req->get_param( 'maker_bank_account' ) ?: '' ),
+                'maker_bank_holder'      => sanitize_text_field( $req->get_param( 'maker_bank_holder' ) ?: '' ),
+                'maker_bank_code'        => sanitize_text_field( $req->get_param( 'maker_bank_code' ) ?: '' ),
+                'maker_currency'         => sanitize_text_field( $req->get_param( 'maker_currency' ) ?: '' ),
+                'maker_status'           => sanitize_text_field( $req->get_param( 'maker_status' ) ?: '' ),
+                'maker_notes'            => sanitize_textarea_field( $req->get_param( 'maker_notes' ) ?: '' ),
+                'maker_credit_limit'     => floatval( $req->get_param( 'maker_credit_limit' ) ?: 0 ),
+                'maker_credit_term_days' => intval( $req->get_param( 'maker_credit_term_days' ) ?: 0 ),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับคำขอเก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // Create or update
         if ( $id > 0 ) {
             $post = get_post( $id );
@@ -1080,10 +1146,17 @@ if ( ! function_exists( 'b2f_rest_save_maker' ) ) {
             b2f_log( sprintf( 'Maker saved: #%d %s', $id, $name ) );
         }
 
-        return new WP_REST_Response( array(
+        $resp = array(
             'success' => true,
             'maker'   => b2f_format_maker( $id ),
-        ), 200 );
+        );
+
+        // V.11.19 Round 33 batch 11: store cached response for replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 
@@ -2071,6 +2144,52 @@ if ( ! function_exists( 'b2f_rest_save_maker_product' ) ) {
 
         $product_name = sanitize_text_field( $req->get_param( 'mp_product_name' ) ?: $sku );
 
+        // ── V.11.19 Round 33 batch 11: Idempotency-Key support ──
+        // Admin "บันทึกสินค้า" double-click on slow ACF write → 2 attempts hit duplicate-SKU guard
+        // (DUPLICATE_SKU 400) confusingly OR (rare race) 2 separate b2f_maker_product CPT rows
+        // with same maker_id + sku → junction observation log + LIFF picker shows duplicate.
+        // Body hash = {id, mp_maker_id, mp_product_sku, mp_unit_cost, mp_moq, mp_lead_time_days,
+        //              mp_lead_land, mp_lead_sea, mp_shipping_land, mp_shipping_sea, mp_status,
+        //              mp_notes, mp_product_name}. id IS in hash — admin editing existing row vs
+        // creating new row is different intent. NULL fields normalized to 0/'' for stable hash.
+        // Backward compat: missing X-Idempotency-Key = byte-identical V.11.18 behavior.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker-product';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'id'                => $id,
+                'mp_maker_id'       => $maker_id,
+                'mp_product_sku'    => $sku,
+                'mp_product_name'   => $product_name,
+                'mp_unit_cost'      => $cost,
+                'mp_moq'            => intval( $req->get_param( 'mp_moq' ) ?: 1 ),
+                'mp_lead_time_days' => intval( $req->get_param( 'mp_lead_time_days' ) ?: 7 ),
+                'mp_lead_land'      => intval( $req->get_param( 'mp_lead_land' ) ?: 7 ),
+                'mp_lead_sea'       => intval( $req->get_param( 'mp_lead_sea' ) ?: 14 ),
+                'mp_shipping_land'  => floatval( $req->get_param( 'mp_shipping_land' ) ?: 0 ),
+                'mp_shipping_sea'   => floatval( $req->get_param( 'mp_shipping_sea' ) ?: 0 ),
+                'mp_status'         => sanitize_text_field( $req->get_param( 'mp_status' ) ?: '' ),
+                'mp_notes'          => sanitize_textarea_field( $req->get_param( 'mp_notes' ) ?: '' ),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับคำขอเก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // Create or update
         if ( $id > 0 ) {
             $post = get_post( $id );
@@ -2154,10 +2273,17 @@ if ( ! function_exists( 'b2f_rest_save_maker_product' ) ) {
             b2f_log( sprintf( 'Maker product saved: #%d SKU=%s Maker=#%d Cost=%.2f', $id, $sku, $maker_id, $cost ) );
         }
 
-        return new WP_REST_Response( array(
+        $resp = array(
             'success' => true,
             'product' => b2f_format_maker_product( $id ),
-        ), 200 );
+        );
+
+        // V.11.19 Round 33 batch 11: store cached response for replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 
@@ -3758,6 +3884,43 @@ if ( ! function_exists( 'b2f_rest_po_undo_submit' ) ) {
             ), 429 );
         }
 
+        // ── V.11.19 Round 33 batch 11: Idempotency-Key support ──
+        // Admin "ยกเลิกอัตโนมัติ 30 วินาที" double-click within window → 2 attempts. 1st commits
+        // FSM transition + stock restore + payable recalc; 2nd hits already_cancelled idempotent
+        // branch (returns 200 with already_cancelled:true). Both return 200 but the side-effects
+        // already happened. Wrapper provides cache replay across 24h for slow-network clients
+        // who never received the 1st 200 response → return cached 200 with full undo result
+        // (fsm_transition + refunded_credit + stock_restored) instead of the lossy
+        // already_cancelled:true response.
+        // Body hash = {po_id, user_id}. user_id from get_current_user_id() (auth-scoped, can't
+        // cross-tenant cache poison). po_id is the only meaningful body param.
+        // Backward compat: missing X-Idempotency-Key = byte-identical V.11.18 behavior.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::po-undo-submit';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'po_id'   => $po_id,
+                'user_id' => $user_id,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับคำขอเก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         global $wpdb;
 
         // W1 — MySQL named lock (same pattern as po-cancel) prevents concurrent undo+cancel+receive
@@ -3917,7 +4080,7 @@ if ( ! function_exists( 'b2f_rest_po_undo_submit' ) ) {
 
             $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );
 
-            return new WP_REST_Response( array(
+            $resp = array(
                 'success' => true,
                 'data'    => array(
                     'po_id'            => $po_id,
@@ -3926,7 +4089,14 @@ if ( ! function_exists( 'b2f_rest_po_undo_submit' ) ) {
                     'stock_restored'   => $stock_restored,
                     'cancelled_reason' => 'user_undo_within_30s',
                 ),
-            ), 200 );
+            );
+
+            // V.11.19 Round 33 batch 11: store cached response for replay (24h window for slow clients)
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return new WP_REST_Response( $resp, 200 );
         } catch ( Exception $e ) {
             $wpdb->query( 'ROLLBACK' );
             $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $undo_lock ) );

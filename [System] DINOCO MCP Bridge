@@ -1,6 +1,19 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.2.6 (2026-04-30) — Round 33 batch 11: Idempotency-Key support on 2 retry-prone MCP endpoints:
+ *   • POST /dinoco-mcp/v1/distributor-notify — body hash {distributor_id, lead_id, type,
+ *     customer_name, product, province, phone, message}. OpenClaw lead notification retry
+ *     (chatbot Gemini → MCP) on slow LINE Push response → dealer receives 2x identical Lead
+ *     Flex notifications + postback `lead_accepted:{lead_id}` could double-mark. Wrapper caches
+ *     successful (HTTP 200) replies only — failed pushes still retried after token fix.
+ *   • POST /dinoco-mcp/v1/customer-link — body hash {source_id, platform, wp_user_id_or_phone}.
+ *     Chatbot link retry on slow WP response → 2x update_user_meta writes + mcp_linked_at
+ *     timestamp loss (1st audit timestamp overwritten by 2nd). Wrapper returns cached 200
+ *     without rewriting meta. source_id discriminates per-customer; platform separates
+ *     same-source FB vs IG namespaces.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.2.5 behavior.
  * Version: V.2.5 (2026-04-30) — Round 31 batch 9: Idempotency-Key support on 2 status-update MCP endpoints:
  *   • POST /dinoco-mcp/v1/claim-manual-update — body hash {claim_id, status, case_type, tracking_number}.
  *     Pair กับ claim-manual-create (Round 30). OpenClaw retry บน slow WP response → status update ซ้ำ
@@ -535,6 +548,49 @@ function dinoco_mcp_distributor_notify( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'distributor_id required' ), 400 );
     }
 
+    // ── V.2.6 Round 33 batch 11: Idempotency-Key support ──
+    // OpenClaw lead notification retry path — chatbot Gemini → MCP distributor-notify can fire
+    // twice on slow LINE Push API response (typical: timeout 10s → chatbot internal retry).
+    // Without wrapper, dealer receives 2x identical Lead Flex notifications → annoying spam +
+    // postback action `lead_accepted:{lead_id}` could double-mark lead as accepted.
+    // Body hash = {distributor_id, lead_id, type, customer_name, product, province, phone, message}.
+    //   - lead_id is primary discriminator (per-lead notify isolation)
+    //   - type discriminates "new_lead" Flex vs "follow_up" plain text
+    //   - message included for follow-up retries with edited content (different intent → 409)
+    //   - phone/customer_name in hash so chatbot retry with corrected data surfaces 409
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.5 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::distributor-notify';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'distributor_id' => $dist_id,
+            'lead_id'        => $lead_id,
+            'type'           => $msg_type,
+            'customer_name'  => $customer_name,
+            'product'        => $product,
+            'province'       => $province,
+            'phone'          => $phone,
+            'message'        => $custom_msg,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // ดึง LINE group ID ของตัวแทน
     $line_group = get_post_meta( $dist_id, 'line_group_id', true );
     if ( empty( $line_group ) ) {
@@ -619,7 +675,21 @@ function dinoco_mcp_distributor_notify( $request ) {
     ) );
 
     $code = wp_remote_retrieve_response_code( $response );
-    return new WP_REST_Response( array( 'success' => $code === 200, 'http_status' => $code ), 200 );
+    $resp_data = array( 'success' => $code === 200, 'http_status' => $code );
+
+    // V.2.6 Round 33 batch 11: store cached response for replay (only cache successful pushes —
+    // failed LINE Push should not be cached because admin/chatbot may retry after fixing token)
+    if ( $code === 200 && $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
@@ -1742,6 +1812,43 @@ function dinoco_mcp_customer_link( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'source_id and wp_user_id_or_phone required' ), 400 );
     }
 
+    // ── V.2.6 Round 33 batch 11: Idempotency-Key support ──
+    // OpenClaw chatbot link path — when chatbot identifies a returning customer's WP profile via
+    // phone match → MCP customer-link binds FB/IG user ID to the WP user. Retry on slow WP
+    // response → 2x update_user_meta writes + 2x mcp_linked_at timestamp overwrite (loses 1st
+    // link audit timestamp). Wrapper caches 1st 200 response → 2nd call returns cached value
+    // without rewriting meta or timestamp.
+    // Body hash = {source_id, platform, wp_user_id_or_phone}. source_id is the FB/IG user (per-
+    // customer isolation). platform discriminates same source_id across FB vs IG namespaces
+    // (theoretically separate user spaces). wp_user_id_or_phone is the link target.
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.5 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::customer-link';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'source_id'           => $source_id,
+            'platform'            => $platform,
+            'wp_user_id_or_phone' => $wp_user,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // หา WP user จาก user_id หรือ phone
     $user = null;
     if ( is_numeric( $wp_user ) ) {
@@ -1767,12 +1874,25 @@ function dinoco_mcp_customer_link( $request ) {
     update_user_meta( $user->ID, 'mcp_linked_platform', $platform );
     update_user_meta( $user->ID, 'mcp_linked_at', current_time( 'mysql' ) );
 
-    return new WP_REST_Response( array(
+    $resp_data = array(
         'success'    => true,
         'wp_user_id' => $user->ID,
         'platform'   => $platform,
         'source_id'  => $source_id,
-    ), 200 );
+    );
+
+    // V.2.6 Round 33 batch 11: store cached response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
