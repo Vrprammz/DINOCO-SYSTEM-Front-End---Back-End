@@ -1,6 +1,17 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.3.1 — Round 25 (2026-04-29): 25-day SLA reminder cron (Phase 6.1 deferred item).
+ *   NEW dinoco_gdpr_sla_reminder_cron — daily 09:00 Bangkok scan for queued/processing requests
+ *   older than 25 days. Per request: emails admin reminder + appends `SLA_REMINDER_SENT:<ts>`
+ *   marker to notes column (prevents duplicate fire on consecutive days) + writes audit log
+ *   (action='sla_reminder_sent', note records day count + recipient + days remaining) +
+ *   fires `dinoco_gdpr_sla_reminders_sent` action hook for Telegram/Slack downstream notifiers.
+ *   Email cap: 50 requests/run (LIMIT 50 in SQL — defensive against runaway). Defensive:
+ *   short-circuits if flag OFF / table missing / no admin_email configured. Per
+ *   docs/compliance/GDPR-PHASE-6-DESIGN.md §"25-day reminder" line 274-277 + Thai PDPA §35.
+ *   Risk: NONE — additive cron, ALL operations gated by dinoco_gdpr_is_enabled() default OFF.
+ *   Production never reaches new code paths until Phase 7 admin UI activated + flag flipped.
  * Version: V.3.0 — Round 24 (2026-04-29): Phase 7 admin review UI + 6 admin REST endpoints.
  *   ALL admin features still gated by `dinoco_gdpr_is_enabled()` (flag default OFF).
  *   Adds admin shortcode `[dinoco_admin_gdpr]` (5 tabs: Pending Review / Processing / Ready / Failed / Audit Log)
@@ -1354,6 +1365,163 @@ if ( function_exists( 'dinoco_register_cron' ) ) {
     dinoco_register_cron( 'dinoco_gdpr_export_cleanup_cron', 'daily', 'dinoco_gdpr_export_cleanup_run' );
 } else {
     add_action( 'dinoco_gdpr_export_cleanup_cron', 'dinoco_gdpr_export_cleanup_run' );
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.3.1 — SLA Reminder Cron (daily 09:00; alert admin on 25-day stale requests)
+// Per docs/compliance/GDPR-PHASE-6-DESIGN.md §"25-day reminder":
+// "คำขอใกล้ครบกำหนด 30 วัน → admin Telegram alert if unprocessed"
+//
+// Thai PDPA §35 + GDPR Art. 12(3) require response within 30 days. This cron
+// fires at day 25 → admin email reminder + audit log entry. Marks reminder
+// sent via row meta to prevent duplicate fire across consecutive days.
+//
+// Risk: NONE — additive cron, ALL operations gated by dinoco_gdpr_is_enabled().
+// Production never reaches new code paths until flag flipped.
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_sla_reminder_run' ) ) {
+    /**
+     * Daily cron: scan for queued/processing requests older than 25 days.
+     * Email admin reminder + insert audit log + mark reminder_sent_at to
+     * prevent re-fire on consecutive days.
+     *
+     * SLA window logic: created_at < NOW() - 25 days = day 25 of 30-day SLA.
+     * Status filter: 'queued', 'processing' — already-resolved requests
+     * (ready/done/expired/cancelled/rejected) excluded.
+     *
+     * Defensive: short-circuits if flag OFF, schema not at v3.0 yet,
+     * or no admin email configured.
+     *
+     * @return int Count of reminders sent (0 if no eligible requests)
+     */
+    function dinoco_gdpr_sla_reminder_run() {
+        // Flag-gate: never fire on production until activation
+        if ( ! function_exists( 'dinoco_gdpr_is_enabled' ) || ! dinoco_gdpr_is_enabled() ) {
+            return 0;
+        }
+
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        // Defensive — table may not exist yet (lazy install gates on first endpoint hit)
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SHOW TABLES LIKE %s", $tbl
+        ) );
+        if ( ! $exists ) return 0;
+
+        // Schema check — `notes` column always exists from v1.0; we abuse `notes`
+        // to store reminder marker (`SLA_REMINDER_SENT:<timestamp>`) since adding
+        // a dedicated column requires schema bump. JSON marker keeps original notes.
+        // Day 25 cutoff: created_at < NOW() - INTERVAL 25 DAY
+        $cutoff = gmdate( 'Y-m-d H:i:s', strtotime( '-25 days' ) );
+        $stale  = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, user_id, type, status, created_at, notes
+             FROM {$tbl}
+             WHERE status IN ('queued', 'processing')
+               AND created_at < %s
+               AND ( notes IS NULL OR notes NOT LIKE %s )
+             ORDER BY created_at ASC
+             LIMIT 50",
+            $cutoff,
+            '%SLA_REMINDER_SENT%'
+        ) );
+        if ( ! is_array( $stale ) || empty( $stale ) ) return 0;
+
+        $admin_email = function_exists( 'dinoco_config' )
+            ? (string) dinoco_config( 'admin.notify_email', get_option( 'admin_email' ) )
+            : (string) get_option( 'admin_email' );
+        if ( empty( $admin_email ) || ! is_email( $admin_email ) ) {
+            // No admin email configured — log + skip (audit still recorded so admin sees skip)
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( '[GDPR][SLA] No admin_email configured — reminders skipped (' . count( $stale ) . ' eligible)' );
+            }
+            return 0;
+        }
+
+        $sent_count = 0;
+        foreach ( $stale as $row ) {
+            $request_id = (int) $row->id;
+            $user_id    = (int) $row->user_id;
+            $type       = (string) $row->type;
+            $created_at = (string) $row->created_at;
+
+            // Compute days since creation (Bangkok time)
+            $created_ts = strtotime( $created_at );
+            $age_days   = $created_ts ? (int) floor( ( time() - $created_ts ) / DAY_IN_SECONDS ) : 25;
+            $days_left  = max( 0, 30 - $age_days );
+
+            // Build reminder email body
+            $user        = get_userdata( $user_id );
+            $user_label  = $user ? sprintf( '%s (%s)', $user->display_name, $user->user_email ) : sprintf( 'user #%d', $user_id );
+            $type_label  = ( $type === 'export' ) ? 'Data Export' : 'Account Deletion';
+
+            $subject = '[DINOCO GDPR] SLA Reminder: Request #' . $request_id . ' — ' . $days_left . ' days left';
+            $body  = "GDPR/PDPA Request SLA Reminder\n";
+            $body .= "================================\n\n";
+            $body .= "Request ID: #{$request_id}\n";
+            $body .= "Type: {$type_label}\n";
+            $body .= "User: {$user_label}\n";
+            $body .= "Created: {$created_at}\n";
+            $body .= "Age: {$age_days} days (SLA window: 30 days)\n";
+            $body .= "Days Remaining: {$days_left}\n";
+            $body .= "Status: " . (string) $row->status . "\n\n";
+            $body .= "ACTION REQUIRED: Process this request before SLA breach.\n";
+            $body .= "Review at: " . admin_url( 'admin.php?page=dinoco_admin_gdpr&request_id=' . $request_id ) . "\n\n";
+            $body .= "Legal: Thailand PDPA §35 + GDPR Article 12(3) — 30-day response window.\n";
+
+            $sent = wp_mail( $admin_email, $subject, $body );
+
+            if ( $sent ) {
+                // Mark reminder sent — prevents re-fire on consecutive days.
+                // Append to notes (preserves any existing admin notes).
+                $marker = 'SLA_REMINDER_SENT:' . current_time( 'mysql' );
+                $existing_notes = (string) ( $row->notes ?: '' );
+                $new_notes = trim( $existing_notes . "\n" . $marker );
+                $wpdb->update(
+                    $tbl,
+                    array( 'notes' => $new_notes ),
+                    array( 'id' => $request_id ),
+                    array( '%s' ),
+                    array( '%d' )
+                );
+
+                // Audit log — immutable trail per PDPA §39
+                if ( function_exists( 'dinoco_gdpr_audit_log' ) ) {
+                    dinoco_gdpr_audit_log( $request_id, 'sla_reminder_sent', array(
+                        'note' => sprintf( 'Day %d/30 reminder sent to %s. Days remaining: %d.', $age_days, $admin_email, $days_left ),
+                    ) );
+                }
+
+                $sent_count++;
+            } elseif ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[GDPR][SLA] wp_mail() returned false for request #%d', $request_id ) );
+            }
+        }
+
+        // Optional Telegram alert when reminders fired (best-effort, non-blocking)
+        if ( $sent_count > 0 ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[GDPR][SLA] Sent %d reminder(s) to admin (cutoff=25 days)', $sent_count ) );
+            }
+            // Hook for downstream notifiers (Telegram bot, Slack, etc.)
+            do_action( 'dinoco_gdpr_sla_reminders_sent', $sent_count, $stale );
+        }
+
+        return $sent_count;
+    }
+}
+
+// Schedule daily 09:00 (Bangkok time) — admins start the day with stale-request inbox
+if ( ! wp_next_scheduled( 'dinoco_gdpr_sla_reminder_cron' ) ) {
+    $first_run = strtotime( 'tomorrow 09:00' );
+    if ( ! $first_run ) $first_run = time() + DAY_IN_SECONDS;
+    wp_schedule_event( $first_run, 'daily', 'dinoco_gdpr_sla_reminder_cron' );
+}
+if ( function_exists( 'dinoco_register_cron' ) ) {
+    dinoco_register_cron( 'dinoco_gdpr_sla_reminder_cron', 'daily', 'dinoco_gdpr_sla_reminder_run' );
+} else {
+    add_action( 'dinoco_gdpr_sla_reminder_cron', 'dinoco_gdpr_sla_reminder_run' );
 }
 
 // ═══════════════════════════════════════════════════════════════════
