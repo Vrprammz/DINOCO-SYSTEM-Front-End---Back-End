@@ -7,9 +7,9 @@
 [![Regression Guard](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml)
 [![Coverage Lines](https://img.shields.io/badge/jest_coverage_lines-98.68%25-brightgreen)](coverage/jest/index.html)
 [![Coverage Branches](https://img.shields.io/badge/jest_coverage_branches-85.09%25-green)](coverage/jest/index.html)
-[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-466_passing-brightgreen)](tests/helpers/)
+[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-495_passing-brightgreen)](tests/helpers/)
 [![Jest Tests](https://img.shields.io/badge/jest_tests-156_passing-brightgreen)](tests/jest/)
-[![Mermaid Diagrams](https://img.shields.io/badge/mermaid_diagrams-22-blue)](WORKFLOW-REFERENCE.md)
+[![Mermaid Diagrams](https://img.shields.io/badge/mermaid_diagrams-23-blue)](WORKFLOW-REFERENCE.md)
 
 WordPress-based motorcycle warranty management platform serving B2C members and B2B distributors.
 
@@ -22,10 +22,11 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 - **Integrations**: LINE push notifications, Flash Express shipping, Slip2Go (Thai bank slip verification), Telegram alerts.
 - **Documentation**: 22 Mermaid diagrams (`WORKFLOW-REFERENCE.md`) cover B2B order, B2F PO sequence, Walk-in stateDiagram, MCP Bridge, Brand Voice, member warranty, etc.
 
-## What's New (2026-04-29)
+## What's New (2026-04-30)
 
-Recent infrastructure rounds (Rounds 13-25):
+Recent infrastructure rounds (Rounds 13-26):
 
+- **Round 26** — Idempotency batch 4 +5 endpoints (13 → 18, ~24% of POST surface) + GDPR V.4.0 LINE messages export from OpenClaw MongoDB (closes deferred Phase 6.1 item from CLAUDE.md scope). +29 tests (16 contract + 13 LINE export normalization).
 - **Round 25** — Idempotency expansion +5 (8 → 13 endpoints) + GDPR 25-day SLA reminder cron. +15 contract tests.
 - **Round 24** — GDPR Phase 7 admin review UI + 6 admin REST endpoints. +28 admin permission tests.
 - **Round 23** — Idempotency expansion (3 → 8) + GDPR Phase 6 deletion executor. +15 contract tests + 19 decision matrix tests.
@@ -33,7 +34,7 @@ Recent infrastructure rounds (Rounds 13-25):
 - **Round 21** — Patterns library + cron drift + inline handler regression. +1 drift detector (7 → 8).
 - **Round 19** — Idempotency-Key integrated on 3 critical POST endpoints (place-order, manual-flash-create, create-po). +20 contract tests.
 - **Round 18** — Idempotency Helper foundation V.1.0 (NEW snippet, 5 functions, 25 unit tests). +18 IsTopLevelSet test cases.
-- **Cumulative**: 0 → 466 PHPUnit tests + 0 → 156 Jest tests + 0 → 22 Mermaid diagrams + 0 → 8 drift detectors. ZERO regressions.
+- **Cumulative**: 0 → 495 PHPUnit tests + 0 → 156 Jest tests + 0 → 23 Mermaid diagrams + 0 → 8 drift detectors. ZERO regressions.
 
 See [docs/audit/ROUNDS-1-19-RETROSPECTIVE.md](docs/audit/ROUNDS-1-19-RETROSPECTIVE.md) for full retrospective.
 

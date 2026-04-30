@@ -10,6 +10,99 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 26 (Idempotency batch 4 +5 + GDPR V.4.0 LINE export cross-system) (2026-04-30)
+
+Round 26 closes 2 work items: (1) extends Round 19+23+25 Idempotency-Key infrastructure to 5 more endpoints (cumulative 13 → 18, ~24% of POST surface), and (2) implements the deferred Phase 6.1 GDPR LINE messages export per CLAUDE.md scope ("LINE messages (via agent:3000)" — was a stub since V.1.0 2026-04-17). ZERO regressions, all gates green.
+
+#### Phase 1 — Idempotency batch 4 (5 endpoints, +16 contract tests, 56 → 72 cases)
+
+| Endpoint | Snippet | Body Hash Inputs | Use Case |
+| --- | --- | --- | --- |
+| `POST /b2b/v1/bo-confirm-full` | Snippet 16 V.3.3 → V.3.4 | `{order_id, dist_id}` (dist_id cross-tenant scoping) | Admin Flex "ยืนยันเต็ม" double-tap → previously caused FSM transition retry warnings |
+| `POST /b2b/v1/bo-split` | Snippet 16 V.3.3 → V.3.4 | `{order_id, dist_id, splits[normalized sort by sku]}` | CRITICAL: splits[] in hash → admin editing values mid-retry surfaces 409 (different intent). Row reorder canonicalized via usort() |
+| `POST /b2b/v1/bo-undo-split` | Snippet 16 V.3.3 → V.3.4 | `{order_id, dist_id}` (undo_count NOT in hash — DB-derived) | Existing 1-undo-per-order limit primary defense; wrapper extends 24h replay |
+| `POST /b2f/v1/maker-deliver` | B2F Snippet 2 V.11.13 → V.11.14 | `{po_id, maker_id (JWT), delivery_items[normalized], note}` | Maker LIFF "แจ้งส่งของ" double-tap on slow LINE response. JWT-scoped maker_id prevents cross-maker key reuse |
+| `POST /liff-ai/v1/lead/{id}/accept` | LIFF AI Snippet 1 V.1.10 → V.1.11 | `{lead_id, dealer_id (auth), uid (auth)}` | Dealer double-tap on slow MongoDB roundtrip — wrapper returns cached 200 instead of "already accepted" bounce |
+
+All 5 mirror Round 19/23/25 proven pattern: optional `X-Idempotency-Key` header + `dinoco_idempotency_extract_key/check/store` triad + `function_exists()` guards. Backward compat: missing header = byte-identical to previous version.
+
+bo-confirm-full + bo-undo-split intentionally share body shape `{order_id, dist_id}` — namespace discriminates at storage layer (documented in `test_bo_undo_split_distinct_from_bo_confirm_full`).
+
+Tests: `tests/helpers/IdempotencyEndpointContractTest.php` 56 → 72 cases. Each new endpoint: 3 cases (identical body / different discriminator / cross-tenant or critical-edit case) + 1 cumulative collision test renamed (now covers 17 distinct shapes for 18 endpoints).
+
+#### Phase 2 — GDPR V.4.0 LINE messages export from OpenClaw MongoDB
+
+Closes deferred CLAUDE.md scope item: "LINE messages (via agent:3000)" — was a stub since V.1.0.
+
+**Cross-system architecture**: WP GDPR worker → HTTP GET → OpenClaw agent (V.2.3) → MongoDB. Bearer auth (`LIFF_AI_AGENT_KEY`). Rate limit 1 export/line_uid/hour (MongoDB-backed via `gdpr_export_log` collection — immutable INSERT per call). Best-effort design: agent unreachable → warning log + placeholder note in ZIP (does NOT block rest of export).
+
+**WordPress side** (`[System] DINOCO GDPR Data Requests` V.3.1 → V.4.0, +175 LOC):
+
+- NEW `dinoco_gdpr_export_line_messages($line_uid, $request_id)` — calls `agent:3000/api/gdpr/line-messages` with 10s timeout + 1 retry + Docker `agent:` → `localhost:` fallback. Returns `{messages, claims, leads, total_count, generated_at, unavailable}`. Handles: 200 OK → full structure / 429 → `unavailable=true` / 5xx → `unavailable=true` / 4xx → empty (not unavailable) / malformed → empty (defensive).
+- `dinoco_gdpr_build_export()` now wires LINE branch (line 1074-1117): reads `dinoco_line_uid` (V.1.7+) or legacy `line_user_id` meta. Adds `line-messages.json` + `line-claims.json` + `line-leads.json` to ZIP (or `line-messages-UNAVAILABLE.txt` placeholder if agent down). Updates `record_counts` with `line_messages/line_claims/line_leads/line_unavailable`.
+- README.txt section extended documenting LINE export contents.
+
+**OpenClaw side** (`openclawminicrm/proxy/index.js`, +110 LOC):
+
+- NEW `GET /api/gdpr/line-messages?line_uid=Uxxx&request_id=N` — Auth: `requireAuth` (Bearer LIFF_AI_AGENT_KEY). Rate limit 1 req/line_uid/hour via MongoDB find on `gdpr_export_log`. Query 3 collections: `messages` (LINE platform) + `claim_logs` + `leads`. Hard cap 10000/500/500 (defensive). Strip MongoDB internals (`_id`, embeddings, AI cost metadata). Insert audit row in `gdpr_export_log` (line_uid, ts, counts, caller_ip).
+- PII: returns user's own messages verbatim (self-export = no redaction needed); 3rd-party data already filtered at message-level by agent.
+
+#### Phase 3 — Tests + Documentation
+
+- NEW `tests/helpers/GdprLineExportTest.php` (13 cases): pure-logic response normalization tests covering all branches — 200 OK valid + empty arrays / 429 unavailable / 500/503 unavailable / 400/404 empty (not unavailable) / malformed JSON / missing ok / ok=false / type coercion / PII passthrough.
+- WORKFLOW-REFERENCE.md §3.5.1 NEW Mermaid sequenceDiagram (User → WP → MongoDB cross-system flow with all 5 phases visualized incl. 429/5xx fallback path).
+- README.md badges bumped: phpunit_tests 466 → 495, mermaid_diagrams 22 → 23. What's New section extended with Round 26 entry.
+- CLAUDE.md updated: 18-endpoint Idempotency table + GDPR V.4.0 section detailing cross-system + activation requirements.
+
+#### Verification gate
+
+- PHPUnit: 466 → 495 (+29 cases: 16 contract + 13 GDPR LINE export). ALL GREEN.
+- Jest: 21 suites / 156 tests + 2 skipped. ALL GREEN.
+- `php -l`: clean on Snippet 16, B2F Snippet 2, LIFF AI Snippet 1, GDPR snippet.
+- `node --check`: clean on `proxy/index.js`.
+- 1 pre-existing PHPUnit deprecation (test framework, not code).
+
+#### Cumulative coverage after Round 26
+
+- 18/75+ POST endpoints with central Idempotency-Key support (~24% of mutating surface)
+- 495 PHPUnit + 156 Jest + 25 × 4 Playwright = 802 tests total
+- 8 drift detectors active (cron drift detector tracks `dinoco_gdpr_sla_reminder_cron` from Round 25 — V.4.0 doesn't add new crons)
+
+#### Files touched (8 total, 2 commits + this docs sync)
+
+Phase 1 (commit `c21e1fa`):
+
+- `[B2B] Snippet 16: Backorder System` V.3.3 → V.3.4
+- `[B2F] Snippet 2: REST API` V.11.13 → V.11.14
+- `[LIFF AI] Snippet 1: REST API` V.1.10 → V.1.11
+- `tests/helpers/IdempotencyEndpointContractTest.php` +16 cases
+
+Phase 2 (commit `e62292d`):
+
+- `[System] DINOCO GDPR Data Requests` V.3.1 → V.4.0 (+175 LOC helper + dual-write into build_export + README)
+- `openclawminicrm/proxy/index.js` (+110 LOC GDPR endpoint)
+- `tests/helpers/GdprLineExportTest.php` (NEW, 13 cases)
+- `WORKFLOW-REFERENCE.md` §3.5.1 (+50 LOC Mermaid sequenceDiagram)
+
+Phase 3 (this commit):
+
+- `CLAUDE.md` (Idempotency endpoint list + GDPR V.4.0 update)
+- `README.md` (badges + What's New)
+- `CHANGELOG.md` (this entry)
+
+#### Activation (deferred)
+
+GDPR V.4.0 still flag-gated OFF (`dinoco_gdpr_enabled='0'`). When activating:
+
+1. `composer require sentry/sentry` if Observability not yet activated
+2. Verify `LIFF_AI_AGENT_URL` + `LIFF_AI_AGENT_KEY` constants defined (already used by LIFF AI)
+3. Rebuild + restart OpenClaw agent container with V.2.3+ (`docker compose -f docker-compose.prod.yml up -d --build agent`)
+4. Test with curl: `curl -H "Authorization: Bearer $LIFF_AI_AGENT_KEY" "https://ai.dinoco.in.th/api/gdpr/line-messages?line_uid=Utest"` (expect 503 if user not in MongoDB; expect 200 with empty arrays otherwise)
+5. Flip `wp option update dinoco_gdpr_enabled '1'`
+6. Update `docs/compliance/PDPA-BASICS.md` activation status section
+
+---
+
 ### Feature — Round 25 (Idempotency expansion +5 + GDPR 25-day SLA reminder cron + verification gate) (2026-04-29)
 
 Round 25 closes 2 work items: (1) extends Round 19+23's Idempotency-Key infrastructure to 5 more critical POST endpoints (cumulative 8 → 13 endpoints, ~17% of 75+ POST surface), and (2) implements the deferred GDPR Phase 6.1 25-day SLA reminder cron per `docs/compliance/GDPR-PHASE-6-DESIGN.md` line 274-277. Verification gate confirmed all 466 PHPUnit + 156 Jest tests green; 1 pre-existing security allowlist line drift (line 989 → 999) re-pinned.
