@@ -10,6 +10,91 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 27 (Idempotency batch 5 +5 endpoints — first bulk-array batch) (2026-04-30)
+
+Round 27 extends Round 19/23/25/26 Idempotency-Key infrastructure to 5 more critical POST endpoints. **Cumulative: 23/75+ POST endpoints (~31% of mutating REST surface)**. First batch dominated by bulk-array endpoints (3/5) — formalized canonical sort pattern in `docs/patterns/IDEMPOTENCY-KEY.md` §"Bulk endpoint considerations" (5 rules + bo-split reference impl). ZERO regressions, all gates green.
+
+#### Phase 1 — Idempotency batch 5 (5 endpoints, +16 contract tests, 72 → 88 cases)
+
+| Endpoint | Snippet | Body Hash Inputs | Use Case |
+| --- | --- | --- | --- |
+| `POST /b2b/v1/bo-cancel-item` | Snippet 16 V.3.4 → V.3.5 | `{order_id, bo_queue_id, reason}` | Admin Flex postback double-fire on slow LINE → 2nd request sees row already `status='cancelled'` → wpdb update returns 0 affected → confusing 500. Wrapper returns cached 200. reason in hash → admin editing reason between retries surfaces 409. |
+| `POST /b2b/v1/bo-bulk-fulfill` | Snippet 16 V.3.4 → V.3.5 | `{items[normalized: sort by bo_queue_id, qty in hash]}` | Admin "✅ จัดส่ง BO ที่เลือก" network-drop retry → cached partial-success summary. CRITICAL bulk pattern: items[] sorted → admin row reorder ≠ different intent. qty per-row override IN hash. |
+| `POST /b2b/v1/bo-bulk-cancel` | Snippet 16 V.3.4 → V.3.5 | `{bo_queue_ids[normalized sort numeric], reason}` | Same pattern as bo-bulk-fulfill. reason in hash → admin editing reason = 409. |
+| `POST /b2f/v1/po-complete` | B2F Snippet 2 V.11.14 → V.11.15 | `{po_id, note}` | Admin "ปิด PO" double-click on slow Flex push → 2nd request fails at FSM (status='completed' = invalid transition target) → 400 INVALID_STATUS. Wrapper returns cached 200. note in hash → editing closure note = 409. |
+| `POST /dinoco-stock/v1/dip-stock/approve` | Inventory V.45.2 → V.45.3 | `{session_id, skus[normalized: uppercase + dedup + sort]}` | Admin "อนุมัติทั้งหมด" double-click → cached summary. SKU normalize uppercase + dedup + sort → case-insensitive identity (admin retyping subset = same hash). subset change = 409. |
+
+**Pattern (proven Round 19/23/25/26)**: optional `X-Idempotency-Key` header + helper triad + `function_exists()` defensive guards. Backward compat: missing header = byte-identical to previous version. WP_Error 409 on body hash mismatch (different intent, same key). Bulk endpoints canonicalize array order via `usort()` — admin row reorder ≠ different intent. qty/value/reason fields IN hash → admin editing values surfaces 409.
+
+**3 BO endpoints intentionally same {order_id, dist_id} OR {bo_queue_id} root shapes** — namespace string discriminates at storage layer (documented in `test_bo_undo_split_distinct_from_bo_confirm_full` from Round 26 + Round 27 cumulative collision test now expects 22 distinct shapes for 23 endpoints).
+
+#### Phase 2 — Pattern doc formalization (`docs/patterns/IDEMPOTENCY-KEY.md`)
+
+NEW section "Bulk endpoint considerations" with 5 rules:
+
+1. Canonicalize array order before hashing (sort by deterministic key)
+2. Include semantic per-row fields, exclude UI metadata
+3. Normalize string fields (case, whitespace, dedup)
+4. Avoid timestamp/random in cached response (replays would return stale)
+5. Bulk replay returns entire batch result incl. partial failures (intentional)
+
+Reference impl: bo-split (Round 26 canonical example, ~30 LOC top + bottom block).
+
+Updated "Used in" section to reflect 23 endpoints across 7 snippets, Round 19-27 references, status 23/75+ (~31% of POST surface), recommendation for Round 28.
+
+#### Phase 3 — Drift sweep (chore commit `50bee55`)
+
+- README line 104 "PHPUnit Unit | 466" stale since Round 26 → 511 (Round 27 +16)
+- README line 108 "Total | 773" derived stale → 818
+- Round 27 entry added to "What's New" (line 29)
+- Cumulative line 37 "0 → 495" → 511
+- PHPUnit badge URL `phpunit_tests-495_passing` → 511
+
+No other drift observed:
+
+- Snippet 16 V.3.5, B2F Snippet 2 V.11.15, Inventory V.45.3 all sync
+- GDPR V.4.0, LIFF AI V.1.11 stable from Round 26
+- `wp_dinoco_idempotency_keys` schema lives in Idempotency Helper snippet (lazy install) — not Snippet 15 (verified)
+
+#### Round 27 — Verification gate
+
+- PHPUnit: 495 → 511 (+16 cases: 15 new + 1 cumulative collision update). ALL GREEN.
+- Jest: 21 suites / 156 tests + 2 skipped — stable
+- `php -l`: clean on Snippet 16, B2F Snippet 2, Inventory DB, contract test
+- 1 pre-existing PHPUnit deprecation (test framework, not code)
+
+#### Round 27 — Cumulative coverage
+
+- 23/75+ POST endpoints with central Idempotency-Key support (~31% of mutating surface)
+- 511 PHPUnit + 156 Jest + 25 × 4 Playwright = 818 tests total
+- 8 drift detectors active
+
+#### Round 27 — Files touched (6 total, 3 commits)
+
+- Phase 1 commit `9ad8ddc` (Idempotency batch 5): 4 files
+  - `[B2B] Snippet 16: Backorder System` V.3.4 → V.3.5 (3 endpoints)
+  - `[B2F] Snippet 2: REST API` V.11.14 → V.11.15 (po-complete)
+  - `[Admin System] DINOCO Global Inventory Database` V.45.2 → V.45.3 (dip-stock/approve)
+  - `tests/helpers/IdempotencyEndpointContractTest.php` (+16 cases)
+- Phase 2 commit `ab52955` (pattern doc): `docs/patterns/IDEMPOTENCY-KEY.md`
+- Phase 3 commit `50bee55` (drift sweep): `README.md`
+- Phase 4 commit (this docs sync): `CLAUDE.md` (Round 27 endpoint list) + `CHANGELOG.md`
+
+#### Round 27 — Pattern reusable for next batch
+
+- 5 more endpoints proven safe — same `function_exists()` defensive header + store call before final return
+- Bulk pattern fully documented (5 rules + reference impl)
+- 23 → next batch of 5 = 28 endpoints would target ~37% surface coverage
+
+#### Round 27 — Recommendation for Round 28
+
+Continue or pivot:
+
+- **Continue**: bulk endpoints with similar shapes (admin-shipping-queue actions, b2f reject-resolve, b2b admin-submit-tracking)
+- **Pivot**: Sentry canary observation start, Vite LIFF bundle staging deploy, B2F CPT final drop (2026-05-02 Day 14 from Phase 4 migration timeline per `docs/runbooks/WEEK-LONG-SPRINT-2026-04-29.md`)
+
+---
+
 ### Feature — Round 26 (Idempotency batch 4 +5 + GDPR V.4.0 LINE export cross-system) (2026-04-30)
 
 Round 26 closes 2 work items: (1) extends Round 19+23+25 Idempotency-Key infrastructure to 5 more endpoints (cumulative 13 → 18, ~24% of POST surface), and (2) implements the deferred Phase 6.1 GDPR LINE messages export per CLAUDE.md scope ("LINE messages (via agent:3000)" — was a stub since V.1.0 2026-04-17). ZERO regressions, all gates green.
