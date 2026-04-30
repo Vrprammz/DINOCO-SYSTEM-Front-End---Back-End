@@ -10,6 +10,40 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fix — Round 15 (Top 3 ROI items: update_meta_cache guards + flow diagrams + unit tests) (2026-04-29)
+
+After Round 14 closed 3 MED findings, Round 15 picks Top 3 ROI items from the pending list and ships all 3 in batched commits. Risk NONE on every item. Test suite grows 226 → 252 (+11.5%).
+
+#### ITEM A — `update_meta_cache()` `function_exists` guard sweep (commit `e43b614`)
+
+- **Background**: Round 14 MED-2 closed `_prime_post_caches()` guards in Snippet 16 but explicitly deferred `update_meta_cache()` (also marked WP private API per source code marker). Round 15 ITEM A closes the deferred sweep.
+- **Approach**: Grep all `update_meta_cache(` call sites → 22 across 8 snippets. `[B2B] Snippet 7` (V.30.x) already guarded — used as reference pattern. Wrap remaining 11 sites in `if ( function_exists( 'update_meta_cache' ) )` block.
+- **Snippets touched** (7 files, 11 sites guarded, +57/-22 LOC):
+  - `[B2B] Snippet 5` V.33.3 → V.33.4 — admin orders distributor priming (1 site)
+  - `[B2B] Snippet 16` V.3.2 → V.3.3 — bo-pending-review + bo-queue (2 sites)
+  - `[LIFF AI] Snippet 1` V.1.9 → V.1.10 — `/claims` REST endpoint (1 site)
+  - `[B2F] Snippet 11` V.2.5 → V.2.6 — `flex_retry` cron batch (1 site)
+  - `[B2B] Snippet 12` V.31.6 → V.31.7 — BO + tracking + shipping distributor priming (3 sites)
+  - `[B2F] Snippet 2` V.11.9 → V.11.10 — makers list + admin maker products + po-history + dashboard-stats + po-history maker priming (5 sites)
+  - `[B2B] Snippet 3` V.42.8 → V.42.9 — catalog + order-history + admin-bo-tickets + admin-shipping-queue (9 sites)
+- **Verification**: `php -l` against all 7 modified files → all pass. Pure no-op on healthy WP installs (≥ 2.7.0). Trigger only if WP core ever moves/renames `update_meta_cache()`.
+
+#### ITEM B — 2 new Mermaid sequenceDiagrams (commit `5d23e91`)
+
+- File: `WORKFLOW-REFERENCE.md` (+181 LOC)
+- **§1.1.1 Member Warranty Registration Flow** — End-to-end: scan QR → LINE Login OAuth → WP user create/link → `[dinoco_gateway]` form → optional Gemini OCR → serial validate → `warranty_registration` CPT create → 12-month period start. Edge cases: PDPA first-time consent, optional non-blocking OCR, motorcycle image lookup via custom table, daily auto-expire cron.
+- **§2.1.1 B2B Order Confirmation Flow** — End-to-end: customer `confirm_order` postback → BO flag check (V.1.6+ opaque accept vs legacy) → atomic stock subtract (FOR UPDATE per leaf SKU) → debt update (FOR UPDATE) → INV image push → Slip2Go PULL verify → `paid` transition → V.42 G4 async snapshot defer → V.42 G1 dispatcher Flash create. Edge cases: walk-in skip stock + auto-complete, BO opaque reply (no stock info), 72hr timeout cron.
+- TOC updated with sub-section anchors. Pure documentation.
+
+#### ITEM C — +26 unit tests (commit `94ef795`)
+
+- New files: `tests/helpers/SetCostsTest.php` (14 tests, 37 assertions) + `tests/helpers/PackModeDetectTest.php` (12 tests, 12 assertions)
+- Suite size: 226 → 252 tests (+26, +11.5%). All green.
+- **`SetCostsTest.php`** — Locks `b2f_compute_set_costs_v918()` invariants. The V.11.3 design rule "SET has NO manual price; it's an aggregate of leaves" (commit 7e6b726). Coverage: empty inputs / full leaf coverage / partial leaves / zero-cost leaf as missing / no registered leaves preserves unit_cost (NEVER zero out — fallback) / non-SET untouched / 3-level hierarchy walks only leaves / shipping_land summed when SET empty / shipping_land preserved when explicit / DD-3 shared leaf counted per SET independently / lowercase SKU → uppercase normalization / self-loop guard / unit_cost_stored audit snapshot.
+- **`PackModeDetectTest.php`** — Locks `dinoco_smart_detect_pack_mode()` decision matrix. Flash V.42 pack mode picker drives PNO count + shipping fee + courier dispatch — wrong detection = wrong fee. Coverage: catalog miss → 'auto' / leaf default → 'single_box' / `upb>1` → 'bulk_pack' / `bpu>1` → 'multi_box' / SET+`bpu=1` → 'assembled_set' / SET+`bpu>1` → 'multi_box' / decision priority `upb > bpu > assembled_set > single_box > auto` / missing dims default 1 / zero dims → 'auto' / string numeric coercion / lowercase SKU normalization.
+- **Implementation**: Used dedicated sub-namespace `DinocoTests\Helpers\PackMode` to avoid collision with `HierarchyTest`'s `dinoco_is_leaf_sku($sku, array $relations)` (2-arg signature). Pack-mode helper takes 1 arg only.
+- **Risk**: NONE on every item (additive guards / pure docs / additive tests).
+
 ### Fix — Round 14 (Close 3 MED findings from Round 13 code-reviewer audit) (2026-04-29)
 
 After Round 13 audit identified 3 MED findings (0 HIGH/CRIT), Round 14 closes all 3 in a single batched commit. Risk LOW-NONE on every item. Net code: -1 LOC dead, +95 LOC defensive guards/cache.
