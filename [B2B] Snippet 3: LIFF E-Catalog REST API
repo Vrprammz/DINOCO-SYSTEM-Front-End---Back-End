@@ -1,6 +1,13 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.14 — Round 29 (2026-04-30): Idempotency-Key support extended to 2 endpoints:  ║
+ * ║    combined-slip-upload (LIFF customer "ชำระรวม" — bulk: ticket_ids[sorted+dedup] + gid;     ║
+ * ║    image_base64 EXCLUDED from hash — 5MB binary causes hash flap, payment intent = same N    ║
+ * ║    tickets) + manual-flash-ready (RPi warehouse — single/bulk: pno + all_pnos[sorted+dedup]; ║
+ * ║    courier_called status churn + log noise on dual-fire). 3 store sites in manual-flash-     ║
+ * ║    ready (active_pickup / courier_called success / already_booked). Wrapper-only, additive.  ║
+ * ║    Risk: LOW — Round 19/23/25/27/28 pattern proven. Backward compat: missing header = no-op. ║
  * ║  Version: V.42.13 — Round 28 (2026-04-30): Extend Idempotency-Key support to 3 admin POST    ║
  * ║    endpoints: admin-stock-unlock + admin-stock-mark-oos + admin-submit-tracking. Bulk        ║
  * ║    pattern (admin-submit-tracking) normalizes entries[] (sort by ticket_id, sanitize per-    ║
@@ -3373,6 +3380,48 @@ function b2b_rest_combined_slip_upload( WP_REST_Request $request ) {
     if ( empty($ticket_ids) || !is_array($ticket_ids) || empty($image_b64) )
         return new WP_REST_Response(array('success'=>false,'message'=>'Missing ticket_ids or image'), 400);
 
+    // ── V.42.14 Round 29: Idempotency-Key support (bulk endpoint, MISSION-CRITICAL) ──
+    // Combined slip upload marks N tickets paid + reduces debt + sends N customer Flex confirmations
+    // + admin Flex notification. Customer LIFF "ชำระรวม" double-fire (slow network/retry) without
+    // wrapper → debt double-subtracted (CRITICAL — accounting drift) + duplicate paid Flex spam +
+    // double admin notification. Wrapper replays cached success on retry.
+    // Body hash = {ticket_ids[sorted+dedup], gid} — image binary EXCLUDED (5MB base64 → hash flap on
+    // re-encoding). Same intent = same N tickets being paid; image is "evidence" not semantic identity.
+    // gid from session prevents cross-group key reuse cache poisoning.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::combined-slip-upload';
+    $idem_body = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        // Normalize ticket_ids — dedup + sort numeric ASC
+        $norm_tids = array();
+        foreach ($ticket_ids as $tid) {
+            $tid = intval($tid);
+            if ($tid > 0) $norm_tids[] = $tid;
+        }
+        $norm_tids = array_values(array_unique($norm_tids));
+        sort($norm_tids, SORT_NUMERIC);
+        $idem_body = array(
+            'ticket_ids' => $norm_tids,
+            'gid'        => (string) $gid,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if (is_array($cached)) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     // Validate all tickets belong to this group + status = awaiting_payment
     $combined_total = 0;
     $valid_tickets = array();
@@ -3553,14 +3602,21 @@ function b2b_rest_combined_slip_upload( WP_REST_Request $request ) {
         if ( function_exists('b2b_push_raw_to_admin') ) b2b_push_raw_to_admin(array($flex));
     }
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'success'        => true,
         'message'        => 'ชำระรวม ' . count($paid_ticket_ids) . ' บิลสำเร็จ',
         'paid_tickets'   => $paid_ticket_ids,
         'combined_total' => $combined_total,
         'slip_url'       => $slip_url,
         'slip_result'    => $slip_result,
-    ), 200);
+    );
+
+    // V.42.14 Round 29: store cached response for replay (24h TTL)
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
     } catch ( Exception $e ) {
         b2b_log('[CombinedSlipUpload] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาดภายใน กรุณาลองใหม่'), 500);
@@ -5417,6 +5473,50 @@ function b2b_rest_manual_flash_ready( WP_REST_Request $r ) {
     try {
         $pno = sanitize_text_field( $r->get_param( 'pno' ) );
 
+        // ── V.42.14 Round 29: Idempotency-Key support ──
+        // RPi warehouse "เรียกรถ Flash" double-tap on slow Wi-Fi → 2nd request hits same active_pickup
+        // transient (so courier won't double-call) BUT still re-fires manual_shipment_update_status
+        // for each pno → status churn + log noise. With the Flash already-booked branch, dual calls
+        // produce same response shape — wrapper makes it explicit + caches reply.
+        // Body hash = {pno, all_pnos[sorted+dedup]} — RPi fires either single pno OR multi-box all_pnos.
+        // Same set of PNOs = same intent (one warehouse pickup batch). Different = different pickup.
+        $all_pnos = $r->get_param( 'all_pnos' );
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $r ) : '';
+        $idem_namespace = 'b2b/v1::manual-flash-ready';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Normalize all_pnos — dedup + sort string ASC for stable hash
+            $norm_pnos = array();
+            if ( is_array( $all_pnos ) ) {
+                foreach ( $all_pnos as $p ) {
+                    $cp = sanitize_text_field( $p );
+                    if ( $cp !== '' ) $norm_pnos[] = $cp;
+                }
+                $norm_pnos = array_values( array_unique( $norm_pnos ) );
+                sort( $norm_pnos, SORT_STRING );
+            }
+            $idem_body = array(
+                'pno'      => (string) $pno,
+                'all_pnos' => $norm_pnos,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // Check active pickup — ถ้ามีอยู่แล้วใช้เดิม
         $active_pickup = get_transient( 'b2b_flash_active_pickup' );
         if ( is_array( $active_pickup ) && ! empty( $active_pickup['pickup_id'] ) ) {
@@ -5425,18 +5525,23 @@ function b2b_rest_manual_flash_ready( WP_REST_Request $r ) {
                 $info = $active_pickup['staff_name'] . ' ' . ( $active_pickup['staff_phone'] ?? '' );
             }
             // อัพเดทสถานะ manual shipment — V.41.0: support all_pnos for multi-box
-            $all_pnos = $r->get_param( 'all_pnos' );
+            // V.42.14 Round 29: $all_pnos already fetched above for idempotency hash
             if ( is_array( $all_pnos ) ) {
                 foreach ( $all_pnos as $p ) b2b_manual_shipment_update_status( sanitize_text_field( $p ), 'courier_called' );
             } elseif ( $pno ) {
                 b2b_manual_shipment_update_status( $pno, 'courier_called' );
             }
-            return new WP_REST_Response( array(
+            $resp_active = array(
                 'success'      => true,
                 'message'      => 'มี pickup อยู่แล้ว — คูเรียร์กำลังมา',
                 'courier_info' => $info,
                 'pickup_id'    => $active_pickup['pickup_id'],
-            ), 200 );
+            );
+            // V.42.14 Round 29: store cached response (replay-safe — same active pickup)
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_active, array( '_idem_code' => 200 ) ), 200 );
+            }
+            return new WP_REST_Response( $resp_active, 200 );
         }
 
         // เรียก courier ใหม่
@@ -5468,19 +5573,24 @@ function b2b_rest_manual_flash_ready( WP_REST_Request $r ) {
             b2b_log( '[ManualFlash] Courier called: ' . $info );
 
             // อัพเดทสถานะ manual shipment — V.41.0: support all_pnos
-            $all_pnos = $r->get_param( 'all_pnos' );
+            // V.42.14 Round 29: $all_pnos already fetched above for idempotency hash
             if ( is_array( $all_pnos ) ) {
                 foreach ( $all_pnos as $p ) b2b_manual_shipment_update_status( sanitize_text_field( $p ), 'courier_called' );
             } elseif ( $pno ) {
                 b2b_manual_shipment_update_status( $pno, 'courier_called' );
             }
 
-            return new WP_REST_Response( array(
+            $resp_called = array(
                 'success'      => true,
                 'message'      => 'เรียกรถสำเร็จ',
                 'courier_info' => trim( $info ),
                 'pickup_id'    => $pickup_id,
-            ), 200 );
+            );
+            // V.42.14 Round 29: store cached response
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_called, array( '_idem_code' => 200 ) ), 200 );
+            }
+            return new WP_REST_Response( $resp_called, 200 );
         }
 
         // Flash rejected — might already have a pickup (e.g. "คุณได้ทำรายนัดรับพัสดุแล้ว")
@@ -5488,14 +5598,19 @@ function b2b_rest_manual_flash_ready( WP_REST_Request $r ) {
         $already_booked = ( mb_strpos( $err, 'นัดรับ' ) !== false || mb_strpos( $err, 'ซ้ำ' ) !== false );
         if ( $already_booked ) {
             // Flash says pickup already exists — treat as success + update status
-            $all_pnos = $r->get_param( 'all_pnos' );
+            // V.42.14 Round 29: $all_pnos already fetched above for idempotency hash
             if ( is_array( $all_pnos ) ) {
                 foreach ( $all_pnos as $p ) b2b_manual_shipment_update_status( sanitize_text_field( $p ), 'courier_called' );
             } elseif ( $pno ) {
                 b2b_manual_shipment_update_status( $pno, 'courier_called' );
             }
             b2b_log( '[ManualFlash] Already booked, treating as success: ' . $err );
-            return new WP_REST_Response( array( 'success' => true, 'message' => 'เรียกรถแล้ว (มีนัดรับอยู่)' ), 200 );
+            $resp_booked = array( 'success' => true, 'message' => 'เรียกรถแล้ว (มีนัดรับอยู่)' );
+            // V.42.14 Round 29: store cached response
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_booked, array( '_idem_code' => 200 ) ), 200 );
+            }
+            return new WP_REST_Response( $resp_booked, 200 );
         }
         b2b_log( '[ManualFlash] Courier call failed: ' . $err );
         return new WP_REST_Response( array( 'success' => false, 'message' => $err ), 400 );

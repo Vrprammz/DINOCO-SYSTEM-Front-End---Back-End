@@ -1,6 +1,13 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 9: Admin Control Panel                      ║
+ * ║  Version: V.34.1 (2026-04-30) — Round 29: Idempotency-Key support on import-distributors    ║
+ * ║    (bulk CSV up to 500 rows). Body hash = {rows[normalized: sort by gid + sanitize per-     ║
+ * ║    row], dry_run}. dry_run=true vs false → distinct cache slots so admin previewing then    ║
+ * ║    committing same data uses different keys. Replay returns same imported/skipped/errors    ║
+ * ║    counts → admin retry on network drop sees "already done" not partial-state drift.        ║
+ * ║    Wrapper-only, additive (Round 28 bulk pattern proven). Backward compat: missing header   ║
+ * ║    = identical to V.34.0. Risk: LOW.                                                         ║
  * ║  Version: V.34.0 (2026-04-29) — Flash V.42 G1: flash-test/run-step uses dispatcher:     ║
  * ║    • flash_create case in /system-check sysadmin runner now routes through              ║
  * ║      b2b_flash_dispatch_create_all() (V.42) instead of b2b_flash_create_all_boxes()      ║
@@ -968,6 +975,63 @@ function b2b_rest_import_distributors( WP_REST_Request $req ) {
     if (!is_array($rows)||empty($rows)) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มีข้อมูล'),400);
     if (count($rows) > 500) return new WP_REST_Response(array('success'=>false,'message'=>'ข้อมูลเกินขีดจำกัด (สูงสุด 500 แถว)'),400);
 
+    // ── V.34.1 Round 29: Idempotency-Key support (bulk endpoint) ──
+    // Admin uploads CSV (up to 500 distributors) — network drops mid-import + retry without
+    // wrapper → wp_insert_post for distributors created in 1st run = exists, gets UPDATE
+    // (idempotent on shop fields). BUT new rows created in 1st run + missing in 2nd retry =
+    // partial-state drift (admin might have edited CSV between retries). Wrapper guarantees
+    // 2nd retry returns SAME imported/skipped count + errors — admin sees "already done" not
+    // "doing it again, hope for same result".
+    // Body hash = {rows[normalized: sort by gid, sanitize per-row], dry_run}. Sort by gid so
+    // CSV row reorder = same intent. Per-row: shop_name, line_group_id, rank_system, credit_limit,
+    // credit_term_days, address fields. dry_run=true vs false MUST differ → distinct cache slots.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $req ) : '';
+    $idem_namespace = 'b2b/v1::import-distributors';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        // Normalize rows — sanitize each field + sort by line_group_id for stable hash
+        $norm_rows = array();
+        foreach ( $rows as $row ) {
+            if ( ! is_array( $row ) ) continue;
+            $gid = sanitize_text_field( $row['line_group_id'] ?? '' );
+            if ( $gid === '' ) continue; // skip empty gid (will fail validation anyway)
+            $norm_rows[] = array(
+                'shop_name'        => sanitize_text_field( $row['shop_name'] ?? '' ),
+                'line_group_id'    => $gid,
+                'rank_system'      => sanitize_text_field( $row['rank_system'] ?? '' ),
+                'credit_limit'     => isset( $row['credit_limit'] ) ? (string) $row['credit_limit'] : '',
+                'credit_term_days' => isset( $row['credit_term_days'] ) ? (string) $row['credit_term_days'] : '',
+                'dist_phone'       => sanitize_text_field( $row['dist_phone'] ?? '' ),
+                'dist_province'    => sanitize_text_field( $row['dist_province'] ?? '' ),
+                'dist_address'     => sanitize_text_field( $row['dist_address'] ?? '' ),
+                'dist_district'    => sanitize_text_field( $row['dist_district'] ?? '' ),
+                'dist_city'        => sanitize_text_field( $row['dist_city'] ?? '' ),
+                'dist_postcode'    => sanitize_text_field( $row['dist_postcode'] ?? '' ),
+            );
+        }
+        usort( $norm_rows, function ( $a, $b ) { return strcmp( $a['line_group_id'], $b['line_group_id'] ); } );
+        $idem_body = array(
+            'rows'    => $norm_rows,
+            'dry_run' => $dry_run ? 1 : 0,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     $imported = 0;
     $skipped  = 0;
     $errors   = array();
@@ -1018,13 +1082,18 @@ function b2b_rest_import_distributors( WP_REST_Request $req ) {
         }
         $imported++;
     }
-    return new WP_REST_Response(array(
+    $import_resp = array(
         'success'  => true,
         'dry_run'  => $dry_run,
         'imported' => $imported,
         'skipped'  => $skipped,
         'errors'   => $errors,
-    ),200);
+    );
+    // V.34.1 Round 29: store cached response (24h replay)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $import_resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+    return new WP_REST_Response( $import_resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);

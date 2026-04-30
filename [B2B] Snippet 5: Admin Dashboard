@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 5: Admin Dashboard                          ║
+ * ║  Version: V.33.7 (2026-04-30) — Round 29: Idempotency-Key on delete-ticket + recalculate-   ║
+ * ║    total. delete-ticket: prevents already-trashed retry confusion + double Flash cancel +    ║
+ * ║    debt reverse (some sites guarded, some not). recalculate-total: prevents audit log churn  ║
+ * ║    on admin double-click (50-row cap drops history faster). Body hash = {ticket_id} for      ║
+ * ║    both. Wrapper-only, additive (Round 19/23/25/27/28 pattern proven). Backward compat:      ║
+ * ║    missing X-Idempotency-Key header = identical to V.33.6. Risk: LOW.                         ║
  * ║  Version: V.33.6 (2026-04-29) — Round 25: Idempotency-Key support on update-status.         ║
  * ║    Reads X-Idempotency-Key header (optional). Same key + same body hash → cached response   ║
  * ║    (24h TTL). Body = {ticket_id, status}. `old_st` excluded (DB-derived, NOT a write field, ║
@@ -961,6 +967,38 @@ function b2b_rest_delete_ticket( WP_REST_Request $r ) {
     $post = get_post($tid);
     if(!$post || $post->post_type !== 'b2b_order')
         return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบ Ticket #'.$tid.' (อาจลบแล้ว)'),400);
+
+    // ── V.33.7 Round 29: Idempotency-Key support ──
+    // Admin "ลบ Ticket" double-click on slow Flex push → 2nd request hits already-trashed post →
+    // 400 "ไม่พบ Ticket #X (อาจลบแล้ว)" confusing UX. Worse: race window where 1st call succeeds
+    // but client times out + retries → 2nd call sees "trashed" post_type=='b2b_order' (still valid
+    // until permanent delete) → re-fires debt reverse + Flash cancel + cancel Flex (dedup guard
+    // _cancel_flex_sent stops Flex but stock_returned + debt reverse paths are NOT all guarded).
+    // Wrapper replays cached success on retry — admin sees same "ย้ายไปถังขยะ" reply.
+    // Body hash = {ticket_id} only — single semantic identity (the ticket being deleted).
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::delete-ticket';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array( 'ticket_id' => (int) $tid );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // FIX C5: set is_billed=false before trash + use recalculate_debt
     $billed=get_field('is_billed',$tid);$total=floatval(get_field('total_amount',$tid));$gid=get_field('source_group_id',$tid);$rev=false;
     $dist_id_del = 0;
@@ -1051,7 +1089,12 @@ function b2b_rest_delete_ticket( WP_REST_Request $r ) {
         }
     }
     if(function_exists('b2b_log'))b2b_log('[Trash] #'.$tid.($rev?' reversed ฿'.number_format($total,0):''));
-    return new WP_REST_Response(array('success'=>true,'message'=>'🗑️ ย้ายไปถังขยะ #'.$tid.' สำเร็จ'.($rev?' (คืนหนี้ ฿'.number_format($total,0).')':'')));
+    $delete_resp = array('success'=>true,'message'=>'🗑️ ย้ายไปถังขยะ #'.$tid.' สำเร็จ'.($rev?' (คืนหนี้ ฿'.number_format($total,0).')':''));
+    // V.33.7 Round 29: store cached response (24h replay)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $delete_resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+    return new WP_REST_Response( $delete_resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
@@ -1065,6 +1108,37 @@ function b2b_rest_recalculate_total( WP_REST_Request $r ) {
     try {
     $tid = intval($r->get_param('ticket_id'));
     if(!$tid || get_post_type($tid)!=='b2b_order') return new WP_REST_Response(array('success'=>false,'message'=>'Ticket ไม่ถูกต้อง'),400);
+
+    // ── V.33.7 Round 29: Idempotency-Key support ──
+    // Admin "คำนวณใหม่" double-click → 2nd request re-parses items + audit log gets duplicate
+    // 'recalculate' entries (50-row cap means useful audit history pushed out faster). Wrapper
+    // replays original computed total. Subsequent legitimate recalc (admin edits items + retries)
+    // = different content but same key → 409 → admin sees conflict + must use new key.
+    // Body hash = {ticket_id} only. Note: items_text is read AFTER hash check so a cosmetically
+    // identical retry replays cached old_total/new_total even if items_text changed in-between
+    // (admin should send fresh key for re-runs after editing — standard idempotency contract).
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::recalculate-total';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array( 'ticket_id' => (int) $tid );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
 
     $items_text = get_field('order_items', $tid) ?: '';
     $old_total  = floatval(get_field('total_amount', $tid));
@@ -1084,12 +1158,17 @@ function b2b_rest_recalculate_total( WP_REST_Request $r ) {
     update_field('total_amount', $new_total, $tid);
     b2b_add_audit_log($tid, 'recalculate', '฿'.number_format($old_total,0).' → ฿'.number_format($new_total,0));
 
-    return new WP_REST_Response(array(
+    $recalc_resp = array(
         'success'   => true,
         'old_total' => $old_total,
         'new_total' => $new_total,
         'message'   => '🔄 คำนวณใหม่: ฿'.number_format($new_total,0),
-    ));
+    );
+    // V.33.7 Round 29: store cached response (24h replay)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $recalc_resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+    return new WP_REST_Response( $recalc_resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
