@@ -1,0 +1,803 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Idempotency Helper                        ║
+ * ║  Version: V.1.0 (2026-04-29) — Round 18 API-H4 Foundation        ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
+ * ║  Description: Idempotency-Key middleware for safe POST retry     ║
+ * ║    handling across DINOCO REST endpoints.                        ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * PROBLEM
+ * -------
+ * Audit finding API-H4 (Phase 5+ Deferred): 75+ POST endpoints across
+ * /b2b/v1/, /b2f/v1/, /dinoco-stock/v1/, /dinoco-mcp/v1/, /liff-ai/v1/
+ * accept any retry as a NEW request. Mobile/RPi/OpenClaw retries on
+ * timeout (which often succeed server-side but client doesn't know) →
+ * duplicate orders, double debt, double Flash dispatches.
+ *
+ * Existing patterns (per-endpoint custom keys):
+ *   - bo-bulk-update-display: idempotency_key in body (B2F audit V.3.3)
+ *   - DLQ retry: GET_LOCK prevents duplicate (V.34.5)
+ *   - bo-fulfill: FOR UPDATE + idempotency check (V.1.6)
+ *   - Snapshot create: GET_LOCK + idempotency (V.34.6)
+ *
+ * No central infrastructure → each endpoint reinvents the pattern,
+ * inconsistent client integration story (some need body field, some
+ * need header, some none at all).
+ *
+ * SOLUTION
+ * --------
+ * Single canonical table `wp_dinoco_idempotency_keys` (24h TTL) +
+ * helper functions any REST handler can call:
+ *
+ *   - dinoco_idempotency_check( $key, $namespace, $request_body )
+ *     → returns cached response if key+hash match, NULL if new request,
+ *       WP_Error 409 if key matches but body hash differs
+ *
+ *   - dinoco_idempotency_store( $key, $namespace, $body, $resp, $code )
+ *     → persists for future replay (24h)
+ *
+ *   - dinoco_idempotency_middleware( $namespace ) → wrapper that does
+ *     check + handler + store in one call.
+ *
+ * Storage namespace: 'b2b/v1::place-order' so two endpoints with same
+ * client-generated UUID don't collide.
+ *
+ * DESIGN PRINCIPLES
+ *   - ADDITIVE       — zero behavior change at existing endpoints
+ *                      (foundation only, integration in future rounds)
+ *   - NON-THROWING   — best-effort; failures fall through to handler
+ *   - DEFENSIVE      — silent fail-soft if table missing (lazy install)
+ *   - BOUNDED        — 24h TTL via cron + hard 64-char key cap
+ *
+ * Public API:
+ *   dinoco_idempotency_check( $key, $namespace, $body ) : array|null|WP_Error
+ *   dinoco_idempotency_store( $key, $namespace, $body, $resp_data, $resp_code ) : int|false
+ *   dinoco_idempotency_hash( $body ) : string  (SHA256)
+ *   dinoco_idempotency_extract_key( WP_REST_Request $req ) : string  (header)
+ *   dinoco_idempotency_cleanup_run() : int  (cron)
+ *
+ * Future endpoint integration pattern:
+ *   register_rest_route( 'b2b/v1', '/place-order', array(
+ *     'methods'  => 'POST',
+ *     'callback' => function( WP_REST_Request $req ) {
+ *       $key = dinoco_idempotency_extract_key( $req );
+ *       if ( $key !== '' ) {
+ *         $cached = dinoco_idempotency_check( $key, 'b2b/v1::place-order', $req->get_body() );
+ *         if ( is_wp_error( $cached ) ) return $cached;          // 409 conflict
+ *         if ( is_array( $cached ) )   return rest_ensure_response( $cached );  // replay
+ *       }
+ *       $result = b2b_place_order_handler( $req );  // existing logic untouched
+ *       if ( $key !== '' && ! is_wp_error( $result ) ) {
+ *         dinoco_idempotency_store( $key, 'b2b/v1::place-order', $req->get_body(), $result->get_data(), $result->get_status() );
+ *       }
+ *       return $result;
+ *     },
+ *   ) );
+ *
+ * NOT integrated into endpoints in this round — foundation only.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. SCHEMA INSTALL (lazy, idempotent)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_idempotency_schema_install' ) ) {
+    /**
+     * Install wp_dinoco_idempotency_keys table via dbDelta. Idempotent —
+     * tracks version in wp_option 'dinoco_idempotency_schema_version'.
+     *
+     * Schema rationale:
+     *   - idempotency_key VARCHAR(64) — covers UUIDv4 (36 chars), ULID
+     *     (26 chars), client custom keys; 64 = headroom + cap enforced
+     *     in extract helper to prevent abuse (very long keys waste index).
+     *   - namespace VARCHAR(64) — '<namespace>::<route>' format, e.g.
+     *     'b2b/v1::place-order' (19 chars typical, 64 = headroom).
+     *   - request_hash CHAR(64) — SHA256 hex (always 64 chars).
+     *   - response_data LONGTEXT — JSON-encoded, no realistic upper bound
+     *     for cached endpoint responses (Flex cards can be ~10KB).
+     *   - response_code SMALLINT UNSIGNED — HTTP status (200, 400, etc.)
+     *   - 2 indexes:
+     *       idx_key_namespace — primary lookup path (composite, ordered
+     *         to match WHERE idempotency_key=? AND namespace=?)
+     *       idx_expires_at — retention DELETE WHERE expires_at < NOW()
+     *
+     * @return void
+     */
+    function dinoco_idempotency_schema_install() {
+        global $wpdb;
+
+        $current = get_option( 'dinoco_idempotency_schema_version', '0' );
+        $target  = '1.0';
+        if ( $current === $target ) return;
+
+        $table   = $wpdb->prefix . 'dinoco_idempotency_keys';
+        $charset = $wpdb->get_charset_collate();
+
+        // dbDelta-compatible CREATE: PRIMARY KEY inside, no FOREIGN KEY,
+        // KEY (not INDEX), 2 spaces after PRIMARY KEY (dbDelta quirk).
+        $sql = "CREATE TABLE {$table} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            idempotency_key VARCHAR(64) NOT NULL,
+            namespace VARCHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            response_data LONGTEXT DEFAULT NULL,
+            response_code SMALLINT(5) UNSIGNED DEFAULT NULL,
+            user_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            request_ip VARCHAR(45) DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            expires_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_key_namespace (idempotency_key, namespace),
+            KEY idx_expires_at (expires_at)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta( $sql );
+
+        update_option( 'dinoco_idempotency_schema_version', $target, false );
+    }
+}
+
+// Lazy install on admin_init (fast — dbDelta is idempotent + version-gated)
+add_action( 'admin_init', function() {
+    if ( get_option( 'dinoco_idempotency_schema_version', '0' ) !== '1.0' ) {
+        dinoco_idempotency_schema_install();
+    }
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. UTILITIES — hash, key extract, IP resolve
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_idempotency_hash' ) ) {
+    /**
+     * Compute SHA256 hex hash of a request body. Used to detect when
+     * a client retries the SAME idempotency key with a DIFFERENT body
+     * (which is a 409 conflict — client bug or intentional abuse).
+     *
+     * Body normalization rules:
+     *   - null/array/object  → wp_json_encode (canonical form)
+     *   - string             → as-is (already serialized by client)
+     *   - scalar (int/bool)  → cast to string
+     *
+     * NOTE: We do NOT alphabetize JSON keys — same client should produce
+     * the same byte sequence on retry. If the JS object key order differs
+     * between attempts, that's a CLIENT bug worth surfacing as 409.
+     *
+     * @param mixed $body Request body
+     * @return string SHA256 hex (64 chars)
+     */
+    function dinoco_idempotency_hash( $body ) {
+        if ( is_array( $body ) || is_object( $body ) ) {
+            $serialized = function_exists( 'wp_json_encode' )
+                ? wp_json_encode( $body )
+                : json_encode( $body );
+            if ( $serialized === false ) $serialized = '[encode_failed]';
+        } elseif ( is_scalar( $body ) ) {
+            $serialized = (string) $body;
+        } else {
+            $serialized = ''; // null
+        }
+        return hash( 'sha256', $serialized );
+    }
+}
+
+if ( ! function_exists( 'dinoco_idempotency_extract_key' ) ) {
+    /**
+     * Extract Idempotency-Key from a WP_REST_Request. Reads:
+     *   1. X-Idempotency-Key header (preferred)
+     *   2. Idempotency-Key header (canonical RFC draft naming)
+     *
+     * Returns '' (empty) if missing or invalid (not [A-Za-z0-9_-]+).
+     * Caller treats '' as "no idempotency requested" → handler runs as
+     * usual (no caching).
+     *
+     * Validation rules:
+     *   - 1-64 chars (longer = abuse, reject silently as missing)
+     *   - alphanum + dash + underscore + dot only (UUID/ULID compatible)
+     *
+     * @param WP_REST_Request $req
+     * @return string Extracted key or '' if invalid/missing
+     */
+    function dinoco_idempotency_extract_key( $req ) {
+        if ( ! is_object( $req ) || ! method_exists( $req, 'get_header' ) ) {
+            return '';
+        }
+        $key = (string) $req->get_header( 'x_idempotency_key' );
+        if ( $key === '' ) {
+            $key = (string) $req->get_header( 'idempotency_key' );
+        }
+        $key = trim( $key );
+        if ( $key === '' ) return '';
+
+        // Strict validation: only safe chars + length cap
+        if ( strlen( $key ) > 64 ) return '';
+        if ( ! preg_match( '/^[A-Za-z0-9._-]+$/', $key ) ) return '';
+
+        return $key;
+    }
+}
+
+if ( ! function_exists( 'dinoco_idempotency_resolve_ip' ) ) {
+    /**
+     * Resolve client IP. Prefers GDPR snippet's Cloudflare/proxy-aware
+     * helper (V.1.1), falls back to raw REMOTE_ADDR.
+     *
+     * @return string IPv4/IPv6 (max 45 chars) or '' if unavailable
+     */
+    function dinoco_idempotency_resolve_ip() {
+        if ( function_exists( 'dinoco_gdpr_get_client_ip' ) ) {
+            return (string) dinoco_gdpr_get_client_ip();
+        }
+        return isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '';
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. CHECK API — dinoco_idempotency_check()
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_idempotency_check' ) ) {
+    /**
+     * Check if (key, namespace) has a cached response. Returns:
+     *
+     *   array      → cached response data (replay this to client; no handler call)
+     *   WP_Error   → 409 conflict (key reused with DIFFERENT body — client bug)
+     *   null       → no cache (proceed with handler, then store)
+     *
+     * Defensive behavior: if table missing, returns null (fall-through to
+     * handler). Caller MUST treat null as "no cache" not "error".
+     *
+     * @param string $key       Client-supplied idempotency key
+     * @param string $namespace Endpoint discriminator (e.g. 'b2b/v1::place-order')
+     * @param mixed  $body      Request body (for hash comparison)
+     * @return array|WP_Error|null
+     */
+    function dinoco_idempotency_check( $key, $namespace, $body ) {
+        if ( ! is_string( $key ) || $key === '' || ! is_string( $namespace ) || $namespace === '' ) {
+            return null;
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_idempotency_keys';
+
+        // Defensive — table may not exist yet (snippet activated before sync)
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SHOW TABLES LIKE %s", $wpdb->esc_like( $table )
+        ) );
+        if ( $exists !== $table ) {
+            // Try lazy install once per request
+            static $tried_install = false;
+            if ( ! $tried_install ) {
+                $tried_install = true;
+                if ( function_exists( 'dinoco_idempotency_schema_install' ) ) {
+                    dinoco_idempotency_schema_install();
+                    $exists = $wpdb->get_var( $wpdb->prepare(
+                        "SHOW TABLES LIKE %s", $wpdb->esc_like( $table )
+                    ) );
+                }
+            }
+            if ( $exists !== $table ) {
+                if ( ! get_transient( 'dinoco_idempotency_table_missing_logged' ) ) {
+                    error_log( '[DINOCO_IDEMPOTENCY] table missing — replay disabled' );
+                    set_transient( 'dinoco_idempotency_table_missing_logged', 1, HOUR_IN_SECONDS );
+                }
+                return null;
+            }
+        }
+
+        $request_hash = dinoco_idempotency_hash( $body );
+
+        try {
+            // Cap key/namespace lengths defensively (extract helper already caps,
+            // but caller may bypass)
+            $key_safe       = substr( (string) $key, 0, 64 );
+            $namespace_safe = substr( (string) $namespace, 0, 64 );
+
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, request_hash, response_data, response_code, expires_at
+                 FROM {$table}
+                 WHERE idempotency_key = %s AND namespace = %s
+                 ORDER BY id DESC LIMIT 1",
+                $key_safe,
+                $namespace_safe
+            ) );
+
+            if ( ! $row ) return null;
+
+            // TTL check — if expired, treat as new request (cron may not
+            // have cleaned up yet; check defensively at read time too)
+            $now_ts = (int) ( function_exists( 'current_time' ) ? current_time( 'timestamp' ) : time() );
+            $exp_ts = strtotime( (string) $row->expires_at );
+            if ( $exp_ts && $exp_ts < $now_ts ) {
+                return null;
+            }
+
+            // Hash mismatch — same key, different body → 409 conflict
+            if ( (string) $row->request_hash !== $request_hash ) {
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key reused with different request body',
+                    array(
+                        'status'           => 409,
+                        'idempotency_key'  => $key_safe,
+                        'namespace'        => $namespace_safe,
+                        'original_request' => substr( (string) $row->request_hash, 0, 16 ) . '…',
+                    )
+                );
+            }
+
+            // Hash match — replay cached response
+            $data = $row->response_data;
+            if ( is_string( $data ) && $data !== '' ) {
+                $decoded = json_decode( $data, true );
+                if ( json_last_error() === JSON_ERROR_NONE ) {
+                    $data = $decoded;
+                }
+            }
+
+            return is_array( $data ) ? $data : array( 'replayed' => true, 'data' => $data );
+        } catch ( \Throwable $e ) {
+            error_log( '[DINOCO_IDEMPOTENCY] check exception: ' . $e->getMessage() );
+            return null;
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. STORE API — dinoco_idempotency_store()
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_idempotency_store' ) ) {
+    /**
+     * Persist a (key, namespace, body, response) tuple for 24h replay.
+     * No-op if table missing or key/namespace invalid.
+     *
+     * @param string $key
+     * @param string $namespace
+     * @param mixed  $body          Request body (hashed for future compare)
+     * @param mixed  $response_data Response payload (array/scalar/null)
+     * @param int    $response_code HTTP status (default 200)
+     * @param int    $ttl_seconds   Default 86400 (24h); range 60..604800 (1min..7d)
+     * @return int|false insert_id on success, false on failure
+     */
+    function dinoco_idempotency_store( $key, $namespace, $body, $response_data, $response_code = 200, $ttl_seconds = 86400 ) {
+        if ( ! is_string( $key ) || $key === '' || ! is_string( $namespace ) || $namespace === '' ) {
+            return false;
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_idempotency_keys';
+
+        // Defensive — table may not exist yet
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SHOW TABLES LIKE %s", $wpdb->esc_like( $table )
+        ) );
+        if ( $exists !== $table ) {
+            // Don't bother lazy-installing here — check() already tried; if
+            // we got here without check() (caller pattern violation), the
+            // sole next request gets a fresh attempt.
+            return false;
+        }
+
+        // Clamp TTL to safe range
+        $ttl = (int) $ttl_seconds;
+        if ( $ttl < 60 )       $ttl = 60;        // 1 min floor (anything less = pointless)
+        if ( $ttl > 604800 )   $ttl = 604800;    // 7d ceiling
+
+        $now      = (int) ( function_exists( 'current_time' ) ? current_time( 'timestamp' ) : time() );
+        $created  = function_exists( 'current_time' ) ? current_time( 'mysql' ) : gmdate( 'Y-m-d H:i:s', $now );
+        $expires  = function_exists( 'current_time' )
+            ? gmdate( 'Y-m-d H:i:s', $now + $ttl )  // current_time('timestamp') is local; but we add seconds → still correct
+            : gmdate( 'Y-m-d H:i:s', $now + $ttl );
+
+        // Encode response — JSON for arrays/objects, string fallback for scalars
+        $resp_str = '';
+        if ( is_array( $response_data ) || is_object( $response_data ) ) {
+            $encoded = function_exists( 'wp_json_encode' )
+                ? wp_json_encode( $response_data )
+                : json_encode( $response_data );
+            $resp_str = ( $encoded === false ) ? '' : $encoded;
+        } elseif ( is_scalar( $response_data ) ) {
+            $resp_str = (string) $response_data;
+        }
+
+        $row = array(
+            'idempotency_key' => substr( (string) $key, 0, 64 ),
+            'namespace'       => substr( (string) $namespace, 0, 64 ),
+            'request_hash'    => dinoco_idempotency_hash( $body ),
+            'response_data'   => $resp_str,
+            'response_code'   => max( 0, min( 65535, (int) $response_code ) ),
+            'user_id'         => function_exists( 'get_current_user_id' ) ? ( get_current_user_id() ?: null ) : null,
+            'request_ip'      => substr( dinoco_idempotency_resolve_ip(), 0, 45 ),
+            'created_at'      => $created,
+            'expires_at'      => $expires,
+        );
+
+        try {
+            $ok = $wpdb->insert( $table, $row );
+            if ( $ok === false ) {
+                if ( ! get_transient( 'dinoco_idempotency_insert_failed_logged' ) ) {
+                    error_log( '[DINOCO_IDEMPOTENCY] INSERT failed: ' . $wpdb->last_error );
+                    set_transient( 'dinoco_idempotency_insert_failed_logged', 1, HOUR_IN_SECONDS );
+                }
+                return false;
+            }
+            return (int) $wpdb->insert_id;
+        } catch ( \Throwable $e ) {
+            error_log( '[DINOCO_IDEMPOTENCY] store exception: ' . $e->getMessage() );
+            return false;
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. CLEANUP CRON (24h TTL by default)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_idempotency_cleanup_run' ) ) {
+    /**
+     * DELETE expired rows. Chunked 1000/iter to avoid long lock + deadlock
+     * with concurrent INSERTs. Max 20 iterations (= 20K rows/run cap).
+     *
+     * @return int Total rows deleted this run
+     */
+    function dinoco_idempotency_cleanup_run() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_idempotency_keys';
+        if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $table ) ) ) !== $table ) {
+            return 0;
+        }
+
+        $total_deleted = 0;
+        $max_iters     = 20;
+        for ( $i = 0; $i < $max_iters; $i++ ) {
+            $deleted = $wpdb->query(
+                "DELETE FROM {$table} WHERE expires_at < NOW() LIMIT 1000"
+            );
+            if ( ! $deleted || $deleted === false ) break;
+            $total_deleted += (int) $deleted;
+            if ( $deleted < 1000 ) break;
+            usleep( 50000 ); // 50ms gap
+        }
+
+        if ( $total_deleted > 0 ) {
+            update_option( 'dinoco_idempotency_cleanup_last_run', array(
+                'ran_at'  => current_time( 'mysql' ),
+                'deleted' => $total_deleted,
+            ), false );
+        }
+
+        return $total_deleted;
+    }
+}
+
+if ( ! wp_next_scheduled( 'dinoco_idempotency_cleanup_cron' ) ) {
+    // Daily at ~03:15 (offset from flag-audit retention at 03:00 to spread DB load)
+    $first_run = strtotime( 'tomorrow 03:15' );
+    if ( ! $first_run ) $first_run = time() + DAY_IN_SECONDS;
+    wp_schedule_event( $first_run, 'daily', 'dinoco_idempotency_cleanup_cron' );
+}
+add_action( 'dinoco_idempotency_cleanup_cron', 'dinoco_idempotency_cleanup_run' );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. QUERY API (admin viewer)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_idempotency_query' ) ) {
+    /**
+     * Query idempotency rows with filters + pagination.
+     *
+     * @param array $args {
+     *   @type string $namespace  Filter by namespace (exact)
+     *   @type int    $user_id    Filter by user_id
+     *   @type int    $limit      Page size (default 50, max 500)
+     *   @type int    $offset     Pagination offset (default 0)
+     *   @type string $orderby    'created_at'|'expires_at' (default created_at)
+     *   @type string $order      'ASC'|'DESC' (default DESC)
+     * }
+     * @return array { rows: array<object>, total: int }
+     */
+    function dinoco_idempotency_query( $args = array() ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_idempotency_keys';
+
+        $defaults = array(
+            'namespace' => '',
+            'user_id'   => 0,
+            'limit'     => 50,
+            'offset'    => 0,
+            'orderby'   => 'created_at',
+            'order'     => 'DESC',
+        );
+        $args = wp_parse_args( $args, $defaults );
+
+        $where  = array( '1=1' );
+        $params = array();
+
+        if ( ! empty( $args['namespace'] ) ) {
+            $where[]  = 'namespace = %s';
+            $params[] = (string) $args['namespace'];
+        }
+        if ( ! empty( $args['user_id'] ) ) {
+            $where[]  = 'user_id = %d';
+            $params[] = (int) $args['user_id'];
+        }
+
+        $orderby = in_array( $args['orderby'], array( 'created_at', 'expires_at', 'id' ), true )
+            ? $args['orderby'] : 'created_at';
+        $order   = strtoupper( $args['order'] ) === 'ASC' ? 'ASC' : 'DESC';
+
+        $limit  = max( 1, min( 500, (int) $args['limit'] ) );
+        $offset = max( 0, (int) $args['offset'] );
+
+        $where_sql = implode( ' AND ', $where );
+
+        // Count
+        $count_sql = "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}";
+        $total = (int) ( $params
+            ? $wpdb->get_var( $wpdb->prepare( $count_sql, $params ) )
+            : $wpdb->get_var( $count_sql ) );
+
+        // Rows — exclude response_data from list view (LONGTEXT — too heavy)
+        $row_sql = "SELECT id, idempotency_key, namespace, request_hash, response_code,
+                           user_id, request_ip, created_at, expires_at
+                    FROM {$table}
+                    WHERE {$where_sql}
+                    ORDER BY {$orderby} {$order}
+                    LIMIT %d OFFSET %d";
+        $row_params = array_merge( $params, array( $limit, $offset ) );
+        $rows = $wpdb->get_results( $wpdb->prepare( $row_sql, $row_params ) );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        return array( 'rows' => $rows, 'total' => $total );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. REST API — /wp-json/dinoco/v1/idempotency*
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_action( 'rest_api_init', function() {
+
+    $perm_admin = function() {
+        return current_user_can( 'manage_options' );
+    };
+
+    // GET /idempotency — list with filters
+    register_rest_route( 'dinoco/v1', '/idempotency', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function( WP_REST_Request $req ) {
+            $args = array(
+                'namespace' => sanitize_text_field( (string) $req->get_param( 'namespace' ) ),
+                'user_id'   => absint( $req->get_param( 'user_id' ) ),
+                'limit'     => max( 1, min( 500, (int) ( $req->get_param( 'limit' ) ?: 50 ) ) ),
+                'offset'    => max( 0, (int) $req->get_param( 'offset' ) ),
+                'orderby'   => sanitize_text_field( (string) ( $req->get_param( 'orderby' ) ?: 'created_at' ) ),
+                'order'     => sanitize_text_field( (string) ( $req->get_param( 'order' ) ?: 'DESC' ) ),
+            );
+            $result = dinoco_idempotency_query( $args );
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => $result['rows'],
+                'meta'    => array(
+                    'total'  => $result['total'],
+                    'limit'  => $args['limit'],
+                    'offset' => $args['offset'],
+                ),
+            ) );
+        },
+    ) );
+
+    // POST /idempotency/cleanup — manual trigger (admin only)
+    register_rest_route( 'dinoco/v1', '/idempotency/cleanup', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin,
+        'callback'            => function( WP_REST_Request $req ) {
+            $deleted = dinoco_idempotency_cleanup_run();
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'deleted'  => $deleted,
+                    'last_run' => get_option( 'dinoco_idempotency_cleanup_last_run', null ),
+                ),
+            ) );
+        },
+    ) );
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. ADMIN VIEWER — [dinoco_idempotency_viewer] shortcode
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_shortcode( 'dinoco_idempotency_viewer', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return '<p style="color:#dc2626;">⚠️ ต้องเป็น admin (manage_options) เท่านั้น</p>';
+    }
+
+    $nonce    = wp_create_nonce( 'wp_rest' );
+    $rest_url = esc_url_raw( rest_url( 'dinoco/v1/idempotency' ) );
+    $cleanup  = esc_url_raw( rest_url( 'dinoco/v1/idempotency/cleanup' ) );
+    $last_run = get_option( 'dinoco_idempotency_cleanup_last_run', null );
+    $last_run_str = is_array( $last_run ) && ! empty( $last_run['ran_at'] )
+        ? sprintf( 'ล่าสุด: %s (ลบ %d แถว)', esc_html( $last_run['ran_at'] ), (int) $last_run['deleted'] )
+        : 'ยังไม่เคยรัน';
+
+    ob_start();
+    ?>
+    <div class="dinoco-idempotency-viewer" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2937;">
+
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+            <h2 style="margin:0;font-size:18px;font-weight:700;color:#111827;">
+                🔁 Idempotency Keys
+                <small style="font-weight:400;color:#6b7280;font-size:13px;">— ป้องกัน duplicate POST จากการ retry (24 ชม.)</small>
+            </h2>
+            <div>
+                <button type="button" id="idmCleanupBtn" style="background:#dc2626;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">
+                    🧹 Cleanup ทันที
+                </button>
+                <button type="button" id="idmRefresh" style="background:#3b82f6;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;margin-left:6px;">
+                    🔄 Refresh
+                </button>
+            </div>
+        </div>
+
+        <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end;">
+            <label style="font-size:12px;color:#374151;">
+                <span style="display:block;margin-bottom:3px;font-weight:600;">Namespace</span>
+                <input type="text" id="idmFilterNs" style="width:100%;padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;" placeholder="b2b/v1::place-order">
+            </label>
+            <label style="font-size:12px;color:#374151;">
+                <span style="display:block;margin-bottom:3px;font-weight:600;">User ID</span>
+                <input type="number" id="idmFilterUser" style="width:100%;padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;" placeholder="(any)">
+            </label>
+            <button type="button" id="idmApply" style="background:#1f2937;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">
+                🔍 ค้นหา
+            </button>
+        </div>
+
+        <div style="font-size:12px;color:#9ca3af;margin-bottom:8px;">Cleanup cron: ทุกวัน 03:15 — <?php echo esc_html( $last_run_str ); ?></div>
+
+        <div style="overflow-x:auto;border:1px solid #e5e7eb;border-radius:8px;background:#fff;">
+            <table id="idmTable" style="width:100%;border-collapse:collapse;font-size:13px;">
+                <thead style="background:#f3f4f6;">
+                    <tr>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">สร้าง</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">Key</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">Namespace</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">Hash</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">Code</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">User</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">หมดอายุ</th>
+                    </tr>
+                </thead>
+                <tbody id="idmTbody">
+                    <tr><td colspan="7" style="padding:24px;text-align:center;color:#9ca3af;">กดปุ่ม "ค้นหา" หรือ "Refresh" เพื่อโหลดข้อมูล</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div id="idmSummary" style="font-size:13px;color:#6b7280;margin-top:8px;"></div>
+
+        <div style="margin-top:16px;padding:12px;background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;font-size:12px;color:#78350f;">
+            ℹ️ Foundation Mode (Round 18, V.1.0) — endpoint integration เริ่มในอนาคต. ยังไม่มี endpoint ไหนใช้ middleware นี้ในการตอบ client.
+        </div>
+    </div>
+
+    <script>
+    (function() {
+        var REST_LIST    = <?php echo wp_json_encode( $rest_url ); ?>;
+        var REST_CLEANUP = <?php echo wp_json_encode( $cleanup ); ?>;
+        var NONCE        = <?php echo wp_json_encode( $nonce ); ?>;
+
+        function esc(s) {
+            if (s === null || s === undefined) return '';
+            return String(s).replace(/[&<>"']/g, function(c) {
+                return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+            });
+        }
+
+        function fmtUser(uid) {
+            if (!uid || uid === '0') return '<span style="color:#9ca3af;">system</span>';
+            return '<a href="user-edit.php?user_id=' + esc(uid) + '" target="_blank" style="color:#3b82f6;">#' + esc(uid) + '</a>';
+        }
+
+        function fmtCode(c) {
+            c = parseInt(c, 10) || 0;
+            var color = c >= 200 && c < 300 ? '#10b981' : (c >= 400 ? '#dc2626' : '#6b7280');
+            return '<span style="color:' + color + ';font-weight:600;font-family:monospace;">' + esc(c) + '</span>';
+        }
+
+        function fetchPage() {
+            var params = new URLSearchParams({
+                namespace: document.getElementById('idmFilterNs').value || '',
+                user_id:   document.getElementById('idmFilterUser').value || '',
+                limit:     50,
+                offset:    0
+            });
+            var tbody = document.getElementById('idmTbody');
+            tbody.innerHTML = '<tr><td colspan="7" style="padding:18px;text-align:center;color:#9ca3af;">⏳ กำลังโหลด...</td></tr>';
+
+            fetch(REST_LIST + '?' + params.toString(), {
+                headers: { 'X-WP-Nonce': NONCE },
+                credentials: 'same-origin'
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(j) {
+                if (!j || !j.success) {
+                    tbody.innerHTML = '<tr><td colspan="7" style="padding:18px;text-align:center;color:#dc2626;">❌ โหลดล้มเหลว</td></tr>';
+                    return;
+                }
+                renderRows(j.data || [], j.meta || {});
+            })
+            .catch(function(err) {
+                tbody.innerHTML = '<tr><td colspan="7" style="padding:18px;text-align:center;color:#dc2626;">❌ ' + esc(err.message) + '</td></tr>';
+            });
+        }
+
+        function renderRows(rows, meta) {
+            var tbody = document.getElementById('idmTbody');
+            if (!rows.length) {
+                tbody.innerHTML = '<tr><td colspan="7" style="padding:24px;text-align:center;color:#9ca3af;">— ไม่มีรายการ —</td></tr>';
+                document.getElementById('idmSummary').textContent = '';
+                return;
+            }
+            var html = '';
+            rows.forEach(function(r) {
+                var hash_short = (r.request_hash || '').substring(0, 12) + '…';
+                html += '<tr style="border-bottom:1px solid #f3f4f6;">';
+                html += '<td style="padding:8px 10px;white-space:nowrap;color:#6b7280;font-size:12px;">' + esc(r.created_at) + '</td>';
+                html += '<td style="padding:8px 10px;font-family:monospace;font-size:11px;color:#1f2937;">' + esc(r.idempotency_key) + '</td>';
+                html += '<td style="padding:8px 10px;font-family:monospace;font-size:11px;color:#374151;">' + esc(r.namespace) + '</td>';
+                html += '<td style="padding:8px 10px;font-family:monospace;font-size:11px;color:#9ca3af;" title="' + esc(r.request_hash) + '">' + esc(hash_short) + '</td>';
+                html += '<td style="padding:8px 10px;">' + fmtCode(r.response_code) + '</td>';
+                html += '<td style="padding:8px 10px;">' + fmtUser(r.user_id) + '</td>';
+                html += '<td style="padding:8px 10px;color:#6b7280;font-size:12px;">' + esc(r.expires_at) + '</td>';
+                html += '</tr>';
+            });
+            tbody.innerHTML = html;
+            document.getElementById('idmSummary').textContent = '✓ ' + rows.length + ' / ' + (meta.total || 0) + ' รายการ';
+        }
+
+        function runCleanup() {
+            var doIt = function(ok) {
+                if (!ok) return;
+                fetch(REST_CLEANUP, {
+                    method: 'POST',
+                    headers: { 'X-WP-Nonce': NONCE, 'Content-Type': 'application/json' },
+                    credentials: 'same-origin'
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(j) {
+                    var msg = (j && j.success) ? ('✓ ลบแล้ว ' + (j.data && j.data.deleted || 0) + ' แถว') : ('❌ ล้มเหลว');
+                    if (window.dinocoModal && window.dinocoModal.alert) {
+                        window.dinocoModal.alert({ title: 'Cleanup', message: msg });
+                    } else {
+                        alert(msg);
+                    }
+                    fetchPage();
+                });
+            };
+            if (window.dinocoModal && window.dinocoModal.confirm) {
+                window.dinocoModal.confirm({
+                    title: 'Cleanup ทันที',
+                    message: 'ลบ idempotency keys ที่หมดอายุแล้วทั้งหมด?',
+                    onConfirm: function() { doIt(true); }
+                });
+            } else {
+                doIt(confirm('ลบ idempotency keys ที่หมดอายุแล้วทั้งหมด?'));
+            }
+        }
+
+        document.getElementById('idmRefresh').addEventListener('click', fetchPage);
+        document.getElementById('idmApply').addEventListener('click', fetchPage);
+        document.getElementById('idmCleanupBtn').addEventListener('click', runCleanup);
+    })();
+    </script>
+    <?php
+    return ob_get_clean();
+} );
