@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.6 (2026-04-30) — Round 30 F1 HIGH FIX: bo-fulfill drift remediation:           ║
+ * ║    • POST /b2b/v1/bo-fulfill — body hash {order_id, items[sort by bo_queue_id, qty]}.        ║
+ * ║      Round 29 drift sweep flagged tracker entry #14 as "integrated" since Round 19 but       ║
+ * ║      actual code had NO wrapper (only bo-bulk-fulfill did). Risk: admin double-click on       ║
+ * ║      "ส่งสินค้า BO" Flex action → debt double-add + duplicate Flash secondary order +       ║
+ * ║      duplicate "BO ready" Flex card to customer (M7 builder fires twice). GET_LOCK +         ║
+ * ║      idempotency complement: GET_LOCK serializes concurrent calls but releases on            ║
+ * ║      completion → 2nd call after release re-runs full mutation chain. Idempotency cache      ║
+ * ║      returns cached response immediately without re-executing — true replay safety.          ║
+ * ║    • Wrapper inserted before dinoco_transaction call (and legacy path) — covers both         ║
+ * ║      wrapper-loaded + legacy paths uniformly. Cache stores ONLY on success (WP_Error skips    ║
+ * ║      cache so retry re-evaluates).                                                            ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.         ║
  * ║  Version: V.3.5 (2026-04-30) — Round 27: Extend Idempotency-Key support to 3 more BO endpoints: ║
  * ║    • POST /b2b/v1/bo-cancel-item — body hash {order_id, bo_queue_id, reason}. Admin Flex      ║
  * ║      "ยกเลิก BO" single-item action can double-fire on slow LINE postback. Wrapper returns    ║
@@ -2121,6 +2134,59 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
 
         $dist_id = (int) get_field( 'distributor_id', $order_id );
 
+        // ── V.3.6 Round 30 F1 FIX: Idempotency-Key support ──
+        // Round 29 drift sweep (F1 HIGH) found bo-fulfill listed as integrated #14 in tracker
+        // since Round 19 — but actual code had NO wrapper (only bo-bulk-fulfill did). Risk:
+        // admin double-clicks "ส่งสินค้า BO" Flex action → debt double-add + duplicate Flash
+        // secondary order (b2b_bo_items_fulfilled action fires twice → H5 + H6 listeners run
+        // twice) + duplicate "BO ready" Flex card to customer (M7 builder fires twice).
+        //
+        // GET_LOCK + idempotency complement each other:
+        //   GET_LOCK serializes concurrent calls but releases on completion → 2nd call after
+        //   release re-runs full mutation chain. Idempotency cache returns cached response
+        //   immediately without re-executing — true replay safety.
+        //
+        // Body hash = { order_id, items: [sort by bo_queue_id, qty] } — matches bo-bulk-fulfill
+        // canonicalization (admin row reorder ≠ different intent).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-fulfill';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $norm_items = array();
+            foreach ( $items as $it ) {
+                if ( ! is_array( $it ) ) continue;
+                $bo_queue_id = (int) ( $it['bo_queue_id'] ?? 0 );
+                if ( ! $bo_queue_id ) continue;
+                $qty = isset( $it['qty'] ) ? (int) $it['qty'] : 0;
+                $norm_items[] = array(
+                    'bo_queue_id' => $bo_queue_id,
+                    'qty'         => $qty,
+                );
+            }
+            usort( $norm_items, function( $a, $b ) {
+                return $a['bo_queue_id'] <=> $b['bo_queue_id'];
+            } );
+            $idem_body = array(
+                'order_id' => $order_id,
+                'items'    => $norm_items,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         if ( function_exists( 'dinoco_transaction' ) && $dist_id ) {
             $txn_ctx = array(
                 'audit_event_type' => 'bo_fulfill',
@@ -2139,11 +2205,28 @@ if ( ! function_exists( 'b2b_rest_bo_fulfill' ) ) {
                     return _b2b_rest_bo_fulfill_inner( $request, $order_id, $items, $dist_id );
                 },
             );
-            return dinoco_transaction( 'bo_fulfill', $txn_phases, $txn_ctx );
+            $res = dinoco_transaction( 'bo_fulfill', $txn_phases, $txn_ctx );
+        } else {
+            // Legacy path — Transaction Wrapper not loaded
+            $res = _b2b_rest_bo_fulfill_legacy( $request, $order_id, $items );
         }
 
-        // Legacy path — Transaction Wrapper not loaded
-        return _b2b_rest_bo_fulfill_legacy( $request, $order_id, $items );
+        // Cache successful response for replay (skip on WP_Error — only successful mutations
+        // benefit from replay safety; errors should re-evaluate on retry).
+        if ( $idem_key !== '' && $idem_body !== null && ! is_wp_error( $res ) && function_exists( 'dinoco_idempotency_store' ) ) {
+            $resp_data = ( $res instanceof WP_REST_Response ) ? $res->get_data() : $res;
+            if ( is_array( $resp_data ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+        }
+
+        return $res;
     }
 }
 
