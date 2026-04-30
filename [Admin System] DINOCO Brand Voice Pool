@@ -3,6 +3,17 @@
  * [Admin System] DINOCO Brand Voice Pool
  * Shortcode: [dinoco_brand_voice]
  * Description: เก็บเสียงลูกค้าจากโซเชียล — วิเคราะห์แบรนด์ DINOCO vs คู่แข่ง
+ * Version: V.2.11 (2026-04-29) — Round 14 MED-3 — bv_get_stats() transient cache:
+ *   • Wrap bv_get_stats() with bv_get_stats_cached($days, $force_refresh) — 5-min
+ *     transient TTL keyed by $days. Eliminates 9999-post × 22-meta = 219K cache
+ *     lookups per stats request (CPU-bound aggregation hot path). Recompute on
+ *     create_entry / update_entry / delete_entry via bv_invalidate_stats_cache().
+ *   • Direct bv_get_stats() preserved as low-level helper (used by AI summary).
+ *     Stats endpoint + AI summary now route through cached wrapper. Cache is
+ *     scoped per-$days (separate keys for 30d / 90d / etc.) to prevent stale
+ *     cross-window aggregations.
+ *   • Invalidation hooks: 3 mutation points + delete_entry handler. Pattern
+ *     mirrors b2f_junction_updated cache-bust convention.
  * Version: V.2.10 (2026-04-24) — Phase 4e Module Registry adoption (Pillar 1):
  *   • Self-register via dinoco_register_admin_module() at init priority 30.
  *     key=brand_voice, shortcode=dinoco_brand_voice, section=ai, cache_ttl=300.
@@ -104,6 +115,11 @@ function bv_create_entry($data) {
 
     update_post_meta($post_id, 'bv_entered_by', get_current_user_id());
     update_post_meta($post_id, 'bv_entry_method', 'manual');
+
+    // V.2.11 (Round 14 MED-3): bust stats cache on new entry
+    if (function_exists('bv_invalidate_stats_cache')) {
+        bv_invalidate_stats_cache();
+    }
 
     return $post_id;
 }
@@ -276,8 +292,69 @@ function bv_get_stats($days = 30) {
     ];
 }
 
+/**
+ * V.2.11 (Round 14 MED-3): cached wrapper around bv_get_stats().
+ *
+ * Why: bv_get_stats() loads up to 9999 entries × ~22 meta fields each ≈ 219K
+ * postmeta cache lookups per call. Stats endpoint hits this on every dashboard
+ * load. Transient with 5-min TTL collapses repeated calls into a single compute.
+ *
+ * Cache key includes $days so 30-day vs 90-day aggregations don't collide.
+ * Pass $force_refresh=true to bypass cache (e.g. immediately after a write).
+ *
+ * @param int  $days          Window in days (passed to bv_get_stats — currently informational).
+ * @param bool $force_refresh If true, bypass cache and recompute.
+ * @return array Stats payload (same shape as bv_get_stats).
+ */
+function bv_get_stats_cached($days = 30, $force_refresh = false) {
+    $key = 'bv_stats_v1_' . intval($days);
+    if (!$force_refresh) {
+        $cached = get_transient($key);
+        if ($cached !== false && is_array($cached)) {
+            return $cached;
+        }
+    }
+    $stats = bv_get_stats($days);
+    // 5-min TTL — short enough that admin edits feel responsive,
+    // long enough to absorb dashboard refresh bursts.
+    set_transient($key, $stats, 5 * MINUTE_IN_SECONDS);
+    return $stats;
+}
+
+/**
+ * V.2.11 (Round 14 MED-3): invalidate every cached stats window.
+ *
+ * Called after bv_create_entry / update_entry / delete_entry handlers so
+ * the next /get_stats request recomputes fresh aggregations.
+ *
+ * Wildcard delete via direct option scan to avoid hardcoding $days values
+ * (cheap — `bv_stats_v1_*` is short prefix, options table has index on
+ * option_name). Falls back to common windows (30, 90) if scan fails.
+ */
+function bv_invalidate_stats_cache() {
+    global $wpdb;
+    // Common windows first (cheap, deterministic)
+    foreach (array(30, 90, 180, 365) as $d) {
+        delete_transient('bv_stats_v1_' . $d);
+    }
+    // Defensive sweep — catches any non-standard $days values
+    if (isset($wpdb)) {
+        $like = $wpdb->esc_like('_transient_bv_stats_v1_') . '%';
+        $rows = $wpdb->get_col($wpdb->prepare(
+            "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s LIMIT 50",
+            $like
+        ));
+        if (is_array($rows)) {
+            foreach ($rows as $opt) {
+                $key = preg_replace('/^_transient_/', '', $opt);
+                if ($key !== $opt) delete_transient($key);
+            }
+        }
+    }
+}
+
 function bv_get_ai_summary() {
-    $stats = bv_get_stats(90);
+    $stats = bv_get_stats_cached(90);
     if ($stats['total'] === 0) return null;
 
     $recent    = bv_get_entries(['limit' => 20]);
@@ -838,13 +915,14 @@ add_action('init', function() {
         exit;
     }
 
-    // (c) get_stats
+    // (c) get_stats — V.2.11 cached wrapper (5-min transient TTL)
     if ($action === 'get_stats') {
         if (ob_get_length()) ob_clean();
         header('Content-Type: application/json; charset=utf-8');
         if (!current_user_can('manage_options')) { echo json_encode(['success'=>false]); exit; }
 
-        echo json_encode(['success' => true, 'data' => bv_get_stats()]);
+        $force_refresh = !empty($_POST['refresh']);
+        echo json_encode(['success' => true, 'data' => bv_get_stats_cached(30, $force_refresh)]);
         exit;
     }
 
@@ -869,6 +947,11 @@ add_action('init', function() {
         if (isset($_POST['admin_notes'])) update_post_meta($id, 'bv_admin_notes', sanitize_textarea_field($_POST['admin_notes']));
         if (isset($_POST['tags'])) update_post_meta($id, 'bv_tags', sanitize_text_field($_POST['tags']));
 
+        // V.2.11 (Round 14 MED-3): bust stats cache on update
+        if (function_exists('bv_invalidate_stats_cache')) {
+            bv_invalidate_stats_cache();
+        }
+
         echo json_encode(['success' => true, 'id' => $id]);
         exit;
     }
@@ -881,6 +964,12 @@ add_action('init', function() {
 
         $post_id = intval($_POST['id'] ?? 0);
         if ($post_id) wp_delete_post($post_id, true);
+
+        // V.2.11 (Round 14 MED-3): bust stats cache on delete
+        if (function_exists('bv_invalidate_stats_cache')) {
+            bv_invalidate_stats_cache();
+        }
+
         echo json_encode(['success' => true]);
         exit;
     }

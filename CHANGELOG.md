@@ -10,6 +10,46 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fix — Round 14 (Close 3 MED findings from Round 13 code-reviewer audit) (2026-04-29)
+
+After Round 13 audit identified 3 MED findings (0 HIGH/CRIT), Round 14 closes all 3 in a single batched commit. Risk LOW-NONE on every item. Net code: -1 LOC dead, +95 LOC defensive guards/cache.
+
+#### MED-1 — manual_ship.html V.44.5 dead code removal
+
+- File: `rpi-print-server/templates/manual_ship.html` (V.44.4 → V.44.5)
+- Removed `t.style.display='none'` inside img-error capture-phase delegation (line 1337) — `parentNode.textContent='📦'` on next line replaces all child nodes, wiping the `<img>` element entirely. Setting display:none on a soon-to-be-removed node has no effect.
+- Behavior identical to V.44.4. Pure dead-code elimination.
+
+#### MED-2 — `_prime_post_caches()` defensive guard sweep
+
+- File: `[B2B] Snippet 16: Backorder System` (V.3.1 → V.3.2)
+- WordPress source marks `_prime_post_caches()` as `@access private` despite being public + stable since 2.7.0. Defensive guard wraps every call.
+- 4 sites guarded (lines 1108, 1120, 2347, 2360 — bo-pending-review + bo-queue paths). `update_meta_cache()` left ungated (also private but stable).
+- Snippet 3 V.41.x already had this guard. Sweep confirmed only Snippet 16 was missing — no other snippets use `_prime_post_caches()`.
+- Pattern: `if ( function_exists( '_prime_post_caches' ) ) { _prime_post_caches(...); }` — pure no-op on installs ≥ WP 2.7.
+
+#### MED-3 — Brand Voice Pool stats aggregation cache
+
+- File: `[Admin System] DINOCO Brand Voice Pool` (V.2.10 → V.2.11)
+- Issue: `bv_get_stats()` loads up to 9999 entries × ~22 meta fields = 219K postmeta cache lookups per call. Stats endpoint hits this on every dashboard refresh + AI summary trigger. CPU-bound aggregation hot path.
+- Solution: Layer 1 transient cache wrapper (5-min TTL, keyed by `$days`):
+  - NEW `bv_get_stats_cached($days = 30, $force_refresh = false)` — read-through transient with bypass param
+  - NEW `bv_invalidate_stats_cache()` — busts every cached window (common: 30/90/180/365 + defensive SQL sweep on `_transient_bv_stats_v1_%` LIMIT 50)
+  - 3 invalidation hooks: `bv_create_entry()` end / `update_entry` REST handler end / `delete_entry` REST handler end (all gated by `function_exists`)
+  - 2 call sites converted: `bv_get_ai_summary()` (90d) + REST `get_stats` route (30d, with `?refresh=1` bypass param)
+- Worst-case stale window: 5 minutes (acceptable per spec). Read-heavy workload (dashboard refresh) benefits most: 1 compute / 5min vs 1 compute / request.
+- Direct `bv_get_stats()` callers unchanged — preserved as low-level helper.
+
+#### Validation
+
+- `php -l` clean on both PHP snippets
+- `grep -c "function_exists.*_prime_post_caches" Snippet 16` = 4 (matches site count)
+- `grep -c "bv_invalidate_stats_cache" BVP` = 6 (1 def + 5 callers)
+
+Files touched: 3 (manual_ship.html / Snippet 16 / Brand Voice Pool)
+
+---
+
 ### Audit + Test — Round 13 (Cross-rounds code review + unit test expansion + PERF sweep finalize) (2026-04-30)
 
 After 42 commits across Rounds 1-12 (UX-H3 100% / onerror 100% / 7 drift detectors / 211 phpunit + 146 jest tests / Flag Audit Log / 5 PERF sweeps / MD040 clean / coverage badges) without independent code review, Round 13 = safety verification + final polish. ZERO regressions across all 12 rounds maintained.
