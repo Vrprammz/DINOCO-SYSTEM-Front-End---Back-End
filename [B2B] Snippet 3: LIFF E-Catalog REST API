@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.11 — Round 23 (2026-04-29): Extend Idempotency-Key support to manual-flash-   ║
+ * ║    cancel. DB cleanup loop is NOT idempotent on its own (status='cancelled' second time      ║
+ * ║    walks list, finds match, succeeds but warehouse double-click could see "Flash already     ║
+ * ║    cancelled" error from second call). Wrapper replays original success response.            ║
+ * ║    Body hash = {pno}. Mirrors place-order + manual-flash-create V.42.10 pattern.             ║
+ * ║    Risk: LOW — wrapper-only, additive. Backward compat: missing X-Idempotency-Key = no-op.   ║
  * ║  Version: V.42.10 — Round 19 (2026-04-29): Idempotency-Key integration on 2 critical POST    ║
  * ║    endpoints: place-order + manual-flash-create. Reads X-Idempotency-Key header (optional).  ║
  * ║    If present: same key + same body hash → returns cached response (no duplicate order/PNO). ║
@@ -5068,6 +5074,42 @@ function b2b_rest_manual_flash_cancel( WP_REST_Request $r ) {
         if ( empty( $pno ) ) {
             return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่มี PNO' ), 400 );
         }
+
+        // ── V.42.11 Round 23: Idempotency-Key support ──
+        // Flash API has its own idempotent cancel (same PNO cancel twice = no-op),
+        // but our DB cleanup (wp_options['b2b_manual_shipments_YYYY_MM']) is NOT
+        // idempotent — second call walks shipments array, finds status='cancelled'
+        // already, and returns success but UI sees inconsistent state. Worse: warehouse
+        // double-click sends 2 requests. First wins with status update + log; second
+        // gets "Flash already cancelled" failure response → admin sees error toast even
+        // though cancel succeeded. Wrapper cache replays original success response.
+        // Body hash: pno only (cancel is per-PNO operation, deterministic).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $r )
+            : '';
+        $idem_namespace = 'b2b/v1::manual-flash-cancel';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'pno' => (string) $pno,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         if ( ! function_exists( 'b2b_flash_cancel_order' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'message' => 'Flash cancel function not available' ), 500 );
         }
@@ -5084,13 +5126,21 @@ function b2b_rest_manual_flash_cancel( WP_REST_Request $r ) {
                         update_option( $month_key, $shipments, false );
                         b2b_log( '[ManualFlash] Cancelled pno=' . $pno . ' (month=' . $m . ')' );
                         unset( $s );
-                        return new WP_REST_Response( array( 'success' => true, 'message' => 'ยกเลิกสำเร็จ' ), 200 );
+                        $cancel_resp = array( 'success' => true, 'message' => 'ยกเลิกสำเร็จ' );
+                        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $cancel_resp, array( '_idem_code' => 200 ) ), 200 );
+                        }
+                        return new WP_REST_Response( $cancel_resp, 200 );
                     }
                 }
                 unset( $s );
             }
             b2b_log( '[ManualFlash] Cancelled pno=' . $pno . ' (not found in options but Flash cancelled)' );
-            return new WP_REST_Response( array( 'success' => true, 'message' => 'ยกเลิกสำเร็จ' ), 200 );
+            $cancel_resp = array( 'success' => true, 'message' => 'ยกเลิกสำเร็จ' );
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $cancel_resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+            return new WP_REST_Response( $cancel_resp, 200 );
         }
         return new WP_REST_Response( array( 'success' => false, 'message' => $result['error'] ?? 'ยกเลิกไม่สำเร็จ' ), 400 );
     } catch ( \Throwable $e ) {

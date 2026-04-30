@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 5: Admin Dashboard                          ║
+ * ║  Version: V.33.5 (2026-04-29) — Round 23: Idempotency-Key support on confirm-order +        ║
+ * ║    flash-create. Reads X-Idempotency-Key header (optional). Same key + same body hash →     ║
+ * ║    cached response (24h TTL). Confirm-order body = {ticket_id, total, status, admin_note}.  ║
+ * ║    Flash-create body = {ticket_id} (deterministic per ticket; dispatcher already locks).    ║
+ * ║    Conflict (same key, different body) → 409. Backward compat: missing header = identical   ║
+ * ║    behavior to V.33.4. Risk: LOW — wrapper-only, additive (Round 19 pattern proven).        ║
  * ║  Version: V.33.4 (2026-04-29) — Round 15 ITEM A: function_exists guard on update_meta_cache  ║
  * ║    Defensive guard added to admin orders loop priming (line ~1053). update_meta_cache is    ║
  * ║    a WP private API (per source code marker) — guard mirrors Snippet 7 V.30.x pattern.      ║
@@ -276,6 +282,45 @@ function b2b_rest_confirm_order( WP_REST_Request $r ) {
     $total = floatval($r->get_param('total_amount'));
     $note  = sanitize_textarea_field($r->get_param('admin_note'));
     $st    = sanitize_text_field($r->get_param('status'));
+
+    // ── V.33.5 Round 23: Idempotency-Key support ──
+    // Optional X-Idempotency-Key header — if present + same body hash → return cached response.
+    // Why critical: confirm-order mutates BO flow heavily (debt add, FSM transition, BO Flex push).
+    //   Double-fire (admin double-click + slow LINE push) can fire stock_check_alert twice + commit
+    //   debt twice if the ticket transitions to awaiting_confirm + total>0 between the dupes.
+    // Backward compat: missing header = handler runs identical to V.33.4 (zero behavior change).
+    // Body hash inputs: ticket_id + total_amount + status + admin_note (semantic write fields).
+    //   Strip non-idempotent: nonces, raw $_REQUEST junk. Status is a legitimate input — same
+    //   admin re-clicking "Confirm" with same status+total = legitimate retry → cached response.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r )
+        : '';
+    $idem_namespace = 'b2b/v1::confirm-order';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'ticket_id'    => (int) $tid,
+            'total_amount' => (float) $total,
+            'status'       => (string) $st,
+            'admin_note'   => (string) $note,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // V.31 SEC: Validate price bounds + audit log
     if($total>0) {
         if($total > 10000000) return new WP_REST_Response(array('success'=>false,'message'=>'ยอดเงินเกินขีดจำกัด'),400);
@@ -317,7 +362,12 @@ function b2b_rest_confirm_order( WP_REST_Request $r ) {
             b2b_line_push_raw($gid,array(b2b_build_flex_bill_confirm($tid,$total,$note)));
         }
     }
-    return new WP_REST_Response(array('success'=>true,'message'=>'อัปเดต #'.$tid.' สำเร็จ'));
+    $confirm_resp = array('success'=>true,'message'=>'อัปเดต #'.$tid.' สำเร็จ');
+    // V.33.5 Round 23: store idempotency response (24h replay)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $confirm_resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+    return new WP_REST_Response( $confirm_resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
@@ -334,6 +384,41 @@ function b2b_rest_flash_create( WP_REST_Request $r ) {
     if(!$tid||get_post_type($tid)!=='b2b_order') return new WP_REST_Response(array('success'=>false,'message'=>'Ticket ไม่ถูกต้อง'),400);
     if(!defined('B2B_FLASH_MCH_ID')||!defined('B2B_FLASH_SECRET_KEY')||!defined('B2B_FLASH_API_URL'))
         return new WP_REST_Response(array('success'=>false,'message'=>'Flash ยังไม่ตั้งค่า (MCH_ID/SECRET_KEY/API_URL)'),400);
+
+    // ── V.33.5 Round 23: Idempotency-Key support ──
+    // Optional X-Idempotency-Key — Flash dispatch already has GET_LOCK + idempotency at the
+    //   helper level (b2b_flash_dispatch_create_all V.42), but admin double-click can still
+    //   produce 2 sequential requests where the second sees stale meta state during retry
+    //   window. Wrapper-level cache returns identical response for identical requests within 24h.
+    // Body hash input: ticket_id only — Flash creation is deterministic per ticket
+    //   (uses ticket meta + dispatcher resolves shipping data from snapshot).
+    //   Same ticket retry MUST produce same PNO list → cached response is correct.
+    // Backward compat: missing header = handler runs identical to V.33.4.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r )
+        : '';
+    $idem_namespace = 'b2b/v1::flash-create';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'ticket_id' => (int) $tid,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
 
     // Check order status
     $cur_status = get_field('order_status', $tid);
@@ -380,12 +465,17 @@ function b2b_rest_flash_create( WP_REST_Request $r ) {
             $flex = b2b_build_flex_flash_admin($tid, 'created', array('boxes' => $result['total_boxes'] . ' กล่อง: ' . implode(', ', $result['pnos'])));
             b2b_push_raw_to_admin(array($flex));
         }
-        return new WP_REST_Response(array(
+        $flash_create_resp = array(
             'success'     => true,
             'tracking'    => implode(', ', $result['pnos']),
             'total_boxes' => $result['total_boxes'],
             'pnos'        => $result['pnos'],
-        ));
+        );
+        // V.33.5 Round 23: store idempotency response (24h replay — admin retry safe)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $flash_create_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $flash_create_resp, 200 );
     }
 
     return new WP_REST_Response(array('success'=>false,'message'=>'Flash: '.$result['error']),500);

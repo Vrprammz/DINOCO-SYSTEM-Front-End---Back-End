@@ -19,6 +19,7 @@ Curated patterns extracted from Rounds 1-20 of the audit remediation sprint. Eac
 | 3 | [Data-Attr Scoping](./DATA-ATTR-SCOPING.md) | Rendering hierarchical DOM (parent/child/grandchild) where shared children appear multiple times |
 | 4 | [function_exists Guards](./FUNCTION-EXISTS-GUARDS.md) | Calling helpers that live in another snippet (cross-snippet calls or WP private API) |
 | 5 | [Idempotency-Key Wrapper](./IDEMPOTENCY-KEY.md) | Adding deduplication to a POST endpoint without breaking backward compat |
+| 6 | [Soft-Delete Conventions](./SOFT-DELETE-CONVENTIONS.md) | Designing a new table that needs delete/un-delete/audit semantics (DB-H2 documentation) |
 
 ## How patterns relate
 
@@ -63,3 +64,4 @@ When a recurring solution emerges across 3+ snippets:
 | Shared child renders only under one parent in the UI | Data-Attr Scoping |
 | Fatal error on rollback "function not found" | function_exists Guards |
 | Duplicate orders in DB on flaky network | Idempotency-Key Wrapper |
+| Designing new table that needs delete + audit history | Soft-Delete Conventions |

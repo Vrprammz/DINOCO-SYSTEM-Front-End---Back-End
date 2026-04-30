@@ -1,5 +1,17 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.12 (2026-04-29) — Round 23: Extend Idempotency-Key support to POST /po-update +
+ *   POST /receive-goods. Both are critical write paths — po-update bumps version + amendment count
+ *   + total + auto-resubmit + Maker Flex push (double-fire would inflate counters + spam Maker).
+ *   receive-goods commits debt (b2f_payable_add) + writes inventory + transitions PO (double-fire
+ *   would double-charge maker + double-add stock). GET_LOCK provides short-window protection;
+ *   wrapper provides 24h replay window. po-update body = { po_id, items, note, requested_date,
+ *   resubmit_only }; exchange_rate IMMUTABLE post-submit per V.7.0 design (excluded from hash).
+ *   receive-goods body = { po_id, items (JSON or array — normalized), inspected_by, note }.
+ *   Photo uploads (FormData binary) NOT hashed — accepted limitation; client retries with same
+ *   key still succeed because GET_LOCK at handler level + idempotency key ensures only first
+ *   request commits. Backward compat: missing header = handler runs identical to V.11.11.
+ *   Risk: LOW — wrapper-only, additive (Round 19 pattern proven).
  * Version: V.11.11 (2026-04-29) — Round 19: Idempotency-Key integration on POST /create-po.
  *   Reads X-Idempotency-Key header (optional). Same key + same body hash → returns cached PO
  *   response (no duplicate PO creation, no double exchange_rate snapshot). Body normalized
@@ -3214,6 +3226,45 @@ if ( ! function_exists( 'b2f_rest_po_update' ) ) {
         $current_status  = get_field( 'po_status', $po_id );
         $resubmit_only   = ! empty( $req->get_param( 'resubmit_only' ) );
 
+        // ── V.11.12 Round 23: Idempotency-Key support ──
+        // PO update is critical — admin amend bumps version + total + auto-resubmit. Double-fire
+        //   could increment amendment_count + version twice (annoying but recoverable) AND fire
+        //   2 Flex notifications to maker. Wrapper-level cache returns identical response.
+        // Body hash inputs: po_id + items[] + note + requested_date + resubmit_only flag.
+        //   exchange_rate is IMMUTABLE post-submit (snapshot lock per V.7.0 design) so excluded
+        //   from hash — same po_id retry can't legitimately change rate.
+        // Backward compat: missing header = handler runs identical to V.11.11.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req )
+            : '';
+        $idem_namespace = 'b2f/v1::po-update';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $items_for_hash = $req->get_param( 'items' );
+            $idem_body = array(
+                'po_id'          => (int) $po_id,
+                'items'          => is_array( $items_for_hash ) ? $items_for_hash : array(),
+                'note'           => (string) sanitize_textarea_field( (string) $req->get_param( 'note' ) ),
+                'requested_date' => (string) sanitize_text_field( (string) $req->get_param( 'requested_date' ) ),
+                'resubmit_only'  => $resubmit_only ? 1 : 0,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // B-02 fix: Resubmit — ส่ง PO เดิมกลับ Maker โดยไม่แก้ไข items
         if ( $resubmit_only ) {
             if ( $current_status !== 'rejected' ) {
@@ -3239,7 +3290,12 @@ if ( ! function_exists( 'b2f_rest_po_update' ) ) {
             $po_number = get_field( 'po_number', $po_id ) ?: '';
             if ( function_exists( 'b2f_log' ) ) b2f_log( "PO resubmitted: {$po_number} (#{$po_id})" );
 
-            return new WP_REST_Response( array( 'success' => true, 'po_id' => $po_id, 'status' => 'submitted', 'po_number' => $po_number ), 200 );
+            $resubmit_resp = array( 'success' => true, 'po_id' => $po_id, 'status' => 'submitted', 'po_number' => $po_number );
+            // V.11.12 Round 23: store idempotency response (24h replay)
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resubmit_resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+            return new WP_REST_Response( $resubmit_resp, 200 );
         }
 
         // Only allow amend in these statuses
@@ -3342,13 +3398,18 @@ if ( ! function_exists( 'b2f_rest_po_update' ) ) {
             b2f_log( sprintf( 'PO amended: %s (#%d) version=%d total=%.2f', $po_number, $po_id, $version, $total ) );
         }
 
-        return new WP_REST_Response( array(
+        $amend_resp = array(
             'success'      => true,
             'po_id'        => $po_id,
             'version'      => $version,
             'total_amount' => round( $total, 2 ),
             'status'       => 'submitted',
-        ), 200 );
+        );
+        // V.11.12 Round 23: store idempotency response (24h replay)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $amend_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $amend_resp, 200 );
     }
 }
 
@@ -4530,6 +4591,54 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
         }
 
+        // ── V.11.12 Round 23: Idempotency-Key support ──
+        // Receive-goods is the most critical B2F endpoint — adds debt (b2f_payable_add)
+        //   + writes to inventory + transitions PO to received/partial_received. Double-fire
+        //   on slow LINE push would commit debt twice + double-write stock.
+        // Body hash: po_id + items (JSON or array) + inspected_by + note. Photo files NOT
+        //   hashed (FormData binary uploads not deterministic — accepted limitation).
+        // Note: GET_LOCK below adds a SHORT-window guarantee (in-flight protection); the
+        //   idempotency wrapper provides the LONG-window guarantee (24h replay window).
+        // Backward compat: missing header = handler runs identical to V.11.11.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req )
+            : '';
+        $idem_namespace = 'b2f/v1::receive-goods';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $items_raw_for_hash = $req->get_param( 'items' );
+            // Items may arrive as JSON string (FormData) or array (JSON body) — normalize for hash
+            if ( is_string( $items_raw_for_hash ) ) {
+                $items_decoded_for_hash = json_decode( $items_raw_for_hash, true );
+                $items_for_hash = is_array( $items_decoded_for_hash ) ? $items_decoded_for_hash : array();
+            } elseif ( is_array( $items_raw_for_hash ) ) {
+                $items_for_hash = $items_raw_for_hash;
+            } else {
+                $items_for_hash = array();
+            }
+            $idem_body = array(
+                'po_id'        => (int) $po_id,
+                'items'        => $items_for_hash,
+                'inspected_by' => (string) sanitize_text_field( (string) $req->get_param( 'inspected_by' ) ),
+                'note'         => (string) sanitize_textarea_field( (string) $req->get_param( 'note' ) ),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // FIX HIGH-03: MySQL GET_LOCK แทน transient (atomic, ป้องกัน TOCTOU double receiving)
         $lock_key = 'b2f_recv_' . intval( $po_id );
         global $wpdb;
@@ -5117,7 +5226,7 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
         // Release MySQL lock ก่อน return (CRIT-05 fix — dead code)
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", 'b2f_recv_' . intval( $po_id ) ) );
 
-        return new WP_REST_Response( array(
+        $receive_resp = array(
             'success'           => true,
             'rcv_id'            => $rcv_id,
             'rcv_number'        => esc_html( $rcv_number ),
@@ -5132,7 +5241,12 @@ if ( ! function_exists( 'b2f_rest_receive_goods' ) ) {
                 'admin_push'  => $push_admin ? 'OK' : 'FAIL',
                 'maker_id'    => $maker_id,
             ),
-        ), 200 );
+        );
+        // V.11.12 Round 23: store idempotency response (24h replay — admin retry safe)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $receive_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $receive_resp, 200 );
     }
 }
 

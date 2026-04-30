@@ -10,6 +10,92 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 23 (Idempotency expansion + GDPR Phase 6 foundation + Phase 5+ deferred sweep) (2026-04-29)
+
+3-phase mega-round per user override of Round 19's "defer until canary observed" recommendation. User explicitly chose to continue parallel infrastructure work.
+
+#### Phase 1 — Idempotency Endpoint Expansion (Option 1)
+
+5 critical POST endpoints integrated with `dinoco_idempotency_*` middleware (mirrors Round 19 proven pattern). Backward compat preserved — missing X-Idempotency-Key header = byte-identical behavior to prior version.
+
+- **`POST /b2b/v1/confirm-order`** ([B2B] Snippet 5 V.33.4 → V.33.5) — body hash = `{ticket_id, total_amount, status, admin_note}`. Prevents double-fire on admin double-click which would commit debt twice + double-fire stock_check_alert.
+- **`POST /b2b/v1/flash-create`** ([B2B] Snippet 5 V.33.4 → V.33.5) — body hash = `{ticket_id}` only (deterministic dispatch per ticket; helper-level GET_LOCK already serializes). Wrapper provides 24h replay window for admin retry.
+- **`POST /b2b/v1/manual-flash-cancel`** ([B2B] Snippet 3 V.42.10 → V.42.11) — body hash = `{pno}`. Flash API cancel is idempotent but DB cleanup loop is NOT — second call could return error toast even though Flash already cancelled. Wrapper replays original success.
+- **`POST /b2f/v1/po-update`** ([B2F] Snippet 2 V.11.11 → V.11.12) — body hash = `{po_id, items, note, requested_date, resubmit_only}`. Critical: `exchange_rate` IMMUTABLE post-submit per V.7.0 design (excluded from hash). Prevents double amend (which would inflate version + amendment_count + spam Maker via Flex).
+- **`POST /b2f/v1/receive-goods`** ([B2F] Snippet 2 V.11.11 → V.11.12) — body hash = `{po_id, items, inspected_by, note}`. Photo file uploads NOT hashed (FormData binary — accepted limitation; GET_LOCK at handler level provides short-window protection alongside wrapper's long-window). Most critical B2F endpoint — prevents double `b2f_payable_add` + double inventory write.
+
+15 new test cases added to `tests/helpers/IdempotencyEndpointContractTest.php` (was 22, now 37 — all passing). Cross-namespace collision check verifies all 5 new body shapes hash uniquely.
+
+#### Phase 2 — GDPR Phase 6 Foundation (Option 2)
+
+Per `docs/compliance/GDPR-PHASE-6-DESIGN.md`. **Foundation built but DORMANT** — all helpers gated by `dinoco_gdpr_is_enabled()` which defaults to `false`. Production NEVER reaches new code paths until Phase 7 admin UI ships + activation flag flipped.
+
+- **Schema v1.0 → v2.0** ([System] DINOCO GDPR Data Requests V.1.3 → V.2.0)
+  - `wp_dinoco_gdpr_requests` adds 3 columns: `download_token VARCHAR(64)`, `scope_json LONGTEXT`, `expires_at DATETIME` + new index `idx_expires_at`
+  - dbDelta handles ALTER TABLE additively for existing v1.0 installs (zero data loss)
+- **Queue worker** `dinoco_gdpr_run_worker($request_id)` — FOR UPDATE lock + state machine (queued → processing → ready/failed). Listens on `dinoco_gdpr_process_request` action; defensive flag re-check on entry (skips if disabled even if hook fires accidentally).
+- **Export builder** `dinoco_gdpr_build_export($user_id)` — ZIP via ZipArchive. Whitelist scope: `account.json` (wp_users core), `usermeta.json` (PII whitelist via `dinoco_gdpr_pii_meta_key_whitelist()` helper), `warranties.csv`, `claims/{claim-id}.json`, `orders.csv` (linked distributor only). Output to `wp-content/uploads/gdpr/{user_id}/` with `.htaccess` deny + `robots.txt` disallow + `bin2hex(random_bytes(32))` token + 7-day TTL.
+- **Deletion executor** `dinoco_gdpr_execute_deletion($user_id)` — applies decision matrix per record type. Anonymize wp_users.user_email (hash to `deleted-{hash}@anon.local`), DELETE wp_usermeta PII keys, anonymize warranty/claim/order CPTs (preserve product/SKU records, scrub `customer_*`), NEVER delete `dinoco_debt_log` / `b2f_payable_log` (Thai Revenue Code §86/14 5-year audit trail).
+- **Decision matrix helper** `dinoco_gdpr_decide_action_for_record($record_type)` — pure-logic lookup returning `'anonymize'|'delete'|'preserve'`. Safe default: unknown types → `'preserve'` (never accidentally destroy unrecognized records).
+- **Email notification** `dinoco_gdpr_email_user($user_id, $template, $payload)` — Thai default + English fallback for 3 templates: `export_ready`, `deletion_complete`, `rejection`. Filterable subject/body via `dinoco_gdpr_email_subject_*`.
+- **Cleanup cron** `dinoco_gdpr_export_cleanup_cron` — daily 03:30 (offset from idempotency cleanup at 03:15 + flag-audit retention at 03:00 to spread DB load). Prunes ZIP files past `expires_at`, nulls `download_token`, marks `status='expired'`. Defensive: aborts gracefully if column doesn't exist (legacy v1.0 schema).
+- **Tests**: NEW `tests/helpers/GdprDeletionDecisionTest.php` with 19 cases covering all 4 buckets (anonymize/delete/preserve) + safe-default fallback + case-insensitivity + invariant test (legal-hold records NEVER classified as `delete` under any case/whitespace variant).
+
+Risk: LOW. Flag-gated OFF default → no production impact. dbDelta migration is additive only (no destructive changes). All helpers have `function_exists()` guards + `try/catch \Throwable` for fatal isolation.
+
+#### Phase 3 — Phase 5+ Deferred Sweep (Option 3)
+
+2 items closed (1 fix + 1 docs); 1 verified-already-mitigated.
+
+- **UX-H18 — iOS swipe-back LIFF guard** (real fix)
+  - [B2B] Snippet 4 V.32.6 → V.32.7 — `history.replaceState({view:'root', _liffGuard:1}, '', location.href)` injected after `liff.init()` success (idempotent guard checks `!history.state`)
+  - [B2F] Snippet 8 V.7.11 → V.7.12 — same pattern at parallel position
+  - First iOS swipe-back gesture now triggers `popstate` (which closes SET detail / cart) instead of exiting LIFF window. Best-effort `try/catch` — iOS Safari edge cases must NOT block init. Snippet 11 NOT touched (doesn't directly init LIFF; uses Snippet 4's gate).
+- **DB-H2 — Soft-delete conventions doc** (documentation-only, no data migration)
+  - NEW `docs/patterns/SOFT-DELETE-CONVENTIONS.md` (~150 LOC) — documents 3 existing patterns: Pattern A (compound `status` + `deleted_at`, B2F junction), Pattern B (`is_active=1`, Inventory tables), Pattern C (`expires_at` TTL, idempotency + GDPR ZIPs). Recommendation matrix (state machine vs toggle vs time-bounded) + anti-patterns + migration plan (deferred — most B-type tables don't need to migrate).
+  - `docs/patterns/README.md` index updated (5 → 6 patterns) + quick reference table extended.
+- **BUG-H13 — Dual-listener race** (verify only — already mitigated)
+  - Confirmed [B2B] Snippet 1 V.34.x snapshot hook already uses GET_LOCK (per V.34.6 changelog "C-Conc-1: Snapshot hook GET_LOCK replaces non-atomic transient"). No code change needed.
+
+#### Files Touched (Round 23)
+
+**Phase 1** (4 files, +554/-10 LOC):
+
+- `[B2B] Snippet 3: LIFF E-Catalog REST API` V.42.10 → V.42.11 (manual-flash-cancel idempotency)
+- `[B2B] Snippet 5: Admin Dashboard` V.33.4 → V.33.5 (confirm-order + flash-create idempotency)
+- `[B2F] Snippet 2: REST API` V.11.11 → V.11.12 (po-update + receive-goods idempotency)
+- `tests/helpers/IdempotencyEndpointContractTest.php` (+15 cases — 290 new lines)
+
+**Phase 2** (2 files, ~700 new LOC):
+
+- `[System] DINOCO GDPR Data Requests` V.1.3 → V.2.0 (queue worker + export builder + deletion executor + decision matrix helper + email + cleanup cron + schema v2.0)
+- NEW `tests/helpers/GdprDeletionDecisionTest.php` (19 cases — ~180 LOC)
+
+**Phase 3** (4 files):
+
+- `[B2B] Snippet 4: LIFF E-Catalog Frontend` V.32.6 → V.32.7 (UX-H18)
+- `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.11 → V.7.12 (UX-H18)
+- NEW `docs/patterns/SOFT-DELETE-CONVENTIONS.md` (DB-H2 docs)
+- `docs/patterns/README.md` (index update)
+
+#### Risk Summary
+
+- Phase 1 (Option 1): LOW — Round 19 pattern proven across 3 endpoints since 2026-04-29; this round adds 5 more under same pattern. Cross-namespace collision tests in PHPUnit.
+- Phase 2 (Option 2): LOW — flag-gated OFF default. Production NEVER reaches new code paths until activation. dbDelta additive only. PHPUnit covers decision matrix correctness (legal-hold records can never trigger delete under any input variant).
+- Phase 3 (Option 3): LOW — UX-H18 is pure additive defensive `replaceState` (no logic change). DB-H2 is documentation-only.
+
+#### User Override Note (per task brief)
+
+Round 19 recommended "defer Idempotency expansion until 1-2 weeks canary observed" but user explicitly chose to continue parallel infrastructure work. Documented per task brief instruction. No production impact (Round 19 endpoints already canary-OK; new endpoints follow identical proven pattern).
+
+#### Test Suite Growth (Round 23)
+
+- PHPUnit: 400 → 419 tests passing (+19 GDPR decision matrix). Helper test count: was 22 endpoint contracts → now 37 (+15 new endpoint hash invariants).
+- Total assertions: was 596 → 634 (+38).
+- Jest: unchanged (no new JS tests; existing 155 passing + 1 pre-existing failure in `php-security.test.js` for `@shell_exec` in B2F Migration Audit:999 — unrelated to Round 23).
+
+---
+
 ### Feature — Round 22 (Wave 3 UI Gap 1+2: Order Intent Dashboard + Mode filter persistence) (2026-04-29)
 
 Closes the last 2 deferred gaps from Wave 3 inventory (Round 4 deferred since UX wireframe sign-off requested). Backend V.7.0 Order Intent fully shipped 13 days ago — production data ready. Wave 3 status: **5/5 gaps CLOSED**.

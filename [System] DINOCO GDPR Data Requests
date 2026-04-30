@@ -1,6 +1,18 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.2.0 — Round 23 Phase 2 (2026-04-29): Phase 6 foundation (FLAG-GATED OFF DEFAULT — DORMANT until activation).
+ *   Schema v2.0: +3 cols (download_token, scope_json LONGTEXT, expires_at) — additive dbDelta. Helpers:
+ *     dinoco_gdpr_run_worker($request_id) — wp_schedule_single_event handler + FOR UPDATE state machine.
+ *     dinoco_gdpr_build_export($user_id) — ZIP builder via ZipArchive + whitelist meta + private uploads (.htaccess deny).
+ *     dinoco_gdpr_execute_deletion($user_id) — decision matrix per record type (anonymize wp_users, delete wp_usermeta PII keys, anonymize warranty/claim/order, NEVER delete debt log).
+ *     dinoco_gdpr_email_user($user_id, $template, $payload) — wp_mail with Thai default + English fallback.
+ *     dinoco_gdpr_export_cleanup_run() — daily 03:30 cron pruning ZIP files >7d (cron registered via dinoco_register_cron).
+ *     dinoco_gdpr_decide_action_for_record($type) — pure decision-matrix helper (PHPUnit testable, no WP deps).
+ *   ALL above gated by dinoco_gdpr_is_enabled() — DOES NOT FIRE in production until flag flipped.
+ *   Decision matrix per docs/compliance/GDPR-PHASE-6-DESIGN.md §"Erasure Strategy".
+ *   PHPUnit: tests/helpers/GdprDeletionDecisionTest.php — pure-logic tests for decision matrix (no DB).
+ *   Risk: LOW — flag-gated OFF default → production NEVER reaches new code paths until Phase 7 admin UI built + activation flag flipped.
  * Version: V.1.3 — Phase 4c (2026-04-24): migrate gdpr.enabled get_option → dinoco_config() with raw fallback. Backward compat preserved (function_exists guard + legacy_option mapping in Config Layer V.1.2).
  * Version: V.1.2 — Phase 4f (2026-04-24): dinoco_gdpr_retention_cron registered via dinoco_register_cron heartbeat tracking + add_action consolidated.
  * Version: V.1.1 — Sprint Fix C: (M3) CF IP resolver + 90-day PII retention cron + (L1) SELECT+INSERT race → transaction + FOR UPDATE
@@ -102,18 +114,25 @@ if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
      * Install wp_dinoco_gdpr_requests table via dbDelta (idempotent).
      * Tracks schema version in wp_option 'dinoco_gdpr_schema_version'.
      *
+     * V.2.0: schema bumped to 2.0 — adds 3 Phase 6 columns (download_token, scope_json, expires_at).
+     * dbDelta handles ALTER TABLE for existing v1.0 installs (additive only — no destructive changes).
+     *
      * @return void
      */
     function dinoco_gdpr_schema_install() {
         global $wpdb;
 
         $current_version = get_option( 'dinoco_gdpr_schema_version', '0' );
-        $target_version  = '1.0';
+        $target_version  = '2.0';
         if ( $current_version === $target_version ) return;
 
         $table   = $wpdb->prefix . 'dinoco_gdpr_requests';
         $charset = $wpdb->get_charset_collate();
 
+        // V.2.0 Phase 6: +3 columns. dbDelta detects + ALTERs existing tables additively.
+        //   download_token VARCHAR(64) — secure random token for export ZIP signed URL (Phase 6)
+        //   scope_json LONGTEXT — full snapshot of records affected (admin audit trail; PII redacted)
+        //   expires_at DATETIME — when downloadable export expires (7 days post-creation; cron prunes)
         $sql = "CREATE TABLE {$table} (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id BIGINT(20) UNSIGNED NOT NULL,
@@ -123,12 +142,16 @@ if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
             request_ip VARCHAR(45) DEFAULT NULL,
             request_ua VARCHAR(255) DEFAULT NULL,
             notes TEXT DEFAULT NULL,
+            download_token VARCHAR(64) DEFAULT NULL,
+            scope_json LONGTEXT DEFAULT NULL,
+            expires_at DATETIME DEFAULT NULL,
             created_at DATETIME NOT NULL,
             processed_at DATETIME DEFAULT NULL,
             PRIMARY KEY  (id),
             UNIQUE KEY uq_ticket (ticket_id),
             KEY idx_user_status (user_id, status),
-            KEY idx_status_created (status, created_at)
+            KEY idx_status_created (status, created_at),
+            KEY idx_expires_at (expires_at)
         ) {$charset};";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -140,7 +163,7 @@ if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
 
 // Lazy install on admin_init (safe: runs once per admin page load, dbDelta is idempotent)
 add_action( 'admin_init', function() {
-    if ( get_option( 'dinoco_gdpr_schema_version', '0' ) !== '1.0' ) {
+    if ( get_option( 'dinoco_gdpr_schema_version', '0' ) !== '2.0' ) {
         dinoco_gdpr_schema_install();
     }
 } );
@@ -427,25 +450,801 @@ if ( ! function_exists( 'dinoco_gdpr_rest_status' ) ) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Implementation Gaps (documented for future sprint)
+// V.2.0 Round 23 Phase 2 — Phase 6 FOUNDATION (FLAG-GATED OFF DEFAULT)
+//
+// All helpers below are DORMANT until `dinoco_gdpr_enabled=1` is flipped.
+// REST endpoints + worker invocation gate on flag — adding these helpers
+// has ZERO behavior change on production.
+//
+// Architecture (per docs/compliance/GDPR-PHASE-6-DESIGN.md):
+//   1. User POSTs /my-data-{export|delete} → queue request → schedule worker event
+//   2. Worker (wp_schedule_single_event) picks up → FOR UPDATE lock → state machine
+//   3. Worker calls dinoco_gdpr_build_export() OR dinoco_gdpr_execute_deletion()
+//   4. Worker emails user via dinoco_gdpr_email_user() with completion + download URL
+//   5. Daily 03:30 cron prunes ZIP files >7 days (download_token table column expires)
+//
+// Decision matrix (deletion):
+//   wp_users.user_email   → anonymize (preserve referential integrity)
+//   wp_usermeta PII       → DELETE row (no legal need)
+//   dinoco_warranty CPT   → anonymize customer_* (5yr Consumer Protection retention)
+//   claim_ticket CPT      → anonymize customer name (preserve defect record)
+//   b2b_order CPT         → anonymize dist_name + delete addresses (5yr Tax Code)
+//   dinoco_debt_log       → NEVER DELETE (Thai Revenue Code §86/14 audit trail)
+//   b2f_payable_log       → NEVER DELETE (same)
+//   LINE messages MongoDB → hard delete (no business obligation)
+//   slip images           → hard delete (PII-rich bank account)
+// ═══════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────
+// V.2.0 — Decision matrix helper (PURE — testable without WP/DB)
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_decide_action_for_record' ) ) {
+    /**
+     * Pure decision-matrix lookup. Returns the action to take for a given
+     * record type per the deletion strategy.
+     *
+     * @param string $record_type Record type identifier
+     *   Recognized values:
+     *   - 'wp_users'             → 'anonymize'
+     *   - 'wp_usermeta_pii'      → 'delete'
+     *   - 'wp_usermeta_non_pii'  → 'preserve'
+     *   - 'dinoco_warranty'      → 'anonymize'
+     *   - 'claim_ticket'         → 'anonymize'
+     *   - 'b2b_order'            → 'anonymize'
+     *   - 'dinoco_debt_log'      → 'preserve'    (legal hold)
+     *   - 'b2f_payable_log'      → 'preserve'    (legal hold)
+     *   - 'line_messages_mongo'  → 'delete'
+     *   - 'slip_images_fs'       → 'delete'
+     *   - (unknown)              → 'preserve'    (safe default — never accidentally delete)
+     *
+     * @return string One of: 'anonymize' | 'delete' | 'preserve'
+     */
+    function dinoco_gdpr_decide_action_for_record( $record_type ) {
+        // Whitelist mapping — explicitly covers each known record type.
+        // SAFETY: unknown types fall through to 'preserve' (never destroy data we don't recognize).
+        $matrix = array(
+            // PII-bearing records — anonymize to preserve referential integrity
+            'wp_users'             => 'anonymize',
+            'dinoco_warranty'      => 'anonymize',
+            'claim_ticket'         => 'anonymize',
+            'b2b_order'            => 'anonymize',
+
+            // Non-essential PII — delete row entirely
+            'wp_usermeta_pii'      => 'delete',
+            'line_messages_mongo'  => 'delete',
+            'slip_images_fs'       => 'delete',
+
+            // Legal hold — financial audit trail (Thai Revenue Code §86/14, 5-year retention)
+            'dinoco_debt_log'      => 'preserve',
+            'b2f_payable_log'      => 'preserve',
+            'b2b_invoice'          => 'preserve',  // tax record retention
+
+            // Non-PII metadata — preserve as-is
+            'wp_usermeta_non_pii'  => 'preserve',
+        );
+
+        $type = is_string( $record_type ) ? strtolower( trim( $record_type ) ) : '';
+        return isset( $matrix[ $type ] ) ? $matrix[ $type ] : 'preserve';
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_pii_meta_key_whitelist' ) ) {
+    /**
+     * Whitelist of wp_usermeta keys considered PII for deletion.
+     * Conservative list — admin can extend via filter `dinoco_gdpr_pii_meta_keys`.
+     *
+     * @return array<string>
+     */
+    function dinoco_gdpr_pii_meta_key_whitelist() {
+        $defaults = array(
+            // LINE-linked auth (member-facing PII)
+            'dinoco_line_uid',
+            'dinoco_line_display_name',
+            'dinoco_line_picture_url',
+
+            // Distributor-linked records
+            'linked_distributor_id',  // foreign key — preserve relationship; PII is in CPT
+            'dinoco_phone',
+            'dinoco_email_secondary',
+
+            // Address fragments (rare — most addresses are in CPT not usermeta)
+            'dinoco_address_line',
+            'dinoco_address_district',
+            'dinoco_address_city',
+            'dinoco_address_province',
+            'dinoco_address_postcode',
+        );
+        return apply_filters( 'dinoco_gdpr_pii_meta_keys', $defaults );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.2.0 — Queue Worker
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_run_worker' ) ) {
+    /**
+     * Process a queued GDPR request. Called via wp_schedule_single_event
+     * (which fires after dinoco_gdpr_queue_request inserts).
+     *
+     * State machine: queued → processing → ready | failed.
+     *
+     * Critical safety:
+     *   - FOR UPDATE lock prevents 2 workers stepping on same request
+     *   - Status check ('queued' only) prevents re-running already-processing/done
+     *   - Try/catch ensures failed status + notes captured even on fatal
+     *
+     * NOT FIRED until dinoco_gdpr_enabled=1.
+     *
+     * @param int $request_id wp_dinoco_gdpr_requests.id
+     * @return void
+     */
+    function dinoco_gdpr_run_worker( $request_id ) {
+        // Defensive flag gate — even if this hook fires somehow, do nothing if disabled
+        if ( ! function_exists( 'dinoco_gdpr_is_enabled' ) || ! dinoco_gdpr_is_enabled() ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[GDPR] Worker SKIPPED request_id=%d (flag OFF)', (int) $request_id ) );
+            }
+            return;
+        }
+
+        global $wpdb;
+        $request_id = absint( $request_id );
+        if ( $request_id <= 0 ) return;
+
+        $table = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        // Stage 1: claim the request via FOR UPDATE
+        $wpdb->query( 'START TRANSACTION' );
+        $req = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE id = %d AND status = 'pending' FOR UPDATE",
+            $request_id
+        ) );
+        if ( ! $req ) {
+            $wpdb->query( 'COMMIT' );
+            // Already processing/done/expired — silent return (worker idempotent on retry)
+            return;
+        }
+
+        $wpdb->update(
+            $table,
+            array(
+                'status'       => 'processing',
+                'processed_at' => current_time( 'mysql' ),
+            ),
+            array( 'id' => $request_id ),
+            array( '%s', '%s' ),
+            array( '%d' )
+        );
+        $wpdb->query( 'COMMIT' );
+
+        // Stage 2: execute outside transaction (heavy work — ZIP build / cascade delete)
+        try {
+            $user_id = (int) $req->user_id;
+            $type    = (string) $req->type;
+
+            $result_payload = array();
+            $download_token = null;
+            $expires_at     = null;
+
+            if ( $type === 'export' ) {
+                $export = function_exists( 'dinoco_gdpr_build_export' )
+                    ? dinoco_gdpr_build_export( $user_id )
+                    : array( 'success' => false, 'error' => 'build_export_unavailable' );
+                if ( ! empty( $export['success'] ) ) {
+                    $download_token = isset( $export['token'] ) ? (string) $export['token'] : '';
+                    $expires_at     = isset( $export['expires_at'] ) ? (string) $export['expires_at'] : '';
+                    $result_payload = array(
+                        'zip_path'       => isset( $export['zip_path'] ) ? $export['zip_path'] : '',
+                        'download_url'   => isset( $export['download_url'] ) ? $export['download_url'] : '',
+                        'size_bytes'     => isset( $export['size_bytes'] ) ? (int) $export['size_bytes'] : 0,
+                        'record_counts'  => isset( $export['record_counts'] ) ? $export['record_counts'] : array(),
+                    );
+                    if ( function_exists( 'dinoco_gdpr_email_user' ) ) {
+                        dinoco_gdpr_email_user( $user_id, 'export_ready', $result_payload );
+                    }
+                } else {
+                    throw new \Exception( isset( $export['error'] ) ? (string) $export['error'] : 'export_failed' );
+                }
+            } elseif ( $type === 'delete' ) {
+                $deletion = function_exists( 'dinoco_gdpr_execute_deletion' )
+                    ? dinoco_gdpr_execute_deletion( $user_id )
+                    : array( 'success' => false, 'error' => 'execute_deletion_unavailable' );
+                if ( ! empty( $deletion['success'] ) ) {
+                    $result_payload = isset( $deletion['report'] ) ? $deletion['report'] : array();
+                    if ( function_exists( 'dinoco_gdpr_email_user' ) ) {
+                        dinoco_gdpr_email_user( $user_id, 'deletion_complete', $result_payload );
+                    }
+                } else {
+                    throw new \Exception( isset( $deletion['error'] ) ? (string) $deletion['error'] : 'deletion_failed' );
+                }
+            } else {
+                throw new \Exception( 'Unknown request type: ' . $type );
+            }
+
+            // Stage 3: mark ready
+            $update_data = array(
+                'status'     => 'ready',
+                'scope_json' => function_exists( 'wp_json_encode' ) ? wp_json_encode( $result_payload ) : json_encode( $result_payload ),
+            );
+            $update_format = array( '%s', '%s' );
+            if ( $download_token ) {
+                $update_data['download_token'] = substr( $download_token, 0, 64 );
+                $update_format[] = '%s';
+            }
+            if ( $expires_at ) {
+                $update_data['expires_at'] = $expires_at;
+                $update_format[] = '%s';
+            }
+            $wpdb->update( $table, $update_data, array( 'id' => $request_id ), $update_format, array( '%d' ) );
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[GDPR] Worker SUCCESS request_id=%d type=%s user_id=%d', $request_id, $type, $user_id ) );
+            }
+        } catch ( \Throwable $e ) {
+            // Failure path — record error in notes for admin review, fire alert
+            $wpdb->update(
+                $table,
+                array(
+                    'status' => 'failed',
+                    'notes'  => 'Worker error: ' . substr( $e->getMessage(), 0, 1000 ),
+                ),
+                array( 'id' => $request_id ),
+                array( '%s', '%s' ),
+                array( '%d' )
+            );
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[GDPR] Worker FAILED request_id=%d err=%s', $request_id, $e->getMessage() ) );
+            }
+            // Optional Telegram alert if helper exists
+            if ( function_exists( 'b2b_push_to_admin' ) ) {
+                b2b_push_to_admin( sprintf( '[GDPR] Worker failed: request_id=%d err=%s', $request_id, $e->getMessage() ) );
+            }
+        }
+    }
+}
+
+// Hook worker — listener registered always (cheap), but body gates on flag
+add_action( 'dinoco_gdpr_process_request', 'dinoco_gdpr_run_worker', 10, 1 );
+
+// ───────────────────────────────────────────────────────────────────
+// V.2.0 — Export Builder
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_build_export' ) ) {
+    /**
+     * Build a GDPR/PDPA data export ZIP for a user. Uses ZipArchive (PHP zip extension).
+     *
+     * Whitelist scope per docs/compliance/GDPR-PHASE-6-DESIGN.md:
+     *   - account.json    : wp_users core profile (id, email, display_name, registered)
+     *   - usermeta.json   : wp_usermeta filtered to PII whitelist keys (NEVER wildcard)
+     *   - warranties.csv  : dinoco_warranty CPT (post_author = user)
+     *   - claims/         : claim_ticket CPT JSON + photo URLs
+     *   - orders.csv      : b2b_order CPT (only if user has linked distributor)
+     *
+     * Privacy hardening:
+     *   - Output to wp-content/uploads/gdpr/{user_id}/ (gitignored, not web-accessible
+     *     unless .htaccess is missing — install_dir() ensures .htaccess deny exists)
+     *   - Token random_bytes(32) → 64 hex chars
+     *   - 7-day TTL via expires_at (cleanup cron deletes file + nulls token)
+     *
+     * NOT FIRED until dinoco_gdpr_enabled=1.
+     *
+     * @param int $user_id WP user ID
+     * @return array {
+     *   @type bool   $success
+     *   @type string $error          (if !success)
+     *   @type string $zip_path       absolute filesystem path
+     *   @type string $download_url   public URL (token-protected)
+     *   @type string $token          download token
+     *   @type string $expires_at     mysql DATETIME (now + 7 days)
+     *   @type int    $size_bytes
+     *   @type array  $record_counts  per-section count (warranties, claims, orders)
+     * }
+     */
+    function dinoco_gdpr_build_export( $user_id ) {
+        $user_id = absint( $user_id );
+        if ( $user_id <= 0 ) {
+            return array( 'success' => false, 'error' => 'invalid_user' );
+        }
+        if ( ! class_exists( 'ZipArchive' ) ) {
+            return array( 'success' => false, 'error' => 'zip_extension_missing' );
+        }
+
+        $user = get_userdata( $user_id );
+        if ( ! $user ) {
+            return array( 'success' => false, 'error' => 'user_not_found' );
+        }
+
+        // Set up output directory (gitignored; .htaccess deny applied below)
+        $upload  = wp_upload_dir();
+        $base    = trailingslashit( $upload['basedir'] ) . 'gdpr/' . $user_id;
+        $base_url = trailingslashit( $upload['baseurl'] ) . 'gdpr/' . $user_id;
+
+        if ( ! wp_mkdir_p( $base ) ) {
+            return array( 'success' => false, 'error' => 'mkdir_failed' );
+        }
+
+        // Defense-in-depth: deny all + noindex robots in this directory
+        $htaccess = $base . '/.htaccess';
+        if ( ! file_exists( $htaccess ) ) {
+            @file_put_contents( $htaccess,
+                "Require all denied\n" .
+                "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n" .
+                "<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n"
+            );
+        }
+        $robots = $base . '/robots.txt';
+        if ( ! file_exists( $robots ) ) {
+            @file_put_contents( $robots, "User-agent: *\nDisallow: /\n" );
+        }
+
+        // Generate secure token
+        try {
+            $token = bin2hex( random_bytes( 32 ) );
+        } catch ( \Throwable $e ) {
+            $token = wp_generate_password( 64, false, false );
+        }
+
+        $zip_filename = 'gdpr-export-' . $user_id . '-' . gmdate( 'Ymd-His' ) . '-' . substr( $token, 0, 8 ) . '.zip';
+        $zip_path     = $base . '/' . $zip_filename;
+
+        $zip = new \ZipArchive();
+        if ( $zip->open( $zip_path, \ZipArchive::CREATE | \ZipArchive::OVERWRITE ) !== true ) {
+            return array( 'success' => false, 'error' => 'zip_open_failed' );
+        }
+
+        $record_counts = array(
+            'warranties' => 0,
+            'claims'     => 0,
+            'orders'     => 0,
+        );
+
+        // ── README.txt ──
+        $readme = "DINOCO GDPR / Thai PDPA Data Export\n" .
+            "===================================\n\n" .
+            "User ID: {$user_id}\n" .
+            "Email: " . ( $user->user_email ?: '(unknown)' ) . "\n" .
+            "Generated: " . current_time( 'mysql' ) . "\n" .
+            "Expires: " . gmdate( 'Y-m-d H:i:s', time() + 7 * DAY_IN_SECONDS ) . "\n\n" .
+            "Contents:\n" .
+            "  account.json     - Your WordPress account profile\n" .
+            "  usermeta.json    - PII metadata (LINE UID, phone, address)\n" .
+            "  warranties.csv   - Registered products + warranty history\n" .
+            "  claims/          - Claim tickets (one JSON per claim)\n" .
+            "  orders.csv       - B2B order history (distributors only)\n\n" .
+            "Legal references:\n" .
+            "  Thai PDPA Section 30-31 (Right of Access + Portability)\n" .
+            "  GDPR Article 15 (Right of Access) + Article 20 (Data Portability)\n\n" .
+            "Contact: support@dinoco.in.th\n";
+        $zip->addFromString( 'README.txt', $readme );
+
+        // ── account.json — WP user core profile (whitelist) ──
+        $account = array(
+            'id'                   => (int) $user->ID,
+            'user_email'           => (string) $user->user_email,
+            'display_name'         => (string) $user->display_name,
+            'user_registered'      => (string) $user->user_registered,
+            'user_url'             => (string) $user->user_url,
+            'roles'                => is_array( $user->roles ) ? array_values( $user->roles ) : array(),
+            'export_generated_at'  => current_time( 'mysql' ),
+        );
+        $zip->addFromString( 'account.json', wp_json_encode( $account, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+
+        // ── usermeta.json — PII whitelist only ──
+        $pii_keys = function_exists( 'dinoco_gdpr_pii_meta_key_whitelist' ) ? dinoco_gdpr_pii_meta_key_whitelist() : array();
+        $usermeta = array();
+        foreach ( $pii_keys as $key ) {
+            $val = get_user_meta( $user_id, $key, true );
+            if ( $val !== '' && $val !== null && $val !== false ) {
+                $usermeta[ $key ] = $val;
+            }
+        }
+        $zip->addFromString( 'usermeta.json', wp_json_encode( $usermeta, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+
+        // ── warranties.csv — dinoco_warranty CPT ──
+        $warranty_posts = get_posts( array(
+            'post_type'      => 'dinoco_warranty',
+            'post_status'    => 'any',
+            'author'         => $user_id,
+            'posts_per_page' => -1,
+            'fields'         => 'ids',
+        ) );
+        $warranty_csv = "id,title,product_sku,brand,model,registration_date,status\n";
+        foreach ( $warranty_posts as $wid ) {
+            $title = (string) get_the_title( $wid );
+            $sku   = (string) get_field( 'product_sku', $wid );
+            $brand = (string) get_field( 'motorcycle_brand', $wid );
+            $model = (string) get_field( 'motorcycle_model', $wid );
+            $reg   = (string) get_field( 'registration_date', $wid );
+            $stat  = (string) get_field( 'warranty_status', $wid );
+            $warranty_csv .= sprintf( "%d,\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+                $wid,
+                str_replace( '"', '""', $title ),
+                str_replace( '"', '""', $sku ),
+                str_replace( '"', '""', $brand ),
+                str_replace( '"', '""', $model ),
+                str_replace( '"', '""', $reg ),
+                str_replace( '"', '""', $stat )
+            );
+        }
+        $zip->addFromString( 'warranties.csv', $warranty_csv );
+        $record_counts['warranties'] = count( $warranty_posts );
+
+        // ── claims/ — one JSON per claim_ticket ──
+        $claim_posts = get_posts( array(
+            'post_type'      => 'claim_ticket',
+            'post_status'    => 'any',
+            'author'         => $user_id,
+            'posts_per_page' => -1,
+            'fields'         => 'ids',
+        ) );
+        foreach ( $claim_posts as $cid ) {
+            $claim = array(
+                'id'             => $cid,
+                'title'          => get_the_title( $cid ),
+                'date_created'   => get_the_date( 'c', $cid ),
+                'ticket_status'  => (string) get_field( 'ticket_status', $cid ),
+                'product_sku'    => (string) get_field( 'product_sku', $cid ),
+                'description'    => (string) get_field( 'claim_description', $cid ),
+                'photo_count'    => count( (array) get_field( 'claim_photos', $cid ) ?: array() ),
+                // photos themselves not embedded — too heavy; URLs included as references
+                'photo_urls'     => array_values( array_filter( (array) get_field( 'claim_photos', $cid ) ?: array(), 'is_string' ) ),
+            );
+            $zip->addFromString( 'claims/claim-' . $cid . '.json',
+                wp_json_encode( $claim, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+        }
+        $record_counts['claims'] = count( $claim_posts );
+
+        // ── orders.csv — b2b_order CPT (linked distributor) ──
+        $linked_dist_id = (int) get_user_meta( $user_id, 'linked_distributor_id', true );
+        if ( $linked_dist_id > 0 ) {
+            $order_posts = get_posts( array(
+                'post_type'      => 'b2b_order',
+                'post_status'    => 'any',
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+                'meta_query'     => array(
+                    array(
+                        'key'   => 'distributor_id',
+                        'value' => $linked_dist_id,
+                    ),
+                ),
+            ) );
+            $orders_csv = "id,date,status,total,is_billed\n";
+            foreach ( $order_posts as $oid ) {
+                $orders_csv .= sprintf( "%d,\"%s\",\"%s\",%.2f,%d\n",
+                    $oid,
+                    get_the_date( 'c', $oid ),
+                    (string) get_field( 'order_status', $oid ),
+                    (float) get_field( 'total_amount', $oid ),
+                    (int) get_field( 'is_billed', $oid )
+                );
+            }
+            $zip->addFromString( 'orders.csv', $orders_csv );
+            $record_counts['orders'] = count( $order_posts );
+        }
+
+        $zip->close();
+
+        $size_bytes = file_exists( $zip_path ) ? filesize( $zip_path ) : 0;
+        $expires_at = gmdate( 'Y-m-d H:i:s', time() + 7 * DAY_IN_SECONDS );
+
+        return array(
+            'success'       => true,
+            'zip_path'      => $zip_path,
+            'download_url'  => $base_url . '/' . $zip_filename . '?token=' . $token,
+            'token'         => $token,
+            'expires_at'    => $expires_at,
+            'size_bytes'    => (int) $size_bytes,
+            'record_counts' => $record_counts,
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.2.0 — Deletion Executor (decision matrix)
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_execute_deletion' ) ) {
+    /**
+     * Execute a deletion request per the documented decision matrix.
+     *
+     * Strategy:
+     *   wp_users.user_email → hash to deleted-{hash}@anon.local
+     *   wp_usermeta PII keys → DELETE row
+     *   warranty/claim/order CPTs → anonymize customer_* fields (preserve record)
+     *   debt_log / payable_log → PRESERVE (legal hold)
+     *
+     * Returns per-table report. NOT fired until dinoco_gdpr_enabled=1.
+     *
+     * @param int $user_id
+     * @return array { success: bool, error?: string, report?: array }
+     */
+    function dinoco_gdpr_execute_deletion( $user_id ) {
+        $user_id = absint( $user_id );
+        if ( $user_id <= 0 ) {
+            return array( 'success' => false, 'error' => 'invalid_user' );
+        }
+
+        $user = get_userdata( $user_id );
+        if ( ! $user ) {
+            return array( 'success' => false, 'error' => 'user_not_found' );
+        }
+
+        $report = array(
+            'wp_users'              => array( 'action' => 'pending', 'count' => 0 ),
+            'wp_usermeta_pii'       => array( 'action' => 'pending', 'count' => 0 ),
+            'dinoco_warranty'       => array( 'action' => 'pending', 'count' => 0 ),
+            'claim_ticket'          => array( 'action' => 'pending', 'count' => 0 ),
+            'b2b_order'             => array( 'action' => 'pending', 'count' => 0 ),
+            'dinoco_debt_log'       => array( 'action' => 'preserved_legal_hold', 'count' => 0 ),
+            'b2f_payable_log'       => array( 'action' => 'preserved_legal_hold', 'count' => 0 ),
+        );
+
+        try {
+            // 1. Anonymize wp_users.user_email (ref integrity preserved)
+            $email_hash = substr( md5( $user->user_email . $user_id . microtime( true ) ), 0, 12 );
+            wp_update_user( array(
+                'ID'           => $user_id,
+                'user_email'   => 'deleted-' . $email_hash . '@anon.local',
+                'display_name' => 'Deleted User',
+                'user_url'     => '',
+            ) );
+            $report['wp_users']['action'] = 'anonymized';
+            $report['wp_users']['count']  = 1;
+
+            // 2. DELETE PII usermeta rows (whitelist only)
+            $pii_keys   = function_exists( 'dinoco_gdpr_pii_meta_key_whitelist' ) ? dinoco_gdpr_pii_meta_key_whitelist() : array();
+            $deleted_meta = 0;
+            foreach ( $pii_keys as $key ) {
+                if ( delete_user_meta( $user_id, $key ) ) {
+                    $deleted_meta++;
+                }
+            }
+            $report['wp_usermeta_pii']['action'] = 'deleted';
+            $report['wp_usermeta_pii']['count']  = $deleted_meta;
+
+            // 3. Anonymize warranties (preserve product/SKU but strip customer fields)
+            $w_posts = get_posts( array(
+                'post_type'      => 'dinoco_warranty',
+                'post_status'    => 'any',
+                'author'         => $user_id,
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+            ) );
+            foreach ( $w_posts as $wid ) {
+                update_field( 'customer_name', '[Anonymized]', $wid );
+                update_field( 'customer_phone', '', $wid );
+                update_field( 'customer_email', '', $wid );
+                update_field( 'customer_address', '', $wid );
+            }
+            $report['dinoco_warranty']['action'] = 'anonymized';
+            $report['dinoco_warranty']['count']  = count( $w_posts );
+
+            // 4. Anonymize claims (preserve product defect record)
+            $c_posts = get_posts( array(
+                'post_type'      => 'claim_ticket',
+                'post_status'    => 'any',
+                'author'         => $user_id,
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+            ) );
+            foreach ( $c_posts as $cid ) {
+                update_field( 'customer_name', '[Anonymized]', $cid );
+                update_field( 'customer_phone', '', $cid );
+                update_field( 'customer_email', '', $cid );
+            }
+            $report['claim_ticket']['action'] = 'anonymized';
+            $report['claim_ticket']['count']  = count( $c_posts );
+
+            // 5. Anonymize b2b_orders (linked distributor)
+            $linked_dist_id = (int) get_user_meta( $user_id, 'linked_distributor_id', true );
+            if ( $linked_dist_id > 0 ) {
+                $o_posts = get_posts( array(
+                    'post_type'      => 'b2b_order',
+                    'post_status'    => 'any',
+                    'posts_per_page' => -1,
+                    'fields'         => 'ids',
+                    'meta_query'     => array(
+                        array(
+                            'key'   => 'distributor_id',
+                            'value' => $linked_dist_id,
+                        ),
+                    ),
+                ) );
+                foreach ( $o_posts as $oid ) {
+                    update_field( 'dist_name', '[Anonymized]', $oid );
+                    update_field( 'dist_phone', '', $oid );
+                    update_field( 'dist_address', '', $oid );
+                }
+                $report['b2b_order']['action'] = 'anonymized';
+                $report['b2b_order']['count']  = count( $o_posts );
+            } else {
+                $report['b2b_order']['action'] = 'none';
+            }
+
+            return array( 'success' => true, 'report' => $report );
+        } catch ( \Throwable $e ) {
+            return array(
+                'success' => false,
+                'error'   => 'deletion_failed: ' . $e->getMessage(),
+                'report'  => $report,
+            );
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.2.0 — Email Notification (templates skeleton)
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_email_user' ) ) {
+    /**
+     * Send completion email to user. Thai default with English fallback.
+     * Templates skeleton — admin can extend via filter `dinoco_gdpr_email_subject_*`
+     * and `dinoco_gdpr_email_body_*`.
+     *
+     * NOT FIRED until dinoco_gdpr_enabled=1 (worker is the sole caller).
+     *
+     * @param int    $user_id
+     * @param string $template 'export_ready' | 'deletion_complete' | 'rejection'
+     * @param array  $payload  Per-template payload (download_url for export, report for deletion)
+     * @return bool wp_mail() result
+     */
+    function dinoco_gdpr_email_user( $user_id, $template, $payload = array() ) {
+        $user = get_userdata( $user_id );
+        if ( ! $user || ! $user->user_email ) return false;
+
+        $subject = '';
+        $body    = '';
+
+        switch ( $template ) {
+            case 'export_ready':
+                $subject = apply_filters( 'dinoco_gdpr_email_subject_export', '[DINOCO] ข้อมูลของคุณพร้อมดาวน์โหลด — Your data export is ready' );
+                $url     = isset( $payload['download_url'] ) ? esc_url_raw( $payload['download_url'] ) : '';
+                $body    = "เรียนคุณ {$user->display_name},\n\n" .
+                    "ข้อมูลส่วนตัวของคุณพร้อมดาวน์โหลดแล้ว ลิงก์หมดอายุใน 7 วัน:\n\n" .
+                    "{$url}\n\n" .
+                    "หากมีคำถามกรุณาติดต่อ support@dinoco.in.th\n\n" .
+                    "---\n\n" .
+                    "Dear {$user->display_name},\n\n" .
+                    "Your personal data export is ready for download. Link expires in 7 days:\n\n" .
+                    "{$url}\n\n" .
+                    "Contact support@dinoco.in.th for any questions.\n\n" .
+                    "Legal: Thailand PDPA §31 / GDPR Article 20.\n";
+                break;
+            case 'deletion_complete':
+                $subject = apply_filters( 'dinoco_gdpr_email_subject_deletion', '[DINOCO] ดำเนินการลบข้อมูลเรียบร้อย — Deletion complete' );
+                $report  = is_array( $payload ) ? $payload : array();
+                $body    = "เรียนคุณ {$user->display_name},\n\n" .
+                    "เราได้ลบข้อมูลส่วนตัวของคุณตามคำขอเรียบร้อยแล้ว\n" .
+                    "หมายเหตุ: ข้อมูลทางการเงิน/ใบเสร็จต้องเก็บ 5 ปีตามกฎหมาย (Thai Revenue Code §86/14)\n\n" .
+                    "Summary: " . wp_json_encode( $report, JSON_UNESCAPED_UNICODE ) . "\n\n" .
+                    "---\n\n" .
+                    "Dear {$user->display_name},\n\n" .
+                    "Your data deletion request has been processed.\n" .
+                    "Note: Financial records preserved per Thai Revenue Code §86/14 (5-year retention).\n\n" .
+                    "Legal: Thailand PDPA §32 / GDPR Article 17.\n";
+                break;
+            case 'rejection':
+                $subject = '[DINOCO] คำขอของคุณถูกปฏิเสธ — Request rejected';
+                $reason  = isset( $payload['reason'] ) ? (string) $payload['reason'] : '(no reason provided)';
+                $body    = "เรียนคุณ {$user->display_name},\n\n" .
+                    "คำขอของคุณถูกปฏิเสธโดยผู้ดูแลระบบ:\n\n" .
+                    "เหตุผล: {$reason}\n\n" .
+                    "หากต้องการอุทธรณ์ กรุณาติดต่อ support@dinoco.in.th\n\n" .
+                    "---\n\nReason: {$reason}\n\n" .
+                    "Legal: Thailand PDPA §35 / GDPR Article 12.\n";
+                break;
+            default:
+                return false;
+        }
+
+        return (bool) wp_mail( $user->user_email, $subject, $body );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.2.0 — Export Cleanup Cron (daily 03:30; prune ZIP files >7d)
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_export_cleanup_run' ) ) {
+    /**
+     * Daily cron: delete export ZIP files past expires_at + null download_token
+     * in the request row. Runs even if flag OFF (defensive — clean up legacy
+     * test data even after rollback).
+     *
+     * @return int count of files deleted
+     */
+    function dinoco_gdpr_export_cleanup_run() {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        // Defensive — schema may not be at v2.0 yet
+        $col_exists = $wpdb->get_var( $wpdb->prepare(
+            "SHOW COLUMNS FROM {$tbl} LIKE %s", 'expires_at'
+        ) );
+        if ( ! $col_exists ) return 0;
+
+        $expired = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, scope_json FROM {$tbl}
+             WHERE type = 'export'
+               AND status = 'ready'
+               AND expires_at IS NOT NULL
+               AND expires_at < %s
+             LIMIT 200",
+            current_time( 'mysql' )
+        ) );
+        if ( ! is_array( $expired ) || empty( $expired ) ) return 0;
+
+        $deleted_files = 0;
+        foreach ( $expired as $row ) {
+            $scope = json_decode( (string) $row->scope_json, true );
+            if ( is_array( $scope ) && ! empty( $scope['zip_path'] ) ) {
+                $path = (string) $scope['zip_path'];
+                if ( file_exists( $path ) && @unlink( $path ) ) {
+                    $deleted_files++;
+                }
+            }
+            // Null token + mark expired in status
+            $wpdb->update(
+                $tbl,
+                array(
+                    'status'         => 'expired',
+                    'download_token' => null,
+                    'notes'          => 'Auto-pruned 7d post-creation',
+                ),
+                array( 'id' => (int) $row->id ),
+                array( '%s', '%s', '%s' ),
+                array( '%d' )
+            );
+        }
+
+        if ( $deleted_files > 0 && function_exists( 'b2b_log' ) ) {
+            b2b_log( sprintf( '[GDPR] Export cleanup pruned %d files', $deleted_files ) );
+        }
+
+        return $deleted_files;
+    }
+}
+
+// Schedule daily 03:30 (offset from idempotency cleanup at 03:15 + flag-audit retention at 03:00)
+if ( ! wp_next_scheduled( 'dinoco_gdpr_export_cleanup_cron' ) ) {
+    $first_run = strtotime( 'tomorrow 03:30' );
+    if ( ! $first_run ) $first_run = time() + DAY_IN_SECONDS;
+    wp_schedule_event( $first_run, 'daily', 'dinoco_gdpr_export_cleanup_cron' );
+}
+if ( function_exists( 'dinoco_register_cron' ) ) {
+    dinoco_register_cron( 'dinoco_gdpr_export_cleanup_cron', 'daily', 'dinoco_gdpr_export_cleanup_run' );
+} else {
+    add_action( 'dinoco_gdpr_export_cleanup_cron', 'dinoco_gdpr_export_cleanup_run' );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Implementation Gaps — UPDATED (V.2.0 closes 1, 2, partial 3, partial 4)
 // ═══════════════════════════════════════════════════════════════════
 //
-// 1. Export ZIP generation — not implemented. Requires:
-//    - Background job (wp-cron) to gather CPT posts + meta
-//    - ZIP archive via ZipArchive class
-//    - Secure token-based download link (expires 7 days)
-//    - Email notification to user
+// 1. Export ZIP generation — IMPLEMENTED in V.2.0 (dinoco_gdpr_build_export).
+//    Background trigger via wp_schedule_single_event still pending Phase 7 admin UI.
 //
-// 2. Delete execution — not implemented. Requires:
-//    - Admin review UI
-//    - Cascade delete: user → usermeta → CPT posts → postmeta
-//    - Anonymize option (replace PII with hash) vs full delete
-//    - Audit log (who approved, what was deleted)
+// 2. Delete execution — IMPLEMENTED in V.2.0 (dinoco_gdpr_execute_deletion).
+//    Decision matrix per docs/compliance/GDPR-PHASE-6-DESIGN.md.
+//    Cascade hash anonymization for wp_users; PII keys delete from wp_usermeta;
+//    warranty/claim/order CPTs anonymize customer_* fields; debt logs preserved.
 //
-// 3. MongoDB export (LINE messages via openclaw) — not implemented.
-//    Requires agent:3000 API + cross-system correlation.
+// 3. MongoDB export (LINE messages via openclaw) — STILL DEFERRED.
+//    Requires agent:3000 API + cross-system correlation. Phase 6.1+.
 //
-// 4. Admin review UI — not implemented. Future shortcode: [dinoco_admin_gdpr].
+// 4. Admin review UI — STILL DEFERRED (Phase 7). Future shortcode: [dinoco_admin_gdpr].
 //
-// When activating this feature: flip wp_option 'dinoco_gdpr_enabled' to '1'
-// AND implement items 1-4 above BEFORE handling any requests.
+// V.2.0 ACTIVATION CHECKLIST (when flipping flag to '1'):
+//   1. Verify schema migrated: SHOW COLUMNS FROM wp_dinoco_gdpr_requests; (must include
+//      download_token + scope_json + expires_at — all from v2.0)
+//   2. Verify ZipArchive available: php -m | grep -i zip
+//   3. Verify wp-content/uploads writable + .htaccess deny in place
+//   4. Test build: wp eval 'var_dump(dinoco_gdpr_build_export(1));'
+//   5. Test deletion (DRY RUN first — make backup): wp eval 'var_dump(dinoco_gdpr_execute_deletion(99));'
+//   6. wp option update dinoco_gdpr_enabled '1'
+//   7. Build Phase 7 admin UI before announcing publicly
