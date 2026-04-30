@@ -10,6 +10,77 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Refactor — Round 7 UX-H3 Phase 4 (stopProp + compound delegation) + PERF cache priming round 3 (2026-04-29)
+
+2 commits closing 2 audit items. Risk: LOW (additive same-behavior refactor + pure cache priming).
+
+**ITEM A — UX-H3 Phase 4: stopProp + compound close-and-call delegation (B2F Snippet 5 V.8.3 → V.8.4, commit `7912225`)**
+
+19 onclick sites migrated (11 static stopProp + 8 compound close-and-call):
+
+(1) **Static stopPropagation containers — 11 sites**:
+
+- Orders module 5 (modal-create-po, modal-receive, modal-payment, modal-detail, modal-bulk-cancel)
+- Makers module 4 (modal-maker, modal-products, modal-bulk-audit-delete, modal-blacklist-viewer)
+- Credit module 2 (modal-credit-history, modal-credit-pay)
+
+Replaces inline `onclick="event.stopPropagation()"` with `data-stop-prop="1"` attribute.
+Single page-level initializer (`_b2fStopPropBound` guard) attaches element-level click
+handler to each match. **Element-level (not document-delegated)** because document capture
+would prevent ALL nested click handlers. Backdrop close still works via existing
+`e.target === bd` check.
+
+(2) **Compound close-and-call (PO Detail action buttons) — 8 sites**:
+Migrates `onclick="closeModal('b2f-modal-detail');B2F_Orders.fn(args)"` to
+`data-action="orders-close-and-call"` + `data-modal-target` + `data-fn` + `data-args`.
+Functions: `editPO, resubmitPO, openReceive, openPayment, rejectLot, completePO, cancelPO,
+reorderPO`. Args passed as `JSON.stringify`-encoded array, `esc()`-escaped for HTML
+attribute (Thai PO numbers safe). Delegation handler in `B2F_Orders` IIFE parses with
+`JSON.parse` + dispatches via `window.B2F_Orders[fnName].apply(args)`. **Function whitelist**
+`_ORDERS_CLOSE_AND_CALL_FNS` (8 keys) prevents arbitrary fn dispatch — security guard.
+Behavior preservation: closeModal runs FIRST then fn — same execution order as legacy
+compound onclick semicolon chain.
+
+Total `onclick=` sites migrated: 19 + 24 + 20 + 19 = **82 of 124**. Remaining ~42:
+
+- Dynamic stopProp+function compounds (5 sites: 1110/1115 PO checkbox+cancel, 3612 confirm
+  pill, 3722/3730 set-inputs container) — defer to Round 8
+- Misc inline onclick on form steppers + dynamic PO card row handlers
+
+Risk: LOW for stopProp (defense-in-depth, backdrop close path unchanged) + LOW-MEDIUM
+for compound (whitelist gate + JSON.parse fail-safe abort). PHP lint clean. JS syntax
+clean (3 script blocks parse OK after stripping PHP).
+
+**ITEM B — PERF cache priming sweep round 3 (B2B Snippet 5 V.33.2 → V.33.3 + Snippet 12 V.31.5 → V.31.6, commit `2882e10`)**
+
+Investigated 4 list endpoints — Slip Monitor (V.1.1 M-4 already optimized via
+`dinoco_slip_monitor_get_dist_names_batch`), Manual Invoice (`_dinoco_inv_get_pending_invoices`
+already calls `update_postmeta_cache`), B2F po-history (V.11.9 already primes maker postmeta) —
+all 3 candidates from Round 7 brief skipped because already optimized.
+
+Real opportunities found in B2B admin dashboard renderers — distributor postmeta NOT primed
+when accessed via `b2b_get_dist_by_group($gid)` inside per-order loops:
+
+(1) **B2B Snippet 5 main admin dashboard render** — `foreach($orders as $o)` reads
+`get_field('shop_name', $dist->ID)` per order. WP_Query primes `b2b_order` metas but NOT
+distributor metas. Per-page render: 50 orders × ~10-15 unique distributors. Fix: pre-resolve
+$dist objects via static cache hit, collect IDs, batch `update_meta_cache('post', $od_dist_ids)`
+before render loop. Saves ~10-30 cold meta reads per page render.
+
+(2) **B2B Snippet 12 Admin LIFF (3 sites)**:
+
+- `[b2b_tracking_entry]` shortcode: 50 awaiting-shipping orders × 6 metas/dist (shop_name,
+  dist_address, dist_district, dist_province, dist_postcode, dist_phone) = ~60-90 cold reads
+- BO ticket map: 20-50 BO tickets × 1 meta / ~10 unique dists = ~30 cold reads
+- Recently shipped today: 20 shipped × 1 meta / ~6 dists = ~6 cold reads
+
+Pattern: pre-resolve via `b2b_get_dist_by_group()` (static cache), collect `$d->ID` values,
+`array_unique` + `array_filter`, single `update_meta_cache` call. Mirrors B2F V.11.9 / Round 5
+sweep / Round 2 priming pattern. Idempotent — `b2b_get_dist_by_group` caches resolved $dist
+objects; pre-warm doesn't double-fetch. No business logic change — pure cache priming.
+
+PHP lint clean (both files).
+
 ### Refactor — Round 6 UX-H3 Phase 3 (closeModal delegation) + Workflow Diagrams (2026-04-29)
 
 2 commits closing 2 audit items. Risk: LOW (additive same-behavior refactor + pure docs work).
