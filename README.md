@@ -7,7 +7,7 @@
 [![Regression Guard](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml)
 [![Coverage Lines](https://img.shields.io/badge/jest_coverage_lines-98.68%25-brightgreen)](coverage/jest/index.html)
 [![Coverage Branches](https://img.shields.io/badge/jest_coverage_branches-85.09%25-green)](coverage/jest/index.html)
-[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-495_passing-brightgreen)](tests/helpers/)
+[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-511_passing-brightgreen)](tests/helpers/)
 [![Jest Tests](https://img.shields.io/badge/jest_tests-156_passing-brightgreen)](tests/jest/)
 [![Mermaid Diagrams](https://img.shields.io/badge/mermaid_diagrams-23-blue)](WORKFLOW-REFERENCE.md)
 
@@ -26,6 +26,7 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 
 Recent infrastructure rounds (Rounds 13-26):
 
+- **Round 27** — Idempotency batch 5 +5 endpoints (18 → 23, ~31% of POST surface). 3 BO endpoints (bo-cancel-item / bo-bulk-fulfill / bo-bulk-cancel) + B2F po-complete + Inventory dip-stock/approve. First batch with 3 bulk-array endpoints — canonical sort pattern proven (admin row reorder ≠ different intent; qty/value field changes still surface 409). +16 contract tests.
 - **Round 26** — Idempotency batch 4 +5 endpoints (13 → 18, ~24% of POST surface) + GDPR V.4.0 LINE messages export from OpenClaw MongoDB (closes deferred Phase 6.1 item from CLAUDE.md scope). +29 tests (16 contract + 13 LINE export normalization).
 - **Round 25** — Idempotency expansion +5 (8 → 13 endpoints) + GDPR 25-day SLA reminder cron. +15 contract tests.
 - **Round 24** — GDPR Phase 7 admin review UI + 6 admin REST endpoints. +28 admin permission tests.
@@ -34,7 +35,7 @@ Recent infrastructure rounds (Rounds 13-26):
 - **Round 21** — Patterns library + cron drift + inline handler regression. +1 drift detector (7 → 8).
 - **Round 19** — Idempotency-Key integrated on 3 critical POST endpoints (place-order, manual-flash-create, create-po). +20 contract tests.
 - **Round 18** — Idempotency Helper foundation V.1.0 (NEW snippet, 5 functions, 25 unit tests). +18 IsTopLevelSet test cases.
-- **Cumulative**: 0 → 495 PHPUnit tests + 0 → 156 Jest tests + 0 → 23 Mermaid diagrams + 0 → 8 drift detectors. ZERO regressions.
+- **Cumulative**: 0 → 511 PHPUnit tests + 0 → 156 Jest tests + 0 → 23 Mermaid diagrams + 0 → 8 drift detectors. ZERO regressions.
 
 See [docs/audit/ROUNDS-1-19-RETROSPECTIVE.md](docs/audit/ROUNDS-1-19-RETROSPECTIVE.md) for full retrospective.
 
@@ -101,11 +102,11 @@ Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-fun
 
 | Suite | Tests | Runtime | Surface |
 |---|---|---|---|
-| PHPUnit Unit | 466 | < 5s | Pure-logic helpers (math/policy) — 23+ test files (Currency, Hierarchy, IsTopLevelSet, IntentBreakdown, ValidateSkuHierarchy, V70SourceSku, FlashEcSuggester, DiscountTier, BoxCalc, BoQty, ShippingResolve, OrderSnapshot, FlashSign, FlagAudit, Idempotency, IdempotencyEndpointContract, GdprDeletionDecision, GdprAdminPermission, +5 more) |
+| PHPUnit Unit | 511 | < 5s | Pure-logic helpers (math/policy) — 23+ test files (Currency, Hierarchy, IsTopLevelSet, IntentBreakdown, ValidateSkuHierarchy, V70SourceSku, FlashEcSuggester, DiscountTier, BoxCalc, BoQty, ShippingResolve, OrderSnapshot, FlashSign, FlagAudit, Idempotency, IdempotencyEndpointContract, GdprDeletionDecision, GdprAdminPermission, +5 more) |
 | PHPUnit Integration | 51 | ~1 min | DB-coupled (FOR UPDATE, GET_LOCK, FSM, REST) |
 | Jest | 156 | < 2s | LIFF foundation + OpenAPI + links + secrets + dangerous-APIs + PHP security + 8 drift detectors (api-contract / JSDoc / DB_ID / shortcode / constants / feature-flags / REST endpoints / cron) |
 | Playwright E2E | 25 × 4 projects | ~9s | Cart + API client + place-order + modal + liff-init + Vite-built bundle smoke in 4 browsers |
-| **Total** | **773** | | |
+| **Total** | **818** | | |
 
 ### Coverage (Jest)
 
