@@ -44,7 +44,7 @@
 
 ### 1.2 Server Architecture
 
-```
+```text
                     +-------------------+
                     |   LINE Platform   |
                     | (Messaging API)   |
@@ -1180,7 +1180,7 @@ Created 2026-04-16 alongside junction table. Drift log for CPT vs junction compa
 
 ### 5.7 Relationships Diagram (Text)
 
-```
+```text
 warranty_registration (B2C)
     └── claim_ticket (1:N) -- ลูกค้าแจ้งเคลม
 
@@ -2176,7 +2176,7 @@ sequenceDiagram
 **Status**: Foundation complete; migration pending. Currently **parallel artifact** — inline rendering in Snippet 4 remains the source of truth for runtime; Vite build is future target.
 
 **Tree structure** (`liff-src/`):
-```
+```text
 liff-src/
 ├── b2b/
 │   └── catalog/
