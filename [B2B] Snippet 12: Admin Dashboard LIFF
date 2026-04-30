@@ -1,11 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  DINOCO B2B — Snippet 12: Admin Dashboard LIFF             ║
+ * ║  Version: V.31.6 — Round 7 PERF: prime distributor postmeta cache before tracking/BO loops ║
  * ║  Version: V.31.5 — exclude manual_invoice from shipping/payment/tracking tabs (BUG follow-up V.30.8/V.30.9) ║
  * ║  Version: V.31.4 — UX-C2: migrate 9 confirm/alert dialogs to dinocoModal via _liffCfm/_liffAlert (native fallback) ║
  * ║  Version: V.31.3 — custom table stock list (source of truth)  ║
  * ║  DB_ID: 65                                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * V.31.6 (Round 7 PERF cache priming sweep round 3):
+ * - tracking-entry shortcode [b2b_tracking_entry] (line ~1685): pre-resolve distributor IDs from
+ *   $orders source_group_id meta + update_meta_cache('post', $dist_ids) before per-order loop. Loop
+ *   reads shop_name/dist_address/dist_district/dist_province/dist_postcode/dist_phone (6 metas/dist).
+ *   With 50 awaiting-shipping orders spanning ~10-15 unique distributors, this saves ~60-90 cold reads.
+ * - BO ticket map [b2b_admin_dashboard] (line ~1339): same pattern for $bo_tickets — prime distributor
+ *   postmeta before loop reads shop_name. Saves ~30 cold reads on 20-50 BO tickets / ~10 unique dists.
+ * - Shipped today loop (line ~1755): also primes — 6 unique dists typical for 20 recent_shipped.
+ * - WP_Query auto-primes b2b_order postmeta but NOT cross-referenced distributor postmeta. Mirrors
+ *   B2F V.11.9 / Round 5 sweep / Round 2 priming pattern.
+ * - No business logic change — pure cache-priming. b2b_get_dist_by_group() static cache preserved.
  *
  * V.31.5: BUG FIX — Manual Invoice ติดในหน้า Admin LIFF ผิด
  * - Shipping tab (line 339-341) — exclude manual_invoice
@@ -1339,6 +1352,23 @@ function b2b_render_stock_manager_page() {
     $bo_tickets = get_posts(array('post_type'=>'b2b_order','posts_per_page'=>-1,'post_status'=>'publish',
         'meta_query'=>array(array('key'=>'order_status','value'=>'backorder'))));
 
+    // V.31.6 PERF Round 7: Pre-resolve + prime distributor postmeta cache before loop.
+    // Loop reads shop_name from $dist->ID per BO ticket. WP_Query auto-primes b2b_order metas
+    // but NOT cross-referenced distributor metas. Pre-resolve $dist via b2b_get_dist_by_group()
+    // (static cache) then prime in single update_meta_cache call → all subsequent get_field reads
+    // hit warm cache. Idempotent — b2b_get_dist_by_group caches resolved $dist objects.
+    if ( ! empty( $bo_tickets ) && function_exists( 'b2b_get_dist_by_group' ) ) {
+        $bo_dist_ids = array();
+        foreach ( $bo_tickets as $bt ) {
+            $gid_seed = get_field( 'source_group_id', $bt->ID );
+            if ( ! $gid_seed ) continue;
+            $d = b2b_get_dist_by_group( $gid_seed );
+            if ( $d && isset( $d->ID ) ) $bo_dist_ids[] = (int) $d->ID;
+        }
+        $bo_dist_ids = array_values( array_unique( array_filter( $bo_dist_ids ) ) );
+        if ( ! empty( $bo_dist_ids ) ) update_meta_cache( 'post', $bo_dist_ids );
+    }
+
     // Build SKU → BO tickets map
     $bo_map = array();
     foreach ($bo_tickets as $bt) {
@@ -1694,6 +1724,24 @@ function b2b_render_tracking_entry_page() {
         ),
         'orderby'=>'date','order'=>'ASC'));
 
+    // V.31.6 PERF Round 7: Pre-resolve + prime distributor postmeta cache before tracking loop.
+    // Loop reads 6 metas per distributor (shop_name, dist_address, dist_district, dist_province,
+    // dist_postcode, dist_phone). WP_Query auto-primes b2b_order metas but NOT distributor metas.
+    // Pre-resolve via b2b_get_dist_by_group() (static cache) → batch update_meta_cache → warm reads.
+    if ( ! empty( $orders ) && function_exists( 'b2b_get_dist_by_group' ) ) {
+        $tr_dist_ids = array();
+        foreach ( $orders as $o_seed ) {
+            $tn_seed = get_field( 'tracking_number', $o_seed->ID );
+            if ( ! empty( $tn_seed ) ) continue; // skip already-tracked
+            $gid_seed = get_field( 'source_group_id', $o_seed->ID );
+            if ( ! $gid_seed ) continue;
+            $d = b2b_get_dist_by_group( $gid_seed );
+            if ( $d && isset( $d->ID ) ) $tr_dist_ids[] = (int) $d->ID;
+        }
+        $tr_dist_ids = array_values( array_unique( array_filter( $tr_dist_ids ) ) );
+        if ( ! empty( $tr_dist_ids ) ) update_meta_cache( 'post', $tr_dist_ids );
+    }
+
     $tier_red = array(); $tier_yellow = array(); $tier_green = array();
     $shop_map = array(); // shop_name => [orders]
     foreach ($orders as $o) {
@@ -1753,6 +1801,22 @@ function b2b_render_tracking_entry_page() {
             ),
         ),
         'orderby'=>'date','order'=>'DESC'));
+    // V.31.6 PERF Round 7: Pre-resolve + prime distributor postmeta cache before recent_shipped loop.
+    // Loop reads shop_name from $dist->ID per shipped order. Same pattern as above. Saves ~6 cold reads
+    // for typical 20 shipped_orders / ~6 unique distributors.
+    if ( ! empty( $shipped_orders ) && function_exists( 'b2b_get_dist_by_group' ) ) {
+        $sh_dist_ids = array();
+        foreach ( $shipped_orders as $o_seed ) {
+            $sd_seed = get_field( 'shipped_date', $o_seed->ID );
+            if ( ! $sd_seed || strtotime( $sd_seed ) < $today_start ) continue; // skip non-today (matches loop guard)
+            $gid_seed = get_field( 'source_group_id', $o_seed->ID );
+            if ( ! $gid_seed ) continue;
+            $d = b2b_get_dist_by_group( $gid_seed );
+            if ( $d && isset( $d->ID ) ) $sh_dist_ids[] = (int) $d->ID;
+        }
+        $sh_dist_ids = array_values( array_unique( array_filter( $sh_dist_ids ) ) );
+        if ( ! empty( $sh_dist_ids ) ) update_meta_cache( 'post', $sh_dist_ids );
+    }
     $recent_shipped = array();
     foreach ($shipped_orders as $o) {
         $sd = get_field('shipped_date', $o->ID);
