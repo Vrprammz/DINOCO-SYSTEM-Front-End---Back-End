@@ -10,6 +10,49 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fix — Round 17 (MCP Bridge architecture diagram + Brand Voice flow + more unit tests) (2026-04-29)
+
+After Round 16 closed +31 unit tests + 2 Mermaid diagrams + master regression index, Round 17 continues safe polish: 4 new Mermaid diagrams documenting the largest API namespace (MCP Bridge — 32 endpoints) + Brand Voice Pool entry lifecycle, plus 2 more unit test suites covering V.7.0 intent breakdown aggregator + Snippet 15 hierarchy validator. Test suite grows 283 → 320 (+13.1%). Cumulative diagrams 18 → 22.
+
+#### ITEM A — MCP Bridge architecture + Brand Voice flow (+4 Mermaid, commit `d9fc51e`)
+
+- **§13 MCP Bridge Architecture** (`WORKFLOW-REFERENCE.md` +99 LOC) — first comprehensive doc for the largest namespace (`/wp-json/dinoco-mcp/v1/` × 32 endpoints, `[System] DINOCO MCP Bridge` V.2.3, DB_ID 1050). Cross-ref code lines 9-44 (header), 61-90 (atomic key gen), 93-1090 (32 routes). Includes `graph TB` diagram (clients → X-API-Key auth → 6 categories → subsystems + cache layer) + `sequenceDiagram` (atomic key gen via `add_option` per V.2.3 API-H2 + `hash_equals` verify flow). Captures all 6 endpoint categories: Core lookup × 8 / Manual claims × 4 / KB+BV × 2 / Lead Pipeline P1 × 5 / Phase 2 reads × 7 / Phase 3 webhooks × 5. Documents 4 external clients (OpenClaw / Claude Desktop / Telegram / Admin) + 5 subsystem integration points + cache layer (transients per endpoint TTL).
+- **§14 Brand Voice Pool Flow** (`WORKFLOW-REFERENCE.md` +64 LOC) — `[Admin System] DINOCO Brand Voice Pool` V.2.11 (DB_ID 1159). Includes `sequenceDiagram` covering 4 phases (Ingest → AI Classify → Review/Action → Daily expire) with 7 participants (social listener, REST, CPT, Gemini AI, Admin, transient cache, cron). Plus `graph LR` diagram visualizing V.2.11 stats cache strategy (5-min TTL transient + 3 invalidation hooks — eliminates 219K cache lookups per stats request per the V.2.11 MED-3 fix).
+- **Gotchas documented**: X-API-Key vs X-MCP-Key (legacy doc typo), key rotation procedure, OpenClaw separate `dinoco_openclaw_api_key`, per-$days transient keys, Gemini direct (not via OpenClaw agent), bv_dup_md5 1-day guard, brands enum hardcoded.
+- **Risk**: NONE — pure docs.
+
+#### ITEM B — +37 unit tests for V.7.0 intent + hierarchy validator (commit `bc111e0`)
+
+- **`IntentBreakdownTest.php`** (21 tests, 38 assertions) — Locks `b2f_compute_intent_breakdown()` aggregation logic (Snippet 2 V.11.0 lines 2712-2727 REST + Snippet 1 V.7.0 §100.6 lines 4055-4068 fallback). 4-key counter feeds 5 UI sites (Flex card, PO Image, PO Ticket, Maker LIFF, Admin LIFF SET Detail). Coverage: empty/null/non-array, single mode, mixed, ACF vs REST shape (with REST precedence test), empty mode, missing key, unknown enum, type coercion (str/float/neg), malformed items, legacy V.6 PO backward compat, schema invariants (total ≥ bucket sum, 4-key shape).
+- **`ValidateSkuHierarchyTest.php`** (16 tests, 40 assertions) — Locks `dinoco_validate_sku_hierarchy()` pre-save validator (Snippet 15 V.7.1+ lines 1769-1804). Guards Admin Inventory V.42.x save_sku_relation endpoint — bypass would corrupt hierarchy → DD-2 stock cut chain explodes (infinite recursion in `dinoco_get_leaf_skus`). Coverage: self-ref (case-insensitive + trim), circular (2-level + 3-level), depth violation (chain + parent already has grandchildren), allowed cases (empty set, existing child, DD-3 shared leaf, unrelated), edge cases (case insensitive parent lookup, whitespace trim, exactly depth 3 boundary).
+- **Suite size**: 283 → 320 tests (+37, +13.1%), 424 → 502 assertions (+78). All green. Zero failures, zero errors. PHP 8.5.4 runtime.
+- **Pattern**: same isolation boundary as existing helpers (`HierarchyTest`, `OrderModeLabelTest`) — inline copy of pure logic, `function_exists` guard for cross-test compat, `declare(strict_types=1)`, no WP boot, no DB.
+- **Risk**: NONE — additive tests only.
+
+#### ITEM C — Health check (this entry, no separate commit)
+
+Verified all test infrastructure green after 17 rounds:
+
+- **PHPUnit**: 320 tests, 502 assertions, 1 deprecation (PHPUnit 11 minor — pre-existing). Runtime ~12ms full suite.
+- **Jest**: 19 suites, 146 passed, 2 skipped. Runtime ~1.2s.
+- **markdownlint-cli**: 0 MD040 / 0 MD060 / 0 MD012 in new sections (28 MD013 line-length hits in §13/§14 — same pattern as existing file, not regressions).
+- **php -l smoke**: 5 referenced snippets (B2F Snippet 1, B2F Snippet 2, B2B Snippet 15, MCP Bridge, Brand Voice Pool) all syntactically valid (Brand Voice false-positive resolved with `<?php` prepend per WP Code Snippets convention).
+
+#### Cumulative impact (Rounds 1-17)
+
+- Tests: 0 → 320 (+320 across 17 rounds)
+- Mermaid diagrams: 0 → 22 (+4 this round)
+- Drift detectors: 0 → 7
+- Doc index files: 0 → 1 (regression manifest)
+- Audit findings closed: 38+ (UX-H3, onerror sweeps, PERF guards, Flag Audit Log, etc.)
+
+#### Files Touched (Round 17, 3 total)
+
+- 2 new tests: `tests/helpers/IntentBreakdownTest.php` (+283 LOC) + `tests/helpers/ValidateSkuHierarchyTest.php` (+224 LOC)
+- 1 docs update: `WORKFLOW-REFERENCE.md` (+243 LOC, §13 + §14 added)
+
+---
+
 ### Fix — Round 16 (More unit tests + flow diagrams + regression manifest index) (2026-04-29)
 
 After Round 15 closed Top 3 ROI items (update_meta_cache guards + flow diagrams + unit tests), Round 16 continues low-priority polish: 2 more unit test suites for V.7.0 + V.42 critical guards, 2 new Mermaid diagrams (Walk-in stateDiagram + B2F PO sequenceDiagram), and a master REGRESSION-MANIFEST-INDEX.md linking 3 separate manifest files. ROI lower than Round 15 but additive coverage with NONE risk. Test suite grows 252 → 283 (+12.3%).
