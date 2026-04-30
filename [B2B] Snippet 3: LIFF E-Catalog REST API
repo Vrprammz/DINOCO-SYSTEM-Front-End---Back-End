@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.12 — Round 25 (2026-04-29): Idempotency-Key support on cancel-request.        ║
+ * ║    Customer LIFF "ยกเลิก" button can double-fire on slow networks → admin notification +     ║
+ * ║    rate-limit consumption double-charged. Body hash = {ticket_id, group_id} (group_id from   ║
+ * ║    session prevents cross-customer key reuse). Same key + same body → cached response (24h). ║
+ * ║    Conflict (different ticket_id) → 409. Backward compat: missing X-Idempotency-Key = no-op. ║
+ * ║    Risk: LOW — wrapper-only, additive (Round 19 + 23 pattern proven).                        ║
  * ║  Version: V.42.11 — Round 23 (2026-04-29): Extend Idempotency-Key support to manual-flash-   ║
  * ║    cancel. DB cleanup loop is NOT idempotent on its own (status='cancelled' second time      ║
  * ║    walks list, finds match, succeeds but warehouse double-click could see "Flash already     ║
@@ -1036,6 +1042,40 @@ function b2b_rest_cancel_request( WP_REST_Request $request ) {
             return new WP_REST_Response(array('success' => false, 'message' => 'Missing ticket_id'), 400);
         }
 
+        // ── V.42.12 Round 25: Idempotency-Key support ──
+        // Optional X-Idempotency-Key header — same key + same body hash → cached response (24h TTL).
+        // Why critical: cancel-request triggers FSM transition (status → cancel_requested) +
+        //   admin notification (Flex). Customer double-tap "ยกเลิก" or LIFF retry on slow network
+        //   could fire admin notify twice + spend 2/hr rate-limit slots unnecessarily.
+        // Backward compat: missing header = identical to V.42.11 (zero behavior change).
+        // Body hash = {ticket_id, group_id} — group_id from session (prevents cross-customer
+        //   key reuse). NOT hashing optional `reason` — customer can edit between retries.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::cancel-request';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'ticket_id' => (int) $ticket_id,
+                'group_id'  => (string) $session['gid'],
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // V.40.6 — Audit H8: ownership check BEFORE rate limiter, then use canonical helper.
         // Ownership-first prevents attackers from burning a victim's quota by spamming
         // ticket_ids they don't own. The helper uses transient-primary so it works on
@@ -1141,7 +1181,12 @@ function b2b_rest_cancel_request( WP_REST_Request $request ) {
 
         delete_transient($lock_key);
 
-        return new WP_REST_Response(array('success' => true, 'message' => 'ส่งคำขอยกเลิกเรียบร้อย'), 200);
+        $cancel_resp = array('success' => true, 'message' => 'ส่งคำขอยกเลิกเรียบร้อย');
+        // V.42.12 Round 25: store idempotency response (24h replay)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $cancel_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $cancel_resp, 200 );
     } catch ( Exception $e ) {
         b2b_log('[CancelRequest] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาด'), 500);

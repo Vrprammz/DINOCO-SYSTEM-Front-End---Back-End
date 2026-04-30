@@ -1,6 +1,13 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 5: Admin Dashboard                          ║
+ * ║  Version: V.33.6 (2026-04-29) — Round 25: Idempotency-Key support on update-status.         ║
+ * ║    Reads X-Idempotency-Key header (optional). Same key + same body hash → cached response   ║
+ * ║    (24h TTL). Body = {ticket_id, status}. `old_st` excluded (DB-derived, NOT a write field, ║
+ * ║    so omission preserves replay safety after first commit). Backward compat: missing header ║
+ * ║    = identical to V.33.5 (zero behavior change). Bulk Confirm/Cancel admin loops (~50       ║
+ * ║    tickets) particularly benefit — partial network drop + retry no longer double-fires      ║
+ * ║    debt mutations. Risk: LOW — additive wrapper, Round 19 + 23 pattern proven safe.         ║
  * ║  Version: V.33.5 (2026-04-29) — Round 23: Idempotency-Key support on confirm-order +        ║
  * ║    flash-create. Reads X-Idempotency-Key header (optional). Same key + same body hash →     ║
  * ║    cached response (24h TTL). Confirm-order body = {ticket_id, total, status, admin_note}.  ║
@@ -782,6 +789,43 @@ function b2b_rest_update_status( WP_REST_Request $r ) {
     if(!$tid||get_post_type($tid)!=='b2b_order') return new WP_REST_Response(array('success'=>false,'message'=>'Ticket ไม่ถูกต้อง'),400);
     if(function_exists('b2b_allowed_statuses')&&!in_array($st,b2b_allowed_statuses(),true)) return new WP_REST_Response(array('success'=>false,'message'=>'สถานะไม่ถูกต้อง'),400);
     $old_st = get_field('order_status',$tid) ?: 'unknown';
+
+    // ── V.33.6 Round 25: Idempotency-Key support ──
+    // Optional X-Idempotency-Key header — same key + same body hash → cached response (24h TTL).
+    // Why critical: update-status drives FSM transitions + can fire debt reverse on cancel +
+    //   debt add on awaiting_payment. Bulk admin operations (Bulk Confirm / Bulk Cancel) loop this
+    //   endpoint per ticket — partial network drop + retry can double-fire debt mutations if
+    //   ticket transitions between (e.g.) draft → awaiting_payment twice in succession.
+    // Backward compat: missing header = identical to V.33.5 (zero behavior change).
+    // Body hash inputs: ticket_id + status only — these are the semantic write fields.
+    //   `old_st` is computed from DB so always reflects current state, NOT included in hash
+    //   (prevents replay-fail when 2nd call is legitimate idempotent retry post-success).
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::update-status';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'ticket_id' => (int) $tid,
+            'status'    => (string) $st,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // V.33.0 HIGH-H1 FIX: removed shadow FSM transition table (was duplicate of Snippet 14, with drift —
     // included `ready_to_ship` & `pending` which don't exist in canonical FSM, missing
     // `pending_stock_review` + `partial_fulfilled` BO states). Now defers to canonical FSM
@@ -899,7 +943,12 @@ function b2b_rest_update_status( WP_REST_Request $r ) {
     }
     // V.9: C1 audit log
     b2b_add_audit_log($tid, 'status_change', $old_st.' → '.$st);
-    return new WP_REST_Response(array('success'=>true,'message'=>'สถานะ → '.$st));
+    $update_resp = array('success'=>true,'message'=>'สถานะ → '.$st);
+    // V.33.6 Round 25: store idempotency response (24h replay)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $update_resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+    return new WP_REST_Response( $update_resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);

@@ -636,4 +636,307 @@ class IdempotencyEndpointContractTest extends TestCase {
             'Round 23 endpoint body shapes MUST all hash differently. Got: ' . print_r( $hashes, true )
         );
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // ROUND 25 — 5 NEW ENDPOINT INTEGRATIONS
+    //   B2B: update-status (Snippet 5 V.33.6) + cancel-request (Snippet 3 V.42.12)
+    //   B2F: po-cancel + maker-confirm + record-payment (Snippet 2 V.11.13)
+    // ════════════════════════════════════════════════════════════════
+
+    // ────────────────────────────────────────────────────────────────
+    // update-status body shape (Snippet 5 V.33.6)
+    //   { ticket_id, status }
+    //   `old_st` excluded (DB-derived; would break replay-after-success)
+    // ────────────────────────────────────────────────────────────────
+
+    private function update_status_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'ticket_id' => 12345,
+            'status'    => 'awaiting_confirm',
+        ), $overrides );
+    }
+
+    public function test_update_status_identical_body_same_hash(): void {
+        $b1 = $this->update_status_body();
+        $b2 = $this->update_status_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Bulk Confirm/Cancel admin loops MUST replay safely on partial drop'
+        );
+    }
+
+    public function test_update_status_different_status_different_hash(): void {
+        // Cancel vs awaiting_confirm = different debt impact → 409
+        $b1 = $this->update_status_body( array( 'status' => 'awaiting_confirm' ) );
+        $b2 = $this->update_status_body( array( 'status' => 'cancelled' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'status drives debt add (awaiting_payment) or reverse (cancelled) — MUST discriminate'
+        );
+    }
+
+    public function test_update_status_different_ticket_different_hash(): void {
+        $b1 = $this->update_status_body( array( 'ticket_id' => 12345 ) );
+        $b2 = $this->update_status_body( array( 'ticket_id' => 99999 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'ticket_id namespacing prevents cross-ticket cache poisoning'
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // cancel-request body shape (Snippet 3 V.42.12)
+    //   { ticket_id, group_id }
+    //   group_id from session (auth-scoped; prevents cross-customer poison)
+    // ────────────────────────────────────────────────────────────────
+
+    private function cancel_request_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'ticket_id' => 12345,
+            'group_id'  => 'C1234567890',
+        ), $overrides );
+    }
+
+    public function test_cancel_request_identical_body_same_hash(): void {
+        $b1 = $this->cancel_request_body();
+        $b2 = $this->cancel_request_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Customer LIFF double-tap "ยกเลิก" MUST cache replay safely'
+        );
+    }
+
+    public function test_cancel_request_different_group_different_hash(): void {
+        // Two customers with same key (collision via separate clients) → 409
+        $b1 = $this->cancel_request_body( array( 'group_id' => 'C111' ) );
+        $b2 = $this->cancel_request_body( array( 'group_id' => 'C222' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'group_id in hash prevents cross-customer cache poisoning'
+        );
+    }
+
+    public function test_cancel_request_different_ticket_different_hash(): void {
+        $b1 = $this->cancel_request_body( array( 'ticket_id' => 12345 ) );
+        $b2 = $this->cancel_request_body( array( 'ticket_id' => 99999 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // po-cancel body shape (B2F Snippet 2 V.11.13)
+    //   { po_id, reason }
+    //   reason IN hash — admin re-editing reason = different intent → 409
+    // ────────────────────────────────────────────────────────────────
+
+    private function po_cancel_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'po_id'  => 5555,
+            'reason' => 'Maker out of stock',
+        ), $overrides );
+    }
+
+    public function test_po_cancel_identical_body_same_hash(): void {
+        $b1 = $this->po_cancel_body();
+        $b2 = $this->po_cancel_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Admin double-click cancel + same reason MUST replay safely'
+        );
+    }
+
+    public function test_po_cancel_different_reason_different_hash(): void {
+        // Admin types more detailed reason on retry → 409 surfaces edit intent
+        $b1 = $this->po_cancel_body( array( 'reason' => 'OOS' ) );
+        $b2 = $this->po_cancel_body( array( 'reason' => 'Maker bankruptcy — escalate' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'reason editing between retries surfaces as 409 (different audit trail content)'
+        );
+    }
+
+    public function test_po_cancel_different_po_different_hash(): void {
+        $b1 = $this->po_cancel_body( array( 'po_id' => 5555 ) );
+        $b2 = $this->po_cancel_body( array( 'po_id' => 7777 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // maker-confirm body shape (B2F Snippet 2 V.11.13)
+    //   { po_id, maker_id, expected_date, note }
+    //   maker_id from JWT (auth-scoped)
+    // ────────────────────────────────────────────────────────────────
+
+    private function maker_confirm_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'po_id'         => 5555,
+            'maker_id'      => 1234,
+            'expected_date' => '2026-05-30',
+            'note'          => '',
+        ), $overrides );
+    }
+
+    public function test_maker_confirm_identical_body_same_hash(): void {
+        $b1 = $this->maker_confirm_body();
+        $b2 = $this->maker_confirm_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Maker LIFF retry on slow LINE response MUST replay safely'
+        );
+    }
+
+    public function test_maker_confirm_different_eta_different_hash(): void {
+        // Maker corrects ETA between retries → 409 (different commitment)
+        $b1 = $this->maker_confirm_body( array( 'expected_date' => '2026-05-30' ) );
+        $b2 = $this->maker_confirm_body( array( 'expected_date' => '2026-06-15' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'expected_date is the commitment — must surface as 409 if changed'
+        );
+    }
+
+    public function test_maker_confirm_different_maker_different_hash(): void {
+        // Cross-maker key collision (impossible in practice — JWT-scoped — but defense-in-depth)
+        $b1 = $this->maker_confirm_body( array( 'maker_id' => 1234 ) );
+        $b2 = $this->maker_confirm_body( array( 'maker_id' => 9999 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'maker_id in hash = belt-and-braces over JWT-scoped namespace'
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // record-payment body shape (B2F Snippet 2 V.11.13)
+    //   { po_id, amount, method, date, reference, note }
+    //   slip_image binary EXCLUDED (FormData limitation)
+    // ────────────────────────────────────────────────────────────────
+
+    private function record_payment_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'po_id'     => 5555,
+            'amount'    => 12500.0,
+            'method'    => 'transfer',
+            'date'      => '2026-04-29',
+            'reference' => 'TXN-ABC-2026',
+            'note'      => '',
+        ), $overrides );
+    }
+
+    public function test_record_payment_identical_body_same_hash(): void {
+        $b1 = $this->record_payment_body();
+        $b2 = $this->record_payment_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Identical payment body MUST replay safely (24h, beyond 10s legacy transient)'
+        );
+    }
+
+    public function test_record_payment_different_amount_different_hash(): void {
+        // CRITICAL — DOUBLE-PAY prevention test
+        // Admin types wrong amount, fixes it, retries with same key = MUST be 409
+        $b1 = $this->record_payment_body( array( 'amount' => 10000.0 ) );
+        $b2 = $this->record_payment_body( array( 'amount' => 12500.0 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'amount drives ledger commitment — MUST surface as 409 on edit'
+        );
+    }
+
+    public function test_record_payment_different_method_different_hash(): void {
+        // transfer vs cheque vs cash = different reconciliation flow
+        $b1 = $this->record_payment_body( array( 'method' => 'transfer' ) );
+        $b2 = $this->record_payment_body( array( 'method' => 'cheque' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_record_payment_different_reference_different_hash(): void {
+        // Reference number is the audit lookup key — must be discriminatory
+        $b1 = $this->record_payment_body( array( 'reference' => 'TXN-001' ) );
+        $b2 = $this->record_payment_body( array( 'reference' => 'TXN-002' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'reference is bank txn ID — MUST differ in hash to prevent cross-txn replay'
+        );
+    }
+
+    public function test_record_payment_different_po_different_hash(): void {
+        $b1 = $this->record_payment_body( array( 'po_id' => 5555 ) );
+        $b2 = $this->record_payment_body( array( 'po_id' => 7777 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // ROUND 25 cross-endpoint collision sanity (5 new shapes)
+    // ────────────────────────────────────────────────────────────────
+
+    public function test_round25_endpoint_body_shapes_dont_collide(): void {
+        $update_status   = $this->update_status_body();
+        $cancel_request  = $this->cancel_request_body();
+        $po_cancel       = $this->po_cancel_body();
+        $maker_confirm   = $this->maker_confirm_body();
+        $record_payment  = $this->record_payment_body();
+
+        $hashes = array(
+            'update_status'   => dinoco_idempotency_hash( $update_status ),
+            'cancel_request'  => dinoco_idempotency_hash( $cancel_request ),
+            'po_cancel'       => dinoco_idempotency_hash( $po_cancel ),
+            'maker_confirm'   => dinoco_idempotency_hash( $maker_confirm ),
+            'record_payment'  => dinoco_idempotency_hash( $record_payment ),
+        );
+
+        // All 5 hashes MUST be unique — defense-in-depth (namespace also discriminates at storage)
+        $this->assertSame( 5, count( array_unique( $hashes ) ),
+            'Round 25 endpoint body shapes MUST all hash differently. Got: ' . print_r( $hashes, true )
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Cumulative collision check across ALL 13 endpoints
+    //   (Round 19: 3 + Round 23: 5 + Round 25: 5 = 13)
+    // ────────────────────────────────────────────────────────────────
+
+    public function test_all_13_endpoints_cumulative_no_collision(): void {
+        $hashes = array(
+            'place_order'         => dinoco_idempotency_hash( $this->place_order_body() ),
+            'manual_flash'        => dinoco_idempotency_hash( $this->manual_flash_body() ),
+            'create_po'           => dinoco_idempotency_hash( $this->create_po_body() ),
+            'confirm_order'       => dinoco_idempotency_hash( $this->confirm_order_body() ),
+            'flash_create'        => dinoco_idempotency_hash( $this->flash_create_body() ),
+            'manual_flash_cancel' => dinoco_idempotency_hash( $this->manual_flash_cancel_body() ),
+            'po_update'           => dinoco_idempotency_hash( $this->po_update_body() ),
+            'receive_goods'       => dinoco_idempotency_hash( $this->receive_goods_body() ),
+            'update_status'       => dinoco_idempotency_hash( $this->update_status_body() ),
+            'cancel_request'      => dinoco_idempotency_hash( $this->cancel_request_body() ),
+            'po_cancel'           => dinoco_idempotency_hash( $this->po_cancel_body() ),
+            'maker_confirm'       => dinoco_idempotency_hash( $this->maker_confirm_body() ),
+            'record_payment'      => dinoco_idempotency_hash( $this->record_payment_body() ),
+        );
+        $this->assertSame( 13, count( array_unique( $hashes ) ),
+            'All 13 cumulative endpoint shapes MUST hash uniquely (defense-in-depth)'
+        );
+    }
 }

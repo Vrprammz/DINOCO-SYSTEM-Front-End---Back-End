@@ -1,5 +1,18 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.13 (2026-04-29) — Round 25: Extend Idempotency-Key support to 3 more endpoints:
+ *   POST /po-cancel + POST /maker-confirm + POST /record-payment. Mirrors Round 19 + 23 pattern.
+ *   - po-cancel body hash = {po_id, reason}. Reason IN hash so admin re-edit between retries
+ *     surfaces 409 (different intent). Stock reverse + payable recalc + Maker Flex push are
+ *     idempotent at FSM level (ALREADY_CANCELLED guard) but central wrapper protects double
+ *     Flex notification spam.
+ *   - maker-confirm body hash = {po_id, maker_id (from JWT), expected_date, note}. JWT-scoped
+ *     so cross-maker key reuse impossible. Maker LIFF retry safe.
+ *   - record-payment body hash = {po_id, amount, method, date, reference, note}. slip_image
+ *     binary excluded (FormData limitation; GET_LOCK + 10s transient at handler level still
+ *     guard concurrent commits). Central wrapper extends 10s → 24h for slow-network clients.
+ *   Backward compat: missing X-Idempotency-Key = no-op for all 3 endpoints. Risk: LOW —
+ *   wrapper-only, additive, Round 19 + 23 pattern proven safe across 6 prior endpoints.
  * Version: V.11.12 (2026-04-29) — Round 23: Extend Idempotency-Key support to POST /po-update +
  *   POST /receive-goods. Both are critical write paths — po-update bumps version + amendment count
  *   + total + auto-resubmit + Maker Flex push (double-fire would inflate counters + spam Maker).
@@ -3432,6 +3445,40 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบใบสั่งซื้อ', 'code' => 'NOT_FOUND' ), 404 );
         }
 
+        // ── V.11.13 Round 25: Idempotency-Key support ──
+        // Optional X-Idempotency-Key header — same key + same body → cached response (24h TTL).
+        // Why critical: po-cancel triggers stock reversal + payable recalculation + Maker Flex
+        //   notification + admin Flex. Double-fire on slow LINE push timeout = double Maker
+        //   notification spam + (unlikely but possible) double stock reverse if FSM check misses
+        //   second-fire window. Reason field IS in hash (admin editing reason between retries
+        //   should surface as 409 — different intent).
+        // Backward compat: missing header = identical to V.11.12 (zero behavior change).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::po-cancel';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'po_id'  => (int) $po_id,
+                'reason' => (string) $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // W1 FIX: Lock ป้องกัน concurrent cancel + receive/payment
         global $wpdb;
         $cancel_lock = 'b2f_recv_' . intval( $po_id );
@@ -3618,6 +3665,10 @@ if ( ! function_exists( 'b2f_rest_po_cancel' ) ) {
 
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $cancel_lock ) );
 
+        // V.11.13 Round 25: store idempotency response (24h replay)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
         return new WP_REST_Response( $resp, 200 );
     }
 }
@@ -3908,6 +3959,41 @@ if ( ! function_exists( 'b2f_rest_maker_confirm' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => b2f_t('กรุณากรอกวันที่คาดว่าจะส่ง', 'Please specify delivery date', '请指定交货日期', $cur), 'code' => 'MISSING_DATE' ), 400 );
         }
 
+        // ── V.11.13 Round 25: Idempotency-Key support ──
+        // Optional X-Idempotency-Key header — same key + same body → cached response (24h TTL).
+        // Why critical: maker-confirm transitions PO submitted→confirmed + sets ETA + pushes
+        //   admin Flex. Maker LIFF retry on slow LINE response can fire admin notify twice.
+        // Body hash = {po_id, expected_date, note} — note IS in hash (different note = different
+        //   action). maker_id from JWT (auth-scoped, can't cross-tenant cache poison).
+        // Backward compat: missing header = identical to V.11.12 (zero behavior change).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker-confirm';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'po_id'         => (int) $po_id,
+                'maker_id'      => (int) $maker_id,
+                'expected_date' => (string) $expected_date,
+                'note'          => (string) ( sanitize_textarea_field( $req->get_param( 'note' ) ?: '' ) ),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => b2f_t( 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน', 'Idempotency-Key conflict — body differs from previous request', 'Idempotency-Key 冲突 — 数据与先前请求不一致', $cur ),
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         $date_ts  = strtotime( $expected_date );
         $today_ts = strtotime( wp_date( 'Y-m-d' ) );
         if ( $date_ts === false || $date_ts <= $today_ts ) {
@@ -3942,11 +4028,16 @@ if ( ! function_exists( 'b2f_rest_maker_confirm' ) ) {
             b2f_log( sprintf( 'Maker confirmed: %s (#%d) ETA=%s', $po_number, $po_id, $expected_date ) );
         }
 
-        return new WP_REST_Response( array(
+        $confirm_resp = array(
             'success' => true,
             'po_id'   => $po_id,
             'status'  => 'confirmed',
-        ), 200 );
+        );
+        // V.11.13 Round 25: store idempotency response (24h replay)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $confirm_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $confirm_resp, 200 );
     }
 }
 
@@ -5293,6 +5384,43 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
         }
 
+        // ── V.11.13 Round 25: Central Idempotency-Key support ──
+        // Optional X-Idempotency-Key header (separate from per-endpoint FIX-2b transient guard
+        // which is short-window 10s collision protection — central wrapper extends to 24h
+        // and supports admin client-supplied UUIDs across slow networks). Body hash includes
+        // amount + method + date + reference + note (semantic write fields). slip_image binary
+        // NOT hashed (FormData limitation; GET_LOCK at handler level prevents concurrent commit).
+        // Backward compat: missing header = identical to V.11.12 (legacy transient guard still runs).
+        $idem_key_central = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace_central = 'b2f/v1::record-payment';
+        $idem_body_central = null;
+        if ( $idem_key_central !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body_central = array(
+                'po_id'     => (int) $po_id,
+                'amount'    => (float) $amount,
+                'method'    => (string) $method,
+                'date'      => (string) $date,
+                'reference' => (string) $ref,
+                'note'      => (string) $note,
+            );
+            $cached = dinoco_idempotency_check( $idem_key_central, $idem_namespace_central, $idem_body_central );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // FIX-2a: MySQL GET_LOCK ป้องกัน concurrent payment (เหมือน receive-goods)
         $pmt_lock_key = 'b2f_pmt_' . intval( $po_id );
         global $wpdb;
@@ -5301,7 +5429,8 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'มีคนอื่นกำลังบันทึกจ่ายเงิน PO นี้อยู่ กรุณารอสักครู่', 'code' => 'LOCKED' ), 423 );
         }
 
-        // FIX-2b: Idempotency — ป้องกันกดซ้ำภายใน 10 วินาที
+        // FIX-2b: Idempotency — ป้องกันกดซ้ำภายใน 10 วินาที (per-endpoint short-window guard,
+        // complements V.11.13 24h central wrapper above)
         $idem_key = 'b2f_pmt_idem_' . $po_id . '_' . md5( $amount . $method . $date );
         if ( get_transient( $idem_key ) ) {
             $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $pmt_lock_key ) );
@@ -5510,7 +5639,7 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
         // FIX-2a: Release payment lock
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $pmt_lock_key ) );
 
-        return new WP_REST_Response( array(
+        $payment_resp = array(
             'success'        => true,
             'pmt_id'         => $pmt_id,
             'payment_status' => $payment_status,
@@ -5518,7 +5647,12 @@ if ( ! function_exists( 'b2f_rest_record_payment' ) ) {
             'po_status'      => esc_html( get_field( 'po_status', $po_id ) ),
             'slip_status'    => $slip_status ?: null,
             'slip_error'     => ( $slip_status === 'rejected' && isset( $slip_result['error'] ) ) ? $slip_result['error'] : null,
-        ), 200 );
+        );
+        // V.11.13 Round 25: store central idempotency response (24h replay)
+        if ( $idem_key_central !== '' && $idem_body_central !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key_central, $idem_namespace_central, $idem_body_central, array_merge( $payment_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $payment_resp, 200 );
     }
 }
 
