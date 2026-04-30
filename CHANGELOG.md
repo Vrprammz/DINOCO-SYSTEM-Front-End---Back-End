@@ -10,6 +10,49 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fix — Round 16 (More unit tests + flow diagrams + regression manifest index) (2026-04-29)
+
+After Round 15 closed Top 3 ROI items (update_meta_cache guards + flow diagrams + unit tests), Round 16 continues low-priority polish: 2 more unit test suites for V.7.0 + V.42 critical guards, 2 new Mermaid diagrams (Walk-in stateDiagram + B2F PO sequenceDiagram), and a master REGRESSION-MANIFEST-INDEX.md linking 3 separate manifest files. ROI lower than Round 15 but additive coverage with NONE risk. Test suite grows 252 → 283 (+12.3%).
+
+#### ITEM A — +31 unit tests for V.7.0 + V.42 critical decision helpers (commit `85c6fd1`)
+
+- **`ValidateSourceSkuTest.php`** (14 tests, 31 assertions) — Locks `b2f_validate_source_sku_in_ancestors()` (Snippet 1 V.7.0 line 3761), the V.7.0 Order Intent anti-malicious guard preventing cross-set source-spoof attack.
+- **`ExpressCategoryTest.php`** (17 tests, 17 assertions) — Locks `dinoco_suggest_express_category()` (Snippet 15 V.8.0 line 4045), the Flash V.42 vehicle suggester (1=bike, 4=truck) — wrong = wrong courier dispatched + wrong fee billed.
+- **Coverage**: empty inputs → WP_Error (NOT silent pass) / self-loop / case-insensitive + whitespace tolerated / DD-3 shared leaf in N sets / spoof attack rejected / boundary conditions at all 3 thresholds (5000g/45cm/150cm) STRICT > / intval string coercion / custom thresholds via dinoco_shipping_defaults() / negative weight graceful / documents geometric reality (sum_dim threshold only fires when max_dim already trips).
+- **Suite size**: 252 → 283 tests (+31, +12.3%), 376 → 424 assertions (+48). All green. Zero failures, zero errors.
+- **Risk**: NONE — additive tests only.
+
+#### ITEM B — 2 new Mermaid flow diagrams (commit `c2051e1`, `WORKFLOW-REFERENCE.md` +164 LOC)
+
+- **§2.2.1 Walk-in Order Auto-Complete Flow (stateDiagram-v2)** — Visualizes the 2 key bypass behaviors (skip stock check + auto-complete after payment) next to the regular OOS-gated path. Documents the WALK-IN-ONLY `completed → cancelled` escape hatch (V.33.2, FSM V.1.5).
+- **§3.1.1 B2F PO Submission Flow (sequenceDiagram)** — End-to-end POST /b2f/v1/create-po with 11 participants. Captures DD-7 leaf expansion / DD-3 composite merge key / V.7.0 7-rule validator / multi-currency immutability / par/and parallel notify / PII gate.
+- **TOC**: Updated with sub-section anchors.
+- **Risk**: NONE — pure documentation.
+
+#### ITEM C — Master Regression Manifest Index (commit `a4f0c63`, NEW `REGRESSION-MANIFEST-INDEX.md` 143 LOC)
+
+- **Problem**: 3 separate regression manifest files scattered across the repo (B2B-BACKORDER + FLASH-SHIPPING-V42 + chatbot regression-guard) — no discoverability layer.
+- **Approach**: Index provides discoverability layer without duplicating scenario content. Each manifest remains the single source of truth for its system.
+- **Total**: 165 scenarios indexed across 3 systems (71 B2B BO + 69 Flash V.42 + 25 chatbot).
+- **Sections**: TL;DR table / "When to Use Each Manifest" decision guide / Section maps per manifest / Cross-system patterns (walk-in bypass, feature flag rollback, DD-3 shared leaf, atomic compensation) / "Adding New Scenarios" workflow / Future Automation Roadmap / Related docs cross-refs.
+- **Risk**: NONE — pure docs.
+
+#### Cumulative impact (Rounds 1-16)
+
+- Tests: 0 → 283 (+283 across 16 rounds)
+- Mermaid diagrams: 0 → 18
+- Drift detectors: 0 → 7
+- Doc index files: 0 → 1 (regression manifest)
+- Audit findings closed: 35+ (UX-H3, onerror sweeps, PERF guards, Flag Audit Log, etc.)
+
+#### Files Touched (Round 16, 4 total)
+
+- 2 new tests: `tests/helpers/ValidateSourceSkuTest.php` + `tests/helpers/ExpressCategoryTest.php`
+- 1 docs update: `WORKFLOW-REFERENCE.md` (+164 LOC + 2 TOC entries)
+- 1 new docs: `REGRESSION-MANIFEST-INDEX.md` (143 LOC)
+
+---
+
 ### Fix — Round 15 (Top 3 ROI items: update_meta_cache guards + flow diagrams + unit tests) (2026-04-29)
 
 After Round 14 closed 3 MED findings, Round 15 picks Top 3 ROI items from the pending list and ships all 3 in batched commits. Risk NONE on every item. Test suite grows 226 → 252 (+11.5%).
