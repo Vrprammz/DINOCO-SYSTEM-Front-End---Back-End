@@ -1,5 +1,15 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.20 (2026-04-29) — Round 22 Wave 3 UI Gap 1: Order Intent Dashboard backend.
+ *   • NEW endpoint GET /maker-rollup-stats — aggregation across all makers for the
+ *     Order Intent Dashboard tab. Returns per-maker rollup (total, confirmed,
+ *     auto_synced, missing_leaves_count, display_mode breakdown, production_mode
+ *     breakdown) + global summary. Read-only consumer of wp_dinoco_product_makers
+ *     junction (V.11.0 schema) — no business logic, additive.
+ *   • Single SQL aggregation per maker (GROUP BY) — fast for typical N≤30 makers.
+ *   • Enriched with maker_name from CPT title.
+ *   • Backward compat: 404 if junction not activated, 501 if columns missing.
+ *   • Global summary mirrors `b2f_get_all_flags()` pattern — all sums + counts.
  * Version: V.3.19 (2026-04-29) — Round 3 Pending Items Sprint — Flag Audit Log integration:
  *   • POST /feature-flags/toggle now also writes to wp_dinoco_flag_audit table via
  *     dinoco_flag_audit_log() helper (centralized history). Dual-write preserves the
@@ -3743,6 +3753,115 @@ add_action( 'rest_api_init', function () {
                     'by_maker'        => $by_maker,
                     'flat'            => $dry_run ? $missing : $inserted,
                     'errors'          => $errors,
+                ),
+            ) );
+        },
+    ) );
+
+    // ─────────────────────────────────────────────
+    // V.3.20: GET /maker-rollup-stats — Order Intent Dashboard aggregation
+    //   Returns per-maker rollup + global summary across all makers.
+    //   Read-only. Single SQL aggregation per maker via GROUP BY.
+    //   Used by [b2f_admin_order_intent_dashboard] shortcode (Snippet 5 V.9.0).
+    // ─────────────────────────────────────────────
+    register_rest_route( B2F_AUDIT_NS, '/maker-rollup-stats', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function ( $req ) use ( $rl ) {
+            $check = $rl( 'maker_rollup_stats' );
+            if ( is_wp_error( $check ) ) return $check;
+
+            if ( ! b2f_audit_junction_table_exists() ) {
+                return new WP_Error( 'table_missing', 'junction table ยังไม่ถูกสร้าง (Activate Schema ก่อน)', array( 'status' => 404 ) );
+            }
+
+            global $wpdb;
+            $tbl = $wpdb->prefix . 'dinoco_product_makers';
+
+            // V.11.0 columns required — fail soft if Phase 4 migration not run yet
+            $cols_sql = "SHOW COLUMNS FROM {$tbl} LIKE 'production_mode'";
+            $has_v11 = ! empty( $wpdb->get_results( $cols_sql ) );
+            if ( ! $has_v11 ) {
+                return new WP_Error( 'schema_v11_missing', 'V.11.0 columns ยังไม่มี — ต้องรัน Phase 4 migration ก่อน (Audit Dashboard → Phase 4 Controls)', array( 'status' => 501 ) );
+            }
+
+            // Per-maker rollup via GROUP BY — 1 SQL covers all makers
+            $rows = $wpdb->get_results(
+                "SELECT
+                    maker_id,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN confirmation_status='confirmed' THEN 1 ELSE 0 END) AS confirmed,
+                    SUM(CASE WHEN confirmation_status='auto_synced' THEN 1 ELSE 0 END) AS auto_synced,
+                    SUM(CASE WHEN admin_display_mode='auto' THEN 1 ELSE 0 END) AS dm_auto,
+                    SUM(CASE WHEN admin_display_mode='as_set' THEN 1 ELSE 0 END) AS dm_as_set,
+                    SUM(CASE WHEN admin_display_mode='as_parts' THEN 1 ELSE 0 END) AS dm_as_parts,
+                    SUM(CASE WHEN production_mode='set_assembled' THEN 1 ELSE 0 END) AS pm_set,
+                    SUM(CASE WHEN production_mode='sub_unit' THEN 1 ELSE 0 END) AS pm_sub,
+                    SUM(CASE WHEN production_mode='single' THEN 1 ELSE 0 END) AS pm_single,
+                    SUM(CASE WHEN production_mode='cross_factory_assembly' THEN 1 ELSE 0 END) AS pm_cross,
+                    SUM(CASE WHEN missing_leaves_count > 0 THEN 1 ELSE 0 END) AS rows_with_missing,
+                    COALESCE(SUM(missing_leaves_count), 0) AS missing_leaves_total,
+                    SUM(CASE WHEN legacy_cpt_id > 0 THEN 1 ELSE 0 END) AS source_cpt,
+                    SUM(CASE WHEN legacy_cpt_id IS NULL OR legacy_cpt_id = 0 THEN 1 ELSE 0 END) AS source_auto
+                 FROM {$tbl}
+                 WHERE deleted_at IS NULL
+                 GROUP BY maker_id
+                 ORDER BY total DESC",
+                ARRAY_A
+            );
+            if ( ! is_array( $rows ) ) $rows = array();
+
+            // Enrich + cast int
+            $maker_rows = array();
+            $totals = array(
+                'total' => 0, 'confirmed' => 0, 'auto_synced' => 0,
+                'dm_auto' => 0, 'dm_as_set' => 0, 'dm_as_parts' => 0,
+                'pm_set' => 0, 'pm_sub' => 0, 'pm_single' => 0, 'pm_cross' => 0,
+                'rows_with_missing' => 0, 'missing_leaves_total' => 0,
+                'source_cpt' => 0, 'source_auto' => 0,
+            );
+            foreach ( $rows as $r ) {
+                $mid = intval( $r['maker_id'] );
+                $name = $mid ? get_the_title( $mid ) : '';
+                $row = array(
+                    'maker_id'             => $mid,
+                    'maker_name'           => $name ?: ( '#' . $mid ),
+                    'total'                => intval( $r['total'] ),
+                    'confirmed'            => intval( $r['confirmed'] ),
+                    'auto_synced'          => intval( $r['auto_synced'] ),
+                    'dm_auto'              => intval( $r['dm_auto'] ),
+                    'dm_as_set'            => intval( $r['dm_as_set'] ),
+                    'dm_as_parts'          => intval( $r['dm_as_parts'] ),
+                    'pm_set'               => intval( $r['pm_set'] ),
+                    'pm_sub'               => intval( $r['pm_sub'] ),
+                    'pm_single'            => intval( $r['pm_single'] ),
+                    'pm_cross'             => intval( $r['pm_cross'] ),
+                    'rows_with_missing'    => intval( $r['rows_with_missing'] ),
+                    'missing_leaves_total' => intval( $r['missing_leaves_total'] ),
+                    'source_cpt'           => intval( $r['source_cpt'] ),
+                    'source_auto'          => intval( $r['source_auto'] ),
+                );
+                // Confirmation percentage
+                $row['confirmed_pct'] = $row['total'] > 0
+                    ? round( ( $row['confirmed'] / $row['total'] ) * 100, 1 )
+                    : 0;
+                $maker_rows[] = $row;
+
+                foreach ( $totals as $k => $_v ) {
+                    if ( isset( $row[ $k ] ) ) $totals[ $k ] += $row[ $k ];
+                }
+            }
+            $totals['confirmed_pct'] = $totals['total'] > 0
+                ? round( ( $totals['confirmed'] / $totals['total'] ) * 100, 1 )
+                : 0;
+            $totals['maker_count'] = count( $maker_rows );
+
+            return rest_ensure_response( array(
+                'success' => true,
+                'data' => array(
+                    'makers'       => $maker_rows,
+                    'summary'      => $totals,
+                    'generated_at' => current_time( 'mysql' ),
                 ),
             ) );
         },

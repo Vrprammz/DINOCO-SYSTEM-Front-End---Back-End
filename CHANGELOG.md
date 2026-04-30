@@ -10,6 +10,61 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 22 (Wave 3 UI Gap 1+2: Order Intent Dashboard + Mode filter persistence) (2026-04-29)
+
+Closes the last 2 deferred gaps from Wave 3 inventory (Round 4 deferred since UX wireframe sign-off requested). Backend V.7.0 Order Intent fully shipped 13 days ago — production data ready. Wave 3 status: **5/5 gaps CLOSED**.
+
+#### ITEM A — Order Intent Dashboard (Gap 1)
+
+NEW admin tab consolidating V.7.0 Order Intent statistics across all makers. Read-only, additive UI.
+
+- **NEW REST endpoint** `GET /dinoco-b2f-audit/v1/maker-rollup-stats` ([Admin System] B2F Migration Audit V.3.19 → V.3.20)
+  - Single SQL aggregation (GROUP BY maker_id) over `wp_dinoco_product_makers` junction
+  - Returns per-maker rollup (total, confirmed, auto_synced, dm_*, pm_*, missing_leaves_*, source_cpt/auto, confirmed_pct) + global summary
+  - Read-only. Reuses existing rate-limit (20/hr/user). 404 on missing junction, 501 on missing V.11.0 columns
+- **NEW shortcode** `[b2f_admin_order_intent_dashboard]` ([B2F] Snippet 5: Admin Dashboard Tabs V.8.6 → V.9.0)
+  - 4 stats cards: total SKUs / confirmation pct + split / display-mode dominant / production-mode dominant
+  - Per-maker rollup table: filter (all/needs_attention/fully_confirmed/has_missing) + sort (name/missing/auto/confirmed) + deep-link to Makers tab
+  - Actions panel: Migration Audit deep-link / Makers tab deep-link / Export CSV (UTF-8 BOM Thai-friendly)
+  - Recent activity feed: top 20 from existing `/observations` endpoint with Thai-translated source labels
+  - Banner warning when `b2f_flag_order_intent` is OFF (graceful — informational only)
+  - Module registry self-registration: key=b2f_order_intent, section=b2f, order=25 — auto-wires into TAB_LABELS via Phase 5 registry merge
+- **Sidebar nav-item HTML** ([Admin System] DINOCO Admin Dashboard V.34.0 → V.34.1)
+  - Added under "โรงงาน (B2F)" section between Makers and Credit
+  - data-tab="b2f_order_intent" — wired automatically via registry merge (no emergency fallback added)
+- **Mobile-first CSS**: ≤640px stack 2-col cards + table compact, ≤380px single col. Scoped namespace `.b2f-oi-*`. Round 9 event delegation (data-action/data-change with `.closest()` guard).
+
+#### ITEM B — Mode-aware filter chips on Orders tab (Gap 2)
+
+Enhanced V.7.1 mode filter (5 chips: all/full_set/sub_unit/single_leaf/legacy) with 2 additions:
+
+- **localStorage persistence** — key `b2f_orders_mode_filter`, whitelist guard via `_MODE_FILTER_VALID` array (rejects tampered values), try/catch silent fail (private mode safety). Restored at module load + chip active state set in `init()` before `loadOrders()`.
+- **🌈 Mixed chip** — `data-mode="mixed"` filters POs with ≥2 modes (counts modes from `s.full_set/sub_unit/single_leaf > 0`). CSS gradient background (purple→amber→gray) on active state. Tooltip "PO ที่มี ≥2 โหมดผสม".
+- Behavior preservation: existing `setModeFilter()` + `applyFilters()` flow untouched. New chip uses identical `data-action="orders-mode-chip"` delegation (V.8.1 pattern).
+
+#### Risk + Verification
+
+- Risk: LOW-MEDIUM. Backend addition is additive single SQL, read-only, gated 404/501 on missing schema. Frontend dashboard is pure consumer (no writes).
+- Verification: PHP syntax pass on 3 modified files (`php -l` with `<?php` wrapper); JS data-action delegation scoped via `.closest('#b2f-oi-dashboard-wrap')` prevents cross-module fire; HTML escaping uses `esc_url()` + `esc_js()` properly.
+
+#### Files
+
+- `[Admin System] B2F Migration Audit` V.3.19 → V.3.20 (+119 lines)
+- `[B2F] Snippet 5: Admin Dashboard Tabs` V.8.6 → V.9.0 (+571 lines)
+- `[Admin System] DINOCO Admin Dashboard` V.34.0 → V.34.1 (+11 lines)
+
+#### Wave 3 Closeout
+
+| Gap   | Description                           | Status                                |
+| ----- | ------------------------------------- | ------------------------------------- |
+| Gap 1 | Admin Order Intent Dashboard          | ✅ Round 22 (V.9.0 + V.3.20 + V.34.1) |
+| Gap 2 | Mode-aware filter chips on Orders tab | ✅ Round 22 (V.9.0)                   |
+| Gap 3 | Maker LIFF mode badge                 | ✅ Round 4 (V.4.6)                    |
+| Gap 4 | SET Detail compact toggle             | ✅ Round 4 (V.7.10)                   |
+| Gap 5 | Cart Submit Review WAI-ARIA           | ✅ Round 4 (V.7.11)                   |
+
+---
+
 ### Infra — Round 21 (patterns library + cron drift detector + inline handler regression guard) (2026-04-29)
 
 After Round 20 retrospective doc identified 5 reusable patterns inline, Round 21 = solidify infrastructure for long-term maintainability. 3 items, all Risk NONE. ZERO source code changes.
