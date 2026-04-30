@@ -14,10 +14,23 @@ PHP version: 8.1+ (see `composer.json` `config.platform`).
 
 ## Scope (current)
 
-- `tests/helpers/CurrencyTest.php` — B2F currency formatting (15 cases)
-- `tests/helpers/FSMValidationTest.php` — B2B + B2F state transitions (13 cases + parametric)
+Helper unit tests under `tests/helpers/` cover pure-logic snippets (no
+WP/DB). 21 test classes, **383 tests / 579 assertions** as of Round 19
+(2026-04-29). Highlights:
 
-Total: ~28 assertions across ~20 test methods.
+- `CurrencyTest.php` — B2F currency formatting
+- `FSMValidationTest.php` — B2B + B2F state transitions
+- `IdempotencyTest.php` — Round 18 hash + extract_key foundation
+- `IdempotencyEndpointContractTest.php` — Round 19 body normalization
+  contracts for place-order / manual-flash-create / create-po
+- `IsTopLevelSetTest.php` — Round 18 hierarchy classification
+- `IntentBreakdownTest.php` + `ItemBreakdownTest.php` — V.7.0 Order Intent
+- `HierarchyTest.php` + `ValidateSourceSkuTest.php` — DD-3 shared leaf
+- `DealerPriceTest.php` + `InvoicePickerTest.php` — V.32.6 tier pricing
+- `SetCostsTest.php` + `ManufacturingSummaryTest.php` — B2F SET aggregation
+- `BoxCalcTest.php` + `ExpressCategoryTest.php` + `PackModeDetectTest.php` — V.42 Flash
+- `ModuleRegistryTest.php` + `FlagAuditTest.php` + `AuditRedactTest.php` — observability
+- `OrderModeLabelTest.php` + `FormatDateThaiTest.php` + `ValidateSkuHierarchyTest.php`
 
 ## Conventions
 
