@@ -10,6 +10,72 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Refactor — Round 5 UX-H3 onclick → Event Delegation + PERF Sweep Round 2 (2026-04-29)
+
+3 commits closing 2 deferred audit items. Risk: LOW (additive — same behavior,
+cleaner code + better CSP-readiness; no business logic touched).
+
+**ITEM A — UX-H3 onclick → delegation refactor (B2F Snippet 5 V.8.0 → V.8.2)**
+
+43 of 124 inline `onclick=` sites in `[B2F] Snippet 5: Admin Dashboard Tabs`
+migrated to single-listener event delegation pattern.
+
+Phase 1 (commit `1b915ce` V.8.1) — B2F_Orders module (19 sites):
+- 9 status tabs (`data-action="orders-filter-tab"` + `data-status`)
+- 5 KPI cards (same data-action, distinguishes via data-status)
+- 5 mode filter chips (`data-action="orders-mode-chip"` + `data-mode`)
+- Delegated listener inside Orders IIFE with idempotent guard
+  `_b2fOrdersDelegationBound` calls existing `filterByTab()` / `setModeFilter()`.
+
+Phase 2 (commit `9d63d30` V.8.2) — B2F_Makers + B2F_Credit (24 sites):
+- B2F_Makers (23): 3 source filter chips + 5 picker type chips + 2 view mode
+  + 2 quick shipping + 11 standalone action buttons (open create modal, save
+  settings, submit maker, open bulk delete, open blacklist, batch save, open
+  product picker, close picker, confirm picker, back to picker, submit
+  selected, execute bulk delete)
+- B2F_Credit (1): submit payment button
+- Per-module delegated listeners with `_b2fMakersDelegationBound` /
+  `_b2fCreditDelegationBound` guards. No cross-module interference (each
+  filters by action prefix).
+
+CSP-friendly: no `unsafe-inline` script-src needed for migrated batch.
+Behavior preservation: all chips still toggle `.active`, all buttons call
+same internal functions. window.B2F_*.* APIs intact for backward compat.
+Dynamic-rendered handlers (PO cards, SKU rows with id/name args) deferred —
+covered by future batches. PHP lint clean.
+
+**ITEM B — PERF cache priming sweep round 2 (commit `e879caf`)**
+
+Extends Round 2 sweep (commit `920b3ac`) to admin REST endpoints with
+cross-referenced postmeta N+1 patterns:
+
+`[B2F] Snippet 2: REST API` V.11.8 → V.11.9:
+- `b2f_rest_po_history()` (admin, per_page up to 100): WP_Query auto-primes
+  `b2f_order` postmeta but NOT cross-referenced `b2f_maker` postmeta.
+  `b2f_format_po_detail()` reads `maker_name` + `maker_credit_term_days`
+  per PO → N×2 cold reads with many distinct makers. Fix: pluck po IDs →
+  walk po_maker_id from primed cache → unique maker_ids →
+  `update_meta_cache('post', $maker_ids)` once. Expected p95 200-400ms →
+  50-100ms on history with 50+ POs spanning 5+ makers.
+- `b2f_rest_maker_po_list()` (Maker LIFF, per_page=50): JWT-scoped to one
+  maker, prime ensures first iteration cache-warm (eliminates 2 cold reads
+  on first PO).
+
+`[LIFF AI] Snippet 1: REST API` V.1.8 → V.1.9:
+- `liff_ai_rest_claims()`: 7× `get_field()` per claim_ticket. WP_Query
+  auto-primes by default → mostly no-op today. Defense-in-depth prime
+  guards against future refactor disabling cache_results.
+
+All changes additive — empty result sets skip the prime. Backward compat
+preserved.
+
+**Files Touched (3)**:
+- `[B2F] Snippet 5: Admin Dashboard Tabs` V.8.0 → V.8.2
+- `[B2F] Snippet 2: REST API` V.11.8 → V.11.9
+- `[LIFF AI] Snippet 1: REST API` V.1.8 → V.1.9
+
+**Commits**: `1b915ce`, `9d63d30`, `e879caf`
+
 ### UI — Round 4 Wave 3 UI Polish (2026-04-29) — B2F V.7.0 Order Intent UX (Gaps 3+4+5)
 
 3 commits closing Wave 3 UI gaps surveyed in Round 3. All flag-gated by
