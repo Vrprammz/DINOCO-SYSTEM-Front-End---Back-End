@@ -16,6 +16,7 @@
    - 2.2 [Walk-in Order Flow](#22-walk-in-order-flow)
    - 2.3 [B2B Payment Flow](#23-b2b-payment-flow)
    - 2.4 [B2B Shipping (Flash Express)](#24-b2b-shipping-flash-express)
+   - 2.5 [B2B Order Lifecycle (Full FSM Diagram)](#25-b2b-order-lifecycle-full-fsm-diagram--v18-snippet-14)
 3. [B2F Factory Purchasing Workflows](#3-b2f-factory-purchasing-workflows)
    - 3.1 [Create PO (Admin) -- Text](#31-create-po-admin----text)
    - 3.2 [Maker Confirm/Reject PO -- Text](#32-maker-confirmreject-po----text)
@@ -23,7 +24,7 @@
    - 3.4 [Receive Goods (Admin) -- Text](#34-receive-goods-admin----text)
    - 3.5 [Payment (Admin to Maker) -- Text](#35-payment-admin-to-maker----text)
    - 3.6 [B2F Full Loop Flow -- Mermaid Diagram](#36-b2f-full-loop-flow----mermaid-diagram)
-4. [B2F FSM Diagram (State Machine)](#4-b2f-fsm-diagram-state-machine)
+4. [B2F PO Lifecycle (Full FSM Diagram)](#4-b2f-po-lifecycle-full-fsm-diagram--v17-snippet-6)
    - 4.1 [Mermaid stateDiagram](#41-mermaid-statediagram)
    - 4.2 [Transition Rules Table](#42-transition-rules-table)
 5. [B2F Notification Flow](#5-b2f-notification-flow)
@@ -398,6 +399,165 @@ Rollback (instant):
   → b2b_flash_dispatch_create_all routes to legacy V.41 path
   → byte-identical behavior (REG-029 guarantee)
 ```
+
+### 2.5 B2B Order Lifecycle (Full FSM Diagram) — V.1.8 (Snippet 14)
+
+ระบบสถานะ order ครบทุกเส้นทาง — รวม legacy stock-check + walk-in + BO opaque accept + cancel_request + change_request + claim flow. ใช้ `B2B_Order_FSM::transition()` (ผ่าน Transaction Wrapper V.1.8 → GET_LOCK per-order + audit log) เป็น single point of mutation. ทุก transition ต้องผ่าน FSM validation (`required_role` + `from_status` whitelist).
+
+**หมายเหตุ stateDiagram**:
+
+- เส้น actor: `customer` (ลูกค้า/ตัวแทน), `admin` (Admin LIFF/Bot/Dashboard), `system` (cron/auto), `any` (ทั้ง 3 ใช้ได้)
+- BO flag (`b2b_flag_bo_system`) เปิด ON globally ตั้งแต่ 2026-04-17 — non-walkin ใหม่ทั้งหมดเข้า `pending_stock_review`
+- Legacy `checking_stock` ยังทำงานสำหรับ orders เก่าที่สร้างก่อน flag ON + flag OFF path
+- Walk-in (is_walkin=1) bypass stock check ทั้งหมด → `draft → awaiting_confirm` ตรง
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft : place_order
+
+    draft --> checking_stock : confirm_order (legacy / flag OFF) [customer]
+    draft --> pending_stock_review : confirm_order (BO flag ON, non-walkin) [customer]
+    draft --> awaiting_confirm : confirm_order (walk-in skip stock) [system]
+    draft --> cancelled : ลูกค้ายกเลิก draft [customer]
+
+    checking_stock --> awaiting_confirm : admin ยืนยันสต็อก [admin]
+    checking_stock --> backorder : admin มาร์ก stock หมด [admin]
+    checking_stock --> cancel_requested : ลูกค้าขอยกเลิก [customer]
+
+    pending_stock_review --> awaiting_confirm : bo-confirm-full [admin]
+    pending_stock_review --> partial_fulfilled : bo-split [admin]
+    pending_stock_review --> cancelled : bo-reject / 72h timeout cron [admin/system]
+    pending_stock_review --> cancel_requested : ลูกค้าขอยกเลิก [customer]
+
+    partial_fulfilled --> awaiting_confirm : ทุก BO resolved (last fulfill/cancel) [any]
+    partial_fulfilled --> pending_stock_review : bo-undo-split (≤10min, 1 max) [admin]
+    partial_fulfilled --> cancelled : manual escalation [admin]
+
+    backorder --> checking_stock : restock [admin]
+    backorder --> awaiting_confirm : ลูกค้ารับ partial [customer]
+    backorder --> cancelled : ลูกค้ายกเลิก BO [customer]
+
+    awaiting_confirm --> awaiting_payment : confirm_bill [customer]
+    awaiting_confirm --> cancelled : auto-cancel 30min timeout [system]
+    awaiting_confirm --> cancel_requested : ขอยกเลิก [customer]
+    awaiting_confirm --> change_requested : ขอแก้ไข [customer]
+
+    awaiting_payment --> paid : slip verified / manual approve [system]
+    awaiting_payment --> cancel_requested : ขอยกเลิก [customer]
+
+    paid --> packed : Flash courier book [admin]
+    paid --> shipped : manual ship/rider [admin]
+    paid --> completed : self-pickup / walk-in auto-complete [admin]
+    paid --> claim_opened : เปิดเคลม [customer]
+
+    packed --> shipped : Flash courier pickup [system]
+    packed --> cancel_requested : admin cancel ก่อน pickup [admin]
+
+    shipped --> completed : delivery confirmed / auto-complete [any]
+    shipped --> claim_opened : เปิดเคลม [customer]
+
+    cancel_requested --> cancelled : admin approve [admin]
+    cancel_requested --> awaiting_payment : admin reject restore [admin]
+    cancel_requested --> awaiting_confirm : admin reject restore [admin]
+    cancel_requested --> checking_stock : admin reject restore [admin]
+
+    change_requested --> draft : admin approve change [admin]
+    change_requested --> awaiting_confirm : admin reject change [admin]
+
+    claim_opened --> claim_resolved : exchange/refund [admin]
+    claim_opened --> completed : claim rejected [admin]
+    claim_opened --> shipped : claim exchange ship ใหม่ [admin]
+
+    claim_resolved --> completed : auto-complete [system]
+
+    completed --> cancelled : admin walk-in cancel เท่านั้น [admin]
+
+    completed --> [*]
+    cancelled --> [*]
+
+    note right of pending_stock_review
+        BO opaque accept gate
+        ลูกค้าเห็น "รอแอดมินตรวจ 2-4 ชม."
+        admin เห็น stock review Flex
+        72h timeout cron auto-cancel
+    end note
+
+    note right of partial_fulfilled
+        BO ส่งบางส่วน + ค้างบางส่วน
+        ทุก bo_queue resolved → awaiting_confirm
+        undo-split window 10min, 1 max
+    end note
+
+    note right of awaiting_confirm
+        ลูกค้ารอยืนยันบิล
+        30min auto-cancel ถ้าไม่ confirm
+        Walk-in: ติดลบสต็อกได้
+    end note
+
+    note right of completed
+        Walk-in only: completed → cancelled
+        Non-walkin completed = strict terminal
+    end note
+```
+
+**Transition Rules Table (B2B FSM V.1.8 — Snippet 14):**
+
+| From | To | Actor | Trigger / Notes |
+|------|----|-------|-----------------|
+| `draft` | `checking_stock` | customer | confirm_order (legacy / BO flag OFF) |
+| `draft` | `pending_stock_review` | customer | confirm_order (BO flag ON, non-walkin) |
+| `draft` | `awaiting_confirm` | system | Walk-in: skip stock check |
+| `draft` | `cancelled` | customer | ลูกค้ายกเลิก draft |
+| `checking_stock` | `awaiting_confirm` | admin | admin ยืนยันสต็อก |
+| `checking_stock` | `backorder` | admin | สินค้าหมด |
+| `checking_stock` | `cancel_requested` | customer | ขอยกเลิก |
+| `pending_stock_review` | `awaiting_confirm` | admin | bo-confirm-full (full stock available) |
+| `pending_stock_review` | `partial_fulfilled` | admin | bo-split (invariant: Σ qty_fulfill + Σ qty_bo = Σ qty per SKU) |
+| `pending_stock_review` | `cancelled` | admin | bo-reject / 72h timeout cron |
+| `pending_stock_review` | `cancel_requested` | customer | ขอยกเลิก |
+| `partial_fulfilled` | `awaiting_confirm` | any | ทุก bo_queue resolved (`b2b_bo_check_all_resolved`) |
+| `partial_fulfilled` | `pending_stock_review` | admin | bo-undo-split (`now() < _b2b_split_undo_deadline` AND undo_count < 1) |
+| `partial_fulfilled` | `cancelled` | admin | manual escalation |
+| `backorder` | `checking_stock` | admin | restock |
+| `backorder` | `awaiting_confirm` | customer | ลูกค้ารับ partial |
+| `backorder` | `cancelled` | customer | ลูกค้ายกเลิก BO |
+| `awaiting_confirm` | `awaiting_payment` | customer | ลูกค้ายืนยันบิล (confirm_bill) |
+| `awaiting_confirm` | `cancelled` | system | auto-cancel 30min timeout (Inventory cron) |
+| `awaiting_confirm` | `cancel_requested` | customer | ขอยกเลิก |
+| `awaiting_confirm` | `change_requested` | customer | ขอแก้ไข |
+| `awaiting_payment` | `paid` | system | slip verify / manual payment |
+| `awaiting_payment` | `cancel_requested` | customer | ขอยกเลิก |
+| `paid` | `packed` | admin | Flash Express book courier |
+| `paid` | `shipped` | admin | manual ship / rider |
+| `paid` | `completed` | admin | self-pickup / walk-in auto-complete |
+| `paid` | `claim_opened` | customer | เปิดเคลม |
+| `packed` | `shipped` | system | Flash courier pickup |
+| `packed` | `cancel_requested` | admin | admin cancel ก่อน courier pickup |
+| `shipped` | `completed` | any | delivery confirmed / auto-complete |
+| `shipped` | `claim_opened` | customer | เปิดเคลม |
+| `cancel_requested` | `cancelled` | admin | admin approve cancel |
+| `cancel_requested` | `awaiting_payment` | admin | admin reject restore |
+| `cancel_requested` | `awaiting_confirm` | admin | admin reject restore |
+| `cancel_requested` | `checking_stock` | admin | admin reject restore |
+| `change_requested` | `draft` | admin | admin approve change → กลับ draft |
+| `change_requested` | `awaiting_confirm` | admin | admin reject change |
+| `claim_opened` | `claim_resolved` | admin | exchange / refund |
+| `claim_opened` | `completed` | admin | claim rejected |
+| `claim_opened` | `shipped` | admin | claim exchange → ship ใหม่ |
+| `claim_resolved` | `completed` | system | auto-complete after resolution |
+| `completed` | `cancelled` | admin | Walk-in only — non-walkin = strict terminal |
+
+**Terminal States:** `cancelled` (always), `completed` (non-walkin only — walkin can re-cancel)
+
+**Atomic Guards (V.1.8 Phase 4d Transaction Wrapper):**
+
+- ทุก transition acquire GET_LOCK `b2b_fsm_order_<id>` (3s timeout) → serialize concurrent transitions
+- Audit row event=`b2b_fsm_transition` with correlation_id chain
+- Phase 1.5 in-body `dinoco_audit_log` calls preserved (dual-write index overlay)
+- Failure modes logged: `terminal_state` / `invalid_transition` / `permission_denied`
+- Hook `do_action('b2b_order_status_changed', $order_id, $current, $new_status, $actor)` fires on success
+
+---
 
 ### 2.10 B2B Backorder System -- Opaque Accept + Admin Split BO (V.1.6, 2026-04-16)
 
@@ -1264,9 +1424,16 @@ Alternative paths: แก้ไข PO (amended), ยกเลิก (cancelled -
 
 ---
 
-## 4. B2F FSM Diagram (State Machine)
+## 4. B2F PO Lifecycle (Full FSM Diagram) — V.1.7 (Snippet 6)
 
-12 สถานะ + transitions + ระบุ actor (admin/maker/system) ทุกเส้น
+12 สถานะ + transitions + ระบุ actor (admin/maker/system/any) ทุกเส้น. ใช้ `B2F_Order_FSM::transition()` (ผ่าน Transaction Wrapper V.1.7 → GET_LOCK per-PO + audit log) เป็น single point of mutation. Multi-currency immutable หลัง `submitted` (po_currency + po_exchange_rate snapshot).
+
+**หมายเหตุ stateDiagram**:
+
+- เส้น actor: `admin` (DINOCO Admin LIFF/Dashboard), `maker` (โรงงาน Maker LIFF), `system` (cron/auto)
+- `cancelled` ตอน V.8.2+ ใช้ FSM transition (ไม่ลบ PO) → preserve audit trail + rollback stock/debt
+- `amended` = transient state — auto-resubmit เป็น `submitted` ทันที (ไม่ค้าง)
+- Multi-currency: ทุก transition ที่กระทบ debt/credit คำนวณ THB (rcv_total_value × exchange_rate) — ดู Snippet 7 V.1.0
 
 ### 4.1 Mermaid stateDiagram
 
@@ -1274,79 +1441,130 @@ Alternative paths: แก้ไข PO (amended), ยกเลิก (cancelled -
 stateDiagram-v2
     [*] --> draft
 
-    draft --> submitted : Admin submit
-    draft --> cancelled : Admin cancel
+    draft --> submitted : Admin submit [admin]
+    draft --> cancelled : Admin cancel draft [admin]
 
-    submitted --> confirmed : Maker confirm
-    submitted --> rejected : Maker reject
-    submitted --> amended : Admin amend
-    submitted --> cancelled : Admin cancel
+    submitted --> confirmed : Maker confirm + ETA [maker]
+    submitted --> rejected : Maker reject [maker]
+    submitted --> amended : Admin amend PO [admin]
+    submitted --> cancelled : Admin cancel [admin]
 
-    confirmed --> delivering : Maker deliver
-    confirmed --> amended : Admin amend
-    confirmed --> cancelled : Admin cancel
+    confirmed --> delivering : Maker deliver [maker]
+    confirmed --> amended : Admin amend [admin]
+    confirmed --> cancelled : Admin cancel [admin]
 
-    amended --> submitted : System auto-resubmit
+    amended --> submitted : System auto-resubmit [system]
 
-    rejected --> amended : Admin amend
-    rejected --> cancelled : Admin cancel
-    rejected --> submitted : Admin re-submit (ไม่แก้ไข)
+    rejected --> amended : Admin amend แก้ไขส่งใหม่ [admin]
+    rejected --> submitted : Admin re-submit (ไม่แก้ไข) [admin]
+    rejected --> cancelled : Admin cancel [admin]
 
-    delivering --> received : Admin inspect (ครบ)
-    delivering --> partial_received : Admin inspect (ไม่ครบ)
-    delivering --> confirmed : Admin reject lot -> Maker ส่งใหม่
+    delivering --> delivering : Maker ส่งของเพิ่ม (self-loop) [maker]
+    delivering --> received : Admin inspect ครบ [admin]
+    delivering --> partial_received : Admin inspect ไม่ครบ [admin]
+    delivering --> confirmed : Admin reject lot → Maker ส่งใหม่ [admin]
+    delivering --> cancelled : Admin cancel [admin]
 
-    partial_received --> delivering : Maker ส่งเพิ่ม
-    partial_received --> received : Admin รับครบแล้ว
-    partial_received --> cancelled : Admin cancel (rollback inventory+debt)
+    partial_received --> delivering : Maker ส่งเพิ่ม [maker]
+    partial_received --> received : Admin รับครบ [admin]
+    partial_received --> confirmed : Admin reject reship → Maker ส่งใหม่ [admin]
+    partial_received --> cancelled : Admin cancel + rollback inventory+debt [admin]
 
-    received --> paid : Admin จ่ายครบ
-    received --> partial_paid : Admin จ่ายบางส่วน
-    received --> completed : Admin (sample/ของฟรี)
+    received --> confirmed : Admin QC reject reship → Maker ส่งใหม่ [admin]
+    received --> paid : Admin จ่ายครบ [admin]
+    received --> partial_paid : Admin จ่ายบางส่วน [admin]
+    received --> completed : Admin ปิด PO (sample/ของฟรี) [admin]
+    received --> cancelled : Admin cancel rollback debt [admin]
 
-    partial_paid --> paid : Admin จ่ายเพิ่มจนครบ
+    partial_paid --> paid : Admin จ่ายเพิ่มจนครบ [admin]
+    partial_paid --> completed : Admin ปิด (จ่ายบางส่วน + write-off) [admin]
+    partial_paid --> cancelled : Admin cancel rollback debt [admin]
 
-    paid --> completed : System auto-complete
+    paid --> completed : System auto-complete [system]
+    paid --> cancelled : Admin cancel rollback debt [admin]
 
     completed --> [*]
     cancelled --> [*]
 
-    note right of draft : Admin เพิ่งเริ่มกรอก
-    note right of amended : Transient state\nauto-resubmit ทันที
-    note right of cancelled : Terminal state\nV.8.2: FSM transition (ไม่ลบ PO)\nrollback สต็อก+หนี้ ถ้ามี receiving\nเก็บ audit trail ทุก record
-    note right of completed : Terminal state\nPO จบสมบูรณ์
+    note right of draft
+        Admin เพิ่งเริ่มกรอก
+        Currency + exchange_rate
+        ยังแก้ไขได้
+    end note
+
+    note right of amended
+        Transient state
+        auto-resubmit ทันที
+        currency immutable หลัง submitted
+    end note
+
+    note right of delivering
+        Maker ส่งของเพิ่ม = self-loop
+        ไม่ต้องรอตรวจรับ
+        partial_received support
+    end note
+
+    note right of cancelled
+        Terminal state (V.8.2+)
+        FSM transition ไม่ลบ PO
+        rollback สต็อก+หนี้ ถ้ามี receiving
+        เก็บ audit trail ทุก record
+    end note
+
+    note right of completed
+        Terminal state
+        PO จบสมบูรณ์
+    end note
 ```
 
 ### 4.2 Transition Rules Table
 
 | From | To | Actor | เงื่อนไข |
 |------|----|-------|---------|
-| `draft` | `submitted` | Admin | Admin กดยืนยัน PO |
-| `draft` | `cancelled` | Admin | Admin ยกเลิกก่อนส่ง |
-| `submitted` | `confirmed` | Maker | Maker ยืนยัน + กรอก ETA |
-| `submitted` | `rejected` | Maker | Maker ปฏิเสธ + เหตุผล |
-| `submitted` | `amended` | Admin | Admin แก้ไข PO |
-| `submitted` | `cancelled` | Admin | Admin ยกเลิก |
-| `confirmed` | `delivering` | Maker | Maker แจ้งส่งของ |
-| `confirmed` | `amended` | Admin | Admin แก้ไขหลัง confirm |
-| `confirmed` | `cancelled` | Admin | Admin ยกเลิก |
-| `amended` | `submitted` | System | Auto-resubmit ทันที (transient state) |
-| `rejected` | `amended` | Admin | Admin แก้ไขแล้วส่งใหม่ |
-| `rejected` | `cancelled` | Admin | Admin ยกเลิกหลังถูกปฏิเสธ |
-| `rejected` | `submitted` | Admin | Admin re-submit โดยไม่แก้ไข |
-| `delivering` | `received` | Admin | ตรวจรับครบ |
-| `delivering` | `partial_received` | Admin | ตรวจรับไม่ครบ |
-| `delivering` | `confirmed` | Admin | Reject ทั้ง lot -> Maker ส่งใหม่ |
-| `partial_received` | `delivering` | Maker | Maker ส่งเพิ่ม |
-| `partial_received` | `received` | Admin | รับครบแล้ว |
-| `partial_received` | `cancelled` | Admin | Cancel + rollback inventory & debt |
-| `received` | `paid` | Admin | จ่ายเงินครบ |
-| `received` | `partial_paid` | Admin | จ่ายบางส่วน |
-| `received` | `completed` | Admin | Sample/ของฟรี (is_sample=true) |
-| `partial_paid` | `paid` | Admin | จ่ายเพิ่มจนครบ |
-| `paid` | `completed` | System | Auto-complete |
+| `draft` | `submitted` | admin | Admin กดยืนยัน PO |
+| `draft` | `cancelled` | admin | Admin ยกเลิกก่อนส่ง |
+| `submitted` | `confirmed` | maker | Maker ยืนยัน + กรอก ETA |
+| `submitted` | `rejected` | maker | Maker ปฏิเสธ + เหตุผล |
+| `submitted` | `amended` | admin | Admin แก้ไข PO |
+| `submitted` | `cancelled` | admin | Admin ยกเลิก |
+| `confirmed` | `delivering` | maker | Maker แจ้งส่งของ |
+| `confirmed` | `amended` | admin | Admin แก้ไขหลัง confirm |
+| `confirmed` | `cancelled` | admin | Admin ยกเลิก |
+| `amended` | `submitted` | system | Auto-resubmit ทันที (transient state) |
+| `rejected` | `amended` | admin | Admin แก้ไขแล้วส่งใหม่ |
+| `rejected` | `submitted` | admin | Admin re-submit โดยไม่แก้ไข |
+| `rejected` | `cancelled` | admin | Admin ยกเลิกหลังถูกปฏิเสธ |
+| `delivering` | `delivering` | maker | Maker ส่งของเพิ่ม (ไม่ต้องรอตรวจรับ — self-loop) |
+| `delivering` | `received` | admin | ตรวจรับครบ |
+| `delivering` | `partial_received` | admin | ตรวจรับไม่ครบ |
+| `delivering` | `confirmed` | admin | Reject ทั้ง lot → Maker ส่งใหม่ |
+| `delivering` | `cancelled` | admin | Admin ยกเลิก |
+| `partial_received` | `delivering` | maker | Maker ส่งเพิ่ม |
+| `partial_received` | `received` | admin | รับครบ |
+| `partial_received` | `confirmed` | admin | Reject reship → Maker ส่งใหม่ |
+| `partial_received` | `cancelled` | admin | Cancel + rollback inventory & debt |
+| `received` | `confirmed` | admin | QC reject reship → Maker ส่งใหม่ |
+| `received` | `paid` | admin | จ่ายเงินครบ |
+| `received` | `partial_paid` | admin | จ่ายบางส่วน |
+| `received` | `completed` | admin | ปิด PO ไม่จ่าย (sample/ของฟรี — is_sample=true) |
+| `received` | `cancelled` | admin | Cancel + rollback debt |
+| `partial_paid` | `paid` | admin | จ่ายเพิ่มจนครบ |
+| `partial_paid` | `completed` | admin | ปิด PO (จ่ายบางส่วน + write-off) |
+| `partial_paid` | `cancelled` | admin | Cancel + rollback debt |
+| `paid` | `completed` | system | Auto-complete |
+| `paid` | `cancelled` | admin | Cancel + rollback debt |
 
 **Terminal States:** `completed`, `cancelled`
+
+**Atomic Guards (V.1.7 Phase 4d Transaction Wrapper):**
+
+- ทุก transition acquire GET_LOCK `b2f_fsm_po_<id>` (3s timeout) → serialize concurrent transitions
+- Audit row event=`b2f_fsm_transition` with correlation_id chain + fsm='b2f' tag
+- Phase 1.5 in-body `dinoco_audit_log` calls preserved (dual-write index overlay)
+- Failure modes logged: `terminal_state` / `invalid_transition` / `permission_denied`
+- Hook `do_action('b2f_order_status_changed', $po_id, $current, $new_status, $actor)` fires on success
+- Currency immutable หลัง `submitted` — `po_currency` + `po_exchange_rate` snapshot ไม่เปลี่ยน
+- `cancelled` ที่มี receiving records → rollback ผ่าน `dinoco_stock_add()` (คืน leaf) + `b2f_payable_subtract()` (THB amount × exchange_rate snapshot)
 
 ---
 
