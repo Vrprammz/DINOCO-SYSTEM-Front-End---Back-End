@@ -111,7 +111,7 @@ function dinoco_idempotency_compute_body_hash($body_input) {
 
 ## State machine
 
-```
+```text
 client sends key → check store
 ├─ key not found       → INSERT (status=in_progress) → run handler → UPDATE (status=done, response=...)
 ├─ key found, status=in_progress, body matches    → REPLAY 200 with cached response (in-flight retry)
@@ -225,14 +225,162 @@ This means rolling out the wrapper has zero risk for legacy clients — they sim
 - Test/debug endpoints
 - Endpoints with externally-coordinated dedup (e.g. Stripe payments — Stripe handles its own idempotency)
 
+## Bulk endpoint considerations
+
+**Added in Round 26 (bo-split splits[]) and Round 27 (3 bulk endpoints)**.
+
+When the body contains a list (items[], skus[], bo_queue_ids[]), the wrapper
+needs extra care to discriminate "same intent" from "different intent":
+
+### Rule 1 — Canonicalize array order before hashing
+
+Admin reordering rows in the UI is **not** different intent. Sort the array
+by a deterministic key (sku, bo_queue_id, etc.) before hashing.
+
+```php
+// GOOD — admin row reorder ≠ different intent
+usort( $norm_items, function( $a, $b ) {
+    return $a['bo_queue_id'] <=> $b['bo_queue_id'];
+} );
+$idem_body = array( 'items' => $norm_items );
+```
+
+```php
+// BAD — admin reordering rows would surface as 409 unexpectedly
+$idem_body = array( 'items' => $items );  // accepts any order
+```
+
+### Rule 2 — Include semantic per-row fields, exclude metadata
+
+Per-row qty/value/reason changes ARE different intent → MUST be in hash.
+Per-row UI-only fields (display order, color, expanded state) MUST NOT be
+in hash.
+
+```php
+// GOOD — qty + reason discriminate intent
+foreach ( $items as $it ) {
+    $norm_items[] = array(
+        'bo_queue_id' => (int) $it['bo_queue_id'],
+        'qty'         => (int) $it['qty'],  // semantic — admin overriding qty = 409
+    );
+}
+```
+
+### Rule 3 — Normalize string fields (case, whitespace, dedup)
+
+For SKU arrays, uppercase-normalize + dedup + sort:
+
+```php
+$norm_skus = array();
+foreach ( $skus as $s ) {
+    $sku = is_string( $s ) ? trim( $s ) : '';
+    if ( $sku !== '' ) $norm_skus[] = strtoupper( $sku );
+}
+$norm_skus = array_values( array_unique( $norm_skus ) );
+sort( $norm_skus, SORT_STRING );
+```
+
+This means `['DNCBOX500', 'dncrack500']` and `['DNCRACK500', 'DNCBOX500', 'dncbox500']`
+hash identically — admin retyping or reselecting the same set is safe.
+
+### Rule 4 — Avoid timestamp/random in cached response
+
+The bulk wrapper returns the entire batch result. If the result includes
+a server-side timestamp or random ID, replays will return the **stale**
+timestamp from the first call:
+
+```php
+// BAD — ts in $resp = stale on replay
+$resp = array(
+    'success' => true,
+    'results' => $results,
+    'ts'      => current_time( 'mysql' ),  // ⚠ STALE on replay
+);
+dinoco_idempotency_store( $key, $ns, $body, $resp, 200 );
+```
+
+```php
+// GOOD — only deterministic fields in the cached response
+$resp = array(
+    'success' => true,
+    'results' => $results,  // counts + per-item errors only
+);
+dinoco_idempotency_store( $key, $ns, $body, $resp, 200 );
+```
+
+### Rule 5 — Bulk replay returns entire batch result (incl. partial failures)
+
+If 3/5 rows succeeded on first call, the cached response contains
+`{success: 3, failed: 2, errors: [...]}`. Replay returns the same shape —
+admin sees identical confirmation and can act on the same per-item error
+list as the first call.
+
+This is **intentional** — replay = "same answer to same question".
+
+### Reference impl (Round 26 bo-split, canonical example)
+
+```php
+// Top: extract + check
+$idem_key = function_exists('dinoco_idempotency_extract_key')
+    ? dinoco_idempotency_extract_key($request) : '';
+$idem_namespace = 'b2b/v1::bo-split';
+$idem_body = null;
+if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+    // Normalize splits to deterministic shape (sort by sku for stable hash)
+    $norm_splits = array();
+    foreach ($splits as $sp) {
+        if (!is_array($sp)) continue;
+        $norm_splits[] = array(
+            'sku'         => isset($sp['sku']) ? sanitize_text_field($sp['sku']) : '',
+            'qty_fulfill' => isset($sp['qty_fulfill']) ? intval($sp['qty_fulfill']) : 0,
+            'qty_bo'      => isset($sp['qty_bo']) ? intval($sp['qty_bo']) : 0,
+            'eta_days'    => isset($sp['eta_days']) ? intval($sp['eta_days']) : 0,
+        );
+    }
+    usort($norm_splits, function($a, $b) { return strcmp($a['sku'], $b['sku']); });
+    $idem_body = array(
+        'order_id' => $order_id,
+        'dist_id'  => $dist_id,
+        'splits'   => $norm_splits,
+    );
+    $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+    if (is_wp_error($cached)) return $cached;       // 409 conflict
+    if (is_array($cached)) return rest_ensure_response($cached);  // replay
+}
+
+// ... handler logic (unchanged) ...
+
+// Bottom: store
+if ($idem_key !== '' && $idem_body !== null && !is_wp_error($res) && function_exists('dinoco_idempotency_store')) {
+    $resp_data = ($res instanceof WP_REST_Response) ? $res->get_data() : (is_array($res) ? $res : array());
+    $resp_code = ($res instanceof WP_REST_Response) ? $res->get_status() : 200;
+    if (is_array($resp_data) && !empty($resp_data['success'])) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp_data, array('_idem_code' => $resp_code)), $resp_code);
+    }
+}
+return $res;
+```
+
 ## Used in
 
 - **`[Admin System] DINOCO Idempotency Helper` V.1.0** (Round 18 foundation, 5 helpers + 25 unit tests)
-- **`[B2B] Snippet 3` V.42.9** — `place-order` (Round 19, mobile LIFF dup risk)
-- **`[B2B] Snippet 3` (manual-flash-create)** — RPi warehouse Wi-Fi dup risk
-- **`[B2F] Snippet 2` V.11.10** — `create-po` (admin LIFF retry risk)
+- **`[B2B] Snippet 3` V.42.9+** — `place-order`, `manual-flash-create`, `manual-flash-cancel`, `cancel-request` (Round 19 + 23 + 25)
+- **`[B2F] Snippet 2` V.11.10+** — `create-po`, `po-update`, `receive-goods`, `po-cancel`, `maker-confirm`, `record-payment`, `maker-deliver`, `po-complete` (Rounds 19/23/25/26/27)
+- **`[B2B] Snippet 5` V.33.5+** — `confirm-order`, `flash-create`, `update-status` (Round 23/25)
+- **`[B2B] Snippet 16` V.3.4+** — `bo-fulfill`, `bo-confirm-full`, `bo-split`, `bo-undo-split`, `bo-cancel-item`, `bo-bulk-fulfill`, `bo-bulk-cancel` (Round 19/26/27)
+- **`[Admin System] DINOCO Global Inventory Database` V.45.3** — `dip-stock/approve` (Round 27)
+- **`[LIFF AI] Snippet 1` V.1.11** — `lead/{id}/accept` (Round 26)
 
-**Status**: 3/72+ POST endpoints integrated. Remaining deferred until 1-2 weeks production canary observed (per Round 19 recommendation).
+**Status**: 23/75+ POST endpoints integrated (~31% of mutating REST surface).
+
+Cumulative test coverage: 88 contract test cases (3-9 per endpoint depending
+on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php`.
+
+**Recommendation**: Continue bo-undo-split + similar single-button endpoints
+in Round 28 if no production issues observed. Pivot candidates: Sentry
+canary observation / Vite LIFF bundle staging / B2F CPT final drop (target
+2026-05-02 day 14 from Phase 4 migration).
 
 ## Anti-patterns
 
