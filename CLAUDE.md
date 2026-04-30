@@ -170,7 +170,7 @@ All under `/wp-json/dinoco/v1/idempotency*` (V.1.1 — `[Admin System] DINOCO Id
 
 ## REST API Endpoints (MCP Bridge)
 
-All under `/wp-json/dinoco-mcp/v1/` (32 endpoints, V.2.0):
+All under `/wp-json/dinoco-mcp/v1/` (32 endpoints, V.2.0). **Idempotency-Key wrapper**: 13/17 POST endpoints integrated (~76% MCP namespace coverage as of Round 35) — see [`docs/audit/IDEMPOTENCY-COVERAGE.md` § MCP Cluster Coverage](docs/audit/IDEMPOTENCY-COVERAGE.md). Remaining 4 POST routes are read-only queries (product-lookup/dealer-lookup/warranty-check/kb-search) — naturally idempotent.
 - **Core**: `product-lookup` (+stock_status), `dealer-lookup`, `warranty-check`, `kb-search`, `kb-export`, `catalog-full`, `distributor-notify`, `distributor-list`, `kb-suggest`, `brand-voice-submit`
 - **Claims**: `claim-manual-create`, `claim-manual-update`, `claim-manual-status`, `claim-manual-list`, `claim-status`
 - **Leads (P1)**: `lead-create`, `lead-update`, `lead-list`, `lead-get/{id}`, `lead-followup-schedule`
