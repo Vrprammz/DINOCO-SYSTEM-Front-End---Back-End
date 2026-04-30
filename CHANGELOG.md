@@ -10,6 +10,62 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fix — Round 18 (API-H4 Idempotency-Key foundation + more unit tests + cleanup) (2026-04-29)
+
+After Round 17 closed +37 unit tests (IntentBreakdown + ValidateSkuHierarchy) + 4 Mermaid diagrams (MCP Bridge + Brand Voice), Round 18 closes the long-deferred **API-H4 Idempotency-Key** infrastructure as foundation only (NEW snippet + helpers + tests, no endpoint integration this round). Plus +18 more unit tests for `dinoco_is_top_level_set()` (B2C visibility filter / DD-6 invariant). Test suite grows 320 → 363 (+13.4%).
+
+#### ITEM A — API-H4 Idempotency-Key Helper Foundation V.1.0 (commit `aab03c6`)
+
+- **NEW snippet `[Admin System] DINOCO Idempotency Helper` V.1.0** (~600 LOC, DB_ID pending) — additive infrastructure for safe POST retry handling. Closes audit memory `project_audit_2026_04_17_pending_actions.md` "API-H4 Idempotency-Key header (75+ POST endpoints) — Phase 5+ Deferred" as **foundation only**. Endpoint integration deferred to future rounds (5-10 endpoints at a time).
+- **Schema** (lazy-installed via `dbDelta` on `admin_init`): `wp_dinoco_idempotency_keys` (idempotency_key VARCHAR(64), namespace VARCHAR(64), request_hash CHAR(64), response_data LONGTEXT, response_code SMALLINT, user_id, request_ip, created_at, expires_at). 2 indexes: composite `idx_key_namespace` (primary lookup) + `idx_expires_at` (cleanup DELETE).
+- **Public API** (5 functions, all `function_exists` guarded):
+  - `dinoco_idempotency_hash($body)` — SHA256 hex, body normalization (array/object → JSON, scalar → string, null → '')
+  - `dinoco_idempotency_extract_key($req)` — header reader with strict validation (1-64 chars, `[A-Za-z0-9._-]` only, UUID/ULID compatible)
+  - `dinoco_idempotency_check($key, $namespace, $body)` — returns `array` (replay), `WP_Error 409` (hash mismatch = conflict), or `null` (proceed to handler)
+  - `dinoco_idempotency_store($key, $namespace, $body, $resp, $code, $ttl)` — persist for 24h replay (TTL 60s..7d clamp)
+  - `dinoco_idempotency_query($args)` — admin viewer with namespace + user_id filters
+- **Cleanup cron**: `dinoco_idempotency_cleanup_cron` daily 03:15 (offset from flag-audit retention 03:00 to spread DB load). Chunked 1000/iter × 20 iter cap = 20K rows/run.
+- **REST API** (admin only, `manage_options` + `wp_rest` nonce): `GET /dinoco/v1/idempotency` (list with filters) + `POST /dinoco/v1/idempotency/cleanup` (manual trigger).
+- **Admin viewer**: shortcode `[dinoco_idempotency_viewer]` — table list + filters + manual cleanup button + amber "Foundation Mode" banner clarifying no endpoints use it yet.
+- **Tests** (NEW `tests/helpers/IdempotencyTest.php`, 25 cases, 31 assertions): HASH (12 cases — 64-char SHA256 hex, identical body deterministic, different body distinct, null = '' well-known constant, string pass-through, scalar coercion, order-sensitive RFC draft, nested array, empty array vs null distinct, stdClass = assoc array, Thai unicode preserved). EXTRACT KEY (11 cases — UUID v4, ULID, empty, whitespace only, trimmed, too long >64, boundary 64, special chars rejected (SQL inject/spaces/slashes/HTML), whitelist `.-_` allowed, unicode rejected, single char). CONFLICT (2 cases — hash mismatch reliable, identical retry deterministic).
+- **Risk: NONE** — additive new snippet, zero existing-code changes, no endpoint integration this round. Defensive fail-soft if table missing (lazy install + silent return null).
+
+#### ITEM B — +18 IsTopLevelSet test cases (commit `b4eb5e9`)
+
+- **NEW `tests/helpers/IsTopLevelSetTest.php`** (18 tests, 24 assertions) — locks the DD-6 invariant for `dinoco_is_top_level_set()` (Snippet 15 V.6.0+ lines 1736-1759).
+- **Why DD-6 lock matters**: Wrong = TRUE → sub-SET appears as standalone B2C product → customer buys "half a kit" → claim/refund hell. Wrong = FALSE → real top-level SET hidden from B2C → lost sales.
+- **Coverage**:
+  - **POSITIVE (5 cases)**: standard 3-level top set / 2-level direct leaves / DD-3 both parents top-level / lowercase normalization / whitespace trim
+  - **NEGATIVE (7 cases)**: intermediate child / leaf SKU / unknown SKU / DD-3 shared child (any parent disqualifies) / empty relations / empty children array / bare SKU
+  - **EDGE (5 cases)**: lowercase children in relations / whitespace in relations / non-array children value (defensive) / empty string input / whitespace input
+  - **INVARIANT (1 case)**: Real-world DINOCO catalog example — `DNCGNDPRO5500` shared leaf NEVER appears as B2C bundle even though referenced by 2 SETs
+- **Pattern**: same isolation as existing helpers (`HierarchyTest`, `ValidateSkuHierarchyTest`) — inline pure logic, `function_exists` guard, `declare(strict_types=1)`, no WP boot, no DB. Adapter accepts `$relations` by-arg instead of `get_option` call.
+- **Risk: NONE** — additive tests only.
+
+#### ITEM C — Cleanup + verification (this entry)
+
+- **PHPUnit**: 320 → 363 tests (+43, +13.4%), 502 → 557 assertions (+55). Runtime ~7ms. All green. Zero failures, zero errors. PHP 8.5.4.
+- **Jest**: 19 suites, 146 passed, 2 skipped. Runtime ~1.0s. All green.
+- **README badge**: Updated PHPUnit count badge `211_passing` → `363_passing` (had drifted across rounds).
+- **DB_ID drift test** (`tests/jest/snippet-db-id.test.js`): NEW Idempotency snippet uses `DB_ID: (pending — populate after first WP Code Snippets sync)` placeholder pattern — passes drift detector.
+- **PHP syntax**: `[Admin System] DINOCO Idempotency Helper` validated via `php -l` (with `<?php` prepend per WP Code Snippets convention).
+
+#### Cumulative impact (Rounds 1-18)
+
+- Tests: 0 → 363 (+363 across 18 rounds)
+- Mermaid diagrams: 0 → 22
+- Drift detectors: 0 → 7
+- Doc index files: 0 → 1 (regression manifest)
+- Audit findings closed: 39+ (UX-H3, onerror sweeps, PERF guards, Flag Audit Log, **API-H4 Foundation**, etc.)
+
+#### Files Touched (Round 18, 4 total)
+
+- 1 new snippet: `[Admin System] DINOCO Idempotency Helper` (+~600 LOC)
+- 2 new tests: `tests/helpers/IdempotencyTest.php` (+~210 LOC) + `tests/helpers/IsTopLevelSetTest.php` (+~252 LOC)
+- 1 docs update: `README.md` (test count badge bump)
+
+---
+
 ### Fix — Round 17 (MCP Bridge architecture diagram + Brand Voice flow + more unit tests) (2026-04-29)
 
 After Round 16 closed +31 unit tests + 2 Mermaid diagrams + master regression index, Round 17 continues safe polish: 4 new Mermaid diagrams documenting the largest API namespace (MCP Bridge — 32 endpoints) + Brand Voice Pool entry lifecycle, plus 2 more unit test suites covering V.7.0 intent breakdown aggregator + Snippet 15 hierarchy validator. Test suite grows 283 → 320 (+13.1%). Cumulative diagrams 18 → 22.

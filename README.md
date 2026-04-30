@@ -7,7 +7,7 @@
 [![Regression Guard](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml)
 [![Coverage Lines](https://img.shields.io/badge/jest_coverage_lines-98.68%25-brightgreen)](coverage/jest/index.html)
 [![Coverage Branches](https://img.shields.io/badge/jest_coverage_branches-85.09%25-green)](coverage/jest/index.html)
-[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-211_passing-brightgreen)](tests/helpers/)
+[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-363_passing-brightgreen)](tests/helpers/)
 
 WordPress-based motorcycle warranty management platform serving B2C members and B2B distributors.
 
