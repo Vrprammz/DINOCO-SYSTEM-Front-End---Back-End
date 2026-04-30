@@ -43,6 +43,15 @@ const DOCUMENTED_NOT_USED = new Set([
     // trail value (Phase 1 cleanup record). Verify removal: grep
     // returns 0 PHP refs as of 2026-04-29.
     "b2f_flag_ungroup_auto_hide",
+    // Historical-context mention only. The actual runtime flag is
+    // `dinoco_shipping_meta_enabled` (without the `_flag_` infix), wired
+    // throughout Snippet 1 + Snippet 3 + Snippet 15 (V.42 Flash Shipping
+    // Metadata system). The misspelled `dinoco_flag_shipping_meta_enabled`
+    // appeared in early FEATURE-SPEC drafts + CHANGELOG; Day 1 Quick Wins
+    // (commit `357852a`, 2026-04-29) sync'd 10 occurrences across docs.
+    // CLAUDE.md preserves the mention as Day 1 Quick Wins audit trail —
+    // explaining the doc-drift fix. Verify: grep returns 0 PHP refs.
+    "dinoco_flag_shipping_meta_enabled",
 ]);
 
 /**
