@@ -25,34 +25,70 @@
 |--------|-------|
 | Distinct namespaces | **12** |
 | Total `register_rest_route` calls | **334** |
-| Total endpoint method definitions | **335** (1 multi-method route adds +1) |
-| **Total POST endpoint definitions** | **193** |
-| Idempotency-integrated endpoints | **39** (Round 30 batch 8) |
-| **Coverage** | **39 / 193 = 20.2%** of POST endpoints |
+| Total endpoint method definitions | **334** (Round 33 fresh re-census) |
+| **Total POST endpoint definitions** | **196** (Round 33: +3 since Round 30) |
+| Total GET endpoint definitions | **137** |
+| Total DELETE endpoint definitions | **1** (`/dinoco-stock/v1/warehouse`) |
+| Multi-method routes | **0** |
+| Idempotency-integrated endpoints | **54** (Round 33 batch 11) |
+| **Coverage** | **54 / 196 = 27.6%** of POST endpoints |
 
 > Note: The previous tracker denominator of "~75 POST endpoints" was a
-> conservative pre-audit estimate. The actual census (193) means earlier
-> rounds reported inflated coverage percentages. **Round 30 establishes the
-> authoritative denominator** (193) for future tracking.
+> conservative pre-audit estimate. The actual census (193 → 196 in Round 33)
+> means earlier rounds reported inflated coverage percentages. **Round 30
+> established the authoritative denominator**, and Round 33 refreshed it for
+> natural growth (+3 POST endpoints since Round 30 — likely Slip Monitor / Flag
+> Audit / Idempotency self-admin endpoints).
 
 ---
 
-## Per-namespace breakdown
+## Per-namespace breakdown (Round 33 fresh re-census)
 
-| Namespace | Routes | GET | POST | DELETE | Sample paths (top 5) |
-|-----------|--------|-----|------|--------|---------------------|
-| `b2b/v1` | 128 | 44 | 84 | 0 | `/place-order`, `/manual-flash-create`, `/bo-fulfill`, `/flash-create`, `/print-heartbeat` |
-| `dinoco-stock/v1` | 42 | 19 | 22 | 1 | `/stock/adjust`, `/stock/transfer`, `/dip-stock/approve`, `/warehouses`, `/margin-analysis` |
-| `dinoco-mcp/v1` | 32 | 15 | 17 | 0 | `/claim-manual-create`, `/lead-create`, `/product-lookup`, `/dealer-lookup`, `/warranty-check` |
-| `b2f/v1` | 29 | 8 | 21 | 0 | `/create-po`, `/maker-confirm`, `/receive-goods`, `/po-update`, `/po-cancel` |
-| `dinoco-b2f-audit/v1` | 22 | 11 | 11 | 0 | `/sync-missing-intermediates`, `/junction-bulk-delete`, `/observations`, `/dry-run`, `/feature-flags` |
-| `dinoco/v1` | 22 | 12 | 10 | 0 | `/sync-status`, `/audit/retention/run`, `/flag-audit/export`, `/onboard/save`, `/idempotency` |
-| `dinoco-slip/v1` | 15 | 9 | 6 | 0 | `/manual-process`, `/replay-slip`, `/clear-locks`, `/missed-sweep`, `/ai-toggle` |
-| `liff-ai/v1` | 13 | 7 | 6 | 0 | `/auth`, `/dashboard`, `/lead/(?P<id>[a-f0-9]+)/accept`, `/agent-ask`, `/dealer-dashboard` |
-| `dinoco-flash-golive/v1` | 10 | 5 | 5 | 0 | `/preflight`, `/flip-flag`, `/save-pack-slots`, `/box-templates-list`, `/multi-box-pending` |
-| `dinoco-gdpr/v1` | 10 | 4 | 6 | 0 | `/my-data-export`, `/my-data-delete`, `/my-data-status`, `/admin/request/(?P<id>\d+)/approve`, `/admin/request/(?P<id>\d+)/reject` |
-| `brand-voice/v1` | 7 | 2 | 5 | 0 | `/entries`, `/entries/ai-bulk`, `/api-keys/generate`, `/api-keys`, `/meta` |
-| `dinoco-export/v1` | 4 | 4 | 0 | 0 | `/makers`, `/catalog`, `/download-all`, `/health` |
+| Namespace | Routes | GET | POST | DELETE | PUT | PATCH | Sample paths (top 5) |
+|-----------|--------|-----|------|--------|-----|-------|---------------------|
+| `b2b/v1` | 126 | 40 | 86 | 0 | 0 | 0 | `/place-order`, `/manual-flash-create`, `/bo-fulfill`, `/flash-create`, `/print-heartbeat` |
+| `dinoco-stock/v1` | 42 | 19 | 22 | 1 | 0 | 0 | `/stock/adjust`, `/stock/transfer`, `/dip-stock/approve`, `/warehouses`, `/margin-analysis` |
+| `dinoco-mcp/v1` | 32 | 15 | 17 | 0 | 0 | 0 | `/claim-manual-create`, `/lead-create`, `/product-lookup`, `/dealer-lookup`, `/warranty-check` |
+| `b2f/v1` | 29 | 8 | 21 | 0 | 0 | 0 | `/create-po`, `/maker-confirm`, `/receive-goods`, `/po-update`, `/po-cancel` |
+| `dinoco-b2f-audit/v1` | 24 | 12 | 12 | 0 | 0 | 0 | `/sync-missing-intermediates`, `/junction-bulk-delete`, `/observations`, `/dry-run`, `/feature-flags` |
+| `dinoco/v1` | 22 | 12 | 10 | 0 | 0 | 0 | `/sync-status`, `/audit/retention/run`, `/flag-audit/export`, `/onboard/save`, `/idempotency` |
+| `dinoco-slip/v1` | 15 | 9 | 6 | 0 | 0 | 0 | `/manual-process`, `/replay-slip`, `/clear-locks`, `/missed-sweep`, `/ai-toggle` |
+| `liff-ai/v1` | 13 | 7 | 6 | 0 | 0 | 0 | `/auth`, `/dashboard`, `/lead/(?P<id>[a-f0-9]+)/accept`, `/agent-ask`, `/dealer-dashboard` |
+| `dinoco-flash-golive/v1` | 10 | 5 | 5 | 0 | 0 | 0 | `/preflight`, `/flip-flag`, `/save-pack-slots`, `/box-templates-list`, `/multi-box-pending` |
+| `dinoco-gdpr/v1` | 10 | 4 | 6 | 0 | 0 | 0 | `/my-data-export`, `/my-data-delete`, `/my-data-status`, `/admin/request/(?P<id>\d+)/approve`, `/admin/request/(?P<id>\d+)/reject` |
+| `brand-voice/v1` | 7 | 2 | 5 | 0 | 0 | 0 | `/entries`, `/entries/ai-bulk`, `/api-keys/generate`, `/api-keys`, `/meta` |
+| `dinoco-export/v1` | 4 | 4 | 0 | 0 | 0 | 0 | `/makers`, `/catalog`, `/download-all`, `/health` |
+| **TOTAL** | **334** | **137** | **196** | **1** | **0** | **0** | — |
+
+### Method coverage analysis (Round 33)
+
+| Method | Count | % of total | Idempotency relevance |
+|--------|-------|-----------|----------------------|
+| **POST** | **196** | **58.7%** | **Target for idempotency wrappers** — mutation endpoints where double-fire = side effect duplication |
+| GET | 137 | 41.0% | **Skip** — read-only by definition, idempotent for free (no side effects) |
+| DELETE | 1 | 0.3% | **Consider** — idempotent at DELETE semantics (delete twice = same end state) but admin double-click = cleaner UX with wrapper |
+| PUT | 0 | 0% | N/A — DINOCO uses POST for all upserts |
+| PATCH | 0 | 0% | N/A — DINOCO uses POST for partial updates |
+| Multi-method routes | 0 | 0% | N/A — every `register_rest_route` call binds 1 method (no `methods=>['GET','POST']` patterns) |
+
+> **Why POST-only tracker scope**: GET endpoints are replay-safe by definition (no
+> side effects → identical responses without server state mutation). DELETE has
+> only 1 endpoint (`/dinoco-stock/v1/warehouse` admin warehouse delete) which is
+> idempotent at semantics level (DELETE twice = same end state); a wrapper would
+> only improve UX (cleaner error messages on double-click) not data correctness.
+> PUT/PATCH unused (DINOCO follows REST-loose convention: POST for all writes).
+> See `tests/jest/idempotency-tracker-drift.test.js` Round 33 POST-only assertion
+> that enforces this scope.
+
+### Multi-method routes detection
+
+The Round 30 census initially noted "1 multi-method route adds +1" leading to
+335 endpoint definitions. Round 33 fresh re-census found **0 multi-method
+routes** — every `register_rest_route` call binds exactly 1 HTTP method via
+either string literal (`'methods' => 'POST'`) or constant
+(`WP_REST_Server::CREATABLE` etc.). The previous +1 discrepancy was likely a
+parser edge case in the Round 30 Python script. Total endpoint methods = 334
+(matches `register_rest_route` call count exactly).
 
 ---
 
@@ -73,22 +109,22 @@
 
 ---
 
-## Idempotency coverage by namespace
+## Idempotency coverage by namespace (Round 33)
 
 | Namespace | POST total | Integrated | Coverage |
 |-----------|-----------|------------|----------|
-| `b2b/v1` | 84 | 22 | 26.2% |
-| `b2f/v1` | 21 | 10 | 47.6% |
-| `dinoco-stock/v1` | 22 | 4 | 18.2% |
-| `dinoco-mcp/v1` | 17 | 2 | 11.8% (Round 30 entry) |
+| `b2b/v1` | 86 | 25 | 29.1% |
+| `b2f/v1` | 21 | 16 | 76.2% (highest — Round 33 +3: maker-product, maker, po-undo-submit; remaining: maker/delete, maker/toggle-bot, maker-product/delete, po-detail/jwt POST, auth-admin) |
+| `dinoco-stock/v1` | 22 | 6 | 27.3% |
+| `dinoco-mcp/v1` | 17 | 6 | 35.3% (Round 33 +2: distributor-notify, customer-link) |
 | `liff-ai/v1` | 6 | 1 | 16.7% |
 | `dinoco/v1` | 10 | 0 | 0% |
-| `dinoco-b2f-audit/v1` | 11 | 0 | 0% (admin-only audit endpoints — lower priority) |
+| `dinoco-b2f-audit/v1` | 12 | 0 | 0% (admin-only audit endpoints — lower priority) |
 | `dinoco-slip/v1` | 6 | 0 | 0% |
 | `dinoco-flash-golive/v1` | 5 | 0 | 0% (one-time tool) |
 | `dinoco-gdpr/v1` | 6 | 0 | 0% (V.1.0 stubs — full impl deferred) |
 | `brand-voice/v1` | 5 | 0 | 0% |
-| **Total** | **193** | **39** | **20.2%** |
+| **Total** | **196** | **54** | **27.6%** |
 
 ---
 
