@@ -10,6 +10,64 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Refactor — Round 6 UX-H3 Phase 3 (closeModal delegation) + Workflow Diagrams (2026-04-29)
+
+2 commits closing 2 audit items. Risk: LOW (additive same-behavior refactor + pure docs work).
+
+**ITEM A — UX-H3 Phase 3: closeModal delegation (B2F Snippet 5 V.8.2 → V.8.3, commit `1d1ba6d`)**
+
+20 inline `onclick="B2F_*.closeModal('id')"` sites migrated to
+`data-action="modal-close"` + `data-modal-target="<id>"` pattern. Per-module
+delegation handlers extended (Orders 9 + Makers 8 + Credit 3 = 20 sites total).
+
+Each branch is scoped via `.closest('.b2f-modal-backdrop')` ID match against
+per-module whitelist (`ordersIds` / `makersIds` / `creditIds`) — prevents
+cross-module fire when 3 delegation handlers see the same `data-action='modal-close'`
+signal. Behavior preservation: identical to legacy onclick (DOM `removeClass('open')`
+via existing `closeModal()`). `closeModal` functions intact in all 3 module
+IIFEs and still exposed via `window.B2F_*.closeModal` for backward compat with
+dynamic detail-modal action buttons (line ~1702-1726, deferred to Round 7+
+as compound onclick with id+name args).
+
+Total `onclick=` sites migrated: 19 (Phase 1) + 24 (Phase 2) + 20 (Phase 3) =
+**63 of 124**. `stopPropagation` containers (11 static + 6 dynamic) deferred —
+element-level handler is required for backdrop-click semantics (event must stop
+BEFORE bubbling reaches backdrop; document-level delegation fires too late).
+
+PHP lint clean. Modal IDs cross-checked against actual `<div class="b2f-modal-backdrop" id="...">`
+elements (11 modals total — all whitelisted correctly).
+
+**ITEM B — Workflow Mermaid diagrams (commit `8a12728`)**
+
+3 NEW Mermaid diagrams added to `WORKFLOW-REFERENCE.md` to fill visual coverage
+gaps for text-only flows. Pure docs work — zero code changes, no runtime risk.
+
+1. **§2.3.1 Slip Verification Sequence Diagram** (sequenceDiagram) — 6 participants
+   (Customer/LineG/Bot/Slip2Go/DB/AdminG), 2 nested `alt` blocks for B2B customer
+   + B2F maker flows, foreign currency PO note (CNY/USD skips Slip2Go),
+   implementation refs (Snippet 2/3, `B2B_SLIP2GO_SECRET_KEY`, atomic txns).
+
+2. **§10.5.1 Dip Stock Cycle State Diagram** (stateDiagram-v2) — 5 states
+   (`not_started → counting → variance_review → approved/force_closed/expired`),
+   cron auto-expire edge (>48h), state transitions table (6×4), V.39.0 leaf-only
+   guards (DD-2).
+
+3. **§7.2.1 LIFF AI Lead Pipeline State Diagram** (stateDiagram-v2) — 11 states
+   covering `lead-pipeline.js` V.2.0 transitions, auto-followup cron note (4h),
+   trigger triggers table (6 source types), FSM authority ref
+   (`updateLeadStatus()`), backward compat note (3 V.2.0 statuses additive only).
+
+Mermaid block balance verified (8 starts ↔ 8 closes). Both new tables use
+spaced separator format (MD060 lint clean).
+
+**Round 6 Cumulative Status (post-Round 5 backlog drain)**:
+
+- Round 1-5 closed: 12 items (BO V.3.0, PERF sweeps, Flag Audit Log, Wave 3 UI gaps 3+4+5, UX-H3 Phase 1+2)
+- Round 6 closes: 2 items (UX-H3 Phase 3 + Workflow Diagrams)
+- Total UX-H3 sites closed: 63/124 (51%) — remaining 61 = 11 stopProp static
+  (defer — backdrop semantics need element-level), 30 dynamic onclick (PO cards
+  / SKU rows with id+name args — needs careful data-attr escaping), 20 misc.
+
 ### Refactor — Round 5 UX-H3 onclick → Event Delegation + PERF Sweep Round 2 (2026-04-29)
 
 3 commits closing 2 deferred audit items. Risk: LOW (additive — same behavior,
