@@ -10,6 +10,86 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 30 (Idempotency batch 8 + F1 drift fix + REST endpoint census) (2026-04-30)
+
+Round 30 closes 2 high-priority Round 29 drift findings (F1 HIGH bo-fulfill drift + F3 MEDIUM REST endpoint count drift) + extends Idempotency-Key infrastructure to 5 new POST endpoints. **Cumulative: 39 integrated endpoints** with new authoritative denominator established. ZERO regressions across 589 PHPUnit + 156 Jest tests.
+
+#### Phase 1 — F1 HIGH FIX: bo-fulfill drift remediation
+
+Round 29 drift sweep flagged that `POST /b2b/v1/bo-fulfill` (tracker entry #14) was listed as integrated since Round 19 but actual code at `[B2B] Snippet 16` lines 2114+ had NO idempotency wrapper — only `bo-bulk-fulfill` did. Risk: admin double-click on "ส่งสินค้า BO" Flex action → debt double-add + duplicate Flash secondary order + duplicate "BO ready" Flex card to customer (M7 builder fires twice).
+
+**Fix** (`[B2B] Snippet 16` V.3.5 → V.3.6): wrapper inserted before `dinoco_transaction()` call (and legacy path). Body hash = `{order_id, items[sort by bo_queue_id, qty]}`. GET_LOCK + idempotency complement: GET_LOCK serializes concurrent calls but releases on completion → 2nd call after release re-runs full mutation chain. Idempotency cache returns cached response immediately without re-executing — true replay safety. Cache stores ONLY on success (WP_Error skips cache so retry re-evaluates).
+
+#### Phase 2 — F3 MEDIUM FIX: REST endpoint census
+
+CLAUDE.md line 59 claimed "125+ REST endpoints across 7 namespaces" — Round 29 found 335 actual `register_rest_route` calls. Round 30 ran a comprehensive census (Python AST-style regex resolving variable namespaces `$ns` + constants `B2F_AUDIT_NS` + `define()` lookups).
+
+**Result**: **334 register_rest_route calls across 12 namespaces** (193 POST + 141 GET/DELETE). 5 new namespaces vs April 17 baseline: `dinoco-slip/v1`, `dinoco-flash-golive/v1`, `dinoco-gdpr/v1`, `brand-voice/v1`, `dinoco-export/v1`.
+
+Per-namespace breakdown:
+
+| Namespace | Routes | POST | Sample |
+| --- | --- | --- | --- |
+| `b2b/v1` | 128 | 84 | place-order, manual-flash-create, bo-fulfill |
+| `dinoco-stock/v1` | 42 | 22 | stock/adjust, stock/transfer, dip-stock/approve |
+| `dinoco-mcp/v1` | 32 | 17 | claim-manual-create, lead-create |
+| `b2f/v1` | 29 | 21 | create-po, maker-confirm, receive-goods |
+| `dinoco-b2f-audit/v1` | 22 | 11 | sync-missing-intermediates, junction-bulk-delete |
+| `dinoco/v1` | 22 | 10 | flag-audit, idempotency, audit/retention |
+| `dinoco-slip/v1` | 15 | 6 | manual-process, replay-slip |
+| `liff-ai/v1` | 13 | 6 | auth, lead/{id}/accept |
+| `dinoco-flash-golive/v1` | 10 | 5 | preflight, flip-flag |
+| `dinoco-gdpr/v1` | 10 | 6 | my-data-export, my-data-delete |
+| `brand-voice/v1` | 7 | 5 | entries, api-keys |
+| `dinoco-export/v1` | 4 | 0 | makers, catalog |
+
+Updated CLAUDE.md to reflect new totals. Full census: `docs/audit/REST-ENDPOINT-CENSUS-2026-04-30.md`.
+
+**Idempotency denominator correction**: Pre-Round 30 tracker assumed ~75 POST endpoints. Authoritative count is 193. **Round 30 coverage = 39 / 193 = 20.2%** (not the 50% milestone the prompt anticipated). Pre-Round 30 milestones (25%/30%/35%/40%/45%) used estimated denominators and are now retrospectively known to be inflated. Foundation + retry-prone hot paths (BO + Flash + create-PO + B2F writes) are fully covered — true 50% milestone (~97 endpoints) is a future round target.
+
+#### Phase 3 — Idempotency batch 8 (5 NEW endpoints + 21 contract tests)
+
+| Endpoint | Snippet | Body Hash Inputs | Use Case |
+| --- | --- | --- | --- |
+| `POST /dinoco-mcp/v1/claim-manual-create` | MCP V.2.3 → V.2.4 | `{serial, symptoms, source_id, platform, customer, phone}` | OpenClaw chatbot Gemini function-call retry path → duplicate claim CPT records cleaned in Service Center. source_id = FB/IG/LINE user ID primary discriminator. photos[] EXCLUDED (CDN signed URLs differ between retries). |
+| `POST /dinoco-mcp/v1/lead-create` | MCP V.2.3 → V.2.4 | `{source_id, phone, platform, product_interest, customer_name}` | Mobile chatbot retry → duplicate `LEAD-{ts}-{rand}` records (timestamp + rand suffix means no natural dedup). |
+| `POST /dinoco-stock/v1/stock/initialize` | Inventory V.45.3 → V.45.4 | `{action: 'init'}` (constant marker — endpoint takes no params) | Admin "เริ่มต้น Dip Stock" first-run flag flip — double-click harmless functionally but emits 2 audit log lines pre-fix. |
+| `POST /dinoco-stock/v1/stock/adjust` | Inventory V.45.4 | `{sku, type, qty, reason, warehouse_id}` | Admin manual stock adjust. Without wrapper, double-click on "ปรับสต็อก" → 2x stock movement = WRONG balance. type=add vs subtract = CRITICAL discriminator. |
+| `POST /dinoco-stock/v1/stock/transfer` | Inventory V.45.4 | `{sku, from_wh, to_wh, qty, reason}` | Warehouse-to-warehouse transfer. Double-click → 2x transfer = WRONG balance both warehouses. from_wh/to_wh swap caught (1→2 vs 2→1 ≠ same intent). |
+
+**Test additions** (`tests/helpers/IdempotencyRound30Test.php` — 21 cases via `IdempotencyTestFixture` Round 29 DRY base class):
+
+- 3 cases × 5 new endpoints + 3 cases × bo-fulfill = 18 endpoint-specific
+- 1 cumulative no-collision (Round 30: 6 shapes unique)
+- 1 cross-namespace collision guard (claim-manual-create vs lead-create — same source_id+phone but different schema)
+- 1 stock-initialize constant-marker stability (no timestamp/random in hash)
+
+**Pattern (proven Round 19/23/25/26/27/28/29)**: optional `X-Idempotency-Key` header + helper triad + `function_exists()` defensive guards. Backward compat: missing header = byte-identical to previous version. WP_Error 409 on body hash mismatch.
+
+#### Files touched
+
+- `[B2B] Snippet 16: Backorder System` V.3.5 → V.3.6 (F1 fix)
+- `[System] DINOCO MCP Bridge` V.2.3 → V.2.4 (claim + lead create)
+- `[Admin System] DINOCO Global Inventory Database` V.45.3 → V.45.4 (3 stock endpoints)
+- `tests/helpers/IdempotencyRound30Test.php` NEW (21 cases)
+- `docs/audit/REST-ENDPOINT-CENSUS-2026-04-30.md` NEW
+- `docs/audit/IDEMPOTENCY-COVERAGE.md` updated (39 integrated, 193 denominator)
+- `CLAUDE.md` REST endpoint count drift fix (125+ → 334)
+
+#### Test results
+
+- PHPUnit: 568 → **589 tests** (+21 Round 30 contract tests, 100% pass)
+- Jest: **156 stable** (no UI/contract changes)
+- ZERO production-path regressions
+
+#### Pending Round 31
+
+- Idempotency batch 9 (Round 31 candidates: claim-manual-update, lead-update, product/pricing, warehouse, maker-reject)
+- Test coverage: bring authoritative denominator coverage from 20.2% → 25%
+- Cron audit follow-ups from Round 28 deferred items
+
+---
+
 ### Feature — Round 28 (Idempotency batch 6 +5 endpoints + cron audit + coverage tracker) (2026-04-30)
 
 Round 28 extends Idempotency-Key infrastructure to 5 admin POST endpoints + closes 2 cron heartbeat gaps + introduces a single-source-of-truth coverage tracker. **Cumulative: 28/75+ POST endpoints (~37% of mutating REST surface)**. ZERO regressions, all gates green.

@@ -17,11 +17,40 @@
 
 | Metric | Count |
 |--------|-------|
-| Total integrated endpoints | **33** |
-| Estimated total POST endpoints | ~75 |
-| Coverage | **~44%** |
-| Cumulative test cases | 145 (Round 19-29 contract + fixture-based) |
-| Body-shape distinct hashes asserted | 32 (bo-undo-split shares shape with bo-confirm-full + delete-ticket shares shape with recalculate-total — both namespace-discriminated) |
+| Total integrated endpoints | **39** (Round 30: +5 new + bo-fulfill F1 fix) |
+| **Total POST endpoints (authoritative — Round 30 census)** | **193** |
+| Coverage | **39 / 193 = 20.2%** of POST endpoints |
+| Cumulative test cases | 166 (Round 19-30 contract + fixture-based — Round 30 added 21) |
+| Body-shape distinct hashes asserted | 38 (bo-undo-split shares shape with bo-confirm-full + delete-ticket shares shape with recalculate-total — both namespace-discriminated) |
+
+> **Round 30 note**: Earlier rounds reported coverage against a conservative
+> "~75 POST endpoints" estimate. The Round 30 REST endpoint census
+> ([REST-ENDPOINT-CENSUS-2026-04-30.md](./REST-ENDPOINT-CENSUS-2026-04-30.md))
+> established the authoritative denominator of **193 POST endpoints**, so
+> percentages prior to this round were inflated. The 50% milestone target
+> (~97 endpoints) is therefore further out than initially planned — but
+> the foundation + retry-prone hot paths (BO + Flash + create-PO + B2F
+> writes) are now fully covered.
+
+---
+
+## Milestones
+
+| Milestone | Round | Date | Notes |
+|-----------|-------|------|-------|
+| 25% (against ~75 estimate) | 22 | 2026-04-29 | First batch coverage past 1/4 of estimated total |
+| 30% | 24 | 2026-04-29 | After Round 24 multi-currency POs |
+| 35% | 26 | 2026-04-30 | BO endpoints (split + bulk-fulfill etc.) |
+| 40% | 28 | 2026-04-30 | Admin BO + B2F approve-reschedule |
+| 45% | 29 | 2026-04-30 | Combined-slip + import-distributors + delete/recalculate |
+| **20.2% (corrected denominator)** | **30** | **2026-04-30** | Round 30 census reset — actual is 39/193 = 20.2% (not 50%). The pre-Round 30 milestones used estimated denominators; once authoritative count was established, real coverage is more conservative. Foundation + hot-path retry-prone endpoints fully covered. |
+
+> **Why no 50% milestone in Round 30**: User-facing milestone celebration in the
+> Round 30 prompt assumed the ~75 denominator. The REST endpoint census (F3
+> deferred fix from Round 29) revealed the real denominator is 193 POST
+> endpoints. Round 30 still represents major progress (39 endpoints integrated +
+> tracker drift fix + 21 new contract tests), but mathematical 50% (~97
+> endpoints) is a future milestone, not Round 30.
 
 ---
 
@@ -63,29 +92,36 @@
 | 32 | `POST /b2b/v1/delete-ticket` | `[B2B] Snippet 5` V.33.7 | single (shares {ticket_id} shape with recalculate-total — namespace-discriminated) | **29** | **integrated** |
 | 33 | `POST /b2b/v1/recalculate-total` | `[B2B] Snippet 5` V.33.7 | single (shares {ticket_id} shape with delete-ticket — namespace-discriminated) | **29** | **integrated** |
 | 34 | `POST /b2b/v1/import-distributors` | `[B2B] Snippet 9` V.34.1 | **bulk** (rows[] sort by gid + dry_run discriminator) | **29** | **integrated** |
+| 35 | `POST /b2b/v1/bo-fulfill` (DRIFT FIXED) | `[B2B] Snippet 16` V.3.6 | single (items[sort by bo_queue_id, qty]) | **30** | **integrated** ✅ |
+| 36 | `POST /dinoco-mcp/v1/claim-manual-create` | `[System] DINOCO MCP Bridge` V.2.4 | single (source_id primary discriminator) | **30** | **integrated** |
+| 37 | `POST /dinoco-mcp/v1/lead-create` | `[System] DINOCO MCP Bridge` V.2.4 | single (source_id + phone identity) | **30** | **integrated** |
+| 38 | `POST /dinoco-stock/v1/stock/initialize` | `[Admin System] DINOCO Global Inventory Database` V.45.4 | constant-marker `{action: 'init'}` | **30** | **integrated** |
+| 39 | `POST /dinoco-stock/v1/stock/adjust` | `[Admin System] DINOCO Global Inventory Database` V.45.4 | single (type discriminates add/subtract) | **30** | **integrated** |
+| 40 | `POST /dinoco-stock/v1/stock/transfer` | `[Admin System] DINOCO Global Inventory Database` V.45.4 | single (from_wh+to_wh swap caught) | **30** | **integrated** |
 
-> Note: numbering goes to 34 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
+> Note: numbering goes to 40 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
 > delete-ticket (32) + recalculate-total (33) share body shape — all namespace-discriminated. Total
-> integrated endpoint count = 33 (Round 28: 28 + Round 29: +5).
+> integrated endpoint count = 39 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
+> for bo-fulfill which had no actual wrapper despite tracker entry).
 >
-> **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1)**: `bo-fulfill` (#14, Round 19) is
-> listed as "integrated" but actual code in `[B2B] Snippet 16` line 2114-2189 has NO idempotency
-> wrapper. Single-call bo-fulfill is **NOT** integrated — only bo-bulk-fulfill (#21, Round 27) is.
-> Tracker entry retained pending Round 30 fix.
+> **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1) — RESOLVED in Round 30**: `bo-fulfill`
+> (#14, Round 19) was listed as "integrated" but actual code had NO wrapper. **Round 30 fixed**:
+> wrapper added in `[B2B] Snippet 16` V.3.6 between input validation and `dinoco_transaction()` call.
+> See entry #35 above (DRIFT FIXED ✅). 21 new contract tests in `IdempotencyRound30Test.php`.
 
 ---
 
-## Pending POST endpoints (Round 29+ candidates)
+## Pending POST endpoints (Round 31+ candidates)
 
-### High priority (next 5 picks — Round 30 candidates)
+### High priority (next 5 picks — Round 31 candidates)
 
 | Endpoint | Snippet | Risk if double-fired | Round candidate |
 |----------|---------|----------------------|-----------------|
-| `POST /b2b/v1/bo-fulfill` | `[B2B] Snippet 16` | TRACKER DRIFT — single-call NOT integrated; debt double-add + duplicate H5/H6 + duplicate Flex M7 | Round 30 (priority) |
-| `POST /dinoco-mcp/v1/claim-manual-create` | `[System] DINOCO MCP Bridge` | OpenClaw chatbot retry path — high duplicate risk | Round 30 |
-| `POST /dinoco-mcp/v1/lead-create` | `[System] DINOCO MCP Bridge` | Mobile retry from chatbot | Round 30 |
-| `POST /dinoco-stock/v1/stock/adjust` | `[Admin System] DINOCO Global Inventory Database` | Stock movement double-write | Round 30 |
-| `POST /dinoco-stock/v1/stock/transfer` | `[Admin System] DINOCO Global Inventory Database` | Warehouse transfer double-write | Round 30 |
+| `POST /dinoco-mcp/v1/claim-manual-update` | `[System] DINOCO MCP Bridge` | Status change double-fire | Round 31 |
+| `POST /dinoco-mcp/v1/lead-update` | `[System] DINOCO MCP Bridge` | Status update double-fire | Round 31 |
+| `POST /dinoco-stock/v1/product/pricing` | `[Admin System] DINOCO Global Inventory Database` | Tier price dual-write | Round 31 |
+| `POST /dinoco-stock/v1/warehouse` | `[Admin System] DINOCO Global Inventory Database` | Warehouse CRUD | Round 31 |
+| `POST /b2f/v1/maker-reject` | `[B2F] Snippet 2` | Pair with maker-confirm (already integrated) | Round 31 |
 
 ### Medium priority (Round 30+)
 
@@ -155,11 +191,12 @@ Each integrated endpoint has 3-9 contract tests in
 | 26    | 5         | 15         | 17 (bo-undo-split shares with bo-confirm-full) |
 | 27    | 5         | 18         | 22                            |
 | 28    | 5         | 18         | 27                            |
-| **29** | **5**     | **39**     | **32** (delete-ticket + recalculate-total share {ticket_id} shape) |
+| 29    | 5         | 39         | 32 (delete-ticket + recalculate-total share {ticket_id} shape) |
+| **30** | **6** (incl. bo-fulfill F1 fix) | **21** | **38** (Round 30 added 6 new shapes — all unique; cross-namespace claim-vs-lead collision guard added) |
 
-Total: **145 contract tests** across 7 rounds (Rounds 19-29). Round 29 introduced
-`IdempotencyTestFixture` base class + `IdempotencyRound29Test.php` demonstrating
-~5 LOC/test pattern (vs ~25 LOC inline) — see [F2 fixture refactor](#fixture-refactor) below.
+Total: **166 contract tests** across 8 rounds (Rounds 19-30). Round 29 introduced
+`IdempotencyTestFixture` base class — Round 30 fully adopts it
+(`IdempotencyRound30Test.php` averages ~5 LOC/test).
 
 ### Fixture refactor (Round 29) {#fixture-refactor}
 
