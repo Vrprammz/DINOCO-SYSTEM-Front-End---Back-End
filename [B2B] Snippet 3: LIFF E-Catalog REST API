@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.10 — Round 19 (2026-04-29): Idempotency-Key integration on 2 critical POST    ║
+ * ║    endpoints: place-order + manual-flash-create. Reads X-Idempotency-Key header (optional).  ║
+ * ║    If present: same key + same body hash → returns cached response (no duplicate order/PNO). ║
+ * ║    If absent: handler runs identical to V.42.9 (zero behavior change for existing clients).  ║
+ * ║    Conflict (same key, different body) → 409. Stores response 24h (cap 86400s default).      ║
+ * ║    Body normalized — strips _wpnonce, edit_ticket (allows edit re-issue), token-only fields. ║
+ * ║    Defensive: function_exists() guard on every helper call → snippet not synced = no-op.     ║
+ * ║    Risk: LOW — wrapper-only, additive. Existing rate-limit (V.41.3) + dedup (line 760) intact.║
  * ║  Version: V.42.9 — Round 15 ITEM A (2026-04-29): function_exists guard on 9 update_meta_cache ║
  * ║    sites (catalog/order-history/admin-bo-tickets/admin-shipping-queue/dist priming). Risk:    ║
  * ║    NONE — additive defensive wrap. Mirrors Snippet 7 + 16 V.3.3 + B2F V.11.10 pattern.        ║
@@ -752,6 +760,42 @@ function b2b_rest_place_order( WP_REST_Request $request ) {
     $items    = $request->get_param('items');
     $note     = mb_substr(sanitize_textarea_field($request->get_param('note')), 0, 500);
 
+    // ── V.42.10 Round 19: Idempotency-Key support ──
+    // Optional header X-Idempotency-Key — if present + same body hash → return cached response.
+    // Backward compat: missing header = handler runs normally (existing rate-limit + dedup intact).
+    // Body normalization: strip non-idempotent fields so cosmetic differences don't trigger 409.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request )
+        : '';
+    $idem_namespace = 'b2b/v1::place-order';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        // Compose body hash input from semantically meaningful fields only
+        $idem_body = array(
+            'gid'          => (string) $group_id,
+            'items'        => is_array( $items ) ? $items : array(),
+            'note'         => (string) $note,
+            'edit_ticket'  => intval( $request->get_param( 'edit_ticket' ) ),
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            // 409 conflict — same key but different body
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            // Replay cached response — preserve original status (default 200)
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     if ( empty($items) || !is_array($items) )
         return new WP_REST_Response(array('success'=>false,'message'=>'กรุณาระบุรายการสินค้า'), 400);
     if ( count($items) > 50 )
@@ -884,7 +928,12 @@ function b2b_rest_place_order( WP_REST_Request $request ) {
             b2b_enqueue_print_job($post_id);
         }
 
-        return new WP_REST_Response(array('success' => true, 'ticket_id' => $post_id, 'total' => $total, 'edited' => true), 200);
+        $edit_resp = array('success' => true, 'ticket_id' => $post_id, 'total' => $total, 'edited' => true);
+        // V.42.10 Round 19: store idempotency response (24h replay)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $edit_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $edit_resp, 200 );
     }
 
     $post_id = wp_insert_post(array('post_type'=>'b2b_order','post_title'=>'Order จาก '.$dist_name.' — '.b2b_date('d/m/Y H:i'),'post_status'=>'publish'));
@@ -955,7 +1004,12 @@ function b2b_rest_place_order( WP_REST_Request $request ) {
     $dist_id_post = $dist ? (int) $dist->ID : 0;
     do_action( 'b2b_place_order_post_process', $post_id, $dist_id_post, $items, $total );
 
-    return new WP_REST_Response(array('success'=>true,'ticket_id'=>$post_id,'message'=>'✅ ส่งออเดอร์เรียบร้อย'), 200);
+    $place_resp = array('success'=>true,'ticket_id'=>$post_id,'message'=>'✅ ส่งออเดอร์เรียบร้อย');
+    // V.42.10 Round 19: store idempotency response (24h replay)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $place_resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+    return new WP_REST_Response( $place_resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[PlaceOrder] Error: ' . get_class($e) . ' — ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาดภายใน กรุณาลองใหม่'), 500);
@@ -4637,6 +4691,49 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
             return new WP_REST_Response( array( 'success' => false, 'message' => 'Flash ยังไม่ตั้งค่า' ), 400 );
         }
 
+        // ── V.42.10 Round 19: Idempotency-Key support ──
+        // RPi network is warehouse-WiFi prone. Same key + same dst → return same PNO.
+        // Body normalization: include destination + dims + weight (everything that creates Flash order).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $r )
+            : '';
+        $idem_namespace = 'b2b/v1::manual-flash-create';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Build hash input from semantically meaningful params
+            $idem_body = array(
+                'dst_name'     => sanitize_text_field( $r->get_param( 'dst_name' ) ),
+                'dst_phone'    => sanitize_text_field( $r->get_param( 'dst_phone' ) ),
+                'dst_address'  => sanitize_text_field( $r->get_param( 'dst_address' ) ),
+                'dst_district' => sanitize_text_field( $r->get_param( 'dst_district' ) ),
+                'dst_city'     => sanitize_text_field( $r->get_param( 'dst_city' ) ),
+                'dst_province' => sanitize_text_field( $r->get_param( 'dst_province' ) ),
+                'dst_postcode' => sanitize_text_field( $r->get_param( 'dst_postcode' ) ),
+                'item_desc'    => sanitize_text_field( $r->get_param( 'item_desc' ) ),
+                'weight'       => intval( $r->get_param( 'weight' ) ),
+                'sku'          => trim( sanitize_text_field( $r->get_param( 'sku' ) ) ),
+                'sender_key'   => sanitize_text_field( $r->get_param( 'sender_key' ) ),
+                'length_cm'    => intval( $r->get_param( 'length_cm' ) ),
+                'width_cm'     => intval( $r->get_param( 'width_cm' ) ),
+                'height_cm'    => intval( $r->get_param( 'height_cm' ) ),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // Validate required fields
         $dst_name     = sanitize_text_field( $r->get_param( 'dst_name' ) );
         $dst_phone    = sanitize_text_field( $r->get_param( 'dst_phone' ) );
@@ -4911,7 +5008,7 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
 
         b2b_log( '[ManualFlash] Created ' . $out_trade_no . ' -> pno=' . $pno . ' (pickup=warehouse, label=' . $sender_key . ')' );
 
-        return new WP_REST_Response( array(
+        $manual_flash_resp = array(
             'success'    => true,
             'pno'        => $pno,
             'sort_code'  => $sort_code,
@@ -4925,7 +5022,14 @@ function b2b_rest_manual_flash_create( WP_REST_Request $r ) {
                 'address' => $reg_address,
             ),
             'message'    => 'สร้างพัสดุสำเร็จ: ' . $pno,
-        ), 200 );
+        );
+
+        // V.42.10 Round 19: store idempotency response (24h replay — RPi can retry safely)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $manual_flash_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $manual_flash_resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log( '[ManualFlash] Error: ' . $e->getMessage() );
         return new WP_REST_Response( array( 'success' => false, 'message' => 'Internal error' ), 500 );

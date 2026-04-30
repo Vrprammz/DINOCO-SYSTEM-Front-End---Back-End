@@ -1,5 +1,16 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.11 (2026-04-29) — Round 19: Idempotency-Key integration on POST /create-po.
+ *   Reads X-Idempotency-Key header (optional). Same key + same body hash → returns cached PO
+ *   response (no duplicate PO creation, no double exchange_rate snapshot). Body normalized
+ *   from { user_id, maker_id, items, note, requested_date, exchange_rate, shipping_method }
+ *   so cosmetic differences (whitespace, key order) don't trigger 409.
+ *   - Hash mismatch (same key, different body) → 409 idempotency_conflict.
+ *   - Cache hit → replay original 200 response (with PO id + warnings + items intact).
+ *   - Helper function_exists() guard → if Idempotency Helper snippet not synced = no-op.
+ *   - Backward compat: missing header = handler runs as V.11.10 (zero behavior change).
+ *   Risk: LOW — additive wrapper-only at top + bottom of handler. Existing rate-limit
+ *   (10 req/min) + duplicate-PO transient (5min) intact.
  * Version: V.11.10 (2026-04-29) — Round 15 ITEM A: function_exists guard on 5 update_meta_cache sites.
  *   Defensive wrap — update_meta_cache is a WP private API (per source code marker). Mirrors
  *   Snippet 7 + 16 V.3.3 + LIFF AI Snippet 1 V.1.10 pattern. Risk: NONE — additive only.
@@ -2156,6 +2167,45 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
         $note     = sanitize_textarea_field( $req->get_param( 'note' ) ?: '' );
         $req_date = sanitize_text_field( $req->get_param( 'requested_date' ) ?: '' );
 
+        // ── V.11.11 Round 19: Idempotency-Key support ──
+        // Optional X-Idempotency-Key header — same key + same body → return cached PO response.
+        // Critical for B2F because re-create with different exchange_rate could double-charge.
+        // V.7.0 Order Intent items + DD-7 leaf-expansion would re-snapshot incorrectly on retry.
+        // Backward compat: missing header = handler runs as V.11.10 (zero behavior change).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req )
+            : '';
+        $idem_namespace = 'b2f/v1::create-po';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Compose body hash input from semantically meaningful fields.
+            // include user_id so the same key from different admins is namespaced separately.
+            $idem_body = array(
+                'user_id'         => (int) $user_id,
+                'maker_id'        => (int) $maker_id,
+                'items'           => is_array( $items ) ? $items : array(),
+                'note'            => (string) $note,
+                'requested_date'  => (string) $req_date,
+                'exchange_rate'   => (float) ( $req->get_param( 'exchange_rate' ) ?: 1 ),
+                'shipping_method' => sanitize_text_field( $req->get_param( 'shipping_method' ) ?: '' ),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // ── Validate maker ──
         if ( ! $maker_id ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'กรุณาเลือกโรงงาน', 'code' => 'INVALID_MAKER' ), 400 );
@@ -2833,6 +2883,11 @@ if ( ! function_exists( 'b2f_rest_create_po' ) ) {
         }
         if ( ! empty( $warnings ) ) {
             $resp['warnings'] = $warnings;
+        }
+
+        // V.11.11 Round 19: store idempotency response (24h replay)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
         }
 
         return new WP_REST_Response( $resp, 200 );
