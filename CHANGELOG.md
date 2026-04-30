@@ -10,6 +10,44 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Fix — Round 19 (Idempotency-Key endpoint integration + +20 contract tests) (2026-04-29)
+
+After Round 18 closed Idempotency-Key foundation (NEW snippet + helpers + 25 unit tests), Round 19 wires the helper into 3 critical POST endpoints — the highest dup-risk surface area: `place-order` (B2B mobile LIFF), `manual-flash-create` (RPi warehouse Wi-Fi), and `create-po` (B2F admin LIFF). All wrapping is additive — clients without `X-Idempotency-Key` header behave identical to V.42.9 / V.11.10.
+
+#### ITEM A — Endpoint integration (commit `c6f91d7`)
+
+- **POST `/b2b/v1/place-order`** (Snippet 3 V.42.9 → V.42.10): wraps both new-order and edit-ticket paths. Body hash = `{ gid, items, note, edit_ticket }`. Existing transient dedup (line 760) + rate-limit V.41.3 intact — idempotency is a layer ABOVE these.
+- **POST `/b2b/v1/manual-flash-create`** (Snippet 3 V.42.10): RPi-initiated Flash dispatch. Body hash = `{ dst_*, item_desc, weight, sku, sender_key, dims }`. Same key + same parcel → returns same PNO (no duplicate Flash dispatch on warehouse Wi-Fi retry).
+- **POST `/b2f/v1/create-po`** (Snippet 2 V.11.10 → V.11.11): admin LIFF E-Catalog. Body hash = `{ user_id, maker_id, items, note, requested_date, exchange_rate, shipping_method }`. Critical: re-create with different `exchange_rate` would double-charge — now triggers 409 explicitly.
+- **Pattern (per endpoint, ~50 LOC inserted)**:
+  1. After auth + rate-limit → `dinoco_idempotency_extract_key()` from header (function_exists guard)
+  2. Compose body hash input (semantically meaningful fields only — strip nonces, timestamps)
+  3. `dinoco_idempotency_check()` → 409 conflict (hash mismatch) / array (cache hit replay) / null (proceed)
+  4. Run handler normally if null
+  5. Before success return → `dinoco_idempotency_store()` with response + `_idem_code` marker
+- **Conflict response**: HTTP 409 + `code: idempotency_conflict` + Thai user-facing message. Cache TTL: 24h (helper default).
+- **Helper guard**: `function_exists()` on every call — no-op if Idempotency Helper snippet not synced yet (foundation-deploy ordering protected).
+- **Risk: LOW** — wrapper-only at top + bottom of each handler. Body extraction defensive (null fallback). Existing rate-limit + dedup transients intact as defense-in-depth. Rollback: remove `if ( $idem_key )` blocks → handler returns to V.X behavior.
+
+#### ITEM B — +20 endpoint contract tests (commit `c565199`)
+
+- **NEW `tests/helpers/IdempotencyEndpointContractTest.php`** (20 cases, 22 assertions): pure-logic body normalization tests for each integrated endpoint.
+- **Coverage**:
+  - **place-order** (6 cases): identical body same hash / qty difference 409 / sku difference 409 / **edit_ticket discriminates new vs edit retry** (CRITICAL — prevents wrong-cache replay) / gid namespacing / note difference 409
+  - **manual-flash-create** (6 cases): identical body / address difference / weight difference / dims difference / sender_key (DINOCO vs FoxRiderShop) / phone typo correction
+  - **create-po** (7 cases): identical body / **exchange_rate difference** (CRITICAL — DOUBLE-CHARGE prevention) / shipping_method (land vs sea) / user_id namespacing / maker_id difference / qty difference / **V.7.0 order_mode in items[] contributes to hash** (DD-3 composite merge key correctness)
+  - **cross-endpoint defense-in-depth** (1 case): default body shapes from 3 endpoints all hash differently
+- **Pattern**: reuses `IdempotencyTest.php` namespace + `dinoco_idempotency_hash()` adapter (no duplicate inline copy). Test fixtures use `private function {endpoint}_body( $overrides = array() )` factory.
+
+#### ITEM C — Cleanup + verification
+
+- **PHPUnit**: 363 → 383 tests (+20, +5.5%), 557 → 579 assertions. Runtime ~8ms. All green. Zero failures, zero errors. PHP 8.5.4.
+- **PHP syntax validate**: both modified snippets pass `php -l` (Snippet 3 V.42.10 + Snippet 2 V.11.11).
+- **README**: `tests/README.md` updated with current count (383 tests / 579 assertions) + scope summary listing 21 helper test classes.
+- **Files (3 modified, 1 new)**: `[B2B] Snippet 3` V.42.9→V.42.10, `[B2F] Snippet 2` V.11.10→V.11.11, `tests/README.md`, NEW `tests/helpers/IdempotencyEndpointContractTest.php`.
+- **Backward compat**: clients without `X-Idempotency-Key` header behave byte-identical to V.42.9 / V.11.10. New mobile / RPi / OpenClaw clients can opt-in by sending header.
+- **Future rounds**: 72+ POST endpoints remaining unwrapped — defer until production canary observed (1-2 weeks at minimum) to confirm no regression in the 3 wrapped endpoints. Then batch 5-10 endpoints per round.
+
 ### Fix — Round 18 (API-H4 Idempotency-Key foundation + more unit tests + cleanup) (2026-04-29)
 
 After Round 17 closed +37 unit tests (IntentBreakdown + ValidateSkuHierarchy) + 4 Mermaid diagrams (MCP Bridge + Brand Voice), Round 18 closes the long-deferred **API-H4 Idempotency-Key** infrastructure as foundation only (NEW snippet + helpers + tests, no endpoint integration this round). Plus +18 more unit tests for `dinoco_is_top_level_set()` (B2C visibility filter / DD-6 invariant). Test suite grows 320 → 363 (+13.4%).
