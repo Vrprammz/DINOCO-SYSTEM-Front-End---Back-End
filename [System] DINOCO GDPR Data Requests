@@ -1,6 +1,17 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.3.0 — Round 24 (2026-04-29): Phase 7 admin review UI + 6 admin REST endpoints.
+ *   ALL admin features still gated by `dinoco_gdpr_is_enabled()` (flag default OFF).
+ *   Adds admin shortcode `[dinoco_admin_gdpr]` (5 tabs: Pending Review / Processing / Ready / Failed / Audit Log)
+ *   + admin REST namespace `/dinoco-gdpr/v1/admin/*` (list, detail, approve, reject, manual-export, audit-log)
+ *   + `wp_dinoco_gdpr_audit_log` schema (immutable append-only decision trail)
+ *   + Module Registry self-registration (section='system', order=80)
+ *   + worker dispatch on Approve via wp_schedule_single_event('dinoco_gdpr_process_request')
+ *   + dinocoModal-driven destructive confirms (typed "DELETE" required for delete actions)
+ *   + 30-second undo window via cancellation_window_at column
+ *   Risk: LOW-MEDIUM — admin UI for irreversible operations; flag-gated OFF default + decision audit trail.
+ *   PHPUnit: tests/helpers/GdprAdminPermissionTest.php — pure-logic state machine + permission gate (no DB).
  * Version: V.2.0 — Round 23 Phase 2 (2026-04-29): Phase 6 foundation (FLAG-GATED OFF DEFAULT — DORMANT until activation).
  *   Schema v2.0: +3 cols (download_token, scope_json LONGTEXT, expires_at) — additive dbDelta. Helpers:
  *     dinoco_gdpr_run_worker($request_id) — wp_schedule_single_event handler + FOR UPDATE state machine.
@@ -123,7 +134,7 @@ if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
         global $wpdb;
 
         $current_version = get_option( 'dinoco_gdpr_schema_version', '0' );
-        $target_version  = '2.0';
+        $target_version  = '3.0';
         if ( $current_version === $target_version ) return;
 
         $table   = $wpdb->prefix . 'dinoco_gdpr_requests';
@@ -133,6 +144,10 @@ if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
         //   download_token VARCHAR(64) — secure random token for export ZIP signed URL (Phase 6)
         //   scope_json LONGTEXT — full snapshot of records affected (admin audit trail; PII redacted)
         //   expires_at DATETIME — when downloadable export expires (7 days post-creation; cron prunes)
+        // V.3.0 Phase 7: +3 columns for admin review workflow.
+        //   reviewed_by BIGINT — WP user_id of admin who approved/rejected/manual-processed
+        //   reviewed_at DATETIME — when admin took the action (audit trail)
+        //   cancellation_window_at DATETIME — 30s undo window after approval (worker fires after this)
         $sql = "CREATE TABLE {$table} (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id BIGINT(20) UNSIGNED NOT NULL,
@@ -145,17 +160,44 @@ if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
             download_token VARCHAR(64) DEFAULT NULL,
             scope_json LONGTEXT DEFAULT NULL,
             expires_at DATETIME DEFAULT NULL,
+            reviewed_by BIGINT(20) UNSIGNED DEFAULT NULL,
+            reviewed_at DATETIME DEFAULT NULL,
+            cancellation_window_at DATETIME DEFAULT NULL,
             created_at DATETIME NOT NULL,
             processed_at DATETIME DEFAULT NULL,
             PRIMARY KEY  (id),
             UNIQUE KEY uq_ticket (ticket_id),
             KEY idx_user_status (user_id, status),
             KEY idx_status_created (status, created_at),
-            KEY idx_expires_at (expires_at)
+            KEY idx_expires_at (expires_at),
+            KEY idx_reviewed_by (reviewed_by)
         ) {$charset};";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         dbDelta( $sql );
+
+        // V.3.0 Phase 7: Audit log table — immutable append-only decision trail.
+        // Records EVERY admin action (approve, reject, manual-export, undo, status change, view).
+        // PDPA §39 documentation requirement + GDPR Article 30 records of processing.
+        $audit_table = $wpdb->prefix . 'dinoco_gdpr_audit_log';
+        $sql_audit = "CREATE TABLE {$audit_table} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            request_id BIGINT(20) UNSIGNED NOT NULL,
+            actor_user_id BIGINT(20) UNSIGNED NOT NULL,
+            actor_login VARCHAR(60) DEFAULT NULL,
+            action VARCHAR(40) NOT NULL,
+            from_status VARCHAR(20) DEFAULT NULL,
+            to_status VARCHAR(20) DEFAULT NULL,
+            reason VARCHAR(40) DEFAULT NULL,
+            note TEXT DEFAULT NULL,
+            actor_ip VARCHAR(45) DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_request (request_id),
+            KEY idx_actor (actor_user_id),
+            KEY idx_action_created (action, created_at)
+        ) {$charset};";
+        dbDelta( $sql_audit );
 
         update_option( 'dinoco_gdpr_schema_version', $target_version, false );
     }
@@ -163,7 +205,7 @@ if ( ! function_exists( 'dinoco_gdpr_schema_install' ) ) {
 
 // Lazy install on admin_init (safe: runs once per admin page load, dbDelta is idempotent)
 add_action( 'admin_init', function() {
-    if ( get_option( 'dinoco_gdpr_schema_version', '0' ) !== '2.0' ) {
+    if ( get_option( 'dinoco_gdpr_schema_version', '0' ) !== '3.0' ) {
         dinoco_gdpr_schema_install();
     }
 } );
@@ -327,6 +369,98 @@ add_action( 'rest_api_init', function() {
         'methods'             => 'GET',
         'permission_callback' => $auth_logged_in,
         'callback'            => 'dinoco_gdpr_rest_status',
+    ) );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // V.3.0 Round 24 Phase 7 — Admin Review REST endpoints
+    // Permission: manage_options + wp_rest nonce (X-WP-Nonce header)
+    // Rate limit: 60/min/user (best-effort transient)
+    // Flag gate: ALL endpoints return 503 when dinoco_gdpr_enabled=0
+    // ═══════════════════════════════════════════════════════════════════
+
+    $auth_admin = function( $request ) {
+        if ( ! is_user_logged_in() ) {
+            return new WP_Error( 'not_logged_in', 'Login required', array( 'status' => 401 ) );
+        }
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'forbidden', 'Admin capability required', array( 'status' => 403 ) );
+        }
+        // CSRF — nonce check on POST only (GET endpoints are read-only).
+        // Note: WP REST cookie auth automatically requires X-WP-Nonce on cookie-authed
+        // requests, but we double-check here for explicit POST verification.
+        $method = $request->get_method();
+        if ( $method !== 'GET' ) {
+            $nonce = $request->get_header( 'X-WP-Nonce' );
+            if ( ! $nonce ) {
+                $nonce = $request->get_param( '_wpnonce' );
+            }
+            if ( ! $nonce || ! wp_verify_nonce( $nonce, 'wp_rest' ) ) {
+                return new WP_Error( 'rest_cookie_invalid_nonce', 'Cookie nonce is invalid', array( 'status' => 403 ) );
+            }
+        }
+        // Rate limit 60/min/user — best-effort transient
+        $uid       = get_current_user_id();
+        $bucket    = 'dnc_gdpr_admin_rl_' . $uid . '_' . floor( time() / 60 );
+        $hits      = (int) get_transient( $bucket );
+        if ( $hits >= 60 ) {
+            return new WP_Error( 'rate_limited', 'Too many admin requests (60/min cap)', array( 'status' => 429 ) );
+        }
+        set_transient( $bucket, $hits + 1, 70 );
+        return true;
+    };
+
+    // GET /admin/requests — list (filters: status, type, age, user)
+    register_rest_route( 'dinoco-gdpr/v1', '/admin/requests', array(
+        'methods'             => 'GET',
+        'permission_callback' => $auth_admin,
+        'callback'            => 'dinoco_gdpr_rest_admin_list',
+    ) );
+
+    // GET /admin/request/{id} — single record + scope preview
+    register_rest_route( 'dinoco-gdpr/v1', '/admin/request/(?P<id>\d+)', array(
+        'methods'             => 'GET',
+        'permission_callback' => $auth_admin,
+        'callback'            => 'dinoco_gdpr_rest_admin_detail',
+        'args'                => array( 'id' => array( 'validate_callback' => function( $v ) { return is_numeric( $v ) && (int) $v > 0; } ) ),
+    ) );
+
+    // POST /admin/request/{id}/approve — trigger worker (30s undo window)
+    register_rest_route( 'dinoco-gdpr/v1', '/admin/request/(?P<id>\d+)/approve', array(
+        'methods'             => 'POST',
+        'permission_callback' => $auth_admin,
+        'callback'            => 'dinoco_gdpr_rest_admin_approve',
+        'args'                => array( 'id' => array( 'validate_callback' => function( $v ) { return is_numeric( $v ) && (int) $v > 0; } ) ),
+    ) );
+
+    // POST /admin/request/{id}/reject — reject with reason
+    register_rest_route( 'dinoco-gdpr/v1', '/admin/request/(?P<id>\d+)/reject', array(
+        'methods'             => 'POST',
+        'permission_callback' => $auth_admin,
+        'callback'            => 'dinoco_gdpr_rest_admin_reject',
+        'args'                => array( 'id' => array( 'validate_callback' => function( $v ) { return is_numeric( $v ) && (int) $v > 0; } ) ),
+    ) );
+
+    // POST /admin/request/{id}/manual-export — admin manual trigger (synchronous)
+    register_rest_route( 'dinoco-gdpr/v1', '/admin/request/(?P<id>\d+)/manual-export', array(
+        'methods'             => 'POST',
+        'permission_callback' => $auth_admin,
+        'callback'            => 'dinoco_gdpr_rest_admin_manual_export',
+        'args'                => array( 'id' => array( 'validate_callback' => function( $v ) { return is_numeric( $v ) && (int) $v > 0; } ) ),
+    ) );
+
+    // POST /admin/request/{id}/undo — cancel approval within 30s window
+    register_rest_route( 'dinoco-gdpr/v1', '/admin/request/(?P<id>\d+)/undo', array(
+        'methods'             => 'POST',
+        'permission_callback' => $auth_admin,
+        'callback'            => 'dinoco_gdpr_rest_admin_undo',
+        'args'                => array( 'id' => array( 'validate_callback' => function( $v ) { return is_numeric( $v ) && (int) $v > 0; } ) ),
+    ) );
+
+    // GET /admin/audit-log — list audit entries (filterable)
+    register_rest_route( 'dinoco-gdpr/v1', '/admin/audit-log', array(
+        'methods'             => 'GET',
+        'permission_callback' => $auth_admin,
+        'callback'            => 'dinoco_gdpr_rest_admin_audit_log',
     ) );
 } );
 
@@ -1248,3 +1382,1437 @@ if ( function_exists( 'dinoco_register_cron' ) ) {
 //   5. Test deletion (DRY RUN first — make backup): wp eval 'var_dump(dinoco_gdpr_execute_deletion(99));'
 //   6. wp option update dinoco_gdpr_enabled '1'
 //   7. Build Phase 7 admin UI before announcing publicly
+
+// ═══════════════════════════════════════════════════════════════════
+// V.3.0 Round 24 Phase 7 — Admin Review Workflow
+// ALL functions below gated by dinoco_gdpr_is_enabled() — DORMANT until flag flipped.
+// ═══════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────
+// V.3.0 — State Machine Validator (PURE — testable without WP/DB)
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_is_valid_status_transition' ) ) {
+    /**
+     * Pure state-machine validator.
+     *
+     * State graph:
+     *   pending → processing (admin approve)
+     *   pending → rejected   (admin reject)
+     *   pending → cancelled  (admin undo within 30s)
+     *   processing → ready   (worker success)
+     *   processing → failed  (worker error)
+     *   processing → cancelled (admin undo within 30s window — only before worker fires)
+     *   failed → processing  (admin manual retry)
+     *   ready → expired      (cleanup cron — 7d post-creation)
+     *
+     * @param string $from
+     * @param string $to
+     * @return bool
+     */
+    function dinoco_gdpr_is_valid_status_transition( $from, $to ) {
+        $from = is_string( $from ) ? strtolower( trim( $from ) ) : '';
+        $to   = is_string( $to ) ? strtolower( trim( $to ) ) : '';
+
+        $graph = array(
+            'pending'    => array( 'processing', 'rejected', 'cancelled' ),
+            'processing' => array( 'ready', 'failed', 'cancelled' ),
+            'failed'     => array( 'processing', 'cancelled' ),
+            'ready'      => array( 'expired' ),
+            // Terminal states — no outgoing transitions
+            'rejected'   => array(),
+            'cancelled'  => array(),
+            'expired'    => array(),
+        );
+
+        if ( ! isset( $graph[ $from ] ) ) return false;
+        return in_array( $to, $graph[ $from ], true );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.3.0 — Audit Log Insert
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_audit_log' ) ) {
+    /**
+     * Insert immutable audit log row. PDPA §39 documentation requirement.
+     *
+     * @param int    $request_id   wp_dinoco_gdpr_requests.id
+     * @param string $action       e.g. 'approve', 'reject', 'undo', 'manual_export', 'view', 'transition'
+     * @param array  $opts         {
+     *     @type string $from_status
+     *     @type string $to_status
+     *     @type string $reason     enum: legal_hold|fraud|cooling_off|other
+     *     @type string $note       free text (truncated to 1000 chars)
+     * }
+     * @return int|false insert_id or false on fail
+     */
+    function dinoco_gdpr_audit_log( $request_id, $action, $opts = array() ) {
+        global $wpdb;
+        $tbl  = $wpdb->prefix . 'dinoco_gdpr_audit_log';
+        $user = wp_get_current_user();
+        $ip   = function_exists( 'dinoco_gdpr_get_client_ip' ) ? dinoco_gdpr_get_client_ip() : '';
+
+        $note = isset( $opts['note'] ) ? (string) $opts['note'] : '';
+        if ( strlen( $note ) > 1000 ) $note = substr( $note, 0, 1000 );
+
+        $data = array(
+            'request_id'    => (int) $request_id,
+            'actor_user_id' => $user ? (int) $user->ID : 0,
+            'actor_login'   => $user && isset( $user->user_login ) ? substr( (string) $user->user_login, 0, 60 ) : null,
+            'action'        => substr( (string) $action, 0, 40 ),
+            'from_status'   => isset( $opts['from_status'] ) ? substr( (string) $opts['from_status'], 0, 20 ) : null,
+            'to_status'     => isset( $opts['to_status'] ) ? substr( (string) $opts['to_status'], 0, 20 ) : null,
+            'reason'        => isset( $opts['reason'] ) ? substr( (string) $opts['reason'], 0, 40 ) : null,
+            'note'          => $note ?: null,
+            'actor_ip'      => $ip ? substr( (string) $ip, 0, 45 ) : null,
+            'created_at'    => current_time( 'mysql' ),
+        );
+        $formats = array( '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' );
+        $ok = $wpdb->insert( $tbl, $data, $formats );
+        return $ok ? (int) $wpdb->insert_id : false;
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.3.0 — User Identity Helper (admin display)
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_admin_user_summary' ) ) {
+    /**
+     * Build user identity summary for admin review (no PII redaction — admins
+     * see full details to make informed decision per PDPA §39 admin role).
+     *
+     * @param int $user_id
+     * @return array
+     */
+    function dinoco_gdpr_admin_user_summary( $user_id ) {
+        $user = get_userdata( (int) $user_id );
+        if ( ! $user ) {
+            return array(
+                'id'              => (int) $user_id,
+                'display_name'    => '(unknown)',
+                'user_email'      => '',
+                'user_registered' => '',
+                'line_uid'        => '',
+                'distributor_id'  => 0,
+                'roles'           => array(),
+                'exists'          => false,
+            );
+        }
+        return array(
+            'id'              => (int) $user->ID,
+            'display_name'    => (string) $user->display_name,
+            'user_email'      => (string) $user->user_email,
+            'user_registered' => (string) $user->user_registered,
+            'line_uid'        => (string) get_user_meta( $user->ID, 'dinoco_line_uid', true ),
+            'distributor_id'  => (int) get_user_meta( $user->ID, 'linked_distributor_id', true ),
+            'roles'           => is_array( $user->roles ) ? array_values( $user->roles ) : array(),
+            'exists'          => true,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_admin_record_summary' ) ) {
+    /**
+     * Quick stats summary of records linked to a user. Stats only — no PII.
+     * Used in Pending Review card to give admin context before approval.
+     *
+     * @param int $user_id
+     * @return array { warranties: int, claims: int, orders: int, has_open_debt: bool }
+     */
+    function dinoco_gdpr_admin_record_summary( $user_id ) {
+        $user_id = (int) $user_id;
+        $summary = array(
+            'warranties'    => 0,
+            'claims'        => 0,
+            'orders'        => 0,
+            'has_open_debt' => false,
+            'open_debt_thb' => 0.0,
+        );
+        if ( $user_id <= 0 ) return $summary;
+
+        // Warranties (post_author)
+        $w = new WP_Query( array(
+            'post_type'      => 'dinoco_warranty',
+            'post_status'    => 'any',
+            'author'         => $user_id,
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'no_found_rows'  => false,
+        ) );
+        $summary['warranties'] = (int) $w->found_posts;
+
+        // Claims (post_author)
+        $c = new WP_Query( array(
+            'post_type'      => 'claim_ticket',
+            'post_status'    => 'any',
+            'author'         => $user_id,
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'no_found_rows'  => false,
+        ) );
+        $summary['claims'] = (int) $c->found_posts;
+
+        // Orders (linked distributor)
+        $linked_dist_id = (int) get_user_meta( $user_id, 'linked_distributor_id', true );
+        if ( $linked_dist_id > 0 ) {
+            $o = new WP_Query( array(
+                'post_type'      => 'b2b_order',
+                'post_status'    => 'any',
+                'posts_per_page' => 1,
+                'fields'         => 'ids',
+                'no_found_rows'  => false,
+                'meta_query'     => array(
+                    array( 'key' => 'distributor_id', 'value' => $linked_dist_id ),
+                ),
+            ) );
+            $summary['orders'] = (int) $o->found_posts;
+
+            // Open debt check (legal hold candidate)
+            $debt = function_exists( 'get_field' ) ? (float) get_field( 'current_debt', $linked_dist_id ) : 0.0;
+            if ( $debt > 0 ) {
+                $summary['has_open_debt'] = true;
+                $summary['open_debt_thb'] = $debt;
+            }
+        }
+        return $summary;
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// V.3.0 — Admin REST callbacks
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_rest_admin_list' ) ) {
+    /**
+     * GET /admin/requests
+     * Filters (query params): status, type, user, age_days, page, per_page
+     */
+    function dinoco_gdpr_rest_admin_list( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        $valid_status = array( 'pending', 'processing', 'ready', 'failed', 'rejected', 'cancelled', 'expired' );
+        $valid_type   = array( 'export', 'delete' );
+
+        $status   = sanitize_key( (string) $request->get_param( 'status' ) );
+        $type     = sanitize_key( (string) $request->get_param( 'type' ) );
+        $user_id  = absint( $request->get_param( 'user' ) );
+        $age_days = absint( $request->get_param( 'age_days' ) );
+        $page     = max( 1, absint( $request->get_param( 'page' ) ) ?: 1 );
+        $per_page = max( 1, min( 100, absint( $request->get_param( 'per_page' ) ) ?: 25 ) );
+        $offset   = ( $page - 1 ) * $per_page;
+
+        $where  = array( '1=1' );
+        $params = array();
+        if ( $status && in_array( $status, $valid_status, true ) ) {
+            $where[]  = 'status = %s';
+            $params[] = $status;
+        }
+        if ( $type && in_array( $type, $valid_type, true ) ) {
+            $where[]  = 'type = %s';
+            $params[] = $type;
+        }
+        if ( $user_id > 0 ) {
+            $where[]  = 'user_id = %d';
+            $params[] = $user_id;
+        }
+        if ( $age_days > 0 ) {
+            $cutoff   = gmdate( 'Y-m-d H:i:s', strtotime( '-' . $age_days . ' days' ) );
+            $where[]  = 'created_at <= %s';
+            $params[] = $cutoff;
+        }
+
+        $where_sql = implode( ' AND ', $where );
+        // Sort: pending oldest first (priority), then by created_at DESC for everything else.
+        // Simpler: pending bucket first, then everything else by created DESC.
+        $order_sql = "ORDER BY (status='pending') DESC, created_at " .
+            ( $status === 'pending' ? 'ASC' : 'DESC' );
+
+        $count_sql = "SELECT COUNT(*) FROM {$tbl} WHERE {$where_sql}";
+        $total = $params
+            ? (int) $wpdb->get_var( $wpdb->prepare( $count_sql, $params ) )
+            : (int) $wpdb->get_var( $count_sql );
+
+        $rows_sql = "SELECT id, user_id, type, status, ticket_id, request_ip, request_ua,
+                            notes, scope_json, expires_at, reviewed_by, reviewed_at,
+                            cancellation_window_at, created_at, processed_at
+                     FROM {$tbl}
+                     WHERE {$where_sql}
+                     {$order_sql}
+                     LIMIT %d OFFSET %d";
+        $params_with_paging = array_merge( $params, array( $per_page, $offset ) );
+        $rows = $wpdb->get_results( $wpdb->prepare( $rows_sql, $params_with_paging ), ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // Enrich with user summary + record summary
+        $now = time();
+        foreach ( $rows as &$row ) {
+            $row['user']            = dinoco_gdpr_admin_user_summary( (int) $row['user_id'] );
+            $row['record_summary']  = dinoco_gdpr_admin_record_summary( (int) $row['user_id'] );
+            $row['age_days']        = floor( ( $now - strtotime( $row['created_at'] ) ) / DAY_IN_SECONDS );
+            // Don't expose download_token to list view (only single detail)
+        }
+        unset( $row );
+
+        // Bucket counts (overview)
+        $buckets = $wpdb->get_results( "SELECT status, COUNT(*) c FROM {$tbl} GROUP BY status", ARRAY_A );
+        $bucket_counts = array(
+            'pending'    => 0,
+            'processing' => 0,
+            'ready'      => 0,
+            'failed'     => 0,
+            'rejected'   => 0,
+            'cancelled'  => 0,
+            'expired'    => 0,
+        );
+        if ( is_array( $buckets ) ) {
+            foreach ( $buckets as $b ) {
+                $key = isset( $b['status'] ) ? (string) $b['status'] : '';
+                if ( isset( $bucket_counts[ $key ] ) ) {
+                    $bucket_counts[ $key ] = (int) $b['c'];
+                }
+            }
+        }
+
+        return new WP_REST_Response( array(
+            'success'        => true,
+            'data'           => $rows,
+            'total'          => $total,
+            'page'           => $page,
+            'per_page'       => $per_page,
+            'bucket_counts'  => $bucket_counts,
+            'filters_used'   => array(
+                'status'   => $status,
+                'type'     => $type,
+                'user'     => $user_id,
+                'age_days' => $age_days,
+            ),
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_admin_detail' ) ) {
+    function dinoco_gdpr_rest_admin_detail( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+        $id  = absint( $request->get_param( 'id' ) );
+        if ( $id <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
+        }
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
+        if ( ! $row ) {
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'not_found' ), 404 );
+        }
+
+        $row['user']           = dinoco_gdpr_admin_user_summary( (int) $row['user_id'] );
+        $row['record_summary'] = dinoco_gdpr_admin_record_summary( (int) $row['user_id'] );
+
+        // Audit log for this request (last 50)
+        $audit_tbl = $wpdb->prefix . 'dinoco_gdpr_audit_log';
+        $audit = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, actor_user_id, actor_login, action, from_status, to_status,
+                    reason, note, actor_ip, created_at
+             FROM {$audit_tbl} WHERE request_id = %d ORDER BY id DESC LIMIT 50",
+            $id
+        ), ARRAY_A );
+
+        // Log view event for audit trail
+        dinoco_gdpr_audit_log( $id, 'view', array() );
+
+        return new WP_REST_Response( array(
+            'success' => true,
+            'data'    => $row,
+            'audit'   => is_array( $audit ) ? $audit : array(),
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_admin_approve' ) ) {
+    /**
+     * POST /admin/request/{id}/approve
+     * Body: confirm_text (required, must equal "APPROVE" for safety)
+     * Behavior:
+     *   - Verify status='pending' (FOR UPDATE)
+     *   - Set status='processing' + reviewed_by/at + cancellation_window_at = now+30s
+     *   - Schedule wp_schedule_single_event('dinoco_gdpr_process_request', now+30s)
+     *   - Return scheduled_at + window_until
+     */
+    function dinoco_gdpr_rest_admin_approve( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+        $id = absint( $request->get_param( 'id' ) );
+        if ( $id <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
+        }
+
+        // Confirmation gate — caller must pass "APPROVE" (matches dinocoModal.confirm typed input)
+        $confirm = (string) $request->get_param( 'confirm_text' );
+        if ( $confirm !== 'APPROVE' ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'confirmation_required',
+                'message' => 'Pass confirm_text=APPROVE to proceed',
+            ), 400 );
+        }
+
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, status, type, user_id FROM {$tbl} WHERE id = %d FOR UPDATE", $id
+            ), ARRAY_A );
+            if ( ! $row ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array( 'success' => false, 'code' => 'not_found' ), 404 );
+            }
+            if ( $row['status'] !== 'pending' ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'code'    => 'invalid_state',
+                    'message' => 'Request must be in pending state, currently: ' . $row['status'],
+                    'current_status' => $row['status'],
+                ), 409 );
+            }
+            // State machine validate
+            if ( ! dinoco_gdpr_is_valid_status_transition( $row['status'], 'processing' ) ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'code'    => 'invalid_transition',
+                    'message' => 'pending → processing transition rejected by state machine',
+                ), 409 );
+            }
+
+            $now             = current_time( 'mysql' );
+            $window_until    = gmdate( 'Y-m-d H:i:s', strtotime( current_time( 'mysql', 1 ) ) + 30 );
+            $window_until_ts = time() + 30;
+
+            $wpdb->update(
+                $tbl,
+                array(
+                    'status'                 => 'processing',
+                    'reviewed_by'            => get_current_user_id(),
+                    'reviewed_at'            => $now,
+                    'cancellation_window_at' => $window_until,
+                ),
+                array( 'id' => $id ),
+                array( '%s', '%d', '%s', '%s' ),
+                array( '%d' )
+            );
+            $wpdb->query( 'COMMIT' );
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'db_error', 'message' => $e->getMessage() ), 500 );
+        }
+
+        // Schedule worker AFTER 30s undo window. wp_schedule_single_event uses GMT timestamp.
+        $scheduled = wp_schedule_single_event( $window_until_ts, 'dinoco_gdpr_process_request', array( $id ) );
+
+        dinoco_gdpr_audit_log( $id, 'approve', array(
+            'from_status' => 'pending',
+            'to_status'   => 'processing',
+            'note'        => 'Worker scheduled at ' . $window_until . ' (30s undo window)',
+        ) );
+
+        return new WP_REST_Response( array(
+            'success'         => true,
+            'request_id'      => $id,
+            'scheduled'       => (bool) $scheduled,
+            'scheduled_at'    => $window_until,
+            'window_seconds'  => 30,
+            'message'         => 'Approved. Worker fires after 30s undo window.',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_admin_reject' ) ) {
+    /**
+     * POST /admin/request/{id}/reject
+     * Body: reason (enum), note (optional)
+     */
+    function dinoco_gdpr_rest_admin_reject( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+        $id     = absint( $request->get_param( 'id' ) );
+        $reason = sanitize_key( (string) $request->get_param( 'reason' ) );
+        $note   = sanitize_textarea_field( (string) $request->get_param( 'note' ) );
+        if ( $id <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
+        }
+        $valid_reasons = array( 'legal_hold', 'fraud', 'cooling_off', 'other' );
+        if ( ! in_array( $reason, $valid_reasons, true ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'invalid_reason',
+                'message' => 'reason must be one of: ' . implode( ', ', $valid_reasons ),
+            ), 400 );
+        }
+        if ( $reason === 'other' && strlen( trim( $note ) ) < 5 ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'note_required',
+                'message' => 'note (>=5 chars) is required when reason=other',
+            ), 400 );
+        }
+
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, status, user_id FROM {$tbl} WHERE id = %d FOR UPDATE", $id
+            ), ARRAY_A );
+            if ( ! $row ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array( 'success' => false, 'code' => 'not_found' ), 404 );
+            }
+            if ( $row['status'] !== 'pending' ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'code'    => 'invalid_state',
+                    'current_status' => $row['status'],
+                ), 409 );
+            }
+            if ( ! dinoco_gdpr_is_valid_status_transition( $row['status'], 'rejected' ) ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_transition' ), 409 );
+            }
+
+            $combined_note = '[REJECTED reason=' . $reason . '] ' . $note;
+            if ( strlen( $combined_note ) > 1000 ) $combined_note = substr( $combined_note, 0, 1000 );
+
+            $wpdb->update(
+                $tbl,
+                array(
+                    'status'       => 'rejected',
+                    'reviewed_by'  => get_current_user_id(),
+                    'reviewed_at'  => current_time( 'mysql' ),
+                    'processed_at' => current_time( 'mysql' ),
+                    'notes'        => $combined_note,
+                ),
+                array( 'id' => $id ),
+                array( '%s', '%d', '%s', '%s', '%s' ),
+                array( '%d' )
+            );
+            $wpdb->query( 'COMMIT' );
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'db_error' ), 500 );
+        }
+
+        dinoco_gdpr_audit_log( $id, 'reject', array(
+            'from_status' => 'pending',
+            'to_status'   => 'rejected',
+            'reason'      => $reason,
+            'note'        => $note,
+        ) );
+
+        // Notify user via email if helper available
+        if ( function_exists( 'dinoco_gdpr_email_user' ) ) {
+            $payload = array( 'reason' => 'reason=' . $reason . ( $note ? '; ' . $note : '' ) );
+            dinoco_gdpr_email_user( (int) $row['user_id'], 'rejection', $payload );
+        }
+
+        return new WP_REST_Response( array(
+            'success'    => true,
+            'request_id' => $id,
+            'message'    => 'Request rejected. User notified via email.',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_admin_undo' ) ) {
+    /**
+     * POST /admin/request/{id}/undo
+     * Cancels an approval within the 30-second window. Removes scheduled event.
+     */
+    function dinoco_gdpr_rest_admin_undo( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+        $id = absint( $request->get_param( 'id' ) );
+        if ( $id <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
+        }
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, status, cancellation_window_at FROM {$tbl} WHERE id = %d FOR UPDATE", $id
+            ), ARRAY_A );
+            if ( ! $row ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array( 'success' => false, 'code' => 'not_found' ), 404 );
+            }
+            if ( $row['status'] !== 'processing' ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'code'    => 'invalid_state',
+                    'message' => 'Undo only allowed during processing (within 30s window)',
+                    'current_status' => $row['status'],
+                ), 409 );
+            }
+            // 30s window check
+            $window_at = $row['cancellation_window_at'];
+            if ( ! $window_at || strtotime( $window_at ) < time() ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'code'    => 'window_expired',
+                    'message' => '30-second undo window has expired. Worker may have already started.',
+                ), 410 );
+            }
+            if ( ! dinoco_gdpr_is_valid_status_transition( $row['status'], 'cancelled' ) ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_transition' ), 409 );
+            }
+
+            $wpdb->update(
+                $tbl,
+                array(
+                    'status'       => 'cancelled',
+                    'reviewed_by'  => get_current_user_id(),
+                    'reviewed_at'  => current_time( 'mysql' ),
+                    'processed_at' => current_time( 'mysql' ),
+                    'notes'        => 'Cancelled by admin undo within 30s window',
+                ),
+                array( 'id' => $id ),
+                array( '%s', '%d', '%s', '%s', '%s' ),
+                array( '%d' )
+            );
+            $wpdb->query( 'COMMIT' );
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'db_error' ), 500 );
+        }
+
+        // Unschedule worker (best-effort — wp_unschedule_event removes by hook+args+timestamp)
+        $next = wp_next_scheduled( 'dinoco_gdpr_process_request', array( $id ) );
+        if ( $next ) {
+            wp_unschedule_event( $next, 'dinoco_gdpr_process_request', array( $id ) );
+        }
+
+        dinoco_gdpr_audit_log( $id, 'undo', array(
+            'from_status' => 'processing',
+            'to_status'   => 'cancelled',
+            'note'        => 'Cancelled via 30s undo window',
+        ) );
+
+        return new WP_REST_Response( array(
+            'success'    => true,
+            'request_id' => $id,
+            'message'    => 'Approval cancelled. Worker unscheduled.',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_admin_manual_export' ) ) {
+    /**
+     * POST /admin/request/{id}/manual-export
+     * Admin manual trigger for failed/stuck requests. Synchronous — runs worker NOW.
+     * Useful to retry failed exports without waiting for cron.
+     */
+    function dinoco_gdpr_rest_admin_manual_export( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+        $id = absint( $request->get_param( 'id' ) );
+        if ( $id <= 0 ) {
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'invalid_id' ), 400 );
+        }
+        $confirm = (string) $request->get_param( 'confirm_text' );
+        if ( $confirm !== 'PROCESS' ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'confirmation_required',
+                'message' => 'Pass confirm_text=PROCESS to proceed (synchronous run)',
+            ), 400 );
+        }
+
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_requests';
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT id, status FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
+        if ( ! $row ) {
+            return new WP_REST_Response( array( 'success' => false, 'code' => 'not_found' ), 404 );
+        }
+        // Allowed states for manual processing: failed (retry) or pending (skip undo window)
+        if ( ! in_array( $row['status'], array( 'failed', 'pending' ), true ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'invalid_state',
+                'message' => 'Manual export only allowed from pending or failed state',
+                'current_status' => $row['status'],
+            ), 409 );
+        }
+
+        // Reset to pending so worker's FOR UPDATE 'pending' check passes
+        $wpdb->update(
+            $tbl,
+            array(
+                'status'      => 'pending',
+                'reviewed_by' => get_current_user_id(),
+                'reviewed_at' => current_time( 'mysql' ),
+                'notes'       => 'Manual processing trigger',
+            ),
+            array( 'id' => $id ),
+            array( '%s', '%d', '%s', '%s' ),
+            array( '%d' )
+        );
+
+        dinoco_gdpr_audit_log( $id, 'manual_export', array(
+            'from_status' => $row['status'],
+            'to_status'   => 'pending',
+            'note'        => 'Synchronous manual processing initiated',
+        ) );
+
+        // Run worker synchronously — gives admin immediate feedback
+        if ( function_exists( 'dinoco_gdpr_run_worker' ) ) {
+            dinoco_gdpr_run_worker( $id );
+        }
+
+        // Re-read final state
+        $final = $wpdb->get_row( $wpdb->prepare( "SELECT id, status, notes FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
+
+        return new WP_REST_Response( array(
+            'success'      => true,
+            'request_id'   => $id,
+            'final_status' => $final ? $final['status'] : '?',
+            'message'      => 'Manual processing complete (synchronous)',
+        ), 200 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_rest_admin_audit_log' ) ) {
+    /**
+     * GET /admin/audit-log
+     * Filters: request_id, actor_user_id, action, date_from, date_to
+     */
+    function dinoco_gdpr_rest_admin_audit_log( WP_REST_Request $request ) {
+        if ( ! dinoco_gdpr_is_enabled() ) {
+            return dinoco_gdpr_disabled_response();
+        }
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_gdpr_audit_log';
+
+        $request_id = absint( $request->get_param( 'request_id' ) );
+        $actor_id   = absint( $request->get_param( 'actor_user_id' ) );
+        $action     = sanitize_key( (string) $request->get_param( 'action' ) );
+        $date_from  = sanitize_text_field( (string) $request->get_param( 'date_from' ) );
+        $date_to    = sanitize_text_field( (string) $request->get_param( 'date_to' ) );
+        $page       = max( 1, absint( $request->get_param( 'page' ) ) ?: 1 );
+        $per_page   = max( 1, min( 200, absint( $request->get_param( 'per_page' ) ) ?: 50 ) );
+        $offset     = ( $page - 1 ) * $per_page;
+
+        $where  = array( '1=1' );
+        $params = array();
+        if ( $request_id > 0 ) {
+            $where[]  = 'request_id = %d';
+            $params[] = $request_id;
+        }
+        if ( $actor_id > 0 ) {
+            $where[]  = 'actor_user_id = %d';
+            $params[] = $actor_id;
+        }
+        if ( $action ) {
+            $where[]  = 'action = %s';
+            $params[] = $action;
+        }
+        if ( $date_from && preg_match( '/^\d{4}-\d{2}-\d{2}/', $date_from ) ) {
+            $where[]  = 'created_at >= %s';
+            $params[] = substr( $date_from, 0, 10 ) . ' 00:00:00';
+        }
+        if ( $date_to && preg_match( '/^\d{4}-\d{2}-\d{2}/', $date_to ) ) {
+            $where[]  = 'created_at <= %s';
+            $params[] = substr( $date_to, 0, 10 ) . ' 23:59:59';
+        }
+        $where_sql = implode( ' AND ', $where );
+
+        $count_sql = "SELECT COUNT(*) FROM {$tbl} WHERE {$where_sql}";
+        $total = $params
+            ? (int) $wpdb->get_var( $wpdb->prepare( $count_sql, $params ) )
+            : (int) $wpdb->get_var( $count_sql );
+
+        $rows_sql = "SELECT id, request_id, actor_user_id, actor_login, action,
+                            from_status, to_status, reason, note, actor_ip, created_at
+                     FROM {$tbl}
+                     WHERE {$where_sql}
+                     ORDER BY id DESC
+                     LIMIT %d OFFSET %d";
+        $rows = $wpdb->get_results( $wpdb->prepare( $rows_sql, array_merge( $params, array( $per_page, $offset ) ) ), ARRAY_A );
+
+        // CSV export support — ?export=csv
+        if ( (string) $request->get_param( 'export' ) === 'csv' ) {
+            // Cap export to 5000 rows for safety
+            $rows_sql_csv = "SELECT id, request_id, actor_user_id, actor_login, action,
+                                    from_status, to_status, reason, note, actor_ip, created_at
+                             FROM {$tbl}
+                             WHERE {$where_sql}
+                             ORDER BY id DESC
+                             LIMIT 5000";
+            $csv_rows = $params
+                ? $wpdb->get_results( $wpdb->prepare( $rows_sql_csv, $params ), ARRAY_A )
+                : $wpdb->get_results( $rows_sql_csv, ARRAY_A );
+
+            // Build CSV with UTF-8 BOM (Thai-friendly)
+            $csv = "\xEF\xBB\xBF"; // BOM
+            $csv .= "id,request_id,actor_user_id,actor_login,action,from_status,to_status,reason,note,actor_ip,created_at\n";
+            if ( is_array( $csv_rows ) ) {
+                foreach ( $csv_rows as $r ) {
+                    $csv .= sprintf( "%d,%d,%d,\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+                        (int) $r['id'],
+                        (int) $r['request_id'],
+                        (int) $r['actor_user_id'],
+                        str_replace( '"', '""', (string) $r['actor_login'] ),
+                        str_replace( '"', '""', (string) $r['action'] ),
+                        str_replace( '"', '""', (string) $r['from_status'] ),
+                        str_replace( '"', '""', (string) $r['to_status'] ),
+                        str_replace( '"', '""', (string) $r['reason'] ),
+                        str_replace( '"', '""', str_replace( "\n", ' ', (string) $r['note'] ) ),
+                        str_replace( '"', '""', (string) $r['actor_ip'] ),
+                        (string) $r['created_at']
+                    );
+                }
+            }
+            $resp = new WP_REST_Response( $csv, 200 );
+            $resp->header( 'Content-Type', 'text/csv; charset=utf-8' );
+            $resp->header( 'Content-Disposition', 'attachment; filename=gdpr-audit-' . gmdate( 'Ymd' ) . '.csv' );
+            return $resp;
+        }
+
+        return new WP_REST_Response( array(
+            'success'  => true,
+            'data'     => is_array( $rows ) ? $rows : array(),
+            'total'    => $total,
+            'page'     => $page,
+            'per_page' => $per_page,
+        ), 200 );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// V.3.0 — Module Registry self-registration (Phase 4a pattern)
+// ═══════════════════════════════════════════════════════════════════
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+    dinoco_register_admin_module( array(
+        'key'        => 'gdpr',
+        'shortcode'  => 'dinoco_admin_gdpr',
+        'label'      => 'GDPR / PDPA',
+        'section'    => 'system',
+        'icon'       => 'fa-shield-halved',
+        'color'      => '#6366f1',
+        'cache_ttl'  => 0,  // dynamic data — never cache
+        'capability' => 'manage_options',
+        'order'      => 80,
+        'source'     => '[System] DINOCO GDPR Data Requests V.3.0',
+    ) );
+}, 30 );
+
+// ═══════════════════════════════════════════════════════════════════
+// V.3.0 — Admin Shortcode `[dinoco_admin_gdpr]`
+// 5 tabs: Pending / Processing / Ready / Failed / Audit Log
+// All actions gated by manage_options + dinoco_gdpr_enabled flag
+// ═══════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_admin_gdpr_render' ) ) {
+    function dinoco_admin_gdpr_render() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p>' . esc_html__( 'คุณไม่มีสิทธิ์ดูหน้านี้', 'dinoco' ) . '</p>';
+        }
+
+        $flag_enabled = function_exists( 'dinoco_gdpr_is_enabled' ) ? dinoco_gdpr_is_enabled() : false;
+        $nonce        = wp_create_nonce( 'wp_rest' );
+        $rest_base    = esc_url_raw( rest_url( 'dinoco-gdpr/v1/admin' ) );
+
+        ob_start();
+        ?>
+        <div class="dinoco-gdpr-admin" data-rest-base="<?php echo esc_attr( $rest_base ); ?>" data-nonce="<?php echo esc_attr( $nonce ); ?>">
+            <style>
+                /* Scoped CSS — .dnc-gdpr-* prefix to avoid conflict */
+                .dnc-gdpr-wrap { font-family: 'Noto Sans Thai', 'Inter', -apple-system, sans-serif; color: #1f2937; padding: 16px; }
+                .dnc-gdpr-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+                .dnc-gdpr-header h2 { margin: 0; font-size: 22px; font-weight: 700; }
+                .dnc-gdpr-flag-badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+                .dnc-gdpr-flag-on { background: #dcfce7; color: #166534; }
+                .dnc-gdpr-flag-off { background: #fee2e2; color: #991b1b; }
+                .dnc-gdpr-banner { padding: 14px 16px; border-radius: 10px; margin-bottom: 16px; font-size: 14px; }
+                .dnc-gdpr-banner-warn { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+                .dnc-gdpr-banner-info { background: #dbeafe; color: #1e3a8a; border: 1px solid #93c5fd; }
+
+                .dnc-gdpr-tabs { display: flex; gap: 4px; border-bottom: 2px solid #e5e7eb; margin-bottom: 16px; flex-wrap: wrap; }
+                .dnc-gdpr-tab { padding: 10px 16px; background: none; border: none; cursor: pointer; font-size: 14px; font-weight: 500; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+                .dnc-gdpr-tab:hover { color: #374151; }
+                .dnc-gdpr-tab.active { color: #6366f1; border-bottom-color: #6366f1; font-weight: 600; }
+                .dnc-gdpr-tab-count { display: inline-block; padding: 1px 8px; background: #e0e7ff; color: #4338ca; border-radius: 999px; font-size: 11px; font-weight: 700; margin-left: 6px; }
+                .dnc-gdpr-tab.active .dnc-gdpr-tab-count { background: #6366f1; color: #fff; }
+
+                .dnc-gdpr-panel { display: none; }
+                .dnc-gdpr-panel.active { display: block; }
+
+                .dnc-gdpr-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+                .dnc-gdpr-card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+                .dnc-gdpr-card-title { font-weight: 600; font-size: 14px; color: #111827; }
+                .dnc-gdpr-card-meta { font-size: 12px; color: #6b7280; margin-top: 4px; }
+                .dnc-gdpr-card-body { font-size: 13px; color: #374151; }
+
+                .dnc-gdpr-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; margin-right: 4px; }
+                .dnc-gdpr-badge-export { background: #dbeafe; color: #1e40af; }
+                .dnc-gdpr-badge-delete { background: #fee2e2; color: #991b1b; }
+                .dnc-gdpr-badge-pending { background: #fef3c7; color: #92400e; }
+                .dnc-gdpr-badge-processing { background: #dbeafe; color: #1e40af; }
+                .dnc-gdpr-badge-ready { background: #dcfce7; color: #166534; }
+                .dnc-gdpr-badge-failed { background: #fee2e2; color: #991b1b; }
+                .dnc-gdpr-badge-rejected { background: #f3f4f6; color: #4b5563; }
+                .dnc-gdpr-badge-cancelled { background: #f3f4f6; color: #4b5563; }
+                .dnc-gdpr-badge-expired { background: #f3f4f6; color: #6b7280; }
+                .dnc-gdpr-badge-age { background: #f3f4f6; color: #4b5563; }
+                .dnc-gdpr-badge-age-warn { background: #fef3c7; color: #92400e; }
+                .dnc-gdpr-badge-age-danger { background: #fee2e2; color: #991b1b; }
+
+                .dnc-gdpr-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; margin: 8px 0 10px; }
+                .dnc-gdpr-stat { background: #f9fafb; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+                .dnc-gdpr-stat-label { color: #6b7280; }
+                .dnc-gdpr-stat-val { color: #111827; font-weight: 600; }
+
+                .dnc-gdpr-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+                .dnc-gdpr-btn { padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; border: 1px solid transparent; min-height: 36px; }
+                .dnc-gdpr-btn-primary { background: #6366f1; color: #fff; }
+                .dnc-gdpr-btn-primary:hover { background: #4f46e5; }
+                .dnc-gdpr-btn-success { background: #10b981; color: #fff; }
+                .dnc-gdpr-btn-success:hover { background: #059669; }
+                .dnc-gdpr-btn-danger { background: #dc2626; color: #fff; }
+                .dnc-gdpr-btn-danger:hover { background: #b91c1c; }
+                .dnc-gdpr-btn-secondary { background: #fff; color: #374151; border-color: #d1d5db; }
+                .dnc-gdpr-btn-secondary:hover { background: #f3f4f6; }
+                .dnc-gdpr-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+                .dnc-gdpr-filters { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+                .dnc-gdpr-filters select, .dnc-gdpr-filters input { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; min-height: 36px; }
+
+                .dnc-gdpr-empty { padding: 40px 16px; text-align: center; color: #9ca3af; font-size: 14px; }
+                .dnc-gdpr-loading { padding: 24px; text-align: center; color: #6b7280; font-size: 13px; }
+
+                .dnc-gdpr-undo-banner { background: #fef3c7; border: 1px solid #fcd34d; padding: 10px 14px; border-radius: 8px; margin: 10px 0; font-size: 13px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+                .dnc-gdpr-undo-countdown { font-weight: 700; color: #b45309; }
+
+                .dnc-gdpr-audit-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+                .dnc-gdpr-audit-table th, .dnc-gdpr-audit-table td { padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; }
+                .dnc-gdpr-audit-table th { background: #f9fafb; color: #6b7280; font-weight: 600; }
+                .dnc-gdpr-audit-table .col-action { font-weight: 600; }
+
+                @media (max-width: 640px) {
+                    .dnc-gdpr-card-head { flex-direction: column; align-items: flex-start; }
+                    .dnc-gdpr-actions .dnc-gdpr-btn { flex: 1; min-width: 0; }
+                }
+            </style>
+
+            <div class="dnc-gdpr-wrap">
+                <div class="dnc-gdpr-header">
+                    <h2>🛡️ GDPR / PDPA Data Requests</h2>
+                    <span class="dnc-gdpr-flag-badge <?php echo $flag_enabled ? 'dnc-gdpr-flag-on' : 'dnc-gdpr-flag-off'; ?>">
+                        <?php echo $flag_enabled ? '✅ ACTIVE' : '⏸ FLAG OFF'; ?>
+                    </span>
+                </div>
+
+                <?php if ( ! $flag_enabled ): ?>
+                    <div class="dnc-gdpr-banner dnc-gdpr-banner-warn">
+                        <strong>⚠️ ระบบยังไม่เปิดใช้งาน:</strong> ตั้งค่า <code>dinoco_gdpr_enabled='1'</code> ใน wp_options เมื่อพร้อมเปิดใช้งาน Phase 7 admin review.<br>
+                        Endpoints ของ user ทั้งหมด (<code>/my-data-export</code> / <code>/my-data-delete</code>) จะ return 503 จนกว่าจะ flip flag.
+                    </div>
+                <?php else: ?>
+                    <div class="dnc-gdpr-banner dnc-gdpr-banner-info">
+                        ระบบ GDPR / PDPA Phase 7 ใช้งานได้แล้ว — review คำขอ access + erasure ตาม PDPA §30-35 / GDPR Articles 15-17.<br>
+                        <strong>📌 ทุก action ถูก audit log เก็บ trail ตาม PDPA §39</strong>
+                    </div>
+                <?php endif; ?>
+
+                <div class="dnc-gdpr-tabs" role="tablist">
+                    <button type="button" class="dnc-gdpr-tab active" data-tab="pending">
+                        Pending Review <span class="dnc-gdpr-tab-count" data-count="pending">0</span>
+                    </button>
+                    <button type="button" class="dnc-gdpr-tab" data-tab="processing">
+                        Processing <span class="dnc-gdpr-tab-count" data-count="processing">0</span>
+                    </button>
+                    <button type="button" class="dnc-gdpr-tab" data-tab="ready">
+                        Ready <span class="dnc-gdpr-tab-count" data-count="ready">0</span>
+                    </button>
+                    <button type="button" class="dnc-gdpr-tab" data-tab="failed">
+                        Failed <span class="dnc-gdpr-tab-count" data-count="failed">0</span>
+                    </button>
+                    <button type="button" class="dnc-gdpr-tab" data-tab="audit">
+                        Audit Log
+                    </button>
+                </div>
+
+                <div class="dnc-gdpr-panel active" data-panel="pending">
+                    <div class="dnc-gdpr-loading">กำลังโหลด...</div>
+                </div>
+                <div class="dnc-gdpr-panel" data-panel="processing">
+                    <div class="dnc-gdpr-loading">กำลังโหลด...</div>
+                </div>
+                <div class="dnc-gdpr-panel" data-panel="ready">
+                    <div class="dnc-gdpr-loading">กำลังโหลด...</div>
+                </div>
+                <div class="dnc-gdpr-panel" data-panel="failed">
+                    <div class="dnc-gdpr-loading">กำลังโหลด...</div>
+                </div>
+                <div class="dnc-gdpr-panel" data-panel="audit">
+                    <div class="dnc-gdpr-filters">
+                        <input type="text" data-audit-filter="actor_user_id" placeholder="actor_user_id" />
+                        <select data-audit-filter="action">
+                            <option value="">ทุก action</option>
+                            <option value="approve">approve</option>
+                            <option value="reject">reject</option>
+                            <option value="undo">undo</option>
+                            <option value="manual_export">manual_export</option>
+                            <option value="view">view</option>
+                        </select>
+                        <input type="date" data-audit-filter="date_from" />
+                        <input type="date" data-audit-filter="date_to" />
+                        <button type="button" class="dnc-gdpr-btn dnc-gdpr-btn-secondary" data-audit-action="apply">กรอง</button>
+                        <button type="button" class="dnc-gdpr-btn dnc-gdpr-btn-secondary" data-audit-action="export-csv">📥 Export CSV</button>
+                    </div>
+                    <div class="dnc-gdpr-loading">กำลังโหลด...</div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        (function() {
+            'use strict';
+            var root = document.querySelector('.dinoco-gdpr-admin');
+            if (!root || root.__inited) return;
+            root.__inited = true;
+
+            var REST = root.getAttribute('data-rest-base');
+            var NONCE = root.getAttribute('data-nonce');
+            var FLAG_ON = <?php echo $flag_enabled ? 'true' : 'false'; ?>;
+
+            // Modal helper shim — fall back to native if dinocoModal absent
+            function _confirm(opts) {
+                if (window.dinocoModal && typeof window.dinocoModal.confirm === 'function') {
+                    try { return window.dinocoModal.confirm(opts); } catch(e){}
+                }
+                return Promise.resolve(window.confirm((opts.title || '') + '\n' + (opts.message || '')));
+            }
+            function _alert(opts) {
+                if (window.dinocoModal && typeof window.dinocoModal.alert === 'function') {
+                    try { return window.dinocoModal.alert(opts); } catch(e){}
+                }
+                try { window.alert((opts.title || '') + '\n' + (opts.message || '')); } catch(e){}
+                return Promise.resolve();
+            }
+            function _prompt(opts) {
+                if (window.dinocoModal && typeof window.dinocoModal.prompt === 'function') {
+                    try { return window.dinocoModal.prompt(opts); } catch(e){}
+                }
+                var v = window.prompt((opts.title || '') + '\n' + (opts.message || ''), opts.defaultValue || '');
+                return Promise.resolve(v);
+            }
+
+            function esc(s) {
+                if (s === null || s === undefined) return '';
+                return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            }
+
+            function api(path, opts) {
+                opts = opts || {};
+                var headers = opts.headers || {};
+                headers['X-WP-Nonce'] = NONCE;
+                if (opts.method && opts.method !== 'GET') headers['Content-Type'] = 'application/json';
+                return fetch(REST + path, {
+                    method: opts.method || 'GET',
+                    headers: headers,
+                    credentials: 'same-origin',
+                    body: opts.body ? JSON.stringify(opts.body) : undefined
+                }).then(function(r) {
+                    return r.json().then(function(j) { return { status: r.status, body: j }; })
+                        .catch(function() { return { status: r.status, body: { success: false, code: 'parse_error' } }; });
+                });
+            }
+
+            // Tab navigation
+            root.querySelectorAll('.dnc-gdpr-tab').forEach(function(btn) {
+                btn.addEventListener('click', function() {
+                    var tab = btn.getAttribute('data-tab');
+                    root.querySelectorAll('.dnc-gdpr-tab').forEach(function(b) { b.classList.remove('active'); });
+                    root.querySelectorAll('.dnc-gdpr-panel').forEach(function(p) { p.classList.remove('active'); });
+                    btn.classList.add('active');
+                    var panel = root.querySelector('.dnc-gdpr-panel[data-panel="' + tab + '"]');
+                    if (panel) panel.classList.add('active');
+                    loadTab(tab);
+                });
+            });
+
+            function ageBadgeClass(days) {
+                if (days >= 25) return 'dnc-gdpr-badge dnc-gdpr-badge-age-danger';
+                if (days >= 14) return 'dnc-gdpr-badge dnc-gdpr-badge-age-warn';
+                return 'dnc-gdpr-badge dnc-gdpr-badge-age';
+            }
+
+            function renderRequestCard(row, panelKey) {
+                var u = row.user || {};
+                var rs = row.record_summary || {};
+                var typeBadge = '<span class="dnc-gdpr-badge dnc-gdpr-badge-' + esc(row.type) + '">' +
+                                (row.type === 'export' ? '📥 Export' : '🗑️ Delete') + '</span>';
+                var statusBadge = '<span class="dnc-gdpr-badge dnc-gdpr-badge-' + esc(row.status) + '">' + esc(row.status) + '</span>';
+                var ageBadge = '<span class="' + ageBadgeClass(row.age_days) + '">⏱ ' + esc(row.age_days) + ' วัน</span>';
+
+                var legalHoldWarn = '';
+                if (row.type === 'delete' && rs.has_open_debt) {
+                    legalHoldWarn = '<div class="dnc-gdpr-banner dnc-gdpr-banner-warn" style="margin-top:8px;font-size:12px;">' +
+                        '⚠️ <strong>Legal Hold candidate:</strong> Distributor มีหนี้ค้าง ' +
+                        esc(Number(rs.open_debt_thb).toLocaleString('th-TH', {minimumFractionDigits: 2})) + ' ฿ — ' +
+                        'ควร reject reason=legal_hold จนกว่าจะเคลียร์</div>';
+                }
+
+                var actionsHtml = '';
+                if (panelKey === 'pending') {
+                    actionsHtml =
+                        '<div class="dnc-gdpr-actions">' +
+                            '<button type="button" class="dnc-gdpr-btn dnc-gdpr-btn-success" data-action="approve" data-id="' + row.id + '">✅ Approve</button>' +
+                            '<button type="button" class="dnc-gdpr-btn dnc-gdpr-btn-danger" data-action="reject" data-id="' + row.id + '">❌ Reject</button>' +
+                            '<button type="button" class="dnc-gdpr-btn dnc-gdpr-btn-secondary" data-action="manual" data-id="' + row.id + '">⚙️ Manual Process</button>' +
+                        '</div>';
+                } else if (panelKey === 'processing') {
+                    var windowAt = row.cancellation_window_at || '';
+                    actionsHtml =
+                        '<div class="dnc-gdpr-actions">' +
+                            '<button type="button" class="dnc-gdpr-btn dnc-gdpr-btn-secondary" data-action="undo" data-id="' + row.id + '" data-window-at="' + esc(windowAt) + '">↩️ Undo (30s window)</button>' +
+                        '</div>';
+                } else if (panelKey === 'failed') {
+                    actionsHtml =
+                        '<div class="dnc-gdpr-actions">' +
+                            '<button type="button" class="dnc-gdpr-btn dnc-gdpr-btn-primary" data-action="retry" data-id="' + row.id + '">🔄 Retry (Manual)</button>' +
+                        '</div>';
+                } else if (panelKey === 'ready') {
+                    var scope = {};
+                    try { scope = row.scope_json ? JSON.parse(row.scope_json) : {}; } catch(e){}
+                    if (row.type === 'export' && scope.download_url) {
+                        actionsHtml =
+                            '<div class="dnc-gdpr-actions">' +
+                                '<a class="dnc-gdpr-btn dnc-gdpr-btn-primary" href="' + esc(scope.download_url) + '" target="_blank" rel="noopener">📦 Download ZIP</a>' +
+                                '<span style="font-size:12px;color:#6b7280;align-self:center;">หมดอายุ: ' + esc(row.expires_at || '—') + '</span>' +
+                            '</div>';
+                    }
+                }
+
+                return '<div class="dnc-gdpr-card" data-id="' + row.id + '" data-panel="' + esc(panelKey) + '">' +
+                    '<div class="dnc-gdpr-card-head">' +
+                        '<div>' +
+                            '<div class="dnc-gdpr-card-title">' + typeBadge + ' ' + statusBadge + ' ' + ageBadge + '</div>' +
+                            '<div class="dnc-gdpr-card-meta">' +
+                                'Ticket: <code>' + esc(row.ticket_id) + '</code> · ' +
+                                'User: ' + esc(u.display_name || '(unknown)') + ' (' + esc(u.user_email || '—') + ') · ID #' + esc(u.id) +
+                                (u.line_uid ? ' · LINE: <code>' + esc(u.line_uid.substring(0, 12)) + '…</code>' : '') +
+                                (u.distributor_id ? ' · Dist #' + esc(u.distributor_id) : '') +
+                            '</div>' +
+                            '<div class="dnc-gdpr-card-meta">Submitted: ' + esc(row.created_at) + '</div>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="dnc-gdpr-stats">' +
+                        '<div class="dnc-gdpr-stat"><span class="dnc-gdpr-stat-label">Warranties:</span> <span class="dnc-gdpr-stat-val">' + esc(rs.warranties || 0) + '</span></div>' +
+                        '<div class="dnc-gdpr-stat"><span class="dnc-gdpr-stat-label">Claims:</span> <span class="dnc-gdpr-stat-val">' + esc(rs.claims || 0) + '</span></div>' +
+                        '<div class="dnc-gdpr-stat"><span class="dnc-gdpr-stat-label">Orders:</span> <span class="dnc-gdpr-stat-val">' + esc(rs.orders || 0) + '</span></div>' +
+                    '</div>' +
+                    legalHoldWarn +
+                    (row.notes ? '<div class="dnc-gdpr-card-body" style="margin-top:8px;color:#7f1d1d;font-size:12px;">📝 ' + esc(row.notes) + '</div>' : '') +
+                    actionsHtml +
+                '</div>';
+            }
+
+            function loadTab(tab) {
+                if (tab === 'audit') return loadAuditLog();
+                var panel = root.querySelector('.dnc-gdpr-panel[data-panel="' + tab + '"]');
+                if (!panel) return;
+                panel.innerHTML = '<div class="dnc-gdpr-loading">กำลังโหลด...</div>';
+                api('/requests?status=' + encodeURIComponent(tab) + '&per_page=50', {})
+                    .then(function(res) {
+                        if (res.status === 503) {
+                            panel.innerHTML = '<div class="dnc-gdpr-banner dnc-gdpr-banner-warn">⚠️ ระบบยังไม่เปิดใช้งาน (flag OFF)</div>';
+                            return;
+                        }
+                        if (res.status !== 200 || !res.body || res.body.success !== true) {
+                            panel.innerHTML = '<div class="dnc-gdpr-empty">โหลดไม่สำเร็จ — ' + esc((res.body && res.body.code) || 'error') + '</div>';
+                            return;
+                        }
+                        // Update tab counts
+                        if (res.body.bucket_counts) {
+                            Object.keys(res.body.bucket_counts).forEach(function(k) {
+                                var el = root.querySelector('.dnc-gdpr-tab-count[data-count="' + k + '"]');
+                                if (el) el.textContent = res.body.bucket_counts[k];
+                            });
+                        }
+                        var rows = res.body.data || [];
+                        if (!rows.length) {
+                            panel.innerHTML = '<div class="dnc-gdpr-empty">ไม่มีคำขอใน bucket นี้</div>';
+                            return;
+                        }
+                        panel.innerHTML = rows.map(function(r) { return renderRequestCard(r, tab); }).join('');
+                    })
+                    .catch(function(e) {
+                        panel.innerHTML = '<div class="dnc-gdpr-empty">โหลดไม่สำเร็จ: ' + esc(e.message || 'network error') + '</div>';
+                    });
+            }
+
+            function loadAuditLog() {
+                var panel = root.querySelector('.dnc-gdpr-panel[data-panel="audit"]');
+                var loadingEl = panel.querySelector('.dnc-gdpr-loading');
+                var existingTable = panel.querySelector('.dnc-gdpr-audit-table-wrap');
+                if (existingTable) existingTable.remove();
+                if (!loadingEl) {
+                    loadingEl = document.createElement('div');
+                    loadingEl.className = 'dnc-gdpr-loading';
+                    loadingEl.textContent = 'กำลังโหลด...';
+                    panel.appendChild(loadingEl);
+                } else {
+                    loadingEl.style.display = 'block';
+                }
+
+                var qs = '';
+                ['actor_user_id', 'action', 'date_from', 'date_to'].forEach(function(k) {
+                    var el = panel.querySelector('[data-audit-filter="' + k + '"]');
+                    if (el && el.value) qs += '&' + k + '=' + encodeURIComponent(el.value);
+                });
+                api('/audit-log?per_page=100' + qs, {})
+                    .then(function(res) {
+                        if (loadingEl) loadingEl.style.display = 'none';
+                        if (res.status === 503) {
+                            var w = document.createElement('div');
+                            w.className = 'dnc-gdpr-banner dnc-gdpr-banner-warn';
+                            w.textContent = '⚠️ ระบบยังไม่เปิดใช้งาน (flag OFF)';
+                            panel.appendChild(w);
+                            return;
+                        }
+                        if (res.status !== 200 || !res.body.success) {
+                            var e = document.createElement('div');
+                            e.className = 'dnc-gdpr-empty';
+                            e.textContent = 'โหลดไม่สำเร็จ';
+                            panel.appendChild(e);
+                            return;
+                        }
+                        var rows = res.body.data || [];
+                        var wrap = document.createElement('div');
+                        wrap.className = 'dnc-gdpr-audit-table-wrap';
+                        if (!rows.length) {
+                            wrap.innerHTML = '<div class="dnc-gdpr-empty">ไม่มี audit entries (ลอง clear filters)</div>';
+                        } else {
+                            var html = '<table class="dnc-gdpr-audit-table"><thead><tr>' +
+                                '<th>เวลา</th><th>Action</th><th>Actor</th><th>Request</th>' +
+                                '<th>From → To</th><th>Reason</th><th>Note</th><th>IP</th>' +
+                                '</tr></thead><tbody>';
+                            rows.forEach(function(r) {
+                                html += '<tr>' +
+                                    '<td>' + esc(r.created_at) + '</td>' +
+                                    '<td class="col-action">' + esc(r.action) + '</td>' +
+                                    '<td>' + esc(r.actor_login || '#' + r.actor_user_id) + '</td>' +
+                                    '<td>#' + esc(r.request_id) + '</td>' +
+                                    '<td>' + esc(r.from_status || '—') + ' → ' + esc(r.to_status || '—') + '</td>' +
+                                    '<td>' + esc(r.reason || '') + '</td>' +
+                                    '<td>' + esc(r.note || '') + '</td>' +
+                                    '<td><code>' + esc(r.actor_ip || '—') + '</code></td>' +
+                                '</tr>';
+                            });
+                            html += '</tbody></table>';
+                            wrap.innerHTML = html;
+                        }
+                        panel.appendChild(wrap);
+                    });
+            }
+
+            // Audit filter handlers
+            var auditPanel = root.querySelector('.dnc-gdpr-panel[data-panel="audit"]');
+            if (auditPanel) {
+                auditPanel.addEventListener('click', function(e) {
+                    var btn = e.target.closest('[data-audit-action]');
+                    if (!btn) return;
+                    var act = btn.getAttribute('data-audit-action');
+                    if (act === 'apply') {
+                        loadAuditLog();
+                    } else if (act === 'export-csv') {
+                        var qs = 'export=csv&_wpnonce=' + encodeURIComponent(NONCE);
+                        ['actor_user_id', 'action', 'date_from', 'date_to'].forEach(function(k) {
+                            var el = auditPanel.querySelector('[data-audit-filter="' + k + '"]');
+                            if (el && el.value) qs += '&' + k + '=' + encodeURIComponent(el.value);
+                        });
+                        window.location.href = REST + '/audit-log?' + qs;
+                    }
+                });
+            }
+
+            // Action button delegation
+            root.addEventListener('click', function(e) {
+                var btn = e.target.closest('[data-action]');
+                if (!btn) return;
+                var act = btn.getAttribute('data-action');
+                var id = parseInt(btn.getAttribute('data-id'), 10);
+                if (!id) return;
+                if (act === 'approve') return doApprove(id);
+                if (act === 'reject')  return doReject(id);
+                if (act === 'manual')  return doManual(id);
+                if (act === 'retry')   return doManual(id);
+                if (act === 'undo')    return doUndo(id, btn.getAttribute('data-window-at'));
+            });
+
+            function doApprove(id) {
+                _confirm({
+                    title: 'อนุมัติคำขอ #' + id,
+                    message: 'Worker จะรันหลัง 30 วินาที (มี Undo button) — ดำเนินการต่อ?',
+                    confirmText: 'อนุมัติ',
+                    cancelText: 'ยกเลิก'
+                }).then(function(ok) {
+                    if (!ok) return;
+                    api('/request/' + id + '/approve', { method: 'POST', body: { confirm_text: 'APPROVE' } })
+                        .then(function(res) {
+                            if (res.body.success) {
+                                _alert({ title: '✅ อนุมัติแล้ว', message: 'Worker จะทำงานหลัง 30s (' + res.body.scheduled_at + ') — ไปแท็บ Processing เพื่อ Undo', type: 'success' });
+                                loadTab('pending');
+                            } else {
+                                _alert({ title: '❌ ผิดพลาด', message: (res.body.message || res.body.code || 'unknown'), type: 'error' });
+                            }
+                        });
+                });
+            }
+
+            function doReject(id) {
+                // Two-step: pick reason then optional note
+                _prompt({
+                    title: 'เหตุผลการปฏิเสธ #' + id,
+                    message: 'พิมพ์ reason: legal_hold | fraud | cooling_off | other',
+                    placeholder: 'legal_hold',
+                    defaultValue: 'legal_hold',
+                    required: true,
+                    maxLength: 40
+                }).then(function(reason) {
+                    if (!reason) return;
+                    var validReasons = ['legal_hold', 'fraud', 'cooling_off', 'other'];
+                    if (validReasons.indexOf(reason) === -1) {
+                        return _alert({ title: 'รหัสไม่ถูกต้อง', message: 'reason ต้องเป็น: ' + validReasons.join(', '), type: 'error' });
+                    }
+                    var promptNote = (reason === 'other') ? 'note (>=5 ตัวอักษร, บังคับเมื่อ reason=other)' : 'note เพิ่มเติม (ทางเลือก)';
+                    _prompt({
+                        title: 'หมายเหตุ',
+                        message: promptNote,
+                        placeholder: 'รายละเอียด...',
+                        required: reason === 'other',
+                        multiline: true,
+                        maxLength: 1000
+                    }).then(function(note) {
+                        if (note === null) return;
+                        api('/request/' + id + '/reject', { method: 'POST', body: { reason: reason, note: note || '' } })
+                            .then(function(res) {
+                                if (res.body.success) {
+                                    _alert({ title: '✅ ปฏิเสธแล้ว', message: 'User ได้รับ email แจ้งแล้ว', type: 'success' });
+                                    loadTab('pending');
+                                } else {
+                                    _alert({ title: '❌ ผิดพลาด', message: (res.body.message || res.body.code), type: 'error' });
+                                }
+                            });
+                    });
+                });
+            }
+
+            function doManual(id) {
+                _confirm({
+                    title: 'รัน Worker แบบ Synchronous #' + id,
+                    message: '⚠️ การลบเป็น irreversible — ระบบจะรัน worker ทันทีโดยไม่มี undo window\n\nพิมพ์ "PROCESS" ในหน้าถัดไปเพื่อยืนยัน',
+                    confirmText: 'ดำเนินการ',
+                    cancelText: 'ยกเลิก',
+                    danger: true
+                }).then(function(ok) {
+                    if (!ok) return;
+                    _prompt({
+                        title: 'พิมพ์ "PROCESS" เพื่อยืนยัน',
+                        message: 'การ manual run จะทำงานทันทีและไม่สามารถ undo ได้',
+                        placeholder: 'PROCESS',
+                        required: true,
+                        maxLength: 20
+                    }).then(function(typed) {
+                        if (typed !== 'PROCESS') {
+                            return _alert({ title: 'ยกเลิก', message: 'ต้องพิมพ์ "PROCESS" ตรง ๆ', type: 'warning' });
+                        }
+                        api('/request/' + id + '/manual-export', { method: 'POST', body: { confirm_text: 'PROCESS' } })
+                            .then(function(res) {
+                                if (res.body.success) {
+                                    _alert({ title: '✅ Manual run เสร็จ', message: 'final_status: ' + (res.body.final_status || '?'), type: 'success' });
+                                    loadTab('pending');
+                                    loadTab('failed');
+                                } else {
+                                    _alert({ title: '❌ ผิดพลาด', message: (res.body.message || res.body.code), type: 'error' });
+                                }
+                            });
+                    });
+                });
+            }
+
+            function doUndo(id, windowAt) {
+                _confirm({
+                    title: 'ยกเลิกการอนุมัติ #' + id,
+                    message: 'จะยกเลิกการอนุมัติและ unschedule worker (ใช้ได้ภายใน 30s window)',
+                    confirmText: 'ยกเลิกการอนุมัติ',
+                    cancelText: 'กลับ',
+                    danger: true
+                }).then(function(ok) {
+                    if (!ok) return;
+                    api('/request/' + id + '/undo', { method: 'POST', body: {} })
+                        .then(function(res) {
+                            if (res.body.success) {
+                                _alert({ title: '✅ ยกเลิกแล้ว', message: 'Worker ถูก unschedule', type: 'success' });
+                                loadTab('processing');
+                            } else if (res.body.code === 'window_expired') {
+                                _alert({ title: '⏱ หมดเวลา', message: '30s window หมดแล้ว — worker เริ่มทำงานแล้ว ไม่สามารถ undo', type: 'warning' });
+                                loadTab('processing');
+                            } else {
+                                _alert({ title: '❌ ผิดพลาด', message: (res.body.message || res.body.code), type: 'error' });
+                            }
+                        });
+                });
+            }
+
+            // Initial load: pending tab
+            if (FLAG_ON) {
+                loadTab('pending');
+                // Refresh count badges by loading all status buckets in background
+                ['processing', 'ready', 'failed'].forEach(function(t) {
+                    setTimeout(function() {
+                        api('/requests?status=' + t + '&per_page=1', {}).then(function(res) {
+                            if (res.body && res.body.bucket_counts) {
+                                Object.keys(res.body.bucket_counts).forEach(function(k) {
+                                    var el = root.querySelector('.dnc-gdpr-tab-count[data-count="' + k + '"]');
+                                    if (el) el.textContent = res.body.bucket_counts[k];
+                                });
+                            }
+                        });
+                    }, 100);
+                });
+            }
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+if ( ! shortcode_exists( 'dinoco_admin_gdpr' ) ) {
+    add_shortcode( 'dinoco_admin_gdpr', 'dinoco_admin_gdpr_render' );
+}
