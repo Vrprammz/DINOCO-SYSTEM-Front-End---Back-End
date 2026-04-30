@@ -2,6 +2,16 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.45.4 (2026-04-30) — Round 30 batch 8: Idempotency-Key support on 3 inventory POSTs:
+ *   • POST /stock/initialize — admin Dip Stock first-run flag flip. Body hash = {action: 'init'}
+ *     (constant marker since endpoint takes no params). Double-click harmless functionally but
+ *     emits 2 audit log lines pre-fix; wrapper returns cached 200 immediately.
+ *   • POST /stock/adjust — admin manual stock adjust. Body hash = {sku, type, qty, reason,
+ *     warehouse_id}. Double-click → 2x stock movement = WRONG balance (double-add/double-sub).
+ *   • POST /stock/transfer — warehouse-to-warehouse transfer. Body hash = {sku, from_wh, to_wh,
+ *     qty, reason}. Double-click → 2x transfer = WRONG balance both warehouses.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.45.3.
  * Version: V.45.3 (2026-04-30) — Round 27: Idempotency-Key support on POST /dip-stock/approve.
  *   Admin "อนุมัติทั้งหมด" double-click on slow Dip Stock approval → 2nd request runs
  *   stock_add/subtract loop again on rows that DID adjust + skips rows already marked
@@ -2032,6 +2042,10 @@ add_action('rest_api_init', function() {
     ]);
 
     // --- POST /dinoco-stock/v1/stock/adjust ---
+    // V.45.4 Round 30 batch 8: Idempotency-Key support — admin manual stock adjust
+    // Body hash = {sku, type, qty, reason, warehouse_id}. Without wrapper, double-click
+    // on "ปรับสต็อก" → 2x stock movement = double-add/double-subtract = WRONG balance.
+    // Wrapper returns cached 200 immediately. type+qty discriminate add vs subtract.
     register_rest_route('dinoco-stock/v1', '/stock/adjust', [
         'methods'  => 'POST',
         'callback' => function( WP_REST_Request $request ) {
@@ -2050,6 +2064,35 @@ add_action('rest_api_init', function() {
             }
             if (empty($reason)) {
                 return new WP_Error('missing_reason', 'กรุณาระบุเหตุผล', ['status' => 400]);
+            }
+
+            // ── V.45.4 Round 30 batch 8: Idempotency-Key support ──
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::stock-adjust';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'sku'          => strtoupper( $sku ),
+                    'type'         => $type,
+                    'qty'          => $qty,
+                    'reason'       => $reason,
+                    'warehouse_id' => $warehouse_id,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
             }
 
             // V.42.0 [H-9 FIX]: ห้ามปรับสต็อก SET/parent ตรงๆ — ต้องปรับที่ leaf
@@ -2117,12 +2160,25 @@ add_action('rest_api_init', function() {
                 DINOCO_Catalog::set_stock_status($sku, $b2b_status);
             }
 
-            return rest_ensure_response([
+            $resp_data = [
                 'success'       => true,
                 'new_qty'       => $qty_after,
                 'stock_display' => $display,
                 'transaction_id'=> 0,
-            ]);
+            ];
+
+            // Cache successful response for replay
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp_data );
         },
         'permission_callback' => $inv_perm,
     ]);
@@ -2274,11 +2330,50 @@ add_action('rest_api_init', function() {
     ]);
 
     // --- POST /dinoco-stock/v1/stock/initialize ---
+    // V.45.4 Round 30 batch 8: Idempotency-Key support — admin one-time setup
+    // (Dip Stock first run flag flip). Without wrapper, double-click during slow
+    // network flips flag twice = no harm functionally but emits 2 audit log lines.
+    // Wrapper returns cached 200 immediately. Body hash = {action: 'init'} (constant
+    // marker — endpoint takes no params, but constant body is needed for hash compute).
     register_rest_route('dinoco-stock/v1', '/stock/initialize', [
         'methods'  => 'POST',
-        'callback' => function() {
+        'callback' => function( WP_REST_Request $request ) {
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::stock-initialize';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array( 'action' => 'init' );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             update_option('dinoco_inv_initialized', true);
-            return rest_ensure_response(['success' => true]);
+            $resp = array( 'success' => true );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ]);
@@ -2915,6 +3010,10 @@ add_action('rest_api_init', function() {
     ]);
 
     // POST /dinoco-stock/v1/stock/transfer
+    // V.45.4 Round 30 batch 8: Idempotency-Key support — warehouse-to-warehouse transfer
+    // Body hash = {sku, from_warehouse_id, to_warehouse_id, qty, reason}. Without wrapper,
+    // double-click on "โอน" → 2x transfer = WRONG balance both warehouses (over-subtract from
+    // source + over-add to dest). Wrapper returns cached 200 immediately.
     register_rest_route('dinoco-stock/v1', '/stock/transfer', [
         'methods'  => 'POST',
         'callback' => function( WP_REST_Request $request ) {
@@ -2928,6 +3027,35 @@ add_action('rest_api_init', function() {
                 return new WP_Error('invalid_params', 'ข้อมูลไม่ครบ', ['status' => 400]);
             }
 
+            // ── V.45.4 Round 30 batch 8: Idempotency-Key support ──
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::stock-transfer';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'sku'     => strtoupper( $sku ),
+                    'from_wh' => $from_wh,
+                    'to_wh'   => $to_wh,
+                    'qty'     => $qty,
+                    'reason'  => $reason,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             if (!function_exists('dinoco_transfer_stock')) {
                 return new WP_Error('not_available', 'Multi-warehouse not available', ['status' => 500]);
             }
@@ -2936,7 +3064,20 @@ add_action('rest_api_init', function() {
             if (is_wp_error($result)) {
                 return $result;
             }
-            return rest_ensure_response([ 'success' => true, 'data' => $result ]);
+            $resp_data = [ 'success' => true, 'data' => $result ];
+
+            // Cache successful response for replay
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp_data );
         },
         'permission_callback' => $inv_perm,
     ]);

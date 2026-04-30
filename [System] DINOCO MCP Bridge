@@ -1,6 +1,13 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.2.4 (2026-04-30) — Round 30 batch 8: Idempotency-Key support on 2 retry-prone MCP endpoints:
+ *   • POST /dinoco-mcp/v1/claim-manual-create — body hash {serial, symptoms, source_id, platform, customer, phone}.
+ *     OpenClaw chatbot Gemini function-call retry path → duplicate claim CPT records cleaned in Service Center.
+ *   • POST /dinoco-mcp/v1/lead-create — body hash {source_id, phone, platform, product_interest, customer_name}.
+ *     Mobile chatbot retry → duplicate LEAD-{ts}-{rand} records (timestamp+rand suffix means no natural dedup).
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.2.3 behavior.
  * Version: V.2.3 — API-H2: atomic API key auto-generate via add_option (TOCTOU fix)
  * Version: V.2.2 — Lead storage: per-row wp_options (scalable) + migration from flat array
  * DB_ID: 1050
@@ -725,6 +732,44 @@ function dinoco_mcp_claim_manual_create( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'symptoms required' ), 400 );
     }
 
+    // ── V.2.4 Round 30 batch 8: Idempotency-Key support ──
+    // OpenClaw chatbot retry path — Gemini function-call → MCP claim-manual-create can fire
+    // twice on slow WP response (network blip + chatbot internal retry). Without wrapper,
+    // duplicate claim CPT records appear in Service Center → admin manual cleanup.
+    // Body hash = {serial, symptoms, source_id, platform, customer, phone}. source_id is
+    // the FB/IG/LINE user ID — primary discriminator. timestamp/photos[] excluded:
+    //   - photos: URLs differ between retries (CDN signed re-uploads)
+    //   - timestamps: implicit in claim post date
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::claim-manual-create';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'serial'    => $serial,
+            'symptoms'  => $symptoms,
+            'source_id' => $source_id,
+            'platform'  => $platform,
+            'customer'  => $customer,
+            'phone'     => $phone,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // สร้าง claim ticket
     $claim_id = wp_insert_post( array(
         'post_type'   => 'claim_ticket',
@@ -763,12 +808,25 @@ function dinoco_mcp_claim_manual_create( $request ) {
     $ticket_number = 'MC-' . str_pad( $claim_id, 5, '0', STR_PAD_LEFT );
     update_post_meta( $claim_id, 'ticket_number', $ticket_number );
 
-    return new WP_REST_Response( array(
+    $resp_data = array(
         'success' => true,
         'claim_id' => $claim_id,
         'ticket_number' => $ticket_number,
         'status' => 'info_collected',
-    ), 200 );
+    );
+
+    // Cache successful response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // === Claim Manual Update Status ===
@@ -1228,6 +1286,40 @@ function dinoco_mcp_lead_create( $request ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'customer_name, phone, or source_id required' ), 400 );
     }
 
+    // ── V.2.4 Round 30 batch 8: Idempotency-Key support ──
+    // Mobile chatbot retry path — when user types "สนใจ Top Box" + phone, agent calls
+    // lead-create. If WP slow → chatbot retries → duplicate lead records (LEAD-{ts}-{rand}
+    // generates new lead_id every call → no natural dedup). Body hash = {source_id, phone,
+    // platform, product_interest}. source_id is FB/IG user ID — primary identity key.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::lead-create';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'source_id'        => $source_id,
+            'phone'            => $phone,
+            'platform'         => $platform,
+            'product_interest' => $product_interest,
+            'customer_name'    => $customer_name,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // TODO: MCP leads ถูกเก็บใน WP (wp_options) แต่ LIFF AI leads อยู่ใน MongoDB (ผ่าน Agent proxy)
     // ยังไม่มี sync mechanism ระหว่าง 2 ระบบ — ควรรวมเป็น single source of truth ในอนาคต
     // ตัวเลือก: (1) ให้ MCP Bridge forward ไป Agent proxy (2) ให้ LIFF AI อ่านจาก WP
@@ -1256,11 +1348,24 @@ function dinoco_mcp_lead_create( $request ) {
 
     dinoco_mcp_save_lead( $new_lead );
 
-    return new WP_REST_Response( array(
+    $resp_data = array(
         'success' => true,
         'lead_id' => $lead_id,
         'status'  => 'new',
-    ), 200 );
+    );
+
+    // Cache successful response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
