@@ -1396,6 +1396,60 @@ Update status=done + processed_at
 
 **Data scope**: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE conversation logs (via OpenClaw agent).
 
+### 3.5.1 GDPR Export Cross-System Flow (V.4.0 — 2026-04-30)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User<br/>(LIFF Member)
+    participant WP as WordPress<br/>(GDPR System)
+    participant DB as wp_dinoco_<br/>gdpr_requests
+    participant A as OpenClaw Agent<br/>(agent:3000)
+    participant M as MongoDB<br/>(messages/claims/leads)
+    participant ZIP as ZIP Builder<br/>(ZipArchive)
+    participant E as wp_mail
+
+    Note over U,WP: Phase 1 — User request
+    U->>WP: POST /dinoco-gdpr/v1/my-data-export
+    WP->>DB: INSERT (user_id, type=export, status=queued)
+    WP-->>U: { request_id, eta_days }
+
+    Note over WP,DB: Phase 2 — Admin approves<br/>(via Phase 7 admin UI)
+    WP->>WP: dinoco_gdpr_run_worker($id)
+    WP->>DB: SELECT FOR UPDATE → status=processing
+
+    Note over WP,ZIP: Phase 3 — Build local data
+    WP->>ZIP: account.json + usermeta.json
+    WP->>ZIP: warranties.csv + claims/*.json
+    WP->>ZIP: orders.csv
+
+    Note over WP,M: Phase 4 — V.4.0 cross-system fetch
+    WP->>WP: get_user_meta(dinoco_line_uid)
+    alt line_uid exists
+        WP->>A: GET /api/gdpr/line-messages<br/>?line_uid=Uxxx&request_id=N<br/>Authorization: Bearer LIFF_AI_AGENT_KEY
+        A->>M: rate_limit check (1/hour/uid)
+        alt within limit
+            A->>M: find messages WHERE sourceId=line_uid<br/>find claim_logs + leads
+            M-->>A: rows
+            A->>M: INSERT gdpr_export_log (audit)
+            A-->>WP: { ok:true, messages, claims, leads, total_count }
+            WP->>ZIP: line-messages.json + line-claims.json + line-leads.json
+        else 429 rate-limited / 5xx unavailable
+            A-->>WP: { ok:false } / 5xx
+            WP->>ZIP: line-messages-UNAVAILABLE.txt placeholder
+            Note over WP: log warning + continue<br/>(does NOT block export)
+        end
+    else no line_uid
+        Note over WP: skip LINE export (record_counts.line_*=0)
+    end
+
+    Note over WP,E: Phase 5 — Finalize
+    WP->>ZIP: close()
+    WP->>DB: UPDATE status=ready,<br/>download_token, expires_at=now+7d
+    WP->>E: dinoco_gdpr_email_user('export_ready', token)
+    E-->>U: Download link (7d expiry)
+```
+
 ---
 
 ## 3. B2F Factory Purchasing Workflows

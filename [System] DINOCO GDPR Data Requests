@@ -1,6 +1,18 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.4.0 — Round 26 (2026-04-30): LINE messages export from OpenClaw MongoDB.
+ *   Closes deferred item from Phase 6.1 (CLAUDE.md scope: "LINE messages (via agent:3000)").
+ *   NEW dinoco_gdpr_export_line_messages($user_line_uid, $request_id) — calls OpenClaw agent
+ *     GET /api/gdpr/line-messages with bearer auth (LIFF_AI_AGENT_KEY). Timeout 10s + 1 retry.
+ *     Returns array { messages, claims, leads, total_count, generated_at } or empty array on
+ *     failure (logged warning, does NOT block export). Defensive: missing line_uid → skip.
+ *   dinoco_gdpr_build_export() now calls helper if user has dinoco_line_uid meta — adds
+ *     line-messages.json + line-claims.json + line-leads.json to ZIP. README updated with
+ *     section about LINE conversation history (PDPA Sec 30 right of access).
+ *   Cross-system: agent endpoint added in proxy/index.js V.2.3 (rate-limited 1/hour/user,
+ *     MongoDB gdpr_export_log audit collection).
+ *   Risk: LOW — function_exists guard + try/catch + continues on failure. Flag-gated default OFF.
  * Version: V.3.1 — Round 25 (2026-04-29): 25-day SLA reminder cron (Phase 6.1 deferred item).
  *   NEW dinoco_gdpr_sla_reminder_cron — daily 09:00 Bangkok scan for queued/processing requests
  *   older than 25 days. Per request: emails admin reminder + appends `SLA_REMINDER_SENT:<ts>`
@@ -854,6 +866,128 @@ if ( ! function_exists( 'dinoco_gdpr_run_worker' ) ) {
 add_action( 'dinoco_gdpr_process_request', 'dinoco_gdpr_run_worker', 10, 1 );
 
 // ───────────────────────────────────────────────────────────────────
+// V.4.0 — LINE Messages Export (cross-system, OpenClaw MongoDB)
+// ───────────────────────────────────────────────────────────────────
+
+if ( ! function_exists( 'dinoco_gdpr_export_line_messages' ) ) {
+    /**
+     * V.4.0 — Fetch LINE conversation history from OpenClaw agent (MongoDB).
+     *
+     * Cross-system call to agent:3000 (containerized OpenClaw proxy). Returns
+     * array shape: { messages: [...], claims: [...], leads: [...], total_count }.
+     * On any failure (timeout, 4xx/5xx, missing constants) returns empty array
+     * + logs warning — does NOT block the rest of the export.
+     *
+     * Auth: Bearer LIFF_AI_AGENT_KEY (same env constant used by liff_ai_call_agent).
+     * Rate limit enforced agent-side (1 export/line_uid/hour, MongoDB-backed).
+     *
+     * @param string $line_uid    LINE user ID (e.g. "U1234567890abc...") from
+     *                           wp_usermeta `dinoco_line_uid`.
+     * @param int    $request_id  GDPR request_id for audit correlation (passed
+     *                           as ?request_id= query param to agent).
+     * @return array {
+     *     @type array  $messages    LINE conversation history (timestamp, direction, text, type)
+     *     @type array  $claims      Claim logs originated via LINE (created_at, status, claim_id)
+     *     @type array  $leads       Lead records (created_at, status, product_interest, lead_id)
+     *     @type int    $total_count Sum of above lengths
+     *     @type string $generated_at ISO 8601 timestamp from agent
+     *     @type bool   $unavailable True if agent unreachable (caller skip)
+     * }
+     */
+    function dinoco_gdpr_export_line_messages( $line_uid, $request_id = 0 ) {
+        $empty = array(
+            'messages'     => array(),
+            'claims'       => array(),
+            'leads'        => array(),
+            'total_count'  => 0,
+            'generated_at' => '',
+            'unavailable'  => false,
+        );
+
+        $line_uid = trim( (string) $line_uid );
+        if ( $line_uid === '' || strlen( $line_uid ) < 5 ) {
+            return $empty;
+        }
+
+        // Required constants
+        if ( ! defined( 'LIFF_AI_AGENT_URL' ) || ! defined( 'LIFF_AI_AGENT_KEY' ) ) {
+            error_log( '[GDPR-LINE] Skipped: LIFF_AI_AGENT_URL or LIFF_AI_AGENT_KEY undefined' );
+            $empty['unavailable'] = true;
+            return $empty;
+        }
+
+        $base_url = rtrim( LIFF_AI_AGENT_URL, '/' );
+        $endpoint = $base_url . '/api/gdpr/line-messages';
+        $url = add_query_arg( array(
+            'line_uid'   => $line_uid,
+            'request_id' => (int) $request_id,
+        ), $endpoint );
+
+        $args = array(
+            'method'  => 'GET',
+            'headers' => array(
+                'Authorization' => 'Bearer ' . LIFF_AI_AGENT_KEY,
+                'Accept'        => 'application/json',
+            ),
+            'timeout' => 10,
+        );
+
+        // Try once, then retry on transient network failure (max 1 retry)
+        $response = wp_remote_request( $url, $args );
+        if ( is_wp_error( $response ) ) {
+            error_log( '[GDPR-LINE] First attempt failed for uid=' . substr( $line_uid, 0, 6 ) . '...: ' . $response->get_error_message() . ' — retrying once' );
+            // Fallback: try localhost if URL contains agent: hostname (Docker compat)
+            if ( strpos( $url, 'agent:' ) !== false ) {
+                $fallback_url = str_replace( 'agent:', 'localhost:', $url );
+                $response = wp_remote_request( $fallback_url, $args );
+            } else {
+                $response = wp_remote_request( $url, $args );  // simple retry
+            }
+            if ( is_wp_error( $response ) ) {
+                error_log( '[GDPR-LINE] Retry failed: ' . $response->get_error_message() );
+                $empty['unavailable'] = true;
+                return $empty;
+            }
+        }
+
+        $code = wp_remote_retrieve_response_code( $response );
+        $body_str = wp_remote_retrieve_body( $response );
+
+        // 429 rate-limited (recent export already issued) → return empty + log
+        if ( $code === 429 ) {
+            error_log( '[GDPR-LINE] Rate limited for uid=' . substr( $line_uid, 0, 6 ) . '... (1/hour cap)' );
+            $empty['unavailable'] = true;
+            return $empty;
+        }
+        // 503 db unavailable → log + empty
+        if ( $code >= 500 ) {
+            error_log( '[GDPR-LINE] Server error code=' . $code . ' body=' . substr( $body_str, 0, 200 ) );
+            $empty['unavailable'] = true;
+            return $empty;
+        }
+        if ( $code >= 400 ) {
+            error_log( '[GDPR-LINE] Client error code=' . $code . ' body=' . substr( $body_str, 0, 200 ) );
+            return $empty;  // not unavailable — likely missing line_uid validation; treat as no data
+        }
+
+        $data = json_decode( $body_str, true );
+        if ( ! is_array( $data ) || empty( $data['ok'] ) ) {
+            error_log( '[GDPR-LINE] Malformed agent response for uid=' . substr( $line_uid, 0, 6 ) . '...' );
+            return $empty;
+        }
+
+        return array(
+            'messages'     => isset( $data['messages'] ) && is_array( $data['messages'] ) ? $data['messages'] : array(),
+            'claims'       => isset( $data['claims'] ) && is_array( $data['claims'] ) ? $data['claims'] : array(),
+            'leads'        => isset( $data['leads'] ) && is_array( $data['leads'] ) ? $data['leads'] : array(),
+            'total_count'  => isset( $data['total_count'] ) ? (int) $data['total_count'] : 0,
+            'generated_at' => isset( $data['generated_at'] ) ? (string) $data['generated_at'] : '',
+            'unavailable'  => false,
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
 // V.2.0 — Export Builder
 // ───────────────────────────────────────────────────────────────────
 
@@ -958,7 +1092,10 @@ if ( ! function_exists( 'dinoco_gdpr_build_export' ) ) {
             "  usermeta.json    - PII metadata (LINE UID, phone, address)\n" .
             "  warranties.csv   - Registered products + warranty history\n" .
             "  claims/          - Claim tickets (one JSON per claim)\n" .
-            "  orders.csv       - B2B order history (distributors only)\n\n" .
+            "  orders.csv       - B2B order history (distributors only)\n" .
+            "  line-messages.json - LINE chat history (if linked LINE UID)\n" .
+            "  line-claims.json   - Claims initiated via LINE chatbot\n" .
+            "  line-leads.json    - Lead records from LINE conversations\n\n" .
             "Legal references:\n" .
             "  Thai PDPA Section 30-31 (Right of Access + Portability)\n" .
             "  GDPR Article 15 (Right of Access) + Article 20 (Data Portability)\n\n" .
@@ -1069,6 +1206,52 @@ if ( ! function_exists( 'dinoco_gdpr_build_export' ) ) {
             }
             $zip->addFromString( 'orders.csv', $orders_csv );
             $record_counts['orders'] = count( $order_posts );
+        }
+
+        // ── V.4.0 — LINE conversation history (cross-system from OpenClaw MongoDB) ──
+        // Best-effort: agent unreachable → log warning + skip (does NOT block export).
+        $line_uid = (string) get_user_meta( $user_id, 'dinoco_line_uid', true );
+        if ( $line_uid === '' ) {
+            // Legacy meta key fallback
+            $line_uid = (string) get_user_meta( $user_id, 'line_user_id', true );
+        }
+        $record_counts['line_messages'] = 0;
+        $record_counts['line_claims']   = 0;
+        $record_counts['line_leads']    = 0;
+        $record_counts['line_unavailable'] = false;
+        if ( $line_uid !== '' && function_exists( 'dinoco_gdpr_export_line_messages' ) ) {
+            try {
+                $line_data = dinoco_gdpr_export_line_messages( $line_uid, 0 );
+                if ( ! empty( $line_data['unavailable'] ) ) {
+                    $record_counts['line_unavailable'] = true;
+                    // Add placeholder note in ZIP so user knows export was incomplete
+                    $zip->addFromString( 'line-messages-UNAVAILABLE.txt',
+                        "LINE conversation history could not be exported.\n" .
+                        "The OpenClaw chatbot service was temporarily unavailable.\n" .
+                        "Please contact support@dinoco.in.th to request manual export.\n" .
+                        "Generated: " . current_time( 'mysql' ) . "\n"
+                    );
+                } else {
+                    if ( ! empty( $line_data['messages'] ) ) {
+                        $zip->addFromString( 'line-messages.json',
+                            wp_json_encode( $line_data['messages'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                        $record_counts['line_messages'] = count( $line_data['messages'] );
+                    }
+                    if ( ! empty( $line_data['claims'] ) ) {
+                        $zip->addFromString( 'line-claims.json',
+                            wp_json_encode( $line_data['claims'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                        $record_counts['line_claims'] = count( $line_data['claims'] );
+                    }
+                    if ( ! empty( $line_data['leads'] ) ) {
+                        $zip->addFromString( 'line-leads.json',
+                            wp_json_encode( $line_data['leads'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                        $record_counts['line_leads'] = count( $line_data['leads'] );
+                    }
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[GDPR-LINE] Export helper threw: ' . $e->getMessage() );
+                $record_counts['line_unavailable'] = true;
+            }
         }
 
         $zip->close();

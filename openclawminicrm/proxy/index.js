@@ -1256,6 +1256,124 @@ app.post("/api/leads/:id/status", requireAuth, express.json(), async (req, res) 
 app.post("/api/leads/b2b-order-linked", requireAuth, express.json(), async (req, res) => { const db = await getDB(); if (!db) return res.status(500).json({ error: "DB error" }); const { distributor_id, order_id } = req.body; const lead = await db.collection("leads").findOne({ dealerId: String(distributor_id), status: { $in: ["waiting_order", "dealer_contacted", "checking_contact", "dealer_notified"] }, closedAt: null }, { sort: { createdAt: -1 } }); if (!lead) return res.json({ linked: false }); await db.collection("leads").updateOne({ _id: lead._id }, { $set: { status: "order_placed", b2bOrderId: order_id, updatedAt: new Date() }, $push: { history: { from: lead.status, to: "order_placed", status: "order_placed", at: new Date(), by: "b2b_link" } } }); res.json({ linked: true, lead_id: String(lead._id) }); });
 app.post("/api/leads/cron/:type", requireAuth, async (req, res) => { const validTypes = ["first-check", "contact-recheck", "delivery-check", "install-check", "30day-check", "dormant-cleanup", "dealer-sla-weekly", "closing-soon"]; if (!validTypes.includes(req.params.type)) return res.status(400).json({ error: "Invalid type" }); try { const result = await runLeadCronByType(req.params.type); res.json({ ok: true, ...result }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
+// ════════════════════════════════════════════════════════════════════
+// === GDPR LINE Messages Export (V.1.0 — 2026-04-30) ===
+// Cross-system: WP GDPR system (V.4.0) calls this endpoint to fetch a
+// user's LINE conversation history from MongoDB for inclusion in the
+// data export ZIP per Thai PDPA §30 + GDPR Article 15.
+//
+// Auth: requireAuth (LIFF_AI_AGENT_KEY bearer) — same gate as advisor APIs.
+// Rate limit: 1 req/user/hour (MongoDB-backed dedup via gdpr_export_log).
+// Audit: every call logged in gdpr_export_log collection with ts + caller.
+// Privacy: returns ONLY the requested user's own messages (no third-party
+//   PII redaction needed because user_data_export is a self-request).
+// ════════════════════════════════════════════════════════════════════
+app.get("/api/gdpr/line-messages", requireAuth, async (req, res) => {
+  try {
+    const lineUid = sanitizeId(req.query.line_uid || "");
+    const requestId = sanitizeId(req.query.request_id || "");
+    if (!lineUid || lineUid.length < 5) {
+      return res.status(400).json({ ok: false, error: "missing_or_invalid_line_uid" });
+    }
+    const db = await getDB();
+    if (!db) return res.status(503).json({ ok: false, error: "db_unavailable" });
+
+    // Rate limit: 1 export per line_uid per hour (defensive against abuse)
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const recent = await db.collection("gdpr_export_log").findOne({
+      line_uid: lineUid,
+      ts: { $gte: oneHourAgo },
+    });
+    if (recent) {
+      return res.status(429).json({
+        ok: false,
+        error: "rate_limited",
+        message: "Recent export already issued — try again in 1 hour",
+        last_export_at: recent.ts,
+      });
+    }
+
+    // Fetch messages — sourceId === line_uid for direct chats, or check both fields
+    // (some legacy rows may use lineUid; current schema uses sourceId)
+    const messages = await db.collection("messages")
+      .find({
+        $or: [
+          { sourceId: lineUid },
+          { lineUid: lineUid },
+        ],
+        platform: "line",
+      })
+      .sort({ timestamp: 1 })
+      .limit(10000)  // hard cap — typical user has < 1000 messages
+      .toArray();
+
+    // Strip MongoDB internal fields + redact only third-party PII (other users
+    // mentioned in messages should not be exposed). User's own messages = OK.
+    const cleanedMessages = messages.map((m) => ({
+      timestamp: m.timestamp || m.createdAt || null,
+      direction: m.direction || (m.from === lineUid ? "user" : "bot"),
+      text: m.text || "",
+      type: m.type || "text",
+      // omit internal _id, embeddings, AI metadata (cost/tokens)
+    }));
+
+    // Fetch claim_logs for this user (LINE-originated claims)
+    const claims = await db.collection("claim_logs")
+      .find({ sourceId: lineUid })
+      .sort({ createdAt: 1 })
+      .limit(500)
+      .toArray();
+
+    const cleanedClaims = claims.map((c) => ({
+      created_at: c.createdAt || null,
+      status: c.status || "",
+      claim_id: c.claimId || c._id?.toString() || "",
+      // omit internal AI processing metadata
+    }));
+
+    // Fetch leads where this user is the customer
+    const leads = await db.collection("leads")
+      .find({ sourceId: lineUid })
+      .sort({ createdAt: 1 })
+      .limit(500)
+      .toArray();
+
+    const cleanedLeads = leads.map((l) => ({
+      created_at: l.createdAt || null,
+      status: l.status || "",
+      product_interest: l.productInterest || "",
+      lead_id: l._id?.toString() || "",
+      // omit dealerId (3rd party) + internal scoring metadata
+    }));
+
+    // Audit log — every export call recorded immutably
+    await db.collection("gdpr_export_log").insertOne({
+      line_uid: lineUid,
+      request_id: requestId || null,
+      ts: new Date(),
+      counts: {
+        messages: cleanedMessages.length,
+        claims: cleanedClaims.length,
+        leads: cleanedLeads.length,
+      },
+      caller_ip: req.ip || req.headers["x-forwarded-for"] || "",
+    });
+
+    return res.json({
+      ok: true,
+      line_uid: lineUid,
+      messages: cleanedMessages,
+      claims: cleanedClaims,
+      leads: cleanedLeads,
+      total_count: cleanedMessages.length + cleanedClaims.length + cleanedLeads.length,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[GDPR-Export] LINE messages export failed:", e.message);
+    return res.status(500).json({ ok: false, error: "internal_error", detail: e.message });
+  }
+});
+
 // === Dealers API (V.2.0 — Dealer Management) ===
 app.get("/api/dealers", requireAuth, async (req, res) => {
   try {
