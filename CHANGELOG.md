@@ -10,6 +10,57 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 25 (Idempotency expansion +5 + GDPR 25-day SLA reminder cron + verification gate) (2026-04-29)
+
+Round 25 closes 2 work items: (1) extends Round 19+23's Idempotency-Key infrastructure to 5 more critical POST endpoints (cumulative 8 → 13 endpoints, ~17% of 75+ POST surface), and (2) implements the deferred GDPR Phase 6.1 25-day SLA reminder cron per `docs/compliance/GDPR-PHASE-6-DESIGN.md` line 274-277. Verification gate confirmed all 466 PHPUnit + 156 Jest tests green; 1 pre-existing security allowlist line drift (line 989 → 999) re-pinned.
+
+#### Phase 1 — Idempotency expansion (5 endpoints, +15 contract tests)
+
+| Endpoint | Snippet | Body Hash Inputs | Use Case |
+| --- | --- | --- | --- |
+| `POST /b2b/v1/update-status` | Snippet 5 V.33.5 → V.33.6 | `{ticket_id, status}` (old_st DB-derived excluded) | Bulk Confirm/Cancel admin loops on partial network drop |
+| `POST /b2b/v1/cancel-request` | Snippet 3 V.42.11 → V.42.12 | `{ticket_id, group_id}` (group_id from session, auth-scoped) | Customer LIFF "ยกเลิก" double-tap on slow network |
+| `POST /b2f/v1/po-cancel` | Snippet 2 V.11.12 → V.11.13 | `{po_id, reason}` (reason editing surfaces 409) | Admin double-click cancel + reason edit between retries |
+| `POST /b2f/v1/maker-confirm` | Snippet 2 V.11.12 → V.11.13 | `{po_id, maker_id, expected_date, note}` (JWT-scoped) | Maker LIFF retry on slow LINE response |
+| `POST /b2f/v1/record-payment` | Snippet 2 V.11.12 → V.11.13 | `{po_id, amount, method, date, reference, note}` (slip binary excluded — FormData limitation) | Central wrapper extends per-endpoint 10s transient → 24h replay |
+
+All 5 mirror Round 19+23 proven pattern: optional `X-Idempotency-Key` header + `dinoco_idempotency_extract_key/check/store` helper triad + `function_exists()` defensive guards everywhere. Backward compat: missing header = byte-identical to previous version. record-payment additionally preserves the legacy FIX-2b 10s transient (per-endpoint short-window collision protection) — central wrapper layered ABOVE it for 24h replay window.
+
+#### Phase 2 — GDPR 25-day SLA reminder cron (V.3.0 → V.3.1)
+
+NEW `dinoco_gdpr_sla_reminder_cron` daily 09:00 Bangkok scan:
+
+- Query: `status IN ('queued','processing') AND created_at < NOW() - 25 days` (`LIMIT 50` defensive cap)
+- Per match: `wp_mail` admin reminder (subject: `[DINOCO GDPR] SLA Reminder: Request #N — X days left`) + `dinoco_gdpr_audit_log` immutable trail entry (`action='sla_reminder_sent'`)
+- Idempotency marker: append `SLA_REMINDER_SENT:<ts>` to `notes` column (preserves existing notes via newline append) — prevents re-fire on consecutive cron runs
+- Hook: `do_action('dinoco_gdpr_sla_reminders_sent', $count, $stale_rows)` for downstream Telegram/Slack notifiers
+- Defensive guards: flag-gate (`dinoco_gdpr_is_enabled()` short-circuits), schema check (`SHOW TABLES LIKE` before SELECT), admin_email validation (empty/invalid → log + skip), `wp_mail()` failure → log + continue
+- Per Thai PDPA §35 + GDPR Art. 12(3) 30-day response window — fires at day 25 to give admin 5-day action buffer
+
+Risk: NONE — additive cron, ALL operations gated by `dinoco_gdpr_is_enabled()` default OFF. Production never reaches new code paths until Phase 7 admin UI activated + flag flipped.
+
+#### Phase 3 — Verification gate
+
+- PHPUnit: 466 tests pass (was 451 — Round 25 +15 cases)
+- Jest: 21 suites, 156 tests + 2 skipped (1 suite required allowlist line re-pin: `[Admin System] B2F Migration Audit:989 → :999` — pre-existing drift from Round 24, not Round 25 impact)
+- All 8 drift detectors clean
+- README badges updated: phpunit_tests 383 → 466, jest_tests 146 → 156, total 680 → 773
+- README "What's New" extended to Rounds 13-25
+
+#### Files touched
+
+- `[B2B] Snippet 5: Admin Dashboard` V.33.5 → V.33.6
+- `[B2B] Snippet 3: LIFF E-Catalog REST API` V.42.11 → V.42.12
+- `[B2F] Snippet 2: REST API` V.11.12 → V.11.13
+- `[System] DINOCO GDPR Data Requests` V.3.0 → V.3.1
+- `tests/helpers/IdempotencyEndpointContractTest.php` 41 → 56 cases
+- `tests/jest/php-security.test.js` allowlist line re-pin
+- `README.md` test badges + "What's New" + count table
+
+ZERO regressions. Round 25 brings the cumulative round count to 25 with 65+ commits across all rounds.
+
+---
+
 ### Feature — Round 24 (GDPR Phase 7 admin review UI + 6 REST endpoints + audit log) (2026-04-29)
 
 Phase 7 closes the GDPR/PDPA admin workflow on top of Round 23's foundation. ALL features remain flag-gated `dinoco_gdpr_enabled=0` default — endpoints return 503 + admin UI shows "FLAG OFF" badge until explicit activation.

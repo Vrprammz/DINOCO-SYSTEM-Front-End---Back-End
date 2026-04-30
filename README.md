@@ -7,8 +7,8 @@
 [![Regression Guard](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml)
 [![Coverage Lines](https://img.shields.io/badge/jest_coverage_lines-98.68%25-brightgreen)](coverage/jest/index.html)
 [![Coverage Branches](https://img.shields.io/badge/jest_coverage_branches-85.09%25-green)](coverage/jest/index.html)
-[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-383_passing-brightgreen)](tests/helpers/)
-[![Jest Tests](https://img.shields.io/badge/jest_tests-146_passing-brightgreen)](tests/jest/)
+[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-466_passing-brightgreen)](tests/helpers/)
+[![Jest Tests](https://img.shields.io/badge/jest_tests-156_passing-brightgreen)](tests/jest/)
 [![Mermaid Diagrams](https://img.shields.io/badge/mermaid_diagrams-22-blue)](WORKFLOW-REFERENCE.md)
 
 WordPress-based motorcycle warranty management platform serving B2C members and B2B distributors.
@@ -24,14 +24,16 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 
 ## What's New (2026-04-29)
 
-Recent infrastructure rounds (Rounds 13-19):
+Recent infrastructure rounds (Rounds 13-25):
 
+- **Round 25** — Idempotency expansion +5 (8 → 13 endpoints) + GDPR 25-day SLA reminder cron. +15 contract tests.
+- **Round 24** — GDPR Phase 7 admin review UI + 6 admin REST endpoints. +28 admin permission tests.
+- **Round 23** — Idempotency expansion (3 → 8) + GDPR Phase 6 deletion executor. +15 contract tests + 19 decision matrix tests.
+- **Round 22** — B2F V.7.0 Order Intent Dashboard + filter persistence.
+- **Round 21** — Patterns library + cron drift + inline handler regression. +1 drift detector (7 → 8).
 - **Round 19** — Idempotency-Key integrated on 3 critical POST endpoints (place-order, manual-flash-create, create-po). +20 contract tests.
 - **Round 18** — Idempotency Helper foundation V.1.0 (NEW snippet, 5 functions, 25 unit tests). +18 IsTopLevelSet test cases.
-- **Round 17** — MCP Bridge architecture + Brand Voice flow diagrams. +37 unit tests (intent breakdown + validate hierarchy).
-- **Round 16** — Walk-in stateDiagram + B2F PO sequenceDiagram. Master regression manifest index.
-- **Round 15** — `update_meta_cache` `function_exists` guards (7 snippets, 11 call sites). 2 sequence diagrams.
-- **Cumulative**: 0 → 383 PHPUnit tests + 0 → 146 Jest tests + 0 → 22 Mermaid diagrams + 0 → 7 drift detectors. ZERO regressions.
+- **Cumulative**: 0 → 466 PHPUnit tests + 0 → 156 Jest tests + 0 → 22 Mermaid diagrams + 0 → 8 drift detectors. ZERO regressions.
 
 See [docs/audit/ROUNDS-1-19-RETROSPECTIVE.md](docs/audit/ROUNDS-1-19-RETROSPECTIVE.md) for full retrospective.
 
@@ -98,11 +100,11 @@ Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-fun
 
 | Suite | Tests | Runtime | Surface |
 |---|---|---|---|
-| PHPUnit Unit | 383 | < 5s | Pure-logic helpers (math/policy) — 21 test files (Currency, Hierarchy, IsTopLevelSet, IntentBreakdown, ValidateSkuHierarchy, V70SourceSku, FlashEcSuggester, DiscountTier, BoxCalc, BoQty, ShippingResolve, OrderSnapshot, FlashSign, FlagAudit, Idempotency, IdempotencyEndpointContract, +5 more) |
+| PHPUnit Unit | 466 | < 5s | Pure-logic helpers (math/policy) — 23+ test files (Currency, Hierarchy, IsTopLevelSet, IntentBreakdown, ValidateSkuHierarchy, V70SourceSku, FlashEcSuggester, DiscountTier, BoxCalc, BoQty, ShippingResolve, OrderSnapshot, FlashSign, FlagAudit, Idempotency, IdempotencyEndpointContract, GdprDeletionDecision, GdprAdminPermission, +5 more) |
 | PHPUnit Integration | 51 | ~1 min | DB-coupled (FOR UPDATE, GET_LOCK, FSM, REST) |
-| Jest | 146 | < 2s | LIFF foundation + OpenAPI + links + secrets + dangerous-APIs + PHP security + 7 drift detectors (api-contract / JSDoc / DB_ID / shortcode / constants / feature-flags / REST endpoints) |
+| Jest | 156 | < 2s | LIFF foundation + OpenAPI + links + secrets + dangerous-APIs + PHP security + 8 drift detectors (api-contract / JSDoc / DB_ID / shortcode / constants / feature-flags / REST endpoints / cron) |
 | Playwright E2E | 25 × 4 projects | ~9s | Cart + API client + place-order + modal + liff-init + Vite-built bundle smoke in 4 browsers |
-| **Total** | **680** | | |
+| **Total** | **773** | | |
 
 ### Coverage (Jest)
 

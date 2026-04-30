@@ -74,9 +74,9 @@ const PHP_SECURITY_ALLOWLIST = new Set([
     // (cred file, db name, table name, output path) are passed through
     // escapeshellarg() before sprintf — textbook-correct shell hardening.
     // Verified 2026-04-28 in commit 4c01934 cleanup. Line drifted from
-    // :984 → :989 across edits from commits 8784976..(Round 10) — re-pinned
-    // 2026-04-30 (Round 10 push gate). Re-verify if line moves again.
-    "[Admin System] B2F Migration Audit:989:RCE_SHELL",
+    // :984 → :989 → :999 across edits from commits 8784976..Round 24 — re-pinned
+    // 2026-04-30 (Round 25 verification gate). Re-verify if line moves again.
+    "[Admin System] B2F Migration Audit:999:RCE_SHELL",
 ]);
 
 /**
