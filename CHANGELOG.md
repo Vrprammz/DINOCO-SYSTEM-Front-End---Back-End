@@ -10,6 +10,81 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Refactor + Docs + PERF — Round 9 FINAL (UX-H3 100% closure + Inventory/Manual Invoice diagrams + Snippet 7 cache priming) (2026-04-30)
+
+3 files closing the last 12 UX-H3 sites + 2 new flow diagrams + 5 cache-priming spots. Risk: LOW (delegation defense-in-depth, behavior preserved) + NONE (docs) + NONE (PERF additive).
+
+**ITEM A — UX-H3 Phase 6 FINAL: SET header + form change/input delegated (B2F Snippet 5 V.8.5 → V.8.6)**
+
+12 sites migrated — UX-H3 closed 124/124 (100%) for B2F Snippet 5.
+
+- **(1) SET header accordion**: `onclick="B2F_Makers.toggleSet(...)"` → `data-action="makers-toggle-set"` + `data-set-id`. Delegated handler bails when click target is inside `.b2f-set-inputs` / `.sku-inp` / `.b2f-auto-set-delete` (defense-in-depth replacing legacy element-level stopPropagation). Legacy `B2F_Makers.toggleSet` function retained for backward compat.
+- **(2) SET inputs wrapper**: `onclick="event.stopPropagation()"` → `data-stop-prop="1"` semantic marker (runtime no-op since toggle handler already defense-bails).
+- **(3)-(4) SET MOQ/lead inputs + SKU rows × 6 inputs/row**: `oninput="B2F_Makers.checkDirty(this)"` → `data-input="makers-check-dirty"` (delegated input listener passes target → checkDirty(el)).
+- **(5)-(6) Static filter rows (Orders)**: 4 sites — maker select + dates + search input → `data-change="orders-apply-filters"` / `data-input="orders-debounce-search"`.
+- **(6) Create-PO form (Orders, 3 fields)**: maker select + shipping_method (×2 land/sea/THB) + exchange_rate input → data-change/data-input.
+- **(7) Create-PO sku grid (Orders, dynamic)**: checkbox + qty number input → `data-change/data-input="orders-recalc-total"`.
+- **(8) Static filter row (Makers)**: search input + status select + audit-select-all → data-change/data-input.
+- **(9) Picker checkboxes (Makers, dynamic)**: 3-arg encoding (sku/name/img with `replace(/'/g,"\\'")` escape soup) → `data-change="makers-toggle-picker-item"` + `data-sku/data-name/data-img` attrs. Delegated handler reads attrs + checkbox.checked, calls `togglePickerItem(sku,name,img,el)`.
+- **2 NEW idempotent guards**: `_b2fOrdersChangeBound` + `_b2fMakersChangeBound`.
+
+**Cumulative tally**: 19 (P1) + 24 (P2) + 20 (P3) + 19 (P4) + ~30 (P5) + 12 (P6) = **124 of 124 — UX-H3 100% closed for B2F Snippet 5**. Eliminates all inline `onclick=`/`onchange=`/`oninput=` (CSP-readier).
+
+**Behavior preserved** (verified):
+
+- All delegated handlers call IDENTICAL functions with same args as legacy inline calls
+- Accordion expand/collapse semantics unchanged (defense-bail covers SET inputs + .sku-inp + .b2f-auto-set-delete)
+- SET MOQ/lead_time inputs editable inline without toggling parent
+- Picker auto-expand SET still triggers via togglePickerItem
+- PHP + JS syntax validated (php -l on Snippet 5 + node --check on 3 extracted JS blocks)
+
+**ITEM B — Inventory + Manual Invoice flow diagrams (WORKFLOW-REFERENCE.md)**
+
+2 new Mermaid diagrams:
+
+- **Section 8.3 NEW — Manual Invoice Lifecycle (V.34.10)**: stateDiagram-v2 covering builder → draft_saved → issued → notified → paid/cancelled/refunded → partial_paid. Documents V.34.4-V.34.10 fix series (picker double-discount V.34.4-6, image push observability V.34.8, stale nonce auto-reload V.34.9, V.34.10 hardening). Includes Excluded-from list (Daily Summary 17:30 ICT pending_ship + Admin LIFF + Admin Dashboard stat boxes) and Included-in list (revenue MTD + Finance Dashboard) per user policy.
+- **Section 10.0 NEW — Inventory Stock Cycle Sequence Diagram (V.8.5+)**: sequenceDiagram showing 5 cycles: (1) B2F receive (stock IN + payable_add); (2a) B2B order awaiting_confirm; (2b) Cancel restore with `_stock_returned` idempotent guard; (3) Walk-in DD-5 allow_negative; (4) Dip stock variance approve; (5) Hierarchy compute (recursive MIN with cache). 8 critical guards (DD-2 through DD-7 + leaf guard + stock_returned meta) with version refs (V.7.1, V.39.0, V.31.7, V.34.2). Atomic transaction code skeleton + cache invalidation chain.
+- **Both diagrams syntax-validated**: 6 loops + 3 alt/else properly closed (9 ends total) in sequence diagram. State diagram has 16 transitions + bracket escape for `[dinoco_manual_invoice]` shortcode.
+- **TOC updated** for both new sections.
+
+**ITEM C — PERF audit B2B Snippet 7 cache priming (V.31.0 → V.31.1)**
+
+5 N+1 patterns eliminated in cron jobs via `update_post_meta_cache` priming:
+
+| Cron | Loop | Symptoms before | Fix |
+| ---- | ---- | --------------- | --- |
+| `b2b_run_daily_summary` | `$today_orders` | get_field × today's orders | Prime once via `wp_list_pluck($today_orders, 'ID')` |
+| `b2b_run_daily_summary` | `$shipped_today_ids` | fields=ids list → get_field('total_amount') per ID | Prime once on IDs list |
+| `b2b_run_rank_update` | `$dists` | monthly_sales_mtd × N + rank_system × N + line_group_id × N | Prime distributors once |
+| `b2b_run_weekly_report` | `$week_orders` | total_amount + source_group_id loop | Prime once |
+| `b2b_run_weekly_report` | `$dists` | current_debt + credit_hold loop for overdue count | Prime once |
+| `b2b_run_shipping_overdue_summary` | `$orders` | source_group_id + total_amount loop | Prime once |
+
+**Pattern**: `if (!empty($posts)) update_post_meta_cache(wp_list_pluck($posts, 'ID'));` — 1 extra query upfront primes WP object cache so subsequent `get_field`/`get_post_meta` calls inside loop hit cache.
+
+**Already optimized** (no change needed): `b2b_run_dunning_process` (V.30.6 already primes both `$dists` + `$all_ap_orders`), Flash tracking cron (V.30.7 PERF-H8 prime).
+
+**Behavior unchanged** — only adds cache priming. PHP lint clean.
+
+**Files touched (3)**:
+
+- `[B2F] Snippet 5: Admin Dashboard Tabs` V.8.5 → V.8.6 (+187/-30)
+- `WORKFLOW-REFERENCE.md` (+204 sections 8.3 NEW + 10.0 NEW + TOC)
+- `[B2B] Snippet 7: Cron Jobs - Dunning + Summary + Rank` V.31.0 → V.31.1 (+15)
+
+**Cumulative Round 1-9 outcome**:
+
+- 22+ items closed across 9 rounds
+- **UX-H3 100% closed** for B2F Snippet 5 — eliminates all 124 inline event handlers
+- **5 lifecycle/sequence diagrams** in WORKFLOW-REFERENCE.md (B2B + B2F + Inventory + Manual Invoice + dip stock)
+- ZERO behavior change across all rounds — pure refactor + observability + cache priming
+
+**Deferred** (out of scope):
+
+- `onerror=` image fallback handlers (img onerror differs from user-action handlers)
+- Other snippets' inline event handlers (Round 9 scoped to B2F Snippet 5 + Snippet 7 PERF only)
+- MD040 fenced-code-language warnings (pre-existing whole file — bulk fix for separate session)
+
 ### Refactor + Docs — Round 8 UX-H3 Phase 5 (dynamic compound delegation) + B2B/B2F lifecycle Mermaid (2026-04-30)
 
 2 commits closing 1 UX-H3 batch + 1 docs gap. Risk: LOW-MEDIUM (UX-H3 dynamic) + NONE (docs).
