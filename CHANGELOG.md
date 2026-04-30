@@ -10,6 +10,71 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Audit + Test — Round 13 (Cross-rounds code review + unit test expansion + PERF sweep finalize) (2026-04-30)
+
+After 42 commits across Rounds 1-12 (UX-H3 100% / onerror 100% / 7 drift detectors / 211 phpunit + 146 jest tests / Flag Audit Log / 5 PERF sweeps / MD040 clean / coverage badges) without independent code review, Round 13 = safety verification + final polish. ZERO regressions across all 12 rounds maintained.
+
+**ITEM A — Cross-rounds code review audit (read-only)**
+
+Manual audit of 42 commits since session start. Focus areas: UX-H3 refactor (Phases 1-6 — 124 sites in B2F Snippet 5 V.7.x → V.8.6) / onerror migration (manual_ship V.44.4) / PERF cache priming (Snippets 5/7/12 + B2F Snippet 2 + LIFF AI Snippet 1) / NEW Flag Audit Log V.1.0 (DB schema + helper + viewer + REST API) / NEW BO V.3.0 bulk ops (Snippet 16 selection state + bulk handlers).
+
+Findings (3 MEDIUM + 0 HIGH + 0 CRITICAL):
+
+- **MED-1** — `manual_ship.html` V.44.4 line 1337 (`t.style.display='none'`) is dead code after `parentNode.textContent='📦'` on next line wipes the entire `<img>` element. Cosmetic; leaving as-is for V.44.5 cleanup batch (no behavior impact — emoji renders correctly either way).
+- **MED-2** — `[B2B] Snippet 16` V.2.9 `_prime_post_caches()` calls (4 sites: lines 1108, 1120, 2347, 2360) lack `function_exists` defensive guard. WP internal function (private but stable since 1.5+); risk: future WP could deprecate without notice. Defer to V.3.2 (additive guard, no urgency).
+- **MED-3** — `[Admin System] DINOCO Brand Voice Pool` `bv_get_stats()` calls `bv_get_entries(['limit' => 9999])` → fetches up to 9999 posts × 22 meta reads = 219k cache lookups. WP_Query auto-primes postmeta cache (single query) so it's CPU/memory-bound, not N+1 query. Defer to V.42.x backlog (refactor to SQL-aggregate sentiment counts directly).
+
+POSITIVE FINDINGS (concerns proven safe):
+
+- **UX-H3 outer card delegation chain** (B2F Snippet 5 V.8.5+): `closest('[data-action]')` walks UP from target → child action buttons match before outer card's `orders-go-to-ticket` → checkbox/edit/delete buttons fire only their own handler. Verified via tracing checkbox→updateBulkBar path: browser default action toggles checkbox state BEFORE click bubbles to document → `:checked` query inside `updateBulkBar` reads correct post-toggle state. Behavior preservation confirmed.
+- **Compound `data-args` JSON dispatch** (V.8.4 close-and-call): Whitelist `_ORDERS_CLOSE_AND_CALL_FNS` (8 entries) prevents arbitrary fn dispatch. JSON.parse + Array.isArray gate. esc() HTML-encodes attribute. Thai PO numbers + special chars handled safely.
+- **Flag Audit Log V.1.0 DB safety**: SHOW TABLES probe + lazy install retry + transient-throttled error_log on persistent miss + `\Throwable` catch + try/finally. Insert never throws to caller. Source whitelist (8 values, falls to 'other'). VARCHAR(255) truncation via serializer. Composite indexes (flag_name, changed_at, user_id). Retention cron chunked 1000/iter + 50ms gap + 20-iter cap = 20K rows/run safety ceiling.
+- **Snippet 16 BO bulk ops state**: `_boSelected` (Set) + `_boRowMeta` (Map) preserved across `loadQueue()` refresh. Stale ID drop after each refresh (`if (!visibleIds.has(id))`). Status guard (`pending`/`ready` only) before bulk-fulfill build. Defensive: dinocoModal try/catch + native confirm/prompt fallback. Idempotent.
+- **PERF cache priming (5 sites in Snippet 7 V.31.1)**: dunning + daily-summary today_orders + shipped_today_ids + rank-update dists + weekly-report week_orders + weekly-report dists + shipping-overdue orders. All use `update_post_meta_cache(wp_list_pluck($posts, 'ID'))` pattern. function_exists guards in 1 site (line 1233) — others rely on WP core (acceptable since Snippet 7 only loads in WP context).
+
+**ITEM B — Unit test expansion (+15 tests, 211 → 226)**
+
+Picked CurrencyTest expansion to fill gaps (16 → 31 cases). Ranking: critical because `b2f_currency_symbol/format/name_en/t` feed every Flex card amount + cron message + Bot reply across all 3 currencies (THB/CNY/USD). Regression here = wrong language/symbol shown to factories.
+
+15 new cases added across 4 helpers:
+
+- **`b2f_currency_symbol`** (+3): default-arg-is-thb / empty-string → empty (no fallback to code) / lowercase 'thb' NOT recognized (case-sensitive map invariant locked).
+- **`b2f_format_currency`** (+4): default-arg-is-thb / integer→2dp / half-up rounding boundary (1.234 vs 1.235) / 999,999 thousands separator boundary.
+- **`b2f_currency_name_en`** (+4): CNY → 'Chinese Yuan' / USD → 'US Dollar' / default-arg-is-thb / empty → empty.
+- **`b2f_t`** (+4): default-arg-is-thb / unknown currency 'JPY' → EN branch / `'0'` Chinese is truthy (NOT fallback) / empty TH stays empty (no silent EN fallback when THB).
+
+Why these matter (regression scenarios prevented):
+
+- Lowercase-not-recognized lock prevents future "let's normalize automatically" PR — would silently break `'thb'` callers expecting fallback returns.
+- Half-up rounding boundary locks PHP `number_format` behavior — sensitive for invoice totals (10K orders × off-by-1 satang adds up).
+- `'0'` truthy lock: prevents false-positive "missing translation" detection that would silently fall to EN when admin literally wanted '0' as Chinese.
+
+Result: 211 → 226 phpunit tests (+15), 311 → 327 assertions (+16). All green.
+
+**ITEM C — PERF sweep finalize**
+
+Surveyed 2 candidate Admin shortcodes for N+1 patterns:
+
+- **`[Admin System] DINOCO Service Center & Claims`** — `dinoco_daily_auto_close_tickets` cron + `get_claims_list` action handler both use `WP_Query` (default `cache_results=true` auto-primes postmeta). `get_product_info($tid)` closure reads same-post ACF inside loop — cached. NO N+1.
+- **`[Admin System] DINOCO Brand Voice Pool`** — `bv_get_entries()` 22 meta reads per post but WP_Query auto-primes cache. Concern: `bv_get_stats($days=30)` calls limit=9999 (CPU-bound). Documented as MED-3 above; not Round 13 quick win.
+
+No actionable N+1 found. Phase 4 status: complete (Rounds 2/5/7/9 already closed all major hot paths in B2B Snippets 3/5/7/12 + B2F Snippet 2 + LIFF AI Snippet 1).
+
+**Files touched (2 total)**:
+
+- `tests/helpers/CurrencyTest.php` (+15 cases, ~80 LOC additive)
+- `CHANGELOG.md` (this entry)
+
+**Validation**:
+
+- `vendor/bin/phpunit` → 226 tests pass (+15 from R12) / 327 assertions / 1 deprecation warning (PHPUnit 11+ namespace warning, not a failure).
+- `php -l tests/helpers/CurrencyTest.php` clean.
+- No source files modified — pure additive (audit findings logged, fixes deferred to next versioned releases).
+
+**Round 13 net**: 0 commits to source code, 1 commit to tests + docs, 0 regressions, 3 MEDIUM findings logged for future batches, 4 positive verifications recorded.
+
+---
+
 ### Test + Docs — Round 12 (MD040 lint sweep + unit test expansion + coverage badge) (2026-04-30)
 
 3 cosmetic+test items closed zero-risk. Net: +99 markdown lang tags, +41 unit tests, 3 coverage badges in README.
