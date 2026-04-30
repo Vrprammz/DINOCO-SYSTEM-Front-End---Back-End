@@ -17,11 +17,11 @@
 
 | Metric | Count |
 |--------|-------|
-| Total integrated endpoints | **49** (Round 32: +5 new — maker-reschedule, manual-flash-test, bo-update-eta, bo-restock-scan, reject-lot) |
-| **Total POST endpoints (authoritative — Round 30 census)** | **193** |
-| Coverage | **49 / 193 = 25.4%** of POST endpoints — 🎯 **25% milestone** (true coverage against authoritative denominator) |
-| Cumulative test cases | 200 (Round 19-32 — Round 32 added 17) |
-| Body-shape distinct hashes asserted | 48 (Round 32: +5 new — all unique; cross-namespace maker-reschedule vs reject-lot guard added) |
+| Total integrated endpoints | **54** (Round 33: +5 new — maker-product, maker, po-undo-submit, distributor-notify, customer-link) |
+| **Total POST endpoints (Round 33 fresh census)** | **196** (+3 since Round 30 — natural growth, see [REST-ENDPOINT-CENSUS-2026-04-30.md](./REST-ENDPOINT-CENSUS-2026-04-30.md)) |
+| Coverage | **54 / 196 = 27.6%** of POST endpoints — on track for 30% milestone in Round 34 |
+| Cumulative test cases | 218 (Round 19-33 — Round 33 added 18) |
+| Body-shape distinct hashes asserted | 53 (Round 33: +5 new — all unique; cross-namespace maker-product vs maker + distributor-notify vs customer-link guards added) |
 
 > **Round 30 note**: Earlier rounds reported coverage against a conservative
 > "~75 POST endpoints" estimate. The Round 30 REST endpoint census
@@ -63,8 +63,9 @@
 | **20.2% (corrected denominator)** | **30** | **2026-04-30** | Round 30 census reset — actual is 39/193 = 20.2% (not 50%). Foundation + hot-path retry-prone endpoints fully covered. |
 | **22.8% (Round 31)** | **31** | **2026-04-30** | +5 endpoints (44/193) — claim-update + lead-update + pricing + warehouse + maker-reject. F1 drift regression guard added (`tests/jest/idempotency-tracker-drift.test.js`). |
 | 🎯 **25.4% (Round 32 — TRUE 25% milestone)** | **32** | **2026-04-30** | +5 endpoints (49/193) — maker-reschedule + manual-flash-test + bo-update-eta + bo-restock-scan + reject-lot. **First milestone past 1/4 of POST endpoints AGAINST AUTHORITATIVE Round 30 census denominator** (earlier "25%" entries above were against stale ~75 estimate). 16 B2F endpoints + 22 B2B + 8 inventory + 3 MCP. |
-| Target: 30% | 34 | TBD | Need +9 more endpoints from Round 32 baseline (58/193 = 30.0%) |
-| Target: 50% | future | TBD | ~97 endpoints — major sustained effort across 10+ rounds. Realistic timeline: Round 50+ |
+| **27.6% (Round 33)** | **33** | **2026-04-30** | +5 endpoints (54/196 — denominator refreshed Round 33 to 196 from 193, +3 natural growth). Batch 11: maker-product + maker + po-undo-submit (B2F CRUD/admin) + distributor-notify + customer-link (MCP OpenClaw retry-prone). 19 B2F + 22 B2B + 8 inventory + 5 MCP. Drift detector extended (4 → 5 tests) — POST-only assertion guards against accidentally adding read-only endpoints to tracker. |
+| Target: 30% | 34 | TBD | Need +5 more endpoints from Round 33 baseline (59/196 = 30.1%) |
+| Target: 50% | future | TBD | ~98 endpoints — major sustained effort across 10+ rounds. Realistic timeline: Round 50+ |
 
 > **Why no 50% milestone in Round 30**: User-facing milestone celebration in the
 > Round 30 prompt assumed the ~75 denominator. The REST endpoint census (F3
@@ -75,7 +76,7 @@
 
 ---
 
-## Integrated endpoints (44)
+## Integrated endpoints (54)
 
 | # | Endpoint | Snippet | Pattern | Round | Status |
 |---|----------|---------|---------|-------|--------|
@@ -129,11 +130,17 @@
 | 48 | `POST /b2b/v1/bo-update-eta` | `[B2B] Snippet 16` V.3.7 | single (notes silent double-append guard) | **32** | **integrated** |
 | 49 | `POST /b2b/v1/bo-restock-scan` | `[B2B] Snippet 16` V.3.7 | single (sku target — empty = full scan) | **32** | **integrated** |
 | 50 | `POST /b2f/v1/reject-lot` | `[B2F] Snippet 2` V.11.18 | single (po_id + reason in hash; pair with maker-reschedule) | **32** | **integrated** |
+| 51 | `POST /b2f/v1/maker-product` | `[B2F] Snippet 2` V.11.19 | single (id discriminates create/update + cost in hash) | **33** | **integrated** |
+| 52 | `POST /b2f/v1/maker` | `[B2F] Snippet 2` V.11.19 | single (id discriminates create/update + bank/credit fields in hash) | **33** | **integrated** |
+| 53 | `POST /b2f/v1/po-undo-submit` | `[B2F] Snippet 2` V.11.19 | single (auth-scoped user_id from get_current_user_id — cross-tenant cache poison guard) | **33** | **integrated** |
+| 54 | `POST /dinoco-mcp/v1/distributor-notify` | `[System] DINOCO MCP Bridge` V.2.6 | single (lead_id primary discriminator + type Flex vs follow_up) — caches HTTP 200 only | **33** | **integrated** |
+| 55 | `POST /dinoco-mcp/v1/customer-link` | `[System] DINOCO MCP Bridge` V.2.6 | single (source_id + platform discriminates FB vs IG namespaces) | **33** | **integrated** |
 
-> Note: numbering goes to 50 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
+> Note: numbering goes to 55 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
 > delete-ticket (32) + recalculate-total (33) share body shape — all namespace-discriminated. Total
-> integrated endpoint count = 49 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
-> for bo-fulfill which had no actual wrapper despite tracker entry + Round 31: +5 + Round 32: +5).
+> integrated endpoint count = 54 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
+> for bo-fulfill which had no actual wrapper despite tracker entry + Round 31: +5 + Round 32: +5
+> + Round 33: +5).
 >
 > **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1) — RESOLVED in Round 30**: `bo-fulfill`
 > (#14, Round 19) was listed as "integrated" but actual code had NO wrapper. **Round 30 fixed**:
@@ -144,29 +151,36 @@
 > parses this tracker + asserts each claimed file actually contains
 > `dinoco_idempotency_check` call site + endpoint suffix appears in REST route
 > registration. Catches the same drift class automatically on every CI run.
+>
+> **Round 33 drift detector enhancement**: 4 → 5 tests. Added POST-only assertion —
+> every tracker row MUST start with HTTP method `POST`. Read-only endpoints (GET) are
+> idempotent by definition (no side effects); accidentally adding them to the tracker
+> = scope creep + misleading coverage metric. DELETE/PUT/PATCH endpoints would warrant
+> wrappers if mutational, but the current tracker schema documents POST only — guard
+> keeps schema consistent.
 
 ---
 
-## Pending POST endpoints (Round 33+ candidates)
+## Pending POST endpoints (Round 34+ candidates)
 
-### High priority (next 5 picks — Round 33 candidates to reach 28%)
+### High priority (next 5 picks — Round 34 candidates to cross 30% milestone)
 
 | Endpoint | Snippet | Risk if double-fired | Round candidate |
 |----------|---------|----------------------|-----------------|
-| `POST /b2f/v1/maker-product` | `[B2F] Snippet 2` | CRUD upsert — admin double-click = duplicate junction row attempt + observation log noise | Round 33 |
-| `POST /b2f/v1/maker` | `[B2F] Snippet 2` | CRUD maker create/update — duplicate group_id collision risk | Round 33 |
-| `POST /b2f/v1/po-undo-submit` | `[B2F] Snippet 2` | 30s undo window — admin retry within window = 2x cancel + 2x stock restore | Round 33 |
-| `POST /dinoco-mcp/v1/distributor-notify` | `[System] DINOCO MCP Bridge` | OpenClaw lead notification → 2x LINE message to dealer | Round 33 |
-| `POST /dinoco-mcp/v1/customer-link` | `[System] DINOCO MCP Bridge` | Link FB/IG user to WP — 2x meta write + 2x activity log | Round 33 |
+| `POST /b2b/v1/bo-clear-enum-flag` | `[B2B] Snippet 16` | Admin flag clear — false-positive enumeration_flags reset; double-click = clear+log spam | Round 34 |
+| `POST /dinoco-mcp/v1/kb-suggest` | `[System] DINOCO MCP Bridge` | KB entry submission from chatbot training — 2x KB rows with same content → admin manual cleanup | Round 34 |
+| `POST /dinoco-mcp/v1/brand-voice-submit` | `[System] DINOCO MCP Bridge` | Brand voice signal — 2x records pollute sentiment ML training data | Round 34 |
+| `POST /b2b/v1/distributor/delete` | `[B2B] Snippet 9` | Admin distributor delete — double-fire safe (idempotent at FSM) but Telegram alert spam | Round 34 |
+| `POST /b2b/v1/distributor/toggle-bot` | `[B2B] Snippet 9` | Toggle bot on/off — double-click flips back to original state silently (lost intent) | Round 34 |
 
-### Medium priority (Round 34+)
+### Medium priority (Round 35+)
 
 | Endpoint | Snippet | Notes |
 |----------|---------|-------|
 | `POST /b2b/v1/print-test` | `[B2B] Snippet 3` | Test endpoint — lower priority |
-| `POST /b2b/v1/bo-clear-enum-flag` | `[B2B] Snippet 16` | Admin flag clear |
-| `POST /dinoco-mcp/v1/kb-suggest` | `[System] DINOCO MCP Bridge` | KB entry submission |
-| `POST /dinoco-mcp/v1/brand-voice-submit` | `[System] DINOCO MCP Bridge` | Brand voice signal |
+| `POST /dinoco-mcp/v1/dashboard-inject-metrics` | `[System] DINOCO MCP Bridge` | FB/IG metrics inject — frequent retries, low harm |
+| `POST /dinoco-mcp/v1/lead-attribution` | `[System] DINOCO MCP Bridge` | Lead conversion measurement — small dedup risk |
+| `POST /dinoco-mcp/v1/inventory-changed` | `[System] DINOCO MCP Bridge` | Webhook trigger — Qdrant re-sync may double-fire |
 
 ### Low priority (don't need wrapper)
 
@@ -213,10 +227,11 @@ Each integrated endpoint has 3-9 contract tests in
 | 30    | 6 (incl. bo-fulfill F1 fix) | 21 | 38 (Round 30 added 6 new shapes — all unique; cross-namespace claim-vs-lead collision guard added) |
 | **31** | **5** | **17** | **43** (Round 31: +5 new — all unique; cross-namespace claim-update vs lead-update collision guard added) |
 | **32** | **5** | **17** | **48** (Round 32: +5 new — all unique; cross-namespace maker-reschedule vs reject-lot collision guard added) |
+| **33** | **5** | **18** | **53** (Round 33: +5 new — all unique; 2 cross-namespace pair guards added — maker-product vs maker + distributor-notify vs customer-link) |
 
-Total: **200 contract tests** across 10 rounds (Rounds 19-32). Round 29 introduced
+Total: **218 contract tests** across 11 rounds (Rounds 19-33). Round 29 introduced
 `IdempotencyTestFixture` base class — Round 30+ fully adopt it
-(`IdempotencyRound32Test.php` averages ~5 LOC/test).
+(`IdempotencyRound33Test.php` averages ~5 LOC/test).
 
 ### Fixture refactor (Round 29) {#fixture-refactor}
 
