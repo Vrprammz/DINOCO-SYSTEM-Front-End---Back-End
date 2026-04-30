@@ -274,6 +274,170 @@ sequenceDiagram
 - Constants: `B2B_SLIP2GO_SECRET_KEY` (shared B2B + B2F)
 - Atomic transactions: `b2b_debt_subtract` / `b2f_payable_subtract` (FOR UPDATE lock)
 
+#### 2.3.2 Slip Replay Pool Cascade + Manual Review Flow (V.34.10+ — 2026-04-24)
+
+**Background**: CNX MotoGear regression incident — สลิป KKP 069 ยอด 2,280 THB ส่งช่วง V.34.7 routing bug → บอทเงียบ + Slip2Go cache 7d → V.34.9 ส่งซ้ำ → Slip2Go return 200501 (duplicate, no trans_ref/amount) → ตัดหนี้ไม่ได้. V.34.10 ปิดด้วย 4-layer architecture: image hash dedup + replay cascade + persisted Slip2Go JSON + admin manual process tool.
+
+##### 2.3.2.1 Replay Cascade State Diagram
+
+แสดง state machine ของ slip processing ในมุมมอง `_slip_final_status` (column ใน `dinoco_slip_log`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> received: bot รับรูปสลิป
+
+    received --> not_slip_heuristic: AI prefilter confidence < 0.3<br/>(ไม่ใช่สลิป)
+    received --> not_slip_ai: AI classifier reject<br/>(slip.ai_classifier_enabled=1)
+    received --> hash_lookup: confidence >= 0.3<br/>คำนวณ SHA-256
+
+    hash_lookup --> replay_after_paid: cascade (a)<br/>hash match + prior paid
+    hash_lookup --> replay_cached: cascade (b)<br/>hash match + our failure<br/>(JSON snapshot ใช้ได้)
+    hash_lookup --> replay_blocked_rejected: cascade (c)<br/>hash match + prior reject
+    hash_lookup --> slip2go_fresh: cascade (d) — no match<br/>(fresh API call)
+
+    replay_after_paid --> [*]: reply "ชำระแล้ว" + audit row
+    replay_cached --> slip2go_branches: ใช้ cached JSON<br/>เข้า Slip2Go branches
+    replay_blocked_rejected --> [*]: admin Flex alert (manual review)
+
+    slip2go_fresh --> slip2go_error: HTTP non-200<br/>(retry 200ms/800ms exhausted)
+    slip2go_fresh --> slip2go_branches: HTTP 200
+
+    slip2go_branches --> duplicate: code 200501
+    slip2go_branches --> receiver_mismatch: bank/account ไม่ตรง
+    slip2go_branches --> amount_mismatch: ยอดไม่ตรง
+    slip2go_branches --> not_slip: code 200400
+    slip2go_branches --> data_missing: trans_ref/amount หาย
+    slip2go_branches --> amount_no_pending: ยอดตรง แต่ไม่มี order ค้าง
+    slip2go_branches --> no_distributor: Slip2Go OK + group_id ไม่มี dist CPT
+    slip2go_branches --> needs_review: unknown code (200xxx ใหม่)<br/>save image to slip-pool/
+    slip2go_branches --> unknown_slip_code: code unrecognized
+    slip2go_branches --> helper_missing: b2b_apply_slip_payment ไม่ load
+    slip2go_branches --> paid: amount match ±2% + b2b_debt_subtract
+
+    paid --> [*]: Flex ใบเสร็จ + audit
+    duplicate --> [*]
+    receiver_mismatch --> [*]
+    amount_mismatch --> [*]
+    not_slip --> [*]
+    data_missing --> [*]
+    amount_no_pending --> [*]
+    slip2go_error --> [*]: admin Flex
+    no_distributor --> [*]: admin Flex
+    needs_review --> needs_review_pool: image saved to slip-pool/{YYYY-MM}/{hash}.{ext}
+    unknown_slip_code --> [*]: admin Flex
+    helper_missing --> [*]: admin Flex
+    not_slip_heuristic --> [*]: silent (no customer reply)
+    not_slip_ai --> [*]: silent (no customer reply)
+
+    needs_review_pool --> manual_admin_paid: admin "Manual Process" → debt subtract
+    needs_review_pool --> manual_admin_rejected: admin "Reject Slip"
+    needs_review_pool --> manual_admin_reroute: admin "Re-route Distributor"
+
+    manual_admin_paid --> [*]
+    manual_admin_rejected --> [*]
+    manual_admin_reroute --> slip2go_branches: re-enter cascade<br/>with new dist context
+```
+
+##### 2.3.2.2 Cascade Lookup Sequence (Path a/b/c/d)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Bot as DINOCO Bot
+    participant Hash as SHA-256 Hasher
+    participant Cache as dinoco_slip_log<br/>(image_hash IDX)
+    participant Slip2Go as Slip2Go API
+    participant Pool as needs_review pool<br/>(slip-pool/ + table flag)
+    participant Admin as Slip Monitor UI<br/>(REST /dinoco-slip/v1/*)
+    participant Stock as b2b_debt_subtract<br/>(FOR UPDATE)
+    participant LINE as LINE Customer + Admin Group
+
+    Bot->>Hash: image binary → SHA-256
+    Hash-->>Bot: hash (40-hex prefix used as filename)
+    Bot->>Cache: SELECT prior log<br/>WHERE image_hash=? ORDER BY created_at DESC
+
+    alt Cascade (a) — prior PAID
+        Cache-->>Bot: row { result_status='paid', order_id, paid_at }
+        Bot->>LINE: Flex "ชำระแล้วเมื่อ {paid_at}" → group<br/>(no Slip2Go call, no debt mutation)
+        Bot->>Cache: INSERT log<br/>result_status='replay_after_paid'
+    else Cascade (b) — prior FAILURE with cached JSON
+        Cache-->>Bot: row { result_status IN (slip2go_error, line_api_error),<br/>slip2go_response JSON not null }
+        Bot->>Bot: $slip = json_decode(cached)<br/>$_slip_skip_fetch = true
+        Note right of Bot: skip live Slip2Go call —<br/>re-enter branch matrix<br/>with cached data
+        Bot->>Stock: b2b_apply_slip_payment(...)<br/>(only if amount match)
+        Stock-->>Bot: { paid: true, order_id }
+        Bot->>LINE: Flex ใบเสร็จ
+        Bot->>Cache: INSERT log<br/>result_status='paid' (replay_cached origin)
+    else Cascade (c) — prior REJECTED
+        Cache-->>Bot: row { result_status IN (rejected, manual_admin_rejected) }
+        Bot->>LINE: NO customer reply<br/>(prevent harassment loop)
+        Bot->>LINE: admin Flex "duplicate rejected slip — review needed"
+        Bot->>Cache: INSERT log<br/>result_status='replay_blocked_rejected'
+    else Cascade (d) — NO MATCH (fresh)
+        Cache-->>Bot: 0 rows
+        Bot->>Slip2Go: POST /api/verify-slip<br/>(B2B_SLIP2GO_SECRET_KEY)<br/>retry 2x backoff 200ms/800ms
+        Slip2Go-->>Bot: { code, trans_ref, amount, ... }
+        alt code 200000 (success)
+            Bot->>Stock: b2b_apply_slip_payment(...)
+            Stock-->>Bot: { paid: true, order_id }
+            Bot->>LINE: Flex ใบเสร็จ
+            Bot->>Cache: INSERT log<br/>result_status='paid'<br/>+ slip2go_response JSON snapshot
+        else code 2005xx (unknown code)
+            Bot->>Pool: save image binary to<br/>wp-content/uploads/slip-pool/{YYYY-MM}/{first40}.{ext}<br/>+ .htaccess deny
+            Bot->>Cache: INSERT log<br/>result_status='needs_review'<br/>+ image_path
+            Bot->>LINE: admin Flex (1/hr/group rate-limited)
+            Note over Pool,Admin: --- waits for admin manual review ---
+            Admin->>Pool: GET /needs-review (Slip Monitor UI)
+            Admin->>Bot: POST /review-decision<br/>{ action: paid|rejected|reroute }
+            alt action=paid
+                Admin->>Stock: b2b_debt_subtract (manual_mode=true)
+                Admin->>Cache: UPDATE log<br/>result_status='manual_admin_paid'
+                Admin->>LINE: Flex แจ้งลูกค้า + admin
+            else action=rejected
+                Admin->>Cache: UPDATE log<br/>result_status='manual_admin_rejected'
+            else action=reroute
+                Admin->>Bot: re-enter cascade w/ new dist
+            end
+        else other failure codes
+            Bot->>Cache: INSERT log + slip2go_response JSON snapshot<br/>(future replay can use)
+            Bot->>LINE: Flex error to customer/admin
+        end
+    end
+
+    Note over Bot,LINE: Kill switch: wp_option `b2b_slip_replay_pool_enabled=0`<br/>→ skip cascade entirely, always fresh Slip2Go call
+```
+
+##### 2.3.2.3 Status Enum Reference
+
+| `_slip_final_status` | Customer Reply | Admin Notify | Debt Mutation | Notes |
+| --- | --- | --- | --- | --- |
+| `paid` | Flex ใบเสร็จ | summary | YES (b2b_debt_subtract) | success path |
+| `replay_after_paid` | "ชำระแล้วเมื่อ X" | none | NO | cascade (a) |
+| `replay_blocked_rejected` | none (silence) | manual review Flex | NO | cascade (c) prevent loop |
+| `needs_review` | none | rate-limited 1/hr | NO | unknown code → pool |
+| `unknown_slip_code` | error Flex | yes | NO | unrecognized 200xxx |
+| `manual_admin_paid` | Flex via admin action | manual logged | YES (admin-initiated) | from pool review |
+| `manual_admin_rejected` | none | manual logged | NO | from pool review |
+| `slip2go_error` | retry exhausted message | yes | NO | HTTP non-200 + retry fail |
+| `line_api_error` | none | yes | NO | LINE Content API fail |
+| `duplicate` | "สลิปซ้ำ" | none | NO | Slip2Go 200501 |
+| `receiver_mismatch` | "บัญชีรับโอนไม่ตรง" | none | NO | bank/account differ |
+| `amount_mismatch` | "ยอดไม่ตรง" | none | NO | ±2% tolerance fail |
+| `amount_no_pending` | "ตรวจไม่พบออเดอร์" | yes (admin manual) | NO | match fail at WP layer |
+| `not_slip` / `not_slip_heuristic` / `not_slip_ai` | none | none | NO | filtered out |
+| `data_missing` | "ข้อมูลสลิปไม่ครบ" | none | NO | trans_ref/amount null |
+| `no_distributor` | none | yes (Flex urgent) | NO | group_id orphan |
+| `helper_missing` | error | urgent | NO | b2b_apply_slip_payment unavailable |
+
+##### 2.3.2.4 Audit Trail Sources
+
+- **`dinoco_slip_log`** (Snippet 15 V.8.4+) — every slip processed writes 1 row: `id`, `image_hash`, `image_path`, `slip2go_response JSON`, `result_status`, `error_code`, `error_msg`, `http_code`, `processing_time_ms`, `retry_count`, `created_at`, `manual_mode` (boolean), `actor` ('bot'|'admin')
+- **`dinoco_slip_replay_log`** — append-only on cascade hits (a/b/c) + manual review actions (paid/rejected/reroute)
+- **REST endpoints** (Slip Monitor namespace `/wp-json/dinoco-slip/v1/`): `monitor`, `recent`, `clear-locks`, `missed-sweep`, `manual-process`, `replay-candidates`, `replay-slip`, `distributors`, `needs-review`, `review-decision`, `pool-image`, `ai-stats`, `ai-toggle`, `credit-note-eligible`, `issue-credit-note`
+- **Snippets** wired: `[B2B] Snippet 2` V.34.10+ (orchestrator), `[B2B] Snippet 1` V.34.12+ (helpers `b2b_slip_compute_image_hash`, `b2b_slip_is_trans_ref_seen`), `[B2B] Snippet 15` V.8.6+ (schema + `image_hash` index), `[Admin System] DINOCO Slip Monitor` V.1.13+ (admin UI + REST)
+
+**Rollback**: `update_option('b2b_slip_replay_pool_enabled', 0)` → cascade lookup skipped, every slip = fresh Slip2Go call (V.34.9 behavior). Image hash + JSON snapshots still recorded in slip_log (audit-only, not consumed by short-circuits).
+
 ### 2.4 B2B Shipping (Flash Express)
 
 ```
@@ -822,6 +986,94 @@ stateDiagram-v2
 | `b2b_bo_pending_review_expire_cron` | hourly | 72h timeout → auto-cancel |
 | `b2b_bo_enumeration_scan_cron` | hourly | detect abuse patterns + Telegram |
 | `b2b_bo_attempt_log_cleanup_cron` | daily 03:00 | 90d retention, chunked 1000/iter + 50ms gap |
+
+### 2.12 BO Restock + Lifecycle Cron Flow (Mermaid)
+
+แสดง 5 BO crons ของ Snippet 16 V.3.0+ ทำงานพร้อมกัน. แต่ละ cron มี responsibility แยก ไม่ทับกัน — restock scan = promotion path / eta warn = reminder / expire = timeout / enumeration scan = abuse detection / cleanup = retention.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sched as WP-Cron Scheduler
+    participant Restock as restock_scan_cron<br/>(15 min)
+    participant Expire as pending_review_expire_cron<br/>(hourly)
+    participant Enum as enumeration_scan_cron<br/>(hourly)
+    participant ETA as eta_warn_cron<br/>(daily 09:00)
+    participant Cleanup as attempt_log_cleanup_cron<br/>(daily 03:00)
+    participant DB as MySQL<br/>(bo_queue + orders + attempt_log)
+    participant Stock as Stock Helpers<br/>(dinoco_stock_*)
+    participant LINE as LINE Customer/Admin
+    participant TG as Telegram (น้องกุ้ง)
+    participant FSM as Snippet 14 FSM
+
+    Note over Sched,FSM: === Path A: Restock Scan (every 15 min) ===
+    Sched->>Restock: tick (every 15 min)
+    Restock->>DB: SELECT FROM bo_queue<br/>WHERE status='pending'<br/>AND ready_at IS NULL
+    loop per pending BO row
+        Restock->>Stock: dinoco_compute_hierarchy_stock(sku)
+        alt available >= qty_bo
+            Restock->>DB: UPDATE bo_queue<br/>SET status='ready', ready_at=NOW()
+            Restock->>LINE: Flex แจ้งลูกค้า BO ready<br/>(builder: bo_ready_customer)
+            Restock->>TG: alert "BO ready: order #X SKU Y"
+        else still pending
+            Note right of Restock: skip — wait next tick
+        end
+    end
+
+    Note over Sched,FSM: === Path B: Pending Review 72h Timeout (hourly) ===
+    Sched->>Expire: tick (hourly)
+    Expire->>DB: SELECT orders WHERE status='pending_stock_review'<br/>AND _b2b_opaque_accept_at < (NOW() - 72h)
+    loop per expired order
+        Expire->>FSM: pending_stock_review → cancelled<br/>(reason: 72h_timeout)
+        Expire->>DB: revert daily counters<br/>(qty/sku/value caps)
+        Expire->>LINE: Flex แจ้งลูกค้า "ออเดอร์ถูกยกเลิกอัตโนมัติ"
+        Expire->>TG: alert summary
+    end
+
+    Note over Sched,FSM: === Path C: Enumeration Scan (hourly) ===
+    Sched->>Enum: tick (hourly)
+    Enum->>DB: aggregate attempt_log per distributor 24h
+    loop per distributor with anomaly
+        alt cancels >= b2b_bo_anomaly_cancel_24h (5)
+            Enum->>DB: SET _b2b_enumeration_flags |= 0x02 (cancel_abuse)
+            Enum->>TG: alert enumeration_attempt
+        else qty_cap_hits >= b2b_bo_anomaly_qty_cap_24h (3)
+            Enum->>DB: SET _b2b_enumeration_flags |= 0x04 (qty_cap_hit)
+            Enum->>TG: alert enumeration_attempt
+        end
+    end
+
+    Note over Sched,FSM: === Path D: ETA Warning (daily 09:00) ===
+    Sched->>ETA: tick (daily 09:00 ICT)
+    ETA->>DB: SELECT bo_queue WHERE status='pending'<br/>AND eta_date < (NOW() + 3 days)
+    loop per upcoming ETA
+        ETA->>TG: reminder Flex<br/>"BO ใกล้ครบกำหนด: SKU X, qty Y, ETA Z"
+    end
+
+    Note over Sched,FSM: === Path E: Attempt Log Cleanup (daily 03:00) ===
+    Sched->>Cleanup: tick (daily 03:00 ICT)
+    loop max 20 iterations
+        Cleanup->>DB: DELETE FROM attempt_log<br/>WHERE created_at < (NOW() - 90 days)<br/>LIMIT 1000
+        alt rows_affected > 0
+            Cleanup-->>Cleanup: usleep(50ms) — yield to other queries
+        else done
+            Note right of Cleanup: exit loop
+        end
+    end
+    Cleanup->>DB: option update b2b_bo_cleanup_last_run = NOW()
+```
+
+**Cron handler sources**:
+
+- `b2b_bo_restock_scan_cron` — promotion logic (`pending → ready`) + customer Flex alert + Telegram digest
+- `b2b_bo_pending_review_expire_cron` — 72h hard deadline (`_b2b_opaque_accept_at` timestamp gate)
+- `b2b_bo_enumeration_scan_cron` — bit-field flag mutation (rate_hit=1, cancel_abuse=2, qty_cap_hit=4, suspicious_pattern=8 — OR-combined per Phase 1 BUG-C1 fix)
+- `b2b_bo_eta_warn_cron` — non-mutating; only Telegram reminder
+- `b2b_bo_attempt_log_cleanup_cron` — chunked DELETE (1000/iter + 50ms gap + 20-iteration cap = max 20K rows/run, conservative for shared MySQL)
+
+**Idempotency**: All BO crons are safe to re-run. State transitions guarded by FSM (`b2b_set_order_status`) + `FOR UPDATE` lock for stock subtract path. Cleanup cron tracks last run via wp_options for monitoring drift detection.
+
+**Observability**: Each cron writes heartbeat to `dinoco_cron_<name>_last_run` wp_option (matched on Round 4-8 fix HIGH-1 — option key naming consistency). Admin Dashboard Slip Monitor + BO admin tabs show last-run badges.
 
 ### 2.13 Modal Pattern (V.1.0 — 2026-04-17)
 
