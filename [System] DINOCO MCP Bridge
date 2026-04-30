@@ -1,6 +1,31 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.2.8 (2026-04-30) — Round 35 batch 13: Idempotency-Key support on 5 OpenClaw retry-prone MCP endpoints (32.7% milestone):
+ *   • POST /dinoco-mcp/v1/dashboard-inject-metrics — body hash {platform, date, metrics_signature}.
+ *     OpenClaw chatbot retry on slow WP response → 2x update_option ด้วย key เดียวกัน → metrics_count
+ *     ตอบกลับถูกต้อง แต่ inject log เพิ่มเป็น 2 entry ใน dashboard timeline → KPI ดู spike ปลอม. Wrapper
+ *     return cached 200 → log entry ครั้งเดียว. metrics_signature = sha1 of sorted name=>value pairs
+ *     (stable hash regardless of array order from chatbot).
+ *   • POST /dinoco-mcp/v1/lead-attribution — body hash {lead_id, event, order_id, revenue, source}.
+ *     Lead conversion event retry → 2x append เข้า dinoco_mcp_attributions wp_options + double-counted
+ *     revenue ใน analytics. Worse: lead status flip ไป converted ครั้งแรก แต่ครั้งที่ 2 append notes ซ้ำ
+ *     "Auto-converted" ทำให้ admin reading log สับสน. Wrapper return cached 200 → 1 attribution row.
+ *     event ('converted'/'purchased'/'registered') discriminate intent — admin retry ด้วย different event
+ *     เป็น distinct conversion path → 409 ถูกต้อง.
+ *   • POST /dinoco-mcp/v1/inventory-changed — body hash {sku, action, quantity}. Webhook retry จาก
+ *     WP stock change broadcaster → 2x event log + Qdrant re-sync trigger ซ้ำ (wasted compute).
+ *     action enum (in/out/hold/release) discriminate; same sku + same action + same quantity = idempotent
+ *     replay; different action = different intent → 409.
+ *   • POST /dinoco-mcp/v1/kb-updated — body hash {kb_count, trigger_source}. KB write hook fires
+ *     → MCP webhook → OpenClaw triggers Qdrant re-sync. Retry duplicates rebuild work (~30-60s
+ *     embedding compute waste). Wrapper return cached 200 instantly. trigger_source = optional
+ *     param distinguishing 'admin_save' vs 'bulk_import' (different rebuild scope intent).
+ *   • POST /dinoco-mcp/v1/product-compatibility — body hash {brand, model_normalized}. Chatbot retry
+ *     บน slow catalog scan (~500 SKU walk) → wasted compute + ตอบลูกค้าช้า. model normalized via
+ *     mb_strtolower + trim เพื่อ match handler logic. brand+model identifies query intent.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key = byte-identical V.2.7 behavior.
  * Version: V.2.7 (2026-04-30) — Round 34 batch 12: Idempotency-Key support on 2 chatbot signal MCP endpoints:
  *   • POST /dinoco-mcp/v1/kb-suggest         — body hash {question[lowercased+trimmed], source, frequency}.
  *     Chatbot retry on Gemini timeout → 2x suggestion entries with same lowercase question (frequency
@@ -2099,6 +2124,38 @@ function dinoco_mcp_product_compatibility( $request ) {
         return new WP_REST_Response( array( 'found' => false, 'message' => 'brand or model required' ), 400 );
     }
 
+    // ── V.2.8 Round 35 batch 13: Idempotency-Key support ──
+    // Chatbot retry on slow catalog scan (~500 SKU walk × 2 mb_strpos calls) → wasted compute.
+    // Wrapper returns cached 200 instantly. Body hash normalizes brand+model via mb_strtolower
+    // + trim (matches handler logic line ~2107). Different brand or model = different query
+    // intent → 409 if same key reused.
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.7 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::product-compatibility';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'brand' => trim( mb_strtolower( $brand, 'UTF-8' ) ),
+            'model' => trim( mb_strtolower( $model, 'UTF-8' ) ),
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     $catalog = function_exists( 'b2b_get_catalog' ) ? b2b_get_catalog() : get_option( 'dinoco_product_catalog', array() );
     if ( empty( $catalog ) || ! is_array( $catalog ) ) {
         return new WP_REST_Response( array( 'found' => false, 'message' => 'ไม่มีข้อมูลสินค้าในระบบ' ), 200 );
@@ -2130,16 +2187,75 @@ function dinoco_mcp_product_compatibility( $request ) {
     }
 
     if ( empty( $matches ) ) {
-        return new WP_REST_Response( array( 'found' => false, 'message' => "ไม่พบสินค้าสำหรับ {$brand} {$model}" ), 200 );
+        $resp_data = array( 'found' => false, 'message' => "ไม่พบสินค้าสำหรับ {$brand} {$model}" );
+        // V.2.8 Round 35: cache "not found" replies too (same query → same answer; saves catalog walk on retry)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+        return new WP_REST_Response( $resp_data, 200 );
     }
 
-    return new WP_REST_Response( array( 'found' => true, 'count' => count( $matches ), 'products' => $matches ), 200 );
+    $resp_data = array( 'found' => true, 'count' => count( $matches ), 'products' => $matches );
+
+    // V.2.8 Round 35 batch 13: store cached response for replay (24h TTL via helper default)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
 // P3-1. KB UPDATED — Webhook trigger for Qdrant re-sync
 // =========================================================================
 function dinoco_mcp_kb_updated( $request ) {
+    $kb_count       = (int) $request->get_param( 'kb_count' );
+    $trigger_source = sanitize_text_field( $request->get_param( 'trigger_source' ) ); // optional 'admin_save'/'bulk_import'
+
+    // ── V.2.8 Round 35 batch 13: Idempotency-Key support ──
+    // KB write hook → MCP webhook → OpenClaw triggers Qdrant re-sync (~30-60s embedding compute).
+    // Retry duplicates rebuild work + last_updated timestamp churn. Wrapper returns cached 200.
+    // Body hash = {kb_count, trigger_source} — same kb_count + same source = same rebuild scope
+    // (idempotent replay). Different trigger_source = different rebuild intent → 409.
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.7 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::kb-updated';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'kb_count'       => $kb_count,
+            'trigger_source' => $trigger_source ?: 'unknown',
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // Acknowledge webhook — OpenClaw สามารถ re-sync Qdrant ได้เอง
     // บันทึก last trigger time เพื่อ debug
     update_option( 'dinoco_mcp_kb_last_updated', current_time( 'mysql' ), false );
@@ -2149,11 +2265,24 @@ function dinoco_mcp_kb_updated( $request ) {
     $total = isset( $count->publish ) ? $count->publish : 0;
     $total += isset( $count->private ) ? $count->private : 0;
 
-    return new WP_REST_Response( array(
+    $resp_data = array(
         'acknowledged' => true,
         'kb_total'     => $total,
         'triggered_at' => current_time( 'c' ),
-    ), 200 );
+    );
+
+    // V.2.8 Round 35 batch 13: store cached response for replay (24h TTL)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
@@ -2163,6 +2292,39 @@ function dinoco_mcp_inventory_changed( $request ) {
     $sku      = sanitize_text_field( $request->get_param( 'sku' ) );
     $action   = sanitize_text_field( $request->get_param( 'action' ) ); // "in" / "out" / "hold" / "release"
     $quantity = (int) $request->get_param( 'quantity' );
+
+    // ── V.2.8 Round 35 batch 13: Idempotency-Key support ──
+    // Webhook retry → 2x event log entries + Qdrant re-sync trigger ซ้ำ. Wrapper returns cached
+    // 200 → 1 log entry. Body hash = {sku, action, quantity}. action enum (in/out/hold/release)
+    // discriminates intent. Same sku+action+qty = idempotent replay; admin retry ด้วย 'release'
+    // หลังจากเรียก 'hold' ครั้งแรก = different intent → 409.
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.7 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::inventory-changed';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'sku'      => strtoupper( $sku ),
+            'action'   => $action ?: 'unknown',
+            'quantity' => $quantity,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
 
     // บันทึก event log
     $log = get_option( 'dinoco_mcp_inventory_log', array() );
@@ -2176,12 +2338,25 @@ function dinoco_mcp_inventory_changed( $request ) {
     $log = array_slice( $log, -200 );
     update_option( 'dinoco_mcp_inventory_log', $log, false );
 
-    return new WP_REST_Response( array(
+    $resp_data = array(
         'acknowledged' => true,
         'sku'          => $sku,
         'action'       => $action,
         'logged_at'    => current_time( 'c' ),
-    ), 200 );
+    );
+
+    // V.2.8 Round 35 batch 13: store cached response for replay (24h TTL)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
@@ -2226,6 +2401,49 @@ function dinoco_mcp_dashboard_inject_metrics( $request ) {
         );
     }
 
+    // ── V.2.8 Round 35 batch 13: Idempotency-Key support ──
+    // OpenClaw chatbot retry → 2x update_option ด้วย key เดียวกัน. update_option idempotent ใน
+    // wp_options layer แต่ injected_at timestamp ทับ + dashboard timeline log spike ปลอม.
+    // Wrapper return cached 200 → 1 inject event. Body hash = {platform, date, metrics_signature}.
+    // metrics_signature = sha1 of sorted name=>value pairs (stable hash regardless of array order
+    // จาก chatbot — ป้องกัน false 409 จาก JSON key reorder). Different metrics values = different
+    // snapshot → 409 (admin needs to know which version is canonical).
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.7 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::dashboard-inject-metrics';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        // Build stable signature from metrics (sort by name → "name=value" pairs → sha1)
+        $sig_pairs = array();
+        foreach ( $clean_metrics as $m ) {
+            $sig_pairs[] = ( $m['name'] ?? '' ) . '=' . ( is_float( $m['value'] ?? null ) ? (string) $m['value'] : (string) ( $m['value'] ?? '' ) );
+        }
+        sort( $sig_pairs );
+        $metrics_signature = sha1( implode( '|', $sig_pairs ) );
+
+        $idem_body = array(
+            'platform'          => $platform,
+            'date'              => $date,
+            'metrics_signature' => $metrics_signature,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     // เก็บใน wp_options keyed by date+platform
     $key = 'dinoco_mcp_metrics_' . $platform . '_' . str_replace( '-', '', $date );
     update_option( $key, array(
@@ -2235,12 +2453,25 @@ function dinoco_mcp_dashboard_inject_metrics( $request ) {
         'injected_at' => current_time( 'mysql' ),
     ), false );
 
-    return new WP_REST_Response( array(
+    $resp_data = array(
         'success'       => true,
         'platform'      => $platform,
         'date'          => $date,
         'metrics_count' => count( $clean_metrics ),
-    ), 200 );
+    );
+
+    // V.2.8 Round 35 batch 13: store cached response for replay (24h TTL)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
 
 // =========================================================================
@@ -2255,6 +2486,42 @@ function dinoco_mcp_lead_attribution( $request ) {
 
     if ( empty( $lead_id ) || empty( $event ) ) {
         return new WP_REST_Response( array( 'success' => false, 'message' => 'lead_id and event required' ), 400 );
+    }
+
+    // ── V.2.8 Round 35 batch 13: Idempotency-Key support ──
+    // CRITICAL: lead conversion event retry → double-counted revenue ใน analytics + duplicate
+    // attribution row + lead notes append "Auto-converted" 2 ครั้ง. Wrapper return cached 200
+    // → 1 attribution row. Body hash = {lead_id, event, order_id, revenue, source}. event enum
+    // (converted/purchased/registered) ถือเป็น distinct conversion path — admin retry ด้วย event
+    // ที่ต่างกัน = different intent → 409 (admin ต้องลบ original ก่อน reclassify).
+    // Backward compat: missing X-Idempotency-Key = byte-identical V.2.7 behavior.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $request ) : '';
+    $idem_namespace = 'dinoco-mcp/v1::lead-attribution';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'lead_id'  => $lead_id,
+            'event'    => $event,
+            'order_id' => $order_id,
+            'revenue'  => $revenue,
+            'source'   => $source ?: 'unknown',
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key conflict — body differs from prior request',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
     }
 
     // บันทึก attribution event
@@ -2280,10 +2547,23 @@ function dinoco_mcp_lead_attribution( $request ) {
         dinoco_mcp_save_lead( $lead );
     }
 
-    return new WP_REST_Response( array(
+    $resp_data = array(
         'success'  => true,
         'lead_id'  => $lead_id,
         'event'    => $event,
         'recorded' => true,
-    ), 200 );
+    );
+
+    // V.2.8 Round 35 batch 13: store cached response for replay (24h TTL)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store(
+            $idem_key,
+            $idem_namespace,
+            $idem_body,
+            array_merge( $resp_data, array( '_idem_code' => 200 ) ),
+            200
+        );
+    }
+
+    return new WP_REST_Response( $resp_data, 200 );
 }
