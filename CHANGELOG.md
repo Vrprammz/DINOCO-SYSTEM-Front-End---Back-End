@@ -10,6 +10,43 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 34 (Idempotency batch 12 — 🎯 30% TRUE milestone) (2026-04-30)
+
+Round 34 pushes idempotency coverage to **59/196 POST endpoints (30.1%)** — ⭐ **first sustained crossing past 30% of POST surface AGAINST AUTHORITATIVE Round 30 census denominator**. Past 3/10 of mutating REST surface. ZERO regressions across **659 PHPUnit (was 641, +18) + 161 Jest** (drift detector still green with 59 entries).
+
+#### Phase 1 — Idempotency batch 12 (5 endpoints)
+
+5 retry-prone admin flag/notification/distributor hot paths:
+
+- **`POST /b2b/v1/bo-clear-enum-flag`** — admin Security Log "ล้างธง" double-click = 2x delete_post_meta (idempotent storage) + 2x b2b_log line spam. Body hash `{distributor_id}`. Different distributor_id with same key = different intent → 409.
+- **`POST /dinoco-mcp/v1/kb-suggest`** — chatbot Gemini retry → 2x kb-suggest with same question → frequency increment 2x (stale "asked Nx" metric). Body hash `{question[mb_strtolower+trim], source, frequency}` — normalization matches handler dedup logic. Different source (fb_chat vs ig_chat) = legitimate distinct platform signal → 409.
+- **`POST /dinoco-mcp/v1/brand-voice-submit`** — OpenClaw retry on bv_create_entry timeout → 2x sentiment ML training row → ML signal poisoning. Body hash `{content, sentiment, platform, source_url, intensity}` — sentiment edits between retries (positive→negative) → 409.
+- **`POST /b2b/v1/distributor/delete`** — admin "ลบตัวแทน" double-click → wp_delete_post no-op on 2nd call but log/alert spam. Body hash `{id}`. Different id with same key = different intent (silent replay would say "already deleted" referring to first id) → 409.
+- **`POST /b2b/v1/distributor/toggle-bot`** — boolean-discriminator pattern. Existing 5s transient dedup protects rapid double-click but NOT cross-window replay. Body hash `{dist_id, bot_enabled}` — bot_enabled flip between retries (admin changed mind) caught as 409 instead of silent state flip.
+
+Backward compat: missing `X-Idempotency-Key` header = byte-identical to V.3.7 / V.34.1 / V.2.6 behavior.
+
+Versions:
+
+- `[B2B] Snippet 16: Backorder System` V.3.7 → V.3.8
+- `[B2B] Snippet 9: Admin Control Panel` V.34.1 → V.34.2
+- `[System] DINOCO MCP Bridge` V.2.6 → V.2.7
+
+Tests: `tests/helpers/IdempotencyRound34Test.php` — 18 fixture-based contract tests (5×3 cases + cumulative no-collision + 2 cross-namespace pair guards: distributor-delete vs distributor-toggle-bot + kb-suggest vs brand-voice-submit). PHPUnit 641 → 659 (+18 tests). All 18 pass.
+
+#### Phase 2 — Documentation in-place updates
+
+- `docs/audit/IDEMPOTENCY-COVERAGE.md` — Status summary 27.6% → **🎯 30.1%**, Milestones table NEW Round 34 row (TRUE 30% milestone), Integrated endpoints table +5 rows (#56-60), Pending POST endpoints refreshed (Round 35 candidates: dashboard-inject-metrics + lead-attribution + inventory-changed + kb-updated + product-compatibility — all MCP), Test coverage table NEW Round 34 row.
+- `docs/patterns/IDEMPOTENCY-KEY.md` — NEW "Round 18-34 case study patterns" section crystallizing 5 distinct patterns (single / bulk / bulk-of-targets / state-machine / boolean-discriminator + enum-discriminator) with endpoint references + 3 anti-patterns spotted across rounds.
+- `README.md` badge — Idempotency coverage 25.4% → **🎯 30.1%**.
+- `CLAUDE.md` Idempotency line — synced from stale Round 19 numbers to current Round 34 + 30% milestone marker.
+
+#### Verification
+
+- Drift detector (`tests/jest/idempotency-tracker-drift.test.js`) — all 59 tracker rows resolve to real snippet files + each file contains `dinoco_idempotency_check` + each endpoint suffix appears as string literal. POST-only assertion green.
+- PHP lint clean across 3 modified snippets.
+- Test count delta: +18 PHPUnit (659 total), Jest stable at 161.
+
 ### Feature — Round 32 (Idempotency batch 10 — 🎯 25.4% TRUE milestone) (2026-04-30)
 
 Round 32 pushes idempotency coverage to **49/193 POST endpoints (25.4%)** — 🎯 **first milestone past 1/4 of POST endpoints AGAINST AUTHORITATIVE Round 30 census denominator** (earlier 25%/30%/35%/40%/45% milestones in tracker were against stale ~75 estimate). ZERO regressions across **623 PHPUnit (was 606, +17) + 160 Jest** (drift detector still green).

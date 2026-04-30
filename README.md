@@ -24,11 +24,13 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 
 ## What's New (2026-04-30)
 
-Idempotency-Key coverage: **🎯 25.4% (49/193 POST endpoints)** — true milestone against authoritative Round 30 census denominator. See [`docs/audit/IDEMPOTENCY-COVERAGE.md`](docs/audit/IDEMPOTENCY-COVERAGE.md).
+Idempotency-Key coverage: **🎯 30.1% (59/196 POST endpoints)** ⭐ — first sustained crossing past 30% TRUE milestone against authoritative Round 30 census denominator. Past 3/10 of mutating REST surface. See [`docs/audit/IDEMPOTENCY-COVERAGE.md`](docs/audit/IDEMPOTENCY-COVERAGE.md).
 
-Recent infrastructure rounds (Rounds 13-32):
+Recent infrastructure rounds (Rounds 13-34):
 
-- **Round 32** — Idempotency batch 10 +5 endpoints (44 → 49, **🎯 25.4% TRUE milestone**). maker-reschedule (Maker LIFF retry guard) + manual-flash-test (Flash quota retry burn) + bo-update-eta (silent "|" notes double-append) + bo-restock-scan (admin click + cron concurrent) + reject-lot (Maker rejection Flex re-fire). +17 contract tests (183 → 200 cumulative).
+- **Round 34** ⭐ — Idempotency batch 12 +5 endpoints (54 → 59, **🎯 30.1% TRUE milestone**). bo-clear-enum-flag (admin Security Log false-positive flag reset — log/alert spam guard) + kb-suggest (chatbot Gemini retry → frequency double-increment) + brand-voice-submit (OpenClaw retry → ML signal poisoning) + distributor/delete (admin destructive guard) + distributor/toggle-bot (boolean-discriminator pattern — replay >5s silent flip without wrapper). +18 contract tests (218 → 236 cumulative). NEW `docs/patterns/IDEMPOTENCY-KEY.md` "Round 18-34 case study patterns" section crystallizing 5 distinct patterns observed across 17 rounds.
+- **Round 33** — Idempotency batch 11 +5 endpoints (49 → 54, 27.6% — denominator refreshed Round 33 to 196 from 193, +3 natural growth). maker-product + maker + po-undo-submit (B2F CRUD/admin) + distributor-notify + customer-link (MCP OpenClaw retry-prone). +18 contract tests. Drift detector extended (4 → 5 tests) — POST-only assertion guards against scope creep.
+- **Round 32** — Idempotency batch 10 +5 endpoints (44 → 49, 25.4% TRUE milestone). maker-reschedule (Maker LIFF retry guard) + manual-flash-test (Flash quota retry burn) + bo-update-eta (silent "|" notes double-append) + bo-restock-scan (admin click + cron concurrent) + reject-lot (Maker rejection Flex re-fire). +17 contract tests (183 → 200 cumulative).
 - **Round 31** — Idempotency batch 9 +5 endpoints (39 → 44, 22.8%) + cron audit follow-ups + NEW F1-class drift regression guard (`tests/jest/idempotency-tracker-drift.test.js`). claim-update + lead-update (paired with Round 30 creates) + product/pricing + warehouse + maker-reject. +17 contract tests (166 → 183 cumulative).
 - **Round 30** — Idempotency batch 8 +6 endpoints (incl. F1 HIGH drift fix for bo-fulfill listed integrated since Round 19 but had no wrapper) + REST endpoint census (75 → 193 authoritative POST denominator) + IdempotencyTestFixture DRY base class adoption. +21 contract tests (145 → 166).
 - **Round 29** — Idempotency batch 7 +5 endpoints (28 → 33) + IdempotencyTestFixture introduction (~80% LOC saved per round file) + 4-finding drift sweep + README badge. +21 contract tests.
