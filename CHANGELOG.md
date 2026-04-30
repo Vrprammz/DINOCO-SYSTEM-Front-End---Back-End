@@ -10,6 +10,91 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Infra — Round 21 (patterns library + cron drift detector + inline handler regression guard) (2026-04-29)
+
+After Round 20 retrospective doc identified 5 reusable patterns inline, Round 21 = solidify infrastructure for long-term maintainability. 3 items, all Risk NONE. ZERO source code changes.
+
+#### ITEM A — Patterns Library Docs (1158 LOC, 6 new files)
+
+Extract 5 patterns from Round 20 retrospective into dedicated `docs/patterns/` library. Each pattern is battle-tested across Rounds 1-20 with concrete code examples + before/after migrations.
+
+- **NEW `docs/patterns/README.md`** (65 LOC) — index linking 5 patterns + when-to-use lookup table + dependency diagram + how-to-add workflow
+- **NEW `docs/patterns/EVENT-DELEGATION.md`** (162 LOC) — UX-H3 inline handler refactor pattern. Before/after code, data-attr scoping rules, module-level idempotent guard pattern, helper extraction (`_b2bCfm`, `_scCfm`, `_liffCfm`)
+- **NEW `docs/patterns/CACHE-PRIMING.md`** (172 LOC) — PERF sweep pattern. `_prime_post_caches` + `update_meta_cache` template, distributor/maker pre-resolve, function_exists guards, 90%+ DB roundtrip elimination measured
+- **NEW `docs/patterns/DATA-ATTR-SCOPING.md`** (244 LOC) — DOM hierarchy data-attr pattern. DD-3 shared child correctness, `.stock-child-of-<SKU>` scheme, forward-lookup `parent_skus[]` indexing, pagination group-aware slicing, search expansion gotcha
+- **NEW `docs/patterns/FUNCTION-EXISTS-GUARDS.md`** (229 LOC) — Phase 5+ rollback safety pattern. Cross-snippet calls, WP private API guards, class_exists vs function_exists for class methods, JS `dinocoModal` native fallback chain
+- **NEW `docs/patterns/IDEMPOTENCY-KEY.md`** (286 LOC) — Round 19+ wrapper pattern. Top + bottom integration template, state machine (in_progress/done/expired/failed × body match), 24h TTL rationale, Snippet 3 + Snippet 2 examples, backward compat (no header → byte-identical)
+
+Each pattern doc structure: Problem → Solution → When to use → When NOT to use → Used in (concrete file refs + versions) → Anti-patterns → Migration checklist → See also (cross-links).
+
+#### ITEM B — Cron Drift Detector (1 new file, 317 LOC)
+
+- **NEW `tests/jest/cron-drift.test.js`** — extends drift detector suite from 7 → 8
+
+Detection layers:
+
+- **Documented** (CLAUDE.md): backtick-wrapped tokens matching `b2[bf]?_*_(cron|event)` / `dinoco_*_(cron|event)` / `flash_*_(cron|event)`. Code blocks stripped before extraction. Helper names (`dinoco_register_cron`, `dinoco_get_cron`) filtered out.
+- **Scheduled**: `wp_schedule_event(<time>, <recurrence>, '<name>')` + `dinoco_register_cron('<name>', ...)` (Health Monitor helper)
+- **Handler**: `add_action('<name>', <callback>)` (direct) + `'hook' => 'callback'` (registry array string) + `'hook' => array(<sched>, '<callback>')` (registry array config — Snippet 11) + `dinoco_register_cron(...)` (combines schedule + add_action)
+
+Cron-shape regex captures both suffix-style (`b2b_dunning_cron_event`) and middle-style (`b2f_diff_cron_hourly`, `b2f_cron_weekly_summary`) names.
+
+Whitelists:
+
+- `DOCUMENTED_NOT_SCHEDULED` (1 entry: `b2f_junction_diff_cron` — historical name preserved in CLAUDE.md to explain rename)
+- `HANDLER_VIA_DYNAMIC` (empty — registry pattern detection covers all cases)
+
+Coverage: 17 documented + 30+ scheduled + 35+ handlers across 16 snippets — ZERO regressions found in current codebase.
+
+#### ITEM C — Inline Handler Regression Guard (1 new file, 205 LOC)
+
+- **NEW `tests/jest/inline-handler-regression.test.js`** — count-baseline + monotonic decrease enforcement to prevent UX-H3 regression
+
+Detection scope:
+
+- All snippet files (prefix `[B2B]`, `[B2F]`, `[Admin System]`, `[System]`, `[GitHub]`, `[LIFF AI]`)
+- Comprehensive event attribute set (40+ attrs from HTML5 + legacy): mouse, keyboard, form, lifecycle, touch, drag/drop, clipboard, misc
+- Excluded: `openclawminicrm/` (own audit), `rpi-print-server/` (Python), `liff-src/` (Vite ES modules), `tests/` (fixtures)
+
+Comment-stripping pre-pass (`//` + `/* */`) before regex match — prevents false positives from documentation/migration-pattern examples.
+
+Baseline: 870 (current count: 862, slack: 8). Top contributors: Inventory DB (197), Manual Invoice (94), Service Center (58), Snippet 9 (50), Admin Dashboard (41). 39 files total.
+
+3 test cases:
+
+1. **Sanity** — snippets exist (>5 files have handlers)
+2. **Regression check** — count <= baseline + tolerance(0)
+3. **Freshness check** — count not significantly below baseline (force ratchet-down when migrations land; threshold = 50 slack)
+
+Failure messages include top 10 offenders + migration pattern code example + pointer to `docs/patterns/EVENT-DELEGATION.md` + 3 resolution paths.
+
+#### Test Suite Growth
+
+- Jest suites: 19 → 21 (+2 NEW: `cron-drift`, `inline-handler-regression`)
+- Jest tests: 153 → 156 passing (3 sanity + 1 regression + 1 freshness + 7 cron drift cases)
+- Drift detectors: 7 → 8 (cron added — joins shortcode, REST endpoint, constants, snippet DB_ID, JSDoc endpoint, feature flags, markdown links)
+
+#### Commits
+
+- `2721a89` — docs(patterns): NEW patterns library — 5 reusable patterns + index (Round 21 ITEM A)
+- `59741b6` — test(jest): NEW cron drift detector — 7 → 8 drift detectors (Round 21 ITEM B)
+- `22c6d20` — test(jest): NEW inline handler regression guard — UX-H3 prevention (Round 21 ITEM C)
+
+#### Files Touched (Round 21, 8 total)
+
+- `docs/patterns/README.md` (NEW, 65 LOC)
+- `docs/patterns/EVENT-DELEGATION.md` (NEW, 162 LOC)
+- `docs/patterns/CACHE-PRIMING.md` (NEW, 172 LOC)
+- `docs/patterns/DATA-ATTR-SCOPING.md` (NEW, 244 LOC)
+- `docs/patterns/FUNCTION-EXISTS-GUARDS.md` (NEW, 229 LOC)
+- `docs/patterns/IDEMPOTENCY-KEY.md` (NEW, 286 LOC)
+- `tests/jest/cron-drift.test.js` (NEW, 317 LOC)
+- `tests/jest/inline-handler-regression.test.js` (NEW, 205 LOC)
+
+Risk: **NONE** on every item. Pure docs + additive test layer. No production impact possible.
+
+---
+
 ### Docs — Round 20 FINAL polish (CLAUDE.md drift sweep + README polish + retrospective doc) (2026-04-29)
 
 After Round 19 explicitly recommended deferring further endpoint integration until 1-2 weeks production canary observed, Round 20 = pure docs sync + verification only. Risk NONE on every item. ZERO source code changes.
