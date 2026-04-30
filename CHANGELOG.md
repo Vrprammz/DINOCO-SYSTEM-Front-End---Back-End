@@ -10,6 +10,53 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Test + Docs — Round 12 (MD040 lint sweep + unit test expansion + coverage badge) (2026-04-30)
+
+3 cosmetic+test items closed zero-risk. Net: +99 markdown lang tags, +41 unit tests, 3 coverage badges in README.
+
+**ITEM A — MD040 lint sweep (3 .md files, 99 fixes)**
+
+Pre-existing MD040 warnings ("Fenced code blocks should have a language specified") cleared across `WORKFLOW-REFERENCE.md` (53), `FEATURE-SPECS.md` (43), `SYSTEM-REFERENCE.md` (3). `CLAUDE.md` + `CHANGELOG.md` + `README.md` already clean.
+
+- Detection: paired fence positions, content-sniffed each pair → `text` (workflow narrative), `sql` (SQL queries), `json`, `php`, `bash`, `http` per content fingerprint.
+- Result: 95% workflow text, 5% SQL — applied automated language tagging via Python AST-style scan.
+- Verification: `npx markdownlint-cli` returns 0 MD040 across all 6 major .md files post-fix.
+- Risk: NONE — pure docs cosmetics.
+
+**ITEM B — Unit test expansion (+41 tests, 170 → 211)**
+
+Picked 2 helpers not yet covered after surveying 11 existing test files.
+
+- **`b2f_format_date_thai()`** (FormatDateThaiTest, 19 cases): empty/null/zero/falsy → `'-'`, ISO date/datetime/T+TZ/leap day → `'DD/MM/YYYY'`, garbage → passthrough, `@unix` epoch → Bangkok TZ, US/Thai format edge cases. Locks Bangkok TZ in setUp/tearDown.
+- **`b2f_compute_manufacturing_summary()`** (ManufacturingSummaryTest, 22 cases): empty/null/string → `[]`, item filter (empty SKU skipped), numeric coercion, name fallback chain, image_url fallback, DD-3 detection (`is_shared` true ⇔ count(breakdown) > 1) — 1/2/3 parents tested, summary order preserved. Critical for "ใช้ใน N SET" badge logic.
+- Pattern: re-implements function inline (mirrors snippet body), no `require` of WP-loaded snippet.
+- Total: 170 → 211 tests, 261 → 311 assertions.
+- Risk: NONE — additive tests only.
+
+**ITEM C — Coverage badge (Phase 5 M5 closed)**
+
+Jest coverage generated and badged in README:
+
+- Lines 98.68% (brightgreen badge)
+- Statements 96.38%
+- Functions 93.75%
+- Branches 85.09% (green badge)
+
+PHPUnit coverage skipped — no XDebug/PCOV in dev env. Documented in README ("requires `pecl install pcov`"). Test counts table updated: PHPUnit Unit 110 → 211 (13 files), Jest 136 → 146 (7 drift detectors), Total 363 → 508. Coverage metric table inserted.
+
+**Files touched (5 total)**:
+
+- `WORKFLOW-REFERENCE.md` (+53 lang tags)
+- `SYSTEM-REFERENCE.md` (+3 lang tags)
+- `FEATURE-SPECS.md` (+43 lang tags)
+- `tests/helpers/FormatDateThaiTest.php` (NEW, 137 LOC, 19 cases)
+- `tests/helpers/ManufacturingSummaryTest.php` (NEW, 269 LOC, 22 cases)
+- `README.md` (+3 badges + coverage table + counts updated)
+
+**Validation**: `npx markdownlint-cli ...md` MD040=0; `vendor/bin/phpunit` 211 pass; `npx jest` 146/148 pass; `php -l` clean on new files; `npx jest --coverage` produces coverage-summary.json.
+
+---
+
 ### Test + Refactor — Round 11 (onerror migration + REST drift detector + unit test expansion) (2026-04-30)
 
 3 commits closing low-priority polish + safety nets queued for a long time. Risk: LOW (UX-equivalent refactor) + NONE (additive tests).
