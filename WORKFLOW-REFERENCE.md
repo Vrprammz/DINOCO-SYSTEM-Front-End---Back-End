@@ -16,11 +16,13 @@
    - 2.1 [B2B Order (LINE Bot)](#21-b2b-order-line-bot)
      - 2.1.1 [B2B Order Confirmation Flow (sequenceDiagram)](#211-b2b-order-confirmation-flow-sequencediagram)
    - 2.2 [Walk-in Order Flow](#22-walk-in-order-flow)
+     - 2.2.1 [Walk-in Order Auto-Complete Flow (stateDiagram-v2)](#221-walk-in-order-auto-complete-flow-statediagram-v2)
    - 2.3 [B2B Payment Flow](#23-b2b-payment-flow)
    - 2.4 [B2B Shipping (Flash Express)](#24-b2b-shipping-flash-express)
    - 2.5 [B2B Order Lifecycle (Full FSM Diagram)](#25-b2b-order-lifecycle-full-fsm-diagram--v18-snippet-14)
 3. [B2F Factory Purchasing Workflows](#3-b2f-factory-purchasing-workflows)
    - 3.1 [Create PO (Admin) -- Text](#31-create-po-admin----text)
+     - 3.1.1 [B2F PO Submission Flow (sequenceDiagram)](#311-b2f-po-submission-flow-sequencediagram)
    - 3.2 [Maker Confirm/Reject PO -- Text](#32-maker-confirmreject-po----text)
    - 3.3 [Maker Delivery -- Text](#33-maker-delivery----text)
    - 3.4 [Receive Goods (Admin) -- Text](#34-receive-goods-admin----text)
@@ -361,6 +363,74 @@ Walk-in Cancel:
 
 End State: b2b_order สถานะ completed หรือ cancelled
 ```
+
+#### 2.2.1 Walk-in Order Auto-Complete Flow (stateDiagram-v2)
+
+Visualizes the **two key bypass behaviors** that distinguish walk-in from regular B2B orders:
+
+1. **Skip stock check** at order confirmation (regular flow gates here on OOS)
+2. **Auto-complete** after payment (regular flow loops through `awaiting_shipping` → `shipped` → `delivered` → `completed`)
+
+Plus: walk-in is the **only** flow where `completed → cancelled` is permitted (admin-only escape hatch — V.33.2 in `[B2B] Snippet 14: FSM` V.1.5).
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft: Create Order<br/>(LINE Bot/LIFF)
+
+    state "Walk-in Detection" as detect <<choice>>
+    draft --> detect: ลูกค้ายืนยันออเดอร์
+    detect --> awaiting_confirm_regular: is_walkin=0<br/>(regular distributor)
+    detect --> awaiting_confirm_walkin: is_walkin=1<br/>SKIP stock check<br/>SKIP OOS gate
+
+    state "Regular Path (OOS-gated)" as regular {
+        awaiting_confirm_regular --> bo_check: b2b_check_order_oos()
+        bo_check --> pending_stock_review: stock < qty
+        bo_check --> awaiting_confirm_ok: stock OK
+    }
+
+    state "Walk-in Path (auto-pass)" as walkin {
+        awaiting_confirm_walkin --> awaiting_payment_walkin: ยืนยันบิล<br/>+ debt + INV<br/>(stamp _b2b_is_walkin=1)
+    }
+
+    awaiting_confirm_ok --> awaiting_payment_walkin: ยืนยันบิล (regular path merges here<br/>after stock pass)
+
+    awaiting_payment_walkin --> paid: รับสลิป + verify<br/>Slip2Go API<br/>(walk-in bank fallback:<br/>B2B_WALKIN_BANK_*)
+
+    state "Post-Payment" as post_payment <<choice>>
+    paid --> post_payment
+    post_payment --> awaiting_shipping: is_walkin=0<br/>(regular: choose ship method)
+    post_payment --> completed_walkin: is_walkin=1<br/>AUTO-COMPLETE<br/>(skip ship flow)
+
+    awaiting_shipping --> shipped: Flash/MNGR/etc.
+    shipped --> completed: confirm receipt
+
+    completed_walkin --> cancelled_walkin: Admin only<br/>(V.33.2 escape hatch)<br/>FSM completed→cancelled
+    cancelled_walkin --> [*]: คืนหนี้ +<br/>คืนสต็อก leaf<br/>(_stock_returned guard)
+
+    completed --> [*]
+    pending_stock_review --> [*]: BO flow<br/>(see §2.10)
+
+    note right of awaiting_confirm_walkin
+        is_walkin=1 → 3 effects:
+        1. Skip OOS gate
+        2. allow_negative=true (DD-5)
+        3. Stamp meta _b2b_is_walkin=1
+    end note
+
+    note left of completed_walkin
+        Walk-in only: cancel after
+        completion permitted.
+        Regular completed = TERMINAL.
+    end note
+```
+
+**Bank account override** (V.32.0): Walk-in orders read from `B2B_WALKIN_BANK_*` constants if defined, falling back to standard `B2B_BANK_*`. Helper: `b2b_get_bank_info($order_id)` checks `_b2b_is_walkin` meta to route. Slip verification (`b2b_verify_slip()` in Snippet 2 + 3) accepts both bank accounts. Cancellation **also** uses walk-in bank for refund Flex card.
+
+**Stock semantics** (V.6.0 + V.7.1):
+
+- Stock subtract at `awaiting_confirm` transition uses `allow_negative=true` (DD-5: walk-in can go negative — physical sales already happened)
+- Cancel cascade: `dinoco_get_leaf_skus($sku)` expand → `dinoco_stock_add($leaf, $qty, allow_neg=false)` per leaf
+- `_stock_returned` meta flag prevents double restore on repeated cancel attempts (V.31.7 guard)
 
 ### 2.3 B2B Payment Flow
 
@@ -1348,6 +1418,100 @@ Trigger: Admin เปิด LIFF Catalog หรือ B2F Dashboard
 
 End State: b2f_order สถานะ submitted
 ```
+
+#### 3.1.1 B2F PO Submission Flow (sequenceDiagram)
+
+End-to-end view of `POST /b2f/v1/create-po` showing every transformation between Admin LIFF cart submit and Maker Flex notification:
+
+- **DD-7 leaf expansion**: SET orders auto-expand to leaf items at server side (admin sees SET, Maker sees parts to manufacture)
+- **DD-3 shared leaf**: same leaf in N SETs → composite merge key `$sku|$order_mode|$source_sku` preserves intent per item + breakdown JSON tracks origin
+- **V.7.0 Order Intent**: 7-rule validator (enum strict + source_sku ancestor check + intent_notes 200-char sanitize)
+- **Multi-currency immutability**: `po_currency` + `po_exchange_rate` snapshot at submit — frozen for PO lifetime (no re-rate on FX swing)
+- **PII gate**: `poi_intent_notes` admin-only — stripped from Maker Flex + PO Image (Snippet 10 V.3.0)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin as Admin (LIFF)
+    participant Cart as Cart UI<br/>(Snippet 8 V.7.0+)
+    participant API as REST API<br/>(Snippet 2 V.11.0)
+    participant Validator as 7-Rule Validator<br/>(Snippet 1 V.7.0)
+    participant Junction as wp_dinoco_product_makers
+    participant Catalog as wp_dinoco_products<br/>(DINOCO_Catalog)
+    participant CPT as b2f_order CPT
+    participant FSM as B2F_Order_FSM<br/>(Snippet 6)
+    participant Flex as Flex Builders<br/>(Snippet 1)
+    participant LINE as LINE Push API
+    participant Image as PO Image<br/>(Snippet 10 V.3.0)
+
+    Admin->>Cart: Add items + select<br/>order_mode<br/>(full_set/sub_unit/<br/>single_leaf)
+    Note over Cart: Persist localStorage<br/>b2f_cart_v7_{maker_id}<br/>(schema v7)
+
+    Admin->>Cart: Submit Review<br/>(3-bucket accordion preview)
+    Cart->>API: POST /b2f/v1/create-po<br/>{maker_id, items[], currency,<br/>exchange_rate, shipping_method,<br/>order_mode, source_sku,<br/>intent_notes}
+
+    API->>API: Auth: WP nonce OR<br/>X-B2F-Token JWT
+    alt unauthorized
+        API-->>Cart: 401 unauthorized
+    end
+
+    API->>API: Rate limit check<br/>(b2b_rate_limit per user)
+
+    API->>Validator: Validate items[]
+    Note over Validator: 7 rules:<br/>1. enum strict (mode/currency)<br/>2. source_sku in ancestors<br/>3. intent_notes ≤200 chars<br/>4. qty ≥ 1<br/>5. exchange_rate range<br/>6. shipping_method (land/sea<br/>   if non-THB)<br/>7. maker_id authorized
+    Validator->>Junction: SELECT cost/MOQ/lead_time<br/>WHERE maker × sku
+    Junction-->>Validator: row + missing_leaves[]
+    Validator-->>API: ok | WP_Error 400
+
+    alt validation fails
+        API-->>Cart: 400 + error code<br/>(B2F_ERR_*)
+    end
+
+    API->>Catalog: get_by_skus()<br/>(batch lookup, single SQL)
+    Catalog-->>API: hierarchy + leaves
+
+    Note over API: DD-7 expand: SET orders<br/>→ resolve leaf SKUs<br/>(dinoco_get_leaf_skus)<br/><br/>DD-3 merge: composite key<br/>"sku|mode|source_sku"<br/>preserves intent per item<br/><br/>Build poi_parent_breakdown<br/>JSON per leaf
+    API->>API: Build po_items[] +<br/>compute totals<br/>(THB + native currency)
+
+    API->>CPT: wp_insert_post(b2f_order)<br/>+ ACF update (po_currency,<br/>po_exchange_rate frozen)
+    CPT-->>API: post_id
+
+    API->>CPT: update_post_meta<br/>_b2f_order_intent_summary JSON<br/>(show_in_rest=false +<br/>auth_callback=manage_options)
+
+    API->>FSM: transition draft → submitted
+    FSM->>FSM: Validate transition allowed
+    FSM-->>API: ok + audit log
+
+    par Notify Maker (group)
+        API->>Flex: build_flex_new_po(<br/>$po, lang=currency)
+        Note over Flex: PII strip:<br/>unset poi_intent_notes<br/>3-lang via b2f_t()
+        Flex->>LINE: PUSH to maker_group_id
+        LINE-->>Flex: 200 OK
+    and Notify Admin (group)
+        API->>Flex: build_flex_admin_po_created
+        Flex->>LINE: PUSH to admin_group_id
+        LINE-->>Flex: 200 OK
+    and Generate PO Image (lazy)
+        API->>Image: schedule render A4 PDF<br/>(GD Library)
+        Note over Image: Mode badge per item<br/>(🟣🟠⚪)<br/>Intent Summary header<br/>NO intent_notes (PII)
+        Image-->>API: image_url cached
+    end
+
+    API-->>Cart: 200 + {post_id, status}
+    Note over Cart: Clear localStorage<br/>b2f_cart_v7_{maker_id}<br/>+ redirect to PO Ticket
+    Cart-->>Admin: ✅ PO submitted<br/>+ undo window 30s<br/>(POST /po-undo-submit)
+```
+
+**Undo window** (V.11.0): For 30 seconds after submit, admin can call `POST /b2f/v1/po-undo-submit` (DB-clock window + dual auth + FOR UPDATE + FSM `draft→cancelled`). After window expires, only admin reject path (`po-cancel`) remains.
+
+**Currency immutability**: `po_currency` + `po_exchange_rate` snapshot at submit are **frozen** for PO lifetime. If FX rate changes between submit and receive-goods, the original rate applies — debt/credit always settles in THB at the PO-snapshot rate. This protects both DINOCO and Maker from FX volatility ambiguity.
+
+**PII protection** (defense-in-depth):
+
+- `poi_intent_notes` ACF field flagged admin-only via REST callback gate in `b2f_format_po_detail()`
+- Maker LIFF V.4.3 shows mode badge ONLY (no intent_notes rendered)
+- PO Image (Snippet 10 V.3.0) omits intent_notes — admin reviews via PO Ticket separately
+- `_b2f_order_intent_summary` postmeta has `show_in_rest=false` + `auth_callback=manage_options`
 
 ### 3.1.7 Create PO V.7.0 — Order Intent System (2026-04-17)
 
