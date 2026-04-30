@@ -10,6 +10,74 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### UI — Round 4 Wave 3 UI Polish (2026-04-29) — B2F V.7.0 Order Intent UX (Gaps 3+4+5)
+
+3 commits closing Wave 3 UI gaps surveyed in Round 3. All flag-gated by
+`b2f_flag_order_intent` (default OFF in V.7.0 spec, ON since 2026-04-17).
+Risk: LOW — display + a11y layer only, no API contract change.
+
+**Gap 3 — Maker LIFF PO list mode-summary badge**
+(`[B2F] Snippet 4: Maker LIFF Pages` V.4.5 → V.4.6):
+
+- New JS helper `modeSummaryHtml(po)` iterates items[], counts qty per
+  `poi_order_mode`, returns compact 3-mode breakdown HTML or `""` for
+  legacy POs (no order_mode).
+- Output: `🟣 5  🟠 3  ⚪ 2` (mixed) or `🟣 ทั้งหมด ชุดเต็ม (10)` (single mode).
+- 3-lang labels (TH/EN/ZH) via L() helper for THB/USD/CNY currency makers.
+- Inserted in renderListPage() PO card after po-total, before status badges.
+- PHP wires flag via new `$b2f_order_intent_js` variable in `b2f_liff_page_js()`
+  using `dinoco_config()` with `get_option` fallback.
+- CSS scoped under `.b2f-po-card`: `.po-mode-summary` flex container,
+  `.po-mode-pill.{full-set,sub-unit,single-leaf,all-mode}` color variants.
+- Defensively ignores intent_notes (admin-only — API strips for Maker JWT).
+
+**Gap 4 — SET Detail mode toggle compact-on-scroll**
+(`[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.9 → V.7.10):
+
+- When user scrolls overlay > 100px, toggle shrinks to maximize content area:
+  margin 12→6px, padding 10→4px vertical, font 13→12px, min-height 44→32px.
+- Smooth 200ms transition (margin/box-shadow/padding/font-size/min-height).
+- rAF-throttled scroll listener on `$setDetail` (overlay scroll container).
+- Single-init pattern (`_setDetailScrollListenerAttached` flag) — listener
+  bound once per session, persists across SET re-opens.
+- `passive: true` (non-blocking scroll for smooth iOS momentum).
+- `closeSetDetail()` cancels pending rAF + removes `.scrolled` class
+  (clean slate for next overlay open).
+- Tap target stays ≥ 32px (Apple HIG min, WCAG AA acceptable).
+- Flag-gated `ORDER_INTENT_ENABLED` (no-op when OFF — toggle isn't injected,
+  listener init is skipped naturally).
+
+**Gap 5 — Cart Submit Review Gate WAI-ARIA tabs pattern**
+(`[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.10 → V.7.11):
+
+- Modal root: `role="dialog"` + `aria-modal="true"` + `aria-labelledby` to
+  stable header id.
+- Tablist wrapper: `role="tablist"` + `aria-label` + `aria-orientation="vertical"`.
+- Bucket headers: `role="tab"` + id + `aria-controls` + `aria-selected` +
+  `aria-expanded` + tabindex (roving 0/-1) + `data-bucket-tab`.
+- Bucket bodies: `role="tabpanel"` + id + `aria-labelledby` + `tabindex="0"`
+  (focusable for screen reader) + `hidden` attribute when closed.
+- Total row: `role="status"` + `aria-live="polite"` — screen reader
+  announces total when buckets toggle.
+- Arrow span: `aria-hidden="true"` (decorative).
+- Keyboard nav (new helper `bindReviewTablistA11y(visibleBuckets)`):
+  - ArrowDown/ArrowRight → next visible tab (wraps)
+  - ArrowUp/ArrowLeft → prev visible tab (wraps)
+  - Home → first tab; End → last tab
+  - Enter/Space activate native (not intercepted)
+- Architectural cleanup: removed inline `onclick="..."` from V.7.0 (XSS
+  surface reduced). Replaced with event delegation in tablist handler.
+- Buckets independent (not radio) — each opens/closes individually;
+  aria-selected reflects "is panel currently visible" (hybrid pattern).
+
+**Files** (3 commits, +266/-19 LOC):
+
+- `[B2F] Snippet 4: Maker LIFF Pages` V.4.5 → V.4.6 (+85/-1)
+- `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.9 → V.7.11 (+200/-19 across
+  V.7.10 + V.7.11)
+
+**Commits**: `b997598` (Gap 3) + `20d6ed2` (Gap 4) + `69a62f4` (Gap 5)
+
 ### Audit — Round 3 Pending Items Sprint (2026-04-29) — Flag Audit Log NEW snippet
 
 NEW snippet **`[Admin System] DINOCO Flag Audit Log` V.1.0** — centralized
