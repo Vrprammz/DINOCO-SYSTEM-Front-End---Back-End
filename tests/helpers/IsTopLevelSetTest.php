@@ -42,11 +42,11 @@ if ( ! function_exists( __NAMESPACE__ . '\\dinoco_is_top_level_set' ) ) {
         if ( ! $is_parent ) return false;
 
         // Must NOT be a child of any other parent
-        foreach ( $relations as $parent => $children ) {
+        foreach ( $relations as $children ) {
             if ( ! is_array( $children ) ) continue;
             $children_upper = array_map( function( $c ) { return strtoupper( trim( (string) $c ) ); }, $children );
             if ( in_array( $sku_upper, $children_upper, true ) ) {
-                return false; // child of $parent → not top-level
+                return false; // child of some parent → not top-level
             }
         }
         return true;
