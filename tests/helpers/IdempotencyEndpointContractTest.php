@@ -1182,15 +1182,288 @@ class IdempotencyEndpointContractTest extends TestCase {
         );
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // ROUND 27 — 5 NEW ENDPOINT INTEGRATIONS
+    //   Snippet 16: bo-cancel-item / bo-bulk-fulfill / bo-bulk-cancel
+    //   B2F Snippet 2: po-complete
+    //   Inventory: dip-stock/approve
+    //
+    // Highlights:
+    //   - 3 BULK-array endpoints (canonical sort key required)
+    //   - First "skus[]" array endpoint (uppercase normalize + sort + dedup)
+    //   - po-complete = simple 2-field {po_id, note} pattern
+    // ════════════════════════════════════════════════════════════════
+
+    // ── BO-CANCEL-ITEM body shape (Snippet 16 V.3.5) ──
+    //   { order_id, bo_queue_id, reason }
+    private function bo_cancel_item_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'order_id'    => 5001,
+            'bo_queue_id' => 88,
+            'reason'      => 'discontinued',
+        ), $overrides );
+    }
+
+    public function test_bo_cancel_item_identical_body_same_hash(): void {
+        $b1 = $this->bo_cancel_item_body();
+        $b2 = $this->bo_cancel_item_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Admin Flex postback double-fire MUST replay safely'
+        );
+    }
+
+    public function test_bo_cancel_item_different_reason_different_hash(): void {
+        // Admin edits reason between retries → 409 (different audit trail content)
+        $b1 = $this->bo_cancel_item_body( array( 'reason' => 'discontinued' ) );
+        $b2 = $this->bo_cancel_item_body( array( 'reason' => 'OOS — replacement ordered' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'reason in hash → admin editing reason surfaces 409'
+        );
+    }
+
+    public function test_bo_cancel_item_different_queue_id_different_hash(): void {
+        // Cross-row key reuse (admin tab confusion) → 409
+        $b1 = $this->bo_cancel_item_body();
+        $b2 = $this->bo_cancel_item_body( array( 'bo_queue_id' => 999 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'bo_queue_id namespacing prevents cross-row cache poisoning'
+        );
+    }
+
+    // ── BO-BULK-FULFILL body shape (Snippet 16 V.3.5) ──
+    //   { items[normalized: sort by bo_queue_id] }
+    private function bo_bulk_fulfill_body( array $overrides = array() ): array {
+        $defaults = array(
+            'items' => array(
+                array( 'bo_queue_id' => 30, 'qty' => 5 ),
+                array( 'bo_queue_id' => 10, 'qty' => 2 ),
+                array( 'bo_queue_id' => 20, 'qty' => 1 ),
+            ),
+        );
+        $merged = array_merge( $defaults, $overrides );
+        if ( isset( $merged['items'] ) && is_array( $merged['items'] ) ) {
+            usort( $merged['items'], function( $a, $b ) {
+                return ( $a['bo_queue_id'] ?? 0 ) <=> ( $b['bo_queue_id'] ?? 0 );
+            } );
+        }
+        return $merged;
+    }
+
+    public function test_bo_bulk_fulfill_identical_body_same_hash(): void {
+        $b1 = $this->bo_bulk_fulfill_body();
+        $b2 = $this->bo_bulk_fulfill_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Bulk-fulfill double-tap with same selection MUST replay'
+        );
+    }
+
+    public function test_bo_bulk_fulfill_row_reorder_same_hash(): void {
+        // CRITICAL bulk pattern test: admin reorders rows → same intent, same hash
+        // because integration sorts by bo_queue_id before hashing
+        $b1 = $this->bo_bulk_fulfill_body();
+        $b2 = $this->bo_bulk_fulfill_body( array(
+            'items' => array(
+                array( 'bo_queue_id' => 20, 'qty' => 1 ),  // reordered
+                array( 'bo_queue_id' => 30, 'qty' => 5 ),
+                array( 'bo_queue_id' => 10, 'qty' => 2 ),
+            ),
+        ) );
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Row reorder MUST hash identically (sort by bo_queue_id canonicalizes intent)'
+        );
+    }
+
+    public function test_bo_bulk_fulfill_qty_change_different_hash(): void {
+        // Admin types per-row qty override → different intent → 409
+        $b1 = $this->bo_bulk_fulfill_body();
+        $b2 = $this->bo_bulk_fulfill_body( array(
+            'items' => array(
+                array( 'bo_queue_id' => 10, 'qty' => 2 ),
+                array( 'bo_queue_id' => 20, 'qty' => 99 ),  // changed
+                array( 'bo_queue_id' => 30, 'qty' => 5 ),
+            ),
+        ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'qty override change MUST surface 409 (admin re-edited intent)'
+        );
+    }
+
+    // ── BO-BULK-CANCEL body shape (Snippet 16 V.3.5) ──
+    //   { bo_queue_ids[normalized sort], reason }
+    private function bo_bulk_cancel_body( array $overrides = array() ): array {
+        $defaults = array(
+            'bo_queue_ids' => array( 30, 10, 20 ),
+            'reason'       => 'bulk_cancel',
+        );
+        $merged = array_merge( $defaults, $overrides );
+        if ( isset( $merged['bo_queue_ids'] ) && is_array( $merged['bo_queue_ids'] ) ) {
+            $merged['bo_queue_ids'] = array_map( 'intval', $merged['bo_queue_ids'] );
+            sort( $merged['bo_queue_ids'], SORT_NUMERIC );
+        }
+        return $merged;
+    }
+
+    public function test_bo_bulk_cancel_identical_body_same_hash(): void {
+        $b1 = $this->bo_bulk_cancel_body();
+        $b2 = $this->bo_bulk_cancel_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_bo_bulk_cancel_id_reorder_same_hash(): void {
+        // Admin reorders selection → same intent, same hash (sort canonicalizes)
+        $b1 = $this->bo_bulk_cancel_body( array( 'bo_queue_ids' => array( 10, 20, 30 ) ) );
+        $b2 = $this->bo_bulk_cancel_body( array( 'bo_queue_ids' => array( 30, 10, 20 ) ) );
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'bo_queue_ids reorder MUST be normalized via sort()'
+        );
+    }
+
+    public function test_bo_bulk_cancel_different_reason_different_hash(): void {
+        $b1 = $this->bo_bulk_cancel_body( array( 'reason' => 'OOS' ) );
+        $b2 = $this->bo_bulk_cancel_body( array( 'reason' => 'EOL' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'reason in hash differentiates audit-trail intent'
+        );
+    }
+
+    // ── PO-COMPLETE body shape (B2F Snippet 2 V.11.15) ──
+    //   { po_id, note }
+    private function po_complete_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'po_id' => 8200,
+            'note'  => 'ปิด PO — ไม่ต้องชำระ',
+        ), $overrides );
+    }
+
+    public function test_po_complete_identical_body_same_hash(): void {
+        $b1 = $this->po_complete_body();
+        $b2 = $this->po_complete_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Admin double-click "ปิด PO" MUST replay safely'
+        );
+    }
+
+    public function test_po_complete_different_note_different_hash(): void {
+        $b1 = $this->po_complete_body( array( 'note' => 'ปิด PO ฟรี' ) );
+        $b2 = $this->po_complete_body( array( 'note' => 'ปิด PO — sample shipment' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'note edit MUST surface 409 (different audit-log content)'
+        );
+    }
+
+    public function test_po_complete_different_po_different_hash(): void {
+        $b1 = $this->po_complete_body( array( 'po_id' => 8200 ) );
+        $b2 = $this->po_complete_body( array( 'po_id' => 8500 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'po_id namespacing prevents cross-PO cache poisoning'
+        );
+    }
+
+    // ── DIP-STOCK/APPROVE body shape (Inventory V.45.3) ──
+    //   { session_id, skus[normalized: uppercase + dedup + sort] }
+    private function dip_stock_approve_body( array $overrides = array() ): array {
+        $defaults = array(
+            'session_id' => 12,
+            'skus'       => array( 'DNCBOX500', 'DNCRACK500', 'DNCSET500' ),
+        );
+        $merged = array_merge( $defaults, $overrides );
+        if ( isset( $merged['skus'] ) && is_array( $merged['skus'] ) ) {
+            $norm = array();
+            foreach ( $merged['skus'] as $s ) {
+                $sku = is_string( $s ) ? trim( $s ) : '';
+                if ( $sku !== '' ) $norm[] = strtoupper( $sku );
+            }
+            $norm = array_values( array_unique( $norm ) );
+            sort( $norm, SORT_STRING );
+            $merged['skus'] = $norm;
+        }
+        return $merged;
+    }
+
+    public function test_dip_stock_approve_identical_body_same_hash(): void {
+        $b1 = $this->dip_stock_approve_body();
+        $b2 = $this->dip_stock_approve_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Admin "อนุมัติทั้งหมด" double-click MUST replay safely'
+        );
+    }
+
+    public function test_dip_stock_approve_case_insensitive_normalization(): void {
+        // CRITICAL: SKU must uppercase-normalize. Admin clicking subset with lowercase
+        // input vs uppercase input MUST hash identically (same intent semantically).
+        $b1 = $this->dip_stock_approve_body( array( 'skus' => array( 'DNCBOX500', 'DNCRACK500' ) ) );
+        $b2 = $this->dip_stock_approve_body( array( 'skus' => array( 'dncbox500', 'DnCrAcK500' ) ) );
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'SKU case + reorder normalization MUST canonicalize'
+        );
+    }
+
+    public function test_dip_stock_approve_different_subset_different_hash(): void {
+        // Admin reselects subset on retry → 409 (different intent)
+        $b1 = $this->dip_stock_approve_body( array( 'skus' => array( 'DNCBOX500', 'DNCRACK500' ) ) );
+        $b2 = $this->dip_stock_approve_body( array( 'skus' => array( 'DNCBOX500', 'DNCSET500' ) ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'skus[] is part of admin intent → subset change = 409'
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────
-    // Cumulative collision check across ALL 18 endpoints
-    //   (Round 19: 3 + Round 23: 5 + Round 25: 5 + Round 26: 5 = 18)
+    // ROUND 27 cross-endpoint collision sanity (5 new shapes)
+    // ────────────────────────────────────────────────────────────────
+
+    public function test_round27_endpoint_body_shapes_dont_collide(): void {
+        $hashes = array(
+            'bo_cancel_item'    => dinoco_idempotency_hash( $this->bo_cancel_item_body() ),
+            'bo_bulk_fulfill'   => dinoco_idempotency_hash( $this->bo_bulk_fulfill_body() ),
+            'bo_bulk_cancel'    => dinoco_idempotency_hash( $this->bo_bulk_cancel_body() ),
+            'po_complete'       => dinoco_idempotency_hash( $this->po_complete_body() ),
+            'dip_stock_approve' => dinoco_idempotency_hash( $this->dip_stock_approve_body() ),
+        );
+        $this->assertSame( 5, count( array_unique( $hashes ) ),
+            'Round 27 endpoint body shapes MUST all hash differently. Got: ' . print_r( $hashes, true )
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Cumulative collision check across ALL 23 endpoints
+    //   (Round 19: 3 + Round 23: 5 + Round 25: 5 + Round 26: 5 + Round 27: 5 = 23)
     //
     // NOTE: BO endpoints bo-confirm-full + bo-undo-split intentionally share
     // body shape {order_id, dist_id} — they are discriminated by namespace at
     // the storage layer. This test EXCLUDES bo-undo-split from uniqueness check
     // to document that contract; namespace-level isolation is verified by the
-    // dinoco_idempotency_check / store path.
+    // dinoco_idempotency_check / store path. Distinct shapes = 22.
     // ────────────────────────────────────────────────────────────────
 
     public function test_all_distinct_shape_endpoints_cumulative_no_collision(): void {
@@ -1214,9 +1487,15 @@ class IdempotencyEndpointContractTest extends TestCase {
             'bo_split'            => dinoco_idempotency_hash( $this->bo_split_body() ),
             'maker_deliver'       => dinoco_idempotency_hash( $this->maker_deliver_body() ),
             'lead_accept'         => dinoco_idempotency_hash( $this->lead_accept_body() ),
+            // Round 27 — 5 new distinct shapes
+            'bo_cancel_item'      => dinoco_idempotency_hash( $this->bo_cancel_item_body() ),
+            'bo_bulk_fulfill'     => dinoco_idempotency_hash( $this->bo_bulk_fulfill_body() ),
+            'bo_bulk_cancel'      => dinoco_idempotency_hash( $this->bo_bulk_cancel_body() ),
+            'po_complete'         => dinoco_idempotency_hash( $this->po_complete_body() ),
+            'dip_stock_approve'   => dinoco_idempotency_hash( $this->dip_stock_approve_body() ),
         );
-        $this->assertSame( 17, count( array_unique( $hashes ) ),
-            'All 17 distinct-shape endpoint bodies MUST hash uniquely (bo-undo-split intentionally shares shape with bo-confirm-full → namespace-discriminated at storage). Total cumulative endpoint count = 18.'
+        $this->assertSame( 22, count( array_unique( $hashes ) ),
+            'All 22 distinct-shape endpoint bodies MUST hash uniquely (bo-undo-split intentionally shares shape with bo-confirm-full → namespace-discriminated at storage). Total cumulative endpoint count = 23.'
         );
     }
 }

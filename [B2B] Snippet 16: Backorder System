@@ -1,6 +1,22 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.5 (2026-04-30) — Round 27: Extend Idempotency-Key support to 3 more BO endpoints: ║
+ * ║    • POST /b2b/v1/bo-cancel-item — body hash {order_id, bo_queue_id, reason}. Admin Flex      ║
+ * ║      "ยกเลิก BO" single-item action can double-fire on slow LINE postback. Wrapper returns    ║
+ * ║      cached 200 instead of "Cancel update failed" (row already cancelled = wpdb->update      ║
+ * ║      returns 0 affected rows = error). reason in hash surfaces 409 if admin edits reason.    ║
+ * ║    • POST /b2b/v1/bo-bulk-fulfill — body hash {bo_queue_ids[normalized sort], qty_overrides}. ║
+ * ║      Admin selects N rows + bulk action. Network drop mid-batch → admin retries → wrapper    ║
+ * ║      returns cached partial-success summary instead of double-running fulfilled rows         ║
+ * ║      (b2b_rest_bo_fulfill is FSM-protected but bulk wrapper returns ambiguous "N succeeded"   ║
+ * ║      summary that could confuse admin). bo_queue_ids canonicalized via usort() — admin row    ║
+ * ║      reorder ≠ different intent. qty overrides hashed when admin types per-row qty.           ║
+ * ║    • POST /b2b/v1/bo-bulk-cancel — body hash {bo_queue_ids[normalized sort], reason}.         ║
+ * ║      Admin "❌ ยกเลิก N รายการ" double-tap. Same pattern as bo-bulk-fulfill.                  ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.         ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical to V.3.4 behavior.   ║
+ * ║    • Pattern: documented in docs/patterns/IDEMPOTENCY-KEY.md "Bulk endpoint considerations". ║
  * ║  Version: V.3.4 (2026-04-30) — Round 26: Idempotency-Key support on 3 BO endpoints:        ║
  * ║    • POST /b2b/v1/bo-confirm-full — body hash {order_id, dist_id}. Admin double-click on   ║
  * ║      "ยืนยันเต็ม" button can fire twice on slow Flex action → previously caused FSM        ║
@@ -929,6 +945,49 @@ if ( ! function_exists( 'b2b_rest_bo_bulk_fulfill' ) ) {
             return new WP_Error( 'invalid_input', 'items required', array( 'status' => 400 ) );
         }
 
+        // ── V.3.5 Round 27: Idempotency-Key support ──
+        // Admin selects N rows + clicks "✅ จัดส่ง BO ที่เลือก". Network drop mid-batch →
+        // admin retries → wrapper returns cached partial-success summary instead of double-
+        // running fulfilled rows (b2b_rest_bo_fulfill is FSM-protected but bulk wrapper returns
+        // ambiguous summary). bo_queue_ids canonicalized via usort() — admin row reorder ≠
+        // different intent. qty overrides hashed when admin types per-row qty.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-bulk-fulfill';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Normalize items: extract bo_queue_id + qty, sort by bo_queue_id (admin reorder ≠ different intent)
+            $norm_items = array();
+            foreach ( $items as $it ) {
+                if ( ! is_array( $it ) ) continue;
+                $bo_queue_id = (int) ( $it['bo_queue_id'] ?? 0 );
+                if ( ! $bo_queue_id ) continue;
+                $qty = isset( $it['qty'] ) ? (int) $it['qty'] : 0;
+                $norm_items[] = array(
+                    'bo_queue_id' => $bo_queue_id,
+                    'qty'         => $qty,
+                );
+            }
+            usort( $norm_items, function( $a, $b ) {
+                return $a['bo_queue_id'] <=> $b['bo_queue_id'];
+            } );
+            $idem_body = array( 'items' => $norm_items );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         $results = array( 'success' => 0, 'failed' => 0, 'errors' => array() );
 
         // Group by order_id to handle FSM transition batch
@@ -967,10 +1026,17 @@ if ( ! function_exists( 'b2b_rest_bo_bulk_fulfill' ) ) {
             }
         }
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success' => true,
             'results' => $results,
-        ) );
+        );
+
+        // V.3.5 Round 27: store cached response for bulk replay (deterministic — no timestamps in $results)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -985,6 +1051,42 @@ if ( ! function_exists( 'b2b_rest_bo_bulk_cancel' ) ) {
 
         if ( ! is_array( $ids ) || empty( $ids ) ) {
             return new WP_Error( 'invalid_input', 'bo_queue_ids required', array( 'status' => 400 ) );
+        }
+
+        // ── V.3.5 Round 27: Idempotency-Key support ──
+        // Admin "❌ ยกเลิก N รายการ" double-tap. Same pattern as bo-bulk-fulfill.
+        // bo_queue_ids canonicalized via sort() — admin row reorder ≠ different intent.
+        // reason in hash → admin editing reason between retries = 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-bulk-cancel';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Normalize ids: cast int + sort ascending
+            $norm_ids = array();
+            foreach ( $ids as $id ) {
+                $iid = (int) $id;
+                if ( $iid > 0 ) $norm_ids[] = $iid;
+            }
+            sort( $norm_ids, SORT_NUMERIC );
+            $idem_body = array(
+                'bo_queue_ids' => $norm_ids,
+                'reason'       => $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
         }
 
         // V.1.11 BUG-M7: capture per-item error messages (mirrors bo-bulk-fulfill)
@@ -1026,7 +1128,14 @@ if ( ! function_exists( 'b2b_rest_bo_bulk_cancel' ) ) {
             }
         }
 
-        return rest_ensure_response( array( 'success' => true, 'results' => $results ) );
+        $resp = array( 'success' => true, 'results' => $results );
+
+        // V.3.5 Round 27: store cached response for bulk replay (deterministic — no timestamps)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -2411,6 +2520,36 @@ if ( ! function_exists( 'b2b_rest_bo_cancel_item' ) ) {
             return new WP_Error( 'invalid_input', 'order_id + bo_queue_id required', array( 'status' => 400 ) );
         }
 
+        // ── V.3.5 Round 27: Idempotency-Key support ──
+        // Admin Flex postback "ยกเลิก BO" can fire twice on slow LINE → 2nd fires AFTER row
+        // is status='cancelled' → wpdb->update returns 0 affected rows → 'update_failed' 500.
+        // Wrapper returns cached 200 instead. reason in hash → admin editing reason = 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-cancel-item';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'order_id'    => $order_id,
+                'bo_queue_id' => $bo_queue_id,
+                'reason'      => $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         global $wpdb;
         $bo_table = $wpdb->prefix . 'dinoco_bo_queue';
 
@@ -2471,7 +2610,14 @@ if ( ! function_exists( 'b2b_rest_bo_cancel_item' ) ) {
         // V.1.9 PERF-H4: bo_pending/ready count drops → invalidate
         b2b_bo_invalidate_summary_cache();
 
-        return rest_ensure_response( array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'status' => 'cancelled' ) );
+        $resp = array( 'success' => true, 'bo_queue_id' => $bo_queue_id, 'status' => 'cancelled' );
+
+        // V.3.5 Round 27: store cached response for idempotent replay (success only)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 

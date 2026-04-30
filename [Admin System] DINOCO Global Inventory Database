@@ -2,6 +2,15 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.45.3 (2026-04-30) — Round 27: Idempotency-Key support on POST /dip-stock/approve.
+ *   Admin "อนุมัติทั้งหมด" double-click on slow Dip Stock approval → 2nd request runs
+ *   stock_add/subtract loop again on rows that DID adjust + skips rows already marked
+ *   adjusted=1 (so idempotent in practice on row level), but the wrapper provides clean
+ *   24h replay of the "adjusted_count" summary so admin sees identical confirmation.
+ *   Body hash = {session_id, skus[normalized sort]}. skus[] in hash → admin reselecting
+ *   subset between retries surfaces 409 (different intent). Backward compat: missing
+ *   X-Idempotency-Key header = byte-identical V.45.2 behavior.
+ *   Pattern: docs/patterns/IDEMPOTENCY-KEY.md "Bulk endpoint considerations".
  * Version: V.45.2 (2026-04-29) — V.45.1 code-reviewer remediation (2 HIGH + 2 MED batched).
  *   HIGH-1: "แนะนำ" badge layout — V.45.1 used flex inline + margin-left:auto but prior flex:1 sibling
  *           consumed all auto-margin → badge clamped wrong position. Reverted to position:absolute
@@ -2624,6 +2633,46 @@ add_action('rest_api_init', function() {
                 return new WP_REST_Response([ 'success' => false, 'message' => 'ไม่ได้ระบุ session_id' ], 400);
             }
 
+            // ── V.45.3 Round 27: Idempotency-Key support ──
+            // Admin "อนุมัติทั้งหมด" double-click → wrapper returns cached 200 instead of running
+            // approval loop twice (rows already adjusted=1 are skipped at SQL level so no double-
+            // adjust risk, but wrapper provides clean replay of summary for retry-friendly UX).
+            // Body hash = {session_id, skus[normalized sort]} — admin reselecting subset = 409.
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::dip-stock/approve';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $norm_skus = array();
+                if ( is_array( $skus ) ) {
+                    foreach ( $skus as $s ) {
+                        $sku = is_string( $s ) ? trim( $s ) : '';
+                        if ( $sku !== '' ) $norm_skus[] = strtoupper( $sku );
+                    }
+                    $norm_skus = array_values( array_unique( $norm_skus ) );
+                    sort( $norm_skus, SORT_STRING );
+                }
+                $idem_body = array(
+                    'session_id' => $session_id,
+                    'skus'       => $norm_skus,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_REST_Response([
+                        'success' => false,
+                        'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        'code'    => 'idempotency_conflict',
+                    ], $status_code);
+                }
+                if ( is_array( $cached ) ) {
+                    $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                    unset( $cached['_idem_code'] );
+                    return new WP_REST_Response( $cached, $cached_code );
+                }
+            }
+
             $session = $wpdb->get_row( $wpdb->prepare(
                 "SELECT id, status FROM {$dip_table} WHERE id = %d", $session_id
             ) );
@@ -2706,11 +2755,18 @@ add_action('rest_api_init', function() {
                 b2b_log( "[DipStock] Approved {$adjusted_count} SKUs for session #{$session_id}" );
             }
 
-            return rest_ensure_response([
+            $resp = [
                 'success'        => true,
                 'adjusted_count' => $adjusted_count,
                 'completed'      => isset( $update_data['status'] ) && $update_data['status'] === 'completed',
-            ]);
+            ];
+
+            // V.45.3 Round 27: store cached response for idempotent replay
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ]);
