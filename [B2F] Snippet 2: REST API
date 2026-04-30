@@ -1,5 +1,12 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.14 (2026-04-30) — Round 26: Extend Idempotency-Key support to maker-deliver.
+ *   Maker LIFF "แจ้งส่งของ" button can fire 2x on slow LINE response. Body hash = {po_id,
+ *   maker_id (from JWT), delivery_items[normalized], note}. JWT-scoped maker_id prevents
+ *   cross-maker key reuse. delivery_items normalized (sort by sku, integer qty) for stable
+ *   hash regardless of admin row reorder. Existing GET_LOCK on b2f_dlv_<po_id> still primary
+ *   defense; central wrapper extends 24h replay window for retry-friendly UX.
+ *   Backward compat: missing X-Idempotency-Key = byte-identical V.11.13 behavior.
  * Version: V.11.13 (2026-04-29) — Round 25: Extend Idempotency-Key support to 3 more endpoints:
  *   POST /po-cancel + POST /maker-confirm + POST /record-payment. Mirrors Round 19 + 23 pattern.
  *   - po-cancel body hash = {po_id, reason}. Reason IN hash so admin re-edit between retries
@@ -4304,6 +4311,49 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => b2f_t('ระบบไม่พร้อม', 'System not ready', '系统未就绪', $cur) ), 500 );
         }
 
+        // ── V.11.14 Round 26: Idempotency-Key support ──
+        // Maker LIFF "แจ้งส่งของ" double-tap on slow LINE response. JWT-scoped maker_id.
+        // Body hash = {po_id, maker_id, delivery_items[normalized], note}.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker-deliver';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Normalize delivery_items: sort by sku + integer qty for stable hash
+            $norm_items = array();
+            if ( is_array( $delivery_items ) ) {
+                foreach ( $delivery_items as $di ) {
+                    if ( ! is_array( $di ) ) continue;
+                    $norm_items[] = array(
+                        'sku' => isset( $di['sku'] ) ? sanitize_text_field( $di['sku'] ) : '',
+                        'qty' => isset( $di['qty'] ) ? intval( $di['qty'] ) : 0,
+                    );
+                }
+                usort( $norm_items, function( $a, $b ) { return strcmp( $a['sku'], $b['sku'] ); } );
+            }
+            $idem_body = array(
+                'po_id'          => $po_id,
+                'maker_id'       => $maker_id,
+                'delivery_items' => $norm_items,
+                'note'           => $maker_note,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => b2f_t('Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน', 'Idempotency-Key conflicts with previous request', 'Idempotency-Key 与之前请求冲突', $cur),
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // W7 FIX: Lock ป้องกัน concurrent deliver
         global $wpdb;
         $dlv_lock = 'b2f_dlv_' . intval( $po_id );
@@ -4547,13 +4597,20 @@ if ( ! function_exists( 'b2f_rest_maker_deliver' ) ) {
 
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $dlv_lock ) );
 
-        return new WP_REST_Response( array(
+        $deliver_resp = array(
             'success'         => true,
             'message'         => "แจ้งส่งของ {$po_number} เรียบร้อย",
             'delivery_number' => $has_items ? ( $dlv_number ?? '' ) : '',
             'is_complete'     => $is_complete,
             'items_count'     => count( $dlv_summary ),
-        ), 200 );
+        );
+
+        // V.11.14 Round 26: store idempotent response for replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $deliver_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $deliver_resp, 200 );
     }
 }
 

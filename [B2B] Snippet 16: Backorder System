@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.4 (2026-04-30) — Round 26: Idempotency-Key support on 3 BO endpoints:        ║
+ * ║    • POST /b2b/v1/bo-confirm-full — body hash {order_id, dist_id}. Admin double-click on   ║
+ * ║      "ยืนยันเต็ม" button can fire twice on slow Flex action → previously caused FSM        ║
+ * ║      transition retry warnings. Wrapper provides 24h replay window.                        ║
+ * ║    • POST /b2b/v1/bo-split — body hash {order_id, splits[]}. Admin types split values then ║
+ * ║      submits; if browser hangs + admin re-clicks, 2nd POST would fail at FSM (already      ║
+ * ║      partial_fulfilled) but central wrapper returns cached 200 instead of confusing 400.   ║
+ * ║      CRITICAL: splits[] in hash → admin editing values mid-retry surfaces 409 (different   ║
+ * ║      intent — prevents wrong cached response).                                             ║
+ * ║    • POST /b2b/v1/bo-undo-split — body hash {order_id}. 10-min undo window already         ║
+ * ║      enforced; central wrapper extends replay → 24h (read-only after first commit).        ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.       ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical to V.3.3 behavior. ║
  * ║  Version: V.3.3 (2026-04-29) — Round 15 ITEM A: extend MED-2 sweep to update_meta_cache:  ║
  * ║    • Round 14 V.3.2 left update_meta_cache calls ungated (deferred). V.3.3 closes both    ║
  * ║      sites (lines ~1118, ~2363) with function_exists guard. Mirrors Snippet 7 pattern.    ║
@@ -1230,6 +1243,49 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
 
         $dist_id = (int) get_field( 'distributor_id', $order_id );
 
+        // ── V.3.4 Round 26: Idempotency-Key support ──
+        // Admin types split values then submits; if browser hangs + admin re-clicks, 2nd POST
+        // would fail at FSM (already partial_fulfilled) — wrapper returns cached 200 instead.
+        // CRITICAL: splits[] in hash → admin editing values mid-retry surfaces 409 (different intent).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-split';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            // Normalize splits to deterministic shape (sort by sku for stable hash)
+            $norm_splits = array();
+            foreach ( $splits as $sp ) {
+                if ( ! is_array( $sp ) ) continue;
+                $norm_splits[] = array(
+                    'sku'         => isset( $sp['sku'] ) ? sanitize_text_field( $sp['sku'] ) : '',
+                    'qty_fulfill' => isset( $sp['qty_fulfill'] ) ? intval( $sp['qty_fulfill'] ) : 0,
+                    'qty_bo'      => isset( $sp['qty_bo'] ) ? intval( $sp['qty_bo'] ) : 0,
+                    'eta_days'    => isset( $sp['eta_days'] ) ? intval( $sp['eta_days'] ) : 0,
+                );
+            }
+            // Sort by sku for canonical ordering (admin reorder rows ≠ different intent)
+            usort( $norm_splits, function( $a, $b ) { return strcmp( $a['sku'], $b['sku'] ); } );
+            $idem_body = array(
+                'order_id' => $order_id,
+                'dist_id'  => $dist_id,
+                'splits'   => $norm_splits,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         if ( function_exists( 'dinoco_transaction' ) && $dist_id ) {
             $txn_ctx = array(
                 'audit_event_type' => 'bo_split',
@@ -1249,11 +1305,20 @@ if ( ! function_exists( 'b2b_rest_bo_split' ) ) {
                 },
             );
             $res = dinoco_transaction( 'bo_split', $txn_phases, $txn_ctx );
-            return $res;
+        } else {
+            // Legacy path — Transaction Wrapper not loaded
+            $res = _b2b_rest_bo_split_legacy( $request, $order_id, $splits );
         }
 
-        // Legacy path — Transaction Wrapper not loaded
-        return _b2b_rest_bo_split_legacy( $request, $order_id, $splits );
+        // V.3.4 Round 26: store cached response for idempotent replay (success only)
+        if ( $idem_key !== '' && $idem_body !== null && ! is_wp_error( $res ) && function_exists( 'dinoco_idempotency_store' ) ) {
+            $resp_data = ( $res instanceof WP_REST_Response ) ? $res->get_data() : ( is_array( $res ) ? $res : array() );
+            $resp_code = ( $res instanceof WP_REST_Response ) ? $res->get_status() : 200;
+            if ( is_array( $resp_data ) && ! empty( $resp_data['success'] ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_data, array( '_idem_code' => $resp_code ) ), $resp_code );
+            }
+        }
+        return $res;
     }
 }
 
@@ -1552,6 +1617,34 @@ if ( ! function_exists( 'b2b_rest_bo_confirm_full' ) ) {
 
         $dist_id = (int) get_field( 'distributor_id', $order_id );
 
+        // ── V.3.4 Round 26: Idempotency-Key support ──
+        // Admin double-click on "ยืนยันเต็ม" Flex button or LINE postback retry can fire 2x.
+        // Body hash = {order_id, dist_id} — dist_id provides cross-distributor scoping.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-confirm-full';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'order_id' => $order_id,
+                'dist_id'  => $dist_id,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         if ( function_exists( 'dinoco_transaction' ) ) {
             $txn_ctx = array(
                 'audit_event_type' => 'bo_confirm_full',
@@ -1568,11 +1661,21 @@ if ( ! function_exists( 'b2b_rest_bo_confirm_full' ) ) {
                     return _b2b_rest_bo_confirm_full_inner( $order_id, $dist_id );
                 },
             );
-            return dinoco_transaction( 'bo_confirm_full', $txn_phases, $txn_ctx );
+            $resp = dinoco_transaction( 'bo_confirm_full', $txn_phases, $txn_ctx );
+        } else {
+            // Legacy path — Transaction Wrapper not loaded
+            $resp = _b2b_rest_bo_confirm_full_inner( $order_id, $dist_id );
         }
 
-        // Legacy path — Transaction Wrapper not loaded
-        return _b2b_rest_bo_confirm_full_inner( $order_id, $dist_id );
+        // V.3.4 Round 26: store cached response for idempotent replay (only on success path)
+        if ( $idem_key !== '' && $idem_body !== null && ! is_wp_error( $resp ) && function_exists( 'dinoco_idempotency_store' ) ) {
+            $resp_data = ( $resp instanceof WP_REST_Response ) ? $resp->get_data() : ( is_array( $resp ) ? $resp : array() );
+            $resp_code = ( $resp instanceof WP_REST_Response ) ? $resp->get_status() : 200;
+            if ( is_array( $resp_data ) && ! empty( $resp_data['success'] ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_data, array( '_idem_code' => $resp_code ) ), $resp_code );
+            }
+        }
+        return $resp;
     }
 }
 
@@ -1693,6 +1796,34 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
 
         $dist_id = (int) get_field( 'distributor_id', $order_id );
 
+        // ── V.3.4 Round 26: Idempotency-Key support ──
+        // Body hash = {order_id, dist_id} — undo_count NOT in hash (DB-derived state).
+        // Same key + same order = replay; existing 1-undo-per-order limit is still primary defense.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-undo-split';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'order_id' => $order_id,
+                'dist_id'  => $dist_id,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         if ( function_exists( 'dinoco_transaction' ) && $dist_id ) {
             $txn_ctx = array(
                 'audit_event_type' => 'bo_undo_split',
@@ -1711,11 +1842,21 @@ if ( ! function_exists( 'b2b_rest_bo_undo_split' ) ) {
                     return _b2b_rest_bo_undo_split_inner( $order_id, $dist_id, $undo_count );
                 },
             );
-            return dinoco_transaction( 'bo_undo_split', $txn_phases, $txn_ctx );
+            $resp = dinoco_transaction( 'bo_undo_split', $txn_phases, $txn_ctx );
+        } else {
+            // Legacy path — Transaction Wrapper not loaded
+            $resp = _b2b_rest_bo_undo_split_legacy( $order_id, $dist_id, $undo_count );
         }
 
-        // Legacy path — Transaction Wrapper not loaded
-        return _b2b_rest_bo_undo_split_legacy( $order_id, $dist_id, $undo_count );
+        // V.3.4 Round 26: store cached response for idempotent replay (success only)
+        if ( $idem_key !== '' && $idem_body !== null && ! is_wp_error( $resp ) && function_exists( 'dinoco_idempotency_store' ) ) {
+            $resp_data = ( $resp instanceof WP_REST_Response ) ? $resp->get_data() : ( is_array( $resp ) ? $resp : array() );
+            $resp_code = ( $resp instanceof WP_REST_Response ) ? $resp->get_status() : 200;
+            if ( is_array( $resp_data ) && ! empty( $resp_data['success'] ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp_data, array( '_idem_code' => $resp_code ) ), $resp_code );
+            }
+        }
+        return $resp;
     }
 }
 

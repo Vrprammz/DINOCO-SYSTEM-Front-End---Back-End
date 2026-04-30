@@ -1,6 +1,13 @@
 /**
  * File: [LIFF AI] Snippet 1: REST API
  * Description: REST API + Auth สำหรับ LIFF AI Command Center
+ * Version: V.1.11 (2026-04-30) — Round 26: Idempotency-Key support on POST /lead/{id}/accept.
+ *   Dealer LIFF "รับ Lead" double-tap on slow MongoDB roundtrip can fire 2x → previously
+ *   2nd call would observe checking_contact status and bounce as "already accepted". Central
+ *   wrapper returns cached 200 instead. Body hash = {lead_id, dealer_id, uid}. dealer_id +
+ *   uid scoped from JWT auth (cross-dealer key reuse impossible). function_exists() guards
+ *   throughout — pure no-op if Idempotency Helper snippet not synced. Backward compat:
+ *   missing X-Idempotency-Key = byte-identical V.1.10 behavior.
  * Version: V.1.10 (2026-04-29) — Round 15 ITEM A: function_exists guard on update_meta_cache.
  *   Defensive wrap — update_meta_cache is a WP private API (per source code marker). Mirrors
  *   Snippet 7 + 16 pattern. Risk: NONE — additive guard only. Pure no-op on healthy installs.
@@ -778,6 +785,37 @@ if ( ! function_exists( 'liff_ai_rest_lead_accept' ) ) {
         $auth = $request->get_param( '_auth' );
         $id   = sanitize_text_field( $request->get_param( 'id' ) );
 
+        // ── V.1.11 Round 26: Idempotency-Key support ──
+        // Dealer LIFF "รับ Lead" double-tap on slow agent roundtrip (MongoDB cross-system)
+        // would otherwise observe checking_contact status and bounce. Wrapper returns cached 200.
+        // Body hash includes auth-scoped fields (dealer_id, uid) to prevent cross-tenant key reuse.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'liff-ai/v1::lead-accept';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'lead_id'   => $id,
+                'dealer_id' => isset( $auth['dealer_id'] ) ? strval( $auth['dealer_id'] ) : '',
+                'uid'       => isset( $auth['uid'] ) ? sanitize_text_field( $auth['uid'] ) : '',
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // ตรวจว่า lead เป็นของ dealer นี้
         $lead_data = liff_ai_call_agent( 'GET', '/api/leads/' . $id );
         if ( is_wp_error( $lead_data ) ) {
@@ -803,7 +841,14 @@ if ( ! function_exists( 'liff_ai_rest_lead_accept' ) ) {
 
         liff_ai_log( sprintf( '[Lead] Accepted id=%s by dealer=%d', $id, $auth['dealer_id'] ) );
 
-        return new WP_REST_Response( array( 'success' => true, 'message' => 'รับ Lead สำเร็จ' ), 200 );
+        $accept_resp = array( 'success' => true, 'message' => 'รับ Lead สำเร็จ' );
+
+        // V.1.11 Round 26: store cached response for idempotent replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $accept_resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $accept_resp, 200 );
     }
 }
 

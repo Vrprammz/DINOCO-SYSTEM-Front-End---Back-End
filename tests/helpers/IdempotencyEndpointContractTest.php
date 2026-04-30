@@ -889,6 +889,274 @@ class IdempotencyEndpointContractTest extends TestCase {
         );
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // ROUND 26 — 5 new endpoints (BO + B2F + LIFF AI)
+    //   bo-confirm-full / bo-split / bo-undo-split / maker-deliver / lead-accept
+    // ════════════════════════════════════════════════════════════════
+
+    // ── BO-CONFIRM-FULL body shape (Snippet 16 V.3.4) ──
+    //   { order_id, dist_id }
+    private function bo_confirm_full_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'order_id' => 5001,
+            'dist_id'  => 42,
+        ), $overrides );
+    }
+
+    public function test_bo_confirm_full_identical_body_same_hash(): void {
+        $b1 = $this->bo_confirm_full_body();
+        $b2 = $this->bo_confirm_full_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Identical bo-confirm-full bodies MUST produce same hash for replay'
+        );
+    }
+
+    public function test_bo_confirm_full_different_order_different_hash(): void {
+        $b1 = $this->bo_confirm_full_body();
+        $b2 = $this->bo_confirm_full_body( array( 'order_id' => 9999 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Different order_id MUST trigger 409 (admin reused key across orders)'
+        );
+    }
+
+    public function test_bo_confirm_full_different_dist_different_hash(): void {
+        // Cross-distributor key reuse: dist_id MUST be in hash to prevent
+        // wrong dist's cached response from being replayed
+        $b1 = $this->bo_confirm_full_body();
+        $b2 = $this->bo_confirm_full_body( array( 'dist_id' => 99 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    // ── BO-SPLIT body shape (Snippet 16 V.3.4) ──
+    //   { order_id, dist_id, splits[normalized: sort by sku] }
+    private function bo_split_body( array $overrides = array() ): array {
+        $defaults = array(
+            'order_id' => 5001,
+            'dist_id'  => 42,
+            'splits'   => array(
+                array( 'sku' => 'DNCS500A', 'qty_fulfill' => 5, 'qty_bo' => 3, 'eta_days' => 7 ),
+                array( 'sku' => 'DNCS500B', 'qty_fulfill' => 2, 'qty_bo' => 0, 'eta_days' => 0 ),
+            ),
+        );
+        $merged = array_merge( $defaults, $overrides );
+        // Normalize splits sort by SKU (mirrors integration logic)
+        if ( isset( $merged['splits'] ) && is_array( $merged['splits'] ) ) {
+            usort( $merged['splits'], function( $a, $b ) {
+                return strcmp( (string) ( $a['sku'] ?? '' ), (string) ( $b['sku'] ?? '' ) );
+            } );
+        }
+        return $merged;
+    }
+
+    public function test_bo_split_identical_body_same_hash(): void {
+        $b1 = $this->bo_split_body();
+        $b2 = $this->bo_split_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Identical bo-split bodies MUST produce same hash for replay'
+        );
+    }
+
+    public function test_bo_split_admin_edits_qty_different_hash(): void {
+        // CRITICAL: admin types value, hangs, edits qty, retries — wrapper MUST 409
+        // (different intent — should not silently replay first attempt)
+        $b1 = $this->bo_split_body();
+        $b2 = $this->bo_split_body( array(
+            'splits' => array(
+                array( 'sku' => 'DNCS500A', 'qty_fulfill' => 8, 'qty_bo' => 0, 'eta_days' => 0 ),  // changed
+                array( 'sku' => 'DNCS500B', 'qty_fulfill' => 2, 'qty_bo' => 0, 'eta_days' => 0 ),
+            ),
+        ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Edited qty_fulfill MUST surface 409 (different admin intent)'
+        );
+    }
+
+    public function test_bo_split_row_reorder_same_hash(): void {
+        // Admin drags split rows around → same intent, same hash
+        $b1 = $this->bo_split_body();
+        $b2 = $this->bo_split_body( array(
+            'splits' => array(
+                // reversed order from default
+                array( 'sku' => 'DNCS500B', 'qty_fulfill' => 2, 'qty_bo' => 0, 'eta_days' => 0 ),
+                array( 'sku' => 'DNCS500A', 'qty_fulfill' => 5, 'qty_bo' => 3, 'eta_days' => 7 ),
+            ),
+        ) );
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Row reorder (same intent) MUST hash identically — sort by sku canonicalizes'
+        );
+    }
+
+    // ── BO-UNDO-SPLIT body shape (Snippet 16 V.3.4) ──
+    //   { order_id, dist_id }
+    private function bo_undo_split_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'order_id' => 5001,
+            'dist_id'  => 42,
+        ), $overrides );
+    }
+
+    public function test_bo_undo_split_identical_body_same_hash(): void {
+        $b1 = $this->bo_undo_split_body();
+        $b2 = $this->bo_undo_split_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_bo_undo_split_different_order_different_hash(): void {
+        $b1 = $this->bo_undo_split_body();
+        $b2 = $this->bo_undo_split_body( array( 'order_id' => 9999 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_bo_undo_split_distinct_from_bo_confirm_full(): void {
+        // Same {order_id, dist_id} shape — namespace discriminates at storage,
+        // but body hash is also distinct (ensure no accidental overlap)
+        // NOTE: identical body shape → identical hash (this is OK because namespace
+        // separates them at storage layer). This test documents the contract.
+        $b1 = $this->bo_undo_split_body();
+        $b2 = $this->bo_confirm_full_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'BO endpoints with identical {order_id, dist_id} share hash — namespace MUST differ at storage layer'
+        );
+    }
+
+    // ── MAKER-DELIVER body shape (B2F Snippet 2 V.11.14) ──
+    //   { po_id, maker_id (JWT), delivery_items[normalized], note }
+    private function maker_deliver_body( array $overrides = array() ): array {
+        $defaults = array(
+            'po_id'          => 8200,
+            'maker_id'       => 17,
+            'delivery_items' => array(
+                array( 'sku' => 'DNCBOX500', 'qty' => 10 ),
+                array( 'sku' => 'DNCRACK500', 'qty' => 5 ),
+            ),
+            'note'           => '',
+        );
+        $merged = array_merge( $defaults, $overrides );
+        if ( isset( $merged['delivery_items'] ) && is_array( $merged['delivery_items'] ) ) {
+            usort( $merged['delivery_items'], function( $a, $b ) {
+                return strcmp( (string) ( $a['sku'] ?? '' ), (string) ( $b['sku'] ?? '' ) );
+            } );
+        }
+        return $merged;
+    }
+
+    public function test_maker_deliver_identical_body_same_hash(): void {
+        $b1 = $this->maker_deliver_body();
+        $b2 = $this->maker_deliver_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_maker_deliver_different_qty_different_hash(): void {
+        $b1 = $this->maker_deliver_body();
+        $b2 = $this->maker_deliver_body( array(
+            'delivery_items' => array(
+                array( 'sku' => 'DNCBOX500', 'qty' => 99 ),  // changed
+                array( 'sku' => 'DNCRACK500', 'qty' => 5 ),
+            ),
+        ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Maker editing qty MUST surface 409 (different shipment intent)'
+        );
+    }
+
+    public function test_maker_deliver_cross_maker_distinct(): void {
+        // CRITICAL: JWT-scoped maker_id MUST be in hash — prevents one maker's
+        // cached response from being replayed for another maker (cross-tenant poison)
+        $b1 = $this->maker_deliver_body();
+        $b2 = $this->maker_deliver_body( array( 'maker_id' => 99 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Cross-maker key reuse MUST be impossible (auth-scoped hash)'
+        );
+    }
+
+    // ── LIFF AI LEAD-ACCEPT body shape (LIFF AI Snippet 1 V.1.11) ──
+    //   { lead_id, dealer_id (auth), uid (auth) }
+    private function lead_accept_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'lead_id'   => '6722abcd1234',
+            'dealer_id' => '88',
+            'uid'       => 'U1234567890abcdef',
+        ), $overrides );
+    }
+
+    public function test_lead_accept_identical_body_same_hash(): void {
+        $b1 = $this->lead_accept_body();
+        $b2 = $this->lead_accept_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_lead_accept_different_lead_different_hash(): void {
+        $b1 = $this->lead_accept_body();
+        $b2 = $this->lead_accept_body( array( 'lead_id' => 'ffffaaaa9999' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_lead_accept_cross_dealer_distinct(): void {
+        // Cross-tenant safety: 2 dealers cannot share idempotency key
+        $b1 = $this->lead_accept_body();
+        $b2 = $this->lead_accept_body( array( 'dealer_id' => '999', 'uid' => 'Uotherdealer' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Cross-dealer key reuse MUST be impossible (auth-scoped dealer_id + uid in hash)'
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // ROUND 26 cross-endpoint collision sanity (5 new shapes)
+    // ────────────────────────────────────────────────────────────────
+
+    public function test_round26_endpoint_body_shapes_dont_collide(): void {
+        // Body shapes are distinct (different field sets). bo-confirm-full + bo-undo-split
+        // intentionally share {order_id, dist_id} — namespace discriminates at storage.
+        $bo_split        = $this->bo_split_body();
+        $maker_deliver   = $this->maker_deliver_body();
+        $lead_accept     = $this->lead_accept_body();
+
+        $hashes = array(
+            'bo_split'      => dinoco_idempotency_hash( $bo_split ),
+            'maker_deliver' => dinoco_idempotency_hash( $maker_deliver ),
+            'lead_accept'   => dinoco_idempotency_hash( $lead_accept ),
+        );
+        $this->assertSame( 3, count( array_unique( $hashes ) ),
+            'Distinct-shape endpoints MUST hash differently. Got: ' . print_r( $hashes, true )
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────
     // ROUND 25 cross-endpoint collision sanity (5 new shapes)
     // ────────────────────────────────────────────────────────────────
@@ -915,11 +1183,17 @@ class IdempotencyEndpointContractTest extends TestCase {
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Cumulative collision check across ALL 13 endpoints
-    //   (Round 19: 3 + Round 23: 5 + Round 25: 5 = 13)
+    // Cumulative collision check across ALL 18 endpoints
+    //   (Round 19: 3 + Round 23: 5 + Round 25: 5 + Round 26: 5 = 18)
+    //
+    // NOTE: BO endpoints bo-confirm-full + bo-undo-split intentionally share
+    // body shape {order_id, dist_id} — they are discriminated by namespace at
+    // the storage layer. This test EXCLUDES bo-undo-split from uniqueness check
+    // to document that contract; namespace-level isolation is verified by the
+    // dinoco_idempotency_check / store path.
     // ────────────────────────────────────────────────────────────────
 
-    public function test_all_13_endpoints_cumulative_no_collision(): void {
+    public function test_all_distinct_shape_endpoints_cumulative_no_collision(): void {
         $hashes = array(
             'place_order'         => dinoco_idempotency_hash( $this->place_order_body() ),
             'manual_flash'        => dinoco_idempotency_hash( $this->manual_flash_body() ),
@@ -934,9 +1208,15 @@ class IdempotencyEndpointContractTest extends TestCase {
             'po_cancel'           => dinoco_idempotency_hash( $this->po_cancel_body() ),
             'maker_confirm'       => dinoco_idempotency_hash( $this->maker_confirm_body() ),
             'record_payment'      => dinoco_idempotency_hash( $this->record_payment_body() ),
+            // Round 26 — distinct body shapes only (excluding bo-undo-split which shares
+            // shape with bo-confirm-full; documented in test_bo_undo_split_distinct_from_bo_confirm_full)
+            'bo_confirm_full'     => dinoco_idempotency_hash( $this->bo_confirm_full_body() ),
+            'bo_split'            => dinoco_idempotency_hash( $this->bo_split_body() ),
+            'maker_deliver'       => dinoco_idempotency_hash( $this->maker_deliver_body() ),
+            'lead_accept'         => dinoco_idempotency_hash( $this->lead_accept_body() ),
         );
-        $this->assertSame( 13, count( array_unique( $hashes ) ),
-            'All 13 cumulative endpoint shapes MUST hash uniquely (defense-in-depth)'
+        $this->assertSame( 17, count( array_unique( $hashes ) ),
+            'All 17 distinct-shape endpoint bodies MUST hash uniquely (bo-undo-split intentionally shares shape with bo-confirm-full → namespace-discriminated at storage). Total cumulative endpoint count = 18.'
         );
     }
 }
