@@ -372,18 +372,143 @@ return $res;
 - **`[Admin System] DINOCO Global Inventory Database` V.45.3** — `dip-stock/approve` (Round 27)
 - **`[LIFF AI] Snippet 1` V.1.11** — `lead/{id}/accept` (Round 26)
 
-**Status**: 28/75+ POST endpoints integrated (~37% of mutating REST surface).
+**Status**: 🎯 **59/196 POST endpoints integrated (30.1% — Round 34 TRUE 30% milestone)** against authoritative Round 30 census denominator. Past 3/10 of mutating REST surface.
 
-Cumulative test coverage: 106 contract test cases (3-9 per endpoint depending
-on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php`.
+Cumulative test coverage: **236 contract test cases** (3-9 per endpoint depending on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php` plus 6 fixture-based round files (`IdempotencyRound29Test.php` ... `Round34Test.php`).
 
 **Tracker**: see [`docs/audit/IDEMPOTENCY-COVERAGE.md`](../audit/IDEMPOTENCY-COVERAGE.md) for the full list of integrated + pending endpoints + recommended next picks.
 
-**Recommendation**: Continue with `combined-slip-upload` / `combined-invoice-gen` /
-`recalculate-total` / `delete-ticket` / `import-distributors` in Round 29 if no
-production issues observed. Pivot candidates: Sentry canary observation / Vite
-LIFF bundle staging / B2F CPT final drop (target 2026-05-02 day 14 from
-Phase 4 migration).
+**Recommendation**: Round 35 candidates = MCP cluster (`dashboard-inject-metrics` +
+`lead-attribution` + `inventory-changed` + `kb-updated` + `product-compatibility`).
+Pivot candidates: Sentry canary observation / Vite LIFF bundle staging / B2F CPT
+final drop. 50% milestone (~98 endpoints) realistic timeline Round 50+.
+
+## Round 18-34 case study patterns
+
+After 17 rounds (18, 19, 23, 25-34) of incremental integration across 59 endpoints
+spanning 4 namespaces (B2B / B2F / inventory / MCP), 5 distinct patterns
+have crystallized. Each is the wrapper composition for a specific class of
+endpoint — pick the right pattern for your endpoint shape to keep contract tests
+clean and replay semantics correct.
+
+### Pattern 1 — `single` (most common, ~40 of 59 integrated)
+
+Single semantic record, flat body. Most place-order / save / submit endpoints
+fall here. Hash includes flat fields only — no array iteration needed.
+
+**Reference impls**:
+- `POST /b2b/v1/place-order` (Round 19, Snippet 3 V.42.10) — `{gid, items, note, edit_ticket}` (edit_ticket boolean discriminates new vs edit retry)
+- `POST /b2f/v1/maker-confirm` (Round 25, Snippet 2 V.11.13) — JWT-scoped maker_id in hash for cross-tenant cache poison guard
+- `POST /b2f/v1/po-undo-submit` (Round 33, Snippet 2 V.11.19) — `user_id` from `get_current_user_id()` in hash; same key from different admins = different audit trail attribution → 409
+
+**Use when**: 1 record per call, no per-row arrays, no FSM transitions involved.
+
+### Pattern 2 — `bulk` (canonical-sort ARRAY, ~7 of 59 integrated)
+
+Body contains an array (items[], skus[], ids[]). MUST canonicalize order before
+hashing — admin reordering rows in UI ≠ different intent.
+
+**Reference impls**:
+- `POST /b2b/v1/bo-split` (Round 26, Snippet 16 V.3.4) — `splits[]` sort by sku
+- `POST /b2b/v1/bo-bulk-fulfill` (Round 27, Snippet 16 V.3.5) — `items[]` sort by bo_queue_id
+- `POST /b2b/v1/admin-submit-tracking` (Round 28, Snippet 3 V.42.13) — `entries[]` sort by ticket_id
+- `POST /b2b/v1/import-distributors` (Round 29, Snippet 9 V.34.1) — `rows[]` sort by gid + sanitize per-row + `dry_run` discriminator
+- `POST /b2f/v1/maker-deliver` (Round 26, Snippet 2 V.11.14) — `delivery_items[]` sort by sku
+
+**Use when**: client submits N rows in a single POST. Canonical sort key MUST
+be deterministic (numeric ID > string SKU > position-based last resort).
+
+### Pattern 3 — `bulk-of-targets` (1 entity + N notify targets)
+
+Single primary entity + array of secondary targets to notify/affect. Treat
+targets[] like bulk pattern (sort + dedup) but the cached response describes
+the primary entity outcome.
+
+**Reference impls**:
+- `POST /b2b/v1/admin-stock-unlock` (Round 28, Snippet 3 V.42.13) — 1 SKU primary + `notify_tickets[]` sort + dedup
+- `POST /b2b/v1/combined-slip-upload` (Round 29, Snippet 3 V.42.14) — 1 gid primary + `ticket_ids[]` sort+dedup + image_base64 EXCLUDED from hash (binary)
+
+**Use when**: 1 mutation, N side-effect targets. Cached response = "did the
+1 mutation succeed" + summary of side effects.
+
+### Pattern 4 — `state-machine` (FSM transition with terminal/already-target guard)
+
+Endpoint transitions FSM. Replays may hit "already in target state" guard
+(handler returns 400). Wrapper turns 400 into cached 200 — replay = "same answer
+to same question".
+
+**Reference impls**:
+- `POST /b2f/v1/po-complete` (Round 27, Snippet 2 V.11.15) — FSM `received → completed` is terminal; replay hits "already completed" but wrapper returns cached 200 with original `completed_at` timestamp
+- `POST /b2f/v1/approve-reschedule` (Round 28, Snippet 2 V.11.16) — boolean discriminator (approve/reject) doubles as FSM transition gate
+- `POST /b2b/v1/bo-confirm-full` (Round 26, Snippet 16 V.3.4) — `pending_stock_review → awaiting_confirm` transition; FSM blocks 2nd transition but Flex builder re-fires before FSM check (wrapper closes the gap)
+
+**Use when**: handler validates current state before transitioning, retry
+hits the validator and returns 400. Cached 200 replay > 400 noise.
+
+### Pattern 5 — `boolean-discriminator` + `enum-discriminator` (state flip caught by hash)
+
+Specialized pattern where a boolean (or small enum) field discriminates intent
+within an otherwise identical body. Critical: the field MUST be in the hash so
+replay with flipped value triggers 409 (admin changed mind) instead of silent
+state flip. Complements existing transient/lock-based dedup.
+
+**Reference impls**:
+- `POST /b2b/v1/distributor/toggle-bot` (Round 34, Snippet 9 V.34.2) — `bot_enabled` boolean in hash; complements 5s transient dedup which only protects rapid double-click. Replay >5s with same bot_enabled = idempotent; replay with flipped bot_enabled = 409.
+- `POST /dinoco-mcp/v1/distributor-notify` (Round 33, MCP V.2.6) — `type` enum (`new_lead` vs `follow_up`); same key + different type = different message format → 409 instead of replaying wrong Flex bubble shape.
+- `POST /dinoco-mcp/v1/brand-voice-submit` (Round 34, MCP V.2.7) — `sentiment` enum (positive/neutral/negative) in hash; sentiment edits between retries = different ML training signal → 409 instead of cached stale classification.
+
+**Use when**: endpoint has a boolean/enum that flips intent. Without the field
+in hash, silent replay corrupts state in ways the dedup guard (transient/FSM)
+can't see.
+
+## Anti-patterns spotted across rounds
+
+These showed up in code review across Rounds 19-34 — avoid them:
+
+### Anti-pattern A — Timestamps in cached body (bulk pattern)
+
+```php
+// BAD — bulk endpoint cached response includes server-side timestamp
+$resp = array(
+    'success' => true,
+    'results' => $results,
+    'ts'      => current_time( 'mysql' ),  // ⚠ STALE on replay 24h later
+);
+```
+
+**Surfaced in**: Round 26 bulk-array audit (caught before commit). Round 28
+bulk-of-targets pattern formalized exclusion of timestamp/random fields from
+cached response. **Fix**: cache only deterministic fields; let client read
+cached `_idem_code` if it needs to verify staleness.
+
+### Anti-pattern B — Non-canonical bulk array (admin reorder = false 409)
+
+```php
+// BAD — admin reordering rows in the UI between retries surfaces unexpected 409
+$idem_body = array( 'items' => $items );  // accepts any order
+```
+
+**Surfaced in**: Round 27 review (bo-bulk-fulfill / bo-bulk-cancel). Without
+canonical sort, admin clicking checkboxes in different order on 2nd attempt
+= different hash = 409 = confusing UX. **Fix**: `usort` by deterministic key
+before hashing. See Pattern 2 reference impls.
+
+### Anti-pattern C — Cross-namespace shape collision (defense-in-depth gap)
+
+```php
+// BAD — 2 different endpoints accept identical {ticket_id} body
+// place-order namespace + delete-ticket namespace both hash {ticket_id}
+// → same key reused across endpoints = stale cross-endpoint replay
+```
+
+**Surfaced in**: Round 29 dual-pattern (delete-ticket vs recalculate-total
+both take `{ticket_id}`). Round 33 maker-product vs maker pair (both have
+`id` field). Round 34 distributor-delete vs distributor-toggle-bot (both
+target distributor `id`). **Fix**: namespace prefix in cache key
+(`b2b/v1::delete-ticket` vs `b2b/v1::recalculate-total`) is the primary
+defense; cross-namespace pair guard tests in `IdempotencyRoundNNTest.php`
+prove hashes differ even within same canonical body shape (defense-in-depth).
+Each round file documents which pair guards apply to that round's batch.
 
 ## Anti-patterns
 
