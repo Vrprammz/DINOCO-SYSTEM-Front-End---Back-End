@@ -10,6 +10,76 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 31 (Idempotency batch 9 + cron audit follow-ups + drift detector expansion) (2026-04-30)
+
+Round 31 push toward **22.8% Idempotency-Key coverage** (44/193 POST endpoints) + closes 1 deferred cron audit item from Round 28 + adds F1-class drift regression guard. ZERO regressions across 606 PHPUnit + 160 Jest tests.
+
+#### Phase 1 — Idempotency batch 9 (5 endpoints)
+
+Pair-pattern integration with previously-shipped paired endpoints from Rounds 25/30:
+
+- **`POST /dinoco-mcp/v1/claim-manual-update`** — pair with `claim-manual-create` (Round 30). Body hash `{claim_id, status, case_type, tracking_number}`. notes excluded (chatbot whitespace tweaks → false 409). OpenClaw retry double-fire prevented.
+- **`POST /dinoco-mcp/v1/lead-update`** — pair with `lead-create` (Round 30). Body hash `{lead_id, status, updated_by, followup_at}`. notes excluded (each retry would APPEND with new timestamp — that's the bug we want to prevent).
+- **`POST /dinoco-stock/v1/product/pricing`** — admin tier price + discount dual-write. Body hash `{sku, discount_percent, price_silver/gold/platinum/diamond, category, moq, boxes_per_unit, units_per_box, b2b_visible}`. compatible_models excluded (large array, admin tweaks between retries). Selective save semantics preserved.
+- **`POST /dinoco-stock/v1/warehouse`** — warehouse CRUD (create/update). Body hash `{id, name, code, address, is_default, is_active}`. id discriminates create (id=0) vs update (id>0).
+- **`POST /b2f/v1/maker-reject`** — pair with `maker-confirm` (Round 25). Body hash `{po_id, maker_id (JWT), reason}`. JWT-scoped maker_id prevents cross-maker poison. Admin Flex push only fires on first call.
+
+Backward compat: missing `X-Idempotency-Key` header = byte-identical to V.45.4 / V.11.16 / V.2.4 behavior.
+
+Versions:
+
+- `[System] DINOCO MCP Bridge` V.2.4 → V.2.5
+- `[Admin System] DINOCO Global Inventory Database` V.45.4 → V.45.5
+- `[B2F] Snippet 2: REST API` V.11.16 → V.11.17
+
+Tests: `tests/helpers/IdempotencyRound31Test.php` — 17 fixture-based contract tests (5×3 cases + 2 collision guards). PHPUnit 589 → 606 (+17 tests). All 17 pass.
+
+#### Phase 2 — Cron audit follow-ups
+
+Round 28 cron drift report flagged 3 deferred items. Round 31 closes #1:
+
+- **#1 ✅ RESOLVED — Heartbeat key drift (`flash_category_verify`)**:
+  Health Monitor V.1.3 reader checked legacy key `_dinoco_cron_flash_category_verify_cron_last_run` (leading underscore + double `_cron_` suffix), but Snippet 1 V.34.x writer uses canonical `dinoco_cron_flash_category_verify_last_run`. Drift caused `verify_cron_stale_*min` warning to fire perpetually even when cron healthy.
+  Fix in V.1.4: reader uses fallback chain (canonical first, legacy second). Snippet 1 NOT modified per CLAUDE.md sensitive-snippet rule (V.34.25).
+- **#2 ⏸ Still deferred — Single-event cron observability**: no concrete bug surfaced. Cost-benefit doesn't justify per-event tracking infrastructure.
+- **#3 ⏸ Still deferred — Cron interval consistency**: cosmetic only. Consolidation would touch 3 sensitive snippets including Snippet 1 (forbidden).
+
+Versions: `[Admin System] DINOCO Health Monitor` V.1.3 → V.1.4
+
+#### Phase 3 — Drift detector expansion (8 → 9)
+
+NEW `tests/jest/idempotency-tracker-drift.test.js` — F1-class regression guard. Round 29 drift sweep discovered F1 HIGH bug: tracker listed `bo-fulfill` as integrated but actual code had ZERO `dinoco_idempotency_check` wrapper. The same drift could recur for any future endpoint if tracker entry is committed before wrapper code lands.
+
+This detector parses IDEMPOTENCY-COVERAGE.md "Integrated endpoints" table, extracts (endpoint, snippet_filename) tuples, then asserts:
+
+1. Tracker has ≥1 integrated row (smoke test)
+2. Every tracker row resolves to a real snippet file in repo
+3. Every claimed file contains `dinoco_idempotency_check` (F1-class catch)
+4. Every endpoint suffix appears in a `register_rest_route` or namespace marker within its claimed file (catches mis-attributed entries)
+
+If this detector had existed at Round 19, the bo-fulfill F1 bug would have been caught immediately upon tracker commit. Jest 156 → 160 (+4 new).
+
+#### Phase 4 — IDEMPOTENCY-COVERAGE.md tracker sync
+
+- 39 → 44 integrated endpoints (5 added: claim-update + lead-update + pricing + warehouse + maker-reject)
+- Annotated pre-Round 30 milestones (25%/30%/35%/40%/45%) with "estimated denominator stale" warning since they were calculated against the obsolete ~75 estimate
+- Added true-coverage milestones (10% Round 26, 15% Round 28, 20.2% Round 30, **22.8% Round 31**)
+- Added forward targets (25% Round 32, 30% Round 34, 50% future)
+- 183 cumulative contract tests across 9 rounds (Rounds 19-31)
+- 43 distinct body-shape hashes asserted
+
+#### Round 32 recommendation
+
+Pick batch 10 to reach true 25% milestone (need +5 endpoints to 49/193 = 25.4%). Suggested:
+
+- `POST /b2f/v1/maker-reschedule` — Maker LIFF retry
+- `POST /b2b/v1/manual-flash-test` — Flash test endpoint
+- `POST /b2b/v1/bo-update-eta` — Admin ETA edit
+- `POST /b2b/v1/bo-restock-scan` — Manual cron trigger
+- `POST /b2f/v1/reject-lot` — QC reject path
+
+---
+
 ### Feature — Round 30 (Idempotency batch 8 + F1 drift fix + REST endpoint census) (2026-04-30)
 
 Round 30 closes 2 high-priority Round 29 drift findings (F1 HIGH bo-fulfill drift + F3 MEDIUM REST endpoint count drift) + extends Idempotency-Key infrastructure to 5 new POST endpoints. **Cumulative: 39 integrated endpoints** with new authoritative denominator established. ZERO regressions across 589 PHPUnit + 156 Jest tests.
