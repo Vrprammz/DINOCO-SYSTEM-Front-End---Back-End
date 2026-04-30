@@ -10,6 +10,63 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Docs — Round 20 FINAL polish (CLAUDE.md drift sweep + README polish + retrospective doc) (2026-04-29)
+
+After Round 19 explicitly recommended deferring further endpoint integration until 1-2 weeks production canary observed, Round 20 = pure docs sync + verification only. Risk NONE on every item. ZERO source code changes.
+
+#### ITEM A — CLAUDE.md drift sweep
+
+- Added new top-level entry **Idempotency-Key Helper + Endpoint Integration (V.1.0, Rounds 18-19)** documenting Idempotency Helper foundation + 3 endpoint wirings (place-order V.42.10, manual-flash-create V.42.10, create-po V.11.11) + body hash semantics + DD-3 composite merge correctness + future deferral note.
+- Added new top-level entry **Test Infrastructure Growth (Rounds 1-19)** summarizing cumulative metrics (0 → 383 PHPUnit + 0 → 146 Jest, 22 Mermaid diagrams, 7 drift detectors, 21 helper test classes, established patterns) + retrospective doc reference.
+- Added NEW REST API section **Idempotency Helper — `dinoco/v1/idempotency*`** (2 endpoints) listing list + cleanup + 3 integrating handlers.
+
+#### ITEM B — README polish
+
+- Test count badges updated: PHPUnit `363_passing` → `383_passing` (current count). NEW Jest badge `146_passing`. NEW Mermaid Diagrams badge `22`.
+- "What's New (2026-04-29)" section added — summarizes Rounds 13-19 with retrospective link.
+- Architecture overview adds "22 Mermaid diagrams" line referencing WORKFLOW-REFERENCE.md.
+- Test counts table updated: PHPUnit Unit `211 (13 files)` → `383 (21 files)` listing all test classes. Total `508` → `680`.
+
+#### ITEM C — Final health check
+
+- **PHPUnit**: 383 tests, 579 assertions. All green. Runtime ~7ms. PHP 8.5.4. (1 deprecation — pre-existing).
+- **Jest**: 19 suites, 146 passed, 2 skipped. All green. Runtime ~1.2s.
+- **PHP `php -l`**: validated 5 critical snippets (Snippet 3 V.42.10, B2F Snippet 2 V.11.11, Idempotency Helper V.1.0, Flag Audit Log V.1.0, Snippet 5 V.33.4) — zero syntax errors.
+- **Markdown lint**: `markdownlint-cli2` shows pre-existing line-length + table-style warnings on README + CLAUDE.md (no `.markdownlint.json` config present — defaults). Pattern matches existing convention; no new violations introduced.
+
+#### ITEM D — NEW retrospective doc
+
+- **NEW `docs/audit/ROUNDS-1-19-RETROSPECTIVE.md`** (~280 lines) — cumulative summary of 19 rounds:
+  - Round-by-round one-line summary table (Round 1-19)
+  - Cumulative metrics (tests / coverage / diagrams / drift detectors)
+  - Audit findings closed (10+ CRIT / 24+ HIGH / 40+ MED / 20+ LOW)
+  - 5 patterns established (event delegation / cache priming / data-attr scoping / function_exists guards / Idempotency wrapper) with code snippets
+  - Lessons learned (what worked / what didn't / tradeoffs)
+  - Pending items snapshot for next session (deferred / open low-priority / risks tracked)
+  - File tree snapshot of `tests/` + drift detectors
+  - Cross-links to ARCHITECTURE-STATUS, CHANGELOG, CLAUDE, AUDIT-REPORT, tests/README
+
+#### Cumulative impact (Rounds 1-19, FINAL snapshot before Round 20)
+
+- Tests: 0 → 383 PHPUnit + 0 → 146 Jest = **529 tests** (+529 across 19 rounds)
+- Mermaid diagrams: 0 → 22
+- Drift detectors: 0 → 7
+- Helper test classes: 0 → 21
+- Audit findings closed: 39+ (UX-H3, onerror sweeps, PERF guards, Flag Audit Log, **Idempotency-Key Foundation + 3 endpoint integrations**, etc.)
+- Production breaks: **ZERO** across all 19 rounds
+
+#### Files Touched (Round 20, 4 total)
+
+- `CLAUDE.md` — 2 new entries + 1 new REST endpoint section
+- `README.md` — 3 new badges + What's New section + test count table
+- `CHANGELOG.md` — Round 20 entry (this section)
+- `docs/audit/ROUNDS-1-19-RETROSPECTIVE.md` — NEW file (~280 lines)
+
+#### Risk
+
+- **NONE** — pure docs sync + verification, ZERO source code changes, ZERO test changes
+- All test suites still green after edits (verified via re-run)
+
 ### Fix — Round 19 (Idempotency-Key endpoint integration + +20 contract tests) (2026-04-29)
 
 After Round 18 closed Idempotency-Key foundation (NEW snippet + helpers + 25 unit tests), Round 19 wires the helper into 3 critical POST endpoints — the highest dup-risk surface area: `place-order` (B2B mobile LIFF), `manual-flash-create` (RPi warehouse Wi-Fi), and `create-po` (B2F admin LIFF). All wrapping is additive — clients without `X-Idempotency-Key` header behave identical to V.42.9 / V.11.10.

@@ -7,7 +7,9 @@
 [![Regression Guard](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml/badge.svg?branch=main)](https://github.com/Vrprammz/DINOCO-SYSTEM-Front-End---Back-End/actions/workflows/regression-guard.yml)
 [![Coverage Lines](https://img.shields.io/badge/jest_coverage_lines-98.68%25-brightgreen)](coverage/jest/index.html)
 [![Coverage Branches](https://img.shields.io/badge/jest_coverage_branches-85.09%25-green)](coverage/jest/index.html)
-[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-363_passing-brightgreen)](tests/helpers/)
+[![PHPUnit Tests](https://img.shields.io/badge/phpunit_tests-383_passing-brightgreen)](tests/helpers/)
+[![Jest Tests](https://img.shields.io/badge/jest_tests-146_passing-brightgreen)](tests/jest/)
+[![Mermaid Diagrams](https://img.shields.io/badge/mermaid_diagrams-22-blue)](WORKFLOW-REFERENCE.md)
 
 WordPress-based motorcycle warranty management platform serving B2C members and B2B distributors.
 
@@ -18,6 +20,20 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 - **Authentication**: LINE Login (OAuth2) creates/links WordPress users.
 - **AI Module**: Gemini Flash + Claude (chatbot) + Gemini (admin AI control panel).
 - **Integrations**: LINE push notifications, Flash Express shipping, Slip2Go (Thai bank slip verification), Telegram alerts.
+- **Documentation**: 22 Mermaid diagrams (`WORKFLOW-REFERENCE.md`) cover B2B order, B2F PO sequence, Walk-in stateDiagram, MCP Bridge, Brand Voice, member warranty, etc.
+
+## What's New (2026-04-29)
+
+Recent infrastructure rounds (Rounds 13-19):
+
+- **Round 19** — Idempotency-Key integrated on 3 critical POST endpoints (place-order, manual-flash-create, create-po). +20 contract tests.
+- **Round 18** — Idempotency Helper foundation V.1.0 (NEW snippet, 5 functions, 25 unit tests). +18 IsTopLevelSet test cases.
+- **Round 17** — MCP Bridge architecture + Brand Voice flow diagrams. +37 unit tests (intent breakdown + validate hierarchy).
+- **Round 16** — Walk-in stateDiagram + B2F PO sequenceDiagram. Master regression manifest index.
+- **Round 15** — `update_meta_cache` `function_exists` guards (7 snippets, 11 call sites). 2 sequence diagrams.
+- **Cumulative**: 0 → 383 PHPUnit tests + 0 → 146 Jest tests + 0 → 22 Mermaid diagrams + 0 → 7 drift detectors. ZERO regressions.
+
+See [docs/audit/ROUNDS-1-19-RETROSPECTIVE.md](docs/audit/ROUNDS-1-19-RETROSPECTIVE.md) for full retrospective.
 
 ## Documentation
 
@@ -82,11 +98,11 @@ Covers cart state machine, REST client, LIFF auth, modal bridge — all pure-fun
 
 | Suite | Tests | Runtime | Surface |
 |---|---|---|---|
-| PHPUnit Unit | 211 | < 5s | Pure-logic helpers (math/policy) — 13 test files |
+| PHPUnit Unit | 383 | < 5s | Pure-logic helpers (math/policy) — 21 test files (Currency, Hierarchy, IsTopLevelSet, IntentBreakdown, ValidateSkuHierarchy, V70SourceSku, FlashEcSuggester, DiscountTier, BoxCalc, BoQty, ShippingResolve, OrderSnapshot, FlashSign, FlagAudit, Idempotency, IdempotencyEndpointContract, +5 more) |
 | PHPUnit Integration | 51 | ~1 min | DB-coupled (FOR UPDATE, GET_LOCK, FSM, REST) |
 | Jest | 146 | < 2s | LIFF foundation + OpenAPI + links + secrets + dangerous-APIs + PHP security + 7 drift detectors (api-contract / JSDoc / DB_ID / shortcode / constants / feature-flags / REST endpoints) |
 | Playwright E2E | 25 × 4 projects | ~9s | Cart + API client + place-order + modal + liff-init + Vite-built bundle smoke in 4 browsers |
-| **Total** | **508** | | |
+| **Total** | **680** | | |
 
 ### Coverage (Jest)
 
