@@ -10,6 +10,76 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Test + Refactor — Round 11 (onerror migration + REST drift detector + unit test expansion) (2026-04-30)
+
+3 commits closing low-priority polish + safety nets queued for a long time. Risk: LOW (UX-equivalent refactor) + NONE (additive tests).
+
+**ITEM A — onerror img fallback delegation (`rpi-print-server/templates/manual_ship.html`)**
+
+Survey result: 1 site remaining across entire repo (PHP files: 0 sites — already CSP-clean across all snippets after Rounds 6-9 closed onclick patterns 100%). The lone site was at line 1280 — picker thumbnail with inline `onerror="this.style.display='none';this.parentNode.textContent='📦'"`.
+
+- Pattern: `onerror=...` → `data-img-fallback="emoji"` + capture-phase event delegation.
+- CRITICAL: `error` events do NOT bubble for `<img>` — listener uses `addEventListener('error', ..., true)` capture phase (essential, not optional).
+- Loop guard: clear `data-img-fallback` before mutation to prevent re-fire if fallback path itself errors.
+- Manual_ship V.44.3 → V.44.4 with bullet in HTML header comment.
+- JS validated via `new Function()` parse check (passed clean).
+
+**ITEM B — REST endpoints drift detector (`tests/jest/rest-endpoints-drift.test.js`, NEW, 327 LOC)**
+
+6th drift detector after shortcode / feature-flags / constants / DB_ID / markdown-links / jsdoc-endpoint-refs. Cross-checks all documented `/wp-json/<ns>/v1/<path>` mentions in CLAUDE.md against actual `register_rest_route()` registrations across snippet files. 125+ endpoints in 7 namespaces — easy to add new endpoint without doc update.
+
+Detector handles 3 register_rest_route patterns:
+
+- A) Direct: `register_rest_route('NS/v1', '/path', ...)`
+- B) Variable: `$ns = 'NS/v1';` + `register_rest_route($ns, '/path', ...)` (B2F)
+- C) Constant: `define('B2F_AUDIT_NS', 'dinoco-b2f-audit/v1');` + `register_rest_route(B2F_AUDIT_NS, '/path', ...)` (Audit dashboard).
+  - **CRITICAL bug fix during dev**: const name char class must include digits `[A-Z0-9_]+` because `B2F_AUDIT_NS` contains `2`. The `[A-Z_]+` form silently failed all const matches — would have shipped a broken detector.
+
+Doc extraction handles 3 patterns:
+
+- A) "Under `/wp-json/NS/v1/`: `path1`, `path2`, ..."
+- B) "All under `/wp-json/NS/v1/`: ..."
+- C) Bullet style with backtick path `GET /drift` after a namespace banner. **Namespace context resets** on heading boundaries (lines starting with `##` or `###`) and after 3+ blank lines — prevents bleed across sections (initial run had GDPR section bullets discussing `/b2b/v1/rpi-products` mistakenly tagged dinoco-gdpr/v1).
+
+Path-equivalence: registered routes with `(?P<id>\d+)` parameter capture canonicalize to `:param`. Documented forms often omit the param suffix (e.g. doc `maker-products` vs reg `maker-products/(?P<maker_id>\d+)`). Detector emits both exact + base-path tuples so omitted-suffix doc forms still match.
+
+Initial run revealed 17 candidates → narrowed to 1 actionable mismatch:
+
+- `b2b/v1::manual-reprint` — V.41.0 changelog says "via RPi print queue" but actual implementation is `/api/manual-reprint-label` in RPi Flask dashboard (not WP REST). Added to `DOCUMENTED_NOT_REGISTERED` allowlist with explanatory comment as audit trail.
+
+Result: 4 tests pass (sanity + diff + allowlist non-shadow). Full Jest suite: **19/19 suites + 146 tests pass + 2 skipped**.
+
+**ITEM C — Unit test expansion (`tests/helpers/OrderModeLabelTest.php` + `tests/helpers/ItemBreakdownTest.php`, NEW, +439 LOC)**
+
+Expands tests/helpers/ from 131 → 170 cases (39 new). Two pure-logic helpers used heavily across V.7.0 Order Intent System + V.6.4 DD-3 Shared Child support — both previously without dedicated unit test coverage.
+
+- **OrderModeLabelTest (22 cases)** — `b2f_order_mode_label($mode, $currency)` from [B2F] Snippet 1 §100.5 (V.7.0+).
+  - 5 modes × 3 currencies = 15 happy-path cases (full_set, sub_unit, single_leaf official + raw_parts, partial_replenish legacy)
+  - default currency THB when omitted, em-dash fallback for unknown/empty/null mode (language-neutral), `(string)` cast guard for numeric/boolean modes, unknown currency falls back to English.
+  - Locks UX integrity: feeds Mode Badge UI in 5 places (Maker LIFF Snippet 4, PO Ticket Snippet 9, PO Image Snippet 10, Admin LIFF Snippet 8 SET Detail, Admin Dashboard Orders tab Snippet 5). Regression = silent UX bug (wrong language).
+- **ItemBreakdownTest (17 cases)** — `b2f_get_item_breakdown($item)` from [B2F] Snippet 1 §511 (V.6.4+).
+  - empty/null/string input → empty array
+  - JSON valid + sum invariant (sum(qty) === poi_qty_ordered) → return parsed
+  - JSON sum mismatch → fallback to single-entry from poi_parent_sku
+  - JSON malformed / object-not-array / empty-array → fallback (no exception)
+  - fallback uses `__standalone__` marker when no poi_parent_sku, trims whitespace
+  - intval coercion for string qty values, negative qty allowed when sum balances
+  - 1/2/3-parent breakdown (DD-3 shared across multiple SETs)
+  - Locks DD-3 sum-invariant: a leaf SKU in 2+ SETs records per-SET qty distribution. Sum invariant violation = silent corruption in manufacturing summary.
+
+Both helpers re-implemented inline (mirroring snippet body modulo WP helper calls — same pattern as CurrencyTest + BoxCalcTest already in suite). When snippets split into composer packages, swap to `require` + real source.
+
+phpunit run: **170 tests pass, 261 assertions, 0 failures** (1 pre-existing deprecation warning — non-blocking, predates Round 11).
+
+**Round 11 totals**:
+
+- 3 commits, +789/-2 LOC across 4 files (1 modified, 3 new tests)
+- 1 onerror site closed (last in repo); PHP files now 100% CSP-clean
+- 1 NEW drift detector (6 → 7 detectors total)
+- 39 NEW unit test cases (131 → 170 in tests/helpers/)
+- Test suite total: **19 jest suites (146 tests)** + **170 phpunit tests** = 316 tests + 2 skipped, all green
+- Risk: LOW (UX-equivalent refactor) + NONE (additive tests). Zero production code touched in items B + C.
+
 ### Docs + Lint — Round 10 (Drift detector audit + BO Cron Lifecycle + Slip Replay Pool diagrams) (2026-04-30)
 
 3 files closing drift detector audit + 2 new flow diagrams. Risk: LOW (drift whitelist documentation entry) + NONE (docs).
