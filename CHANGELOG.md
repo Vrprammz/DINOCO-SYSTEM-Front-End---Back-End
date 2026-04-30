@@ -10,6 +10,80 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Refactor + Docs — Round 8 UX-H3 Phase 5 (dynamic compound delegation) + B2B/B2F lifecycle Mermaid (2026-04-30)
+
+2 commits closing 1 UX-H3 batch + 1 docs gap. Risk: LOW-MEDIUM (UX-H3 dynamic) + NONE (docs).
+
+**ITEM A — UX-H3 Phase 5: dynamic compound onclick delegation (B2F Snippet 5 V.8.4 → V.8.5, commit `d55810c`)**
+
+~30 onclick sites migrated across 3 modules — leverages existing card root `data-*` attributes for arg passing, eliminates inline-encoded args + `esc()/replace(/'/g,...)` escapes for Thai PO numbers + maker names.
+
+**Orders module (~22 sites)**:
+
+- 7 static buttons: `orders-open-create-modal`, `orders-bulk-select-all`, `orders-open-bulk-cancel-modal`, `orders-submit-create-po`, `orders-submit-receive`, `orders-submit-payment`, `orders-execute-bulk-cancel`
+- Outer card click: `orders-go-to-ticket` (reads `data-po-id` from card root)
+- 2 stopProp+fn: `orders-card-checkbox` + `orders-card-cancel`
+- 8 PO action buttons: `orders-card-detail/edit/resubmit/receive/reject-lot/pay/complete/reorder` (read PO id+number from `.b2f-po-card[data-po-id]` ancestor via `_readPoFromCard` helper)
+- 1 stopProp wrapper: `orders-stop-prop-noop` on `.b2f-po-actions` (no-op handler catches gap clicks — defense-in-depth)
+- Pagination: 3 sites (`orders-page` + `data-page`)
+- Qty stepper: 2 sites (`orders-adjust-qty` + `data-delta`)
+
+**Makers module (~9 sites)**:
+
+- 3 maker card buttons: `makers-card-edit/products/delete` (read m.id/m.name/m.currency from `.b2f-maker-card[data-mid]` via `_readMakerFromCard`)
+- Confirm-all banner: `makers-confirm-all` + `data-mid`
+- Confirm-pill: `makers-confirm-sku` + `data-mid+data-sku`
+- Jump-to-primary span: `makers-jump-to-primary` + `data-jump-id+data-sku`
+- Delete-product button: `makers-delete-product` + `data-pid+data-sku`
+- Add-missing-leaves: `makers-add-missing-leaves` + `data-top-sku`
+- Remove-price-item: `makers-remove-price-item` + `data-sku`
+- Remove-blacklist: reads from existing `.bl-item[data-mid][data-sku]` ancestor (already had data attrs from V.6.5)
+
+**Credit module (~4 sites)**:
+
+- 4 credit card buttons: `credit-card-history/payment/unlock/hold` (read m.id/m.name/debt from `.b2f-credit-card[data-mid]` via `_readCreditFromCard`)
+
+**Pattern**: `closest('[data-action]')` walks UP from event target — child action buttons match BEFORE outer card, so card's go-to-ticket fires only when click hits non-action area (PO number, badges, meta). Defense-in-depth: `orders-stop-prop-noop` wrapper on `.b2f-po-actions` catches gap/padding clicks.
+
+**Behavior preservation**: identical function calls + arg semantics. Async functions (cancelPO/resubmitPO/rejectLot/completePO) work fire-and-forget. PHP lint clean.
+
+**Cumulative tally**: 19 (P1) + 24 (P2) + 20 (P3) + 19 (P4) + ~30 (P5) = **~112 of 124** UX-H3 sites migrated (~90%). Remaining ~12 sites: deferred dynamic stopProp on SET header structure (lines 3790/3816/3824) + onchange/oninput patterns (separate event class, not in UX-H3 scope).
+
+**ITEM B — Lifecycle Mermaid diagrams (WORKFLOW-REFERENCE.md, commit `8fbbb61`)**
+
+1 NEW + 1 EXPANDED stateDiagram-v2 — both verified 1:1 against actual code FSM `$transitions` arrays.
+
+**Section 2.5 NEW — B2B Order Lifecycle (Full FSM)**:
+
+- 16 states + 38 transitions covering legacy stock-check + walk-in + BO opaque-accept (`pending_stock_review` → `partial_fulfilled`) + cancel_request + change_request + claim flow
+- Includes "completed → cancelled" walk-in only edge
+- Atomic Guards section (V.1.8 Phase 4d Transaction Wrapper GET_LOCK + correlation_id chain)
+- Transition Rules Table mapped 1:1 with `B2B_Order_FSM::$transitions` (Snippet 14 V.1.8)
+- Multi-actor labels (`customer/admin/system/any`) per actual code
+
+**Section 4 UPDATED — B2F PO Lifecycle (renamed from "FSM Diagram (State Machine)")**:
+
+- Added 6 missing transitions per actual V.1.7 code:
+  - `delivering → delivering` (Maker ส่งของเพิ่ม self-loop)
+  - `partial_received → confirmed` (reject reship)
+  - `received → confirmed` (QC reject reship)
+  - `partial_paid → completed` (write-off)
+  - `partial_paid → cancelled` (rollback debt)
+  - `paid → cancelled` (admin cancel after payment)
+- Added Atomic Guards section (V.1.7 Phase 4d wrapper)
+- Multi-currency immutability note + cancel rollback semantics (stock_add per-leaf + payable_subtract THB × snapshot rate)
+
+**TOC updated** for renamed/new sections. Pure docs — no code touched.
+
+**Files touched (2)**:
+
+- `[B2F] Snippet 5: Admin Dashboard Tabs` V.8.4 → V.8.5 (210+ insertions / 40 deletions — UX-H3 Phase 5 + 3 helper functions)
+- `WORKFLOW-REFERENCE.md` (273 insertions / 55 deletions — section 2.5 NEW + section 4 expanded + TOC update)
+
+**Deferred to Round 9+**: 5 dynamic stopProp on SET header structure (lines 3790 toggleSet onclick + 3816 _stopInput template + 3824 set-inputs container) + onchange/oninput patterns (~10-15 sites, separate event class).
+
+---
+
 ### Refactor — Round 7 UX-H3 Phase 4 (stopProp + compound delegation) + PERF cache priming round 3 (2026-04-29)
 
 2 commits closing 2 audit items. Risk: LOW (additive same-behavior refactor + pure cache priming).
