@@ -364,23 +364,26 @@ return $res;
 
 ## Used in
 
-- **`[Admin System] DINOCO Idempotency Helper` V.1.0** (Round 18 foundation, 5 helpers + 25 unit tests)
-- **`[B2B] Snippet 3` V.42.9+** — `place-order`, `manual-flash-create`, `manual-flash-cancel`, `cancel-request` (Round 19 + 23 + 25)
-- **`[B2F] Snippet 2` V.11.10+** — `create-po`, `po-update`, `receive-goods`, `po-cancel`, `maker-confirm`, `record-payment`, `maker-deliver`, `po-complete` (Rounds 19/23/25/26/27)
+- **`[Admin System] DINOCO Idempotency Helper` V.1.1** (Round 18 foundation + Round 28 cron heartbeat — 5 helpers + 25 unit tests)
+- **`[B2B] Snippet 3` V.42.13** — `place-order`, `manual-flash-create`, `manual-flash-cancel`, `cancel-request`, `admin-stock-unlock`, `admin-stock-mark-oos`, `admin-submit-tracking` (Rounds 19/23/25/28)
+- **`[B2F] Snippet 2` V.11.16** — `create-po`, `po-update`, `receive-goods`, `po-cancel`, `maker-confirm`, `record-payment`, `maker-deliver`, `po-complete`, `approve-reschedule`, `reject-resolve` (Rounds 19/23/25/26/27/28)
 - **`[B2B] Snippet 5` V.33.5+** — `confirm-order`, `flash-create`, `update-status` (Round 23/25)
 - **`[B2B] Snippet 16` V.3.4+** — `bo-fulfill`, `bo-confirm-full`, `bo-split`, `bo-undo-split`, `bo-cancel-item`, `bo-bulk-fulfill`, `bo-bulk-cancel` (Round 19/26/27)
 - **`[Admin System] DINOCO Global Inventory Database` V.45.3** — `dip-stock/approve` (Round 27)
 - **`[LIFF AI] Snippet 1` V.1.11** — `lead/{id}/accept` (Round 26)
 
-**Status**: 23/75+ POST endpoints integrated (~31% of mutating REST surface).
+**Status**: 28/75+ POST endpoints integrated (~37% of mutating REST surface).
 
-Cumulative test coverage: 88 contract test cases (3-9 per endpoint depending
+Cumulative test coverage: 106 contract test cases (3-9 per endpoint depending
 on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php`.
 
-**Recommendation**: Continue bo-undo-split + similar single-button endpoints
-in Round 28 if no production issues observed. Pivot candidates: Sentry
-canary observation / Vite LIFF bundle staging / B2F CPT final drop (target
-2026-05-02 day 14 from Phase 4 migration).
+**Tracker**: see [`docs/audit/IDEMPOTENCY-COVERAGE.md`](../audit/IDEMPOTENCY-COVERAGE.md) for the full list of integrated + pending endpoints + recommended next picks.
+
+**Recommendation**: Continue with `combined-slip-upload` / `combined-invoice-gen` /
+`recalculate-total` / `delete-ticket` / `import-distributors` in Round 29 if no
+production issues observed. Pivot candidates: Sentry canary observation / Vite
+LIFF bundle staging / B2F CPT final drop (target 2026-05-02 day 14 from
+Phase 4 migration).
 
 ## Anti-patterns
 
