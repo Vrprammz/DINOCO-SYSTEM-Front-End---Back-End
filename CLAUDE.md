@@ -56,7 +56,7 @@ DINOCO System is a **WordPress-based motorcycle warranty management platform** s
 
 ## REST API Endpoints
 
-**125+ REST endpoints across 7 namespaces** (verified by `AUDIT-REPORT-2026-04-17.md` §Repo Map). Breakdown: `/b2b/v1/` ~30 + `/b2f/v1/` 21 + `/dinoco-stock/v1/` 11 + `/dinoco-b2f-audit/v1/` ~17 + `/liff-ai/v1/` 13 + `/dinoco-mcp/v1/` 32 + `/dinoco/v1/` 1. Detailed per-namespace list below.
+**334 register_rest_route calls across 12 namespaces** (verified by Round 30 census `docs/audit/REST-ENDPOINT-CENSUS-2026-04-30.md`, supersedes April-17 audit's 125+ claim). Breakdown: `/b2b/v1/` 128 (84 POST + 44 GET) + `/dinoco-stock/v1/` 42 + `/dinoco-mcp/v1/` 32 + `/b2f/v1/` 29 + `/dinoco-b2f-audit/v1/` 22 + `/dinoco/v1/` 22 + `/dinoco-slip/v1/` 15 + `/liff-ai/v1/` 13 + `/dinoco-flash-golive/v1/` 10 + `/dinoco-gdpr/v1/` 10 + `/brand-voice/v1/` 7 + `/dinoco-export/v1/` 4. Total POST endpoints: **193** (idempotency-coverage denominator). Detailed per-namespace list below.
 
 ## REST API Endpoints (B2B)
 
