@@ -1,5 +1,14 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.16 (2026-04-30) — Round 28: Extend Idempotency-Key support to 2 admin endpoints:
+ *   approve-reschedule + reject-resolve. approve-reschedule body hash = {po_id, approved, note} —
+ *   approved flag discriminates approve vs reject (different intents on same PO). reject-resolve body
+ *   hash = {rcv_id, action, note} — action enum (replacement/reship/write_off) has different financial
+ *   impact (replacement creates new PO, write_off marks debt forfeit). Both endpoints protect against
+ *   slow-Flex-push double-clicks where 2nd request hits NO_PENDING / ALREADY_RESOLVED. Existing
+ *   GET_LOCK on reject-resolve covers short-window concurrency; wrapper extends to 24h replay window.
+ *   Backward compat: missing X-Idempotency-Key = byte-identical V.11.15 behavior. Pattern proven
+ *   across 13 B2F endpoints (Round 19/23/25/26/27).
  * Version: V.11.15 (2026-04-30) — Round 27: Extend Idempotency-Key support to po-complete.
  *   Admin "ปิด PO" button (used for sample/free PO that skips payment flow). Double-click on
  *   slow Flex push → 2nd request fails at FSM (status='completed' = invalid transition target)
@@ -4640,6 +4649,38 @@ if ( ! function_exists( 'b2f_rest_approve_reschedule' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ PO', 'code' => 'MISSING_PO' ), 400 );
         }
 
+        // ── V.11.16 Round 28: Idempotency-Key support ──
+        // Admin clicks "อนุมัติ"/"ปฏิเสธ" twice on slow Maker Flex push → 2nd request fails
+        // NO_PENDING (status changed pending → approved/rejected on first call) → confusing error.
+        // Wrapper returns cached 200 on retry. Body hash = {po_id, approved, note}. approved discriminates
+        // approve vs reject (different intents). note in hash → admin re-edit between retries surfaces 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::approve-reschedule';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'po_id'    => $po_id,
+                'approved' => $approved ? 1 : 0,
+                'note'     => $note,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         $post = get_post( $po_id );
         if ( ! $post || $post->post_type !== 'b2f_order' ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่พบ PO', 'code' => 'NOT_FOUND' ), 404 );
@@ -4680,11 +4721,18 @@ if ( ! function_exists( 'b2f_rest_approve_reschedule' ) ) {
                 b2f_log( sprintf( 'Reschedule approved: %s (#%d) new_eta=%s', $po_number, $po_id, $new_date ) );
             }
 
-            return new WP_REST_Response( array(
+            $resp = array(
                 'success'   => true,
                 'new_eta'   => esc_html( $new_date ),
                 'po_status' => esc_html( get_field( 'po_status', $po_id ) ),
-            ), 200 );
+            );
+
+            // V.11.16 Round 28: store cached response for replay
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return new WP_REST_Response( $resp, 200 );
 
         } else {
             $pending['status']      = 'rejected';
@@ -4709,10 +4757,17 @@ if ( ! function_exists( 'b2f_rest_approve_reschedule' ) ) {
                 b2f_log( sprintf( 'Reschedule rejected: %s (#%d)', $po_number, $po_id ) );
             }
 
-            return new WP_REST_Response( array(
+            $resp = array(
                 'success' => true,
                 'message' => 'ปฏิเสธคำขอเลื่อนวันส่ง',
-            ), 200 );
+            );
+
+            // V.11.16 Round 28: store cached response for replay
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return new WP_REST_Response( $resp, 200 );
         }
     }
 }
@@ -6152,6 +6207,39 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'action ไม่ถูกต้อง (replacement/reship/write_off)', 'code' => 'INVALID_ACTION' ), 400 );
         }
 
+        // ── V.11.16 Round 28: Idempotency-Key support ──
+        // Admin clicks "ดำเนินการ" twice on slow Maker Flex push → 2nd request fails
+        // ALREADY_RESOLVED (rcv_reject_resolved=1 set on first call). Existing GET_LOCK protects
+        // concurrent commits (short-window) but not 1-hour-later retry of the same intent. Wrapper
+        // returns cached 200 instead of confusing error. Body hash = {rcv_id, action, note}.
+        // action discriminates replacement/reship/write_off (different financial implications).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::reject-resolve';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'rcv_id' => $rcv_id,
+                'action' => $action,
+                'note'   => $note,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'error'   => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, $cached_code );
+            }
+        }
+
         // C-2: MySQL GET_LOCK ป้องกัน concurrent resolve
         global $wpdb;
         $lock_key = 'b2f_reject_resolve_' . $rcv_id;
@@ -6341,7 +6429,15 @@ if ( ! function_exists( 'b2f_rest_reject_resolve' ) ) {
         }
 
         $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
-        return new WP_REST_Response( array_merge( array( 'success' => true, 'rcv_id' => $rcv_id ), $result_data ), 200 );
+
+        $resp = array_merge( array( 'success' => true, 'rcv_id' => $rcv_id ), $result_data );
+
+        // V.11.16 Round 28: store cached response for replay
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 

@@ -1493,9 +1493,321 @@ class IdempotencyEndpointContractTest extends TestCase {
             'bo_bulk_cancel'      => dinoco_idempotency_hash( $this->bo_bulk_cancel_body() ),
             'po_complete'         => dinoco_idempotency_hash( $this->po_complete_body() ),
             'dip_stock_approve'   => dinoco_idempotency_hash( $this->dip_stock_approve_body() ),
+            // Round 28 — 5 new distinct shapes
+            'admin_stock_unlock'    => dinoco_idempotency_hash( $this->admin_stock_unlock_body() ),
+            'admin_stock_mark_oos'  => dinoco_idempotency_hash( $this->admin_stock_mark_oos_body() ),
+            'admin_submit_tracking' => dinoco_idempotency_hash( $this->admin_submit_tracking_body() ),
+            'approve_reschedule'    => dinoco_idempotency_hash( $this->approve_reschedule_body() ),
+            'reject_resolve'        => dinoco_idempotency_hash( $this->reject_resolve_body() ),
         );
-        $this->assertSame( 22, count( array_unique( $hashes ) ),
-            'All 22 distinct-shape endpoint bodies MUST hash uniquely (bo-undo-split intentionally shares shape with bo-confirm-full → namespace-discriminated at storage). Total cumulative endpoint count = 23.'
+        $this->assertSame( 27, count( array_unique( $hashes ) ),
+            'All 27 distinct-shape endpoint bodies MUST hash uniquely (bo-undo-split intentionally shares shape with bo-confirm-full → namespace-discriminated at storage). Total cumulative endpoint count = 28.'
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // ROUND 28 — 5 NEW ENDPOINT INTEGRATIONS
+    //   B2B Snippet 3: admin-stock-unlock / admin-stock-mark-oos / admin-submit-tracking
+    //   B2F Snippet 2: approve-reschedule / reject-resolve
+    //
+    // Highlights:
+    //   - admin-submit-tracking = 2nd bulk endpoint (entries[] sort by ticket_id)
+    //   - admin-stock-unlock = bulk-of-targets pattern (notify_tickets[] sort + dedup)
+    //   - approve-reschedule = boolean discriminator (approved flag) — approve/reject same PO
+    //   - reject-resolve = enum discriminator (action: replacement/reship/write_off)
+    // ════════════════════════════════════════════════════════════════
+
+    // ── ADMIN-STOCK-UNLOCK body shape (B2B Snippet 3 V.42.13) ──
+    //   { sku, notify_tickets[normalized sort + dedup] }
+    private function admin_stock_unlock_body( array $overrides = array() ): array {
+        $defaults = array(
+            'sku'            => 'DNCS500',
+            'notify_tickets' => array( 5003, 5001, 5002 ),
+        );
+        $merged = array_merge( $defaults, $overrides );
+        if ( isset( $merged['notify_tickets'] ) && is_array( $merged['notify_tickets'] ) ) {
+            // Match integration normalization: dedup + sort numeric
+            $tickets = array();
+            foreach ( $merged['notify_tickets'] as $t ) {
+                $tid = (int) $t;
+                if ( $tid > 0 ) $tickets[] = $tid;
+            }
+            $tickets = array_values( array_unique( $tickets ) );
+            sort( $tickets, SORT_NUMERIC );
+            $merged['notify_tickets'] = $tickets;
+        }
+        return $merged;
+    }
+
+    public function test_admin_stock_unlock_identical_body_same_hash(): void {
+        $b1 = $this->admin_stock_unlock_body();
+        $b2 = $this->admin_stock_unlock_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Admin double-click "ปลดล็อก" MUST replay safely (no double Flex spam)'
+        );
+    }
+
+    public function test_admin_stock_unlock_ticket_reorder_same_hash(): void {
+        // Admin reorders notify_tickets selection → same intent
+        $b1 = $this->admin_stock_unlock_body( array( 'notify_tickets' => array( 5001, 5002, 5003 ) ) );
+        $b2 = $this->admin_stock_unlock_body( array( 'notify_tickets' => array( 5003, 5001, 5002 ) ) );
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Ticket order MUST hash identically (sort canonicalizes intent)'
+        );
+    }
+
+    public function test_admin_stock_unlock_different_sku_different_hash(): void {
+        // Different SKU → completely different operation → 409
+        $b1 = $this->admin_stock_unlock_body( array( 'sku' => 'DNCS500' ) );
+        $b2 = $this->admin_stock_unlock_body( array( 'sku' => 'DNCT500' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'sku in hash prevents cross-SKU cache poisoning'
+        );
+    }
+
+    public function test_admin_stock_unlock_added_ticket_different_hash(): void {
+        // Admin adds another ticket to notify list between retries → different intent
+        $b1 = $this->admin_stock_unlock_body( array( 'notify_tickets' => array( 5001, 5002 ) ) );
+        $b2 = $this->admin_stock_unlock_body( array( 'notify_tickets' => array( 5001, 5002, 5003 ) ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Adding ticket to notify list MUST surface 409 (different audit trail)'
+        );
+    }
+
+    // ── ADMIN-STOCK-MARK-OOS body shape (B2B Snippet 3 V.42.13) ──
+    //   { sku, eta_days }
+    private function admin_stock_mark_oos_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'sku'      => 'DNCS500',
+            'eta_days' => 7,
+        ), $overrides );
+    }
+
+    public function test_admin_stock_mark_oos_identical_body_same_hash(): void {
+        $b1 = $this->admin_stock_mark_oos_body();
+        $b2 = $this->admin_stock_mark_oos_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_admin_stock_mark_oos_eta_change_different_hash(): void {
+        // Admin extends ETA between retries (7d → 14d) → different intent
+        $b1 = $this->admin_stock_mark_oos_body( array( 'eta_days' => 7 ) );
+        $b2 = $this->admin_stock_mark_oos_body( array( 'eta_days' => 14 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'eta_days in hash → admin re-estimating ETA surfaces 409'
+        );
+    }
+
+    public function test_admin_stock_mark_oos_different_sku_different_hash(): void {
+        $b1 = $this->admin_stock_mark_oos_body( array( 'sku' => 'DNCS500' ) );
+        $b2 = $this->admin_stock_mark_oos_body( array( 'sku' => 'DNCT500' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    // ── ADMIN-SUBMIT-TRACKING body shape (B2B Snippet 3 V.42.13, BULK) ──
+    //   { entries[normalized: sort by ticket_id] }
+    private function admin_submit_tracking_body( array $overrides = array() ): array {
+        $defaults = array(
+            'entries' => array(
+                array( 'ticket_id' => 5003, 'tracking_number' => 'TH3', 'carrier' => 'Flash' ),
+                array( 'ticket_id' => 5001, 'tracking_number' => 'TH1', 'carrier' => 'Kerry' ),
+                array( 'ticket_id' => 5002, 'tracking_number' => 'TH2', 'carrier' => 'Flash' ),
+            ),
+        );
+        $merged = array_merge( $defaults, $overrides );
+        if ( isset( $merged['entries'] ) && is_array( $merged['entries'] ) ) {
+            // Match integration normalization
+            $norm = array();
+            foreach ( $merged['entries'] as $e ) {
+                if ( ! is_array( $e ) ) continue;
+                $tid = (int) ( $e['ticket_id'] ?? 0 );
+                if ( $tid <= 0 ) continue;
+                $norm[] = array(
+                    'ticket_id'       => $tid,
+                    'tracking_number' => trim( (string) ( $e['tracking_number'] ?? '' ) ),
+                    'carrier'         => (string) ( $e['carrier'] ?? '' ),
+                );
+            }
+            usort( $norm, function( $a, $b ) { return $a['ticket_id'] <=> $b['ticket_id']; } );
+            $merged['entries'] = $norm;
+        }
+        return $merged;
+    }
+
+    public function test_admin_submit_tracking_identical_body_same_hash(): void {
+        $b1 = $this->admin_submit_tracking_body();
+        $b2 = $this->admin_submit_tracking_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Bulk tracking save retry MUST replay safely'
+        );
+    }
+
+    public function test_admin_submit_tracking_row_reorder_same_hash(): void {
+        // Admin reorders tracking grid → same intent (sort by ticket_id canonicalizes)
+        $b1 = $this->admin_submit_tracking_body();
+        $b2 = $this->admin_submit_tracking_body( array(
+            'entries' => array(
+                // intentionally reversed
+                array( 'ticket_id' => 5003, 'tracking_number' => 'TH3', 'carrier' => 'Flash' ),
+                array( 'ticket_id' => 5002, 'tracking_number' => 'TH2', 'carrier' => 'Flash' ),
+                array( 'ticket_id' => 5001, 'tracking_number' => 'TH1', 'carrier' => 'Kerry' ),
+            ),
+        ) );
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'Bulk row reorder MUST hash identically (sort by ticket_id)'
+        );
+    }
+
+    public function test_admin_submit_tracking_typo_correction_different_hash(): void {
+        // Admin fixes tracking number typo on retry → different intent → 409
+        $b1 = $this->admin_submit_tracking_body();
+        $b2 = $this->admin_submit_tracking_body( array(
+            'entries' => array(
+                array( 'ticket_id' => 5001, 'tracking_number' => 'TH1-CORRECTED', 'carrier' => 'Kerry' ),
+                array( 'ticket_id' => 5002, 'tracking_number' => 'TH2', 'carrier' => 'Flash' ),
+                array( 'ticket_id' => 5003, 'tracking_number' => 'TH3', 'carrier' => 'Flash' ),
+            ),
+        ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'tracking_number edit MUST surface 409 (admin re-edited)'
+        );
+    }
+
+    public function test_admin_submit_tracking_carrier_change_different_hash(): void {
+        // Admin switches carrier (Kerry → Flash) on retry → different shipment routing
+        $b1 = $this->admin_submit_tracking_body();
+        $b2 = $this->admin_submit_tracking_body( array(
+            'entries' => array(
+                array( 'ticket_id' => 5001, 'tracking_number' => 'TH1', 'carrier' => 'Flash' ), // changed
+                array( 'ticket_id' => 5002, 'tracking_number' => 'TH2', 'carrier' => 'Flash' ),
+                array( 'ticket_id' => 5003, 'tracking_number' => 'TH3', 'carrier' => 'Flash' ),
+            ),
+        ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'carrier change MUST surface 409 (different SLA cron schedule)'
+        );
+    }
+
+    // ── APPROVE-RESCHEDULE body shape (B2F Snippet 2 V.11.16) ──
+    //   { po_id, approved (0|1), note }
+    private function approve_reschedule_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'po_id'    => 7001,
+            'approved' => 1,
+            'note'     => 'OK เลื่อนได้',
+        ), $overrides );
+    }
+
+    public function test_approve_reschedule_identical_body_same_hash(): void {
+        $b1 = $this->approve_reschedule_body();
+        $b2 = $this->approve_reschedule_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_approve_reschedule_approve_vs_reject_different_hash(): void {
+        // CRITICAL: same PO, approved=1 vs approved=0 → completely different intent
+        $b_approve = $this->approve_reschedule_body( array( 'approved' => 1 ) );
+        $b_reject  = $this->approve_reschedule_body( array( 'approved' => 0 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b_approve ),
+            dinoco_idempotency_hash( $b_reject ),
+            'approved boolean discriminates approve vs reject (CRITICAL — wrong cached response = wrong PO state)'
+        );
+    }
+
+    public function test_approve_reschedule_note_change_different_hash(): void {
+        // Admin re-edits note between retries → different audit trail
+        $b1 = $this->approve_reschedule_body( array( 'note' => 'OK' ) );
+        $b2 = $this->approve_reschedule_body( array( 'note' => 'OK เลื่อนได้ + ส่งด่วน' ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    // ── REJECT-RESOLVE body shape (B2F Snippet 2 V.11.16) ──
+    //   { rcv_id, action: replacement|reship|write_off, note }
+    private function reject_resolve_body( array $overrides = array() ): array {
+        return array_merge( array(
+            'rcv_id' => 8001,
+            'action' => 'replacement',
+            'note'   => 'QC reject 5 ชิ้น ส่งใหม่',
+        ), $overrides );
+    }
+
+    public function test_reject_resolve_identical_body_same_hash(): void {
+        $b1 = $this->reject_resolve_body();
+        $b2 = $this->reject_resolve_body();
+        $this->assertSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 )
+        );
+    }
+
+    public function test_reject_resolve_action_enum_distinct_hashes(): void {
+        // CRITICAL: 3 actions = 3 different financial impacts (replacement = new PO debt;
+        // reship = no new PO; write_off = forfeit current debt). MUST not share cached response.
+        $h_replacement = dinoco_idempotency_hash( $this->reject_resolve_body( array( 'action' => 'replacement' ) ) );
+        $h_reship      = dinoco_idempotency_hash( $this->reject_resolve_body( array( 'action' => 'reship' ) ) );
+        $h_writeoff    = dinoco_idempotency_hash( $this->reject_resolve_body( array( 'action' => 'write_off' ) ) );
+
+        $this->assertSame( 3, count( array_unique( array( $h_replacement, $h_reship, $h_writeoff ) ) ),
+            'action enum (replacement/reship/write_off) MUST produce 3 distinct hashes (CRITICAL — financial integrity)'
+        );
+    }
+
+    public function test_reject_resolve_different_rcv_id_different_hash(): void {
+        // Cross-receipt key reuse → 409
+        $b1 = $this->reject_resolve_body();
+        $b2 = $this->reject_resolve_body( array( 'rcv_id' => 9999 ) );
+        $this->assertNotSame(
+            dinoco_idempotency_hash( $b1 ),
+            dinoco_idempotency_hash( $b2 ),
+            'rcv_id namespacing prevents cross-receipt cache poisoning'
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Round 28 cumulative — 5 new endpoint shapes distinct from each other
+    // ────────────────────────────────────────────────────────────────
+
+    public function test_round_28_endpoints_no_collision(): void {
+        $hashes = array(
+            'admin_stock_unlock'    => dinoco_idempotency_hash( $this->admin_stock_unlock_body() ),
+            'admin_stock_mark_oos'  => dinoco_idempotency_hash( $this->admin_stock_mark_oos_body() ),
+            'admin_submit_tracking' => dinoco_idempotency_hash( $this->admin_submit_tracking_body() ),
+            'approve_reschedule'    => dinoco_idempotency_hash( $this->approve_reschedule_body() ),
+            'reject_resolve'        => dinoco_idempotency_hash( $this->reject_resolve_body() ),
+        );
+        $this->assertSame( 5, count( array_unique( $hashes ) ),
+            'Round 28 endpoint body shapes MUST all hash differently. Got: ' . print_r( $hashes, true )
         );
     }
 }

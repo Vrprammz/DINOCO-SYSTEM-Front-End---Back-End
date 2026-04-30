@@ -1,6 +1,11 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.13 — Round 28 (2026-04-30): Extend Idempotency-Key support to 3 admin POST    ║
+ * ║    endpoints: admin-stock-unlock + admin-stock-mark-oos + admin-submit-tracking. Bulk        ║
+ * ║    pattern (admin-submit-tracking) normalizes entries[] (sort by ticket_id, sanitize per-    ║
+ * ║    row fields) so admin row reorder = same intent. Body hash includes notify_tickets[]      ║
+ * ║    normalized for stock-unlock. Wrapper-only, additive (Round 19/23/25/27 pattern proven).   ║
  * ║  Version: V.42.12 — Round 25 (2026-04-29): Idempotency-Key support on cancel-request.        ║
  * ║    Customer LIFF "ยกเลิก" button can double-fire on slow networks → admin notification +     ║
  * ║    rate-limit consumption double-charged. Body hash = {ticket_id, group_id} (group_id from   ║
@@ -1786,6 +1791,47 @@ function b2b_rest_admin_stock_unlock( WP_REST_Request $request ) {
     $notify_tickets = $request->get_param('notify_tickets');
     if (empty($sku)) return new WP_REST_Response(array('success'=>false,'message'=>'Missing sku'), 400);
 
+    // ── V.42.13 Round 28: Idempotency-Key support ──
+    // Admin clicks "ปลดล็อก" twice on slow Flex push → 2nd request still succeeds (b2b_unlock_product_oos
+    // returns false on already-unlocked, surfacing as 404 "ไม่พบ SKU") + double-fires BO restock Flex notify
+    // → customers get 2x duplicate Flex spam. Wrapper replays cached success on retry.
+    // Body hash = {sku, notify_tickets[normalized]} — sort + dedup ticket IDs so admin row reorder = same intent.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::admin-stock-unlock';
+    $idem_body = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        // Normalize notify_tickets — sort + dedup → row reorder same as same intent
+        $norm_tickets = array();
+        if (!empty($notify_tickets) && is_array($notify_tickets)) {
+            foreach ($notify_tickets as $t) {
+                $tid = intval($t);
+                if ($tid > 0) $norm_tickets[] = $tid;
+            }
+            $norm_tickets = array_values(array_unique($norm_tickets));
+            sort($norm_tickets, SORT_NUMERIC);
+        }
+        $idem_body = array(
+            'sku'            => $sku,
+            'notify_tickets' => $norm_tickets,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if (is_array($cached)) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     // Unlock the product
     $result = function_exists('b2b_unlock_product_oos') ? b2b_unlock_product_oos($sku) : false;
     if (!$result) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบ SKU: '.$sku), 404);
@@ -1805,11 +1851,18 @@ function b2b_rest_admin_stock_unlock( WP_REST_Request $request ) {
         }
     }
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'success'=>true,
         'message'=>'ปลดล็อก '.$sku.' เรียบร้อย',
         'notified'=>$notified,
-    ), 200);
+    );
+
+    // V.42.13 Round 28: store cached response for replay
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
 }
 
 /**
@@ -1824,16 +1877,54 @@ function b2b_rest_admin_stock_mark_oos( WP_REST_Request $request ) {
     $eta_days = max(0, intval($request->get_param('eta_days')));
     if (empty($sku)) return new WP_REST_Response(array('success'=>false,'message'=>'Missing sku'), 400);
 
+    // ── V.42.13 Round 28: Idempotency-Key support ──
+    // Admin double-clicks "ตั้งหมดสต็อก" → 2nd request overwrites ETA timestamp + re-saves OOS state.
+    // If admin changes eta_days between clicks (e.g. 7 → 14) → different intent → 409. Same → replay.
+    // Body hash = {sku, eta_days}. Note: eta_date IS computed server-side (today + eta_days),
+    // so cached response replays a stale date on next-day retry — accepted (24h TTL is the boundary).
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::admin-stock-mark-oos';
+    $idem_body = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'sku'      => $sku,
+            'eta_days' => $eta_days,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if (is_array($cached)) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     $result = function_exists('b2b_mark_product_oos') ? b2b_mark_product_oos($sku, $eta_days) : false;
     if (!$result) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบ SKU: '.$sku), 404);
 
     $eta_date = $eta_days > 0 ? b2b_date('Y-m-d', strtotime(b2b_date('Y-m-d') . ' +'.$eta_days.' days')) : '';
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'success'=>true,
         'message'=>'ตั้งหมดสต็อก '.$sku.' เรียบร้อย',
         'eta_date'=>$eta_date,
-    ), 200);
+    );
+
+    // V.42.13 Round 28: store cached response for replay
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1993,6 +2084,49 @@ function b2b_rest_admin_submit_tracking( WP_REST_Request $request ) {
     if (empty($entries) || !is_array($entries))
         return new WP_REST_Response(array('success'=>false,'message'=>'Missing entries'), 400);
 
+    // ── V.42.13 Round 28: Idempotency-Key support (bulk endpoint) ──
+    // Admin saves tracking for 50 orders, network drops mid-request, retry → without wrapper:
+    //   - All 50 orders re-fire b2b_set_order_status to 'shipped' (already-shipped no-op but FSM logged twice)
+    //   - All 50 customer groups receive duplicate Flex shipped notification
+    //   - 50 delivery_check crons scheduled twice (3 days later)
+    // Bulk hash pattern: normalize entries[] (sort by ticket_id, dedup, lowercase carrier) so admin row
+    // reorder = same intent. Per-entry semantic fields (ticket_id, tracking_number, carrier) hashed.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::admin-submit-tracking';
+    $idem_body = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        // Normalize entries: per-row semantic fields only, sort by ticket_id for stable hash
+        $norm_entries = array();
+        foreach ($entries as $e) {
+            if (!is_array($e)) continue;
+            $tid = intval($e['ticket_id'] ?? 0);
+            if ($tid <= 0) continue;
+            $norm_entries[] = array(
+                'ticket_id'       => $tid,
+                'tracking_number' => trim(sanitize_text_field($e['tracking_number'] ?? '')),
+                'carrier'         => sanitize_text_field($e['carrier'] ?? ''),
+            );
+        }
+        usort($norm_entries, function($a, $b) { return $a['ticket_id'] <=> $b['ticket_id']; });
+        $idem_body = array('entries' => $norm_entries);
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if (is_array($cached)) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     $updated = 0;
     $errors = array();
 
@@ -2041,12 +2175,20 @@ function b2b_rest_admin_submit_tracking( WP_REST_Request $request ) {
         $updated++;
     }
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'success' => true,
         'message' => 'บันทึกเลขพัสดุ '.$updated.' รายการ',
         'updated' => $updated,
         'errors'  => $errors,
-    ), 200);
+    );
+
+    // V.42.13 Round 28: store cached response for replay (success only — bulk wrapper returns
+    // entire batch result including partial failures; replay returns same shape)
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
     } catch ( Exception $e ) {
         b2b_log('[SubmitTracking] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาดภายใน กรุณาลองใหม่'), 500);
