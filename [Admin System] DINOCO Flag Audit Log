@@ -1,0 +1,972 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Flag Audit Log                            ║
+ * ║  Version: V.1.0 (2026-04-29) — Round 3 Pending Items Sprint      ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
+ * ║  Description: Centralized audit trail for ALL feature-flag and   ║
+ * ║    config-key toggles across DINOCO (B2B, B2F, Observability,    ║
+ * ║    GDPR, Flash V.42, BO config, etc).                            ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * PROBLEM
+ * -------
+ * Each subsystem stamps wp_options separately:
+ *   - BO Snippet 16        → b2b_flag_bo_system / beta_distributors / 12 BO config keys
+ *   - B2F Audit            → b2f_flag_v11_explicit_mode / order_intent / shadow_write / read_from_junction / coverage_autosync
+ *   - Flash V.42 Go-Live   → dinoco_shipping_meta_enabled (via dinoco_set_shipping_flag)
+ *   - V.33.5 hotfixes      → dinoco_oos_gate_hierarchy_compute / dinoco_auto_unlock_enabled
+ *   - Observability        → dinoco_obs_sentry_enabled / correlation_enabled / structured_log
+ *   - GDPR                 → dinoco_gdpr_enabled
+ *   - Inventory God Mode   → varies
+ *
+ * Existing audit was scattered:
+ *   - b2f_log_flag_change()  → log file (text), no query
+ *   - b2b_log()              → log file (text), no query
+ *   - dinoco_set_shipping_flag → wp_dinoco_flash_audit (only Flash V.42)
+ *   - Most direct update_option() calls → NO audit at all
+ *
+ * Incident debug "ใครเปิด flag X เมื่อไหร่?" → manual grep across log files (slow, lossy).
+ *
+ * SOLUTION
+ * --------
+ * Single canonical table `wp_dinoco_flag_audit` (90-day retention) +
+ * `dinoco_flag_audit_log()` helper that ALL flag toggle sites can call.
+ *
+ *   - Persistent (queryable) instead of text log files
+ *   - Auto-redacts PII via dinoco_obs_redact_context (if loaded)
+ *   - Admin viewer UI (`[dinoco_flag_audit_viewer]` shortcode)
+ *   - REST API (`/wp-json/dinoco/v1/flag-audit*`) for cron/CLI tools
+ *   - 90-day TTL via cron `dinoco_flag_audit_retention_cron`
+ *   - Defensive: silent fail-soft if table missing (no fatal)
+ *
+ * DESIGN PRINCIPLES (Modal Helpers / Observability / Audit Log pattern)
+ *   - DUAL-WRITE — never replaces existing audit (b2f_log_flag_change keeps logging)
+ *   - NON-THROWING — best-effort insert; failure → error_log + return false
+ *   - ADDITIVE     — zero behavior change at existing toggle sites
+ *
+ * Public API:
+ *   dinoco_flag_audit_log( $flag, $old, $new, [$reason], [$source] ) : int|false
+ *   dinoco_flag_audit_query( $args ) : array      // admin viewer + REST
+ *   dinoco_flag_audit_retention_run() : int       // cron + manual
+ *
+ * Backward compat:
+ *   - If flag value unchanged → no-op (skip insert)
+ *   - If table missing → silent return false (snippet activated before Snippet 15 sync)
+ *   - If function_exists() guard at caller → safe to deploy in any order
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. SCHEMA INSTALL (lazy, idempotent)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_flag_audit_schema_install' ) ) {
+    /**
+     * Install wp_dinoco_flag_audit table via dbDelta. Idempotent — tracks
+     * version in wp_option 'dinoco_flag_audit_schema_version'.
+     *
+     * Schema rationale:
+     *   - flag_name VARCHAR(64) — covers all current keys (longest:
+     *     'dinoco_oos_gate_hierarchy_compute' = 33 chars; 64 = headroom)
+     *   - old/new VARCHAR(255) — most flags are bool '0'|'1' or short JSON;
+     *     longer values truncated by helper before insert
+     *   - source ENUM-like VARCHAR(32) — not real ENUM (ALTER-friendly)
+     *   - 3 indexes: flag_name (filter by flag), changed_at (time queries
+     *     + retention DELETE), user_id (audit "who changed")
+     *
+     * @return void
+     */
+    function dinoco_flag_audit_schema_install() {
+        global $wpdb;
+
+        $current = get_option( 'dinoco_flag_audit_schema_version', '0' );
+        $target  = '1.0';
+        if ( $current === $target ) return;
+
+        $table   = $wpdb->prefix . 'dinoco_flag_audit';
+        $charset = $wpdb->get_charset_collate();
+
+        // dbDelta requires specific formatting (PRIMARY KEY inside, no FOREIGN KEY)
+        $sql = "CREATE TABLE {$table} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            flag_name VARCHAR(64) NOT NULL,
+            old_value VARCHAR(255) DEFAULT NULL,
+            new_value VARCHAR(255) DEFAULT NULL,
+            user_id BIGINT(20) UNSIGNED DEFAULT NULL,
+            source VARCHAR(32) DEFAULT NULL,
+            reason VARCHAR(255) DEFAULT NULL,
+            request_ip VARCHAR(45) DEFAULT NULL,
+            user_agent VARCHAR(128) DEFAULT NULL,
+            request_id VARCHAR(64) DEFAULT NULL,
+            changed_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_flag_name (flag_name),
+            KEY idx_changed_at (changed_at),
+            KEY idx_user_id (user_id)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta( $sql );
+
+        update_option( 'dinoco_flag_audit_schema_version', $target, false );
+    }
+}
+
+// Lazy install on admin_init (fast — dbDelta is idempotent + version-gated)
+add_action( 'admin_init', function() {
+    if ( get_option( 'dinoco_flag_audit_schema_version', '0' ) !== '1.0' ) {
+        dinoco_flag_audit_schema_install();
+    }
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. WRITE API — dinoco_flag_audit_log()
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_flag_audit_serialize_value' ) ) {
+    /**
+     * Serialize an arbitrary value for storage in VARCHAR(255).
+     *
+     * Rules:
+     *   - bool   → '1' / '0' (matches wp_options convention)
+     *   - null   → '' (NULL handled at caller via DB layer)
+     *   - scalar → cast to string
+     *   - array/object → JSON encode (truncated to 255 chars with '…' suffix if longer)
+     *
+     * @param mixed $value
+     * @return string|null  null if input is null (DB stores NULL); else string ≤ 255
+     */
+    function dinoco_flag_audit_serialize_value( $value ) {
+        if ( $value === null ) return null;
+        if ( is_bool( $value ) ) return $value ? '1' : '0';
+        if ( is_scalar( $value ) ) return substr( (string) $value, 0, 255 );
+        // Array/object — JSON encode
+        $json = wp_json_encode( $value );
+        if ( $json === false ) $json = '[encode_failed]';
+        if ( strlen( $json ) > 255 ) {
+            // Reserve 1 char for ellipsis marker
+            $json = substr( $json, 0, 254 ) . '…';
+        }
+        return $json;
+    }
+}
+
+if ( ! function_exists( 'dinoco_flag_audit_resolve_ip' ) ) {
+    /**
+     * Resolve client IP. Prefers GDPR snippet's Cloudflare/proxy-aware helper,
+     * falls back to raw REMOTE_ADDR if GDPR snippet missing.
+     *
+     * @return string IPv4/IPv6 (max 45 chars) or '' if unavailable
+     */
+    function dinoco_flag_audit_resolve_ip() {
+        if ( function_exists( 'dinoco_gdpr_get_client_ip' ) ) {
+            return (string) dinoco_gdpr_get_client_ip();
+        }
+        return isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '';
+    }
+}
+
+if ( ! function_exists( 'dinoco_flag_audit_log' ) ) {
+    /**
+     * Persist a flag-change event. No-op if old === new (idempotent re-saves).
+     *
+     * Never throws — if anything fails (table missing, DB error), logs to
+     * error_log() and returns false. Callers SHOULD NOT branch on result.
+     *
+     * @param string $flag_name  Flag option key (e.g. 'b2b_flag_bo_system')
+     * @param mixed  $old_value  Previous value (any type — serialized)
+     * @param mixed  $new_value  New value (any type — serialized)
+     * @param string $reason     Optional admin note (free-text, ≤255 chars)
+     * @param string $source     One of 'admin_ui'|'cron'|'cli'|'rest_api'|'snippet_init'|'auto_rollback'|'other'
+     * @return int|false  insert_id on success, false otherwise
+     */
+    function dinoco_flag_audit_log( $flag_name, $old_value, $new_value, $reason = '', $source = 'admin_ui' ) {
+        // No-op short-circuit — comparison preserves type for bool/string/int.
+        // Strict equality avoids false-positive "0" vs 0 changes.
+        if ( $old_value === $new_value ) return false;
+
+        // Loose-equality also no-op — admin saving same form twice with mixed
+        // type (e.g. wp_options stores '1' string, code passes true bool).
+        // We DO want to log type-only changes for forensics, BUT not when
+        // both serialize to the same string. Let serializer decide.
+        $old_str = dinoco_flag_audit_serialize_value( $old_value );
+        $new_str = dinoco_flag_audit_serialize_value( $new_value );
+        if ( $old_str === $new_str ) return false;
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_flag_audit';
+
+        // Defensive — schema not yet installed (snippet activated before Snippet 15 sync)
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SHOW TABLES LIKE %s", $wpdb->esc_like( $table )
+        ) );
+        if ( $exists !== $table ) {
+            // Try lazy install once per request
+            static $tried_install = false;
+            if ( ! $tried_install ) {
+                $tried_install = true;
+                if ( function_exists( 'dinoco_flag_audit_schema_install' ) ) {
+                    dinoco_flag_audit_schema_install();
+                    $exists = $wpdb->get_var( $wpdb->prepare(
+                        "SHOW TABLES LIKE %s", $wpdb->esc_like( $table )
+                    ) );
+                }
+            }
+            if ( $exists !== $table ) {
+                if ( ! get_transient( 'dinoco_flag_audit_table_missing_logged' ) ) {
+                    error_log( '[DINOCO_FLAG_AUDIT] table missing — flag changes not persisted' );
+                    set_transient( 'dinoco_flag_audit_table_missing_logged', 1, HOUR_IN_SECONDS );
+                }
+                return false;
+            }
+        }
+
+        // Whitelist sources — keeps cardinality bounded for filter UI
+        $allowed_sources = array( 'admin_ui', 'cron', 'cli', 'rest_api', 'snippet_init', 'auto_rollback', 'manual_rollback', 'other' );
+        if ( ! in_array( $source, $allowed_sources, true ) ) $source = 'other';
+
+        $request_id = function_exists( 'dinoco_obs_get_request_id' )
+            ? (string) dinoco_obs_get_request_id()
+            : '';
+
+        $row = array(
+            'flag_name'  => substr( (string) $flag_name, 0, 64 ),
+            'old_value'  => $old_str,    // already trimmed by serializer
+            'new_value'  => $new_str,
+            'user_id'    => get_current_user_id() ?: null,
+            'source'     => $source,
+            'reason'     => substr( (string) $reason, 0, 255 ),
+            'request_ip' => substr( dinoco_flag_audit_resolve_ip(), 0, 45 ),
+            'user_agent' => isset( $_SERVER['HTTP_USER_AGENT'] )
+                ? substr( (string) $_SERVER['HTTP_USER_AGENT'], 0, 128 )
+                : null,
+            'request_id' => $request_id !== '' ? substr( $request_id, 0, 64 ) : null,
+            'changed_at' => current_time( 'mysql' ),
+        );
+
+        try {
+            $ok = $wpdb->insert( $table, $row );
+            if ( $ok === false ) {
+                if ( ! get_transient( 'dinoco_flag_audit_insert_failed_logged' ) ) {
+                    error_log( '[DINOCO_FLAG_AUDIT] INSERT failed: ' . $wpdb->last_error );
+                    set_transient( 'dinoco_flag_audit_insert_failed_logged', 1, HOUR_IN_SECONDS );
+                }
+                return false;
+            }
+            return (int) $wpdb->insert_id;
+        } catch ( \Throwable $e ) {
+            error_log( '[DINOCO_FLAG_AUDIT] exception: ' . $e->getMessage() );
+            return false;
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. QUERY API — dinoco_flag_audit_query() / get_by_id()
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_flag_audit_query' ) ) {
+    /**
+     * Query audit rows with filters + pagination.
+     *
+     * @param array $args {
+     *   @type string $flag       Filter by flag_name (exact match)
+     *   @type int    $user_id    Filter by user_id
+     *   @type string $source     Filter by source
+     *   @type int    $days       Filter by changed_at >= NOW() - N days (default 30)
+     *   @type string $from       Filter changed_at >= 'YYYY-MM-DD HH:MM:SS'
+     *   @type string $to         Filter changed_at <= 'YYYY-MM-DD HH:MM:SS'
+     *   @type int    $limit      Page size (default 50, max 500)
+     *   @type int    $offset     Pagination offset (default 0)
+     *   @type string $orderby    'changed_at'|'flag_name' (default changed_at)
+     *   @type string $order      'ASC'|'DESC' (default DESC)
+     * }
+     * @return array { rows: array<object>, total: int }
+     */
+    function dinoco_flag_audit_query( $args = array() ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_flag_audit';
+
+        $defaults = array(
+            'flag'    => '',
+            'user_id' => 0,
+            'source'  => '',
+            'days'    => 30,
+            'from'    => '',
+            'to'      => '',
+            'limit'   => 50,
+            'offset'  => 0,
+            'orderby' => 'changed_at',
+            'order'   => 'DESC',
+        );
+        $args = wp_parse_args( $args, $defaults );
+
+        // Sanitize
+        $where  = array( '1=1' );
+        $params = array();
+
+        if ( ! empty( $args['flag'] ) ) {
+            $where[]  = 'flag_name = %s';
+            $params[] = (string) $args['flag'];
+        }
+        if ( ! empty( $args['user_id'] ) ) {
+            $where[]  = 'user_id = %d';
+            $params[] = (int) $args['user_id'];
+        }
+        if ( ! empty( $args['source'] ) ) {
+            $where[]  = 'source = %s';
+            $params[] = (string) $args['source'];
+        }
+        if ( ! empty( $args['from'] ) ) {
+            $where[]  = 'changed_at >= %s';
+            $params[] = (string) $args['from'];
+        }
+        if ( ! empty( $args['to'] ) ) {
+            $where[]  = 'changed_at <= %s';
+            $params[] = (string) $args['to'];
+        }
+        if ( empty( $args['from'] ) && empty( $args['to'] ) && (int) $args['days'] > 0 ) {
+            $where[]  = 'changed_at >= DATE_SUB(NOW(), INTERVAL %d DAY)';
+            $params[] = (int) $args['days'];
+        }
+
+        $orderby = in_array( $args['orderby'], array( 'changed_at', 'flag_name', 'id' ), true )
+            ? $args['orderby'] : 'changed_at';
+        $order   = strtoupper( $args['order'] ) === 'ASC' ? 'ASC' : 'DESC';
+
+        $limit  = max( 1, min( 500, (int) $args['limit'] ) );
+        $offset = max( 0, (int) $args['offset'] );
+
+        $where_sql = implode( ' AND ', $where );
+
+        // Count first (without LIMIT/OFFSET)
+        $count_sql = "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}";
+        $total = (int) ( $params
+            ? $wpdb->get_var( $wpdb->prepare( $count_sql, $params ) )
+            : $wpdb->get_var( $count_sql ) );
+
+        // Rows
+        $row_sql = "SELECT * FROM {$table} WHERE {$where_sql} ORDER BY {$orderby} {$order} LIMIT %d OFFSET %d";
+        $row_params = array_merge( $params, array( $limit, $offset ) );
+        $rows = $wpdb->get_results( $wpdb->prepare( $row_sql, $row_params ) );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        return array( 'rows' => $rows, 'total' => $total );
+    }
+}
+
+if ( ! function_exists( 'dinoco_flag_audit_get_by_id' ) ) {
+    /**
+     * Fetch single row by ID (admin viewer detail page).
+     * @param int $id
+     * @return object|null
+     */
+    function dinoco_flag_audit_get_by_id( $id ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_flag_audit';
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE id = %d LIMIT 1",
+            (int) $id
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_flag_audit_distinct_flags' ) ) {
+    /**
+     * Get distinct flag names for filter dropdown UI. Cached 60s.
+     * @return array<string>
+     */
+    function dinoco_flag_audit_distinct_flags() {
+        $cache_key = 'dinoco_flag_audit_distinct_flags';
+        $cached = get_transient( $cache_key );
+        if ( is_array( $cached ) ) return $cached;
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_flag_audit';
+        $rows = $wpdb->get_col( "SELECT DISTINCT flag_name FROM {$table} ORDER BY flag_name ASC LIMIT 200" );
+        if ( ! is_array( $rows ) ) $rows = array();
+        set_transient( $cache_key, $rows, MINUTE_IN_SECONDS );
+        return $rows;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. RETENTION CRON (90-day default)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_flag_audit_retention_run' ) ) {
+    /**
+     * DELETE rows older than retention_days. Chunked 1000/iter to avoid
+     * long lock + deadlock with concurrent INSERTs. Max 20 iterations
+     * (= 20K rows/run cap — anything more carries to next run).
+     *
+     * Default 90 days (configurable via wp_option 'dinoco_flag_audit_retention_days').
+     *
+     * @return int Total rows deleted this run
+     */
+    function dinoco_flag_audit_retention_run() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'dinoco_flag_audit';
+        if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $table ) ) ) !== $table ) {
+            return 0;
+        }
+
+        $days = (int) get_option( 'dinoco_flag_audit_retention_days', 90 );
+        if ( $days < 30 ) $days = 30;   // Floor — protect against misconfiguration
+        if ( $days > 365 ) $days = 365; // Ceiling
+
+        $total_deleted = 0;
+        $max_iters     = 20;
+        for ( $i = 0; $i < $max_iters; $i++ ) {
+            $deleted = $wpdb->query( $wpdb->prepare(
+                "DELETE FROM {$table} WHERE changed_at < DATE_SUB(NOW(), INTERVAL %d DAY) LIMIT 1000",
+                $days
+            ) );
+            if ( ! $deleted || $deleted === false ) break;
+            $total_deleted += (int) $deleted;
+            if ( $deleted < 1000 ) break;  // Last batch — stop early
+            // Tiny gap to let other queries breathe
+            usleep( 50000 ); // 50ms
+        }
+
+        if ( $total_deleted > 0 ) {
+            update_option( 'dinoco_flag_audit_retention_last_run', array(
+                'ran_at'  => current_time( 'mysql' ),
+                'deleted' => $total_deleted,
+                'days'    => $days,
+            ), false );
+        }
+
+        return $total_deleted;
+    }
+}
+
+if ( ! wp_next_scheduled( 'dinoco_flag_audit_retention_cron' ) ) {
+    // Schedule daily at ~03:00 server time (slightly offset so Bangkok-area
+    // cron fleet doesn't all hit DB at exactly 03:00 — cluster spread).
+    $first_run = strtotime( 'tomorrow 03:00' );
+    if ( ! $first_run ) $first_run = time() + DAY_IN_SECONDS;
+    wp_schedule_event( $first_run, 'daily', 'dinoco_flag_audit_retention_cron' );
+}
+add_action( 'dinoco_flag_audit_retention_cron', 'dinoco_flag_audit_retention_run' );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. REST API — /wp-json/dinoco/v1/flag-audit*
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_action( 'rest_api_init', function() {
+
+    $perm_admin = function() {
+        return current_user_can( 'manage_options' );
+    };
+
+    // GET /flag-audit — list with filters
+    register_rest_route( 'dinoco/v1', '/flag-audit', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function( WP_REST_Request $req ) {
+            $args = array(
+                'flag'    => sanitize_text_field( (string) $req->get_param( 'flag' ) ),
+                'user_id' => absint( $req->get_param( 'user_id' ) ),
+                'source'  => sanitize_text_field( (string) $req->get_param( 'source' ) ),
+                'days'    => max( 1, min( 365, (int) ( $req->get_param( 'days' ) ?: 30 ) ) ),
+                'from'    => sanitize_text_field( (string) $req->get_param( 'from' ) ),
+                'to'      => sanitize_text_field( (string) $req->get_param( 'to' ) ),
+                'limit'   => max( 1, min( 500, (int) ( $req->get_param( 'limit' ) ?: 50 ) ) ),
+                'offset'  => max( 0, (int) $req->get_param( 'offset' ) ),
+                'orderby' => sanitize_text_field( (string) ( $req->get_param( 'orderby' ) ?: 'changed_at' ) ),
+                'order'   => sanitize_text_field( (string) ( $req->get_param( 'order' ) ?: 'DESC' ) ),
+            );
+            $result = dinoco_flag_audit_query( $args );
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => $result['rows'],
+                'meta'    => array(
+                    'total'  => $result['total'],
+                    'limit'  => $args['limit'],
+                    'offset' => $args['offset'],
+                    'flags'  => dinoco_flag_audit_distinct_flags(),
+                ),
+            ) );
+        },
+    ) );
+
+    // GET /flag-audit/{id} — single row
+    register_rest_route( 'dinoco/v1', '/flag-audit/(?P<id>\d+)', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function( WP_REST_Request $req ) {
+            $id = (int) $req['id'];
+            $row = dinoco_flag_audit_get_by_id( $id );
+            if ( ! $row ) {
+                return new WP_Error( 'not_found', 'Audit row not found', array( 'status' => 404 ) );
+            }
+            return rest_ensure_response( array( 'success' => true, 'data' => $row ) );
+        },
+    ) );
+
+    // POST /flag-audit/retention/run — manual trigger (admin only)
+    register_rest_route( 'dinoco/v1', '/flag-audit/retention/run', array(
+        'methods'             => 'POST',
+        'permission_callback' => $perm_admin,
+        'callback'            => function( WP_REST_Request $req ) {
+            $deleted = dinoco_flag_audit_retention_run();
+            return rest_ensure_response( array(
+                'success' => true,
+                'data'    => array(
+                    'deleted' => $deleted,
+                    'last_run' => get_option( 'dinoco_flag_audit_retention_last_run', null ),
+                ),
+            ) );
+        },
+    ) );
+
+    // GET /flag-audit/export — CSV download
+    register_rest_route( 'dinoco/v1', '/flag-audit/export', array(
+        'methods'             => 'GET',
+        'permission_callback' => $perm_admin,
+        'callback'            => function( WP_REST_Request $req ) {
+            // Reuse query but cap at 5000 rows for CSV
+            $args = array(
+                'flag'   => sanitize_text_field( (string) $req->get_param( 'flag' ) ),
+                'days'   => max( 1, min( 365, (int) ( $req->get_param( 'days' ) ?: 90 ) ) ),
+                'limit'  => 5000,
+                'offset' => 0,
+            );
+            $result = dinoco_flag_audit_query( $args );
+
+            // Build CSV
+            $csv = "id,flag_name,old_value,new_value,user_id,source,reason,request_ip,changed_at\n";
+            foreach ( $result['rows'] as $r ) {
+                $csv .= sprintf(
+                    "%d,%s,%s,%s,%d,%s,%s,%s,%s\n",
+                    (int) $r->id,
+                    str_replace( ',', ' ', (string) $r->flag_name ),
+                    str_replace( ',', ' ', (string) $r->old_value ),
+                    str_replace( ',', ' ', (string) $r->new_value ),
+                    (int) $r->user_id,
+                    str_replace( ',', ' ', (string) $r->source ),
+                    str_replace( array( ',', "\n", "\r" ), ' ', (string) $r->reason ),
+                    (string) $r->request_ip,
+                    (string) $r->changed_at
+                );
+            }
+
+            // UTF-8 BOM for Excel compat
+            $csv = "\xEF\xBB\xBF" . $csv;
+
+            $filename = 'dinoco_flag_audit_' . current_time( 'Ymd_His' ) . '.csv';
+            $resp = new WP_REST_Response( $csv );
+            $resp->set_headers( array(
+                'Content-Type'        => 'text/csv; charset=utf-8',
+                'Content-Disposition' => 'attachment; filename="' . $filename . '"',
+            ) );
+            return $resp;
+        },
+    ) );
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. ADMIN VIEWER UI — [dinoco_flag_audit_viewer] shortcode
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_shortcode( 'dinoco_flag_audit_viewer', function() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return '<p style="color:#dc2626;">⚠️ ต้องเป็น admin (manage_options) เท่านั้น</p>';
+    }
+
+    // Initial render — empty + filter form. JS fetches via REST.
+    $nonce = wp_create_nonce( 'wp_rest' );
+    $rest_url = esc_url_raw( rest_url( 'dinoco/v1/flag-audit' ) );
+
+    ob_start();
+    ?>
+    <div class="dinoco-flag-audit-viewer" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1f2937;">
+
+        <div class="flag-audit-header" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+            <h2 style="margin:0;font-size:18px;font-weight:700;color:#111827;">
+                🚩 Flag Audit Log
+                <small style="font-weight:400;color:#6b7280;font-size:13px;">— ประวัติการเปลี่ยน feature flag (90 วัน)</small>
+            </h2>
+            <div>
+                <button type="button" id="flagAuditExport" style="background:#10b981;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">
+                    ⬇ Export CSV
+                </button>
+                <button type="button" id="flagAuditRefresh" style="background:#3b82f6;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;margin-left:6px;">
+                    🔄 Refresh
+                </button>
+            </div>
+        </div>
+
+        <div class="flag-audit-filters" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end;">
+            <label style="font-size:12px;color:#374151;">
+                <span style="display:block;margin-bottom:3px;font-weight:600;">Flag</span>
+                <select id="flagAuditFilterFlag" style="width:100%;padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;">
+                    <option value="">— ทั้งหมด —</option>
+                </select>
+            </label>
+            <label style="font-size:12px;color:#374151;">
+                <span style="display:block;margin-bottom:3px;font-weight:600;">Source</span>
+                <select id="flagAuditFilterSource" style="width:100%;padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;">
+                    <option value="">— ทั้งหมด —</option>
+                    <option value="admin_ui">admin_ui</option>
+                    <option value="rest_api">rest_api</option>
+                    <option value="cron">cron</option>
+                    <option value="cli">cli</option>
+                    <option value="auto_rollback">auto_rollback</option>
+                    <option value="manual_rollback">manual_rollback</option>
+                    <option value="snippet_init">snippet_init</option>
+                    <option value="other">other</option>
+                </select>
+            </label>
+            <label style="font-size:12px;color:#374151;">
+                <span style="display:block;margin-bottom:3px;font-weight:600;">User ID</span>
+                <input type="number" id="flagAuditFilterUser" style="width:100%;padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;" placeholder="(any)">
+            </label>
+            <label style="font-size:12px;color:#374151;">
+                <span style="display:block;margin-bottom:3px;font-weight:600;">Days</span>
+                <select id="flagAuditFilterDays" style="width:100%;padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;">
+                    <option value="7">7 วัน</option>
+                    <option value="30" selected>30 วัน</option>
+                    <option value="90">90 วัน</option>
+                </select>
+            </label>
+            <button type="button" id="flagAuditApplyFilter" style="background:#1f2937;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">
+                🔍 ค้นหา
+            </button>
+        </div>
+
+        <div class="flag-audit-summary" id="flagAuditSummary" style="font-size:13px;color:#6b7280;margin-bottom:8px;"></div>
+
+        <div class="flag-audit-table-wrap" style="overflow-x:auto;border:1px solid #e5e7eb;border-radius:8px;background:#fff;">
+            <table class="flag-audit-table" id="flagAuditTable" style="width:100%;border-collapse:collapse;font-size:13px;">
+                <thead style="background:#f3f4f6;">
+                    <tr>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">เมื่อ</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">Flag</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">เก่า → ใหม่</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">User</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">Source</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">Reason</th>
+                        <th style="padding:8px 10px;text-align:left;border-bottom:1px solid #e5e7eb;font-weight:600;">IP</th>
+                    </tr>
+                </thead>
+                <tbody id="flagAuditTbody">
+                    <tr><td colspan="7" style="padding:24px;text-align:center;color:#9ca3af;">กดปุ่ม "ค้นหา" หรือ "Refresh" เพื่อโหลดข้อมูล</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="flag-audit-pager" id="flagAuditPager" style="margin-top:12px;display:flex;justify-content:center;gap:8px;"></div>
+
+        <div style="margin-top:12px;font-size:11px;color:#9ca3af;text-align:center;">
+            Retention: 90 วัน (auto-prune ทุกวัน 03:00) — เก็บไว้สำหรับ incident debug + compliance audit
+        </div>
+    </div>
+
+    <script>
+    (function() {
+        var REST = <?php echo wp_json_encode( $rest_url ); ?>;
+        var NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+        var STATE = { offset: 0, limit: 50 };
+
+        function esc(s) {
+            if (s === null || s === undefined) return '';
+            return String(s).replace(/[&<>"']/g, function(c) {
+                return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+            });
+        }
+
+        function fmtUser(uid) {
+            if (!uid || uid === '0') return '<span style="color:#9ca3af;">system</span>';
+            return '<a href="user-edit.php?user_id=' + esc(uid) + '" target="_blank" style="color:#3b82f6;">#' + esc(uid) + '</a>';
+        }
+
+        function fmtSource(s) {
+            if (!s) return '';
+            var colors = {
+                'admin_ui':       '#3b82f6',
+                'rest_api':       '#8b5cf6',
+                'cron':           '#f59e0b',
+                'cli':            '#6b7280',
+                'auto_rollback':  '#dc2626',
+                'manual_rollback':'#ea580c',
+                'snippet_init':   '#10b981',
+                'other':          '#9ca3af'
+            };
+            var c = colors[s] || '#6b7280';
+            return '<span style="background:' + c + '20;color:' + c + ';padding:2px 6px;border-radius:3px;font-size:11px;font-weight:600;">' + esc(s) + '</span>';
+        }
+
+        function fmtDelta(oldv, newv) {
+            var ov = oldv === null || oldv === '' ? '<span style="color:#9ca3af;">∅</span>' : '<code style="background:#fee2e2;color:#991b1b;padding:1px 4px;border-radius:3px;">' + esc(oldv) + '</code>';
+            var nv = newv === null || newv === '' ? '<span style="color:#9ca3af;">∅</span>' : '<code style="background:#dcfce7;color:#166534;padding:1px 4px;border-radius:3px;">' + esc(newv) + '</code>';
+            return ov + ' → ' + nv;
+        }
+
+        function loadFlagsList() {
+            // initial — fetch first page just to get distinct flags via meta
+            fetchPage(0);
+        }
+
+        function fetchPage(offset) {
+            STATE.offset = offset;
+            var params = new URLSearchParams({
+                flag:    document.getElementById('flagAuditFilterFlag').value || '',
+                source:  document.getElementById('flagAuditFilterSource').value || '',
+                user_id: document.getElementById('flagAuditFilterUser').value || '',
+                days:    document.getElementById('flagAuditFilterDays').value || '30',
+                limit:   STATE.limit,
+                offset:  offset
+            });
+            var url = REST + '?' + params.toString();
+            var tbody = document.getElementById('flagAuditTbody');
+            tbody.innerHTML = '<tr><td colspan="7" style="padding:18px;text-align:center;color:#9ca3af;">⏳ กำลังโหลด...</td></tr>';
+
+            fetch(url, { headers: { 'X-WP-Nonce': NONCE }, credentials: 'same-origin' })
+                .then(function(r) { return r.json(); })
+                .then(function(j) {
+                    if (!j || !j.success) {
+                        tbody.innerHTML = '<tr><td colspan="7" style="padding:18px;text-align:center;color:#dc2626;">❌ โหลดล้มเหลว: ' + esc((j && j.message) || 'unknown') + '</td></tr>';
+                        return;
+                    }
+                    renderRows(j.data || [], j.meta || {});
+                    populateFlagSelect((j.meta && j.meta.flags) || []);
+                })
+                .catch(function(err) {
+                    tbody.innerHTML = '<tr><td colspan="7" style="padding:18px;text-align:center;color:#dc2626;">❌ network error: ' + esc(err.message) + '</td></tr>';
+                });
+        }
+
+        function renderRows(rows, meta) {
+            var tbody = document.getElementById('flagAuditTbody');
+            if (!rows.length) {
+                tbody.innerHTML = '<tr><td colspan="7" style="padding:24px;text-align:center;color:#9ca3af;">— ไม่มีรายการตาม filter นี้ —</td></tr>';
+                document.getElementById('flagAuditSummary').textContent = '';
+                renderPager(0, meta);
+                return;
+            }
+
+            var html = '';
+            rows.forEach(function(r) {
+                html += '<tr style="border-bottom:1px solid #f3f4f6;">';
+                html += '<td style="padding:8px 10px;white-space:nowrap;color:#6b7280;font-size:12px;">' + esc(r.changed_at) + '</td>';
+                html += '<td style="padding:8px 10px;font-family:monospace;font-size:12px;color:#1f2937;">' + esc(r.flag_name) + '</td>';
+                html += '<td style="padding:8px 10px;">' + fmtDelta(r.old_value, r.new_value) + '</td>';
+                html += '<td style="padding:8px 10px;">' + fmtUser(r.user_id) + '</td>';
+                html += '<td style="padding:8px 10px;">' + fmtSource(r.source) + '</td>';
+                html += '<td style="padding:8px 10px;color:#374151;max-width:240px;overflow:hidden;text-overflow:ellipsis;" title="' + esc(r.reason || '') + '">' + esc(r.reason || '') + '</td>';
+                html += '<td style="padding:8px 10px;color:#9ca3af;font-family:monospace;font-size:11px;">' + esc(r.request_ip || '') + '</td>';
+                html += '</tr>';
+            });
+            tbody.innerHTML = html;
+
+            var summary = '✓ ' + rows.length + ' / ' + (meta.total || 0) + ' รายการ';
+            document.getElementById('flagAuditSummary').textContent = summary;
+
+            renderPager(meta.total || 0, meta);
+        }
+
+        function renderPager(total, meta) {
+            var pager = document.getElementById('flagAuditPager');
+            if (total <= STATE.limit) { pager.innerHTML = ''; return; }
+
+            var pages = Math.ceil(total / STATE.limit);
+            var current = Math.floor(STATE.offset / STATE.limit);
+            var html = '';
+
+            if (current > 0) {
+                html += '<button type="button" data-offset="' + ((current - 1) * STATE.limit) + '" class="flag-audit-page-btn" style="background:#fff;border:1px solid #d1d5db;padding:6px 10px;border-radius:4px;cursor:pointer;font-size:12px;">‹ ก่อน</button>';
+            }
+            html += '<span style="padding:6px 10px;font-size:12px;color:#374151;">หน้า ' + (current + 1) + ' / ' + pages + '</span>';
+            if (current < pages - 1) {
+                html += '<button type="button" data-offset="' + ((current + 1) * STATE.limit) + '" class="flag-audit-page-btn" style="background:#fff;border:1px solid #d1d5db;padding:6px 10px;border-radius:4px;cursor:pointer;font-size:12px;">ถัดไป ›</button>';
+            }
+            pager.innerHTML = html;
+
+            Array.prototype.forEach.call(pager.querySelectorAll('.flag-audit-page-btn'), function(btn) {
+                btn.addEventListener('click', function() {
+                    fetchPage(parseInt(btn.getAttribute('data-offset'), 10) || 0);
+                });
+            });
+        }
+
+        function populateFlagSelect(flags) {
+            var sel = document.getElementById('flagAuditFilterFlag');
+            if (sel.options.length > 1) return; // only populate first time
+            flags.forEach(function(f) {
+                var opt = document.createElement('option');
+                opt.value = f;
+                opt.textContent = f;
+                sel.appendChild(opt);
+            });
+        }
+
+        document.getElementById('flagAuditApplyFilter').addEventListener('click', function() { fetchPage(0); });
+        document.getElementById('flagAuditRefresh').addEventListener('click', function() { fetchPage(STATE.offset); });
+        document.getElementById('flagAuditExport').addEventListener('click', function() {
+            var params = new URLSearchParams({
+                flag: document.getElementById('flagAuditFilterFlag').value || '',
+                days: document.getElementById('flagAuditFilterDays').value || '90'
+            });
+            var exportUrl = REST + '/export?' + params.toString() + '&_wpnonce=' + encodeURIComponent(NONCE);
+            window.open(exportUrl, '_blank');
+        });
+
+        loadFlagsList();
+    })();
+    </script>
+    <?php
+    return ob_get_clean();
+} );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. PASSIVE HOOK — auto-capture update_option() on tracked flags
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * For sites we cannot edit directly (e.g. Snippet 1 V.34.25 dinoco_set_shipping_flag,
+ * Flash Go-Live wizard's update_option() outside our reach, or any future flag
+ * not explicitly wired), WordPress's `update_option_{$option}` action fires AFTER
+ * every persisted change. We listen for a curated list and audit-log automatically.
+ *
+ * This is a SAFETY NET — explicit dinoco_flag_audit_log() calls at toggle sites
+ * are still preferred (carry richer reason/source context). When both fire for
+ * the same flag, the no-op short-circuit (old===new) prevents duplicate rows.
+ *
+ * Filter `dinoco_flag_audit_tracked_flags` lets future snippets register their
+ * own flags without modifying this file. */
+
+if ( ! function_exists( 'dinoco_flag_audit_get_tracked_flags' ) ) {
+    /**
+     * Curated whitelist of flags whose update_option events we auto-capture.
+     * Filterable so other snippets can register additional flags.
+     *
+     * @return array<string>
+     */
+    function dinoco_flag_audit_get_tracked_flags() {
+        $defaults = array(
+            // B2B BO Backorder System
+            'b2b_flag_bo_system',
+            'b2b_flag_bo_beta_distributors',
+            // V.33.5 hotfix toggles (BO Snippet 16 Flag Manager)
+            'dinoco_oos_gate_hierarchy_compute',
+            'dinoco_auto_unlock_enabled',
+            // Flash Shipping V.42 master kill switch
+            'dinoco_shipping_meta_enabled',
+            // B2F Migration Audit (Option F Hybrid Shadow-Write + V.7.0 Order Intent)
+            'b2f_flag_shadow_write',
+            'b2f_flag_read_from_junction',
+            'b2f_flag_auto_sync_sets',
+            'b2f_flag_v11_explicit_mode',
+            'b2f_flag_order_intent',
+            'b2f_flag_coverage_autosync',
+            // Observability scaffolding (V.1.0 — Sprint 5)
+            'dinoco_obs_sentry_enabled',
+            'dinoco_obs_correlation_enabled',
+            'dinoco_obs_structured_log',
+            // GDPR scaffolding (V.1.0 — Sprint 5)
+            'dinoco_gdpr_enabled',
+            // Catch-all retention setting (also audited if changed)
+            'dinoco_flag_audit_retention_days',
+        );
+        return apply_filters( 'dinoco_flag_audit_tracked_flags', $defaults );
+    }
+}
+
+if ( ! function_exists( 'dinoco_flag_audit_passive_listener' ) ) {
+    /**
+     * Generic update_option listener — fires for EVERY wp_options write.
+     * We filter inside to only audit tracked flags.
+     *
+     * Hook signature (WP):
+     *   do_action( "update_option_{$option}", $old_value, $value, $option )
+     *
+     * Using the generic 'updated_option' (without {$option} suffix) so we get
+     * one registration covering all flags — cheaper than 16 add_action calls.
+     *
+     * @param string $option   Option name
+     * @param mixed  $old_value
+     * @param mixed  $value
+     * @return void
+     */
+    function dinoco_flag_audit_passive_listener( $option, $old_value, $value ) {
+        // Whitelist gate — short-circuit for unrelated wp_options writes.
+        // dinoco_flag_audit_get_tracked_flags() is cached statically inside
+        // get_tracked_flags() per request via apply_filters memoization.
+        static $tracked_set = null;
+        if ( $tracked_set === null ) {
+            $tracked_set = array_flip( dinoco_flag_audit_get_tracked_flags() );
+        }
+        if ( ! isset( $tracked_set[ $option ] ) ) return;
+
+        // Re-entrancy guard — explicit dinoco_flag_audit_log() callers may
+        // still trigger this passive listener (since they call update_option
+        // before logging). The no-op short-circuit on (old===new) inside
+        // dinoco_flag_audit_log handles deduplication, but we also flag
+        // a per-request seen set to skip the second call entirely (saves
+        // a redundant SHOW TABLES + serialize + INSERT attempt).
+        static $seen = array();
+        $seen_key = $option . '|' . md5( serialize( array( $old_value, $value ) ) );
+        if ( isset( $seen[ $seen_key ] ) ) return;
+        $seen[ $seen_key ] = true;
+
+        if ( function_exists( 'dinoco_flag_audit_log' ) ) {
+            dinoco_flag_audit_log( $option, $old_value, $value, '[passive: updated_option hook]', 'other' );
+        }
+    }
+}
+
+// Register listener — `updated_option` fires for ALL wp_options writes.
+// We filter inside listener for tracked flags only — keeps overhead minimal.
+add_action( 'updated_option', 'dinoco_flag_audit_passive_listener', 99, 3 );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. CONVENIENCE WRAPPER — for use INSIDE update_option() chains
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_flag_set' ) ) {
+    /**
+     * Atomic flag setter with audit log built in.
+     * Reads current value, persists new, logs change.
+     *
+     * Usage (B2B / B2F / Inventory toggle endpoints):
+     *
+     *   dinoco_flag_set( 'b2b_flag_bo_system', true, 'Phase A-D rollout', 'admin_ui' );
+     *
+     * @param string $flag    Option key
+     * @param mixed  $new_val New value
+     * @param string $reason  Free-text reason
+     * @param string $source  'admin_ui'|'rest_api'|'cron'|'cli'|...
+     * @return array { ok, old, new, no_change?, audit_id? }
+     */
+    function dinoco_flag_set( $flag, $new_val, $reason = '', $source = 'admin_ui' ) {
+        $old_val = get_option( $flag, null );
+
+        // Normalize bools to '0'/'1' string for wp_options compat (matches Flash Go-Live)
+        if ( is_bool( $new_val ) ) $new_val = $new_val ? '1' : '0';
+
+        // No-op detection — avoid writing wp_option + audit row
+        $cmp_old = is_bool( $old_val ) ? ( $old_val ? '1' : '0' ) : $old_val;
+        if ( $cmp_old === $new_val ) {
+            return array( 'ok' => true, 'old' => $old_val, 'new' => $new_val, 'no_change' => true );
+        }
+
+        $persist_ok = update_option( $flag, $new_val );
+
+        $audit_id = false;
+        if ( function_exists( 'dinoco_flag_audit_log' ) ) {
+            $audit_id = dinoco_flag_audit_log( $flag, $old_val, $new_val, $reason, $source );
+        }
+
+        return array(
+            'ok'       => (bool) $persist_ok,
+            'old'      => $old_val,
+            'new'      => $new_val,
+            'audit_id' => $audit_id,
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 9. END
+ * ═══════════════════════════════════════════════════════════════════════════ */

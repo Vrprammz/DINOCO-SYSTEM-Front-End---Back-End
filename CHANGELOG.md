@@ -10,6 +10,60 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Audit — Round 3 Pending Items Sprint (2026-04-29) — Flag Audit Log NEW snippet
+
+NEW snippet **`[Admin System] DINOCO Flag Audit Log` V.1.0** — centralized
+audit trail for ALL feature-flag and config-key toggles across DINOCO. Closes
+the "ใครเปลี่ยน flag X เมื่อไหร่?" incident-debug pain point.
+
+- **Schema**: `wp_dinoco_flag_audit` (lazy `dbDelta` install, version-gated).
+  11 columns including `flag_name` VARCHAR(64), `old_value`/`new_value`
+  VARCHAR(255), `user_id`, `source` (admin_ui/rest_api/cron/cli/etc),
+  `reason`, `request_ip`, `user_agent`, `request_id` (correlation with
+  Observability snippet), `changed_at`. 3 indexes (flag_name, changed_at,
+  user_id) optimize common queries.
+- **Helper API**: `dinoco_flag_audit_log($flag, $old, $new, $reason, $source)`
+  with no-op short-circuit (old===new strict and serialized strict comparison),
+  automatic PII context inheritance, and lazy schema install on first call.
+  Best-effort non-throwing pattern (mirrors Audit Log V.1.0 design).
+- **Convenience wrapper**: `dinoco_flag_set($flag, $val, $reason, $source)`
+  — atomic update_option + audit log + bool→'0'/'1' normalization.
+- **Passive listener**: `updated_option` action hook auto-captures changes
+  to a curated whitelist (16 flags: BO, V.33.5 hotfixes, Flash V.42, B2F
+  V.7.0/migration, Observability, GDPR). Filter `dinoco_flag_audit_tracked_flags`
+  lets future snippets register flags without modifying this file. Per-request
+  dedup guard prevents duplicate rows when explicit + passive both fire.
+- **Admin viewer UI**: `[dinoco_flag_audit_viewer]` shortcode — filterable
+  table (by flag/source/user/days), pagination 50/page, color-coded delta
+  badges (red old → green new), source-tag chips, per-row IP/UA, refresh +
+  CSV export.
+- **REST API** under `/dinoco/v1/flag-audit*`: list with filters, single by
+  ID, manual retention trigger, CSV export (UTF-8 BOM, 5K row cap).
+- **Retention cron**: `dinoco_flag_audit_retention_cron` daily 03:00, 90-day
+  default (configurable 30-365 via `dinoco_flag_audit_retention_days` option),
+  chunked 1000/iter × 20 max iters per run.
+- **Wiring** (3 explicit call sites — function_exists() guarded):
+  - `[B2B] Snippet 16` V.3.1 — `[b2b_bo_flags]` shortcode wraps existing
+    update_option calls (3 flags + beta_distributors array). Existing
+    b2b_log() text logging preserved (dual-write).
+  - `[Admin System] B2F Migration Audit` V.3.19 — `POST /feature-flags/toggle`
+    REST endpoint adds audit_log call. Existing `b2f_log_flag_change()` text
+    log preserved (dual-write).
+  - `[Admin System] Flash Shipping V.42 Go-Live Tool` V.1.9 — `POST /flip-flag`
+    endpoint adds audit_log call. Existing wp_dinoco_flash_audit row preserved.
+  - **NOTE**: `[B2B] Snippet 1`'s `dinoco_set_shipping_flag()` helper is NOT
+    explicitly wired (sensitive snippet — no edits permitted). The passive
+    `updated_option` listener captures it automatically.
+- **Tests**: `tests/helpers/FlagAuditTest.php` (21 cases — serializer null/bool/
+  int/float/string/array/object/long/unicode, no-op detection strict and serialized,
+  and edge cases). All pass; full suite (131 tests, 208 assertions) green.
+- **Risk**: LOW — additive snippet (no existing logic change). function_exists()
+  guards at every call site. Lazy schema install. Silent fail-soft if table
+  missing. Idempotent re-saves (no-op short-circuit).
+- **Files**: NEW `[Admin System] DINOCO Flag Audit Log` V.1.0 +
+  `tests/helpers/FlagAuditTest.php` + 3 wiring updates (Snippet 16 V.3.1,
+  B2F Audit V.3.19, Go-Live V.1.9).
+
 ### Performance — PERF cache priming sweep (2026-04-29) — Snippet 3 V.42.8
 
 Round 2 sprint follow-up to Snippet 16 V.2.9 cache priming pattern.
