@@ -10,6 +10,51 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Docs + Lint — Round 10 (Drift detector audit + BO Cron Lifecycle + Slip Replay Pool diagrams) (2026-04-30)
+
+3 files closing drift detector audit + 2 new flow diagrams. Risk: LOW (drift whitelist documentation entry) + NONE (docs).
+
+**ITEM A — Drift Detector Audit Run (`tests/jest/feature-flags-drift.test.js`)**
+
+After 31 commits since Round 5 (massive Round 5-9 churn), full drift suite audit:
+
+- Survey: 6 detectors run via Jest (`jsdoc-endpoint-refs`, `snippet-db-id`, `shortcode-drift`, `constants-drift`, `feature-flags-drift`, `markdown-links`).
+- 5 PASS + 1 FAIL: `feature-flags-drift` flagged `dinoco_flag_shipping_meta_enabled` documented but never used.
+- Root cause: misspelled flag with extra `_flag_` infix only appears in CLAUDE.md historical context (Day 1 Quick Wins doc-drift sync, commit `357852a` 2026-04-29 — fixed 10 occurrences). Actual runtime flag is `dinoco_shipping_meta_enabled` (without `_flag_` infix).
+- Fix: added flag to `DOCUMENTED_NOT_USED` whitelist set with explanatory comment (same pattern as `b2f_flag_ungroup_auto_hide` historical entry).
+- Verification: re-ran all 6 detectors → **6/6 PASS, 21/21 tests green**.
+
+**ITEM B — Remaining Flow Diagrams (`WORKFLOW-REFERENCE.md`)**
+
+2 NEW Mermaid diagrams documenting BO cron lifecycle + Slip Replay Pool architecture:
+
+- **Diagram 1 — section 2.12 BO Restock + Lifecycle Cron Flow (sequenceDiagram)**: 5 parallel cron paths shown side-by-side (restock_scan_cron 15min / pending_review_expire_cron hourly / enumeration_scan_cron hourly / eta_warn_cron daily 09:00 / attempt_log_cleanup_cron daily 03:00). Documents bit-field flag mutation (rate_hit=1, cancel_abuse=2, qty_cap_hit=4, suspicious_pattern=8 OR-combined per Phase 1 BUG-C1 fix), 72h timeout via `_b2b_opaque_accept_at`, chunked DELETE (1000/iter + 50ms gap, 20-iteration cap = max 20K rows/run), FOR UPDATE locks. Idempotency note + observability heartbeat (`dinoco_cron_<name>_last_run` wp_option).
+- **Diagram 2 — section 2.3.2 Slip Replay Pool Cascade + Manual Review Flow** (V.34.10+ — 2026-04-24 CNX MotoGear regression fix):
+  - **2.3.2.1 Replay Cascade State Diagram (stateDiagram-v2)**: 14+ result_status states from Snippet 2 V.34.10+ — AI prefilter / AI classifier / hash lookup → cascade (a/b/c/d) → Slip2Go branches → manual review pool transitions (paid/rejected/reroute).
+  - **2.3.2.2 Cascade Lookup Sequence (sequenceDiagram)**: 4 cascade paths with `alt` blocks showing prior-paid short-circuit / cached JSON replay / silent rejection / fresh Slip2Go call with retry 200ms/800ms backoff. Path (d) bifurcates into success / unknown 200xxx code (image saved to `slip-pool/{YYYY-MM}/{first40}.{ext}` + .htaccess deny + admin Flex 1/hr/group) / other failures.
+  - **2.3.2.3 Status Enum Reference table**: 17 rows × 5 columns mapping `_slip_final_status` → customer reply, admin notify, debt mutation, notes.
+  - **2.3.2.4 Audit Trail Sources**: `dinoco_slip_log` + `dinoco_slip_replay_log` schemas + 15 REST endpoints under `/wp-json/dinoco-slip/v1/` + 4 wired snippets.
+- Kill switches documented: `b2b_slip_replay_pool_enabled=0` reverts to V.34.9 fresh-call behavior. BO crons FSM-guarded for safe re-runs.
+
+**ITEM C — onerror handlers (DEFERRED)**
+
+Skipped per user directive ("optional if time"). `onerror="this.src='fallback.png'"` patterns are inline image fallback handlers — CSP-acceptable for `style-src/script-src` (lower priority than `onclick` which UX-H3 closed in Rounds 6-9). Future round can migrate to global `addEventListener('error', e => ...)` capture-phase delegation if user prioritizes.
+
+**Files Touched**
+
+- `tests/jest/feature-flags-drift.test.js` (+9 lines: DOCUMENTED_NOT_USED whitelist entry + comment)
+- `WORKFLOW-REFERENCE.md` (+252 lines: section 2.12 BO cron lifecycle + section 2.3.2 slip replay pool with 4 sub-sections)
+- `.second-brain/log.md` + `CHANGELOG.md` (Round 10 entries)
+
+**Risk Profile**
+
+- LOW (drift whitelist test config) + NONE (docs only)
+- No code touched in any snippet, no business logic changes
+- Drift suite remains 21/21 green after fix
+- WORKFLOW-REFERENCE.md MD060 lint clean (table style fixed mid-edit) — pre-existing MD040 fenced-code-language warnings unrelated to round 10 edits
+
+---
+
 ### Refactor + Docs + PERF — Round 9 FINAL (UX-H3 100% closure + Inventory/Manual Invoice diagrams + Snippet 7 cache priming) (2026-04-30)
 
 3 files closing the last 12 UX-H3 sites + 2 new flow diagrams + 5 cache-priming spots. Risk: LOW (delegation defense-in-depth, behavior preserved) + NONE (docs) + NONE (PERF additive).
