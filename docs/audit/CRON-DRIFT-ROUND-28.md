@@ -141,14 +141,27 @@ allowlist still has 1 entry (`b2f_junction_diff_cron` historical mention).
 
 1. **Heartbeat key naming consistency** — `flash_category_verify` has 2
    option keys. Need to reconcile reader/writer side then mark canonical.
+   ✅ **RESOLVED in Round 31** ([Admin System] DINOCO Health Monitor V.1.4):
+   Reader now reads canonical `dinoco_cron_flash_category_verify_last_run`
+   (matches Snippet 1 V.34.x writer) with fallback chain to legacy
+   `_dinoco_cron_flash_category_verify_cron_last_run` for backward compat.
+   Snippet 1 NOT modified (V.34.25 sensitive). Effect: `verify_cron_stale_*min`
+   warning no longer fires perpetually when cron is actually healthy.
 2. **Single-event crons** — `wp_schedule_single_event` calls (36 sites
    across 7 snippets) have NO heartbeat coverage by design (one-shot).
    But some DINOCO-specific patterns (e.g. `b2b_delivery_check_event`,
    `b2b_verify_slip_async`, `b2b_flash_courier_retry`) might benefit
    from observability. Defer until concrete need.
+   ⏸ **Still deferred** (Round 31 assessment): no concrete bug surfaced
+   from missing heartbeat. Cost-benefit doesn't justify per-event tracking
+   infrastructure. Revisit in Round 34+ if specific incident requires it.
 3. **Cron interval consistency** — `every_15min_b2b_bo` (Snippet 16) +
    `every_2hr_b2b` (Snippet 7) + `everytwohours` (Snippet 3) overlap
    semantically. Documented in CLAUDE.md but no detector enforces.
+   ⏸ **Still deferred** (Round 31 assessment): cosmetic only — no functional
+   impact since each snippet uses its own well-named filter. Consolidation
+   would touch 3 sensitive snippets including Snippet 1 (forbidden). Defer
+   indefinitely unless WP core schedule registration breaks.
 
 ## Summary
 
