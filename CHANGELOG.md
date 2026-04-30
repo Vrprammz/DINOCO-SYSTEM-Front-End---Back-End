@@ -10,6 +10,93 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 28 (Idempotency batch 6 +5 endpoints + cron audit + coverage tracker) (2026-04-30)
+
+Round 28 extends Idempotency-Key infrastructure to 5 admin POST endpoints + closes 2 cron heartbeat gaps + introduces a single-source-of-truth coverage tracker. **Cumulative: 28/75+ POST endpoints (~37% of mutating REST surface)**. ZERO regressions, all gates green.
+
+#### Phase 1 — Idempotency batch 6 (5 endpoints, +18 contract tests, 88 → 106 cases)
+
+| Endpoint | Snippet | Body Hash Inputs | Use Case |
+| --- | --- | --- | --- |
+| `POST /b2b/v1/admin-stock-unlock` | Snippet 3 V.42.12 → V.42.13 | `{sku, notify_tickets[normalized sort + dedup]}` | Admin double-click "ปลดล็อก" on slow Flex push → 2nd request hits 404 (already unlocked) + double-fires BO restock Flex notify → customers get duplicate spam. notify_tickets[] sorted + dedup → row reorder = same intent. |
+| `POST /b2b/v1/admin-stock-mark-oos` | Snippet 3 V.42.12 → V.42.13 | `{sku, eta_days}` | Admin re-estimating ETA between retries (7d → 14d) surfaces 409. Cached response replays stale eta_date — accepted (24h TTL boundary). |
+| `POST /b2b/v1/admin-submit-tracking` | Snippet 3 V.42.12 → V.42.13 | `{entries[normalized: sort by ticket_id, sanitize per-row]}` | Bulk pattern (2nd of its kind). 50-order tracking save retry → 50× duplicate Flex shipped notify + 50× duplicate delivery_check cron schedules. Wrapper replays {updated, errors} batch result. tracking_number typo correction or carrier change = 409. |
+| `POST /b2f/v1/approve-reschedule` | B2F Snippet 2 V.11.15 → V.11.16 | `{po_id, approved, note}` | Admin double-click "อนุมัติ"/"ปฏิเสธ" → 2nd request hits NO_PENDING (status flipped on first call). approved boolean CRITICAL discriminator (approve vs reject same PO ≠ same hash). note = audit trail content. |
+| `POST /b2f/v1/reject-resolve` | B2F Snippet 2 V.11.15 → V.11.16 | `{rcv_id, action, note}` | Admin double-click "ดำเนินการ" → 2nd request hits ALREADY_RESOLVED. Existing GET_LOCK protects short-window concurrency; wrapper extends to 24h replay. action enum (replacement/reship/write_off) = 3 distinct financial impacts → MUST hash distinctly. |
+
+**Pattern (proven Round 19/23/25/26/27)**: optional `X-Idempotency-Key` header + helper triad + `function_exists()` defensive guards. Backward compat: missing header = byte-identical to previous version. WP_Error 409 on body hash mismatch. Bulk endpoints canonicalize array order via `usort()`. Bulk-of-targets pattern (admin-stock-unlock notify_tickets[]) = treat secondary array like bulk: sort + dedup before hash.
+
+#### Phase 2 — Cron audit (2 crons migrated to registry)
+
+Drift detection sweep across 34 scheduled crons identified 2 still on legacy `add_action` without heartbeat tracking visibility:
+
+- `dinoco_flag_audit_retention_cron` — Flag Audit Log V.1.0 → V.1.1
+- `dinoco_idempotency_cleanup_cron` — Idempotency Helper V.1.0 → V.1.1
+
+Both wrapped with `dinoco_register_cron` + fallback `add_action` (preserves backward compat when Health Monitor snippet not synced). `wp_schedule_event` preserved unchanged to keep custom 03:00 / 03:15 time-of-day schedule.
+
+**Result**: 34 scheduled crons → 32 already registered + 2 fixed = **100% heartbeat coverage** (excluding intentional one-shot single events).
+
+Report: `docs/audit/CRON-DRIFT-ROUND-28.md` — findings + handler verification + 2 deferred Round 29 candidates (heartbeat key naming consistency, single-event observability).
+
+#### Phase 3 — Coverage tracker (`docs/audit/IDEMPOTENCY-COVERAGE.md`)
+
+NEW single-source-of-truth tracker for Idempotency-Key endpoint integration status. Lists all 28 integrated endpoints with snippet version, pattern type, round added, status. Helps future rounds pick next batch + lets reviewers audit at a glance.
+
+Pending list grouped by priority:
+
+- High (Round 29 candidates): `combined-slip-upload`, `combined-invoice-gen`, `import-distributors`, `recalculate-total`, `delete-ticket`
+- Medium (Round 30+): MCP claim/lead endpoints, manual-flash-ready/test, stock/adjust + transfer, B2F maker-* + reject-lot
+- Low (don't need wrapper): `print-ack`, `print-heartbeat`, `flash-webhook`, `rpi-command-ack`, `test-push`, `god-mode/verify` (rationale documented)
+
+Pattern legend documents 4 types: single (most common) / bulk (items[]/skus[]) / bulk-of-targets (admin-stock-unlock) / state-machine (po-complete).
+
+#### Phase 4 — Pattern doc + drift sync
+
+`docs/patterns/IDEMPOTENCY-KEY.md` "Used in" section updated:
+
+- 23 → 28 endpoints
+- ~31% → ~37% coverage
+- 88 → 106 contract test cases
+- Cross-link to new tracker
+- Round 29 recommendation list
+
+#### Round 28 — Verification gate
+
+- PHPUnit: 511 → 529 (+18 cases: 17 new + 1 cumulative collision update). ALL GREEN.
+- Jest: 21 suites / 156 tests + 2 skipped — stable. cron-drift.test.js 7/7 pass.
+- `php -l`: clean on Snippet 3, B2F Snippet 2, Flag Audit Log, Idempotency Helper
+- markdown-links.test.js 2/2 pass after new doc cross-links
+
+#### Round 28 — Cumulative coverage
+
+- 28/75+ POST endpoints with central Idempotency-Key support (~37% of mutating surface)
+- 529 PHPUnit + 156 Jest + 25 × 4 Playwright = 836 tests total (was 818)
+- 8 drift detectors active (cron-drift now reports 100% heartbeat coverage)
+
+#### Round 28 — Files touched (5 total, 4 commits)
+
+- Phase 1 commit `11716b2` (Idempotency batch 6): 3 files
+  - `[B2B] Snippet 3: LIFF E-Catalog REST API` V.42.12 → V.42.13 (3 endpoints)
+  - `[B2F] Snippet 2: REST API` V.11.15 → V.11.16 (2 endpoints)
+  - `tests/helpers/IdempotencyEndpointContractTest.php` (+18 cases)
+- Phase 2 commit `9c64bd9` (cron audit): 3 files
+  - `[Admin System] DINOCO Flag Audit Log` V.1.0 → V.1.1
+  - `[Admin System] DINOCO Idempotency Helper` V.1.0 → V.1.1
+  - `docs/audit/CRON-DRIFT-ROUND-28.md` (new)
+- Phase 3 commit `763de38` (coverage tracker): 2 files
+  - `docs/audit/IDEMPOTENCY-COVERAGE.md` (new)
+  - `docs/patterns/IDEMPOTENCY-KEY.md` (Used in update)
+- Phase 4 commit (this docs sync): `CLAUDE.md` + `CHANGELOG.md` + `README.md`
+
+#### Round 28 — Recommendation for Round 29
+
+- **Idempotency batch 7 (push to ~43%)**: 5 high-priority endpoints already triaged in `IDEMPOTENCY-COVERAGE.md` (combined-slip-upload, combined-invoice-gen, import-distributors, recalculate-total, delete-ticket).
+- **Pivot candidates** (defer Idempotency batch 7):
+  - **Sentry canary observation** — V.4.0 GDPR + Phase 5 Observability snippets are flag-OFF. Time to flip + 7-day observation per `docs/runbooks/SENTRY-ACTIVATION.md`.
+  - **B2F CPT final drop** — Phase 4 migration target 2026-05-02 day 14 (today + 2 days).
+  - **Vite LIFF bundle staging** — `liff-src/b2b/catalog/` artifacts ready since Round 18; needs staging-first canary per `docs/runbooks/WEEK-LONG-SPRINT-2026-04-29.md` Day 4.
+
 ### Feature — Round 27 (Idempotency batch 5 +5 endpoints — first bulk-array batch) (2026-04-30)
 
 Round 27 extends Round 19/23/25/26 Idempotency-Key infrastructure to 5 more critical POST endpoints. **Cumulative: 23/75+ POST endpoints (~31% of mutating REST surface)**. First batch dominated by bulk-array endpoints (3/5) — formalized canonical sort pattern in `docs/patterns/IDEMPOTENCY-KEY.md` §"Bulk endpoint considerations" (5 rules + bo-split reference impl). ZERO regressions, all gates green.

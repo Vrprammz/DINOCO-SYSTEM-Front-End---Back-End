@@ -154,17 +154,19 @@ All under `/wp-json/dinoco/v1/flag-audit*` (V.1.0 — `[Admin System] DINOCO Fla
 
 ## REST API Endpoints (Idempotency Helper — `dinoco/v1`)
 
-All under `/wp-json/dinoco/v1/idempotency*` (V.1.0 — `[Admin System] DINOCO Idempotency Helper`):
+All under `/wp-json/dinoco/v1/idempotency*` (V.1.1 — `[Admin System] DINOCO Idempotency Helper`):
 
 - `GET /idempotency` — list with filters (namespace, user_id, days, limit, offset). Returns rows + meta.
 - `POST /idempotency/cleanup` — manual cleanup trigger (admin only). Returns deleted count.
 - Permission: `manage_options` + `wp_rest` nonce. Schema `wp_dinoco_idempotency_keys` (lazy install on first admin_init).
-- Used by **23 integrated endpoints** (Rounds 19-27, ~31% of POST surface):
+- Cleanup cron `dinoco_idempotency_cleanup_cron` registered via `dinoco_register_cron` (Round 28, V.1.1) for Health Monitor heartbeat tracking.
+- Used by **28 integrated endpoints** (Rounds 19-28, ~37% of POST surface) — see `docs/audit/IDEMPOTENCY-COVERAGE.md` for full tracker:
   - **Round 19** (3): `POST /b2b/v1/place-order`, `POST /b2b/v1/manual-flash-create`, `POST /b2f/v1/create-po`
   - **Round 23** (5): `POST /b2b/v1/confirm-order`, `POST /b2b/v1/flash-create`, `POST /b2b/v1/manual-flash-cancel`, `POST /b2f/v1/po-update`, `POST /b2f/v1/receive-goods`
   - **Round 25** (5): `POST /b2b/v1/update-status`, `POST /b2b/v1/cancel-request`, `POST /b2f/v1/po-cancel`, `POST /b2f/v1/maker-confirm`, `POST /b2f/v1/record-payment`
   - **Round 26** (5): `POST /b2b/v1/bo-confirm-full`, `POST /b2b/v1/bo-split`, `POST /b2b/v1/bo-undo-split`, `POST /b2f/v1/maker-deliver`, `POST /liff-ai/v1/lead/{id}/accept`
   - **Round 27** (5): `POST /b2b/v1/bo-cancel-item`, `POST /b2b/v1/bo-bulk-fulfill`, `POST /b2b/v1/bo-bulk-cancel`, `POST /b2f/v1/po-complete`, `POST /dinoco-stock/v1/dip-stock/approve` (first batch with 3 bulk-array endpoints — canonical sort pattern in `docs/patterns/IDEMPOTENCY-KEY.md` §Bulk endpoint considerations)
+  - **Round 28** (5): `POST /b2b/v1/admin-stock-unlock`, `POST /b2b/v1/admin-stock-mark-oos`, `POST /b2b/v1/admin-submit-tracking`, `POST /b2f/v1/approve-reschedule`, `POST /b2f/v1/reject-resolve` (2nd bulk-array endpoint admin-submit-tracking entries[] sort by ticket_id + bulk-of-targets pattern admin-stock-unlock notify_tickets[])
 
 ## REST API Endpoints (MCP Bridge)
 
