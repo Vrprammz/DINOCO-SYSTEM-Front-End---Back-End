@@ -203,6 +203,74 @@ Walk-in Bank Account:
 End State: Order paid, debt updated
 ```
 
+#### 2.3.1 Slip Verification Sequence Diagram (Mermaid)
+
+แสดงลำดับการยืนยันสลิปใน B2B + B2F (Slip2Go API integration = PULL-only, no webhook).
+
+```mermaid
+sequenceDiagram
+    participant Customer as ลูกค้า/Maker
+    participant LineG as LINE Group
+    participant Bot as DINOCO Bot
+    participant Slip2Go as Slip2Go API
+    participant DB as MySQL (orders/PO)
+    participant AdminG as Admin Group
+
+    Note over Customer,AdminG: === B2B Customer Slip ===
+    Customer->>LineG: ส่งรูปสลิป (image message)
+    LineG->>Bot: webhook → image event
+    Bot->>Bot: download from LINE Content API
+    Bot->>Slip2Go: POST /api/verify-slip<br/>(B2B_SLIP2GO_SECRET_KEY)
+
+    alt สลิปถูกต้อง + match bank account
+        Slip2Go-->>Bot: { amount, bank, account, timestamp }
+        Bot->>DB: SELECT pending orders<br/>WHERE distributor_id=X<br/>AND total ±2% match
+        alt match สำเร็จ
+            Bot->>DB: status → paid<br/>b2b_debt_subtract (atomic FOR UPDATE)
+            Bot->>LineG: Flex ใบเสร็จ → กลุ่มลูกค้า
+            Bot->>AdminG: Flex แจ้ง Admin (สรุป)
+        else match ไม่ได้ (ยอดไม่ตรง)
+            Bot->>LineG: Flex "ตรวจไม่พบออเดอร์"
+            Bot->>AdminG: Flex แจ้ง Admin ตรวจสอบเอง
+        end
+    else สลิปปลอม / verify fail
+        Slip2Go-->>Bot: { error: invalid_signature }
+        Bot->>LineG: Flex "สลิปไม่ผ่าน"
+        Bot->>AdminG: Flex แจ้ง Admin ตรวจสอบ
+    end
+
+    Note over Customer,AdminG: === B2F Maker Slip ===
+    Note right of Bot: Maker LINE group (different routing)
+    Customer->>LineG: ส่งรูปสลิป (THB only)
+    LineG->>Bot: webhook → b2f_handle_maker_slip_image
+    Bot->>DB: SELECT b2f_maker WHERE group_id=X<br/>(b2f_get_maker_by_group cached 5min)
+
+    alt Maker has maker_bank_code (ACF)
+        Bot->>Slip2Go: POST /api/verify-slip
+        Slip2Go-->>Bot: { amount, bank, ... }
+        Bot->>DB: b2f_find_pending_po_for_slip<br/>(±2% match + status='received')
+        alt match สำเร็จ
+            Bot->>DB: pmt_slip_status = verified<br/>FSM transition (paid)<br/>b2f_payable_subtract (atomic)
+            Bot->>LineG: Flex แจ้ง Maker
+            Bot->>AdminG: Flex แจ้ง Admin
+        else
+            Bot->>LineG: Flex "ตรวจไม่พบ PO"
+        end
+    else Maker ไม่มี maker_bank_code
+        Bot->>DB: pmt_slip_status = pending<br/>(admin manual review)
+        Bot->>AdminG: Flex แจ้ง Admin ตรวจสอบเอง
+    end
+
+    Note over Customer,AdminG: Foreign currency PO (CNY/USD) skips Slip2Go<br/>→ admin_approved manual flow
+```
+
+**Implementation refs**:
+
+- B2B: Snippet 2 (`b2b_handle_distributor_slip_image`) + Snippet 3 (slip match query)
+- B2F: Snippet 1 (`b2f_verify_slip_image`) + Snippet 3 (`b2f_handle_maker_slip_image`)
+- Constants: `B2B_SLIP2GO_SECRET_KEY` (shared B2B + B2F)
+- Atomic transactions: `b2b_debt_subtract` / `b2f_payable_subtract` (FOR UPDATE lock)
+
 ### 2.4 B2B Shipping (Flash Express)
 
 ```
@@ -1521,6 +1589,72 @@ Lead Statuses (V.2.0 — 20 statuses):
   (ทุก status มีทางไป closed_lost/cancelled)
 ```
 
+#### 7.2.1 LIFF AI Lead Pipeline State Diagram (Mermaid)
+
+แสดง state transitions ของ Lead (V.2.0 — 17 statuses ใน `lead-pipeline.js`). Used by LIFF AI Lead Detail page (`[liff_ai_page]`) + dealer postback handlers + Telegram commands. Diagram โฟกัสที่ key transitions; รัฐ terminal (`closed_won` / `closed_lost` / `cancelled`) เข้าได้จากเกือบทุก state.
+
+```mermaid
+stateDiagram-v2
+    [*] --> new: AI detect ชื่อ+เบอร์<br/>(ai-chat.js Auto-Lead V.8.0)<br/>or admin manual create
+
+    new --> contacted: dealer/admin contact<br/>(LINE/Phone)
+    new --> dealer_notified: notifyDealerDirect()<br/>auto-assign
+
+    contacted --> interested: customer ตอบรับ<br/>(qualified)
+    contacted --> closed_lost: ติดต่อไม่ได้<br/>(>3 attempts)
+
+    dealer_notified --> contacted: dealer accept lead<br/>(LIFF AI postback)
+    dealer_notified --> waiting_decision: dealer ส่งใบเสนอราคา
+    dealer_notified --> reassigned: dealer reject<br/>(>72h no response)
+
+    interested --> waiting_decision: dealer ส่งใบเสนอราคา
+    interested --> waiting_stock: สินค้าหมดสต็อก<br/>(StockBack Flex pending)
+
+    waiting_decision --> closed_won: customer สั่งซื้อ
+    waiting_decision --> closed_lost: customer ปฏิเสธ<br/>or no decision >14d
+    waiting_decision --> negotiating: ต่อราคา/เงื่อนไข
+
+    negotiating --> waiting_decision: ส่งข้อเสนอใหม่
+    negotiating --> closed_won
+    negotiating --> closed_lost
+
+    waiting_stock --> interested: stock ready<br/>(StockBack Flex sent)
+    waiting_stock --> closed_lost: customer หา/ใจเย็นไม่รอ
+
+    reassigned --> dealer_notified: assign ตัวแทนใหม่
+    reassigned --> closed_lost
+
+    closed_won --> [*]: archived
+    closed_lost --> [*]: archived
+    cancelled --> [*]: archived
+
+    note right of new
+        Auto-followup cron (4h):
+        - new >24h → followup
+        - dealer_notified >72h → reassign
+    end note
+```
+
+**Transition triggers**:
+
+| Trigger Type | Source | Statuses Affected |
+| ------------ | ------ | ----------------- |
+| AI detect | `ai-chat.js` Auto-Lead V.8.0 | `[*] → new` |
+| Dealer postback | LIFF AI Flex card buttons | `dealer_notified → contacted` / `interested → waiting_decision` |
+| Cron auto-followup | OpenClaw `lead-no-contact-cron` (every 4h) | `new → contacted` (dealer reminder), `dealer_notified → reassigned` (>72h) |
+| Cron stock back | WP `b2b_stock_back_notify_cron` | `waiting_stock → interested` |
+| Telegram command | น้องกุ้ง bot (`/lead-update`) | any status (admin override) |
+| LIFF AI direct | `POST /liff-ai/v1/lead/{id}/status` | any → any (dealer/admin auth) |
+
+**FSM authority** (`openclawminicrm/proxy/lead-pipeline.js`):
+
+- `updateLeadStatus(leadId, newStatus, actor)` — single FSM gate
+- Validates transition table (rejects invalid edges) + logs to `leads.history[]` array
+- Emits Telegram alert on status change (V.2.0 alert system)
+- Postback handler **never** mutates status directly — always routes through FSM
+
+**Backward compat**: 3 legacy statuses (`closed_won` / `waiting_decision` / `waiting_stock`) added in V.2.0 but old `new/contacted/interested/closed_lost` workflow unchanged. New leads default `status='new'`.
+
 ### 7.3 Telegram Command Workflow (น้องกุ้ง V.1.0)
 
 ```
@@ -1851,6 +1985,56 @@ Multi-Warehouse:
   - dinoco_get_total_stock($sku) รวมทุกคลัง
   - dinoco_transfer_stock($sku, $from, $to, $qty)
 ```
+
+#### 10.5.1 Dip Stock Cycle State Diagram (Mermaid)
+
+แสดง state ของ dip stock session (V.39.0) ตั้งแต่ admin เปิด session จนกว่าจะ approve / force-close. Snapshot เฉพาะ leaf SKUs (V.42.22 leaf-based classification).
+
+```mermaid
+stateDiagram-v2
+    [*] --> not_started: page load (no active session)
+
+    not_started --> counting: POST /dip-stock/start<br/>(snapshot leaf SKUs<br/>dinoco_is_leaf_sku filter)
+
+    counting --> counting: POST /dip-stock/count<br/>(per-SKU counted_qty update)
+    counting --> variance_review: POST /dip-stock/current<br/>(all SKUs counted → preview variance)
+
+    variance_review --> counting: edit some SKU<br/>(re-count adjustment)
+    variance_review --> approved: POST /dip-stock/approve<br/>(adjust stock via<br/>dinoco_stock_add/subtract)
+
+    counting --> force_closed: POST /dip-stock/force-close<br/>(admin abort, no adjustment)
+    variance_review --> force_closed: POST /dip-stock/force-close
+
+    counting --> expired: cron auto-expire >48h<br/>(dinoco_dip_stock_expire_cron)
+    variance_review --> expired: cron auto-expire
+
+    approved --> [*]: session archived<br/>(history viewable via /dip-stock/history)
+    force_closed --> [*]
+    expired --> [*]
+```
+
+**State transitions table**:
+
+| From | To | Trigger | Side Effects |
+| ---- | -- | ------- | ------------ |
+| not_started | counting | `POST /dip-stock/start` | INSERT `dinoco_dip_stock` (status=counting) + per-SKU rows in `dinoco_dip_stock_items` (expected_qty=current stock or 0 for initial import) |
+| counting | counting | `POST /dip-stock/count` | UPDATE `dinoco_dip_stock_items.counted_qty` per SKU (idempotent) |
+| counting | variance_review | `POST /dip-stock/current` after all counted | Compute variance = counted - expected per SKU |
+| variance_review | approved | `POST /dip-stock/approve` | For each variance: call `dinoco_stock_add()` or `dinoco_stock_subtract()` (atomic FOR UPDATE) + status='approved' + closed_at=NOW |
+| counting/variance_review | force_closed | `POST /dip-stock/force-close` | status='force_closed' + reason logged + NO stock adjustment |
+| counting/variance_review | expired | Cron `dinoco_dip_stock_expire_cron` (twicedaily) | status='expired' if started_at < NOW - 48h |
+
+**Cron schedule** (Snippet 15):
+
+- `dinoco_dip_stock_reminder_cron` — daily, 30-day interval (configurable) → reminder LINE Flex if no session in 30+ days
+- `dinoco_dip_stock_expire_cron` — twicedaily → auto-expire stale sessions
+
+**Guards**:
+
+- DD-2 (V.39.0): snapshot เฉพาะ leaf nodes (ไม่นับ SET + sub-SET) — `dinoco_is_leaf_sku()` filter
+- V.42.22: classification leaf-based (ตรงกับ stock/list V.42.21 + JS V.42.13)
+- 1 active session per warehouse — INSERT guards via SELECT FOR UPDATE
+- Approve requires all SKUs counted (no NULL counted_qty)
 
 ### 10.6 Auto-Split Workflow (V.41.0 → V.42.11)
 
