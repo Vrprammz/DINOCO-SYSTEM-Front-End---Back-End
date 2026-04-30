@@ -10,6 +10,42 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 32 (Idempotency batch 10 — 🎯 25.4% TRUE milestone) (2026-04-30)
+
+Round 32 pushes idempotency coverage to **49/193 POST endpoints (25.4%)** — 🎯 **first milestone past 1/4 of POST endpoints AGAINST AUTHORITATIVE Round 30 census denominator** (earlier 25%/30%/35%/40%/45% milestones in tracker were against stale ~75 estimate). ZERO regressions across **623 PHPUnit (was 606, +17) + 160 Jest** (drift detector still green).
+
+#### Phase 1 — Idempotency batch 10 (5 endpoints)
+
+5 retry-prone admin/maker hot paths:
+
+- **`POST /b2f/v1/maker-reschedule`** — Maker LIFF "ขอเลื่อนวันส่ง" double-fire on slow LINE = 2x reschedule history rows + 2x admin Flex push. Body hash `{po_id, maker_id (JWT-scoped), new_date, reason}`. new_date in hash → 409 if maker edits date between retries.
+- **`POST /b2b/v1/manual-flash-test`** — admin "ทดสอบ Flash API" retry burns 2x Flash API quota + log spam. Constant marker `{action:'test'}` hashes consistently for retries.
+- **`POST /b2b/v1/bo-update-eta`** — admin "📅 ETA" retry double-appends "|" separator notes silently (status guard pending/ready bypassed after first call). Body hash `{bo_queue_id, eta_days, notes}` — different notes between retries surfaces 409.
+- **`POST /b2b/v1/bo-restock-scan`** — admin double-click "🔍 Restock Scan" + manual cron concurrent run = 2x mark-ready + 2x Telegram alert + 2x cache invalidation. Body hash `{sku}` (empty for full scan) — full vs specific = different intents.
+- **`POST /b2f/v1/reject-lot`** — admin "ปฏิเสธทั้ง lot" double-click = 2x Maker rejection Flex push (FSM blocks 2nd transition but Flex builder re-fires before FSM check). Body hash `{po_id, reason}` — reason in hash since it's Maker's audit trail.
+
+Backward compat: missing `X-Idempotency-Key` header = byte-identical to V.3.6 / V.42.14 / V.11.17 behavior.
+
+Versions:
+
+- `[B2B] Snippet 16: Backorder System` V.3.6 → V.3.7
+- `[B2B] Snippet 3: LIFF E-Catalog REST API` V.42.14 → V.42.15
+- `[B2F] Snippet 2: REST API` V.11.17 → V.11.18
+
+Tests: `tests/helpers/IdempotencyRound32Test.php` — 17 fixture-based contract tests (5×3 cases + cumulative no-collision + cross-namespace maker-reschedule vs reject-lot pair guard). PHPUnit 606 → 623 (+17 tests). All 17 pass.
+
+#### Phase 2 — Documentation in-place updates
+
+- `docs/audit/IDEMPOTENCY-COVERAGE.md` — Status summary 22.8% → **🎯 25.4%**, Milestones table NEW Round 32 row (TRUE milestone vs stale-denominator earlier rows), Integrated endpoints table +5 rows (#46-50), Pending POST endpoints refreshed (Round 33 candidates: maker-product CRUD, maker CRUD, po-undo-submit, distributor-notify, customer-link), Test coverage table NEW Round 32 row.
+- `CLAUDE.md` drift sweep — "Idempotency-Key Helper + Endpoint Integration" section synced from stale Round 19 numbers (3 endpoints / 72+ remaining) to current Round 32 (49 endpoints / 144 remaining / 14 rounds across 4 namespaces). Tracker linked as source of truth.
+- `README.md` badge — Idempotency coverage 22.8% → 25.4%.
+
+#### Verification
+
+- Drift detector (`tests/jest/idempotency-tracker-drift.test.js`) — all 50 tracker rows resolve to real snippet files + each file contains `dinoco_idempotency_check` + each endpoint suffix appears as string literal. Round 31 F1-class regression guard remains effective.
+- PHP lint clean across 3 modified snippets.
+- Test count delta: +17 PHPUnit (623 total), Jest stable at 160.
+
 ### Feature — Round 31 (Idempotency batch 9 + cron audit follow-ups + drift detector expansion) (2026-04-30)
 
 Round 31 push toward **22.8% Idempotency-Key coverage** (44/193 POST endpoints) + closes 1 deferred cron audit item from Round 28 + adds F1-class drift regression guard. ZERO regressions across 606 PHPUnit + 160 Jest tests.

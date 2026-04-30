@@ -24,8 +24,14 @@ WordPress-based motorcycle warranty management platform serving B2C members and 
 
 ## What's New (2026-04-30)
 
-Recent infrastructure rounds (Rounds 13-28):
+Idempotency-Key coverage: **🎯 25.4% (49/193 POST endpoints)** — true milestone against authoritative Round 30 census denominator. See [`docs/audit/IDEMPOTENCY-COVERAGE.md`](docs/audit/IDEMPOTENCY-COVERAGE.md).
 
+Recent infrastructure rounds (Rounds 13-32):
+
+- **Round 32** — Idempotency batch 10 +5 endpoints (44 → 49, **🎯 25.4% TRUE milestone**). maker-reschedule (Maker LIFF retry guard) + manual-flash-test (Flash quota retry burn) + bo-update-eta (silent "|" notes double-append) + bo-restock-scan (admin click + cron concurrent) + reject-lot (Maker rejection Flex re-fire). +17 contract tests (183 → 200 cumulative).
+- **Round 31** — Idempotency batch 9 +5 endpoints (39 → 44, 22.8%) + cron audit follow-ups + NEW F1-class drift regression guard (`tests/jest/idempotency-tracker-drift.test.js`). claim-update + lead-update (paired with Round 30 creates) + product/pricing + warehouse + maker-reject. +17 contract tests (166 → 183 cumulative).
+- **Round 30** — Idempotency batch 8 +6 endpoints (incl. F1 HIGH drift fix for bo-fulfill listed integrated since Round 19 but had no wrapper) + REST endpoint census (75 → 193 authoritative POST denominator) + IdempotencyTestFixture DRY base class adoption. +21 contract tests (145 → 166).
+- **Round 29** — Idempotency batch 7 +5 endpoints (28 → 33) + IdempotencyTestFixture introduction (~80% LOC saved per round file) + 4-finding drift sweep + README badge. +21 contract tests.
 - **Round 28** — Idempotency batch 6 +5 endpoints (23 → 28, ~37% of POST surface) + cron audit (2 crons migrated to registry heartbeat = 100% coverage) + NEW `docs/audit/IDEMPOTENCY-COVERAGE.md` tracker. 3 admin B2B endpoints (admin-stock-unlock + admin-stock-mark-oos + admin-submit-tracking) + 2 B2F endpoints (approve-reschedule + reject-resolve). 2nd bulk-array endpoint (admin-submit-tracking entries[] sort by ticket_id) + bulk-of-targets pattern (admin-stock-unlock notify_tickets[]). +18 contract tests (88 → 106 cases).
 - **Round 27** — Idempotency batch 5 +5 endpoints (18 → 23, ~31% of POST surface). 3 BO endpoints (bo-cancel-item / bo-bulk-fulfill / bo-bulk-cancel) + B2F po-complete + Inventory dip-stock/approve. First batch with 3 bulk-array endpoints — canonical sort pattern proven (admin row reorder ≠ different intent; qty/value field changes still surface 409). +16 contract tests.
 - **Round 26** — Idempotency batch 4 +5 endpoints (13 → 18, ~24% of POST surface) + GDPR V.4.0 LINE messages export from OpenClaw MongoDB (closes deferred Phase 6.1 item from CLAUDE.md scope). +29 tests (16 contract + 13 LINE export normalization).
