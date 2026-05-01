@@ -10,6 +10,59 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF Round 1 — B2F Maker LIFF foundation port (CSS + 6 utility modules + bootstrap) (2026-04-30)
+
+First **actual UI code port** in the Vite migration (not scaffold). Smallest scope chosen first: B2F Maker LIFF (1,745 LOC inline → V.4.7 header bump only; PHP runtime UNCHANGED). Round 1 = foundation; Rounds 2-5 will port page renderers + cut over.
+
+**Files added** (8 new files, ~1,705 LOC):
+
+- `liff-src/b2f/maker/styles.css` (~600 LOC) — verbatim CSS port from `b2f_liff_page_css()` lines 48-238
+- `liff-src/b2f/maker/utils/lang.js` (145 LOC) — `L()` 3-language picker + `setupLanguage()` + `STATUS_TH/EN/ZH` (12 statuses each) + `statusLabel()`
+- `liff-src/b2f/maker/utils/format.js` (130 LOC) — `formatNumber`, `curSym`, `formatDate`, `fmtDateShort` (Buddhist Era for Thai), `escHtml` (textContent round-trip)
+- `liff-src/b2f/maker/utils/dom.js` (175 LOC) — `$`, `$$`, `showToast`, `showError`, `showLoading`, `lockBtn`/`unlockBtn` (single-flight LOCKED state), `setupOfflineDetection`
+- `liff-src/b2f/maker/utils/jwt.js` (50 LOC) — `jwtPayload` (no signature verify — frontend display hints only)
+- `liff-src/b2f/maker/utils/badges.js` (230 LOC) — `modeBadgeHtml` (V.4.3), `modeSummaryHtml` (V.4.6 — flag-gated PO list mix breakdown), `buildStatusInfoBadges` (V.3.16)
+- `liff-src/b2f/maker/utils/timeline.js` (200 LOC) — `getMinDate`, `buildTimelineBars` (delivery + payment-due bars with overdue color thresholds); `buildTimeline` scaffold (Round 2)
+- `liff-src/b2f/maker/entry.js` (175 LOC, V.0.1 stub → V.0.2 foundation) — full bootstrap: `initLiff` + `setupLanguage` (from currency/JWT) + `setupOfflineDetection`. Exposes helpers via `window.DINOCO_B2F_MAKER` for inline-bridge during parallel rendering window.
+
+**Tests added** (1 new file, 480 LOC, +59 tests, 191 → 250):
+
+- `tests/jest/liff-b2f-maker-utils.test.js` — covers all 6 utility modules: lang (11 tests), format (16), dom (8), jwt (3), badges (16), timeline (5).
+
+**Snippet wiring** (1 file changed, header only):
+
+- `[B2F] Snippet 4: Maker LIFF Pages` V.4.6 → **V.4.7** — header comment block bump documenting Round 1 port. PHP runtime UNCHANGED. Vite-or-inline conditional rendering (`b2f_maker_liff_render_vite_or_inline`) was already in place since V.4.5. Production behavior preserved (REG-029 byte-identical) until `dinoco_liff_use_vite_b2f_maker` flag flipped + Round 5 cutover lands.
+
+**Bundle size delta**:
+
+- `dist/liff/b2f-maker.<hash>.js`: **1.2 KB → 12.0 KB** (gzip 4.79 KB) — first real code introduced
+- `dist/liff/b2f-maker.<hash>.css`: new — 10.5 KB (gzip 2.71 KB) — extracted from inline `<style>` block
+- Bundle-size guard threshold bumped 10 KB → 16 KB per entry (`tests/jest/bundle-size.test.js`) with rationale logged in test header. Round 2-5 will hoist shared helpers into `chunks/` so the threshold can ratchet back.
+
+**Production safety** (triple gate preserved):
+
+- `dinoco_liff_use_vite_b2f_maker` flag default OFF
+- Manifest absent in production (Step 3 disabled) → `dinoco_liff_enqueue('b2f-maker')` returns false → fallback inline
+- Inline `b2f_liff_page_css()` + `b2f_liff_page_js()` UNCHANGED in Snippet 4 — Round 5 is the only point where inline gets dropped
+
+**Round 2-5 roadmap** (next sprints):
+
+- Round 2: page renderers (5 pages) + full `buildTimeline` body
+- Round 3: router (`?view=` / JWT page fallback) + `apiCall` wrapper
+- Round 4: inline-bridge cleanup
+- Round 5: drop inline `b2f_liff_page_js()` from Snippet 4 once flag flipped + soaked 1 week
+
+**Verification commands**:
+
+```bash
+npm run build:liff           # → dist/liff/b2f-maker.<hash>.js (12 KB)
+npm run test:jest            # → 250 tests pass (was 191)
+npx jest liff-b2f-maker-utils.test.js   # → 59 unit tests
+php -l "[B2F] Snippet 4: Maker LIFF Pages"   # syntax clean
+```
+
+**Documentation**: `docs/runbooks/PHASE-2-VITE-MIGRATION.md` Step 2.5 section added (between Step 2 wiring + Step 3 deploy template).
+
 ### Feature — 🎯🎯🎯 70% MAJOR MILESTONE — Idempotency-Key middleware integrated to 139/196 POST endpoints (70.9%) — sustained 32-round campaign Rounds 18-50 (sprint round 50 anniversary) (2026-04-30) ⭐⭐⭐
 
 **Round 50 closes the 🎯 70% MAJOR MILESTONE + sprint round 50 anniversary milestone (doubly significant)** — Idempotency-Key middleware now wraps **139/196 POST endpoints (70.9%)** against the Round 30 authoritative census denominator. Past **7/10 of POST surface** integrated. **32-round sustained Idempotency campaign Rounds 18-50** — longest sustained drift-prevention instrumentation effort in DINOCO history (started with `place-order` + `manual-flash-create` + `create-po` in Round 19; closed 50% milestone in Round 42; reached 60% milestone in Round 46; reached 70% milestone in Round 50 with cross-snippet 2-file batch closure of Slip Monitor cluster + B2F Migration Audit cluster opening). ZERO regressions across **940 PHPUnit (was 922, +18) + 191 Jest** (23 suites — drift detector still green with 139 tracker entries).

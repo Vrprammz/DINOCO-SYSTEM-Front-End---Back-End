@@ -191,6 +191,64 @@ Each migration is an independent commit + flag flip. Don't migrate multiple at o
 
 ---
 
+## Step 2.5 — B2F Maker LIFF code port (Round 1 — foundation + utilities) ✅ (2026-04-30)
+
+First **actual UI code port** (not scaffold). Smallest scope chosen first: B2F Maker LIFF (1,745 LOC inline). Round 1 covers CSS + utilities + bootstrap; Round 2-5 will port page renderers + cut over.
+
+### What landed in Round 1
+
+| Path | LOC | Status |
+| --- | --- | --- |
+| `liff-src/b2f/maker/styles.css` | ~600 | Verbatim port of `b2f_liff_page_css()` lines 48-238 |
+| `liff-src/b2f/maker/utils/lang.js` | 145 | `L()` + `setupLanguage()` + `STATUS_TH/EN/ZH` + `statusLabel` |
+| `liff-src/b2f/maker/utils/format.js` | 130 | `formatNumber`, `curSym`, `formatDate`, `fmtDateShort`, `escHtml` |
+| `liff-src/b2f/maker/utils/dom.js` | 175 | `$`, `$$`, toast/error/loading, `lockBtn`/`unlockBtn`, offline detect |
+| `liff-src/b2f/maker/utils/jwt.js` | 50 | `jwtPayload` (display-only, no verify) |
+| `liff-src/b2f/maker/utils/badges.js` | 230 | `modeBadgeHtml` (V.4.3), `modeSummaryHtml` (V.4.6), `buildStatusInfoBadges` |
+| `liff-src/b2f/maker/utils/timeline.js` | 200 | `getMinDate`, `buildTimelineBars`; `buildTimeline` scaffold (Round 2) |
+| `liff-src/b2f/maker/entry.js` | 175 | Foundation bootstrap (`initLiff` + `setupLanguage` + offline detect) |
+| `tests/jest/liff-b2f-maker-utils.test.js` | 480 | **59 unit tests** covering all 6 utility modules |
+
+### Snippet wiring change
+
+`[B2F] Snippet 4: Maker LIFF Pages` V.4.6 → **V.4.7** — header comment update only. Vite-or-inline conditional rendering (`b2f_maker_liff_render_vite_or_inline`) was already in place since V.4.5. No PHP runtime change.
+
+### Bundle size delta
+
+| Entry | Before (V.0.1 stub) | After (V.0.2 Round 1) | Notes |
+| --- | --- | --- | --- |
+| `b2f-maker.<hash>.js` | 1.2 KB | **12.0 KB** (gzip 4.79 KB) | +CSS import + 6 utility modules + bootstrap |
+| `b2f-maker.<hash>.css` | n/a | 10.5 KB (gzip 2.71 KB) | New CSS chunk extracted from inline |
+
+Bundle-size guard threshold bumped from 10 KB → 16 KB per entry (`tests/jest/bundle-size.test.js`) to allow Round 1 growth. Rationale logged in test header — Round 2-5 will hoist shared code into `chunks/` so we can ratchet the threshold back.
+
+### Round 2-5 roadmap (next sprints)
+
+| Round | Scope | Touch points |
+| --- | --- | --- |
+| **2** | Page renderers (5 pages) | `liff-src/b2f/maker/pages/{confirm,detail,reschedule,list,deliver}.js` + `buildTimeline` full body |
+| **3** | Router + apiCall wrapper | `liff-src/b2f/maker/router.js` + `liff-src/b2f/maker/api.js` (extends shared `createApi`) |
+| **4** | Inline-bridge cleanup | Remove duplicated globals; entry.js owns full bootstrap |
+| **5** | Cut over | Drop inline `b2f_liff_page_js()` from Snippet 4 once flag flipped + soaked 1 week |
+
+### Production safety preserved
+
+- `dinoco_liff_use_vite_b2f_maker` flag still default OFF — **production unchanged**
+- Manifest absent in production (Step 3 disabled) → triple safety chain holds: flag + manifest + `dinoco_liff_enqueue` presence all required
+- Inline `b2f_liff_page_css()` + `b2f_liff_page_js()` UNCHANGED in Snippet 4 — Round 5 cutover is the only point where inline gets dropped
+- 59 new unit tests + drift detectors enforce that Round 1 utilities stay byte-identical to inline behavior
+
+### Verifying Round 1 locally
+
+```bash
+npm run build:liff           # → dist/liff/b2f-maker.<hash>.js (12 KB)
+npm run test:jest            # → 250 tests pass (was 191 before Round 1)
+npx jest liff-b2f-maker-utils.test.js   # → 59 unit tests for utilities only
+php -l "[B2F] Snippet 4: Maker LIFF Pages"   # syntax clean
+```
+
+---
+
 ## Step 3 — Production deploy of bundles (TEMPLATE READY ⏸ DISABLED)
 
 `.github/workflows/liff-deploy.yml` ready. **Disabled by default** — `workflow_dispatch` only until secrets provisioned + first manual dry-run verified.
