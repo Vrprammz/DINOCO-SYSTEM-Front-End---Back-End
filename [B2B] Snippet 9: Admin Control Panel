@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 9: Admin Control Panel                      ║
+ * ║  Version: V.34.3 (2026-04-30) — Round 39 batch 17: Idempotency-Key on 3 Flash admin     ║
+ * ║    setup endpoints (push toward 45% milestone — 84/196 = 42.9%):                        ║
+ * ║    • POST /b2b/v1/flash-webhook-setup — bulk-shape {webhook_url, codes:[0,1,2,3,4]}.    ║
+ * ║      Admin double-click "ตั้งค่า Webhook" → 2× POST /open/v3/notify/setting × 5 codes    ║
+ * ║      (10 Flash API calls instead of 5; quota burn). Wrapper returns cached 200 → single  ║
+ * ║      setup batch. Different webhook_url across retries (site URL change) → 409 alerts.   ║
+ * ║    • POST /b2b/v1/flash-api-test — bulk-shape {action, mch_id, is_production}. Admin    ║
+ * ║      double-click "ทดสอบ Flash API" → 2× GET /open/v3/warehouses (read-only but counts   ║
+ * ║      toward rate limit). is_production discriminator alerts admin if env switched mid-   ║
+ * ║      retry. Errors NOT cached so admin can retry immediately after config fix.            ║
+ * ║    • POST /b2b/v1/test-push — single {target, message}. Admin double-click "Test Push"  ║
+ * ║      → 2× LINE push to admin group (notification spam). Different message text across   ║
+ * ║      retries → 409 (admin changed mind). Same exact retry → cached 200 → single push.   ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.   ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical V.34.2 behavior. ║
  * ║  Version: V.34.2 (2026-04-30) — Round 34 batch 12: Idempotency-Key support on 2 distributor admin endpoints: ║
  * ║    • POST /b2b/v1/distributor/delete       — body hash {id}.                                  ║
  * ║      Admin double-click "ลบตัวแทน" → wp_delete_post is no-op on 2nd call (post already gone) ║
@@ -446,7 +461,49 @@ function b2b_rest_system_check( WP_REST_Request $req ) {
 function b2b_rest_test_push( WP_REST_Request $req ) {
     try {
     $target=sanitize_text_field($req->get_param('target'))?:'admin';$msg=sanitize_text_field($req->get_param('message'))?:'🧪 Test Push — '.b2b_date('d/m/Y H:i:s');
-    if($target==='admin'&&defined('B2B_ADMIN_GROUP_ID')){b2b_line_push(B2B_ADMIN_GROUP_ID,$msg);return new WP_REST_Response(array('success'=>true,'message'=>'ส่งไป Admin Group แล้ว'),200);}
+
+    // ── V.34.3 Round 39 batch 17: Idempotency-Key support ──
+    // Admin double-click "ทดสอบ Push" button → 2× LINE push to admin group (notification spam +
+    // confusing "did the test work twice?" UX). Body hash = {target, message_normalized} —
+    // preserves ability to send DIFFERENT messages with same key (e.g. admin retries with new
+    // wording) by 409, while also dedup-ing exact-same retries. Note: timestamp-default message
+    // means each fresh request without explicit message DOES get unique cache slot per second
+    // (intentional — admin probably wants log of each test).
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $req ) : '';
+    $idem_namespace = 'b2b/v1::test-push';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'target'  => (string) $target,
+            'message' => (string) $msg,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
+    if($target==='admin'&&defined('B2B_ADMIN_GROUP_ID')){
+        b2b_line_push(B2B_ADMIN_GROUP_ID,$msg);
+        $resp = array('success'=>true,'message'=>'ส่งไป Admin Group แล้ว');
+        // V.34.3 Round 39: store cached response for replay (success only)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response($resp,200);
+    }
     return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มีเป้าหมาย'),400);
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
@@ -625,12 +682,53 @@ function b2b_rest_print_monitor( WP_REST_Request $req ) {
 function b2b_rest_flash_webhook_setup( WP_REST_Request $req ) {
     try {
     $site_url = get_rest_url( null, 'b2b/v1/flash-webhook' );
+
+    // ── V.34.3 Round 39 batch 17: Idempotency-Key support ──
+    // Admin double-click "ตั้งค่า Webhook" button → 2× POST /open/v3/notify/setting calls per code
+    // (5 codes × 2 = 10 Flash API calls instead of 5; quota burn). Flash returns OK on duplicate
+    // setup but admin sees confusing dual completion banners. Body hash = {webhook_url, codes
+    // sorted constant} — webhook_url drives semantics; if site URL changes between retries the
+    // setup is genuinely different (force 409 to alert admin).
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $req ) : '';
+    $idem_namespace = 'b2b/v1::flash-webhook-setup';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'webhook_url' => (string) $site_url,
+            'codes'       => array( 0, 1, 2, 3, 4 ),
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     $results = array();
     foreach ( array(0,1,2,3,4) as $code ) {
         $r = function_exists('b2b_flash_setup_webhook') ? b2b_flash_setup_webhook( $site_url, $code ) : array('error'=>'b2b_flash_setup_webhook not found');
         $results[$code] = $r;
     }
-    return new WP_REST_Response( array('success'=>true,'results'=>$results,'webhook_url'=>$site_url), 200 );
+
+    $resp = array('success'=>true,'results'=>$results,'webhook_url'=>$site_url);
+
+    // V.34.3 Round 39: store cached response for replay (success only)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+
+    return new WP_REST_Response( $resp, 200 );
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
@@ -648,17 +746,57 @@ function b2b_rest_flash_api_test( WP_REST_Request $req ) {
     if ( ! function_exists('b2b_flash_get_warehouses') ) {
         return new WP_REST_Response( array('success'=>false,'message'=>'b2b_flash_get_warehouses not found (S1 not loaded)'), 200 );
     }
-    // FIX S-3: เพิ่ม diagnostic info เพื่อ debug Production vs Training
+
+    // ── V.34.3 Round 39 batch 17: Idempotency-Key support ──
+    // Admin double-click "ทดสอบ Flash API" → 2× GET /open/v3/warehouses calls (Flash quota burn
+    // — read-only but counts toward rate limit). Body hash = {action: 'flash-api-test', mch_id,
+    // is_production} — discriminates between training/production env so admin retest after
+    // env-switch creates new cache slot.
     $sk = B2B_FLASH_SECRET_KEY;
+    $is_production = strpos(B2B_FLASH_API_URL, 'open-api-tra') === false;
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $req ) : '';
+    $idem_namespace = 'b2b/v1::flash-api-test';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array(
+            'action'        => 'flash-api-test',
+            'mch_id'        => (string) B2B_FLASH_MCH_ID,
+            'is_production' => (bool) $is_production,
+        );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
+    // FIX S-3: เพิ่ม diagnostic info เพื่อ debug Production vs Training
     $diag = array(
         'api_url'    => B2B_FLASH_API_URL,
         'mch_id'     => B2B_FLASH_MCH_ID,
         'key_hint'   => substr($sk,0,4) . '...' . substr($sk,-4) . ' (' . strlen($sk) . ' chars)',
-        'is_production' => strpos(B2B_FLASH_API_URL, 'open-api-tra') === false,
+        'is_production' => $is_production,
     );
     $result = b2b_flash_get_warehouses();
     if ( ! empty($result['ok']) ) {
-        return new WP_REST_Response( array('success'=>true,'message'=>'Flash API connected','data'=>$result,'diagnostic'=>$diag), 200 );
+        $resp = array('success'=>true,'message'=>'Flash API connected','data'=>$result,'diagnostic'=>$diag);
+        // V.34.3 Round 39: store cached response for replay (success only — Flash error responses
+        // not cached to allow admin to immediately retry after fixing config without TTL wait).
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return new WP_REST_Response( $resp, 200 );
     }
     $err = isset($result['error']) ? $result['error'] : 'Unknown error';
     return new WP_REST_Response( array('success'=>false,'message'=>'Flash API: ' . $err,'data'=>$result,'diagnostic'=>$diag), 200 );

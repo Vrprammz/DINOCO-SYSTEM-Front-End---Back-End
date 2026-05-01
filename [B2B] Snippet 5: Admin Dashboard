@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 5: Admin Dashboard                          ║
+ * ║  Version: V.34.0 (2026-04-30) — Round 39 batch 17: Idempotency-Key on 2 Flash admin     ║
+ * ║    endpoints (push toward 45% milestone — 84/196 = 42.9%):                              ║
+ * ║    • POST /b2b/v1/flash-ready-to-ship — bulk-shape {ticket_ids sorted+deduped}. Admin   ║
+ * ║      double-click "พร้อมจัดส่ง" → 2× distributor Flex push spam + 2× courier /notify     ║
+ * ║      Flash quota burn + 2× admin LINE notification + 2× audit log churn per ticket.    ║
+ * ║      Wrapper returns cached 200 → single courier call + single notification batch.     ║
+ * ║    • POST /b2b/v1/daily-summary — constant-marker {action: 'trigger-summary'}. Admin   ║
+ * ║      manual-trigger via Dashboard button → 2× admin Flex summary card + 2× DB storm    ║
+ * ║      cron-replica read. Wrapper returns cached 200 within 24h → single push.            ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.   ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical V.33.9 behavior.║
  * ║  Version: V.33.9 (2026-04-30) — Round 38 batch 16: 🎯 40% milestone — Idempotency-Key on   ║
  * ║    POST /b2b/v1/flash-label. Admin double-click "ดาวน์โหลด Label" button → 2× Flash        ║
  * ║    /open/v3/orders/printPdf API call (quota burn + I/O waste). Body hash = {pno} —          ║
@@ -599,6 +610,39 @@ function b2b_rest_flash_ready_to_ship( WP_REST_Request $r ) {
     $tids = array_filter(array_map('intval', $tids));
     if (empty($tids)) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มี ticket_id'),400);
 
+    // ── V.34.0 Round 39 batch 17: Idempotency-Key support ──
+    // Admin double-click "พร้อมจัดส่ง" / bulk ready-to-ship action → 2× distributor LINE Flex push
+    // (customer "📦 ออเดอร์ #X กำลังจัดส่ง" spam) + 2× b2b_flash_notify_courier_from_warehouse call
+    // (Flash /open/v3/notify quota burn — every call charges) + 2× admin LINE notification + 2×
+    // audit log churn per ticket. Bulk-shape: {ticket_ids sorted + deduped} — admin input order
+    // shouldn't affect cache key. Replay returns cached 200 → single courier call + single Flex
+    // batch + single audit set.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::flash-ready-to-ship';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $sorted_tids = $tids;
+        sort( $sorted_tids, SORT_NUMERIC );
+        $sorted_tids = array_values( array_unique( $sorted_tids ) );
+        $idem_body = array( 'ticket_ids' => $sorted_tids );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     $total_parcels = 0;
     $notified_tids = array();
     foreach ($tids as $tid) {
@@ -666,7 +710,7 @@ function b2b_rest_flash_ready_to_ship( WP_REST_Request $r ) {
         b2b_push_raw_to_admin(array($admin_flex));
     }
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'success'      => true,
         'message'      => 'แจ้ง '.count($notified_tids).' ออเดอร์ ('.$total_parcels.' กล่อง) สำเร็จ',
         'notified'     => count($notified_tids),
@@ -674,7 +718,16 @@ function b2b_rest_flash_ready_to_ship( WP_REST_Request $r ) {
         'courier'      => $courier_info,
         'courier_ok'   => $courier_result['ok'],
         'courier_error'=> !$courier_result['ok'] ? ($courier_result['error']??'') : '',
-    ));
+    );
+
+    // V.34.0 Round 39: store cached response for replay (success only — courier_result['ok']
+    // covers both branches — if Flash courier call failed, distributor Flex still went out so we
+    // still cache to prevent re-spam on retry; admin can manually re-trigger after TTL if needed).
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+
+    return new WP_REST_Response($resp);
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
@@ -950,9 +1003,53 @@ function b2b_rest_flash_switch_manual( WP_REST_Request $r ) {
 
 function b2b_rest_trigger_summary( WP_REST_Request $r ) {
     try {
-    if(function_exists('b2b_run_daily_summary')){b2b_run_daily_summary();return new WP_REST_Response(array('success'=>true,'message'=>'ส่งสรุปแล้ว'));}
-    if(function_exists('b2b_generate_daily_summary')){b2b_generate_daily_summary();return new WP_REST_Response(array('success'=>true,'message'=>'ส่งสรุปแล้ว'));}
-    return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบ Snippet 7'),500);
+    // ── V.34.0 Round 39 batch 17: Idempotency-Key support ──
+    // Admin manual-trigger daily summary via Admin Dashboard "ส่งสรุป" button. Body has no params
+    // (constant-marker pattern — like /b2b/v1/manual-flash-test Round 32). Admin double-click →
+    // 2× b2b_run_daily_summary execution → 2× admin Flex card to admin LINE group + 2× LINE push
+    // (DAILY_SUMMARY_PUSHED) + 2× cron-replica DB read storms. Wrapper returns cached 200 within
+    // 24h → single summary push. Body hash = {action: 'trigger-summary'} — constant marker means
+    // any retry/replay within 24h hits cache without reading actual posts again.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::daily-summary';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array( 'action' => 'trigger-summary' );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
+    $resp = null;
+    if(function_exists('b2b_run_daily_summary')){
+        b2b_run_daily_summary();
+        $resp = array('success'=>true,'message'=>'ส่งสรุปแล้ว');
+    } elseif(function_exists('b2b_generate_daily_summary')){
+        b2b_generate_daily_summary();
+        $resp = array('success'=>true,'message'=>'ส่งสรุปแล้ว');
+    } else {
+        return new WP_REST_Response(array('success'=>false,'message'=>'ไม่พบ Snippet 7'),500);
+    }
+
+    // V.34.0 Round 39: store cached response for replay (success only)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+
+    return new WP_REST_Response($resp);
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
