@@ -10,6 +10,73 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 38 (🎯 40% Idempotency milestone — 79/196 = 40.3%) (2026-04-30)
+
+Round 38 pushes idempotency coverage to **79/196 POST endpoints (40.3%)** — 🎯 **TRUE 40% milestone reached against Round 30 authoritative census denominator**. Past 4/10 of mutating REST surface. ZERO regressions across **735 PHPUnit (was 716, +19) + 161 Jest** (22 suites — drift detector still green with 79 entries).
+
+#### Phase 1 — Idempotency batch 16 (5 endpoints)
+
+5 retry-prone Snippet 3 medium-priority + Snippet 5 Flash admin label closures:
+
+- **`POST /b2b/v1/bo-notify`** — admin "ส่ง Flex แจ้งลูกค้า" double-click → 2× LINE Flex push to customer group spam + 2× update_field('bo_available_qty') churn. Body hash `{ticket_id, items}` where `items` is sorted by sku for deterministic hash regardless of admin input order. Different items[].available between retries (admin changed BO offer) = 409 prevents customer receiving stale offer.
+- **`POST /b2b/v1/rpi-command`** — admin spam-click "รีบูท RPi" / "รีสตาร์ท service" → 2× cmd_id queue entries + 2× option write churn. cmd_id internally unique (time+rand) but admin spam = same intent enqueues distinct cmd_ids. Body hash `{command, params normalized via ksort}`. Different command (restart_service vs reboot — destructively different) = 409.
+- **`POST /b2b/v1/rpi-flash-box-packed`** — RPi scanner double-trigger / network retry on last-box-completes-manifest → 2× Flash /notify call (per-pickup quota burn) + 2× admin Flex pickup_added/courier_pickup spam. Body hash `{pno}` — pno globally unique per Flash dispatch. **4 success store sites**: reused_pickup / called / pending / partial-status (replay returns whichever variant the original request landed in).
+- **`POST /b2b/v1/flash-ship-packed`** — partial-ship timeout dialog double-confirm on warehouse → 2× courier /notify + 2× admin LINE notification + 2× hold_pending Flex push to dealer + 2× audit log churn. Body hash `{ticket_id}` — shares shape with rpi-flash-ready/print-requeue/rpi-accept-order (4-way namespace-discriminated collision).
+- **`POST /b2b/v1/flash-label`** — admin "ดาวน์โหลด Label" double-click → 2× Flash `/open/v3/orders/printPdf` API call (quota burn + I/O waste). Body hash `{pno}` — globally unique. Replay returns JSON marker (binary PDF cannot replay through cache — admin can re-download via fresh request after TTL). Shares shape with rpi-flash-box-packed (2-way namespace-discriminated collision).
+
+Backward compat: missing `X-Idempotency-Key` header = byte-identical to V.42.16 / V.33.8 behavior.
+
+**Versions**:
+
+- `[B2B] Snippet 3` V.42.16 → V.42.17
+- `[B2B] Snippet 5` V.33.8 → V.33.9
+
+#### Phase 2 — Tests (+19 PHPUnit cases)
+
+NEW `tests/helpers/IdempotencyRound38Test.php`:
+
+- 15 endpoint cases (3 per endpoint × 5: first_call_success / replay_matches / different_field_409)
+- 1 cumulative no-collision check
+- 3 cross-namespace pair guards: flash-ship-packed vs rpi-flash-ready (4-way ticket_id collision proof) + flash-label vs rpi-flash-box-packed (2-way pno collision proof) + bo-notify vs flash-ship-packed (bulk vs single schema)
+
+Total Round 38 contract test cases: 19. Cumulative Round 19-38: **312 cases** (was 293).
+
+#### Phase 3 — Tracker + Milestone Docs (in-place only)
+
+- `docs/audit/IDEMPOTENCY-COVERAGE.md`: status summary 74→79 / 196, milestones table adds "🎯 40.3% (Round 38 — TRUE 40% milestone)" row, integrated table rows 76-80, pending section pivot from "Snippet 3 long-tail" to "Snippet 5+9 Flash admin closure" (Round 39 candidates: flash-ready-to-ship, daily-summary, flash-webhook-setup, flash-api-test, test-push)
+- `CHANGELOG.md`: this entry
+- `README.md`: idempotency badge "37.8% → 40%" + What's New entry
+- `CLAUDE.md`: 1-line note on 40% milestone
+
+#### Verification
+
+- PHPUnit: **735 tests, 1065 assertions, 0 errors, 0 failures** (was 716, +19)
+- Jest: **22 suites, 161 tests** (stable — drift detector validates 79 entries)
+- `idempotency-tracker-drift.test.js` (5 tests): all PASS — tracker entries match wrappers
+- `php -l` syntax check: clean on Snippet 3 V.42.17 + Snippet 5 V.33.9
+
+#### Pattern observation (Round 38)
+
+Mix of 2 patterns shipped:
+
+- **2× bulk-shape**: bo-notify `{ticket_id, items[]}` + rpi-command `{command, params}` — both require normalization (sort items[] by sku / ksort params) for deterministic hash
+- **3× single**: 2× `{pno}` (rpi-flash-box-packed + flash-label) + 1× `{ticket_id}` (flash-ship-packed)
+- **Multi-success-site (rpi-flash-box-packed)**: 4 distinct success returns (reused_pickup / called / pending / partial-status) — store call mirrored at each return site so replay matches actual original branch
+
+#### Round 39 candidates (next batch)
+
+Pivot from saturated Snippet 3 (now 18/26 = 69%) to Snippet 5/9 Flash admin tools cluster:
+
+- `POST /b2b/v1/flash-ready-to-ship` — Flash ready + customer notify (Snippet 5)
+- `POST /b2b/v1/daily-summary` — admin trigger cron (Snippet 5)
+- `POST /b2b/v1/flash-webhook-setup` — admin one-time webhook init (Snippet 9)
+- `POST /b2b/v1/flash-api-test` — Flash connectivity probe (Snippet 9)
+- `POST /b2b/v1/test-push` — admin LINE test push (Snippet 9)
+
+Realistic timeline: 88/196 = 45% milestone in Round 40.
+
+---
+
 ### Feature — Round 34 (Idempotency batch 12 — 🎯 30% TRUE milestone) (2026-04-30)
 
 Round 34 pushes idempotency coverage to **59/196 POST endpoints (30.1%)** — ⭐ **first sustained crossing past 30% of POST surface AGAINST AUTHORITATIVE Round 30 census denominator**. Past 3/10 of mutating REST surface. ZERO regressions across **659 PHPUnit (was 641, +18) + 161 Jest** (drift detector still green with 59 entries).
