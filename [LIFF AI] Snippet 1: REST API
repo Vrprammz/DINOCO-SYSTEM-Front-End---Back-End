@@ -1,6 +1,17 @@
 /**
  * File: [LIFF AI] Snippet 1: REST API
  * Description: REST API + Auth สำหรับ LIFF AI Command Center
+ * Version: V.1.12 (2026-04-30) — Round 40 batch 18: Idempotency-Key support on POST /claim/{id}/status.
+ *   Admin in LIFF AI Command Center clicks status dropdown → slow WordPress save (claim_ticket
+ *   ACF + status_history + admin_note append) → admin clicks again thinking it didn't fire →
+ *   without wrapper = 2× dinoco_set_claim_status() invocations → 2× status_history append +
+ *   2× admin_note line + 2× WP hook fires (post_updated, claim/status_changed) + 2× LINE
+ *   notification (if hook chain triggers). Body hash = {claim_id, status, note, actor uid}.
+ *   actor scoped from JWT $auth['uid'] — cross-admin key reuse impossible. Tip: dinoco_set_
+ *   claim_status() already returns terminal_state if same status — wrapper layer prevents
+ *   the repeated function call entirely. function_exists() guards throughout — pure no-op
+ *   if Idempotency Helper snippet not synced. Backward compat: missing X-Idempotency-Key =
+ *   byte-identical V.1.11 behavior. Pushes 🎯 45% milestone (89/196 = 45.4%).
  * Version: V.1.11 (2026-04-30) — Round 26: Idempotency-Key support on POST /lead/{id}/accept.
  *   Dealer LIFF "รับ Lead" double-tap on slow MongoDB roundtrip can fire 2x → previously
  *   2nd call would observe checking_contact status and bounce as "already accepted". Central
@@ -1079,6 +1090,37 @@ if ( ! function_exists( 'liff_ai_rest_claim_status' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'message' => 'ไม่พบใบเคลม' ), 200 );
         }
 
+        // ── V.1.12 Round 40 batch 18: Idempotency-Key support ──
+        // Admin status-change dropdown → slow ACF save → admin clicks again → without wrapper
+        // dinoco_set_claim_status() fires 2× → 2× status_history rows + 2× admin_note line
+        // + 2× hook chain (claim/status_changed listeners may push LINE notification).
+        // Body hash = {claim_id, status, note, actor uid from JWT — cross-admin key reuse impossible}.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'liff-ai/v1::claim-status';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'claim_id' => $id,
+                'status'   => $new_status,           // status enum discriminator
+                'note'     => $note,                 // admin-edited note text → 409 if changed
+                'actor'    => $auth['uid'] ?? '',    // JWT-scoped — cross-admin key reuse blocked
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, 200 );
+            }
+        }
+
         $old_status = get_field( 'ticket_status', $id ) ?: 'Registered in System';
 
         // M18: route through canonical helper. The $valid allowlist above (line 880)
@@ -1121,7 +1163,15 @@ if ( ! function_exists( 'liff_ai_rest_claim_status' ) ) {
 
         liff_ai_log( sprintf( '[Claim] Status changed id=%d to=%s', $id, $new_status ) );
 
-        return new WP_REST_Response( array( 'success' => true, 'message' => 'อัพเดทสถานะเคลมสำเร็จ' ), 200 );
+        $resp = array( 'success' => true, 'message' => 'อัพเดทสถานะเคลมสำเร็จ' );
+
+        // V.1.12 Round 40 batch 18: store cached response for idempotent replay (success only).
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 
