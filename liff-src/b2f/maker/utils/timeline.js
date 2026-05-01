@@ -1,14 +1,13 @@
 /**
- * B2F Maker LIFF — Timeline + date helpers (V.0.2 Round 1 foundation)
+ * B2F Maker LIFF — Timeline + date helpers (V.0.3 Round 2 page renderers)
  *
- * MIGRATION SOURCE: `[B2F] Snippet 4: Maker LIFF Pages` V.4.6
+ * MIGRATION SOURCE: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *   Source location: inline `b2f_liff_page_js()`
- *     - lines 448-508: buildTimelineBars
+ *     - lines 463-508: buildTimelineBars
  *     - lines 510-514: getMinDate
- *     - lines 954-1027: buildTimeline (status sequence renderer — Round 2)
+ *     - lines 969-1007: buildTimeline (FULL impl — status sequence renderer)
  *
- * Round 1 ports: buildTimelineBars + getMinDate + scaffolds buildTimeline.
- * Full `buildTimeline()` body migrates in Round 2 alongside renderDetailPage.
+ * Round 2 (V.0.3): full `buildTimeline()` body ported verbatim.
  *
  * Color thresholds (delivery bar):
  *   - overdue (remaining < 0)  → #dc2626 (danger)
@@ -22,8 +21,8 @@
  *   - else         → #16a34a
  */
 
-import { L } from "./lang.js";
-import { fmtDateShort } from "./format.js";
+import { L, statusLabel } from "./lang.js";
+import { fmtDateShort, formatDate, escHtml } from "./format.js";
 
 /**
  * @returns {string} ISO date (YYYY-MM-DD) for tomorrow — used as `min`
@@ -203,16 +202,81 @@ export function buildTimelineBars(po) {
 
 /**
  * Build the per-status timeline (active/current/upcoming dots).
- * SCAFFOLD ONLY in Round 1 — Round 2 will port the full body of
- * `buildTimeline(po)` from inline V.4.6 lines 954-1027 alongside
- * `renderDetailPage`.
  *
- * @param {{ po_status?: string, status_history?: any[] }} _po
- * @returns {string} empty string in Round 1 — caller falls back to inline
- *                   when running on Vite path during Round 2 dev.
+ * Mirrors inline `buildTimeline(po)` V.4.7 lines 969-1007 verbatim:
+ *   - 6-step happy path: submitted → confirmed → delivering → received → paid → completed
+ *   - rejected/cancelled short-circuit: 2-row layout with reject reason
+ *   - per-step date stamps:
+ *       submitted  → post_date / created_date
+ *       confirmed  → "ETA: " + po_expected_date
+ *       received   → po_actual_date
+ *
+ * @param {{
+ *   po_status?: string,
+ *   post_date?: string,
+ *   created_date?: string,
+ *   po_expected_date?: string,
+ *   po_actual_date?: string,
+ *   po_rejected_reason?: string,
+ *   po_cancelled_reason?: string,
+ * }} po
+ * @returns {string} HTML
  */
-export function buildTimeline(_po) {
-    // Intentional Round 1 stub: inline renderDetailPage still owns the
-    // full status-step list. Will be ported next round to keep diff small.
-    return "";
+export function buildTimeline(po) {
+    const allStates = [
+        { key: "submitted", label: L("สร้าง PO", "PO Created", "创建PO") },
+        { key: "confirmed", label: L("Maker ยืนยัน", "Maker Confirmed", "供应商已确认") },
+        { key: "delivering", label: L("กำลังจัดส่ง", "Shipping", "发货中") },
+        { key: "received", label: L("รับของแล้ว", "Received", "已收货") },
+        { key: "paid", label: L("จ่ายเงินแล้ว", "Paid", "已付款") },
+        { key: "completed", label: L("เสร็จสิ้น", "Completed", "已完成") },
+    ];
+
+    const stateOrder = allStates.map(function (s) {
+        return s.key;
+    });
+    const currentIdx = stateOrder.indexOf(po.po_status);
+
+    if (po.po_status === "rejected" || po.po_status === "cancelled") {
+        return (
+            '<div class="b2f-timeline-item active">' +
+            '<div class="tl-title">สร้าง PO</div>' +
+            '<div class="tl-date">' +
+            formatDate(po.post_date || po.created_date) +
+            "</div></div>" +
+            '<div class="b2f-timeline-item current">' +
+            '<div class="tl-title" style="color:var(--b2f-danger);">' +
+            statusLabel(po.po_status) +
+            "</div>" +
+            '<div class="tl-note">' +
+            escHtml(po.po_rejected_reason || po.po_cancelled_reason || "") +
+            "</div></div>"
+        );
+    }
+
+    let html = "";
+    allStates.forEach(function (state, idx) {
+        let cls = "";
+        if (idx < currentIdx) cls = "active";
+        else if (idx === currentIdx) cls = "current";
+
+        let dateStr = "";
+        if (state.key === "submitted")
+            dateStr = formatDate(po.post_date || po.created_date);
+        else if (state.key === "confirmed" && po.po_expected_date)
+            dateStr = "ETA: " + formatDate(po.po_expected_date);
+        else if (state.key === "received" && po.po_actual_date)
+            dateStr = formatDate(po.po_actual_date);
+
+        html +=
+            '<div class="b2f-timeline-item ' +
+            cls +
+            '">' +
+            '<div class="tl-title">' +
+            state.label +
+            "</div>" +
+            (dateStr ? '<div class="tl-date">' + dateStr + "</div>" : "") +
+            "</div>";
+    });
+    return html;
 }
