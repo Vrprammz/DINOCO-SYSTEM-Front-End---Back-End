@@ -10,6 +10,26 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF Step 2: flag-gated snippet wiring (3 surfaces, default OFF) (2026-04-30)
+
+Phase 2 Step 2 of LIFF Vite migration (per `docs/runbooks/PHASE-2-VITE-MIGRATION.md`). Three LIFF snippets wired with per-surface bundle path; all flags default OFF so production rendering is byte-identical (REG-029 preserved).
+
+- `[B2B] Snippet 4: LIFF E-Catalog Frontend` V.32.7 → **V.32.8** — gate `dinoco_liff_use_vite_b2b_catalog`, entry `b2b-catalog`, root `<div id="b2b-catalog-app">`
+- `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.12 → **V.7.13** — gate `dinoco_liff_use_vite_b2f_catalog`, entry `b2f-catalog`, root `<div id="b2f-catalog-app">`
+- `[LIFF AI] Snippet 2: Frontend` V.3.7 → **V.3.8** — gate `dinoco_liff_use_vite_liff_ai`, entry `liff-ai`, root `<div id="liff-ai-app">`
+
+Pattern: each handler reads `(bool) get_option('dinoco_liff_use_vite_<surface>', false)`. When true AND `dinoco_liff_enqueue('<entry>')` returns true → emit minimal shell page (head w/ `wp_head()`, root mount div w/ `data-config` JSON, `wp_footer()`). Else fall through to inline (existing path unchanged). Vite mounts into root div; entry.js drives LIFF auth + UI.
+
+CI deploy template `.github/workflows/liff-deploy.yml` already in place (commit `6d011dc`) — `workflow_dispatch` only until SSH/secrets provisioned. Step 3 (production canary) pending user secret provisioning.
+
+NEW drift detector `tests/jest/vite-snippet-wiring.test.js` (30 assertions): verifies flag check pattern + `function_exists` guard + root mount ID + `wp_head/wp_footer` calls + inline fallback preserved + version bump + config payload + CI workflow disabled-by-default. Auto-fails on contract drift.
+
+**Rollback** (zero-redeploy): `wp option update dinoco_liff_use_vite_<surface> 0` — inline path resumes immediately on next request.
+
+Activation order (smallest blast radius first): `b2f-maker` → `liff-ai` → `b2f-catalog` → `b2b-catalog`.
+
+**Test counts**: PHPUnit 870 (no change — pure JS/PHP rendering). Jest 161 → 191 (+30 new wiring assertions).
+
 ### Feature — 🎯🎯 60% MAJOR MILESTONE — Idempotency-Key middleware integrated to 119/196 POST endpoints (60.7%) — sustained 28-round campaign Rounds 18-46 (2026-04-30) ⭐⭐
 
 **Round 46 closes the 60% MAJOR MILESTONE** — Idempotency-Key middleware now wraps **119/196 POST endpoints (60.7%)** against the Round 30 authoritative census denominator. Past **6/10 of POST surface** integrated. **28-round sustained Idempotency campaign Rounds 18-46** (started with `place-order` + `manual-flash-create` + `create-po` in Round 19; closed 50% milestone in Round 42; reached 60% milestone in Round 46 with mixed-namespace cross-snippet batch). ZERO regressions across **870 PHPUnit (was 854, +16) + 161 Jest** (22 suites — drift detector still green with 119 tracker entries).

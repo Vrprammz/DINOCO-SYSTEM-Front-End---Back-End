@@ -1,6 +1,6 @@
 # Phase 2 — LIFF Vite Migration Runbook
 
-**Status (2026-04-29)**: Step 1 complete. Asset pipeline ready. Snippet wiring not yet done.
+**Status (2026-04-30)**: Steps 1 + 2 complete. CI deploy template ready (workflow_dispatch only). Production canary (Step 3 live run) pending SSH/secrets provisioning.
 
 จุดประสงค์: ย้าย inline JS/CSS ออกจาก WP snippets (B2B Snippet 4, B2F Snippet 8, LIFF AI Snippet 2) ไปเป็น Vite-built bundles ที่ enqueue ผ่าน WP. แก้ PERF-H6 (155KB inline JS).
 
@@ -51,16 +51,87 @@ ls dist/liff/.vite/manifest.json   # confirms emit
 
 ---
 
-## Step 2 — Wire one snippet (NOT YET DONE)
+## Step 2 — Wire snippets ✅ (2026-04-30)
 
-### Pre-flight checklist
+3 LIFF snippets wired with flag-gated bundle path. **All flags default OFF** — production behavior byte-identical until per-surface flip:
 
-Before modifying ANY production WP snippet:
+| Snippet | Version (after) | Flag | Vite entry | Mount root |
+| --- | --- | --- | --- | --- |
+| `[B2B] Snippet 4: LIFF E-Catalog Frontend` | V.32.8 | `dinoco_liff_use_vite_b2b_catalog` | `b2b-catalog` | `<div id="b2b-catalog-app">` |
+| `[B2F] Snippet 8: Admin LIFF E-Catalog` | V.7.13 | `dinoco_liff_use_vite_b2f_catalog` | `b2f-catalog` | `<div id="b2f-catalog-app">` |
+| `[LIFF AI] Snippet 2: Frontend` | V.3.8 | `dinoco_liff_use_vite_liff_ai` | `liff-ai` | `<div id="liff-ai-app">` |
 
-- [ ] CI deploy step copies `dist/liff/` → `WP_CONTENT/uploads/dinoco-liff/` after every push to main
+Each gate sits at the top of the shortcode/template_redirect handler (after config vars resolve, before inline `?>` HTML emission). Pattern:
+
+```php
+$use_vite = (bool) get_option( 'dinoco_liff_use_vite_<surface>', false );
+if ( $use_vite && function_exists( 'dinoco_liff_enqueue' )
+     && dinoco_liff_enqueue( '<entry>' ) ) {
+    // Emit minimal shell — wp_head/wp_footer print enqueued tags
+    echo '<!DOCTYPE html><html lang="th"><head>...';
+    echo '<script src="line-scdn liff sdk"></script>';
+    wp_head();
+    echo '</head><body>';
+    echo '<div id="<surface>-app" data-config="' . esc_attr( wp_json_encode( $config ) ) . '"></div>';
+    wp_footer();
+    echo '</body></html>';
+    exit; // or return ob_get_clean() for shortcode path
+}
+// Else fall through to inline rendering (REG-029 byte-identical preserved)
+```
+
+### Drift detector
+
+`tests/jest/vite-snippet-wiring.test.js` (30 assertions) verifies on every push:
+
+- Each snippet reads its flag via `(bool) get_option( '<flag>', false )` exact pattern
+- `function_exists('dinoco_liff_enqueue')` guard before helper call
+- Root mount div `<div id="<surface>-app" data-config=...>` present
+- Shell calls `wp_head()` + `wp_footer()`
+- Inline fallback path preserved (legacy `<body>` or shortcode tail still emits)
+- Version header bumped + config payload includes `liff_id` + `rest_url`
+- CI workflow exists + disabled by default (workflow_dispatch only)
+
+If a future refactor accidentally deletes the gate or breaks the contract, this fails fast.
+
+### To activate per-surface (post-Step 3 production canary)
+
+```bash
+# Via WP-CLI (recommended):
+wp option update dinoco_liff_use_vite_b2f_maker 1
+wp option update dinoco_liff_use_vite_b2b_catalog 1   # last (highest traffic)
+
+# Or via WP admin → Tools → Options screen
+# Or directly via SQL (less safe, no audit log):
+# UPDATE wp_options SET option_value='1' WHERE option_name='dinoco_liff_use_vite_b2b_catalog';
+```
+
+Activate **smallest-blast-radius first** (b2f-maker → liff-ai → b2f-catalog → b2b-catalog). Each flag flip is independent — never flip multiple at once.
+
+### Rollback (zero-redeploy)
+
+```bash
+wp option update dinoco_liff_use_vite_b2b_catalog 0
+```
+
+Inline path resumes immediately on next request. No redeploy, no cache flush, no risk to data.
+
+### Pre-Step-3 prerequisites
+
+- [x] Snippet wiring complete (V.32.8 / V.7.13 / V.3.8)
+- [x] CI workflow template ready (`.github/workflows/liff-deploy.yml`)
+- [ ] CI workflow secrets provisioned (`LIFF_DEPLOY_*`) — see Step 3 below
+- [ ] First manual `workflow_dispatch` `dry_run: true` succeeds
+- [ ] First live run lands bundles at `WP_CONTENT/uploads/dinoco-liff/`
+- [ ] `curl -I https://<host>/wp-content/uploads/dinoco-liff/manifest.json` → 200
+- [ ] Feature flag flipped to true on staging FIRST → smoke-test before production canary
+
+### Pre-flight checklist (legacy reference)
+
+- [x] Feature flag wp_option created: `dinoco_liff_use_vite_<surface>` default `false` (in code)
+- [x] Rollback plan: flip flag → `false` reverts to inline (no redeploy)
+- [ ] CI deploy step copies `dist/liff/` → `WP_CONTENT/uploads/dinoco-liff/` (template ready, secrets pending)
 - [ ] Manual verification: SSH to staging, confirm manifest.json + bundles present
-- [ ] Feature flag wp_option created: `dinoco_liff_use_vite_<surface>` default `false`
-- [ ] Rollback plan: flip flag → `false` reverts to inline (no redeploy)
 - [ ] Monitoring: Sentry / observability snippet captures any post-flip errors
 
 ### Migration pattern (per surface)
