@@ -17,11 +17,11 @@
 
 | Metric | Count |
 |--------|-------|
-| Total integrated endpoints | **79** (+5 new — Round 38 batch 16: bo-notify, rpi-command, rpi-flash-box-packed, flash-ship-packed, flash-label — Snippet 3 retry-prone medium-priority + Snippet 5 Flash admin label download) |
+| Total integrated endpoints | **84** (+5 new — Round 39 batch 17: flash-ready-to-ship, daily-summary, flash-webhook-setup, flash-api-test, test-push — Snippet 5 Flash ops + Snippet 9 Flash admin setup cluster) |
 | **Total POST endpoints (Round 33 fresh census)** | **196** (+3 since Round 30 — natural growth, see [REST-ENDPOINT-CENSUS-2026-04-30.md](./REST-ENDPOINT-CENSUS-2026-04-30.md)) |
-| Coverage | **79 / 196 = 40.3%** of POST endpoints — 🎯 **TRUE 40% milestone reached against Round 30 authoritative census denominator**. Round 38 closes 4 of 5 Round 37 high-priority Snippet 3 candidates + 1 Snippet 5 Flash admin label. B2B namespace coverage = **37/56 ≈ 66%** (highest absolute count, +5 since Round 37 — 4 in Snippet 3 + 1 in Snippet 5). Snippet 3 coverage = **18/26 ≈ 69%** of POST routes (+4 since Round 37 = 14/26 ≈ 54%). MCP cluster coverage = **13/17 = ~76%** (saturated, no further candidates). |
-| Cumulative test cases | 312 (Round 19-38 — Round 38 added 19) |
-| Body-shape distinct hashes asserted | 78 (Round 38: +5 new — all unique; 3 cross-namespace pair guards — flash-ship-packed vs rpi-flash-ready SHAPE-MATCH guard (proves namespace is sole discriminator for {ticket_id}-only endpoints — 4-way collision now: print-requeue/rpi-accept-order/rpi-flash-ready/flash-ship-packed) + flash-label vs rpi-flash-box-packed SHAPE-MATCH guard ({pno}-only 2-way collision) + bo-notify vs flash-ship-packed schema-shape guard (bulk vs single)) |
+| Coverage | **84 / 196 = 42.9%** of POST endpoints — push toward 🎯 **45% milestone (88/196 ≈ 45%)** against Round 30 authoritative census denominator. Round 39 closes Snippet 5 Flash ops cluster (flash-ready-to-ship + daily-summary) + Snippet 9 Flash admin setup cluster (flash-webhook-setup + flash-api-test + test-push). B2B namespace coverage = **42/56 ≈ 75%** (+5 since Round 38). Snippet 5 coverage = **11 endpoints** (+2 since Round 38). Snippet 9 coverage = **6 endpoints** (+3 since Round 38 = 3 → 6). MCP cluster coverage = **13/17 = ~76%** (saturated since Round 35). |
+| Cumulative test cases | 329 (Round 19-39 — Round 39 added 17) |
+| Body-shape distinct hashes asserted | 83 (Round 39: +5 new — all unique; 1 cross-namespace pair guard — daily-summary vs manual-flash-test (Round 32) constant-marker isolation guard, proves distinct action strings prevent collision even without namespace gate) |
 
 > **Round 30 note**: Earlier rounds reported coverage against a conservative
 > "~75 POST endpoints" estimate. The Round 30 REST endpoint census
@@ -69,7 +69,8 @@
 | 🎯 **35.2% (Round 36 — TRUE 35% milestone)** ⭐ | **36** | **2026-04-30** | +5 endpoints (69/196). Batch 14 — pivot from saturated MCP cluster to B2B admin Flash + BO + inventory long tail per Round 35 recommendation: bo-reject (admin pending_stock_review reject — customer Flex spam guard + counter decrement integrity) + flash-cancel (Flash per-PNO API charge guard + 1015 dedup) + flash-cancel-notify (pickup cancel — shares shape with flash-cancel via namespace discriminator) + flash-switch-manual (RPi duplicate manual label print guard + admin Flex spam dedup) + stock/hold (boolean-discriminator: hold/release flip caught by hash). 19 B2F + **27 B2B** + **9 inventory** + 13 MCP. **First 35% milestone past 7/20 of POST surface. B2B namespace passes ~48% (highest absolute count).** Pattern: 1× state-machine-enum (FSM cancellation) + 4× single (3 ticket-scoped flash + 1 boolean-discriminator inventory). |
 | **37.8% (Round 37 — Snippet 3 RPi + customer LIFF cluster)** | **37** | **2026-04-30** | +5 endpoints (74/196). Batch 15 — closes ALL 5 Round 36 high-priority candidates in `[B2B] Snippet 3`: print-test (constant-marker `{type}` — admin double-click test print) + print-requeue (single `{ticket_id}` — admin/RPi reprint shipping label) + rpi-accept-order (single `{ticket_id}` — RPi kiosk FSM 400 surface fix) + rpi-flash-ready (single `{ticket_id}` — RPi scan-to-call-courier Flash /notify quota burn; 4 success store sites: already-courier / active-pickup-reuse / new-pickup-success / queued-retry) + slip-upload (CRITICAL — Slip2Go double-charge guard: `{ticket_id, gid}` bulk-shape with `image_base64` EXCLUDED following combined-slip-upload Round 29 pattern; gid from session prevents cross-group cache poisoning). 19 B2F + **32 B2B** + 9 inventory + 13 MCP + 1 LIFF AI. **Snippet 3 coverage 35% → 54% (9/26 → 14/26 POST routes).** Pattern: 1× constant-marker (no body content) + 3× single (ticket_id) + 1× bulk-shape (ticket_id+gid). |
 | 🎯 **40.3% (Round 38 — TRUE 40% milestone) ⭐** | **38** | **2026-04-30** | +5 endpoints (79/196). Batch 16 — Snippet 3 medium-priority retry-prone closures + Snippet 5 Flash admin label: bo-notify (admin "ส่ง Flex แจ้งลูกค้า" double-click → 2× LINE Flex push to customer spam + bo_available_qty churn; bulk-shape `{ticket_id, items sorted by sku}`) + rpi-command (admin spam-click "รีบูท RPi"/"รีสตาร์ท service" → 2× cmd queue entries + cmd_id pollution; bulk-shape `{command, params normalized via ksort}`) + rpi-flash-box-packed (RPi scanner double-trigger → manifest-completion 2× Flash /notify quota burn + admin Flex pickup_added spam; single `{pno}`; 4 success store sites — reused_pickup / called / pending / partial-status) + flash-ship-packed (timeout dialog double-confirm → 2× courier /notify + admin LINE notification + hold_pending Flex push + audit log; single `{ticket_id}`) + flash-label (admin "ดาวน์โหลด Label" double-click → 2× Flash /open/v3/orders/printPdf quota burn; single `{pno}` — binary PDF cannot replay through cache, returns JSON marker on replay). **Snippet 3 coverage 54% → 69% (14/26 → 18/26 POST routes). B2B namespace coverage 57% → 66%.** 19 B2F + **37 B2B** + 9 inventory + 13 MCP + 1 LIFF AI. **First sustained 40% milestone past 4/10 of POST surface against authoritative Round 30 census denominator.** Pattern: 2× bulk-shape (ticket_id+items / command+params) + 3× single (2× pno + 1× ticket_id). |
-| 🎯 Target: 45% | future | TBD | Need +9 more endpoints (~88/196). Realistic timeline: Round 40 (batch 18). |
+| **42.9% (Round 39 — push toward 45% milestone)** | **39** | **2026-04-30** | +5 endpoints (84/196). Batch 17 — Snippet 5 Flash ops + Snippet 9 Flash admin setup cluster: flash-ready-to-ship (admin double-click "พร้อมจัดส่ง" → 2× distributor Flex push spam + 2× Flash courier /notify quota burn + 2× admin LINE notification + 2× audit log churn per ticket; **bulk-shape** `{ticket_ids sorted+deduped}` — handler accepts single or array, normalized) + daily-summary (admin manual-trigger "ส่งสรุป" → 2× admin Flex summary card + 2× DB storm cron-replica read; **constant-marker** `{action: 'trigger-summary'}` — no params at all, namespace + action string sole discriminator) + flash-webhook-setup (admin "ตั้งค่า Webhook" → 2× POST /notify/setting × 5 codes = 10 Flash API calls instead of 5 quota burn; **bulk-shape** `{webhook_url, codes:[0..4]}` — webhook_url change between retries → 409 alert env mismatch) + flash-api-test (admin "ทดสอบ Flash API" → 2× GET /warehouses Flash rate-limit count; **single** `{action, mch_id, is_production}` — env discriminator catches training↔prod switch; errors NOT cached) + test-push (admin "Test Push" double-click → 2× LINE push to admin group spam; **single** `{target, message}` — different message text → 409). **Snippet 5 coverage = 11 endpoints. Snippet 9 coverage 3 → 6 (+3).** B2B namespace coverage 66% → ~75%. 19 B2F + **42 B2B** + 9 inventory + 13 MCP + 1 LIFF AI. Pattern mix: 1× constant-marker (daily-summary — third instance, after stock/initialize Round 30 + manual-flash-test Round 32) + 1× bulk-shape (flash-ready-to-ship) + 1× bulk-shape with env discriminator (flash-webhook-setup) + 2× single (flash-api-test + test-push). |
+| 🎯 Target: 45% | future | TBD | Need +4 more endpoints (~88/196). Realistic timeline: Round 40 (batch 18). |
 | Target: 50% | future | TBD | ~98 endpoints — major sustained effort across 10+ rounds. Realistic timeline: Round 50+ |
 | Target: 50% | future | TBD | ~98 endpoints — major sustained effort across 10+ rounds. Realistic timeline: Round 50+ |
 
@@ -82,7 +83,7 @@
 
 ---
 
-## Integrated endpoints (74)
+## Integrated endpoints (84)
 
 | # | Endpoint | Snippet | Pattern | Round | Status |
 |---|----------|---------|---------|-------|--------|
@@ -166,17 +167,22 @@
 | 78 | `POST /b2b/v1/rpi-flash-box-packed` | `[B2B] Snippet 3` V.42.17 | single ({pno} globally unique — Flash /notify quota burn guard on manifest-completion trigger; 4 success store sites: reused_pickup / called / pending / partial-status) | **38** ⭐ | **integrated** |
 | 79 | `POST /b2b/v1/flash-ship-packed` | `[B2B] Snippet 3` V.42.17 | single ({ticket_id} — partial-ship timeout dialog double-confirm guard; shares shape with rpi-flash-ready + print-requeue + rpi-accept-order, namespace-discriminated) | **38** ⭐ | **integrated** |
 | 80 | `POST /b2b/v1/flash-label` | `[B2B] Snippet 5` V.33.9 | single ({pno} globally unique — Flash /open/v3/orders/printPdf quota guard; binary PDF cannot replay through cache, returns JSON marker on replay; shares shape with rpi-flash-box-packed, namespace-discriminated) | **38** ⭐ | **integrated** |
+| 81 | `POST /b2b/v1/flash-ready-to-ship` | `[B2B] Snippet 5` V.34.0 | **bulk-shape** ({ticket_ids sorted+deduped} — handler accepts single ticket_id OR array param; bulk admin "พร้อมจัดส่ง" double-click → courier /notify quota burn + Flex spam guard) | **39** | **integrated** |
+| 82 | `POST /b2b/v1/daily-summary` | `[B2B] Snippet 5` V.34.0 | **constant-marker** ({action: 'trigger-summary'} — no params; admin manual-trigger "ส่งสรุป" double-click → admin Flex summary card + DB storm cron-replica read guard; 3rd constant-marker instance after stock/initialize R30 + manual-flash-test R32) | **39** | **integrated** |
+| 83 | `POST /b2b/v1/flash-webhook-setup` | `[B2B] Snippet 9` V.34.3 | **bulk-shape** ({webhook_url, codes:[0..4]} — webhook_url change between retries → 409 alerts env mismatch; admin "ตั้งค่า Webhook" double-click → 2× POST /notify/setting × 5 codes = 10 Flash API calls instead of 5 quota burn) | **39** | **integrated** |
+| 84 | `POST /b2b/v1/flash-api-test` | `[B2B] Snippet 9` V.34.3 | single ({action, mch_id, is_production} — env discriminator catches training↔prod switch between retries; errors NOT cached so admin can immediately retry after config fix without TTL wait) | **39** | **integrated** |
+| 85 | `POST /b2b/v1/test-push` | `[B2B] Snippet 9` V.34.3 | single ({target, message} — different message text across retries → 409 admin changed mind; same exact retry → cached 200 → single LINE push to admin group instead of spam) | **39** | **integrated** |
 
-> Note: numbering goes to 80 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
+> Note: numbering goes to 85 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
 > delete-ticket (32) + recalculate-total (33) share body shape +
 > flash-cancel (67) + flash-cancel-notify (68) share body shape +
 > print-requeue (72) + rpi-accept-order (73) + rpi-flash-ready (74) + flash-ship-packed (79) all
 > share {ticket_id}-only body shape (4-way intentional collision via namespace discriminator) +
 > rpi-flash-box-packed (78) + flash-label (80) share {pno}-only body shape (2-way namespace-
-> discriminated) — all namespace-discriminated. Total integrated endpoint count = 79 (Round 28:
+> discriminated) — all namespace-discriminated. Total integrated endpoint count = 84 (Round 28:
 > 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix for bo-fulfill which had no actual wrapper
 > despite tracker entry + Round 31: +5 + Round 32: +5 + Round 33: +5 + Round 34: +5 + Round 35: +5
-> + Round 36: +5 + Round 37: +5 + Round 38: +5).
+> + Round 36: +5 + Round 37: +5 + Round 38: +5 + Round 39: +5).
 >
 > **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1) — RESOLVED in Round 30**: `bo-fulfill`
 > (#14, Round 19) was listed as "integrated" but actual code had NO wrapper. **Round 30 fixed**:
@@ -197,49 +203,44 @@
 
 ---
 
-## Pending POST endpoints (Round 39+ candidates)
+## Pending POST endpoints (Round 40+ candidates)
 
-### Round 38 audit findings (Snippet 3 long-tail closure complete + Snippet 5 Flash admin)
+### Round 39 audit findings (Snippet 5/9 Flash admin cluster closed)
 
-> **Snippet 3 POST endpoint audit (Round 38)**: 26 POST endpoints in `[B2B] Snippet 3`,
-> **18/26 ≈ 69% now integrated** (was 14/26 ≈ 54% after Round 37). Round 38 closed all 4 of 5
-> Round 37 high-priority Snippet 3 candidates (bo-notify, rpi-command, rpi-flash-box-packed,
-> flash-ship-packed) + Snippet 5 flash-label admin Flash label download. **8 unwrapped POST
-> endpoints remain in Snippet 3** — listed below as low-priority Round 39+ targets.
+> **Round 39 closure**: Snippet 5 Flash ops (flash-ready-to-ship + daily-summary) + Snippet 9
+> Flash admin setup (flash-webhook-setup + flash-api-test + test-push) all integrated. Snippet 5
+> coverage = 11 endpoints. Snippet 9 coverage 3 → 6 (+3). B2B namespace coverage 66% → ~75%.
+> Coverage 84/196 = 42.9% — push toward 🎯 45% milestone (88/196 ≈ 45%) needs +4 more endpoints.
 >
-> **Endpoints found NOT mutational/retry-prone after Round 38 audit**: `auth-group` (session
-> bootstrap — already TTL-gated), `manual-flash-status` (verified GET-only despite docs claim),
-> `print-ack` (RPi natural dedup via cmd_id), `print-heartbeat` (idempotent by design — last-poll
-> timestamp). These are deferred to "low priority" section (don't need wrapper).
+> **Round 39 deferred (Snippet 9 Flash test console — NOT routinely retry-prone)**: `flash-test/
+> run-step` (sysadmin tool, 1-step-at-a-time UX naturally serial) + `flash-test/simulate-webhook`
+> (testing harness, no production retry path). These remain in low priority section.
 
-### High priority (next 5 picks — Round 39 candidates to push toward 45% milestone — ~88/196)
+### High priority (next 5 picks — Round 40 candidates to reach 🎯 45% milestone — ~88/196)
 
-> **Snippet 5 + Snippet 9 Flash admin closure**: After Round 38 reaching 🎯 40% milestone,
-> Round 39 should target Snippet 5/9 Flash admin tools cluster (daily-summary trigger, flash-
-> ready-to-ship, flash-webhook-setup, flash-api-test) + B2F admin maker/PO endpoints. Reaching
-> ~88/196 ≈ 45% closes another major slice.
+> **B2F admin + Inventory long-tail**: After Round 39 reaching 42.9%, Round 40 should pivot to
+> B2F admin maker/PO + Inventory remaining writes (warehouse delete, dip-stock force-close,
+> moto catalog upserts) + LIFF AI claim status update. Reaching ~88/196 ≈ 45% closes the
+> sub-45% gap.
 
 | Endpoint | Snippet | Risk if double-fired | Round candidate |
 |----------|---------|----------------------|-----------------|
-| `POST /b2b/v1/flash-ready-to-ship` | `[B2B] Snippet 5` | Flash ready signal — double customer notify + double Flash /notify quota burn | Round 39 |
-| `POST /b2b/v1/daily-summary` | `[B2B] Snippet 5` | Trigger daily summary cron — log spam + Flex card duplicate to admin group | Round 39 |
-| `POST /b2b/v1/flash-webhook-setup` | `[B2B] Snippet 9` | Flash webhook init — admin one-time setup but URL change + duplicate notification spam | Round 39 |
-| `POST /b2b/v1/flash-api-test` | `[B2B] Snippet 9` | Flash API connectivity probe — quota burn + admin Flex spam | Round 39 |
-| `POST /b2b/v1/test-push` | `[B2B] Snippet 9` | Admin LINE test push — duplicate notification | Round 39 |
+| `POST /b2f/v1/po-update` (admin variant) | `[B2F] Snippet 2` | Already integrated R23 — verify admin path doesn't bypass | Round 40 (verify) |
+| `POST /dinoco-stock/v1/dip-stock/force-close` | Inventory | Admin force-close stuck dip session — 2× audit log + variance recompute | Round 40 |
+| `POST /liff-ai/v1/claim/{id}/status` | `[LIFF AI] Snippet 1` | Dealer claim FSM transition — 2× LINE push to customer + 2× audit log | Round 40 |
+| `POST /dinoco-stock/v1/moto/brands` | Inventory | Admin brand upsert — natural dedup but log spam | Round 40 |
+| `POST /dinoco-stock/v1/moto/models` | Inventory | Admin model upsert — same as above | Round 40 |
 
-### Medium priority (Round 38+)
+### Medium priority (Round 41+)
 
 | Endpoint | Snippet | Notes |
 |----------|---------|-------|
 | `POST /b2b/v1/auth-group` | `[B2B] Snippet 3` | LIFF auth init — natural session token TTL but log spam |
-| `POST /b2b/v1/manual-flash-status` | `[B2B] Snippet 3` | Manual Flash status check — read-only? Verify in Round 38 |
-| `POST /b2b/v1/test-push` | `[B2B] Snippet 9` | Admin test push — natural rate limit |
-| `POST /b2b/v1/flash-webhook-setup` | `[B2B] Snippet 9` | Flash webhook init — admin one-time setup |
-| `POST /b2b/v1/flash-api-test` | `[B2B] Snippet 9` | Flash API connectivity probe |
-| `POST /b2b/v1/flash-test/run-step` | `[B2B] Snippet 9` | Flash test step runner |
-| `POST /b2b/v1/flash-test/simulate-webhook` | `[B2B] Snippet 9` | Webhook simulator |
-| `POST /b2b/v1/daily-summary` | `[B2B] Snippet 5` | Trigger daily summary cron — log spam guard |
-| `POST /b2b/v1/flash-ready-to-ship` | `[B2B] Snippet 5` | Flash ready signal — double customer notify |
+| `POST /b2b/v1/manual-flash-status` | `[B2B] Snippet 3` | Manual Flash status check — verified GET-effectively despite POST method |
+| `POST /b2b/v1/flash-test/run-step` | `[B2B] Snippet 9` | Flash test step runner — sysadmin tool, low retry rate |
+| `POST /b2b/v1/flash-test/simulate-webhook` | `[B2B] Snippet 9` | Webhook simulator — testing harness, no production retry path |
+| `POST /b2b/v1/print-monitor` | `[B2B] Snippet 3` | RPi print monitor poll — verify mutational |
+| `POST /b2b/v1/print-status` | `[B2B] Snippet 3` | Print status poll — verify mutational |
 
 ### Low priority (don't need wrapper)
 
@@ -334,10 +335,12 @@ Each integrated endpoint has 3-9 contract tests in
 | **35** | **5** | **18** | **63** (Round 35: +5 new — all unique; 2 cross-namespace pair guards added — dashboard-inject-metrics vs lead-attribution + inventory-changed vs kb-updated; MCP cluster ~76%) |
 | 🎯 **36** ⭐ | **5** | **19** | **68** (Round 36: +5 new — all unique; 3 cross-namespace pair guards — flash-cancel vs flash-cancel-notify SHAPE-MATCH guard (proves namespace is sole discriminator) + bo-reject vs flash-switch-manual + stock-hold vs flash-cancel; **🎯 35% milestone**) |
 | **37** | **5** | **20** | **73** (Round 37: +5 new — all unique; 3 cross-namespace pair guards — print-requeue vs rpi-accept-order SHAPE-MATCH guard (proves namespace is sole discriminator for {ticket_id}-only endpoints — pattern reused from Round 36 flash-cancel pair) + print-test vs print-requeue + slip-upload vs print-requeue; **37.8% — Snippet 3 RPi + customer LIFF cluster**) |
+| 🎯 **38** ⭐ | **5** | **19** | **78** (Round 38: +5 new — all unique; 3 cross-namespace pair guards — flash-ship-packed vs rpi-flash-ready SHAPE-MATCH guard ({ticket_id} 4-way collision: print-requeue/rpi-accept-order/rpi-flash-ready/flash-ship-packed) + flash-label vs rpi-flash-box-packed SHAPE-MATCH guard ({pno} 2-way) + bo-notify vs flash-ship-packed schema-shape (bulk vs single); **🎯 40% milestone — first sustained 40% past 4/10 of POST surface**) |
+| **39** | **5** | **17** | **83** (Round 39: +5 new — all unique; 1 cross-namespace pair guard — daily-summary vs manual-flash-test (Round 32) constant-marker isolation guard, proves distinct action strings prevent collision even without namespace gate; **42.9% — Snippet 5/9 Flash admin cluster closed**) |
 
-Total: **293 contract tests** across 15 rounds (Rounds 19-37). Round 29 introduced
+Total: **329 contract tests** across 17 rounds (Rounds 19-39). Round 29 introduced
 `IdempotencyTestFixture` base class — Round 30+ fully adopt it
-(`IdempotencyRound37Test.php` averages ~5 LOC/test).
+(`IdempotencyRound39Test.php` averages ~4 LOC/test).
 
 ### Fixture refactor (Round 29) {#fixture-refactor}
 
@@ -374,4 +377,4 @@ When adding a new endpoint to this tracker:
 - Pattern: [`docs/patterns/IDEMPOTENCY-KEY.md`](../patterns/IDEMPOTENCY-KEY.md)
 - Foundation: `[Admin System] DINOCO Idempotency Helper` V.1.1
 - Tests: `tests/helpers/IdempotencyEndpointContractTest.php`
-- Audit history: Rounds 18-19, 23, 25-28
+- Audit history: Rounds 18-19, 23, 25-39
