@@ -17,11 +17,11 @@
 
 | Metric | Count |
 |--------|-------|
-| Total integrated endpoints | **94** (+5 new — Round 41 batch 19: dip-stock/count, box-template create, box-template/{id} update, maker/delete, maker-product/delete — Inventory bulk + admin upsert/update + B2F admin delete pair) |
+| Total integrated endpoints | **99** (+5 new — Round 42 batch 20: invoice-gen, manual-flash-label, auth-group, lead-note, upload-image — B2B LIFF GD render + Flash quota + LIFF auth + LIFF AI MongoDB note + Inventory **binary-fingerprint NEW pattern**) |
 | **Total POST endpoints (Round 33 fresh census)** | **196** (+3 since Round 30 — natural growth, see [REST-ENDPOINT-CENSUS-2026-04-30.md](./REST-ENDPOINT-CENSUS-2026-04-30.md)) |
-| Coverage | **94 / 196 = 48.0%** of POST endpoints — push toward 🎯 50% MAJOR MILESTONE (only +4 needed for ~98/196). Round 41 pivots from B2B Flash admin cluster (Round 36-39) and mixed Round 40 to Inventory shipping cluster + B2F admin delete. **Inventory namespace coverage = 16 endpoints** (+3 since Round 40 = 13 → 16). **B2F namespace coverage = 21 endpoints** (+2 since Round 40 = 19 → 21). B2B namespace coverage = **42/56 ≈ 75%** (unchanged since Round 39). MCP cluster coverage = **13/17 = ~76%** (saturated since Round 35). LIFF AI namespace coverage = **2 endpoints** (unchanged since Round 40). Cross-namespace SHAPE-MATCH guard pattern reused: maker/delete vs maker-product/delete (both `{id}`-only — namespace gate is sole discriminator, mirrors flash-cancel/flash-cancel-notify R36 pair). |
-| Cumulative test cases | 365 (Round 19-41 — Round 41 added 18) |
-| Body-shape distinct hashes asserted | 93 (Round 41: +5 new — all unique; 2 cross-namespace pair guards — maker-delete vs maker-product-delete SHAPE-MATCH (proves namespace is sole discriminator for `{id}`-only B2F admin deletes) + box-template-create vs box-template-update (id field discriminates create vs update intent within same domain)) |
+| Coverage | **🎯🎯🎯 99 / 196 = 50.5% — 50% MAJOR MILESTONE REACHED ROUND 42 ⭐⭐⭐** of POST endpoints — past 1/2 of POST surface integrated. **24-round sustained Idempotency-Key campaign Rounds 18-42**. Round 42 pivots from saturated Inventory shipping cluster (R40-41) + closes 2 long-pending B2B LIFF retry-prone POSTs + introduces **NEW binary-fingerprint sub-pattern** (upload-image — first idempotent endpoint with sha1_file content fingerprint, expanding "image_base64 EXCLUDED" parent pattern to general binary uploads with file-identity check). **Inventory namespace coverage = 17 endpoints** (+1 since Round 41 = 16 → 17). **B2B namespace coverage = 45 endpoints** (+3 since Round 41 = 42 → 45). **LIFF AI namespace coverage = 3 endpoints** (+1 since Round 41 = 2 → 3). **B2F namespace coverage = 21 endpoints** (unchanged). MCP cluster coverage = **13/17 = ~76%** (saturated since Round 35). |
+| Cumulative test cases | 382 (Round 19-42 — Round 42 added 17) |
+| Body-shape distinct hashes asserted | 98 (Round 42: +5 new — all unique; binary-fingerprint pattern guard — upload-image content_sha1 fingerprint catches binary changes WITHOUT storing 5MB raw bytes; documents new sub-pattern alongside slip-upload R37 + combined-slip-upload R29 image_base64 EXCLUDED variants) |
 
 > **Round 30 note**: Earlier rounds reported coverage against a conservative
 > "~75 POST endpoints" estimate. The Round 30 REST endpoint census
@@ -70,9 +70,9 @@
 | **37.8% (Round 37 — Snippet 3 RPi + customer LIFF cluster)** | **37** | **2026-04-30** | +5 endpoints (74/196). Batch 15 — closes ALL 5 Round 36 high-priority candidates in `[B2B] Snippet 3`: print-test (constant-marker `{type}` — admin double-click test print) + print-requeue (single `{ticket_id}` — admin/RPi reprint shipping label) + rpi-accept-order (single `{ticket_id}` — RPi kiosk FSM 400 surface fix) + rpi-flash-ready (single `{ticket_id}` — RPi scan-to-call-courier Flash /notify quota burn; 4 success store sites: already-courier / active-pickup-reuse / new-pickup-success / queued-retry) + slip-upload (CRITICAL — Slip2Go double-charge guard: `{ticket_id, gid}` bulk-shape with `image_base64` EXCLUDED following combined-slip-upload Round 29 pattern; gid from session prevents cross-group cache poisoning). 19 B2F + **32 B2B** + 9 inventory + 13 MCP + 1 LIFF AI. **Snippet 3 coverage 35% → 54% (9/26 → 14/26 POST routes).** Pattern: 1× constant-marker (no body content) + 3× single (ticket_id) + 1× bulk-shape (ticket_id+gid). |
 | 🎯 **40.3% (Round 38 — TRUE 40% milestone) ⭐** | **38** | **2026-04-30** | +5 endpoints (79/196). Batch 16 — Snippet 3 medium-priority retry-prone closures + Snippet 5 Flash admin label: bo-notify (admin "ส่ง Flex แจ้งลูกค้า" double-click → 2× LINE Flex push to customer spam + bo_available_qty churn; bulk-shape `{ticket_id, items sorted by sku}`) + rpi-command (admin spam-click "รีบูท RPi"/"รีสตาร์ท service" → 2× cmd queue entries + cmd_id pollution; bulk-shape `{command, params normalized via ksort}`) + rpi-flash-box-packed (RPi scanner double-trigger → manifest-completion 2× Flash /notify quota burn + admin Flex pickup_added spam; single `{pno}`; 4 success store sites — reused_pickup / called / pending / partial-status) + flash-ship-packed (timeout dialog double-confirm → 2× courier /notify + admin LINE notification + hold_pending Flex push + audit log; single `{ticket_id}`) + flash-label (admin "ดาวน์โหลด Label" double-click → 2× Flash /open/v3/orders/printPdf quota burn; single `{pno}` — binary PDF cannot replay through cache, returns JSON marker on replay). **Snippet 3 coverage 54% → 69% (14/26 → 18/26 POST routes). B2B namespace coverage 57% → 66%.** 19 B2F + **37 B2B** + 9 inventory + 13 MCP + 1 LIFF AI. **First sustained 40% milestone past 4/10 of POST surface against authoritative Round 30 census denominator.** Pattern: 2× bulk-shape (ticket_id+items / command+params) + 3× single (2× pno + 1× ticket_id). |
 | **42.9% (Round 39 — push toward 45% milestone)** | **39** | **2026-04-30** | +5 endpoints (84/196). Batch 17 — Snippet 5 Flash ops + Snippet 9 Flash admin setup cluster: flash-ready-to-ship (admin double-click "พร้อมจัดส่ง" → 2× distributor Flex push spam + 2× Flash courier /notify quota burn + 2× admin LINE notification + 2× audit log churn per ticket; **bulk-shape** `{ticket_ids sorted+deduped}` — handler accepts single or array, normalized) + daily-summary (admin manual-trigger "ส่งสรุป" → 2× admin Flex summary card + 2× DB storm cron-replica read; **constant-marker** `{action: 'trigger-summary'}` — no params at all, namespace + action string sole discriminator) + flash-webhook-setup (admin "ตั้งค่า Webhook" → 2× POST /notify/setting × 5 codes = 10 Flash API calls instead of 5 quota burn; **bulk-shape** `{webhook_url, codes:[0..4]}` — webhook_url change between retries → 409 alert env mismatch) + flash-api-test (admin "ทดสอบ Flash API" → 2× GET /warehouses Flash rate-limit count; **single** `{action, mch_id, is_production}` — env discriminator catches training↔prod switch; errors NOT cached) + test-push (admin "Test Push" double-click → 2× LINE push to admin group spam; **single** `{target, message}` — different message text → 409). **Snippet 5 coverage = 11 endpoints. Snippet 9 coverage 3 → 6 (+3).** B2B namespace coverage 66% → ~75%. 19 B2F + **42 B2B** + 9 inventory + 13 MCP + 1 LIFF AI. Pattern mix: 1× constant-marker (daily-summary — third instance, after stock/initialize Round 30 + manual-flash-test Round 32) + 1× bulk-shape (flash-ready-to-ship) + 1× bulk-shape with env discriminator (flash-webhook-setup) + 2× single (flash-api-test + test-push). |
+| 🎯🎯🎯 **50.5% (Round 42 — 50% MAJOR MILESTONE REACHED ⭐⭐⭐)** | **42** | **2026-04-30** | +5 endpoints (99/196 = **50.5%**). **24-round sustained campaign Rounds 18-42**. Batch 20 — push past the half-way mark: invoice-gen (customer/admin LIFF "ดูใบแจ้งหนี้" double-click on slow GD render → 2× expensive PDF generation b2b_generate_invoice_pages → 2× upload to /wp-content/uploads/b2b-invoices/ + 2× LINE notification spam if downstream pushes wired; **single** body hash = `{ticket_id, gid}` — gid from session prevents cross-group cache poisoning) + manual-flash-label (admin "ดาวน์โหลด Label Manual" double-click on slow Flash API → 2× call to b2b_flash_get_label_pdf → 2× Flash /open/v3/orders/printPdf quota burn; **single** body hash = `{pno}` globally unique; PDF binary CANNOT replay through cache — wrapper stores lightweight cached_replay marker on success store + LIFF/admin client handles UX) + auth-group (LIFF auth init double-fire on slow LINE verify → 2× session_token issuance + 2× rate-limit consumption + log spam; **single** body hash = `{group_id, line_uid}` — both required for distinct auth identity; rate-limit increment ALREADY happened so wrapper additionally protects token issuance + downstream side-effects only) + lead-note (admin/dealer LIFF "บันทึกหมายเหตุ" double-tap on slow MongoDB → 2× POST to agent proxy → 2× note insert into lead.history MongoDB array → user sees duplicate "by" entries UX + 2× downstream notify hooks; **single** body hash = `{lead_id, note, role, actor uid}` — actor scoped from JWT $auth['uid'] cross-admin/dealer key reuse impossible; note text edits between retries → 409 integrity guard) + upload-image (admin "อัพโหลดรูป" double-click on slow upload 5MB image over 4G → 2× S3/local file write to wp-content/uploads/ + 2× catalog UPDATE + 2× ACF update_field + 2× set_post_thumbnail; **NEW binary-fingerprint pattern** body hash = `{sku, filename, size, content_sha1}` — **binary blob EXCLUDED** from hash (5MB raw bytes would explode idempotency_keys table); content_sha1 = sha1_file of upload tmp file (~50ms for 5MB) — serves as fingerprint to distinguish "same file vs different file" without storing binary; admin selected wrong file mid-retry = different content_sha1 = 409 prevents wrong image stuck on SKU). **B2B namespace coverage 42 → 45 (+3)**. **Inventory namespace coverage 16 → 17 (+1)**. **LIFF AI namespace coverage 2 → 3 (+1)**. 21 B2F + 45 B2B + 17 inventory + 13 MCP + 3 LIFF AI = **99/196 = 🎯🎯🎯 50.5% MAJOR MILESTONE**. Pattern mix: 4× single (invoice-gen + manual-flash-label + auth-group + lead-note) + 1× **binary-fingerprint NEW** (upload-image). Pattern maturity at Round 42: **7 patterns** observed (single / bulk / bulk-of-targets / state-machine / boolean-discriminator + enum-discriminator / constant-marker / **binary-fingerprint NEW R42**) — see [`docs/patterns/IDEMPOTENCY-KEY.md`](../patterns/IDEMPOTENCY-KEY.md). |
 | **48.0% (Round 41 — push toward 🎯 50% MAJOR MILESTONE)** | **41** | **2026-04-30** | +5 endpoints (94/196). Batch 19 — pivot from B2B Flash admin cluster + LIFF AI/Inventory mix (Round 40) to Inventory shipping ops + B2F admin delete pair: dip-stock/count (admin "บันทึกผลนับ" double-click → 2x SQL UPDATE per item + variance/variance_pct re-compute waste + counted_skus recount; **bulk-shape** body hash = `{session_id, items: sorted-by-sku [{sku UPPER, actual_qty, note}]}` — different actual_qty between retries → 409 prevents wrong variance stuck via cached replay) + box-template create (admin "เพิ่มกล่อง" double-click race → 2x INSERT slips through handler dedup microsecond gap + 2x cache flush + 2x dinoco_invalidate_box_template_cache; **single** body hash = `{code, name, dims, tare/max weight, owner_type, sort_order}`) + box-template/{id} update (admin "แก้ไขกล่อง" double-click → 2x UPDATE + cache flush 2x + downstream Snippet 1 V.34.x dinoco_resolve_pno_shipping() static memo flush twice; **single** body hash = `{id, ...selective fields present}` — id discriminates create vs update; dim change between retries → 409) + maker/delete (admin "ลบโรงงาน" double-click on slow ACF write → 2nd request finds maker already inactive idempotent at storage but 2x b2f_log + admin Flex push double-fire risk; **single** `{id}` — cross-namespace pair guard with maker-product/delete same shape) + maker-product/delete (admin "ลบสินค้า" double-click → 1st wp_delete_post succeeds + soft-delete junction + b2f_junction_updated hook + cache invalidation; 2nd request hits NOT_FOUND 404 confusion — wrapper turns "already deleted" 404 into cached 200 retry-friendly UX; **single** `{id}`). **Inventory namespace coverage 13 → 16 (+3). B2F namespace coverage 19 → 21 (+2)**. 21 B2F + 42 B2B + **16 inventory** + 13 MCP + 2 LIFF AI. **Push toward 🎯 50% MAJOR MILESTONE — 94/196 = 48.0%, only +4 needed for ~98/196 in Round 42 batch 20.** Pattern mix: 1× bulk-shape (dip-stock/count items[] sort by SKU) + 2× single full-shape (box-template create) + 2× single shape-match {id}-only (B2F deletes — namespace-discriminated). Cross-namespace SHAPE-MATCH pattern reused (mirrors flash-cancel/flash-cancel-notify R36 pair + print-requeue/rpi-accept-order R37 pair). |
 | 🎯 **45.4% (Round 40 — TRUE 45% milestone) ⭐** | **40** | **2026-04-30** | +5 endpoints (89/196). Batch 18 — pivot from saturated B2B Flash admin cluster (Round 36-39) to mixed-namespace closure (1 LIFF AI + 4 Inventory): claim/{id}/status (LIFF AI Command Center admin status dropdown → slow ACF save → 2× dinoco_set_claim_status() → 2× status_history + 2× admin_note + 2× hook chain LINE push potential; **single** `{claim_id, status, note, actor uid from JWT}` — JWT-scoped actor, cross-admin key reuse impossible) + dip-stock/start (admin "เริ่มนับสต็อก" double-click race → 2× session INSERT + 10K+ row snapshot DB storm; **constant-marker** `{action: 'start'}` — handler takes no params, fourth constant-marker instance) + dip-stock/force-close (admin "ปิด session" double-click → 2× UPDATE + b2b_log fires twice audit noise; **single** `{session_id}` — 0 means close-any-in-progress) + stock/settings (admin "บันทึก" → 4× update_option × 2 = 8 DB writes + 2× option_changed hooks; **selective save** body hash — only fields PRESENT in request hashed; alert_enabled boolean discriminator) + shipping-defaults (admin "บันทึกค่าเริ่มต้น Flash" → 2× wp_dinoco_flash_audit INSERT on flag toggle + 2× cache flush + 2× update_option; **bulk-shape** with express_threshold sub-object normalized via ksort + flag_enabled **boolean discriminator** — V.42 enable/disable is single most consequential Flash admin action, ON↔OFF flip catches via 409). **Inventory namespace coverage 9 → 13 (+4)**. **LIFF AI namespace coverage 1 → 2 (+1)**. 19 B2F + 42 B2B + **13 inventory** + 13 MCP + **2 LIFF AI**. **First sustained 45% milestone past 9/20 of POST surface against authoritative Round 30 census denominator.** Pattern mix: 2× constant-marker (dip-stock/start — 4th instance after stock/initialize R30 + manual-flash-test R32 + daily-summary R39) + 2× single (claim-status + dip-stock/force-close) + 1× selective save (stock-settings) + 1× bulk-shape with boolean discriminator (shipping-defaults flag_enabled flip). Constant-marker pattern firmly proven across 4 endpoints in 4 rounds. |
-| Target: 🎯 50% MAJOR MILESTONE | **42** | **TBD** | Need +4 more endpoints (~98/196). Realistic timeline: Round 42 batch 20 (single batch closes the milestone after Round 41 = 94/196 = 48.0%). |
 | Target: 60% | future | TBD | ~118 endpoints — major sustained effort. Realistic timeline: Round 50+ |
 
 > **Why no 50% milestone in Round 30**: User-facing milestone celebration in the
@@ -84,7 +84,7 @@
 
 ---
 
-## Integrated endpoints (94)
+## Integrated endpoints (99) — 🎯🎯🎯 50% MAJOR MILESTONE
 
 | # | Endpoint | Snippet | Pattern | Round | Status |
 |---|----------|---------|---------|-------|--------|
@@ -183,6 +183,11 @@
 | 93 | `POST /dinoco-stock/v1/box-template/{id}` | `[Admin System] DINOCO Global Inventory Database` V.45.8 | single ({id, ...selective fields present: name, owner_type, length_cm, width_cm, height_cm, tare_weight_g, max_weight_g, sort_order} — admin "แก้ไขกล่อง" double-click → 2× UPDATE + updated_at re-stamp + cache flush 2× + downstream Snippet 1 dinoco_resolve_pno_shipping() static memo flush twice; id discriminates from create endpoint; dimension change between retries → 409) | **41** | **integrated** |
 | 94 | `POST /b2f/v1/maker/delete` | `[B2F] Snippet 2` V.11.20 | single ({id} — admin "ลบโรงงาน" double-click on slow ACF write → 2nd request finds maker already inactive idempotent at storage but 2× b2f_log entry + admin Flex push double-fire risk on hook chain; shares shape with maker-product/delete via SHAPE-MATCH pattern) | **41** | **integrated** |
 | 95 | `POST /b2f/v1/maker-product/delete` | `[B2F] Snippet 2` V.11.20 | single ({id} — admin "ลบสินค้า" double-click → 1st wp_delete_post(true) succeeds + b2f_dual_soft_delete_junction + b2f_junction_updated hook + cache invalidation; 2nd request hits NOT_FOUND 404 confusion — wrapper turns "already deleted" 404 into cached 200 retry-friendly UX; SHAPE-MATCH with maker/delete, namespace-discriminated) | **41** | **integrated** |
+| 96 | `POST /b2b/v1/invoice-gen` | `[B2B] Snippet 3` V.42.18 | single ({ticket_id, gid} — customer/admin LIFF "ดูใบแจ้งหนี้" double-click on slow GD render → 2× expensive PDF generation b2b_generate_invoice_pages + 2× upload to /wp-content/uploads/b2b-invoices/; gid from session prevents cross-group cache poisoning) | **42** ⭐⭐⭐ | **integrated** |
+| 97 | `POST /b2b/v1/manual-flash-label` | `[B2B] Snippet 3` V.42.18 | single ({pno} globally unique — admin "ดาวน์โหลด Label Manual" double-click on slow Flash API → 2× call to b2b_flash_get_label_pdf → 2× Flash /open/v3/orders/printPdf quota burn; PDF binary CANNOT replay through cache — wrapper stores lightweight cached_replay marker on success store) | **42** ⭐⭐⭐ | **integrated** |
+| 98 | `POST /b2b/v1/auth-group` | `[B2B] Snippet 3` V.42.18 | single ({group_id, line_uid} — LIFF auth init double-fire on slow LINE verify → 2× session_token issuance + 2× rate-limit consumption + log spam; both fields required for distinct auth identity; rate-limit increment ALREADY happened so wrapper additionally protects token issuance + downstream side-effects only) | **42** ⭐⭐⭐ | **integrated** |
+| 99 | `POST /liff-ai/v1/lead/{id}/note` | `[LIFF AI] Snippet 1` V.1.13 | single ({lead_id, note, role, actor uid} — admin/dealer LIFF "บันทึกหมายเหตุ" double-tap on slow MongoDB → 2× POST to agent proxy → 2× note insert into lead.history MongoDB array → user sees duplicate "by" entries UX + 2× downstream notify hooks; actor scoped from JWT $auth['uid'] cross-admin/dealer key reuse impossible; note text edits between retries → 409 integrity guard) | **42** ⭐⭐⭐ | **integrated** |
+| 100 | `POST /dinoco-stock/v1/product/upload-image` | `[Admin System] DINOCO Global Inventory Database` V.45.9 | **binary-fingerprint NEW R42** ({sku, filename, size, content_sha1} — admin "อัพโหลดรูป" double-click on slow upload 5MB image → 2× S3/local file write + 2× catalog UPDATE + 2× ACF update_field + 2× set_post_thumbnail; **binary blob EXCLUDED** from hash; content_sha1 = sha1_file of upload tmp file ~50ms — fingerprint distinguishes "same file vs different file" without storing 5MB; admin selected wrong file mid-retry = different sha1 = 409) | **42** ⭐⭐⭐ | **integrated** |
 
 > Note: numbering goes to 95 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
 > delete-ticket (32) + recalculate-total (33) share body shape +
@@ -193,10 +198,10 @@
 > discriminated) +
 > maker/delete (94) + maker-product/delete (95) share {id}-only body shape (2-way namespace-
 > discriminated, R41 SHAPE-MATCH pair guard) — all namespace-discriminated. Total integrated
-> endpoint count = 94 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix for
+> endpoint count = 99 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix for
 > bo-fulfill which had no actual wrapper despite tracker entry + Round 31: +5 + Round 32: +5
 > + Round 33: +5 + Round 34: +5 + Round 35: +5 + Round 36: +5 + Round 37: +5 + Round 38: +5
-> + Round 39: +5 + Round 40: +5 + Round 41: +5).
+> + Round 39: +5 + Round 40: +5 + Round 41: +5 + Round 42: +5 — **🎯🎯🎯 50% MAJOR MILESTONE**).
 >
 > **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1) — RESOLVED in Round 30**: `bo-fulfill`
 > (#14, Round 19) was listed as "integrated" but actual code had NO wrapper. **Round 30 fixed**:
@@ -217,45 +222,43 @@
 
 ---
 
-## Pending POST endpoints (Round 42+ candidates)
+## Pending POST endpoints (Round 43+ candidates)
 
-### Round 41 audit findings (push toward 🎯 50% MAJOR MILESTONE)
+### Round 42 closure — 🎯🎯🎯 50% MAJOR MILESTONE REACHED
 
-> **Round 41 closure**: 94/196 = 48.0% — only +4 endpoints to reach 🎯 50% MAJOR MILESTONE.
-> Pivoted from B2B Flash admin cluster (Round 36-39) and mixed Round 40 (1 LIFF AI + 4 Inventory)
-> to Inventory shipping ops + B2F admin delete pair: 3 Inventory (dip-stock/count, box-template
-> create, box-template/{id} update) + 2 B2F admin delete (maker/delete, maker-product/delete).
-> Inventory namespace coverage 13 → 16 (+3). B2F namespace coverage 19 → 21 (+2).
-> Cross-namespace SHAPE-MATCH guard pattern reused: maker/delete vs maker-product/delete (both
-> `{id}`-only — namespace gate is sole discriminator, mirrors flash-cancel/flash-cancel-notify
-> R36 pair + print-requeue/rpi-accept-order R37 pair).
+> **Round 42 closure**: 99/196 = **50.5%** — past the half-way mark of POST surface integrated
+> against authoritative Round 30 census denominator. **24-round sustained Idempotency-Key
+> campaign Rounds 18-42**. Closed 2 long-pending B2B LIFF retry-prone POSTs (invoice-gen
+> + manual-flash-label) + auth-group (LIFF init) + LIFF AI lead-note + introduced **NEW
+> binary-fingerprint sub-pattern** with upload-image (first idempotent endpoint with
+> sha1_file content fingerprint expanding "image_base64 EXCLUDED" parent pattern).
 >
-> **Round 41 noted swaps**: 3 of the 5 Round 40 candidate paths were not POST-mutational —
-> `manual-shipments` is GET (line 306), `admin-bo-tickets` is GET (line 254), `print-monitor`
-> doesn't exist in the route registry. Replaced with: dip-stock/count (POST verified at line
-> 2804 of Inventory) + box-template (POST line 3845) + box-template/{id} update (POST line
-> 3913) + maker/delete (B2F handler line 1168) + maker-product/delete (handler line 2298).
+> **Round 42 pattern milestone**: 7 patterns now observed — single / bulk / bulk-of-targets /
+> state-machine / boolean-discriminator + enum-discriminator / constant-marker (4 instances)
+> / **binary-fingerprint NEW R42**. Pattern playbook is mature; future rounds expected to
+> reuse existing patterns rather than introduce new ones (until ~70% coverage when remaining
+> endpoints will likely be edge cases).
 >
-> **Round 41 deferred (low priority)**: Snippet 3 RPi print poll endpoints (print-monitor
-> doesn't exist; print-status/print-heartbeat/print-ack are stateless polls — natural dedup
-> via order_id state). manual-flash-status verified GET-effectively despite POST registration.
+> **Round 42 recommendation**: Slow-down to 1-2 weeks production canary observation before
+> Round 43 batch 21. The 50% milestone marks a natural pause point — sustained 24-round
+> campaign deserves a check-in window. Alternatively, continue toward 60% (118/196) with
+> ~5-batch sustained pace = ~Round 47.
 
-### High priority (next 4 picks — Round 42 candidates close 🎯 50% MAJOR MILESTONE — ~98/196)
+### High priority (Round 43+ candidates)
 
-> **Round 42 = milestone batch**: Only +4 endpoints needed to reach 50%. Recommended targets:
-> remaining B2F admin endpoints (e.g. distributor-related writes if any uncovered) + remaining
-> Inventory write paths (e.g. product/upload-image which validates server-side, warehouse/{id}
-> mutations, dip-stock approve already done R27 so look at additional ops) + uncovered B2B
-> admin endpoints + uncovered LIFF AI write paths if any.
+> **Round 43+ targets**: Remaining B2F admin endpoints (e.g. maker/toggle-bot — verify handler
+> exists), remaining Inventory write paths (product/shipping bulk import, warehouse delete),
+> uncovered B2B admin endpoints (flash-test/run-step + flash-test/simulate-webhook —
+> sysadmin tools, low retry rate), uncovered LIFF AI write paths (claim status update done R40,
+> lead status update — already done R32 via /accept).
 
 | Endpoint | Snippet | Risk if double-fired | Round candidate |
 |----------|---------|----------------------|-----------------|
-| `POST /dinoco-stock/v1/product/upload-image` | Inventory | Admin upload double-click → 2× S3/local file write + 2× catalog UPDATE. Verify if mutational | Round 42 |
-| `POST /b2f/v1/maker/toggle-bot` | `[B2F] Snippet 2` | Admin bot-enable toggle double-click → 2× ACF write + Flex push (verify handler exists — registered but undefined per grep) | Round 42 |
-| `POST /dinoco-stock/v1/dip-stock/start` (audit-recheck) | Inventory | Already R40 — confirm no drift | Round 42 (dedup verify) |
-| `POST /b2b/v1/auth-group` | `[B2B] Snippet 3` | LIFF auth init — natural session token TTL but log spam guard | Round 42 |
-| `POST /b2b/v1/manual-flash-label` | `[B2B] Snippet 3` | Manual Flash label fetch — Flash quota + admin Flex spam guard | Round 42 |
-| `POST /liff-ai/v1/lead/{id}/note` | `[LIFF AI] Snippet 1` | Admin note add double-click → 2× MongoDB note insert | Round 42 |
+| `POST /b2f/v1/maker/toggle-bot` | `[B2F] Snippet 2` | Admin bot-enable toggle double-click → 2× ACF write + Flex push (verify handler exists — registered but undefined per grep) | Round 43 |
+| `POST /dinoco-stock/v1/product/shipping/bulk` | Inventory | CSV bulk import double-click → 2× INSERT/UPDATE batch | Round 43 |
+| `POST /dinoco-stock/v1/shipping-compute` | Inventory | Dry-run resolver — natural idempotent (no side-effect) but Flash quota dedup useful | Round 43 |
+| `POST /b2b/v1/flash-tracking/{ticket_id}` | `[B2B] Snippet 3` | Flash tracking lookup — verify mutational | Round 43 |
+| `POST /b2b/v1/flash-test/run-step` | `[B2B] Snippet 9` | Flash test step runner — sysadmin tool low retry rate | Round 43 |
 
 ### Medium priority (Round 41+)
 
