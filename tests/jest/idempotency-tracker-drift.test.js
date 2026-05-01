@@ -278,12 +278,18 @@ describe("Idempotency tracker drift", () => {
                 const suffix = segments[segments.length - 1];
 
                 // The suffix must appear in a register_rest_route URI
-                // ('/suffix' or 'subgroup/suffix') OR in a namespace marker
-                // ('::suffix') from the wrapper. Loose match — file-level only.
+                // ('/suffix' or 'subgroup/suffix' or 'subgroup/suffix/(?P<placeholder>...)')
+                // OR in a namespace marker ('::suffix' or '::group-suffix') from the wrapper.
+                // Loose match — file-level only. R47: extended pattern 2 to permit
+                // dynamic-route trailing regex segment (?P<placeholder>) after suffix +
+                // pattern 4 hyphenated namespace marker (e.g. '::shipping-classify' covers
+                // suffix 'classify' from endpoint '/shipping/classify/{sku}').
                 const patterns = [
                     new RegExp(`::${escapeRegex(suffix)}\\b`),
                     new RegExp(`['"][^'"]*\\/${escapeRegex(suffix)}['"]`),
                     new RegExp(`['"]${escapeRegex(suffix)}['"]`),
+                    new RegExp(`['"][^'"]*\\/${escapeRegex(suffix)}\\/`),
+                    new RegExp(`::[\\w-]*${escapeRegex(suffix)}\\b`),
                 ];
 
                 const found = patterns.some((p) => p.test(content));

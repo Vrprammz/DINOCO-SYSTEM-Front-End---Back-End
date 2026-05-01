@@ -2,6 +2,36 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.45.11 (2026-04-30) — Round 47 batch 25: Idempotency-Key support on 4 inventory POSTs
+ *   (push toward 70% milestone — 119/196 → 124/196 = 63.3%):
+ *   - POST /dinoco-stock/v1/stock/sync-missing — admin "🔄 Sync Missing" double-click on
+ *     slow drift sweep → 2× full table scan + 2× INSERT loop on missing SKUs (e.g. 50
+ *     missing rows = 100 INSERTs) + 2× cache invalidation. Body hash = constant-marker
+ *     {action:'sync-missing'}. 6th constant-marker instance after R30/R32/R39/R40/R43.
+ *   - POST /dinoco-stock/v1/shipping/classify/{sku} — admin classify ad-hoc SKU "บันทึก
+ *     pack mode" double-click on slow UPDATE → 2× UPDATE wp_dinoco_products + 2× memo
+ *     flush + 2× shipping cache flush. Body hash = single {sku, validated update fields
+ *     ksort-normalized}. Different pack_mode mid-retry (single_box → multi_box) → 409.
+ *     updated_by/updated_at EXCLUDED — auto-stamped drift fields.
+ *   - POST /dinoco-stock/v1/product/shipping — admin Edit Product modal "บันทึก Shipping"
+ *     double-click on slow transaction (UPDATE products + DELETE+INSERT pack_slots × N) →
+ *     2× transaction commit + 2× cache invalidation + 2× downstream Snippet 1
+ *     dinoco_resolve_pno_shipping memo flush. Body hash = bulk-shape selective {sku,
+ *     update fields ksort-normalized, pack_slots[] sorted by slot_index — slot_label,
+ *     box_template_id, content_weight_g per row}. Different pack_mode/weight between
+ *     retries → 409. updated_* audit columns EXCLUDED.
+ *   - POST /dinoco-stock/v1/image-proxy — admin Edit Product modal "อัพโหลดรูป" via
+ *     canvas → JS calls image-proxy to fetch external CDN URL → base64 data URL (CORS
+ *     workaround). Flaky network → 2× wp_remote_get bandwidth burn (10MB image × 2 =
+ *     20MB download). Body hash = single {url}. Cached response includes data_url base64
+ *     directly (small payload) — replay returns identical bytes (mirror upload-image R42
+ *     binary-fingerprint precedent EXCEPT direct cache vs sha1 fingerprint here).
+ *   Pattern mix: 1× constant-marker (sync-missing — 6th instance) + 2× single (shipping/
+ *   classify + image-proxy) + 1× bulk-shape selective (product/shipping with pack_slots[]
+ *   sorted by slot_index). All 4 endpoints function_exists() guarded — pure no-op if
+ *   helper not synced. Backward compat: missing X-Idempotency-Key = byte-identical
+ *   V.45.10 behavior. **Push toward 70% milestone — 124/196 = 63.3%**. Inventory namespace
+ *   coverage: 19 → 23 (+4).
  * Version: V.45.10 (2026-04-30) — Round 45 batch 23: Idempotency-Key support on 2 inventory POSTs
  *   (push toward 60% milestone — 109/196 → 114/196 = 58.2%):
  *   - POST /dinoco-stock/v1/product/shipping/bulk — UPGRADED ad-hoc transient idempotency
@@ -1714,6 +1744,38 @@ add_action('rest_api_init', function() {
             if ( empty( $parsed['scheme'] ) || ! in_array( $parsed['scheme'], [ 'http', 'https' ], true ) ) {
                 return new WP_Error( 'bad_scheme', 'Only http/https allowed', [ 'status' => 400 ] );
             }
+
+            // ── V.45.11 Round 47 batch 25: Idempotency-Key support ──
+            // Admin Edit Product modal "อัพโหลดรูป" via canvas → JS calls image-proxy to
+            // fetch external CDN URL → base64 data URL (CORS workaround). On flaky network
+            // / slow remote → 2× wp_remote_get bandwidth burn (10MB image × 2 = 20MB
+            // download). Body hash = single {url} normalized (admin tries same URL again
+            // = replay safe via cached data_url; different URL between retries → 409 surfaces
+            // accidental URL change). Note: cached response includes data_url base64 string
+            // so replay returns identical image bytes from idempotency_keys table — same
+            // pattern as upload-image binary-fingerprint precedent (R42 EXCEPT smaller payload
+            // here so cache directly without sha1 fingerprint).
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-stock/v1::image-proxy';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array( 'url' => (string) $url );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             $response = wp_remote_get( $url, [
                 'timeout' => 10,
                 'headers' => [ 'User-Agent' => 'DINOCO-ImageProxy/1.0' ],
@@ -1733,11 +1795,18 @@ add_action('rest_api_init', function() {
             if ( strpos( $content_type, 'image/' ) !== 0 ) {
                 return new WP_Error( 'not_image', "Not an image (type={$content_type})", [ 'status' => 400 ] );
             }
-            return rest_ensure_response( [
+            $resp = [
                 'success'  => true,
                 'data_url' => 'data:' . $content_type . ';base64,' . base64_encode( $body ),
                 'size'     => strlen( $body ),
-            ] );
+            ];
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ]);
@@ -2573,16 +2642,53 @@ add_action('rest_api_init', function() {
     // GET /stock/list. Run after bulk catalog import or if WARN log shows drift.
     register_rest_route('dinoco-stock/v1', '/stock/sync-missing', [
         'methods'  => 'POST',
-        'callback' => function() {
+        'callback' => function( WP_REST_Request $request ) {
             if ( ! function_exists('dinoco_inv_sync_missing_products') ) {
                 return new WP_REST_Response(['success' => false, 'message' => 'helper not loaded'], 500);
             }
+
+            // ── V.45.11 Round 47 batch 25: Idempotency-Key support ──
+            // Admin "🔄 Sync Missing" double-click on slow drift sweep → 2× full table
+            // scan + 2× INSERT loop on missing SKUs (e.g. 50 missing rows = 100 INSERTs)
+            // + 2× cache invalidation. Body hash = {action:'sync-missing'} constant-marker
+            // (no params) — admin generates fresh key per click; same key reuse = cached
+            // 200 replay (instant, no scan + insert burn). 6th constant-marker instance
+            // (after R30 stock/initialize + R32 manual-flash-test + R39 daily-summary +
+            // R40 dip-stock/start + R43 invoice/init).
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::stock-sync-missing';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array( 'action' => 'sync-missing' );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             $result = dinoco_inv_sync_missing_products();
-            return rest_ensure_response([
+            $resp = array(
                 'success'  => true,
                 'inserted' => (int) ($result['inserted'] ?? 0),
                 'errors'   => (int) ($result['errors'] ?? 0),
-            ]);
+            );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ]);
@@ -4397,11 +4503,60 @@ add_action('rest_api_init', function() {
             $update = $validated['data'];
             if ( empty( $update ) ) return new WP_Error( 'bad_input', 'no fields to update', array( 'status' => 400 ) );
 
+            // ── V.45.11 Round 47 batch 25: Idempotency-Key support ──
+            // Admin Edit Product modal "บันทึก Shipping V.42" double-click on slow
+            // transaction (UPDATE wp_dinoco_products + DELETE+INSERT pack_slots × N) →
+            // 2× transaction commit + 2× cache invalidation (P2 matrix Snippet 1
+            // dinoco_resolve_pno_shipping memo flushed twice) + 2× downstream cron
+            // recompute. Body hash = bulk-shape selective {sku, update fields ksort-
+            // normalized, pack_slots[] sorted by slot_index}. Different pack_mode or
+            // weight_grams between retries → 409 prevents silent overwrite. updated_*
+            // audit columns EXCLUDED.
+            $slots_input = $req->get_param( 'pack_slots' );
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-stock/v1::product-shipping';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $hash_update = $update;
+                ksort( $hash_update );
+                $hash_slots = array();
+                if ( is_array( $slots_input ) ) {
+                    foreach ( $slots_input as $idx => $slot ) {
+                        if ( ! is_array( $slot ) ) continue;
+                        $row = array(
+                            'slot_index'      => absint( $idx ),
+                            'slot_label'      => sanitize_text_field( $slot['slot_label'] ?? '' ),
+                            'box_template_id' => absint( $slot['box_template_id'] ?? 0 ),
+                            'content_weight_g'=> isset( $slot['content_weight_g'] ) ? absint( $slot['content_weight_g'] ) : 0,
+                        );
+                        ksort( $row );
+                        $hash_slots[] = $row;
+                    }
+                    usort( $hash_slots, function( $a, $b ) {
+                        return $a['slot_index'] <=> $b['slot_index'];
+                    } );
+                }
+                $idem_body = array( 'sku' => $sku, 'update' => $hash_update, 'pack_slots' => $hash_slots );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             $update['shipping_updated_by'] = $uid;
             $update['shipping_updated_at'] = current_time( 'mysql' );
 
             // H6 fix (V.44.1): wrap product UPDATE + pack_slots mutation in transaction
-            $slots_input = $req->get_param( 'pack_slots' );
             $slots_tbl = $wpdb->prefix . 'dinoco_pack_slots';
             $wpdb->query( 'START TRANSACTION' );
             try {
@@ -4456,7 +4611,15 @@ add_action('rest_api_init', function() {
                 wp_cache_flush();
             }
 
-            return rest_ensure_response( array( 'ok' => true, 'sku' => $sku, 'updated_fields' => array_keys( $update ) ) );
+            $resp = array( 'ok' => true, 'sku' => $sku, 'updated_fields' => array_keys( $update ) );
+
+            // V.45.11 Round 47: store cached response for idempotent replay (success only).
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ] );
@@ -4881,6 +5044,37 @@ add_action('rest_api_init', function() {
             if ( empty( $update['pack_mode'] ) || $update['pack_mode'] === 'unknown' ) {
                 return new WP_Error( 'bad_input', 'pack_mode must be != unknown', array( 'status' => 400 ) );
             }
+
+            // ── V.45.11 Round 47 batch 25: Idempotency-Key support ──
+            // Admin classify ad-hoc SKU "บันทึก pack mode" double-click on slow UPDATE →
+            // 2× UPDATE wp_dinoco_products + 2× DINOCO_Catalog::flush_memo + 2× shipping
+            // cache flush. Body hash = single {sku, ...validated update fields ksort-
+            // normalized} — sku is path param + canonical UPPER. Different pack_mode
+            // mid-retry (admin reclassified single_box → multi_box) → 409 prevents
+            // silent override. updated_by/updated_at EXCLUDED — auto-stamped drift.
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-stock/v1::shipping-classify';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $hash_update = $update; // copy validated fields
+                ksort( $hash_update );
+                $idem_body = array( 'sku' => $sku, 'update' => $hash_update );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             $update['shipping_updated_by'] = get_current_user_id();
             $update['shipping_updated_at'] = current_time( 'mysql' );
             $wpdb->update( $wpdb->prefix . 'dinoco_products', $update, array( 'sku' => $sku ) );
@@ -4893,7 +5087,14 @@ add_action('rest_api_init', function() {
             } else {
                 wp_cache_flush();
             }
-            return rest_ensure_response( array( 'ok' => true, 'sku' => $sku, 'classified_as' => $update['pack_mode'] ) );
+            $resp = array( 'ok' => true, 'sku' => $sku, 'classified_as' => $update['pack_mode'] );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ] );
