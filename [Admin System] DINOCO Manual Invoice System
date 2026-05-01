@@ -2,6 +2,27 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.34.11 (2026-04-30) — Round 43 batch 21 Idempotency-Key on 5 retry-prone POSTs.
+ *   Closes 5 long-pending Manual Invoice retry-prone endpoints — push past 50% milestone
+ *   toward 60% (104/196 = 53.1%):
+ *   • POST /b2b/v1/invoice/init           — constant-marker {action: 'init', user_id}.
+ *     Admin "เริ่มออกบิล" double-click on slow wp_insert_post → 2× draft + 2× invoice
+ *     number consumed (gap in sequence). Replay returns 1st draft id + inv_number.
+ *   • POST /b2b/v1/invoice/issue          — single {id}. Admin "ออกบิล/ส่ง LINE" double-
+ *     click on slow LINE push → 2× Flex card + 2× invoice image push to distributor +
+ *     2× FSM transition + 2× debt add. Replay short-circuits before FSM gate.
+ *   • POST /b2b/v1/invoice/record-payment — single {id, amount, note} CRITICAL. Admin
+ *     double-click → 2× _inv_paid_amount add + 2× partial_payments append + 2× debt
+ *     subtract → debt double-cleared. Tolerance epsilon 0.01 + amount round(2) for hash.
+ *   • POST /b2b/v1/invoice/record-refund  — single {id, amount, reason, method} CRITICAL.
+ *     Admin double-click → 2× refund entry + 2× FSM paid→awaiting_payment + 2× debt
+ *     re-add → debt double-credited. Method enum (manual/bank_transfer/cash/credit_note).
+ *   • POST /b2b/v1/invoice/cancel         — single {id, force, force_reason}. Admin
+ *     double-click → 2× cancel Flex push + 2× dinoco_inv_reverse_debt. force boolean
+ *     discriminator + force_reason text catches admin re-issuing with different excuse.
+ *   Pattern: 1× constant-marker (init) + 4× single (issue/record-payment/record-refund/
+ *   cancel). Backward compat: clients without X-Idempotency-Key header behave byte-
+ *   identical to V.34.10. Round 43 → 104/196 = 53.1%.
  * Version: V.34.10 (2026-04-28) — Code-reviewer remediation post-V.34.9 (1 HIGH + 2 MED).
  *   • HIGH-1: V.34.9 ดัก 403 ทุกตัว → non-nonce 403 (rate_limit, BO tier mismatch, per-endpoint
  *     capability fail) ก็ redirect to wp-login → admin โดน force-logout ทั้งที่ session ยังดี.
@@ -1385,7 +1406,36 @@ function dinoco_inv_rest_get(WP_REST_Request $req) {
 
 // --- CREATE ---
 // --- INIT (create empty draft, reserve invoice number) ---
+// V.34.11 Round 43: Idempotency-Key support — admin "เริ่มออกบิล" double-click on slow
+// wp_insert_post → 2× draft created + 2× invoice number consumed (gap in number sequence)
+// + 2× audit log entries. Body shape = constant-marker {action: 'init', user_id} —
+// no params at all + user_id from current admin (different admin = different draft scope).
+// Replay returns the FIRST draft's id + inv_number — admin sees same draft on retry instead
+// of accidentally creating duplicate. Subsequent legitimate inits = different idempotency key.
 function dinoco_inv_rest_init(WP_REST_Request $req) {
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/init';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'action'  => 'init',
+            'user_id' => (int) get_current_user_id(),
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $inv_number = dinoco_inv_generate_number();
     $post_id = wp_insert_post([
         'post_type'   => 'b2b_order',
@@ -1401,7 +1451,13 @@ function dinoco_inv_rest_init(WP_REST_Request $req) {
     update_post_meta($post_id, '_inv_created_by', get_current_user_id());
     update_field('order_status', 'draft', $post_id);
     b2b_add_audit_log($post_id, 'created', 'เริ่มสร้างใบแจ้งหนี้/วางบิล ' . $inv_number);
-    return rest_ensure_response(['success' => true, 'id' => $post_id, 'inv_number' => $inv_number]);
+
+    $resp = array('success' => true, 'id' => $post_id, 'inv_number' => $inv_number);
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 function dinoco_inv_rest_create(WP_REST_Request $req) {
@@ -1901,16 +1957,48 @@ function _dinoco_inv_do_issue_legacy($post_id, $dist_id, $total, $dist_name) {
     return true;
 }
 
+// V.34.11 Round 43: Idempotency-Key support — admin "ออกบิล/ส่ง LINE" double-click on slow
+// LINE push → 2× Flex card + 2× invoice image push to distributor LINE group + 2× FSM
+// transition draft→awaiting_payment + 2× debt add via dinoco_inv_apply_debt. Body hash =
+// {id} — invoice id discriminator. FSM gate (status=draft) prevents 2nd write but 2× LINE
+// push fires before status check completes. Wrapper short-circuits at hash-check level.
 function dinoco_inv_rest_issue(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
+
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/issue';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array('id' => (int) $id);
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     if (get_field('order_status', $id) !== 'draft') return new WP_Error('invalid', 'ออกบิลได้เฉพาะสถานะ Draft', ['status' => 400]);
     $dist_id = intval(get_post_meta($id, '_dist_post_id', true));
     $total   = floatval(get_field('total_amount', $id));
     $dist_name = get_field('dist_name', $id);
     $result = _dinoco_inv_do_issue($id, $dist_id, $total, $dist_name);
     if (is_wp_error($result)) return $result;
-    return rest_ensure_response(['success' => true, 'id' => $id, 'status' => 'awaiting_payment']);
+
+    $resp = array('success' => true, 'id' => $id, 'status' => 'awaiting_payment');
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 // --- RECORD PAYMENT ---
@@ -1925,6 +2013,38 @@ function dinoco_inv_rest_record_payment(WP_REST_Request $req) {
     $note   = sanitize_text_field($req->get_param('note') ?? '');
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
     if ($amount <= 0) return new WP_Error('invalid', 'ยอดชำระต้องมากกว่า 0', ['status' => 400]);
+
+    // V.34.11 Round 43: Idempotency-Key support — CRITICAL retry-prone endpoint.
+    // Admin "บันทึกชำระ" double-click on slow ACF/SQL → 2× _inv_paid_amount add + 2×
+    // partial_payments json append + 2× debt subtract via b2b_recalculate_debt → debt
+    // double-cleared. FOR UPDATE lock prevents physical race but a 2nd retry AFTER 1st
+    // commit still re-adds the payment. Body hash = {id, amount, note} — same payment
+    // on retry replays cached response; different amount mid-retry → 409 (admin must
+    // use new key). FSM-gated by status=awaiting_payment but 1st call FSM transitions
+    // to paid → 2nd call returns "ไม่ใช่สถานะรอชำระ" — wrapper preempts that error path.
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/record-payment';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'id'     => (int) $id,
+            'amount' => round($amount, 2),  // normalize float precision
+            'note'   => $note,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
 
     $dist_id = intval(get_post_meta($id, '_dist_post_id', true));
     $total   = 0;
@@ -2003,14 +2123,24 @@ function dinoco_inv_rest_record_payment(WP_REST_Request $req) {
             b2b_log('[CRITICAL] Manual Invoice V.34.1 record_payment fully_paid: b2b_recalculate_debt + b2b_debt_subtract both missing — debt NOT reversed for dist=' . $dist_id . ' amount=' . $total . ' (admin must reconcile manually)');
         }
         b2b_add_audit_log($id, 'invoice_paid', 'ชำระครบ ฿' . number_format($new_paid, 0));
-        return rest_ensure_response(['success' => true, 'fully_paid' => true, 'status' => 'paid']);
+        $resp = array('success' => true, 'fully_paid' => true, 'status' => 'paid');
+        if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+            dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                array_merge($resp, array('_idem_code' => 200)), 200);
+        }
+        return rest_ensure_response($resp);
     } else {
         // Recalculate debt after partial payment so credit limit + Flex show correct values
         if (function_exists('b2b_recalculate_debt') && $dist_id) {
             b2b_recalculate_debt($dist_id);
         }
         b2b_add_audit_log($id, 'partial_payment', 'รับชำระบางส่วน ฿' . number_format($amount, 0) . ' (รวม ฿' . number_format($new_paid, 0) . '/' . number_format($total, 0) . ')');
-        return rest_ensure_response(['success' => true, 'fully_paid' => false, 'paid_amount' => $new_paid]);
+        $resp = array('success' => true, 'fully_paid' => false, 'paid_amount' => $new_paid);
+        if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+            dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                array_merge($resp, array('_idem_code' => 200)), 200);
+        }
+        return rest_ensure_response($resp);
     }
 }
 
@@ -2027,6 +2157,38 @@ function dinoco_inv_rest_record_refund(WP_REST_Request $req) {
     if ($amount <= 0) return new WP_Error('invalid', 'จำนวนเงินคืนต้องมากกว่า 0', ['status' => 400]);
     if (empty($reason)) return new WP_Error('invalid', 'กรุณาระบุเหตุผลการคืนเงิน', ['status' => 400]);
     if (strlen($reason) > 500)  return new WP_Error('invalid', 'เหตุผลยาวเกินไป (สูงสุด 500 อักขระ)', ['status' => 400]);
+
+    // V.34.11 Round 43: Idempotency-Key support — CRITICAL retry-prone endpoint mirrors
+    // record-payment but reverses ledger. Admin "บันทึกคืนเงิน" double-click → 2× refund
+    // entry + 2× _inv_refunded_amount add + 2× FSM transition paid→awaiting_payment +
+    // 2× debt re-add via b2b_recalculate_debt → debt double-credited → distributor sees
+    // wrong outstanding balance. Body hash = {id, amount, reason, method} —
+    // method enum (manual|bank_transfer|cash|credit_note) discriminates accounting category.
+    // Different reason = different idempotency key (admin must use new key for distinct refund).
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/record-refund';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'id'     => (int) $id,
+            'amount' => round($amount, 2),  // normalize float precision
+            'reason' => $reason,            // sanitized + length-checked above
+            'method' => $method,            // enum: manual|bank_transfer|cash|credit_note
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
 
     // Start atomic block
     $wpdb->query('START TRANSACTION');
@@ -2104,12 +2266,17 @@ function dinoco_inv_rest_record_refund(WP_REST_Request $req) {
         sprintf('คืนเงิน ฿%s (%s) — เหตุผล: %s', number_format($amount, 0), $method, $reason)
     );
 
-    return rest_ensure_response([
-        'success'       => true,
-        'refunded_total'=> $new_refunded,
-        'net_paid'      => $net_paid,
-        'new_status'    => get_field('order_status', $id),
-    ]);
+    $resp = array(
+        'success'        => true,
+        'refunded_total' => $new_refunded,
+        'net_paid'       => $net_paid,
+        'new_status'     => get_field('order_status', $id),
+    );
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 // --- VERIFY SLIP ---
@@ -2631,10 +2798,42 @@ function dinoco_inv_rest_upload_slip(WP_REST_Request $req) {
 }
 
 // --- CANCEL ---
+// V.34.11 Round 43: Idempotency-Key support — admin "ยกเลิก" double-click on slow LINE
+// push → 2× cancel Flex card to distributor LINE group + 2× FSM transition (2nd → 400
+// "ยกเลิกแล้ว") + 2× dinoco_inv_reverse_debt → debt double-reverted (rare but BO race
+// possible). Body hash = {id, force, force_reason} — force boolean discriminator + force
+// reason text catches admin re-issuing with different excuse mid-retry. Replay returns
+// cached success on retry; different force_reason mid-retry → 409 prevents accidental
+// override of existing audit log entry.
 function dinoco_inv_rest_cancel(WP_REST_Request $req) {
     $id = intval($req->get_param('id'));
     $force = (bool) $req->get_param('force'); // V.33.3 — allow override after refund recorded
     if (!$id || !_dinoco_inv_check_owner($id)) return new WP_Error('not_found', 'Invoice not found', ['status' => 404]);
+
+    $idem_key       = function_exists('dinoco_idempotency_extract_key') ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::invoice/cancel';
+    $idem_body      = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'id'           => (int) $id,
+            'force'        => $force ? 1 : 0,  // boolean discriminator (force=1 has different audit path)
+            'force_reason' => sanitize_text_field($req->get_param('force_reason') ?? ''),
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data    = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $status = get_field('order_status', $id);
     if ($status === 'cancelled') return new WP_Error('invalid', 'ยกเลิกแล้ว', ['status' => 400]);
     if ($status === 'paid') return new WP_Error('invalid', 'ชำระแล้ว ไม่สามารถยกเลิกได้', ['status' => 400]);
@@ -2708,7 +2907,12 @@ function dinoco_inv_rest_cancel(WP_REST_Request $req) {
         b2b_line_push_raw($line_gid, $cancel_flex);
     }
 
-    return rest_ensure_response(['success' => true, 'status' => 'cancelled']);
+    $resp = array('success' => true, 'status' => 'cancelled');
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return rest_ensure_response($resp);
 }
 
 // --- RESEND LINE FLEX CARD + IMAGE ---
