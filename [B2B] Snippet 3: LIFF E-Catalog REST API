@@ -1,6 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.17 — Round 38 (2026-04-30): 🎯 40% milestone — Idempotency-Key batch 16 —      ║
+ * ║    4 endpoints in this snippet (Snippet 5 adds 1 more = 5 total batch): bo-notify (admin     ║
+ * ║    double-click "ส่ง Flex แจ้งลูกค้า" → 2× LINE Flex push to customer group spam + 2×          ║
+ * ║    update_field bo_available_qty churn; body hash = {ticket_id, items sorted by sku for      ║
+ * ║    deterministic hash}) + rpi-command (admin spam-click "รีบูท RPi"/"รีสตาร์ท service" →       ║
+ * ║    2× cmd_id queue entries + 2× option write churn — cmd_id natural dedup but admin          ║
+ * ║    confusion; body hash = {command, params normalized via ksort}) + rpi-flash-box-packed     ║
+ * ║    (RPi scanner double-trigger / network retry → 2× Flash /notify call when last box        ║
+ * ║    completes manifest = quota burn + 2× admin Flex pickup_added/courier_pickup duplicate;    ║
+ * ║    body hash = {pno} globally unique; 4 success store sites: reused_pickup / called /        ║
+ * ║    pending / partial-status) + flash-ship-packed (timeout dialog double-confirm → 2×         ║
+ * ║    courier /notify + 2× admin LINE notification + 2× hold_pending Flex push to dealer +     ║
+ * ║    2× audit log churn; body hash = {ticket_id}). Coverage 74→78/196 = 39.8% (Snippet 5      ║
+ * ║    adds flash-label = 79/196 = 40.3% TRUE 40% milestone vs Round 30 census).                 ║
  * ║  Version: V.42.16 — Round 37 (2026-04-30): Idempotency-Key batch 15 — 5 endpoints (RPi +     ║
  * ║    customer slip retry-prone POSTs): print-test (constant {type} marker — admin double-click  ║
  * ║    test print double labels) + print-requeue (single {ticket_id} — admin/RPi retry double     ║
@@ -1494,6 +1508,40 @@ function b2b_rest_bo_notify( WP_REST_Request $request ) {
         $partial_total += $ci['unit_price'] * min($ci['available'], $ci['ordered']);
     }
 
+    // V.42.17 Round 38: Idempotency-Key wrapper — prevents admin double-click on
+    // "ส่ง Flex แจ้งลูกค้า" button → 2× LINE Flex push to customer group (spam) +
+    // 2× update_field('bo_available_qty') churn. Body hash = {ticket_id, items normalized}
+    // — items array sorted by sku for deterministic hash. Same intent = wrapper replays
+    // cached success on retry. Different items = 409 (admin changed BO selection).
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::bo-notify';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        // Sort items by sku for deterministic hash regardless of input order
+        $items_sorted = $clean_items;
+        usort($items_sorted, function($a, $b) { return strcmp($a['sku'], $b['sku']); });
+        $idem_body = array(
+            'ticket_id' => $ticket_id,
+            'items'     => $items_sorted,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     update_field('bo_available_qty', wp_json_encode($clean_items), $ticket_id);
 
     // ── ส่ง Flex ถามลูกค้า ──
@@ -1503,11 +1551,17 @@ function b2b_rest_bo_notify( WP_REST_Request $request ) {
         b2b_line_push_raw($group_id, array($flex));
     }
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'success'=>true,
         'message'=>'ส่ง Flex แจ้งลูกค้าแล้ว',
         'partial_total'=>$partial_total,
-    ), 200);
+    );
+
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
     } catch ( Exception $e ) {
         b2b_log('[BONotify] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาดภายใน กรุณาลองใหม่'), 500);
@@ -2843,12 +2897,48 @@ function b2b_rest_rpi_command( WP_REST_Request $request ) {
     if ( !in_array($command, $allowed, true) )
         return new WP_REST_Response(array('success'=>false,'message'=>'Unknown command: '.$command.'. Allowed: '.implode(', ',$allowed)), 400);
 
+    // V.42.17 Round 38: Idempotency-Key wrapper — prevents admin double-click on
+    // RPi command panel ("รีบูท RPi" / "รีสตาร์ท service") → 2× cmd queue entries +
+    // 2× RPi exec (e.g. 2× reboot calls = first wins but extra cmd_id pollutes
+    // history option to 2× option write churn). cmd_id is internally unique (time+rand)
+    // but admin spam-clicking enqueues distinct cmd_ids = same intent. Body hash =
+    // {command, params normalized}. Different command = 409. Replay returns same cmd_id.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::rpi-command';
+    $idem_body = null;
+    $params = $request->get_param('params');
+    if ( !is_array($params) ) $params = array();
+    // Normalize params for deterministic hash (sort by key)
+    ksort($params);
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array(
+            'command' => $command,
+            'params'  => $params,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     $cmd_id = 'cmd_' . time() . '_' . wp_rand(1000, 9999);
     $pending = get_option('b2b_rpi_pending_commands', array());
     $pending[] = array(
         'id'        => $cmd_id,
         'command'   => $command,
-        'params'    => $request->get_param('params') ?: array(),
+        'params'    => $params,
         'queued_at' => time(),
         'queued_by' => wp_get_current_user()->user_login,
     );
@@ -2861,11 +2951,18 @@ function b2b_rest_rpi_command( WP_REST_Request $request ) {
         'get_logs'        => 'ดึง log ล่าสุด',
     );
     b2b_log('[RPi Command] Queued: ' . $command . ' (id: ' . $cmd_id . ')');
-    return new WP_REST_Response(array(
+
+    $resp = array(
         'success' => true,
         'cmd_id'  => $cmd_id,
         'message' => 'ส่งคำสั่ง "' . $labels[$command] . '" แล้ว — RPi จะรับภายใน 10 วินาที',
-    ), 200);
+    );
+
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
 }
 
 /**
@@ -3926,6 +4023,37 @@ function b2b_rest_rpi_flash_box_packed( WP_REST_Request $request ) {
     if ( ! is_array( $pno_statuses ) || ! isset( $pno_statuses[ $pno ] ) )
         return new WP_REST_Response( array( 'success' => false, 'message' => 'PNO not in ticket #' . $ticket_id ), 404 );
 
+    // V.42.17 Round 38: Idempotency-Key wrapper — prevents per-box scan double-fire
+    // (RPi scanner double-trigger / network retry) → 2× courier /notify call when last
+    // box completes manifest = quota burn + 2× admin Flex push (pickup_added/courier_pickup
+    // duplicate). Body hash = {pno} — pno globally unique per Flash dispatch. Same pno
+    // scanned twice = wrapper replays cached success (already-packed safe). Different
+    // pno = different ticket flow = new key required.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::rpi-flash-box-packed';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array(
+            'pno' => $pno,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     // Mark this box as packed
     $now = time();
     if ( is_array( $pno_statuses[ $pno ] ) ) {
@@ -3990,7 +4118,7 @@ function b2b_rest_rpi_flash_box_packed( WP_REST_Request $request ) {
                     b2b_push_raw_to_admin( array( $flex ) );
                 }
 
-                return new WP_REST_Response( array(
+                $resp = array(
                     'success'      => true,
                     'all_packed'   => true,
                     'courier'      => 'reused_pickup',
@@ -3999,7 +4127,11 @@ function b2b_rest_rpi_flash_box_packed( WP_REST_Request $request ) {
                     'item_name'    => $item_name,
                     'packed_count' => $packed_count,
                     'total_active' => $total_active,
-                ), 200 );
+                );
+                if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+                    dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+                }
+                return new WP_REST_Response( $resp, 200 );
             }
 
             // Call new courier
@@ -4026,7 +4158,7 @@ function b2b_rest_rpi_flash_box_packed( WP_REST_Request $request ) {
                     b2b_push_raw_to_admin( array( $flex ) );
                 }
 
-                return new WP_REST_Response( array(
+                $resp = array(
                     'success'      => true,
                     'all_packed'   => true,
                     'courier'      => 'called',
@@ -4036,11 +4168,15 @@ function b2b_rest_rpi_flash_box_packed( WP_REST_Request $request ) {
                     'item_name'    => $item_name,
                     'packed_count' => $packed_count,
                     'total_active' => $total_active,
-                ), 200 );
+                );
+                if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+                    dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+                }
+                return new WP_REST_Response( $resp, 200 );
             }
         }
 
-        return new WP_REST_Response( array(
+        $resp = array(
             'success'      => true,
             'all_packed'   => true,
             'courier'      => 'pending',
@@ -4049,11 +4185,15 @@ function b2b_rest_rpi_flash_box_packed( WP_REST_Request $request ) {
             'item_name'    => $item_name,
             'packed_count' => $packed_count,
             'total_active' => $total_active,
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+            dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+        }
+        return new WP_REST_Response( $resp, 200 );
     }
 
     // Not all packed yet — return partial status
-    return new WP_REST_Response( array(
+    $resp = array(
         'success'      => true,
         'all_packed'   => false,
         'message'      => '✅ กล่อง ' . $box_label . ' ' . $item_name . ' — เหลือ ' . $remaining . ' กล่อง',
@@ -4065,7 +4205,11 @@ function b2b_rest_rpi_flash_box_packed( WP_REST_Request $request ) {
         'pack_started' => $pack_started,
         'pno_statuses' => $pno_statuses,
         'ticket_id'    => $ticket_id,
-    ), 200 );
+    );
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return new WP_REST_Response( $resp, 200 );
 }
 
 // =====================================================================
@@ -4083,6 +4227,36 @@ function b2b_rest_flash_ship_packed( WP_REST_Request $request ) {
     $pno_statuses = get_post_meta( $tid, '_flash_pno_statuses', true );
     if ( ! is_array( $pno_statuses ) )
         return new WP_REST_Response( array( 'success' => false, 'message' => 'No PNO statuses' ), 400 );
+
+    // V.42.17 Round 38: Idempotency-Key wrapper — prevents partial-ship retry double-fire
+    // (timeout dialog double-confirm on warehouse) → 2× courier /notify call (Flash quota
+    // burn) + 2× admin LINE notification + 2× hold_pending Flex push to dealer +
+    // 2× audit log churn. Body hash = {ticket_id} — each ticket has unique partial ship
+    // moment; stale tab retry replays cached success. Different ticket = new flow.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::flash-ship-packed';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array(
+            'ticket_id' => $tid,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
 
     // Count packed vs unpacked
     $packed_pnos = array();
@@ -4164,13 +4338,17 @@ function b2b_rest_flash_ship_packed( WP_REST_Request $request ) {
 
     b2b_add_audit_log( $tid, 'partial_ship', 'ส่ง ' . count($packed_pnos) . ' กล่อง, hold ' . count($hold_pnos) . ' กล่อง' );
 
-    return new WP_REST_Response( array(
+    $resp = array(
         'success'     => true,
         'message'     => 'ส่ง ' . count($packed_pnos) . ' กล่อง — ' . implode(', ', $hold_names) . ' รอส่งรอบถัดไป',
         'packed'      => $packed_pnos,
         'hold'        => $hold_pnos,
         'courier'     => $courier_msg,
-    ), 200 );
+    );
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return new WP_REST_Response( $resp, 200 );
 }
 
 // =====================================================================
