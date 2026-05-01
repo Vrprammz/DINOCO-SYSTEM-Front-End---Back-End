@@ -17,6 +17,7 @@
  * byte-identical to inline output during the parallel rendering window.
  */
 
+/** @type {"th"|"en"|"zh"} */
 let _lang = "th";
 
 /**
@@ -30,9 +31,13 @@ export function setupLanguage(currency) {
         return;
     }
     const c = String(currency).toUpperCase();
-    if (c === "CNY") _lang = "zh";
-    else if (c === "USD") _lang = "en";
-    else _lang = "th";
+    if (c === "CNY") {
+        _lang = "zh";
+    } else if (c === "USD") {
+        _lang = "en";
+    } else {
+        _lang = "th";
+    }
 }
 
 /**
@@ -51,9 +56,9 @@ export function getLang() {
  * @param {"th"|"en"|"zh"} lang
  */
 export function setLang(lang) {
-    if (lang === "th" || lang === "en" || lang === "zh") {
-        _lang = lang;
-    }
+    if (lang === "th") _lang = "th";
+    else if (lang === "en") _lang = "en";
+    else if (lang === "zh") _lang = "zh";
 }
 
 /**

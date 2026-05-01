@@ -77,10 +77,14 @@ export function buildTimelineBars(po) {
         createdDate.setHours(0, 0, 0, 0);
         const totalDays = Math.max(
             1,
-            Math.round((etaDate - createdDate) / 86400000)
+            Math.round((etaDate.getTime() - createdDate.getTime()) / 86400000)
         );
-        const elapsed = Math.round((today - createdDate) / 86400000);
-        const remaining = Math.round((etaDate - today) / 86400000);
+        const elapsed = Math.round(
+            (today.getTime() - createdDate.getTime()) / 86400000
+        );
+        const remaining = Math.round(
+            (etaDate.getTime() - today.getTime()) / 86400000
+        );
         const pct = Math.min(100, Math.max(0, Math.round((elapsed / totalDays) * 100)));
         const overdue = remaining < 0;
         const color = overdue
@@ -138,9 +142,16 @@ export function buildTimelineBars(po) {
             ? new Date(dueDate)
             : new Date(rcvDate.getTime() + creditDays * 86400000);
         payDue.setHours(0, 0, 0, 0);
-        const creditTotal = Math.max(1, Math.round((payDue - rcvDate) / 86400000));
-        const creditElapsed = Math.round((today - rcvDate) / 86400000);
-        const creditRemaining = Math.round((payDue - today) / 86400000);
+        const creditTotal = Math.max(
+            1,
+            Math.round((payDue.getTime() - rcvDate.getTime()) / 86400000)
+        );
+        const creditElapsed = Math.round(
+            (today.getTime() - rcvDate.getTime()) / 86400000
+        );
+        const creditRemaining = Math.round(
+            (payDue.getTime() - today.getTime()) / 86400000
+        );
         const creditPct = Math.min(
             100,
             Math.max(0, Math.round((creditElapsed / creditTotal) * 100))

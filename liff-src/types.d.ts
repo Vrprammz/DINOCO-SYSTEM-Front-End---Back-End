@@ -79,7 +79,13 @@ interface Window {
     DINOCO_B2B_CATALOG_CONFIG?: DinocoLiffConfig;
     DINOCO_B2F_CATALOG_CONFIG?: DinocoLiffConfig;
     DINOCO_B2F_MAKER_CONFIG?: DinocoLiffConfig;
+    DINOCO_B2F_MAKER?: any; // inline-bridge surface for Round 2-4 cleanup
     DINOCO_LIFF_AI_CONFIG?: DinocoLiffConfig;
+    /** B2F Maker LIFF id — injected by Snippet 4 PHP shortcode. */
+    B2F_LIFF_ID?: string;
+    /** Legacy inline router fallback — Round 2 will replace with module
+     *  callback. Snippet 4 inline JS still defines window.goToPage. */
+    goToPage?: (page: string) => void;
 }
 
 /**
