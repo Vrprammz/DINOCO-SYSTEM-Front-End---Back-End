@@ -2,6 +2,24 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.45.10 (2026-04-30) — Round 45 batch 23: Idempotency-Key support on 2 inventory POSTs
+ *   (push toward 60% milestone — 109/196 → 114/196 = 58.2%):
+ *   - POST /dinoco-stock/v1/product/shipping/bulk — UPGRADED ad-hoc transient idempotency
+ *     (V.45.9 used legacy `set_transient` keyed on raw header) → migrated to **central
+ *     helper** with binary-fingerprint body hash (Round 42 upload-image precedent).
+ *     Body hash = {csv_sha1, csv_size, line_count} — same CSV retry = idempotent replay
+ *     (admin sees "already imported"); different rows mid-retry → 409 (intent change
+ *     surfaces accidental admin override). Legacy `set_transient` shadow-write kept for
+ *     DAY_IN_SECONDS to cover V.45.9 in-flight clients during upgrade window.
+ *   - POST /dinoco-stock/v1/shipping-compute — M6 "Test Payload" dry-run resolver. Pure
+ *     compute path BUT 500-item `dinoco_resolve_manifest_shipping()` is expensive
+ *     (recursion + catalog lookups + box-template joins). Admin double-click on slow
+ *     tab switch → 2× resolver pass = CPU waste. **bulk-shape** body hash = items[]
+ *     sorted by SKU UPPER + qty per row (deterministic via usort by sku). Same items +
+ *     same qtys = idempotent replay (instant). Different SKU set mid-retry → 409.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.45.9.
+ *   • **27-round sustained Idempotency campaign Rounds 18-45**.
  * Version: V.45.9 (2026-04-30) — Round 42 batch 20: 🎯🎯🎯 50% MAJOR MILESTONE — Idempotency-Key
  *   support on POST /dinoco-stock/v1/product/upload-image (1 endpoint in this snippet — 5 total
  *   batch with Snippet 3 + LIFF AI). Pushes coverage 94/196 → 99/196 = 50.5% — past the major
@@ -4461,12 +4479,19 @@ add_action('rest_api_init', function() {
                 if ( is_wp_error( $rl_ip ) ) return $rl_ip;
             }
 
-            // Idempotency
-            $idem_key = $req->get_header( 'X-Idempotency-Key' );
-            if ( $idem_key ) {
-                $cached = get_transient( 'shipping_bulk_idem_' . md5( $idem_key ) );
-                if ( $cached !== false ) return rest_ensure_response( $cached );
-            }
+            // ── V.45.10 Round 45: Central Idempotency Helper migration ──
+            // Bulk CSV import: admin "อัพโหลด CSV" double-click on slow update_csv path
+            // (500 rows × validate + UPDATE + flush_memo) → 2× UPDATE per row + 2× cache
+            // flush + 2× audit churn. Body hash CANNOT include raw CSV (100KB max would
+            // explode idempotency_keys row). Use binary-fingerprint pattern (Round 42
+            // upload-image precedent): {csv_sha1, csv_size, line_count} — same CSV =
+            // idempotent replay; admin uploads different rows mid-retry → 409 (intent
+            // change). Legacy ad-hoc transient kept for backward compat (DAY_IN_SECONDS
+            // shadow window covers V.45.9 in-flight clients) but central helper PREFERRED.
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-stock/v1::product/shipping/bulk';
+            $idem_body = null;
 
             $csv = $req->get_param( 'csv' );
             if ( ! $csv || ! is_string( $csv ) ) return new WP_Error( 'bad_input', 'csv string required', array( 'status' => 400 ) );
@@ -4474,6 +4499,38 @@ add_action('rest_api_init', function() {
 
             $lines = preg_split( '/\r\n|\n|\r/', trim( $csv ) );
             if ( count( $lines ) > 501 ) return new WP_Error( 'too_many', 'CSV > 500 rows', array( 'status' => 413 ) );
+
+            // Compute fingerprint AFTER size guards — avoid hashing rejected payloads.
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'csv_sha1'   => sha1( $csv ),
+                    'csv_size'   => strlen( $csv ),
+                    'line_count' => count( $lines ),
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ CSV เก่าที่มีข้อมูลต่างกัน — เปลี่ยน X-Idempotency-Key ใหม่',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp = $cached;
+                    unset( $resp['_idem_code'] );
+                    return rest_ensure_response( $resp );
+                }
+            }
+
+            // Legacy ad-hoc transient (back-compat for V.45.9 in-flight clients during
+            // DAY_IN_SECONDS shadow window). Once central helper observed stable, remove.
+            $legacy_key = $req->get_header( 'X-Idempotency-Key' );
+            if ( $legacy_key && ! is_array( $idem_body ) ) {
+                $cached_legacy = get_transient( 'shipping_bulk_idem_' . md5( $legacy_key ) );
+                if ( $cached_legacy !== false ) return rest_ensure_response( $cached_legacy );
+            }
 
             // Parse header
             $header = str_getcsv( array_shift( $lines ) );
@@ -4520,8 +4577,17 @@ add_action('rest_api_init', function() {
             }
 
             $result = array( 'ok' => true, 'processed' => $ok_count, 'errors' => $errors );
-            if ( $idem_key ) {
-                set_transient( 'shipping_bulk_idem_' . md5( $idem_key ), $result, DAY_IN_SECONDS );
+
+            // Central helper store (Round 45)
+            if ( $idem_key !== '' && is_array( $idem_body ) && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $result, array( '_idem_code' => 200 ) ), 200
+                );
+            }
+            // Legacy ad-hoc store (back-compat)
+            if ( $legacy_key ) {
+                set_transient( 'shipping_bulk_idem_' . md5( $legacy_key ), $result, DAY_IN_SECONDS );
             }
             return rest_ensure_response( $result );
         },
@@ -4718,14 +4784,60 @@ add_action('rest_api_init', function() {
                     'total_qty' => absint( $it['qty'] ?? 1 ),
                 );
             }
+
+            // ── V.45.10 Round 45: Idempotency-Key support ──
+            // Dry-run resolver: M6 "Test Payload" admin tool. Pure compute (no DB writes)
+            // BUT 500-item dinoco_resolve_manifest_shipping() = expensive recursion +
+            // catalog lookups + box-template joins. Admin double-click on slow tab switch
+            // → 2× resolver pass = CPU waste. **bulk-shape body hash** = items[] sorted
+            // by sku UPPER + qty per row (deterministic ksort + BINARY collation
+            // canonicalization). Same items + same qtys retry → cached replay (instant).
+            // Different items[] mid-retry → 409 (admin selected different SKUs in form).
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-stock/v1::shipping-compute';
+            $idem_body = null;
+
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $sorted_items = $manifest;
+                usort( $sorted_items, function( $a, $b ) {
+                    return strcmp( (string) ( $a['sku'] ?? '' ), (string) ( $b['sku'] ?? '' ) );
+                } );
+                $idem_body = array( 'items' => $sorted_items );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ items เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp = $cached;
+                    unset( $resp['_idem_code'] );
+                    return rest_ensure_response( $resp );
+                }
+            }
+
             $per_pno = dinoco_resolve_manifest_shipping( $manifest );
-            return rest_ensure_response( array(
+            $resp = array(
                 'ok' => true,
                 'manifest' => $manifest,
                 'per_pno'  => $per_pno,
                 'total_weight_g' => array_sum( array_column( $per_pno, 'weight_g' ) ),
                 'pno_count' => count( $per_pno ),
-            ) );
+            );
+
+            if ( $idem_key !== '' && is_array( $idem_body ) && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ] );

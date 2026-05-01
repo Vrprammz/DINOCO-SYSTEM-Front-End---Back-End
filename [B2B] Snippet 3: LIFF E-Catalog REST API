@@ -1,6 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.19 — Round 45 (2026-04-30): Idempotency-Key batch 23 — 3 RPi heartbeat /     ║
+ * ║    ack POST endpoints in this snippet (Inventory adds 2 = 5 total batch). Push toward       ║
+ * ║    60% milestone — coverage 109/196 → 114/196 = 58.2% (Round 30 census denominator).        ║
+ * ║    27-round sustained Idempotency campaign Rounds 18-45.                                     ║
+ * ║    - print-ack: RPi network retry / double-ack race → 2× update_field(print_status) +       ║
+ * ║      2× admin LINE Flex spam on error/partial (printer error during peak ops = 50+ dup       ║
+ * ║      notifications drown chat). Body hash = {ticket_id, status} — same outcome retry =       ║
+ * ║      replay; different status mid-retry (RPi state confusion done→partial) → 409.            ║
+ * ║      msg/details/printed_at EXCLUDED (diagnostic drift).                                     ║
+ * ║    - print-heartbeat: RPi 30s heartbeat double-fire (network glitch/systemd timer race) →    ║
+ * ║      2× update_option idempotent at storage BUT 2× admin Flex if printer status changed      ║
+ * ║      (idle→disabled during peak hours). Body hash = {hostname} — RPi auto-generates new       ║
+ * ║      key per heartbeat tick → distinct keys per legitimate beat; same key = retry of         ║
+ * ║      same tick. Excludes timestamp/cpu_temp/uptime/printers (drift naturally).               ║
+ * ║    - rpi-command-ack: cmd_id naturally unique BUT array_filter+array_unshift after           ║
+ * ║      pending drained → cmd_info null → history row labelled 'unknown' (audit                 ║
+ * ║      corruption) + 2× admin Flex on error. Body hash = {cmd_id, status} — same as            ║
+ * ║      print-ack discriminator pattern.                                                        ║
  * ║  Version: V.42.18 — Round 42 (2026-04-30): 🎯🎯🎯 50% MAJOR MILESTONE — Idempotency-Key       ║
  * ║    batch 20 — 3 endpoints in this snippet (Inventory adds 1 + LIFF AI adds 1 = 5 total       ║
  * ║    batch): invoice-gen (customer/admin LIFF "ดูใบแจ้งหนี้" double-click on slow GD render →   ║
@@ -2723,6 +2741,42 @@ function b2b_rest_print_ack( WP_REST_Request $request ) {
     if ( get_post_type($tid) !== 'b2b_order' )
         return new WP_REST_Response(array('success'=>false,'message'=>'Ticket not found'), 404);
 
+    // ── V.42.19 Round 45: Idempotency-Key support ──
+    // RPi network retry / double-ack race: print client sends result twice on flaky
+    // wifi → 2× update_field(print_status) + 2× LINE admin Flex spam on error/partial
+    // (b2b_push_to_admin uses LINE quota; printer error during peak hours = 50+ duplicate
+    // notifications drown ops chat) + 2× flash_packing_status state churn (print_queued
+    // → print_done idempotent BUT log entry duplicated). **Body hash** = {ticket_id,
+    // status} — same ticket + same outcome retry = idempotent replay (matches RPi
+    // intent: "tell server about THIS print job"). Different status mid-retry (e.g.
+    // RPi reports done then partial after retry from misread output) → 409 (catches
+    // RPi state confusion). msg/details/printed_at EXCLUDED from hash — those are
+    // diagnostic fields that may differ between retries (timestamp drift) without
+    // changing semantic intent.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::print-ack';
+    $idem_body = null;
+
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array( 'ticket_id' => $tid, 'status' => $status );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array($err_data) && isset($err_data['status']) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ ticket/status เก่าที่ต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return new WP_REST_Response($resp, 200);
+        }
+    }
+
     update_field('print_status', $status, $tid);
     if ( in_array($status, array('error','partial'), true) && $msg ) update_field('print_error', $msg, $tid);
     if ( $printed_at ) update_field('print_timestamp', $printed_at, $tid);
@@ -2779,7 +2833,15 @@ function b2b_rest_print_ack( WP_REST_Request $request ) {
     }
 
     b2b_log('[Print] Ack #' . $tid . ' — ' . $status . ($msg ? ': '.$msg : ''));
-    return new WP_REST_Response(array('success'=>true,'message'=>'Status updated'), 200);
+    $resp = array('success'=>true,'message'=>'Status updated');
+    // V.42.19 Round 45 — store success response for replay
+    if ( $idem_key !== '' && is_array($idem_body) && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store(
+            $idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200
+        );
+    }
+    return new WP_REST_Response($resp, 200);
     } catch ( Exception $e ) {
         b2b_log('[PrintAck] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาดภายใน กรุณาลองใหม่'), 500);
@@ -2803,6 +2865,41 @@ function b2b_rest_print_heartbeat( WP_REST_Request $request ) {
         'printers'   => array(),
         'timestamp'  => time(),
     );
+
+    // ── V.42.19 Round 45: Idempotency-Key support ──
+    // RPi 30s heartbeat double-fire (network glitch / systemd timer race) → 2×
+    // update_option(b2b_print_device_info) is idempotent at storage BUT printer-
+    // status-change detection (idle→disabled) fires b2b_push_to_admin Flex once per
+    // heartbeat → admin gets DUPLICATE "🖨️ Printer สถานะเปลี่ยน" alerts during peak
+    // ops hours. **Body hash** = {hostname} only — heartbeat from same RPi within
+    // replay window = same event (different printer status would normally come from
+    // NEXT 30s heartbeat with new key). Excludes timestamp / cpu_temp / uptime /
+    // printers (those drift naturally per heartbeat without semantic intent change).
+    // RPi auto-generates X-Idempotency-Key per heartbeat tick → distinct keys per
+    // legitimate heartbeat; same key = retry of same tick = replay safe.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::print-heartbeat';
+    $idem_body = null;
+
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array( 'hostname' => $device['hostname'] );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array($err_data) && isset($err_data['status']) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ heartbeat จาก hostname อื่น',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return new WP_REST_Response($resp, 200);
+        }
+    }
 
     $printers = $request->get_param('printers');
     if ( is_array($printers) ) {
@@ -2835,7 +2932,15 @@ function b2b_rest_print_heartbeat( WP_REST_Request $request ) {
     }
 
     update_option('b2b_print_device_info', $device, false);
-    return new WP_REST_Response(array('success'=>true), 200);
+    $resp = array('success'=>true);
+    // V.42.19 Round 45 — store success response for replay
+    if ( $idem_key !== '' && is_array($idem_body) && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store(
+            $idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200
+        );
+    }
+    return new WP_REST_Response($resp, 200);
 }
 
 /**
@@ -3080,6 +3185,41 @@ function b2b_rest_rpi_command_ack( WP_REST_Request $request ) {
     if ( !$cmd_id || !in_array($status, array('done','error'), true) )
         return new WP_REST_Response(array('success'=>false,'message'=>'Invalid params'), 400);
 
+    // ── V.42.19 Round 45: Idempotency-Key support ──
+    // RPi command ack double-fire (network retry / systemd race after /rpi-command
+    // result): cmd_id is naturally unique BUT array_filter+array_unshift on
+    // b2b_rpi_pending_commands + b2b_rpi_command_history is non-idempotent — second
+    // call after pending already drained → cmd_info null → history row labelled
+    // 'unknown' (audit log corruption) + 2× admin LINE Flex on error (b2b_push_to_admin
+    // duplicates "❌ RPi command failed" alert). **Body hash** = {cmd_id, status} —
+    // cmd_id is RPi-side UUID (globally unique per command); same status retry =
+    // idempotent replay (RPi confirming same outcome). Different status mid-retry
+    // (RPi reports done then error after misread) → 409 (catches RPi confusion). Same
+    // pattern as print-ack.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::rpi-command-ack';
+    $idem_body = null;
+
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array( 'cmd_id' => $cmd_id, 'status' => $status );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array($err_data) && isset($err_data['status']) ) ? (int) $err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ cmd_id/status เก่าที่ต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return new WP_REST_Response($resp, 200);
+        }
+    }
+
     // Remove from pending
     $pending = get_option('b2b_rpi_pending_commands', array());
     $cmd_info = null;
@@ -3111,7 +3251,15 @@ function b2b_rest_rpi_command_ack( WP_REST_Request $request ) {
         b2b_push_to_admin("{$emoji} RPi command failed: {$cmd_label}\n{$output}");
     }
 
-    return new WP_REST_Response(array('success'=>true), 200);
+    $resp = array('success'=>true);
+    // V.42.19 Round 45 — store success response for replay
+    if ( $idem_key !== '' && is_array($idem_body) && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store(
+            $idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200
+        );
+    }
+    return new WP_REST_Response($resp, 200);
 }
 
 // ═══════════════════════════════════════════════════════════════
