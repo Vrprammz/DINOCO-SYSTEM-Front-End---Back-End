@@ -17,11 +17,11 @@
 
 | Metric | Count |
 |--------|-------|
-| Total integrated endpoints | **69** (+5 new — Round 36 batch 14: bo-reject, flash-cancel, flash-cancel-notify, flash-switch-manual, stock/hold — pivot from MCP saturated cluster to B2B admin Flash + BO + inventory long tail per Round 35 recommendation) |
+| Total integrated endpoints | **74** (+5 new — Round 37 batch 15: print-test, print-requeue, rpi-accept-order, rpi-flash-ready, slip-upload — Snippet 3 RPi + customer LIFF retry-prone hot paths per Round 36 high-priority candidates) |
 | **Total POST endpoints (Round 33 fresh census)** | **196** (+3 since Round 30 — natural growth, see [REST-ENDPOINT-CENSUS-2026-04-30.md](./REST-ENDPOINT-CENSUS-2026-04-30.md)) |
-| Coverage | **69 / 196 = 35.2%** of POST endpoints — **🎯 35% milestone achieved (Round 36)**. B2B namespace coverage = **27/56 ≈ 48%** (highest absolute count). MCP cluster coverage = **13/17 = ~76%** (saturated, no further candidates). |
-| Cumulative test cases | 273 (Round 19-36 — Round 36 added 19) |
-| Body-shape distinct hashes asserted | 68 (Round 36: +5 new — all unique; 3 cross-namespace pair guards — flash-cancel vs flash-cancel-notify body shape match guard + bo-reject vs flash-switch-manual + stock-hold vs flash-cancel) |
+| Coverage | **74 / 196 = 37.8%** of POST endpoints — Round 37 closes 5 of 5 Round 36 high-priority candidates. B2B namespace coverage = **32/56 ≈ 57%** (highest absolute count, +5 since Round 36). Snippet 3 coverage = **14/26 ≈ 54%** of POST routes (+5 since Round 36 = 9/26 ≈ 35%). MCP cluster coverage = **13/17 = ~76%** (saturated, no further candidates). |
+| Cumulative test cases | 293 (Round 19-37 — Round 37 added 20) |
+| Body-shape distinct hashes asserted | 73 (Round 37: +5 new — all unique; 3 cross-namespace pair guards — print-requeue vs rpi-accept-order SHAPE-MATCH guard (proves namespace is sole discriminator for {ticket_id}-only endpoints) + print-test vs print-requeue + slip-upload vs print-requeue) |
 
 > **Round 30 note**: Earlier rounds reported coverage against a conservative
 > "~75 POST endpoints" estimate. The Round 30 REST endpoint census
@@ -67,7 +67,8 @@
 | 🎯 **30.1% (Round 34 — TRUE 30% milestone)** ⭐ | **34** | **2026-04-30** | +5 endpoints (59/196). Batch 12: bo-clear-enum-flag (B2B admin flag reset) + kb-suggest + brand-voice-submit (MCP chatbot signals) + distributor/delete + distributor/toggle-bot (B2B admin distributor management). 19 B2F + 24 B2B + 8 inventory + 7 MCP. **First sustained 30% milestone against authoritative Round 30 census denominator** — past 3/10 of POST surface. 5 distinct patterns observed across Rounds 18-34 (single / bulk / bulk-of-targets / state-machine / boolean-discriminator + enum-discriminator) — see [`docs/patterns/IDEMPOTENCY-KEY.md`](../patterns/IDEMPOTENCY-KEY.md) "Round 18-34 case study patterns". |
 | **32.7% (Round 35 — MCP cluster ~76%)** | **35** | **2026-04-30** | +5 endpoints (64/196). Batch 13 — all `/dinoco-mcp/v1/*` retry-prone OpenClaw signals: dashboard-inject-metrics (FB/IG metrics — inflated KPI guard) + lead-attribution (revenue double-count guard, event enum discriminator) + inventory-changed (stock webhook, action enum) + kb-updated (Qdrant rebuild webhook, trigger_source discriminator) + product-compatibility (catalog query — chatbot retry compute saver, brand+model normalized). 19 B2F + 24 B2B + 8 inventory + **12 MCP** (13/17 POST = 76% MCP namespace coverage). Pattern: 4× "compute-only/log-only" cache + 1× analytics signature hash. |
 | 🎯 **35.2% (Round 36 — TRUE 35% milestone)** ⭐ | **36** | **2026-04-30** | +5 endpoints (69/196). Batch 14 — pivot from saturated MCP cluster to B2B admin Flash + BO + inventory long tail per Round 35 recommendation: bo-reject (admin pending_stock_review reject — customer Flex spam guard + counter decrement integrity) + flash-cancel (Flash per-PNO API charge guard + 1015 dedup) + flash-cancel-notify (pickup cancel — shares shape with flash-cancel via namespace discriminator) + flash-switch-manual (RPi duplicate manual label print guard + admin Flex spam dedup) + stock/hold (boolean-discriminator: hold/release flip caught by hash). 19 B2F + **27 B2B** + **9 inventory** + 13 MCP. **First 35% milestone past 7/20 of POST surface. B2B namespace passes ~48% (highest absolute count).** Pattern: 1× state-machine-enum (FSM cancellation) + 4× single (3 ticket-scoped flash + 1 boolean-discriminator inventory). |
-| Target: 40% | future | TBD | Need +9 more endpoints (~78/196). Realistic timeline: Rounds 37-38. |
+| **37.8% (Round 37 — Snippet 3 RPi + customer LIFF cluster)** | **37** | **2026-04-30** | +5 endpoints (74/196). Batch 15 — closes ALL 5 Round 36 high-priority candidates in `[B2B] Snippet 3`: print-test (constant-marker `{type}` — admin double-click test print) + print-requeue (single `{ticket_id}` — admin/RPi reprint shipping label) + rpi-accept-order (single `{ticket_id}` — RPi kiosk FSM 400 surface fix) + rpi-flash-ready (single `{ticket_id}` — RPi scan-to-call-courier Flash /notify quota burn; 4 success store sites: already-courier / active-pickup-reuse / new-pickup-success / queued-retry) + slip-upload (CRITICAL — Slip2Go double-charge guard: `{ticket_id, gid}` bulk-shape with `image_base64` EXCLUDED following combined-slip-upload Round 29 pattern; gid from session prevents cross-group cache poisoning). 19 B2F + **32 B2B** + 9 inventory + 13 MCP + 1 LIFF AI. **Snippet 3 coverage 35% → 54% (9/26 → 14/26 POST routes).** Pattern: 1× constant-marker (no body content) + 3× single (ticket_id) + 1× bulk-shape (ticket_id+gid). |
+| 🎯 Target: 40% | future | TBD | Need +5 more endpoints (~79/196). Realistic timeline: Round 38 (batch 16). |
 | Target: 50% | future | TBD | ~98 endpoints — major sustained effort across 10+ rounds. Realistic timeline: Round 50+ |
 
 > **Why no 50% milestone in Round 30**: User-facing milestone celebration in the
@@ -79,7 +80,7 @@
 
 ---
 
-## Integrated endpoints (64)
+## Integrated endpoints (74)
 
 | # | Endpoint | Snippet | Pattern | Round | Status |
 |---|----------|---------|---------|-------|--------|
@@ -153,13 +154,21 @@
 | 68 | `POST /b2b/v1/flash-cancel-notify` | `[B2B] Snippet 5` V.33.8 | single (ticket_id — shares shape with flash-cancel; namespace-discriminated) | **36** ⭐ | **integrated** |
 | 69 | `POST /b2b/v1/flash-switch-manual` | `[B2B] Snippet 5` V.33.8 | single (ticket_id — RPi duplicate manual label print guard + admin Flex spam dedup) | **36** ⭐ | **integrated** |
 | 70 | `POST /dinoco-stock/v1/stock/hold` | `[Admin System] DINOCO Global Inventory Database` V.45.6 | **boolean-discriminator** (sku UPPER + hold flip caught by hash; release-after-hold = 409) | **36** ⭐ | **integrated** |
+| 71 | `POST /b2b/v1/print-test` | `[B2B] Snippet 3` V.42.16 | **constant-marker** ({type} — type discriminates label/invoice/picking format) | **37** | **integrated** |
+| 72 | `POST /b2b/v1/print-requeue/{ticket_id}` | `[B2B] Snippet 3` V.42.16 | single ({ticket_id} — admin/RPi reprint guard; shares shape with rpi-accept-order + rpi-flash-ready, namespace-discriminated) | **37** | **integrated** |
+| 73 | `POST /b2b/v1/rpi-accept-order` | `[B2B] Snippet 3` V.42.16 | single ({ticket_id} — RPi kiosk FSM transition; replay turns 400 surface into cached 200) | **37** | **integrated** |
+| 74 | `POST /b2b/v1/rpi-flash-ready` | `[B2B] Snippet 3` V.42.16 | single ({ticket_id} — Flash /notify quota guard; 4 success store sites: already-courier / active-pickup-reuse / new-pickup-success / queued-retry) | **37** | **integrated** |
+| 75 | `POST /b2b/v1/slip-upload` | `[B2B] Snippet 3` V.42.16 | **bulk-shape** ({ticket_id, gid} — image_base64 EXCLUDED 5MB binary hash flap; gid from session prevents cross-group cache poisoning; CRITICAL Slip2Go double-charge guard) | **37** | **integrated** |
 
-> Note: numbering goes to 70 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
+> Note: numbering goes to 75 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
 > delete-ticket (32) + recalculate-total (33) share body shape +
-> flash-cancel (67) + flash-cancel-notify (68) share body shape — all namespace-discriminated. Total
-> integrated endpoint count = 69 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
-> for bo-fulfill which had no actual wrapper despite tracker entry + Round 31: +5 + Round 32: +5
-> + Round 33: +5 + Round 34: +5 + Round 35: +5 + Round 36: +5).
+> flash-cancel (67) + flash-cancel-notify (68) share body shape +
+> print-requeue (72) + rpi-accept-order (73) + rpi-flash-ready (74) all share {ticket_id}-only
+> body shape (3-way intentional collision via namespace discriminator) — all namespace-
+> discriminated. Total integrated endpoint count = 74 (Round 28: 28 + Round 29: +5 + Round 30:
+> +6 — incl. F1 drift fix for bo-fulfill which had no actual wrapper despite tracker entry +
+> Round 31: +5 + Round 32: +5 + Round 33: +5 + Round 34: +5 + Round 35: +5 + Round 36: +5 +
+> Round 37: +5).
 >
 > **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1) — RESOLVED in Round 30**: `bo-fulfill`
 > (#14, Round 19) was listed as "integrated" but actual code had NO wrapper. **Round 30 fixed**:
@@ -196,37 +205,34 @@
 > Tracker pivoted to verified-existing routes (bo-reject, flash-cancel, flash-cancel-notify,
 > flash-switch-manual, stock/hold) for batch 14.
 
-### High priority (next 5 picks — Round 37 candidates to push toward 40% milestone)
+### High priority (next 5 picks — Round 38 candidates to push toward 🎯 40% milestone — 79/196)
 
-> **B2B/B2F long tail** is the next focus area — Round 36 closed retry-prone Flash + BO admin
-> flows. Round 37+ should target B2F LIFF maker endpoints (e.g. po-history requests, dashboard
-> stat refresh) and inventory bulk operations (warehouse stock scans, dip-stock recount).
+> **B2B Snippet 3 long-tail closure**: After Round 37, Snippet 3 stands at 14/26 POST routes
+> (~54%). Round 38 should target the remaining **medium-priority Snippet 3 retry-prone endpoints**
+> (rpi-flash-box-packed, flash-ship-packed, bo-notify, rpi-command, auth-group) PLUS Snippet 5/9
+> Flash admin tools (daily-summary, flash-label, flash-ready-to-ship). Reaching 79/196 = 40.3%
+> milestone closes the first 4/10 of POST surface.
 
 | Endpoint | Snippet | Risk if double-fired | Round candidate |
 |----------|---------|----------------------|-----------------|
-| `POST /b2b/v1/print-test` | `[B2B] Snippet 3` | RPi print test — duplicate test labels printed | Round 37 |
-| `POST /b2b/v1/print-requeue/{ticket_id}` | `[B2B] Snippet 3` | Re-enqueue print — double print of same label | Round 37 |
-| `POST /b2b/v1/rpi-accept-order` | `[B2B] Snippet 3` | RPi acceptance — double FSM transition attempt | Round 37 |
-| `POST /b2b/v1/rpi-flash-ready` | `[B2B] Snippet 3` | Flash ready signal — double notify admin Flex | Round 37 |
-| `POST /b2b/v1/slip-upload` | `[B2B] Snippet 3` | Customer slip upload — duplicate slip verify call (Slip2Go API charge) | Round 37 |
+| `POST /b2b/v1/rpi-flash-box-packed` | `[B2B] Snippet 3` | Per-box pack scan — double Flash ready transition + double "all_packed" courier auto-call | Round 38 |
+| `POST /b2b/v1/flash-ship-packed` | `[B2B] Snippet 3` | Partial-ship after timeout — double Flash courier call (per-pickup quota burn) + double admin Flex | Round 38 |
+| `POST /b2b/v1/bo-notify` | `[B2B] Snippet 3` | BO ready notification — already covered upstream via bo-fulfill, but standalone retry possible | Round 38 |
+| `POST /b2b/v1/rpi-command` | `[B2B] Snippet 3` | RPi remote command — cmd_id natural dedup but admin spam guard | Round 38 |
+| `POST /b2b/v1/flash-label` | `[B2B] Snippet 5` | Flash label PDF download — wasted I/O on retry | Round 38 |
 
-### Medium priority (Round 37+)
+### Medium priority (Round 38+)
 
 | Endpoint | Snippet | Notes |
 |----------|---------|-------|
 | `POST /b2b/v1/auth-group` | `[B2B] Snippet 3` | LIFF auth init — natural session token TTL but log spam |
-| `POST /b2b/v1/bo-notify` | `[B2B] Snippet 3` | BO ready notification — already covered upstream by bo-fulfill but standalone retry possible |
-| `POST /b2b/v1/rpi-command` | `[B2B] Snippet 3` | RPi remote command — command_id natural dedup but admin spam guard |
-| `POST /b2b/v1/rpi-flash-box-packed` | `[B2B] Snippet 3` | RPi packing event — double Flash ready transition |
-| `POST /b2b/v1/flash-ship-packed` | `[B2B] Snippet 3` | Flash packing → ship transition |
-| `POST /b2b/v1/manual-flash-status` | `[B2B] Snippet 3` | Manual Flash status check — read-only? Verify in Round 37 |
+| `POST /b2b/v1/manual-flash-status` | `[B2B] Snippet 3` | Manual Flash status check — read-only? Verify in Round 38 |
 | `POST /b2b/v1/test-push` | `[B2B] Snippet 9` | Admin test push — natural rate limit |
 | `POST /b2b/v1/flash-webhook-setup` | `[B2B] Snippet 9` | Flash webhook init — admin one-time setup |
 | `POST /b2b/v1/flash-api-test` | `[B2B] Snippet 9` | Flash API connectivity probe |
 | `POST /b2b/v1/flash-test/run-step` | `[B2B] Snippet 9` | Flash test step runner |
 | `POST /b2b/v1/flash-test/simulate-webhook` | `[B2B] Snippet 9` | Webhook simulator |
 | `POST /b2b/v1/daily-summary` | `[B2B] Snippet 5` | Trigger daily summary cron — log spam guard |
-| `POST /b2b/v1/flash-label` | `[B2B] Snippet 5` | Flash label PDF download — wasted I/O on retry |
 | `POST /b2b/v1/flash-ready-to-ship` | `[B2B] Snippet 5` | Flash ready signal — double customer notify |
 
 ### Low priority (don't need wrapper)
@@ -321,10 +327,11 @@ Each integrated endpoint has 3-9 contract tests in
 | 🎯 **34** ⭐ | **5** | **18** | **58** (Round 34: +5 new — all unique; 2 cross-namespace pair guards added — distributor-delete vs distributor-toggle-bot + kb-suggest vs brand-voice-submit) |
 | **35** | **5** | **18** | **63** (Round 35: +5 new — all unique; 2 cross-namespace pair guards added — dashboard-inject-metrics vs lead-attribution + inventory-changed vs kb-updated; MCP cluster ~76%) |
 | 🎯 **36** ⭐ | **5** | **19** | **68** (Round 36: +5 new — all unique; 3 cross-namespace pair guards — flash-cancel vs flash-cancel-notify SHAPE-MATCH guard (proves namespace is sole discriminator) + bo-reject vs flash-switch-manual + stock-hold vs flash-cancel; **🎯 35% milestone**) |
+| **37** | **5** | **20** | **73** (Round 37: +5 new — all unique; 3 cross-namespace pair guards — print-requeue vs rpi-accept-order SHAPE-MATCH guard (proves namespace is sole discriminator for {ticket_id}-only endpoints — pattern reused from Round 36 flash-cancel pair) + print-test vs print-requeue + slip-upload vs print-requeue; **37.8% — Snippet 3 RPi + customer LIFF cluster**) |
 
-Total: **273 contract tests** across 14 rounds (Rounds 19-36). Round 29 introduced
+Total: **293 contract tests** across 15 rounds (Rounds 19-37). Round 29 introduced
 `IdempotencyTestFixture` base class — Round 30+ fully adopt it
-(`IdempotencyRound36Test.php` averages ~5 LOC/test).
+(`IdempotencyRound37Test.php` averages ~5 LOC/test).
 
 ### Fixture refactor (Round 29) {#fixture-refactor}
 
