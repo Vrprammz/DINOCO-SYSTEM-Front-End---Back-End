@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.16 — Round 37 (2026-04-30): Idempotency-Key batch 15 — 5 endpoints (RPi +     ║
+ * ║    customer slip retry-prone POSTs): print-test (constant {type} marker — admin double-click  ║
+ * ║    test print double labels) + print-requeue (single {ticket_id} — admin/RPi retry double     ║
+ * ║    print of same shipping label) + rpi-accept-order (single {ticket_id} — kiosk double-tap    ║
+ * ║    FSM 400 surface confusion) + rpi-flash-ready (single {ticket_id} — RPi scan-to-call-       ║
+ * ║    courier double-fire Flash /notify quota + admin Flex spam; 4 success store sites:          ║
+ * ║    already-courier / active-pickup-reuse / new-pickup-success / queued-retry) + slip-upload   ║
+ * ║    (CRITICAL — Slip2Go double-charge guard: bulk-shape body hash {ticket_id, gid} +           ║
+ * ║    image_base64 EXCLUDED — 5MB binary hash flap; gid from session prevents cross-group cache  ║
+ * ║    poisoning). Wrapper-only, additive. Risk: LOW — Round 19/23/25/27/28/29/32 pattern proven. ║
+ * ║    Backward compat: missing header = no-op. Coverage 69→74/196 = 37.8%.                       ║
  * ║  Version: V.42.15 — Round 32 (2026-04-30): Idempotency-Key support on manual-flash-test.     ║
  * ║    Admin "ทดสอบ Flash API" button + retry on slow Flash network double-fire `b2b_flash_get_  ║
  * ║    warehouses()` → 2x test API call to Flash → counts against API quota + creates noise log. ║
@@ -1575,6 +1586,42 @@ function b2b_rest_slip_upload( WP_REST_Request $request ) {
     if ( $source !== $gid )
         return new WP_REST_Response(array('success'=>false,'message'=>'Unauthorized'), 403);
 
+    // ── V.42.16 Round 37: Idempotency-Key support (CRITICAL — Slip2Go double-charge guard) ──
+    // Customer LIFF ticket-view "อัพโหลดสลิป" double-tap on slow upload → 2nd request:
+    //   (1) saves duplicate slip-{tid}-{ts}.jpg to uploads (filename collides on same second)
+    //   (2) re-schedules b2b_verify_slip_async → Slip2Go API charged TWICE (~2 THB/call)
+    //   (3) double admin LINE push notification (group spam)
+    //   (4) double slip_status update churn ('verifying' → 'verifying')
+    // Body hash = {ticket_id, gid} — image_base64 EXCLUDED (5MB base64 → re-encoding flap +
+    // base64 padding variance; payment intent = same ticket being slip-paid). gid from session
+    // prevents cross-group key reuse cache poisoning. Same intent = wrapper replays cached
+    // success on retry. Different ticket_id on stale tab = 409 (customer paid wrong order).
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::slip-upload';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array(
+            'ticket_id' => $tid,
+            'gid'       => $gid,
+        );
+        $cached_idem = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached_idem) ) {
+            $err_data = $cached_idem->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached_idem) ) {
+            $cached_code = isset($cached_idem['_idem_code']) ? (int)$cached_idem['_idem_code'] : 200;
+            unset($cached_idem['_idem_code']);
+            return new WP_REST_Response($cached_idem, $cached_code);
+        }
+    }
+
     // ── Save slip image to uploads ──
     $upload_dir = wp_upload_dir();
     $slip_dir   = $upload_dir['basedir'] . '/b2b-slips';
@@ -1622,12 +1669,19 @@ function b2b_rest_slip_upload( WP_REST_Request $request ) {
     $admin_msg .= "\n🔗 " . $slip_url;
     if ( function_exists('b2b_push_to_admin') ) b2b_push_to_admin($admin_msg);
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'success'    => true,
         'message'    => 'อัพโหลดสลิปเรียบร้อย',
         'slip_url'   => $slip_url,
         'slip_status'=> 'verifying',
-    ), 200);
+    );
+
+    // V.42.16 Round 37: store cached response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
     } catch ( Exception $e ) {
         b2b_log('[SlipUpload] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาดภายใน กรุณาลองใหม่'), 500);
@@ -2667,10 +2721,46 @@ function b2b_rest_print_requeue( WP_REST_Request $request ) {
     if ( !$tid || get_post_type($tid) !== 'b2b_order' )
         return new WP_REST_Response(array('success'=>false,'message'=>'Ticket not found'), 404);
 
+    // ── V.42.16 Round 37: Idempotency-Key support ──
+    // Admin "พิมพ์ใหม่" double-click + RPi auto-retry race → double print of same shipping label
+    // (paper waste + duplicate FedEx/Flash ID confusion if both labels reach courier). Same
+    // {ticket_id} = same intent (admin wants 1 fresh print of that order). Wrapper replays cached
+    // success on retry. Body hash = {ticket_id} — different ticket = different physical label →
+    // 409 (admin clicked wrong row on stale list).
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::print-requeue';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array( 'ticket_id' => $tid );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     update_field('print_status', 'queued', $tid);
     update_field('print_error', '', $tid);
     b2b_log('[Print] Requeued #' . $tid . ($is_admin ? ' by admin' : ' by RPi'));
-    return new WP_REST_Response(array('success'=>true,'message'=>'Requeued for print'), 200);
+    $resp = array('success'=>true,'message'=>'Requeued for print');
+
+    // V.42.16 Round 37: store cached response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
 }
 
 /**
@@ -2685,6 +2775,36 @@ function b2b_rest_print_test( WP_REST_Request $request ) {
     $type = sanitize_text_field($request->get_param('type') ?: 'label');
     if ( !in_array($type, array('invoice','label','picking'), true) ) $type = 'label';
 
+    // ── V.42.16 Round 37: Idempotency-Key support ──
+    // Admin "ทดสอบ Print" double-click on slow RPi pickup → 2nd request overwrites transient
+    // (timestamp + requested_by churn) + duplicates b2b_log noise. Same {type} = same intent
+    // (admin wants 1 test print of that label format). Wrapper replays cached success on retry.
+    // Body hash = {type} — only semantic field on this endpoint (timestamp + user excluded;
+    // those are response-side artifacts not intent). Different type (invoice→label) = different
+    // hash → 409 (admin clicked wrong button on stale tab — wrong label format would print).
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::print-test';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array( 'type' => $type );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     // Store test job in a transient for RPi to pick up
     $test_job = array(
         'type'      => $type,
@@ -2695,7 +2815,14 @@ function b2b_rest_print_test( WP_REST_Request $request ) {
 
     $labels = array('invoice'=>'Invoice A4','label'=>'ใบแปะหน้ากล่อง','picking'=>'Picking List');
     b2b_log('[Print] Test print requested: ' . $type);
-    return new WP_REST_Response(array('success'=>true,'message'=>'ส่ง Test Print ('.$labels[$type].') แล้ว — รอ RPi ดึงงาน'), 200);
+    $resp = array('success'=>true,'message'=>'ส่ง Test Print ('.$labels[$type].') แล้ว — รอ RPi ดึงงาน');
+
+    // V.42.16 Round 37: store cached response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2988,6 +3115,36 @@ function b2b_rest_rpi_accept_order( WP_REST_Request $request ) {
     if ( !$tid || get_post_type($tid) !== 'b2b_order' )
         return new WP_REST_Response(array('success'=>false,'message'=>'Ticket not found'), 404);
 
+    // ── V.42.16 Round 37: Idempotency-Key support ──
+    // RPi kiosk "ยอมรับออเดอร์" double-tap on slow Wi-Fi → 2nd request hits FSM gate
+    // (checking_stock → awaiting_confirm) on already-transitioned ticket → returns 400
+    // "Order not in checking_stock status" → kiosk shows confusing error when first call
+    // already succeeded. Wrapper replays cached success on retry instead of surfacing the
+    // FSM-state-changed error to RPi UI. Body hash = {ticket_id} — different ticket on stale
+    // tab = different intent → 409.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::rpi-accept-order';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array( 'ticket_id' => $tid );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached) ) {
+            $cached_code = isset($cached['_idem_code']) ? (int)$cached['_idem_code'] : 200;
+            unset($cached['_idem_code']);
+            return new WP_REST_Response($cached, $cached_code);
+        }
+    }
+
     $current_status = get_field('order_status', $tid) ?: '';
     if ( $current_status !== 'checking_stock' )
         return new WP_REST_Response(array('success'=>false,'message'=>'Order not in checking_stock status'), 400);
@@ -2999,7 +3156,14 @@ function b2b_rest_rpi_accept_order( WP_REST_Request $request ) {
     }
     b2b_log('[RPi] Order #' . $tid . ' accepted from kiosk screen');
 
-    return new WP_REST_Response(array('success'=>true,'message'=>'Order accepted'), 200);
+    $resp = array('success'=>true,'message'=>'Order accepted');
+
+    // V.42.16 Round 37: store cached response for replay
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3155,6 +3319,37 @@ function b2b_rest_rpi_flash_ready( WP_REST_Request $request ) {
     if ( ! $tid || get_post_type( $tid ) !== 'b2b_order' )
         return new WP_REST_Response( array( 'success' => false, 'message' => 'Ticket not found' ), 404 );
 
+    // ── V.42.16 Round 37: Idempotency-Key support ──
+    // RPi kiosk scan-to-call-courier double-fire on slow Wi-Fi → 2nd request hits Flash /notify
+    // again (per-pickup API quota + can return misleading "duplicate" error) + double admin Flex
+    // pickup announcement (LINE group spam) + double WP_Cron retry chain enqueued. Wrapper replays
+    // cached success on retry. Body hash = {ticket_id} — different ticket = different physical
+    // pickup intent → 409 (warehouse staff scanned wrong ticket on stale screen).
+    // Has 4 success return paths (already-courier-called / active-pickup-reuse / new-pickup-success
+    // / queued-retry-on-Flash-error) — store cached response in each path.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::rpi-flash-ready';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array( 'ticket_id' => $tid );
+        $cached_idem = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached_idem) ) {
+            $err_data = $cached_idem->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached_idem) ) {
+            $cached_code = isset($cached_idem['_idem_code']) ? (int)$cached_idem['_idem_code'] : 200;
+            unset($cached_idem['_idem_code']);
+            return new WP_REST_Response($cached_idem, $cached_code);
+        }
+    }
+
     $packing = get_post_meta( $tid, '_flash_packing_status', true );
 
     // ── Already past courier stage → return current info, no re-call ──
@@ -3164,13 +3359,17 @@ function b2b_rest_rpi_flash_ready( WP_REST_Request $request ) {
         if ( is_array( $cached ) && ! empty( $cached['name'] ) ) {
             $info_text = 'คูเรียร์: ' . $cached['name'] . ' ' . ( $cached['phone'] ?? '' ) . ' (เรียกแล้ว)';
         }
-        return new WP_REST_Response( array(
+        $resp_already = array(
             'success'        => true,
             'queued'         => false,
             'message'        => 'เรียกรถไปแล้ว — ไม่ต้องเรียกซ้ำ',
             'courier_info'   => $info_text,
             'packing_status' => $packing,
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+            dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp_already, array('_idem_code' => 200)), 200);
+        }
+        return new WP_REST_Response( $resp_already, 200 );
     }
 
     // ── Validate packing status allows courier call ──
@@ -3243,13 +3442,17 @@ function b2b_rest_rpi_flash_ready( WP_REST_Request $request ) {
 
         b2b_log( '[Flash] #' . $tid . ' added to existing pickup ' . $active_pickup['pickup_id'] );
 
-        return new WP_REST_Response( array(
+        $resp_active = array(
             'success'        => true,
             'queued'         => false,
             'message'        => 'เพิ่มเข้า pickup เดิม — คูเรียร์กำลังมา',
             'courier_info'   => 'คูเรียร์: ' . $active_pickup['staff_name'] . ' ' . $active_pickup['staff_phone'],
             'packing_status' => 'courier_called',
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+            dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp_active, array('_idem_code' => 200)), 200);
+        }
+        return new WP_REST_Response( $resp_active, 200 );
     }
 
     // ─── No active pickup → call Flash /notify ───
@@ -3330,13 +3533,17 @@ function b2b_rest_rpi_flash_ready( WP_REST_Request $request ) {
             b2b_push_to_admin( '🚛 เรียกรถ Flash สำเร็จ — ' . $courier_msg );
         }
 
-        return new WP_REST_Response( array(
+        $resp_called = array(
             'success'        => true,
             'queued'         => false,
             'message'        => $courier_msg,
             'courier_info'   => $courier_msg,
             'packing_status' => 'courier_called',
-        ), 200 );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+            dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp_called, array('_idem_code' => 200)), 200);
+        }
+        return new WP_REST_Response( $resp_called, 200 );
     }
 
     // ─── Failed: schedule WP Cron retry (network errors only) ───
@@ -3362,13 +3569,17 @@ function b2b_rest_rpi_flash_ready( WP_REST_Request $request ) {
         }
     }
 
-    return new WP_REST_Response( array(
+    $resp_queued = array(
         'success'        => true,  // tell kiosk "รับแล้ว" (ระบบจะ retry เอง)
         'queued'         => true,
         'message'        => 'ระบบรับแล้ว กำลังเรียกรถ...',
         'courier_info'   => $courier_msg,
         'packing_status' => 'notify_error',
-    ), 200 );
+    );
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body, array_merge($resp_queued, array('_idem_code' => 200)), 200);
+    }
+    return new WP_REST_Response( $resp_queued, 200 );
 }
 
 // ═══════════════════════════════════════════════════════════════
