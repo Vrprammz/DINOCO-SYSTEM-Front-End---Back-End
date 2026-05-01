@@ -1,5 +1,18 @@
 /**
  * [B2F] Snippet 2: REST API
+ * Version: V.11.20 (2026-04-30) — Round 41 batch 19: Idempotency-Key support on 2 B2F delete endpoints
+ *   (push toward 50% milestone — 94/196 = 48.0%):
+ *   maker/delete (admin "ลบโรงงาน" double-click → 2nd request finds maker already inactive
+ *   → idempotent at storage but 2x b2f_log entry + audit noise + admin Flex push potentially
+ *   double-fires on hook chain). Body hash = {id} — same maker id resubmit = cached 200
+ *   replay. Cross-namespace pair guard with maker-product/delete (same {id}-only shape,
+ *   namespace-discriminated). maker-product/delete (admin "ลบสินค้า" double-click → 1st
+ *   wp_delete_post(true) succeeds + b2f_dual_soft_delete_junction fires + b2f_junction_updated
+ *   hook fires + cache invalidation; 2nd request hits NOT_FOUND 404 confusion when admin
+ *   actually wanted idempotent confirmation that delete completed). Body hash = {id} —
+ *   wrapper turns "already deleted" 404 into cached 200 for retry-friendly UX. Backward
+ *   compat: missing X-Idempotency-Key = byte-identical V.11.19 behavior. Pattern proven
+ *   across 21 B2F endpoints now (Round 19/23/25/26/27/28/31/32/33/41).
  * Version: V.11.19 (2026-04-30) — Round 33 batch 11: Idempotency-Key support on 3 B2F endpoints:
  *   maker-product (admin "บันทึกสินค้า" double-click → DUPLICATE_SKU 400 confusion or rare race
  *   = 2 b2f_maker_product CPT rows + 2x junction observation log noise). Body hash =
@@ -1164,11 +1177,38 @@ if ( ! function_exists( 'b2f_rest_delete_maker' ) ) {
     /**
      * POST /maker/delete — soft delete (set inactive)
      * Body: { id }
+     * V.11.20 Round 41: Idempotency-Key support — admin double-click → cached 200 replay.
      */
     function b2f_rest_delete_maker( WP_REST_Request $req ) {
         $id = intval( $req->get_param( 'id' ) ?: 0 );
         if ( ! $id ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ ID', 'code' => 'MISSING_ID' ), 400 );
+        }
+
+        // ── V.11.20 Round 41 batch 19: Idempotency-Key support ──
+        // Body hash = {id}. Admin "ลบโรงงาน" double-click on slow ACF write → 2nd request
+        // finds maker already inactive → idempotent at storage but 2x b2f_log entry + admin
+        // Flex push could double-fire. Same id resubmit = cached 200 replay.
+        // Cross-namespace pair guard with maker-product/delete (same {id}-only shape).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker-delete';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array( 'id' => (int) $id );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, 200 );
+            }
         }
 
         $post = get_post( $id );
@@ -1182,7 +1222,15 @@ if ( ! function_exists( 'b2f_rest_delete_maker' ) ) {
             b2f_log( sprintf( 'Maker soft deleted: #%d %s', $id, get_the_title( $id ) ) );
         }
 
-        return new WP_REST_Response( array( 'success' => true ), 200 );
+        $resp = array( 'success' => true );
+
+        // V.11.20 Round 41: store cached response for idempotent replay (success only).
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 
@@ -2294,11 +2342,39 @@ if ( ! function_exists( 'b2f_rest_delete_maker_product' ) ) {
      * V.10.0: Soft-delete junction row (UPDATE deleted_at + status=discontinued)
      *         in addition to CPT hard delete. Phase 3 read path will skip
      *         soft-deleted rows (WHERE deleted_at IS NULL).
+     * V.11.20 Round 41: Idempotency-Key support — admin double-click → cached 200 replay
+     *         instead of confusing NOT_FOUND on already-deleted resource.
      */
     function b2f_rest_delete_maker_product( WP_REST_Request $req ) {
         $id = intval( $req->get_param( 'id' ) ?: 0 );
         if ( ! $id ) {
             return new WP_REST_Response( array( 'success' => false, 'error' => 'ไม่ระบุ ID', 'code' => 'MISSING_ID' ), 400 );
+        }
+
+        // ── V.11.20 Round 41 batch 19: Idempotency-Key support ──
+        // Body hash = {id}. Admin "ลบสินค้า" double-click → 1st wp_delete_post(true) succeeds
+        // + b2f_dual_soft_delete_junction + b2f_junction_updated hook + cache invalidation.
+        // 2nd request hits NOT_FOUND 404 confusion. Wrapper turns "already deleted" 404
+        // into cached 200 for retry-friendly UX.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'b2f/v1::maker-product-delete';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array( 'id' => (int) $id );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                unset( $cached['_idem_code'] );
+                return new WP_REST_Response( $cached, 200 );
+            }
         }
 
         $post = get_post( $id );
@@ -2329,7 +2405,15 @@ if ( ! function_exists( 'b2f_rest_delete_maker_product' ) ) {
             b2f_log( sprintf( 'Maker product deleted: #%d', $id ) );
         }
 
-        return new WP_REST_Response( array( 'success' => true ), 200 );
+        $resp = array( 'success' => true );
+
+        // V.11.20 Round 41: store cached response for idempotent replay (success only).
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response( $resp, 200 );
     }
 }
 

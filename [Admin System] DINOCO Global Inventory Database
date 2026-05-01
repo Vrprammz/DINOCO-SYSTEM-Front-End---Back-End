@@ -2,6 +2,29 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.45.8 (2026-04-30) — Round 41 batch 19: Idempotency-Key support on 3 inventory POSTs
+ *   (push toward 50% milestone — 92/196 = 46.9% inventory contribution; total 94/196 = 48.0%):
+ *   - POST /dinoco-stock/v1/dip-stock/count — admin "บันทึกผลนับ" double-click → 2x SQL
+ *     UPDATE per item (variance/variance_pct re-computed identically — idempotent at storage)
+ *     + 2x counted_skus recount + audit noise. **bulk-shape** body hash =
+ *     {session_id, items: sorted-by-sku [{sku, actual_qty, note}]} — admin re-submit with
+ *     edited variance value caught via 409 (different actual_qty → wrong variance sticks).
+ *   - POST /dinoco-stock/v1/box-template — admin "เพิ่มกล่อง" double-click → 2x box template
+ *     INSERT race (handler 409 guard via duplicate code SELECT, but microsecond window between
+ *     SELECT + INSERT slips through under load) + 2x cache flush + 2x dinoco_invalidate_box_
+ *     template_cache hook fire. **single** body hash = {code, name, length_cm, width_cm,
+ *     height_cm, tare_weight_g, max_weight_g, owner_type, sort_order} — same code resubmit =
+ *     idempotent replay; admin renamed code mid-retry = 409 (avoids ghost duplicate).
+ *   - POST /dinoco-stock/v1/box-template/{id} — admin "แก้ไขกล่อง" double-click → 2x UPDATE
+ *     (idempotent at storage but updated_at re-stamped twice + cache flush 2x + 2x
+ *     dinoco_invalidate_box_template_cache hook fire that downstream Snippet 1 V.34.x
+ *     dinoco_resolve_pno_shipping() static memo flush twice — wasted shipping resolver
+ *     warm-up). **single** body hash = {id, name, owner_type, length_cm, width_cm, height_cm,
+ *     tare_weight_g, max_weight_g, sort_order} — id discriminates from create endpoint;
+ *     dimension change between retries → 409 (admin changed mind from 30cm to 35cm — wrong
+ *     value would stick via cached replay).
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.45.7 behavior.
  * Version: V.45.7 (2026-04-30) — Round 40 batch 18: Idempotency-Key support on 4 inventory POSTs
  *   (push toward 🎯 45% milestone — 89/196 = 45.4%):
  *   • POST /dinoco-stock/v1/dip-stock/start — admin "เริ่มนับสต็อก" double-click → 2× session
@@ -2815,6 +2838,50 @@ add_action('rest_api_init', function() {
                 return new WP_REST_Response([ 'success' => false, 'message' => 'ข้อมูลไม่ครบ' ], 400);
             }
 
+            // ── V.45.8 Round 41 batch 19: Idempotency-Key support ──
+            // Body hash = {session_id, items: sorted-by-sku [{sku UPPER, actual_qty, note}]}.
+            // Admin "บันทึกผลนับ" double-click on slow network → 2x UPDATE per item
+            // (idempotent at storage — variance recomputed identically, but updated_at noise
+            // + 2x counted_skus recount). Different actual_qty between retries → 409 prevents
+            // wrong variance stuck via cached replay.
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $request ) : '';
+            $idem_namespace = 'dinoco-stock/v1::dip-stock-count';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $norm_items = array();
+                foreach ( $items as $it ) {
+                    if ( ! is_array( $it ) ) continue;
+                    $sku = isset( $it['sku'] ) ? strtoupper( trim( (string) $it['sku'] ) ) : '';
+                    if ( $sku === '' ) continue;
+                    $norm_items[] = array(
+                        'sku'        => $sku,
+                        'actual_qty' => isset( $it['actual_qty'] ) ? (int) $it['actual_qty'] : 0,
+                        'note'       => isset( $it['note'] ) ? (string) $it['note'] : '',
+                    );
+                }
+                usort( $norm_items, function( $a, $b ) {
+                    return strcmp( $a['sku'], $b['sku'] );
+                } );
+                $idem_body = array(
+                    'session_id' => (int) $session_id,
+                    'items'      => $norm_items,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             // Validate session
             $session = $wpdb->get_row( $wpdb->prepare(
                 "SELECT id, status FROM {$dip_table} WHERE id = %d", $session_id
@@ -2864,12 +2931,20 @@ add_action('rest_api_init', function() {
             ) );
             $wpdb->update( $dip_table, [ 'counted_skus' => $counted ], [ 'id' => $session_id ] );
 
-            return rest_ensure_response([
+            $resp = array(
                 'success'   => true,
                 'updated'   => $updated_count,
                 'counted'   => $counted,
                 'remaining' => $total - $counted,
-            ]);
+            );
+
+            // V.45.8 Round 41: store cached response for idempotent replay.
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ]);
@@ -3865,6 +3940,43 @@ add_action('rest_api_init', function() {
             $owner= sanitize_text_field( $req->get_param( 'owner_type' ) );
             $sort = absint( $req->get_param( 'sort_order' ) );
 
+            // ── V.45.8 Round 41 batch 19: Idempotency-Key support ──
+            // Body hash = {code, name, length_cm, width_cm, height_cm, tare_weight_g,
+            // max_weight_g, owner_type, sort_order}. Admin "เพิ่มกล่อง" double-click race →
+            // 2x INSERT (handler 409 dedup via duplicate code SELECT, but microsecond gap
+            // before commit slips through). Same code resubmit = cached 200 replay.
+            // Renamed code mid-retry = 409 (admin changed mind — wrong code stuck via cache).
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-stock/v1::box-template-create';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'code'          => (string) $code,
+                    'name'          => (string) $name,
+                    'length_cm'     => (int) $L,
+                    'width_cm'      => (int) $W,
+                    'height_cm'     => (int) $H,
+                    'tare_weight_g' => (int) $tare,
+                    'max_weight_g'  => (int) $maxw,
+                    'owner_type'    => (string) $owner,
+                    'sort_order'    => (int) $sort,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
+
             // Validation
             if ( ! $code || ! $name ) return new WP_Error( 'bad_input', 'code + name required', array( 'status' => 400 ) );
             if ( $L < 1 || $L > 200 ) return new WP_Error( 'bad_input', 'length_cm 1-200', array( 'status' => 400 ) );
@@ -3902,7 +4014,15 @@ add_action('rest_api_init', function() {
                 dinoco_invalidate_box_template_cache( $new_id );
             }
 
-            return rest_ensure_response( array( 'ok' => true, 'id' => $new_id ) );
+            $resp = array( 'ok' => true, 'id' => $new_id );
+
+            // V.45.8 Round 41: store cached response for idempotent replay (success only).
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ] );
@@ -3919,6 +4039,41 @@ add_action('rest_api_init', function() {
 
             $existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ), ARRAY_A );
             if ( ! $existing ) return new WP_Error( 'not_found', 'template ไม่พบ', array( 'status' => 404 ) );
+
+            // ── V.45.8 Round 41 batch 19: Idempotency-Key support ──
+            // Body hash = {id, name, owner_type, length_cm, width_cm, height_cm,
+            // tare_weight_g, max_weight_g, sort_order} — only fields PRESENT in request hashed
+            // (selective save — admin may submit only changed dims). id discriminates create
+            // vs update (separate namespace also helps). Dimension change between retries =
+            // 409 (admin changed value mid-retry — wrong dim stuck via cache).
+            $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+                ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-stock/v1::box-template-update';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array( 'id' => (int) $id );
+                foreach ( array( 'name', 'owner_type' ) as $f ) {
+                    $v = $req->get_param( $f );
+                    if ( $v !== null ) $idem_body[ $f ] = (string) $v;
+                }
+                foreach ( array( 'length_cm', 'width_cm', 'height_cm', 'tare_weight_g', 'max_weight_g', 'sort_order' ) as $f ) {
+                    $v = $req->get_param( $f );
+                    if ( $v !== null ) $idem_body[ $f ] = (int) $v;
+                }
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error( 'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    unset( $cached['_idem_code'] );
+                    return rest_ensure_response( $cached );
+                }
+            }
 
             $update = array( 'updated_at' => current_time( 'mysql' ) );
             foreach ( array( 'name', 'owner_type' ) as $f ) {
@@ -3951,7 +4106,15 @@ add_action('rest_api_init', function() {
                 dinoco_invalidate_box_template_cache( $id );
             }
 
-            return rest_ensure_response( array( 'ok' => true ) );
+            $resp = array( 'ok' => true );
+
+            // V.45.8 Round 41: store cached response for idempotent replay (success only).
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => $inv_perm,
     ] );
