@@ -1,21 +1,32 @@
 /**
- * B2F Maker LIFF — Vite entry (V.0.2 Round 1 foundation)
+ * B2F Maker LIFF — Vite entry (V.0.3 Round 2 page renderers)
  *
  * MIGRATION TARGET: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *
- * Round 1 scope (this file):
- *   ✅ Wiring (Snippet 4 V.4.5 already added flag-gated render)
+ * Round 1 (V.0.2):
+ *   ✅ Wiring (Snippet 4 V.4.5 added flag-gated render)
  *   ✅ CSS port (`./styles.css`)
  *   ✅ 6 utility modules (`./utils/{lang,format,dom,jwt,badges,timeline}.js`)
- *   ✅ Foundation bootstrap — initLiff + setupLanguage + setupOfflineDetection
+ *   ✅ Foundation bootstrap
  *
- * Round 2+ scope (NOT in this file yet):
- *   ⏳ Page renderers (renderConfirmPage / renderDetailPage / renderListPage /
- *      renderReschedulePage / renderDeliverPage / renderDeliverForm)
+ * Round 2 (V.0.3 — this commit):
+ *   ✅ Full `buildTimeline()` body (utils/timeline.js — was stub in R1)
+ *   ✅ 5 page renderers in `./pages/`:
+ *      - confirm.js  (renderConfirmPage + renderItemRow + attachConfirmHandlers)
+ *      - detail.js   (renderDetailPage + renderDetailItem)
+ *      - reschedule.js (renderRescheduleList + renderReschedulePage +
+ *                       attachRescheduleHandler)
+ *      - list.js     (renderListPage + filter state)
+ *      - deliver.js  (renderDeliverPage + renderDeliverForm)
+ *   ✅ Renderers exposed via `window.DINOCO_B2F_MAKER_RENDERERS` for
+ *      inline-bridge use during cutover.
+ *
+ * Round 3+ scope (NOT in this file yet):
  *   ⏳ Router (?view= / JWT page fallback) + apiCall wrapper
+ *   ⏳ Page bootstrap functions (loadConfirmPage / loadDetailPage / etc.)
  *   ⏳ Cut-over (drop inline JS from Snippet 4)
  *
- * Surface area (per V.4.6):
+ * Surface area (per V.4.7):
  *   - PO confirm / reject / reschedule
  *   - Deliver confirmation
  *   - PO list
@@ -72,7 +83,32 @@ import {
     getMinDate,
 } from "./utils/timeline.js";
 
-const BOOT_MARKER = "[b2f-maker] Vite bundle loaded (V.0.2 Round 1 — foundation)";
+// Round 2 — page renderers
+import {
+    renderConfirmPage,
+    renderItemRow,
+    attachConfirmHandlers,
+} from "./pages/confirm.js";
+import {
+    renderDetailPage,
+    renderDetailItem,
+} from "./pages/detail.js";
+import {
+    renderRescheduleList,
+    renderReschedulePage,
+    attachRescheduleHandler,
+} from "./pages/reschedule.js";
+import {
+    renderListPage,
+    getListFilter,
+    _resetListFilter,
+} from "./pages/list.js";
+import {
+    renderDeliverPage,
+    renderDeliverForm,
+} from "./pages/deliver.js";
+
+const BOOT_MARKER = "[b2f-maker] Vite bundle loaded (V.0.3 Round 2 — page renderers)";
 console.info(BOOT_MARKER);
 
 /**
@@ -113,12 +149,34 @@ export async function bootstrap(opts = {}) {
 
     setupOfflineDetection();
 
+    // Round 2: expose page renderers for inline-bridge during cutover.
+    // Round 3 will replace inline `renderConfirmPage` / `renderDetailPage` /
+    // etc. globals in Snippet 4 V.4.7 with calls into this namespace.
+    const renderers = {
+        confirm: renderConfirmPage,
+        confirmItem: renderItemRow,
+        attachConfirmHandlers,
+        detail: renderDetailPage,
+        detailItem: renderDetailItem,
+        rescheduleList: renderRescheduleList,
+        reschedule: renderReschedulePage,
+        attachRescheduleHandler,
+        list: renderListPage,
+        deliver: renderDeliverPage,
+        deliverForm: renderDeliverForm,
+    };
+
+    if (typeof window !== "undefined") {
+        window.DINOCO_B2F_MAKER_RENDERERS = renderers;
+    }
+
     return {
         ctx,
         api,
         currency,
         lang: getLang(),
-        // Expose helpers so Round 2 page renderers can import via the
+        renderers,
+        // Expose helpers so Round 3 page bootstrap can import via the
         // returned facade rather than re-importing from utils. Keeps the
         // public surface small + gives us a single rename point later.
         helpers: {
@@ -166,7 +224,7 @@ if (typeof window !== "undefined" && window.DINOCO_B2F_MAKER_CONFIG) {
 // replacing globals with calls to `window.DINOCO_B2F_MAKER.helpers.*`.
 if (typeof window !== "undefined") {
     window.DINOCO_B2F_MAKER = Object.freeze({
-        version: "V.0.2",
+        version: "V.0.3",
         bootstrap,
         helpers: {
             L,
@@ -185,6 +243,21 @@ if (typeof window !== "undefined") {
             buildTimelineBars,
             buildTimeline,
             getMinDate,
+        },
+        renderers: {
+            confirm: renderConfirmPage,
+            confirmItem: renderItemRow,
+            attachConfirmHandlers,
+            detail: renderDetailPage,
+            detailItem: renderDetailItem,
+            rescheduleList: renderRescheduleList,
+            reschedule: renderReschedulePage,
+            attachRescheduleHandler,
+            list: renderListPage,
+            deliver: renderDeliverPage,
+            deliverForm: renderDeliverForm,
+            getListFilter,
+            _resetListFilter,
         },
         constants: { STATUS_TH, STATUS_EN, STATUS_ZH },
     });

@@ -10,6 +10,47 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF Round 2 — B2F Maker LIFF page renderers (5 pages + full buildTimeline) (2026-04-30)
+
+Continues Round 1 foundation. Ports the 5 page renderers from inline `b2f_liff_page_js()` V.4.7 (lines 686-1700+) into ES modules under `liff-src/b2f/maker/pages/`. Inline V.4.7 stays UNCHANGED — renderers exposed via `window.DINOCO_B2F_MAKER_RENDERERS` for inline-bridge fallback during Round 3-4 cutover.
+
+**Files added** (5 new files, ~1,220 LOC):
+
+- `liff-src/b2f/maker/pages/confirm.js` (~280 LOC) — `renderConfirmPage` + `renderItemRow` + `attachConfirmHandlers`. DD-3 SET grouping (purple header rows), V.4.3 mode badges (🟣🟠⚪), reject-box `.show` toggle with `scrollIntoView`. Mirrors V.4.7 lines 701-812 verbatim.
+- `liff-src/b2f/maker/pages/detail.js` (~190 LOC) — `renderDetailPage` + `renderDetailItem`. Image thumbnails, receivedPct progress, status-aware action button (Confirm / Reschedule / Ship more). Calls `buildTimeline(po)` (now full impl). Mirrors V.4.7 lines 878-967.
+- `liff-src/b2f/maker/pages/reschedule.js` (~180 LOC) — `renderRescheduleList` (PO list when no po_id) + `renderReschedulePage` (form view) + `attachRescheduleHandler`. Min-date validation via `getMinDate()`. Mirrors V.4.7 lines 1043-1112.
+- `liff-src/b2f/maker/pages/list.js` (~180 LOC) — `renderListPage` + 6 filter tabs with module-private `listFilter` state mirroring inline `var listFilter`. Card click → `goToPageWithPO('detail', id)` (preserved inline global). V.4.6 mode-summary pill flag-gated via `orderIntentEnabled` opt. Mirrors V.4.7 lines 1138-1227.
+- `liff-src/b2f/maker/pages/deliver.js` (~390 LOC) — `renderDeliverPage` (PO list with shipped/remaining table per item, V.3.16 inspect/reject summary, button-disabled when fully shipped) + `renderDeliverForm` (per-SKU qty stepper +/- with max=remaining, "Fill all (auto)" button, DD-3 SET groupings). Mirrors V.4.7 lines 1247-1484.
+
+**Files modified** (3):
+
+- `liff-src/b2f/maker/utils/timeline.js` — replaced Round 1 stub: full `buildTimeline(po)` body (V.4.7 lines 969-1007). 6-step happy path (submitted → confirmed → delivering → received → paid → completed) with active/current state classes. rejected/cancelled short-circuit shows reject reason via `escHtml`.
+- `liff-src/b2f/maker/entry.js` — V.0.2 → V.0.3. Imports all 5 page renderer modules. Adds `renderers` facade to bootstrap return value + `window.DINOCO_B2F_MAKER_RENDERERS` global namespace. `window.DINOCO_B2F_MAKER.renderers` mirror added.
+- `liff-src/types.d.ts` — adds `DINOCO_B2F_MAKER_RENDERERS?: any` + `goToPageWithPO?` ambient declarations.
+
+**Tests added** (1 new file, ~700 LOC, +68 tests, 250 → 318):
+
+- `tests/jest/liff-b2f-maker-pages.test.js` — covers all 5 renderers + buildTimeline full impl. Test groups: renderItemRow (6 tests — SKU/name/qty/escape/3 mode badges/no-badge), renderConfirmPage (12), attachConfirmHandlers (3), renderDetailItem (4), renderDetailPage (5), buildTimeline (7), renderRescheduleList (3), renderReschedulePage (3), attachRescheduleHandler (1), renderListPage (8), renderDeliverPage (4), renderDeliverForm (8).
+
+Total Jest suite now: **25 suites, 318/320 tests pass** (2 skipped). PHPUnit unchanged. Lint + typecheck clean.
+
+**Bundle deltas**:
+
+- `b2f-maker.<hash>.js`: 12.21 KB → **39.52 KB** (gzip 4.79 KB → 11.03 KB) — adds 5 page renderers + full timeline body
+- CSS unchanged (10.5 KB / gzip 2.71 KB)
+- Bundle-size guard threshold bumped 16 KB → **48 KB** per entry (`tests/jest/bundle-size.test.js`). Rationale: page renderers are bulk of inline V.4.7. Round 3+ router won't significantly increase entry size; Round 4-5 cleanup will hoist shared code into `chunks/` and ratchet back down.
+
+**Production safety**:
+
+- `dinoco_liff_use_vite_b2f_maker` flag still default OFF — **production unchanged**
+- Inline `b2f_liff_page_js()` V.4.7 UNCHANGED in Snippet 4 — Round 5 cutover is the only point where inline gets dropped
+- Triple safety chain (flag + manifest + `dinoco_liff_enqueue` presence) preserved
+- 68 new tests enforce that Round 2 page renderers stay byte-identical to inline behavior — DOM structure preserved (REG-029 contract)
+
+**Round 3 next**: router (`?view=` URL param + JWT page fallback) + `apiCall` wrapper + page-level `loadXxxPage()` bootstrap functions that wire renderers + handlers to API responses. Will replace inline V.4.7 globals progressively.
+
+---
+
 ### Feature — Vite LIFF Round 1 — B2F Maker LIFF foundation port (CSS + 6 utility modules + bootstrap) (2026-04-30)
 
 First **actual UI code port** in the Vite migration (not scaffold). Smallest scope chosen first: B2F Maker LIFF (1,745 LOC inline → V.4.7 header bump only; PHP runtime UNCHANGED). Round 1 = foundation; Rounds 2-5 will port page renderers + cut over.

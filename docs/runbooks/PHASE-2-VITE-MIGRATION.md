@@ -226,25 +226,53 @@ Bundle-size guard threshold bumped from 10 KB → 16 KB per entry (`tests/jest/b
 
 | Round | Scope | Touch points |
 | --- | --- | --- |
-| **2** | Page renderers (5 pages) | `liff-src/b2f/maker/pages/{confirm,detail,reschedule,list,deliver}.js` + `buildTimeline` full body |
+| **2** ✅ | Page renderers (5 pages) + full `buildTimeline` | `liff-src/b2f/maker/pages/{confirm,detail,reschedule,list,deliver}.js` |
 | **3** | Router + apiCall wrapper | `liff-src/b2f/maker/router.js` + `liff-src/b2f/maker/api.js` (extends shared `createApi`) |
 | **4** | Inline-bridge cleanup | Remove duplicated globals; entry.js owns full bootstrap |
 | **5** | Cut over | Drop inline `b2f_liff_page_js()` from Snippet 4 once flag flipped + soaked 1 week |
 
+---
+
+## Step 2.5 — B2F Maker LIFF code port (Round 2 — page renderers) ✅ (2026-04-30)
+
+Continues from Round 1 foundation. Round 2 ports the 5 page renderers from inline `b2f_liff_page_js()` (V.4.7 lines 686-1700+) into ES modules under `liff-src/b2f/maker/pages/`. Inline V.4.7 stays UNCHANGED — renderers exposed via `window.DINOCO_B2F_MAKER_RENDERERS` for inline-bridge fallback during Round 3-4 cutover.
+
+### What landed in Round 2
+
+| File | LOC | Notes |
+| --- | --- | --- |
+| `liff-src/b2f/maker/pages/confirm.js` | ~280 | `renderConfirmPage` + `renderItemRow` + `attachConfirmHandlers`; DD-3 SET grouping + V.4.3 mode badges + reject-box toggle |
+| `liff-src/b2f/maker/pages/detail.js` | ~190 | `renderDetailPage` + `renderDetailItem`; image thumbnails + receivedPct progress + status-aware action button |
+| `liff-src/b2f/maker/pages/reschedule.js` | ~180 | `renderRescheduleList` + `renderReschedulePage` + `attachRescheduleHandler`; min-date validation |
+| `liff-src/b2f/maker/pages/list.js` | ~180 | `renderListPage` + 6 filter tabs with module-private `listFilter` state mirroring inline `var listFilter`; V.4.6 mode-summary pill flag-gated |
+| `liff-src/b2f/maker/pages/deliver.js` | ~390 | `renderDeliverPage` (PO list with shipped/remaining table) + `renderDeliverForm` (per-SKU qty stepper + DD-3 SET groupings + V.3.16 inspect/reject summary) |
+| `liff-src/b2f/maker/utils/timeline.js` | (extended) | Replaced Round 1 stub: full `buildTimeline(po)` body — 6-step happy path + rejected/cancelled short-circuit |
+| `liff-src/b2f/maker/entry.js` | V.0.2 → V.0.3 | Imports all renderers + exposes via `renderers` facade on bootstrap return + `window.DINOCO_B2F_MAKER_RENDERERS` global |
+
+### Bundle deltas (Round 1 → Round 2)
+
+| Entry | Before (V.0.2 R1) | After (V.0.3 R2) | Notes |
+| --- | --- | --- | --- |
+| `b2f-maker.<hash>.js` | 12.21 KB | **39.52 KB** (gzip 11.03 KB) | +5 page renderers + full timeline body |
+| `b2f-maker.<hash>.css` | 10.5 KB | 10.5 KB (unchanged) | CSS already complete in Round 1 |
+
+Bundle-size guard threshold bumped from 16 KB → 48 KB per entry (`tests/jest/bundle-size.test.js`). Rationale: page renderers are the bulk of inline V.4.7 — Round 3+ router will not increase entry size significantly; Round 4-5 cleanup will hoist shared utilities into `chunks/` and ratchet back down.
+
 ### Production safety preserved
 
 - `dinoco_liff_use_vite_b2f_maker` flag still default OFF — **production unchanged**
-- Manifest absent in production (Step 3 disabled) → triple safety chain holds: flag + manifest + `dinoco_liff_enqueue` presence all required
-- Inline `b2f_liff_page_css()` + `b2f_liff_page_js()` UNCHANGED in Snippet 4 — Round 5 cutover is the only point where inline gets dropped
-- 59 new unit tests + drift detectors enforce that Round 1 utilities stay byte-identical to inline behavior
+- Inline `b2f_liff_page_css()` + `b2f_liff_page_js()` UNCHANGED in Snippet 4 V.4.7 — Round 5 cutover is the only point where inline gets dropped
+- 68 new unit tests for page renderers + DD-3 hierarchy + V.7.0 mode badges + buildTimeline full impl
+- Test count: 250 → 318 (Round 2 adds 68 tests)
 
-### Verifying Round 1 locally
+### Verifying Round 2 locally
 
 ```bash
-npm run build:liff           # → dist/liff/b2f-maker.<hash>.js (12 KB)
-npm run test:jest            # → 250 tests pass (was 191 before Round 1)
-npx jest liff-b2f-maker-utils.test.js   # → 59 unit tests for utilities only
-php -l "[B2F] Snippet 4: Maker LIFF Pages"   # syntax clean
+npm run build:liff           # → dist/liff/b2f-maker.<hash>.js (39.5 KB)
+npm run test:jest            # → 318 tests pass (was 250 before Round 2)
+npx jest liff-b2f-maker-pages.test.js   # → 68 unit tests for page renderers only
+npm run lint && npm run typecheck       # both clean
+php -l "[B2F] Snippet 4: Maker LIFF Pages"   # syntax clean (untouched)
 ```
 
 ---
