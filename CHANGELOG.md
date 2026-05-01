@@ -10,6 +10,46 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Round 40 (🎯 45% Idempotency milestone — 89/196 = 45.4%) (2026-04-30) ⭐
+
+Round 40 pushes idempotency coverage to **89/196 POST endpoints (45.4%)** — 🎯 **TRUE 45% milestone reached against Round 30 authoritative census denominator**. Past 9/20 of mutating REST surface. ZERO regressions across **770 PHPUnit (was 752, +18) + 161 Jest** (22 suites — drift detector still green with 89 entries).
+
+#### Phase 1 — Idempotency batch 18 (5 endpoints)
+
+Pivot from saturated B2B Flash admin cluster (Round 36-39) to mixed-namespace closure: 1 LIFF AI + 4 Inventory:
+
+- **`POST /liff-ai/v1/claim/{id}/status`** — Admin status dropdown in LIFF AI Command Center → slow ACF save → admin clicks again thinking it didn't fire → without wrapper = 2× `dinoco_set_claim_status()` invocation → 2× `status_history` row append + 2× `admin_note` line + 2× WP hook fires (`post_updated`, `claim/status_changed` — potential LINE push to customer 2×). Body hash `{claim_id, status enum, note, actor uid from JWT}`. Actor JWT-scoped — cross-admin key reuse impossible. Different status between retries (Maintenance Completed → Replacement Approved = different financial impact) = 409 prevents wrong status sticking.
+- **`POST /dinoco-stock/v1/dip-stock/start`** — Admin "เริ่มนับสต็อก" double-click → 10K+ row snapshot bulk-INSERT in progress → 2× session INSERT race + 2× DB storm + duplicate session_id orphans. Constant-marker `{action: 'start'}` — handler takes no params (session_date computed server-side). **4th constant-marker instance** after stock/initialize R30 + manual-flash-test R32 + daily-summary R39 — pattern firmly proven across 4 endpoints in 4 rounds.
+- **`POST /dinoco-stock/v1/dip-stock/force-close`** — Admin "ปิด session" double-click → 2× UPDATE (idempotent at storage but stamps `updated_at` twice + `b2b_log` fires twice = audit noise). Single `{session_id}` — 0 means "close-any-in-progress" (server resolves at runtime). Different session_id between retries = 409 prevents accidentally force-closing wrong active session.
+- **`POST /dinoco-stock/v1/stock/settings`** — Admin "บันทึก" double-click → 4× `update_option` × 2 = 8 DB writes + 2x `option_changed` hooks. **Selective save** body hash — only fields PRESENT in request hashed (admin may submit partial form with just dip_interval). `alert_enabled` boolean discriminator — flipping ON↔OFF between retries = 409 (admin's intent changed).
+- **`POST /dinoco-stock/v1/shipping-defaults`** — Admin "บันทึกค่าเริ่มต้น Flash" double-click → 2× `wp_dinoco_flash_audit` INSERT (only when flag toggles) + 2× cache flush + 2× `update_option`. Bulk-shape with `express_threshold` sub-object normalized via `ksort` + `flag_enabled` **boolean discriminator**. **CRITICAL**: V.42 enable/disable is the single most consequential Flash admin action (controls whether shipping metadata is sent to Flash courier API — affects ALL future B2B orders). Flipping ON↔OFF between retries = 409 prevents accidental flag desync from cached replay.
+
+Backward compat: missing `X-Idempotency-Key` header = byte-identical to V.45.6 / V.1.11 behavior.
+
+**Versions**:
+- `[LIFF AI] Snippet 1: REST API` V.1.11 → V.1.12 (Round 40 batch 18 — claim/{id}/status wrapper)
+- `[Admin System] DINOCO Global Inventory Database` V.45.6 → V.45.7 (Round 40 batch 18 — 4 endpoints: dip-stock/start + dip-stock/force-close + stock/settings + shipping-defaults)
+
+#### Phase 2 — Tracker + tests
+
+- `docs/audit/IDEMPOTENCY-COVERAGE.md` — coverage 84/196 (42.9%) → **89/196 (45.4%)** ⭐. Status summary updated. Milestone "🎯 45.4% (Round 40 — TRUE 45% milestone) ⭐" added. 5 new rows for entries 86-90 (LIFF AI claim-status + 4 Inventory). Round 41 candidates list refreshed (push toward 50%).
+- `tests/helpers/IdempotencyRound40Test.php` (NEW, 18 tests) — 3 cases per endpoint × 5 endpoints + cumulative no-collision (1) + 4-way constant-marker pairwise distinct guard (1) — validates dip-stock/start vs daily-summary R39 vs manual-flash-test R32 vs stock/initialize R30 hashes are all distinct (firmly proves constant-marker pattern across 4 rounds without namespace gate dependency).
+
+#### Why this milestone matters
+
+🎯 **45% — past 9/20 of POST surface integrated**. Constant-marker pattern firmly proven across 4 endpoints in 4 different rounds (stock/initialize R30 + manual-flash-test R32 + daily-summary R39 + dip-stock/start R40) — pattern is now firmly part of the project's idempotency vocabulary. **Inventory namespace coverage 9 → 13 (+4)**. **LIFF AI namespace coverage 1 → 2 (+1)**. Diverse-namespace strategy (1 LIFF AI + 4 Inventory) breaks the B2B-saturation pattern of Round 36-39.
+
+**Pattern mix Round 40**: 2× single (claim-status + dip-stock/force-close) + 1× constant-marker (dip-stock/start) + 1× selective save (stock-settings) + 1× bulk-shape with boolean discriminator (shipping-defaults flag_enabled flip).
+
+#### Cumulative test growth (Round 19-40)
+
+- PHPUnit: 0 → **770 tests** (+18 in Round 40)
+- Jest: 0 → **161 tests across 22 suites** (drift detector validates 89 tracker entries)
+- Cumulative idempotency contract tests: 329 → **347 cases** (Round 40: +18)
+- Body-shape distinct hashes asserted: 83 → **88** (Round 40: +5 new — all unique; 1 cross-namespace 4-way constant-marker pair guard)
+
+---
+
 ### Feature — Round 38 (🎯 40% Idempotency milestone — 79/196 = 40.3%) (2026-04-30)
 
 Round 38 pushes idempotency coverage to **79/196 POST endpoints (40.3%)** — 🎯 **TRUE 40% milestone reached against Round 30 authoritative census denominator**. Past 4/10 of mutating REST surface. ZERO regressions across **735 PHPUnit (was 716, +19) + 161 Jest** (22 suites — drift detector still green with 79 entries).
