@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.14 (2026-04-30) — Round 49 batch 27 idempotency wrap (2 endpoints):║
+ * ║    POST /dinoco-slip/v1/clear-locks — admin force-unlock + audit row.            ║
+ * ║      Body hash: single {group_id, reason} — different reason mid-retry → 409     ║
+ * ║      catches admin clarifying audit message (must store true reason). Same       ║
+ * ║      group_id retry = cached 200 instant + skip 2× lock cleanup.                 ║
+ * ║    POST /dinoco-slip/v1/manual-process — CRITICAL retry-prone admin debt        ║
+ * ║      subtract for Slip2Go quota deadlock rescue. Body hash: single               ║
+ * ║      {dist_id, amount, trans_ref, sender_name} core — image_b64 EXCLUDED        ║
+ * ║      (binary blob too large; trans_ref + image_hash internal dedup remains       ║
+ * ║      authoritative defense per V.1.4/V.1.6 GET_LOCK + b2b_slip_is_trans_ref_     ║
+ * ║      seen guards). Different amount mid-retry → 409 prevents wrong amount       ║
+ * ║      stuck via cached replay. reason EXCLUDED (admin may correct text without   ║
+ * ║      triggering 409 — is just audit annotation).                                ║
  * ║  Version: V.1.13 (2026-04-24) — Refund/Credit-Note workflow (Journey A):         ║
  * ║    Closes UX gap: admin had to swap 4 pages (Slip Monitor → Manual Invoice →     ║
  * ║      Finance Dashboard → LINE manual) to refund overpayment. Now: inline action  ║
@@ -538,8 +551,51 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_clear_locks' ) ) {
         $group_id = sanitize_text_field( (string) $req->get_param( 'group_id' ) );
         $reason   = sanitize_text_field( (string) $req->get_param( 'reason' ) ?: 'admin_manual' );
 
+        // V.1.14 Round 49: Idempotency-Key wrap. Admin "Clear Locks" double-click on
+        // slow b2b_slip_clear_locks() (scans wp_options → DELETE LIKE pattern + audit
+        // INSERT) → 2× DELETE storm + 2× audit row "slip_locks_cleared" + 2× admin
+        // dashboard refresh. Body hash = single {group_id, reason} — same retry =
+        // cached 200; different reason mid-retry → 409 forces admin to type correct
+        // reason (audit trail integrity).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-slip/v1::clear-locks';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'group_id' => $group_id,
+                'reason'   => $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         $result = b2b_slip_clear_locks( $group_id, 'admin:' . $uid . ':' . $reason );
-        return rest_ensure_response( array( 'success' => true, 'data' => $result ) );
+        $resp   = array( 'success' => true, 'data' => $result );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -761,6 +817,44 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
 
         $dist_name = get_the_title( $dist_id );
         $group_id  = function_exists( 'get_field' ) ? (string) get_field( 'line_group_id', $dist_id ) : '';
+
+        // V.1.14 Round 49: Idempotency-Key wrap (CRITICAL retry-prone — debt subtract).
+        // Admin "บันทึก Manual" double-click on slow b2b_debt_subtract + LINE push +
+        // audit log → 2× debt subtract (FOR UPDATE prevents physical race BUT 2nd retry
+        // AFTER 1st commit re-subtracts — V.1.4/V.1.6 GET_LOCK prevents within window
+        // but cached idempotency replay extends protection across full TTL). Body hash
+        // = single {dist_id, amount, trans_ref, sender_name} core — image_b64 EXCLUDED
+        // (binary blob too large for idempotency_keys row; image_hash + trans_ref +
+        // GET_LOCK provide layered defense already). reason EXCLUDED — admin may
+        // correct text without triggering 409 (audit annotation only). Different
+        // amount/dist_id/trans_ref mid-retry → 409 catches admin business decision
+        // change (wrong dist clicked / amount typo / fresh trans_ref pasted).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-slip/v1::manual-process';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'dist_id'     => $dist_id,
+                'amount'      => round( $amount, 2 ),
+                'trans_ref'   => $trans_ref,
+                'sender_name' => $sender_name,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
 
         // Duplicate guard — hash the uploaded image (if any) + trans_ref check
         $image_hash = '';
@@ -988,7 +1082,7 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
             ) );
         }
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success'        => true,
             'log_id'         => $log_id,
             'dist_id'        => $dist_id,
@@ -1001,7 +1095,20 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_manual_process' ) ) {
             'image_hash'     => $image_hash,
             'image_stored_url' => $image_stored_url,
             'message'        => 'ตัดหนี้ ฿' . number_format( $amount, 2 ) . ' สำเร็จ — หนี้เหลือ ฿' . number_format( $new_debt, 2 ),
-        ) );
+        );
+
+        // V.1.14 Round 49: store cached replay payload for double-click protection.
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 

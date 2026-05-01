@@ -1,6 +1,21 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Health Monitor                        ║
+ * ║  Version: V.1.5 (2026-04-30) — Round 49 batch 27 idempotency wrap.            ║
+ * ║    POST /dinoco/v1/health/run-check — admin manual probe trigger.             ║
+ * ║      Body hash: single {key, user_id} — same key from same admin retry on     ║
+ * ║      slow check (e.g. line_api_health hits LINE API ~2s) → cached 200 saves   ║
+ * ║      duplicate audit_log row + redundant remote calls. Different key = 409.   ║
+ * ║    POST /dinoco/v1/smoke-test — admin "Run Full System Test" trigger.         ║
+ * ║      Body hash: constant-marker {action: 'smoke-test', user_id} — handler     ║
+ * ║      takes no params + 16 health probes + 5 integration tests + audit row     ║
+ * ║      proof-of-write. Double-click race writes 2× audit_log "smoke_test" row + ║
+ * ║      bumps cumulative_pass counter twice → cached 200 prevents both. Rate     ║
+ * ║      limit 5/min/user already in place but does NOT prevent double-click     ║
+ * ║      within rate window (replay-of-cache is idempotent at storage).          ║
+ * ║      7th constant-marker instance after R30 stock/initialize + R32 manual-   ║
+ * ║      flash-test + R39 daily-summary + R40 dip-stock/start + R43 invoice/init ║
+ * ║      + R47 stock/sync-missing.                                                ║
  * ║  Version: V.1.4 (2026-04-30) — Round 31 cron audit follow-up.                 ║
  * ║    Fix heartbeat key drift — flash_category_verify reader was checking         ║
  * ║    `_dinoco_cron_flash_category_verify_cron_last_run` (leading underscore +    ║
@@ -1387,6 +1402,39 @@ if ( ! function_exists( 'dinoco_health_rest_run_check' ) ) {
         if ( $key === '' ) {
             return new WP_Error( 'invalid_key', 'key required', array( 'status' => 400 ) );
         }
+
+        // V.1.5 Round 49: Idempotency-Key wrap. Admin "Run Check" double-click on slow
+        // probe (e.g. line_api_health hits LINE API ~2s, flash_v42_health touches Flash
+        // routes ~1s) → 2× remote network call + 2× dinoco_audit_log row "health_check_
+        // manual" → audit log noise + LINE/Flash quota burn. Body hash = single
+        // {key, user_id} — same key from same admin = cached 200 instant; different key
+        // mid-retry → 409 catches admin clicking different probe button. user_id scopes
+        // per-admin (cross-admin key reuse not a leak — same probe result).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco/v1::health/run-check';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'key'     => $key,
+                'user_id' => (int) get_current_user_id(),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         $result = dinoco_run_health_check( $key );
         if ( function_exists( 'dinoco_audit_log' ) ) {
             dinoco_audit_log( array(
@@ -1397,6 +1445,18 @@ if ( ! function_exists( 'dinoco_health_rest_run_check' ) ) {
                 'success'     => $result['status'] === 'fail' ? 0 : 1,
             ) );
         }
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            $store_resp = is_array( $result ) ? $result : array( 'result' => $result );
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $store_resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
         return $result;
     }
 }
@@ -1651,6 +1711,41 @@ if ( ! function_exists( 'dinoco_run_full_smoke_test' ) ) {
             );
         }
 
+        // V.1.5 Round 49: Idempotency-Key wrap (constant-marker pattern — 7th instance
+        // after R30 stock/initialize + R32 manual-flash-test + R39 daily-summary + R40
+        // dip-stock/start + R43 invoice/init + R47 stock/sync-missing). Handler takes
+        // no params + writes ONE intentional audit_log row "smoke_test" + bumps
+        // _dinoco_smoke_cumulative_pass counter on success + 16 health probes + 5
+        // integration probes (full ~2-5s). Double-click race writes 2× audit row + 2×
+        // counter bump → cached 200 returns first verdict instantly + skips 2-5s
+        // re-probe (saves Flash/LINE/DB load). Body shape = constant-marker
+        // {action: 'smoke-test', user_id} — user_id scopes per-admin (different admin
+        // = different probe scope; cross-admin replay possible but harmless).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'dinoco/v1::smoke-test';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'action'  => 'smoke-test',
+                'user_id' => (int) get_current_user_id(),
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         $started_at = current_time( 'mysql' );
         $started_ms = microtime( true );
 
@@ -1722,7 +1817,7 @@ if ( ! function_exists( 'dinoco_run_full_smoke_test' ) ) {
             update_option( '_dinoco_smoke_cumulative_pass', $cumulative_pass + 1, false );
         }
 
-        return array(
+        $resp = array(
             'started_at'       => $started_at,
             'ended_at'         => current_time( 'mysql' ),
             'elapsed_ms'       => $elapsed_ms,
@@ -1738,5 +1833,18 @@ if ( ! function_exists( 'dinoco_run_full_smoke_test' ) ) {
                 'cumulative_pass'  => (int) get_option( '_dinoco_smoke_cumulative_pass', 0 ),
             ),
         );
+
+        // V.1.5 Round 49: store cached replay payload for double-click protection.
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return $resp;
     }
 }

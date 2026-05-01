@@ -1,6 +1,12 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Flag Audit Log                            ║
+ * ║  Version: V.1.2 (2026-04-30) — Round 49 batch 27 idempotency wrap.║
+ * ║    POST /dinoco/v1/flag-audit/retention/run — admin manual prune. ║
+ * ║    Body hash: constant-marker {action: 'retention-run', user_id}. ║
+ * ║    Admin double-click on slow DELETE (90+ days, ~10K rows) → 2×   ║
+ * ║    DELETE storm + 2× last_run option overwrite + 2× UI flicker.   ║
+ * ║    Cached 200 returns first deleted count instantly.              ║
  * ║  Version: V.1.1 (2026-04-30) — Round 28: register dinoco_flag_   ║
  * ║    audit_retention_cron via dinoco_register_cron heartbeat       ║
  * ║    tracking (Health Monitor visibility). Fallback to legacy      ║
@@ -520,14 +526,57 @@ add_action( 'rest_api_init', function() {
         'methods'             => 'POST',
         'permission_callback' => $perm_admin,
         'callback'            => function( WP_REST_Request $req ) {
+            // V.1.2 Round 49: Idempotency-Key wrap (constant-marker pattern). Admin
+            // double-click on slow DELETE (90+ days = up to ~10K rows + index rebuild)
+            // → 2× full DELETE pass + 2× audit log entry + 2× last_run option overwrite
+            // + UI flicker. Body hash = {action, user_id} — user_id scopes per-admin
+            // (cross-admin retry safe — same prune outcome). Different user mid-retry
+            // → 409 catches admin session swap (rare but surfaces fleet key reuse).
+            $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco/v1::flag-audit/retention/run';
+            $idem_body      = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'action'  => 'retention-run',
+                    'user_id' => (int) get_current_user_id(),
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp = $cached;
+                    unset( $resp['_idem_code'] );
+                    return rest_ensure_response( $resp );
+                }
+            }
+
             $deleted = dinoco_flag_audit_retention_run();
-            return rest_ensure_response( array(
+            $resp = array(
                 'success' => true,
                 'data'    => array(
                     'deleted' => $deleted,
                     'last_run' => get_option( 'dinoco_flag_audit_retention_last_run', null ),
                 ),
-            ) );
+            );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
     ) );
 
