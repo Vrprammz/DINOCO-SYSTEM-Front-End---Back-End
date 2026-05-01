@@ -1,6 +1,14 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 16: Backorder System                          ║
+ * ║  Version: V.3.9 (2026-04-30) — Round 36 batch 14: Idempotency-Key support on bo-reject:        ║
+ * ║    • POST /b2b/v1/bo-reject — body hash {order_id, reason}.                                    ║
+ * ║      Admin double-click "ปฏิเสธออเดอร์" on Pending Stock Review modal → 2× FSM transition       ║
+ * ║      attempt (second hits 'invalid_status' = noisy 400), 2× customer Flex notify (LINE spam),  ║
+ * ║      2× decrement_daily_counters (corrupts opaque-accept rate budget). Wrapper returns cached  ║
+ * ║      200 within 24h replay → single transition + single notify. Different reason text → 409.   ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.          ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical to V.3.8 behavior.   ║
  * ║  Version: V.3.8 (2026-04-30) — Round 34 batch 12: Idempotency-Key support on bo-clear-enum-flag: ║
  * ║    • POST /b2b/v1/bo-clear-enum-flag — body hash {distributor_id}.                            ║
  * ║      Admin manual reset of false-positive enumeration_flags (V.1.6 feature). Double-click      ║
@@ -1940,6 +1948,37 @@ if ( ! function_exists( 'b2b_rest_bo_reject' ) ) {
             return new WP_Error( 'invalid_status', 'Order must be in pending_stock_review', array( 'status' => 400 ) );
         }
 
+        // ── V.3.9 Round 36 batch 14: Idempotency-Key support ──
+        // Admin double-click "ปฏิเสธออเดอร์" on Pending Stock Review modal → 2× FSM transition
+        // attempt (second hits 'invalid_status' = noisy 400) + 2× customer Flex notify (LINE
+        // message spam) + 2× decrement_daily_counters (corrupts opaque-accept rate budget).
+        // Wrapper returns cached 200 → single transition + single notify. Body hash =
+        // {order_id, reason} — different reason text by admin = different intent → 409.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $request ) : '';
+        $idem_namespace = 'b2b/v1::bo-reject';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'order_id' => $order_id,
+                'reason'   => $reason,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+                unset( $cached['_idem_code'] );
+                return rest_ensure_response( $cached );
+            }
+        }
+
         // Revert daily counters
         $dist_id = (int) get_field( 'distributor_id', $order_id );
         $order_items_text = get_field( 'order_items', $order_id ) ?: '';
@@ -1967,7 +2006,14 @@ if ( ! function_exists( 'b2b_rest_bo_reject' ) ) {
         // V.1.9 PERF-H4: pending_review_count drops → invalidate summary cache
         b2b_bo_invalidate_summary_cache();
 
-        return rest_ensure_response( array( 'success' => true, 'order_id' => $order_id, 'status' => 'cancelled' ) );
+        $resp = array( 'success' => true, 'order_id' => $order_id, 'status' => 'cancelled' );
+
+        // V.3.9 Round 36: store cached response for replay (success only)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 

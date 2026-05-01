@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 5: Admin Dashboard                          ║
+ * ║  Version: V.33.8 (2026-04-30) — Round 36 batch 14: Idempotency-Key on 3 Flash admin endpoints: ║
+ * ║    • POST /b2b/v1/flash-cancel — body hash {ticket_id}. Admin double-click "ยกเลิก Flash" →    ║
+ * ║      2× /open/v3/orders/cancel per PNO + 2× delete_post_meta + 2× audit. Flash returns 1015   ║
+ * ║      "courier picked up" on 2nd call (misleading). Wrapper returns cached 200 → single call.  ║
+ * ║    • POST /b2b/v1/flash-cancel-notify — body hash {ticket_id}. Admin double-click "ยกเลิกเรียก   ║
+ * ║      รถ" → 2× POST /open/v3/notify/cancel + 2× audit. Flash idempotent server-side but admin  ║
+ * ║      sees confusing dual notifications. Wrapper returns cached 200 → single audit.            ║
+ * ║    • POST /b2b/v1/flash-switch-manual — body hash {ticket_id}. Admin double-click "เปลี่ยน      ║
+ * ║      เป็นส่งเอง" → 2× Flash cancel + 2× pickup cancel + 2× enqueue_print_job (RPi prints      ║
+ * ║      duplicate manual labels) + 2× admin Flex push. State guard catches 2nd call only AFTER  ║
+ * ║      side effects fire. Wrapper returns cached 200 → single transition + single print + Flex. ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.          ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical to V.33.7 behavior.  ║
  * ║  Version: V.33.7 (2026-04-30) — Round 29: Idempotency-Key on delete-ticket + recalculate-   ║
  * ║    total. delete-ticket: prevents already-trashed retry confusion + double Flash cancel +    ║
  * ║    debt reverse (some sites guarded, some not). recalculate-total: prevents audit log churn  ║
@@ -626,6 +639,34 @@ function b2b_rest_flash_cancel( WP_REST_Request $r ) {
     $tid = intval($r->get_param('ticket_id'));
     if(!$tid||get_post_type($tid)!=='b2b_order') return new WP_REST_Response(array('success'=>false,'message'=>'Ticket ไม่ถูกต้อง'),400);
 
+    // ── V.33.8 Round 36 batch 14: Idempotency-Key support ──
+    // Admin double-click "ยกเลิก Flash" on B2B Admin Dashboard → 2× POST /open/v3/orders/cancel
+    // for each PNO (Flash API charges per call + can return 1015 "courier picked up" on the
+    // 2nd call which is misleading), 2× delete_post_meta + 2× audit log spam. Wrapper returns
+    // cached 200 within 24h replay window → single cancel + single audit. Body hash =
+    // {ticket_id} — single semantic field, ticket-scoped intent.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::flash-cancel';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array( 'ticket_id' => $tid );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_Error( 'idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array( 'status' => $status_code )
+            );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     $pnos = get_post_meta($tid, '_flash_tracking_numbers', true);
     if (empty($pnos)) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มี tracking'),400);
 
@@ -656,7 +697,15 @@ function b2b_rest_flash_cancel( WP_REST_Request $r ) {
         update_post_meta($tid, '_flash_packing_status', 'cancelled');
         update_post_meta($tid, '_flash_status', 'cancelled');
         b2b_add_audit_log($tid, 'flash_cancelled', 'ยกเลิกพัสดุ Flash');
-        return new WP_REST_Response(array('success'=>true,'message'=>'ยกเลิกสำเร็จ'));
+
+        $resp = array('success'=>true,'message'=>'ยกเลิกสำเร็จ');
+
+        // V.33.8 Round 36: store cached response for replay (success only)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response($resp);
     }
 
     return new WP_REST_Response(array('success'=>false,'message'=>implode('; ', $errors)),400);
@@ -671,6 +720,33 @@ function b2b_rest_flash_cancel_notify( WP_REST_Request $r ) {
     $tid = intval($r->get_param('ticket_id'));
     if(!$tid||get_post_type($tid)!=='b2b_order') return new WP_REST_Response(array('success'=>false,'message'=>'Ticket ไม่ถูกต้อง'),400);
 
+    // ── V.33.8 Round 36 batch 14: Idempotency-Key support ──
+    // Admin double-click "ยกเลิกเรียกรถ" → 2× POST /open/v3/notify/cancel for same pickup_id +
+    // 2× delete_post_meta(_flash_pickup_id) + 2× audit log spam. Flash returns OK on 2nd call
+    // (idempotent at Flash side) but admin sees confusing dual notifications. Wrapper returns
+    // cached 200 → single Flash call + single audit. Body hash = {ticket_id}.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::flash-cancel-notify';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array( 'ticket_id' => $tid );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_Error( 'idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array( 'status' => $status_code )
+            );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
+
     $pickup_id = get_post_meta($tid, '_flash_pickup_id', true);
     if (!$pickup_id) return new WP_REST_Response(array('success'=>false,'message'=>'ไม่มี pickup ID'),400);
 
@@ -681,7 +757,15 @@ function b2b_rest_flash_cancel_notify( WP_REST_Request $r ) {
         update_post_meta($tid, '_flash_packing_status', 'ready_to_ship');
         delete_post_meta($tid, '_flash_pickup_id');
         b2b_add_audit_log($tid, 'flash_cancel_notify', 'ยกเลิกเรียกรถ');
-        return new WP_REST_Response(array('success'=>true,'message'=>'ยกเลิกเรียกรถสำเร็จ'));
+
+        $resp = array('success'=>true,'message'=>'ยกเลิกเรียกรถสำเร็จ');
+
+        // V.33.8 Round 36: store cached response for replay (success only)
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return new WP_REST_Response($resp);
     }
     return new WP_REST_Response(array('success'=>false,'message'=>'Flash: '.($result['error']??'Unknown')),500);
     } catch ( \Throwable $e ) {
@@ -698,6 +782,35 @@ function b2b_rest_flash_switch_manual( WP_REST_Request $r ) {
     $tid = intval($r->get_param('ticket_id'));
     if (!$tid || get_post_type($tid) !== 'b2b_order')
         return new WP_REST_Response(array('success'=>false,'message'=>'Ticket ไม่ถูกต้อง'), 400);
+
+    // ── V.33.8 Round 36 batch 14: Idempotency-Key support ──
+    // Admin double-click "เปลี่ยนเป็นส่งเอง" → 2× Flash cancel API per PNO + 2× pickup cancel +
+    // 2× enqueue_print_job (RPi prints duplicate manual labels) + 2× admin Flex push
+    // (b2b_push_raw_to_admin sends duplicate notifications to admin LINE group). State guard
+    // catches second call (packing_status already 'cancelled') but only AFTER side effects
+    // fire. Wrapper returns cached 200 → single transition + single print + single Flex.
+    // Body hash = {ticket_id} — single semantic field.
+    $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+        ? dinoco_idempotency_extract_key( $r ) : '';
+    $idem_namespace = 'b2b/v1::flash-switch-manual';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+        $idem_body = array( 'ticket_id' => $tid );
+        $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+        if ( is_wp_error( $cached ) ) {
+            $err_data = $cached->get_error_data();
+            $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+            return new WP_Error( 'idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array( 'status' => $status_code )
+            );
+        }
+        if ( is_array( $cached ) ) {
+            $cached_code = isset( $cached['_idem_code'] ) ? (int) $cached['_idem_code'] : 200;
+            unset( $cached['_idem_code'] );
+            return new WP_REST_Response( $cached, $cached_code );
+        }
+    }
 
     $packing = get_post_meta($tid, '_flash_packing_status', true);
     if (!in_array($packing, array('notify_error','flash_created','print_queued','print_done','flash_create_error'), true))
@@ -768,10 +881,17 @@ function b2b_rest_flash_switch_manual( WP_REST_Request $r ) {
     }
 
     b2b_log('[AdminDash] Switch to manual #'.$tid);
-    return new WP_REST_Response(array(
+    $resp = array(
         'success' => true,
         'message' => 'เปลี่ยน #'.$tid.' เป็นส่งเองแล้ว — กำลังพิมพ์ใบแปะหน้าธรรมดา',
-    ));
+    );
+
+    // V.33.8 Round 36: store cached response for replay (success only)
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+    }
+
+    return new WP_REST_Response($resp);
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
