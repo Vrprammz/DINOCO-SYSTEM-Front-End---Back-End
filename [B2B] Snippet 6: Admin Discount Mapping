@@ -1,6 +1,17 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 6: Admin Discount Mapping                   ║
+ * ║  Version: V.31.4 (2026-04-30) — Round 44 batch 22: Idempotency-Key support on
+ * ║    legacy backwards-compat write path (push toward 60% milestone — 109/196 = 55.6%):
+ * ║    • POST /b2b/v1/discount-mapping — bulk-shape body hash {items[normalized: sort by
+ * ║      SKU UPPER + per-row sanitized fields]}. Admin double-click batch upsert (or
+ * ║      external system retrying on network drop) → 2× custom table writes + 2× ACF
+ * ║      update_field per item × 500 items = up to 5000 redundant DB ops + 2× transient
+ * ║      flush. Wrapper returns cached 200 → single batch. Different items[] (admin
+ * ║      changed prices mid-retry) → 409 (intent change). Same items retry → cached 200
+ * ║      with same updated/new_posts counts.
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical V.31.3.
  * ║  Version: V.31.3 — clamp tier values 0-100 (% discount validation)    ║
  * ║  DB_ID: 55                                                  ║
  * ║  Shortcode: [b2b_discount_mapping]                         ║
@@ -231,6 +242,45 @@ function b2b_rest_discount_mapping( WP_REST_Request $request ) {
     if ( ! is_array($items) ) return new WP_REST_Response( array('success'=>false,'message'=>'Invalid data'), 400 );
     if ( count($items) > 500 ) return new WP_REST_Response( array('success'=>false,'message'=>'Too many items (max 500)'), 400 );
 
+    // ── V.31.4 Round 44 batch 22: Idempotency-Key support ──
+    // Bulk-shape body hash = {items[]} sorted by SKU UPPER + per-row normalized.
+    // Admin batch upsert double-click → 2× custom table writes × N items = quota burn.
+    // Different items[] mid-retry → 409 (intent change); same retry → cached 200.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::discount-mapping';
+    $idem_body = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        // Normalize: sort by SKU UPPER + selective per-row fields (post_id excluded —
+        // creation race could differ across retries; only data fields define intent).
+        $norm_items = array();
+        foreach ( $items as $sku => $data ) {
+            $sku_u = strtoupper( sanitize_text_field( $sku ) );
+            $row = array( 'sku' => $sku_u );
+            foreach ( array('discount','ps','psi','pg','pp','pd','category') as $f ) {
+                if ( isset($data[$f]) ) {
+                    $row[ $f ] = is_numeric( $data[$f] ) ? (float) $data[$f] : sanitize_text_field( (string) $data[$f] );
+                }
+            }
+            $norm_items[] = $row;
+        }
+        usort( $norm_items, function( $a, $b ) { return strcmp( $a['sku'], $b['sku'] ); } );
+        $idem_body = array( 'items' => $norm_items );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return new WP_REST_Response($resp, 200);
+        }
+    }
+
     $updated = 0; $new_posts = array();
     $rank_fields = array('ps'=>'price_standard','psi'=>'price_silver','pg'=>'price_gold','pp'=>'price_platinum','pd'=>'price_diamond');
 
@@ -290,5 +340,12 @@ function b2b_rest_discount_mapping( WP_REST_Request $request ) {
         $updated++;
     }
     delete_transient('b2b_sku_data_map');
-    return new WP_REST_Response( array('success'=>true,'updated'=>$updated,'new_posts'=>$new_posts), 200 );
+
+    $resp = array('success'=>true,'updated'=>$updated,'new_posts'=>$new_posts);
+    // V.31.4 Round 44: store cached response on success.
+    if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return new WP_REST_Response( $resp, 200 );
 }

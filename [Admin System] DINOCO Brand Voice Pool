@@ -3,6 +3,23 @@
  * [Admin System] DINOCO Brand Voice Pool
  * Shortcode: [dinoco_brand_voice]
  * Description: เก็บเสียงลูกค้าจากโซเชียล — วิเคราะห์แบรนด์ DINOCO vs คู่แข่ง
+ * Version: V.2.12 (2026-04-30) — Round 44 batch 22 — Idempotency-Key on 2 Brand Voice
+ *   API-key admin endpoints (push toward 60% milestone — 109/196 = 55.6%):
+ *   • POST /brand-voice/v1/api-keys/generate — admin "Generate Key" double-click on slow
+ *     update_option → 2× api_key INSERT into bv_api_keys array → 2 keys exist in wild
+ *     (security risk: admin only saw 1 in UI). Body hash = {name} — different name
+ *     between retries → 409 (admin labeling change mid-retry); SAME name retry → cached
+ *     200 returns the FIRST key's raw value + audit log entry. Note: api_key value
+ *     itself is generated INSIDE handler (random_bytes) so cache stores result key —
+ *     replay gives admin same key (intent: dedupe identical create-extension-key clicks).
+ *   • POST /brand-voice/v1/api-keys/revoke — admin "Revoke" double-click during slow
+ *     reload race → 2× array_splice on adjacent indices → wrong key revoked (audit log
+ *     scrambled). Body hash = {index} — index discriminator catches admin clicking
+ *     different row mid-retry → 409 (security event). Same index retry → cached 200
+ *     prevents double-decrement of array (which would skip middle key). Subsequent
+ *     legitimate revokes use new idempotency-key (24h TTL).
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical V.2.11 behavior.
  * Version: V.2.11 (2026-04-29) — Round 14 MED-3 — bv_get_stats() transient cache:
  *   • Wrap bv_get_stats() with bv_get_stats_cached($days, $force_refresh) — 5-min
  *     transient TTL keyed by $days. Eliminates 9999-post × 22-meta = 219K cache
@@ -773,6 +790,36 @@ is_relevant=false เฉพาะ: ขายของ/โฆษณา, ถาม
         'permission_callback' => function() { return current_user_can('manage_options'); },
         'callback' => function(WP_REST_Request $req) {
             $name = sanitize_text_field($req->get_param('name') ?: 'Extension Key');
+
+            // ── V.2.12 Round 44 batch 22: Idempotency-Key support ──
+            // Admin "Generate Key" double-click on slow update_option → 2× api_key
+            // INSERT into bv_api_keys array → 2 keys exist in wild (security risk:
+            // admin only saw 1 in UI). Body hash = {name} — different name → 409.
+            // Same name retry → cached 200 returns the FIRST key + raw value
+            // (intent: dedup identical "Generate Key" double-click clicks).
+            $idem_key = function_exists('dinoco_idempotency_extract_key')
+                ? dinoco_idempotency_extract_key($req) : '';
+            $idem_namespace = 'brand-voice/v1::api-keys/generate';
+            $idem_body = null;
+            if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+                $idem_body = array(
+                    'name' => (string) $name,
+                );
+                $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+                if (is_wp_error($cached)) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+                    return new WP_Error('idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array('status' => $status_code));
+                }
+                if (is_array($cached)) {
+                    $resp = $cached;
+                    unset($resp['_idem_code']);
+                    return new WP_REST_Response($resp, 201);
+                }
+            }
+
             $raw_key = 'bvk_' . bin2hex(random_bytes(24));
             $stored = get_option('bv_api_keys', []);
             if (!is_array($stored)) $stored = [];
@@ -783,11 +830,18 @@ is_relevant=false เฉพาะ: ขายของ/โฆษณา, ถาม
                 'last_used'  => null,
             ];
             update_option('bv_api_keys', $stored);
-            return new WP_REST_Response([
+
+            $resp = array(
                 'success' => true,
                 'api_key' => $raw_key,
                 'message' => 'เก็บ key นี้ไว้ — จะแสดงครั้งเดียว',
-            ], 201);
+            );
+            // Store cached response (replay returns same raw_key — admin's intent on retry).
+            if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+                dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                    array_merge($resp, array('_idem_code' => 201)), 201);
+            }
+            return new WP_REST_Response($resp, 201);
         },
     ]);
 
@@ -797,6 +851,36 @@ is_relevant=false เฉพาะ: ขายของ/โฆษณา, ถาม
         'permission_callback' => function() { return current_user_can('manage_options'); },
         'callback' => function(WP_REST_Request $req) {
             $index = intval($req->get_param('index'));
+
+            // ── V.2.12 Round 44 batch 22: Idempotency-Key support ──
+            // Admin "Revoke" double-click during slow reload race → 2× array_splice on
+            // adjacent indices → wrong key revoked (audit log scrambled). Body hash =
+            // {index} — index discriminator catches admin clicking different row mid-
+            // retry → 409 (security event). Same index retry → cached 200 prevents
+            // double-decrement of array.
+            $idem_key = function_exists('dinoco_idempotency_extract_key')
+                ? dinoco_idempotency_extract_key($req) : '';
+            $idem_namespace = 'brand-voice/v1::api-keys/revoke';
+            $idem_body = null;
+            if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+                $idem_body = array(
+                    'index' => (int) $index,
+                );
+                $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+                if (is_wp_error($cached)) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+                    return new WP_Error('idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array('status' => $status_code));
+                }
+                if (is_array($cached)) {
+                    $resp = $cached;
+                    unset($resp['_idem_code']);
+                    return new WP_REST_Response($resp, 200);
+                }
+            }
+
             $stored = get_option('bv_api_keys', []);
             if (!is_array($stored) || !isset($stored[$index])) {
                 return new WP_Error('not_found', 'Key not found', ['status' => 404]);
@@ -804,7 +888,13 @@ is_relevant=false เฉพาะ: ขายของ/โฆษณา, ถาม
             $name = $stored[$index]['name'] ?? 'Unknown';
             array_splice($stored, $index, 1);
             update_option('bv_api_keys', $stored);
-            return new WP_REST_Response(['success' => true, 'message' => 'Revoked: ' . $name], 200);
+
+            $resp = array('success' => true, 'message' => 'Revoked: ' . $name);
+            if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+                dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                    array_merge($resp, array('_idem_code' => 200)), 200);
+            }
+            return new WP_REST_Response($resp, 200);
         },
     ]);
 

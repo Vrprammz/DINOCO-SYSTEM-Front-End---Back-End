@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 9: Admin Control Panel                      ║
+ * ║  Version: V.34.4 (2026-04-30) — Round 44 batch 22: Idempotency-Key on 2 Flash test     ║
+ * ║    sysadmin endpoints (push toward 60% milestone — 109/196 = 55.6%):                    ║
+ * ║    • POST /b2b/v1/flash-test/run-step — single-shape body hash {ticket_id, step}.       ║
+ * ║      sysadmin runner double-click → 2× expensive Flash dispatch / API call / DB        ║
+ * ║      mutation per step (e.g. flash_create burns Flash quota; scan_qr flips packing      ║
+ * ║      status + courier notify; webhook simulator fires b2b_flash_wh_status). Step enum   ║
+ * ║      discriminator catches admin re-running different step on same ticket → 409.        ║
+ * ║    • POST /b2b/v1/flash-test/simulate-webhook — single-shape body hash {ticket_id, type}║
+ * ║      Admin re-fires webhook simulator double-click → 2× state-mutation per type (e.g.   ║
+ * ║      delivered fires order auto-complete; returned generates new returnedPno). type enum║
+ * ║      catches admin re-running different webhook type on same ticket → 409.              ║
+ * ║    • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.   ║
+ * ║    • Backward compat: missing X-Idempotency-Key header = byte-identical V.34.3 behavior.║
  * ║  Version: V.34.3 (2026-04-30) — Round 39 batch 17: Idempotency-Key on 3 Flash admin     ║
  * ║    setup endpoints (push toward 45% milestone — 84/196 = 42.9%):                        ║
  * ║    • POST /b2b/v1/flash-webhook-setup — bulk-shape {webhook_url, codes:[0,1,2,3,4]}.    ║
@@ -869,7 +882,39 @@ function b2b_rest_flash_test_run_step( WP_REST_Request $req ) {
     if (!$tid || get_post_type($tid) !== 'b2b_order')
         return new WP_REST_Response(array('success'=>false,'message'=>'Invalid ticket'),400);
 
+    // ── V.34.4 Round 44 batch 22: Idempotency-Key support ──
+    // sysadmin double-click on slow Flash dispatch → 2× expensive operations per step.
+    // Body hash = {ticket_id, step} — step enum discriminator catches admin re-running
+    // different step on same ticket → 409. Same step replay → cached 200 → single op.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::flash-test/run-step';
+    $idem_body = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'ticket_id' => $tid,
+            'step'      => $step,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $log = array();
+
+    // V.34.4 Round 44: wrap switch in IIFE to capture response → store cached → return.
+    // Pattern preserves all existing case returns intact (zero refactoring of 200+ LOC).
+    $response = ( function() use ( $req, $tid, $step, &$log ) {
 
     switch ($step) {
         case 'check_address':
@@ -1124,6 +1169,19 @@ function b2b_rest_flash_test_run_step( WP_REST_Request $req ) {
         default:
             return new WP_REST_Response(array('success'=>false,'message'=>'Unknown step: '.$step),400);
     }
+
+    } )();
+
+    // V.34.4 Round 44: store cached response on success (idempotency wrapper exit).
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        $resp_data = ( $response instanceof WP_REST_Response ) ? $response->get_data() : null;
+        $resp_code = ( $response instanceof WP_REST_Response ) ? $response->get_status() : 200;
+        if ( is_array( $resp_data ) && ! empty( $resp_data['success'] ) && $resp_code >= 200 && $resp_code < 300 ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp_data, array( '_idem_code' => $resp_code ) ), $resp_code );
+        }
+    }
+    return $response;
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
@@ -1140,8 +1198,40 @@ function b2b_rest_flash_test_simulate_webhook( WP_REST_Request $req ) {
     if (!$tid || get_post_type($tid) !== 'b2b_order')
         return new WP_REST_Response(array('success'=>false,'message'=>'Invalid ticket'),400);
 
+    // ── V.34.4 Round 44 batch 22: Idempotency-Key support ──
+    // Admin re-fires webhook simulator double-click → 2× state-mutation per type (e.g.
+    // delivered fires order auto-complete; returned generates new returnedPno; weight/price
+    // overwrites prior data). Body hash = {ticket_id, type} — type enum discriminator
+    // catches admin re-running different webhook type on same ticket → 409.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($req) : '';
+    $idem_namespace = 'b2b/v1::flash-test/simulate-webhook';
+    $idem_body = null;
+    if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+        $idem_body = array(
+            'ticket_id' => $tid,
+            'type'      => $type,
+        );
+        $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if (is_wp_error($cached)) {
+            $err_data = $cached->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_Error('idempotency_conflict',
+                'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                array('status' => $status_code));
+        }
+        if (is_array($cached)) {
+            $resp = $cached;
+            unset($resp['_idem_code']);
+            return rest_ensure_response($resp);
+        }
+    }
+
     $pnos = get_post_meta($tid, '_flash_tracking_numbers', true) ?: array();
     $pno = !empty($pnos) ? $pnos[0] : 'TEST-' . $tid;
+
+    // V.34.4 Round 44: wrap switch in IIFE to capture response → store cached → return.
+    $response = ( function() use ( $req, $tid, $type, $pno ) {
 
     switch ($type) {
         case 'picked_up': // State 1
@@ -1200,6 +1290,19 @@ function b2b_rest_flash_test_simulate_webhook( WP_REST_Request $req ) {
         default:
             return new WP_REST_Response(array('success'=>false,'message'=>'Unknown type: '.$type),400);
     }
+
+    } )();
+
+    // V.34.4 Round 44: store cached response on success (idempotency wrapper exit).
+    if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+        $resp_data = ( $response instanceof WP_REST_Response ) ? $response->get_data() : null;
+        $resp_code = ( $response instanceof WP_REST_Response ) ? $response->get_status() : 200;
+        if ( is_array( $resp_data ) && ! empty( $resp_data['success'] ) && $resp_code >= 200 && $resp_code < 300 ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp_data, array( '_idem_code' => $resp_code ) ), $resp_code );
+        }
+    }
+    return $response;
     } catch ( \Throwable $e ) {
         b2b_log('[AdminDash] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'Internal error'), 500);
