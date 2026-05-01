@@ -1,6 +1,29 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Distributor Onboarding Wizard         ║
+ * ║  Version: V.1.1 (2026-04-30) — Round 48 batch 26: Idempotency-Key ║
+ * ║    on 2 onboard endpoints (push toward 70% milestone — 129/196     ║
+ * ║    = 65.8%):                                                       ║
+ * ║    • POST /dinoco/v1/onboard/check-group-id — admin "ตรวจสอบ"      ║
+ * ║      double-click on slow get_posts meta_query → 2× DB scan        ║
+ * ║      ~5K distributor rows × 2 = 10K row scans + UI flicker.        ║
+ * ║      Body hash = {group_id, exclude_id} — different group_id mid-  ║
+ * ║      retry → 409 (admin pasted wrong group_id then corrected).     ║
+ * ║      Storage idempotent BUT prevents UX confusion + DB load.       ║
+ * ║    • POST /dinoco/v1/onboard/save — CRITICAL retry-prone: admin    ║
+ * ║      "Save" double-click on slow wp_insert_post + 10× ACF          ║
+ * ║      update_field → race window allows 2× distributor CPT          ║
+ * ║      creation with same line_group_id (uniqueness check passes     ║
+ * ║      for 1st request, microsecond gap before commit, 2nd request   ║
+ * ║      sees no dup yet, both succeed). Body hash = {shop_name,       ║
+ * ║      line_group_id, rank_system, credit_limit, credit_term_days}   ║
+ * ║      core — admin renamed shop mid-retry → 409 catches business    ║
+ * ║      decision change. Same dataset retry → cached 200 returns      ║
+ * ║      first dist_id (admin's intent).                               ║
+ * ║    Backward compat: missing X-Idempotency-Key = byte-identical     ║
+ * ║    V.1.0 behavior. /onboard/test-bot NOT wrapped (rate-limited     ║
+ * ║    5/min already + non-mutation LINE push admin can retry).       ║
+ * ║                                                              ║
  * ║  Version: V.1.0 (2026-04-24) — Initial release (Journey D)   ║
  * ║  DB_ID: (pending — populate after first WP Code Snippets sync) ║
  * ║  Description: 5-step wizard to onboard a new distributor in   ║
@@ -116,6 +139,35 @@ if ( ! function_exists( 'dinoco_onboard_rest_check_group_id' ) ) {
                 array( 'status' => 400 ) );
         }
 
+        // ── V.1.1 Round 48 batch 26: Idempotency-Key support ──
+        // Admin "ตรวจสอบ" double-click on slow get_posts meta_query → 2× DB scan ~5K
+        // distributor rows × 2 = 10K row scans + UI flicker. Body hash = {group_id,
+        // exclude_id} — different group_id mid-retry → 409 (admin pasted wrong then
+        // corrected). Storage is idempotent (read-only) but reduces DB load on retry.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco/v1::onboard/check-group-id';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'group_id'   => $group_id,
+                'exclude_id' => $exclude_id,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code ) );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         // Search distributor CPT by line_group_id meta
         $existing = get_posts( array(
             'post_type'      => 'distributor',
@@ -136,15 +188,20 @@ if ( ! function_exists( 'dinoco_onboard_rest_check_group_id' ) ) {
         }
 
         if ( empty( $existing ) ) {
-            return rest_ensure_response( array(
+            $resp = array(
                 'success'   => true,
                 'available' => true,
                 'group_id'  => $group_id,
-            ) );
+            );
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+            }
+            return rest_ensure_response( $resp );
         }
 
         $conflict_id = (int) $existing[0];
-        return rest_ensure_response( array(
+        $resp = array(
             'success'   => true,
             'available' => false,
             'group_id'  => $group_id,
@@ -153,7 +210,12 @@ if ( ! function_exists( 'dinoco_onboard_rest_check_group_id' ) ) {
                 'title'        => get_the_title( $conflict_id ),
                 'line_group_id' => $group_id,
             ),
-        ) );
+        );
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -301,6 +363,40 @@ if ( ! function_exists( 'dinoco_onboard_rest_save' ) ) {
             return new WP_Error( 'bad_term', 'credit_term_days อยู่ในช่วง 1 ถึง 365', array( 'status' => 400 ) );
         }
 
+        // ── V.1.1 Round 48 batch 26: Idempotency-Key support ──
+        // CRITICAL retry-prone: admin "Save" double-click on slow wp_insert_post + 10×
+        // ACF update_field → race window allows 2× distributor CPT creation with same
+        // line_group_id (uniqueness check passes for 1st request, microsecond gap before
+        // commit, 2nd request sees no dup yet, both succeed). Body hash = {shop_name,
+        // line_group_id, rank_system, credit_limit, credit_term_days} core — admin
+        // renamed shop / changed credit mid-retry → 409 catches business decision change.
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco/v1::onboard/save';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'shop_name'        => $shop_name,
+                'line_group_id'    => $line_group_id,
+                'rank_system'      => $rank_system,
+                'credit_limit'     => $credit_limit,
+                'credit_term_days' => $credit_term_days,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error( 'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code ) );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         // Uniqueness re-check (defense-in-depth — frontend already checked)
         $dup = get_posts( array(
             'post_type'      => 'distributor',
@@ -422,7 +518,7 @@ if ( ! function_exists( 'dinoco_onboard_rest_save' ) ) {
                 . ' tier=' . $rank_system . ' admin=' . $uid );
         }
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success'  => true,
             'dist_id'  => $dist_id,
             'edit_url' => admin_url( 'post.php?post=' . $dist_id . '&action=edit' ),
@@ -437,7 +533,18 @@ if ( ! function_exists( 'dinoco_onboard_rest_save' ) ) {
                 'bot_enabled'    => $bot_enabled,
             ),
             'message' => 'สร้างตัวแทน "' . $shop_name . '" สำเร็จ',
-        ) );
+        );
+
+        // ── V.1.1 Round 48 batch 26: store cached response on success ──
+        // Replay returns same dist_id (admin's intent on retry — same created distributor).
+        // Errors above (uniqueness rejection / validation fail / wp_insert_post fail) are
+        // NOT cached so legitimate retry cycle works after admin fixes the offending field.
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ), 200 );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 

@@ -3,6 +3,25 @@
  * [Admin System] DINOCO Brand Voice Pool
  * Shortcode: [dinoco_brand_voice]
  * Description: เก็บเสียงลูกค้าจากโซเชียล — วิเคราะห์แบรนด์ DINOCO vs คู่แข่ง
+ * Version: V.2.13 (2026-04-30) — Round 48 batch 26 — Idempotency-Key on 2 entries POST
+ *   endpoints (push toward 70% milestone — 129/196 = 65.8%):
+ *   • POST /brand-voice/v1/entries — Chrome extension single entry create — slow
+ *     wp_insert_post + 5-10x update_post_meta + bv_invalidate_stats_cache → ext retries
+ *     on flaky network → 2× brand_voice CPT row + 2× sentiment counter inflation +
+ *     duplicate analytics signal corruption. Existing dedup (24h transient by source_url +
+ *     content_hash) protects identical {url, content, brands} but NOT 2× DB writes when
+ *     extension generates fresh key per click. Body hash = {source_url, content_hash:
+ *     md5(author|content[:100]|brands_csv), platform} — mirrors handler dedup logic
+ *     deterministically. Different content mid-retry → 409 surfaces sentiment edit
+ *     accident. Errors (e.g. duplicate 409 from existing transient) NOT cached so
+ *     legitimate retry cycle works.
+ *   • POST /brand-voice/v1/entries/batch — Chrome extension bulk entries (max 50)
+ *     — sysadmin import double-click → 2× full loop = up to 100 wp_insert_post + 250-
+ *     500 update_post_meta + 50× bv_invalidate_stats_cache calls → analytics signal
+ *     storm. Body hash = bulk-shape {entries[]: sorted by content_hash} — order-stable
+ *     hash so admin uploading same dataset = cached 200 instant; different rows
+ *     mid-retry → 409 catches admin re-uploading partial batch.
+ *   Backward compat: missing X-Idempotency-Key = byte-identical V.2.12 behavior.
  * Version: V.2.12 (2026-04-30) — Round 44 batch 22 — Idempotency-Key on 2 Brand Voice
  *   API-key admin endpoints (push toward 60% milestone — 109/196 = 55.6%):
  *   • POST /brand-voice/v1/api-keys/generate — admin "Generate Key" double-click on slow
@@ -551,9 +570,54 @@ add_action('rest_api_init', function() {
             $body = $req->get_json_params();
             if (empty($body)) return new WP_Error('bad_request', 'JSON body required', ['status' => 400]);
 
+            // ── V.2.13 Round 48 batch 26: Idempotency-Key support ──
+            // Extension single entry create — slow wp_insert_post + 5-10× update_post_meta
+            // → ext retries on flaky → 2× CPT row + 2× sentiment counter + duplicate
+            // analytics signal corruption. Body hash mirrors existing dedup_key (md5 of
+            // author|content[:100]|brands_csv) + source_url + platform — deterministic.
+            $idem_key = function_exists('dinoco_idempotency_extract_key')
+                ? dinoco_idempotency_extract_key($req) : '';
+            $idem_namespace = 'brand-voice/v1::entries';
+            $idem_body = null;
+            if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+                $brands_arr = is_array($body['brands'] ?? null) ? (array) $body['brands'] : [];
+                sort($brands_arr);
+                $brands_csv = implode(',', array_map('sanitize_text_field', $brands_arr));
+                $content_hash = md5(
+                    ($body['author_name'] ?? '') . '|'
+                    . mb_substr((string) ($body['content'] ?? ''), 0, 100) . '|'
+                    . $brands_csv
+                );
+                $idem_body = array(
+                    'source_url'   => esc_url_raw((string) ($body['source_url'] ?? '')),
+                    'content_hash' => $content_hash,
+                    'platform'     => sanitize_text_field((string) ($body['platform'] ?? 'other')),
+                );
+                $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+                if (is_wp_error($cached)) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+                    return new WP_Error('idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array('status' => $status_code));
+                }
+                if (is_array($cached)) {
+                    $resp = $cached;
+                    $code = isset($resp['_idem_code']) ? (int) $resp['_idem_code'] : 201;
+                    unset($resp['_idem_code']);
+                    return new WP_REST_Response($resp, $code);
+                }
+            }
+
             $result = $save_single_entry($body);
             if ($result['status'] === 'created') {
-                return new WP_REST_Response(['success' => true, 'entry_id' => $result['entry_id']], 201);
+                $resp = ['success' => true, 'entry_id' => $result['entry_id']];
+                // Store cached response on success only (errors not cached — admin retries).
+                if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+                    dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                        array_merge($resp, array('_idem_code' => 201)), 201);
+                }
+                return new WP_REST_Response($resp, 201);
             } elseif ($result['status'] === 'duplicate') {
                 return new WP_REST_Response(['success' => false, 'code' => 'duplicate', 'message' => $result['message']], 409);
             }
@@ -575,6 +639,56 @@ add_action('rest_api_init', function() {
                 return new WP_Error('bad_request', 'Max 50 entries per batch', ['status' => 400]);
             }
 
+            // ── V.2.13 Round 48 batch 26: Idempotency-Key support ──
+            // Extension bulk import (max 50) — sysadmin double-click → 2× full loop = up
+            // to 100 wp_insert_post + 250-500 update_post_meta + 50× cache invalidation
+            // → analytics signal storm. Body hash = bulk-shape {entries[]: per-row
+            // content_hash, source_url, platform — sorted by content_hash for
+            // determinism}. Same dataset retry = cached 200; different rows mid-retry
+            // → 409 catches admin re-uploading partial batch.
+            $idem_key = function_exists('dinoco_idempotency_extract_key')
+                ? dinoco_idempotency_extract_key($req) : '';
+            $idem_namespace = 'brand-voice/v1::entries-batch';
+            $idem_body = null;
+            if ($idem_key !== '' && function_exists('dinoco_idempotency_check')) {
+                $row_hashes = array();
+                foreach ($entries as $entry) {
+                    if (!is_array($entry)) continue;
+                    $brands_arr = is_array($entry['brands'] ?? null) ? (array) $entry['brands'] : [];
+                    sort($brands_arr);
+                    $brands_csv = implode(',', array_map('sanitize_text_field', $brands_arr));
+                    $row_hashes[] = array(
+                        'h'   => md5(
+                            ($entry['author_name'] ?? '') . '|'
+                            . mb_substr((string) ($entry['content'] ?? ''), 0, 100) . '|'
+                            . $brands_csv
+                        ),
+                        'url' => esc_url_raw((string) ($entry['source_url'] ?? '')),
+                        'plt' => sanitize_text_field((string) ($entry['platform'] ?? 'other')),
+                    );
+                }
+                // Sort by content_hash for deterministic order (admin re-uploading rows in
+                // different sequence = same idempotent dataset).
+                usort($row_hashes, function($a, $b) { return strcmp($a['h'], $b['h']); });
+                $idem_body = array(
+                    'count' => count($row_hashes),
+                    'rows'  => $row_hashes,
+                );
+                $cached = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+                if (is_wp_error($cached)) {
+                    $err_data = $cached->get_error_data();
+                    $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int) $err_data['status'] : 409;
+                    return new WP_Error('idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array('status' => $status_code));
+                }
+                if (is_array($cached)) {
+                    $resp = $cached;
+                    unset($resp['_idem_code']);
+                    return new WP_REST_Response($resp, 200);
+                }
+            }
+
             $results = [];
             $created = 0;
             foreach ($entries as $i => $entry) {
@@ -584,10 +698,15 @@ add_action('rest_api_init', function() {
                 if ($r['status'] === 'created') $created++;
             }
 
-            return new WP_REST_Response([
+            $resp = [
                 'success' => true, 'total' => count($entries),
                 'created' => $created, 'results' => $results,
-            ], 200);
+            ];
+            if ($idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store')) {
+                dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                    array_merge($resp, array('_idem_code' => 200)), 200);
+            }
+            return new WP_REST_Response($resp, 200);
         },
     ]);
 
