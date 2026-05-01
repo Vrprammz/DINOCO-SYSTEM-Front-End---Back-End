@@ -372,16 +372,15 @@ return $res;
 - **`[Admin System] DINOCO Global Inventory Database` V.45.3** — `dip-stock/approve` (Round 27)
 - **`[LIFF AI] Snippet 1` V.1.11** — `lead/{id}/accept` (Round 26)
 
-**Status**: 🎯 **59/196 POST endpoints integrated (30.1% — Round 34 TRUE 30% milestone)** against authoritative Round 30 census denominator. Past 3/10 of mutating REST surface.
+**Status**: 🎯🎯🎯 **99/196 POST endpoints integrated (50.5% — Round 42 50% MAJOR MILESTONE REACHED ⭐⭐⭐)** against authoritative Round 30 census denominator. **24-round sustained Idempotency-Key campaign Rounds 18-42** — first sustained milestone past **1/2 of POST surface** integrated. (Earlier annotation: 59/196 = 30.1% TRUE 30% milestone Round 34.)
 
-Cumulative test coverage: **236 contract test cases** (3-9 per endpoint depending on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php` plus 6 fixture-based round files (`IdempotencyRound29Test.php` ... `Round34Test.php`).
+Cumulative test coverage: **382 contract test cases** (3-9 per endpoint depending on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php` plus fixture-based round files (`IdempotencyRound29Test.php` ... `Round42Test.php`).
 
 **Tracker**: see [`docs/audit/IDEMPOTENCY-COVERAGE.md`](../audit/IDEMPOTENCY-COVERAGE.md) for the full list of integrated + pending endpoints + recommended next picks.
 
-**Recommendation**: Round 35 candidates = MCP cluster (`dashboard-inject-metrics` +
-`lead-attribution` + `inventory-changed` + `kb-updated` + `product-compatibility`).
-Pivot candidates: Sentry canary observation / Vite LIFF bundle staging / B2F CPT
-final drop. 50% milestone (~98 endpoints) realistic timeline Round 50+.
+**Pattern maturity at Round 42**: **7 patterns observed** across 24 rounds — single (most common ~75 of 99) / bulk (sorted-by-key arrays — ~10 instances) / bulk-of-targets (notify_tickets[] sort + dedup — Round 28) / state-machine (status enum + actor — Round 23/40) / boolean-discriminator + enum-discriminator (toggle-bot Round 34 / shipping-defaults Round 40) / constant-marker (4 instances — stock/initialize R30 + manual-flash-test R32 + daily-summary R39 + dip-stock/start R40) / **binary-fingerprint NEW R42** (upload-image — sha1_file fingerprint, see Pattern 7 below).
+
+**Recommendation**: **Round 43+ slow-down** to 1-2 weeks production canary observation before continuing toward 60% milestone (~118/196 endpoints, Round 47+ realistic). The 50% milestone marks a natural pause point — sustained 24-round campaign deserves a check-in window. Pattern playbook is mature; future rounds expected to reuse existing patterns rather than introduce new ones (until ~70% coverage when remaining endpoints will likely be edge cases).
 
 ## Round 18-34 case study patterns
 
@@ -460,6 +459,61 @@ state flip. Complements existing transient/lock-based dedup.
 **Use when**: endpoint has a boolean/enum that flips intent. Without the field
 in hash, silent replay corrupts state in ways the dedup guard (transient/FSM)
 can't see.
+
+### Pattern 6 — `constant-marker` (no body params — 4 instances)
+
+Endpoints that take NO meaningful body params (action implicit in URL or
+server-side state). Use a constant marker like `{action: 'start'}` so hash
+extraction works consistently. Hash itself isn't discriminating intent —
+namespace gate at `idempotency_check()` layer is the sole separator.
+
+**Reference impls**:
+- `POST /dinoco-stock/v1/stock/initialize` (Round 30) — `{action: 'init'}`
+- `POST /b2b/v1/manual-flash-test` (Round 32) — `{action: 'test'}`
+- `POST /b2b/v1/daily-summary` (Round 39) — `{action: 'trigger-summary'}`
+- `POST /dinoco-stock/v1/dip-stock/start` (Round 40) — `{action: 'start'}`
+
+**Use when**: handler takes no body params. The constant marker keeps the
+helper signature consistent — wrapper still extracts a hash even though the
+hash is identical for all calls within the namespace.
+
+### Pattern 7 — `binary-fingerprint` (NEW Round 42 — upload endpoints with file content)
+
+Multipart form upload endpoints with binary blob (image, PDF, etc.). Storing
+raw binary in the body hash would explode the `idempotency_keys` table
+(5MB image × N retries × N admins). Use a content fingerprint (`sha1_file()`)
+as a hash field — distinguishes "same file vs different file" without
+storing binary.
+
+**Reference impl**:
+- `POST /dinoco-stock/v1/product/upload-image` (Round 42, Inventory V.45.9) —
+  body hash `{sku, filename, size, content_sha1}`. `content_sha1 = sha1_file($_FILES['product_image']['tmp_name'])` computed once (~50ms for 5MB). Same image retry = idempotent replay (admin sees "already uploaded"). Different content_sha1 = 409 (admin selected wrong file mid-retry, prevents wrong image stuck on SKU).
+
+```php
+// GOOD — binary-fingerprint pattern
+$content_sha1 = @sha1_file($_FILES['product_image']['tmp_name']);
+$idem_body = array(
+    'sku'          => $sku,
+    'filename'     => sanitize_file_name($_FILES['product_image']['name'] ?? ''),
+    'size'         => intval($_FILES['product_image']['size'] ?? 0),
+    'content_sha1' => $content_sha1 ?: '',
+);
+```
+
+**Use when**: endpoint accepts binary upload via multipart form. Binary itself
+must be EXCLUDED from hash (table explosion). Fingerprint distinguishes file
+identity without storing bytes. Compare with parent pattern "image_base64
+EXCLUDED" (slip-upload R37 + combined-slip-upload R29) which omits binary
+entirely with no fingerprint — that variant is fine for endpoints where
+"same ticket retry = same intent regardless of which image was attached"
+(payment slip upload). The NEW binary-fingerprint variant adds file-identity
+check for endpoints where "same SKU but different image = admin error to
+catch via 409" (catalog product image upload).
+
+**Pattern selection guide**: image_base64 EXCLUDED variant (no fingerprint)
+when endpoint is "outcome-oriented" (payment confirmed regardless of slip
+photo); binary-fingerprint variant (sha1_file) when endpoint is
+"file-identity-oriented" (catalog image must match admin's intended file).
 
 ## Anti-patterns spotted across rounds
 
