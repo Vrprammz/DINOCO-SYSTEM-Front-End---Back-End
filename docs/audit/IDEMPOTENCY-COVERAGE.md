@@ -17,11 +17,11 @@
 
 | Metric | Count |
 |--------|-------|
-| Total integrated endpoints | **64** (+5 new — Round 35 batch 13: dashboard-inject-metrics, lead-attribution, inventory-changed, kb-updated, product-compatibility — all `/dinoco-mcp/v1/*` OpenClaw retry-prone) |
+| Total integrated endpoints | **69** (+5 new — Round 36 batch 14: bo-reject, flash-cancel, flash-cancel-notify, flash-switch-manual, stock/hold — pivot from MCP saturated cluster to B2B admin Flash + BO + inventory long tail per Round 35 recommendation) |
 | **Total POST endpoints (Round 33 fresh census)** | **196** (+3 since Round 30 — natural growth, see [REST-ENDPOINT-CENSUS-2026-04-30.md](./REST-ENDPOINT-CENSUS-2026-04-30.md)) |
-| Coverage | **64 / 196 = 32.7%** of POST endpoints — sustained progress past 30% milestone after Round 34. MCP cluster coverage = **13/17 = ~76%** (high-coverage cluster — see "MCP Cluster Coverage" section below) |
-| Cumulative test cases | 254 (Round 19-35 — Round 35 added 18) |
-| Body-shape distinct hashes asserted | 63 (Round 35: +5 new — all unique; 2 cross-namespace pair guards added — dashboard-inject-metrics vs lead-attribution + inventory-changed vs kb-updated) |
+| Coverage | **69 / 196 = 35.2%** of POST endpoints — **🎯 35% milestone achieved (Round 36)**. B2B namespace coverage = **27/56 ≈ 48%** (highest absolute count). MCP cluster coverage = **13/17 = ~76%** (saturated, no further candidates). |
+| Cumulative test cases | 273 (Round 19-36 — Round 36 added 19) |
+| Body-shape distinct hashes asserted | 68 (Round 36: +5 new — all unique; 3 cross-namespace pair guards — flash-cancel vs flash-cancel-notify body shape match guard + bo-reject vs flash-switch-manual + stock-hold vs flash-cancel) |
 
 > **Round 30 note**: Earlier rounds reported coverage against a conservative
 > "~75 POST endpoints" estimate. The Round 30 REST endpoint census
@@ -66,7 +66,8 @@
 | **27.6% (Round 33)** | **33** | **2026-04-30** | +5 endpoints (54/196 — denominator refreshed Round 33 to 196 from 193, +3 natural growth). Batch 11: maker-product + maker + po-undo-submit (B2F CRUD/admin) + distributor-notify + customer-link (MCP OpenClaw retry-prone). 19 B2F + 22 B2B + 8 inventory + 5 MCP. Drift detector extended (4 → 5 tests) — POST-only assertion guards against accidentally adding read-only endpoints to tracker. |
 | 🎯 **30.1% (Round 34 — TRUE 30% milestone)** ⭐ | **34** | **2026-04-30** | +5 endpoints (59/196). Batch 12: bo-clear-enum-flag (B2B admin flag reset) + kb-suggest + brand-voice-submit (MCP chatbot signals) + distributor/delete + distributor/toggle-bot (B2B admin distributor management). 19 B2F + 24 B2B + 8 inventory + 7 MCP. **First sustained 30% milestone against authoritative Round 30 census denominator** — past 3/10 of POST surface. 5 distinct patterns observed across Rounds 18-34 (single / bulk / bulk-of-targets / state-machine / boolean-discriminator + enum-discriminator) — see [`docs/patterns/IDEMPOTENCY-KEY.md`](../patterns/IDEMPOTENCY-KEY.md) "Round 18-34 case study patterns". |
 | **32.7% (Round 35 — MCP cluster ~76%)** | **35** | **2026-04-30** | +5 endpoints (64/196). Batch 13 — all `/dinoco-mcp/v1/*` retry-prone OpenClaw signals: dashboard-inject-metrics (FB/IG metrics — inflated KPI guard) + lead-attribution (revenue double-count guard, event enum discriminator) + inventory-changed (stock webhook, action enum) + kb-updated (Qdrant rebuild webhook, trigger_source discriminator) + product-compatibility (catalog query — chatbot retry compute saver, brand+model normalized). 19 B2F + 24 B2B + 8 inventory + **12 MCP** (13/17 POST = 76% MCP namespace coverage). Pattern: 4× "compute-only/log-only" cache + 1× analytics signature hash. |
-| Target: 35% | future | TBD | Need +5 more endpoints (~69/196). Realistic timeline: Rounds 36-37 (B2B/B2F long tail). |
+| 🎯 **35.2% (Round 36 — TRUE 35% milestone)** ⭐ | **36** | **2026-04-30** | +5 endpoints (69/196). Batch 14 — pivot from saturated MCP cluster to B2B admin Flash + BO + inventory long tail per Round 35 recommendation: bo-reject (admin pending_stock_review reject — customer Flex spam guard + counter decrement integrity) + flash-cancel (Flash per-PNO API charge guard + 1015 dedup) + flash-cancel-notify (pickup cancel — shares shape with flash-cancel via namespace discriminator) + flash-switch-manual (RPi duplicate manual label print guard + admin Flex spam dedup) + stock/hold (boolean-discriminator: hold/release flip caught by hash). 19 B2F + **27 B2B** + **9 inventory** + 13 MCP. **First 35% milestone past 7/20 of POST surface. B2B namespace passes ~48% (highest absolute count).** Pattern: 1× state-machine-enum (FSM cancellation) + 4× single (3 ticket-scoped flash + 1 boolean-discriminator inventory). |
+| Target: 40% | future | TBD | Need +9 more endpoints (~78/196). Realistic timeline: Rounds 37-38. |
 | Target: 50% | future | TBD | ~98 endpoints — major sustained effort across 10+ rounds. Realistic timeline: Round 50+ |
 
 > **Why no 50% milestone in Round 30**: User-facing milestone celebration in the
@@ -147,12 +148,18 @@
 | 63 | `POST /dinoco-mcp/v1/inventory-changed` | `[System] DINOCO MCP Bridge` V.2.8 | single (action enum in/out/hold/release + UPPER sku) | **35** | **integrated** |
 | 64 | `POST /dinoco-mcp/v1/kb-updated` | `[System] DINOCO MCP Bridge` V.2.8 | single (trigger_source admin_save vs bulk_import — Qdrant rebuild scope) | **35** | **integrated** |
 | 65 | `POST /dinoco-mcp/v1/product-compatibility` | `[System] DINOCO MCP Bridge` V.2.8 | single (brand+model normalized via mb_strtolower + trim — catalog query cache) | **35** | **integrated** |
+| 66 | `POST /b2b/v1/bo-reject` | `[B2B] Snippet 16` V.3.9 | single (order_id + reason discriminator — admin-edited reason text in audit/Flex) | **36** ⭐ | **integrated** |
+| 67 | `POST /b2b/v1/flash-cancel` | `[B2B] Snippet 5` V.33.8 | single (ticket_id — Flash per-PNO API charge guard + 1015 misleading code dedup) | **36** ⭐ | **integrated** |
+| 68 | `POST /b2b/v1/flash-cancel-notify` | `[B2B] Snippet 5` V.33.8 | single (ticket_id — shares shape with flash-cancel; namespace-discriminated) | **36** ⭐ | **integrated** |
+| 69 | `POST /b2b/v1/flash-switch-manual` | `[B2B] Snippet 5` V.33.8 | single (ticket_id — RPi duplicate manual label print guard + admin Flex spam dedup) | **36** ⭐ | **integrated** |
+| 70 | `POST /dinoco-stock/v1/stock/hold` | `[Admin System] DINOCO Global Inventory Database` V.45.6 | **boolean-discriminator** (sku UPPER + hold flip caught by hash; release-after-hold = 409) | **36** ⭐ | **integrated** |
 
-> Note: numbering goes to 65 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
-> delete-ticket (32) + recalculate-total (33) share body shape — all namespace-discriminated. Total
-> integrated endpoint count = 64 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
+> Note: numbering goes to 70 because bo-confirm-full (15) + bo-undo-split (17) share body shape +
+> delete-ticket (32) + recalculate-total (33) share body shape +
+> flash-cancel (67) + flash-cancel-notify (68) share body shape — all namespace-discriminated. Total
+> integrated endpoint count = 69 (Round 28: 28 + Round 29: +5 + Round 30: +6 — incl. F1 drift fix
 > for bo-fulfill which had no actual wrapper despite tracker entry + Round 31: +5 + Round 32: +5
-> + Round 33: +5 + Round 34: +5 + Round 35: +5).
+> + Round 33: +5 + Round 34: +5 + Round 35: +5 + Round 36: +5).
 >
 > **Round 29 drift-sweep finding (DRIFT-SWEEP-ROUND-29.md F1) — RESOLVED in Round 30**: `bo-fulfill`
 > (#14, Round 19) was listed as "integrated" but actual code had NO wrapper. **Round 30 fixed**:
@@ -173,29 +180,54 @@
 
 ---
 
-## Pending POST endpoints (Round 36+ candidates)
+## Pending POST endpoints (Round 37+ candidates)
 
-### High priority (next 5 picks — Round 36 candidates to push toward 35% milestone)
+### Round 36 audit findings (Snippet 3 POST audit)
 
-> **MCP namespace nearly exhausted** — 13/17 POST endpoints integrated (Rounds 19-35). Remaining
-> 4 MCP POST routes are either GET in disguise (returning data without side-effects) or already
-> have natural dedup (e.g. claim-manual-list returns existing rows). Future rounds should pivot
-> to **B2B/B2F long tail** (admin print/RPi/finance flows) where retry-prone hot paths remain.
+> **Snippet 3 POST endpoint audit (Round 36)**: 26 POST endpoints in `[B2B] Snippet 3`,
+> 8 currently integrated (place-order, manual-flash-create, cancel-request, manual-flash-cancel,
+> admin-stock-unlock, admin-stock-mark-oos, admin-submit-tracking, combined-slip-upload,
+> manual-flash-ready, delete-ticket equivalent — see table). **18 unwrapped POST endpoints
+> remain in Snippet 3** — listed below by retry-risk priority.
+>
+> **Endpoints found NOT to exist as POST routes** (Round 36 verification): `manual-reprint`,
+> `system-check`, `po-image` are referenced in CLAUDE.md but registered as GET-only OR
+> registered in different sensitive snippet (Snippet 1 — out of scope per user policy).
+> Tracker pivoted to verified-existing routes (bo-reject, flash-cancel, flash-cancel-notify,
+> flash-switch-manual, stock/hold) for batch 14.
+
+### High priority (next 5 picks — Round 37 candidates to push toward 40% milestone)
+
+> **B2B/B2F long tail** is the next focus area — Round 36 closed retry-prone Flash + BO admin
+> flows. Round 37+ should target B2F LIFF maker endpoints (e.g. po-history requests, dashboard
+> stat refresh) and inventory bulk operations (warehouse stock scans, dip-stock recount).
 
 | Endpoint | Snippet | Risk if double-fired | Round candidate |
 |----------|---------|----------------------|-----------------|
-| `POST /b2b/v1/manual-reprint` | `[B2B] Snippet 3` | Reprint job dispatch — print queue idempotent at job_id but spam alerts | Round 36 |
-| `POST /b2b/v1/admin-bo-tickets` | `[B2B] Snippet 3` | Admin BO bulk action — already in Snippet 16 cluster but tracker double-check | Round 36 |
-| `POST /b2b/v1/system-check` | `[B2B] Snippet 9` | Ops health probe — log spam guard | Round 36 |
-| `POST /b2f/v1/po-image` | `[B2F] Snippet 10` | PO Image gen — wasted GD compute on retry | Round 36 |
-| `POST /dinoco-stock/v1/stock/hold` | `[Admin System] DINOCO Global Inventory Database` | Stock hold timer — sku × duration discriminator | Round 36 |
+| `POST /b2b/v1/print-test` | `[B2B] Snippet 3` | RPi print test — duplicate test labels printed | Round 37 |
+| `POST /b2b/v1/print-requeue/{ticket_id}` | `[B2B] Snippet 3` | Re-enqueue print — double print of same label | Round 37 |
+| `POST /b2b/v1/rpi-accept-order` | `[B2B] Snippet 3` | RPi acceptance — double FSM transition attempt | Round 37 |
+| `POST /b2b/v1/rpi-flash-ready` | `[B2B] Snippet 3` | Flash ready signal — double notify admin Flex | Round 37 |
+| `POST /b2b/v1/slip-upload` | `[B2B] Snippet 3` | Customer slip upload — duplicate slip verify call (Slip2Go API charge) | Round 37 |
 
-### Medium priority (Round 36+)
+### Medium priority (Round 37+)
 
 | Endpoint | Snippet | Notes |
 |----------|---------|-------|
-| `POST /b2b/v1/print-test` | `[B2B] Snippet 3` | Test endpoint — lower priority |
-| `POST /b2b/v1/manual-reprint` | `[B2B] Snippet 3` | Reprint job dispatch — print queue is idempotent at job_id |
+| `POST /b2b/v1/auth-group` | `[B2B] Snippet 3` | LIFF auth init — natural session token TTL but log spam |
+| `POST /b2b/v1/bo-notify` | `[B2B] Snippet 3` | BO ready notification — already covered upstream by bo-fulfill but standalone retry possible |
+| `POST /b2b/v1/rpi-command` | `[B2B] Snippet 3` | RPi remote command — command_id natural dedup but admin spam guard |
+| `POST /b2b/v1/rpi-flash-box-packed` | `[B2B] Snippet 3` | RPi packing event — double Flash ready transition |
+| `POST /b2b/v1/flash-ship-packed` | `[B2B] Snippet 3` | Flash packing → ship transition |
+| `POST /b2b/v1/manual-flash-status` | `[B2B] Snippet 3` | Manual Flash status check — read-only? Verify in Round 37 |
+| `POST /b2b/v1/test-push` | `[B2B] Snippet 9` | Admin test push — natural rate limit |
+| `POST /b2b/v1/flash-webhook-setup` | `[B2B] Snippet 9` | Flash webhook init — admin one-time setup |
+| `POST /b2b/v1/flash-api-test` | `[B2B] Snippet 9` | Flash API connectivity probe |
+| `POST /b2b/v1/flash-test/run-step` | `[B2B] Snippet 9` | Flash test step runner |
+| `POST /b2b/v1/flash-test/simulate-webhook` | `[B2B] Snippet 9` | Webhook simulator |
+| `POST /b2b/v1/daily-summary` | `[B2B] Snippet 5` | Trigger daily summary cron — log spam guard |
+| `POST /b2b/v1/flash-label` | `[B2B] Snippet 5` | Flash label PDF download — wasted I/O on retry |
+| `POST /b2b/v1/flash-ready-to-ship` | `[B2B] Snippet 5` | Flash ready signal — double customer notify |
 
 ### Low priority (don't need wrapper)
 
@@ -288,10 +320,11 @@ Each integrated endpoint has 3-9 contract tests in
 | **33** | **5** | **18** | **53** (Round 33: +5 new — all unique; 2 cross-namespace pair guards added — maker-product vs maker + distributor-notify vs customer-link) |
 | 🎯 **34** ⭐ | **5** | **18** | **58** (Round 34: +5 new — all unique; 2 cross-namespace pair guards added — distributor-delete vs distributor-toggle-bot + kb-suggest vs brand-voice-submit) |
 | **35** | **5** | **18** | **63** (Round 35: +5 new — all unique; 2 cross-namespace pair guards added — dashboard-inject-metrics vs lead-attribution + inventory-changed vs kb-updated; MCP cluster ~76%) |
+| 🎯 **36** ⭐ | **5** | **19** | **68** (Round 36: +5 new — all unique; 3 cross-namespace pair guards — flash-cancel vs flash-cancel-notify SHAPE-MATCH guard (proves namespace is sole discriminator) + bo-reject vs flash-switch-manual + stock-hold vs flash-cancel; **🎯 35% milestone**) |
 
-Total: **254 contract tests** across 13 rounds (Rounds 19-35). Round 29 introduced
+Total: **273 contract tests** across 14 rounds (Rounds 19-36). Round 29 introduced
 `IdempotencyTestFixture` base class — Round 30+ fully adopt it
-(`IdempotencyRound35Test.php` averages ~5 LOC/test).
+(`IdempotencyRound36Test.php` averages ~5 LOC/test).
 
 ### Fixture refactor (Round 29) {#fixture-refactor}
 
