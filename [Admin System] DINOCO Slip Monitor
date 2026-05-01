@@ -1,6 +1,35 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Slip Monitor                          ║
+ * ║  Version: V.1.15 (2026-04-30) — 🎯 70% MAJOR MILESTONE Round 50 batch 28          ║
+ * ║    idempotency wrap (4 endpoints — Slip Monitor cluster closed):                  ║
+ * ║    POST /dinoco-slip/v1/replay-slip — single {log_id} only. Admin "Replay"        ║
+ * ║      double-click on slow b2b_handle_slip_image cascade (LINE Content download    ║
+ * ║      ~1-2s + Slip2Go API ~1-3s) → cached 200 instant + skip 2× LINE quota burn    ║
+ * ║      + 2× Slip2Go quota burn + possible 2× debt subtract path (d). Different      ║
+ * ║      log_id mid-retry → 409 (admin clicked wrong row).                            ║
+ * ║    POST /dinoco-slip/v1/review-decision — single {log_id, decision, delete_image} ║
+ * ║      Pool sweep double-click → cached 200 + skip 2× audit row "slip_review_       ║
+ * ║      decision" + 2× @unlink image. DB has audit lock (review_decision NOT NULL    ║
+ * ║      → 409) but cached replay extends across full TTL beyond DB lock. Different   ║
+ * ║      decision mid-retry (is_slip vs not_slip vs manual_process) → 409 catches     ║
+ * ║      admin re-evaluation (audit trail integrity).                                 ║
+ * ║    POST /dinoco-slip/v1/ai-toggle — boolean+constant-marker {action:'ai-toggle',  ║
+ * ║      explicit:'on'|'off'|'toggle', user_id}. Admin "🔄 Toggle AI Classifier"      ║
+ * ║      double-click within rate window → cached 200 + skip 2× update_option         ║
+ * ║      flicker + 2× audit_log "config_change". Different explicit mode mid-retry   ║
+ * ║      → 409 (admin re-evaluation toggle vs explicit ON).                           ║
+ * ║    POST /dinoco-slip/v1/issue-credit-note — CRITICAL financial single             ║
+ * ║      {log_id, amount round(2), notify_dist} core. Admin "💰 ออก Credit Note"      ║
+ * ║      double-click on slow b2b_debt_subtract + dinoco_audit_log + slip_log         ║
+ * ║      UPDATE + LINE push chain (~1-3s). DB has GET_LOCK dnc_cn_{log_id} 3s         ║
+ * ║      timeout + credit_note_issued_at NOT NULL → 409 inside lock, but cached       ║
+ * ║      replay extends across full TTL beyond GET_LOCK so retry 5s+ later (lock      ║
+ * ║      released) skips DB round-trip entirely. reason EXCLUDED (audit annotation    ║
+ * ║      — admin may correct text mid-retry; >=10 chars validation enforces           ║
+ * ║      meaningful audit). Different amount mid-retry → 409 catches admin typo —     ║
+ * ║      CRITICAL prevents wrong debt subtract via cached replay (wrong distributor   ║
+ * ║      LINE notify amount + accounting reconciliation drift).                       ║
  * ║  Version: V.1.14 (2026-04-30) — Round 49 batch 27 idempotency wrap (2 endpoints):║
  * ║    POST /dinoco-slip/v1/clear-locks — admin force-unlock + audit row.            ║
  * ║      Body hash: single {group_id, reason} — different reason mid-retry → 409     ║
@@ -1191,6 +1220,38 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_replay_slip' ) ) {
         if ( $log_id <= 0 ) {
             return new WP_Error( 'bad_log_id', 'log_id ไม่ถูกต้อง', array( 'status' => 400 ) );
         }
+
+        // V.1.15 (Round 50 batch 28 — 🎯 70% MAJOR MILESTONE push):
+        // Idempotency-Key wrap. Body hash = single {log_id} only — admin "Replay"
+        // double-click on slow b2b_handle_slip_image cascade (LINE Content download
+        // ~1-2s + Slip2Go API ~1-3s) → 2× LINE quota burn + 2× Slip2Go quota burn +
+        // possible 2× debt subtract path (d) when LINE Content still fresh. Cached
+        // 200 replay skips entire cascade. Different log_id mid-retry → 409 (admin
+        // clicked wrong row — wrong-record replay risk).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-slip/v1::replay-slip';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'log_id' => $log_id,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         global $wpdb;
         $table = $wpdb->prefix . 'dinoco_slip_log';
         $row = $wpdb->get_row( $wpdb->prepare(
@@ -1230,11 +1291,23 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_replay_slip' ) ) {
             return new WP_Error( 'replay_exception', $e->getMessage(), array( 'status' => 500 ) );
         }
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success' => true,
             'log_id'  => $log_id,
             'message' => 'Replay triggered — ดู Recent 50 Attempts ว่า process สำเร็จหรือไม่. ถ้า LINE Content หมดอายุ (>24h) ให้ใช้ Manual Process Tool แทน',
-        ) );
+        );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -1348,6 +1421,43 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_review_decision' ) ) {
                 array( 'status' => 400 ) );
         }
 
+        // V.1.15 (Round 50 batch 28 — 🎯 70% MAJOR MILESTONE push):
+        // Idempotency-Key wrap. Body hash = single {log_id, decision, delete_image}
+        // — admin "บันทึก decision" double-click during pool sweep → 2× UPDATE row +
+        // 2× audit_log "slip_review_decision" + 2× @unlink image (if not_slip). DB
+        // already has audit lock (review_decision NOT NULL → 409) but cached
+        // idempotency replay extends protection across full TTL beyond DB lock so
+        // duplicate audit_log row never even attempts INSERT. Different decision
+        // mid-retry (is_slip vs not_slip vs manual_process) → 409 catches admin
+        // re-evaluation — wrong cached decision via replay would corrupt audit
+        // trail (e.g. is_slip cached but admin decided not_slip → image stays on
+        // disk despite admin intent + audit row says wrong category).
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-slip/v1::review-decision';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'log_id'       => $log_id,
+                'decision'     => $decision,
+                'delete_image' => $delete_image ? 1 : 0,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         global $wpdb;
         $table = $wpdb->prefix . 'dinoco_slip_log';
         $row = $wpdb->get_row( $wpdb->prepare(
@@ -1420,7 +1530,7 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_review_decision' ) ) {
             ) );
         }
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success'       => true,
             'log_id'        => $log_id,
             'decision'      => $decision,
@@ -1430,7 +1540,19 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_review_decision' ) ) {
                 : ( $decision === 'manual_process'
                     ? 'บันทึกแล้ว — ลิงก์กับ manual_process แล้ว'
                     : 'บันทึกแล้ว — รูปถูกลบแล้ว (ไม่ใช่สลิป)' ),
-        ) );
+        );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -1578,16 +1700,54 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_ai_toggle' ) ) {
         if ( ! is_array( $body ) ) $body = array();
 
         $enabled = isset( $body['enabled'] ) ? (bool) $body['enabled'] : null;
+        $explicit_enabled = $enabled; // null = toggle mode, bool = explicit set
         if ( $enabled === null ) {
             // Toggle current value
             $enabled = ! (bool) get_option( 'b2b_slip_ai_classifier_enabled', 1 );
         }
 
+        $uid     = get_current_user_id();
         $new_val = $enabled ? '1' : '0';
+
+        // V.1.15 (Round 50 batch 28 — 🎯 70% MAJOR MILESTONE push):
+        // Idempotency-Key wrap. Body hash = boolean+constant-marker
+        // {action:'ai-toggle', explicit:'on'|'off'|'toggle', user_id} — admin "🔄
+        // Toggle AI Classifier" double-click within rate window (10/min) → 2×
+        // update_option flicker + 2× audit_log row "config_change" + 2× cache
+        // invalidation if downstream Slip2Go listener uses the option. Cached
+        // 200 replay skips entire flip + audit. Different explicit mode mid-
+        // retry (admin decided to set explicit ON instead of toggle) → 409
+        // catches admin re-evaluation. user_id discriminates per-admin.
+        $explicit_marker = ( $explicit_enabled === null ) ? 'toggle' : ( $explicit_enabled ? 'on' : 'off' );
+        $idem_key        = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace  = 'dinoco-slip/v1::ai-toggle';
+        $idem_body       = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'action'   => 'ai-toggle',
+                'explicit' => $explicit_marker,
+                'user_id'  => $uid,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
+
         update_option( 'b2b_slip_ai_classifier_enabled', $new_val, false );
 
         if ( function_exists( 'b2b_log' ) ) {
-            $uid = get_current_user_id();
             b2b_log( '[SlipMonitor] AI classifier toggle → ' . $new_val . ' by user_id=' . $uid );
         }
 
@@ -1605,11 +1765,23 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_ai_toggle' ) ) {
             } catch ( \Throwable $e ) { /* silent */ }
         }
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success' => true,
             'enabled' => (bool) $enabled,
             'message' => $enabled ? 'เปิด AI classifier' : 'ปิด AI classifier (fallback ไป heuristic + Slip2Go)',
-        ) );
+        );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -1780,6 +1952,48 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_issue_credit_note' ) ) {
             return new WP_Error( 'bad_reason', 'ต้องระบุเหตุผลไม่น้อยกว่า 10 ตัวอักษร (audit trail)', array( 'status' => 400 ) );
         }
         if ( mb_strlen( $reason ) > 500 ) $reason = mb_substr( $reason, 0, 500 );
+
+        // V.1.15 (Round 50 batch 28 — 🎯 70% MAJOR MILESTONE — CRITICAL financial):
+        // Idempotency-Key wrap. Body hash = single {log_id, amount round(2),
+        // notify_dist} — admin "💰 ออก Credit Note" double-click on slow chain
+        // (b2b_debt_subtract FOR UPDATE + dinoco_audit_log INSERT + slip_log
+        // UPDATE + LINE push + admin Flex notify ~1-3s). DB layer has GET_LOCK
+        // dnc_cn_{log_id} + credit_note_issued_at NOT NULL → 409 inside lock,
+        // but cached idempotency replay extends protection across full TTL
+        // beyond the 3s GET_LOCK timeout (e.g. admin retry 5s later, lock
+        // released, would re-attempt → DB row check catches it but wastes
+        // round-trip + log noise). Reason EXCLUDED from hash (audit annotation
+        // — admin may correct text mid-retry without 409 noise; reason >=10
+        // chars validation already enforces meaningful audit). Different
+        // amount mid-retry → 409 catches admin typo (CRITICAL: wrong amount
+        // via cached replay = wrong debt subtract = wrong distributor LINE
+        // notify amount). Different log_id mid-retry → 409 catches admin
+        // clicked wrong overpayment row.
+        $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+        $idem_namespace = 'dinoco-slip/v1::issue-credit-note';
+        $idem_body      = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array(
+                'log_id'      => $log_id,
+                'amount'      => round( $amount, 2 ),
+                'notify_dist' => $notify_dist ? 1 : 0,
+            );
+            $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached ) ) {
+                $err_data    = $cached->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_Error(
+                    'idempotency_conflict',
+                    'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน (CRITICAL — credit note ป้องกันการคืนเงินซ้ำ)',
+                    array( 'status' => $status_code )
+                );
+            }
+            if ( is_array( $cached ) ) {
+                $resp = $cached;
+                unset( $resp['_idem_code'] );
+                return rest_ensure_response( $resp );
+            }
+        }
 
         global $wpdb;
         $table = $wpdb->prefix . 'dinoco_slip_log';
@@ -1953,7 +2167,7 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_issue_credit_note' ) ) {
                 . ' audit_id=' . $audit_id );
         }
 
-        return rest_ensure_response( array(
+        $resp = array(
             'success'    => true,
             'log_id'     => $log_id,
             'dist_id'    => $dist_id,
@@ -1963,7 +2177,19 @@ if ( ! function_exists( 'dinoco_slip_monitor_rest_issue_credit_note' ) ) {
             'new_debt'   => round( $new_debt, 2 ),
             'audit_id'   => $audit_id,
             'message'    => 'ออก Credit Note ฿' . number_format( $amount, 2 ) . ' สำเร็จ — หนี้เหลือ ฿' . number_format( $new_debt, 2 ),
-        ) );
+        );
+
+        if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store(
+                $idem_key,
+                $idem_namespace,
+                $idem_body,
+                array_merge( $resp, array( '_idem_code' => 200 ) ),
+                200
+            );
+        }
+
+        return rest_ensure_response( $resp );
     }
 }
 
@@ -1991,7 +2217,7 @@ add_action( 'init', function() {
         'cache_ttl'  => 30,
         'capability' => 'manage_options',
         'order'      => 50,
-        'source'     => '[Admin System] DINOCO Slip Monitor V.1.13',
+        'source'     => '[Admin System] DINOCO Slip Monitor V.1.15',
     ) );
 }, 30 );
 
