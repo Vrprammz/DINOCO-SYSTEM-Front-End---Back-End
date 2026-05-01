@@ -10,6 +10,35 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — 🎯🎯 60% MAJOR MILESTONE — Idempotency-Key middleware integrated to 119/196 POST endpoints (60.7%) — sustained 28-round campaign Rounds 18-46 (2026-04-30) ⭐⭐
+
+**Round 46 closes the 60% MAJOR MILESTONE** — Idempotency-Key middleware now wraps **119/196 POST endpoints (60.7%)** against the Round 30 authoritative census denominator. Past **6/10 of POST surface** integrated. **28-round sustained Idempotency campaign Rounds 18-46** (started with `place-order` + `manual-flash-create` + `create-po` in Round 19; closed 50% milestone in Round 42; reached 60% milestone in Round 46 with mixed-namespace cross-snippet batch). ZERO regressions across **870 PHPUnit (was 854, +16) + 161 Jest** (22 suites — drift detector still green with 119 tracker entries).
+
+#### Phase 1 — Idempotency batch 24 (5 endpoints — 🎯🎯 60% MAJOR MILESTONE)
+
+Cross-snippet 3-file batch closes mixed B2B admin save + LIFF AI lead state cluster:
+
+- **`POST /b2b/v1/manual-flash-status`** — Admin/RPi "เช็คสถานะ Manual Flash" double-click on slow Flash network → 2× `b2b_flash_get_routes(pno)` Flash Routes API quota burn + if `state>0` → 2× `b2b_flash_manual_shipment_webhook(pno)` status mutation + 2× notify spam. Body hash `{pno}` — pno globally unique per shipment.
+- **`POST /b2b/v1/distributor`** — Admin "บันทึกตัวแทน" double-click race → 2× `wp_insert_post` (NEW only) + 2× ACF `update_field` × 15 fields + 2× `b2b_recalculate_debt` potential. Body hash `{id, shop_name, line_group_id}` core — id discriminates create (id=0) vs update (id>0).
+- **`POST /b2b/v1/settings`** — Admin "บันทึกตั้งค่า" double-click → 2× `update_option(b2b_settings)` array overwrite race. Bulk-shape selective hash `{bank_name, bank_account, bank_holder, company_name, promptpay_id}` — fields PRESENT only sorted by ksort.
+- **`POST /b2b/v1/print-settings`** — Admin "บันทึกตั้งค่า Print" double-click → 2× `update_option` × 4 + if `regen=1` → 2× `wp_generate_password` creates **2 different API keys last one wins SECURITY-CRITICAL key rotation race**. Bulk-shape selective with **regen boolean discriminator** — toggling `regenerate_key=true` between retries = 409.
+- **`POST /liff-ai/v1/lead/{id}/status`** — Admin LIFF "เปลี่ยนสถานะ Lead" double-tap on slow MongoDB → 2× POST to agent proxy → 2× lead status update + 2× history insert + 2× downstream notify hooks. Body hash `{lead_id, status, actor_uid from JWT}` — **status enum 17-statuses discriminator**.
+
+Backward compat: missing `X-Idempotency-Key` header = byte-identical to V.42.19 / V.34.4 / V.1.13 behavior.
+
+**Versions**: `[B2B] Snippet 3` V.42.19 → V.42.20, `[B2B] Snippet 9` V.34.4 → V.34.5, `[LIFF AI] Snippet 1` V.1.13 → V.1.14.
+
+**Pattern mix** (Round 46): 3× single + 2× bulk-shape selective (print-settings adds regen boolean discriminator). Pattern maturity unchanged: **7 patterns** (single / bulk / bulk-of-targets / state-machine / boolean+enum-discriminator / constant-marker / binary-fingerprint).
+
+**Coverage breakdown after Round 46**: 21 B2F + **60 B2B** (+4) + 19 inventory + 13 MCP + **4 LIFF AI** (+1) + 2 Brand Voice = **🎯🎯 119/196 = 60.7% MAJOR MILESTONE**.
+
+**Strategic note**: After 🎯🎯 60% MAJOR MILESTONE, recommend slow-down to 1-2 weeks production canary observation matching Round 42 50% pause. 28-round sustained campaign represents significant test infra burden (447 cumulative test cases).
+
+#### Tests + tracker
+
+- `tests/helpers/IdempotencyRound46Test.php` (NEW, 16 tests) — 3 cases per endpoint × 5 endpoints + cumulative no-collision (1).
+- `docs/audit/IDEMPOTENCY-COVERAGE.md` — coverage 114/196 (58.2%) → **🎯🎯 119/196 (60.7%)**. 5 new rows for entries 116-120. Section heading updated. NEW Round 46 milestone row + Round 47+ candidates rewritten.
+
 ### Feature — 🎯🎯🎯 50% MAJOR MILESTONE — Idempotency-Key middleware integrated to 99/196 POST endpoints (50.5%) — sustained 24-round campaign Rounds 18-42 (2026-04-30) ⭐⭐⭐
 
 **Round 42 closes the 50% MAJOR MILESTONE** — Idempotency-Key middleware now wraps **99/196 POST endpoints (50.5%)** against the Round 30 authoritative census denominator. Past **1/2 of POST surface** integrated. **24-round sustained Idempotency campaign Rounds 18-42** (started with `place-order` + `manual-flash-create` + `create-po` in Round 19; closed half-way mark in Round 42 with mixed-namespace batch). ZERO regressions across **805 PHPUnit (was 788, +17) + 161 Jest** (22 suites — drift detector still green with 99 tracker entries).

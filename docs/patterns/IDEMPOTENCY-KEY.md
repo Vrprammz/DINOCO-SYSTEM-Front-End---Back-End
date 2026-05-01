@@ -372,15 +372,17 @@ return $res;
 - **`[Admin System] DINOCO Global Inventory Database` V.45.3** — `dip-stock/approve` (Round 27)
 - **`[LIFF AI] Snippet 1` V.1.11** — `lead/{id}/accept` (Round 26)
 
-**Status**: 🎯🎯🎯 **99/196 POST endpoints integrated (50.5% — Round 42 50% MAJOR MILESTONE REACHED ⭐⭐⭐)** against authoritative Round 30 census denominator. **24-round sustained Idempotency-Key campaign Rounds 18-42** — first sustained milestone past **1/2 of POST surface** integrated. (Earlier annotation: 59/196 = 30.1% TRUE 30% milestone Round 34.)
+**Status**: 🎯🎯 **119/196 POST endpoints integrated (60.7% — Round 46 60% MAJOR MILESTONE REACHED ⭐⭐)** against authoritative Round 30 census denominator. **28-round sustained Idempotency-Key campaign Rounds 18-46** — sustained milestone past **6/10 of POST surface** integrated. (Earlier annotations: 59/196 = 30.1% TRUE 30% milestone Round 34; 99/196 = 50.5% MAJOR MILESTONE Round 42.)
 
-Cumulative test coverage: **382 contract test cases** (3-9 per endpoint depending on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php` plus fixture-based round files (`IdempotencyRound29Test.php` ... `Round42Test.php`).
+Cumulative test coverage: **447 contract test cases** (3-9 per endpoint depending on field count + bulk semantics). See `tests/helpers/IdempotencyEndpointContractTest.php` plus fixture-based round files (`IdempotencyRound29Test.php` ... `Round46Test.php`).
 
 **Tracker**: see [`docs/audit/IDEMPOTENCY-COVERAGE.md`](../audit/IDEMPOTENCY-COVERAGE.md) for the full list of integrated + pending endpoints + recommended next picks.
 
-**Pattern maturity at Round 42**: **7 patterns observed** across 24 rounds — single (most common ~75 of 99) / bulk (sorted-by-key arrays — ~10 instances) / bulk-of-targets (notify_tickets[] sort + dedup — Round 28) / state-machine (status enum + actor — Round 23/40) / boolean-discriminator + enum-discriminator (toggle-bot Round 34 / shipping-defaults Round 40) / constant-marker (4 instances — stock/initialize R30 + manual-flash-test R32 + daily-summary R39 + dip-stock/start R40) / **binary-fingerprint NEW R42** (upload-image — sha1_file fingerprint, see Pattern 7 below).
+**Pattern maturity at Round 46**: **7 patterns observed** across 28 rounds — single (most common ~85 of 119) / bulk (sorted-by-key arrays — ~12 instances) / bulk-of-targets (notify_tickets[] sort + dedup — Round 28) / state-machine (status enum + actor — Round 23/40) / boolean-discriminator + enum-discriminator (toggle-bot Round 34 / shipping-defaults Round 40 / **print-settings regen Round 46**) / constant-marker (5 instances — stock/initialize R30 + manual-flash-test R32 + daily-summary R39 + dip-stock/start R40 + invoice/init R43) / binary-fingerprint (R42 upload-image + R45 product/shipping/bulk — 2 instances proven across upload + bulk-import endpoint shapes).
 
-**Recommendation**: **Round 43+ slow-down** to 1-2 weeks production canary observation before continuing toward 60% milestone (~118/196 endpoints, Round 47+ realistic). The 50% milestone marks a natural pause point — sustained 24-round campaign deserves a check-in window. Pattern playbook is mature; future rounds expected to reuse existing patterns rather than introduce new ones (until ~70% coverage when remaining endpoints will likely be edge cases).
+**Round 46 60% MILESTONE marker**: Cross-snippet 3-file batch (Snippet 3 + Snippet 9 + LIFF AI) closed manual-flash-status + 3 admin save endpoints (distributor + settings + print-settings) + lead-status. Print-settings demonstrates **bulk-shape selective with regen boolean discriminator** — toggling `regenerate_key=true` between retries surfaces SECURITY-CRITICAL key rotation event via 409. No new pattern variants — existing patterns + 2nd boolean-discriminator instance.
+
+**Recommendation**: **Round 47+ slow-down** to 1-2 weeks production canary observation matching Round 42 50% pause before continuing toward 70% milestone (~138/196 endpoints, Round 50+ realistic). The 60% milestone marks a natural pause point — sustained 28-round campaign deserves a check-in window. Pattern playbook is mature (7 patterns proven); future rounds expected to reuse existing patterns rather than introduce new ones (until ~80% coverage when remaining endpoints will likely be edge cases).
 
 ## Round 18-34 case study patterns
 
