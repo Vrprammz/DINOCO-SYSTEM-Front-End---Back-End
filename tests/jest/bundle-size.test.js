@@ -5,11 +5,12 @@
  * below a threshold. Catches silent bloat — adding a heavy dep to a
  * shared module raises every entry's size, easy to miss in PR review.
  *
- * Phase 5 audit target was <10KB per shell entry. Current state at
- * landing (V.0.1 pilot — Phase 2 migration not yet done):
- *   - b2b-catalog: ~3.5KB (biggest)
+ * Phase 5 audit target was <10KB per shell entry. Current state:
+ *   - b2b-catalog: ~3.5KB
  *   - b2f-catalog: ~620B
- *   - b2f-maker:   ~475B
+ *   - b2f-maker:   ~12KB  (Round 1 foundation port — CSS + 6 utility
+ *                          modules + bootstrap. See liff-src/b2f/maker/
+ *                          and runbooks/PHASE-2-VITE-MIGRATION.md.)
  *   - liff-ai:     ~605B
  *
  * Behavior:
@@ -19,16 +20,17 @@
  *     guard fires
  *
  * Threshold:
- *   - 10240 bytes (10KB) per entry — Phase 5 audit target. Bump up if
- *     legitimate growth, bump down once Phase 2 migration extracts more
- *     shared code into chunks/.
+ *   - 16384 bytes (16KB) per entry — bumped from 10KB on 2026-04-30 to
+ *     accommodate Round 1 b2f-maker code port (foundation utilities). Once
+ *     Round 2-5 land more shared code can hoist into `chunks/` and we can
+ *     ratchet back down. See PHASE-2-VITE-MIGRATION.md "Step 2.5".
  */
 
 const fs = require("fs");
 const path = require("path");
 
 const DIST_DIR = path.resolve(__dirname, "../../dist/liff");
-const PER_ENTRY_LIMIT = 10 * 1024; // 10 KB per entry
+const PER_ENTRY_LIMIT = 16 * 1024; // 16 KB per entry — see header note for Round 1 bump rationale.
 
 const distExists = fs.existsSync(DIST_DIR);
 
