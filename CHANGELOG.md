@@ -10,6 +10,60 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — 🎯🎯🎯 50% MAJOR MILESTONE — Idempotency-Key middleware integrated to 99/196 POST endpoints (50.5%) — sustained 24-round campaign Rounds 18-42 (2026-04-30) ⭐⭐⭐
+
+**Round 42 closes the 50% MAJOR MILESTONE** — Idempotency-Key middleware now wraps **99/196 POST endpoints (50.5%)** against the Round 30 authoritative census denominator. Past **1/2 of POST surface** integrated. **24-round sustained Idempotency campaign Rounds 18-42** (started with `place-order` + `manual-flash-create` + `create-po` in Round 19; closed half-way mark in Round 42 with mixed-namespace batch). ZERO regressions across **805 PHPUnit (was 788, +17) + 161 Jest** (22 suites — drift detector still green with 99 tracker entries).
+
+#### Phase 1 — Idempotency batch 20 (5 endpoints — 🎯🎯🎯 50% MAJOR MILESTONE)
+
+Mixed-namespace closure across B2B (3) + Inventory (1) + LIFF AI (1) — closes long-pending retry-prone POSTs + introduces NEW pattern:
+
+- **`POST /b2b/v1/invoice-gen`** — Customer/admin LIFF "ดูใบแจ้งหนี้" double-click on slow GD render → 2× expensive PDF generation (`b2b_generate_invoice_pages` → multi-page PNG composite ~1-3s) + 2× upload to `/wp-content/uploads/b2b-invoices/` (filename collision possible on same second) + 2× LINE notification spam if downstream pushes wired. Body hash `{ticket_id, gid}` — gid from session prevents cross-group cache poisoning. Different ticket_id = 409 (admin opened wrong tab, prevents wrong invoice URL stuck).
+- **`POST /b2b/v1/manual-flash-label`** — Admin "ดาวน์โหลด Label Manual" double-click on slow Flash API → 2× call to `b2b_flash_get_label_pdf` → 2× Flash `/open/v3/orders/printPdf` quota burn (~2 calls against rate-limit per retry). Body hash `{pno}` globally unique. PDF binary CANNOT replay through cache (5MB+ base64 bloat) — wrapper stores lightweight `cached_replay` marker on success store + LIFF/admin client handles "label already cached locally" UX.
+- **`POST /b2b/v1/auth-group`** — LIFF auth init double-fire on slow LINE verify → 2× `b2b_create_session_token()` issuance + 2× rate-limit consumption + log spam. Body hash `{group_id, line_uid}` — both required for distinct auth identity. Rate-limit increment ALREADY happened above (transient set unconditionally) — wrapper additionally protects token issuance + downstream side-effects only.
+- **`POST /liff-ai/v1/lead/{id}/note`** — Admin/dealer LIFF "บันทึกหมายเหตุ" double-tap on slow MongoDB → 2× POST to agent proxy `/api/leads/{id}/note` → 2× note insert into `lead.history` MongoDB array → user sees duplicate "by" entries (annoying UX) + 2× downstream notify hooks if `lead-pipeline` event fires. Body hash `{lead_id, note, role, actor uid}` — actor scoped from JWT `$auth['uid']` (cross-admin/dealer key reuse impossible). Different note (admin re-typed) = 409.
+- **`POST /dinoco-stock/v1/product/upload-image`** — **NEW binary-fingerprint pattern** — Admin "อัพโหลดรูป" double-click on slow upload (5MB image over 4G) → 2× S3/local file write to `wp-content/uploads/` + 2× catalog UPDATE + 2× ACF `update_field` + 2× `set_post_thumbnail`. Body hash `{sku, filename, size, content_sha1}` — **binary blob EXCLUDED** from hash (5MB raw bytes would explode `idempotency_keys` table). content_sha1 = sha1_file of upload tmp file (~50ms for 5MB) — serves as fingerprint to distinguish "same file vs different file" without storing binary. Same image retry = idempotent replay. Different content_sha1 = 409 (admin selected wrong file mid-retry, prevents wrong image stuck on SKU). **Pattern-extension**: first idempotent endpoint with binary content fingerprint, expanding "image_base64 EXCLUDED" parent pattern (slip-upload R37 + combined-slip-upload R29) to general binary uploads with file-identity check.
+
+Backward compat: missing `X-Idempotency-Key` header = byte-identical to V.42.17 / V.45.8 / V.1.12 behavior.
+
+**Versions**:
+
+- `[B2B] Snippet 3: LIFF E-Catalog REST API` V.42.17 → V.42.18 (Round 42 batch 20 — invoice-gen + manual-flash-label + auth-group wrappers)
+- `[Admin System] DINOCO Global Inventory Database` V.45.8 → V.45.9 (Round 42 batch 20 — upload-image wrapper with binary-fingerprint NEW pattern)
+- `[LIFF AI] Snippet 1: REST API` V.1.12 → V.1.13 (Round 42 batch 20 — lead-note wrapper)
+
+#### Phase 2 — Tracker + tests
+
+- `docs/audit/IDEMPOTENCY-COVERAGE.md` — coverage 94/196 (48.0%) → **🎯🎯🎯 99/196 (50.5%) MAJOR MILESTONE**. Status summary updated. Milestone row "🎯🎯🎯 50.5% (Round 42 — 50% MAJOR MILESTONE REACHED ⭐⭐⭐)" added at top of milestones table. 5 new rows for entries 96-100. Round 43+ candidates list refreshed (post-milestone slow-down recommendation).
+- `tests/helpers/IdempotencyRound42Test.php` (NEW, 17 tests) — 3 cases per endpoint × 5 endpoints + cumulative no-collision (1) + binary-fingerprint pattern guard (1) — validates upload-image filename change with same content_sha1 produces different hash (admin intent guard) + SHA1 change with same filename produces different hash (content fingerprint catches binary change without storing 5MB).
+
+#### Why this milestone matters
+
+🎯🎯🎯 **50% MAJOR MILESTONE** — first sustained milestone past **1/2 of POST surface** integrated against authoritative Round 30 census denominator. **24-round sustained campaign Rounds 18-42** — started with foundation in Round 18 (`[Admin System] DINOCO Idempotency Helper` snippet) + 3 critical retry-prone endpoints in Round 19; closed half-way mark in Round 42 with mixed-namespace batch + NEW binary-fingerprint pattern. **Pattern maturity at Round 42**: 7 patterns now observed (single / bulk / bulk-of-targets / state-machine / boolean-discriminator + enum-discriminator / constant-marker (4 instances) / **binary-fingerprint NEW R42**) — pattern playbook is mature; future rounds expected to reuse existing patterns rather than introduce new ones (until ~70% coverage when remaining endpoints will likely be edge cases).
+
+**Pattern mix Round 42**: 4× single (invoice-gen + manual-flash-label + auth-group + lead-note) + 1× **binary-fingerprint NEW** (upload-image).
+
+**Coverage breakdown post-Round 42**: 21 B2F + 45 B2B (+3) + 17 Inventory (+1) + 13 MCP + 3 LIFF AI (+1) = **99/196 = 🎯🎯🎯 50.5% MAJOR MILESTONE**. B2B namespace coverage 42 → 45 (+3 new — invoice-gen + manual-flash-label + auth-group). Inventory namespace coverage 16 → 17 (+1 — upload-image). LIFF AI namespace coverage 2 → 3 (+1 — lead-note).
+
+#### Cumulative test growth (Round 19-42)
+
+- PHPUnit: 0 → **805 tests** (+17 in Round 42)
+- Jest: 0 → **161 tests across 22 suites** (drift detector validates 99 tracker entries)
+- Cumulative idempotency contract tests: 365 → **382 cases** (Round 42: +17)
+- Body-shape distinct hashes asserted: 93 → **98** (Round 42: +5 new — all unique; 1 binary-fingerprint pattern guard)
+
+#### Round 43+ recommendation
+
+**Slow-down to 1-2 weeks production canary observation** before Round 43 batch 21. The 50% milestone marks a natural pause point — sustained 24-round campaign deserves a check-in window. Alternatively, continue toward 60% (118/196) with ~5-batch sustained pace = ~Round 47.
+
+---
+
+### Feature — Round 41 (push toward 🎯 50% — 94/196 = 48.0%) (2026-04-30)
+
+Round 41 pushed idempotency coverage to **94/196 POST endpoints (48.0%)** — only +4 endpoints away from 🎯 50% MAJOR MILESTONE. Pivot from B2B Flash admin cluster (Round 36-39) and mixed Round 40 to Inventory shipping ops + B2F admin delete pair: 3 Inventory (dip-stock/count, box-template create, box-template/{id} update) + 2 B2F admin delete (maker/delete, maker-product/delete). ZERO regressions across **788 PHPUnit (was 770, +18) + 161 Jest** (22 suites).
+
+---
+
 ### Feature — Round 40 (🎯 45% Idempotency milestone — 89/196 = 45.4%) (2026-04-30) ⭐
 
 Round 40 pushes idempotency coverage to **89/196 POST endpoints (45.4%)** — 🎯 **TRUE 45% milestone reached against Round 30 authoritative census denominator**. Past 9/20 of mutating REST surface. ZERO regressions across **770 PHPUnit (was 752, +18) + 161 Jest** (22 suites — drift detector still green with 89 entries).
