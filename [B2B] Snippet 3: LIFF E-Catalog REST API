@@ -1,6 +1,22 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 3: LIFF E-Catalog REST API                  ║
+ * ║  Version: V.42.18 — Round 42 (2026-04-30): 🎯🎯🎯 50% MAJOR MILESTONE — Idempotency-Key       ║
+ * ║    batch 20 — 3 endpoints in this snippet (Inventory adds 1 + LIFF AI adds 1 = 5 total       ║
+ * ║    batch): invoice-gen (customer/admin LIFF "ดูใบแจ้งหนี้" double-click on slow GD render →   ║
+ * ║    2× expensive PDF generation b2b_generate_invoice_pages → 2× upload to wp-content/uploads/  ║
+ * ║    + 2× LINE notification spam if downstream pushes wired; body hash = {ticket_id, gid} —    ║
+ * ║    gid from session prevents cross-group key reuse cache poisoning) + manual-flash-label     ║
+ * ║    (admin "ดาวน์โหลด Label Manual" double-click on slow Flash API → 2× call to                 ║
+ * ║    b2b_flash_get_label_pdf → 2× Flash /open/v3/orders/printPdf quota burn; body hash =       ║
+ * ║    {pno} globally unique; PDF binary CANNOT replay through cache — wrapper stores             ║
+ * ║    lightweight cached_replay marker on success store + LIFF/admin client handles UX)         ║
+ * ║    + auth-group (LIFF auth init double-fire on slow LINE verify → 2× session_token            ║
+ * ║    issuance + 2× rate-limit consumption + log spam; body hash = {group_id, line_uid} —        ║
+ * ║    both required for distinct auth identity; rate-limit increment already happened so         ║
+ * ║    wrapper additionally protects token issuance + downstream side-effects only). Coverage    ║
+ * ║    94→99/196 = 50.5%. **🎯🎯🎯 50% MAJOR MILESTONE REACHED ROUND 42 — 24-round sustained     ║
+ * ║    Idempotency campaign Rounds 18-42**.                                                       ║
  * ║  Version: V.42.17 — Round 38 (2026-04-30): 🎯 40% milestone — Idempotency-Key batch 16 —      ║
  * ║    4 endpoints in this snippet (Snippet 5 adds 1 more = 5 total batch): bo-notify (admin     ║
  * ║    double-click "ส่ง Flex แจ้งลูกค้า" → 2× LINE Flex push to customer group spam + 2×          ║
@@ -609,12 +625,46 @@ function b2b_rest_auth_group( WP_REST_Request $request ) {
     if ( get_field('credit_hold', $dist->ID) )
         return new WP_REST_Response(array('authorized'=>false,'reason'=>'credit_hold','message'=>'บัญชีถูกระงับ กรุณาชำระยอดค้างก่อน'), 200);
 
+    // ── V.42.18 Round 42: Idempotency-Key support (🎯 50% MAJOR MILESTONE batch 20) ──
+    // LIFF auth init double-fire on slow LINE verify → 2× session_token issuance + 2× rate-
+    // limit consumption + log spam ('Auth attempt from gid=...' per call). Body hash =
+    // {group_id, line_uid} — both required for distinct auth identity. Wrapper replays
+    // cached token on retry (same session is OK — token natural TTL handles re-auth in 24h).
+    // Different group_id or line_uid = 409 (different identity, must mint fresh token).
+    // Note: rate-limit increment ALREADY happened above (transient set unconditionally) —
+    // wrapper additionally protects token issuance + downstream side-effects only.
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::auth-group';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array(
+            'group_id' => $group_id,
+            'line_uid' => $line_uid,
+        );
+        $cached_idem = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached_idem) ) {
+            $err_data = $cached_idem->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'authorized' => false,
+                'message'    => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'       => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached_idem) ) {
+            $cached_code = isset($cached_idem['_idem_code']) ? (int)$cached_idem['_idem_code'] : 200;
+            unset($cached_idem['_idem_code']);
+            return new WP_REST_Response($cached_idem, $cached_code);
+        }
+    }
+
     $rank = get_field('rank_system', $dist->ID) ?: 'standard';
 
     // ── V.8.2-SEC: สร้าง session token ──
     $token = b2b_create_session_token($group_id, $line_uid);
 
-    return new WP_REST_Response(array(
+    $resp = array(
         'authorized' => true,
         'dist_id'    => $dist->ID,
         'dist_name'  => get_the_title($dist->ID),
@@ -623,7 +673,14 @@ function b2b_rest_auth_group( WP_REST_Request $request ) {
         'credit_hold'=> false,
         'debt'       => floatval(get_field('current_debt', $dist->ID)),
         'token'      => $token, // ← NEW: ส่ง token กลับให้ LIFF
-    ), 200);
+    );
+
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+
+    return new WP_REST_Response($resp, 200);
 }
 
 // ═══════════════════════════════════════
@@ -1591,11 +1648,50 @@ function b2b_rest_invoice_gen( WP_REST_Request $request ) {
     if ( $source !== $gid && !$is_admin )
         return new WP_REST_Response(array('success'=>false,'message'=>'Unauthorized'), 403);
 
+    // ── V.42.18 Round 42: Idempotency-Key support (🎯 50% MAJOR MILESTONE batch 20) ──
+    // Customer / admin LIFF "ดูใบแจ้งหนี้" double-click on slow GD render → 2× expensive
+    // PDF generation (b2b_generate_invoice_pages → multi-page PNG composite ~1-3s) +
+    // 2× upload to /wp-content/uploads/b2b-invoices/ (filename collision possible on
+    // same second) + 2× LINE notification spam if downstream pushes are wired. Body
+    // hash = {ticket_id, gid} — gid from session prevents cross-group key reuse cache
+    // poisoning. Same intent (same ticket) = wrapper replays cached page URLs on retry.
+    // Different ticket_id = 409 (admin opened wrong tab, prevents wrong invoice URL stuck).
+    $idem_key = function_exists('dinoco_idempotency_extract_key')
+        ? dinoco_idempotency_extract_key($request) : '';
+    $idem_namespace = 'b2b/v1::invoice-gen';
+    $idem_body = null;
+    if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+        $idem_body = array(
+            'ticket_id' => $tid,
+            'gid'       => $gid,
+        );
+        $cached_idem = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+        if ( is_wp_error($cached_idem) ) {
+            $err_data = $cached_idem->get_error_data();
+            $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+            return new WP_REST_Response(array(
+                'success' => false,
+                'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                'code'    => 'idempotency_conflict',
+            ), $status_code);
+        }
+        if ( is_array($cached_idem) ) {
+            $cached_code = isset($cached_idem['_idem_code']) ? (int)$cached_idem['_idem_code'] : 200;
+            unset($cached_idem['_idem_code']);
+            return new WP_REST_Response($cached_idem, $cached_code);
+        }
+    }
+
     // Generate invoice via S10
     if ( function_exists('b2b_generate_invoice_pages') ) {
         $urls = b2b_generate_invoice_pages($tid);
         if ( $urls && is_array($urls) ) {
-            return new WP_REST_Response(array('success'=>true,'pages'=>$urls), 200);
+            $resp = array('success'=>true,'pages'=>$urls);
+            if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+                dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                    array_merge($resp, array('_idem_code' => 200)), 200);
+            }
+            return new WP_REST_Response($resp, 200);
         }
         // V.14.0: Better error when generation fails
         return new WP_REST_Response(array('success'=>false,'message'=>'สร้างใบแจ้งหนี้ไม่สำเร็จ (GD/Font error)'), 500);
@@ -1609,7 +1705,12 @@ function b2b_rest_invoice_gen( WP_REST_Request $request ) {
     }
     $api_url = $base . '/wp-json/b2b/v1/invoice-image?' . http_build_query($inv_params);
 
-    return new WP_REST_Response(array('success'=>true,'pages'=>array($api_url)), 200);
+    $resp = array('success'=>true,'pages'=>array($api_url));
+    if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+        dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+            array_merge($resp, array('_idem_code' => 200)), 200);
+    }
+    return new WP_REST_Response($resp, 200);
     } catch ( Exception $e ) {
         b2b_log('[InvoiceGen] Error: ' . $e->getMessage());
         return new WP_REST_Response(array('success' => false, 'message' => 'เกิดข้อผิดพลาดภายใน กรุณาลองใหม่'), 500);
@@ -6189,16 +6290,60 @@ function b2b_rest_manual_flash_label( WP_REST_Request $r ) {
     try {
         $pno = sanitize_text_field( $r->get_param( 'pno' ) );
         if ( empty( $pno ) ) return new WP_REST_Response( array( 'success' => false, 'message' => 'Missing PNO' ), 400 );
+
+        // ── V.42.18 Round 42: Idempotency-Key support (🎯 50% MAJOR MILESTONE batch 20) ──
+        // Admin "ดาวน์โหลด Label Manual" double-click on slow Flash API → 2× call to
+        // b2b_flash_get_label_pdf() → 2× Flash /open/v3/orders/printPdf quota burn (~2 calls
+        // against rate-limit per retry). Body hash = {pno} — globally unique. PDF binary
+        // cannot replay through cache (5MB+ base64 bloat unacceptable in idempotency_keys
+        // table) — wrapper returns lightweight success marker on replay; LIFF/admin client
+        // handles "label already cached locally" UX by checking cached_replay flag.
+        // Same PNO retry = idempotent replay. Different PNO = 409 (stale tab guard).
+        $idem_key = function_exists( 'dinoco_idempotency_extract_key' )
+            ? dinoco_idempotency_extract_key( $r ) : '';
+        $idem_namespace = 'b2b/v1::manual-flash-label';
+        $idem_body = null;
+        if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+            $idem_body = array( 'pno' => $pno );
+            $cached_idem = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+            if ( is_wp_error( $cached_idem ) ) {
+                $err_data = $cached_idem->get_error_data();
+                $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                return new WP_REST_Response( array(
+                    'success' => false,
+                    'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                    'code'    => 'idempotency_conflict',
+                ), $status_code );
+            }
+            if ( is_array( $cached_idem ) ) {
+                $cached_code = isset( $cached_idem['_idem_code'] ) ? (int) $cached_idem['_idem_code'] : 200;
+                unset( $cached_idem['_idem_code'] );
+                return new WP_REST_Response( $cached_idem, $cached_code );
+            }
+        }
+
         if ( ! function_exists( 'b2b_flash_get_label_pdf' ) ) {
             return new WP_REST_Response( array( 'success' => false, 'message' => 'Flash label function not available' ), 500 );
         }
         $result = b2b_flash_get_label_pdf( $pno );
         if ( ! empty( $result['ok'] ) && ! empty( $result['pdf'] ) ) {
-            return new WP_REST_Response( array(
+            $resp = array(
                 'success'      => true,
                 'pdf_base64'   => base64_encode( $result['pdf'] ),
                 'content_type' => $result['content_type'] ?? 'application/pdf',
-            ), 200 );
+            );
+            // Store lightweight replay marker (omit pdf_base64 — too large for cache table).
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                $cache_resp = array(
+                    'success'         => true,
+                    'cached_replay'   => true,
+                    'message'         => 'Label already fetched (idempotency replay) — re-request without X-Idempotency-Key for fresh PDF',
+                    'content_type'    => $result['content_type'] ?? 'application/pdf',
+                    '_idem_code'      => 200,
+                );
+                dinoco_idempotency_store( $idem_key, $idem_namespace, $idem_body, $cache_resp, 200 );
+            }
+            return new WP_REST_Response( $resp, 200 );
         }
         $err = $result['error'] ?? 'Label not available';
         return new WP_REST_Response( array( 'success' => false, 'message' => $err ), 400 );

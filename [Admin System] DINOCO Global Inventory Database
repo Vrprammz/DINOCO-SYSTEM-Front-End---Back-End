@@ -2,6 +2,26 @@
  * File: [Admin System] DINOCO Global Inventory Database
  * Template Name: [Admin System] Inventory Command Center
  * Shortcode: [dinoco_admin_inventory]
+ * Version: V.45.9 (2026-04-30) — Round 42 batch 20: 🎯🎯🎯 50% MAJOR MILESTONE — Idempotency-Key
+ *   support on POST /dinoco-stock/v1/product/upload-image (1 endpoint in this snippet — 5 total
+ *   batch with Snippet 3 + LIFF AI). Pushes coverage 94/196 → 99/196 = 50.5% — past the major
+ *   half-way milestone of POST surface against authoritative Round 30 census denominator.
+ *   - POST /dinoco-stock/v1/product/upload-image — Admin "อัพโหลดรูป" double-click on slow
+ *     upload (5MB image over 4G) → 2× S3/local file write to wp-content/uploads/ +
+ *     2× catalog UPDATE + 2× ACF update_field + 2× set_post_thumbnail. **Body hash special
+ *     case** — multipart form upload with binary blob: {sku, filename, size, content_sha1}.
+ *     **Binary blob EXCLUDED** from hash (5MB raw bytes would explode idempotency_keys table).
+ *     content_sha1 = sha1_file($_FILES['product_image']['tmp_name']) computed once (~50ms for
+ *     5MB) — serves as fingerprint to distinguish "same file vs different file" without
+ *     storing binary. Same image retry = idempotent replay (admin sees "already uploaded").
+ *     Different image = 409 (admin selected wrong file mid-retry, prevents wrong image stuck
+ *     on SKU). Pattern-extension: first idempotent endpoint with binary content fingerprint
+ *     (sha1_file) instead of full-body hash. Documents new "binary-fingerprint" sub-pattern
+ *     for upload endpoints — separate from "image_base64 EXCLUDED" pattern (slip-upload R37,
+ *     combined-slip-upload R29) which omits binary entirely with no fingerprint.
+ *   • function_exists() guards — pure no-op if Idempotency Helper snippet not synced.
+ *   • Backward compat: missing X-Idempotency-Key header = byte-identical to V.45.8 behavior.
+ *   • **🎯🎯🎯 50% MAJOR MILESTONE REACHED — 24-round sustained campaign Rounds 18-42**.
  * Version: V.45.8 (2026-04-30) — Round 41 batch 19: Idempotency-Key support on 3 inventory POSTs
  *   (push toward 50% milestone — 92/196 = 46.9% inventory contribution; total 94/196 = 48.0%):
  *   - POST /dinoco-stock/v1/dip-stock/count — admin "บันทึกผลนับ" double-click → 2x SQL
@@ -3736,6 +3756,47 @@ add_action('rest_api_init', function() {
                 return new WP_REST_Response(['success' => false, 'message' => 'SKU too long'], 400);
             }
 
+            // ── V.45.9 Round 42: Idempotency-Key support (🎯 50% MAJOR MILESTONE batch 20) ──
+            // Admin "อัพโหลดรูป" double-click on slow upload (5MB image over 4G) → 2× S3/local
+            // file write to wp-content/uploads/ + 2× catalog UPDATE + 2× ACF update_field +
+            // 2× set_post_thumbnail. Body hash = {sku, filename, size, content_sha1} —
+            // **binary blob EXCLUDED** from hash (5MB raw bytes would explode idempotency_keys
+            // table). content_sha1 is computed once via sha1_file($_FILES['product_image']
+            // ['tmp_name']) — SHA1 is FAST (160-bit ~50ms for 5MB), serves as fingerprint to
+            // detect "same file vs different file" distinction. Same image retry = idempotent
+            // replay (admin sees "already uploaded"). Different image = 409 (admin selected
+            // wrong file mid-retry, prevents wrong image stuck on SKU).
+            $idem_key = function_exists('dinoco_idempotency_extract_key')
+                ? dinoco_idempotency_extract_key($request) : '';
+            $idem_namespace = 'dinoco-stock/v1::product-upload-image';
+            $idem_body = null;
+            if ( $idem_key !== '' && function_exists('dinoco_idempotency_check') ) {
+                // Compute lightweight content fingerprint (SHA1 of upload tmp file).
+                // Excludes binary from hash; fingerprint distinguishes file identity.
+                $content_sha1 = @sha1_file($_FILES['product_image']['tmp_name']);
+                $idem_body = array(
+                    'sku'          => $sku,
+                    'filename'     => sanitize_file_name($_FILES['product_image']['name'] ?? ''),
+                    'size'         => intval($_FILES['product_image']['size'] ?? 0),
+                    'content_sha1' => $content_sha1 ?: '',
+                );
+                $cached_idem = dinoco_idempotency_check($idem_key, $idem_namespace, $idem_body);
+                if ( is_wp_error($cached_idem) ) {
+                    $err_data = $cached_idem->get_error_data();
+                    $status_code = (is_array($err_data) && isset($err_data['status'])) ? (int)$err_data['status'] : 409;
+                    return new WP_REST_Response([
+                        'success' => false,
+                        'message' => 'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        'code'    => 'idempotency_conflict',
+                    ], $status_code);
+                }
+                if ( is_array($cached_idem) ) {
+                    $cached_code = isset($cached_idem['_idem_code']) ? (int)$cached_idem['_idem_code'] : 200;
+                    unset($cached_idem['_idem_code']);
+                    return new WP_REST_Response($cached_idem, $cached_code);
+                }
+            }
+
             // Upload to WordPress Media Library
             $attachment_id = media_handle_upload('product_image', 0);
             if ( is_wp_error($attachment_id) ) {
@@ -3773,12 +3834,19 @@ add_action('rest_api_init', function() {
                 }
             }
 
-            return new WP_REST_Response([
+            $resp = [
                 'success'       => true,
                 'url'           => $url,
                 'attachment_id' => $attachment_id,
                 'message'       => 'Image uploaded successfully',
-            ], 200);
+            ];
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists('dinoco_idempotency_store') ) {
+                dinoco_idempotency_store($idem_key, $idem_namespace, $idem_body,
+                    array_merge($resp, ['_idem_code' => 200]), 200);
+            }
+
+            return new WP_REST_Response($resp, 200);
         },
         'permission_callback' => $inv_perm,
     ]);
