@@ -10,6 +10,42 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 1 — foundation (2026-04-30)
+
+Final LIFF surface port begins. Closes the 4-of-4 inline → Vite migration roadmap by extracting `[LIFF AI] Snippet 2: Frontend` V.3.8 inline `<style>` (~425 LOC) + JS utility helpers into Vite-buildable ES modules. Snippet 2 V.3.8 → V.3.9 (header annotation only — inline rendering UNCHANGED, REG-029 byte-identical preserved). Flag `dinoco_liff_use_vite_liff_ai` default OFF.
+
+**New files** (6, all under `liff-src/liff-ai/frontend/`):
+
+- `styles.css` (~425 LOC) — full inline `<style>` extraction. Dark theme `:root` tokens (`--ai-primary` orange #FF6B00 / `--ai-dark` #0a0a0a + 14 more). All `.liff-ai-*` selectors verbatim from inline V.3.8 lines 118-543. Distinct CSS scope from B2B / B2F surfaces.
+- `utils/lang.js` — Thai-only with English fallback (LIFF AI doesn't multi-currency). 3-arg `L(th, en, zh)` signature accepts but ignores `zh` so renderer code copy-pastes cleanly across LIFF surfaces.
+- `utils/format.js` — `formatNumber` / `formatDate` (th-TH) / `formatRelativeTime` + `timeAgo` alias / `escHtml`. `escHtml` matches inline `esc()` semantics (quotes NOT escaped — textContent round-trip).
+- `utils/dom.js` — `$` / `$$` / `showToast` (reuses pre-rendered `#liffAiToast` if present, defensive fallback creates one) / `showError` / `showLoading` / `lockBtn` / `unlockBtn` / `setupOfflineDetection` (idempotent). Module-private LOCKED flag mirrors B2F maker pattern.
+- `utils/auth.js` — sessionStorage-backed JWT mgmt. Promotes inline closure-scoped `var TOKEN/ROLE/LINE_UID` to per-tab persistence. `setSessionToken` / `getSessionToken` / `clearSessionToken` (wipes all 3 keys together) / `setRole/getRole` / `setLineUid/getLineUid`. Security: sessionStorage only — never localStorage (JWT TTL is short-lived).
+- `utils/lead-status.js` — 17 lead statuses + 13 claim statuses (Service Center alignment) + 9-step Dealer timeline + 9-key STATUS_COLORS hex map + 4 classifiers (`statusBadgeClass` / `claimBadgeClass` mirror inline V.3.8 lines 627-650 EXACTLY) + 6 lookup helpers.
+
+**entry.js V.0.1 stub → V.0.2 foundation**:
+
+- Imports + re-exports the 5 utility modules so renderer modules (Round 2) and tests can consume from one barrel.
+- Bootstrap: cached JWT first (skip exchange) → fallback `POST /liff-ai/v1/auth` with `line_user_id` + `id_token` → store token + role + line_uid → build `createApi({ tokenHeader: "X-LIFF-AI-Token" })` → `setupOfflineDetection()`.
+- Auto-boot only when `window.DINOCO_LIFF_AI_CONFIG` exposed (parallel-rendering pattern).
+
+**Snippet 2 V.3.9** — annotation-only header bump documenting parallel Vite artifact paths. Inline rendering authoritative until Round 5 cut-over.
+
+**Tests** — `tests/jest/liff-ai-utils.test.js` 66 cases across 6 describe blocks (lang / format / dom / auth / lead-status enums / lead-status classifiers + labels). jsdom env. `beforeEach` resets module state. Statuses + classifier outputs MUST match inline V.3.8 EXACTLY (drift = visual regression in `.liff-ai-badge-*` rendering).
+
+**Bundle delta**:
+
+| Asset | V.0.1 stub | V.0.2 R1 |
+| --- | --- | --- |
+| `liff-ai.<hash>.js` | 0.60KB (0.40KB gzip) | 2.85KB (1.38KB gzip) |
+| `assets/liff-ai.<hash>.css` | n/a | 17.73KB (3.65KB gzip) |
+
+Still well under 10KB cap. CSS is the bulk (dark theme + chat + lightbox + 9-step timeline + 13 claim badge variants).
+
+**Test count**: 1137 → 1203 (+66 tests, +1 suite).
+
+**Risk** — NONE. Pure additive: utility modules only, NOT wired into Snippet 2 inline rendering. Flag default OFF. Bundle still well under 10KB cap (Vite manifest test passes). Round 2 will port page renderers. Round 5 will flip the cut-over flag.
+
 ### Feature — Vite LIFF B2F Catalog code port Round 4 — inline-bridge cleanup (2026-04-30)
 
 Continues from Round 3. Round 4 mirrors B2B Catalog R4 + B2F Maker R4: drop the legacy `window.DINOCO_B2F_CATALOG_NAV` + `window.DINOCO_B2F_CATALOG_RENDERERS` bridge bags in favor of a single delegated click + change listener on `#b2f-catalog-app`. Pages already emit declarative `data-action` / `data-stepact` / `data-subaddsku` / `data-bucket-tab` attributes from Round 2 onward — Round 4 wires the dispatcher that consumes them + adds the missing markers (`data-action="remove"` on cart row delete, `data-action="detail"` on SET cards, `data-action="pick-maker"` on maker cards). Flag `dinoco_liff_use_vite_b2f_catalog` default OFF (REG-029 byte-identical preserved).

@@ -835,6 +835,57 @@ Real migration will grow these — bundle-size test will fail if any entry excee
 
 ---
 
+## Step 2.5 Round 11 — LIFF AI Frontend code port (Round 1 — foundation) ✅ (2026-04-30)
+
+Final LIFF surface port begins. Closes the 4-of-4 inline → Vite migration by porting `[LIFF AI] Snippet 2: Frontend` V.3.8 → V.3.9 (annotation only — inline rendering UNCHANGED). Most complex surface: dual-role admin/dealer dashboards + lead pipeline (17 statuses) + claim management (13 statuses) + AI agent chat. Dark theme `.liff-ai-*` (distinct from B2B / B2F surfaces).
+
+### Round 1 scope (DONE)
+
+- `liff-src/liff-ai/frontend/styles.css` — full inline `<style>` extraction (~425 LOC). Dark theme `:root` tokens (`--ai-primary` orange #FF6B00 / `--ai-dark` #0a0a0a / `--ai-card` #1a1a2e + 12 more). All `.liff-ai-*` selectors mirrored verbatim from inline V.3.8 lines 118-543.
+- `liff-src/liff-ai/frontend/utils/lang.js` — Thai-only with English fallback (LIFF AI doesn't multi-currency). 3-arg `L(th, en, zh)` signature accepted but `zh` ignored — matches B2F maker / catalog signature so renderer code copy-pastes cleanly across LIFF surfaces.
+- `liff-src/liff-ai/frontend/utils/format.js` — `formatNumber` / `formatDate` (th-TH locale) / `formatRelativeTime` + `timeAgo` alias / `escHtml` (matches inline `esc()` textContent semantics — quotes NOT escaped).
+- `liff-src/liff-ai/frontend/utils/dom.js` — `$` / `$$` / `showToast` (reuses pre-rendered `#liffAiToast` if present, creates one if missing — defensive) / `showError` / `showLoading` / `lockBtn` / `unlockBtn` / `setupOfflineDetection` (idempotent). Module-private `LOCKED` flag mirrors B2F maker pattern (Round 2 page renderers will use it).
+- `liff-src/liff-ai/frontend/utils/auth.js` — sessionStorage-backed JWT session token mgmt. Promotes inline `var TOKEN/ROLE/LINE_UID` (closure-scoped) to per-tab persistence so reloads inside LIFF browser don't force re-auth. `setSessionToken` / `getSessionToken` / `clearSessionToken` (wipes token + role + line_uid together) / `setRole/getRole` / `setLineUid/getLineUid`. **Security**: sessionStorage only (per-tab + cleared on close) — never localStorage. JWT TTL is short-lived; X-LIFF-AI-Token header sent on every REST call.
+- `liff-src/liff-ai/frontend/utils/lead-status.js` — 17 lead statuses (`LEAD_STATUSES` array + `LEAD_STATUS_TH` Thai map) + 13 claim statuses (`CLAIM_STATUS_TH`, aligns with `[Admin System] Service Center & Claims`) + 9-step `TIMELINE_STEPS` (Dealer view) + `STATUS_COLORS` hex map + 4 classifiers (`statusBadgeClass` / `claimBadgeClass` mirror inline V.3.8 lines 627-650 EXACTLY) + 6 lookup helpers (`getStatusLabel` / `getClaimStatusLabel` / `getStatusColor` / `getClaimStatusColor` / `getTimelineIndex`).
+
+### entry.js V.0.1 → V.0.2
+
+Imports + re-exports the 5 utility modules so renderer modules (Round 2) and tests can consume from one barrel. Bootstrap function:
+1. `initLiff(liffId)` (shared)
+2. Try `getSessionToken()` cached JWT first (sessionStorage) — skip exchange if valid
+3. Else `POST /liff-ai/v1/auth` with `line_user_id` + `id_token` → store token + role + line_uid
+4. Build authenticated `createApi({ token, tokenHeader: "X-LIFF-AI-Token" })`
+5. `setupOfflineDetection()` injects sticky banner
+
+Auto-boot guard: only runs when `window.DINOCO_LIFF_AI_CONFIG` is exposed (parallel-rendering pattern — inline path always executes; Vite path only auto-boots when wp_option `dinoco_liff_use_vite_liff_ai = '1'` AND config window-var present).
+
+### Tests
+
+`tests/jest/liff-ai-utils.test.js` — 66 cases across 6 describe blocks (lang / format / dom / auth / lead-status enums / lead-status classifiers + labels). jsdom env. `beforeEach` resets module-private state (`_resetLangForTests` / `_resetLockForTests` / `sessionStorage.clear()` / `document.body.innerHTML = ""`). Coverage targets: `statusBadgeClass` / `claimBadgeClass` MUST match inline V.3.8 EXACTLY — drift = visual regression in `.liff-ai-badge-*` styling.
+
+### Bundle delta
+
+| Entry | V.0.1 stub | V.0.2 R1 |
+|---|---|---|
+| `liff-ai.<hash>.js` | 0.60KB (0.40KB gzip) | 2.85KB (1.38KB gzip) |
+| `assets/liff-ai.<hash>.css` | n/a | 17.73KB (3.65KB gzip) |
+| Lang chunk (shared with surfaces) | 1.39KB (0.70KB gzip) | unchanged |
+
+Still well under 10KB cap. CSS is the bulk (dark theme + chat + lightbox + 9-step timeline + 13 claim badge variants).
+
+### Snippet 2 V.3.9 header bump
+
+Annotation only — inline rendering authoritative. NEW comment block documents the parallel Vite artifact paths so Round 2 page-port commits can reference. Flag `dinoco_liff_use_vite_liff_ai` default OFF (REG-029 byte-identical preserved).
+
+### Round 2-5 roadmap (next sprints)
+
+- **Round 2** — port 5 page renderers from inline V.3.8 lines 786-1567 into `liff-src/liff-ai/frontend/pages/{dashboard,dealer,lead-detail,claim-list,claim-detail,agent-chat}.js`. Mirrors B2B / B2F maker / B2F catalog Round 2 pattern. Inline V.3.8 stays UNCHANGED — expose renderers via `window.DINOCO_LIFF_AI_RENDERERS` for inline-bridge fallback during Round 5 cut-over.
+- **Round 3** — router + lead pipeline FSM client-side validation (gated by server-side `/lead-fsm` endpoint). Photo lightbox + status change modal extracted to dedicated modules.
+- **Round 4** — agent chat module (Phase 3 AI proxy). Claude bubble rendering + quick actions + typing indicator.
+- **Round 5** — destructive cut-over. Flip `dinoco_liff_use_vite_liff_ai = '1'`. Snippet 2 inline `<style>` + `<script>` blocks stripped (preserve shell HTML + `wp_head/wp_footer` only). REG-029 baseline updates.
+
+---
+
 ## References
 
 - `[System] DINOCO LIFF Asset Loader` snippet — runtime helper
