@@ -1,5 +1,5 @@
 /**
- * B2B LIFF E-Catalog — Vite entry (V.0.4 Round 3 — router + API + loaders)
+ * B2B LIFF E-Catalog — Vite entry (V.0.5 Round 4 — inline-bridge cleanup)
  *
  * MIGRATION TARGET: `[B2B] Snippet 4: LIFF E-Catalog Frontend` V.32.9
  *
@@ -13,7 +13,7 @@
  * Round 2 (V.0.3):
  *   ✅ 5 page modules under `./pages/` — pure HTML-string builders.
  *
- * Round 3 (V.0.4 — this commit):
+ * Round 3 (V.0.4):
  *   ✅ Router (`./router.js`) — hash-based navigation:
  *      • getCurrentTab / getCurrentSetSku / goToTab / openSetDetail /
  *        closeSetDetail / back / setupHashRouter / dispatchInitial
@@ -29,15 +29,25 @@
  *      • setDetail.js— loadSetDetail + handleAddSet (V.32.1 dup guard)
  *      • cart.js     — loadCartModal + handleSubmitOrder (place/modify)
  *
- * Round 4+ scope (NOT in this file yet):
- *   ⏳ Bridge cleanup — drop legacy `window.goToTab` / `window.openSetDetail`
- *      / `window.handleAddToCart` globals once Snippet 4 V.32.10 cut-over
- *      lands. Replace with event delegation (`data-action="*"`).
+ * Round 4 (V.0.5 — this commit):
+ *   ✅ Event delegation — `setupEventDelegation(rootEl)` listens on
+ *      `#b2b-catalog-app` for click + change events bubbling up from
+ *      `[data-action]` (and legacy `data-stepact` / `data-rmsku` /
+ *      `data-cancel` / `data-reorder` / `data-claim` for V.32.9 parity)
+ *      and dispatches to imported handlers.
+ *   ✅ Pages already emit declarative attributes (Round 2 onward) — no
+ *      page-source changes needed for the dispatcher.
+ *   ✅ Drop 12 legacy `window.B2B_CATALOG_*` bridge globals — entry.js
+ *      now owns full bootstrap autonomously when the flag is flipped ON.
+ *   ✅ Drop `helpers` + `renderers` + `loaders` parallel surfaces from
+ *      `window.DINOCO_B2B_CATALOG` — single namespaced debug surface
+ *      kept (router + api factory only) for console testing parity with
+ *      B2F Maker V.0.5.
  *
- * Round 5 scope (final cut-over):
- *   ⏳ Drop inline `<script>` block from Snippet 4 once flag has been ON
- *      1 week with no regressions (REG-029 byte-identical preserved
- *      throughout earlier rounds).
+ * Round 5+ scope (NOT in this file yet):
+ *   ⏳ Production canary cutover — drop inline `b2b_liff_js()` from
+ *      Snippet 4 once flag has been ON 1 week with no regressions
+ *      (REG-029 byte-identical preserved throughout earlier rounds).
  *
  * Production safety: this bundle only loads when wp_option
  * `dinoco_liff_use_vite_b2b_catalog = '1'`. Default OFF — Snippet 4
@@ -51,41 +61,14 @@ import { initLiff } from "../../shared/liff-init.js";
 import { wpRestUrl } from "../../shared/api-client.js";
 import { liffAuth } from "../../shared/liff-auth.js";
 
-import {
-    L,
-    setupLanguage,
-    getLang,
-} from "./utils/lang.js";
-import {
-    formatNumber,
-    formatCurrency,
-    formatDate,
-    escHtml,
-} from "./utils/format.js";
+import { setupLanguage } from "./utils/lang.js";
 import {
     $,
     $$,
     showToast,
     showAuthError,
-    showLinkExpired,
-    showLoading,
-    hideLoading,
-    lockBtn,
-    unlockBtn,
     setupOfflineDetection,
 } from "./utils/dom.js";
-import {
-    computeDealerPrice,
-    validateMOQ,
-    computeBoxes,
-} from "./utils/pricing.js";
-import {
-    getLeafSkus,
-    isLeafSku,
-    isTopLevelSet,
-    computeHierarchyStock,
-    getAncestorSkus,
-} from "./utils/hierarchy.js";
 import {
     loadCart,
     saveCart,
@@ -96,55 +79,7 @@ import {
     toOrderItems,
     detectCartDuplicates,
     clearCart,
-    CART_STORAGE_KEY,
 } from "./utils/cart.js";
-
-// Round 2 — page renderers (pure HTML-string builders).
-import {
-    productMatchesModel,
-    renderModelCard,
-    renderModelRow,
-    shouldShowModelLabel,
-    renderCategoryCard,
-    renderCategoryRow,
-    shouldShowCategoryLabel,
-    renderHome,
-    renderViewState,
-    collectCategoriesForModel,
-    collectModelsForCategory,
-    renderCrossFilterPills,
-} from "./pages/home.js";
-import {
-    filterProducts,
-    formatEtaDate,
-    renderProductCard,
-    renderProducts,
-} from "./pages/catalog.js";
-import {
-    buildB2bStepper,
-    renderSetDetailMainStepper,
-    updateSetDetailAddBtn,
-    renderSetDetailItems,
-} from "./pages/setDetail.js";
-import {
-    HISTORY_FILTERS,
-    STATUS_COLORS,
-    STATUS_LABELS,
-    getStatusColor,
-    getStatusLabel,
-    renderHistoryFilter,
-    renderHistoryCard,
-    renderLoadMoreButton,
-    renderHistory,
-} from "./pages/history.js";
-import {
-    updateCartBar,
-    renderCartModalItem,
-    renderCartEmptyState,
-    renderCartNoteSection,
-    renderCartItems,
-    renderRecommendedChips,
-} from "./pages/cart.js";
 
 // Round 3 — router + API wrapper + 5 page loaders.
 import {
@@ -166,7 +101,6 @@ import {
     handleAddToCart,
     handleIncrement,
     handleDecrement,
-    handleOpenSetDetail,
 } from "./loaders/catalog.js";
 import {
     setupHome,
@@ -174,7 +108,6 @@ import {
     applyModelFilter,
     applyCategoryFilter,
     applyCrossFilter,
-    resetFilters,
 } from "./loaders/home.js";
 import {
     setupHistory,
@@ -190,16 +123,12 @@ import {
     handleSubItemStep,
     handleClose as handleSetDetailClose,
 } from "./loaders/setDetail.js";
-import {
-    setupCart,
-    loadCartModal,
-    handleSubmitOrder,
-    handleCartItemRemove,
-    getCartTotals,
-} from "./loaders/cart.js";
+import { setupCart, handleCartItemRemove } from "./loaders/cart.js";
 
-const VERSION = "V.0.4";
-const BOOT_MARKER = `[b2b-catalog] Vite bundle loaded (${VERSION} Round 3 — router + API + loaders)`;
+import { setupEventDelegation } from "./event-delegation.js";
+
+const VERSION = "V.0.5";
+const BOOT_MARKER = `[b2b-catalog] Vite bundle loaded (${VERSION} Round 4 — inline-bridge cleanup)`;
 console.info(BOOT_MARKER);
 
 /**
@@ -348,6 +277,73 @@ export async function bootstrap(opts = {}) {
         dispatchInitial();
     }
 
+    // ── Round 4: Event delegation wiring ────────────────────────────────
+    // Listen on the mount root for click + change events bubbling up
+    // from [data-action] / [data-stepact] / [data-rmsku] etc. — replaces
+    // the legacy `window.B2B_CATALOG_*` bridge globals from V.0.4.
+    let detachDelegation = null;
+    if (typeof document !== "undefined") {
+        const root = document.getElementById("b2b-catalog-app");
+        if (root) {
+            detachDelegation = setupEventDelegation(root, {
+                goTab: goToTab,
+                openSetDetail: (sku) => openSetDetail(sku),
+                addToCart: (sku, qty) => handleAddToCart(sku, qty || 1),
+                increment: (sku) => handleIncrement(sku, 1),
+                decrement: (sku) => handleDecrement(sku),
+                removeFromCart: (sku) => handleCartItemRemove(sku),
+                setHistoryFilter: (key) => handleHistoryFilter(key),
+                loadMore: () => handleLoadMore(),
+                setModelView: (name) => applyModelFilter(name),
+                setCategoryView: (name) => applyCategoryFilter(name),
+                setCrossFilter: (value) => applyCrossFilter(value),
+                cancelOrder: (id) => handleCancelOrder(id),
+                reorder: (/** @type {string} */ id) => {
+                    // V.32.9 inline reorder = navigate back to catalog
+                    // with state.editTicket set. Surface remains owned
+                    // by inline JS until Round 5 cut-over — emit a
+                    // window event so the caller can handle it.
+                    if (typeof window !== "undefined") {
+                        window.dispatchEvent(
+                            new CustomEvent("b2b-catalog:reorder", {
+                                detail: { id },
+                            })
+                        );
+                    }
+                },
+                openClaim: (/** @type {string} */ id) => {
+                    if (typeof window !== "undefined") {
+                        window.dispatchEvent(
+                            new CustomEvent("b2b-catalog:claim", {
+                                detail: { id },
+                            })
+                        );
+                    }
+                },
+                openTicket: (url) => {
+                    if (url && typeof window !== "undefined") {
+                        window.location.href = url;
+                    }
+                },
+                addSet: (sku, qty) => handleAddSet(sku, qty || 1),
+                subItemStep: (sku, dir) =>
+                    handleSubItemStep(sku, dir === "minus" ? -1 : 1),
+                subItemReveal: (sku) => {
+                    // Parity with V.32.9 line ~1410 — first reveal +
+                    // immediate add 1. Loader does both.
+                    handleAddToCart(sku, 1);
+                },
+                stepperInput: (/** @type {string} */ _sku, /** @type {number} */ _val) => {
+                    // V.32.9 inline updates the input value in place
+                    // (no state mutation needed) — re-rendering happens
+                    // on add. We accept the call for telemetry parity
+                    // but intentionally leave the DOM untouched here.
+                },
+                back: () => routerBack(),
+            });
+        }
+    }
+
     return {
         version: VERSION,
         session,
@@ -387,6 +383,7 @@ export async function bootstrap(opts = {}) {
             isSetDetailOpen,
         },
         $, $$,
+        detachDelegation,
     };
 }
 
@@ -439,100 +436,36 @@ if (typeof window !== "undefined") {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Legacy-bridge globals (Round 3 — Round 4 will drop these in favor of
-// data-action event delegation). Inline V.32.9 already uses
-// `data-action="*"` for the product grid; the globals below let other
-// parts of the inline script (cart bar / order history filter chips)
-// call into the Vite loaders by name during the parallel phase.
+// Round 4 (V.0.5): Single namespaced debug surface — frozen, minimal.
+//
+// Removed (vs V.0.4):
+//   - 12 `window.B2B_CATALOG_*` legacy bridge globals
+//   - `helpers` / `renderers` / `loaders` parallel surfaces on
+//     `window.DINOCO_B2B_CATALOG` — those existed for the parallel-render
+//     phase. Round 4 owns rendering autonomously via event delegation;
+//     external callers should `import` from the bundle directly.
+//
+// Kept (for console testing parity with B2F Maker V.0.5):
+//   - version
+//   - bootstrap (re-bootstrap, e.g. for tests)
+//   - router (read-only navigation helpers)
+//   - api factory (createB2BCatalogApi)
 // ─────────────────────────────────────────────────────────────────────
-if (typeof window !== "undefined") {
-    /** @type {any} */
-    const w = window;
-    w.B2B_CATALOG_GO_TO_TAB = goToTab;
-    w.B2B_CATALOG_OPEN_SET_DETAIL = openSetDetail;
-    w.B2B_CATALOG_CLOSE_SET_DETAIL = closeSetDetail;
-    w.B2B_CATALOG_ADD_TO_CART = handleAddToCart;
-    w.B2B_CATALOG_INCREMENT = handleIncrement;
-    w.B2B_CATALOG_DECREMENT = handleDecrement;
-    w.B2B_CATALOG_HISTORY_FILTER = handleHistoryFilter;
-    w.B2B_CATALOG_LOAD_MORE = handleLoadMore;
-    w.B2B_CATALOG_SUBMIT_ORDER = handleSubmitOrder;
-    w.B2B_CATALOG_CART_REMOVE = handleCartItemRemove;
-    w.B2B_CATALOG_ADD_SET = handleAddSet;
-    w.B2B_CATALOG_SUB_STEP = handleSubItemStep;
-}
-
-// Stable debug surface — extends Round 1+2 helpers with Round 3 router
-// + API + loaders. Frozen so external callers can inspect the version
-// + helpers but not mutate the surface.
 if (typeof window !== "undefined") {
     window.DINOCO_B2B_CATALOG = Object.freeze({
         version: VERSION,
         bootstrap,
-        helpers: Object.freeze({
-            // lang
-            L, setupLanguage, getLang,
-            // format
-            formatNumber, formatCurrency, formatDate, escHtml,
-            // dom
-            showToast, showAuthError, showLinkExpired,
-            showLoading, hideLoading, lockBtn, unlockBtn,
-            // pricing
-            computeDealerPrice, validateMOQ, computeBoxes,
-            // hierarchy
-            getLeafSkus, isLeafSku, isTopLevelSet,
-            computeHierarchyStock, getAncestorSkus,
-            // cart
-            loadCart, saveCart, setCartQty, incrCartQty,
-            computeItemCount, computeTotal, toOrderItems,
-            detectCartDuplicates, clearCart, CART_STORAGE_KEY,
-        }),
-        // Round 2 — page renderers.
-        renderers: Object.freeze({
-            // home
-            productMatchesModel, renderModelCard, renderModelRow,
-            shouldShowModelLabel, renderCategoryCard, renderCategoryRow,
-            shouldShowCategoryLabel, renderHome, renderViewState,
-            collectCategoriesForModel, collectModelsForCategory,
-            renderCrossFilterPills,
-            // catalog
-            filterProducts, formatEtaDate, renderProductCard, renderProducts,
-            // SET Detail
-            buildB2bStepper, renderSetDetailMainStepper,
-            updateSetDetailAddBtn, renderSetDetailItems,
-            // history
-            HISTORY_FILTERS, STATUS_COLORS, STATUS_LABELS,
-            getStatusColor, getStatusLabel, renderHistoryFilter,
-            renderHistoryCard, renderLoadMoreButton, renderHistory,
-            // cart
-            updateCartBar, renderCartModalItem, renderCartEmptyState,
-            renderCartNoteSection, renderCartItems, renderRecommendedChips,
-        }),
-        // Round 3 — router + API + loaders.
         router: Object.freeze({
-            getCurrentTab, getCurrentSetSku, isSetDetailOpen,
-            goToTab, openSetDetail, closeSetDetail,
-            back: routerBack, setupHashRouter, dispatchInitial,
+            getCurrentTab,
+            getCurrentSetSku,
+            isSetDetailOpen,
+            goToTab,
+            openSetDetail,
+            closeSetDetail,
+            back: routerBack,
+            setupHashRouter,
+            dispatchInitial,
         }),
         api: Object.freeze({ createB2BCatalogApi }),
-        loaders: Object.freeze({
-            // catalog
-            setupCatalog, loadCatalog, renderCatalog,
-            handleAddToCart, handleIncrement, handleDecrement,
-            handleOpenSetDetail,
-            // home
-            setupHome, loadHome,
-            applyModelFilter, applyCategoryFilter,
-            applyCrossFilter, resetFilters,
-            // history
-            setupHistory, loadHistory,
-            handleHistoryFilter, handleLoadMore, handleCancelOrder,
-            // SET Detail
-            setupSetDetail, loadSetDetail,
-            handleAddSet, handleSubItemStep,
-            // cart
-            setupCart, loadCartModal,
-            handleSubmitOrder, handleCartItemRemove, getCartTotals,
-        }),
     });
 }
