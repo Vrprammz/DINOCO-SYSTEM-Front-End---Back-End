@@ -1,5 +1,5 @@
 /**
- * B2F Maker LIFF — Vite entry (V.0.3 Round 2 page renderers)
+ * B2F Maker LIFF — Vite entry (V.0.4 Round 3 router + API + page bootstrap)
  *
  * MIGRATION TARGET: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *
@@ -9,21 +9,31 @@
  *   ✅ 6 utility modules (`./utils/{lang,format,dom,jwt,badges,timeline}.js`)
  *   ✅ Foundation bootstrap
  *
- * Round 2 (V.0.3 — this commit):
+ * Round 2 (V.0.3):
  *   ✅ Full `buildTimeline()` body (utils/timeline.js — was stub in R1)
- *   ✅ 5 page renderers in `./pages/`:
- *      - confirm.js  (renderConfirmPage + renderItemRow + attachConfirmHandlers)
- *      - detail.js   (renderDetailPage + renderDetailItem)
- *      - reschedule.js (renderRescheduleList + renderReschedulePage +
- *                       attachRescheduleHandler)
- *      - list.js     (renderListPage + filter state)
- *      - deliver.js  (renderDeliverPage + renderDeliverForm)
+ *   ✅ 5 page renderers in `./pages/`
  *   ✅ Renderers exposed via `window.DINOCO_B2F_MAKER_RENDERERS` for
  *      inline-bridge use during cutover.
  *
- * Round 3+ scope (NOT in this file yet):
- *   ⏳ Router (?view= / JWT page fallback) + apiCall wrapper
- *   ⏳ Page bootstrap functions (loadConfirmPage / loadDetailPage / etc.)
+ * Round 3 (V.0.4 — this commit):
+ *   ✅ Router (`./router.js`) — getCurrentView / goToPage / goToPageWithPO /
+ *      setupRouter / dispatchInitial. Supports both V.4.7 reload-style and
+ *      SPA-style (history.pushState) navigation. Production stays on reload.
+ *   ✅ Maker API wrapper (`./api.js`) — createMakerApi() with named methods
+ *      (confirmPO / rejectPO / reschedulePO / deliverLot / getPODetail /
+ *      getMakerPOList) + auto X-Idempotency-Key on mutations + 401/410/409
+ *      error mapping.
+ *   ✅ 5 page loaders in `./loaders/` — confirm / detail / reschedule / list /
+ *      deliver. Each owns its load + render + handler-attach pipeline. Pure
+ *      port of inline V.4.7 `loadConfirmPage` / `handleConfirm` / etc.
+ *   ✅ Legacy bridge — `window.goToPage` / `window.goToPageWithPO` /
+ *      `window.b2fOpenDeliverForm` / `window.b2fFillAllRemaining` /
+ *      `window.b2fStepQty` / `window.b2fSubmitDeliver` re-exposed so existing
+ *      inline JS in Snippet 4 V.4.7 (still rendering pages when flag OFF)
+ *      keeps working. Round 4 will drop these.
+ *
+ * Round 4+ scope (NOT in this file yet):
+ *   ⏳ Inline-bridge cleanup (entry.js owns full bootstrap, drop window.* legacy bridge)
  *   ⏳ Cut-over (drop inline JS from Snippet 4)
  *
  * Surface area (per V.4.7):
@@ -43,7 +53,7 @@
 import "./styles.css";
 
 import { initLiff } from "../../shared/liff-init.js";
-import { createApi, wpRestUrl } from "../../shared/api-client.js";
+import { wpRestUrl } from "../../shared/api-client.js";
 
 import {
     L,
@@ -108,12 +118,44 @@ import {
     renderDeliverForm,
 } from "./pages/deliver.js";
 
-const BOOT_MARKER = "[b2f-maker] Vite bundle loaded (V.0.3 Round 2 — page renderers)";
+// Round 3 — router + API wrapper + loaders
+import {
+    setupRouter,
+    goToPage,
+    goToPageWithPO,
+    getCurrentView,
+    getCurrentPoId,
+    dispatchInitial,
+} from "./router.js";
+import { createMakerApi } from "./api.js";
+import {
+    setupConfirm,
+    loadConfirmPage,
+    handleConfirmSubmit,
+    handleRejectSubmit,
+} from "./loaders/confirm.js";
+import { setupDetail, loadDetailPage } from "./loaders/detail.js";
+import {
+    setupReschedule,
+    loadReschedulePage,
+    handleRescheduleSubmit,
+} from "./loaders/reschedule.js";
+import { setupList, loadListPage } from "./loaders/list.js";
+import {
+    setupDeliver,
+    loadDeliverPage,
+    b2fOpenDeliverForm,
+    b2fFillAllRemaining,
+    b2fStepQty,
+    handleDeliverSubmit,
+} from "./loaders/deliver.js";
+
+const BOOT_MARKER =
+    "[b2f-maker] Vite bundle loaded (V.0.4 Round 3 — router + API + loaders)";
 console.info(BOOT_MARKER);
 
 /**
- * Foundation bootstrap (Round 1 — does NOT yet render pages).
- * Round 2 will add page routing + renderers.
+ * Full-featured bootstrap (Round 3 — wires router + loaders).
  *
  * @param {{
  *   liffId?: string,
@@ -121,6 +163,7 @@ console.info(BOOT_MARKER);
  *   makerToken?: string,
  *   currency?: string,
  *   orderIntentEnabled?: boolean,
+ *   useHistoryApi?: boolean,
  * }} [opts]
  */
 export async function bootstrap(opts = {}) {
@@ -141,17 +184,68 @@ export async function bootstrap(opts = {}) {
     }
     setupLanguage(currency);
 
-    const api = createApi({
+    // Round 3 — Maker-scoped API wrapper (replaces ad-hoc apiCall)
+    const api = createMakerApi({
         base: opts.restUrl || wpRestUrl("b2f/v1"),
         token: opts.makerToken,
-        tokenHeader: "X-B2F-Token",
+        lineUid: (ctx && ctx.profile && ctx.profile.userId) || "",
+        onAuthExpired: async () => {
+            // Token expired: re-init LIFF (will trigger login redirect when
+            // not in client). Caller may swap this for a softer toast.
+            try {
+                await initLiff(liffId);
+            } catch {
+                /* swallow */
+            }
+        },
+        onCancelledPO: (msg) => {
+            showError(
+                L("PO ถูกยกเลิก", "PO Cancelled", "PO已取消"),
+                msg
+            );
+        },
     });
 
     setupOfflineDetection();
 
+    // Shared PO data ref — confirm/detail/reschedule loaders write current PO
+    // here so subsequent navigation can read it without re-fetching.
+    const poDataRef = { current: null };
+
+    // Wire each loader's deps once at bootstrap (idempotent).
+    setupConfirm({
+        api,
+        lineUid: (ctx && ctx.profile && ctx.profile.userId) || "",
+        poDataRef,
+        onSuccessNavigate: () => goToPage("detail"),
+    });
+    setupDetail({ api, poDataRef });
+    setupReschedule({
+        api,
+        lineUid: (ctx && ctx.profile && ctx.profile.userId) || "",
+        poDataRef,
+        onSuccessNavigate: () => goToPage("detail"),
+    });
+    setupList({ api, orderIntentEnabled: !!opts.orderIntentEnabled });
+    setupDeliver({
+        api,
+        lineUid: (ctx && ctx.profile && ctx.profile.userId) || "",
+        poDataRef,
+    });
+
+    // Wire router + handler map (each handler accepts optional po_id arg).
+    setupRouter({
+        useHistoryApi: !!opts.useHistoryApi,
+        handlers: {
+            confirm: loadConfirmPage,
+            detail: loadDetailPage,
+            reschedule: loadReschedulePage,
+            list: loadListPage,
+            deliver: loadDeliverPage,
+        },
+    });
+
     // Round 2: expose page renderers for inline-bridge during cutover.
-    // Round 3 will replace inline `renderConfirmPage` / `renderDetailPage` /
-    // etc. globals in Snippet 4 V.4.7 with calls into this namespace.
     const renderers = {
         confirm: renderConfirmPage,
         confirmItem: renderItemRow,
@@ -168,6 +262,61 @@ export async function bootstrap(opts = {}) {
 
     if (typeof window !== "undefined") {
         window.DINOCO_B2F_MAKER_RENDERERS = renderers;
+
+        // Round 3 — legacy global bridge so existing Snippet 4 V.4.7 inline
+        // JS keeps working when bundle co-exists with inline render. Round 4
+        // will drop this bridge once inline JS is removed.
+        if (typeof window.goToPage !== "function") {
+            window.goToPage = goToPage;
+        }
+        if (typeof window.goToPageWithPO !== "function") {
+            window.goToPageWithPO = goToPageWithPO;
+        }
+        if (typeof window.b2fOpenDeliverForm !== "function") {
+            window.b2fOpenDeliverForm = b2fOpenDeliverForm;
+        }
+        if (typeof window.b2fFillAllRemaining !== "function") {
+            window.b2fFillAllRemaining = b2fFillAllRemaining;
+        }
+        if (typeof window.b2fStepQty !== "function") {
+            window.b2fStepQty = b2fStepQty;
+        }
+        if (typeof window.b2fSubmitDeliver !== "function") {
+            window.b2fSubmitDeliver = handleDeliverSubmit;
+        }
+        // V.4.7 line 1464 deliver form ←Back button uses inline `loadDeliverPage()`.
+        if (typeof window.loadDeliverPage !== "function") {
+            window.loadDeliverPage = loadDeliverPage;
+        }
+    }
+
+    // Initial dispatch — render the page user landed on (or default 'list').
+    const initialView = getCurrentView();
+    const initialPoId = getCurrentPoId();
+    try {
+        // For full-reload mode (production), router doesn't dispatch on
+        // setupRouter — we trigger it manually here, mirroring V.4.7 init()
+        // line 413-419 switch.
+        switch (initialView) {
+            case "confirm":
+                await loadConfirmPage(initialPoId);
+                break;
+            case "detail":
+                await loadDetailPage(initialPoId);
+                break;
+            case "reschedule":
+                await loadReschedulePage(initialPoId);
+                break;
+            case "deliver":
+                await loadDeliverPage();
+                break;
+            case "list":
+            default:
+                await loadListPage();
+                break;
+        }
+    } catch (err) {
+        console.error("[b2f-maker] initial dispatch failed", err);
     }
 
     return {
@@ -176,9 +325,7 @@ export async function bootstrap(opts = {}) {
         currency,
         lang: getLang(),
         renderers,
-        // Expose helpers so Round 3 page bootstrap can import via the
-        // returned facade rather than re-importing from utils. Keeps the
-        // public surface small + gives us a single rename point later.
+        router: { goToPage, goToPageWithPO, getCurrentView, dispatchInitial },
         helpers: {
             L,
             formatNumber,
@@ -224,8 +371,33 @@ if (typeof window !== "undefined" && window.DINOCO_B2F_MAKER_CONFIG) {
 // replacing globals with calls to `window.DINOCO_B2F_MAKER.helpers.*`.
 if (typeof window !== "undefined") {
     window.DINOCO_B2F_MAKER = Object.freeze({
-        version: "V.0.3",
+        version: "V.0.4",
         bootstrap,
+        // Round 3 — router + API factories for any Snippet 4 caller that
+        // wants to migrate piecemeal.
+        router: {
+            goToPage,
+            goToPageWithPO,
+            getCurrentView,
+            getCurrentPoId,
+            setupRouter,
+            dispatchInitial,
+        },
+        createMakerApi,
+        loaders: {
+            loadConfirmPage,
+            loadDetailPage,
+            loadReschedulePage,
+            loadListPage,
+            loadDeliverPage,
+            b2fOpenDeliverForm,
+            b2fFillAllRemaining,
+            b2fStepQty,
+            handleConfirmSubmit,
+            handleRejectSubmit,
+            handleRescheduleSubmit,
+            handleDeliverSubmit,
+        },
         helpers: {
             L,
             getLang,
