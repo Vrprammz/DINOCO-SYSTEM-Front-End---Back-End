@@ -89,6 +89,15 @@ interface Window {
     goToPage?: (page: string) => void;
     /** Legacy inline router with PO id arg — Snippet 4 V.4.7 inline. */
     goToPageWithPO?: (page: string, poId: string | number) => void;
+    /** Legacy inline deliver helpers — Snippet 4 V.4.7 inline. Round 3
+     *  re-exposes from loaders/deliver.js so existing inline onclick
+     *  handlers (b2fOpenDeliverForm / b2fStepQty / etc.) keep working
+     *  during the parallel-rendering window. Round 4 drops these. */
+    b2fOpenDeliverForm?: (poId: string | number) => Promise<void>;
+    b2fFillAllRemaining?: () => void;
+    b2fStepQty?: (btn: HTMLElement, delta: number) => void;
+    b2fSubmitDeliver?: () => Promise<void>;
+    loadDeliverPage?: () => Promise<void>;
 }
 
 /**
@@ -99,4 +108,5 @@ interface Window {
 interface Error {
     status?: number;
     body?: any;
+    code?: string;
 }
