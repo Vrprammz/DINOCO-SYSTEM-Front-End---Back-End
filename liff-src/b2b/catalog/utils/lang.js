@@ -19,12 +19,11 @@
  * Signature mirrors B2F maker `L(th, en, zh)` so modules can be moved
  * between surfaces without refactor. The `en` and `zh` args are ignored.
  *
- * @param {string} th — Thai string (always returned)
- * @param {string} [_en] — English fallback (ignored in B2B)
- * @param {string} [_zh] — Chinese fallback (ignored in B2B)
+ * @param {string} th - Thai string (always returned)
+ * @param {string} [_en] - English fallback (ignored in B2B)
+ * @param {string} [_zh] - Chinese fallback (ignored in B2B)
  * @returns {string}
  */
-// eslint-disable-next-line no-unused-vars
 export function L(th, _en, _zh) {
     return th;
 }

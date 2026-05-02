@@ -44,7 +44,7 @@ export function formatNumber(n) {
  * single helper so callers don't have to remember the glyph.
  *
  * @param {number|string|null|undefined} n
- * @param {string} [currency] — currency code (defaults to "THB"/"฿")
+ * @param {string} [currency] - currency code (defaults to "THB"/"฿")
  * @returns {string}
  */
 export function formatCurrency(n, currency) {
@@ -82,11 +82,12 @@ export function formatDate(dateStr) {
  * for `<>&"'` plus extended Unicode without a custom map. SSR fallback
  * (jsdom) handles this identically.
  *
- * @param {string|null|undefined} str
+ * @param {string|number|null|undefined} str
  * @returns {string}
  */
 export function escHtml(str) {
-    if (!str && str !== 0) return "";
+    // Defensive: handle 0 / "0" as a valid value (truthiness edge case).
+    if (str === null || str === undefined || str === "") return "";
     const d = document.createElement("div");
     d.appendChild(document.createTextNode(String(str)));
     return d.innerHTML;

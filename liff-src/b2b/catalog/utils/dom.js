@@ -143,7 +143,7 @@ export function showLinkExpired() {
 /**
  * Show the submit overlay (spinner + message) during /place-order.
  *
- * @param {string} [message] — defaults to inline V.32.9 message
+ * @param {string} [message] - defaults to inline V.32.9 message
  */
 export function showLoading(message) {
     const overlay = document.getElementById("submitOverlay");
@@ -166,7 +166,7 @@ export function hideLoading() {
  * in a finally block to guarantee release.
  *
  * @param {HTMLButtonElement|null|undefined} btn
- * @param {string} [busyText] — optional replacement label while locked
+ * @param {string} [busyText] - optional replacement label while locked
  */
 export function lockBtn(btn, busyText) {
     if (LOCKED) return false;
@@ -203,8 +203,12 @@ export function unlockBtn(btn) {
  */
 export function setupOfflineDetection() {
     if (typeof window === "undefined") return;
-    if (window.__b2bCatOfflineWired) return;
-    window.__b2bCatOfflineWired = true;
+    // Sentinel on window — type-erased via cast since vanilla Window
+    // doesn't declare arbitrary props (this is intentional: tests + Snippet 4
+    // inline use the same idempotency pattern).
+    const w = /** @type {any} */ (window);
+    if (w.__b2bCatOfflineWired) return;
+    w.__b2bCatOfflineWired = true;
     window.addEventListener("offline", () => {
         showToast("⚠️ ออฟไลน์ — ตรวจสอบสัญญาณ");
     });

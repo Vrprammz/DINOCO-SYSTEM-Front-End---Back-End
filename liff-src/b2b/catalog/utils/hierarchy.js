@@ -32,10 +32,10 @@
  *
  * Mirrors `dinoco_get_leaf_skus($sku)` in PHP V.7.1.
  *
- * @param {string} sku — the SKU to resolve (case-insensitive)
- * @param {Record<string, string[]>} relations — flat parent → children map
+ * @param {string} sku - the SKU to resolve (case-insensitive)
+ * @param {Record<string, string[]>} relations - flat parent to children map
  *   keys + values UPPERCASE (matches `dinoco_sku_relations` shape)
- * @param {Set<string>} [_visited] — internal: branch-scoped cycle guard
+ * @param {Set<string>} [_visited] - internal: branch-scoped cycle guard
  * @returns {string[]} flat list of leaf SKUs (uppercase, deduped via array_unique)
  */
 export function getLeafSkus(sku, relations, _visited) {
@@ -115,9 +115,9 @@ export function isTopLevelSet(sku, relations) {
  * we expose for live recompute after a successful order).
  *
  * @param {string} sku
- * @param {Record<string, number>} stockMap — leaf SKU → stock_qty
- * @param {Record<string, string[]>} relations — flat parent → children
- * @param {Set<string>} [_visited] — internal cycle guard (branch-scoped)
+ * @param {Record<string, number>} stockMap - leaf SKU to stock_qty
+ * @param {Record<string, string[]>} relations - flat parent to children
+ * @param {Set<string>} [_visited] - internal cycle guard (branch-scoped)
  * @returns {number}
  */
 export function computeHierarchyStock(sku, stockMap, relations, _visited) {

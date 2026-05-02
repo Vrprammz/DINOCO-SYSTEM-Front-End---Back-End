@@ -42,8 +42,8 @@
  *     `b2b_discount_percent` (Standard tier default).
  *   - This helper does NOT do that fallback — pass the resolved % in.
  *
- * @param {number} basePrice — catalog (retail) price in baht
- * @param {number} discountPct — % discount (0-100) for the tier
+ * @param {number} basePrice - catalog (retail) price in baht
+ * @param {number} discountPct - % discount (0-100) for the tier
  * @returns {number} dealer price (rounded to 2 decimals to match PHP)
  */
 export function computeDealerPrice(basePrice, discountPct) {
