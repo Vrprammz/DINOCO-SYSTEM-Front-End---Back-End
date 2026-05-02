@@ -1,5 +1,5 @@
 /**
- * B2F Maker LIFF — PO List page renderer (V.0.3 Round 2)
+ * B2F Maker LIFF — PO List page renderer (V.0.5 Round 4)
  *
  * MIGRATION SOURCE: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *   - lines 1138-1227: renderListPage + listFilter state + filter tab events
@@ -10,7 +10,9 @@
  *   - Each PO card shows: number / status / item count / created date /
  *     ETA (optional) / total / V.4.6 mode-summary pill / status-info badges /
  *     timeline bars.
- *   - Tap card → goToPageWithPO('detail', id).
+ *   - Tap card → navigate to detail with po_id (Round 4: handled by
+ *     event delegation in entry.js — `data-action="navigate-with-po"
+ *     data-view="detail" data-po-id="..."`).
  *   - Tap filter tab → re-render same poList with new filter (state held
  *     in module-level `listFilter` mirroring inline `var listFilter`).
  *
@@ -106,7 +108,7 @@ export function renderListPage(poList, opts = {}) {
     } else {
         filtered.forEach(function (po) {
             cardsHtml +=
-                '<div class="b2f-po-card" data-po-id="' +
+                '<div class="b2f-po-card" data-action="navigate-with-po" data-view="detail" data-po-id="' +
                 escHtml(String(po.ID || po.id)) +
                 '">' +
                 '<div class="po-header">' +
@@ -166,7 +168,8 @@ export function renderListPage(poList, opts = {}) {
         cardsHtml +
         "</div>";
 
-    // Filter tab click → switch + re-render
+    // Filter tab click → switch + re-render. Filter state is renderer-local;
+    // tab buttons keep their inline listener (no global navigation).
     $$(".b2f-filter-tab").forEach(function (tab) {
         tab.addEventListener("click", function () {
             listFilter = this.dataset.filter;
@@ -174,19 +177,6 @@ export function renderListPage(poList, opts = {}) {
         });
     });
 
-    // Card click → goToPageWithPO/detail. Inline V.4.7 uses globals
-    // `goToPageWithPO` + `goToPage` — preserved here verbatim. Round 4
-    // will swap to a shared router helper.
-    $$(".b2f-po-card").forEach(function (card) {
-        card.addEventListener("click", function () {
-            const poId =
-                this.dataset.poId || this.getAttribute("data-po-id");
-            const w = typeof window !== "undefined" ? window : null;
-            if (poId && w && typeof w.goToPageWithPO === "function") {
-                w.goToPageWithPO("detail", poId);
-            } else if (w && typeof w.goToPage === "function") {
-                w.goToPage("detail");
-            }
-        });
-    });
+    // Card click → handled by event delegation in entry.js via
+    // `data-action="navigate-with-po"` attribute. No inline listener here.
 }

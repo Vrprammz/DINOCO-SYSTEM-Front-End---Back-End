@@ -1,5 +1,5 @@
 /**
- * B2F Maker LIFF — Deliver pages renderer (V.0.3 Round 2)
+ * B2F Maker LIFF — Deliver pages renderer (V.0.5 Round 4)
  *
  * MIGRATION SOURCE: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *   - lines 1247-1368: renderDeliverPage (PO list ready to ship)
@@ -12,12 +12,14 @@
  *   - Deliver form: per-SKU qty stepper (- / number / +) with max =
  *     remaining, "Fill all (auto)" button, note textarea, submit.
  *   - DD-3 hierarchy: SET header rows (purple) flatten into form.
- *   - Inline `onclick` handlers preserved:
- *       - `b2fOpenDeliverForm(id)` — load + render form (Snippet 4 owns)
- *       - `loadDeliverPage()` — back to list
- *       - `b2fStepQty(this, ±1)` — stepper +/- buttons
- *       - `b2fFillAllRemaining()` / `b2fSubmitDeliver()` — global helpers
- *     Round 4 will migrate these to imported handlers + event delegation.
+ *   - Round 4: inline `onclick` handlers migrated to data-action attrs:
+ *       - `b2fOpenDeliverForm(id)` → `data-action="deliver-open" data-po-id`
+ *       - `loadDeliverPage()`     → `data-action="deliver-back"`
+ *       - `b2fStepQty(this, ±1)`  → `data-action="deliver-step" data-delta`
+ *       - `b2fFillAllRemaining()` → `data-action="deliver-fill-all"`
+ *       - `b2fSubmitDeliver()`    → `data-action="deliver-submit"`
+ *       - `goToPage('list')`      → `data-action="navigate" data-view="list"`
+ *   - Visual + behavior identical (REG-029 byte-equivalent).
  */
 
 import { L, statusLabel } from "../utils/lang.js";
@@ -271,9 +273,9 @@ export function renderDeliverPage(poList) {
                 '"' +
                 (btnDisabled
                     ? " disabled"
-                    : ' onclick="event.stopPropagation();b2fOpenDeliverForm(' +
-                      (po.ID || po.id) +
-                      ')"') +
+                    : ' data-action="deliver-open" data-po-id="' +
+                      escHtml(String(po.ID || po.id)) +
+                      '"') +
                 ">" +
                 (btnDisabled
                     ? "✅ " +
@@ -305,7 +307,7 @@ export function renderDeliverPage(poList) {
         cardsHtml +
         "</div>" +
         '<div style="padding:12px;text-align:center;">' +
-        "<button class=\"b2f-btn b2f-btn-outline\" onclick=\"goToPage('list')\">← " +
+        '<button class="b2f-btn b2f-btn-outline" data-action="navigate" data-view="list">← ' +
         L("กลับรายการ", "Back to list", "返回列表") +
         "</button>" +
         "</div>";
@@ -456,7 +458,7 @@ export function renderDeliverForm(po) {
                 L("ส่งรอบนี้:", "This shipment:", "本次发货:") +
                 "</div>" +
                 '<div style="display:flex;align-items:center;gap:6px;">' +
-                '<button type="button" onclick="b2fStepQty(this,-1)" style="width:48px;height:48px;border:1px solid #d1d5db;border-radius:10px;background:#f8fafc;font-size:22px;font-weight:700;cursor:pointer;color:#374151;">-</button>' +
+                '<button type="button" data-action="deliver-step" data-delta="-1" style="width:48px;height:48px;border:1px solid #d1d5db;border-radius:10px;background:#f8fafc;font-size:22px;font-weight:700;cursor:pointer;color:#374151;">-</button>' +
                 '<input type="number" inputmode="numeric" pattern="[0-9]*" class="b2f-dlv-qty" data-idx="' +
                 idx +
                 '" data-sku="' +
@@ -466,7 +468,7 @@ export function renderDeliverForm(po) {
                 remaining +
                 '" value="0" ' +
                 'style="flex:1;padding:12px;border:2px solid #d1d5db;border-radius:12px;font-size:28px;font-weight:700;text-align:center;max-width:120px;">' +
-                '<button type="button" onclick="b2fStepQty(this,1)" style="width:48px;height:48px;border:1px solid #d1d5db;border-radius:10px;background:#f8fafc;font-size:22px;font-weight:700;cursor:pointer;color:#374151;">+</button>' +
+                '<button type="button" data-action="deliver-step" data-delta="1" style="width:48px;height:48px;border:1px solid #d1d5db;border-radius:10px;background:#f8fafc;font-size:22px;font-weight:700;cursor:pointer;color:#374151;">+</button>' +
                 '<span style="font-size:13px;color:#94a3b8;font-weight:600;">/ ' +
                 remaining +
                 "</span>" +
@@ -480,7 +482,7 @@ export function renderDeliverForm(po) {
         '<div class="b2f-liff-header">' +
         '<div class="b2f-header-content">' +
         '<div style="display:flex;align-items:center;gap:10px;">' +
-        '<button onclick="loadDeliverPage()" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;color:#fff;">←</button>' +
+        '<button data-action="deliver-back" style="background:none;border:none;font-size:20px;cursor:pointer;padding:4px;color:#fff;">←</button>' +
         '<div><h1 style="margin:0;">' +
         L("🚛 กรอกรายการจัดส่ง", "🚛 Shipment Form", "🚛 发货表单") +
         "</h1>" +
@@ -491,7 +493,7 @@ export function renderDeliverForm(po) {
         '<img src="https://www.dinoco.in.th/wp-content/uploads/2026/01/sss.png" class="b2f-logo" alt="DINOCO">' +
         "</div>" +
         '<div style="padding:0 12px;">' +
-        '<button class="b2f-btn b2f-btn-secondary" style="width:100%;margin-bottom:12px;font-size:13px;padding:10px;" onclick="b2fFillAllRemaining()">' +
+        '<button class="b2f-btn b2f-btn-secondary" style="width:100%;margin-bottom:12px;font-size:13px;padding:10px;" data-action="deliver-fill-all">' +
         L("📋 ส่งครบทุกรายการ (auto-fill)", "📋 Fill all (auto)", "📋 全部填满") +
         "</button>" +
         rows +
@@ -502,10 +504,10 @@ export function renderDeliverForm(po) {
         'style="width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px;font-size:13px;box-sizing:border-box;"></textarea>' +
         "</div>" +
         '<div style="display:flex;gap:8px;padding-bottom:20px;">' +
-        '<button class="b2f-btn b2f-btn-secondary" style="flex:1;padding:12px;" onclick="loadDeliverPage()">' +
+        '<button class="b2f-btn b2f-btn-secondary" style="flex:1;padding:12px;" data-action="deliver-back">' +
         L("← กลับ", "← Back", "← 返回") +
         "</button>" +
-        '<button class="b2f-btn b2f-btn-primary" style="flex:2;padding:12px;font-size:14px;" onclick="b2fSubmitDeliver()">' +
+        '<button class="b2f-btn b2f-btn-primary" style="flex:2;padding:12px;font-size:14px;" data-action="deliver-submit">' +
         L("🚛 ยืนยันส่งของ", "🚛 Confirm Shipment", "🚛 确认发货") +
         "</button>" +
         "</div>" +

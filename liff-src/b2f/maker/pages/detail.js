@@ -1,5 +1,5 @@
 /**
- * B2F Maker LIFF — Detail page renderer (V.0.3 Round 2)
+ * B2F Maker LIFF — Detail page renderer (V.0.5 Round 4)
  *
  * MIGRATION SOURCE: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *   - lines 878-967: renderDetailPage + renderDetailItem
@@ -9,9 +9,9 @@
  *   - Image thumbnail when item has `image_url` / `poi_image_url`.
  *   - Per-item received progress (`receivedPct`) + reject count.
  *   - Status-aware action buttons (Confirm / Reschedule / Ship more).
- *   - Inline `onclick` handlers preserved (`goToPage('confirm')` etc.) —
- *     Round 4 will replace with event delegation. Snippet 4 still defines
- *     `window.goToPage` until cut-over.
+ *   - Round 4: inline `onclick="goToPage('...')"` migrated to
+ *     `data-action="navigate"` + `data-view="..."` (event delegation in
+ *     entry.js). Visual + behavior identical (REG-029 byte-equivalent).
  *   - Calls `buildTimeline(po)` (now full impl in utils/timeline.js).
  */
 
@@ -135,13 +135,13 @@ export function renderDetailPage(po) {
     if (po.po_status === "submitted" || po.po_status === "amended") {
         actionsHtml =
             '<div class="b2f-liff-actions">' +
-            "<button class=\"b2f-btn b2f-btn-accent\" onclick=\"goToPage('confirm')\" style=\"width:100%;\">✅ " +
+            '<button class="b2f-btn b2f-btn-accent" data-action="navigate" data-view="confirm" style="width:100%;">✅ ' +
             L("ไปยืนยัน PO", "Confirm PO", "确认订单") +
             "</button></div>";
     } else if (po.po_status === "confirmed") {
         actionsHtml =
             '<div class="b2f-liff-actions">' +
-            "<button class=\"b2f-btn b2f-btn-outline\" onclick=\"goToPage('reschedule')\">📅 " +
+            '<button class="b2f-btn b2f-btn-outline" data-action="navigate" data-view="reschedule">📅 ' +
             L("ขอเลื่อนวันส่ง", "Request reschedule", "申请延期") +
             "</button></div>";
     } else if (
@@ -150,7 +150,7 @@ export function renderDetailPage(po) {
     ) {
         actionsHtml =
             '<div class="b2f-liff-actions">' +
-            "<button class=\"b2f-btn b2f-btn-accent\" onclick=\"goToPage('deliver')\" style=\"width:100%;\">📦 " +
+            '<button class="b2f-btn b2f-btn-accent" data-action="navigate" data-view="deliver" style="width:100%;">📦 ' +
             L("แจ้งส่งของเพิ่ม", "Ship more items", "继续发货") +
             "</button></div>";
     }

@@ -1,5 +1,5 @@
 /**
- * B2F Maker LIFF — Confirm page renderer (V.0.3 Round 2)
+ * B2F Maker LIFF — Confirm page renderer (V.0.5 Round 4)
  *
  * MIGRATION SOURCE: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *   - lines 701-812: renderConfirmPage + renderItemRow (DD-3 SET grouping)
@@ -9,13 +9,14 @@
  *     #ede9fe / #7c3aed) + standalone fallback for legacy POs.
  *   - V.4.3 mode badge per item via `modeBadgeHtml(item)`.
  *   - 3-language strings via `L(th, en, zh)` — currency-aware.
- *   - inline event handlers preserved (#b2f-confirm-btn / #b2f-reject-btn /
- *     #b2f-confirm-reject) — Round 4 will migrate these to event delegation
- *     once we drop inline JS from Snippet 4.
+ *   - Round 4: confirm page already used id-based event listeners
+ *     (#b2f-confirm-btn / #b2f-reject-btn / #b2f-confirm-reject) — kept as-is
+ *     since `attachConfirmHandlers()` wires them imperatively, no global
+ *     bridge required.
  *
  * Renderer is pure — caller wires button event listeners after `innerHTML`
- * assignment. We export a small `attachConfirmHandlers()` helper so Round 3
- * (router + apiCall) can keep handler logic out of inline V.4.7.
+ * assignment. We export a small `attachConfirmHandlers()` helper so loaders
+ * can keep handler logic out of inline V.4.7.
  */
 
 import { L } from "../utils/lang.js";

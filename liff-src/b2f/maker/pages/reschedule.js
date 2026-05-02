@@ -1,16 +1,19 @@
 /**
- * B2F Maker LIFF — Reschedule pages renderer (V.0.3 Round 2)
+ * B2F Maker LIFF — Reschedule pages renderer (V.0.5 Round 4)
  *
  * MIGRATION SOURCE: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *   - lines 1043-1072: renderRescheduleList (PO list when no po_id)
  *   - lines 1074-1112: renderReschedulePage (form when po_id present)
  *
  * Behavioral parity:
- *   - List view: confirmed POs → tap → goToPageWithPO('reschedule', id)
+ *   - List view: confirmed POs → tap → navigate to reschedule with po_id
  *   - Form view: current ETA + items count + total → new date input
  *     (min = tomorrow) + reason textarea → "ขอเลื่อนวันส่ง" submit.
- *   - Inline `onclick="goToPageWithPO(...)"` preserved — Round 4 migrate.
- *   - Inline `onclick="goToPage('detail')"` preserved (back button).
+ *   - Round 4: inline `onclick="goToPageWithPO('reschedule', id)"` migrated to
+ *     `data-action="navigate-with-po" data-view="reschedule" data-po-id="..."`.
+ *   - Round 4: inline `onclick="goToPage('detail')"` (back button) migrated to
+ *     `data-action="navigate" data-view="detail"`.
+ *   - Visual + behavior identical (REG-029 byte-equivalent).
  */
 
 import { L, statusLabel } from "../utils/lang.js";
@@ -41,12 +44,11 @@ export function renderRescheduleList(poList) {
             "</p></div>";
     } else {
         poList.forEach(function (po) {
+            const poIdRaw = String(po.ID || po.id);
             cardsHtml +=
-                '<div class="b2f-po-card" style="cursor:pointer" data-po-id="' +
-                escHtml(String(po.ID || po.id)) +
-                "\" onclick=\"goToPageWithPO('reschedule','" +
-                (po.ID || po.id) +
-                "')\">" +
+                '<div class="b2f-po-card" style="cursor:pointer" data-action="navigate-with-po" data-view="reschedule" data-po-id="' +
+                escHtml(poIdRaw) +
+                '">' +
                 '<div class="po-header">' +
                 '<span class="po-number">' +
                 escHtml(po.po_number) +
@@ -181,7 +183,7 @@ export function renderReschedulePage(po) {
         "</div>" +
         "</div>" +
         '<div class="b2f-liff-actions">' +
-        "<button class=\"b2f-btn b2f-btn-outline\" onclick=\"goToPage('detail')\">← " +
+        '<button class="b2f-btn b2f-btn-outline" data-action="navigate" data-view="detail">← ' +
         L("กลับ", "Back", "返回") +
         "</button>" +
         '<button class="b2f-btn b2f-btn-accent" id="b2f-reschedule-btn">📅 ' +
