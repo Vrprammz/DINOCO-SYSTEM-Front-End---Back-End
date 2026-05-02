@@ -6,7 +6,10 @@
  * shared module raises every entry's size, easy to miss in PR review.
  *
  * Phase 5 audit target was <10KB per shell entry. Current state:
- *   - b2b-catalog: ~3.5KB
+ *   - b2b-catalog: ~27.6KB (Round 2 — adds 5 page modules / 12+ renderers
+ *                            on top of Round 1 utilities. gzip ~9.1KB.
+ *                            See liff-src/b2b/catalog/ and
+ *                            runbooks/PHASE-2-VITE-MIGRATION.md.)
  *   - b2f-catalog: ~620B
  *   - b2f-maker:   ~55KB  (Round 3 — adds router + Maker API wrapper +
  *                          5 page loaders on top of Round 2 page
