@@ -636,6 +636,48 @@ npm run typecheck            # → tsc --noEmit clean
 
 ---
 
+## Step 2.5 Round 9 — B2F Catalog LIFF code port (Round 1 — foundation + utilities) ✅ (2026-04-30)
+
+Foundation port for `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.13 → V.7.14 (annotation only — flag default OFF). Bundle V.0.1 stub → V.0.2 with CSS + 6 utility modules (`lang/format/dom/cart/hierarchy/badges`). 126 Jest tests added.
+
+Bundle: `b2f-catalog.<hash>.js` 10.75 KB (gzip 4.18 KB) + `.css` 31.40 KB (gzip 5.88 KB). REG-029 byte-identical preserved (inline render still active).
+
+Commit `239d5c0`.
+
+---
+
+## Step 2.5 Round 10 — B2F Catalog LIFF code port (Round 2 — page renderers) ✅ (2026-04-30)
+
+Continues from Round 9. Ports the 5 page renderers from inline `b2f_liff_page_js()` (V.7.14 lines 1380-3062+) into ES modules under `liff-src/b2f/catalog/pages/`. Inline V.7.14 stays UNCHANGED — renderers exposed via `window.DINOCO_B2F_CATALOG_RENDERERS` for inline-bridge fallback during Round 11+ cutover.
+
+### What landed in Round 10
+
+| File | LOC | Purpose |
+| --- | --- | --- |
+| `liff-src/b2f/catalog/pages/catalog.js` | ~290 | `renderProducts` + `renderProductCard` — V.7.0 3-card variants (set_assembled / sub_unit / cross_factory_assembly / single) + V.6.6 fallback + LCP fetchpriority="high" first 6 imgs + virtual SET amber badge + breadcrumb |
+| `liff-src/b2f/catalog/pages/setDetail.js` | ~225 | `renderSetDetailItems` + `renderSetDetailMainStepper` + `buildQtyStepperHtml` — DD-3 shared-leaf safe via forward-lookup `skuRelations` + `countTopSetsForProduct` callback. V.6.4 collapsed `+ สั่งแยก` button. V.7.5 UX-H14 MOQ hint |
+| `liff-src/b2f/catalog/pages/cart.js` | ~310 | `renderCartItems` (V.7.0 dual-section purple/amber, V.6.6 flat fallback) + `buildCartItemThumbHtml` (3-source priority chain) + `renderCartManufacturingSummary` + `computeCartManufacturingSummary` (DD-3 walk) |
+| `liff-src/b2f/catalog/pages/reviewGate.js` | ~165 | `renderReviewGate` (V.7.0 Submit Review Gate, V.7.11 a11y `role=tab`/`tabpanel` + `aria-orientation=vertical`) |
+| `liff-src/b2f/catalog/pages/filters.js` | ~205 | `renderModelFilter` + `renderTypeChips` + `applyVisibilityFilters` (V.5.1 hide-zero chips + V.5.3 model inheritance via descendants) |
+
+Bundle size: 10.75 KB → **29.39 KB** (gzip 9.55 KB) — still well under PERF-H6 155 KB inline target.
+
+Tests: 80 new Jest cases in `tests/jest/liff-b2f-catalog-pages.test.js` covering all 5 modules. Total Jest suite **947 → 1027** (+80).
+
+`entry.js` V.0.2 → V.0.3 exposes a frozen `window.DINOCO_B2F_CATALOG_RENDERERS` namespace so Round 11+ cutover can call renderers without re-importing.
+
+Snippet 8 V.7.14 → V.7.15 (annotation only — flag still default OFF, REG-029 byte-identical preserved).
+
+### Round 11+ roadmap (next sprints)
+
+1. **Round 11** — hash router + B2F API client + 5 page loaders (load makers / load products / submit PO / load history / virtual toggle persistence)
+2. **Round 12** — event delegation + maker-home + success screen + drop legacy globals after staging QA
+3. **Round 13** — final cut-over (inline `b2f_liff_page_js()` deleted from Snippet 8 — destructive, requires confirmation)
+
+Commit `b730551`.
+
+---
+
 ## Step 3 — Production deploy of bundles (TEMPLATE READY ⏸ DISABLED)
 
 `.github/workflows/liff-deploy.yml` ready. **Disabled by default** — `workflow_dispatch` only until secrets provisioned + first manual dry-run verified.

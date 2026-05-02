@@ -10,6 +10,39 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF B2F Catalog code port Round 2 — page renderers (2026-04-30)
+
+Second Vite-side migration round for the B2F Admin E-Catalog (`[B2F] Snippet 8` V.7.14 → V.7.15 annotation-only). Mirrors the B2B Catalog Round 2 + B2F Maker Round 2 patterns: ship 5 page-renderer modules as pure HTML builders + frozen `window.DINOCO_B2F_CATALOG_RENDERERS` namespace for inline-bridge fallback. Inline V.7.14 stays UNCHANGED — flag still default OFF (REG-029 byte-identical preserved).
+
+#### What landed
+
+- **5 page modules** under `liff-src/b2f/catalog/pages/`:
+  - `catalog.js` — `renderProducts` + `renderProductCard`. V.7.0 3-card variants (set_assembled / sub_unit / cross_factory_assembly / single) + V.6.6 fallback + LCP `fetchpriority="high"` first 6 imgs + virtual SET amber badge + breadcrumb.
+  - `setDetail.js` — `renderSetDetailItems` + `renderSetDetailMainStepper` + `buildQtyStepperHtml`. DD-3 shared-leaf safe via forward-lookup `skuRelations` + `countTopSetsForProduct` callback. V.6.4 collapsed `+ สั่งแยก` button when qty=0. V.7.5 UX-H14 MOQ hint.
+  - `cart.js` — `renderCartItems` (V.7.0 dual-section purple/amber, V.6.6 flat fallback) + `buildCartItemThumbHtml` (56×56, 3-source priority chain) + `renderCartManufacturingSummary` + `computeCartManufacturingSummary` (DD-3 walk). XSS-safe `intent_notes` via `escHtml`.
+  - `reviewGate.js` — `renderReviewGate` (V.7.0 Submit Review Gate, V.7.11 a11y `role=tab`/`tabpanel` + `aria-orientation=vertical` + `aria-labelledby`).
+  - `filters.js` — `renderModelFilter` + `renderTypeChips` + `applyVisibilityFilters`. V.5.1 hide-zero chips + V.5.3 model inheritance via descendants walk.
+- **80 Jest tests** in `tests/jest/liff-b2f-catalog-pages.test.js`. Total Jest suite **947 → 1027** (+80).
+- **`entry.js` V.0.2 → V.0.3** — exposes a frozen `window.DINOCO_B2F_CATALOG_RENDERERS` namespace (15 renderer functions) so Round 11+ cutover can call them without re-importing.
+
+#### Bundle delta
+
+| Bundle | Before (Round 1) | After (Round 2) |
+| --- | --- | --- |
+| `b2f-catalog.<hash>.js` | 10.75 KB (gzip 4.18 KB) | 29.39 KB (gzip 9.55 KB) |
+| `b2f-catalog.<hash>.css` | 31.40 KB (gzip 5.88 KB) | 31.40 KB (gzip 5.88 KB) |
+
+Still well under PERF-H6 155 KB inline target.
+
+#### Verification
+
+- `npm run lint` — clean (1 spurious `MAKER_ID` unused warning silenced via comment).
+- `npm run typecheck` — clean (3 type narrowings added: cart summary `Record` annotation, setDetail ctx default cast, MOQ `parseInt(String())` guard).
+- `npm run test:jest` — 1027 passed / 2 skipped / 0 failed across 37 suites.
+- `npm run build:liff` — 4 entries built; b2f-catalog bundle grew as expected.
+
+Commit `b730551`.
+
 ### Feature — Vite LIFF B2F Catalog code port Round 1 — foundation (2026-04-30)
 
 First Vite-side migration round for the B2F Admin E-Catalog (`[B2F] Snippet 8` V.7.13 → V.7.14 annotation-only header bump). Mirrors the B2B Catalog Round 1 + B2F Maker Round 1 patterns: ship CSS + utility modules + `bootstrap()` wiring without touching the inline render path. Flag `dinoco_liff_use_vite_b2f_catalog` default OFF (REG-029 byte-identical preserved).
