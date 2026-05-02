@@ -144,15 +144,15 @@ function _render() {
     if (typeof document === "undefined" || !_state) return;
     const root = document.getElementById("b2b-catalog-app");
     if (!root) return;
-    const filterHtml = renderHistoryFilter(_state.historyFilter || "");
-    const listHtml = renderHistory(_state.historyItems || [], {
-        page: _state.historyPage || 1,
-        totalPages: _state.historyTotalPages || 1,
+    const filterHtml = renderHistoryFilter({
+        historyFilter: _state.historyFilter || "",
     });
-    const loadMore = renderLoadMoreButton({
-        page: _state.historyPage || 1,
-        totalPages: _state.historyTotalPages || 1,
-    });
+    const stateForRender = {
+        historyPage: _state.historyPage || 1,
+        historyTotalPages: _state.historyTotalPages || 1,
+    };
+    const listHtml = renderHistory(_state.historyItems || [], stateForRender);
+    const loadMore = renderLoadMoreButton(stateForRender);
     root.innerHTML = filterHtml + listHtml + loadMore;
 }
 

@@ -117,10 +117,11 @@ export function isSetDetailOpen() {
  * Internal — fire registered handler.
  *
  * @param {keyof RouterHandlers} key
- * @param {string} [arg]
+ * @param {string} [arg=""]
  */
-function _dispatch(key, arg) {
+function _dispatch(key, arg = "") {
     if (!_handlers) return;
+    /** @type {any} */
     const fn = _handlers[key];
     if (typeof fn !== "function") return;
     try {

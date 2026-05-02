@@ -48,7 +48,7 @@
 import "./styles.css";
 
 import { initLiff } from "../../shared/liff-init.js";
-import { createB2BApi, wpRestUrl } from "../../shared/api-client.js";
+import { wpRestUrl } from "../../shared/api-client.js";
 import { liffAuth } from "../../shared/liff-auth.js";
 
 import {

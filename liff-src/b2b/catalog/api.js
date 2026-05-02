@@ -110,7 +110,7 @@ function _isMutatingCatalogEndpoint(endpoint) {
  *   onConflict?: Function|null,
  *   onMaintenance?: Function|null,
  * }} cbs
- * @returns {never}
+ * @returns {Promise<never>}
  */
 async function _decorateAndThrow(err, cbs) {
     const status = err.status;

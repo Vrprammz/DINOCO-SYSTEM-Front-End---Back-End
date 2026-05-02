@@ -20,6 +20,18 @@ import {
     collectModelsForCategory,
 } from "../pages/home.js";
 
+/**
+ * @param {unknown} err
+ * @returns {string}
+ */
+function _msg(err) {
+    if (err && typeof err === "object" && "message" in err) {
+        const m = /** @type {{message?: unknown}} */ (err).message;
+        if (typeof m === "string") return m;
+    }
+    return "";
+}
+
 let _api = null;
 let _state = null;
 let _renderCatalogCb = null;
@@ -58,7 +70,7 @@ export async function loadHome() {
             const res = await _api.getCatalog();
             _state.products = (res && (res.products || res.data)) || [];
         } catch (err) {
-            const msg = (err && err.message) || "";
+            const msg = _msg(err);
             showAuthError("โหลดสินค้าไม่สำเร็จ", msg, true);
         } finally {
             hideLoading();
@@ -71,11 +83,21 @@ function _render() {
     if (typeof document === "undefined" || !_state) return;
     const root = document.getElementById("b2b-catalog-app");
     if (!root) return;
-    root.innerHTML = renderHome(_state.products || [], {
-        modelImageMap: _state.modelImageMap || {},
-        modelOrder: _state.modelOrder || [],
-        categoryOrder: _state.categoryOrder || [],
-    });
+    // renderHome returns { modelRowHtml, categoryRowHtml, ... } — caller
+    // composes the final shell. Inline V.32.9 has separate #modelRow +
+    // #catRow containers; this Vite path emits a single block when
+    // running on the new render shell.
+    const home = renderHome(_state);
+    const view = renderViewState(_state);
+    let html = "";
+    if (view.showSubHeader && view.subTitle) {
+        html += '<div class="b2b-cat-sub-header">' + view.subTitle + "</div>";
+    }
+    if (view.showHomeRows) {
+        html += '<div class="b2b-cat-model-row">' + home.modelRowHtml + "</div>";
+        html += '<div class="b2b-cat-cat-row">' + home.categoryRowHtml + "</div>";
+    }
+    root.innerHTML = html;
 }
 
 /**
@@ -142,19 +164,18 @@ export function resetFilters() {
 
 function _renderHeaderState() {
     if (typeof document === "undefined" || !_state) return;
-    // renderViewState returns an HTML chunk for the sub-header; injection
-    // point inline V.32.9 = #subHeader. Defensive when missing.
+    // renderViewState returns visibility booleans + subTitle. Apply to
+    // the existing #subHeader element (inline V.32.9 path).
     const subHeader = document.getElementById("subHeader");
     if (subHeader) {
-        subHeader.innerHTML = renderViewState(_state);
+        const view = renderViewState(_state);
+        subHeader.style.display = view.showSubHeader ? "" : "none";
+        if (view.showSubHeader) subHeader.textContent = view.subTitle || "";
     }
     const crossPills = document.getElementById("crossPills");
     if (crossPills) {
         const pillState = _computeCrossPillState();
-        crossPills.innerHTML = renderCrossFilterPills(
-            _state.products || [],
-            pillState
-        );
+        crossPills.innerHTML = renderCrossFilterPills(pillState);
     }
 }
 

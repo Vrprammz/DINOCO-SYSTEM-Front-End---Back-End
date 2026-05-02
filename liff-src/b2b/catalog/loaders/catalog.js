@@ -33,7 +33,7 @@ import {
     incrCartQty,
     detectCartDuplicates,
 } from "../utils/cart.js";
-import { renderProducts, filterProducts } from "../pages/catalog.js";
+import { renderProducts } from "../pages/catalog.js";
 import { updateCartBar } from "../pages/cart.js";
 
 /**
@@ -132,11 +132,18 @@ function _renderInto(state) {
     if (typeof document === "undefined") return;
     const root = document.getElementById("b2b-catalog-app");
     if (!root) return; // Inline V.32.9 owns DOM until Round 5.
-    const filtered = filterProducts(state.products || [], state);
-    root.innerHTML = renderProducts(filtered, {
+    // renderProducts internally calls filterProducts via state — pass
+    // the full state in. Returns { html, count, isEmpty }.
+    const result = renderProducts(state.products || [], {
         cart: state.cart || {},
         viewMode: state.viewMode || "home",
+        searchQuery: state.searchQuery || "",
+        filterModel: state.filterModel || "",
+        filterCategory: state.filterCategory || "",
+        crossFilter: state.crossFilter || "",
+        homeSearchQuery: state.homeSearchQuery || "",
     });
+    root.innerHTML = result && result.html ? result.html : "";
 }
 
 /**
