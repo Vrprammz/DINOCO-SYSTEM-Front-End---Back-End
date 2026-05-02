@@ -277,6 +277,59 @@ php -l "[B2F] Snippet 4: Maker LIFF Pages"   # syntax clean (untouched)
 
 ---
 
+## Step 2.6 — B2F Maker LIFF code port (Round 3 — router + Maker API + 5 loaders) ✅ (2026-05-01)
+
+Continues from Round 2. Round 3 ports the **navigation + REST orchestration** layer from inline `b2f_liff_page_js()` (V.4.7) into ES modules under `liff-src/b2f/maker/`. Inline V.4.7 stays UNCHANGED — Round 3 exposes globals (`window.goToPage`, `window.b2fOpenDeliverForm`, etc.) so existing inline onclick handlers keep working during the parallel-rendering window. Round 4 will drop the bridge.
+
+### What landed in Round 3
+
+| File | LOC | Notes |
+| --- | --- | --- |
+| `liff-src/b2f/maker/router.js` | ~226 | `getCurrentView` + `getCurrentPoId` + `goToPage` + `goToPageWithPO` + `setupRouter` + `dispatchInitial`. Dual mode: V.4.7 full-reload (production default) + SPA `pushState` (Round 5 cut-over + tests). Idempotent setup, popstate handler, swallows handler exceptions. |
+| `liff-src/b2f/maker/api.js` | ~230 | `createMakerApi({ base, token, lineUid, onAuthExpired, onCancelledPO })`. Named methods (`confirmPO`/`rejectPO`/`reschedulePO`/`deliverLot`/`getPODetail`/`getMakerPOList`). Auto-attaches `X-B2F-Token` + `X-B2F-Line-Uid` + `X-Idempotency-Key` (mutating endpoints only). 401/410/409 error mapping. `[METHOD URL]` suffix decoration mirrors V.4.7 line 661 for parity. |
+| `liff-src/b2f/maker/loaders/confirm.js` | ~255 | `setupConfirm` + `loadConfirmPage` + `handleConfirmSubmit` + `handleRejectSubmit`. Mirrors V.4.7 lines 670-855 — guards cancelled / already-confirmed / rejected POs, validates ETA in future, locks button via shared `lockBtn`. |
+| `liff-src/b2f/maker/loaders/detail.js` | ~69 | `setupDetail` + `loadDetailPage` (V.4.7 lines 862-876). URL fallback for `?po_id=`. |
+| `liff-src/b2f/maker/loaders/reschedule.js` | ~199 | `setupReschedule` + `loadReschedulePage` + `handleRescheduleSubmit`. Dual mode: list picker (no `?po_id=`) vs detail form (with). Status guard (only `confirmed`/`delivering` allowed). |
+| `liff-src/b2f/maker/loaders/list.js` | ~66 | `setupList` + `loadListPage` (V.4.7 lines 1140-1152). Forwards `orderIntentEnabled` flag for V.4.6 mode-summary pill. |
+| `liff-src/b2f/maker/loaders/deliver.js` | ~246 | `setupDeliver` + `loadDeliverPage` + `b2fOpenDeliverForm` + `b2fStepQty` + `b2fFillAllRemaining` + `handleDeliverSubmit`. Mirrors V.4.7 lines 1233-1557 — qty validation against `max`, in-flight guard, post-success refresh. |
+| `liff-src/b2f/maker/entry.js` | V.0.3 → V.0.4 | Wires all loaders + router on bootstrap. Re-exposes 6 legacy globals (`goToPage`, `goToPageWithPO`, `b2fOpenDeliverForm`, `b2fFillAllRemaining`, `b2fStepQty`, `b2fSubmitDeliver`, `loadDeliverPage`) for inline-bridge during cutover. Initial dispatch matches V.4.7 init() switch (lines 413-419). |
+| `liff-src/types.d.ts` | (extended) | Added `Window.b2fOpenDeliverForm/b2fFillAllRemaining/b2fStepQty/b2fSubmitDeliver/loadDeliverPage` declarations + `Error.code` field for 409 idempotency_conflict surface. |
+
+### Bundle deltas (Round 2 → Round 3)
+
+| Entry | Before (V.0.3 R2) | After (V.0.4 R3) | Notes |
+| --- | --- | --- | --- |
+| `b2f-maker.<hash>.js` | 39.52 KB | **54.85 KB** (gzip 15.26 KB) | +router (7.7 KB) + Maker API (9.5 KB) + 5 loaders (24.7 KB) — but all wired so cutover is one flag flip |
+| `b2f-maker.<hash>.css` | 10.5 KB | 10.5 KB (unchanged) | CSS untouched |
+
+Bundle-size guard threshold bumped from 48 KB → 64 KB per entry (`tests/jest/bundle-size.test.js`). Round 5 cutover will drop inline JS from Snippet 4 entirely (no double load), and shared utilities can hoist into `chunks/` to ratchet back down.
+
+### Production safety preserved (Round 3)
+
+- `dinoco_liff_use_vite_b2f_maker` flag still default OFF — **production unchanged**
+- Inline `b2f_liff_page_css()` + `b2f_liff_page_js()` UNCHANGED in Snippet 4 V.4.7
+- 66 new unit tests cover router (28 cases — view detection, popstate, handler dispatch), Maker API (21 cases — header injection, idempotency key, 401/410/409 mapping, endpoint routing), and 5 loaders (17 cases — load + render branches, validation guards, submit flow)
+- Test count: 318 → 384 (Round 3 adds 66 tests)
+- ETA validation byte-identical to V.4.7 (rejects today + past dates)
+- DOM contract preserved — same input ids (`#b2f-eta`, `#b2f-note`, `#b2f-confirm-btn`, `#b2f-reschedule-btn`, `.b2f-dlv-qty`, etc.) so renderer output stays interoperable
+
+### Verifying Round 3 locally
+
+```bash
+npm run build:liff           # → dist/liff/b2f-maker.<hash>.js (54.85 KB)
+npm run test:jest            # → 384 tests pass (was 318 before Round 3)
+npx jest liff-b2f-maker-router liff-b2f-maker-api liff-b2f-maker-loaders   # → 66 Round 3 cases
+npm run lint && npm run typecheck       # both clean
+php -l "[B2F] Snippet 4: Maker LIFF Pages"   # syntax clean (untouched)
+```
+
+### Round 4 scope (next)
+
+- Inline-bridge cleanup — drop `window.goToPage` / `window.b2fOpenDeliverForm` legacy globals + remove parallel-rendering exposure once Snippet 4 V.4.8 cutover lands
+- Begin retiring inline `b2f_liff_page_js()` block in Snippet 4 (Round 5 deletes it entirely once flag is flipped on for canary)
+
+---
+
 ## Step 3 — Production deploy of bundles (TEMPLATE READY ⏸ DISABLED)
 
 `.github/workflows/liff-deploy.yml` ready. **Disabled by default** — `workflow_dispatch` only until secrets provisioned + first manual dry-run verified.

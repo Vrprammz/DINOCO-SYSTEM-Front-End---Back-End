@@ -10,6 +10,55 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF Round 3 — B2F Maker LIFF router + Maker API + 5 page loaders (2026-05-01)
+
+Continues Round 2. Ports the **navigation + REST orchestration** layer from inline V.4.7 into ES modules. Inline `b2f_liff_page_js()` stays UNCHANGED — Round 3 re-exposes 6 legacy globals (`window.goToPage`, `window.b2fOpenDeliverForm`, etc.) so existing inline onclick handlers keep working during the parallel-rendering window. Round 4 will drop the bridge.
+
+**Files added** (7 new files, ~1,290 LOC):
+
+- `liff-src/b2f/maker/router.js` (~226 LOC) — `getCurrentView` + `getCurrentPoId` + `goToPage` + `goToPageWithPO` + `setupRouter` + `dispatchInitial`. Dual mode: V.4.7 full-reload (production default) + SPA `pushState` (Round 5 cut-over + tests). Idempotent setup, popstate handler, swallows handler exceptions.
+- `liff-src/b2f/maker/api.js` (~230 LOC) — `createMakerApi({ base, token, lineUid, onAuthExpired, onCancelledPO })`. Named methods (`confirmPO`/`rejectPO`/`reschedulePO`/`deliverLot`/`getPODetail`/`getMakerPOList`). Auto-attaches `X-B2F-Token` + `X-B2F-Line-Uid` + `X-Idempotency-Key` (mutating endpoints only). 401/410/409 error mapping. `[METHOD URL]` suffix decoration mirrors V.4.7 line 661 for parity.
+- `liff-src/b2f/maker/loaders/confirm.js` (~255 LOC) — `setupConfirm` + `loadConfirmPage` + `handleConfirmSubmit` + `handleRejectSubmit`. Mirrors V.4.7 lines 670-855. Guards cancelled / already-confirmed / rejected POs, validates ETA in future, locks button via shared `lockBtn`.
+- `liff-src/b2f/maker/loaders/detail.js` (~69 LOC) — `setupDetail` + `loadDetailPage` (V.4.7 lines 862-876). URL fallback for `?po_id=`.
+- `liff-src/b2f/maker/loaders/reschedule.js` (~199 LOC) — `setupReschedule` + `loadReschedulePage` + `handleRescheduleSubmit`. Dual mode: list picker (no `?po_id=`) vs detail form. Status guard (only `confirmed`/`delivering` allowed).
+- `liff-src/b2f/maker/loaders/list.js` (~66 LOC) — `setupList` + `loadListPage` (V.4.7 lines 1140-1152). Forwards `orderIntentEnabled` flag for V.4.6 mode-summary pill.
+- `liff-src/b2f/maker/loaders/deliver.js` (~246 LOC) — `setupDeliver` + `loadDeliverPage` + `b2fOpenDeliverForm` + `b2fStepQty` + `b2fFillAllRemaining` + `handleDeliverSubmit`. Mirrors V.4.7 lines 1233-1557. Qty validation against `max`, in-flight guard, post-success refresh.
+
+**Files modified** (2):
+
+- `liff-src/b2f/maker/entry.js` — V.0.3 → V.0.4. Wires all loaders + router on bootstrap. Re-exposes 6 legacy globals (`goToPage`, `goToPageWithPO`, `b2fOpenDeliverForm`, `b2fFillAllRemaining`, `b2fStepQty`, `b2fSubmitDeliver`, `loadDeliverPage`). Initial dispatch matches V.4.7 init() switch (lines 413-419).
+- `liff-src/types.d.ts` — Added `Window.b2fOpenDeliverForm`/`b2fFillAllRemaining`/`b2fStepQty`/`b2fSubmitDeliver`/`loadDeliverPage` declarations + `Error.code` field for 409 idempotency_conflict surface.
+
+**Test files added** (3 new files, ~970 LOC):
+
+- `tests/jest/liff-b2f-maker-router.test.js` — 28 cases (view detection, popstate, handler dispatch, SPA vs reload mode, dispatchInitial)
+- `tests/jest/liff-b2f-maker-api.test.js` — 21 cases (header injection, idempotency key generation, GET serialization, 401/410/409 error mapping, endpoint routing)
+- `tests/jest/liff-b2f-maker-loaders.test.js` — 17 cases (load + render branches per page, ETA validation guards, status guards for cancelled/already-confirmed POs, deliver qty stepper bounds, submit flow)
+
+**Bundle deltas**:
+
+- `b2f-maker.<hash>.js`: 39.52 KB → **54.85 KB** (gzip 11.03 → 15.26 KB) — +router (7.7 KB) + Maker API (9.5 KB) + 5 loaders (24.7 KB)
+- `b2f-maker.<hash>.css`: 10.5 KB unchanged
+- Total dist size still <200KB (well under sane ceiling)
+
+**Test count**: 318 → 384 (Round 3 adds 66 tests across 3 new test files)
+
+**Bundle-size guard threshold**: bumped 48 KB → 64 KB per entry (`tests/jest/bundle-size.test.js`). Round 5 cutover will drop inline JS from Snippet 4 (no double load), then we ratchet back down.
+
+**Production safety preserved**:
+
+- `dinoco_liff_use_vite_b2f_maker` flag still default OFF — production unchanged
+- Inline `b2f_liff_page_js()` UNCHANGED in Snippet 4 V.4.7
+- ETA validation byte-identical to V.4.7 (rejects today + past dates)
+- DOM contract preserved — same input ids/classes (`#b2f-eta`, `#b2f-note`, `#b2f-confirm-btn`, `#b2f-reschedule-btn`, `.b2f-dlv-qty`, etc.) so renderer output stays interoperable
+
+**Round 4 scope** (next sprint):
+
+- Inline-bridge cleanup — drop `window.goToPage` / `window.b2fOpenDeliverForm` legacy globals
+- Begin retiring inline `b2f_liff_page_js()` block in Snippet 4 (Round 5 deletes it entirely once flag is flipped on for canary)
+
+---
+
 ### Feature — Vite LIFF Round 2 — B2F Maker LIFF page renderers (5 pages + full buildTimeline) (2026-04-30)
 
 Continues Round 1 foundation. Ports the 5 page renderers from inline `b2f_liff_page_js()` V.4.7 (lines 686-1700+) into ES modules under `liff-src/b2f/maker/pages/`. Inline V.4.7 stays UNCHANGED — renderers exposed via `window.DINOCO_B2F_MAKER_RENDERERS` for inline-bridge fallback during Round 3-4 cutover.
