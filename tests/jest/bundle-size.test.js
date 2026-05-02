@@ -8,9 +8,9 @@
  * Phase 5 audit target was <10KB per shell entry. Current state:
  *   - b2b-catalog: ~3.5KB
  *   - b2f-catalog: ~620B
- *   - b2f-maker:   ~40KB  (Round 2 page renderers — CSS + 6 utility
- *                          modules + 5 page renderers + bootstrap +
- *                          full buildTimeline. See liff-src/b2f/maker/
+ *   - b2f-maker:   ~55KB  (Round 3 — adds router + Maker API wrapper +
+ *                          5 page loaders on top of Round 2 page
+ *                          renderers. gzip ~15KB. See liff-src/b2f/maker/
  *                          and runbooks/PHASE-2-VITE-MIGRATION.md.)
  *   - liff-ai:     ~605B
  *
@@ -21,18 +21,19 @@
  *     guard fires
  *
  * Threshold:
- *   - 49152 bytes (48KB) per entry — bumped from 16KB on 2026-04-30 to
- *     accommodate Round 2 b2f-maker page renderer port (5 page
- *     renderers + full buildTimeline; gzip stays at ~11KB). Once Round
- *     3-5 land router + cut-over, shared code can hoist into `chunks/`
- *     and we can ratchet back down. See PHASE-2-VITE-MIGRATION.md.
+ *   - 65536 bytes (64KB) per entry — bumped from 48KB on 2026-05-01
+ *     (Round 3) to accommodate router + Maker API wrapper + 5 page
+ *     loaders (~15.3 KB raw / ~3.3 KB gzip added on top of Round 2).
+ *     Once Round 5 cut-over lands and inline JS is dropped from
+ *     Snippet 4, shared code can hoist into `chunks/` and we can
+ *     ratchet back down. See PHASE-2-VITE-MIGRATION.md.
  */
 
 const fs = require("fs");
 const path = require("path");
 
 const DIST_DIR = path.resolve(__dirname, "../../dist/liff");
-const PER_ENTRY_LIMIT = 48 * 1024; // 48 KB per entry — see header note for Round 2 bump rationale.
+const PER_ENTRY_LIMIT = 64 * 1024; // 64 KB per entry — see header note for Round 3 bump rationale.
 
 const distExists = fs.existsSync(DIST_DIR);
 
