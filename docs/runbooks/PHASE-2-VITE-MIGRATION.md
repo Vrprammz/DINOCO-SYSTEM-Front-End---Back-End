@@ -589,6 +589,53 @@ Round 5 final cut-over (drop inline `<script>` block from Snippet 4) — gated o
 
 ---
 
+## Step 2.5 Round 8 — B2B Catalog LIFF code port (Round 4 — inline-bridge cleanup) ✅ (2026-04-30)
+
+Continues from Round 3. Round 4 mirrors the B2F Maker Round 4 pattern (Step 2.7 above): replace the legacy `window.B2B_CATALOG_*` bridge with a **single delegated click + change listener** on `#b2b-catalog-app`. Pages already emit declarative `data-action` / `data-stepact` / `data-rmsku` / `data-cancel` / `data-reorder` / `data-claim` attributes from Round 2 onward — Round 4 wires the dispatcher that consumes them.
+
+### What landed in B2B Catalog Round 4
+
+| Change | LOC | Notes |
+| --- | --- | --- |
+| `liff-src/b2b/catalog/event-delegation.js` (NEW) | ~330 | `setupEventDelegation(root, deps)` — single `click` + `change` listener. Resolves bubbling events via `closest()` on a small attribute taxonomy (`data-action`, `data-stepact`, `data-rmsku`, `data-subaddsku`, history card buttons). 20-key dependency-injected handler bag — pure module, testable without CSS imports. Returns idempotent cleanup function. Handler-thrown errors caught + logged via `console.error` so a misbehaving sub-handler cannot break the listener. |
+| `entry.js` V.0.4 → V.0.5 | ~−95 LOC | Bumps version + boot marker. Wires `setupEventDelegation` after `dispatchInitial()` against the root mount + 20 closure handlers (router back, addToCart, increment, decrement, removeFromCart, history filter, load more, model/category/cross filter, cancel/reorder/claim, openTicket via `window.location`, addSet, subItemStep, subItemReveal, stepperInput). Returns `detachDelegation` cleanup on the bootstrap result. Drops 12 `window.B2B_CATALOG_*` legacy globals + the `helpers` / `renderers` / `loaders` parallel surfaces from `window.DINOCO_B2B_CATALOG` — single namespaced debug surface kept (router + api factory only). |
+| `tests/jest/liff-b2b-catalog-bridge.test.js` (NEW) | ~600 | **75 Jest cases** covering: basic contract (6) / catalog grid actions (6) / home page actions (4) / history actions (6) / cart modal (3) / SET Detail stepper incl. clamp 1-999 (12) / resilience + error swallow (5) / drift detector for entry.js V.0.5 (19) / drift detector for `pages/*` + `loaders/*` no-onclick guard (10) / module contract (2) / change-event dispatch on stepper input (3 sub-cases). |
+
+### Bundle deltas — B2B Catalog (V.0.4 Round 3 → V.0.5 Round 4)
+
+| Asset | V.0.4 (Round 3) | V.0.5 (Round 4) | Delta |
+| --- | --- | --- | --- |
+| `b2b-catalog.<hash>.js` | **45.03 KB** (gzip 13.86) | **42.56 KB** (gzip 12.61) | **−2.47 KB** raw (**−1.25 KB** gzip) |
+| `assets/b2b-catalog.<hash>.css` | 27.86 KB | 27.86 KB | unchanged |
+
+Bundle shrunk because Round 4 drops the `helpers` / `renderers` / `loaders` parallel debug surface (which kept page renderers + loader symbols reachable for inline-bridge consumers). The single `event-delegation.js` module is smaller than what it replaces.
+
+### Production safety preserved (B2B Catalog Round 4)
+
+- **REG-029 byte-identical preserved**: Snippet 4 V.32.9 inline `<script>` block still authoritative — Round 4 only ports + tests the replacement layer. Flag `dinoco_liff_use_vite_b2b_catalog` default OFF.
+- **Triple-safety chain**: flag + manifest + `dinoco_liff_enqueue('b2b-catalog')` presence (V.32.8 wiring unchanged).
+- **Drift detectors**: 19 new test cases in `liff-b2b-catalog-bridge.test.js` fail-fast if any of the 12 `window.B2B_CATALOG_*` globals reappear OR if `helpers` / `renderers` / `loaders` parallel surfaces are re-added OR if `pages/*.js` / `loaders/*.js` accidentally regrow inline `onclick=`.
+- Test count: 746 → **821** (Round 4 adds 75 tests).
+- Bundle thresholds: 64 KB per-entry guard untouched. b2b-catalog at 42.56 KB has **21 KB headroom**.
+
+### Verifying B2B Catalog Round 4 locally (V.0.5)
+
+```bash
+npm run build:liff           # → b2b-catalog.<hash>.js ~42.56 KB (gzip 12.61)
+npm run test:jest            # → 821 passed (was 746 before Round 4)
+npx jest liff-b2b-catalog-bridge   # → 75 Round 4 cases
+npm run lint                 # → 0 errors
+npm run typecheck            # → tsc --noEmit clean
+```
+
+### B2B Catalog Round 5 scope (final cut-over — DESTRUCTIVE)
+
+- **Drop inline `b2b_liff_js()` block from Snippet 4** once flag has been ON ≥1 week with no regressions reported. Bumps Snippet 4 to V.32.10. **Requires explicit user confirmation** before any destructive change to inline JS — Round 5 is irreversible without webhook re-sync from a previous commit.
+- **Canary plan**: enable `dinoco_liff_use_vite_b2b_catalog=1` for one trusted distributor LINE group → monitor 7 days → expand to 10% → 50% → 100% → drop inline.
+- **Rollback**: `update_option('dinoco_liff_use_vite_b2b_catalog', '0')` flips back to inline V.32.9 instantly (no re-deploy needed) so long as Round 5 hasn't run.
+
+---
+
 ## Step 3 — Production deploy of bundles (TEMPLATE READY ⏸ DISABLED)
 
 `.github/workflows/liff-deploy.yml` ready. **Disabled by default** — `workflow_dispatch` only until secrets provisioned + first manual dry-run verified.
