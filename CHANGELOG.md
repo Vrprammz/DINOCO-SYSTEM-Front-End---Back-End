@@ -10,6 +10,39 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF B2B Catalog code port Round 1 — CSS + 6 utility modules + foundation bootstrap (2026-04-30)
+
+Mirrors the B2F Maker port pattern (Rounds 1-4 already shipped). B2B Catalog (`[B2B] Snippet 4: LIFF E-Catalog Frontend`) is the largest LIFF surface (~155KB inline). Round 1 = foundation only — inline JS untouched, flag `dinoco_liff_use_vite_b2b_catalog` default OFF (REG-029 byte-identical preserved).
+
+**What landed**:
+
+- `[B2B] Snippet 4` V.32.8 → V.32.9 — header annotation only, NO behavior change.
+- **CSS port**: `liff-src/b2b/catalog/styles.css` (335 LOC verbatim from inline lines 132-467) layered on existing `tokens.css` + `base.css`. Full coverage: header / tabs / search / sub-page header / hscroll model+category cards / cross-filter pills / 2-col product grid / floating cart bar (V.32.2 64px green) / skeleton / empty / recommended chips / cart modal + cancel modal / history panel + filter chips / overlays + loading screen + toast + edit banner / SET Detail view + child / grandchild / qty steppers V.32.2 / sub-add button V.32.4 / cart remove V.32.4.
+- **6 utility modules** under `liff-src/b2b/catalog/utils/` (~870 LOC):
+  - `lang.js` (5 fns) — Thai-only `L()` / `setupLanguage()` / `getLang()`. Parallel API to B2F maker for portability — actual switch is no-op (B2B catalog single-language).
+  - `format.js` (4 fns) — `formatNumber` (Math.round + toLocaleString — matches inline `fmt()`), `formatCurrency`, `formatDate`, `escHtml`.
+  - `dom.js` (10 fns) — `$`, `$$`, `showToast` (auto-creates `#liffToast`), `showAuthError` (with retry button + onRetry callback), `showLinkExpired`, `showLoading` / `hideLoading`, `lockBtn` / `unlockBtn` (LOCKED flag — pair in finally), idempotent `setupOfflineDetection`.
+  - `pricing.js` (3 fns) — `computeDealerPrice` (client preview only — documents Manual Invoice double-discount contract V.34.4–V.34.6), `validateMOQ` (returns `{valid, reason, suggested}`), `computeBoxes` (UPB/BPU rules from Snippet 1 V.32.9).
+  - `hierarchy.js` (5 fns) — `getLeafSkus` / `isLeafSku` / `isTopLevelSet` / `computeHierarchyStock` / `getAncestorSkus`. V.7.1 lesson preserved: pass `visited` Set BY VALUE per branch (DD-3 shared child requires fresh sibling scope) — same bug class fixed in PHP would re-emerge if we shared visited across siblings.
+  - `cart.js` (10 fns) — `loadCart` / `saveCart` (localStorage `dinoco_cart` — matches inline key), `setCartQty` / `incrCartQty` (immutable returns), `computeItemCount` / `computeTotal` / `toOrderItems`, `detectCartDuplicates` (V.32.1 H-10 SET-vs-child hard-stop logic), `clearCart`, `CART_STORAGE_KEY`.
+- `liff-src/b2b/catalog/entry.js` V.0.1 → V.0.2 — replaces pilot scaffold with real bootstrap. Auto-boot reads JSON config from `<div id="b2b-catalog-app" data-config="...">` mount element (Snippet 4 V.32.8 shell path) OR explicit `window.DINOCO_B2B_CATALOG_BOOT === true`. Frozen debug surface `window.DINOCO_B2B_CATALOG` exposes 24 named helpers for the inline-bridge during Rounds 2-4.
+- **112 Jest tests** in `tests/jest/liff-b2b-catalog-utils.test.js` covering all 6 modules — incl. DD-3 shared-child regression guard (sibling pollution test), V.32.1 H-10 hard-stop, Manual Invoice tier preview Silver/Gold/Platinum/Diamond, MOQ + UPB/BPU validation, hierarchy MIN-of-children stock compute.
+
+**Bundle delta**: pilot 3.5KB → V.0.2 9.04KB JS (gzip 3.65KB) + 27.86KB CSS (gzip 5.38KB). Threshold 64KB per-entry unaffected — 55KB headroom.
+
+**Test count**: 435 → 547 (+112 tests). PHPUnit 940 unchanged.
+
+**Production safety preserved**:
+
+- Snippet 4 inline `<style>` + `<script>` blocks intact (REG-029 byte-identical when flag OFF)
+- Flag `dinoco_liff_use_vite_b2b_catalog` default `false` — inline path is authoritative
+- `dinoco_liff_enqueue('b2b-catalog')` triple-safety chain (flag + manifest + helper) preserved per V.32.8 wiring
+- Rollback = `update_option('dinoco_liff_use_vite_b2b_catalog', false)` — instant, no redeploy
+
+**Round 2 scope (next)**: page renderers (catalog grid + SET Detail + cart UI + history panel + recommended chips). Rounds 3-5 mirror B2F Maker (router + loaders → event delegation → cut-over).
+
+---
+
 ### Feature — Vite LIFF Round 4 — B2F Maker LIFF inline-bridge cleanup (drop 6 legacy globals + event delegation pattern) (2026-05-01)
 
 Continues Round 3. Round 4 is the **inline-bridge cleanup pass**: replaces all inline `onclick="..."` attributes in `pages/*.js` with declarative `data-action="..."` attributes, wires a single click listener on `#b2f-app` via event delegation, and drops the 7 legacy `window.*` globals exposed in V.0.4. After Round 4, the Vite bundle owns 100% of UI interaction without any global bridge — Snippet 4 V.4.7 inline JS stays intact (Round 5 will remove it as a destructive cutover after 1+ week canary).

@@ -387,6 +387,74 @@ php -l "[B2F] Snippet 4: Maker LIFF Pages"   # syntax clean (untouched)
 
 ---
 
+## Step 2.5 Round 5 — B2B Catalog LIFF code port (Round 1 — foundation + utilities) ✅ (2026-04-30)
+
+Mirrors the B2F Maker port pattern (Steps 2.4 → 2.7 above). B2B Catalog (`[B2B] Snippet 4: LIFF E-Catalog Frontend`) is the largest LIFF surface (~155KB inline, customer-facing distributors). Round 1 = foundation only — inline JS in Snippet 4 V.32.9 remains authoritative; flag `dinoco_liff_use_vite_b2b_catalog` default OFF (REG-029 byte-identical preserved).
+
+### What landed in Round 1
+
+- **Snippet 4 V.32.8 → V.32.9** — header annotation only. NO behavior change. Inline `<style>` + `<script>` blocks intact.
+- **CSS port**: `liff-src/b2b/catalog/styles.css` (335 LOC verbatim from inline lines 132-467) layered on existing `tokens.css` + `base.css`. Covers header / tabs / search / sub-page / hscroll cards / pills / product grid / floating cart bar (V.32.2 64px green) / skeleton / empty / recommended / cart modal / cancel modal / history / overlays / loading / toast / edit banner / SET Detail view / qty steppers / sub-add button / cart remove.
+- **6 utility modules** under `liff-src/b2b/catalog/utils/`:
+  - `lang.js` — Thai-only `L()` / `setupLanguage()` / `getLang()` (parallel API to B2F maker for portability — actual switch is no-op since B2B catalog is single-language)
+  - `format.js` — `formatNumber` (Math.round + toLocaleString — matches inline `fmt()`), `formatCurrency`, `formatDate`, `escHtml`
+  - `dom.js` — `$`, `$$`, `showToast` (auto-creates `#liffToast`), `showAuthError` (with retry button wiring), `showLinkExpired`, `showLoading` / `hideLoading`, `lockBtn` / `unlockBtn` (LOCKED flag — pair in finally), idempotent `setupOfflineDetection`
+  - `pricing.js` — `computeDealerPrice` (client preview only; documents Manual Invoice double-discount contract V.34.4–V.34.6), `validateMOQ`, `computeBoxes` (UPB/BPU rules)
+  - `hierarchy.js` — `getLeafSkus` / `isLeafSku` / `isTopLevelSet` / `computeHierarchyStock` / `getAncestorSkus` (V.7.1 lesson: pass `visited` Set BY VALUE per branch — DD-3 shared child requires fresh sibling scope)
+  - `cart.js` — `loadCart` / `saveCart` (localStorage `dinoco_cart` — matches inline key), `setCartQty` / `incrCartQty`, `computeItemCount` / `computeTotal` / `toOrderItems`, `detectCartDuplicates` (V.32.1 H-10 SET-vs-child hard-stop logic)
+- **`entry.js` V.0.1 → V.0.2** — replaces pilot scaffold with real bootstrap that imports the 6 utility modules + styles.css. Auto-boot reads `data-config` JSON from `<div id="b2b-catalog-app" data-config="...">` mount element OR explicit `window.DINOCO_B2B_CATALOG_BOOT === true`. Frozen debug surface `window.DINOCO_B2B_CATALOG` exposes 24 named helpers for the inline-bridge during Rounds 2-4.
+- **112 Jest tests** in `tests/jest/liff-b2b-catalog-utils.test.js` covering all 6 modules incl. DD-3 shared-child regression guard, V.32.1 H-10 hard-stop, Manual Invoice double-discount tier preview.
+
+### Bundle deltas (V.0.1 pilot → V.0.2 Round 1)
+
+| Bundle | V.0.1 | V.0.2 | Delta | Notes |
+|---|---|---|---|---|
+| `b2b-catalog.<hash>.js` | ~3.5KB | **9.04KB** | +5.5KB | utility modules + bootstrap |
+| `assets/b2b-catalog.<hash>.css` | n/a | **27.86KB** (gzip 5.38KB) | new | CSS port |
+| Total Jest | 435 | **547** | +112 | new test file |
+| PHPUnit | 940 | 940 | 0 | unchanged |
+
+Threshold `64KB` per-entry in `tests/jest/bundle-size.test.js` unaffected (b2b-catalog has 55KB headroom).
+
+### Production safety preserved (Round 1)
+
+- Snippet 4 inline `<style>` + `<script>` blocks intact (REG-029 byte-identical when flag OFF)
+- Flag `dinoco_liff_use_vite_b2b_catalog` default `false` — inline path is authoritative
+- `dinoco_liff_enqueue('b2b-catalog')` triple-safety chain (flag + manifest + enqueue helper) preserved per V.32.8 wiring
+- Rollback = flip flag false (no redeploy) — instant
+
+### Verifying Round 1 locally
+
+```bash
+npm run build:liff
+# Expect: dist/liff/b2b-catalog.<hash>.js  ~9KB
+
+npm run test:jest -- tests/jest/liff-b2b-catalog-utils.test.js
+# Expect: 112 passed
+
+npm run lint && npm run typecheck
+# Expect: clean
+
+php -l <(printf '<?php\n'; cat "[B2B] Snippet 4: LIFF E-Catalog Frontend")
+# Expect: No syntax errors
+```
+
+### Round 2 scope (next)
+
+- **Page renderers** — port inline V.32.9 functions:
+  - `renderProducts()` (catalog grid, line ~991)
+  - `renderHome()` / `renderModelRow()` / `renderCategoryRow()` / `renderViewState()` / `renderCrossFilterPills()` (home + drilldown views)
+  - `renderSetDetailMainStepper()` / `updateSetDetailAddBtn()` / `renderSetDetailItems()` (SET Detail view)
+  - `renderHistoryFilter()` / `renderHistory()` (history panel + pagination)
+  - `updateCartBar()` (floating bar count + total)
+  - `renderRecommendedChips()` (chip strip)
+- **Cart UI** — modal item row builder + remove button (V.32.4) + thumbnail (V.32.3) + empty-state (V.32.6 P3)
+- **Inline-bridge** — `window.DINOCO_B2B_CATALOG.renderers.*` so Snippet 4 inline can call into bundle for parallel rendering
+
+Rounds 3-5 mirror B2F Maker (router + loaders → event delegation → cut-over).
+
+---
+
 ## Step 3 — Production deploy of bundles (TEMPLATE READY ⏸ DISABLED)
 
 `.github/workflows/liff-deploy.yml` ready. **Disabled by default** — `workflow_dispatch` only until secrets provisioned + first manual dry-run verified.
