@@ -1,9 +1,24 @@
 /**
- * B2F LIFF Admin E-Catalog — Vite entry (V.0.4 Round 3 router + api + loaders)
+ * B2F LIFF Admin E-Catalog — Vite entry (V.0.5 Round 4 event delegation)
  *
  * MIGRATION TARGET: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.15+
  *
- * Round 2 (V.0.3 — this commit):
+ * Round 4 (V.0.5 — this commit):
+ *   ✅ Event delegation via `./event-delegation.js` — single click +
+ *      change listener on `#b2f-catalog-app` dispatches via [data-action]
+ *      / [data-stepact] / [data-subaddsku] / [data-bucket-tab] taxonomy.
+ *   ✅ Legacy bridge globals dropped:
+ *      • `window.DINOCO_B2F_CATALOG_NAV` (router + handler bag) — REMOVED
+ *      • `window.DINOCO_B2F_CATALOG_RENDERERS` (renderer bag) — REMOVED
+ *      Only `window.DINOCO_B2F_CATALOG` remains as a frozen debug surface.
+ *   ✅ Maker-card imperative `addEventListener` removed (loaders/makerHome
+ *      V.0.5) — picker now emits `data-action="pick-maker"` consumed by
+ *      the central listener.
+ *   ✅ Drift detector tests — source-level grep verifies pages emit
+ *      `data-action` (no inline `onclick=`) + entry.js does not assign
+ *      legacy globals.
+ *
+ * Round 2 (V.0.3 — earlier commit):
  *   ✅ 5 page-renderer modules under `./pages/`:
  *      • ./pages/catalog.js     — renderProducts + renderProductCard
  *                                  (V.7.0 3-card variants + V.6.6 fallback +
@@ -115,42 +130,22 @@ import {
     unconfirmedBadgeHtml,
 } from "./utils/badges.js";
 
-// Round 2 (V.0.3) — page renderers
-import { renderProducts, renderProductCard } from "./pages/catalog.js";
-import {
-    renderSetDetailItems,
-    renderSetDetailMainStepper,
-    buildQtyStepperHtml,
-} from "./pages/setDetail.js";
-import {
-    renderCartItems,
-    renderCartManufacturingSummary,
-    computeCartManufacturingSummary,
-    buildCartItemThumbHtml,
-} from "./pages/cart.js";
-import { renderReviewGate, BUCKET_CONFIGS } from "./pages/reviewGate.js";
-import {
-    renderModelFilter,
-    renderTypeChips,
-    applyVisibilityFilters,
-} from "./pages/filters.js";
-
-// Round 3 (V.0.4) — router + api + loaders
+// Round 3 (V.0.4) — router + api + loaders. Page renderers are imported
+// directly by their loaders — not re-imported here (Round 4 dropped the
+// `window.DINOCO_B2F_CATALOG_RENDERERS` bridge bag).
 import {
     setupHashRouter,
     goToView,
     openSetDetail,
     back as routerBack,
-    getCurrentView,
     dispatchInitial,
 } from "./router.js";
 import { createB2FCatalogApi } from "./api.js";
-import { setupMakerHome, loadMakerHome } from "./loaders/makerHome.js";
+import { setupMakerHome, loadMakerHome, handlePickMaker } from "./loaders/makerHome.js";
 import {
     setupCatalog,
     loadCatalog,
     handleAddToCart,
-    setShowVirtual,
     setQty,
 } from "./loaders/catalog.js";
 import { setupSetDetail, loadSetDetail, handleStepperChange } from "./loaders/setDetail.js";
@@ -160,9 +155,12 @@ import {
     handleSubmitOrder,
     handleReviewGate,
 } from "./loaders/cart.js";
-import { setupSuccess, loadSuccess, renderSuccess } from "./loaders/success.js";
+import { setupSuccess, loadSuccess } from "./loaders/success.js";
 
-console.info("[b2f-catalog] V.0.4 — Round 3 router + api + loaders ready");
+// Round 4 (V.0.5) — event delegation
+import { setupEventDelegation } from "./event-delegation.js";
+
+console.info("[b2f-catalog] V.0.5 — Round 4 event delegation ready");
 
 /**
  * Bootstrap the B2F Admin E-Catalog LIFF surface.
@@ -265,18 +263,86 @@ export async function bootstrap(opts = {}) {
         },
     });
 
-    // 9) Expose a debug surface (mirrors B2B catalog + B2F maker pattern).
+    // 9) Wire central event-delegation listener on the Vite root mount.
+    //    Round 4 — replaces the V.0.4 legacy `window.DINOCO_B2F_CATALOG_NAV`
+    //    bridge. All [data-action] / [data-stepact] / [data-subaddsku] /
+    //    [data-bucket-tab] dispatches resolve through this single listener.
+    if (typeof document !== "undefined") {
+        const root = document.getElementById("b2f-catalog-app");
+        if (root) {
+            setupEventDelegation(root, {
+                pickMaker: handlePickMaker,
+                openSetDetail,
+                addToCart: (sku, qty, mode, src) => handleAddToCart(sku, qty, mode, src),
+                increment: (sku) => {
+                    const cur = (state.cart && state.cart[sku] && state.cart[sku].qty) || 0;
+                    handleAddToCart(sku, cur + 1);
+                },
+                decrement: (sku) => {
+                    const cur = (state.cart && state.cart[sku] && state.cart[sku].qty) || 0;
+                    handleAddToCart(sku, Math.max(0, cur - 1));
+                },
+                removeFromCart: (sku) => {
+                    handleAddToCart(sku, 0);
+                    if (state.currentView === "cart" || state.currentView === "review") {
+                        loadCartView();
+                    }
+                },
+                addSet: (sku, qty) => handleAddToCart(sku, qty, "full_set", sku),
+                subItemStep: (sku, dir) => {
+                    handleStepperChange(sku, dir === "plus" ? 1 : -1);
+                },
+                subItemReveal: (sku) => handleAddToCart(sku, 1),
+                stepperInput: (sku, val) => setQty(sku, val),
+                toggleBucket: (key) => {
+                    // V.7.11 a11y accordion — toggle aria-expanded on the
+                    // matching tab + hide/show its panel.
+                    const root2 = document.getElementById("b2f-catalog-app");
+                    if (!root2) return;
+                    const tab = /** @type {HTMLElement|null} */ (
+                        root2.querySelector('[data-bucket-tab="' + key + '"]')
+                    );
+                    if (!tab) return;
+                    const expanded = tab.getAttribute("aria-expanded") === "true";
+                    tab.setAttribute("aria-expanded", expanded ? "false" : "true");
+                    tab.setAttribute("aria-selected", expanded ? "false" : "true");
+                    const panelId = tab.getAttribute("aria-controls") || "";
+                    if (panelId) {
+                        const panel = document.getElementById(panelId);
+                        if (panel) {
+                            if (expanded) panel.setAttribute("hidden", "");
+                            else panel.removeAttribute("hidden");
+                        }
+                    }
+                },
+                back: () => routerBack(),
+                openReviewGate: () => handleReviewGate(),
+                submitOrder: () => handleSubmitOrder(),
+            });
+        }
+    }
+
+    // 10) Expose a single frozen debug surface (mirrors B2B catalog +
+    //     B2F maker V.0.5 pattern). Legacy `_NAV` + `_RENDERERS` bag
+    //     globals from Round 3 are dropped — event delegation owns the
+    //     dispatch surface now.
     if (typeof window !== "undefined") {
         const w = /** @type {any} */ (window);
-        w.DINOCO_B2F_CATALOG = {
-            version: "V.0.4",
+        w.DINOCO_B2F_CATALOG = Object.freeze({
+            version: "V.0.5",
             ctx,
             api,
             state,
             modal,
             makerId: opts.makerId || null,
             orderIntentEnabled: !!opts.orderIntentEnabled,
-            utils: {
+            // Public navigation entry points (read-only) — kept on the
+            // single debug surface for the inline V.7.15 fallback during
+            // canary; Round 5 cutover removes the inline path entirely.
+            goToView,
+            openSetDetail,
+            back: routerBack,
+            utils: Object.freeze({
                 $, $$, L, getLang,
                 escHtml, formatNumber, formatCurrency, formatDate,
                 currencySymbol, currencyNameEn,
@@ -294,61 +360,19 @@ export async function bootstrap(opts = {}) {
                 modeBadgeHtml, productionModeCardBadgeHtml,
                 hierarchyBadgeHtml, virtualSetBadgeHtml,
                 unconfirmedBadgeHtml,
-            },
-            constants: {
+            }),
+            constants: Object.freeze({
                 CART_SCHEMA_VERSION,
-            },
+            }),
             initialCart,
-        };
-        // Round 3 — legacy bridge for inline V.7.15 fallback. These
-        // globals will be dropped in Round 4 once event delegation is
-        // wired through the new event-delegation.js module.
-        w.DINOCO_B2F_CATALOG_NAV = Object.freeze({
-            goToView,
-            openSetDetail,
-            back: routerBack,
-            getCurrentView,
-            dispatchInitial,
-            handleAddToCart,
-            handleStepperChange,
-            handleSubmitOrder,
-            handleReviewGate,
-            setShowVirtual,
-            setQty,
-            renderSuccess,
-        });
-
-        // Round 2 — page renderers exposed on a frozen sub-namespace so
-        // the inline V.7.15 fallback (Round 5 cutover) can call them
-        // without re-importing.
-        w.DINOCO_B2F_CATALOG_RENDERERS = Object.freeze({
-            // Catalog grid
-            catalog: renderProducts,
-            productCard: renderProductCard,
-            // SET Detail
-            setDetail: renderSetDetailItems,
-            setStepper: renderSetDetailMainStepper,
-            qtyStepper: buildQtyStepperHtml,
-            // Cart
-            cart: renderCartItems,
-            cartManufacturing: renderCartManufacturingSummary,
-            cartManufacturingSummary: computeCartManufacturingSummary,
-            cartThumb: buildCartItemThumbHtml,
-            // Review Gate
-            reviewGate: renderReviewGate,
-            reviewGateConfigs: BUCKET_CONFIGS,
-            // Filters
-            modelFilter: renderModelFilter,
-            typeChips: renderTypeChips,
-            applyFilters: applyVisibilityFilters,
         });
     }
 
-    // 10) Dispatch initial view based on current URL hash.
+    // 11) Dispatch initial view based on current URL hash.
     dispatchInitial();
 
     return {
-        version: "V.0.4",
+        version: "V.0.5",
         ctx,
         api,
         state,

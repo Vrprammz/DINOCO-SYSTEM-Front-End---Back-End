@@ -279,7 +279,9 @@ export function renderProductCard(p, ctx = {}) {
         html +=
             '<button class="' +
             setBtnClass +
-            '" data-setsku="' +
+            '" data-action="detail" data-setsku="' +
+            escHtml(p.sku) +
+            '" data-sku="' +
             escHtml(p.sku) +
             '">' +
             escHtml(setBtnText) +

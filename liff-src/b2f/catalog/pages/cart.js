@@ -104,7 +104,7 @@ function _renderCartItemRow(cartEntry, cartSku, ctx) {
         csym +
         formatNumber(sub) +
         "</div>" +
-        '<button class="b2f-cat-item-remove" data-sku="' +
+        '<button class="b2f-cat-item-remove" data-action="remove" data-sku="' +
         escHtml(cartSku) +
         '">&#10005;</button></div>';
     if (orderIntentEnabled && c.intent_notes) {

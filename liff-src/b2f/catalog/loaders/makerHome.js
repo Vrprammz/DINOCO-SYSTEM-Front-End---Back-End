@@ -1,15 +1,18 @@
 /**
- * B2F Admin LIFF E-Catalog — Maker Home loader (V.0.4 Round 3)
+ * B2F Admin LIFF E-Catalog — Maker Home loader (V.0.5 Round 4)
  *
  * MIGRATION SOURCE: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.15
  *   - line 1601: loadMakers() — fetch + render maker dropdown
  *
- * Round 3 contract:
- *   `setupMakerHome({ api, state })` once at bootstrap; `loadMakerHome()`
- *   triggers fetch + render. Loader is mount-tolerant — when the inline
- *   V.7.15 DOM (#b2fMakerSelect) is present it delegates to that node;
- *   when the Round 4+ Vite container `#b2f-catalog-app` exists it injects
- *   markup. Either way, `state.makerId` is updated when the user picks.
+ * Round 4 contract: maker cards now emit `data-action="pick-maker"`
+ * + `data-maker-id` and rely on the central event-delegation listener
+ * wired in entry.js. The previous per-card `addEventListener` loop is
+ * removed (drift detector enforces no `addEventListener` here).
+ *
+ * `setupMakerHome({ api, state, onPick })` once at bootstrap;
+ * `loadMakerHome()` triggers fetch + render. Mount-tolerant — when the
+ * Vite container `#b2f-catalog-app` exists it injects markup; inline
+ * V.7.15 keeps owning #b2fMakerSelect until Round 5 cutover.
  */
 
 import { showLoading, hideLoading, showToast } from "../utils/dom.js";
@@ -21,6 +24,22 @@ let _api = null;
 let _state = null;
 /** @type {((makerId: string) => void)|null} */
 let _onPick = null;
+
+/**
+ * Public picker — called from event-delegation when a card with
+ * `data-action="pick-maker"` is clicked. Updates state + invokes
+ * the bootstrap-supplied onPick (typically `goToView('catalog')`).
+ *
+ * @param {string} makerId
+ * @returns {void}
+ */
+export function handlePickMaker(makerId) {
+    if (!makerId) return;
+    if (_state) {
+        /** @type {any} */ (_state).makerId = String(makerId);
+    }
+    if (_onPick) _onPick(String(makerId));
+}
 
 /**
  * @param {{
@@ -68,7 +87,9 @@ export async function loadMakerHome() {
         }
         if (mountVite) {
             mountVite.innerHTML = _buildMakerHomeHtml(makers);
-            _wireMakerPickerClicks(mountVite);
+            // Round 4 — no imperative listener; event-delegation in
+            // entry.js dispatches `data-action="pick-maker"` →
+            // handlePickMaker via the bootstrap deps bag.
         }
         // Inline V.7.15 already manages #b2fMakerSelect — Round 3 doesn't
         // touch it. Round 4 will add the cut-over guard.
@@ -97,7 +118,7 @@ function _buildMakerHomeHtml(makers) {
             const name = escHtml(String(m.name || m.maker_name || ""));
             const cur = escHtml(String(m.currency || m.maker_currency || "THB"));
             return (
-                '<button type="button" class="b2f-maker-card" data-maker-id="' +
+                '<button type="button" class="b2f-maker-card" data-action="pick-maker" data-maker-id="' +
                 escHtml(id) +
                 '">' +
                 '<div class="b2f-maker-name">' + name + "</div>" +
@@ -112,23 +133,6 @@ function _buildMakerHomeHtml(makers) {
         '<div class="b2f-maker-list">' + cards + "</div>" +
         "</div>"
     );
-}
-
-/**
- * @param {HTMLElement} root
- */
-function _wireMakerPickerClicks(root) {
-    const buttons = root.querySelectorAll(".b2f-maker-card[data-maker-id]");
-    buttons.forEach(function (btn) {
-        btn.addEventListener("click", function () {
-            const id = btn.getAttribute("data-maker-id") || "";
-            if (!id) return;
-            if (_state) {
-                /** @type {any} */ (_state).makerId = id;
-            }
-            if (_onPick) _onPick(id);
-        });
-    });
 }
 
 /**

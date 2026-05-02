@@ -16,6 +16,7 @@
 import {
     setupMakerHome,
     loadMakerHome,
+    handlePickMaker,
     _resetMakerHome,
 } from "../../liff-src/b2f/catalog/loaders/makerHome.js";
 import {
@@ -75,7 +76,7 @@ describe("makerHome loader", () => {
         expect(() => setupMakerHome({ api: {}, state: null })).toThrow();
     });
 
-    test("loadMakerHome renders cards from API + onPick fires on click", async () => {
+    test("loadMakerHome renders cards with data-action=pick-maker (delegation taxonomy)", async () => {
         const mount = mountVite();
         const state = { makerId: null };
         const onPick = jest.fn();
@@ -92,9 +93,27 @@ describe("makerHome loader", () => {
         expect(api.getMakers).toHaveBeenCalled();
         expect(mount.querySelectorAll(".b2f-maker-card").length).toBe(2);
         const firstBtn = /** @type {HTMLElement} */ (mount.querySelector(".b2f-maker-card[data-maker-id='1']"));
-        firstBtn.click();
+        // Round 4 — loader no longer wires per-card listener; emits
+        // `data-action="pick-maker"` consumed by central event-delegation.
+        expect(firstBtn.getAttribute("data-action")).toBe("pick-maker");
+        // The exported `handlePickMaker` is the public action handler that
+        // event-delegation invokes — exercise it directly.
+        handlePickMaker("1");
         expect(state.makerId).toBe("1");
         expect(onPick).toHaveBeenCalledWith("1");
+    });
+
+    test("handlePickMaker is no-op when makerId blank", () => {
+        const state = { makerId: null };
+        const onPick = jest.fn();
+        setupMakerHome({
+            api: { getMakers: jest.fn() },
+            state,
+            onPick,
+        });
+        handlePickMaker("");
+        expect(state.makerId).toBe(null);
+        expect(onPick).not.toHaveBeenCalled();
     });
 
     test("loadMakerHome empty list shows empty marker", async () => {

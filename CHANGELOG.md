@@ -10,6 +10,40 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF B2F Catalog code port Round 4 — inline-bridge cleanup (2026-04-30)
+
+Continues from Round 3. Round 4 mirrors B2B Catalog R4 + B2F Maker R4: drop the legacy `window.DINOCO_B2F_CATALOG_NAV` + `window.DINOCO_B2F_CATALOG_RENDERERS` bridge bags in favor of a single delegated click + change listener on `#b2f-catalog-app`. Pages already emit declarative `data-action` / `data-stepact` / `data-subaddsku` / `data-bucket-tab` attributes from Round 2 onward — Round 4 wires the dispatcher that consumes them + adds the missing markers (`data-action="remove"` on cart row delete, `data-action="detail"` on SET cards, `data-action="pick-maker"` on maker cards). Flag `dinoco_liff_use_vite_b2f_catalog` default OFF (REG-029 byte-identical preserved).
+
+**New module**:
+- `liff-src/b2f/catalog/event-delegation.js` (~330 LOC) — `setupEventDelegation(root, deps)` returns cleanup; dispatches every action in the V.7.15 emit taxonomy to a dependency-injected handler bag. Handler errors swallowed via `console.error` so a misbehaving sub-handler cannot break the listener.
+
+**entry.js V.0.4 → V.0.5**:
+- Drops `window.DINOCO_B2F_CATALOG_NAV` (router + handler bag) — REMOVED.
+- Drops `window.DINOCO_B2F_CATALOG_RENDERERS` (page renderer bag) — REMOVED.
+- Keeps `window.DINOCO_B2F_CATALOG` as the single frozen debug surface (`Object.freeze` — version, ctx, api, state, modal, makerId, goToView, openSetDetail, back, utils, constants, initialCart).
+- Calls `setupEventDelegation(root, { pickMaker, openSetDetail, addToCart, increment, decrement, removeFromCart, addSet, subItemStep, subItemReveal, stepperInput, toggleBucket, back, openReviewGate, submitOrder })` once at bootstrap.
+- `loaders/makerHome.js` V.0.5 — exports new `handlePickMaker(makerId)` action handler; removes the per-card imperative `addEventListener` loop. Maker cards now emit `data-action="pick-maker"` consumed by the central listener.
+- Tab toggle (review-gate accordion) is wired inline in entry.js bootstrap — switches `aria-expanded` / `aria-selected` + `[hidden]` on the matching `aria-controls` panel.
+
+**Bundle delta**:
+
+| Asset | V.0.4 (Round 3) | V.0.5 (Round 4) | Delta |
+|---|---|---|---|
+| `b2f-catalog.<hash>.js` | 44.09 KB (gzip 14.04 KB) | 44.68 KB (gzip 14.03 KB) | +0.59 KB raw / -0.01 KB gzip |
+| `b2f-catalog.<hash>.css` | 31.40 KB (gzip 5.88 KB) | 31.40 KB (gzip 5.88 KB) | 0 |
+
+Net bundle is essentially flat — the new event-delegation module (~330 LOC, ~3 KB raw) almost exactly offsets the Round 3 bridge globals (`_NAV` + `_RENDERERS` bag boilerplate) that Round 4 removes.
+
+**Tests**: `tests/jest/liff-b2f-catalog-bridge.test.js` (49 cases) covers basic contract (cleanup, idempotent, no-deps no-op) + every action in the taxonomy + Promise rejection swallow + source-level drift detectors (entry.js no longer assigns `_NAV` / `_RENDERERS`, KEEPS frozen `DINOCO_B2F_CATALOG`, calls `setupEventDelegation(root,`, bumps version to V.0.5; pages/* contain no inline `onclick=` literal; `loaders/makerHome.js` no longer calls `.addEventListener` and emits `data-action="pick-maker"` + exports `handlePickMaker`). `tests/jest/liff-b2f-catalog-loaders.test.js` updated — maker-pick test now exercises `handlePickMaker(id)` directly + asserts emitted `data-action="pick-maker"` attribute (the loader no longer wires the listener; event-delegation in entry.js does). New `handlePickMaker` no-op test for blank input.
+
+Total Jest count 1087 → 1137 (+50). Build, lint, typecheck all clean.
+
+**Production safety**: Inline V.7.15 still authoritative — Round 4 only ports + tests the replacement layer. Triple-safety chain (flag + manifest + `dinoco_liff_enqueue('b2f-catalog')`) preserved per V.7.13 wiring. Round 5 (drop inline `b2f_liff_page_js()` from Snippet 8) requires explicit user confirmation + 1-week canary before destructive change.
+
+After R4 all three LIFF surfaces — B2F Maker (R1-4: 16 commits), B2B Catalog (R1-4: 23 commits), B2F Catalog (R1-4: ~9 commits) — are ready for canary observation.
+
+---
+
 ### Feature — Vite LIFF B2F Catalog code port Round 2 — page renderers (2026-04-30)
 
 Second Vite-side migration round for the B2F Admin E-Catalog (`[B2F] Snippet 8` V.7.14 → V.7.15 annotation-only). Mirrors the B2B Catalog Round 2 + B2F Maker Round 2 patterns: ship 5 page-renderer modules as pure HTML builders + frozen `window.DINOCO_B2F_CATALOG_RENDERERS` namespace for inline-bridge fallback. Inline V.7.14 stays UNCHANGED — flag still default OFF (REG-029 byte-identical preserved).
