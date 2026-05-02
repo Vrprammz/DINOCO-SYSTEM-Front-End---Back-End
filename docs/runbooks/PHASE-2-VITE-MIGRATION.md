@@ -879,10 +879,72 @@ Annotation only — inline rendering authoritative. NEW comment block documents 
 
 ### Round 2-5 roadmap (next sprints)
 
-- **Round 2** — port 5 page renderers from inline V.3.8 lines 786-1567 into `liff-src/liff-ai/frontend/pages/{dashboard,dealer,lead-detail,claim-list,claim-detail,agent-chat}.js`. Mirrors B2B / B2F maker / B2F catalog Round 2 pattern. Inline V.3.8 stays UNCHANGED — expose renderers via `window.DINOCO_LIFF_AI_RENDERERS` for inline-bridge fallback during Round 5 cut-over.
+- **Round 2** ✅ DONE — see Step 2.5 Round 11 R2 below.
 - **Round 3** — router + lead pipeline FSM client-side validation (gated by server-side `/lead-fsm` endpoint). Photo lightbox + status change modal extracted to dedicated modules.
 - **Round 4** — agent chat module (Phase 3 AI proxy). Claude bubble rendering + quick actions + typing indicator.
 - **Round 5** — destructive cut-over. Flip `dinoco_liff_use_vite_liff_ai = '1'`. Snippet 2 inline `<style>` + `<script>` blocks stripped (preserve shell HTML + `wp_head/wp_footer` only). REG-029 baseline updates.
+
+---
+
+## Step 2.5 Round 11 R2 — LIFF AI Frontend code port (Round 2 — page renderers) ✅ (2026-05-02)
+
+Continues from Round 1 foundation. Round 2 ports the 7 page renderers from inline `[LIFF AI] Snippet 2: Frontend` V.3.10 (header annotation only — inline body UNCHANGED) into ES modules under `liff-src/liff-ai/frontend/pages/`. Renderers exposed via frozen `window.DINOCO_LIFF_AI_RENDERERS` namespace (21 fns + 2 const exports) for inline-bridge fallback during Round 5 cut-over. Mirrors B2B / B2F maker / B2F catalog Round 2 patterns.
+
+### Round 11 R2 — what landed
+
+| File | LOC | Notes |
+| --- | --- | --- |
+| `liff-src/liff-ai/frontend/pages/dashboard.js` | 169 | `renderDashboard` (Admin top-level shell) + `renderUrgentSection` (needs-attention + pending claims) |
+| `liff-src/liff-ai/frontend/pages/dealer.js` | 91 | `renderDealer` — Dealer dashboard 2-tab shell |
+| `liff-src/liff-ai/frontend/pages/leadCard.js` | 65 | `renderLeadCard` — single lead row (shared across list + detail) |
+| `liff-src/liff-ai/frontend/pages/leadDetail.js` | 218 | `renderLeadDetail` + `renderLeadHistory` + `renderLeadStatusChange` modal |
+| `liff-src/liff-ai/frontend/pages/claimList.js` | 211 | `renderClaimList` + `renderClaimFilter` + `renderClaimCard` + `renderLeadList` + `renderLeadFilter` (lead/claim list patterns share filter chips) |
+| `liff-src/liff-ai/frontend/pages/claimDetail.js` | 265 | `renderClaimDetail` + `renderStatusHistory` + `renderPhotoLightbox` (swipe-enabled) + `renderClaimStatusChange` modal |
+| `liff-src/liff-ai/frontend/pages/agentChat.js` | 139 | `renderAgentChat` + `renderChatBubble` + `formatBotText` (markdown-lite) + `AGENT_LABELS` + `QUICK_QUESTIONS` exports |
+| `tests/jest/liff-ai-pages.test.js` | 673 | 69 cases across 7 describe blocks — pure render → HTML string round-trip + escape tests + `data-action` attribute presence |
+
+Total Round 2 source: **1,058 LOC** across 7 page modules. All renderers are pure HTML output — caller wires events post-mount. No DOM mutation inside renderers. Mirror inline V.3.8 lines 847-1567 EXACTLY (drift = visual regression).
+
+### Round 11 R2 — entry.js V.0.2 → V.0.3
+
+- Imports the 7 page modules + re-exports all 21 named renderer functions.
+- Exposes a frozen `window.DINOCO_LIFF_AI_RENDERERS` namespace (registry pattern matches B2F catalog R2 `_RENDERERS` + B2F maker R2 `_RENDERERS`) so inline V.3.10 can call them via the bridge during Round 5 cut-over.
+- 21 renderer keys + 2 const exports (`AGENT_LABELS` / `QUICK_QUESTIONS`) on the registry.
+
+### Round 11 R2 — Snippet 2 V.3.10 header bump
+
+Annotation only — inline body UNCHANGED. Documents the Round 2 page module paths so Round 5 cut-over commits can reference. Flag still default OFF (REG-029 byte-identical preserved).
+
+### Round 11 R2 — bundle deltas (Round 1 → Round 2)
+
+| Asset | V.0.2 (R1) | V.0.3 (R2) | Delta |
+| --- | --- | --- | --- |
+| `liff-ai.<hash>.js` | 2.85 KB (1.38 KB gzip) | 25.62 KB (6.72 KB gzip) | +22.77 KB / +5.34 KB gzip |
+| `assets/liff-ai.<hash>.css` | 17.73 KB (3.65 KB gzip) | unchanged | 0 |
+| Lang chunk | 1.39 KB | 1.39 KB | 0 |
+
+Bundle-size guard threshold bumped 240 KB → 280 KB total (R1+R2 expansion of all 4 LIFF surface bundles). Liff-ai entry well under per-entry 48 KB cap from Round 9 R3.
+
+### Round 11 R2 — tests
+
+- `tests/jest/liff-ai-pages.test.js` (NEW) — 69 cases across 7 describe blocks. jsdom env. Coverage: pure render output → HTML string → `data-action` attribute presence + `escHtml` correctness + edge cases (empty arrays, null fields, pre-mount wireup contract).
+- Test count: 1203 → 1272 (Round 2 adds 69 tests, +3 over the +66 estimated)
+
+### Round 11 R2 — verifying locally
+
+```bash
+npm run build:liff           # → liff-ai bundle 25.62 KB (was 2.85 KB)
+npm run test:jest            # → 1272 tests pass (was 1203 before Round 2)
+npx jest liff-ai-pages       # → 69 Round 2 cases
+```
+
+### Round 11 R3 — scope (next)
+
+- Add router (hashchange + history.pushState) — bottom-nav + back-button preserve
+- Add LIFF AI API client wrapper (`createApi` + retry + 401 → re-auth flow)
+- Add 5 page loaders (`loadDashboard` / `loadDealer` / `loadLeadDetail` / `loadClaimList` / `loadClaimDetail`)
+- Auth flow refinement — JWT exchange retry + role-based first-page selection (admin → dashboard, dealer → dealer)
+- Round 4 will then do inline-bridge cleanup (mirror B2F maker / B2B catalog R4 pattern: drop globals + wire `data-action` event delegation)
 
 ---
 

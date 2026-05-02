@@ -10,6 +10,38 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 2 — page renderers (2026-05-02)
+
+Continues from Round 1 foundation. Round 2 ports the 7 page renderers from inline `[LIFF AI] Snippet 2: Frontend` V.3.9 → V.3.10 (header annotation only — inline body UNCHANGED, REG-029 byte-identical preserved). Mirrors B2B / B2F maker / B2F catalog Round 2 patterns: ship page-renderer modules as pure HTML builders + frozen `window.DINOCO_LIFF_AI_RENDERERS` namespace for inline-bridge fallback. Flag `dinoco_liff_use_vite_liff_ai` default OFF.
+
+**New files** (8, all under `liff-src/liff-ai/frontend/pages/` + tests):
+
+- `pages/dashboard.js` (169 LOC) — `renderDashboard` (Admin top-level shell) + `renderUrgentSection` (needs-attention leads + pending claims). Source: inline V.3.9 lines 847-943.
+- `pages/dealer.js` (91 LOC) — `renderDealer` (Dealer 2-tab shell — leads queue + my claims).
+- `pages/leadCard.js` (65 LOC) — `renderLeadCard` shared row renderer (lead list + lead detail headers).
+- `pages/leadDetail.js` (218 LOC) — `renderLeadDetail` + `renderLeadHistory` + `renderLeadStatusChange` modal. Status timeline mirrors `LEAD_STATUSES` + `LEAD_STATUS_TH` from utils/lead-status.js.
+- `pages/claimList.js` (211 LOC) — `renderClaimList` + `renderClaimFilter` + `renderClaimCard` + `renderLeadList` + `renderLeadFilter` (lead/claim list patterns share filter chip layout).
+- `pages/claimDetail.js` (265 LOC) — `renderClaimDetail` + `renderStatusHistory` + `renderPhotoLightbox` (swipe-enabled) + `renderClaimStatusChange` modal. Photo lightbox uses native touch events.
+- `pages/agentChat.js` (139 LOC) — `renderAgentChat` + `renderChatBubble` + `formatBotText` (markdown-lite) + exported constants `AGENT_LABELS` + `QUICK_QUESTIONS`.
+- `tests/jest/liff-ai-pages.test.js` (673 LOC, 69 cases across 7 describe blocks) — jsdom env. Coverage: pure render → HTML string round-trip + escape tests + `data-action` attribute presence + edge cases (empty arrays, null fields, pre-mount wireup contract).
+
+**entry.js V.0.2 → V.0.3** — exposes a frozen `window.DINOCO_LIFF_AI_RENDERERS` namespace (21 renderer fns + 2 const exports — `AGENT_LABELS`, `QUICK_QUESTIONS`) so Round 5 cutover can call renderers without re-importing. All 21 keys also re-exported via the entry module barrel for tests + future Round 3 router.
+
+**Snippet 2 V.3.9 → V.3.10** — annotation-only header bump documenting parallel Vite artifact paths for Round 2. Inline body UNCHANGED.
+
+**Bundle delta**:
+
+| Asset | V.0.2 (R1) | V.0.3 (R2) | Delta |
+| --- | --- | --- | --- |
+| `liff-ai.<hash>.js` | 2.85 KB (1.38 KB gzip) | 25.62 KB (6.72 KB gzip) | +22.77 KB / +5.34 KB gzip |
+| `assets/liff-ai.<hash>.css` | 17.73 KB (3.65 KB gzip) | unchanged | 0 |
+
+Bundle-size guard threshold bumped 240 KB → 280 KB total (`tests/jest/bundle-size.test.js`). Liff-ai entry still well under per-entry 48 KB cap.
+
+**Test count**: 1203 → 1272 (+69 tests, +1 suite).
+
+**Risk** — NONE. Pure additive: page-renderer modules only, NOT wired into Snippet 2 inline rendering. Flag default OFF. lint + typecheck + 43 jest suites all pass. Round 3 will add router + LIFF AI API + 5 loaders + auth-flow refinement. Round 5 will flip the cut-over flag.
+
 ### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 1 — foundation (2026-04-30)
 
 Final LIFF surface port begins. Closes the 4-of-4 inline → Vite migration roadmap by extracting `[LIFF AI] Snippet 2: Frontend` V.3.8 inline `<style>` (~425 LOC) + JS utility helpers into Vite-buildable ES modules. Snippet 2 V.3.8 → V.3.9 (header annotation only — inline rendering UNCHANGED, REG-029 byte-identical preserved). Flag `dinoco_liff_use_vite_liff_ai` default OFF.
