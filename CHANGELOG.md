@@ -10,6 +10,29 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF B2B Catalog code port Round 2 — 5 page modules + 12+ renderers (2026-04-30)
+
+Continues from Round 1 foundation. Round 2 ports the page renderers from inline `b2b_liff_page_js()` (V.32.9 lines 884-1850) into ES modules under `liff-src/b2b/catalog/pages/`. Inline V.32.9 stays UNCHANGED — renderers exposed via `window.DINOCO_B2B_CATALOG.renderers.*` for inline-bridge fallback during Round 3-4 cutover. Flag `dinoco_liff_use_vite_b2b_catalog` default OFF (REG-029 byte-identical preserved).
+
+**What landed**:
+
+- **5 page modules** (`liff-src/b2b/catalog/pages/`, ~870 LOC):
+  - `home.js` — `renderHome` composite + `renderModelRow` / `renderCategoryRow` / `renderModelCard` (🏍️ emoji fallback) / `renderCategoryCard` + `renderViewState` (4-mode visibility decision tree) + `renderCrossFilterPills` (sub-header chips with active-state highlighting) + `productMatchesModel` / `collectCategoriesForModel` / `collectModelsForCategory` helpers
+  - `catalog.js` — `renderProducts` 2-col grid (V.32.6 P18 LCP boost: first 6 imgs `fetchpriority="high" loading="eager"`, remainder `lazy`) + `renderProductCard` (SET purple "ดูชุด" overlay btn / OOS disabled chip / low-stock yellow chip / discount red badge / model tags 3-cap with "+N more") + `filterProducts` (4 modes: home/search/model/category with crossFilter) + `formatEtaDate` parity
+  - `setDetail.js` — V.32.0 SET overlay + V.32.2 typable stepper (1-999 clamp + min/max + Enter-to-add) + V.32.4 collapsed sub-item default ("+ สั่งแยก" reveals stepper) + V.32.6 P1 MOQ hint. Exposes `renderSetDetailMainStepper` / `updateSetDetailAddBtn` (boolean) / `renderSetDetailItems` (children + grandchildren via "ซื้อแยกชิ้น") / `buildB2bStepper` (shared widget)
+  - `history.js` — `renderHistoryFilter` (11 chips, "ทั้งหมด" leading) + `renderHistory` / `renderHistoryCard` / `renderLoadMoreButton` + 15-entry `STATUS_COLORS` + `STATUS_LABELS` constants + `getStatusColor` / `getStatusLabel` fallback helpers. Action button order preserved: ดู → ยกเลิก → สั่งซ้ำ → เคลม
+  - `cart.js` — `updateCartBar` (count + total + visibility based on `activeTab==='catalog'`) + `renderCartItems` (V.32.4 🗑️ remove btn + V.32.6 P3 empty state) + `renderCartModalItem` (V.32.3 56×56 thumbnails with `onerror` fallback to 📦) + `renderCartNoteSection` + `renderRecommendedChips` (cap 6, case-insensitive, name truncated 16 chars)
+- **`entry.js` V.0.2 → V.0.3** — imports the 5 page modules + extends `window.DINOCO_B2B_CATALOG` debug surface with frozen `renderers` namespace exposing 32 named exports for the inline-bridge during Rounds 3-4
+- **111 Jest tests** in `tests/jest/liff-b2b-catalog-pages.test.js`: model/category card emoji+image branches + XSS escape + view-state truth table + 4-mode filter combinations + LCP fetchpriority threshold + 3 stepper variants (collapsed/full/OOS-disabled) + MOQ hint conditional + DD-3 shared leaf appears under each parent SET (multi-DOM-row guarantee) + 11 history filter chips + 15 status colors + load-more pagination + V.32.4 remove button + V.32.6 P3 empty state + V.32.3 thumbnails with placeholder fallback + recommended chip cap-6 + case-insensitive SKU match
+- **Bundle deltas**: `b2b-catalog.<hash>.js` 9.04KB → 27.63KB (gzip 9.13KB, +18.6KB raw / +3.7KB gzip). CSS unchanged 27.86KB. Bundle-size guard threshold 64KB unaffected — 36KB headroom for Rounds 3-5
+- **Test count**: 547 → 658 (Jest), PHPUnit 383 unchanged
+
+**Production safety**: Snippet 4 inline `<style>` + `<script>` blocks intact (REG-029 byte-identical when flag OFF). DOM structure preserved — same class names, data-action taxonomy, Thai user-facing strings. NEW `data-action` attributes (`set-model-view` / `set-category-view` / `set-cross-filter` / `set-history-filter` / `add-recommended` / `load-more`) emit on Round 2 outputs but stay inert when bundle is OFF — they enable Round 3 event delegation. Rollback = flip flag false (no redeploy) — instant.
+
+**Round 3 scope** (next): router (tab-switch + URL hash sync `#detail-<sku>`) + B2B API wrapper (5 endpoints through `createB2BApi()`) + page bootstrap loaders.
+
+---
+
 ### Feature — Vite LIFF B2B Catalog code port Round 1 — CSS + 6 utility modules + foundation bootstrap (2026-04-30)
 
 Mirrors the B2F Maker port pattern (Rounds 1-4 already shipped). B2B Catalog (`[B2B] Snippet 4: LIFF E-Catalog Frontend`) is the largest LIFF surface (~155KB inline). Round 1 = foundation only — inline JS untouched, flag `dinoco_liff_use_vite_b2b_catalog` default OFF (REG-029 byte-identical preserved).
