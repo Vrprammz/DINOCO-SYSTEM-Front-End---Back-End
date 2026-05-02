@@ -1,5 +1,5 @@
 /**
- * B2F Maker LIFF — Vite entry (V.0.4 Round 3 router + API + page bootstrap)
+ * B2F Maker LIFF — Vite entry (V.0.5 Round 4 — inline-bridge cleanup)
  *
  * MIGRATION TARGET: `[B2F] Snippet 4: Maker LIFF Pages` V.4.7
  *
@@ -15,26 +15,28 @@
  *   ✅ Renderers exposed via `window.DINOCO_B2F_MAKER_RENDERERS` for
  *      inline-bridge use during cutover.
  *
- * Round 3 (V.0.4 — this commit):
- *   ✅ Router (`./router.js`) — getCurrentView / goToPage / goToPageWithPO /
- *      setupRouter / dispatchInitial. Supports both V.4.7 reload-style and
- *      SPA-style (history.pushState) navigation. Production stays on reload.
- *   ✅ Maker API wrapper (`./api.js`) — createMakerApi() with named methods
- *      (confirmPO / rejectPO / reschedulePO / deliverLot / getPODetail /
- *      getMakerPOList) + auto X-Idempotency-Key on mutations + 401/410/409
- *      error mapping.
- *   ✅ 5 page loaders in `./loaders/` — confirm / detail / reschedule / list /
- *      deliver. Each owns its load + render + handler-attach pipeline. Pure
- *      port of inline V.4.7 `loadConfirmPage` / `handleConfirm` / etc.
- *   ✅ Legacy bridge — `window.goToPage` / `window.goToPageWithPO` /
+ * Round 3 (V.0.4):
+ *   ✅ Router (`./router.js`) + Maker API wrapper (`./api.js`)
+ *   ✅ 5 page loaders in `./loaders/`
+ *   ✅ Legacy bridge — exposed `window.goToPage` / `window.goToPageWithPO` /
  *      `window.b2fOpenDeliverForm` / `window.b2fFillAllRemaining` /
- *      `window.b2fStepQty` / `window.b2fSubmitDeliver` re-exposed so existing
- *      inline JS in Snippet 4 V.4.7 (still rendering pages when flag OFF)
- *      keeps working. Round 4 will drop these.
+ *      `window.b2fStepQty` / `window.b2fSubmitDeliver` / `window.loadDeliverPage`
+ *      so existing inline JS in Snippet 4 V.4.7 keeps working.
  *
- * Round 4+ scope (NOT in this file yet):
- *   ⏳ Inline-bridge cleanup (entry.js owns full bootstrap, drop window.* legacy bridge)
- *   ⏳ Cut-over (drop inline JS from Snippet 4)
+ * Round 4 (V.0.5 — this commit):
+ *   ✅ Event delegation — `setupEventDelegation(rootEl)` listens on
+ *      `#b2f-app` for click events bubbling up from `[data-action]`
+ *      elements, dispatches to imported handlers.
+ *   ✅ Pages migrated to `data-action="..."` attributes (no inline onclick).
+ *   ✅ Drop 7 legacy `window.*` globals — entry.js now owns full bootstrap
+ *      autonomously when flag flipped ON.
+ *   ✅ Drop `window.DINOCO_B2F_MAKER_RENDERERS` parallel-rendering surface.
+ *   ✅ Single namespaced surface kept: `window.DINOCO_B2F_MAKER` (debug +
+ *      console testing only — not consumed by Snippet 4 V.4.7 inline JS).
+ *
+ * Round 5+ scope (NOT in this file yet):
+ *   ⏳ Production canary cutover — drop inline `b2f_liff_page_js()` from
+ *      Snippet 4 once flag has been ON 1 week with no regressions.
  *
  * Surface area (per V.4.7):
  *   - PO confirm / reject / reschedule
@@ -128,6 +130,7 @@ import {
     dispatchInitial,
 } from "./router.js";
 import { createMakerApi } from "./api.js";
+import { setupEventDelegation as _setupEventDelegationCore } from "./event-delegation.js";
 import {
     setupConfirm,
     loadConfirmPage,
@@ -151,11 +154,44 @@ import {
 } from "./loaders/deliver.js";
 
 const BOOT_MARKER =
-    "[b2f-maker] Vite bundle loaded (V.0.4 Round 3 — router + API + loaders)";
+    "[b2f-maker] Vite bundle loaded (V.0.5 Round 4 — event delegation)";
 console.info(BOOT_MARKER);
 
 /**
- * Full-featured bootstrap (Round 3 — wires router + loaders).
+ * Round 4 — wire one click listener on `#b2f-app` that dispatches to the
+ * proper handler based on `data-action` attribute. Uses bubbling so clicks
+ * on inner children of action elements still match (`closest()`).
+ *
+ * Handled actions:
+ *   - `navigate`           — generic page navigation (data-view)
+ *   - `navigate-with-po`   — page nav with po_id (data-view, data-po-id)
+ *   - `deliver-open`       — open deliver form for a specific PO (data-po-id)
+ *   - `deliver-back`       — return from deliver form to deliver list
+ *   - `deliver-step`       — qty stepper +/- (data-delta = "1" or "-1")
+ *   - `deliver-fill-all`   — auto-fill all qty inputs to max
+ *   - `deliver-submit`     — submit deliver form
+ *
+ * Thin wrapper around `event-delegation.js` core (DI-friendly for tests).
+ * Caller passes the live root element; this binds the imported router +
+ * loader handlers as deps.
+ *
+ * @param {HTMLElement|null|undefined} root
+ * @returns {() => void} cleanup
+ */
+export function setupEventDelegation(root) {
+    return _setupEventDelegationCore(root, {
+        goToPage,
+        goToPageWithPO,
+        b2fOpenDeliverForm,
+        loadDeliverPage,
+        b2fStepQty,
+        b2fFillAllRemaining,
+        handleDeliverSubmit,
+    });
+}
+
+/**
+ * Full-featured bootstrap (Round 4 — autonomous, no window.* legacy bridge).
  *
  * @param {{
  *   liffId?: string,
@@ -245,48 +281,15 @@ export async function bootstrap(opts = {}) {
         },
     });
 
-    // Round 2: expose page renderers for inline-bridge during cutover.
-    const renderers = {
-        confirm: renderConfirmPage,
-        confirmItem: renderItemRow,
-        attachConfirmHandlers,
-        detail: renderDetailPage,
-        detailItem: renderDetailItem,
-        rescheduleList: renderRescheduleList,
-        reschedule: renderReschedulePage,
-        attachRescheduleHandler,
-        list: renderListPage,
-        deliver: renderDeliverPage,
-        deliverForm: renderDeliverForm,
-    };
-
-    if (typeof window !== "undefined") {
-        window.DINOCO_B2F_MAKER_RENDERERS = renderers;
-
-        // Round 3 — legacy global bridge so existing Snippet 4 V.4.7 inline
-        // JS keeps working when bundle co-exists with inline render. Round 4
-        // will drop this bridge once inline JS is removed.
-        if (typeof window.goToPage !== "function") {
-            window.goToPage = goToPage;
-        }
-        if (typeof window.goToPageWithPO !== "function") {
-            window.goToPageWithPO = goToPageWithPO;
-        }
-        if (typeof window.b2fOpenDeliverForm !== "function") {
-            window.b2fOpenDeliverForm = b2fOpenDeliverForm;
-        }
-        if (typeof window.b2fFillAllRemaining !== "function") {
-            window.b2fFillAllRemaining = b2fFillAllRemaining;
-        }
-        if (typeof window.b2fStepQty !== "function") {
-            window.b2fStepQty = b2fStepQty;
-        }
-        if (typeof window.b2fSubmitDeliver !== "function") {
-            window.b2fSubmitDeliver = handleDeliverSubmit;
-        }
-        // V.4.7 line 1464 deliver form ←Back button uses inline `loadDeliverPage()`.
-        if (typeof window.loadDeliverPage !== "function") {
-            window.loadDeliverPage = loadDeliverPage;
+    // Round 4 — event delegation on #b2f-app. Replaces all inline `onclick=`
+    // handlers + drops `window.goToPage` / `window.b2fOpenDeliverForm` /
+    // etc. legacy globals from Round 3. Cleanup fn is held for tests + future
+    // hot-reload.
+    let _delegationCleanup = function () {};
+    if (typeof document !== "undefined") {
+        const appRoot = document.getElementById("b2f-app");
+        if (appRoot) {
+            _delegationCleanup = setupEventDelegation(appRoot);
         }
     }
 
@@ -324,8 +327,8 @@ export async function bootstrap(opts = {}) {
         api,
         currency,
         lang: getLang(),
-        renderers,
         router: { goToPage, goToPageWithPO, getCurrentView, dispatchInitial },
+        teardown: _delegationCleanup,
         helpers: {
             L,
             formatNumber,
@@ -366,15 +369,27 @@ if (typeof window !== "undefined" && window.DINOCO_B2F_MAKER_CONFIG) {
     );
 }
 
-// Surface utilities for inline-bridge during parallel rendering window.
-// This lets Round 2-3 incrementally migrate inline JS by gradually
-// replacing globals with calls to `window.DINOCO_B2F_MAKER.helpers.*`.
+// Round 4 — single namespaced debug surface. Kept for console testing +
+// hot-reload diagnostics. NOT consumed by Snippet 4 V.4.7 inline JS — that
+// inline path is gated by the flag and never co-runs with this bundle.
+//
+// Removed in this round:
+//   - window.goToPage             (use DINOCO_B2F_MAKER.router.goToPage)
+//   - window.goToPageWithPO       (use DINOCO_B2F_MAKER.router.goToPageWithPO)
+//   - window.b2fOpenDeliverForm
+//   - window.b2fFillAllRemaining
+//   - window.b2fStepQty
+//   - window.b2fSubmitDeliver
+//   - window.loadDeliverPage
+//   - window.DINOCO_B2F_MAKER_RENDERERS
+//
+// All UI interaction now flows through `data-action="..."` event delegation
+// wired by `setupEventDelegation()` above.
 if (typeof window !== "undefined") {
     window.DINOCO_B2F_MAKER = Object.freeze({
-        version: "V.0.4",
+        version: "V.0.5",
         bootstrap,
-        // Round 3 — router + API factories for any Snippet 4 caller that
-        // wants to migrate piecemeal.
+        setupEventDelegation,
         router: {
             goToPage,
             goToPageWithPO,
