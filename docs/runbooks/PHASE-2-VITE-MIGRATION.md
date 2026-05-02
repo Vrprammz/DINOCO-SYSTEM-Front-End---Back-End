@@ -948,6 +948,65 @@ npx jest liff-ai-pages       # → 69 Round 2 cases
 
 ---
 
+## Step 2.5 Round 11 R3 — LIFF AI Frontend code port (Round 3 — router + API + loaders) ✅ (2026-05-02)
+
+Port the runtime layer for `[LIFF AI] Snippet 2: Frontend` V.3.10 → entry.js V.0.4. Wires Round 2 page renderers into a navigable SPA with backend API + auth flow + handlers. Mirrors prior R3 patterns (B2F Maker R3, B2B Catalog R3, B2F Catalog R3). Inline V.3.10 stays untouched (REG-029 byte-identical preserved until cut-over).
+
+### Round 11 R3 — what landed
+
+| File | LOC | Surface |
+| --- | --- | --- |
+| `liff-src/liff-ai/frontend/router.js` | 222 | `setupHashRouter` / `goToTab` / `openLeadDetail` / `openClaimDetail` / `back` / `getCurrentTab` / `getCurrentId` / `dispatchInitial` (pushState + popstate + role-based default) |
+| `liff-src/liff-ai/frontend/api.js` | 211 | `createLiffAiApi()` — X-LIFF-AI-Token + X-Idempotency-Key auto-attach (5 mutating endpoints) + 401/409/5xx mapping + 11 named methods |
+| `liff-src/liff-ai/frontend/auth-flow.js` | 145 | `initAuth(ctx, api)` — id_token → JWT exchange + 401 retry + role resolution (sessionStorage cache) |
+| `liff-src/liff-ai/frontend/loaders/dashboard.js` | 80 | `setupDashboard` + `loadDashboard` (admin) + secondary urgent fetch |
+| `liff-src/liff-ai/frontend/loaders/dealer.js` | 60 | `setupDealer` + `loadDealerDashboard` |
+| `liff-src/liff-ai/frontend/loaders/leadDetail.js` | 175 | `loadLeadDetail` / `handleAcceptLead` / `handleNoteAdd` / `handleStatusChange` / `showStatusChangeModal` |
+| `liff-src/liff-ai/frontend/loaders/claimList.js` | 67 | `setupClaimList` + `loadClaimList` (with status filter) |
+| `liff-src/liff-ai/frontend/loaders/claimDetail.js` | 145 | `loadClaimDetail` / `openLightbox` / `closeLightbox` / `handleClaimStatusUpdate` / `showClaimStatusModal` |
+| `liff-src/liff-ai/frontend/loaders/agentChat.js` | 195 | `setupAgentChat` + `loadAgentChat` + `handleAskAgent` (history persistence + welcome bubble + send-lock guard) |
+
+### Round 11 R3 — entry.js V.0.3 → V.0.4
+
+- Bootstrap rewires to: `initLiff` → `createLiffAiApi` (no token) → `initAuth` → `createLiffAiApi` (with token) → setup loaders → `setupHashRouter` → initial dispatch by `getCurrentTab()` × `state.role`.
+- Idempotency keys auto-attach on `lead/{id}/accept` (Round 26), `claim/{id}/status` (Round 40), `lead/{id}/note` (Round 42), `lead/{id}/status` (Round 46), `agent-ask` (Round 47) — sent always; server ignores when wrapper inactive.
+- Round 3 legacy bridge (kept until Round 4): `window.{navigate, goToTab, openLeadDetail, openClaimDetail, handleAskAgent, handleAcceptLead, handleNoteAdd, handleStatusChange, handleClaimStatusUpdate, showStatusChangeModal, showClaimStatusModal, openLightbox, closeLightbox}` so existing inline `onclick=` handlers in V.3.10 keep firing when flag flips ON.
+- Namespaced surface kept: `window.DINOCO_LIFF_AI` (frozen — `.api` / `.state` / `.router` / `.loaders` / `.bootstrap`).
+
+### Round 11 R3 — bundle deltas (Round 2 → Round 3)
+
+| Artifact | Round 2 | Round 3 |
+| --- | --- | --- |
+| `liff-ai.<hash>.js` | 25.61KB (6.72KB gzip) | 42.08KB (10.99KB gzip) |
+| total dist non-map | 252KB | 277KB |
+
+Bundle-size threshold (per-entry) stayed 64KB. Total dist ceiling raised 280 → 320KB (header note + comment in `tests/jest/bundle-size.test.js`) for Round 4 headroom.
+
+### Round 11 R3 — tests
+
+- `tests/jest/liff-ai-router.test.js` — 22 cases (URL parse / pushState / popstate / dispatch).
+- `tests/jest/liff-ai-api.test.js` — 22 cases (header injection / idempotency-key / 401/409/5xx / 11 named methods).
+- `tests/jest/liff-ai-loaders.test.js` — 25 cases (6 loaders × setup/load/error/handler).
+- Total: **+69 tests** (1272 → 1341).
+
+### Round 11 R3 — verifying locally
+
+```bash
+npm run build:liff           # → liff-ai bundle 42.08 KB (gzip 10.99 KB)
+npm run test:jest            # → 1341 tests pass (was 1272 before Round 3)
+npx jest liff-ai-router liff-ai-api liff-ai-loaders   # → 69 Round 3 cases
+npm run lint && npm run typecheck   # clean
+```
+
+### Round 11 R4 — scope (next)
+
+- Migrate inline `onclick=` handlers in `[LIFF AI] Snippet 2: Frontend` V.3.10 → `data-action="..."` attributes.
+- Wire `setupEventDelegation(rootEl)` listener on `#liffAiApp` dispatching to imported handlers (mirror B2F Maker R4 / B2B Catalog R4 pattern).
+- Drop the 13 `window.*` legacy globals from R3 bridge — entry.js owns full bootstrap autonomously when flag flips ON.
+- Round 5 = production canary cut-over (1 distributor → 10% → 100%) + drop inline `<script>` block from Snippet 2.
+
+---
+
 ## References
 
 - `[System] DINOCO LIFF Asset Loader` snippet — runtime helper

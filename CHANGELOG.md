@@ -10,6 +10,40 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 3 — router + API + auth-flow + 6 loaders (2026-05-02)
+
+Continues from Round 2 page renderers. Round 3 ports the runtime layer (router + API wrapper + auth flow + 6 page loaders) so Round 2 renderers connect to live data + handlers. Mirrors prior R3 patterns (B2F Maker R3, B2B Catalog R3, B2F Catalog R3). Inline `[LIFF AI] Snippet 2: Frontend` V.3.10 stays untouched — REG-029 byte-identical preserved until Round 5 cut-over.
+
+**New files** (9 under `liff-src/liff-ai/frontend/` + 3 test files):
+
+- `router.js` (222 LOC) — `setupHashRouter` / `goToTab` / `openLeadDetail` / `openClaimDetail` / `back` / `getCurrentTab` / `getCurrentId` / `dispatchInitial`. pushState navigation + popstate listener + role-based `defaultPageResolver`. Source: inline V.3.10 `route(page, params)` lines 749-764 + `navigate(page, params)` lines 766-775.
+- `api.js` (211 LOC) — `createLiffAiApi()` wrapping shared `createApi` with `X-LIFF-AI-Token` header + `X-Idempotency-Key` auto-attach on 5 mutating endpoints (`lead/{id}/accept` Round 26, `claim/{id}/status` Round 40, `lead/{id}/note` Round 42, `lead/{id}/status` Round 46, `agent-ask` Round 47). Error mapping: 401 → `onAuthExpired` callback, 409 → `onConflict` callback (decorates `code: 'idempotency_conflict'`), 5xx → single retry. 11 named methods (`auth` / `getDashboard` / `getDealerDashboard` / `getLeads` / `getLeadDetail` / `acceptLead` / `addNote` / `updateLeadStatus` / `getClaims` / `getClaimDetail` / `updateClaimStatus` / `askAgent`).
+- `auth-flow.js` (145 LOC) — `initAuth(ctx, api)` exchanges LINE id_token → JWT session via `POST /liff-ai/v1/auth`, persists to sessionStorage via `utils/auth.js`, resolves role (admin/dealer). 401 retry: clears cached token + re-inits LIFF + retries once. Second 401 → `showError` + null return.
+- `loaders/dashboard.js` (80 LOC) — `setupDashboard` + `loadDashboard`. Best-effort secondary fetch for urgent leads (`status=dealer_no_response`) into `#liffAiUrgent` slot.
+- `loaders/dealer.js` (60 LOC) — `setupDealer` + `loadDealerDashboard`.
+- `loaders/leadDetail.js` (175 LOC) — `loadLeadDetail` / `handleAcceptLead` / `handleNoteAdd` / `handleStatusChange` / `showStatusChangeModal`. UX-H12 try/catch on every API call — re-enables button on network error.
+- `loaders/claimList.js` (67 LOC) — `setupClaimList` + `loadClaimList(filter?)` with status filter parameter.
+- `loaders/claimDetail.js` (145 LOC) — `loadClaimDetail` + `openLightbox(photos, idx)` / `closeLightbox()` overlay management + `handleClaimStatusUpdate` + `showClaimStatusModal`.
+- `loaders/agentChat.js` (195 LOC) — `setupAgentChat` + `loadAgentChat` + `handleAskAgent(question)`. Chat history persistence in sessionStorage (cap 30 messages). Welcome bubble when history empty. Send-lock guard prevents double-sends. Typing indicator bubble during request.
+
+**entry.js V.0.3 → V.0.4** — bootstrap rewires to: `initLiff` → `createLiffAiApi` (no token) → `initAuth` → `createLiffAiApi` (with token) → `setupX(deps)` × 6 loaders → `setupHashRouter({handlers, defaultPageResolver})` → initial dispatch by `getCurrentTab()` × `state.role`. Round 3 legacy bridge (kept until Round 4): `window.{navigate, goToTab, openLeadDetail, openClaimDetail, handleAskAgent, handleAcceptLead, handleNoteAdd, handleStatusChange, handleClaimStatusUpdate, showStatusChangeModal, showClaimStatusModal, openLightbox, closeLightbox}` — 13 globals so existing inline `onclick=` handlers in V.3.10 keep working when flag flips ON. Frozen `window.DINOCO_LIFF_AI` namespace exposes `.api` / `.state` / `.router` / `.loaders` / `.bootstrap` for tests + console debugging.
+
+**New tests** (3 files, **+69 cases**, 1272 → 1341 total Jest):
+
+- `tests/jest/liff-ai-router.test.js` (~22 cases) — URL parse / pushState / popstate / dispatch / `?id=` preserve+strip / handler error swallow.
+- `tests/jest/liff-ai-api.test.js` (~22 cases) — header injection / idempotency-key auto-attach + uniqueness / GET serialization / 401/409/5xx mapping / 11 named-method URL+body shape.
+- `tests/jest/liff-ai-loaders.test.js` (~25 cases) — 6 loaders × setup throws + load fetches+renders + error path + handler functions + lightbox open/close + send-lock guard.
+
+**Bundle delta**:
+
+| Asset | V.0.3 (R2) | V.0.4 (R3) | Delta |
+| --- | --- | --- | --- |
+| `liff-ai.<hash>.js` | 25.61 KB (6.72 KB gzip) | 42.08 KB (10.99 KB gzip) | +16.47 KB / +4.27 KB gzip |
+| `assets/liff-ai.<hash>.css` | 17.73 KB (3.65 KB gzip) | unchanged | 0 |
+| total dist non-map | 252 KB | 277 KB | +25 KB |
+
+Bundle-size guard threshold raised 280 KB → 320 KB total (`tests/jest/bundle-size.test.js`) for Round 4 event-delegation headroom. Per-entry 64 KB cap unchanged; liff-ai 42 KB well under.
+
 ### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 2 — page renderers (2026-05-02)
 
 Continues from Round 1 foundation. Round 2 ports the 7 page renderers from inline `[LIFF AI] Snippet 2: Frontend` V.3.9 → V.3.10 (header annotation only — inline body UNCHANGED, REG-029 byte-identical preserved). Mirrors B2B / B2F maker / B2F catalog Round 2 patterns: ship page-renderer modules as pure HTML builders + frozen `window.DINOCO_LIFF_AI_RENDERERS` namespace for inline-bridge fallback. Flag `dinoco_liff_use_vite_liff_ai` default OFF.
