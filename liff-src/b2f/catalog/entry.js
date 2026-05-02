@@ -1,9 +1,25 @@
 /**
- * B2F LIFF Admin E-Catalog — Vite entry (V.0.2 Round 1 foundation)
+ * B2F LIFF Admin E-Catalog — Vite entry (V.0.3 Round 2 page renderers)
  *
- * MIGRATION TARGET: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.13+
+ * MIGRATION TARGET: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.14+
  *
- * Round 1 (V.0.2 — this commit):
+ * Round 2 (V.0.3 — this commit):
+ *   ✅ 5 page-renderer modules under `./pages/`:
+ *      • ./pages/catalog.js     — renderProducts + renderProductCard
+ *                                  (V.7.0 3-card variants + V.6.6 fallback +
+ *                                   LCP `fetchpriority="high"` + virtual badge)
+ *      • ./pages/setDetail.js   — renderSetDetailItems + renderSetDetailMainStepper
+ *                                  + buildQtyStepperHtml (DD-3 shared-leaf safe)
+ *      • ./pages/cart.js        — renderCartItems + renderCartManufacturingSummary
+ *                                  + buildCartItemThumbHtml (V.7.0 dual-section)
+ *      • ./pages/reviewGate.js  — renderReviewGate (V.7.11 a11y tabs pattern)
+ *      • ./pages/filters.js     — renderModelFilter + renderTypeChips +
+ *                                  applyVisibilityFilters
+ *
+ *   Pure HTML builders — no DOM mutation, no event binding (Round 3 will
+ *   wire event delegation via `data-*` attributes).
+ *
+ * Round 1 (V.0.2 — previous commit):
  *   ✅ CSS port (`./styles.css` — ~800 LOC verbatim from inline style block)
  *   ✅ 6 utility modules:
  *      • ./utils/lang.js       — re-exports B2F Maker lang (TH/EN/ZH per
@@ -26,12 +42,11 @@
  *   ✅ bootstrap() — wires LIFF auth + offline detection + lang + exposes
  *      a debug surface on `window.DINOCO_B2F_CATALOG`.
  *
- * Round 2+ scope (NOT in this file yet):
- *   ⏳ Page renderers (`./pages/`) — catalog grid, SET Detail, cart modal,
- *      review gate, success screen.
- *   ⏳ Hash router (`./router.js`) — `#detail-<sku>` parity with V.7.13.
+ * Round 3+ scope (NOT in this file yet):
+ *   ⏳ Hash router (`./router.js`) — `#detail-<sku>` parity with V.7.14.
  *   ⏳ Page loaders (`./loaders/`) — load makers / products / submit PO.
- *   ⏳ Event delegation (`./event-delegation.js`).
+ *   ⏳ Event delegation (`./event-delegation.js`) — wires data-* attrs.
+ *   ⏳ Maker home + success screen renderers.
  *
  * Production safety: this bundle only loads when wp_option
  * `dinoco_liff_use_vite_b2f_catalog = '1'`. Default OFF — Snippet 8 V.7.13
@@ -100,7 +115,27 @@ import {
     unconfirmedBadgeHtml,
 } from "./utils/badges.js";
 
-console.info("[b2f-catalog] foundation V.0.2 — utils + styles ready");
+// Round 2 (V.0.3) — page renderers
+import { renderProducts, renderProductCard } from "./pages/catalog.js";
+import {
+    renderSetDetailItems,
+    renderSetDetailMainStepper,
+    buildQtyStepperHtml,
+} from "./pages/setDetail.js";
+import {
+    renderCartItems,
+    renderCartManufacturingSummary,
+    computeCartManufacturingSummary,
+    buildCartItemThumbHtml,
+} from "./pages/cart.js";
+import { renderReviewGate, BUCKET_CONFIGS } from "./pages/reviewGate.js";
+import {
+    renderModelFilter,
+    renderTypeChips,
+    applyVisibilityFilters,
+} from "./pages/filters.js";
+
+console.info("[b2f-catalog] V.0.3 — Round 2 page renderers ready");
 
 /**
  * Bootstrap the B2F Admin E-Catalog LIFF surface.
@@ -154,7 +189,7 @@ export async function bootstrap(opts = {}) {
     if (typeof window !== "undefined") {
         const w = /** @type {any} */ (window);
         w.DINOCO_B2F_CATALOG = {
-            version: "V.0.2",
+            version: "V.0.3",
             ctx,
             api,
             modal,
@@ -184,10 +219,34 @@ export async function bootstrap(opts = {}) {
             },
             initialCart,
         };
+        // Round 2 — page renderers exposed on a frozen sub-namespace so
+        // the inline V.7.14 fallback (Round 5 cutover) can call them
+        // without re-importing.
+        w.DINOCO_B2F_CATALOG_RENDERERS = Object.freeze({
+            // Catalog grid
+            catalog: renderProducts,
+            productCard: renderProductCard,
+            // SET Detail
+            setDetail: renderSetDetailItems,
+            setStepper: renderSetDetailMainStepper,
+            qtyStepper: buildQtyStepperHtml,
+            // Cart
+            cart: renderCartItems,
+            cartManufacturing: renderCartManufacturingSummary,
+            cartManufacturingSummary: computeCartManufacturingSummary,
+            cartThumb: buildCartItemThumbHtml,
+            // Review Gate
+            reviewGate: renderReviewGate,
+            reviewGateConfigs: BUCKET_CONFIGS,
+            // Filters
+            modelFilter: renderModelFilter,
+            typeChips: renderTypeChips,
+            applyFilters: applyVisibilityFilters,
+        });
     }
 
     return {
-        version: "V.0.2",
+        version: "V.0.3",
         ctx,
         api,
         modal,
