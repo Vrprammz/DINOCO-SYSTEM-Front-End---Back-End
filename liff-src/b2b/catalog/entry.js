@@ -1,68 +1,115 @@
 /**
- * B2B LIFF E-Catalog — Vite entry point (V.0.1 pilot)
+ * B2B LIFF E-Catalog — Vite entry (V.0.2 Round 1 — foundation port)
  *
- * ⚠️ PARALLEL RENDERING ACTIVE — do NOT assume this bundle ships to prod yet.
+ * MIGRATION TARGET: `[B2B] Snippet 4: LIFF E-Catalog Frontend` V.32.9
  *
- * Migration target: `[B2B] Snippet 4: LIFF E-Catalog Frontend` V.32.6
- *   The snippet still emits inline <style> + <script> via PHP echo.
- *   This bundle is a **scaffold** for the future wp_enqueue_script path.
+ * Round 1 (V.0.2 — this commit):
+ *   ✅ Wiring (Snippet 4 V.32.8 added flag-gated render shell)
+ *   ✅ CSS port (`./styles.css` — 335 LOC verbatim from inline)
+ *   ✅ 6 utility modules (`./utils/{lang,format,dom,pricing,hierarchy,cart}.js`)
+ *   ✅ Foundation bootstrap — wires LIFF auth + offline detection +
+ *      exposes a debug surface on `window.DINOCO_B2B_CATALOG`.
  *
- * Pilot smoke test:
- *   - Imports token + base CSS so Vite emits a CSS chunk (verifies
- *     postcss + CSS pipeline end-to-end).
- *   - Imports shared helpers (api-client / cart / liff-auth) to validate
- *     module graph resolution + tree-shaking.
- *   - Does NOT call any network / DOM / LIFF APIs unless
- *     `window.DINOCO_B2B_CATALOG_BOOT === true`.
+ * Round 2+ scope (NOT in this file yet):
+ *   ⏳ Page renderers (catalog grid + SET Detail + cart UI + history) —
+ *      currently still emitted inline by Snippet 4 V.32.9.
+ *   ⏳ Router (tab-switch + URL hash sync).
+ *   ⏳ Event delegation — replace inline onclick=".." with data-action="..".
  *
- * Phase 1 migration plan (see `liff-src/README.md`):
- *   1. Move inline <script> renderer functions from Snippet 4 into this
- *      file, keeping the exact same CSS selectors + DOM structure.
- *   2. Add `wp_enqueue_script('dinoco-b2b-catalog', ...)` call inside
- *      Snippet 4's `template_redirect` handler, guarded by
- *      `dinoco_liff_enqueue('b2b-catalog')` — returns false if manifest
- *      missing → falls back to inline.
- *   3. Soak for 1 week, measure LCP, then drop inline emission.
+ * Round 5 scope (final cut-over):
+ *   ⏳ Drop inline `<script>` block from Snippet 4 once flag has been ON
+ *      1 week with no regressions (REG-029 byte-identical preserved
+ *      throughout earlier rounds).
+ *
+ * Production safety: this bundle only loads when wp_option
+ * `dinoco_liff_use_vite_b2b_catalog = '1'`. Default OFF — Snippet 4
+ * falls back to inline render. Triple safety chain (flag + manifest +
+ * `dinoco_liff_enqueue` presence) preserved per V.32.8 wiring.
  */
 
-// ── CSS (extracted tokens + base reset — Snippet 4 V.32.6 subset) ──
-import "./tokens.css";
-import "./base.css";
+import "./styles.css";
 
-// ── Shared helpers (tree-shaken — only used symbols retained) ──
 import { initLiff } from "../../shared/liff-init.js";
 import { createB2BApi, wpRestUrl } from "../../shared/api-client.js";
 import { liffAuth } from "../../shared/liff-auth.js";
-import {
-    createCart,
-    addToCart,
-    setCartQty,
-    removeFromCart,
-    computeTotal,
-    computeItemCount,
-    toOrderItems,
-    saveCartToStorage,
-    loadCartFromStorage,
-} from "../../shared/cart.js";
-import { modal } from "../../shared/modal.js";
 
-const BOOT_MARKER = "[b2b-catalog] Vite bundle loaded (V.0.1 pilot — parallel)";
+import {
+    L,
+    setupLanguage,
+    getLang,
+} from "./utils/lang.js";
+import {
+    formatNumber,
+    formatCurrency,
+    formatDate,
+    escHtml,
+} from "./utils/format.js";
+import {
+    $,
+    $$,
+    showToast,
+    showAuthError,
+    showLinkExpired,
+    showLoading,
+    hideLoading,
+    lockBtn,
+    unlockBtn,
+    setupOfflineDetection,
+} from "./utils/dom.js";
+import {
+    computeDealerPrice,
+    validateMOQ,
+    computeBoxes,
+} from "./utils/pricing.js";
+import {
+    getLeafSkus,
+    isLeafSku,
+    isTopLevelSet,
+    computeHierarchyStock,
+    getAncestorSkus,
+} from "./utils/hierarchy.js";
+import {
+    loadCart,
+    saveCart,
+    setCartQty,
+    incrCartQty,
+    computeItemCount,
+    computeTotal,
+    toOrderItems,
+    detectCartDuplicates,
+    clearCart,
+    CART_STORAGE_KEY,
+} from "./utils/cart.js";
+
+const VERSION = "V.0.2";
+const BOOT_MARKER = `[b2b-catalog] Vite bundle loaded (${VERSION} Round 1 — foundation, parallel)`;
 console.info(BOOT_MARKER);
 
 /**
- * Full bootstrap (Phase 1 target — currently gated behind explicit flag
- * to avoid clashing with inline renderer in Snippet 4).
+ * Bootstrap the B2B catalog Vite bundle.
  *
- * @param {{ liffId?: string, sessionToken?: string, authEndpoint?: string }} [opts]
+ * @param {{
+ *   liffId?: string,
+ *   restUrl?: string,
+ *   logoUrl?: string,
+ *   nonce?: string,
+ *   sessionToken?: string,
+ *   authEndpoint?: string,
+ * }} [opts]
  */
-export async function bootstrap({ liffId, sessionToken, authEndpoint } = {}) {
+export async function bootstrap(opts = {}) {
+    const { liffId, restUrl, sessionToken, authEndpoint } = opts;
     if (!liffId) {
         console.warn("[b2b-catalog] liffId not provided — skipping init");
         return null;
     }
 
-    // If caller provides an authEndpoint, run full auth exchange.
-    // Otherwise assume sessionToken was injected by PHP bootstrap.
+    setupLanguage();
+    setupOfflineDetection();
+
+    // If caller provides an authEndpoint, run the full auth exchange
+    // through the shared helper. Otherwise assume sessionToken was
+    // injected via PHP bootstrap (via data-config on the root element).
     let session = null;
     if (authEndpoint) {
         session = await liffAuth({ liffId, authEndpoint });
@@ -73,75 +120,123 @@ export async function bootstrap({ liffId, sessionToken, authEndpoint } = {}) {
         session = { token: sessionToken, _liffContext: ctx };
     }
 
+    const apiBase = restUrl ? restUrl.replace(/\/$/, "") : wpRestUrl("b2b/v1");
     const api = createB2BApi({
-        base: wpRestUrl("b2b/v1"),
+        base: apiBase,
         sessionToken: session.token,
     });
 
-    // Restore persisted cart (localStorage) — safe no-op if empty.
-    const cartKey = "b2b_cart_v1";
-    let cart = loadCartFromStorage(cartKey);
+    // Cart state (shallow dict — matches inline V.32.9 contract).
+    // Round 2 page renderers will read/write through these accessors so
+    // we can swap to the shared cart state machine later without
+    // refactoring callers.
+    let cart = loadCart();
 
     return {
+        version: VERSION,
         session,
         api,
-        modal,
-        // Cart facade bound to closure state (immutable state pattern —
-        // each mutation returns a new object, then we save + replace ref).
         cart: {
             get state() {
                 return cart;
             },
-            add: (sku, qty, meta) => {
-                cart = addToCart(cart, sku, qty, meta);
-                saveCartToStorage(cartKey, cart);
+            set: (sku, qty) => {
+                cart = setCartQty(cart, sku, qty);
+                saveCart(cart);
                 return cart;
             },
-            set: (sku, qty, meta) => {
-                cart = setCartQty(cart, sku, qty, meta);
-                saveCartToStorage(cartKey, cart);
-                return cart;
-            },
-            remove: (sku) => {
-                cart = removeFromCart(cart, sku);
-                saveCartToStorage(cartKey, cart);
+            incr: (sku, delta) => {
+                cart = incrCartQty(cart, sku, delta);
+                saveCart(cart);
                 return cart;
             },
             clear: () => {
-                cart = createCart();
-                saveCartToStorage(cartKey, cart);
+                cart = clearCart();
+                saveCart(cart);
                 return cart;
             },
-            total: (priceMap) => computeTotal(cart, priceMap),
             count: () => computeItemCount(cart),
-            toOrder: () => toOrderItems(cart),
+            total: (products) => computeTotal(cart, products),
+            toOrder: (products) => toOrderItems(cart, products),
+            detectDupes: (products) => detectCartDuplicates(cart, products),
         },
+        $,
+        $$,
     };
 }
 
-// Opt-in auto-boot: only if PHP explicitly sets the flag (prevents
-// accidental double-rendering while inline renderer is still active).
-if (typeof window !== "undefined" && window.DINOCO_B2B_CATALOG_BOOT === true) {
-    bootstrap(window.DINOCO_B2B_CATALOG_CONFIG || {}).catch((err) =>
-        console.error("[b2b-catalog] bootstrap failed", err)
-    );
+/**
+ * Read JSON config from `data-config` on the root element. PHP shell
+ * (Snippet 4 V.32.8 path) writes:
+ *   <div id="b2b-catalog-app" data-config='{"liff_id":"...","rest_url":"..."}'></div>
+ *
+ * @returns {object|null}
+ */
+function readMountConfig() {
+    if (typeof document === "undefined") return null;
+    const root = document.getElementById("b2b-catalog-app");
+    if (!root) return null;
+    const raw = root.getAttribute("data-config") || "";
+    if (!raw) return null;
+    try {
+        const parsed = JSON.parse(raw);
+        return {
+            liffId: parsed.liff_id || parsed.liffId,
+            restUrl: parsed.rest_url || parsed.restUrl,
+            logoUrl: parsed.logo_url || parsed.logoUrl,
+            nonce: parsed.nonce,
+            sessionToken: parsed.session_token || parsed.sessionToken,
+            authEndpoint: parsed.auth_endpoint || parsed.authEndpoint,
+        };
+    } catch (err) {
+        console.error("[b2b-catalog] data-config parse failed", err);
+        return null;
+    }
 }
 
-// Export surface for future inline-bridge during migration (PHP can
-// stash the bundle's exports on `window.DINOCO_B2B_CATALOG` for
-// gradual cutover — call helpers from legacy inline code).
+// Auto-boot when:
+//   (a) explicit window.DINOCO_B2B_CATALOG_BOOT === true (legacy / tests), OR
+//   (b) the root mount element exists with a data-config payload (Phase 2
+//       Vite Step 2 shell path — Snippet 4 V.32.8 emits this when flag ON).
+if (typeof window !== "undefined") {
+    const explicit = window.DINOCO_B2B_CATALOG_BOOT === true
+        ? (window.DINOCO_B2B_CATALOG_CONFIG || {})
+        : null;
+    const mounted = readMountConfig();
+    const config = explicit || mounted;
+    if (config) {
+        bootstrap(config).catch((err) =>
+            console.error("[b2b-catalog] bootstrap failed", err)
+        );
+    }
+}
+
+// Stable debug surface — Round 2 page renderers (when imported from
+// the same bundle) will replace this. Frozen so external callers can
+// inspect the version + helpers but not mutate the surface.
 if (typeof window !== "undefined") {
     window.DINOCO_B2B_CATALOG = Object.freeze({
-        version: "V.0.1",
+        version: VERSION,
         bootstrap,
-        helpers: {
-            createCart,
-            addToCart,
-            setCartQty,
-            removeFromCart,
-            computeTotal,
-            computeItemCount,
-            toOrderItems,
-        },
+        // Helpers exposed for the inline-bridge during migration. Round 2
+        // page renderers will reach through these to the same exports.
+        helpers: Object.freeze({
+            // lang
+            L, setupLanguage, getLang,
+            // format
+            formatNumber, formatCurrency, formatDate, escHtml,
+            // dom
+            showToast, showAuthError, showLinkExpired,
+            showLoading, hideLoading, lockBtn, unlockBtn,
+            // pricing
+            computeDealerPrice, validateMOQ, computeBoxes,
+            // hierarchy
+            getLeafSkus, isLeafSku, isTopLevelSet,
+            computeHierarchyStock, getAncestorSkus,
+            // cart
+            loadCart, saveCart, setCartQty, incrCartQty,
+            computeItemCount, computeTotal, toOrderItems,
+            detectCartDuplicates, clearCart, CART_STORAGE_KEY,
+        }),
     });
 }
