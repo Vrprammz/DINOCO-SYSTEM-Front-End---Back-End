@@ -10,6 +10,42 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF Round 4 — B2F Maker LIFF inline-bridge cleanup (drop 6 legacy globals + event delegation pattern) (2026-05-01)
+
+Continues Round 3. Round 4 is the **inline-bridge cleanup pass**: replaces all inline `onclick="..."` attributes in `pages/*.js` with declarative `data-action="..."` attributes, wires a single click listener on `#b2f-app` via event delegation, and drops the 7 legacy `window.*` globals exposed in V.0.4. After Round 4, the Vite bundle owns 100% of UI interaction without any global bridge — Snippet 4 V.4.7 inline JS stays intact (Round 5 will remove it as a destructive cutover after 1+ week canary).
+
+**What landed**:
+
+- **NEW** `liff-src/b2f/maker/event-delegation.js` (~165 LOC) — pure DI module. `setupEventDelegation(root, deps)` wires one click listener that dispatches via `data-action` attribute on the closest ancestor of click target. 7 supported actions (navigate / navigate-with-po / deliver-open / deliver-back / deliver-step / deliver-fill-all / deliver-submit). Returns idempotent cleanup fn. Handler exceptions caught + logged via `console.error`. Click bubbling (`closest()`) so inner children of action elements still resolve.
+- `liff-src/b2f/maker/entry.js` V.0.4 → V.0.5 — wraps `event-delegation.js` core with imported router + loader handlers. Wires delegation on `#b2f-app` after router setup. **DROPS 7 legacy `window.*` globals**: `goToPage`, `goToPageWithPO`, `b2fOpenDeliverForm`, `b2fFillAllRemaining`, `b2fStepQty`, `b2fSubmitDeliver`, `loadDeliverPage`. **DROPS** `window.DINOCO_B2F_MAKER_RENDERERS`. **KEEPS** single namespaced surface `window.DINOCO_B2F_MAKER` (frozen, debug only — NOT consumed by Snippet 4 inline JS).
+- `liff-src/b2f/maker/pages/{detail,reschedule,deliver,list}.js` — all inline `onclick` → `data-action` migration. Visual + behavior identical (REG-029 byte-equivalent).
+  - `detail.js` — 3 status-action buttons → `data-action="navigate" data-view="confirm|reschedule|deliver"`
+  - `reschedule.js` — list card → `data-action="navigate-with-po"`; back button → `data-action="navigate" data-view="detail"`
+  - `deliver.js` — list "Ship more" → `data-action="deliver-open" data-po-id`; form back/header arrow → `data-action="deliver-back"`; stepper +/- → `data-action="deliver-step" data-delta="±1"`; fill-all → `data-action="deliver-fill-all"`; submit → `data-action="deliver-submit"`; list back → `data-action="navigate" data-view="list"`
+  - `list.js` — card click drops `window.goToPageWithPO` fallback — uses `data-action="navigate-with-po"` directly. Filter tab listeners remain inline (no global navigation, just renderer-local state).
+  - `confirm.js` — already used id-based `addEventListener` via `attachConfirmHandlers()` (no `onclick=` to migrate). Header doc updated.
+
+**Bundle delta**: 54.85 KB → 55.87 KB (+1.02 KB raw / +0.25 KB gzip) — trade-off for declarative dispatch + cleaner architecture. Will shrink in Round 5 once inline JS in Snippet 4 is removed.
+
+**Test count**: 384 → 435 (+51 tests).
+
+- `tests/jest/liff-b2f-maker-bridge.test.js` (NEW) — 48 tests covering: setupEventDelegation contract (null root noop, idempotent cleanup, listener removal), navigate action (click bubbling, missing data-view, unknown action, no-data-action click), navigate-with-po action (po-id forwarding, fallback to navigate), deliver-open (po-id forwarding, missing po-id no-call, async rejection swallowed), deliver-back (async rejection swallowed), deliver-step (data-delta=1/-1/missing/parsing), deliver-fill-all, deliver-submit (rejection swallowed), exception handling (sync throw caught, listener survives crash), and **source-level drift detection** (11 entry.js drift checks + 9 pages/* drift checks — fails CI when V.0.5 cleanup is undone).
+- `tests/jest/liff-b2f-maker-pages.test.js` (UPDATED) — 6 assertions migrated from `goToPage('confirm')` literal text scan to `querySelector('button[data-action="navigate"][data-view="confirm"]')` semantic query. 1 assertion `goToPageWithPO('reschedule','99')` → data-attr query. 2 assertions `b2fFillAllRemaining` / `b2fSubmitDeliver` → data-action. 3 NEW assertions for stepper data-delta=±1, deliver-back twice (header + footer), and "no inline onclick survives" sanity check.
+
+**Production safety preserved**:
+
+- `dinoco_liff_use_vite_b2f_maker` flag still default OFF → production unchanged
+- Inline `b2f_liff_page_css()` + `b2f_liff_page_js()` UNCHANGED in Snippet 4 V.4.7
+- All inline `onclick` handlers in V.4.7 still work (untouched code path)
+- Source-level drift detector blocks regressions: any future commit that re-introduces `window.goToPage =` or `onclick="..."` in pages/* fails CI immediately
+- DOM contract preserved — same input ids (`#b2f-eta`, `#b2f-note`, `.b2f-dlv-qty`, etc.)
+
+**Round 5 scope (next — destructive cutover)**:
+
+- Drop inline `b2f_liff_page_js()` block from `[B2F] Snippet 4 V.4.7` (~1700 LOC removal — destructive, requires user confirmation + canary observation 1+ week with flag ON)
+- Drop inline `b2f_liff_page_css()` block (CSS now lives in Vite bundle)
+- Snippet 4 becomes a thin shortcode + LIFF auth + JWT issuance shell — page rendering 100% Vite-driven
+
 ### Feature — Vite LIFF Round 3 — B2F Maker LIFF router + Maker API + 5 page loaders (2026-05-01)
 
 Continues Round 2. Ports the **navigation + REST orchestration** layer from inline V.4.7 into ES modules. Inline `b2f_liff_page_js()` stays UNCHANGED — Round 3 re-exposes 6 legacy globals (`window.goToPage`, `window.b2fOpenDeliverForm`, etc.) so existing inline onclick handlers keep working during the parallel-rendering window. Round 4 will drop the bridge.
