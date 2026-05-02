@@ -1,9 +1,11 @@
 /**
- * LIFF AI Command Center — Vite entry (V.0.2 Round 1 foundation port)
+ * LIFF AI Command Center — Vite entry (V.0.3 Round 2 page renderer port)
  *
  * MIGRATION TARGET: `[LIFF AI] Snippet 2: Frontend` V.3.9 (header bump only)
  * Round 1 status: foundation utilities ported (CSS + 5 utility modules).
- * Round 2 will port page renderers (dashboard / dealer / lead / claim / agent).
+ * Round 2 status: 6 page renderers ported (dashboard / dealer / lead / claim / agent).
+ *   Pure HTML output — caller wires events. Mirrors B2B/B2F R2 patterns.
+ * Round 3 will add router + LIFF AI API + page loaders.
  * Round 5 will flip the cut-over flag.
  *
  * Surface area (full):
@@ -62,7 +64,40 @@ import {
     getTimelineIndex,
 } from "./utils/lead-status.js";
 
-console.info("[liff-ai] foundation V.0.2 — Round 1 utility port complete");
+// Round 2 page renderers — pure HTML output, no DOM mutation.
+import {
+    renderDashboard,
+    renderUrgentSection,
+} from "./pages/dashboard.js";
+import { renderDealer } from "./pages/dealer.js";
+import { renderLeadCard } from "./pages/leadCard.js";
+import {
+    renderLeadDetail,
+    renderLeadHistory,
+    renderLeadStatusChange,
+} from "./pages/leadDetail.js";
+import {
+    renderClaimList,
+    renderClaimFilter,
+    renderClaimCard,
+    renderLeadList,
+    renderLeadFilter,
+} from "./pages/claimList.js";
+import {
+    renderClaimDetail,
+    renderStatusHistory,
+    renderPhotoLightbox,
+    renderClaimStatusChange,
+} from "./pages/claimDetail.js";
+import {
+    renderAgentChat,
+    renderChatBubble,
+    formatBotText,
+    AGENT_LABELS,
+    QUICK_QUESTIONS,
+} from "./pages/agentChat.js";
+
+console.info("[liff-ai] foundation V.0.3 — Round 2 page renderer port complete");
 
 /**
  * Bootstrap the LIFF AI command center.
@@ -117,6 +152,34 @@ export async function bootstrap(opts = {}) {
 
     setupOfflineDetection();
 
+    // Round 2: expose renderer registry for the (future) Round 3 router and
+    // for tests that boot via `bootstrap()`. Frozen so consumers can't mutate.
+    if (typeof window !== "undefined") {
+        /** @type {any} */ (window).DINOCO_LIFF_AI_RENDERERS = Object.freeze({
+            dashboard: renderDashboard,
+            urgentSection: renderUrgentSection,
+            dealer: renderDealer,
+            leadCard: renderLeadCard,
+            leadList: renderLeadList,
+            leadFilter: renderLeadFilter,
+            leadDetail: renderLeadDetail,
+            leadHistory: renderLeadHistory,
+            leadStatusChange: renderLeadStatusChange,
+            claimList: renderClaimList,
+            claimFilter: renderClaimFilter,
+            claimCard: renderClaimCard,
+            claimDetail: renderClaimDetail,
+            statusHistory: renderStatusHistory,
+            photoLightbox: renderPhotoLightbox,
+            claimStatusChange: renderClaimStatusChange,
+            agentChat: renderAgentChat,
+            chatBubble: renderChatBubble,
+            formatBotText: formatBotText,
+            AGENT_LABELS: AGENT_LABELS,
+            QUICK_QUESTIONS: QUICK_QUESTIONS,
+        });
+    }
+
     return { ctx, auth, api, modal, $, $$, L };
 }
 
@@ -169,4 +232,26 @@ export {
     getStatusColor,
     getClaimStatusColor,
     getTimelineIndex,
+    // pages (Round 2)
+    renderDashboard,
+    renderUrgentSection,
+    renderDealer,
+    renderLeadCard,
+    renderLeadList,
+    renderLeadFilter,
+    renderLeadDetail,
+    renderLeadHistory,
+    renderLeadStatusChange,
+    renderClaimList,
+    renderClaimFilter,
+    renderClaimCard,
+    renderClaimDetail,
+    renderStatusHistory,
+    renderPhotoLightbox,
+    renderClaimStatusChange,
+    renderAgentChat,
+    renderChatBubble,
+    formatBotText,
+    AGENT_LABELS,
+    QUICK_QUESTIONS,
 };

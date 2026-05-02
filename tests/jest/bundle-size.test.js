@@ -94,7 +94,9 @@ const distExists = fs.existsSync(DIST_DIR);
         // (images, fonts) committed under publicDir or via import.
         // Round 9 R3 bumped 200KB → 240KB after b2f-catalog gained router +
         // api + 5 loaders (29.39 KB → 44.07 KB JS, ~14.68 KB delta).
-        expect(total).toBeLessThan(240 * 1024);
+        // Round 11 R2 bumped 240KB → 280KB after liff-ai gained 6 page renderers
+        // (2.85 KB → 25.61 KB JS, ~22.76 KB delta).
+        expect(total).toBeLessThan(280 * 1024);
     });
 });
 
