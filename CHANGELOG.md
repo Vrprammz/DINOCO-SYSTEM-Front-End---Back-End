@@ -10,6 +10,39 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF B2F Catalog code port Round 1 — foundation (2026-04-30)
+
+First Vite-side migration round for the B2F Admin E-Catalog (`[B2F] Snippet 8` V.7.13 → V.7.14 annotation-only header bump). Mirrors the B2B Catalog Round 1 + B2F Maker Round 1 patterns: ship CSS + utility modules + `bootstrap()` wiring without touching the inline render path. Flag `dinoco_liff_use_vite_b2f_catalog` default OFF (REG-029 byte-identical preserved).
+
+**What landed**:
+
+- **`liff-src/b2f/catalog/styles.css`** (~810 LOC verbatim) — full `<style>` block from inline V.7.13 lines 161-957. All selectors prefixed `.b2f-cat-*` / `.b2f-qty-*` / `.b2f-status-*`. V.7.0 Order Intent CSS preserved at the bottom (gated by JS — no-op when `b2f_flag_order_intent=false`).
+- **6 utility modules** (`liff-src/b2f/catalog/utils/`):
+  - `lang.js` — re-exports `setupLanguage` / `L` / `getLang` / `setLang` / `STATUS_TH/EN/ZH` / `statusLabel` from `liff-src/b2f/maker/utils/lang.js` (single source of truth — Maker LIFF + Admin Catalog never drift on translations).
+  - `format.js` — multi-currency aware: `currencySymbol("THB"|"USD"|"CNY")` → ฿/$/¥, `formatNumber` (th-TH locale, 0-2 decimals — preserves V.7.13 `min:0` no-trailing-zero rule), `formatCurrency`, `formatDate`, `escHtml` (textNode + SSR regex fallback), `currencyNameEn`.
+  - `dom.js` — `$` / `$$` / `showToast` (auto-creates `#b2fToast` + 3s lifetime + `.error`/`.success` modifiers) / `showAuthError` (HTML-escaped via `escHtml` per V.7.13 line 1273 contract) / `showLoading` / `hideLoading` / `lockBtn` / `unlockBtn` / `isLocked` / `setupOfflineDetection` (idempotent via `window.__b2fCatOfflineWired` sentinel).
+  - `cart.js` — V.7.0 schema persistence: `getCartStorageKey(makerId)` → `b2f_cart_v7_<id>`, `loadCart` (strict `_schema === 7` validation + 30-day TTL discard via V.7.8 L5 contract), `saveCart` (writes envelope `{_schema, _ts, items, updated_at}`), `clearCart`, `setCartQty` (immutable update + meta merge), `computeItemCount`, `computeTotal`, `deriveOrderMode` (production_mode → full_set/sub_unit/single_leaf), `orderModeLabel`, `orderModeBadgeClass`. Per-maker scope — switching maker uses a different localStorage key.
+  - `hierarchy.js` — re-exports `getLeafSkus` / `isLeafSku` / `isTopLevelSet` / `computeHierarchyStock` / `getAncestorSkus` from `liff-src/b2b/catalog/utils/hierarchy.js` (DD-2 / DD-3 / DD-4 / DD-7 single source of truth — drift between B2B + B2F leaf computation has historically caused stock cut bugs per V.7.1 C1/C2/C3 lessons). Adds B2F-specific helpers: `parseModels` (3 shapes — JSON string, string array, object array with `name`/`brand_name` fallback), `productMatchesModel`, `collectModelsWithDescendants` (V.10.1 SET-direct contract — respects own `compatible_models` if explicit, walks descendants only when empty), `buildHierarchyLookup` (uppercase normalize + DD-3 reverse `parents` map), `countTopSetsForProduct` (DD-3 walk-up via parents map), `isVirtualSet`.
+  - `badges.js` — V.7.0 mode badges (`modeBadgeHtml(mode, opts)` — purple/amber/gray with optional 🟣🟠⚪ icon prefix + 3-language label via `L()`), `productionModeCardBadgeHtml` (set_assembled / sub_unit / single / cross_factory_assembly), `hierarchyBadgeHtml` (legacy V.5.x classification — set/child/grandchild/single), `virtualSetBadgeHtml` (amber "✨ ประกอบจากชิ้นส่วน"), `unconfirmedBadgeHtml` (amber "⚠️ รอยืนยัน"). Re-exports `orderModeLabel` / `orderModeBadgeClass` / `deriveOrderMode` from `cart.js` for one-stop import.
+- **`entry.js` V.0.1 stub → V.0.2 foundation**. Wires `initLiff` + `setupLanguage(makerCurrency)` + `setupOfflineDetection` + `createApi(base, X-B2F-Token, nonce?)` + pre-warms cart from localStorage when `makerId` present. Exposes a debug surface on `window.DINOCO_B2F_CATALOG` (`utils.*` for console testing during Round 2+, `constants.CART_SCHEMA_VERSION`, `initialCart`). Round 2+ will add `pages/` / `loaders/` / `router.js` / `event-delegation.js`.
+- **126 Jest tests** in `tests/jest/liff-b2f-catalog-utils.test.js` covering: lang.js (15 — 3-language switch, status maps, fallback chain), format.js (24 — multi-currency symbol + number/date/escape edges), dom.js (13 — toast variants + auth error XSS-escape + loading toggle + lockBtn pair contract), cart.js (32 — schema validation gates + 30-day TTL + V.7.0 envelope round-trip + per-maker isolation + computeTotal `unit_cost` fallback + deriveOrderMode 5-way switch), hierarchy.js (27 — DD-3 dedup + leaf walk + parents map + V.10.1 SET-direct contract + parseModels 3 shapes), badges.js (18 — 3-language render + XSS-safe reason attribute + amber contrast classes). Imports the existing B2B catalog hierarchy primitives via re-export so any future drift in DD-2/3/7 logic surfaces in BOTH suites.
+
+**Bundle output (first build)**:
+
+| Asset | Size | Gzip |
+| --- | --- | --- |
+| `b2f-catalog.<hash>.js` | 10.75 KB | 4.18 KB |
+| `b2f-catalog.<hash>.css` | 31.40 KB | 5.88 KB |
+
+**Quality gates**:
+
+- `npm run test:jest` — 947 passed (821 baseline + 126 new). 2 skipped (pre-existing).
+- `npm run lint` — clean.
+- `npm run typecheck` — clean (4 inline JSDoc casts added in `hierarchy.js#buildHierarchyLookup` so empty object literals satisfy `Record<string, string[]>`).
+- `npm run build:liff` — clean. b2f-catalog bundle down 0% (foundation only — no inline cleanup yet).
+
+**Risk profile**: ZERO. Pure additive — new files + 1 inert annotation-only Snippet 8 header bump (V.7.13 → V.7.14, no behavior change). When flag OFF, Snippet 8 still emits the inline render path byte-identical to V.7.13 (REG-029 preserved). Round 1 ships only the foundation needed by Round 2+ page renderers — nothing in this commit affects the LIFF that production admins see.
+
 ### Feature — Vite LIFF B2B Catalog code port Round 4 — inline-bridge cleanup (2026-04-30)
 
 Continues from Round 3. Round 4 mirrors the B2F Maker Round 4 pattern: drop the legacy `window.B2B_CATALOG_*` bridge in favor of a single delegated click + change listener on `#b2b-catalog-app`. Pages already emit declarative `data-action` / `data-stepact` / `data-rmsku` / `data-cancel` / `data-reorder` / `data-claim` attributes from Round 2 onward — Round 4 wires the dispatcher that consumes them. Flag `dinoco_liff_use_vite_b2b_catalog` default OFF (REG-029 byte-identical preserved).
