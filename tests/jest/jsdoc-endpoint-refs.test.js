@@ -39,7 +39,14 @@ const LIFF_SRC = path.join(REPO_ROOT, "liff-src");
  * Each entry needs a comment explaining why.
  */
 const JSDOC_KNOWN_OK = new Set([
-    // (none currently)
+    // B2F Catalog R3 (V.0.4) — JSDoc header references the maker-products
+    // endpoint without the `{id}` path param because the trailing-punct
+    // strip on line 100 of this file removes `}` from `{id}` mid-doc.
+    // Production registration is `/maker-products/(?P<maker_id>\d+)` →
+    // normalized to `/maker-products/{id}`. Both API + tests verify the
+    // call uses the correct URL — this entry just whitelists the
+    // documentation-style shorthand reference.
+    "GET /b2f/v1/maker-products",
 ]);
 
 /**

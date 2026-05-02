@@ -1,7 +1,7 @@
 /**
- * B2F LIFF Admin E-Catalog — Vite entry (V.0.3 Round 2 page renderers)
+ * B2F LIFF Admin E-Catalog — Vite entry (V.0.4 Round 3 router + api + loaders)
  *
- * MIGRATION TARGET: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.14+
+ * MIGRATION TARGET: `[B2F] Snippet 8: Admin LIFF E-Catalog` V.7.15+
  *
  * Round 2 (V.0.3 — this commit):
  *   ✅ 5 page-renderer modules under `./pages/`:
@@ -57,7 +57,7 @@
 import "./styles.css";
 
 import { initLiff } from "../../shared/liff-init.js";
-import { createApi, wpRestUrl } from "../../shared/api-client.js";
+import { wpRestUrl } from "../../shared/api-client.js";
 import { modal } from "../../shared/modal.js";
 
 import { setupLanguage, L, getLang } from "./utils/lang.js";
@@ -135,7 +135,34 @@ import {
     applyVisibilityFilters,
 } from "./pages/filters.js";
 
-console.info("[b2f-catalog] V.0.3 — Round 2 page renderers ready");
+// Round 3 (V.0.4) — router + api + loaders
+import {
+    setupHashRouter,
+    goToView,
+    openSetDetail,
+    back as routerBack,
+    getCurrentView,
+    dispatchInitial,
+} from "./router.js";
+import { createB2FCatalogApi } from "./api.js";
+import { setupMakerHome, loadMakerHome } from "./loaders/makerHome.js";
+import {
+    setupCatalog,
+    loadCatalog,
+    handleAddToCart,
+    setShowVirtual,
+    setQty,
+} from "./loaders/catalog.js";
+import { setupSetDetail, loadSetDetail, handleStepperChange } from "./loaders/setDetail.js";
+import {
+    setupCart,
+    loadCartView,
+    handleSubmitOrder,
+    handleReviewGate,
+} from "./loaders/cart.js";
+import { setupSuccess, loadSuccess, renderSuccess } from "./loaders/success.js";
+
+console.info("[b2f-catalog] V.0.4 — Round 3 router + api + loaders ready");
 
 /**
  * Bootstrap the B2F Admin E-Catalog LIFF surface.
@@ -171,27 +198,81 @@ export async function bootstrap(opts = {}) {
     // 3) Wire offline toast (idempotent).
     setupOfflineDetection();
 
-    // 4) Build the API client — Round 2+ page loaders will call this.
+    // 4) Build the API client — Round 3 typed wrapper around shared createApi.
     const baseUrl = opts.restUrl
         ? opts.restUrl.replace(/\/+$/, "")
         : wpRestUrl("b2f/v1");
-    const api = createApi({
+    const api = createB2FCatalogApi({
         base: baseUrl,
         token: opts.adminToken,
-        tokenHeader: "X-B2F-Token",
         nonce: opts.nonce || undefined,
+        onAuthExpired: () => showAuthError("ไม่มีสิทธิ์ — กรุณา login ใหม่"),
+        onRateLimit: (msg) => showToast(msg, "error"),
+        onConflict: (msg) => showToast(msg, "error"),
+        onCancelledPO: (msg) => showToast(msg, "error"),
     });
 
     // 5) Pre-warm cart from localStorage (per-maker scope).
     const initialCart = opts.makerId ? loadCart(opts.makerId) : {};
 
-    // 6) Expose a debug surface (mirrors B2B catalog + B2F maker pattern).
+    // 6) Build shared mutable state (loaders read + write).
+    /** @type {any} */
+    const state = {
+        makerId: opts.makerId || null,
+        currency: opts.makerCurrency || "THB",
+        orderIntentEnabled: !!opts.orderIntentEnabled,
+        products: [],
+        cart: initialCart,
+        skuRelations: {},
+        catalogMap: {},
+        hierarchyMeta: {},
+        showVirtual: false,
+        currentView: "catalog",
+        lastPO: null,
+    };
+
+    // 7) Wire loaders.
+    setupMakerHome({
+        api,
+        state,
+        onPick: (id) => {
+            state.makerId = id;
+            goToView("catalog");
+        },
+    });
+    setupCatalog({ api, state });
+    setupSetDetail({ api, state, onAddToCart: handleAddToCart });
+    setupCart({
+        api,
+        state,
+        onSuccess: (poNumber, poId, warnings) => {
+            state.lastPO = { number: poNumber, id: poId, warnings: warnings || [] };
+            goToView("success");
+        },
+    });
+    setupSuccess({ state });
+
+    // 8) Wire hash router (popstate-aware SPA navigation).
+    setupHashRouter({
+        useHashApi: true,
+        handlers: {
+            home: loadMakerHome,
+            catalog: () => { state.currentView = "catalog"; loadCatalog(); },
+            detail: (sku) => { state.currentView = "detail"; loadSetDetail(sku); },
+            cart: () => { state.currentView = "cart"; loadCartView(); },
+            review: () => { state.currentView = "review"; loadCartView(); },
+            success: () => { state.currentView = "success"; loadSuccess(); },
+        },
+    });
+
+    // 9) Expose a debug surface (mirrors B2B catalog + B2F maker pattern).
     if (typeof window !== "undefined") {
         const w = /** @type {any} */ (window);
         w.DINOCO_B2F_CATALOG = {
-            version: "V.0.3",
+            version: "V.0.4",
             ctx,
             api,
+            state,
             modal,
             makerId: opts.makerId || null,
             orderIntentEnabled: !!opts.orderIntentEnabled,
@@ -219,8 +300,26 @@ export async function bootstrap(opts = {}) {
             },
             initialCart,
         };
+        // Round 3 — legacy bridge for inline V.7.15 fallback. These
+        // globals will be dropped in Round 4 once event delegation is
+        // wired through the new event-delegation.js module.
+        w.DINOCO_B2F_CATALOG_NAV = Object.freeze({
+            goToView,
+            openSetDetail,
+            back: routerBack,
+            getCurrentView,
+            dispatchInitial,
+            handleAddToCart,
+            handleStepperChange,
+            handleSubmitOrder,
+            handleReviewGate,
+            setShowVirtual,
+            setQty,
+            renderSuccess,
+        });
+
         // Round 2 — page renderers exposed on a frozen sub-namespace so
-        // the inline V.7.14 fallback (Round 5 cutover) can call them
+        // the inline V.7.15 fallback (Round 5 cutover) can call them
         // without re-importing.
         w.DINOCO_B2F_CATALOG_RENDERERS = Object.freeze({
             // Catalog grid
@@ -245,10 +344,14 @@ export async function bootstrap(opts = {}) {
         });
     }
 
+    // 10) Dispatch initial view based on current URL hash.
+    dispatchInitial();
+
     return {
-        version: "V.0.3",
+        version: "V.0.4",
         ctx,
         api,
+        state,
         modal,
         makerId: opts.makerId || null,
         initialCart,

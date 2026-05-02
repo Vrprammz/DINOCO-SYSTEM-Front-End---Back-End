@@ -92,7 +92,9 @@ const distExists = fs.existsSync(DIST_DIR);
         walk(DIST_DIR);
         // Loose ceiling — primarily catches accidentally-included assets
         // (images, fonts) committed under publicDir or via import.
-        expect(total).toBeLessThan(200 * 1024);
+        // Round 9 R3 bumped 200KB → 240KB after b2f-catalog gained router +
+        // api + 5 loaders (29.39 KB → 44.07 KB JS, ~14.68 KB delta).
+        expect(total).toBeLessThan(240 * 1024);
     });
 });
 
