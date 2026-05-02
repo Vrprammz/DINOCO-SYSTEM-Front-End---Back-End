@@ -438,30 +438,55 @@ describe("renderDetailPage", () => {
         ).not.toBeNull();
     });
 
-    test("shows 'Confirm PO' action when status=submitted", () => {
+    test("shows 'Confirm PO' action when status=submitted (V.0.5 data-action)", () => {
         renderDetailPage(makePO({ po_status: "submitted" }));
-        const html = getApp().innerHTML;
-        expect(html).toContain("goToPage('confirm')");
+        const btn = getApp().querySelector(
+            'button[data-action="navigate"][data-view="confirm"]'
+        );
+        expect(btn).not.toBeNull();
+        // Default lang in tests is "th" → button text shows ไทย translation.
+        expect(btn.textContent).toMatch(/ไปยืนยัน|Confirm PO|确认订单/);
     });
 
     test("shows 'Request reschedule' action when status=confirmed", () => {
         renderDetailPage(makePO({ po_status: "confirmed" }));
-        const html = getApp().innerHTML;
-        expect(html).toContain("goToPage('reschedule')");
+        const btn = getApp().querySelector(
+            'button[data-action="navigate"][data-view="reschedule"]'
+        );
+        expect(btn).not.toBeNull();
     });
 
     test("shows 'Ship more' action when status=delivering", () => {
         renderDetailPage(makePO({ po_status: "delivering" }));
-        const html = getApp().innerHTML;
-        expect(html).toContain("goToPage('deliver')");
+        const btn = getApp().querySelector(
+            'button[data-action="navigate"][data-view="deliver"]'
+        );
+        expect(btn).not.toBeNull();
     });
 
     test("no action button when status=completed", () => {
         renderDetailPage(makePO({ po_status: "completed" }));
         const html = getApp().innerHTML;
-        expect(html).not.toContain("goToPage('confirm')");
-        expect(html).not.toContain("goToPage('reschedule')");
-        expect(html).not.toContain("goToPage('deliver')");
+        // V.0.5 — assert no `data-action="navigate"` action buttons render
+        // for terminal status. Filter chips on list page use a different
+        // class, so a global selector here would still match navigation.
+        expect(
+            getApp().querySelector(
+                'button[data-action="navigate"][data-view="confirm"]'
+            )
+        ).toBeNull();
+        expect(
+            getApp().querySelector(
+                'button[data-action="navigate"][data-view="reschedule"]'
+            )
+        ).toBeNull();
+        expect(
+            getApp().querySelector(
+                'button[data-action="navigate"][data-view="deliver"]'
+            )
+        ).toBeNull();
+        // Sanity — onclick legacy strings must not appear in V.0.5 output.
+        expect(html).not.toContain("onclick=");
     });
 
     test("renders items grouped by SET parent (DD-3)", () => {
@@ -592,7 +617,7 @@ describe("renderRescheduleList", () => {
         expect(cards.length).toBe(2);
     });
 
-    test("card click handler uses goToPageWithPO", () => {
+    test("card uses data-action delegation for navigation (V.0.5)", () => {
         renderRescheduleList([
             {
                 ID: 99,
@@ -603,8 +628,12 @@ describe("renderRescheduleList", () => {
                 currency: "THB",
             },
         ]);
-        const html = getApp().innerHTML;
-        expect(html).toContain("goToPageWithPO('reschedule','99')");
+        const card = getApp().querySelector(
+            '.b2f-po-card[data-action="navigate-with-po"][data-view="reschedule"][data-po-id="99"]'
+        );
+        expect(card).not.toBeNull();
+        // Sanity — no inline onclick survived migration.
+        expect(getApp().innerHTML).not.toContain("onclick=");
     });
 });
 
@@ -915,14 +944,45 @@ describe("renderDeliverForm", () => {
         expect(input.max).toBe("5");
     });
 
-    test("renders 'fill all' button", () => {
+    test("renders 'fill all' button (V.0.5 data-action)", () => {
         renderDeliverForm(makePO());
-        expect(getApp().innerHTML).toContain("b2fFillAllRemaining");
+        const btn = getApp().querySelector(
+            'button[data-action="deliver-fill-all"]'
+        );
+        expect(btn).not.toBeNull();
     });
 
-    test("renders submit button", () => {
+    test("renders submit button (V.0.5 data-action)", () => {
         renderDeliverForm(makePO());
-        expect(getApp().innerHTML).toContain("b2fSubmitDeliver");
+        const btn = getApp().querySelector(
+            'button[data-action="deliver-submit"]'
+        );
+        expect(btn).not.toBeNull();
+    });
+
+    test("stepper buttons use data-action='deliver-step' + data-delta", () => {
+        renderDeliverForm(makePO());
+        const minus = getApp().querySelector(
+            'button[data-action="deliver-step"][data-delta="-1"]'
+        );
+        const plus = getApp().querySelector(
+            'button[data-action="deliver-step"][data-delta="1"]'
+        );
+        expect(minus).not.toBeNull();
+        expect(plus).not.toBeNull();
+    });
+
+    test("back buttons use data-action='deliver-back' (V.0.5)", () => {
+        renderDeliverForm(makePO());
+        const backs = getApp().querySelectorAll(
+            'button[data-action="deliver-back"]'
+        );
+        expect(backs.length).toBe(2); // header arrow + footer "← กลับ"
+    });
+
+    test("no inline onclick attributes remain in deliver form output", () => {
+        renderDeliverForm(makePO());
+        expect(getApp().innerHTML).not.toContain("onclick=");
     });
 
     test("DD-3 SET grouping renders header row before children", () => {
