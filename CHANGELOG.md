@@ -10,6 +10,36 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF B2B Catalog code port Round 3 — router + B2B API wrapper + 5 page loaders (2026-05-02)
+
+Continues from Round 2 page renderers. Round 3 ports the **navigation + REST orchestration** layer from inline `b2b_liff_page_js()` (V.32.9) into ES modules. Inline V.32.9 stays UNCHANGED — Round 3 exposes 12 globals (`window.B2B_CATALOG_GO_TO_TAB`, `window.B2B_CATALOG_OPEN_SET_DETAIL`, `window.B2B_CATALOG_ADD_TO_CART`, etc.) for the inline-bridge during the parallel-rendering window. Round 4 will drop the bridge in favor of `data-action` event delegation. Flag `dinoco_liff_use_vite_b2b_catalog` default OFF (REG-029 byte-identical preserved).
+
+**What landed**:
+
+- **`liff-src/b2b/catalog/router.js`** (~340 LOC) — hash-based router. `getCurrentTab` / `getCurrentSetSku` / `isSetDetailOpen` (pure URL-hash readers) + `goToTab(tab, opts)` (pushState + dispatch, silent flag respected) + `openSetDetail(sku, product)` (pushes `#detail-<sku>` byte-identical to inline V.32.9 line 1187 format) + `closeSetDetail` (`history.back()` when overlay open) + `back` (close overlay first, else history.back) + `setupHashRouter({handlers, useHashApi})` (idempotent hashchange + popstate listener, SPA mode default true) + `dispatchInitial` (fires handler matching landing URL).
+- **`liff-src/b2b/catalog/api.js`** (~270 LOC) — `createB2BCatalogApi({base, sessionToken, nonce, onAuthExpired, onRateLimit, onConflict, onMaintenance})` with 6 named methods (`getCatalog` / `getOrderHistory` / `getOrderDetail` / `placeOrder` / `cancelOrder` / `modifyOrder`). **Auto-attach X-Idempotency-Key** (crypto.randomUUID + timestamp+random fallback) on `placeOrder` + `cancelOrder` — pairs with [B2B] Snippet 3 V.42.10 + Idempotency Helper V.1.0 wrapper. `modifyOrder` routes through `/place-order` with `edit_ticket` body field (production V.41.x line 1002-1018 detects > 0 and re-uses existing post_id; NO separate REST endpoint). HTTP error mapping → wired callbacks: 401 → onAuthExpired (re-init LIFF), 409 → onConflict + per-code Thai message rewrite (`idempotency_conflict` / `order_modified` / `stock_changed`), 429 → onRateLimit, 503 → onMaintenance.
+- **5 page loaders** (`liff-src/b2b/catalog/loaders/`, ~970 LOC):
+  - `catalog.js` — `setupCatalog` + `loadCatalog` (api → state → render) + `handleAddToCart` (V.32.1 H-10 SET ↔ child duplicate guard preserved) + `handleIncrement` / `handleDecrement` (qty stepper) + `handleOpenSetDetail` (delegates to router via callback)
+  - `home.js` — `setupHome` + `loadHome` (lazy fetch fallback if catalog not yet loaded) + `applyModelFilter` / `applyCategoryFilter` / `applyCrossFilter` / `resetFilters` (mutate state + fire onCatalogRender callback)
+  - `history.js` — `setupHistory` + `loadHistory({append, perPage})` + `handleHistoryFilter` (resets pagination) + `handleLoadMore` (appends next page) + `handleCancelOrder` (calls api.cancelOrder + reloads list)
+  - `setDetail.js` — `setupSetDetail` + `loadSetDetail(sku, productHint)` (uses hint when supplied, else looks up state.products) + `handleAddSet` (clamps 1-999 + V.32.1 H-10 dup guard) + `handleSubItemStep(sku, delta)` + `handleClose`
+  - `cart.js` — `setupCart` + `loadCartModal` (renders empty state when cart empty) + `handleSubmitOrder` (routes `placeOrder` vs `modifyOrder` based on `editMode`/`editTicket` — calls `liff.closeWindow()` on success like inline V.32.9 line 1690) + `handleCartItemRemove` + `getCartTotals` (count + total)
+- **`entry.js` V.0.3 → V.0.4** — wires the router + API + 5 loaders through `bootstrap()`. Adds 12 `window.B2B_CATALOG_*` legacy-bridge globals so inline V.32.9 callers can fire-and-forget into Vite loaders. Extends frozen `window.DINOCO_B2B_CATALOG` debug surface with `.router` / `.api` / `.loaders` namespaces.
+- **88 Jest tests** across 3 new suites:
+  - `liff-b2b-catalog-router.test.js` (32 tests) — getCurrentTab / getCurrentSetSku / openSetDetail / closeSetDetail / back / setupHashRouter idempotency / dispatchInitial / hashchange + popstate listener wiring (with useHashApi=false negative case)
+  - `liff-b2b-catalog-api.test.js` (22 tests) — header injection (X-B2B-Token + X-WP-Nonce + auto X-Idempotency-Key on mutations) + URL parity all 6 methods + modifyOrder routes through /place-order with edit_ticket + 401/409/429/503 callback dispatch + per-code Thai message rewrite + newIdempotencyKey uniqueness
+  - `liff-b2b-catalog-loaders.test.js` (34 tests) — per loader: api method called + state populated + render emitted + V.32.1 H-10 duplicate guard + edit-mode submit routing + cart totals computation
+- **Bundle deltas**: `b2b-catalog.<hash>.js` 27.63 KB → **45.03 KB** (gzip 13.86 KB, +17.4 KB raw / +4.7 KB gzip). CSS unchanged 27.86 KB. Bundle-size guard threshold 64 KB — 19 KB headroom for Round 4 cleanup work (Round 4 will drop ~3-5 KB by removing legacy-bridge globals).
+- **Test count**: 658 → **746** (Jest, +88 across 3 suites). PHPUnit 383 unchanged.
+
+**Production safety**: Snippet 4 inline `<style>` + `<script>` blocks intact (REG-029 byte-identical when flag OFF). Hash format `#detail-<sku>` byte-identical to inline V.32.9 line 1187. 12 `window.B2B_CATALOG_*` globals are NEW — they enable inline → Vite loader bridges but stay inert when bundle is OFF (inline never references them). Rollback = flip flag false (no redeploy) — instant.
+
+**Round 4 scope** (next): drop the 12 legacy-bridge globals + replace inline `onclick="..."` attributes in `pages/*.js` with declarative `data-action="..."`. Single delegated click listener on `#b2b-catalog-app` routes by attribute to the appropriate loader handler. Mobile back-button parity verification on iOS LIFF in-app browser.
+
+**Files**: `liff-src/b2b/catalog/router.js` (NEW), `liff-src/b2b/catalog/api.js` (NEW), `liff-src/b2b/catalog/loaders/{catalog,home,history,setDetail,cart}.js` (NEW), `liff-src/b2b/catalog/entry.js` (V.0.3 → V.0.4), `tests/jest/liff-b2b-catalog-{router,api,loaders}.test.js` (NEW), `docs/runbooks/PHASE-2-VITE-MIGRATION.md` (Step 2.5 Round 7 added), `CHANGELOG.md`.
+
+---
+
 ### Feature — Vite LIFF B2B Catalog code port Round 2 — 5 page modules + 12+ renderers (2026-04-30)
 
 Continues from Round 1 foundation. Round 2 ports the page renderers from inline `b2b_liff_page_js()` (V.32.9 lines 884-1850) into ES modules under `liff-src/b2b/catalog/pages/`. Inline V.32.9 stays UNCHANGED — renderers exposed via `window.DINOCO_B2B_CATALOG.renderers.*` for inline-bridge fallback during Round 3-4 cutover. Flag `dinoco_liff_use_vite_b2b_catalog` default OFF (REG-029 byte-identical preserved).
