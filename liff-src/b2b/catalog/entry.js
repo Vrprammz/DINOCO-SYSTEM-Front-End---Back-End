@@ -1,5 +1,5 @@
 /**
- * B2B LIFF E-Catalog — Vite entry (V.0.3 Round 2 — page renderers)
+ * B2B LIFF E-Catalog — Vite entry (V.0.4 Round 3 — router + API + loaders)
  *
  * MIGRATION TARGET: `[B2B] Snippet 4: LIFF E-Catalog Frontend` V.32.9
  *
@@ -10,23 +10,29 @@
  *   ✅ Foundation bootstrap — wires LIFF auth + offline detection +
  *      exposes a debug surface on `window.DINOCO_B2B_CATALOG`.
  *
- * Round 2 (V.0.3 — this commit):
- *   ✅ 5 page modules under `./pages/` — pure HTML-string builders:
- *      • home.js     — view-state + cross-pills + model row + category row
- *      • catalog.js  — 2-col product grid (V.32.6 P18 LCP boost)
- *      • setDetail.js— SET overlay + V.32.2 typable stepper +
- *                       V.32.4 collapsed sub-item buttons
- *      • history.js  — order list + filter chips + load-more pagination
- *      • cart.js     — cart bar + modal items + V.32.4 remove btn +
- *                       V.32.6 P3 empty state + recommended chips
- *   ✅ Renderers exposed on `window.DINOCO_B2B_CATALOG.renderers` for
- *      the inline bridge during migration. Inline V.32.9 still owns DOM
- *      injection + event delegation — these helpers run side-by-side.
+ * Round 2 (V.0.3):
+ *   ✅ 5 page modules under `./pages/` — pure HTML-string builders.
  *
- * Round 3+ scope (NOT in this file yet):
- *   ⏳ Router (tab-switch + URL hash sync).
- *   ⏳ Event delegation — replace inline onclick=".." with data-action="..".
- *   ⏳ Page bootstrap loaders (own DOM injection from Vite side).
+ * Round 3 (V.0.4 — this commit):
+ *   ✅ Router (`./router.js`) — hash-based navigation:
+ *      • getCurrentTab / getCurrentSetSku / goToTab / openSetDetail /
+ *        closeSetDetail / back / setupHashRouter / dispatchInitial
+ *      • Hash format `#detail-<sku>` matches inline V.32.9 line 1187.
+ *   ✅ B2B API wrapper (`./api.js`) — `createB2BCatalogApi()`:
+ *      • Wraps shared createB2BApi + adds X-Idempotency-Key on
+ *        place-order / cancel-request / modify-order.
+ *      • Maps 401/409/429/503 → wired callbacks for global toasts.
+ *   ✅ 5 page loaders under `./loaders/`:
+ *      • catalog.js  — loadCatalog + add-to-cart + stepper increments
+ *      • home.js     — loadHome + model/category drilldown
+ *      • history.js  — loadHistory + filter chips + load more
+ *      • setDetail.js— loadSetDetail + handleAddSet (V.32.1 dup guard)
+ *      • cart.js     — loadCartModal + handleSubmitOrder (place/modify)
+ *
+ * Round 4+ scope (NOT in this file yet):
+ *   ⏳ Bridge cleanup — drop legacy `window.goToTab` / `window.openSetDetail`
+ *      / `window.handleAddToCart` globals once Snippet 4 V.32.10 cut-over
+ *      lands. Replace with event delegation (`data-action="*"`).
  *
  * Round 5 scope (final cut-over):
  *   ⏳ Drop inline `<script>` block from Snippet 4 once flag has been ON
@@ -140,8 +146,60 @@ import {
     renderRecommendedChips,
 } from "./pages/cart.js";
 
-const VERSION = "V.0.3";
-const BOOT_MARKER = `[b2b-catalog] Vite bundle loaded (${VERSION} Round 2 — page renderers, parallel)`;
+// Round 3 — router + API wrapper + 5 page loaders.
+import {
+    getCurrentTab,
+    getCurrentSetSku,
+    isSetDetailOpen,
+    goToTab,
+    openSetDetail,
+    closeSetDetail,
+    back as routerBack,
+    setupHashRouter,
+    dispatchInitial,
+} from "./router.js";
+import { createB2BCatalogApi } from "./api.js";
+import {
+    setupCatalog,
+    loadCatalog,
+    renderCatalog,
+    handleAddToCart,
+    handleIncrement,
+    handleDecrement,
+    handleOpenSetDetail,
+} from "./loaders/catalog.js";
+import {
+    setupHome,
+    loadHome,
+    applyModelFilter,
+    applyCategoryFilter,
+    applyCrossFilter,
+    resetFilters,
+} from "./loaders/home.js";
+import {
+    setupHistory,
+    loadHistory,
+    handleHistoryFilter,
+    handleLoadMore,
+    handleCancelOrder,
+} from "./loaders/history.js";
+import {
+    setupSetDetail,
+    loadSetDetail,
+    handleAddSet,
+    handleSubItemStep,
+    handleClose as handleSetDetailClose,
+} from "./loaders/setDetail.js";
+import {
+    setupCart,
+    loadCartModal,
+    handleSubmitOrder,
+    handleCartItemRemove,
+    getCartTotals,
+} from "./loaders/cart.js";
+
+const VERSION = "V.0.4";
+const BOOT_MARKER = `[b2b-catalog] Vite bundle loaded (${VERSION} Round 3 — router + API + loaders)`;
 console.info(BOOT_MARKER);
 
 /**
@@ -154,10 +212,13 @@ console.info(BOOT_MARKER);
  *   nonce?: string,
  *   sessionToken?: string,
  *   authEndpoint?: string,
+ *   gid?: string,
+ *   editTicket?: number,
+ *   useHashApi?: boolean,
  * }} [opts]
  */
 export async function bootstrap(opts = {}) {
-    const { liffId, restUrl, sessionToken, authEndpoint } = opts;
+    const { liffId, restUrl, sessionToken, authEndpoint, nonce } = opts;
     if (!liffId) {
         console.warn("[b2b-catalog] liffId not provided — skipping init");
         return null;
@@ -180,47 +241,152 @@ export async function bootstrap(opts = {}) {
     }
 
     const apiBase = restUrl ? restUrl.replace(/\/$/, "") : wpRestUrl("b2b/v1");
-    const api = createB2BApi({
+
+    // Round 3 — instantiate the catalog API wrapper. Wires global error
+    // toasts via showToast/showAuthError so loaders don't have to.
+    const api = createB2BCatalogApi({
         base: apiBase,
         sessionToken: session.token,
+        nonce: nonce || null,
+        onAuthExpired: async () => {
+            // Token expired — re-init LIFF (LINE bot pushes fresh URL
+            // when user taps the next chat link). Inline V.32.9 line
+            // 738-741 takes the same approach.
+            showAuthError(
+                "เซสชันหมดอายุ",
+                "กรุณาปิดแล้วเปิดลิงก์ใหม่",
+                false
+            );
+        },
+        onRateLimit: (msg) => showToast(msg),
+        onConflict: (msg) => showToast(msg),
+        onMaintenance: (msg) =>
+            showAuthError(
+                "ระบบกำลังปรับปรุง",
+                msg || "กรุณาลองใหม่ภายหลัง",
+                true
+            ),
     });
 
-    // Cart state (shallow dict — matches inline V.32.9 contract).
-    // Round 2 page renderers will read/write through these accessors so
-    // we can swap to the shared cart state machine later without
-    // refactoring callers.
-    let cart = loadCart();
+    // Shared cart dict (matches inline V.32.9 contract — shallow {sku: qty}).
+    const initialCart = loadCart();
+
+    /** @type {object} */
+    const state = {
+        products: [],
+        cart: initialCart,
+        viewMode: "home",
+        searchQuery: "",
+        homeSearchQuery: "",
+        filterModel: "",
+        filterCategory: "",
+        crossFilter: "",
+        modelImageMap: {},
+        modelOrder: [],
+        categoryOrder: [],
+        historyFilter: "",
+        historyPage: 1,
+        historyTotalPages: 1,
+        historyItems: [],
+        editMode: false,
+        editTicket: opts.editTicket || 0,
+        gid: opts.gid || "",
+    };
+
+    // Wire all 5 loaders. Order matters — catalog re-render hook depends
+    // on home loader being wired so applyModelFilter can call
+    // renderCatalog().
+    setupCatalog({
+        api,
+        state,
+        onOpenSetDetail: (sku, product) => openSetDetail(sku, product),
+    });
+    setupHome({
+        api,
+        state,
+        onCatalogRender: () => renderCatalog(),
+    });
+    setupHistory({ api, state });
+    setupSetDetail({
+        state,
+        onClose: () => goToTab("catalog", { silent: true }),
+    });
+    setupCart({
+        api,
+        state,
+        liff:
+            typeof window !== "undefined" && window.liff
+                ? window.liff
+                : null,
+        onSuccess: () => {
+            // After place-order success, clear edit mode.
+            state.editMode = false;
+            state.editTicket = 0;
+        },
+    });
+
+    // Wire the hash-based router. The `useHashApi` flag controls whether
+    // we own navigation (Round 3 tests + future Round 5 cut-over) or let
+    // inline V.32.9 own it (current production path with flag OFF). When
+    // the bundle is loaded behind the flag-gated render shell, the inline
+    // path is dormant — useHashApi defaults TRUE here.
+    const useHashApi = opts.useHashApi !== false;
+    setupHashRouter({
+        useHashApi,
+        handlers: {
+            catalog: () => loadCatalog(),
+            home: () => loadHome(),
+            history: () => loadHistory(),
+            setDetail: (sku) => loadSetDetail(sku),
+            closeSetDetail: () => handleSetDetailClose(),
+        },
+    });
+
+    // Initial dispatch — fire the handler matching the URL the user
+    // landed on. Defaults to catalog/home when hash absent.
+    if (useHashApi) {
+        dispatchInitial();
+    }
 
     return {
         version: VERSION,
         session,
         api,
+        state,
         cart: {
             get state() {
-                return cart;
+                return state.cart;
             },
             set: (sku, qty) => {
-                cart = setCartQty(cart, sku, qty);
-                saveCart(cart);
-                return cart;
+                state.cart = setCartQty(state.cart, sku, qty);
+                saveCart(state.cart);
+                return state.cart;
             },
             incr: (sku, delta) => {
-                cart = incrCartQty(cart, sku, delta);
-                saveCart(cart);
-                return cart;
+                state.cart = incrCartQty(state.cart, sku, delta);
+                saveCart(state.cart);
+                return state.cart;
             },
             clear: () => {
-                cart = clearCart();
-                saveCart(cart);
-                return cart;
+                state.cart = clearCart();
+                saveCart(state.cart);
+                return state.cart;
             },
-            count: () => computeItemCount(cart),
-            total: (products) => computeTotal(cart, products),
-            toOrder: (products) => toOrderItems(cart, products),
-            detectDupes: (products) => detectCartDuplicates(cart, products),
+            count: () => computeItemCount(state.cart),
+            total: () => computeTotal(state.cart, state.products),
+            toOrder: () => toOrderItems(state.cart, state.products),
+            detectDupes: () => detectCartDuplicates(state.cart, state.products),
         },
-        $,
-        $$,
+        router: {
+            goToTab,
+            openSetDetail,
+            closeSetDetail,
+            back: routerBack,
+            getCurrentTab,
+            getCurrentSetSku,
+            isSetDetailOpen,
+        },
+        $, $$,
     };
 }
 
@@ -246,6 +412,8 @@ function readMountConfig() {
             nonce: parsed.nonce,
             sessionToken: parsed.session_token || parsed.sessionToken,
             authEndpoint: parsed.auth_endpoint || parsed.authEndpoint,
+            gid: parsed.gid || "",
+            editTicket: parsed.edit_ticket || parsed.editTicket || 0,
         };
     } catch (err) {
         console.error("[b2b-catalog] data-config parse failed", err);
@@ -270,10 +438,33 @@ if (typeof window !== "undefined") {
     }
 }
 
-// Stable debug surface — extends Round 1 helpers with Round 2 page
-// renderers. Frozen so external callers can inspect the version + helpers
-// but not mutate the surface. Inline V.32.9 reads from `renderers` when
-// the flag is ON; inline render path is preserved when OFF.
+// ─────────────────────────────────────────────────────────────────────
+// Legacy-bridge globals (Round 3 — Round 4 will drop these in favor of
+// data-action event delegation). Inline V.32.9 already uses
+// `data-action="*"` for the product grid; the globals below let other
+// parts of the inline script (cart bar / order history filter chips)
+// call into the Vite loaders by name during the parallel phase.
+// ─────────────────────────────────────────────────────────────────────
+if (typeof window !== "undefined") {
+    /** @type {any} */
+    const w = window;
+    w.B2B_CATALOG_GO_TO_TAB = goToTab;
+    w.B2B_CATALOG_OPEN_SET_DETAIL = openSetDetail;
+    w.B2B_CATALOG_CLOSE_SET_DETAIL = closeSetDetail;
+    w.B2B_CATALOG_ADD_TO_CART = handleAddToCart;
+    w.B2B_CATALOG_INCREMENT = handleIncrement;
+    w.B2B_CATALOG_DECREMENT = handleDecrement;
+    w.B2B_CATALOG_HISTORY_FILTER = handleHistoryFilter;
+    w.B2B_CATALOG_LOAD_MORE = handleLoadMore;
+    w.B2B_CATALOG_SUBMIT_ORDER = handleSubmitOrder;
+    w.B2B_CATALOG_CART_REMOVE = handleCartItemRemove;
+    w.B2B_CATALOG_ADD_SET = handleAddSet;
+    w.B2B_CATALOG_SUB_STEP = handleSubItemStep;
+}
+
+// Stable debug surface — extends Round 1+2 helpers with Round 3 router
+// + API + loaders. Frozen so external callers can inspect the version
+// + helpers but not mutate the surface.
 if (typeof window !== "undefined") {
     window.DINOCO_B2B_CATALOG = Object.freeze({
         version: VERSION,
@@ -296,48 +487,52 @@ if (typeof window !== "undefined") {
             computeItemCount, computeTotal, toOrderItems,
             detectCartDuplicates, clearCart, CART_STORAGE_KEY,
         }),
-        // Round 2 — page renderers (pure HTML-string builders).
+        // Round 2 — page renderers.
         renderers: Object.freeze({
             // home
-            productMatchesModel,
-            renderModelCard,
-            renderModelRow,
-            shouldShowModelLabel,
-            renderCategoryCard,
-            renderCategoryRow,
-            shouldShowCategoryLabel,
-            renderHome,
-            renderViewState,
-            collectCategoriesForModel,
-            collectModelsForCategory,
+            productMatchesModel, renderModelCard, renderModelRow,
+            shouldShowModelLabel, renderCategoryCard, renderCategoryRow,
+            shouldShowCategoryLabel, renderHome, renderViewState,
+            collectCategoriesForModel, collectModelsForCategory,
             renderCrossFilterPills,
             // catalog
-            filterProducts,
-            formatEtaDate,
-            renderProductCard,
-            renderProducts,
+            filterProducts, formatEtaDate, renderProductCard, renderProducts,
             // SET Detail
-            buildB2bStepper,
-            renderSetDetailMainStepper,
-            updateSetDetailAddBtn,
-            renderSetDetailItems,
+            buildB2bStepper, renderSetDetailMainStepper,
+            updateSetDetailAddBtn, renderSetDetailItems,
             // history
-            HISTORY_FILTERS,
-            STATUS_COLORS,
-            STATUS_LABELS,
-            getStatusColor,
-            getStatusLabel,
-            renderHistoryFilter,
-            renderHistoryCard,
-            renderLoadMoreButton,
-            renderHistory,
+            HISTORY_FILTERS, STATUS_COLORS, STATUS_LABELS,
+            getStatusColor, getStatusLabel, renderHistoryFilter,
+            renderHistoryCard, renderLoadMoreButton, renderHistory,
             // cart
-            updateCartBar,
-            renderCartModalItem,
-            renderCartEmptyState,
-            renderCartNoteSection,
-            renderCartItems,
-            renderRecommendedChips,
+            updateCartBar, renderCartModalItem, renderCartEmptyState,
+            renderCartNoteSection, renderCartItems, renderRecommendedChips,
+        }),
+        // Round 3 — router + API + loaders.
+        router: Object.freeze({
+            getCurrentTab, getCurrentSetSku, isSetDetailOpen,
+            goToTab, openSetDetail, closeSetDetail,
+            back: routerBack, setupHashRouter, dispatchInitial,
+        }),
+        api: Object.freeze({ createB2BCatalogApi }),
+        loaders: Object.freeze({
+            // catalog
+            setupCatalog, loadCatalog, renderCatalog,
+            handleAddToCart, handleIncrement, handleDecrement,
+            handleOpenSetDetail,
+            // home
+            setupHome, loadHome,
+            applyModelFilter, applyCategoryFilter,
+            applyCrossFilter, resetFilters,
+            // history
+            setupHistory, loadHistory,
+            handleHistoryFilter, handleLoadMore, handleCancelOrder,
+            // SET Detail
+            setupSetDetail, loadSetDetail,
+            handleAddSet, handleSubItemStep,
+            // cart
+            setupCart, loadCartModal,
+            handleSubmitOrder, handleCartItemRemove, getCartTotals,
         }),
     });
 }
