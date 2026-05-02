@@ -15,7 +15,10 @@
  *                          5 page loaders on top of Round 2 page
  *                          renderers. gzip ~15KB. See liff-src/b2f/maker/
  *                          and runbooks/PHASE-2-VITE-MIGRATION.md.)
- *   - liff-ai:     ~605B
+ *   - liff-ai:     ~42KB  (Round 3 — adds router + LIFF AI API wrapper +
+ *                          auth-flow + 6 page loaders on top of Round 2 page
+ *                          renderers. gzip ~11KB. See liff-src/liff-ai/
+ *                          frontend/ and runbooks/PHASE-2-VITE-MIGRATION.md.)
  *
  * Behavior:
  *   - Skips if dist/liff/ doesn't exist (`npm run build:liff` not yet run)
@@ -96,7 +99,11 @@ const distExists = fs.existsSync(DIST_DIR);
         // api + 5 loaders (29.39 KB → 44.07 KB JS, ~14.68 KB delta).
         // Round 11 R2 bumped 240KB → 280KB after liff-ai gained 6 page renderers
         // (2.85 KB → 25.61 KB JS, ~22.76 KB delta).
-        expect(total).toBeLessThan(280 * 1024);
+        // Round 11 R3: liff-ai 25.61 → 42.08 KB JS (+16.47 KB) — router + API
+        // wrapper + auth-flow + 6 loaders. Total dist now ~277 KB; ceiling
+        // raised 280 → 320 KB to keep headroom for Round 4 event delegation
+        // bundle (~10-15 KB). See PHASE-2-VITE-MIGRATION.md.
+        expect(total).toBeLessThan(320 * 1024);
     });
 });
 
