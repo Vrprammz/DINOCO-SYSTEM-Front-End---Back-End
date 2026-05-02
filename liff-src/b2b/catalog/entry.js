@@ -1,20 +1,32 @@
 /**
- * B2B LIFF E-Catalog — Vite entry (V.0.2 Round 1 — foundation port)
+ * B2B LIFF E-Catalog — Vite entry (V.0.3 Round 2 — page renderers)
  *
  * MIGRATION TARGET: `[B2B] Snippet 4: LIFF E-Catalog Frontend` V.32.9
  *
- * Round 1 (V.0.2 — this commit):
+ * Round 1 (V.0.2):
  *   ✅ Wiring (Snippet 4 V.32.8 added flag-gated render shell)
  *   ✅ CSS port (`./styles.css` — 335 LOC verbatim from inline)
  *   ✅ 6 utility modules (`./utils/{lang,format,dom,pricing,hierarchy,cart}.js`)
  *   ✅ Foundation bootstrap — wires LIFF auth + offline detection +
  *      exposes a debug surface on `window.DINOCO_B2B_CATALOG`.
  *
- * Round 2+ scope (NOT in this file yet):
- *   ⏳ Page renderers (catalog grid + SET Detail + cart UI + history) —
- *      currently still emitted inline by Snippet 4 V.32.9.
+ * Round 2 (V.0.3 — this commit):
+ *   ✅ 5 page modules under `./pages/` — pure HTML-string builders:
+ *      • home.js     — view-state + cross-pills + model row + category row
+ *      • catalog.js  — 2-col product grid (V.32.6 P18 LCP boost)
+ *      • setDetail.js— SET overlay + V.32.2 typable stepper +
+ *                       V.32.4 collapsed sub-item buttons
+ *      • history.js  — order list + filter chips + load-more pagination
+ *      • cart.js     — cart bar + modal items + V.32.4 remove btn +
+ *                       V.32.6 P3 empty state + recommended chips
+ *   ✅ Renderers exposed on `window.DINOCO_B2B_CATALOG.renderers` for
+ *      the inline bridge during migration. Inline V.32.9 still owns DOM
+ *      injection + event delegation — these helpers run side-by-side.
+ *
+ * Round 3+ scope (NOT in this file yet):
  *   ⏳ Router (tab-switch + URL hash sync).
  *   ⏳ Event delegation — replace inline onclick=".." with data-action="..".
+ *   ⏳ Page bootstrap loaders (own DOM injection from Vite side).
  *
  * Round 5 scope (final cut-over):
  *   ⏳ Drop inline `<script>` block from Snippet 4 once flag has been ON
@@ -81,8 +93,55 @@ import {
     CART_STORAGE_KEY,
 } from "./utils/cart.js";
 
-const VERSION = "V.0.2";
-const BOOT_MARKER = `[b2b-catalog] Vite bundle loaded (${VERSION} Round 1 — foundation, parallel)`;
+// Round 2 — page renderers (pure HTML-string builders).
+import {
+    productMatchesModel,
+    renderModelCard,
+    renderModelRow,
+    shouldShowModelLabel,
+    renderCategoryCard,
+    renderCategoryRow,
+    shouldShowCategoryLabel,
+    renderHome,
+    renderViewState,
+    collectCategoriesForModel,
+    collectModelsForCategory,
+    renderCrossFilterPills,
+} from "./pages/home.js";
+import {
+    filterProducts,
+    formatEtaDate,
+    renderProductCard,
+    renderProducts,
+} from "./pages/catalog.js";
+import {
+    buildB2bStepper,
+    renderSetDetailMainStepper,
+    updateSetDetailAddBtn,
+    renderSetDetailItems,
+} from "./pages/setDetail.js";
+import {
+    HISTORY_FILTERS,
+    STATUS_COLORS,
+    STATUS_LABELS,
+    getStatusColor,
+    getStatusLabel,
+    renderHistoryFilter,
+    renderHistoryCard,
+    renderLoadMoreButton,
+    renderHistory,
+} from "./pages/history.js";
+import {
+    updateCartBar,
+    renderCartModalItem,
+    renderCartEmptyState,
+    renderCartNoteSection,
+    renderCartItems,
+    renderRecommendedChips,
+} from "./pages/cart.js";
+
+const VERSION = "V.0.3";
+const BOOT_MARKER = `[b2b-catalog] Vite bundle loaded (${VERSION} Round 2 — page renderers, parallel)`;
 console.info(BOOT_MARKER);
 
 /**
@@ -211,15 +270,14 @@ if (typeof window !== "undefined") {
     }
 }
 
-// Stable debug surface — Round 2 page renderers (when imported from
-// the same bundle) will replace this. Frozen so external callers can
-// inspect the version + helpers but not mutate the surface.
+// Stable debug surface — extends Round 1 helpers with Round 2 page
+// renderers. Frozen so external callers can inspect the version + helpers
+// but not mutate the surface. Inline V.32.9 reads from `renderers` when
+// the flag is ON; inline render path is preserved when OFF.
 if (typeof window !== "undefined") {
     window.DINOCO_B2B_CATALOG = Object.freeze({
         version: VERSION,
         bootstrap,
-        // Helpers exposed for the inline-bridge during migration. Round 2
-        // page renderers will reach through these to the same exports.
         helpers: Object.freeze({
             // lang
             L, setupLanguage, getLang,
@@ -237,6 +295,49 @@ if (typeof window !== "undefined") {
             loadCart, saveCart, setCartQty, incrCartQty,
             computeItemCount, computeTotal, toOrderItems,
             detectCartDuplicates, clearCart, CART_STORAGE_KEY,
+        }),
+        // Round 2 — page renderers (pure HTML-string builders).
+        renderers: Object.freeze({
+            // home
+            productMatchesModel,
+            renderModelCard,
+            renderModelRow,
+            shouldShowModelLabel,
+            renderCategoryCard,
+            renderCategoryRow,
+            shouldShowCategoryLabel,
+            renderHome,
+            renderViewState,
+            collectCategoriesForModel,
+            collectModelsForCategory,
+            renderCrossFilterPills,
+            // catalog
+            filterProducts,
+            formatEtaDate,
+            renderProductCard,
+            renderProducts,
+            // SET Detail
+            buildB2bStepper,
+            renderSetDetailMainStepper,
+            updateSetDetailAddBtn,
+            renderSetDetailItems,
+            // history
+            HISTORY_FILTERS,
+            STATUS_COLORS,
+            STATUS_LABELS,
+            getStatusColor,
+            getStatusLabel,
+            renderHistoryFilter,
+            renderHistoryCard,
+            renderLoadMoreButton,
+            renderHistory,
+            // cart
+            updateCartBar,
+            renderCartModalItem,
+            renderCartEmptyState,
+            renderCartNoteSection,
+            renderCartItems,
+            renderRecommendedChips,
         }),
     });
 }
