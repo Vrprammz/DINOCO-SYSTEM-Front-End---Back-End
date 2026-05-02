@@ -11,13 +11,21 @@
  *   - GET  /b2b/v1/catalog            — product list with tier pricing
  *   - GET  /b2b/v1/order-history      — paginated history
  *   - GET  /b2b/v1/order-detail?ticket_id=X — single ticket
- *   - POST /b2b/v1/place-order        — new order (Idempotency Round 19+)
+ *   - POST /b2b/v1/place-order        — new order OR edit re-issue
+ *                                        (when body.edit_ticket > 0,
+ *                                        Snippet 3 V.41.x line 1002-1018
+ *                                        re-uses the existing post_id)
  *   - POST /b2b/v1/cancel-request     — cancel pending order
- *   - POST /b2b/v1/modify-order       — distributor self-edit (V.32.x)
+ *
+ * NOTE: There is NO separate `/modify-order` endpoint in production.
+ * Distributor self-edit (V.32.x editMode) flows through place-order
+ * with `edit_ticket` body field — Snippet 3 line 1004 detects > 0 and
+ * routes to update path. The `modifyOrder()` method below is a thin
+ * wrapper that adds `edit_ticket` and calls placeOrder.
  *
  * Round 3 ALSO adds:
  *   - Idempotency-Key auto-attach on mutating endpoints (place-order,
- *     cancel-request, modify-order). [B2B] Snippet 3 V.42.10 + helper
+ *     cancel-request). [B2B] Snippet 3 V.42.10 + helper
  *     V.1.0 wrap these — replays return cached response. Safe to send
  *     always; ignored when wrapper not active.
  *   - X-WP-Nonce auto-attach when caller provides `nonce` (admin LIFF
@@ -87,8 +95,7 @@ function _isMutatingCatalogEndpoint(endpoint) {
     const e = endpoint.replace(/^\//, "");
     return (
         e === "place-order" ||
-        e === "cancel-request" ||
-        e === "modify-order"
+        e === "cancel-request"
     );
 }
 
@@ -252,12 +259,14 @@ export function createB2BCatalogApi(options = {}) {
                 reason: reason || "",
             }),
         /**
-         * POST /modify-order — distributor self-edit (V.32.x).
-         * Snippet 16 V.2.x wraps this with the idempotency helper.
+         * Distributor self-edit (V.32.x editMode). Routes through
+         * /place-order with `edit_ticket` body field — Snippet 3 V.41.x
+         * line 1004 detects > 0 and re-uses existing post_id. NOT a
+         * separate REST endpoint despite the method name.
          */
         modifyOrder: (orderId, payload) =>
-            call("POST", "/modify-order", Object.assign(
-                { order_id: orderId },
+            call("POST", "/place-order", Object.assign(
+                { edit_ticket: orderId },
                 payload || {}
             )),
     };
