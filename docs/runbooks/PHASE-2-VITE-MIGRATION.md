@@ -678,6 +678,44 @@ Commit `b730551`.
 
 ---
 
+## Step 2.5 Round 9 R3 — B2F Catalog LIFF code port (Round 3 — router + api + loaders) ✅ (2026-04-30)
+
+Continues from Round 10. Ports the hash router, typed REST API wrapper, and 5 page loaders into ES modules under `liff-src/b2f/catalog/`. Inline V.7.15 stays UNCHANGED — entry.js V.0.4 wires the new modules + dispatches the URL-hash view on bootstrap.
+
+### What landed in Round 9 R3
+
+| File | LOC | Purpose |
+| --- | --- | --- |
+| `liff-src/b2f/catalog/router.js` | ~210 | `getCurrentView` + `goToView` + `openSetDetail` + `back` + `setupHashRouter` + `dispatchInitial`. Hash-based SPA routing (catalog/cart/review/success/home + `#detail-<sku>`). Idempotent listener wire + popstate-aware. Falls back to `goToView('catalog')` when history exhausted |
+| `liff-src/b2f/catalog/api.js` | ~210 | `createB2FCatalogApi({base, token, ...})` — typed wrapper around shared `createApi`. 5 named methods (getMakers / getMakerProducts / getCatalogMap / createPO / getPOHistory). Auto-attach `X-B2F-Token` + `X-Idempotency-Key` (POST /create-po). Error mapping: 401 → onAuthExpired, 410 → onCancelledPO, 429 → onRateLimit, 409 → onConflict |
+| `liff-src/b2f/catalog/loaders/makerHome.js` | ~115 | `setupMakerHome` + `loadMakerHome` — fetch + render maker picker cards + click handler mutates `state.makerId` + fires `onPick` callback |
+| `liff-src/b2f/catalog/loaders/catalog.js` | ~155 | `setupCatalog` + `loadCatalog` (delegates to `pages/catalog.js`) + `handleAddToCart` (cart mutate + localStorage persist) + `setQty` + `setShowVirtual` (toggle V.6.5 virtual SETs) |
+| `liff-src/b2f/catalog/loaders/setDetail.js` | ~115 | `setupSetDetail` + `loadSetDetail` (delegates to `pages/setDetail.js`) + `handleStepperChange` (delta with 0-min clamp) |
+| `liff-src/b2f/catalog/loaders/cart.js` | ~205 | `setupCart` + `loadCartView` (delegates to `pages/cart.js` + foreign currency fields) + `handleSubmitOrder` (POST /create-po + clear cart + transition to success) + `handleReviewGate` (V.7.11 a11y review gate) |
+| `liff-src/b2f/catalog/loaders/success.js` | ~95 | `setupSuccess` + `renderSuccess` + `loadSuccess` + auto-close LIFF after 5s (matches V.7.15 line 3185-3191) |
+
+Bundle size: 29.39 KB → **44.09 KB** (gzip 9.55 → 14.04 KB) — +14.70 KB JS for full SPA navigation surface. Still well under PERF-H6 155 KB inline target.
+
+Tests: 81 new Jest cases across 3 test files (router 22 + api 19 + loaders 40). Total Jest suite **1006 → 1087** passing (2 skipped).
+
+`entry.js` V.0.3 → V.0.4 wires `setupHashRouter` + `setupCatalog` + `setupSetDetail` + `setupCart` + `setupSuccess` + `setupMakerHome`. Exposes a frozen `window.DINOCO_B2F_CATALOG_NAV` namespace (legacy bridge for Round 4 — drops in Round 12 once event delegation is fully wired).
+
+Snippet 8 V.7.15 stays UNCHANGED (annotation header reflects the V.0.4 migration target — flag still default OFF, REG-029 byte-identical preserved).
+
+### Bundle-size threshold bump
+
+`tests/jest/bundle-size.test.js` — total dist sum threshold raised 200 KB → 240 KB to accommodate the V.0.4 b2f-catalog growth (router + api + 5 loaders contribute ~14.7 KB JS over Round 10 baseline). Per-entry limit unchanged.
+
+### Round 4 roadmap (next sprint — final cut-over prep)
+
+1. **Round 4** — event delegation module (`event-delegation.js`) wires `data-action="..."` attributes to handler methods. Drop legacy `window.openSetDetail` / `window.handleAddToCart` / `window.handleSubmitOrder` globals from inline V.7.15 once Round 4 lands. Cart-bar visibility update on cart change. Foreign currency field validation before navigating to review.
+2. **Round 5** — staging canary (flag flip on test maker only) + 7-day observation. Remove `window.DINOCO_B2F_CATALOG_NAV` legacy bridge.
+3. **Round 6** — final inline `b2f_liff_page_js()` deletion (destructive, requires explicit confirmation).
+
+Commit `[round-3-pending]`.
+
+---
+
 ## Step 3 — Production deploy of bundles (TEMPLATE READY ⏸ DISABLED)
 
 `.github/workflows/liff-deploy.yml` ready. **Disabled by default** — `workflow_dispatch` only until secrets provisioned + first manual dry-run verified.

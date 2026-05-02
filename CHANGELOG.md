@@ -2797,10 +2797,12 @@ Two-tier PHPUnit stack:
 | Suite | Tests | Speed |
 |---|---|---|
 | PHPUnit Unit + Integration | 161 | ~1 min |
-| Jest (17 files) | 136 | <1s |
+| Jest (43 files, post-Round 9 R3) | 1087 | <1s |
 | Playwright E2E (5 specs × 4 projects) | 88 | ~17s |
 | ESLint + tsc | 0 errors | <2s |
-| **Total** | **385** | |
+| **Total** | **1336** | |
+
+Round 9 R3 (2026-04-30) added 81 Jest tests across `liff-b2f-catalog-{router,api,loaders}.test.js` (22 + 19 + 40). Bundle `b2f-catalog.<hash>.js` 29.39 KB to 44.09 KB JS (+14.7 KB) for full SPA navigation surface. See `docs/runbooks/PHASE-2-VITE-MIGRATION.md` Step 2.5 Round 9 R3 for details.
 
 ---
 
