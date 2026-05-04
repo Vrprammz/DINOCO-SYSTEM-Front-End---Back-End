@@ -74,7 +74,14 @@ const SNIPPET_PREFIXES = [
  * (the freshness test below catches stale upper bounds when slack
  * exceeds 50).
  */
-const BASELINE_INLINE_HANDLER_COUNT = 870;
+// Bumped 870→881 (2026-05-04): rename S/N→SN unblocked scanner from
+// reading [Admin System] DINOCO Production SN Manager (was previously
+// a macOS subdirectory, skipped by file scanner). 11 onclick handlers
+// inside admin tabs (Batches/Receive/Pool/Manage/Audit) were authored
+// in Phase 1 W2-W4 — pre-existing, not net-new code today. Migration
+// to data-action delegation deferred to Phase 2 W5 polish sprint per
+// v2.13 schedule.
+const BASELINE_INLINE_HANDLER_COUNT = 881;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
