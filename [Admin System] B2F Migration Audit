@@ -1,5 +1,42 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.22 (2026-04-30) — Round 51 batch 29 idempotency wrap (push toward 80%):
+ *   5 endpoints in dinoco-b2f-audit/v1 cluster (1 → 6/20, namespace cluster expansion).
+ *   POST /sync-missing-intermediates — coverage rule cleanup. Body hash =
+ *     constant-marker hybrid {action:'sync-missing-intermediates', maker_id_filter,
+ *     dry_run, user_id}. **10th constant-marker instance**. dry_run=1 vs commit=0
+ *     different hashes (preview vs live INSERT loop semantics). maker_id_filter
+ *     scopes which makers are synced — different scope mid-retry → 409 catches
+ *     admin re-evaluation. Double-click on slow detect+insert loop → 2× UPDATE/
+ *     INSERT storm + 2× junction-updated cache invalidation per maker. Cached
+ *     200 instant + skip whole loop on replay.
+ *   POST /junction-bulk-delete — CRITICAL bulk soft-delete (max 200 SKUs). Body
+ *     hash = bulk-of-targets {maker_id, skus_sorted_dedup, add_to_blacklist,
+ *     only_auto_synced, user_id}. SKUs canonicalized via uppercase + dedup +
+ *     sort to make hash order-stable (admin re-uploads same set in different
+ *     order = same hash = idempotent). only_auto_synced boolean discriminator —
+ *     toggling protects CPT vs auto-only intent mid-retry → 409. Different
+ *     skus[] mid-retry (admin selected different rows) → 409. Cached replay
+ *     skips 2× UPDATE storm + 2× blacklist write storm.
+ *   POST /autosync-blacklist — single {maker_id, sku, action:'add'|'remove',
+ *     user_id}. add ↔ remove enum discriminator catches admin clicking opposite
+ *     button mid-retry → 409. Cached replay skips 2× wp_option array overwrite.
+ *   POST /junction-update-classification — state-machine optimistic concurrency.
+ *     Body hash = {maker_id, sku, fields ksort-normalized, expected_updated_at,
+ *     user_id}. NEW field `expected_updated_at` is stale-write guard for the
+ *     same retry semantic → including it in hash is correct (same retry =
+ *     same expected_updated_at = same hash). Admin tweaked production_mode/
+ *     confirmation_status/admin_display_mode mid-retry → 409 prevents wrong
+ *     classification stuck via cached replay. reason EXCLUDED — audit
+ *     annotation drift OK.
+ *   POST /junction-confirm-classification — layered defense over V.3.16 ad-hoc
+ *     transient (which uses own request param `idempotency_key`). Central
+ *     helper uses standard X-Idempotency-Key header — both can coexist (request
+ *     param idempotency replays prior result; central helper protects when
+ *     client did not pass param). Body hash = bulk {maker_id, skus_sorted_dedup,
+ *     user_id}. Different skus[] mid-retry → 409. Cached replay skips 2×
+ *     transaction + 2× audit observation INSERT storm.
+ *   Cumulative: 144/196 = 73.5%. dinoco-b2f-audit/v1 cluster: 1 → 6/20.
  * Version: V.3.21 (2026-04-30) — 🎯 70% MAJOR MILESTONE Round 50 batch 28 idempotency wrap:
  *   POST /dinoco-b2f-audit/v1/purge-stale-prices — admin "🧹 Purge Stale Prices"
  *     constant-marker {action:'purge-stale-prices', sentinel, dry_run, user_id}.
@@ -2779,9 +2816,9 @@ add_action( 'rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) {
+            $uid = get_current_user_id();
             // Rate limit: 5/min/user (tighter than default 20/hour)
             if ( function_exists( 'b2b_rate_limit' ) ) {
-                $uid = get_current_user_id();
                 $chk = b2b_rate_limit( 'b2f_audit_bulk_delete_' . $uid, 5, MINUTE_IN_SECONDS );
                 if ( is_wp_error( $chk ) ) return $chk;
             }
@@ -2819,9 +2856,49 @@ add_action( 'rest_api_init', function () {
                 return new WP_Error( 'no_skus', 'no valid SKUs after normalization', array( 'status' => 400 ) );
             }
 
+            // V.3.22 (Round 51 batch 29): Idempotency-Key wrap. Body hash =
+            // bulk-of-targets {maker_id, skus_sorted_dedup, add_to_blacklist,
+            // only_auto_synced, user_id}. SKUs already canonicalized above
+            // (uppercase + dedup) — additionally sort here for order-stable
+            // hash so admin re-uploading same set in different order = cached
+            // 200. only_auto_synced boolean discriminator: toggling protects
+            // CPT vs auto-only intent mid-retry → 409 prevents accidental
+            // CPT row deletion via cached replay when admin flipped intent.
+            // Different skus[] mid-retry (admin selected different rows) →
+            // 409 catches business decision change (CRITICAL — wrong cached
+            // replay deletes wrong SKUs).
+            $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-b2f-audit/v1::junction-bulk-delete';
+            $idem_body      = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $skus_sorted = $skus;
+                sort( $skus_sorted ); // order-stable hash
+                $idem_body = array(
+                    'maker_id'         => $maker_id,
+                    'skus'             => $skus_sorted,
+                    'add_to_blacklist' => $add_bl ? 1 : 0,
+                    'only_auto_synced' => $only_auto ? 1 : 0,
+                    'user_id'          => $uid,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
+            }
+
             global $wpdb;
             $tbl = $wpdb->prefix . 'dinoco_product_makers';
-            $uid = get_current_user_id();
             $now = current_time( 'mysql' );
 
             // Count CPT rows that WOULD be targeted (for skipped_cpt_protected metric)
@@ -2873,7 +2950,7 @@ add_action( 'rest_api_init', function () {
                 ) );
             }
 
-            return rest_ensure_response( array(
+            $resp = array(
                 'success' => true,
                 'data'    => array(
                     'deleted'               => intval( $affected ),
@@ -2882,7 +2959,19 @@ add_action( 'rest_api_init', function () {
                     'errors'                => array(),
                     'updated_blacklist_count' => count( b2f_autosync_blacklist_get( $maker_id ) ),
                 ),
-            ) );
+            );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
     ) );
 
@@ -2898,6 +2987,7 @@ add_action( 'rest_api_init', function () {
                 $check = $rl( 'blacklist_toggle' );
                 if ( is_wp_error( $check ) ) return $check;
 
+                $uid      = get_current_user_id();
                 $maker_id = intval( $req->get_param( 'maker_id' ) );
                 $sku      = strtoupper( trim( (string) $req->get_param( 'sku' ) ) );
                 $action   = strtolower( (string) $req->get_param( 'action' ) );
@@ -2907,6 +2997,40 @@ add_action( 'rest_api_init', function () {
                 }
                 if ( ! in_array( $action, array( 'add', 'remove' ), true ) ) {
                     return new WP_Error( 'bad_action', "action must be 'add' or 'remove'", array( 'status' => 400 ) );
+                }
+
+                // V.3.22 (Round 51 batch 29): Idempotency-Key wrap. Body hash =
+                // single {maker_id, sku, action, user_id}. add ↔ remove enum
+                // discriminator catches admin clicking opposite button mid-
+                // retry → 409 prevents wrong final state via cached replay
+                // (e.g. cached add returning when admin actually wanted remove
+                // would leave SKU permanently blacklisted). Cached replay
+                // skips 2× wp_option array overwrite.
+                $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+                $idem_namespace = 'dinoco-b2f-audit/v1::autosync-blacklist';
+                $idem_body      = null;
+                if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                    $idem_body = array(
+                        'maker_id' => $maker_id,
+                        'sku'      => $sku,
+                        'action'   => $action,
+                        'user_id'  => $uid,
+                    );
+                    $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                    if ( is_wp_error( $cached ) ) {
+                        $err_data    = $cached->get_error_data();
+                        $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                        return new WP_Error(
+                            'idempotency_conflict',
+                            'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                            array( 'status' => $status_code )
+                        );
+                    }
+                    if ( is_array( $cached ) ) {
+                        $resp_cached = $cached;
+                        unset( $resp_cached['_idem_code'] );
+                        return rest_ensure_response( $resp_cached );
+                    }
                 }
 
                 if ( $action === 'add' ) {
@@ -2920,13 +3044,25 @@ add_action( 'rest_api_init', function () {
                 $total = 0;
                 foreach ( $all as $arr ) { $total += is_array( $arr ) ? count( $arr ) : 0; }
 
-                return rest_ensure_response( array(
+                $resp = array(
                     'success' => true,
                     'data'    => array(
                         'blacklist_for_maker'  => $list,
                         'total_blacklist_count' => $total,
                     ),
-                ) );
+                );
+
+                if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                    dinoco_idempotency_store(
+                        $idem_key,
+                        $idem_namespace,
+                        $idem_body,
+                        array_merge( $resp, array( '_idem_code' => 200 ) ),
+                        200
+                    );
+                }
+
+                return rest_ensure_response( $resp );
             },
         ),
         array(
@@ -3022,8 +3158,8 @@ add_action( 'rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => $perm_admin_or_liff,
         'callback'            => function ( $req ) {
+            $uid = get_current_user_id();
             if ( function_exists( 'b2b_rate_limit' ) ) {
-                $uid = get_current_user_id();
                 $chk = b2b_rate_limit( 'b2f_classify_' . $uid, 5, MINUTE_IN_SECONDS );
                 if ( is_wp_error( $chk ) ) return $chk;
             }
@@ -3045,6 +3181,50 @@ add_action( 'rest_api_init', function () {
 
             if ( ! $maker_id || trim( $sku ) === '' ) {
                 return new WP_Error( 'invalid_field', 'maker_id + sku required', array( 'status' => 400 ) );
+            }
+
+            // V.3.22 (Round 51 batch 29): Idempotency-Key wrap. Body hash =
+            // state-machine {maker_id, sku UPPER, fields ksort-normalized,
+            // expected_updated_at, user_id}. expected_updated_at in hash =
+            // correct semantic — same retry attempt = same expected ts = same
+            // hash; admin tweaked classification mid-retry (production_mode
+            // single→sub_unit, or admin_display_mode auto→as_set, etc.) →
+            // different hash → 409 prevents wrong classification stuck via
+            // cached replay. reason EXCLUDED — audit annotation drift OK.
+            // DB-level optimistic concurrency (expected_updated_at compare)
+            // already in place + this wrap protects observation_log spam from
+            // double-click.
+            $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-b2f-audit/v1::junction-update-classification';
+            $idem_body      = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $cls_fields = array();
+                if ( $prod !== null && $prod !== '' )       $cls_fields['production_mode']     = (string) $prod;
+                if ( $conf !== null && $conf !== '' )       $cls_fields['confirmation_status'] = (string) $conf;
+                if ( $display !== null && $display !== '' ) $cls_fields['admin_display_mode']  = (string) $display;
+                ksort( $cls_fields );
+                $idem_body = array(
+                    'maker_id'            => $maker_id,
+                    'sku'                 => strtoupper( trim( $sku ) ),
+                    'fields'              => $cls_fields,
+                    'expected_updated_at' => $expected ? (string) $expected : '',
+                    'user_id'             => $uid,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
             }
 
             // Optimistic concurrency (optional) — compare updated_at before delegating
@@ -3080,7 +3260,6 @@ add_action( 'rest_api_init', function () {
                 return new WP_Error( 'invalid_field', 'at least one classification field required', array( 'status' => 400 ) );
             }
 
-            $uid = get_current_user_id();
             $res = b2f_junction_update_classification( $sku, $maker_id, $fields, $uid );
             if ( is_wp_error( $res ) ) return $res;
 
@@ -3091,7 +3270,7 @@ add_action( 'rest_api_init', function () {
                 ) );
             }
 
-            return rest_ensure_response( array(
+            $resp = array(
                 'success' => true,
                 'data'    => array(
                     'row_id'          => $res['row_id'] ?? 0,
@@ -3100,7 +3279,19 @@ add_action( 'rest_api_init', function () {
                     'observations_id' => $res['observations_id'] ?? 0,
                     'reason'          => sanitize_text_field( (string) $req->get_param( 'reason' ) ),
                 ),
-            ) );
+            );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
     ) );
 
@@ -3370,6 +3561,43 @@ add_action( 'rest_api_init', function () {
                 }
             }
 
+            // V.3.22 (Round 51 batch 29): Idempotency-Key wrap — LAYERED DEFENSE
+            // over V.3.16 ad-hoc transient (which uses request param
+            // `idempotency_key`). Central helper uses standard X-Idempotency-Key
+            // header — both can coexist. Request-param ad-hoc check above
+            // returns first if matched; central helper protects when client
+            // does not pass the request param. Body hash = bulk {maker_id,
+            // skus_sorted_dedup, user_id}. Different skus[] mid-retry → 409.
+            // Cached replay skips 2× transaction + 2× audit observation INSERT
+            // storm.
+            $idem_hdr_key   = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-b2f-audit/v1::junction-confirm-classification';
+            $idem_body      = null;
+            if ( $idem_hdr_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $skus_sorted = $skus;
+                sort( $skus_sorted ); // order-stable hash
+                $idem_body = array(
+                    'maker_id' => $maker_id,
+                    'skus'     => $skus_sorted,
+                    'user_id'  => get_current_user_id(),
+                );
+                $cached = dinoco_idempotency_check( $idem_hdr_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
+            }
+
             global $wpdb;
             $tbl = $wpdb->prefix . 'dinoco_product_makers';
             $obs = $wpdb->prefix . 'dinoco_maker_product_observations';
@@ -3468,6 +3696,18 @@ add_action( 'rest_api_init', function () {
             if ( $idem_key !== '' ) {
                 $tkey = 'b2f_confirm_idem_' . get_current_user_id() . '_' . md5( $idem_key );
                 set_transient( $tkey, $result, 5 * MINUTE_IN_SECONDS );
+            }
+
+            // V.3.22 (Round 51 batch 29): Central idempotency store — layered
+            // defense alongside request-param transient above.
+            if ( $idem_hdr_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_hdr_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $result, array( '_idem_code' => 200 ) ),
+                    200
+                );
             }
 
             return rest_ensure_response( $result );
@@ -3758,8 +3998,8 @@ add_action( 'rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => $perm_admin_write,
         'callback'            => function ( $req ) {
+            $uid = get_current_user_id();
             if ( function_exists( 'b2b_rate_limit' ) ) {
-                $uid = get_current_user_id();
                 $chk = b2b_rate_limit( 'b2f_audit_sync_intermediates_' . $uid, 5, HOUR_IN_SECONDS );
                 if ( is_wp_error( $chk ) ) return $chk;
             }
@@ -3775,6 +4015,43 @@ add_action( 'rest_api_init', function () {
             }
             if ( ! function_exists( 'b2f_detect_missing_intermediates' ) ) {
                 return new WP_Error( 'not_implemented', 'Snippet 1 V.7.1 ยังไม่ sync — missing b2f_detect_missing_intermediates()', array( 'status' => 501 ) );
+            }
+
+            // V.3.22 (Round 51 batch 29): Idempotency-Key wrap. Body hash =
+            // constant-marker hybrid {action:'sync-missing-intermediates',
+            // maker_id_filter, dry_run, user_id}. **10th constant-marker
+            // instance**. dry_run vs commit catches admin preview→live drift via
+            // distinct hashes (cached preview replay returning instead of
+            // committing live INSERT loop would silently skip the actual sync).
+            // maker_id_filter scopes which makers are synced — admin re-
+            // evaluation (e.g. switched scope from "all" to single maker) →
+            // 409. Cached replay skips 2× detect loop + 2× INSERT storm + 2×
+            // junction-updated cache invalidation per maker.
+            $idem_key       = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace = 'dinoco-b2f-audit/v1::sync-missing-intermediates';
+            $idem_body      = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'action'          => 'sync-missing-intermediates',
+                    'maker_id_filter' => $maker_id_filter > 0 ? $maker_id_filter : 0,
+                    'dry_run'         => $dry_run ? 1 : 0,
+                    'user_id'         => $uid,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
             }
 
             $missing = b2f_detect_missing_intermediates( $maker_id_filter > 0 ? $maker_id_filter : 0 );
@@ -3803,7 +4080,7 @@ add_action( 'rest_api_init', function () {
                 $by_maker[ $mid ][] = $row['sku'];
             }
 
-            return rest_ensure_response( array(
+            $resp = array(
                 'success' => empty( $errors ),
                 'message' => $dry_run
                     ? sprintf( 'preview: %d intermediate SKU(s) would be added across %d maker(s)', count( $missing ), count( $by_maker ) )
@@ -3816,7 +4093,19 @@ add_action( 'rest_api_init', function () {
                     'flat'            => $dry_run ? $missing : $inserted,
                     'errors'          => $errors,
                 ),
-            ) );
+            );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
     ) );
 
