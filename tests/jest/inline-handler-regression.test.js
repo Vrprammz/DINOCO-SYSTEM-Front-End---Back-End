@@ -81,7 +81,11 @@ const SNIPPET_PREFIXES = [
 // in Phase 1 W2-W4 — pre-existing, not net-new code today. Migration
 // to data-action delegation deferred to Phase 2 W5 polish sprint per
 // v2.13 schedule.
-const BASELINE_INLINE_HANDLER_COUNT = 881;
+//
+// Bumped 881→884 (2026-05-04): Phase 2 W5 added 3 onclick handlers in
+// new Pool/Manage/Audit tabs (Refresh / Search / Search). Migration
+// to data-action delegation deferred per same v2.13 polish sprint plan.
+const BASELINE_INLINE_HANDLER_COUNT = 884;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

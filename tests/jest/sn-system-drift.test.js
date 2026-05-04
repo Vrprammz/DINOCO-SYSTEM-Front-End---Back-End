@@ -84,6 +84,61 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         });
     });
 
+    test('Phase 2 W5 endpoints registered', () => {
+        const code = readSnippet('rest');
+        const expected_endpoints = [
+            "/pool-stats'",                        // GET heatmap
+            "/search'",                            // GET universal search
+            "/sn/(?P<sn>[A-Za-z0-9]+)'",           // GET detail card
+            "/audit'",                             // GET audit log
+            "/void'",                              // POST void
+            "/swap'",                              // POST swap
+        ];
+        expected_endpoints.forEach(ep => {
+            expect(code).toContain(ep);
+        });
+    });
+
+    test('Phase 2 W5 admin renders Pool/Manage/Audit tabs', () => {
+        const code = readSnippet('manager');
+        const renderers = [
+            'dinoco_sn_render_tab_pool',
+            'dinoco_sn_render_tab_manage',
+            'dinoco_sn_render_tab_audit',
+        ];
+        renderers.forEach(fn => expect(code).toContain(fn));
+    });
+
+    test('Phase 2 W5 JS handlers wired', () => {
+        const code = readSnippet('manager');
+        const handlers = [
+            'dncSnLoadPoolStats',
+            'dncSnDoSearch',
+            'dncSnOpenDetail',
+            'dncSnCloseDetail',
+            'dncSnVoidPrompt',
+            'dncSnLoadAudit',
+        ];
+        handlers.forEach(h => expect(code).toContain(h));
+    });
+
+    test('Phase 2 W5 swap uses GET_LOCK + atomic transaction', () => {
+        const code = readSnippet('rest');
+        expect(code).toContain('GET_LOCK');
+        expect(code).toContain('RELEASE_LOCK');
+        expect(code).toContain("'START TRANSACTION'");
+        expect(code).toContain("'ROLLBACK'");
+        expect(code).toContain("'COMMIT'");
+    });
+
+    test('Phase 2 W5 void enforces auto-tier (in_pool/reserved only)', () => {
+        const code = readSnippet('rest');
+        // tier matrix should reject registered/claimed status with 422
+        expect(code).toContain('requires_approval');
+        expect(code).toContain("'in_pool'");
+        expect(code).toContain("'reserved'");
+    });
+
     test('LIFF activate registers POST /activate endpoint', () => {
         const code = readSnippet('liff');
         expect(code).toContain("'/activate'");
