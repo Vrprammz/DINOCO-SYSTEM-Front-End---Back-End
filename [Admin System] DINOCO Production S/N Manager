@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production S/N Manager                   ║
+ * ║  Version: V.0.2 (2026-05-04) — Phase 1 W2 Day 3 hierarchy + helpers║
  * ║  Version: V.0.1 (2026-05-04) — Phase 1 W2 Foundation             ║
  * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
  * ║  Description: Schema lazy install + module registration for      ║
@@ -747,4 +748,235 @@ if ( ! function_exists( 'dinoco_sn_init_flags' ) ) {
 
 if ( ! has_action( 'init', 'dinoco_sn_init_flags' ) ) {
     add_action( 'init', 'dinoco_sn_init_flags', 5 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. HIERARCHY RESOLVER (V.0.2 — Phase 1 W2 Day 3)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * ตอบคำถาม: "1 ชุด {SKU X} ต้องใช้ plate กี่ใบ + ที่ระดับไหน?"
+ *
+ * ตามที่บอสยกตัวอย่าง:
+ *   DNC4537SETGNDPRO002 (sn_attach_level=leaf) → 4 plates (1 ต่อ leaf)
+ *   DNCSETNX500EIRNB    (sn_attach_level=child) → 2 plates (children, ข้าม grandchildren)
+ *   SET-level                                   → 1 plate ที่ SET เอง
+ *   SKU sn_attach_level=none                    → 0 plates
+ *
+ * Pattern: V.7.1 fix C2 — value-copy $visited per branch + array_unique dedup (DD-3 safe)
+ */
+
+if ( ! function_exists( 'dinoco_sn_required_plates_for_sku' ) ) {
+    /**
+     * Compute plate requirement for a SKU at given quantity.
+     *
+     * @param string $sku SKU to compute (case-sensitive, will UPPER)
+     * @param int    $qty Quantity ordered (default 1)
+     * @return array Array of { sku, qty } pairs OR [] if no plates needed
+     *
+     * Examples:
+     *   dinoco_sn_required_plates_for_sku('DNC4537SETGNDPRO002', 1)
+     *   → [
+     *       ['sku' => 'DNCGND45L002',    'qty' => 1],
+     *       ['sku' => 'DNCGNDPROS500',  'qty' => 1],
+     *       ['sku' => 'DNCGNDPROT500',  'qty' => 1],
+     *       ['sku' => 'DNCGND37LS',      'qty' => 1],
+     *     ]
+     *
+     *   dinoco_sn_required_plates_for_sku('DNCSETNX500EIRNB', 2)
+     *   → [
+     *       ['sku' => 'DNCNX500E002IRONB', 'qty' => 2],
+     *       ['sku' => 'DNCNX500001IRONB',  'qty' => 2],
+     *     ]
+     */
+    function dinoco_sn_required_plates_for_sku( $sku, $qty = 1 ) {
+        $sku = strtoupper( trim( (string) $sku ) );
+        $qty = max( 1, (int) $qty );
+
+        if ( $sku === '' ) return array();
+
+        // Read sn_attach_level from wp_dinoco_products (Phase 1 W2 ALTER)
+        $attach_level = dinoco_sn_get_attach_level_for_sku( $sku );
+        $sn_qty_per_unit = dinoco_sn_get_qty_per_unit_for_sku( $sku );
+
+        if ( $attach_level === 'none' || $attach_level === '' ) {
+            return array();
+        }
+
+        if ( $attach_level === 'set' ) {
+            // Single plate at SET level
+            return array(
+                array(
+                    'sku' => $sku,
+                    'qty' => $qty * max( 1, $sn_qty_per_unit ),
+                ),
+            );
+        }
+
+        // 'child' or 'leaf' — walk down hierarchy
+        $target_level = ( $attach_level === 'child' ) ? 'child' : 'leaf';
+        $relations = get_option( 'dinoco_sku_relations', array() );
+        if ( ! is_array( $relations ) || empty( $relations ) ) {
+            return array();
+        }
+
+        $nodes = dinoco_sn_walk_to_level( $sku, $target_level, $relations );
+        if ( empty( $nodes ) ) return array();
+
+        // Apply qty multiplier
+        $result = array();
+        $seen = array(); // DD-3: shared leaf may appear under multiple parents — dedup
+        foreach ( $nodes as $node ) {
+            $node_sku = $node['sku'];
+            if ( isset( $seen[ $node_sku ] ) ) continue; // dedup (V.7.1 array_unique pattern)
+            $seen[ $node_sku ] = true;
+            $result[] = array(
+                'sku' => $node_sku,
+                'qty' => $qty * max( 1, (int) $node['qty_per_set'] ),
+            );
+        }
+
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_walk_to_level' ) ) {
+    /**
+     * Recursive walk from $start_sku down to nodes at $target_level.
+     *
+     * V.7.1 C2 fix pattern: pass $visited by VALUE per branch (NOT reference)
+     * to prevent DD-3 shared-child detection loss.
+     *
+     * @param string $start_sku    Starting SKU
+     * @param string $target_level 'child' or 'leaf'
+     * @param array  $relations    dinoco_sku_relations wp_option
+     * @param array  $visited      (internal) circular-ref guard, value-copy per branch
+     * @param int    $depth        (internal) max depth 3
+     * @return array Array of { sku, qty_per_set, level }
+     */
+    function dinoco_sn_walk_to_level( $start_sku, $target_level, $relations, $visited = array(), $depth = 0 ) {
+        if ( $depth > 3 ) return array(); // DD-4 max depth guard
+        if ( in_array( $start_sku, $visited, true ) ) return array(); // circular ref
+
+        // value-copy $visited per branch (V.7.1 critical)
+        $visited[] = $start_sku;
+
+        $children = isset( $relations[ $start_sku ] ) ? $relations[ $start_sku ] : array();
+        if ( empty( $children ) ) {
+            // Leaf reached
+            if ( $target_level === 'leaf' ) {
+                return array(
+                    array( 'sku' => $start_sku, 'qty_per_set' => 1, 'level' => 'leaf' ),
+                );
+            }
+            return array();
+        }
+
+        $results = array();
+        foreach ( $children as $child_sku ) {
+            $child_sku = strtoupper( trim( (string) $child_sku ) );
+            if ( $child_sku === '' ) continue;
+
+            // Determine if this child is at the target level
+            $child_has_grandchildren = ! empty( $relations[ $child_sku ] ?? array() );
+
+            if ( $target_level === 'child' && $child_has_grandchildren ) {
+                // child level + has grandchildren = stop here (don't walk deeper)
+                $results[] = array( 'sku' => $child_sku, 'qty_per_set' => 1, 'level' => 'child' );
+            } elseif ( $target_level === 'child' && ! $child_has_grandchildren ) {
+                // child level + no grandchildren = treat as child anyway
+                $results[] = array( 'sku' => $child_sku, 'qty_per_set' => 1, 'level' => 'child' );
+            } elseif ( $target_level === 'leaf' && ! $child_has_grandchildren ) {
+                // leaf level + this is leaf
+                $results[] = array( 'sku' => $child_sku, 'qty_per_set' => 1, 'level' => 'leaf' );
+            } elseif ( $target_level === 'leaf' && $child_has_grandchildren ) {
+                // leaf level + child has grandchildren = recurse
+                $sub = dinoco_sn_walk_to_level( $child_sku, 'leaf', $relations, $visited, $depth + 1 );
+                $results = array_merge( $results, $sub );
+            }
+        }
+
+        return $results;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_attach_level_for_sku' ) ) {
+    /**
+     * Read sn_attach_level from wp_dinoco_products. Returns 'none' if SKU
+     * not found or column doesn't exist (graceful before ALTER applied).
+     */
+    function dinoco_sn_get_attach_level_for_sku( $sku ) {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_products';
+
+        // Check column exists (defensive — ALTER may not have applied yet)
+        static $column_exists = null;
+        if ( $column_exists === null ) {
+            $column_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                DB_NAME, $tbl, 'sn_attach_level'
+            ) );
+        }
+        if ( ! $column_exists ) return 'none';
+
+        $val = $wpdb->get_var( $wpdb->prepare(
+            "SELECT sn_attach_level FROM {$tbl} WHERE sku = %s",
+            strtoupper( $sku )
+        ) );
+
+        return $val ?: 'none';
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_qty_per_unit_for_sku' ) ) {
+    function dinoco_sn_get_qty_per_unit_for_sku( $sku ) {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_products';
+
+        static $column_exists = null;
+        if ( $column_exists === null ) {
+            $column_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                DB_NAME, $tbl, 'sn_qty_per_unit'
+            ) );
+        }
+        if ( ! $column_exists ) return 1;
+
+        $val = $wpdb->get_var( $wpdb->prepare(
+            "SELECT sn_qty_per_unit FROM {$tbl} WHERE sku = %s",
+            strtoupper( $sku )
+        ) );
+
+        return $val ? max( 1, (int) $val ) : 1;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_set_attach_level' ) ) {
+    /**
+     * Update sn_attach_level + sn_required + sn_qty_per_unit per SKU.
+     * Used by Admin Inventory UI (Phase 1 W3) when admin configures SKU.
+     */
+    function dinoco_sn_set_attach_level( $sku, $level, $required = false, $qty_per_unit = 1 ) {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_products';
+
+        $sku = strtoupper( trim( (string) $sku ) );
+        $level = in_array( $level, array( 'set', 'child', 'leaf', 'none' ), true ) ? $level : 'none';
+        $required = $required ? 1 : 0;
+        $qty_per_unit = max( 1, min( 99, (int) $qty_per_unit ) );
+
+        $ok = $wpdb->update( $tbl,
+            array(
+                'sn_attach_level' => $level,
+                'sn_required'     => $required,
+                'sn_qty_per_unit' => $qty_per_unit,
+            ),
+            array( 'sku' => $sku ),
+            array( '%s', '%d', '%d' ),
+            array( '%s' )
+        );
+
+        return $ok !== false;
+    }
 }

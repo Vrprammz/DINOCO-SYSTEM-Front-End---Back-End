@@ -1,0 +1,716 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [System] DINOCO Warranty Activation LIFF                        ║
+ * ║  Version: V.0.1 (2026-05-04) — Phase 1 W2 Day 5 Foundation       ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
+ * ║  Description: Customer-facing LIFF page for warranty activation  ║
+ * ║    via QR scan. Reuses existing LINE OAuth pattern from           ║
+ * ║    [dinoco_login_button] (D11 v2.3 fix — no new JWT system).     ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md (v2.13)
+ * Wireframe: docs/sn-system/01-system-architecture.md (Path 1)
+ * State: docs/sn-system/02-state-machine.md
+ *
+ * Shortcode: [dinoco_warranty_activate]
+ * URL: /warranty/activate?sn=DNCSS0001234
+ *
+ * UX Flow (per v2.0 §B.4 Page 6):
+ *   State A: Initial scan/landing — show product info from /lookup/{sn}
+ *   State B: Form — moto brand/model + receipt photo
+ *   State C: Success — warranty period + LINE Flex push
+ *   State D: Already registered — show owner info + transfer flow
+ *   State E: Not yet shipped — "ติดต่อร้าน" + investigation ticket
+ *
+ * Auth (D11 fix from v2.3 fullstack-developer review):
+ *   - NO new JWT system
+ *   - Reuse [dinoco_login_button] LINE OAuth → WP user → wp_get_current_user
+ *   - Activate flow uses is_user_logged_in() + wp_create_nonce('wp_rest')
+ *
+ * Phase 1 W2 Day 5 scope:
+ *   ✓ Shortcode registration
+ *   ✓ Scan landing page (states A/D/E)
+ *   ✓ POST /activate endpoint (handler + lookup form)
+ *   ✗ Form submission UX (Phase 1 W3 polish)
+ *   ✗ Receipt OCR validation (Phase 3 W8)
+ *   ✗ Multi-plate "include_set_siblings" (Phase 1 W3)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. SHORTCODE REGISTRATION
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! shortcode_exists( 'dinoco_warranty_activate' ) ) {
+    add_shortcode( 'dinoco_warranty_activate', 'dinoco_sn_render_warranty_activate' );
+}
+
+if ( ! function_exists( 'dinoco_sn_render_warranty_activate' ) ) {
+    function dinoco_sn_render_warranty_activate( $atts = array() ) {
+        // Feature flag check
+        if ( function_exists( 'dinoco_sn_is_enabled' ) && ! dinoco_sn_is_enabled() ) {
+            return '<div class="dnc-sn-disabled" style="text-align:center;padding:50px;">
+                <h3>ระบบยังไม่เปิดให้บริการ</h3>
+                <p>กรุณาลองใหม่อีกครั้ง</p>
+            </div>';
+        }
+
+        $sn = isset( $_GET['sn'] ) ? strtoupper( trim( sanitize_text_field( $_GET['sn'] ) ) ) : '';
+
+        ob_start();
+        ?>
+        <div class="dnc-sn-activate-page">
+            <?php
+            // Render styles
+            dinoco_sn_render_activate_styles();
+
+            // No SN param → show landing
+            if ( $sn === '' ) {
+                dinoco_sn_render_activate_landing();
+            } else {
+                // Validate SN format (preliminary check before API call)
+                if ( ! preg_match( '/^[A-Z0-9]{8,16}$/', $sn ) ) {
+                    dinoco_sn_render_activate_error( 'invalid_sn_format', 'รูปแบบ S/N ไม่ถูกต้อง' );
+                } else {
+                    dinoco_sn_render_activate_form( $sn );
+                }
+            }
+            ?>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_activate_styles' ) ) {
+    function dinoco_sn_render_activate_styles() {
+        static $rendered = false;
+        if ( $rendered ) return;
+        $rendered = true;
+        ?>
+        <style>
+            .dnc-sn-activate-page {
+                max-width: 480px;
+                margin: 0 auto;
+                padding: 16px;
+                font-family: 'Sarabun', 'Noto Sans Thai', -apple-system, sans-serif;
+                color: #111827;
+                line-height: 1.6;
+            }
+            .dnc-sn-card {
+                background: white;
+                border-radius: 12px;
+                padding: 20px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+                margin-bottom: 16px;
+            }
+            .dnc-sn-product-image {
+                width: 100%;
+                max-width: 280px;
+                height: auto;
+                border-radius: 8px;
+                margin: 0 auto 16px;
+                display: block;
+                background: #f3f4f6;
+            }
+            .dnc-sn-product-name {
+                font-size: 18px;
+                font-weight: bold;
+                margin: 12px 0 4px;
+                text-align: center;
+            }
+            .dnc-sn-sn-display {
+                font-family: 'JetBrains Mono', 'Roboto Mono', monospace;
+                background: #f3f4f6;
+                padding: 8px 12px;
+                border-radius: 6px;
+                text-align: center;
+                margin: 12px 0;
+                font-size: 16px;
+                letter-spacing: 1px;
+            }
+            .dnc-sn-status-badge {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 12px;
+                font-weight: bold;
+                margin: 0 4px;
+            }
+            .dnc-sn-status-in-pool { background: #dbeafe; color: #1e40af; }
+            .dnc-sn-status-registered { background: #d1fae5; color: #065f46; }
+            .dnc-sn-status-voided { background: #fee2e2; color: #991b1b; }
+
+            .dnc-sn-btn {
+                display: block;
+                width: 100%;
+                padding: 14px;
+                border-radius: 8px;
+                border: none;
+                font-size: 16px;
+                font-weight: bold;
+                cursor: pointer;
+                margin: 8px 0;
+                min-height: 44px;
+            }
+            .dnc-sn-btn-primary {
+                background: #10b981;
+                color: white;
+            }
+            .dnc-sn-btn-primary:hover { background: #059669; }
+            .dnc-sn-btn-secondary {
+                background: #f3f4f6;
+                color: #1f2937;
+            }
+            .dnc-sn-btn-disabled {
+                background: #e5e7eb;
+                color: #9ca3af;
+                cursor: not-allowed;
+            }
+
+            .dnc-sn-form-field {
+                margin: 16px 0;
+            }
+            .dnc-sn-form-field label {
+                display: block;
+                font-weight: bold;
+                margin-bottom: 6px;
+                font-size: 14px;
+            }
+            .dnc-sn-form-field input,
+            .dnc-sn-form-field select {
+                width: 100%;
+                padding: 12px;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                font-size: 16px;
+                box-sizing: border-box;
+                min-height: 44px;
+            }
+            .dnc-sn-error-banner {
+                background: #fee2e2;
+                color: #991b1b;
+                padding: 16px;
+                border-radius: 8px;
+                margin: 16px 0;
+                border-left: 4px solid #dc2626;
+            }
+            .dnc-sn-success-banner {
+                background: #d1fae5;
+                color: #065f46;
+                padding: 16px;
+                border-radius: 8px;
+                margin: 16px 0;
+                border-left: 4px solid #10b981;
+            }
+            .dnc-sn-info-banner {
+                background: #dbeafe;
+                color: #1e40af;
+                padding: 16px;
+                border-radius: 8px;
+                margin: 16px 0;
+            }
+            @media (max-width: 480px) {
+                .dnc-sn-activate-page { padding: 12px; }
+                .dnc-sn-card { padding: 16px; }
+            }
+        </style>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_activate_landing' ) ) {
+    function dinoco_sn_render_activate_landing() {
+        ?>
+        <div class="dnc-sn-card">
+            <h2 style="text-align:center;">🛡 ลงทะเบียนรับประกัน</h2>
+            <p style="text-align:center;color:#6b7280;">
+                สแกน QR บนเพลทสินค้าหรือพิมพ์ S/N เพื่อลงทะเบียน
+            </p>
+            <button class="dnc-sn-btn dnc-sn-btn-primary" onclick="dncSnStartScan()">
+                📷 สแกน QR
+            </button>
+            <p style="text-align:center;margin-top:16px;font-size:14px;color:#9ca3af;">หรือ</p>
+            <div class="dnc-sn-form-field">
+                <label>พิมพ์ S/N เอง</label>
+                <input type="text" id="dnc-sn-manual-input"
+                       placeholder="เช่น DNCSS0001234"
+                       style="text-transform:uppercase;font-family:monospace;">
+            </div>
+            <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                    onclick="dncSnSubmitManual()">
+                ยืนยัน S/N
+            </button>
+        </div>
+        <script>
+        function dncSnStartScan() {
+            // Phase 1 W3 will integrate html5-qrcode lazy load
+            alert('Scanner กำลังพัฒนา — ใช้ "พิมพ์ S/N เอง" ไปก่อน');
+        }
+        function dncSnSubmitManual() {
+            var input = document.getElementById('dnc-sn-manual-input');
+            var sn = (input.value || '').toUpperCase().trim();
+            if (!sn.match(/^[A-Z0-9]{8,16}$/)) {
+                alert('รูปแบบ S/N ไม่ถูกต้อง');
+                return;
+            }
+            window.location.href = window.location.pathname + '?sn=' + encodeURIComponent(sn);
+        }
+        </script>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_activate_form' ) ) {
+    function dinoco_sn_render_activate_form( $sn ) {
+        // Lookup plate via REST
+        $rest_url = rest_url( 'dinoco-sn/v1/lookup/' . urlencode( $sn ) );
+        $response = wp_remote_get( $rest_url, array( 'timeout' => 5 ) );
+
+        if ( is_wp_error( $response ) ) {
+            dinoco_sn_render_activate_error( 'lookup_failed', 'ไม่สามารถดึงข้อมูล S/N ได้ ลองอีกครั้ง' );
+            return;
+        }
+
+        $code = wp_remote_retrieve_response_code( $response );
+        $body = json_decode( wp_remote_retrieve_body( $response ), true );
+
+        if ( $code === 404 ) {
+            dinoco_sn_render_activate_error( 'sn_not_found', 'ไม่พบ S/N นี้ในระบบ' );
+            return;
+        }
+
+        if ( $code === 410 ) {
+            dinoco_sn_render_activate_error( 'voided', 'เพลทถูกยกเลิก กรุณาทิ้งทันที' );
+            return;
+        }
+
+        if ( ! is_array( $body ) ) {
+            dinoco_sn_render_activate_error( 'system_error', 'ระบบขัดข้อง กรุณาลองใหม่' );
+            return;
+        }
+
+        $status = $body['status'] ?? '';
+        $linked_sku = $body['product']['linked_sku'] ?? '';
+        $top_set = $body['product']['top_set_sku'] ?? $linked_sku;
+
+        // State D: Already registered
+        if ( in_array( $status, array( 'registered', 'claimed', 'transferred' ), true ) ) {
+            dinoco_sn_render_state_already_registered( $sn, $body );
+            return;
+        }
+
+        // State E: Not in_pool yet (still reserved/sent_to_factory etc.)
+        if ( $status !== 'in_pool' && $status !== 'shipped_legacy' ) {
+            dinoco_sn_render_state_not_yet_shipped( $sn, $status );
+            return;
+        }
+
+        // State A/B: Ready to activate
+        ?>
+        <div class="dnc-sn-card">
+            <h2 style="text-align:center;">🛡 ลงทะเบียนรับประกัน</h2>
+
+            <?php if ( $linked_sku ) : ?>
+                <?php
+                // Try fetch product image (defensive — function from Inventory snippet)
+                $img_url = '';
+                if ( class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'get_by_sku' ) ) {
+                    $product = DINOCO_Catalog::get_by_sku( $top_set ?: $linked_sku );
+                    if ( $product && ! empty( $product->image_url ) ) {
+                        $img_url = $product->image_url;
+                    }
+                }
+                ?>
+                <?php if ( $img_url ) : ?>
+                    <img src="<?php echo esc_url( $img_url ); ?>"
+                         class="dnc-sn-product-image" alt="">
+                <?php endif; ?>
+                <p class="dnc-sn-product-name">
+                    <?php
+                    $product_name = '';
+                    if ( isset( $product ) && $product ) {
+                        $product_name = $product->name ?? '';
+                    }
+                    echo esc_html( $product_name ?: $top_set );
+                    ?>
+                </p>
+            <?php endif; ?>
+
+            <div class="dnc-sn-sn-display">
+                S/N: <?php echo esc_html( $sn ); ?>
+            </div>
+            <p style="text-align:center;">
+                <span class="dnc-sn-status-badge dnc-sn-status-in-pool">🟢 พร้อมลงทะเบียน</span>
+            </p>
+
+            <?php if ( ! is_user_logged_in() ) : ?>
+                <div class="dnc-sn-info-banner">
+                    <p>กรุณา login ด้วย LINE ก่อนลงทะเบียน</p>
+                </div>
+                <?php
+                // Reuse existing LINE login button — preserve sn param via state
+                $return_url = add_query_arg( 'sn', $sn, get_permalink() );
+                ?>
+                <a href="<?php echo esc_url( wp_login_url( $return_url ) ); ?>"
+                   class="dnc-sn-btn dnc-sn-btn-primary"
+                   style="text-decoration:none;text-align:center;display:block;">
+                    📱 Login ด้วย LINE
+                </a>
+            <?php else : ?>
+                <?php dinoco_sn_render_register_form( $sn, $linked_sku, $top_set ); ?>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_register_form' ) ) {
+    function dinoco_sn_render_register_form( $sn, $linked_sku, $top_set ) {
+        $current_user = wp_get_current_user();
+        $nonce = wp_create_nonce( 'wp_rest' );
+        ?>
+        <form id="dnc-sn-activate-form">
+            <input type="hidden" name="sn" value="<?php echo esc_attr( $sn ); ?>">
+            <input type="hidden" name="_wpnonce" value="<?php echo esc_attr( $nonce ); ?>">
+
+            <div class="dnc-sn-form-field">
+                <label>ยี่ห้อรถ *</label>
+                <select name="moto_brand" required>
+                    <option value="">เลือกยี่ห้อ</option>
+                    <?php
+                    // Try fetch from existing moto catalog
+                    if ( function_exists( 'dinoco_get_brands_list' ) ) {
+                        $brands = dinoco_get_brands_list();
+                        if ( is_array( $brands ) ) {
+                            foreach ( $brands as $brand ) {
+                                $name = is_object( $brand ) ? ( $brand->brand_name ?? '' ) : ( $brand['brand_name'] ?? '' );
+                                if ( $name ) {
+                                    echo '<option value="' . esc_attr( $name ) . '">' . esc_html( $name ) . '</option>';
+                                }
+                            }
+                        }
+                    }
+                    ?>
+                </select>
+            </div>
+
+            <div class="dnc-sn-form-field">
+                <label>รุ่นรถ *</label>
+                <input type="text" name="moto_model" required placeholder="เช่น XL750 Transalp">
+            </div>
+
+            <div class="dnc-sn-form-field">
+                <label>วันที่ซื้อ *</label>
+                <input type="date" name="purchase_date" required
+                       max="<?php echo esc_attr( date( 'Y-m-d' ) ); ?>">
+            </div>
+
+            <div class="dnc-sn-form-field">
+                <label>
+                    <input type="checkbox" name="pdpa_accepted" value="1" required>
+                    ยอมรับ PDPA และข้อตกลงการรับประกัน
+                </label>
+            </div>
+
+            <button type="submit" class="dnc-sn-btn dnc-sn-btn-primary">
+                ✓ ลงทะเบียนรับประกัน
+            </button>
+        </form>
+
+        <script>
+        document.getElementById('dnc-sn-activate-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            var form = e.target;
+            var btn = form.querySelector('button[type="submit"]');
+            btn.disabled = true;
+            btn.textContent = 'กำลังบันทึก...';
+
+            var data = {};
+            new FormData(form).forEach(function(v, k) { data[k] = v; });
+
+            fetch('<?php echo esc_js( rest_url( 'dinoco-sn/v1/activate' ) ); ?>', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-WP-Nonce': data._wpnonce,
+                    'X-Idempotency-Key': crypto.randomUUID()
+                },
+                body: JSON.stringify(data),
+                credentials: 'same-origin'
+            })
+            .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, body: j }; }); })
+            .then(function(res) {
+                if (res.ok) {
+                    document.querySelector('.dnc-sn-card').innerHTML =
+                        '<div style="text-align:center;padding:30px;">' +
+                        '<div style="font-size:64px;">🎉</div>' +
+                        '<h2>ลงทะเบียนสำเร็จ!</h2>' +
+                        '<p>สินค้าของคุณได้รับประกันแล้ว</p>' +
+                        '<p>หมายเลข Warranty: WR-' + (res.body.warranty_id || '') + '</p>' +
+                        '<a href="/dashboard" class="dnc-sn-btn dnc-sn-btn-primary" style="text-decoration:none;display:block;">ดู Dashboard</a>' +
+                        '</div>';
+                } else {
+                    btn.disabled = false;
+                    btn.textContent = '✓ ลงทะเบียนรับประกัน';
+                    alert(res.body.message || 'เกิดข้อผิดพลาด ลองใหม่อีกครั้ง');
+                }
+            })
+            .catch(function(err) {
+                btn.disabled = false;
+                btn.textContent = '✓ ลงทะเบียนรับประกัน';
+                alert('เกิดข้อผิดพลาด ลองใหม่อีกครั้ง');
+            });
+        });
+        </script>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_state_already_registered' ) ) {
+    function dinoco_sn_render_state_already_registered( $sn, $data ) {
+        ?>
+        <div class="dnc-sn-card">
+            <h2 style="text-align:center;">⚠️ ลงทะเบียนแล้ว</h2>
+            <div class="dnc-sn-sn-display">S/N: <?php echo esc_html( $sn ); ?></div>
+            <div class="dnc-sn-info-banner">
+                <p>เพลทนี้ลงทะเบียนแล้ว</p>
+                <?php if ( ! empty( $data['warranty']['is_owned_by_caller'] ) ) : ?>
+                    <p><strong>คุณเป็นเจ้าของ — สามารถดูได้ใน Dashboard</strong></p>
+                <?php else : ?>
+                    <p>หากคุณซื้อต่อจากเจ้าของเดิม สามารถขอโอนสิทธิ์ได้</p>
+                <?php endif; ?>
+            </div>
+            <?php if ( ! empty( $data['warranty']['is_owned_by_caller'] ) ) : ?>
+                <a href="/dashboard" class="dnc-sn-btn dnc-sn-btn-primary"
+                   style="text-decoration:none;display:block;text-align:center;">ดู Dashboard</a>
+            <?php else : ?>
+                <a href="/transfer-warranty?sn=<?php echo esc_attr( $sn ); ?>"
+                   class="dnc-sn-btn dnc-sn-btn-primary"
+                   style="text-decoration:none;display:block;text-align:center;">🔄 ขอโอนสิทธิ์</a>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_state_not_yet_shipped' ) ) {
+    function dinoco_sn_render_state_not_yet_shipped( $sn, $status ) {
+        ?>
+        <div class="dnc-sn-card">
+            <h2 style="text-align:center;">⚠️ ยังไม่พร้อมลงทะเบียน</h2>
+            <div class="dnc-sn-sn-display">S/N: <?php echo esc_html( $sn ); ?></div>
+            <div class="dnc-sn-info-banner">
+                <p>S/N นี้ยังอยู่ระหว่างการจัดส่ง</p>
+                <p><strong>สาเหตุที่เป็นไปได้:</strong></p>
+                <ul style="margin:8px 0 0 20px;">
+                    <li>คุณซื้อจากผู้ค้าที่ยังไม่ active</li>
+                    <li>S/N ถูกใช้ผิด</li>
+                </ul>
+                <p style="margin-top:12px;">เราจะแจ้งเตือนใน LINE เมื่อพร้อม</p>
+            </div>
+            <a href="https://line.me/R/oaMessage/@dinoco/?<?php echo urlencode( 'ขอสอบถาม S/N ' . $sn ); ?>"
+               class="dnc-sn-btn dnc-sn-btn-primary"
+               style="text-decoration:none;display:block;text-align:center;">💬 ติดต่อเจ้าหน้าที่</a>
+            <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                    onclick="window.location.reload()">🔄 ลองใหม่</button>
+        </div>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_activate_error' ) ) {
+    function dinoco_sn_render_activate_error( $code, $message ) {
+        ?>
+        <div class="dnc-sn-card">
+            <h2 style="text-align:center;">⚠️ ไม่สามารถดำเนินการได้</h2>
+            <div class="dnc-sn-error-banner">
+                <p><strong><?php echo esc_html( $message ); ?></strong></p>
+                <p style="margin-top:8px;font-size:12px;color:#6b7280;">รหัส: <?php echo esc_html( $code ); ?></p>
+            </div>
+            <a href="<?php echo esc_url( get_permalink() ); ?>"
+               class="dnc-sn-btn dnc-sn-btn-secondary"
+               style="text-decoration:none;display:block;text-align:center;">← กลับ</a>
+        </div>
+        <?php
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. POST /activate ENDPOINT (registers in REST namespace)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_register_activate_endpoint' ) ) {
+    function dinoco_sn_register_activate_endpoint() {
+        register_rest_route( 'dinoco-sn/v1', '/activate', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_activate',
+            'permission_callback' => function() {
+                return is_user_logged_in();
+            },
+            'args' => array(
+                'sn' => array( 'required' => true, 'type' => 'string' ),
+                'moto_brand' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'moto_model' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'purchase_date' => array( 'required' => true, 'type' => 'string' ),
+                'pdpa_accepted' => array( 'required' => true ),
+            ),
+        ) );
+    }
+}
+
+if ( ! has_action( 'rest_api_init', 'dinoco_sn_register_activate_endpoint' ) ) {
+    add_action( 'rest_api_init', 'dinoco_sn_register_activate_endpoint' );
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_activate' ) ) {
+    /**
+     * POST /dinoco-sn/v1/activate — customer activate warranty
+     *
+     * Atomic: SELECT FOR UPDATE on sn_pool + flip status=registered +
+     * INSERT warranty_registration CPT + INSERT audit row + LINE Flex push.
+     */
+    function dinoco_sn_rest_activate( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', '', array( 'status' => 503 ) );
+        }
+        if ( ! function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            // REST API snippet not synced — fall through
+            return dinoco_sn_handler_activate( $req );
+        }
+
+        return dinoco_sn_with_idempotency(
+            $req,
+            'activate',
+            array( 'sn', 'moto_brand', 'moto_model', 'purchase_date' ),
+            function( $req ) { return dinoco_sn_handler_activate( $req ); }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_activate' ) ) {
+    function dinoco_sn_handler_activate( $req ) {
+        global $wpdb;
+
+        $sn = strtoupper( trim( (string) $req->get_param( 'sn' ) ) );
+        $moto_brand = sanitize_text_field( $req->get_param( 'moto_brand' ) );
+        $moto_model = sanitize_text_field( $req->get_param( 'moto_model' ) );
+        $purchase_date = sanitize_text_field( $req->get_param( 'purchase_date' ) );
+        $pdpa = (bool) $req->get_param( 'pdpa_accepted' );
+        $user_id = get_current_user_id();
+
+        if ( $sn === '' || $moto_brand === '' || $moto_model === '' || $purchase_date === '' ) {
+            return new WP_Error( 'invalid_input', __( 'Missing required fields.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( ! $pdpa ) {
+            return new WP_Error( 'pdpa_required', __( 'ต้องยอมรับ PDPA.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( $user_id <= 0 ) {
+            return new WP_Error( 'not_logged_in', '', array( 'status' => 401 ) );
+        }
+
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+        }
+
+        $tbl_pool = dinoco_sn_table( 'pool' );
+
+        try {
+            $wpdb->query( "START TRANSACTION" );
+
+            $plate = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$tbl_pool} WHERE sn = %s FOR UPDATE", $sn
+            ) );
+
+            if ( ! $plate ) {
+                $wpdb->query( "ROLLBACK" );
+                return new WP_Error( 'sn_not_found', '', array( 'status' => 404 ) );
+            }
+
+            if ( in_array( $plate->status, array( 'registered', 'claimed', 'transferred' ), true ) ) {
+                $wpdb->query( "ROLLBACK" );
+                return new WP_Error( 'already_registered', __( 'S/N นี้ลงทะเบียนแล้ว', 'dinoco-sn' ),
+                    array( 'status' => 409 ) );
+            }
+
+            if ( ! in_array( $plate->status, array( 'in_pool', 'shipped_legacy' ), true ) ) {
+                $wpdb->query( "ROLLBACK" );
+                return new WP_Error( 'not_ready', __( 'S/N ยังไม่พร้อมลงทะเบียน', 'dinoco-sn' ),
+                    array( 'status' => 403 ) );
+            }
+
+            // Create warranty_registration CPT
+            $warranty_id = wp_insert_post( array(
+                'post_type'   => 'warranty_registration',
+                'post_status' => 'publish',
+                'post_title'  => 'Warranty ' . $sn,
+                'post_author' => $user_id,
+            ) );
+
+            if ( ! $warranty_id || is_wp_error( $warranty_id ) ) {
+                throw new \Exception( 'Failed to create warranty_registration CPT' );
+            }
+
+            // ACF fields (defensive — use update_post_meta if ACF not loaded)
+            $meta_fields = array(
+                'serial_code'   => $sn,
+                'sn_pool_id'    => $sn,
+                'sn_batch_id'   => $plate->batch_id,
+                'brand'         => $moto_brand,
+                'model'         => $moto_model,
+                'purchase_date' => $purchase_date,
+                'owner_user_id' => $user_id,
+                'w_status'      => 'warranty_on',
+            );
+            foreach ( $meta_fields as $k => $v ) {
+                update_post_meta( $warranty_id, $k, $v );
+            }
+
+            // Update sn_pool
+            $now = current_time( 'mysql' );
+            $wpdb->update( $tbl_pool, array(
+                'status'                 => 'registered',
+                'prev_status'            => $plate->status,
+                'registered_user_id'     => $user_id,
+                'registered_warranty_id' => $warranty_id,
+                'registered_at'          => $now,
+            ), array( 'sn' => $sn ),
+               array( '%s', '%s', '%d', '%d', '%s' ),
+               array( '%s' )
+            );
+
+            $wpdb->query( "COMMIT" );
+
+            // Audit log
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                dinoco_sn_audit_log( $sn, 'plate_registered', $plate->status, 'registered', array(
+                    'warranty_id' => $warranty_id,
+                    'user_id'     => $user_id,
+                    'moto'        => "{$moto_brand} {$moto_model}",
+                ), $user_id );
+            }
+
+            // Invalidate lookup cache
+            delete_transient( 'dinoco_sn_lookup_' . md5( $sn ) );
+
+            // LINE Flex push (deferred async per v2.4 performance fix)
+            // wp_schedule_single_event( time() + 5, 'dinoco_sn_push_activate_flex', array( $sn, $user_id ) );
+
+            return rest_ensure_response( array(
+                'success'     => true,
+                'sn'          => $sn,
+                'warranty_id' => $warranty_id,
+                'status'      => 'registered',
+                'registered_at' => $now,
+            ) );
+
+        } catch ( \Throwable $e ) {
+            $wpdb->query( "ROLLBACK" );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_activate', 'sn' => $sn ) );
+            }
+            return new WP_Error( 'activate_failed', $e->getMessage(), array( 'status' => 500 ) );
+        }
+    }
+}
