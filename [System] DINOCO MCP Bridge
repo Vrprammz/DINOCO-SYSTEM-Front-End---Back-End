@@ -1,6 +1,7 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.2.9 (2026-05-04) — Phase 2 W6.3 — NEW GET /sn-lookup (S/N system bridge, PII-stripped, function_exists guarded)
  * Version: V.2.8 (2026-04-30) — Round 35 batch 13: Idempotency-Key support on 5 OpenClaw retry-prone MCP endpoints (32.7% milestone):
  *   • POST /dinoco-mcp/v1/dashboard-inject-metrics — body hash {platform, date, metrics_signature}.
  *     OpenClaw chatbot retry on slow WP response → 2x update_option ด้วย key เดียวกัน → metrics_count
@@ -1354,6 +1355,16 @@ function dinoco_mcp_kb_suggest( $request ) {
         'permission_callback' => 'dinoco_mcp_verify_key',
     ) );
 
+    /* ─── Phase 2 W6.3 — S/N system MCP bridge (additive 2026-05-04) ─── */
+    register_rest_route( $ns, '/sn-lookup', array(
+        'methods'             => 'GET',
+        'callback'            => 'dinoco_mcp_sn_lookup',
+        'permission_callback' => 'dinoco_mcp_verify_key',
+        'args'                => array(
+            'sn' => array( 'required' => true, 'type' => 'string' ),
+        ),
+    ) );
+
 } ); // ปิด rest_api_init hook ที่เปิดไว้ใน section 10
 
 function dinoco_mcp_brand_voice_submit( $request ) {
@@ -2566,4 +2577,109 @@ function dinoco_mcp_lead_attribution( $request ) {
     }
 
     return new WP_REST_Response( $resp_data, 200 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Phase 2 W6.3 — S/N system MCP bridge (additive 2026-05-04)
+ *
+ * GET /dinoco-mcp/v1/sn-lookup?sn=DNCSS0001234
+ *
+ * Allows external chatbot/3rd-party to query S/N status without WP nonce.
+ * Reads via internal /dinoco-sn/v1/lookup helper (function_exists guard) —
+ * if S/N system not synced → returns 503 feature_disabled (not 500).
+ *
+ * PII protection: returns only top_set / status / warranty_active —
+ * never customer_user_id / phone / email. Aligns with v2.6 Anti-
+ * Hallucination Rule §15 chatbot guard.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+if ( ! function_exists( 'dinoco_mcp_sn_lookup' ) ) {
+    function dinoco_mcp_sn_lookup( $request ) {
+        $sn = strtoupper( trim( (string) $request->get_param( 'sn' ) ) );
+        if ( $sn === '' ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'sn parameter required',
+            ), 400 );
+        }
+
+        // Defensive: S/N system may not yet be synced
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'feature_disabled',
+                'message' => 'S/N system not enabled',
+                'sn'      => $sn,
+            ), 503 );
+        }
+
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'code'    => 'schema_not_ready',
+                'message' => 'sn_pool table not installed',
+                'sn'      => $sn,
+            ), 503 );
+        }
+
+        global $wpdb;
+        $pool = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool' ) : '';
+        if ( $pool === '' ) {
+            return new WP_REST_Response( array(
+                'success' => false,
+                'message' => 'pool table helper unavailable',
+                'sn'      => $sn,
+            ), 503 );
+        }
+
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT sn, status, linked_sku, top_set_sku, registered_at
+             FROM {$pool} WHERE sn = %s LIMIT 1",
+            $sn
+        ), ARRAY_A );
+
+        if ( ! $row ) {
+            return new WP_REST_Response( array(
+                'success' => true,
+                'found'   => false,
+                'sn'      => $sn,
+                'message' => 'S/N ไม่อยู่ในระบบ DINOCO',
+            ), 404 );
+        }
+
+        // Resolve top SET name via Catalog (best-effort)
+        $top_set_sku = $row['top_set_sku'];
+        if ( ! $top_set_sku && ! empty( $row['linked_sku'] ) && function_exists( 'dinoco_get_ancestor_skus' ) ) {
+            $ancestors = (array) dinoco_get_ancestor_skus( $row['linked_sku'] );
+            $top_set_sku = end( $ancestors ) ?: $row['linked_sku'];
+        }
+        $top_set_name = $top_set_sku;
+        if ( $top_set_sku && class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'get_by_sku' ) ) {
+            $cat_row = DINOCO_Catalog::get_by_sku( $top_set_sku );
+            if ( $cat_row && ! empty( $cat_row->title ) ) {
+                $top_set_name = $cat_row->title;
+            }
+        }
+
+        // PII-stripped response — never expose user_id, phone, email, address
+        $public_statuses = array( 'in_pool', 'allocated_to_order', 'shipped', 'registered', 'claimed', 'replaced', 'transferred' );
+        $is_public = in_array( $row['status'], $public_statuses, true );
+
+        return new WP_REST_Response( array(
+            'success'         => true,
+            'found'           => true,
+            'sn'              => $sn,
+            'status'          => $row['status'],
+            'is_warranty_active' => ( $row['status'] === 'registered' || $row['status'] === 'claimed' ),
+            'is_in_pool'      => ( $row['status'] === 'in_pool' ),
+            'is_voided'       => ( $row['status'] === 'voided' ),
+            'is_recalled'     => ( $row['status'] === 'recalled' ),
+            'linked_sku'      => $row['linked_sku'],
+            'top_set_sku'     => $top_set_sku,
+            'top_set_name'    => $top_set_name,
+            'registered_at'   => $row['registered_at'],
+            // Anti-hallucination guard: AI ห้าม cache หรือ guess — ใช้ tool result เท่านั้น
+            'cache_ttl'       => 60,
+            'note'            => $is_public ? null : 'S/N status restricted — escalate to admin',
+        ), 200 );
+    }
 }

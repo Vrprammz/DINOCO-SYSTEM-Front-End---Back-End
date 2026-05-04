@@ -139,6 +139,51 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toContain("'reserved'");
     });
 
+    test('Phase 2 W6.3 MCP /sn-lookup endpoint registered', () => {
+        const mcpPath = path.join(REPO_ROOT, '[System] DINOCO MCP Bridge');
+        if (!fs.existsSync(mcpPath)) {
+            // MCP snippet not present in this repo (rare) — skip
+            return;
+        }
+        const code = fs.readFileSync(mcpPath, 'utf8');
+        expect(code).toContain("'/sn-lookup'");
+        expect(code).toContain('dinoco_mcp_sn_lookup');
+        // PII guard — must not return user_id / phone / email
+        const handler = code.split('function dinoco_mcp_sn_lookup')[1] || '';
+        expect(handler).not.toMatch(/registered_user_id\s*['"]?\s*=>\s*\$row/);
+        expect(handler).not.toContain("'phone'");
+        expect(handler).not.toContain("'email'");
+    });
+
+    test('Phase 3 W8 cron jobs scheduled with heartbeat', () => {
+        const code = readSnippet('manager');
+        const expected_crons = [
+            'dinoco_sn_low_pool_alert_cron',
+            'dinoco_sn_audit_retention_cron',
+            'dinoco_sn_batch_reconcile_cron',
+        ];
+        expected_crons.forEach(c => {
+            expect(code).toContain(c);
+            // Heartbeat option follows pattern dinoco_cron_<short>_last_run
+            // (cron name dinoco_sn_X_cron → heartbeat dinoco_cron_sn_X_last_run)
+            const short = c.replace(/^dinoco_sn_/, '').replace(/_cron$/, '');
+            const heartbeat = 'dinoco_cron_sn_' + short + '_last_run';
+            expect(code).toContain(heartbeat);
+        });
+        // Functions exist
+        expect(code).toContain('dinoco_sn_run_low_pool_alert');
+        expect(code).toContain('dinoco_sn_run_audit_retention');
+        expect(code).toContain('dinoco_sn_run_batch_reconcile');
+    });
+
+    test('Phase 3 W8 audit retention split sensitive 5y / non-sensitive 3y', () => {
+        const code = readSnippet('manager');
+        // PDPA §17 financial fraud retention split
+        expect(code).toContain('5 * 365 * 86400');
+        expect(code).toContain('3 * 365 * 86400');
+        expect(code).toContain('is_sensitive');
+    });
+
     test('LIFF activate registers POST /activate endpoint', () => {
         const code = readSnippet('liff');
         expect(code).toContain("'/activate'");

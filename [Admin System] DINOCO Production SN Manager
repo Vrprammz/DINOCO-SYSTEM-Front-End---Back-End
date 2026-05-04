@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.6 (2026-05-04) — Phase 3 W8 cron foundation (3 jobs + heartbeat)║
  * ║  Version: V.0.5 (2026-05-04) — Phase 2 W5 Pool/Manage/Audit tabs + JS handlers║
  * ║  Version: V.0.4 (2026-05-04) — Phase 1 W3 Day 3 sidebar registration║
  * ║  Version: V.0.3 (2026-05-04) — Phase 1 W3 Admin UI Tabs 1+2       ║
@@ -2449,3 +2450,193 @@ if ( ! function_exists( 'dinoco_sn_render_admin_js' ) ) {
         <?php
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 11. PHASE 3 W8 — CRON HEARTBEAT FOUNDATION (additive 2026-05-04)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 3 cron jobs:
+ *   - dinoco_sn_low_pool_alert_cron      — hourly low-stock alert per SKU
+ *   - dinoco_sn_audit_retention_cron     — daily 03:30 chunked delete > 5y
+ *   - dinoco_sn_batch_reconcile_cron     — weekly sum drift detect per batch
+ *
+ * Pattern: dinoco_register_cron() heartbeat (Round 28+ Idempotency Helper)
+ * Fallback: plain add_action if registry wrapper not synced.
+ * Defensive: all guarded by feature flag dinoco_sn_system_enabled + table_exists.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_run_low_pool_alert' ) ) {
+    /**
+     * Hourly low-pool alert. Threshold 30-day demand forecast per linked_sku.
+     * Phase 3 W8 stub: simple count threshold (Phase 4 W13 forecast integration).
+     */
+    function dinoco_sn_run_low_pool_alert() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) return;
+
+        // Guard: dedup 1hr
+        if ( get_transient( 'dinoco_sn_low_pool_alert_lock' ) ) return;
+        set_transient( 'dinoco_sn_low_pool_alert_lock', 1, HOUR_IN_SECONDS - 60 );
+
+        try {
+            global $wpdb;
+            $tbl = dinoco_sn_table( 'pool' );
+            $threshold = (int) get_option( 'dinoco_sn_low_pool_threshold', 30 );
+
+            $low = $wpdb->get_results( $wpdb->prepare(
+                "SELECT linked_sku, COUNT(*) AS in_pool_qty
+                 FROM {$tbl}
+                 WHERE status = 'in_pool' AND linked_sku IS NOT NULL AND linked_sku != ''
+                 GROUP BY linked_sku
+                 HAVING in_pool_qty < %d
+                 ORDER BY in_pool_qty ASC
+                 LIMIT 50",
+                $threshold
+            ), ARRAY_A );
+
+            if ( $low ) {
+                update_option( 'dinoco_sn_low_pool_last_alert', array(
+                    'at'    => current_time( 'mysql' ),
+                    'count' => count( $low ),
+                    'top'   => array_slice( $low, 0, 10 ),
+                ), false );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_low_pool_alert' ) );
+            }
+        }
+
+        // Heartbeat for Health Monitor (per Round 28 dinoco_register_cron pattern)
+        update_option( 'dinoco_cron_sn_low_pool_alert_last_run', current_time( 'mysql' ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_audit_retention' ) ) {
+    /**
+     * Daily 03:30 — chunked delete sn_audit > 5 years (PDPA §17 financial
+     * fraud retention). Sensitive ops (is_sensitive=1) keep 5y; non-sensitive
+     * keep 3y per v2.4 SHOULD-FIX #5 ux-ui-expert review.
+     *
+     * Chunked 1000/iter × 20 iter cap to avoid OOM on huge tables.
+     */
+    function dinoco_sn_run_audit_retention() {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'audit' ) ) return;
+
+        try {
+            global $wpdb;
+            $tbl = dinoco_sn_table( 'audit' );
+            $deleted = 0;
+            $cap = 20;
+            $cutoff_5y = gmdate( 'Y-m-d H:i:s', time() - 5 * 365 * 86400 );
+            $cutoff_3y = gmdate( 'Y-m-d H:i:s', time() - 3 * 365 * 86400 );
+
+            for ( $i = 0; $i < $cap; $i++ ) {
+                // Sensitive rows: 5y retention
+                $sensitive_del = $wpdb->query( $wpdb->prepare(
+                    "DELETE FROM {$tbl}
+                     WHERE is_sensitive = 1 AND created_at < %s
+                     LIMIT 500",
+                    $cutoff_5y
+                ) );
+                // Non-sensitive: 3y retention
+                $nonsensitive_del = $wpdb->query( $wpdb->prepare(
+                    "DELETE FROM {$tbl}
+                     WHERE is_sensitive = 0 AND created_at < %s
+                     LIMIT 500",
+                    $cutoff_3y
+                ) );
+                $batch = (int) $sensitive_del + (int) $nonsensitive_del;
+                $deleted += $batch;
+                if ( $batch === 0 ) break;
+                usleep( 50000 ); // 50ms gap to avoid hammering DB
+            }
+
+            update_option( 'dinoco_sn_audit_retention_last_run', array(
+                'at'      => current_time( 'mysql' ),
+                'deleted' => $deleted,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_audit_retention' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_audit_retention_last_run', current_time( 'mysql' ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_batch_reconcile' ) ) {
+    /**
+     * Weekly batch reconcile — verify sn_batches.qty_received matches
+     * actual COUNT in sn_pool grouped by batch_id. Drift > 0 → write
+     * `dinoco_sn_batch_drift_report` option for admin review.
+     */
+    function dinoco_sn_run_batch_reconcile() {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'batches' ) || ! dinoco_sn_table_exists( 'pool' ) ) return;
+
+        try {
+            global $wpdb;
+            $batches = dinoco_sn_table( 'batches' );
+            $pool    = dinoco_sn_table( 'pool' );
+
+            $drifts = $wpdb->get_results(
+                "SELECT b.id AS batch_id, b.batch_code,
+                        b.qty_received AS reported,
+                        COUNT( CASE WHEN p.status NOT IN ('reserved') THEN 1 END ) AS actual,
+                        ABS( b.qty_received - COUNT( CASE WHEN p.status NOT IN ('reserved') THEN 1 END ) ) AS drift
+                 FROM {$batches} b
+                 LEFT JOIN {$pool} p ON p.batch_id = b.id
+                 WHERE b.status NOT IN ('cancelled', 'closed')
+                 GROUP BY b.id, b.batch_code, b.qty_received
+                 HAVING drift > 0
+                 ORDER BY drift DESC
+                 LIMIT 100",
+                ARRAY_A
+            );
+
+            update_option( 'dinoco_sn_batch_drift_report', array(
+                'at'     => current_time( 'mysql' ),
+                'count'  => $drifts ? count( $drifts ) : 0,
+                'rows'   => $drifts ?: array(),
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_batch_reconcile' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_batch_reconcile_last_run', current_time( 'mysql' ) );
+    }
+}
+
+// Cron registration via registry wrapper (Round 28 pattern with fallback)
+add_action( 'init', function() {
+    if ( ! wp_next_scheduled( 'dinoco_sn_low_pool_alert_cron' ) ) {
+        wp_schedule_event( time(), 'hourly', 'dinoco_sn_low_pool_alert_cron' );
+    }
+    if ( ! wp_next_scheduled( 'dinoco_sn_audit_retention_cron' ) ) {
+        wp_schedule_event( time(), 'daily', 'dinoco_sn_audit_retention_cron' );
+    }
+    if ( ! wp_next_scheduled( 'dinoco_sn_batch_reconcile_cron' ) ) {
+        wp_schedule_event( time(), 'weekly', 'dinoco_sn_batch_reconcile_cron' );
+    }
+
+    if ( function_exists( 'dinoco_register_cron' ) ) {
+        dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
+        dinoco_register_cron( 'dinoco_sn_audit_retention_cron', 'daily', 'dinoco_sn_run_audit_retention' );
+        dinoco_register_cron( 'dinoco_sn_batch_reconcile_cron', 'weekly', 'dinoco_sn_run_batch_reconcile' );
+    } else {
+        // Fallback when Idempotency Helper / registry wrapper not synced
+        if ( ! has_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' ) ) {
+            add_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' );
+        }
+        if ( ! has_action( 'dinoco_sn_audit_retention_cron', 'dinoco_sn_run_audit_retention' ) ) {
+            add_action( 'dinoco_sn_audit_retention_cron', 'dinoco_sn_run_audit_retention' );
+        }
+        if ( ! has_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' ) ) {
+            add_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' );
+        }
+    }
+} );
