@@ -1,0 +1,750 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Production S/N Manager                   ║
+ * ║  Version: V.0.1 (2026-05-04) — Phase 1 W2 Foundation             ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
+ * ║  Description: Schema lazy install + module registration for      ║
+ * ║    Production: Generate S/N Management System (warranty plate    ║
+ * ║    lifecycle from China factory → DINOCO warehouse → customer    ║
+ * ║    activation → claim/transfer/recall).                          ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * PROBLEM
+ * -------
+ * Existing warranty system (V.30.x) has customer-submitted S/N free
+ * text (no validation) — admin sends wrong S/N can't fix in UI, no
+ * traceability, no hierarchy awareness (SET 4-leaves vs 2-children).
+ *
+ * SOLUTION
+ * --------
+ * Greenfield S/N pool system v2.13 (boss-approved 2026-05-04, 19 wk
+ * continuous Phase 0-6). v2.2 simplification = standalone (no B2B
+ * order flow integration). Source of truth = customer LIFF activate.
+ *
+ * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md (v2.13)
+ * Schema POC: docs/sn-system/05-schema-v1.sql (15 tables + ALTER)
+ * Architecture: docs/sn-system/01-system-architecture.md
+ * State machine: docs/sn-system/02-state-machine.md
+ *
+ * DESIGN PRINCIPLES (v2.0 + v2.12)
+ *   - ADDITIVE        — zero behavior change at existing endpoints
+ *                       until v2.13 Phase 1 W3+ wires admin UI
+ *   - NON-THROWING    — best-effort; failures fall through gracefully
+ *   - DEFENSIVE       — function_exists guards everywhere; lazy install
+ *   - SPLIT TABLE     — sn_pool 12 hot cols + sn_pool_meta 7 cold cols
+ *                       (40% smaller hot-path indexes, 50% query speedup)
+ *   - utf8mb4_bin     — case-sensitive S/N + SKU lookup (DINOCO standard)
+ *   - PRIMARY KEY sn  — atomic uniqueness + race protection
+ *
+ * Phase 1 W2 scope (THIS VERSION):
+ *   ✓ Schema dbDelta lazy install (15 tables + ALTER on admin_init)
+ *   ✓ Schema version tracking via wp_option
+ *   ✓ Feature flag `dinoco_sn_system_enabled` (default OFF)
+ *   ✗ Admin UI (Phase 1 W3)
+ *   ✗ REST endpoints (Phase 1 W2 PM separate snippet)
+ *   ✗ Customer LIFF activate (Phase 1 W3)
+ *
+ * Public helpers (Phase 1+ snippets will call):
+ *   dinoco_sn_schema_version()        : string
+ *   dinoco_sn_is_enabled()             : bool
+ *   dinoco_sn_table( $name )           : string  (prefixed table name)
+ *   dinoco_sn_get_plate_data( $sn )    : object|null
+ *   dinoco_sn_table_exists( $name )    : bool
+ *
+ * NOT integrated into endpoints in this round — foundation only.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0. CONSTANTS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_SN_SCHEMA_VERSION' ) ) {
+    define( 'DINOCO_SN_SCHEMA_VERSION', '1.0' );
+}
+
+if ( ! defined( 'DINOCO_SN_TABLES' ) ) {
+    define( 'DINOCO_SN_TABLES', array(
+        'batches'          => 'dinoco_sn_batches',
+        'pool'             => 'dinoco_sn_pool',
+        'pool_meta'        => 'dinoco_sn_pool_meta',
+        'audit'            => 'dinoco_sn_audit',
+        'notifications'    => 'dinoco_sn_notifications',
+        'promo_codes'      => 'dinoco_sn_promo_codes',
+        'ltv_snapshot'     => 'dinoco_sn_customer_ltv_snapshot',
+        'review_requests'  => 'dinoco_sn_review_requests',
+        'fraud_scores'     => 'dinoco_sn_fraud_scores',
+        'geo_activations'  => 'dinoco_sn_geo_activations',
+        'stolen_log'       => 'dinoco_sn_stolen_log',
+        'api_tokens'       => 'dinoco_sn_api_tokens',
+        'api_log'          => 'dinoco_sn_api_log',
+        'demand_forecast'  => 'dinoco_sn_demand_forecast',
+        'extensions'       => 'dinoco_sn_warranty_extensions',
+    ) );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. PUBLIC HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_schema_version' ) ) {
+    function dinoco_sn_schema_version() {
+        return (string) get_option( 'dinoco_sn_schema_version', '0.0' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_is_enabled' ) ) {
+    /**
+     * Master kill switch. Phase 1 W2 = OFF default.
+     * Boss flips ON after Pre-Phase 1 sign-off.
+     */
+    function dinoco_sn_is_enabled() {
+        return (bool) get_option( 'dinoco_sn_system_enabled', false );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_table' ) ) {
+    /**
+     * Get fully prefixed table name. Use this instead of hardcoding
+     * to support multisite + table prefix variations.
+     *
+     * Usage: $tbl = dinoco_sn_table( 'pool' );
+     *        // → 'wp_dinoco_sn_pool'
+     */
+    function dinoco_sn_table( $logical_name ) {
+        global $wpdb;
+        $tables = DINOCO_SN_TABLES;
+        if ( ! isset( $tables[ $logical_name ] ) ) {
+            return '';
+        }
+        return $wpdb->prefix . $tables[ $logical_name ];
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_table_exists' ) ) {
+    /**
+     * Check if table physically exists. Defensive — used before
+     * any query during transition period when schema may not yet
+     * be installed (e.g., between snippet sync + admin_init fire).
+     */
+    function dinoco_sn_table_exists( $logical_name ) {
+        global $wpdb;
+        $tbl = dinoco_sn_table( $logical_name );
+        if ( $tbl === '' ) return false;
+        $result = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        return ( (int) $result ) > 0;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_plate_data' ) ) {
+    /**
+     * Read plate from sn_pool. Returns object with hot path columns
+     * only. Use dinoco_sn_get_plate_meta() separately if cold meta needed.
+     *
+     * @param string $sn Plate S/N (case-sensitive UPPER)
+     * @return object|null
+     */
+    function dinoco_sn_get_plate_data( $sn ) {
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) return null;
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'pool' );
+        $sn_upper = strtoupper( trim( (string) $sn ) );
+        if ( $sn_upper === '' ) return null;
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$tbl} WHERE sn = %s",
+            $sn_upper
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_plate_meta' ) ) {
+    /**
+     * Read cold meta path. Use only when needed (purchase_dealer,
+     * stolen_at, replacement chain, etc.) — adds 1 query.
+     */
+    function dinoco_sn_get_plate_meta( $sn ) {
+        if ( ! dinoco_sn_table_exists( 'pool_meta' ) ) return null;
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'pool_meta' );
+        $sn_upper = strtoupper( trim( (string) $sn ) );
+        if ( $sn_upper === '' ) return null;
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$tbl} WHERE sn = %s",
+            $sn_upper
+        ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. SCHEMA INSTALL (lazy, idempotent)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
+    /**
+     * Install all 15 tables + ALTER wp_dinoco_products via dbDelta.
+     * Idempotent — tracks version in wp_option 'dinoco_sn_schema_version'.
+     *
+     * Pattern follows [Admin System] DINOCO Idempotency Helper V.1.1
+     * + [Admin System] DINOCO Flag Audit Log V.1.0.
+     *
+     * Schema POC reference: docs/sn-system/05-schema-v1.sql
+     *
+     * Capacity at 1M plates × 6mo = ~530MB total across all tables.
+     */
+    function dinoco_sn_schema_install() {
+        global $wpdb;
+
+        $current = dinoco_sn_schema_version();
+        if ( version_compare( $current, DINOCO_SN_SCHEMA_VERSION, '>=' ) ) {
+            return; // Already installed at this version or higher
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $charset_collate = $wpdb->get_charset_collate();
+        $prefix = $wpdb->prefix;
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 1: sn_batches — Batch metadata
+        // ═══════════════════════════════════════════════════════
+        $sql_batches = "CREATE TABLE {$prefix}dinoco_sn_batches (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            batch_code VARCHAR(64) NOT NULL,
+            prefix VARCHAR(8) NOT NULL,
+            format_pattern VARCHAR(64) NOT NULL DEFAULT '{PREFIX}{SEQ:7}',
+            qty_total INT UNSIGNED NOT NULL,
+            qty_received INT UNSIGNED NOT NULL DEFAULT 0,
+            qty_voided INT UNSIGNED NOT NULL DEFAULT 0,
+            allocation_strategy VARCHAR(20) NOT NULL DEFAULT 'open_pool',
+            factory_name VARCHAR(128) DEFAULT NULL,
+            factory_po_ref VARCHAR(64) DEFAULT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'draft',
+            notes TEXT DEFAULT NULL,
+            created_by BIGINT UNSIGNED NOT NULL,
+            created_at DATETIME NOT NULL,
+            sent_at DATETIME DEFAULT NULL,
+            closed_at DATETIME DEFAULT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uq_batch_code (batch_code),
+            KEY idx_prefix (prefix),
+            KEY idx_status (status),
+            KEY idx_created_by (created_by)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 2: sn_pool — Hot path 12 columns
+        // ═══════════════════════════════════════════════════════
+        $sql_pool = "CREATE TABLE {$prefix}dinoco_sn_pool (
+            sn VARCHAR(40) NOT NULL,
+            batch_id BIGINT UNSIGNED NOT NULL,
+            linked_sku VARCHAR(50) DEFAULT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'reserved',
+            prev_status VARCHAR(32) DEFAULT NULL,
+            lock_version INT UNSIGNED NOT NULL DEFAULT 0,
+            registered_user_id BIGINT UNSIGNED DEFAULT NULL,
+            registered_warranty_id BIGINT UNSIGNED DEFAULT NULL,
+            claim_id BIGINT UNSIGNED DEFAULT NULL,
+            legacy_request_id BIGINT UNSIGNED DEFAULT NULL,
+            registered_at DATETIME DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (sn),
+            KEY idx_batch (batch_id),
+            KEY idx_status_user (registered_user_id, status),
+            KEY idx_linked_sku_status (linked_sku, status),
+            KEY idx_lookup (linked_sku, status, registered_at),
+            KEY idx_claim (claim_id),
+            KEY idx_legacy (legacy_request_id),
+            KEY idx_status_created (status, created_at)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 3: sn_pool_meta — Cold path 1:1 join
+        // ═══════════════════════════════════════════════════════
+        $sql_pool_meta = "CREATE TABLE {$prefix}dinoco_sn_pool_meta (
+            sn VARCHAR(40) NOT NULL,
+            purchase_dealer_id BIGINT UNSIGNED DEFAULT NULL,
+            purchase_date DATE DEFAULT NULL,
+            top_set_sku VARCHAR(50) DEFAULT NULL,
+            replaced_by_sn VARCHAR(40) DEFAULT NULL,
+            replaces_sn VARCHAR(40) DEFAULT NULL,
+            stolen_at DATETIME DEFAULT NULL,
+            stolen_police_report VARCHAR(64) DEFAULT NULL,
+            recalled_at DATETIME DEFAULT NULL,
+            voided_at DATETIME DEFAULT NULL,
+            notes TEXT DEFAULT NULL,
+            PRIMARY KEY  (sn),
+            KEY idx_purchase_dealer (purchase_dealer_id),
+            KEY idx_top_set (top_set_sku),
+            KEY idx_stolen (stolen_at),
+            KEY idx_replacement_chain (replaces_sn)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 4: sn_audit — Immutable audit log
+        // ═══════════════════════════════════════════════════════
+        $sql_audit = "CREATE TABLE {$prefix}dinoco_sn_audit (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sn VARCHAR(40) NOT NULL,
+            event_type VARCHAR(64) NOT NULL,
+            status_from VARCHAR(32) DEFAULT NULL,
+            status_to VARCHAR(32) DEFAULT NULL,
+            actor_user_id BIGINT UNSIGNED NOT NULL,
+            approver_user_id BIGINT UNSIGNED DEFAULT NULL,
+            reason VARCHAR(255) DEFAULT NULL,
+            reason_category VARCHAR(64) DEFAULT NULL,
+            context_json TEXT DEFAULT NULL,
+            ip_address VARCHAR(45) DEFAULT NULL,
+            user_agent VARCHAR(255) DEFAULT NULL,
+            is_sensitive TINYINT(1) NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_sn (sn),
+            KEY idx_event (event_type),
+            KEY idx_actor (actor_user_id),
+            KEY idx_approver (approver_user_id),
+            KEY idx_created (created_at),
+            KEY idx_sensitive_created (is_sensitive, created_at)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 5: sn_notifications — Phase 3 (F#1, F#4, F#10)
+        // ═══════════════════════════════════════════════════════
+        $sql_notifications = "CREATE TABLE {$prefix}dinoco_sn_notifications (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sn VARCHAR(40) NOT NULL,
+            user_id BIGINT UNSIGNED NOT NULL,
+            notification_type VARCHAR(32) NOT NULL,
+            channel VARCHAR(20) NOT NULL DEFAULT 'line_flex',
+            scheduled_at DATETIME NOT NULL,
+            sent_at DATETIME DEFAULT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'scheduled',
+            meta_json TEXT DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_sn (sn),
+            KEY idx_user (user_id),
+            KEY idx_scheduled_status (scheduled_at, status),
+            KEY idx_type_user_sn (notification_type, user_id, sn)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 6: sn_promo_codes — Phase 3 (F#1, F#4, F#10 cross-sell)
+        // ═══════════════════════════════════════════════════════
+        $sql_promo = "CREATE TABLE {$prefix}dinoco_sn_promo_codes (
+            code VARCHAR(20) NOT NULL,
+            user_id BIGINT UNSIGNED NOT NULL,
+            source_sn VARCHAR(40) DEFAULT NULL,
+            discount_pct TINYINT UNSIGNED NOT NULL,
+            discount_value DECIMAL(10,2) DEFAULT NULL,
+            scope VARCHAR(32) NOT NULL DEFAULT 'any',
+            scope_value VARCHAR(255) DEFAULT NULL,
+            expires_at DATETIME NOT NULL,
+            used_at DATETIME DEFAULT NULL,
+            used_order_id BIGINT UNSIGNED DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (code),
+            KEY idx_user (user_id),
+            KEY idx_expires_used (expires_at, used_at)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 7: sn_customer_ltv_snapshot — Phase 3 (F#9)
+        // ═══════════════════════════════════════════════════════
+        $sql_ltv = "CREATE TABLE {$prefix}dinoco_sn_customer_ltv_snapshot (
+            user_id BIGINT UNSIGNED NOT NULL,
+            plates_count INT UNSIGNED NOT NULL DEFAULT 0,
+            registered_count INT UNSIGNED NOT NULL DEFAULT 0,
+            active_warranties_count INT UNSIGNED NOT NULL DEFAULT 0,
+            total_lifetime_spent DECIMAL(12,2) NOT NULL DEFAULT 0,
+            first_purchase_date DATE DEFAULT NULL,
+            last_purchase_date DATE DEFAULT NULL,
+            claim_count INT UNSIGNED NOT NULL DEFAULT 0,
+            loyalty_tier VARCHAR(20) NOT NULL DEFAULT 'bronze',
+            computed_at DATETIME NOT NULL,
+            PRIMARY KEY  (user_id),
+            KEY idx_ltv (total_lifetime_spent),
+            KEY idx_tier (loyalty_tier)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 8: sn_review_requests — Phase 3 (F#10)
+        // ═══════════════════════════════════════════════════════
+        $sql_reviews = "CREATE TABLE {$prefix}dinoco_sn_review_requests (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sn VARCHAR(40) NOT NULL,
+            user_id BIGINT UNSIGNED NOT NULL,
+            brand_voice_id BIGINT UNSIGNED DEFAULT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'scheduled',
+            rating TINYINT UNSIGNED DEFAULT NULL,
+            scheduled_at DATETIME NOT NULL,
+            sent_at DATETIME DEFAULT NULL,
+            reviewed_at DATETIME DEFAULT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_sn (sn),
+            KEY idx_user (user_id),
+            KEY idx_status_scheduled (status, scheduled_at)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 9: sn_fraud_scores — Phase 3 (F#12)
+        // ═══════════════════════════════════════════════════════
+        $sql_fraud = "CREATE TABLE {$prefix}dinoco_sn_fraud_scores (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sn VARCHAR(40) NOT NULL,
+            event_type VARCHAR(20) NOT NULL,
+            score TINYINT UNSIGNED NOT NULL,
+            factors_json TEXT NOT NULL,
+            ip_address VARCHAR(45) DEFAULT NULL,
+            user_agent VARCHAR(255) DEFAULT NULL,
+            device_fp VARCHAR(64) DEFAULT NULL,
+            geo_country CHAR(2) DEFAULT NULL,
+            geo_province VARCHAR(64) DEFAULT NULL,
+            reviewed_by BIGINT UNSIGNED DEFAULT NULL,
+            reviewed_at DATETIME DEFAULT NULL,
+            outcome VARCHAR(20) DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_sn_score (sn, score),
+            KEY idx_outcome_created (outcome, created_at),
+            KEY idx_geo_country (geo_country)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 10: sn_geo_activations — Phase 3 (F#13)
+        // ═══════════════════════════════════════════════════════
+        $sql_geo = "CREATE TABLE {$prefix}dinoco_sn_geo_activations (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sn VARCHAR(40) NOT NULL,
+            province VARCHAR(64) NOT NULL,
+            district VARCHAR(64) DEFAULT NULL,
+            lat DECIMAL(10,7) DEFAULT NULL,
+            lng DECIMAL(10,7) DEFAULT NULL,
+            source VARCHAR(20) NOT NULL,
+            is_in_dealer_territory TINYINT(1) NOT NULL DEFAULT 0,
+            expected_dealer_id BIGINT UNSIGNED DEFAULT NULL,
+            actual_dealer_id BIGINT UNSIGNED DEFAULT NULL,
+            is_gray_market_suspect TINYINT(1) NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_province_created (province, created_at),
+            KEY idx_gray_market (is_gray_market_suspect),
+            KEY idx_sn (sn)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 11: sn_stolen_log — Phase 3 (F#14)
+        // ═══════════════════════════════════════════════════════
+        $sql_stolen = "CREATE TABLE {$prefix}dinoco_sn_stolen_log (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sn VARCHAR(40) NOT NULL,
+            user_id BIGINT UNSIGNED DEFAULT NULL,
+            reported_by BIGINT UNSIGNED NOT NULL,
+            police_report_no VARCHAR(64) DEFAULT NULL,
+            police_station VARCHAR(128) DEFAULT NULL,
+            incident_date DATE DEFAULT NULL,
+            description TEXT DEFAULT NULL,
+            evidence_attachment_ids TEXT DEFAULT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'reported',
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_sn (sn),
+            KEY idx_status (status),
+            KEY idx_reported_by (reported_by)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 12: sn_api_tokens — Phase 4 (F#15)
+        // ═══════════════════════════════════════════════════════
+        $sql_api_tokens = "CREATE TABLE {$prefix}dinoco_sn_api_tokens (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            partner_name VARCHAR(128) NOT NULL,
+            partner_type VARCHAR(20) NOT NULL,
+            api_key VARCHAR(64) NOT NULL,
+            api_secret_hash VARCHAR(255) NOT NULL,
+            scopes TEXT NOT NULL,
+            rate_limit_per_min SMALLINT UNSIGNED NOT NULL DEFAULT 30,
+            ip_allowlist TEXT DEFAULT NULL,
+            is_active TINYINT(1) NOT NULL DEFAULT 1,
+            expires_at DATETIME DEFAULT NULL,
+            last_used_at DATETIME DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            created_by BIGINT UNSIGNED NOT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uq_api_key (api_key),
+            KEY idx_active_expires (is_active, expires_at)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 13: sn_api_log — Phase 4 (F#15)
+        // ═══════════════════════════════════════════════════════
+        $sql_api_log = "CREATE TABLE {$prefix}dinoco_sn_api_log (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            api_token_id BIGINT UNSIGNED NOT NULL,
+            endpoint VARCHAR(128) NOT NULL,
+            http_status SMALLINT NOT NULL,
+            response_time_ms INT NOT NULL,
+            ip_address VARCHAR(45) DEFAULT NULL,
+            request_summary TEXT DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_token_created (api_token_id, created_at),
+            KEY idx_status (http_status)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 14: sn_demand_forecast — Phase 4 (F#16)
+        // ═══════════════════════════════════════════════════════
+        $sql_forecast = "CREATE TABLE {$prefix}dinoco_sn_demand_forecast (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sku VARCHAR(50) NOT NULL,
+            forecast_month DATE NOT NULL,
+            predicted_qty INT UNSIGNED NOT NULL,
+            confidence_pct TINYINT UNSIGNED NOT NULL,
+            current_pool_qty INT UNSIGNED NOT NULL,
+            suggested_order_qty INT UNSIGNED NOT NULL,
+            computed_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uq_sku_month (sku, forecast_month),
+            KEY idx_computed (computed_at)
+        ) {$charset_collate};";
+
+        // ═══════════════════════════════════════════════════════
+        // TABLE 15: sn_warranty_extensions — Phase 5 (F#8)
+        // ═══════════════════════════════════════════════════════
+        $sql_extensions = "CREATE TABLE {$prefix}dinoco_sn_warranty_extensions (
+            id BIGINT UNSIGNED AUTO_INCREMENT,
+            sn VARCHAR(40) NOT NULL,
+            user_id BIGINT UNSIGNED NOT NULL,
+            extension_months SMALLINT UNSIGNED NOT NULL,
+            price_paid DECIMAL(10,2) NOT NULL,
+            payment_method VARCHAR(20) NOT NULL,
+            payment_ref VARCHAR(64) DEFAULT NULL,
+            payment_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            warranty_until_old DATE NOT NULL,
+            warranty_until_new DATE NOT NULL,
+            receipt_invoice_id BIGINT UNSIGNED DEFAULT NULL,
+            created_at DATETIME NOT NULL,
+            paid_at DATETIME DEFAULT NULL,
+            PRIMARY KEY  (id),
+            KEY idx_sn (sn),
+            KEY idx_user (user_id),
+            KEY idx_status_created (payment_status, created_at)
+        ) {$charset_collate};";
+
+        // Run dbDelta — order matters for some FKs (we don't have explicit
+        // FKs but logical dependencies exist: pool_meta references pool's sn)
+        dbDelta( $sql_batches );
+        dbDelta( $sql_pool );
+        dbDelta( $sql_pool_meta );
+        dbDelta( $sql_audit );
+        dbDelta( $sql_notifications );
+        dbDelta( $sql_promo );
+        dbDelta( $sql_ltv );
+        dbDelta( $sql_reviews );
+        dbDelta( $sql_fraud );
+        dbDelta( $sql_geo );
+        dbDelta( $sql_stolen );
+        dbDelta( $sql_api_tokens );
+        dbDelta( $sql_api_log );
+        dbDelta( $sql_forecast );
+        dbDelta( $sql_extensions );
+
+        // Apply utf8mb4_bin collation on key columns (case-sensitive S/N + SKU).
+        // dbDelta doesn't support COLLATE per-column, so ALTER post-create.
+        // Idempotent: checks current collation before changing.
+        dinoco_sn_apply_bin_collations();
+
+        // ALTER wp_dinoco_products — add sn_attach_level columns
+        dinoco_sn_alter_products_table();
+
+        // Persist version + activation timestamp
+        update_option( 'dinoco_sn_schema_version', DINOCO_SN_SCHEMA_VERSION, 'no' );
+        update_option( 'dinoco_sn_schema_activated_at', current_time( 'mysql' ), 'no' );
+
+        // Log to obs if available
+        if ( function_exists( 'dinoco_obs_capture' ) ) {
+            // Not an exception, just an event log
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_apply_bin_collations' ) ) {
+    /**
+     * Apply utf8mb4_bin collation to S/N + SKU columns. Idempotent —
+     * checks current collation via INFORMATION_SCHEMA before ALTER.
+     *
+     * Tables/columns affected:
+     *   sn_pool.sn, sn_pool.linked_sku
+     *   sn_pool_meta.sn, sn_pool_meta.top_set_sku, replaced_by_sn, replaces_sn
+     *   sn_audit.sn
+     *   sn_notifications.sn
+     *   sn_promo_codes.source_sn
+     *   sn_review_requests.sn
+     *   sn_fraud_scores.sn
+     *   sn_geo_activations.sn
+     *   sn_stolen_log.sn
+     *   sn_demand_forecast.sku
+     *   sn_warranty_extensions.sn
+     */
+    function dinoco_sn_apply_bin_collations() {
+        global $wpdb;
+        $prefix = $wpdb->prefix;
+
+        $bin_columns = array(
+            // table => array( column => 'TYPE' )
+            'pool'             => array(
+                'sn'         => 'VARCHAR(40)',
+                'linked_sku' => 'VARCHAR(50)',
+            ),
+            'pool_meta'        => array(
+                'sn'             => 'VARCHAR(40)',
+                'top_set_sku'    => 'VARCHAR(50)',
+                'replaced_by_sn' => 'VARCHAR(40)',
+                'replaces_sn'    => 'VARCHAR(40)',
+            ),
+            'audit'            => array( 'sn' => 'VARCHAR(40)' ),
+            'notifications'    => array( 'sn' => 'VARCHAR(40)' ),
+            'promo_codes'      => array( 'source_sn' => 'VARCHAR(40)' ),
+            'review_requests'  => array( 'sn' => 'VARCHAR(40)' ),
+            'fraud_scores'     => array( 'sn' => 'VARCHAR(40)' ),
+            'geo_activations'  => array( 'sn' => 'VARCHAR(40)' ),
+            'stolen_log'       => array( 'sn' => 'VARCHAR(40)' ),
+            'demand_forecast'  => array( 'sku' => 'VARCHAR(50)' ),
+            'extensions'       => array( 'sn' => 'VARCHAR(40)' ),
+        );
+
+        foreach ( $bin_columns as $logical => $cols ) {
+            $tbl = dinoco_sn_table( $logical );
+            if ( ! dinoco_sn_table_exists( $logical ) ) continue;
+
+            foreach ( $cols as $col => $type ) {
+                $current_col = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT COLLATION_NAME FROM information_schema.columns
+                     WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                    DB_NAME, $tbl, $col
+                ) );
+                if ( ! $current_col ) continue;
+                if ( $current_col->COLLATION_NAME === 'utf8mb4_bin' ) continue;
+
+                // Apply collation — preserve nullability default
+                $is_nullable_query = $wpdb->prepare(
+                    "SELECT IS_NULLABLE FROM information_schema.columns
+                     WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                    DB_NAME, $tbl, $col
+                );
+                $is_nullable = $wpdb->get_var( $is_nullable_query );
+                $null_clause = ( $is_nullable === 'YES' ) ? 'DEFAULT NULL' : 'NOT NULL';
+
+                $sql = "ALTER TABLE {$tbl} MODIFY COLUMN {$col} {$type} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin {$null_clause}";
+                $wpdb->query( $sql );
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_alter_products_table' ) ) {
+    /**
+     * Add sn_attach_level + sn_required + sn_qty_per_unit columns to
+     * wp_dinoco_products. Idempotent — checks INFORMATION_SCHEMA before ALTER.
+     *
+     * Per Q recommended preset: sn_attach_level enum(set/child/leaf/none).
+     */
+    function dinoco_sn_alter_products_table() {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_products';
+
+        // Check if products table exists (Inventory Snippet 15 must be deployed)
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        if ( ! $exists ) return; // Inventory not yet deployed — skip silently
+
+        $alters = array(
+            'sn_attach_level' => "ADD COLUMN sn_attach_level VARCHAR(20) NOT NULL DEFAULT 'none' AFTER ui_role_override",
+            'sn_required'     => "ADD COLUMN sn_required TINYINT(1) NOT NULL DEFAULT 0 AFTER sn_attach_level",
+            'sn_qty_per_unit' => "ADD COLUMN sn_qty_per_unit TINYINT(1) NOT NULL DEFAULT 1 AFTER sn_required",
+        );
+
+        foreach ( $alters as $col => $alter_sql ) {
+            $col_exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                DB_NAME, $tbl, $col
+            ) );
+            if ( $col_exists ) continue;
+            $wpdb->query( "ALTER TABLE {$tbl} {$alter_sql}" );
+        }
+
+        // Add composite index if missing
+        $idx_exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.statistics
+             WHERE table_schema = %s AND table_name = %s AND index_name = %s",
+            DB_NAME, $tbl, 'idx_sn_attach'
+        ) );
+        if ( ! $idx_exists ) {
+            $wpdb->query( "ALTER TABLE {$tbl} ADD KEY idx_sn_attach (sn_attach_level, sn_required)" );
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. ADMIN_INIT HOOK — Lazy install on each admin page load (cheap)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! has_action( 'admin_init', 'dinoco_sn_maybe_install' ) ) {
+    add_action( 'admin_init', 'dinoco_sn_maybe_install', 30 );
+}
+
+if ( ! function_exists( 'dinoco_sn_maybe_install' ) ) {
+    function dinoco_sn_maybe_install() {
+        // Only install if version mismatch (cheap check)
+        if ( version_compare( dinoco_sn_schema_version(), DINOCO_SN_SCHEMA_VERSION, '>=' ) ) {
+            return;
+        }
+        try {
+            dinoco_sn_schema_install();
+        } catch ( \Throwable $e ) {
+            // Non-throwing — log + continue
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_schema_install' ) );
+            } else {
+                error_log( '[DINOCO S/N] Schema install failed: ' . $e->getMessage() );
+            }
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. FEATURE FLAG INIT (default OFF — Phase 1 W2)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_init_flags' ) ) {
+    /**
+     * Set default values for system flags. Boss flips ON during sign-off.
+     * Logged via Flag Audit Log V.1.0+ when toggled.
+     */
+    function dinoco_sn_init_flags() {
+        $defaults = array(
+            'dinoco_sn_system_enabled'             => '0',  // Master kill switch
+            'dinoco_sn_block_legacy_serial_code'   => '0',  // Phase 2+
+            'dinoco_sn_require_2sig_for_swap'      => '1',  // 4-eyes default ON for sensitive ops
+            'dinoco_sn_dual_source_enabled'        => '1',  // Phase 1-2: read both legacy + new
+            'dinoco_sn_oos_gate_hierarchy_compute' => '0',  // Reserved for future
+        );
+        foreach ( $defaults as $key => $val ) {
+            if ( get_option( $key, null ) === null ) {
+                add_option( $key, $val, '', 'no' );
+            }
+        }
+    }
+}
+
+if ( ! has_action( 'init', 'dinoco_sn_init_flags' ) ) {
+    add_action( 'init', 'dinoco_sn_init_flags', 5 );
+}

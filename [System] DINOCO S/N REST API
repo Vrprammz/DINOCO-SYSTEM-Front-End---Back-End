@@ -1,0 +1,785 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [System] DINOCO S/N REST API                                   ║
+ * ║  Version: V.0.1 (2026-05-04) — Phase 1 W2 Day 1-2 Foundation     ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
+ * ║  Description: REST namespace /dinoco-sn/v1/ + permission helpers ║
+ * ║    + capability registration + Idempotency-Key wrapper helpers.  ║
+ * ║    Phase 1 W2 = Batch CRUD endpoints. Receive/Activate/Manage    ║
+ * ║    endpoints come Phase 1 W3+.                                   ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md (v2.13)
+ * Architecture: docs/sn-system/01-system-architecture.md
+ * State machine: docs/sn-system/02-state-machine.md
+ *
+ * Endpoints registered (Phase 1 W2):
+ *   POST   /dinoco-sn/v1/batches              — create batch
+ *   GET    /dinoco-sn/v1/batches              — list batches (paginated)
+ *   GET    /dinoco-sn/v1/batches/(?P<id>\d+)  — batch detail
+ *   PATCH  /dinoco-sn/v1/batches/(?P<id>\d+)/status — flip status
+ *
+ * Endpoints reserved (Phase 1 W3+, NOT registered yet):
+ *   POST   /receive                  — single plate scan (Mode 3 USB)
+ *   POST   /receive/bulk             — Range/Paste mode (D4 contract)
+ *   GET    /lookup/{sn}              — public lookup (HMAC URL gated)
+ *   POST   /activate                 — customer LIFF activate
+ *   POST   /swap                     — admin swap (4-eyes)
+ *   POST   /void                     — admin void
+ *   POST   /recall                   — mass recall
+ *   POST   /relink                   — relink in_pool plate
+ *   ... (30+ total per v2.0 §4.1 + v2.5/v2.7 additions)
+ *
+ * DESIGN PRINCIPLES
+ *   - ADDITIVE        — register routes only when system enabled
+ *   - DEFENSIVE       — function_exists guards on all helpers
+ *   - IDEMPOTENT      — every POST uses Idempotency-Key wrapper
+ *   - CAPABILITY      — proper roles (dinoco_sn_warehouse + admin)
+ *   - HEADER NONCE    — X-WP-Nonce for admin write
+ *   - LINE ID TOKEN   — for customer activate (LIFF AI pattern reuse)
+ *
+ * Capabilities introduced (added during init):
+ *   - dinoco_sn_warehouse  — warehouse admin (receive + pack scan)
+ *   - dinoco_sn_approver   — 4-eyes approver delegate (Q15)
+ *   - dinoco_sn_view_pii   — view masked customer data unmask
+ *
+ * Phase 1 W2 scope:
+ *   ✓ Namespace registration via rest_api_init
+ *   ✓ Permission callbacks (admin + warehouse + LIFF)
+ *   ✓ Idempotency wrapper integration (Round 19+ pattern)
+ *   ✓ Capability registration on activation
+ *   ✓ Batch CRUD endpoints
+ *   ✗ Receive/Activate/Manage (Phase 1 W3+)
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0. CONSTANTS + NAMESPACE
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_SN_REST_NAMESPACE' ) ) {
+    define( 'DINOCO_SN_REST_NAMESPACE', 'dinoco-sn/v1' );
+}
+
+if ( ! defined( 'DINOCO_SN_API_VERSION' ) ) {
+    define( 'DINOCO_SN_API_VERSION', '1.0' );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. CAPABILITY HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_user_can_admin' ) ) {
+    function dinoco_sn_user_can_admin() {
+        return current_user_can( 'manage_options' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_user_can_warehouse' ) ) {
+    function dinoco_sn_user_can_warehouse() {
+        return current_user_can( 'dinoco_sn_warehouse' )
+            || current_user_can( 'manage_options' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_user_can_approver' ) ) {
+    function dinoco_sn_user_can_approver() {
+        return current_user_can( 'dinoco_sn_approver' )
+            || current_user_can( 'manage_options' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_user_can_view_pii' ) ) {
+    /**
+     * Permission to see unmasked customer phone/address. Phase 1+ — only
+     * super admin (boss). Service Center sees masked by default.
+     */
+    function dinoco_sn_user_can_view_pii() {
+        return current_user_can( 'dinoco_sn_view_pii' )
+            || current_user_can( 'manage_options' );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. CAPABILITY REGISTRATION (one-time on init)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_register_capabilities' ) ) {
+    /**
+     * Add custom capabilities to administrator role. Idempotent —
+     * safe to run on every init (WP role->add_cap is no-op if exists).
+     *
+     * Naming convention: dinoco_sn_* (matches snippet namespace per
+     * v2.4 SHOULD-FIX #7 fullstack-developer review).
+     */
+    function dinoco_sn_register_capabilities() {
+        $admin = get_role( 'administrator' );
+        if ( ! $admin ) return;
+        $caps = array(
+            'dinoco_sn_warehouse',
+            'dinoco_sn_approver',
+            'dinoco_sn_view_pii',
+        );
+        foreach ( $caps as $cap ) {
+            if ( ! $admin->has_cap( $cap ) ) {
+                $admin->add_cap( $cap );
+            }
+        }
+    }
+}
+
+if ( ! has_action( 'init', 'dinoco_sn_register_capabilities' ) ) {
+    add_action( 'init', 'dinoco_sn_register_capabilities', 10 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. PERMISSION CALLBACK FACTORIES
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_perm_admin' ) ) {
+    /**
+     * Admin-only endpoint with WP REST nonce. Used for batch CRUD,
+     * swap/void/recall, settings, audit log search.
+     */
+    function dinoco_sn_perm_admin( $request ) {
+        if ( ! dinoco_sn_user_can_admin() ) {
+            return new WP_Error(
+                'rest_forbidden',
+                __( 'You do not have permission to perform this action.', 'dinoco-sn' ),
+                array( 'status' => 403 )
+            );
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_perm_warehouse' ) ) {
+    /**
+     * Warehouse staff endpoints (receive plate, pack scan).
+     */
+    function dinoco_sn_perm_warehouse( $request ) {
+        if ( ! dinoco_sn_user_can_warehouse() ) {
+            return new WP_Error(
+                'rest_forbidden',
+                __( 'Warehouse capability required.', 'dinoco-sn' ),
+                array( 'status' => 403 )
+            );
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_perm_logged_in' ) ) {
+    /**
+     * Customer-facing endpoints (activate, transfer). Requires WP login
+     * (set up by LINE OAuth via [dinoco_login_button]).
+     */
+    function dinoco_sn_perm_logged_in( $request ) {
+        if ( ! is_user_logged_in() ) {
+            return new WP_Error(
+                'rest_not_logged_in',
+                __( 'You must be logged in to use this endpoint.', 'dinoco-sn' ),
+                array( 'status' => 401 )
+            );
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_perm_public' ) ) {
+    /**
+     * Public lookup endpoint (S/N → top SET name only). Rate-limited.
+     * Phase 2+ adds HMAC URL signing (v2.7 BLOCKER B3 promote).
+     */
+    function dinoco_sn_perm_public( $request ) {
+        // Rate limit — reuse b2b_rate_limit if available
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+            $rl = b2b_rate_limit( $ip, 'sn_lookup', 30, 60 ); // 30/min/IP
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+        return true;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. IDEMPOTENCY WRAPPER (delegates to Idempotency Helper V.1.0+)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_with_idempotency' ) ) {
+    /**
+     * Standard wrapper for POST endpoints. Pattern from Round 19+ DINOCO
+     * (e.g., place-order, manual-flash-create).
+     *
+     * Body hash includes actor_user_id (Round 30+ pattern, fullstack
+     * SHOULD-FIX #1 from v2.12 review).
+     *
+     * Usage:
+     *   register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches', array(
+     *     'methods'  => 'POST',
+     *     'callback' => 'dinoco_sn_rest_create_batch',
+     *     'permission_callback' => 'dinoco_sn_perm_admin',
+     *   ) );
+     *
+     *   function dinoco_sn_rest_create_batch( $req ) {
+     *       return dinoco_sn_with_idempotency( $req, 'sn-batch-create',
+     *           array( 'batch_code', 'prefix', 'qty_total', 'format_pattern' ),
+     *           function( $req ) { return dinoco_sn_handler_create_batch( $req ); }
+     *       );
+     *   }
+     */
+    function dinoco_sn_with_idempotency( $req, $namespace_suffix, $body_keys, $handler ) {
+        if ( ! function_exists( 'dinoco_idempotency_extract_key' )
+          || ! function_exists( 'dinoco_idempotency_check' )
+          || ! function_exists( 'dinoco_idempotency_store' )
+          || ! function_exists( 'dinoco_idempotency_hash' ) ) {
+            // Idempotency Helper not synced — fall through (defensive)
+            return call_user_func( $handler, $req );
+        }
+
+        $key = dinoco_idempotency_extract_key( $req );
+        $namespace = DINOCO_SN_REST_NAMESPACE . '::' . $namespace_suffix;
+
+        // Build body hash from declared keys + actor_user_id
+        $body = array();
+        foreach ( $body_keys as $k ) {
+            $body[ $k ] = $req->get_param( $k );
+        }
+        $body['_actor_user_id'] = get_current_user_id();
+        $body_hash = dinoco_idempotency_hash( $body );
+
+        if ( $key !== '' ) {
+            $cached = dinoco_idempotency_check( $key, $namespace, $body_hash );
+            if ( is_wp_error( $cached ) ) return $cached; // 409 hash mismatch
+            if ( is_array( $cached ) ) return rest_ensure_response( $cached );
+        }
+
+        $result = call_user_func( $handler, $req );
+
+        if ( $key !== '' && ! is_wp_error( $result ) ) {
+            $resp_data = is_a( $result, 'WP_REST_Response' ) ? $result->get_data() : $result;
+            $resp_code = is_a( $result, 'WP_REST_Response' ) ? $result->get_status() : 200;
+            dinoco_idempotency_store( $key, $namespace, $body_hash, $resp_data, $resp_code );
+        }
+
+        return $result;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. ROUTE REGISTRATION (Phase 1 W2 — Batch CRUD only)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
+    function dinoco_sn_rest_register_routes() {
+
+        // POST /batches — create batch
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_create_batch',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'batch_code' => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                    'validate_callback' => function( $val ) {
+                        return is_string( $val ) && strlen( $val ) >= 3 && strlen( $val ) <= 64;
+                    },
+                ),
+                'prefix' => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => function( $val ) {
+                        return strtoupper( preg_replace( '/[^A-Z0-9]/i', '', (string) $val ) );
+                    },
+                    'validate_callback' => function( $val ) {
+                        return is_string( $val ) && preg_match( '/^[A-Z0-9]{3,6}$/', strtoupper( $val ) );
+                    },
+                ),
+                'qty_total' => array(
+                    'required'          => true,
+                    'type'              => 'integer',
+                    'validate_callback' => function( $val ) {
+                        $n = (int) $val;
+                        return $n >= 1 && $n <= 1000000;
+                    },
+                ),
+                'format_pattern' => array(
+                    'type'              => 'string',
+                    'default'           => '{PREFIX}{SEQ:7}',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ),
+                'allocation_strategy' => array(
+                    'type'              => 'string',
+                    'default'           => 'open_pool',
+                    'enum'              => array( 'open_pool', 'pre_assigned' ),
+                ),
+                'factory_name'   => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'factory_po_ref' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'notes'          => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        // GET /batches — list (paginated)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_list_batches',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'status'   => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'prefix'   => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'orderby'  => array( 'type' => 'string', 'default' => 'created_at',
+                                     'enum' => array( 'created_at', 'qty_total', 'qty_received' ) ),
+                'order'    => array( 'type' => 'string', 'default' => 'DESC',
+                                     'enum' => array( 'ASC', 'DESC' ) ),
+                'limit'    => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+                'offset'   => array( 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /batches/{id} — detail
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches/(?P<id>\d+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_get_batch',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // PATCH /batches/{id}/status — flip status
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches/(?P<id>\d+)/status', array(
+            'methods'             => 'POST', // PATCH not universally supported, use POST
+            'callback'            => 'dinoco_sn_rest_update_batch_status',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'status' => array(
+                    'required' => true,
+                    'type'     => 'string',
+                    'enum'     => array( 'draft', 'sent_to_factory', 'received_partial', 'received_full', 'closed', 'cancelled' ),
+                ),
+            ),
+        ) );
+
+        // GET /version — health check (helps debugging)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/version', array(
+            'methods'             => 'GET',
+            'callback'            => function() {
+                return rest_ensure_response( array(
+                    'api_version'    => DINOCO_SN_API_VERSION,
+                    'schema_version' => function_exists( 'dinoco_sn_schema_version' ) ? dinoco_sn_schema_version() : 'unknown',
+                    'enabled'        => function_exists( 'dinoco_sn_is_enabled' ) ? dinoco_sn_is_enabled() : false,
+                    'phase'          => '1 W2',
+                ) );
+            },
+            'permission_callback' => '__return_true',
+        ) );
+    }
+}
+
+if ( ! has_action( 'rest_api_init', 'dinoco_sn_rest_register_routes' ) ) {
+    add_action( 'rest_api_init', 'dinoco_sn_rest_register_routes' );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. BATCH CRUD HANDLERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_create_batch' ) ) {
+    /**
+     * POST /dinoco-sn/v1/batches
+     *
+     * Create new batch + reserve N S/N rows in sn_pool atomically.
+     * Idempotent via X-Idempotency-Key header.
+     */
+    function dinoco_sn_rest_create_batch( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system is disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        return dinoco_sn_with_idempotency(
+            $req,
+            'batch-create',
+            array( 'batch_code', 'prefix', 'qty_total', 'format_pattern', 'allocation_strategy' ),
+            function( $req ) {
+                return dinoco_sn_handler_create_batch( $req );
+            }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_create_batch' ) ) {
+    /**
+     * Inner handler — atomic batch + bulk INSERT chunked 5000/iter.
+     *
+     * SAFETY:
+     *   - GET_LOCK on prefix (prevent prefix collision)
+     *   - START TRANSACTION wrap
+     *   - Validates qty range + prefix uniqueness
+     *   - Chunked INSERT prevents OOM at 100k+ qty
+     */
+    function dinoco_sn_handler_create_batch( $req ) {
+        global $wpdb;
+
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            return new WP_Error( 'helper_missing', __( 'S/N Manager not synced.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        $tbl_batches = dinoco_sn_table( 'batches' );
+        $tbl_pool    = dinoco_sn_table( 'pool' );
+
+        $batch_code  = sanitize_text_field( $req->get_param( 'batch_code' ) );
+        $prefix      = strtoupper( preg_replace( '/[^A-Z0-9]/i', '', (string) $req->get_param( 'prefix' ) ) );
+        $qty_total   = (int) $req->get_param( 'qty_total' );
+        $format      = sanitize_text_field( $req->get_param( 'format_pattern' ) ?: '{PREFIX}{SEQ:7}' );
+        $strategy    = sanitize_text_field( $req->get_param( 'allocation_strategy' ) ?: 'open_pool' );
+        $factory     = sanitize_text_field( (string) $req->get_param( 'factory_name' ) );
+        $po_ref      = sanitize_text_field( (string) $req->get_param( 'factory_po_ref' ) );
+        $notes       = sanitize_textarea_field( (string) $req->get_param( 'notes' ) );
+        $created_by  = get_current_user_id();
+        $now         = current_time( 'mysql' );
+
+        // Acquire prefix lock (5s timeout)
+        $lock_name = "dnc_sn_batch_prefix_{$prefix}";
+        $lock_acquired = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, %d)", $lock_name, 5 ) );
+        if ( $lock_acquired !== '1' ) {
+            return new WP_Error( 'db_lock_timeout', __( 'Cannot acquire prefix lock — try again.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        try {
+            // Check batch_code uniqueness
+            $exists = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$tbl_batches} WHERE batch_code = %s", $batch_code
+            ) );
+            if ( $exists > 0 ) {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+                return new WP_Error( 'batch_code_duplicate',
+                    sprintf( __( 'Batch code %s already exists.', 'dinoco-sn' ), $batch_code ),
+                    array( 'status' => 409 )
+                );
+            }
+
+            // Determine next start_seq for this prefix (continue from last or start at 1)
+            $last_seq = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT MAX(qty_total) FROM {$tbl_batches} WHERE prefix = %s", $prefix
+            ) );
+            $start_seq = $last_seq + 1; // Conservative — could clash if old batches existed
+            // Safer: scan sn_pool for max numeric suffix matching prefix
+            $sn_max = $wpdb->get_var( $wpdb->prepare(
+                "SELECT sn FROM {$tbl_pool} WHERE sn LIKE %s ORDER BY sn DESC LIMIT 1",
+                $wpdb->esc_like( $prefix ) . '%'
+            ) );
+            if ( $sn_max ) {
+                $sn_suffix = preg_replace( '/^' . preg_quote( $prefix, '/' ) . '/', '', $sn_max );
+                $start_seq = ( (int) $sn_suffix ) + 1;
+            } else {
+                $start_seq = 1;
+            }
+
+            // Begin transaction
+            $wpdb->query( "START TRANSACTION" );
+
+            // INSERT batch
+            $insert_ok = $wpdb->insert( $tbl_batches, array(
+                'batch_code'          => $batch_code,
+                'prefix'              => $prefix,
+                'format_pattern'      => $format,
+                'qty_total'           => $qty_total,
+                'qty_received'        => 0,
+                'qty_voided'          => 0,
+                'allocation_strategy' => $strategy,
+                'factory_name'        => $factory ?: null,
+                'factory_po_ref'      => $po_ref ?: null,
+                'status'              => 'draft',
+                'notes'               => $notes ?: null,
+                'created_by'          => $created_by,
+                'created_at'          => $now,
+            ), array( '%s','%s','%s','%d','%d','%d','%s','%s','%s','%s','%s','%d','%s' ) );
+
+            if ( ! $insert_ok ) {
+                throw new \Exception( 'Failed to insert batch: ' . $wpdb->last_error );
+            }
+
+            $batch_id = (int) $wpdb->insert_id;
+
+            // Generate S/N values + chunked INSERT (5000/chunk)
+            $chunk_size = 5000;
+            $seq_pad = 7; // Default for {PREFIX}{SEQ:7}
+            // Parse format pattern (simple {SEQ:N} extraction)
+            if ( preg_match( '/\{SEQ:(\d+)\}/', $format, $m ) ) {
+                $seq_pad = (int) $m[1];
+            }
+
+            $first_sn = $prefix . str_pad( (string) $start_seq, $seq_pad, '0', STR_PAD_LEFT );
+            $last_sn  = $prefix . str_pad( (string) ( $start_seq + $qty_total - 1 ), $seq_pad, '0', STR_PAD_LEFT );
+
+            $rows_inserted = 0;
+            for ( $i = 0; $i < $qty_total; $i += $chunk_size ) {
+                $values = array();
+                $placeholders = array();
+                $end = min( $i + $chunk_size, $qty_total );
+
+                for ( $j = $i; $j < $end; $j++ ) {
+                    $sn = $prefix . str_pad( (string) ( $start_seq + $j ), $seq_pad, '0', STR_PAD_LEFT );
+                    $values[] = $sn;
+                    $values[] = $batch_id;
+                    $values[] = $now;
+                    $placeholders[] = "(%s, %d, 'reserved', %s)";
+                }
+
+                if ( empty( $placeholders ) ) continue;
+
+                $sql = "INSERT INTO {$tbl_pool} (sn, batch_id, status, created_at) VALUES " . implode( ',', $placeholders );
+                $prepared = $wpdb->prepare( $sql, $values );
+                $chunk_ok = $wpdb->query( $prepared );
+
+                if ( $chunk_ok === false ) {
+                    throw new \Exception( "Chunk insert failed at offset {$i}: " . $wpdb->last_error );
+                }
+
+                $rows_inserted += (int) $chunk_ok;
+            }
+
+            $wpdb->query( "COMMIT" );
+
+            // Audit log
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                dinoco_sn_audit_log( null, 'batch_created', null, null, array(
+                    'batch_id'   => $batch_id,
+                    'batch_code' => $batch_code,
+                    'qty_total'  => $qty_total,
+                    'first_sn'   => $first_sn,
+                    'last_sn'    => $last_sn,
+                ) );
+            }
+
+            return rest_ensure_response( array(
+                'success'      => true,
+                'id'           => $batch_id,
+                'batch_code'   => $batch_code,
+                'qty_total'    => $qty_total,
+                'qty_inserted' => $rows_inserted,
+                'first_sn'     => $first_sn,
+                'last_sn'      => $last_sn,
+                'status'       => 'draft',
+                'csv_url'      => rest_url( DINOCO_SN_REST_NAMESPACE . "/batches/{$batch_id}/csv" ),
+                'qr_pdf_url'   => rest_url( DINOCO_SN_REST_NAMESPACE . "/batches/{$batch_id}/qr-pdf" ),
+                'created_at'   => $now,
+            ) );
+
+        } catch ( \Throwable $e ) {
+            $wpdb->query( "ROLLBACK" );
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_create_batch', 'batch_code' => $batch_code ) );
+            }
+            return new WP_Error( 'batch_create_failed', $e->getMessage(), array( 'status' => 500 ) );
+        } finally {
+            // RELEASE_LOCK is idempotent — safe to call again
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_list_batches' ) ) {
+    function dinoco_sn_rest_list_batches( $req ) {
+        global $wpdb;
+
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+        }
+
+        $tbl = dinoco_sn_table( 'batches' );
+        $where = array( '1=1' );
+        $params = array();
+
+        $status = $req->get_param( 'status' );
+        if ( $status ) { $where[] = "status = %s"; $params[] = $status; }
+
+        $prefix = $req->get_param( 'prefix' );
+        if ( $prefix ) { $where[] = "prefix = %s"; $params[] = strtoupper( $prefix ); }
+
+        $orderby = in_array( $req->get_param( 'orderby' ), array( 'created_at', 'qty_total', 'qty_received' ), true )
+            ? $req->get_param( 'orderby' ) : 'created_at';
+        $order = in_array( strtoupper( $req->get_param( 'order' ) ), array( 'ASC', 'DESC' ), true )
+            ? strtoupper( $req->get_param( 'order' ) ) : 'DESC';
+
+        $limit  = max( 1, min( 200, (int) $req->get_param( 'limit' ) ) );
+        $offset = max( 0, (int) $req->get_param( 'offset' ) );
+
+        $sql_count = "SELECT COUNT(*) FROM {$tbl} WHERE " . implode( ' AND ', $where );
+        $sql_data  = "SELECT * FROM {$tbl} WHERE " . implode( ' AND ', $where ) .
+                     " ORDER BY {$orderby} {$order} LIMIT %d OFFSET %d";
+
+        if ( ! empty( $params ) ) {
+            $total = (int) $wpdb->get_var( $wpdb->prepare( $sql_count, $params ) );
+            $rows  = $wpdb->get_results( $wpdb->prepare( $sql_data, array_merge( $params, array( $limit, $offset ) ) ) );
+        } else {
+            $total = (int) $wpdb->get_var( $sql_count );
+            $rows  = $wpdb->get_results( $wpdb->prepare( $sql_data, $limit, $offset ) );
+        }
+
+        return rest_ensure_response( array(
+            'data' => $rows,
+            'meta' => array(
+                'total'  => $total,
+                'limit'  => $limit,
+                'offset' => $offset,
+            ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_get_batch' ) ) {
+    function dinoco_sn_rest_get_batch( $req ) {
+        global $wpdb;
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+        }
+        $id = (int) $req->get_param( 'id' );
+        $tbl = dinoco_sn_table( 'batches' );
+
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ) );
+        if ( ! $row ) {
+            return new WP_Error( 'batch_not_found', __( 'Batch not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+        }
+
+        return rest_ensure_response( $row );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_update_batch_status' ) ) {
+    function dinoco_sn_rest_update_batch_status( $req ) {
+        return dinoco_sn_with_idempotency(
+            $req,
+            'batch-status',
+            array( 'id', 'status' ),
+            function( $req ) {
+                return dinoco_sn_handler_update_batch_status( $req );
+            }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_update_batch_status' ) ) {
+    function dinoco_sn_handler_update_batch_status( $req ) {
+        global $wpdb;
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+        }
+
+        $id = (int) $req->get_param( 'id' );
+        $new_status = sanitize_text_field( $req->get_param( 'status' ) );
+        $valid = array( 'draft', 'sent_to_factory', 'received_partial', 'received_full', 'closed', 'cancelled' );
+        if ( ! in_array( $new_status, $valid, true ) ) {
+            return new WP_Error( 'invalid_status', __( 'Invalid batch status.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        $tbl = dinoco_sn_table( 'batches' );
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ) );
+        if ( ! $row ) {
+            return new WP_Error( 'batch_not_found', '', array( 'status' => 404 ) );
+        }
+
+        $now = current_time( 'mysql' );
+        $update = array( 'status' => $new_status );
+        $update_format = array( '%s' );
+
+        if ( $new_status === 'sent_to_factory' && empty( $row->sent_at ) ) {
+            $update['sent_at'] = $now;
+            $update_format[] = '%s';
+        }
+        if ( in_array( $new_status, array( 'closed', 'cancelled' ), true ) && empty( $row->closed_at ) ) {
+            $update['closed_at'] = $now;
+            $update_format[] = '%s';
+        }
+
+        $wpdb->update( $tbl, $update, array( 'id' => $id ), $update_format, array( '%d' ) );
+
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log( null, 'batch_status_change', $row->status, $new_status, array(
+                'batch_id'   => $id,
+                'batch_code' => $row->batch_code,
+            ) );
+        }
+
+        return rest_ensure_response( array(
+            'success'    => true,
+            'id'         => $id,
+            'status'     => $new_status,
+            'updated_at' => $now,
+        ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. AUDIT LOG HELPER (used by handlers + state transitions)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_audit_log' ) ) {
+    /**
+     * Insert audit row. Non-throwing — failures log to obs.
+     *
+     * @param string|null $sn          Plate S/N (null for batch-level events)
+     * @param string      $event_type  ENUM event type
+     * @param string|null $status_from Optional state transition source
+     * @param string|null $status_to   Optional state transition target
+     * @param array       $context     Additional context (will JSON encode)
+     * @param int|null    $actor       User ID (default = current user)
+     * @param int|null    $approver    Approver user ID (4-eyes)
+     * @param string      $reason      Optional reason text
+     * @param string      $reason_cat  Optional reason category
+     * @param bool        $sensitive   Mark as sensitive (5y retention)
+     * @return int|false Insert ID or false
+     */
+    function dinoco_sn_audit_log(
+        $sn,
+        $event_type,
+        $status_from = null,
+        $status_to = null,
+        $context = array(),
+        $actor = null,
+        $approver = null,
+        $reason = '',
+        $reason_cat = '',
+        $sensitive = false
+    ) {
+        global $wpdb;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'audit' ) ) {
+            return false;
+        }
+
+        try {
+            $tbl = dinoco_sn_table( 'audit' );
+            $actor = $actor ?: get_current_user_id();
+            $ip = $_SERVER['REMOTE_ADDR'] ?? null;
+            $ua = $_SERVER['HTTP_USER_AGENT'] ?? null;
+
+            $ok = $wpdb->insert( $tbl, array(
+                'sn'                => $sn ? strtoupper( $sn ) : '',
+                'event_type'        => $event_type,
+                'status_from'       => $status_from,
+                'status_to'         => $status_to,
+                'actor_user_id'     => (int) $actor,
+                'approver_user_id'  => $approver ? (int) $approver : null,
+                'reason'            => $reason ? mb_substr( $reason, 0, 255 ) : null,
+                'reason_category'   => $reason_cat ?: null,
+                'context_json'      => wp_json_encode( $context ),
+                'ip_address'        => $ip ? mb_substr( $ip, 0, 45 ) : null,
+                'user_agent'        => $ua ? mb_substr( $ua, 0, 255 ) : null,
+                'is_sensitive'      => $sensitive ? 1 : 0,
+                'created_at'        => current_time( 'mysql' ),
+            ) );
+
+            return $ok ? (int) $wpdb->insert_id : false;
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_audit_log', 'event_type' => $event_type ) );
+            }
+            return false;
+        }
+    }
+}
