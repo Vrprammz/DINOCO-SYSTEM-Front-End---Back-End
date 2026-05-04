@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO S/N REST API                                   ║
+ * ║  Version: V.0.3 (2026-05-04) — Phase 1 W3 Day 4-5 CSV + QR PDF gen║
  * ║  Version: V.0.2 (2026-05-04) — Phase 1 W2 Day 4 receive endpoints ║
  * ║  Version: V.0.1 (2026-05-04) — Phase 1 W2 Day 1-2 Foundation     ║
  * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
@@ -362,6 +363,27 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                     'type'     => 'string',
                     'enum'     => array( 'draft', 'sent_to_factory', 'received_partial', 'received_full', 'closed', 'cancelled' ),
                 ),
+            ),
+        ) );
+
+        // GET /batches/{id}/csv — download S/N list CSV
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches/(?P<id>\d+)/csv', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_batch_csv',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id' => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /batches/{id}/qr-pdf — generate QR PDF (per chunk, Phase 1 W3 D5)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches/(?P<id>\d+)/qr-pdf', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_batch_qr_pdf',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id'    => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'chunk' => array( 'type' => 'integer', 'default' => 1, 'sanitize_callback' => 'absint' ),
             ),
         ) );
 
@@ -766,6 +788,157 @@ if ( ! function_exists( 'dinoco_sn_handler_update_batch_status' ) ) {
             'id'         => $id,
             'status'     => $new_status,
             'updated_at' => $now,
+        ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6.4. CSV + QR PDF GENERATION (V.0.3 — Phase 1 W3 Day 4-5)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_batch_csv' ) ) {
+    /**
+     * GET /dinoco-sn/v1/batches/{id}/csv
+     *
+     * Stream CSV of all S/N in batch — for sending to factory.
+     * Format: PREFIX, SN, status, created_at
+     *
+     * Performance: streams chunked 5000/iter — handles 1M plates without OOM.
+     */
+    function dinoco_sn_rest_batch_csv( $req ) {
+        global $wpdb;
+        $id = (int) $req->get_param( 'id' );
+
+        $tbl_batches = dinoco_sn_table( 'batches' );
+        $tbl_pool = dinoco_sn_table( 'pool' );
+
+        $batch = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl_batches} WHERE id = %d", $id ) );
+        if ( ! $batch ) {
+            return new WP_Error( 'batch_not_found', '', array( 'status' => 404 ) );
+        }
+
+        // Stream CSV directly to output (no buffering)
+        nocache_headers();
+        header( 'Content-Type: text/csv; charset=utf-8' );
+        header( 'Content-Disposition: attachment; filename="' . sanitize_file_name( $batch->batch_code ) . '.csv"' );
+
+        // BOM for Excel UTF-8
+        echo "\xEF\xBB\xBF";
+
+        // Header
+        echo "S/N,Prefix,Status,Created At,Batch Code\n";
+
+        $chunk = 5000;
+        $offset = 0;
+        do {
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, status, created_at FROM {$tbl_pool}
+                 WHERE batch_id = %d
+                 ORDER BY sn ASC
+                 LIMIT %d OFFSET %d",
+                $id, $chunk, $offset
+            ) );
+            if ( empty( $rows ) ) break;
+
+            foreach ( $rows as $row ) {
+                echo sprintf(
+                    "%s,%s,%s,%s,%s\n",
+                    $row->sn,
+                    $batch->prefix,
+                    $row->status,
+                    $row->created_at,
+                    $batch->batch_code
+                );
+            }
+            $offset += $chunk;
+            if ( ob_get_length() ) ob_flush();
+            flush();
+        } while ( count( $rows ) === $chunk );
+
+        // Audit
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log( null, 'batch_csv_downloaded', null, null, array(
+                'batch_id'   => $id,
+                'batch_code' => $batch->batch_code,
+                'qty_total'  => $batch->qty_total,
+            ), null, null, '', '', false );
+        }
+
+        exit; // Prevent WP from appending HTML
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_batch_qr_pdf' ) ) {
+    /**
+     * GET /dinoco-sn/v1/batches/{id}/qr-pdf?chunk=N
+     *
+     * Generate QR PDF chunked (5000 plates/file ~250MB max). Frontend
+     * sequentially downloads chunks 1..N (per v2.4 F8 fix).
+     *
+     * Phase 1 W3 = scaffold only. Full PDF generation requires:
+     *   - QR code library (e.g., chillerlan/php-qrcode via composer)
+     *   - PDF library (e.g., TCPDF, FPDF, mPDF)
+     *
+     * For Phase 1 W4 pilot — return JSON metadata; PDF generation
+     * deferred to Phase 1 W4 (after batch creation tested).
+     */
+    function dinoco_sn_rest_batch_qr_pdf( $req ) {
+        global $wpdb;
+        $id = (int) $req->get_param( 'id' );
+        $chunk = max( 1, (int) $req->get_param( 'chunk' ) );
+
+        $tbl_batches = dinoco_sn_table( 'batches' );
+        $tbl_pool = dinoco_sn_table( 'pool' );
+
+        $batch = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl_batches} WHERE id = %d", $id ) );
+        if ( ! $batch ) {
+            return new WP_Error( 'batch_not_found', '', array( 'status' => 404 ) );
+        }
+
+        $chunk_size = 5000;
+        $total_chunks = (int) ceil( $batch->qty_total / $chunk_size );
+        $offset = ( $chunk - 1 ) * $chunk_size;
+        $end = min( $offset + $chunk_size, $batch->qty_total );
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT sn FROM {$tbl_pool}
+             WHERE batch_id = %d
+             ORDER BY sn ASC
+             LIMIT %d OFFSET %d",
+            $id, $chunk_size, $offset
+        ) );
+
+        // Phase 1 W3 D4-5: return JSON metadata + per-S/N URL list
+        // Phase 1 W4: integrate actual PDF generation (composer require)
+
+        // Generate QR URL per S/N (reusable for printing labels)
+        $base = home_url( '/warranty/activate?sn=' );
+        $sns = array_map( function( $r ) use ( $base ) {
+            return array(
+                'sn'  => $r->sn,
+                'url' => $base . urlencode( $r->sn ),
+                // QR data URL (server-side QR generation needs library — placeholder for now)
+                'qr_placeholder' => 'data:image/svg+xml;utf8,' . urlencode(
+                    sprintf(
+                        '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120"><rect width="120" height="120" fill="white"/><text x="60" y="65" text-anchor="middle" font-family="monospace" font-size="10">%s</text></svg>',
+                        $r->sn
+                    )
+                ),
+            );
+        }, $rows );
+
+        return rest_ensure_response( array(
+            'batch_id'     => $id,
+            'batch_code'   => $batch->batch_code,
+            'chunk'        => $chunk,
+            'total_chunks' => $total_chunks,
+            'chunk_size'   => $chunk_size,
+            'qty_in_chunk' => count( $rows ),
+            'sns'          => $sns,
+            'note'         => 'Phase 1 W3 returns metadata. Phase 1 W4 will integrate composer require + serve PDF binary.',
+            'next_chunk_url' => $chunk < $total_chunks
+                ? rest_url( DINOCO_SN_REST_NAMESPACE . "/batches/{$id}/qr-pdf?chunk=" . ( $chunk + 1 ) )
+                : null,
         ) );
     }
 }
