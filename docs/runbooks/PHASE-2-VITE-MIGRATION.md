@@ -1007,6 +1007,59 @@ npm run lint && npm run typecheck   # clean
 
 ---
 
+## Step 2.5 Round 11 R4 — LIFF AI Frontend code port (Round 4 — inline-bridge cleanup) ✅ (2026-05-02) — ALL 4 LIFF SURFACES R4 COMPLETE
+
+Final R4 of the four LIFF surfaces. Drops the V.0.4 legacy `window.*` bridge globals (13 dropped) and replaces inline `onclick="navigate('dashboard')"` in `pages/agentChat.js` with declarative `data-action="go-tab" data-tab="dashboard"`. Inline `[LIFF AI] Snippet 2: Frontend` V.3.10 stays untouched — REG-029 byte-identical preserved until Round 5 destructive cut-over.
+
+### Round 11 R4 — what landed
+
+- NEW `liff-src/liff-ai/frontend/event-delegation.js` (~310 LOC, default export `setupEventDelegation(root, deps)`). Action taxonomy: `go-tab` / `navigate` / `back` / `refresh` / `open-lead-detail` / `accept-lead` / `add-lead-note` / `show-lead-status-modal` / `change-lead-status` / `open-claim-detail` / `show-claim-status-modal` / `change-claim-status` / `open-photo-lightbox` / `close-photo-lightbox` / `ask-agent` / `quick-question` / `submit-agent-question` (form submit).
+- Backward compat: legacy `[data-quick]` (no `data-action`) still routes to `askAgent` so V.0.3 emits keep working.
+- Defensive: noop when root null/undefined/non-Element / deps null. Handler-thrown errors caught + `console.error` — listener stays alive across siblings. Promise rejections from async handlers caught.
+- `entry.js` V.0.4 → V.0.5: dropped 13 legacy bridge globals + dropped `window.DINOCO_LIFF_AI_RENDERERS`. Single frozen `window.DINOCO_LIFF_AI` debug surface retained.
+- `pages/agentChat.js` V.0.3 → V.0.4: 0 inline `onclick=` HTML attributes remain.
+- Adapter wrappers in entry.js handle signature mismatches: `acceptLead`/`addLeadNote` strip optional `btn` arg, `showLeadStatusModal` passes empty `allowed[]`, `showClaimStatusModal` passes empty `currentStatus`, `openPhotoLightbox` wraps single URL into `[url], 0`.
+
+### Round 11 R4 — bundle deltas (R3 → R4)
+
+| Asset | V.0.4 (R3) | V.0.5 (R4) | Delta |
+| --- | --- | --- | --- |
+| `dist/liff/liff-ai.*.js` | 42.08 KB | 44.49 KB | +2.41 KB |
+| `dist/liff/liff-ai.*.js` (gzip) | 10.99 KB | 11.57 KB | +0.58 KB |
+
+Stays well under 64 KB per-entry guard. Total dist ~286 KB across 4 surfaces; ceiling 320 KB intact.
+
+### Round 11 R4 — tests
+
+- NEW `tests/jest/liff-ai-bridge.test.js` (~530 LOC, **57 cases**) — 8 describe blocks: basic contract / navigation / lead actions / claim actions / photo lightbox / agent chat / error+unknown handling / source-level drift checks (entry.js V.0.5 + pages/agentChat.js no-onclick).
+- Updated 1 assertion in `tests/jest/liff-ai-pages.test.js` (R3 inline onclick check → R4 data-action check).
+- Drift detector parametrized `test.each` over 13 legacy globals — fails CI if any reappear.
+- Total Jest: 1341 → 1398 (+57).
+
+### Round 11 R4 — verifying locally
+
+```bash
+npm run build:liff
+npm run test:jest
+npm run lint
+npm run typecheck
+```
+
+All pass.
+
+### ALL 4 LIFF SURFACES R4 COMPLETE
+
+| Surface | Round 4 status | Inline cut-over |
+| --- | --- | --- |
+| `b2b-catalog` | ✅ done (V.0.5) | Round 5 pending |
+| `b2f-maker` | ✅ done | Round 5 pending |
+| `b2f-catalog` | ✅ done (V.0.5) | Round 5 pending |
+| `liff-ai` | ✅ done (V.0.5) — this commit | Round 5 pending |
+
+Round 5 (destructive cut-over): drops inline JS blocks from Snippet 4 / Snippet 8 / Maker LIFF / Snippet 2 — pending user confirmation + 1-week canary observation per surface (smallest blast radius first: `b2f-maker` → `liff-ai` → `b2f-catalog` → `b2b-catalog`). Rollback (zero-redeploy) per surface: `wp option update dinoco_liff_use_vite_<surface> 0`.
+
+---
+
 ## References
 
 - `[System] DINOCO LIFF Asset Loader` snippet — runtime helper

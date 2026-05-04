@@ -10,6 +10,64 @@ Snippet versioning ของ feature changes ดูใน individual snippet hea
 
 ## [Unreleased]
 
+### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 4 — inline-bridge cleanup — ALL 4 LIFF SURFACES R4 COMPLETE (2026-05-02)
+
+Final Round 4 of the four LIFF surfaces (b2b-catalog / b2f-maker / b2f-catalog / liff-ai). Drops the V.0.4 legacy `window.*` bridge globals (13 dropped) and replaces inline `onclick=` in `pages/agentChat.js` with a declarative `data-action="..."` taxonomy consumed by a single click + change + submit listener on the root mount. Inline `[LIFF AI] Snippet 2: Frontend` V.3.10 stays untouched — REG-029 byte-identical preserved until Round 5 destructive cut-over (drop inline JS blocks pending user confirmation + 1-week canary).
+
+**New files** (1 module + 1 test):
+
+- `liff-src/liff-ai/frontend/event-delegation.js` (~310 LOC) — `setupEventDelegation(root, deps)` returns a cleanup fn. Action taxonomy mirrors V.3.10 inline emit sites:
+  - Navigation: `go-tab` / `navigate` / `back` / `refresh`
+  - Lead: `open-lead-detail` / `accept-lead` / `add-lead-note` / `show-lead-status-modal` / `change-lead-status`
+  - Claim: `open-claim-detail` / `show-claim-status-modal` / `change-claim-status`
+  - Photo lightbox: `open-photo-lightbox` / `close-photo-lightbox`
+  - Agent chat: `ask-agent` / `quick-question` / `submit-agent-question` (form submit)
+  - Backward compat: legacy `[data-quick]` (without `data-action`) still routes to `askAgent` so V.0.3 emits keep working.
+  - Defensive: noop when root null/undefined/non-Element / deps null. Handler-thrown errors caught + `console.error` — listener stays alive across siblings. Promise rejections from async handlers (`askAgent`, `acceptLead`, etc.) caught with `.catch(console.error)`.
+- `tests/jest/liff-ai-bridge.test.js` (~530 LOC, **57 cases**) — 8 describe blocks: basic contract / navigation / lead actions / claim actions / photo lightbox / agent chat / error+unknown handling / source-level drift checks (entry.js V.0.5 + pages/agentChat.js no-onclick).
+
+**entry.js V.0.4 → V.0.5**:
+
+- DROPPED 13 legacy bridge globals: `window.{navigate, goToTab, openLeadDetail, openClaimDetail, handleAskAgent, handleAcceptLead, handleNoteAdd, handleStatusChange, handleClaimStatusUpdate, showStatusChangeModal, showClaimStatusModal, openLightbox, closeLightbox}`.
+- DROPPED `window.DINOCO_LIFF_AI_RENDERERS` — pages emit declarative attributes; renderer list still available via the module's `export {}` block for test consumption.
+- ADDED `setupEventDelegation()` call in bootstrap, mounted on `#liff-ai-app` (or `[data-liff-ai-root]` / body fallback). Adapter wrappers handle signature mismatches: `acceptLead`/`addLeadNote` strip optional `btn` arg, `showLeadStatusModal` passes empty `allowed[]` (modal fetches from FSM), `showClaimStatusModal` passes empty `currentStatus` (modal fetches from claim detail), `openPhotoLightbox` wraps single URL into `[url], 0` to fit `openLightbox(photos[], idx)` signature, `refresh` re-dispatches via `getCurrentTab()` switch.
+- KEPT single frozen debug surface `window.DINOCO_LIFF_AI` (version V.0.5 + api + state + router + loaders) for tests + console debugging.
+- EXPORTED `setupEventDelegation` from the entry barrel for test consumption.
+
+**pages/agentChat.js V.0.3 → V.0.4**:
+
+- Close button: `onclick="navigate('dashboard')"` → `data-action="go-tab" data-tab="dashboard"`.
+- Quick-question chips: now emit BOTH `data-action="quick-question"` AND `data-quick="<text>"` (delegation supports both — backward-compat for V.0.3).
+- 0 inline `onclick=` HTML attributes remain in any pages/* file.
+
+**Tests** (1341 → 1398, **+57 cases**):
+
+- `tests/jest/liff-ai-bridge.test.js` (NEW, 57 cases).
+- `tests/jest/liff-ai-pages.test.js` updated 1 assertion: "preserves inline onclick on close button (Round 4 will migrate)" → "close button uses data-action=go-tab (Round 4 — no inline onclick)".
+- Drift detector: source-level scan asserts (a) entry.js does NOT assign any of 13 legacy globals (parametrized `test.each`), (b) entry.js does NOT assign `window.DINOCO_LIFF_AI_RENDERERS`, (c) entry.js KEEPS frozen `window.DINOCO_LIFF_AI`, (d) entry.js calls `setupEventDelegation`, (e) entry.js bumps to V.0.5, (f) `pages/agentChat.js` does NOT contain inline `onclick=` HTML attribute, (g) close button uses `data-action="go-tab"` + `data-tab="dashboard"`, (h) quick-question chips emit `data-action="quick-question"`. Comment-stripper avoids false positives where commentary mentions legacy globals.
+
+**Bundle delta** (`npm run build:liff`):
+
+| Asset | V.0.4 (R3) | V.0.5 (R4) | Delta |
+| --- | --- | --- | --- |
+| `dist/liff/liff-ai.*.js` | 42.08 KB | 44.49 KB | +2.41 KB |
+| `dist/liff/liff-ai.*.js` (gzip) | 10.99 KB | 11.57 KB | +0.58 KB |
+
+Bundle stays well under the 64 KB per-entry guard. Total dist now ~286 KB across 4 surfaces; ceiling 320 KB intact.
+
+**Final state** — All 4 LIFF surfaces R1-4 complete:
+
+| Surface | Round 4 status | Inline cut-over |
+| --- | --- | --- |
+| `b2b-catalog` | ✅ done (V.0.5) | Round 5 pending |
+| `b2f-maker` | ✅ done | Round 5 pending |
+| `b2f-catalog` | ✅ done (V.0.5) | Round 5 pending |
+| `liff-ai` | ✅ done (V.0.5) — this commit | Round 5 pending |
+
+Round 5 (destructive cut-over): drops inline JS blocks from Snippet 4 / Snippet 8 / Maker LIFF / Snippet 2 — pending user confirmation + 1-week canary observation per surface (smallest blast radius first: `b2f-maker` → `liff-ai` → `b2f-catalog` → `b2b-catalog`). Rollback (zero-redeploy) per surface: `wp option update dinoco_liff_use_vite_<surface> 0`.
+
+---
+
 ### Feature — Vite LIFF AI Frontend (Snippet 2) code port Round 3 — router + API + auth-flow + 6 loaders (2026-05-02)
 
 Continues from Round 2 page renderers. Round 3 ports the runtime layer (router + API wrapper + auth flow + 6 page loaders) so Round 2 renderers connect to live data + handlers. Mirrors prior R3 patterns (B2F Maker R3, B2B Catalog R3, B2F Catalog R3). Inline `[LIFF AI] Snippet 2: Frontend` V.3.10 stays untouched — REG-029 byte-identical preserved until Round 5 cut-over.
