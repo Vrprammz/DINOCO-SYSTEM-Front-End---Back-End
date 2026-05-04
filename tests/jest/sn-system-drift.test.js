@@ -184,6 +184,62 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toContain('is_sensitive');
     });
 
+    test('Phase 3 W8.2 recall + reissue + reconcile-report endpoints', () => {
+        const code = readSnippet('rest');
+        const expected_endpoints = [
+            "/recall'",
+            "/reissue'",
+            "/reconcile-report'",
+        ];
+        expected_endpoints.forEach(ep => expect(code).toContain(ep));
+        // Handlers exist
+        expect(code).toContain('dinoco_sn_rest_recall');
+        expect(code).toContain('dinoco_sn_rest_reissue');
+        expect(code).toContain('dinoco_sn_rest_reconcile_report');
+    });
+
+    test('Phase 3 W8 recall categories whitelist enforced', () => {
+        const code = readSnippet('rest');
+        // 5 recall categories per App K M14
+        ['defect', 'safety', 'stolen', 'fraud', 'misship'].forEach(c => {
+            expect(code).toContain(`'${c}'`);
+        });
+    });
+
+    test('Phase 3 W8 recall/reissue audit rows are sensitive', () => {
+        const code = readSnippet('rest');
+        // Both /recall and /reissue handlers must pass is_sensitive=true
+        // (5y PDPA retention via dinoco_sn_run_audit_retention cron).
+        // Locate recall handler block + verify audit_log call has true arg.
+        const recallStart = code.indexOf('function dinoco_sn_rest_recall');
+        const reissueStart = code.indexOf('function dinoco_sn_rest_reissue');
+        const reconcileStart = code.indexOf('function dinoco_sn_rest_reconcile_report');
+        expect(recallStart).toBeGreaterThan(-1);
+        expect(reissueStart).toBeGreaterThan(-1);
+        expect(reconcileStart).toBeGreaterThan(recallStart);
+        const recallBlock = code.substring(recallStart, reissueStart);
+        const reissueBlock = code.substring(reissueStart, reconcileStart);
+        // Both blocks call audit_log with is_sensitive=true (last `true` arg)
+        expect(recallBlock).toContain('dinoco_sn_audit_log');
+        expect(recallBlock).toMatch(/true\s*\);/);
+        expect(reissueBlock).toContain('dinoco_sn_audit_log');
+        expect(reissueBlock).toMatch(/true\s*\);/);
+    });
+
+    test('Phase 3 W8.3 reconcile UI mounted in audit tab', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('dnc-sn-reconcile-card');
+        expect(code).toContain('dncSnLoadReconcileReport');
+        // Lazy-load on tab activation
+        expect(code).toContain('_dncSnReconcileLoaded');
+    });
+
+    test('Phase 3 W8 Recall button wired in search row + handler exists', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('dncSnRecallPrompt');
+        expect(code).toContain('⚠️ Recall');
+    });
+
     test('LIFF activate registers POST /activate endpoint', () => {
         const code = readSnippet('liff');
         expect(code).toContain("'/activate'");
