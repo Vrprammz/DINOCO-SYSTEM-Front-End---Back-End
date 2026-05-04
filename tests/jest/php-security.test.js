@@ -78,7 +78,7 @@ const PHP_SECURITY_ALLOWLIST = new Set([
     // re-pinned 2026-04-30 (Round 51 V.3.22 header insertion +37 lines for
     // batch 29 push toward 80% wrap of 5 b2f-audit cluster endpoints).
     // Re-verify if line moves again.
-    "[Admin System] B2F Migration Audit:1046:RCE_SHELL",
+    "[Admin System] B2F Migration Audit:1065:RCE_SHELL",
 ]);
 
 /**

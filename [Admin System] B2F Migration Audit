@@ -1,5 +1,24 @@
 /**
  * [Admin System] B2F Migration Audit
+ * Version: V.3.23 (2026-05-02) — Round 52 batch 30 idempotency wrap (push toward 80%):
+ *   2 endpoints in dinoco-b2f-audit/v1 cluster (6 → 8/20). Cluster expansion
+ *   continues. POST /feature-flags/toggle — admin flag flip. Body hash =
+ *   single+enum {flag, value (boolean), user_id}. Different value mid-retry
+ *   (admin re-evaluated ON↔OFF) → 409 prevents wrong final flag state via
+ *   cached replay — CRITICAL for shadow_write / read_from_junction /
+ *   order_intent flags that gate cut-over phases. Layered defense over
+ *   existing dependency-chain guards (shadow_write requires schema+backfill
+ *   etc.) which run BEFORE wrapper. Cached replay skips 2× update_option
+ *   + 2× b2f_log_flag_change + 2× dinoco_flag_audit_log audit row.
+ *   POST /junction-bulk-update-display — bulk admin display mode flip
+ *   (max 200 SKUs). Layered defense over V.3.16 ad-hoc transient (request
+ *   param idempotency_key 60s TTL) — central helper uses standard
+ *   X-Idempotency-Key header — both can coexist (this wrap checked first).
+ *   Body hash = bulk-of-targets {maker_id, skus_sorted_dedup,
+ *   admin_display_mode, user_id}. SKUs sort()'d for order-stable hash.
+ *   Different admin_display_mode mid-retry (auto→as_set or auto→as_parts)
+ *   → 409 prevents wrong final display state via cached replay across up
+ *   to 200 SKUs at once.
  * Version: V.3.22 (2026-04-30) — Round 51 batch 29 idempotency wrap (push toward 80%):
  *   5 endpoints in dinoco-b2f-audit/v1 cluster (1 → 6/20, namespace cluster expansion).
  *   POST /sync-missing-intermediates — coverage rule cleanup. Body hash =
@@ -2362,6 +2381,49 @@ add_action( 'rest_api_init', function () {
                 }
             }
 
+            // V.3.23 (Round 52 batch 30): Idempotency-Key wrap. Body hash =
+            // single+enum {flag, value (boolean), user_id}. Different value
+            // mid-retry (admin re-evaluated ON↔OFF) → 409 prevents wrong final
+            // flag state via cached replay (cached ON returning when admin
+            // wanted OFF would leave flag stuck enabled — CRITICAL for
+            // shadow_write / read_from_junction / order_intent flags that
+            // gate cut-over phases). flag_name discriminator catches admin
+            // clicking different flag mid-retry. user_id scopes per-admin.
+            // confirm EXCLUDED — boolean gate already validated above; cached
+            // replay only stores success path. Layered defense over existing
+            // dependency-chain guards (shadow_write requires schema+backfill,
+            // order_intent requires v11_explicit_mode etc.) which run BEFORE
+            // wrapper — wrapper protects double-flip race during peak admin
+            // ops (multi-tab dashboard with same flag selected) + cached
+            // replay skips 2× update_option + 2× b2f_log_flag_change + 2×
+            // dinoco_flag_audit_log audit row spam.
+            $uid_idem        = get_current_user_id();
+            $idem_key        = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace  = 'dinoco-b2f-audit/v1::feature-flags/toggle';
+            $idem_body       = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'flag'    => $flag,
+                    'value'   => $value ? 1 : 0,
+                    'user_id' => $uid_idem,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
+            }
+
             $old = (bool) get_option( $flag, false );
             $new = (bool) $value;
             update_option( $flag, $new, false );
@@ -2376,7 +2438,7 @@ add_action( 'rest_api_init', function () {
                 dinoco_flag_audit_log( $flag, $old, $new, '[B2F Migration Audit /feature-flags/toggle]', 'rest_api' );
             }
 
-            return rest_ensure_response( array(
+            $resp = array(
                 'success' => true,
                 'data'    => array(
                     'flag_name' => $flag,
@@ -2385,7 +2447,19 @@ add_action( 'rest_api_init', function () {
                     'changed_at'=> current_time( 'mysql' ),
                     'uid'       => get_current_user_id(),
                 ),
-            ) );
+            );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
     ) );
 
@@ -3374,6 +3448,52 @@ add_action( 'rest_api_init', function () {
             $uid = get_current_user_id();
             $now = current_time( 'mysql' );
 
+            // V.3.23 (Round 52 batch 30): Central Idempotency-Key wrap. Layered
+            // defense over existing V.3.16 ad-hoc transient (request param
+            // `idempotency_key` 60s TTL above). Central helper uses standard
+            // X-Idempotency-Key HTTP header — both can coexist (this wrap
+            // checked first; ad-hoc transient retained for backward compat).
+            // Body hash = bulk-of-targets {maker_id, skus_sorted_dedup,
+            // admin_display_mode, user_id}. SKUs already canonicalized
+            // (uppercase + dedup); ksort'd here for order-stable hash so admin
+            // re-uploads same set in different order = cached 200 instant.
+            // Different admin_display_mode mid-retry (admin re-evaluated
+            // auto→as_set or auto→as_parts) → 409 prevents wrong final display
+            // state via cached replay (cached "as_set" replay returning when
+            // admin actually wanted "as_parts" would leave SETs displayed as
+            // bundle when admin wanted broken-out parts list — UX drift across
+            // up to 200 SKUs at once). Cached replay skips 2× transaction +
+            // 2× UPDATE per SKU (up to 200) + 2× observations INSERT storm
+            // + 2× b2f_junction_updated cache invalidation hook.
+            $sku_hash_input = $skus;
+            sort( $sku_hash_input );
+            $idem_key_hdr        = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace_hdr  = 'dinoco-b2f-audit/v1::junction-bulk-update-display';
+            $idem_body_hdr       = null;
+            if ( $idem_key_hdr !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body_hdr = array(
+                    'maker_id'           => $maker_id,
+                    'skus'               => $sku_hash_input,
+                    'admin_display_mode' => $display,
+                    'user_id'            => $uid,
+                );
+                $cached_hdr = dinoco_idempotency_check( $idem_key_hdr, $idem_namespace_hdr, $idem_body_hdr );
+                if ( is_wp_error( $cached_hdr ) ) {
+                    $err_data    = $cached_hdr->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached_hdr ) ) {
+                    $resp_cached = $cached_hdr;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
+            }
+
             // Server-side PHP validator (MED-2 CHECK equivalent): single + as_parts blocked
             // We cannot know production_mode of each row yet — fetch first (inside transaction).
 
@@ -3486,10 +3606,24 @@ add_action( 'rest_api_init', function () {
                 ) );
             }
 
-            return rest_ensure_response( array(
+            $resp_full = array(
                 'success' => true,
                 'data'    => $payload,
-            ) );
+            );
+
+            // V.3.23 (Round 52 batch 30): store cached response (central helper —
+            // layered defense over V.3.16 ad-hoc transient above).
+            if ( $idem_key_hdr !== '' && $idem_body_hdr !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key_hdr,
+                    $idem_namespace_hdr,
+                    $idem_body_hdr,
+                    array_merge( $resp_full, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp_full );
         },
     ) );
 

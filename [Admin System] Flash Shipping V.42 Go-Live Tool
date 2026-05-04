@@ -2,6 +2,23 @@
  * File: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Template Name: [Admin System] Flash Shipping V.42 Go-Live Tool
  * Shortcode: [dinoco_flash_v42_golive]
+ * Version: V.2.0 (2026-05-02) — Round 52 batch 30 idempotency wrap (push toward 80%):
+ *   3 endpoints in dinoco-flash-golive/v1 cluster (NEW namespace integration).
+ *   POST /auto-detect-all — chunked admin migration tool (500 SKU/page).
+ *     Body hash = single+chunk-pagination {action, dry_run, offset, user_id}.
+ *     Per-chunk idempotency: same offset retry = cached 200 instant; admin
+ *     dry_run=1 preview vs dry_run=0 commit mid-loop → 409.
+ *   POST /bulk-assign-defaults — sister endpoint, same chunked pattern.
+ *     Same body shape — namespace discriminator separates from auto-detect-all.
+ *   POST /save-pack-slots — admin per-SKU multi-box config save (replace-all).
+ *     Body hash = bulk-shape {sku UPPER, slots[] sorted by slot_index normalized
+ *     box_template_id + content_weight_g per row, user_id}. Different slots
+ *     mid-retry (admin re-evaluated box assignment 5→7 or weight 1000→1500)
+ *     → 409 prevents wrong final pack-slot config via cached replay — CRITICAL
+ *     for accurate Flash Express shipping label dimensions/weight/insurance.
+ *   Layered defense over existing GET_LOCK fsv42_bulk_op (auto-detect-all +
+ *   bulk-assign-defaults) and START TRANSACTION (save-pack-slots) — wrapper
+ *   adds full-TTL replay protection beyond microsecond DB lock window.
  * Version: V.1.9 (2026-04-29) — Round 3 Pending Items Sprint — Flag Audit Log integration:
  *   • POST /flip-flag now also writes to wp_dinoco_flag_audit table via dinoco_flag_audit_log()
  *     helper (centralized cross-system flag history). Existing wp_dinoco_flash_audit row
@@ -393,6 +410,48 @@ add_action( 'rest_api_init', function() {
             }
             $dry_run = (bool) $req->get_param( 'dry_run' );
 
+            // V.2.0 (Round 52 batch 30): Idempotency-Key wrap. Body hash =
+            // single+chunk-pagination {action:'auto-detect-all', dry_run,
+            // offset, user_id}. **11th constant-marker** flavor (with chunk
+            // pagination scope). Admin "Auto-detect All" wizard runs chunked
+            // 500/page loop (V.1.7 LOW-2) — each chunk is a separate POST.
+            // Per-chunk idempotency: same offset retry (network glitch /
+            // wizard re-render) = cached 200 instant; admin clicks dry_run=1
+            // preview vs dry_run=0 commit mid-loop → 409 prevents wrong
+            // chunk applied (cached preview replay would silently skip
+            // committing live UPDATEs to wp_dinoco_products column pack_mode).
+            // Cached replay skips 2× SELECT chunk + 2× dinoco_smart_detect_
+            // pack_mode loop (~500 SKUs × call_count) + 2× UPDATE storm.
+            $uid_idem        = get_current_user_id();
+            $offset_idem     = intval( $req->get_param( 'offset' ) ?: 0 );
+            if ( $offset_idem < 0 ) $offset_idem = 0;
+            $idem_key        = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace  = 'dinoco-flash-golive/v1::auto-detect-all';
+            $idem_body       = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'action'  => 'auto-detect-all',
+                    'dry_run' => $dry_run ? 1 : 0,
+                    'offset'  => $offset_idem,
+                    'user_id' => $uid_idem,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
+            }
+
             // V.1.2 C-Conc-H3: serialize bulk UPDATE across PHP workers via MySQL advisory lock
             $lock_name = 'fsv42_bulk_op';
             $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 2)", $lock_name ) );
@@ -438,7 +497,7 @@ add_action( 'rest_api_init', function() {
                     DINOCO_Catalog::flush_memo();
                 }
                 $has_more = count( $rows ) === $chunk_size;
-                return rest_ensure_response( array(
+                $resp = array(
                     'ok'          => true,
                     'dry_run'     => $dry_run,
                     'scanned'     => count( $rows ),
@@ -446,7 +505,17 @@ add_action( 'rest_api_init', function() {
                     'samples'     => $samples,
                     'has_more'    => $has_more,
                     'next_offset' => $has_more ? $offset + $chunk_size : null,
-                ) );
+                );
+                if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                    dinoco_idempotency_store(
+                        $idem_key,
+                        $idem_namespace,
+                        $idem_body,
+                        array_merge( $resp, array( '_idem_code' => 200 ) ),
+                        200
+                    );
+                }
+                return rest_ensure_response( $resp );
             } finally {
                 $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
             }
@@ -460,6 +529,47 @@ add_action( 'rest_api_init', function() {
         'callback' => function( $req ) {
             global $wpdb;
             $dry_run = (bool) $req->get_param( 'dry_run' );
+
+            // V.2.0 (Round 52 batch 30): Idempotency-Key wrap. Body hash =
+            // single+chunk-pagination {action:'bulk-assign-defaults', dry_run,
+            // offset, user_id}. Same shape as auto-detect-all (sister endpoint
+            // — both chunked-pagination admin tools). Per-chunk idempotency
+            // protects retry on flaky network during 100K+ SKU catalog scan.
+            // Different dry_run mid-loop → 409 catches preview→commit drift.
+            // Different offset = different chunk = independent idempotency
+            // (admin clicked "next page" button = legitimate progression).
+            // Cached replay skips 2× SELECT + 2× dinoco_fsv42_suggest_template
+            // _by_weight loop + 2× UPDATE storm + 2× cache flush + 2×
+            // DINOCO_Catalog::flush_memo.
+            $uid_idem        = get_current_user_id();
+            $offset_idem     = intval( $req->get_param( 'offset' ) ?: 0 );
+            if ( $offset_idem < 0 ) $offset_idem = 0;
+            $idem_key        = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace  = 'dinoco-flash-golive/v1::bulk-assign-defaults';
+            $idem_body       = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $idem_body = array(
+                    'action'  => 'bulk-assign-defaults',
+                    'dry_run' => $dry_run ? 1 : 0,
+                    'offset'  => $offset_idem,
+                    'user_id' => $uid_idem,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
+            }
 
             // V.1.2 C-Conc-H3: serialize bulk UPDATE across PHP workers via MySQL advisory lock
             $lock_name = 'fsv42_bulk_op';
@@ -516,7 +626,7 @@ add_action( 'rest_api_init', function() {
                     if ( class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();
                 }
                 $has_more = count( $rows ) === $chunk_size;
-                return rest_ensure_response( array(
+                $resp = array(
                     'ok'          => true,
                     'dry_run'     => $dry_run,
                     'scanned'     => count( $rows ),
@@ -524,7 +634,17 @@ add_action( 'rest_api_init', function() {
                     'samples'     => $samples,
                     'has_more'    => $has_more,
                     'next_offset' => $has_more ? $offset + $chunk_size : null,
-                ) );
+                );
+                if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                    dinoco_idempotency_store(
+                        $idem_key,
+                        $idem_namespace,
+                        $idem_body,
+                        array_merge( $resp, array( '_idem_code' => 200 ) ),
+                        200
+                    );
+                }
+                return rest_ensure_response( $resp );
             } finally {
                 $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
             }
@@ -598,6 +718,63 @@ add_action( 'rest_api_init', function() {
             }
             if ( count( $slots ) > 20 ) {
                 return new WP_Error( 'too_many_slots', 'max 20 slots per SKU', array( 'status' => 400 ) );
+            }
+
+            // V.2.0 (Round 52 batch 30): Idempotency-Key wrap. Body hash =
+            // bulk-shape {sku UPPER, slots[] sorted by slot_index normalized
+            // box_template_id + content_weight_g per row, user_id}. Replace-
+            // all semantics — admin "Save Pack Slots" double-click on slow
+            // DELETE+INSERT × bpu rows transaction → 2× DELETE all old slots
+            // + 2× re-INSERT N slots + 2× wp_dinoco_products UPDATE
+            // shipping_updated_at + 2× cache flush + 2× DINOCO_Catalog::
+            // flush_memo + 2× downstream Snippet 1 dinoco_resolve_pno_
+            // shipping memo flush. Different slots[] mid-retry (admin
+            // re-evaluated box assignment box_template_id 5→7 or weight
+            // 1000→1500) → 409 prevents wrong final pack-slot config via
+            // cached replay (cached "old assignment" replay returning when
+            // admin actually wanted "new assignment" would leave Flash V.42
+            // resolver computing wrong dimensions/weight for shipping label
+            // — CRITICAL for accurate Flash Express insurance + courier
+            // selection). slot_index is the array key ($idx in INSERT loop)
+            // — same slot order = same hash. user_id scopes per-admin.
+            $uid_idem        = get_current_user_id();
+            $idem_key        = function_exists( 'dinoco_idempotency_extract_key' ) ? dinoco_idempotency_extract_key( $req ) : '';
+            $idem_namespace  = 'dinoco-flash-golive/v1::save-pack-slots';
+            $idem_body       = null;
+            if ( $idem_key !== '' && function_exists( 'dinoco_idempotency_check' ) ) {
+                $slots_norm = array();
+                foreach ( $slots as $idx => $slot ) {
+                    if ( ! is_array( $slot ) ) continue;
+                    $slots_norm[] = array(
+                        'slot_index'       => intval( $idx ),
+                        'box_template_id'  => intval( $slot['box_template_id'] ?? 0 ),
+                        'content_weight_g' => intval( $slot['content_weight_g'] ?? 0 ),
+                    );
+                }
+                // Sort by slot_index for order-stable hash
+                usort( $slots_norm, function( $a, $b ) {
+                    return $a['slot_index'] - $b['slot_index'];
+                } );
+                $idem_body = array(
+                    'sku'     => $sku,
+                    'slots'   => $slots_norm,
+                    'user_id' => $uid_idem,
+                );
+                $cached = dinoco_idempotency_check( $idem_key, $idem_namespace, $idem_body );
+                if ( is_wp_error( $cached ) ) {
+                    $err_data    = $cached->get_error_data();
+                    $status_code = ( is_array( $err_data ) && isset( $err_data['status'] ) ) ? (int) $err_data['status'] : 409;
+                    return new WP_Error(
+                        'idempotency_conflict',
+                        'Idempotency-Key ซ้ำกับ request เก่าที่มีข้อมูลต่างกัน',
+                        array( 'status' => $status_code )
+                    );
+                }
+                if ( is_array( $cached ) ) {
+                    $resp_cached = $cached;
+                    unset( $resp_cached['_idem_code'] );
+                    return rest_ensure_response( $resp_cached );
+                }
             }
 
             $products_tbl = $wpdb->prefix . 'dinoco_products';
@@ -682,11 +859,23 @@ add_action( 'rest_api_init', function() {
             }
             if ( class_exists( 'DINOCO_Catalog' ) && method_exists( 'DINOCO_Catalog', 'flush_memo' ) ) DINOCO_Catalog::flush_memo();
 
-            return rest_ensure_response( array(
+            $resp = array(
                 'ok'       => true,
                 'sku'      => $sku,
                 'inserted' => $inserted,
-            ) );
+            );
+
+            if ( $idem_key !== '' && $idem_body !== null && function_exists( 'dinoco_idempotency_store' ) ) {
+                dinoco_idempotency_store(
+                    $idem_key,
+                    $idem_namespace,
+                    $idem_body,
+                    array_merge( $resp, array( '_idem_code' => 200 ) ),
+                    200
+                );
+            }
+
+            return rest_ensure_response( $resp );
         },
         'permission_callback' => 'dinoco_fsv42_perm',
     ) );
