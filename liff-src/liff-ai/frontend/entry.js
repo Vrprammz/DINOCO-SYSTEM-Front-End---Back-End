@@ -1,25 +1,33 @@
 /**
- * LIFF AI Command Center — Vite entry (V.0.4 Round 3 router + API + loaders)
+ * LIFF AI Command Center — Vite entry (V.0.5 Round 4 inline-bridge cleanup)
  *
  * MIGRATION TARGET: `[LIFF AI] Snippet 2: Frontend` V.3.10 (header bump only)
  *
  * Round 1 (V.0.2): foundation utilities (CSS + 5 utility modules).
  * Round 2 (V.0.3): 6 page renderers in `./pages/` — pure HTML output.
- * Round 3 (V.0.4 — this commit):
- *   ✅ Router (`./router.js`) — pushState navigation + popstate listener +
- *      role-based default-page resolver.
- *   ✅ LIFF AI API wrapper (`./api.js`) — X-LIFF-AI-Token + idempotency-key
- *      auto-attach for accept/note/status/agent-ask + 401/409/5xx handling.
- *   ✅ Auth flow (`./auth-flow.js`) — id_token → JWT exchange + 401 retry +
- *      role resolution.
- *   ✅ 6 page loaders in `./loaders/` — fetch + render + handler binding:
- *        dashboard / dealer / leadDetail / claimList / claimDetail / agentChat.
- *   ✅ Legacy bridge — exposes `window.goToTab` / `window.openLeadDetail` /
- *      `window.openClaimDetail` / `window.handleAskAgent` so existing inline
- *      JS in Snippet 2 V.3.10 keeps working until Round 4.
+ * Round 3 (V.0.4): router + API wrapper + auth-flow + 6 loaders.
+ * Round 4 (V.0.5 — this commit) — FINAL R4 of all 4 LIFF surfaces:
+ *   ✅ NEW `./event-delegation.js` — single click + change + submit listener
+ *      on the root mount that dispatches via `[data-action]` taxonomy.
+ *   ✅ DROPPED 13 legacy `window.*` bridge globals:
+ *        navigate / goToTab / openLeadDetail / openClaimDetail /
+ *        handleAskAgent / handleAcceptLead / handleNoteAdd /
+ *        handleStatusChange / handleClaimStatusUpdate /
+ *        showStatusChangeModal / showClaimStatusModal /
+ *        openLightbox / closeLightbox.
+ *   ✅ DROPPED `window.DINOCO_LIFF_AI_RENDERERS` — no longer needed once
+ *      pages emit declarative attributes.
+ *   ✅ Migrated inline `onclick="navigate('dashboard')"` in
+ *      pages/agentChat.js → `data-action="go-tab" data-tab="dashboard"`.
+ *   ✅ Quick-question chips now emit `data-action="quick-question"` alongside
+ *      legacy `data-quick` (delegation supports both for backward-compat).
+ *   ✅ Single frozen debug surface `window.DINOCO_LIFF_AI` retains version /
+ *      api / state / router / loaders for tests + console debugging.
  *
- * Round 4 will drop the window.* legacy globals once event delegation +
- * cut-over flag flip have soaked in production.
+ * All 4 LIFF surfaces now R1-4 complete (b2b-catalog / b2f-maker /
+ * b2f-catalog / liff-ai). Ready for Round 5 destructive cut-over (drop
+ * inline JS blocks from Snippet 4 / Snippet 8 / Maker LIFF / Snippet 2)
+ * pending user confirmation + 1-week canary observation.
  *
  * Default flag: `dinoco_liff_use_vite_liff_ai = false` → inline preserved.
  * REG-029 byte-identical guarantee until cut-over.
@@ -141,7 +149,10 @@ import {
     handleAskAgent,
 } from "./loaders/agentChat.js";
 
-console.info("[liff-ai] V.0.4 — Round 3 router + API + loaders complete");
+// Round 4 — single click/submit/change listener on the root mount.
+import { setupEventDelegation } from "./event-delegation.js";
+
+console.info("[liff-ai] V.0.5 — Round 4 inline-bridge cleanup complete");
 
 /**
  * Bootstrap the LIFF AI command center.
@@ -267,34 +278,72 @@ export async function bootstrap(opts = {}) {
         console.error("[liff-ai] initial dispatch failed", err);
     }
 
-    // ── Round 3 legacy bridge ──────────────────────────────────────────
-    // Inline V.3.10 has plenty of `onclick="navigate('lead', {id: ...})"`
-    // and similar globals. Expose minimal bridge surface so existing inline
-    // JS keeps working when Vite path is enabled. Round 4 will switch to
-    // event delegation + drop these.
-    if (typeof window !== "undefined") {
-        // navigate(page, params) — V.3.10 inline contract
-        /** @type {any} */ (window).navigate = function (page, params) {
-            goToTab(page, params || {});
-        };
-        /** @type {any} */ (window).goToTab = goToTab;
-        /** @type {any} */ (window).openLeadDetail = openLeadDetail;
-        /** @type {any} */ (window).openClaimDetail = openClaimDetail;
-        /** @type {any} */ (window).handleAskAgent = handleAskAgent;
-        /** @type {any} */ (window).handleAcceptLead = handleAcceptLead;
-        /** @type {any} */ (window).handleNoteAdd = handleNoteAdd;
-        /** @type {any} */ (window).handleStatusChange = handleStatusChange;
-        /** @type {any} */ (window).handleClaimStatusUpdate = handleClaimStatusUpdate;
-        /** @type {any} */ (window).showStatusChangeModal = showStatusChangeModal;
-        /** @type {any} */ (window).showClaimStatusModal = showClaimStatusModal;
-        /** @type {any} */ (window).openLightbox = openLightbox;
-        /** @type {any} */ (window).closeLightbox = closeLightbox;
+    // ── Round 4 event delegation ───────────────────────────────────────
+    // Single click + change + submit listener on the root mount. Replaces
+    // the V.0.4 legacy `window.navigate` / `window.goToTab` / etc. bridge
+    // (13 globals dropped). Pages now emit declarative `data-action="..."`
+    // attributes; the delegation module dispatches to the right handler.
+    if (typeof document !== "undefined") {
+        const root =
+            document.getElementById("liff-ai-app") ||
+            document.querySelector("[data-liff-ai-root]") ||
+            document.body;
+        if (root) {
+            setupEventDelegation(/** @type {HTMLElement} */ (root), {
+                goTab: (tab, params) => goToTab(tab, params || {}),
+                navigate: (page, params) => goToTab(page, params || {}),
+                openLeadDetail,
+                openClaimDetail,
+                // handleAcceptLead / handleNoteAdd accept (id, btn?) — wrap to
+                // ignore the optional btn arg from delegation (no btn ref).
+                acceptLead: (id) => handleAcceptLead(id),
+                addLeadNote: (id) => handleNoteAdd(id),
+                // showStatusChangeModal expects (id, allowed[]) — pass empty
+                // allowed[] when triggered via delegation (modal will fetch
+                // FSM list itself; allowed[] is an optional override).
+                showLeadStatusModal: (id) => showStatusChangeModal(id),
+                changeLeadStatus: handleStatusChange,
+                // showClaimStatusModal expects (id, currentStatus) — current
+                // status is unknown from delegation site, pass empty string;
+                // modal fetches the latest from claim detail itself.
+                showClaimStatusModal: (id) => showClaimStatusModal(id, ""),
+                changeClaimStatus: handleClaimStatusUpdate,
+                // openLightbox expects (photos[], idx) — adapt single-url
+                // bridge contract to wrap into a 1-element array, idx=0.
+                openPhotoLightbox: (url) => openLightbox([url], 0),
+                closePhotoLightbox: closeLightbox,
+                askAgent: handleAskAgent,
+                back,
+                refresh: () => {
+                    const tab = getCurrentTab();
+                    const id = getCurrentId();
+                    switch (tab) {
+                        case "dealer":
+                            return loadDealerDashboard();
+                        case "lead":
+                            return loadLeadDetail(id);
+                        case "claim":
+                            return loadClaimDetail(id);
+                        case "claims":
+                            return loadClaimList();
+                        case "agent":
+                            return loadAgentChat();
+                        default:
+                            return loadDashboard();
+                    }
+                },
+            });
+        }
     }
 
-    // Round 3 namespaced surface for tests + console debugging.
+    // Single frozen debug surface — version + api + state + router + loaders
+    // for tests + console debugging. The 13 legacy `window.*` bridge globals
+    // and `window.DINOCO_LIFF_AI_RENDERERS` were dropped in Round 4. Renderers
+    // are still exported via the module's `export {}` block at the bottom of
+    // this file for test consumption (no need for a window mirror).
     if (typeof window !== "undefined") {
         /** @type {any} */ (window).DINOCO_LIFF_AI = Object.freeze({
-            version: "V.0.4",
+            version: "V.0.5",
             bootstrap,
             api,
             state,
@@ -316,30 +365,6 @@ export async function bootstrap(opts = {}) {
                 showStatusChangeModal,
                 showClaimStatusModal,
             },
-        });
-
-        /** @type {any} */ (window).DINOCO_LIFF_AI_RENDERERS = Object.freeze({
-            dashboard: renderDashboard,
-            urgentSection: renderUrgentSection,
-            dealer: renderDealer,
-            leadCard: renderLeadCard,
-            leadList: renderLeadList,
-            leadFilter: renderLeadFilter,
-            leadDetail: renderLeadDetail,
-            leadHistory: renderLeadHistory,
-            leadStatusChange: renderLeadStatusChange,
-            claimList: renderClaimList,
-            claimFilter: renderClaimFilter,
-            claimCard: renderClaimCard,
-            claimDetail: renderClaimDetail,
-            statusHistory: renderStatusHistory,
-            photoLightbox: renderPhotoLightbox,
-            claimStatusChange: renderClaimStatusChange,
-            agentChat: renderAgentChat,
-            chatBubble: renderChatBubble,
-            formatBotText: formatBotText,
-            AGENT_LABELS: AGENT_LABELS,
-            QUICK_QUESTIONS: QUICK_QUESTIONS,
         });
     }
 
@@ -448,4 +473,6 @@ export {
     setupAgentChat,
     loadAgentChat,
     handleAskAgent,
+    // Round 4 — event delegation
+    setupEventDelegation,
 };

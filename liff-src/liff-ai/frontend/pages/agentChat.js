@@ -1,5 +1,5 @@
 /**
- * LIFF AI Frontend — Agent Chat panel renderer (V.0.3 Round 2).
+ * LIFF AI Frontend — Agent Chat panel renderer (V.0.4 Round 4).
  *
  * MIGRATION SOURCE: `[LIFF AI] Snippet 2: Frontend` V.3.9
  *   Source location: lines 1587-1790 (renderAgentChat) — chat shell only.
@@ -7,13 +7,14 @@
  *   because they require live API + sessionStorage.
  *
  * Pure HTML for the chat shell:
- *   - Header (title + close button)
- *   - Quick-question chips
+ *   - Header (title + close button — emits data-action="go-tab" data-tab="dashboard")
+ *   - Quick-question chips (data-quick + data-action="quick-question")
  *   - Empty `<div id="chatMessages">` for bubbles
  *   - Input bar with `<input id="chatInput">` + `<button id="chatSend">`
  *
- * The inline `onclick="navigate('dashboard')"` close-button attribute is
- * preserved verbatim — Round 4 will migrate to `data-action`.
+ * Round 4: replaced inline `onclick="navigate('dashboard')"` with declarative
+ * `data-action="go-tab" data-tab="dashboard"`. Event delegation in
+ * entry.js V.0.5 dispatches via shared `event-delegation.js` module.
  */
 
 import { escHtml } from "../utils/format.js";
@@ -56,16 +57,16 @@ export function renderAgentChat() {
     html +=
         '<div class="liff-ai-chat-header-sub">DINOCO AI — ถามอะไรก็ได้</div>';
     html += "</div>";
-    // Inline `onclick=` preserved verbatim — Round 4 will migrate to data-action.
+    // Round 4: declarative dispatch via event delegation in entry.js V.0.5.
     html +=
-        '<button class="liff-ai-chat-close" onclick="navigate(\'dashboard\')" title="ปิด" aria-label="ปิด" data-modal-close><span aria-hidden="true">&times;</span><span class="sr-only">ปิด</span></button>';
+        '<button class="liff-ai-chat-close" data-action="go-tab" data-tab="dashboard" title="ปิด" aria-label="ปิด" data-modal-close><span aria-hidden="true">&times;</span><span class="sr-only">ปิด</span></button>';
     html += "</div>";
 
     // Quick questions
     html += '<div class="liff-ai-quick-actions">';
     QUICK_QUESTIONS.forEach(function (q) {
         html +=
-            '<button class="liff-ai-quick-btn" data-quick="' +
+            '<button class="liff-ai-quick-btn" data-action="quick-question" data-quick="' +
             escHtml(q.text) +
             '">' +
             q.icon +

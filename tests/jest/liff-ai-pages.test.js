@@ -596,9 +596,11 @@ describe("renderAgentChat", () => {
         expect(html.match(/data-quick=/g).length).toBe(4);
     });
 
-    test("preserves inline onclick on close button (Round 4 will migrate)", () => {
+    test("close button uses data-action=go-tab (Round 4 — no inline onclick)", () => {
         const html = renderAgentChat();
-        expect(html).toContain("onclick=\"navigate('dashboard')\"");
+        expect(html).toContain('data-action="go-tab"');
+        expect(html).toContain('data-tab="dashboard"');
+        expect(html).not.toContain("onclick=");
     });
 });
 
