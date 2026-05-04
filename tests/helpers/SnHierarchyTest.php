@@ -2,7 +2,7 @@
 /**
  * SnHierarchyTest — pure-logic test of S/N hierarchy resolver.
  *
- * Source: [Admin System] DINOCO Production S/N Manager V.0.2+
+ * Source: [Admin System] DINOCO Production SN Manager V.0.2+
  *   function dinoco_sn_walk_to_level()
  *   function dinoco_sn_required_plates_for_sku()
  *

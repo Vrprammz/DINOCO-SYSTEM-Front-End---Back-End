@@ -52,16 +52,6 @@ const DOCUMENTED_NOT_USED = new Set([
     // CLAUDE.md preserves the mention as Day 1 Quick Wins audit trail —
     // explaining the doc-drift fix. Verify: grep returns 0 PHP refs.
     "dinoco_flag_shipping_meta_enabled",
-    // Production S/N Management System v2.13 (Phase 1 W2-W4, 2026-05-04).
-    // The flag IS wired in [Admin System] DINOCO Production S/N Manager
-    // (function dinoco_sn_is_enabled() + dinoco_sn_init_flags()), but
-    // the filesystem path uses a literal `/` in `S/N` which causes git
-    // to track it under a subdirectory (`[Admin System] DINOCO Production S/`
-    // → `N Manager`). The drift detector scans only top-level snippet
-    // files at REPO_ROOT, so the wrapper code is invisible to this test.
-    // Adding to whitelist as documented exception. Verify wired:
-    //   grep -r "dinoco_sn_system_enabled" "[Admin System] DINOCO Production S/"
-    "dinoco_sn_system_enabled",
 ]);
 
 /**

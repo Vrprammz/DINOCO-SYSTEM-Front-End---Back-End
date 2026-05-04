@@ -43,8 +43,8 @@ Total project: 19 weeks · ~620h continuous · Phase 0-6
 ## Phase 1 W2 Day 1-2 Planned
 
 ทันทีที่ Q1-Q12 ตอบครบ:
-- Day 1 AM: NEW snippet `[Admin System] DINOCO Production S/N Manager` V.0.1 — header + DB_ID placeholder + `admin_init` schema lazy install
-- Day 1 PM: NEW snippet `[System] DINOCO S/N REST API` V.0.1 — namespace `/dinoco-sn/v1/` registration + permission helpers
+- Day 1 AM: NEW snippet `[Admin System] DINOCO Production SN Manager` V.0.1 — header + DB_ID placeholder + `admin_init` schema lazy install
+- Day 1 PM: NEW snippet `[System] DINOCO SN REST API` V.0.1 — namespace `/dinoco-sn/v1/` registration + permission helpers
 - Day 2 AM: ALTER `wp_dinoco_products` (3 columns) idempotent + verify INFORMATION_SCHEMA gate
 - Day 2 PM: Batch CRUD REST endpoints (4 endpoints) + Idempotency wrapper + integration test
 

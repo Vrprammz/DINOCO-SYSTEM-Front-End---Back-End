@@ -2,7 +2,7 @@
 /**
  * SnBulkReceiveContractTest — pure-logic test of bulk receive D4 contract.
  *
- * Source: [System] DINOCO S/N REST API V.0.2+ (handler_receive_bulk)
+ * Source: [System] DINOCO SN REST API V.0.2+ (handler_receive_bulk)
  * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.13 §B3 D4 fix
  * Phase: 1 W4 Day 1-2
  *

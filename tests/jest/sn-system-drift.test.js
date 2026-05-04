@@ -22,8 +22,8 @@ const path = require('path');
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
 const SN_SNIPPETS = {
-    manager: '[Admin System] DINOCO Production S/N Manager',
-    rest: '[System] DINOCO S/N REST API',
+    manager: '[Admin System] DINOCO Production SN Manager',
+    rest: '[System] DINOCO SN REST API',
     liff: '[System] DINOCO Warranty Activation LIFF',
 };
 
