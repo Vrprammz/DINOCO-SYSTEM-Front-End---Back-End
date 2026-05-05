@@ -25,19 +25,19 @@
 | Q12 | Fraud baseline | "ไม่ค่อยมีปลอม — ทำกันไว้เฉยๆ" | 🔴 **Override** | → Q21 ตัดออก |
 | Q13 | HMAC URL signing | **A** Phase 1 | ✅ Yes | ⚠️ Pending implement |
 | Q14 | 4-eyes scope | **B** 3-tier | ✅ Yes | ✅ Done |
-| Q15 | Approver list | 🆕 **Backend UserAdmin Role** + role-based access | 🔴 **Override** | ⚠️ NEW snippet needed |
+| Q15 | Approver list | 🆕 **Backend UserAdmin Role** + role-based access — บอสจะตั้งเอง | 🔴 **Override** | ✅ Snippet สร้างแล้ว — UI checkbox ง่ายๆ ให้บอส assign |
 | Q16 | Customer transfer | **A** เพลทเดิม | ✅ Yes | ใช้ระบบเดิม `[System] Transfer Warranty Page` |
 | Q17 | Multi-batch | **B** หลายล็อต per SKU mix | ✅ Yes | ✅ Done |
 | Q18 | Invoice S/N column | **ไม่โชว์** (admin ไม่ได้ SN ตอนส่ง) | 🟡 Partial — ปิดถาวร | ✅ Confirmed default OFF |
 | Q19 | Extension grace | **A** 30 วัน | ✅ Yes | Phase 4 |
-| Q20 | Refund policy | **B** ไม่คืน | 🔴 **Override** | ⚠️ Legal review needed (consumer protection) |
+| Q20 | Refund policy | 🔄 **คืนได้ผ่าน Admin Facebook + Backend ปุ่มยืนยันคืน** (revert from B) | 🔴 **Re-override 2026-05-05** | ✅ Manual approve refund flow |
 | Q21 | Fraud threshold | **ตัดระบบของปลอมออกเลย** | 🔴 **Override** | ⚠️ **REMOVE F#12** |
 | Q22 | Public API pricing | "ยังไม่มีแผนใช้" | 🔴 **Override** | ⚠️ **DEFER F#15** (keep code dormant) |
 | Q23 | Stolen lookup | **Admin เท่านั้นก่อน** | 🔴 **Override** | ⚠️ **REMOVE public shortcode** |
 | Q24 | Audit retention | **B** 3y operational + 5y sensitive | ✅ Yes | ✅ Done |
 | Q25 | Banner limit | **A** 3 home + scrollable | ✅ Yes | Phase 2 W7 |
 | Q26 | Notification opt-out | **A** per-type | ✅ Yes | Phase 2 W7 |
-| Q27 | Tier badge | "มี Card Role อยู่แล้วไปอ่านระบบดีๆก่อน" | 🟡 Use existing | ⚠️ Read existing system first |
+| Q27 | Tier badge | "ใช้ Rank เดิม" — confirmed = B2B distributor `rank_system` (silver/gold/platinum/diamond) | 🟢 **Confirmed 2026-05-05** | ✅ ใช้ pattern เดียวกัน |
 | Q28 | Asset card timeline | **B** Collapsible | ✅ Yes | Phase 2 W7 |
 | Q29 | Scan vs Type first | **A** Scan first | ✅ Yes | Phase 2 W7 |
 
@@ -186,6 +186,146 @@
 4. **No new "Card" entity** — ใช้ snapshot table ที่มี อยู่แล้ว — สอดคล้อง boss "อย่าสร้างใหม่"
 
 **Status**: ⚠️ Pending boss confirmation — ถ้า boss หมายถึงระบบอื่น (มี customer-side tier system ที่ผมยังไม่เจอ) → boss ระบุชื่อ snippet/file ให้ผม explore ใหม่
+
+---
+
+## 🔁 Round 2 Boss Answers (2026-05-05 follow-up)
+
+หลัง Round 1 boss ตอบครบ ผมถามตามอีก 11 รายการ → boss ตอบกลับ:
+
+### Q20 — REVERT จาก "ไม่คืน" → "คืนได้แต่ manual approve"
+
+**Boss**: "คืนก็ได้ให้ติดต่อ Admin Facebook และก็มี Backend ให้ยืนยันคืน"
+
+**Implementation**:
+1. **Customer LIFF checkout page**: เปลี่ยนจาก "ไม่คืนเงินทุกกรณี" → "ขอคืนเงิน: ติดต่อ Admin Facebook DINOCO" + LINE/Facebook deep link
+2. **Customer extension confirmation page**: หลังจ่ายเงิน → footer "หากต้องการคืนเงิน ทักไป Admin Facebook + แจ้งเลขรายการ"
+3. **Admin Tab 11 Marketplace**: ปุ่ม "💰 ยืนยันคืนเงิน" per row (status=paid only) → opens modal:
+   - Reason dropdown (ลูกค้าเปลี่ยนใจ / เพลทเสีย / order error / อื่นๆ)
+   - Note textarea (Admin Facebook conversation reference)
+   - Refund amount (default = full, allow partial)
+   - Confirm "REFUND" typed → execute
+4. **Backend logic** (atomic):
+   - INSERT refund row in `wp_dinoco_sn_warranty_extensions.meta_json`
+   - REVERT `warranty_until` → original date (atomic SELECT FOR UPDATE on sn_pool)
+   - LINE notify customer "คืนเงิน ฿X เรียบร้อย — ประกันกลับเป็นเดิม"
+   - Audit row + IP + admin_user_id
+5. **NO automatic refund** — admin manual approve only (ป้องกัน fraud)
+6. **Legal compliance** (no longer block!): consumer-friendly policy = ผ่าน Consumer Protection Act ทั้งหมด ไม่ต้องทนายตรวจ
+
+**Status**: ✅ **Unblocked** — Phase 4 W13 implement refund button (~3h work)
+
+---
+
+### Q15 — UI Design Change: Checkbox-based simple selector
+
+**Boss**: "เดี๋ยวฉันไปตั้งเอง ออกแบบแต่ UI มาให้เลือกเข้าถึงหน้าหรือสิทไหนง่ายๆ"
+
+**Decision**: บอสจะ assign role เอง — ผมแค่ทำ UI ให้ใช้งานง่าย
+
+**Implementation** (Role Manager V.0.2):
+- **List view**: ตาราง user × role (matrix) — checkbox per cell
+  ```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ User       │ Approver │ Warehouse │ View PII │ Read-only │  │
+  ├─────────────────────────────────────────────────────────────┤
+  │ บอส        │   ✅     │    ✅     │   ✅     │    ✅     │👑│
+  │ คุณวิน      │   ☐      │    ✅     │   ☐      │    ☐      │  │
+  │ คุณสมชาย   │   ☐      │    ☐      │   ✅     │    ✅     │  │
+  └─────────────────────────────────────────────────────────────┘
+  [💾 บันทึกการเปลี่ยนแปลง]
+  ```
+- Tap checkbox → mark dirty (yellow highlight)
+- Bulk save button bottom (1 click → save all changes atomic)
+- Per-role tooltip on hover (อธิบายว่า role นี้ทำอะไรได้)
+- Filter: "แสดงเฉพาะ users ที่มี S/N role" (default ON)
+- Search by username/email
+- Audit log link (ดูว่าใครเปลี่ยน role ของใครเมื่อไหร่)
+
+**Phase**: Phase 2 W5 (~14h เดิม → ลดเหลือ ~8h เพราะ UI ง่ายลง)
+
+**Status**: ✅ **Unblocked** — implement V.0.2 UI ตอนนี้เลย
+
+---
+
+### Q27 — Confirm B2B `rank_system` pattern
+
+**Boss**: "หมายถึงมันมี Rank เดิมอยู่แล้ว"
+
+**Confirmed**: ผม interpretation ถูกตั้งแต่ Round 1 — boss หมายถึง B2B distributor `rank_system` ACF field (Snippet 7 + cron monthly recompute)
+
+**Pattern adoption**:
+- **Visual style**: ใช้ emoji + label + color เหมือน B2B distributor rank
+  - 🥉 Bronze · #b45309 (dark amber on light bg)
+  - 🥈 Silver · #94a3b8 (slate)
+  - 🥇 Gold · #ca8a04 (dark yellow)
+  - 💜 Platinum · #4338ca (indigo)
+  - 💎 Diamond · #7c3aed→#a855f7 (purple gradient)
+- **Data source**: `wp_dinoco_sn_customer_ltv_snapshot.loyalty_tier` (Q9 LTV — already created)
+- **Display location**: Member Dashboard `[dinoco_dashboard_header]` ข้างชื่อลูกค้า + tap → drill-down detail modal
+
+**Status**: ✅ **Unblocked** — Phase 2 W7 implement (already in helpers V.0.18)
+
+---
+
+### Q8 — Admin กรอกราคาเอง
+
+**Boss**: "ได้" (Phase 4 W12 admin UI สำหรับกรอกราคา per-SKU per-year)
+
+**Status**: ✅ **Confirmed** — design doc 08-f8-extension-marketplace already aligned
+
+---
+
+### Q7/Q8 — ใช้ Slip2Go + bank account ของ B2B เดิม
+
+**Boss**: "ใช่ใช้ของเดิม"
+
+**Implementation**:
+- **Slip2Go API key**: `B2B_SLIP2GO_SECRET_KEY` constant (existing) — reuse
+- **Bank display**: `B2B_BANK_NAME`, `B2B_BANK_ACCOUNT`, `B2B_BANK_HOLDER`, `B2B_PROMPTPAY_ID` constants — reuse
+- **Helper to call**: `b2b_verify_slip()` (existing — Snippet 1) — reuse for F#8 Extension Marketplace verification
+
+**Status**: ✅ **Confirmed** — no new constants needed, no new partnership
+
+---
+
+### F1-F5 — เริ่มทันทีถ้าทุกอย่างเสร็จ
+
+**Boss**: "จะเริ่มเลยถ้าทุกอย่างเสร็จ"
+
+**"ทุกอย่างเสร็จ" gate definition** (ผมต้องระบุชัดเจน):
+
+| ✅ ต้องทำเสร็จก่อน flag flip | สถานะปัจจุบัน |
+|---|---|
+| Phase 1 W4 acceptance test 100% pass | ⏸️ pending pilot decision (Q12 above) |
+| LINE Premium tier ฿1,500/mo activated | ⏸️ pending boss payment |
+| 4-eyes approval workflow (Phase 2 W5) | ⏸️ pending |
+| User Role Manager UI (Q15 V.0.2) | ⏸️ pending (this commit) |
+| F#1 expiry cron tested with 10 mock plates | ⏸️ pending acceptance test |
+| F#4 anniversary cron tested | ⏸️ pending |
+| F#10 review request cron tested | ⏸️ pending |
+| Telegram alert ทุกตัว ทดสอบ end-to-end | ⏸️ pending |
+| Admin Tab 5 Audit log accessible | ✅ Done (V.0.21) |
+| GDPR export scope รวม sn_pool/audit | ✅ Done (V.4.1) |
+
+**Estimate**: ~10 wk (Phase 1 W4 → Phase 2 W7 → flip ON)
+
+**Status**: ✅ **Schedule confirmed** — automatic ON after Phase 2 W7 completes
+
+---
+
+### Q12 — ผมพูดผิด (ขอแก้)
+
+**Boss**: "คืออะไร" (boss ไม่จำว่า Q12 = อะไร)
+
+**ผม clarification**: Q12 ในเอกสาร = **fraud baseline audit** (อ่าน claim 12 เดือน) — ไม่เกี่ยวข้อง pilot dealer. ผมเขียน "Q12 = pilot dealer 5 ราย" ในข้อความก่อน = **ผิด** ขอโทษ
+
+**Pilot dealer คำถามจริง** (อยู่นอก 29 Q):
+- Phase 1 W4 ต้องการ pilot 100 plates → 5 dealers × 20 plates
+- หรือ skip pilot ไปเลย (full rollout flag flip)
+- **Boss decision pending** — ถ้าตอบ "skip pilot" ผมจะ remove จาก Phase 1 W4 + รัน internal acceptance test แทน
+
+**Status**: ⚠️ **Still pending** (1 unblocked item)
 
 ---
 

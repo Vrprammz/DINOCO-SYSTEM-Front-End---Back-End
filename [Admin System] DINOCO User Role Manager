@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO User Role Manager                        ║
+ * ║  Version: V.0.2 (2026-05-05) — Q15 R2: matrix UI + bulk save    ║
  * ║  Version: V.0.1 (2026-05-05) — Q15 OVERRIDE foundation          ║
  * ║  DB_ID: (pending — populate after first WP Code Snippets sync)  ║
  * ║  Description: Custom WP roles + capabilities for S/N system.    ║
@@ -192,7 +193,110 @@ add_action( 'init', function() {
 }, 30 );
 
 // ════════════════════════════════════════════════════════════════════════
-// Phase 1 placeholder shortcode — full UI in Phase 2 W5
+// V.0.2 (Q15 R2) — REST endpoint for bulk role assignment
+// ════════════════════════════════════════════════════════════════════════
+
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'dinoco/v1', '/sn-roles/bulk-assign', array(
+        'methods'  => 'POST',
+        'callback' => 'dinoco_sn_rest_bulk_assign_roles',
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' )
+                && wp_verify_nonce( $_SERVER['HTTP_X_WP_NONCE'] ?? '', 'wp_rest' );
+        },
+    ) );
+} );
+
+if ( ! function_exists( 'dinoco_sn_rest_bulk_assign_roles' ) ) {
+    /**
+     * Bulk role assignment from matrix UI.
+     * Body: { changes: [ {user_id, role, action: 'add'|'remove'}, ... ] }
+     * Returns: { applied: N, errors: [], audit_ids: [] }
+     */
+    function dinoco_sn_rest_bulk_assign_roles( $request ) {
+        $body = $request->get_json_params();
+        $changes = isset( $body['changes'] ) && is_array( $body['changes'] ) ? $body['changes'] : array();
+
+        if ( empty( $changes ) ) {
+            return new WP_Error( 'no_changes', 'ไม่มีการเปลี่ยนแปลง', array( 'status' => 400 ) );
+        }
+        if ( count( $changes ) > 200 ) {
+            return new WP_Error( 'too_many', 'แก้ทีละไม่เกิน 200 รายการ', array( 'status' => 413 ) );
+        }
+
+        $valid_roles = array( 'dinoco_sn_approver', 'dinoco_sn_warehouse', 'dinoco_sn_view_pii', 'dinoco_sn_readonly' );
+        $applied = 0;
+        $errors = array();
+        $actor_id = get_current_user_id();
+
+        foreach ( $changes as $idx => $c ) {
+            $user_id = (int) ( $c['user_id'] ?? 0 );
+            $role = sanitize_text_field( $c['role'] ?? '' );
+            $action = sanitize_text_field( $c['action'] ?? '' );
+
+            if ( ! $user_id || ! in_array( $role, $valid_roles, true ) || ! in_array( $action, array( 'add', 'remove' ), true ) ) {
+                $errors[] = array( 'idx' => $idx, 'reason' => 'invalid_payload', 'user_id' => $user_id, 'role' => $role );
+                continue;
+            }
+
+            $user = get_user_by( 'id', $user_id );
+            if ( ! $user ) {
+                $errors[] = array( 'idx' => $idx, 'reason' => 'user_not_found', 'user_id' => $user_id );
+                continue;
+            }
+
+            // Self-protection: cannot remove own administrator/approver role
+            if ( $user_id === $actor_id && $action === 'remove' && $role === 'dinoco_sn_approver' ) {
+                $errors[] = array( 'idx' => $idx, 'reason' => 'cannot_remove_self_approver' );
+                continue;
+            }
+
+            $had_role = in_array( $role, (array) $user->roles, true );
+
+            if ( $action === 'add' && ! $had_role ) {
+                $user->add_role( $role );
+                $applied++;
+                dinoco_sn_log_role_change( $user_id, $role, 'add', $actor_id );
+            } elseif ( $action === 'remove' && $had_role ) {
+                $user->remove_role( $role );
+                $applied++;
+                dinoco_sn_log_role_change( $user_id, $role, 'remove', $actor_id );
+            }
+            // No-op (add when already has, remove when doesn't have) — silent skip
+        }
+
+        return rest_ensure_response( array(
+            'applied'    => $applied,
+            'errors'     => $errors,
+            'total'      => count( $changes ),
+            'no_op'      => count( $changes ) - $applied - count( $errors ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_log_role_change' ) ) {
+    /**
+     * Audit role change. Best-effort — non-throwing.
+     */
+    function dinoco_sn_log_role_change( $user_id, $role, $action, $actor_id ) {
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log( array(
+                'event_type' => 'role_change',
+                'sn'         => '',
+                'actor_user_id' => $actor_id,
+                'reason'     => sprintf( '%s role %s for user_id=%d', $action, $role, $user_id ),
+                'context_json' => wp_json_encode( array(
+                    'target_user_id' => $user_id,
+                    'role'           => $role,
+                    'action'         => $action,
+                ), JSON_UNESCAPED_UNICODE ),
+            ) );
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// V.0.2 (Q15 R2) — Matrix UI shortcode
 // ════════════════════════════════════════════════════════════════════════
 
 if ( ! shortcode_exists( 'dinoco_admin_user_roles' ) ) {
@@ -202,79 +306,263 @@ if ( ! shortcode_exists( 'dinoco_admin_user_roles' ) ) {
         }
 
         $caps = dinoco_sn_caps_list();
-        $roles = array(
-            'dinoco_sn_approver'  => array( 'label' => '🛡️ S/N Approver', 'desc' => '4-eyes approver (swap/void/recall)' ),
-            'dinoco_sn_warehouse' => array( 'label' => '📦 S/N Warehouse', 'desc' => 'รับเพลทจากโรงงาน + scan' ),
-            'dinoco_sn_view_pii'  => array( 'label' => '🔍 S/N View PII', 'desc' => 'ดูข้อมูลส่วนตัวลูกค้า (Service Center)' ),
-            'dinoco_sn_readonly'  => array( 'label' => '👥 S/N Read-only', 'desc' => 'ดู dashboard + audit (ไม่เห็น PII)' ),
+        $sn_roles = array(
+            'dinoco_sn_approver'  => array( 'label' => '🛡️ Approver',  'desc' => 'อนุมัติ swap/void/recall (4-eyes)', 'color' => '#dc2626' ),
+            'dinoco_sn_warehouse' => array( 'label' => '📦 Warehouse', 'desc' => 'รับเพลท + scan',                  'color' => '#2563eb' ),
+            'dinoco_sn_view_pii'  => array( 'label' => '🔍 View PII',  'desc' => 'ดูข้อมูลลูกค้าเต็ม (Service Center)','color' => '#10b981' ),
+            'dinoco_sn_readonly'  => array( 'label' => '👥 Read-only', 'desc' => 'ดู dashboard + audit (no PII)',  'color' => '#6b7280' ),
         );
+
+        // Fetch all users with any S/N role OR administrator (default 100, paginate later)
+        $users = get_users( array(
+            'number'  => 200,
+            'orderby' => 'display_name',
+            'order'   => 'ASC',
+        ) );
+
+        $nonce = wp_create_nonce( 'wp_rest' );
+        $rest_url = esc_url( rest_url( 'dinoco/v1/sn-roles/bulk-assign' ) );
 
         ob_start();
         ?>
-        <div class="dnc-sn-roles-root" style="font-family:'Sarabun',sans-serif;max-width:980px;margin:0 auto;padding:24px;">
-            <h2 style="color:#1f2937;border-bottom:2px solid #e5e7eb;padding-bottom:12px;">
-                🔐 S/N Role Manager
-                <span style="font-size:13px;color:#6b7280;font-weight:normal;float:right;">V.0.1 — Phase 1 stub</span>
+        <div class="dnc-sn-roles-root" style="font-family:'Sarabun',sans-serif;max-width:1180px;margin:0 auto;padding:24px;">
+            <h2 style="color:#1f2937;border-bottom:2px solid #e5e7eb;padding-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
+                <span>🔐 S/N Role Manager</span>
+                <span style="font-size:13px;color:#6b7280;font-weight:normal;">V.0.2 — Matrix UI</span>
             </h2>
 
-            <div style="background:#fef3c7;border-left:4px solid #f59e0b;padding:16px;border-radius:6px;margin:20px 0;">
-                <strong>⚠️ Phase 1 placeholder</strong> —
-                Role registration ทำงานอัตโนมัติแล้ว (4 roles + 13 caps registered)
-                แต่ Admin UI สำหรับมอบหมาย role ให้ user จะเสร็จใน Phase 2 W5
-                (~40h sprint per <code>docs/sn-system/09-q15-role-based-access-control.md</code>)
+            <div style="background:#dbeafe;border-left:4px solid #2563eb;padding:16px;border-radius:6px;margin:20px 0;color:#1e40af;">
+                <strong>วิธีใช้:</strong> ติ๊กช่อง role ที่ต้องการ → ระบบจะเน้นสีเหลือง (dirty) → กด "บันทึกการเปลี่ยนแปลง" เพื่อ save ทั้งหมดในคลิกเดียว
             </div>
 
-            <h3 style="color:#1f2937;margin-top:28px;">📋 Roles ที่ลงทะเบียนแล้ว</h3>
-            <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
-                <thead>
-                    <tr style="background:#f9fafb;">
-                        <th style="padding:12px;text-align:left;border-bottom:1px solid #e5e7eb;">Role</th>
-                        <th style="padding:12px;text-align:left;border-bottom:1px solid #e5e7eb;">คำอธิบาย</th>
-                        <th style="padding:12px;text-align:right;border-bottom:1px solid #e5e7eb;">จำนวน users</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ( $roles as $slug => $info ) : ?>
-                        <?php $count = count( get_users( array( 'role' => $slug, 'fields' => 'ID' ) ) ); ?>
-                        <tr>
-                            <td style="padding:12px;border-bottom:1px solid #f3f4f6;font-weight:600;">
-                                <?php echo esc_html( $info['label'] ); ?>
-                                <br><code style="font-size:11px;color:#6b7280;font-weight:normal;"><?php echo esc_html( $slug ); ?></code>
+            <!-- Filter row -->
+            <div style="display:flex;gap:12px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">
+                <input type="text" id="dncSnRoleSearch"
+                       placeholder="🔍 ค้นหา username / email / display name"
+                       style="flex:1;min-width:220px;padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;">
+                <label style="display:flex;align-items:center;gap:6px;color:#4b5563;font-size:14px;">
+                    <input type="checkbox" id="dncSnRoleFilterActive" checked>
+                    แสดงเฉพาะ users ที่มี S/N role
+                </label>
+                <span id="dncSnDirtyCount" style="background:#fef3c7;color:#b45309;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:600;display:none;">
+                    🟡 <span class="count">0</span> รายการที่ยังไม่บันทึก
+                </span>
+            </div>
+
+            <!-- Matrix table -->
+            <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:auto;">
+                <table style="width:100%;border-collapse:collapse;min-width:760px;">
+                    <thead>
+                        <tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb;">
+                            <th style="padding:14px 12px;text-align:left;font-size:13px;color:#374151;width:38%;">User</th>
+                            <?php foreach ( $sn_roles as $slug => $info ) : ?>
+                                <th style="padding:14px 8px;text-align:center;font-size:13px;color:<?php echo esc_attr( $info['color'] ); ?>;"
+                                    title="<?php echo esc_attr( $info['desc'] ); ?>">
+                                    <?php echo esc_html( $info['label'] ); ?>
+                                </th>
+                            <?php endforeach; ?>
+                            <th style="padding:14px 8px;text-align:center;font-size:13px;color:#374151;">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dncSnRoleMatrix">
+                    <?php foreach ( $users as $u ) :
+                        $user_roles = (array) $u->roles;
+                        $has_any_sn_role = ! empty( array_intersect( array_keys( $sn_roles ), $user_roles ) );
+                        $is_admin = in_array( 'administrator', $user_roles, true );
+                    ?>
+                        <tr data-user-id="<?php echo (int) $u->ID; ?>"
+                            data-display-name="<?php echo esc_attr( strtolower( $u->display_name . ' ' . $u->user_login . ' ' . $u->user_email ) ); ?>"
+                            data-has-sn-role="<?php echo $has_any_sn_role ? '1' : '0'; ?>"
+                            style="border-bottom:1px solid #f3f4f6;">
+                            <td style="padding:12px;">
+                                <div style="font-weight:600;color:#1f2937;">
+                                    <?php echo esc_html( $u->display_name ); ?>
+                                    <?php if ( $is_admin ) : ?>
+                                        <span style="font-size:11px;background:#fef3c7;color:#b45309;padding:2px 6px;border-radius:4px;margin-left:6px;">👑 Admin</span>
+                                    <?php endif; ?>
+                                </div>
+                                <div style="font-size:12px;color:#6b7280;"><?php echo esc_html( $u->user_email ); ?></div>
                             </td>
-                            <td style="padding:12px;border-bottom:1px solid #f3f4f6;color:#4b5563;">
-                                <?php echo esc_html( $info['desc'] ); ?>
-                            </td>
-                            <td style="padding:12px;border-bottom:1px solid #f3f4f6;text-align:right;font-weight:600;">
-                                <?php echo (int) $count; ?>
-                            </td>
+                            <?php foreach ( $sn_roles as $slug => $info ) :
+                                $checked = in_array( $slug, $user_roles, true );
+                            ?>
+                                <td style="padding:12px 8px;text-align:center;">
+                                    <input type="checkbox"
+                                           class="dnc-sn-role-cb"
+                                           data-user-id="<?php echo (int) $u->ID; ?>"
+                                           data-role="<?php echo esc_attr( $slug ); ?>"
+                                           data-original="<?php echo $checked ? '1' : '0'; ?>"
+                                           <?php checked( $checked ); ?>
+                                           <?php disabled( $is_admin ); ?>
+                                           style="width:18px;height:18px;cursor:<?php echo $is_admin ? 'not-allowed' : 'pointer'; ?>;"
+                                           title="<?php echo esc_attr( $is_admin ? 'Administrator มีสิทธิ์ทุกอย่างอยู่แล้ว' : $info['desc'] ); ?>">
+                                </td>
+                            <?php endforeach; ?>
+                            <td class="dnc-sn-row-status" style="padding:12px 8px;text-align:center;font-size:12px;color:#6b7280;">—</td>
                         </tr>
                     <?php endforeach; ?>
-                </tbody>
-            </table>
+                    </tbody>
+                </table>
+            </div>
 
-            <h3 style="color:#1f2937;margin-top:28px;">🔑 Capabilities (13 caps)</h3>
-            <ul style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px 32px;color:#4b5563;">
-                <?php foreach ( $caps as $cap => $desc ) : ?>
-                    <li style="margin:6px 0;">
-                        <code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;color:#1f2937;"><?php echo esc_html( $cap ); ?></code>
-                        — <?php echo esc_html( $desc ); ?>
-                    </li>
-                <?php endforeach; ?>
-            </ul>
-
-            <h3 style="color:#1f2937;margin-top:28px;">📌 Phase 2 W5 — Admin UI plan</h3>
-            <p style="color:#4b5563;line-height:1.7;">
-                ใน Phase 2 W5 จะมี:
-            </p>
-            <ul style="color:#4b5563;line-height:1.8;">
-                <li>📋 ตาราง user list + role badges (filter by role)</li>
-                <li>🔧 Modal แก้ role per user (multi-role + role explanation tooltip)</li>
-                <li>📊 Audit log การเปลี่ยน role (date + actor + old → new role + reason)</li>
-                <li>🔔 LINE Flex notify เมื่อ role เปลี่ยน</li>
-                <li>⚡ Approval workflow (swap/void/recall request → notify approvers)</li>
-                <li>🚦 Strict mode toggle (Phase 3 W8 — disable manage_options fallback)</li>
-            </ul>
+            <!-- Sticky save bar -->
+            <div id="dncSnSaveBar" style="position:sticky;bottom:0;background:#fff;border-top:1px solid #e5e7eb;padding:14px 0;margin-top:20px;display:flex;justify-content:flex-end;gap:10px;">
+                <button id="dncSnRoleReset" class="button" style="padding:10px 20px;background:#f3f4f6;color:#374151;border:1px solid #d1d5db;border-radius:8px;cursor:pointer;font-size:14px;">
+                    🔄 ยกเลิกการเปลี่ยนแปลง
+                </button>
+                <button id="dncSnRoleSave" class="button button-primary" style="padding:10px 24px;background:#10b981;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;" disabled>
+                    💾 บันทึกการเปลี่ยนแปลง (<span class="count">0</span>)
+                </button>
+            </div>
         </div>
+
+        <script>
+        (function() {
+            var DNC_SN_NONCE = <?php echo wp_json_encode( $nonce ); ?>;
+            var DNC_SN_REST = <?php echo wp_json_encode( $rest_url ); ?>;
+            var $matrix = document.getElementById('dncSnRoleMatrix');
+            var $saveBtn = document.getElementById('dncSnRoleSave');
+            var $resetBtn = document.getElementById('dncSnRoleReset');
+            var $dirtyCount = document.getElementById('dncSnDirtyCount');
+            var $search = document.getElementById('dncSnRoleSearch');
+            var $filterActive = document.getElementById('dncSnRoleFilterActive');
+
+            function getDirtyChanges() {
+                var changes = [];
+                $matrix.querySelectorAll('.dnc-sn-role-cb').forEach(function(cb) {
+                    var orig = cb.getAttribute('data-original') === '1';
+                    if (cb.checked !== orig) {
+                        changes.push({
+                            user_id: parseInt(cb.getAttribute('data-user-id'), 10),
+                            role: cb.getAttribute('data-role'),
+                            action: cb.checked ? 'add' : 'remove',
+                            $cb: cb,
+                        });
+                    }
+                });
+                return changes;
+            }
+
+            function updateDirtyUI() {
+                var dirty = getDirtyChanges();
+                var n = dirty.length;
+                $saveBtn.disabled = (n === 0);
+                $saveBtn.querySelector('.count').textContent = n;
+                $dirtyCount.style.display = n > 0 ? 'inline-block' : 'none';
+                $dirtyCount.querySelector('.count').textContent = n;
+
+                // Highlight dirty rows
+                $matrix.querySelectorAll('tr').forEach(function(tr) { tr.style.background = ''; });
+                dirty.forEach(function(c) {
+                    var tr = c.$cb.closest('tr');
+                    if (tr) tr.style.background = '#fef3c7';
+                });
+            }
+
+            function applyFilter() {
+                var q = ($search.value || '').toLowerCase().trim();
+                var activeOnly = $filterActive.checked;
+                $matrix.querySelectorAll('tr').forEach(function(tr) {
+                    var name = tr.getAttribute('data-display-name') || '';
+                    var hasSnRole = tr.getAttribute('data-has-sn-role') === '1';
+                    var visible = (!q || name.indexOf(q) !== -1) && (!activeOnly || hasSnRole);
+                    tr.style.display = visible ? '' : 'none';
+                });
+            }
+
+            $matrix.addEventListener('change', function(ev) {
+                if (ev.target.classList.contains('dnc-sn-role-cb')) {
+                    updateDirtyUI();
+                }
+            });
+
+            $resetBtn.addEventListener('click', function() {
+                var modalCfm = (window.dinocoModal && window.dinocoModal.confirm) || function(opts) { return Promise.resolve(confirm(opts.content)); };
+                modalCfm({ title: 'ยกเลิกการเปลี่ยนแปลง?', content: 'การเปลี่ยนแปลงทั้งหมดจะถูกรีเซ็ต' }).then(function(ok) {
+                    if (!ok) return;
+                    $matrix.querySelectorAll('.dnc-sn-role-cb').forEach(function(cb) {
+                        cb.checked = (cb.getAttribute('data-original') === '1');
+                    });
+                    updateDirtyUI();
+                });
+            });
+
+            $saveBtn.addEventListener('click', function() {
+                var changes = getDirtyChanges();
+                if (changes.length === 0) return;
+
+                var payload = changes.map(function(c) {
+                    return { user_id: c.user_id, role: c.role, action: c.action };
+                });
+
+                $saveBtn.disabled = true;
+                $saveBtn.textContent = '⏳ กำลังบันทึก...';
+
+                fetch(DNC_SN_REST, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-WP-Nonce': DNC_SN_NONCE,
+                    },
+                    body: JSON.stringify({ changes: payload }),
+                })
+                .then(function(r) { return r.json().then(function(d) { return { status: r.status, data: d }; }); })
+                .then(function(res) {
+                    if (res.status >= 200 && res.status < 300) {
+                        var msg = '✅ บันทึก ' + (res.data.applied || 0) + ' รายการ';
+                        if (res.data.errors && res.data.errors.length) {
+                            msg += ' (มี ' + res.data.errors.length + ' ข้อผิดพลาด — ดู console)';
+                            console.warn('[Role Manager] errors:', res.data.errors);
+                        }
+                        var modalAlert = (window.dinocoModal && window.dinocoModal.alert) || function(opts) { alert(opts.content); return Promise.resolve(); };
+                        modalAlert({ title: 'บันทึกสำเร็จ', content: msg }).then(function() {
+                            window.location.reload();
+                        });
+                    } else {
+                        throw new Error(res.data.message || 'บันทึกล้มเหลว');
+                    }
+                })
+                .catch(function(err) {
+                    console.error('[Role Manager] save failed:', err);
+                    var modalAlert = (window.dinocoModal && window.dinocoModal.alert) || function(opts) { alert(opts.content); return Promise.resolve(); };
+                    modalAlert({ title: 'ผิดพลาด', content: 'บันทึกไม่สำเร็จ: ' + (err.message || 'unknown') });
+                    $saveBtn.disabled = false;
+                    $saveBtn.innerHTML = '💾 บันทึกการเปลี่ยนแปลง (<span class="count">' + changes.length + '</span>)';
+                });
+            });
+
+            $search.addEventListener('input', applyFilter);
+            $filterActive.addEventListener('change', applyFilter);
+
+            // Initial filter (default: show only users with SN roles)
+            applyFilter();
+        })();
+        </script>
+
+        <details style="margin-top:24px;color:#4b5563;">
+            <summary style="cursor:pointer;font-size:14px;font-weight:600;color:#1f2937;padding:8px 0;">
+                ℹ️ Role descriptions + capabilities (13 caps)
+            </summary>
+            <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-top:8px;">
+                <h4 style="margin:0 0 12px;color:#1f2937;">Roles</h4>
+                <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                    <?php foreach ( $sn_roles as $slug => $info ) : ?>
+                        <tr style="border-bottom:1px solid #f3f4f6;">
+                            <td style="padding:8px;font-weight:600;width:140px;color:<?php echo esc_attr( $info['color'] ); ?>;"><?php echo esc_html( $info['label'] ); ?></td>
+                            <td style="padding:8px;color:#4b5563;"><?php echo esc_html( $info['desc'] ); ?></td>
+                            <td style="padding:8px;"><code style="font-size:11px;color:#6b7280;"><?php echo esc_html( $slug ); ?></code></td>
+                        </tr>
+                    <?php endforeach; ?>
+                </table>
+                <h4 style="margin:16px 0 12px;color:#1f2937;">Capabilities</h4>
+                <ul style="margin:0;padding-left:20px;color:#4b5563;font-size:13px;line-height:1.8;">
+                    <?php foreach ( $caps as $cap => $desc ) : ?>
+                        <li><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;color:#1f2937;font-size:11px;"><?php echo esc_html( $cap ); ?></code> — <?php echo esc_html( $desc ); ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+        </details>
         <?php
         return ob_get_clean();
     } );

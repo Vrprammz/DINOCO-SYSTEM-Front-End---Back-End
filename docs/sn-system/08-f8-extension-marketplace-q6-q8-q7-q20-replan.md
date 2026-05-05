@@ -15,7 +15,7 @@
 | **Q6** | Phase placement | Phase 5 (separate decision gate after stable launch) | **Phase 4 W12-13** + ทำให้ละเอียดที่สุด | -4wk timeline · merged ก่อน Phase 5 cut |
 | **Q7** | Payment | LINE Pay + SCB + PromptPay multi-gateway | **เลขบัญชี + Slip2GO verify เท่านั้น** | -16h dev · ไม่ต้อง partnership LINE Pay/SCB |
 | **Q8** | Pricing | % of retail (1y=10%, 2y=18%, 3y=25%) | **per-SKU manual** (admin กรอกราคาแต่ละ SKU ต่อปี) | NEW backend admin UI |
-| **Q20** | Refund policy | A: 7-day refund | **B: ไม่คืน** | -4h dev · ⚠️ legal review pending |
+| **Q20** | Refund policy | A: 7-day auto-refund | **manual: คืนได้ผ่าน Admin Facebook + Backend ปุ่มยืนยัน** (revert from B 2026-05-05) | +6h dev · ✅ legal-friendly |
 
 ---
 
@@ -158,29 +158,68 @@ function dinoco_sn_extension_available( $sku ) {
    - Admin Tab 11 marketplace tab เห็น row "paid" + can refund (ดู Q20 below)
 ```
 
-### Q20 No-Refund policy implementation
+### Q20 Manual Refund Flow (REVERT 2026-05-05 — Round 2)
 
-**Boss decision**: "ไม่คืนเงิน — ลูกค้าจ่ายแล้วผูกประกันใหม่เลย"
+**Boss decision (Round 2)**: "คืนก็ได้ให้ติดต่อ Admin Facebook และก็มี Backend ให้ยืนยันคืน"
 
-⚠️ **Legal review pending** — ตรงข้ามกับ Consumer Protection Act §44 (default 7-day return for digital services). Risk:
-- กฎหมายไทย Consumer Protection Act 2019 — บางกรณี require refund window
-- PDPA + กรมการค้าภายใน — ต้องประกาศชัดในหน้า checkout
-- Recommendation: ทนายตรวจ Terms & Conditions ก่อน Phase 4 W13 launch
+**Reversal of Round 1 "ไม่คืน" decision**: ลูกค้าขอคืนได้ผ่าน Admin Facebook → admin กดปุ่ม "ยืนยันคืน" ใน Backend → ระบบ revert warranty + คืนเงิน manual
 
-**Implementation in code**:
-- Admin Tab 11 marketplace **NO refund button** (just "void" for fraud cases)
-- Customer LIFF checkout page must show explicit policy:
-  ```
-  ⚠️ นโยบาย "ไม่คืนเงิน" — ก่อนชำระโปรดอ่าน:
-  • การชำระเงินถือว่ายอมรับเงื่อนไขทั้งหมด
-  • ไม่มีระยะเวลา cooling-off
-  • ไม่สามารถขอคืนเงินได้ทุกกรณี
-  ☐ ฉันอ่านและยอมรับเงื่อนไข (required checkbox)
-  ```
-- Force checkbox before "ดำเนินการชำระ" button enabled
-- Save customer's acceptance timestamp + IP in `wp_dinoco_sn_warranty_extensions.meta_json`
+✅ **Legal compliance** (no longer block!): consumer-friendly = ผ่าน Consumer Protection Act 2019 ทั้งหมด — ไม่ต้องทนายตรวจ T&C
 
-**Edge case allowed**: Manual void (admin only) — กรณี fraud/system error/double-charge → admin manual handle ผ่าน Tab 11 + audit row + chat with customer
+**Customer-side UX (LIFF)**:
+
+หน้า checkout F#8 แทนข้อความเดิม "ไม่คืน" ด้วย:
+
+```text
+ℹ️ การคืนเงิน: ติดต่อ Admin DINOCO ผ่าน Facebook
+   [💬 เปิดแชท Facebook DINOCO]  ← deep link m.me/DINOCO.PPT
+   เจ้าหน้าที่จะยืนยันการคืนภายใน 24 ชม.
+☐ ฉันอ่านและยอมรับเงื่อนไข (required checkbox)
+```
+
+หลังจ่ายเงินสำเร็จ — confirmation page footer:
+
+```text
+ขอคืนเงิน: ทักไป Admin Facebook + แจ้งเลขรายการ EXT-2026-{ID}
+[💬 เปิดแชท Facebook]
+```
+
+**Admin-side UX (Tab 11 Marketplace)**:
+
+ปุ่ม "💰 ยืนยันคืน" per row (status=paid only) → modal:
+
+| Field | Type | Notes |
+|---|---|---|
+| Reason | dropdown | ลูกค้าเปลี่ยนใจ / เพลทเสีย / order error / อื่นๆ |
+| Note | textarea required | Admin Facebook conversation reference (ลิงก์/ภาพ chat) |
+| Refund amount | number | default = full · allow partial |
+| FB chat ID/timestamp | text | for audit trail |
+| Confirm | typed string | "REFUND" required to enable execute button |
+
+**Backend logic** (atomic transaction):
+
+1. SELECT FOR UPDATE on `wp_dinoco_sn_pool` (lock plate row)
+2. INSERT refund row in `wp_dinoco_sn_warranty_extensions` with:
+   - `payment_status` = 'refunded'
+   - `meta_json` = JSON { refund_reason, refund_amount, fb_chat_ref, admin_user_id, refunded_at, original_warranty_until }
+3. UPDATE `wp_dinoco_sn_pool` SET `warranty_until` = `original_warranty_until` (revert)
+4. UPDATE `wp_dinoco_sn_audit` add row event_type='extension_refunded'
+5. LINE Flex notify ลูกค้า: "💰 คืนเงิน ฿{amount} เรียบร้อย — ประกันกลับเป็น {original_until}"
+6. Audit row + IP + admin_user_id + reason
+
+**Anti-abuse guards**:
+- Single-admin can refund ≤ ฿5,000/transaction
+- > ฿5,000 → require 4-eyes (1 approver จาก `dinoco_sn_approver` role)
+- Cap 3 refunds/admin/day (alert บอส if exceeded)
+- LINE alert บอส every refund > ฿2,000
+
+**No automatic refund** — admin manual approve only (ป้องกัน fraud + บังคับ Facebook conversation log = audit trail แข็งแรง)
+
+**REST endpoint** (Phase 4 W13):
+
+- `POST /dinoco-sn/v1/extension/{id}/refund` — body `{ reason, note, amount, fb_chat_ref, confirm: 'REFUND' }`
+- Permission: `dinoco_sn_approver` cap หรือ `manage_options`
+- Idempotency-Key wrapper (Round 28+ pattern)
 
 ---
 
