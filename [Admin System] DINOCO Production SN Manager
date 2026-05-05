@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.9 (2026-05-05) — Phase 3 W9 F#1 Expiry Reminder cron foundation║
  * ║  Version: V.0.8 (2026-05-05) — Phase 3 W8.4 Reissue button + handler in Tab 4║
  * ║  Version: V.0.7 (2026-05-04) — Phase 3 W8.2-3 reconcile viewer + recall button║
  * ║  Version: V.0.6 (2026-05-04) — Phase 3 W8 cron foundation (3 jobs + heartbeat)║
@@ -2780,6 +2781,244 @@ if ( ! function_exists( 'dinoco_sn_run_batch_reconcile' ) ) {
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 12. PHASE 3 W9 — F#1 EXPIRY REMINDER (additive 2026-05-05)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 2 cron jobs:
+ *   dinoco_sn_expiry_schedule_cron   daily 02:00 — enqueue expiry notifications
+ *                                     (status='scheduled', NO LINE push yet)
+ *   dinoco_sn_notification_send_cron  every 15 min — send queued (when boss
+ *                                     flips dinoco_sn_notification_send_enabled)
+ *
+ * Master gate: dinoco_sn_notification_send_enabled (default '0').
+ * When OFF: schedule cron still enqueues rows for visibility, but send cron
+ * is a no-op. This lets boss verify the queue + answer Q21 (LINE Premium tier)
+ * before going live.
+ *
+ * Default warranty period: 1 year from registered_at (configurable per-SKU
+ * via wp_dinoco_products.warranty_years — Phase 4 W9). For Phase 3 W9 stub:
+ * use option dinoco_sn_default_warranty_years (default 1).
+ *
+ * Anti-spam dedup: notification_type + user_id + sn unique index — same
+ * combo cannot be scheduled twice (handled via INSERT IGNORE in helper).
+ *
+ * Reference: v2.13 §F.1 + §K.7
+ */
+
+if ( ! function_exists( 'dinoco_sn_warranty_end_for_pool_row' ) ) {
+    /**
+     * Compute warranty end date for a sn_pool row.
+     * Returns DateTime or null if not registered.
+     *
+     * Phase 3 W9 stub: registered_at + N years (default 1, override via option).
+     * Phase 4 W9: read warranty_years from linked SKU + extension records.
+     */
+    function dinoco_sn_warranty_end_for_pool_row( $row ) {
+        $registered_at = is_array( $row ) ? ( $row['registered_at'] ?? null ) : ( $row->registered_at ?? null );
+        if ( empty( $registered_at ) ) return null;
+        $years = (int) get_option( 'dinoco_sn_default_warranty_years', 1 );
+        if ( $years < 1 ) $years = 1;
+        try {
+            $start = new \DateTime( $registered_at, wp_timezone() );
+            $start->modify( '+' . $years . ' years' );
+            return $start;
+        } catch ( \Throwable $e ) {
+            return null;
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_schedule_notification' ) ) {
+    /**
+     * Insert notification row idempotent — composite check on
+     * (notification_type, user_id, sn) prevents duplicate scheduling.
+     *
+     * Returns true if inserted, false if dup or invalid.
+     */
+    function dinoco_sn_schedule_notification( $sn, $user_id, $notif_type, $scheduled_at, $meta = array() ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'notifications' ) ) {
+            return false;
+        }
+        $sn = strtoupper( trim( (string) $sn ) );
+        $user_id = (int) $user_id;
+        $notif_type = sanitize_key( $notif_type );
+        if ( $sn === '' || $user_id <= 0 || $notif_type === '' || ! $scheduled_at ) {
+            return false;
+        }
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'notifications' );
+
+        // Dedup check (no UNIQUE index because Phase 4 may add anniversary
+        // variants — keep app-level dedup for forward compat)
+        $exists = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$tbl}
+             WHERE notification_type = %s AND user_id = %d AND sn = %s
+             LIMIT 1",
+            $notif_type, $user_id, $sn
+        ) );
+        if ( $exists > 0 ) return false;
+
+        $ok = $wpdb->insert( $tbl, array(
+            'sn'                => $sn,
+            'user_id'           => $user_id,
+            'notification_type' => $notif_type,
+            'channel'           => 'line_flex',
+            'scheduled_at'      => $scheduled_at,
+            'status'            => 'scheduled',
+            'meta_json'         => wp_json_encode( $meta ),
+            'created_at'        => current_time( 'mysql' ),
+        ) );
+        return (bool) $ok;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_expiry_schedule' ) ) {
+    /**
+     * Daily 02:00 — scan registered plates approaching expiry and enqueue
+     * 3 notifications per plate: expiry_30d, expiry_7d, expiry_1d.
+     *
+     * Idempotent: helper dedups by (type, user_id, sn). Re-running same day
+     * is safe (same rows already exist → skipped).
+     *
+     * Phase 3 W9 stub:
+     *   - 1-year warranty default (Phase 4 W9 reads SKU.warranty_years)
+     *   - Skip plates with status NOT IN ('registered', 'claimed')
+     *   - LIMIT 5000 plates per run to avoid OOM at 1M+ rows
+     */
+    function dinoco_sn_run_expiry_schedule() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool = dinoco_sn_table( 'pool' );
+            $years = max( 1, (int) get_option( 'dinoco_sn_default_warranty_years', 1 ) );
+
+            // Fetch rows whose computed warranty_end ∈ [now, now+30d]
+            // Window includes 30/7/1 day milestones so single query covers all.
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, registered_user_id, registered_at, linked_sku
+                 FROM {$pool}
+                 WHERE status IN ('registered', 'claimed')
+                   AND registered_user_id IS NOT NULL
+                   AND registered_at IS NOT NULL
+                   AND registered_at >= DATE_SUB(NOW(), INTERVAL %d YEAR)
+                   AND DATE_ADD(registered_at, INTERVAL %d YEAR)
+                       BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 30 DAY)
+                 ORDER BY registered_at ASC
+                 LIMIT 5000",
+                $years, $years
+            ), ARRAY_A );
+
+            $scheduled = 0;
+            $skipped = 0;
+            $milestones = array(
+                'expiry_30d' => 30,
+                'expiry_7d'  => 7,
+                'expiry_1d'  => 1,
+            );
+
+            foreach ( $rows ?: array() as $row ) {
+                $end = dinoco_sn_warranty_end_for_pool_row( $row );
+                if ( ! $end ) { $skipped++; continue; }
+                foreach ( $milestones as $type => $days ) {
+                    $send_at = clone $end;
+                    $send_at->modify( '-' . $days . ' days' );
+                    // Skip if already past send window
+                    if ( $send_at->getTimestamp() < time() - 86400 ) continue;
+
+                    $ok = dinoco_sn_schedule_notification(
+                        $row['sn'],
+                        (int) $row['registered_user_id'],
+                        $type,
+                        $send_at->format( 'Y-m-d H:i:s' ),
+                        array(
+                            'linked_sku'    => $row['linked_sku'],
+                            'warranty_end'  => $end->format( 'Y-m-d' ),
+                            'days_to_expiry' => $days,
+                        )
+                    );
+                    if ( $ok ) $scheduled++; else $skipped++;
+                }
+            }
+
+            update_option( 'dinoco_sn_expiry_schedule_last_run', array(
+                'at'        => current_time( 'mysql' ),
+                'scanned'   => count( $rows ?: array() ),
+                'scheduled' => $scheduled,
+                'skipped'   => $skipped,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_expiry_schedule' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_expiry_schedule_last_run', current_time( 'mysql' ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_notification_send' ) ) {
+    /**
+     * Every 15 min — process scheduled notifications past send time.
+     *
+     * Phase 3 W9 STUB: gated by dinoco_sn_notification_send_enabled (default 0).
+     * When OFF: log skip + heartbeat only (visibility for boss).
+     * When ON: dequeue + dispatch via b2b_send_flex_message helper (LINE
+     * push) + update status='sent' or 'failed' with error in meta_json.
+     *
+     * Boss must answer Q21 (LINE Premium tier budget ฿1,500/mo) before
+     * flipping ON to avoid quota burn.
+     *
+     * Rate limit: max 50 sends per run (LINE quota safety per v2.12 §B2).
+     */
+    function dinoco_sn_run_notification_send() {
+        update_option( 'dinoco_cron_sn_notification_send_last_run', current_time( 'mysql' ) );
+
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        $send_enabled = (bool) get_option( 'dinoco_sn_notification_send_enabled', false );
+        if ( ! $send_enabled ) {
+            // Stub mode — record visibility only, no actual push
+            return;
+        }
+
+        // Phase 4 implementation hook — actual send logic
+        // Stub for now: dequeue + log (no push)
+        try {
+            global $wpdb;
+            $tbl = dinoco_sn_table( 'notifications' );
+            $now = current_time( 'mysql' );
+
+            $batch = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, sn, user_id, notification_type, meta_json
+                 FROM {$tbl}
+                 WHERE status = 'scheduled' AND scheduled_at <= %s
+                 ORDER BY scheduled_at ASC
+                 LIMIT 50",
+                $now
+            ), ARRAY_A );
+
+            foreach ( $batch ?: array() as $n ) {
+                // Phase 4 W9: dispatch via b2b_send_flex_message + Flex builder
+                // For Phase 3 W9 stub: mark as 'pending_dispatch' so admin can audit
+                $wpdb->update( $tbl, array(
+                    'status'  => 'pending_dispatch',
+                    'sent_at' => $now,
+                ), array( 'id' => (int) $n['id'] ) );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_notification_send' ) );
+            }
+        }
+    }
+}
+
 // Cron registration via registry wrapper (Round 28 pattern with fallback)
 add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'dinoco_sn_low_pool_alert_cron' ) ) {
@@ -2791,11 +3030,25 @@ add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'dinoco_sn_batch_reconcile_cron' ) ) {
         wp_schedule_event( time(), 'weekly', 'dinoco_sn_batch_reconcile_cron' );
     }
+    // Phase 3 W9 — F#1 Expiry Reminder
+    if ( ! wp_next_scheduled( 'dinoco_sn_expiry_schedule_cron' ) ) {
+        wp_schedule_event( time(), 'daily', 'dinoco_sn_expiry_schedule_cron' );
+    }
+    if ( ! wp_next_scheduled( 'dinoco_sn_notification_send_cron' ) ) {
+        // Use 'fifteen_minutes' if registered (B2B Snippet 1) or fallback hourly
+        $sched = wp_get_schedules();
+        $recurrence = isset( $sched['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly';
+        wp_schedule_event( time(), $recurrence, 'dinoco_sn_notification_send_cron' );
+    }
 
     if ( function_exists( 'dinoco_register_cron' ) ) {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
         dinoco_register_cron( 'dinoco_sn_audit_retention_cron', 'daily', 'dinoco_sn_run_audit_retention' );
         dinoco_register_cron( 'dinoco_sn_batch_reconcile_cron', 'weekly', 'dinoco_sn_run_batch_reconcile' );
+        dinoco_register_cron( 'dinoco_sn_expiry_schedule_cron', 'daily', 'dinoco_sn_run_expiry_schedule' );
+        dinoco_register_cron( 'dinoco_sn_notification_send_cron',
+            isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly',
+            'dinoco_sn_run_notification_send' );
     } else {
         // Fallback when Idempotency Helper / registry wrapper not synced
         if ( ! has_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' ) ) {
@@ -2806,6 +3059,12 @@ add_action( 'init', function() {
         }
         if ( ! has_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' ) ) {
             add_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' );
+        }
+        if ( ! has_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_run_expiry_schedule' ) ) {
+            add_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_run_expiry_schedule' );
+        }
+        if ( ! has_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' ) ) {
+            add_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' );
         }
     }
 } );

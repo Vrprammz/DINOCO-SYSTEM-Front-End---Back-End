@@ -269,6 +269,41 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).not.toMatch(/fetch\([^)]*\/activate/);
     });
 
+    test('Phase 3 W9 F#1 expiry reminder cron + helpers exist', () => {
+        const code = readSnippet('manager');
+        // Cron names + heartbeat keys
+        expect(code).toContain('dinoco_sn_expiry_schedule_cron');
+        expect(code).toContain('dinoco_sn_notification_send_cron');
+        expect(code).toContain('dinoco_cron_sn_expiry_schedule_last_run');
+        expect(code).toContain('dinoco_cron_sn_notification_send_last_run');
+        // Functions
+        expect(code).toContain('dinoco_sn_run_expiry_schedule');
+        expect(code).toContain('dinoco_sn_run_notification_send');
+        expect(code).toContain('dinoco_sn_warranty_end_for_pool_row');
+        expect(code).toContain('dinoco_sn_schedule_notification');
+    });
+
+    test('Phase 3 W9 F#1 send cron is gated by flag (default OFF)', () => {
+        const code = readSnippet('manager');
+        // Master flag default false until boss answers Q21 LINE Premium tier
+        expect(code).toContain('dinoco_sn_notification_send_enabled');
+        // Stub mode early-return when flag OFF
+        expect(code).toMatch(/\$send_enabled[\s\S]*?return;/);
+    });
+
+    test('Phase 3 W9 F#1 schedules 3 milestones (30d/7d/1d)', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('expiry_30d');
+        expect(code).toContain('expiry_7d');
+        expect(code).toContain('expiry_1d');
+    });
+
+    test('Phase 3 W9 F#1 dedup uses composite key (type, user_id, sn)', () => {
+        const code = readSnippet('manager');
+        // Helper queries should check all 3 fields (no UNIQUE index — app-level dedup)
+        expect(code).toMatch(/notification_type\s*=\s*%s[\s\S]*?user_id\s*=\s*%d[\s\S]*?sn\s*=\s*%s/);
+    });
+
     test('Phase 3 W8.5 SC Quick Lookup is mobile-first', () => {
         const filepath = path.join(REPO_ROOT, SN_SNIPPETS.sc_lookup);
         const code = fs.readFileSync(filepath, 'utf8');
