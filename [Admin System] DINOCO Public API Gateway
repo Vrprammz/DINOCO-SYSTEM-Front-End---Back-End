@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Public API Gateway                       ║
+ * ║  Version: V.0.2 (2026-05-05) — Phase 4 W12.5 HMAC raw-secret wiring║
  * ║  Version: V.0.1 (2026-05-05) — Phase 4 W12 F#15 foundation      ║
  * ║  DB_ID: (pending — populate after first WP Code Snippets sync)  ║
  * ║  Description: Public API for partners (insurance / dealer /     ║
@@ -63,6 +64,121 @@ if ( ! function_exists( 'dinoco_sn_pubapi_table' ) ) {
     }
 }
 
+/* ─── Phase 4 W12.5 — HMAC raw-secret crypto helpers (V.0.2) ─── */
+
+if ( ! function_exists( 'dinoco_sn_pubapi_master_key' ) ) {
+    /**
+     * Master encryption key for AES-256-GCM. Auto-generated on first use,
+     * stored in wp_options. Operator can override via constant
+     * DINOCO_SN_PUBAPI_MASTER_KEY (recommended for production).
+     *
+     * Returns 32-byte binary key.
+     */
+    function dinoco_sn_pubapi_master_key() {
+        if ( defined( 'DINOCO_SN_PUBAPI_MASTER_KEY' ) ) {
+            $hex = DINOCO_SN_PUBAPI_MASTER_KEY;
+            if ( ctype_xdigit( $hex ) && strlen( $hex ) === 64 ) {
+                return hex2bin( $hex );
+            }
+        }
+        $stored = get_option( 'dinoco_sn_pubapi_master_key_hex', '' );
+        if ( ! $stored || strlen( $stored ) !== 64 ) {
+            $key   = random_bytes( 32 );
+            $stored = bin2hex( $key );
+            update_option( 'dinoco_sn_pubapi_master_key_hex', $stored, false );
+            return $key;
+        }
+        return hex2bin( $stored );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_pubapi_encrypt' ) ) {
+    /**
+     * AES-256-GCM authenticated encryption.
+     * Output: base64( iv (12) || ciphertext || tag (16) )
+     * Returns null on encryption failure.
+     */
+    function dinoco_sn_pubapi_encrypt( $plaintext ) {
+        if ( ! function_exists( 'openssl_encrypt' ) ) return null;
+        $key = dinoco_sn_pubapi_master_key();
+        if ( ! $key ) return null;
+        $iv  = random_bytes( 12 );
+        $tag = '';
+        $ct  = openssl_encrypt(
+            (string) $plaintext, 'aes-256-gcm', $key,
+            OPENSSL_RAW_DATA, $iv, $tag, '', 16
+        );
+        if ( $ct === false ) return null;
+        return base64_encode( $iv . $ct . $tag );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_pubapi_decrypt' ) ) {
+    /**
+     * Reverse of encrypt(). Returns plaintext or null on failure
+     * (auth tag mismatch / corrupt input / missing openssl).
+     */
+    function dinoco_sn_pubapi_decrypt( $blob ) {
+        if ( ! function_exists( 'openssl_decrypt' ) ) return null;
+        $key = dinoco_sn_pubapi_master_key();
+        if ( ! $key ) return null;
+        $raw = base64_decode( (string) $blob, true );
+        if ( $raw === false || strlen( $raw ) < 28 ) return null;
+        $iv  = substr( $raw, 0, 12 );
+        $tag = substr( $raw, -16 );
+        $ct  = substr( $raw, 12, -16 );
+        $pt = openssl_decrypt(
+            $ct, 'aes-256-gcm', $key,
+            OPENSSL_RAW_DATA, $iv, $tag, ''
+        );
+        return ( $pt === false ) ? null : $pt;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_pubapi_compute_hmac' ) ) {
+    /**
+     * Compute the canonical HMAC signature.
+     *
+     * Format signed: timestamp + "\n" + body
+     * Output: HMAC-SHA256 hex (lowercase)
+     *
+     * Client + server MUST agree on this format. Document in
+     * docs/api/openapi.yaml snApiKey securityScheme.
+     */
+    function dinoco_sn_pubapi_compute_hmac( $secret, $timestamp, $body ) {
+        $payload = (string) $timestamp . "\n" . (string) $body;
+        return hash_hmac( 'sha256', $payload, (string) $secret );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_pubapi_ensure_secret_column' ) ) {
+    /**
+     * Lazy ALTER TABLE: ensure api_secret_encrypted column exists. Idempotent.
+     * Tokens issued before V.0.2 will have NULL — verify path returns
+     * 'legacy_token_no_hmac' so admin can rotate.
+     */
+    function dinoco_sn_pubapi_ensure_secret_column() {
+        static $checked = false;
+        if ( $checked ) return;
+        $checked = true;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'api_tokens' ) ) return;
+        global $wpdb;
+        $tbl = dinoco_sn_pubapi_table( 'api_tokens' );
+        $col = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = %s
+               AND COLUMN_NAME = %s",
+            $tbl, 'api_secret_encrypted'
+        ) );
+        if ( ! $col ) {
+            $wpdb->query( "ALTER TABLE {$tbl} ADD COLUMN api_secret_encrypted TEXT NULL AFTER api_secret_hash" );
+        }
+    }
+}
+add_action( 'admin_init', 'dinoco_sn_pubapi_ensure_secret_column' );
+
 if ( ! function_exists( 'dinoco_sn_pubapi_issue_token' ) ) {
     /**
      * Generate new API token + secret pair. Returns plaintext secret ONCE
@@ -96,26 +212,40 @@ if ( ! function_exists( 'dinoco_sn_pubapi_issue_token' ) ) {
         } ) );
         if ( ! $clean_scopes ) $clean_scopes = array( 'verify' );
 
+        // Ensure encrypted column exists (lazy migrate for V.0.2 upgrade path)
+        dinoco_sn_pubapi_ensure_secret_column();
+
         // Generate secure random key + secret
         $api_key = 'pk_' . bin2hex( random_bytes( 16 ) );    // 35 chars total
         $api_secret = 'sk_' . bin2hex( random_bytes( 24 ) ); // 51 chars total
-        $api_secret_hash = wp_hash_password( $api_secret );
+
+        // Dual-store: bcrypt hash (audit/lookup integrity) + AES-GCM encrypted
+        // (HMAC verify needs raw secret). Encrypted may be null if openssl
+        // missing — issue_token will refuse rather than degrade silently.
+        $api_secret_hash      = wp_hash_password( $api_secret );
+        $api_secret_encrypted = dinoco_sn_pubapi_encrypt( $api_secret );
+        if ( $api_secret_encrypted === null ) {
+            return new WP_Error( 'crypto_unavailable',
+                __( 'AES-256-GCM (openssl) unavailable on this server. Cannot issue HMAC-verifiable token.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
 
         global $wpdb;
         $tbl = dinoco_sn_pubapi_table( 'api_tokens' );
 
         $ok = $wpdb->insert( $tbl, array(
-            'partner_name'      => $partner_name,
-            'partner_type'      => $partner_type,
-            'api_key'           => $api_key,
-            'api_secret_hash'   => $api_secret_hash,
-            'scopes'            => wp_json_encode( $clean_scopes ),
-            'rate_limit_per_min' => max( 1, min( 1000, $rate_limit ) ),
-            'ip_allowlist'      => $ip_allowlist ?: null,
-            'is_active'         => 1,
-            'expires_at'        => $expires_at ?: null,
-            'created_at'        => current_time( 'mysql' ),
-            'created_by'        => (int) get_current_user_id(),
+            'partner_name'         => $partner_name,
+            'partner_type'         => $partner_type,
+            'api_key'              => $api_key,
+            'api_secret_hash'      => $api_secret_hash,
+            'api_secret_encrypted' => $api_secret_encrypted,
+            'scopes'               => wp_json_encode( $clean_scopes ),
+            'rate_limit_per_min'   => max( 1, min( 1000, $rate_limit ) ),
+            'ip_allowlist'         => $ip_allowlist ?: null,
+            'is_active'            => 1,
+            'expires_at'           => $expires_at ?: null,
+            'created_at'           => current_time( 'mysql' ),
+            'created_by'           => (int) get_current_user_id(),
         ) );
 
         if ( ! $ok ) {
@@ -170,7 +300,7 @@ if ( ! function_exists( 'dinoco_sn_pubapi_verify_request' ) ) {
         $tbl = dinoco_sn_pubapi_table( 'api_tokens' );
 
         $row = $wpdb->get_row( $wpdb->prepare(
-            "SELECT id, partner_name, partner_type, api_secret_hash, scopes,
+            "SELECT id, partner_name, partner_type, api_secret_hash, api_secret_encrypted, scopes,
                     rate_limit_per_min, ip_allowlist, is_active, expires_at
              FROM {$tbl}
              WHERE api_key = %s LIMIT 1",
@@ -212,17 +342,48 @@ if ( ! function_exists( 'dinoco_sn_pubapi_verify_request' ) ) {
                 array( 'status' => 403 ) );
         }
 
-        // HMAC verify — body + timestamp signed with secret
-        // Note: full HMAC validation requires raw secret; we store HASH only.
-        // Phase 4 W12 stub: skip HMAC verify if X-API-Sig matches "skip_hmac"
-        // (testing aid). Production: client computes HMAC with secret, server
-        // recomputes with same secret stored in env/wp_option (NOT in DB).
-        // For now, mark as 'placeholder_verified' — Phase 4 W12.5 will store
-        // HMAC-derivable verifier (e.g., HKDF or raw secret in encrypted option).
-        $hmac_ok = true; // PLACEHOLDER per v2.13 §F.15 Phase 4 stub
-        if ( ! $hmac_ok ) {
-            return new WP_Error( 'hmac_invalid', '', array( 'status' => 401 ) );
+        // Phase 4 W12.5 (V.0.2) — Real HMAC verify with AES-256-GCM stored secret.
+        //
+        // Token lifecycle:
+        //   pre-V.0.2: api_secret_encrypted = NULL → 'legacy_token_no_hmac' →
+        //     admin must rotate token (issue new one, revoke old).
+        //   V.0.2+:    decrypt → recompute HMAC-SHA256(secret, ts + "\n" + body)
+        //     → hash_equals (constant-time compare) for timing-attack defense.
+        //
+        // Body: read raw POST body via file_get_contents('php://input') BEFORE
+        // any json_decode side effects. WP_REST_Request->get_body() also works
+        // and is the recommended path here.
+
+        if ( empty( $row['api_secret_encrypted'] ) ) {
+            return new WP_Error( 'legacy_token_no_hmac',
+                __( 'Token created before HMAC support. Admin must rotate.', 'dinoco-sn' ),
+                array( 'status' => 401 ) );
         }
+
+        $secret = dinoco_sn_pubapi_decrypt( $row['api_secret_encrypted'] );
+        if ( $secret === null ) {
+            // Decrypt failed — corrupt blob OR master_key changed
+            return new WP_Error( 'crypto_decrypt_failed',
+                __( 'Cannot decrypt stored secret — admin must rotate token.', 'dinoco-sn' ),
+                array( 'status' => 500 ) );
+        }
+
+        $body = (string) $request->get_body();
+        $expected = dinoco_sn_pubapi_compute_hmac( $secret, $ts, $body );
+
+        // Constant-time compare prevents byte-by-byte timing attack
+        if ( ! hash_equals( $expected, (string) $sig ) ) {
+            // Defensive — wipe secret from memory before throwing
+            $secret = str_repeat( "\0", strlen( $secret ) );
+            unset( $secret );
+            return new WP_Error( 'hmac_invalid',
+                __( 'HMAC signature mismatch.', 'dinoco-sn' ),
+                array( 'status' => 401 ) );
+        }
+
+        // Wipe secret from PHP memory (best-effort — GC will collect later)
+        $secret = str_repeat( "\0", strlen( $secret ) );
+        unset( $secret );
 
         return array(
             'token_id'      => (int) $row['id'],

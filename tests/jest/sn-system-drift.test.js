@@ -1048,6 +1048,45 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('sn_clamp_days_window');
     });
 
+    test('Phase 4 W12.5 F#15 HMAC raw-secret wiring (V.0.2)', () => {
+        const code = readSnippet('public_api');
+        // Crypto helpers exist
+        expect(code).toContain('function dinoco_sn_pubapi_master_key');
+        expect(code).toContain('function dinoco_sn_pubapi_encrypt');
+        expect(code).toContain('function dinoco_sn_pubapi_decrypt');
+        expect(code).toContain('function dinoco_sn_pubapi_compute_hmac');
+        expect(code).toContain('function dinoco_sn_pubapi_ensure_secret_column');
+        // AES-256-GCM specifically (not CBC/CTR)
+        expect(code).toContain("'aes-256-gcm'");
+        // Constant-time compare for timing-attack defense
+        expect(code).toContain('hash_equals');
+        // Master key 32 bytes
+        expect(code).toMatch(/random_bytes\(\s*32\s*\)/);
+        // IV 12 bytes (GCM standard)
+        expect(code).toMatch(/random_bytes\(\s*12\s*\)/);
+        // Lazy migrate hooks admin_init
+        expect(code).toMatch(/add_action\(\s*['"]admin_init['"]\s*,\s*['"]dinoco_sn_pubapi_ensure_secret_column['"]/);
+        // Canonical sign format: timestamp + "\n" + body
+        const hmacFn = code.split('function dinoco_sn_pubapi_compute_hmac')[1] || '';
+        const block = hmacFn.split('function dinoco_sn_pubapi_ensure_secret_column')[0];
+        expect(block).toContain('"\\n"');
+        // verify_request reads encrypted column + uses real HMAC
+        expect(code).toContain('api_secret_encrypted');
+        expect(code).toContain('legacy_token_no_hmac');
+        // Placeholder removed
+        expect(code).not.toContain('PLACEHOLDER per v2.13');
+    });
+
+    test('Phase 4 W12.5 SnPubApiHmacTest exists with crypto coverage', () => {
+        const filepath = path.join(REPO_ROOT, 'tests/helpers/SnPubApiHmacTest.php');
+        expect(fs.existsSync(filepath)).toBe(true);
+        const content = fs.readFileSync(filepath, 'utf8');
+        expect(content).toContain('test_hmac_canonical_format');
+        expect(content).toContain('test_aes_round_trip');
+        expect(content).toContain('test_aes_tampered_ciphertext_detected');
+        expect(content).toContain('test_full_round_trip_partner_signs');
+    });
+
     test('Phase 3 W11 F#14 stolen_check public shortcode registered', () => {
         const code = readSnippet('stolen_check');
         // Shortcode + render fn
