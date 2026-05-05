@@ -25,7 +25,8 @@ const SN_SNIPPETS = {
     manager: '[Admin System] DINOCO Production SN Manager',
     rest: '[System] DINOCO SN REST API',
     liff: '[System] DINOCO Warranty Activation LIFF',
-    sc_lookup: '[System] DINOCO SN Quick Lookup', // Phase 3 W8.5
+    sc_lookup: '[System] DINOCO SN Quick Lookup',  // Phase 3 W8.5
+    public_api: '[Admin System] DINOCO Public API Gateway',  // Phase 4 W12 F#15
 };
 
 const readSnippet = (key) => {
@@ -614,6 +615,68 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(handler).toContain('min_score');
         // Returns factors decoded + tier classification per row
         expect(handler).toContain('factors_json');
+    });
+
+    test('Phase 4 W12 F#15 Public API Gateway snippet exists', () => {
+        const filepath = path.join(REPO_ROOT, SN_SNIPPETS.public_api);
+        expect(fs.existsSync(filepath)).toBe(true);
+        const code = fs.readFileSync(filepath, 'utf8');
+        // Separate namespace prevents collision with admin /dinoco-sn/v1
+        expect(code).toContain("'dinoco-sn-api/v1'");
+        // 3 public endpoints + 3 admin token mgmt endpoints
+        expect(code).toContain("'/verify'");
+        expect(code).toContain("'/claim-status'");
+        expect(code).toContain("'/stolen-check'");
+        expect(code).toContain("'/api-tokens'");
+        expect(code).toContain("'/api-tokens/(?P<id>\\d+)/disable'");
+    });
+
+    test('Phase 4 W12 F#15 token issue + verify + rate limit helpers', () => {
+        const code = fs.readFileSync(path.join(REPO_ROOT, SN_SNIPPETS.public_api), 'utf8');
+        expect(code).toContain('dinoco_sn_pubapi_issue_token');
+        expect(code).toContain('dinoco_sn_pubapi_verify_request');
+        expect(code).toContain('dinoco_sn_pubapi_check_rate_limit');
+        expect(code).toContain('dinoco_sn_pubapi_log_request');
+        // Token format: pk_/sk_ prefix
+        expect(code).toContain("'pk_'");
+        expect(code).toContain("'sk_'");
+        // Scopes whitelist
+        ['verify', 'claim_status', 'stolen_check', 'full'].forEach(scope => {
+            expect(code).toContain(`'${scope}'`);
+        });
+    });
+
+    test('Phase 4 W12 F#15 public endpoints PII-stripped', () => {
+        const code = fs.readFileSync(path.join(REPO_ROOT, SN_SNIPPETS.public_api), 'utf8');
+        const verify_handler = code.split('function dinoco_sn_pubapi_handle_verify')[1] || '';
+        const claim_handler = code.split('function dinoco_sn_pubapi_handle_claim_status')[1] || '';
+        const stolen_handler = code.split('function dinoco_sn_pubapi_handle_stolen_check')[1] || '';
+        // None of the 3 handlers should emit user_id / phone / email / display_name
+        [verify_handler, claim_handler, stolen_handler].forEach(handler => {
+            expect(handler).not.toMatch(/'phone'\s*=>/);
+            expect(handler).not.toMatch(/'email'\s*=>/);
+            expect(handler).not.toMatch(/'display_name'\s*=>/);
+            expect(handler).not.toMatch(/'registered_user_id'\s*=>/);
+        });
+    });
+
+    test('Phase 4 W12 F#15 90-day cleanup cron + heartbeat', () => {
+        const code = fs.readFileSync(path.join(REPO_ROOT, SN_SNIPPETS.public_api), 'utf8');
+        expect(code).toContain('dinoco_sn_pubapi_log_cleanup_cron');
+        expect(code).toContain('dinoco_sn_pubapi_run_log_cleanup');
+        expect(code).toContain('dinoco_cron_sn_pubapi_log_cleanup_last_run');
+        // 90-day cutoff
+        expect(code).toMatch(/90\s*\*\s*86400/);
+        // Chunked DELETE 500/iter × 10 cap
+        expect(code).toMatch(/LIMIT 500/);
+    });
+
+    test('Phase 4 W12 F#15 admin list never exposes secret hash', () => {
+        const code = fs.readFileSync(path.join(REPO_ROOT, SN_SNIPPETS.public_api), 'utf8');
+        const handler = code.split('function dinoco_sn_pubapi_admin_list')[1] || '';
+        // SELECT clause must NOT include api_secret_hash
+        const select_block = handler.split('FROM')[0] || '';
+        expect(select_block).not.toContain('api_secret_hash');
     });
 
     test('15 schema tables defined in Production S/N Manager', () => {
