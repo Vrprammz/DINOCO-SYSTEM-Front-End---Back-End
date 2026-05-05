@@ -419,18 +419,46 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toContain("'methods'             => 'POST'");
     });
 
-    test('6 admin tabs declared in Production S/N Manager (Phase 3 W10 added ltv)', () => {
+    test('9 admin tabs declared (Phase 3 W11 added fraud/geo/stolen)', () => {
         const code = readSnippet('manager');
-        const expected_tabs = ['batches', 'receive', 'pool', 'manage', 'audit', 'ltv'];
+        const expected_tabs = ['batches', 'receive', 'pool', 'manage', 'audit', 'ltv',
+                                'fraud', 'geo', 'stolen'];
         expected_tabs.forEach(tab => {
-            // Check tab declaration in nav (data-tab="X")
             const navPattern = new RegExp(`data-tab="${tab}"`);
             expect(code).toMatch(navPattern);
-
-            // Check panel declaration (data-tab-panel="X")
             const panelPattern = new RegExp(`data-tab-panel="${tab}"`);
             expect(code).toMatch(panelPattern);
         });
+    });
+
+    test('Phase 3 W11 admin tab render functions + lazy load wiring', () => {
+        const code = readSnippet('manager');
+        ['fraud', 'geo', 'stolen'].forEach(tab => {
+            expect(code).toContain(`dinoco_sn_render_tab_${tab}`);
+            // Lazy-load flag prevents double-fetch on re-activation
+            expect(code).toContain(`_dncSn${tab.charAt(0).toUpperCase() + tab.slice(1)}Loaded`);
+        });
+        // Module Registry includes all 3 new subtabs
+        ['fraud', 'geo', 'stolen'].forEach(tab => {
+            expect(code).toMatch(new RegExp(`'${tab}'\\s*=>`));
+        });
+    });
+
+    test('Phase 3 W11 fraud/stolen JS handlers wired', () => {
+        const code = readSnippet('manager');
+        // Fraud Queue actions
+        expect(code).toContain('dncSnLoadFraud');
+        expect(code).toContain('dncSnLoadFraudStats');
+        expect(code).toContain('dncSnFraudDecision');
+        // Geo handlers
+        expect(code).toContain('dncSnLoadGeoHeatmap');
+        expect(code).toContain('dncSnLoadGrayMarket');
+        // Stolen handlers
+        expect(code).toContain('dncSnLoadStolen');
+        expect(code).toContain('dncSnStolenDecision');
+        // Idempotency-Key pattern on decision posts
+        expect(code).toMatch(/X-Idempotency-Key.*?fraud-/);
+        expect(code).toMatch(/X-Idempotency-Key.*?stolen-/);
     });
 
     test('Phase 3 W10 F#9 LTV endpoints + tier helper + cron', () => {

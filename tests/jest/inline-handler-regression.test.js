@@ -96,7 +96,12 @@ const SNIPPET_PREFIXES = [
 // Bumped 887→890 (2026-05-05): Phase 3 W10 F#9 LTV Dashboard added
 // 3 onclick handlers (Load button + Detail close + per-row Detail open).
 // Migration deferred per same v2.13 polish sprint.
-const BASELINE_INLINE_HANDLER_COUNT = 890;
+//
+// Bumped 890→904 (2026-05-05): Phase 3 W11 admin Tabs 7/8/9 added
+// 14 onclick handlers — Fraud Queue (Load/Stats + 3-decision per row),
+// Geo Heatmap (Load + GrayMarket buttons), Stolen Registry (Load +
+// 4-decision per row). Migration deferred per v2.13 polish sprint.
+const BASELINE_INLINE_HANDLER_COUNT = 904;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
