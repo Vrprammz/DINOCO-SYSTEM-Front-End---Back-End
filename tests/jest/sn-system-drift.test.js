@@ -902,6 +902,59 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         });
     });
 
+    test('Phase 3 W9 F#1/F#4/F#10 Flex template builders exist in manager', () => {
+        const code = readSnippet('manager');
+        // Pure helper functions (defensive function_exists guard pattern)
+        expect(code).toContain('function dinoco_sn_format_thai_date');
+        expect(code).toContain('function dinoco_sn_pick_anniversary_emoji');
+        expect(code).toContain('function dinoco_sn_build_flex_expiry');
+        expect(code).toContain('function dinoco_sn_build_flex_anniversary');
+        expect(code).toContain('function dinoco_sn_build_flex_review_request');
+        expect(code).toContain('function dinoco_sn_build_flex_for_notification');
+    });
+
+    test('Phase 3 W9 dispatcher routes 3 notification types', () => {
+        const code = readSnippet('manager');
+        const dispatcher = code.split('function dinoco_sn_build_flex_for_notification')[1] || '';
+        // Type prefix matching for expiry_*/anniversary_*
+        expect(dispatcher).toMatch(/strpos\(\s*\$type,\s*['"]expiry_['"]/);
+        expect(dispatcher).toMatch(/strpos\(\s*\$type,\s*['"]anniversary_['"]/);
+        // Exact match for review_request
+        expect(dispatcher).toMatch(/\$type\s*===\s*['"]review_request['"]/);
+        // Suffix parsing for days_left
+        expect(dispatcher).toMatch(/expiry_\(\\d\+\)d/);
+        expect(dispatcher).toMatch(/anniversary_\(\\d\+\)y/);
+    });
+
+    test('Phase 3 W9 expiry header severity colors per v2.10 §F#1 spec', () => {
+        const code = readSnippet('manager');
+        const handler = code.split('function dinoco_sn_build_flex_expiry')[1] || '';
+        const block = handler.split('function dinoco_sn_build_flex_anniversary')[0];
+        // 3-tier severity: red ≤1d, amber ≤7d, navy >7d
+        expect(block).toContain('#dc2626'); // red urgent
+        expect(block).toContain('#f59e0b'); // amber warning
+        expect(block).toContain('#1f2937'); // navy normal
+    });
+
+    test('Phase 3 W9 anniversary tier colors per v2.10 §F#4 spec', () => {
+        const code = readSnippet('manager');
+        const handler = code.split('function dinoco_sn_build_flex_anniversary')[1] || '';
+        const block = handler.split('function dinoco_sn_build_flex_review_request')[0];
+        expect(block).toContain('#7c3aed'); // diamond/violet 3y+
+        expect(block).toContain('#ca8a04'); // gold 2y
+        expect(block).toContain('#1f2937'); // navy 1y
+    });
+
+    test('Phase 3 W9 SnFlexTemplateTest helper exists', () => {
+        const filepath = path.join(REPO_ROOT, 'tests/helpers/SnFlexTemplateTest.php');
+        expect(fs.existsSync(filepath)).toBe(true);
+        const content = fs.readFileSync(filepath, 'utf8');
+        // Sanity: covers all 3 builders
+        expect(content).toContain('expiry');
+        expect(content).toContain('anniversary');
+        expect(content).toContain('review');
+    });
+
     test('Phase 0 W1 docs deliverables exist', () => {
         const docs = [
             'docs/sn-system/README.md',
