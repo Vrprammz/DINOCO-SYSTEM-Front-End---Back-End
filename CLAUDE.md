@@ -714,6 +714,15 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
     - **Q27**: Tier badge = use **existing "Card Role" system** ("มี Card Role อยู่แล้ว ไปอ่านระบบดีๆก่อน") — must explore existing implementation before reinventing.
   - **Pending boss inputs**: F1-F5 flag flip schedule + Q12 pilot dealer names + Q15 approver delegation list + Q20 no-refund policy legal review.
   - **v2.14 (in progress)**: Q21+Q23 cleanup landed (commit `8d97fdf`). Q22 flag-gate landed (V.0.3). Q6/Q8/Q15/Q27 = Phase replan + new work items (sequenced after Phase 1 W4 pilot).
+  - **Round 2 boss answers** (2026-05-05, commits `3d9d3c9` + `9ee8f0f` + Pilot decision):
+    - **Q11**: LINE Premium ฿1,500/mo **paid** — F1 cron firing risk mitigated
+    - **Q15 R2**: บอสจะตั้ง role เอง — Role Manager V.0.2 = Matrix UI (User × 4 Role checkbox + bulk save + REST `/sn-roles/bulk-assign`)
+    - **Q20 R2 (REVERT)**: ไม่ใช่ "ไม่คืน" — เปลี่ยนเป็น **manual refund flow** (ลูกค้าติดต่อ Admin Facebook + Backend ปุ่มยืนยันคืน + 4-eyes ฿5K threshold)
+    - **Q27 R2**: Confirmed = ใช้ B2B distributor `rank_system` pattern (emoji+color+label) for tier badge visual
+    - **Q8 R2**: Confirmed Phase 4 W12 admin UI กรอกราคา per-SKU
+    - **Q7 R2**: Reuse `B2B_SLIP2GO_SECRET_KEY` + `B2B_BANK_*` constants (no new partnership)
+    - **F1-F5 schedule**: "เริ่มทันทีถ้าทุกอย่างเสร็จ" → go-live gate doc `docs/sn-system/10-go-live-gate-checklist.md`
+    - **Pilot decision**: **B — Skip pilot** (flip flag ON ทุกดีลเลอร์พร้อมกัน). Phase 1 W4 replan: replace pilot 100 plates → internal QA 50 test cases (`docs/sn-system/11-phase1-w4-internal-qa-acceptance-test.md`). Production batch ส่งโรงงานจีนตอน Phase 2 W6 parallel. Risk mitigation = hard rollback < 30s + Sentry/observability + Telegram alert + Phase 2 W7 atomic 5-step deploy.
 
 ## Reference Documentation
 

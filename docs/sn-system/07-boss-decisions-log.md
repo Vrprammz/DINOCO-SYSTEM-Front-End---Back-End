@@ -321,11 +321,28 @@
 **ผม clarification**: Q12 ในเอกสาร = **fraud baseline audit** (อ่าน claim 12 เดือน) — ไม่เกี่ยวข้อง pilot dealer. ผมเขียน "Q12 = pilot dealer 5 ราย" ในข้อความก่อน = **ผิด** ขอโทษ
 
 **Pilot dealer คำถามจริง** (อยู่นอก 29 Q):
-- Phase 1 W4 ต้องการ pilot 100 plates → 5 dealers × 20 plates
-- หรือ skip pilot ไปเลย (full rollout flag flip)
-- **Boss decision pending** — ถ้าตอบ "skip pilot" ผมจะ remove จาก Phase 1 W4 + รัน internal acceptance test แทน
 
-**Status**: ⚠️ **Still pending** (1 unblocked item)
+**Boss decision (2026-05-05 R2)**: **B — Skip pilot** (flip flag ON ทุกดีลเลอร์พร้อมกัน)
+
+**Implementation impact** — Phase 1 W4 replan:
+
+- ❌ ลบ pilot 100 plates → 5 hand-picked dealers × 20 plates
+- ✅ แทนด้วย **Internal QA Acceptance Test** (Phase 1 W4):
+  - Boss + dev team รัน 50 simulated test cases
+  - Test plate batch 100 plates ไว้สำหรับ internal scan testing เท่านั้น (ไม่ส่งดีลเลอร์)
+  - End-to-end flow verification (batch create → receive → activate → claim → transfer)
+  - Edge cases (race conditions / duplicate scan / voided plate / wrong owner)
+  - Acceptance gate: 0 critical bugs across 50 cases
+- ✅ **Full launch** ตอน Phase 2 W7 จบ → flip F1 ON ทุกดีลเลอร์ทั่วประเทศพร้อมกัน
+- ✅ Production batch ใหญ่ (1000+ plates) ส่งโรงงานจีนตอน Phase 2 W6 (parallel กับ existing system integration)
+
+**Risk mitigation** (since skipping pilot):
+- 🛡 **Hard rollback ready** — `wp option update dinoco_sn_system_enabled 0` → instant revert (< 30s)
+- 🛡 **Observability** — `dinoco_obs_capture` + Sentry on every sensitive op (log critical errors)
+- 🛡 **Telegram alert** — บอสได้รับ alert ทันทีถ้า activation rate ต่ำผิดปกติ / fraud spike / DB lock timeout
+- 🛡 **Phase 2 W7 atomic deploy** — 5-step deploy strategy (NEW snippets first → backfill → flag dual-source → atomic V.31.0 → 24h monitor)
+
+**Status**: ✅ **Unblocked** — Phase 1 W4 ready to start (replace pilot with internal QA)
 
 ---
 
