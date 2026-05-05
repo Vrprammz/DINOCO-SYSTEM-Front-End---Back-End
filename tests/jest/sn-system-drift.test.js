@@ -718,6 +718,35 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/Q22 OVERRIDE/);
     });
 
+    test('Phase 1 W4 — Pre-flight check + observability helpers present', () => {
+        const code = readSnippet('manager');
+
+        // Pre-flight check function
+        expect(code).toContain('function dinoco_sn_preflight_check_batch');
+        expect(code).toContain('function dinoco_sn_compute_hierarchy_depth');
+
+        // Returns structured report shape
+        expect(code).toMatch(/'plates_required_total'\s*=>/);
+        expect(code).toMatch(/'plates_per_sku'\s*=>/);
+        expect(code).toMatch(/'warnings'\s*=>\s*array/);
+        expect(code).toMatch(/'errors'\s*=>\s*array/);
+
+        // Error codes catalog
+        ['no_skus', 'empty_sku', 'sku_attach_level_none', 'no_plates_resolved',
+         'depth_exceeds_max', 'batch_qty_too_small'].forEach(c => {
+            expect(code).toContain(`'${c}'`);
+        });
+
+        // DD-3 + DD-4 guards
+        expect(code).toMatch(/in_array\(\s*\$sku,\s*\$visited,\s*true\s*\)/); // circular ref
+        expect(code).toMatch(/\$depth\s*>\s*5/); // safety cap
+
+        // Observability wrapper
+        expect(code).toContain('function dinoco_sn_obs_capture');
+        expect(code).toMatch(/function_exists\(\s*'dinoco_obs_capture'\s*\)/); // defensive
+        expect(code).toMatch(/catch\s*\(\s*\\Throwable\s+\$e\s*\)/); // never throw
+    });
+
     test('Q15 OVERRIDE — User Role Manager snippet exists + 4 roles + 13 caps', () => {
         // Boss decision (2026-05-05): "ทำ Backend UserAdmin Role-based access control"
         const filepath = path.join(REPO_ROOT, '[Admin System] DINOCO User Role Manager');

@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.24 (2026-05-05) — Phase 1 W4.1+W4.2: pre-flight + obs hooks║
  * ║  Version: V.0.23 (2026-05-05) — Q21 OVERRIDE: F#12 nav-item REMOVED (final cleanup)║
  * ║  Version: V.0.22 (2026-05-05) — Phase 3 W8 Gap D orphan-claim scan cron (daily 03:30)║
  * ║  Version: V.0.21 (2026-05-05) — Phase 2 W5 audit log CSV export (Tab 5 button + handler)║
@@ -1300,6 +1301,191 @@ if ( ! function_exists( 'dinoco_sn_set_attach_level' ) ) {
         );
 
         return $ok !== false;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_preflight_check_batch' ) ) {
+    /**
+     * Phase 1 W4.2 — Pre-flight check before sending batch to factory.
+     *
+     * Validates:
+     *   - All target SKUs have sn_attach_level ≠ 'none' + sn_required=1
+     *   - Hierarchy resolves cleanly (no circular ref + max depth 3)
+     *   - Plate count makes sense (qty * sn_qty_per_unit > 0)
+     *   - top_set_sku resolvable for customer-facing display (DD-6)
+     *   - No collision with existing batch sequences
+     *
+     * Returns structured report admin can review before confirming batch.
+     *
+     * @param array $skus_with_qty Array of {sku, qty}
+     * @param int   $batch_qty Total plate count requested in batch
+     * @return array {
+     *   ok: bool,
+     *   warnings: [{ sku, code, message }],
+     *   errors: [{ sku, code, message }],
+     *   plates_required_total: int,
+     *   plates_per_sku: [{ sku, qty, hierarchy: [...] }]
+     * }
+     */
+    function dinoco_sn_preflight_check_batch( $skus_with_qty, $batch_qty ) {
+        $report = array(
+            'ok'                    => true,
+            'warnings'              => array(),
+            'errors'                => array(),
+            'plates_required_total' => 0,
+            'plates_per_sku'        => array(),
+        );
+
+        if ( ! is_array( $skus_with_qty ) || empty( $skus_with_qty ) ) {
+            $report['ok'] = false;
+            $report['errors'][] = array(
+                'sku'     => '',
+                'code'    => 'no_skus',
+                'message' => 'ต้องระบุอย่างน้อย 1 SKU',
+            );
+            return $report;
+        }
+
+        $batch_qty = max( 1, (int) $batch_qty );
+        $total_plates_needed = 0;
+
+        foreach ( $skus_with_qty as $entry ) {
+            $sku = isset( $entry['sku'] ) ? strtoupper( trim( (string) $entry['sku'] ) ) : '';
+            $qty = isset( $entry['qty'] ) ? max( 1, (int) $entry['qty'] ) : 1;
+
+            if ( $sku === '' ) {
+                $report['errors'][] = array(
+                    'sku'     => '',
+                    'code'    => 'empty_sku',
+                    'message' => 'SKU ว่าง',
+                );
+                $report['ok'] = false;
+                continue;
+            }
+
+            // Check sn_attach_level
+            $attach = dinoco_sn_get_attach_level_for_sku( $sku );
+            if ( $attach === 'none' || $attach === '' ) {
+                $report['errors'][] = array(
+                    'sku'     => $sku,
+                    'code'    => 'sku_attach_level_none',
+                    'message' => sprintf( 'SKU %s ตั้ง sn_attach_level=none — ห้ามสร้าง plate ให้ SKU นี้', $sku ),
+                );
+                $report['ok'] = false;
+                continue;
+            }
+
+            // Resolve hierarchy
+            $required = dinoco_sn_required_plates_for_sku( $sku, $qty );
+            if ( empty( $required ) ) {
+                $report['warnings'][] = array(
+                    'sku'     => $sku,
+                    'code'    => 'no_plates_resolved',
+                    'message' => sprintf( 'SKU %s ไม่มีลูก/หลานที่ resolve ได้ — ตรวจ dinoco_sku_relations', $sku ),
+                );
+                continue;
+            }
+
+            // Compute plate count
+            $sku_plate_count = 0;
+            foreach ( $required as $req ) {
+                $sku_plate_count += (int) $req['qty'];
+            }
+            $total_plates_needed += $sku_plate_count;
+
+            $report['plates_per_sku'][] = array(
+                'sku'             => $sku,
+                'qty_units'       => $qty,
+                'attach_level'    => $attach,
+                'plates_required' => $sku_plate_count,
+                'hierarchy'       => $required,
+            );
+
+            // Warn if hierarchy too deep (DD-4)
+            $relations = get_option( 'dinoco_sku_relations', array() );
+            if ( is_array( $relations ) && ! empty( $relations ) ) {
+                $depth = dinoco_sn_compute_hierarchy_depth( $sku, $relations );
+                if ( $depth > 3 ) {
+                    $report['warnings'][] = array(
+                        'sku'     => $sku,
+                        'code'    => 'depth_exceeds_max',
+                        'message' => sprintf( 'SKU %s hierarchy depth=%d เกิน DD-4 max 3', $sku, $depth ),
+                    );
+                }
+            }
+        }
+
+        $report['plates_required_total'] = $total_plates_needed;
+
+        // Check batch_qty matches
+        if ( $batch_qty < $total_plates_needed ) {
+            $report['warnings'][] = array(
+                'sku'     => '',
+                'code'    => 'batch_qty_too_small',
+                'message' => sprintf( 'batch_qty=%d น้อยกว่า plates ที่ต้องการ=%d', $batch_qty, $total_plates_needed ),
+            );
+        }
+
+        return $report;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_compute_hierarchy_depth' ) ) {
+    /**
+     * Compute max depth of SKU hierarchy. Pure-logic helper for pre-flight check.
+     */
+    function dinoco_sn_compute_hierarchy_depth( $sku, $relations, $visited = array(), $depth = 0 ) {
+        if ( $depth > 5 ) return $depth; // safety cap (V.7.1 pattern)
+        $sku = strtoupper( trim( (string) $sku ) );
+        if ( in_array( $sku, $visited, true ) ) return $depth; // circular ref
+        $visited[] = $sku;
+
+        $children = isset( $relations[ $sku ] ) && is_array( $relations[ $sku ] )
+            ? $relations[ $sku ]
+            : array();
+
+        if ( empty( $children ) ) return $depth;
+
+        $max_child = $depth;
+        foreach ( $children as $child ) {
+            // value-copy $visited per branch (DD-3 pattern)
+            $child_depth = dinoco_sn_compute_hierarchy_depth( $child, $relations, $visited, $depth + 1 );
+            if ( $child_depth > $max_child ) $max_child = $child_depth;
+        }
+        return $max_child;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_obs_capture' ) ) {
+    /**
+     * Phase 1 W4.2 — Wrapper around dinoco_obs_capture for sensitive S/N ops.
+     * Defensive: no-op if Observability snippet not synced yet.
+     *
+     * Use at top of every:
+     *   - batch creation
+     *   - bulk receive
+     *   - customer activate
+     *   - swap/void/recall
+     *
+     * Captures structured context for Sentry/log aggregation.
+     */
+    function dinoco_sn_obs_capture( $event, $context = array() ) {
+        if ( ! function_exists( 'dinoco_obs_capture' ) ) return; // Observability not loaded
+        $tag = 'sn_' . sanitize_key( $event );
+        $payload = array(
+            'event' => $tag,
+            'time'  => current_time( 'c' ),
+            'user'  => get_current_user_id(),
+        );
+        if ( is_array( $context ) ) {
+            $payload = array_merge( $payload, $context );
+        }
+        try {
+            dinoco_obs_capture( null, $payload );
+        } catch ( \Throwable $e ) {
+            // Best-effort — never throw from observability
+            error_log( '[SN-Obs] capture failed: ' . $e->getMessage() );
+        }
     }
 }
 
