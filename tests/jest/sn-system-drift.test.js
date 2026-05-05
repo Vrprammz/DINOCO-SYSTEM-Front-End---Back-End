@@ -718,6 +718,49 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/Q22 OVERRIDE/);
     });
 
+    test('Q15 OVERRIDE — User Role Manager snippet exists + 4 roles + 13 caps', () => {
+        // Boss decision (2026-05-05): "ทำ Backend UserAdmin Role-based access control"
+        const filepath = path.join(REPO_ROOT, '[Admin System] DINOCO User Role Manager');
+        expect(fs.existsSync(filepath)).toBe(true);
+        const code = fs.readFileSync(filepath, 'utf8');
+
+        // 4 custom roles registered
+        ['dinoco_sn_approver', 'dinoco_sn_warehouse', 'dinoco_sn_view_pii', 'dinoco_sn_readonly'].forEach(role => {
+            expect(code).toContain(`add_role( '${role}'`);
+        });
+
+        // Capabilities catalog function exists
+        expect(code).toContain('function dinoco_sn_caps_list');
+
+        // Permission helper with backward compat fallback
+        expect(code).toContain('function dinoco_sn_user_can');
+        expect(code).toMatch(/get_option\(\s*'dinoco_sn_strict_role_check'\s*,\s*'0'\s*\)/);
+
+        // 13 caps from Q15 spec
+        const expected_caps = [
+            'dinoco_sn_warehouse', 'dinoco_sn_approver',
+            'dinoco_sn_approve_swap', 'dinoco_sn_approve_void', 'dinoco_sn_approve_recall',
+            'dinoco_sn_view_pii', 'dinoco_sn_view_pii_full', 'dinoco_sn_export_pii',
+            'dinoco_sn_view_dashboard', 'dinoco_sn_view_audit', 'dinoco_sn_view_inventory',
+            'dinoco_sn_manage_settings', 'dinoco_sn_manage_users',
+        ];
+        expected_caps.forEach(cap => {
+            expect(code).toContain(`'${cap}'`);
+        });
+
+        // Idempotent registration via version marker
+        expect(code).toMatch(/dinoco_sn_roles_registered_version/);
+
+        // Module Registry self-registration
+        expect(code).toContain('dinoco_register_admin_module');
+        expect(code).toContain("'sn_roles'");
+        expect(code).toContain("'dinoco_admin_user_roles'");
+
+        // Q15 plan doc exists
+        const planDoc = path.join(REPO_ROOT, 'docs/sn-system/09-q15-role-based-access-control.md');
+        expect(fs.existsSync(planDoc)).toBe(true);
+    });
+
     test('Q6+Q8 — F#8 extension price helper stubs present (Phase 4 W12 wiring)', () => {
         // Boss decisions (2026-05-05):
         //   Q6: F#8 Phase 5 → Phase 4 W12-13 + ทำให้ละเอียดที่สุด
