@@ -718,6 +718,29 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/Q22 OVERRIDE/);
     });
 
+    test('Phase 1 W4.2 — dinoco_sn_obs_capture wired into 4 sensitive ops', () => {
+        const rest = readSnippet('rest');
+        const liff = readSnippet('liff');
+
+        // batch_create_attempt in REST handler
+        expect(rest).toContain("'batch_create_attempt'");
+        // receive_attempt in REST handler
+        expect(rest).toContain("'receive_attempt'");
+        // void_attempt in REST handler (sensitive 4-eyes op)
+        expect(rest).toContain("'void_attempt'");
+        // swap_attempt in REST handler (sensitive 4-eyes op)
+        expect(rest).toContain("'swap_attempt'");
+        // activate_attempt in LIFF (high-volume customer op)
+        expect(liff).toContain("'activate_attempt'");
+
+        // All wired with function_exists guard (defensive — never throw if obs not loaded)
+        const guardCount = (rest.match(/function_exists\(\s*'dinoco_sn_obs_capture'\s*\)/g) || []).length;
+        expect(guardCount).toBeGreaterThanOrEqual(4); // batch + receive + void + swap
+
+        const liffGuardCount = (liff.match(/function_exists\(\s*'dinoco_sn_obs_capture'\s*\)/g) || []).length;
+        expect(liffGuardCount).toBeGreaterThanOrEqual(1); // activate
+    });
+
     test('Phase 1 W4 — Pre-flight check + observability helpers present', () => {
         const code = readSnippet('manager');
 
