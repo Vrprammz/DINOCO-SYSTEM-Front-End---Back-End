@@ -92,7 +92,11 @@ const SNIPPET_PREFIXES = [
 //
 // Bumped 886→887 (2026-05-05): Phase 3 W8.4 added per-row Reissue button
 // (M2 plate-fell-off scenario). Migration deferred per v2.13 polish.
-const BASELINE_INLINE_HANDLER_COUNT = 887;
+//
+// Bumped 887→890 (2026-05-05): Phase 3 W10 F#9 LTV Dashboard added
+// 3 onclick handlers (Load button + Detail close + per-row Detail open).
+// Migration deferred per same v2.13 polish sprint.
+const BASELINE_INLINE_HANDLER_COUNT = 890;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

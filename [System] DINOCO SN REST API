@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.7 (2026-05-05) — Phase 3 W10 F#9 LTV /list + /{user_id} drill-down║
  * ║  Version: V.0.6 (2026-05-05) — Audit fixes P0-1/2/5/6 + P1-1/2/3 (PII + locks + SQL)║
  * ║  Version: V.0.5 (2026-05-04) — Phase 3 W8.2-3 recall + reissue + reconcile-report║
  * ║  Version: V.0.4 (2026-05-04) — Phase 2 W5 pool-stats/search/audit/void/swap║
@@ -581,6 +582,30 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             'methods'             => 'GET',
             'callback'            => 'dinoco_sn_rest_reconcile_report',
             'permission_callback' => 'dinoco_sn_perm_admin',
+        ) );
+
+        /* ─── Phase 3 W10 — F#9 Customer LTV Dashboard ─── */
+
+        // GET /ltv/list — top customers paginated by lifetime spend
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/ltv/list', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_ltv_list',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'tier'   => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
+                'limit'  => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+                'offset' => array( 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /ltv/{user_id} — drill-down customer detail
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/ltv/(?P<user_id>\d+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_ltv_detail',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'user_id' => array( 'required' => true, 'type' => 'integer' ),
+            ),
         ) );
     }
 }
@@ -2484,6 +2509,162 @@ if ( ! function_exists( 'dinoco_sn_rest_reconcile_report' ) ) {
             'last_run'  => $report['at']    ?? null,
             'count'     => $report['count'] ?? 0,
             'rows'      => $report['rows']  ?? array(),
+        ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 9. PHASE 3 W10 — F#9 CUSTOMER LTV DASHBOARD HANDLERS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Reads from wp_dinoco_sn_customer_ltv_snapshot (populated by daily cron).
+ * Admin-only. PII (phone/email) auto-masked unless dinoco_sn_view_pii cap.
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_ltv_list' ) ) {
+    /**
+     * GET /ltv/list?tier=&limit=&offset= — top customers by lifetime spend.
+     */
+    function dinoco_sn_rest_ltv_list( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'ltv_snapshot' ) ) {
+            return rest_ensure_response( array( 'rows' => array(), 'total' => 0,
+                'note' => 'ltv_snapshot table not installed (run cron once)' ) );
+        }
+
+        global $wpdb;
+        $tbl   = dinoco_sn_table( 'ltv_snapshot' );
+        $tier  = sanitize_key( (string) $req->get_param( 'tier' ) );
+        $limit = max( 1, min( 200, (int) $req->get_param( 'limit' ) ) );
+        $offset = max( 0, (int) $req->get_param( 'offset' ) );
+
+        $allowed_tiers = array( 'bronze', 'silver', 'gold', 'platinum', 'diamond' );
+        $where  = '';
+        $params = array();
+        if ( $tier !== '' && in_array( $tier, $allowed_tiers, true ) ) {
+            $where = 'WHERE loyalty_tier = %s';
+            $params[] = $tier;
+        }
+
+        $count_sql = "SELECT COUNT(*) FROM {$tbl} {$where}";
+        $list_sql  = "SELECT user_id, plates_count, registered_count, active_warranties_count,
+                             total_lifetime_spent, first_purchase_date, last_purchase_date,
+                             claim_count, loyalty_tier, computed_at
+                      FROM {$tbl}
+                      {$where}
+                      ORDER BY total_lifetime_spent DESC, user_id ASC
+                      LIMIT %d OFFSET %d";
+
+        $total = (int) ( $params
+            ? $wpdb->get_var( $wpdb->prepare( $count_sql, $params ) )
+            : $wpdb->get_var( $count_sql ) );
+
+        $list_params = array_merge( $params, array( $limit, $offset ) );
+        $rows = $wpdb->get_results( $wpdb->prepare( $list_sql, $list_params ), ARRAY_A );
+
+        // Resolve display names + PII gate
+        $can_pii = function_exists( 'dinoco_sn_user_can_view_pii' ) && dinoco_sn_user_can_view_pii();
+        $rows = array_map( function( $r ) use ( $can_pii ) {
+            $uid = (int) $r['user_id'];
+            $u = $uid ? get_user_by( 'id', $uid ) : null;
+            $r['user_id']           = $uid;
+            $r['display_name']      = $u ? $u->display_name : ( 'user#' . $uid );
+            $r['email']             = ( $u && $can_pii )
+                ? $u->user_email
+                : ( $u ? preg_replace( '/(.).*(@.*)/', '$1***$2', (string) $u->user_email ) : null );
+            $r['plates_count']            = (int) $r['plates_count'];
+            $r['registered_count']        = (int) $r['registered_count'];
+            $r['active_warranties_count'] = (int) $r['active_warranties_count'];
+            $r['claim_count']             = (int) $r['claim_count'];
+            $r['total_lifetime_spent']    = (float) $r['total_lifetime_spent'];
+            return $r;
+        }, $rows ?: array() );
+
+        // Tier distribution summary (single-pass aggregation)
+        $tier_dist = $wpdb->get_results(
+            "SELECT loyalty_tier, COUNT(*) AS n FROM {$tbl} GROUP BY loyalty_tier",
+            ARRAY_A
+        );
+        $tier_summary = array();
+        foreach ( $allowed_tiers as $t ) { $tier_summary[ $t ] = 0; }
+        foreach ( $tier_dist ?: array() as $td ) {
+            $tier_summary[ $td['loyalty_tier'] ] = (int) $td['n'];
+        }
+
+        return rest_ensure_response( array(
+            'rows'         => $rows,
+            'total'        => $total,
+            'limit'        => $limit,
+            'offset'       => $offset,
+            'tier_summary' => $tier_summary,
+            'pii_visible'  => $can_pii,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_ltv_detail' ) ) {
+    /**
+     * GET /ltv/{user_id} — full detail with plate list + summary.
+     */
+    function dinoco_sn_rest_ltv_detail( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) {
+            return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+        }
+        $user_id = (int) $req->get_param( 'user_id' );
+        if ( $user_id <= 0 ) {
+            return new WP_Error( 'invalid_user', __( 'Invalid user_id.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        global $wpdb;
+        $u = get_user_by( 'id', $user_id );
+        if ( ! $u ) {
+            return new WP_Error( 'user_not_found', __( 'User not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+        }
+
+        $can_pii = function_exists( 'dinoco_sn_user_can_view_pii' ) && dinoco_sn_user_can_view_pii();
+
+        // LTV snapshot (may be null if cron hasn't run for this user)
+        $snapshot = null;
+        if ( dinoco_sn_table_exists( 'ltv_snapshot' ) ) {
+            $tbl = dinoco_sn_table( 'ltv_snapshot' );
+            $snapshot = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$tbl} WHERE user_id = %d", $user_id
+            ), ARRAY_A );
+            if ( $snapshot ) {
+                foreach ( array( 'plates_count', 'registered_count',
+                    'active_warranties_count', 'claim_count' ) as $k ) {
+                    $snapshot[ $k ] = (int) $snapshot[ $k ];
+                }
+                $snapshot['total_lifetime_spent'] = (float) $snapshot['total_lifetime_spent'];
+            }
+        }
+
+        // Plates owned (top 50 most recent)
+        $plates = array();
+        if ( dinoco_sn_table_exists( 'pool' ) ) {
+            $pool = dinoco_sn_table( 'pool' );
+            $plates = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, status, linked_sku, registered_at
+                 FROM {$pool}
+                 WHERE registered_user_id = %d
+                 ORDER BY registered_at DESC
+                 LIMIT 50",
+                $user_id
+            ), ARRAY_A );
+        }
+
+        return rest_ensure_response( array(
+            'user' => array(
+                'user_id'      => (int) $u->ID,
+                'display_name' => $u->display_name,
+                'email'        => $can_pii
+                    ? $u->user_email
+                    : preg_replace( '/(.).*(@.*)/', '$1***$2', (string) $u->user_email ),
+                'registered_at' => $u->user_registered,
+            ),
+            'snapshot'    => $snapshot,
+            'plates'      => $plates ?: array(),
+            'pii_visible' => $can_pii,
+            'fetched_at'  => current_time( 'c' ),
         ) );
     }
 }

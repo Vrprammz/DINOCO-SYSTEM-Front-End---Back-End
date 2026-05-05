@@ -418,9 +418,9 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toContain("'methods'             => 'POST'");
     });
 
-    test('5 admin tabs declared in Production S/N Manager', () => {
+    test('6 admin tabs declared in Production S/N Manager (Phase 3 W10 added ltv)', () => {
         const code = readSnippet('manager');
-        const expected_tabs = ['batches', 'receive', 'pool', 'manage', 'audit'];
+        const expected_tabs = ['batches', 'receive', 'pool', 'manage', 'audit', 'ltv'];
         expected_tabs.forEach(tab => {
             // Check tab declaration in nav (data-tab="X")
             const navPattern = new RegExp(`data-tab="${tab}"`);
@@ -430,6 +430,50 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             const panelPattern = new RegExp(`data-tab-panel="${tab}"`);
             expect(code).toMatch(panelPattern);
         });
+    });
+
+    test('Phase 3 W10 F#9 LTV endpoints + tier helper + cron', () => {
+        const code = readSnippet('rest');
+        const manager = readSnippet('manager');
+        // REST endpoints
+        expect(code).toContain("'/ltv/list'");
+        expect(code).toContain("'/ltv/(?P<user_id>\\d+)'");
+        expect(code).toContain('dinoco_sn_rest_ltv_list');
+        expect(code).toContain('dinoco_sn_rest_ltv_detail');
+        // Cron
+        expect(manager).toContain('dinoco_sn_ltv_snapshot_cron');
+        expect(manager).toContain('dinoco_sn_run_ltv_snapshot');
+        expect(manager).toContain('dinoco_cron_sn_ltv_snapshot_last_run');
+        // Tier helper + 5 tiers
+        expect(manager).toContain('dinoco_sn_compute_loyalty_tier');
+        ['diamond', 'platinum', 'gold', 'silver', 'bronze'].forEach(t => {
+            expect(manager).toContain(`'${t}'`);
+        });
+    });
+
+    test('Phase 3 W10 F#9 LTV admin tab + JS handlers', () => {
+        const code = readSnippet('manager');
+        // Render function
+        expect(code).toContain('dinoco_sn_render_tab_ltv');
+        // JS handlers (3 functions)
+        expect(code).toContain('dncSnLoadLtv');
+        expect(code).toContain('dncSnOpenLtvDetail');
+        expect(code).toContain('dncSnCloseLtvDetail');
+        // Lazy load on tab activation
+        expect(code).toContain('_dncSnLtvLoaded');
+        // Module Registry includes ltv subtab
+        expect(code).toMatch(/'ltv'\s*=>\s*'ลูกค้า VIP'/);
+    });
+
+    test('Phase 3 W10 F#9 LTV uses INSERT ... ON DUPLICATE KEY UPDATE (idempotent)', () => {
+        const code = readSnippet('manager');
+        const cron = code.split('function dinoco_sn_run_ltv_snapshot')[1] || '';
+        // Idempotent rebuild — safe to re-run same day
+        expect(cron).toContain('ON DUPLICATE KEY UPDATE');
+        // Chunked aggregation by user_id range (no OOM)
+        expect(cron).toMatch(/LIMIT 500/);
+        // Cap to prevent runaway
+        expect(cron).toMatch(/\$cap\s*=\s*40/);
     });
 
     test('15 schema tables defined in Production S/N Manager', () => {
