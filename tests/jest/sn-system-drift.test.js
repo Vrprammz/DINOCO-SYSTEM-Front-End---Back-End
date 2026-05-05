@@ -476,6 +476,62 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(cron).toMatch(/\$cap\s*=\s*40/);
     });
 
+    test('Phase 3 W11 F#14 Stolen Registry endpoints + permission tiers', () => {
+        const code = readSnippet('rest');
+        // 4 endpoints with different permission gates
+        expect(code).toContain("'/stolen/report'");
+        expect(code).toContain("'/stolen/list'");
+        expect(code).toContain("'/stolen/(?P<id>\\d+)/decision'");
+        expect(code).toContain("'/stolen/verify/(?P<sn>[A-Za-z0-9]+)'");
+        // Handlers
+        expect(code).toContain('dinoco_sn_rest_stolen_report');
+        expect(code).toContain('dinoco_sn_rest_stolen_list');
+        expect(code).toContain('dinoco_sn_rest_stolen_decision');
+        expect(code).toContain('dinoco_sn_rest_stolen_verify');
+    });
+
+    test('Phase 3 W11 F#14 stolen ownership check (customer reports own only)', () => {
+        const code = readSnippet('rest');
+        const handler = code.split('function dinoco_sn_rest_stolen_report')[1] || '';
+        // Customer can only report own plate; admin any
+        expect(handler).toContain('manage_options');
+        expect(handler).toMatch(/owner_id\s*!==\s*\$reporter/);
+    });
+
+    test('Phase 3 W11 F#14 stolen public verify is PII-stripped', () => {
+        const code = readSnippet('rest');
+        const handler = code.split('function dinoco_sn_rest_stolen_verify')[1] || '';
+        // Public response must contain only boolean + date — no police info
+        expect(handler).toContain('is_stolen');
+        const respBlock = handler.split('set_transient')[0] || '';
+        // Must NOT emit police_report_no / police_station / description / user_id
+        expect(respBlock).not.toMatch(/'police_report_no'\s*=>/);
+        expect(respBlock).not.toMatch(/'police_station'\s*=>/);
+        expect(respBlock).not.toMatch(/'description'\s*=>/);
+        expect(respBlock).not.toMatch(/'user_id'\s*=>/);
+    });
+
+    test('Phase 3 W11 F#14 audit rows are sensitive (5y retention)', () => {
+        const code = readSnippet('rest');
+        const report = code.split('function dinoco_sn_rest_stolen_report')[1] || '';
+        const decision = code.split('function dinoco_sn_rest_stolen_decision')[1] || '';
+        // Both audit log calls must pass is_sensitive=true
+        expect(report).toContain('dinoco_sn_audit_log');
+        expect(report).toMatch(/true\s*\);/);
+        expect(decision).toContain('dinoco_sn_audit_log');
+        expect(decision).toMatch(/true\s*\);/);
+    });
+
+    test('Phase 3 W11 F#14 recovered decision unlocks plate to prev_status', () => {
+        const code = readSnippet('rest');
+        const handler = code.split('function dinoco_sn_rest_stolen_decision')[1] || '';
+        // 'recovered' branch must restore plate to prev_status (if registered/claimed)
+        expect(handler).toMatch(/'recovered'/);
+        expect(handler).toContain('prev_status');
+        // Set stolen_at + recalled_at to null
+        expect(handler).toMatch(/'stolen_at'\s*=>\s*null/);
+    });
+
     test('15 schema tables defined in Production S/N Manager', () => {
         const code = readSnippet('manager');
         const expected_tables = [

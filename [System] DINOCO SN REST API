@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.8 (2026-05-05) — Phase 3 W11 F#14 Stolen Registry (4 endpoints)║
  * ║  Version: V.0.7 (2026-05-05) — Phase 3 W10 F#9 LTV /list + /{user_id} drill-down║
  * ║  Version: V.0.6 (2026-05-05) — Audit fixes P0-1/2/5/6 + P1-1/2/3 (PII + locks + SQL)║
  * ║  Version: V.0.5 (2026-05-04) — Phase 3 W8.2-3 recall + reissue + reconcile-report║
@@ -605,6 +606,59 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             'permission_callback' => 'dinoco_sn_perm_admin',
             'args'                => array(
                 'user_id' => array( 'required' => true, 'type' => 'integer' ),
+            ),
+        ) );
+
+        /* ─── Phase 3 W11 — F#14 Stolen Plate Registry ─── */
+
+        // POST /stolen/report — log stolen plate + auto-recall
+        // Permission: customer (own plate) OR admin (any plate)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/stolen/report', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_stolen_report',
+            'permission_callback' => 'dinoco_sn_perm_logged_in',
+            'args'                => array(
+                'sn'                 => array( 'required' => true, 'type' => 'string',
+                                               'sanitize_callback' => function( $v ) { return strtoupper( trim( (string) $v ) ); } ),
+                'police_report_no'   => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'police_station'     => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'incident_date'      => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'description'        => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        // GET /stolen/list — admin review queue
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/stolen/list', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_stolen_list',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'status' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
+                'limit'  => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+                'offset' => array( 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // POST /stolen/{id}/decision — admin verify / recover / close
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/stolen/(?P<id>\d+)/decision', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_stolen_decision',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id'       => array( 'required' => true, 'type' => 'integer' ),
+                'decision' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
+                'notes'    => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        // GET /stolen/verify/{sn} — PUBLIC rate-limited check
+        // For police/insurance/dealer checking second-hand plate before resale
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/stolen/verify/(?P<sn>[A-Za-z0-9]+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_stolen_verify',
+            'permission_callback' => 'dinoco_sn_perm_public',  // rate-limited 30/min/IP
+            'args'                => array(
+                'sn' => array( 'required' => true, 'type' => 'string' ),
             ),
         ) );
     }
@@ -2666,5 +2720,403 @@ if ( ! function_exists( 'dinoco_sn_rest_ltv_detail' ) ) {
             'pii_visible' => $can_pii,
             'fetched_at'  => current_time( 'c' ),
         ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 10. PHASE 3 W11 — F#14 STOLEN PLATE REGISTRY HANDLERS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Two-sided system:
+ *   - Customer-side: owner reports stolen via member dashboard (Phase 3 W11
+ *     deferred — current scope = REST endpoint only, member UI later)
+ *   - Admin-side: review queue + verify/recover/close decisions
+ *   - Public verify: police/insurance/dealer check before second-hand purchase
+ *
+ * Cross-system effect:
+ *   On stolen report → also create "recall" event with category=stolen
+ *   so existing /recall workflow handles plate state. Anti-fraud (Phase 3
+ *   W10 F#12) reads sn_pool.stolen_at + sn_stolen_log to block activation.
+ *
+ * PII protection:
+ *   - /stolen/list (admin): includes police info, status, dates
+ *   - /stolen/verify (public): returns ONLY {is_stolen: bool, reported_at}
+ *     — no police_report_no / no station / no description
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_stolen_report' ) ) {
+    function dinoco_sn_rest_stolen_report( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        return dinoco_sn_with_idempotency( $req, 'stolen-report',
+            array( 'sn', 'police_report_no', 'police_station', 'incident_date' ),
+            function( $req ) {
+                global $wpdb;
+                $sn       = strtoupper( trim( (string) $req->get_param( 'sn' ) ) );
+                $police_no = trim( (string) $req->get_param( 'police_report_no' ) );
+                $station  = trim( (string) $req->get_param( 'police_station' ) );
+                $incident = trim( (string) $req->get_param( 'incident_date' ) );
+                $desc     = trim( (string) $req->get_param( 'description' ) );
+                $reporter = (int) get_current_user_id();
+
+                if ( $sn === '' ) {
+                    return new WP_Error( 'invalid_input', __( 'sn required.', 'dinoco-sn' ), array( 'status' => 400 ) );
+                }
+                if ( ! function_exists( 'dinoco_sn_table_exists' ) ) {
+                    return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+                }
+                if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'stolen_log' ) ) {
+                    return new WP_Error( 'schema_not_ready',
+                        __( 'sn_stolen_log not installed.', 'dinoco-sn' ),
+                        array( 'status' => 503 ) );
+                }
+
+                $pool       = dinoco_sn_table( 'pool' );
+                $stolen_tbl = dinoco_sn_table( 'stolen_log' );
+                $is_admin   = current_user_can( 'manage_options' );
+
+                $wpdb->query( 'START TRANSACTION' );
+                try {
+                    $row = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT sn, status, registered_user_id FROM {$pool} WHERE sn = %s FOR UPDATE",
+                        $sn
+                    ), ARRAY_A );
+
+                    if ( ! $row ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sn_not_found',
+                            __( 'S/N not in pool.', 'dinoco-sn' ),
+                            array( 'status' => 404 ) );
+                    }
+
+                    // Permission: customer can only report own plate; admin any
+                    $owner_id = (int) ( $row['registered_user_id'] ?? 0 );
+                    if ( ! $is_admin && $owner_id !== $reporter ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'rest_forbidden',
+                            __( 'You can only report your own plate as stolen.', 'dinoco-sn' ),
+                            array( 'status' => 403 ) );
+                    }
+
+                    if ( in_array( $row['status'], array( 'voided', 'recalled' ), true ) ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'already_terminal',
+                            sprintf( __( 'S/N already %s.', 'dinoco-sn' ), $row['status'] ),
+                            array( 'status' => 409 ) );
+                    }
+
+                    if ( ! in_array( $row['status'], array( 'registered', 'claimed', 'shipped', 'allocated_to_order' ), true ) ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'invalid_state',
+                            sprintf( __( 'Cannot report stolen for status %s.', 'dinoco-sn' ), $row['status'] ),
+                            array( 'status' => 422 ) );
+                    }
+
+                    $now = current_time( 'mysql' );
+
+                    // Insert stolen log row
+                    $ok = $wpdb->insert( $stolen_tbl, array(
+                        'sn'               => $sn,
+                        'user_id'          => $owner_id ?: null,
+                        'reported_by'      => $reporter,
+                        'police_report_no' => $police_no ?: null,
+                        'police_station'   => $station ?: null,
+                        'incident_date'    => $incident ?: null,
+                        'description'      => $desc ?: null,
+                        'status'           => 'reported',
+                        'created_at'       => $now,
+                    ) );
+                    if ( ! $ok ) {
+                        throw new \RuntimeException( 'stolen_log insert failed' );
+                    }
+                    $stolen_id = (int) $wpdb->insert_id;
+
+                    // Flip plate to recalled + record stolen_at
+                    $upd = $wpdb->update( $pool, array(
+                        'status'              => 'recalled',
+                        'prev_status'         => $row['status'],
+                        'stolen_at'           => $now,
+                        'stolen_police_report' => $police_no ?: null,
+                        'recalled_at'         => $now,
+                    ), array( 'sn' => $sn, 'status' => $row['status'] ) );
+
+                    if ( $upd === false || $upd === 0 ) {
+                        throw new \RuntimeException( 'pool update failed (concurrent modification)' );
+                    }
+
+                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                        dinoco_sn_audit_log( $sn, 'plate_recalled', $row['status'], 'recalled',
+                            array(
+                                'category'         => 'stolen',
+                                'stolen_log_id'    => $stolen_id,
+                                'reporter_user_id' => $reporter,
+                                'police_report_no' => $police_no,
+                            ),
+                            $reporter, null,
+                            $desc ?: 'reported stolen by ' . ( $is_admin ? 'admin' : 'owner' ),
+                            'stolen_report', true );
+                    }
+
+                    $wpdb->query( 'COMMIT' );
+
+                    return rest_ensure_response( array(
+                        'success'         => true,
+                        'stolen_log_id'   => $stolen_id,
+                        'sn'              => $sn,
+                        'status_to'       => 'recalled',
+                        'is_admin_report' => $is_admin,
+                    ) );
+                } catch ( \Throwable $e ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( $e, array( 'context' => 'sn_stolen_report', 'sn' => $sn ) );
+                    }
+                    return new WP_Error( 'stolen_report_failed', $e->getMessage(), array( 'status' => 500 ) );
+                }
+            }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_stolen_list' ) ) {
+    function dinoco_sn_rest_stolen_list( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'stolen_log' ) ) {
+            return rest_ensure_response( array( 'rows' => array(), 'total' => 0 ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'stolen_log' );
+
+        $status = sanitize_key( (string) $req->get_param( 'status' ) );
+        $limit  = max( 1, min( 200, (int) $req->get_param( 'limit' ) ) );
+        $offset = max( 0, (int) $req->get_param( 'offset' ) );
+
+        $allowed_statuses = array( 'reported', 'verified', 'recovered', 'closed' );
+        $where = '';
+        $params = array();
+        if ( $status !== '' && in_array( $status, $allowed_statuses, true ) ) {
+            $where = 'WHERE status = %s';
+            $params[] = $status;
+        }
+
+        $count_sql = "SELECT COUNT(*) FROM {$tbl} {$where}";
+        $list_sql  = "SELECT id, sn, user_id, reported_by, police_report_no, police_station,
+                             incident_date, status, created_at,
+                             SUBSTRING(description, 1, 200) AS description_excerpt
+                      FROM {$tbl}
+                      {$where}
+                      ORDER BY created_at DESC, id DESC
+                      LIMIT %d OFFSET %d";
+
+        $total = (int) ( $params
+            ? $wpdb->get_var( $wpdb->prepare( $count_sql, $params ) )
+            : $wpdb->get_var( $count_sql ) );
+
+        $list_params = array_merge( $params, array( $limit, $offset ) );
+        $rows = $wpdb->get_results( $wpdb->prepare( $list_sql, $list_params ), ARRAY_A );
+
+        // Resolve display names
+        static $user_cache = array();
+        $rows = array_map( function( $r ) use ( &$user_cache ) {
+            foreach ( array( 'user_id', 'reported_by' ) as $field ) {
+                if ( ! empty( $r[ $field ] ) ) {
+                    $uid = (int) $r[ $field ];
+                    if ( ! isset( $user_cache[ $uid ] ) ) {
+                        $u = get_user_by( 'id', $uid );
+                        $user_cache[ $uid ] = $u ? $u->display_name : ( 'user#' . $uid );
+                    }
+                    $key = str_replace( '_id', '_display', $field );
+                    $r[ $key ] = $user_cache[ $uid ];
+                }
+            }
+            return $r;
+        }, $rows ?: array() );
+
+        // Status distribution summary
+        $status_dist = $wpdb->get_results(
+            "SELECT status, COUNT(*) AS n FROM {$tbl} GROUP BY status",
+            ARRAY_A
+        );
+        $status_summary = array();
+        foreach ( $allowed_statuses as $s ) { $status_summary[ $s ] = 0; }
+        foreach ( $status_dist ?: array() as $sd ) {
+            $status_summary[ $sd['status'] ] = (int) $sd['n'];
+        }
+
+        return rest_ensure_response( array(
+            'rows'           => $rows,
+            'total'          => $total,
+            'limit'          => $limit,
+            'offset'         => $offset,
+            'status_summary' => $status_summary,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_stolen_decision' ) ) {
+    /**
+     * POST /stolen/{id}/decision — admin verify/recover/close.
+     *
+     * Decisions:
+     *   verified   — admin confirmed report legit (insurance can claim)
+     *   recovered  — plate found, customer confirmed return → unlock plate
+     *   closed     — case closed without recovery (insurance paid out, etc.)
+     *
+     * On 'recovered': revert sn_pool from recalled → registered (if owner
+     *   still wants warranty, plate continues serving same warranty).
+     */
+    function dinoco_sn_rest_stolen_decision( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        return dinoco_sn_with_idempotency( $req, 'stolen-decision',
+            array( 'id', 'decision' ),
+            function( $req ) {
+                global $wpdb;
+                $id       = (int) $req->get_param( 'id' );
+                $decision = sanitize_key( (string) $req->get_param( 'decision' ) );
+                $notes    = trim( (string) $req->get_param( 'notes' ) );
+
+                $allowed = array( 'verified', 'recovered', 'closed' );
+                if ( ! in_array( $decision, $allowed, true ) ) {
+                    return new WP_Error( 'invalid_decision',
+                        sprintf( __( 'decision must be one of: %s', 'dinoco-sn' ), implode( ', ', $allowed ) ),
+                        array( 'status' => 400 ) );
+                }
+                if ( ! function_exists( 'dinoco_sn_table_exists' ) ) {
+                    return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+                }
+                if ( ! dinoco_sn_table_exists( 'stolen_log' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
+                    return new WP_Error( 'schema_not_ready', '', array( 'status' => 503 ) );
+                }
+
+                $stolen_tbl = dinoco_sn_table( 'stolen_log' );
+                $pool       = dinoco_sn_table( 'pool' );
+
+                $wpdb->query( 'START TRANSACTION' );
+                try {
+                    $row = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT id, sn, status FROM {$stolen_tbl} WHERE id = %d FOR UPDATE",
+                        $id
+                    ), ARRAY_A );
+                    if ( ! $row ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'not_found', __( 'Stolen log not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+                    }
+                    if ( $row['status'] === $decision ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'already_in_state',
+                            sprintf( __( 'Already %s.', 'dinoco-sn' ), $decision ),
+                            array( 'status' => 409 ) );
+                    }
+                    if ( $row['status'] === 'closed' ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'closed_terminal',
+                            __( 'Closed cases cannot be reopened via decision.', 'dinoco-sn' ),
+                            array( 'status' => 422 ) );
+                    }
+
+                    $upd = $wpdb->update( $stolen_tbl,
+                        array( 'status' => $decision ),
+                        array( 'id' => $id, 'status' => $row['status'] )
+                    );
+                    if ( $upd === false || $upd === 0 ) {
+                        throw new \RuntimeException( 'stolen_log update failed (concurrent modification)' );
+                    }
+
+                    // On 'recovered' — unlock plate back to registered
+                    if ( $decision === 'recovered' ) {
+                        $pool_row = $wpdb->get_row( $wpdb->prepare(
+                            "SELECT prev_status FROM {$pool} WHERE sn = %s FOR UPDATE",
+                            $row['sn']
+                        ), ARRAY_A );
+                        if ( $pool_row && in_array( $pool_row['prev_status'], array( 'registered', 'claimed' ), true ) ) {
+                            $wpdb->update( $pool, array(
+                                'status'      => $pool_row['prev_status'],
+                                'stolen_at'   => null,
+                                'recalled_at' => null,
+                            ), array( 'sn' => $row['sn'] ) );
+                        }
+                    }
+
+                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                        dinoco_sn_audit_log( $row['sn'], 'plate_recalled',  // reuse event_type
+                            $row['status'], $decision,
+                            array(
+                                'stolen_log_id' => $id,
+                                'decision'      => $decision,
+                            ),
+                            null, null, $notes ?: '', 'stolen_' . $decision, true );
+                    }
+
+                    $wpdb->query( 'COMMIT' );
+                    return rest_ensure_response( array(
+                        'success'  => true,
+                        'id'       => $id,
+                        'sn'       => $row['sn'],
+                        'decision' => $decision,
+                    ) );
+                } catch ( \Throwable $e ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( $e, array( 'context' => 'sn_stolen_decision', 'id' => $id ) );
+                    }
+                    return new WP_Error( 'decision_failed', $e->getMessage(), array( 'status' => 500 ) );
+                }
+            }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_stolen_verify' ) ) {
+    /**
+     * GET /stolen/verify/{sn} — PUBLIC rate-limited check.
+     *
+     * For police / insurance / dealer to verify plate before second-hand
+     * resale. Returns boolean only — no PII, no police info, no description.
+     *
+     * Anti-abuse: rate-limited 30/min/IP via dinoco_sn_perm_public.
+     */
+    function dinoco_sn_rest_stolen_verify( $req ) {
+        $sn = strtoupper( trim( (string) $req->get_param( 'sn' ) ) );
+        if ( $sn === '' ) {
+            return new WP_Error( 'invalid_sn', '', array( 'status' => 400 ) );
+        }
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) {
+            return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+        }
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) {
+            return rest_ensure_response( array( 'sn' => $sn, 'is_stolen' => false, 'note' => 'system not active' ) );
+        }
+
+        // 5-minute cache (less frequent updates than /lookup)
+        $cache_key = 'dinoco_sn_stolen_v_' . md5( $sn );
+        $cached = get_transient( $cache_key );
+        if ( $cached !== false ) {
+            return rest_ensure_response( $cached );
+        }
+
+        global $wpdb;
+        $pool = dinoco_sn_table( 'pool' );
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT status, stolen_at FROM {$pool} WHERE sn = %s",
+            $sn
+        ), ARRAY_A );
+
+        // Boolean-only response — no PII oracle leak
+        $resp = array(
+            'sn'        => $sn,
+            'is_stolen' => false,
+            'reported_at' => null,
+        );
+
+        if ( $row && $row['status'] === 'recalled' && ! empty( $row['stolen_at'] ) ) {
+            $resp['is_stolen'] = true;
+            // Date-only (YYYY-MM-DD) — no time precision to avoid timing oracle
+            $resp['reported_at'] = date( 'Y-m-d', strtotime( $row['stolen_at'] ) );
+        }
+
+        set_transient( $cache_key, $resp, 5 * MINUTE_IN_SECONDS );
+        return rest_ensure_response( $resp );
     }
 }
