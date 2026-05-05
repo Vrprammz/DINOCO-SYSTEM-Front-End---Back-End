@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.22 (2026-05-05) — Phase 3 W8 Gap D orphan-claim scan cron (daily 03:30)║
  * ║  Version: V.0.21 (2026-05-05) — Phase 2 W5 audit log CSV export (Tab 5 button + handler)║
  * ║  Version: V.0.20 (2026-05-05) — Phase 3 W10 F#9 LTV drill-down expansion (claims+reviews+cross-sell)║
  * ║  Version: V.0.19 (2026-05-05) — Phase 4 W13 F#16 Demand Forecast viewer panel║
@@ -4022,6 +4023,86 @@ if ( ! function_exists( 'dinoco_sn_run_batch_reconcile' ) ) {
     }
 }
 
+/* ─── Phase 3 W8 / V.0.22 — Orphan claim alert scan (Gap D) ─── */
+
+if ( ! function_exists( 'dinoco_sn_run_orphan_claim_scan' ) ) {
+    /**
+     * Daily 03:30 cron — detect data inconsistency between sn_pool + claim_ticket.
+     *
+     * Two alert categories per v2.6 §Gap D:
+     *   🔴 stuck-claim: plate.status='claimed' for > 7 days (plate locked,
+     *      claim_ticket may be stalled; admin should investigate).
+     *   🟡 plate-claimed-no-ticket: plate.status='claimed' but claim_id IS NULL
+     *      (data drift — plate transitioned to claimed without claim_ticket
+     *      record; possible 4-eyes approval bypass or stale state).
+     *
+     * Storage: `dinoco_sn_orphan_claim_alerts` wp_option (array, capped 200 rows).
+     * Tab 4 จัดการ S/N admin can read via /orphan-alerts REST + dismiss via POST.
+     *
+     * Defensive — catches all throwables, never blocks cron heartbeat.
+     */
+    function dinoco_sn_run_orphan_claim_scan() {
+        update_option( 'dinoco_cron_sn_orphan_claim_scan_last_run', current_time( 'mysql' ) );
+
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) return;
+
+        $alerts = array(
+            'at'                       => current_time( 'mysql' ),
+            'stuck_claim'              => array(),
+            'plate_claimed_no_ticket'  => array(),
+            'total'                    => 0,
+        );
+
+        try {
+            global $wpdb;
+            $pool = dinoco_sn_table( 'pool' );
+            $threshold = gmdate( 'Y-m-d H:i:s', time() - 7 * DAY_IN_SECONDS );
+
+            // Category 1: stuck-claim (status=claimed > 7 days)
+            // Use updated_at if exists, fall back to registered_at
+            $stuck = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, registered_user_id, registered_at, claim_id,
+                        DATEDIFF( CURDATE(), DATE(registered_at) ) AS days_since_register
+                 FROM {$pool}
+                 WHERE status = 'claimed'
+                   AND registered_at <= %s
+                 ORDER BY registered_at ASC
+                 LIMIT 100",
+                $threshold
+            ), ARRAY_A );
+            $alerts['stuck_claim'] = is_array( $stuck ) ? $stuck : array();
+
+            // Category 2: plate-claimed-no-ticket (status=claimed AND claim_id IS NULL)
+            $orphan = $wpdb->get_results(
+                "SELECT sn, registered_user_id, registered_at,
+                        DATEDIFF( CURDATE(), DATE(registered_at) ) AS days_since_register
+                 FROM {$pool}
+                 WHERE status = 'claimed'
+                   AND ( claim_id IS NULL OR claim_id = 0 )
+                 ORDER BY registered_at ASC
+                 LIMIT 100",
+                ARRAY_A
+            );
+            $alerts['plate_claimed_no_ticket'] = is_array( $orphan ) ? $orphan : array();
+
+            $alerts['total'] = count( $alerts['stuck_claim'] ) + count( $alerts['plate_claimed_no_ticket'] );
+
+            update_option( 'dinoco_sn_orphan_claim_alerts', $alerts, false );
+
+            // Phase 5+ Telegram dispatch hook — fire action if helper available
+            // (placeholder for future cross-system Telegram integration via Node agent)
+            if ( $alerts['total'] > 0 ) {
+                do_action( 'dinoco_sn_orphan_claim_alerts_detected', $alerts );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_orphan_claim_scan' ) );
+            }
+        }
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 12. PHASE 3 W9 — F#1 EXPIRY REMINDER (additive 2026-05-05)
  * ═══════════════════════════════════════════════════════════════════════════
@@ -5466,6 +5547,10 @@ add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'dinoco_sn_batch_reconcile_cron' ) ) {
         wp_schedule_event( time(), 'weekly', 'dinoco_sn_batch_reconcile_cron' );
     }
+    // Phase 3 W8 / V.0.22 — Orphan claim scan (Gap D)
+    if ( ! wp_next_scheduled( 'dinoco_sn_orphan_claim_scan_cron' ) ) {
+        wp_schedule_event( time(), 'daily', 'dinoco_sn_orphan_claim_scan_cron' );
+    }
     // Phase 3 W9 — F#1 Expiry Reminder
     if ( ! wp_next_scheduled( 'dinoco_sn_expiry_schedule_cron' ) ) {
         wp_schedule_event( time(), 'daily', 'dinoco_sn_expiry_schedule_cron' );
@@ -5504,6 +5589,7 @@ add_action( 'init', function() {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
         dinoco_register_cron( 'dinoco_sn_audit_retention_cron', 'daily', 'dinoco_sn_run_audit_retention' );
         dinoco_register_cron( 'dinoco_sn_batch_reconcile_cron', 'weekly', 'dinoco_sn_run_batch_reconcile' );
+        dinoco_register_cron( 'dinoco_sn_orphan_claim_scan_cron', 'daily', 'dinoco_sn_run_orphan_claim_scan' );
         dinoco_register_cron( 'dinoco_sn_expiry_schedule_cron', 'daily', 'dinoco_sn_run_expiry_schedule' );
         dinoco_register_cron( 'dinoco_sn_notification_send_cron',
             isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly',
@@ -5524,6 +5610,9 @@ add_action( 'init', function() {
         }
         if ( ! has_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' ) ) {
             add_action( 'dinoco_sn_batch_reconcile_cron', 'dinoco_sn_run_batch_reconcile' );
+        }
+        if ( ! has_action( 'dinoco_sn_orphan_claim_scan_cron', 'dinoco_sn_run_orphan_claim_scan' ) ) {
+            add_action( 'dinoco_sn_orphan_claim_scan_cron', 'dinoco_sn_run_orphan_claim_scan' );
         }
         if ( ! has_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_run_expiry_schedule' ) ) {
             add_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_run_expiry_schedule' );

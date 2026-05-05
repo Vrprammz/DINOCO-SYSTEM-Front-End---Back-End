@@ -956,6 +956,32 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('review');
     });
 
+    test('Phase 3 W8 Gap D orphan-claim scan cron + REST endpoints', () => {
+        // Production SN Manager has scan helper + cron registered
+        const mgr = readSnippet('manager');
+        expect(mgr).toContain('function dinoco_sn_run_orphan_claim_scan');
+        // Scan logic: 2 alert categories per v2.6 §Gap D
+        const scan = mgr.split('function dinoco_sn_run_orphan_claim_scan')[1] || '';
+        const block = scan.split('function dinoco_sn_run_expiry_schedule')[0];
+        expect(block).toContain("'stuck_claim'");
+        expect(block).toContain("'plate_claimed_no_ticket'");
+        // Threshold: 7 days for stuck-claim
+        expect(block).toMatch(/7\s*\*\s*DAY_IN_SECONDS/);
+        // Storage in wp_option (not DB write — admin reviews)
+        expect(block).toContain("'dinoco_sn_orphan_claim_alerts'");
+        // Action hook for downstream integrations
+        expect(block).toContain('dinoco_sn_orphan_claim_alerts_detected');
+        // Cron registered (both registry wrapper + add_action fallback)
+        expect(mgr).toContain("'dinoco_sn_orphan_claim_scan_cron'");
+
+        // REST API: 2 new endpoints
+        const rest = readSnippet('rest');
+        expect(rest).toContain("'/orphan-alerts'");
+        expect(rest).toContain("'/orphan-alerts/dismiss'");
+        expect(rest).toContain('function dinoco_sn_rest_orphan_alerts');
+        expect(rest).toContain('function dinoco_sn_rest_orphan_alerts_dismiss');
+    });
+
     test('Phase 4 W14.4 GDPR V.4.1 export extended with sn_* scope', () => {
         const filepath = path.join(REPO_ROOT, '[System] DINOCO GDPR Data Requests');
         expect(fs.existsSync(filepath)).toBe(true);
