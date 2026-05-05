@@ -532,6 +532,43 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(handler).toMatch(/'stolen_at'\s*=>\s*null/);
     });
 
+    test('Phase 3 W11 F#13 Geographic Heatmap endpoints + helper', () => {
+        const code = readSnippet('rest');
+        const manager = readSnippet('manager');
+        // Endpoints
+        expect(code).toContain("'/geo/heatmap'");
+        expect(code).toContain("'/geo/gray-market'");
+        expect(code).toContain('dinoco_sn_rest_geo_heatmap');
+        expect(code).toContain('dinoco_sn_rest_geo_gray_market');
+        // Public helper for activate flow (Phase 4 W12 wires it)
+        expect(code).toContain('dinoco_sn_record_geo_activation');
+        // Cron + helper
+        expect(manager).toContain('dinoco_sn_gray_market_scan_cron');
+        expect(manager).toContain('dinoco_sn_run_gray_market_scan');
+        expect(manager).toContain('dinoco_cron_sn_gray_market_scan_last_run');
+    });
+
+    test('Phase 3 W11 F#13 heatmap accepts ISO date filter + sku join', () => {
+        const code = readSnippet('rest');
+        const handler = code.split('function dinoco_sn_rest_geo_heatmap')[1] || '';
+        // Date validation against PHP-side regex literal
+        expect(handler).toContain('preg_match');
+        expect(handler).toContain('\\d{4}-\\d{2}-\\d{2}');
+        // SKU optional inner join with pool table
+        expect(handler).toContain('INNER JOIN');
+        expect(handler).toContain('linked_sku');
+    });
+
+    test('Phase 3 W11 F#13 gray-market scan respects threshold + window', () => {
+        const code = readSnippet('manager');
+        const cron = code.split('function dinoco_sn_run_gray_market_scan')[1] || '';
+        // Configurable via wp_options
+        expect(cron).toContain('dinoco_sn_gray_market_window_days');
+        expect(cron).toContain('dinoco_sn_gray_market_threshold');
+        // Only consider rows OUTSIDE dealer territory
+        expect(cron).toMatch(/is_in_dealer_territory\s*=\s*0/);
+    });
+
     test('15 schema tables defined in Production S/N Manager', () => {
         const code = readSnippet('manager');
         const expected_tables = [

@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.9 (2026-05-05) — Phase 3 W11 F#13 Geographic Heatmap (2 endpoints + helper)║
  * ║  Version: V.0.8 (2026-05-05) — Phase 3 W11 F#14 Stolen Registry (4 endpoints)║
  * ║  Version: V.0.7 (2026-05-05) — Phase 3 W10 F#9 LTV /list + /{user_id} drill-down║
  * ║  Version: V.0.6 (2026-05-05) — Audit fixes P0-1/2/5/6 + P1-1/2/3 (PII + locks + SQL)║
@@ -659,6 +660,31 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             'permission_callback' => 'dinoco_sn_perm_public',  // rate-limited 30/min/IP
             'args'                => array(
                 'sn' => array( 'required' => true, 'type' => 'string' ),
+            ),
+        ) );
+
+        /* ─── Phase 3 W11 — F#13 Geographic Heatmap ─── */
+
+        // GET /geo/heatmap?from=&to=&sku= — province aggregation for map
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/geo/heatmap', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_geo_heatmap',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'from' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'to'   => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'sku'  => array( 'type' => 'string',
+                                  'sanitize_callback' => function( $v ) { return strtoupper( trim( (string) $v ) ); } ),
+            ),
+        ) );
+
+        // GET /geo/gray-market — suspected provinces (no dealer + activations)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/geo/gray-market', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_geo_gray_market',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'days' => array( 'type' => 'integer', 'default' => 30, 'sanitize_callback' => 'absint' ),
             ),
         ) );
     }
@@ -3118,5 +3144,181 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_verify' ) ) {
 
         set_transient( $cache_key, $resp, 5 * MINUTE_IN_SECONDS );
         return rest_ensure_response( $resp );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 11. PHASE 3 W11 — F#13 GEOGRAPHIC HEATMAP HANDLERS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Reads from wp_dinoco_sn_geo_activations table (populated by activate flow
+ * + weekly gray-market scan cron).
+ *
+ * Phase 3 W11 stub:
+ *   - /geo/heatmap aggregates by province + date range + optional SKU
+ *   - /geo/gray-market returns provinces flagged is_gray_market_suspect=1
+ *
+ * Phase 4 W12+ adds:
+ *   - IP geolocation library integration (currently relies on activate
+ *     flow inserting rows manually — Phase 3 W11 = read-only viewer)
+ *   - Leaflet/Mapbox UI in admin Tab 8 (deferred)
+ *   - Weekly cron auto-detect gray market suspects
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_geo_heatmap' ) ) {
+    function dinoco_sn_rest_geo_heatmap( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'geo_activations' ) ) {
+            return rest_ensure_response( array(
+                'rows' => array(),
+                'total' => 0,
+                'note' => 'geo_activations table not installed (Phase 4 wires activate hook)',
+            ) );
+        }
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'geo_activations' );
+
+        $from = trim( (string) $req->get_param( 'from' ) );
+        $to   = trim( (string) $req->get_param( 'to' ) );
+        $sku  = strtoupper( trim( (string) $req->get_param( 'sku' ) ) );
+
+        $where  = array();
+        $params = array();
+        if ( $from !== '' && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $from ) ) {
+            $where[] = 'created_at >= %s';
+            $params[] = $from . ' 00:00:00';
+        }
+        if ( $to !== '' && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $to ) ) {
+            $where[] = 'created_at <= %s';
+            $params[] = $to . ' 23:59:59';
+        }
+
+        $sku_join = '';
+        if ( $sku !== '' && function_exists( 'dinoco_sn_table' ) ) {
+            $pool = dinoco_sn_table( 'pool' );
+            $sku_join = "INNER JOIN {$pool} p ON p.sn = g.sn AND p.linked_sku = %s";
+            $params[] = $sku;
+        }
+
+        $where_sql = $where ? ( 'WHERE ' . implode( ' AND ', $where ) ) : '';
+
+        $sql = "SELECT province,
+                       COUNT(*) AS activations,
+                       SUM(is_gray_market_suspect) AS gray_market_count,
+                       AVG(lat) AS avg_lat,
+                       AVG(lng) AS avg_lng
+                FROM {$tbl} g
+                {$sku_join}
+                {$where_sql}
+                GROUP BY province
+                ORDER BY activations DESC
+                LIMIT 100";
+
+        $rows = $params
+            ? $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A )
+            : $wpdb->get_results( $sql, ARRAY_A );
+
+        $rows = array_map( function( $r ) {
+            return array(
+                'province'         => $r['province'],
+                'activations'      => (int) $r['activations'],
+                'gray_market_count' => (int) $r['gray_market_count'],
+                'avg_lat'          => $r['avg_lat'] !== null ? (float) $r['avg_lat'] : null,
+                'avg_lng'          => $r['avg_lng'] !== null ? (float) $r['avg_lng'] : null,
+            );
+        }, $rows ?: array() );
+
+        // Total count for sanity (unfiltered)
+        $total_count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$tbl}" );
+
+        return rest_ensure_response( array(
+            'rows'           => $rows,
+            'province_count' => count( $rows ),
+            'total_records'  => $total_count,
+            'filter'         => array(
+                'from' => $from ?: null,
+                'to'   => $to ?: null,
+                'sku'  => $sku ?: null,
+            ),
+            'fetched_at'     => current_time( 'c' ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_geo_gray_market' ) ) {
+    function dinoco_sn_rest_geo_gray_market( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'geo_activations' ) ) {
+            return rest_ensure_response( array( 'rows' => array(), 'total' => 0 ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'geo_activations' );
+
+        $days = max( 1, min( 365, (int) $req->get_param( 'days' ) ) );
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT province,
+                    COUNT(*) AS suspect_count,
+                    MIN(created_at) AS first_seen,
+                    MAX(created_at) AS last_seen
+             FROM {$tbl}
+             WHERE is_gray_market_suspect = 1
+               AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+             GROUP BY province
+             ORDER BY suspect_count DESC
+             LIMIT 50",
+            $days
+        ), ARRAY_A );
+
+        $rows = array_map( function( $r ) {
+            return array(
+                'province'      => $r['province'],
+                'suspect_count' => (int) $r['suspect_count'],
+                'first_seen'    => $r['first_seen'],
+                'last_seen'     => $r['last_seen'],
+            );
+        }, $rows ?: array() );
+
+        return rest_ensure_response( array(
+            'rows'  => $rows,
+            'days'  => $days,
+            'total' => count( $rows ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_record_geo_activation' ) ) {
+    /**
+     * Helper for Phase 4 W12 — call from activate flow after successful
+     * customer registration. Lightweight INSERT (no FK, no transaction).
+     *
+     * Phase 3 W11 stub: helper exists but no caller wired yet — IP
+     * geolocation lib needed (Maxmind / IP-API). Test infra ready.
+     */
+    function dinoco_sn_record_geo_activation( $sn, $province, $opts = array() ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'geo_activations' ) ) {
+            return false;
+        }
+        $sn = strtoupper( trim( (string) $sn ) );
+        $province = trim( (string) $province );
+        if ( $sn === '' || $province === '' ) return false;
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'geo_activations' );
+
+        return (bool) $wpdb->insert( $tbl, array(
+            'sn'                     => $sn,
+            'province'               => mb_substr( $province, 0, 64 ),
+            'district'               => isset( $opts['district'] ) ? mb_substr( (string) $opts['district'], 0, 64 ) : null,
+            'lat'                    => isset( $opts['lat'] ) ? (float) $opts['lat'] : null,
+            'lng'                    => isset( $opts['lng'] ) ? (float) $opts['lng'] : null,
+            'source'                 => isset( $opts['source'] )
+                ? mb_substr( sanitize_key( $opts['source'] ), 0, 20 )
+                : 'unknown',
+            'is_in_dealer_territory' => ! empty( $opts['is_in_dealer_territory'] ) ? 1 : 0,
+            'expected_dealer_id'     => isset( $opts['expected_dealer_id'] ) ? (int) $opts['expected_dealer_id'] : null,
+            'actual_dealer_id'       => isset( $opts['actual_dealer_id'] ) ? (int) $opts['actual_dealer_id'] : null,
+            'is_gray_market_suspect' => ! empty( $opts['is_gray_market_suspect'] ) ? 1 : 0,
+            'created_at'             => current_time( 'mysql' ),
+        ) );
     }
 }
