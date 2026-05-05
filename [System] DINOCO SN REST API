@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.13 (2026-05-05) — Phase 2 W5 audit/export CSV streaming endpoint║
  * ║  Version: V.0.12 (2026-05-05) — Phase 3 W10 F#9 LTV detail expansion (claims/reviews/cross-sell)║
  * ║  Version: V.0.11 (2026-05-05) — Phase 4 W13 F#16 Demand Forecast (2 endpoints)║
  * ║  Version: V.0.10 (2026-05-05) — Phase 3 W11 F#12 Anti-Fraud (3 endpoints + queue + decision)║
@@ -522,6 +523,22 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 'days'       => array( 'type' => 'integer', 'default' => 30, 'sanitize_callback' => 'absint' ),
                 'limit'      => array( 'type' => 'integer', 'default' => 100, 'sanitize_callback' => 'absint' ),
                 'offset'     => array( 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /audit/export — Tab 5 CSV download (V.0.13)
+        // Same filters as /audit but streams CSV up to 5,000 rows.
+        // Rate limit 5/hr/user via b2b_rate_limit() (reuse existing helper).
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/audit/export', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_audit_export',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'sn'         => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'event_type' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
+                'actor_id'   => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'days'       => array( 'type' => 'integer', 'default' => 30, 'sanitize_callback' => 'absint' ),
+                'limit'      => array( 'type' => 'integer', 'default' => 5000, 'sanitize_callback' => 'absint' ),
             ),
         ) );
 
@@ -2121,6 +2138,140 @@ if ( ! function_exists( 'dinoco_sn_rest_audit_search' ) ) {
             'offset' => $offset,
             'days'   => $days,
         ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_audit_export' ) ) {
+    /**
+     * GET /audit/export — Phase 2 W5 / V.0.13 CSV download for Tab 5.
+     *
+     * Same filters as /audit search. Streams up to 5,000 rows as CSV
+     * (UTF-8 BOM for Excel + RFC 4180 quoting). Rate-limited via
+     * b2b_rate_limit() if helper available — fail-open to prevent
+     * accidental admin lockout if helper missing.
+     *
+     * Response is CSV (Content-Type: text/csv) — NOT JSON. WordPress
+     * REST framework supports this via $response->get_data() returning
+     * raw string + manual headers.
+     */
+    function dinoco_sn_rest_audit_export( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'audit' ) ) {
+            return new WP_Error( 'schema_not_ready', __( 'Audit table not installed.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        // Rate limit (5/hr/user) — reuse B2B helper if available
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid   = (int) get_current_user_id();
+            $limit = b2b_rate_limit( "sn_audit_export_{$uid}", 5, HOUR_IN_SECONDS );
+            if ( is_wp_error( $limit ) ) {
+                return new WP_Error( 'rate_limited',
+                    __( 'Export limit reached (5/hr). Please retry later.', 'dinoco-sn' ),
+                    array( 'status' => 429, 'retry_after' => 3600 ) );
+            }
+        }
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'audit' );
+
+        $sn       = trim( (string) $req->get_param( 'sn' ) );
+        $eventTyp = (string) $req->get_param( 'event_type' );
+        $actorId  = (int) $req->get_param( 'actor_id' );
+        $days     = max( 1, min( 365, (int) $req->get_param( 'days' ) ) );
+        $limit    = max( 1, min( 5000, (int) $req->get_param( 'limit' ) ) );
+
+        $where  = array( 'created_at >= %s' );
+        $params = array( gmdate( 'Y-m-d H:i:s', time() - $days * 86400 ) );
+
+        if ( $sn !== '' ) {
+            $where[] = 'sn = %s';
+            $params[] = strtoupper( $sn );
+        }
+        if ( $eventTyp !== '' ) {
+            $where[] = 'event_type = %s';
+            $params[] = $eventTyp;
+        }
+        if ( $actorId > 0 ) {
+            $where[] = 'actor_user_id = %d';
+            $params[] = $actorId;
+        }
+
+        $where_sql = 'WHERE ' . implode( ' AND ', $where );
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, sn, event_type, status_from, status_to, actor_user_id,
+                    approver_user_id, reason, reason_category, ip_address,
+                    is_sensitive, context_json, created_at
+             FROM {$tbl}
+             {$where_sql}
+             ORDER BY created_at DESC, id DESC
+             LIMIT %d",
+            array_merge( $params, array( $limit ) )
+        ), ARRAY_A );
+
+        // Resolve actor display names with single batch query (N+1 defense)
+        $user_ids = array();
+        foreach ( $rows ?: array() as $r ) {
+            if ( ! empty( $r['actor_user_id'] ) ) $user_ids[] = (int) $r['actor_user_id'];
+            if ( ! empty( $r['approver_user_id'] ) ) $user_ids[] = (int) $r['approver_user_id'];
+        }
+        $user_ids = array_unique( $user_ids );
+        $users = array();
+        if ( ! empty( $user_ids ) ) {
+            $u_objs = get_users( array( 'include' => $user_ids, 'fields' => array( 'ID', 'display_name', 'user_login' ) ) );
+            foreach ( $u_objs as $u ) {
+                $users[ (int) $u->ID ] = $u->display_name . ' (' . $u->user_login . ')';
+            }
+        }
+
+        // Stream CSV — UTF-8 BOM + RFC 4180 quoting via fputcsv
+        $fh = fopen( 'php://temp', 'w+' );
+        // BOM for Excel UTF-8 detection
+        fwrite( $fh, "\xEF\xBB\xBF" );
+
+        // Header row
+        fputcsv( $fh, array(
+            'id', 'created_at', 'sn', 'event_type',
+            'status_from', 'status_to',
+            'actor_user_id', 'actor_display',
+            'approver_user_id', 'approver_display',
+            'reason_category', 'reason',
+            'is_sensitive', 'ip_address', 'context_json',
+        ) );
+
+        foreach ( $rows ?: array() as $r ) {
+            fputcsv( $fh, array(
+                (int) $r['id'],
+                (string) $r['created_at'],
+                (string) $r['sn'],
+                (string) $r['event_type'],
+                (string) $r['status_from'],
+                (string) $r['status_to'],
+                (int) $r['actor_user_id'],
+                $users[ (int) $r['actor_user_id'] ] ?? '',
+                (int) $r['approver_user_id'],
+                $users[ (int) $r['approver_user_id'] ] ?? '',
+                (string) $r['reason_category'],
+                (string) $r['reason'],
+                (int) $r['is_sensitive'],
+                (string) $r['ip_address'],
+                (string) $r['context_json'],
+            ) );
+        }
+
+        rewind( $fh );
+        $csv = stream_get_contents( $fh );
+        fclose( $fh );
+
+        // Build filename — sn_audit_YYYY-MM-DD_HHMMSS.csv
+        $filename = 'sn_audit_' . gmdate( 'Y-m-d_His' ) . '.csv';
+
+        $resp = new WP_REST_Response( $csv, 200 );
+        $resp->header( 'Content-Type', 'text/csv; charset=utf-8' );
+        $resp->header( 'Content-Disposition', 'attachment; filename="' . $filename . '"' );
+        $resp->header( 'X-Content-Type-Options', 'nosniff' );
+        $resp->header( 'X-Audit-Row-Count', (string) count( $rows ?: array() ) );
+
+        return $resp;
     }
 }
 

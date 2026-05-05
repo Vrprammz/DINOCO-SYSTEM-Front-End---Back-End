@@ -956,6 +956,42 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('review');
     });
 
+    test('Phase 2 W5 V.0.13 audit/export CSV endpoint registered', () => {
+        const restCode = readSnippet('rest');
+        // Endpoint registered
+        expect(restCode).toContain("'/audit/export'");
+        expect(restCode).toContain('function dinoco_sn_rest_audit_export');
+        // CSV streaming with UTF-8 BOM (Excel detection)
+        const handler = restCode.split('function dinoco_sn_rest_audit_export')[1] || '';
+        const block = handler.split('function dinoco_sn_rest_void')[0];
+        expect(block).toContain('"\\xEF\\xBB\\xBF"');  // UTF-8 BOM
+        expect(block).toContain('fputcsv');
+        expect(block).toContain('text/csv');
+        expect(block).toContain('Content-Disposition');
+        // Rate limit reuse (double-quoted because key uses {$uid} interpolation)
+        expect(block).toMatch(/sn_audit_export_/);
+        expect(block).toContain('b2b_rate_limit');
+        // 5,000 row cap
+        expect(block).toMatch(/min\(\s*5000/);
+        // N+1 defense — batch user lookup
+        expect(block).toContain('get_users');
+        expect(block).toContain('array_unique');
+        // X-Audit-Row-Count header for frontend to surface count
+        expect(block).toContain('X-Audit-Row-Count');
+
+        // Frontend wiring
+        const fe = readSnippet('manager');
+        expect(fe).toContain('window.dncSnExportAuditCsv = function');
+        expect(fe).toContain('dncSnExportAuditCsv()');
+        // Blob download (no anchor href navigation on error)
+        const exportFn = fe.split('window.dncSnExportAuditCsv = function')[1] || '';
+        const exBlock = exportFn.split('window.dncSnLoadLtv')[0];
+        expect(exBlock).toContain('r.blob()');
+        expect(exBlock).toContain('URL.createObjectURL');
+        // 429 rate-limit message
+        expect(exBlock).toMatch(/r\.status\s*===\s*429/);
+    });
+
     test('Phase 3 W10 F#9 LTV detail drill-down extended (claims/reviews/cross-sell)', () => {
         const restCode = readSnippet('rest');
         // REST handler returns 3 new keys

@@ -107,7 +107,11 @@ const SNIPPET_PREFIXES = [
 // 2× per-row "ดู" detail buttons rendered dynamically). Migration to
 // data-action delegation deferred per v2.13 polish sprint plan (consistent
 // with Tabs 7/8/9 SN admin tab pattern).
-const BASELINE_INLINE_HANDLER_COUNT = 908;
+//
+// Bumped 908→909 (2026-05-05): Phase 2 W5 V.0.13 audit log CSV export added
+// 1 onclick handler (📥 Export CSV button in Tab 5 Audit). Migration to
+// data-action delegation deferred per same v2.13 polish sprint plan.
+const BASELINE_INLINE_HANDLER_COUNT = 909;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
