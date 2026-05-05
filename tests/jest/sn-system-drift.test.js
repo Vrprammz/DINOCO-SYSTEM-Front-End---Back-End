@@ -956,6 +956,34 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('review');
     });
 
+    test('Phase 3 W10 F#9 LTV detail drill-down extended (claims/reviews/cross-sell)', () => {
+        const restCode = readSnippet('rest');
+        // REST handler returns 3 new keys
+        const handler = restCode.split('function dinoco_sn_rest_ltv_detail')[1] || '';
+        const block = handler.split('function dinoco_sn_rest_stolen')[0];
+        expect(block).toContain("'claims'");
+        expect(block).toContain("'reviews'");
+        expect(block).toContain("'cross_sell'");
+        // claim_ticket integration via WP_Query + author filter
+        expect(block).toContain("post_type'      => 'claim_ticket'");
+        expect(block).toContain("'author'");
+        // Round 15 ITEM A: meta cache priming for N+1 defense
+        expect(block).toContain('update_meta_cache');
+        // review_requests table query
+        expect(block).toContain("dinoco_sn_table( 'review_requests' )");
+
+        // Frontend renders 3 new sections
+        const fe = readSnippet('manager');
+        const detail = fe.split('window.dncSnOpenLtvDetail = function')[1] || '';
+        const detailBlock = detail.split('window.dncSnCloseLtvDetail')[0];
+        expect(detailBlock).toMatch(/Claim History/);
+        expect(detailBlock).toMatch(/⭐ Reviews/);
+        expect(detailBlock).toMatch(/Cross-Sell Suggestion/);
+        // Status color coding for claims (green/red/amber)
+        expect(detailBlock).toContain('#10b981');  // completed = green
+        expect(detailBlock).toContain('#dc2626');  // rejected/cancelled = red
+    });
+
     test('Phase 4 W13 F#16 Demand Forecast viewer panel in Tab 3 Pool', () => {
         const code = readSnippet('manager');
         // Render section IDs
