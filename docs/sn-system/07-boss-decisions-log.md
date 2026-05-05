@@ -166,13 +166,26 @@
 
 **Boss reasoning**: "มันมี Card Role อยู่แล้ว ไปอ่านระบบดีๆก่อน"
 
-**สิ่งที่ต้องทำ**:
-- ⚠️ ผมยังไม่เคยอ่าน "Card Role" system — ต้องหาก่อนว่าหมายถึงอะไร
-- Likely candidates:
-  - distributor CPT มี `tier` field (silver/gold/platinum/diamond)?
-  - WP user role + custom meta?
-  - Existing Member Dashboard มี tier display?
-- **Action**: explore + read existing code → integrate F#9 LTV tier กับ existing Card Role แทนสร้างใหม่
+**Exploration result (2026-05-05 autonomous search)**:
+
+ค้นทั่ว repo พบ 3 candidates ที่อาจเป็น "Card Role":
+
+| Candidate | Snippet | Field/Schema | Match? |
+|---|---|---|---|
+| **B2B distributor `rank_system`** | `[B2B] Snippet 7` Cron + ACF on distributor CPT | `rank_system` ENUM (standard/silver/gold/platinum/diamond) — recomputed monthly จาก MTD sales | 🟡 Distributor-side only — ไม่ครอบ customer |
+| **Legacy plastic card system** | `[System] Legacy Migration Logic` + `[Admin System] DINOCO Legacy Migration Requests` | `dnc_code` field (DNC/DNX format) — บัตรพลาสติกเก่าก่อนระบบดิจิตอล | 🔴 Not "Role" — เป็น migration only ไม่มี tier |
+| **SN system `loyalty_tier`** | `[Admin System] DINOCO Production SN Manager` V.0.4 | `loyalty_tier` VARCHAR (bronze/silver/gold/platinum/diamond) ใน `wp_dinoco_sn_customer_ltv_snapshot` — recomputed daily จาก total_spent | 🟢 Customer-side — ใหม่ที่เพิ่งสร้าง |
+
+**Most likely interpretation**: Boss หมายถึง **B2B `rank_system`** (option 1) — DINOCO มีระบบ tier บน distributor อยู่แล้ว (badge icon/label) → boss อยาก reuse pattern เดียวกันสำหรับ customer (NOT reinvent).
+
+**Decision**: Tier badge for customer (v2.11 Member Dashboard `[dinoco_dashboard_header]` `dinoco_sn_get_user_ltv()`) จะ:
+
+1. **Render style copy จาก B2B distributor rank** — emoji + label + color (🥉/🥈/🥇/💜/💎)
+2. **Data source** = `wp_dinoco_sn_customer_ltv_snapshot.loyalty_tier` (Q9 LTV ที่ผมสร้างแล้ว)
+3. **Visual subtle** บนหน้าแรก (badge ข้างชื่อ + tooltip on tap → drill-down)
+4. **No new "Card" entity** — ใช้ snapshot table ที่มี อยู่แล้ว — สอดคล้อง boss "อย่าสร้างใหม่"
+
+**Status**: ⚠️ Pending boss confirmation — ถ้า boss หมายถึงระบบอื่น (มี customer-side tier system ที่ผมยังไม่เจอ) → boss ระบุชื่อ snippet/file ให้ผม explore ใหม่
 
 ---
 
