@@ -718,6 +718,24 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/Q22 OVERRIDE/);
     });
 
+    test('Q6+Q8 — F#8 extension price helper stubs present (Phase 4 W12 wiring)', () => {
+        // Boss decisions (2026-05-05):
+        //   Q6: F#8 Phase 5 → Phase 4 W12-13 + ทำให้ละเอียดที่สุด
+        //   Q8: per-SKU manual pricing (admin กรอกราคาแต่ละ SKU ต่อปี)
+        const code = readSnippet('rest');
+        // Helper functions defined
+        expect(code).toContain('function dinoco_sn_get_extension_price');
+        expect(code).toContain('function dinoco_sn_extension_available');
+        // Defensive guards (no DB access until Phase 4 W12 ALTER lands)
+        expect(code).toMatch(/class_exists\(\s*'DINOCO_Catalog'\s*\)/);
+        expect(code).toMatch(/sn_ext_price_\{?\$years\}?y/);
+        // Years validation
+        expect(code).toMatch(/in_array\(\s*\(int\)\s*\$years,\s*array\(\s*1,\s*2,\s*3\s*\)/);
+        // Replan doc exists
+        const planDoc = path.join(REPO_ROOT, 'docs/sn-system/08-f8-extension-marketplace-q6-q8-q7-q20-replan.md');
+        expect(fs.existsSync(planDoc)).toBe(true);
+    });
+
     test('Phase 4 W13 F#16 forecast endpoints + cron + helper', () => {
         const code = readSnippet('rest');
         const manager = readSnippet('manager');
