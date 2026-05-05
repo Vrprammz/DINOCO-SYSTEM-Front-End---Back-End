@@ -66,6 +66,74 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/DINOCO_SN_REST_NAMESPACE/);
     });
 
+    test('Phase 3 audit fix — public /lookup strips PII + cache-safe', () => {
+        const code = readSnippet('rest');
+        const handler = code.split('function dinoco_sn_rest_lookup')[1] || '';
+        // Public response must contain only minimal status oracle
+        expect(handler).toContain('public_status');
+        expect(handler).toContain('is_registered');
+        // Must NOT EMIT user-derived or PII fields in response array (key=>value)
+        // Comments mentioning the stripped field are OK; emission is not.
+        expect(handler).not.toMatch(/'is_owned_by_caller'\s*=>/);
+        expect(handler.split('set_transient')[0]).not.toMatch(/'top_set_sku'\s*=>/);
+        expect(handler.split('set_transient')[0]).not.toMatch(/'linked_sku'\s*=>/);
+    });
+
+    test('Phase 3 audit fix — /sc-lookup endpoint accepts warehouse cap', () => {
+        const code = readSnippet('rest');
+        // P0-1: SC Quick Lookup needs warehouse cap, not admin
+        expect(code).toContain("'/sc-lookup/(?P<sn>[A-Za-z0-9]+)'");
+        // Must use warehouse permission callback (not admin-only)
+        const scBlock = code.split("'/sc-lookup/")[1] || '';
+        expect(scBlock.split('register_rest_route')[0])
+            .toContain("'permission_callback' => 'dinoco_sn_perm_warehouse'");
+    });
+
+    test('Phase 3 audit fix — notification UNIQUE index + INSERT IGNORE', () => {
+        const code = readSnippet('manager');
+        // P0-4: schema must have UNIQUE composite key
+        expect(code).toContain('UNIQUE KEY uniq_dedup (notification_type, user_id, sn)');
+        // Helper must use INSERT IGNORE (not SELECT-then-INSERT)
+        expect(code).toContain('INSERT IGNORE INTO');
+    });
+
+    test('Phase 3 audit fix — review request claim guard uses placeholders', () => {
+        const code = readSnippet('manager');
+        // P0-3 + P1-4: closed_statuses must NOT be raw-interpolated
+        // The variable $closed_in (raw SQL list) should NOT exist
+        expect(code).not.toContain('$closed_in =');
+        // Should use $status_ph + array_merge args pattern
+        expect(code).toContain('$status_ph');
+    });
+
+    test('Phase 3 audit fix — pool-stats uses SUM(CASE WHEN) portable SQL', () => {
+        const code = readSnippet('rest');
+        const handler = code.split('function dinoco_sn_rest_pool_stats')[1] || '';
+        // P1-3: portable SUM(CASE WHEN ... THEN 1 ELSE 0 END) instead of SUM(status='x')
+        expect(handler).toContain('SUM(CASE WHEN status');
+        // Capped flag for UI hint
+        expect(handler).toContain('stats_capped');
+    });
+
+    test('Phase 3 audit fix — swap/reissue lock release in finally', () => {
+        const code = readSnippet('rest');
+        // P1-2: try/finally guarantees RELEASE_LOCK on every path
+        const swap = code.split('function dinoco_sn_rest_swap')[1] || '';
+        const reissue = code.split('function dinoco_sn_rest_reissue')[1] || '';
+        // Both should have finally { ... RELEASE_LOCK }
+        expect(swap).toMatch(/} finally \{[\s\S]*?RELEASE_LOCK[\s\S]*?\}/);
+        expect(reissue).toMatch(/} finally \{[\s\S]*?RELEASE_LOCK[\s\S]*?\}/);
+    });
+
+    test('Phase 3 audit fix — swap NULLs old registered_user_id atomically', () => {
+        const code = readSnippet('rest');
+        const swap = code.split('function dinoco_sn_rest_swap')[1] || '';
+        // P1-1: sn_old UPDATE must clear registered_user_id + registered_warranty_id
+        const upd_old_block = swap.split('// sn_new → take')[0] || '';
+        expect(upd_old_block).toMatch(/'registered_user_id'\s*=>\s*null/);
+        expect(upd_old_block).toMatch(/'registered_warranty_id'\s*=>\s*null/);
+    });
+
     test('REST API has all Phase 1 endpoints registered', () => {
         const code = readSnippet('rest');
         const expected_endpoints = [
@@ -298,10 +366,15 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toContain('expiry_1d');
     });
 
-    test('Phase 3 W9 F#1 dedup uses composite key (type, user_id, sn)', () => {
+    test('Phase 3 W9 F#1 dedup uses INSERT IGNORE + UNIQUE index (P0-4 fixed)', () => {
         const code = readSnippet('manager');
-        // Helper queries should check all 3 fields (no UNIQUE index — app-level dedup)
-        expect(code).toMatch(/notification_type\s*=\s*%s[\s\S]*?user_id\s*=\s*%d[\s\S]*?sn\s*=\s*%s/);
+        // After audit fix: dedup at DB layer via UNIQUE KEY uniq_dedup +
+        // INSERT IGNORE in helper. Race-safe vs old SELECT-then-INSERT.
+        expect(code).toContain('UNIQUE KEY uniq_dedup (notification_type, user_id, sn)');
+        expect(code).toContain('INSERT IGNORE INTO');
+        // Schedule notification helper must check rows === 1 to know if inserted vs dup
+        const helper = code.split('function dinoco_sn_schedule_notification')[1] || '';
+        expect(helper).toMatch(/\$rows\s*===\s*1/);
     });
 
     test('Phase 3 W9 F#4 Anniversary cron + types 1y..5y', () => {

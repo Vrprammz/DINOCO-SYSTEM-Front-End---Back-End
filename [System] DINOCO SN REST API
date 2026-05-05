@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.6 (2026-05-05) — Audit fixes P0-1/2/5/6 + P1-1/2/3 (PII + locks + SQL)║
  * ║  Version: V.0.5 (2026-05-04) — Phase 3 W8.2-3 recall + reissue + reconcile-report║
  * ║  Version: V.0.4 (2026-05-04) — Phase 2 W5 pool-stats/search/audit/void/swap║
  * ║  Version: V.0.3 (2026-05-04) — Phase 1 W3 Day 4-5 CSV + QR PDF gen║
@@ -490,6 +491,19 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             ),
         ) );
 
+        // GET /sc-lookup/{sn} — Phase 3 W8.5 fix (P0-1)
+        // Service Center walk-in verify: warehouse cap accepted. Same payload
+        // as /sn/{sn} but PII auto-masked unless dinoco_sn_view_pii cap.
+        // Quick Lookup shortcode UI calls this endpoint.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/sc-lookup/(?P<sn>[A-Za-z0-9]+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_sn_detail',  // reuse same handler
+            'permission_callback' => 'dinoco_sn_perm_warehouse',  // admin OR warehouse cap
+            'args'                => array(
+                'sn' => array( 'required' => true, 'type' => 'string' ),
+            ),
+        ) );
+
         // GET /audit — Tab 5 paginated audit log search
         register_rest_route( DINOCO_SN_REST_NAMESPACE, '/audit', array(
             'methods'             => 'GET',
@@ -653,22 +667,26 @@ if ( ! function_exists( 'dinoco_sn_handler_create_batch' ) ) {
                 );
             }
 
-            // Determine next start_seq for this prefix (continue from last or start at 1)
-            $last_seq = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT MAX(qty_total) FROM {$tbl_batches} WHERE prefix = %s", $prefix
+            // V.0.6 audit fix (P0-6): determine start_seq via numeric-suffix-only
+            // scan of sn_pool (not MAX(qty_total) which has wrong semantics —
+            // qty_total is per-batch count, not last sequence).
+            //
+            // REGEXP constraint ensures suffix is digits-only — prevents
+            // collision with alphanumeric SKU-like prefixes (e.g., DNC4537SET).
+            // ORDER BY CAST descending picks the numerically highest suffix.
+            $sn_max_seq = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT CAST(SUBSTRING(sn, %d) AS UNSIGNED) AS suffix
+                 FROM {$tbl_pool}
+                 WHERE sn LIKE %s
+                   AND SUBSTRING(sn, %d) REGEXP %s
+                 ORDER BY suffix DESC
+                 LIMIT 1",
+                strlen( $prefix ) + 1,
+                $wpdb->esc_like( $prefix ) . '%',
+                strlen( $prefix ) + 1,
+                '^[0-9]+$'
             ) );
-            $start_seq = $last_seq + 1; // Conservative — could clash if old batches existed
-            // Safer: scan sn_pool for max numeric suffix matching prefix
-            $sn_max = $wpdb->get_var( $wpdb->prepare(
-                "SELECT sn FROM {$tbl_pool} WHERE sn LIKE %s ORDER BY sn DESC LIMIT 1",
-                $wpdb->esc_like( $prefix ) . '%'
-            ) );
-            if ( $sn_max ) {
-                $sn_suffix = preg_replace( '/^' . preg_quote( $prefix, '/' ) . '/', '', $sn_max );
-                $start_seq = ( (int) $sn_suffix ) + 1;
-            } else {
-                $start_seq = 1;
-            }
+            $start_seq = $sn_max_seq > 0 ? $sn_max_seq + 1 : 1;
 
             // Begin transaction
             $wpdb->query( "START TRANSACTION" );
@@ -1411,33 +1429,43 @@ if ( ! function_exists( 'dinoco_sn_rest_lookup' ) ) {
             return new WP_Error( 'sn_not_found', __( 'S/N not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
         }
 
-        $resp = array(
-            'sn'     => $sn,
-            'status' => $plate->status,
+        // Phase 3 W9 audit fix (P0-2 + P0-5):
+        // Public lookup must NOT expose:
+        //   - linked_sku / top_set_sku (SKU enumeration oracle)
+        //   - is_owned_by_caller (per-user field that poisons shared cache)
+        //   - activate_url (info leak: which S/Ns are pre-shipped)
+        // Authenticated admin uses /sn/{sn} for full payload.
+        // Public response = minimal status oracle for QR scan validation only.
+        $public_status_map = array(
+            'reserved'           => 'pending',
+            'in_pool'            => 'pending',
+            'allocated_to_order' => 'pending',
+            'shipped'            => 'pending',
+            'registered'         => 'registered',
+            'claimed'            => 'registered',  // collapse to "registered" — claim detail is private
+            'replaced'           => 'registered',
+            'transferred'        => 'registered',
+            'voided'             => 'invalid',
+            'recalled'           => 'invalid',
         );
+        $public_status = $public_status_map[ $plate->status ] ?? 'pending';
 
-        // Add product info if registered
-        if ( in_array( $plate->status, array( 'registered', 'claimed', 'transferred' ), true ) ) {
-            $meta = function_exists( 'dinoco_sn_get_plate_meta' ) ? dinoco_sn_get_plate_meta( $sn ) : null;
-            $top_sku = $meta ? $meta->top_set_sku : $plate->linked_sku;
-
-            $resp['product'] = array(
-                'top_set_sku' => $top_sku,
-                'linked_sku'  => $plate->linked_sku,
-            );
-
-            $resp['warranty'] = array(
-                'registered'   => true,
-                'is_owned_by_caller' => is_user_logged_in() && (int) $plate->registered_user_id === get_current_user_id(),
-            );
-        } elseif ( $plate->status === 'in_pool' ) {
-            $resp['product'] = array( 'linked_sku' => $plate->linked_sku );
-            $resp['warranty'] = array( 'registered' => false );
-            $resp['activate_url'] = home_url( '/warranty/activate?sn=' . urlencode( $sn ) );
-        } elseif ( $plate->status === 'voided' || $plate->status === 'recalled' ) {
-            return new WP_Error( 'voided_plate', __( 'Plate is voided/recalled.', 'dinoco-sn' ), array( 'status' => 410 ) );
+        if ( $public_status === 'invalid' ) {
+            return new WP_Error( 'voided_plate',
+                __( 'Plate is no longer valid — please contact support.', 'dinoco-sn' ),
+                array( 'status' => 410 ) );
         }
 
+        $resp = array(
+            'sn'             => $sn,
+            'public_status'  => $public_status,        // pending | registered (only)
+            'is_registered'  => ( $public_status === 'registered' ),
+            'activate_hint'  => ( $public_status === 'pending' )
+                ? __( 'หากเป็นลูกค้า กรุณาเปิด LINE LIFF + scan QR ที่ตัวสินค้าเพื่อลงทะเบียน', 'dinoco-sn' )
+                : null,
+        );
+
+        // Cache safe to share — no per-user / no PII fields above this point
         set_transient( $cache_key, $resp, 60 );
         return rest_ensure_response( $resp );
     }
@@ -1596,20 +1624,28 @@ if ( ! function_exists( 'dinoco_sn_rest_pool_stats' ) ) {
         global $wpdb;
         $tbl = dinoco_sn_table( 'pool' );
 
-        // Per-SKU breakdown (top 200 SKUs by total to avoid huge payload)
+        // V.0.6 audit fix (P1-3): SUM(status='x') is MySQL boolean shorthand —
+        // not portable to ANSI SQL strict modes (PostgreSQL / MySQL strict).
+        // SUM(CASE WHEN status='x' THEN 1 ELSE 0 END) is portable + identical
+        // semantics on all engines.
+        //
+        // 200-SKU LIMIT note: per-row breakdown shows top 200 by total only.
+        // sum(stats[].total) MAY NOT equal totals.total if more SKUs exist —
+        // this is intentional to cap payload size. Admin UI should display
+        // both values + label "showing top 200 SKUs" if stats[] count = 200.
         $rows = $wpdb->get_results(
             "SELECT linked_sku,
-                    SUM( status = 'reserved' )            AS reserved,
-                    SUM( status = 'in_pool' )             AS in_pool,
-                    SUM( status = 'allocated_to_order' )  AS allocated,
-                    SUM( status = 'shipped' )             AS shipped,
-                    SUM( status = 'registered' )          AS registered,
-                    SUM( status = 'claimed' )             AS claimed,
-                    SUM( status = 'replaced' )            AS replaced,
-                    SUM( status = 'transferred' )         AS transferred,
-                    SUM( status = 'voided' )              AS voided,
-                    SUM( status = 'recalled' )            AS recalled,
-                    COUNT(*)                              AS total
+                    SUM(CASE WHEN status = 'reserved'           THEN 1 ELSE 0 END) AS reserved,
+                    SUM(CASE WHEN status = 'in_pool'            THEN 1 ELSE 0 END) AS in_pool,
+                    SUM(CASE WHEN status = 'allocated_to_order' THEN 1 ELSE 0 END) AS allocated,
+                    SUM(CASE WHEN status = 'shipped'            THEN 1 ELSE 0 END) AS shipped,
+                    SUM(CASE WHEN status = 'registered'         THEN 1 ELSE 0 END) AS registered,
+                    SUM(CASE WHEN status = 'claimed'            THEN 1 ELSE 0 END) AS claimed,
+                    SUM(CASE WHEN status = 'replaced'           THEN 1 ELSE 0 END) AS replaced,
+                    SUM(CASE WHEN status = 'transferred'        THEN 1 ELSE 0 END) AS transferred,
+                    SUM(CASE WHEN status = 'voided'             THEN 1 ELSE 0 END) AS voided,
+                    SUM(CASE WHEN status = 'recalled'           THEN 1 ELSE 0 END) AS recalled,
+                    COUNT(*)                                                       AS total
              FROM {$tbl}
              WHERE linked_sku IS NOT NULL AND linked_sku != ''
              GROUP BY linked_sku
@@ -1618,32 +1654,33 @@ if ( ! function_exists( 'dinoco_sn_rest_pool_stats' ) ) {
             ARRAY_A
         );
 
-        // Totals across all rows
+        // Totals across ALL rows (not limited)
         $totals = $wpdb->get_row(
             "SELECT
-                SUM( status = 'reserved' )            AS reserved,
-                SUM( status = 'in_pool' )             AS in_pool,
-                SUM( status = 'allocated_to_order' )  AS allocated,
-                SUM( status = 'shipped' )             AS shipped,
-                SUM( status = 'registered' )          AS registered,
-                SUM( status = 'claimed' )             AS claimed,
-                SUM( status = 'replaced' )            AS replaced,
-                SUM( status = 'transferred' )         AS transferred,
-                SUM( status = 'voided' )              AS voided,
-                SUM( status = 'recalled' )            AS recalled,
-                COUNT(*)                              AS total
+                SUM(CASE WHEN status = 'reserved'           THEN 1 ELSE 0 END) AS reserved,
+                SUM(CASE WHEN status = 'in_pool'            THEN 1 ELSE 0 END) AS in_pool,
+                SUM(CASE WHEN status = 'allocated_to_order' THEN 1 ELSE 0 END) AS allocated,
+                SUM(CASE WHEN status = 'shipped'            THEN 1 ELSE 0 END) AS shipped,
+                SUM(CASE WHEN status = 'registered'         THEN 1 ELSE 0 END) AS registered,
+                SUM(CASE WHEN status = 'claimed'            THEN 1 ELSE 0 END) AS claimed,
+                SUM(CASE WHEN status = 'replaced'           THEN 1 ELSE 0 END) AS replaced,
+                SUM(CASE WHEN status = 'transferred'        THEN 1 ELSE 0 END) AS transferred,
+                SUM(CASE WHEN status = 'voided'             THEN 1 ELSE 0 END) AS voided,
+                SUM(CASE WHEN status = 'recalled'           THEN 1 ELSE 0 END) AS recalled,
+                COUNT(*)                                                       AS total
              FROM {$tbl}",
             ARRAY_A
         );
 
         $resp = array(
-            'stats'      => array_map( function( $r ) {
+            'stats'         => array_map( function( $r ) {
                 foreach ( $r as $k => $v ) { $r[ $k ] = $k === 'linked_sku' ? $v : (int) $v; }
                 return $r;
             }, $rows ?: array() ),
-            'totals'     => $totals ? array_map( 'intval', $totals ) : new \stdClass(),
-            'updated_at' => current_time( 'c' ),
-            'cached'     => false,
+            'totals'        => $totals ? array_map( 'intval', $totals ) : new \stdClass(),
+            'stats_capped'  => count( $rows ?: array() ) >= 200,  // hint UI to show "top 200" badge
+            'updated_at'    => current_time( 'c' ),
+            'cached'        => false,
         );
 
         set_transient( 'dinoco_sn_pool_stats_v1', $resp, 60 );
@@ -2066,66 +2103,78 @@ if ( ! function_exists( 'dinoco_sn_rest_swap' ) ) {
                 return new WP_Error( 'lock_timeout', __( 'Concurrent swap in progress.', 'dinoco-sn' ), array( 'status' => 503 ) );
             }
 
-            $wpdb->query( 'START TRANSACTION' );
+            // V.0.6 audit fix (P1-2): wrap entire post-GET_LOCK block in
+            // try/finally so RELEASE_LOCK fires on every code path —
+            // including unhandled throws between START TRANSACTION + the
+            // inner try{}. Early-returns no longer need manual RELEASE_LOCK.
             try {
-                $row_old = $wpdb->get_row( $wpdb->prepare(
-                    "SELECT sn, status, linked_sku, registered_user_id, registered_warranty_id, batch_id
-                     FROM {$pool} WHERE sn = %s FOR UPDATE", $sn_old
-                ), ARRAY_A );
-                $row_new = $wpdb->get_row( $wpdb->prepare(
-                    "SELECT sn, status, linked_sku, batch_id
-                     FROM {$pool} WHERE sn = %s FOR UPDATE", $sn_new
-                ), ARRAY_A );
+                $wpdb->query( 'START TRANSACTION' );
+                try {
+                    $row_old = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT sn, status, linked_sku, registered_user_id, registered_warranty_id, batch_id
+                         FROM {$pool} WHERE sn = %s FOR UPDATE", $sn_old
+                    ), ARRAY_A );
+                    $row_new = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT sn, status, linked_sku, batch_id
+                         FROM {$pool} WHERE sn = %s FOR UPDATE", $sn_new
+                    ), ARRAY_A );
 
-                if ( ! $row_old || ! $row_new ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'sn_not_found', __( 'One or both S/N not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
-                }
+                    if ( ! $row_old || ! $row_new ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sn_not_found', __( 'One or both S/N not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+                    }
 
-                $auto_tier_old = array( 'in_pool', 'allocated_to_order', 'shipped' );
-                if ( ! in_array( $row_old['status'], $auto_tier_old, true ) ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'requires_approval',
-                        sprintf( __( 'sn_old status %s requires 4-eyes approval (Phase 3+).', 'dinoco-sn' ), $row_old['status'] ),
-                        array( 'status' => 422, 'current_status' => $row_old['status'] ) );
-                }
+                    $auto_tier_old = array( 'in_pool', 'allocated_to_order', 'shipped' );
+                    if ( ! in_array( $row_old['status'], $auto_tier_old, true ) ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'requires_approval',
+                            sprintf( __( 'sn_old status %s requires 4-eyes approval (Phase 3+).', 'dinoco-sn' ), $row_old['status'] ),
+                            array( 'status' => 422, 'current_status' => $row_old['status'] ) );
+                    }
 
-                if ( $row_new['status'] !== 'in_pool' ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'sn_new_not_available',
-                        __( 'sn_new must be in_pool.', 'dinoco-sn' ),
-                        array( 'status' => 422 ) );
-                }
+                    if ( $row_new['status'] !== 'in_pool' ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sn_new_not_available',
+                            __( 'sn_new must be in_pool.', 'dinoco-sn' ),
+                            array( 'status' => 422 ) );
+                    }
 
-                if ( $row_new['linked_sku'] !== $row_old['linked_sku'] ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'sku_mismatch',
-                        sprintf( __( 'SKU mismatch: %s vs %s.', 'dinoco-sn' ), $row_old['linked_sku'], $row_new['linked_sku'] ),
-                        array( 'status' => 422 ) );
-                }
+                    if ( $row_new['linked_sku'] !== $row_old['linked_sku'] ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sku_mismatch',
+                            sprintf( __( 'SKU mismatch: %s vs %s.', 'dinoco-sn' ), $row_old['linked_sku'], $row_new['linked_sku'] ),
+                            array( 'status' => 422 ) );
+                    }
 
                 $now = current_time( 'mysql' );
 
-                // sn_old → voided + replaced_by_sn = sn_new
-                $wpdb->update( $pool, array(
-                    'status'         => 'voided',
-                    'prev_status'    => $row_old['status'],
-                    'replaced_by_sn' => $sn_new,
-                    'voided_at'      => $now,
+                // V.0.6 audit fix (P1-1): NULL out sn_old's registered_user_id +
+                // registered_warranty_id in same UPDATE flipping to voided.
+                // Prevents dual-binding window where both sn_old + sn_new
+                // appear bound to same warranty if audit log fails post-COMMIT.
+                $upd_old = $wpdb->update( $pool, array(
+                    'status'                 => 'voided',
+                    'prev_status'            => $row_old['status'],
+                    'replaced_by_sn'         => $sn_new,
+                    'voided_at'              => $now,
+                    'registered_user_id'     => null,
+                    'registered_warranty_id' => null,
                 ), array( 'sn' => $sn_old, 'status' => $row_old['status'] ) );
+                if ( $upd_old === false || $upd_old === 0 ) {
+                    throw new \RuntimeException( 'sn_old update failed (concurrent modification)' );
+                }
 
                 // sn_new → take old's state (registered → registered, etc)
-                $wpdb->update( $pool, array(
+                $upd_new = $wpdb->update( $pool, array(
                     'status'                 => $row_old['status'],
                     'prev_status'            => 'in_pool',
                     'replaces_sn'            => $sn_old,
                     'registered_user_id'     => $row_old['registered_user_id'],
                     'registered_warranty_id' => $row_old['registered_warranty_id'],
                 ), array( 'sn' => $sn_new, 'status' => 'in_pool' ) );
+                if ( $upd_new === false || $upd_new === 0 ) {
+                    throw new \RuntimeException( 'sn_new update failed (concurrent modification)' );
+                }
 
                 if ( function_exists( 'dinoco_sn_audit_log' ) ) {
                     dinoco_sn_audit_log( $sn_old, 'plate_swapped', $row_old['status'], 'voided',
@@ -2136,22 +2185,24 @@ if ( ! function_exists( 'dinoco_sn_rest_swap' ) ) {
                         null, null, $reason, 'admin_swap', false );
                 }
 
-                $wpdb->query( 'COMMIT' );
-                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-
-                return rest_ensure_response( array(
-                    'success'      => true,
-                    'sn_old'       => array( 'sn' => $sn_old, 'status' => 'voided' ),
-                    'sn_new'       => array( 'sn' => $sn_new, 'status' => $row_old['status'] ),
-                    'tier'         => 'auto',
-                ) );
-            } catch ( \Throwable $e ) {
-                $wpdb->query( 'ROLLBACK' );
-                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                if ( function_exists( 'dinoco_obs_capture' ) ) {
-                    dinoco_obs_capture( $e, array( 'context' => 'sn_swap', 'sn_old' => $sn_old, 'sn_new' => $sn_new ) );
+                    $wpdb->query( 'COMMIT' );
+                    return rest_ensure_response( array(
+                        'success'      => true,
+                        'sn_old'       => array( 'sn' => $sn_old, 'status' => 'voided' ),
+                        'sn_new'       => array( 'sn' => $sn_new, 'status' => $row_old['status'] ),
+                        'tier'         => 'auto',
+                    ) );
+                } catch ( \Throwable $e ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( $e, array( 'context' => 'sn_swap', 'sn_old' => $sn_old, 'sn_new' => $sn_new ) );
+                    }
+                    return new WP_Error( 'swap_failed', $e->getMessage(), array( 'status' => 500 ) );
                 }
-                return new WP_Error( 'swap_failed', $e->getMessage(), array( 'status' => 500 ) );
+            } finally {
+                // P1-2: ensures lock release on every path including
+                // unhandled throws + early returns
+                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
             }
         } );
     }
@@ -2329,84 +2380,84 @@ if ( ! function_exists( 'dinoco_sn_rest_reissue' ) ) {
                 return new WP_Error( 'lock_timeout', __( 'Concurrent reissue in progress.', 'dinoco-sn' ), array( 'status' => 503 ) );
             }
 
-            $wpdb->query( 'START TRANSACTION' );
+            // V.0.6 audit fix (P1-2): try/finally ensures RELEASE_LOCK on
+            // every code path including unhandled throws + early returns.
             try {
-                $row_old = $wpdb->get_row( $wpdb->prepare(
-                    "SELECT sn, status, linked_sku, registered_user_id, registered_warranty_id
-                     FROM {$pool} WHERE sn = %s FOR UPDATE", $sn_old
-                ), ARRAY_A );
-                $row_new = $wpdb->get_row( $wpdb->prepare(
-                    "SELECT sn, status, linked_sku FROM {$pool}
-                     WHERE sn = %s FOR UPDATE", $sn_new
-                ), ARRAY_A );
+                $wpdb->query( 'START TRANSACTION' );
+                try {
+                    $row_old = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT sn, status, linked_sku, registered_user_id, registered_warranty_id
+                         FROM {$pool} WHERE sn = %s FOR UPDATE", $sn_old
+                    ), ARRAY_A );
+                    $row_new = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT sn, status, linked_sku FROM {$pool}
+                         WHERE sn = %s FOR UPDATE", $sn_new
+                    ), ARRAY_A );
 
-                if ( ! $row_old || ! $row_new ) {
+                    if ( ! $row_old || ! $row_new ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sn_not_found', __( 'One or both S/N not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+                    }
+
+                    if ( ! in_array( $row_old['status'], array( 'registered', 'claimed' ), true ) ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sn_old_not_active',
+                            __( 'sn_old must be registered or claimed.', 'dinoco-sn' ),
+                            array( 'status' => 422, 'current_status' => $row_old['status'] ) );
+                    }
+                    if ( $row_new['status'] !== 'in_pool' ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sn_new_not_available',
+                            __( 'sn_new must be in_pool.', 'dinoco-sn' ),
+                            array( 'status' => 422 ) );
+                    }
+                    if ( $row_new['linked_sku'] !== $row_old['linked_sku'] ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'sku_mismatch',
+                            sprintf( __( 'SKU mismatch: %s vs %s.', 'dinoco-sn' ), $row_old['linked_sku'], $row_new['linked_sku'] ),
+                            array( 'status' => 422 ) );
+                    }
+
+                    // Issue sn_new with same warranty linkage as sn_old
+                    $wpdb->update( $pool, array(
+                        'status'                 => $row_old['status'],
+                        'prev_status'            => 'in_pool',
+                        'replaces_sn'            => $sn_old,
+                        'registered_user_id'     => $row_old['registered_user_id'],
+                        'registered_warranty_id' => $row_old['registered_warranty_id'],
+                    ), array( 'sn' => $sn_new, 'status' => 'in_pool' ) );
+
+                    // Mark sn_old as having reissue pending (don't void — customer keeps proof)
+                    $wpdb->update( $pool, array(
+                        'replaced_by_sn' => $sn_new,
+                    ), array( 'sn' => $sn_old ) );
+
+                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                        dinoco_sn_audit_log( $sn_old, 'plate_reissue_pending', $row_old['status'], $row_old['status'],
+                            array( 'pair' => array( 'old' => $sn_old, 'new' => $sn_new ), 'side' => 'old' ),
+                            null, null, $reason, 'admin_reissue', true );
+                        dinoco_sn_audit_log( $sn_new, 'plate_reissue_pending', 'in_pool', $row_old['status'],
+                            array( 'pair' => array( 'old' => $sn_old, 'new' => $sn_new ), 'side' => 'new' ),
+                            null, null, $reason, 'admin_reissue', true );
+                    }
+
+                    $wpdb->query( 'COMMIT' );
+                    return rest_ensure_response( array(
+                        'success' => true,
+                        'sn_old'  => array( 'sn' => $sn_old, 'status' => $row_old['status'], 'replaced_by' => $sn_new ),
+                        'sn_new'  => array( 'sn' => $sn_new, 'status' => $row_old['status'] ),
+                        'note'    => 'admin must arrange physical shipment of new plate to customer',
+                    ) );
+                } catch ( \Throwable $e ) {
                     $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'sn_not_found', __( 'One or both S/N not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( $e, array( 'context' => 'sn_reissue', 'sn_old' => $sn_old, 'sn_new' => $sn_new ) );
+                    }
+                    return new WP_Error( 'reissue_failed', $e->getMessage(), array( 'status' => 500 ) );
                 }
-
-                if ( ! in_array( $row_old['status'], array( 'registered', 'claimed' ), true ) ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'sn_old_not_active',
-                        __( 'sn_old must be registered or claimed.', 'dinoco-sn' ),
-                        array( 'status' => 422, 'current_status' => $row_old['status'] ) );
-                }
-                if ( $row_new['status'] !== 'in_pool' ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'sn_new_not_available',
-                        __( 'sn_new must be in_pool.', 'dinoco-sn' ),
-                        array( 'status' => 422 ) );
-                }
-                if ( $row_new['linked_sku'] !== $row_old['linked_sku'] ) {
-                    $wpdb->query( 'ROLLBACK' );
-                    $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                    return new WP_Error( 'sku_mismatch',
-                        sprintf( __( 'SKU mismatch: %s vs %s.', 'dinoco-sn' ), $row_old['linked_sku'], $row_new['linked_sku'] ),
-                        array( 'status' => 422 ) );
-                }
-
-                // Issue sn_new with same warranty linkage as sn_old
-                $wpdb->update( $pool, array(
-                    'status'                 => $row_old['status'],
-                    'prev_status'            => 'in_pool',
-                    'replaces_sn'            => $sn_old,
-                    'registered_user_id'     => $row_old['registered_user_id'],
-                    'registered_warranty_id' => $row_old['registered_warranty_id'],
-                ), array( 'sn' => $sn_new, 'status' => 'in_pool' ) );
-
-                // Mark sn_old as having reissue pending (don't void — customer keeps proof)
-                $wpdb->update( $pool, array(
-                    'replaced_by_sn' => $sn_new,
-                ), array( 'sn' => $sn_old ) );
-
-                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
-                    dinoco_sn_audit_log( $sn_old, 'plate_reissue_pending', $row_old['status'], $row_old['status'],
-                        array( 'pair' => array( 'old' => $sn_old, 'new' => $sn_new ), 'side' => 'old' ),
-                        null, null, $reason, 'admin_reissue', true );
-                    dinoco_sn_audit_log( $sn_new, 'plate_reissue_pending', 'in_pool', $row_old['status'],
-                        array( 'pair' => array( 'old' => $sn_old, 'new' => $sn_new ), 'side' => 'new' ),
-                        null, null, $reason, 'admin_reissue', true );
-                }
-
-                $wpdb->query( 'COMMIT' );
+            } finally {
+                // P1-2: guaranteed lock release on every path
                 $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-
-                return rest_ensure_response( array(
-                    'success' => true,
-                    'sn_old'  => array( 'sn' => $sn_old, 'status' => $row_old['status'], 'replaced_by' => $sn_new ),
-                    'sn_new'  => array( 'sn' => $sn_new, 'status' => $row_old['status'] ),
-                    'note'    => 'admin must arrange physical shipment of new plate to customer',
-                ) );
-            } catch ( \Throwable $e ) {
-                $wpdb->query( 'ROLLBACK' );
-                $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
-                if ( function_exists( 'dinoco_obs_capture' ) ) {
-                    dinoco_obs_capture( $e, array( 'context' => 'sn_reissue', 'sn_old' => $sn_old, 'sn_new' => $sn_new ) );
-                }
-                return new WP_Error( 'reissue_failed', $e->getMessage(), array( 'status' => 500 ) );
             }
         } );
     }

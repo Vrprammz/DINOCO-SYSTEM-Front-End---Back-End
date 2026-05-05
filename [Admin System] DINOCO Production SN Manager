@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.11 (2026-05-05) — Audit fixes P0-3/4 + P1-4 (sql + UNIQUE + INSERT IGNORE)║
  * ║  Version: V.0.10 (2026-05-05) — Phase 3 W9 F#4 Anniversary + F#10 Review crons║
  * ║  Version: V.0.9 (2026-05-05) — Phase 3 W9 F#1 Expiry Reminder cron foundation║
  * ║  Version: V.0.8 (2026-05-05) — Phase 3 W8.4 Reissue button + handler in Tab 4║
@@ -322,6 +323,11 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
         // ═══════════════════════════════════════════════════════
         // TABLE 5: sn_notifications — Phase 3 (F#1, F#4, F#10)
         // ═══════════════════════════════════════════════════════
+        // V.0.11 audit fix (P0-4): UNIQUE index on (notification_type, user_id, sn)
+        // promotes the previous KEY to UNIQUE — closes SELECT-then-INSERT race
+        // where 2 concurrent crons both see $exists=0 → double Flex push.
+        // dbDelta will alter existing tables idempotently. INSERT IGNORE in
+        // dinoco_sn_schedule_notification handles the duplicate-key gracefully.
         $sql_notifications = "CREATE TABLE {$prefix}dinoco_sn_notifications (
             id BIGINT UNSIGNED AUTO_INCREMENT,
             sn VARCHAR(40) NOT NULL,
@@ -334,10 +340,10 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
             meta_json TEXT DEFAULT NULL,
             created_at DATETIME NOT NULL,
             PRIMARY KEY  (id),
+            UNIQUE KEY uniq_dedup (notification_type, user_id, sn),
             KEY idx_sn (sn),
             KEY idx_user (user_id),
-            KEY idx_scheduled_status (scheduled_at, status),
-            KEY idx_type_user_sn (notification_type, user_id, sn)
+            KEY idx_scheduled_status (scheduled_at, status)
         ) {$charset_collate};";
 
         // ═══════════════════════════════════════════════════════
@@ -2851,27 +2857,26 @@ if ( ! function_exists( 'dinoco_sn_schedule_notification' ) ) {
         global $wpdb;
         $tbl = dinoco_sn_table( 'notifications' );
 
-        // Dedup check (no UNIQUE index because Phase 4 may add anniversary
-        // variants — keep app-level dedup for forward compat)
-        $exists = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*) FROM {$tbl}
-             WHERE notification_type = %s AND user_id = %d AND sn = %s
-             LIMIT 1",
-            $notif_type, $user_id, $sn
-        ) );
-        if ( $exists > 0 ) return false;
-
-        $ok = $wpdb->insert( $tbl, array(
-            'sn'                => $sn,
-            'user_id'           => $user_id,
-            'notification_type' => $notif_type,
-            'channel'           => 'line_flex',
-            'scheduled_at'      => $scheduled_at,
-            'status'            => 'scheduled',
-            'meta_json'         => wp_json_encode( $meta ),
-            'created_at'        => current_time( 'mysql' ),
-        ) );
-        return (bool) $ok;
+        // V.0.11 audit fix (P0-4): UNIQUE KEY uniq_dedup enforces dedup
+        // at DB level. INSERT IGNORE skips silently on duplicate. App-level
+        // SELECT-first race window eliminated.
+        // Use direct query (wpdb->insert escapes but doesn't support IGNORE).
+        $sql = $wpdb->prepare(
+            "INSERT IGNORE INTO {$tbl}
+                (sn, user_id, notification_type, channel, scheduled_at, status, meta_json, created_at)
+             VALUES (%s, %d, %s, %s, %s, %s, %s, %s)",
+            $sn,
+            $user_id,
+            $notif_type,
+            'line_flex',
+            $scheduled_at,
+            'scheduled',
+            wp_json_encode( $meta ),
+            current_time( 'mysql' )
+        );
+        $rows = $wpdb->query( $sql );
+        // INSERT IGNORE: rows = 1 if inserted, 0 if dup, false on real error
+        return $rows === 1;
     }
 }
 
@@ -3074,22 +3079,22 @@ if ( ! function_exists( 'dinoco_sn_run_review_request_schedule' ) ) {
             $users_with_open_claim = array();
             if ( $user_ids ) {
                 // Existing Service Center claim_ticket CPT — open if status NOT in completed/closed/rejected/cancelled
-                $placeholders = implode( ',', array_fill( 0, count( $user_ids ), '%d' ) );
+                // V.0.11 audit fix (P0-3 + P1-4): use proper placeholders for both
+                // user_ids AND status enum (was raw {$closed_in} interpolation).
                 $closed_statuses = array( 'completed', 'closed', 'rejected', 'cancelled' );
-                $closed_in = "'" . implode( "','", array_map( 'esc_sql', $closed_statuses ) ) . "'";
+                $user_ph    = implode( ',', array_fill( 0, count( $user_ids ), '%d' ) );
+                $status_ph  = implode( ',', array_fill( 0, count( $closed_statuses ), '%s' ) );
 
-                // Best-effort query — claim_ticket CPT has post_author = customer user_id
-                // and meta `ticket_status`. If CPT not registered yet → empty result (allow all).
-                $cpt_users = $wpdb->get_col( $wpdb->prepare(
-                    "SELECT DISTINCT p.post_author
-                     FROM {$wpdb->posts} p
-                     LEFT JOIN {$wpdb->postmeta} m ON m.post_id = p.ID AND m.meta_key = 'ticket_status'
-                     WHERE p.post_type = 'claim_ticket'
-                       AND p.post_status = 'publish'
-                       AND p.post_author IN ({$placeholders})
-                       AND ( m.meta_value IS NULL OR m.meta_value NOT IN ({$closed_in}) )",
-                    $user_ids
-                ) );
+                $sql = "SELECT DISTINCT p.post_author
+                        FROM {$wpdb->posts} p
+                        LEFT JOIN {$wpdb->postmeta} m ON m.post_id = p.ID AND m.meta_key = 'ticket_status'
+                        WHERE p.post_type = 'claim_ticket'
+                          AND p.post_status = 'publish'
+                          AND p.post_author IN ({$user_ph})
+                          AND ( m.meta_value IS NULL OR m.meta_value NOT IN ({$status_ph}) )";
+
+                $args = array_merge( array_map( 'intval', $user_ids ), $closed_statuses );
+                $cpt_users = $wpdb->get_col( $wpdb->prepare( $sql, $args ) );
                 if ( is_array( $cpt_users ) ) {
                     $users_with_open_claim = array_flip( array_map( 'intval', $cpt_users ) );
                 }
