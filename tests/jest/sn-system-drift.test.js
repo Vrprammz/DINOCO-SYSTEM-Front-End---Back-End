@@ -718,6 +718,30 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/Q22 OVERRIDE/);
     });
 
+    test('Phase 2 W5.4 — 3-tier approval classifier + SLA helper', () => {
+        const code = readSnippet('rest');
+
+        // Functions defined
+        expect(code).toContain('function dinoco_sn_classify_approval_tier');
+        expect(code).toContain('function dinoco_sn_get_approval_sla_seconds');
+
+        // 3 tiers
+        expect(code).toMatch(/return\s+'4_eyes'/);
+        expect(code).toMatch(/return\s+'single_admin'/);
+        expect(code).toMatch(/return\s+'auto'/);
+
+        // 4-eyes triggers (boss decision rules per v2.13 §2.7)
+        expect(code).toMatch(/'recall'/);  // recall always 4-eyes
+        expect(code).toMatch(/'registered'/);  // swap/void registered
+        expect(code).toMatch(/'claimed'/);  // swap/void claimed
+        expect(code).toMatch(/\$bulk_count\s*>\s*100/);  // bulk threshold
+
+        // SLA windows
+        expect(code).toMatch(/3600/);     // 1h urgent
+        expect(code).toMatch(/86400/);    // 24h normal
+        expect(code).toMatch(/259200/);   // 72h low
+    });
+
     test('Phase 1 W4.2 — dinoco_sn_obs_capture wired into 4 sensitive ops', () => {
         const rest = readSnippet('rest');
         const liff = readSnippet('liff');
