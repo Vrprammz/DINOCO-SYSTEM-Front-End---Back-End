@@ -21,7 +21,7 @@
 | Q8 | Extension pricing | 🆕 **per-SKU manual** (backend admin กรอก) | 🔴 **Override** | ⚠️ NEW backend UI needed |
 | Q9 | VAT | **A** รวม VAT | ✅ Yes | Phase 4 |
 | Q10 | Slip OCR | **A** Slip2Go reuse | ✅ Yes | Phase 4 |
-| Q11 | LINE Premium | **B** ฿1,500/mo เดี๋ยวจ่าย | ✅ Yes | ⏸️ F2 flag flip ready |
+| Q11 | LINE Premium | **B** ฿1,500/mo จ่ายแล้ว (2026-05-05 R2) | ✅ Yes | ✅ Done — F1 unblocked |
 | Q12 | Fraud baseline | "ไม่ค่อยมีปลอม — ทำกันไว้เฉยๆ" | 🔴 **Override** | → Q21 ตัดออก |
 | Q13 | HMAC URL signing | **A** Phase 1 | ✅ Yes | ⚠️ Pending implement |
 | Q14 | 4-eyes scope | **B** 3-tier | ✅ Yes | ✅ Done |

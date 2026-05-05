@@ -34,8 +34,8 @@
 
 ### B. Operational readiness
 
-- [ ] **LINE Premium tier ฿1,500/mo activated** (Q11 — boss confirmed "เดี๋ยวจ่าย" but not paid yet)
-  - Risk if skip: F#1 + F#4 + F#10 cron concurrent firing = 1000+ push/day = quota exceeded → fallback email
+- [x] **LINE Premium tier ฿1,500/mo activated** (Q11 — boss confirmed paid 2026-05-05 R2)
+  - F#1 + F#4 + F#10 cron concurrent firing = OK (Premium quota unlimited / high-tier)
 - [ ] **Pilot 100 plates** generated + sent to factory (or simulated) (Q12 still pending — boss may skip pilot)
 - [ ] **Approver delegate list assigned** (Q15 — boss assigns role via UI Q15 V.0.2 matrix)
 - [ ] **Service Center role assigned** (`dinoco_sn_view_pii` role to staff)
