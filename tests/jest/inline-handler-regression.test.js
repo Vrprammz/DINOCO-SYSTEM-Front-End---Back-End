@@ -101,7 +101,13 @@ const SNIPPET_PREFIXES = [
 // 14 onclick handlers — Fraud Queue (Load/Stats + 3-decision per row),
 // Geo Heatmap (Load + GrayMarket buttons), Stolen Registry (Load +
 // 4-decision per row). Migration deferred per v2.13 polish sprint.
-const BASELINE_INLINE_HANDLER_COUNT = 904;
+//
+// Bumped 904→908 (2026-05-05): Phase 4 W13 F#16 Demand Forecast viewer panel
+// added to Tab 3 Pool Status — 4 onclick handlers (Refresh / Close detail +
+// 2× per-row "ดู" detail buttons rendered dynamically). Migration to
+// data-action delegation deferred per v2.13 polish sprint plan (consistent
+// with Tabs 7/8/9 SN admin tab pattern).
+const BASELINE_INLINE_HANDLER_COUNT = 908;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

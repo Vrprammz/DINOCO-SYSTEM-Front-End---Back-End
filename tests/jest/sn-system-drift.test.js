@@ -956,6 +956,28 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('review');
     });
 
+    test('Phase 4 W13 F#16 Demand Forecast viewer panel in Tab 3 Pool', () => {
+        const code = readSnippet('manager');
+        // Render section IDs
+        expect(code).toContain('dnc-sn-forecast-summary');
+        expect(code).toContain('dnc-sn-forecast-critical');
+        expect(code).toContain('dnc-sn-forecast-full');
+        expect(code).toContain('dnc-sn-forecast-detail');
+        // Section heading + heading
+        expect(code).toMatch(/Demand Forecast.*F#16/);
+        // 3 JS handlers
+        expect(code).toContain('window.dncSnLoadForecast = function');
+        expect(code).toContain('window.dncSnLoadForecastDetail = function');
+        expect(code).toContain('window.dncSnCloseForecastDetail = function');
+        // Wires to existing forecast/all + forecast/sku endpoints
+        expect(code).toContain("'/forecast/all'");
+        expect(code).toContain("'/forecast/sku/'");
+        // Lazy-load on pool tab open
+        expect(code).toMatch(/which === 'pool'[\s\S]{0,400}window\.dncSnLoadForecast/);
+        // Critical threshold (≤60 days)
+        expect(code).toMatch(/days_until_empty\s*<=\s*60/);
+    });
+
     test('Phase 2 W7 v2.11 Member Dashboard helpers exist (read-only)', () => {
         const code = readSnippet('manager');
         // 6 read helpers per v2.11 §V.31.0 contract
