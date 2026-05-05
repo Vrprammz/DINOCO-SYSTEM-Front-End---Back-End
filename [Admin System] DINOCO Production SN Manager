@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.18 (2026-05-05) — Phase 2 W7 v2.11 Member Dashboard helpers (6) ║
  * ║  Version: V.0.17 (2026-05-05) — Phase 3 W9 F#1/F#4/F#10 Flex template builders║
  * ║  Version: V.0.16 (2026-05-05) — Phase 3 W11 admin Tabs 7/8/9 (Fraud/Geo/Stolen UI)║
  * ║  Version: V.0.15 (2026-05-05) — Phase 4 W13 F#16 Demand Forecast (math + cron)║
@@ -66,6 +67,14 @@
  *   dinoco_sn_table( $name )           : string  (prefixed table name)
  *   dinoco_sn_get_plate_data( $sn )    : object|null
  *   dinoco_sn_table_exists( $name )    : bool
+ *
+ * v2.11 Member Dashboard helpers (Phase 2 W7 — read-only):
+ *   dinoco_sn_get_user_plates( $uid, $statuses )       : array<object>
+ *   dinoco_sn_get_user_expiring_plates( $uid, $days )  : array<object>
+ *   dinoco_sn_get_user_ltv( $uid )                     : object|null
+ *   dinoco_sn_get_pending_reviews( $uid )              : array<object>
+ *   dinoco_sn_get_user_anniversaries( $uid, $days )    : array<object>
+ *   dinoco_sn_get_user_stats( $uid )                   : array (4 keys)
  *
  * NOT integrated into endpoints in this round — foundation only.
  */
@@ -193,6 +202,259 @@ if ( ! function_exists( 'dinoco_sn_get_plate_meta' ) ) {
             "SELECT * FROM {$tbl} WHERE sn = %s",
             $sn_upper
         ) );
+    }
+}
+
+/* ─── Phase 2 W7 — v2.11 Member Dashboard helpers (read-only) ─── */
+
+if ( ! function_exists( 'dinoco_sn_get_user_plates' ) ) {
+    /**
+     * List plates owned by a user. Read-only helper for Member Dashboard
+     * "My Warranties" panel + Asset List card. Returns plates with status
+     * in given whitelist (default: registered + claimed).
+     *
+     * Backward compat: returns empty array if user has no plates yet
+     * (legacy users still on serial_code ACF — Phase 2 W7 V.31.0 dual
+     * source migration). Member Dashboard uses graceful fallback when
+     * empty — never throws.
+     *
+     * @param int   $user_id    WP user ID
+     * @param array $statuses   Whitelist (default: registered + claimed)
+     * @return array<object>    Array of plate rows (hot path only)
+     */
+    function dinoco_sn_get_user_plates( $user_id, $statuses = array( 'registered', 'claimed' ) ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return array();
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) return array();
+
+        // Whitelist sanitize — accept only known states
+        $allowed_states = array(
+            'reserved', 'in_pool', 'registered', 'claimed', 'replaced',
+            'transferred', 'voided', 'recalled', 'reserved_for_legacy',
+            'shipped_legacy', 'cancelled_batch',
+        );
+        $clean = array();
+        foreach ( (array) $statuses as $s ) {
+            $s = (string) $s;
+            if ( in_array( $s, $allowed_states, true ) ) {
+                $clean[] = $s;
+            }
+        }
+        if ( empty( $clean ) ) return array();
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'pool' );
+        $placeholders = implode( ',', array_fill( 0, count( $clean ), '%s' ) );
+        $args = array_merge( array( $user_id ), $clean );
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT sn, status, linked_sku, registered_at, claim_id, batch_id, prev_status, lock_version
+             FROM {$tbl}
+             WHERE registered_user_id = %d
+               AND status IN ( {$placeholders} )
+             ORDER BY registered_at DESC",
+            $args
+        ) );
+        return is_array( $rows ) ? $rows : array();
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_user_expiring_plates' ) ) {
+    /**
+     * Plates whose warranty ends within $days_window. Used by Member
+     * Dashboard expiry banner (F#1 surfaces the same data through the
+     * notifications table — this helper is for instant read).
+     *
+     * Warranty math: `warranty_until = registered_at + warranty_years YEAR`
+     * matches the F#1 schedule cron. Default warranty_years=1 if not
+     * stored on plate (per v2.10 §F#1 default).
+     *
+     * @param int $user_id
+     * @param int $days_window  default 30 (clamped 1..365)
+     * @return array<object>    sn, top_set_sku, registered_at, days_left
+     */
+    function dinoco_sn_get_user_expiring_plates( $user_id, $days_window = 30 ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return array();
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) return array();
+        $days = max( 1, min( 365, (int) $days_window ) );
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'pool' );
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT sn,
+                    linked_sku,
+                    registered_at,
+                    DATEDIFF(
+                        DATE_ADD( DATE(registered_at), INTERVAL 1 YEAR ),
+                        CURDATE()
+                    ) AS days_left
+             FROM {$tbl}
+             WHERE registered_user_id = %d
+               AND status = 'registered'
+               AND DATE_ADD( DATE(registered_at), INTERVAL 1 YEAR )
+                   BETWEEN CURDATE() AND DATE_ADD( CURDATE(), INTERVAL %d DAY )
+             ORDER BY days_left ASC",
+            $user_id,
+            $days
+        ) );
+        return is_array( $rows ) ? $rows : array();
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_user_ltv' ) ) {
+    /**
+     * Read pre-aggregated LTV snapshot. Cron `dinoco_sn_ltv_snapshot_cron`
+     * keeps this fresh (daily 03:00). Cached 1hr in transient to absorb
+     * dashboard reload spam.
+     *
+     * @return object|null  Row from sn_customer_ltv_snapshot, or null
+     */
+    function dinoco_sn_get_user_ltv( $user_id ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return null;
+        if ( ! dinoco_sn_table_exists( 'ltv_snapshot' ) ) return null;
+
+        $cache_key = 'dinoco_sn_ltv_' . $user_id;
+        $cached = get_transient( $cache_key );
+        if ( $cached !== false ) {
+            return $cached === '__null__' ? null : $cached;
+        }
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'ltv_snapshot' );
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$tbl} WHERE user_id = %d",
+            $user_id
+        ) );
+
+        // Cache null too — prevent repeated SELECT on no-snapshot users
+        set_transient( $cache_key, $row ?: '__null__', HOUR_IN_SECONDS );
+        return $row;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_pending_reviews' ) ) {
+    /**
+     * Review requests sent but not yet reviewed (banner CTA on dashboard).
+     *
+     * Per v2.11 §F#10 Banner: shows up to 3 banners on home; rest in
+     * notifications page. Caller decides display cap.
+     *
+     * @return array<object>  sn, scheduled_at, sent_at
+     */
+    function dinoco_sn_get_pending_reviews( $user_id ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return array();
+        if ( ! dinoco_sn_table_exists( 'review_requests' ) ) return array();
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'review_requests' );
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, sn, scheduled_at, sent_at
+             FROM {$tbl}
+             WHERE user_id = %d
+               AND status = 'sent'
+               AND reviewed_at IS NULL
+             ORDER BY sent_at DESC",
+            $user_id
+        ) );
+        return is_array( $rows ) ? $rows : array();
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_user_anniversaries' ) ) {
+    /**
+     * Plates whose anniversary falls within $days_window from today.
+     * Used by F#4 dashboard banner (preview anniversary before LINE Flex push).
+     *
+     * Mirrors `dinoco_sn_run_anniversary_schedule` cron logic — month-day
+     * match against today (across N years). Caps at 5y to align with cron.
+     *
+     * @param int $user_id
+     * @param int $days_window  default 7 (clamped 1..30)
+     * @return array<object>    sn, registered_at, years_diff
+     */
+    function dinoco_sn_get_user_anniversaries( $user_id, $days_window = 7 ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return array();
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) return array();
+        $days = max( 1, min( 30, (int) $days_window ) );
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'pool' );
+        // Find plates registered N years ago (1..5) on a date within +/- $days from today
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT sn, linked_sku, registered_at,
+                    TIMESTAMPDIFF(YEAR, registered_at, CURDATE()) AS years_diff
+             FROM {$tbl}
+             WHERE registered_user_id = %d
+               AND status = 'registered'
+               AND TIMESTAMPDIFF(YEAR, registered_at, CURDATE()) BETWEEN 1 AND 5
+               AND ABS(DATEDIFF(
+                   DATE_ADD( DATE(registered_at),
+                             INTERVAL TIMESTAMPDIFF(YEAR, registered_at, CURDATE()) YEAR ),
+                   CURDATE()
+               )) <= %d
+             ORDER BY years_diff DESC",
+            $user_id,
+            $days
+        ) );
+        return is_array( $rows ) ? $rows : array();
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_user_stats' ) ) {
+    /**
+     * Stats grid for dashboard hero — plates_count / active_count /
+     * claim_count / member_years.
+     *
+     * Single SQL query — fast. Member dashboard renders 4 cells; if user
+     * has no plates yet (legacy fallback) returns zeros.
+     *
+     * @return array{plates_count:int,active_count:int,claim_count:int,member_years:int}
+     */
+    function dinoco_sn_get_user_stats( $user_id ) {
+        $user_id = (int) $user_id;
+        $base = array(
+            'plates_count' => 0,
+            'active_count' => 0,
+            'claim_count'  => 0,
+            'member_years' => 0,
+        );
+        if ( $user_id <= 0 ) return $base;
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) return $base;
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'pool' );
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT
+                COUNT(*) AS plates_count,
+                SUM( CASE WHEN status = 'registered' THEN 1 ELSE 0 END ) AS active_count,
+                SUM( CASE WHEN status = 'claimed' THEN 1 ELSE 0 END ) AS claim_count,
+                MIN(registered_at) AS first_registered_at
+             FROM {$tbl}
+             WHERE registered_user_id = %d",
+            $user_id
+        ), ARRAY_A );
+
+        if ( ! is_array( $row ) ) return $base;
+
+        $stats = array(
+            'plates_count' => (int) ( $row['plates_count'] ?? 0 ),
+            'active_count' => (int) ( $row['active_count'] ?? 0 ),
+            'claim_count'  => (int) ( $row['claim_count'] ?? 0 ),
+            'member_years' => 0,
+        );
+
+        if ( ! empty( $row['first_registered_at'] ) ) {
+            $first = strtotime( $row['first_registered_at'] );
+            if ( $first !== false ) {
+                $stats['member_years'] = (int) floor( ( time() - $first ) / ( 365 * 86400 ) );
+            }
+        }
+
+        return $stats;
     }
 }
 

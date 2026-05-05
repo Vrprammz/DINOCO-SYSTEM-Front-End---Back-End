@@ -956,6 +956,48 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('review');
     });
 
+    test('Phase 2 W7 v2.11 Member Dashboard helpers exist (read-only)', () => {
+        const code = readSnippet('manager');
+        // 6 read helpers per v2.11 §V.31.0 contract
+        expect(code).toContain('function dinoco_sn_get_user_plates');
+        expect(code).toContain('function dinoco_sn_get_user_expiring_plates');
+        expect(code).toContain('function dinoco_sn_get_user_ltv');
+        expect(code).toContain('function dinoco_sn_get_pending_reviews');
+        expect(code).toContain('function dinoco_sn_get_user_anniversaries');
+        expect(code).toContain('function dinoco_sn_get_user_stats');
+    });
+
+    test('Phase 2 W7 helpers use safe SQL patterns (no raw interpolation)', () => {
+        const code = readSnippet('manager');
+        // get_user_plates uses prepared statement with placeholders array
+        const userPlates = code.split('function dinoco_sn_get_user_plates')[1] || '';
+        const userPlatesBlock = userPlates.split('function dinoco_sn_get_user_expiring_plates')[0];
+        // Must use $wpdb->prepare with %s/%d placeholders
+        expect(userPlatesBlock).toMatch(/\$wpdb->prepare/);
+        // Status whitelist sanitization (no raw $statuses → SQL)
+        expect(userPlatesBlock).toContain('in_array');
+    });
+
+    test('Phase 2 W7 LTV helper has transient cache + null-marker guard', () => {
+        const code = readSnippet('manager');
+        const ltvBlock = code.split('function dinoco_sn_get_user_ltv')[1] || '';
+        const block = ltvBlock.split('function dinoco_sn_get_pending_reviews')[0];
+        expect(block).toContain('get_transient');
+        expect(block).toContain('set_transient');
+        // Null marker prevents repeated SELECT on no-snapshot users
+        expect(block).toContain('__null__');
+        expect(block).toContain('HOUR_IN_SECONDS');
+    });
+
+    test('Phase 2 W7 SnMemberHelpersTest exists', () => {
+        const filepath = path.join(REPO_ROOT, 'tests/helpers/SnMemberHelpersTest.php');
+        expect(fs.existsSync(filepath)).toBe(true);
+        const content = fs.readFileSync(filepath, 'utf8');
+        expect(content).toContain('sn_sanitize_status_whitelist');
+        expect(content).toContain('sn_compute_member_years');
+        expect(content).toContain('sn_clamp_days_window');
+    });
+
     test('Phase 3 W11 F#14 stolen_check public shortcode registered', () => {
         const code = readSnippet('stolen_check');
         // Shortcode + render fn
