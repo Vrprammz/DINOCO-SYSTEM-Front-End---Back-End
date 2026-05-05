@@ -703,6 +703,17 @@ Every snippet file includes a `DB_ID: NNN` header in its comment block (first 10
   - **v2.13 Continuous Phase Schedule** (binding): Phase 0 Pre-Validation 1wk → Phase 1 MVP Pilot 3wk → Phase 2 Operations 3wk → Phase 3 Polish+Risk 3.5wk → Phase 4 API+Forecast 3wk → Phase 5 Marketplace 4wk = 17.5wk total + 1wk pre = **19wk · ~620h continuous** (no gate stops per boss decision 2026-05-04).
   - **12 features selected** (boss v2.9): F#1 Expiry Reminder + F#3 Auto-fill Claim + F#4 Anniversary + F#6 Click-to-Call Dealer + F#8 Extension Marketplace (Phase 5) + F#9 LTV Dashboard + F#10 Review Request + F#12 Anti-Fraud ML + F#13 Geo Heatmap + F#14 Stolen Registry + F#15 Public API + F#16 Demand Forecast.
   - **Plan reference**: `~/.claude/plans/wiki-doc-sequential-lantern.md` (v2.13 boss-approved, 13 versions iterated, 6 audits passed: tech-lead × 3 + fullstack-developer × 2 + 15-specialist parallel × 1).
+  - **Boss decision overrides** (2026-05-05, `docs/sn-system/07-boss-decisions-log.md` — 5 critical):
+    - **Q6**: F#8 Extension Marketplace **Phase 5 → Phase 4** ("B แต่ทำให้ละเอียดที่สุด" — boss override of recommendation A). Replan needed.
+    - **Q7**: Payment = **Slip2GO เช็คสลิป + เลขบัญชี** เท่านั้น (no LINE Pay/SCB integration — simpler than recommendation B).
+    - **Q8**: Extension pricing = **per-SKU manual** ("ไม่ตายตัว — backend จะให้กรอกว่าแต่ละ SKU ต่อเท่าไหร่ต่อปี") — NEW backend admin UI (NOT in original A/B/C).
+    - **Q15**: Approval delegation = **Backend UserAdmin Role-based access control** ("ทำ Backend UserAdmin Role-based access control") — NEW snippet ~40h.
+    - **Q21**: F#12 Anti-Fraud Engine **REMOVED entirely** ("ตัดระบบของปลอมออกไปเลย เยอะเกิน ไม่ใช้แล้ว") — schema/routes/cron/JS/test surface removed in commit `8d97fdf` (V.0.23 manager). Tab 7 cut. fraud_scores table not installed. Cron defensive `wp_unschedule_event` for rollback. Handlers archived as dead code.
+    - **Q22**: F#15 Public API Gateway **DEFERRED** ("ยังไม่มีแผนใช้") — code retained but `dinoco_sn_pubapi_enabled` flag default OFF → all public endpoints return 503 `feature_disabled` (V.0.3 commit pending). Activation: `wp option update dinoco_sn_pubapi_enabled 1` when boss approves use case.
+    - **Q23**: Stolen plate verify = **admin-only** ("Admin เท่านั้นก่อน — Public ไว้ทีหลัง") — public shortcode snippet deleted (386 LOC), `/stolen/verify/{sn}` permission flipped to `dinoco_sn_perm_admin`.
+    - **Q27**: Tier badge = use **existing "Card Role" system** ("มี Card Role อยู่แล้ว ไปอ่านระบบดีๆก่อน") — must explore existing implementation before reinventing.
+  - **Pending boss inputs**: F1-F5 flag flip schedule + Q12 pilot dealer names + Q15 approver delegation list + Q20 no-refund policy legal review.
+  - **v2.14 (in progress)**: Q21+Q23 cleanup landed (commit `8d97fdf`). Q22 flag-gate landed (V.0.3). Q6/Q8/Q15/Q27 = Phase replan + new work items (sequenced after Phase 1 W4 pilot).
 
 ## Reference Documentation
 

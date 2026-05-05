@@ -706,6 +706,18 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(select_block).not.toContain('api_secret_hash');
     });
 
+    test('Q22 OVERRIDE — F#15 Public API DEFERRED (flag-gated 503)', () => {
+        // Boss decision (2026-05-05): "ยังไม่มีแผนใช้ — Phase 4 W12 ตัดออกชั่วคราว"
+        const code = fs.readFileSync(path.join(REPO_ROOT, SN_SNIPPETS.public_api), 'utf8');
+        // Flag default OFF
+        expect(code).toMatch(/get_option\(\s*'dinoco_sn_pubapi_enabled'\s*,\s*'0'\s*\)/);
+        // 503 feature_disabled response when flag OFF
+        expect(code).toContain("'feature_disabled'");
+        expect(code).toMatch(/'status'\s*=>\s*503/);
+        // Q22 marker in header docblock
+        expect(code).toMatch(/Q22 OVERRIDE/);
+    });
+
     test('Phase 4 W13 F#16 forecast endpoints + cron + helper', () => {
         const code = readSnippet('rest');
         const manager = readSnippet('manager');
