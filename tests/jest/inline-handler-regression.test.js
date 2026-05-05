@@ -89,7 +89,10 @@ const SNIPPET_PREFIXES = [
 // Bumped 884→886 (2026-05-04): Phase 3 W8.2-3 added 2 onclick handlers
 // (Reconcile refresh ↻ button + per-row Recall action button). Migration
 // to data-action delegation deferred to v2.13 polish sprint.
-const BASELINE_INLINE_HANDLER_COUNT = 886;
+//
+// Bumped 886→887 (2026-05-05): Phase 3 W8.4 added per-row Reissue button
+// (M2 plate-fell-off scenario). Migration deferred per v2.13 polish.
+const BASELINE_INLINE_HANDLER_COUNT = 887;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

@@ -25,6 +25,7 @@ const SN_SNIPPETS = {
     manager: '[Admin System] DINOCO Production SN Manager',
     rest: '[System] DINOCO SN REST API',
     liff: '[System] DINOCO Warranty Activation LIFF',
+    sc_lookup: '[System] DINOCO SN Quick Lookup', // Phase 3 W8.5
 };
 
 const readSnippet = (key) => {
@@ -238,6 +239,45 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         const code = readSnippet('manager');
         expect(code).toContain('dncSnRecallPrompt');
         expect(code).toContain('⚠️ Recall');
+    });
+
+    test('Phase 3 W8.4 Reissue button + handler in admin', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('dncSnReissuePrompt');
+        expect(code).toContain('♻️ Reissue');
+        // SKU mismatch guard surfaced to user via prompt copy
+        expect(code).toContain('linked_sku');
+    });
+
+    test('Phase 3 W8.5 SC Quick Lookup snippet exists with shortcode', () => {
+        const filepath = path.join(REPO_ROOT, SN_SNIPPETS.sc_lookup);
+        expect(fs.existsSync(filepath)).toBe(true);
+        const code = fs.readFileSync(filepath, 'utf8');
+        // Shortcode registered
+        expect(code).toContain("add_shortcode( 'dinoco_sc_quick_lookup'");
+        // Permission gate (warehouse OR admin)
+        expect(code).toContain('dinoco_sn_warehouse');
+        expect(code).toContain('manage_options');
+        // Reuses existing /sn/{sn} endpoint (no new endpoint needed)
+        expect(code).toContain('/sn/');
+        // Read-only — no POST methods + no mutation endpoint fetch calls
+        expect(code).not.toMatch(/method:\s*['"]POST['"]/);
+        expect(code).not.toMatch(/fetch\([^)]*\/swap/);
+        expect(code).not.toMatch(/fetch\([^)]*\/void/);
+        expect(code).not.toMatch(/fetch\([^)]*\/recall/);
+        expect(code).not.toMatch(/fetch\([^)]*\/reissue/);
+        expect(code).not.toMatch(/fetch\([^)]*\/activate/);
+    });
+
+    test('Phase 3 W8.5 SC Quick Lookup is mobile-first', () => {
+        const filepath = path.join(REPO_ROOT, SN_SNIPPETS.sc_lookup);
+        const code = fs.readFileSync(filepath, 'utf8');
+        // Touch targets >= 48px (iOS HIG)
+        expect(code).toMatch(/min-height:\s*48px/);
+        // Responsive breakpoint
+        expect(code).toContain('@media (max-width: 480px)');
+        // Auto-uppercase + autocapitalize for S/N input
+        expect(code).toContain('autocapitalize="characters"');
     });
 
     test('LIFF activate registers POST /activate endpoint', () => {
