@@ -956,6 +956,49 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('review');
     });
 
+    test('Phase 4 W14.4 GDPR V.4.1 export extended with sn_* scope', () => {
+        const filepath = path.join(REPO_ROOT, '[System] DINOCO GDPR Data Requests');
+        expect(fs.existsSync(filepath)).toBe(true);
+        const code = fs.readFileSync(filepath, 'utf8');
+
+        // Version bump
+        expect(code).toMatch(/Version:\s*V\.4\.1/);
+
+        // 5 new record_counts keys initialized
+        expect(code).toContain("'sn_plates'");
+        expect(code).toContain("'sn_audit_events'");
+        expect(code).toContain("'sn_notifications'");
+        expect(code).toContain("'sn_review_requests'");
+        expect(code).toContain("'sn_unavailable'");
+
+        // Defensive function_exists guard
+        expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_table_exists['"]/);
+        expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_table['"]/);
+
+        // ZIP entries added
+        expect(code).toContain("'sn-plates.json'");
+        expect(code).toContain("'sn-plates-meta.json'");
+        expect(code).toContain("'sn-audit-events.json'");
+        expect(code).toContain("'sn-notifications.json'");
+        expect(code).toContain("'sn-review-requests.json'");
+
+        // Row caps for memory defense
+        expect(code).toMatch(/LIMIT 5000/);
+
+        // Cold meta chunked at 500 (SQL placeholder limit)
+        expect(code).toMatch(/array_chunk\(\s*\$sn_list,\s*500\s*\)/);
+
+        // GdprSnExportTest exists
+        const testPath = path.join(REPO_ROOT, 'tests/helpers/GdprSnExportTest.php');
+        expect(fs.existsSync(testPath)).toBe(true);
+
+        // Design doc updated
+        const designPath = path.join(REPO_ROOT, 'docs/compliance/GDPR-PHASE-6-DESIGN.md');
+        const designContent = fs.readFileSync(designPath, 'utf8');
+        expect(designContent).toContain('sn-plates.json');
+        expect(designContent).toContain('V.4.1');
+    });
+
     test('Phase 2 W5 V.0.13 audit/export CSV endpoint registered', () => {
         const restCode = readSnippet('rest');
         // Endpoint registered

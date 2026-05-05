@@ -145,16 +145,36 @@ Per PDPA §31 portability requirement → **machine-readable format** (JSON + CS
 
 ```
 gdpr-export-{user_id}-{timestamp}.zip
-├── README.txt           — explanation of contents + dates
-├── account.json         — wp_users core profile
-├── usermeta.json        — wp_usermeta filtered to PII keys (whitelist)
-├── warranties.csv       — registered products
+├── README.txt                  — explanation of contents + dates
+├── account.json                — wp_users core profile
+├── usermeta.json               — wp_usermeta filtered to PII keys (whitelist)
+├── warranties.csv              — registered products
 ├── claims/
-│   ├── claim-{id}.json  — per-claim metadata
-│   └── photos/          — claim attachments (if user uploaded)
-├── orders.csv           — B2B order history (for distributors)
-└── line-messages.json   — chat history from MongoDB (optional, V.6.1+)
+│   ├── claim-{id}.json         — per-claim metadata
+│   └── photos/                 — claim attachments (if user uploaded)
+├── orders.csv                  — B2B order history (for distributors)
+├── line-messages.json          — chat history from MongoDB (V.4.0+)
+├── line-claims.json            — chatbot-mediated claims (V.4.0+)
+├── line-leads.json             — chatbot lead pipeline entries (V.4.0+)
+├── line-messages-UNAVAILABLE.txt — placeholder if agent unreachable
+├── sn-plates.json              — wp_dinoco_sn_pool registered_user_id=user (V.4.1+)
+├── sn-plates-meta.json         — wp_dinoco_sn_pool_meta cold-path join (V.4.1+)
+├── sn-audit-events.json        — wp_dinoco_sn_audit actor or approver (V.4.1+, 5K cap)
+├── sn-notifications.json       — wp_dinoco_sn_notifications push history (V.4.1+, 5K cap)
+└── sn-review-requests.json     — wp_dinoco_sn_review_requests F#10 (V.4.1+, 5K cap)
 ```
+
+**V.4.1 (2026-05-05) — Production S/N Management scope** (Plan v2.13 §H Phase 4 W14.4):
+S/N data integrated into ZIP export per PDPA §30 right-of-access. All entries
+best-effort: `function_exists()` guard + `try/catch` graceful skip when SN
+system not installed → `record_counts.sn_unavailable=true`. Row caps (5,000)
+prevent runaway memory blow-up; sn_pool itself uncapped (one user rarely owns
+> 5K plates; if so, that's a forensic signal worth surfacing).
+
+PII column whitelist for `sn_plates.json` selects only structural columns
+(sn / status / linked_sku / registered_at / batch_id / prev_status /
+lock_version) — explicitly excludes `registered_user_id` (filter param,
+redundant) and `claim_id` (cross-system reference, separate scope).
 
 **Privacy hardening**:
 - Export URL: `/wp-content/uploads/gdpr/{user_id}/{token}.zip` with `.htaccess` deny + signed URL via `dinoco_gdpr_signed_url($token, expires=86400)`

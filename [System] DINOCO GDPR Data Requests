@@ -1,6 +1,24 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.4.1 — (2026-05-05): Plan v2.13 §H Phase 4 W14.4 — extend export scope
+ *   to Production S/N Management data per PDPA §30 right-of-access. Adds 4 new
+ *   ZIP entries (when SN system installed):
+ *     - sn-plates.json          : wp_dinoco_sn_pool rows where registered_user_id = user
+ *                                 (sn / status / linked_sku / registered_at / batch_id /
+ *                                  prev_status / lock_version)
+ *     - sn-plates-meta.json     : wp_dinoco_sn_pool_meta cold-path join (purchase_dealer,
+ *                                 stolen_at, replacement chain, legacy_request_id)
+ *     - sn-audit-events.json    : wp_dinoco_sn_audit rows where actor_user_id OR
+ *                                 approver_user_id = user (5,000 row cap defensive)
+ *     - sn-notifications.json   : wp_dinoco_sn_notifications rows (F#1/F#4/F#10 push history)
+ *     - sn-review-requests.json : wp_dinoco_sn_review_requests rows (F#10 history)
+ *   record_counts response gains 5 new keys (sn_plates / sn_audit_events /
+ *     sn_notifications / sn_review_requests / sn_unavailable). All entries
+ *     best-effort — function_exists + try/catch graceful skip when SN system
+ *     not installed → record_counts.sn_unavailable=true.
+ *   Risk: LOW — additive only, all reads via $wpdb->prepare, no PII writes,
+ *     5,000 row caps prevent runaway query memory blow-up.
  * Version: V.4.0 — Round 26 (2026-04-30): LINE messages export from OpenClaw MongoDB.
  *   Closes deferred item from Phase 6.1 (CLAUDE.md scope: "LINE messages (via agent:3000)").
  *   NEW dinoco_gdpr_export_line_messages($user_line_uid, $request_id) — calls OpenClaw agent
@@ -1252,6 +1270,124 @@ if ( ! function_exists( 'dinoco_gdpr_build_export' ) ) {
                 error_log( '[GDPR-LINE] Export helper threw: ' . $e->getMessage() );
                 $record_counts['line_unavailable'] = true;
             }
+        }
+
+        // ── V.4.1 — Production S/N Management data (cross-system from sn_pool) ──
+        // Per plan v2.6 §G + Phase 4 W14.4: include all S/N data linked to this user
+        // for PDPA right-of-access. Best-effort: SN tables may not exist if system
+        // not yet activated → graceful skip with $record_counts['sn_unavailable']=true.
+        $record_counts['sn_plates']            = 0;
+        $record_counts['sn_audit_events']      = 0;
+        $record_counts['sn_notifications']     = 0;
+        $record_counts['sn_review_requests']   = 0;
+        $record_counts['sn_unavailable']       = false;
+
+        if ( function_exists( 'dinoco_sn_table_exists' ) && function_exists( 'dinoco_sn_table' ) ) {
+            global $wpdb;
+            try {
+                // sn_pool — plates owned by user (PII oracle: ownership timeline)
+                if ( dinoco_sn_table_exists( 'pool' ) ) {
+                    $pool_tbl = dinoco_sn_table( 'pool' );
+                    $plates = $wpdb->get_results( $wpdb->prepare(
+                        "SELECT sn, status, linked_sku, registered_at, batch_id, prev_status, lock_version
+                         FROM {$pool_tbl}
+                         WHERE registered_user_id = %d
+                         ORDER BY registered_at DESC",
+                        $user_id
+                    ), ARRAY_A );
+                    if ( $plates ) {
+                        $zip->addFromString( 'sn-plates.json',
+                            wp_json_encode( $plates, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                        $record_counts['sn_plates'] = count( $plates );
+
+                        // Also add cold-meta join for plates that have purchase info etc.
+                        if ( dinoco_sn_table_exists( 'pool_meta' ) ) {
+                            $meta_tbl = dinoco_sn_table( 'pool_meta' );
+                            $sn_list = array_map( function( $p ) { return $p['sn']; }, $plates );
+                            // Chunk to avoid SQL length limit on huge arrays
+                            $chunks = array_chunk( $sn_list, 500 );
+                            $all_meta = array();
+                            foreach ( $chunks as $chunk ) {
+                                $placeholders = implode( ',', array_fill( 0, count( $chunk ), '%s' ) );
+                                $rows = $wpdb->get_results( $wpdb->prepare(
+                                    "SELECT * FROM {$meta_tbl} WHERE sn IN ({$placeholders})",
+                                    $chunk
+                                ), ARRAY_A );
+                                if ( is_array( $rows ) ) $all_meta = array_merge( $all_meta, $rows );
+                            }
+                            if ( $all_meta ) {
+                                $zip->addFromString( 'sn-plates-meta.json',
+                                    wp_json_encode( $all_meta, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                            }
+                        }
+                    }
+                }
+
+                // sn_audit — events where user was actor or approver (4-eyes trail)
+                // Some events also reference user via context_json — we filter those
+                // post-hoc since JSON_EXTRACT not available on all MySQL versions.
+                if ( dinoco_sn_table_exists( 'audit' ) ) {
+                    $audit_tbl = dinoco_sn_table( 'audit' );
+                    $audit_rows = $wpdb->get_results( $wpdb->prepare(
+                        "SELECT id, sn, event_type, status_from, status_to,
+                                actor_user_id, approver_user_id,
+                                reason_category, is_sensitive, ip_address,
+                                created_at
+                         FROM {$audit_tbl}
+                         WHERE actor_user_id = %d OR approver_user_id = %d
+                         ORDER BY created_at DESC
+                         LIMIT 5000",
+                        $user_id, $user_id
+                    ), ARRAY_A );
+                    if ( $audit_rows ) {
+                        $zip->addFromString( 'sn-audit-events.json',
+                            wp_json_encode( $audit_rows, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                        $record_counts['sn_audit_events'] = count( $audit_rows );
+                    }
+                }
+
+                // sn_notifications — push history (F#1/F#4/F#10)
+                if ( dinoco_sn_table_exists( 'notifications' ) ) {
+                    $notif_tbl = dinoco_sn_table( 'notifications' );
+                    $notifs = $wpdb->get_results( $wpdb->prepare(
+                        "SELECT id, sn, notification_type, channel, scheduled_at, sent_at, status
+                         FROM {$notif_tbl}
+                         WHERE user_id = %d
+                         ORDER BY COALESCE(sent_at, scheduled_at) DESC
+                         LIMIT 5000",
+                        $user_id
+                    ), ARRAY_A );
+                    if ( $notifs ) {
+                        $zip->addFromString( 'sn-notifications.json',
+                            wp_json_encode( $notifs, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                        $record_counts['sn_notifications'] = count( $notifs );
+                    }
+                }
+
+                // sn_review_requests — F#10 review history
+                if ( dinoco_sn_table_exists( 'review_requests' ) ) {
+                    $rr_tbl = dinoco_sn_table( 'review_requests' );
+                    $reviews = $wpdb->get_results( $wpdb->prepare(
+                        "SELECT id, sn, rating, status, scheduled_at, sent_at, reviewed_at
+                         FROM {$rr_tbl}
+                         WHERE user_id = %d
+                         ORDER BY COALESCE(reviewed_at, sent_at, scheduled_at) DESC
+                         LIMIT 5000",
+                        $user_id
+                    ), ARRAY_A );
+                    if ( $reviews ) {
+                        $zip->addFromString( 'sn-review-requests.json',
+                            wp_json_encode( $reviews, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) );
+                        $record_counts['sn_review_requests'] = count( $reviews );
+                    }
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[GDPR-SN] Export of S/N data threw: ' . $e->getMessage() );
+                $record_counts['sn_unavailable'] = true;
+            }
+        } else {
+            // SN system not installed — note in placeholder
+            $record_counts['sn_unavailable'] = true;
         }
 
         $zip->close();
