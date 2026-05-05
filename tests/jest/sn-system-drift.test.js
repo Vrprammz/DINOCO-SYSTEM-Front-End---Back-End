@@ -956,6 +956,37 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('review');
     });
 
+    test('Phase 3 W8.6 Gap C Photo OCR validation chain endpoint', () => {
+        const rest = readSnippet('rest');
+        // REST endpoint registered
+        expect(rest).toContain("'/photo-ocr/validate'");
+        expect(rest).toContain('function dinoco_sn_rest_photo_ocr_validate');
+        expect(rest).toContain('function dinoco_sn_photo_ocr_decide');
+
+        // Decision matrix — 7 codes per chatbot-rules.md §15.8
+        const decide = rest.split('function dinoco_sn_photo_ocr_decide')[1] || '';
+        const block = decide.split('function dinoco_sn_rest_photo_ocr_validate')[0];
+        const codes = ['proceed', 'not_yet_active', 'block_voided', 'block_recalled',
+                       'block_stolen', 'block_other_owner', 'not_found'];
+        codes.forEach(code => {
+            expect(block).toContain(`'decision_code' => '${code}'`);
+        });
+
+        // REG-082 anti social-engineering: stolen reply NEVER says "ถูกแจ้งหาย"
+        const stolenBranch = block.split("'block_stolen'")[1] || '';
+        const stolenSection = stolenBranch.split('}')[0];
+        expect(stolenSection).not.toMatch(/ถูกแจ้งหาย/);
+
+        // Stolen check BEFORE registered routing (REG-082 precedence)
+        const stolenCheckPos = block.indexOf("'block_stolen'");
+        const registeredCheckPos = block.indexOf("'proceed'");
+        expect(stolenCheckPos).toBeLessThan(registeredCheckPos);
+
+        // PHPUnit test exists
+        const testPath = path.join(REPO_ROOT, 'tests/helpers/SnPhotoOcrDecideTest.php');
+        expect(fs.existsSync(testPath)).toBe(true);
+    });
+
     test('Phase 3 W8 Gap D orphan-claim scan cron + REST endpoints', () => {
         // Production SN Manager has scan helper + cron registered
         const mgr = readSnippet('manager');

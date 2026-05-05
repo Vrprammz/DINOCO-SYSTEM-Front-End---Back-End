@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.15 (2026-05-05) — Phase 3 W8.6 Gap C Photo OCR validation chain endpoint║
  * ║  Version: V.0.14 (2026-05-05) — Phase 3 W8 Gap D orphan-alerts endpoints (GET + dismiss)║
  * ║  Version: V.0.13 (2026-05-05) — Phase 2 W5 audit/export CSV streaming endpoint║
  * ║  Version: V.0.12 (2026-05-05) — Phase 3 W10 F#9 LTV detail expansion (claims/reviews/cross-sell)║
@@ -540,6 +541,26 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 'actor_id'   => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
                 'days'       => array( 'type' => 'integer', 'default' => 30, 'sanitize_callback' => 'absint' ),
                 'limit'      => array( 'type' => 'integer', 'default' => 5000, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // POST /photo-ocr/validate — Phase 3 W8.6 / V.0.15 (Gap C)
+        // Photo OCR validation chain for chatbot Photo claim flow.
+        // Caller (OpenClaw claim-flow.js) extracts S/N from photo via Gemini Vision
+        // → POSTs here for canonical sn_pool lookup + decision routing.
+        // PII-safe: returns ONLY decision_code + status — no owner identity leak.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/photo-ocr/validate', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_photo_ocr_validate',
+            'permission_callback' => 'dinoco_sn_perm_admin',  // chatbot uses admin token
+            'args'                => array(
+                'sn'        => array( 'required' => true, 'type' => 'string',
+                                      'sanitize_callback' => function( $v ) {
+                                          // Normalize: uppercase + strip whitespace + dashes
+                                          return strtoupper( preg_replace( '/[\s\-]+/', '', (string) $v ) );
+                                      } ),
+                'line_uid'  => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'caller'    => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
             ),
         ) );
 
@@ -2288,6 +2309,189 @@ if ( ! function_exists( 'dinoco_sn_rest_audit_export' ) ) {
         $resp->header( 'X-Audit-Row-Count', (string) count( $rows ?: array() ) );
 
         return $resp;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_photo_ocr_decide' ) ) {
+    /**
+     * Pure-logic decision matrix for photo OCR validation.
+     * Mirrors chatbot-rules.md §15.8 Photo OCR Validation Chain.
+     *
+     * @param array|null $plate    sn_pool row (null if S/N not found)
+     * @param string     $line_uid LINE UID of caller (or empty if not provided)
+     * @return array {
+     *   decision_code: string  — proceed / not_yet_active / block_voided /
+     *                            block_recalled / block_stolen /
+     *                            block_other_owner / not_found
+     *   status:        string  — sn_pool.status echoed (or 'unknown')
+     *   message_thai:  string  — chatbot-safe Thai message (no PII oracle leak)
+     *   action_hint:   string  — suggested chatbot next step
+     *   escalate:      bool    — true → Telegram บอส (M14 stolen / fake)
+     * }
+     */
+    function dinoco_sn_photo_ocr_decide( $plate, $line_uid = '' ) {
+        // S/N not in system — possible counterfeit (REG-084)
+        if ( ! $plate || empty( $plate['sn'] ) ) {
+            return array(
+                'decision_code' => 'not_found',
+                'status'        => 'unknown',
+                'message_thai'  => 'S/N นี้ไม่ตรงกับฐานข้อมูล DINOCO',
+                'action_hint'   => 'log_and_escalate',
+                'escalate'      => true,
+            );
+        }
+
+        $status = (string) ( $plate['status'] ?? 'unknown' );
+
+        // Voided / recalled / stolen — block + escalate, NEVER reveal reason
+        if ( in_array( $status, array( 'voided' ), true ) ) {
+            return array(
+                'decision_code' => 'block_voided',
+                'status'        => $status,
+                'message_thai'  => 'เพลทนี้ถูกยกเลิกในระบบ — กรุณาติดต่อทีมงาน DINOCO',
+                'action_hint'   => 'show_support_contact',
+                'escalate'      => true,
+            );
+        }
+        if ( in_array( $status, array( 'recalled' ), true ) ) {
+            return array(
+                'decision_code' => 'block_recalled',
+                'status'        => $status,
+                'message_thai'  => 'เพลทนี้อยู่ในรอบ recall — กรุณาติดต่อร้านที่ซื้อเพื่อตรวจสอบ',
+                'action_hint'   => 'show_support_contact',
+                'escalate'      => true,
+            );
+        }
+        // Stolen reported (sn_pool.status='registered' + sn_pool_meta.stolen_at IS NOT NULL)
+        // is checked here only when caller passes plate with 'is_stolen' flag set.
+        if ( ! empty( $plate['is_stolen'] ) ) {
+            // REG-082: NEVER use the word "ถูกแจ้งหาย" in customer-facing reply
+            return array(
+                'decision_code' => 'block_stolen',
+                'status'        => $status,
+                'message_thai'  => 'เพลทนี้มีรายงานในระบบ — โปรดติดต่อ DINOCO Support 02-XXX-XXXX',
+                'action_hint'   => 'show_support_contact',
+                'escalate'      => true,
+            );
+        }
+
+        // Pre-activate states — customer hasn't registered yet
+        if ( in_array( $status, array( 'reserved', 'in_pool', 'reserved_for_legacy', 'shipped_legacy' ), true ) ) {
+            return array(
+                'decision_code' => 'not_yet_active',
+                'status'        => $status,
+                'message_thai'  => 'ยังไม่ activate — กรุณาลงทะเบียนสินค้าก่อนเปิดเคลม',
+                'action_hint'   => 'show_activation_link',
+                'escalate'      => false,
+            );
+        }
+
+        // Registered — owner check
+        if ( in_array( $status, array( 'registered', 'claimed' ), true ) ) {
+            // Owner check is best-effort — if line_uid not provided or no
+            // user_id stored on plate, skip cross-check + assume valid.
+            $plate_owner_user_id = (int) ( $plate['registered_user_id'] ?? 0 );
+            $line_uid = trim( (string) $line_uid );
+
+            if ( $plate_owner_user_id > 0 && $line_uid !== '' ) {
+                // Resolve LINE UID → WP user_id (caller's user)
+                $caller_uid = 0;
+                if ( function_exists( 'get_users' ) ) {
+                    $matched = get_users( array(
+                        'meta_key'   => 'dinoco_line_uid',
+                        'meta_value' => $line_uid,
+                        'fields'     => array( 'ID' ),
+                        'number'     => 1,
+                    ) );
+                    if ( ! empty( $matched ) ) {
+                        $caller_uid = (int) $matched[0]->ID;
+                    }
+                }
+
+                if ( $caller_uid > 0 && $caller_uid !== $plate_owner_user_id ) {
+                    // Different LINE UID claims this plate — possible stolen/transferred
+                    return array(
+                        'decision_code' => 'block_other_owner',
+                        'status'        => $status,
+                        'message_thai'  => 'เพลทนี้ลงทะเบียนกับเจ้าของอื่น — กรุณาติดต่อเรา ทีมงานจะตรวจสอบ',
+                        'action_hint'   => 'open_investigation_ticket',
+                        'escalate'      => true,
+                    );
+                }
+            }
+
+            return array(
+                'decision_code' => 'proceed',
+                'status'        => $status,
+                'message_thai'  => 'ตรวจสอบ S/N เรียบร้อย — เริ่มเปิดเคลมได้',
+                'action_hint'   => 'continue_claim_flow',
+                'escalate'      => false,
+            );
+        }
+
+        // Replaced / transferred / cancelled_batch — non-actionable
+        return array(
+            'decision_code' => 'not_yet_active',
+            'status'        => $status,
+            'message_thai'  => 'สถานะเพลทไม่พร้อมรับเคลม — กรุณาติดต่อทีมงาน',
+            'action_hint'   => 'show_support_contact',
+            'escalate'      => false,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_photo_ocr_validate' ) ) {
+    /**
+     * POST /photo-ocr/validate — Phase 3 W8.6 / V.0.15 (Gap C)
+     *
+     * Photo OCR validation chain endpoint. Caller (OpenClaw claim-flow.js)
+     * extracts S/N from customer photo, normalizes via §15.1 regex, POSTs
+     * here. Server performs sn_pool lookup + decision matrix per §15.8.
+     *
+     * Response is PII-safe: returns decision_code + status + message_thai +
+     * action_hint + escalate flag. NEVER returns owner identity even if
+     * mismatch detected (caller gets generic 'block_other_owner' code only).
+     */
+    function dinoco_sn_rest_photo_ocr_validate( $req ) {
+        $sn = (string) $req->get_param( 'sn' );
+        $line_uid = (string) $req->get_param( 'line_uid' );
+
+        // Format pre-check (chatbot-rules.md §15.1)
+        if ( ! preg_match( '/^[A-Z0-9]{4,40}$/', $sn ) ) {
+            return rest_ensure_response( array(
+                'decision_code' => 'not_found',
+                'status'        => 'unknown',
+                'message_thai'  => 'รูปแบบ S/N ไม่ถูกต้อง — ตัวอย่าง: DNCSS0001234',
+                'action_hint'   => 'request_retype',
+                'escalate'      => false,
+            ) );
+        }
+
+        $plate_data = null;
+        if ( function_exists( 'dinoco_sn_get_plate_data' ) ) {
+            $row = dinoco_sn_get_plate_data( $sn );
+            if ( $row ) {
+                // Convert object → array for decision helper
+                $plate_data = (array) $row;
+
+                // Optional: enrich with stolen flag from pool_meta if available
+                if ( function_exists( 'dinoco_sn_get_plate_meta' ) ) {
+                    $meta = dinoco_sn_get_plate_meta( $sn );
+                    if ( $meta && ! empty( $meta->stolen_at ) ) {
+                        $plate_data['is_stolen'] = true;
+                    }
+                }
+            }
+        }
+
+        $decision = dinoco_sn_photo_ocr_decide( $plate_data, $line_uid );
+
+        // Audit hook for forensics — fire even on failures
+        if ( function_exists( 'do_action' ) ) {
+            do_action( 'dinoco_sn_photo_ocr_validated', $sn, $decision, $line_uid );
+        }
+
+        return rest_ensure_response( $decision );
     }
 }
 
