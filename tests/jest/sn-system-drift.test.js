@@ -26,8 +26,10 @@ const SN_SNIPPETS = {
     rest: '[System] DINOCO SN REST API',
     liff: '[System] DINOCO Warranty Activation LIFF',
     sc_lookup: '[System] DINOCO SN Quick Lookup',  // Phase 3 W8.5
-    public_api: '[Admin System] DINOCO Public API Gateway',  // Phase 4 W12 F#15
-    stolen_check: '[System] DINOCO Stolen Plate Public Verify',  // Phase 3 W11 F#14
+    public_api: '[Admin System] DINOCO Public API Gateway',  // Phase 4 W12 F#15 (deferred Q22)
+    // stolen_check REMOVED Q23 (2026-05-05) — boss "Admin เท่านั้นก่อน"
+    //   snippet [System] DINOCO Stolen Plate Public Verify deleted
+    //   endpoint /stolen/verify/{sn} flipped to perm_admin (was perm_public)
 };
 
 const readSnippet = (key) => {
@@ -420,46 +422,51 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toContain("'methods'             => 'POST'");
     });
 
-    test('9 admin tabs declared (Phase 3 W11 added fraud/geo/stolen)', () => {
+    test('8 admin tabs declared (Phase 3 W11 — fraud REMOVED Q21, geo/stolen kept)', () => {
         const code = readSnippet('manager');
+        // Q21 (2026-05-05): 'fraud' tab REMOVED — boss "ตัดระบบของปลอมออกไปเลย"
         const expected_tabs = ['batches', 'receive', 'pool', 'manage', 'audit', 'ltv',
-                                'fraud', 'geo', 'stolen'];
+                                'geo', 'stolen'];
         expected_tabs.forEach(tab => {
             const navPattern = new RegExp(`data-tab="${tab}"`);
             expect(code).toMatch(navPattern);
             const panelPattern = new RegExp(`data-tab-panel="${tab}"`);
             expect(code).toMatch(panelPattern);
         });
+        // Q21 OVERRIDE: fraud nav-item must NOT have data-tab
+        expect(code).not.toMatch(/data-tab="fraud"/);
     });
 
-    test('Phase 3 W11 admin tab render functions + lazy load wiring', () => {
+    test('Phase 3 W11 admin tab render functions + lazy load wiring (geo/stolen — fraud REMOVED Q21)', () => {
         const code = readSnippet('manager');
-        ['fraud', 'geo', 'stolen'].forEach(tab => {
+        // Q21 (2026-05-05): fraud render function REMOVED — replaced with stub
+        ['geo', 'stolen'].forEach(tab => {
             expect(code).toContain(`dinoco_sn_render_tab_${tab}`);
             // Lazy-load flag prevents double-fetch on re-activation
             expect(code).toContain(`_dncSn${tab.charAt(0).toUpperCase() + tab.slice(1)}Loaded`);
         });
-        // Module Registry includes all 3 new subtabs
-        ['fraud', 'geo', 'stolen'].forEach(tab => {
+        // Module Registry includes geo + stolen subtabs (fraud removed)
+        ['geo', 'stolen'].forEach(tab => {
             expect(code).toMatch(new RegExp(`'${tab}'\\s*=>`));
         });
     });
 
-    test('Phase 3 W11 fraud/stolen JS handlers wired', () => {
+    test('Phase 3 W11 geo/stolen JS handlers wired (fraud handlers REMOVED Q21)', () => {
         const code = readSnippet('manager');
-        // Fraud Queue actions
-        expect(code).toContain('dncSnLoadFraud');
-        expect(code).toContain('dncSnLoadFraudStats');
-        expect(code).toContain('dncSnFraudDecision');
-        // Geo handlers
+        // Q21 (2026-05-05): Fraud Queue handlers REMOVED — boss "ตัดระบบของปลอมออกไปเลย"
+        expect(code).not.toContain('dncSnLoadFraud');
+        expect(code).not.toContain('dncSnLoadFraudStats');
+        expect(code).not.toContain('dncSnFraudDecision');
+        // Geo handlers — kept
         expect(code).toContain('dncSnLoadGeoHeatmap');
         expect(code).toContain('dncSnLoadGrayMarket');
-        // Stolen handlers
+        // Stolen handlers — kept (Q23 admin-only)
         expect(code).toContain('dncSnLoadStolen');
         expect(code).toContain('dncSnStolenDecision');
-        // Idempotency-Key pattern on decision posts
-        expect(code).toMatch(/X-Idempotency-Key.*?fraud-/);
+        // Idempotency-Key pattern on stolen decision posts
         expect(code).toMatch(/X-Idempotency-Key.*?stolen-/);
+        // No fraud-* idempotency keys
+        expect(code).not.toMatch(/X-Idempotency-Key.*?fraud-/);
     });
 
     test('Phase 3 W10 F#9 LTV endpoints + tier helper + cron', () => {
@@ -599,51 +606,42 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(cron).toMatch(/is_in_dealer_territory\s*=\s*0/);
     });
 
-    test('Phase 3 W11 F#12 Anti-Fraud 6-factor scoring engine', () => {
-        const code = readSnippet('manager');
-        // Pure helper exists
-        expect(code).toContain('dinoco_sn_compute_fraud_score');
-        expect(code).toContain('dinoco_sn_record_fraud_score');
-        // 6 factors with documented weights summing to 100
-        ['velocity', 'geographic', 'phone_pattern', 'time_pattern', 'sequential', 'receipt']
-            .forEach(factor => expect(code).toContain(`'${factor}'`));
-        // Configurable thresholds via wp_options
-        expect(code).toContain('dinoco_sn_fraud_block_threshold');
-        expect(code).toContain('dinoco_sn_fraud_monitor_threshold');
-        // Tier classification
-        ['safe', 'monitor', 'block'].forEach(tier => expect(code).toContain(`'${tier}'`));
-    });
-
-    test('Phase 3 W11 F#12 fraud REST endpoints + cron + decision audit', () => {
+    test('Q21 OVERRIDE — F#12 Anti-Fraud Engine REMOVED (no live routes)', () => {
+        // Boss decision (2026-05-05): "ตัดระบบของปลอมออกไปเลย เยอะเกิน ไม่ใช้แล้ว"
+        // Verify F#12 surface is fully unreachable:
         const code = readSnippet('rest');
         const manager = readSnippet('manager');
-        // 3 endpoints
-        expect(code).toContain("'/fraud/queue'");
-        expect(code).toContain("'/fraud/stats'");
-        expect(code).toContain("'/fraud/(?P<id>\\d+)/decision'");
-        // Handlers
-        expect(code).toContain('dinoco_sn_rest_fraud_queue');
-        expect(code).toContain('dinoco_sn_rest_fraud_stats');
-        expect(code).toContain('dinoco_sn_rest_fraud_decision');
-        // Hourly aggregate cron
-        expect(manager).toContain('dinoco_sn_fraud_aggregate_cron');
-        expect(manager).toContain('dinoco_sn_run_fraud_aggregate');
-        // Decisions whitelist
-        const decision = code.split('function dinoco_sn_rest_fraud_decision')[1] || '';
-        ['legit', 'fraud', 'suspicious'].forEach(d => expect(decision).toContain(`'${d}'`));
-        // Sensitive audit (5y retention)
-        expect(decision).toContain('dinoco_sn_audit_log');
+
+        // No active register_rest_route for fraud endpoints
+        expect(code).not.toMatch(/register_rest_route\([^)]*\/fraud\/queue/);
+        expect(code).not.toMatch(/register_rest_route\([^)]*\/fraud\/stats/);
+        expect(code).not.toMatch(/register_rest_route\([^)]*\/fraud\/\(\?P<id>/);
+
+        // No fraud_scores schema entry in DINOCO_SN_TABLES
+        expect(manager).not.toMatch(/'fraud_scores'\s*=>\s*'dinoco_sn_fraud_scores'/);
+
+        // No fraud cron registration
+        expect(manager).not.toMatch(/dinoco_register_cron\(\s*'dinoco_sn_fraud_aggregate_cron'/);
+
+        // Section heading documents removal
+        expect(code).toMatch(/F#12 ANTI-FRAUD.*REMOVED/i);
     });
 
-    test('Phase 3 W11 F#12 fraud queue filters unreviewed only', () => {
+    test('Q23 OVERRIDE — public stolen verify shortcode REMOVED + endpoint admin-only', () => {
+        // Boss decision (2026-05-05): "Admin เท่านั้นก่อน"
+        // 1. Snippet file deleted
+        const filepath = path.join(REPO_ROOT, '[System] DINOCO Stolen Plate Public Verify');
+        expect(fs.existsSync(filepath)).toBe(false);
+
+        // 2. Endpoint flipped from perm_public → perm_admin
         const code = readSnippet('rest');
-        const handler = code.split('function dinoco_sn_rest_fraud_queue')[1] || '';
-        // Queue should only show pending review (outcome IS NULL)
-        expect(handler).toMatch(/outcome\s+IS\s+NULL/);
-        // Min score threshold filter
-        expect(handler).toContain('min_score');
-        // Returns factors decoded + tier classification per row
-        expect(handler).toContain('factors_json');
+        const block = code.split("'/stolen/verify/")[1] || '';
+        const verifyBlock = block.split('register_rest_route')[0];
+        expect(verifyBlock).toContain("'dinoco_sn_perm_admin'");
+        expect(verifyBlock).not.toContain("'dinoco_sn_perm_public'");
+
+        // 3. Q23 marker comment present
+        expect(code).toMatch(/Q23 OVERRIDE/);
     });
 
     test('Phase 4 W12 F#15 Public API Gateway snippet exists', () => {
@@ -749,7 +747,7 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(helper).toMatch(/max\(\s*0\s*,\s*\(int\)\s*round\s*\(\s*\$predicted_base/);
     });
 
-    test('15 schema tables defined in Production S/N Manager', () => {
+    test('14 schema tables defined in Production S/N Manager (fraud_scores REMOVED Q21)', () => {
         const code = readSnippet('manager');
         const expected_tables = [
             'dinoco_sn_batches',
@@ -760,7 +758,7 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             'dinoco_sn_promo_codes',
             'dinoco_sn_customer_ltv_snapshot',
             'dinoco_sn_review_requests',
-            'dinoco_sn_fraud_scores',
+            // 'dinoco_sn_fraud_scores' — REMOVED Q21 (2026-05-05) boss "ตัดระบบของปลอมออกไปเลย"
             'dinoco_sn_geo_activations',
             'dinoco_sn_stolen_log',
             'dinoco_sn_api_tokens',
@@ -771,6 +769,8 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expected_tables.forEach(table => {
             expect(code).toContain(table);
         });
+        // Q21 OVERRIDE: fraud_scores must NOT be in DINOCO_SN_TABLES map
+        expect(code).not.toMatch(/'fraud_scores'\s*=>\s*'dinoco_sn_fraud_scores'/);
     });
 
     test('Module Registry self-registration present', () => {
@@ -1223,27 +1223,9 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('test_full_round_trip_partner_signs');
     });
 
-    test('Phase 3 W11 F#14 stolen_check public shortcode registered', () => {
-        const code = readSnippet('stolen_check');
-        // Shortcode + render fn
-        expect(code).toMatch(/add_shortcode\(\s*['"]dinoco_stolen_check['"]/);
-        expect(code).toContain('function dinoco_sn_stolen_check_render');
-        // Wires to existing REST endpoint /stolen/verify/
-        expect(code).toContain("'dinoco-sn/v1/stolen/verify/'");
-        // Privacy guards: no PII rendering, REG-082 wording
-        expect(code).toContain('มีรายงานในระบบ');
-        // Banned phrase must not appear in user-facing markup (textContent / output).
-        // Strip comment block before checking — banned word is mentioned IN the
-        // comment as the rule explanation, which is correct.
-        const codeWithoutComments = code.replace(/\/\*[\s\S]*?\*\//g, '');
-        expect(codeWithoutComments).not.toMatch(/ถูกแจ้งหาย/);
-        // Self-contained — no enqueue calls (inline CSS+JS)
-        expect(code).not.toMatch(/wp_enqueue_(script|style)/);
-        // Rate-limit awareness in JS
-        expect(code).toContain('rate_limit');
-        // Mobile-first touch targets ≥48px
-        expect(code).toMatch(/min-height:\s*48px/);
-    });
+    /* Q23 OVERRIDE (2026-05-05): public stolen_check shortcode REMOVED.
+     * Test moved to Q23 override block above (line ~604). Snippet file
+     * `[System] DINOCO Stolen Plate Public Verify` deleted from repo. */
 
     test('Phase 0 W1 docs deliverables exist', () => {
         const docs = [

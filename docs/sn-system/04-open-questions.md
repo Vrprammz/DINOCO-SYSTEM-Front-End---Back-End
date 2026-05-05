@@ -9,21 +9,21 @@
 
 ### Architecture Decisions
 
-#### Q1: S/N Format ที่ใช้ส่งโรงงาน
+#### Q1: S/N Format ที่ใช้ส่งโรงงาน = A
 - (A) `DNCSS0000001` (PREFIX + 7-digit) — ตามที่บอสยกตัวอย่าง — **recommended**
 - (B) `DNCSS-2505-00001` (PREFIX-YYMM-5digit) — มี date traceability
 - (C) Custom format อื่น
 
-#### Q2: ใครติดเพลทกับสินค้า (B2F plate origin)
+#### Q2: ใครติดเพลทกับสินค้า (B2F plate origin) = B
 - (A) **โรงงานจีนติดให้ก่อนส่ง** — ส่งเพลทไปจีน + โรงงานติด + ส่งกลับ
 - (B) **DINOCO warehouse ติดเอง** — โรงงานส่งสินค้าเปล่า + คลังติดเองตอนแพ็ค — **recommended (consistent กับ v2.2)**
 
-#### Q3: First-time registration flow (Gateway)
+#### Q3: First-time registration flow (Gateway) = B
 - (A) Deprecate `[dinoco_gateway]` form — บังคับ scan QR เท่านั้น
 - (B) **Unified Gateway** — primary scan QR + secondary type S/N + tertiary no-plate — **recommended**
 - (C) Auto-detect ตาม SKU (มี plate → required scan)
 
-#### Q4: Schema split table (sn_pool 23 cols)
+#### Q4: Schema split table (sn_pool 23 cols) = A
 - (A) **Split 2 tables** (hot path 12 + cold meta 7) — **recommended** (50% query speedup)
 - (B) Stay wide (1 table 23 cols)
 
