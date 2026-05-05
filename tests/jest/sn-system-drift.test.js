@@ -304,6 +304,30 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/notification_type\s*=\s*%s[\s\S]*?user_id\s*=\s*%d[\s\S]*?sn\s*=\s*%s/);
     });
 
+    test('Phase 3 W9 F#4 Anniversary cron + types 1y..5y', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('dinoco_sn_anniversary_schedule_cron');
+        expect(code).toContain('dinoco_sn_run_anniversary_schedule');
+        expect(code).toContain('dinoco_cron_sn_anniversary_schedule_last_run');
+        // Notification type prefix
+        expect(code).toContain("'anniversary_'");
+        // Loop bounds 1..5 years
+        expect(code).toMatch(/\$years\s*=\s*1;\s*\$years\s*<=\s*5/);
+    });
+
+    test('Phase 3 W9 F#10 Review Request cron + claim guard', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('dinoco_sn_review_request_cron');
+        expect(code).toContain('dinoco_sn_run_review_request_schedule');
+        expect(code).toContain('dinoco_cron_sn_review_request_last_run');
+        expect(code).toContain('review_request');
+        // Skip-if-claim guard via claim_ticket CPT
+        expect(code).toContain('claim_ticket');
+        expect(code).toContain('ticket_status');
+        // Should reference closed_statuses (don't pester completed claims)
+        expect(code).toMatch(/'completed'[\s,]*'closed'[\s,]*'rejected'[\s,]*'cancelled'/);
+    });
+
     test('Phase 3 W8.5 SC Quick Lookup is mobile-first', () => {
         const filepath = path.join(REPO_ROOT, SN_SNIPPETS.sc_lookup);
         const code = fs.readFileSync(filepath, 'utf8');

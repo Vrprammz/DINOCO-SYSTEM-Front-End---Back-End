@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.10 (2026-05-05) — Phase 3 W9 F#4 Anniversary + F#10 Review crons║
  * ║  Version: V.0.9 (2026-05-05) — Phase 3 W9 F#1 Expiry Reminder cron foundation║
  * ║  Version: V.0.8 (2026-05-05) — Phase 3 W8.4 Reissue button + handler in Tab 4║
  * ║  Version: V.0.7 (2026-05-04) — Phase 3 W8.2-3 reconcile viewer + recall button║
@@ -2961,6 +2962,174 @@ if ( ! function_exists( 'dinoco_sn_run_expiry_schedule' ) ) {
     }
 }
 
+if ( ! function_exists( 'dinoco_sn_run_anniversary_schedule' ) ) {
+    /**
+     * Phase 3 W9 — F#4 Anniversary push
+     * Daily 09:00 — find plates registered exactly N years ago today.
+     *
+     * Anniversary types (capped at 5 to avoid noise):
+     *   anniversary_1y / 2y / 3y / 4y / 5y
+     *
+     * Reuses dinoco_sn_schedule_notification dedup. send_at = now()
+     * (anniversary today) so notification_send cron picks it up next tick.
+     *
+     * Multi-plate same day same user = each plate = separate row. Phase 4
+     * may bundle into 1 Flex (group_by user_id) at send time.
+     */
+    function dinoco_sn_run_anniversary_schedule() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool = dinoco_sn_table( 'pool' );
+            $today = current_time( 'Y-m-d' );
+            $now = current_time( 'mysql' );
+
+            $scheduled = 0;
+            for ( $years = 1; $years <= 5; $years++ ) {
+                // Match plates registered exactly N years ago today
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT sn, registered_user_id, linked_sku, registered_at
+                     FROM {$pool}
+                     WHERE status IN ('registered', 'claimed')
+                       AND registered_user_id IS NOT NULL
+                       AND DATE(registered_at) = DATE_SUB(%s, INTERVAL %d YEAR)
+                     LIMIT 5000",
+                    $today, $years
+                ), ARRAY_A );
+
+                foreach ( $rows ?: array() as $row ) {
+                    $ok = dinoco_sn_schedule_notification(
+                        $row['sn'],
+                        (int) $row['registered_user_id'],
+                        'anniversary_' . $years . 'y',
+                        $now,
+                        array(
+                            'linked_sku' => $row['linked_sku'],
+                            'years'      => $years,
+                            'registered_at' => $row['registered_at'],
+                        )
+                    );
+                    if ( $ok ) $scheduled++;
+                }
+            }
+
+            update_option( 'dinoco_sn_anniversary_schedule_last_run', array(
+                'at'        => $now,
+                'scheduled' => $scheduled,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_anniversary_schedule' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_anniversary_schedule_last_run', current_time( 'mysql' ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_review_request_schedule' ) ) {
+    /**
+     * Phase 3 W9 — F#10 Review Request
+     * Daily 10:00 — find plates registered exactly 30 days ago.
+     *
+     * Skip-if-claim guard: don't pester unhappy customer. Check claim_ticket
+     * CPT (existing Service Center system). If any open claim for this user
+     * → skip review request.
+     *
+     * Anti-spam: dedup ensures one review_request per (user, sn). If customer
+     * misses + 7 day → no retry (don't pester per v2.13 §F.10 Edge Cases).
+     */
+    function dinoco_sn_run_review_request_schedule() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool = dinoco_sn_table( 'pool' );
+            $today = current_time( 'Y-m-d' );
+            $now = current_time( 'mysql' );
+
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, registered_user_id, linked_sku, registered_at
+                 FROM {$pool}
+                 WHERE status = 'registered'
+                   AND registered_user_id IS NOT NULL
+                   AND DATE(registered_at) = DATE_SUB(%s, INTERVAL 30 DAY)
+                 LIMIT 1000",
+                $today
+            ), ARRAY_A );
+
+            $scheduled = 0;
+            $skipped_claim = 0;
+
+            // Pre-compute users with open claims (cheap dedup vs N+1)
+            $user_ids = array_unique( array_filter( array_map( function( $r ) {
+                return (int) ( $r['registered_user_id'] ?? 0 );
+            }, $rows ?: array() ) ) );
+
+            $users_with_open_claim = array();
+            if ( $user_ids ) {
+                // Existing Service Center claim_ticket CPT — open if status NOT in completed/closed/rejected/cancelled
+                $placeholders = implode( ',', array_fill( 0, count( $user_ids ), '%d' ) );
+                $closed_statuses = array( 'completed', 'closed', 'rejected', 'cancelled' );
+                $closed_in = "'" . implode( "','", array_map( 'esc_sql', $closed_statuses ) ) . "'";
+
+                // Best-effort query — claim_ticket CPT has post_author = customer user_id
+                // and meta `ticket_status`. If CPT not registered yet → empty result (allow all).
+                $cpt_users = $wpdb->get_col( $wpdb->prepare(
+                    "SELECT DISTINCT p.post_author
+                     FROM {$wpdb->posts} p
+                     LEFT JOIN {$wpdb->postmeta} m ON m.post_id = p.ID AND m.meta_key = 'ticket_status'
+                     WHERE p.post_type = 'claim_ticket'
+                       AND p.post_status = 'publish'
+                       AND p.post_author IN ({$placeholders})
+                       AND ( m.meta_value IS NULL OR m.meta_value NOT IN ({$closed_in}) )",
+                    $user_ids
+                ) );
+                if ( is_array( $cpt_users ) ) {
+                    $users_with_open_claim = array_flip( array_map( 'intval', $cpt_users ) );
+                }
+            }
+
+            foreach ( $rows ?: array() as $row ) {
+                $uid = (int) $row['registered_user_id'];
+                if ( isset( $users_with_open_claim[ $uid ] ) ) {
+                    $skipped_claim++;
+                    continue;
+                }
+                $ok = dinoco_sn_schedule_notification(
+                    $row['sn'],
+                    $uid,
+                    'review_request',
+                    $now,
+                    array(
+                        'linked_sku'    => $row['linked_sku'],
+                        'registered_at' => $row['registered_at'],
+                    )
+                );
+                if ( $ok ) $scheduled++;
+            }
+
+            update_option( 'dinoco_sn_review_request_last_run', array(
+                'at'             => $now,
+                'scanned'        => count( $rows ?: array() ),
+                'scheduled'      => $scheduled,
+                'skipped_claim'  => $skipped_claim,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_review_request' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_review_request_last_run', current_time( 'mysql' ) );
+    }
+}
+
 if ( ! function_exists( 'dinoco_sn_run_notification_send' ) ) {
     /**
      * Every 15 min — process scheduled notifications past send time.
@@ -3040,6 +3209,13 @@ add_action( 'init', function() {
         $recurrence = isset( $sched['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly';
         wp_schedule_event( time(), $recurrence, 'dinoco_sn_notification_send_cron' );
     }
+    // Phase 3 W9 — F#4 Anniversary + F#10 Review Request
+    if ( ! wp_next_scheduled( 'dinoco_sn_anniversary_schedule_cron' ) ) {
+        wp_schedule_event( time(), 'daily', 'dinoco_sn_anniversary_schedule_cron' );
+    }
+    if ( ! wp_next_scheduled( 'dinoco_sn_review_request_cron' ) ) {
+        wp_schedule_event( time(), 'daily', 'dinoco_sn_review_request_cron' );
+    }
 
     if ( function_exists( 'dinoco_register_cron' ) ) {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
@@ -3049,6 +3225,8 @@ add_action( 'init', function() {
         dinoco_register_cron( 'dinoco_sn_notification_send_cron',
             isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly',
             'dinoco_sn_run_notification_send' );
+        dinoco_register_cron( 'dinoco_sn_anniversary_schedule_cron', 'daily', 'dinoco_sn_run_anniversary_schedule' );
+        dinoco_register_cron( 'dinoco_sn_review_request_cron', 'daily', 'dinoco_sn_run_review_request_schedule' );
     } else {
         // Fallback when Idempotency Helper / registry wrapper not synced
         if ( ! has_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' ) ) {
@@ -3065,6 +3243,12 @@ add_action( 'init', function() {
         }
         if ( ! has_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' ) ) {
             add_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' );
+        }
+        if ( ! has_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_run_anniversary_schedule' ) ) {
+            add_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_run_anniversary_schedule' );
+        }
+        if ( ! has_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_run_review_request_schedule' ) ) {
+            add_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_run_review_request_schedule' );
         }
     }
 } );
