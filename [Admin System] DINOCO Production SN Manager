@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.15 (2026-05-05) — Phase 4 W13 F#16 Demand Forecast (math + cron)║
  * ║  Version: V.0.14 (2026-05-05) — Phase 3 W11 F#12 Anti-Fraud 6-factor + cron║
  * ║  Version: V.0.13 (2026-05-05) — Phase 3 W11 F#13 Gray Market scan cron + helper║
  * ║  Version: V.0.12 (2026-05-05) — Phase 3 W10 F#9 Customer LTV Dashboard (Tab 6)║
@@ -3168,6 +3169,200 @@ if ( ! function_exists( 'dinoco_sn_run_expiry_schedule' ) ) {
     }
 }
 
+if ( ! function_exists( 'dinoco_sn_compute_demand_forecast' ) ) {
+    /**
+     * Phase 4 W13 — F#16 Demand Forecasting
+     *
+     * Pure-PHP time-series forecast using:
+     *   - Moving average (last 6 months) for trend
+     *   - Single exponential smoothing (alpha=0.3 default) for level
+     *   - Combined: weighted blend of MA + ES with confidence based on
+     *     data variance + sample size
+     *
+     * Inputs:
+     *   $history = [['month' => 'YYYY-MM-01', 'qty' => N], ...]
+     *   $forecast_months = 6 (default)
+     *
+     * Output: [
+     *   ['month' => YYYY-MM-01, 'predicted_qty' => N, 'confidence_pct' => P],
+     *   ...
+     * ]
+     *
+     * Confidence model (deterministic):
+     *   confidence = max(0, min(100, 100 - (cv_percent + (12 - sample_size)*5)))
+     *   where cv_percent = (stddev / mean) * 100
+     *   Lower variance + more data → higher confidence.
+     *
+     * Boss can verify math (testable). Phase 5+ ML is overkill — boss
+     * needs explainable + auditable forecasts.
+     */
+    function dinoco_sn_compute_demand_forecast( array $history, int $forecast_months = 6, float $alpha = 0.3 ): array {
+        if ( empty( $history ) ) {
+            return array();
+        }
+
+        // Sort ascending by month
+        usort( $history, function( $a, $b ) {
+            return strcmp( (string) $a['month'], (string) $b['month'] );
+        } );
+
+        $qtys = array_map( function( $r ) { return (float) ( $r['qty'] ?? 0 ); }, $history );
+        $n = count( $qtys );
+
+        // Moving average over last min(6, n) periods
+        $ma_window = min( 6, $n );
+        $ma_slice = array_slice( $qtys, -$ma_window );
+        $ma = array_sum( $ma_slice ) / max( 1, count( $ma_slice ) );
+
+        // Exponential smoothing — initialize with first value, run through
+        $level = $qtys[0];
+        for ( $i = 1; $i < $n; $i++ ) {
+            $level = $alpha * $qtys[ $i ] + ( 1 - $alpha ) * $level;
+        }
+
+        // Confidence: variance + sample size
+        $mean = array_sum( $qtys ) / $n;
+        $variance = 0.0;
+        foreach ( $qtys as $q ) {
+            $variance += ( $q - $mean ) ** 2;
+        }
+        $variance = $variance / max( 1, $n );
+        $stddev = sqrt( $variance );
+        $cv_percent = $mean > 0 ? ( $stddev / $mean ) * 100 : 0;
+        $sample_penalty = max( 0, 12 - $n ) * 5;
+        $confidence = max( 0, min( 100, 100 - $cv_percent - $sample_penalty ) );
+
+        // Blend MA + ES (50/50 weight) for prediction
+        $predicted_base = ( $ma + $level ) / 2;
+
+        // Build forecast for next N months from last history month
+        $last_month = $history[ count( $history ) - 1 ]['month'];
+        $forecasts = array();
+        for ( $i = 1; $i <= $forecast_months; $i++ ) {
+            try {
+                $dt = new \DateTime( $last_month );
+                $dt->modify( '+' . $i . ' months' );
+                $forecast_month = $dt->format( 'Y-m-01' );
+            } catch ( \Throwable $_e ) {
+                continue;
+            }
+            $forecasts[] = array(
+                'month'          => $forecast_month,
+                'predicted_qty'  => max( 0, (int) round( $predicted_base ) ),
+                'confidence_pct' => (int) round( $confidence ),
+            );
+        }
+        return $forecasts;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_demand_forecast' ) ) {
+    /**
+     * Phase 4 W13 — Weekly Sunday 02:00 demand forecast cron.
+     *
+     * For each linked_sku in sn_pool with ≥3 months of activation history:
+     *   1. Aggregate monthly activation count from registered_at
+     *   2. Compute 6-month forecast via dinoco_sn_compute_demand_forecast
+     *   3. UPSERT into wp_dinoco_sn_demand_forecast
+     *
+     * Idempotent — UNIQUE KEY (sku, forecast_month) ensures
+     * INSERT...ON DUPLICATE KEY overwrites stale forecasts.
+     */
+    function dinoco_sn_run_demand_forecast() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'demand_forecast' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool = dinoco_sn_table( 'pool' );
+            $forecast_tbl = dinoco_sn_table( 'demand_forecast' );
+
+            // Find SKUs with at least 3 months of activation history
+            $skus = $wpdb->get_col(
+                "SELECT linked_sku
+                 FROM {$pool}
+                 WHERE registered_user_id IS NOT NULL
+                   AND linked_sku IS NOT NULL AND linked_sku != ''
+                   AND status IN ('registered', 'claimed', 'replaced', 'transferred', 'recalled')
+                 GROUP BY linked_sku
+                 HAVING COUNT(DISTINCT DATE_FORMAT(registered_at, '%Y-%m')) >= 3
+                 ORDER BY linked_sku ASC
+                 LIMIT 200"
+            );
+
+            $now = current_time( 'mysql' );
+            $sku_count = 0;
+            $row_count = 0;
+
+            foreach ( $skus ?: array() as $sku ) {
+                // 12-month rolling history per SKU
+                $history_rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT DATE_FORMAT(registered_at, '%%Y-%%m-01') AS month,
+                            COUNT(*) AS qty
+                     FROM {$pool}
+                     WHERE linked_sku = %s
+                       AND registered_at IS NOT NULL
+                       AND registered_at >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
+                       AND status IN ('registered', 'claimed', 'replaced', 'transferred', 'recalled')
+                     GROUP BY DATE_FORMAT(registered_at, '%%Y-%%m-01')
+                     ORDER BY month ASC",
+                    $sku
+                ), ARRAY_A );
+
+                if ( count( $history_rows ?: array() ) < 3 ) continue;
+
+                $forecasts = dinoco_sn_compute_demand_forecast( $history_rows, 6 );
+                if ( empty( $forecasts ) ) continue;
+
+                // Current pool qty for SKU
+                $current_pool = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$pool}
+                     WHERE linked_sku = %s AND status = 'in_pool'",
+                    $sku
+                ) );
+
+                foreach ( $forecasts as $f ) {
+                    $suggested = max( 0, $f['predicted_qty'] - $current_pool );
+                    $wpdb->query( $wpdb->prepare(
+                        "INSERT INTO {$forecast_tbl}
+                            (sku, forecast_month, predicted_qty, confidence_pct,
+                             current_pool_qty, suggested_order_qty, computed_at)
+                         VALUES (%s, %s, %d, %d, %d, %d, %s)
+                         ON DUPLICATE KEY UPDATE
+                            predicted_qty       = VALUES(predicted_qty),
+                            confidence_pct      = VALUES(confidence_pct),
+                            current_pool_qty    = VALUES(current_pool_qty),
+                            suggested_order_qty = VALUES(suggested_order_qty),
+                            computed_at         = VALUES(computed_at)",
+                        $sku,
+                        $f['month'],
+                        $f['predicted_qty'],
+                        $f['confidence_pct'],
+                        $current_pool,
+                        $suggested,
+                        $now
+                    ) );
+                    $row_count++;
+                }
+                $sku_count++;
+            }
+
+            update_option( 'dinoco_sn_demand_forecast_last_run', array(
+                'at'         => $now,
+                'sku_count'  => $sku_count,
+                'row_count'  => $row_count,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_demand_forecast' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_demand_forecast_last_run', current_time( 'mysql' ) );
+    }
+}
+
 if ( ! function_exists( 'dinoco_sn_compute_fraud_score' ) ) {
     /**
      * Phase 3 W11 — F#12 Anti-Fraud 6-factor scoring engine.
@@ -3787,6 +3982,10 @@ add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'dinoco_sn_fraud_aggregate_cron' ) ) {
         wp_schedule_event( time(), 'hourly', 'dinoco_sn_fraud_aggregate_cron' );
     }
+    // Phase 4 W13 — F#16 Demand Forecast weekly
+    if ( ! wp_next_scheduled( 'dinoco_sn_demand_forecast_cron' ) ) {
+        wp_schedule_event( time(), 'weekly', 'dinoco_sn_demand_forecast_cron' );
+    }
 
     if ( function_exists( 'dinoco_register_cron' ) ) {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
@@ -3801,6 +4000,7 @@ add_action( 'init', function() {
         dinoco_register_cron( 'dinoco_sn_ltv_snapshot_cron', 'daily', 'dinoco_sn_run_ltv_snapshot' );
         dinoco_register_cron( 'dinoco_sn_gray_market_scan_cron', 'weekly', 'dinoco_sn_run_gray_market_scan' );
         dinoco_register_cron( 'dinoco_sn_fraud_aggregate_cron', 'hourly', 'dinoco_sn_run_fraud_aggregate' );
+        dinoco_register_cron( 'dinoco_sn_demand_forecast_cron', 'weekly', 'dinoco_sn_run_demand_forecast' );
     } else {
         // Fallback when Idempotency Helper / registry wrapper not synced
         if ( ! has_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' ) ) {
@@ -3832,6 +4032,9 @@ add_action( 'init', function() {
         }
         if ( ! has_action( 'dinoco_sn_fraud_aggregate_cron', 'dinoco_sn_run_fraud_aggregate' ) ) {
             add_action( 'dinoco_sn_fraud_aggregate_cron', 'dinoco_sn_run_fraud_aggregate' );
+        }
+        if ( ! has_action( 'dinoco_sn_demand_forecast_cron', 'dinoco_sn_run_demand_forecast' ) ) {
+            add_action( 'dinoco_sn_demand_forecast_cron', 'dinoco_sn_run_demand_forecast' );
         }
     }
 } );

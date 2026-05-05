@@ -679,6 +679,47 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(select_block).not.toContain('api_secret_hash');
     });
 
+    test('Phase 4 W13 F#16 forecast endpoints + cron + helper', () => {
+        const code = readSnippet('rest');
+        const manager = readSnippet('manager');
+        // Endpoints
+        expect(code).toContain("'/forecast/sku/(?P<sku>[A-Za-z0-9._-]+)'");
+        expect(code).toContain("'/forecast/all'");
+        expect(code).toContain('dinoco_sn_rest_forecast_sku');
+        expect(code).toContain('dinoco_sn_rest_forecast_all');
+        // Math helper
+        expect(manager).toContain('dinoco_sn_compute_demand_forecast');
+        expect(manager).toContain('dinoco_sn_run_demand_forecast');
+        // Cron
+        expect(manager).toContain('dinoco_sn_demand_forecast_cron');
+        expect(manager).toContain('dinoco_cron_sn_demand_forecast_last_run');
+    });
+
+    test('Phase 4 W13 F#16 forecast uses idempotent UPSERT', () => {
+        const manager = readSnippet('manager');
+        const cron = manager.split('function dinoco_sn_run_demand_forecast')[1] || '';
+        // Idempotent rebuild via UNIQUE KEY (sku, forecast_month)
+        expect(cron).toContain('ON DUPLICATE KEY UPDATE');
+        // Uses 12-month rolling history
+        expect(cron).toMatch(/INTERVAL\s+12\s+MONTH/);
+        // Min 3 months data threshold
+        expect(cron).toMatch(/COUNT\(DISTINCT[\s\S]*?>=\s*3/);
+    });
+
+    test('Phase 4 W13 F#16 forecast math: blend MA + exp smoothing', () => {
+        const manager = readSnippet('manager');
+        const helper = manager.split('function dinoco_sn_compute_demand_forecast')[1] || '';
+        // MA + ES blend
+        expect(helper).toMatch(/\$ma\s*=/);
+        expect(helper).toMatch(/\$level\s*=/);
+        expect(helper).toMatch(/\$predicted_base\s*=\s*\(\s*\$ma\s*\+\s*\$level\s*\)/);
+        // Confidence math (CV + sample penalty)
+        expect(helper).toMatch(/cv_percent/);
+        expect(helper).toContain('sample_penalty');
+        // Predicted qty never negative
+        expect(helper).toMatch(/max\(\s*0\s*,\s*\(int\)\s*round\s*\(\s*\$predicted_base/);
+    });
+
     test('15 schema tables defined in Production S/N Manager', () => {
         const code = readSnippet('manager');
         const expected_tables = [

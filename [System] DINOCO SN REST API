@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.11 (2026-05-05) — Phase 4 W13 F#16 Demand Forecast (2 endpoints)║
  * ║  Version: V.0.10 (2026-05-05) — Phase 3 W11 F#12 Anti-Fraud (3 endpoints + queue + decision)║
  * ║  Version: V.0.9 (2026-05-05) — Phase 3 W11 F#13 Geographic Heatmap (2 endpoints + helper)║
  * ║  Version: V.0.8 (2026-05-05) — Phase 3 W11 F#14 Stolen Registry (4 endpoints)║
@@ -719,6 +720,29 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 'id'       => array( 'required' => true, 'type' => 'integer' ),
                 'decision' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
                 'notes'    => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        /* ─── Phase 4 W13 — F#16 Demand Forecast ─── */
+
+        // GET /forecast/sku/{sku} — per-SKU 6-month forecast
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/forecast/sku/(?P<sku>[A-Za-z0-9._-]+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_forecast_sku',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'sku' => array( 'required' => true, 'type' => 'string' ),
+            ),
+        ) );
+
+        // GET /forecast/all — top SKUs needing reorder soonest
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/forecast/all', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_forecast_all',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'min_suggested' => array( 'type' => 'integer', 'default' => 1, 'sanitize_callback' => 'absint' ),
+                'limit'         => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
             ),
         ) );
     }
@@ -3574,5 +3598,94 @@ if ( ! function_exists( 'dinoco_sn_rest_fraud_decision' ) ) {
                 }
             }
         );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 13. PHASE 4 W13 — F#16 DEMAND FORECAST HANDLERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_forecast_sku' ) ) {
+    function dinoco_sn_rest_forecast_sku( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'demand_forecast' ) ) {
+            return rest_ensure_response( array( 'available' => false, 'note' => 'forecast table not installed' ) );
+        }
+        $sku = strtoupper( trim( (string) $req->get_param( 'sku' ) ) );
+        if ( $sku === '' ) {
+            return new WP_Error( 'invalid_sku', '', array( 'status' => 400 ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'demand_forecast' );
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT forecast_month, predicted_qty, confidence_pct,
+                    current_pool_qty, suggested_order_qty, computed_at
+             FROM {$tbl}
+             WHERE sku = %s
+             ORDER BY forecast_month ASC
+             LIMIT 12",
+            $sku
+        ), ARRAY_A );
+
+        $rows = array_map( function( $r ) {
+            return array(
+                'forecast_month'      => $r['forecast_month'],
+                'predicted_qty'       => (int) $r['predicted_qty'],
+                'confidence_pct'      => (int) $r['confidence_pct'],
+                'current_pool_qty'    => (int) $r['current_pool_qty'],
+                'suggested_order_qty' => (int) $r['suggested_order_qty'],
+                'computed_at'         => $r['computed_at'],
+            );
+        }, $rows ?: array() );
+
+        return rest_ensure_response( array(
+            'sku'      => $sku,
+            'rows'     => $rows,
+            'has_data' => ! empty( $rows ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_forecast_all' ) ) {
+    function dinoco_sn_rest_forecast_all( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'demand_forecast' ) ) {
+            return rest_ensure_response( array( 'rows' => array() ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'demand_forecast' );
+        $min_suggested = (int) $req->get_param( 'min_suggested' );
+        $limit = max( 1, min( 200, (int) $req->get_param( 'limit' ) ) );
+
+        // Aggregate per SKU — sum suggested_order_qty across forecast months
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT sku,
+                    SUM(suggested_order_qty)         AS total_suggested,
+                    AVG(confidence_pct)              AS avg_confidence,
+                    MIN(current_pool_qty)            AS current_pool_qty,
+                    MAX(forecast_month)              AS latest_forecast,
+                    MAX(computed_at)                 AS computed_at
+             FROM {$tbl}
+             GROUP BY sku
+             HAVING total_suggested >= %d
+             ORDER BY total_suggested DESC
+             LIMIT %d",
+            $min_suggested, $limit
+        ), ARRAY_A );
+
+        $rows = array_map( function( $r ) {
+            return array(
+                'sku'              => $r['sku'],
+                'total_suggested'  => (int) $r['total_suggested'],
+                'avg_confidence'   => (int) round( (float) $r['avg_confidence'] ),
+                'current_pool_qty' => (int) $r['current_pool_qty'],
+                'latest_forecast'  => $r['latest_forecast'],
+                'computed_at'      => $r['computed_at'],
+            );
+        }, $rows ?: array() );
+
+        return rest_ensure_response( array(
+            'rows'          => $rows,
+            'min_suggested' => $min_suggested,
+            'fetched_at'    => current_time( 'c' ),
+        ) );
     }
 }
