@@ -66,11 +66,21 @@ tags:
     description: MCP Bridge for OpenClaw agent (32 endpoints, full coverage)
   - name: GDPR
     description: Data Subject Access Request scaffold
+  - name: SN-Admin
+    description: |
+      Production S/N Management — admin-only batch CRUD, receive, search,
+      lookup, audit, void/swap/recall/reissue, LTV, fraud queue, geo, stolen.
+      Phase 0-3 W11 + Phase 4 W12-13 of v2.13 plan.
+  - name: SN-Public
+    description: |
+      Public S/N API for partners (insurance / dealer / police) — token-gated
+      with HMAC + rate limit + 90-day audit log retention. PII-stripped.
 
 security:
   - wpNonce: []
   - liffAiBearer: []
   - b2fAdminToken: []
+  - snApiKey: []  # Phase 4 W12 F#15 — public partner namespace
 
 paths:
   #
@@ -3074,6 +3084,619 @@ paths:
                     enum: [queued, running, completed, failed, cancelled]
                   download_url: { type: string, nullable: true }
 
+  #
+  # S/N Management System — admin namespace (Phase 0-4 of v2.13)
+  # See plan: ~/.claude/plans/wiki-doc-sequential-lantern.md (v2.13)
+  #
+  /dinoco-sn/v1/version:
+    get:
+      tags: [SN-Admin]
+      summary: Health check + version + phase
+      security: []
+      responses:
+        "200":
+          description: System metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_version: { type: string }
+                  schema_version: { type: string }
+                  enabled: { type: boolean }
+                  phase: { type: string }
+
+  /dinoco-sn/v1/batches:
+    get:
+      tags: [SN-Admin]
+      summary: List batches (paginated)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [draft, sent_to_factory, received_partial, received_full, closed, cancelled] } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200": { description: Batch list }
+    post:
+      tags: [SN-Admin]
+      summary: Create batch + reserve N S/N rows atomically
+      description: |
+        Idempotent via X-Idempotency-Key (Round 30+ pattern).
+        Atomic: GET_LOCK on prefix + START TRANSACTION + chunked INSERT 5000/iter.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batch_code, prefix, qty_total, format_pattern]
+              properties:
+                batch_code: { type: string, maxLength: 64 }
+                prefix: { type: string, pattern: '^[A-Z0-9]{3,6}$' }
+                qty_total: { type: integer, minimum: 1, maximum: 1000000 }
+                format_pattern: { type: string, example: '{PREFIX}{SEQ:7}' }
+                allocation_strategy: { type: string, enum: [open_pool, pre_assigned] }
+                factory_name: { type: string }
+                factory_po_ref: { type: string }
+                notes: { type: string }
+      responses:
+        "201": { description: Batch created }
+        "409": { description: Duplicate batch_code or idempotency conflict }
+
+  /dinoco-sn/v1/batches/{id}:
+    get:
+      tags: [SN-Admin]
+      summary: Batch detail with progress
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Batch detail }
+        "404": { description: Not found }
+
+  /dinoco-sn/v1/batches/{id}/status:
+    post:
+      tags: [SN-Admin]
+      summary: Flip batch status (admin)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Status updated }
+
+  /dinoco-sn/v1/batches/{id}/csv:
+    get:
+      tags: [SN-Admin]
+      summary: Download CSV S/N list (chunked stream)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: CSV file
+          content: { text/csv: { schema: { type: string, format: binary } } }
+
+  /dinoco-sn/v1/batches/{id}/qr-pdf:
+    get:
+      tags: [SN-Admin]
+      summary: Download QR PDF (chunked 5000/file)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: chunk, in: query, schema: { type: integer, default: 1 } }
+      responses:
+        "200":
+          description: PDF file
+          content: { application/pdf: { schema: { type: string, format: binary } } }
+
+  /dinoco-sn/v1/receive:
+    post:
+      tags: [SN-Admin]
+      summary: Receive single S/N (USB scan / manual)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn, batch_id, sku]
+              properties:
+                sn: { type: string }
+                batch_id: { type: integer }
+                sku: { type: string }
+                mode: { type: string, enum: [usb, range, paste], default: usb }
+      responses:
+        "200": { description: Plate received }
+        "409": { description: Already received or status conflict }
+
+  /dinoco-sn/v1/receive/bulk:
+    post:
+      tags: [SN-Admin]
+      summary: Bulk receive Range/Paste mode (D4 contract)
+      description: |
+        Per-row atomic + skip-conflicts default. Chunk cap 100 plates per request.
+        Idempotency body hash uses sort(sns) for determinism (Round 27 pattern).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sns, batch_id, sku, mode]
+              properties:
+                sns: { type: array, items: { type: string } }
+                batch_id: { type: integer }
+                sku: { type: string }
+                mode: { type: string, enum: [range, paste] }
+      responses:
+        "200":
+          description: Bulk receive results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success_count: { type: integer }
+                  skip_count: { type: integer }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sn: { type: string }
+                        status: { type: string, enum: [ok, skip] }
+                        code: { type: string }
+
+  /dinoco-sn/v1/lookup/{sn}:
+    get:
+      tags: [SN-Admin]
+      summary: Public lookup — minimal status oracle (60s cache, rate-limited)
+      description: |
+        PII-stripped (no SKU / no user_id / no ownership oracle).
+        Audit fix Round 26: only returns {sn, public_status, is_registered, activate_hint}.
+      security: []
+      parameters:
+        - { name: sn, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Lookup result }
+        "404": { description: S/N not found }
+        "410": { description: Voided / recalled — generic message }
+
+  /dinoco-sn/v1/sn/{sn}:
+    get:
+      tags: [SN-Admin]
+      summary: Detail card (full timeline + meta + audit slice)
+      parameters:
+        - { name: sn, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: SN detail }
+
+  /dinoco-sn/v1/sc-lookup/{sn}:
+    get:
+      tags: [SN-Admin]
+      summary: Service Center walk-in verify (warehouse cap accepted)
+      description: Same payload as /sn/{sn} but accepts dinoco_sn_warehouse capability.
+      parameters:
+        - { name: sn, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: SN detail (PII auto-masked unless view_pii cap) }
+
+  /dinoco-sn/v1/search:
+    get:
+      tags: [SN-Admin]
+      summary: Universal admin search across sn_pool
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: batch_id, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        "200": { description: Search results paginated }
+
+  /dinoco-sn/v1/audit:
+    get:
+      tags: [SN-Admin]
+      summary: Audit log search (filterable timeline)
+      parameters:
+        - { name: sn, in: query, schema: { type: string } }
+        - { name: event_type, in: query, schema: { type: string } }
+        - { name: actor_id, in: query, schema: { type: integer } }
+        - { name: days, in: query, schema: { type: integer, default: 30 } }
+      responses:
+        "200": { description: Audit events }
+
+  /dinoco-sn/v1/pool-stats:
+    get:
+      tags: [SN-Admin]
+      summary: Heatmap counters per linked_sku × status (60s cached)
+      responses:
+        "200": { description: Pool stats with totals + 200-SKU breakdown }
+
+  /dinoco-sn/v1/void:
+    post:
+      tags: [SN-Admin]
+      summary: Void single S/N (auto-tier in_pool/reserved only — Phase 3 stub)
+      description: registered/claimed status returns 422 (Phase 4 W11 4-eyes promotion)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn, reason]
+              properties:
+                sn: { type: string }
+                reason: { type: string, minLength: 10 }
+      responses:
+        "200": { description: Voided }
+        "422": { description: Requires 4-eyes approval }
+
+  /dinoco-sn/v1/swap:
+    post:
+      tags: [SN-Admin]
+      summary: Swap sn_old → sn_new (same SKU, GET_LOCK + atomic dual UPDATE)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn_old, sn_new, reason]
+              properties:
+                sn_old: { type: string }
+                sn_new: { type: string }
+                reason: { type: string, minLength: 10 }
+      responses:
+        "200": { description: Swap complete }
+
+  /dinoco-sn/v1/recall:
+    post:
+      tags: [SN-Admin]
+      summary: Defect/safety/stolen/fraud/misship recall
+      description: 5-category whitelist. is_sensitive=1 (5y retention).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn, reason]
+              properties:
+                sn: { type: string }
+                category: { type: string, enum: [defect, safety, stolen, fraud, misship] }
+                reason: { type: string, minLength: 10 }
+      responses:
+        "200": { description: Recalled }
+
+  /dinoco-sn/v1/reissue:
+    post:
+      tags: [SN-Admin]
+      summary: M2 plate-fell-off — issue replacement (same SKU, customer keeps proof)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn_old, sn_new, reason]
+              properties:
+                sn_old: { type: string }
+                sn_new: { type: string }
+                reason: { type: string, minLength: 10 }
+      responses:
+        "200": { description: Reissue complete (admin must arrange physical shipment) }
+
+  /dinoco-sn/v1/reconcile-report:
+    get:
+      tags: [SN-Admin]
+      summary: Weekly batch drift report (qty_received vs actual count)
+      responses:
+        "200": { description: Drift report rows }
+
+  /dinoco-sn/v1/required-plates:
+    post:
+      tags: [SN-Admin]
+      summary: Hierarchy resolver — compute plate requirement for SKU + qty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sku, qty]
+              properties:
+                sku: { type: string }
+                qty: { type: integer, minimum: 1 }
+      responses:
+        "200": { description: Required plates per leaf }
+
+  /dinoco-sn/v1/ltv/list:
+    get:
+      tags: [SN-Admin]
+      summary: Top customers by lifetime spend (paginated)
+      parameters:
+        - { name: tier, in: query, schema: { type: string, enum: [bronze, silver, gold, platinum, diamond] } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        "200": { description: LTV ranked list + tier distribution }
+
+  /dinoco-sn/v1/ltv/{user_id}:
+    get:
+      tags: [SN-Admin]
+      summary: Customer LTV detail + plates owned
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: LTV detail with plates }
+
+  /dinoco-sn/v1/fraud/queue:
+    get:
+      tags: [SN-Admin]
+      summary: Anti-fraud review queue (unreviewed only)
+      parameters:
+        - { name: min_score, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        "200": { description: Pending review events with factor breakdown }
+
+  /dinoco-sn/v1/fraud/stats:
+    get:
+      tags: [SN-Admin]
+      summary: Fraud dashboard metrics (7d outcomes + tier dist + 24h confirmed)
+      responses:
+        "200": { description: Fraud stats }
+
+  /dinoco-sn/v1/fraud/{id}/decision:
+    post:
+      tags: [SN-Admin]
+      summary: Admin verdict (legit / fraud / suspicious)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [legit, fraud, suspicious] }
+                notes: { type: string }
+      responses:
+        "200": { description: Decision recorded }
+
+  /dinoco-sn/v1/geo/heatmap:
+    get:
+      tags: [SN-Admin]
+      summary: Per-province activation heatmap aggregation
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: sku, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Heatmap rows }
+
+  /dinoco-sn/v1/geo/gray-market:
+    get:
+      tags: [SN-Admin]
+      summary: Gray-market suspect provinces (no dealer + activations)
+      parameters:
+        - { name: days, in: query, schema: { type: integer, default: 30 } }
+      responses:
+        "200": { description: Suspect provinces list }
+
+  /dinoco-sn/v1/stolen/report:
+    post:
+      tags: [SN-Admin]
+      summary: Report plate stolen (customer own plate or admin any)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sn]
+              properties:
+                sn: { type: string }
+                police_report_no: { type: string }
+                police_station: { type: string }
+                incident_date: { type: string, format: date }
+                description: { type: string }
+      responses:
+        "200": { description: Reported + plate auto-recalled }
+
+  /dinoco-sn/v1/stolen/list:
+    get:
+      tags: [SN-Admin]
+      summary: Stolen registry queue (admin)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [reported, verified, recovered, closed] } }
+      responses:
+        "200": { description: Stolen rows + status distribution }
+
+  /dinoco-sn/v1/stolen/{id}/decision:
+    post:
+      tags: [SN-Admin]
+      summary: Admin verify / recover / close stolen report
+      description: "Recovered decision auto-restores plate to prev_status."
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [verified, recovered, closed] }
+                notes: { type: string }
+      responses:
+        "200": { description: Decision recorded }
+
+  /dinoco-sn/v1/stolen/verify/{sn}:
+    get:
+      tags: [SN-Public]
+      summary: Public stolen check (rate-limited 30/min/IP)
+      description: |
+        For police / insurance / dealer second-hand check. Returns boolean
+        only — no PII / no police info / date-only precision.
+      security: []
+      parameters:
+        - { name: sn, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Stolen status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sn: { type: string }
+                  is_stolen: { type: boolean }
+                  reported_at: { type: string, format: date, nullable: true }
+
+  /dinoco-sn/v1/forecast/sku/{sku}:
+    get:
+      tags: [SN-Admin]
+      summary: 6-month demand forecast per SKU
+      parameters:
+        - { name: sku, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Forecast rows }
+
+  /dinoco-sn/v1/forecast/all:
+    get:
+      tags: [SN-Admin]
+      summary: Top SKUs needing reorder (aggregated)
+      parameters:
+        - { name: min_suggested, in: query, schema: { type: integer, default: 1 } }
+      responses:
+        "200": { description: Top reorder candidates }
+
+  /dinoco-sn/v1/api-tokens:
+    get:
+      tags: [SN-Admin]
+      summary: List API tokens (admin) — never includes api_secret_hash
+      responses:
+        "200": { description: Token list }
+    post:
+      tags: [SN-Admin]
+      summary: Issue new API token (returns api_secret ONCE)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [partner_name]
+              properties:
+                partner_name: { type: string, maxLength: 128 }
+                partner_type: { type: string, enum: [dealer, insurance, government, other] }
+                scopes:
+                  type: array
+                  items: { type: string, enum: [verify, claim_status, stolen_check, full] }
+                rate_limit_per_min: { type: integer, default: 30 }
+                ip_allowlist: { type: string, description: 'comma/space separated IPs' }
+                expires_at: { type: string, format: date-time }
+      responses:
+        "200": { description: Token issued — save api_secret immediately }
+
+  /dinoco-sn/v1/api-tokens/{id}/disable:
+    post:
+      tags: [SN-Admin]
+      summary: Soft-kill API token
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Disabled }
+
+  #
+  # S/N Public API — partner namespace (Phase 4 W12 F#15)
+  # Rate-limited per token + HMAC + scope-gated + 90-day audit log
+  #
+  /dinoco-sn-api/v1/verify:
+    get:
+      tags: [SN-Public]
+      summary: Basic plate validity check (insurance / dealer)
+      security:
+        - snApiKey: []
+      parameters:
+        - { name: sn, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Validity oracle — PII-stripped
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sn: { type: string }
+                  valid: { type: boolean }
+                  public_status: { type: string, enum: [active, invalid, unknown] }
+        "401": { description: Auth missing / invalid }
+        "403": { description: Scope denied / IP blocked }
+        "429": { description: Rate limit exceeded }
+
+  /dinoco-sn-api/v1/claim-status:
+    get:
+      tags: [SN-Public]
+      summary: Claim status check (insurance subrogation)
+      security:
+        - snApiKey: []
+      parameters:
+        - { name: sn, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Claim status (PII-stripped)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sn: { type: string }
+                  has_claim: { type: boolean }
+                  claim_status: { type: string, enum: [in_progress, completed], nullable: true }
+
+  /dinoco-sn-api/v1/stolen-check:
+    get:
+      tags: [SN-Public]
+      summary: Stolen registry check (police / dealer second-hand)
+      security:
+        - snApiKey: []
+      parameters:
+        - { name: sn, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Stolen oracle
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sn: { type: string }
+                  is_stolen: { type: boolean }
+                  reported_at: { type: string, format: date, nullable: true }
+
+  #
+  # MCP Bridge — S/N system bridge (Phase 2 W6.3)
+  #
+  /dinoco-mcp/v1/sn-lookup:
+    get:
+      tags: [MCP, SN-Admin]
+      summary: S/N system bridge for OpenClaw chatbot (PII-stripped)
+      parameters:
+        - { name: sn, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: SN status with anti-hallucination guard
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  found: { type: boolean }
+                  status: { type: string }
+                  top_set_name: { type: string }
+                  is_warranty_active: { type: boolean }
+                  is_in_pool: { type: boolean }
+                  is_voided: { type: boolean }
+                  is_recalled: { type: boolean }
+
 components:
   securitySchemes:
     wpNonce:
@@ -3120,6 +3743,26 @@ components:
       in: header
       name: X-API-Key
       description: MCP Bridge API key (OpenClaw agent only)
+
+    snApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Phase 4 W12 F#15 — Public S/N API token (partner namespace).
+        Issued via admin `POST /dinoco-sn/v1/api-tokens`. Format `pk_<hex>`.
+
+        Required headers when calling `/dinoco-sn-api/v1/*`:
+          - `X-API-Key`     — token api_key (pk_<hex>)
+          - `X-API-Sig`     — HMAC-SHA256(secret, body) hex (Phase 4 W12.5)
+          - `X-API-Timestamp` — Unix timestamp (5-min skew tolerance)
+
+        Behavior:
+          - Token must be active + not expired
+          - IP must match allowlist (if set)
+          - Scope must match endpoint requirement (verify / claim_status / stolen_check / full)
+          - Per-token rate limit (default 30/min) enforced via api_log sliding window
+          - Every request logged for 90-day audit retention
 
   responses:
     Unauthorized:
