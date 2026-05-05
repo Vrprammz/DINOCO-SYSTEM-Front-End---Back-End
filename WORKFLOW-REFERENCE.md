@@ -3717,3 +3717,166 @@ graph LR
 - `bv_get_stats()` raw helper preserved as low-level (used by AI summary generator) — only stats endpoint + AI summary route through cached wrapper
 - Brands enum hardcoded: `DINOCO, SRC, F2MOTO, BMMOTO, MOTOSkill, H2C` (line 52) — adding new requires code change
 - `is_relevant=false` entries persisted but excluded from stats aggregation (filter via `bv_relevant=1` meta)
+
+---
+
+## 15. Production S/N Management Workflows (v2.13)
+
+Source of truth: `~/.claude/plans/wiki-doc-sequential-lantern.md` v2.13 (boss-approved 2026-05-04, 19wk continuous Phase 0-6, ~620h).
+
+Per v2.2 simplification: standalone system, NOT integrated with B2B order flow. Source of truth for "where is this plate?" = customer LIFF activate (not warehouse pack scan). Trade-off accepted by boss for 6× lower complexity.
+
+### 15.1 4-Step Lifecycle (boss-approved simplification)
+
+```text
+[1] Boss creates batch → [2] Warehouse receives plates → [3] Pack & ship (legacy flow) → [4] Customer activates
+```
+
+| Step | Actor | System touch | Output |
+|------|-------|--------------|--------|
+| 1 | Boss | `[Admin System] DINOCO Production SN Manager` Tab 1 → Create Batch modal | qty rows in `sn_pool` (status=`reserved`), CSV + QR PDF download for factory |
+| 2 | Warehouse Admin A | Tab 2 รับเพลท — 3 modes (⌨️ Range / 📋 Paste / 📷 USB Scanner) | `sn_pool.status` → `in_pool` + `linked_sku` set |
+| 3 | Warehouse Admin B | Existing B2B/B2F pick-pack flow (UNCHANGED) — physical plate attach happens here, no system update | (none — `sn_pool.status` stays `in_pool`) |
+| 4 | Customer | LINE LIFF `[dinoco_warranty_activate]?sn=DNCSS0001234` | `sn_pool.status` → `registered` + `registered_user_id` + warranty CPT created + `serial_code` ACF mirror |
+
+### 15.2 Atomic Activate Flow (D11 — LINE OAuth + WP session reuse)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Customer (LINE LIFF)
+    participant W as WP / [System] DINOCO Warranty Activation LIFF
+    participant API as REST /dinoco-sn/v1/activate
+    participant DB as wp_dinoco_sn_pool
+
+    U->>W: scan QR plate → /warranty/activate?sn=DNCSS0001234
+    alt user not logged in
+        W->>U: redirect [dinoco_login_button] LINE OAuth
+        U->>W: OAuth callback → wp_set_current_user
+    end
+
+    W->>API: POST /activate { sn, moto_brand, moto_model, ใบเสร็จ_url } + nonce
+    API->>DB: GET_LOCK(`dnc_sn_act_{sn}`, 5)
+    API->>DB: SELECT FOR UPDATE WHERE sn=?
+    alt status != in_pool
+        API->>U: 409 / 410 / 422 (Thai error catalog C.6)
+    else status == in_pool
+        API->>DB: UPDATE status='registered' + registered_user_id + registered_at
+        API->>DB: INSERT warranty_registration CPT (mirror serial_code)
+        API->>DB: INSERT sn_audit row (event=plate_registered)
+        API->>DB: RELEASE_LOCK
+        API->>W: 200 + warranty_id
+        W->>U: success card + LINE Flex push (deferred via wp_schedule_single_event — perf)
+    end
+```
+
+### 15.3 Notification Pipeline (F#1/F#4/F#10 — Phase 3 W9)
+
+```mermaid
+graph LR
+    A[Daily 02:00<br/>schedule_cron] -->|F#1| B[Detect plates<br/>warranty - 30/7/1d]
+    A -->|F#4| C[Detect plates<br/>anniversary today<br/>1y/2y/3y/4y/5y]
+    A -->|F#10| D[Detect plates<br/>registered + 30d<br/>+ no claim]
+
+    B --> E[INSERT IGNORE<br/>sn_notifications<br/>UNIQUE dedup composite]
+    C --> E
+    D --> E
+
+    F[Every 15min<br/>send_cron] -->|gated by<br/>send_enabled flag| G{Flag ON?}
+    G -->|No stub| H[mark pending_dispatch<br/>visibility only]
+    G -->|Yes Phase 4 W9| I[Build Flex via<br/>dinoco_sn_build_flex_for_notification dispatcher]
+    I --> J[b2b_send_flex_message<br/>LINE push]
+    J --> K[UPDATE status=sent<br/>or failed]
+
+    style G fill:#fef3c7,stroke:#f59e0b
+    style H fill:#e5e7eb,stroke:#6b7280
+    style J fill:#d1fae5,stroke:#10b981
+```
+
+Severity colors per Flex builders (V.0.17):
+
+- **Expiry header**: red `#dc2626` (≤1d) / amber `#f59e0b` (≤7d) / navy `#1f2937` (>7d)
+- **Anniversary header**: navy 1y / gold `#ca8a04` 2y / violet `#7c3aed` 3y+ (Diamond)
+- **Review request header**: green `#10b981`
+
+### 15.4 4-eyes Approval State Machine (Sensitive ops)
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: actor POST /swap or /void or /recall
+    pending --> approved: approver POST decision=approve\n(actor != approver enforced)
+    pending --> rejected: approver POST decision=reject
+    pending --> expired: SLA breach\nauto-escalate Telegram
+    approved --> [*]: atomic apply\n+ audit row + LINE notify customer
+    rejected --> [*]: audit row + actor notify
+    expired --> escalated: super_admin role\n(or boss LINE)
+    escalated --> approved: super_admin approve
+    escalated --> rejected: super_admin reject
+
+    note right of pending
+        SLA tiers per v2.7 §2.7:
+        Urgent (swap registered): 1hr
+        Normal (void / relink post-alloc): 24hr
+        Low (relink in_pool): 72hr
+    end note
+```
+
+### 15.5 Public Stolen Plate Verify Flow (F#14 — Phase 3 W11)
+
+```mermaid
+graph LR
+    A[Police/Insurance/Dealer<br/>opens dinoco.in.th/stolen-check] --> B[shortcode<br/>dinoco_stolen_check]
+    B --> C[Type/scan S/N]
+    C --> D[fetch /dinoco-sn/v1/stolen/verify/SN]
+    D -->|cache hit 5min| E[boolean response]
+    D -->|miss| F[SELECT status stolen_at]
+    F -->|status=recalled<br/>+ stolen_at NOT NULL| G[is_stolen=true<br/>reported_at=Y-m-d only]
+    F -->|otherwise| H[is_stolen=false]
+    G --> I[set_transient 5min]
+    H --> I
+    I --> E
+    E -->|stolen| J[Red banner<br/>มีรายงานในระบบ<br/>contact DINOCO Support]
+    E -->|clean| K[Green banner<br/>ไม่พบรายงาน]
+    E -->|429| L[Amber banner<br/>มีคำขอมากเกินไป รอ 1 นาที]
+
+    style G fill:#fee2e2,stroke:#dc2626
+    style J fill:#fee2e2,stroke:#dc2626
+    style K fill:#d1fae5,stroke:#10b981
+    style L fill:#fef3c7,stroke:#f59e0b
+```
+
+REG-082 alignment: response says "มีรายงานในระบบ" — never "ถูกแจ้งหาย" (chatbot rules §15.3 anti social-engineering).
+
+### 15.6 v2.11 Member Dashboard Helper Read Path (Phase 2 W7)
+
+When `[System] Member Dashboard Main` → V.31.0 lands:
+
+```mermaid
+graph TB
+    A[Customer opens<br/>dinoco_dashboard] --> B{user_id valid?}
+    B -->|No 0 or negative| C[empty state<br/>render legacy serial_code path]
+    B -->|Yes| D[6 read helpers fan-out]
+
+    D --> E[get_user_plates<br/>status whitelist + ORDER BY registered_at DESC]
+    D --> F[get_user_expiring_plates<br/>days_window 30 clamped + DATEDIFF SQL]
+    D --> G[get_user_ltv<br/>1hr transient + null marker]
+    D --> H[get_pending_reviews<br/>status=sent + reviewed_at NULL]
+    D --> I[get_user_anniversaries<br/>days_window 7 clamped + TIMESTAMPDIFF YEAR]
+    D --> J[get_user_stats<br/>single SUM CASE WHEN aggregate]
+
+    E --> K[Member Dashboard render]
+    F --> K
+    G --> K
+    H --> K
+    I --> K
+    J --> K
+
+    K --> L[banner notifications panel<br/>3 max on home]
+    K --> M[stats grid<br/>plates / active / claims / member years]
+    K --> N[asset cards w/ tier badge]
+
+    style B fill:#fef3c7,stroke:#f59e0b
+    style C fill:#e5e7eb,stroke:#6b7280
+```
+
+All 6 helpers `function_exists()` guarded — Member Dashboard renders empty/zero when SN system not active (Phase 2 W7 atomic deploy gate). PHPUnit `tests/helpers/SnMemberHelpersTest.php` covers status whitelist sanitization + days_window clamping + member_years math + user_id validation.

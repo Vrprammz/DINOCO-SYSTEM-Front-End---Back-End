@@ -109,6 +109,10 @@
 | [System] DINOCO MCP Bridge | V.2.2 | 1050 | -- | REST API Bridge for OpenClaw (32 endpoints, per-lead storage) |
 | [System] DINOCO GDPR Data Requests | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — Thai PDPA compliance stubs. 3 endpoints `/wp-json/dinoco-gdpr/v1/{my-data-export,my-data-delete,my-data-status}`. Flag `dinoco_gdpr_enabled` default OFF → returns 503. Schema `wp_dinoco_gdpr_requests` (id, user_id, type, status, created_at, processed_at, notes) lazy-install via `dbDelta` on first use. Data scope: wp_users + wp_usermeta + distributor CPT + warranties + claims + B2B orders + LINE messages (via agent:3000). Full impl + admin review UI deferred to Phase 6. |
 | [System] DINOCO LIFF Asset Loader | V.1.0 | pending | -- | **NEW (Phase 6, 2026-04-17)** — Manifest-based Vite build enqueue helper. `dinoco_liff_enqueue($entry_name)` reads `dist/liff/manifest.json` and enqueues the hashed JS + CSS assets. **Scaffold only** — no active call yet (inline rendering in Snippet 4 intact as fallback). Future: Snippet 4 migration will call `dinoco_liff_enqueue('b2b-catalog')` + drop inline blocks. Goal: address PERF-H6 (155KB inline → <10KB shell). |
+| [System] DINOCO SN REST API | V.0.11 | 1196 | -- | **NEW (v2.13 Phase 1, 2026-05-04)** — Production S/N Management REST namespace `/dinoco-sn/v1/*` (29+ endpoints). Phase 0-3 coverage: batches CRUD + receive (bulk D4 contract) + lookup (PII-stripped, 60s cache) + sc-lookup (warehouse cap) + activate + audit + void/swap/recall/reissue (4-eyes tier matrix) + LTV + fraud queue + geo heatmap + stolen registry + demand forecast. Idempotency-Key wrapper includes `actor_user_id` (Round 30+ pattern). Phase 3 audit closed 6 P0 + 4 P1 findings. |
+| [System] DINOCO Warranty Activation LIFF | V.0.1 | 1197 | `[dinoco_warranty_activate]` | **NEW (v2.13 Phase 1, 2026-05-04)** — Customer-facing LIFF route `/warranty/activate?sn=...`. 5 UX states (landing/form/already_registered/not_yet_shipped/error). D11 fix: LINE OAuth + WP session reuse (NO new JWT). Atomic activate handler: SELECT FOR UPDATE + flip status=registered + create warranty_registration CPT + mirror serial_code ACF backward compat. |
+| [System] DINOCO SN Quick Lookup | V.0.2 | 1198 | `[dinoco_sc_quick_lookup]` | **NEW (v2.13 Phase 3 W8.5, 2026-05-04)** — Mobile-first read-only verify shortcode for Service Center walk-in lookup. Permission: `dinoco_sn_warehouse` OR `manage_options`. 48px touch targets, USB barcode scanner support, status-aware action hints. Wires to `/sc-lookup/{sn}` (warehouse cap) instead of admin-only `/sn/{sn}`. |
+| [System] DINOCO Stolen Plate Public Verify | V.0.1 | 1199 | `[dinoco_stolen_check]` | **NEW (v2.13 Phase 3 W11 F#14, 2026-05-05)** — Public-facing verify shortcode for police/insurance/dealer to check plate before second-hand resale. Wires to `/dinoco-sn/v1/stolen/verify/{sn}` (boolean only — no PII oracle leak, 5-min cache, 30/min/IP rate limit). REG-082 alignment: uses "มีรายงานในระบบ" never "ถูกแจ้งหาย" (anti social-engineering). Self-contained CSS+JS scoped `.dnc-sn-stolen-*`. |
 
 ### 2.2 [Admin System] -- Admin/Management
 
@@ -131,6 +135,8 @@
 | [Admin System] Product Catalog Export Tool | V.1.2 | pending | -- | 1-click ZIP bundle (5 CSVs incl. migration-audit-report) for offline analysis |
 | [Admin System] DINOCO Modal Helpers | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — shared `window.dinocoModal.{confirm,alert,prompt}({})` API replacing native blocking dialogs. Scoped `.dnc-modal-*` CSS + ESC/focus-trap/backdrop-click/native-fallback. 6 destructive admin sites migrated (BO confirm/reject/cancel-item/split-bo + B2F rejectLot + Phase 4 LIVE). 67 sites remaining for Phase 6 bulk migration. |
 | [Admin System] DINOCO Observability | V.1.0 | pending | -- | **NEW (Phase 5, 2026-04-17)** — Sentry + correlation ID + structured logs. 5 functions (`is_enabled`, `init_sentry`, `capture`, `get_request_id`, `rest_post_dispatch` correlation filter). 3 wp_option flags default=0: `dinoco_obs_sentry_enabled`, `dinoco_obs_correlation_enabled`, `dinoco_obs_structured_log`. Defensive `class_exists('\Sentry\Client')` — zero behavior change if SDK missing. Activate via `composer require sentry/sentry` + flag flip. |
+| [Admin System] DINOCO Production SN Manager | V.0.18 | 1195 | `[dinoco_admin_production_sn]` | **NEW (v2.13 Phase 0-3, 2026-05-04..05)** — Foundation snippet for Production S/N Management System. Schema lazy-install on `admin_init` (15 tables incl. sn_pool split hot/cold + audit + 11 supporting). 9 admin tabs (Batches/รับเพลท/Pool/จัดการ/Audit/VIP/Fraud/Geo/Stolen) embedded in Inventory DB tab 8 via `do_shortcode`. Module Registry self-registration (section=inventory, order=25). 5 feature flags default OFF (`dinoco_sn_system_enabled` master). 3 capabilities (`dinoco_sn_warehouse` / `dinoco_sn_approver` / `dinoco_sn_view_pii`). Hierarchy resolver `dinoco_sn_required_plates_for_sku()` + DD-3 array_unique. **V.0.17 (Phase 3 W9)**: 6 Flex template builders (expiry/anniversary/review_request) — pure helpers, dispatcher-routed. **V.0.18 (Phase 2 W7)**: 6 Member Dashboard read-only helpers (user_plates / expiring / ltv / pending_reviews / anniversaries / user_stats). 9 cron jobs heartbeat-tracked. Boss must answer Q21 LINE Premium tier before flipping `dinoco_sn_notification_send_enabled`. |
+| [Admin System] DINOCO Public API Gateway | V.0.1 | pending | -- | **NEW (v2.13 Phase 4 W12 F#15, 2026-05-04)** — External partner API namespace `/dinoco-sn-api/v1/*` (3 public endpoints: verify/claim-status/stolen-check, all PII-stripped). Token format `pk_<32hex>` + `sk_<48hex>` secret stored as `wp_hash_password`. HMAC-SHA256 signing (X-API-Key + X-API-Sig + X-API-Timestamp). Admin CRUD namespace `/dinoco-sn/v1/api-tokens/*`. 4 partner types (dealer/insurance/government/other). 4 scopes (verify/claim_status/stolen_check/full). 90-day cleanup cron `dinoco_sn_pubapi_log_cleanup_cron`. |
 
 ### 2.3 [AdminSystem-System] -- Infrastructure
 
@@ -520,6 +526,65 @@ github-sync (webhook), github-sync-manual, sync-status
 | GET | `/my-data-status` | WP login | Check status of active request |
 
 **Status**: Phase 5 scaffold (2026-04-17). All 3 return 503 until `dinoco_gdpr_enabled=1`. Schema `wp_dinoco_gdpr_requests` lazy-install on first activation. Admin review UI deferred to Phase 6.
+
+### 3.10 S/N Management Admin (`/wp-json/dinoco-sn/v1/`) -- v2.13 Phase 0-4
+
+29+ endpoints in `[System] DINOCO SN REST API` V.0.11+. Full namespace covered in `docs/api/openapi.yaml` SN-Admin tag. All flag-gated by `dinoco_sn_system_enabled` (default 0).
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/version` | Public | Health check + schema version + enabled flag |
+| POST | `/batches` | manage_options + Idem-Key | Create batch (qty, prefix, allocation strategy) |
+| GET | `/batches` | manage_options | List batches with pagination + status filter |
+| GET | `/batches/{id}` | manage_options | Batch detail + qty progress |
+| PATCH | `/batches/{id}` | manage_options + Idem-Key | Update batch status (draft → sent_to_factory → received) |
+| GET | `/batches/{id}/csv` | manage_options | Download CSV (chunked stream 5000/iter, 1M plates safe) |
+| GET | `/batches/{id}/qr-pdf?chunk=N` | manage_options | QR PDF (5000/file ~250MB max) — Phase 1 W4 PDF lib |
+| POST | `/receive` | sn_warehouse + Idem-Key | Single plate receive with FOR UPDATE lock |
+| POST | `/receive/bulk` | sn_warehouse + Idem-Key | Bulk receive D4 contract: per-row atomic + skip-conflicts default + chunk cap 100 |
+| GET | `/lookup/{sn}` | Public + 30/min/IP | Verify activation status — **PII-stripped** (no SKU / owner / batch leak) + 60s cache |
+| GET | `/sc-lookup/{sn}` | sn_warehouse OR manage_options | Service Center walk-in lookup (returns top_set_sku + warranty_until — gated by warehouse cap) |
+| POST | `/activate` | LINE OAuth + WP session | Customer activate (D11 fix — no JWT) |
+| POST | `/required-plates` | manage_options | Hierarchy resolver: SKU + qty → leaf plates needed (DD-3 array_unique) |
+| GET | `/pool-stats` | manage_options | SUM(CASE WHEN) portable per-status counters |
+| GET | `/search?q=...&filters=...` | manage_options | Tag-chip universal search (sn / dealer / customer / batch) |
+| GET | `/sn/{sn}` | manage_options | Full plate detail incl. PII + audit timeline |
+| GET | `/audit?sn=...&actor=...&since=...` | manage_options | Audit log filtered timeline |
+| POST | `/void` | dinoco_sn_approver + Idem-Key | Void plate (4-eyes for status > in_pool) |
+| POST | `/swap` | dinoco_sn_approver + Idem-Key | Swap S/N — atomic NULL-binding pattern + RuntimeException on update fail |
+| POST | `/recall` | dinoco_sn_approver + Idem-Key | Recall plate (4-eyes mandatory) |
+| POST | `/reissue` | dinoco_sn_approver + Idem-Key | Reissue plate (M2 plate-fell-off scenario) |
+| GET | `/reconcile-report` | manage_options | Variance report (physical count vs system) |
+| GET | `/ltv/list` | manage_options | LTV snapshot list (paginated, sortable by tier) |
+| GET | `/ltv/{user_id}` | manage_options | Customer drill-down (orders + claims + reviews + cross-sell) |
+| GET | `/fraud/queue` | manage_options | Fraud review queue (score >= 70) |
+| GET | `/fraud/stats` | manage_options | F#12 6-factor scoring metrics |
+| POST | `/fraud/{id}/decision` | manage_options + Idem-Key | Mark legit / suspicious / fraud + cascading actions |
+| GET | `/geo/heatmap` | manage_options | F#13 GeoJSON activation density per province |
+| GET | `/geo/gray-market` | manage_options | Gray market suspect provinces (no dealer + activations > 10/mo) |
+| POST | `/stolen/report` | LINE OAuth + WP session | Customer reports stolen plate + police report evidence |
+| GET | `/stolen/list` | manage_options | Active stolen reports |
+| POST | `/stolen/{id}/decision` | manage_options + Idem-Key | Verify / recover / close report |
+| GET | `/stolen/verify/{sn}` | Public + 30/min/IP + 5min cache | Boolean only (is_stolen + reported_at date) — REG-082 anti social-engineering |
+| GET | `/forecast/sku/{sku}` | manage_options | F#16 6-month forecast per SKU + suggested order qty |
+| GET | `/forecast/all` | manage_options | All SKUs forecast + critical reorder list |
+| GET, POST | `/api-tokens/*` | manage_options | Phase 4 W12 F#15 partner token CRUD |
+
+### 3.11 S/N Public Partner API (`/wp-json/dinoco-sn-api/v1/`) -- v2.13 Phase 4 W12 F#15
+
+External partner API in `[Admin System] DINOCO Public API Gateway` V.0.1+. HMAC-SHA256 signing required (X-API-Key + X-API-Sig + X-API-Timestamp).
+
+| Method | Endpoint | Scope | Description |
+|--------|----------|-------|-------------|
+| POST | `/verify` | verify | Partner-side plate authenticity check (rate-limited per token) |
+| POST | `/claim-status` | claim_status | Insurance partner claim status query (limited PII) |
+| POST | `/stolen-check` | stolen_check | Police/insurance stolen registry query (boolean only) |
+
+Partner types: dealer / insurance / government / other. Token format: `pk_<32hex>` + `sk_<48hex>` (secret stored as `wp_hash_password`). 90-day cleanup cron `dinoco_sn_pubapi_log_cleanup_cron`. Documented in `docs/api/openapi.yaml` SN-Public tag + `snApiKey` securityScheme.
+
+### 3.12 MCP Bridge S/N integration (`/wp-json/dinoco-mcp/v1/sn-lookup`)
+
+Added in `[System] DINOCO MCP Bridge` V.2.9 (V.2.13 Phase 4 W14 prep) — chatbot-bound endpoint. PII-stripped output. Used by OpenClaw `dinoco-tools.js` 3 tools post-refactor: `dinoco_warranty_check` (extended return shape) + `dinoco_serial_lookup` (NEW canonical) + `dinoco_create_claim` (validates against sn_pool before insert). Section 15 chatbot rules govern usage.
 
 ---
 
@@ -1026,6 +1091,30 @@ Created 2026-04-16 alongside junction table. Drift log for CPT vs junction compa
 - `b2f_schema_version` = `'10.1'`
 - `b2f_schema_v10_activated` = unix timestamp (set after dbDelta success)
 - `b2f_phase2_backfill_state` = JSON `{ran_at, cpt_migrated, orphans_added, errors, elapsed_ms, uid}`
+
+#### S/N Management 15 tables (Phase 0-4 v2.13)
+
+Created via lazy `dbDelta` on `admin_init` in `[Admin System] DINOCO Production SN Manager`. Schema marker `dinoco_sn_schema_version` (`'1.0'`). Plan v2.12 §B3 split hot path (`sn_pool` 12 cols) from cold meta (`sn_pool_meta` 7 cols) for 50% query speedup at 1M rows.
+
+| Table | Purpose | Phase |
+|-------|---------|-------|
+| `dinoco_sn_batches` | Batch metadata + qty_received counter | 1 |
+| `dinoco_sn_pool` | PK `sn` (utf8mb4_bin), 12-state status enum, prev_status revert, lock_version optimistic concurrency | 1 |
+| `dinoco_sn_pool_meta` | 1:1 cold join — purchase_dealer_id, top_set_sku, stolen_at, replacement chain, legacy_request_id | 1 |
+| `dinoco_sn_audit` | Immutable audit log — 5y sensitive_op + 3y operational retention split | 1 |
+| `dinoco_sn_notifications` | F#1/F#4/F#10 dispatch queue + UNIQUE dedup composite key (P0-4 fix) | 3 W9 |
+| `dinoco_sn_promo_codes` | F#1 cross-sell codes + redemption hook | 3 W9 |
+| `dinoco_sn_customer_ltv_snapshot` | F#9 daily 03:00 cron-fed aggregate | 3 W10 |
+| `dinoco_sn_review_requests` | F#10 30-day post-activate review request tracker | 3 W9 |
+| `dinoco_sn_fraud_scores` | F#12 6-factor scoring (velocity 25 + geo 20 + phone 20 + time 15 + sequential 10 + receipt 10) | 3 W11 |
+| `dinoco_sn_geo_activations` | F#13 IP geolocation + LINE region cross-reference per activate | 3 W11 |
+| `dinoco_sn_stolen_log` | F#14 customer reports + police_report_no + admin verify chain | 3 W11 |
+| `dinoco_sn_api_tokens` | F#15 partner token CRUD (pk_*/sk_* + scopes + IP allowlist) | 4 W12 |
+| `dinoco_sn_api_log` | F#15 partner request audit (90-day cleanup) | 4 W12 |
+| `dinoco_sn_demand_forecast` | F#16 6-month per-SKU forecast snapshot | 4 W13 |
+| `dinoco_sn_warranty_extensions` | F#8 1-year/2-year extension purchase records | 5 |
+
+**Indexes (per-table):** All hot-path queries covered. `sn_pool` has `idx_status`, `idx_registered_user`, `idx_legacy_request`, `idx_replaces` for swap chain lookup. `sn_audit` has `idx_sn_time` + `idx_actor` for forensics drill-down. utf8mb4_bin on `sn` columns enforces UPPER case-sensitive match (matches DINOCO_Catalog SKU pattern).
 
 ### 5.4 wp_options (Shared State)
 
@@ -2103,6 +2192,17 @@ sequenceDiagram
 | `define('B2F_DISABLED', true)` | All B2F snippets (0-11) | Disables entire B2F system |
 | `define('DISABLE_WP_CRON', true)` | WordPress Cron | Use external cron trigger instead |
 | Unset `TELEGRAM_BOT_TOKEN` | Telegram Bot (OpenClaw) | Disables น้องกุ้ง + alerts (graceful -- no crash) |
+| `update_option('dinoco_sn_system_enabled', '0')` | All S/N system writes (REST + cron + LIFF activate) | Hard kill switch — REST returns 503, cron skips, customer activate falls back to legacy `[dinoco_gateway]` |
+| `update_option('dinoco_sn_notification_send_enabled', '0')` | F#1/F#4/F#10 LINE Flex push | Cron still queues notifications for visibility but ZERO LINE quota burned (boss decides Q21 Premium tier ฿1,500/mo before flipping ON) |
+| `update_option('dinoco_sn_block_legacy_serial_code', '0')` | `serial_code` ACF mirror | When `'1'` blocks legacy direct edits — Phase 2 W7 V.31.0 deploy gate |
+| `update_option('dinoco_sn_require_2sig_for_swap', '1')` | Swap/void approval | Default ON — 4-eyes mandatory for sensitive ops |
+| `update_option('dinoco_sn_require_2sig_for_recall', '1')` | Recall approval | Default ON — 4-eyes mandatory for mass defect recall |
+
+**S/N rollback levels** (instant → progressive):
+
+1. **Soft kill** — `update_option('dinoco_sn_system_enabled', '0')` → REST 503 + cron skip + LIFF fallback. No redeploy.
+2. **Schema rollback** — keep tables (don't drop) + revert ALTER on `wp_dinoco_products`. 1-day notice.
+3. **Hard rollback** — export `sn_pool` to CSV → drop tables → re-enable old `serial_code`-only flow. Last resort, > 7 days observation needed.
 
 ---
 
