@@ -27,6 +27,7 @@ const SN_SNIPPETS = {
     liff: '[System] DINOCO Warranty Activation LIFF',
     sc_lookup: '[System] DINOCO SN Quick Lookup',  // Phase 3 W8.5
     public_api: '[Admin System] DINOCO Public API Gateway',  // Phase 4 W12 F#15
+    stolen_check: '[System] DINOCO Stolen Plate Public Verify',  // Phase 3 W11 F#14
 };
 
 const readSnippet = (key) => {
@@ -953,6 +954,28 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(content).toContain('expiry');
         expect(content).toContain('anniversary');
         expect(content).toContain('review');
+    });
+
+    test('Phase 3 W11 F#14 stolen_check public shortcode registered', () => {
+        const code = readSnippet('stolen_check');
+        // Shortcode + render fn
+        expect(code).toMatch(/add_shortcode\(\s*['"]dinoco_stolen_check['"]/);
+        expect(code).toContain('function dinoco_sn_stolen_check_render');
+        // Wires to existing REST endpoint /stolen/verify/
+        expect(code).toContain("'dinoco-sn/v1/stolen/verify/'");
+        // Privacy guards: no PII rendering, REG-082 wording
+        expect(code).toContain('มีรายงานในระบบ');
+        // Banned phrase must not appear in user-facing markup (textContent / output).
+        // Strip comment block before checking — banned word is mentioned IN the
+        // comment as the rule explanation, which is correct.
+        const codeWithoutComments = code.replace(/\/\*[\s\S]*?\*\//g, '');
+        expect(codeWithoutComments).not.toMatch(/ถูกแจ้งหาย/);
+        // Self-contained — no enqueue calls (inline CSS+JS)
+        expect(code).not.toMatch(/wp_enqueue_(script|style)/);
+        // Rate-limit awareness in JS
+        expect(code).toContain('rate_limit');
+        // Mobile-first touch targets ≥48px
+        expect(code).toMatch(/min-height:\s*48px/);
     });
 
     test('Phase 0 W1 docs deliverables exist', () => {
