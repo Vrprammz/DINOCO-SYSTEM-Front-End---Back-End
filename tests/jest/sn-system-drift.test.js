@@ -569,6 +569,53 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(cron).toMatch(/is_in_dealer_territory\s*=\s*0/);
     });
 
+    test('Phase 3 W11 F#12 Anti-Fraud 6-factor scoring engine', () => {
+        const code = readSnippet('manager');
+        // Pure helper exists
+        expect(code).toContain('dinoco_sn_compute_fraud_score');
+        expect(code).toContain('dinoco_sn_record_fraud_score');
+        // 6 factors with documented weights summing to 100
+        ['velocity', 'geographic', 'phone_pattern', 'time_pattern', 'sequential', 'receipt']
+            .forEach(factor => expect(code).toContain(`'${factor}'`));
+        // Configurable thresholds via wp_options
+        expect(code).toContain('dinoco_sn_fraud_block_threshold');
+        expect(code).toContain('dinoco_sn_fraud_monitor_threshold');
+        // Tier classification
+        ['safe', 'monitor', 'block'].forEach(tier => expect(code).toContain(`'${tier}'`));
+    });
+
+    test('Phase 3 W11 F#12 fraud REST endpoints + cron + decision audit', () => {
+        const code = readSnippet('rest');
+        const manager = readSnippet('manager');
+        // 3 endpoints
+        expect(code).toContain("'/fraud/queue'");
+        expect(code).toContain("'/fraud/stats'");
+        expect(code).toContain("'/fraud/(?P<id>\\d+)/decision'");
+        // Handlers
+        expect(code).toContain('dinoco_sn_rest_fraud_queue');
+        expect(code).toContain('dinoco_sn_rest_fraud_stats');
+        expect(code).toContain('dinoco_sn_rest_fraud_decision');
+        // Hourly aggregate cron
+        expect(manager).toContain('dinoco_sn_fraud_aggregate_cron');
+        expect(manager).toContain('dinoco_sn_run_fraud_aggregate');
+        // Decisions whitelist
+        const decision = code.split('function dinoco_sn_rest_fraud_decision')[1] || '';
+        ['legit', 'fraud', 'suspicious'].forEach(d => expect(decision).toContain(`'${d}'`));
+        // Sensitive audit (5y retention)
+        expect(decision).toContain('dinoco_sn_audit_log');
+    });
+
+    test('Phase 3 W11 F#12 fraud queue filters unreviewed only', () => {
+        const code = readSnippet('rest');
+        const handler = code.split('function dinoco_sn_rest_fraud_queue')[1] || '';
+        // Queue should only show pending review (outcome IS NULL)
+        expect(handler).toMatch(/outcome\s+IS\s+NULL/);
+        // Min score threshold filter
+        expect(handler).toContain('min_score');
+        // Returns factors decoded + tier classification per row
+        expect(handler).toContain('factors_json');
+    });
+
     test('15 schema tables defined in Production S/N Manager', () => {
         const code = readSnippet('manager');
         const expected_tables = [

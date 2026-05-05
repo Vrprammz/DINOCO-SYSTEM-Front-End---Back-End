@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.14 (2026-05-05) — Phase 3 W11 F#12 Anti-Fraud 6-factor + cron║
  * ║  Version: V.0.13 (2026-05-05) — Phase 3 W11 F#13 Gray Market scan cron + helper║
  * ║  Version: V.0.12 (2026-05-05) — Phase 3 W10 F#9 Customer LTV Dashboard (Tab 6)║
  * ║  Version: V.0.11 (2026-05-05) — Audit fixes P0-3/4 + P1-4 (sql + UNIQUE + INSERT IGNORE)║
@@ -3167,6 +3168,166 @@ if ( ! function_exists( 'dinoco_sn_run_expiry_schedule' ) ) {
     }
 }
 
+if ( ! function_exists( 'dinoco_sn_compute_fraud_score' ) ) {
+    /**
+     * Phase 3 W11 — F#12 Anti-Fraud 6-factor scoring engine.
+     *
+     * Pure function (testable). Returns int 0-100.
+     *
+     * 6 factors (max sum = 100):
+     *   velocity      max 25  — same IP/device > N activate/hour
+     *   geographic    max 20  — activate in province with no DINOCO dealer
+     *   phone_pattern max 20  — duplicate phone across multiple plates
+     *   time_pattern  max 15  — activate at outlier hours (3am etc)
+     *   sequential    max 10  — burst of consecutive S/Ns in short window
+     *   receipt       max 10  — receipt OCR mismatch with shipped_at
+     *
+     * Thresholds (configurable via wp_options):
+     *   < 50          safe (allow + log)
+     *   50-69         monitor (allow + flag for review)
+     *   ≥ 70          block (queue + admin verdict required)
+     *
+     * Each factor accepts 0-1 normalized signal × max_weight =
+     * weighted score; total = sum of all 6 weighted scores, clamped 0-100.
+     */
+    function dinoco_sn_compute_fraud_score( array $signals ): array {
+        $weights = array(
+            'velocity'      => 25,
+            'geographic'    => 20,
+            'phone_pattern' => 20,
+            'time_pattern'  => 15,
+            'sequential'    => 10,
+            'receipt'       => 10,
+        );
+
+        $factors = array();
+        $total = 0;
+        foreach ( $weights as $key => $max_weight ) {
+            $signal = isset( $signals[ $key ] ) ? (float) $signals[ $key ] : 0.0;
+            // Clamp signal to [0, 1] — caller may send confidence/probability
+            $signal = max( 0.0, min( 1.0, $signal ) );
+            $weighted = (int) round( $signal * $max_weight );
+            $factors[ $key ] = array(
+                'signal'   => $signal,
+                'weight'   => $max_weight,
+                'weighted' => $weighted,
+            );
+            $total += $weighted;
+        }
+
+        // Clamp total 0-100 (defensive — should already be capped by weights)
+        $total = max( 0, min( 100, $total ) );
+
+        $threshold_block   = (int) get_option( 'dinoco_sn_fraud_block_threshold', 70 );
+        $threshold_monitor = (int) get_option( 'dinoco_sn_fraud_monitor_threshold', 50 );
+
+        $tier = 'safe';
+        if ( $total >= $threshold_block ) $tier = 'block';
+        elseif ( $total >= $threshold_monitor ) $tier = 'monitor';
+
+        return array(
+            'score'   => $total,
+            'tier'    => $tier,
+            'factors' => $factors,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_record_fraud_score' ) ) {
+    /**
+     * Insert fraud_scores row from event handler (e.g., activate flow).
+     * Called via internal hook — not a public REST endpoint.
+     */
+    function dinoco_sn_record_fraud_score( $sn, $event_type, array $signals, array $context = array() ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'fraud_scores' ) ) {
+            return false;
+        }
+
+        $sn = strtoupper( trim( (string) $sn ) );
+        $event_type = sanitize_key( (string) $event_type );
+        if ( $sn === '' || $event_type === '' ) return false;
+
+        $allowed_events = array( 'activate', 'transfer', 'swap', 'claim', 'lookup' );
+        if ( ! in_array( $event_type, $allowed_events, true ) ) {
+            return false;
+        }
+
+        $result = dinoco_sn_compute_fraud_score( $signals );
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'fraud_scores' );
+
+        $ok = $wpdb->insert( $tbl, array(
+            'sn'           => $sn,
+            'event_type'   => $event_type,
+            'score'        => $result['score'],
+            'factors_json' => wp_json_encode( $result['factors'] ),
+            'ip_address'   => isset( $context['ip'] ) ? mb_substr( (string) $context['ip'], 0, 45 ) : null,
+            'user_agent'   => isset( $context['user_agent'] ) ? mb_substr( (string) $context['user_agent'], 0, 255 ) : null,
+            'device_fp'    => isset( $context['device_fp'] ) ? mb_substr( (string) $context['device_fp'], 0, 64 ) : null,
+            'geo_country'  => isset( $context['geo_country'] ) ? mb_substr( (string) $context['geo_country'], 0, 2 ) : null,
+            'geo_province' => isset( $context['geo_province'] ) ? mb_substr( (string) $context['geo_province'], 0, 64 ) : null,
+            // outcome NULL initially — admin verdict via /fraud/{id}/decision
+            'outcome'      => $result['tier'] === 'safe' ? 'legit' : null,
+            'created_at'   => current_time( 'mysql' ),
+        ) );
+
+        return $ok ? array(
+            'id'    => (int) $wpdb->insert_id,
+            'score' => $result['score'],
+            'tier'  => $result['tier'],
+        ) : false;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_run_fraud_aggregate' ) ) {
+    /**
+     * Phase 3 W11 — F#12 hourly aggregate
+     *
+     * Hourly — count fraud confirmed in last 24h. If > N (default 5) →
+     * write alert option for boss notification (Phase 4 wires Telegram).
+     * Detects mass-attack signal (coordinated fraud burst).
+     */
+    function dinoco_sn_run_fraud_aggregate() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'fraud_scores' ) ) return;
+
+        try {
+            global $wpdb;
+            $tbl = dinoco_sn_table( 'fraud_scores' );
+
+            $confirmed_24h = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$tbl}
+                 WHERE outcome = 'fraud'
+                   AND reviewed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+            );
+
+            $pending_review = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$tbl}
+                 WHERE outcome IS NULL
+                   AND score >= 70"
+            );
+
+            $threshold = (int) get_option( 'dinoco_sn_fraud_alert_threshold', 5 );
+            $alert = $confirmed_24h >= $threshold;
+
+            update_option( 'dinoco_sn_fraud_aggregate_last_run', array(
+                'at'              => current_time( 'mysql' ),
+                'confirmed_24h'   => $confirmed_24h,
+                'pending_review'  => $pending_review,
+                'alert_threshold' => $threshold,
+                'alert_active'    => $alert,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_fraud_aggregate' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_fraud_aggregate_last_run', current_time( 'mysql' ) );
+    }
+}
+
 if ( ! function_exists( 'dinoco_sn_run_gray_market_scan' ) ) {
     /**
      * Phase 3 W11 — F#13 Gray Market weekly scan
@@ -3622,6 +3783,10 @@ add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'dinoco_sn_gray_market_scan_cron' ) ) {
         wp_schedule_event( time(), 'weekly', 'dinoco_sn_gray_market_scan_cron' );
     }
+    // Phase 3 W11 — F#12 Anti-Fraud hourly aggregate
+    if ( ! wp_next_scheduled( 'dinoco_sn_fraud_aggregate_cron' ) ) {
+        wp_schedule_event( time(), 'hourly', 'dinoco_sn_fraud_aggregate_cron' );
+    }
 
     if ( function_exists( 'dinoco_register_cron' ) ) {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
@@ -3635,6 +3800,7 @@ add_action( 'init', function() {
         dinoco_register_cron( 'dinoco_sn_review_request_cron', 'daily', 'dinoco_sn_run_review_request_schedule' );
         dinoco_register_cron( 'dinoco_sn_ltv_snapshot_cron', 'daily', 'dinoco_sn_run_ltv_snapshot' );
         dinoco_register_cron( 'dinoco_sn_gray_market_scan_cron', 'weekly', 'dinoco_sn_run_gray_market_scan' );
+        dinoco_register_cron( 'dinoco_sn_fraud_aggregate_cron', 'hourly', 'dinoco_sn_run_fraud_aggregate' );
     } else {
         // Fallback when Idempotency Helper / registry wrapper not synced
         if ( ! has_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' ) ) {
@@ -3663,6 +3829,9 @@ add_action( 'init', function() {
         }
         if ( ! has_action( 'dinoco_sn_gray_market_scan_cron', 'dinoco_sn_run_gray_market_scan' ) ) {
             add_action( 'dinoco_sn_gray_market_scan_cron', 'dinoco_sn_run_gray_market_scan' );
+        }
+        if ( ! has_action( 'dinoco_sn_fraud_aggregate_cron', 'dinoco_sn_run_fraud_aggregate' ) ) {
+            add_action( 'dinoco_sn_fraud_aggregate_cron', 'dinoco_sn_run_fraud_aggregate' );
         }
     }
 } );

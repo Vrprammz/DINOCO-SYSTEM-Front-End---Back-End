@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.10 (2026-05-05) — Phase 3 W11 F#12 Anti-Fraud (3 endpoints + queue + decision)║
  * ║  Version: V.0.9 (2026-05-05) — Phase 3 W11 F#13 Geographic Heatmap (2 endpoints + helper)║
  * ║  Version: V.0.8 (2026-05-05) — Phase 3 W11 F#14 Stolen Registry (4 endpoints)║
  * ║  Version: V.0.7 (2026-05-05) — Phase 3 W10 F#9 LTV /list + /{user_id} drill-down║
@@ -685,6 +686,39 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             'permission_callback' => 'dinoco_sn_perm_admin',
             'args'                => array(
                 'days' => array( 'type' => 'integer', 'default' => 30, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        /* ─── Phase 3 W11 — F#12 Anti-Fraud Engine ─── */
+
+        // GET /fraud/queue — admin review queue (pending + scored ≥ threshold)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/fraud/queue', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_fraud_queue',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'min_score' => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+                'limit'     => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+                'offset'    => array( 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /fraud/stats — dashboard metrics (last 7d + 24h + risk dist)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/fraud/stats', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_fraud_stats',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+        ) );
+
+        // POST /fraud/{id}/decision — admin verdict (legit / fraud / suspicious)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/fraud/(?P<id>\d+)/decision', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_fraud_decision',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id'       => array( 'required' => true, 'type' => 'integer' ),
+                'decision' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_key' ),
+                'notes'    => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
             ),
         ) );
     }
@@ -3320,5 +3354,225 @@ if ( ! function_exists( 'dinoco_sn_record_geo_activation' ) ) {
             'is_gray_market_suspect' => ! empty( $opts['is_gray_market_suspect'] ) ? 1 : 0,
             'created_at'             => current_time( 'mysql' ),
         ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 12. PHASE 3 W11 — F#12 ANTI-FRAUD ENGINE HANDLERS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Reads from wp_dinoco_sn_fraud_scores table (populated by activate flow
+ * + manual admin trigger). Decision flow:
+ *
+ *   activate event → compute_fraud_score → record_fraud_score row
+ *     ↓
+ *   score >= block_threshold (70) → block + queue for admin review
+ *   score >= monitor_threshold (50) → allow + flag for review
+ *   score < monitor → allow + auto-mark outcome=legit
+ *     ↓
+ *   admin opens /fraud/queue → reviews evidence → POST /fraud/{id}/decision
+ *     ↓
+ *   decision=fraud → block customer (Phase 4 cascading void) + Telegram boss
+ *   decision=legit → unblock + override
+ *   decision=suspicious → flag for monitoring (no action yet)
+ */
+
+if ( ! function_exists( 'dinoco_sn_rest_fraud_queue' ) ) {
+    function dinoco_sn_rest_fraud_queue( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'fraud_scores' ) ) {
+            return rest_ensure_response( array( 'rows' => array(), 'total' => 0 ) );
+        }
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'fraud_scores' );
+
+        $min_score = max( 0, min( 100, (int) $req->get_param( 'min_score' ) ) );
+        $limit     = max( 1, min( 200, (int) $req->get_param( 'limit' ) ) );
+        $offset    = max( 0, (int) $req->get_param( 'offset' ) );
+
+        // Show only unreviewed events with score >= min_score
+        $where = "WHERE outcome IS NULL AND score >= %d";
+
+        $total = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$tbl} {$where}",
+            $min_score
+        ) );
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, sn, event_type, score, factors_json,
+                    ip_address, geo_country, geo_province, created_at
+             FROM {$tbl}
+             {$where}
+             ORDER BY score DESC, created_at DESC
+             LIMIT %d OFFSET %d",
+            $min_score, $limit, $offset
+        ), ARRAY_A );
+
+        // Decode factors_json + classify tier per-row
+        $rows = array_map( function( $r ) {
+            $r['score'] = (int) $r['score'];
+            $r['factors'] = ! empty( $r['factors_json'] )
+                ? json_decode( $r['factors_json'], true )
+                : null;
+            unset( $r['factors_json'] );
+            $r['tier'] = $r['score'] >= 70 ? 'block'
+                       : ( $r['score'] >= 50 ? 'monitor' : 'safe' );
+            return $r;
+        }, $rows ?: array() );
+
+        return rest_ensure_response( array(
+            'rows'      => $rows,
+            'total'     => $total,
+            'limit'     => $limit,
+            'offset'    => $offset,
+            'min_score' => $min_score,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_fraud_stats' ) ) {
+    function dinoco_sn_rest_fraud_stats( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'fraud_scores' ) ) {
+            return rest_ensure_response( array( 'available' => false ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'fraud_scores' );
+
+        // Last 7 days outcome distribution
+        $outcome_dist = $wpdb->get_results(
+            "SELECT outcome, COUNT(*) AS n
+             FROM {$tbl}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+             GROUP BY outcome",
+            ARRAY_A
+        );
+        $outcomes = array( 'pending' => 0, 'legit' => 0, 'fraud' => 0, 'suspicious' => 0 );
+        foreach ( $outcome_dist ?: array() as $od ) {
+            $key = $od['outcome'] ?: 'pending';
+            if ( isset( $outcomes[ $key ] ) ) $outcomes[ $key ] = (int) $od['n'];
+        }
+
+        // Risk tier distribution last 7d
+        $tier_rows = $wpdb->get_row(
+            "SELECT
+                SUM(CASE WHEN score < 50 THEN 1 ELSE 0 END)              AS safe,
+                SUM(CASE WHEN score >= 50 AND score < 70 THEN 1 ELSE 0 END) AS monitor,
+                SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END)             AS block,
+                COUNT(*)                                                  AS total
+             FROM {$tbl}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)",
+            ARRAY_A
+        );
+        $tier_summary = $tier_rows
+            ? array_map( 'intval', $tier_rows )
+            : array( 'safe' => 0, 'monitor' => 0, 'block' => 0, 'total' => 0 );
+
+        // Last 24h confirmed fraud (mass-attack signal)
+        $confirmed_24h = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$tbl}
+             WHERE outcome = 'fraud'
+               AND reviewed_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+        );
+
+        $aggregate = get_option( 'dinoco_sn_fraud_aggregate_last_run', null );
+
+        return rest_ensure_response( array(
+            'window_days'    => 7,
+            'outcomes'       => $outcomes,
+            'tier_summary'   => $tier_summary,
+            'confirmed_24h'  => $confirmed_24h,
+            'aggregate'      => $aggregate,
+            'fetched_at'     => current_time( 'c' ),
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_fraud_decision' ) ) {
+    function dinoco_sn_rest_fraud_decision( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        return dinoco_sn_with_idempotency( $req, 'fraud-decision',
+            array( 'id', 'decision' ),
+            function( $req ) {
+                global $wpdb;
+                $id       = (int) $req->get_param( 'id' );
+                $decision = sanitize_key( (string) $req->get_param( 'decision' ) );
+                $notes    = trim( (string) $req->get_param( 'notes' ) );
+
+                $allowed = array( 'legit', 'fraud', 'suspicious' );
+                if ( ! in_array( $decision, $allowed, true ) ) {
+                    return new WP_Error( 'invalid_decision',
+                        sprintf( __( 'decision must be one of: %s', 'dinoco-sn' ), implode( ', ', $allowed ) ),
+                        array( 'status' => 400 ) );
+                }
+                if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'fraud_scores' ) ) {
+                    return new WP_Error( 'schema_not_ready', '', array( 'status' => 503 ) );
+                }
+
+                $tbl = dinoco_sn_table( 'fraud_scores' );
+                $reviewer_id = (int) get_current_user_id();
+
+                $wpdb->query( 'START TRANSACTION' );
+                try {
+                    $row = $wpdb->get_row( $wpdb->prepare(
+                        "SELECT id, sn, event_type, score, outcome, ip_address
+                         FROM {$tbl}
+                         WHERE id = %d FOR UPDATE",
+                        $id
+                    ), ARRAY_A );
+
+                    if ( ! $row ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'not_found', __( 'Fraud score not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+                    }
+                    if ( $row['outcome'] !== null && $row['outcome'] !== 'pending' ) {
+                        $wpdb->query( 'ROLLBACK' );
+                        return new WP_Error( 'already_decided',
+                            sprintf( __( 'Already decided: %s.', 'dinoco-sn' ), $row['outcome'] ),
+                            array( 'status' => 409 ) );
+                    }
+
+                    $upd = $wpdb->update( $tbl, array(
+                        'outcome'     => $decision,
+                        'reviewed_by' => $reviewer_id,
+                        'reviewed_at' => current_time( 'mysql' ),
+                    ), array( 'id' => $id ) );
+
+                    if ( $upd === false || $upd === 0 ) {
+                        throw new \RuntimeException( 'fraud_scores update failed' );
+                    }
+
+                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                        dinoco_sn_audit_log( $row['sn'], 'plate_recalled',
+                            $row['outcome'] ?: 'pending', $decision,
+                            array(
+                                'fraud_score_id' => $id,
+                                'event_type'     => $row['event_type'],
+                                'score'          => (int) $row['score'],
+                                'decision'       => $decision,
+                                'ip'             => $row['ip_address'],
+                            ),
+                            $reviewer_id, null, $notes ?: '', 'fraud_' . $decision, true );
+                    }
+
+                    $wpdb->query( 'COMMIT' );
+
+                    return rest_ensure_response( array(
+                        'success'      => true,
+                        'id'           => $id,
+                        'sn'           => $row['sn'],
+                        'decision'     => $decision,
+                        'reviewer_id'  => $reviewer_id,
+                    ) );
+                } catch ( \Throwable $e ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( $e, array( 'context' => 'sn_fraud_decision', 'id' => $id ) );
+                    }
+                    return new WP_Error( 'decision_failed', $e->getMessage(), array( 'status' => 500 ) );
+                }
+            }
+        );
     }
 }
