@@ -3001,12 +3001,14 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/activate/);
         });
 
-        test('Module Registry self-registration (key=sc_lookup, section=claims)', () => {
+        test('Module Registry self-registration (key=sc_lookup, section=system)', () => {
+            // V.31.2 (2026-05-07): section bumped 'claims' → 'system' per Module
+            // Registry whitelist (allowed: b2b|b2f|inventory|finance|ai|system|dashboard).
+            // Original 'claims' was rejected with invalid_section error on init.
             const code = readSc();
-            // Module Registry registration block exists
             expect(code).toContain("'key'         => 'sc_lookup'");
             expect(code).toContain("'shortcode'   => 'dinoco_sc_quick_lookup'");
-            expect(code).toContain("'section'     => 'claims'");
+            expect(code).toContain("'section'     => 'system'");
             expect(code).toMatch(/'order'\s*=>\s*10\b/);
             // cache_ttl must be 0 (always fresh — sensitive PII)
             expect(code).toMatch(/'cache_ttl'\s*=>\s*0\b/);
@@ -4700,14 +4702,18 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toContain('600'); // 10 min
         });
 
-        test('Module Registry self-registration call (defensive)', () => {
+        test('Module Registry registration REMOVED (V.0.2 — customer-facing not in admin)', () => {
+            // V.0.2 (2026-05-07): admin_module registration removed because Marketplace
+            // is a customer-facing LIFF, not an admin tool. Admins access via Manager
+            // V.0.31 Tab 11 (already registered under 'inventory' section).
+            // Earlier V.0.1 attempted section='customer-facing' which was rejected by
+            // Module Registry whitelist (allowed: b2b|b2f|inventory|finance|ai|system|dashboard).
             const code = readMpx();
-            expect(code).toMatch(/function_exists\(\s*['"]dinoco_register_admin_module['"]\s*\)/);
-            expect(code).toMatch(/dinoco_register_admin_module\(/);
-            expect(code).toContain("'section'");
-            expect(code).toContain("'customer-facing'");
-            expect(code).toContain("'key'");
-            expect(code).toContain("'marketplace'");
+            // Strip comments — only inspect executable code
+            const stripped = code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+            expect(stripped).not.toMatch(/dinoco_register_admin_module\s*\(\s*array/);
+            // Marketplace LIFF version bumped to V.0.2 to reflect this change
+            expect(code).toMatch(/Version: V\.0\.2 \(2026-05-07\) — REMOVED admin_module registration/);
         });
 
         test('CSS prefix .dnc-sn-mpx-* (distinct from .dnc-sn-mp-*)', () => {
@@ -5735,6 +5741,66 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(fnBlock).toContain('$prefer_liff');
             // QR codes printed on plate need web URL (not LIFF) — camera scan opens browser
             expect(fnBlock).toMatch(/home_url\(\s*\$path\s*\.\s*\$sn_q\s*\)/);
+        });
+    });
+
+    describe('Module Registry section whitelist (b2b|b2f|inventory|finance|ai|system|dashboard)', () => {
+        // Allowed sections per Module Registry whitelist (DINOCO Admin Command Center)
+        const ALLOWED_SECTIONS = ['b2b', 'b2f', 'inventory', 'finance', 'ai', 'system', 'dashboard'];
+
+        function readSnippet(filename) {
+            return fs.readFileSync(path.join(REPO_ROOT, filename), 'utf8');
+        }
+
+        test('User Role Manager uses valid section', () => {
+            const code = readSnippet('[Admin System] DINOCO User Role Manager');
+            const block = code.split("'key'         => 'sn_roles'")[1] || '';
+            const sectionMatch = block.match(/'section'\s*=>\s*'([^']+)'/);
+            expect(sectionMatch).toBeTruthy();
+            expect(ALLOWED_SECTIONS).toContain(sectionMatch[1]);
+        });
+
+        test('SC Quick Lookup uses valid section', () => {
+            const code = readSnippet('[Admin System] DINOCO Service Center & Claims');
+            const block = code.split("'key'         => 'sc_lookup'")[1] || '';
+            const sectionMatch = block.match(/'section'\s*=>\s*'([^']+)'/);
+            expect(sectionMatch).toBeTruthy();
+            expect(ALLOWED_SECTIONS).toContain(sectionMatch[1]);
+        });
+
+        test('Warranty Extension Marketplace does NOT register admin module', () => {
+            // Customer-facing LIFF should not register in Admin Command Center
+            const code = readSnippet('[System] DINOCO Warranty Extension Marketplace');
+            // No active dinoco_register_admin_module() call (only inside comments OK)
+            const stripped = code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+            expect(stripped).not.toMatch(/dinoco_register_admin_module\s*\(\s*array/);
+        });
+
+        test('All admin modules across S/N snippets use whitelisted sections', () => {
+            // Sweep all snippets that call dinoco_register_admin_module to make sure
+            // future additions can't ship a typo'd section.
+            const snippetFiles = fs.readdirSync(REPO_ROOT)
+                .filter(f => f.startsWith('[') && f.endsWith(']') === false && /^\[(Admin System|System|B2B|B2F)\]/.test(f));
+
+            const violations = [];
+            for (const file of snippetFiles) {
+                const fp = path.join(REPO_ROOT, file);
+                if (!fs.statSync(fp).isFile()) continue;
+                const code = fs.readFileSync(fp, 'utf8');
+                if (!code.includes('dinoco_register_admin_module(')) continue;
+
+                // Extract every section value used in dinoco_register_admin_module() blocks.
+                const blocks = code.split('dinoco_register_admin_module(');
+                for (let i = 1; i < blocks.length; i++) {
+                    // Take only up to the closing ); to isolate this single call.
+                    const body = blocks[i].split(/\)\s*;/)[0] || '';
+                    const m = body.match(/'section'\s*=>\s*'([^']+)'/);
+                    if (m && !ALLOWED_SECTIONS.includes(m[1])) {
+                        violations.push(`${file}: section='${m[1]}'`);
+                    }
+                }
+            }
+            expect(violations).toEqual([]);
         });
     });
 });
