@@ -1,5 +1,11 @@
 /**
  * dinoco-cache.js — WordPress data cache with stale fallback
+ * V.1.2 — Phase 4 W14.5 Round 3 (chatbot-rules.md §15.14.4 + R3 Gap "dinoco-cache.js V.1.2"):
+ *         + cacheSnLookup(sn, data, ttl_ms = 60000) — explicit per-entry TTL parameter.
+ *           Default 60s preserved (backward compat). Lazy delete on getCachedSnLookup
+ *           when expires_at < now (existing behavior — re-affirmed).
+ *         + 500-cap LRU + 60s TTL combined defense against memory growth.
+ *         + Wired into POST /webhook/sn-event (V.1.0 sn-webhook.js module).
  * V.1.1 — Phase 4 W14.5 Round 2 (chatbot-rules.md §15.10 / §15.14.4):
  *         + snLookupCache Map (per-S/N TTL 60s) for /sn-lookup responses
  *         + invalidateSnCache(sn) / invalidateAllSnCache() — wired by WP webhook hook
@@ -85,7 +91,10 @@ function getCachedSnLookup(sn) {
   return entry.data;
 }
 
-function cacheSnLookup(sn, data) {
+// V.1.2 (R3) — explicit ttl_ms parameter (default 60000ms = 60s).
+// Caller can override for short-lived high-confidence caches (e.g. immediately
+// after activation, server may emit a hint). Bounded 1s..7d for safety.
+function cacheSnLookup(sn, data, ttl_ms) {
   const key = _normalizeSnKey(sn);
   if (!key || !data) return;
   // Soft eviction — drop oldest 50 entries when cap hit (Map preserves insertion order)
@@ -97,7 +106,14 @@ function cacheSnLookup(sn, data) {
       snLookupCache.delete(k);
     }
   }
-  snLookupCache.set(key, { data, expires: Date.now() + SN_LOOKUP_TTL });
+  // Validate ttl_ms — fall back to default if not a finite positive number
+  const TTL_MIN = 1000;             // 1s
+  const TTL_MAX = 7 * 24 * 60 * 60 * 1000; // 7 days
+  let ttl = SN_LOOKUP_TTL;
+  if (typeof ttl_ms === "number" && Number.isFinite(ttl_ms) && ttl_ms > 0) {
+    ttl = Math.max(TTL_MIN, Math.min(TTL_MAX, ttl_ms));
+  }
+  snLookupCache.set(key, { data, expires: Date.now() + ttl });
 }
 
 function invalidateSnCache(sn) {

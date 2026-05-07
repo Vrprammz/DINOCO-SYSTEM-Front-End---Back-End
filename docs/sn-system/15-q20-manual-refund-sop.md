@@ -146,3 +146,150 @@ Admin เปิด `[Admin System] DINOCO Manual Invoice System` shortcode → t
 - [ ] Tech Lead — Backend UI design ตรงตาม SOP
 - [ ] Accounting team — reconciliation flow OK
 - [ ] บอส — final policy approval
+
+---
+
+## 📞 CS Team Intake Script — Facebook DM (R3 BLOCKER)
+
+**Source**: Plan v2.13 §Phase 1 W4 R3 BLOCKER + Q20 R2 manual refund flow
+**Owner**: Customer Service Lead
+**Audience**: CS reps responding to refund inquiries via DINOCO Facebook page
+
+ใช้ template ตามลำดับเป็น verbatim — ปรับเฉพาะ customer name + plate ID:
+
+---
+
+### Step 1 — Initial response (within 4 hr business hours)
+
+```
+สวัสดีค่ะ คุณ [CUSTOMER_NAME] 🙏
+
+ทีม DINOCO รับเรื่องขอคืนเงินสำหรับการขยายประกัน [SN: DNCSS....] แล้วค่ะ
+
+เพื่อให้ทีมตรวจสอบได้รวดเร็ว รบกวนแจ้งข้อมูล:
+1. เลขเพลท S/N ที่ขยายประกัน (เช่น DNCSS0001234)
+2. วันที่ซื้อ Extension (ดูได้จาก LINE Flex confirmation)
+3. ยอดเงิน (฿)
+4. เหตุผลที่ขอคืน (เช่น ตัดสินใจคืนภายใน 7 วัน / สินค้าคุณภาพไม่ตรงกับที่คาด / โอนสิทธิ์ขายต่อแล้ว ฯลฯ)
+5. PromptPay หรือเลขบัญชีธนาคารที่ต้องการรับเงินคืน (ของลูกค้าเองเท่านั้น)
+
+ทีมจะตอบกลับภายใน 48 ชั่วโมงทำการค่ะ 🙏
+```
+
+### Step 2 — Verification (after customer provides info)
+
+```
+ขอบคุณค่ะ คุณ [CUSTOMER_NAME]
+
+ทีมยืนยันข้อมูลแล้ว — Refund Request ถูกบันทึกในระบบ:
+- Refund ID: REF-[YYYYMMDD]-[NNNN]
+- ยอดที่จะคืน: ฿[AMOUNT]
+- ช่องทาง: [PromptPay XXX-XXX-XXXX / Bank XXX-X-XXXXX-X]
+
+ขั้นตอนต่อไป:
+✅ ทีม Admin จะ review + approve (1-2 วันทำการ)
+✅ หากยอด ≥ ฿5,000 จะมี approver ที่ 2 ตรวจซ้ำ (4-eyes review)
+✅ เมื่อ approve แล้วจะโอนเงิน + แจ้ง slip ทาง DM นี้
+
+⚠️ Note: Extension warranty จะถูก revoke พร้อมโอนคืน (ใช้สิทธิ์ไม่ได้แล้ว)
+
+มีคำถามเพิ่มเติมแจ้งได้เลยค่ะ 🙏
+```
+
+### Step 3 — Edge cases — escalation rules
+
+| Customer ผิดเงื่อนไข | Response |
+|---|---|
+| Extension ใช้ไปแล้วบางส่วน (claim already filed) | "ค่ะ — ทีมตรวจพบมีการเคลมในระยะ Extension แล้ว — case นี้ขอ escalate ไป Manager. ทีมจะติดต่อกลับภายใน 5 วันทำการ" |
+| ขอ refund > 90 วันหลังซื้อ | "ตามนโยบายระบบ refund window = 90 วัน — case นี้ขอ escalate ไปบอส. ทีมจะติดต่อกลับ" |
+| Suspicious abuse pattern (≥ 3 refunds ใน 90d) | "ค่ะ — case นี้ระบบ flag เป็น 4-eyes mandatory — ทีม Admin senior จะ review เพิ่มเติม" + alert Tech Lead |
+| ยอด ≥ ฿20,000 (urgent tier SLA 1 hr) | Trigger Telegram alert บอส immediately + notify CS Lead |
+| Customer claims บัตรเครดิต / ตัดผ่าน gateway อื่น | "ค่ะ — refund ของกระบวนการชำระอื่นต้อง process ผ่าน gateway โดยตรง — ขอเชื่อมต่อ Tech Lead" |
+
+### Step 4 — After admin approval — confirmation message
+
+```
+สวัสดีค่ะ คุณ [CUSTOMER_NAME] 🎉
+
+Refund ของคุณ approved + โอนเงินเรียบร้อยแล้วค่ะ:
+- Refund ID: REF-[YYYYMMDD]-[NNNN]
+- ยอด: ฿[AMOUNT]
+- โอนเมื่อ: [DATE TIME]
+- Slip: [URL_OR_ATTACHMENT]
+
+✅ Extension warranty ถูก revoke แล้ว
+✅ เพลท S/N กลับสู่สถานะ registered (ประกันเดิม) — ใช้สิทธิ์เคลมประกันต่อได้
+
+ขอบคุณที่ไว้วางใจ DINOCO ค่ะ 🙏
+หากต้องการสอบถามเพิ่มเติม DM กลับมาได้เสมอ
+```
+
+### Step 5 — Decline message (refund rejected)
+
+```
+สวัสดีค่ะ คุณ [CUSTOMER_NAME]
+
+ทีม Admin review เรื่องขอคืนเงินแล้ว — ขออภัย case นี้ไม่ผ่านเงื่อนไข:
+
+เหตุผล: [REASON — e.g. "เกินระยะ 90 วัน" / "เคลมในระยะ Extension แล้ว"]
+
+หากต้องการ appeal ขอให้ส่ง:
+1. ข้อมูล + หลักฐานเพิ่มเติม
+2. เหตุผล appeal
+
+ทีมจะ escalate ไปบอสภายใน 7 วันทำการค่ะ 🙏
+
+(สำหรับ disputes ทางกฎหมาย — โปรดติดต่อ DINOCO Co Ltd. ที่ [LEGAL_EMAIL])
+```
+
+---
+
+## 🚨 Escalation Chain
+
+| Level | Timing | Owner | Action |
+|---|---|---|---|
+| L1 | T+0 (initial intake) | CS Rep | Step 1-2 verification + log refund row |
+| L2 | T+24h (no response from customer) | CS Rep | Reminder DM ครั้งที่ 1 |
+| L3 | T+48h (customer responded, awaiting admin) | CS Lead | Backend review + approve/deny |
+| L4 | T+72h (≥ ฿5K, awaiting 4-eyes) | Admin senior | 4-eyes approval (LIFF prompt) |
+| L5 | T+96h (no admin action) | Tech Lead | Telegram alert + manual escalate ไปบอส |
+| L6 | T+1wk (boss escalation) | บอส | Override decision + close case |
+
+---
+
+## 📊 Reconciliation Owner
+
+**ทุกวันที่ 25 ของเดือน** — Accounting team รัน CSV export:
+```
+GET /dinoco-sn/v1/refunds/export?from=YYYY-MM-01&to=YYYY-MM-31
+```
+
+Owner: **Accounting Lead** (ชื่อ + email + phone — fill in pre-launch)
+- ลงบัญชี + handle VAT credit note
+- Reconcile กับ slip + bank statement
+- Flag discrepancies ส่ง Tech Lead
+
+Backup owner: **CS Lead** ถ้า Accounting Lead unavailable > 2 วัน
+
+---
+
+## ✅ CS Team Pre-launch Training (R3 BLOCKER acceptance)
+
+ก่อน F1 flag flip → CS team ต้องผ่าน training:
+- [ ] อ่านครบ template Step 1-5
+- [ ] Role-play 3 cases ด้วย Tech Lead (refund / decline / escalate)
+- [ ] Test backend Manual Refund admin UI (staging — ดู `docs/sn-system/22-customer-support-readiness-plan.md`)
+- [ ] Sign off ที่ section นี้
+
+**Training session**:
+- Owner: CS Lead + Tech Lead
+- Duration: 2 hr
+- Schedule: Pre-Phase 1 W4 (1 wk before F1 flip)
+- Material: ตัว doc นี้ + recorded session
+
+**Sign-off**:
+- [ ] CS Lead — script approved + role-play passed
+- [ ] CS Rep #1 (name): ____________
+- [ ] CS Rep #2 (name): ____________
+- [ ] Tech Lead — backend tooling demo verified
+- [ ] บอส — refund policy + escalation chain approved

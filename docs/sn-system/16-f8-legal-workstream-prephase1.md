@@ -139,3 +139,75 @@ Legal/regulatory readiness for warranty extension marketplace **before** Phase 4
 - [ ] Tech Lead — workstream coordination plan OK
 - [ ] Legal counsel selected — engagement letter signed
 - [ ] Accounting — tax + VAT readiness owner identified
+
+---
+
+## ✉️ Boss Email Template (Urgency: This Week)
+
+**Source**: Plan v2.13 §Phase 1 W4 R3 BLOCKER
+**Action**: Tech Lead ส่ง email ภายใน 5 วันทำการนี้
+**Recipient**: บอส (boss) — final budget + counsel selection approval
+
+ใช้ template ด้านล่างเป็น verbatim — ปรับ name + amount + dates เท่านั้น:
+
+---
+
+> **From**: Tech Lead
+> **To**: บอส (CEO)
+> **Cc**: Tech Lead deputy
+> **Subject**: 🚨 Phase 4 W12 Legal Engagement — ต้อง engage external counsel ภายในสัปดาห์นี้
+>
+> เรียน บอส
+>
+> **Summary**: Phase 4 W12 (F#8 Extension Marketplace launch) จะเริ่มเขียน code Week 12 (เริ่ม [DATE]) — ก่อนหน้านั้น **ต้อง engage external e-commerce counsel ให้ทำ deliverables 1-6 ใน docs/sn-system/16-f8-legal-workstream-prephase1.md**
+>
+> Timeline:
+> - Phase 4 W12 dev kick-off: **[DATE_PHASE4_START]**
+> - Legal engagement letter ต้องลงนามภายใน: **[DATE_PHASE4_START - 12 weeks]** = **[DATE_LEGAL_DEADLINE]** (ภายใน 5 วันทำการนี้)
+> - หาก delay → Phase 4 W12 delayed → cascade impact ถึง Phase 5 marketplace launch (เลื่อน 2-4 wk)
+>
+> **Decisions ขออนุมัติ**:
+> 1. ✅/❌ — Budget ฿125,000 - ฿195,000 (ดู `docs/sn-system/16-f8-legal-workstream-prephase1.md` §Budget) ครอบคลุม:
+>    - External legal counsel ฿80K-150K (e-commerce specialist, 30-40 hr)
+>    - VAT registration + tax accountant ฿30K (annual)
+>    - Translation T&C (ไทย ↔ English) ฿15K
+> 2. ✅/❌ — Counsel candidates ที่ Tech Lead screen ไว้:
+>    - **Candidate A**: [NAME], [FIRM] — ฿4,500/hr, e-commerce + PDPA specialist, มี case แพ้ Lazada
+>    - **Candidate B**: [NAME], [FIRM] — ฿3,800/hr, mass-market consumer law, มี client ใน Shopee
+>    - **Candidate C**: [NAME], [FIRM] — ฿5,200/hr, payment compliance specialist (Slip2Go review), recommended ตามเรื่อง F#15 Public API + payment partnership
+> 3. ✅/❌ — Refund policy direction (Q20 manual flow):
+>    - Default = no automated refund; ติดต่อ Customer Support — ดู `docs/sn-system/15-q20-manual-refund-sop.md`
+>    - Counsel จะ review SOP + suggest amendments
+> 4. ✅/❌ — Payment gateway compliance scope:
+>    - Slip2Go retention review (existing partnership) — counsel scope check
+>    - PromptPay/bank transfer = merchant-of-record ต่อตัว (likely out of PCI scope, แต่ counsel confirm)
+>
+> **Risk if delayed**:
+> - Phase 4 W12 marketplace launch delayed → revenue lost ~฿[ESTIMATE] from extension sales
+> - PDPA enforcement risk ใน gap window (Section 39 fines up to ฿5M)
+> - Counsel availability shrinks (Q4 = busy season, candidates booked solid)
+>
+> **Next steps after approval**:
+> 1. Tech Lead schedule kickoff call กับ chosen counsel ภายใน 3 วันหลังบอส approve
+> 2. Counsel เริ่ม deliverable 1-2 (T&C draft + refund policy review) week หน้า
+> 3. Weekly Friday standup เริ่ม week หน้า — ดู `docs/sn-system/16-f8-legal-workstream-prephase1.md` §Weekly check-in
+>
+> ขอ reply หรือ verbal confirm ทาง LINE ภายใน [DATE+3] เพื่อให้ engagement letter ลงนามทันก่อน [DATE_LEGAL_DEADLINE]
+>
+> ขอบคุณครับ
+> Tech Lead
+
+---
+
+### Email send checklist
+- [ ] DATE placeholders replaced ด้วยค่าจริง
+- [ ] Counsel candidates screened (A/B/C ที่กล่าวถึง — ส่ง CV link หรือ engagement letter sample)
+- [ ] Budget ฿ ranges aligned กับ บอส accounting team แล้ว (no surprise)
+- [ ] Cc Tech Lead deputy
+- [ ] Sent date logged ใน `docs/sn-system/07-boss-decisions-log.md` Q6/Q7/Q8 row
+
+### Follow-up cadence
+- T+0d: ส่ง email
+- T+3d: หากไม่มี reply → LINE follow-up บอส + standup mention
+- T+5d: หากยังไม่ตอบ → escalate ทาง phone call (urgency = legal deadline)
+- T+7d: หากยังไม่ลงนาม engagement → flag ใน Phase 4 W12 risk register

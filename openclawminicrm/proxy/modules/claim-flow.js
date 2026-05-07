@@ -1,5 +1,11 @@
 /**
  * claim-flow.js — Manual claim flow, AI-powered claim detection + KB-aware questions
+ * V.4.1 — Phase 4 W14.5 Round 3 (chatbot-rules.md §15.14): OCR_SN_REGEX strict Crockford
+ *         alphabet (excludes I/L/O/U) — prevents OCR misread false positives
+ *         (DNCO0123 → "O" ambiguous, DNCL1234 → "L" ambiguous). Validation chain now
+ *         calls validateSnFormat() from dinoco-tools — if format invalid (excluded chars
+ *         detected) flag separately as 'ocr_misread_suspect' for less aggressive escalation.
+ *         R3 Gap 3 fix.
  * V.4.0 — Phase 4 W14.4 Round 2 (chatbot-rules.md §15.8 / §15.14.5):
  *         + extractSerialFromAnalysis() — regex extraction of S/N from Gemini Vision text
  *         + validatePhotoSerial() — sn_pool lookup with 4-eyes fraud detection
@@ -31,14 +37,30 @@ function _getTelegramAlert() {
   return _telegramAlertFn;
 }
 
-// V.4.0 — chatbot-rules.md §15.14.5 Photo OCR fraud detection
-// Lenient pattern catches OCR noise (DNCSS / DNCXX...) — backend /sn-lookup is authoritative
-const OCR_SN_REGEX = /DNC[A-Z0-9]{3,11}/gi;
+// V.4.1 (R3 Gap 3) — chatbot-rules.md §15.14 Photo OCR strict Crockford alphabet.
+// Excludes I, L, O, U to prevent OCR misread false positives (1↔I↔L, 0↔O, U↔V).
+// Backend /sn-lookup is authoritative — this regex only captures candidate strings
+// from Gemini Vision output. validateSnFormat() (dinoco-tools) classifies the result.
+//
+// Pattern explanation:
+//   DNC          — DINOCO prefix
+//   (SS)?        — optional SS (legacy) or part of canonical 12-char
+//   [0-9A-HJ-KMNP-TV-Z]{3,11}  — Crockford base32 alphabet (excludes I/L/O/U)
+//
+// Width: 6-14 chars total — accommodates legacy DNCSS\d{7} (12 chars) + canonical
+// DNCSS<6alphanum><1checksum> (12 chars) + future variants.
+const OCR_SN_REGEX = /DNC(?:SS)?[0-9A-HJ-KMNP-TV-Z]{3,11}/gi;
 
 /**
  * Extract candidate S/N strings from Gemini Vision analysis text.
  * Returns deduped uppercase array. Empty array if none detected.
  * Pure-logic — no I/O.
+ *
+ * V.4.1 (R3 Gap 3) — uses strict Crockford alphabet regex. Note: legacy 7-digit format
+ * (DNCSS + 7 numeric digits) ALSO matches because [0-9...] superset includes digits.
+ * Strings with excluded chars (I/L/O/U) silently skipped — common OCR misreads
+ * (1→I, 0→O, etc.) are NOT promoted to suspicious flags here. Customer-facing AI
+ * should ask "ลองตรวจ S/N อีกครั้ง" (cf. §15.14.7 scenario 4).
  */
 function extractSerialFromAnalysis(analysisText) {
   if (!analysisText || typeof analysisText !== "string") return [];
@@ -64,6 +86,21 @@ function extractSerialFromAnalysis(analysisText) {
 async function validatePhotoSerial(sn, claim, sourceId) {
   const result = { sn, status: "unknown", flag: null, alertCategory: null };
   try {
+    // V.4.1 (R3 Gap 3) — pre-check format. If invalid (e.g. contains I/L/O/U),
+    // log as 'ocr_misread_suspect' and DON'T treat as fake_sn_attempt — it's
+    // probably an OCR misread of a valid plate. Skip backend call to save quota.
+    const helpers = _getSnHelpers();
+    if (typeof helpers.validateSnFormat === "function") {
+      const fmt = helpers.validateSnFormat(sn);
+      if (!fmt.valid && fmt.reason === "contains_excluded_char_ILOU") {
+        result.status = "format_invalid";
+        result.flag = "ocr_misread_suspect";
+        // No telegram escalate — common OCR noise. Caller decides whether to log.
+        console.log(`[ClaimOCR] format invalid (likely OCR misread) sn=${sn} reason=${fmt.reason}`);
+        return result;
+      }
+    }
+
     // Cache hit shortcut (60s TTL) — avoid spamming /sn-lookup during multi-photo upload
     let snData = getCachedSnLookup(sn);
     if (!snData) {

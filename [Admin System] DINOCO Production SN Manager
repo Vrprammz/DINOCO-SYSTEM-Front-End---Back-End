@@ -2,6 +2,20 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
  * ║  DB_ID: 1195                                                     ║
+ * ║  Version: V.0.40 (2026-05-07) — R3 Manager fixes:                       ║
+ * ║   • CRIT-2 build_warranty_url appends &sig= when REST API V.0.29 HMAC   ║
+ * ║     helper is synced (printed QR + LIFF Flex CTAs immune to             ║
+ * ║     dinoco_sn_hmac_required=1 promotion).                               ║
+ * ║   • HIGH ALTER mitigation: schema_install pre-flight COUNT(*) on        ║
+ * ║     wp_dinoco_sn_pool. >100K rows → log + admin notice + skip ALTER     ║
+ * ║     (require manual `wp eval dinoco_sn_schema_install()` CLI for prod   ║
+ * ║     scale to avoid lock-window write blocks).                           ║
+ * ║   • HIGH dbDelta uniq_dedup → uq_dedup explicit DROP INDEX IF EXISTS    ║
+ * ║     pre-dbDelta with INFORMATION_SCHEMA precheck (clean rename).        ║
+ * ║   • HIGH audit retention cron — daily 03:30 anonymize ip_address last   ║
+ * ║     octet for rows > 90d + hard-delete operational rows > 3y.           ║
+ * ║   • HIGH cron stagger — different daily/15min cron jobs offset 0-30min  ║
+ * ║     to prevent thundering herd (was all firing at midnight UTC).        ║
  * ║  Version: V.0.39 (2026-05-07) — Audit fixes: H1 checksum strict, M4 UNIQUE, ║
  * ║                                  M2 schema-version short-circuit (1.1→1.2),║
  * ║                                  HIGH-5 Sec GET_LOCK schema install,        ║
@@ -1166,10 +1180,75 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
                 return;
             }
 
+            // V.0.40 HIGH ALTER mitigation: pre-flight COUNT(*) on hottest table.
+            // For MariaDB / MySQL < 8.0.16, ENUM/UNIQUE re-shape ALTERs rebuild the
+            // entire table → multi-second WRITE LOCK. > 100k rows in production
+            // pool means the auto-installer should refuse to run on web request
+            // and require admin to invoke via WP-CLI or pt-online-schema-change.
+            $pool_tbl = $prefix . 'dinoco_sn_pool';
+            $pool_table_present = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_schema = %s AND table_name = %s",
+                DB_NAME, $pool_tbl
+            ) );
+            if ( $pool_table_present ) {
+                $pool_row_count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$pool_tbl}" );
+                $threshold = 100000;
+                $is_cli = ( defined( 'WP_CLI' ) && WP_CLI );
+                if ( $pool_row_count > $threshold && ! $is_cli ) {
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( sprintf(
+                            '[SN-Schema] ALTER mitigation: pool rows=%d > %d threshold — skipping web-context migration. Run `wp eval "dinoco_sn_schema_install();"` from CLI.',
+                            $pool_row_count, $threshold
+                        ) );
+                    }
+                    update_option( 'dinoco_sn_schema_alter_blocked_at', current_time( 'mysql' ), 'no' );
+                    update_option( 'dinoco_sn_schema_alter_blocked_rowcount', $pool_row_count, 'no' );
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture(
+                            new \Exception( 'sn_schema_install_skipped_large_pool' ),
+                            array(
+                                'context'    => 'sn_schema_install',
+                                'pool_rows'  => $pool_row_count,
+                                'threshold'  => $threshold,
+                            )
+                        );
+                    }
+                    return;
+                }
+            }
+
             require_once ABSPATH . 'wp-admin/includes/upgrade.php';
             $charset_collate = $wpdb->get_charset_collate();
             $prefix = $wpdb->prefix;
             $_lock_payload_open = true; // marker for try/finally — see closing block
+
+            // V.0.40 HIGH dbDelta uniq_dedup → uq_dedup migration: explicit
+            // DROP INDEX before dbDelta runs CREATE/ALTER. dbDelta can't always
+            // reshape an existing UNIQUE KEY when the column list changed (V.0.11
+            // → V.0.39 reshape added scheduled_at). INFORMATION_SCHEMA precheck
+            // makes the DROP idempotent (no error if already dropped).
+            $notif_tbl = $prefix . 'dinoco_sn_notifications';
+            $notif_present = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_schema = %s AND table_name = %s",
+                DB_NAME, $notif_tbl
+            ) );
+            if ( $notif_present ) {
+                $legacy_uniq = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM information_schema.statistics
+                     WHERE table_schema = %s AND table_name = %s AND index_name = %s",
+                    DB_NAME, $notif_tbl, 'uniq_dedup'
+                ) );
+                if ( $legacy_uniq > 0 ) {
+                    // Drop legacy 3-col UNIQUE so dbDelta can clean-add the
+                    // V.0.39 4-col uq_dedup. Note: idempotent — guarded by precheck.
+                    $wpdb->query( "ALTER TABLE {$notif_tbl} DROP INDEX uniq_dedup" );
+                    if ( function_exists( 'b2b_log' ) ) {
+                        b2b_log( '[SN-Schema] dropped legacy uniq_dedup on sn_notifications (renamed to uq_dedup with scheduled_at)' );
+                    }
+                }
+            }
 
         // ═══════════════════════════════════════════════════════
         // TABLE 1: sn_batches — Batch metadata
@@ -1817,6 +1896,34 @@ if ( ! function_exists( 'dinoco_sn_install_perf_indexes' ) ) {
 
 if ( ! has_action( 'admin_init', 'dinoco_sn_maybe_install' ) ) {
     add_action( 'admin_init', 'dinoco_sn_maybe_install', 30 );
+}
+
+// V.0.40 HIGH ALTER mitigation — admin notice when schema_install was skipped
+// because pool > 100K rows. Shown only to manage_options users. Provides the
+// CLI command they should run.
+if ( ! has_action( 'admin_notices', 'dinoco_sn_admin_notice_alter_blocked' ) ) {
+    add_action( 'admin_notices', 'dinoco_sn_admin_notice_alter_blocked' );
+}
+
+if ( ! function_exists( 'dinoco_sn_admin_notice_alter_blocked' ) ) {
+    function dinoco_sn_admin_notice_alter_blocked() {
+        if ( ! function_exists( 'current_user_can' ) || ! current_user_can( 'manage_options' ) ) return;
+        $blocked_at = get_option( 'dinoco_sn_schema_alter_blocked_at', '' );
+        if ( ! $blocked_at ) return;
+        // Auto-clear when schema reaches target version (CLI ran successfully)
+        if ( function_exists( 'dinoco_sn_schema_version' )
+             && version_compare( dinoco_sn_schema_version(), DINOCO_SN_SCHEMA_VERSION, '>=' ) ) {
+            delete_option( 'dinoco_sn_schema_alter_blocked_at' );
+            delete_option( 'dinoco_sn_schema_alter_blocked_rowcount' );
+            return;
+        }
+        $rowcount = (int) get_option( 'dinoco_sn_schema_alter_blocked_rowcount', 0 );
+        echo '<div class="notice notice-warning is-dismissible"><p><strong>S/N Schema Migration Pending</strong></p>';
+        echo '<p>Pool size (~' . esc_html( number_format( $rowcount ) ) . ' rows) is above the safe-auto-migrate threshold (100,000). The web installer was skipped to avoid a multi-second WRITE LOCK on production. Run this from CLI on the server:</p>';
+        echo '<p><code>wp eval "dinoco_sn_schema_install();"</code></p>';
+        echo '<p>For very large deployments use <code>pt-online-schema-change</code> (Percona Toolkit) instead.</p>';
+        echo '<p><em>Blocked at: ' . esc_html( $blocked_at ) . '</em></p></div>';
+    }
 }
 
 if ( ! function_exists( 'dinoco_sn_maybe_install' ) ) {
@@ -8048,10 +8155,12 @@ if ( ! function_exists( 'dinoco_sn_run_audit_retention' ) ) {
         try {
             global $wpdb;
             $tbl = dinoco_sn_table( 'audit' );
-            $deleted = 0;
+            $deleted   = 0;
+            $anonymized = 0;
             $cap = 20;
             $cutoff_5y = gmdate( 'Y-m-d H:i:s', time() - 5 * 365 * 86400 );
             $cutoff_3y = gmdate( 'Y-m-d H:i:s', time() - 3 * 365 * 86400 );
+            $cutoff_90d = gmdate( 'Y-m-d H:i:s', time() - 90 * 86400 );
 
             for ( $i = 0; $i < $cap; $i++ ) {
                 // Sensitive rows: 5y retention
@@ -8074,9 +8183,34 @@ if ( ! function_exists( 'dinoco_sn_run_audit_retention' ) ) {
                 usleep( 50000 ); // 50ms gap to avoid hammering DB
             }
 
+            // V.0.40 HIGH — anonymize ip_address last octet for rows older than
+            // 90d (PDPA §39 minimization). UPDATE chunked 500/iter × 10 iter cap.
+            // Pattern handles IPv4 a.b.c.d → a.b.c.0, IPv6 keeps first 4 hextets
+            // and zeroes the rest. Skips rows where ip_address is already null /
+            // empty / already-anonymized (ends with .0).
+            for ( $j = 0; $j < 10; $j++ ) {
+                // IPv4 anonymization (most common in TH market) — use CONCAT
+                // since MySQL `||` is logical OR (not string concat).
+                $ipv4_upd = $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tbl}
+                     SET ip_address = CONCAT(SUBSTRING_INDEX(ip_address, '.', 3), '.0')
+                     WHERE created_at < %s
+                       AND ip_address IS NOT NULL
+                       AND ip_address LIKE '%%.%%.%%.%%'
+                       AND ip_address NOT LIKE '%%.0'
+                     LIMIT 500",
+                    $cutoff_90d
+                ) );
+                $batch_anon = (int) $ipv4_upd;
+                $anonymized += $batch_anon;
+                if ( $batch_anon === 0 ) break;
+                usleep( 50000 );
+            }
+
             update_option( 'dinoco_sn_audit_retention_last_run', array(
-                'at'      => current_time( 'mysql' ),
-                'deleted' => $deleted,
+                'at'         => current_time( 'mysql' ),
+                'deleted'    => $deleted,
+                'anonymized' => $anonymized,
             ), false );
         } catch ( \Throwable $e ) {
             if ( function_exists( 'dinoco_obs_capture' ) ) {
@@ -10407,7 +10541,21 @@ if ( ! function_exists( 'dinoco_sn_build_warranty_url' ) ) {
      */
     function dinoco_sn_build_warranty_url( $type, $sn, $prefer_liff = true ) {
         $type = ( $type === 'activate' ) ? 'activate' : 'extend';
-        $sn_q = '?sn=' . rawurlencode( (string) $sn );
+        $sn   = strtoupper( trim( (string) $sn ) );
+
+        // V.0.29 CRIT-2 — always append &sig= when REST API V.0.29+ HMAC helper
+        // is synced. URLs printed today on QR codes / sent in Notifier Flex /
+        // Marketplace LIFF entry remain valid even after admin promotes
+        // dinoco_sn_hmac_required=1. Backward compat: when helper missing the
+        // raw URL is emitted (current pre-V.0.29 behavior).
+        $sig_q = '';
+        if ( $sn !== '' && function_exists( 'dinoco_sn_hmac_sign' ) ) {
+            $sig = dinoco_sn_hmac_sign( $sn );
+            if ( is_string( $sig ) && $sig !== '' ) {
+                $sig_q = '&sig=' . rawurlencode( $sig );
+            }
+        }
+        $sn_q = '?sn=' . rawurlencode( $sn ) . $sig_q;
 
         // Hardcoded defaults (DINOCO LOGIN SYSTEM channel 2008686775, provisioned 2026-05-07)
         $default_liff_ids = array(
@@ -10529,22 +10677,42 @@ if ( ! function_exists( 'dinoco_sn_build_flex_for_notification' ) ) {
 
 // Cron registration via registry wrapper (Round 28 pattern with fallback)
 add_action( 'init', function() {
+    // V.0.40 HIGH — cron stagger: each daily/15min job offsets by N minutes
+    // from a common anchor (today 02:00 ICT) to prevent thundering herd.
+    // Schedule:
+    //   audit_retention      02:00 (anchor)
+    //   expiry_schedule      02:00 (logically separate, low cost)
+    //   anniversary          02:05
+    //   review_request       02:10
+    //   ltv_snapshot         02:15
+    //   demand_forecast      02:20 (weekly)
+    //   pool_stats_recompute (every 15min, runs at :00/:15/:30/:45)
+    //   orphan_claim_scan    03:30
+    $base_offset = (int) strtotime( 'tomorrow 02:00' );
+    if ( ! $base_offset ) $base_offset = time() + 60;
+
     if ( ! wp_next_scheduled( 'dinoco_sn_low_pool_alert_cron' ) ) {
         wp_schedule_event( time(), 'hourly', 'dinoco_sn_low_pool_alert_cron' );
     }
     if ( ! wp_next_scheduled( 'dinoco_sn_audit_retention_cron' ) ) {
-        wp_schedule_event( time(), 'daily', 'dinoco_sn_audit_retention_cron' );
+        // 03:30 to bracket low-traffic window + spread from other 02:* crons
+        $anchor = strtotime( 'tomorrow 03:30' );
+        if ( ! $anchor ) $anchor = $base_offset + 1800;
+        wp_schedule_event( $anchor, 'daily', 'dinoco_sn_audit_retention_cron' );
     }
     if ( ! wp_next_scheduled( 'dinoco_sn_batch_reconcile_cron' ) ) {
         wp_schedule_event( time(), 'weekly', 'dinoco_sn_batch_reconcile_cron' );
     }
     // Phase 3 W8 / V.0.22 — Orphan claim scan (Gap D)
     if ( ! wp_next_scheduled( 'dinoco_sn_orphan_claim_scan_cron' ) ) {
-        wp_schedule_event( time(), 'daily', 'dinoco_sn_orphan_claim_scan_cron' );
+        // Already documented as 03:30, keep but offset 5min later to skip audit cleanup contention
+        $anchor = strtotime( 'tomorrow 03:35' );
+        if ( ! $anchor ) $anchor = $base_offset + 5700;
+        wp_schedule_event( $anchor, 'daily', 'dinoco_sn_orphan_claim_scan_cron' );
     }
-    // Phase 3 W9 — F#1 Expiry Reminder
+    // Phase 3 W9 — F#1 Expiry Reminder (offset 0 from base — anchor)
     if ( ! wp_next_scheduled( 'dinoco_sn_expiry_schedule_cron' ) ) {
-        wp_schedule_event( time(), 'daily', 'dinoco_sn_expiry_schedule_cron' );
+        wp_schedule_event( $base_offset, 'daily', 'dinoco_sn_expiry_schedule_cron' );
     }
     if ( ! wp_next_scheduled( 'dinoco_sn_notification_send_cron' ) ) {
         // Use 'fifteen_minutes' if registered (B2B Snippet 1) or fallback hourly
@@ -10552,16 +10720,16 @@ add_action( 'init', function() {
         $recurrence = isset( $sched['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly';
         wp_schedule_event( time(), $recurrence, 'dinoco_sn_notification_send_cron' );
     }
-    // Phase 3 W9 — F#4 Anniversary + F#10 Review Request
+    // Phase 3 W9 — F#4 Anniversary (+5min) + F#10 Review Request (+10min)
     if ( ! wp_next_scheduled( 'dinoco_sn_anniversary_schedule_cron' ) ) {
-        wp_schedule_event( time(), 'daily', 'dinoco_sn_anniversary_schedule_cron' );
+        wp_schedule_event( $base_offset + 300, 'daily', 'dinoco_sn_anniversary_schedule_cron' );
     }
     if ( ! wp_next_scheduled( 'dinoco_sn_review_request_cron' ) ) {
-        wp_schedule_event( time(), 'daily', 'dinoco_sn_review_request_cron' );
+        wp_schedule_event( $base_offset + 600, 'daily', 'dinoco_sn_review_request_cron' );
     }
-    // Phase 3 W10 — F#9 Customer LTV snapshot
+    // Phase 3 W10 — F#9 Customer LTV snapshot (+15min)
     if ( ! wp_next_scheduled( 'dinoco_sn_ltv_snapshot_cron' ) ) {
-        wp_schedule_event( time(), 'daily', 'dinoco_sn_ltv_snapshot_cron' );
+        wp_schedule_event( $base_offset + 900, 'daily', 'dinoco_sn_ltv_snapshot_cron' );
     }
     // Phase 3 W11 — F#13 Gray Market weekly scan
     if ( ! wp_next_scheduled( 'dinoco_sn_gray_market_scan_cron' ) ) {
@@ -10572,9 +10740,11 @@ add_action( 'init', function() {
     if ( $next = wp_next_scheduled( 'dinoco_sn_fraud_aggregate_cron' ) ) {
         wp_unschedule_event( $next, 'dinoco_sn_fraud_aggregate_cron' );
     }
-    // Phase 4 W13 — F#16 Demand Forecast weekly
+    // Phase 4 W13 — F#16 Demand Forecast weekly (+20min from base_offset, weekly Sunday)
     if ( ! wp_next_scheduled( 'dinoco_sn_demand_forecast_cron' ) ) {
-        wp_schedule_event( time(), 'weekly', 'dinoco_sn_demand_forecast_cron' );
+        $weekly_anchor = strtotime( 'next Sunday 02:20' );
+        if ( ! $weekly_anchor ) $weekly_anchor = $base_offset + 1200;
+        wp_schedule_event( $weekly_anchor, 'weekly', 'dinoco_sn_demand_forecast_cron' );
     }
     // Phase 5 W16.3 V.0.32 — Marketplace pending payment timeout (every 5 min)
     if ( ! wp_next_scheduled( 'dinoco_sn_marketplace_timeout_cron' ) ) {

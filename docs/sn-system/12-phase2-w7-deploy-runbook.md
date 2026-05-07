@@ -129,3 +129,123 @@ Rollback target: ≤ 30 seconds. If rollback fails, restore from `mysqldump` bac
 - [ ] Tech Lead — deploy plan reviewed
 - [ ] บอส (boss) — go/no-go confirmation
 - [ ] On-call admin — monitoring window confirmed
+
+---
+
+## 🛢️ Schema Migration CLI (R3 BLOCKER)
+
+**Source**: Plan v2.13 §Phase 1 W4 R3 + REG-094
+**Owner**: Tech Lead (boss observes)
+**Run timing**: Pre-deploy T-30 min ก่อน Step 1 (Drain)
+
+ก่อน Phase 2 W7 atomic deploy ต้อง migrate schema → v1.2 ให้สำเร็จก่อน เพราะ:
+- New `uq_dedup` 4-col composite key + 3 covering indexes
+- `dinoco_sn_schema_version` flips `1.1 → 1.2`
+- ผลกระทบ: query plans ใน 5+ admin endpoints จะใช้ index ใหม่
+
+### Step 1 — Pre-flight (T-30m)
+
+```bash
+# 1. Backup DB
+mysqldump --single-transaction \
+    --databases wp_dinoco_prod \
+    --tables wp_dinoco_sn_pool wp_dinoco_sn_pool_meta \
+             wp_dinoco_sn_audit wp_dinoco_sn_notifications \
+    > /backup/sn-prew7-$(date +%Y%m%d_%H%M%S).sql
+
+# 2. Verify backup OK
+ls -lh /backup/sn-prew7-*.sql | tail -1
+```
+
+### Step 2 — Dry-run schema migration
+
+```bash
+ssh root@5.223.95.236
+cd /var/www/html
+wp eval '
+$ok = dinoco_sn_install_schema( true /* dry_run */ );
+echo $ok ? "DRY-RUN OK\n" : "DRY-RUN FAIL\n";
+echo "Pre-version: " . get_option("dinoco_sn_schema_version") . "\n";
+'
+```
+
+**Expected**:
+- Output: `DRY-RUN OK` + `Pre-version: 1.1`
+- ไม่มี error log ใน `/var/log/dinoco-debug.log`
+- ไม่มีการเปลี่ยน schema (DB inspection)
+
+**ถ้าล้มเหลว**:
+- Log row count: `wp eval 'echo $GLOBALS["wpdb"]->get_var("SELECT COUNT(*) FROM wp_dinoco_sn_notifications");'`
+- ถ้า > 100k rows → SKIP migration + เลื่อน W7 ไป run schema offline (ในช่วง maintenance window)
+- ถ้า < 100k rows → debug error + retry
+
+### Step 3 — Live migration
+
+```bash
+wp eval '
+$ok = dinoco_sn_install_schema();
+echo $ok ? "LIVE OK\n" : "LIVE FAIL\n";
+echo "Post-version: " . get_option("dinoco_sn_schema_version") . "\n";
+'
+```
+
+**Expected**:
+- Output: `LIVE OK` + `Post-version: 1.2`
+- รัน < 30 วินาที (ที่ row count < 100k)
+- GET_LOCK acquired/released cleanly (no orphan lock)
+- รันซ้ำได้ idempotent — รันครั้งที่ 2 = no-op + return OK
+
+### Step 4 — Verify new indexes
+
+```bash
+wp eval '
+$wpdb = $GLOBALS["wpdb"];
+$indexes = $wpdb->get_results("SHOW INDEX FROM wp_dinoco_sn_notifications");
+foreach ($indexes as $i) echo $i->Key_name . " - " . $i->Column_name . "\n";
+'
+```
+
+**Expected output**:
+```
+uq_dedup - notification_type
+uq_dedup - user_id
+uq_dedup - sn
+uq_dedup - scheduled_at
+idx_user_status - user_id
+idx_user_status - status
+idx_sn_action - sn
+idx_sn_action - action
+idx_scheduled_at - scheduled_at
+```
+
+### Rollback SQL (ถ้า migration ทำให้ระบบล่ม)
+
+```sql
+-- 1. Drop new indexes
+ALTER TABLE wp_dinoco_sn_notifications DROP INDEX uq_dedup;
+ALTER TABLE wp_dinoco_sn_notifications DROP INDEX idx_user_status;
+ALTER TABLE wp_dinoco_sn_notifications DROP INDEX idx_sn_action;
+ALTER TABLE wp_dinoco_sn_notifications DROP INDEX idx_scheduled_at;
+
+-- 2. Restore legacy 3-col uniq_dedup
+ALTER TABLE wp_dinoco_sn_notifications
+    ADD UNIQUE KEY uniq_dedup (notification_type, user_id, sn);
+
+-- 3. Revert schema_version
+UPDATE wp_options SET option_value = '1.1'
+WHERE option_name = 'dinoco_sn_schema_version';
+```
+
+หรือ restore mysqldump:
+```bash
+mysql wp_dinoco_prod < /backup/sn-prew7-YYYYMMDD_HHMMSS.sql
+```
+
+### Owner sign-off — Schema migration
+
+- [ ] Pre-deploy backup verified
+- [ ] Dry-run output shows `Pre-version: 1.1` + no errors
+- [ ] Live migration completes < 30s
+- [ ] All 9 index columns present
+- [ ] Schema version = "1.2"
+- [ ] Boss + Tech Lead present

@@ -179,3 +179,160 @@ Format:
 - `docs/sn-system/10-go-live-gate-checklist.md` — F1-F5 flip criteria
 - `~/.claude/plans/wiki-doc-sequential-lantern.md` v2.13 §Phase 1 W4 (modified)
 - Hard rollback: `[Admin System] DINOCO Production SN Manager` line ~860 kill switch
+
+---
+
+## 🆕 R3 Manual Verification (2026-05-07)
+
+**Source**: Plan v2.13 §Phase 1 W4 R3 BLOCKER
+**Owner**: Tech Lead + บอส
+**Run timing**: หลัง PHPUnit + Jest drift detector ผ่านครบ ก่อน flag flip F1
+
+8 manual cases ที่ pure-logic test ครอบคลุมไม่ได้ (ต้อง browser/LIFF/staging real):
+
+### R3-M1 — HMAC sig tampering
+**Steps**:
+1. ดึง URL จริงจาก factory CSV: `https://dinoco.in.th/warranty/activate?sn=DNCSS0001234&sig=ABCD...XYZ`
+2. แก้ตัวอักษรตัวเดียวใน `sig` (เช่น `A` → `Z`)
+3. เปิด URL ที่ tamper แล้ว
+4. ตรวจ network response
+
+**Expected**:
+- ระบบ return 403 forbidden + Thai error message "QR ไม่ถูกต้อง — กรุณาสแกนใหม่"
+- Audit log row `event_type=hmac_verify_failed` พร้อม IP + UA
+- ไม่มี warranty_registration ถูกสร้าง
+- ไม่มี LINE Flex push
+
+**Why manual**: HMAC verify endpoint ใช้ WP nonce + LINE OAuth state แทรกใน URL — ต้องผ่าน real browser เพื่อ trigger OAuth round-trip จริง.
+
+---
+
+### R3-M2 — Banner localStorage cross-user leakage
+**Steps**:
+1. Login user A ใน LIFF Activation page
+2. ปิด banner "ยินดีต้อนรับ" (จะ store key `dnc_sn_banner_dismissed_<uid>` ใน localStorage)
+3. Logout
+4. Login user B (เครื่องเดียวกัน)
+5. เข้า activation page
+
+**Expected**:
+- User B เห็น banner เป็นครั้งแรก (localStorage key per-uid ไม่ leak)
+- Test ในเครื่อง 2 บราว์เซอร์ + private mode ครบ
+
+**Why manual**: ต้อง real browser localStorage + multi-account LINE OAuth flow.
+
+---
+
+### R3-M3 — Marketplace progress 360px viewport
+**Steps**:
+1. Open DevTools — set viewport 360×640 (iPhone SE)
+2. เข้า F#8 Marketplace LIFF (`/marketplace/extension/...`)
+3. Submit checkout flow
+4. Capture screenshot ของ progress bar
+
+**Expected**:
+- Progress bar (4 steps: เลือกแผน / ชำระเงิน / ยืนยัน / สำเร็จ) ไม่ overflow
+- ทุก step label อ่านได้ชัด ไม่ถูกตัด
+- Tap target ≥ 44px (iOS HIG)
+
+**Why manual**: visual regression — automated tools ไม่จับ overflow ที่ subtle padding edge cases ครบ.
+
+---
+
+### R3-M4 — Photo OCR Crockford education
+**Steps**:
+1. เข้า /claim → AI Auto-fill flow
+2. Upload รูปเพลทที่ S/N พิมพ์ผิด: "DNCSS-OOL-123" (มี O และ L)
+3. ตรวจ AI response
+
+**Expected**:
+- Bot reply: "S/N นี้ไม่ถูกต้อง — DINOCO ไม่ใช้ตัวอักษร I/L/O/U บนเพลท. โปรดตรวจสอบใหม่: 0=ศูนย์ไม่ใช่ O, 1=หนึ่งไม่ใช่ I/L"
+- ไม่ส่งเข้า activate flow (ขาด validation gate)
+- Telegram alert บอส `event=ocr_crockford_violation`
+
+**Why manual**: OCR + LINE Bot integration — ต้อง LINE message round-trip จริง.
+
+---
+
+### R3-M5 — Customer Support intake script walkthrough
+**Steps**:
+1. CS team rep + Tech Lead ทำ role-play ครบ 5 case categories ใน `docs/sn-system/22-customer-support-readiness-plan.md`:
+   - Refund request (Q20 manual flow)
+   - Stolen plate report
+   - Voided plate inquiry
+   - Recalled plate inquiry
+   - Lost LINE OAuth (re-auth via DM)
+2. CS rep operate Backend manual refund admin UI (staging)
+3. Tech Lead observe + log gaps
+
+**Expected**:
+- ทุก case มี step-by-step script + escalation flow
+- CS rep ไม่ติดขัด (≥ 80% test cases ผ่านโดยไม่ถาม Tech Lead)
+- Refund + recall + stolen flows ทำงานถูก audit + Telegram alert
+
+**Why manual**: human-in-the-loop UAT.
+
+---
+
+### R3-M6 — Schema migration CLI dry-run
+**Steps**:
+1. SSH เข้า staging WP server
+2. รัน: `wp eval 'echo dinoco_sn_install_schema(true) ? "OK" : "FAIL";'` (dry-run flag)
+3. ตรวจ output: ต้อง list SQL queries ที่จะรันโดยไม่จริง execute
+4. ตรวจ option: `wp option get dinoco_sn_schema_version` ต้องไม่เปลี่ยน
+5. รันจริง: `wp eval 'echo dinoco_sn_install_schema() ? "OK" : "FAIL";'`
+6. Verify: schema_version → "1.2", `wp_dinoco_sn_notifications` มี `uq_dedup` index 4-col
+
+**Expected**:
+- Dry-run ไม่กระทบ DB
+- Live run idempotent (รันซ้ำได้ ไม่ error)
+- Rollback SQL พร้อม: `docs/sn-system/12-phase2-w7-deploy-runbook.md` Section "Schema Migration CLI"
+
+**Why manual**: WP eval + DB inspection — ต้อง shell access.
+
+---
+
+### R3-M7 — Cache staleness within 60s scenario
+**Steps**:
+1. เปิด lookup endpoint ใน 2 tabs: `GET /dinoco-sn/v1/lookup/DNCSS0001234`
+2. Tab 1: response ครั้งแรก (cache miss)
+3. Tab 2 ภายใน 30s: response cache hit (header `X-Dinoco-Cache: hit`)
+4. รันใน Tab 3: `POST /dinoco-sn/v1/void` กับ DNCSS0001234
+5. Tab 4 ภายใน 5s: lookup อีกครั้ง
+
+**Expected**:
+- Cache invalidate ภายใน 60s หลัง void (transient TTL)
+- Tab 4 อาจยังเห็น stale = registered ใน 5s แรก แต่ภายใน 60s ต้องเป็น voided
+- ไม่มี false-negative > 60s
+
+**Why manual**: cache TTL clock — automated tool ไม่ control real-time well.
+
+---
+
+### R3-M8 — Telegram alert flood suppression test
+**Steps**:
+1. Trigger 10 events `pool_status_changed` ใน 60s (ปลอม: rapid void+recover loop)
+2. ตรวจ Telegram chat บอส
+3. ตรวจ `wp_dinoco_sn_audit` rows
+
+**Expected**:
+- บอสได้รับ alert สูงสุด 5 messages ใน 60s (rate limit)
+- Audit table มี 10 rows (no suppression)
+- ครั้งที่ 6+ → silent suppression + audit row `event_type=alert_suppressed`
+
+**Why manual**: Telegram delivery + rate limit ใน live LINE server — ไม่มี mock.
+
+---
+
+## ✅ R3 Acceptance Sign-off
+
+- [ ] R3-M1 — HMAC tamper rejected
+- [ ] R3-M2 — Banner cross-user safe
+- [ ] R3-M3 — Marketplace 360px viewport OK
+- [ ] R3-M4 — Crockford OCR education works
+- [ ] R3-M5 — CS intake script complete
+- [ ] R3-M6 — Schema CLI dry-run + live run OK
+- [ ] R3-M7 — Cache staleness within 60s
+- [ ] R3-M8 — Telegram flood suppression works
+
+หาก case ใดล้มเหลว → log ใน `docs/sn-system/12-phase1-w4-bug-log.md` + assign Tech Lead → fix → re-run ก่อน flag flip

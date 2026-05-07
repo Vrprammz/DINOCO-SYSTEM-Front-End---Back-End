@@ -7,6 +7,10 @@
  * V.2.1 — Optional Sentry integration via SENTRY_DSN env var (defensive require)
  * V.2.2 — [L4] isFinite guard on SENTRY_SAMPLE_RATE (malformed env → NaN → Sentry crash)
  *         [L7] Correlation-ID middleware (flag-gated via CORRELATION_ID_ENABLED=1)
+ * V.2.3 — Phase 4 W14.5 R3 Gap 1: wire modules/sn-webhook.js
+ *         Endpoint POST /webhook/sn-event — WP fires after sn_pool status flip
+ *         → invalidateSnCache(sn) + log MongoDB sn_event_log
+ *         Promotes cache invalidation from Phase 4 W14.5 → W6 NOW (R3 BLOCKER).
  */
 
 // Sentry reference kept in module scope for correlation middleware tagging (L7).
@@ -115,6 +119,9 @@ const { sendTelegramReply, sendTelegramPhoto } = telegramAlert;
 const telegramGung = require("./modules/telegram-gung");
 const { handleTelegramMessage, sendDailySummary, checkLeadNoContact, checkClaimAging } = telegramGung;
 
+// V.2.3 (R3 Gap 1) — WP→Agent webhook listener for sn_pool state changes
+const snWebhook = require("./modules/sn-webhook");
+
 // === Wire up cross-module dependencies ===
 dinocoTools.init({ searchMessages, getRecentMessages, callMCPTool });
 aiChat.init({
@@ -128,6 +135,9 @@ telegramGung.init({
   sendLinePush, sendMetaMessage, sendTelegramReply, sendTelegramPhoto,
   callDinocoAPI, searchKB, saveMsg, getDB,
 });
+// V.2.3 (R3 Gap 1) — wire sn-webhook + register POST /webhook/sn-event
+snWebhook.init({ getDB });
+snWebhook.registerRoutes(app);
 
 // === Reply Token Cache: 5-Min Auto-Reply Timer ===
 const pendingAutoReply = new Map();

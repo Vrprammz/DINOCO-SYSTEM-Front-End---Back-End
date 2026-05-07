@@ -1,6 +1,11 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Idempotency Helper                        ║
+ * ║  Version: V.1.2 (2026-05-07) — R3 Idempotency hash deterministic ║
+ * ║    (RFC 8785 JCS canonical form). Recursive ksort + sort numeric ║
+ * ║    arrays by `sn` (when present) ascending. Stabilizes hash      ║
+ * ║    across cross-client retries (mobile/RPi/OpenClaw produce      ║
+ * ║    different JSON key order on retry → previously triggered 409).║
  * ║  Version: V.1.1 (2026-04-30) — Round 28: register dinoco_        ║
  * ║    idempotency_cleanup_cron via dinoco_register_cron heartbeat   ║
  * ║    tracking (Health Monitor visibility). Fallback to legacy      ║
@@ -156,26 +161,93 @@ add_action( 'admin_init', function() {
  * 2. UTILITIES — hash, key extract, IP resolve
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+if ( ! function_exists( 'dinoco_idempotency_canonical_normalize' ) ) {
+    /**
+     * V.1.2 — RFC 8785 JCS canonical form for cross-client retry compat.
+     *
+     * Recursively normalizes a body structure so that two clients producing
+     * the same logical request (different JSON key order, different array
+     * order) hash to the same value:
+     *
+     *   - Associative arrays  → ksort by key (stable, ASCII)
+     *   - Numeric arrays      → if every element is an associative array
+     *                           AND has 'sn' key → sort by sn ASC
+     *                           (bulk-array endpoint pattern, see
+     *                           docs/patterns/IDEMPOTENCY-KEY.md §Bulk).
+     *                           Otherwise → preserved order (semantic).
+     *   - Objects             → cast to array → ksort
+     *   - Scalars             → returned unchanged
+     *
+     * Pure-logic. Bounded recursion (max depth 32). Defensive for cycles via
+     * stack depth cap.
+     *
+     * @param mixed $value Input structure
+     * @param int   $depth Current recursion depth (internal)
+     * @return mixed Normalized structure
+     */
+    function dinoco_idempotency_canonical_normalize( $value, $depth = 0 ) {
+        if ( $depth > 32 ) return $value; // safety cap
+        if ( is_object( $value ) ) {
+            $value = (array) $value;
+        }
+        if ( ! is_array( $value ) ) {
+            return $value;
+        }
+        // Detect numeric (list) vs associative
+        $is_list = ( array_keys( $value ) === range( 0, count( $value ) - 1 ) );
+        if ( $is_list ) {
+            $normalized = array();
+            $all_have_sn = ( ! empty( $value ) );
+            foreach ( $value as $item ) {
+                $normalized[] = dinoco_idempotency_canonical_normalize( $item, $depth + 1 );
+                if ( ! is_array( $item ) || ! array_key_exists( 'sn', $item ) ) {
+                    $all_have_sn = false;
+                }
+            }
+            if ( $all_have_sn ) {
+                usort( $normalized, function( $a, $b ) {
+                    $sa = is_array( $a ) && isset( $a['sn'] ) ? (string) $a['sn'] : '';
+                    $sb = is_array( $b ) && isset( $b['sn'] ) ? (string) $b['sn'] : '';
+                    return strcmp( $sa, $sb );
+                } );
+            }
+            return $normalized;
+        }
+        // Associative — ksort + recurse
+        ksort( $value, SORT_STRING );
+        foreach ( $value as $k => $v ) {
+            $value[ $k ] = dinoco_idempotency_canonical_normalize( $v, $depth + 1 );
+        }
+        return $value;
+    }
+}
+
 if ( ! function_exists( 'dinoco_idempotency_hash' ) ) {
     /**
      * Compute SHA256 hex hash of a request body. Used to detect when
      * a client retries the SAME idempotency key with a DIFFERENT body
      * (which is a 409 conflict — client bug or intentional abuse).
      *
-     * Body normalization rules:
-     *   - null/array/object  → wp_json_encode (canonical form)
+     * Body normalization rules (V.1.2):
+     *   - null/array/object  → canonical normalize → wp_json_encode
      *   - string             → as-is (already serialized by client)
      *   - scalar (int/bool)  → cast to string
      *
-     * NOTE: We do NOT alphabetize JSON keys — same client should produce
-     * the same byte sequence on retry. If the JS object key order differs
-     * between attempts, that's a CLIENT bug worth surfacing as 409.
+     * V.1.2 RFC 8785 JCS canonical form: associative arrays ksort recursively,
+     * numeric arrays sort by `sn` if every element has `sn` key. Stabilizes
+     * hash across cross-client retries — different mobile/RPi/OpenClaw retry
+     * paths emit JSON in different key order but same logical payload now
+     * hashes identically.
      *
      * @param mixed $body Request body
      * @return string SHA256 hex (64 chars)
      */
     function dinoco_idempotency_hash( $body ) {
         if ( is_array( $body ) || is_object( $body ) ) {
+            // V.1.2 — canonical normalize before encode
+            if ( function_exists( 'dinoco_idempotency_canonical_normalize' ) ) {
+                $body = dinoco_idempotency_canonical_normalize( $body );
+            }
             $serialized = function_exists( 'wp_json_encode' )
                 ? wp_json_encode( $body )
                 : json_encode( $body );

@@ -1,6 +1,13 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.31.4 (2026-05-07) — R3 CRIT-1 align lock timeout to
+ *   DINOCO_SN_LOCK_TIMEOUT (5s, was 3s) — matches Activation + Manual Transfer.
+ *   Defensive constant fallback if REST API V.0.29 not yet synced.
+ *   CRIT-3/F-NEW-1 — fire `dinoco_sn_pool_status_changed` post-COMMIT (was
+ *   missing) + `dinoco_sn_pool_status_changed_for_user` when registered_user_id
+ *   resolved from sn_pool row. Centralized via dinoco_sn_fire_status_changed
+ *   helper if REST API V.0.29 synced; else direct do_action() fallback.
  * Version: V.31.3 (2026-05-07) — C1 FIX: unified lock key 'dnc_sn_{md5}' for
  *   claim status sync hook (was per-action 'dnc_sn_claim_{md5}'). Aligns with
  *   Activation/Transfer/Service Center so concurrent SN ops serialize
@@ -294,8 +301,12 @@ if ( ! function_exists( 'dinoco_sn_claim_status_changed' ) ) {
         // ops on the same SN serialize correctly. Without unified key,
         // claim FSM flip interleaved with transfer → prev_status corruption
         // (state machine sees unexpected from-state).
-        $lock_key = 'dnc_sn_' . md5( $sn_code );
-        $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $lock_key ) );
+        // V.31.4 — unified key + 5s timeout (constant from REST API V.0.29; fallback 5)
+        $lock_key = function_exists( 'dinoco_sn_lock_name' )
+            ? dinoco_sn_lock_name( $sn_code )
+            : 'dnc_sn_' . md5( $sn_code );
+        $lock_to  = defined( 'DINOCO_SN_LOCK_TIMEOUT' ) ? (int) DINOCO_SN_LOCK_TIMEOUT : 5;
+        $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, %d)", $lock_key, $lock_to ) );
         if ( ! $got_lock ) {
             if ( function_exists( 'b2b_log' ) ) {
                 b2b_log( sprintf( '[SN-Claim] GET_LOCK timeout sn=%s claim=#%d', $sn_code, $claim_id ) );
@@ -392,6 +403,24 @@ if ( ! function_exists( 'dinoco_sn_claim_status_changed' ) ) {
             }
 
             $wpdb->query( 'COMMIT' );
+
+            // V.31.4 CRIT-3 + F-NEW-1 — fire status_changed AFTER commit so
+            // listeners (REST/MCP cache invalidation, Member Dashboard) only
+            // see committed state. registered_user_id was selected once via
+            // FOR UPDATE; re-fetch a fresh row to expose the user_id for the
+            // for_user variant (skipped if no owner present).
+            $owner_uid = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT registered_user_id FROM {$tbl} WHERE sn = %s LIMIT 1",
+                $sn_code
+            ) );
+            if ( function_exists( 'dinoco_sn_fire_status_changed' ) ) {
+                dinoco_sn_fire_status_changed( $sn_code, $old_pool_status, $new_pool_status, $owner_uid );
+            } else {
+                do_action( 'dinoco_sn_pool_status_changed', $sn_code, $old_pool_status, $new_pool_status );
+                if ( $owner_uid > 0 ) {
+                    do_action( 'dinoco_sn_pool_status_changed_for_user', $owner_uid, $sn_code, $old_pool_status, $new_pool_status );
+                }
+            }
 
             // Replacement flow scaffold (Phase 3 will allocate new plate via UI):
             // when status flipped to `replaced`, set ACF flag for admin banner.

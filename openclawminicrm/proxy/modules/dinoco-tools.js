@@ -1,5 +1,13 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
+ * V.6.2 — Phase 4 W14.5 Round 3 (chatbot-rules.md §15.14): Strict Crockford alphabet
+ *         (excludes I, L, O, U) for SN_LENIENT_REGEX + new SN_CROCKFORD_REGEX (canonical
+ *         12-char DNCSS + 6 alphanum + 1 checksum) + new validateSnFormat() returns
+ *         { valid, format: 'crockford'|'legacy'|'invalid', reason } per R3 Gap 4.
+ *         Tool descriptions (R3 Gap 2): trim is_owned_by_caller from advertised fields
+ *         (PII gate deferred to MCP V.3.1 — Phase 4 W14.5). Keep top_set_sku, plate_status
+ *         (PII-safe).
+ *         No signature change — backward compat 100%. isLenientSn() / isCanonicalSn() retained.
  * V.6.1 — Phase 4 W14.4 Round 2 (chatbot-rules.md §15.14): description hardening for
  *         dinoco_warranty_check + dinoco_serial_lookup + dinoco_create_claim — explicit
  *         §15.2/§15.3/§15.5/§15.6 enforcement notes. NEW lenient regex helper isLenientSn()
@@ -19,23 +27,65 @@
 // ★ V.6.0 — S/N format helpers (Phase 4 W14)
 // Canonical regex per chatbot-rules.md §15.1 — DNCSS prefix + 7 digits (legacy default).
 // V.6.1 (Round 2): added lenient regex per §15.14.1 — AI-side soft validation only.
-//   Backend (/sn-lookup) is source of truth for actual checksum verification (Crockford
-//   base32 + Luhn-mod-32 per plan v2.13). Lenient pattern accepts future variable-length
-//   format (DNCSS<RAND6><CHK1> = 12 chars) + legacy DNCSS\d{7} (12 chars too).
+// V.6.2 (Round 3 Gap 4): strict Crockford alphabet — excludes I, L, O, U to prevent
+//   ambiguous OCR misreads (1↔I↔L, 0↔O, U↔V). Backend (/sn-lookup) is source of truth
+//   for actual checksum verification (Luhn-mod-32 per plan v2.13).
+//   Crockford base32 alphabet: 0-9, A-H, J-K, M-N, P-T, V-Z (32 chars total).
+//   Excluded: I, L, O, U (4 chars).
 // Normalize: uppercase + strip whitespace + strip dashes (e.g. "dncss-0001234" → "DNCSS0001234")
-const SN_PREFIX_REGEX = /^DNCSS\d{7}$/;
-const SN_LENIENT_REGEX = /^DNC[A-Z0-9]{3,9}$/; // V.6.1 — for OCR extraction & soft validation
+const SN_PREFIX_REGEX = /^DNCSS\d{7}$/;                              // legacy 7-digit (12 chars total)
+// V.6.2 — Strict Crockford alphabet (canonical): DNCSS + 6 random + 1 checksum = 12 chars
+const SN_CROCKFORD_REGEX = /^DNCSS[0-9A-HJ-KMNP-TV-Z]{6}[0-9A-HJ-KMNP-TV-Z]$/;
+// V.6.2 — Lenient (for OCR extraction & soft validation in claim-flow): widened length range
+// covers both legacy 7-digit (12 char total) and future canonical (12 chars). Excludes I/L/O/U.
+const SN_LENIENT_REGEX = /^DNC(SS)?[0-9A-HJ-KMNP-TV-Z]{3,9}$/;
 function normalizeSerial(input) {
   if (!input || typeof input !== "string") return "";
   return input.toUpperCase().replace(/[\s-]+/g, "");
 }
 function isCanonicalSn(input) {
-  return SN_PREFIX_REGEX.test(normalizeSerial(input));
+  // Accepts legacy DNCSS\d{7} OR new Crockford 12-char (both backend-verified)
+  const norm = normalizeSerial(input);
+  return SN_PREFIX_REGEX.test(norm) || SN_CROCKFORD_REGEX.test(norm);
 }
 // V.6.1 — lenient check used by claim-flow Photo OCR (§15.8 / §15.14.5).
 // AI MUST NOT use this to reject — only to detect candidates worth backend verification.
 function isLenientSn(input) {
   return SN_LENIENT_REGEX.test(normalizeSerial(input));
+}
+
+/**
+ * V.6.2 — validateSnFormat: classify a serial into crockford / legacy / invalid.
+ * R3 Gap 4 — gives AI a structured way to explain the format error to the customer
+ * without rejecting outright. Backend (/sn-lookup) is still authoritative — even invalid
+ * format may be deliberately routed for audit logging (e.g. fraud probe).
+ *
+ * Returns: { valid: bool, format: 'crockford'|'legacy'|'invalid', reason?: string, normalized: string }
+ */
+function validateSnFormat(input) {
+  const normalized = normalizeSerial(input);
+  if (!normalized) {
+    return { valid: false, format: "invalid", reason: "empty_input", normalized: "" };
+  }
+  if (SN_CROCKFORD_REGEX.test(normalized)) {
+    return { valid: true, format: "crockford", normalized };
+  }
+  if (SN_PREFIX_REGEX.test(normalized)) {
+    return { valid: true, format: "legacy", normalized };
+  }
+  // Probe common OCR misread cases for helpful error message
+  if (/[ILOU]/.test(normalized) && /^DNC/.test(normalized)) {
+    return {
+      valid: false,
+      format: "invalid",
+      reason: "contains_excluded_char_ILOU",
+      normalized,
+    };
+  }
+  if (!/^DNC/.test(normalized)) {
+    return { valid: false, format: "invalid", reason: "missing_prefix", normalized };
+  }
+  return { valid: false, format: "invalid", reason: "length_or_alphabet_mismatch", normalized };
 }
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -171,7 +221,7 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_warranty_check",
-      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial (รองรับ DNCSSxxxxxxx ใหม่ หรือ DN-XXXXX เก่า) หรือเบอร์โทร — ★ ห้ามตอบสถานะจากความจำ ต้องเรียก tool ทุกครั้ง (chatbot-rules §15.2). Tool อาจ return ฟิลด์ top_set_sku, plate_status (registered/claimed/voided/recalled/transferred/stolen), is_owned_by_caller — ใช้ฟิลด์นี้ตัดสินใจตอบแทนการ guess. ถ้า status ∈ {voided, recalled, stolen} → ตอบ generic ไม่เผยรายละเอียด (§15.3)",
+      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial (รองรับ DNCSSxxxxxxx ใหม่ format Crockford 12 ตัว ไม่มี I/L/O/U หรือ DNCSS\\d{7} legacy หรือ DN-XXXXX เก่า) หรือเบอร์โทร — ★ ห้ามตอบสถานะจากความจำ ต้องเรียก tool ทุกครั้ง (chatbot-rules §15.2). Tool อาจ return ฟิลด์ top_set_sku, plate_status (registered/claimed/voided/recalled/transferred/stolen) — ใช้ฟิลด์นี้ตัดสินใจตอบแทนการ guess. ถ้า status ∈ {voided, recalled, stolen} → ตอบ generic ไม่เผยรายละเอียด (§15.3). NOTE: is_owned_by_caller deferred — requires PII gate (Phase 4 W14.5 MCP V.3.1). ใช้ phone matching + status เท่านั้นจนกว่า field จะถูก enable",
       parameters: {
         type: "object",
         properties: {
@@ -185,11 +235,11 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_serial_lookup",
-      description: "ค้นหา canonical S/N → product + warranty info ใช้เมื่อลูกค้าถาม 'ของฉันซื้อเมื่อไหร่' 'ประกันถึงเมื่อไหร่' 'นี่ของแท้ DINOCO ไหม' 'S/N นี้ของอะไร' หรือส่งเลข S/N รูปแบบ DNCSS+ตัวเลข มา — ★ read-only canonical lookup (chatbot-rules §15.2). ห้าม guess product/owner จาก context — เรียก tool ทุกครั้ง. ถ้า not_found → 'อาจไม่ใช่ของแท้ DINOCO หรือยังไม่ลงทะเบียน' (อย่าสรุปว่าปลอม — เป็น admin call)",
+      description: "ค้นหา canonical S/N → product + warranty info ใช้เมื่อลูกค้าถาม 'ของฉันซื้อเมื่อไหร่' 'ประกันถึงเมื่อไหร่' 'นี่ของแท้ DINOCO ไหม' 'S/N นี้ของอะไร' หรือส่งเลข S/N รูปแบบ DNCSS+ตัวเลข มา — ★ read-only canonical lookup (chatbot-rules §15.2). S/N format = DNCSS + 6 ตัวอักษร/ตัวเลข + 1 checksum (12 ตัว, Crockford alphabet ไม่มี I/L/O/U). Legacy: DNCSS + ตัวเลข 7 หลัก. ห้าม guess product/owner จาก context — เรียก tool ทุกครั้ง. ถ้า not_found → 'อาจไม่ใช่ของแท้ DINOCO หรือยังไม่ลงทะเบียน' (อย่าสรุปว่าปลอม — เป็น admin call)",
       parameters: {
         type: "object",
         properties: {
-          serial: { type: "string", description: "เลข S/N เช่น 'DNCSS0001234' (format: DNCSS + ตัวเลข 7 หลัก legacy หรือ DNCSS+RAND6+CHK1 ใหม่)" },
+          serial: { type: "string", description: "เลข S/N เช่น 'DNCSS0001234' (legacy 7-digit) หรือ 'DNCSSXY3K7P2' (Crockford 12-char ใหม่ — ไม่มี I/L/O/U)" },
         },
         required: ["serial"],
       },
@@ -1057,4 +1107,7 @@ module.exports = {
   isLenientSn,
   SN_PREFIX_REGEX,
   SN_LENIENT_REGEX,
+  // V.6.2 — Round 3 Gap 4: Crockford alphabet helpers (strict canonical 12-char)
+  SN_CROCKFORD_REGEX,
+  validateSnFormat,
 };

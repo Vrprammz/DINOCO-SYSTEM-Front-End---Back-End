@@ -4,8 +4,8 @@
 > ทุก rule ในไฟล์นี้คือสิ่งที่ถูกแก้ไปแล้ว **ห้ามเปลี่ยน** เวลาแก้ feature อื่น
 > ก่อนแก้อะไรที่เกี่ยวกับ chatbot (ai-chat.js, shared.js, dinoco-tools.js) **ต้องอ่านไฟล์นี้ก่อนเสมอ**
 
-**Last updated:** 2026-05-07 | **Version:** 1.5
-**Regression status:** 25/25 PASS (100%) — Gate verified stable | Section 15 v2.13 implementation wired in dinoco-tools.js V.6.0 + Section 15.14 Round 2 (2026-05-07) deltas — Photo OCR validation (claim-flow.js), SN cache invalidation hooks (dinoco-cache.js), 3 new Telegram aging alerts (telegram-gung.js)
+**Last updated:** 2026-05-07 | **Version:** 1.6
+**Regression status:** 25/25 PASS (100%) — Gate verified stable | Section 15 v2.13 implementation wired in dinoco-tools.js V.6.2 + Section 15.14 Round 3 (2026-05-07) deltas — sn-webhook.js V.1.0 listener (POST /webhook/sn-event), Crockford alphabet strict regex (excludes I/L/O/U), validateSnFormat() helper, OCR misread-suspect classification (less aggressive escalation), 5 new training scenarios (15.14.7 extension)
 
 ---
 
@@ -380,6 +380,13 @@ cd /opt/dinoco && git pull origin main && cd openclawminicrm && docker compose -
 | 2026-05-07 | เพลทหายไม่ขอ evidence | enforce §15.6 ขอรูป + ใบเสร็จ + address ก่อน escalate Service Center | (this commit) | REG-094 |
 | 2026-05-07 | dinoco_serial_lookup tool ขาด — AI guess product จาก S/N | tool added (V.6.0) — dispatcher routes DNCSS\d{7} | (already wired V.6.0) | REG-095 |
 | 2026-05-07 | Cache stale หลัง customer activate plate ทันที | dinoco-cache.js V.1.1 invalidateSnCache + WP webhook hook spec (Phase 4 W14.5 wiring TODO) | (this commit) | REG-096 |
+| 2026-05-07 | **R3 Gap 1 BLOCKER**: WP→Agent webhook listener ขาด — 60s TTL fallback only, customer activate plate → AI ตอบสถานะเก่า | NEW `proxy/modules/sn-webhook.js` V.1.0 + register `POST /webhook/sn-event` ใน `proxy/index.js` V.2.3 (bearer auth + rate limit 1000/min + payload validation + MongoDB `sn_event_log` audit) | (this commit) | REG-097 |
+| 2026-05-07 | R3 Gap 2: Tool description claim `is_owned_by_caller` แต่ MCP V.3.0 strip PII (`registered_user_id`) — AI confused | dinoco-tools.js V.6.2: trim is_owned_by_caller from `dinoco_warranty_check` description + add explicit "deferred — requires PII gate (Phase 4 W14.5)" note | (this commit) | REG-098 |
+| 2026-05-07 | R3 Gap 3: Photo OCR regex `/DNC[A-Z0-9]{3,11}/i` lenient — accepts I/L/O/U → false positive flagged as fake_sn_attempt (actually OCR misread) | claim-flow.js V.4.1: strict Crockford regex `/DNC(?:SS)?[0-9A-HJ-KMNP-TV-Z]{3,11}/gi` + new `ocr_misread_suspect` flag (no Telegram escalate, less aggressive) | (this commit) | REG-099 |
+| 2026-05-07 | R3 Gap 4: `isLenientSn()` regex too permissive (no I/L/O/U exclusion) — would accept user typo as valid | dinoco-tools.js V.6.2: `SN_LENIENT_REGEX` Crockford alphabet + new `validateSnFormat()` returns `{valid, format, reason, normalized}` | (this commit) | REG-100 |
+| 2026-05-07 | R3 Gap 5: §15.14 implicit relation to Section 15 base unclear — could be read as override | chatbot-rules.md §15.14 header explicit "ขยาย Section 15 — ไม่ override" + cross-ref `(see also §15.X)` per sub-section + priority on conflict rule | (this commit) | — |
+| 2026-05-07 | R3 cache: cacheSnLookup signature ไม่รับ ttl_ms — caller ปรับ TTL ไม่ได้ | dinoco-cache.js V.1.2: `cacheSnLookup(sn, data, ttl_ms = 60000)` + bounded 1s..7d validation | (this commit) | — |
+| 2026-05-07 | R3 training: 5 new scenarios (lenient regex / OCR partial / cache stale / Crockford education / alert flood) | chatbot-rules.md §15.14.7 R3-1..R3-5 added | (this commit) | — |
 
 ---
 
@@ -571,7 +578,7 @@ REG-IDs ที่ map ไป Section 15 (ใส่ใน `regression_scenarios` 
 
 ---
 
-**Last updated:** 2026-05-07 (Section 15 implementation landed — Phase 4 W14.1 wired in dinoco-tools.js V.6.0)
+**Last updated:** 2026-05-07 R3 (Section 15.14 R3 deltas landed — sn-webhook.js V.1.0 + Crockford strict alphabet + 5 new scenarios)
 
 ### 15.13 Implementation Status (Phase 4 W14.1 — 2026-05-07)
 
@@ -595,21 +602,27 @@ Deferred to future rounds:
 
 ### 15.14 Round 2 Implementation Deltas (Phase 4 W14.4 + W14.5 — 2026-05-07)
 
+> **Section 15.14 ขยาย Section 15 G1 sub-rules (15.1-15.6) — ไม่ override**
 > 7 findings G1..G7 wired across `dinoco-tools.js`, `claim-flow.js`, `telegram-gung.js`, `dinoco-cache.js`.
 > Backward-compatible: every change is additive; signatures of existing tools preserved.
+> **Priority on conflict**: Section 15 base rules (15.1-15.13) take precedence over 15.14 extensions.
+> เช่น ถ้า §15.1 บอก format `^DNCSS\d{7}$` (canonical) แต่ §15.14.1 ขยายเป็น lenient — backend ยึด canonical (Crockford 12-char + Luhn checksum), AI ใช้ lenient เฉพาะ OCR extraction.
 
-#### 15.14.1 S/N format scope expansion (G1)
+#### 15.14.1 S/N format scope expansion (G1) (see also §15.1)
 
-§15.1 used `^DNCSS\d{7}$` (legacy 7-digit). Round 2 widens validation to **lenient regex** for AI safety:
+§15.1 used `^DNCSS\d{7}$` (legacy 7-digit). Round 2 widens validation to **lenient regex** for AI safety. Round 3 (R3 Gap 4) tightens lenient to **Crockford alphabet** (excludes I, L, O, U):
 
-- Lenient (AI-side guard, never authoritative): `/^DNC[A-Z0-9]{3,9}$/`
-- Strict (backend authoritative — uses Crockford base32 + Luhn-mod-32 checksum from plan v2.13): WP `/sn-lookup` validates internally
+- **Lenient** (AI-side guard, never authoritative): `/^DNC(SS)?[0-9A-HJ-KMNP-TV-Z]{3,9}$/` — Crockford base32, no I/L/O/U
+- **Strict canonical** (backend authoritative — Luhn-mod-32 checksum from plan v2.13): `/^DNCSS[0-9A-HJ-KMNP-TV-Z]{6}[0-9A-HJ-KMNP-TV-Z]$/` — 12 chars total
+- **Legacy**: `/^DNCSS\d{7}$/` — backward-compat with pre-v2.13 batches
 - Future canonical (per Round 1 G1 finding): `DNCSS<RAND6><CHK1>` 12-char. Backward-compat with legacy `DNCSS\d{7}`.
-- AI rule: never reject a serial purely on regex — let backend respond `not_found`. AI's job = normalize (uppercase + strip whitespace + dashes), pass through, surface backend reply verbatim.
+- **AI rule**: never reject a serial purely on regex — let backend respond `not_found`. AI's job = normalize (uppercase + strip whitespace + dashes), pass through, surface backend reply verbatim.
+- **Crockford rationale**: I/L look like 1, O looks like 0, U looks like V — excluding them prevents human error AND OCR misreads. If customer types "DNCSS-OOL-123" → AI says "S/N format DINOCO ไม่มีตัวอักษร O และ L" (see §15.14.7 scenario 4).
+- **Helper**: `validateSnFormat(input)` (dinoco-tools.js V.6.2) returns `{ valid, format: 'crockford'|'legacy'|'invalid', reason, normalized }` — used by claim-flow Photo OCR to classify candidates.
 
-#### 15.14.2 Owner verification (G2 partial — backward-compat shim)
+#### 15.14.2 Owner verification (G2 partial — backward-compat shim) (see also §15.2)
 
-`dinoco_warranty_check` description updated to advertise that it **may return** ownership signal (`is_owned_by_caller`) once the WP `/warranty-check` + `/sn-lookup` payloads include the field. Tool code does not require the field today (graceful nullable) — plan V.7+ MCP wiring is responsible for emitting it. Until then AI continues to use `phone` matching + backend `status` only.
+`dinoco_warranty_check` description updated to advertise `top_set_sku` + `plate_status` (PII-safe). **R3 Gap 2**: removed `is_owned_by_caller` from advertised fields — that field requires PII gate (Phase 4 W14.5 MCP V.3.1) which strips `registered_user_id` from the response. Until MCP V.3.1 emits the derived ownership boolean server-side, AI continues to use `phone` matching + backend `status` only. Tool code does not require the field today (graceful nullable). The description note "is_owned_by_caller deferred — requires PII gate (Phase 4 W14.5)" makes this explicit to the AI.
 
 #### 15.14.3 NEW dinoco_serial_lookup vs dinoco_warranty_check (G2)
 
@@ -620,30 +633,51 @@ Both tools coexist:
 
 AI rule: prefer `dinoco_serial_lookup` for read-only queries. Use `dinoco_warranty_check` only when caller has phone but no S/N, or when migrating legacy DN- format.
 
-#### 15.14.4 Cache invalidation hook (G3 — partial landing)
+#### 15.14.4 Cache invalidation hook (G3 — Round 3 FULL landing) (see also §15.2 + §15.10)
 
-`dinoco-cache.js` V.1.1 exposes:
+`dinoco-cache.js` V.1.2 + `sn-webhook.js` V.1.0 wired in `proxy/index.js` V.2.3:
 
-- `snLookupCache` Map (key = `DNCSSnnnnnnn`, value = `{ data, expires }`, TTL **60s**) — replaces ad-hoc WP-side caching, makes invalidation atomic
+- `snLookupCache` Map (key = `DNCSSnnnnnnn`, value = `{ data, expires }`, TTL **60s default**, configurable via `cacheSnLookup(sn, data, ttl_ms)`) — replaces ad-hoc WP-side caching, makes invalidation atomic
 - `invalidateSnCache(sn)` — single-SN bust + invalidates `kb` cache (entries may reference SN status indirectly)
-- `invalidateAllSnCache()` — full bust (used by `dinoco_sn_state_changed` MCP event — Phase 4 W14.5 integration point)
-- WP integration spec (Agent B owns the wiring): WP fires `do_action('dinoco_sn_pool_status_changed', $sn)` → existing OpenClaw POST hook → agent endpoint `/webhook/sn-event` (TODO Phase 4 W14.5) → `invalidateSnCache(sn)`
-- AI rule: if `dinoco_serial_lookup` returns `expires_at` field, agent layer respects it. AI never caches SN status itself (only the cache Map does — for exactly 60s).
+- `invalidateAllSnCache()` — full bust (used by `dinoco_sn_state_changed` MCP event)
+- **R3 NEW: `POST /webhook/sn-event`** — receives WP fire of `dinoco_sn_pool_status_changed`:
+  - Auth: bearer token `LIFF_AI_AGENT_KEY` (env)
+  - Rate limit: 1000/min (cache invalidation = high-volume read-side mutation)
+  - Payload: `{ sn, old_status, new_status, ts, source: 'wp' }`
+  - Action: `invalidateSnCache(sn)` + log MongoDB `sn_event_log`
+  - Response: `{ success: true, invalidated: ['warranty_check', 'sn_lookup'], cache_existed: bool }`
+  - Defensive: try/catch every step, never throws, never breaks agent
+- **WP integration spec** (Agent A — separate task): NEW WP listener (in MCP Bridge V.3.1 or dedicated `[System] DINOCO SN Webhook Forwarder` snippet):
+  - Hook into `dinoco_sn_pool_status_changed` action
+  - Build payload + POST to `OPENCLAW_AGENT_URL/webhook/sn-event` with `Authorization: Bearer LIFF_AI_AGENT_KEY`
+  - Async / fire-and-forget (don't block sn_pool transaction); 5s timeout; failure → log + 1 retry; never throw
+- **Backward compat**: cache invalidation falls back to 60s TTL (§15.14.4) if webhook missed.
+- **AI rule**: if `dinoco_serial_lookup` returns `expires_at` field, agent layer respects it. AI never caches SN status itself (only the cache Map does — for the configured TTL, default 60s).
 
-#### 15.14.5 Photo OCR fraud validation chain (G4)
+#### 15.14.5 Photo OCR fraud validation chain (G4) (see also §15.8)
 
-`claim-flow.js` V.4.0 adds `extractSerialFromAnalysis(analysis)` + `validatePhotoSerial(extractedSn, claim, sourceId)`:
+`claim-flow.js` V.4.1 adds `extractSerialFromAnalysis(analysis)` + `validatePhotoSerial(extractedSn, claim, sourceId)`:
 
-- **Trigger**: photo uploaded during claim flow → Gemini Vision returns `analysis` text → regex `/DNC[A-Z0-9]{3,11}/i` extracts candidate serials
-- **Validation**: each extracted SN → `callDinocoAPI('/sn-lookup', { sn })` → 4 outcomes:
+- **Trigger**: photo uploaded during claim flow → Gemini Vision returns `analysis` text → strict Crockford regex `/DNC(?:SS)?[0-9A-HJ-KMNP-TV-Z]{3,11}/gi` extracts candidate serials (R3 Gap 3 — excludes I/L/O/U OCR-ambiguous chars)
+- **Validation**: each extracted SN → `validateSnFormat()` pre-check → if `contains_excluded_char_ILOU` → flag `ocr_misread_suspect` + skip backend call (saves quota, less aggressive escalation). Otherwise → `callDinocoAPI('/sn-lookup', { sn })` → 4 outcomes:
   - `not_found` → flag `intent: 'fake_sn_attempt'` + telegram `ocr_unknown_serial` alert (claim continues — admin reviews)
   - `voided / recalled / stolen` → block claim continuation + telegram `voided_inquiry` (or appropriate category) + generic reply per §15.3
   - `registered` + `registered_user_id` ≠ claim submitter → flag `requires_4eyes_review` + telegram `ocr_mismatch_fraud_suspect` (claim continues — admin reviews owner mismatch)
   - `registered` + owner matches → ✓ proceed (no flag)
+- **R3 NEW: ocr_misread_suspect classification** — when extracted SN contains I/L/O/U, it's most likely OCR error (1↔I↔L, 0↔O), not counterfeit. Flag separately, no telegram alert by default. Customer-facing: AI should ask "ลองตรวจ S/N อีกครั้ง — DINOCO ไม่มีตัวอักษร I, L, O, U" (see §15.14.7 scenario 4).
 - **AI rule**: never tell customer "S/N นี้ไม่ใช่ของคุณ" — that's an admin call. Claim continues, internal flag handles routing.
 - **Defensive**: extraction skips Gemini (no fetch loop), all telegram calls `.catch(() => {})` — claim flow never breaks on OCR validation failure.
 
-#### 15.14.6 Telegram น้องกุ้ง 3 new aging categories (G5)
+#### 15.14.6 Telegram น้องกุ้ง 3 new aging categories (G5) (see also §1-§14 alert hygiene)
+
+**R3 — Alert flood suppression spec** (deferred to `telegram-alert.js` V.2.2 — file outside R3 ownership scope):
+
+- Per-sourceId, per-category sliding window: > 5 alerts/min → suppress individual sends + add to MongoDB `telegram_alert_digest` queue
+- Daily 09:00 cron consolidates queue → single digest message to บอส per sourceId per category
+- Rationale: high-volume OCR fraud probes (e.g. attacker iterates DNCSS00001..99999) currently spam Telegram. Digest preserves visibility without flooding.
+- Owner: telegram-alert.js V.2.2 sprint (separate task — touches `sendTelegramAlert` rate-limit branch + cron addition).
+- AI rule: alert categories `voided_inquiry / recall_inquiry / ocr_unknown_serial / ocr_mismatch_fraud_suspect` are subject to suppression. Claim-flow continues regardless (alert is best-effort).
+
 
 `telegram-gung.js` V.2.0 `checkClaimAging` extended:
 
@@ -672,6 +706,39 @@ Manual QA after deploying Round 2:
 6. **"ขอโอนประกันให้เพื่อน"** → call `dinoco_warranty_check` ก่อน → warn ถ้า status ∈ {stolen, recalled, claimed} → block transfer flow. Active+registered → ส่งไป LIFF transfer.
 7. **Manual claims backfill: legacy serial ไม่มีใน sn_pool** → "ระบบใหม่อัพเดทอยู่ — ทีมงานจะตรวจสอบให้นะคะ" + flag `requires_manual_review` (no fake_sn_attempt — known migration gap). Telegram `ocr_unknown_serial` with note `legacy_pre_v213`.
 
+**R3 (2026-05-07) — 5 new scenarios (extends §15.14.7):**
+
+**R3-1. Lenient regex false positive recovery (Crockford)**
+
+- User: "S/N ของผม DNC001 ยังประกันอยู่ไหม"
+- AI: "S/N นี้ format ไม่ถูกต้อง — DINOCO S/N เริ่มด้วย DNCSS ตามด้วย 6-7 ตัวอักษร/ตัวเลข (ไม่มี I, L, O, U) ลองตรวจ S/N บนเพลทอีกครั้งครับ"
+- **ห้าม** call `dinoco_serial_lookup` (frontend regex reject — saves backend quota). **ห้าม** escalate Telegram (ไม่ใช่ fraud — แค่ user error).
+
+**R3-2. OCR partial match (length too short)**
+
+- System: photo upload, Gemini Vision extract `"DNCSS123"` (8 chars, length too short for canonical 12-char)
+- AI: "ระบบอ่าน S/N จากรูปได้บางส่วน (DNCSS123) — กรุณาส่งรูปชัดขึ้น หรือพิมพ์ S/N เต็มให้หน่อยครับ"
+- claim-flow: extract regex matches but length < 12 → flag `ocr_partial_match` (no backend call).
+
+**R3-3. Cache staleness within 60s (webhook-driven invalidation)**
+
+- User asks "ลงทะเบียนแล้วยัง" 2 ครั้งภายใน 60 วินาที — first call cache miss → backend lookup → cache. Customer activates plate at second 30 → WP fires `dinoco_sn_pool_status_changed` → POST `/webhook/sn-event` → `invalidateSnCache(sn)` → next agent call (second 45s) refetches fresh data.
+- **Without webhook**: 60s TTL safety net — second call (after second 60) auto-refetches.
+- AI rule: AI never assumes cache is fresh beyond TTL — `dinoco_serial_lookup` always returns latest.
+
+**R3-4. Crockford alphabet education (preemptive)**
+
+- User: "S/N DNCSS-OOL-123 ใช่ของจริงไหม"
+- AI: "S/N format DINOCO ไม่มีตัวอักษร O และ L (เพราะดูคล้าย 0 และ 1) ลองตรวจอีกครั้ง — อาจเป็นเลข 0 หรือ 1 ครับ"
+- `validateSnFormat` returns `{ valid: false, format: 'invalid', reason: 'contains_excluded_char_ILOU' }` → AI uses reason to craft helpful reply.
+
+**R3-5. Telegram alert flood suppression**
+
+- System detects: same `sourceId` triggers `ocr_unknown_serial` > 5 ครั้ง/นาที (e.g. attacker iterates SNs)
+- Action: rate limit at agent layer — suppress individual sends + add to daily digest queue (`telegram_alert_digest`).
+- **Note**: implementation deferred to `telegram-alert.js` V.2.2 (separate sprint, see §15.14.6 R3 spec).
+- AI behavior unchanged — claim continues regardless.
+
 #### 15.14.8 Files touched (Round 2 — 2026-05-07)
 
 | File | Version | Change |
@@ -681,5 +748,22 @@ Manual QA after deploying Round 2:
 | `openclawminicrm/proxy/modules/claim-flow.js` | V.4.0 | Photo OCR validation chain (G4) |
 | `openclawminicrm/proxy/modules/telegram-gung.js` | V.2.0 | 3 new aging categories (G5) |
 | `openclawminicrm/proxy/modules/dinoco-cache.js` | V.1.1 | `snLookupCache` Map + `invalidateSnCache` + `invalidateAllSnCache` |
+
+#### 15.14.9 Files touched (Round 3 — 2026-05-07)
+
+| File | Version | Change |
+|---|---|---|
+| `openclawminicrm/docs/chatbot-rules.md` | V.1.6 | §15.14 base-extension clarification + cross-refs + 5 new R3 scenarios + 7 new fix history rows |
+| `openclawminicrm/proxy/modules/sn-webhook.js` | V.1.0 (NEW) | WP→Agent webhook listener (`POST /webhook/sn-event`) — bearer auth + rate limit 1000/min + payload validation + MongoDB `sn_event_log` |
+| `openclawminicrm/proxy/index.js` | V.2.3 | Wire sn-webhook module + register route |
+| `openclawminicrm/proxy/modules/dinoco-tools.js` | V.6.2 | Crockford alphabet (excludes I/L/O/U) — `SN_CROCKFORD_REGEX` + `validateSnFormat()` + `SN_LENIENT_REGEX` tightened. `dinoco_warranty_check` description trimmed (is_owned_by_caller deferred per R3 Gap 2) |
+| `openclawminicrm/proxy/modules/claim-flow.js` | V.4.1 | OCR_SN_REGEX strict Crockford + `ocr_misread_suspect` flag classification (less aggressive escalation) |
+| `openclawminicrm/proxy/modules/dinoco-cache.js` | V.1.2 | `cacheSnLookup(sn, data, ttl_ms=60000)` accepts explicit per-entry TTL parameter |
+
+**Round 3 deferred (out of file ownership scope, separate sprints):**
+
+- `openclawminicrm/proxy/modules/telegram-alert.js` V.2.2 — alert flood suppression (per-sourceId 5/min limit + daily digest queue)
+- WP-side: NEW snippet `[System] DINOCO SN Webhook Forwarder` (or extend MCP Bridge V.3.1) — hook `dinoco_sn_pool_status_changed` → POST `/webhook/sn-event` with bearer auth (Agent A task)
+- MCP V.3.1 — emit derived `is_owned_by_caller` boolean server-side (PII gate) so AI tool can use it without exposing `registered_user_id`
 
 **END OF CANONICAL BRAIN**
