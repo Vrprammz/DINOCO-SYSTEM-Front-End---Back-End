@@ -5904,4 +5904,81 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(content).toContain('test_typo_detection_rate_high');
         });
     });
+
+    describe('V.0.37 — UX system toggle + disabled banner', () => {
+        function readManager() {
+            const file = path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager');
+            return fs.readFileSync(file, 'utf8');
+        }
+        function readRest() {
+            const file = path.join(REPO_ROOT, '[System] DINOCO SN REST API');
+            return fs.readFileSync(file, 'utf8');
+        }
+
+        test('Manager V.0.37 + REST V.0.27 headers bumped', () => {
+            expect(readManager()).toMatch(/Version: V\.0\.37 \(2026-05-07\) — UX: 1-click system toggle/);
+            expect(readRest()).toMatch(/Version: V\.0\.27 \(2026-05-07\) — POST \/system\/toggle/);
+        });
+
+        test('Manager renders disabled banner when system OFF', () => {
+            const code = readManager();
+            // Banner only shown when ! dinoco_sn_is_enabled()
+            expect(code).toMatch(/<\?php\s+if\s*\(\s*!\s*dinoco_sn_is_enabled\(\)\s*\)\s*:\s*\?>/);
+            expect(code).toContain('dnc-sn-disabled-banner');
+            expect(code).toContain('ระบบ S/N ยังปิดอยู่');
+        });
+
+        test('Status badge is now an interactive button', () => {
+            const code = readManager();
+            // Both ON and OFF render as clickable buttons (not span)
+            expect(code).toContain('class="dnc-sn-status-toggle dnc-sn-status-on"');
+            expect(code).toContain('class="dnc-sn-status-toggle dnc-sn-status-off"');
+            expect(code).toMatch(/data-action="dnc-sn-toggle-system"/);
+        });
+
+        test('JS toggle handler with confirm dialog + reload on success', () => {
+            const code = readManager();
+            // Event delegation pattern (data-action), not inline onclick
+            expect(code).toContain("data-action=\"dnc-sn-toggle-system\"");
+            expect(code).toContain('/system/toggle');
+            expect(code).toContain('window.location.reload()');
+            // Defensive Modal Helpers fallback
+            expect(code).toContain('window.dinocoModal');
+        });
+
+        test('dncSnOpenCreateBatchModal pre-flight check (no silent fail)', () => {
+            const code = readManager();
+            const fnBlock = code.split('window.dncSnOpenCreateBatchModal = function')[1] || '';
+            expect(fnBlock).toContain('dnc-sn-disabled-banner');
+            expect(fnBlock).toContain('scrollIntoView');
+            // Must abort opening modal when system disabled
+            expect(fnBlock).toMatch(/return;/);
+        });
+
+        test('REST /system/toggle endpoint registered (admin-only)', () => {
+            const code = readRest();
+            expect(code).toContain("'/system/toggle'");
+            expect(code).toContain('dinoco_sn_rest_system_toggle');
+            // Permission gating
+            const block = code.split("'/system/toggle'")[1] || '';
+            expect(block).toMatch(/current_user_can\(\s*'manage_options'\s*\)/);
+        });
+
+        test('Toggle handler does NOT abort on disabled flag (the only such endpoint)', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_rest_system_toggle')[1] || '';
+            // Crucial: must NOT call dinoco_sn_is_enabled() at top — would lock admin out
+            const beforeUpdateOption = fnBlock.split('update_option')[0];
+            expect(beforeUpdateOption).not.toContain('dinoco_sn_is_enabled');
+            // Should call update_option for the master flag
+            expect(fnBlock).toContain("'dinoco_sn_system_enabled'");
+        });
+
+        test('Toggle audit-logged via dinoco_flag_audit_log (defensive)', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_rest_system_toggle')[1] || '';
+            expect(fnBlock).toContain("function_exists( 'dinoco_flag_audit_log' )");
+            expect(fnBlock).toContain('dinoco_sn_audit_log');
+        });
+    });
 });
