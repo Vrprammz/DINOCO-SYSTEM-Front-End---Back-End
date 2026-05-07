@@ -131,7 +131,12 @@ const SNIPPET_PREFIXES = [
 // Bumped 932→935 (2026-05-07): Phase 3 W8.5 SC Quick Lookup mobile shortcode
 // added 3 onclick handlers: scan QR primary CTA + scan cancel + reset/back
 // to empty state. Mobile-first SC counter UX. Phase 6 migration sweep applies.
-const BASELINE_INLINE_HANDLER_COUNT = 935;
+//
+// Bumped 935→942 (2026-05-07): Phase 3 W9.2 F#6 Dealer Resolver added 7 onclick
+// handlers in Manager Tab 4 dealer link UI: Edit dealer button + Save dealer
+// button + Cancel modal + Bulk dealer link button + admin search + 2 dealer
+// row interactions. Phase 6 migration sweep applies.
+const BASELINE_INLINE_HANDLER_COUNT = 942;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

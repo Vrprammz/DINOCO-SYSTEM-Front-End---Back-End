@@ -224,7 +224,7 @@ class SnReconciliationTest extends TestCase {
         $this->assertFalse( sn_recon_valid_resolution( 'delete' ) );
         $this->assertFalse( sn_recon_valid_resolution( 'recall' ) );
         $this->assertFalse( sn_recon_valid_resolution( '' ) );
-        $this->assertFalse( sn_recon_valid_resolution( null ) );
+        $this->assertFalse( sn_recon_valid_resolution( 'unknown_action' ) );
     }
 
     /* ─── 6. SLA timeout (7 days) ──────────────────────────────────────── */

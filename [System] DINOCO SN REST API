@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.20 (2026-05-05) — Phase 3 W9.2 F#6 Click-to-Call Dealer Resolver║
  * ║  Version: V.0.19 (2026-05-07) — Round 3: CSV +QR Content URL col, QR PDF deprecated║
  * ║  Version: V.0.18 (2026-05-05) — Phase 2 W5.4 3-tier approval classifier║
  * ║  Version: V.0.17 (2026-05-05) — Phase 1 W4.2 obs hooks (batch/receive/swap/void)║
@@ -849,6 +850,37 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             'args'                => array(
                 'min_suggested' => array( 'type' => 'integer', 'default' => 1, 'sanitize_callback' => 'absint' ),
                 'limit'         => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        /* ─── Phase 3 W9.2 (V.0.20) — F#6 Click-to-Call Dealer ─── */
+
+        // GET /dealer-info/{sn} — customer "📞 โทรร้าน" button (Member Dashboard)
+        // Permission: any logged-in user. Handler enforces owner OR view_pii cap
+        // OR admin internally (returns 403 if non-owner without elevated cap).
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/dealer-info/(?P<sn>[A-Za-z0-9]+)', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_dealer_info',
+            'permission_callback' => 'dinoco_sn_perm_logged_in',
+            'args'                => array(
+                'sn' => array( 'required' => true, 'type' => 'string' ),
+            ),
+        ) );
+
+        // POST /dealer-link — admin manually links plate to dealer (Tab 4)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/dealer-link', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_dealer_link',
+            'permission_callback' => 'dinoco_sn_perm_warehouse',  // admin OR warehouse cap
+            'args'                => array(
+                'sn'            => array( 'required' => true, 'type' => 'string',
+                                          'sanitize_callback' => function( $v ) { return strtoupper( trim( (string) $v ) ); } ),
+                'dealer_id'     => array( 'required' => true, 'type' => 'integer',
+                                          'sanitize_callback' => 'absint' ),
+                'purchase_date' => array( 'type' => 'string',
+                                          'sanitize_callback' => 'sanitize_text_field' ),
+                'notes'         => array( 'type' => 'string',
+                                          'sanitize_callback' => 'sanitize_textarea_field' ),
             ),
         ) );
     }
@@ -1864,6 +1896,470 @@ if ( ! function_exists( 'dinoco_sn_audit_log' ) ) {
             }
             return false;
         }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6.5 PHASE 3 W9.2 — F#6 CLICK-TO-CALL DEALER RESOLVER (V.0.20)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Helpers for dealer info resolution + phone masking. Used by:
+ *   - GET  /dinoco-sn/v1/dealer-info/{sn}  (customer Member Dashboard "📞 โทรร้าน")
+ *   - POST /dinoco-sn/v1/dealer-link       (admin Tab 4 manual link)
+ *
+ * Source of truth for dealer:
+ *   - wp_dinoco_sn_pool_meta.purchase_dealer_id → distributor CPT (post_type='distributor')
+ *   - Fallback: DINOCO Hotline (wp_option 'dinoco_hotline_phone' default '02-xxx-xxxx')
+ *
+ * PII protection:
+ *   - phone_full visible ONLY to plate owner OR dinoco_sn_view_pii cap
+ *   - non-owners get phone_masked (08x-xxx-1234, 4 last digits visible)
+ */
+
+if ( ! function_exists( 'dinoco_sn_mask_phone' ) ) {
+    /**
+     * Pure-logic mask Thai phone for PII protection.
+     *
+     * Different from dinoco_sn_mask_phone_for_display (which is cap-aware) —
+     * this helper ALWAYS masks regardless of caller cap. Use this when you
+     * need a deterministic masked output (e.g. always-mask field).
+     *
+     * Strategy: extract digits only → keep first 2 + last 4 → mask middle.
+     *   "0812345678"      → "08x-xxx-5678"
+     *   "081-234-5678"    → "08x-xxx-5678"
+     *   "081 234 5678"    → "08x-xxx-5678"
+     *   "+66812345678"    → "66x-xxx-5678" (best-effort)
+     *   "1234"            → "***" (too short)
+     *   ""                → ""
+     *   null              → ""
+     *
+     * @param string|null $phone Raw phone input
+     * @return string masked rendering ('' if empty, '***' if < 4 digits)
+     */
+    function dinoco_sn_mask_phone( $phone ) {
+        if ( $phone === null || $phone === '' ) return '';
+        $digits = preg_replace( '/[^0-9]/', '', (string) $phone );
+        if ( $digits === '' ) return '';
+        if ( strlen( $digits ) < 4 ) return '***';
+        $first2 = substr( $digits, 0, 2 );
+        $last4  = substr( $digits, -4 );
+        return sprintf( '%sx-xxx-%s', $first2, $last4 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_hotline_fallback' ) ) {
+    /**
+     * DINOCO Support fallback when plate has no purchase_dealer_id linked
+     * (or dealer post deleted/deactivated). Returns same shape as resolver
+     * with is_fallback=true flag so frontend can render "DINOCO Support"
+     * instead of dealer shop name.
+     *
+     * Phone source: wp_option 'dinoco_hotline_phone' (default '02-xxx-xxxx').
+     * Admin can override via shortcode/option page.
+     *
+     * @return array
+     */
+    function dinoco_sn_get_hotline_fallback() {
+        $hotline = (string) get_option( 'dinoco_hotline_phone', '02-xxx-xxxx' );
+        return array(
+            'dealer_id'     => 0,
+            'shop_name'     => __( 'DINOCO Support', 'dinoco-sn' ),
+            'phone_masked'  => dinoco_sn_mask_phone( $hotline ),
+            'phone_full'    => $hotline,  // hotline is public — never masked
+            'line_oa'       => (string) get_option( 'dinoco_hotline_line_oa', '' ),
+            'address'       => (string) get_option( 'dinoco_hotline_address', '' ),
+            'is_fallback'   => true,
+            'purchase_date' => null,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_resolve_dealer_for_plate' ) ) {
+    /**
+     * Resolve dealer info from sn_pool_meta.purchase_dealer_id.
+     *
+     * Defensive against:
+     *   - missing purchase_dealer_id (legacy plates) → return null
+     *   - dealer post deleted (post_type !== 'distributor') → return null
+     *   - dealer post in trash / unpublished → return null
+     *   - empty phone_number / shop_phone meta → phone fields empty
+     *
+     * Returns DEALER row OR null. Caller decides fallback to hotline.
+     *
+     * @param string $sn Plate S/N (case-insensitive UPPER normalized)
+     * @return array|null { dealer_id, shop_name, phone_raw, line_oa, address, purchase_date } or null
+     */
+    function dinoco_sn_resolve_dealer_for_plate( $sn ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) return null;
+
+        if ( ! function_exists( 'dinoco_sn_get_plate_meta' ) ) return null;
+
+        $meta = dinoco_sn_get_plate_meta( $sn );
+        if ( ! $meta || empty( $meta->purchase_dealer_id ) ) return null;
+
+        $dealer_id = (int) $meta->purchase_dealer_id;
+        if ( $dealer_id <= 0 ) return null;
+
+        $dealer_post = get_post( $dealer_id );
+        if ( ! $dealer_post
+            || $dealer_post->post_type !== 'distributor'
+            || $dealer_post->post_status !== 'publish'
+        ) {
+            return null;
+        }
+
+        // Shop name: prefer ACF shop_name, fallback to post_title
+        $shop_name = '';
+        if ( function_exists( 'get_field' ) ) {
+            $shop_name = (string) get_field( 'shop_name', $dealer_id );
+        }
+        if ( $shop_name === '' ) {
+            $shop_name = (string) $dealer_post->post_title;
+        }
+
+        // Phone: try multiple meta keys (W7.4 used phone_number + shop_phone fallback)
+        $phone_raw = (string) get_post_meta( $dealer_id, 'phone_number', true );
+        if ( $phone_raw === '' ) {
+            $phone_raw = (string) get_post_meta( $dealer_id, 'shop_phone', true );
+        }
+        if ( $phone_raw === '' ) {
+            // ACF dist_phone (used in B2B Snippet 9)
+            if ( function_exists( 'get_field' ) ) {
+                $phone_raw = (string) get_field( 'dist_phone', $dealer_id );
+            }
+        }
+
+        // Address: prefer ACF dist_address, then shop_address meta
+        $address = '';
+        if ( function_exists( 'get_field' ) ) {
+            $address = (string) get_field( 'dist_address', $dealer_id );
+        }
+        if ( $address === '' ) {
+            $address = (string) get_post_meta( $dealer_id, 'shop_address', true );
+        }
+
+        // LINE OA (optional — may not be set in legacy CPT)
+        $line_oa = '';
+        if ( function_exists( 'get_field' ) ) {
+            $line_oa = (string) get_field( 'line_oa', $dealer_id );
+        }
+        if ( $line_oa === '' ) {
+            $line_oa = (string) get_post_meta( $dealer_id, 'line_oa', true );
+        }
+
+        return array(
+            'dealer_id'     => $dealer_id,
+            'shop_name'     => $shop_name,
+            'phone_raw'     => $phone_raw,
+            'line_oa'       => $line_oa,
+            'address'       => $address,
+            'purchase_date' => isset( $meta->purchase_date ) ? (string) $meta->purchase_date : null,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_dealer_info' ) ) {
+    /**
+     * GET /dinoco-sn/v1/dealer-info/{sn}
+     *
+     * Returns dealer contact info for a plate. Used by Member Dashboard
+     * "My Plates" card "📞 โทรร้าน" button.
+     *
+     * Auth model:
+     *   - Requires logged-in user (LINE OAuth → WP session reuse).
+     *   - Plate owner sees phone_full + dealer info.
+     *   - Non-owner WITH dinoco_sn_view_pii cap → phone_full visible.
+     *   - Anyone else → 403 (privacy: customer A can't lookup customer B's dealer).
+     *   - Admin (manage_options) bypasses owner check (always allowed).
+     *
+     * Fallback:
+     *   - No purchase_dealer_id linked → DINOCO Support hotline (is_fallback=true).
+     *   - Dealer post deleted / deactivated → DINOCO Support hotline.
+     */
+    function dinoco_sn_rest_dealer_info( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled',
+                __( 'S/N system is disabled.', 'dinoco-sn' ),
+                array( 'status' => 503 )
+            );
+        }
+
+        $sn = strtoupper( trim( (string) $req->get_param( 'sn' ) ) );
+        if ( $sn === '' ) {
+            return new WP_Error( 'invalid_sn',
+                __( 'Invalid S/N format.', 'dinoco-sn' ),
+                array( 'status' => 400 )
+            );
+        }
+
+        if ( ! function_exists( 'dinoco_sn_get_plate_data' ) ) {
+            return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
+        }
+
+        $plate = dinoco_sn_get_plate_data( $sn );
+        if ( ! $plate ) {
+            return new WP_Error( 'sn_not_found',
+                __( 'S/N not found.', 'dinoco-sn' ),
+                array( 'status' => 404 )
+            );
+        }
+
+        // Permission: owner OR view_pii cap OR admin
+        $current_uid = (int) get_current_user_id();
+        $owner_uid   = isset( $plate->registered_user_id ) ? (int) $plate->registered_user_id : 0;
+        $is_owner    = ( $current_uid > 0 && $current_uid === $owner_uid );
+        $is_admin    = current_user_can( 'manage_options' );
+        $can_pii     = function_exists( 'dinoco_sn_user_can_view_pii' )
+            ? dinoco_sn_user_can_view_pii() : $is_admin;
+
+        if ( ! $is_owner && ! $is_admin && ! $can_pii ) {
+            return new WP_Error( 'rest_forbidden',
+                __( 'You do not have permission to view dealer info for this plate.', 'dinoco-sn' ),
+                array( 'status' => 403 )
+            );
+        }
+
+        // Resolve dealer (defensive — falls back to hotline if missing/deleted)
+        $dealer = dinoco_sn_resolve_dealer_for_plate( $sn );
+
+        if ( ! $dealer ) {
+            $resp = dinoco_sn_get_hotline_fallback();
+            $resp['sn'] = $sn;
+            return rest_ensure_response( $resp );
+        }
+
+        // Mask phone for response (full only if owner/admin/view_pii)
+        $show_full = $is_owner || $is_admin || $can_pii;
+        $phone_raw = (string) ( $dealer['phone_raw'] ?? '' );
+
+        $resp = array(
+            'sn'            => $sn,
+            'dealer_id'     => (int) $dealer['dealer_id'],
+            'shop_name'     => (string) $dealer['shop_name'],
+            'phone_masked'  => dinoco_sn_mask_phone( $phone_raw ),
+            'phone_full'    => $show_full ? $phone_raw : null,
+            'line_oa'       => (string) $dealer['line_oa'],
+            'address'       => (string) $dealer['address'],
+            'is_fallback'   => false,
+            'purchase_date' => $dealer['purchase_date'],
+        );
+
+        return rest_ensure_response( $resp );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_dealer_link' ) ) {
+    /**
+     * POST /dinoco-sn/v1/dealer-link
+     *
+     * Admin manually links a plate to a dealer (used in Tab 4 single S/N
+     * detail OR bulk action after manual invoice issue). Atomic: GET_LOCK
+     * + INSERT/UPDATE on pool_meta + audit row.
+     *
+     * Body: {
+     *   sn:            "DNCSS0001234",
+     *   dealer_id:     1234,            // distributor CPT post ID
+     *   purchase_date: "2026-05-04",    // YYYY-MM-DD optional
+     *   notes:         "..."            // optional, audit-only
+     * }
+     *
+     * Idempotency: Idempotency-Key wrapper covers retries.
+     */
+    function dinoco_sn_rest_dealer_link( $req ) {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled',
+                __( 'S/N system is disabled.', 'dinoco-sn' ),
+                array( 'status' => 503 )
+            );
+        }
+
+        return dinoco_sn_with_idempotency(
+            $req,
+            'dealer-link',
+            array( 'sn', 'dealer_id', 'purchase_date' ),
+            function( $req ) { return dinoco_sn_handler_dealer_link( $req ); }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_dealer_link' ) ) {
+    function dinoco_sn_handler_dealer_link( $req ) {
+        global $wpdb;
+
+        if ( ! function_exists( 'dinoco_sn_table' )
+            || ! function_exists( 'dinoco_sn_table_exists' )
+        ) {
+            return new WP_Error( 'helper_missing',
+                __( 'S/N Manager not synced.', 'dinoco-sn' ),
+                array( 'status' => 503 )
+            );
+        }
+
+        $sn = strtoupper( trim( (string) $req->get_param( 'sn' ) ) );
+        $dealer_id = (int) $req->get_param( 'dealer_id' );
+        $purchase_date_raw = (string) $req->get_param( 'purchase_date' );
+        $notes = (string) $req->get_param( 'notes' );
+
+        if ( $sn === '' ) {
+            return new WP_Error( 'invalid_sn',
+                __( 'S/N is required.', 'dinoco-sn' ),
+                array( 'status' => 400 )
+            );
+        }
+        if ( $dealer_id <= 0 ) {
+            return new WP_Error( 'invalid_dealer',
+                __( 'dealer_id is required.', 'dinoco-sn' ),
+                array( 'status' => 400 )
+            );
+        }
+
+        // Validate dealer_id exists as distributor CPT
+        $dealer_post = get_post( $dealer_id );
+        if ( ! $dealer_post
+            || $dealer_post->post_type !== 'distributor'
+            || $dealer_post->post_status !== 'publish'
+        ) {
+            return new WP_Error( 'dealer_not_found',
+                __( 'Distributor not found or unpublished.', 'dinoco-sn' ),
+                array( 'status' => 404 )
+            );
+        }
+
+        // Validate purchase_date format (YYYY-MM-DD) — optional
+        $purchase_date = null;
+        if ( $purchase_date_raw !== '' ) {
+            if ( ! preg_match( '/^\d{4}-\d{2}-\d{2}$/', $purchase_date_raw ) ) {
+                return new WP_Error( 'invalid_date',
+                    __( 'purchase_date must be YYYY-MM-DD.', 'dinoco-sn' ),
+                    array( 'status' => 400 )
+                );
+            }
+            $purchase_date = $purchase_date_raw;
+        }
+
+        // Tables
+        if ( ! dinoco_sn_table_exists( 'pool' ) ) {
+            return new WP_Error( 'schema_not_ready',
+                __( 'sn_pool not installed.', 'dinoco-sn' ),
+                array( 'status' => 503 )
+            );
+        }
+        if ( ! dinoco_sn_table_exists( 'pool_meta' ) ) {
+            return new WP_Error( 'schema_not_ready',
+                __( 'sn_pool_meta not installed.', 'dinoco-sn' ),
+                array( 'status' => 503 )
+            );
+        }
+
+        // Verify plate exists in pool
+        $plate = function_exists( 'dinoco_sn_get_plate_data' )
+            ? dinoco_sn_get_plate_data( $sn ) : null;
+        if ( ! $plate ) {
+            return new WP_Error( 'sn_not_found',
+                sprintf( __( 'S/N %s not found.', 'dinoco-sn' ), $sn ),
+                array( 'status' => 404 )
+            );
+        }
+
+        $tbl_meta = dinoco_sn_table( 'pool_meta' );
+        $lock_name = 'dinoco_sn_dealer_link_' . md5( $sn );
+
+        // Atomic: GET_LOCK + UPSERT + audit
+        $lock_acquired = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT GET_LOCK(%s, 5)", $lock_name
+        ) );
+        if ( $lock_acquired !== 1 ) {
+            return new WP_Error( 'lock_busy',
+                __( 'Another admin is updating this S/N. Try again.', 'dinoco-sn' ),
+                array( 'status' => 423 )
+            );
+        }
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+
+            // Check if pool_meta row exists
+            $existing = $wpdb->get_row( $wpdb->prepare(
+                "SELECT sn, purchase_dealer_id FROM {$tbl_meta} WHERE sn = %s FOR UPDATE",
+                $sn
+            ) );
+
+            $prev_dealer_id = $existing ? (int) $existing->purchase_dealer_id : 0;
+
+            $update_data = array(
+                'purchase_dealer_id' => $dealer_id,
+            );
+            if ( $purchase_date !== null ) {
+                $update_data['purchase_date'] = $purchase_date;
+            }
+
+            if ( $existing ) {
+                $ok = $wpdb->update(
+                    $tbl_meta,
+                    $update_data,
+                    array( 'sn' => $sn )
+                );
+            } else {
+                $insert_data = array_merge( array( 'sn' => $sn ), $update_data );
+                $ok = $wpdb->insert( $tbl_meta, $insert_data );
+            }
+
+            if ( $ok === false ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'db_error',
+                    __( 'Failed to update pool_meta.', 'dinoco-sn' ),
+                    array( 'status' => 500 )
+                );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            // Audit log (non-throwing)
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                dinoco_sn_audit_log(
+                    $sn,
+                    'dealer_link_set',
+                    null, null,
+                    array(
+                        'prev_dealer_id' => $prev_dealer_id,
+                        'new_dealer_id'  => $dealer_id,
+                        'purchase_date'  => $purchase_date,
+                        'notes'          => mb_substr( $notes, 0, 255 ),
+                    ),
+                    null, null,
+                    mb_substr( $notes, 0, 255 ),
+                    'dealer_link',
+                    false
+                );
+            }
+
+        } finally {
+            $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
+
+        // Return updated dealer info (same shape as GET /dealer-info)
+        $dealer = dinoco_sn_resolve_dealer_for_plate( $sn );
+        if ( ! $dealer ) {
+            return rest_ensure_response( array(
+                'success' => true,
+                'sn'      => $sn,
+                'message' => __( 'Dealer linked but resolver returned null.', 'dinoco-sn' ),
+            ) );
+        }
+
+        return rest_ensure_response( array(
+            'success'       => true,
+            'sn'            => $sn,
+            'dealer_id'     => (int) $dealer['dealer_id'],
+            'shop_name'     => (string) $dealer['shop_name'],
+            'phone_masked'  => dinoco_sn_mask_phone( (string) $dealer['phone_raw'] ),
+            'phone_full'    => (string) $dealer['phone_raw'],
+            'line_oa'       => (string) $dealer['line_oa'],
+            'address'       => (string) $dealer['address'],
+            'is_fallback'   => false,
+            'purchase_date' => $dealer['purchase_date'],
+        ) );
     }
 }
 

@@ -1,0 +1,1112 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO Warranty Lifecycle Notifier               ║
+ * ║  Version: V.0.1 (2026-05-07) — Phase 3 W9.1 cron worker realization║
+ * ║  DB_ID: TBD (assigned by GitHub Webhook Sync on first push)      ║
+ * ║  Description: Real implementation of F#1 (Expiry) / F#4          ║
+ * ║    (Anniversary) / F#10 (Review Request) lifecycle workers —    ║
+ * ║    replaces Production SN Manager stubs (V.0.26+).               ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * PROBLEM
+ * -------
+ * Production SN Manager V.0.9–V.0.26 ships scheduler STUBS:
+ *   - dinoco_sn_run_expiry_schedule       — schedules but no LINE push
+ *   - dinoco_sn_run_anniversary_schedule  — schedules but no coupon gen
+ *   - dinoco_sn_run_review_request_schedule — schedules but no review row
+ *   - dinoco_sn_run_notification_send     — gated by dinoco_sn_notification_send_enabled,
+ *                                            stub mode marks rows 'pending_dispatch'
+ *                                            instead of pushing LINE Flex.
+ *
+ * Plan v2.13 §F#1 + §F#4 + §F#10 + Phase 3 W9.1 promised real LINE Flex
+ * dispatch + promo code generation + tier-aware anniversary coupons +
+ * review_request row creation (cross-feature with sn_review_requests).
+ *
+ * SOLUTION
+ * --------
+ * Standalone snippet that supplies REAL workers under namespaced names
+ * (`dinoco_sn_lifecycle_*`) and rebinds the existing cron hooks to the
+ * new workers via `init` priority 20 (after Manager binds at default 10).
+ *
+ *   remove_action( 'dinoco_sn_expiry_schedule_cron',     'dinoco_sn_run_expiry_schedule' );
+ *   remove_action( 'dinoco_sn_anniversary_schedule_cron','dinoco_sn_run_anniversary_schedule' );
+ *   remove_action( 'dinoco_sn_review_request_cron',      'dinoco_sn_run_review_request_schedule' );
+ *   remove_action( 'dinoco_sn_notification_send_cron',   'dinoco_sn_run_notification_send' );
+ *   add_action( ..., 'dinoco_sn_lifecycle_run_*' );
+ *
+ * Stub functions remain in Manager (no-op safe — INSERT IGNORE dedup at DB)
+ * but the cron pipeline routes through this snippet.
+ *
+ * DESIGN PRINCIPLES
+ * -----------------
+ *   - ADDITIVE        — does NOT modify existing snippets; rebinds via WP hooks
+ *   - DEFENSIVE       — function_exists guard on ALL Manager + B2B helpers;
+ *                       graceful no-op when sibling snippets not synced
+ *   - NON-THROWING    — try/catch \Throwable around every cron entry-point
+ *   - IDEMPOTENT      — INSERT IGNORE on notifications/review_requests/promo_codes;
+ *                       no-op safe across multiple cron firings
+ *   - RATE-LIMITED    — 50 sends/run cap (LINE quota safety, plan §B2)
+ *   - OBSERVABLE      — heartbeats wp_options + Telegram alerts on volume
+ *                       thresholds (>100 plates expiring, >5 LINE failures/hr)
+ *
+ * Public helpers exposed (testable + reusable):
+ *   dinoco_sn_compute_anniversary_coupon( $year_n )      : array
+ *   dinoco_sn_generate_promo_code( $user_id, $sn, $type ): string|false
+ *   dinoco_sn_should_send_to_user( $user_id, $type )     : bool
+ *   dinoco_sn_format_thai_date( $timestamp )             : string
+ *   dinoco_sn_compute_days_until_expiry( $row )          : int|null
+ *
+ * Worker functions (cron callbacks):
+ *   dinoco_sn_lifecycle_run_expiry_schedule()
+ *   dinoco_sn_lifecycle_run_notification_send()
+ *   dinoco_sn_lifecycle_run_anniversary_schedule()
+ *   dinoco_sn_lifecycle_run_review_request_schedule()
+ *
+ * REST endpoints (admin-only, idempotency-wrapped):
+ *   POST /dinoco-sn/v1/notifications/send-now/{id}  — manual single dispatch
+ *   GET  /dinoco-sn/v1/notifications/pending        — next 24h queue
+ *   GET  /dinoco-sn/v1/notifications/stats          — counts by type/status
+ *
+ * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md (v2.13 §F#1+F#4+F#10)
+ *
+ * Phase 3 W9.1 scope (THIS VERSION):
+ *   ✓ Real LINE Flex dispatch via b2b_line_push_raw
+ *   ✓ Promo code generation with retry on collision
+ *   ✓ Anniversary tier coupons (1y=5%, 2y=7%, 3y+=10%)
+ *   ✓ Review request row insert + 30-day window
+ *   ✓ Notification preference check (5 wp_usermeta keys)
+ *   ✓ Telegram alerts on volume / failure thresholds
+ *   ✓ 3 admin REST endpoints
+ *   ✓ Heartbeat options for Health Monitor
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0. CONSTANTS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_SN_LIFECYCLE_VERSION' ) ) {
+    define( 'DINOCO_SN_LIFECYCLE_VERSION', '0.1' );
+}
+
+if ( ! defined( 'DINOCO_SN_LIFECYCLE_SEND_BATCH_CAP' ) ) {
+    // LINE quota safety — max sends per cron run
+    define( 'DINOCO_SN_LIFECYCLE_SEND_BATCH_CAP', 50 );
+}
+
+if ( ! defined( 'DINOCO_SN_LIFECYCLE_MAX_RETRIES' ) ) {
+    // Notification dispatch retry cap before declaring 'failed'
+    define( 'DINOCO_SN_LIFECYCLE_MAX_RETRIES', 3 );
+}
+
+if ( ! defined( 'DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS' ) ) {
+    // F#1 expiry promo + F#10 review reward expiry window
+    define( 'DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS', 90 );
+}
+
+if ( ! defined( 'DINOCO_SN_LIFECYCLE_TG_VOLUME_THRESHOLD' ) ) {
+    // Plates expiring per run that triggers Telegram volume alert
+    define( 'DINOCO_SN_LIFECYCLE_TG_VOLUME_THRESHOLD', 100 );
+}
+
+if ( ! defined( 'DINOCO_SN_LIFECYCLE_TG_FAILURE_THRESHOLD' ) ) {
+    // LINE push failures in trailing 1hr window that triggers TG alert
+    define( 'DINOCO_SN_LIFECYCLE_TG_FAILURE_THRESHOLD', 5 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. PURE HELPERS (testable — no DB / no LINE I/O)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_compute_anniversary_coupon' ) ) {
+    /**
+     * Tier-aware anniversary coupon table.
+     *
+     *   1 year  →  5% off
+     *   2 year  →  7% off
+     *   3+ year → 10% off (capped)
+     *
+     * @param int $year_n
+     * @return array{discount_pct:int, discount_value:?float, scope:string}
+     */
+    function dinoco_sn_compute_anniversary_coupon( $year_n ) {
+        $y = (int) $year_n;
+        if ( $y < 1 ) $y = 1;
+        if ( $y === 1 ) {
+            $pct = 5;
+        } elseif ( $y === 2 ) {
+            $pct = 7;
+        } else {
+            $pct = 10; // 3y / 4y / 5y+ all cap at 10%
+        }
+        return array(
+            'discount_pct'   => $pct,
+            'discount_value' => null,
+            'scope'          => 'any', // valid against any SKU
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_format_thai_date' ) ) {
+    /**
+     * Convert MySQL DATETIME / Unix timestamp / Y-m-d → "7 พ.ค. 2569".
+     *
+     * Returns empty string on parse fail (defensive — never throws).
+     *
+     * Note: Manager V.0.10+ already defines this helper. We guard with
+     * function_exists so loading order is irrelevant.
+     */
+    function dinoco_sn_format_thai_date( $when ) {
+        $ts = is_numeric( $when ) ? (int) $when : strtotime( (string) $when );
+        if ( ! $ts || $ts <= 0 ) return '';
+        $months_th = array(
+            1 => 'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
+                 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.',
+        );
+        $d = (int) date( 'j', $ts );
+        $m = (int) date( 'n', $ts );
+        $y = (int) date( 'Y', $ts ) + 543; // Buddhist era
+        $mlabel = isset( $months_th[ $m ] ) ? $months_th[ $m ] : '';
+        return $d . ' ' . $mlabel . ' ' . $y;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_compute_days_until_expiry' ) ) {
+    /**
+     * Days from now → warranty_end (registered_at + N years, default 1).
+     * Returns int (negative if already expired) or null on parse fail.
+     *
+     * @param array|object $row  pool row with registered_at + optional warranty_years
+     */
+    function dinoco_sn_compute_days_until_expiry( $row ) {
+        $registered_at = is_array( $row ) ? ( $row['registered_at'] ?? null ) : ( $row->registered_at ?? null );
+        if ( empty( $registered_at ) ) return null;
+        $years = is_array( $row )
+            ? (int) ( $row['warranty_years'] ?? 0 )
+            : (int) ( $row->warranty_years ?? 0 );
+        if ( $years < 1 ) {
+            $years = (int) get_option( 'dinoco_sn_default_warranty_years', 1 );
+            if ( $years < 1 ) $years = 1;
+        }
+        try {
+            $tz    = function_exists( 'wp_timezone' ) ? wp_timezone() : new \DateTimeZone( 'Asia/Bangkok' );
+            $start = new \DateTime( (string) $registered_at, $tz );
+            $start->modify( '+' . $years . ' years' );
+            $now   = new \DateTime( 'now', $tz );
+            $diff  = $now->diff( $start );
+            return ( $diff->invert ? -1 : 1 ) * (int) $diff->days;
+        } catch ( \Throwable $e ) {
+            return null;
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_should_send_to_user' ) ) {
+    /**
+     * Honor user notification preferences + LINE UID presence.
+     *
+     * Per-type opt-out via wp_usermeta keys (default ON for first 3):
+     *   - dinoco_sn_notif_expiry        (default '1')
+     *   - dinoco_sn_notif_anniversary   (default '1')
+     *   - dinoco_sn_notif_review        (default '1')
+     *   - dinoco_sn_notif_promo         (default '0')
+     *   - dinoco_sn_notif_service       (default '0')
+     *
+     * @param int    $user_id
+     * @param string $notification_type  expiry_30d / anniversary_2y / review_request / etc.
+     * @return bool
+     */
+    function dinoco_sn_should_send_to_user( $user_id, $notification_type ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return false;
+
+        // LINE UID presence is mandatory — Flex push without UID = 100% fail
+        $line_uid = get_user_meta( $user_id, 'dinoco_line_uid', true );
+        if ( empty( $line_uid ) ) {
+            return false;
+        }
+
+        $type = (string) $notification_type;
+        $pref_key  = '';
+        $default_on = true;
+        if ( strpos( $type, 'expiry_' ) === 0 ) {
+            $pref_key = 'dinoco_sn_notif_expiry';
+        } elseif ( strpos( $type, 'anniversary_' ) === 0 ) {
+            $pref_key = 'dinoco_sn_notif_anniversary';
+        } elseif ( $type === 'review_request' ) {
+            $pref_key = 'dinoco_sn_notif_review';
+        } elseif ( strpos( $type, 'promo_' ) === 0 ) {
+            $pref_key  = 'dinoco_sn_notif_promo';
+            $default_on = false;
+        } elseif ( strpos( $type, 'service_' ) === 0 ) {
+            $pref_key  = 'dinoco_sn_notif_service';
+            $default_on = false;
+        } else {
+            // Unknown type — send (admin-defined custom types pass through)
+            return true;
+        }
+
+        $val = get_user_meta( $user_id, $pref_key, true );
+        if ( $val === '' || $val === false || $val === null ) {
+            return $default_on;
+        }
+        return ! empty( $val ) && $val !== '0';
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_random_code' ) ) {
+    /**
+     * Generate 12-char alphanumeric (A-Z + 0-9) promo code.
+     * Uppercase only — case-insensitive lookup at redemption.
+     *
+     * Pure helper — testable without WP. wp_generate_password used when
+     * available; fallback mt_rand for unit tests.
+     */
+    function dinoco_sn_lifecycle_random_code( $length = 12 ) {
+        $length = max( 6, min( 20, (int) $length ) );
+        if ( function_exists( 'wp_generate_password' ) ) {
+            $raw = wp_generate_password( $length, false, false ); // alnum no-special
+            return strtoupper( substr( $raw, 0, $length ) );
+        }
+        // Fallback — pure PHP (testable)
+        $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        $out   = '';
+        for ( $i = 0; $i < $length; $i++ ) {
+            $out .= $chars[ mt_rand( 0, strlen( $chars ) - 1 ) ];
+        }
+        return $out;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. PROMO CODE GENERATION
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_generate_promo_code' ) ) {
+    /**
+     * Atomic promo code creation — INSERT into wp_dinoco_sn_promo_codes.
+     *
+     * On collision (PRIMARY KEY violation on `code`) retries up to 5 times
+     * with fresh random codes. Returns generated code string or false on
+     * error / table missing.
+     *
+     * @param int    $user_id   Recipient
+     * @param string $sn        Source plate S/N (audit linkage)
+     * @param string $type      'expiry_30d' / 'anniversary_2y' / 'review_reward' …
+     * @param array  $opts      Override: discount_pct (int), discount_value (?float),
+     *                          scope ('any'|'same_sku'|...), scope_value, ttl_days (int)
+     * @return string|false  generated code, or false
+     */
+    function dinoco_sn_generate_promo_code( $user_id, $sn, $type, $opts = array() ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'promo_codes' ) ) {
+            return false;
+        }
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return false;
+
+        // Defaults per type (boss can override via $opts)
+        $defaults = array(
+            'discount_pct'   => 10,
+            'discount_value' => null,
+            'scope'          => 'same_sku',
+            'scope_value'    => null,
+            'ttl_days'       => DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS,
+        );
+        if ( strpos( (string) $type, 'anniversary_' ) === 0 ) {
+            // Anniversary tiers
+            if ( preg_match( '/anniversary_(\d+)y/', (string) $type, $m ) ) {
+                $tier = dinoco_sn_compute_anniversary_coupon( (int) $m[1] );
+                $defaults['discount_pct']   = $tier['discount_pct'];
+                $defaults['scope']          = $tier['scope']; // 'any'
+            }
+        } elseif ( $type === 'review_reward' ) {
+            // Flat reward — ฿50 (per F#10 spec)
+            $defaults['discount_pct']   = 0;
+            $defaults['discount_value'] = 50.0;
+            $defaults['scope']          = 'any';
+        } elseif ( strpos( (string) $type, 'expiry_' ) === 0 ) {
+            $defaults['discount_pct'] = 10;
+            $defaults['scope']        = 'same_sku';
+        }
+        $opts = array_merge( $defaults, is_array( $opts ) ? $opts : array() );
+
+        global $wpdb;
+        $tbl    = dinoco_sn_table( 'promo_codes' );
+        $sn_up  = $sn ? strtoupper( trim( (string) $sn ) ) : null;
+        $expires_at = gmdate( 'Y-m-d H:i:s', time() + ( max( 1, (int) $opts['ttl_days'] ) * 86400 ) );
+        $created_at = current_time( 'mysql' );
+
+        for ( $attempt = 1; $attempt <= 5; $attempt++ ) {
+            $code = dinoco_sn_lifecycle_random_code( 12 );
+            $ok = $wpdb->query( $wpdb->prepare(
+                "INSERT IGNORE INTO {$tbl}
+                    (code, user_id, source_sn, discount_pct, discount_value, scope, scope_value, expires_at, created_at)
+                 VALUES (%s, %d, %s, %d, %s, %s, %s, %s, %s)",
+                $code,
+                $user_id,
+                $sn_up,
+                (int) $opts['discount_pct'],
+                $opts['discount_value'] === null ? null : number_format( (float) $opts['discount_value'], 2, '.', '' ),
+                (string) $opts['scope'],
+                $opts['scope_value'] === null ? null : (string) $opts['scope_value'],
+                $expires_at,
+                $created_at
+            ) );
+            if ( $ok === 1 ) {
+                return $code;
+            }
+            // ok === 0 → collision; retry. ok === false → SQL error; stop.
+            if ( $ok === false ) break;
+        }
+        return false;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. EXPIRY SCHEDULER (F#1)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_run_expiry_schedule' ) ) {
+    /**
+     * Daily 02:00 — find plates expiring in 30/7/1 days + insert
+     * notifications + generate promo code per plate.
+     *
+     * Replaces Production SN Manager V.0.9 stub.
+     */
+    function dinoco_sn_lifecycle_run_expiry_schedule() {
+        update_option( 'dinoco_cron_sn_expiry_schedule_last_run', current_time( 'mysql' ) );
+
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool   = dinoco_sn_table( 'pool' );
+            $years  = max( 1, (int) get_option( 'dinoco_sn_default_warranty_years', 1 ) );
+
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, registered_user_id, registered_at, linked_sku
+                 FROM {$pool}
+                 WHERE status IN ('registered','claimed')
+                   AND registered_user_id IS NOT NULL
+                   AND registered_at IS NOT NULL
+                   AND DATE_ADD( registered_at, INTERVAL %d YEAR )
+                       BETWEEN NOW() AND DATE_ADD( NOW(), INTERVAL 30 DAY )
+                 ORDER BY registered_at ASC
+                 LIMIT 5000",
+                $years
+            ), ARRAY_A );
+
+            $milestones = array(
+                'expiry_30d' => 30,
+                'expiry_7d'  => 7,
+                'expiry_1d'  => 1,
+            );
+            $scheduled = 0; $skipped = 0; $promo_count = 0;
+
+            foreach ( $rows ?: array() as $row ) {
+                $uid = (int) $row['registered_user_id'];
+
+                // Honor pref — early skip avoids promo_code spam
+                if ( ! dinoco_sn_should_send_to_user( $uid, 'expiry_30d' ) ) {
+                    $skipped++;
+                    continue;
+                }
+
+                // Generate one promo code per plate (lifecycle, not per milestone)
+                $promo_code = dinoco_sn_generate_promo_code( $uid, $row['sn'], 'expiry_30d', array(
+                    'discount_pct' => 10,
+                    'scope'        => 'same_sku',
+                    'scope_value'  => $row['linked_sku'] ?? null,
+                    'ttl_days'     => DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS,
+                ) );
+                if ( $promo_code ) $promo_count++;
+
+                // Resolve warranty_end via existing helper (Manager) or fallback
+                $end = function_exists( 'dinoco_sn_warranty_end_for_pool_row' )
+                    ? dinoco_sn_warranty_end_for_pool_row( $row )
+                    : null;
+                if ( ! $end instanceof \DateTime ) {
+                    try {
+                        $tz = function_exists( 'wp_timezone' ) ? wp_timezone() : new \DateTimeZone( 'Asia/Bangkok' );
+                        $end = new \DateTime( (string) $row['registered_at'], $tz );
+                        $end->modify( '+' . $years . ' years' );
+                    } catch ( \Throwable $e ) {
+                        $skipped++; continue;
+                    }
+                }
+
+                foreach ( $milestones as $mtype => $days ) {
+                    $send_at = clone $end;
+                    $send_at->modify( '-' . $days . ' days' );
+                    if ( $send_at->getTimestamp() < time() - 86400 ) continue;
+
+                    $meta = array(
+                        'linked_sku'      => $row['linked_sku'] ?? '',
+                        'warranty_end'    => $end->format( 'Y-m-d' ),
+                        'days_to_expiry'  => $days,
+                        'promo_code'      => $promo_code ?: null,
+                    );
+                    $ok = function_exists( 'dinoco_sn_schedule_notification' )
+                        ? dinoco_sn_schedule_notification(
+                            $row['sn'], $uid, $mtype, $send_at->format( 'Y-m-d H:i:s' ), $meta
+                        )
+                        : false;
+                    if ( $ok ) $scheduled++; else $skipped++;
+                }
+            }
+
+            $scanned = count( $rows ?: array() );
+            update_option( 'dinoco_sn_expiry_schedule_last_run', array(
+                'at'           => current_time( 'mysql' ),
+                'scanned'      => $scanned,
+                'scheduled'    => $scheduled,
+                'skipped'      => $skipped,
+                'promos_made'  => $promo_count,
+            ), false );
+
+            // Volume alert — boss heads up if 100+ plates expiring
+            if ( $scanned >= DINOCO_SN_LIFECYCLE_TG_VOLUME_THRESHOLD ) {
+                dinoco_sn_lifecycle_telegram_alert( sprintf(
+                    "📅 Expiry Volume Alert\n%d plates expiring in next 30d\nScheduled: %d notifications | Promos: %d",
+                    $scanned, $scheduled, $promo_count
+                ) );
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                dinoco_sn_obs_capture( 'lifecycle_expiry_schedule', array( 'error' => $e->getMessage() ) );
+            } else {
+                error_log( '[SN-Lifecycle] expiry_schedule: ' . $e->getMessage() );
+            }
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. ANNIVERSARY SCHEDULER (F#4)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_run_anniversary_schedule' ) ) {
+    /**
+     * Daily 09:00 — find plates with registered_at exactly N years ago today
+     * (1y, 2y, 3y, 4y, 5y) + insert anniversary_Ny notification + tier coupon.
+     *
+     * Replaces Production SN Manager V.0.10 stub.
+     */
+    function dinoco_sn_lifecycle_run_anniversary_schedule() {
+        update_option( 'dinoco_cron_sn_anniversary_schedule_last_run', current_time( 'mysql' ) );
+
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool  = dinoco_sn_table( 'pool' );
+            $today = current_time( 'Y-m-d' );
+            $now   = current_time( 'mysql' );
+
+            $scheduled = 0; $skipped = 0; $promo_count = 0;
+
+            for ( $years = 1; $years <= 5; $years++ ) {
+                $rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT sn, registered_user_id, linked_sku, registered_at
+                     FROM {$pool}
+                     WHERE status IN ('registered','claimed')
+                       AND registered_user_id IS NOT NULL
+                       AND DATE(registered_at) = DATE_SUB(%s, INTERVAL %d YEAR)
+                     LIMIT 5000",
+                    $today, $years
+                ), ARRAY_A );
+
+                foreach ( $rows ?: array() as $row ) {
+                    $uid  = (int) $row['registered_user_id'];
+                    $type = 'anniversary_' . $years . 'y';
+
+                    if ( ! dinoco_sn_should_send_to_user( $uid, $type ) ) {
+                        $skipped++; continue;
+                    }
+
+                    // Generate tier coupon
+                    $tier = dinoco_sn_compute_anniversary_coupon( $years );
+                    $promo_code = dinoco_sn_generate_promo_code( $uid, $row['sn'], $type, array(
+                        'discount_pct' => $tier['discount_pct'],
+                        'scope'        => $tier['scope'],
+                        'ttl_days'     => DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS,
+                    ) );
+                    if ( $promo_code ) $promo_count++;
+
+                    $meta = array(
+                        'linked_sku'    => $row['linked_sku'] ?? '',
+                        'years'         => $years,
+                        'registered_at' => $row['registered_at'],
+                        'promo_code'    => $promo_code ?: null,
+                        'discount_pct'  => $tier['discount_pct'],
+                    );
+                    $ok = function_exists( 'dinoco_sn_schedule_notification' )
+                        ? dinoco_sn_schedule_notification( $row['sn'], $uid, $type, $now, $meta )
+                        : false;
+                    if ( $ok ) $scheduled++; else $skipped++;
+                }
+            }
+
+            update_option( 'dinoco_sn_anniversary_schedule_last_run', array(
+                'at'          => $now,
+                'scheduled'   => $scheduled,
+                'skipped'     => $skipped,
+                'promos_made' => $promo_count,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                dinoco_sn_obs_capture( 'lifecycle_anniversary_schedule', array( 'error' => $e->getMessage() ) );
+            } else {
+                error_log( '[SN-Lifecycle] anniversary_schedule: ' . $e->getMessage() );
+            }
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. REVIEW REQUEST SCHEDULER (F#10)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_run_review_request_schedule' ) ) {
+    /**
+     * Daily 10:00 — find plates registered exactly 30 days ago + insert
+     * review_request row + ฿50 reward coupon + schedule notification.
+     *
+     * Skip-if-claim guard: don't pester unhappy customer (open claim_ticket).
+     * Skip-if-already-requested guard: review_requests has UNIQUE(user_id, sn).
+     *
+     * Replaces Production SN Manager V.0.10 stub.
+     */
+    function dinoco_sn_lifecycle_run_review_request_schedule() {
+        update_option( 'dinoco_cron_sn_review_request_last_run', current_time( 'mysql' ) );
+
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'pool' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        try {
+            global $wpdb;
+            $pool  = dinoco_sn_table( 'pool' );
+            $today = current_time( 'Y-m-d' );
+            $now   = current_time( 'mysql' );
+
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, registered_user_id, linked_sku, registered_at
+                 FROM {$pool}
+                 WHERE status = 'registered'
+                   AND registered_user_id IS NOT NULL
+                   AND DATE(registered_at) = DATE_SUB(%s, INTERVAL 30 DAY)
+                 LIMIT 1000",
+                $today
+            ), ARRAY_A );
+
+            // Pre-fetch users with open claims (cheap dedup vs N+1)
+            $user_ids = array_unique( array_filter( array_map( function( $r ) {
+                return (int) ( $r['registered_user_id'] ?? 0 );
+            }, $rows ?: array() ) ) );
+
+            $users_with_open_claim = array();
+            if ( ! empty( $user_ids ) ) {
+                $closed_statuses = array( 'completed', 'closed', 'rejected', 'cancelled' );
+                $user_ph    = implode( ',', array_fill( 0, count( $user_ids ), '%d' ) );
+                $status_ph  = implode( ',', array_fill( 0, count( $closed_statuses ), '%s' ) );
+                $sql = "SELECT DISTINCT p.post_author
+                        FROM {$wpdb->posts} p
+                        LEFT JOIN {$wpdb->postmeta} m
+                               ON m.post_id = p.ID AND m.meta_key = 'ticket_status'
+                        WHERE p.post_type = 'claim_ticket'
+                          AND p.post_status = 'publish'
+                          AND p.post_author IN ({$user_ph})
+                          AND ( m.meta_value IS NULL OR m.meta_value NOT IN ({$status_ph}) )";
+                $args = array_merge( array_map( 'intval', $user_ids ), $closed_statuses );
+                $cpt_users = $wpdb->get_col( $wpdb->prepare( $sql, $args ) );
+                if ( is_array( $cpt_users ) ) {
+                    $users_with_open_claim = array_flip( array_map( 'intval', $cpt_users ) );
+                }
+            }
+
+            $scheduled = 0; $skipped_claim = 0; $skipped_pref = 0;
+            $promo_count = 0; $review_inserted = 0;
+            $reviews_tbl = dinoco_sn_table_exists( 'review_requests' )
+                ? dinoco_sn_table( 'review_requests' )
+                : null;
+
+            foreach ( $rows ?: array() as $row ) {
+                $uid   = (int) $row['registered_user_id'];
+                $sn_up = strtoupper( trim( (string) $row['sn'] ) );
+
+                if ( isset( $users_with_open_claim[ $uid ] ) ) {
+                    $skipped_claim++; continue;
+                }
+                if ( ! dinoco_sn_should_send_to_user( $uid, 'review_request' ) ) {
+                    $skipped_pref++; continue;
+                }
+
+                // Insert review_request row idempotently (UNIQUE-ish check via SELECT)
+                if ( $reviews_tbl ) {
+                    $exists = (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT COUNT(*) FROM {$reviews_tbl} WHERE user_id=%d AND sn=%s",
+                        $uid, $sn_up
+                    ) );
+                    if ( $exists === 0 ) {
+                        $ok_review = $wpdb->insert( $reviews_tbl, array(
+                            'sn'           => $sn_up,
+                            'user_id'      => $uid,
+                            'status'       => 'scheduled',
+                            'scheduled_at' => $now,
+                        ) );
+                        if ( $ok_review ) $review_inserted++;
+                    }
+                }
+
+                // ฿50 reward coupon — granted now; redemption tracked at review submit
+                $reward = dinoco_sn_generate_promo_code( $uid, $sn_up, 'review_reward', array(
+                    'discount_pct'   => 0,
+                    'discount_value' => 50.0,
+                    'scope'          => 'any',
+                    'ttl_days'       => DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS,
+                ) );
+                if ( $reward ) $promo_count++;
+
+                $meta = array(
+                    'linked_sku'    => $row['linked_sku'] ?? '',
+                    'registered_at' => $row['registered_at'],
+                    'reward_code'   => $reward ?: null,
+                );
+                $ok = function_exists( 'dinoco_sn_schedule_notification' )
+                    ? dinoco_sn_schedule_notification( $sn_up, $uid, 'review_request', $now, $meta )
+                    : false;
+                if ( $ok ) $scheduled++;
+            }
+
+            update_option( 'dinoco_sn_review_request_last_run', array(
+                'at'              => $now,
+                'scanned'         => count( $rows ?: array() ),
+                'scheduled'       => $scheduled,
+                'skipped_claim'   => $skipped_claim,
+                'skipped_pref'    => $skipped_pref,
+                'reviews_added'   => $review_inserted,
+                'rewards_made'    => $promo_count,
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                dinoco_sn_obs_capture( 'lifecycle_review_request', array( 'error' => $e->getMessage() ) );
+            } else {
+                error_log( '[SN-Lifecycle] review_request: ' . $e->getMessage() );
+            }
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. NOTIFICATION DISPATCH (every 15 min)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_run_notification_send' ) ) {
+    /**
+     * Every 15 min — process scheduled notifications past send time.
+     *
+     * Real implementation: build Flex via dinoco_sn_build_flex_for_notification,
+     * push via b2b_line_push_raw, mark sent/failed accordingly. Rate limit
+     * 50/run for LINE quota safety (plan §B2). On 5+ failures within 1hr →
+     * Telegram alert to boss.
+     *
+     * Replaces Production SN Manager V.0.10 stub (which currently just marks
+     * rows as 'pending_dispatch').
+     */
+    function dinoco_sn_lifecycle_run_notification_send() {
+        update_option( 'dinoco_cron_sn_notification_send_last_run', current_time( 'mysql' ) );
+
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'notifications' ) ) return;
+
+        $send_enabled = (bool) get_option( 'dinoco_sn_notification_send_enabled', false );
+        if ( ! $send_enabled ) {
+            return; // boss-gated kill switch — match Manager stub behavior
+        }
+
+        try {
+            global $wpdb;
+            $tbl = dinoco_sn_table( 'notifications' );
+            $now = current_time( 'mysql' );
+            $cap = max( 1, (int) DINOCO_SN_LIFECYCLE_SEND_BATCH_CAP );
+
+            // Pull statuses 'scheduled' OR 'failed' with retry_count<MAX (in meta_json)
+            $batch = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, sn, user_id, notification_type, meta_json, status
+                 FROM {$tbl}
+                 WHERE status IN ('scheduled')
+                   AND scheduled_at <= %s
+                 ORDER BY scheduled_at ASC
+                 LIMIT %d",
+                $now, $cap
+            ), ARRAY_A );
+
+            $sent = 0; $failed = 0; $skipped = 0;
+
+            foreach ( $batch ?: array() as $n ) {
+                $uid    = (int) $n['user_id'];
+                $type   = (string) $n['notification_type'];
+                $meta_j = (string) ( $n['meta_json'] ?? '' );
+
+                // Last-mile preference + LINE UID check (could have changed since enqueue)
+                if ( ! dinoco_sn_should_send_to_user( $uid, $type ) ) {
+                    $wpdb->update( $tbl, array(
+                        'status'  => 'skipped_pref',
+                        'sent_at' => $now,
+                    ), array( 'id' => (int) $n['id'] ) );
+                    $skipped++;
+                    continue;
+                }
+
+                $line_uid = get_user_meta( $uid, 'dinoco_line_uid', true );
+                if ( empty( $line_uid ) ) {
+                    $wpdb->update( $tbl, array(
+                        'status'  => 'skipped_no_line',
+                        'sent_at' => $now,
+                    ), array( 'id' => (int) $n['id'] ) );
+                    $skipped++;
+                    continue;
+                }
+
+                // Build Flex via Manager dispatcher
+                $flex = function_exists( 'dinoco_sn_build_flex_for_notification' )
+                    ? dinoco_sn_build_flex_for_notification( $type, $meta_j )
+                    : null;
+
+                if ( ! is_array( $flex ) ) {
+                    $wpdb->update( $tbl, array(
+                        'status'  => 'failed',
+                        'sent_at' => $now,
+                    ), array( 'id' => (int) $n['id'] ) );
+                    $failed++;
+                    continue;
+                }
+
+                // Compose LINE Messaging API push
+                $messages = array( array(
+                    'type'     => 'flex',
+                    'altText'  => isset( $flex['altText'] ) ? (string) $flex['altText'] : 'DINOCO Notification',
+                    'contents' => isset( $flex['contents'] ) ? $flex['contents'] : $flex,
+                ) );
+
+                $ok = false;
+                if ( function_exists( 'b2b_send_flex_message' ) ) {
+                    // Compatibility shim: spec mentioned helper that doesn't exist in
+                    // current B2B Snippet 1; honor if a future snippet provides it.
+                    $ok = (bool) b2b_send_flex_message( $line_uid, $flex );
+                } elseif ( function_exists( 'b2b_line_push_raw' ) ) {
+                    $r = b2b_line_push_raw( $line_uid, $messages );
+                    $ok = is_array( $r ) && ( (int) ( $r['code'] ?? 0 ) === 200 );
+                }
+
+                if ( $ok ) {
+                    $wpdb->update( $tbl, array(
+                        'status'  => 'sent',
+                        'sent_at' => $now,
+                    ), array( 'id' => (int) $n['id'] ) );
+                    $sent++;
+                } else {
+                    // Bump retry_count via meta_json
+                    $meta_arr = json_decode( $meta_j, true );
+                    if ( ! is_array( $meta_arr ) ) $meta_arr = array();
+                    $retries = (int) ( $meta_arr['_retry_count'] ?? 0 ) + 1;
+                    $meta_arr['_retry_count'] = $retries;
+                    $meta_arr['_last_error']  = 'line_push_failed';
+                    $new_status = $retries >= DINOCO_SN_LIFECYCLE_MAX_RETRIES
+                        ? 'failed'
+                        : 'scheduled'; // re-eligible next run
+                    $wpdb->update( $tbl, array(
+                        'status'    => $new_status,
+                        'meta_json' => wp_json_encode( $meta_arr ),
+                    ), array( 'id' => (int) $n['id'] ) );
+                    $failed++;
+                }
+            }
+
+            update_option( 'dinoco_sn_notification_send_last_run', array(
+                'at'      => $now,
+                'sent'    => $sent,
+                'failed'  => $failed,
+                'skipped' => $skipped,
+                'batch'   => count( $batch ?: array() ),
+            ), false );
+
+            // Failure threshold alert — 5+ failures in last hour
+            if ( $failed >= DINOCO_SN_LIFECYCLE_TG_FAILURE_THRESHOLD ) {
+                $hourly_failed = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$tbl}
+                     WHERE status = 'failed' AND sent_at >= DATE_SUB(%s, INTERVAL 1 HOUR)",
+                    $now
+                ) );
+                if ( $hourly_failed >= DINOCO_SN_LIFECYCLE_TG_FAILURE_THRESHOLD ) {
+                    dinoco_sn_lifecycle_telegram_alert( sprintf(
+                        "🚨 LINE Push Failure Alert\n%d failures in last 1hr\nBatch: sent=%d failed=%d skipped=%d",
+                        $hourly_failed, $sent, $failed, $skipped
+                    ) );
+                }
+            }
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                dinoco_sn_obs_capture( 'lifecycle_notification_send', array( 'error' => $e->getMessage() ) );
+            } else {
+                error_log( '[SN-Lifecycle] notification_send: ' . $e->getMessage() );
+            }
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. TELEGRAM ALERTS (defensive)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_telegram_alert' ) ) {
+    /**
+     * Best-effort Telegram boss alert. Tries 3 known helper names —
+     * skips silently if none available.
+     */
+    function dinoco_sn_lifecycle_telegram_alert( $message ) {
+        $msg = (string) $message;
+        if ( $msg === '' ) return;
+        try {
+            if ( function_exists( 'b2b_send_telegram_alert' ) ) {
+                b2b_send_telegram_alert( $msg, 'sn_lifecycle' );
+                return;
+            }
+            if ( function_exists( 'dinoco_telegram_send' ) ) {
+                dinoco_telegram_send( $msg );
+                return;
+            }
+            if ( function_exists( 'b2b_tg_send' ) ) {
+                b2b_tg_send( $msg );
+                return;
+            }
+            // Fallback — capture via observability for visibility
+            if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                dinoco_sn_obs_capture( 'lifecycle_tg_alert_undelivered', array(
+                    'message' => mb_substr( $msg, 0, 500 ),
+                ) );
+            }
+        } catch ( \Throwable $e ) {
+            error_log( '[SN-Lifecycle][TG] ' . $e->getMessage() );
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. CRON HOOK REBINDING
+ *    Replace Manager stubs with real workers (priority 5 = before default 10)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_action( 'init', function() {
+    // Only rebind if Manager already registered its stubs (guard against
+    // load-order surprises). If Manager not loaded yet → bind anyway; the
+    // stubs will be replaced on next request once Manager loads.
+
+    if ( has_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_run_expiry_schedule' ) ) {
+        remove_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_run_expiry_schedule' );
+    }
+    if ( ! has_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_lifecycle_run_expiry_schedule' ) ) {
+        add_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_lifecycle_run_expiry_schedule' );
+    }
+
+    if ( has_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_run_anniversary_schedule' ) ) {
+        remove_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_run_anniversary_schedule' );
+    }
+    if ( ! has_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_lifecycle_run_anniversary_schedule' ) ) {
+        add_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_lifecycle_run_anniversary_schedule' );
+    }
+
+    if ( has_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_run_review_request_schedule' ) ) {
+        remove_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_run_review_request_schedule' );
+    }
+    if ( ! has_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_lifecycle_run_review_request_schedule' ) ) {
+        add_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_lifecycle_run_review_request_schedule' );
+    }
+
+    if ( has_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' ) ) {
+        remove_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' );
+    }
+    if ( ! has_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_lifecycle_run_notification_send' ) ) {
+        add_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_lifecycle_run_notification_send' );
+    }
+}, 20 );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 9. ADMIN REST ENDPOINTS (debugging + manual dispatch)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_register_rest' ) ) {
+    function dinoco_sn_lifecycle_register_rest() {
+        $perm_admin = function() {
+            return current_user_can( 'manage_options' );
+        };
+
+        // POST /dinoco-sn/v1/notifications/send-now/{id}
+        register_rest_route( 'dinoco-sn/v1', '/notifications/send-now/(?P<id>\d+)', array(
+            'methods'             => 'POST',
+            'permission_callback' => $perm_admin,
+            'callback'            => 'dinoco_sn_lifecycle_rest_send_now',
+            'args'                => array(
+                'id' => array( 'type' => 'integer', 'required' => true ),
+            ),
+        ) );
+
+        // GET /dinoco-sn/v1/notifications/pending
+        register_rest_route( 'dinoco-sn/v1', '/notifications/pending', array(
+            'methods'             => 'GET',
+            'permission_callback' => $perm_admin,
+            'callback'            => 'dinoco_sn_lifecycle_rest_pending',
+        ) );
+
+        // GET /dinoco-sn/v1/notifications/stats
+        register_rest_route( 'dinoco-sn/v1', '/notifications/stats', array(
+            'methods'             => 'GET',
+            'permission_callback' => $perm_admin,
+            'callback'            => 'dinoco_sn_lifecycle_rest_stats',
+        ) );
+    }
+}
+add_action( 'rest_api_init', 'dinoco_sn_lifecycle_register_rest' );
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_rest_send_now' ) ) {
+    function dinoco_sn_lifecycle_rest_send_now( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'notifications' ) ) {
+            return new \WP_Error( 'sn_table_missing', 'Notifications table not installed', array( 'status' => 503 ) );
+        }
+        $id = (int) $req->get_param( 'id' );
+        if ( $id <= 0 ) {
+            return new \WP_Error( 'invalid_id', 'invalid notification id', array( 'status' => 400 ) );
+        }
+
+        // Idempotency wrapper (Round 30+ pattern, defensive)
+        if ( function_exists( 'dinoco_idempotency_extract_key' )
+             && function_exists( 'dinoco_idempotency_check' )
+             && function_exists( 'dinoco_idempotency_store' ) ) {
+            $idem_key = dinoco_idempotency_extract_key( $req );
+            if ( $idem_key ) {
+                $body_hash = array( 'action' => 'sn_send_now', 'id' => $id );
+                $check = dinoco_idempotency_check( $idem_key, 'sn_lifecycle', $body_hash );
+                if ( is_wp_error( $check ) ) return $check;
+                if ( $check !== null )       return rest_ensure_response( $check );
+            }
+        }
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'notifications' );
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, sn, user_id, notification_type, meta_json, status
+             FROM {$tbl} WHERE id=%d",
+            $id
+        ), ARRAY_A );
+        if ( ! $row ) {
+            return new \WP_Error( 'not_found', 'notification not found', array( 'status' => 404 ) );
+        }
+
+        $uid = (int) $row['user_id'];
+        $line_uid = get_user_meta( $uid, 'dinoco_line_uid', true );
+        if ( empty( $line_uid ) ) {
+            return new \WP_Error( 'no_line_uid', 'user has no LINE UID', array( 'status' => 422 ) );
+        }
+
+        $flex = function_exists( 'dinoco_sn_build_flex_for_notification' )
+            ? dinoco_sn_build_flex_for_notification( $row['notification_type'], $row['meta_json'] )
+            : null;
+        if ( ! is_array( $flex ) ) {
+            return new \WP_Error( 'flex_build_failed', 'unknown notification type', array( 'status' => 422 ) );
+        }
+
+        $messages = array( array(
+            'type'     => 'flex',
+            'altText'  => $flex['altText'] ?? 'DINOCO Notification',
+            'contents' => $flex['contents'] ?? $flex,
+        ) );
+
+        $ok = false; $http_code = 0;
+        if ( function_exists( 'b2b_line_push_raw' ) ) {
+            $r = b2b_line_push_raw( $line_uid, $messages );
+            $ok = is_array( $r ) && ( (int) ( $r['code'] ?? 0 ) === 200 );
+            $http_code = is_array( $r ) ? (int) ( $r['code'] ?? 0 ) : 0;
+        }
+
+        $now = current_time( 'mysql' );
+        $wpdb->update( $tbl, array(
+            'status'  => $ok ? 'sent' : 'failed',
+            'sent_at' => $now,
+        ), array( 'id' => $id ) );
+
+        $resp = array(
+            'success'   => $ok,
+            'id'        => $id,
+            'http_code' => $http_code,
+            'sent_at'   => $now,
+        );
+        if ( isset( $idem_key ) && $idem_key
+             && function_exists( 'dinoco_idempotency_store' ) ) {
+            dinoco_idempotency_store( $idem_key, 'sn_lifecycle', $body_hash ?? array(), $resp, 200 );
+        }
+        return rest_ensure_response( $resp );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_rest_pending' ) ) {
+    function dinoco_sn_lifecycle_rest_pending( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'notifications' ) ) {
+            return new \WP_Error( 'sn_table_missing', 'Notifications table not installed', array( 'status' => 503 ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'notifications' );
+        $now = current_time( 'mysql' );
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, sn, user_id, notification_type, scheduled_at, status, channel
+             FROM {$tbl}
+             WHERE status = 'scheduled'
+               AND scheduled_at BETWEEN %s AND DATE_ADD(%s, INTERVAL 24 HOUR)
+             ORDER BY scheduled_at ASC
+             LIMIT 500",
+            $now, $now
+        ), ARRAY_A );
+        return rest_ensure_response( array(
+            'count' => count( $rows ?: array() ),
+            'items' => $rows ?: array(),
+            'as_of' => $now,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_lifecycle_rest_stats' ) ) {
+    function dinoco_sn_lifecycle_rest_stats( $req ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'notifications' ) ) {
+            return new \WP_Error( 'sn_table_missing', 'Notifications table not installed', array( 'status' => 503 ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'notifications' );
+        $rows = $wpdb->get_results(
+            "SELECT notification_type, status, COUNT(*) AS n
+             FROM {$tbl}
+             WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+             GROUP BY notification_type, status
+             ORDER BY notification_type, status",
+            ARRAY_A
+        );
+        return rest_ensure_response( array(
+            'window_days' => 30,
+            'rows'        => $rows ?: array(),
+            'heartbeats'  => array(
+                'expiry'        => get_option( 'dinoco_cron_sn_expiry_schedule_last_run', null ),
+                'anniversary'   => get_option( 'dinoco_cron_sn_anniversary_schedule_last_run', null ),
+                'review'        => get_option( 'dinoco_cron_sn_review_request_last_run', null ),
+                'send'          => get_option( 'dinoco_cron_sn_notification_send_last_run', null ),
+            ),
+        ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * END OF SNIPPET — Phase 3 W9.1 V.0.1
+ * ═══════════════════════════════════════════════════════════════════════════ */

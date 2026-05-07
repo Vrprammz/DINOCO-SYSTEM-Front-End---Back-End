@@ -3070,4 +3070,491 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(opens).toBe(closes);
         });
     });
+
+    /* ═════════════════════════════════════════════════════════════════════
+     *  Phase 3 W8.3 — SN Reconciliation snippet drift assertions
+     * ═════════════════════════════════════════════════════════════════════
+     *
+     * Source: [Admin System] DINOCO SN Reconciliation V.0.1
+     * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.0 §K.15
+     * Spec: docs/sn-system/16-phase3-w8-cron-infrastructure.md §W8.3
+     * ═════════════════════════════════════════════════════════════════════ */
+
+    describe('Reconciliation Snippet (Phase 3 W8.3)', () => {
+        const RECON_SNIPPET_PATH = path.join(REPO_ROOT, '[Admin System] DINOCO SN Reconciliation');
+        const readRecon = () => fs.readFileSync(RECON_SNIPPET_PATH, 'utf8');
+
+        test('Reconciliation snippet file exists', () => {
+            expect(fs.existsSync(RECON_SNIPPET_PATH)).toBe(true);
+        });
+
+        test('Snippet has version header V.0.1+', () => {
+            const code = readRecon();
+            expect(code).toMatch(/Version: V\.0\.[1-9]/);
+        });
+
+        test('Two schema tables defined (sessions + scans)', () => {
+            const code = readRecon();
+            expect(code).toContain('dinoco_sn_reconciliation_sessions');
+            expect(code).toContain('dinoco_sn_reconciliation_scans');
+            // Both have CREATE TABLE in lazy install
+            expect(code).toMatch(/CREATE TABLE \{[^}]*sessions[^}]*\}/i);
+            expect(code).toMatch(/CREATE TABLE \{[^}]*scans[^}]*\}/i);
+        });
+
+        test('Schema includes UNIQUE KEY uq_session_sn (idempotent dup-scan)', () => {
+            const code = readRecon();
+            expect(code).toContain('UNIQUE KEY uq_session_sn');
+            expect(code).toMatch(/UNIQUE KEY uq_session_sn \(session_id, sn\)/);
+        });
+
+        test('utf8mb4_bin enforced on sn column (case-sensitive matching)', () => {
+            const code = readRecon();
+            // ALTER post-create to set utf8mb4_bin (matches sn_pool collation)
+            expect(code).toMatch(/MODIFY sn VARCHAR\(40\) COLLATE utf8mb4_bin/);
+        });
+
+        test('All 7 REST endpoints registered under /reconciliation/*', () => {
+            const code = readRecon();
+            // POST /reconciliation/start
+            expect(code).toMatch(/register_rest_route\([^)]+,\s*['"]\/reconciliation\/start['"]/);
+            // GET /reconciliation/active
+            expect(code).toMatch(/register_rest_route\([^)]+,\s*['"]\/reconciliation\/active['"]/);
+            // GET /reconciliation/history
+            expect(code).toMatch(/register_rest_route\([^)]+,\s*['"]\/reconciliation\/history['"]/);
+            // GET /reconciliation/{uuid}
+            expect(code).toMatch(/register_rest_route\([^)]+,\s*['"]\/reconciliation\/\(\?P<uuid>/);
+            // POST /reconciliation/{uuid}/scan
+            expect(code).toMatch(/\/reconciliation\/\(\?P<uuid>[^)]+\)\/scan/);
+            // POST /reconciliation/{uuid}/submit
+            expect(code).toMatch(/\/reconciliation\/\(\?P<uuid>[^)]+\)\/submit/);
+            // POST /reconciliation/{uuid}/close
+            expect(code).toMatch(/\/reconciliation\/\(\?P<uuid>[^)]+\)\/close/);
+        });
+
+        test('SLA cron registered with heartbeat option', () => {
+            const code = readRecon();
+            // Cron hook name
+            expect(code).toContain('dinoco_sn_reconciliation_timeout_cron');
+            // Daily schedule
+            expect(code).toMatch(/dinoco_register_cron\([^)]*['"]dinoco_sn_reconciliation_timeout_cron['"][^)]*['"]daily['"]/);
+            // Heartbeat option
+            expect(code).toContain('dinoco_cron_sn_reconciliation_timeout_last_run');
+            // 7-day SLA constant
+            expect(code).toContain('DINOCO_SN_RECON_SLA_DAYS');
+        });
+
+        test('All 6 core helpers defined', () => {
+            const code = readRecon();
+            const helpers = [
+                'dinoco_sn_recon_start_session',
+                'dinoco_sn_recon_get_active_session',
+                'dinoco_sn_recon_record_scan',
+                'dinoco_sn_recon_submit_session',
+                'dinoco_sn_recon_close_session',
+                'dinoco_sn_recon_get_variance_report',
+            ];
+            helpers.forEach((fn) => {
+                expect(code).toContain(`function ${fn}(`);
+            });
+        });
+
+        test('Atomic transaction patterns (GET_LOCK + START TRANSACTION + FOR UPDATE)', () => {
+            const code = readRecon();
+            // GET_LOCK / RELEASE_LOCK pattern (multiple sites: start, submit, close)
+            expect(code).toMatch(/SELECT GET_LOCK\(/);
+            expect(code).toMatch(/SELECT RELEASE_LOCK\(/);
+            // START TRANSACTION / COMMIT / ROLLBACK
+            expect(code).toContain("START TRANSACTION");
+            expect(code).toContain("'COMMIT'");
+            expect(code).toContain("'ROLLBACK'");
+            // FOR UPDATE row lock (session row reads)
+            expect(code).toMatch(/FOR UPDATE/);
+            // try/finally pattern around lock release
+            expect(code).toMatch(/try\s*\{[\s\S]*?finally\s*\{[\s\S]*?RELEASE_LOCK/);
+        });
+
+        test('3 resolution_action variants enforced (whitelist)', () => {
+            const code = readRecon();
+            // Constant defines 3 variants
+            expect(code).toContain('cancel,investigate,void_missing');
+            // REST endpoint enum exposes them
+            expect(code).toMatch(/'enum'\s*=>\s*array\(\s*'void_missing',\s*'investigate',\s*'cancel'/);
+            // close handler dispatches on action
+            expect(code).toMatch(/resolution_action.*===.*'void_missing'/);
+        });
+
+        test('Module Registry self-registration with section=inventory order=30', () => {
+            const code = readRecon();
+            expect(code).toContain('dinoco_register_admin_module');
+            expect(code).toMatch(/'key'\s*=>\s*'sn_reconciliation'/);
+            expect(code).toMatch(/'shortcode'\s*=>\s*'dinoco_admin_sn_reconciliation'/);
+            expect(code).toMatch(/'section'\s*=>\s*'inventory'/);
+            expect(code).toMatch(/'order'\s*=>\s*30/);
+            // Defensive function_exists guard
+            expect(code).toMatch(/function_exists\(\s*'dinoco_register_admin_module'\s*\)/);
+        });
+
+        test('Telegram alert call defensive (function_exists guarded)', () => {
+            const code = readRecon();
+            // Both close-with-high-variance + SLA cron guard b2b_tg_send_dedup
+            expect(code).toMatch(/function_exists\(\s*'b2b_tg_send_dedup'\s*\)/);
+            expect(code).toContain("b2b_tg_send_dedup( 'sn_recon_close_'");
+            expect(code).toContain("b2b_tg_send_dedup( 'sn_recon_sla_'");
+        });
+
+        test('Audit log calls defensive (function_exists guarded)', () => {
+            const code = readRecon();
+            // dinoco_sn_audit_log called from start/submit/close/SLA cron — all guarded
+            expect(code).toMatch(/function_exists\(\s*'dinoco_sn_audit_log'\s*\)/);
+            expect(code).toMatch(/dinoco_sn_audit_log\(\s*'',\s*'reconciliation_started'/);
+            expect(code).toMatch(/dinoco_sn_audit_log\(\s*'',\s*'reconciliation_submitted'/);
+            expect(code).toMatch(/dinoco_sn_audit_log\(\s*'',\s*'reconciliation_closed'/);
+        });
+
+        test('Idempotency wrapper used for all POST endpoints', () => {
+            const code = readRecon();
+            expect(code).toMatch(/dinoco_sn_with_idempotency\(\s*\$req,\s*'reconciliation-start'/);
+            expect(code).toMatch(/dinoco_sn_with_idempotency\(\s*\$req,\s*'reconciliation-scan'/);
+            expect(code).toMatch(/dinoco_sn_with_idempotency\(\s*\$req,\s*'reconciliation-submit'/);
+            expect(code).toMatch(/dinoco_sn_with_idempotency\(\s*\$req,\s*'reconciliation-close'/);
+            // Defensive — falls through if helper not synced
+            expect(code).toMatch(/function_exists\(\s*'dinoco_sn_with_idempotency'\s*\)/);
+        });
+
+        test('4-eyes variance gate (>5% requires manage_options)', () => {
+            const code = readRecon();
+            expect(code).toContain('DINOCO_SN_RECON_4EYES_VARIANCE_PCT');
+            // Constant value 5
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_RECON_4EYES_VARIANCE_PCT',\s*5\s*\)/);
+            // requires_4eyes pure helper
+            expect(code).toContain('function dinoco_sn_recon_requires_4eyes(');
+            // close gate enforces capability
+            expect(code).toMatch(/needs_4eyes.*current_user_can\(\s*'manage_options'\s*\)/);
+        });
+
+        test('Defensive function_exists guards on all cross-snippet calls', () => {
+            const code = readRecon();
+            // Cross-snippet helpers all guarded
+            const guarded = [
+                'dinoco_sn_table_exists',
+                'dinoco_sn_audit_log',
+                'dinoco_sn_obs_capture',
+                'dinoco_sn_with_idempotency',
+                'dinoco_register_cron',
+                'dinoco_register_admin_module',
+                'b2b_tg_send_dedup',
+                'dinoco_sn_user_can_warehouse',
+            ];
+            guarded.forEach((fn) => {
+                expect(code).toMatch(new RegExp(`function_exists\\(\\s*['"]${fn}['"]\\s*\\)`));
+            });
+        });
+
+        test('Lazy schema install on admin_init', () => {
+            const code = readRecon();
+            expect(code).toMatch(/add_action\(\s*'admin_init',\s*'dinoco_sn_recon_install_schema'/);
+            // dbDelta + version gate
+            expect(code).toContain('dbDelta(');
+            expect(code).toContain('dinoco_sn_recon_schema_version');
+            expect(code).toMatch(/version_compare\(\s*\$current,\s*DINOCO_SN_RECON_SCHEMA_VERSION/);
+        });
+
+        test('Admin shortcode [dinoco_admin_sn_reconciliation] registered', () => {
+            const code = readRecon();
+            expect(code).toContain("add_shortcode( 'dinoco_admin_sn_reconciliation'");
+            // 3-state UI rendering functions present
+            expect(code).toContain('dinoco_sn_recon_render_state_idle');
+            expect(code).toContain('dinoco_sn_recon_render_state_counting');
+            expect(code).toContain('dinoco_sn_recon_render_state_variance');
+            // CSS namespace scoped
+            expect(code).toContain('.dnc-sn-recon-');
+            // Touch target enforced (≥44px)
+            expect(code).toMatch(/min-height:\s*44px/);
+        });
+
+        test('Capability check uses warehouse OR admin role', () => {
+            const code = readRecon();
+            // Two permission callbacks
+            expect(code).toContain('function dinoco_sn_recon_perm_warehouse_or_admin(');
+            expect(code).toContain('function dinoco_sn_recon_perm_admin(');
+            // Warehouse check uses dinoco_sn_warehouse cap (matches User Role Manager)
+            expect(code).toContain("current_user_can( 'dinoco_sn_warehouse' )");
+            // Close endpoint admin-only (4-eyes gate inside helper)
+            expect(code).toMatch(/['"]\/reconciliation\/[^'"]*\/close['"][^)]*'permission_callback'\s*=>\s*\$perm_admin/s);
+        });
+
+        test('Constants defined for SLA + thresholds + tables', () => {
+            const code = readRecon();
+            expect(code).toContain("define( 'DINOCO_SN_RECON_SCHEMA_VERSION'");
+            expect(code).toContain("define( 'DINOCO_SN_RECON_TABLE_SESSIONS'");
+            expect(code).toContain("define( 'DINOCO_SN_RECON_TABLE_SCANS'");
+            expect(code).toContain("define( 'DINOCO_SN_RECON_VALID_RESOLUTIONS'");
+            expect(code).toContain("define( 'DINOCO_SN_RECON_SLA_DAYS'");
+            expect(code).toContain("define( 'DINOCO_SN_RECON_4EYES_VARIANCE_PCT'");
+            // 7-day SLA matches plan §W8.3
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_RECON_SLA_DAYS',\s*7\s*\)/);
+        });
+
+        test('PHPUnit pure-logic test SnReconciliationTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnReconciliationTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('class SnReconciliationTest');
+            // Required test cases
+            expect(content).toContain('test_variance_zero_when_all_match');
+            expect(content).toContain('test_variance_5_percent_with_5_missing_of_100');
+            expect(content).toContain('test_4eyes_required_above_5_percent');
+            expect(content).toContain('test_4eyes_NOT_required_at_exactly_5_percent');
+            expect(content).toContain('test_state_counting_to_submitted_allowed');
+            expect(content).toContain('test_state_submitted_to_cancelled_NOT_allowed');
+            expect(content).toContain('test_uuid_v4_valid');
+            expect(content).toContain('test_resolution_action_unknown_rejected');
+            expect(content).toContain('test_sla_boundary_exactly_7_days_old_not_stale');
+            expect(content).toContain('test_dup_scan_returns_idempotent_marker');
+        });
+
+        test('Drift sentinel — Reconciliation snippet passes balanced-brace check', () => {
+            const code = readRecon();
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+    });
+
+    /**
+     * Phase 3 W9.1 — Warranty Lifecycle Notifier drift detector.
+     *
+     * NEW snippet `[Admin System] DINOCO Warranty Lifecycle Notifier`
+     * (V.0.1) supplies real LINE Flex dispatch for F#1/F#4/F#10 — replaces
+     * Production SN Manager V.0.9-V.0.26 stubs via cron hook rebinding.
+     *
+     * Asserts:
+     *   - Snippet file exists at repo root
+     *   - 4 cron worker functions defined (lifecycle_run_*)
+     *   - 5 helper functions defined
+     *   - 4 hook rebindings (remove_action + add_action pairs)
+     *   - 3 admin REST endpoints under dinoco-sn/v1/notifications/
+     *   - 5 constants for quota/threshold safety
+     *   - LINE quota cap = 50 sends/run (plan §B2)
+     *   - Telegram volume threshold = 100 plates
+     *   - Telegram failure threshold = 5 failures/hr
+     *   - Max retries = 3
+     *   - Promo TTL = 90 days
+     *   - Defensive function_exists guards on Manager + B2B helpers
+     *   - Idempotency wrapper integration on send-now endpoint
+     *   - Notification preference check (5 wp_usermeta keys)
+     *   - Heartbeats wp_options written for all 4 crons
+     *   - PHPUnit pure-logic test exists
+     */
+    describe('Warranty Lifecycle Notifier (Phase 3 W9.1)', () => {
+
+        const LIFECYCLE_FILE = '[Admin System] DINOCO Warranty Lifecycle Notifier';
+        const readLifecycle = () => {
+            const filepath = path.join(REPO_ROOT, LIFECYCLE_FILE);
+            return fs.readFileSync(filepath, 'utf8');
+        };
+
+        test('NEW snippet [Admin System] DINOCO Warranty Lifecycle Notifier exists', () => {
+            const filepath = path.join(REPO_ROOT, LIFECYCLE_FILE);
+            expect(fs.existsSync(filepath)).toBe(true);
+        });
+
+        test('Snippet declares V.0.1 + Phase 3 W9.1', () => {
+            const code = readLifecycle();
+            expect(code).toMatch(/Version:\s*V\.0\.1/);
+            expect(code).toMatch(/Phase 3 W9\.1/);
+        });
+
+        test('4 cron worker functions defined', () => {
+            const code = readLifecycle();
+            expect(code).toContain('function dinoco_sn_lifecycle_run_expiry_schedule');
+            expect(code).toContain('function dinoco_sn_lifecycle_run_anniversary_schedule');
+            expect(code).toContain('function dinoco_sn_lifecycle_run_review_request_schedule');
+            expect(code).toContain('function dinoco_sn_lifecycle_run_notification_send');
+        });
+
+        test('5 helper functions defined (testable + reusable)', () => {
+            const code = readLifecycle();
+            expect(code).toContain('function dinoco_sn_compute_anniversary_coupon');
+            expect(code).toContain('function dinoco_sn_generate_promo_code');
+            expect(code).toContain('function dinoco_sn_should_send_to_user');
+            expect(code).toContain('function dinoco_sn_format_thai_date');
+            expect(code).toContain('function dinoco_sn_compute_days_until_expiry');
+        });
+
+        test('Cron hooks rebound — 4 remove_action + 4 add_action pairs', () => {
+            const code = readLifecycle();
+
+            // remove Manager stubs
+            expect(code).toContain("remove_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_run_expiry_schedule' )");
+            expect(code).toContain("remove_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_run_anniversary_schedule' )");
+            expect(code).toContain("remove_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_run_review_request_schedule' )");
+            expect(code).toContain("remove_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_run_notification_send' )");
+
+            // add new lifecycle workers
+            expect(code).toContain("add_action( 'dinoco_sn_expiry_schedule_cron', 'dinoco_sn_lifecycle_run_expiry_schedule' )");
+            expect(code).toContain("add_action( 'dinoco_sn_anniversary_schedule_cron', 'dinoco_sn_lifecycle_run_anniversary_schedule' )");
+            expect(code).toContain("add_action( 'dinoco_sn_review_request_cron', 'dinoco_sn_lifecycle_run_review_request_schedule' )");
+            expect(code).toContain("add_action( 'dinoco_sn_notification_send_cron', 'dinoco_sn_lifecycle_run_notification_send' )");
+        });
+
+        test('init priority 20 (after Manager priority 10)', () => {
+            const code = readLifecycle();
+            // The closing of init lambda must include priority 20
+            expect(code).toMatch(/add_action\(\s*'init'\s*,\s*function\(\)\s*\{[\s\S]*?\},\s*20\s*\)/);
+        });
+
+        test('3 admin REST endpoints registered under dinoco-sn/v1/notifications/', () => {
+            const code = readLifecycle();
+            expect(code).toContain("'/notifications/send-now/(?P<id>\\d+)'");
+            expect(code).toContain("'/notifications/pending'");
+            expect(code).toContain("'/notifications/stats'");
+            // All 3 must register on dinoco-sn/v1
+            const matches = code.match(/register_rest_route\(\s*'dinoco-sn\/v1'/g) || [];
+            expect(matches.length).toBeGreaterThanOrEqual(3);
+        });
+
+        test('REST endpoints all admin-gated (manage_options)', () => {
+            const code = readLifecycle();
+            expect(code).toContain("current_user_can( 'manage_options' )");
+        });
+
+        test('5 quota/threshold constants defined', () => {
+            const code = readLifecycle();
+            expect(code).toContain("define( 'DINOCO_SN_LIFECYCLE_VERSION'");
+            expect(code).toContain("define( 'DINOCO_SN_LIFECYCLE_SEND_BATCH_CAP'");
+            expect(code).toContain("define( 'DINOCO_SN_LIFECYCLE_MAX_RETRIES'");
+            expect(code).toContain("define( 'DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS'");
+            expect(code).toContain("define( 'DINOCO_SN_LIFECYCLE_TG_VOLUME_THRESHOLD'");
+            expect(code).toContain("define( 'DINOCO_SN_LIFECYCLE_TG_FAILURE_THRESHOLD'");
+        });
+
+        test('LINE quota cap = 50 sends/run (plan §B2)', () => {
+            const code = readLifecycle();
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_LIFECYCLE_SEND_BATCH_CAP',\s*50\s*\)/);
+        });
+
+        test('Telegram volume threshold = 100 plates', () => {
+            const code = readLifecycle();
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_LIFECYCLE_TG_VOLUME_THRESHOLD',\s*100\s*\)/);
+        });
+
+        test('Telegram failure threshold = 5 in 1hr', () => {
+            const code = readLifecycle();
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_LIFECYCLE_TG_FAILURE_THRESHOLD',\s*5\s*\)/);
+        });
+
+        test('Max retries before failed = 3', () => {
+            const code = readLifecycle();
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_LIFECYCLE_MAX_RETRIES',\s*3\s*\)/);
+        });
+
+        test('Promo code TTL default = 90 days', () => {
+            const code = readLifecycle();
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_LIFECYCLE_PROMO_TTL_DAYS',\s*90\s*\)/);
+        });
+
+        test('Anniversary coupon table 1y=5%, 2y=7%, 3y+=10%', () => {
+            const code = readLifecycle();
+            // Search for the structure of the coupon function
+            expect(code).toContain('function dinoco_sn_compute_anniversary_coupon');
+            // The 5/7/10 progression must appear somewhere in the function body
+            expect(code).toMatch(/\$pct\s*=\s*5\s*;/);
+            expect(code).toMatch(/\$pct\s*=\s*7\s*;/);
+            expect(code).toMatch(/\$pct\s*=\s*10\s*;/);
+        });
+
+        test('Defensive function_exists guards on b2b LINE push helpers', () => {
+            const code = readLifecycle();
+            // Either modern (b2b_send_flex_message) or fallback (b2b_line_push_raw) must be guarded
+            expect(code).toContain("function_exists( 'b2b_send_flex_message' )");
+            expect(code).toContain("function_exists( 'b2b_line_push_raw' )");
+        });
+
+        test('Defensive function_exists guards on Manager helpers', () => {
+            const code = readLifecycle();
+            expect(code).toContain("function_exists( 'dinoco_sn_table_exists' )");
+            expect(code).toContain("function_exists( 'dinoco_sn_schedule_notification' )");
+            expect(code).toContain("function_exists( 'dinoco_sn_build_flex_for_notification' )");
+            expect(code).toContain("function_exists( 'dinoco_sn_is_enabled' )");
+            expect(code).toContain("function_exists( 'dinoco_sn_obs_capture' )");
+        });
+
+        test('Defensive Telegram alert helper checks 3 known names', () => {
+            const code = readLifecycle();
+            expect(code).toContain("function_exists( 'b2b_send_telegram_alert' )");
+            expect(code).toContain("function_exists( 'dinoco_telegram_send' )");
+            expect(code).toContain("function_exists( 'b2b_tg_send' )");
+        });
+
+        test('Idempotency wrapper integrated on send-now endpoint', () => {
+            const code = readLifecycle();
+            expect(code).toContain("function_exists( 'dinoco_idempotency_extract_key' )");
+            expect(code).toContain("function_exists( 'dinoco_idempotency_check' )");
+            expect(code).toContain("function_exists( 'dinoco_idempotency_store' )");
+            expect(code).toContain("'sn_lifecycle'"); // namespace
+        });
+
+        test('Notification preference check across 5 wp_usermeta keys', () => {
+            const code = readLifecycle();
+            expect(code).toContain('dinoco_sn_notif_expiry');
+            expect(code).toContain('dinoco_sn_notif_anniversary');
+            expect(code).toContain('dinoco_sn_notif_review');
+            expect(code).toContain('dinoco_sn_notif_promo');
+            expect(code).toContain('dinoco_sn_notif_service');
+        });
+
+        test('LINE UID presence required (dinoco_line_uid usermeta)', () => {
+            const code = readLifecycle();
+            expect(code).toContain('dinoco_line_uid');
+        });
+
+        test('Heartbeat wp_options written for all 4 crons', () => {
+            const code = readLifecycle();
+            expect(code).toContain('dinoco_cron_sn_expiry_schedule_last_run');
+            expect(code).toContain('dinoco_cron_sn_anniversary_schedule_last_run');
+            expect(code).toContain('dinoco_cron_sn_review_request_last_run');
+            expect(code).toContain('dinoco_cron_sn_notification_send_last_run');
+        });
+
+        test('Skip-if-claim guard for review_request scheduler', () => {
+            const code = readLifecycle();
+            // Must reference claim_ticket CPT + ticket_status meta
+            expect(code).toContain("'claim_ticket'");
+            expect(code).toContain("'ticket_status'");
+        });
+
+        test('Try/catch \\Throwable on every cron entry-point', () => {
+            const code = readLifecycle();
+            // Each of 4 workers must be wrapped — count `catch ( \Throwable $e )`
+            const catches = code.match(/catch\s*\(\s*\\Throwable\s+\$e\s*\)/g) || [];
+            expect(catches.length).toBeGreaterThanOrEqual(4);
+        });
+
+        test('PHPUnit pure-logic test SnLifecycleNotifierTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnLifecycleNotifierTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('class SnLifecycleNotifierTest');
+            // Required test cases (sample of 7)
+            expect(content).toContain('test_anniversary_coupon_1y_5pct');
+            expect(content).toContain('test_anniversary_coupon_2y_7pct');
+            expect(content).toContain('test_anniversary_coupon_3y_10pct');
+            expect(content).toContain('test_anniversary_coupon_5y_capped_at_10pct');
+            expect(content).toContain('test_promo_code_default_length_12');
+            expect(content).toContain('test_promo_code_alphanumeric_uppercase_only');
+            expect(content).toContain('test_should_send_skips_when_no_line_uid');
+            expect(content).toContain('test_idempotent_rerun_three_milestones');
+            expect(content).toContain('test_review_request_skipped_when_user_has_open_claim');
+            expect(content).toContain('test_thai_date_buddhist_year');
+        });
+
+        test('Drift sentinel — Lifecycle snippet passes balanced-brace check', () => {
+            const code = readLifecycle();
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+    });
 });
