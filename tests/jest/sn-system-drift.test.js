@@ -747,6 +747,40 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/259200/);   // 72h low
     });
 
+    test('Phase 2 W6.2 — Manual Invoice SN allocation scaffold', () => {
+        const filepath = path.join(REPO_ROOT, '[Admin System] DINOCO Manual Invoice System');
+        const code = fs.readFileSync(filepath, 'utf8');
+
+        // V.35.0 marker present in version header
+        expect(code).toMatch(/V\.35\.0.*Phase 2 W6\.2/);
+
+        // Helper function defined
+        expect(code).toContain('function dinoco_inv_check_sn_required_items');
+
+        // Defensive column existence check
+        expect(code).toMatch(/sn_attach_level/);
+        expect(code).toMatch(/information_schema\.columns/);
+
+        // Skip rules: none / empty / not-required
+        expect(code).toMatch(/'none'/);
+        expect(code).toMatch(/sn_required/);
+
+        // Hooks called from notify phase
+        expect(code).toContain("'_b2b_sn_pending_alloc'");
+        expect(code).toMatch(/dinoco_inv_check_sn_required_items\(\s*\$post_id\s*\)/);
+
+        // Defensive function_exists guards
+        expect(code).toMatch(/function_exists\(\s*'dinoco_sn_required_plates_for_sku'\s*\)/);
+        expect(code).toMatch(/function_exists\(\s*'dinoco_sn_obs_capture'\s*\)/);
+
+        // Try/catch — never throws from notify phase
+        expect(code).toMatch(/catch\s*\(\s*\\Throwable\s+\$e\s*\)/);
+
+        // Companion test exists
+        const testFile = path.join(REPO_ROOT, 'tests/helpers/SnInvoiceCheckRequiredTest.php');
+        expect(fs.existsSync(testFile)).toBe(true);
+    });
+
     test('Round 3 — Factory QR generation: CSV +QR Content URL column, QR PDF removed', () => {
         const rest = readSnippet('rest');
         const manager = readSnippet('manager');
@@ -1769,5 +1803,525 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
     test('Phase 2 W5.2 Tab 4 defensive — degrades when approval workflow missing', () => {
         const code = readSnippet('manager');
         expect(code).toContain('Approval workflow ยังไม่ active');
+    });
+
+    /* ──────────────────────────────────────────────────────────────────
+     * Phase 2 W6.1 — [System] DINOCO Gateway Unified Flow Option B
+     * Plan ref: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.7 §B1
+     * Boss decision Q3: scan-first primary, type S/N secondary,
+     *                   legacy fallback tertiary.
+     * Boss R3 (2026-05-07): QR Content format = B (URL with sn= param).
+     * ────────────────────────────────────────────────────────────────── */
+    describe('Phase 2 W6.1 — Gateway Unified Flow Option B (boss Q3)', () => {
+
+        const GATEWAY_FILE = '[System] DINOCO Gateway';
+        const readGateway = () => {
+            const filepath = path.join(REPO_ROOT, GATEWAY_FILE);
+            if (!fs.existsSync(filepath)) {
+                throw new Error(`Gateway snippet not found: ${GATEWAY_FILE}`);
+            }
+            return fs.readFileSync(filepath, 'utf8');
+        };
+
+        test('Gateway snippet exists', () => {
+            const filepath = path.join(REPO_ROOT, GATEWAY_FILE);
+            expect(fs.existsSync(filepath)).toBe(true);
+        });
+
+        test('Gateway version bumped to V.31.0+ (Phase 2 W6.1)', () => {
+            const code = readGateway();
+            expect(code).toMatch(/Version:\s*V\.3[1-9]\.\d+/);
+        });
+
+        test('Section heading "หรือ ลงทะเบียนสินค้าใหม่" present', () => {
+            const code = readGateway();
+            expect(code).toContain('หรือ ลงทะเบียนสินค้าใหม่');
+        });
+
+        test('Scan QR primary CTA present (📷 + "สแกน QR เพลทบนสินค้า")', () => {
+            const code = readGateway();
+            expect(code).toContain('📷');
+            expect(code).toContain('สแกน QR เพลทบนสินค้า');
+            expect(code).toContain('id="dnc-gateway-sn-scan-btn"');
+        });
+
+        test('Helper text "เร็วที่สุด — 5 วินาที" present', () => {
+            const code = readGateway();
+            expect(code).toContain('เร็วที่สุด');
+            expect(code).toContain('5 วินาที');
+        });
+
+        test('Type S/N input + ⌨️ icon + DNCSS placeholder present', () => {
+            const code = readGateway();
+            expect(code).toContain('⌨️');
+            expect(code).toContain('id="dnc-gateway-sn-input"');
+            expect(code).toContain('DNCSS0000000');
+            expect(code).toContain('id="dnc-gateway-sn-submit"');
+        });
+
+        test('Legacy migration tertiary link present', () => {
+            const code = readGateway();
+            expect(code).toContain('สินค้าเก่าที่ไม่มี plate');
+            expect(code).toContain('/legacy-migration/');
+            expect(code).toMatch(/dnc-gateway-sn-legacy/);
+        });
+
+        test('CSS scope prefix .dnc-gateway-sn-* used (not leaking to .dinoco-app-screen)', () => {
+            const code = readGateway();
+            // Must declare scoped namespace
+            expect(code).toMatch(/\.dnc-gateway-sn-section/);
+            expect(code).toMatch(/\.dnc-gateway-sn-scan-btn/);
+            expect(code).toMatch(/\.dnc-gateway-sn-input/);
+            // Existing surface preserved
+            expect(code).toContain('.dinoco-app-screen');
+        });
+
+        test('html5-qrcode lazy-load pattern (CDN load on first scan click)', () => {
+            const code = readGateway();
+            // Lazy load on click — script element appended, not <script src> on page load
+            expect(code).toContain('html5-qrcode');
+            expect(code).toContain('cdn.jsdelivr.net');
+            // Cache flag (so re-clicks reuse the cached library)
+            expect(code).toContain('_html5QrcodeLoaded');
+            // Defensive optional override hook for snippet authors
+            expect(code).toContain('html5_qrcode_lazy_load');
+        });
+
+        test('QR parser function dinoco_gateway_qr_parse defined inline', () => {
+            const code = readGateway();
+            expect(code).toContain('dinoco_gateway_qr_parse');
+            // Exposed on window for sharing/debug
+            expect(code).toContain('dinocoGatewayQrParse');
+        });
+
+        test('Boss R3 — QR Content format B (URL ?sn= parsing) present', () => {
+            const code = readGateway();
+            // Must parse https?:// URLs and extract `sn` query param
+            expect(code).toMatch(/searchParams\.get\(\s*['"]sn['"]\s*\)/);
+            expect(code).toMatch(/\/\^https\?:\\\/\\\//);
+        });
+
+        test('Defensive — graceful camera deny handling (fallback to typed input)', () => {
+            const code = readGateway();
+            // Camera-error path should highlight typed input + show fallback message
+            expect(code).toContain('ไม่สามารถเปิดกล้อง');
+            expect(code).toContain('พิมพ์ S/N เอง');
+            // Catch on .start() promise (camera permission denied)
+            expect(code).toMatch(/\.catch\(\s*function\s*\(/);
+        });
+
+        test('Activate URL points to /warranty/activate?sn=', () => {
+            const code = readGateway();
+            expect(code).toContain('/warranty/activate');
+            expect(code).toContain("'?sn='");
+            expect(code).toContain('encodeURIComponent');
+        });
+
+        test('Existing LINE OAuth flow preserved (additive only)', () => {
+            const code = readGateway();
+            // Must keep V.30.3 OAuth state-token nonce logic intact
+            expect(code).toContain('dinoco_line_state_');
+            expect(code).toContain('GENERAL_LOGIN');
+            expect(code).toContain('scope=profile%20openid');
+            // Original LINE login button still rendered for guests
+            expect(code).toContain('เข้าสู่ระบบ / สมัครสมาชิก');
+        });
+
+        test('Touch targets ≥44px on input + scan button + close button', () => {
+            const code = readGateway();
+            // min-height: 60px scan button, 44px input/submit/close
+            expect(code).toMatch(/\.dnc-gateway-sn-scan-btn[^}]*min-height:\s*60px/s);
+            expect(code).toMatch(/\.dnc-gateway-sn-input[^}]*min-height:\s*44px/s);
+            expect(code).toMatch(/\.dnc-gateway-sn-submit[^}]*min-height:\s*44px/s);
+            expect(code).toMatch(/\.dnc-gateway-sn-qr-close[^}]*min-height:\s*44px/s);
+        });
+
+        test('Mobile-first responsive (≤640px media query present)', () => {
+            const code = readGateway();
+            expect(code).toMatch(/@media\s*\(\s*max-width:\s*640px\s*\)/);
+        });
+
+        test('Defensive obs hook (dinoco_sn_obs_capture) — guarded with typeof', () => {
+            const code = readGateway();
+            expect(code).toContain('dinoco_sn_obs_capture');
+            expect(code).toContain('gateway_scan_success');
+            // Must be defensive — typeof check before call
+            expect(code).toMatch(/typeof\s+window\.dinoco_sn_obs_capture\s*===\s*['"]function['"]/);
+        });
+
+        test('New section is guest-only (renders inside is_logged_in else branch)', () => {
+            const code = readGateway();
+            // Drift guard: rendered scan-button element (id=) must appear AFTER
+            // the guest LINE login CTA literal and BEFORE the closing endif of
+            // the guest branch. We match the rendered DOM marker, not CSS rules.
+            const scanIdx  = code.indexOf('id="dnc-gateway-sn-scan-btn"');
+            const lineIdx  = code.indexOf('เข้าสู่ระบบ / สมัครสมาชิก');
+            const endifIdx = code.lastIndexOf('endif;');
+            expect(scanIdx).toBeGreaterThan(-1);
+            expect(lineIdx).toBeGreaterThan(-1);
+            expect(scanIdx).toBeGreaterThan(lineIdx);
+            expect(endifIdx).toBeGreaterThan(scanIdx);
+        });
+
+        test('PHPUnit pure-logic test SnGatewayQrParserTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests', 'helpers', 'SnGatewayQrParserTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('class SnGatewayQrParserTest');
+            expect(content).toContain('dinoco_gateway_qr_parse');
+        });
+
+        test('ESC key closes QR overlay (a11y)', () => {
+            const code = readGateway();
+            expect(code).toMatch(/e\.key\s*===\s*['"]Escape['"]/);
+            expect(code).toContain('closeQrOverlay');
+        });
+
+        test('ARIA — overlay role=dialog + aria-hidden toggling', () => {
+            const code = readGateway();
+            expect(code).toContain('role="dialog"');
+            expect(code).toContain('aria-hidden');
+            expect(code).toMatch(/aria-label\s*=/);
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 2 W6.4 + W6.5 — Service Center + Claim System sn_pool integration
+    // ─────────────────────────────────────────────────────────────────────
+
+    describe('Phase 2 W6.4 + W6.5 — Service Center + Claim System sn_pool integration', () => {
+
+        const readRepoFile = (relPath) => {
+            const filepath = path.join(REPO_ROOT, relPath);
+            if (!fs.existsSync(filepath)) {
+                throw new Error(`File not found: ${relPath}`);
+            }
+            return fs.readFileSync(filepath, 'utf8');
+        };
+
+        test('Service Center bumped to V.31.0', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            expect(code).toMatch(/Version: V\.31\.0/);
+            expect(code).toContain('Phase 2 W6.4 sn_pool integration');
+        });
+
+        test('Service Center listener function defined', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            expect(code).toContain('function dinoco_sn_claim_status_changed');
+            expect(code).toContain("add_action( 'dinoco/claim/state_changed', 'dinoco_sn_claim_status_changed'");
+        });
+
+        test('Service Center mapping function defined', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            expect(code).toContain('function dinoco_sn_map_claim_to_pool_status');
+        });
+
+        test('lookup helper dinoco_sn_lookup_by_warranty_id defined with defensive guards', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            expect(code).toContain('function dinoco_sn_lookup_by_warranty_id');
+            expect(code).toContain('information_schema.tables');
+            expect(code).toContain('registered_warranty_id');
+        });
+
+        test('11 claim FSM statuses mapped to sn_pool', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            const statuses = [
+                'pending',
+                'reviewing',
+                'approved',
+                'in_progress',
+                'waiting_parts',
+                'repairing',
+                'quality_check',
+                'completed',
+                'rejected',
+                'cancelled',
+                'closed',
+            ];
+            statuses.forEach((s) => {
+                expect(code).toContain(`'${s}'`);
+            });
+        });
+
+        test('Long-form claim labels mapped (Repaired Item Dispatched, Replacement Shipped)', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            expect(code).toContain("'Repaired Item Dispatched'");
+            expect(code).toContain("'Replacement Shipped'");
+            expect(code).toContain("'Replacement Rejected by Company'");
+            expect(code).toContain("'Replacement Approved'");
+            expect(code).toContain("'Pending Issue Verification'");
+            expect(code).toContain("'Awaiting Customer Shipment'");
+        });
+
+        test('Replacement-flow scaffold writes _sn_replacement_pending meta', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            expect(code).toContain('_sn_replacement_pending');
+            expect(code).toContain('_b2b_replacement_sent');
+        });
+
+        test('Atomic SQL: GET_LOCK + START TRANSACTION + RELEASE_LOCK + FOR UPDATE', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            const fnBlock = code.split('function dinoco_sn_claim_status_changed')[1] || '';
+            const block = fnBlock.split('function dinoco_sn_map_claim_to_pool_status')[0];
+            expect(block).toContain('GET_LOCK');
+            expect(block).toContain('RELEASE_LOCK');
+            expect(block).toContain('START TRANSACTION');
+            expect(block).toContain('ROLLBACK');
+            expect(block).toContain('COMMIT');
+            expect(block).toContain('FOR UPDATE');
+        });
+
+        test('Defensive guards: function_exists + dinoco_sn_table_exists + dinoco_sn_is_enabled', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            const fnBlock = code.split('function dinoco_sn_claim_status_changed')[1] || '';
+            const block = fnBlock.split('function dinoco_sn_map_claim_to_pool_status')[0];
+            expect(block).toContain("function_exists( 'dinoco_sn_table_exists' )");
+            expect(block).toContain("dinoco_sn_table_exists( 'pool' )");
+            expect(block).toContain("function_exists( 'dinoco_sn_is_enabled' )");
+            expect(block).toContain('dinoco_sn_is_enabled()');
+        });
+
+        test('Audit log via dinoco_sn_audit_log defensive call', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            const fnBlock = code.split('function dinoco_sn_claim_status_changed')[1] || '';
+            expect(fnBlock).toContain("function_exists( 'dinoco_sn_audit_log' )");
+            expect(fnBlock).toContain('dinoco_sn_audit_log(');
+            expect(fnBlock).toContain("'claim_status_synced'");
+        });
+
+        test('Replacement-pending admin banner hook registered', () => {
+            const code = readRepoFile('[Admin System] DINOCO Service Center & Claims');
+            expect(code).toContain("add_action( 'edit_form_after_title', 'dinoco_sn_render_replacement_pending_banner' )");
+            expect(code).toContain('Allocate new plate for replacement');
+        });
+
+        test('Claim System bumped to V.31.0', () => {
+            const code = readRepoFile('[System] DINOCO Claim System');
+            expect(code).toMatch(/Version: V\.31\.0/);
+            expect(code).toContain('Phase 2 W6.5 sn_pool source-of-truth');
+        });
+
+        test('Claim System prefers sn_pool with ACF fallback', () => {
+            const code = readRepoFile('[System] DINOCO Claim System');
+            expect(code).toContain("function_exists( 'dinoco_sn_lookup_by_warranty_id' )");
+            expect(code).toContain('dinoco_sn_lookup_by_warranty_id( $prod_id )');
+            expect(code).toContain("get_field( 'serial_code', $prod_id )");
+        });
+
+        test('Claim System validates plate.status === registered', () => {
+            const code = readRepoFile('[System] DINOCO Claim System');
+            expect(code).toContain("(string) $plate_row->status !== 'registered'");
+            expect(code).toContain('เพลทไม่อยู่ในสถานะลงทะเบียน');
+        });
+
+        test('Claim System validates registered_user_id === current user', () => {
+            const code = readRepoFile('[System] DINOCO Claim System');
+            expect(code).toContain('$plate_row->registered_user_id');
+            expect(code).toContain('!== (int) $uid');
+            expect(code).toContain('เพลทนี้ไม่ใช่ของคุณ');
+        });
+
+        test('Claim System validation guarded by sn_pool table check', () => {
+            const code = readRepoFile('[System] DINOCO Claim System');
+            expect(code).toContain("function_exists( 'dinoco_sn_table_exists' )");
+            expect(code).toContain("dinoco_sn_table_exists( 'pool' )");
+            expect(code).toContain('dinoco_sn_is_enabled()');
+        });
+
+        test('PHPUnit SnClaimStatusMappingTest.php exists with key cases', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnClaimStatusMappingTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('test_pending_locks_plate');
+            expect(content).toContain('test_completed_with_replacement_flag_marks_replaced');
+            expect(content).toContain('test_replacement_shipped_marks_replaced');
+            expect(content).toContain('test_rejected_reverts_to_registered');
+            expect(content).toContain('test_closed_is_no_change');
+            expect(content).toContain('test_lock_preserves_old_status_into_prev');
+            expect(content).toContain('test_revert_uses_stored_prev_status');
+        });
+    });
+
+    /* ────────────────────────────────────────────────────────────────────
+     * Phase 2 W6.6 + W6.7 — Manual Transfer + Member Transfer sn_pool integration
+     *
+     * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.6 §Gap E
+     * Boss decision Q16: Customer transfer = ใช้เพลทเดิม (no new plate, same SN).
+     *
+     * Files:
+     *   • [Admin System] DINOCO Manual Transfer Tool   V.30.4 → V.31.0
+     *   • [System] Transfer Warranty Page              V.30.2 → V.31.0
+     *
+     * Asserts: V.31.0 markers + helper signatures + atomic transaction pattern
+     * + 5 block conditions + LINE notify both parties + audit log call + BUG-S2
+     * nonce verification fix + cross-snippet defensive guards.
+     * ──────────────────────────────────────────────────────────────────── */
+    describe('Phase 2 W6.6 + W6.7 — Manual Transfer + Member Transfer sn_pool integration', () => {
+
+        const readByPath = (relPath) => {
+            const filepath = path.join(REPO_ROOT, relPath);
+            if (!fs.existsSync(filepath)) {
+                throw new Error(`File not found: ${relPath}`);
+            }
+            return fs.readFileSync(filepath, 'utf8');
+        };
+
+        test('W6.6 Manual Transfer Tool bumped to V.31.0', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toMatch(/Version:\s*V\.31\.0/);
+            expect(code).toContain('Phase 2 W6.6');
+        });
+
+        test('W6.7 Transfer Warranty Page bumped to V.31.0', () => {
+            const code = readByPath('[System] Transfer Warranty Page');
+            expect(code).toMatch(/Version:\s*V\.31\.0/);
+            expect(code).toContain('Phase 2 W6.7');
+        });
+
+        test('W6.6 dinoco_sn_transfer_owner_by_sn helper defined with function_exists guard', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain("function_exists( 'dinoco_sn_transfer_owner_by_sn' )");
+            expect(code).toContain('function dinoco_sn_transfer_owner_by_sn(');
+        });
+
+        test('W6.6 dinoco_sn_transfer_owner warranty_id wrapper defined', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain("function_exists( 'dinoco_sn_transfer_owner' )");
+            expect(code).toContain('function dinoco_sn_transfer_owner(');
+        });
+
+        test('W6.6 atomic transaction pattern — GET_LOCK + START TRANSACTION + FOR UPDATE', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain('SELECT GET_LOCK');
+            expect(code).toContain('START TRANSACTION');
+            expect(code).toContain('FOR UPDATE');
+            expect(code).toContain('COMMIT');
+            expect(code).toContain('ROLLBACK');
+            expect(code).toContain('SELECT RELEASE_LOCK');
+        });
+
+        test('W6.6 try/catch/finally ensures lock release', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toMatch(/try\s*{[\s\S]*?catch\s*\(\s*\\Throwable[\s\S]*?finally\s*{/);
+        });
+
+        test('W6.6 blocks all 5 forbidden states (claimed/voided/recalled/stolen/replaced)', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            ['claimed', 'voided', 'recalled', 'stolen', 'replaced'].forEach((state) => {
+                expect(code).toContain(`'${state}'`);
+            });
+            expect(code).toContain('blocked_states');
+        });
+
+        test('W6.6 stolen plate triggers LINE alert to admin group', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain('B2B_ADMIN_GROUP_ID');
+            expect(code).toContain('STOLEN');
+            expect(code).toContain('plate_stolen');
+        });
+
+        test('W6.6 audit log via function_exists guard', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain("function_exists( 'dinoco_sn_audit_log' )");
+            expect(code).toContain("'plate_transferred'");
+        });
+
+        test('W6.6 BUG-S2 nonce action consistency hardened', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain("wp_create_nonce( 'dinoco_admin_action' )");
+            expect(code).toContain("wp_verify_nonce( $nonce_received, 'dinoco_admin_action' )");
+            expect(code).toContain('BUG-S2');
+            expect(code).toContain("error_log( '[ManualTransfer] BUG-S2");
+        });
+
+        test('W6.6 graceful no-op when sn_pool table missing', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain('information_schema.tables');
+            expect(code).toContain('graceful no-op');
+        });
+
+        test('W6.6 sn normalized to uppercase before lookup', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            expect(code).toContain('strtoupper( trim( (string) $sn )');
+        });
+
+        test('W6.7 Transfer Warranty Page sn_pool pre-flight extends w_status check', () => {
+            const code = readByPath('[System] Transfer Warranty Page');
+            expect(code).toContain('$dnc_sn_preflight');
+            expect(code).toContain("function_exists( 'dinoco_sn_transfer_owner_by_sn' )");
+            expect(code).toContain("'claim_process'");
+        });
+
+        test('W6.7 sn_pool flip + LINE notify wired into both bundle + single paths', () => {
+            const code = readByPath('[System] Transfer Warranty Page');
+            expect(code).toContain('$dnc_sn_sync_and_notify');
+            // Closure invoked from BOTH bundle path and single-product path
+            // (definition uses `=` so doesn't match `\(` after name).
+            const invocations = (code.match(/\$dnc_sn_sync_and_notify\(/g) || []).length;
+            expect(invocations).toBeGreaterThanOrEqual(2);
+            // Both bundle + single product code-paths exist
+            expect(code).toContain('Transfer (Bundle) by');
+            expect(code).toMatch(/:\s*Transfer by/);
+        });
+
+        test('W6.7 LINE notify uses b2b_line_push to both old + new owner', () => {
+            const code = readByPath('[System] Transfer Warranty Page');
+            expect(code).toContain("function_exists( 'b2b_line_push' )");
+            expect(code).toContain('owner_line_id');
+            expect(code).toContain('ไม่ใช่ของคุณแล้ว');
+            expect(code).toContain('ยินดีต้อนรับ');
+            expect(code).toContain('ระยะประกันคงเดิม');
+        });
+
+        test('W6.7 sn_pool pre-flight blocks claimed/voided/recalled/stolen/replaced', () => {
+            const code = readByPath('[System] Transfer Warranty Page');
+            // Locate the closure body and assert all 5 blocked states are listed
+            const preflightSection = code.split('$dnc_sn_preflight')[1] || '';
+            ['claimed', 'voided', 'recalled', 'stolen', 'replaced'].forEach((state) => {
+                expect(preflightSection).toContain(`'${state}'`);
+            });
+        });
+
+        test('W6.6 + W6.7 both use shared dinoco_sn_transfer_owner_by_sn helper', () => {
+            const mt = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            const tw = readByPath('[System] Transfer Warranty Page');
+            expect(mt).toContain("'plate_transferred'");
+            expect(mt).toContain('dinoco_sn_transfer_owner_by_sn');
+            expect(tw).toContain('dinoco_sn_transfer_owner_by_sn');
+        });
+
+        test('W6.6 helper defensive — every cross-snippet call has function_exists guard', () => {
+            const code = readByPath('[Admin System] DINOCO Manual Transfer Tool');
+            ['dinoco_sn_audit_log', 'dinoco_obs_capture', 'b2b_line_push'].forEach((fn) => {
+                const guards = (code.match(new RegExp(`function_exists\\(\\s*'${fn}'`, 'g')) || []).length;
+                expect(guards).toBeGreaterThan(0);
+            });
+        });
+
+        test('W6.7 helper defensive — every cross-snippet call has function_exists guard', () => {
+            const code = readByPath('[System] Transfer Warranty Page');
+            ['dinoco_sn_transfer_owner_by_sn', 'b2b_line_push'].forEach((fn) => {
+                const guards = (code.match(new RegExp(`function_exists\\(\\s*'${fn}'`, 'g')) || []).length;
+                expect(guards).toBeGreaterThan(0);
+            });
+        });
+
+        test('W6.6 + W6.7 SnTransferOwnerTest helper test exists with required cases', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnTransferOwnerTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('test_block_claimed_plate');
+            expect(content).toContain('test_block_voided_plate');
+            expect(content).toContain('test_block_recalled_plate');
+            expect(content).toContain('test_block_replaced_plate');
+            expect(content).toContain('test_block_stolen_uses_dedicated_code');
+            expect(content).toContain('test_allow_registered_plate');
+            expect(content).toContain('test_legacy_plate_no_sn_pool_row_is_noop');
+            expect(content).toContain('test_same_old_new_owner_is_noop');
+            expect(content).toContain('test_missing_sn_pool_table_is_noop');
+            expect(content).toContain('test_zero_new_owner_is_noop');
+            expect(content).toContain('test_empty_sn_returns_400');
+            expect(content).toContain('sn_transfer_guard');
+        });
     });
 });

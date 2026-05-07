@@ -1,6 +1,22 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.31.0 (2026-05-05) — Phase 2 W6.4 sn_pool integration:
+ *   • Listener `dinoco_sn_claim_status_changed()` hooks into existing
+ *     `dinoco/claim/state_changed` action (no modification of canonical helper).
+ *   • Maps 11-status claim FSM → sn_pool.status: pending/reviewing/approved/
+ *     in_progress/waiting_parts/repairing/quality_check → claimed (lock plate).
+ *     completed (Repaired Item Dispatched) → registered (repair returns same plate).
+ *     completed (Replacement Shipped) → replaced (chain — new plate allocated separately).
+ *     rejected/cancelled → registered (revert via prev_status preservation).
+ *     closed (auto 30d cron) → final state honored.
+ *   • Atomic SQL UPDATE + START TRANSACTION + prev_status preservation pattern.
+ *   • Audit log via dinoco_sn_audit_log() if function exists (defensive).
+ *   • Replacement-flow scaffold: when ticket completed AND _b2b_replacement_sent meta,
+ *     flip old plate to `replaced`. Admin UI banner instructs new-plate allocation
+ *     (full chain creation deferred to Phase 3).
+ *   • Defensive: legacy claims without sn_pool entries continue working unchanged.
+ *     ALL cross-snippet helpers use function_exists()/dinoco_sn_table_exists() guards.
  * Version: V.30.8 (2026-04-24) — Phase 4f: dinoco_daily_auto_close_event registered via
  *   dinoco_register_cron heartbeat tracking + add_action moved into schedule function.
  * Version: V.30.7 (2026-04-24) — Phase 4e Module Registry adoption (Pillar 1):
@@ -166,6 +182,338 @@ if ( ! function_exists( 'dinoco_claim_record_observation' ) ) {
         }
 
         update_option( 'dinoco_claim_observations', $obs, false ); // autoload=false
+    }
+}
+
+// ==============================================================================
+// V.31.0 — Phase 2 W6.4 sn_pool integration listener
+// ==============================================================================
+//
+// Hooks into the EXISTING `dinoco/claim/state_changed` action fired by
+// dinoco_set_claim_status() (M18 V.30.5). This listener is purely additive —
+// it does NOT modify the canonical helper. If sn_pool tables are not yet
+// installed (Phase 1 W2 not yet deployed) every code path defensively no-ops.
+//
+// Status mapping (v2.6 spec §Gap A):
+//   pending / reviewing / Pending Issue Verification          → claimed
+//   approved / Replacement Approved                            → claimed
+//   in_progress / Under Maintenance / Awaiting Customer Shipment → claimed
+//   waiting_parts / Pending Issue Verification (parts wait)    → claimed
+//   repairing / quality_check / Maintenance Completed          → claimed
+//   completed + claim_condition=send_repair (Repaired Item Dispatched) → registered (revert)
+//   completed + Replacement Shipped → replaced (old plate; new plate chained separately)
+//   rejected / Replacement Rejected by Company                 → registered (revert via prev_status)
+//   cancelled                                                  → registered (revert)
+//   closed                                                     → final (no flip — already terminal)
+//
+// `prev_status` preservation:
+//   When transitioning to `claimed`, capture current sn_pool.status into prev_status
+//   so rejected/cancelled can revert to the original (almost always `registered`).
+//
+// Backward compat:
+//   Legacy claim_ticket records without a sn_pool counterpart return early
+//   with a debug log (no error). serial_code lookup is the join key — falls back
+//   to `snapshot_serial_code` ACF field if `serial_code` empty.
+// ==============================================================================
+
+add_action( 'dinoco/claim/state_changed', 'dinoco_sn_claim_status_changed', 10, 4 );
+
+if ( ! function_exists( 'dinoco_sn_claim_status_changed' ) ) {
+    /**
+     * Sync claim_ticket.ticket_status mutations into wp_dinoco_sn_pool.status.
+     *
+     * @param int    $claim_id  claim_ticket post ID
+     * @param string $from_state previous claim status string
+     * @param string $to_state   new claim status string
+     * @param array  $context    optional metadata from dinoco_set_claim_status()
+     * @return void
+     */
+    function dinoco_sn_claim_status_changed( $claim_id, $from_state, $to_state, $context = array() ) {
+        $claim_id = intval( $claim_id );
+        if ( $claim_id <= 0 ) return;
+
+        // Guard 1: sn_pool table not deployed yet → silent no-op
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
+            return;
+        }
+
+        // Guard 2: master kill switch off → silent no-op
+        if ( function_exists( 'dinoco_sn_is_enabled' ) && ! dinoco_sn_is_enabled() ) {
+            return;
+        }
+
+        // Resolve serial code → sn_pool row
+        $sn_code = get_field( 'serial_code', $claim_id );
+        if ( empty( $sn_code ) ) {
+            $sn_code = get_field( 'snapshot_serial_code', $claim_id );
+        }
+        $sn_code = is_string( $sn_code ) ? strtoupper( trim( $sn_code ) ) : '';
+        if ( $sn_code === '' ) {
+            // Legacy claim with no serial → expected, no log
+            return;
+        }
+
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_sn_pool';
+
+        // Resolve target sn_pool.status from claim status
+        $mapping = dinoco_sn_map_claim_to_pool_status( $to_state, $claim_id );
+        if ( $mapping['action'] === 'no_change' ) {
+            // Closed (already terminal) — no plate flip
+            return;
+        }
+
+        // GET_LOCK + START TRANSACTION for atomic prev_status preservation
+        $lock_key = 'dnc_sn_claim_' . md5( $sn_code );
+        $got_lock = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 3)", $lock_key ) );
+        if ( ! $got_lock ) {
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[SN-Claim] GET_LOCK timeout sn=%s claim=#%d', $sn_code, $claim_id ) );
+            }
+            return;
+        }
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+
+            // Read current pool row
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT sn, status, prev_status FROM {$tbl} WHERE sn = %s FOR UPDATE",
+                $sn_code
+            ) );
+
+            if ( ! $row ) {
+                // No sn_pool row — legacy claim, log + abort txn
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( sprintf( '[SN-Claim] No sn_pool row for sn=%s claim=#%d (legacy claim, OK)', $sn_code, $claim_id ) );
+                }
+                return;
+            }
+
+            $old_pool_status = (string) $row->status;
+            $new_pool_status = (string) $mapping['target'];
+
+            if ( $old_pool_status === $new_pool_status ) {
+                // Idempotent — already in target state
+                $wpdb->query( 'COMMIT' );
+                return;
+            }
+
+            // Preserve prev_status when locking (claimed) so rejected/cancelled can revert
+            $prev_to_write = $row->prev_status;
+            if ( $new_pool_status === 'claimed' && $old_pool_status !== 'claimed' ) {
+                $prev_to_write = $old_pool_status;
+            } elseif ( $mapping['action'] === 'revert' ) {
+                // For revert flows, fall back to stored prev_status if present, else assume 'registered'
+                if ( empty( $row->prev_status ) ) {
+                    $new_pool_status = 'registered';
+                } else {
+                    $new_pool_status = $row->prev_status;
+                }
+                $prev_to_write = null;
+            }
+
+            $update_data = array(
+                'status'      => $new_pool_status,
+                'prev_status' => $prev_to_write,
+            );
+            $update_format = array( '%s', '%s' );
+            if ( $prev_to_write === null ) {
+                $update_data['prev_status'] = null;
+                // wpdb does not handle NULL via format — use direct SQL
+                $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tbl} SET status = %s, prev_status = NULL, updated_at = %s WHERE sn = %s",
+                    $new_pool_status,
+                    current_time( 'mysql' ),
+                    $sn_code
+                ) );
+            } else {
+                $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tbl} SET status = %s, prev_status = %s, updated_at = %s WHERE sn = %s",
+                    $new_pool_status,
+                    $prev_to_write,
+                    current_time( 'mysql' ),
+                    $sn_code
+                ) );
+            }
+
+            // Audit log — defensive function_exists guard
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                dinoco_sn_audit_log(
+                    $sn_code,
+                    'claim_status_synced',
+                    $old_pool_status,
+                    $new_pool_status,
+                    array(
+                        'claim_id'        => $claim_id,
+                        'claim_from'      => (string) $from_state,
+                        'claim_to'        => (string) $to_state,
+                        'mapping_action'  => $mapping['action'],
+                        'context_actor'   => isset( $context['actor'] )  ? (string) $context['actor']  : '',
+                        'context_source'  => isset( $context['source'] ) ? (string) $context['source'] : '',
+                    ),
+                    null,
+                    null,
+                    sprintf( 'Claim #%d: %s → %s', $claim_id, $from_state, $to_state ),
+                    'claim_sync',
+                    false
+                );
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            // Replacement flow scaffold (Phase 3 will allocate new plate via UI):
+            // when status flipped to `replaced`, set ACF flag for admin banner.
+            if ( $new_pool_status === 'replaced' ) {
+                update_post_meta( $claim_id, '_sn_replacement_pending', '1' );
+            }
+
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf(
+                    '[SN-Claim] sn=%s claim=#%d pool: %s → %s (action=%s)',
+                    $sn_code, $claim_id, $old_pool_status, $new_pool_status, $mapping['action']
+                ) );
+            }
+
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_claim_status_sync', 'claim_id' => $claim_id, 'sn' => $sn_code ) );
+            }
+            if ( function_exists( 'b2b_log' ) ) {
+                b2b_log( sprintf( '[SN-Claim] EXCEPTION sn=%s claim=#%d: %s', $sn_code, $claim_id, $e->getMessage() ) );
+            }
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_key ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_map_claim_to_pool_status' ) ) {
+    /**
+     * Map 11-status claim_ticket FSM → sn_pool.status flip directive.
+     *
+     * Pure logic — easily unit-testable without DB.
+     *
+     * @param string $claim_status  Target claim_ticket.ticket_status
+     * @param int    $claim_id      Optional — used to detect replacement flow via meta
+     * @return array { action: 'lock'|'revert'|'replace'|'no_change', target: string }
+     */
+    function dinoco_sn_map_claim_to_pool_status( $claim_status, $claim_id = 0 ) {
+        $cs = is_string( $claim_status ) ? trim( $claim_status ) : '';
+
+        // Closed = terminal, plate already in final state
+        if ( $cs === 'closed' || $cs === 'Closed' ) {
+            return array( 'action' => 'no_change', 'target' => '' );
+        }
+
+        // Rejected / Replacement Rejected by Company / Cancelled → revert plate
+        if ( in_array( $cs, array(
+            'rejected', 'Rejected',
+            'Replacement Rejected by Company',
+            'cancelled', 'Cancelled',
+        ), true ) ) {
+            return array( 'action' => 'revert', 'target' => 'registered' );
+        }
+
+        // Completed flows: depends on claim_condition / replacement flag
+        if ( in_array( $cs, array(
+            'completed', 'Completed',
+            'Repaired Item Dispatched',
+            'Maintenance Completed',
+        ), true ) ) {
+            // Repair return → plate registered (same plate back to customer)
+            if ( $claim_id > 0 ) {
+                $replacement_sent = get_post_meta( $claim_id, '_b2b_replacement_sent', true );
+                if ( $replacement_sent === '1' ) {
+                    return array( 'action' => 'replace', 'target' => 'replaced' );
+                }
+            }
+            return array( 'action' => 'revert', 'target' => 'registered' );
+        }
+
+        if ( $cs === 'Replacement Shipped' ) {
+            return array( 'action' => 'replace', 'target' => 'replaced' );
+        }
+
+        // All other in-flight statuses → lock plate as `claimed`
+        $in_flight = array(
+            'pending', 'Pending',
+            'reviewing', 'Reviewing',
+            'approved', 'Approved',
+            'in_progress', 'In Progress',
+            'waiting_parts', 'Waiting Parts',
+            'repairing', 'Repairing',
+            'quality_check', 'Quality Check',
+            'Registered in System',
+            'Pending Issue Verification',
+            'Awaiting Customer Shipment',
+            'In Transit to Company',
+            'Received at Company',
+            'Under Maintenance',
+            'Replacement Approved',
+        );
+        if ( in_array( $cs, $in_flight, true ) ) {
+            return array( 'action' => 'lock', 'target' => 'claimed' );
+        }
+
+        // Unknown → defensive no-op
+        return array( 'action' => 'no_change', 'target' => '' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_lookup_by_warranty_id' ) ) {
+    /**
+     * Resolve warranty_registration CPT ID → sn_pool.sn (V.31.0 source of truth).
+     * Defensive: returns empty string if sn_pool table not exists or no link.
+     *
+     * @param int $warranty_id warranty_registration post ID
+     * @return string Plate S/N or empty string
+     */
+    function dinoco_sn_lookup_by_warranty_id( $warranty_id ) {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_sn_pool';
+        // Check table exists (defensive — Phase 1 W2 may not be deployed yet)
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        if ( ! $exists ) return '';
+        return (string) $wpdb->get_var( $wpdb->prepare(
+            "SELECT sn FROM {$tbl} WHERE registered_warranty_id = %d LIMIT 1",
+            (int) $warranty_id
+        ) );
+    }
+}
+
+// ==============================================================================
+// V.31.0 — Admin UI banner: replacement-pending flag
+// ==============================================================================
+//
+// When dinoco_sn_claim_status_changed() flips a plate to `replaced`, it sets
+// post_meta _sn_replacement_pending=1 on the claim. The Service Center claim
+// edit screen reads this flag and shows a yellow banner instructing the admin
+// to allocate a fresh plate via Phase 3 W5 (full chain creation = future work).
+
+add_action( 'edit_form_after_title', 'dinoco_sn_render_replacement_pending_banner' );
+if ( ! function_exists( 'dinoco_sn_render_replacement_pending_banner' ) ) {
+    function dinoco_sn_render_replacement_pending_banner( $post ) {
+        if ( ! is_object( $post ) || ! isset( $post->post_type ) ) return;
+        if ( $post->post_type !== 'claim_ticket' ) return;
+        if ( ! current_user_can( 'manage_options' ) ) return;
+
+        $pending = get_post_meta( $post->ID, '_sn_replacement_pending', true );
+        if ( $pending !== '1' ) return;
+
+        // Bail if SN system not active
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+
+        echo '<div class="notice notice-warning" style="padding:12px;border-left:4px solid #f0b400;margin:12px 0;">';
+        echo '<strong>⚠️ Allocate new plate for replacement</strong><br>';
+        echo 'เพลทเดิมถูกตั้งสถานะเป็น <code>replaced</code> เรียบร้อย — กรุณาจัดสรรเพลทใหม่ให้ลูกค้าผ่านระบบ S/N Manager (Phase 3 W5 จะมี flow เต็ม).';
+        echo '</div>';
     }
 }
 

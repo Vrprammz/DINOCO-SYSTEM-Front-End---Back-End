@@ -2,6 +2,15 @@
  * Template Name: [Admin System] DINOCO Manual Invoice System
  * Shortcode: [dinoco_manual_invoice]
  * Description: ระบบออกบิลแมนนวลสำหรับตัวแทนจำหน่าย B2B (แทน Zortout)
+ * Version: V.35.0 (2026-05-07) — Phase 2 W6.2: SN system integration scaffold.
+ *   • NEW dinoco_inv_check_sn_required_items($invoice_id) helper — scan invoice items
+ *     for SKUs needing plate allocation (sn_attach_level≠'none' + sn_required=1).
+ *   • _dinoco_inv_do_issue_notify post-issue hook — track pending allocation in
+ *     postmeta `_b2b_sn_pending_alloc` for admin Tab 4 follow-up.
+ *   • Defensive: sn_attach_level column existence check (graceful no-op if Phase 1 W2
+ *     ALTER not deployed). function_exists guards on dinoco_sn_required_plates_for_sku
+ *     + dinoco_sn_obs_capture. Try/catch — never throws from notify phase.
+ *   • Phase 2 W6.2 scope = scaffold + tracking. Actual plate allocation UI = Phase 3.
  * Version: V.34.11 (2026-04-30) — Round 43 batch 21 Idempotency-Key on 5 retry-prone POSTs.
  *   Closes 5 long-pending Manual Invoice retry-prone endpoints — push past 50% milestone
  *   toward 60% (104/196 = 53.1%):
@@ -1854,6 +1863,97 @@ function _dinoco_inv_do_issue_notify($post_id, $dist_id, $total, $dist_name) {
         }
     } else {
         if (function_exists('b2b_log')) b2b_log('[InvNotify] inv=' . $post_id . ' SKIP — distributor has no line_group_id (dist=' . $dist_id . ')');
+    }
+
+    // V.35.0 — Phase 2 W6.2 SN system integration. Scan invoice items for sn_required SKUs
+    // and emit warning audit + flag for admin follow-up. Actual sn_pool plate allocation
+    // happens later (Phase 3) when admin uses Tab 4 จัดการ S/N to assign physical plates.
+    // For now: track which invoices need plate allocation in postmeta `_b2b_sn_pending_alloc`
+    // so admin can review via Tab 4 + cross-link the customer with plates manually.
+    if ( function_exists( 'dinoco_inv_check_sn_required_items' ) ) {
+        try {
+            $sn_pending = dinoco_inv_check_sn_required_items( $post_id );
+            if ( ! empty( $sn_pending ) ) {
+                update_post_meta( $post_id, '_b2b_sn_pending_alloc', $sn_pending );
+                if ( function_exists( 'b2b_log' ) ) {
+                    b2b_log( '[InvSN] inv=' . $post_id . ' has ' . count( $sn_pending ) . ' sn_required items pending allocation' );
+                }
+                // Defensive obs capture
+                if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                    dinoco_sn_obs_capture( 'invoice_sn_pending', array(
+                        'invoice_id' => $post_id, 'dist_id' => $dist_id, 'pending_count' => count( $sn_pending ),
+                    ) );
+                }
+            }
+        } catch ( \Throwable $e ) {
+            error_log( '[InvSN] check failed inv=' . $post_id . ': ' . $e->getMessage() );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_inv_check_sn_required_items' ) ) {
+    /**
+     * V.35.0 — Phase 2 W6.2: scan invoice items for SKUs with sn_attach_level≠'none' AND
+     * sn_required=1. Returns array of pending items needing plate allocation.
+     *
+     * Used by _dinoco_inv_do_issue_notify after invoice issue. Defensive — returns empty
+     * array if SN system not deployed (sn_attach_level column missing).
+     *
+     * @param int $invoice_id wp_posts.ID of the invoice
+     * @return array [ { sku, qty, level, qty_per_unit, plates_needed } ... ]
+     */
+    function dinoco_inv_check_sn_required_items( $invoice_id ) {
+        $items_json = get_post_meta( $invoice_id, '_inv_items', true );
+        if ( empty( $items_json ) ) return array();
+        $items = is_string( $items_json ) ? json_decode( $items_json, true ) : (array) $items_json;
+        if ( ! is_array( $items ) || empty( $items ) ) return array();
+
+        $pending = array();
+        global $wpdb;
+        $tbl_products = $wpdb->prefix . 'dinoco_products';
+
+        // Defensive: sn_attach_level column may not exist (Phase 1 W2 ALTER not deployed)
+        $col_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            DB_NAME, $tbl_products, 'sn_attach_level'
+        ) );
+        if ( ! $col_exists ) return array();
+
+        foreach ( $items as $item ) {
+            $sku = isset( $item['sku'] ) ? strtoupper( trim( (string) $item['sku'] ) ) : '';
+            $qty = isset( $item['qty'] ) ? max( 1, (int) $item['qty'] ) : 1;
+            if ( $sku === '' ) continue;
+
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT sn_attach_level, sn_required, sn_qty_per_unit
+                 FROM {$tbl_products} WHERE sku = %s",
+                $sku
+            ) );
+            if ( ! $row ) continue;
+            if ( ! $row->sn_required ) continue;
+            if ( $row->sn_attach_level === 'none' || empty( $row->sn_attach_level ) ) continue;
+
+            // Compute plates needed using existing helper if available
+            $plates_needed = $qty * max( 1, (int) ( $row->sn_qty_per_unit ?: 1 ) );
+            if ( function_exists( 'dinoco_sn_required_plates_for_sku' ) ) {
+                $required = dinoco_sn_required_plates_for_sku( $sku, $qty );
+                if ( ! empty( $required ) ) {
+                    $plates_needed = 0;
+                    foreach ( $required as $r ) $plates_needed += (int) $r['qty'];
+                }
+            }
+
+            $pending[] = array(
+                'sku'           => $sku,
+                'qty'           => $qty,
+                'level'         => $row->sn_attach_level,
+                'qty_per_unit'  => (int) ( $row->sn_qty_per_unit ?: 1 ),
+                'plates_needed' => $plates_needed,
+            );
+        }
+
+        return $pending;
     }
 }
 

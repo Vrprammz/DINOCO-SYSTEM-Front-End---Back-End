@@ -2,6 +2,28 @@
  * Template Name: [Admin System] DINOCO Manual Transfer Tool
  * Shortcode: [dinoco_admin_transfer]
  * Description: ระบบย้ายเจ้าของสินค้าแบบ Force Transfer (Admin Override)
+ * Version: V.31.0 (2026-05-05) — Phase 2 W6.6 sn_pool integration + nonce hardening.
+ *   • NEW dinoco_sn_transfer_owner_by_sn($sn, $old_owner, $new_owner) helper —
+ *     atomic warranty owner transfer in wp_dinoco_sn_pool. SELECT FOR UPDATE +
+ *     GET_LOCK + START TRANSACTION + try/catch ROLLBACK + finally RELEASE_LOCK.
+ *     status flips registered → transferred (intermediate) → registered with new
+ *     owner in same atomic transaction. Audit row written via dinoco_sn_audit_log
+ *     (defensive function_exists guard). Boss decision Q16: Customer transfer =
+ *     ใช้เพลทเดิม (no new plate issued — same physical SN, different owner).
+ *   • NEW pre-flight guard before transfer: SELECT plate by sn → if status in
+ *     [claimed, voided, recalled, replaced] → reject with localized message; if
+ *     status = stolen → reject + alert บอส LINE. Defensive: missing sn_pool table
+ *     or missing row (legacy SN before Phase 1 W2) → graceful no-op fall-through
+ *     to legacy ACF-only logic, returns true.
+ *   • Phase 1 audit BUG-S2 — nonce action consistency hardening. wp_create_nonce
+ *     and wp_verify_nonce both use the action 'dinoco_admin_action'. Verified
+ *     identical action name across emit (line ~158) and check (line ~53) sites.
+ *     Adds defensive: also accepts 'dinoco_transfer_v3' as fallback action name
+ *     to tolerate legacy clients during rollout. Logs every verify failure for
+ *     observability. (V.30.3 already fixed the missing-nonce-on-payload bug; this
+ *     hardens the action-name verification side of the same defense.)
+ *   • Backward compat: legacy serial_number CPTs without a sn_pool row continue
+ *     to work — sn_pool sync hook is best-effort + non-blocking.
  * Version: V.30.4 (2026-04-24) — Phase 4e Module Registry adoption (Pillar 1):
  *   • Self-register via dinoco_register_admin_module() at init priority 30.
  *     key=transfer, shortcode=dinoco_admin_transfer, section=inventory, cache_ttl=300.
@@ -49,8 +71,26 @@ add_action( 'init', function() {
             exit;
         }
 
-        /* CSRF Protection */
-        if ( ! isset( $_POST['dinoco_admin_nonce'] ) || ! wp_verify_nonce( $_POST['dinoco_admin_nonce'], 'dinoco_admin_action' ) ) {
+        /* CSRF Protection
+         * V.31.0 Phase 1 audit BUG-S2: hardened nonce verification.
+         * The canonical nonce action used by the shortcode emitter (line ~158:
+         * wp_create_nonce('dinoco_admin_action')) MUST match the action passed
+         * here. Defensive — also accepts legacy action 'dinoco_transfer_v3'
+         * during rollout window. Every verify failure is logged for observability.
+         */
+        $nonce_received = isset( $_POST['dinoco_admin_nonce'] ) ? (string) $_POST['dinoco_admin_nonce'] : '';
+        if ( $nonce_received === '' ) {
+            error_log( '[ManualTransfer] BUG-S2: nonce field missing from POST payload' );
+            echo json_encode( [ 'success' => false, 'message' => 'Security token invalid. Please refresh.' ] );
+            exit;
+        }
+        $nonce_ok = wp_verify_nonce( $nonce_received, 'dinoco_admin_action' );
+        if ( ! $nonce_ok ) {
+            // Defensive fallback for any older client hitting this endpoint.
+            $nonce_ok = wp_verify_nonce( $nonce_received, 'dinoco_transfer_v3' );
+        }
+        if ( ! $nonce_ok ) {
+            error_log( '[ManualTransfer] BUG-S2: wp_verify_nonce failed for both canonical + legacy actions' );
             echo json_encode( [ 'success' => false, 'message' => 'Security token invalid. Please refresh.' ] );
             exit;
         }
@@ -99,7 +139,7 @@ add_action( 'init', function() {
 
                 /* 4. Perform Transfer */
                 $old_owner = get_field( 'owner_product', $pid ) ?: 'System/Unknown';
-                
+
                 // [SECURITY FIX] Block transfer of locked products
                 $w_status = get_field('w_status', $pid);
                 if ( in_array($w_status, ['claim_process', 'stolen', 'void', 'warranty_pending'], true) ) {
@@ -107,9 +147,31 @@ add_action( 'init', function() {
                     exit;
                 }
 
+                /* V.31.0 Phase 2 W6.6 — sn_pool atomic flip (PRE-FLIGHT + ATOMIC).
+                 * Boss decision Q16: Customer transfer = ใช้เพลทเดิม (same SN, new owner).
+                 * Resolves new_owner username → user_id for sn_pool registered_user_id.
+                 * Defensive: function_exists guard + graceful no-op when sn_pool missing.
+                 */
+                $new_owner_user = get_user_by( 'login', $new_owner );
+                $new_owner_uid  = $new_owner_user ? (int) $new_owner_user->ID : 0;
+                $old_owner_user = is_string( $old_owner ) ? get_user_by( 'login', $old_owner ) : null;
+                $old_owner_uid  = $old_owner_user ? (int) $old_owner_user->ID : 0;
+
+                if ( function_exists( 'dinoco_sn_transfer_owner_by_sn' ) ) {
+                    $sn_transfer_result = dinoco_sn_transfer_owner_by_sn( $target_sn, $old_owner_uid, $new_owner_uid );
+                    if ( is_wp_error( $sn_transfer_result ) ) {
+                        echo json_encode( [
+                            'success' => false,
+                            'message' => $sn_transfer_result->get_error_message(),
+                            'code'    => $sn_transfer_result->get_error_code(),
+                        ] );
+                        exit;
+                    }
+                }
+
                 // Update Owner
                 update_field( 'owner_product', $new_owner, $pid );
-                
+
                 // Update Sequence (Optional: Increment)
                 $current_seq = (int) get_field( 'owner_sequence', $pid );
                 update_field( 'owner_sequence', $current_seq + 1, $pid );
@@ -274,6 +336,211 @@ add_action( 'init', function() {
         'cache_ttl'  => 300,
         'capability' => 'manage_options',
         'order'      => 60,
-        'source'     => '[Admin System] DINOCO Manual Transfer Tool V.30.4',
+        'source'     => '[Admin System] DINOCO Manual Transfer Tool V.31.0',
     ) );
 }, 30 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V.31.0 Phase 2 W6.6 — sn_pool atomic owner transfer helpers (shared)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Helpers may be loaded by EITHER this snippet OR [System] Transfer Warranty
+// Page (whichever fires first wins) — therefore both define them inside
+// function_exists guards. Boss decision Q16 (binding):
+//   "Customer transfer = ใช้เพลทเดิม" — same physical SN plate, new owner.
+//
+// Atomic flow per plan v2.6 §Gap E:
+//   GET_LOCK(dnc_sn_transfer_{sn}, 5s)
+//   START TRANSACTION
+//     SELECT ... FOR UPDATE   (snapshot status + lock_version)
+//     blocked_states early-exit (claimed/voided/recalled/stolen/replaced)
+//     UPDATE status='transferred' (intermediate, ~5s)
+//     UPDATE status='registered', registered_user_id=<new>
+//   COMMIT
+//   RELEASE_LOCK
+//   audit row (best-effort)
+//
+// Defensive policy:
+//   • Missing wp_dinoco_sn_pool table  → return true (graceful no-op)
+//   • Missing row for this SN          → return true (legacy SN, pre-Phase 1 W2)
+//   • Blocked status                   → return WP_Error (HTTP 422)
+//   • Same old/new owner               → return true (no-op, write nothing)
+//   • DB exception                     → ROLLBACK + return WP_Error (HTTP 500)
+
+if ( ! function_exists( 'dinoco_sn_transfer_owner_by_sn' ) ) {
+    /**
+     * V.31.0 — Phase 2 W6.6/W6.7 atomic warranty owner transfer (by SN string).
+     *
+     * @param string $sn           Plate S/N string (uppercased internally).
+     * @param int    $old_owner_id Previous WP user_id (0 = unknown legacy).
+     * @param int    $new_owner_id New WP user_id (must be > 0).
+     * @return true|WP_Error true on success or graceful no-op, WP_Error if blocked.
+     */
+    function dinoco_sn_transfer_owner_by_sn( $sn, $old_owner_id, $new_owner_id ) {
+        global $wpdb;
+
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) {
+            return new WP_Error( 'sn_empty', 'Serial number is empty', array( 'status' => 400 ) );
+        }
+        $new_owner_id = (int) $new_owner_id;
+        $old_owner_id = (int) $old_owner_id;
+        if ( $new_owner_id <= 0 ) {
+            // Manual Transfer accepts username string — caller may have failed
+            // to resolve. Fall through gracefully (legacy ACF logic still runs).
+            return true;
+        }
+
+        $tbl = $wpdb->prefix . 'dinoco_sn_pool';
+
+        // Defensive: table may not exist yet (Phase 1 W2 not deployed)
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        if ( ! $exists ) {
+            return true; // graceful no-op
+        }
+
+        // Same owner → write nothing (idempotent caller)
+        if ( $old_owner_id > 0 && $old_owner_id === $new_owner_id ) {
+            return true;
+        }
+
+        $lock_name = 'dnc_sn_transfer_' . md5( $sn );
+        $got_lock  = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_name ) );
+
+        try {
+            $wpdb->query( "START TRANSACTION" );
+
+            $plate = $wpdb->get_row( $wpdb->prepare(
+                "SELECT sn, status, registered_user_id, registered_warranty_id, lock_version
+                 FROM {$tbl} WHERE sn = %s FOR UPDATE",
+                $sn
+            ) );
+
+            if ( ! $plate ) {
+                $wpdb->query( "ROLLBACK" );
+                return true; // legacy SN without sn_pool entry — graceful
+            }
+
+            // Block if not transferable
+            $blocked_states = array( 'claimed', 'voided', 'recalled', 'stolen', 'replaced' );
+            if ( in_array( $plate->status, $blocked_states, true ) ) {
+                $wpdb->query( "ROLLBACK" );
+
+                if ( $plate->status === 'stolen' ) {
+                    // Best-effort alert บอส (LINE)
+                    if ( function_exists( 'b2b_line_push' ) && defined( 'B2B_ADMIN_GROUP_ID' ) ) {
+                        @b2b_line_push( B2B_ADMIN_GROUP_ID,
+                            "🚨 SN STOLEN ATTEMPTED TRANSFER\nSN: {$sn}\nFrom UID: {$old_owner_id}\nTo UID: {$new_owner_id}\nBlocked at " . current_time( 'mysql' )
+                        );
+                    }
+                    return new WP_Error( 'plate_stolen',
+                        sprintf( 'เพลท %s ถูกแจ้งหาย/ระงับสิทธิ์ — โอนไม่ได้', $sn ),
+                        array( 'status' => 422, 'sn' => $sn )
+                    );
+                }
+
+                $msg_map = array(
+                    'claimed'  => 'เพลทกำลังเปิดเคลม โอนไม่ได้',
+                    'voided'   => 'เพลทถูกยกเลิก โอนไม่ได้',
+                    'recalled' => 'เพลทถูกเรียกคืน (Recall) โอนไม่ได้',
+                    'replaced' => 'เพลทถูกเปลี่ยนใหม่แล้ว โอนไม่ได้',
+                );
+                return new WP_Error( 'plate_not_transferable',
+                    isset( $msg_map[ $plate->status ] ) ? $msg_map[ $plate->status ]
+                        : sprintf( 'เพลท %s อยู่ในสถานะ %s โอนไม่ได้', $sn, $plate->status ),
+                    array( 'status' => 422, 'sn' => $sn, 'sn_status' => $plate->status )
+                );
+            }
+
+            // Intermediate state: registered → transferred (audit visibility ~5s window)
+            $wpdb->update( $tbl,
+                array(
+                    'status'       => 'transferred',
+                    'prev_status'  => $plate->status,
+                    'lock_version' => ( (int) $plate->lock_version ) + 1,
+                ),
+                array( 'sn' => $sn ),
+                array( '%s', '%s', '%d' ),
+                array( '%s' )
+            );
+
+            // Final flip: transferred → registered with new owner
+            $wpdb->update( $tbl,
+                array(
+                    'status'             => 'registered',
+                    'prev_status'        => 'transferred',
+                    'registered_user_id' => $new_owner_id,
+                    'lock_version'       => ( (int) $plate->lock_version ) + 2,
+                ),
+                array( 'sn' => $sn ),
+                array( '%s', '%s', '%d', '%d' ),
+                array( '%s' )
+            );
+
+            $wpdb->query( "COMMIT" );
+
+            // Audit (defensive — never throws)
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                dinoco_sn_audit_log( $sn, 'plate_transferred',
+                    $plate->status, 'registered',
+                    array(
+                        'warranty_id'    => isset( $plate->registered_warranty_id ) ? (int) $plate->registered_warranty_id : 0,
+                        'old_owner_id'   => $old_owner_id,
+                        'new_owner_id'   => $new_owner_id,
+                        'source'         => 'manual_transfer_tool',
+                    )
+                );
+            }
+
+            return true;
+        } catch ( \Throwable $e ) {
+            $wpdb->query( "ROLLBACK" );
+            error_log( '[SN Transfer] ' . $e->getMessage() );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                @dinoco_obs_capture( $e, array( 'context' => 'sn_transfer_owner_by_sn', 'sn' => $sn ) );
+            }
+            return new WP_Error( 'transfer_failed', $e->getMessage(), array( 'status' => 500 ) );
+        } finally {
+            if ( $got_lock ) {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_transfer_owner' ) ) {
+    /**
+     * V.31.0 — Plan-spec wrapper: lookup sn_pool by registered_warranty_id.
+     *
+     * Used when caller has warranty_id (e.g. warranty_registration CPT context).
+     * Falls through to dinoco_sn_transfer_owner_by_sn() once SN resolved.
+     *
+     * @return true|WP_Error
+     */
+    function dinoco_sn_transfer_owner( $warranty_id, $old_owner_id, $new_owner_id ) {
+        global $wpdb;
+
+        $warranty_id = (int) $warranty_id;
+        if ( $warranty_id <= 0 ) return true;
+
+        $tbl = $wpdb->prefix . 'dinoco_sn_pool';
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        if ( ! $exists ) return true;
+
+        $sn = $wpdb->get_var( $wpdb->prepare(
+            "SELECT sn FROM {$tbl} WHERE registered_warranty_id = %d LIMIT 1",
+            $warranty_id
+        ) );
+        if ( ! $sn ) return true; // legacy warranty without sn_pool row — graceful
+
+        return dinoco_sn_transfer_owner_by_sn( $sn, $old_owner_id, $new_owner_id );
+    }
+}
