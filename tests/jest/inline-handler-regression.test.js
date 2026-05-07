@@ -127,7 +127,11 @@ const SNIPPET_PREFIXES = [
 // (claim/transfer/call-dealer/extend-warranty/report-stolen) +
 // collapsible history timeline toggles. All 3 snippets follow Phase 6
 // migration sweep plan — additive markers now, data-action refactor later.
-const BASELINE_INLINE_HANDLER_COUNT = 932;
+//
+// Bumped 932→935 (2026-05-07): Phase 3 W8.5 SC Quick Lookup mobile shortcode
+// added 3 onclick handlers: scan QR primary CTA + scan cancel + reset/back
+// to empty state. Mobile-first SC counter UX. Phase 6 migration sweep applies.
+const BASELINE_INLINE_HANDLER_COUNT = 935;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

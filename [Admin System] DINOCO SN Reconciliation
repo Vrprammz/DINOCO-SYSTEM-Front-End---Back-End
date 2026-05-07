@@ -1,0 +1,1805 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO SN Reconciliation                         ║
+ * ║  Version: V.0.1 (2026-05-05) — Phase 3 W8.3 quarterly count session║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync)   ║
+ * ║  Description: Quarterly physical stock count session vs sn_pool. ║
+ * ║    Admin starts session → scans plates → submits → variance      ║
+ * ║    review (missing/extra) → close with resolution (void_missing/ ║
+ * ║    investigate/cancel). 7-day SLA cron auto-cancels abandoned    ║
+ * ║    sessions. 4-eyes for variance > 5%. Telegram alert on close.  ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.0 §K.15
+ * Phase 3 W8.3 spec: docs/sn-system/16-phase3-w8-cron-infrastructure.md §W8.3
+ *
+ * REST endpoints registered:
+ *   POST   /dinoco-sn/v1/reconciliation/start
+ *   GET    /dinoco-sn/v1/reconciliation/active
+ *   GET    /dinoco-sn/v1/reconciliation/history
+ *   GET    /dinoco-sn/v1/reconciliation/(?P<uuid>[a-f0-9-]+)
+ *   POST   /dinoco-sn/v1/reconciliation/(?P<uuid>[a-f0-9-]+)/scan
+ *   POST   /dinoco-sn/v1/reconciliation/(?P<uuid>[a-f0-9-]+)/submit
+ *   POST   /dinoco-sn/v1/reconciliation/(?P<uuid>[a-f0-9-]+)/close
+ *
+ * Cron:
+ *   dinoco_sn_reconciliation_timeout_cron — daily 04:00
+ *     Auto-cancel sessions where status='counting' AND started_at > 7 days ago
+ *     Heartbeat: dinoco_cron_sn_reconciliation_timeout_last_run option
+ *
+ * Public helpers:
+ *   dinoco_sn_recon_start_session( $actor_user_id ) : array|WP_Error
+ *   dinoco_sn_recon_get_active_session()             : object|null
+ *   dinoco_sn_recon_record_scan( $uuid, $sn, $by )   : array|WP_Error
+ *   dinoco_sn_recon_submit_session( $uuid, $by )     : array|WP_Error
+ *   dinoco_sn_recon_close_session( $uuid, $by, $action ) : array|WP_Error
+ *   dinoco_sn_recon_get_variance_report( $uuid )     : array|WP_Error
+ *
+ * Dependencies (function_exists guarded — defensive):
+ *   - [Admin System] DINOCO Production SN Manager — table helpers + audit log
+ *   - [System] DINOCO SN REST API — namespace + idempotency wrapper + permissions
+ *   - [Admin System] DINOCO Idempotency Helper — POST replay protection
+ *   - [Admin System] DINOCO User Role Manager — capabilities
+ *
+ * Resolution actions:
+ *   'void_missing' — flip missing plates to status='voided' + reason 'lost during count'
+ *   'investigate'  — keep status as-is, flag for investigation (notes)
+ *   'cancel'       — close without changes (audit trail only)
+ *
+ * DESIGN PRINCIPLES
+ *   - ADDITIVE   — table installs lazily on admin_init; no other side effects
+ *   - DEFENSIVE  — all cross-snippet calls function_exists guarded
+ *   - ATOMIC     — GET_LOCK + START TRANSACTION + try/catch ROLLBACK + finally RELEASE_LOCK
+ *   - IDEMPOTENT — every POST uses dinoco_sn_with_idempotency() wrapper
+ *   - AUDIT      — every state transition logs via dinoco_sn_audit_log()
+ *   - 4-EYES     — variance > 5% requires admin (manage_options) close, defensive tier classify
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0. CONSTANTS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_SN_RECON_SCHEMA_VERSION' ) ) {
+    define( 'DINOCO_SN_RECON_SCHEMA_VERSION', '1.0' );
+}
+
+if ( ! defined( 'DINOCO_SN_RECON_TABLE_SESSIONS' ) ) {
+    define( 'DINOCO_SN_RECON_TABLE_SESSIONS', 'dinoco_sn_reconciliation_sessions' );
+}
+
+if ( ! defined( 'DINOCO_SN_RECON_TABLE_SCANS' ) ) {
+    define( 'DINOCO_SN_RECON_TABLE_SCANS', 'dinoco_sn_reconciliation_scans' );
+}
+
+if ( ! defined( 'DINOCO_SN_RECON_VALID_RESOLUTIONS' ) ) {
+    // Keep alphabetical for predictable ordering in admin dropdowns
+    define( 'DINOCO_SN_RECON_VALID_RESOLUTIONS', 'cancel,investigate,void_missing' );
+}
+
+if ( ! defined( 'DINOCO_SN_RECON_SLA_DAYS' ) ) {
+    // Auto-cancel any session in 'counting' status > 7 days old
+    define( 'DINOCO_SN_RECON_SLA_DAYS', 7 );
+}
+
+if ( ! defined( 'DINOCO_SN_RECON_4EYES_VARIANCE_PCT' ) ) {
+    // > 5% absolute variance (missing+extra / expected) triggers 4-eyes close gate
+    define( 'DINOCO_SN_RECON_4EYES_VARIANCE_PCT', 5 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. TABLE NAME + EXISTS HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_recon_table_sessions' ) ) {
+    function dinoco_sn_recon_table_sessions() {
+        global $wpdb;
+        return $wpdb->prefix . DINOCO_SN_RECON_TABLE_SESSIONS;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_table_scans' ) ) {
+    function dinoco_sn_recon_table_scans() {
+        global $wpdb;
+        return $wpdb->prefix . DINOCO_SN_RECON_TABLE_SCANS;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_tables_exist' ) ) {
+    function dinoco_sn_recon_tables_exist() {
+        global $wpdb;
+        $sessions = dinoco_sn_recon_table_sessions();
+        $scans    = dinoco_sn_recon_table_scans();
+        $count = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name IN ( %s, %s )",
+            DB_NAME, $sessions, $scans
+        ) );
+        return ( (int) $count ) >= 2;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. SCHEMA — lazy install on admin_init via dbDelta
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_recon_install_schema' ) ) {
+    /**
+     * Lazy install both tables. Idempotent via dbDelta. Sets
+     * `dinoco_sn_recon_schema_version` option after success.
+     *
+     * Pattern follows Approval Workflow V.0.1 — utf8mb4_bin on sn column
+     * via post-create ALTER (dbDelta does not support per-column COLLATE).
+     */
+    function dinoco_sn_recon_install_schema() {
+        global $wpdb;
+
+        $current = (string) get_option( 'dinoco_sn_recon_schema_version', '0.0' );
+        if ( version_compare( $current, DINOCO_SN_RECON_SCHEMA_VERSION, '>=' ) ) return;
+
+        $sessions = dinoco_sn_recon_table_sessions();
+        $scans    = dinoco_sn_recon_table_scans();
+        $charset  = $wpdb->get_charset_collate();
+
+        $sql_sessions = "CREATE TABLE {$sessions} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            session_uuid CHAR(36) NOT NULL,
+            initiated_by BIGINT UNSIGNED NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'counting',
+            expected_count INT UNSIGNED NOT NULL,
+            scanned_count INT UNSIGNED NOT NULL DEFAULT 0,
+            variance_missing INT NOT NULL DEFAULT 0,
+            variance_extra INT NOT NULL DEFAULT 0,
+            resolution_action VARCHAR(20) DEFAULT NULL,
+            notes TEXT,
+            started_at DATETIME NOT NULL,
+            submitted_at DATETIME DEFAULT NULL,
+            closed_at DATETIME DEFAULT NULL,
+            closed_by BIGINT UNSIGNED DEFAULT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uniq_uuid (session_uuid),
+            KEY idx_status (status, started_at),
+            KEY idx_initiator (initiated_by, started_at)
+        ) {$charset};";
+
+        $sql_scans = "CREATE TABLE {$scans} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            session_id BIGINT UNSIGNED NOT NULL,
+            sn VARCHAR(40) NOT NULL,
+            scanned_at DATETIME NOT NULL,
+            found_in_system TINYINT(1) NOT NULL DEFAULT 1,
+            scanned_by BIGINT UNSIGNED NOT NULL,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uq_session_sn (session_id, sn),
+            KEY idx_session (session_id, scanned_at)
+        ) {$charset};";
+
+        if ( ! function_exists( 'dbDelta' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        }
+        dbDelta( $sql_sessions );
+        dbDelta( $sql_scans );
+
+        // ALTER post-create to enforce utf8mb4_bin collation on sn column
+        // (case-sensitive S/N matching — DINOCO standard, mirrors sn_pool).
+        $wpdb->query( "ALTER TABLE {$scans} MODIFY sn VARCHAR(40) COLLATE utf8mb4_bin NOT NULL" );
+
+        update_option( 'dinoco_sn_recon_schema_version', DINOCO_SN_RECON_SCHEMA_VERSION, false );
+    }
+}
+
+if ( ! has_action( 'admin_init', 'dinoco_sn_recon_install_schema' ) ) {
+    add_action( 'admin_init', 'dinoco_sn_recon_install_schema', 36 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. UUID + VALIDATION HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_recon_generate_uuid' ) ) {
+    function dinoco_sn_recon_generate_uuid() {
+        if ( function_exists( 'wp_generate_uuid4' ) ) {
+            return wp_generate_uuid4();
+        }
+        try {
+            $data = random_bytes( 16 );
+        } catch ( \Throwable $e ) {
+            $data = openssl_random_pseudo_bytes( 16 );
+        }
+        $data[6] = chr( ord( $data[6] ) & 0x0f | 0x40 );
+        $data[8] = chr( ord( $data[8] ) & 0x3f | 0x80 );
+        return vsprintf( '%s%s-%s-%s-%s-%s%s%s', str_split( bin2hex( $data ), 4 ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_is_valid_uuid' ) ) {
+    function dinoco_sn_recon_is_valid_uuid( $uuid ) {
+        return is_string( $uuid ) && (bool) preg_match(
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i',
+            $uuid
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_valid_resolution' ) ) {
+    function dinoco_sn_recon_valid_resolution( $action ) {
+        $allowed = explode( ',', DINOCO_SN_RECON_VALID_RESOLUTIONS );
+        return in_array( strtolower( trim( (string) $action ) ), $allowed, true );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_compute_variance_pct' ) ) {
+    /**
+     * Compute absolute variance percentage of a session.
+     * Pure-logic — no DB. Returns float [0.0, +∞).
+     *
+     * Edge case: expected_count=0 → variance_pct=0 ถ้าทุกอย่าง 0 ก็ตาม
+     * (empty session is degenerate but not an error).
+     */
+    function dinoco_sn_recon_compute_variance_pct( $expected, $missing, $extra ) {
+        $expected = max( 0, (int) $expected );
+        $missing  = max( 0, (int) $missing );
+        $extra    = max( 0, (int) $extra );
+        if ( $expected === 0 ) {
+            // No baseline — any extra is 100% variance, otherwise 0
+            return $extra > 0 ? 100.0 : 0.0;
+        }
+        return ( ( $missing + $extra ) / $expected ) * 100.0;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_requires_4eyes' ) ) {
+    /**
+     * 4-eyes gate: variance > threshold (default 5%) must be closed by an
+     * admin with manage_options capability (regardless of warehouse role).
+     *
+     * Pure-logic — no DB. Threshold configurable via constant.
+     */
+    function dinoco_sn_recon_requires_4eyes( $expected, $missing, $extra ) {
+        $pct = dinoco_sn_recon_compute_variance_pct( $expected, $missing, $extra );
+        return $pct > (float) DINOCO_SN_RECON_4EYES_VARIANCE_PCT;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. CORE HELPERS — START / GET / SCAN / SUBMIT / CLOSE
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_recon_get_active_session' ) ) {
+    /**
+     * Return current open session (status='counting' OR 'submitted') or null.
+     * Defensive: null if tables not yet installed.
+     */
+    function dinoco_sn_recon_get_active_session() {
+        if ( ! dinoco_sn_recon_tables_exist() ) return null;
+        global $wpdb;
+        $tbl = dinoco_sn_recon_table_sessions();
+        return $wpdb->get_row(
+            "SELECT * FROM {$tbl}
+             WHERE status IN ( 'counting', 'submitted' )
+             ORDER BY started_at DESC
+             LIMIT 1"
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_start_session' ) ) {
+    /**
+     * Atomic start. Snapshots `expected_count = COUNT(in_pool)` + INSERT.
+     * Blocks if existing session is counting or submitted (409).
+     *
+     * @param int $actor_user_id Defaults to current user
+     * @return array|WP_Error    { uuid, expected_count, started_at } | error
+     */
+    function dinoco_sn_recon_start_session( $actor_user_id = 0 ) {
+        global $wpdb;
+
+        $actor_user_id = (int) ( $actor_user_id ?: get_current_user_id() );
+        if ( $actor_user_id <= 0 ) {
+            return new WP_Error( 'invalid_actor',
+                __( 'Actor user ID required.', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+
+        // Defensive: ensure schema installed
+        if ( ! dinoco_sn_recon_tables_exist() ) {
+            if ( function_exists( 'dinoco_sn_recon_install_schema' ) ) {
+                dinoco_sn_recon_install_schema();
+            }
+            if ( ! dinoco_sn_recon_tables_exist() ) {
+                return new WP_Error( 'schema_not_ready',
+                    __( 'Reconciliation tables not installed.', 'dinoco-sn' ),
+                    array( 'status' => 503 ) );
+            }
+        }
+
+        // Pool table required — we snapshot in_pool count from there
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
+            return new WP_Error( 'pool_not_ready',
+                __( 'sn_pool table missing.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        $sessions = dinoco_sn_recon_table_sessions();
+        $pool     = dinoco_sn_table( 'pool' );
+        $lock_name = 'dnc_sn_recon_start';
+
+        // GET_LOCK to serialize concurrent start attempts (race protection)
+        $got = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_name ) );
+        if ( $got !== 1 ) {
+            return new WP_Error( 'lock_timeout',
+                __( 'Another reconciliation start in progress.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                // Block if any active session exists
+                $active = $wpdb->get_var(
+                    "SELECT id FROM {$sessions}
+                     WHERE status IN ( 'counting', 'submitted' )
+                     LIMIT 1"
+                );
+                if ( $active ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'session_active',
+                        __( 'An active reconciliation session already exists. Close it before starting a new one.', 'dinoco-sn' ),
+                        array( 'status' => 409 ) );
+                }
+
+                $expected = (int) $wpdb->get_var(
+                    "SELECT COUNT(*) FROM {$pool} WHERE status = 'in_pool'"
+                );
+
+                $uuid = dinoco_sn_recon_generate_uuid();
+                $now  = current_time( 'mysql' );
+
+                $ok = $wpdb->insert( $sessions, array(
+                    'session_uuid'     => $uuid,
+                    'initiated_by'     => $actor_user_id,
+                    'status'           => 'counting',
+                    'expected_count'   => $expected,
+                    'scanned_count'    => 0,
+                    'variance_missing' => 0,
+                    'variance_extra'   => 0,
+                    'started_at'       => $now,
+                ) );
+
+                if ( ! $ok ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'insert_failed',
+                        __( 'Could not start reconciliation session.', 'dinoco-sn' ),
+                        array( 'status' => 500 ) );
+                }
+
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log(
+                        '', 'reconciliation_started', null, 'counting',
+                        array( 'session_uuid' => $uuid, 'expected' => $expected ),
+                        $actor_user_id, null, '', 'reconciliation', false
+                    );
+                }
+                if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                    dinoco_sn_obs_capture( 'reconciliation_started', array(
+                        'uuid' => $uuid, 'expected' => $expected, 'actor' => $actor_user_id,
+                    ) );
+                }
+
+                $wpdb->query( 'COMMIT' );
+
+                return array(
+                    'uuid'           => $uuid,
+                    'expected_count' => $expected,
+                    'started_at'     => $now,
+                );
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                    dinoco_sn_obs_capture( $e, array( 'context' => 'sn_recon_start' ) );
+                }
+                return new WP_Error( 'start_failed', $e->getMessage(), array( 'status' => 500 ) );
+            }
+        } finally {
+            // Always release lock
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_get_session_by_uuid' ) ) {
+    function dinoco_sn_recon_get_session_by_uuid( $uuid ) {
+        if ( ! dinoco_sn_recon_is_valid_uuid( $uuid ) ) return null;
+        if ( ! dinoco_sn_recon_tables_exist() ) return null;
+        global $wpdb;
+        $tbl = dinoco_sn_recon_table_sessions();
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$tbl} WHERE session_uuid = %s LIMIT 1", $uuid
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_record_scan' ) ) {
+    /**
+     * Idempotent scan record. Atomic check session active + check sn exists
+     * in sn_pool. INSERT scan row (UNIQUE KEY uq_session_sn prevents dup).
+     * Updates sessions.scanned_count.
+     *
+     * Defensive: dup-scan returns existing record (idempotent — admin scans
+     * same plate twice). UNIQUE constraint catches race.
+     *
+     * @return array|WP_Error  { scanned_count, found_in_system, sn, message, dup }
+     */
+    function dinoco_sn_recon_record_scan( $uuid, $sn, $scanner_user_id = 0 ) {
+        global $wpdb;
+
+        if ( ! dinoco_sn_recon_is_valid_uuid( $uuid ) ) {
+            return new WP_Error( 'invalid_uuid', __( 'Invalid session UUID.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) {
+            return new WP_Error( 'invalid_sn', __( 'sn is required.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        $scanner_user_id = (int) ( $scanner_user_id ?: get_current_user_id() );
+        if ( $scanner_user_id <= 0 ) {
+            return new WP_Error( 'invalid_actor', __( 'Scanner user required.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( ! dinoco_sn_recon_tables_exist() ) {
+            return new WP_Error( 'schema_not_ready',
+                __( 'Reconciliation tables not installed.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        $sessions = dinoco_sn_recon_table_sessions();
+        $scans    = dinoco_sn_recon_table_scans();
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            // Lock session row + check status
+            $session = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, status, scanned_count FROM {$sessions}
+                 WHERE session_uuid = %s FOR UPDATE",
+                $uuid
+            ), ARRAY_A );
+
+            if ( ! $session ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'session_not_found',
+                    __( 'Session not found.', 'dinoco-sn' ),
+                    array( 'status' => 404 ) );
+            }
+            if ( $session['status'] !== 'counting' ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'session_not_counting',
+                    sprintf( __( 'Session is %s; cannot accept new scans.', 'dinoco-sn' ), $session['status'] ),
+                    array( 'status' => 409, 'current_status' => $session['status'] ) );
+            }
+
+            $session_id = (int) $session['id'];
+
+            // Look up plate in sn_pool to set found_in_system
+            $found = 0;
+            if ( function_exists( 'dinoco_sn_table_exists' ) && dinoco_sn_table_exists( 'pool' ) ) {
+                $pool = dinoco_sn_table( 'pool' );
+                $exists = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$pool}
+                     WHERE sn = %s AND status = 'in_pool'",
+                    $sn
+                ) );
+                $found = ( (int) $exists > 0 ) ? 1 : 0;
+            }
+
+            $now = current_time( 'mysql' );
+            $ins_ok = $wpdb->insert( $scans, array(
+                'session_id'      => $session_id,
+                'sn'              => $sn,
+                'scanned_at'      => $now,
+                'found_in_system' => $found,
+                'scanned_by'      => $scanner_user_id,
+            ) );
+
+            if ( ! $ins_ok ) {
+                // Most likely UNIQUE KEY violation on (session_id, sn) — duplicate scan.
+                // Treat as idempotent — return existing record + dup=true.
+                $existing = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT id, scanned_at, found_in_system FROM {$scans}
+                     WHERE session_id = %d AND sn = %s LIMIT 1",
+                    $session_id, $sn
+                ), ARRAY_A );
+                if ( $existing ) {
+                    $wpdb->query( 'COMMIT' ); // no-op commit (no writes happened)
+                    return array(
+                        'scanned_count'    => (int) $session['scanned_count'],
+                        'found_in_system'  => (int) $existing['found_in_system'] === 1,
+                        'sn'               => $sn,
+                        'message'          => 'duplicate_scan_idempotent',
+                        'dup'              => true,
+                    );
+                }
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'scan_insert_failed',
+                    __( 'Could not record scan.', 'dinoco-sn' ),
+                    array( 'status' => 500 ) );
+            }
+
+            // Bump scanned_count atomically
+            $wpdb->query( $wpdb->prepare(
+                "UPDATE {$sessions} SET scanned_count = scanned_count + 1
+                 WHERE id = %d AND status = 'counting'",
+                $session_id
+            ) );
+
+            $wpdb->query( 'COMMIT' );
+
+            $new_count = (int) $session['scanned_count'] + 1;
+            return array(
+                'scanned_count'   => $new_count,
+                'found_in_system' => $found === 1,
+                'sn'              => $sn,
+                'message'         => $found ? 'recorded' : 'recorded_unknown_sn',
+                'dup'             => false,
+            );
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                dinoco_sn_obs_capture( $e, array( 'context' => 'sn_recon_scan', 'sn' => $sn, 'uuid' => $uuid ) );
+            }
+            return new WP_Error( 'scan_failed', $e->getMessage(), array( 'status' => 500 ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_submit_session' ) ) {
+    /**
+     * Atomic compute variance + flip status counting → submitted.
+     *   missing = sn_pool WHERE status='in_pool' AND sn NOT IN (scans this session)
+     *   extra   = scans WHERE found_in_system=0 (sn not in_pool at scan time)
+     *
+     * Note: extra computed at SCAN time (not submit) to match boss spec —
+     * pool can mutate between scans + submit; we use scan snapshot.
+     *
+     * @return array|WP_Error  { variance_missing, variance_extra, missing_sns[], extra_sns[], variance_pct, requires_4eyes }
+     */
+    function dinoco_sn_recon_submit_session( $uuid, $actor_user_id = 0 ) {
+        global $wpdb;
+
+        if ( ! dinoco_sn_recon_is_valid_uuid( $uuid ) ) {
+            return new WP_Error( 'invalid_uuid', __( 'Invalid session UUID.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        $actor_user_id = (int) ( $actor_user_id ?: get_current_user_id() );
+        if ( ! dinoco_sn_recon_tables_exist() ) {
+            return new WP_Error( 'schema_not_ready',
+                __( 'Reconciliation tables not installed.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        $sessions = dinoco_sn_recon_table_sessions();
+        $scans    = dinoco_sn_recon_table_scans();
+        $lock_name = 'dnc_sn_recon_sub_' . substr( md5( $uuid ), 0, 16 );
+
+        $got = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_name ) );
+        if ( $got !== 1 ) {
+            return new WP_Error( 'lock_timeout',
+                __( 'Concurrent submit in progress.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                $session = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT id, status, expected_count, scanned_count FROM {$sessions}
+                     WHERE session_uuid = %s FOR UPDATE",
+                    $uuid
+                ), ARRAY_A );
+
+                if ( ! $session ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'session_not_found',
+                        __( 'Session not found.', 'dinoco-sn' ),
+                        array( 'status' => 404 ) );
+                }
+                if ( $session['status'] !== 'counting' ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'invalid_state',
+                        sprintf( __( 'Session is %s; cannot submit.', 'dinoco-sn' ), $session['status'] ),
+                        array( 'status' => 409, 'current_status' => $session['status'] ) );
+                }
+
+                $session_id = (int) $session['id'];
+
+                // Compute MISSING — in_pool plates not scanned this session
+                $missing_sns = array();
+                if ( function_exists( 'dinoco_sn_table_exists' ) && dinoco_sn_table_exists( 'pool' ) ) {
+                    $pool = dinoco_sn_table( 'pool' );
+                    $rows = $wpdb->get_col( $wpdb->prepare(
+                        "SELECT p.sn FROM {$pool} p
+                         WHERE p.status = 'in_pool'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM {$scans} s
+                               WHERE s.session_id = %d AND s.sn = p.sn
+                           )
+                         LIMIT 5000",
+                        $session_id
+                    ) );
+                    $missing_sns = is_array( $rows ) ? $rows : array();
+                }
+
+                // Compute EXTRA — scanned but not found_in_system at scan time
+                $extra_sns = $wpdb->get_col( $wpdb->prepare(
+                    "SELECT sn FROM {$scans}
+                     WHERE session_id = %d AND found_in_system = 0
+                     LIMIT 5000",
+                    $session_id
+                ) );
+                if ( ! is_array( $extra_sns ) ) $extra_sns = array();
+
+                $missing_count = count( $missing_sns );
+                $extra_count   = count( $extra_sns );
+
+                $now = current_time( 'mysql' );
+                $upd = $wpdb->update( $sessions,
+                    array(
+                        'status'           => 'submitted',
+                        'variance_missing' => $missing_count,
+                        'variance_extra'   => $extra_count,
+                        'submitted_at'     => $now,
+                    ),
+                    array( 'id' => $session_id, 'status' => 'counting' ) // optimistic
+                );
+                if ( $upd === false || $upd === 0 ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'concurrent_modification',
+                        __( 'Status changed during submit. Retry.', 'dinoco-sn' ),
+                        array( 'status' => 409 ) );
+                }
+
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log(
+                        '', 'reconciliation_submitted', 'counting', 'submitted',
+                        array(
+                            'session_uuid' => $uuid,
+                            'missing'      => $missing_count,
+                            'extra'        => $extra_count,
+                            'expected'     => (int) $session['expected_count'],
+                            'scanned'      => (int) $session['scanned_count'],
+                        ),
+                        $actor_user_id, null, '', 'reconciliation', false
+                    );
+                }
+                if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                    dinoco_sn_obs_capture( 'reconciliation_submitted', array(
+                        'uuid' => $uuid, 'missing' => $missing_count, 'extra' => $extra_count,
+                    ) );
+                }
+
+                $wpdb->query( 'COMMIT' );
+
+                $variance_pct = dinoco_sn_recon_compute_variance_pct(
+                    (int) $session['expected_count'], $missing_count, $extra_count
+                );
+                $requires_4eyes = dinoco_sn_recon_requires_4eyes(
+                    (int) $session['expected_count'], $missing_count, $extra_count
+                );
+
+                return array(
+                    'variance_missing' => $missing_count,
+                    'variance_extra'   => $extra_count,
+                    'variance_pct'     => round( $variance_pct, 2 ),
+                    'missing_sns'      => $missing_sns,
+                    'extra_sns'        => $extra_sns,
+                    'requires_4eyes'   => $requires_4eyes,
+                );
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                    dinoco_sn_obs_capture( $e, array( 'context' => 'sn_recon_submit', 'uuid' => $uuid ) );
+                }
+                return new WP_Error( 'submit_failed', $e->getMessage(), array( 'status' => 500 ) );
+            }
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_close_session' ) ) {
+    /**
+     * Close session with resolution. Atomic.
+     *
+     *   'void_missing' → loop missing → flip plate status → 'voided' (per-plate
+     *                    audit + reason 'lost during count'); admin-only if
+     *                    variance > 5% (4-eyes gate)
+     *   'investigate'  → keep plates as-is, store notes, mark closed
+     *   'cancel'       → close without changes (audit only)
+     *
+     * @return array|WP_Error  { resolution_action, voided_count, variance_pct, telegram_alert_sent }
+     */
+    function dinoco_sn_recon_close_session( $uuid, $actor_user_id = 0, $resolution_action = 'cancel', $notes = '' ) {
+        global $wpdb;
+
+        if ( ! dinoco_sn_recon_is_valid_uuid( $uuid ) ) {
+            return new WP_Error( 'invalid_uuid', __( 'Invalid session UUID.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( ! dinoco_sn_recon_valid_resolution( $resolution_action ) ) {
+            return new WP_Error( 'invalid_resolution',
+                __( 'resolution_action must be void_missing|investigate|cancel.', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        $actor_user_id = (int) ( $actor_user_id ?: get_current_user_id() );
+        if ( ! dinoco_sn_recon_tables_exist() ) {
+            return new WP_Error( 'schema_not_ready',
+                __( 'Reconciliation tables not installed.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        $sessions = dinoco_sn_recon_table_sessions();
+        $scans    = dinoco_sn_recon_table_scans();
+        $resolution_action = strtolower( trim( (string) $resolution_action ) );
+        $notes = mb_substr( (string) $notes, 0, 2000 );
+
+        $lock_name = 'dnc_sn_recon_close_' . substr( md5( $uuid ), 0, 16 );
+        $got = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_name ) );
+        if ( $got !== 1 ) {
+            return new WP_Error( 'lock_timeout',
+                __( 'Concurrent close in progress.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                $session = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT id, status, expected_count, variance_missing, variance_extra
+                     FROM {$sessions} WHERE session_uuid = %s FOR UPDATE",
+                    $uuid
+                ), ARRAY_A );
+
+                if ( ! $session ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'session_not_found',
+                        __( 'Session not found.', 'dinoco-sn' ),
+                        array( 'status' => 404 ) );
+                }
+                // Allow close from BOTH counting (admin force-close) AND submitted (normal flow)
+                if ( ! in_array( $session['status'], array( 'counting', 'submitted' ), true ) ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'invalid_state',
+                        sprintf( __( 'Session is %s; cannot close.', 'dinoco-sn' ), $session['status'] ),
+                        array( 'status' => 409, 'current_status' => $session['status'] ) );
+                }
+
+                // 4-eyes gate — if variance > 5%, require admin manage_options
+                $expected = (int) $session['expected_count'];
+                $missing  = (int) $session['variance_missing'];
+                $extra    = (int) $session['variance_extra'];
+                $needs_4eyes = dinoco_sn_recon_requires_4eyes( $expected, $missing, $extra );
+
+                if ( $needs_4eyes && ! current_user_can( 'manage_options' ) ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'requires_4eyes',
+                        sprintf( __( 'Variance > %d%% requires admin (manage_options) to close.', 'dinoco-sn' ),
+                                 (int) DINOCO_SN_RECON_4EYES_VARIANCE_PCT ),
+                        array( 'status' => 422 ) );
+                }
+
+                $session_id = (int) $session['id'];
+                $voided_count = 0;
+
+                if ( $resolution_action === 'void_missing'
+                     && function_exists( 'dinoco_sn_table_exists' )
+                     && dinoco_sn_table_exists( 'pool' ) ) {
+
+                    $pool = dinoco_sn_table( 'pool' );
+
+                    // Re-derive missing list at close time (defensive — pool may
+                    // have shifted since submit). Use NOT EXISTS subquery.
+                    $missing_sns = $wpdb->get_col( $wpdb->prepare(
+                        "SELECT p.sn FROM {$pool} p
+                         WHERE p.status = 'in_pool'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM {$scans} s
+                               WHERE s.session_id = %d AND s.sn = p.sn
+                           )
+                         LIMIT 5000",
+                        $session_id
+                    ) );
+
+                    if ( is_array( $missing_sns ) && ! empty( $missing_sns ) ) {
+                        foreach ( $missing_sns as $sn ) {
+                            $sn = strtoupper( trim( (string) $sn ) );
+                            if ( $sn === '' ) continue;
+                            // Per-plate UPDATE — optimistic on status='in_pool' to avoid stomping
+                            // any race-arrived registration.
+                            $r = $wpdb->update( $pool,
+                                array(
+                                    'status'      => 'voided',
+                                    'prev_status' => 'in_pool',
+                                    'voided_at'   => current_time( 'mysql' ),
+                                ),
+                                array( 'sn' => $sn, 'status' => 'in_pool' )
+                            );
+                            if ( $r ) {
+                                $voided_count++;
+                                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                                    dinoco_sn_audit_log(
+                                        $sn, 'plate_voided', 'in_pool', 'voided',
+                                        array( 'reconciliation_uuid' => $uuid ),
+                                        $actor_user_id, null,
+                                        'lost during count', 'reconciliation_void', false
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Flip session → closed
+                $now = current_time( 'mysql' );
+                $upd = $wpdb->update( $sessions,
+                    array(
+                        'status'            => $resolution_action === 'cancel' && $session['status'] === 'counting'
+                                                  ? 'cancelled' : 'closed',
+                        'resolution_action' => $resolution_action,
+                        'notes'             => $notes !== '' ? $notes : null,
+                        'closed_at'         => $now,
+                        'closed_by'         => $actor_user_id,
+                    ),
+                    array( 'id' => $session_id )
+                );
+                if ( $upd === false ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'close_failed',
+                        __( 'Could not close session.', 'dinoco-sn' ),
+                        array( 'status' => 500 ) );
+                }
+
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log(
+                        '', 'reconciliation_closed', $session['status'],
+                        $resolution_action === 'cancel' && $session['status'] === 'counting' ? 'cancelled' : 'closed',
+                        array(
+                            'session_uuid'      => $uuid,
+                            'resolution_action' => $resolution_action,
+                            'voided_count'      => $voided_count,
+                            'variance_missing'  => $missing,
+                            'variance_extra'    => $extra,
+                            'variance_pct'      => round( dinoco_sn_recon_compute_variance_pct( $expected, $missing, $extra ), 2 ),
+                        ),
+                        $actor_user_id, null, $notes, 'reconciliation_close',
+                        $needs_4eyes  // sensitive=true if 4-eyes was required (5y retention)
+                    );
+                }
+
+                $wpdb->query( 'COMMIT' );
+
+                $variance_pct = dinoco_sn_recon_compute_variance_pct( $expected, $missing, $extra );
+                $telegram_sent = false;
+
+                // Telegram alert บอส if variance > 5% (defensive function_exists)
+                if ( $needs_4eyes && function_exists( 'b2b_tg_send_dedup' ) ) {
+                    $msg = sprintf(
+                        "⚠️ S/N Reconciliation closed with HIGH variance\n"
+                        . "Session: %s\n"
+                        . "Variance: %.2f%% (missing=%d, extra=%d, expected=%d)\n"
+                        . "Resolution: %s%s\n"
+                        . "Voided: %d plates\n"
+                        . "Closed by user #%d",
+                        $uuid, $variance_pct, $missing, $extra, $expected,
+                        $resolution_action,
+                        $resolution_action === 'void_missing' ? ' (auto-voided missing plates)' : '',
+                        $voided_count, $actor_user_id
+                    );
+                    try {
+                        b2b_tg_send_dedup( 'sn_recon_close_' . $uuid, $msg, 86400 );
+                        $telegram_sent = true;
+                    } catch ( \Throwable $e ) {
+                        // Best-effort — never throw from notification path
+                    }
+                }
+
+                if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                    dinoco_sn_obs_capture( 'reconciliation_closed', array(
+                        'uuid' => $uuid, 'resolution' => $resolution_action,
+                        'voided_count' => $voided_count, 'variance_pct' => round( $variance_pct, 2 ),
+                    ) );
+                }
+
+                return array(
+                    'resolution_action'   => $resolution_action,
+                    'voided_count'        => $voided_count,
+                    'variance_pct'        => round( $variance_pct, 2 ),
+                    'telegram_alert_sent' => $telegram_sent,
+                );
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+                    dinoco_sn_obs_capture( $e, array( 'context' => 'sn_recon_close', 'uuid' => $uuid ) );
+                }
+                return new WP_Error( 'close_failed', $e->getMessage(), array( 'status' => 500 ) );
+            }
+        } finally {
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_get_variance_report' ) ) {
+    /**
+     * Read-only variance report. Returns missing[]+extra[] SNs with metadata.
+     * Safe to call on submitted OR closed sessions.
+     */
+    function dinoco_sn_recon_get_variance_report( $uuid ) {
+        global $wpdb;
+        if ( ! dinoco_sn_recon_is_valid_uuid( $uuid ) ) {
+            return new WP_Error( 'invalid_uuid', __( 'Invalid session UUID.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( ! dinoco_sn_recon_tables_exist() ) {
+            return new WP_Error( 'schema_not_ready',
+                __( 'Reconciliation tables not installed.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        $sessions = dinoco_sn_recon_table_sessions();
+        $scans    = dinoco_sn_recon_table_scans();
+
+        $session = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$sessions} WHERE session_uuid = %s LIMIT 1", $uuid
+        ), ARRAY_A );
+        if ( ! $session ) {
+            return new WP_Error( 'session_not_found',
+                __( 'Session not found.', 'dinoco-sn' ),
+                array( 'status' => 404 ) );
+        }
+
+        $session_id = (int) $session['id'];
+        $missing = array();
+        $extra   = array();
+
+        if ( function_exists( 'dinoco_sn_table_exists' ) && dinoco_sn_table_exists( 'pool' ) ) {
+            $pool = dinoco_sn_table( 'pool' );
+            $missing = $wpdb->get_col( $wpdb->prepare(
+                "SELECT p.sn FROM {$pool} p
+                 WHERE p.status = 'in_pool'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {$scans} s WHERE s.session_id = %d AND s.sn = p.sn
+                   )
+                 LIMIT 5000",
+                $session_id
+            ) );
+            $missing = is_array( $missing ) ? $missing : array();
+        }
+
+        $extra = $wpdb->get_col( $wpdb->prepare(
+            "SELECT sn FROM {$scans}
+             WHERE session_id = %d AND found_in_system = 0
+             LIMIT 5000",
+            $session_id
+        ) );
+        $extra = is_array( $extra ) ? $extra : array();
+
+        return array(
+            'session'      => $session,
+            'missing_sns'  => $missing,
+            'extra_sns'    => $extra,
+            'variance_pct' => round( dinoco_sn_recon_compute_variance_pct(
+                (int) $session['expected_count'],
+                (int) $session['variance_missing'],
+                (int) $session['variance_extra']
+            ), 2 ),
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. SLA CRON — auto-cancel sessions older than 7 days
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_run_reconciliation_timeout' ) ) {
+    /**
+     * Daily 04:00 — find sessions where status='counting' AND started_at older
+     * than 7 days. Auto-flip to status='cancelled' + write Telegram alert.
+     *
+     * Heartbeat: dinoco_cron_sn_reconciliation_timeout_last_run option
+     * (Round 28+ Health Monitor pattern).
+     */
+    function dinoco_sn_run_reconciliation_timeout() {
+        if ( ! dinoco_sn_recon_tables_exist() ) {
+            update_option( 'dinoco_cron_sn_reconciliation_timeout_last_run', current_time( 'mysql' ) );
+            return;
+        }
+
+        try {
+            global $wpdb;
+            $tbl = dinoco_sn_recon_table_sessions();
+            $cutoff = gmdate( 'Y-m-d H:i:s', time() - DINOCO_SN_RECON_SLA_DAYS * 86400 );
+
+            $stale = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, session_uuid, initiated_by, expected_count, scanned_count, started_at
+                 FROM {$tbl}
+                 WHERE status = 'counting' AND started_at < %s
+                 LIMIT 50",
+                $cutoff
+            ), ARRAY_A );
+
+            if ( ! is_array( $stale ) ) $stale = array();
+            $cancelled = 0;
+
+            foreach ( $stale as $row ) {
+                $upd = $wpdb->update( $tbl,
+                    array(
+                        'status'            => 'cancelled',
+                        'resolution_action' => 'cancel',
+                        'notes'             => 'auto-cancelled by SLA cron (>' . DINOCO_SN_RECON_SLA_DAYS . ' days)',
+                        'closed_at'         => current_time( 'mysql' ),
+                    ),
+                    array( 'id' => (int) $row['id'], 'status' => 'counting' )
+                );
+                if ( $upd ) {
+                    $cancelled++;
+                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                        dinoco_sn_audit_log(
+                            '', 'reconciliation_auto_cancelled', 'counting', 'cancelled',
+                            array(
+                                'session_uuid' => $row['session_uuid'],
+                                'reason'       => 'sla_timeout',
+                                'started_at'   => $row['started_at'],
+                            ),
+                            0, null, '', 'reconciliation_sla', false
+                        );
+                    }
+                    if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                        $msg = sprintf(
+                            "⏰ S/N Reconciliation auto-cancelled (SLA %dd)\n"
+                            . "Session: %s\n"
+                            . "Started: %s\n"
+                            . "Initiated by: user #%d\n"
+                            . "Progress: %d/%d scanned",
+                            DINOCO_SN_RECON_SLA_DAYS,
+                            $row['session_uuid'],
+                            $row['started_at'],
+                            (int) $row['initiated_by'],
+                            (int) $row['scanned_count'],
+                            (int) $row['expected_count']
+                        );
+                        try {
+                            b2b_tg_send_dedup( 'sn_recon_sla_' . $row['session_uuid'], $msg, 86400 );
+                        } catch ( \Throwable $e ) {
+                            // Best-effort
+                        }
+                    }
+                }
+            }
+
+            update_option( 'dinoco_sn_recon_last_sla_run', array(
+                'at'        => current_time( 'mysql' ),
+                'cancelled' => $cancelled,
+                'scanned'   => count( $stale ),
+            ), false );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_reconciliation_timeout' ) );
+            }
+        }
+
+        update_option( 'dinoco_cron_sn_reconciliation_timeout_last_run', current_time( 'mysql' ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_register_cron' ) ) {
+    function dinoco_sn_recon_register_cron() {
+        // Use dinoco_register_cron heartbeat pattern (Round 28+) if available
+        if ( function_exists( 'dinoco_register_cron' ) ) {
+            dinoco_register_cron(
+                'dinoco_sn_reconciliation_timeout_cron',
+                'daily',
+                'dinoco_sn_run_reconciliation_timeout'
+            );
+            return;
+        }
+
+        // Fallback — plain WP-Cron schedule + action
+        if ( ! wp_next_scheduled( 'dinoco_sn_reconciliation_timeout_cron' ) ) {
+            wp_schedule_event( time() + 60, 'daily', 'dinoco_sn_reconciliation_timeout_cron' );
+        }
+        if ( ! has_action( 'dinoco_sn_reconciliation_timeout_cron', 'dinoco_sn_run_reconciliation_timeout' ) ) {
+            add_action( 'dinoco_sn_reconciliation_timeout_cron', 'dinoco_sn_run_reconciliation_timeout' );
+        }
+    }
+}
+
+if ( ! has_action( 'init', 'dinoco_sn_recon_register_cron' ) ) {
+    add_action( 'init', 'dinoco_sn_recon_register_cron', 35 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. PERMISSION CALLBACKS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_recon_perm_warehouse_or_admin' ) ) {
+    /**
+     * Warehouse staff (dinoco_sn_warehouse cap) OR admin (manage_options).
+     * Used for start/scan/submit/active/get/history.
+     */
+    function dinoco_sn_recon_perm_warehouse_or_admin( $req ) {
+        if ( current_user_can( 'manage_options' ) ) return true;
+        if ( current_user_can( 'dinoco_sn_warehouse' ) ) return true;
+        if ( function_exists( 'dinoco_sn_user_can_warehouse' ) && dinoco_sn_user_can_warehouse() ) {
+            return true;
+        }
+        return new WP_Error( 'rest_forbidden',
+            __( 'Warehouse or admin role required.', 'dinoco-sn' ),
+            array( 'status' => 403 ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_perm_admin' ) ) {
+    /**
+     * Admin only (manage_options) — used for close (4-eyes gate enforced inside).
+     */
+    function dinoco_sn_recon_perm_admin( $req ) {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'rest_forbidden',
+                __( 'Admin (manage_options) required.', 'dinoco-sn' ),
+                array( 'status' => 403 ) );
+        }
+        return true;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. REST ENDPOINT REGISTRATION
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_recon_register_routes' ) ) {
+    function dinoco_sn_recon_register_routes() {
+        if ( ! defined( 'DINOCO_SN_REST_NAMESPACE' ) ) return; // REST API snippet not synced
+
+        $ns = DINOCO_SN_REST_NAMESPACE;
+        $perm_we = function_exists( 'dinoco_sn_recon_perm_warehouse_or_admin' )
+                     ? 'dinoco_sn_recon_perm_warehouse_or_admin' : '__return_true';
+        $perm_admin = function_exists( 'dinoco_sn_recon_perm_admin' )
+                        ? 'dinoco_sn_recon_perm_admin' : '__return_true';
+
+        // POST /reconciliation/start
+        register_rest_route( $ns, '/reconciliation/start', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_recon_start',
+            'permission_callback' => $perm_we,
+            'args'                => array(
+                'actor_user_id' => array( 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /reconciliation/active
+        register_rest_route( $ns, '/reconciliation/active', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_recon_active',
+            'permission_callback' => $perm_we,
+        ) );
+
+        // GET /reconciliation/history
+        register_rest_route( $ns, '/reconciliation/history', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_recon_history',
+            'permission_callback' => $perm_admin,
+            'args'                => array(
+                'limit'  => array( 'type' => 'integer', 'default' => 20, 'sanitize_callback' => 'absint' ),
+                'offset' => array( 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /reconciliation/{uuid}
+        register_rest_route( $ns, '/reconciliation/(?P<uuid>[a-f0-9\-]{36})', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_recon_get',
+            'permission_callback' => $perm_we,
+            'args'                => array(
+                'uuid' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+            ),
+        ) );
+
+        // POST /reconciliation/{uuid}/scan
+        register_rest_route( $ns, '/reconciliation/(?P<uuid>[a-f0-9\-]{36})/scan', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_recon_scan',
+            'permission_callback' => $perm_we,
+            'args'                => array(
+                'uuid' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'sn'   => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+            ),
+        ) );
+
+        // POST /reconciliation/{uuid}/submit
+        register_rest_route( $ns, '/reconciliation/(?P<uuid>[a-f0-9\-]{36})/submit', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_recon_submit',
+            'permission_callback' => $perm_we,
+            'args'                => array(
+                'uuid' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+            ),
+        ) );
+
+        // POST /reconciliation/{uuid}/close
+        register_rest_route( $ns, '/reconciliation/(?P<uuid>[a-f0-9\-]{36})/close', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_recon_close',
+            'permission_callback' => $perm_admin,
+            'args'                => array(
+                'uuid' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'resolution_action' => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                    'enum'              => array( 'void_missing', 'investigate', 'cancel' ),
+                ),
+                'notes' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+    }
+}
+
+if ( ! has_action( 'rest_api_init', 'dinoco_sn_recon_register_routes' ) ) {
+    add_action( 'rest_api_init', 'dinoco_sn_recon_register_routes', 22 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. REST CALLBACKS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_recon_start' ) ) {
+    function dinoco_sn_rest_recon_start( $req ) {
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'reconciliation-start',
+                array( 'actor_user_id' ),
+                function( $req ) {
+                    $actor = (int) $req->get_param( 'actor_user_id' );
+                    $r = dinoco_sn_recon_start_session( $actor );
+                    if ( is_wp_error( $r ) ) return $r;
+                    return rest_ensure_response( array_merge( array( 'success' => true ), $r ) );
+                }
+            );
+        }
+        $actor = (int) $req->get_param( 'actor_user_id' );
+        $r = dinoco_sn_recon_start_session( $actor );
+        if ( is_wp_error( $r ) ) return $r;
+        return rest_ensure_response( array_merge( array( 'success' => true ), $r ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_recon_active' ) ) {
+    function dinoco_sn_rest_recon_active( $req ) {
+        $session = dinoco_sn_recon_get_active_session();
+        return rest_ensure_response( array(
+            'success' => true,
+            'session' => $session ?: null,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_recon_history' ) ) {
+    function dinoco_sn_rest_recon_history( $req ) {
+        if ( ! dinoco_sn_recon_tables_exist() ) {
+            return rest_ensure_response( array( 'success' => true, 'sessions' => array() ) );
+        }
+        global $wpdb;
+        $tbl = dinoco_sn_recon_table_sessions();
+        $limit  = min( 100, max( 1, (int) $req->get_param( 'limit' ) ) );
+        $offset = max( 0, (int) $req->get_param( 'offset' ) );
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$tbl}
+             ORDER BY started_at DESC
+             LIMIT %d OFFSET %d",
+            $limit, $offset
+        ) );
+        return rest_ensure_response( array(
+            'success'  => true,
+            'sessions' => is_array( $rows ) ? $rows : array(),
+            'limit'    => $limit,
+            'offset'   => $offset,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_recon_get' ) ) {
+    function dinoco_sn_rest_recon_get( $req ) {
+        $uuid = (string) $req->get_param( 'uuid' );
+        $session = dinoco_sn_recon_get_session_by_uuid( $uuid );
+        if ( ! $session ) {
+            return new WP_Error( 'session_not_found',
+                __( 'Session not found.', 'dinoco-sn' ),
+                array( 'status' => 404 ) );
+        }
+        // Include variance report if session is submitted/closed
+        $report = null;
+        if ( in_array( $session->status, array( 'submitted', 'closed' ), true ) ) {
+            $rep = dinoco_sn_recon_get_variance_report( $uuid );
+            if ( ! is_wp_error( $rep ) ) $report = $rep;
+        }
+        return rest_ensure_response( array(
+            'success' => true,
+            'session' => $session,
+            'report'  => $report,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_recon_scan' ) ) {
+    function dinoco_sn_rest_recon_scan( $req ) {
+        $uuid = (string) $req->get_param( 'uuid' );
+        $sn   = (string) $req->get_param( 'sn' );
+        $cb = function( $req ) use ( $uuid, $sn ) {
+            $r = dinoco_sn_recon_record_scan( $uuid, $sn, get_current_user_id() );
+            if ( is_wp_error( $r ) ) return $r;
+            return rest_ensure_response( array_merge( array( 'success' => true ), $r ) );
+        };
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'reconciliation-scan',
+                array( 'uuid', 'sn' ), $cb );
+        }
+        return $cb( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_recon_submit' ) ) {
+    function dinoco_sn_rest_recon_submit( $req ) {
+        $uuid = (string) $req->get_param( 'uuid' );
+        $cb = function( $req ) use ( $uuid ) {
+            $r = dinoco_sn_recon_submit_session( $uuid, get_current_user_id() );
+            if ( is_wp_error( $r ) ) return $r;
+            return rest_ensure_response( array_merge( array( 'success' => true ), $r ) );
+        };
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'reconciliation-submit',
+                array( 'uuid' ), $cb );
+        }
+        return $cb( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_recon_close' ) ) {
+    function dinoco_sn_rest_recon_close( $req ) {
+        $uuid   = (string) $req->get_param( 'uuid' );
+        $action = (string) $req->get_param( 'resolution_action' );
+        $notes  = (string) $req->get_param( 'notes' );
+        $cb = function( $req ) use ( $uuid, $action, $notes ) {
+            $r = dinoco_sn_recon_close_session( $uuid, get_current_user_id(), $action, $notes );
+            if ( is_wp_error( $r ) ) return $r;
+            return rest_ensure_response( array_merge( array( 'success' => true ), $r ) );
+        };
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'reconciliation-close',
+                array( 'uuid', 'resolution_action', 'notes' ), $cb );
+        }
+        return $cb( $req );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 9. ADMIN UI SHORTCODE — [dinoco_admin_sn_reconciliation]
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 3-state UI:
+ *   - No active session: "Start Reconciliation" button + history list
+ *   - Counting state:    progress bar + scanner input + recent scans + Submit
+ *   - Variance report:   missing/extra lists + 3 action buttons
+ *
+ * CSS scoped `.dnc-sn-recon-*`. Touch targets ≥ 44px. Sticky bottom action bar.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! shortcode_exists( 'dinoco_admin_sn_reconciliation' ) ) {
+    add_shortcode( 'dinoco_admin_sn_reconciliation', 'dinoco_sn_recon_render_admin_ui' );
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_render_admin_ui' ) ) {
+    function dinoco_sn_recon_render_admin_ui( $atts = array() ) {
+        if ( ! current_user_can( 'manage_options' )
+             && ! current_user_can( 'dinoco_sn_warehouse' ) ) {
+            return '<div class="dnc-sn-recon"><p>คุณไม่มีสิทธิ์เข้าถึงหน้านี้</p></div>';
+        }
+
+        $active = dinoco_sn_recon_get_active_session();
+        $nonce  = wp_create_nonce( 'wp_rest' );
+
+        ob_start();
+        ?>
+        <div class="dnc-sn-recon-root">
+            <?php dinoco_sn_recon_render_styles(); ?>
+            <header class="dnc-sn-recon-header">
+                <h2>📋 S/N Reconciliation</h2>
+                <small>Phase 3 W8.3 · Quarterly physical count</small>
+            </header>
+
+            <?php if ( ! $active ) : ?>
+                <?php dinoco_sn_recon_render_state_idle( $nonce ); ?>
+            <?php elseif ( $active->status === 'counting' ) : ?>
+                <?php dinoco_sn_recon_render_state_counting( $active, $nonce ); ?>
+            <?php elseif ( $active->status === 'submitted' ) : ?>
+                <?php dinoco_sn_recon_render_state_variance( $active, $nonce ); ?>
+            <?php endif; ?>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_render_state_idle' ) ) {
+    function dinoco_sn_recon_render_state_idle( $nonce ) {
+        global $wpdb;
+        $rows = array();
+        if ( dinoco_sn_recon_tables_exist() ) {
+            $tbl = dinoco_sn_recon_table_sessions();
+            $rows = $wpdb->get_results(
+                "SELECT * FROM {$tbl} ORDER BY started_at DESC LIMIT 10"
+            );
+        }
+        ?>
+        <section class="dnc-sn-recon-section">
+            <button type="button" class="dnc-sn-recon-btn-primary" data-action="start"
+                    data-nonce="<?php echo esc_attr( $nonce ); ?>">
+                📋 เริ่ม Reconciliation Session
+            </button>
+            <p class="dnc-sn-recon-hint">
+                Snapshot จำนวนแผ่นใน sn_pool (status='in_pool') แล้วเริ่ม session ใหม่
+            </p>
+        </section>
+
+        <section class="dnc-sn-recon-section">
+            <h3>ประวัติย้อนหลัง (10 ครั้งล่าสุด)</h3>
+            <?php if ( empty( $rows ) ) : ?>
+                <p class="dnc-sn-recon-empty">ยังไม่มีประวัติ</p>
+            <?php else : ?>
+                <table class="dnc-sn-recon-table">
+                    <thead>
+                        <tr>
+                            <th>เริ่ม</th><th>สถานะ</th>
+                            <th>คาด</th><th>นับได้</th>
+                            <th>ขาด</th><th>เกิน</th>
+                            <th>Resolution</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $rows as $r ) : ?>
+                            <tr>
+                                <td><?php echo esc_html( $r->started_at ); ?></td>
+                                <td><span class="dnc-sn-recon-status-<?php echo esc_attr( $r->status ); ?>">
+                                    <?php echo esc_html( $r->status ); ?></span></td>
+                                <td><?php echo (int) $r->expected_count; ?></td>
+                                <td><?php echo (int) $r->scanned_count; ?></td>
+                                <td><?php echo (int) $r->variance_missing; ?></td>
+                                <td><?php echo (int) $r->variance_extra; ?></td>
+                                <td><?php echo esc_html( $r->resolution_action ?: '—' ); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php endif; ?>
+        </section>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_render_state_counting' ) ) {
+    function dinoco_sn_recon_render_state_counting( $active, $nonce ) {
+        $expected = (int) $active->expected_count;
+        $scanned  = (int) $active->scanned_count;
+        $pct = $expected > 0 ? round( ( $scanned / $expected ) * 100 ) : 0;
+        ?>
+        <section class="dnc-sn-recon-section dnc-sn-recon-counting"
+                 data-uuid="<?php echo esc_attr( $active->session_uuid ); ?>"
+                 data-nonce="<?php echo esc_attr( $nonce ); ?>">
+            <div class="dnc-sn-recon-progress">
+                <div class="dnc-sn-recon-progress-bar">
+                    <div class="dnc-sn-recon-progress-fill" style="width: <?php echo esc_attr( min( 100, $pct ) ); ?>%"></div>
+                </div>
+                <div class="dnc-sn-recon-progress-text">
+                    <strong><?php echo (int) $scanned; ?></strong> / <?php echo (int) $expected; ?>
+                    (<?php echo (int) $pct; ?>%)
+                </div>
+            </div>
+
+            <div class="dnc-sn-recon-warning">
+                ⚠️ ห้ามปิดหน้า — งานจะหยุดกลางคัน (auto-cancel หลัง <?php echo (int) DINOCO_SN_RECON_SLA_DAYS; ?> วัน)
+            </div>
+
+            <div class="dnc-sn-recon-scanner">
+                <label>สแกน S/N</label>
+                <input type="text" id="dnc-sn-recon-scan-input"
+                       placeholder="DNCSS0001234" autofocus
+                       autocomplete="off" autocapitalize="characters" />
+                <button type="button" class="dnc-sn-recon-btn-primary" data-action="scan">บันทึก</button>
+            </div>
+
+            <div class="dnc-sn-recon-recent">
+                <h4>50 รายการล่าสุด</h4>
+                <ul id="dnc-sn-recon-recent-list" class="dnc-sn-recon-recent-list">
+                    <!-- populated via JS after each scan -->
+                </ul>
+            </div>
+        </section>
+
+        <div class="dnc-sn-recon-action-bar">
+            <button type="button" class="dnc-sn-recon-btn-primary" data-action="submit"
+                    data-uuid="<?php echo esc_attr( $active->session_uuid ); ?>"
+                    data-nonce="<?php echo esc_attr( $nonce ); ?>">
+                ✓ Submit Count
+            </button>
+        </div>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_render_state_variance' ) ) {
+    function dinoco_sn_recon_render_state_variance( $active, $nonce ) {
+        $report = dinoco_sn_recon_get_variance_report( $active->session_uuid );
+        $missing = is_wp_error( $report ) ? array() : ( $report['missing_sns'] ?? array() );
+        $extra   = is_wp_error( $report ) ? array() : ( $report['extra_sns'] ?? array() );
+        $variance_pct = is_wp_error( $report ) ? 0 : ( $report['variance_pct'] ?? 0 );
+        $needs_4eyes = $variance_pct > (float) DINOCO_SN_RECON_4EYES_VARIANCE_PCT;
+        ?>
+        <section class="dnc-sn-recon-section dnc-sn-recon-variance"
+                 data-uuid="<?php echo esc_attr( $active->session_uuid ); ?>"
+                 data-nonce="<?php echo esc_attr( $nonce ); ?>">
+
+            <div class="dnc-sn-recon-summary">
+                <div>คาด: <strong><?php echo (int) $active->expected_count; ?></strong></div>
+                <div>นับได้: <strong><?php echo (int) $active->scanned_count; ?></strong></div>
+                <div>ขาด: <strong class="dnc-sn-recon-missing-count"><?php echo (int) $active->variance_missing; ?></strong></div>
+                <div>เกิน: <strong class="dnc-sn-recon-extra-count"><?php echo (int) $active->variance_extra; ?></strong></div>
+                <div>Variance: <strong><?php echo esc_html( $variance_pct ); ?>%</strong></div>
+            </div>
+
+            <?php if ( $needs_4eyes ) : ?>
+                <div class="dnc-sn-recon-4eyes-warn">
+                    ⚠️ Variance > <?php echo (int) DINOCO_SN_RECON_4EYES_VARIANCE_PCT; ?>% — ต้อง admin (manage_options) ปิด session
+                </div>
+            <?php endif; ?>
+
+            <div class="dnc-sn-recon-grid">
+                <div class="dnc-sn-recon-col">
+                    <h4>🔴 ขาด (system says in_pool, ไม่ scan)</h4>
+                    <?php if ( empty( $missing ) ) : ?>
+                        <p class="dnc-sn-recon-empty">ไม่มี</p>
+                    <?php else : ?>
+                        <ul class="dnc-sn-recon-list">
+                            <?php foreach ( array_slice( $missing, 0, 100 ) as $sn ) : ?>
+                                <li><?php echo esc_html( $sn ); ?></li>
+                            <?php endforeach; ?>
+                            <?php if ( count( $missing ) > 100 ) : ?>
+                                <li>… และอีก <?php echo (int) ( count( $missing ) - 100 ); ?> ราย</li>
+                            <?php endif; ?>
+                        </ul>
+                    <?php endif; ?>
+                </div>
+
+                <div class="dnc-sn-recon-col">
+                    <h4>🟡 เกิน (scan, ไม่อยู่ใน system)</h4>
+                    <?php if ( empty( $extra ) ) : ?>
+                        <p class="dnc-sn-recon-empty">ไม่มี</p>
+                    <?php else : ?>
+                        <ul class="dnc-sn-recon-list">
+                            <?php foreach ( array_slice( $extra, 0, 100 ) as $sn ) : ?>
+                                <li><?php echo esc_html( $sn ); ?></li>
+                            <?php endforeach; ?>
+                            <?php if ( count( $extra ) > 100 ) : ?>
+                                <li>… และอีก <?php echo (int) ( count( $extra ) - 100 ); ?> ราย</li>
+                            <?php endif; ?>
+                        </ul>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <textarea id="dnc-sn-recon-close-notes" placeholder="หมายเหตุ (optional)"
+                      class="dnc-sn-recon-notes"></textarea>
+        </section>
+
+        <div class="dnc-sn-recon-action-bar dnc-sn-recon-action-bar-3">
+            <button type="button" class="dnc-sn-recon-btn-danger" data-action="close-void"
+                    data-uuid="<?php echo esc_attr( $active->session_uuid ); ?>"
+                    data-nonce="<?php echo esc_attr( $nonce ); ?>">
+                🗑️ Void Missing
+            </button>
+            <button type="button" class="dnc-sn-recon-btn-warning" data-action="close-investigate"
+                    data-uuid="<?php echo esc_attr( $active->session_uuid ); ?>"
+                    data-nonce="<?php echo esc_attr( $nonce ); ?>">
+                🔍 Investigate
+            </button>
+            <button type="button" class="dnc-sn-recon-btn-secondary" data-action="close-cancel"
+                    data-uuid="<?php echo esc_attr( $active->session_uuid ); ?>"
+                    data-nonce="<?php echo esc_attr( $nonce ); ?>">
+                ✕ Cancel
+            </button>
+        </div>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_render_styles' ) ) {
+    function dinoco_sn_recon_render_styles() {
+        static $rendered = false;
+        if ( $rendered ) return;
+        $rendered = true;
+        ?>
+        <style>
+        .dnc-sn-recon-root { font-family: -apple-system, BlinkMacSystemFont, 'Sarabun', sans-serif; max-width: 1200px; margin: 0 auto; padding: 16px; }
+        .dnc-sn-recon-header { padding: 16px; background: #1f2937; color: #fff; border-radius: 8px; margin-bottom: 16px; }
+        .dnc-sn-recon-header h2 { margin: 0; font-size: 1.4rem; }
+        .dnc-sn-recon-header small { opacity: 0.8; }
+        .dnc-sn-recon-section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+        .dnc-sn-recon-section h3 { margin: 0 0 12px 0; font-size: 1.1rem; color: #111; }
+        .dnc-sn-recon-btn-primary,
+        .dnc-sn-recon-btn-danger,
+        .dnc-sn-recon-btn-warning,
+        .dnc-sn-recon-btn-secondary {
+            min-height: 44px; min-width: 44px; padding: 12px 20px; border: none;
+            border-radius: 6px; cursor: pointer; font-size: 1rem; font-weight: 600;
+        }
+        .dnc-sn-recon-btn-primary { background: #2563eb; color: #fff; }
+        .dnc-sn-recon-btn-primary:hover { background: #1d4ed8; }
+        .dnc-sn-recon-btn-danger { background: #dc2626; color: #fff; }
+        .dnc-sn-recon-btn-warning { background: #d97706; color: #fff; }
+        .dnc-sn-recon-btn-secondary { background: #6b7280; color: #fff; }
+        .dnc-sn-recon-hint { color: #6b7280; font-size: 0.9rem; margin-top: 8px; }
+        .dnc-sn-recon-empty { color: #9ca3af; font-style: italic; }
+        .dnc-sn-recon-table { width: 100%; border-collapse: collapse; }
+        .dnc-sn-recon-table th, .dnc-sn-recon-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e5e7eb; font-size: 0.9rem; }
+        .dnc-sn-recon-table th { background: #f9fafb; font-weight: 600; }
+        .dnc-sn-recon-status-counting { color: #2563eb; font-weight: 600; }
+        .dnc-sn-recon-status-submitted { color: #d97706; font-weight: 600; }
+        .dnc-sn-recon-status-closed { color: #059669; font-weight: 600; }
+        .dnc-sn-recon-status-cancelled { color: #6b7280; font-weight: 600; }
+        .dnc-sn-recon-progress { margin-bottom: 16px; }
+        .dnc-sn-recon-progress-bar { height: 16px; background: #e5e7eb; border-radius: 8px; overflow: hidden; }
+        .dnc-sn-recon-progress-fill { height: 100%; background: linear-gradient(90deg, #2563eb, #10b981); transition: width 0.3s; }
+        .dnc-sn-recon-progress-text { margin-top: 6px; font-size: 0.95rem; color: #374151; }
+        .dnc-sn-recon-warning { background: #fef3c7; color: #b45309; padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-size: 0.9rem; }
+        .dnc-sn-recon-4eyes-warn { background: #fee2e2; color: #b91c1c; padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-size: 0.9rem; font-weight: 600; }
+        .dnc-sn-recon-scanner { display: flex; gap: 8px; align-items: center; margin: 16px 0; flex-wrap: wrap; }
+        .dnc-sn-recon-scanner label { font-weight: 600; min-width: 80px; }
+        .dnc-sn-recon-scanner input { flex: 1; min-width: 200px; min-height: 44px; padding: 10px 12px; border: 2px solid #d1d5db; border-radius: 6px; font-family: monospace; font-size: 1rem; }
+        .dnc-sn-recon-scanner input:focus { outline: none; border-color: #2563eb; }
+        .dnc-sn-recon-recent { margin-top: 20px; }
+        .dnc-sn-recon-recent h4 { margin: 0 0 8px 0; font-size: 0.95rem; color: #4b5563; }
+        .dnc-sn-recon-recent-list { list-style: none; padding: 0; margin: 0; max-height: 360px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 6px; }
+        .dnc-sn-recon-recent-list li { padding: 6px 12px; border-bottom: 1px solid #f3f4f6; font-family: monospace; font-size: 0.9rem; display: flex; justify-content: space-between; }
+        .dnc-sn-recon-recent-list li.found { color: #065f46; }
+        .dnc-sn-recon-recent-list li.not-found { color: #b91c1c; }
+        .dnc-sn-recon-recent-list li.dup { color: #6b7280; }
+        .dnc-sn-recon-summary { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; padding: 12px; background: #f9fafb; border-radius: 6px; margin-bottom: 16px; }
+        .dnc-sn-recon-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        @media (max-width: 768px) {
+            .dnc-sn-recon-grid { grid-template-columns: 1fr; }
+            .dnc-sn-recon-summary { grid-template-columns: repeat(2, 1fr); }
+        }
+        .dnc-sn-recon-col h4 { margin: 0 0 10px 0; font-size: 1rem; }
+        .dnc-sn-recon-list { list-style: none; padding: 0; margin: 0; max-height: 320px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 6px; background: #fafafa; }
+        .dnc-sn-recon-list li { padding: 6px 12px; border-bottom: 1px solid #f3f4f6; font-family: monospace; font-size: 0.85rem; }
+        .dnc-sn-recon-notes { width: 100%; min-height: 80px; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; margin-top: 12px; font-family: inherit; }
+        .dnc-sn-recon-action-bar { position: sticky; bottom: 0; background: #fff; border-top: 2px solid #e5e7eb; padding: 12px 16px; margin: 0 -16px -16px -16px; display: flex; gap: 12px; justify-content: flex-end; }
+        .dnc-sn-recon-action-bar-3 button { flex: 1; }
+        .dnc-sn-recon-missing-count { color: #b91c1c; }
+        .dnc-sn-recon-extra-count { color: #d97706; }
+        </style>
+        <script>
+        (function() {
+            var ROOT = document.querySelector('.dnc-sn-recon-root');
+            if (!ROOT || ROOT.dataset.bound === '1') return;
+            ROOT.dataset.bound = '1';
+
+            var REST = (window.wpApiSettings && window.wpApiSettings.root) || '/wp-json/';
+            var NS = REST + 'dinoco-sn/v1/reconciliation';
+
+            function api(path, opts) {
+                opts = opts || {};
+                var headers = opts.headers || {};
+                headers['Content-Type'] = 'application/json';
+                var nonce = (opts.nonce) || (ROOT.querySelector('[data-nonce]') || {}).getAttribute && ROOT.querySelector('[data-nonce]').getAttribute('data-nonce');
+                if (nonce) headers['X-WP-Nonce'] = nonce;
+                opts.headers = headers;
+                opts.credentials = 'same-origin';
+                return fetch(NS + path, opts).then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, body: j }; }); });
+            }
+
+            ROOT.addEventListener('click', function(ev) {
+                var btn = ev.target.closest('[data-action]');
+                if (!btn) return;
+                var action = btn.dataset.action;
+                var uuid = btn.dataset.uuid || (btn.closest('[data-uuid]') || {}).getAttribute && btn.closest('[data-uuid]').getAttribute('data-uuid');
+                var nonce = btn.dataset.nonce || (btn.closest('[data-nonce]') || {}).getAttribute && btn.closest('[data-nonce]').getAttribute('data-nonce');
+
+                if (action === 'start') {
+                    if (!confirm('เริ่ม Reconciliation Session ใหม่?')) return;
+                    api('/start', { method: 'POST', nonce: nonce, body: '{}' }).then(function(r) {
+                        if (r.ok) { location.reload(); }
+                        else alert((r.body && r.body.message) || 'Start failed');
+                    });
+                }
+                else if (action === 'scan') {
+                    var input = ROOT.querySelector('#dnc-sn-recon-scan-input');
+                    if (!input || !input.value.trim()) return;
+                    var sn = input.value.trim().toUpperCase();
+                    api('/' + uuid + '/scan', { method: 'POST', nonce: nonce, body: JSON.stringify({ uuid: uuid, sn: sn }) }).then(function(r) {
+                        if (r.ok) {
+                            var li = document.createElement('li');
+                            var cls = r.body.dup ? 'dup' : (r.body.found_in_system ? 'found' : 'not-found');
+                            li.className = cls;
+                            li.innerHTML = '<span>' + sn + '</span><span>' + (r.body.dup ? 'ซ้ำ' : (r.body.found_in_system ? '✓' : '⚠ ไม่อยู่')) + '</span>';
+                            var list = ROOT.querySelector('#dnc-sn-recon-recent-list');
+                            if (list) list.insertBefore(li, list.firstChild);
+                            input.value = ''; input.focus();
+                        } else {
+                            alert((r.body && r.body.message) || 'Scan failed');
+                        }
+                    });
+                }
+                else if (action === 'submit') {
+                    if (!confirm('Submit count? หลังจากนี้แก้ scan ไม่ได้')) return;
+                    api('/' + uuid + '/submit', { method: 'POST', nonce: nonce, body: JSON.stringify({ uuid: uuid }) }).then(function(r) {
+                        if (r.ok) location.reload();
+                        else alert((r.body && r.body.message) || 'Submit failed');
+                    });
+                }
+                else if (action === 'close-void' || action === 'close-investigate' || action === 'close-cancel') {
+                    var resmap = { 'close-void': 'void_missing', 'close-investigate': 'investigate', 'close-cancel': 'cancel' };
+                    var res = resmap[action];
+                    var msg = res === 'void_missing'
+                        ? 'Void missing plates ทั้งหมด? — ไม่สามารถ undo ได้'
+                        : (res === 'investigate' ? 'ปิด session แบบ investigate (เก็บ missing plates ไว้)?' : 'ยกเลิก session?');
+                    if (!confirm(msg)) return;
+                    var notes = (ROOT.querySelector('#dnc-sn-recon-close-notes') || {}).value || '';
+                    api('/' + uuid + '/close', { method: 'POST', nonce: nonce, body: JSON.stringify({ uuid: uuid, resolution_action: res, notes: notes }) }).then(function(r) {
+                        if (r.ok) location.reload();
+                        else alert((r.body && r.body.message) || 'Close failed');
+                    });
+                }
+            });
+
+            // Enter-key scan support
+            var scanInput = ROOT.querySelector('#dnc-sn-recon-scan-input');
+            if (scanInput) {
+                scanInput.addEventListener('keydown', function(ev) {
+                    if (ev.key === 'Enter') {
+                        ev.preventDefault();
+                        var btn = ROOT.querySelector('button[data-action="scan"]');
+                        if (btn) btn.click();
+                    }
+                });
+            }
+        })();
+        </script>
+        <?php
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 10. ADMIN COMMAND CENTER MODULE REGISTRY
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Self-register sidebar nav-item under "สินค้า/Inventory" section.
+ * Order=30 (after Production SN Manager order=25, before Inventory Database).
+ * Defensive: no-op if Module Registry not synced.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! has_action( 'init', 'dinoco_sn_recon_register_admin_module' ) ) {
+    add_action( 'init', 'dinoco_sn_recon_register_admin_module', 30 );
+}
+
+if ( ! function_exists( 'dinoco_sn_recon_register_admin_module' ) ) {
+    function dinoco_sn_recon_register_admin_module() {
+        if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+
+        dinoco_register_admin_module( array(
+            'key'        => 'sn_reconciliation',
+            'shortcode'  => 'dinoco_admin_sn_reconciliation',
+            'label'      => '📋 Reconciliation',
+            'section'    => 'inventory',
+            'icon'       => 'fa-clipboard-check',
+            'color'      => '#1f2937',
+            'cache_ttl'  => 30, // short — admin actively interacting
+            'capability' => 'manage_options',
+            'order'      => 30, // after Production SN Manager (25)
+            'source'     => '[Admin System] DINOCO SN Reconciliation V.0.1',
+        ) );
+    }
+}

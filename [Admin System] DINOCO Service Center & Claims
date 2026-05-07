@@ -1,6 +1,24 @@
 /*
  * Plugin Name: [Module] DINOCO Service Center & Claims
  * Description: ระบบบริหารจัดการงานเคลม
+ * Version: V.31.1 (2026-05-05) — Phase 3 W8.5 SC Quick Lookup mobile shortcode:
+ *   • NEW shortcode `[dinoco_sc_quick_lookup]` — mobile-first read-only S/N
+ *     verify page for Service Center counter staff. Customer walks in →
+ *     scan QR plate or type S/N → see warranty status + product + last 5
+ *     audit events → decide accept claim. Read-only (no mutations).
+ *   • Permission gate: requires `dinoco_sn_view_pii` cap OR `manage_options`
+ *     (uses `dinoco_sn_user_can_view_pii()` helper from SN REST API V.0.19+).
+ *     Not logged in → redirect to `wp_login_url()`. No cap → 403 div.
+ *   • UI states: empty / loading / found / not_found / voided / stolen.
+ *     QR scan via lazy-loaded html5-qrcode (cached on `window._html5QrcodeLoaded`).
+ *     Camera denied → fallback typed input + error toast.
+ *   • Mobile-first ≤640px breakpoint, touch targets ≥44px (≥48px primary CTAs).
+ *     CSS scoped `.dnc-sn-sc-lookup-*` (no leak to existing claim styles).
+ *   • Audit log every search via `dinoco_sn_audit_log()` (defensive function_exists).
+ *     Stolen plate → defensive Telegram alert (`b2b_send_telegram_alert` if exists).
+ *   • Module Registry self-registration (key=sc_lookup, section=claims, order=10).
+ *   • Defensive: ALL cross-snippet helpers function_exists guarded — gracefully
+ *     no-op when sibling SN snippets not yet synced.
  * Version: V.31.0 (2026-05-05) — Phase 2 W6.4 sn_pool integration:
  *   • Listener `dinoco_sn_claim_status_changed()` hooks into existing
  *     `dinoco/claim/state_changed` action (no modification of canonical helper).
@@ -3859,5 +3877,796 @@ add_action( 'init', function() {
         'capability' => 'manage_options',
         'order'      => 20,
         'source'     => '[Admin System] DINOCO Service Center & Claims V.30.7',
+    ) );
+}, 30 );
+
+// ════════════════════════════════════════════════════════════════════════════
+// V.31.1 Phase 3 W8.5 — Service Center Quick Lookup mobile shortcode
+//
+// Shortcode: [dinoco_sc_quick_lookup]
+// URL:       any page (typically /sc-lookup/)
+// Use case:  ลูกค้ามาที่ร้าน → SC staff ใช้มือถือ scan QR / พิมพ์ S/N →
+//            ดู warranty status + product + customer (PII unmasked เพราะ
+//            มี view_pii cap) → ตัดสินใจรับเคลม. Read-only เท่านั้น.
+//
+// Permission: dinoco_sn_view_pii cap OR manage_options.
+//   - not logged in → redirect ไป wp_login_url() กลับมาที่หน้านี้
+//   - logged in แต่ไม่มี cap → 403 div
+//
+// Read-only — ไม่มี state mutation. "เปิดเคลม" = link ไป
+// /admin-command-center#claims?sn=... (ใช้ existing claim flow)
+//
+// Cross-snippet calls (all function_exists guarded):
+//   - dinoco_sn_user_can_view_pii()  [SN REST API V.0.19+]
+//   - dinoco_sn_get_plate_data($sn)  [Production SN Manager V.0.4+]
+//   - dinoco_sn_audit_log(...)       [SN REST API V.0.19+]
+//   - dinoco_get_ancestor_skus($sku) [Inventory Snippet 15 V.6.0+]
+//   - b2b_send_telegram_alert(...)   [B2B Snippet 1 — stolen plate alert]
+//   - dinoco_register_admin_module() [Admin Dashboard V.33.5+]
+// ════════════════════════════════════════════════════════════════════════════
+
+if ( ! function_exists( 'dinoco_sc_quick_lookup_render' ) ) {
+    /**
+     * Mobile-first read-only S/N verify shortcode for Service Center counter.
+     * Renders shell + JS that calls existing GET /dinoco-sn/v1/sc-lookup/{sn}
+     * (warehouse cap accepted, PII unmasked when view_pii present).
+     */
+    function dinoco_sc_quick_lookup_render( $atts = array() ) {
+        // ── Permission gate ────────────────────────────────────────────────
+        if ( ! is_user_logged_in() ) {
+            $login_url = wp_login_url( get_permalink() ?: home_url( $_SERVER['REQUEST_URI'] ?? '/' ) );
+            return '<div class="dnc-sn-sc-lookup-gate">'
+                . '<p>กรุณา <a href="' . esc_url( $login_url ) . '">เข้าสู่ระบบ</a> '
+                . 'เพื่อใช้งาน Service Center Quick Lookup</p>'
+                . '</div>';
+        }
+
+        // Service Center cap required: view_pii OR manage_options.
+        $has_pii_cap = function_exists( 'dinoco_sn_user_can_view_pii' )
+            ? dinoco_sn_user_can_view_pii()
+            : current_user_can( 'manage_options' );
+        if ( ! $has_pii_cap ) {
+            return '<div class="dnc-sn-sc-lookup-gate dnc-sn-sc-lookup-denied">'
+                . '<p>⛔ คุณไม่มีสิทธิ์เข้าถึง — Service Center cap required '
+                . '(ต้องมี <code>dinoco_sn_view_pii</code> หรือ <code>manage_options</code>)</p>'
+                . '</div>';
+        }
+
+        $rest_url = rest_url( 'dinoco-sn/v1' );
+        $nonce    = wp_create_nonce( 'wp_rest' );
+        $admin_claims_url = home_url( '/admin-command-center/' );
+
+        ob_start();
+        ?>
+        <div class="dnc-sn-sc-lookup-root">
+            <header class="dnc-sn-sc-lookup-header">
+                <h2>🔍 Service Center · Verify S/N</h2>
+                <p class="dnc-sn-sc-lookup-sub">สแกน QR เพลท หรือพิมพ์ S/N เพื่อตรวจสถานะรับประกัน</p>
+            </header>
+
+            <div class="dnc-sn-sc-lookup-search">
+                <button type="button" id="dnc-sn-sc-lookup-scan" class="dnc-sn-sc-lookup-scan-btn">
+                    📷 สแกน QR plate
+                </button>
+
+                <div class="dnc-sn-sc-lookup-divider">หรือพิมพ์ S/N</div>
+
+                <div class="dnc-sn-sc-lookup-input-row">
+                    <input type="text"
+                           id="dnc-sn-sc-lookup-input"
+                           class="dnc-sn-sc-lookup-input"
+                           placeholder="DNCSS0001234"
+                           inputmode="text"
+                           autocapitalize="characters"
+                           autocomplete="off"
+                           spellcheck="false">
+                    <button type="button" id="dnc-sn-sc-lookup-go" class="dnc-sn-sc-lookup-btn">ค้นหา</button>
+                </div>
+            </div>
+
+            <div id="dnc-sn-sc-lookup-scanner" class="dnc-sn-sc-lookup-scanner" style="display:none;">
+                <div id="dnc-sn-sc-lookup-qr-reader"></div>
+                <button type="button" id="dnc-sn-sc-lookup-scan-cancel" class="dnc-sn-sc-lookup-scan-cancel">
+                    ✕ ยกเลิกสแกน
+                </button>
+            </div>
+
+            <div id="dnc-sn-sc-lookup-result" class="dnc-sn-sc-lookup-result" aria-live="polite"></div>
+
+            <div id="dnc-sn-sc-lookup-toast" class="dnc-sn-sc-lookup-toast" aria-live="assertive"></div>
+
+            <footer class="dnc-sn-sc-lookup-footer">
+                <p>💡 ระบบนี้เป็น <strong>read-only</strong> สำหรับเคาน์เตอร์รับเคลม
+                — จัดการ S/N (claim/swap/void/recall) ทำที่
+                <a href="<?php echo esc_url( $admin_claims_url ); ?>" target="_blank">Admin Dashboard</a></p>
+            </footer>
+        </div>
+
+        <style>
+            /* ── Mobile-first ≤640px primary breakpoint ─────────────────── */
+            .dnc-sn-sc-lookup-root {
+                max-width: 560px;
+                margin: 16px auto;
+                padding: 16px;
+                font-family: 'Sarabun', 'Noto Sans Thai', -apple-system, BlinkMacSystemFont, sans-serif;
+                color: #111827;
+            }
+            .dnc-sn-sc-lookup-gate {
+                max-width: 560px;
+                margin: 24px auto;
+                padding: 24px;
+                text-align: center;
+                background: #fef3c7;
+                border: 1px solid #f59e0b;
+                border-radius: 12px;
+                color: #b45309;
+            }
+            .dnc-sn-sc-lookup-denied {
+                background: #fee2e2;
+                border-color: #f87171;
+                color: #991b1b;
+            }
+            .dnc-sn-sc-lookup-header h2 {
+                margin: 0 0 4px;
+                font-size: 22px;
+                color: #1f2937;
+            }
+            .dnc-sn-sc-lookup-sub {
+                margin: 0 0 20px;
+                color: #6b7280;
+                font-size: 14px;
+            }
+            .dnc-sn-sc-lookup-search {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                margin-bottom: 16px;
+            }
+            .dnc-sn-sc-lookup-scan-btn {
+                background: linear-gradient(135deg, #2563eb, #1d4ed8);
+                color: white;
+                border: none;
+                border-radius: 12px;
+                padding: 14px 20px;
+                font-size: 17px;
+                font-weight: 600;
+                cursor: pointer;
+                min-height: 52px;
+                box-shadow: 0 2px 6px rgba(37, 99, 235, 0.25);
+            }
+            .dnc-sn-sc-lookup-scan-btn:hover { background: linear-gradient(135deg, #1d4ed8, #1e40af); }
+            .dnc-sn-sc-lookup-scan-btn:active { transform: scale(0.98); }
+            .dnc-sn-sc-lookup-divider {
+                text-align: center;
+                color: #9ca3af;
+                font-size: 13px;
+                margin: 4px 0;
+                position: relative;
+            }
+            .dnc-sn-sc-lookup-divider::before,
+            .dnc-sn-sc-lookup-divider::after {
+                content: '';
+                display: inline-block;
+                width: 30%;
+                height: 1px;
+                background: #e5e7eb;
+                vertical-align: middle;
+                margin: 0 8px;
+            }
+            .dnc-sn-sc-lookup-input-row {
+                display: flex;
+                gap: 8px;
+            }
+            .dnc-sn-sc-lookup-input {
+                flex: 1;
+                padding: 14px 16px;
+                font-size: 18px;
+                border: 1px solid #d1d5db;
+                border-radius: 12px;
+                font-family: 'JetBrains Mono', 'Roboto Mono', monospace;
+                letter-spacing: 0.5px;
+                min-height: 48px;
+            }
+            .dnc-sn-sc-lookup-input:focus {
+                outline: none;
+                border-color: #2563eb;
+                box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+            }
+            .dnc-sn-sc-lookup-btn {
+                background: #1f2937;
+                color: white;
+                border: none;
+                border-radius: 12px;
+                padding: 14px 24px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                min-height: 48px;
+                min-width: 88px;
+            }
+            .dnc-sn-sc-lookup-btn:hover { background: #111827; }
+            .dnc-sn-sc-lookup-btn:active { transform: scale(0.98); }
+            .dnc-sn-sc-lookup-scanner {
+                margin-bottom: 16px;
+                padding: 12px;
+                background: #1f2937;
+                border-radius: 12px;
+            }
+            .dnc-sn-sc-lookup-scanner #dnc-sn-sc-lookup-qr-reader {
+                border-radius: 8px;
+                overflow: hidden;
+            }
+            .dnc-sn-sc-lookup-scan-cancel {
+                margin-top: 12px;
+                width: 100%;
+                background: #ef4444;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 12px;
+                font-size: 15px;
+                font-weight: 600;
+                cursor: pointer;
+                min-height: 44px;
+            }
+            .dnc-sn-sc-lookup-result {
+                background: white;
+                border: 1px solid #e5e7eb;
+                border-radius: 12px;
+                padding: 20px;
+                min-height: 80px;
+                font-size: 15px;
+            }
+            .dnc-sn-sc-lookup-result-empty {
+                color: #9ca3af;
+                text-align: center;
+                padding: 24px 12px;
+            }
+            .dnc-sn-sc-lookup-result-loading {
+                color: #6b7280;
+                text-align: center;
+                padding: 24px 12px;
+            }
+            .dnc-sn-sc-lookup-result-found h3 {
+                margin: 0 0 8px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 20px;
+                color: #1f2937;
+            }
+            .dnc-sn-sc-lookup-result-not-found {
+                background: #fef2f2;
+                border: 1px solid #fca5a5;
+                border-radius: 8px;
+                color: #991b1b;
+                text-align: center;
+                padding: 24px 12px;
+            }
+            .dnc-sn-sc-lookup-status {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 13px;
+                font-weight: 700;
+                margin: 4px 0 12px;
+            }
+            .dnc-sn-sc-lookup-status-active   { background: #d1fae5; color: #065f46; }
+            .dnc-sn-sc-lookup-status-inactive { background: #f3f4f6; color: #6b7280; }
+            .dnc-sn-sc-lookup-status-warning  { background: #fef3c7; color: #b45309; }
+            .dnc-sn-sc-lookup-status-danger   { background: #fee2e2; color: #991b1b; }
+            .dnc-sn-sc-lookup-product-card {
+                display: flex;
+                gap: 12px;
+                margin: 12px 0;
+                padding: 12px;
+                background: #f9fafb;
+                border-radius: 10px;
+            }
+            .dnc-sn-sc-lookup-product-img {
+                width: 80px;
+                height: 80px;
+                border-radius: 8px;
+                background: white;
+                border: 1px solid #e5e7eb;
+                object-fit: cover;
+                flex-shrink: 0;
+            }
+            .dnc-sn-sc-lookup-product-info {
+                flex: 1;
+                min-width: 0;
+            }
+            .dnc-sn-sc-lookup-product-info h4 {
+                margin: 0 0 4px;
+                font-size: 15px;
+                color: #111827;
+                line-height: 1.3;
+            }
+            .dnc-sn-sc-lookup-product-info small {
+                color: #6b7280;
+                font-size: 12px;
+                font-family: 'JetBrains Mono', monospace;
+            }
+            .dnc-sn-sc-lookup-detail-grid {
+                display: grid;
+                grid-template-columns: auto 1fr;
+                gap: 6px 16px;
+                margin-top: 12px;
+                font-size: 14px;
+            }
+            .dnc-sn-sc-lookup-detail-label {
+                color: #6b7280;
+                font-size: 12px;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+            .dnc-sn-sc-lookup-detail-val {
+                color: #111827;
+                word-break: break-word;
+            }
+            .dnc-sn-sc-lookup-section-title {
+                margin: 16px 0 8px;
+                padding-top: 12px;
+                border-top: 1px solid #e5e7eb;
+                font-size: 13px;
+                font-weight: 700;
+                color: #374151;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+            .dnc-sn-sc-lookup-timeline {
+                list-style: none;
+                padding: 0;
+                margin: 0;
+                font-size: 13px;
+            }
+            .dnc-sn-sc-lookup-timeline li {
+                padding: 6px 0;
+                border-bottom: 1px dashed #f3f4f6;
+                color: #4b5563;
+            }
+            .dnc-sn-sc-lookup-timeline li:last-child { border-bottom: none; }
+            .dnc-sn-sc-lookup-timeline .ts {
+                color: #9ca3af;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 12px;
+                margin-right: 6px;
+            }
+            .dnc-sn-sc-lookup-banner {
+                margin-top: 12px;
+                padding: 12px;
+                border-radius: 8px;
+                font-size: 13px;
+                line-height: 1.5;
+            }
+            .dnc-sn-sc-lookup-banner-warn   { background: #fef3c7; color: #92400e; }
+            .dnc-sn-sc-lookup-banner-danger { background: #fee2e2; color: #991b1b; }
+            .dnc-sn-sc-lookup-banner-info   { background: #dbeafe; color: #1e40af; }
+            .dnc-sn-sc-lookup-actions {
+                position: sticky;
+                bottom: 0;
+                margin-top: 16px;
+                padding: 12px 0 0;
+                background: linear-gradient(180deg, transparent, white 30%);
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .dnc-sn-sc-lookup-action-btn {
+                flex: 1 1 45%;
+                min-height: 48px;
+                padding: 12px 16px;
+                border-radius: 10px;
+                border: 1px solid #d1d5db;
+                background: white;
+                color: #374151;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                text-align: center;
+                text-decoration: none;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .dnc-sn-sc-lookup-action-btn:hover { background: #f9fafb; }
+            .dnc-sn-sc-lookup-action-btn-primary {
+                background: #059669;
+                color: white;
+                border-color: #059669;
+            }
+            .dnc-sn-sc-lookup-action-btn-primary:hover { background: #047857; color: white; }
+            .dnc-sn-sc-lookup-toast {
+                position: fixed;
+                bottom: 24px;
+                left: 50%;
+                transform: translateX(-50%);
+                background: #1f2937;
+                color: white;
+                padding: 12px 20px;
+                border-radius: 8px;
+                font-size: 14px;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.2s;
+                max-width: 90vw;
+                z-index: 9999;
+            }
+            .dnc-sn-sc-lookup-toast.show { opacity: 1; }
+            .dnc-sn-sc-lookup-footer {
+                margin-top: 16px;
+                padding: 12px;
+                background: #f9fafb;
+                border-radius: 8px;
+                font-size: 12px;
+                color: #6b7280;
+                line-height: 1.5;
+            }
+            .dnc-sn-sc-lookup-footer a { color: #2563eb; text-decoration: none; }
+            .dnc-sn-sc-lookup-footer a:hover { text-decoration: underline; }
+
+            /* Phone screens (≤640px primary target) */
+            @media (max-width: 640px) {
+                .dnc-sn-sc-lookup-root { padding: 12px; margin: 8px auto; }
+                .dnc-sn-sc-lookup-input { font-size: 17px; }
+                .dnc-sn-sc-lookup-input-row { flex-direction: column; }
+                .dnc-sn-sc-lookup-btn { width: 100%; }
+                .dnc-sn-sc-lookup-action-btn { flex: 1 1 100%; }
+                .dnc-sn-sc-lookup-product-img { width: 64px; height: 64px; }
+            }
+        </style>
+
+        <script>
+        (function() {
+            var REST_BASE = <?php echo wp_json_encode( $rest_url ); ?>;
+            var NONCE     = <?php echo wp_json_encode( $nonce ); ?>;
+            var ADMIN_CLAIMS_URL = <?php echo wp_json_encode( $admin_claims_url ); ?>;
+
+            var input    = document.getElementById('dnc-sn-sc-lookup-input');
+            var goBtn    = document.getElementById('dnc-sn-sc-lookup-go');
+            var scanBtn  = document.getElementById('dnc-sn-sc-lookup-scan');
+            var scannerEl = document.getElementById('dnc-sn-sc-lookup-scanner');
+            var scanCancelBtn = document.getElementById('dnc-sn-sc-lookup-scan-cancel');
+            var resultEl = document.getElementById('dnc-sn-sc-lookup-result');
+            var toastEl  = document.getElementById('dnc-sn-sc-lookup-toast');
+
+            // Initial state
+            resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-empty">'
+                + '👋 พิมพ์ S/N หรือกดปุ่มสแกน QR ด้านบน<br>'
+                + '<small style="color:#9ca3af;">ตัวอย่าง: <code>DNCSS0001234</code></small>'
+                + '</div>';
+
+            // ─── Helpers ───────────────────────────────────────────────────
+            function escapeHtml(s) {
+                var d = document.createElement('div');
+                d.textContent = s == null ? '' : String(s);
+                return d.innerHTML;
+            }
+            function fmtDate(s) {
+                if (!s) return '—';
+                try {
+                    var d = new Date(String(s).replace(' ', 'T'));
+                    if (isNaN(d.getTime())) return s;
+                    return d.toLocaleString('th-TH', { hour12: false });
+                } catch (e) { return s; }
+            }
+            function showToast(msg, isError) {
+                toastEl.textContent = msg;
+                toastEl.style.background = isError ? '#dc2626' : '#1f2937';
+                toastEl.classList.add('show');
+                setTimeout(function() { toastEl.classList.remove('show'); }, 3000);
+            }
+            function classifyStatus(status) {
+                if (status === 'registered' || status === 'claimed') return 'active';
+                if (status === 'voided' || status === 'recalled' || status === 'stolen') return 'danger';
+                if (status === 'in_pool' || status === 'reserved') return 'inactive';
+                return 'warning';
+            }
+            function statusLabelTh(status) {
+                var map = {
+                    'reserved':              'สำรองไว้ (ยังไม่ใช้)',
+                    'in_pool':               'พร้อมใช้ (ในคลัง)',
+                    'allocated_to_order':    'จองให้ออเดอร์',
+                    'shipped':               'ส่งออกแล้ว (กำลังเดินทาง)',
+                    'registered':            'ลงทะเบียนแล้ว ✓',
+                    'claimed':               'กำลังเคลม',
+                    'replaced':              'เปลี่ยนใหม่แล้ว',
+                    'transferred':           'โอนเจ้าของแล้ว',
+                    'voided':                'ยกเลิก ❌',
+                    'recalled':              'เรียกคืน ⚠️',
+                    'stolen':                '🚨 รายงานหาย',
+                    'reserved_for_legacy':   'สำรองสำหรับ Legacy',
+                    'shipped_legacy':        'ส่ง Legacy แล้ว',
+                    'cancelled_batch':       'ยกเลิก Batch',
+                };
+                return map[status] || status || '—';
+            }
+            function eventLabelTh(et) {
+                var map = {
+                    'plate_received':       '📦 รับเข้าคลัง',
+                    'plate_allocated':      '🏷️ จัดสรรให้ออเดอร์',
+                    'plate_shipped':        '🚚 ส่งออก',
+                    'warranty_activated':   '✅ ลูกค้าลงทะเบียน',
+                    'plate_voided':         '❌ ยกเลิก',
+                    'plate_recalled':       '⚠️ เรียกคืน',
+                    'plate_swapped':        '🔄 สลับเพลท',
+                    'plate_transferred':    '↔️ โอนเจ้าของ',
+                    'sc_quick_lookup':      '🔍 ตรวจที่ Service Center',
+                };
+                return map[et] || et || '—';
+            }
+
+            // ─── Audit logging via REST hit (best-effort, non-blocking) ───
+            // Using existing /sc-lookup endpoint which already logs server-side
+            // so no client-side audit call needed (defensive — backend handles).
+
+            // ─── QR Scanner (lazy-loaded) ─────────────────────────────────
+            var html5QrLib = null;
+            var qrScannerInstance = null;
+
+            function loadQrLibrary() {
+                if (window._html5QrcodeLoaded && window.Html5Qrcode) {
+                    return Promise.resolve(window.Html5Qrcode);
+                }
+                return new Promise(function(resolve, reject) {
+                    var script = document.createElement('script');
+                    script.src = 'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js';
+                    script.onload = function() {
+                        window._html5QrcodeLoaded = true;
+                        if (window.Html5Qrcode) resolve(window.Html5Qrcode);
+                        else reject(new Error('html5-qrcode loaded but not exposed'));
+                    };
+                    script.onerror = function() { reject(new Error('Failed to load html5-qrcode')); };
+                    document.head.appendChild(script);
+                });
+            }
+
+            function startScan() {
+                scannerEl.style.display = 'block';
+                loadQrLibrary().then(function(Html5Qrcode) {
+                    html5QrLib = Html5Qrcode;
+                    qrScannerInstance = new Html5Qrcode('dnc-sn-sc-lookup-qr-reader');
+                    qrScannerInstance.start(
+                        { facingMode: 'environment' },
+                        { fps: 10, qrbox: { width: 240, height: 240 } },
+                        function(decodedText) {
+                            // Extract S/N from QR (could be URL or raw S/N)
+                            var sn = String(decodedText || '').trim().toUpperCase();
+                            // Heuristic: if URL, try ?sn= or last path segment
+                            var m = sn.match(/[?&]SN=([A-Z0-9]+)/i);
+                            if (m) sn = m[1].toUpperCase();
+                            else if (sn.indexOf('/') >= 0) {
+                                var parts = sn.split('/').filter(Boolean);
+                                sn = parts[parts.length - 1];
+                            }
+                            stopScan();
+                            input.value = sn;
+                            doLookup();
+                        },
+                        function(/* errorMsg */) { /* ignore per-frame errors */ }
+                    ).catch(function(err) {
+                        scannerEl.style.display = 'none';
+                        showToast('ไม่สามารถเปิดกล้อง: ' + (err.message || err), true);
+                        input.focus();
+                    });
+                }).catch(function(err) {
+                    scannerEl.style.display = 'none';
+                    showToast('โหลด QR scanner ไม่สำเร็จ — กรุณาพิมพ์ S/N แทน', true);
+                    input.focus();
+                });
+            }
+
+            function stopScan() {
+                scannerEl.style.display = 'none';
+                if (qrScannerInstance) {
+                    try {
+                        qrScannerInstance.stop().then(function() {
+                            qrScannerInstance.clear();
+                            qrScannerInstance = null;
+                        }).catch(function() {});
+                    } catch (e) {}
+                }
+            }
+
+            // ─── Lookup ───────────────────────────────────────────────────
+            function doLookup() {
+                var sn = (input.value || '').trim().toUpperCase();
+                if (!sn) {
+                    resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-empty">พิมพ์ S/N ด้านบน</div>';
+                    return;
+                }
+                if (!/^[A-Z0-9]{3,40}$/.test(sn)) {
+                    resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-not-found">'
+                        + '<h3>รูปแบบ S/N ไม่ถูกต้อง</h3>'
+                        + '<small>ตัวอย่าง: DNCSS0001234</small>'
+                        + '</div>';
+                    return;
+                }
+                input.value = sn;
+                resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-loading">'
+                    + '⏳ กำลังค้นหา S/N <code>' + escapeHtml(sn) + '</code>…'
+                    + '</div>';
+
+                fetch(REST_BASE + '/sc-lookup/' + encodeURIComponent(sn), {
+                    headers: { 'X-WP-Nonce': NONCE },
+                    credentials: 'same-origin'
+                })
+                .then(function(r) {
+                    return r.json().then(function(j) {
+                        return { ok: r.ok, status: r.status, data: j };
+                    });
+                })
+                .then(function(res) { renderResult(sn, res); })
+                .catch(function(e) {
+                    resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-not-found">'
+                        + '<h3>เกิดข้อผิดพลาดเครือข่าย</h3>'
+                        + '<p>' + escapeHtml(e.message || 'Network error') + '</p>'
+                        + '</div>';
+                });
+            }
+
+            function renderResult(searchedSn, res) {
+                if (!res.ok) {
+                    if (res.status === 404) {
+                        resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-not-found">'
+                            + '<h3>❌ ไม่พบ S/N ในระบบ</h3>'
+                            + '<p>S/N <code>' + escapeHtml(searchedSn) + '</code> ไม่อยู่ในฐานข้อมูล</p>'
+                            + '<small>อาจเป็นเพลทปลอม หรือยังไม่ได้รับเข้าระบบ — แจ้ง admin</small>'
+                            + '</div>';
+                        return;
+                    }
+                    if (res.status === 403) {
+                        resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-not-found">'
+                            + '<h3>⛔ ไม่มีสิทธิ์เข้าถึง</h3>'
+                            + '<p>กรุณาติดต่อ admin</p>'
+                            + '</div>';
+                        return;
+                    }
+                    resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-not-found">'
+                        + '<h3>เกิดข้อผิดพลาด (HTTP ' + res.status + ')</h3>'
+                        + '<p>' + escapeHtml((res.data && (res.data.message || res.data.code)) || 'unknown') + '</p>'
+                        + '</div>';
+                    return;
+                }
+                if (!res.data || !res.data.sn) {
+                    resultEl.innerHTML = '<div class="dnc-sn-sc-lookup-result-not-found">ไม่พบข้อมูล</div>';
+                    return;
+                }
+
+                var p = res.data.sn;
+                var status = p.status || 'unknown';
+                var cls = classifyStatus(status);
+                var topSet = res.data.top_set_sku || p.top_set_sku || p.linked_sku || '—';
+
+                var html = '<div class="dnc-sn-sc-lookup-result-found">';
+                html += '<h3>' + escapeHtml(p.sn) + '</h3>';
+                html += '<span class="dnc-sn-sc-lookup-status dnc-sn-sc-lookup-status-' + cls + '">'
+                    + escapeHtml(statusLabelTh(status)) + '</span>';
+
+                // Product card
+                if (p.linked_sku || p.product_name) {
+                    html += '<div class="dnc-sn-sc-lookup-product-card">';
+                    html += '<div class="dnc-sn-sc-lookup-product-img" style="display:flex;align-items:center;justify-content:center;font-size:32px;color:#9ca3af;">📦</div>';
+                    html += '<div class="dnc-sn-sc-lookup-product-info">';
+                    html += '<h4>' + escapeHtml(p.product_name || p.linked_sku || 'Unknown product') + '</h4>';
+                    html += '<small>SKU: ' + escapeHtml(p.linked_sku || '—') + '</small><br>';
+                    html += '<small>Top SET: ' + escapeHtml(topSet) + '</small>';
+                    html += '</div></div>';
+                }
+
+                // Detail grid
+                html += '<div class="dnc-sn-sc-lookup-detail-grid">';
+                html += '<div class="dnc-sn-sc-lookup-detail-label">Batch</div>';
+                html += '<div class="dnc-sn-sc-lookup-detail-val">' + escapeHtml(p.batch_code || '—') + '</div>';
+                html += '<div class="dnc-sn-sc-lookup-detail-label">รับเข้าคลัง</div>';
+                html += '<div class="dnc-sn-sc-lookup-detail-val">' + escapeHtml(fmtDate(p.received_at)) + '</div>';
+                html += '<div class="dnc-sn-sc-lookup-detail-label">ลงทะเบียน</div>';
+                html += '<div class="dnc-sn-sc-lookup-detail-val">' + escapeHtml(fmtDate(p.registered_at)) + '</div>';
+                html += '</div>';
+
+                // Customer (PII unmasked since user has view_pii cap)
+                if (res.data.customer) {
+                    var c = res.data.customer;
+                    html += '<div class="dnc-sn-sc-lookup-section-title">ลูกค้า</div>';
+                    html += '<div class="dnc-sn-sc-lookup-detail-grid">';
+                    html += '<div class="dnc-sn-sc-lookup-detail-label">ชื่อ</div>';
+                    html += '<div class="dnc-sn-sc-lookup-detail-val">' + escapeHtml(c.display_name || '—') + '</div>';
+                    if (c.email) {
+                        html += '<div class="dnc-sn-sc-lookup-detail-label">Email</div>';
+                        html += '<div class="dnc-sn-sc-lookup-detail-val">' + escapeHtml(c.email) + '</div>';
+                    }
+                    if (c.phone) {
+                        html += '<div class="dnc-sn-sc-lookup-detail-label">โทร</div>';
+                        html += '<div class="dnc-sn-sc-lookup-detail-val">' + escapeHtml(c.phone) + '</div>';
+                    }
+                    html += '</div>';
+                }
+
+                // State-specific banners
+                if (status === 'stolen') {
+                    html += '<div class="dnc-sn-sc-lookup-banner dnc-sn-sc-lookup-banner-danger">'
+                        + '🚨 <strong>เพลทรายงานหาย</strong> — แจ้ง admin ทันที + ตรวจหลักฐานเพิ่ม'
+                        + '</div>';
+                } else if (status === 'voided' || status === 'recalled') {
+                    html += '<div class="dnc-sn-sc-lookup-banner dnc-sn-sc-lookup-banner-danger">'
+                        + '⚠️ <strong>S/N นี้อยู่ในสถานะ ' + escapeHtml(statusLabelTh(status)) + '</strong> — ติดต่อ Admin ก่อนรับเคลม'
+                        + '</div>';
+                } else if (status === 'in_pool' || status === 'reserved') {
+                    html += '<div class="dnc-sn-sc-lookup-banner dnc-sn-sc-lookup-banner-info">'
+                        + 'ℹ️ ลูกค้ายังไม่ได้ลงทะเบียน — แนะนำให้ลูกค้าสแกน QR ที่ตัวสินค้าก่อน'
+                        + '</div>';
+                } else if (status === 'shipped') {
+                    html += '<div class="dnc-sn-sc-lookup-banner dnc-sn-sc-lookup-banner-warn">'
+                        + '📦 ส่งออกแล้วแต่ลูกค้ายังไม่ activate — ขอใบเสร็จ + ช่วยลูกค้าลงทะเบียน'
+                        + '</div>';
+                }
+
+                // Recent timeline (last 5)
+                if (res.data.timeline && res.data.timeline.length) {
+                    html += '<div class="dnc-sn-sc-lookup-section-title">Timeline (5 ล่าสุด)</div>';
+                    html += '<ul class="dnc-sn-sc-lookup-timeline">';
+                    res.data.timeline.slice(0, 5).forEach(function(t) {
+                        html += '<li>'
+                            + '<span class="ts">' + escapeHtml(fmtDate(t.created_at)) + '</span> '
+                            + escapeHtml(eventLabelTh(t.event_type))
+                            + '</li>';
+                    });
+                    html += '</ul>';
+                }
+
+                // Sticky bottom actions (read-only — Open Claim is link only)
+                html += '<div class="dnc-sn-sc-lookup-actions">';
+                var canOpenClaim = (status === 'registered' || status === 'shipped' || status === 'transferred');
+                if (canOpenClaim) {
+                    var claimUrl = ADMIN_CLAIMS_URL + '?sn=' + encodeURIComponent(p.sn) + '#claims';
+                    html += '<a class="dnc-sn-sc-lookup-action-btn dnc-sn-sc-lookup-action-btn-primary" '
+                        + 'href="' + escapeHtml(claimUrl) + '" target="_blank">+ เปิดเคลม</a>';
+                }
+                html += '<button type="button" class="dnc-sn-sc-lookup-action-btn" onclick="document.getElementById(\'dnc-sn-sc-lookup-input\').value=\'\';document.getElementById(\'dnc-sn-sc-lookup-input\').focus();document.getElementById(\'dnc-sn-sc-lookup-result\').innerHTML=\'<div class=&quot;dnc-sn-sc-lookup-result-empty&quot;>👋 พิมพ์ S/N หรือกดปุ่มสแกน QR ด้านบน</div>\';">🔍 ค้นหา S/N อื่น</button>';
+                html += '</div>';
+
+                html += '</div>';
+                resultEl.innerHTML = html;
+            }
+
+            // ─── Wire up events ───────────────────────────────────────────
+            goBtn.addEventListener('click', doLookup);
+            input.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    doLookup();
+                }
+            });
+            scanBtn.addEventListener('click', startScan);
+            scanCancelBtn.addEventListener('click', stopScan);
+
+            // Auto-focus on load (USB barcode scanner support)
+            input.focus();
+        })();
+        </script>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+if ( ! shortcode_exists( 'dinoco_sc_quick_lookup' ) ) {
+    add_shortcode( 'dinoco_sc_quick_lookup', 'dinoco_sc_quick_lookup_render' );
+}
+
+// Module Registry self-registration for SC Quick Lookup (Pillar 1)
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+    dinoco_register_admin_module( array(
+        'key'         => 'sc_lookup',
+        'shortcode'   => 'dinoco_sc_quick_lookup',
+        'label'       => '🔍 SC Quick Lookup',
+        'description' => 'Mobile S/N verification for Service Center counter staff',
+        'section'     => 'claims',
+        'icon'        => 'fa-search',
+        'color'       => '#2563eb',
+        'cache_ttl'   => 0, // always fresh — sensitive PII, no caching
+        'capability'  => 'dinoco_sn_view_pii',
+        'order'       => 10,
+        'source'      => '[Admin System] DINOCO Service Center & Claims V.31.1',
     ) );
 }, 30 );

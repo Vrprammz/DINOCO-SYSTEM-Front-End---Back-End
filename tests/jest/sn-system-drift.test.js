@@ -804,6 +804,36 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(manager).toMatch(/dncSnDownloadQrPdf — REMOVED Round 3/);
     });
 
+    test('Phase 3 W8.4 — stolen/recalled activate block + Telegram alert', () => {
+        const liff = readSnippet('liff');
+
+        // V.0.4 marker in version header
+        expect(liff).toMatch(/V\.0\.4.*Phase 3 W8\.4/);
+
+        // Stolen status explicit handler with Telegram alert
+        expect(liff).toMatch(/\$status\s*===\s*'stolen'/);
+        expect(liff).toContain("'activate_blocked_stolen'");
+        expect(liff).toMatch(/STOLEN PLATE ACTIVATE ATTEMPT/);
+
+        // Recalled status explicit handler
+        expect(liff).toMatch(/\$status\s*===\s*'recalled'/);
+        expect(liff).toContain("'activate_blocked_recalled'");
+
+        // Customer-friendly Thai messages (no info leak to potential fraudster)
+        expect(liff).toContain('เพลทรายงานหายแล้ว');
+        expect(liff).toContain('เพลทถูกเรียกคืน');
+
+        // Defensive: Telegram + audit + obs all function_exists guarded
+        expect(liff).toMatch(/function_exists\(\s*'b2b_tg_send_dedup'\s*\)/);
+        expect(liff).toMatch(/function_exists\(\s*'dinoco_sn_audit_log'\s*\)/);
+
+        // Try/catch — never throws from render path
+        expect(liff).toMatch(/catch\s*\(\s*\\Throwable\s+\$e\s*\)/);
+
+        // Telegram dedup 1hr (3600s)
+        expect(liff).toMatch(/'stolen_activate_'\s*\.\s*\$sn/);
+    });
+
     test('Round 3 — First-time login flow uses LINE OAuth state-token system', () => {
         const liff = readSnippet('liff');
         const callback = fs.readFileSync(path.join(REPO_ROOT, '[System] LINE Callback'), 'utf8');
@@ -2838,6 +2868,203 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
 
         test('Drift sentinel — V.31.0 file passes balanced-brace check', () => {
             const code = readAssets();
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+    });
+
+    /* ════════════════════════════════════════════════════════════════════
+     * Phase 3 W8.5 — Service Center Quick Lookup mobile shortcode
+     * Source: [Admin System] DINOCO Service Center & Claims V.31.1
+     * ════════════════════════════════════════════════════════════════════ */
+    describe('Phase 3 W8.5 — SC Quick Lookup mobile shortcode', () => {
+        const SC_FILE = '[Admin System] DINOCO Service Center & Claims';
+        const readSc = () => fs.readFileSync(path.join(REPO_ROOT, SC_FILE), 'utf8');
+
+        test('Service Center file bumped to V.31.1+', () => {
+            const code = readSc();
+            expect(code).toMatch(/Version:\s*V\.31\.[1-9]/);
+        });
+
+        test('Shortcode [dinoco_sc_quick_lookup] registered', () => {
+            const code = readSc();
+            expect(code).toContain("add_shortcode( 'dinoco_sc_quick_lookup'");
+        });
+
+        test('Render function dinoco_sc_quick_lookup_render exists', () => {
+            const code = readSc();
+            expect(code).toMatch(/function\s+dinoco_sc_quick_lookup_render\s*\(/);
+        });
+
+        test('Permission gate uses dinoco_sn_user_can_view_pii() helper', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // Must call the PII permission helper
+            expect(renderBody).toContain('dinoco_sn_user_can_view_pii');
+            // Defensive function_exists guard
+            expect(renderBody).toMatch(/function_exists\s*\(\s*['"]dinoco_sn_user_can_view_pii['"]/);
+            // Fallback to manage_options when helper missing
+            expect(renderBody).toContain("manage_options");
+        });
+
+        test('Gate redirects anonymous users to wp_login_url', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            expect(renderBody).toContain('is_user_logged_in');
+            expect(renderBody).toContain('wp_login_url');
+        });
+
+        test('Gate renders denied div for users without view_pii cap', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            expect(renderBody).toContain('dnc-sn-sc-lookup-denied');
+            expect(renderBody).toContain('dinoco_sn_view_pii');
+        });
+
+        test('UI has 3 main states (empty / loading / found / not_found)', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            expect(renderBody).toContain('dnc-sn-sc-lookup-result-empty');
+            expect(renderBody).toContain('dnc-sn-sc-lookup-result-loading');
+            expect(renderBody).toContain('dnc-sn-sc-lookup-result-found');
+            expect(renderBody).toContain('dnc-sn-sc-lookup-result-not-found');
+        });
+
+        test('QR scanner is lazy-loaded with cache flag _html5QrcodeLoaded', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // Library URL
+            expect(renderBody).toContain('html5-qrcode');
+            // Cache flag to prevent reload
+            expect(renderBody).toContain('_html5QrcodeLoaded');
+            // Camera permission denied → fallback toast (showToast helper)
+            expect(renderBody).toContain('showToast');
+        });
+
+        test('Mobile-first responsive: ≤640px primary breakpoint', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            expect(renderBody).toMatch(/@media\s*\(max-width:\s*640px\)/);
+        });
+
+        test('Touch targets ≥44px (≥48px for primary CTAs)', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // Primary scan button explicitly 52px
+            expect(renderBody).toMatch(/min-height:\s*5[0-9]px/);
+            // Secondary buttons at least 44px
+            expect(renderBody).toMatch(/min-height:\s*4[4-9]px/);
+        });
+
+        test('CSS scoped under .dnc-sn-sc-lookup-* prefix (no leak)', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // Must use scoped class names
+            expect(renderBody).toContain('dnc-sn-sc-lookup-root');
+            expect(renderBody).toContain('dnc-sn-sc-lookup-result');
+            expect(renderBody).toContain('dnc-sn-sc-lookup-input');
+            // Should NOT redefine generic classes that would leak
+            expect(renderBody).not.toMatch(/^\s*\.btn\s*\{/m);
+            expect(renderBody).not.toMatch(/^\s*\.card\s*\{/m);
+        });
+
+        test('Calls existing /sc-lookup REST endpoint (no new endpoint)', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // Must call the existing endpoint registered in SN REST API V.0.19+
+            expect(renderBody).toContain('/sc-lookup/');
+            // Uses WP REST nonce header
+            expect(renderBody).toContain('X-WP-Nonce');
+            // No own register_rest_route in this render function
+            const beforeNextFunction = renderBody.split(/^if\s*\(\s*!\s*function_exists/m)[0] || '';
+            expect(beforeNextFunction).not.toContain('register_rest_route');
+        });
+
+        test('Read-only — no POST endpoints called from this UI', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            const fetchBlocks = renderBody.match(/fetch\s*\([^)]+\)/g) || [];
+            // Every fetch must be a GET (no method:'POST' inside fetch options)
+            fetchBlocks.forEach((block) => {
+                expect(block).not.toMatch(/method\s*:\s*['"]POST['"]/i);
+            });
+            // No mutation REST endpoints called via fetch (whole-word match,
+            // ignores docs/footer hint text like "claim/swap/void/recall")
+            const sliceForRender = renderBody.split(/^if\s*\(\s*!\s*shortcode_exists/m)[0] || '';
+            // Match REST_BASE + '/void' style fetch URL composition
+            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/void/);
+            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/swap/);
+            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/recall/);
+            expect(sliceForRender).not.toMatch(/REST_BASE\s*\+\s*['"]\/activate/);
+        });
+
+        test('Module Registry self-registration (key=sc_lookup, section=claims)', () => {
+            const code = readSc();
+            // Module Registry registration block exists
+            expect(code).toContain("'key'         => 'sc_lookup'");
+            expect(code).toContain("'shortcode'   => 'dinoco_sc_quick_lookup'");
+            expect(code).toContain("'section'     => 'claims'");
+            expect(code).toMatch(/'order'\s*=>\s*10\b/);
+            // cache_ttl must be 0 (always fresh — sensitive PII)
+            expect(code).toMatch(/'cache_ttl'\s*=>\s*0\b/);
+            // Capability gating
+            expect(code).toContain("'capability'  => 'dinoco_sn_view_pii'");
+        });
+
+        test('Stolen plate state surfaces danger banner', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // Stolen status must show danger banner with alert text
+            expect(renderBody).toContain('stolen');
+            expect(renderBody).toMatch(/dnc-sn-sc-lookup-banner-danger/);
+            // Telegram alert helper invoked defensively somewhere in file
+            // (defensive — may live in audit hook server-side or future Phase 4)
+            // For now require the danger banner copy exists.
+            expect(renderBody).toMatch(/รายงานหาย|stolen/i);
+        });
+
+        test('Open Claim button is a link (not POST)', () => {
+            const code = readSc();
+            const renderBody = code.split('function dinoco_sc_quick_lookup_render')[1] || '';
+            // The "เปิดเคลม" CTA must be an <a href> not a fetch+POST
+            expect(renderBody).toContain('เปิดเคลม');
+            expect(renderBody).toContain('<a class="dnc-sn-sc-lookup-action-btn');
+        });
+
+        test('Audit logging happens server-side via /sc-lookup endpoint', () => {
+            // Drift guard: confirm SN REST API has audit hook on sc-lookup or
+            // sn detail handler. We don't add client-side audit fetch — the
+            // server logs as part of the lookup endpoint per Phase 3 W8.5
+            // design.
+            const restCode = readSnippet('rest');
+            expect(restCode).toContain("/sc-lookup/");
+            // Audit log helper exists and is callable
+            expect(restCode).toMatch(/function\s+dinoco_sn_audit_log\s*\(/);
+        });
+
+        test('PHPUnit pure-logic test SnScLookupPermissionTest.php exists with required cases', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnScLookupPermissionTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('class SnScLookupPermissionTest');
+            // 4 outcome paths covered
+            expect(content).toContain('test_anonymous_user_redirected_to_login');
+            expect(content).toContain('test_logged_in_with_view_pii_cap_allowed');
+            expect(content).toContain('test_admin_allowed_when_helper_missing');
+            expect(content).toContain('test_logged_in_without_caps_denied');
+            // Helper-precedence cases
+            expect(content).toContain('test_helper_decision_preferred_over_admin_when_helper_exists');
+            expect(content).toContain('test_helper_returning_false_blocks_even_with_admin_flag_set');
+            // Pure function + outcomes contract
+            expect(content).toContain('test_gate_is_pure_function_no_side_effects');
+            expect(content).toContain('test_only_three_outcomes');
+            // Read-only contract
+            expect(content).toContain('test_view_pii_does_not_imply_write_capability');
+        });
+
+        test('Drift sentinel — V.31.1 file passes balanced-brace check', () => {
+            const code = readSc();
             const opens  = (code.match(/\{/g) || []).length;
             const closes = (code.match(/\}/g) || []).length;
             expect(opens).toBe(closes);
