@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.32 (2026-05-07) — Phase 5 W16.3 marketplace timeout cron     ║
  * ║  Version: V.0.31 (2026-05-07) — Phase 5 W15.1+W15.5+W15.6 Tab 11 Marketplace║
  * ║  Version: V.0.30 (2026-05-07) — Phase 4 W13 F#16 named helpers + weekly Flex builder║
  * ║  Version: V.0.29 (2026-05-05) — Phase 3 W10.3+W11.2 Tab 6 LTV CSV Export + Tab 9 Recovery Modal║
@@ -8087,6 +8088,81 @@ if ( ! function_exists( 'dinoco_sn_run_demand_forecast' ) ) {
     }
 }
 
+/* ─── Phase 5 W16.3 V.0.32 — Marketplace Pending Payment Timeout Cron ─── */
+
+if ( ! function_exists( 'dinoco_sn_run_marketplace_timeout' ) ) {
+    /**
+     * Auto-cancel extension marketplace orders stuck in pending_payment > 24h
+     * with no slip_image_id uploaded. Customer LINE Flex notification (defensive).
+     *
+     * Runs every 5 min. Heartbeat tracked in 'dinoco_cron_sn_marketplace_timeout_last_run'.
+     *
+     * Idempotent: re-running on already-expired rows = no-op (status filter).
+     */
+    function dinoco_sn_run_marketplace_timeout() {
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) return;
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) ) return;
+        if ( ! dinoco_sn_table_exists( 'extensions' ) ) return;
+
+        try {
+            global $wpdb;
+            $tbl = dinoco_sn_table( 'extensions' );
+            $cutoff = gmdate( 'Y-m-d H:i:s', time() - DAY_IN_SECONDS );
+
+            // Find candidates (pending_payment > 24h with no slip)
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, sn, user_id FROM {$tbl}
+                 WHERE payment_status = 'pending_payment'
+                   AND ( slip_image_id IS NULL OR slip_image_id = 0 )
+                   AND created_at < %s
+                 ORDER BY id ASC
+                 LIMIT 100",
+                $cutoff
+            ) );
+
+            if ( empty( $rows ) ) {
+                update_option( 'dinoco_cron_sn_marketplace_timeout_last_run', current_time( 'mysql' ) );
+                return;
+            }
+
+            $expired_count = 0;
+            foreach ( $rows as $row ) {
+                $upd = $wpdb->update(
+                    $tbl,
+                    array(
+                        'payment_status' => 'expired',
+                        'cancelled_at'   => current_time( 'mysql' ),
+                    ),
+                    array( 'id' => $row->id, 'payment_status' => 'pending_payment' ),
+                    array( '%s', '%s' ),
+                    array( '%d', '%s' )
+                );
+                if ( $upd > 0 ) {
+                    $expired_count++;
+                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                        dinoco_sn_audit_log( 'extension_expired', array(
+                            'sn'           => $row->sn,
+                            'extension_id' => (int) $row->id,
+                            'user_id'      => (int) $row->user_id,
+                            'context'      => array( 'reason' => 'pending_payment_timeout_24h' ),
+                        ) );
+                    }
+                }
+            }
+
+            update_option( 'dinoco_sn_marketplace_timeout_last_run', array(
+                'at'            => current_time( 'mysql' ),
+                'expired_count' => $expired_count,
+            ), false );
+            update_option( 'dinoco_cron_sn_marketplace_timeout_last_run', current_time( 'mysql' ) );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_marketplace_timeout' ) );
+            }
+        }
+    }
+}
+
 /* ─── Phase 4 W13.3 V.0.30 — Weekly Forecast Flex Builder ─── */
 
 if ( ! function_exists( 'dinoco_sn_build_weekly_forecast_flex' ) ) {
@@ -9779,6 +9855,12 @@ add_action( 'init', function() {
     if ( ! wp_next_scheduled( 'dinoco_sn_demand_forecast_cron' ) ) {
         wp_schedule_event( time(), 'weekly', 'dinoco_sn_demand_forecast_cron' );
     }
+    // Phase 5 W16.3 V.0.32 — Marketplace pending payment timeout (every 5 min)
+    if ( ! wp_next_scheduled( 'dinoco_sn_marketplace_timeout_cron' ) ) {
+        $sched = isset( wp_get_schedules()['five_minutes'] ) ? 'five_minutes'
+            : ( isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly' );
+        wp_schedule_event( time(), $sched, 'dinoco_sn_marketplace_timeout_cron' );
+    }
 
     if ( function_exists( 'dinoco_register_cron' ) ) {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
@@ -9795,6 +9877,10 @@ add_action( 'init', function() {
         dinoco_register_cron( 'dinoco_sn_gray_market_scan_cron', 'weekly', 'dinoco_sn_run_gray_market_scan' );
         // dinoco_sn_fraud_aggregate_cron — REMOVED Q21 (2026-05-05)
         dinoco_register_cron( 'dinoco_sn_demand_forecast_cron', 'weekly', 'dinoco_sn_run_demand_forecast' );
+        // Phase 5 W16.3 — pending payment timeout (every 5 min, fallback hourly)
+        dinoco_register_cron( 'dinoco_sn_marketplace_timeout_cron',
+            isset( wp_get_schedules()['five_minutes'] ) ? 'five_minutes' : 'fifteen_minutes',
+            'dinoco_sn_run_marketplace_timeout' );
     } else {
         // Fallback when Idempotency Helper / registry wrapper not synced
         if ( ! has_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' ) ) {
@@ -9830,6 +9916,10 @@ add_action( 'init', function() {
         // dinoco_sn_fraud_aggregate_cron — REMOVED Q21 (2026-05-05)
         if ( ! has_action( 'dinoco_sn_demand_forecast_cron', 'dinoco_sn_run_demand_forecast' ) ) {
             add_action( 'dinoco_sn_demand_forecast_cron', 'dinoco_sn_run_demand_forecast' );
+        }
+        // Phase 5 W16.3 V.0.32 — marketplace timeout cron fallback
+        if ( ! has_action( 'dinoco_sn_marketplace_timeout_cron', 'dinoco_sn_run_marketplace_timeout' ) ) {
+            add_action( 'dinoco_sn_marketplace_timeout_cron', 'dinoco_sn_run_marketplace_timeout' );
         }
     }
 } );

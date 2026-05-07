@@ -5201,4 +5201,71 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(content).toContain('test_compute_savings_zero_base_returns_null');
         });
     });
+
+    describe('Phase 5 W16.3 Marketplace timeout cron', () => {
+        function readManager() {
+            const file = path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager');
+            return fs.readFileSync(file, 'utf8');
+        }
+
+        test('Manager V.0.32 header bumped', () => {
+            expect(readManager()).toMatch(/Version: V\.0\.32 \(2026-05-07\) — Phase 5 W16\.3/);
+        });
+
+        test('cron worker function dinoco_sn_run_marketplace_timeout exists', () => {
+            const code = readManager();
+            expect(code).toContain('function dinoco_sn_run_marketplace_timeout');
+            expect(code).toContain("'extension_expired'");
+            expect(code).toContain('pending_payment_timeout_24h');
+        });
+
+        test('cron registered via dinoco_register_cron with 5min schedule', () => {
+            const code = readManager();
+            expect(code).toContain("dinoco_register_cron( 'dinoco_sn_marketplace_timeout_cron'");
+            expect(code).toMatch(/'five_minutes'\s*:\s*'fifteen_minutes'/);
+            expect(code).toContain("'dinoco_sn_run_marketplace_timeout'");
+        });
+
+        test('wp_schedule_event scheduling block', () => {
+            const code = readManager();
+            expect(code).toMatch(/wp_next_scheduled\(\s*'dinoco_sn_marketplace_timeout_cron'/);
+            expect(code).toMatch(/wp_schedule_event\(\s*time\(\),\s*\$sched,\s*'dinoco_sn_marketplace_timeout_cron'/);
+        });
+
+        test('add_action fallback when dinoco_register_cron missing', () => {
+            const code = readManager();
+            expect(code).toMatch(/has_action\(\s*'dinoco_sn_marketplace_timeout_cron'/);
+        });
+
+        test('worker uses 24h cutoff via DAY_IN_SECONDS', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_run_marketplace_timeout')[1] || '';
+            expect(fnBlock).toContain('DAY_IN_SECONDS');
+            expect(fnBlock).toContain("payment_status = 'pending_payment'");
+            expect(fnBlock).toMatch(/slip_image_id IS NULL OR slip_image_id = 0/);
+        });
+
+        test('worker batch cap 100 rows per run', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_run_marketplace_timeout')[1] || '';
+            expect(fnBlock).toMatch(/LIMIT 100/);
+        });
+
+        test('worker writes 2 heartbeat options + audit log', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_run_marketplace_timeout')[1] || '';
+            expect(fnBlock).toContain("'dinoco_sn_marketplace_timeout_last_run'");
+            expect(fnBlock).toContain("'dinoco_cron_sn_marketplace_timeout_last_run'");
+            expect(fnBlock).toMatch(/dinoco_sn_audit_log/);
+        });
+
+        test('PHPUnit SnMarketplaceTimeoutTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnMarketplaceTimeoutTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('test_cutoff_is_24h_before_now');
+            expect(content).toContain('test_eligibility_pending_payment_no_slip_old_returns_true');
+            expect(content).toContain('test_batch_cap_at_limit');
+        });
+    });
 });
