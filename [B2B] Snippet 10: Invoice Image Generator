@@ -1,11 +1,32 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
  * ║  [B2B] Snippet 10: Invoice Image Generator                 ║
- * ║  Version: V.30.8 — Scope GD admin notice + dismissible flag (MED-3 fix) ║
+ * ║  Version: V.31.0 — Phase 5 W17.1 Tax invoice for warranty extensions ║
  * ║  DB_ID: 61                                                  ║
  * ║  Multi-page | Logo | 7-col table | Digital Signature       ║
  * ║  Font: Sarabun (Google Fonts gstatic CDN)                  ║
  * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * V.31.0 Changes (2026-05-07 — Phase 5 W17.1 Tax Invoice for Warranty Extensions):
+ * - NEW b2b_send_extension_receipt($extension_id, $line_uid) — render tax invoice PNG
+ *   for F#8 warranty extension purchase from wp_dinoco_sn_warranty_extensions.
+ *   VAT 7% breakdown (price_paid is VAT-inclusive per Thai retail convention):
+ *     subtotal = round(price_paid / 1.07, 2)
+ *     vat      = price_paid - subtotal
+ *   Output: PNG saved under wp-content/uploads/sn-extension-invoices/.
+ *   Best-effort LINE push via b2b_line_push_raw($line_uid, [image_message]).
+ *   Returns array { success, image_url, invoice_number, error? }.
+ * - NEW b2b_generate_extension_invoice_number() — atomic sequential generator
+ *   using GET_LOCK('dinoco_ext_inv_counter', 5) → increments
+ *   wp_option `dinoco_sn_extension_invoice_counter_{YYYY}` (year from current_time).
+ *   Format: INV-EXT-2026-00001 (5-digit zero-pad). Auto-resets per calendar year.
+ * - NEW b2b_render_extension_receipt_pages($extension_row, $invoice_no, $customer)
+ *   — GD render single-page tax invoice (header + customer + line items table
+ *   + VAT breakdown footer + DINOCO tax ID + digital signatures).
+ * - Defensive: returns error structure if table wp_dinoco_sn_warranty_extensions
+ *   missing OR GD library unavailable. NEVER throws.
+ * - Cleanup cron (existing b2b_cleanup_old_invoices) extended to clean
+ *   sn-extension-invoices directory too (30-day retention).
  *
  * V.30.8 Changes (2026-04-28 — code-reviewer remediation MED-3):
  * - GD admin notice scoped to relevant pages — เดิม fire ทุกหน้า admin (edit.php,
@@ -1152,4 +1173,384 @@ function b2b_inv_gd_notice_reset_check() {
             delete_option('b2b_inv_gd_notice_dismissed');
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// V.31.0 — Phase 5 W17.1: Tax Invoice for Warranty Extensions (F#8)
+// — Reads wp_dinoco_sn_warranty_extensions (read-only, no schema mutation)
+// — Distinct from b2b_send_invoice_image (B2B order flow). NEW render path.
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate next sequential extension tax invoice number.
+ * Atomic via MySQL GET_LOCK to serialize concurrent allocations.
+ * Per-year counter (auto-resets each calendar year, Asia/Bangkok).
+ *
+ * Format: INV-EXT-{YYYY}-{NNNNN}  (zero-padded 5 digits)
+ *
+ * @return string e.g. "INV-EXT-2026-00001". Best-effort: falls back to
+ *                timestamp-based suffix if GET_LOCK fails (still unique enough
+ *                for receipt purposes — never throws).
+ */
+function b2b_generate_extension_invoice_number() {
+    global $wpdb;
+    $year = (int) current_time('Y');
+    if ($year < 2024 || $year > 2200) $year = (int) date('Y'); // sanity fallback
+    $option_key = 'dinoco_sn_extension_invoice_counter_' . $year;
+    $lock_key = 'dinoco_ext_inv_counter';
+    $counter = 0;
+    $got_lock = false;
+
+    try {
+        // Best-effort lock — wp_db may be in degraded state during install
+        if ($wpdb && method_exists($wpdb, 'get_var')) {
+            $lock_result = $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, %d)", $lock_key, 5));
+            $got_lock = ($lock_result === '1' || $lock_result === 1);
+        }
+
+        $current = (int) get_option($option_key, 0);
+        $counter = $current + 1;
+
+        // Reset if rolled to absurd value (corruption guard)
+        if ($counter > 999999) {
+            if (function_exists('b2b_log')) b2b_log('[ExtInvoice] counter overflow year=' . $year . ' resetting to 1');
+            $counter = 1;
+        }
+
+        update_option($option_key, $counter, false);
+    } finally {
+        if ($got_lock && $wpdb && method_exists($wpdb, 'query')) {
+            $wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_key));
+        }
+    }
+
+    return sprintf('INV-EXT-%04d-%05d', $year, $counter);
+}
+
+/**
+ * Compute VAT 7% breakdown from VAT-inclusive total (Thai retail convention).
+ * Pure function — testable in isolation.
+ *
+ * @param float $total VAT-inclusive amount (price_paid)
+ * @return array{subtotal:float, vat:float, total:float}
+ */
+function b2b_extension_vat_breakdown($total) {
+    $total = (float) $total;
+    if ($total <= 0) {
+        return array('subtotal' => 0.0, 'vat' => 0.0, 'total' => 0.0);
+    }
+    $subtotal = round($total / 1.07, 2);
+    $vat = round($total - $subtotal, 2);
+    return array(
+        'subtotal' => $subtotal,
+        'vat'      => $vat,
+        'total'    => round($total, 2),
+    );
+}
+
+/**
+ * Render extension tax invoice PNG (single page).
+ *
+ * @param array  $ext_row    DB row from wp_dinoco_sn_warranty_extensions
+ * @param string $invoice_no e.g. "INV-EXT-2026-00001"
+ * @param array  $customer   {name, address, sku, product_name}
+ * @return string|false Filesystem path to PNG, or false on failure.
+ */
+function b2b_render_extension_receipt_pages($ext_row, $invoice_no, $customer) {
+    if (!function_exists('imagecreatetruecolor') || !function_exists('imagettftext')) {
+        if (function_exists('b2b_log')) b2b_log('[ExtInvoice] fail=gd_missing ext=' . ($ext_row['id'] ?? '?'));
+        return false;
+    }
+    if (!function_exists('b2b_inv_get_font') || !function_exists('b2b_inv_colors')) {
+        if (function_exists('b2b_log')) b2b_log('[ExtInvoice] fail=helpers_missing ext=' . ($ext_row['id'] ?? '?'));
+        return false;
+    }
+
+    $font  = b2b_inv_get_font(false);
+    $fontB = b2b_inv_get_font(true);
+    if (!$font) {
+        if (function_exists('b2b_log')) b2b_log('[ExtInvoice] fail=font_missing ext=' . ($ext_row['id'] ?? '?'));
+        return false;
+    }
+    if (!$fontB) $fontB = $font;
+
+    $upload = wp_upload_dir();
+    $dir = $upload['basedir'] . '/sn-extension-invoices';
+    if (!file_exists($dir)) wp_mkdir_p($dir);
+
+    // ── Layout ──
+    $W = defined('B2B_INV_W') ? B2B_INV_W : 1240;
+    $H = defined('B2B_INV_H') ? B2B_INV_H : 1754;
+    $MX = defined('B2B_INV_MX') ? B2B_INV_MX : 60;
+
+    $img = imagecreatetruecolor($W, $H);
+    imagealphablending($img, true);
+    $colors = b2b_inv_colors($img);
+    imagefill($img, 0, 0, $colors['white']);
+
+    // ── Header ──
+    $y = 80;
+    imagettftext($img, 22, 0, $MX, $y, $colors['black'], $fontB, 'ใบเสร็จรับเงิน / ใบกำกับภาษี');
+    imagettftext($img, 12, 0, $MX, $y + 28, $colors['gray'], $font, 'Tax Invoice / Receipt — Warranty Extension');
+    $y += 62;
+
+    // Invoice no + date
+    $issue_date = !empty($ext_row['paid_at']) ? $ext_row['paid_at'] : current_time('mysql');
+    $issue_date_fmt = date('d/m/Y', strtotime($issue_date));
+    imagettftext($img, 13, 0, $MX, $y, $colors['black'], $fontB, 'เลขที่: ' . $invoice_no);
+    imagettftext($img, 12, 0, $MX + 500, $y, $colors['black'], $font, 'วันที่ออก: ' . $issue_date_fmt);
+    $y += 36;
+
+    // Divider
+    imageline($img, $MX, $y, $W - $MX, $y, $colors['lgray']);
+    $y += 24;
+
+    // ── Customer ──
+    imagettftext($img, 11, 0, $MX, $y, $colors['gray'], $font, 'ลูกค้า:');
+    imagettftext($img, 13, 0, $MX + 80, $y, $colors['black'], $fontB, $customer['name'] ?? 'Customer');
+    $y += 28;
+    if (!empty($customer['address'])) {
+        $addr = mb_substr((string) $customer['address'], 0, 120, 'UTF-8');
+        imagettftext($img, 11, 0, $MX + 80, $y, $colors['gray'], $font, $addr);
+        $y += 24;
+    }
+    $y += 12;
+
+    // ── Line items table header ──
+    imagefilledrectangle($img, $MX, $y, $W - $MX, $y + 36, $colors['vlgray']);
+    imagettftext($img, 11, 0, $MX + 12,  $y + 24, $colors['black'], $fontB, 'รายการ');
+    imagettftext($img, 11, 0, $MX + 540, $y + 24, $colors['black'], $fontB, 'S/N');
+    imagettftext($img, 11, 0, $MX + 760, $y + 24, $colors['black'], $fontB, 'ระยะเวลา');
+    imagettftext($img, 11, 0, $W - $MX - 110, $y + 24, $colors['black'], $fontB, 'จำนวนเงิน');
+    $y += 44;
+
+    // Item row
+    $product_name = $customer['product_name'] ?? ($customer['sku'] ?? 'Warranty Extension');
+    $sn = $ext_row['sn'] ?? '';
+    $months = (int) ($ext_row['extension_months'] ?? 0);
+    $years_label = $months >= 12 ? (round($months / 12, 1) . ' ปี') : ($months . ' เดือน');
+    $service_label = 'ต่อประกัน ' . $years_label;
+
+    $vat = b2b_extension_vat_breakdown((float) ($ext_row['price_paid'] ?? 0));
+
+    imagettftext($img, 11, 0, $MX + 12,  $y + 18, $colors['black'], $font, $product_name);
+    imagettftext($img, 9,  0, $MX + 12,  $y + 36, $colors['gray'],  $font, $service_label);
+    imagettftext($img, 10, 0, $MX + 540, $y + 22, $colors['black'], $font, $sn);
+    imagettftext($img, 10, 0, $MX + 760, $y + 22, $colors['black'], $font, $years_label);
+    $amt_str = number_format($vat['subtotal'], 2);
+    imagettftext($img, 11, 0, $W - $MX - 110, $y + 22, $colors['black'], $font, $amt_str);
+    $y += 56;
+    imageline($img, $MX, $y, $W - $MX, $y, $colors['vlgray']);
+    $y += 28;
+
+    // ── VAT breakdown ──
+    $right_label_x = $W - $MX - 320;
+    $right_amt_x   = $W - $MX - 110;
+
+    imagettftext($img, 11, 0, $right_label_x, $y, $colors['gray'], $font, 'ราคา (ก่อน VAT)');
+    imagettftext($img, 11, 0, $right_amt_x, $y, $colors['black'], $font, number_format($vat['subtotal'], 2));
+    $y += 26;
+
+    imagettftext($img, 11, 0, $right_label_x, $y, $colors['gray'], $font, 'ภาษีมูลค่าเพิ่ม 7%');
+    imagettftext($img, 11, 0, $right_amt_x, $y, $colors['black'], $font, number_format($vat['vat'], 2));
+    $y += 26;
+
+    imageline($img, $right_label_x, $y, $W - $MX, $y, $colors['lgray']);
+    $y += 18;
+
+    imagettftext($img, 13, 0, $right_label_x, $y, $colors['black'], $fontB, 'ยอดรวมสุทธิ');
+    imagettftext($img, 13, 0, $right_amt_x, $y, $colors['black'], $fontB, '฿ ' . number_format($vat['total'], 2));
+    $y += 60;
+
+    // ── Bank info (optional, brief) ──
+    if (function_exists('b2b_get_bank_info')) {
+        $bank = b2b_get_bank_info(0); // 0 = no ticket → default bank
+        if (!empty($bank['name']) && $bank['name'] !== '-') {
+            imagettftext($img, 10, 0, $MX, $y, $colors['gray'], $font,
+                'ธนาคาร: ' . $bank['name'] . ' • บัญชี: ' . ($bank['account'] ?? '-') . ' • ' . ($bank['holder'] ?? '-'));
+            $y += 24;
+        }
+    }
+    $y += 16;
+
+    // ── DINOCO tax ID + company info ──
+    $company = defined('B2B_COMPANY_NAME') ? B2B_COMPANY_NAME : 'DINOCO THAILAND';
+    $tax_id  = defined('B2B_COMPANY_TAX_ID') ? B2B_COMPANY_TAX_ID : '0105563000000';
+    imagettftext($img, 11, 0, $MX, $y, $colors['black'], $fontB, $company);
+    $y += 22;
+    imagettftext($img, 10, 0, $MX, $y, $colors['gray'], $font, 'เลขประจำตัวผู้เสียภาษี: ' . $tax_id);
+    $y += 22;
+
+    // ── Digital signatures ──
+    if (function_exists('b2b_inv_draw_signatures')) {
+        b2b_inv_draw_signatures($img, $font, $fontB, $colors);
+    }
+
+    // Footer line
+    $fy = $H - 45;
+    imageline($img, $MX, $fy, $W - $MX, $fy, $colors['vlgray']);
+    imagettftext($img, 9, 0, $MX, $fy + 22, $colors['lgray'], $font,
+        $company . ' • Tax Invoice ' . $invoice_no);
+
+    // ── Save ──
+    $fname = 'inv-' . (int) ($ext_row['id'] ?? 0) . '-' . date('Ymd-His') . '.png';
+    $fpath = $dir . '/' . $fname;
+    imagepng($img, $fpath, 6);
+    imagedestroy($img);
+
+    if (function_exists('b2b_log')) b2b_log('[ExtInvoice] rendered ' . $fname . ' (' . round(filesize($fpath) / 1024) . 'KB)');
+    return $fpath;
+}
+
+/**
+ * Generate + (best-effort) LINE-push tax invoice for a warranty extension.
+ *
+ * @param int    $extension_id Row id in wp_dinoco_sn_warranty_extensions
+ * @param string $line_uid     Customer LINE UID (recipient for image push). Empty = render only, no push.
+ * @return array { success: bool, image_url: string, invoice_number: string, error?: string }
+ */
+function b2b_send_extension_receipt($extension_id, $line_uid = '') {
+    $extension_id = (int) $extension_id;
+    $result = array(
+        'success'        => false,
+        'image_url'      => '',
+        'invoice_number' => '',
+    );
+
+    if ($extension_id <= 0) {
+        $result['error'] = 'invalid_extension_id';
+        if (function_exists('b2b_log')) b2b_log('[ExtInvoice] fail=invalid_extension_id ext=' . $extension_id);
+        return $result;
+    }
+
+    global $wpdb;
+    if (!$wpdb) {
+        $result['error'] = 'wpdb_unavailable';
+        return $result;
+    }
+
+    $table = $wpdb->prefix . 'dinoco_sn_warranty_extensions';
+
+    // Defensive: ensure table exists (table created in Phase 1 W2 dbDelta —
+    // if Manager snippet not yet activated this protects us)
+    $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
+    if ($exists !== $table) {
+        $result['error'] = 'table_missing';
+        if (function_exists('b2b_log')) b2b_log('[ExtInvoice] fail=table_missing ext=' . $extension_id . ' (' . $table . ')');
+        return $result;
+    }
+
+    if (!function_exists('imagecreatetruecolor') || !function_exists('imagettftext')) {
+        $result['error'] = 'gd_missing';
+        if (function_exists('error_log')) error_log('[ExtInvoice] GD library not available for inv ' . $extension_id);
+        return $result;
+    }
+
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id = %d", $extension_id), ARRAY_A);
+    if (!$row) {
+        $result['error'] = 'extension_not_found';
+        if (function_exists('b2b_log')) b2b_log('[ExtInvoice] fail=not_found ext=' . $extension_id);
+        return $result;
+    }
+
+    // Customer name + address (best-effort — fall back to UID if user missing)
+    $customer = array(
+        'name'         => 'Customer',
+        'address'      => '',
+        'sku'          => '',
+        'product_name' => '',
+    );
+    $user_id = (int) ($row['user_id'] ?? 0);
+    if ($user_id > 0 && function_exists('get_userdata')) {
+        $u = get_userdata($user_id);
+        if ($u) {
+            $customer['name'] = $u->display_name ?: $u->user_login;
+        }
+    }
+
+    // SKU + product name from sn_pool (linked_sku) → DINOCO_Catalog
+    $sn = $row['sn'] ?? '';
+    if (!empty($sn) && function_exists('dinoco_sn_get_pool_row')) {
+        $pool = dinoco_sn_get_pool_row($sn);
+        if ($pool && !empty($pool['linked_sku'])) {
+            $customer['sku'] = $pool['linked_sku'];
+            if (class_exists('DINOCO_Catalog') && method_exists('DINOCO_Catalog', 'get_by_sku')) {
+                $prod = DINOCO_Catalog::get_by_sku($pool['linked_sku']);
+                if ($prod && !empty($prod['name'])) $customer['product_name'] = $prod['name'];
+            }
+        }
+    }
+
+    // Address from warranty_registration CPT (best-effort ACF)
+    if (function_exists('get_field') && $user_id > 0) {
+        // Try to find warranty_registration by user_id meta
+        $regs = get_posts(array(
+            'post_type'      => 'warranty_registration',
+            'meta_key'       => 'serial_code',
+            'meta_value'     => $sn,
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'no_found_rows'  => true,
+            'suppress_filters' => true,
+        ));
+        if (!empty($regs)) {
+            $rid = $regs[0];
+            $parts = array_filter(array(
+                get_field('cust_address', $rid),
+                get_field('cust_district', $rid),
+                get_field('cust_province', $rid),
+                get_field('cust_postcode', $rid),
+            ));
+            if (!empty($parts)) $customer['address'] = implode(' ', $parts);
+        }
+    }
+
+    // ── Allocate invoice number ──
+    $invoice_no = b2b_generate_extension_invoice_number();
+    $result['invoice_number'] = $invoice_no;
+
+    // ── Render PNG ──
+    $fpath = b2b_render_extension_receipt_pages($row, $invoice_no, $customer);
+    if (!$fpath) {
+        $result['error'] = 'render_failed';
+        if (function_exists('b2b_log')) b2b_log('[ExtInvoice] fail=render ext=' . $extension_id);
+        return $result;
+    }
+
+    $upload = wp_upload_dir();
+    $url = str_replace($upload['basedir'], $upload['baseurl'], $fpath);
+    $url = str_replace('http://', 'https://', $url);
+    $result['image_url'] = $url;
+    $result['success'] = true;
+
+    // ── Best-effort LINE push ──
+    if (!empty($line_uid)) {
+        if (function_exists('b2b_line_push_raw')) {
+            $msg = array(array(
+                'type'              => 'image',
+                'originalContentUrl' => $url,
+                'previewImageUrl'    => $url,
+            ));
+            $push = b2b_line_push_raw($line_uid, $msg);
+            $code = is_array($push) && isset($push['code']) ? (int) $push['code'] : 0;
+            if (function_exists('b2b_log')) b2b_log('[ExtInvoice] ext=' . $extension_id . ' push code=' . $code . ' uid=' . $line_uid);
+        } else {
+            if (function_exists('b2b_log')) b2b_log('[ExtInvoice] line push helper not available — render-only ext=' . $extension_id);
+        }
+    }
+
+    return $result;
+}
+
+// V.31.0: Extend cleanup cron to handle sn-extension-invoices directory too.
+add_action('b2b_daily_summary_cron', 'b2b_cleanup_old_extension_invoices');
+function b2b_cleanup_old_extension_invoices() {
+    $d = wp_upload_dir();
+    $p = $d['basedir'] . '/sn-extension-invoices';
+    if (!is_dir($p)) return;
+    $c = 0;
+    foreach (glob($p . '/inv-*.png') as $f) {
+        if (filemtime($f) < time() - (30 * 86400)) { @unlink($f); $c++; }
+    }
+    if ($c > 0 && function_exists('b2b_log')) b2b_log('[ExtInvoice] Cleaned ' . $c . ' old extension files');
 }

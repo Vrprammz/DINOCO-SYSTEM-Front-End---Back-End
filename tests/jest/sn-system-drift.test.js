@@ -5268,4 +5268,364 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(content).toContain('test_batch_cap_at_limit');
         });
     });
+
+    // ────────────────────────────────────────────────────────────
+    // Phase 5 W17.1 — Tax Invoice PDF (Snippet 10 V.31.0)
+    // Plan: docs/sn-system/22-phase5-w15-w18-prep.md §W17.1
+    // ────────────────────────────────────────────────────────────
+    describe('Phase 5 W17.1 Tax Invoice PDF', () => {
+        const SNIPPET_10_PATH = path.join(REPO_ROOT, '[B2B] Snippet 10: Invoice Image Generator');
+
+        const readSnippet10 = () => {
+            if (!fs.existsSync(SNIPPET_10_PATH)) {
+                throw new Error('Snippet 10 not found at ' + SNIPPET_10_PATH);
+            }
+            return fs.readFileSync(SNIPPET_10_PATH, 'utf8');
+        };
+
+        test('Snippet 10 file exists', () => {
+            expect(fs.existsSync(SNIPPET_10_PATH)).toBe(true);
+        });
+
+        test('Snippet 10 version bumped to V.31.0+', () => {
+            const code = readSnippet10();
+            expect(code).toMatch(/Version:\s*V\.31\.[0-9]+/);
+        });
+
+        test('Snippet 10 has b2b_send_extension_receipt function', () => {
+            const code = readSnippet10();
+            expect(code).toMatch(/function\s+b2b_send_extension_receipt\s*\(/);
+        });
+
+        test('Snippet 10 has b2b_generate_extension_invoice_number helper', () => {
+            const code = readSnippet10();
+            expect(code).toMatch(/function\s+b2b_generate_extension_invoice_number\s*\(/);
+        });
+
+        test('Snippet 10 has b2b_extension_vat_breakdown helper (VAT 7%)', () => {
+            const code = readSnippet10();
+            expect(code).toMatch(/function\s+b2b_extension_vat_breakdown\s*\(/);
+        });
+
+        test('Snippet 10 has b2b_render_extension_receipt_pages renderer', () => {
+            const code = readSnippet10();
+            expect(code).toMatch(/function\s+b2b_render_extension_receipt_pages\s*\(/);
+        });
+
+        test('Snippet 10 references wp_dinoco_sn_warranty_extensions table (read-only)', () => {
+            const code = readSnippet10();
+            expect(code).toContain('dinoco_sn_warranty_extensions');
+            // Defensive: must use SHOW TABLES LIKE before SELECT (table-missing guard)
+            expect(code).toMatch(/SHOW TABLES LIKE/);
+        });
+
+        test('Snippet 10 uses sequential per-year counter wp_option', () => {
+            const code = readSnippet10();
+            expect(code).toContain('dinoco_sn_extension_invoice_counter_');
+        });
+
+        test('Snippet 10 uses GET_LOCK for atomic counter increment', () => {
+            const code = readSnippet10();
+            // Within b2b_generate_extension_invoice_number scope
+            const fnBlock = code.split('function b2b_generate_extension_invoice_number')[1] || '';
+            const fnSlice = fnBlock.split('function ')[0]; // first function-end approx
+            expect(fnSlice).toMatch(/GET_LOCK/);
+            expect(fnSlice).toMatch(/RELEASE_LOCK/);
+        });
+
+        test('Snippet 10 invoice format INV-EXT-YYYY-NNNNN', () => {
+            const code = readSnippet10();
+            // sprintf format string pattern
+            expect(code).toMatch(/INV-EXT-%04d-%05d/);
+        });
+
+        test('Snippet 10 saves to sn-extension-invoices subdirectory', () => {
+            const code = readSnippet10();
+            expect(code).toContain('sn-extension-invoices');
+        });
+
+        test('Snippet 10 cleanup cron extends to extension invoices (30-day)', () => {
+            const code = readSnippet10();
+            expect(code).toMatch(/function\s+b2b_cleanup_old_extension_invoices/);
+            expect(code).toMatch(/30 \* 86400/);
+        });
+
+        test('Snippet 10 best-effort LINE push via b2b_line_push_raw', () => {
+            const code = readSnippet10();
+            // Must be wrapped in function_exists guard (defensive cross-snippet call)
+            const sendBlock = code.split('function b2b_send_extension_receipt')[1] || '';
+            const sendSlice = sendBlock.split('\nfunction ')[0];
+            expect(sendSlice).toMatch(/function_exists\s*\(\s*['"]b2b_line_push_raw['"]/);
+        });
+
+        test('Snippet 10 returns structured array (success/image_url/invoice_number/error)', () => {
+            const code = readSnippet10();
+            const sendBlock = code.split('function b2b_send_extension_receipt')[1] || '';
+            const sendSlice = sendBlock.split('\nfunction ')[0];
+            expect(sendSlice).toContain("'success'");
+            expect(sendSlice).toContain("'image_url'");
+            expect(sendSlice).toContain("'invoice_number'");
+            // Error structure used in failure paths
+            expect(sendSlice).toMatch(/['"]error['"]\s*\]\s*=/);
+        });
+
+        test('Snippet 10 defensive: returns gracefully if extensions table missing', () => {
+            const code = readSnippet10();
+            const sendBlock = code.split('function b2b_send_extension_receipt')[1] || '';
+            const sendSlice = sendBlock.split('\nfunction ')[0];
+            expect(sendSlice).toMatch(/table_missing/);
+        });
+
+        test('Snippet 10 defensive: returns gracefully if GD missing', () => {
+            const code = readSnippet10();
+            const sendBlock = code.split('function b2b_send_extension_receipt')[1] || '';
+            const sendSlice = sendBlock.split('\nfunction ')[0];
+            expect(sendSlice).toMatch(/gd_missing/);
+            // Also error_log per spec W17.1.4
+            expect(sendSlice).toMatch(/error_log\s*\(/);
+        });
+
+        test('Snippet 10 file size grew (sanity check — V.31.0 should add ~250+ LOC)', () => {
+            const code = readSnippet10();
+            const lineCount = code.split('\n').length;
+            // V.30.8 was ~1155 lines; V.31.0 adds ~270+ LOC of W17.1 code
+            expect(lineCount).toBeGreaterThan(1300);
+        });
+
+        test('PHPUnit SnExtensionInvoiceTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnExtensionInvoiceTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('test_invoice_number_format_matches_pattern');
+            expect(content).toContain('test_counter_monotonic_increment_within_same_year');
+            expect(content).toContain('test_counter_resets_on_new_year');
+            expect(content).toContain('test_vat_breakdown_1284_thb');
+            expect(content).toContain('test_vat_breakdown_subtotal_plus_vat_equals_total');
+        });
+    });
+
+    // ────────────────────────────────────────────────────────────
+    // Phase 5 W17.2 + W17.4 — Q20 Manual Refund Flow
+    // Plan: docs/sn-system/22-phase5-w15-w18-prep.md §W17.2 + §W17.4
+    // Boss: Q20 R2 (manual refund + 4-eyes ≥฿5K)
+    // ────────────────────────────────────────────────────────────
+    describe('Phase 5 W17.2 Refund Flow', () => {
+        const readManager = () => readSnippet('manager');
+        const readRest = () => readSnippet('rest');
+
+        /* ─── Manager schema bumps ─── */
+
+        test('Manager V.0.33 header bumped', () => {
+            expect(readManager()).toMatch(/V\.0\.33.*Phase 5 W17\.2.*W17\.4.*Q20 manual refund/);
+        });
+
+        test('Schema version constant bumped to 1.1', () => {
+            const code = readManager();
+            expect(code).toMatch(/define\(\s*'DINOCO_SN_SCHEMA_VERSION',\s*'1\.1'\s*\)/);
+        });
+
+        test('Schema has 5 new refund columns on extensions table', () => {
+            const code = readManager();
+            expect(code).toContain('refunded_at DATETIME DEFAULT NULL');
+            expect(code).toContain('refund_reason VARCHAR(255) DEFAULT NULL');
+            expect(code).toContain('refund_amount DECIMAL(10,2) DEFAULT NULL');
+            expect(code).toContain('refunded_by BIGINT UNSIGNED DEFAULT NULL');
+            expect(code).toContain('refund_approver BIGINT UNSIGNED DEFAULT NULL');
+        });
+
+        test('Schema has idx_refund_status index', () => {
+            const code = readManager();
+            expect(code).toContain('idx_refund_status');
+            expect(code).toMatch(/ADD KEY idx_refund_status \(refunded_at\)/);
+        });
+
+        test('ALTER helper function declared + idempotent INFORMATION_SCHEMA pattern', () => {
+            const code = readManager();
+            expect(code).toContain('function dinoco_sn_alter_extensions_refund_columns');
+            // Idempotent — must check INFORMATION_SCHEMA before ALTER
+            const fnBlock = code.split('function dinoco_sn_alter_extensions_refund_columns')[1] || '';
+            expect(fnBlock).toContain('information_schema.columns');
+            expect(fnBlock).toContain('information_schema.statistics');
+            expect(fnBlock).toContain('information_schema.tables'); // table exists guard
+        });
+
+        test('ALTER helper called from schema_install', () => {
+            const code = readManager();
+            expect(code).toContain('dinoco_sn_alter_extensions_refund_columns()');
+        });
+
+        /* ─── REST API route + handler ─── */
+
+        test('REST API V.0.25 header bumped', () => {
+            expect(readRest()).toMatch(/V\.0\.25.*Phase 5 W17\.2.*W17\.4.*Q20 manual refund/);
+        });
+
+        test('REST registers POST /marketplace/{id}/refund', () => {
+            const code = readRest();
+            expect(code).toMatch(/register_rest_route\(\s*DINOCO_SN_REST_NAMESPACE,\s*'\/marketplace\/\(\?P<id>\\d\+\)\/refund'/);
+            expect(code).toContain("'callback'            => 'dinoco_sn_rest_marketplace_refund'");
+            expect(code).toContain("'permission_callback' => 'dinoco_sn_perm_admin'");
+        });
+
+        test('REST handler dinoco_sn_rest_marketplace_refund exists', () => {
+            const code = readRest();
+            expect(code).toContain('function dinoco_sn_rest_marketplace_refund');
+        });
+
+        test('REST inner handler dinoco_sn_handler_marketplace_refund exists', () => {
+            const code = readRest();
+            expect(code).toContain('function dinoco_sn_handler_marketplace_refund');
+        });
+
+        test('Refund helper dinoco_sn_apply_refund function exists', () => {
+            const code = readRest();
+            expect(code).toContain('function dinoco_sn_apply_refund');
+        });
+
+        /* ─── Idempotency wrapper used (Round 30+ pattern) ─── */
+
+        test('Idempotency wrapper wired with marketplace-refund namespace', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_rest_marketplace_refund')[1] || '';
+            expect(fnBlock).toContain('dinoco_sn_with_idempotency');
+            expect(fnBlock).toContain("'marketplace-refund'");
+            // body hash fields
+            expect(fnBlock).toMatch(/array\(\s*'id',\s*'refund_amount',\s*'reason'\s*\)/);
+        });
+
+        /* ─── 4-eyes threshold guard (≥ ฿5,000 requires approver) ─── */
+
+        test('4-eyes threshold check enforced (5000 THB)', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            expect(fnBlock).toContain('FOUR_EYES_THRESHOLD = 5000');
+            expect(fnBlock).toMatch(/refund_amount >= \$FOUR_EYES_THRESHOLD/);
+        });
+
+        test('Approver required error code present', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            expect(fnBlock).toContain("'approver_required'");
+        });
+
+        test('Self-approval blocked error code present', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            expect(fnBlock).toContain("'self_approval_blocked'");
+            // Comparison: approver === actor
+            expect(fnBlock).toMatch(/\$approver_user_id === \$actor_user_id/);
+        });
+
+        test('Approver capability check enforced', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            expect(fnBlock).toContain("'approver_not_admin'");
+            expect(fnBlock).toContain("user_can( $approver_user_id, 'dinoco_sn_perm_admin'");
+        });
+
+        /* ─── confirm_text strict match (REFUND CONFIRM) ─── */
+
+        test('confirm_text strict match REFUND CONFIRM enforced', () => {
+            const code = readRest();
+            // Both at validate_callback level + defensive re-check in handler
+            expect(code).toContain("'REFUND CONFIRM'");
+            // count >= 2 references (validate_callback + handler defense)
+            const matches = code.match(/REFUND CONFIRM/g) || [];
+            expect(matches.length).toBeGreaterThanOrEqual(2);
+        });
+
+        /* ─── State machine guard (paid only) ─── */
+
+        test('Wrong state guard blocks non-paid extensions', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            expect(fnBlock).toMatch(/\$ext->payment_status !== 'paid'/);
+            expect(fnBlock).toContain("'wrong_state'");
+        });
+
+        /* ─── refund_amount ≤ price_paid ─── */
+
+        test('refund_amount upper bound check (≤ price_paid)', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            expect(fnBlock).toContain("'refund_exceeds_paid'");
+        });
+
+        /* ─── GET_LOCK + transaction pattern ─── */
+
+        test('GET_LOCK + START TRANSACTION + FOR UPDATE pattern wired', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            expect(fnBlock).toMatch(/SELECT GET_LOCK/);
+            expect(fnBlock).toContain("dinoco_sn_refund_");
+            expect(fnBlock).toMatch(/START TRANSACTION/);
+            expect(fnBlock).toMatch(/SELECT \* FROM \{?\$?tbl\}? WHERE id = %d FOR UPDATE/);
+        });
+
+        test('ROLLBACK + RELEASE_LOCK on every error path', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
+            // Must release lock on rollback (no orphan lock holds)
+            expect(fnBlock).toMatch(/RELEASE_LOCK/);
+            expect(fnBlock).toMatch(/ROLLBACK/);
+        });
+
+        /* ─── Audit event extension_refunded fired (sensitive=true) ─── */
+
+        test('Audit event extension_refunded fired with sensitive=true', () => {
+            const code = readRest();
+            // Inside dinoco_sn_apply_refund
+            const helperBlock = code.split('function dinoco_sn_apply_refund')[1] || '';
+            expect(helperBlock).toContain("'extension_refunded'");
+            expect(helperBlock).toContain('dinoco_sn_audit_log');
+            // Last positional arg = sensitive flag (true → 5y retention)
+            expect(helperBlock).toMatch(/true \/\/ sensitive=true/);
+        });
+
+        /* ─── Warranty revert calc (warranty_until_old preferred) ─── */
+
+        test('Warranty revert uses warranty_until_old when present', () => {
+            const code = readRest();
+            const helperBlock = code.split('function dinoco_sn_apply_refund')[1] || '';
+            expect(helperBlock).toContain('warranty_until_old');
+            // Defensive fallback when NULL/zero-date
+            expect(helperBlock).toContain("'0000-00-00'");
+            expect(helperBlock).toMatch(/extension_months/);
+            // Subtract years fallback
+            expect(helperBlock).toMatch(/-' \. \$years_to_subtract \. ' years'/);
+        });
+
+        test('CAS guard on UPDATE (payment_status=paid in WHERE)', () => {
+            const code = readRest();
+            const helperBlock = code.split('function dinoco_sn_apply_refund')[1] || '';
+            // Compare-and-swap: WHERE payment_status='paid' prevents double refund race
+            expect(helperBlock).toMatch(/'payment_status' => 'paid'.*\/\/ CAS guard/);
+        });
+
+        /* ─── Master kill switch respected ─── */
+
+        test('Marketplace kill switch respected (503 when disabled)', () => {
+            const code = readRest();
+            const fnBlock = code.split('function dinoco_sn_rest_marketplace_refund')[1] || '';
+            expect(fnBlock).toContain('dinoco_sn_marketplace_is_enabled');
+            expect(fnBlock).toContain("'feature_disabled'");
+        });
+
+        /* ─── PHPUnit test exists ─── */
+
+        test('PHPUnit SnMarketplaceRefundTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnMarketplaceRefundTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('test_eligibility_paid_returns_true');
+            expect(content).toContain('test_eligibility_refunded_blocked');
+            expect(content).toContain('test_amount_exceeds_price_paid_invalid');
+            expect(content).toContain('test_four_eyes_at_threshold_required');
+            expect(content).toContain('test_self_approval_blocked');
+            expect(content).toContain('test_confirm_text_exact_match_valid');
+            expect(content).toContain('test_revert_uses_warranty_until_old_when_present');
+            expect(content).toContain('test_revert_falls_back_when_old_empty');
+            expect(content).toContain('test_idempotency_hash_deterministic');
+        });
+    });
 });

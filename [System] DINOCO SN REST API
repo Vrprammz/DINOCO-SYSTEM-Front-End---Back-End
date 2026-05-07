@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.25 (2026-05-07) — Phase 5 W17.2+W17.4 Q20 manual refund flow║
  * ║  Version: V.0.24 (2026-05-07) — Phase 5 W15.3+W15.4 F#8 Marketplace REST║
  * ║                                  (4 customer + 4 admin + apply_warranty atomic)║
  * ║  Version: V.0.23 (2026-05-07) — Phase 4 W13.4 F#16 forecast/run + forecast/notify-boss║
@@ -1116,6 +1117,47 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                     'sanitize_callback' => 'sanitize_textarea_field',
                     'validate_callback' => function( $v ) {
                         return is_string( $v ) && mb_strlen( trim( $v ) ) >= 10;
+                    },
+                ),
+            ),
+        ) );
+
+        // Phase 5 W17.2 — POST /marketplace/{id}/refund (Q20 manual refund flow)
+        // Admin only. 4-eyes when refund_amount >= 5000 THB. Body confirm_text
+        // must equal 'REFUND CONFIRM'. Wrapped via idempotency (Round 30+).
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/marketplace/(?P<id>\d+)/refund', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_marketplace_refund',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'id'                 => array( 'required' => true, 'type' => 'integer', 'sanitize_callback' => 'absint' ),
+                'reason'             => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_textarea_field',
+                    'validate_callback' => function( $v ) {
+                        return is_string( $v ) && mb_strlen( trim( $v ) ) >= 10;
+                    },
+                ),
+                'refund_amount'      => array(
+                    'required'          => true,
+                    'type'              => 'number',
+                    'validate_callback' => function( $v ) {
+                        return is_numeric( $v ) && (float) $v > 0;
+                    },
+                ),
+                'approver_user_id'   => array(
+                    'required'          => false,
+                    'type'              => 'integer',
+                    'sanitize_callback' => 'absint',
+                    'default'           => 0,
+                ),
+                'confirm_text'       => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                    'validate_callback' => function( $v ) {
+                        return is_string( $v ) && trim( $v ) === 'REFUND CONFIRM';
                     },
                 ),
             ),
@@ -7124,6 +7166,386 @@ if ( ! function_exists( 'dinoco_sn_apply_warranty_extension' ) ) {
                 dinoco_obs_capture( $e, array( 'context' => 'apply_warranty_extension', 'extension_id' => $extension_id ) );
             }
             return array( 'success' => false, 'error' => 'exception: ' . $e->getMessage() );
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * W17.2 + W17.4 — Q20 Manual Refund Flow
+ *
+ * Boss Q20 R2 binding (2026-05-05): refund flow = manual (customer contacts
+ * Admin via Facebook → Backend "ยืนยันคืน" button → 4-eyes ≥฿5K threshold).
+ *
+ * Components:
+ *   - dinoco_sn_rest_marketplace_refund    — REST POST handler (idempotency-wrapped)
+ *   - dinoco_sn_handler_marketplace_refund — actual handler (validation + lock)
+ *   - dinoco_sn_apply_refund               — atomic warranty revert + DB mutation
+ *
+ * Constraints:
+ *   - payment_status MUST equal 'paid' (else 409 — already-refunded/pending)
+ *   - refund_amount in (0, amount_total]
+ *   - confirm_text === 'REFUND CONFIRM' (typed safety)
+ *   - 4-eyes: refund_amount >= 5000 → approver_user_id MUST be different
+ *     admin user with dinoco_sn_perm_admin cap (self-approval blocked)
+ *
+ * Audit event: 'extension_refunded' (sensitive=true, 5y retention).
+ * Wired via dinoco_sn_audit_log() — same helper as warranty_extended.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_marketplace_refund' ) ) {
+    /**
+     * POST /dinoco-sn/v1/marketplace/{id}/refund (admin only)
+     *
+     * Idempotency body hash: { id, refund_amount, reason } — different
+     * amount/reason mid-retry returns 409 idempotency_conflict (Round 30+
+     * Idempotency-Key wrapper auto-adds actor_user_id).
+     */
+    function dinoco_sn_rest_marketplace_refund( $req ) {
+        if ( ! function_exists( 'dinoco_sn_marketplace_is_enabled' ) || ! dinoco_sn_marketplace_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'Marketplace disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        return dinoco_sn_with_idempotency(
+            $req,
+            'marketplace-refund',
+            array( 'id', 'refund_amount', 'reason' ),
+            function( $req ) {
+                return dinoco_sn_handler_marketplace_refund( $req );
+            }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_marketplace_refund' ) ) {
+    /**
+     * Actual handler. GET_LOCK + START TRANSACTION + FOR UPDATE pattern.
+     *
+     * Returns rest_ensure_response on success or WP_Error with status code.
+     */
+    function dinoco_sn_handler_marketplace_refund( $req ) {
+        global $wpdb;
+        $extension_id     = (int) $req->get_param( 'id' );
+        $reason           = sanitize_textarea_field( (string) $req->get_param( 'reason' ) );
+        $refund_amount    = (float) $req->get_param( 'refund_amount' );
+        $approver_user_id = (int) $req->get_param( 'approver_user_id' );
+        $confirm_text     = trim( (string) $req->get_param( 'confirm_text' ) );
+        $actor_user_id    = get_current_user_id();
+
+        // Defensive re-validation (validate_callback already enforced, but double-check)
+        if ( $confirm_text !== 'REFUND CONFIRM' ) {
+            return new WP_Error( 'confirm_text_invalid',
+                __( 'confirm_text must equal "REFUND CONFIRM"', 'dinoco-sn' ),
+                array( 'status' => 422 ) );
+        }
+        if ( $refund_amount <= 0 ) {
+            return new WP_Error( 'refund_amount_invalid',
+                __( 'refund_amount must be > 0', 'dinoco-sn' ),
+                array( 'status' => 422 ) );
+        }
+        if ( mb_strlen( trim( $reason ) ) < 10 ) {
+            return new WP_Error( 'reason_invalid',
+                __( 'reason must be ≥10 chars', 'dinoco-sn' ),
+                array( 'status' => 422 ) );
+        }
+
+        // 4-eyes threshold: ≥ ฿5,000 → approver REQUIRED + must differ from actor + must have admin cap
+        $FOUR_EYES_THRESHOLD = 5000;
+        if ( $refund_amount >= $FOUR_EYES_THRESHOLD ) {
+            if ( $approver_user_id <= 0 ) {
+                return new WP_Error( 'approver_required',
+                    sprintf( __( 'refund_amount >= %d THB requires approver_user_id (4-eyes)', 'dinoco-sn' ), $FOUR_EYES_THRESHOLD ),
+                    array( 'status' => 422 ) );
+            }
+            if ( $approver_user_id === $actor_user_id ) {
+                // Self-approval blocked cleanly — 4-eyes integrity gate
+                return new WP_Error( 'self_approval_blocked',
+                    __( 'Self-approval blocked. Approver must be a different admin user.', 'dinoco-sn' ),
+                    array( 'status' => 422 ) );
+            }
+            if ( ! user_can( $approver_user_id, 'dinoco_sn_perm_admin' )
+                 && ! user_can( $approver_user_id, 'manage_options' ) ) {
+                return new WP_Error( 'approver_not_admin',
+                    __( 'Approver must have dinoco_sn_perm_admin capability.', 'dinoco-sn' ),
+                    array( 'status' => 422 ) );
+            }
+        } else {
+            // < ฿5,000: ignore approver_user_id even if provided (NULL stored)
+            $approver_user_id = 0;
+        }
+
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'extensions' ) ) {
+            return new WP_Error( 'schema_not_ready',
+                __( 'extensions table missing', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+        $tbl = dinoco_sn_table( 'extensions' );
+
+        $lock_name = "dinoco_sn_refund_{$extension_id}";
+        $lock_acquired = $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, %d)", $lock_name, 5 ) );
+        if ( $lock_acquired !== '1' ) {
+            return new WP_Error( 'db_lock_timeout',
+                __( 'Refund lock busy. Retry.', 'dinoco-sn' ),
+                array( 'status' => 503 ) );
+        }
+
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $ext = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$tbl} WHERE id = %d FOR UPDATE", $extension_id
+            ) );
+            if ( ! $ext ) {
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+                return new WP_Error( 'not_found',
+                    __( 'Extension not found', 'dinoco-sn' ),
+                    array( 'status' => 404 ) );
+            }
+            // STRICT: only refund 'paid' state. 'refunded' / 'pending_payment' / etc. blocked.
+            if ( $ext->payment_status !== 'paid' ) {
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+                $msg = sprintf(
+                    __( 'Cannot refund extension with payment_status=%s (must be paid)', 'dinoco-sn' ),
+                    $ext->payment_status
+                );
+                return new WP_Error( 'wrong_state', $msg, array(
+                    'status'         => 409,
+                    'current_status' => $ext->payment_status,
+                ) );
+            }
+
+            // Validate refund_amount ≤ amount_total
+            // Schema field is `price_paid` (V.0.31 baseline) — that IS amount_total
+            $amount_total = (float) $ext->price_paid;
+            if ( $refund_amount > $amount_total + 0.001 ) { // tolerance for float compare
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+                return new WP_Error( 'refund_exceeds_paid',
+                    sprintf(
+                        __( 'refund_amount %.2f exceeds price_paid %.2f', 'dinoco-sn' ),
+                        $refund_amount, $amount_total
+                    ),
+                    array( 'status' => 422, 'price_paid' => $amount_total ) );
+            }
+
+            // Apply atomic refund (revert warranty + flip status + audit)
+            $apply_args = array(
+                'reason'           => $reason,
+                'refund_amount'    => $refund_amount,
+                'actor_user_id'    => $actor_user_id,
+                'approver_user_id' => $approver_user_id,
+                'price_paid'       => $amount_total,
+            );
+            $result = function_exists( 'dinoco_sn_apply_refund' )
+                ? dinoco_sn_apply_refund( $extension_id, $apply_args, $ext )
+                : array( 'success' => false, 'error' => 'apply_refund_helper_missing' );
+
+            if ( ! is_array( $result ) || empty( $result['success'] ) ) {
+                $wpdb->query( 'ROLLBACK' );
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+                $err = isset( $result['error'] ) ? (string) $result['error'] : 'apply_refund_failed';
+                return new WP_Error( 'apply_refund_failed', $err, array( 'status' => 500 ) );
+            }
+
+            $wpdb->query( 'COMMIT' );
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+
+            // Best-effort: LINE Flex push to customer
+            try {
+                if ( function_exists( 'wp_schedule_single_event' ) ) {
+                    wp_schedule_single_event( time() + 5, 'dinoco_sn_marketplace_refund_async', array( $extension_id, $refund_amount, $reason ) );
+                }
+            } catch ( \Throwable $e ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( $e, array( 'context' => 'marketplace_refund_async', 'extension_id' => $extension_id ) );
+                }
+            }
+
+            return rest_ensure_response( array(
+                'success'                  => true,
+                'extension_id'             => $extension_id,
+                'status'                   => 'refunded',
+                'refunded_amount'          => $refund_amount,
+                'warranty_until_reverted_to' => isset( $result['warranty_until_reverted_to'] ) ? $result['warranty_until_reverted_to'] : null,
+                'audit_id'                 => isset( $result['audit_id'] ) ? (int) $result['audit_id'] : 0,
+                'four_eyes_applied'        => $approver_user_id > 0,
+            ) );
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'marketplace_refund', 'extension_id' => $extension_id ) );
+            }
+            return new WP_Error( 'refund_failed', $e->getMessage(), array( 'status' => 500 ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_apply_refund' ) ) {
+    /**
+     * Atomic refund helper — revert warranty_until + flip extension to refunded.
+     *
+     * MUST be called within an existing transaction. Caller (handler) holds:
+     *   - GET_LOCK on dinoco_sn_refund_{id}
+     *   - START TRANSACTION already issued
+     *   - Extensions row already SELECTed FOR UPDATE (passed via $ext_locked)
+     *
+     * Steps (matches W17.2.3 spec):
+     *   1. SELECT FOR UPDATE warranty_registration CPT meta to revert
+     *   2. Compute revert: warranty_until_reverted = ext.warranty_until_old
+     *      Defensive fallback if NULL: subtract N years from current
+     *   3. UPDATE warranty_registration warranty_until = reverted
+     *   4. UPDATE extensions row → payment_status='refunded' + refund cols
+     *   5. INSERT audit row event_type='extension_refunded' sensitive=true
+     *
+     * @param int                  $extension_id
+     * @param array<string,mixed>  $args   { reason, refund_amount, actor_user_id, approver_user_id, price_paid }
+     * @param object|null          $ext_locked  Pre-locked extensions row (skip re-SELECT)
+     * @return array<string,mixed> { success: bool, warranty_until_reverted_to?: string, audit_id?: int, error?: string }
+     */
+    function dinoco_sn_apply_refund( $extension_id, array $args, $ext_locked = null ) {
+        global $wpdb;
+        $extension_id = (int) $extension_id;
+        if ( $extension_id <= 0 ) {
+            return array( 'success' => false, 'error' => 'invalid_extension_id' );
+        }
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'extensions' ) ) {
+            return array( 'success' => false, 'error' => 'schema_not_ready' );
+        }
+        $tbl_ext  = dinoco_sn_table( 'extensions' );
+        $tbl_pool = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool' ) : null;
+
+        try {
+            // Use pre-locked row if caller provides; else re-SELECT (defensive)
+            if ( $ext_locked && is_object( $ext_locked ) && isset( $ext_locked->id ) ) {
+                $ext = $ext_locked;
+            } else {
+                $ext = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT * FROM {$tbl_ext} WHERE id = %d FOR UPDATE", $extension_id
+                ) );
+            }
+            if ( ! $ext ) {
+                return array( 'success' => false, 'error' => 'extension_not_found' );
+            }
+
+            // Defensive re-check status (caller validated, but defense-in-depth)
+            if ( $ext->payment_status !== 'paid' ) {
+                return array(
+                    'success'        => false,
+                    'error'          => 'not_paid',
+                    'current_status' => $ext->payment_status,
+                );
+            }
+
+            // Step 1+2: compute warranty_until_reverted_to
+            $warranty_until_reverted = '';
+            $sn = strtoupper( (string) $ext->sn );
+            $warranty_id = 0;
+            if ( $tbl_pool ) {
+                $pool = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT registered_warranty_id FROM {$tbl_pool} WHERE sn = %s FOR UPDATE", $sn
+                ) );
+                if ( $pool ) {
+                    $warranty_id = (int) $pool->registered_warranty_id;
+                }
+            }
+
+            // Prefer ext.warranty_until_old (saved at apply time)
+            $warranty_until_old_raw = isset( $ext->warranty_until_old ) ? (string) $ext->warranty_until_old : '';
+            if ( $warranty_until_old_raw !== ''
+                 && $warranty_until_old_raw !== '0000-00-00'
+                 && strpos( $warranty_until_old_raw, '0000-00-00' ) !== 0 ) {
+                $warranty_until_reverted = $warranty_until_old_raw;
+            } else {
+                // Defensive fallback for legacy rows pre-W15.4: subtract extension_months from current
+                $months = (int) $ext->extension_months;
+                $years_to_subtract = max( 1, (int) round( $months / 12 ) );
+                $current_end = '';
+                if ( $warranty_id > 0 ) {
+                    $current_end = (string) get_post_meta( $warranty_id, 'warranty_until', true );
+                }
+                if ( $current_end === '' ) {
+                    $current_end = isset( $ext->warranty_until_new ) ? (string) $ext->warranty_until_new : gmdate( 'Y-m-d' );
+                }
+                try {
+                    $dt = new \DateTime( $current_end );
+                    $dt->modify( '-' . $years_to_subtract . ' years' );
+                    $warranty_until_reverted = $dt->format( 'Y-m-d' );
+                } catch ( \Throwable $e ) {
+                    return array( 'success' => false, 'error' => 'date_compute_failed' );
+                }
+            }
+            if ( $warranty_until_reverted === '' ) {
+                return array( 'success' => false, 'error' => 'warranty_revert_compute_failed' );
+            }
+
+            // Step 3: UPDATE warranty_registration CPT meta
+            if ( $warranty_id > 0 ) {
+                update_post_meta( $warranty_id, 'warranty_until', $warranty_until_reverted );
+            }
+
+            // Step 4: UPDATE extensions row → refunded + refund columns
+            $now = current_time( 'mysql' );
+            $upd_data = array(
+                'payment_status'  => 'refunded',
+                'refunded_at'     => $now,
+                'refund_reason'   => mb_substr( (string) $args['reason'], 0, 255 ),
+                'refund_amount'   => (float) $args['refund_amount'],
+                'refunded_by'     => (int) $args['actor_user_id'],
+                'refund_approver' => ( (int) $args['approver_user_id'] ) > 0 ? (int) $args['approver_user_id'] : null,
+            );
+            $upd_format = array( '%s', '%s', '%s', '%f', '%d', '%d' );
+            $upd = $wpdb->update(
+                $tbl_ext,
+                $upd_data,
+                array( 'id' => $extension_id, 'payment_status' => 'paid' ), // CAS guard
+                $upd_format,
+                array( '%d', '%s' )
+            );
+            if ( $upd === false || $upd === 0 ) {
+                return array( 'success' => false, 'error' => 'concurrent_modification' );
+            }
+
+            // Step 5: INSERT audit row event_type='extension_refunded' sensitive=true (5y)
+            $audit_id = 0;
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                $audit_context = array(
+                    'extension_id'              => $extension_id,
+                    'refund_amount'             => (float) $args['refund_amount'],
+                    'refund_reason'             => $args['reason'],
+                    'actor_user_id'             => (int) $args['actor_user_id'],
+                    'approver_user_id'          => (int) $args['approver_user_id'],
+                    'price_paid'                => (float) $args['price_paid'],
+                    'warranty_reverted_to'      => $warranty_until_reverted,
+                    'warranty_id'               => $warranty_id,
+                    'four_eyes_applied'         => ( (int) $args['approver_user_id'] ) > 0,
+                );
+                $audit_id = (int) dinoco_sn_audit_log(
+                    $sn,
+                    'extension_refunded',
+                    'paid',
+                    'refunded',
+                    $audit_context,
+                    (int) $args['actor_user_id'],
+                    ( (int) $args['approver_user_id'] ) > 0 ? (int) $args['approver_user_id'] : null,
+                    (string) $args['reason'],
+                    'manual_refund',
+                    true // sensitive=true → 5y retention per W17.4
+                );
+            }
+
+            return array(
+                'success'                    => true,
+                'warranty_until_reverted_to' => $warranty_until_reverted,
+                'audit_id'                   => $audit_id,
+                'extension_id'               => $extension_id,
+                'sn'                         => $sn,
+            );
+        } catch ( \Throwable $e ) {
+            // Re-throw for caller ROLLBACK + obs capture
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'apply_refund', 'extension_id' => $extension_id ) );
+            }
+            throw $e;
         }
     }
 }
