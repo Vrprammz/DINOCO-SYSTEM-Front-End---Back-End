@@ -136,7 +136,12 @@ const SNIPPET_PREFIXES = [
 // handlers in Manager Tab 4 dealer link UI: Edit dealer button + Save dealer
 // button + Cancel modal + Bulk dealer link button + admin search + 2 dealer
 // row interactions. Phase 6 migration sweep applies.
-const BASELINE_INLINE_HANDLER_COUNT = 942;
+//
+// Bumped 942→948 (2026-05-05): Phase 3 W11.1 F#13 Geo Heatmap Tab 8 enhancement
+// added 6 inline handlers in Manager: clickable province rows for drill-down +
+// Investigate + Telegram alert buttons in Gray Market Alerts panel. Per Phase 3
+// W11.1 plan §F#13. Phase 6 migration sweep applies.
+const BASELINE_INLINE_HANDLER_COUNT = 948;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

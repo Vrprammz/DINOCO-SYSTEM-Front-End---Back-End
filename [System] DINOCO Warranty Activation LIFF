@@ -1,6 +1,8 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Warranty Activation LIFF                        ║
+ * ║  Version: V.0.5 (2026-05-05) — Phase 3 W11.1 F#13 geo capture on  ║
+ * ║                                  activate (defensive, best-effort)║
  * ║  Version: V.0.4 (2026-05-07) — Phase 3 W8.4 stolen/recalled block ║
  * ║                                  + Telegram alert + audit log     ║
  * ║  Version: V.0.3 (2026-05-07) — Boss R3 first-time login flow      ║
@@ -801,6 +803,19 @@ if ( ! function_exists( 'dinoco_sn_handler_activate' ) ) {
             // Invalidate lookup cache
             delete_transient( 'dinoco_sn_lookup_' . md5( $sn ) );
 
+            // Phase 3 W11.1 — F#13 geo capture (defensive, best-effort, never throws)
+            // Captures province/IP/lat/lng for heatmap + gray-market scan.
+            // Wrapped in its own try/catch so geo failure NEVER blocks customer activation.
+            if ( function_exists( 'dinoco_sn_record_geo_activation_for_user' ) ) {
+                try {
+                    dinoco_sn_record_geo_activation_for_user( $sn, $user_id );
+                } catch ( \Throwable $geo_e ) {
+                    if ( function_exists( 'dinoco_obs_capture' ) ) {
+                        dinoco_obs_capture( $geo_e, array( 'context' => 'sn_activate_geo_capture', 'sn' => $sn ) );
+                    }
+                }
+            }
+
             // LINE Flex push (deferred async per v2.4 performance fix)
             // wp_schedule_single_event( time() + 5, 'dinoco_sn_push_activate_flex', array( $sn, $user_id ) );
 
@@ -819,5 +834,132 @@ if ( ! function_exists( 'dinoco_sn_handler_activate' ) ) {
             }
             return new WP_Error( 'activate_failed', $e->getMessage(), array( 'status' => 500 ) );
         }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. PHASE 3 W11.1 — F#13 GEO CAPTURE ON ACTIVATE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * dinoco_sn_record_geo_activation_for_user( $sn, $user_id )
+ *   - Best-effort: NEVER throws (caller already wraps in try/catch but defensive again here)
+ *   - Resolves province from REMOTE_ADDR via dinoco_sn_resolve_province_from_ip()
+ *   - LINE region via id_token claim if available (Phase 4 W12 wires reliably)
+ *   - Calls dinoco_sn_record_geo_activation() helper from REST API snippet
+ *     (function_exists guarded — does nothing if REST API not synced yet)
+ *
+ * Called from dinoco_sn_handler_activate() after successful COMMIT.
+ *
+ * PII protection (per audit memo project_audit_2026_04_17_pending_actions):
+ *   - Full IP address NEVER stored (last octet masked before logging)
+ *   - lat/lng nullable (best-effort from IP geo only)
+ */
+if ( ! function_exists( 'dinoco_sn_record_geo_activation_for_user' ) ) {
+    function dinoco_sn_record_geo_activation_for_user( $sn, $user_id ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        $user_id = (int) $user_id;
+        if ( $sn === '' || $user_id <= 0 ) return false;
+
+        // REST API helper guard (different snippet)
+        if ( ! function_exists( 'dinoco_sn_record_geo_activation' ) ) {
+            return false;
+        }
+
+        // Resolve client IP (Cloudflare/proxy aware where possible)
+        $ip = dinoco_sn_get_client_ip();
+
+        // Resolve province (defensive — function may return 'Unknown')
+        $province = function_exists( 'dinoco_sn_resolve_province_from_ip' )
+            ? dinoco_sn_resolve_province_from_ip( $ip )
+            : 'Unknown';
+
+        // If province resolution returned empty/Unknown, still record the row but
+        // tag province='Unknown' — gray-market scan filters by has-dealer per-province.
+        if ( $province === '' ) $province = 'Unknown';
+
+        // Cross-reference dealer territory: see if user's purchase_dealer_id covers
+        // this province (Phase 4 W12 — for now just pass null, leave is_in_dealer_territory=0)
+        $is_in_territory = 0;
+        $expected_dealer_id = null;
+
+        // Best-effort: classify gray market based on province / has-dealer presence
+        $has_dealer = false; // Phase 3 W11.1 stub — Phase 4 W12 wires dealer territory CPT lookup
+        $country_code = function_exists( 'dinoco_sn_resolve_country_from_ip' )
+            ? dinoco_sn_resolve_country_from_ip( $ip )
+            : 'TH';
+        $classification = function_exists( 'dinoco_sn_classify_gray_market' )
+            ? dinoco_sn_classify_gray_market( $country_code, $has_dealer )
+            : 'normal';
+        $is_gray = ( $classification !== 'normal' ) ? 1 : 0;
+
+        return dinoco_sn_record_geo_activation( $sn, $province, array(
+            'source'                 => 'activate',
+            'lat'                    => null, // Phase 4 W12: IP geolocation library
+            'lng'                    => null,
+            'is_in_dealer_territory' => $is_in_territory,
+            'expected_dealer_id'     => $expected_dealer_id,
+            'is_gray_market_suspect' => $is_gray,
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_client_ip' ) ) {
+    /**
+     * Best-effort IP resolver (Cloudflare/proxy aware).
+     * Mirrors pattern from [System] DINOCO GDPR Data Requests V.1.1
+     * (`dinoco_gdpr_get_client_ip()`) for consistency.
+     *
+     * Returns first non-empty header value; falls back to REMOTE_ADDR.
+     * Returns '' if nothing usable (CLI / cron context).
+     */
+    function dinoco_sn_get_client_ip() {
+        $headers = array(
+            'HTTP_CF_CONNECTING_IP', // Cloudflare
+            'HTTP_X_FORWARDED_FOR',
+            'HTTP_X_REAL_IP',
+            'REMOTE_ADDR',
+        );
+        foreach ( $headers as $h ) {
+            if ( ! empty( $_SERVER[ $h ] ) ) {
+                $val = (string) $_SERVER[ $h ];
+                // X-Forwarded-For can be a list — take first
+                if ( strpos( $val, ',' ) !== false ) {
+                    $val = trim( strtok( $val, ',' ) );
+                }
+                $val = trim( $val );
+                if ( $val !== '' && filter_var( $val, FILTER_VALIDATE_IP ) ) {
+                    return $val;
+                }
+            }
+        }
+        return '';
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mask_ip_last_octet' ) ) {
+    /**
+     * PII: mask last octet (IPv4) or last group (IPv6) for safe logging.
+     *   192.168.1.42  → 192.168.1.x
+     *   2001:db8::1   → 2001:db8::x
+     */
+    function dinoco_sn_mask_ip_last_octet( $ip ) {
+        $ip = (string) $ip;
+        if ( $ip === '' ) return '';
+        if ( strpos( $ip, ':' ) !== false ) {
+            // IPv6 — mask last group
+            $parts = explode( ':', $ip );
+            if ( count( $parts ) > 1 ) {
+                $parts[ count( $parts ) - 1 ] = 'x';
+                return implode( ':', $parts );
+            }
+            return 'x';
+        }
+        // IPv4
+        $parts = explode( '.', $ip );
+        if ( count( $parts ) === 4 ) {
+            $parts[3] = 'x';
+            return implode( '.', $parts );
+        }
+        return 'x.x.x.x';
     }
 }

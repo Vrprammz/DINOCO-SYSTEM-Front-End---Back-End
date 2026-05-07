@@ -607,8 +607,10 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         // Configurable via wp_options
         expect(cron).toContain('dinoco_sn_gray_market_window_days');
         expect(cron).toContain('dinoco_sn_gray_market_threshold');
-        // Only consider rows OUTSIDE dealer territory
-        expect(cron).toMatch(/is_in_dealer_territory\s*=\s*0/);
+        // V.0.28 W11.1: dealer-territory filter superseded by classifier helper
+        // (dinoco_sn_classify_gray_market + dinoco_sn_province_has_dealer)
+        // Verify classifier helper is invoked
+        expect(cron).toContain('dinoco_sn_classify_gray_market');
     });
 
     test('Q21 OVERRIDE — F#12 Anti-Fraud Engine REMOVED (no live routes)', () => {
@@ -3555,6 +3557,830 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             const opens  = (code.match(/\{/g) || []).length;
             const closes = (code.match(/\}/g) || []).length;
             expect(opens).toBe(closes);
+        });
+    });
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * Phase 3 W9.2 — F#6 Click-to-Call Dealer Resolver
+     * REST API V.0.20 + Production SN Manager V.0.27
+     * ═══════════════════════════════════════════════════════════════════════ */
+    describe('Phase 3 W9.2 — F#6 Click-to-Call Dealer Resolver', () => {
+
+        test('REST API bumped to V.0.20+', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/Version: V\.0\.(20|2[1-9]|[3-9]\d)/);
+        });
+
+        test('Production SN Manager bumped to V.0.27+', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/Version: V\.0\.(27|2[8-9]|[3-9]\d)/);
+        });
+
+        test('GET /dealer-info/{sn} endpoint registered with logged_in permission', () => {
+            const code = readSnippet('rest');
+            expect(code).toContain("'/dealer-info/(?P<sn>[A-Za-z0-9]+)'");
+            // Find the dealer-info route block + assert permission_callback
+            const idx = code.indexOf("'/dealer-info/(?P<sn>");
+            expect(idx).toBeGreaterThan(0);
+            const block = code.substring(idx, idx + 600);
+            expect(block).toContain("'permission_callback' => 'dinoco_sn_perm_logged_in'");
+            expect(block).toContain("'callback'            => 'dinoco_sn_rest_dealer_info'");
+            expect(block).toContain("'methods'             => 'GET'");
+        });
+
+        test('POST /dealer-link endpoint registered with warehouse permission', () => {
+            const code = readSnippet('rest');
+            expect(code).toContain("'/dealer-link'");
+            const idx = code.indexOf("'/dealer-link'");
+            expect(idx).toBeGreaterThan(0);
+            const block = code.substring(idx, idx + 800);
+            expect(block).toContain("'permission_callback' => 'dinoco_sn_perm_warehouse'");
+            expect(block).toContain("'callback'            => 'dinoco_sn_rest_dealer_link'");
+            expect(block).toContain("'methods'             => 'POST'");
+            // dealer_id required
+            expect(block).toMatch(/'dealer_id'\s*=>\s*array\([^)]*'required'\s*=>\s*true/);
+        });
+
+        test('3 helper functions defined in REST snippet', () => {
+            const code = readSnippet('rest');
+            expect(code).toContain("function dinoco_sn_mask_phone(");
+            expect(code).toContain("function dinoco_sn_resolve_dealer_for_plate(");
+            expect(code).toContain("function dinoco_sn_get_hotline_fallback(");
+        });
+
+        test('Mask phone keeps first 2 + last 4 visible (digits-only logic)', () => {
+            const code = readSnippet('rest');
+            // Function source must show the masking strategy
+            const fnStart = code.indexOf("function dinoco_sn_mask_phone(");
+            expect(fnStart).toBeGreaterThan(0);
+            const fnBlock = code.substring(fnStart, fnStart + 800);
+            // digits-only extraction
+            expect(fnBlock).toMatch(/preg_replace\(\s*['"]\/\[\^0-9\]\/['"],\s*['"]['"],/);
+            // first 2 + last 4
+            expect(fnBlock).toContain("substr( $digits, 0, 2 )");
+            expect(fnBlock).toContain("substr( $digits, -4 )");
+            expect(fnBlock).toContain("'%sx-xxx-%s'");
+        });
+
+        test('Resolver defensively handles missing/deleted dealer post', () => {
+            const code = readSnippet('rest');
+            const fnStart = code.indexOf("function dinoco_sn_resolve_dealer_for_plate(");
+            expect(fnStart).toBeGreaterThan(0);
+            const fnBlock = code.substring(fnStart, fnStart + 2500);
+            // Defensive: post_type === 'distributor'
+            expect(fnBlock).toContain("post_type !== 'distributor'");
+            // Defensive: post_status === 'publish'
+            expect(fnBlock).toContain("post_status !== 'publish'");
+            // function_exists guard for ACF get_field
+            expect(fnBlock).toMatch(/function_exists\(\s*'get_field'\s*\)/);
+        });
+
+        test('Hotline fallback returns is_fallback=true with DINOCO Support shop_name', () => {
+            const code = readSnippet('rest');
+            const fnStart = code.indexOf("function dinoco_sn_get_hotline_fallback(");
+            expect(fnStart).toBeGreaterThan(0);
+            const fnBlock = code.substring(fnStart, fnStart + 1000);
+            expect(fnBlock).toContain("'is_fallback'");
+            expect(fnBlock).toContain("=> true");
+            expect(fnBlock).toContain("DINOCO Support");
+            expect(fnBlock).toContain("dinoco_hotline_phone");
+        });
+
+        test('dealer-info handler enforces owner OR view_pii cap OR admin', () => {
+            const code = readSnippet('rest');
+            const fnStart = code.indexOf("function dinoco_sn_rest_dealer_info(");
+            expect(fnStart).toBeGreaterThan(0);
+            const fnBlock = code.substring(fnStart, fnStart + 3000);
+            // Owner check
+            expect(fnBlock).toContain("registered_user_id");
+            expect(fnBlock).toContain("$is_owner");
+            // Admin check
+            expect(fnBlock).toMatch(/current_user_can\(\s*'manage_options'\s*\)/);
+            // PII cap check
+            expect(fnBlock).toContain("dinoco_sn_user_can_view_pii");
+            // 403 forbidden if not authorized
+            expect(fnBlock).toContain("'rest_forbidden'");
+            expect(fnBlock).toContain("'status' => 403");
+        });
+
+        test('dealer-link handler atomic GET_LOCK + START TRANSACTION + UPSERT', () => {
+            const code = readSnippet('rest');
+            const fnStart = code.indexOf("function dinoco_sn_handler_dealer_link(");
+            expect(fnStart).toBeGreaterThan(0);
+            const fnBlock = code.substring(fnStart, fnStart + 8000);
+            expect(fnBlock).toMatch(/SELECT GET_LOCK\(/);
+            expect(fnBlock).toMatch(/SELECT RELEASE_LOCK\(/);
+            expect(fnBlock).toContain("'START TRANSACTION'");
+            expect(fnBlock).toContain("'COMMIT'");
+            expect(fnBlock).toContain("'ROLLBACK'");
+            expect(fnBlock).toContain("FOR UPDATE");
+            // Audit log on success
+            expect(fnBlock).toContain("dealer_link_set");
+            expect(fnBlock).toMatch(/function_exists\(\s*'dinoco_sn_audit_log'\s*\)/);
+        });
+
+        test('dealer-link uses Idempotency-Key wrapper', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/dinoco_sn_with_idempotency\(\s*\$req,\s*'dealer-link'/);
+        });
+
+        test('dealer-link validates distributor CPT existence', () => {
+            const code = readSnippet('rest');
+            const fnStart = code.indexOf("function dinoco_sn_handler_dealer_link(");
+            const fnBlock = code.substring(fnStart, fnStart + 8000);
+            expect(fnBlock).toContain("post_type !== 'distributor'");
+            expect(fnBlock).toContain("'dealer_not_found'");
+            expect(fnBlock).toContain("'status' => 404");
+        });
+
+        test('dealer-link validates purchase_date YYYY-MM-DD format', () => {
+            const code = readSnippet('rest');
+            const fnStart = code.indexOf("function dinoco_sn_handler_dealer_link(");
+            const fnBlock = code.substring(fnStart, fnStart + 8000);
+            expect(fnBlock).toMatch(/preg_match\(\s*['"]\/\^\\d\{4\}-\\d\{2\}-\\d\{2\}\\?\$\/['"],/);
+            expect(fnBlock).toContain("'invalid_date'");
+        });
+
+        test('Tab 4 modal contains 🏪 dealer info section', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('🏪 ข้อมูลร้านที่ซื้อ');
+            expect(code).toContain('dnc-sn-tab-manage-dealer-section');
+            expect(code).toContain('dnc-sn-tab-manage-dealer-body');
+            // Edit button
+            expect(code).toContain('✏️ แก้ไขร้าน');
+        });
+
+        test('Manager has dealer info loader + searchable dropdown handlers', () => {
+            const code = readSnippet('manager');
+            // Loader
+            expect(code).toContain('window.dncSnTabManageLoadDealerInfo');
+            // Edit modal opener
+            expect(code).toContain('window.dncSnTabManageOpenDealerLinkModal');
+            // Search dealers (uses WP REST distributor endpoint)
+            expect(code).toContain('window.dncSnTabManageSearchDealers');
+            expect(code).toContain('/wp-json/wp/v2/distributor');
+            // Submit
+            expect(code).toContain('window.dncSnTabManageSubmitDealerLink');
+            // Date picker for purchase_date
+            expect(code).toContain('dnc-sn-tab-manage-dealer-date');
+            // Notes textarea
+            expect(code).toContain('dnc-sn-tab-manage-dealer-notes');
+        });
+
+        test('Manager has bulk dealer link action with checkbox UI', () => {
+            const code = readSnippet('manager');
+            // Bulk toolbar
+            expect(code).toContain('dnc-sn-tab-manage-bulk-toolbar');
+            // Checkboxes per card
+            expect(code).toContain('dnc-sn-tab-manage-bulk-cb');
+            expect(code).toContain('Link Dealer (bulk)');
+            // Bulk action handler
+            expect(code).toContain('window.dncSnTabManageBulkLinkDealer');
+            expect(code).toContain('window.dncSnTabManageBulkToggleAll');
+            // Idempotency key per row in bulk
+            expect(code).toContain("'X-Idempotency-Key': 'dlink-bulk-'");
+        });
+
+        test('Frontend uses POST /dealer-link with Idempotency-Key header', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("REST_BASE + '/dealer-link'");
+            expect(code).toContain("'X-Idempotency-Key': 'dlink-'");
+            expect(code).toContain("method: 'POST'");
+        });
+
+        test('PHPUnit SnDealerResolverTest.php exists with 15+ tests', () => {
+            const filepath = path.join(REPO_ROOT, 'tests', 'helpers', 'SnDealerResolverTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('class SnDealerResolverTest');
+            // Phone mask coverage
+            expect(content).toContain('test_mask_phone_standard_thai_format');
+            expect(content).toContain('test_mask_phone_with_dashes');
+            expect(content).toContain('test_mask_phone_international_plus_66');
+            expect(content).toContain('test_mask_phone_short_number_returns_three_stars');
+            expect(content).toContain('test_mask_phone_empty_string');
+            expect(content).toContain('test_mask_phone_null');
+            // Resolver coverage
+            expect(content).toContain('test_resolver_returns_null_when_meta_empty');
+            expect(content).toContain('test_resolver_returns_null_when_dealer_post_deleted');
+            expect(content).toContain('test_resolver_returns_null_when_dealer_post_wrong_type');
+            expect(content).toContain('test_resolver_returns_null_when_dealer_unpublished');
+            expect(content).toContain('test_resolver_uses_acf_shop_name_first');
+            expect(content).toContain('test_resolver_phone_fallback_chain');
+            // Permission coverage
+            expect(content).toContain('test_phone_visible_to_admin');
+            expect(content).toContain('test_phone_visible_to_owner');
+            expect(content).toContain('test_phone_hidden_from_other_logged_in_user');
+            // 4-last-digits-visible assertion present
+            expect(content).toContain('test_masked_phone_keeps_last_4_digits_visible');
+        });
+
+        test('Drift sentinel — REST snippet balanced-brace check', () => {
+            const code = readSnippet('rest');
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+
+        test('Drift sentinel — Manager snippet balanced-brace check', () => {
+            const code = readSnippet('manager');
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+    });
+
+    /* ═════════════════════════════════════════════════════════════════════════
+     * Phase 3 W11.1 — F#13 Geographic Heatmap + Gray Market Detection
+     * ═════════════════════════════════════════════════════════════════════════ */
+
+    describe('Phase 3 W11.1 — F#13 Geo Heatmap + Gray Market', () => {
+
+        /* ─── LIFF Activation V.0.5 ─── */
+
+        test('LIFF Activation has version V.0.5+', () => {
+            const code = readSnippet('liff');
+            expect(code).toMatch(/Version: V\.0\.[5-9]/);
+        });
+
+        test('LIFF: dinoco_sn_record_geo_activation_for_user helper defined', () => {
+            const code = readSnippet('liff');
+            expect(code).toContain("function dinoco_sn_record_geo_activation_for_user(");
+        });
+
+        test('LIFF: defensive geo capture in activate handler (try/catch wrap)', () => {
+            const code = readSnippet('liff');
+            // Geo capture happens after COMMIT but wrapped in own try/catch
+            // so geo failure NEVER blocks customer activation
+            const idx = code.indexOf("dinoco_sn_record_geo_activation_for_user( $sn, $user_id )");
+            expect(idx).toBeGreaterThan(-1);
+            // Search backward for try {
+            const before = code.substring(Math.max(0, idx - 300), idx);
+            expect(before).toMatch(/try\s*\{/);
+            // Search forward for catch
+            const after = code.substring(idx, Math.min(code.length, idx + 400));
+            expect(after).toMatch(/catch\s*\(\s*\\?Throwable/);
+        });
+
+        test('LIFF: geo capture is called AFTER successful COMMIT (atomicity)', () => {
+            const code = readSnippet('liff');
+            const commit_idx = code.indexOf('$wpdb->query( "COMMIT" );');
+            const geo_idx = code.indexOf("dinoco_sn_record_geo_activation_for_user( $sn, $user_id )");
+            expect(commit_idx).toBeGreaterThan(-1);
+            expect(geo_idx).toBeGreaterThan(commit_idx);
+        });
+
+        test('LIFF: client IP resolver (Cloudflare-aware)', () => {
+            const code = readSnippet('liff');
+            expect(code).toContain("function dinoco_sn_get_client_ip()");
+            expect(code).toContain("HTTP_CF_CONNECTING_IP");
+            expect(code).toContain("HTTP_X_FORWARDED_FOR");
+            expect(code).toContain("REMOTE_ADDR");
+            // Defensive: validate via filter_var FILTER_VALIDATE_IP
+            expect(code).toContain("FILTER_VALIDATE_IP");
+        });
+
+        test('LIFF: PII protection — IP last-octet masker for safe logging', () => {
+            const code = readSnippet('liff');
+            expect(code).toContain("function dinoco_sn_mask_ip_last_octet(");
+        });
+
+        /* ─── Manager V.0.28 ─── */
+
+        test('Manager has version V.0.28+ (W11.1)', () => {
+            const code = readSnippet('manager');
+            // V.0.28 line OR higher (28-99 range)
+            expect(code).toMatch(/Version: V\.0\.(2[8-9]|[3-9]\d)/);
+        });
+
+        test('Manager: dinoco_sn_run_gray_market_scan cron worker defined', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("function dinoco_sn_run_gray_market_scan()");
+        });
+
+        test('Manager: gray-market scan worker UPDATES is_gray_market_suspect flag', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_run_gray_market_scan()");
+            expect(fn_idx).toBeGreaterThan(-1);
+            const fn_block = code.substring(fn_idx, fn_idx + 5000);
+            expect(fn_block).toContain("UPDATE");
+            expect(fn_block).toContain("is_gray_market_suspect = 1");
+        });
+
+        test('Manager: gray-market scan calls classifier helper', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_run_gray_market_scan()");
+            const fn_block = code.substring(fn_idx, fn_idx + 5000);
+            expect(fn_block).toContain("dinoco_sn_classify_gray_market");
+        });
+
+        test('Manager: gray-market scan has Telegram alert (defensive function_exists)', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_run_gray_market_scan()");
+            const fn_block = code.substring(fn_idx, fn_idx + 5000);
+            // Defensive function_exists guard before Telegram call
+            expect(fn_block).toMatch(/function_exists\(\s*['"]b2b_send_telegram_alert['"]/);
+        });
+
+        test('Manager: gray-market scan writes heartbeat option', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_run_gray_market_scan()");
+            // Heartbeat is at the very end of the function (~6500 chars in)
+            const fn_block = code.substring(fn_idx, fn_idx + 8000);
+            expect(fn_block).toContain("dinoco_cron_sn_gray_market_scan_last_run");
+        });
+
+        test('Manager: gray-market scan cron registered (weekly)', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("dinoco_sn_gray_market_scan_cron");
+            // weekly schedule
+            expect(code).toMatch(/dinoco_sn_gray_market_scan_cron[^,]*,\s*'weekly'/);
+        });
+
+        test('Manager: dinoco_sn_resolve_province_from_ip defensive helper', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("function dinoco_sn_resolve_province_from_ip(");
+            // Defensive function_exists chain
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_get_province_from_ip['"]/);
+            expect(code).toMatch(/function_exists\(\s*['"]b2b_geolocate_ip['"]/);
+            // 'Unknown' default
+            expect(code).toContain("return 'Unknown'");
+        });
+
+        test('Manager: dinoco_sn_resolve_country_from_ip defensive helper', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("function dinoco_sn_resolve_country_from_ip(");
+        });
+
+        test('Manager: dinoco_sn_classify_gray_market pure-logic helper', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("function dinoco_sn_classify_gray_market(");
+            // Foreign country whitelist
+            expect(code).toMatch(/'CN'.*'LA'.*'KH'.*'MY'.*'MM'/s);
+            // 3 return paths
+            expect(code).toContain("return 'gray_market_suspect'");
+            expect(code).toContain("return 'underserved_market'");
+            expect(code).toContain("return 'normal'");
+        });
+
+        test('Manager: dinoco_sn_province_has_dealer cached lookup', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("function dinoco_sn_province_has_dealer(");
+            // Static memo cache
+            expect(code).toMatch(/static\s+\$memo/);
+            // Queries b2b_distributor CPT
+            expect(code).toContain("'post_type'      => 'b2b_distributor'");
+        });
+
+        test('Manager Tab 8: enhanced filter row with time range chips', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_render_tab_geo()");
+            expect(fn_idx).toBeGreaterThan(-1);
+            const fn_block = code.substring(fn_idx, fn_idx + 8000);
+            // Time range select
+            expect(fn_block).toContain('id="dnc-sn-geo-range"');
+            // Batch filter
+            expect(fn_block).toContain('id="dnc-sn-geo-batch"');
+            // Gray market only toggle
+            expect(fn_block).toContain('id="dnc-sn-geo-gray-only"');
+        });
+
+        test('Manager Tab 8: drill-down sidebar element', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_render_tab_geo()");
+            const fn_block = code.substring(fn_idx, fn_idx + 8000);
+            expect(fn_block).toContain('id="dnc-sn-geo-sidebar"');
+        });
+
+        test('Manager Tab 8: Gray Market Alerts panel', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_render_tab_geo()");
+            const fn_block = code.substring(fn_idx, fn_idx + 8000);
+            expect(fn_block).toContain('id="dnc-sn-gray-alerts"');
+            expect(fn_block).toContain('id="dnc-sn-gray-alerts-list"');
+        });
+
+        test('Manager Tab 8: Top Provinces table', () => {
+            const code = readSnippet('manager');
+            const fn_idx = code.indexOf("function dinoco_sn_render_tab_geo()");
+            // Top Provinces table is at end of tab render (~6000 chars in)
+            const fn_block = code.substring(fn_idx, fn_idx + 8000);
+            expect(fn_block).toContain('id="dnc-sn-geo-top-provinces"');
+        });
+
+        test('Manager Tab 8: drill-down JS handler', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('window.dncSnGeoDrillDown');
+            expect(code).toContain('window.dncSnGeoRenderTopProvinces');
+            expect(code).toContain('window.dncSnLoadGrayMarketAlerts');
+        });
+
+        /* ─── REST API V.0.22 ─── */
+
+        test('REST API has version V.0.22+ (W11.1)', () => {
+            const code = readSnippet('rest');
+            // V.0.22 OR higher
+            expect(code).toMatch(/Version: V\.0\.(2[2-9]|[3-9]\d)/);
+        });
+
+        test('REST API: 3 NEW geo endpoints registered', () => {
+            const code = readSnippet('rest');
+            // Existing /geo/heatmap with new args
+            expect(code).toContain("'/geo/heatmap'");
+            expect(code).toContain("'/geo/gray-market'");
+            // NEW /geo/province/{province} drill-down
+            expect(code).toContain("'/geo/province/(?P<province>[^/]+)'");
+        });
+
+        test('REST API: /geo/heatmap accepts batch + gray_only params', () => {
+            const code = readSnippet('rest');
+            const heatmap_idx = code.indexOf("'/geo/heatmap'");
+            expect(heatmap_idx).toBeGreaterThan(-1);
+            const block = code.substring(heatmap_idx, heatmap_idx + 1500);
+            expect(block).toContain("'batch'");
+            expect(block).toContain("'gray_only'");
+        });
+
+        test('REST API: /geo/province handler defined', () => {
+            const code = readSnippet('rest');
+            expect(code).toContain("function dinoco_sn_rest_geo_province_detail(");
+        });
+
+        test('REST API: /geo/province permission_callback admin only', () => {
+            const code = readSnippet('rest');
+            const route_idx = code.indexOf("'/geo/province/(?P<province>[^/]+)'");
+            const block = code.substring(route_idx, route_idx + 600);
+            expect(block).toContain("'permission_callback' => 'dinoco_sn_perm_admin'");
+        });
+
+        test('REST API: /geo/province handler returns top_skus + line_regions + sample_plates', () => {
+            const code = readSnippet('rest');
+            const fn_idx = code.indexOf("function dinoco_sn_rest_geo_province_detail(");
+            const fn_block = code.substring(fn_idx, fn_idx + 5000);
+            expect(fn_block).toContain("'top_skus'");
+            expect(fn_block).toContain("'line_regions'");
+            expect(fn_block).toContain("'sample_plates'");
+            expect(fn_block).toContain("'gray_market_flag'");
+        });
+
+        test('REST API: /geo/province sample_plates strips PII (no owner_user_id)', () => {
+            const code = readSnippet('rest');
+            const fn_idx = code.indexOf("function dinoco_sn_rest_geo_province_detail(");
+            const fn_block = code.substring(fn_idx, fn_idx + 5000);
+            // Sample query selects only sn + created_at — no PII columns
+            expect(fn_block).toMatch(/SELECT\s+sn,\s*created_at/);
+            // No registered_user_id in sample_plates query
+            const samples_section = fn_block.substring(fn_block.indexOf("Sample plates"));
+            expect(samples_section.substring(0, 800)).not.toMatch(/registered_user_id/);
+        });
+
+        /* ─── PHPUnit test exists ─── */
+
+        test('PHPUnit SnGrayMarketTest.php exists with classifier coverage', () => {
+            const filepath = path.join(REPO_ROOT, 'tests', 'helpers', 'SnGrayMarketTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('class SnGrayMarketTest');
+            // Foreign country coverage
+            expect(content).toContain('test_china_returns_gray_market_suspect');
+            expect(content).toContain('test_laos_returns_gray_market_suspect');
+            expect(content).toContain('test_cambodia_returns_gray_market_suspect');
+            expect(content).toContain('test_malaysia_returns_gray_market_suspect');
+            expect(content).toContain('test_myanmar_returns_gray_market_suspect');
+            // TH cases
+            expect(content).toContain('test_thailand_with_dealer_returns_normal');
+            expect(content).toContain('test_thailand_without_dealer_returns_underserved');
+            // Defensive defaults
+            expect(content).toContain('test_unknown_country_returns_normal');
+            expect(content).toContain('test_empty_country_returns_normal');
+            // Case normalization
+            expect(content).toContain('test_lowercase_country_normalizes_to_uppercase');
+        });
+    });
+
+    /* ───────────────────────────────────────────────────────────────────
+     * Phase 3 W10.3 + W11.2 — LTV CSV Export + Stolen Recovery Flow
+     * Asserts: Manager V.0.29+ Tab 6 export button + Tab 9 recovery modal,
+     *          REST API V.0.21+ /ltv/export + /stolen/{id}/recover
+     * ─────────────────────────────────────────────────────────────────── */
+    describe('Phase 3 W10.3 + W11.2 — LTV CSV Export + Stolen Recovery', () => {
+
+        test('Manager bumped to V.0.29+', () => {
+            const code = readSnippet('manager');
+            // V.0.29 marker = "Phase 3 W10.3+W11.2 Tab 6 LTV CSV Export + Tab 9 Recovery"
+            expect(code).toMatch(/Version: V\.0\.(29|[3-9]\d|\d{3,})/);
+            expect(code).toMatch(/W10\.3.*W11\.2|W11\.2.*W10\.3/);
+        });
+
+        test('REST API bumped to V.0.21+', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/Version: V\.0\.(2[1-9]|[3-9]\d|\d{3,})/);
+            expect(code).toMatch(/W10\.3.*W11\.2|LTV CSV Export.*Stolen Recovery/);
+        });
+
+        /* ─── Tab 6 LTV CSV Export ─── */
+
+        test('Tab 6 has Export CSV button + min_spent filter input', () => {
+            const code = readSnippet('manager');
+            // Button + onclick handler
+            expect(code).toContain('onclick="dncSnExportLtvCsv()"');
+            expect(code).toContain('📥 Export CSV');
+            // Min-spent filter input (optional, complements tier dropdown)
+            expect(code).toContain('id="dnc-sn-ltv-min-spent"');
+        });
+
+        test('Tab 6 export handler dncSnExportLtvCsv defined', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/window\.dncSnExportLtvCsv\s*=\s*function/);
+            // Calls /ltv/export endpoint
+            expect(code).toContain('/ltv/export');
+            // Reads tier filter from current selection (filter awareness)
+            expect(code).toMatch(/document\.getElementById\(['"]dnc-sn-ltv-tier['"]\)/);
+        });
+
+        test('Tab 6 export handles 429 + 503 + reads X-Ltv-Row-Count + X-PII-Visible', () => {
+            const code = readSnippet('manager');
+            // Use function-definition signature to find actual implementation,
+            // not the first onclick reference in tab HTML.
+            const idx = code.indexOf('window.dncSnExportLtvCsv = function');
+            expect(idx).toBeGreaterThan(-1);
+            const handler = code.slice(idx, idx + 5000);
+            expect(handler).toContain('429');
+            expect(handler).toContain('503');
+            expect(handler).toContain('X-Ltv-Row-Count');
+            expect(handler).toContain('X-PII-Visible');
+        });
+
+        test('REST API registers GET /ltv/export with tier+min_spent+limit args', () => {
+            const code = readSnippet('rest');
+            expect(code).toContain("'/ltv/export'");
+            expect(code).toContain('dinoco_sn_rest_ltv_export');
+            const idx = code.indexOf("'/ltv/export'");
+            const block = code.slice(idx, idx + 1500);
+            expect(block).toContain("'tier'");
+            expect(block).toContain("'min_spent'");
+            expect(block).toContain("'limit'");
+            expect(block).toContain('dinoco_sn_perm_admin');
+        });
+
+        test('REST API ltv_export handler exists with rate-limit + audit + PII gate', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/function\s+dinoco_sn_rest_ltv_export\s*\(/);
+            const idx = code.indexOf('function dinoco_sn_rest_ltv_export');
+            const handler = code.slice(idx, idx + 12000);
+            // Rate limit 5/hr/user (defensive — fail-open if helper missing)
+            expect(handler).toContain('sn_ltv_export_');
+            expect(handler).toMatch(/b2b_rate_limit/);
+            // PII cap check via dinoco_sn_user_can_view_pii
+            expect(handler).toContain('dinoco_sn_user_can_view_pii');
+            // Audit log emitted with event_type='ltv_export' (sensitive=true)
+            expect(handler).toContain('ltv_export');
+            expect(handler).toContain('dinoco_sn_audit_log');
+            // PII headers in response
+            expect(handler).toContain('X-PII-Visible');
+        });
+
+        test('REST API ltv_export streams CSV with UTF-8 BOM + RFC 4180 escape', () => {
+            const code = readSnippet('rest');
+            const idx = code.indexOf('function dinoco_sn_rest_ltv_export');
+            const handler = code.slice(idx, idx + 12000);
+            // UTF-8 BOM bytes for Excel detection
+            expect(handler).toContain('\\xEF\\xBB\\xBF');
+            // fputcsv = RFC 4180 escape (handles commas + quotes + newlines)
+            expect(handler).toContain('fputcsv');
+            // Content-Disposition for download
+            expect(handler).toContain('Content-Disposition');
+            expect(handler).toContain('attachment;');
+        });
+
+        test('REST API has CSV formatter helper dinoco_sn_format_csv_row', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/function\s+dinoco_sn_format_csv_row\s*\(/);
+            const idx = code.indexOf('function dinoco_sn_format_csv_row');
+            const fn = code.slice(idx, idx + 1500);
+            expect(fn).toContain('strpbrk');
+            expect(fn).toMatch(/str_replace.*"".*"/s); // dquote escape pattern
+        });
+
+        test('REST API has phone mask helper dinoco_sn_mask_phone_for_csv', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/function\s+dinoco_sn_mask_phone_for_csv\s*\(/);
+            const idx = code.indexOf('function dinoco_sn_mask_phone_for_csv');
+            const fn = code.slice(idx, idx + 800);
+            expect(fn).toContain('-4');  // substr(..., -4)
+            expect(fn).toContain('preg_replace');  // strip non-digits
+        });
+
+        /* ─── Tab 9 Stolen Recovery Flow ─── */
+
+        test('Tab 9 has Mark Recovered button per row (status-aware)', () => {
+            const code = readSnippet('manager');
+            // dncSnLoadStolen render must include "🎉 Mark Recovered" button
+            expect(code).toContain('🎉 Mark Recovered');
+            // Opens recovery modal (not legacy decision shortcut)
+            expect(code).toContain('dncSnOpenRecoverModal(');
+        });
+
+        test('Tab 9 has 4 status badges with correct color classes', () => {
+            const code = readSnippet('manager');
+            // Per spec: reported=orange/amber, verified=red, recovered=green, closed=gray
+            // Use function-definition signature to find actual implementation,
+            // not first onclick reference in tab HTML.
+            const idx = code.indexOf('window.dncSnLoadStolen = function');
+            expect(idx).toBeGreaterThan(-1);
+            const fn = code.slice(idx, idx + 6000);
+            expect(fn).toContain("'dnc-sn-pill-amber'");  // 🟠 reported
+            expect(fn).toContain("'dnc-sn-pill-red'");    // 🔴 verified (W11.2 NEW)
+            expect(fn).toContain("'dnc-sn-pill-green'");  // ✅ recovered
+            expect(fn).toContain("'dnc-sn-pill-gray'");   // ⚫ closed
+            // dnc-sn-pill-red CSS class must exist
+            expect(code).toMatch(/\.dnc-sn-pill-red\s*\{[^}]*background:[^}]*#fee2e2/);
+        });
+
+        test('Tab 9 has stolen recovery modal with date + notes + evidence inputs', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('id="dnc-sn-stolen-recover-modal"');
+            // Modal uses standard overlay+modal class pattern
+            expect(code).toMatch(/id="dnc-sn-stolen-recover-modal"\s+class="dnc-sn-modal-overlay/);
+            // Required inputs
+            expect(code).toContain('id="dnc-sn-recover-date"');
+            expect(code).toContain('id="dnc-sn-recover-notes"');
+            expect(code).toContain('id="dnc-sn-recover-evidence-ids"');
+            // Submit button
+            expect(code).toContain('onclick="dncSnSubmitRecover()"');
+        });
+
+        test('Tab 9 modal handlers defined: open + close + submit', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/window\.dncSnOpenRecoverModal\s*=\s*function/);
+            expect(code).toMatch(/window\.dncSnCloseRecoverModal\s*=\s*function/);
+            expect(code).toMatch(/window\.dncSnSubmitRecover\s*=\s*function/);
+        });
+
+        test('Tab 9 submitRecover sends Idempotency-Key + validates date YYYY-MM-DD', () => {
+            const code = readSnippet('manager');
+            // Use function-definition signature to find actual implementation
+            const idx = code.indexOf('window.dncSnSubmitRecover = function');
+            expect(idx).toBeGreaterThan(-1);
+            const fn = code.slice(idx, idx + 4000);
+            // Idempotency-Key header
+            expect(fn).toContain('X-Idempotency-Key');
+            // Date validation regex YYYY-MM-DD (literal regex pattern in JS source)
+            expect(fn).toMatch(/\\d\{4\}-\\d\{2\}-\\d\{2\}/);
+            // POST to /stolen/{id}/recover
+            expect(fn).toContain('/stolen/');
+            expect(fn).toContain('/recover');
+            // body includes recovery_date + notes + evidence_attachment_ids
+            expect(fn).toContain('recovery_date');
+            expect(fn).toContain('evidence_attachment_ids');
+        });
+
+        test('REST API registers POST /stolen/{id}/recover with required args', () => {
+            const code = readSnippet('rest');
+            expect(code).toContain("'/stolen/(?P<id>\\d+)/recover'");
+            expect(code).toContain('dinoco_sn_rest_stolen_recover');
+            const idx = code.indexOf("'/stolen/(?P<id>\\d+)/recover'");
+            const block = code.slice(idx, idx + 1500);
+            expect(block).toContain('dinoco_sn_perm_admin');
+            expect(block).toContain("'recovery_date'");
+            // recovery_date must be required
+            expect(block).toMatch(/'recovery_date'\s*=>\s*array\([^)]*'required'\s*=>\s*true/s);
+        });
+
+        test('REST API stolen_recover handler is atomic with GET_LOCK + transaction', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/function\s+dinoco_sn_rest_stolen_recover\s*\(/);
+            const idx = code.indexOf('function dinoco_sn_rest_stolen_recover');
+            const handler = code.slice(idx, idx + 16000);
+            // GET_LOCK pattern
+            expect(handler).toContain('GET_LOCK');
+            expect(handler).toContain('RELEASE_LOCK');
+            // START TRANSACTION + COMMIT/ROLLBACK
+            expect(handler).toContain('START TRANSACTION');
+            expect(handler).toContain('COMMIT');
+            expect(handler).toContain('ROLLBACK');
+            // FOR UPDATE on stolen_log
+            expect(handler).toMatch(/FROM\s+\{\$stolen_tbl\}\s+WHERE\s+id\s*=\s*%d\s+FOR\s+UPDATE/);
+            // Idempotency wrapper
+            expect(handler).toContain('dinoco_sn_with_idempotency');
+        });
+
+        test('REST API stolen_recover validates state via dinoco_sn_validate_recovery_state', () => {
+            const code = readSnippet('rest');
+            // Pure-logic validator helper exists
+            expect(code).toMatch(/function\s+dinoco_sn_validate_recovery_state\s*\(/);
+            // Caller invokes it
+            const idx = code.indexOf('function dinoco_sn_rest_stolen_recover');
+            const handler = code.slice(idx, idx + 16000);
+            expect(handler).toContain('dinoco_sn_validate_recovery_state');
+            // Must reject already_recovered (409) and closed_terminal (422)
+            const validatorIdx = code.indexOf('function dinoco_sn_validate_recovery_state');
+            const validator = code.slice(validatorIdx, validatorIdx + 1500);
+            expect(validator).toContain('already_recovered');
+            expect(validator).toContain('closed_terminal');
+            expect(validator).toContain('409');
+            expect(validator).toContain('422');
+        });
+
+        test('REST API stolen_recover reverts pool status recalled → registered', () => {
+            const code = readSnippet('rest');
+            const idx = code.indexOf('function dinoco_sn_rest_stolen_recover');
+            const handler = code.slice(idx, idx + 16000);
+            // Must SELECT FOR UPDATE pool to revert
+            expect(handler).toMatch(/FROM\s+\{\$pool\}\s+WHERE\s+sn\s*=\s*%s\s+FOR\s+UPDATE/);
+            // Must check current status === 'recalled' before reverting (defensive)
+            expect(handler).toMatch(/['"]recalled['"]/);
+            // Must clear stolen_at + recalled_at
+            expect(handler).toContain("'stolen_at'");
+            expect(handler).toContain("'recalled_at'");
+        });
+
+        test('REST API stolen_recover writes audit log with sensitive=true', () => {
+            const code = readSnippet('rest');
+            const idx = code.indexOf('function dinoco_sn_rest_stolen_recover');
+            const handler = code.slice(idx, idx + 16000);
+            // dinoco_sn_audit_log call with event_type='plate_recovered'
+            expect(handler).toContain('dinoco_sn_audit_log');
+            expect(handler).toContain("'plate_recovered'");
+            // Must mark sensitive (last arg = true → 5y retention)
+            expect(handler).toMatch(/'stolen_recovered'.*,\s*true\s*\)/);
+        });
+
+        test('REST API stolen_recover pushes LINE Flex to owner via b2b_line_push_raw', () => {
+            const code = readSnippet('rest');
+            const idx = code.indexOf('function dinoco_sn_rest_stolen_recover');
+            const handler = code.slice(idx, idx + 16000);
+            // Must read line_uid from owner usermeta
+            expect(handler).toContain('dinoco_line_uid');
+            // Must call b2b_line_push_raw with flex envelope
+            expect(handler).toContain('b2b_line_push_raw');
+            // Must invoke recovery flex builder
+            expect(handler).toContain('dinoco_sn_build_recovery_flex');
+            // line_pushed reported in response (best-effort indicator)
+            expect(handler).toContain("'line_pushed'");
+        });
+
+        test('REST API has flex builder dinoco_sn_build_recovery_flex with bubble + button', () => {
+            const code = readSnippet('rest');
+            expect(code).toMatch(/function\s+dinoco_sn_build_recovery_flex\s*\(/);
+            const idx = code.indexOf('function dinoco_sn_build_recovery_flex');
+            const fn = code.slice(idx, idx + 12000);
+            // Must include 🎉 emoji + Thai recovery message
+            expect(fn).toContain('🎉');
+            expect(fn).toMatch(/เพลทกลับคืนแล้ว|เพลทคืนแล้ว/);
+            // Must include type:flex envelope + altText
+            expect(fn).toMatch(/'type'\s*=>\s*'flex'/);
+            expect(fn).toContain("'altText'");
+            // Bubble structure
+            expect(fn).toContain("'bubble'");
+            // Footer button (View dashboard)
+            expect(fn).toContain("'footer'");
+            expect(fn).toContain("'button'");
+            expect(fn).toContain('home_url');
+        });
+
+        test('REST API stolen_recover validates recovery_date format', () => {
+            const code = readSnippet('rest');
+            const idx = code.indexOf('function dinoco_sn_rest_stolen_recover');
+            const handler = code.slice(idx, idx + 16000);
+            // Must validate YYYY-MM-DD
+            expect(handler).toMatch(/preg_match.*\\d\{4\}-\\d\{2\}-\\d\{2\}/);
+            // Must return 400 on invalid date
+            expect(handler).toContain("'invalid_date'");
+            expect(handler).toContain('400');
+        });
+
+        test('PHPUnit SnLtvCsvFormatTest.php exists with RFC 4180 + phone mask coverage', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnLtvCsvFormatTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            // RFC 4180 escape coverage
+            expect(content).toContain('test_cell_with_comma_quoted');
+            expect(content).toContain('test_cell_with_double_quote_escaped');
+            expect(content).toContain('test_cell_with_newline_quoted');
+            expect(content).toContain('test_null_cells_emit_empty');
+            // Phone masking integration
+            expect(content).toContain('test_mask_phone_keeps_last_4_digits');
+            expect(content).toContain('test_full_row_with_masked_phone');
+        });
+
+        test('PHPUnit SnStolenRecoveryTest.php exists with state machine + flex coverage', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnStolenRecoveryTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            // State machine coverage
+            expect(content).toContain('test_recovery_from_reported_allowed');
+            expect(content).toContain('test_recovery_from_verified_allowed');
+            expect(content).toContain('test_recovery_from_recovered_blocked_409');
+            expect(content).toContain('test_recovery_from_closed_blocked_422');
+            // Pool revert decision
+            expect(content).toContain('test_pool_revert_recalled_to_prev_registered');
+            expect(content).toContain('test_pool_no_revert_if_not_recalled');
+            // Flex shape coverage
+            expect(content).toContain('test_flex_includes_thai_date_format');
+            expect(content).toContain('test_flex_handles_missing_recovery_date_gracefully');
+            // Audit row shape
+            expect(content).toContain('test_audit_event_type_for_recovery_is_plate_recovered');
         });
     });
 });
