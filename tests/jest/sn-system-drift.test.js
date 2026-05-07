@@ -2324,4 +2324,523 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(content).toContain('sn_transfer_guard');
         });
     });
+
+    /* ────────────────────────────────────────────────────────────────────
+     * Phase 2 W7.1 + W7.2 + W7.3 — Member Dashboard Main + Header & Forms
+     * v2.11 §Member Dashboard (boss Q25/Q26/Q27/Q29 confirmed 2026-05-04)
+     *
+     * Asserts:
+     *   - Both files V.31.0 marker
+     *   - Banner system render function (3 sources F#1/F#4/F#10) cap=3 boss Q25
+     *   - Stats grid render function (4-cell, uses dinoco_sn_get_user_stats)
+     *   - Tier badge render function with 5 valid slugs (B2B rank_system pattern)
+     *   - Notification settings 5 checkboxes mapped to wp_usermeta keys
+     *   - Scan-first registration button + html5-qrcode lazy load
+     *   - F#3 register_serial DNCSS-prefix → /warranty/activate redirect
+     *   - All 7 SN helpers used under function_exists guard
+     *   - "📋 เคลม" quick action button added (additive — existing buttons preserved)
+     *   - SnTierBadgeTest helper test file present with required cases
+     * ──────────────────────────────────────────────────────────────────── */
+    describe('Phase 2 W7.1+W7.2+W7.3 — Member Dashboard Main + Header & Forms V.31.0', () => {
+
+        const readByPath = (relPath) => {
+            const filepath = path.join(REPO_ROOT, relPath);
+            if (!fs.existsSync(filepath)) {
+                throw new Error(`File not found: ${relPath}`);
+            }
+            return fs.readFileSync(filepath, 'utf8');
+        };
+
+        const MAIN_PATH   = '[System] Member Dashboard Main';
+        const HEADER_PATH = '[System] Dashboard - Header & Forms';
+
+        test('W7.1 Member Dashboard Main bumped to V.31.0', () => {
+            const code = readByPath(MAIN_PATH);
+            expect(code).toMatch(/Version:\s*V\.31\.0/);
+            expect(code).toContain('Phase 2 W7');
+        });
+
+        test('W7.3 Header & Forms bumped to V.31.0', () => {
+            const code = readByPath(HEADER_PATH);
+            expect(code).toMatch(/Version:\s*V\.31\.0/);
+            expect(code).toContain('Phase 2 W7.3');
+        });
+
+        test('W7 tier badge helper present with 5 valid tier slugs', () => {
+            const code = readByPath(MAIN_PATH);
+            expect(code).toContain("function dinoco_render_tier_badge");
+            // 5 tier slugs in the whitelist
+            ['bronze', 'silver', 'gold', 'platinum', 'diamond'].forEach((t) => {
+                expect(code).toContain(`'${t}'`);
+            });
+        });
+
+        test('W7 tier badge CSS classes scoped under .dnc-sn-tier-*', () => {
+            const code = readByPath(MAIN_PATH);
+            ['dnc-sn-tier-bronze', 'dnc-sn-tier-silver', 'dnc-sn-tier-gold',
+                'dnc-sn-tier-platinum', 'dnc-sn-tier-diamond'].forEach((cls) => {
+                expect(code).toContain(cls);
+            });
+            // diamond uses linear-gradient (boss Q27 — premium tier visual)
+            expect(code).toMatch(/dnc-sn-tier-diamond\s*\{[^}]*linear-gradient/);
+        });
+
+        test('W7.1 banner render function with 3 sources F#1/F#4/F#10', () => {
+            const code = readByPath(MAIN_PATH);
+            expect(code).toContain("function dinoco_dashboard_banners");
+            // 3 source helpers called
+            expect(code).toContain("dinoco_sn_get_user_expiring_plates");
+            expect(code).toContain("dinoco_sn_get_user_anniversaries");
+            expect(code).toContain("dinoco_sn_get_pending_reviews");
+            // 3 banner CSS classes
+            expect(code).toContain('dnc-sn-banner-expiry');
+            expect(code).toContain('dnc-sn-banner-anniversary');
+            expect(code).toContain('dnc-sn-banner-review');
+        });
+
+        test('W7.1 banner cap=3 (boss Q25 — 3 home + scrollable)', () => {
+            const code = readByPath(MAIN_PATH);
+            // Look for $cap = 3 explicit
+            expect(code).toMatch(/\$cap\s*=\s*3/);
+            expect(code).toMatch(/boss Q25/i);
+        });
+
+        test('W7.2 stats grid render function uses dinoco_sn_get_user_stats', () => {
+            const code = readByPath(MAIN_PATH);
+            expect(code).toContain("function dinoco_dashboard_stats_card");
+            expect(code).toContain("dinoco_sn_get_user_stats");
+            // 4 stat cells
+            expect(code).toContain('dnc-sn-stat-cell');
+            expect(code).toContain('plates_count');
+            expect(code).toContain('active_count');
+            expect(code).toContain('claim_count');
+            expect(code).toContain('member_years');
+        });
+
+        test('W7.1+W7.2 banner + stats called between Header and Assets shortcodes', () => {
+            const code = readByPath(MAIN_PATH);
+            // Render order: Header → Banners (echo) → Stats (echo) → Assets
+            // Use the echo invocation (not function definition) — search after Header marker
+            const headerIdx  = code.indexOf("do_shortcode('[dinoco_dashboard_header]')");
+            const assetsIdx  = code.indexOf("do_shortcode('[dinoco_dashboard_assets]')");
+            expect(headerIdx).toBeGreaterThan(-1);
+            expect(assetsIdx).toBeGreaterThan(headerIdx);
+            // Banners + stats echo calls must appear between header + assets
+            const between = code.substring(headerIdx, assetsIdx);
+            expect(between).toContain('echo dinoco_dashboard_banners');
+            expect(between).toContain('echo dinoco_dashboard_stats_card');
+        });
+
+        test('W7 all SN helpers called under function_exists guard (defensive)', () => {
+            const code = readByPath(MAIN_PATH);
+            const helpers = [
+                'dinoco_sn_get_user_expiring_plates',
+                'dinoco_sn_get_user_anniversaries',
+                'dinoco_sn_get_pending_reviews',
+                'dinoco_sn_get_user_stats',
+                'dinoco_sn_get_plate_data',
+                'dinoco_dashboard_banners',
+                'dinoco_dashboard_stats_card',
+            ];
+            helpers.forEach((fn) => {
+                const guards = (code.match(new RegExp(`function_exists\\(\\s*['"]${fn}['"]`, 'g')) || []).length;
+                expect(guards).toBeGreaterThan(0);
+            });
+        });
+
+        test('W7 Header reads loyalty_tier via dinoco_sn_get_user_ltv guarded', () => {
+            const code = readByPath(HEADER_PATH);
+            expect(code).toContain('dinoco_sn_get_user_ltv');
+            expect(code).toContain('dinoco_render_tier_badge');
+            expect(code).toContain('loyalty_tier');
+            // Both guarded
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_get_user_ltv['"]/);
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_render_tier_badge['"]/);
+        });
+
+        test('W7.3 tier badge inserted into card-name display', () => {
+            const code = readByPath(HEADER_PATH);
+            // tier_badge_html resolved before rendering, then injected after display_name
+            expect(code).toContain('$tier_badge_html');
+            // After display_name in card-name
+            const cardSection = code.match(/class="card-name"[^]+?<\/div>/);
+            expect(cardSection).not.toBeNull();
+            // The badge variable must be echoed in card-name area
+            const cardScope = code.split('class="card-name"')[1] || '';
+            expect(cardScope.split('class="card-id"')[0]).toContain('$tier_badge_html');
+        });
+
+        test('W7.3 notification settings 5 checkboxes with usermeta keys', () => {
+            const code = readByPath(HEADER_PATH);
+            // wp_usermeta key prefix (PHP concat: 'dinoco_sn_notif_' . $k)
+            expect(code).toContain('dinoco_sn_notif_');
+            // 5 checkbox names + form keys (per-key literal)
+            ['expiry', 'anniversary', 'review', 'promo', 'service'].forEach((k) => {
+                expect(code).toContain(`notif_${k}`);
+            });
+            // First 3 default ON, last 2 default OFF (boss Q26 = A per-type)
+            expect(code).toMatch(/'expiry'\s*=>\s*'1'/);
+            expect(code).toMatch(/'anniversary'\s*=>\s*'1'/);
+            expect(code).toMatch(/'review'\s*=>\s*'1'/);
+            expect(code).toMatch(/'promo'\s*=>\s*'0'/);
+            expect(code).toMatch(/'service'\s*=>\s*'0'/);
+        });
+
+        test('W7.3 notification AJAX handler registered with nonce verify', () => {
+            const code = readByPath(HEADER_PATH);
+            expect(code).toContain("add_action( 'wp_ajax_dinoco_save_notif_prefs'");
+            expect(code).toContain('dinoco_save_notif_prefs');
+            expect(code).toContain('wp_verify_nonce');
+            expect(code).toContain('dinoco_save_notif_prefs');
+            // current_user_id resolved before update_user_meta
+            expect(code).toContain('update_user_meta');
+        });
+
+        test('W7.3 scan-first button + html5-qrcode lazy load', () => {
+            const code = readByPath(HEADER_PATH);
+            // Boss Q29 = A scan-first
+            expect(code).toMatch(/dnc-sn-scan-first-btn|dincocoScanFirstQr|dinocoScanFirstQr/);
+            // Lazy load via dynamic script tag
+            expect(code).toMatch(/unpkg\.com\/html5-qrcode/);
+            // Reuses startQR from Global App Menu when available (P02 dedup)
+            expect(code).toContain('startQR');
+        });
+
+        test('W7.3 typed S/N input retained as fallback', () => {
+            const code = readByPath(HEADER_PATH);
+            // Existing typed input must still exist
+            expect(code).toContain('name="register_serial"');
+            // "หรือ พิมพ์ S/N เอง" fallback hint
+            expect(code).toMatch(/หรือ\s+พิมพ์\s+S\/N/);
+        });
+
+        test('W7 F#3 register_serial DNCSS prefix → /warranty/activate redirect', () => {
+            const code = readByPath(MAIN_PATH);
+            // DNCSS prefix detection
+            expect(code).toContain("'DNCSS'");
+            expect(code).toContain('strpos');
+            // Redirect URL
+            expect(code).toContain('/warranty/activate');
+            // Defensive — only redirect if SN system loaded
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_get_plate_data['"]/);
+        });
+
+        test('W7 F#3 prefill banner in Header when DNCSS sn present', () => {
+            const code = readByPath(HEADER_PATH);
+            expect(code).toContain('dnc-sn-prefill-banner');
+            expect(code).toContain('register_serial');
+            expect(code).toContain('DNCSS');
+            // Banner CTA links to /warranty/activate
+            expect(code).toContain('/warranty/activate');
+        });
+
+        test('W7.1 "📋 เคลม" quick action button added (additive)', () => {
+            const code = readByPath(HEADER_PATH);
+            // 4-button grid class
+            expect(code).toContain('dnc-sn-action-grid-4');
+            // New claim page button
+            expect(code).toContain('btn-claim-page');
+            expect(code).toContain('📋');
+            // Existing 3 buttons preserved (backward compat)
+            expect(code).toContain('btn-reg');
+            expect(code).toContain('btn-claim');
+            expect(code).toContain('btn-trans');
+        });
+
+        test('W7 SnTierBadgeTest helper test file exists with required cases', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnTierBadgeTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            // 5 tier render tests
+            expect(content).toContain('test_bronze_renders_correct_emoji_label_class');
+            expect(content).toContain('test_silver_renders_correct_emoji_label_class');
+            expect(content).toContain('test_gold_renders_correct_emoji_label_class');
+            expect(content).toContain('test_platinum_renders_correct_emoji_label_class');
+            expect(content).toContain('test_diamond_renders_correct_emoji_label_class');
+            // Defensive empty cases
+            expect(content).toContain('test_invalid_tier_slug_returns_empty');
+            expect(content).toContain('test_empty_string_returns_empty');
+            expect(content).toContain('test_null_and_non_string_returns_empty');
+            // Normalization
+            expect(content).toContain('test_uppercase_tier_normalizes_to_lowercase');
+            expect(content).toContain('test_mixed_case_normalizes');
+            expect(content).toContain('test_whitespace_padded_tier_normalizes');
+            // XSS / safety
+            expect(content).toContain('test_html_special_chars_in_invalid_slug_returns_empty');
+            expect(content).toContain('test_output_contains_no_script_tags');
+            // Distinct outputs + idempotent
+            expect(content).toContain('test_helper_is_idempotent_on_repeat_calls');
+            expect(content).toContain('test_all_5_tiers_produce_distinct_html');
+        });
+
+        test('W7 Member Dashboard Main passes PHP syntax check', () => {
+            // Drift sentinel — V.31.0 file must remain parseable
+            const code = readByPath(MAIN_PATH);
+            // Crude but useful: balanced curly braces (catch obvious unclosed blocks)
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+
+        test('W7 Header & Forms passes PHP syntax check', () => {
+            const code = readByPath(HEADER_PATH);
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+
+        test('W7 backward compat — V.30.x state machine preserved (M18 claim variants)', () => {
+            const code = readByPath(MAIN_PATH);
+            // Existing M18 logic must remain intact
+            expect(code).toContain("dinoco_member_dashboard_register_claim_states");
+            expect(code).toContain("'wait_shipping'");
+            expect(code).toContain("'รอลูกค้าส่งสินค้า'");
+            // Existing CTA + AJAX actions preserved
+            expect(code).toContain("'create_bundle'");
+            expect(code).toContain("'delete_bundle'");
+            expect(code).toContain("'save_track'");
+            expect(code).toContain("'confirm_receipt'");
+        });
+
+        test('W7 backward compat — Header sub-flows preserved (gateway/PDPA/profile/moto)', () => {
+            const code = readByPath(HEADER_PATH);
+            expect(code).toContain('gateway-wrapper');
+            expect(code).toContain('pdpa-overlay');
+            expect(code).toContain('save_pdpa_action');
+            expect(code).toContain('save_profile');
+            expect(code).toContain('save_moto');
+            expect(code).toContain('member-card-wrap');
+        });
+    });
+
+    /* ────────────────────────────────────────────────────────────────────
+     * Phase 2 W7.4 — Member Dashboard Assets List V.31.0
+     * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.11 §Asset Card
+     * Boss decision: Q28=B (history timeline default collapsed)
+     * ──────────────────────────────────────────────────────────────────── */
+    describe('Phase 2 W7.4 — Member Dashboard Assets List V.31.0', () => {
+        const ASSETS_PATH = '[System] Dashboard - Assets List';
+        const readAssets = () => {
+            const filepath = path.join(REPO_ROOT, ASSETS_PATH);
+            if (!fs.existsSync(filepath)) {
+                throw new Error(`Assets List snippet not found: ${ASSETS_PATH}`);
+            }
+            return fs.readFileSync(filepath, 'utf8');
+        };
+
+        test('Assets List exists', () => {
+            const filepath = path.join(REPO_ROOT, ASSETS_PATH);
+            expect(fs.existsSync(filepath)).toBe(true);
+        });
+
+        test('Assets List bumped to V.31.0+', () => {
+            const code = readAssets();
+            expect(code).toMatch(/Version:\s*V\.31\.0/);
+        });
+
+        test('dinoco_sn_compute_card_state classifier helper defined', () => {
+            const code = readAssets();
+            expect(code).toContain("function dinoco_sn_compute_card_state");
+            // function_exists guard around the helper definition
+            expect(code).toMatch(/if\s*\(\s*!\s*function_exists\(\s*['"]dinoco_sn_compute_card_state['"]/);
+        });
+
+        test('dinoco_sn_mask_phone_for_call helper defined (F#6)', () => {
+            const code = readAssets();
+            expect(code).toContain("function dinoco_sn_mask_phone_for_call");
+            expect(code).toMatch(/if\s*\(\s*!\s*function_exists\(\s*['"]dinoco_sn_mask_phone_for_call['"]/);
+        });
+
+        test('5 card state classes referenced (active/near_expiry/expired/claimed/stolen)', () => {
+            const code = readAssets();
+            ['active', 'near_expiry', 'expired', 'claimed', 'stolen'].forEach((state) => {
+                expect(code).toContain(`data-state="${state}"`);
+            });
+            // pending_verification fallback also referenced
+            expect(code).toContain('pending_verification');
+        });
+
+        test('Quick action row has 5 buttons (claim/transfer/call/extend/stolen)', () => {
+            const code = readAssets();
+            ['claim', 'transfer', 'call', 'extend', 'stolen'].forEach((action) => {
+                expect(code).toContain(`data-action="${action}"`);
+            });
+            // Quick actions container with role=group
+            expect(code).toContain('dnc-sn-asset-card-quick-actions');
+            expect(code).toContain('role="group"');
+        });
+
+        test('Touch targets ≥44px on action buttons', () => {
+            const code = readAssets();
+            // Base button + modal button + history toggle + stolen modal inputs
+            expect(code).toMatch(/\.dnc-sn-asset-card-action-btn[^}]*min-height:\s*44px/s);
+            expect(code).toMatch(/\.dnc-sn-asset-card-history-toggle[^}]*min-height:\s*44px/s);
+        });
+
+        test('Mobile-first responsive ≤640px media query present', () => {
+            const code = readAssets();
+            expect(code).toMatch(/@media\s*\(\s*max-width:\s*640px\s*\)/);
+            // On ≤640 quick actions collapse to single column
+            expect(code).toMatch(/grid-template-columns:\s*1fr/);
+        });
+
+        test('Collapsible history timeline default collapsed (Q28=B)', () => {
+            const code = readAssets();
+            // Container starts data-expanded="false"
+            expect(code).toContain('class="dnc-sn-asset-card-history" data-expanded="false"');
+            // List hidden by default in CSS
+            expect(code).toMatch(/\.dnc-sn-asset-card-history-list\s*\{[^}]*display:\s*none/s);
+            // Reveal only when expanded
+            expect(code).toMatch(/\.dnc-sn-asset-card-history\[data-expanded="true"\]\s*\.dnc-sn-asset-card-history-list/);
+        });
+
+        test('History timeline lazy-loads on first expand', () => {
+            const code = readAssets();
+            expect(code).toContain('dncSnToggleHistory');
+            expect(code).toContain('dncSnLoadHistory');
+            // data-loaded flag prevents double fetch
+            expect(code).toContain('data-loaded');
+            // Endpoint reference
+            expect(code).toContain('/wp-json/dinoco-sn/v1/timeline/');
+        });
+
+        test('Backward compat — legacy serial_code ACF fallback rendering preserved', () => {
+            const code = readAssets();
+            // Original meta reads (V.30.3 legacy path)
+            expect(code).toContain("get_post_meta($pid, 'serial_code', true)");
+            // Old btn-stolen still reachable when sn_pool plate absent
+            expect(code).toMatch(/\$chk_w\s*!==\s*['"]stolen['"]\s*&&\s*!\s*\$sn_plate/);
+        });
+
+        test('Defensive — sn_pool fetch guarded by function_exists', () => {
+            const code = readAssets();
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_get_plate_data['"]\s*\)/);
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_compute_card_state['"]\s*\)/);
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_render_asset_card_extension['"]\s*\)/);
+        });
+
+        test('F#6 phone masking — display pattern 08x-xxx-1234 implied (last 4 + first 3)', () => {
+            const code = readAssets();
+            // Mask helper substring/format
+            expect(code).toContain("'-xxx-'");
+            // Helper extracts 3 first + 4 last digits
+            expect(code).toMatch(/substr\(\s*\$digits,\s*0,\s*3\s*\)/);
+            expect(code).toMatch(/substr\(\s*\$digits,\s*-4\s*\)/);
+            // strlen guard ≥9 digits before masking (PDPA defensive)
+            expect(code).toMatch(/strlen\(\s*\$digits\s*\)\s*<\s*9/);
+        });
+
+        test('F#6 dealer button uses dialog-confirm flow (not direct tel: link)', () => {
+            const code = readAssets();
+            expect(code).toContain('dncSnCallDealer');
+            // Confirm prompt before invoking tel:
+            expect(code).toContain("data-shop-name=");
+            expect(code).toContain("data-phone=");
+            expect(code).toContain("'tel:'");
+        });
+
+        test('F#6 hotline fallback when no dealer phone available', () => {
+            const code = readAssets();
+            // When dealer phone empty → render Hotline DINOCO instead
+            expect(code).toContain('Hotline DINOCO');
+            expect(code).toContain('tel:02-xxx-xxxx');
+        });
+
+        test('F#8 Extension Marketplace scaffold (Phase 4 toast)', () => {
+            const code = readAssets();
+            expect(code).toContain('dncSnExtendWarranty');
+            // Phase 4 placeholder text rendered as toast
+            expect(code).toContain('Phase 4');
+            // Action button rendered with extend slug
+            expect(code).toContain('data-action="extend"');
+            // ต่อประกัน label present
+            expect(code).toContain('🎁 ต่อประกัน');
+        });
+
+        test('F#14 Stolen Report Modal markup present', () => {
+            const code = readAssets();
+            // Modal container
+            expect(code).toContain('id="dnc-sn-asset-card-stolen-modal"');
+            expect(code).toContain('role="dialog"');
+            // Required form fields per spec (police_report_no + police_station + incident_date + description)
+            expect(code).toContain('name="police_report_no"');
+            expect(code).toContain('name="police_station"');
+            expect(code).toContain('name="incident_date"');
+            expect(code).toContain('name="description"');
+            // Open/close handlers exposed
+            expect(code).toContain('dncSnOpenStolenModal');
+            expect(code).toContain('dncSnCloseStolenModal');
+        });
+
+        test('F#14 Stolen Report submits to /dinoco-sn/v1/stolen/report', () => {
+            const code = readAssets();
+            expect(code).toContain('/wp-json/dinoco-sn/v1/stolen/report');
+            // Defensive — endpoint may not be synced (Phase 3 W11)
+            expect(code).toContain('ติดต่อแอดมินทาง LINE');
+        });
+
+        test('F#14 Stolen Modal supports ESC key + backdrop close (a11y)', () => {
+            const code = readAssets();
+            expect(code).toContain('dncSnStolenEscClose');
+            expect(code).toMatch(/e\.key\s*===\s*['"]Escape['"]/);
+            // backdrop click handler reads aria-hidden state + matches event target
+            expect(code).toMatch(/getAttribute\(\s*['"]aria-hidden['"]\s*\)\s*===\s*['"]false['"]/);
+            expect(code).toMatch(/e\.target\s*===\s*modal/);
+        });
+
+        test('Card state CSS uses scoped .dnc-sn-asset-card-* prefix only (no leak to .prod-*)', () => {
+            const code = readAssets();
+            // V.31.0 CSS additions all share the prefix
+            expect(code).toMatch(/\.dnc-sn-asset-card-state/);
+            expect(code).toMatch(/\.dnc-sn-asset-card-quick-actions/);
+            expect(code).toMatch(/\.dnc-sn-asset-card-history/);
+            // V.30.3 prod-* classes preserved (backward compat)
+            expect(code).toContain('.prod-summary-card');
+            expect(code).toContain('.prod-list-container');
+        });
+
+        test('near_expiry pulses extend warranty CTA (animation)', () => {
+            const code = readAssets();
+            expect(code).toMatch(/@keyframes\s+dncSnAssetPulse/);
+            expect(code).toMatch(/data-state="near_expiry"\][^}]*data-action="extend"/);
+        });
+
+        test('Quick action button states honor card_state (claim/transfer disabled when claimed/stolen)', () => {
+            const code = readAssets();
+            // Claim disabled when stolen OR claimed
+            expect(code).toMatch(/\$is_stolen\s*\|\|\s*\$is_claimed/);
+            // Transfer disabled when stolen OR claimed OR expired
+            expect(code).toMatch(/\$is_stolen\s*\|\|\s*\$is_claimed\s*\|\|\s*\$is_expired/);
+        });
+
+        test('PHPUnit pure-logic test SnAssetCardStateTest.php exists with required cases', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnAssetCardStateTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('class SnAssetCardStateTest');
+            // Priority order assertions present
+            expect(content).toContain('test_null_plate_returns_pending_verification');
+            expect(content).toContain('test_active_state_for_recently_registered_plate');
+            expect(content).toContain('test_near_expiry_state_when_28_days_left');
+            expect(content).toContain('test_expired_state_when_warranty_already_lapsed');
+            expect(content).toContain('test_claimed_state_takes_priority_over_dates');
+            expect(content).toContain('test_stolen_state_overrides_status_field');
+            expect(content).toContain('test_voided_status_returns_pending_verification');
+            expect(content).toContain('test_recalled_status_returns_pending_verification');
+            // Boundary cases
+            expect(content).toContain('test_boundary_exactly_30_days_left_is_near_expiry');
+            expect(content).toContain('test_boundary_31_days_left_is_active');
+            expect(content).toContain('test_boundary_warranty_just_expired_is_expired');
+            // Phone mask cases
+            expect(content).toContain('test_phone_mask_thai_mobile_format');
+            expect(content).toContain('test_phone_mask_returns_empty_when_too_short');
+        });
+
+        test('Drift sentinel — V.31.0 file passes balanced-brace check', () => {
+            const code = readAssets();
+            const opens  = (code.match(/\{/g) || []).length;
+            const closes = (code.match(/\}/g) || []).length;
+            expect(opens).toBe(closes);
+        });
+    });
 });

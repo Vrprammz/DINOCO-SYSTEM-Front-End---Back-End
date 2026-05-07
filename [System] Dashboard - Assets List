@@ -1,9 +1,21 @@
 /*
  * Template Name: System Dashboard - Assets List
- * Description: Dashboard Assets List with Bundle support
+ * Description: Dashboard Assets List with Bundle support + sn_pool integration
  * Author: Dinoco Dev Team x UX Specialist
- * Version: V.30.3
+ * Version: V.31.0
  * DB_ID: 29
+ *
+ * V.31.0 (Phase 2 W7.4 — 2026-05-05):
+ *   - sn_pool dual-source rendering (additive, defensive function_exists guards).
+ *   - dinoco_sn_compute_card_state() classifier (5 visual states + 1 fallback).
+ *   - Quick action row (5 buttons: claim, transfer, call dealer, extend warranty, report stolen).
+ *   - Collapsible history timeline (Q28=B default collapsed).
+ *   - F#6 Click-to-Call (phone masking 08x-xxx-1234 + confirm modal).
+ *   - F#8 Extension Marketplace scaffold (Phase 4 toast).
+ *   - F#14 Stolen Registry (modal form via /dinoco-sn/v1/stolen/report endpoint).
+ *   - All CSS scoped under .dnc-sn-asset-card-* (no leak to V.30.3 .prod-* classes).
+ *   - Backward compat: legacy serial_number CPT + serial_code ACF render unchanged
+ *     when sn_pool helpers absent or plate row missing (Phase 2 transitional dual-source).
  */
 
 // [SECURITY] ห้าม Cache
@@ -56,6 +68,250 @@ if ( ! function_exists( 'dinoco_security_log' ) ) {
         );
         
         @file_put_contents( $log_file, $log_entry, FILE_APPEND | LOCK_EX );
+    }
+}
+
+// --------------------------------------------------------------------------
+// 1.5 V.31.0 HELPER: sn_pool card state classifier
+// --------------------------------------------------------------------------
+if ( ! function_exists( 'dinoco_sn_compute_card_state' ) ) {
+    /**
+     * V.31.0 — Phase 2 W7.4 asset card state classifier.
+     *
+     * Pure-logic classifier for the asset card visual state. Reads only
+     * fields that exist on a sn_pool row (status / registered_at / stolen_at)
+     * — does NOT touch DB. Mirror lives in tests/helpers/SnAssetCardStateTest.php.
+     *
+     * Priority order:
+     *   1. null/missing plate         → 'pending_verification'
+     *   2. stolen_at set              → 'stolen'           (highest mutable priority)
+     *   3. status=voided/recalled     → 'pending_verification'
+     *   4. status=claimed             → 'claimed'
+     *   5. status!=registered         → 'pending_verification'
+     *   6. days_left < 0              → 'expired'
+     *   7. days_left ≤ 30 (inclusive) → 'near_expiry'
+     *   8. otherwise                  → 'active'
+     *
+     * @param object|null $plate    sn_pool row (must expose: status, registered_at, stolen_at)
+     * @param int|null    $now_ts   Override for tests (default = time())
+     * @return string state slug for data-state attribute on the card
+     */
+    function dinoco_sn_compute_card_state( $plate, $now_ts = null ) {
+        if ( ! is_object( $plate ) ) return 'pending_verification';
+
+        $stolen_at = isset( $plate->stolen_at ) ? $plate->stolen_at : '';
+        if ( ! empty( $stolen_at ) && $stolen_at !== '0000-00-00 00:00:00' ) {
+            return 'stolen';
+        }
+
+        $status = isset( $plate->status ) ? (string) $plate->status : '';
+        if ( $status === 'voided' || $status === 'recalled' ) return 'pending_verification';
+        if ( $status === 'claimed' )                          return 'claimed';
+        if ( $status !== 'registered' )                       return 'pending_verification';
+
+        $registered_at = isset( $plate->registered_at ) ? $plate->registered_at : '';
+        if ( empty( $registered_at ) ) return 'pending_verification';
+
+        $reg_ts = strtotime( $registered_at );
+        if ( $reg_ts === false ) return 'pending_verification';
+
+        $now       = is_int( $now_ts ) ? $now_ts : time();
+        $end_ts    = $reg_ts + ( 365 * 86400 );          // 1y default warranty
+        $days_left = (int) floor( ( $end_ts - $now ) / 86400 );
+
+        if ( $days_left < 0 )   return 'expired';
+        if ( $days_left <= 30 ) return 'near_expiry';
+        return 'active';
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mask_phone_for_call' ) ) {
+    /**
+     * V.31.0 — Phase 2 W7.4 F#6 Click-to-Call display masking.
+     *
+     * Returns a masked rendering of the phone number for visible UI,
+     * keeping only first 3 + last 4 digits (e.g. 0812345678 → "08x-xxx-5678").
+     * Full number stays in data-attribute for the tap-to-call action.
+     *
+     * @param string $phone_raw raw 10-digit phone (numbers only or with hyphens)
+     * @return string masked rendering, or empty when phone invalid
+     */
+    function dinoco_sn_mask_phone_for_call( $phone_raw ) {
+        $digits = preg_replace( '/[^0-9]/', '', (string) $phone_raw );
+        if ( strlen( $digits ) < 9 ) return '';
+        $head = substr( $digits, 0, 3 );
+        $tail = substr( $digits, -4 );
+        return $head . '-xxx-' . $tail;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_render_asset_card_extension' ) ) {
+    /**
+     * V.31.0 — Phase 2 W7.4 sn_pool augmentation block.
+     *
+     * Renders the V.31.0 additions to a legacy V.30.3 asset card:
+     *   - State badge (data-state)
+     *   - SN line + days_left progress bar
+     *   - Dealer / purchase row (F#6 prep, mask phone)
+     *   - Quick action row (5 buttons: claim / transfer / call / extend / stolen)
+     *   - Collapsible history timeline (Q28=B default collapsed, lazy fetch)
+     *
+     * Always echoes — wrap in `if ( $sn_plate )` at call site.
+     *
+     * @param object $plate    sn_pool row (passed by ref-equivalent — read-only)
+     * @param string $sn       Plate S/N
+     * @param int    $pid      WP post ID (for cross-page links + stolen modal)
+     * @param string $card_state  state slug from dinoco_sn_compute_card_state()
+     */
+    function dinoco_sn_render_asset_card_extension( $plate, $sn, $pid, $card_state ) {
+        // Defensive defaults
+        $sn = (string) $sn;
+        $pid = (int) $pid;
+        $card_state = (string) $card_state;
+
+        // Cold meta lookup (purchase_dealer_id, purchase_date, etc.)
+        $plate_meta = ( ! empty( $sn ) && function_exists( 'dinoco_sn_get_plate_meta' ) )
+            ? dinoco_sn_get_plate_meta( $sn ) : null;
+
+        $dealer_id    = $plate_meta && isset( $plate_meta->purchase_dealer_id ) ? (int) $plate_meta->purchase_dealer_id : 0;
+        $purchase_date = $plate_meta && isset( $plate_meta->purchase_date ) ? (string) $plate_meta->purchase_date : '';
+
+        // Derive days_left for progress bar (registered + 1y default)
+        $days_left = null;
+        $days_pct = 0;
+        if ( $card_state !== 'pending_verification' && ! empty( $plate->registered_at ) ) {
+            $reg_ts = strtotime( $plate->registered_at );
+            if ( $reg_ts !== false ) {
+                $end_ts    = $reg_ts + ( 365 * 86400 );
+                $now       = time();
+                $secs_left = $end_ts - $now;
+                $days_left = (int) floor( $secs_left / 86400 );
+                $days_pct = max( 0, min( 100, (int) round( ( $secs_left / ( 365 * 86400 ) ) * 100 ) ) );
+            }
+        }
+
+        // Dealer lookup (F#6) — get shop_name + phone defensively
+        $dealer_shop_name = '';
+        $dealer_phone_raw = '';
+        $dealer_phone_masked = '';
+        if ( $dealer_id > 0 ) {
+            $d_post = get_post( $dealer_id );
+            if ( $d_post && $d_post->post_type === 'distributor' ) {
+                $dealer_shop_name = $d_post->post_title;
+                $phone_field = get_post_meta( $dealer_id, 'phone_number', true );
+                if ( empty( $phone_field ) ) {
+                    $phone_field = get_post_meta( $dealer_id, 'shop_phone', true );
+                }
+                $dealer_phone_raw = (string) $phone_field;
+                if ( function_exists( 'dinoco_sn_mask_phone_for_call' ) ) {
+                    $dealer_phone_masked = dinoco_sn_mask_phone_for_call( $dealer_phone_raw );
+                }
+            }
+        }
+
+        // Disable rules per state
+        $is_stolen   = ( $card_state === 'stolen' );
+        $is_expired  = ( $card_state === 'expired' );
+        $is_claimed  = ( $card_state === 'claimed' );
+
+        ?>
+        <div class="dnc-sn-asset-card-state" data-state="<?php echo esc_attr( $card_state ); ?>" data-sn="<?php echo esc_attr( $sn ); ?>" style="margin-top:14px; padding:12px; border-radius:8px;">
+
+            <div class="dnc-sn-asset-card-sn">S/N: <?php echo esc_html( $sn ); ?></div>
+
+            <?php if ( $days_left !== null ) : ?>
+                <div class="dnc-sn-asset-card-days-left">
+                    <?php
+                    if ( $days_left < 0 ) {
+                        echo '⛔ หมดอายุ ' . esc_html( abs( $days_left ) ) . ' วันที่แล้ว';
+                    } elseif ( $days_left <= 30 ) {
+                        echo '⏰ เหลือ ' . esc_html( $days_left ) . ' วัน';
+                    } else {
+                        echo '✅ ใช้ได้อีก ' . esc_html( $days_left ) . ' วัน';
+                    }
+                    ?>
+                </div>
+                <div class="dnc-sn-asset-card-progress-track">
+                    <div class="dnc-sn-asset-card-progress-fill" style="width:<?php echo esc_attr( $days_pct ); ?>%;"></div>
+                </div>
+            <?php endif; ?>
+
+            <?php if ( ! empty( $dealer_shop_name ) || ! empty( $purchase_date ) ) : ?>
+                <div class="dnc-sn-asset-card-dealer-row">
+                    <?php if ( ! empty( $dealer_shop_name ) ) : ?>
+                        <div>🏪 ซื้อจาก: <span class="dnc-sn-asset-card-dealer-name"><?php echo esc_html( $dealer_shop_name ); ?></span></div>
+                    <?php endif; ?>
+                    <?php if ( ! empty( $purchase_date ) ) : ?>
+                        <div class="dnc-sn-asset-card-purchase-date">📅 <?php echo esc_html( $purchase_date ); ?></div>
+                    <?php endif; ?>
+                </div>
+            <?php endif; ?>
+
+            <!-- Quick Actions Row (5 buttons) -->
+            <div class="dnc-sn-asset-card-quick-actions" role="group" aria-label="การดำเนินการกับสินค้า">
+                <a class="dnc-sn-asset-card-action-btn" data-action="claim"
+                   href="/claim/?sn=<?php echo esc_attr( rawurlencode( $sn ) ); ?>"
+                   <?php echo ( $is_stolen || $is_claimed ) ? 'aria-disabled="true" onclick="return false;" tabindex="-1"' : ''; ?>
+                   style="<?php echo ( $is_stolen || $is_claimed ) ? 'opacity:0.5;cursor:not-allowed;' : ''; ?>">
+                    ⚠️ เคลม
+                </a>
+                <a class="dnc-sn-asset-card-action-btn" data-action="transfer"
+                   href="/transfer-warranty/?sn=<?php echo esc_attr( rawurlencode( $sn ) ); ?>"
+                   <?php echo ( $is_stolen || $is_claimed || $is_expired ) ? 'aria-disabled="true" onclick="return false;" tabindex="-1"' : ''; ?>
+                   style="<?php echo ( $is_stolen || $is_claimed || $is_expired ) ? 'opacity:0.5;cursor:not-allowed;' : ''; ?>">
+                    🔄 โอน
+                </a>
+
+                <?php if ( ! empty( $dealer_phone_raw ) && ! empty( $dealer_shop_name ) ) : ?>
+                    <button class="dnc-sn-asset-card-action-btn" data-action="call"
+                            type="button"
+                            data-phone="<?php echo esc_attr( $dealer_phone_raw ); ?>"
+                            data-shop-name="<?php echo esc_attr( $dealer_shop_name ); ?>"
+                            data-phone-masked="<?php echo esc_attr( $dealer_phone_masked ); ?>"
+                            onclick="dncSnCallDealer(this)"
+                            <?php echo $is_stolen ? 'disabled' : ''; ?>>
+                        📞 <span class="dnc-sn-asset-card-phone-display"><?php echo esc_html( $dealer_phone_masked ); ?></span>
+                    </button>
+                <?php else : ?>
+                    <a class="dnc-sn-asset-card-action-btn" data-action="call"
+                       href="tel:02-xxx-xxxx"
+                       title="ติดต่อ DINOCO Hotline">
+                        📞 Hotline DINOCO
+                    </a>
+                <?php endif; ?>
+
+                <button class="dnc-sn-asset-card-action-btn" data-action="extend"
+                        type="button"
+                        onclick="dncSnExtendWarranty('<?php echo esc_js( $sn ); ?>')"
+                        <?php echo ( $is_stolen || $is_expired ) ? 'disabled' : ''; ?>>
+                    🎁 ต่อประกัน
+                </button>
+
+                <button class="dnc-sn-asset-card-action-btn" data-action="stolen"
+                        type="button"
+                        onclick="dncSnOpenStolenModal('<?php echo esc_js( $sn ); ?>', <?php echo (int) $pid; ?>)"
+                        <?php echo $is_stolen ? 'disabled' : ''; ?>
+                        style="grid-column: 1 / -1;">
+                    🚨 รายงานหาย
+                </button>
+            </div>
+
+            <!-- Collapsible history timeline (Q28=B default collapsed) -->
+            <div class="dnc-sn-asset-card-history" data-expanded="false" data-sn="<?php echo esc_attr( $sn ); ?>">
+                <button type="button" class="dnc-sn-asset-card-history-toggle" onclick="dncSnToggleHistory(this)" aria-expanded="false">
+                    <span>📊 ประวัติพล็อต</span>
+                    <span class="dnc-sn-asset-card-history-arrow" aria-hidden="true">▼</span>
+                </button>
+                <ul class="dnc-sn-asset-card-history-list" data-loaded="false" aria-live="polite">
+                    <li class="dnc-sn-asset-card-history-item dnc-sn-asset-card-history-placeholder">
+                        <span class="dnc-sn-asset-card-history-icon">⏳</span>
+                        <span class="dnc-sn-asset-card-history-label">กำลังโหลด...</span>
+                    </li>
+                </ul>
+            </div>
+
+        </div>
+        <?php
     }
 }
 
@@ -1236,6 +1492,337 @@ function dinoco_dashboard_assets_func() {
             100% { transform: rotate(360deg); }
         }
 
+        /* ============================================================== */
+        /* V.31.0 — Phase 2 W7.4 sn_pool Asset Card extensions             */
+        /*   All selectors prefixed .dnc-sn-asset-card-* — NO leak to      */
+        /*   existing V.30.3 .prod-* classes. Mobile-first ≤640px.         */
+        /* ============================================================== */
+
+        /* State-based tinting (applied via data-state="{slug}" attr) */
+        .dnc-sn-asset-card-state[data-state="active"] {
+            border-left: 4px solid #16a34a;
+        }
+        .dnc-sn-asset-card-state[data-state="near_expiry"] {
+            border-left: 4px solid #f59e0b;
+            background: #fffbeb;
+        }
+        .dnc-sn-asset-card-state[data-state="expired"] {
+            border-left: 4px solid #94a3b8;
+            background: #f8fafc;
+            opacity: 0.85;
+        }
+        .dnc-sn-asset-card-state[data-state="claimed"] {
+            border-left: 4px solid #2563eb;
+            background: #eff6ff;
+        }
+        .dnc-sn-asset-card-state[data-state="stolen"] {
+            border: 2px solid #dc2626;
+            background: #fef2f2;
+        }
+
+        /* SN line + days-left progress */
+        .dnc-sn-asset-card-sn {
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 13px;
+            color: #1e293b;
+            background: #f1f5f9;
+            padding: 6px 10px;
+            border-radius: 6px;
+            margin: 8px 0;
+            display: inline-block;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+
+        .dnc-sn-asset-card-days-left {
+            font-size: 13px;
+            font-weight: 600;
+            margin: 8px 0 4px 0;
+            color: #475569;
+        }
+
+        .dnc-sn-asset-card-progress-track {
+            height: 8px;
+            background: #e2e8f0;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 12px;
+        }
+
+        .dnc-sn-asset-card-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #16a34a 0%, #22c55e 100%);
+            transition: width 0.4s ease;
+        }
+
+        .dnc-sn-asset-card-state[data-state="near_expiry"] .dnc-sn-asset-card-progress-fill {
+            background: linear-gradient(90deg, #f59e0b 0%, #fbbf24 100%);
+        }
+
+        .dnc-sn-asset-card-state[data-state="expired"] .dnc-sn-asset-card-progress-fill {
+            background: #94a3b8;
+        }
+
+        /* Dealer / purchase info row (F#6 prep) */
+        .dnc-sn-asset-card-dealer-row {
+            margin: 12px 0;
+            padding: 10px 12px;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 13px;
+            color: #475569;
+            line-height: 1.5;
+        }
+
+        .dnc-sn-asset-card-dealer-row .dnc-sn-asset-card-dealer-name {
+            font-weight: 600;
+            color: #1e293b;
+        }
+
+        .dnc-sn-asset-card-purchase-date {
+            font-size: 12px;
+            color: #64748b;
+            margin-top: 2px;
+        }
+
+        /* Quick Actions (5 buttons row) — touch targets ≥44px */
+        .dnc-sn-asset-card-quick-actions {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin: 14px 0;
+        }
+
+        .dnc-sn-asset-card-action-btn {
+            min-height: 44px;
+            padding: 10px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            background: #fff;
+            font-size: 13px;
+            font-weight: 600;
+            color: #1e293b;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            font-family: inherit;
+            text-decoration: none;
+        }
+
+        .dnc-sn-asset-card-action-btn:hover {
+            background: #f1f5f9;
+            border-color: #94a3b8;
+        }
+
+        .dnc-sn-asset-card-action-btn:focus-visible {
+            outline: 2px solid #2563eb;
+            outline-offset: 2px;
+        }
+
+        .dnc-sn-asset-card-action-btn[data-action="claim"]    { background: #fff7ed; border-color: #fdba74; color: #9a3412; }
+        .dnc-sn-asset-card-action-btn[data-action="transfer"] { background: #eff6ff; border-color: #93c5fd; color: #1e40af; }
+        .dnc-sn-asset-card-action-btn[data-action="call"]     { background: #f0fdf4; border-color: #86efac; color: #14532d; }
+        .dnc-sn-asset-card-action-btn[data-action="extend"]   { background: #faf5ff; border-color: #c4b5fd; color: #5b21b6; }
+        .dnc-sn-asset-card-action-btn[data-action="stolen"]   { background: #fef2f2; border-color: #fca5a5; color: #7f1d1d; }
+
+        .dnc-sn-asset-card-action-btn:disabled,
+        .dnc-sn-asset-card-action-btn[disabled] {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* near_expiry pulses the extend warranty CTA */
+        .dnc-sn-asset-card-state[data-state="near_expiry"] .dnc-sn-asset-card-action-btn[data-action="extend"] {
+            animation: dncSnAssetPulse 1.6s infinite;
+        }
+
+        @keyframes dncSnAssetPulse {
+            0%   { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.5); }
+            70%  { box-shadow: 0 0 0 8px rgba(245, 158, 11, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+        }
+
+        /* Collapsible history timeline (Q28=B default collapsed) */
+        .dnc-sn-asset-card-history {
+            margin-top: 14px;
+            border-top: 1px dashed #e2e8f0;
+            padding-top: 14px;
+        }
+
+        .dnc-sn-asset-card-history-toggle {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            width: 100%;
+            min-height: 44px;
+            padding: 10px 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            background: #f8fafc;
+            font-size: 13px;
+            font-weight: 600;
+            color: #1e293b;
+            cursor: pointer;
+            font-family: inherit;
+        }
+
+        .dnc-sn-asset-card-history-toggle:hover {
+            background: #f1f5f9;
+        }
+
+        .dnc-sn-asset-card-history-arrow {
+            transition: transform 0.2s ease;
+            font-size: 11px;
+            color: #64748b;
+        }
+
+        .dnc-sn-asset-card-history[data-expanded="true"] .dnc-sn-asset-card-history-arrow {
+            transform: rotate(180deg);
+        }
+
+        .dnc-sn-asset-card-history-list {
+            display: none;
+            margin-top: 12px;
+            list-style: none;
+            padding: 0;
+        }
+
+        .dnc-sn-asset-card-history[data-expanded="true"] .dnc-sn-asset-card-history-list {
+            display: block;
+            animation: dncSnAssetSlideDown 0.2s ease-out;
+        }
+
+        @keyframes dncSnAssetSlideDown {
+            from { opacity: 0; transform: translateY(-4px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        .dnc-sn-asset-card-history-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 8px 4px;
+            border-bottom: 1px solid #f1f5f9;
+            font-size: 13px;
+            color: #475569;
+        }
+
+        .dnc-sn-asset-card-history-item:last-child { border-bottom: none; }
+
+        .dnc-sn-asset-card-history-icon {
+            flex-shrink: 0;
+            width: 24px;
+            text-align: center;
+        }
+
+        .dnc-sn-asset-card-history-label {
+            flex-grow: 1;
+            font-weight: 600;
+            color: #1e293b;
+        }
+
+        .dnc-sn-asset-card-history-date {
+            flex-shrink: 0;
+            color: #64748b;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
+        /* Stolen report modal (F#14) */
+        .dnc-sn-asset-card-stolen-modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.55);
+            z-index: 9998;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+        }
+
+        .dnc-sn-asset-card-stolen-modal[aria-hidden="false"] {
+            display: flex;
+        }
+
+        .dnc-sn-asset-card-stolen-modal-body {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            max-width: 480px;
+            width: 100%;
+            max-height: 85vh;
+            overflow-y: auto;
+        }
+
+        .dnc-sn-asset-card-stolen-modal-body label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: #1e293b;
+            margin: 12px 0 4px 0;
+        }
+
+        .dnc-sn-asset-card-stolen-modal-body input[type=text],
+        .dnc-sn-asset-card-stolen-modal-body input[type=date],
+        .dnc-sn-asset-card-stolen-modal-body textarea {
+            width: 100%;
+            min-height: 44px;
+            padding: 10px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            box-sizing: border-box;
+        }
+
+        .dnc-sn-asset-card-stolen-modal-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        .dnc-sn-asset-card-stolen-modal-actions button {
+            flex: 1;
+            min-height: 44px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            font-family: inherit;
+        }
+
+        .dnc-sn-asset-card-stolen-submit {
+            background: #dc2626;
+            color: #fff;
+            border: none;
+        }
+
+        .dnc-sn-asset-card-stolen-cancel {
+            background: #fff;
+            color: #475569;
+            border: 1px solid #cbd5e1;
+        }
+
+        /* Mobile-first responsive ≤640px (member dashboard primary platform) */
+        @media (max-width: 640px) {
+            .dnc-sn-asset-card-quick-actions {
+                grid-template-columns: 1fr;
+            }
+            .dnc-sn-asset-card-action-btn {
+                min-height: 48px;
+                font-size: 14px;
+            }
+            .dnc-sn-asset-card-stolen-modal-body {
+                padding: 16px;
+                border-radius: 8px;
+            }
+        }
+
         /* SweetAlert2 Custom Overrides for Dinoco Theme */
         .swal2-popup {
             font-family: var(--dnc-font, 'Noto Sans Thai', 'Prompt', sans-serif) !important;
@@ -1372,12 +1959,24 @@ function dinoco_dashboard_assets_func() {
                                                 
                                                 // --- [DATA FIX] Full Detail Logic Injection for Children ---
                                                 // 1. Reset Variables
-                                                $st_cls = 'st-green'; 
+                                                $st_cls = 'st-green';
                                                 $st_txt = '✅ รับประกันสินค้า';
-                                                $mini_badge_bg = '#dcfce7'; 
+                                                $mini_badge_bg = '#dcfce7';
                                                 $mini_badge_col = '#166534';
                                                 $is_expired_header = false;
                                                 $chk_w = strtolower( $w_status );
+
+                                                // V.31.0 — sn_pool augmentation (child-in-bundle path)
+                                                $sn_plate    = null;
+                                                $sn_card_state = 'pending_verification';
+                                                if ( ! empty( $sn ) && function_exists( 'dinoco_sn_get_plate_data' ) ) {
+                                                    $sn_plate = dinoco_sn_get_plate_data( $sn );
+                                                }
+                                                if ( $sn_plate ) {
+                                                    $sn_card_state = function_exists( 'dinoco_sn_compute_card_state' )
+                                                        ? dinoco_sn_compute_card_state( $sn_plate )
+                                                        : 'pending_verification';
+                                                }
 
                                                 // 2. Check Expiry
                                                 $header_expire_check = get_post_meta($pid, 'warranty_expiry', true);
@@ -1576,7 +2175,14 @@ function dinoco_dashboard_assets_func() {
                                                                     <span class="st-val"><?php echo esc_html( $show_status ); ?></span>
                                                                 </div>
                                                                 
-                                                                <?php if ( $chk_w !== 'stolen' ) : ?>
+                                                                <?php
+                                                                // V.31.0 — sn_pool augmentation block (child-in-bundle path)
+                                                                if ( $sn_plate && function_exists( 'dinoco_sn_render_asset_card_extension' ) ) {
+                                                                    dinoco_sn_render_asset_card_extension( $sn_plate, $sn, $pid, $sn_card_state );
+                                                                }
+                                                                ?>
+
+                                                                <?php if ( $chk_w !== 'stolen' && ! $sn_plate ) : ?>
                                                                     <button class="btn-stolen" onclick="reportStolen(<?php echo $pid; ?>)">🚨 แจ้งสินค้าหาย/ระงับสิทธิ์</button>
                                                                 <?php endif; ?>
 
@@ -1613,17 +2219,31 @@ function dinoco_dashboard_assets_func() {
             <?php endif; wp_reset_postdata(); ?>
             
             <!-- SINGLE PRODUCT LOOP (FIXED STRUCTURE) -->
-            <?php 
-            while ( $my_singles->have_posts() ) : 
-                $my_singles->the_post(); 
+            <?php
+            while ( $my_singles->have_posts() ) :
+                $my_singles->the_post();
                 $pid                  = get_the_ID();
-                $sn                   = get_post_meta($pid, 'serial_code', true); 
+                $sn                   = get_post_meta($pid, 'serial_code', true);
                 $sku                  = get_post_meta($pid, 'product_sku', true);
                 $w_status_raw         = get_post_meta($pid, 'w_status', true);
-                $w_status             = is_array( $w_status_raw ) ? ( isset( $w_status_raw['value'] ) ? $w_status_raw['value'] : ( isset( $w_status_raw[0] ) ? $w_status_raw[0] : '' ) ) : $w_status_raw; 
+                $w_status             = is_array( $w_status_raw ) ? ( isset( $w_status_raw['value'] ) ? $w_status_raw['value'] : ( isset( $w_status_raw[0] ) ? $w_status_raw[0] : '' ) ) : $w_status_raw;
                 $w_status             = trim( $w_status );
-                
+
                 $chk_w = strtolower( $w_status );
+
+                // V.31.0 — Phase 2 W7.4 sn_pool dual-source augmentation
+                // Defensive: only augment when SN helper is available AND
+                // the plate row exists. Legacy ACF fallback rendering remains.
+                $sn_plate    = null;
+                $sn_card_state = 'pending_verification';
+                if ( ! empty( $sn ) && function_exists( 'dinoco_sn_get_plate_data' ) ) {
+                    $sn_plate = dinoco_sn_get_plate_data( $sn );
+                }
+                if ( $sn_plate ) {
+                    $sn_card_state = function_exists( 'dinoco_sn_compute_card_state' )
+                        ? dinoco_sn_compute_card_state( $sn_plate )
+                        : 'pending_verification';
+                }
 
                 $catalog_item         = isset( $product_catalog[ $sku ] ) ? $product_catalog[ $sku ] : null;
                 $img_url              = ( $catalog_item && ! empty( $catalog_item['img'] ) ) ? $catalog_item['img'] : 'https://placehold.co/400x300?text=No+Image';
@@ -1851,7 +2471,14 @@ function dinoco_dashboard_assets_func() {
                                     <span class="st-val"><?php echo esc_html( $show_status ); ?></span>
                                 </div>
                                 
-                                <?php if ( $chk_w !== 'stolen' ) : ?>
+                                <?php
+                                // V.31.0 — sn_pool augmentation block (single product path)
+                                if ( $sn_plate && function_exists( 'dinoco_sn_render_asset_card_extension' ) ) {
+                                    dinoco_sn_render_asset_card_extension( $sn_plate, $sn, $pid, $sn_card_state );
+                                }
+                                ?>
+
+                                <?php if ( $chk_w !== 'stolen' && ! $sn_plate ) : ?>
                                     <button class="btn-stolen" onclick="reportStolen(<?php echo $pid; ?>)">🚨 แจ้งสินค้าหาย/ระงับสิทธิ์</button>
                                 <?php endif; ?>
 
@@ -1896,7 +2523,42 @@ function dinoco_dashboard_assets_func() {
         <div style="text-align:center; margin-top:40px; padding-bottom: 80px;">
             <a href="<?php echo wp_logout_url( home_url() ); ?>" style="color:#999; text-decoration:none; font-weight:600; display:inline-block; border:1px solid #ddd; padding:10px 20px; border-radius:30px;">ออกจากระบบ</a>
         </div>
-    </div> 
+    </div>
+
+    <!-- V.31.0 — F#14 Stolen Report Modal (singleton, opened by dncSnOpenStolenModal) -->
+    <div id="dnc-sn-asset-card-stolen-modal" class="dnc-sn-asset-card-stolen-modal" role="dialog" aria-hidden="true" aria-labelledby="dnc-sn-asset-card-stolen-title">
+        <div class="dnc-sn-asset-card-stolen-modal-body">
+            <h3 id="dnc-sn-asset-card-stolen-title" style="margin:0 0 8px 0; font-size:18px; color:#7f1d1d;">🚨 รายงานสินค้าหาย</h3>
+            <div style="font-size:13px; color:#475569; margin-bottom:8px;">
+                S/N: <span id="dnc-sn-asset-card-stolen-sn-display" style="font-family:monospace; font-weight:600; color:#1e293b;"></span>
+            </div>
+            <div style="font-size:12px; color:#dc2626; background:#fef2f2; padding:8px 10px; border-radius:6px; margin-bottom:12px; line-height:1.5;">
+                ⚠️ การรายงานสินค้าหายจะระงับการรับประกันชั่วคราว — แอดมินจะตรวจสอบและติดต่อกลับ
+            </div>
+
+            <form id="dnc-sn-asset-card-stolen-form" onsubmit="return dncSnSubmitStolen(event);">
+                <input type="hidden" id="dnc-sn-asset-card-stolen-sn" name="sn" value="">
+                <input type="hidden" id="dnc-sn-asset-card-stolen-pid" name="product_id" value="">
+
+                <label for="dnc-sn-asset-card-stolen-police-no">เลขที่ใบแจ้งความ <span style="color:#dc2626;">*</span></label>
+                <input type="text" id="dnc-sn-asset-card-stolen-police-no" name="police_report_no" required maxlength="60">
+
+                <label for="dnc-sn-asset-card-stolen-station">สถานีตำรวจ <span style="color:#dc2626;">*</span></label>
+                <input type="text" id="dnc-sn-asset-card-stolen-station" name="police_station" required maxlength="120">
+
+                <label for="dnc-sn-asset-card-stolen-date">วันที่เกิดเหตุ <span style="color:#dc2626;">*</span></label>
+                <input type="date" id="dnc-sn-asset-card-stolen-date" name="incident_date" required>
+
+                <label for="dnc-sn-asset-card-stolen-desc">รายละเอียดเหตุการณ์</label>
+                <textarea id="dnc-sn-asset-card-stolen-desc" name="description" rows="3" maxlength="500" placeholder="โปรดระบุพฤติการณ์ที่เกิดเหตุ"></textarea>
+
+                <div class="dnc-sn-asset-card-stolen-modal-actions">
+                    <button type="button" class="dnc-sn-asset-card-stolen-cancel" onclick="dncSnCloseStolenModal()">ยกเลิก</button>
+                    <button type="submit" class="dnc-sn-asset-card-stolen-submit">ยืนยันรายงาน</button>
+                </div>
+            </form>
+        </div>
+    </div>
 
     <!-- JAVASCRIPT LOGIC (V16 - UX Overhaul) -->
     <script>
@@ -2215,12 +2877,238 @@ function dinoco_dashboard_assets_func() {
                 })
                 .catch(e => { 
                     toggleLoader(false); 
-                    console.error(e); 
+                    console.error(e);
                     Swal.fire('เกิดข้อผิดพลาด', 'Connection Error: ' + e.message, 'error');
                 });
             }
         });
     }
+
+    /* ====================================================================
+     * V.31.0 — Phase 2 W7.4 sn_pool Asset Card JS handlers
+     *   All handlers prefixed dncSn* for namespace isolation.
+     *   Defensive: graceful no-ops when API endpoints missing (Phase 4 etc.).
+     * ==================================================================== */
+
+    // F#6 Click-to-Call dealer (mask phone, confirm, then tel:)
+    function dncSnCallDealer(btn) {
+        if (!btn) return;
+        var phone     = btn.getAttribute('data-phone') || '';
+        var shopName  = btn.getAttribute('data-shop-name') || '';
+        var phoneMask = btn.getAttribute('data-phone-masked') || phone;
+        if (!phone) return;
+        if (typeof Swal === 'undefined') {
+            // Defensive native fallback when SweetAlert2 missing
+            if (window.confirm('โทรหา ' + shopName + '\nเบอร์: ' + phone + '?')) {
+                window.location.href = 'tel:' + phone.replace(/[^0-9+]/g, '');
+            }
+            return;
+        }
+        Swal.fire({
+            title: '📞 โทรหา ' + shopName + '?',
+            html: 'เบอร์: <b>' + phone + '</b><br><small style="color:#64748b;">(' + phoneMask + ')</small>',
+            icon: 'question',
+            showCancelButton: true,
+            confirmButtonText: 'โทร',
+            confirmButtonColor: '#16a34a',
+            cancelButtonText: 'ยกเลิก'
+        }).then(function(r) {
+            if (r.isConfirmed) {
+                window.location.href = 'tel:' + phone.replace(/[^0-9+]/g, '');
+            }
+        });
+    }
+
+    // F#8 Extension Marketplace (Phase 4 — scaffold toast for now)
+    function dncSnExtendWarranty(sn) {
+        // Wired to /warranty/extend?sn=... in Phase 4 W12. For now: gentle toast.
+        if (typeof Swal !== 'undefined') {
+            Swal.fire({
+                title: '🎁 ต่อประกัน',
+                text: 'ฟีเจอร์ต่อประกันจะเปิดใน Phase 4 — รอติดตามครับ',
+                icon: 'info',
+                confirmButtonText: 'รับทราบ'
+            });
+        } else {
+            window.alert('ฟีเจอร์ต่อประกันจะเปิดใน Phase 4');
+        }
+        // Placeholder navigate for future activation:
+        //   window.location.href = '/warranty/extend?sn=' + encodeURIComponent(sn);
+    }
+
+    // F#14 Stolen Report Modal (open / close / submit)
+    function dncSnOpenStolenModal(sn, pid) {
+        var modal = document.getElementById('dnc-sn-asset-card-stolen-modal');
+        if (!modal) return;
+        document.getElementById('dnc-sn-asset-card-stolen-sn').value = sn || '';
+        document.getElementById('dnc-sn-asset-card-stolen-pid').value = pid || 0;
+        var disp = document.getElementById('dnc-sn-asset-card-stolen-sn-display');
+        if (disp) disp.textContent = sn || '';
+        modal.setAttribute('aria-hidden', 'false');
+        // ESC key listener
+        document.addEventListener('keydown', dncSnStolenEscClose);
+        // Trap focus on first input
+        setTimeout(function() {
+            var first = document.getElementById('dnc-sn-asset-card-stolen-police-no');
+            if (first) first.focus();
+        }, 100);
+    }
+
+    function dncSnCloseStolenModal() {
+        var modal = document.getElementById('dnc-sn-asset-card-stolen-modal');
+        if (!modal) return;
+        modal.setAttribute('aria-hidden', 'true');
+        document.removeEventListener('keydown', dncSnStolenEscClose);
+        var form = document.getElementById('dnc-sn-asset-card-stolen-form');
+        if (form) form.reset();
+    }
+
+    function dncSnStolenEscClose(e) {
+        if (e && e.key === 'Escape') dncSnCloseStolenModal();
+    }
+
+    function dncSnSubmitStolen(e) {
+        if (e && e.preventDefault) e.preventDefault();
+        var sn      = document.getElementById('dnc-sn-asset-card-stolen-sn').value;
+        var pid     = document.getElementById('dnc-sn-asset-card-stolen-pid').value;
+        var policeNo = document.getElementById('dnc-sn-asset-card-stolen-police-no').value.trim();
+        var station = document.getElementById('dnc-sn-asset-card-stolen-station').value.trim();
+        var date    = document.getElementById('dnc-sn-asset-card-stolen-date').value.trim();
+        var desc    = document.getElementById('dnc-sn-asset-card-stolen-desc').value.trim();
+
+        if (!sn || !policeNo || !station || !date) {
+            if (typeof Swal !== 'undefined') {
+                Swal.fire('ข้อมูลไม่ครบ', 'กรุณากรอกใบแจ้งความ + สถานีตำรวจ + วันที่เกิดเหตุ', 'warning');
+            } else {
+                window.alert('กรุณากรอกข้อมูลให้ครบ');
+            }
+            return false;
+        }
+
+        // POST to /dinoco-sn/v1/stolen/report — defensive: 503 if endpoint not synced
+        if (typeof toggleLoader === 'function') toggleLoader(true);
+        var fd = new FormData();
+        fd.append('sn', sn);
+        fd.append('product_id', pid);
+        fd.append('police_report_no', policeNo);
+        fd.append('police_station', station);
+        fd.append('incident_date', date);
+        fd.append('description', desc);
+
+        var nonceVal = (typeof wpApiSettings !== 'undefined' && wpApiSettings.nonce) ? wpApiSettings.nonce : '';
+        var headers = {};
+        if (nonceVal) headers['X-WP-Nonce'] = nonceVal;
+
+        fetch('/wp-json/dinoco-sn/v1/stolen/report', { method: 'POST', body: fd, credentials: 'same-origin', headers: headers })
+            .then(function(r) {
+                return r.json().then(function(d) { return { ok: r.ok, status: r.status, data: d }; });
+            })
+            .then(function(res) {
+                if (typeof toggleLoader === 'function') toggleLoader(false);
+                if (res.ok) {
+                    dncSnCloseStolenModal();
+                    if (typeof Swal !== 'undefined') {
+                        Swal.fire('รายงานสำเร็จ', 'แอดมินจะตรวจสอบและติดต่อกลับโดยเร็วที่สุด', 'success').then(function(){ location.reload(); });
+                    } else {
+                        window.alert('รายงานสำเร็จ');
+                        location.reload();
+                    }
+                } else {
+                    var msg = (res.data && res.data.message) || 'ส่งรายงานไม่สำเร็จ — กรุณาติดต่อแอดมินทาง LINE';
+                    if (typeof Swal !== 'undefined') {
+                        Swal.fire('ไม่สำเร็จ', msg, 'error');
+                    } else {
+                        window.alert(msg);
+                    }
+                }
+            })
+            .catch(function(err) {
+                if (typeof toggleLoader === 'function') toggleLoader(false);
+                console.error(err);
+                // Defensive — endpoint may not be synced yet
+                if (typeof Swal !== 'undefined') {
+                    Swal.fire('ติดต่อ Admin', 'ไม่สามารถส่งรายงานอัตโนมัติได้ — กรุณาติดต่อแอดมินทาง LINE', 'info');
+                } else {
+                    window.alert('กรุณาติดต่อแอดมินทาง LINE');
+                }
+            });
+        return false;
+    }
+
+    // History timeline toggle (Q28=B default collapsed) + lazy fetch
+    function dncSnToggleHistory(btn) {
+        var wrap = btn && btn.closest ? btn.closest('.dnc-sn-asset-card-history') : null;
+        if (!wrap) return;
+        var expanded = wrap.getAttribute('data-expanded') === 'true';
+        var newState = !expanded;
+        wrap.setAttribute('data-expanded', newState ? 'true' : 'false');
+        btn.setAttribute('aria-expanded', newState ? 'true' : 'false');
+
+        if (newState) {
+            var list = wrap.querySelector('.dnc-sn-asset-card-history-list');
+            if (list && list.getAttribute('data-loaded') !== 'true') {
+                dncSnLoadHistory(wrap);
+            }
+        }
+    }
+
+    function dncSnLoadHistory(wrap) {
+        var sn = wrap.getAttribute('data-sn');
+        var list = wrap.querySelector('.dnc-sn-asset-card-history-list');
+        if (!sn || !list) return;
+        fetch('/wp-json/dinoco-sn/v1/timeline/' + encodeURIComponent(sn), { credentials: 'same-origin' })
+            .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
+            .then(function(data) {
+                list.innerHTML = '';
+                var rows = (data && data.timeline) ? data.timeline : (Array.isArray(data) ? data : []);
+                if (!rows.length) {
+                    list.innerHTML = '<li class="dnc-sn-asset-card-history-item"><span class="dnc-sn-asset-card-history-icon">📭</span><span class="dnc-sn-asset-card-history-label">ยังไม่มีประวัติ</span></li>';
+                } else {
+                    rows.forEach(function(row) {
+                        var icon  = row.icon  || '•';
+                        var label = row.label || row.action || '(ไม่ระบุ)';
+                        var date  = row.date  || row.created_at || '';
+                        var li = document.createElement('li');
+                        li.className = 'dnc-sn-asset-card-history-item';
+                        var iconSp = document.createElement('span');
+                        iconSp.className = 'dnc-sn-asset-card-history-icon';
+                        iconSp.textContent = icon;
+                        var labelSp = document.createElement('span');
+                        labelSp.className = 'dnc-sn-asset-card-history-label';
+                        labelSp.textContent = label;
+                        var dateSp = document.createElement('span');
+                        dateSp.className = 'dnc-sn-asset-card-history-date';
+                        dateSp.textContent = date;
+                        li.appendChild(iconSp);
+                        li.appendChild(labelSp);
+                        li.appendChild(dateSp);
+                        list.appendChild(li);
+                    });
+                }
+                list.setAttribute('data-loaded', 'true');
+            })
+            .catch(function() {
+                list.innerHTML = '<li class="dnc-sn-asset-card-history-item"><span class="dnc-sn-asset-card-history-icon">⚠️</span><span class="dnc-sn-asset-card-history-label">โหลดประวัติไม่สำเร็จ</span></li>';
+            });
+    }
+
+    // Backdrop click → close stolen modal
+    document.addEventListener('click', function(e) {
+        var modal = document.getElementById('dnc-sn-asset-card-stolen-modal');
+        if (!modal) return;
+        if (modal.getAttribute('aria-hidden') === 'false' && e.target === modal) {
+            dncSnCloseStolenModal();
+        }
+    });
+
+    // Expose for tests / external triggers
+    window.dncSnCallDealer       = dncSnCallDealer;
+    window.dncSnExtendWarranty   = dncSnExtendWarranty;
+    window.dncSnOpenStolenModal  = dncSnOpenStolenModal;
+    window.dncSnCloseStolenModal = dncSnCloseStolenModal;
+    window.dncSnToggleHistory    = dncSnToggleHistory;
+    window.dncSnSubmitStolen     = dncSnSubmitStolen;
+
     </script>
     <?php
     return ob_get_clean();

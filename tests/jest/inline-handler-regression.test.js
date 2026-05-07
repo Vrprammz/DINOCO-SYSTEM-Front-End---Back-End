@@ -118,7 +118,16 @@ const SNIPPET_PREFIXES = [
 // cancel/submit, approvals refresh/toggle). Migration to data-action
 // delegation deferred per same v2.13 polish sprint plan — markers ship now,
 // migration sweep planned for Phase 6 polish round.
-const BASELINE_INLINE_HANDLER_COUNT = 919;
+//
+// Bumped 919→932 (2026-05-07): Phase 2 W7 Member Dashboard 3 snippets V.31.0
+// added 13 onclick handlers: Member Dashboard Main banner CTA + stats grid
+// drill-down + quick-action grid (📋 เคลม), Header & Forms tier badge
+// click + notification settings 5 checkboxes + scan-first button + F#3
+// register_serial banner CTA, Assets List 5 quick-action buttons per card
+// (claim/transfer/call-dealer/extend-warranty/report-stolen) +
+// collapsible history timeline toggles. All 3 snippets follow Phase 6
+// migration sweep plan — additive markers now, data-action refactor later.
+const BASELINE_INLINE_HANDLER_COUNT = 932;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
