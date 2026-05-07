@@ -1,0 +1,1242 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO SN Approval Workflow                      ║
+ * ║  Version: V.0.1 (2026-05-05) — Phase 2 W5 4-eyes approval queue ║
+ * ║  DB_ID: (pending — populate after first WP Code Snippets sync)  ║
+ * ║  Description: Approval request lifecycle for S/N system.        ║
+ * ║    Atomic state machine (pending/approved/rejected/expired/     ║
+ * ║    cancelled) with self-approval block + SLA cron + LINE/Tele   ║
+ * ║    notifications. Action callback fires `dinoco_sn_approval_*`  ║
+ * ║    do_action hooks so executor snippets handle state transition.║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * Plan: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.13 §2.7
+ * Architecture: docs/sn-system/01-system-architecture.md
+ * State machine: docs/sn-system/02-state-machine.md
+ *
+ * Dependencies (all `function_exists` guarded — defensive):
+ *   - [System] DINOCO SN REST API V.0.18+        — classifier + idempotency wrapper
+ *   - [Admin System] DINOCO Production SN Manager — table helpers + audit log
+ *   - [Admin System] DINOCO User Role Manager     — capability registration
+ *   - [Admin System] DINOCO Idempotency Helper    — POST replay protection
+ *
+ * REST endpoints registered (Phase 2 W5):
+ *   POST   /dinoco-sn/v1/approval/request                — actor creates request
+ *   POST   /dinoco-sn/v1/approval/(?P<uuid>[a-f0-9-]+)/approve  — approver decides
+ *   POST   /dinoco-sn/v1/approval/(?P<uuid>[a-f0-9-]+)/reject   — approver rejects
+ *   POST   /dinoco-sn/v1/approval/(?P<uuid>[a-f0-9-]+)/cancel   — actor cancels own
+ *   GET    /dinoco-sn/v1/approval/pending                — admin viewer (paginated)
+ *   GET    /dinoco-sn/v1/approval/(?P<uuid>[a-f0-9-]+)   — request detail
+ *
+ * SLA cron:
+ *   dinoco_sn_approval_sla_cron — every 15 min — auto-expire past expires_at
+ *   Heartbeat: dinoco_cron_sn_approval_sla_last_run option (Round 28+ pattern)
+ *
+ * Action hooks fired after approve():
+ *   do_action( 'dinoco_sn_approval_approved', $uuid, $action, $context, $approver_id )
+ *   do_action( 'dinoco_sn_approval_rejected', $uuid, $action, $context, $approver_id, $notes )
+ *   do_action( 'dinoco_sn_approval_expired',  $uuid, $action, $context )
+ *   do_action( 'dinoco_sn_approval_cancelled', $uuid, $action, $context, $actor_id )
+ *
+ * Listeners can wire `dinoco_sn_approval_approved` to actually execute the
+ * state transition (swap/void/recall/reissue/relink). This snippet does NOT
+ * mutate sn_pool itself — it only orchestrates approval.
+ *
+ * DESIGN PRINCIPLES
+ *   - ADDITIVE   — table installs lazily on admin_init, no other side effects
+ *   - DEFENSIVE  — all cross-snippet calls function_exists guarded, no-op if missing
+ *   - ATOMIC     — GET_LOCK + START TRANSACTION + try/catch ROLLBACK pattern
+ *   - IDEMPOTENT — every POST uses dinoco_sn_with_idempotency() wrapper
+ *   - AUDIT      — every state transition logs via dinoco_sn_audit_log()
+ *   - SELF-BLOCK — actor === approver returns 422 + audit trail
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0. CONSTANTS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_SN_APPROVAL_TABLE' ) ) {
+    define( 'DINOCO_SN_APPROVAL_TABLE', 'dinoco_sn_approval_requests' );
+}
+
+if ( ! defined( 'DINOCO_SN_APPROVAL_SCHEMA_VERSION' ) ) {
+    define( 'DINOCO_SN_APPROVAL_SCHEMA_VERSION', '1.0' );
+}
+
+if ( ! defined( 'DINOCO_SN_APPROVAL_VALID_ACTIONS' ) ) {
+    define( 'DINOCO_SN_APPROVAL_VALID_ACTIONS', 'swap,void,recall,relink,reissue' );
+}
+
+if ( ! defined( 'DINOCO_SN_APPROVAL_VALID_URGENCIES' ) ) {
+    define( 'DINOCO_SN_APPROVAL_VALID_URGENCIES', 'urgent,normal,low' );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. SCHEMA — wp_dinoco_sn_approval_requests
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_approval_table_name' ) ) {
+    function dinoco_sn_approval_table_name() {
+        global $wpdb;
+        return $wpdb->prefix . DINOCO_SN_APPROVAL_TABLE;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_table_exists' ) ) {
+    function dinoco_sn_approval_table_exists() {
+        global $wpdb;
+        $tbl = dinoco_sn_approval_table_name();
+        $result = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        return ( (int) $result ) > 0;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_install_schema' ) ) {
+    /**
+     * Lazy install table on admin_init. Idempotent via dbDelta.
+     * Sets option `dinoco_sn_approval_schema_version` after success.
+     */
+    function dinoco_sn_approval_install_schema() {
+        global $wpdb;
+
+        $current = (string) get_option( 'dinoco_sn_approval_schema_version', '0.0' );
+        if ( version_compare( $current, DINOCO_SN_APPROVAL_SCHEMA_VERSION, '>=' ) ) return;
+
+        $tbl     = dinoco_sn_approval_table_name();
+        $charset = $wpdb->get_charset_collate();
+
+        // Note: utf8mb4_bin on sn columns matches sn_pool collation per
+        // schema-v1.sql (case-sensitive UPPER S/N matching).
+        $sql = "CREATE TABLE {$tbl} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            request_uuid CHAR(36) NOT NULL,
+            action VARCHAR(20) NOT NULL,
+            tier VARCHAR(20) NOT NULL,
+            urgency VARCHAR(10) NOT NULL DEFAULT 'normal',
+            sn VARCHAR(40) NOT NULL,
+            sn_target VARCHAR(40) DEFAULT NULL,
+            current_state VARCHAR(32) NOT NULL,
+            bulk_count INT UNSIGNED NOT NULL DEFAULT 1,
+            actor_user_id BIGINT UNSIGNED NOT NULL,
+            approver_user_id BIGINT UNSIGNED DEFAULT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            reason TEXT NOT NULL,
+            approver_notes TEXT,
+            created_at DATETIME NOT NULL,
+            expires_at DATETIME NOT NULL,
+            decided_at DATETIME DEFAULT NULL,
+            context_json LONGTEXT,
+            PRIMARY KEY  (id),
+            UNIQUE KEY uniq_uuid (request_uuid),
+            KEY idx_status_expires (status, expires_at),
+            KEY idx_sn (sn),
+            KEY idx_actor (actor_user_id),
+            KEY idx_approver (approver_user_id, status)
+        ) {$charset};";
+
+        if ( ! function_exists( 'dbDelta' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        }
+        dbDelta( $sql );
+
+        // ALTER post-create to set utf8mb4_bin collation on sn columns
+        // (dbDelta doesn't support per-column COLLATE).
+        $wpdb->query( "ALTER TABLE {$tbl} MODIFY sn VARCHAR(40) COLLATE utf8mb4_bin NOT NULL" );
+        $wpdb->query( "ALTER TABLE {$tbl} MODIFY sn_target VARCHAR(40) COLLATE utf8mb4_bin DEFAULT NULL" );
+
+        update_option( 'dinoco_sn_approval_schema_version', DINOCO_SN_APPROVAL_SCHEMA_VERSION, false );
+    }
+}
+
+if ( ! has_action( 'admin_init', 'dinoco_sn_approval_install_schema' ) ) {
+    add_action( 'admin_init', 'dinoco_sn_approval_install_schema', 35 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. UUID + VALIDATION HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_approval_generate_uuid' ) ) {
+    /**
+     * Generate UUIDv4 (RFC 4122). Uses random_bytes() per V.42.17 god-mode
+     * pattern. Prefer wp_generate_uuid4() when available.
+     */
+    function dinoco_sn_approval_generate_uuid() {
+        if ( function_exists( 'wp_generate_uuid4' ) ) {
+            return wp_generate_uuid4();
+        }
+        try {
+            $data = random_bytes( 16 );
+        } catch ( \Throwable $e ) {
+            // Fallback: openssl_random_pseudo_bytes
+            $data = openssl_random_pseudo_bytes( 16 );
+        }
+        $data[6] = chr( ord( $data[6] ) & 0x0f | 0x40 ); // version 4
+        $data[8] = chr( ord( $data[8] ) & 0x3f | 0x80 ); // variant
+        return vsprintf( '%s%s-%s-%s-%s-%s%s%s', str_split( bin2hex( $data ), 4 ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_is_valid_uuid' ) ) {
+    function dinoco_sn_approval_is_valid_uuid( $uuid ) {
+        return is_string( $uuid ) && (bool) preg_match(
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i',
+            $uuid
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_valid_action' ) ) {
+    function dinoco_sn_approval_valid_action( $action ) {
+        $allowed = explode( ',', DINOCO_SN_APPROVAL_VALID_ACTIONS );
+        return in_array( strtolower( trim( (string) $action ) ), $allowed, true );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_valid_urgency' ) ) {
+    function dinoco_sn_approval_valid_urgency( $urgency ) {
+        $allowed = explode( ',', DINOCO_SN_APPROVAL_VALID_URGENCIES );
+        return in_array( strtolower( trim( (string) $urgency ) ), $allowed, true );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. SELF-APPROVAL BLOCK + STATE-TRANSITION HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_check_self_approval_block' ) ) {
+    /**
+     * Return true if user_id is the same as the request's actor — must
+     * block self-approval (4-eyes rule). Loaded from DB, NOT cached
+     * (small table + critical correctness).
+     *
+     * @param string $uuid Approval request UUID
+     * @param int    $user_id Proposed approver user ID
+     * @return bool true if self-approval (BLOCK), false if OK
+     */
+    function dinoco_sn_check_self_approval_block( $uuid, $user_id ) {
+        global $wpdb;
+        if ( ! dinoco_sn_approval_table_exists() ) return false;
+        $tbl = dinoco_sn_approval_table_name();
+        $actor = $wpdb->get_var( $wpdb->prepare(
+            "SELECT actor_user_id FROM {$tbl} WHERE request_uuid = %s LIMIT 1",
+            (string) $uuid
+        ) );
+        if ( $actor === null ) return false; // request not found — let caller handle
+        return ( (int) $actor === (int) $user_id );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_can_transition' ) ) {
+    /**
+     * State-machine guard. Pure logic — no DB.
+     * Allowed transitions:
+     *   pending → approved | rejected | expired | cancelled
+     *   any other → (locked)
+     *
+     * @param string $from
+     * @param string $to
+     * @return bool
+     */
+    function dinoco_sn_approval_can_transition( $from, $to ) {
+        $from = strtolower( trim( (string) $from ) );
+        $to   = strtolower( trim( (string) $to ) );
+        if ( $from !== 'pending' ) return false;
+        return in_array( $to, array( 'approved', 'rejected', 'expired', 'cancelled' ), true );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. CREATE / GET / LIST HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_create_approval_request' ) ) {
+    /**
+     * Atomic INSERT into approval queue. Returns uuid on success, WP_Error on fail.
+     *
+     * @param string $action       'swap'|'void'|'recall'|'relink'|'reissue'
+     * @param string $sn           Plate S/N
+     * @param string $current_state Plate.status (in_pool/registered/...)
+     * @param string $reason       ≥10 chars
+     * @param array  $context {
+     *     @type string $sn_target   For swap (sn_new)
+     *     @type int    $bulk_count  Plates affected
+     *     @type string $urgency     'urgent'|'normal'|'low'
+     *     @type array  ...          Free-form forwarded to executor
+     * }
+     * @return string|WP_Error UUID or error
+     */
+    function dinoco_sn_create_approval_request( $action, $sn, $current_state, $reason, $context = array() ) {
+        global $wpdb;
+
+        if ( ! dinoco_sn_approval_valid_action( $action ) ) {
+            return new WP_Error( 'invalid_action',
+                __( 'Invalid action; must be swap/void/recall/relink/reissue.', 'dinoco-sn' ),
+                array( 'status' => 400 ) );
+        }
+        if ( ! is_string( $sn ) || $sn === '' ) {
+            return new WP_Error( 'invalid_sn', __( 'sn is required.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( mb_strlen( (string) $reason ) < 10 ) {
+            return new WP_Error( 'invalid_reason', __( 'reason must be ≥10 chars.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( ! dinoco_sn_approval_table_exists() ) {
+            // Defensive: try lazy install if admin_init hasn't fired yet
+            if ( function_exists( 'dinoco_sn_approval_install_schema' ) ) {
+                dinoco_sn_approval_install_schema();
+            }
+            if ( ! dinoco_sn_approval_table_exists() ) {
+                return new WP_Error( 'schema_not_ready',
+                    __( 'Approval table not installed.', 'dinoco-sn' ),
+                    array( 'status' => 503 ) );
+            }
+        }
+
+        $action        = strtolower( trim( (string) $action ) );
+        $sn            = strtoupper( trim( (string) $sn ) );
+        $current_state = strtolower( trim( (string) $current_state ) );
+        $reason        = trim( (string) $reason );
+        $context       = is_array( $context ) ? $context : array();
+
+        $sn_target  = isset( $context['sn_target'] ) ? strtoupper( trim( (string) $context['sn_target'] ) ) : null;
+        $bulk_count = isset( $context['bulk_count'] ) ? max( 1, (int) $context['bulk_count'] ) : 1;
+        $urgency    = isset( $context['urgency'] ) && dinoco_sn_approval_valid_urgency( $context['urgency'] )
+                        ? strtolower( $context['urgency'] ) : 'normal';
+
+        // Tier classification — defensive function_exists guard
+        $tier = 'auto';
+        if ( function_exists( 'dinoco_sn_classify_approval_tier' ) ) {
+            $tier = dinoco_sn_classify_approval_tier( $action, $current_state, $bulk_count );
+        }
+
+        // SLA window
+        $sla_seconds = 86400; // default 24h
+        if ( function_exists( 'dinoco_sn_get_approval_sla_seconds' ) ) {
+            $sla_seconds = (int) dinoco_sn_get_approval_sla_seconds( $tier, $urgency );
+            if ( $sla_seconds <= 0 ) $sla_seconds = 86400; // safety floor — never zero in queue
+        }
+
+        $uuid       = dinoco_sn_approval_generate_uuid();
+        $now_ts     = (int) current_time( 'timestamp' );
+        $created_at = gmdate( 'Y-m-d H:i:s', $now_ts - (int) ( get_option( 'gmt_offset', 0 ) * HOUR_IN_SECONDS ) );
+        // Use current_time('mysql') for consistency with rest of DINOCO codebase
+        $created_at = current_time( 'mysql' );
+        $expires_at = gmdate( 'Y-m-d H:i:s', strtotime( $created_at ) + $sla_seconds );
+
+        $tbl   = dinoco_sn_approval_table_name();
+        $actor = (int) get_current_user_id();
+
+        $context_for_storage = $context;
+        // Strip transient fields not needed for executor
+        unset( $context_for_storage['urgency'] );
+
+        $insert = array(
+            'request_uuid'     => $uuid,
+            'action'           => $action,
+            'tier'             => $tier,
+            'urgency'          => $urgency,
+            'sn'               => $sn,
+            'sn_target'        => $sn_target,
+            'current_state'    => $current_state,
+            'bulk_count'       => $bulk_count,
+            'actor_user_id'    => $actor,
+            'approver_user_id' => null,
+            'status'           => 'pending',
+            'reason'           => mb_substr( $reason, 0, 65535 ),
+            'approver_notes'   => null,
+            'created_at'       => $created_at,
+            'expires_at'       => $expires_at,
+            'decided_at'       => null,
+            'context_json'     => wp_json_encode( $context_for_storage ),
+        );
+
+        $ok = $wpdb->insert( $tbl, $insert );
+        if ( $ok === false ) {
+            error_log( '[SN-Approval] insert failed: ' . $wpdb->last_error );
+            return new WP_Error( 'insert_failed',
+                __( 'Failed to create approval request.', 'dinoco-sn' ),
+                array( 'status' => 500 ) );
+        }
+
+        // Audit log (defensive)
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log(
+                $sn,
+                'approval_request_created',
+                null,
+                'pending',
+                array(
+                    'uuid'       => $uuid,
+                    'action'     => $action,
+                    'tier'       => $tier,
+                    'urgency'    => $urgency,
+                    'bulk_count' => $bulk_count,
+                ),
+                $actor,
+                null,
+                $reason,
+                'approval_create',
+                ( $tier === '4_eyes' ) // mark 4-eyes ops sensitive
+            );
+        }
+
+        // Telegram alert for 4-eyes urgent (defensive — no-op if helper missing)
+        if ( $tier === '4_eyes' && $urgency === 'urgent' ) {
+            dinoco_sn_approval_notify_telegram_urgent( $uuid, $action, $sn, $reason, $actor );
+        }
+
+        // Fire creation hook so listeners can wire downstream notifies
+        do_action( 'dinoco_sn_approval_created', $uuid, $action, $context, $actor, $tier );
+
+        return $uuid;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_notify_telegram_urgent' ) ) {
+    /**
+     * Best-effort Telegram alert for urgent 4-eyes requests. Defensive —
+     * no-op if no Telegram helper synced.
+     */
+    function dinoco_sn_approval_notify_telegram_urgent( $uuid, $action, $sn, $reason, $actor_user_id ) {
+        try {
+            $msg = sprintf(
+                "🚨 SN Approval URGENT (4-eyes)\nUUID: %s\nAction: %s\nS/N: %s\nActor: #%d\nReason: %s",
+                $uuid,
+                strtoupper( $action ),
+                $sn,
+                (int) $actor_user_id,
+                mb_substr( (string) $reason, 0, 200 )
+            );
+            if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                b2b_tg_send_dedup( 'sn_approval_' . $uuid, $msg, 3600 );
+                return;
+            }
+            if ( function_exists( 'sendTelegramAlert' ) ) {
+                sendTelegramAlert( 'sn_approval_urgent', $msg );
+                return;
+            }
+        } catch ( \Throwable $e ) {
+            error_log( '[SN-Approval] telegram alert failed: ' . $e->getMessage() );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approval_get_request' ) ) {
+    /**
+     * Single request fetch by UUID.
+     */
+    function dinoco_sn_approval_get_request( $uuid ) {
+        global $wpdb;
+        if ( ! dinoco_sn_approval_table_exists() ) return null;
+        if ( ! dinoco_sn_approval_is_valid_uuid( $uuid ) ) return null;
+        $tbl = dinoco_sn_approval_table_name();
+        return $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$tbl} WHERE request_uuid = %s LIMIT 1",
+            (string) $uuid
+        ), ARRAY_A );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_pending_approvals' ) ) {
+    /**
+     * List pending requests with optional filters. Used by Tab 6 (Approvals)
+     * admin UI in Phase 2 W6+ + GET /approval/pending endpoint.
+     *
+     * @param array $filter {
+     *     @type string $tier    'auto' | 'single_admin' | '4_eyes'
+     *     @type string $action  filter by action
+     *     @type int    $actor   filter by actor_user_id
+     *     @type int    $approver filter by approver_user_id (assigned)
+     *     @type int    $limit   default 50, max 200
+     *     @type int    $offset  default 0
+     * }
+     * @return array of associative arrays
+     */
+    function dinoco_sn_get_pending_approvals( $filter = array() ) {
+        global $wpdb;
+        if ( ! dinoco_sn_approval_table_exists() ) return array();
+
+        $tbl     = dinoco_sn_approval_table_name();
+        $where   = array( "status = 'pending'" );
+        $params  = array();
+
+        if ( ! empty( $filter['tier'] ) && in_array( $filter['tier'], array( 'auto', 'single_admin', '4_eyes' ), true ) ) {
+            $where[] = "tier = %s";
+            $params[] = $filter['tier'];
+        }
+        if ( ! empty( $filter['action'] ) && dinoco_sn_approval_valid_action( $filter['action'] ) ) {
+            $where[] = "action = %s";
+            $params[] = strtolower( $filter['action'] );
+        }
+        if ( ! empty( $filter['actor'] ) ) {
+            $where[] = "actor_user_id = %d";
+            $params[] = (int) $filter['actor'];
+        }
+        if ( ! empty( $filter['approver'] ) ) {
+            $where[] = "approver_user_id = %d";
+            $params[] = (int) $filter['approver'];
+        }
+
+        $limit  = isset( $filter['limit'] ) ? max( 1, min( 200, (int) $filter['limit'] ) ) : 50;
+        $offset = isset( $filter['offset'] ) ? max( 0, (int) $filter['offset'] ) : 0;
+
+        $sql = "SELECT * FROM {$tbl} WHERE " . implode( ' AND ', $where ) .
+               " ORDER BY created_at DESC LIMIT %d OFFSET %d";
+        $params[] = $limit;
+        $params[] = $offset;
+
+        if ( empty( $params ) ) {
+            return $wpdb->get_results( $sql, ARRAY_A ) ?: array();
+        }
+        return $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A ) ?: array();
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. APPROVE / REJECT / CANCEL — ATOMIC STATE TRANSITIONS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_approval_atomic_transition' ) ) {
+    /**
+     * Internal: GET_LOCK + transaction wrapper for state transitions.
+     * Returns array on success, WP_Error on failure.
+     *
+     * @param string  $uuid
+     * @param string  $new_status 'approved' | 'rejected' | 'expired' | 'cancelled'
+     * @param int|null $approver_id
+     * @param string  $notes
+     * @param int     $expected_actor_id For self-approval block on approve/reject.
+     *                                  Pass 0 to skip the check (cancel/expire).
+     * @return array|WP_Error  Old row data on success
+     */
+    function dinoco_sn_approval_atomic_transition( $uuid, $new_status, $approver_id, $notes, $expected_actor_id = 0 ) {
+        global $wpdb;
+        if ( ! dinoco_sn_approval_is_valid_uuid( $uuid ) ) {
+            return new WP_Error( 'invalid_uuid', __( 'Invalid UUID.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+        if ( ! dinoco_sn_approval_table_exists() ) {
+            return new WP_Error( 'schema_not_ready', __( 'Approval table not installed.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        $tbl       = dinoco_sn_approval_table_name();
+        $lock_name = 'dnc_sn_appr_' . substr( md5( $uuid ), 0, 16 );
+
+        // GET_LOCK serialize concurrent decisions on same uuid
+        $got = (int) $wpdb->get_var( $wpdb->prepare( "SELECT GET_LOCK(%s, 5)", $lock_name ) );
+        if ( $got !== 1 ) {
+            return new WP_Error( 'lock_timeout', __( 'Concurrent approval in progress.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+            try {
+                $row = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT * FROM {$tbl} WHERE request_uuid = %s FOR UPDATE",
+                    $uuid
+                ), ARRAY_A );
+
+                if ( ! $row ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'not_found',
+                        __( 'Approval request not found.', 'dinoco-sn' ),
+                        array( 'status' => 404 ) );
+                }
+
+                if ( ! dinoco_sn_approval_can_transition( $row['status'], $new_status ) ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'invalid_transition',
+                        sprintf( __( 'Cannot transition from %1$s to %2$s.', 'dinoco-sn' ),
+                                 $row['status'], $new_status ),
+                        array( 'status' => 422, 'current_status' => $row['status'] ) );
+                }
+
+                // Self-approval block — applies to approve/reject only
+                if ( in_array( $new_status, array( 'approved', 'rejected' ), true )
+                     && (int) $approver_id > 0
+                     && (int) $approver_id === (int) $row['actor_user_id'] ) {
+                    $wpdb->query( 'ROLLBACK' );
+
+                    // Audit incident (defensive)
+                    if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                        dinoco_sn_audit_log(
+                            $row['sn'],
+                            'approval_self_block',
+                            $row['status'],
+                            $row['status'],
+                            array( 'uuid' => $uuid, 'attempted' => $new_status ),
+                            (int) $approver_id,
+                            null,
+                            'self-approval blocked',
+                            'security',
+                            true // sensitive
+                        );
+                    }
+
+                    return new WP_Error( 'self_approval_blocked',
+                        __( 'Cannot approve/reject your own request (4-eyes rule).', 'dinoco-sn' ),
+                        array( 'status' => 422 ) );
+                }
+
+                // For cancel: actor MUST own the request
+                if ( $new_status === 'cancelled' && $expected_actor_id > 0
+                     && (int) $expected_actor_id !== (int) $row['actor_user_id'] ) {
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'forbidden',
+                        __( 'Only the actor can cancel their own request.', 'dinoco-sn' ),
+                        array( 'status' => 403 ) );
+                }
+
+                $update = array(
+                    'status'      => $new_status,
+                    'decided_at'  => current_time( 'mysql' ),
+                );
+                if ( in_array( $new_status, array( 'approved', 'rejected' ), true ) && $approver_id > 0 ) {
+                    $update['approver_user_id'] = (int) $approver_id;
+                }
+                if ( ! empty( $notes ) ) {
+                    $update['approver_notes'] = mb_substr( (string) $notes, 0, 65535 );
+                }
+
+                $upd = $wpdb->update( $tbl, $update,
+                    array( 'request_uuid' => $uuid, 'status' => 'pending' ) );
+                if ( $upd === false ) {
+                    throw new \RuntimeException( 'update failed: ' . $wpdb->last_error );
+                }
+                if ( $upd === 0 ) {
+                    // Row state changed underneath us — concurrent decision won
+                    $wpdb->query( 'ROLLBACK' );
+                    return new WP_Error( 'concurrent_modification',
+                        __( 'Request was modified by another decision.', 'dinoco-sn' ),
+                        array( 'status' => 409 ) );
+                }
+
+                $wpdb->query( 'COMMIT' );
+                return $row;
+
+            } catch ( \Throwable $e ) {
+                $wpdb->query( 'ROLLBACK' );
+                error_log( '[SN-Approval] transition failed: ' . $e->getMessage() );
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( $e, array(
+                        'context' => 'sn_approval_transition',
+                        'uuid'    => $uuid,
+                        'to'      => $new_status,
+                    ) );
+                }
+                return new WP_Error( 'transition_failed', $e->getMessage(), array( 'status' => 500 ) );
+            }
+        } finally {
+            // Always release lock
+            $wpdb->get_var( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_approve_request' ) ) {
+    /**
+     * Approve a pending request. Atomic. Fires `dinoco_sn_approval_approved`
+     * action hook so executor snippets handle the actual state transition.
+     *
+     * @return array|WP_Error Decoded row (with parsed context) on success
+     */
+    function dinoco_sn_approve_request( $uuid, $approver_user_id, $notes = '' ) {
+        $approver_user_id = (int) $approver_user_id;
+        if ( $approver_user_id <= 0 ) {
+            return new WP_Error( 'invalid_user', __( 'Approver user ID required.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        $row = dinoco_sn_approval_atomic_transition( $uuid, 'approved', $approver_user_id, $notes, 0 );
+        if ( is_wp_error( $row ) ) return $row;
+
+        $context = array();
+        if ( ! empty( $row['context_json'] ) ) {
+            $decoded = json_decode( $row['context_json'], true );
+            if ( is_array( $decoded ) ) $context = $decoded;
+        }
+
+        // Audit log (defensive)
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log(
+                $row['sn'],
+                'approval_approved',
+                'pending',
+                'approved',
+                array( 'uuid' => $uuid, 'action' => $row['action'], 'tier' => $row['tier'] ),
+                (int) $row['actor_user_id'],
+                $approver_user_id,
+                (string) $notes,
+                'approval_decision',
+                ( $row['tier'] === '4_eyes' )
+            );
+        }
+
+        // Fire executor hook — this is where snippets like REST API can
+        // listen to do_action('dinoco_sn_approval_approved') and perform
+        // the actual swap/void/recall on sn_pool.
+        do_action( 'dinoco_sn_approval_approved', $uuid, $row['action'], $context, $approver_user_id );
+
+        return array(
+            'uuid'             => $uuid,
+            'status'           => 'approved',
+            'action'           => $row['action'],
+            'tier'             => $row['tier'],
+            'sn'               => $row['sn'],
+            'actor_user_id'    => (int) $row['actor_user_id'],
+            'approver_user_id' => $approver_user_id,
+            'context'          => $context,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_reject_request' ) ) {
+    /**
+     * Reject a pending request. Atomic. Fires `dinoco_sn_approval_rejected`.
+     */
+    function dinoco_sn_reject_request( $uuid, $approver_user_id, $notes = '' ) {
+        $approver_user_id = (int) $approver_user_id;
+        if ( $approver_user_id <= 0 ) {
+            return new WP_Error( 'invalid_user', __( 'Approver user ID required.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        $row = dinoco_sn_approval_atomic_transition( $uuid, 'rejected', $approver_user_id, $notes, 0 );
+        if ( is_wp_error( $row ) ) return $row;
+
+        $context = array();
+        if ( ! empty( $row['context_json'] ) ) {
+            $decoded = json_decode( $row['context_json'], true );
+            if ( is_array( $decoded ) ) $context = $decoded;
+        }
+
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log(
+                $row['sn'],
+                'approval_rejected',
+                'pending',
+                'rejected',
+                array( 'uuid' => $uuid, 'action' => $row['action'], 'tier' => $row['tier'] ),
+                (int) $row['actor_user_id'],
+                $approver_user_id,
+                (string) $notes,
+                'approval_decision',
+                ( $row['tier'] === '4_eyes' )
+            );
+        }
+
+        do_action( 'dinoco_sn_approval_rejected', $uuid, $row['action'], $context, $approver_user_id, $notes );
+
+        return array(
+            'uuid'             => $uuid,
+            'status'           => 'rejected',
+            'action'           => $row['action'],
+            'sn'               => $row['sn'],
+            'approver_user_id' => $approver_user_id,
+            'notes'            => (string) $notes,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_cancel_request' ) ) {
+    /**
+     * Actor cancels own request. Atomic. Only allowed if actor === current user.
+     */
+    function dinoco_sn_cancel_request( $uuid, $actor_user_id ) {
+        $actor_user_id = (int) $actor_user_id;
+        if ( $actor_user_id <= 0 ) {
+            return new WP_Error( 'invalid_user', __( 'Actor user ID required.', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        $row = dinoco_sn_approval_atomic_transition( $uuid, 'cancelled', null, '', $actor_user_id );
+        if ( is_wp_error( $row ) ) return $row;
+
+        $context = array();
+        if ( ! empty( $row['context_json'] ) ) {
+            $decoded = json_decode( $row['context_json'], true );
+            if ( is_array( $decoded ) ) $context = $decoded;
+        }
+
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log(
+                $row['sn'],
+                'approval_cancelled',
+                'pending',
+                'cancelled',
+                array( 'uuid' => $uuid, 'action' => $row['action'] ),
+                $actor_user_id,
+                null,
+                'actor self-cancel',
+                'approval_cancel',
+                false
+            );
+        }
+
+        do_action( 'dinoco_sn_approval_cancelled', $uuid, $row['action'], $context, $actor_user_id );
+
+        return array(
+            'uuid'   => $uuid,
+            'status' => 'cancelled',
+            'action' => $row['action'],
+            'sn'     => $row['sn'],
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. SLA EXPIRATION CRON
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_run_approval_sla' ) ) {
+    /**
+     * Every 15min — find pending requests past expires_at + mark expired.
+     * Atomic via UPDATE...WHERE pattern (no FOR UPDATE — we don't fire
+     * the executor hook on expire, so race with concurrent approval is
+     * acceptable: UPDATE WHERE status='pending' returns 0 if it raced).
+     */
+    function dinoco_sn_run_approval_sla() {
+        // Heartbeat for Health Monitor (Round 28+ pattern)
+        update_option( 'dinoco_cron_sn_approval_sla_last_run', current_time( 'mysql' ) );
+
+        if ( ! dinoco_sn_approval_table_exists() ) return;
+
+        global $wpdb;
+        $tbl = dinoco_sn_approval_table_name();
+        $now = current_time( 'mysql' );
+
+        try {
+            // Find expired BEFORE update (so we can fire hooks + telegram)
+            $expired = $wpdb->get_results( $wpdb->prepare(
+                "SELECT request_uuid, action, sn, actor_user_id, tier, urgency, context_json
+                 FROM {$tbl}
+                 WHERE status = 'pending' AND expires_at < %s
+                 LIMIT 50",
+                $now
+            ), ARRAY_A );
+
+            if ( empty( $expired ) ) return;
+
+            foreach ( $expired as $row ) {
+                // Atomic single-row mark expired
+                $upd = $wpdb->update(
+                    $tbl,
+                    array(
+                        'status'     => 'expired',
+                        'decided_at' => $now,
+                    ),
+                    array(
+                        'request_uuid' => $row['request_uuid'],
+                        'status'       => 'pending',
+                    )
+                );
+                if ( $upd === 0 || $upd === false ) continue; // raced — concurrent decision won
+
+                $context = array();
+                if ( ! empty( $row['context_json'] ) ) {
+                    $decoded = json_decode( $row['context_json'], true );
+                    if ( is_array( $decoded ) ) $context = $decoded;
+                }
+
+                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                    dinoco_sn_audit_log(
+                        $row['sn'],
+                        'approval_expired',
+                        'pending',
+                        'expired',
+                        array( 'uuid' => $row['request_uuid'], 'action' => $row['action'] ),
+                        (int) $row['actor_user_id'],
+                        null,
+                        'SLA expired',
+                        'approval_expire',
+                        ( $row['tier'] === '4_eyes' )
+                    );
+                }
+
+                // Telegram alert บอส — defensive (no-op if helper missing)
+                try {
+                    $msg = sprintf(
+                        "⏰ SN Approval EXPIRED\nUUID: %s\nAction: %s\nS/N: %s\nActor: #%d\nTier: %s",
+                        $row['request_uuid'],
+                        strtoupper( $row['action'] ),
+                        $row['sn'],
+                        (int) $row['actor_user_id'],
+                        $row['tier']
+                    );
+                    if ( function_exists( 'b2b_tg_send_dedup' ) ) {
+                        b2b_tg_send_dedup( 'sn_appr_exp_' . $row['request_uuid'], $msg, 86400 );
+                    } elseif ( function_exists( 'sendTelegramAlert' ) ) {
+                        sendTelegramAlert( 'sn_approval_expired', $msg );
+                    }
+                } catch ( \Throwable $e ) {
+                    error_log( '[SN-Approval] expire telegram failed: ' . $e->getMessage() );
+                }
+
+                // Fire executor hook so listeners can notify actor via LINE
+                do_action( 'dinoco_sn_approval_expired', $row['request_uuid'], $row['action'], $context );
+            }
+        } catch ( \Throwable $e ) {
+            error_log( '[SN-Approval] SLA cron failed: ' . $e->getMessage() );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_approval_sla_cron' ) );
+            }
+        }
+    }
+}
+
+// Custom 15-minute schedule (reuse if other snippets have already added it)
+if ( ! has_filter( 'cron_schedules', 'dinoco_sn_approval_cron_schedules' ) ) {
+    add_filter( 'cron_schedules', 'dinoco_sn_approval_cron_schedules' );
+}
+if ( ! function_exists( 'dinoco_sn_approval_cron_schedules' ) ) {
+    function dinoco_sn_approval_cron_schedules( $schedules ) {
+        if ( ! isset( $schedules['fifteen_minutes'] ) ) {
+            $schedules['fifteen_minutes'] = array(
+                'interval' => 15 * MINUTE_IN_SECONDS,
+                'display'  => __( 'Every 15 minutes', 'dinoco-sn' ),
+            );
+        }
+        return $schedules;
+    }
+}
+
+// Schedule cron — prefer dinoco_register_cron registry pattern
+add_action( 'init', 'dinoco_sn_approval_register_cron', 20 );
+if ( ! function_exists( 'dinoco_sn_approval_register_cron' ) ) {
+    function dinoco_sn_approval_register_cron() {
+        if ( function_exists( 'dinoco_register_cron' ) ) {
+            dinoco_register_cron(
+                'dinoco_sn_approval_sla_cron',
+                isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly',
+                'dinoco_sn_run_approval_sla'
+            );
+            return;
+        }
+        // Fallback when registry wrapper not synced
+        if ( ! wp_next_scheduled( 'dinoco_sn_approval_sla_cron' ) ) {
+            $schedule = isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly';
+            wp_schedule_event( time() + 60, $schedule, 'dinoco_sn_approval_sla_cron' );
+        }
+        if ( ! has_action( 'dinoco_sn_approval_sla_cron', 'dinoco_sn_run_approval_sla' ) ) {
+            add_action( 'dinoco_sn_approval_sla_cron', 'dinoco_sn_run_approval_sla' );
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. REST ENDPOINT REGISTRATION
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_approval_register_routes' ) ) {
+    function dinoco_sn_approval_register_routes() {
+        if ( ! defined( 'DINOCO_SN_REST_NAMESPACE' ) ) return; // REST API snippet not synced
+
+        $ns = DINOCO_SN_REST_NAMESPACE;
+
+        // POST /approval/request — actor creates request
+        register_rest_route( $ns, '/approval/request', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_approval_create',
+            'permission_callback' => function_exists( 'dinoco_sn_perm_admin' )
+                                       ? 'dinoco_sn_perm_admin' : '__return_true',
+            'args'                => array(
+                'action'        => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                    'validate_callback' => function( $val ) {
+                        return dinoco_sn_approval_valid_action( $val );
+                    },
+                ),
+                'sn'            => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'sn_target'     => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'current_state' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'bulk_count'    => array( 'type' => 'integer', 'default' => 1, 'sanitize_callback' => 'absint' ),
+                'urgency'       => array(
+                    'type'    => 'string',
+                    'default' => 'normal',
+                    'enum'    => array( 'urgent', 'normal', 'low' ),
+                ),
+                'reason'        => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+                'context'       => array( 'type' => 'object', 'default' => array() ),
+            ),
+        ) );
+
+        // POST /approval/{uuid}/approve
+        register_rest_route( $ns, '/approval/(?P<uuid>[a-f0-9\\-]{36})/approve', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_approval_approve',
+            'permission_callback' => 'dinoco_sn_rest_approval_perm_approver',
+            'args'                => array(
+                'uuid'  => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'notes' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        // POST /approval/{uuid}/reject
+        register_rest_route( $ns, '/approval/(?P<uuid>[a-f0-9\\-]{36})/reject', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_approval_reject',
+            'permission_callback' => 'dinoco_sn_rest_approval_perm_approver',
+            'args'                => array(
+                'uuid'  => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+                'notes' => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+            ),
+        ) );
+
+        // POST /approval/{uuid}/cancel
+        register_rest_route( $ns, '/approval/(?P<uuid>[a-f0-9\\-]{36})/cancel', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_approval_cancel',
+            'permission_callback' => function_exists( 'dinoco_sn_perm_admin' )
+                                       ? 'dinoco_sn_perm_admin' : '__return_true',
+            'args'                => array(
+                'uuid' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+            ),
+        ) );
+
+        // GET /approval/pending
+        register_rest_route( $ns, '/approval/pending', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_approval_pending',
+            'permission_callback' => function_exists( 'dinoco_sn_perm_admin' )
+                                       ? 'dinoco_sn_perm_admin' : '__return_true',
+            'args'                => array(
+                'tier'    => array( 'type' => 'string' ),
+                'action'  => array( 'type' => 'string' ),
+                'actor'   => array( 'type' => 'integer' ),
+                'approver' => array( 'type' => 'integer' ),
+                'limit'   => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+                'offset'  => array( 'type' => 'integer', 'default' => 0, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        // GET /approval/{uuid} — single request detail
+        register_rest_route( $ns, '/approval/(?P<uuid>[a-f0-9\\-]{36})', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_approval_get',
+            'permission_callback' => 'dinoco_sn_rest_approval_perm_owner_or_admin',
+            'args'                => array(
+                'uuid' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
+            ),
+        ) );
+    }
+}
+
+if ( ! has_action( 'rest_api_init', 'dinoco_sn_approval_register_routes' ) ) {
+    add_action( 'rest_api_init', 'dinoco_sn_approval_register_routes', 20 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. PERMISSION CALLBACKS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_perm_approver' ) ) {
+    function dinoco_sn_rest_approval_perm_approver( $req ) {
+        // dinoco_sn_user_can_approver returns true for approver cap or manage_options
+        if ( function_exists( 'dinoco_sn_user_can_approver' ) ) {
+            if ( ! dinoco_sn_user_can_approver() ) {
+                return new WP_Error( 'rest_forbidden',
+                    __( 'Approver capability required.', 'dinoco-sn' ),
+                    array( 'status' => 403 ) );
+            }
+            return true;
+        }
+        // Fallback: manage_options only
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'rest_forbidden', __( 'Forbidden.', 'dinoco-sn' ), array( 'status' => 403 ) );
+        }
+        return true;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_perm_owner_or_admin' ) ) {
+    /**
+     * Read access: actor (request owner) OR approver (assigned) OR admin.
+     */
+    function dinoco_sn_rest_approval_perm_owner_or_admin( $req ) {
+        if ( ! is_user_logged_in() ) {
+            return new WP_Error( 'rest_not_logged_in', __( 'Login required.', 'dinoco-sn' ), array( 'status' => 401 ) );
+        }
+        if ( current_user_can( 'manage_options' ) ) return true;
+
+        $uuid = $req->get_param( 'uuid' );
+        $row  = dinoco_sn_approval_get_request( $uuid );
+        if ( ! $row ) {
+            return new WP_Error( 'not_found', __( 'Approval request not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+        }
+        $uid = (int) get_current_user_id();
+        if ( (int) $row['actor_user_id'] === $uid ) return true;
+        if ( (int) $row['approver_user_id'] === $uid ) return true;
+
+        return new WP_Error( 'rest_forbidden',
+            __( 'You do not have access to this approval request.', 'dinoco-sn' ),
+            array( 'status' => 403 ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 9. REST HANDLERS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_create' ) ) {
+    function dinoco_sn_rest_approval_create( $req ) {
+        if ( function_exists( 'dinoco_sn_is_enabled' ) && ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        $handler = function( $req ) {
+            $action  = $req->get_param( 'action' );
+            $sn      = $req->get_param( 'sn' );
+            $state   = $req->get_param( 'current_state' );
+            $reason  = $req->get_param( 'reason' );
+            $context = (array) $req->get_param( 'context' );
+            $context['sn_target']  = $req->get_param( 'sn_target' );
+            $context['bulk_count'] = $req->get_param( 'bulk_count' );
+            $context['urgency']    = $req->get_param( 'urgency' );
+
+            $result = dinoco_sn_create_approval_request( $action, $sn, $state, $reason, $context );
+            if ( is_wp_error( $result ) ) return $result;
+
+            $row = dinoco_sn_approval_get_request( $result );
+            return rest_ensure_response( array(
+                'success'    => true,
+                'uuid'       => $result,
+                'tier'       => $row ? $row['tier'] : null,
+                'expires_at' => $row ? $row['expires_at'] : null,
+                'status'     => 'pending',
+            ) );
+        };
+
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'approval-request',
+                array( 'action', 'sn', 'sn_target', 'current_state', 'bulk_count', 'reason' ),
+                $handler );
+        }
+        return $handler( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_approve' ) ) {
+    function dinoco_sn_rest_approval_approve( $req ) {
+        $handler = function( $req ) {
+            $uuid  = $req->get_param( 'uuid' );
+            $notes = (string) $req->get_param( 'notes' );
+            $uid   = (int) get_current_user_id();
+
+            $result = dinoco_sn_approve_request( $uuid, $uid, $notes );
+            if ( is_wp_error( $result ) ) return $result;
+
+            return rest_ensure_response( array_merge( array( 'success' => true ), $result ) );
+        };
+
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'approval-approve',
+                array( 'uuid', 'notes' ), $handler );
+        }
+        return $handler( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_reject' ) ) {
+    function dinoco_sn_rest_approval_reject( $req ) {
+        $handler = function( $req ) {
+            $uuid  = $req->get_param( 'uuid' );
+            $notes = (string) $req->get_param( 'notes' );
+            $uid   = (int) get_current_user_id();
+
+            $result = dinoco_sn_reject_request( $uuid, $uid, $notes );
+            if ( is_wp_error( $result ) ) return $result;
+
+            return rest_ensure_response( array_merge( array( 'success' => true ), $result ) );
+        };
+
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'approval-reject',
+                array( 'uuid', 'notes' ), $handler );
+        }
+        return $handler( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_cancel' ) ) {
+    function dinoco_sn_rest_approval_cancel( $req ) {
+        $handler = function( $req ) {
+            $uuid = $req->get_param( 'uuid' );
+            $uid  = (int) get_current_user_id();
+
+            $result = dinoco_sn_cancel_request( $uuid, $uid );
+            if ( is_wp_error( $result ) ) return $result;
+
+            return rest_ensure_response( array_merge( array( 'success' => true ), $result ) );
+        };
+
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'approval-cancel',
+                array( 'uuid' ), $handler );
+        }
+        return $handler( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_pending' ) ) {
+    function dinoco_sn_rest_approval_pending( $req ) {
+        $filter = array(
+            'tier'     => $req->get_param( 'tier' ),
+            'action'   => $req->get_param( 'action' ),
+            'actor'    => $req->get_param( 'actor' ),
+            'approver' => $req->get_param( 'approver' ),
+            'limit'    => $req->get_param( 'limit' ) ?: 50,
+            'offset'   => $req->get_param( 'offset' ) ?: 0,
+        );
+        $rows = dinoco_sn_get_pending_approvals( $filter );
+
+        // Decode context_json + strip raw column for cleaner response
+        $rows = array_map( function( $r ) {
+            $ctx = array();
+            if ( ! empty( $r['context_json'] ) ) {
+                $decoded = json_decode( $r['context_json'], true );
+                if ( is_array( $decoded ) ) $ctx = $decoded;
+            }
+            unset( $r['context_json'] );
+            $r['context'] = $ctx;
+            return $r;
+        }, $rows );
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'count'   => count( $rows ),
+            'rows'    => $rows,
+            'limit'   => (int) $filter['limit'],
+            'offset'  => (int) $filter['offset'],
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_approval_get' ) ) {
+    function dinoco_sn_rest_approval_get( $req ) {
+        $uuid = $req->get_param( 'uuid' );
+        $row  = dinoco_sn_approval_get_request( $uuid );
+        if ( ! $row ) {
+            return new WP_Error( 'not_found', __( 'Approval request not found.', 'dinoco-sn' ), array( 'status' => 404 ) );
+        }
+        $ctx = array();
+        if ( ! empty( $row['context_json'] ) ) {
+            $decoded = json_decode( $row['context_json'], true );
+            if ( is_array( $decoded ) ) $ctx = $decoded;
+        }
+        unset( $row['context_json'] );
+        $row['context'] = $ctx;
+
+        return rest_ensure_response( array(
+            'success' => true,
+            'request' => $row,
+        ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 10. EOF
+ * ═══════════════════════════════════════════════════════════════════════════ */

@@ -27,6 +27,7 @@ const SN_SNIPPETS = {
     liff: '[System] DINOCO Warranty Activation LIFF',
     sc_lookup: '[System] DINOCO SN Quick Lookup',  // Phase 3 W8.5
     public_api: '[Admin System] DINOCO Public API Gateway',  // Phase 4 W12 F#15 (deferred Q22)
+    approval: '[Admin System] DINOCO SN Approval Workflow',  // Phase 2 W5 4-eyes queue
     // stolen_check REMOVED Q23 (2026-05-05) — boss "Admin เท่านั้นก่อน"
     //   snippet [System] DINOCO Stolen Plate Public Verify deleted
     //   endpoint /stolen/verify/{sn} flipped to perm_admin (was perm_public)
@@ -144,8 +145,8 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             "/batches'",                           // POST + GET list
             "/batches/(?P<id>\\d+)'",              // GET detail
             "/batches/(?P<id>\\d+)/status'",       // POST status
-            "/batches/(?P<id>\\d+)/csv'",          // GET CSV
-            "/batches/(?P<id>\\d+)/qr-pdf'",       // GET QR PDF
+            "/batches/(?P<id>\\d+)/csv'",          // GET CSV (Round 3 +QR Content col)
+            // qr-pdf REMOVED Round 3 — Huali factory generates QR from CSV URL
             "/receive'",                           // POST single
             "/receive/bulk'",                      // POST bulk
             "/lookup/(?P<sn>[A-Za-z0-9]+)'",       // GET public lookup
@@ -155,6 +156,10 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expected_endpoints.forEach(ep => {
             expect(code).toContain(ep);
         });
+        // QR PDF endpoint deprecated to a sentinel route (kept as dead-code
+        // archive for rollback if factory contract changes — Round 3 boss decision)
+        expect(code).toContain('/qr-pdf-DEPRECATED-R3');
+        expect(code).not.toMatch(/['"]\/batches\/\(\?P<id>\\d\+\)\/qr-pdf['"]/);
     });
 
     test('Phase 2 W5 endpoints registered', () => {
@@ -740,6 +745,60 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
         expect(code).toMatch(/3600/);     // 1h urgent
         expect(code).toMatch(/86400/);    // 24h normal
         expect(code).toMatch(/259200/);   // 72h low
+    });
+
+    test('Round 3 — Factory QR generation: CSV +QR Content URL column, QR PDF removed', () => {
+        const rest = readSnippet('rest');
+        const manager = readSnippet('manager');
+
+        // CSV header must include "QR Content" column (boss decision Round 3 format B)
+        expect(rest).toContain('"S/N,Prefix,Status,Created At,Batch Code,QR Content\\n"');
+
+        // CSV row format includes URL form B
+        expect(rest).toMatch(/home_url\(\s*'\/warranty\/activate\?sn='\s*\)/);
+        expect(rest).toMatch(/rawurlencode\(\s*\$row->sn\s*\)/);
+
+        // QR PDF route DEPRECATED (renamed to -DEPRECATED-R3 sentinel)
+        expect(rest).toContain('/qr-pdf-DEPRECATED-R3');
+
+        // Manager UI: QR PDF button removed (replaced with comment marker)
+        expect(manager).not.toMatch(/onclick="dncSnDownloadQrPdf/);
+        expect(manager).toContain('CSV (รวม QR URL)');
+
+        // dncSnDownloadQrPdf function REMOVED (replaced with deprecation comment)
+        expect(manager).not.toMatch(/window\.dncSnDownloadQrPdf\s*=\s*function/);
+        expect(manager).toMatch(/dncSnDownloadQrPdf — REMOVED Round 3/);
+    });
+
+    test('Round 3 — First-time login flow uses LINE OAuth state-token system', () => {
+        const liff = readSnippet('liff');
+        const callback = fs.readFileSync(path.join(REPO_ROOT, '[System] LINE Callback'), 'utf8');
+
+        // LIFF activation snippet uses LINE OAuth (not generic wp_login_url)
+        expect(liff).toMatch(/access\.line\.me\/oauth2\/v2\.1\/authorize/);
+        expect(liff).toContain('WARRANTY_ACTIVATE_SN');
+        expect(liff).toContain('dinoco_line_state_');
+        expect(liff).toMatch(/wp_generate_password\(\s*32/);
+        expect(liff).toMatch(/set_transient/);
+
+        // Constants used (defensive)
+        expect(liff).toContain('DINOCO_LINE_CHANNEL_ID');
+        expect(liff).toContain('DINOCO_LINE_REDIRECT_URI');
+
+        // Big LINE-branded button (UX upgrade)
+        expect(liff).toContain('#06C755'); // LINE green
+        expect(liff).toMatch(/min-height:\s*48px/); // touch target ≥ 44px
+
+        // LINE Callback handles WARRANTY_ACTIVATE_SN intent
+        expect(callback).toContain('WARRANTY_ACTIVATE_SN');
+        expect(callback).toMatch(/\/warranty\/activate\//);
+
+        // Defensive guard: empty constants → red error (not broken button)
+        expect(liff).toMatch(/ระบบ LINE Login ไม่พร้อมใช้งาน/);
+
+        // Plan doc exists
+        const planDoc = path.join(REPO_ROOT, 'docs/sn-system/14-first-time-login-flow.md');
+        expect(fs.existsSync(planDoc)).toBe(true);
     });
 
     test('Phase 1 W4.2 — dinoco_sn_obs_capture wired into 4 sensitive ops', () => {
@@ -1389,5 +1448,326 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             const filepath = path.join(REPO_ROOT, d);
             expect(fs.existsSync(filepath)).toBe(true);
         });
+    });
+
+    /* ═════════════════════════════════════════════════════════════════════
+     * Phase 2 W5 — SN Approval Workflow drift assertions
+     * Source: [Admin System] DINOCO SN Approval Workflow V.0.1+
+     * ═════════════════════════════════════════════════════════════════════ */
+
+    test('Phase 2 W5 SN Approval Workflow snippet exists', () => {
+        const code = readSnippet('approval');
+        expect(code).toMatch(/Version: V\.0\.[1-9]/);
+        expect(code).toContain('[Admin System] DINOCO SN Approval Workflow');
+    });
+
+    test('Phase 2 W5 approval workflow registers 6 REST endpoints', () => {
+        const code = readSnippet('approval');
+        // POST /approval/request — actor creates
+        expect(code).toContain("'/approval/request'");
+        // POST /approval/{uuid}/approve
+        expect(code).toMatch(/['"]\/approval\/\(\?P<uuid>\[a-f0-9\\\\-\]\{36\}\)\/approve['"]/);
+        // POST /approval/{uuid}/reject
+        expect(code).toMatch(/['"]\/approval\/\(\?P<uuid>\[a-f0-9\\\\-\]\{36\}\)\/reject['"]/);
+        // POST /approval/{uuid}/cancel
+        expect(code).toMatch(/['"]\/approval\/\(\?P<uuid>\[a-f0-9\\\\-\]\{36\}\)\/cancel['"]/);
+        // GET /approval/pending
+        expect(code).toContain("'/approval/pending'");
+        // GET /approval/{uuid} — single
+        expect(code).toMatch(/['"]\/approval\/\(\?P<uuid>\[a-f0-9\\\\-\]\{36\}\)['"]/);
+    });
+
+    test('Phase 2 W5 approval workflow uses idempotency wrapper for POST', () => {
+        const code = readSnippet('approval');
+        // All 4 write endpoints route through dinoco_sn_with_idempotency()
+        expect(code).toMatch(/dinoco_sn_with_idempotency\([^)]*'approval-request'/);
+        expect(code).toMatch(/dinoco_sn_with_idempotency\([^)]*'approval-approve'/);
+        expect(code).toMatch(/dinoco_sn_with_idempotency\([^)]*'approval-reject'/);
+        expect(code).toMatch(/dinoco_sn_with_idempotency\([^)]*'approval-cancel'/);
+    });
+
+    test('Phase 2 W5 approval workflow schema utf8mb4_bin on sn columns', () => {
+        const code = readSnippet('approval');
+        // Schema CREATE TABLE present
+        expect(code).toContain('CREATE TABLE');
+        expect(code).toContain('dinoco_sn_approval_requests');
+        // Required columns
+        expect(code).toContain('request_uuid CHAR(36)');
+        expect(code).toContain("status VARCHAR(20) NOT NULL DEFAULT 'pending'");
+        expect(code).toContain('expires_at DATETIME NOT NULL');
+        expect(code).toContain('actor_user_id BIGINT');
+        // Composite index for status+expires (cron hot path)
+        expect(code).toContain('KEY idx_status_expires (status, expires_at)');
+        // utf8mb4_bin enforced via ALTER post-create (case-sensitive S/N)
+        expect(code).toMatch(/MODIFY sn VARCHAR\(40\) COLLATE utf8mb4_bin NOT NULL/);
+    });
+
+    test('Phase 2 W5 self-approval block logic present', () => {
+        const code = readSnippet('approval');
+        // Helper function exists
+        expect(code).toContain('function dinoco_sn_check_self_approval_block');
+        // Block enforced inside atomic_transition() for approve/reject paths
+        expect(code).toMatch(/self_approval_blocked/);
+        expect(code).toMatch(/actor_user_id.*===.*approver_id|approver_id.*===.*actor_user_id/);
+    });
+
+    test('Phase 2 W5 approval cron registered with heartbeat option', () => {
+        const code = readSnippet('approval');
+        // Cron hook name
+        expect(code).toContain('dinoco_sn_approval_sla_cron');
+        // SLA runner function
+        expect(code).toContain('function dinoco_sn_run_approval_sla');
+        // Heartbeat write (Round 28+ pattern)
+        expect(code).toContain('dinoco_cron_sn_approval_sla_last_run');
+        // Prefer registry pattern with fallback
+        expect(code).toContain('dinoco_register_cron');
+    });
+
+    test('Phase 2 W5 approval workflow Telegram alert defensive', () => {
+        const code = readSnippet('approval');
+        // Telegram helper called via function_exists guard
+        expect(code).toMatch(/function_exists\(\s*['"]b2b_tg_send_dedup['"]/);
+        expect(code).toMatch(/function_exists\(\s*['"]sendTelegramAlert['"]/);
+        // Both urgent-on-create + expire branches integrate
+        expect(code).toContain('dinoco_sn_approval_notify_telegram_urgent');
+    });
+
+    test('Phase 2 W5 approval workflow fires action hooks for executors', () => {
+        const code = readSnippet('approval');
+        // Hooks consumed by executor snippets (REST API listens to do actual swap/void/...)
+        expect(code).toContain("do_action( 'dinoco_sn_approval_approved'");
+        expect(code).toContain("do_action( 'dinoco_sn_approval_rejected'");
+        expect(code).toContain("do_action( 'dinoco_sn_approval_cancelled'");
+        expect(code).toContain("do_action( 'dinoco_sn_approval_expired'");
+    });
+
+    test('Phase 2 W5 approval workflow atomic transitions GET_LOCK + transaction', () => {
+        const code = readSnippet('approval');
+        // Lock acquisition
+        expect(code).toMatch(/SELECT GET_LOCK/);
+        // Transaction wrap
+        expect(code).toContain("'START TRANSACTION'");
+        expect(code).toContain("'COMMIT'");
+        expect(code).toContain("'ROLLBACK'");
+        // FOR UPDATE on read-modify-write row
+        expect(code).toMatch(/FOR UPDATE/);
+        // Lock always released (try/finally)
+        expect(code).toMatch(/RELEASE_LOCK/);
+    });
+
+    test('Phase 2 W5 approval state machine valid transitions only', () => {
+        const code = readSnippet('approval');
+        // dinoco_sn_approval_can_transition() exists + asserts pending source only
+        expect(code).toContain('function dinoco_sn_approval_can_transition');
+        expect(code).toMatch(/\$from\s*!==\s*['"]pending['"]/);
+        // 4 valid targets
+        expect(code).toMatch(/['"]approved['"]\s*,\s*['"]rejected['"]\s*,\s*['"]expired['"]\s*,\s*['"]cancelled['"]/);
+    });
+
+    test('Phase 2 W5 SnApprovalWorkflowTest exists with state-machine + UUID coverage', () => {
+        const filepath = path.join(REPO_ROOT, 'tests/helpers/SnApprovalWorkflowTest.php');
+        expect(fs.existsSync(filepath)).toBe(true);
+        const content = fs.readFileSync(filepath, 'utf8');
+        // State machine
+        expect(content).toContain('test_pending_to_approved_allowed');
+        expect(content).toContain('test_approved_to_anything_blocked');
+        // Self-approval
+        expect(content).toContain('test_self_approval_blocked_when_same_user');
+        // UUID
+        expect(content).toContain('test_uuid_format_v4_compliant');
+        expect(content).toContain('test_uuid_uniqueness_across_invocations');
+        // SLA
+        expect(content).toContain('test_sla_4eyes_urgent_1_hour');
+    });
+
+    /* ════════════════════════════════════════════════════════════════
+     * Phase 2 W5.1+W5.2 — Tab 4 Universal Search + Investigation Timeline
+     * Manager V.0.25 (this round's deliverable)
+     * ════════════════════════════════════════════════════════════════ */
+
+    test('Phase 2 W5.1 Tab 4 search bar + power-user query input present', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('id="dnc-sn-tab-manage-q"');
+        expect(code).toContain('class="dnc-sn-input dnc-sn-tab-manage-q"');
+        expect(code).toContain('id="dnc-sn-tab-manage-results"');
+        expect(code).toContain('Power-user query');
+    });
+
+    test('Phase 2 W5.1 Tab 4 syntax hint lists all 7 filter prefixes', () => {
+        const code = readSnippet('manager');
+        const prefixes = ['phone:', 'line:', 'sku:', 'batch:', 'status:', 'since:', 'actor:'];
+        prefixes.forEach(p => {
+            expect(code).toContain(p);
+        });
+    });
+
+    test('Phase 2 W5.1 Tab 4 quick filter chips present (5+ chips)', () => {
+        const code = readSnippet('manager');
+        const chips = [
+            'data-chip="active"',
+            'data-chip="claim"',
+            'data-chip="voided"',
+            'data-chip="recent_shipped"',
+            'data-chip="recent_activated"',
+        ];
+        chips.forEach(c => expect(code).toContain(c));
+        expect(code).toContain('pending_approval');
+    });
+
+    test('Phase 2 W5.2 Tab 4 investigation timeline modal markup', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('id="dnc-sn-tab-manage-modal-overlay"');
+        expect(code).toContain('id="dnc-sn-tab-manage-modal-body"');
+        expect(code).toContain('id="dnc-sn-tab-manage-modal-sn"');
+        expect(code).toContain('dnc-sn-tab-manage-timeline');
+    });
+
+    test('Phase 2 W5.2 Tab 4 has 4 modal action buttons (swap/void/recall/close)', () => {
+        const code = readSnippet('manager');
+        expect(code).toMatch(/dncSnTabManageRequestAction\(['"]swap['"]\)/);
+        expect(code).toMatch(/dncSnTabManageRequestAction\(['"]void['"]\)/);
+        expect(code).toMatch(/dncSnTabManageRequestAction\(['"]recall['"]\)/);
+        expect(code).toMatch(/dncSnTabManageCloseModal\(\)/);
+    });
+
+    test('Phase 2 W5.2 Tab 4 sub-modal action confirm w/ urgency + reason', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('id="dnc-sn-tab-manage-action-overlay"');
+        expect(code).toContain('id="dnc-sn-tab-manage-action-urgency"');
+        expect(code).toContain('id="dnc-sn-tab-manage-action-reason"');
+        expect(code).toContain('value="urgent"');
+        expect(code).toContain('value="normal"');
+        expect(code).toContain('value="low"');
+        expect(code).toMatch(/reason\.length\s*<\s*10/);
+    });
+
+    test('Phase 2 W5.2 Tab 4 approver pending panel conditional render', () => {
+        const code = readSnippet('manager');
+        expect(code).toMatch(/current_user_can\(\s*['"]dinoco_sn_approver['"]/);
+        expect(code).toContain('id="dnc-sn-tab-manage-approvals"');
+        expect(code).toContain('id="dnc-sn-tab-manage-approvals-body"');
+        expect(code).toContain('id="dnc-sn-tab-manage-approvals-count"');
+    });
+
+    test('Phase 2 W5.2 Tab 4 PHP helper functions defined in manager', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('function dinoco_sn_parse_search_query');
+        expect(code).toContain('function dinoco_sn_search_plates');
+        expect(code).toContain('function dinoco_sn_get_timeline_for_sn');
+        expect(code).toContain('function dinoco_sn_mask_phone_for_display');
+    });
+
+    test('Phase 2 W5.2 Tab 4 JS handlers wired (search/timeline/action)', () => {
+        const code = readSnippet('manager');
+        const handlers = [
+            'dncSnTabManageSearch',
+            'dncSnTabManageOpenTimeline',
+            'dncSnTabManageCloseModal',
+            'dncSnTabManageRequestAction',
+            'dncSnTabManageSubmitAction',
+            'dncSnTabManageCloseActionModal',
+            'dncSnTabManageQuickChip',
+            'dncSnTabManageLoadPendingApprovals',
+            'dncSnTabManageApprove',
+            'dncSnTabManageReject',
+        ];
+        handlers.forEach(h => {
+            expect(code).toContain('window.' + h);
+        });
+    });
+
+    test('Phase 2 W5.2 Tab 4 modal helpers fallback pattern (try/catch + native)', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('window.dinocoModal');
+        expect(code).toContain('_dncSnTabManageCfm');
+        expect(code).toContain('_dncSnTabManageAlert');
+        expect(code).toMatch(/window\.confirm\(/);
+        expect(code).toMatch(/window\.alert\(/);
+    });
+
+    test('Phase 2 W5.2 Tab 4 POST calls include X-WP-Nonce + X-Idempotency-Key', () => {
+        const code = readSnippet('manager');
+        const submitFn = code.split('window.dncSnTabManageSubmitAction')[1] || '';
+        const submitBlock = submitFn.split('window.dncSnTabManageLoadPendingApprovals')[0];
+        expect(submitBlock).toContain("'X-WP-Nonce'");
+        expect(submitBlock).toContain("'X-Idempotency-Key'");
+        // Decide helper is the function block (skip past the call sites)
+        const decideFn = code.split('function _dncSnTabManageDecide')[1] || '';
+        expect(decideFn).toContain("'X-WP-Nonce'");
+        expect(decideFn).toContain("'X-Idempotency-Key'");
+    });
+
+    test('Phase 2 W5.2 Tab 4 uses crypto.randomUUID for idempotency keys', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('window.crypto');
+        expect(code).toContain('randomUUID');
+    });
+
+    test('Phase 2 W5.2 Tab 4 PII masking helper enforced for phone', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('function dinoco_sn_mask_phone_for_display');
+        expect(code).toContain("'dinoco_sn_view_pii'");
+    });
+
+    test('Phase 2 W5.2 Tab 4 search uses prepared SQL (no raw interpolation)', () => {
+        const code = readSnippet('manager');
+        const searchFn = code.split('function dinoco_sn_search_plates')[1] || '';
+        const block = searchFn.split('function dinoco_sn_get_timeline_for_sn')[0];
+        expect(block).toContain('$wpdb->prepare');
+        expect(block).toContain('%s');
+        expect(block).toContain('esc_like');
+        expect(block).toContain('in_array');
+    });
+
+    test('Phase 2 W5.2 Tab 4 status filter has whitelist for safety', () => {
+        const code = readSnippet('manager');
+        const searchFn = code.split('function dinoco_sn_search_plates')[1] || '';
+        ['reserved', 'in_pool', 'registered', 'claimed', 'voided', 'recalled'].forEach(s => {
+            expect(searchFn).toContain(`'${s}'`);
+        });
+    });
+
+    test('Phase 2 W5.2 Tab 4 V.0.25 version bump in header', () => {
+        const code = readSnippet('manager');
+        expect(code).toMatch(/Version: V\.0\.25/);
+        expect(code).toContain('Phase 2 W5.1+W5.2 Tab 4');
+    });
+
+    test('Phase 2 W5.2 Tab 4 SnSearchQueryParserTest exists', () => {
+        const filepath = path.join(REPO_ROOT, 'tests/helpers/SnSearchQueryParserTest.php');
+        expect(fs.existsSync(filepath)).toBe(true);
+        const content = fs.readFileSync(filepath, 'utf8');
+        expect(content).toContain('test_exact_sn_detected_for_long_alnum_token');
+        expect(content).toContain('test_phone_filter_strips_non_digits');
+        expect(content).toContain('test_combined_sku_and_status_filters');
+        expect(content).toContain('sn_parse_search_query');
+    });
+
+    test('Phase 2 W5.2 Tab 4 modal accessibility (role + aria-modal)', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('role="dialog"');
+        expect(code).toContain('aria-modal="true"');
+        expect(code).toContain('aria-labelledby');
+    });
+
+    test('Phase 2 W5.2 Tab 4 touch target >=44px enforced on action buttons', () => {
+        const code = readSnippet('manager');
+        const matches = (code.match(/min-height:\s*44px/g) || []).length;
+        expect(matches).toBeGreaterThanOrEqual(4);
+    });
+
+    test('Phase 2 W5.2 Tab 4 calls approval workflow REST routes', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('/approval/request');
+        expect(code).toContain('/approval/pending');
+        // Approve/reject is called via dynamic decision arg, not literal path
+        expect(code).toContain("/approval/' + encodeURIComponent(uuid) + '/' + decision");
+        expect(code).toContain("'approve'");
+        expect(code).toContain("'reject'");
+    });
+
+    test('Phase 2 W5.2 Tab 4 defensive — degrades when approval workflow missing', () => {
+        const code = readSnippet('manager');
+        expect(code).toContain('Approval workflow ยังไม่ active');
     });
 });

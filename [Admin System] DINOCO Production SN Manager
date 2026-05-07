@@ -1,6 +1,8 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
+ * ║  Version: V.0.26 (2026-05-07) — Round 3: QR PDF button removed (Huali factory generates) ║
+ * ║  Version: V.0.25 (2026-05-05) — Phase 2 W5.1+W5.2 Tab 4 Universal Search + Investigation Timeline║
  * ║  Version: V.0.24 (2026-05-05) — Phase 1 W4.1+W4.2: pre-flight + obs hooks║
  * ║  Version: V.0.23 (2026-05-05) — Q21 OVERRIDE: F#12 nav-item REMOVED (final cleanup)║
  * ║  Version: V.0.22 (2026-05-05) — Phase 3 W8 Gap D orphan-claim scan cron (daily 03:30)║
@@ -463,6 +465,470 @@ if ( ! function_exists( 'dinoco_sn_get_user_stats' ) ) {
         }
 
         return $stats;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1.6 PHASE 2 W5.1+W5.2 — TAB 4 SEARCH HELPERS (additive 2026-05-05)
+ *
+ * Power-user query parser + search SQL + investigation timeline + PII mask.
+ *
+ * Plan ref: ~/.claude/plans/wiki-doc-sequential-lantern.md v2.13 §K + §K.2
+ *
+ * Pure-logic where possible (parser is testable without DB) — search/timeline
+ * touch DB but are read-only and use $wpdb->prepare everywhere (no raw SQL).
+ *
+ * Public helpers:
+ *   dinoco_sn_parse_search_query( $q ) : array
+ *     → Parse "DNCSS* sku:X status:registered phone:0812345678" into struct.
+ *
+ *   dinoco_sn_search_plates( $parsed, $limit = 50 ) : array
+ *     → Execute SQL with prepared statements; return rows joined w/ pool_meta.
+ *
+ *   dinoco_sn_get_timeline_for_sn( $sn, $limit = 50 ) : array
+ *     → Audit events for an S/N + actor display name resolution.
+ *
+ *   dinoco_sn_mask_phone_for_display( $phone ) : string
+ *     → "08x-xxx-1234" unless current_user_can('dinoco_sn_view_pii').
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_parse_search_query' ) ) {
+    /**
+     * Parse power-user search query syntax.
+     *
+     * Supported tokens (combine with space = AND):
+     *   DNCSS0001234         → exact_sn (uppercased)
+     *   DNCSS*               → prefix
+     *   *1234                → suffix
+     *   *MID*                → contains
+     *   phone:0812345678     → filters.phone (digits only)
+     *   line:Somchai_J       → filters.line
+     *   order:6789           → filters.order_id (int)
+     *   sku:DNCGND45L002     → filters.sku (uppercased)
+     *   batch:42             → filters.batch_id (int)
+     *   status:registered    → filters.status (whitelist enforced downstream)
+     *   since:2026-05-01     → filters.since (ISO date string)
+     *   actor:warehouse_a    → filters.actor_login
+     *   bare-word            → free_text (substring search across sn/sku)
+     *
+     * Returns shape:
+     *   {
+     *     exact_sn: string|null,    (literal, no wildcards)
+     *     pattern:  string|null,    ('prefix'|'suffix'|'contains' if present)
+     *     pattern_value: string|null, (the search string with % chars)
+     *     filters: {
+     *       phone, line, order_id, sku, batch_id, status, since, actor_login
+     *     },
+     *     free_text: string|null,
+     *     raw: string,
+     *   }
+     *
+     * Pure logic — no DB access. Testable in isolation.
+     *
+     * @param string $q Raw user input.
+     * @return array
+     */
+    function dinoco_sn_parse_search_query( $q ) {
+        $q = is_string( $q ) ? trim( $q ) : '';
+        $result = array(
+            'exact_sn'      => null,
+            'pattern'       => null,
+            'pattern_value' => null,
+            'filters'       => array(
+                'phone'        => null,
+                'line'         => null,
+                'order_id'     => null,
+                'sku'          => null,
+                'batch_id'     => null,
+                'status'       => null,
+                'since'        => null,
+                'actor_login'  => null,
+            ),
+            'free_text' => null,
+            'raw'       => $q,
+        );
+        if ( $q === '' ) return $result;
+
+        // Tokenize on whitespace, preserve quoted strings (rare but defensive)
+        $tokens = preg_split( '/\s+/', $q );
+        $free_words = array();
+
+        foreach ( $tokens as $tok ) {
+            if ( $tok === '' ) continue;
+            $colon = strpos( $tok, ':' );
+            if ( $colon !== false && $colon > 0 ) {
+                $key = strtolower( substr( $tok, 0, $colon ) );
+                $val = trim( substr( $tok, $colon + 1 ) );
+                if ( $val === '' ) continue;
+                switch ( $key ) {
+                    case 'phone':
+                        // Strip everything except digits
+                        $result['filters']['phone'] = preg_replace( '/\D+/', '', $val );
+                        break;
+                    case 'line':
+                    case 'line_name':
+                        $result['filters']['line'] = $val;
+                        break;
+                    case 'order':
+                    case 'order_id':
+                        $result['filters']['order_id'] = (int) $val;
+                        break;
+                    case 'sku':
+                        $result['filters']['sku'] = strtoupper( $val );
+                        break;
+                    case 'batch':
+                    case 'batch_id':
+                        $result['filters']['batch_id'] = (int) $val;
+                        break;
+                    case 'status':
+                        $result['filters']['status'] = strtolower( $val );
+                        break;
+                    case 'since':
+                        // Accept YYYY-MM-DD or full ISO; defensive validate later
+                        $result['filters']['since'] = $val;
+                        break;
+                    case 'actor':
+                    case 'actor_login':
+                        $result['filters']['actor_login'] = $val;
+                        break;
+                    default:
+                        // Unknown prefix → treat as free text
+                        $free_words[] = $tok;
+                }
+                continue;
+            }
+
+            // Wildcard / literal S/N detection
+            if ( strpos( $tok, '*' ) !== false ) {
+                $upper = strtoupper( $tok );
+                $first = $upper[0];
+                $last  = substr( $upper, -1 );
+                if ( $first === '*' && $last === '*' ) {
+                    $result['pattern']       = 'contains';
+                    $result['pattern_value'] = trim( $upper, '*' );
+                } elseif ( $last === '*' ) {
+                    $result['pattern']       = 'prefix';
+                    $result['pattern_value'] = rtrim( $upper, '*' );
+                } elseif ( $first === '*' ) {
+                    $result['pattern']       = 'suffix';
+                    $result['pattern_value'] = ltrim( $upper, '*' );
+                } else {
+                    // mid-wildcard (rare) — treat as contains pattern
+                    $result['pattern']       = 'contains';
+                    $result['pattern_value'] = str_replace( '*', '', $upper );
+                }
+                continue;
+            }
+
+            // Bare alphanumeric token that "looks like" S/N (≥6 chars, A-Z/0-9)
+            if ( $result['exact_sn'] === null
+                && preg_match( '/^[A-Za-z0-9._-]{4,}$/', $tok )
+                && preg_match( '/[A-Za-z]/', $tok )
+                && strlen( $tok ) >= 6
+            ) {
+                $result['exact_sn'] = strtoupper( $tok );
+                continue;
+            }
+
+            $free_words[] = $tok;
+        }
+
+        if ( $free_words ) {
+            $result['free_text'] = implode( ' ', $free_words );
+        }
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mask_phone_for_display' ) ) {
+    /**
+     * Mask phone like "08x-xxx-1234" unless caller has dinoco_sn_view_pii cap.
+     *
+     * Defensive — accepts any string, only digits matter.
+     *
+     * @param string|null $phone
+     * @return string
+     */
+    function dinoco_sn_mask_phone_for_display( $phone ) {
+        $phone = is_string( $phone ) ? trim( $phone ) : '';
+        if ( $phone === '' ) return '—';
+        if ( current_user_can( 'dinoco_sn_view_pii' )
+            || current_user_can( 'manage_options' )
+        ) {
+            return $phone;
+        }
+        $digits = preg_replace( '/\D+/', '', $phone );
+        if ( strlen( $digits ) < 4 ) {
+            return str_repeat( '•', max( 1, strlen( $digits ) ) );
+        }
+        $first = substr( $digits, 0, 2 );
+        $last4 = substr( $digits, -4 );
+        return $first . 'x-xxx-' . $last4;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_search_plates' ) ) {
+    /**
+     * Execute SQL search using parsed query struct.
+     *
+     * Read-only. All inputs prepared via $wpdb->prepare.
+     *
+     * @param array $parsed Output of dinoco_sn_parse_search_query()
+     * @param int   $limit  Max rows (capped 1..200)
+     * @return array<array> Rows with: sn, linked_sku, status, batch_code, batch_id,
+     *                       registered_user_id, registered_at, received_at,
+     *                       customer_phone (masked unless view_pii cap),
+     *                       customer_display_name
+     */
+    function dinoco_sn_search_plates( $parsed, $limit = 50 ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
+            return array();
+        }
+        $limit = max( 1, min( 200, (int) $limit ) );
+
+        global $wpdb;
+        $pool    = dinoco_sn_table( 'pool' );
+        $batches = dinoco_sn_table( 'batches' );
+        $meta_tbl = function_exists( 'dinoco_sn_table_exists' ) && dinoco_sn_table_exists( 'pool_meta' )
+            ? dinoco_sn_table( 'pool_meta' )
+            : null;
+
+        $where  = array();
+        $params = array();
+
+        // Exact S/N takes precedence
+        if ( ! empty( $parsed['exact_sn'] ) ) {
+            $where[] = 'p.sn = %s';
+            $params[] = (string) $parsed['exact_sn'];
+        } elseif ( ! empty( $parsed['pattern'] ) && $parsed['pattern_value'] !== null ) {
+            $val_esc = $wpdb->esc_like( (string) $parsed['pattern_value'] );
+            switch ( $parsed['pattern'] ) {
+                case 'prefix':
+                    $where[]  = 'p.sn LIKE %s';
+                    $params[] = $val_esc . '%';
+                    break;
+                case 'suffix':
+                    $where[]  = 'p.sn LIKE %s';
+                    $params[] = '%' . $val_esc;
+                    break;
+                case 'contains':
+                default:
+                    $where[]  = 'p.sn LIKE %s';
+                    $params[] = '%' . $val_esc . '%';
+            }
+        }
+
+        $f = $parsed['filters'] ?? array();
+
+        if ( ! empty( $f['sku'] ) ) {
+            $where[]  = 'p.linked_sku = %s';
+            $params[] = (string) $f['sku'];
+        }
+        if ( ! empty( $f['batch_id'] ) ) {
+            $where[]  = 'p.batch_id = %d';
+            $params[] = (int) $f['batch_id'];
+        }
+        if ( ! empty( $f['status'] ) ) {
+            // Whitelist statuses (avoid arbitrary value injection at SQL level)
+            $allowed = array(
+                'reserved','in_pool','allocated_to_order','shipped','registered',
+                'claimed','replaced','transferred','voided','recalled',
+                'reserved_for_legacy','shipped_legacy','cancelled_batch','stolen',
+            );
+            if ( in_array( $f['status'], $allowed, true ) ) {
+                $where[]  = 'p.status = %s';
+                $params[] = (string) $f['status'];
+            }
+        }
+        if ( ! empty( $f['since'] ) ) {
+            $ts = strtotime( (string) $f['since'] );
+            if ( $ts !== false ) {
+                $where[]  = '( p.received_at >= %s OR p.registered_at >= %s )';
+                $params[] = gmdate( 'Y-m-d H:i:s', $ts );
+                $params[] = gmdate( 'Y-m-d H:i:s', $ts );
+            }
+        }
+
+        // Phone / LINE name require lookup via wp_users / usermeta
+        if ( ! empty( $f['phone'] ) ) {
+            // Match LINE phone meta (if present) OR billing phone
+            $phone_digits = preg_replace( '/\D+/', '', (string) $f['phone'] );
+            if ( $phone_digits !== '' ) {
+                // Sub-query — find user_ids via usermeta phone fields
+                $sub_phone = "SELECT um.user_id FROM {$wpdb->usermeta} um
+                              WHERE um.meta_key IN ('billing_phone','dinoco_phone','phone')
+                                AND REPLACE(REPLACE(REPLACE(um.meta_value,'-',''),' ',''),'+','') LIKE %s";
+                $where[]  = "p.registered_user_id IN ( {$sub_phone} )";
+                $params[] = '%' . $wpdb->esc_like( $phone_digits ) . '%';
+            }
+        }
+        if ( ! empty( $f['line'] ) ) {
+            $sub_line = "SELECT u.ID FROM {$wpdb->users} u WHERE u.display_name LIKE %s";
+            $where[]  = "p.registered_user_id IN ( {$sub_line} )";
+            $params[] = '%' . $wpdb->esc_like( (string) $f['line'] ) . '%';
+        }
+        if ( ! empty( $f['order_id'] ) ) {
+            // Defensive: pool_meta MIGHT have order_id column; skip if missing
+            if ( $meta_tbl ) {
+                $cols = $wpdb->get_col( "DESCRIBE {$meta_tbl}", 0 );
+                if ( is_array( $cols ) && in_array( 'order_id', $cols, true ) ) {
+                    $where[]  = 'm.order_id = %d';
+                    $params[] = (int) $f['order_id'];
+                }
+            }
+        }
+        if ( ! empty( $f['actor_login'] ) ) {
+            // Resolve via audit log: SN had any audit row by this actor
+            if ( dinoco_sn_table_exists( 'audit' ) ) {
+                $audit_tbl = dinoco_sn_table( 'audit' );
+                $sub_actor = "SELECT DISTINCT a.sn FROM {$audit_tbl} a
+                              INNER JOIN {$wpdb->users} u ON u.ID = a.actor_user_id
+                              WHERE u.user_login = %s OR u.display_name = %s";
+                $where[]  = "p.sn IN ( {$sub_actor} )";
+                $params[] = (string) $f['actor_login'];
+                $params[] = (string) $f['actor_login'];
+            }
+        }
+
+        // Free-text fallback search across sn + sku
+        if ( ! empty( $parsed['free_text'] ) ) {
+            $val_esc = $wpdb->esc_like( strtoupper( (string) $parsed['free_text'] ) );
+            $where[]  = '( p.sn LIKE %s OR p.linked_sku LIKE %s )';
+            $params[] = '%' . $val_esc . '%';
+            $params[] = '%' . $val_esc . '%';
+        }
+
+        $where_sql = $where ? ( 'WHERE ' . implode( ' AND ', $where ) ) : '';
+        $join_meta = $meta_tbl ? "LEFT JOIN {$meta_tbl} m ON m.sn = p.sn" : '';
+
+        $sql = "SELECT p.sn, p.batch_id, p.linked_sku, p.status,
+                       p.registered_user_id, p.registered_warranty_id,
+                       p.registered_at, p.received_at,
+                       b.batch_code
+                FROM {$pool} p
+                LEFT JOIN {$batches} b ON b.id = p.batch_id
+                {$join_meta}
+                {$where_sql}
+                ORDER BY p.received_at DESC, p.sn ASC
+                LIMIT %d";
+        $params[] = $limit;
+
+        $rows = $params
+            ? $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A )
+            : $wpdb->get_results( $sql, ARRAY_A );
+        if ( ! is_array( $rows ) ) return array();
+
+        // Enrich w/ display_name + masked phone (best-effort)
+        $user_ids = array_unique( array_filter( array_map(
+            function( $r ) { return (int) ( $r['registered_user_id'] ?? 0 ); },
+            $rows
+        ) ) );
+        $names = array();
+        $phones = array();
+        if ( $user_ids ) {
+            $ph = implode( ',', array_fill( 0, count( $user_ids ), '%d' ) );
+            $u_rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT ID, display_name FROM {$wpdb->users} WHERE ID IN ( {$ph} )",
+                $user_ids
+            ), ARRAY_A );
+            foreach ( (array) $u_rows as $u ) {
+                $names[ (int) $u['ID'] ] = (string) $u['display_name'];
+            }
+            // Phones from usermeta (best-effort)
+            $ph_rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT user_id, meta_value FROM {$wpdb->usermeta}
+                 WHERE user_id IN ( {$ph} )
+                   AND meta_key IN ('billing_phone','dinoco_phone','phone')",
+                $user_ids
+            ), ARRAY_A );
+            foreach ( (array) $ph_rows as $pr ) {
+                $uid = (int) $pr['user_id'];
+                if ( ! isset( $phones[ $uid ] ) && ! empty( $pr['meta_value'] ) ) {
+                    $phones[ $uid ] = (string) $pr['meta_value'];
+                }
+            }
+        }
+
+        $enriched = array_map( function( $r ) use ( $names, $phones ) {
+            $uid = (int) ( $r['registered_user_id'] ?? 0 );
+            $r['customer_display_name'] = $uid && isset( $names[ $uid ] ) ? $names[ $uid ] : null;
+            $r['customer_phone_masked'] = $uid && isset( $phones[ $uid ] )
+                ? dinoco_sn_mask_phone_for_display( $phones[ $uid ] )
+                : '—';
+            return $r;
+        }, $rows );
+
+        return $enriched;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_get_timeline_for_sn' ) ) {
+    /**
+     * Investigation timeline — full audit history for a single S/N.
+     *
+     * @param string $sn      Uppercase S/N
+     * @param int    $limit   Max rows (1..200, default 50)
+     * @return array<array>   Rows with id, event_type, status_from, status_to,
+     *                        actor_display, approver_display, reason,
+     *                        reason_category, created_at, is_sensitive,
+     *                        context (decoded JSON)
+     */
+    function dinoco_sn_get_timeline_for_sn( $sn, $limit = 50 ) {
+        if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'audit' ) ) {
+            return array();
+        }
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) return array();
+        $limit = max( 1, min( 200, (int) $limit ) );
+
+        global $wpdb;
+        $tbl = dinoco_sn_table( 'audit' );
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, event_type, status_from, status_to, actor_user_id,
+                    approver_user_id, reason, reason_category, context_json,
+                    ip_address, is_sensitive, created_at
+             FROM {$tbl}
+             WHERE sn = %s
+             ORDER BY created_at DESC, id DESC
+             LIMIT %d",
+            $sn, $limit
+        ), ARRAY_A );
+
+        if ( ! is_array( $rows ) ) return array();
+
+        // Resolve user display names with cache
+        $user_ids = array();
+        foreach ( $rows as $r ) {
+            foreach ( array( 'actor_user_id', 'approver_user_id' ) as $field ) {
+                if ( ! empty( $r[ $field ] ) ) $user_ids[] = (int) $r[ $field ];
+            }
+        }
+        $user_ids = array_unique( array_filter( $user_ids ) );
+        $names = array();
+        if ( $user_ids ) {
+            $ph = implode( ',', array_fill( 0, count( $user_ids ), '%d' ) );
+            $u_rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT ID, display_name FROM {$wpdb->users} WHERE ID IN ( {$ph} )",
+                $user_ids
+            ), ARRAY_A );
+            foreach ( (array) $u_rows as $u ) {
+                $names[ (int) $u['ID'] ] = (string) $u['display_name'];
+            }
+        }
+
+        return array_map( function( $r ) use ( $names ) {
+            $r['actor_display'] = ! empty( $r['actor_user_id'] )
+                && isset( $names[ (int) $r['actor_user_id'] ] )
+                ? $names[ (int) $r['actor_user_id'] ]
+                : ( ! empty( $r['actor_user_id'] ) ? 'user#' . (int) $r['actor_user_id'] : '—' );
+            $r['approver_display'] = ! empty( $r['approver_user_id'] )
+                && isset( $names[ (int) $r['approver_user_id'] ] )
+                ? $names[ (int) $r['approver_user_id'] ]
+                : ( ! empty( $r['approver_user_id'] ) ? 'user#' . (int) $r['approver_user_id'] : null );
+            $r['context'] = ! empty( $r['context_json'] ) ? json_decode( $r['context_json'], true ) : null;
+            unset( $r['context_json'] );
+            return $r;
+        }, $rows );
     }
 }
 
@@ -1967,6 +2433,273 @@ if ( ! function_exists( 'dinoco_sn_render_admin_styles' ) ) {
                 justify-content: flex-end;
                 margin-top: 24px;
             }
+
+            /* ═══════════════════════════════════════════════════════════════
+             * Phase 2 W5.1+W5.2 — Tab 4 จัดการ S/N (V.0.25)
+             * Scoped under .dnc-sn-tab-manage-* to avoid leak.
+             * ═══════════════════════════════════════════════════════════════ */
+            .dnc-sn-tab-manage { display: block; }
+            .dnc-sn-tab-manage-search {
+                background: #f9fafb;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                padding: 16px;
+                margin-bottom: 16px;
+            }
+            .dnc-sn-tab-manage-search-label {
+                display: block;
+                font-weight: 600;
+                color: #374151;
+                margin-bottom: 8px;
+                font-size: 14px;
+            }
+            .dnc-sn-tab-manage-search-row {
+                display: flex;
+                gap: 8px;
+                align-items: stretch;
+            }
+            .dnc-sn-tab-manage-q {
+                flex: 1;
+                font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 14px;
+                min-height: 44px;
+                box-sizing: border-box;
+            }
+            .dnc-sn-tab-manage-syntax-hint {
+                font-size: 12px;
+                color: #6b7280;
+                margin: 8px 0;
+            }
+            .dnc-sn-tab-manage-syntax-hint code {
+                background: #ede9fe;
+                color: #6d28d9;
+                padding: 2px 6px;
+                border-radius: 4px;
+                margin-right: 4px;
+            }
+            .dnc-sn-tab-manage-chips {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+                margin-top: 4px;
+            }
+            .dnc-sn-tab-manage-chip {
+                background: #fff;
+                border: 1px solid #d1d5db;
+                color: #374151;
+                padding: 8px 12px;
+                border-radius: 999px;
+                font-size: 13px;
+                cursor: pointer;
+                min-height: 44px;
+                transition: all 0.15s;
+            }
+            .dnc-sn-tab-manage-chip:hover {
+                background: #f3f4f6;
+                border-color: #9ca3af;
+            }
+            .dnc-sn-tab-manage-chip.active {
+                background: #dbeafe;
+                border-color: #3b82f6;
+                color: #1e40af;
+                font-weight: 600;
+            }
+
+            /* Card grid results */
+            .dnc-sn-tab-manage-results {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+                gap: 12px;
+            }
+            .dnc-sn-tab-manage-card {
+                background: #fff;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                padding: 14px;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                transition: box-shadow 0.15s;
+            }
+            .dnc-sn-tab-manage-card:hover {
+                box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+                border-color: #cbd5e1;
+            }
+            .dnc-sn-tab-manage-card-head {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 8px;
+            }
+            .dnc-sn-tab-manage-card-sn {
+                font-family: 'JetBrains Mono', ui-monospace, monospace;
+                font-size: 13px;
+                font-weight: 600;
+                background: #f3f4f6;
+                padding: 4px 8px;
+                border-radius: 4px;
+            }
+            .dnc-sn-tab-manage-card-body { font-size: 13px; line-height: 1.6; color: #374151; }
+            .dnc-sn-tab-manage-card-phone { color: #6b7280; }
+            .dnc-sn-tab-manage-card-foot { display: flex; justify-content: flex-end; }
+
+            /* Investigation timeline modal */
+            .dnc-sn-tab-manage-modal-overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.5);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 9999;
+                padding: 16px;
+                box-sizing: border-box;
+            }
+            .dnc-sn-tab-manage-modal {
+                background: #fff;
+                border-radius: 12px;
+                width: 100%;
+                max-width: 720px;
+                max-height: 90vh;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+            .dnc-sn-tab-manage-modal-head {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                gap: 12px;
+                padding: 20px 24px;
+                border-bottom: 1px solid #e5e7eb;
+                background: #f9fafb;
+            }
+            .dnc-sn-tab-manage-modal-body {
+                padding: 20px 24px;
+                overflow-y: auto;
+                flex: 1;
+            }
+            .dnc-sn-tab-manage-modal-section {
+                margin-bottom: 20px;
+            }
+            .dnc-sn-tab-manage-modal-section h4 {
+                margin: 0 0 8px;
+                font-size: 14px;
+                color: #374151;
+            }
+            .dnc-sn-tab-manage-modal-foot {
+                display: flex;
+                gap: 8px;
+                padding: 16px 24px;
+                border-top: 1px solid #e5e7eb;
+                background: #f9fafb;
+                flex-wrap: wrap;
+            }
+            .dnc-sn-tab-manage-action-modal {
+                background: #fff;
+                border-radius: 12px;
+                width: 100%;
+                max-width: 520px;
+                padding: 24px;
+                box-sizing: border-box;
+                max-height: 90vh;
+                overflow-y: auto;
+            }
+
+            /* Timeline list */
+            .dnc-sn-tab-manage-timeline {
+                border-left: 2px solid #e5e7eb;
+                padding-left: 16px;
+            }
+            .dnc-sn-tab-manage-timeline-row {
+                position: relative;
+                margin-bottom: 14px;
+                padding-bottom: 14px;
+                border-bottom: 1px solid #f3f4f6;
+                font-size: 13px;
+            }
+            .dnc-sn-tab-manage-timeline-row:last-child {
+                border-bottom: none;
+            }
+            .dnc-sn-tab-manage-timeline-row:before {
+                content: '';
+                position: absolute;
+                left: -22px;
+                top: 4px;
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                background: #2563eb;
+            }
+            .dnc-sn-tab-manage-timeline-time {
+                color: #6b7280;
+                font-size: 12px;
+                margin-bottom: 2px;
+            }
+            .dnc-sn-tab-manage-timeline-event {
+                color: #1f2937;
+            }
+            .dnc-sn-tab-manage-timeline-actor {
+                color: #4b5563;
+                margin-top: 2px;
+            }
+
+            /* Pending approvals panel */
+            .dnc-sn-tab-manage-approvals {
+                background: #fef3c7;
+                border: 1px solid #f59e0b;
+                border-radius: 10px;
+                padding: 12px 16px;
+                margin-bottom: 16px;
+                position: sticky;
+                top: 0;
+                z-index: 50;
+            }
+            .dnc-sn-tab-manage-approvals[data-collapsed="1"] .dnc-sn-tab-manage-approvals-body {
+                display: none;
+            }
+            .dnc-sn-tab-manage-approvals-head {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 8px;
+                flex-wrap: wrap;
+            }
+            .dnc-sn-tab-manage-approvals-body {
+                font-size: 13px;
+                color: #92400e;
+            }
+            .dnc-sn-tab-manage-pending-row {
+                display: flex;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 6px;
+                padding: 8px;
+                background: #fff;
+                border-radius: 6px;
+                margin-bottom: 6px;
+                border-left: 4px solid #f59e0b;
+            }
+            .dnc-sn-tab-manage-pending-urgent { border-left-color: #dc2626; background: #fef2f2; }
+            .dnc-sn-tab-manage-pending-normal { border-left-color: #f59e0b; }
+            .dnc-sn-tab-manage-pending-low    { border-left-color: #9ca3af; background: #fafafa; }
+
+            /* Responsive */
+            @media (max-width: 640px) {
+                .dnc-sn-tab-manage-results {
+                    grid-template-columns: 1fr;
+                }
+                .dnc-sn-tab-manage-search-row {
+                    flex-direction: column;
+                }
+                .dnc-sn-tab-manage-modal-foot {
+                    justify-content: stretch;
+                }
+                .dnc-sn-tab-manage-modal-foot button {
+                    flex: 1;
+                    min-width: 0;
+                }
+            }
         </style>
         <?php
     }
@@ -2236,55 +2969,169 @@ if ( ! function_exists( 'dinoco_sn_render_tab_pool' ) ) {
     }
 }
 
-/* ─── Phase 2 W5 — Tab 4 จัดการ S/N (search + detail) ─── */
+/* ─── Phase 2 W5.1+W5.2 — Tab 4 จัดการ S/N (Universal Search + Investigation Timeline) ─── */
 if ( ! function_exists( 'dinoco_sn_render_tab_manage' ) ) {
+    /**
+     * Tab 4 layout (V.0.25 redesign):
+     *   - Section A: Universal search bar w/ power-user query syntax
+     *     + filter chips (active/pending claim/voided/pending approval/recent shipped/recent activated)
+     *   - Section B: Investigation timeline modal (full audit + status_from→to + actions)
+     *   - Section C: Pending approvals sticky panel (visible if dinoco_sn_approver cap)
+     *
+     * Power-user syntax (parsed by dinoco_sn_parse_search_query):
+     *   DNCSS0001234            exact S/N
+     *   DNCSS*  / *1234         prefix / suffix
+     *   phone:0812345678        by customer phone
+     *   line:Somchai_J          by LINE display name
+     *   sku:DNCGND45L002        all plates linked to SKU
+     *   batch:42                all plates in batch
+     *   status:registered       filter status
+     *   since:2026-05-01        created/updated since
+     *   actor:warehouse_admin   by audit actor
+     *   (combine with space — AND)
+     */
     function dinoco_sn_render_tab_manage() {
+        $is_approver = current_user_can( 'dinoco_sn_approver' )
+            || current_user_can( 'manage_options' );
         ?>
-        <div class="dnc-sn-manage">
-            <div class="dnc-sn-search-bar">
-                <input type="text"
-                       id="dnc-sn-search-q"
-                       class="dnc-sn-input"
-                       placeholder="ค้นหา S/N (DNCSS0001234 หรือ DNCSS*)"
-                       onkeydown="if(event.key==='Enter') dncSnDoSearch()">
-                <select id="dnc-sn-search-status" class="dnc-sn-input" style="max-width:180px;">
-                    <option value="">ทุกสถานะ</option>
-                    <option value="reserved">Reserved</option>
-                    <option value="in_pool">In Pool</option>
-                    <option value="allocated_to_order">Allocated</option>
-                    <option value="shipped">Shipped</option>
-                    <option value="registered">Registered</option>
-                    <option value="claimed">Claimed</option>
-                    <option value="voided">Voided</option>
-                    <option value="recalled">Recalled</option>
-                </select>
-                <button class="dnc-sn-btn dnc-sn-btn-primary" onclick="dncSnDoSearch()">🔍 ค้นหา</button>
-            </div>
-            <div id="dnc-sn-search-meta" class="dnc-sn-meta"></div>
-            <div class="dnc-sn-table-wrap">
-                <table class="dnc-sn-table" id="dnc-sn-search-table">
-                    <thead>
-                        <tr>
-                            <th>S/N</th>
-                            <th>SKU</th>
-                            <th>Status</th>
-                            <th>Batch</th>
-                            <th>Customer</th>
-                            <th>Registered At</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody><tr><td colspan="7" class="dnc-sn-empty">กรอก S/N หรือเลือกสถานะแล้วกดค้นหา</td></tr></tbody>
-                </table>
-            </div>
-            <!-- Detail card slide-in panel -->
-            <div id="dnc-sn-detail-panel" class="dnc-sn-detail-panel" style="display:none;">
-                <div class="dnc-sn-detail-header">
-                    <h3 id="dnc-sn-detail-title">S/N Detail</h3>
-                    <button class="dnc-sn-btn dnc-sn-btn-secondary" onclick="dncSnCloseDetail()">✕ ปิด</button>
+        <div class="dnc-sn-tab-manage" id="dnc-sn-tab-manage">
+
+            <!-- Section C: Pending Approvals (only for approvers) -->
+            <?php if ( $is_approver ) : ?>
+            <div class="dnc-sn-tab-manage-approvals" id="dnc-sn-tab-manage-approvals" data-collapsed="0">
+                <div class="dnc-sn-tab-manage-approvals-head">
+                    <strong>⚠️ คำขออนุมัติ (Pending Approvals)</strong>
+                    <span id="dnc-sn-tab-manage-approvals-count" class="dnc-sn-pill dnc-sn-pill-amber">—</span>
+                    <button class="dnc-sn-btn dnc-sn-btn-link"
+                            onclick="dncSnTabManageToggleApprovalsPanel()"
+                            id="dnc-sn-tab-manage-approvals-toggle"
+                            aria-label="ย่อ/ขยายแผง pending">▾</button>
+                    <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                            onclick="dncSnTabManageLoadPendingApprovals()"
+                            style="margin-left:auto;">↻ Refresh</button>
                 </div>
-                <div id="dnc-sn-detail-body">Loading…</div>
+                <div id="dnc-sn-tab-manage-approvals-body" class="dnc-sn-tab-manage-approvals-body">
+                    <em style="color:#6b7280;">Loading pending approvals…</em>
+                </div>
             </div>
+            <?php endif; ?>
+
+            <!-- Section A: Universal Search Bar -->
+            <div class="dnc-sn-tab-manage-search">
+                <label for="dnc-sn-tab-manage-q" class="dnc-sn-tab-manage-search-label">
+                    🔍 ค้นหา S/N (Power-user query)
+                </label>
+                <div class="dnc-sn-tab-manage-search-row">
+                    <input type="text"
+                           id="dnc-sn-tab-manage-q"
+                           class="dnc-sn-input dnc-sn-tab-manage-q"
+                           placeholder="DNCSS* หรือ phone:08xxxxxxxx sku:DNCGND45L002 status:registered"
+                           autocomplete="off">
+                    <button class="dnc-sn-btn dnc-sn-btn-primary"
+                            onclick="dncSnTabManageSearch()"
+                            style="min-height:44px;">ค้นหา</button>
+                </div>
+                <div class="dnc-sn-tab-manage-syntax-hint">
+                    <code>phone:</code> <code>line:</code> <code>sku:</code> <code>batch:</code>
+                    <code>status:</code> <code>since:</code> <code>actor:</code>
+                    — เว้นวรรค = AND, <code>*</code> = wildcard
+                </div>
+                <div class="dnc-sn-tab-manage-chips" id="dnc-sn-tab-manage-chips">
+                    <button type="button" class="dnc-sn-tab-manage-chip" data-chip="active"
+                            onclick="dncSnTabManageQuickChip('active')">🟢 Active warranty</button>
+                    <button type="button" class="dnc-sn-tab-manage-chip" data-chip="claim"
+                            onclick="dncSnTabManageQuickChip('claim')">🟡 Pending claim</button>
+                    <button type="button" class="dnc-sn-tab-manage-chip" data-chip="voided"
+                            onclick="dncSnTabManageQuickChip('voided')">🔴 Voided</button>
+                    <?php if ( $is_approver ) : ?>
+                    <button type="button" class="dnc-sn-tab-manage-chip" data-chip="pending_approval"
+                            onclick="dncSnTabManageQuickChip('pending_approval')">⚠️ Pending approval</button>
+                    <?php endif; ?>
+                    <button type="button" class="dnc-sn-tab-manage-chip" data-chip="recent_shipped"
+                            onclick="dncSnTabManageQuickChip('recent_shipped')">📦 Recently shipped</button>
+                    <button type="button" class="dnc-sn-tab-manage-chip" data-chip="recent_activated"
+                            onclick="dncSnTabManageQuickChip('recent_activated')">🆕 Recently activated</button>
+                </div>
+            </div>
+
+            <div id="dnc-sn-tab-manage-meta" class="dnc-sn-meta"></div>
+
+            <!-- Search results (card grid) -->
+            <div id="dnc-sn-tab-manage-results" class="dnc-sn-tab-manage-results">
+                <div class="dnc-sn-empty" style="padding:32px;text-align:center;color:#6b7280;">
+                    กรอก query แล้วกด <strong>ค้นหา</strong> หรือเลือก quick filter chip ด้านบน
+                </div>
+            </div>
+
+            <!-- Section B: Investigation Timeline Modal -->
+            <div id="dnc-sn-tab-manage-modal-overlay" class="dnc-sn-tab-manage-modal-overlay" style="display:none;"
+                 role="dialog" aria-labelledby="dnc-sn-tab-manage-modal-title" aria-modal="true">
+                <div class="dnc-sn-tab-manage-modal" role="document">
+                    <header class="dnc-sn-tab-manage-modal-head">
+                        <div>
+                            <h3 id="dnc-sn-tab-manage-modal-title" style="margin:0;">Investigation: <code id="dnc-sn-tab-manage-modal-sn">—</code></h3>
+                            <div id="dnc-sn-tab-manage-modal-summary" class="dnc-sn-meta" style="margin-top:4px;"></div>
+                        </div>
+                        <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                                style="min-height:44px;min-width:44px;"
+                                onclick="dncSnTabManageCloseModal()"
+                                aria-label="ปิด">✕</button>
+                    </header>
+
+                    <section class="dnc-sn-tab-manage-modal-body" id="dnc-sn-tab-manage-modal-body">
+                        Loading…
+                    </section>
+
+                    <footer class="dnc-sn-tab-manage-modal-foot">
+                        <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                                onclick="dncSnTabManageRequestAction('swap')"
+                                style="min-height:44px;">🔄 Swap</button>
+                        <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                                onclick="dncSnTabManageRequestAction('void')"
+                                style="min-height:44px;">🗑 Void</button>
+                        <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                                onclick="dncSnTabManageRequestAction('recall')"
+                                style="min-height:44px;">⚠️ Recall</button>
+                        <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                                onclick="dncSnTabManageCloseModal()"
+                                style="min-height:44px;margin-left:auto;">❌ Close</button>
+                    </footer>
+                </div>
+            </div>
+
+            <!-- Action Confirm Sub-modal (modal-on-modal) -->
+            <div id="dnc-sn-tab-manage-action-overlay" class="dnc-sn-tab-manage-modal-overlay" style="display:none;"
+                 role="dialog" aria-labelledby="dnc-sn-tab-manage-action-title" aria-modal="true">
+                <div class="dnc-sn-tab-manage-action-modal" role="document">
+                    <h3 id="dnc-sn-tab-manage-action-title" style="margin-top:0;">Confirm action</h3>
+                    <p id="dnc-sn-tab-manage-action-desc" class="dnc-sn-meta"></p>
+
+                    <label for="dnc-sn-tab-manage-action-urgency" style="font-weight:600;">Urgency:</label>
+                    <select id="dnc-sn-tab-manage-action-urgency" class="dnc-sn-input" style="margin-bottom:12px;">
+                        <option value="normal" selected>Normal</option>
+                        <option value="urgent">Urgent</option>
+                        <option value="low">Low</option>
+                    </select>
+
+                    <label for="dnc-sn-tab-manage-action-reason" style="font-weight:600;">เหตุผล (≥10 ตัวอักษร):</label>
+                    <textarea id="dnc-sn-tab-manage-action-reason" class="dnc-sn-input"
+                              style="width:100%;min-height:100px;margin-bottom:12px;font-family:inherit;"
+                              placeholder="กรุณาระบุเหตุผล…" required></textarea>
+
+                    <div id="dnc-sn-tab-manage-action-extra"></div>
+
+                    <div class="dnc-sn-tab-manage-modal-foot" style="border-top:1px solid #e5e7eb;padding-top:16px;">
+                        <button class="dnc-sn-btn dnc-sn-btn-secondary"
+                                onclick="dncSnTabManageCloseActionModal()"
+                                style="min-height:44px;">ยกเลิก</button>
+                        <button class="dnc-sn-btn dnc-sn-btn-primary"
+                                id="dnc-sn-tab-manage-action-submit"
+                                onclick="dncSnTabManageSubmitAction()"
+                                style="min-height:44px;margin-left:auto;">ส่งคำขอ</button>
+                    </div>
+                </div>
+            </div>
+
         </div>
         <?php
     }
@@ -2571,8 +3418,8 @@ if ( ! function_exists( 'dinoco_sn_render_admin_js' ) ) {
                                 '<span class="dnc-sn-batch-status ' + statusClass + '">' + escapeHtml(b.status) + '</span>' +
                                 '<div style="margin-top:8px;display:flex;gap:6px;flex-direction:column;">' +
                                 (b.status === 'draft' ? '<button class="dnc-sn-btn dnc-sn-btn-secondary" onclick="dncSnMarkSent(' + b.id + ')">▶ ส่งโรงงาน</button>' : '') +
-                                '<button class="dnc-sn-btn dnc-sn-btn-secondary" onclick="dncSnDownloadCSV(' + b.id + ')">📥 CSV</button>' +
-                                '<button class="dnc-sn-btn dnc-sn-btn-secondary" onclick="dncSnDownloadQrPdf(' + b.id + ')">📄 QR PDF</button>' +
+                                '<button class="dnc-sn-btn dnc-sn-btn-secondary" onclick="dncSnDownloadCSV(' + b.id + ')">📥 CSV (รวม QR URL)</button>' +
+                                /* QR PDF button REMOVED Round 3 (2026-05-07) — Huali Label generates QR from CSV. */
                                 '</div></div></div>';
                         }).join('');
                     })
@@ -2687,20 +3534,11 @@ if ( ! function_exists( 'dinoco_sn_render_admin_js' ) ) {
                 window.open(REST_BASE + '/batches/' + batch_id + '/csv?_wpnonce=' + NONCE, '_blank');
             };
 
-            window.dncSnDownloadQrPdf = function(batch_id) {
-                // Phase 1 W3: returns JSON metadata
-                // Phase 1 W4: will integrate actual PDF generation
-                fetch(REST_BASE + '/batches/' + batch_id + '/qr-pdf?chunk=1', {
-                    headers: { 'X-WP-Nonce': NONCE }, credentials: 'same-origin',
-                })
-                .then(function(r) { return r.json(); })
-                .then(function(res) {
-                    alert('QR PDF metadata loaded:\n' +
-                        'Total chunks: ' + res.total_chunks + '\n' +
-                        'Plates in chunk 1: ' + res.qty_in_chunk + '\n\n' +
-                        'Phase 1 W4 will serve actual PDF binary.');
-                });
-            };
+            // dncSnDownloadQrPdf — REMOVED Round 3 (2026-05-07).
+            //   Boss decision: factory (Huali Label) generates QR from CSV URL text.
+            //   See docs/sn-system/13-factory-qr-generation-update.md
+            //   CSV now includes "QR Content" column (full URL form B) — factory
+            //   parses CSV → encodes URL as QR → prints plate. No PDF needed.
 
             // ═══════ Tab 2: Receive ═══════
             window.dncSnSetReceiveMode = function(mode) {
@@ -3415,6 +4253,616 @@ if ( ! function_exists( 'dinoco_sn_render_admin_js' ) ) {
                 })
                 .catch(function(e) { alert('Reissue failed: ' + e.message); });
             };
+
+            /* ═══════════════════════════════════════════════════════════════
+             * Phase 2 W5.1+W5.2 — Tab 4 จัดการ S/N
+             *   Universal search + investigation timeline + approval workflow
+             *   handlers. Coexists with V.0.5 dncSnDoSearch (kept as fallback).
+             * ═══════════════════════════════════════════════════════════════ */
+
+            // Modal helpers shim (try Modal Helpers snippet → fallback native)
+            function _dncSnTabManageCfm(message, opts) {
+                opts = opts || {};
+                try {
+                    if (window.dinocoModal && typeof window.dinocoModal.confirm === 'function') {
+                        return window.dinocoModal.confirm({
+                            title: opts.title || 'ยืนยัน',
+                            message: message,
+                            okLabel: opts.okLabel || 'ยืนยัน',
+                            cancelLabel: opts.cancelLabel || 'ยกเลิก',
+                        });
+                    }
+                } catch (e) { /* fall through */ }
+                return Promise.resolve(window.confirm(message));
+            }
+            function _dncSnTabManageAlert(message, opts) {
+                opts = opts || {};
+                try {
+                    if (window.dinocoModal && typeof window.dinocoModal.alert === 'function') {
+                        return window.dinocoModal.alert({
+                            title: opts.title || 'แจ้งเตือน',
+                            message: message,
+                        });
+                    }
+                } catch (e) { /* fall through */ }
+                window.alert(message);
+                return Promise.resolve();
+            }
+            function _dncSnTabManageUuid() {
+                try {
+                    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+                        return window.crypto.randomUUID();
+                    }
+                } catch (e) { /* ignore */ }
+                // RFC4122-ish fallback (not crypto strong but unique enough for idempotency keys)
+                return ('xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx').replace(/[xy]/g, function(c) {
+                    var r = Math.random() * 16 | 0;
+                    return (c === 'y' ? (r & 0x3 | 0x8) : r).toString(16);
+                });
+            }
+            function _dncSnTabManageEsc(s) {
+                var d = document.createElement('div');
+                d.textContent = s == null ? '' : String(s);
+                return d.innerHTML;
+            }
+            function _dncSnTabManageFmtDate(s) {
+                if (!s) return '—';
+                try {
+                    var d = new Date(String(s).replace(' ', 'T'));
+                    if (isNaN(d.getTime())) return s;
+                    return d.toLocaleString('th-TH', { hour12: false });
+                } catch (e) { return s; }
+            }
+            function _dncSnTabManageRelTime(s) {
+                if (!s) return '—';
+                try {
+                    var t = new Date(String(s).replace(' ', 'T')).getTime();
+                    if (isNaN(t)) return s;
+                    var diffSec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+                    if (diffSec < 60) return diffSec + 'วิ ที่แล้ว';
+                    if (diffSec < 3600) return Math.floor(diffSec / 60) + 'นาที ที่แล้ว';
+                    if (diffSec < 86400) return Math.floor(diffSec / 3600) + 'ชม. ที่แล้ว';
+                    return Math.floor(diffSec / 86400) + 'วัน ที่แล้ว';
+                } catch (e) { return s; }
+            }
+
+            // Module-level state
+            var _dncSnTabManageDebounce = null;
+            var _dncSnTabManageCurrentSn = null;
+            var _dncSnTabManageCurrentSnRow = null;
+            var _dncSnTabManagePendingTimer = null;
+            var _dncSnTabManageActiveAction = null;
+
+            // Quick filter chips → set query and trigger search
+            window.dncSnTabManageQuickChip = function(chip) {
+                var input = document.getElementById('dnc-sn-tab-manage-q');
+                if (!input) return;
+                var queries = {
+                    active: 'status:registered',
+                    claim: 'status:claimed',
+                    voided: 'status:voided',
+                    pending_approval: '__pending_approval__',
+                    recent_shipped: 'status:shipped since:' + _dncSnTabManageDateNDaysAgo(7),
+                    recent_activated: 'status:registered since:' + _dncSnTabManageDateNDaysAgo(1),
+                };
+                if (chip === 'pending_approval') {
+                    // Scroll to approvals panel; if approver, that panel is the canonical view
+                    var panel = document.getElementById('dnc-sn-tab-manage-approvals');
+                    if (panel) {
+                        panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        if (window.dncSnTabManageLoadPendingApprovals) {
+                            window.dncSnTabManageLoadPendingApprovals();
+                        }
+                    } else {
+                        _dncSnTabManageAlert('ไม่มีสิทธิ์ดู pending approval (ต้องมี cap dinoco_sn_approver)');
+                    }
+                    // Visually mark chip
+                    document.querySelectorAll('.dnc-sn-tab-manage-chip').forEach(function(b) {
+                        b.classList.toggle('active', b.getAttribute('data-chip') === 'pending_approval');
+                    });
+                    return;
+                }
+                input.value = queries[chip] || '';
+                document.querySelectorAll('.dnc-sn-tab-manage-chip').forEach(function(b) {
+                    b.classList.toggle('active', b.getAttribute('data-chip') === chip);
+                });
+                window.dncSnTabManageSearch();
+            };
+
+            function _dncSnTabManageDateNDaysAgo(n) {
+                var d = new Date(Date.now() - (n * 86400000));
+                return d.toISOString().slice(0, 10);
+            }
+
+            // Wire up debounce input listener (300ms)
+            (function _dncSnTabManageInit() {
+                var input = document.getElementById('dnc-sn-tab-manage-q');
+                if (!input) return;
+                input.addEventListener('input', function() {
+                    if (_dncSnTabManageDebounce) clearTimeout(_dncSnTabManageDebounce);
+                    _dncSnTabManageDebounce = setTimeout(function() {
+                        if (input.value && input.value.length >= 2) {
+                            window.dncSnTabManageSearch();
+                        }
+                    }, 300);
+                });
+                input.addEventListener('keydown', function(ev) {
+                    if (ev.key === 'Enter') {
+                        ev.preventDefault();
+                        if (_dncSnTabManageDebounce) clearTimeout(_dncSnTabManageDebounce);
+                        window.dncSnTabManageSearch();
+                    }
+                });
+                // Wire up overlay backdrop click for both modals
+                var ov1 = document.getElementById('dnc-sn-tab-manage-modal-overlay');
+                if (ov1) {
+                    ov1.addEventListener('click', function(e) {
+                        if (e.target === ov1) window.dncSnTabManageCloseModal();
+                    });
+                }
+                var ov2 = document.getElementById('dnc-sn-tab-manage-action-overlay');
+                if (ov2) {
+                    ov2.addEventListener('click', function(e) {
+                        if (e.target === ov2) window.dncSnTabManageCloseActionModal();
+                    });
+                }
+                // ESC closes top-most overlay
+                document.addEventListener('keydown', function(ev) {
+                    if (ev.key !== 'Escape') return;
+                    var actionOpen = ov2 && ov2.style.display !== 'none';
+                    var modalOpen = ov1 && ov1.style.display !== 'none';
+                    if (actionOpen) window.dncSnTabManageCloseActionModal();
+                    else if (modalOpen) window.dncSnTabManageCloseModal();
+                });
+            })();
+
+            // Universal search (Section A)
+            window.dncSnTabManageSearch = function() {
+                var input = document.getElementById('dnc-sn-tab-manage-q');
+                var meta = document.getElementById('dnc-sn-tab-manage-meta');
+                var resultsEl = document.getElementById('dnc-sn-tab-manage-results');
+                if (!input || !resultsEl) return;
+                var q = (input.value || '').trim();
+                if (q === '') {
+                    if (meta) meta.textContent = '';
+                    resultsEl.innerHTML = '<div class="dnc-sn-empty" style="padding:32px;text-align:center;color:#6b7280;">' +
+                        'กรอก query แล้วกด <strong>ค้นหา</strong> หรือเลือก quick filter chip ด้านบน</div>';
+                    return;
+                }
+                if (meta) meta.textContent = 'กำลังค้นหา…';
+                resultsEl.innerHTML = '<div class="dnc-sn-empty" style="padding:24px;text-align:center;">Loading…</div>';
+
+                var url = REST_BASE + '/search?limit=50&q=' + encodeURIComponent(q);
+                fetch(url, {
+                    headers: { 'X-WP-Nonce': NONCE },
+                    credentials: 'same-origin',
+                })
+                .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, data: j }; }); })
+                .then(function(res) {
+                    if (!res.ok) {
+                        if (meta) meta.textContent = 'ค้นหาล้มเหลว: ' + (res.data && (res.data.message || res.data.code) || res.status);
+                        resultsEl.innerHTML = '<div class="dnc-sn-empty" style="padding:24px;color:#dc2626;">ค้นหาล้มเหลว</div>';
+                        return;
+                    }
+                    var data = res.data || {};
+                    var rows = data.rows || [];
+                    if (meta) {
+                        meta.textContent = 'พบ ' + (data.total || rows.length) + ' รายการ' +
+                            (rows.length < (data.total || 0) ? ' (แสดง ' + rows.length + ')' : '');
+                    }
+                    if (!rows.length) {
+                        resultsEl.innerHTML = '<div class="dnc-sn-empty" style="padding:32px;text-align:center;color:#6b7280;">' +
+                            'ไม่พบ S/N ที่ตรงกับ query</div>';
+                        return;
+                    }
+                    resultsEl.innerHTML = rows.map(function(r) {
+                        return _dncSnTabManageRenderCard(r);
+                    }).join('');
+                })
+                .catch(function(e) {
+                    if (meta) meta.textContent = 'ค้นหาล้มเหลว: ' + e.message;
+                    resultsEl.innerHTML = '<div class="dnc-sn-empty" style="padding:24px;color:#dc2626;">ค้นหาล้มเหลว: ' +
+                        _dncSnTabManageEsc(e.message) + '</div>';
+                });
+            };
+
+            function _dncSnTabManageRenderCard(r) {
+                var sn = _dncSnTabManageEsc(r.sn || '');
+                var sku = _dncSnTabManageEsc(r.linked_sku || '—');
+                var status = _dncSnTabManageEsc(r.status || '');
+                var batch = _dncSnTabManageEsc(r.batch_code || '—');
+                var custName = _dncSnTabManageEsc(r.customer_display_name || '—');
+                var custPhone = _dncSnTabManageEsc(r.customer_phone_masked || '—');
+                var regAt = _dncSnTabManageFmtDate(r.registered_at);
+                var rcvAt = _dncSnTabManageFmtDate(r.received_at);
+                return '<article class="dnc-sn-tab-manage-card" data-sn="' + sn + '" data-status="' + status + '" data-sku="' + sku + '">' +
+                    '<div class="dnc-sn-tab-manage-card-head">' +
+                        '<code class="dnc-sn-tab-manage-card-sn">' + sn + '</code>' +
+                        '<span class="dnc-sn-status dnc-sn-status-' + status + '">' + status + '</span>' +
+                    '</div>' +
+                    '<div class="dnc-sn-tab-manage-card-body">' +
+                        '<div><strong>SKU:</strong> ' + sku + '</div>' +
+                        '<div><strong>Batch:</strong> ' + batch + '</div>' +
+                        '<div><strong>ลูกค้า:</strong> ' + custName + ' · <span class="dnc-sn-tab-manage-card-phone">' + custPhone + '</span></div>' +
+                        '<div class="dnc-sn-pill-mute">รับเพลท: ' + rcvAt + '</div>' +
+                        (r.registered_at ? '<div class="dnc-sn-pill-mute">activate: ' + regAt + '</div>' : '') +
+                    '</div>' +
+                    '<div class="dnc-sn-tab-manage-card-foot">' +
+                        '<button class="dnc-sn-btn dnc-sn-btn-primary" style="min-height:44px;" ' +
+                            'onclick="dncSnTabManageOpenTimeline(\'' + sn.replace(/'/g, "\\'") + '\')">📋 Investigate</button>' +
+                    '</div>' +
+                '</article>';
+            }
+
+            // Investigation timeline modal (Section B)
+            window.dncSnTabManageOpenTimeline = function(sn) {
+                _dncSnTabManageCurrentSn = sn;
+                _dncSnTabManageCurrentSnRow = null;
+                var ov = document.getElementById('dnc-sn-tab-manage-modal-overlay');
+                var titleSn = document.getElementById('dnc-sn-tab-manage-modal-sn');
+                var summary = document.getElementById('dnc-sn-tab-manage-modal-summary');
+                var body = document.getElementById('dnc-sn-tab-manage-modal-body');
+                if (!ov || !body) return;
+                ov.style.display = 'flex';
+                document.body.style.overflow = 'hidden';
+                if (titleSn) titleSn.textContent = sn;
+                if (summary) summary.textContent = 'Loading…';
+                body.innerHTML = '<div class="dnc-sn-empty" style="padding:24px;text-align:center;">Loading timeline…</div>';
+
+                fetch(REST_BASE + '/sn/' + encodeURIComponent(sn), {
+                    headers: { 'X-WP-Nonce': NONCE },
+                    credentials: 'same-origin',
+                })
+                .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, data: j }; }); })
+                .then(function(res) {
+                    if (!res.ok || !res.data || !res.data.sn) {
+                        body.innerHTML = '<div class="dnc-sn-empty" style="padding:24px;color:#dc2626;">' +
+                            'โหลดไม่สำเร็จ: ' + _dncSnTabManageEsc((res.data && (res.data.message || res.data.code)) || 'unknown') +
+                            '</div>';
+                        return;
+                    }
+                    var p = res.data.sn;
+                    _dncSnTabManageCurrentSnRow = p;
+                    if (summary) {
+                        summary.innerHTML = 'SKU <strong>' + _dncSnTabManageEsc(p.linked_sku || '—') + '</strong>' +
+                            ' · Status <span class="dnc-sn-status dnc-sn-status-' + _dncSnTabManageEsc(p.status) + '">' +
+                            _dncSnTabManageEsc(p.status) + '</span>' +
+                            ' · Batch ' + _dncSnTabManageEsc(p.batch_code || '—');
+                    }
+
+                    var html = '<section class="dnc-sn-tab-manage-modal-section">' +
+                        '<h4>📋 Plate</h4>' +
+                        '<div class="dnc-sn-detail-grid">' +
+                            '<div><strong>SKU:</strong> ' + _dncSnTabManageEsc(p.linked_sku || '—') + '</div>' +
+                            '<div><strong>Top SET:</strong> ' + _dncSnTabManageEsc(res.data.top_set_sku || '—') + '</div>' +
+                            '<div><strong>Batch:</strong> ' + _dncSnTabManageEsc(p.batch_code || '—') + '</div>' +
+                            '<div><strong>รับเพลท:</strong> ' + _dncSnTabManageFmtDate(p.received_at) + '</div>' +
+                            '<div><strong>Activate:</strong> ' + _dncSnTabManageFmtDate(p.registered_at) + '</div>' +
+                        '</div>' +
+                    '</section>';
+
+                    if (res.data.customer) {
+                        var c = res.data.customer;
+                        html += '<section class="dnc-sn-tab-manage-modal-section">' +
+                            '<h4>👤 ลูกค้า</h4>' +
+                            '<div>' + _dncSnTabManageEsc(c.display_name || '—') +
+                            ' · <code>' + _dncSnTabManageEsc(c.email || '—') + '</code></div>' +
+                        '</section>';
+                    }
+
+                    var tl = res.data.timeline || [];
+                    html += '<section class="dnc-sn-tab-manage-modal-section">' +
+                        '<h4>🕐 Timeline (' + tl.length + ')</h4>';
+                    if (!tl.length) {
+                        html += '<div class="dnc-sn-empty" style="padding:16px;color:#6b7280;">ไม่มี audit events</div>';
+                    } else {
+                        html += '<div class="dnc-sn-tab-manage-timeline">';
+                        tl.forEach(function(t) {
+                            var sensitive = t.is_sensitive ? ' <span class="dnc-sn-pill dnc-sn-pill-pink">sensitive</span>' : '';
+                            var statusFlow = (t.status_from && t.status_to)
+                                ? '<span class="dnc-sn-pill dnc-sn-pill-gray">' + _dncSnTabManageEsc(t.status_from) + '</span>' +
+                                  ' → ' +
+                                  '<span class="dnc-sn-pill dnc-sn-pill-blue">' + _dncSnTabManageEsc(t.status_to) + '</span>'
+                                : '';
+                            html += '<div class="dnc-sn-tab-manage-timeline-row">' +
+                                '<div class="dnc-sn-tab-manage-timeline-time">' + _dncSnTabManageFmtDate(t.created_at) +
+                                ' <span class="dnc-sn-pill-mute">(' + _dncSnTabManageRelTime(t.created_at) + ')</span></div>' +
+                                '<div class="dnc-sn-tab-manage-timeline-event"><strong>' +
+                                _dncSnTabManageEsc(t.event_type || '—') + '</strong>' + sensitive +
+                                (statusFlow ? ' · ' + statusFlow : '') + '</div>' +
+                                '<div class="dnc-sn-tab-manage-timeline-actor">' +
+                                'โดย <strong>' + _dncSnTabManageEsc(t.actor_display || '—') + '</strong>' +
+                                (t.approver_display ? ' · approver <strong>' + _dncSnTabManageEsc(t.approver_display) + '</strong>' : '') +
+                                (t.reason ? ' · ' + _dncSnTabManageEsc(t.reason) : '') +
+                                '</div>' +
+                            '</div>';
+                        });
+                        html += '</div>';
+                    }
+                    html += '</section>';
+
+                    body.innerHTML = html;
+                })
+                .catch(function(e) {
+                    body.innerHTML = '<div class="dnc-sn-empty" style="padding:24px;color:#dc2626;">' +
+                        'โหลดล้มเหลว: ' + _dncSnTabManageEsc(e.message) + '</div>';
+                });
+            };
+
+            window.dncSnTabManageCloseModal = function() {
+                var ov = document.getElementById('dnc-sn-tab-manage-modal-overlay');
+                if (ov) ov.style.display = 'none';
+                document.body.style.overflow = '';
+                _dncSnTabManageCurrentSn = null;
+                _dncSnTabManageCurrentSnRow = null;
+            };
+
+            // Action request (modal-on-modal)
+            window.dncSnTabManageRequestAction = function(action) {
+                if (!_dncSnTabManageCurrentSn) {
+                    _dncSnTabManageAlert('ไม่มี S/N ที่เลือก');
+                    return;
+                }
+                _dncSnTabManageActiveAction = action;
+                var ov = document.getElementById('dnc-sn-tab-manage-action-overlay');
+                var title = document.getElementById('dnc-sn-tab-manage-action-title');
+                var desc = document.getElementById('dnc-sn-tab-manage-action-desc');
+                var extra = document.getElementById('dnc-sn-tab-manage-action-extra');
+                var reasonInput = document.getElementById('dnc-sn-tab-manage-action-reason');
+                if (!ov || !title || !desc) return;
+                var labels = {
+                    swap: { title: '🔄 Swap S/N', desc: 'Swap S/N เก่ากับใหม่ (ลูกค้าทำเพลทหาย/เปลี่ยน)' },
+                    void: { title: '🗑 Void S/N', desc: 'Void S/N (ทำเพลทเสีย / ผิด — ต้องอธิบายเหตุผล ≥10 ตัวอักษร)' },
+                    recall: { title: '⚠️ Recall S/N', desc: 'Recall S/N (ลูกค้าได้ของแล้ว — defect/safety/stolen/fraud/misship)' },
+                };
+                var l = labels[action] || { title: action, desc: '' };
+                title.textContent = l.title + ' — ' + _dncSnTabManageCurrentSn;
+                desc.textContent = l.desc;
+                if (reasonInput) reasonInput.value = '';
+                if (extra) {
+                    if (action === 'recall') {
+                        extra.innerHTML = '<label for="dnc-sn-tab-manage-action-category" style="font-weight:600;">Category:</label>' +
+                            '<select id="dnc-sn-tab-manage-action-category" class="dnc-sn-input" style="margin-bottom:12px;">' +
+                                '<option value="defect">defect</option>' +
+                                '<option value="safety">safety</option>' +
+                                '<option value="stolen">stolen</option>' +
+                                '<option value="fraud">fraud</option>' +
+                                '<option value="misship">misship</option>' +
+                            '</select>';
+                    } else if (action === 'swap') {
+                        extra.innerHTML = '<label for="dnc-sn-tab-manage-action-sn-new" style="font-weight:600;">S/N ใหม่ (ต้องเป็น in_pool):</label>' +
+                            '<input type="text" id="dnc-sn-tab-manage-action-sn-new" class="dnc-sn-input" ' +
+                            'style="margin-bottom:12px;text-transform:uppercase;" placeholder="DNCSS0001234">';
+                    } else {
+                        extra.innerHTML = '';
+                    }
+                }
+                ov.style.display = 'flex';
+            };
+
+            window.dncSnTabManageCloseActionModal = function() {
+                var ov = document.getElementById('dnc-sn-tab-manage-action-overlay');
+                if (ov) ov.style.display = 'none';
+                _dncSnTabManageActiveAction = null;
+            };
+
+            window.dncSnTabManageSubmitAction = function() {
+                var sn = _dncSnTabManageCurrentSn;
+                var action = _dncSnTabManageActiveAction;
+                if (!sn || !action) {
+                    _dncSnTabManageAlert('ไม่มี S/N หรือ action');
+                    return;
+                }
+                var reasonInput = document.getElementById('dnc-sn-tab-manage-action-reason');
+                var urgencySel = document.getElementById('dnc-sn-tab-manage-action-urgency');
+                var reason = ((reasonInput && reasonInput.value) || '').trim();
+                var urgency = (urgencySel && urgencySel.value) || 'normal';
+                if (reason.length < 10) {
+                    _dncSnTabManageAlert('เหตุผลต้องมีอย่างน้อย 10 ตัวอักษร');
+                    return;
+                }
+                var context = {};
+                if (action === 'recall') {
+                    var catSel = document.getElementById('dnc-sn-tab-manage-action-category');
+                    context.category = (catSel && catSel.value) || 'defect';
+                } else if (action === 'swap') {
+                    var snNewIn = document.getElementById('dnc-sn-tab-manage-action-sn-new');
+                    var snNew = ((snNewIn && snNewIn.value) || '').trim().toUpperCase();
+                    if (!snNew || snNew === sn) {
+                        _dncSnTabManageAlert('กรอก S/N ใหม่ที่ไม่ใช่ S/N เดิม');
+                        return;
+                    }
+                    context.sn_target = snNew;
+                }
+                var current_state = _dncSnTabManageCurrentSnRow && _dncSnTabManageCurrentSnRow.status
+                    ? _dncSnTabManageCurrentSnRow.status : 'unknown';
+
+                var btn = document.getElementById('dnc-sn-tab-manage-action-submit');
+                if (btn) { btn.disabled = true; btn.textContent = 'กำลังส่ง…'; }
+
+                var body = {
+                    action: action,
+                    sn: sn,
+                    current_state: current_state,
+                    urgency: urgency,
+                    reason: reason,
+                    context: context,
+                };
+                if (context.sn_target) body.sn_target = context.sn_target;
+
+                fetch(REST_BASE + '/approval/request', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-WP-Nonce': NONCE,
+                        'X-Idempotency-Key': _dncSnTabManageUuid(),
+                    },
+                    credentials: 'same-origin',
+                    body: JSON.stringify(body),
+                })
+                .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, data: j }; }); })
+                .then(function(res) {
+                    if (btn) { btn.disabled = false; btn.textContent = 'ส่งคำขอ'; }
+                    if (!res.ok) {
+                        // Approval workflow snippet may not be active yet — show informative msg
+                        var msg = (res.data && (res.data.message || res.data.code)) || ('HTTP ' + res.status);
+                        if (res.status === 404 || res.status === 503) {
+                            msg = 'Approval workflow ยังไม่ active (snippet ไม่ได้ load) — ' + msg;
+                        }
+                        _dncSnTabManageAlert('ส่งคำขอล้มเหลว: ' + msg);
+                        return;
+                    }
+                    var data = res.data || {};
+                    var tier = data.tier || 'auto';
+                    _dncSnTabManageAlert('✓ ส่งคำขอแล้ว · tier=' + tier +
+                        (data.uuid ? ' · uuid=' + data.uuid.slice(0, 8) : '') +
+                        (data.expires_at ? '\nหมดอายุ: ' + _dncSnTabManageFmtDate(data.expires_at) : ''));
+                    window.dncSnTabManageCloseActionModal();
+                    window.dncSnTabManageCloseModal();
+                    if (window.dncSnTabManageLoadPendingApprovals) {
+                        window.dncSnTabManageLoadPendingApprovals();
+                    }
+                    // Refresh search to show updated state (if any auto-tier action ran)
+                    window.dncSnTabManageSearch();
+                })
+                .catch(function(e) {
+                    if (btn) { btn.disabled = false; btn.textContent = 'ส่งคำขอ'; }
+                    _dncSnTabManageAlert('ส่งคำขอล้มเหลว: ' + e.message);
+                });
+            };
+
+            // Section C — Pending Approvals panel
+            window.dncSnTabManageLoadPendingApprovals = function() {
+                var body = document.getElementById('dnc-sn-tab-manage-approvals-body');
+                var countEl = document.getElementById('dnc-sn-tab-manage-approvals-count');
+                if (!body) return; // not approver — panel not rendered
+                fetch(REST_BASE + '/approval/pending?limit=10', {
+                    headers: { 'X-WP-Nonce': NONCE },
+                    credentials: 'same-origin',
+                })
+                .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, data: j }; }); })
+                .then(function(res) {
+                    if (!res.ok) {
+                        var msg = (res.data && (res.data.message || res.data.code)) || ('HTTP ' + res.status);
+                        if (res.status === 404 || res.status === 503) {
+                            body.innerHTML = '<em style="color:#9ca3af;">Approval workflow ยังไม่ active (รอ snippet sync)</em>';
+                        } else {
+                            body.innerHTML = '<em style="color:#dc2626;">โหลดล้มเหลว: ' + _dncSnTabManageEsc(msg) + '</em>';
+                        }
+                        if (countEl) countEl.textContent = '—';
+                        return;
+                    }
+                    var rows = (res.data && res.data.rows) || [];
+                    if (countEl) countEl.textContent = String(rows.length);
+                    if (!rows.length) {
+                        body.innerHTML = '<em style="color:#10b981;">✓ ไม่มี pending approvals</em>';
+                        return;
+                    }
+                    body.innerHTML = rows.map(function(p) {
+                        var urgency = p.urgency || 'normal';
+                        var ageMin = p.created_at ? Math.floor((Date.now() - new Date(p.created_at.replace(' ', 'T')).getTime()) / 60000) : 0;
+                        var sla = '';
+                        if (p.expires_at) {
+                            var rem = Math.max(0, Math.floor((new Date(p.expires_at.replace(' ', 'T')).getTime() - Date.now()) / 60000));
+                            sla = '<span class="dnc-sn-pill dnc-sn-pill-mute">SLA: ' + rem + ' นาที</span>';
+                        }
+                        return '<div class="dnc-sn-tab-manage-pending-row dnc-sn-tab-manage-pending-' + _dncSnTabManageEsc(urgency) + '">' +
+                            '<span class="dnc-sn-pill dnc-sn-pill-purple">' + _dncSnTabManageEsc(p.action || '—') + '</span> ' +
+                            '<code>' + _dncSnTabManageEsc(p.sn || '—') + '</code> · ' +
+                            'จาก <strong>' + _dncSnTabManageEsc(p.actor_display || ('user#' + (p.actor_user_id || ''))) + '</strong> · ' +
+                            ageMin + ' นาที ' + sla +
+                            ' <button class="dnc-sn-btn dnc-sn-btn-link" onclick="dncSnTabManageApprove(\'' +
+                                _dncSnTabManageEsc(p.uuid || '').replace(/'/g, "\\'") + '\')">✓ Approve</button>' +
+                            ' <button class="dnc-sn-btn dnc-sn-btn-link" onclick="dncSnTabManageReject(\'' +
+                                _dncSnTabManageEsc(p.uuid || '').replace(/'/g, "\\'") + '\')">✗ Reject</button>' +
+                            '</div>';
+                    }).join('');
+                })
+                .catch(function(e) {
+                    body.innerHTML = '<em style="color:#dc2626;">โหลดล้มเหลว: ' + _dncSnTabManageEsc(e.message) + '</em>';
+                });
+            };
+
+            window.dncSnTabManageApprove = function(uuid) {
+                if (!uuid) return;
+                _dncSnTabManageDecide(uuid, 'approve');
+            };
+            window.dncSnTabManageReject = function(uuid) {
+                if (!uuid) return;
+                _dncSnTabManageDecide(uuid, 'reject');
+            };
+            function _dncSnTabManageDecide(uuid, decision) {
+                _dncSnTabManageCfm(
+                    decision === 'approve' ? 'อนุมัติคำขอนี้?' : 'ปฏิเสธคำขอนี้?',
+                    { okLabel: decision === 'approve' ? '✓ Approve' : '✗ Reject' }
+                ).then(function(ok) {
+                    if (!ok) return;
+                    var notes = window.prompt('Notes (optional):', '') || '';
+                    fetch(REST_BASE + '/approval/' + encodeURIComponent(uuid) + '/' + decision, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-WP-Nonce': NONCE,
+                            'X-Idempotency-Key': _dncSnTabManageUuid(),
+                        },
+                        credentials: 'same-origin',
+                        body: JSON.stringify({ notes: notes }),
+                    })
+                    .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, data: j }; }); })
+                    .then(function(res) {
+                        if (!res.ok) {
+                            _dncSnTabManageAlert('Decision failed: ' + ((res.data && (res.data.message || res.data.code)) || ('HTTP ' + res.status)));
+                            return;
+                        }
+                        _dncSnTabManageAlert('✓ ' + decision + ' OK');
+                        if (window.dncSnTabManageLoadPendingApprovals) window.dncSnTabManageLoadPendingApprovals();
+                        if (window.dncSnTabManageSearch) window.dncSnTabManageSearch();
+                    })
+                    .catch(function(e) {
+                        _dncSnTabManageAlert('Decision failed: ' + e.message);
+                    });
+                });
+            }
+
+            window.dncSnTabManageToggleApprovalsPanel = function() {
+                var panel = document.getElementById('dnc-sn-tab-manage-approvals');
+                var body = document.getElementById('dnc-sn-tab-manage-approvals-body');
+                var btn = document.getElementById('dnc-sn-tab-manage-approvals-toggle');
+                if (!panel || !body) return;
+                var collapsed = panel.getAttribute('data-collapsed') === '1';
+                if (collapsed) {
+                    panel.setAttribute('data-collapsed', '0');
+                    body.style.display = '';
+                    if (btn) btn.textContent = '▾';
+                } else {
+                    panel.setAttribute('data-collapsed', '1');
+                    body.style.display = 'none';
+                    if (btn) btn.textContent = '▸';
+                }
+            };
+
+            // Auto-load pending on tab activation + poll every 60s
+            (function _dncSnTabManageLazyApprovals() {
+                var manageTab = document.querySelector('[data-tab="manage"]');
+                if (!manageTab) return;
+                var loaded = false;
+                manageTab.addEventListener('click', function() {
+                    if (loaded) return;
+                    loaded = true;
+                    if (window.dncSnTabManageLoadPendingApprovals) {
+                        window.dncSnTabManageLoadPendingApprovals();
+                    }
+                    // Poll every 60s while user stays on manage tab
+                    if (_dncSnTabManagePendingTimer) clearInterval(_dncSnTabManagePendingTimer);
+                    _dncSnTabManagePendingTimer = setInterval(function() {
+                        // Only poll if Manage tab still active (don't waste cycles elsewhere)
+                        var manageActive = manageTab.classList.contains('active');
+                        if (manageActive && window.dncSnTabManageLoadPendingApprovals) {
+                            window.dncSnTabManageLoadPendingApprovals();
+                        }
+                    }, 60000);
+                });
+            })();
 
             window.dncSnLoadAudit = function() {
                 var sn = (document.getElementById('dnc-sn-audit-sn') || {}).value || '';

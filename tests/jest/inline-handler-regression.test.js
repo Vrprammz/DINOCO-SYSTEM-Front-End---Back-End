@@ -111,7 +111,14 @@ const SNIPPET_PREFIXES = [
 // Bumped 908→909 (2026-05-05): Phase 2 W5 V.0.13 audit log CSV export added
 // 1 onclick handler (📥 Export CSV button in Tab 5 Audit). Migration to
 // data-action delegation deferred per same v2.13 polish sprint plan.
-const BASELINE_INLINE_HANDLER_COUNT = 909;
+//
+// Bumped 909→919 (2026-05-05): Phase 2 W5.1+W5.2 V.0.25 Tab 4 redesign added
+// 10 onclick handlers (universal search button, 6 quick filter chips,
+// timeline modal close, 4 action buttons swap/void/recall/close, sub-modal
+// cancel/submit, approvals refresh/toggle). Migration to data-action
+// delegation deferred per same v2.13 polish sprint plan — markers ship now,
+// migration sweep planned for Phase 6 polish round.
+const BASELINE_INLINE_HANDLER_COUNT = 919;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
