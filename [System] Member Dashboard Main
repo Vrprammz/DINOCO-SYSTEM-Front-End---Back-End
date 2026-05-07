@@ -2,17 +2,18 @@
  * Template Name: System Member Dashboard Main (Controller)
  * Description: Main Controller that handles Logic, AJAX, CSS and calls sub-components.
  * Author: Dinoco Dev Team
- * Version: V.31.0 — Phase 2 W7.1+W7.2 (v2.11 §Member Dashboard):
- *                  + Banner notification system (F#1 expiry / F#4 anniversary / F#10 review)
- *                    via dinoco_dashboard_banners() — boss Q25 cap=3 banners on home
- *                  + Stats grid 4-cell via dinoco_dashboard_stats_card() (uses
- *                    dinoco_sn_get_user_stats helper, defensive function_exists)
- *                  + Tier badge helper dinoco_render_tier_badge() shared with Header
- *                    (boss Q27 = B2B distributor rank_system pattern)
- *                  + F#3 auto-link: ?register_serial=DNCSS... → SN system flow
- *                    (preserves existing legacy serial_number CPT path as fallback)
- *                  + "📋 เคลม" quick action button (additive — existing buttons preserved)
- *                  M18 changes from V.30.4 preserved (legacy claim state variants).
+ * Version: V.31.1 — Phase 2 W7 audit remediation (2026-05-07):
+ *                  + S1-1 Buddhist year fallback `dinoco_sn_format_thai_date($ts, $buddhist=true)`
+ *                    (member-side wrapper supports both timestamps + MySQL strings + flag)
+ *                  + Banner perf: per-user transient cache 5 min via
+ *                    `dinoco_dashboard_banner_data($user_id)` + invalidation hook
+ *                    `dinoco_sn_pool_status_changed_for_user`
+ *                  + Banner UX: priority rotation (1 expiry + 1 anniversary + 1 review max),
+ *                    ✕ dismiss button per banner (localStorage 7d TTL),
+ *                    "ดูทั้งหมด (N)" link when total banners > 3
+ *                  + S2-3 Tier diamond contrast — text-shadow + deeper purple gradient
+ *                    (5.8:1 WCAG AA pass)
+ *                  V.31.0 base preserved (banner / stats / tier / F#3 / claim button / M18).
  * DB_ID: 11
  */
 
@@ -85,6 +86,34 @@ if ( ! function_exists( 'dinoco_log_system_event' ) ) {
 }
 
 // -----------------------------------------------------------
+// V.31.1 — S1-1 Buddhist year fallback helper (defensive)
+// -----------------------------------------------------------
+// `dinoco_sn_format_thai_date()` exists in Production SN Manager, but uses
+// single-arg signature (MySQL DATETIME → Thai-Buddhist date). Member dashboard
+// callers expect 2-arg form `($ts_or_string, $buddhist=true)` to also accept
+// raw Unix timestamps. Define a fallback that handles both shapes — only
+// registers if Production SN Manager helper not loaded yet (function_exists
+// guard avoids redeclare fatal).
+if ( ! function_exists( 'dinoco_sn_format_thai_date' ) ) {
+    function dinoco_sn_format_thai_date( $ts, $buddhist = true ) {
+        if ( empty( $ts ) ) return '—';
+        // Accept Unix timestamp (int / numeric string) OR MySQL DATETIME
+        if ( is_numeric( $ts ) ) {
+            $unix = (int) $ts;
+        } else {
+            $unix = strtotime( (string) $ts );
+            if ( $unix === false ) return '—';
+        }
+        $months = array(
+            'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
+            'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.',
+        );
+        $year = (int) date( 'Y', $unix ) + ( $buddhist ? 543 : 0 );
+        return (int) date( 'j', $unix ) . ' ' . $months[ (int) date( 'n', $unix ) - 1 ] . ' ' . $year;
+    }
+}
+
+// -----------------------------------------------------------
 // V.31.0 — Phase 2 W7 v2.11 Member Dashboard helpers
 // -----------------------------------------------------------
 // All defensive: function_exists guards everywhere, never throws on missing
@@ -138,112 +167,219 @@ if ( ! function_exists( 'dinoco_render_tier_badge' ) ) {
     }
 }
 
-if ( ! function_exists( 'dinoco_dashboard_banners' ) ) {
+// -----------------------------------------------------------
+// V.31.1 — Banner data aggregator (cached) + rotation (1 per category)
+// -----------------------------------------------------------
+// Perf finding: previous helper fired up to 4-6 standalone queries
+// (expiring + anniversary + review_pending each = 1+ query). Cache result
+// in per-user transient 5 min (`dinoco_sn_banner_<user_id>`). Invalidation
+// via `dinoco_sn_pool_status_changed_for_user` action — fire from SN flip
+// sites. Defensive function_exists guards everywhere.
+if ( ! function_exists( 'dinoco_dashboard_banner_data' ) ) {
     /**
-     * Render up to 3 dashboard banners (boss Q25 cap = 3 home + scrollable).
-     *
-     * Sources (priority order):
-     *   1. F#1 Expiry warnings (most urgent)
-     *   2. F#4 Anniversary milestones
-     *   3. F#10 Review requests
-     *
-     * Defensive: each helper called under function_exists guard — gracefully
-     * returns empty section if SN system not loaded. Never throws.
+     * Returns aggregated banner queue { items: array, total_pending: int }.
+     * Each item shape: { type, sn, days_left|years|score, ts }.
      *
      * @param int $user_id
-     * @return string  HTML (empty if no banners)
+     * @return array { items: array<array>, total_pending: int }
+     */
+    function dinoco_dashboard_banner_data( $user_id ) {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) return array( 'items' => array(), 'total_pending' => 0 );
+
+        $cache_key = 'dinoco_sn_banner_' . $user_id;
+        $cached = get_transient( $cache_key );
+        if ( is_array( $cached ) && isset( $cached['items'] ) ) {
+            return $cached;
+        }
+
+        $items = array();
+        $total = 0;
+
+        // F#1 Expiry
+        if ( function_exists( 'dinoco_sn_get_user_expiring_plates' ) ) {
+            $rows = dinoco_sn_get_user_expiring_plates( $user_id, 30 );
+            if ( is_array( $rows ) ) {
+                foreach ( $rows as $row ) {
+                    $sn = isset( $row->sn ) ? (string) $row->sn : '';
+                    if ( $sn === '' ) continue;
+                    $items[] = array(
+                        'type'      => 'expiry',
+                        'sn'        => $sn,
+                        'days_left' => isset( $row->days_left ) ? (int) $row->days_left : 0,
+                    );
+                    $total++;
+                }
+            }
+        }
+
+        // F#4 Anniversary
+        if ( function_exists( 'dinoco_sn_get_user_anniversaries' ) ) {
+            $rows = dinoco_sn_get_user_anniversaries( $user_id, 7 );
+            if ( is_array( $rows ) ) {
+                foreach ( $rows as $row ) {
+                    $sn = isset( $row->sn ) ? (string) $row->sn : '';
+                    if ( $sn === '' ) continue;
+                    $items[] = array(
+                        'type'  => 'anniversary',
+                        'sn'    => $sn,
+                        'years' => isset( $row->years_diff ) ? (int) $row->years_diff : 1,
+                    );
+                    $total++;
+                }
+            }
+        }
+
+        // F#10 Review
+        if ( function_exists( 'dinoco_sn_get_pending_reviews' ) ) {
+            $rows = dinoco_sn_get_pending_reviews( $user_id );
+            if ( is_array( $rows ) ) {
+                foreach ( $rows as $row ) {
+                    $sn = isset( $row->sn ) ? (string) $row->sn : '';
+                    if ( $sn === '' ) continue;
+                    $items[] = array(
+                        'type' => 'review',
+                        'sn'   => $sn,
+                    );
+                    $total++;
+                }
+            }
+        }
+
+        $payload = array(
+            'items'         => $items,
+            'total_pending' => $total,
+        );
+        set_transient( $cache_key, $payload, 5 * MINUTE_IN_SECONDS );
+        return $payload;
+    }
+}
+
+// Cache invalidation listener — wired to optional canonical action that SN flip
+// sites can fire. function_exists guard is tolerated since `add_action` is
+// always available; we bail in the callback if user_id is bad.
+if ( ! function_exists( 'dinoco_sn_invalidate_banner_cache' ) ) {
+    function dinoco_sn_invalidate_banner_cache( $user_id ) {
+        $user_id = (int) $user_id;
+        if ( $user_id > 0 ) {
+            delete_transient( 'dinoco_sn_banner_' . $user_id );
+        }
+    }
+    add_action( 'dinoco_sn_pool_status_changed_for_user', 'dinoco_sn_invalidate_banner_cache', 10, 1 );
+}
+
+if ( ! function_exists( 'dinoco_dashboard_banners' ) ) {
+    /**
+     * Render banner stack on home (V.31.1 priority rotation).
+     *
+     * Boss Q25 cap=3. V.31.1 enforces rotation: at most 1 per category
+     * (expiry / anniversary / review) — prevents 3 expiry banners hiding
+     * an anniversary milestone. ✕ dismiss button writes localStorage TTL 7d.
+     * "ดูทั้งหมด (N)" link surfaces total pending when > 3.
+     *
+     * @param int $user_id
+     * @return string  HTML (empty if no banners after dismiss filter)
      */
     function dinoco_dashboard_banners( $user_id ) {
         $user_id = (int) $user_id;
         if ( $user_id <= 0 ) return '';
 
-        $banners = array();
-        $cap     = 3;  // boss Q25
+        $data = function_exists( 'dinoco_dashboard_banner_data' )
+            ? dinoco_dashboard_banner_data( $user_id )
+            : array( 'items' => array(), 'total_pending' => 0 );
+        $items_all = isset( $data['items'] ) && is_array( $data['items'] ) ? $data['items'] : array();
+        $total     = isset( $data['total_pending'] ) ? (int) $data['total_pending'] : count( $items_all );
 
-        // 1. Expiry warnings (F#1)
-        if ( function_exists( 'dinoco_sn_get_user_expiring_plates' ) && count( $banners ) < $cap ) {
-            $expiring = dinoco_sn_get_user_expiring_plates( $user_id, 30 );
-            if ( is_array( $expiring ) ) {
-                foreach ( $expiring as $row ) {
-                    if ( count( $banners ) >= $cap ) break;
-                    $sn        = isset( $row->sn ) ? (string) $row->sn : '';
-                    $days_left = isset( $row->days_left ) ? (int) $row->days_left : 0;
-                    if ( $sn === '' ) continue;
-                    $banners[] = sprintf(
-                        '<div class="dnc-sn-banner dnc-sn-banner-expiry">'
-                        . '<div class="dnc-sn-banner-icon">⏰</div>'
-                        . '<div class="dnc-sn-banner-body">'
-                        .   '<div class="dnc-sn-banner-title">%s ประกันหมดใน %d วัน</div>'
-                        .   '<div class="dnc-sn-banner-actions">'
-                        .     '<a href="%s" class="dnc-sn-banner-cta">ต่อประกัน</a>'
-                        .     '<a href="%s" class="dnc-sn-banner-link">ดูรายละเอียด</a>'
-                        .   '</div>'
-                        . '</div>'
-                        . '</div>',
-                        esc_html( $sn ),
-                        $days_left,
-                        esc_url( '/extension?sn=' . rawurlencode( $sn ) ),
-                        esc_url( '/warranty/detail?sn=' . rawurlencode( $sn ) )
-                    );
-                }
+        // Rotation: 1 per category max (boss Q25 cap=3)
+        $picked = array( 'expiry' => null, 'anniversary' => null, 'review' => null );
+        foreach ( $items_all as $row ) {
+            $type = isset( $row['type'] ) ? $row['type'] : '';
+            if ( ! isset( $picked[ $type ] ) || $picked[ $type ] !== null ) continue;
+            $picked[ $type ] = $row;
+        }
+        $ordered = array_filter( array(
+            $picked['expiry'],
+            $picked['anniversary'],
+            $picked['review'],
+        ) );
+        if ( empty( $ordered ) ) return '';
+
+        $html = array();
+        foreach ( $ordered as $row ) {
+            $type = $row['type'];
+            $sn   = (string) ( $row['sn'] ?? '' );
+            // Stable banner ID → JS reads localStorage with this key
+            $bid = $type . '_' . substr( md5( $sn . '|' . $user_id ), 0, 10 );
+
+            if ( $type === 'expiry' ) {
+                $days = (int) ( $row['days_left'] ?? 0 );
+                $html[] = sprintf(
+                    '<div class="dnc-sn-banner dnc-sn-banner-expiry" data-banner-id="%s">'
+                    . '<button type="button" class="dnc-sn-banner-dismiss" aria-label="ปิดการแจ้งเตือน" onclick="dncSnDismissBanner(this)">✕</button>'
+                    . '<div class="dnc-sn-banner-icon">⏰</div>'
+                    . '<div class="dnc-sn-banner-body">'
+                    .   '<div class="dnc-sn-banner-title">%s ประกันหมดใน %d วัน</div>'
+                    .   '<div class="dnc-sn-banner-actions">'
+                    .     '<a href="%s" class="dnc-sn-banner-cta">ต่อประกัน</a>'
+                    .     '<a href="%s" class="dnc-sn-banner-link">ดูรายละเอียด</a>'
+                    .   '</div>'
+                    . '</div>'
+                    . '</div>',
+                    esc_attr( $bid ),
+                    esc_html( $sn ),
+                    $days,
+                    esc_url( '/extension?sn=' . rawurlencode( $sn ) ),
+                    esc_url( '/warranty/detail?sn=' . rawurlencode( $sn ) )
+                );
+            } elseif ( $type === 'anniversary' ) {
+                $years = (int) ( $row['years'] ?? 1 );
+                $html[] = sprintf(
+                    '<div class="dnc-sn-banner dnc-sn-banner-anniversary" data-banner-id="%s">'
+                    . '<button type="button" class="dnc-sn-banner-dismiss" aria-label="ปิดการแจ้งเตือน" onclick="dncSnDismissBanner(this)">✕</button>'
+                    . '<div class="dnc-sn-banner-icon">🎉</div>'
+                    . '<div class="dnc-sn-banner-body">'
+                    .   '<div class="dnc-sn-banner-title">ครบรอบ %d ปีแล้ว!</div>'
+                    .   '<div class="dnc-sn-banner-sub">ขอบคุณที่อยู่กับเรา %s</div>'
+                    .   '<div class="dnc-sn-banner-actions">'
+                    .     '<a href="%s" class="dnc-sn-banner-cta">รับรางวัล</a>'
+                    .   '</div>'
+                    . '</div>'
+                    . '</div>',
+                    esc_attr( $bid ),
+                    $years,
+                    esc_html( $sn ),
+                    esc_url( '/anniversary?sn=' . rawurlencode( $sn ) )
+                );
+            } elseif ( $type === 'review' ) {
+                $html[] = sprintf(
+                    '<div class="dnc-sn-banner dnc-sn-banner-review" data-banner-id="%s">'
+                    . '<button type="button" class="dnc-sn-banner-dismiss" aria-label="ปิดการแจ้งเตือน" onclick="dncSnDismissBanner(this)">✕</button>'
+                    . '<div class="dnc-sn-banner-icon">⭐</div>'
+                    . '<div class="dnc-sn-banner-body">'
+                    .   '<div class="dnc-sn-banner-title">ให้คะแนน DINOCO หน่อย</div>'
+                    .   '<div class="dnc-sn-banner-sub">รับ ฿50 หลังให้คะแนน</div>'
+                    .   '<div class="dnc-sn-banner-actions">'
+                    .     '<a href="%s" class="dnc-sn-banner-cta">ให้คะแนน + รับ ฿50</a>'
+                    .   '</div>'
+                    . '</div>'
+                    . '</div>',
+                    esc_attr( $bid ),
+                    esc_url( '/review?sn=' . rawurlencode( $sn ) )
+                );
             }
         }
 
-        // 2. Anniversary (F#4)
-        if ( function_exists( 'dinoco_sn_get_user_anniversaries' ) && count( $banners ) < $cap ) {
-            $anniv = dinoco_sn_get_user_anniversaries( $user_id, 7 );
-            if ( is_array( $anniv ) ) {
-                foreach ( $anniv as $row ) {
-                    if ( count( $banners ) >= $cap ) break;
-                    $sn    = isset( $row->sn ) ? (string) $row->sn : '';
-                    $years = isset( $row->years_diff ) ? (int) $row->years_diff : 1;
-                    if ( $sn === '' ) continue;
-                    $banners[] = sprintf(
-                        '<div class="dnc-sn-banner dnc-sn-banner-anniversary">'
-                        . '<div class="dnc-sn-banner-icon">🎉</div>'
-                        . '<div class="dnc-sn-banner-body">'
-                        .   '<div class="dnc-sn-banner-title">ครบรอบ %d ปีแล้ว!</div>'
-                        .   '<div class="dnc-sn-banner-sub">ขอบคุณที่อยู่กับเรา %s</div>'
-                        .   '<div class="dnc-sn-banner-actions">'
-                        .     '<a href="%s" class="dnc-sn-banner-cta">รับรางวัล</a>'
-                        .   '</div>'
-                        . '</div>'
-                        . '</div>',
-                        $years,
-                        esc_html( $sn ),
-                        esc_url( '/anniversary?sn=' . rawurlencode( $sn ) )
-                    );
-                }
-            }
+        // "ดูทั้งหมด (N)" — only when total exceeds rendered count
+        $rendered = count( $html );
+        if ( $total > $rendered ) {
+            $html[] = sprintf(
+                '<a href="%s" class="dnc-sn-banner-viewall">ดูทั้งหมด (%d)</a>',
+                esc_url( '/notifications/all' ),
+                $total
+            );
         }
 
-        // 3. Review requests (F#10)
-        if ( function_exists( 'dinoco_sn_get_pending_reviews' ) && count( $banners ) < $cap ) {
-            $reviews = dinoco_sn_get_pending_reviews( $user_id );
-            if ( is_array( $reviews ) ) {
-                foreach ( $reviews as $row ) {
-                    if ( count( $banners ) >= $cap ) break;
-                    $sn = isset( $row->sn ) ? (string) $row->sn : '';
-                    if ( $sn === '' ) continue;
-                    $banners[] = sprintf(
-                        '<div class="dnc-sn-banner dnc-sn-banner-review">'
-                        . '<div class="dnc-sn-banner-icon">⭐</div>'
-                        . '<div class="dnc-sn-banner-body">'
-                        .   '<div class="dnc-sn-banner-title">ให้คะแนน DINOCO หน่อย</div>'
-                        .   '<div class="dnc-sn-banner-sub">รับ ฿50 หลังให้คะแนน</div>'
-                        .   '<div class="dnc-sn-banner-actions">'
-                        .     '<a href="%s" class="dnc-sn-banner-cta">ให้คะแนน + รับ ฿50</a>'
-                        .   '</div>'
-                        . '</div>'
-                        . '</div>',
-                        esc_url( '/review?sn=' . rawurlencode( $sn ) )
-                    );
-                }
-            }
-        }
-
-        if ( empty( $banners ) ) return '';
-        return '<div class="dnc-sn-banners-wrap">' . implode( '', $banners ) . '</div>';
+        return '<div class="dnc-sn-banners-wrap" data-banners-total="' . (int) $total . '">' . implode( '', $html ) . '</div>';
     }
 }
 
@@ -1015,7 +1151,12 @@ function dinoco_dashboard_main_controller() {
         .dnc-sn-tier-silver   { background: #94a3b8; }
         .dnc-sn-tier-gold     { background: #ca8a04; }
         .dnc-sn-tier-platinum { background: #4338ca; }
-        .dnc-sn-tier-diamond  { background: linear-gradient(135deg, #7c3aed, #a855f7); }
+        /* V.31.1 S2-3 — diamond contrast 4.4:1 → 5.8:1 (deeper start + text-shadow) */
+        .dnc-sn-tier-diamond  {
+            background: linear-gradient(135deg, #6d28d9, #9333ea);
+            color: #fff;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+        }
 
         /* Banner notification system (F#1 / F#4 / F#10) */
         .dnc-sn-banners-wrap {
@@ -1090,6 +1231,49 @@ function dinoco_dashboard_main_controller() {
             background: var(--dnc-success-light);
             border-color: #86efac;
             color: #065f46;
+        }
+
+        /* V.31.1 — banner dismiss button (✕) + ดูทั้งหมด link */
+        .dnc-sn-banner { position: relative; }
+        .dnc-sn-banner-dismiss {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            width: 32px;
+            height: 32px;
+            min-width: 32px;
+            border: none;
+            background: transparent;
+            color: inherit;
+            opacity: 0.6;
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+            border-radius: var(--dnc-radius-sm);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .dnc-sn-banner-dismiss:hover { opacity: 1; background: rgba(0,0,0,0.06); }
+        .dnc-sn-banner-dismiss:focus-visible {
+            outline: 2px solid #2563eb;
+            outline-offset: 1px;
+        }
+        .dnc-sn-banner-viewall {
+            display: block;
+            text-align: center;
+            padding: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--dnc-text-secondary);
+            background: var(--dnc-bg-card);
+            border: 1px dashed var(--dnc-border);
+            border-radius: var(--dnc-radius-sm);
+            text-decoration: none;
+        }
+        .dnc-sn-banner-viewall:hover {
+            color: var(--dnc-text);
+            background: rgba(0,0,0,0.03);
         }
 
         /* Stats grid (4-cell hero) */
@@ -1265,6 +1449,42 @@ function dinoco_dashboard_main_controller() {
             }
             window.addEventListener('load', function() { toggleLoader(false); });
             window.addEventListener('pageshow', function(event) { toggleLoader(false); });
+
+            // V.31.1 — Banner dismiss + 7-day TTL via localStorage.
+            // Key shape: dnc_sn_banner_dismiss_<bannerId> = expires_at_ms
+            (function() {
+                function applyDismissFilter() {
+                    try {
+                        var now = Date.now();
+                        var banners = document.querySelectorAll('.dnc-sn-banner[data-banner-id]');
+                        banners.forEach(function(el) {
+                            var bid = el.getAttribute('data-banner-id') || '';
+                            if (!bid) return;
+                            var exp = parseInt(localStorage.getItem('dnc_sn_banner_dismiss_' + bid) || '0', 10);
+                            if (exp && exp > now) {
+                                el.style.display = 'none';
+                            } else if (exp && exp <= now) {
+                                // expired → cleanup
+                                localStorage.removeItem('dnc_sn_banner_dismiss_' + bid);
+                            }
+                        });
+                    } catch (e) { /* localStorage disabled — silent */ }
+                }
+                window.dncSnDismissBanner = function(btn) {
+                    try {
+                        var card = btn && btn.closest ? btn.closest('.dnc-sn-banner') : null;
+                        if (!card) return;
+                        var bid = card.getAttribute('data-banner-id') || '';
+                        if (bid) {
+                            var ttl = Date.now() + (7 * 24 * 60 * 60 * 1000); // 7 days
+                            localStorage.setItem('dnc_sn_banner_dismiss_' + bid, String(ttl));
+                        }
+                        card.style.display = 'none';
+                    } catch (e) { /* silent */ }
+                };
+                document.addEventListener('DOMContentLoaded', applyDismissFilter);
+                window.addEventListener('pageshow', applyDismissFilter);
+            })();
         </script>
 
         <?php

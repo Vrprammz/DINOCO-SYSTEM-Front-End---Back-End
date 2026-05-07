@@ -1,6 +1,7 @@
 /**
  * File: [System] DINOCO MCP Bridge
  * Description: REST API Bridge สำหรับ OpenClaw Mini CRM ดึงข้อมูลจาก WordPress
+ * Version: V.3.0 (2026-05-07) — Audit: /sn-lookup transient cache 60s + invalidation hook on dinoco_sn_pool_status_changed
  * Version: V.2.9 (2026-05-04) — Phase 2 W6.3 — NEW GET /sn-lookup (S/N system bridge, PII-stripped, function_exists guarded)
  * Version: V.2.8 (2026-04-30) — Round 35 batch 13: Idempotency-Key support on 5 OpenClaw retry-prone MCP endpoints (32.7% milestone):
  *   • POST /dinoco-mcp/v1/dashboard-inject-metrics — body hash {platform, date, metrics_signature}.
@@ -2602,6 +2603,19 @@ if ( ! function_exists( 'dinoco_mcp_sn_lookup' ) ) {
             ), 400 );
         }
 
+        // V.3.0 — Layer 1 wp_cache (Redis-aware) + Layer 2 transient (60s TTL).
+        // Invalidated by dinoco_sn_pool_status_changed listener below.
+        $cache_key = 'mcp_sn_lookup_' . md5( $sn );
+        $cached = wp_cache_get( $cache_key, 'dinoco_mcp' );
+        if ( $cached === false ) {
+            $cached = get_transient( $cache_key );
+        }
+        if ( is_array( $cached ) && isset( $cached['__http_status'] ) ) {
+            $status = (int) $cached['__http_status'];
+            unset( $cached['__http_status'] );
+            return new WP_REST_Response( $cached, $status );
+        }
+
         // Defensive: S/N system may not yet be synced
         if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
             return new WP_REST_Response( array(
@@ -2664,7 +2678,7 @@ if ( ! function_exists( 'dinoco_mcp_sn_lookup' ) ) {
         $public_statuses = array( 'in_pool', 'allocated_to_order', 'shipped', 'registered', 'claimed', 'replaced', 'transferred' );
         $is_public = in_array( $row['status'], $public_statuses, true );
 
-        return new WP_REST_Response( array(
+        $payload = array(
             'success'         => true,
             'found'           => true,
             'sn'              => $sn,
@@ -2680,6 +2694,38 @@ if ( ! function_exists( 'dinoco_mcp_sn_lookup' ) ) {
             // Anti-hallucination guard: AI ห้าม cache หรือ guess — ใช้ tool result เท่านั้น
             'cache_ttl'       => 60,
             'note'            => $is_public ? null : 'S/N status restricted — escalate to admin',
-        ), 200 );
+        );
+
+        // V.3.0 — write through both cache layers (60s TTL per audit recommendation).
+        // status code embedded for replay; stripped on read above.
+        $cache_payload = $payload;
+        $cache_payload['__http_status'] = 200;
+        wp_cache_set( $cache_key, $cache_payload, 'dinoco_mcp', 60 );
+        set_transient( $cache_key, $cache_payload, 60 );
+
+        return new WP_REST_Response( $payload, 200 );
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * V.3.0 — MCP /sn-lookup cache invalidation listener
+ *
+ * Listens for dinoco_sn_pool_status_changed (fired by REST API V.0.28+ on
+ * void/swap/recall/activate/stolen-report). When a plate state changes,
+ * delete both layer-1 (object cache) and layer-2 (transient) entries so
+ * next chatbot poll returns fresh data.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_mcp_invalidate_sn_cache' ) ) {
+    function dinoco_mcp_invalidate_sn_cache( $sn ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) return;
+        $key = 'mcp_sn_lookup_' . md5( $sn );
+        delete_transient( $key );
+        wp_cache_delete( $key, 'dinoco_mcp' );
+    }
+}
+
+if ( ! has_action( 'dinoco_sn_pool_status_changed', 'dinoco_mcp_invalidate_sn_cache' ) ) {
+    add_action( 'dinoco_sn_pool_status_changed', 'dinoco_mcp_invalidate_sn_cache', 10, 1 );
 }

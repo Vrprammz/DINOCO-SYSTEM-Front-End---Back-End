@@ -1,5 +1,11 @@
 /**
  * dinoco-cache.js — WordPress data cache with stale fallback
+ * V.1.1 — Phase 4 W14.5 Round 2 (chatbot-rules.md §15.10 / §15.14.4):
+ *         + snLookupCache Map (per-S/N TTL 60s) for /sn-lookup responses
+ *         + invalidateSnCache(sn) / invalidateAllSnCache() — wired by WP webhook hook
+ *           (POST /webhook/sn-event) when sn_pool status flips (activate/swap/void/recall)
+ *         + cacheSnLookup() / getCachedSnLookup() helper API
+ *         Backward compat: existing wpCache/callDinocoAPI untouched.
  * V.1.0 — Extracted from index.js monolith
  */
 
@@ -50,6 +56,66 @@ function invalidateWPCache(key) {
   if (key === "all") { Object.keys(wpCache).forEach((k) => { wpCache[k].expires = 0; }); }
   else if (wpCache[key]) { wpCache[key].expires = 0; }
   console.log(`[Cache] Invalidated: ${key}`);
+}
+
+// ============================================================================
+// V.1.1 — S/N Lookup Cache (chatbot-rules.md §15.10 / §15.14.4)
+// ============================================================================
+// Per-S/N short-lived cache (TTL 60s) for /sn-lookup responses.
+// AI must never trust this cache beyond 60s — backend (sn_pool) is source of truth.
+// Invalidated by WP webhook /webhook/sn-event when sn_pool status flips.
+const snLookupCache = new Map(); // key = normalized SN (uppercase), value = { data, expires }
+const SN_LOOKUP_TTL = 60 * 1000; // 60 seconds per §15.2 cache-stale recovery rule
+const SN_CACHE_MAX_SIZE = 500;   // soft cap — LRU-ish eviction below
+
+function _normalizeSnKey(sn) {
+  if (!sn || typeof sn !== "string") return "";
+  return sn.toUpperCase().replace(/[\s-]+/g, "");
+}
+
+function getCachedSnLookup(sn) {
+  const key = _normalizeSnKey(sn);
+  if (!key) return null;
+  const entry = snLookupCache.get(key);
+  if (!entry) return null;
+  if (Date.now() >= entry.expires) {
+    snLookupCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function cacheSnLookup(sn, data) {
+  const key = _normalizeSnKey(sn);
+  if (!key || !data) return;
+  // Soft eviction — drop oldest 50 entries when cap hit (Map preserves insertion order)
+  if (snLookupCache.size >= SN_CACHE_MAX_SIZE) {
+    const drop = Math.min(50, snLookupCache.size);
+    let i = 0;
+    for (const k of snLookupCache.keys()) {
+      if (i++ >= drop) break;
+      snLookupCache.delete(k);
+    }
+  }
+  snLookupCache.set(key, { data, expires: Date.now() + SN_LOOKUP_TTL });
+}
+
+function invalidateSnCache(sn) {
+  const key = _normalizeSnKey(sn);
+  if (!key) return false;
+  const had = snLookupCache.delete(key);
+  // Indirect bust: kb cache may reference S/N status (e.g. "เพลทนี้ active แล้ว" → kb FAQ)
+  if (wpCache.kb) wpCache.kb.expires = 0;
+  console.log(`[Cache] SN invalidated: ${key} (existed=${had})`);
+  return had;
+}
+
+function invalidateAllSnCache() {
+  const count = snLookupCache.size;
+  snLookupCache.clear();
+  if (wpCache.kb) wpCache.kb.expires = 0;
+  console.log(`[Cache] SN cache fully invalidated (${count} entries dropped)`);
+  return count;
 }
 
 // Circuit breaker state (shared in-process)
@@ -139,4 +205,11 @@ module.exports = {
   preloadWPCache,
   invalidateWPCache,
   callDinocoAPI,
+  // V.1.1 — Round 2 §15.14.4 S/N cache API
+  snLookupCache,
+  SN_LOOKUP_TTL,
+  getCachedSnLookup,
+  cacheSnLookup,
+  invalidateSnCache,
+  invalidateAllSnCache,
 };

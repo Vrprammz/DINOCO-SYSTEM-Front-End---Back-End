@@ -60,6 +60,42 @@
 - [ ] **Observability deployed** — `dinoco_obs_capture` ทุก sensitive op + Sentry DSN ตั้งใน Phase 0 W1 ✅
 - [ ] **Audit retention cron registered** — `dinoco_sn_audit_retention_cron` (3y/5y split) ✅
 
+### E. KPI baseline + LINE quota + UAT (NEW — added 2026-05-07)
+
+- [ ] **KPI baseline snapshot recorded** (per `13-kpi-baseline-measurement-plan.md`)
+  - 5 KPIs: repurchase rate / claim rate / activation rate / cross-sell / NPS
+  - T-0 snapshot saved to `docs/sn-system/kpi-snapshots/2026-XX-baseline.csv`
+- [ ] **LINE quota stress test passed** (per `17-line-quota-stress-test-plan.md`)
+  - Phase A internal: 5,000 push in < 4 min, 0 errors observed
+  - Push queue + worker cron deployed
+  - Circuit breaker tested
+- [ ] **Q15 Role Matrix UAT signed** (per `19-q15-role-matrix-uat-plan.md`)
+  - 10 UAT scenarios passed including 4-eyes ฿5K threshold
+  - บอส executed UI test without help (S1)
+- [ ] **Q20 Manual Refund SOP finalized** (per `15-q20-manual-refund-sop.md`)
+  - Customer Service intake script approved
+  - Backend admin form deployed
+  - 4-eyes refund flow tested in staging
+- [ ] **Q12 Skip-pilot risk acceptance signed** (per `14-q12-skip-pilot-risk-acceptance.md`)
+  - 5 mitigation layers in place
+  - 7 pre-flip conditions confirmed
+  - บอส signed-off acceptance
+- [ ] **F#8 Legal workstream kicked off** (per `16-f8-legal-workstream-prephase1.md`)
+  - External counsel engagement letter signed
+  - 6 deliverables on track for T+12 wk
+  - VAT registration in progress
+- [ ] **F#16 Forecast Tier 3 fallback verified** (per `18-f16-forecast-fallback-design.md`)
+  - Auto-tier selection logic deployed
+  - Tier 3 proxy uses B2F + Inventory data
+- [ ] **F#9 LTV Privacy Gate Tier model deployed** (per `20-f9-ltv-privacy-gate-spec.md`)
+  - 3-tier permission model (A/B/C) backend-enforced
+  - 4-eyes export gate for > 100 rows
+  - Audit logs every access (5y retention)
+- [ ] **REG-080..089 PHPUnit suite green** (10 new test files Phase 2 W7 prep)
+- [ ] **Phase 2 W7 atomic deploy runbook reviewed** (per `12-phase2-w7-deploy-runbook.md`)
+  - 5-step deploy practiced on staging
+  - Rollback drill < 30 sec confirmed
+
 ---
 
 ## ✅ F2 — Block legacy serial_code edits

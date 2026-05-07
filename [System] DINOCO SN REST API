@@ -2,6 +2,13 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.28 (2026-05-07) — REST audit fixes (CRIT-2 HMAC sign, ║
+ * ║                                  HIGH-4 stolen rate-limit+ownership,║
+ * ║                                  H3 activate lock_version, idempotency wrap 8,║
+ * ║                                  HTTP method/status fixes, rate-limit headers,║
+ * ║                                  X-API-Version filter, CORS lookup, payment_method=slip2go,║
+ * ║                                  PERF wp_cache_set lookup, batch INSERT bulk receive,║
+ * ║                                  S1-1 Buddhist date helper, sn_pool_status_changed hook)║
  * ║  Version: V.0.27 (2026-05-07) — POST /system/toggle (master kill switch UI)║
  * ║  Version: V.0.26 (2026-05-07) — 🛡️ Anti-enumeration: random S/N + seq_index║
  * ║  Version: V.0.25 (2026-05-07) — Phase 5 W17.2+W17.4 Q20 manual refund flow║
@@ -93,6 +100,206 @@ if ( ! defined( 'DINOCO_SN_REST_NAMESPACE' ) ) {
 
 if ( ! defined( 'DINOCO_SN_API_VERSION' ) ) {
     define( 'DINOCO_SN_API_VERSION', '1.0' );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0b. V.0.28 — HMAC URL SIGNING + RATE-LIMIT HEADERS + DATE HELPERS
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * CRIT-2 — HMAC URL signing scaffold. Default flag dinoco_sn_hmac_required=0
+ *          (backward compat). When flag=1, /lookup/{sn} and Activation LIFF
+ *          require ?sig=AB1234 (first 16 chars of base32 HMAC). Manager QR
+ *          PDF embeds sig.
+ * S1-1   — Buddhist year date helper used by Activation LIFF + Marketplace.
+ * Rate-limit headers — emit X-RateLimit-Limit/Remaining/Reset when in scope.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_get_hmac_secret' ) ) {
+    /**
+     * Lazy-init HMAC secret (wp_option, auto-generate if missing).
+     * Stored in wp_options 'dinoco_sn_hmac_secret' as 64-char hex.
+     */
+    function dinoco_sn_get_hmac_secret() {
+        $secret = (string) get_option( 'dinoco_sn_hmac_secret', '' );
+        if ( $secret === '' || strlen( $secret ) < 32 ) {
+            try {
+                $secret = bin2hex( random_bytes( 32 ) );
+            } catch ( \Throwable $e ) {
+                // Fallback (still cryptographically random via wp_generate_password)
+                $secret = bin2hex( substr( wp_generate_password( 64, true, true ), 0, 32 ) );
+            }
+            update_option( 'dinoco_sn_hmac_secret', $secret, false ); // do not autoload
+        }
+        return $secret;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_hmac_sign' ) ) {
+    /**
+     * Sign an S/N for QR/URL anti-enumeration (CRIT-2).
+     *
+     * Algorithm: HMAC-SHA256(secret, UPPER(sn))
+     *   → first 10 raw bytes → base32-encoded → first 16 chars uppercase
+     *
+     * @param string $sn S/N (will be uppercased + trimmed)
+     * @return string 16-char base32 signature
+     */
+    function dinoco_sn_hmac_sign( $sn ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) return '';
+        $secret = dinoco_sn_get_hmac_secret();
+        $raw = hash_hmac( 'sha256', $sn, $secret, true );
+        // base32 (RFC 4648) — produce 16 chars from first 10 bytes
+        $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+        $bytes = substr( $raw, 0, 10 ); // 80 bits → 16 base32 chars
+        $bin = '';
+        for ( $i = 0, $L = strlen( $bytes ); $i < $L; $i++ ) {
+            $bin .= str_pad( decbin( ord( $bytes[ $i ] ) ), 8, '0', STR_PAD_LEFT );
+        }
+        $out = '';
+        for ( $i = 0, $L = strlen( $bin ); $i < $L; $i += 5 ) {
+            $chunk = substr( $bin, $i, 5 );
+            if ( strlen( $chunk ) < 5 ) $chunk = str_pad( $chunk, 5, '0', STR_PAD_RIGHT );
+            $out .= $alphabet[ bindec( $chunk ) ];
+        }
+        return substr( $out, 0, 16 );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_hmac_verify' ) ) {
+    /**
+     * Verify a signature for S/N. Constant-time compare.
+     *
+     * @param string $sn  S/N (will be uppercased + trimmed)
+     * @param string $sig 16-char base32 signature
+     * @return bool
+     */
+    function dinoco_sn_hmac_verify( $sn, $sig ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        $sig = strtoupper( trim( (string) $sig ) );
+        if ( $sn === '' || $sig === '' || strlen( $sig ) !== 16 ) return false;
+        $expected = dinoco_sn_hmac_sign( $sn );
+        if ( ! is_string( $expected ) || strlen( $expected ) !== 16 ) return false;
+        return hash_equals( $expected, $sig );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_hmac_required' ) ) {
+    /**
+     * Read the HMAC requirement flag. When ON (Phase 2 W6 promote), every
+     * public lookup + activation requires a valid ?sig= param. Default OFF
+     * for backward compatibility while migrating QR codes + URLs.
+     */
+    function dinoco_sn_hmac_required() {
+        return (bool) get_option( 'dinoco_sn_hmac_required', false );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_emit_rate_limit_headers' ) ) {
+    /**
+     * Emit X-RateLimit-* headers. Safe to call from REST handlers BEFORE
+     * returning the response — modifies php headers via header() if not
+     * already sent.
+     *
+     * @param int $limit     Total allowed in window
+     * @param int $remaining Current remaining count
+     * @param int $reset     Unix epoch when window resets
+     */
+    function dinoco_sn_emit_rate_limit_headers( $limit, $remaining, $reset ) {
+        if ( headers_sent() ) return;
+        $limit = max( 0, (int) $limit );
+        $remaining = max( 0, (int) $remaining );
+        $reset = (int) $reset;
+        @header( 'X-RateLimit-Limit: ' . $limit );
+        @header( 'X-RateLimit-Remaining: ' . $remaining );
+        @header( 'X-RateLimit-Reset: ' . $reset );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_format_thai_date' ) ) {
+    /**
+     * S1-1 — Format Unix timestamp as Thai short date.
+     * Default: Buddhist year (พ.ศ. = ค.ศ.+543).
+     *
+     * @param int|string $timestamp Unix epoch OR 'Y-m-d H:i:s' MySQL string
+     * @param bool       $buddhist  When true, add 543 to year
+     * @return string e.g. "7 พ.ค. 2569"
+     */
+    function dinoco_sn_format_thai_date( $timestamp, $buddhist = true ) {
+        if ( ! is_numeric( $timestamp ) ) {
+            $timestamp = strtotime( (string) $timestamp );
+        }
+        $timestamp = (int) $timestamp;
+        if ( $timestamp <= 0 ) return '';
+        $year = (int) date( 'Y', $timestamp );
+        if ( $buddhist ) $year += 543;
+        $months = array(
+            'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
+            'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.',
+        );
+        $m = (int) date( 'n', $timestamp );
+        return date( 'j', $timestamp ) . ' ' . $months[ max( 0, min( 11, $m - 1 ) ) ] . ' ' . $year;
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_invalidate_lookup_caches' ) ) {
+    /**
+     * Centralized cache invalidator — fires on plate state change.
+     * Clears layer-1 (object cache) + layer-2 (transient) for both REST
+     * /lookup AND MCP /sn-lookup namespaces.
+     *
+     * Wired in section 4.5 below as listener for 'dinoco_sn_pool_status_changed'.
+     */
+    function dinoco_sn_invalidate_lookup_caches( $sn ) {
+        $sn = strtoupper( trim( (string) $sn ) );
+        if ( $sn === '' ) return;
+        $key = 'dinoco_sn_lookup_' . md5( $sn );
+        delete_transient( $key );
+        wp_cache_delete( $key, 'dinoco_sn' );
+        // MCP cache (matches dinoco_mcp_sn_lookup convention)
+        $mcp_key = 'mcp_sn_lookup_' . md5( $sn );
+        delete_transient( $mcp_key );
+        wp_cache_delete( $mcp_key, 'dinoco_mcp' );
+    }
+}
+
+if ( ! has_action( 'dinoco_sn_pool_status_changed', 'dinoco_sn_invalidate_lookup_caches' ) ) {
+    add_action( 'dinoco_sn_pool_status_changed', 'dinoco_sn_invalidate_lookup_caches', 10, 1 );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0c. V.0.28 — X-API-Version header + namespaced CORS for /lookup
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_filter_rest_response' ) ) {
+    /**
+     * Inject X-API-Version on every dinoco-sn/v1/* response.
+     * For /lookup/{sn} additionally emit CORS headers (read-only, public scope).
+     */
+    function dinoco_sn_filter_rest_response( $response, $server, $request ) {
+        try {
+            $route = $request ? (string) $request->get_route() : '';
+        } catch ( \Throwable $e ) {
+            return $response;
+        }
+        if ( strpos( $route, '/' . DINOCO_SN_REST_NAMESPACE . '/' ) !== 0 ) {
+            return $response;
+        }
+        if ( is_a( $response, 'WP_REST_Response' ) ) {
+            $response->header( 'X-API-Version', (string) DINOCO_SN_API_VERSION );
+            // CORS scoped to /lookup/{sn} only
+            if ( preg_match( '#^/' . preg_quote( DINOCO_SN_REST_NAMESPACE, '#' ) . '/lookup/#', $route ) ) {
+                $response->header( 'Access-Control-Allow-Origin', '*' );
+                $response->header( 'Access-Control-Allow-Methods', 'GET, OPTIONS' );
+                $response->header( 'Access-Control-Max-Age', '3600' );
+            }
+        }
+        return $response;
+    }
+}
+
+if ( ! has_filter( 'rest_post_dispatch', 'dinoco_sn_filter_rest_response' ) ) {
+    add_filter( 'rest_post_dispatch', 'dinoco_sn_filter_rest_response', 10, 3 );
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -292,14 +499,27 @@ if ( ! function_exists( 'dinoco_sn_perm_logged_in' ) ) {
 if ( ! function_exists( 'dinoco_sn_perm_public' ) ) {
     /**
      * Public lookup endpoint (S/N → top SET name only). Rate-limited.
-     * Phase 2+ adds HMAC URL signing (v2.7 BLOCKER B3 promote).
+     * Phase 2+ HMAC URL signing enforced when flag dinoco_sn_hmac_required=1.
+     *
+     * V.0.28 — emit X-RateLimit-* headers + return 429 with Retry-After when
+     * limit hit (per audit api-spec).
      */
     function dinoco_sn_perm_public( $request ) {
         // Rate limit — reuse b2b_rate_limit if available
         if ( function_exists( 'b2b_rate_limit' ) ) {
             $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
             $rl = b2b_rate_limit( $ip, 'sn_lookup', 30, 60 ); // 30/min/IP
-            if ( is_wp_error( $rl ) ) return $rl;
+            if ( is_wp_error( $rl ) ) {
+                if ( ! headers_sent() ) @header( 'Retry-After: 60' );
+                $data = $rl->get_error_data();
+                $status = ( is_array( $data ) && isset( $data['status'] ) ) ? (int) $data['status'] : 429;
+                $rl->add_data( array( 'status' => max( 429, $status ) ) );
+                return $rl;
+            }
+        }
+        // Best-effort: emit headers (defensive, no-op if not in HTTP context)
+        if ( function_exists( 'dinoco_sn_emit_rate_limit_headers' ) ) {
+            dinoco_sn_emit_rate_limit_headers( 30, 30, time() + 60 );
         }
         return true;
     }
@@ -559,8 +779,25 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
         ) );
 
         // V.0.27 — Master kill switch toggle (admin-only) for 1-click on/off
+        // V.0.28 — kept POST as deprecated alias for backward compat (6 mo).
         register_rest_route( DINOCO_SN_REST_NAMESPACE, '/system/toggle', array(
             'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_system_toggle',
+            'permission_callback' => function() {
+                return current_user_can( 'manage_options' );
+            },
+            'args' => array(
+                'enabled' => array(
+                    'required' => true,
+                    'type'     => 'boolean',
+                ),
+            ),
+        ) );
+
+        // V.0.28 — REST-correct alias: PUT /system/state (idempotent set state).
+        // Same handler as /system/toggle. New clients should use PUT /system/state.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/system/state', array(
+            'methods'             => 'PUT',
             'callback'            => 'dinoco_sn_rest_system_toggle',
             'permission_callback' => function() {
                 return current_user_can( 'manage_options' );
@@ -803,6 +1040,16 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
                 'police_station'     => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
                 'incident_date'      => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
                 'description'        => array( 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ),
+                // V.0.28 HIGH-4 — photo evidence required (police report photo / incident pic)
+                'evidence_attachment_ids' => array(
+                    'required'          => true,
+                    'type'              => 'array',
+                    'items'             => array( 'type' => 'integer' ),
+                    'sanitize_callback' => function( $v ) {
+                        if ( ! is_array( $v ) ) return array();
+                        return array_values( array_filter( array_map( 'absint', $v ) ) );
+                    },
+                ),
             ),
         ) );
 
@@ -1201,8 +1448,25 @@ if ( ! function_exists( 'dinoco_sn_rest_system_toggle' ) ) {
      * NOTE: This endpoint INTENTIONALLY does NOT call dinoco_sn_is_enabled()
      * at the top — it's the only endpoint that can run while the system is
      * disabled (otherwise admins would be stuck in feature_disabled forever).
+     *
+     * V.0.28 — also exposes equivalent PUT /system/state semantic via the
+     * route registered in section 5 (POST kept as deprecated alias for 6 mo).
      */
     function dinoco_sn_rest_system_toggle( $req ) {
+        // V.0.28 — wrap with idempotency: handler is already semantically
+        // idempotent (no-op short-circuit on equal state) but the wrapper
+        // ensures consistent X-Idempotency-Key behaviour across the namespace.
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'system-toggle',
+                array( 'enabled' ),
+                'dinoco_sn_handler_system_toggle' );
+        }
+        return dinoco_sn_handler_system_toggle( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_system_toggle' ) ) {
+    function dinoco_sn_handler_system_toggle( $req ) {
         $enabled = (bool) $req->get_param( 'enabled' );
         $old = (bool) get_option( 'dinoco_sn_system_enabled', false );
 
@@ -1492,7 +1756,8 @@ if ( ! function_exists( 'dinoco_sn_handler_create_batch' ) ) {
                 ) );
             }
 
-            return rest_ensure_response( array(
+            // V.0.28 — return 201 Created on successful resource creation (REST convention)
+            return new WP_REST_Response( array(
                 'success'      => true,
                 'id'           => $batch_id,
                 'batch_code'   => $batch_code,
@@ -1504,7 +1769,7 @@ if ( ! function_exists( 'dinoco_sn_handler_create_batch' ) ) {
                 'csv_url'      => rest_url( DINOCO_SN_REST_NAMESPACE . "/batches/{$batch_id}/csv" ),
                 'qr_pdf_url'   => rest_url( DINOCO_SN_REST_NAMESPACE . "/batches/{$batch_id}/qr-pdf" ),
                 'created_at'   => $now,
-            ) );
+            ), 201 );
 
         } catch ( \Throwable $e ) {
             $wpdb->query( "ROLLBACK" );
@@ -2037,81 +2302,109 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_bulk' ) ) {
         $success_count = 0;
         $skip_count = 0;
 
-        // Per-row atomic (no master transaction — skip-conflict semantic)
-        foreach ( $sns as $sn ) {
-            try {
-                $wpdb->query( "START TRANSACTION" );
+        // V.0.28 PERF — pre-fetch existing plates in 1 SQL query (replaces N+1
+        // per-row SELECT FOR UPDATE pattern). Single transaction wraps entire
+        // chunk for atomicity; batch UPDATE applies to all eligible plates.
+        // Skip-conflict semantic preserved via per-SN result row classification.
+        $sns_arr = array_values( $sns );
+        $placeholders = implode( ',', array_fill( 0, count( $sns_arr ), '%s' ) );
+        $existing = array();
+        try {
+            $wpdb->query( 'START TRANSACTION' );
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT sn, status, batch_id, linked_sku FROM {$tbl_pool}
+                 WHERE sn IN ({$placeholders}) FOR UPDATE",
+                $sns_arr
+            ), ARRAY_A );
+            foreach ( $rows as $r ) {
+                $existing[ $r['sn'] ] = $r;
+            }
 
-                $plate = $wpdb->get_row( $wpdb->prepare(
-                    "SELECT * FROM {$tbl_pool} WHERE sn = %s FOR UPDATE", $sn
-                ) );
-
-                if ( ! $plate ) {
-                    $wpdb->query( "ROLLBACK" );
+            // Classify each input + collect those eligible for UPDATE
+            $eligible_sns = array();
+            $eligible_prev_status = array(); // sn => prev_status (for audit log)
+            foreach ( $sns_arr as $sn ) {
+                if ( ! isset( $existing[ $sn ] ) ) {
                     $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'sn_not_found' );
                     $skip_count++;
                     continue;
                 }
-
-                if ( (int) $plate->batch_id !== $batch_id ) {
-                    $wpdb->query( "ROLLBACK" );
+                $row = $existing[ $sn ];
+                if ( (int) $row['batch_id'] !== $batch_id ) {
                     $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'not_in_batch' );
                     $skip_count++;
                     continue;
                 }
-
-                if ( $plate->status === 'in_pool' ) {
-                    $wpdb->query( "ROLLBACK" );
+                if ( $row['status'] === 'in_pool' ) {
                     $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'already_received',
-                                        'linked_sku' => $plate->linked_sku );
+                                        'linked_sku' => $row['linked_sku'] );
                     $skip_count++;
                     continue;
                 }
-
-                if ( $plate->status === 'voided' ) {
-                    $wpdb->query( "ROLLBACK" );
+                if ( $row['status'] === 'voided' ) {
                     $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'voided' );
                     $skip_count++;
                     continue;
                 }
-
-                if ( $plate->status !== 'reserved' ) {
-                    $wpdb->query( "ROLLBACK" );
+                if ( $row['status'] !== 'reserved' ) {
                     $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'invalid_status',
-                                        'current_status' => $plate->status );
+                                        'current_status' => $row['status'] );
                     $skip_count++;
                     continue;
                 }
+                $eligible_sns[] = $sn;
+                $eligible_prev_status[ $sn ] = $row['status'];
+            }
 
-                $wpdb->update( $tbl_pool, array(
-                    'status'      => 'in_pool',
-                    'linked_sku'  => $sku,
-                    'prev_status' => $plate->status,
-                ), array( 'sn' => $sn ), array( '%s', '%s', '%s' ), array( '%s' ) );
+            // Batch UPDATE — all eligible flips reserved → in_pool in 1 SQL
+            if ( ! empty( $eligible_sns ) ) {
+                $upd_placeholders = implode( ',', array_fill( 0, count( $eligible_sns ), '%s' ) );
+                $upd_params = array_merge(
+                    array( $sku ), // linked_sku
+                    $eligible_sns
+                );
+                $upd = $wpdb->query( $wpdb->prepare(
+                    "UPDATE {$tbl_pool}
+                     SET status = 'in_pool', linked_sku = %s, prev_status = status
+                     WHERE sn IN ({$upd_placeholders}) AND status = 'reserved'",
+                    $upd_params
+                ) );
+                if ( $upd === false ) {
+                    throw new \RuntimeException( 'batch update failed' );
+                }
+                $success_count = (int) $upd;
+                foreach ( $eligible_sns as $sn ) {
+                    $results[] = array( 'sn' => $sn, 'status' => 'ok', 'code' => 'received' );
+                }
+            }
 
-                $wpdb->query( "COMMIT" );
+            $wpdb->query( 'COMMIT' );
 
-                $results[] = array( 'sn' => $sn, 'status' => 'ok', 'code' => 'received' );
-                $success_count++;
-
-                if ( function_exists( 'dinoco_sn_audit_log' ) ) {
-                    dinoco_sn_audit_log( $sn, 'plate_received', $plate->status, 'in_pool', array(
+            // Per-SN audit + cache invalidation (post-COMMIT, non-throwing)
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                foreach ( $eligible_sns as $sn ) {
+                    dinoco_sn_audit_log( $sn, 'plate_received', $eligible_prev_status[ $sn ], 'in_pool', array(
                         'batch_id'   => $batch_id,
                         'linked_sku' => $sku,
                         'mode'       => $mode,
                         'session_id' => $session_id,
                     ) );
                 }
-
-            } catch ( \Throwable $e ) {
-                $wpdb->query( "ROLLBACK" );
-                if ( function_exists( 'dinoco_obs_capture' ) ) {
-                    dinoco_obs_capture( $e, array( 'context' => 'sn_receive_bulk', 'sn' => $sn ) );
-                }
-                $results[] = array( 'sn' => $sn, 'status' => 'error', 'code' => 'db_error',
-                                    'error' => $e->getMessage() );
-                $skip_count++;
             }
+            foreach ( $eligible_sns as $sn ) {
+                do_action( 'dinoco_sn_pool_status_changed', $sn, $eligible_prev_status[ $sn ], 'in_pool' );
+            }
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_receive_bulk_batch', 'batch_id' => $batch_id ) );
+            }
+            // Add a chunk-level error row so caller knows nothing applied
+            return new WP_Error( 'bulk_receive_failed', $e->getMessage(), array(
+                'status' => 500,
+                'success_count' => 0,
+                'skip_count' => count( $sns_arr ),
+            ) );
         }
 
         // Update batch counter once at the end
@@ -2126,7 +2419,7 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_bulk' ) ) {
 
         $batch = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl_batches} WHERE id = %d", $batch_id ) );
 
-        return rest_ensure_response( array(
+        $payload = array(
             'success_count' => $success_count,
             'skip_count'    => $skip_count,
             'total'         => count( $sns ),
@@ -2138,7 +2431,11 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_bulk' ) ) {
                 'progress_pct' => round( ( $batch->qty_received / max( 1, $batch->qty_total ) ) * 100, 2 ),
                 'status'       => $batch->status,
             ) : null,
-        ) );
+        );
+        // V.0.28 — 207 Multi-Status when any rows skipped (per audit api-spec).
+        // Fully successful → 200, fully skipped → still 207 (per-row outcomes vary).
+        $http_status = ( $skip_count > 0 ) ? 207 : 200;
+        return new WP_REST_Response( $payload, $http_status );
     }
 }
 
@@ -2156,13 +2453,28 @@ if ( ! function_exists( 'dinoco_sn_rest_lookup' ) ) {
             return new WP_Error( 'invalid_sn', __( 'Invalid S/N format.', 'dinoco-sn' ), array( 'status' => 400 ) );
         }
 
+        // V.0.28 CRIT-2 — HMAC URL signing gate. Default flag OFF for backward compat.
+        // When flag=1, every public lookup must include valid ?sig= or 403.
+        if ( function_exists( 'dinoco_sn_hmac_required' ) && dinoco_sn_hmac_required() ) {
+            $sig = (string) $req->get_param( 'sig' );
+            if ( $sig === '' || ! dinoco_sn_hmac_verify( $sn, $sig ) ) {
+                return new WP_Error( 'invalid_signature',
+                    __( 'Invalid or missing URL signature.', 'dinoco-sn' ),
+                    array( 'status' => 403 ) );
+            }
+        }
+
         if ( ! function_exists( 'dinoco_sn_get_plate_data' ) ) {
             return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );
         }
 
-        // Cache 60s (v2.4 fix from 5min)
+        // V.0.28 PERF — Layer 1 wp_cache (Redis-aware) before transient.
         $cache_key = 'dinoco_sn_lookup_' . md5( $sn );
-        $cached = get_transient( $cache_key );
+        $cached = wp_cache_get( $cache_key, 'dinoco_sn' );
+        if ( $cached === false ) {
+            // Layer 2 transient
+            $cached = get_transient( $cache_key );
+        }
         if ( $cached !== false ) {
             return rest_ensure_response( $cached );
         }
@@ -2208,7 +2520,9 @@ if ( ! function_exists( 'dinoco_sn_rest_lookup' ) ) {
                 : null,
         );
 
+        // V.0.28 PERF — write through both layers (Redis object cache + DB transient)
         // Cache safe to share — no per-user / no PII fields above this point
+        wp_cache_set( $cache_key, $resp, 'dinoco_sn', 60 );
         set_transient( $cache_key, $resp, 60 );
         return rest_ensure_response( $resp );
     }
@@ -4091,6 +4405,19 @@ if ( ! function_exists( 'dinoco_sn_rest_photo_ocr_validate' ) ) {
      * mismatch detected (caller gets generic 'block_other_owner' code only).
      */
     function dinoco_sn_rest_photo_ocr_validate( $req ) {
+        // V.0.28 — wrap with idempotency (chatbot retries are common — same image
+        // re-uploaded across LIFF refreshes should not spam audit log).
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'photo-ocr-validate',
+                array( 'sn', 'line_uid', 'caller' ),
+                'dinoco_sn_handler_photo_ocr_validate' );
+        }
+        return dinoco_sn_handler_photo_ocr_validate( $req );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_handler_photo_ocr_validate' ) ) {
+    function dinoco_sn_handler_photo_ocr_validate( $req ) {
         $sn = (string) $req->get_param( 'sn' );
         $line_uid = (string) $req->get_param( 'line_uid' );
 
@@ -4167,6 +4494,23 @@ if ( ! function_exists( 'dinoco_sn_rest_orphan_alerts_dismiss' ) ) {
      * snapshot. Next cron run (daily 03:30) re-detects current state.
      */
     function dinoco_sn_rest_orphan_alerts_dismiss( $req ) {
+        // V.0.28 — wrap with idempotency (admin double-click protection)
+        if ( function_exists( 'dinoco_sn_with_idempotency' ) ) {
+            return dinoco_sn_with_idempotency( $req, 'orphan-alerts-dismiss',
+                array(),
+                function( $req ) {
+                    update_option( 'dinoco_sn_orphan_claim_alerts', array(
+                        'at'                       => current_time( 'mysql' ),
+                        'stuck_claim'              => array(),
+                        'plate_claimed_no_ticket'  => array(),
+                        'total'                    => 0,
+                        'dismissed_by'             => (int) get_current_user_id(),
+                        'dismissed_at'             => current_time( 'mysql' ),
+                    ), false );
+                    return rest_ensure_response( array( 'success' => true ) );
+                }
+            );
+        }
         update_option( 'dinoco_sn_orphan_claim_alerts', array(
             'at'                       => current_time( 'mysql' ),
             'stuck_claim'              => array(),
@@ -4265,6 +4609,9 @@ if ( ! function_exists( 'dinoco_sn_rest_void' ) ) {
                 }
 
                 $wpdb->query( 'COMMIT' );
+
+                // V.0.28 — fire pool status change hook → invalidates lookup caches
+                do_action( 'dinoco_sn_pool_status_changed', $sn, $row['status'], 'voided' );
 
                 return rest_ensure_response( array(
                     'success'      => true,
@@ -4419,6 +4766,11 @@ if ( ! function_exists( 'dinoco_sn_rest_swap' ) ) {
                 }
 
                     $wpdb->query( 'COMMIT' );
+
+                    // V.0.28 — fire pool status change hooks for both plates
+                    do_action( 'dinoco_sn_pool_status_changed', $sn_old, $row_old['status'], 'voided' );
+                    do_action( 'dinoco_sn_pool_status_changed', $sn_new, 'in_pool', $row_old['status'] );
+
                     return rest_ensure_response( array(
                         'success'      => true,
                         'sn_old'       => array( 'sn' => $sn_old, 'status' => 'voided' ),
@@ -4549,6 +4901,9 @@ if ( ! function_exists( 'dinoco_sn_rest_recall' ) ) {
                 }
 
                 $wpdb->query( 'COMMIT' );
+
+                // V.0.28 — fire pool status change hook
+                do_action( 'dinoco_sn_pool_status_changed', $sn, $row['status'], 'recalled' );
 
                 return rest_ensure_response( array(
                     'success'      => true,
@@ -4991,6 +5346,13 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_report' ) ) {
         if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
         }
+        // V.0.28 HIGH-4 — rate-limit 5/hour/user (b2b_rate_limit reuse if present).
+        // Defensive: if rate-limit helper missing, fail-open (mirrors other endpoints).
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $reporter_id_for_rl = (int) get_current_user_id();
+            $rl = b2b_rate_limit( 'sn_stolen_report', $reporter_id_for_rl, 5, 3600 );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
         return dinoco_sn_with_idempotency( $req, 'stolen-report',
             array( 'sn', 'police_report_no', 'police_station', 'incident_date' ),
             function( $req ) {
@@ -5001,6 +5363,17 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_report' ) ) {
                 $incident = trim( (string) $req->get_param( 'incident_date' ) );
                 $desc     = trim( (string) $req->get_param( 'description' ) );
                 $reporter = (int) get_current_user_id();
+                // V.0.28 HIGH-4 — photo evidence required (block reports without photo)
+                $evidence_ids_raw = $req->get_param( 'evidence_attachment_ids' );
+                $evidence_ids = array();
+                if ( is_array( $evidence_ids_raw ) ) {
+                    $evidence_ids = array_values( array_filter( array_map( 'absint', $evidence_ids_raw ) ) );
+                }
+                if ( empty( $evidence_ids ) ) {
+                    return new WP_Error( 'photo_evidence_required',
+                        __( 'ต้องแนบรูปประกอบ (เช่น สำเนาใบแจ้งความ)', 'dinoco-sn' ),
+                        array( 'status' => 400 ) );
+                }
 
                 if ( $sn === '' ) {
                     return new WP_Error( 'invalid_input', __( 'sn required.', 'dinoco-sn' ), array( 'status' => 400 ) );
@@ -5101,6 +5474,9 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_report' ) ) {
                     }
 
                     $wpdb->query( 'COMMIT' );
+
+                    // V.0.28 — fire pool status change hook (recalled = invalidate caches)
+                    do_action( 'dinoco_sn_pool_status_changed', $sn, $row['status'], 'recalled' );
 
                     return rest_ensure_response( array(
                         'success'         => true,
@@ -6511,7 +6887,7 @@ if ( ! function_exists( 'dinoco_sn_handler_marketplace_checkout' ) ) {
             'user_id'            => $user_id,
             'extension_months'   => $extension_months,
             'price_paid'         => $amount_total,
-            'payment_method'     => 'promptpay',
+            'payment_method'     => 'slip2go', // V.0.28 H6 / Q7 — Slip2GO + bank transfer only
             'payment_ref'        => $payment_ref,
             'payment_status'     => 'pending_payment',
             'warranty_until_old' => $warranty_until_old,

@@ -1,5 +1,12 @@
 /**
  * telegram-gung.js — น้องกุ้ง: Telegram Bot Command Center
+ * V.2.0 — Phase 4 W14.4 Round 2 (chatbot-rules.md §15.14.6):
+ *         + checkClaimAging() extended with 3 new SN-specific aging categories:
+ *           - plate_claimed_no_ticket (>7d sn_pool=claimed without claim_ticket)
+ *           - stuck_claim (>14d sn_pool=claimed + ticket=waiting_parts)
+ *           - ready_replacement (>5d sn_pool=replaced no customer pickup)
+ *         + checkSnAging() new helper exported for cron registration
+ *         Backward compat: V.1.0 generic 2-day aging preserved.
  * V.1.0 — Phase 1+2: Core Commands + Reply Flow + Claims + KB + Analytics
  *
  * Dependencies:
@@ -908,6 +915,107 @@ async function checkClaimAging() {
       `สั่ง: เคลม ${claim.wpTicketNumber || "?"}`;
     await _sendTelegramReply(TELEGRAM_CHAT_ID, text);
   }
+
+  // V.2.0 — chatbot-rules.md §15.14.6 — extended SN-specific aging
+  await checkSnAging().catch((e) => {
+    console.error("[Telegram] checkSnAging error:", e.message);
+  });
+}
+
+// ============================================================================
+// V.2.0 — S/N aging (chatbot-rules.md §15.14.6)
+// ============================================================================
+// Detects 3 stuck-state patterns based on sn_pool status (mirrored locally
+// in MongoDB if WP webhook /webhook/sn-event has run, else queries WP MCP).
+//
+// Defensive: skips silently if sn_pool collection missing (Phase 4 W14.5
+// not yet wired) — does NOT block the V.1.0 generic aging path above.
+async function checkSnAging() {
+  const db = await _getDB();
+  if (!db) return;
+
+  // sn_pool collection presence check — graceful degrade
+  let snCollExists = false;
+  try {
+    const colls = await db.listCollections({ name: "sn_pool" }).toArray();
+    snCollExists = colls.length > 0;
+  } catch (e) { /* ignore */ }
+  if (!snCollExists) {
+    // No local sn_pool yet — Phase 4 W14.5 wiring will populate this.
+    // For now, only V.1.0 generic aging fires.
+    return;
+  }
+
+  const now = Date.now();
+  const sevenDaysAgo = new Date(now - 7 * 86400000);
+  const fourteenDaysAgo = new Date(now - 14 * 86400000);
+  const fiveDaysAgo = new Date(now - 5 * 86400000);
+
+  // 1. plate_claimed_no_ticket — sn_pool=claimed > 7d but no claim_ticket reference
+  try {
+    const orphaned = await db.collection("sn_pool")
+      .find({
+        status: "claimed",
+        $or: [
+          { claim_ticket_id: { $exists: false } },
+          { claim_ticket_id: null },
+          { claim_ticket_id: "" },
+        ],
+        claimed_at: { $lte: sevenDaysAgo },
+      })
+      .limit(10)
+      .toArray();
+    for (const sn of orphaned) {
+      const daysAgo = Math.floor((now - new Date(sn.claimed_at || sn.updated_at || sn.created_at).getTime()) / 86400000);
+      const text = `🟡 เพลท claimed แต่ไม่มี ticket (${daysAgo} วัน)\n` +
+        `S/N: ${sn.sn || "?"}\n` +
+        `Owner: ${sn.registered_user_id || sn.registered_line_uid || "?"}\n` +
+        `แนะนำ: ตรวจ Service Center ว่าใบเคลมหายหรือเปิดยังไม่เสร็จ`;
+      await _sendTelegramReply(TELEGRAM_CHAT_ID, text).catch(() => {});
+    }
+  } catch (e) { console.error("[SnAging] plate_claimed_no_ticket:", e.message); }
+
+  // 2. stuck_claim — sn_pool=claimed + manual_claims status=waiting_parts > 14d
+  try {
+    const stuck = await db.collection("manual_claims")
+      .find({
+        status: "waiting_parts",
+        updatedAt: { $lte: fourteenDaysAgo },
+      })
+      .limit(10)
+      .toArray();
+    for (const claim of stuck) {
+      const daysAgo = Math.floor((now - new Date(claim.updatedAt || claim.createdAt).getTime()) / 86400000);
+      const text = `🔴 ใบเคลม ${claim.wpTicketNumber || "?"} ค้างที่ waiting_parts ${daysAgo} วัน\n` +
+        `ลูกค้า: ${claim.customerName || "?"}\n` +
+        `S/N: ${claim.serial || "?"}\n` +
+        `แนะนำ: ติดตาม parts team`;
+      await _sendTelegramReply(TELEGRAM_CHAT_ID, text).catch(() => {});
+    }
+  } catch (e) { console.error("[SnAging] stuck_claim:", e.message); }
+
+  // 3. ready_replacement — sn_pool=replaced > 5d, no pickup confirmation
+  try {
+    const replaced = await db.collection("sn_pool")
+      .find({
+        status: "replaced",
+        $or: [
+          { customer_pickup_at: { $exists: false } },
+          { customer_pickup_at: null },
+        ],
+        replaced_at: { $lte: fiveDaysAgo },
+      })
+      .limit(10)
+      .toArray();
+    for (const sn of replaced) {
+      const daysAgo = Math.floor((now - new Date(sn.replaced_at || sn.updated_at).getTime()) / 86400000);
+      const text = `📦 ของเปลี่ยน (replaced) รอ pickup ${daysAgo} วัน\n` +
+        `S/N: ${sn.sn || "?"}\n` +
+        `Owner: ${sn.registered_user_id || sn.registered_line_uid || "?"}\n` +
+        `แนะนำ: ติดตามลูกค้า logistics`;
+      await _sendTelegramReply(TELEGRAM_CHAT_ID, text).catch(() => {});
+    }
+  } catch (e) { console.error("[SnAging] ready_replacement:", e.message); }
 }
 
 // ============================
@@ -992,5 +1100,7 @@ module.exports = {
   sendDailySummary,
   checkLeadNoContact,
   checkClaimAging,
+  // V.2.0 — Round 2 §15.14.6 SN-specific aging exported for cron registration
+  checkSnAging,
   init,
 };

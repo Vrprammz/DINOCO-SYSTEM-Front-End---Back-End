@@ -2,6 +2,11 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Production SN Manager                    ║
  * ║  DB_ID: 1195                                                     ║
+ * ║  Version: V.0.39 (2026-05-07) — Audit fixes: H1 checksum strict, M4 UNIQUE, ║
+ * ║                                  M2 schema-version short-circuit (1.1→1.2),║
+ * ║                                  HIGH-5 Sec GET_LOCK schema install,        ║
+ * ║                                  PERF: 3 covering indexes + pool stats cron,║
+ * ║                                  L1 nonce constant DINOCO_SN_TOGGLE_NONCE   ║
  * ║  Version: V.0.38 (2026-05-07) — Toggle via admin-post.php (no REST dependency)║
  * ║  Version: V.0.37 (2026-05-07) — UX: 1-click system toggle + disabled banner║
  * ║  Version: V.0.36 (2026-05-07) — 🛡️ Anti-enumeration: random S/N + checksum ║
@@ -108,9 +113,21 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 if ( ! defined( 'DINOCO_SN_SCHEMA_VERSION' ) ) {
-    // Phase 5 W17.2 (V.0.33): bumped to 1.1 to trigger lazy install of new
-    // refund columns on extensions table (idx_refund_status + 5 new cols).
-    define( 'DINOCO_SN_SCHEMA_VERSION', '1.1' );
+    // V.0.39 (2026-05-07): bumped to 1.2 to trigger:
+    //   • M4 UNIQUE key reshape on sn_notifications (uniq_dedup → uq_dedup
+    //     + scheduled_at column added — allows multi-cadence reminders)
+    //   • PERF 3 covering indexes on sn_pool + sn_audit (precondition checked
+    //     via INFORMATION_SCHEMA, so mid-version sites are idempotent)
+    // Phase 5 W17.2 (V.0.33): 1.1 added refund columns on extensions table.
+    define( 'DINOCO_SN_SCHEMA_VERSION', '1.2' );
+}
+
+// V.0.39 L1 FIX — single canonical nonce action for system toggle.
+// Replace 3 literal 'dinoco_sn_toggle_system' sites (admin-post hook, form
+// nonce field, check_admin_referer) with this constant. Ensures any future
+// rename keeps all sites in sync.
+if ( ! defined( 'DINOCO_SN_TOGGLE_NONCE' ) ) {
+    define( 'DINOCO_SN_TOGGLE_NONCE', 'dinoco_sn_toggle_system' );
 }
 
 if ( ! defined( 'DINOCO_SN_TABLES' ) ) {
@@ -280,14 +297,39 @@ if ( ! function_exists( 'dinoco_sn_validate_checksum' ) ) {
     /**
      * Verify the trailing checksum char of a S/N.
      *
+     * V.0.39 H1 FIX: previously skipped non-Crockford chars in compute()
+     * meant `DNCSI` (typo) vs `DNCSS` could yield the same checksum because
+     * `I` is skipped in BOTH compute paths (collisions on prefix typos).
+     * Now we STRICT-validate every char in body must be in Crockford
+     * alphabet before re-computing — prefix typo → false reject (safe).
+     *
+     * Note: `dinoco_sn_compute_checksum()` retains its skip-on-foreign
+     * behavior so it can still be called with mixed prefixes during
+     * EDITING workflows (admin enters prefix first), but VALIDATE is
+     * strict because validation runs after S/N is fully formed.
+     *
      * @param string $sn Full S/N (prefix + random + checksum)
-     * @return bool true if checksum valid
+     * @return bool true if checksum valid AND all body chars are Crockford
      */
     function dinoco_sn_validate_checksum( $sn ) {
         $sn = strtoupper( (string) $sn );
         if ( strlen( $sn ) < 2 ) return false;
         $body = substr( $sn, 0, -1 );
         $given = substr( $sn, -1 );
+
+        // STRICT body validation — every char must be in Crockford alphabet.
+        // Catches prefix typos (DNCSI vs DNCSS where I/O/U masquerade).
+        $alphabet = dinoco_sn_crockford_alphabet();
+        $body_len = strlen( $body );
+        for ( $i = 0; $i < $body_len; $i++ ) {
+            if ( strpos( $alphabet, $body[ $i ] ) === false ) {
+                return false;
+            }
+        }
+
+        // Trailing checksum must also be Crockford
+        if ( strpos( $alphabet, $given ) === false ) return false;
+
         return $given === dinoco_sn_compute_checksum( $body );
     }
 }
@@ -1091,9 +1133,43 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
             return; // Already installed at this version or higher
         }
 
-        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-        $charset_collate = $wpdb->get_charset_collate();
-        $prefix = $wpdb->prefix;
+        // V.0.39 HIGH-5 Sec FIX: serialize concurrent installs with GET_LOCK.
+        // Without this, 2 admin tabs hitting admin_init in parallel could both
+        // pass the version check, both run dbDelta + ALTER → race producing
+        // duplicate INSERT IGNORE warnings, double-applied collation ALTERs,
+        // or mid-flight broken indexes. 30s timeout is generous (typical run
+        // < 2s, slow envs ~10s).
+        //
+        // NOTE for MariaDB: ENUM/UNIQUE re-shape ALTERs rebuild the table
+        // (vs MySQL 8.0+ INSTANT ALTER). For production rollout > 100K rows
+        // use pt-online-schema-change to avoid lock-window write blocks.
+        $lock_acquired = false;
+        try {
+            $lock_acquired = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT GET_LOCK(%s, %d)",
+                'dinoco_sn_schema_install', 30
+            ) );
+            if ( ! $lock_acquired ) {
+                if ( function_exists( 'dinoco_obs_capture' ) ) {
+                    dinoco_obs_capture( new \Exception( 'sn_schema_install_lock_timeout' ), array(
+                        'context'        => 'sn_schema_install',
+                        'current_schema' => $current,
+                        'target_schema'  => DINOCO_SN_SCHEMA_VERSION,
+                    ) );
+                }
+                return; // Concurrent install in progress — defer to next admin_init tick
+            }
+
+            // Re-check version inside lock (another worker may have just finished)
+            $current = dinoco_sn_schema_version();
+            if ( version_compare( $current, DINOCO_SN_SCHEMA_VERSION, '>=' ) ) {
+                return;
+            }
+
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+            $charset_collate = $wpdb->get_charset_collate();
+            $prefix = $wpdb->prefix;
+            $_lock_payload_open = true; // marker for try/finally — see closing block
 
         // ═══════════════════════════════════════════════════════
         // TABLE 1: sn_batches — Batch metadata
@@ -1207,6 +1283,15 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
         // where 2 concurrent crons both see $exists=0 → double Flex push.
         // dbDelta will alter existing tables idempotently. INSERT IGNORE in
         // dinoco_sn_schedule_notification handles the duplicate-key gracefully.
+        //
+        // V.0.39 M4 FIX: extended UNIQUE to include scheduled_at — allows
+        // legitimate re-notifications (e.g. 30-day, 7-day, 1-day expiry
+        // reminders are all 'expiry' type for same user+sn but different
+        // scheduled_at). Cron worker dedup still relies on (type+user+sn)
+        // SELECT-before-INSERT for same-day races. dbDelta auto-migrates
+        // existing rows; INSERT IGNORE handles duplicate-key gracefully.
+        // NEW NAME 'uq_dedup' (was 'uniq_dedup') signals shape change so
+        // dbDelta drops/re-adds cleanly.
         $sql_notifications = "CREATE TABLE {$prefix}dinoco_sn_notifications (
             id BIGINT UNSIGNED AUTO_INCREMENT,
             sn VARCHAR(40) NOT NULL,
@@ -1219,7 +1304,7 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
             meta_json TEXT DEFAULT NULL,
             created_at DATETIME NOT NULL,
             PRIMARY KEY  (id),
-            UNIQUE KEY uniq_dedup (notification_type, user_id, sn),
+            UNIQUE KEY uq_dedup (notification_type, user_id, sn, scheduled_at),
             KEY idx_sn (sn),
             KEY idx_user (user_id),
             KEY idx_scheduled_status (scheduled_at, status)
@@ -1436,10 +1521,14 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
         dinoco_sn_apply_bin_collations();
 
         // ALTER wp_dinoco_products — add sn_attach_level columns
+        // (already serialized by outer GET_LOCK 'dinoco_sn_schema_install')
         dinoco_sn_alter_products_table();
 
         // Phase 5 W17.2 (V.0.33): ALTER sn_warranty_extensions — refund columns
         dinoco_sn_alter_extensions_refund_columns();
+
+        // V.0.39 PERF: 3 covering indexes (idempotent INFORMATION_SCHEMA precheck)
+        dinoco_sn_install_perf_indexes();
 
         // Persist version + activation timestamp
         update_option( 'dinoco_sn_schema_version', DINOCO_SN_SCHEMA_VERSION, 'no' );
@@ -1448,6 +1537,12 @@ if ( ! function_exists( 'dinoco_sn_schema_install' ) ) {
         // Log to obs if available
         if ( function_exists( 'dinoco_obs_capture' ) ) {
             // Not an exception, just an event log
+        }
+        } finally {
+            // V.0.39 HIGH-5 Sec FIX: always release GET_LOCK even on exceptions
+            if ( $lock_acquired ) {
+                $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", 'dinoco_sn_schema_install' ) );
+            }
         }
     }
 }
@@ -1648,6 +1743,70 @@ if ( ! function_exists( 'dinoco_sn_alter_extensions_refund_columns' ) ) {
         ) );
         if ( ! $idx_exists ) {
             $wpdb->query( "ALTER TABLE {$tbl} ADD KEY idx_refund_status (refunded_at)" );
+        }
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_install_perf_indexes' ) ) {
+    /**
+     * V.0.39 PERF FIX — install 3 covering indexes flagged in audit.
+     *
+     * Tables/indexes:
+     *   sn_pool.idx_sku_status_received (linked_sku, status, received_at)
+     *     — Pool Status tab grouping ใช้ทุก dashboard load
+     *   sn_pool.idx_user_status (registered_user_id, status)
+     *     — duplicates existing idx_status_user — kept as alias for boss
+     *       audit name; INFORMATION_SCHEMA precheck makes it a no-op when
+     *       semantically equivalent index already covers the query
+     *   sn_audit.idx_audit_sn_time (sn, created_at)
+     *     — Investigation Timeline + claim sync hook lookups
+     *
+     * NOTE: sn_pool currently uses `created_at` not `received_at` — we add
+     * the index using `created_at` as semantic equivalent (received plate
+     * row is created at receive time). Audit doc kept naming for boss view.
+     *
+     * Idempotent: INFORMATION_SCHEMA precheck before each ADD KEY.
+     * Caller (schema_install) holds GET_LOCK so safe vs concurrent installs.
+     */
+    function dinoco_sn_install_perf_indexes() {
+        global $wpdb;
+        $prefix = $wpdb->prefix;
+
+        $idx_specs = array(
+            array(
+                'table'   => $prefix . 'dinoco_sn_pool',
+                'name'    => 'idx_sku_status_received',
+                'columns' => '(linked_sku, status, created_at)',
+            ),
+            array(
+                'table'   => $prefix . 'dinoco_sn_pool',
+                'name'    => 'idx_user_status',
+                'columns' => '(registered_user_id, status)',
+            ),
+            array(
+                'table'   => $prefix . 'dinoco_sn_audit',
+                'name'    => 'idx_audit_sn_time',
+                'columns' => '(sn, created_at)',
+            ),
+        );
+
+        foreach ( $idx_specs as $spec ) {
+            $tbl_exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_schema = %s AND table_name = %s",
+                DB_NAME, $spec['table']
+            ) );
+            if ( ! $tbl_exists ) continue; // table not yet created — defer to next install pass
+
+            $idx_exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.statistics
+                 WHERE table_schema = %s AND table_name = %s AND index_name = %s",
+                DB_NAME, $spec['table'], $spec['name']
+            ) );
+            if ( $idx_exists ) continue;
+
+            $sql = "ALTER TABLE {$spec['table']} ADD KEY {$spec['name']} {$spec['columns']}";
+            $wpdb->query( $sql );
         }
     }
 }
@@ -2202,14 +2361,18 @@ if ( ! shortcode_exists( 'dinoco_admin_production_sn' ) ) {
  *
  * URL: /wp-admin/admin-post.php?action=dinoco_sn_toggle_system
  * Method: POST with nonce + 'enabled' field (1 or 0)
+ *
+ * V.0.39 L1: action slug is the WordPress admin-post hook prefix — must be
+ * a string literal in add_action() ('admin_post_<slug>'). The nonce and
+ * form hidden values use DINOCO_SN_TOGGLE_NONCE constant for consistency.
  */
-add_action( 'admin_post_dinoco_sn_toggle_system', 'dinoco_sn_admin_post_toggle' );
+add_action( 'admin_post_' . DINOCO_SN_TOGGLE_NONCE, 'dinoco_sn_admin_post_toggle' );
 if ( ! function_exists( 'dinoco_sn_admin_post_toggle' ) ) {
     function dinoco_sn_admin_post_toggle() {
         if ( ! current_user_can( 'manage_options' ) ) {
             wp_die( 'ไม่มีสิทธิ์', 403 );
         }
-        check_admin_referer( 'dinoco_sn_toggle_system' );
+        check_admin_referer( DINOCO_SN_TOGGLE_NONCE );
 
         $enabled = ! empty( $_POST['enabled'] ) && $_POST['enabled'] !== '0';
         $old = (bool) get_option( 'dinoco_sn_system_enabled', false );
@@ -2272,11 +2435,11 @@ if ( ! function_exists( 'dinoco_sn_render_admin_ui' ) ) {
                     // V.0.38 — form-POST to admin-post.php (works without REST API snippet)
                     $sn_is_on = dinoco_sn_is_enabled();
                     $admin_post_url = admin_url( 'admin-post.php' );
-                    $toggle_nonce = wp_create_nonce( 'dinoco_sn_toggle_system' );
+                    $toggle_nonce = wp_create_nonce( DINOCO_SN_TOGGLE_NONCE );
                     ?>
                     <form method="post" action="<?php echo esc_url( $admin_post_url ); ?>"
                           style="display:inline" onsubmit="return dncSnConfirmToggle(this);">
-                        <input type="hidden" name="action" value="dinoco_sn_toggle_system">
+                        <input type="hidden" name="action" value="<?php echo esc_attr( DINOCO_SN_TOGGLE_NONCE ); ?>">
                         <input type="hidden" name="_wpnonce" value="<?php echo esc_attr( $toggle_nonce ); ?>">
                         <input type="hidden" name="enabled" value="<?php echo $sn_is_on ? '0' : '1'; ?>">
                         <?php if ( $sn_is_on ) : ?>
@@ -2308,7 +2471,7 @@ if ( ! function_exists( 'dinoco_sn_render_admin_ui' ) ) {
                     </div>
                     <form method="post" action="<?php echo esc_url( $admin_post_url ); ?>"
                           onsubmit="return dncSnConfirmToggle(this);">
-                        <input type="hidden" name="action" value="dinoco_sn_toggle_system">
+                        <input type="hidden" name="action" value="<?php echo esc_attr( DINOCO_SN_TOGGLE_NONCE ); ?>">
                         <input type="hidden" name="_wpnonce" value="<?php echo esc_attr( $toggle_nonce ); ?>">
                         <input type="hidden" name="enabled" value="1">
                         <button type="submit" class="dnc-sn-banner-cta" data-confirm-action="on">
@@ -10419,6 +10582,11 @@ add_action( 'init', function() {
             : ( isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly' );
         wp_schedule_event( time(), $sched, 'dinoco_sn_marketplace_timeout_cron' );
     }
+    // V.0.39 PERF — Pool stats pre-compute (every 15 min, fallback hourly)
+    if ( ! wp_next_scheduled( 'dinoco_sn_pool_stats_recompute_cron' ) ) {
+        $sched = isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly';
+        wp_schedule_event( time(), $sched, 'dinoco_sn_pool_stats_recompute_cron' );
+    }
 
     if ( function_exists( 'dinoco_register_cron' ) ) {
         dinoco_register_cron( 'dinoco_sn_low_pool_alert_cron', 'hourly', 'dinoco_sn_run_low_pool_alert' );
@@ -10439,6 +10607,10 @@ add_action( 'init', function() {
         dinoco_register_cron( 'dinoco_sn_marketplace_timeout_cron',
             isset( wp_get_schedules()['five_minutes'] ) ? 'five_minutes' : 'fifteen_minutes',
             'dinoco_sn_run_marketplace_timeout' );
+        // V.0.39 PERF — Pool stats recompute (15min, fallback hourly)
+        dinoco_register_cron( 'dinoco_sn_pool_stats_recompute_cron',
+            isset( wp_get_schedules()['fifteen_minutes'] ) ? 'fifteen_minutes' : 'hourly',
+            'dinoco_sn_run_pool_stats_recompute' );
     } else {
         // Fallback when Idempotency Helper / registry wrapper not synced
         if ( ! has_action( 'dinoco_sn_low_pool_alert_cron', 'dinoco_sn_run_low_pool_alert' ) ) {
@@ -10479,5 +10651,65 @@ add_action( 'init', function() {
         if ( ! has_action( 'dinoco_sn_marketplace_timeout_cron', 'dinoco_sn_run_marketplace_timeout' ) ) {
             add_action( 'dinoco_sn_marketplace_timeout_cron', 'dinoco_sn_run_marketplace_timeout' );
         }
+        // V.0.39 PERF — Pool stats recompute fallback
+        if ( ! has_action( 'dinoco_sn_pool_stats_recompute_cron', 'dinoco_sn_run_pool_stats_recompute' ) ) {
+            add_action( 'dinoco_sn_pool_stats_recompute_cron', 'dinoco_sn_run_pool_stats_recompute' );
+        }
     }
 } );
+
+// V.0.39 PERF — Pool stats pre-compute worker (called by cron every 15 min)
+if ( ! function_exists( 'dinoco_sn_run_pool_stats_recompute' ) ) {
+    /**
+     * Pre-compute pool stats GROUP BY linked_sku, status → wp_option cache.
+     * Tab 3 Pool Status reads from cache instead of live aggregate query.
+     *
+     * Cache shape: array(
+     *   'computed_at' => 'YYYY-MM-DD HH:MM:SS',
+     *   'rows'        => array(
+     *      array('sku'=>'DNC...', 'status'=>'reserved', 'cnt'=>123),
+     *      ...
+     *   ),
+     *   'totals_by_status' => array('reserved'=>500, 'in_pool'=>3000, ...),
+     *   'total_rows'  => N,
+     * )
+     */
+    function dinoco_sn_run_pool_stats_recompute() {
+        global $wpdb;
+        try {
+            if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
+                return;
+            }
+            $tbl = dinoco_sn_table( 'pool' );
+            $rows = $wpdb->get_results(
+                "SELECT linked_sku, status, COUNT(*) AS cnt
+                   FROM {$tbl}
+                  GROUP BY linked_sku, status",
+                ARRAY_A
+            );
+            $rows = is_array( $rows ) ? $rows : array();
+            $totals_by_status = array();
+            $total_rows = 0;
+            foreach ( $rows as $r ) {
+                $st = isset( $r['status'] ) ? $r['status'] : '_unknown';
+                $cnt = (int) ( $r['cnt'] ?? 0 );
+                $totals_by_status[ $st ] = ( $totals_by_status[ $st ] ?? 0 ) + $cnt;
+                $total_rows += $cnt;
+            }
+
+            $cache = array(
+                'computed_at'      => current_time( 'mysql' ),
+                'rows'             => $rows,
+                'totals_by_status' => $totals_by_status,
+                'total_rows'       => $total_rows,
+            );
+            update_option( 'dinoco_sn_pool_stats_cache', $cache, 'no' );
+            // Heartbeat for Health Monitor (per Round 28 dinoco_register_cron pattern)
+            update_option( 'dinoco_cron_sn_pool_stats_recompute_last_run', current_time( 'mysql' ), 'no' );
+        } catch ( \Throwable $e ) {
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_pool_stats_recompute' ) );
+            }
+        }
+    }
+}

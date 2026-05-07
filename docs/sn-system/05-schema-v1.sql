@@ -170,6 +170,11 @@ CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_audit` (
 -- ===========================================================
 
 -- F#1 + F#4 + F#10 notification queue
+-- M4 FIX (2026-05-07): UNIQUE KEY uq_dedup spans 4 cols (type, user, sn,
+-- scheduled_at). Allows legitimate multi-cadence reminders (30-day +
+-- 7-day + 1-day all 'expiry' for same user+sn) while preventing 2 cron
+-- workers from inserting same scheduled_at row twice. INSERT IGNORE in
+-- dinoco_sn_schedule_notification handles dup gracefully.
 CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_notifications` (
   `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   `sn` VARCHAR(40) COLLATE utf8mb4_bin NOT NULL,
@@ -181,15 +186,21 @@ CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_notifications` (
   `status` ENUM('scheduled','sent','failed','cancelled','dismissed') NOT NULL DEFAULT 'scheduled',
   `meta_json` TEXT DEFAULT NULL,
   `created_at` DATETIME NOT NULL,
+  UNIQUE KEY `uq_dedup` (`notification_type`, `user_id`, `sn`, `scheduled_at`),
   KEY `idx_sn` (`sn`),
   KEY `idx_user` (`user_id`),
-  KEY `idx_scheduled_status` (`scheduled_at`, `status`) COMMENT 'Cron query',
-  KEY `idx_type_user_sn` (`notification_type`, `user_id`, `sn`) COMMENT 'Dedup check'
+  KEY `idx_scheduled_status` (`scheduled_at`, `status`) COMMENT 'Cron query'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- F#1 + F#4 + F#10 promo codes
+-- C2 FIX (2026-05-07): split inline `code VARCHAR(20) NOT NULL PRIMARY KEY` →
+-- separate column declaration + standalone PRIMARY KEY (`code`) clause.
+-- dbDelta in WordPress only recognizes PRIMARY KEY when written on its own
+-- line; inline form was silently dropped → table created without PK on some
+-- environments. The Manager dbDelta block (PHP) was already correct; this
+-- canonical .sql doc now matches.
 CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_promo_codes` (
-  `code` VARCHAR(20) NOT NULL PRIMARY KEY,
+  `code` VARCHAR(20) NOT NULL,
   `user_id` BIGINT UNSIGNED NOT NULL,
   `source_sn` VARCHAR(40) COLLATE utf8mb4_bin DEFAULT NULL,
   `discount_pct` TINYINT UNSIGNED NOT NULL,
@@ -200,6 +211,7 @@ CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_promo_codes` (
   `used_at` DATETIME DEFAULT NULL,
   `used_order_id` BIGINT UNSIGNED DEFAULT NULL,
   `created_at` DATETIME NOT NULL,
+  PRIMARY KEY (`code`),
   KEY `idx_user` (`user_id`),
   KEY `idx_expires_used` (`expires_at`, `used_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -236,26 +248,18 @@ CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_review_requests` (
   KEY `idx_status_scheduled` (`status`, `scheduled_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- F#12 fraud detection scores
-CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_fraud_scores` (
-  `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  `sn` VARCHAR(40) COLLATE utf8mb4_bin NOT NULL,
-  `event_type` ENUM('activate','transfer','swap','claim','lookup') NOT NULL,
-  `score` TINYINT UNSIGNED NOT NULL,
-  `factors_json` TEXT NOT NULL,
-  `ip_address` VARCHAR(45) DEFAULT NULL,
-  `user_agent` VARCHAR(255) DEFAULT NULL,
-  `device_fp` VARCHAR(64) DEFAULT NULL,
-  `geo_country` CHAR(2) DEFAULT NULL,
-  `geo_province` VARCHAR(64) DEFAULT NULL,
-  `reviewed_by` BIGINT UNSIGNED DEFAULT NULL,
-  `reviewed_at` DATETIME DEFAULT NULL,
-  `outcome` ENUM('pending','legit','fraud','suspicious') DEFAULT NULL,
-  `created_at` DATETIME NOT NULL,
-  KEY `idx_sn_score` (`sn`, `score`),
-  KEY `idx_outcome_created` (`outcome`, `created_at`),
-  KEY `idx_geo_country` (`geo_country`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- ===========================================================
+-- F#12 fraud detection — REMOVED per Q21 boss decision (2026-05-05)
+-- ===========================================================
+-- Boss override: "ตัดระบบของปลอมออกไปเลย เยอะเกิน ไม่ใช้แล้ว"
+-- Removed: wp_dinoco_sn_fraud_scores table (CREATE skipped on next admin_init)
+-- Code archived as dead code in Manager V.0.23 commit 8d97fdf:
+--   • dinoco_sn_run_fraud_aggregate cron handler kept disabled
+--   • Tab 7 "Fraud Review" admin UI removed
+--   • dinoco_sn_fraud_aggregate_cron defensively unscheduled
+-- Activation procedure if boss re-introduces: restore CREATE TABLE here +
+-- bump DINOCO_SN_SCHEMA_VERSION + add CREATE to install_schema PHP.
+-- ===========================================================
 
 -- F#13 geographic activations
 CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_geo_activations` (
@@ -342,13 +346,19 @@ CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_demand_forecast` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- F#8 warranty extensions (Phase 5)
+-- H6 FIX (2026-05-07) — payment_method ENUM aligned with Q7 R2 boss binding:
+-- "Slip2GO เช็คสลิป + เลขบัญชี" only. No LINE Pay / SCB direct integration.
+-- Two values: 'slip2go' (auto-verify via Slip2Go API + bank account number) +
+-- 'manual' (admin manual mark-paid for edge cases). PHP layer (Manager + REST)
+-- already enforces these values via VARCHAR(20) — this canonical .sql block
+-- now matches.
 CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_warranty_extensions` (
   `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   `sn` VARCHAR(40) COLLATE utf8mb4_bin NOT NULL,
   `user_id` BIGINT UNSIGNED NOT NULL,
   `extension_months` SMALLINT UNSIGNED NOT NULL,
   `price_paid` DECIMAL(10,2) NOT NULL,
-  `payment_method` ENUM('promptpay','scb_card','line_pay','manual') NOT NULL,
+  `payment_method` ENUM('slip2go','manual') NOT NULL,
   `payment_ref` VARCHAR(64) DEFAULT NULL,
   `payment_status` ENUM('pending','paid','refunded','failed') NOT NULL DEFAULT 'pending',
   `warranty_until_old` DATE NOT NULL,
@@ -383,7 +393,7 @@ CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_warranty_extensions` (
 -- wp_dinoco_sn_batches      ~10 KB  (10-100 batches)
 -- wp_dinoco_sn_notifications ~50 MB (3 notif per registered plate)
 -- wp_dinoco_sn_promo_codes  ~10 MB
--- wp_dinoco_sn_fraud_scores ~30 MB
+-- wp_dinoco_sn_fraud_scores  REMOVED Q21 boss decision (2026-05-05)
 -- wp_dinoco_sn_geo_activations ~40 MB
 -- wp_dinoco_sn_stolen_log   ~100 KB (~1% of registered plates)
 -- wp_dinoco_sn_api_log      ~50 MB (90d retention)
@@ -429,5 +439,62 @@ CREATE TABLE IF NOT EXISTS `wp_dinoco_sn_warranty_extensions` (
 --         dinoco_sn_install_schema();
 --     }
 -- });
+
+-- ===========================================================
+-- SUGGESTED MIGRATION (Phase 2 W7 atomic deploy)
+-- ===========================================================
+-- H1 db-expert finding (2026-05-07): `status` ENUM is ALTER-unfriendly —
+-- adding new states later (e.g. 'pending_extension', 'awaiting_dispute')
+-- requires ENUM rebuild on MariaDB (full table copy). MySQL 8.0+ supports
+-- INSTANT ALTER for ENUM additions but not all production hosts run 8.0+.
+--
+-- L4 db-expert finding: `prev_status` is VARCHAR(32) but `status` is ENUM —
+-- type mismatch on revert paths (transferred → registered restore copies
+-- VARCHAR string into ENUM-narrowed column → silent truncation if value
+-- not in ENUM list).
+--
+-- NOTE: do NOT run these statements as part of normal install. Run only
+-- during Phase 2 W7 atomic deploy day, after taking a mysqldump backup
+-- and pausing background crons. PHP layer (state machine in Manager
+-- + REST API) already enforces enum-equivalent validation.
+--
+-- ALTER TABLE wp_dinoco_sn_pool
+--   MODIFY COLUMN status VARCHAR(32) NOT NULL DEFAULT 'reserved'
+--   COLLATE utf8mb4_unicode_ci;
+--
+-- After this ALTER:
+--   • prev_status (already VARCHAR(32)) and status share same type → no
+--     silent truncation on revert paths.
+--   • Future state additions = no schema change needed; PHP layer +
+--     state machine map enum constants directly.
+--   • idx_status_created composite index is preserved (VARCHAR works
+--     identically with B-tree).
+--
+-- For production rollout > 100K rows, use pt-online-schema-change to
+-- avoid lock-window write blocks (MariaDB rebuilds table for type change).
+
+-- ===========================================================
+-- PERF COVERING INDEXES (V.0.39 install_perf_indexes — 2026-05-07)
+-- ===========================================================
+-- Manager dbDelta block adds these 3 indexes idempotently via
+-- INFORMATION_SCHEMA precheck. Documented here for review/audit:
+--
+--   ALTER TABLE wp_dinoco_sn_pool
+--     ADD INDEX idx_sku_status_received (linked_sku, status, created_at);
+--     -- Pool Status tab Tab 3 grouping query (every dashboard load).
+--     -- NOTE: doc spec said `received_at` but pool table uses `created_at`
+--     -- as semantic equivalent (received plate row created at receive time).
+--
+--   ALTER TABLE wp_dinoco_sn_pool
+--     ADD INDEX idx_user_status (registered_user_id, status);
+--     -- Customer LTV Dashboard + activate path lookups.
+--     -- NOTE: existing idx_status_user covers the same composite —
+--     -- INFORMATION_SCHEMA precheck makes this a no-op when alias index
+--     -- already covers the query.
+--
+--   ALTER TABLE wp_dinoco_sn_audit
+--     ADD INDEX idx_audit_sn_time (sn, created_at);
+--     -- Investigation Timeline (Tab 4 Universal Search) +
+--     -- claim sync hook lookups (Service Center V.31.3).
 
 -- END OF SCHEMA v1.0

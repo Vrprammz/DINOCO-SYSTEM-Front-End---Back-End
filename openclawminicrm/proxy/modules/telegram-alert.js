@@ -1,5 +1,9 @@
 /**
  * telegram-alert.js — น้องกุ้ง: แจ้งเตือนบอสผ่าน Telegram + reply/photo helpers
+ * V.2.1 — Phase 4 W14.4 Round 2 (chatbot-rules.md §15.14.6):
+ *         + 4 new alert types: voided_inquiry / recall_inquiry /
+ *           ocr_mismatch_fraud_suspect / ocr_unknown_serial / reissue_request
+ *         Backward compat: existing types untouched.
  * V.2.0 — เพิ่ม sendTelegramReply, sendTelegramPhoto, alert record บันทึก MongoDB
  */
 
@@ -61,6 +65,12 @@ async function sendTelegramAlert(type, data) {
     ai_wrong: "❌",
     regression_drift: "📉",
     regression_fail_gate: "🚫",
+    // V.2.1 — Round 2 §15.14.6 S/N security/fraud alert categories
+    voided_inquiry: "🛑",
+    recall_inquiry: "🔄",
+    ocr_mismatch_fraud_suspect: "🕵️",
+    ocr_unknown_serial: "❓",
+    reissue_request: "🪪",
   };
 
   const icon = icons[type] || "🔔";
@@ -132,6 +142,46 @@ async function sendTelegramAlert(type, data) {
       message += `👤 Triggered by: ${escapeMarkdown(data.triggered_by || "-")}\n`;
       message += `💬 Reason: ${escapeMarkdown((data.reason || "").substring(0, 200))}\n`;
       message += `\n💡 แก้ bug ก่อน push`;
+      break;
+
+    // V.2.1 — Round 2 §15.14.6 S/N security/fraud categories
+    case "voided_inquiry":
+      message += `เพลทอยู่ในสถานะ sensitive (voided/recalled/stolen) ❗\n`;
+      message += `👤 ${customer} (${platform})\n`;
+      message += `🔢 S/N: ${escapeMarkdown(data.sn || "-")}\n`;
+      message += `💬 บริบท: ${escapeMarkdown((data.customerText || "").substring(0, 150))}\n`;
+      message += `\n💡 ลูกค้าถามถึงเพลท sensitive — AI ตอบ generic แล้ว รอบอสตัดสินใจ`;
+      break;
+
+    case "recall_inquiry":
+      message += `ลูกค้าถามเรื่อง recall 🔄\n`;
+      message += `👤 ${customer} (${platform})\n`;
+      message += `💬 ลูกค้าถาม: "${escapeMarkdown((data.customerText || "").substring(0, 150))}"\n`;
+      message += `\n💡 AI ตอบ generic — ทีม PR/QA พิจารณาเปิดเผยข้อมูล`;
+      break;
+
+    case "ocr_mismatch_fraud_suspect":
+      message += `OCR เจอ S/N ไม่ตรงเจ้าของ 🕵️\n`;
+      message += `👤 ${customer} (${platform})\n`;
+      message += `🔢 S/N: ${escapeMarkdown(data.sn || "-")}\n`;
+      message += `💬 รายละเอียด: ${escapeMarkdown((data.customerText || "").substring(0, 200))}\n`;
+      message += `\n💡 อาจเป็น mature transfer หรือ fraud — ต้องตรวจเอง (4-eyes)`;
+      break;
+
+    case "ocr_unknown_serial":
+      message += `OCR เจอ S/N ไม่อยู่ใน sn_pool ❓\n`;
+      message += `👤 ${customer} (${platform})\n`;
+      message += `🔢 S/N: ${escapeMarkdown(data.sn || "-")}\n`;
+      message += `💬 รายละเอียด: ${escapeMarkdown((data.customerText || "").substring(0, 200))}\n`;
+      message += `\n💡 อาจเป็นของปลอม (F#12) หรือ legacy migration gap`;
+      break;
+
+    case "reissue_request":
+      message += `ลูกค้าขอเพลทใหม่ (เพลทหาย/ร่วง) 🪪\n`;
+      message += `👤 ${customer} (${platform})\n`;
+      message += `💬 บริบท: ${escapeMarkdown((data.customerText || "").substring(0, 200))}\n`;
+      message += `📋 evidence: ${data.has_photo ? "✓ รูป" : "✗"} ${data.has_receipt ? "✓ ใบเสร็จ" : "✗"} ${data.has_address ? "✓ address" : "✗"}\n`;
+      message += `\n💡 ตรวจ warranty status + ส่ง Service Center`;
       break;
 
     default:

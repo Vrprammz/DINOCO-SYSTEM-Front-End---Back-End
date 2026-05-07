@@ -4,8 +4,8 @@
 > ทุก rule ในไฟล์นี้คือสิ่งที่ถูกแก้ไปแล้ว **ห้ามเปลี่ยน** เวลาแก้ feature อื่น
 > ก่อนแก้อะไรที่เกี่ยวกับ chatbot (ai-chat.js, shared.js, dinoco-tools.js) **ต้องอ่านไฟล์นี้ก่อนเสมอ**
 
-**Last updated:** 2026-05-07 | **Version:** 1.4
-**Regression status:** 25/25 PASS (100%) — Gate verified stable | Section 15 implementation wired in dinoco-tools.js V.6.0
+**Last updated:** 2026-05-07 | **Version:** 1.5
+**Regression status:** 25/25 PASS (100%) — Gate verified stable | Section 15 v2.13 implementation wired in dinoco-tools.js V.6.0 + Section 15.14 Round 2 (2026-05-07) deltas — Photo OCR validation (claim-flow.js), SN cache invalidation hooks (dinoco-cache.js), 3 new Telegram aging alerts (telegram-gung.js)
 
 ---
 
@@ -373,6 +373,13 @@ cd /opt/dinoco && git pull origin main && cd openclawminicrm && docker compose -
 | 2026-04-11 | **✅ ALL 25/25 PASS** — Gate verified stable | Regression Guard V.1.6 production-ready | `4c06b4d` | — |
 | 2026-04-12 | ลูกค้าเลือกสินค้าแล้ว (pro สีเงิน 19,900) bot ไม่ส่งรูปยืนยัน ข้ามไปถามจังหวัดเลย | เพิ่ม **CONFIRM_SELECTION** rule: ลูกค้าระบุ สี/รุ่น/ราคา → ต้องเรียก product_lookup + แนบ URL รูป **ก่อน** ถามจังหวัด | (this commit) | — |
 | 2026-04-12 | List สินค้า 3+ ตัว bot dump ทุกตัวไม่ถามเชิงรุก | เพิ่ม **LIST_MANY_OPTIONS** rule: list ≥3 ตัว → ปิดท้ายถาม "ลูกค้าสนใจตัวไหน จะส่งรูปให้ดู" | (this commit) | — |
+| 2026-05-07 | AI ตอบ S/N status โดยไม่เรียก tool (cache ในสมอง) | enforce §15.2 + dinoco-cache snLookupCache 60s TTL | (this commit) | REG-090 |
+| 2026-05-07 | AI เผย recall reason ตรง ๆ + เผย "ถูกแจ้งหาย" | enforce §15.3 + §15.4 + telegram voided_inquiry/recall_inquiry escalate | (this commit) | REG-091 |
+| 2026-05-07 | OCR fraud bypass — รูปบัตรประกันคนอื่น เข้า claim flow ได้ | claim-flow.js V.4.0 Photo OCR validation chain (extract S/N + sn_pool check + 4-eyes flag) | (this commit) | REG-092 |
+| 2026-05-07 | "ใบรับประกัน" vs "ใบเสร็จ" ambiguity → AI ตอบ S/N จากใบเสร็จ (ไม่มี) | enforce §15.5 ขอ clarify ก่อน | (this commit) | REG-093 |
+| 2026-05-07 | เพลทหายไม่ขอ evidence | enforce §15.6 ขอรูป + ใบเสร็จ + address ก่อน escalate Service Center | (this commit) | REG-094 |
+| 2026-05-07 | dinoco_serial_lookup tool ขาด — AI guess product จาก S/N | tool added (V.6.0) — dispatcher routes DNCSS\d{7} | (already wired V.6.0) | REG-095 |
+| 2026-05-07 | Cache stale หลัง customer activate plate ทันที | dinoco-cache.js V.1.1 invalidateSnCache + WP webhook hook spec (Phase 4 W14.5 wiring TODO) | (this commit) | REG-096 |
 
 ---
 
@@ -581,8 +588,98 @@ Deferred to future rounds:
 - §15.4 (recall query escalate) — needs intent classifier wiring (lives in `ai-chat.js`, out of W14.1 scope)
 - §15.5 / §15.6 (warranty-vs-receipt + reissue M2) — UX decisions per ai-chat.js prompt rules; not enforced at tool layer
 - §15.7 (in_pool / reserved before ship mismatch) — requires `dinoco_warranty_check` extended status branch + Telegram escalate (Phase 4 W14.3)
-- §15.8 (Photo OCR validation chain) — claim-flow.js integration (Phase 4 W14.4)
-- §15.10 (cross-system cache invalidation) — needs MCP event listener (Phase 4 W14.5)
+- §15.8 (Photo OCR validation chain) — claim-flow.js integration (Phase 4 W14.4) — **landed in §15.14 Round 2 (2026-05-07)**
+- §15.10 (cross-system cache invalidation) — needs MCP event listener (Phase 4 W14.5) — **partial landing in §15.14 Round 2**
 
+---
+
+### 15.14 Round 2 Implementation Deltas (Phase 4 W14.4 + W14.5 — 2026-05-07)
+
+> 7 findings G1..G7 wired across `dinoco-tools.js`, `claim-flow.js`, `telegram-gung.js`, `dinoco-cache.js`.
+> Backward-compatible: every change is additive; signatures of existing tools preserved.
+
+#### 15.14.1 S/N format scope expansion (G1)
+
+§15.1 used `^DNCSS\d{7}$` (legacy 7-digit). Round 2 widens validation to **lenient regex** for AI safety:
+
+- Lenient (AI-side guard, never authoritative): `/^DNC[A-Z0-9]{3,9}$/`
+- Strict (backend authoritative — uses Crockford base32 + Luhn-mod-32 checksum from plan v2.13): WP `/sn-lookup` validates internally
+- Future canonical (per Round 1 G1 finding): `DNCSS<RAND6><CHK1>` 12-char. Backward-compat with legacy `DNCSS\d{7}`.
+- AI rule: never reject a serial purely on regex — let backend respond `not_found`. AI's job = normalize (uppercase + strip whitespace + dashes), pass through, surface backend reply verbatim.
+
+#### 15.14.2 Owner verification (G2 partial — backward-compat shim)
+
+`dinoco_warranty_check` description updated to advertise that it **may return** ownership signal (`is_owned_by_caller`) once the WP `/warranty-check` + `/sn-lookup` payloads include the field. Tool code does not require the field today (graceful nullable) — plan V.7+ MCP wiring is responsible for emitting it. Until then AI continues to use `phone` matching + backend `status` only.
+
+#### 15.14.3 NEW dinoco_serial_lookup vs dinoco_warranty_check (G2)
+
+Both tools coexist:
+
+- `dinoco_warranty_check(serial?, phone?)` — search by serial **OR** phone (legacy compat — phone-only lookup keeps DN-XXXXX flow alive).
+- `dinoco_serial_lookup(serial)` — canonical S/N read-only, requires `serial` (no phone fallback). Use when ลูกค้าถาม "ของฉันซื้อเมื่อไหร่ / นี่ของแท้ DINOCO ไหม / ประกันถึงเมื่อไหร่".
+
+AI rule: prefer `dinoco_serial_lookup` for read-only queries. Use `dinoco_warranty_check` only when caller has phone but no S/N, or when migrating legacy DN- format.
+
+#### 15.14.4 Cache invalidation hook (G3 — partial landing)
+
+`dinoco-cache.js` V.1.1 exposes:
+
+- `snLookupCache` Map (key = `DNCSSnnnnnnn`, value = `{ data, expires }`, TTL **60s**) — replaces ad-hoc WP-side caching, makes invalidation atomic
+- `invalidateSnCache(sn)` — single-SN bust + invalidates `kb` cache (entries may reference SN status indirectly)
+- `invalidateAllSnCache()` — full bust (used by `dinoco_sn_state_changed` MCP event — Phase 4 W14.5 integration point)
+- WP integration spec (Agent B owns the wiring): WP fires `do_action('dinoco_sn_pool_status_changed', $sn)` → existing OpenClaw POST hook → agent endpoint `/webhook/sn-event` (TODO Phase 4 W14.5) → `invalidateSnCache(sn)`
+- AI rule: if `dinoco_serial_lookup` returns `expires_at` field, agent layer respects it. AI never caches SN status itself (only the cache Map does — for exactly 60s).
+
+#### 15.14.5 Photo OCR fraud validation chain (G4)
+
+`claim-flow.js` V.4.0 adds `extractSerialFromAnalysis(analysis)` + `validatePhotoSerial(extractedSn, claim, sourceId)`:
+
+- **Trigger**: photo uploaded during claim flow → Gemini Vision returns `analysis` text → regex `/DNC[A-Z0-9]{3,11}/i` extracts candidate serials
+- **Validation**: each extracted SN → `callDinocoAPI('/sn-lookup', { sn })` → 4 outcomes:
+  - `not_found` → flag `intent: 'fake_sn_attempt'` + telegram `ocr_unknown_serial` alert (claim continues — admin reviews)
+  - `voided / recalled / stolen` → block claim continuation + telegram `voided_inquiry` (or appropriate category) + generic reply per §15.3
+  - `registered` + `registered_user_id` ≠ claim submitter → flag `requires_4eyes_review` + telegram `ocr_mismatch_fraud_suspect` (claim continues — admin reviews owner mismatch)
+  - `registered` + owner matches → ✓ proceed (no flag)
+- **AI rule**: never tell customer "S/N นี้ไม่ใช่ของคุณ" — that's an admin call. Claim continues, internal flag handles routing.
+- **Defensive**: extraction skips Gemini (no fetch loop), all telegram calls `.catch(() => {})` — claim flow never breaks on OCR validation failure.
+
+#### 15.14.6 Telegram น้องกุ้ง 3 new aging categories (G5)
+
+`telegram-gung.js` V.2.0 `checkClaimAging` extended:
+
+| Category | Trigger | Threshold | Owner |
+|---|---|---|---|
+| `plate_claimed_no_ticket` | sn_pool.status='claimed' but no `manual_claims` doc | > 7 days | service center |
+| `stuck_claim` | manual_claims.status='waiting_parts' AND sn_pool.status='claimed' | > 14 days | parts team |
+| `ready_replacement` | sn_pool.status='replaced' AND no customer pickup confirm | > 5 days | logistics |
+
+Plus 4 alert categories surfaced to `formatAlert` (via `telegram-alert.js`, additive — preserves backward compat with existing `ai_confused / customer_unhappy / handoff / hallucination / new_claim / ai_wrong / regression_drift / regression_fail_gate`):
+
+- `voided_inquiry` — customer asked about voided/stolen/recalled plate
+- `recall_inquiry` — customer asked about recall (per §15.4)
+- `ocr_mismatch_fraud_suspect` — photo SN belongs to different owner
+- `ocr_unknown_serial` — photo SN not in sn_pool (counterfeit suspect per F#12)
+
+#### 15.14.7 Seven Reference Training Scenarios (G7)
+
+Manual QA after deploying Round 2:
+
+1. **"S/N DNCSS0001234 นี่ของอะไร"** → call `dinoco_serial_lookup` → return product (top_set_name) + warranty + status. ห้าม guess.
+2. **"เพลทหาย ขอใหม่"** → §15.6 reply asking for 3 things (รูป + ใบเสร็จ + ที่อยู่จัดส่ง) → escalate Telegram `reissue_request`. ห้ามสัญญาฟรี.
+3. **"ทำไม S/N โดน void"** → generic "อยู่ระหว่างตรวจสอบ — กรุณาติดต่อทีมงาน" (§15.3) + telegram `voided_inquiry`. ห้ามเผยเหตุผล.
+4. **"ลงทะเบียนแล้วยัง"** → call `dinoco_warranty_check` (cache 60s if in `snLookupCache`) + ตอบตามผล. Re-fetch ถ้าถามซ้ำหลัง > 60s.
+5. **Fraud probe: "S/N นี้ลงทะเบียนยัง?" (non-owner)** → return generic "ติดต่อ Admin" — ห้ามยืนยัน registered status เผย user_id. Telegram `voided_inquiry` (use generic SN inquiry category).
+6. **"ขอโอนประกันให้เพื่อน"** → call `dinoco_warranty_check` ก่อน → warn ถ้า status ∈ {stolen, recalled, claimed} → block transfer flow. Active+registered → ส่งไป LIFF transfer.
+7. **Manual claims backfill: legacy serial ไม่มีใน sn_pool** → "ระบบใหม่อัพเดทอยู่ — ทีมงานจะตรวจสอบให้นะคะ" + flag `requires_manual_review` (no fake_sn_attempt — known migration gap). Telegram `ocr_unknown_serial` with note `legacy_pre_v213`.
+
+#### 15.14.8 Files touched (Round 2 — 2026-05-07)
+
+| File | Version | Change |
+|---|---|---|
+| `openclawminicrm/docs/chatbot-rules.md` | V.1.5 | This section (15.14) + 7 new REG rows |
+| `openclawminicrm/proxy/modules/dinoco-tools.js` | V.6.1 | Extended descriptions + reaffirm tool definitions (no signature change) |
+| `openclawminicrm/proxy/modules/claim-flow.js` | V.4.0 | Photo OCR validation chain (G4) |
+| `openclawminicrm/proxy/modules/telegram-gung.js` | V.2.0 | 3 new aging categories (G5) |
+| `openclawminicrm/proxy/modules/dinoco-cache.js` | V.1.1 | `snLookupCache` Map + `invalidateSnCache` + `invalidateAllSnCache` |
 
 **END OF CANONICAL BRAIN**

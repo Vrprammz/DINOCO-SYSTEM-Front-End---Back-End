@@ -1,5 +1,10 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
+ * V.6.1 — Phase 4 W14.4 Round 2 (chatbot-rules.md §15.14): description hardening for
+ *         dinoco_warranty_check + dinoco_serial_lookup + dinoco_create_claim — explicit
+ *         §15.2/§15.3/§15.5/§15.6 enforcement notes. NEW lenient regex helper isLenientSn()
+ *         for AI-side soft validation; backend (/sn-lookup) remains source of truth.
+ *         No signature change — backward compat 100%.
  * V.6.0 — Phase 4 W14.1 S/N integration: dinoco_warranty_check now detects DNCSS\d{7} format
  *         and routes to /sn-lookup; dinoco_create_claim validates S/N exists in sn_pool before
  *         insert; NEW dinoco_serial_lookup tool (read-only canonical S/N lookup).
@@ -12,15 +17,25 @@
  */
 
 // ★ V.6.0 — S/N format helpers (Phase 4 W14)
-// Canonical regex per chatbot-rules.md §15.1 — DNCSS prefix + 7 digits.
+// Canonical regex per chatbot-rules.md §15.1 — DNCSS prefix + 7 digits (legacy default).
+// V.6.1 (Round 2): added lenient regex per §15.14.1 — AI-side soft validation only.
+//   Backend (/sn-lookup) is source of truth for actual checksum verification (Crockford
+//   base32 + Luhn-mod-32 per plan v2.13). Lenient pattern accepts future variable-length
+//   format (DNCSS<RAND6><CHK1> = 12 chars) + legacy DNCSS\d{7} (12 chars too).
 // Normalize: uppercase + strip whitespace + strip dashes (e.g. "dncss-0001234" → "DNCSS0001234")
 const SN_PREFIX_REGEX = /^DNCSS\d{7}$/;
+const SN_LENIENT_REGEX = /^DNC[A-Z0-9]{3,9}$/; // V.6.1 — for OCR extraction & soft validation
 function normalizeSerial(input) {
   if (!input || typeof input !== "string") return "";
   return input.toUpperCase().replace(/[\s-]+/g, "");
 }
 function isCanonicalSn(input) {
   return SN_PREFIX_REGEX.test(normalizeSerial(input));
+}
+// V.6.1 — lenient check used by claim-flow Photo OCR (§15.8 / §15.14.5).
+// AI MUST NOT use this to reject — only to detect candidates worth backend verification.
+function isLenientSn(input) {
+  return SN_LENIENT_REGEX.test(normalizeSerial(input));
 }
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
@@ -156,12 +171,12 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_warranty_check",
-      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial (รองรับ DNCSSxxxxxxx ใหม่ หรือ DN-XXXXX เก่า) หรือเบอร์โทร ใช้เมื่อลูกค้าส่งเลข serial หรือเบอร์โทรมาเช็คประกัน",
+      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial (รองรับ DNCSSxxxxxxx ใหม่ หรือ DN-XXXXX เก่า) หรือเบอร์โทร — ★ ห้ามตอบสถานะจากความจำ ต้องเรียก tool ทุกครั้ง (chatbot-rules §15.2). Tool อาจ return ฟิลด์ top_set_sku, plate_status (registered/claimed/voided/recalled/transferred/stolen), is_owned_by_caller — ใช้ฟิลด์นี้ตัดสินใจตอบแทนการ guess. ถ้า status ∈ {voided, recalled, stolen} → ตอบ generic ไม่เผยรายละเอียด (§15.3)",
       parameters: {
         type: "object",
         properties: {
           serial: { type: "string", description: "เลข serial number เช่น 'DNCSS0001234' (รุ่นใหม่) หรือ 'DN-12345' (รุ่นเก่า)" },
-          phone: { type: "string", description: "เบอร์โทรที่ลงทะเบียน" },
+          phone: { type: "string", description: "เบอร์โทรที่ลงทะเบียน — ใช้เพื่อ owner verification เมื่อ backend support" },
         },
       },
     },
@@ -170,11 +185,11 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_serial_lookup",
-      description: "ค้นหาข้อมูลรับประกันจากเลข S/N (DNCSSxxxxxxx) ใช้เมื่อลูกค้าถามว่า 'ของฉันซื้อเมื่อไหร่' 'ประกันถึงเมื่อไหร่' 'นี่ของแท้ DINOCO ไหม' หรือส่งเลข S/N รูปแบบใหม่มา",
+      description: "ค้นหา canonical S/N → product + warranty info ใช้เมื่อลูกค้าถาม 'ของฉันซื้อเมื่อไหร่' 'ประกันถึงเมื่อไหร่' 'นี่ของแท้ DINOCO ไหม' 'S/N นี้ของอะไร' หรือส่งเลข S/N รูปแบบ DNCSS+ตัวเลข มา — ★ read-only canonical lookup (chatbot-rules §15.2). ห้าม guess product/owner จาก context — เรียก tool ทุกครั้ง. ถ้า not_found → 'อาจไม่ใช่ของแท้ DINOCO หรือยังไม่ลงทะเบียน' (อย่าสรุปว่าปลอม — เป็น admin call)",
       parameters: {
         type: "object",
         properties: {
-          serial: { type: "string", description: "เลข S/N เช่น 'DNCSS0001234'" },
+          serial: { type: "string", description: "เลข S/N เช่น 'DNCSS0001234' (format: DNCSS + ตัวเลข 7 หลัก legacy หรือ DNCSS+RAND6+CHK1 ใหม่)" },
         },
         required: ["serial"],
       },
@@ -231,7 +246,7 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_create_claim",
-      description: "★ เปิดใบเคลมสินค้า DINOCO เข้าระบบ — ใช้เมื่อลูกค้าต้องการเคลม+ได้ข้อมูลครบแล้ว ★ ห้ามเรียกถ้ายังไม่ได้ข้อมูลครบ ต้องถามก่อน: อาการ + ภาพบัตรรับประกัน + ภาพสินค้า + เบอร์โทร + ชื่อ + ที่อยู่จัดส่ง",
+      description: "★ เปิดใบเคลมสินค้า DINOCO เข้าระบบ — ใช้เมื่อลูกค้าต้องการเคลม+ได้ข้อมูลครบแล้ว ★ ห้ามเรียกถ้ายังไม่ได้ข้อมูลครบ ต้องถามก่อน: อาการ + ภาพบัตรรับประกัน + ภาพสินค้า + เบอร์โทร + ชื่อ + ที่อยู่จัดส่ง. ★ S/N validation (§15.9): ถ้ามี serial → backend จะตรวจ sn_pool; ถ้าไม่พบ/voided/recalled/stolen → tool block และไม่ insert claim",
       parameters: {
         type: "object",
         properties: {
@@ -1036,4 +1051,10 @@ module.exports = {
   executeTool,
   trackUnansweredQuestion,
   init,
+  // V.6.1 — Round 2 §15.14 helpers exported for claim-flow.js Photo OCR validation
+  normalizeSerial,
+  isCanonicalSn,
+  isLenientSn,
+  SN_PREFIX_REGEX,
+  SN_LENIENT_REGEX,
 };

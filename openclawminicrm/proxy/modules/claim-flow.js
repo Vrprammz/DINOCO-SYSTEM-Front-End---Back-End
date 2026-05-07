@@ -1,9 +1,153 @@
 /**
  * claim-flow.js — Manual claim flow, AI-powered claim detection + KB-aware questions
+ * V.4.0 — Phase 4 W14.4 Round 2 (chatbot-rules.md §15.8 / §15.14.5):
+ *         + extractSerialFromAnalysis() — regex extraction of S/N from Gemini Vision text
+ *         + validatePhotoSerial() — sn_pool lookup with 4-eyes fraud detection
+ *         + analyzeClaimPhoto() now validates extracted SNs in background (non-blocking)
+ *         + new claim doc fields: ocrExtractedSerials[], ocrValidationFlags[]
+ *         All telegram alerts use try/catch — claim flow NEVER breaks on OCR validation.
+ *         Backward compat: existing claim states + signatures unchanged.
  * V.3.0 — Fix: isClaimIntent strict mode + ห้าม hijack "สอบถามสินค้า" + claim timeout 24h
  */
 const { getDB, getTemplate, getDynamicKeySync } = require("./shared");
-const { callDinocoAPI } = require("./dinoco-cache");
+const { callDinocoAPI, getCachedSnLookup, cacheSnLookup } = require("./dinoco-cache");
+
+// V.4.0 — lazy-load to avoid circular dep (dinoco-tools.js doesn't import claim-flow,
+// but importing tools at top would still pay startup cost on every module load)
+let _snHelpers = null;
+function _getSnHelpers() {
+  if (!_snHelpers) {
+    try { _snHelpers = require("./dinoco-tools"); }
+    catch (e) { _snHelpers = {}; }
+  }
+  return _snHelpers;
+}
+let _telegramAlertFn = null;
+function _getTelegramAlert() {
+  if (!_telegramAlertFn) {
+    try { _telegramAlertFn = require("./telegram-alert").sendTelegramAlert; }
+    catch (e) { _telegramAlertFn = async () => ({ ok: false }); }
+  }
+  return _telegramAlertFn;
+}
+
+// V.4.0 — chatbot-rules.md §15.14.5 Photo OCR fraud detection
+// Lenient pattern catches OCR noise (DNCSS / DNCXX...) — backend /sn-lookup is authoritative
+const OCR_SN_REGEX = /DNC[A-Z0-9]{3,11}/gi;
+
+/**
+ * Extract candidate S/N strings from Gemini Vision analysis text.
+ * Returns deduped uppercase array. Empty array if none detected.
+ * Pure-logic — no I/O.
+ */
+function extractSerialFromAnalysis(analysisText) {
+  if (!analysisText || typeof analysisText !== "string") return [];
+  const matches = analysisText.match(OCR_SN_REGEX) || [];
+  const seen = new Set();
+  for (const m of matches) {
+    const norm = m.toUpperCase().replace(/[\s-]+/g, "");
+    if (norm.length >= 6) seen.add(norm); // skip noise like "DNCAB"
+  }
+  return Array.from(seen);
+}
+
+/**
+ * Validate extracted S/N against sn_pool — 4 outcomes per §15.14.5:
+ *   - not_found      → flag fake_sn_attempt + telegram ocr_unknown_serial
+ *   - voided/recalled/stolen → flag sensitive_state + telegram voided_inquiry
+ *   - registered + owner mismatch → flag requires_4eyes_review + telegram ocr_mismatch_fraud_suspect
+ *   - registered + owner match → ✓ (no flag)
+ *
+ * Returns { sn, status, flag, alertCategory } — never throws.
+ * AI rule: NEVER tell customer the validation result directly — admin's call.
+ */
+async function validatePhotoSerial(sn, claim, sourceId) {
+  const result = { sn, status: "unknown", flag: null, alertCategory: null };
+  try {
+    // Cache hit shortcut (60s TTL) — avoid spamming /sn-lookup during multi-photo upload
+    let snData = getCachedSnLookup(sn);
+    if (!snData) {
+      const apiResult = await callDinocoAPI("/sn-lookup", { sn });
+      if (typeof apiResult === "string") {
+        // upstream error string — treat as not_found for safety
+        result.status = "not_found";
+        result.flag = "fake_sn_attempt";
+        result.alertCategory = "ocr_unknown_serial";
+        return result;
+      }
+      snData = apiResult;
+      if (snData && snData.found) cacheSnLookup(sn, snData);
+    }
+
+    if (!snData || !snData.found) {
+      result.status = "not_found";
+      result.flag = "fake_sn_attempt";
+      result.alertCategory = "ocr_unknown_serial";
+      // Telegram escalate — F#12 anti-fraud counterfeit suspect
+      const sendAlert = _getTelegramAlert();
+      sendAlert("ocr_unknown_serial", {
+        sourceId, customerName: claim.customerName,
+        platform: claim.platform || "unknown",
+        customerText: `OCR extracted SN ${sn} from claim photo — not in sn_pool`,
+        sn,
+      }).catch(() => {});
+      return result;
+    }
+
+    const status = String(snData.status || "").toLowerCase();
+    result.status = status;
+
+    if (["voided", "recalled", "stolen"].includes(status)) {
+      result.flag = "sensitive_state";
+      result.alertCategory = "voided_inquiry";
+      const sendAlert = _getTelegramAlert();
+      sendAlert("voided_inquiry", {
+        sourceId, customerName: claim.customerName,
+        platform: claim.platform || "unknown",
+        customerText: `OCR extracted SN ${sn} — sn_pool status=${status} during claim flow`,
+        sn,
+      }).catch(() => {});
+      return result;
+    }
+
+    // Owner mismatch detection — only when backend provides registered_user_id field
+    const ownerUid = snData.registered_user_id || snData.registered_line_uid || null;
+    if (status === "registered" && ownerUid && claim.sourceId && ownerUid !== claim.sourceId) {
+      result.flag = "requires_4eyes_review";
+      result.alertCategory = "ocr_mismatch_fraud_suspect";
+      const sendAlert = _getTelegramAlert();
+      sendAlert("ocr_mismatch_fraud_suspect", {
+        sourceId, customerName: claim.customerName,
+        platform: claim.platform || "unknown",
+        customerText: `OCR SN ${sn} owned by ${ownerUid}, claim from ${claim.sourceId}`,
+        sn,
+      }).catch(() => {});
+      return result;
+    }
+
+    // ✓ pass — registered + owner matches (or no owner check available)
+    return result;
+  } catch (e) {
+    console.error("[ClaimOCR] validatePhotoSerial error:", e.message);
+    return result; // never throw — claim flow continues
+  }
+}
+
+/**
+ * Run the full OCR validation chain on a single photo's analysis text.
+ * Returns { extractedSerials[], validationFlags[] } — both arrays may be empty.
+ * Side effects: telegram alerts (best-effort), claim doc update via caller.
+ */
+async function runPhotoOcrValidation(analysisText, claim, sourceId) {
+  const extracted = extractSerialFromAnalysis(analysisText);
+  if (extracted.length === 0) return { extractedSerials: [], validationFlags: [] };
+  const flags = [];
+  for (const sn of extracted) {
+    const v = await validatePhotoSerial(sn, claim, sourceId);
+    if (v.flag) flags.push({ sn: v.sn, status: v.status, flag: v.flag, at: new Date() });
+  }
+  return { extractedSerials: extracted, validationFlags: flags };
+}
 
 // Forward declarations
 let analyzeImage = null;
@@ -309,6 +453,23 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
         });
         const analysis = await analyzeClaimPhoto(imageUrl);
         if (analysis) {
+          // V.4.0 — chatbot-rules.md §15.14.5 Photo OCR fraud validation
+          // Best-effort + non-blocking on alerts; never break claim flow on failure.
+          try {
+            const ocr = await runPhotoOcrValidation(analysis, claim, sourceId);
+            if (ocr.extractedSerials.length > 0 || ocr.validationFlags.length > 0) {
+              await db.collection("manual_claims").updateOne(
+                { _id: claim._id },
+                {
+                  $set: { updatedAt: new Date() },
+                  $addToSet: { ocrExtractedSerials: { $each: ocr.extractedSerials } },
+                  $push: { ocrValidationFlags: { $each: ocr.validationFlags } },
+                }
+              );
+            }
+          } catch (ocrErr) {
+            console.error("[ClaimOCR] photo_requested validation error:", ocrErr.message);
+          }
           const isBlurry = /ไม่ชัด|ขอถ่ายใหม่|มืด|เบลอ/.test(analysis);
           if (isBlurry) {
             await db.collection("manual_claims").updateOne({ _id: claim._id }, {
@@ -353,6 +514,21 @@ async function processClaimMessage(sourceId, platform, text, imageUrl, customerN
           await db.collection("manual_claims").updateOne({ _id: claim._id }, {
             $set: { aiAnalysis: (claim.aiAnalysis || "") + "\n" + extraAnalysis },
           });
+          // V.4.0 — §15.14.5 OCR validation on extra photos too
+          try {
+            const ocr = await runPhotoOcrValidation(extraAnalysis, claim, sourceId);
+            if (ocr.extractedSerials.length > 0 || ocr.validationFlags.length > 0) {
+              await db.collection("manual_claims").updateOne(
+                { _id: claim._id },
+                {
+                  $addToSet: { ocrExtractedSerials: { $each: ocr.extractedSerials } },
+                  $push: { ocrValidationFlags: { $each: ocr.validationFlags } },
+                }
+              );
+            }
+          } catch (ocrErr) {
+            console.error("[ClaimOCR] photo_received validation error:", ocrErr.message);
+          }
         }
         return "ได้รูปเพิ่มแล้วค่ะ\nสินค้ารุ่นอะไรคะ";
       }
@@ -466,4 +642,9 @@ module.exports = {
   processClaimMessage,
   ensureClaimIndexes,
   init,
+  // V.4.0 — Round 2 §15.14.5 Photo OCR helpers (exported for testing + reuse)
+  extractSerialFromAnalysis,
+  validatePhotoSerial,
+  runPhotoOcrValidation,
+  OCR_SN_REGEX,
 };
