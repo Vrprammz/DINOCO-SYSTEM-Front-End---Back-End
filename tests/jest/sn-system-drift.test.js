@@ -4654,4 +4654,551 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(content).toContain('test_utf8_bom_is_correct_3_bytes');
         });
     });
+
+    describe('Phase 5 W15.2 Marketplace LIFF', () => {
+        const MPX_PATH = path.join(REPO_ROOT, '[System] DINOCO Warranty Extension Marketplace');
+        const readMpx = () => fs.readFileSync(MPX_PATH, 'utf8');
+
+        test('Marketplace LIFF snippet file exists', () => {
+            expect(fs.existsSync(MPX_PATH)).toBe(true);
+        });
+
+        test('Header has V.0.1 with date 2026-05-07', () => {
+            const code = readMpx();
+            expect(code).toMatch(/Version:\s*V\.0\.1[\s\S]{0,100}2026-05-07/);
+            expect(code).toContain('Phase 5 W15.2');
+        });
+
+        test('Shortcode [dinoco_warranty_extend] registered', () => {
+            const code = readMpx();
+            expect(code).toMatch(/add_shortcode\(\s*['"]dinoco_warranty_extend['"]/);
+        });
+
+        test('LIFF route /warranty/extend documented in header', () => {
+            const code = readMpx();
+            expect(code).toContain('/warranty/extend');
+        });
+
+        test('All 4 stage UI containers present', () => {
+            const code = readMpx();
+            expect(code).toContain('dnc-sn-mpx-stage-1');
+            expect(code).toContain('dnc-sn-mpx-stage-2');
+            expect(code).toContain('dnc-sn-mpx-stage-3');
+            expect(code).toContain('dnc-sn-mpx-stage-4');
+        });
+
+        test('LINE OAuth WARRANTY_EXTEND_SN intent (distinct from ACTIVATE)', () => {
+            const code = readMpx();
+            expect(code).toContain('WARRANTY_EXTEND_SN');
+            // Must NOT use ACTIVATE intent (that belongs to activation LIFF)
+            expect(code).not.toContain("'WARRANTY_ACTIVATE_SN'");
+        });
+
+        test('OAuth state-token transient pattern (10min TTL)', () => {
+            const code = readMpx();
+            expect(code).toMatch(/set_transient\(\s*['"]dinoco_line_state_/);
+            expect(code).toContain('600'); // 10 min
+        });
+
+        test('Module Registry self-registration call (defensive)', () => {
+            const code = readMpx();
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_register_admin_module['"]\s*\)/);
+            expect(code).toMatch(/dinoco_register_admin_module\(/);
+            expect(code).toContain("'section'");
+            expect(code).toContain("'customer-facing'");
+            expect(code).toContain("'key'");
+            expect(code).toContain("'marketplace'");
+        });
+
+        test('CSS prefix .dnc-sn-mpx-* (distinct from .dnc-sn-mp-*)', () => {
+            const code = readMpx();
+            expect(code).toContain('.dnc-sn-mpx-');
+            // Sanity: no Manager-prefixed CSS rules leak into this snippet.
+            // Strip doc-comment lines (containing `*` lead) before checking,
+            // so the header note "different prefix from Manager .dnc-sn-mp-*"
+            // does not false-positive trip this guard.
+            const codeNoComments = code
+                .split('\n')
+                .filter(line => !/^\s*\*/.test(line))
+                .join('\n');
+            expect(codeNoComments).not.toMatch(/\.dnc-sn-mp-(?!x)/);
+        });
+
+        test('UX-H3 compliance: event delegation (no inline onclick=)', () => {
+            const code = readMpx();
+            // Should use data-action, not onclick=
+            expect(code).toContain('data-action=');
+            // Must NOT have inline onclick handlers in production HTML output
+            // (filter out onclick within JS string literals doesn't apply to esc'd output)
+            const onclickMatches = code.match(/<\w[^>]*\sonclick=/g);
+            expect(onclickMatches).toBeNull();
+        });
+
+        test('Defensive feature flag check (marketplace_enabled)', () => {
+            const code = readMpx();
+            expect(code).toContain('dinoco_sn_marketplace_enabled');
+        });
+
+        test('5 pure-logic helpers exposed for testing', () => {
+            const code = readMpx();
+            expect(code).toContain('dinoco_sn_mpx_check_ownership');
+            expect(code).toContain('dinoco_sn_mpx_validate_status');
+            expect(code).toContain('dinoco_sn_mpx_check_grace_period');
+            expect(code).toContain('dinoco_sn_mpx_compute_total');
+            expect(code).toContain('dinoco_sn_mpx_image_compress_target');
+        });
+
+        test('Grace period default 30 days (boss decision)', () => {
+            const code = readMpx();
+            // 30-day grace post-expiry hardcoded as default param
+            expect(code).toMatch(/grace_days\s*=\s*30/);
+        });
+
+        test('Status block messages cover all forbidden states', () => {
+            const code = readMpx();
+            ['voided', 'recalled', 'stolen', 'claimed', 'transferred'].forEach(status => {
+                expect(code).toContain("'" + status + "'");
+            });
+        });
+
+        test('PHPUnit test file exists with all 5 helper coverage groups', () => {
+            const TEST_PATH = path.join(REPO_ROOT, 'tests/helpers/SnMarketplaceLiffTest.php');
+            expect(fs.existsSync(TEST_PATH)).toBe(true);
+            const t = fs.readFileSync(TEST_PATH, 'utf8');
+            // Each helper group has at least 1 test
+            expect(t).toContain('test_ownership_match_ok');
+            expect(t).toContain('test_status_registered_allowed');
+            expect(t).toContain('test_grace_warranty_not_yet_expired_eligible');
+            expect(t).toContain('test_total_basic_with_vat');
+            expect(t).toContain('test_compress_over_2mb_target_quality_85');
+            // Grace boundary edge case covered
+            expect(t).toContain('test_grace_exactly_at_grace_boundary_eligible');
+            expect(t).toContain('test_grace_exceeded_blocked');
+        });
+    });
+
+    describe('Phase 5 W15.3+W15.4 Marketplace REST', () => {
+        const readRest = () => readSnippet('rest');
+
+        test('REST API version bumped to V.0.24+', () => {
+            const code = readRest();
+            expect(code).toMatch(/Version: V\.0\.(2[4-9]|[3-9]\d)/);
+        });
+
+        test('Marketplace master kill switch flag wired (default OFF)', () => {
+            const code = readRest();
+            expect(code).toContain("'dinoco_sn_marketplace_enabled'");
+            expect(code).toContain('dinoco_sn_marketplace_is_enabled');
+        });
+
+        test('All 8 marketplace routes registered', () => {
+            const code = readRest();
+            const routes = [
+                "'/marketplace/quote'",
+                "'/marketplace/checkout'",
+                "/marketplace/checkout/(?P<id>",
+                "/marketplace/(?P<id>\\d+)/receipt",
+                "/marketplace/pricing/(?P<sku>",
+                "'/marketplace/pending-review'",
+                "/marketplace/(?P<id>\\d+)/approve",
+                "/marketplace/(?P<id>\\d+)/reject",
+            ];
+            routes.forEach((r) => {
+                expect(code).toContain(r);
+            });
+        });
+
+        test('Customer endpoints use perm_logged_in (not admin)', () => {
+            const code = readRest();
+            // Quote endpoint must be logged-in not admin
+            const quoteBlock = code.split("'/marketplace/quote'")[1] || '';
+            expect(quoteBlock.split('register_rest_route')[0])
+                .toContain("'permission_callback' => 'dinoco_sn_perm_logged_in'");
+        });
+
+        test('Admin endpoints use perm_admin', () => {
+            const code = readRest();
+            const adminRoutes = [
+                "/marketplace/pricing/(?P<sku>",
+                "'/marketplace/pending-review'",
+                "/marketplace/(?P<id>\\d+)/approve",
+                "/marketplace/(?P<id>\\d+)/reject",
+            ];
+            adminRoutes.forEach((needle) => {
+                const block = code.split(needle)[1] || '';
+                expect(block.split('register_rest_route')[0])
+                    .toContain("'permission_callback' => 'dinoco_sn_perm_admin'");
+            });
+        });
+
+        test('All 4 customer + 4 admin POST handlers wrapped with idempotency', () => {
+            const code = readRest();
+            const expectedNamespaces = [
+                "'marketplace-checkout'",
+                "'marketplace-upload-slip'",
+                "'marketplace-pricing-save'",
+                "'marketplace-approve'",
+                "'marketplace-reject'",
+            ];
+            expectedNamespaces.forEach((ns) => {
+                expect(code).toContain(ns);
+                // Each must be wrapped via dinoco_sn_with_idempotency
+                const ctx = code.split(ns)[0] || '';
+                // Look back ~600 chars for the wrapper invocation
+                const window = ctx.slice(-600);
+                expect(window).toContain('dinoco_sn_with_idempotency');
+            });
+        });
+
+        test('apply_warranty_extension function exists with W15.4 atomic guarantees', () => {
+            const code = readRest();
+            expect(code).toContain('function dinoco_sn_apply_warranty_extension');
+            const fn = code.split('function dinoco_sn_apply_warranty_extension')[1] || '';
+            // Atomic guarantees per W15.4 plan
+            expect(fn).toContain('GET_LOCK');
+            expect(fn).toContain('FOR UPDATE');
+            expect(fn).toContain('START TRANSACTION');
+            expect(fn).toMatch(/COMMIT|ROLLBACK/);
+            expect(fn).toContain('RELEASE_LOCK');
+            // Audit log on success
+            expect(fn).toContain("'warranty_extended'");
+            // Sensitive flag for 5y retention
+            expect(fn).toMatch(/sensitive\s*=\s*true|true\s*\)/);
+        });
+
+        test('Defensive function_exists guards on cross-snippet helpers', () => {
+            const code = readRest();
+            // PromptPay QR + Slip2Go must be guarded
+            expect(code).toMatch(/function_exists\(\s*['"]b2b_generate_promptpay_qr['"]\s*\)/);
+            expect(code).toMatch(/function_exists\(\s*['"]b2b_verify_slip_image['"]\s*\)/);
+            // Audit + obs logger guarded
+            expect(code).toMatch(/function_exists\(\s*['"]dinoco_sn_audit_log['"]\s*\)/);
+        });
+
+        test('Q7 — B2B_BANK_* constants used for bank info (not new partnership)', () => {
+            const code = readRest();
+            const checkout = code.split('function dinoco_sn_handler_marketplace_checkout')[1] || '';
+            expect(checkout).toContain("defined( 'B2B_BANK_ACCOUNT' )");
+            expect(checkout).toContain("defined( 'B2B_BANK_NAME' )");
+            expect(checkout).toContain("defined( 'B2B_BANK_HOLDER' )");
+        });
+
+        test('Q8 — per-SKU pricing reads sn_ext_price_{N}y columns', () => {
+            const code = readRest();
+            // Pricing save endpoint touches sn_ext_price_1y/2y/3y
+            const pricingFn = code.split('function dinoco_sn_handler_marketplace_pricing_save')[1] || '';
+            expect(pricingFn).toContain('sn_ext_price_1y');
+            expect(pricingFn).toContain('sn_ext_price_2y');
+            expect(pricingFn).toContain('sn_ext_price_3y');
+        });
+
+        test('Pricing validator rejects illogical orderings', () => {
+            const code = readRest();
+            const validator = code.split('function dinoco_sn_marketplace_validate_pricing')[1] || '';
+            expect(validator).toContain("'illogical_pricing'");
+            expect(validator).toContain('1000000'); // ceiling
+        });
+
+        test('Quote handler computes VAT 7% + savings_pct hint', () => {
+            const code = readRest();
+            const quoteFn = code.split('function dinoco_sn_marketplace_compute_quote')[1] || '';
+            // VAT rate 0.07 (Thai 7%)
+            expect(quoteFn).toMatch(/0\.07|7\s*\/\s*100/);
+            // Quote endpoint exposes savings_pct + new_warranty_end_if_purchased
+            const handler = code.split('function dinoco_sn_rest_marketplace_quote')[1] || '';
+            expect(handler).toContain('new_warranty_end_if_purchased');
+            expect(handler).toContain('warranty_status'); // active|grace|expired
+        });
+
+        test('Slip upload uses GET_LOCK + FOR UPDATE + idempotent re-process guard', () => {
+            const code = readRest();
+            const fn = code.split('function dinoco_sn_handler_marketplace_upload_slip')[1] || '';
+            expect(fn).toContain('GET_LOCK');
+            expect(fn).toContain('FOR UPDATE');
+            expect(fn).toContain('RELEASE_LOCK');
+            // Idempotent re-process — already-processed returns current state without re-flipping
+            expect(fn).toMatch(/already_processed|idempotent.*=>\s*true/i);
+        });
+
+        test('Reject endpoint requires reason ≥10 chars', () => {
+            const code = readRest();
+            // Find the reject route registration block
+            const rejectRoute = code.split("/marketplace/(?P<id>\\d+)/reject")[1] || '';
+            const block = rejectRoute.split('register_rest_route')[0] || '';
+            // Allow either mb_strlen(...) >= 10 or mb_strlen(trim($v)) >= 10
+            expect(block).toMatch(/mb_strlen\([^;]*?\)\s*>=\s*10/);
+        });
+
+        test('PHPUnit SnMarketplaceTransactionTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnMarketplaceTransactionTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            // Quote math
+            expect(content).toContain('test_quote_1y_basic_vat_7pct');
+            // Date math
+            expect(content).toContain('test_compute_new_end_1y_addition');
+            expect(content).toContain('test_compute_new_end_leap_year');
+            // Grace period boundary
+            expect(content).toContain('test_warranty_status_grace_within_30d');
+            expect(content).toContain('test_warranty_status_expired_beyond_grace');
+            // Pricing validator
+            expect(content).toContain('test_pricing_illogical_1y_gte_2y_rejected');
+            expect(content).toContain('test_pricing_above_ceiling_rejected');
+            // FSM
+            expect(content).toContain('test_fsm_paid_to_refunded_allowed');
+            expect(content).toContain('test_fsm_rejected_to_paid_blocked');
+            // Idempotency
+            expect(content).toContain('test_idempotency_hash_deterministic');
+            expect(content).toContain('test_idempotency_hash_different_user_different_hash');
+        });
+
+        test('All POST handlers return 503 feature_disabled when flag OFF', () => {
+            const code = readRest();
+            const handlers = [
+                'function dinoco_sn_rest_marketplace_quote',
+                'function dinoco_sn_rest_marketplace_checkout',
+                'function dinoco_sn_rest_marketplace_upload_slip',
+                'function dinoco_sn_rest_marketplace_receipt',
+                'function dinoco_sn_rest_marketplace_pricing_save',
+                'function dinoco_sn_rest_marketplace_pending_review',
+                'function dinoco_sn_rest_marketplace_approve',
+                'function dinoco_sn_rest_marketplace_reject',
+            ];
+            handlers.forEach((needle) => {
+                const fn = code.split(needle)[1] || '';
+                // Each handler short-circuits feature_disabled
+                const head = fn.slice(0, 600);
+                expect(head).toContain("'feature_disabled'");
+                expect(head).toContain('dinoco_sn_marketplace_is_enabled');
+            });
+        });
+    });
+
+    /* ─── Phase 5 W15.1+W15.5+W15.6 Manager Tab 11 Marketplace ─── */
+    describe('Phase 5 W15 Manager Tab 11 Marketplace', () => {
+
+        test('Manager bumped to V.0.31', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/V\.0\.31.*Phase 5 W15/);
+        });
+
+        test('Tab 11 nav-item declared in admin UI', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('data-tab="marketplace"');
+            expect(code).toContain('💎 Marketplace');
+        });
+
+        test('Tab 11 panel mount + render function wired', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('data-tab-panel="marketplace"');
+            expect(code).toContain('dinoco_sn_render_tab_marketplace()');
+        });
+
+        test('Tab 11 has 4 sub-tabs (Pricing/Pending Review/All Transactions/Refunds)', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('data-mp-subtab="pricing"');
+            expect(code).toContain('data-mp-subtab="pending-review"');
+            expect(code).toContain('data-mp-subtab="transactions"');
+            expect(code).toContain('data-mp-subtab="refunds"');
+        });
+
+        test('4 sub-panels mounted with role=tabpanel', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('data-mp-panel="pricing"');
+            expect(code).toContain('data-mp-panel="pending-review"');
+            expect(code).toContain('data-mp-panel="transactions"');
+            expect(code).toContain('data-mp-panel="refunds"');
+            expect(code).toContain('role="tablist"');
+            expect(code).toContain('role="tab"');
+            expect(code).toContain('role="tabpanel"');
+        });
+
+        test('All 4 marketplace pure-logic helpers defined', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/function\s+dinoco_sn_marketplace_format_price\s*\(/);
+            expect(code).toMatch(/function\s+dinoco_sn_marketplace_classify_status\s*\(/);
+            expect(code).toMatch(/function\s+dinoco_sn_marketplace_compute_savings\s*\(/);
+            expect(code).toMatch(/function\s+dinoco_sn_marketplace_validate_pricing\s*\(/);
+        });
+
+        test('Helpers are function_exists guarded (defensive)', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("function_exists( 'dinoco_sn_marketplace_format_price' )");
+            expect(code).toContain("function_exists( 'dinoco_sn_marketplace_classify_status' )");
+            expect(code).toContain("function_exists( 'dinoco_sn_marketplace_compute_savings' )");
+            expect(code).toContain("function_exists( 'dinoco_sn_marketplace_validate_pricing' )");
+        });
+
+        test('REST endpoint paths referenced in JS handlers', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("'/marketplace/pricing/'");
+            expect(code).toContain('/marketplace/pricing');
+            expect(code).toContain("'/marketplace/pending-review'");
+            expect(code).toMatch(/\/marketplace\/'\s*\+\s*encodeURIComponent\(.+\)\s*\+\s*'\/approve/);
+            expect(code).toMatch(/\/marketplace\/'\s*\+\s*encodeURIComponent\(.+\)\s*\+\s*'\/reject/);
+            expect(code).toMatch(/\/marketplace\/'\s*\+\s*encodeURIComponent\(.+\)\s*\+\s*'\/refund/);
+            expect(code).toContain('/marketplace/transactions');
+        });
+
+        test('Sub-tab uses purple accent (#7c3aed)', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/\.dnc-sn-mp-subtab\.active[\s\S]*?background:\s*#7c3aed/);
+        });
+
+        test('Refund modal enforces 4-eyes threshold (≥฿5,000) per Q20', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('MP_REFUND_4EYES_THRESHOLD');
+            expect(code).toMatch(/MP_REFUND_4EYES_THRESHOLD\s*=\s*5000/);
+            expect(code).toContain('dnc-sn-mp-refund-approver-row');
+            expect(code).toContain('dnc-sn-mp-refund-approver');
+        });
+
+        test('Refund modal requires typed REFUND CONFIRM string', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('dnc-sn-mp-refund-confirm');
+            expect(code).toMatch(/'REFUND CONFIRM'/);
+        });
+
+        test('Pricing inline-edit uses event delegation (no inline onclick on price inputs)', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/classList\.contains\(\s*'dnc-sn-mp-price-input'\s*\)/);
+            expect(code).toContain('dncSnMpSavePriceFromInput');
+        });
+
+        test('Pending Review supports auto-refresh every 30s', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('dnc-sn-mp-pending-autorefresh');
+            expect(code).toMatch(/setInterval\([^,]+,\s*30000\s*\)/);
+        });
+
+        test('Pending Review badge shows count', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('dnc-sn-mp-pending-badge');
+            expect(code).toContain('dncSnMpRefreshPendingBadge');
+        });
+
+        test('All Transactions has 5 filters (status/from/to/sku/sn) + CSV export', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('dnc-sn-mp-tx-status');
+            expect(code).toContain('dnc-sn-mp-tx-from');
+            expect(code).toContain('dnc-sn-mp-tx-to');
+            expect(code).toContain('dnc-sn-mp-tx-sku');
+            expect(code).toContain('dnc-sn-mp-tx-sn');
+            expect(code).toContain('mp-tx-export');
+            expect(code).toContain('format=csv');
+        });
+
+        test('All Transactions has pagination (server-side)', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('dnc-sn-mp-tx-pagination');
+            expect(code).toContain('_mpTxPage');
+            expect(code).toContain('_mpTxLimit');
+        });
+
+        test('All 7 status badges have color class definitions', () => {
+            const code = readSnippet('manager');
+            const statuses = [
+                'dnc-sn-mp-status-pending-payment',
+                'dnc-sn-mp-status-pending-review',
+                'dnc-sn-mp-status-paid',
+                'dnc-sn-mp-status-expired',
+                'dnc-sn-mp-status-refunded',
+                'dnc-sn-mp-status-rejected',
+                'dnc-sn-mp-status-cancelled',
+            ];
+            statuses.forEach((cls) => expect(code).toContain('.' + cls));
+        });
+
+        test('Tab 11 lazy-loads via dncSnMpInit on first activation', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain("which === 'marketplace'");
+            expect(code).toContain('_dncSnMpLoaded');
+            expect(code).toContain('window.dncSnMpInit');
+        });
+
+        test('Graceful degradation when REST endpoint not deployed (404 handling)', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/r\.status\s*===\s*404/);
+            expect(code).toMatch(/Phase 5/);
+        });
+
+        test('Reject modal requires reason ≥ 5 chars', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('dnc-sn-mp-reject-reason');
+            expect(code).toMatch(/reason\.length\s*<\s*5/);
+        });
+
+        test('Refund modal requires reason ≥ 10 chars', () => {
+            const code = readSnippet('manager');
+            expect(code).toMatch(/reason\.length\s*<\s*10/);
+        });
+
+        test('Sub-panels use scoped .dnc-sn-mp-* CSS namespace', () => {
+            const code = readSnippet('manager');
+            const scopedClasses = [
+                '.dnc-sn-mp-subtabs',
+                '.dnc-sn-mp-subtab',
+                '.dnc-sn-mp-subpanel',
+                '.dnc-sn-mp-toolbar',
+                '.dnc-sn-mp-pricing-row',
+                '.dnc-sn-mp-status-badge',
+                '.dnc-sn-mp-saving-badge',
+            ];
+            scopedClasses.forEach((cls) => {
+                expect(code).toContain(cls);
+            });
+        });
+
+        test('format_price returns Thai conventions (ไม่เปิด / ฿0 (free))', () => {
+            const code = readSnippet('manager');
+            const fnSlice = code.split('function dinoco_sn_marketplace_format_price')[1] || '';
+            expect(fnSlice).toContain('ไม่เปิด');
+            expect(fnSlice).toContain('฿0 (free)');
+        });
+
+        test('classify_status returns 7 canonical statuses + unknown fallback', () => {
+            const code = readSnippet('manager');
+            const fnSlice = code.split('function dinoco_sn_marketplace_classify_status')[1] || '';
+            const statuses = [
+                "'pending_payment'",
+                "'pending_admin_review'",
+                "'paid'",
+                "'expired'",
+                "'refunded'",
+                "'rejected'",
+                "'cancelled'",
+            ];
+            statuses.forEach((s) => expect(fnSlice).toContain(s));
+            expect(fnSlice).toContain('ไม่ทราบ');
+        });
+
+        test('validate_pricing rejects illogical orderings + > 1M cap', () => {
+            const code = readSnippet('manager');
+            const fnSlice = code.split('function dinoco_sn_marketplace_validate_pricing')[1] || '';
+            expect(fnSlice).toContain('price_2y_below_1y');
+            expect(fnSlice).toContain('price_3y_below_2y');
+            expect(fnSlice).toContain('price_3y_below_1y');
+            expect(fnSlice).toContain('1000000');
+            expect(fnSlice).toContain('_negative');
+            expect(fnSlice).toContain('_too_high');
+        });
+
+        test('compute_savings rejects 1y as years (no self-savings)', () => {
+            const code = readSnippet('manager');
+            const fnSlice = code.split('function dinoco_sn_marketplace_compute_savings')[1] || '';
+            expect(fnSlice).toMatch(/array\(\s*2\s*,\s*3\s*\)/);
+        });
+
+        test('PHPUnit SnMarketplacePricingTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnMarketplacePricingTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('test_format_price_null_returns_disabled_label');
+            expect(content).toContain('test_classify_status_all_seven_canonical_statuses');
+            expect(content).toContain('test_compute_savings_2y_at_18pct');
+            expect(content).toContain('test_validate_pricing_2y_below_1y_rejected_illogical');
+            expect(content).toContain('test_format_price_negative_returns_disabled');
+            expect(content).toContain('test_compute_savings_zero_base_returns_null');
+        });
+    });
 });

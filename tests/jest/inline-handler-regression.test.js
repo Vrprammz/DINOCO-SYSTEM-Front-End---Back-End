@@ -147,7 +147,13 @@ const SNIPPET_PREFIXES = [
 // header button + Suggested Action card "📨 ส่งให้บอส LINE" + "📋 สร้าง batch
 // ทันที" deep-link to Tab 1. Per Phase 4 W13 plan §W13.2. Phase 6 migration
 // sweep applies (will refactor to event delegation).
-const BASELINE_INLINE_HANDLER_COUNT = 951;
+//
+// Bumped 951→953 (2026-05-07): Phase 5 W15.2 F#8 Marketplace LIFF snippet added
+// 2 inline handlers (image onerror= fallback for product thumbnails in plan
+// select stage). Agent A Manager Tab 11 contributes 0 (full event delegation).
+// Per Phase 5 W15 plan §W15.2. Phase 6 migration sweep applies (will refactor
+// to CSS placeholder pattern).
+const BASELINE_INLINE_HANDLER_COUNT = 953;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

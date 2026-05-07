@@ -1,0 +1,1507 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [System] DINOCO Warranty Extension Marketplace                  ║
+ * ║  Version: V.0.1 (2026-05-07) — Phase 5 W15.2 F#8 Customer LIFF   ║
+ * ║  DB_ID: pending                                                  ║
+ * ║  Description: Customer-facing LIFF for warranty extension        ║
+ * ║    purchase. Reuses LINE OAuth pattern from Activation LIFF V.0.5║
+ * ║    (D11 v2.3 fix — no new JWT; reuses WP session via             ║
+ * ║    is_user_logged_in() + wp_create_nonce('wp_rest')).            ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * Plan ref: docs/sn-system/22-phase5-w15-w18-prep.md §W15.2
+ * Boss decisions: Q6 (Phase 4→Phase 5 marketplace), Q7 (Slip2Go reuse),
+ *                 Q8 (per-SKU pricing), Q20 (manual refund flow)
+ *
+ * Shortcode:  [dinoco_warranty_extend]
+ * LIFF route: /warranty/extend?sn=DNCSS0001234
+ *
+ * 4-stage UI flow (mobile-first):
+ *   Stage 1 — Plan select (1y/2y/3y) + coupon + total breakdown
+ *   Stage 2 — Payment instructions (PromptPay QR + bank + 24h timer)
+ *   Stage 3 — Slip upload (client compress → /upload-slip → poll)
+ *   Stage 4 — Success (paid) or Pending (admin review 2-4h)
+ *
+ * Auth (mirror Activation LIFF V.0.5):
+ *   - NO new JWT system — reuse WP session
+ *   - Not logged in → LINE OAuth WARRANTY_EXTEND_SN intent
+ *     → state-token transient (10min TTL) preserves sn through round-trip
+ *     → callback returns to /warranty/extend/?sn=...&welcome=1
+ *
+ * Defensive:
+ *   - All cross-snippet calls (REST API, modal helpers) wrapped in
+ *     function_exists(). Snippet works standalone if Agent C REST not synced
+ *     (renders "ระบบยังไม่เปิดให้บริการ" 503 message).
+ *   - sn_pool ownership check → 403 if registered_user_id != current uid
+ *   - sn_pool status validation (registered only; voided/recalled/stolen/
+ *     claimed/transferred → block with reason)
+ *   - warranty_until + 30d grace period — exceeded → block "ติดต่อทีมงาน"
+ *
+ * CSS scoping: .dnc-sn-mpx-* (different prefix from Manager .dnc-sn-mp-*
+ *   to avoid collision; `mpx` = marketplace extension)
+ *
+ * UX-H3 compliance: event delegation only (NO inline onclick=). All
+ *   interactive elements use [data-action="..."] attribute + delegated
+ *   click listener attached at page-mount.
+ *
+ * A11y: role=dialog on stage containers, aria-live=polite for status,
+ *   focus traps on modals, ESC closes overlays, ≥44px touch targets,
+ *   prefers-reduced-motion respected.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. SHORTCODE REGISTRATION
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! shortcode_exists( 'dinoco_warranty_extend' ) ) {
+    add_shortcode( 'dinoco_warranty_extend', 'dinoco_sn_render_warranty_extend' );
+}
+
+if ( ! function_exists( 'dinoco_sn_render_warranty_extend' ) ) {
+    /**
+     * Main shortcode handler. Routes through 4-stage UI based on context.
+     *
+     * Param: ?sn=DNCSS0001234 (required)
+     * Param: ?welcome=1 (set by LINE OAuth callback after first login)
+     */
+    function dinoco_sn_render_warranty_extend( $atts = array() ) {
+        // Master kill switch (sn_system_enabled)
+        if ( function_exists( 'dinoco_sn_is_enabled' ) && ! dinoco_sn_is_enabled() ) {
+            return dinoco_sn_mpx_render_disabled_msg();
+        }
+
+        // Marketplace-specific kill switch
+        $mpx_enabled = (bool) get_option( 'dinoco_sn_marketplace_enabled', 0 );
+        if ( ! $mpx_enabled ) {
+            return dinoco_sn_mpx_render_disabled_msg();
+        }
+
+        $sn = isset( $_GET['sn'] ) ? strtoupper( trim( sanitize_text_field( $_GET['sn'] ) ) ) : '';
+
+        ob_start();
+        ?>
+        <div class="dnc-sn-mpx-page" id="dnc-sn-mpx-root">
+            <?php dinoco_sn_mpx_render_styles(); ?>
+
+            <?php if ( $sn === '' ) : ?>
+                <?php dinoco_sn_mpx_render_landing(); ?>
+            <?php elseif ( ! preg_match( '/^[A-Z0-9]{8,16}$/', $sn ) ) : ?>
+                <?php dinoco_sn_mpx_render_error_box( 'invalid_sn_format', 'รูปแบบ S/N ไม่ถูกต้อง' ); ?>
+            <?php elseif ( ! is_user_logged_in() ) : ?>
+                <?php dinoco_sn_mpx_render_oauth_gate( $sn ); ?>
+            <?php else : ?>
+                <?php dinoco_sn_mpx_render_authorized_flow( $sn ); ?>
+            <?php endif; ?>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mpx_render_disabled_msg' ) ) {
+    function dinoco_sn_mpx_render_disabled_msg() {
+        return '<div class="dnc-sn-mpx-disabled" role="alert" style="text-align:center;padding:48px 20px;max-width:480px;margin:0 auto;">
+            <div style="font-size:48px;margin-bottom:12px;">💎</div>
+            <h3 style="margin:0 0 8px;color:#1f2937;">ระบบยังไม่เปิดให้บริการ</h3>
+            <p style="color:#6b7280;line-height:1.6;">การต่อประกันออนไลน์จะเปิดเร็วๆนี้<br>กรุณาติดต่อทีมงานหากต้องการต่อประกัน</p>
+        </div>';
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. STYLES (scoped .dnc-sn-mpx-*)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_mpx_render_styles' ) ) {
+    function dinoco_sn_mpx_render_styles() {
+        static $rendered = false;
+        if ( $rendered ) return;
+        $rendered = true;
+        ?>
+        <style>
+            .dnc-sn-mpx-page {
+                max-width: 480px;
+                margin: 0 auto;
+                padding: 16px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                color: #1f2937;
+                line-height: 1.6;
+            }
+            .dnc-sn-mpx-page * { box-sizing: border-box; }
+
+            .dnc-sn-mpx-stage {
+                display: none;
+                background: #fff;
+                border-radius: 16px;
+                padding: 20px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+                margin-bottom: 16px;
+            }
+            .dnc-sn-mpx-stage.is-active { display: block; }
+
+            .dnc-sn-mpx-stage-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 16px;
+                padding-bottom: 12px;
+                border-bottom: 1px solid #e5e7eb;
+            }
+            .dnc-sn-mpx-stage-header h2 {
+                margin: 0;
+                font-size: 18px;
+                font-weight: 700;
+            }
+
+            .dnc-sn-mpx-product-card {
+                background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+                padding: 14px;
+                border-radius: 12px;
+                margin-bottom: 16px;
+                display: flex;
+                gap: 12px;
+                align-items: center;
+            }
+            .dnc-sn-mpx-product-card img {
+                width: 64px; height: 64px;
+                border-radius: 8px;
+                object-fit: cover;
+                background: #fff;
+            }
+            .dnc-sn-mpx-product-card .info {
+                flex: 1; min-width: 0;
+            }
+            .dnc-sn-mpx-product-card .name {
+                font-weight: 600;
+                font-size: 15px;
+                margin-bottom: 4px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .dnc-sn-mpx-product-card .meta {
+                font-size: 12px;
+                color: #4b5563;
+            }
+
+            .dnc-sn-mpx-plan {
+                position: relative;
+                padding: 16px;
+                border: 2px solid #e5e7eb;
+                border-radius: 12px;
+                margin-bottom: 12px;
+                cursor: pointer;
+                background: #fff;
+                transition: all 0.2s;
+                min-height: 48px;
+            }
+            .dnc-sn-mpx-plan:hover { border-color: #d1d5db; }
+            .dnc-sn-mpx-plan.is-selected {
+                border-color: #10b981;
+                background: #ecfdf5;
+            }
+            .dnc-sn-mpx-plan .badge-recommend {
+                position: absolute;
+                top: -10px; right: 12px;
+                background: #f59e0b;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 4px 10px;
+                border-radius: 999px;
+            }
+            .dnc-sn-mpx-plan .label {
+                font-size: 14px;
+                font-weight: 600;
+                color: #6b7280;
+            }
+            .dnc-sn-mpx-plan.is-selected .label { color: #065f46; }
+            .dnc-sn-mpx-plan .price {
+                font-size: 24px;
+                font-weight: 700;
+                margin-top: 4px;
+            }
+            .dnc-sn-mpx-plan .savings {
+                font-size: 12px;
+                color: #059669;
+                margin-top: 4px;
+            }
+
+            .dnc-sn-mpx-coupon {
+                display: flex;
+                gap: 8px;
+                margin: 16px 0;
+            }
+            .dnc-sn-mpx-coupon input {
+                flex: 1;
+                padding: 12px;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                font-size: 14px;
+                min-height: 44px;
+            }
+
+            .dnc-sn-mpx-total-box {
+                background: #f9fafb;
+                padding: 14px;
+                border-radius: 10px;
+                margin: 16px 0;
+            }
+            .dnc-sn-mpx-total-line {
+                display: flex;
+                justify-content: space-between;
+                padding: 4px 0;
+                font-size: 14px;
+            }
+            .dnc-sn-mpx-total-line.is-final {
+                border-top: 1px solid #e5e7eb;
+                margin-top: 8px;
+                padding-top: 10px;
+                font-weight: 700;
+                font-size: 16px;
+            }
+            .dnc-sn-mpx-total-line.is-discount { color: #059669; }
+
+            .dnc-sn-mpx-btn {
+                display: block;
+                width: 100%;
+                padding: 14px 18px;
+                border: none;
+                border-radius: 12px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                min-height: 48px;
+                margin-bottom: 10px;
+                text-align: center;
+                text-decoration: none;
+            }
+            .dnc-sn-mpx-btn-primary {
+                background: #10b981; color: #fff;
+            }
+            .dnc-sn-mpx-btn-primary:hover { background: #059669; }
+            .dnc-sn-mpx-btn-primary:disabled,
+            .dnc-sn-mpx-btn-primary.is-disabled {
+                background: #d1d5db; color: #6b7280; cursor: not-allowed;
+            }
+            .dnc-sn-mpx-btn-secondary {
+                background: #f3f4f6; color: #1f2937;
+            }
+            .dnc-sn-mpx-btn-line {
+                background: #06C755; color: #fff;
+            }
+
+            .dnc-sn-mpx-payment-qr {
+                text-align: center;
+                padding: 20px;
+                background: #fff;
+                border-radius: 12px;
+                border: 2px dashed #d1d5db;
+                margin-bottom: 16px;
+            }
+            .dnc-sn-mpx-payment-qr img {
+                max-width: 240px;
+                width: 100%;
+                height: auto;
+                margin: 0 auto;
+            }
+            .dnc-sn-mpx-payment-qr .amount {
+                font-size: 24px;
+                font-weight: 700;
+                color: #1f2937;
+                margin-top: 12px;
+            }
+
+            .dnc-sn-mpx-bank-card {
+                background: #f9fafb;
+                padding: 14px;
+                border-radius: 10px;
+                margin-bottom: 16px;
+            }
+            .dnc-sn-mpx-bank-card .row {
+                display: flex;
+                justify-content: space-between;
+                padding: 6px 0;
+                font-size: 14px;
+            }
+            .dnc-sn-mpx-bank-card .row .v {
+                font-family: 'SF Mono', Monaco, monospace;
+                font-weight: 600;
+            }
+
+            .dnc-sn-mpx-timer {
+                background: #fef3c7;
+                color: #b45309;
+                text-align: center;
+                padding: 10px;
+                border-radius: 8px;
+                font-weight: 600;
+                margin-bottom: 16px;
+            }
+
+            .dnc-sn-mpx-status-card {
+                text-align: center;
+                padding: 32px 20px;
+            }
+            .dnc-sn-mpx-status-card .icon {
+                font-size: 64px;
+                margin-bottom: 16px;
+            }
+            .dnc-sn-mpx-status-card h2 {
+                margin: 0 0 12px;
+                font-size: 22px;
+            }
+            .dnc-sn-mpx-status-card .sub {
+                color: #6b7280;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+
+            .dnc-sn-mpx-error {
+                background: #fee2e2;
+                border-left: 4px solid #dc2626;
+                color: #991b1b;
+                padding: 14px 16px;
+                border-radius: 8px;
+                margin-bottom: 16px;
+            }
+            .dnc-sn-mpx-info {
+                background: #dbeafe;
+                border-left: 4px solid #2563eb;
+                color: #1e40af;
+                padding: 14px 16px;
+                border-radius: 8px;
+                margin-bottom: 16px;
+            }
+
+            .dnc-sn-mpx-spinner {
+                display: inline-block;
+                width: 20px; height: 20px;
+                border: 3px solid #e5e7eb;
+                border-top-color: #10b981;
+                border-radius: 50%;
+                animation: dnc-sn-mpx-spin 0.8s linear infinite;
+                vertical-align: middle;
+                margin-right: 8px;
+            }
+            @keyframes dnc-sn-mpx-spin {
+                to { transform: rotate(360deg); }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                .dnc-sn-mpx-spinner { animation: none; border-top-color: #10b981; }
+            }
+
+            .dnc-sn-mpx-upload-zone {
+                border: 2px dashed #d1d5db;
+                border-radius: 12px;
+                padding: 24px 16px;
+                text-align: center;
+                background: #fafafa;
+                margin-bottom: 16px;
+            }
+            .dnc-sn-mpx-upload-zone .preview img {
+                max-width: 100%; height: auto; border-radius: 8px;
+            }
+
+            @media (max-width: 380px) {
+                .dnc-sn-mpx-page { padding: 12px; }
+                .dnc-sn-mpx-stage { padding: 14px; }
+                .dnc-sn-mpx-plan .price { font-size: 20px; }
+            }
+        </style>
+        <?php
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. PURE-LOGIC HELPERS (testable)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_mpx_check_ownership' ) ) {
+    /**
+     * Pure-logic ownership check. Returns ['ok' => bool, 'reason' => string].
+     *
+     * @param int $registered_user_id sn_pool.registered_user_id
+     * @param int $current_uid wp_get_current_user()->ID
+     * @return array
+     */
+    function dinoco_sn_mpx_check_ownership( $registered_user_id, $current_uid ) {
+        $registered_user_id = (int) $registered_user_id;
+        $current_uid = (int) $current_uid;
+
+        if ( $current_uid <= 0 ) {
+            return array( 'ok' => false, 'reason' => 'not_logged_in' );
+        }
+        if ( $registered_user_id <= 0 ) {
+            return array( 'ok' => false, 'reason' => 'not_registered' );
+        }
+        if ( $registered_user_id !== $current_uid ) {
+            return array( 'ok' => false, 'reason' => 'ownership_mismatch' );
+        }
+        return array( 'ok' => true, 'reason' => '' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mpx_validate_status' ) ) {
+    /**
+     * Validate sn_pool.status for marketplace eligibility.
+     *
+     * @param string $status sn_pool.status enum value
+     * @return array ['ok' => bool, 'reason' => string, 'message' => string]
+     */
+    function dinoco_sn_mpx_validate_status( $status ) {
+        $status = is_string( $status ) ? strtolower( trim( $status ) ) : '';
+
+        if ( $status === 'registered' ) {
+            return array( 'ok' => true, 'reason' => '', 'message' => '' );
+        }
+
+        $reason_map = array(
+            'voided'                  => array( 'voided',          'เพลทนี้อยู่ในสถานะพิเศษ — ไม่สามารถต่อประกันได้ กรุณาติดต่อทีมงาน' ),
+            'recalled'                => array( 'recalled',        'เพลทนี้อยู่ในสถานะพิเศษ — ไม่สามารถต่อประกันได้ กรุณาติดต่อทีมงาน' ),
+            'stolen'                  => array( 'stolen',          'เพลทนี้อยู่ในสถานะพิเศษ — ไม่สามารถต่อประกันได้ กรุณาติดต่อทีมงาน' ),
+            'claimed'                 => array( 'claimed',         'เพลทกำลังเคลม — รอเคลมเสร็จก่อน' ),
+            'transferred'             => array( 'transferred',     'เพลทเปลี่ยนเจ้าของ — ต่อประกันไม่ได้' ),
+            'in_pool'                 => array( 'not_registered',  'เพลทนี้ยังไม่ได้ลงทะเบียน — กรุณาลงทะเบียนก่อน' ),
+            'reserved'                => array( 'not_shipped',     'เพลทนี้ยังไม่พร้อมใช้งาน' ),
+            'replaced'                => array( 'replaced',        'เพลทนี้ถูกเปลี่ยนแล้ว — ใช้เพลทใหม่แทน' ),
+            'cancelled_batch'         => array( 'cancelled',       'เพลทนี้ถูกยกเลิก' ),
+            'reserved_for_legacy'     => array( 'legacy',          'เพลทนี้สงวนสำหรับเคสเก่า' ),
+            'shipped_legacy'          => array( 'legacy',          'เพลทนี้สงวนสำหรับเคสเก่า' ),
+        );
+
+        if ( isset( $reason_map[ $status ] ) ) {
+            return array(
+                'ok'      => false,
+                'reason'  => $reason_map[ $status ][0],
+                'message' => $reason_map[ $status ][1],
+            );
+        }
+
+        return array(
+            'ok'      => false,
+            'reason'  => 'unknown_status',
+            'message' => 'สถานะเพลทไม่ถูกต้อง — กรุณาติดต่อทีมงาน',
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mpx_check_grace_period' ) ) {
+    /**
+     * Check if warranty is within grace period for extension.
+     *
+     * Allows extension if: not yet expired OR expired ≤ grace_days ago.
+     *
+     * @param string $warranty_until 'YYYY-MM-DD' or empty
+     * @param string $today 'YYYY-MM-DD' (testable injection)
+     * @param int $grace_days default 30
+     * @return array ['ok' => bool, 'reason' => string, 'days_past_expiry' => int]
+     */
+    function dinoco_sn_mpx_check_grace_period( $warranty_until, $today = null, $grace_days = 30 ) {
+        if ( $today === null ) {
+            $today = date( 'Y-m-d', current_time( 'timestamp' ) );
+        }
+        $grace_days = max( 0, (int) $grace_days );
+
+        if ( empty( $warranty_until ) ) {
+            return array( 'ok' => false, 'reason' => 'no_warranty_record', 'days_past_expiry' => 0 );
+        }
+
+        // Parse YYYY-MM-DD safely
+        $w_ts = strtotime( $warranty_until );
+        $t_ts = strtotime( $today );
+        if ( $w_ts === false || $t_ts === false ) {
+            return array( 'ok' => false, 'reason' => 'date_parse_error', 'days_past_expiry' => 0 );
+        }
+
+        $days_past = (int) floor( ( $t_ts - $w_ts ) / 86400 );
+
+        if ( $days_past <= 0 ) {
+            // Not yet expired — eligible
+            return array( 'ok' => true, 'reason' => '', 'days_past_expiry' => 0 );
+        }
+
+        if ( $days_past <= $grace_days ) {
+            return array( 'ok' => true, 'reason' => 'within_grace', 'days_past_expiry' => $days_past );
+        }
+
+        return array(
+            'ok'              => false,
+            'reason'          => 'grace_exceeded',
+            'days_past_expiry'=> $days_past,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mpx_compute_total' ) ) {
+    /**
+     * Compute total breakdown for a plan.
+     *
+     * @param float $base_price Plan price (THB, before VAT)
+     * @param float $discount Discount amount (from coupon, default 0)
+     * @param float $vat_rate Default 0.07
+     * @return array {subtotal, discount, vat, total}
+     */
+    function dinoco_sn_mpx_compute_total( $base_price, $discount = 0.0, $vat_rate = 0.07 ) {
+        $base = max( 0.0, (float) $base_price );
+        $disc = max( 0.0, min( $base, (float) $discount ) );
+        $vat_rate = max( 0.0, (float) $vat_rate );
+
+        $subtotal_after_disc = $base - $disc;
+        $vat = round( $subtotal_after_disc * $vat_rate, 2 );
+        $total = round( $subtotal_after_disc + $vat, 2 );
+
+        return array(
+            'subtotal' => round( $base, 2 ),
+            'discount' => round( $disc, 2 ),
+            'vat'      => $vat,
+            'total'    => $total,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mpx_image_compress_target' ) ) {
+    /**
+     * Compute target compression for slip image.
+     *
+     * Returns quality 0.0-1.0 + max dimension.
+     * Strategy: if file > 2MB → quality 0.85 + maxDim 1600
+     *           else passthrough
+     *
+     * Pure-logic helper (mirrored in JS client).
+     *
+     * @param int $file_size_bytes
+     * @return array {quality, max_dimension, should_compress}
+     */
+    function dinoco_sn_mpx_image_compress_target( $file_size_bytes ) {
+        $size = max( 0, (int) $file_size_bytes );
+        $threshold = 2 * 1024 * 1024; // 2MB
+
+        if ( $size <= $threshold ) {
+            return array(
+                'quality'        => 1.0,
+                'max_dimension'  => 0, // 0 = no resize
+                'should_compress'=> false,
+            );
+        }
+
+        return array(
+            'quality'        => 0.85,
+            'max_dimension'  => 1600,
+            'should_compress'=> true,
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. RENDERERS — LANDING + ERROR
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_mpx_render_landing' ) ) {
+    function dinoco_sn_mpx_render_landing() {
+        ?>
+        <div class="dnc-sn-mpx-stage is-active" role="region" aria-label="ต่อประกัน">
+            <div class="dnc-sn-mpx-stage-header">
+                <h2>💎 ต่ออายุประกัน</h2>
+            </div>
+            <div class="dnc-sn-mpx-info">
+                <p style="margin:0;">
+                    กรุณาเข้าหน้านี้ผ่าน LINE Bot
+                    หรือสแกน QR code บนเพลท S/N ของคุณ
+                </p>
+            </div>
+            <a href="/dashboard" class="dnc-sn-mpx-btn dnc-sn-mpx-btn-secondary">
+                ↩ กลับหน้าหลัก
+            </a>
+        </div>
+        <?php
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_mpx_render_error_box' ) ) {
+    function dinoco_sn_mpx_render_error_box( $code, $message ) {
+        ?>
+        <div class="dnc-sn-mpx-stage is-active" role="alert">
+            <div class="dnc-sn-mpx-stage-header">
+                <h2>⚠️ ไม่สามารถดำเนินการได้</h2>
+            </div>
+            <div class="dnc-sn-mpx-error">
+                <strong><?php echo esc_html( $message ); ?></strong>
+                <p style="margin:6px 0 0;font-size:12px;opacity:0.8;">รหัส: <code><?php echo esc_html( $code ); ?></code></p>
+            </div>
+            <a href="/dashboard" class="dnc-sn-mpx-btn dnc-sn-mpx-btn-secondary">↩ กลับหน้าหลัก</a>
+        </div>
+        <?php
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. OAUTH GATE (mirror Activation LIFF V.0.5)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_mpx_render_oauth_gate' ) ) {
+    function dinoco_sn_mpx_render_oauth_gate( $sn ) {
+        $line_ch_id     = defined( 'DINOCO_LINE_CHANNEL_ID' )   ? DINOCO_LINE_CHANNEL_ID   : get_option( 'dinoco_line_channel_id', '' );
+        $line_redir_uri = defined( 'DINOCO_LINE_REDIRECT_URI' ) ? DINOCO_LINE_REDIRECT_URI : get_option( 'dinoco_line_redirect_uri', '' );
+
+        $line_login_url = '';
+        if ( ! empty( $line_ch_id ) && ! empty( $line_redir_uri ) ) {
+            $state_token = wp_generate_password( 32, false, false );
+            set_transient(
+                'dinoco_line_state_' . $state_token,
+                array(
+                    'serial'  => $sn,
+                    'intent'  => 'WARRANTY_EXTEND_SN',  // Distinct from WARRANTY_ACTIVATE_SN
+                    'created' => time(),
+                ),
+                600  // 10 min
+            );
+
+            $line_login_url  = 'https://access.line.me/oauth2/v2.1/authorize';
+            $line_login_url .= '?response_type=code';
+            $line_login_url .= '&client_id=' . urlencode( $line_ch_id );
+            $line_login_url .= '&redirect_uri=' . urlencode( $line_redir_uri );
+            $line_login_url .= '&state=' . urlencode( $state_token );
+            $line_login_url .= '&scope=profile%20openid';
+            $line_login_url .= '&bot_prompt=aggressive';
+        }
+        ?>
+        <div class="dnc-sn-mpx-stage is-active" role="region" aria-label="เข้าสู่ระบบ">
+            <div class="dnc-sn-mpx-stage-header">
+                <h2>💎 ต่ออายุประกัน</h2>
+            </div>
+            <div class="dnc-sn-mpx-info">
+                <p style="margin:0 0 6px;font-weight:600;">📱 เข้าสู่ระบบด้วย LINE</p>
+                <p style="margin:0;font-size:13px;line-height:1.6;">
+                    ต่อประกันสำหรับ S/N: <code><?php echo esc_html( $sn ); ?></code>
+                </p>
+            </div>
+
+            <?php if ( ! empty( $line_login_url ) ) : ?>
+                <a href="<?php echo esc_url( $line_login_url ); ?>"
+                   class="dnc-sn-mpx-btn dnc-sn-mpx-btn-line"
+                   role="button"
+                   aria-label="เข้าสู่ระบบด้วย LINE">
+                    เข้าสู่ระบบด้วย LINE
+                </a>
+                <p style="text-align:center;font-size:12px;color:#6b7280;margin-top:10px;">
+                    หลัง login จะกลับมาหน้านี้อัตโนมัติ
+                </p>
+            <?php else : ?>
+                <div class="dnc-sn-mpx-error">
+                    <strong>⚠️ ระบบ LINE Login ไม่พร้อมใช้งาน</strong>
+                    <p style="margin:6px 0 0;font-size:13px;">กรุณาติดต่อ Admin</p>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. AUTHORIZED FLOW (4 stages mounted, JS toggles `.is-active`)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_mpx_render_authorized_flow' ) ) {
+    function dinoco_sn_mpx_render_authorized_flow( $sn ) {
+        $current_user = wp_get_current_user();
+        $current_uid  = (int) $current_user->ID;
+        $nonce        = wp_create_nonce( 'wp_rest' );
+        $welcome      = ! empty( $_GET['welcome'] );
+
+        // Server-side preflight: if Agent C REST not synced, fail soft
+        $rest_ready = function_exists( 'dinoco_sn_get_extension_price' );
+
+        ?>
+        <?php if ( $welcome ) : ?>
+            <div class="dnc-sn-mpx-info" role="status">
+                ✅ เข้าสู่ระบบสำเร็จ — กำลังโหลดข้อมูลเพลท...
+            </div>
+        <?php endif; ?>
+
+        <!-- STAGE 1: Plan Select -->
+        <section class="dnc-sn-mpx-stage dnc-sn-mpx-stage-1 is-active"
+                 id="dnc-sn-mpx-stage-1"
+                 role="region"
+                 aria-label="เลือกแผนต่อประกัน"
+                 data-sn="<?php echo esc_attr( $sn ); ?>"
+                 data-uid="<?php echo esc_attr( $current_uid ); ?>"
+                 data-nonce="<?php echo esc_attr( $nonce ); ?>"
+                 data-rest-ready="<?php echo $rest_ready ? '1' : '0'; ?>">
+            <div class="dnc-sn-mpx-stage-header">
+                <h2>💎 เลือกแผนต่อประกัน</h2>
+            </div>
+
+            <div class="dnc-sn-mpx-loading" data-role="stage1-loading" aria-live="polite">
+                <span class="dnc-sn-mpx-spinner"></span>กำลังโหลด...
+            </div>
+
+            <div class="dnc-sn-mpx-stage1-body" data-role="stage1-body" hidden>
+                <div class="dnc-sn-mpx-product-card" data-role="product-card">
+                    <img data-role="product-img" alt="" src="" loading="lazy">
+                    <div class="info">
+                        <div class="name" data-role="product-name">—</div>
+                        <div class="meta" data-role="product-meta">—</div>
+                    </div>
+                </div>
+
+                <div data-role="plans-container">
+                    <!-- Plans injected by JS based on /quote responses -->
+                </div>
+
+                <div class="dnc-sn-mpx-coupon">
+                    <input type="text"
+                           data-role="coupon-input"
+                           placeholder="🎟️ โค้ดส่วนลด (ถ้ามี)"
+                           maxlength="32"
+                           autocapitalize="characters"
+                           autocomplete="off">
+                    <button type="button" class="dnc-sn-mpx-btn dnc-sn-mpx-btn-secondary"
+                            style="width:auto;padding:12px 16px;margin:0;"
+                            data-action="apply-coupon">ใช้</button>
+                </div>
+
+                <div class="dnc-sn-mpx-total-box" data-role="total-box" hidden>
+                    <div class="dnc-sn-mpx-total-line">
+                        <span>ราคาแผน</span>
+                        <span data-role="total-subtotal">฿0.00</span>
+                    </div>
+                    <div class="dnc-sn-mpx-total-line is-discount" data-role="total-discount-line" hidden>
+                        <span>ส่วนลด</span>
+                        <span data-role="total-discount">-฿0.00</span>
+                    </div>
+                    <div class="dnc-sn-mpx-total-line">
+                        <span>VAT 7%</span>
+                        <span data-role="total-vat">฿0.00</span>
+                    </div>
+                    <div class="dnc-sn-mpx-total-line is-final">
+                        <span>รวมทั้งสิ้น</span>
+                        <span data-role="total-final">฿0.00</span>
+                    </div>
+                </div>
+
+                <button type="button"
+                        class="dnc-sn-mpx-btn dnc-sn-mpx-btn-primary is-disabled"
+                        data-action="proceed-checkout"
+                        data-role="checkout-btn"
+                        disabled
+                        aria-label="ดำเนินการชำระเงิน">
+                    ดำเนินการชำระเงิน ▶
+                </button>
+            </div>
+        </section>
+
+        <!-- STAGE 2: Payment Instructions -->
+        <section class="dnc-sn-mpx-stage dnc-sn-mpx-stage-2"
+                 id="dnc-sn-mpx-stage-2"
+                 role="region"
+                 aria-label="ชำระเงิน"
+                 hidden>
+            <div class="dnc-sn-mpx-stage-header">
+                <h2>💳 ชำระเงิน</h2>
+            </div>
+
+            <div class="dnc-sn-mpx-timer" data-role="timer" aria-live="polite">
+                ⏰ หมดเวลาใน: <span data-role="timer-display">24:00:00</span>
+            </div>
+
+            <div class="dnc-sn-mpx-payment-qr">
+                <img data-role="promptpay-qr" alt="PromptPay QR" src="">
+                <div class="amount" data-role="payment-amount">฿0.00</div>
+                <p style="font-size:12px;color:#6b7280;margin-top:8px;">สแกนเพื่อชำระผ่าน PromptPay</p>
+            </div>
+
+            <div class="dnc-sn-mpx-bank-card">
+                <h3 style="margin:0 0 10px;font-size:14px;">หรือโอนเข้าบัญชี</h3>
+                <div class="row">
+                    <span>ธนาคาร</span>
+                    <span class="v" data-role="bank-name">—</span>
+                </div>
+                <div class="row">
+                    <span>เลขที่บัญชี</span>
+                    <span class="v" data-role="bank-account">—</span>
+                </div>
+                <div class="row">
+                    <span>ชื่อบัญชี</span>
+                    <span class="v" data-role="bank-holder">—</span>
+                </div>
+            </div>
+
+            <button type="button"
+                    class="dnc-sn-mpx-btn dnc-sn-mpx-btn-primary"
+                    data-action="upload-slip-trigger"
+                    aria-label="อัพโหลดสลิป">
+                📤 อัพโหลดสลิป
+            </button>
+            <input type="file"
+                   data-role="slip-file-input"
+                   accept="image/*"
+                   capture="environment"
+                   style="display:none;">
+
+            <button type="button"
+                    class="dnc-sn-mpx-btn dnc-sn-mpx-btn-secondary"
+                    data-action="back-to-plans">
+                ← เปลี่ยนแผน
+            </button>
+        </section>
+
+        <!-- STAGE 3: Slip Upload + Verify -->
+        <section class="dnc-sn-mpx-stage dnc-sn-mpx-stage-3"
+                 id="dnc-sn-mpx-stage-3"
+                 role="region"
+                 aria-label="ตรวจสอบสลิป"
+                 hidden>
+            <div class="dnc-sn-mpx-stage-header">
+                <h2>🔍 ตรวจสอบสลิป</h2>
+            </div>
+
+            <div class="dnc-sn-mpx-upload-zone">
+                <div class="preview" data-role="slip-preview">
+                    <div data-role="slip-loading">
+                        <span class="dnc-sn-mpx-spinner"></span>กำลังอัพโหลด...
+                    </div>
+                </div>
+            </div>
+
+            <div data-role="verify-status" aria-live="polite">
+                <p style="text-align:center;color:#6b7280;">
+                    <span class="dnc-sn-mpx-spinner"></span>
+                    กำลังตรวจสอบสลิป...
+                </p>
+            </div>
+
+            <div data-role="verify-pending-msg" class="dnc-sn-mpx-info" hidden>
+                <strong>ยังตรวจอยู่...</strong>
+                <p style="margin:6px 0 0;font-size:13px;">
+                    แอดมินจะตรวจให้ภายใน 2-4 ชม. ระบบจะส่ง LINE แจ้งเมื่ออนุมัติ
+                </p>
+            </div>
+        </section>
+
+        <!-- STAGE 4: Success / Pending -->
+        <section class="dnc-sn-mpx-stage dnc-sn-mpx-stage-4"
+                 id="dnc-sn-mpx-stage-4"
+                 role="region"
+                 aria-label="ผลการต่อประกัน"
+                 hidden>
+            <div class="dnc-sn-mpx-status-card" data-role="result-card">
+                <!-- Filled by JS based on final status -->
+            </div>
+        </section>
+
+        <?php dinoco_sn_mpx_render_inline_js( $sn, $current_uid, $nonce ); ?>
+        <?php
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. INLINE JS (event delegation, NO inline onclick, UX-H3 compliant)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_sn_mpx_render_inline_js' ) ) {
+    function dinoco_sn_mpx_render_inline_js( $sn, $uid, $nonce ) {
+        $rest_url = esc_url_raw( rest_url( 'dinoco-sn/v1/' ) );
+        ?>
+        <script>
+        (function(){
+            'use strict';
+            var ROOT = document.getElementById('dnc-sn-mpx-root');
+            if (!ROOT) return;
+
+            var SN     = <?php echo wp_json_encode( $sn ); ?>;
+            var UID    = <?php echo (int) $uid; ?>;
+            var NONCE  = <?php echo wp_json_encode( $nonce ); ?>;
+            var REST   = <?php echo wp_json_encode( $rest_url ); ?>;
+
+            var STATE = {
+                stage: 1,
+                selectedYears: 2,    // default 2y
+                couponCode: '',
+                quotes: {},          // { 1: {...}, 2: {...}, 3: {...} }
+                extensionId: null,
+                pollTimer: null,
+                pollCount: 0,
+                countdownTimer: null,
+                expiresAt: null
+            };
+
+            // ─── DOM helpers ─────────────────────────────────
+            function $(sel, ctx){ return (ctx||ROOT).querySelector(sel); }
+            function $$(sel, ctx){ return Array.prototype.slice.call((ctx||ROOT).querySelectorAll(sel)); }
+            function fmtBaht(n){
+                if (n == null || isNaN(n)) return '฿0.00';
+                return '฿' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+            }
+            function showStage(n){
+                STATE.stage = n;
+                $$('.dnc-sn-mpx-stage').forEach(function(s){
+                    s.classList.remove('is-active');
+                    s.hidden = true;
+                });
+                var target = $('.dnc-sn-mpx-stage-' + n);
+                if (target){
+                    target.classList.add('is-active');
+                    target.hidden = false;
+                    // Focus management
+                    var heading = $('h2', target);
+                    if (heading) heading.setAttribute('tabindex', '-1'), heading.focus();
+                }
+            }
+
+            // ─── Modal helpers (defensive fallback) ─────────
+            function alertMsg(msg){
+                if (window.dinocoModal && typeof window.dinocoModal.alert === 'function') {
+                    window.dinocoModal.alert({title:'แจ้งเตือน', message:msg});
+                } else {
+                    try { alert(msg); } catch(e) {}
+                }
+            }
+            function confirmMsg(msg, cb){
+                if (window.dinocoModal && typeof window.dinocoModal.confirm === 'function') {
+                    window.dinocoModal.confirm({title:'ยืนยัน', message:msg, onConfirm:cb});
+                } else {
+                    try { if (confirm(msg)) cb(); } catch(e) {}
+                }
+            }
+
+            // ─── REST helper ─────────────────────────────────
+            function api(method, path, body){
+                var opts = {
+                    method: method,
+                    credentials: 'include',
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-WP-Nonce': NONCE
+                    }
+                };
+                if (body){
+                    opts.headers['Content-Type'] = 'application/json';
+                    opts.body = JSON.stringify(body);
+                }
+                return fetch(REST + path, opts).then(function(r){
+                    if (r.status === 503){
+                        throw {code: 'feature_disabled', message: 'ระบบยังไม่เปิดให้บริการ'};
+                    }
+                    return r.json().then(function(data){
+                        if (!r.ok){
+                            throw {code: data.code || 'http_'+r.status, message: data.message || 'เกิดข้อผิดพลาด'};
+                        }
+                        return data;
+                    });
+                });
+            }
+
+            // ─── ESC handler ─────────────────────────────────
+            document.addEventListener('keydown', function(e){
+                if (e.key === 'Escape' || e.keyCode === 27){
+                    // Stage 2/3 → allow back to stage 1; stage 4 → no-op
+                    if (STATE.stage === 2) showStage(1);
+                }
+            });
+
+            // ─── Stage 1: Load quotes ────────────────────────
+            function loadQuotes(){
+                var loading = $('[data-role="stage1-loading"]');
+                var body    = $('[data-role="stage1-body"]');
+                var restReady = $('.dnc-sn-mpx-stage-1').getAttribute('data-rest-ready') === '1';
+
+                if (!restReady){
+                    loading.innerHTML = '<div class="dnc-sn-mpx-error">⚠️ ระบบยังไม่เปิดให้บริการ — กรุณาลองใหม่ภายหลัง</div>';
+                    return;
+                }
+
+                // Fetch quotes for 1y, 2y, 3y in parallel
+                var calls = [1,2,3].map(function(y){
+                    return api('GET', 'marketplace/quote?sn=' + encodeURIComponent(SN) + '&years=' + y)
+                        .then(function(d){ return {years:y, ok:true, data:d}; })
+                        .catch(function(e){ return {years:y, ok:false, error:e}; });
+                });
+
+                Promise.all(calls).then(function(results){
+                    var anyOk = false;
+                    var firstErr = null;
+
+                    results.forEach(function(r){
+                        if (r.ok){
+                            anyOk = true;
+                            STATE.quotes[r.years] = r.data;
+                        } else if (!firstErr){
+                            firstErr = r.error;
+                        }
+                    });
+
+                    if (!anyOk){
+                        loading.innerHTML = '<div class="dnc-sn-mpx-error">' +
+                            '<strong>⚠️ ' + (firstErr && firstErr.message ? escapeHtml(firstErr.message) : 'ไม่สามารถโหลดข้อมูลได้') + '</strong>' +
+                            '</div>';
+                        return;
+                    }
+
+                    // Hydrate product card from any successful quote
+                    var first = STATE.quotes[1] || STATE.quotes[2] || STATE.quotes[3];
+                    if (first){
+                        if (first.product_image && $('[data-role="product-img"]')){
+                            $('[data-role="product-img"]').src = first.product_image;
+                        }
+                        if (first.product_name){
+                            $('[data-role="product-name"]').textContent = first.product_name;
+                        }
+                        if (first.current_warranty_end){
+                            $('[data-role="product-meta"]').textContent = 'ประกันถึง: ' + first.current_warranty_end;
+                        }
+                    }
+
+                    renderPlans();
+
+                    loading.style.display = 'none';
+                    body.hidden = false;
+                });
+            }
+
+            function escapeHtml(s){
+                if (s == null) return '';
+                return String(s).replace(/[&<>"']/g, function(c){
+                    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+                });
+            }
+
+            function renderPlans(){
+                var container = $('[data-role="plans-container"]');
+                if (!container) return;
+                container.innerHTML = '';
+
+                var availableYears = [];
+                [1,2,3].forEach(function(y){
+                    var q = STATE.quotes[y];
+                    if (q && q.base_price != null) availableYears.push(y);
+                });
+
+                if (availableYears.length === 0){
+                    container.innerHTML = '<div class="dnc-sn-mpx-error">ไม่มีแผนสำหรับเพลทนี้</div>';
+                    return;
+                }
+
+                // Pick "best value" = highest savings %
+                var bestYears = null, bestSavings = 0;
+                availableYears.forEach(function(y){
+                    var q = STATE.quotes[y];
+                    var perYear = q.base_price / y;
+                    var oneYear = STATE.quotes[1] ? STATE.quotes[1].base_price : perYear;
+                    var savings = oneYear > 0 ? Math.round((1 - perYear/oneYear) * 100) : 0;
+                    if (savings > bestSavings){ bestSavings = savings; bestYears = y; }
+                });
+
+                // If selected default not available, pick first available
+                if (availableYears.indexOf(STATE.selectedYears) === -1){
+                    STATE.selectedYears = availableYears[0];
+                }
+
+                availableYears.forEach(function(y){
+                    var q = STATE.quotes[y];
+                    var card = document.createElement('div');
+                    card.className = 'dnc-sn-mpx-plan' + (y === STATE.selectedYears ? ' is-selected' : '');
+                    card.setAttribute('data-action', 'select-plan');
+                    card.setAttribute('data-years', String(y));
+                    card.setAttribute('role', 'button');
+                    card.setAttribute('tabindex', '0');
+                    card.setAttribute('aria-pressed', y === STATE.selectedYears ? 'true' : 'false');
+
+                    var perYear = q.base_price / y;
+                    var savingsPct = STATE.quotes[1] && STATE.quotes[1].base_price > 0
+                        ? Math.round((1 - perYear / STATE.quotes[1].base_price) * 100)
+                        : 0;
+
+                    var html = '';
+                    if (y === bestYears && bestSavings > 0){
+                        html += '<span class="badge-recommend">🔥 แนะนำ</span>';
+                    }
+                    html += '<div class="label">' + y + ' ปี</div>';
+                    html += '<div class="price">' + escapeHtml(fmtBaht(q.base_price)) + '</div>';
+                    if (savingsPct > 0){
+                        html += '<div class="savings">ประหยัด ' + savingsPct + '%</div>';
+                    }
+                    card.innerHTML = html;
+                    container.appendChild(card);
+                });
+
+                updateTotal();
+            }
+
+            function updateTotal(){
+                var q = STATE.quotes[STATE.selectedYears];
+                if (!q){
+                    $('[data-role="total-box"]').hidden = true;
+                    setCheckoutEnabled(false);
+                    return;
+                }
+                var subtotal = Number(q.base_price) || 0;
+                var discount = Number(q.discount_if_any) || 0;
+                var vat = Number(q.vat) || 0;
+                var total = Number(q.total) || (subtotal - discount + vat);
+
+                $('[data-role="total-subtotal"]').textContent = fmtBaht(subtotal);
+                $('[data-role="total-vat"]').textContent      = fmtBaht(vat);
+                $('[data-role="total-final"]').textContent    = fmtBaht(total);
+
+                if (discount > 0){
+                    $('[data-role="total-discount-line"]').hidden = false;
+                    $('[data-role="total-discount"]').textContent = '-' + fmtBaht(discount);
+                } else {
+                    $('[data-role="total-discount-line"]').hidden = true;
+                }
+
+                $('[data-role="total-box"]').hidden = false;
+                setCheckoutEnabled(true);
+            }
+
+            function setCheckoutEnabled(enabled){
+                var btn = $('[data-role="checkout-btn"]');
+                if (!btn) return;
+                btn.disabled = !enabled;
+                btn.classList.toggle('is-disabled', !enabled);
+            }
+
+            // ─── Coupon ──────────────────────────────────────
+            function applyCoupon(){
+                var input = $('[data-role="coupon-input"]');
+                var code = (input.value || '').trim().toUpperCase();
+                if (!code){
+                    STATE.couponCode = '';
+                    loadQuotes(); // reload without coupon
+                    return;
+                }
+
+                // Re-fetch quote for selected years with coupon
+                api('GET', 'marketplace/quote?sn=' + encodeURIComponent(SN) +
+                    '&years=' + STATE.selectedYears +
+                    '&coupon=' + encodeURIComponent(code))
+                    .then(function(d){
+                        STATE.couponCode = code;
+                        STATE.quotes[STATE.selectedYears] = d;
+                        updateTotal();
+                        alertMsg('✅ ใช้โค้ดส่วนลดสำเร็จ');
+                    })
+                    .catch(function(e){
+                        alertMsg('❌ ' + (e.message || 'โค้ดไม่ถูกต้อง'));
+                    });
+            }
+
+            // ─── Stage 2: Checkout ───────────────────────────
+            function proceedCheckout(){
+                var btn = $('[data-role="checkout-btn"]');
+                if (btn.disabled) return;
+                btn.disabled = true;
+
+                api('POST', 'marketplace/checkout', {
+                    sn: SN,
+                    years: STATE.selectedYears,
+                    coupon_code: STATE.couponCode
+                })
+                .then(function(d){
+                    STATE.extensionId = d.extension_id;
+                    STATE.expiresAt   = d.expires_at;
+
+                    if (d.promptpay_qr){
+                        $('[data-role="promptpay-qr"]').src = d.promptpay_qr;
+                    }
+                    $('[data-role="payment-amount"]').textContent = fmtBaht(d.amount);
+
+                    if (d.bank){
+                        $('[data-role="bank-name"]').textContent    = d.bank.name || '—';
+                        $('[data-role="bank-account"]').textContent = d.bank.account || '—';
+                        $('[data-role="bank-holder"]').textContent  = d.bank.holder || '—';
+                    }
+
+                    startCountdown(d.expires_at);
+                    showStage(2);
+                })
+                .catch(function(e){
+                    alertMsg('❌ ' + (e.message || 'ไม่สามารถดำเนินการได้'));
+                    btn.disabled = false;
+                });
+            }
+
+            function startCountdown(expiresAt){
+                if (STATE.countdownTimer) clearInterval(STATE.countdownTimer);
+                if (!expiresAt) return;
+                var endTs = new Date(expiresAt).getTime();
+                if (isNaN(endTs)) return;
+
+                function tick(){
+                    var diff = endTs - Date.now();
+                    if (diff <= 0){
+                        $('[data-role="timer-display"]').textContent = '00:00:00';
+                        clearInterval(STATE.countdownTimer);
+                        return;
+                    }
+                    var h = Math.floor(diff / 3600000);
+                    var m = Math.floor((diff % 3600000) / 60000);
+                    var s = Math.floor((diff % 60000) / 1000);
+                    $('[data-role="timer-display"]').textContent =
+                        (h<10?'0':'') + h + ':' + (m<10?'0':'') + m + ':' + (s<10?'0':'') + s;
+                }
+                tick();
+                STATE.countdownTimer = setInterval(tick, 1000);
+            }
+
+            // ─── Stage 3: Slip upload ────────────────────────
+            function triggerUpload(){
+                $('[data-role="slip-file-input"]').click();
+            }
+
+            function onSlipSelected(e){
+                var file = e.target.files && e.target.files[0];
+                if (!file) return;
+                if (!/^image\//.test(file.type)){
+                    alertMsg('❌ กรุณาเลือกรูปภาพเท่านั้น');
+                    return;
+                }
+                if (file.size > 10 * 1024 * 1024){
+                    alertMsg('❌ ไฟล์ใหญ่เกิน 10MB');
+                    return;
+                }
+
+                showStage(3);
+                compressIfNeeded(file).then(uploadSlip).catch(function(err){
+                    alertMsg('❌ ' + (err.message || 'อัพโหลดล้มเหลว'));
+                    showStage(2);
+                });
+            }
+
+            // Client-side compression: > 2MB → JPEG q=0.85, max 1600px
+            function compressIfNeeded(file){
+                return new Promise(function(resolve, reject){
+                    if (file.size <= 2 * 1024 * 1024){
+                        resolve(file);
+                        return;
+                    }
+                    var url = URL.createObjectURL(file);
+                    var img = new Image();
+                    img.onload = function(){
+                        try {
+                            var maxDim = 1600;
+                            var w = img.width, h = img.height;
+                            if (w > maxDim || h > maxDim){
+                                if (w > h){ h = Math.round(h * maxDim / w); w = maxDim; }
+                                else      { w = Math.round(w * maxDim / h); h = maxDim; }
+                            }
+                            var canvas = document.createElement('canvas');
+                            canvas.width = w; canvas.height = h;
+                            var ctx = canvas.getContext('2d');
+                            ctx.drawImage(img, 0, 0, w, h);
+                            canvas.toBlob(function(blob){
+                                URL.revokeObjectURL(url);
+                                if (!blob){ reject(new Error('compress_failed')); return; }
+                                resolve(new File([blob], file.name.replace(/\.[^.]+$/,'') + '.jpg', {type:'image/jpeg'}));
+                            }, 'image/jpeg', 0.85);
+                        } catch(e){
+                            URL.revokeObjectURL(url);
+                            reject(e);
+                        }
+                    };
+                    img.onerror = function(){ URL.revokeObjectURL(url); reject(new Error('image_load_failed')); };
+                    img.src = url;
+                });
+            }
+
+            function uploadSlip(file){
+                // Step 1 — upload to WP media library
+                var fd = new FormData();
+                fd.append('file', file);
+
+                fetch('/wp-json/wp/v2/media', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'X-WP-Nonce': NONCE },
+                    body: fd
+                })
+                .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, data:d}; }); })
+                .then(function(res){
+                    if (!res.ok || !res.data.id){
+                        throw new Error(res.data.message || 'media_upload_failed');
+                    }
+                    var mediaId = res.data.id;
+                    var thumb   = res.data.source_url || (res.data.media_details && res.data.media_details.sizes && res.data.media_details.sizes.medium && res.data.media_details.sizes.medium.source_url);
+                    if (thumb){
+                        $('[data-role="slip-preview"]').innerHTML = '<img src="' + escapeHtml(thumb) + '" alt="slip preview">';
+                    }
+                    return api('POST', 'marketplace/checkout/' + STATE.extensionId + '/upload-slip', {
+                        slip_image_id: mediaId
+                    });
+                })
+                .then(function(d){
+                    handleVerifyResult(d);
+                })
+                .catch(function(e){
+                    alertMsg('❌ ' + (e.message || 'อัพโหลดล้มเหลว'));
+                    showStage(2);
+                });
+            }
+
+            function handleVerifyResult(d){
+                if (d.status === 'paid'){
+                    showSuccess(d);
+                } else if (d.status === 'pending_admin_review'){
+                    // Begin polling
+                    STATE.pollCount = 0;
+                    pollVerifyStatus();
+                } else if (d.status === 'rejected'){
+                    showRejected(d);
+                } else {
+                    pollVerifyStatus();
+                }
+            }
+
+            function pollVerifyStatus(){
+                STATE.pollCount += 1;
+                if (STATE.pollCount > 3){
+                    // After 30s → show "admin will review" message
+                    $('[data-role="verify-status"]').hidden = true;
+                    $('[data-role="verify-pending-msg"]').hidden = false;
+                    if (STATE.pollTimer) clearTimeout(STATE.pollTimer);
+                    return;
+                }
+
+                STATE.pollTimer = setTimeout(function(){
+                    api('GET', 'marketplace/' + STATE.extensionId + '/status').then(function(d){
+                        if (d.status === 'paid'){ showSuccess(d); }
+                        else if (d.status === 'rejected'){ showRejected(d); }
+                        else { pollVerifyStatus(); }
+                    }).catch(function(){
+                        pollVerifyStatus();
+                    });
+                }, 10000);
+            }
+
+            // ─── Stage 4: Result ─────────────────────────────
+            function showSuccess(d){
+                if (STATE.pollTimer) clearTimeout(STATE.pollTimer);
+                var card = $('[data-role="result-card"]');
+                var html = '<div class="icon">✅</div>';
+                html += '<h2>ต่อประกันสำเร็จ!</h2>';
+                if (d.new_warranty_end){
+                    html += '<p class="sub">ประกันใหม่ถึง <strong>' + escapeHtml(d.new_warranty_end) + '</strong></p>';
+                }
+                if (d.receipt_url){
+                    html += '<a href="' + escapeHtml(d.receipt_url) + '" class="dnc-sn-mpx-btn dnc-sn-mpx-btn-primary" style="margin-top:20px;">📥 ดาวน์โหลดใบเสร็จ</a>';
+                }
+                html += '<a href="/dashboard" class="dnc-sn-mpx-btn dnc-sn-mpx-btn-secondary">↩ กลับหน้าหลัก</a>';
+                card.innerHTML = html;
+                showStage(4);
+            }
+
+            function showPending(){
+                if (STATE.pollTimer) clearTimeout(STATE.pollTimer);
+                var card = $('[data-role="result-card"]');
+                card.innerHTML =
+                    '<div class="icon">⏳</div>' +
+                    '<h2>รอแอดมินตรวจสอบ</h2>' +
+                    '<p class="sub">แอดมินจะตรวจสอบสลิปของคุณภายใน 2-4 ชม.<br>ระบบจะส่ง LINE แจ้งทันทีที่อนุมัติ</p>' +
+                    '<a href="/dashboard" class="dnc-sn-mpx-btn dnc-sn-mpx-btn-secondary">↩ กลับหน้าหลัก</a>';
+                showStage(4);
+            }
+
+            function showRejected(d){
+                if (STATE.pollTimer) clearTimeout(STATE.pollTimer);
+                var card = $('[data-role="result-card"]');
+                var reason = d && d.reject_reason ? d.reject_reason : 'ไม่ผ่านการตรวจสอบ';
+                card.innerHTML =
+                    '<div class="icon">❌</div>' +
+                    '<h2>ไม่ผ่านการตรวจสอบ</h2>' +
+                    '<p class="sub">เหตุผล: ' + escapeHtml(reason) + '<br>กรุณาติดต่อทีมงานเพื่อแก้ไข</p>' +
+                    '<a href="/dashboard" class="dnc-sn-mpx-btn dnc-sn-mpx-btn-secondary">↩ กลับหน้าหลัก</a>';
+                showStage(4);
+            }
+
+            // ─── Event delegation (UX-H3 compliant) ──────────
+            ROOT.addEventListener('click', function(e){
+                var t = e.target;
+                while (t && t !== ROOT){
+                    var act = t.getAttribute && t.getAttribute('data-action');
+                    if (act){
+                        e.preventDefault();
+                        switch (act){
+                            case 'select-plan':
+                                var y = parseInt(t.getAttribute('data-years'), 10);
+                                if (y && STATE.quotes[y]){
+                                    STATE.selectedYears = y;
+                                    $$('.dnc-sn-mpx-plan').forEach(function(c){
+                                        c.classList.remove('is-selected');
+                                        c.setAttribute('aria-pressed', 'false');
+                                    });
+                                    t.classList.add('is-selected');
+                                    t.setAttribute('aria-pressed', 'true');
+                                    updateTotal();
+                                }
+                                return;
+                            case 'apply-coupon':       applyCoupon(); return;
+                            case 'proceed-checkout':   proceedCheckout(); return;
+                            case 'upload-slip-trigger':triggerUpload(); return;
+                            case 'back-to-plans':      showStage(1); return;
+                        }
+                    }
+                    t = t.parentNode;
+                }
+            });
+
+            // Keyboard activation for plan cards
+            ROOT.addEventListener('keydown', function(e){
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                var t = e.target;
+                if (t && t.getAttribute && t.getAttribute('data-action') === 'select-plan'){
+                    e.preventDefault();
+                    t.click();
+                }
+            });
+
+            // File input change
+            var fileInput = $('[data-role="slip-file-input"]');
+            if (fileInput){
+                fileInput.addEventListener('change', onSlipSelected);
+            }
+
+            // ─── Bootstrap ───────────────────────────────────
+            loadQuotes();
+        })();
+        </script>
+        <?php
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. MODULE REGISTRY (customer-facing section)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Self-register at init priority 30. Defensive — if Module Registry not
+ * synced, no-op. Listed under "customer-facing" section (separate from
+ * Manager's "inventory" section) for admin reference only — actual entry
+ * point is the LIFF URL.
+ */
+
+if ( ! has_action( 'init', 'dinoco_sn_mpx_register_admin_module' ) ) {
+    add_action( 'init', 'dinoco_sn_mpx_register_admin_module', 30 );
+}
+
+if ( ! function_exists( 'dinoco_sn_mpx_register_admin_module' ) ) {
+    function dinoco_sn_mpx_register_admin_module() {
+        if ( ! function_exists( 'dinoco_register_admin_module' ) ) {
+            return; // Module Registry not synced — no-op
+        }
+
+        dinoco_register_admin_module( array(
+            'key'        => 'marketplace',
+            'shortcode'  => 'dinoco_warranty_extend',
+            'label'      => 'Marketplace LIFF',
+            'section'    => 'customer-facing',
+            'icon'       => 'fa-gem',
+            'color'      => '#10b981',
+            'cache_ttl'  => 0,        // customer-facing — no admin cache
+            'capability' => 'read',   // any logged-in user (LIFF route)
+            'order'      => 50,
+            'source'     => '[System] DINOCO Warranty Extension Marketplace V.0.1',
+        ) );
+    }
+}
