@@ -5803,4 +5803,105 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(violations).toEqual([]);
         });
     });
+
+    describe('V.0.36 — Anti-enumeration random S/N + checksum', () => {
+        function readManager() {
+            const file = path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager');
+            return fs.readFileSync(file, 'utf8');
+        }
+        function readRest() {
+            const file = path.join(REPO_ROOT, '[System] DINOCO SN REST API');
+            return fs.readFileSync(file, 'utf8');
+        }
+
+        test('Manager V.0.36 header bumped', () => {
+            expect(readManager()).toMatch(/Version: V\.0\.36 \(2026-05-07\) — 🛡️ Anti-enumeration/);
+        });
+
+        test('REST V.0.26 header bumped', () => {
+            expect(readRest()).toMatch(/Version: V\.0\.26 \(2026-05-07\) — 🛡️ Anti-enumeration/);
+        });
+
+        test('Manager exposes Crockford alphabet helper (no I/L/O/U)', () => {
+            const code = readManager();
+            expect(code).toContain('function dinoco_sn_crockford_alphabet');
+            expect(code).toContain("'0123456789ABCDEFGHJKMNPQRSTVWXYZ'");
+            // Confirm confusing chars excluded
+            const fnBlock = code.split('function dinoco_sn_crockford_alphabet')[1] || '';
+            const alphaLine = fnBlock.split("return '")[1] || '';
+            const alphabet = alphaLine.split("'")[0] || '';
+            expect(alphabet).not.toContain('I');
+            expect(alphabet).not.toContain('L');
+            expect(alphabet).not.toContain('O');
+            expect(alphabet).not.toContain('U');
+        });
+
+        test('Manager has 4 random+checksum helpers', () => {
+            const code = readManager();
+            expect(code).toContain('function dinoco_sn_generate_random_token');
+            expect(code).toContain('function dinoco_sn_compute_checksum');
+            expect(code).toContain('function dinoco_sn_validate_checksum');
+            expect(code).toContain('function dinoco_sn_format_random');
+        });
+
+        test('Random token uses CSPRNG (random_bytes)', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_generate_random_token')[1] || '';
+            expect(fnBlock).toContain('random_bytes');
+        });
+
+        test('Default schema format_pattern is random (not sequential)', () => {
+            const code = readManager();
+            expect(code).toMatch(/format_pattern VARCHAR\(64\) NOT NULL DEFAULT '\{PREFIX\}\{RAND6\}\{CHK1\}'/);
+        });
+
+        test('seq_index column added to sn_pool table', () => {
+            const code = readManager();
+            const poolBlock = code.split('CREATE TABLE {$prefix}dinoco_sn_pool (')[1] || '';
+            expect(poolBlock).toContain('seq_index INT UNSIGNED NOT NULL DEFAULT 0');
+            expect(poolBlock).toContain('idx_batch_seq');
+        });
+
+        test('UI Format dropdown defaults to random + warns about legacy sequential', () => {
+            const code = readManager();
+            // Random options come first + marked RECOMMENDED
+            expect(code).toContain("value=\"{PREFIX}{RAND6}{CHK1}\" selected");
+            expect(code).toContain('RECOMMENDED — anti-enumeration');
+            // Legacy sequential options retain warning emoji
+            expect(code).toContain('LEGACY sequential — enumeration risk');
+        });
+
+        test('REST default format_pattern is random fallback', () => {
+            const code = readRest();
+            expect(code).toContain("'format_pattern' ) ?: '{PREFIX}{RAND6}{CHK1}'");
+        });
+
+        test('REST generator dispatches on RAND format pattern detection', () => {
+            const code = readRest();
+            // Random format detection (paired-braces regex, not literal '{RAND')
+            expect(code).toMatch(/preg_match\(\s*'\/\\\{RAND\\d\+\\\}\/'/);
+            // Generator helper invoked
+            expect(code).toContain('dinoco_sn_format_random');
+            // Collision-retry guard for entropy exhaustion
+            expect(code).toContain('rand_collision_max');
+        });
+
+        test('INSERT chunk includes seq_index 1-based', () => {
+            const code = readRest();
+            // Confirm column order in INSERT statement
+            expect(code).toContain('INSERT INTO {$tbl_pool} (sn, batch_id, seq_index, status, created_at)');
+            // 1-based seq_index (j + 1)
+            expect(code).toMatch(/\(\s*\$j\s*\+\s*1\s*\)/);
+        });
+
+        test('PHPUnit SnRandomGeneratorTest.php exists with key cases', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnRandomGeneratorTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            expect(content).toContain('test_crockford_alphabet_excludes_confusing_chars');
+            expect(content).toContain('test_random_tokens_have_low_collision_rate');
+            expect(content).toContain('test_validate_rejects_typo_in_random_part');
+            expect(content).toContain('test_typo_detection_rate_high');
+        });
+    });
 });
