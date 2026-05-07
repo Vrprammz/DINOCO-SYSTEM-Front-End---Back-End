@@ -4383,4 +4383,275 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(content).toContain('test_audit_event_type_for_recovery_is_plate_recovered');
         });
     });
+
+    describe('Phase 4 W13 F#16 Demand Forecast', () => {
+        test('Manager has run_demand_forecast cron worker function', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('function dinoco_sn_run_demand_forecast');
+            // Heartbeat option key
+            expect(code).toContain("dinoco_cron_sn_demand_forecast_last_run");
+            // Cron registration
+            expect(code).toContain('dinoco_sn_demand_forecast_cron');
+        });
+
+        test('Manager has 4 named forecast helpers (W13.1 plan)', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('function dinoco_sn_compute_moving_average');
+            expect(code).toContain('function dinoco_sn_compute_exponential_smoothing');
+            expect(code).toContain('function dinoco_sn_classify_confidence');
+            expect(code).toContain('function dinoco_sn_compute_safety_stock');
+        });
+
+        test('Manager has weekly forecast Flex builder + dispatcher (W13.3)', () => {
+            const code = readSnippet('manager');
+            expect(code).toContain('function dinoco_sn_build_weekly_forecast_flex');
+            expect(code).toContain('function dinoco_sn_dispatch_weekly_forecast_flex');
+            // Dispatcher uses b2b_send_flex_message + B2B_ADMIN_GROUP_ID
+            const dispatcher = code.split('function dinoco_sn_dispatch_weekly_forecast_flex')[1] || '';
+            expect(dispatcher).toContain('b2b_send_flex_message');
+            expect(dispatcher).toContain('B2B_ADMIN_GROUP_ID');
+            // Defensive function_exists guard
+            expect(dispatcher).toMatch(/function_exists\(\s*['"]b2b_send_flex_message['"]/);
+        });
+
+        test('Cron worker pushes weekly Flex to บอส on completion (W13.3)', () => {
+            const code = readSnippet('manager');
+            const cron = code.split('function dinoco_sn_run_demand_forecast')[1] || '';
+            // Defensive function_exists guard before dispatch
+            expect(cron).toMatch(/function_exists\(\s*['"]dinoco_sn_dispatch_weekly_forecast_flex['"]/);
+            expect(cron).toContain('dinoco_sn_dispatch_weekly_forecast_flex');
+        });
+
+        test('REST API has /forecast/run endpoint with idempotency wrapper', () => {
+            const rest = readSnippet('rest');
+            expect(rest).toContain("'/forecast/run'");
+            expect(rest).toContain("function dinoco_sn_rest_forecast_run");
+            const handler = rest.split('function dinoco_sn_rest_forecast_run')[1] || '';
+            // Rate limit 1/hr/user
+            expect(handler).toMatch(/sn_forecast_run_/);
+            expect(handler).toContain('HOUR_IN_SECONDS');
+            // Idempotency wrapper used
+            expect(handler).toContain('dinoco_sn_with_idempotency');
+            expect(handler).toContain("'sn-forecast-run'");
+        });
+
+        test('REST API has /forecast/notify-boss endpoint with rate limit', () => {
+            const rest = readSnippet('rest');
+            expect(rest).toContain("'/forecast/notify-boss'");
+            expect(rest).toContain("function dinoco_sn_rest_forecast_notify_boss");
+            const handler = rest.split('function dinoco_sn_rest_forecast_notify_boss')[1] || '';
+            // Rate limit 5/hr/user
+            expect(handler).toMatch(/sn_forecast_notify_boss_/);
+            expect(handler).toMatch(/b2b_rate_limit\(\s*"sn_forecast_notify_boss[^,]+,\s*5\s*,/);
+            // Idempotency wrapper
+            expect(handler).toContain('dinoco_sn_with_idempotency');
+            expect(handler).toContain("'sn-forecast-notify-boss'");
+        });
+
+        test('REST API forecast endpoints all admin-only', () => {
+            const rest = readSnippet('rest');
+            // Find route registrations for /forecast/run + /forecast/notify-boss
+            // Each must use dinoco_sn_perm_admin permission callback
+            const runBlock = rest.split("'/forecast/run'")[1] || '';
+            expect(runBlock.slice(0, 500)).toContain("'permission_callback'");
+            expect(runBlock.slice(0, 500)).toContain('dinoco_sn_perm_admin');
+
+            const notifyBlock = rest.split("'/forecast/notify-boss'")[1] || '';
+            expect(notifyBlock.slice(0, 500)).toContain('dinoco_sn_perm_admin');
+        });
+
+        test('Tab 3 forecast viewer JS handlers exist', () => {
+            const code = readSnippet('manager');
+            // Existing W13.2 handlers (V.0.20)
+            expect(code).toContain('window.dncSnLoadForecast = function');
+            expect(code).toContain('window.dncSnLoadForecastDetail = function');
+        });
+
+        test('SnForecastTest.php exists with W13.1 helpers under test', () => {
+            const fpath = path.join(REPO_ROOT, 'tests', 'helpers', 'SnForecastTest.php');
+            expect(fs.existsSync(fpath)).toBe(true);
+            const content = fs.readFileSync(fpath, 'utf8');
+            // Helper coverage tags (one block per helper)
+            expect(content).toContain('Moving Average');
+            expect(content).toContain('Exponential Smoothing');
+            expect(content).toContain('Classify Confidence');
+            expect(content).toContain('Safety Stock');
+            // Boundary tests
+            expect(content).toContain('test_classify_confidence_boundary_zero');
+            expect(content).toContain('test_classify_confidence_high_12_plus');
+            expect(content).toContain('test_safety_stock_default_20_pct');
+        });
+
+        test('Flex builder uses severity tint by urgent count', () => {
+            const code = readSnippet('manager');
+            const builder = code.split('function dinoco_sn_build_weekly_forecast_flex')[1] || '';
+            // Three severity tints (red/amber/green)
+            expect(builder).toContain('#dc2626'); // urgent → red
+            expect(builder).toContain('#f59e0b'); // some urgent → amber
+            expect(builder).toContain('#10b981'); // none → green
+            // Top 3 truncation
+            expect(builder).toMatch(/array_slice\(\s*\$urgent_skus\s*,\s*0\s*,\s*3\s*\)/);
+        });
+
+        test('Manager + REST API versions bumped for W13', () => {
+            const manager = readSnippet('manager');
+            const rest = readSnippet('rest');
+            // Manager V.0.30 line in header
+            expect(manager).toMatch(/Version:\s*V\.0\.30[\s\S]{0,200}W13\s*F#16/);
+            // REST API V.0.23 line in header
+            expect(rest).toMatch(/Version:\s*V\.0\.23[\s\S]{0,200}W13\.4\s*F#16/);
+        });
+    });
+
+    describe('Phase 4 W14.4 GDPR V.4.1 sn_pool extension', () => {
+        const GDPR_PATH = path.join(REPO_ROOT, '[System] DINOCO GDPR Data Requests');
+        const readGdpr = () => fs.readFileSync(GDPR_PATH, 'utf8');
+
+        test('GDPR snippet file exists', () => {
+            expect(fs.existsSync(GDPR_PATH)).toBe(true);
+        });
+
+        test('GDPR header bumped to V.4.2 (CSV scope extension supplements V.4.1)', () => {
+            const code = readGdpr();
+            // V.4.1 line still present (history) AND V.4.2 line present
+            expect(code).toMatch(/Version:\s*V\.4\.2/);
+            expect(code).toMatch(/Version:\s*V\.4\.1/);
+            // Reference to Phase 4 W14.4
+            expect(code).toMatch(/Phase\s*4\s*W14\.4/);
+            // Date 2026-05-07 in V.4.2 entry
+            expect(code).toMatch(/V\.4\.2[\s\S]{0,80}2026-05-07/);
+        });
+
+        test('2 NEW exporter helpers exist', () => {
+            const code = readGdpr();
+            expect(code).toContain('function dinoco_gdpr_export_sn_pool_data');
+            expect(code).toContain('function dinoco_gdpr_export_sn_audit_data');
+        });
+
+        test('CSV helpers exist (escape + row builder + redact)', () => {
+            const code = readGdpr();
+            expect(code).toContain('function dinoco_gdpr_csv_escape_cell');
+            expect(code).toContain('function dinoco_gdpr_csv_build_row');
+            expect(code).toContain('function dinoco_gdpr_csv_redact_audit_context');
+        });
+
+        test('UTF-8 BOM written to CSV strings', () => {
+            const code = readGdpr();
+            // Must contain BOM byte sequence \xEF\xBB\xBF
+            expect(code).toMatch(/\\xEF\\xBB\\xBF/);
+        });
+
+        test('CSV filenames match spec', () => {
+            const code = readGdpr();
+            expect(code).toContain("'sn-pool-plates.csv'");
+            expect(code).toContain("'sn-pool-plates-UNAVAILABLE.txt'");
+            expect(code).toContain("'sn-audit-actions.csv'");
+            expect(code).toContain("'sn-audit-actions-UNAVAILABLE.txt'");
+        });
+
+        test('Anonymize function references sn_pool + sn_audit tables', () => {
+            const code = readGdpr();
+            // Must reference both tables in the deletion executor body
+            const deletionFn = code.split('function dinoco_gdpr_execute_deletion')[1] || '';
+            expect(deletionFn).toContain('dinoco_sn_pool');
+            expect(deletionFn).toContain('dinoco_sn_audit');
+            // Sets registered_user_id=0 (preserve plate, disconnect ownership)
+            expect(deletionFn).toMatch(/registered_user_id\s*=\s*0/);
+            // JSON_REMOVE attempt for context_json PII strip (or fallback to '{}')
+            expect(deletionFn).toContain('JSON_REMOVE');
+        });
+
+        test('Anonymize report includes 2 NEW table keys', () => {
+            const code = readGdpr();
+            const deletionFn = code.split('function dinoco_gdpr_execute_deletion')[1] || '';
+            expect(deletionFn).toContain("'dinoco_sn_pool'");
+            expect(deletionFn).toContain("'dinoco_sn_audit'");
+        });
+
+        test('4 NEW audit log action types referenced', () => {
+            const code = readGdpr();
+            const expectedActions = [
+                'export_sn_pool',
+                'export_sn_audit',
+                'anonymize_sn_pool',
+                'anonymize_sn_audit',
+            ];
+            expectedActions.forEach((action) => {
+                expect(code).toContain(`'${action}'`);
+            });
+        });
+
+        test('INFORMATION_SCHEMA.TABLES probe used for table existence checks', () => {
+            const code = readGdpr();
+            // Find the slice from V.4.2 helpers onward
+            const v42 = code.split('V.4.2 — S/N Management CSV Exporters')[1] || '';
+            expect(v42).toMatch(/information_schema\.tables/i);
+            expect(v42).toContain('table_schema');
+            expect(v42).toContain('table_name');
+        });
+
+        test('All wp_dinoco_sn_* table queries use $wpdb->prepare', () => {
+            const code = readGdpr();
+            const v42 = code.split('V.4.2 — S/N Management CSV Exporters')[1] || '';
+            // Defensive — every SELECT in the new helpers should use prepare
+            expect(v42).toMatch(/\$wpdb->prepare\s*\(/);
+        });
+
+        test('CSV exporters wired into build_export orchestrator', () => {
+            const code = readGdpr();
+            // dinoco_gdpr_build_export must call the new helpers
+            const buildFn = code.split('function dinoco_gdpr_build_export')[1] || '';
+            expect(buildFn).toContain('dinoco_gdpr_export_sn_pool_data');
+            expect(buildFn).toContain('dinoco_gdpr_export_sn_audit_data');
+            // Wrapped in function_exists guards (defensive)
+            expect(buildFn).toMatch(/function_exists\(\s*['"]dinoco_gdpr_export_sn_pool_data['"]\s*\)/);
+            expect(buildFn).toMatch(/function_exists\(\s*['"]dinoco_gdpr_export_sn_audit_data['"]\s*\)/);
+        });
+
+        test('PII redact whitelist covers 11 keys', () => {
+            const code = readGdpr();
+            const redactFn = code.split('function dinoco_gdpr_csv_redact_audit_context')[1] || '';
+            const piiKeys = [
+                'phone', 'email', 'line_uid', 'national_id',
+                'credit_card', 'password', 'token', 'secret',
+                'authorization', 'api_key', 'bearer',
+            ];
+            piiKeys.forEach((k) => {
+                expect(redactFn).toContain(`'${k}'`);
+            });
+        });
+
+        test('Try/catch wraps each anonymize UPDATE (best-effort)', () => {
+            const code = readGdpr();
+            const deletionFn = code.split('function dinoco_gdpr_execute_deletion')[1] || '';
+            // Should have at least 2 try/catch blocks added (sn_pool + sn_audit)
+            const tryCount = (deletionFn.match(/try\s*\{/g) || []).length;
+            expect(tryCount).toBeGreaterThanOrEqual(2);
+            // Throwable catch + error_log fallback
+            expect(deletionFn).toMatch(/catch\s*\(\s*\\?Throwable/);
+            expect(deletionFn).toMatch(/error_log\(\s*'\[GDPR-SN-Anonymize\]/);
+        });
+
+        test('PHPUnit SnGdprExtensionTest.php exists', () => {
+            const filepath = path.join(REPO_ROOT, 'tests/helpers/SnGdprExtensionTest.php');
+            expect(fs.existsSync(filepath)).toBe(true);
+            const content = fs.readFileSync(filepath, 'utf8');
+            // CSV escape coverage (RFC 4180)
+            expect(content).toContain('test_csv_escape_comma_wraps_quotes');
+            expect(content).toContain('test_csv_escape_double_quote_doubled');
+            expect(content).toContain('test_csv_escape_newline_wraps_quotes');
+            // PII redact coverage
+            expect(content).toContain('test_redact_strips_all_11_pii_keys');
+            // Role derivation coverage
+            expect(content).toContain('test_role_actor_only');
+            expect(content).toContain('test_role_approver_only');
+            expect(content).toContain('test_role_both_when_self_approval');
+            // Audit action whitelist
+            expect(content).toContain('test_audit_actions_4_new_v42');
+            // Anonymize SQL safety
+            expect(content).toContain('test_anonymize_user_id_must_be_int');
+            // UTF-8 BOM verification
+            expect(content).toContain('test_utf8_bom_is_correct_3_bytes');
+        });
+    });
 });

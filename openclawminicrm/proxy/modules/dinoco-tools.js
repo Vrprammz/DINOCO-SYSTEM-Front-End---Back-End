@@ -1,11 +1,27 @@
 /**
  * dinoco-tools.js — AGENT_TOOLS definition, executeTool, KB suggestions
+ * V.6.0 — Phase 4 W14.1 S/N integration: dinoco_warranty_check now detects DNCSS\d{7} format
+ *         and routes to /sn-lookup; dinoco_create_claim validates S/N exists in sn_pool before
+ *         insert; NEW dinoco_serial_lookup tool (read-only canonical S/N lookup).
+ *         Refs: chatbot-rules.md Section 15. Test mode (reg_*) preserved for all 3 paths.
  * V.5.2 — C3/L3 fix: dinoco_dealer_lookup added to SIDE_EFFECT_TOOLS (defense-in-depth);
  *         use shared isRegressionMode() helper; mock dealer lookup returns plausible text.
  * V.5.1 — Add Regression Test Mode guard: SIDE_EFFECT_TOOLS mocked when sourceId starts with "reg_"
  *         (prevents dinoco_create_lead / dinoco_create_claim from writing real data during regression tests)
  * V.5.0 — Lead Flex with product image/price: dinoco_dealer_lookup + dinoco_create_lead use MongoDB dealers + notifyDealerDirect
  */
+
+// ★ V.6.0 — S/N format helpers (Phase 4 W14)
+// Canonical regex per chatbot-rules.md §15.1 — DNCSS prefix + 7 digits.
+// Normalize: uppercase + strip whitespace + strip dashes (e.g. "dncss-0001234" → "DNCSS0001234")
+const SN_PREFIX_REGEX = /^DNCSS\d{7}$/;
+function normalizeSerial(input) {
+  if (!input || typeof input !== "string") return "";
+  return input.toUpperCase().replace(/[\s-]+/g, "");
+}
+function isCanonicalSn(input) {
+  return SN_PREFIX_REGEX.test(normalizeSerial(input));
+}
 const { getDB, DEFAULT_BOT_NAME, mcpTools, mcpToolHandlers, getDynamicKeySync } = require("./shared");
 const { sendTelegramAlert } = require("./telegram-alert");
 const { callDinocoAPI } = require("./dinoco-cache");
@@ -140,13 +156,27 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "dinoco_warranty_check",
-      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial หรือเบอร์โทร ใช้เมื่อลูกค้าส่งเลข serial DN-XXXXX หรือเบอร์โทรมาเช็คประกัน",
+      description: "เช็คสถานะการรับประกันสินค้า DINOCO จากเลข Serial (รองรับ DNCSSxxxxxxx ใหม่ หรือ DN-XXXXX เก่า) หรือเบอร์โทร ใช้เมื่อลูกค้าส่งเลข serial หรือเบอร์โทรมาเช็คประกัน",
       parameters: {
         type: "object",
         properties: {
-          serial: { type: "string", description: "เลข serial number เช่น 'DN-12345'" },
+          serial: { type: "string", description: "เลข serial number เช่น 'DNCSS0001234' (รุ่นใหม่) หรือ 'DN-12345' (รุ่นเก่า)" },
           phone: { type: "string", description: "เบอร์โทรที่ลงทะเบียน" },
         },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "dinoco_serial_lookup",
+      description: "ค้นหาข้อมูลรับประกันจากเลข S/N (DNCSSxxxxxxx) ใช้เมื่อลูกค้าถามว่า 'ของฉันซื้อเมื่อไหร่' 'ประกันถึงเมื่อไหร่' 'นี่ของแท้ DINOCO ไหม' หรือส่งเลข S/N รูปแบบใหม่มา",
+      parameters: {
+        type: "object",
+        properties: {
+          serial: { type: "string", description: "เลข S/N เช่น 'DNCSS0001234'" },
+        },
+        required: ["serial"],
       },
     },
   },
@@ -277,6 +307,11 @@ async function executeTool(toolName, args, sourceId) {
       return `[TEST MODE] mocked dealer lookup — ตัวแทน: FOX RIDER (ลาดพร้าว) โทร 02-123-4567 (จำลอง)`;
     }
     return `[TEST MODE] mocked ${toolName}`;
+  }
+
+  // ★ V.6.0 — Serial lookup test mode mock (read-only, but still mock for deterministic regression)
+  if (isRegressionTestMode(sourceId) && toolName === "dinoco_serial_lookup") {
+    return `[TEST MODE] DNCSS0001234 ของจริง — top_set: ชุดกันล้ม XL750 PRO`;
   }
 
   if (toolName === "search_history") {
@@ -501,12 +536,47 @@ async function executeTool(toolName, args, sourceId) {
     return `ตัวแทนจำหน่ายในพื้นที่ ${result.location}:\n${result.dealers}\n\nวิธีตอบ: ${result.how_to_respond || ""}`;
   }
   if (toolName === "dinoco_warranty_check") {
-    const result = await callDinocoAPI("/warranty-check", { serial: args.serial || "", phone: args.phone || "" });
+    // ★ V.6.0 — S/N format detection (chatbot-rules.md §15.1)
+    // ถ้าเลข serial ตรงรูปแบบ DNCSS\d{7} → route ไป /sn-lookup canonical endpoint
+    // มิฉะนั้น → fallback ไป legacy /warranty-check (DN-XXXXX + warranty_registration CPT)
+    const rawSerial = args.serial || "";
+    const normalizedSn = normalizeSerial(rawSerial);
+    if (rawSerial && SN_PREFIX_REGEX.test(normalizedSn)) {
+      // NEW S/N path — call /sn-lookup
+      const snResult = await callDinocoAPI("/sn-lookup", { sn: normalizedSn });
+      if (typeof snResult === "string") return snResult;
+      if (!snResult || !snResult.found) {
+        return `ไม่พบ S/N ${normalizedSn} ในระบบ — เพลทอาจไม่ใช่ของแท้ DINOCO กรุณาติดต่อทีมงาน`;
+      }
+      const claimNote = snResult.claim_id_if_any ? ` | เคลม: ${snResult.claim_id_if_any}` : "";
+      return `S/N: ${snResult.sn} | สินค้า: ${snResult.top_set_name || "-"} | สถานะ: ${snResult.status || "-"} | ลงทะเบียน: ${snResult.registered_at || "-"} | หมดประกัน: ${snResult.warranty_until || "-"}${claimNote}`;
+    }
+    // LEGACY path — DN-XXXXX or phone-only lookup
+    const result = await callDinocoAPI("/warranty-check", { serial: rawSerial, phone: args.phone || "" });
     if (typeof result === "string") return result;
     if (!result.found) return result.message || "ไม่พบข้อมูลประกัน";
     return result.warranties.map((w) =>
       `Serial: ${w.serial} | สินค้า: ${w.product} | สถานะ: ${w.status} | หมดประกัน: ${w.expiry_date || "-"}${w.is_expired ? " (หมดแล้ว)" : " (ยังประกันอยู่)"}`
     ).join("\n");
+  }
+
+  // ★ V.6.0 — NEW dinoco_serial_lookup tool (read-only canonical S/N lookup)
+  // chatbot-rules.md §15.2 — บังคับเรียก tool ทุกครั้งที่ลูกค้าถามเรื่อง warranty/plate
+  if (toolName === "dinoco_serial_lookup") {
+    const rawSerial = args.serial || "";
+    const normalizedSn = normalizeSerial(rawSerial);
+    if (!SN_PREFIX_REGEX.test(normalizedSn)) {
+      return `รูปแบบ S/N ไม่ถูกต้อง ต้องเป็น DNCSS ตามด้วยตัวเลข 7 หลัก เช่น DNCSS0001234`;
+    }
+    const snResult = await callDinocoAPI("/sn-lookup", { sn: normalizedSn });
+    if (typeof snResult === "string") return snResult;
+    if (!snResult || !snResult.found) {
+      return `ไม่พบ S/N ในระบบ — อาจไม่ใช่ของแท้ DINOCO หรือยังไม่ได้ลงทะเบียน`;
+    }
+    const claimLine = snResult.claim_id_if_any
+      ? `มีเคลมเปิดอยู่: ${snResult.claim_id_if_any}`
+      : `ไม่มีเคลมเปิดอยู่`;
+    return `✓ S/N: ${snResult.sn}\nสินค้า: ${snResult.top_set_name || "-"}\nสถานะ: ${snResult.status || "-"}\nลงทะเบียน: ${snResult.registered_at || "-"}\nหมดประกัน: ${snResult.warranty_until || "-"}\n${claimLine}`;
   }
   if (toolName === "dinoco_kb_search") {
     const question = args.question || "";
@@ -814,11 +884,41 @@ async function executeTool(toolName, args, sourceId) {
   }
 
   // ★ V.3.4: เปิดใบเคลม DINOCO เข้าระบบ WP
+  // ★ V.6.0 (Phase 4 W14.1.2): S/N validation before insert (chatbot-rules.md §15.9)
   if (toolName === "dinoco_create_claim") {
     const symptoms = args.symptoms || "";
     const phone = args.phone || "";
     if (!symptoms || !phone) {
       return "ข้อมูลไม่ครบ — ต้องมีอาการ+เบอร์โทร ก่อนเปิดเคลม ตอบลูกค้าว่า: รบกวนแจ้งอาการปัญหา+เบอร์โทรติดต่อด้วยนะคะ";
+    }
+
+    // ★ V.6.0 — S/N validation (canonical DNCSS\d{7} only — legacy DN-XXXXX skips this gate)
+    let snLookupSnapshot = null;
+    const rawSerial = args.serial || "";
+    const normalizedSn = normalizeSerial(rawSerial);
+    if (rawSerial && SN_PREFIX_REGEX.test(normalizedSn)) {
+      const snResult = await callDinocoAPI("/sn-lookup", { sn: normalizedSn });
+      if (typeof snResult === "string") {
+        // upstream returned a plain error string — surface to AI verbatim
+        return `เปิดเคลมไม่สำเร็จ: ${snResult}`;
+      }
+      if (!snResult || !snResult.found) {
+        return `ไม่พบ S/N ${normalizedSn} ในระบบ — เพลทอาจไม่ใช่ของแท้ DINOCO กรุณาตรวจสอบเลขอีกครั้ง หรือติดต่อทีมงานหากต้องการเคลม`;
+      }
+      // Block sensitive states per chatbot-rules.md §15.3 (voided/recalled/stolen)
+      const blockedStatuses = new Set(["voided", "recalled", "stolen"]);
+      if (blockedStatuses.has(String(snResult.status || "").toLowerCase())) {
+        return `S/N ${normalizedSn} อยู่ในสถานะ ${snResult.status} — กรุณาติดต่อทีมงานก่อนเปิดเคลม`;
+      }
+      snLookupSnapshot = {
+        sn: snResult.sn || normalizedSn,
+        status: snResult.status || "",
+        top_set_sku: snResult.top_set_sku || "",
+        top_set_name: snResult.top_set_name || "",
+        registered_at: snResult.registered_at || null,
+        warranty_until: snResult.warranty_until || null,
+        checked_at: new Date(),
+      };
     }
 
     try {
@@ -832,7 +932,9 @@ async function executeTool(toolName, args, sourceId) {
         customerAddress: args.customer_address || "",
         product: args.product || "",
         photos: args.photos || [],
-        serial: args.serial || "",
+        serial: snLookupSnapshot ? snLookupSnapshot.sn : (args.serial || ""),
+        // ★ V.6.0 — preserve sn_pool status snapshot at create time for forensics
+        serial_status_at_create: snLookupSnapshot,
         purchaseFrom: args.purchase_from || "",
         sourceId,
         platform: detectedPlatform,
@@ -854,12 +956,12 @@ async function executeTool(toolName, args, sourceId) {
         customer_address: args.customer_address || "",
         product: args.product || "",
         photos: args.photos || [],
-        serial: args.serial || "",
+        serial: snLookupSnapshot ? snLookupSnapshot.sn : (args.serial || ""),
         purchase_from: args.purchase_from || "",
         source_id: sourceId,
         platform: detectedPlatform,
         initiated_by: "customer",
-        ai_analysis: `AI เปิดเคลมอัตโนมัติ — อาการ: ${symptoms}`,
+        ai_analysis: `AI เปิดเคลมอัตโนมัติ — อาการ: ${symptoms}${snLookupSnapshot ? ` | S/N: ${snLookupSnapshot.sn} (${snLookupSnapshot.status})` : ""}`,
       });
 
       let ticketNumber = "รอเลขจากระบบ";

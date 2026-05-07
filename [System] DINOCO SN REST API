@@ -1,6 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
+ * ║  Version: V.0.23 (2026-05-07) — Phase 4 W13.4 F#16 forecast/run + forecast/notify-boss║
  * ║  Version: V.0.22 (2026-05-05) — Phase 3 W11.1 F#13 geo drill-down + filter expand║
  * ║                                  (province detail + batch/gray_only filters)     ║
  * ║  Version: V.0.21 (2026-05-05) — Phase 3 W10.3+W11.2 LTV CSV Export + Stolen Recovery║
@@ -909,6 +910,31 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             'args'                => array(
                 'min_suggested' => array( 'type' => 'integer', 'default' => 1, 'sanitize_callback' => 'absint' ),
                 'limit'         => array( 'type' => 'integer', 'default' => 50, 'sanitize_callback' => 'absint' ),
+            ),
+        ) );
+
+        /* ─── Phase 4 W13.4 V.0.23 — F#16 Manual triggers ─── */
+
+        // POST /forecast/run — manual cron trigger (rate limit 1/hr/user)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/forecast/run', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_forecast_run',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(),
+        ) );
+
+        // POST /forecast/notify-boss — push weekly forecast Flex to admin LINE group
+        // (rate limit 5/hr/user — manually triggered preview/resend)
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/forecast/notify-boss', array(
+            'methods'             => 'POST',
+            'callback'            => 'dinoco_sn_rest_forecast_notify_boss',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'urgent_threshold_days' => array(
+                    'type'              => 'integer',
+                    'default'           => 60,
+                    'sanitize_callback' => 'absint',
+                ),
             ),
         ) );
 
@@ -5623,6 +5649,102 @@ if ( ! function_exists( 'dinoco_sn_rest_forecast_all' ) ) {
             'min_suggested' => $min_suggested,
             'fetched_at'    => current_time( 'c' ),
         ) );
+    }
+}
+
+/* ─── Phase 4 W13.4 V.0.23 — F#16 Manual trigger handlers ─── */
+
+if ( ! function_exists( 'dinoco_sn_rest_forecast_run' ) ) {
+    /**
+     * POST /dinoco-sn/v1/forecast/run
+     * Manual trigger of `dinoco_sn_run_demand_forecast()` cron worker.
+     * Rate limit: 1/hr/user via b2b_rate_limit (defensive — fail-open).
+     * Idempotency: actor-scoped marker only (no semantic params).
+     */
+    function dinoco_sn_rest_forecast_run( $req ) {
+        // Rate limit 1/hr/user
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = get_current_user_id();
+            $rl = b2b_rate_limit( "sn_forecast_run_{$uid}", 1, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error(
+                    'rate_limited',
+                    'รันได้ 1 ครั้ง/ชั่วโมง — โปรดรอแล้วลองใหม่',
+                    array( 'status' => 429, 'retry_after' => 3600 )
+                );
+            }
+        }
+
+        return dinoco_sn_with_idempotency(
+            $req,
+            'sn-forecast-run',
+            array(),
+            function( $req ) {
+                if ( ! function_exists( 'dinoco_sn_run_demand_forecast' ) ) {
+                    return new WP_Error(
+                        'forecast_unavailable',
+                        'forecast worker not loaded',
+                        array( 'status' => 503 )
+                    );
+                }
+                $start = microtime( true );
+                try {
+                    dinoco_sn_run_demand_forecast();
+                } catch ( \Throwable $e ) {
+                    return new WP_Error(
+                        'forecast_failed',
+                        $e->getMessage(),
+                        array( 'status' => 500 )
+                    );
+                }
+                $elapsed_ms = (int) round( ( microtime( true ) - $start ) * 1000 );
+                $last_run = get_option( 'dinoco_sn_demand_forecast_last_run', array() );
+                return rest_ensure_response( array(
+                    'success'    => true,
+                    'elapsed_ms' => $elapsed_ms,
+                    'last_run'   => is_array( $last_run ) ? $last_run : array(),
+                ) );
+            }
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_forecast_notify_boss' ) ) {
+    /**
+     * POST /dinoco-sn/v1/forecast/notify-boss
+     * Manually push current forecast Flex card to admin LINE group.
+     * Rate limit: 5/hr/user.
+     */
+    function dinoco_sn_rest_forecast_notify_boss( $req ) {
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $uid = get_current_user_id();
+            $rl = b2b_rate_limit( "sn_forecast_notify_boss_{$uid}", 5, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) {
+                return new WP_Error(
+                    'rate_limited',
+                    'ส่งได้สูงสุด 5 ครั้ง/ชั่วโมง — โปรดรอแล้วลองใหม่',
+                    array( 'status' => 429, 'retry_after' => 3600 )
+                );
+            }
+        }
+
+        return dinoco_sn_with_idempotency(
+            $req,
+            'sn-forecast-notify-boss',
+            array( 'urgent_threshold_days' ),
+            function( $req ) {
+                $threshold = max( 1, min( 365, (int) $req->get_param( 'urgent_threshold_days' ) ) );
+                if ( ! function_exists( 'dinoco_sn_dispatch_weekly_forecast_flex' ) ) {
+                    return new WP_Error(
+                        'flex_dispatcher_unavailable',
+                        'weekly forecast flex dispatcher not loaded',
+                        array( 'status' => 503 )
+                    );
+                }
+                $result = dinoco_sn_dispatch_weekly_forecast_flex( $threshold );
+                return rest_ensure_response( $result );
+            }
+        );
     }
 }
 

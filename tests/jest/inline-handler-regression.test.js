@@ -141,7 +141,13 @@ const SNIPPET_PREFIXES = [
 // added 6 inline handlers in Manager: clickable province rows for drill-down +
 // Investigate + Telegram alert buttons in Gray Market Alerts panel. Per Phase 3
 // W11.1 plan §F#13. Phase 6 migration sweep applies.
-const BASELINE_INLINE_HANDLER_COUNT = 948;
+//
+// Bumped 948→951 (2026-05-07): Phase 4 W13.2+W13.4 F#16 Demand Forecast added
+// 3 inline handlers in Manager Tab 3 forecast section: 📨 ส่งให้บอส LINE
+// header button + Suggested Action card "📨 ส่งให้บอส LINE" + "📋 สร้าง batch
+// ทันที" deep-link to Tab 1. Per Phase 4 W13 plan §W13.2. Phase 6 migration
+// sweep applies (will refactor to event delegation).
+const BASELINE_INLINE_HANDLER_COUNT = 951;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

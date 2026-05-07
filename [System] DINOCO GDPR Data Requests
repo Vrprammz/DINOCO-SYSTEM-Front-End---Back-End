@@ -1,6 +1,30 @@
 /**
  * File: [System] DINOCO GDPR Data Requests
  * Description: GDPR / Thai PDPA compliance — self-service data export + deletion
+ * Version: V.4.2 — (2026-05-07): Plan v2.13 §H Phase 4 W14.4 — CSV-format S/N
+ *   scope helpers (additive supplement to V.4.1 JSON exports). Adds:
+ *     - dinoco_gdpr_export_sn_pool_data($user_id, $request_id) — emits
+ *       sn-pool-plates.csv (UTF-8 BOM + RFC 4180) joined with sn_pool_meta when
+ *       available. Empty-but-table-present → CSV with header row only (NOT
+ *       UNAVAILABLE). Table missing → sn-pool-plates-UNAVAILABLE.txt placeholder.
+ *     - dinoco_gdpr_export_sn_audit_data($user_id, $request_id) — emits
+ *       sn-audit-actions.csv (UTF-8 BOM + RFC 4180) for rows where user is
+ *       actor OR approver. Defensive context_json PII redact (phone/email
+ *       stripped) before write. Same UNAVAILABLE pattern.
+ *   Both helpers wired into dinoco_gdpr_build_export() AFTER existing V.4.1
+ *   JSON exports — they coexist (CSV is admin/regulator-friendly while JSON
+ *   preserves full structural audit). 4 new audit log actions:
+ *   export_sn_pool / export_sn_audit / anonymize_sn_pool / anonymize_sn_audit.
+ *   Anonymize scope (dinoco_gdpr_execute_deletion):
+ *     - UPDATE sn_pool SET registered_user_id=0 WHERE registered_user_id=$user
+ *       (preserve plate traceability, disconnect ownership only)
+ *     - UPDATE sn_audit SET context_json=JSON_REMOVE(...,'$.phone','$.email')
+ *       WHERE actor_user_id OR approver_user_id = $user_id. Try/catch fallback
+ *       to context_json='{}' for hosts without JSON functions.
+ *   Each UPDATE in its own try/catch — best-effort, does NOT fail entire erasure.
+ *   Risk: LOW — additive helpers + defensive table existence + prepared statements +
+ *     PII redact before write. PHPUnit: tests/helpers/SnGdprExtensionTest.php (15+
+ *     pure-logic cases for CSV format, anonymize SQL safety, audit log shape).
  * Version: V.4.1 — (2026-05-05): Plan v2.13 §H Phase 4 W14.4 — extend export scope
  *   to Production S/N Management data per PDPA §30 right-of-access. Adds 4 new
  *   ZIP entries (when SN system installed):
@@ -1006,6 +1030,391 @@ if ( ! function_exists( 'dinoco_gdpr_export_line_messages' ) ) {
 }
 
 // ───────────────────────────────────────────────────────────────────
+// V.4.2 — S/N Management CSV Exporters (Phase 4 W14.4)
+// ───────────────────────────────────────────────────────────────────
+//
+// These helpers supplement the V.4.1 JSON exports. They produce
+// regulator-friendly CSV (UTF-8 BOM + RFC 4180) for the two highest-
+// priority S/N tables: sn_pool (plates owned by user) + sn_audit
+// (events where user was actor or approver).
+//
+// Defensive contract:
+//   - Table existence checked via INFORMATION_SCHEMA.TABLES probe
+//   - Missing table → write *-UNAVAILABLE.txt placeholder (does NOT
+//     throw; orchestrator continues)
+//   - Empty result with table present → CSV header row only (NOT
+//     UNAVAILABLE — the user simply has no rows yet)
+//   - All cross-snippet calls wrapped in function_exists() guards
+//   - Audit log entries written best-effort via dinoco_gdpr_audit_log()
+
+if ( ! function_exists( 'dinoco_gdpr_csv_escape_cell' ) ) {
+    /**
+     * Escape a single cell per RFC 4180:
+     *   - If value contains comma, double-quote, CR, or LF: wrap in
+     *     double-quotes and double any embedded double-quotes.
+     *   - Otherwise emit as-is.
+     *   - null / empty → empty cell.
+     *
+     * @param mixed $v
+     * @return string
+     */
+    function dinoco_gdpr_csv_escape_cell( $v ) {
+        if ( $v === null ) return '';
+        $s = (string) $v;
+        if ( $s === '' ) return '';
+        if ( preg_match( '/[",\r\n]/', $s ) ) {
+            return '"' . str_replace( '"', '""', $s ) . '"';
+        }
+        return $s;
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_csv_build_row' ) ) {
+    /**
+     * Build a single CSV row from an associative array given a column
+     * order. Missing keys → empty cells (defensive — schema variations).
+     *
+     * @param array $row     associative
+     * @param array $columns ordered list of column names
+     * @return string CSV line (no trailing newline)
+     */
+    function dinoco_gdpr_csv_build_row( $row, $columns ) {
+        $cells = array();
+        foreach ( $columns as $col ) {
+            $val = isset( $row[ $col ] ) ? $row[ $col ] : null;
+            $cells[] = dinoco_gdpr_csv_escape_cell( $val );
+        }
+        return implode( ',', $cells );
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_csv_redact_audit_context' ) ) {
+    /**
+     * Defensive PII strip on sn_audit.context_json before CSV write.
+     * Keys removed: phone, email, line_uid, national_id, credit_card,
+     * password, token, secret. Returns empty string if input cannot be
+     * decoded (treats as already-empty).
+     *
+     * @param string|null $raw
+     * @return string redacted JSON (or '' if input empty/invalid)
+     */
+    function dinoco_gdpr_csv_redact_audit_context( $raw ) {
+        if ( $raw === null || $raw === '' ) return '';
+        $decoded = json_decode( (string) $raw, true );
+        if ( ! is_array( $decoded ) ) return '';
+        $pii_keys = array(
+            'phone', 'email', 'line_uid', 'national_id',
+            'credit_card', 'password', 'token', 'secret',
+            'authorization', 'api_key', 'bearer',
+        );
+        foreach ( $pii_keys as $k ) {
+            if ( array_key_exists( $k, $decoded ) ) {
+                unset( $decoded[ $k ] );
+            }
+        }
+        $out = wp_json_encode( $decoded, JSON_UNESCAPED_UNICODE );
+        return is_string( $out ) ? $out : '';
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_export_sn_pool_data' ) ) {
+    /**
+     * Export sn_pool + sn_pool_meta data for a user as CSV.
+     *
+     * Output: associative result array. Caller (orchestrator) decides
+     * whether to write CSV string to ZIP or write UNAVAILABLE placeholder.
+     *
+     * @param int $user_id     WP user ID (registered_user_id)
+     * @param int $request_id  wp_dinoco_gdpr_requests.id (for audit log)
+     * @return array {
+     *   @type bool   $success
+     *   @type bool   $table_existed
+     *   @type string $csv               '' if table missing
+     *   @type string $placeholder_text  '' unless UNAVAILABLE
+     *   @type int    $rows_exported
+     *   @type int    $file_size_bytes
+     * }
+     */
+    function dinoco_gdpr_export_sn_pool_data( $user_id, $request_id = 0 ) {
+        $user_id    = absint( $user_id );
+        $request_id = absint( $request_id );
+
+        $result = array(
+            'success'          => false,
+            'table_existed'    => false,
+            'csv'              => '',
+            'placeholder_text' => '',
+            'rows_exported'    => 0,
+            'file_size_bytes'  => 0,
+        );
+
+        if ( $user_id <= 0 ) {
+            $result['placeholder_text'] = "S/N pool export unavailable: invalid user_id\n";
+            return $result;
+        }
+
+        global $wpdb;
+        $tbl      = $wpdb->prefix . 'dinoco_sn_pool';
+        $meta_tbl = $wpdb->prefix . 'dinoco_sn_pool_meta';
+
+        // INFORMATION_SCHEMA probe — defensive against missing table
+        $tbl_exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        if ( ! ( (int) $tbl_exists > 0 ) ) {
+            $result['placeholder_text'] = "wp_dinoco_sn_pool table not installed.\n" .
+                "S/N system may not yet be activated on this site.\n" .
+                "Generated: " . gmdate( 'c' ) . "\n";
+            // Best-effort audit log
+            if ( $request_id > 0 && function_exists( 'dinoco_gdpr_audit_log' ) ) {
+                dinoco_gdpr_audit_log( $request_id, 'export_sn_pool', array(
+                    'note' => wp_json_encode( array(
+                        'rows_exported'   => 0,
+                        'table_existed'   => false,
+                        'file_size_bytes' => strlen( $result['placeholder_text'] ),
+                    ) ),
+                ) );
+            }
+            return $result;
+        }
+
+        $result['table_existed'] = true;
+
+        // Check meta table existence (optional join)
+        $meta_exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $meta_tbl
+        ) );
+        $has_meta = ( (int) $meta_exists > 0 );
+
+        // Hot path columns (always present)
+        $columns = array(
+            'sn',
+            'batch_id',
+            'linked_sku',
+            'status',
+            'prev_status',
+            'lock_version',
+            'registered_user_id',
+            'registered_at',
+            'created_at',
+        );
+        if ( $has_meta ) {
+            $columns = array_merge( $columns, array(
+                'purchase_dealer_id',
+                'purchase_date',
+                'top_set_sku',
+                'replaced_by_sn',
+                'replaces_sn',
+                'stolen_at',
+            ) );
+        }
+
+        // Build query — LEFT JOIN if meta available
+        if ( $has_meta ) {
+            $sql = "SELECT p.sn, p.batch_id, p.linked_sku, p.status, p.prev_status,
+                           p.lock_version, p.registered_user_id, p.registered_at,
+                           p.created_at,
+                           m.purchase_dealer_id, m.purchase_date, m.top_set_sku,
+                           m.replaced_by_sn, m.replaces_sn, m.stolen_at
+                    FROM {$tbl} p
+                    LEFT JOIN {$meta_tbl} m ON m.sn = p.sn
+                    WHERE p.registered_user_id = %d
+                    ORDER BY p.registered_at DESC";
+        } else {
+            $sql = "SELECT sn, batch_id, linked_sku, status, prev_status,
+                           lock_version, registered_user_id, registered_at, created_at
+                    FROM {$tbl}
+                    WHERE registered_user_id = %d
+                    ORDER BY registered_at DESC";
+        }
+
+        $rows = $wpdb->get_results( $wpdb->prepare( $sql, $user_id ), ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // Build CSV with UTF-8 BOM + RFC 4180. Empty-but-table-present is
+        // valid (header row only) — NOT UNAVAILABLE.
+        $bom = "\xEF\xBB\xBF";
+        $lines = array();
+        $lines[] = dinoco_gdpr_csv_build_row( array_combine( $columns, $columns ), $columns );
+        foreach ( $rows as $row ) {
+            $lines[] = dinoco_gdpr_csv_build_row( $row, $columns );
+        }
+        $csv = $bom . implode( "\r\n", $lines ) . "\r\n";
+
+        $result['csv']             = $csv;
+        $result['rows_exported']   = count( $rows );
+        $result['file_size_bytes'] = strlen( $csv );
+        $result['success']         = true;
+
+        // Audit log (best-effort)
+        if ( $request_id > 0 && function_exists( 'dinoco_gdpr_audit_log' ) ) {
+            dinoco_gdpr_audit_log( $request_id, 'export_sn_pool', array(
+                'note' => wp_json_encode( array(
+                    'rows_exported'   => $result['rows_exported'],
+                    'table_existed'   => true,
+                    'file_size_bytes' => $result['file_size_bytes'],
+                    'has_meta_join'   => $has_meta,
+                ) ),
+            ) );
+        }
+
+        // Optional cross-snippet observability hook
+        if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+            dinoco_sn_obs_capture( null, array(
+                'event'         => 'gdpr_export_sn_pool',
+                'user_id'       => $user_id,
+                'request_id'    => $request_id,
+                'rows_exported' => $result['rows_exported'],
+            ) );
+        }
+
+        return $result;
+    }
+}
+
+if ( ! function_exists( 'dinoco_gdpr_export_sn_audit_data' ) ) {
+    /**
+     * Export sn_audit data for a user as CSV (where user was actor OR
+     * approver). PII redacted from context_json before write.
+     *
+     * @param int $user_id
+     * @param int $request_id
+     * @return array see dinoco_gdpr_export_sn_pool_data() return shape
+     */
+    function dinoco_gdpr_export_sn_audit_data( $user_id, $request_id = 0 ) {
+        $user_id    = absint( $user_id );
+        $request_id = absint( $request_id );
+
+        $result = array(
+            'success'          => false,
+            'table_existed'    => false,
+            'csv'              => '',
+            'placeholder_text' => '',
+            'rows_exported'    => 0,
+            'file_size_bytes'  => 0,
+        );
+
+        if ( $user_id <= 0 ) {
+            $result['placeholder_text'] = "S/N audit export unavailable: invalid user_id\n";
+            return $result;
+        }
+
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_sn_audit';
+
+        $tbl_exists = $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s",
+            DB_NAME, $tbl
+        ) );
+        if ( ! ( (int) $tbl_exists > 0 ) ) {
+            $result['placeholder_text'] = "wp_dinoco_sn_audit table not installed.\n" .
+                "S/N system may not yet be activated on this site.\n" .
+                "Generated: " . gmdate( 'c' ) . "\n";
+            if ( $request_id > 0 && function_exists( 'dinoco_gdpr_audit_log' ) ) {
+                dinoco_gdpr_audit_log( $request_id, 'export_sn_audit', array(
+                    'note' => wp_json_encode( array(
+                        'rows_exported'   => 0,
+                        'table_existed'   => false,
+                        'file_size_bytes' => strlen( $result['placeholder_text'] ),
+                    ) ),
+                ) );
+            }
+            return $result;
+        }
+
+        $result['table_existed'] = true;
+
+        $columns = array(
+            'id',
+            'sn',
+            'event_type',
+            'status_from',
+            'status_to',
+            'role',           // actor | approver | both — derived
+            'actor_user_id',
+            'approver_user_id',
+            'reason',
+            'reason_category',
+            'context_json_redacted',
+            'is_sensitive',
+            'created_at',
+        );
+
+        // 5,000 cap defensive
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, sn, event_type, status_from, status_to,
+                    actor_user_id, approver_user_id, reason, reason_category,
+                    context_json, is_sensitive, created_at
+             FROM {$tbl}
+             WHERE actor_user_id = %d OR approver_user_id = %d
+             ORDER BY created_at DESC
+             LIMIT 5000",
+            $user_id, $user_id
+        ), ARRAY_A );
+        if ( ! is_array( $rows ) ) $rows = array();
+
+        // Augment each row with role + redacted context
+        foreach ( $rows as &$r ) {
+            $is_actor    = ( (int) $r['actor_user_id']    === $user_id );
+            $is_approver = ( (int) $r['approver_user_id'] === $user_id );
+            if ( $is_actor && $is_approver ) {
+                $r['role'] = 'both';
+            } elseif ( $is_actor ) {
+                $r['role'] = 'actor';
+            } elseif ( $is_approver ) {
+                $r['role'] = 'approver';
+            } else {
+                $r['role'] = 'unknown';
+            }
+            $r['context_json_redacted'] = dinoco_gdpr_csv_redact_audit_context(
+                isset( $r['context_json'] ) ? $r['context_json'] : ''
+            );
+        }
+        unset( $r );
+
+        $bom = "\xEF\xBB\xBF";
+        $lines = array();
+        $lines[] = dinoco_gdpr_csv_build_row( array_combine( $columns, $columns ), $columns );
+        foreach ( $rows as $row ) {
+            $lines[] = dinoco_gdpr_csv_build_row( $row, $columns );
+        }
+        $csv = $bom . implode( "\r\n", $lines ) . "\r\n";
+
+        $result['csv']             = $csv;
+        $result['rows_exported']   = count( $rows );
+        $result['file_size_bytes'] = strlen( $csv );
+        $result['success']         = true;
+
+        if ( $request_id > 0 && function_exists( 'dinoco_gdpr_audit_log' ) ) {
+            dinoco_gdpr_audit_log( $request_id, 'export_sn_audit', array(
+                'note' => wp_json_encode( array(
+                    'rows_exported'   => $result['rows_exported'],
+                    'table_existed'   => true,
+                    'file_size_bytes' => $result['file_size_bytes'],
+                    'capped_at_5000'  => ( $result['rows_exported'] === 5000 ),
+                ) ),
+            ) );
+        }
+
+        if ( function_exists( 'dinoco_sn_obs_capture' ) ) {
+            dinoco_sn_obs_capture( null, array(
+                'event'         => 'gdpr_export_sn_audit',
+                'user_id'       => $user_id,
+                'request_id'    => $request_id,
+                'rows_exported' => $result['rows_exported'],
+            ) );
+        }
+
+        return $result;
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
 // V.2.0 — Export Builder
 // ───────────────────────────────────────────────────────────────────
 
@@ -1390,6 +1799,38 @@ if ( ! function_exists( 'dinoco_gdpr_build_export' ) ) {
             $record_counts['sn_unavailable'] = true;
         }
 
+        // ── V.4.2 — CSV-format S/N exports (additive supplement to V.4.1 JSON) ──
+        // Per Phase 4 W14.4 spec — regulator-friendly CSV with UTF-8 BOM + RFC 4180.
+        // Coexists with V.4.1 JSON exports above (different consumers/formats).
+        $record_counts['sn_pool_csv_rows']  = 0;
+        $record_counts['sn_audit_csv_rows'] = 0;
+        if ( function_exists( 'dinoco_gdpr_export_sn_pool_data' ) ) {
+            try {
+                $pool_csv = dinoco_gdpr_export_sn_pool_data( $user_id, 0 );
+                if ( ! empty( $pool_csv['table_existed'] ) ) {
+                    $zip->addFromString( 'sn-pool-plates.csv', $pool_csv['csv'] );
+                    $record_counts['sn_pool_csv_rows'] = (int) $pool_csv['rows_exported'];
+                } elseif ( ! empty( $pool_csv['placeholder_text'] ) ) {
+                    $zip->addFromString( 'sn-pool-plates-UNAVAILABLE.txt', $pool_csv['placeholder_text'] );
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[GDPR-SN-CSV] sn_pool CSV export threw: ' . $e->getMessage() );
+            }
+        }
+        if ( function_exists( 'dinoco_gdpr_export_sn_audit_data' ) ) {
+            try {
+                $audit_csv = dinoco_gdpr_export_sn_audit_data( $user_id, 0 );
+                if ( ! empty( $audit_csv['table_existed'] ) ) {
+                    $zip->addFromString( 'sn-audit-actions.csv', $audit_csv['csv'] );
+                    $record_counts['sn_audit_csv_rows'] = (int) $audit_csv['rows_exported'];
+                } elseif ( ! empty( $audit_csv['placeholder_text'] ) ) {
+                    $zip->addFromString( 'sn-audit-actions-UNAVAILABLE.txt', $audit_csv['placeholder_text'] );
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[GDPR-SN-CSV] sn_audit CSV export threw: ' . $e->getMessage() );
+            }
+        }
+
         $zip->close();
 
         $size_bytes = file_exists( $zip_path ) ? filesize( $zip_path ) : 0;
@@ -1445,6 +1886,9 @@ if ( ! function_exists( 'dinoco_gdpr_execute_deletion' ) ) {
             'b2b_order'             => array( 'action' => 'pending', 'count' => 0 ),
             'dinoco_debt_log'       => array( 'action' => 'preserved_legal_hold', 'count' => 0 ),
             'b2f_payable_log'       => array( 'action' => 'preserved_legal_hold', 'count' => 0 ),
+            // V.4.2 — S/N Management anonymize scope (Phase 4 W14.4)
+            'dinoco_sn_pool'        => array( 'action' => 'pending', 'count' => 0 ),
+            'dinoco_sn_audit'       => array( 'action' => 'pending', 'count' => 0 ),
         );
 
         try {
@@ -1527,6 +1971,108 @@ if ( ! function_exists( 'dinoco_gdpr_execute_deletion' ) ) {
                 $report['b2b_order']['count']  = count( $o_posts );
             } else {
                 $report['b2b_order']['action'] = 'none';
+            }
+
+            // ── V.4.2 — S/N Management anonymize scope (Phase 4 W14.4) ──
+            // Each UPDATE in its own try/catch — best-effort, NEVER fails entire
+            // erasure. Logs via error_log on failure for postmortem.
+            global $wpdb;
+
+            // 6. sn_pool — disconnect ownership but preserve plate row (S/N
+            //    traceability + warranty history retained per boss policy)
+            try {
+                $pool_tbl = $wpdb->prefix . 'dinoco_sn_pool';
+                $tbl_exists = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM information_schema.tables
+                     WHERE table_schema = %s AND table_name = %s",
+                    DB_NAME, $pool_tbl
+                ) );
+                if ( (int) $tbl_exists > 0 ) {
+                    $affected = $wpdb->query( $wpdb->prepare(
+                        "UPDATE {$pool_tbl}
+                         SET registered_user_id = 0
+                         WHERE registered_user_id = %d",
+                        $user_id
+                    ) );
+                    $report['dinoco_sn_pool']['action'] = 'anonymized';
+                    $report['dinoco_sn_pool']['count']  = (int) $affected;
+                    if ( function_exists( 'dinoco_gdpr_audit_log' ) ) {
+                        // Best-effort — request_id is unknown in this scope so
+                        // we use 0 sentinel; admin Audit Log viewer filters
+                        // those out by default but still searchable.
+                        dinoco_gdpr_audit_log( 0, 'anonymize_sn_pool', array(
+                            'note' => wp_json_encode( array(
+                                'user_id'        => $user_id,
+                                'rows_affected'  => (int) $affected,
+                            ) ),
+                        ) );
+                    }
+                } else {
+                    $report['dinoco_sn_pool']['action'] = 'table_missing';
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[GDPR-SN-Anonymize] sn_pool UPDATE threw: ' . $e->getMessage() );
+                $report['dinoco_sn_pool']['action'] = 'error';
+            }
+
+            // 7. sn_audit — strip PII keys from context_json. Try MySQL JSON
+            //    function first; on hosts without JSON support, fall back to
+            //    overwriting context_json='{}' on rows touched by user.
+            try {
+                $audit_tbl = $wpdb->prefix . 'dinoco_sn_audit';
+                $audit_exists = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM information_schema.tables
+                     WHERE table_schema = %s AND table_name = %s",
+                    DB_NAME, $audit_tbl
+                ) );
+                if ( (int) $audit_exists > 0 ) {
+                    $affected_audit = 0;
+                    // Attempt JSON_REMOVE first (MySQL 5.7+ / MariaDB 10.2+)
+                    $json_attempt = @$wpdb->query( $wpdb->prepare(
+                        "UPDATE {$audit_tbl}
+                         SET context_json = JSON_REMOVE(
+                                COALESCE(context_json, '{}'),
+                                '$.phone', '$.email', '$.line_uid',
+                                '$.national_id', '$.credit_card', '$.password',
+                                '$.token', '$.secret', '$.authorization',
+                                '$.api_key', '$.bearer'
+                             )
+                         WHERE (actor_user_id = %d OR approver_user_id = %d)
+                           AND context_json IS NOT NULL
+                           AND context_json <> ''",
+                        $user_id, $user_id
+                    ) );
+                    if ( $json_attempt !== false ) {
+                        $affected_audit = (int) $json_attempt;
+                    } else {
+                        // Fallback — JSON funcs unavailable. Overwrite to '{}'.
+                        $fallback = $wpdb->query( $wpdb->prepare(
+                            "UPDATE {$audit_tbl}
+                             SET context_json = '{}'
+                             WHERE (actor_user_id = %d OR approver_user_id = %d)
+                               AND context_json IS NOT NULL
+                               AND context_json <> ''",
+                            $user_id, $user_id
+                        ) );
+                        $affected_audit = (int) ( $fallback !== false ? $fallback : 0 );
+                    }
+                    $report['dinoco_sn_audit']['action'] = 'pii_redacted';
+                    $report['dinoco_sn_audit']['count']  = $affected_audit;
+                    if ( function_exists( 'dinoco_gdpr_audit_log' ) ) {
+                        dinoco_gdpr_audit_log( 0, 'anonymize_sn_audit', array(
+                            'note' => wp_json_encode( array(
+                                'user_id'        => $user_id,
+                                'rows_affected'  => $affected_audit,
+                                'method'         => ( $json_attempt !== false ? 'json_remove' : 'overwrite' ),
+                            ) ),
+                        ) );
+                    }
+                } else {
+                    $report['dinoco_sn_audit']['action'] = 'table_missing';
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[GDPR-SN-Anonymize] sn_audit UPDATE threw: ' . $e->getMessage() );
+                $report['dinoco_sn_audit']['action'] = 'error';
             }
 
             return array( 'success' => true, 'report' => $report );

@@ -4,8 +4,8 @@
 > ทุก rule ในไฟล์นี้คือสิ่งที่ถูกแก้ไปแล้ว **ห้ามเปลี่ยน** เวลาแก้ feature อื่น
 > ก่อนแก้อะไรที่เกี่ยวกับ chatbot (ai-chat.js, shared.js, dinoco-tools.js) **ต้องอ่านไฟล์นี้ก่อนเสมอ**
 
-**Last updated:** 2026-04-11 | **Version:** 1.3
-**Regression status:** 25/25 PASS (100%) — Gate verified stable
+**Last updated:** 2026-05-07 | **Version:** 1.4
+**Regression status:** 25/25 PASS (100%) — Gate verified stable | Section 15 implementation wired in dinoco-tools.js V.6.0
 
 ---
 
@@ -564,6 +564,25 @@ REG-IDs ที่ map ไป Section 15 (ใส่ใน `regression_scenarios` 
 
 ---
 
-**Last updated:** 2026-05-04 (Section 15 added — v2.13 S/N Management Phase 4 W14 prep)
+**Last updated:** 2026-05-07 (Section 15 implementation landed — Phase 4 W14.1 wired in dinoco-tools.js V.6.0)
+
+### 15.13 Implementation Status (Phase 4 W14.1 — 2026-05-07)
+
+`dinoco-tools.js` V.6.0 wires §15.1, §15.2, §15.3 (partial — voided/recalled/stolen block at claim creation), §15.9 (full):
+
+- **§15.1** `normalizeSerial()` + `SN_PREFIX_REGEX` helpers exported in `dinoco-tools.js` head — uppercase + strip whitespace + strip dashes
+- **§15.2** `dinoco_warranty_check` auto-detects `/^DNCSS\d{7}$/` → routes to `/sn-lookup`; non-canonical serial → legacy `/warranty-check` fallback
+- **§15.3** `dinoco_create_claim` blocks insert when sn_pool returns `voided` / `recalled` / `stolen` — generic Thai reply, no leak of reason
+- **§15.9** `dinoco_create_claim` validates S/N exists in sn_pool **before** insert (returns error to AI without DB write if not found); on success preserves `serial_status_at_create` snapshot in MongoDB doc + appends `S/N: ... (status)` to `ai_analysis` for WP-side audit
+- **NEW** `dinoco_serial_lookup` tool — read-only canonical S/N lookup (described to AI for proactive use when ลูกค้าถาม "ของฉันซื้อเมื่อไหร่")
+- **Test mode** (`reg_*` sourceId) — all 3 paths return mocks (`dinoco_serial_lookup` mock added to dispatcher; `dinoco_create_claim` mock unchanged from V.5.x — still returns `REG-TEST-0001` without S/N validation, by design for regression determinism)
+
+Deferred to future rounds:
+- §15.4 (recall query escalate) — needs intent classifier wiring (lives in `ai-chat.js`, out of W14.1 scope)
+- §15.5 / §15.6 (warranty-vs-receipt + reissue M2) — UX decisions per ai-chat.js prompt rules; not enforced at tool layer
+- §15.7 (in_pool / reserved before ship mismatch) — requires `dinoco_warranty_check` extended status branch + Telegram escalate (Phase 4 W14.3)
+- §15.8 (Photo OCR validation chain) — claim-flow.js integration (Phase 4 W14.4)
+- §15.10 (cross-system cache invalidation) — needs MCP event listener (Phase 4 W14.5)
+
 
 **END OF CANONICAL BRAIN**
