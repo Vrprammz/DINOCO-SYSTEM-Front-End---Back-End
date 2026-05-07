@@ -5678,4 +5678,63 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(fnBlock).toContain("$ctx['extension_url']");
         });
     });
+
+    describe('V.0.35 LIFF URL builder + provisioned IDs', () => {
+        function readManager() {
+            const file = path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager');
+            return fs.readFileSync(file, 'utf8');
+        }
+
+        test('Manager V.0.35 header bumped', () => {
+            expect(readManager()).toMatch(/Version: V\.0\.35 \(2026-05-07\) — LIFF URL builder/);
+        });
+
+        test('helper dinoco_sn_build_warranty_url exists', () => {
+            const code = readManager();
+            expect(code).toContain('function dinoco_sn_build_warranty_url');
+            const fnBlock = code.split('function dinoco_sn_build_warranty_url')[1] || '';
+            expect(fnBlock).toContain('https://liff.line.me/');
+            expect(fnBlock).toContain("'/warranty/activate/'");
+            expect(fnBlock).toContain("'/warranty/extend/'");
+        });
+
+        test('hardcoded LIFF IDs are provisioned defaults', () => {
+            const code = readManager();
+            // Activate LIFF ID (DINOCO LOGIN SYSTEM channel 2008686775)
+            expect(code).toContain('2008686775-WzPnX7dB');
+            // Extend LIFF ID
+            expect(code).toContain('2008686775-bJp0ljpM');
+        });
+
+        test('LIFF ID resolution chain: option → constant → hardcoded', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_build_warranty_url')[1] || '';
+            expect(fnBlock).toContain('dinoco_sn_liff_');
+            expect(fnBlock).toContain('DINOCO_SN_LIFF_');
+            expect(fnBlock).toContain('default_liff_ids');
+        });
+
+        test('init hook installs LIFF ID defaults to wp_options', () => {
+            const code = readManager();
+            expect(code).toContain("'dinoco_sn_liff_activate_id'");
+            expect(code).toContain("'dinoco_sn_liff_extend_id'");
+            expect(code).toMatch(/update_option\(\s*'dinoco_sn_liff_activate_id'/);
+            expect(code).toMatch(/update_option\(\s*'dinoco_sn_liff_extend_id'/);
+        });
+
+        test('build_flex_for_notification uses helper for extension_url', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_build_flex_for_notification')[1] || '';
+            expect(fnBlock).toContain('dinoco_sn_build_warranty_url');
+            expect(fnBlock).toMatch(/build_warranty_url\(\s*'extend'/);
+        });
+
+        test('prefer_liff parameter supported (web fallback for QR codes)', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_build_warranty_url')[1] || '';
+            expect(fnBlock).toContain('$prefer_liff');
+            // QR codes printed on plate need web URL (not LIFF) — camera scan opens browser
+            expect(fnBlock).toMatch(/home_url\(\s*\$path\s*\.\s*\$sn_q\s*\)/);
+        });
+    });
 });
