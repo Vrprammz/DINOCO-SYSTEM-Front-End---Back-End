@@ -5628,4 +5628,54 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(content).toContain('test_idempotency_hash_deterministic');
         });
     });
+
+    describe('Phase 5 W15.1 hotfix + W18.3 Flex extension CTA', () => {
+        function readManager() {
+            const file = path.join(REPO_ROOT, '[Admin System] DINOCO Production SN Manager');
+            return fs.readFileSync(file, 'utf8');
+        }
+
+        test('Manager V.0.34 header bumped', () => {
+            expect(readManager()).toMatch(/Version: V\.0\.34 \(2026-05-07\) — Hotfix/);
+        });
+
+        test('ALTER products table includes 3 sn_ext_price_* columns (Q8)', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_alter_products_table')[1] || '';
+            expect(fnBlock).toContain("'sn_ext_price_1y'");
+            expect(fnBlock).toContain("'sn_ext_price_2y'");
+            expect(fnBlock).toContain("'sn_ext_price_3y'");
+            expect(fnBlock).toMatch(/DECIMAL\(10,2\) NULL DEFAULT NULL/);
+        });
+
+        test('ALTER products has idx_sn_ext_enabled index', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_alter_products_table')[1] || '';
+            expect(fnBlock).toContain('idx_sn_ext_enabled');
+            expect(fnBlock).toMatch(/idx_sn_ext_enabled \(sn_ext_price_1y\)/);
+        });
+
+        test('build_flex_for_notification auto-injects extension_url for expiry', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_build_flex_for_notification')[1] || '';
+            expect(fnBlock).toContain('dinoco_sn_marketplace_enabled');
+            expect(fnBlock).toContain('dinoco_sn_extension_available');
+            expect(fnBlock).toContain('/warranty/extend?sn=');
+            expect(fnBlock).toMatch(/expiry_|anniversary_/);
+        });
+
+        test('build_flex_for_notification defensive try/catch + obs_capture', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_build_flex_for_notification')[1] || '';
+            expect(fnBlock).toMatch(/try\s*\{/);
+            expect(fnBlock).toContain('sn_flex_extension_url_inject');
+        });
+
+        test('anniversary builder also has extension button', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_build_flex_anniversary')[1] || '';
+            expect(fnBlock).toContain("'🔄 ต่อประกัน'");
+            expect(fnBlock).toContain("$ctx['extension_url']");
+        });
+    });
 });
