@@ -189,6 +189,37 @@
 
 ---
 
+## 🔁 Round 3 Boss Answers (2026-05-07 — Factory QR update)
+
+### Factory QR generation = โรงงานทำเอง
+
+**Boss source**: chat กับ Huali Label โรงงานเพลทจีน
+
+**Boss decision**: "QRCODE ที่ผลิตออกจากระบบไม่ต้อง Gen นะ เอาแค่ชุดตัวเลขให้ก็พอ"
+
+**Factory message** (Huali Label): "If the QR code is showed numbers, then just need you provide the text, then the QR code will be generated according to numbers"
+
+**Implementation impact** — major scope reduction:
+
+- ❌ **REMOVE**: QR PDF generation chunked 5000/file (saved ~12-16h dev)
+- ❌ **REMOVE**: `dinoco_sn_qr_render_chunk()` helper
+- ❌ **REMOVE**: REST `/batches/{id}/qr-pdf?chunk=N` endpoint
+- ❌ **REMOVE**: Tab 1 Batches "📄 QR PDF" download button
+- ❌ **REMOVE**: GD Library dependency for QR rendering
+- ✅ **KEEP**: CSV download (text list ส่งโรงงาน)
+- ✅ **MAYBE EXPAND**: CSV +1 column "QR Content" (boss decision pending)
+
+**Pending boss decision** — QR Content format:
+- A: S/N text เดี่ยวๆ `DNCSS0001234`
+- B: URL เต็ม `https://dinoco.in.th/warranty/activate?sn=DNCSS0001234` (recommended — iPhone Camera scan → open activate page ทันที)
+- C: URL สั้น `https://dinoco.in.th/sn/DNCSS0001234`
+
+**Status**: ✅ scope reduction confirmed · ⏸️ format A/B/C pending boss
+
+**Doc**: `docs/sn-system/13-factory-qr-generation-update.md`
+
+---
+
 ## 🔁 Round 2 Boss Answers (2026-05-05 follow-up)
 
 หลัง Round 1 boss ตอบครบ ผมถามตามอีก 11 รายการ → boss ตอบกลับ:
