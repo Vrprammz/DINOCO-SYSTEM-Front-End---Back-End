@@ -153,7 +153,15 @@ const SNIPPET_PREFIXES = [
 // select stage). Agent A Manager Tab 11 contributes 0 (full event delegation).
 // Per Phase 5 W15 plan §W15.2. Phase 6 migration sweep applies (will refactor
 // to CSS placeholder pattern).
-const BASELINE_INLINE_HANDLER_COUNT = 953;
+//
+// Bumped 953→955 (2026-05-07): Manager V.0.38 — admin-post.php fallback for
+// system toggle adds 2 inline `onsubmit="return dncSnConfirmToggle(this);"`
+// handlers (status badge form + banner CTA form). Form submission requires
+// inline onsubmit because confirmation must block default submit BEFORE event
+// delegation can run. Justified — used for safety guard before destructive
+// flag flip. Phase 6 sweep will migrate to addEventListener('submit') with
+// preventDefault if confirm() returns false.
+const BASELINE_INLINE_HANDLER_COUNT = 955;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0

@@ -5915,35 +5915,36 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             return fs.readFileSync(file, 'utf8');
         }
 
-        test('Manager V.0.37 + REST V.0.27 headers bumped', () => {
-            expect(readManager()).toMatch(/Version: V\.0\.37 \(2026-05-07\) — UX: 1-click system toggle/);
+        test('Manager V.0.38 + REST V.0.27 headers bumped', () => {
+            expect(readManager()).toMatch(/Version: V\.0\.38 \(2026-05-07\) — Toggle via admin-post\.php/);
             expect(readRest()).toMatch(/Version: V\.0\.27 \(2026-05-07\) — POST \/system\/toggle/);
         });
 
         test('Manager renders disabled banner when system OFF', () => {
             const code = readManager();
-            // Banner only shown when ! dinoco_sn_is_enabled()
-            expect(code).toMatch(/<\?php\s+if\s*\(\s*!\s*dinoco_sn_is_enabled\(\)\s*\)\s*:\s*\?>/);
+            // Banner only shown when ! dinoco_sn_is_enabled() (via $sn_is_on var V.0.38)
+            expect(code).toMatch(/<\?php\s+if\s*\(\s*!\s*\$sn_is_on\s*\)\s*:\s*\?>/);
             expect(code).toContain('dnc-sn-disabled-banner');
             expect(code).toContain('ระบบ S/N ยังปิดอยู่');
         });
 
-        test('Status badge is now an interactive button', () => {
+        test('Toggle uses admin-post.php fallback (no REST dependency)', () => {
             const code = readManager();
-            // Both ON and OFF render as clickable buttons (not span)
-            expect(code).toContain('class="dnc-sn-status-toggle dnc-sn-status-on"');
-            expect(code).toContain('class="dnc-sn-status-toggle dnc-sn-status-off"');
-            expect(code).toMatch(/data-action="dnc-sn-toggle-system"/);
+            // V.0.38 — form POST to admin-post.php (works without snippet 1196)
+            expect(code).toContain('admin-post.php');
+            expect(code).toContain('dinoco_sn_toggle_system');
+            expect(code).toContain('admin_post_dinoco_sn_toggle_system');
+            // Hidden input action + nonce
+            expect(code).toMatch(/<input type="hidden" name="action" value="dinoco_sn_toggle_system">/);
+            expect(code).toMatch(/<input type="hidden" name="_wpnonce"/);
         });
 
-        test('JS toggle handler with confirm dialog + reload on success', () => {
+        test('admin_post handler validates nonce + capability', () => {
             const code = readManager();
-            // Event delegation pattern (data-action), not inline onclick
-            expect(code).toContain("data-action=\"dnc-sn-toggle-system\"");
-            expect(code).toContain('/system/toggle');
-            expect(code).toContain('window.location.reload()');
-            // Defensive Modal Helpers fallback
-            expect(code).toContain('window.dinocoModal');
+            const fnBlock = code.split('function dinoco_sn_admin_post_toggle')[1] || '';
+            expect(fnBlock).toContain("current_user_can( 'manage_options' )");
+            expect(fnBlock).toContain("check_admin_referer( 'dinoco_sn_toggle_system' )");
+            expect(fnBlock).toContain('wp_safe_redirect');
         });
 
         test('dncSnOpenCreateBatchModal pre-flight check (no silent fail)', () => {
@@ -5953,6 +5954,12 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(fnBlock).toContain('scrollIntoView');
             // Must abort opening modal when system disabled
             expect(fnBlock).toMatch(/return;/);
+        });
+
+        test('Object cache cleared on toggle (defensive — stale cache fix)', () => {
+            const code = readManager();
+            const fnBlock = code.split('function dinoco_sn_admin_post_toggle')[1] || '';
+            expect(fnBlock).toContain("wp_cache_delete( 'dinoco_sn_system_enabled', 'options' )");
         });
 
         test('REST /system/toggle endpoint registered (admin-only)', () => {
