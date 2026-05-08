@@ -6865,6 +6865,56 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(foreachBlockMatch[0]).toMatch(/dinoco_sn_fire_status_changed/);
         });
 
+        test('R9 Pattern 1: cron heartbeat update_option calls use autoload=false', () => {
+            // R9 found 17 heartbeat update_option calls missing the 3rd arg
+            // (autoload). Each cron tick (some every 10min) was bloating
+            // the WP alloptions cache loaded on EVERY page request.
+            // R9 fix added `, false` (or `, 'no'`) to all sites.
+            // Drift detector: scan code for cron heartbeat patterns and
+            // verify NONE use the 2-arg form.
+            //
+            // Pattern: update_option( 'dinoco_cron_*_last_run', <value> );
+            // (2-arg = bug; 3-arg with `, false` or `, 'no'` = fixed)
+            const filesToCheck = [
+                '[Admin System] DINOCO Production SN Manager',
+                '[Admin System] DINOCO LINE Push Governance',
+                '[B2B] Snippet 1: Core Utilities & LINE Flex Builders',
+            ];
+            const violations = [];
+            for (const file of filesToCheck) {
+                const code = readSnFile(file);
+                const lines = code.split('\n');
+                let inDocBlock = false;
+                lines.forEach((line, idx) => {
+                    if (/\/\*\*?/.test(line)) inDocBlock = true;
+                    if (/\*\//.test(line)) {
+                        const wasInDoc = inDocBlock;
+                        inDocBlock = false;
+                        if (wasInDoc) return;
+                    }
+                    if (inDocBlock) return;
+                    if (/^\s*\*[^/]/.test(line)) return;
+                    if (/^\s*\/\//.test(line)) return;
+
+                    // Pattern: update_option( 'dinoco_cron_*_last_run', ...
+                    // (must NOT end with `);` on same line — must have ', false' OR ', \'no\'' OR be multi-line)
+                    const heartbeatMatch = line.match(
+                        /update_option\(\s*'dinoco_cron_[a-z_]+_last_run'[\s\S]*\)\s*;\s*$/
+                    );
+                    if (!heartbeatMatch) return;
+                    // Allowed forms: `, false );`, `, 'no' );`, multi-line (continuation)
+                    if (
+                        /,\s*false\s*\)/.test(line) ||
+                        /,\s*'no'\s*\)/.test(line)
+                    ) {
+                        return; // fixed form
+                    }
+                    violations.push(`${file}:${idx + 1}: ${line.trim()}`);
+                });
+            }
+            expect(violations).toEqual([]);
+        });
+
         test('R8 B2: Reconciliation void path fires canonical dispatcher', () => {
             const code = readSnFile('[Admin System] DINOCO SN Reconciliation');
             // Lost-plate void path must fire dispatcher AFTER audit log.
