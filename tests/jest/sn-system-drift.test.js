@@ -6648,5 +6648,207 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             );
         });
     });
+
+    // ────────────────────────────────────────────────────────────
+    // R7 + R8 — class-level pattern drift detectors
+    // R7 surfaced 3 broader patterns hinting at multi-instance bugs:
+    //   • b2b_rate_limit signature drift (3-arg vs legacy 4-arg)
+    //   • wrong-cap-identifier (perm_* callback names vs real caps)
+    //   • canonical fire dispatcher coverage
+    // These detectors sweep the SN namespace files and fail on regressions.
+    // ────────────────────────────────────────────────────────────
+    describe('R7+R8 class-level pattern drift', () => {
+        const SN_FILES = [
+            '[System] DINOCO SN REST API',
+            '[Admin System] DINOCO Production SN Manager',
+            '[Admin System] DINOCO Warranty Lifecycle Notifier',
+            '[System] DINOCO Warranty Activation LIFF',
+            '[Admin System] DINOCO LINE Push Governance',
+        ];
+
+        function readSnFile(name) {
+            return fs.readFileSync(path.join(REPO_ROOT, name), 'utf8');
+        }
+
+        /* ─── Pattern 1: b2b_rate_limit signature ─── */
+
+        test('b2b_rate_limit signature is (key, max=10, window=60) — 3 args', () => {
+            const snippet1 = readSnFile('[B2B] Snippet 1: Core Utilities & LINE Flex Builders');
+            // Function signature must remain 3-arg (R7 lesson: don't accept 4-arg drift)
+            expect(snippet1).toMatch(
+                /function\s+b2b_rate_limit\(\s*\$key,\s*\$max\s*=\s*10,\s*\$window\s*=\s*60\s*\)/
+            );
+        });
+
+        test('No SN snippet calls b2b_rate_limit with 4 args (legacy uid-as-max footgun)', () => {
+            // Pattern: b2b_rate_limit($a, $b, $c, $d) — 4 positional args
+            // R7 C3 found `b2b_rate_limit('sn_stolen_report', $uid, 5, 3600)` was wrong
+            // (function signature is (key, max, window), so $uid ate $max → uncapped).
+            // Detector: scan code lines (NOT comment lines, NOT doc blocks),
+            // count top-level commas inside b2b_rate_limit(...) — must be ≤ 2.
+            const violations = [];
+            for (const file of SN_FILES) {
+                const code = readSnFile(file);
+                const lines = code.split('\n');
+                let inDocBlock = false;
+                lines.forEach((line, idx) => {
+                    // Track multi-line doc blocks /** ... */
+                    if (/\/\*\*?/.test(line)) inDocBlock = true;
+                    if (/\*\//.test(line)) {
+                        const wasInDoc = inDocBlock;
+                        inDocBlock = false;
+                        if (wasInDoc) return; // current line ends the doc block — skip
+                    }
+                    if (inDocBlock) return;
+                    // Skip lines that are entirely inside a single-star
+                    // continuation comment ` * ...`
+                    if (/^\s*\*[^/]/.test(line)) return;
+                    // Skip lines that start with // single-line comment
+                    if (/^\s*\/\//.test(line)) return;
+
+                    // Strip inline `//` comments (preserve string literal content)
+                    const codeOnly = line.replace(/\/\/(?![^'"]*['"][^'"]*$).*$/, '');
+                    if (!codeOnly.includes('b2b_rate_limit(')) return;
+                    const m = codeOnly.match(/b2b_rate_limit\(([^)]*)\)/);
+                    if (!m) return;
+                    const argsStr = m[1];
+                    let depth = 0,
+                        commas = 0,
+                        inSingle = false,
+                        inDouble = false;
+                    for (let i = 0; i < argsStr.length; i++) {
+                        const ch = argsStr[i];
+                        if (ch === "'" && !inDouble) inSingle = !inSingle;
+                        else if (ch === '"' && !inSingle) inDouble = !inDouble;
+                        else if (!inSingle && !inDouble) {
+                            if (ch === '(' || ch === '[') depth++;
+                            else if (ch === ')' || ch === ']') depth--;
+                            else if (ch === ',' && depth === 0) commas++;
+                        }
+                    }
+                    // 3 args = 2 commas. 4-arg call = 3 commas → violation
+                    if (commas >= 3) {
+                        violations.push(`${file}:${idx + 1}: ${codeOnly.trim()}`);
+                    }
+                });
+            }
+            expect(violations).toEqual([]);
+        });
+
+        /* ─── Pattern 2: Wrong-cap-identifier ─── */
+
+        test('No user_can() / current_user_can() uses perm_* callback name as cap', () => {
+            // R7 M2 found user_can($uid, 'dinoco_sn_perm_admin') — but perm_admin
+            // is a CALLBACK function (registered as REST permission_callback),
+            // NOT a registered capability. user_can() always returns false for
+            // such non-cap identifiers.
+            //
+            // Real registered SN caps (Q15 Role Manager V.0.4):
+            //   dinoco_sn_warehouse, dinoco_sn_approver, dinoco_sn_view_pii
+            //
+            // Callback functions (NEVER pass to user_can):
+            //   dinoco_sn_perm_admin, dinoco_sn_perm_warehouse,
+            //   dinoco_sn_perm_logged_in, dinoco_sn_perm_approver
+            const callbackNames = [
+                'dinoco_sn_perm_admin',
+                'dinoco_sn_perm_warehouse',
+                'dinoco_sn_perm_logged_in',
+                'dinoco_sn_perm_approver',
+                'dinoco_sn_perm_pii',
+            ];
+            const violations = [];
+            for (const file of SN_FILES) {
+                const code = readSnFile(file);
+                const lines = code.split('\n');
+                let inDocBlock = false;
+                lines.forEach((line, idx) => {
+                    // Track multi-line doc blocks /** ... */
+                    if (/\/\*\*?/.test(line)) inDocBlock = true;
+                    if (/\*\//.test(line)) {
+                        const wasInDoc = inDocBlock;
+                        inDocBlock = false;
+                        if (wasInDoc) return;
+                    }
+                    if (inDocBlock) return;
+                    // Skip continuation lines in doc/banner comments
+                    if (/^\s*\*[^/]/.test(line)) return;
+                    if (/^\s*\/\//.test(line)) return;
+
+                    const stripped = line.replace(/\/\/.*$/, '');
+                    if (!/user_can\s*\(|current_user_can\s*\(/.test(stripped)) return;
+                    for (const cb of callbackNames) {
+                        const re = new RegExp(
+                            `(user_can|current_user_can)\\s*\\([^)]*['"]${cb}['"]`,
+                            ''
+                        );
+                        if (re.test(stripped)) {
+                            violations.push(
+                                `${file}:${idx + 1}: ${stripped.trim()} (use 'dinoco_sn_approver' or 'dinoco_sn_warehouse' or 'manage_options')`
+                            );
+                        }
+                    }
+                });
+            }
+            expect(violations).toEqual([]);
+        });
+
+        /* ─── Pattern 3: Canonical fire dispatcher coverage ─── */
+
+        test('SN REST API has dinoco_sn_fire_status_changed declared', () => {
+            const code = readSnFile('[System] DINOCO SN REST API');
+            // The canonical dispatcher must exist (R3 introduced it; R6+R7
+            // ensured all mutation paths route through it).
+            expect(code).toMatch(/function\s+dinoco_sn_fire_status_changed\s*\(/);
+        });
+
+        test('Direct do_action calls for pool_status_changed are bounded', () => {
+            // R7+R8 baseline tracking: snapshot current count of direct
+            // `do_action('dinoco_sn_pool_status_changed', ...)` invocations.
+            // Goal is to migrate ALL to canonical `dinoco_sn_fire_status_changed`
+            // dispatcher (which fires both general + _for_user) but legacy
+            // mutation paths (lines 3528, 6047, 6254-6258, 6439, 6618-6622)
+            // still emit direct do_action.
+            //
+            // R8 baseline = 17 occurrences (counted automatically 2026-05-08).
+            // Each new round MUST not increase this count without a refactor.
+            // Decreasing is ENCOURAGED — drift detector flags regressions.
+            const code = readSnFile('[System] DINOCO SN REST API');
+            const matches = code.match(
+                /do_action\(\s*['"]dinoco_sn_pool_status_changed/g
+            ) || [];
+            // Ratchet: must not grow above current baseline
+            expect(matches.length).toBeLessThanOrEqual(17);
+        });
+
+        test('SN REST API V.0.37+ documents R7 fixes in banner', () => {
+            const code = readSnFile('[System] DINOCO SN REST API');
+            // Sanity: R7 fixes shipped to V.0.37 — banner must reflect
+            const versionMatch = code.match(/Version:\s*V\.0\.(\d+)/);
+            expect(versionMatch).not.toBeNull();
+            expect(parseInt(versionMatch[1], 10)).toBeGreaterThanOrEqual(37);
+        });
+
+        test('Idempotency Helper V.1.4+ schema bump documented', () => {
+            const code = readSnFile('[Admin System] DINOCO Idempotency Helper');
+            const versionMatch = code.match(/Version:\s*V\.1\.(\d+)/);
+            expect(versionMatch).not.toBeNull();
+            expect(parseInt(versionMatch[1], 10)).toBeGreaterThanOrEqual(4);
+            // UNIQUE constraint must be in schema definition
+            expect(code).toMatch(
+                /UNIQUE\s+KEY\s+uniq_key_namespace\s*\(\s*idempotency_key,\s*namespace\s*\)/
+            );
+        });
+
+        test('Activation LIFF V.0.10+ has flag-gated sig defense', () => {
+            const code = readSnFile('[System] DINOCO Warranty Activation LIFF');
+            const versionMatch = code.match(/Version:\s*V\.0\.(\d+)/);
+            expect(versionMatch).not.toBeNull();
+            expect(parseInt(versionMatch[1], 10)).toBeGreaterThanOrEqual(10);
+            // sig route arg must be registered
+            expect(code).toMatch(/'sig'\s*=>\s*array\(/);
+            // dinoco_sn_hmac_required flag must be referenced in handler
+            expect(code).toMatch(/dinoco_sn_hmac_required/);
+        });
+    });
 });
 
