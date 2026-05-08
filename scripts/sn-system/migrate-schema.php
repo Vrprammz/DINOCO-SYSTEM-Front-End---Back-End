@@ -84,6 +84,40 @@ if ( ! class_exists( 'WP_CLI', false ) ) {
     }
 }
 
+// --- IDE intelephense stubs for WP core functions/constants ----------------
+// At runtime wp-load.php has loaded WordPress and these are real. The stubs
+// are conditional on `function_exists` / `defined` so they NEVER execute in
+// the WP-CLI runtime — they only silence intelephense during static indexing.
+if ( ! defined( 'ABSPATH_INTELEPHENSE_STUBS_LOADED' ) ) {
+    define( 'ABSPATH_INTELEPHENSE_STUBS_LOADED', true );
+    if ( ! defined( 'DB_NAME' ) )         { define( 'DB_NAME', '' ); }
+    if ( ! defined( 'DB_USER' ) )         { define( 'DB_USER', '' ); }
+    if ( ! defined( 'DB_PASSWORD' ) )     { define( 'DB_PASSWORD', '' ); }
+    if ( ! defined( 'DB_HOST' ) )         { define( 'DB_HOST', '' ); }
+    if ( ! defined( 'WP_CONTENT_DIR' ) )  { define( 'WP_CONTENT_DIR', '' ); }
+    // WP_CLI runtime boolean constant (set true by wp-cli/php/boot-fs.php).
+    // Class WP_CLI is declared above; this constant is a separate symbol.
+    if ( ! defined( 'WP_CLI' ) )          { define( 'WP_CLI', false ); }
+    // DINOCO_SN_TABLES — physical table name map, declared in Manager snippet.
+    // Web-context: defined when Manager loads. CLI: also loaded via wp-load.php.
+    if ( ! defined( 'DINOCO_SN_TABLES' ) ) { define( 'DINOCO_SN_TABLES', array() ); }
+    if ( ! function_exists( 'get_option' ) ) {
+        function get_option( $name, $default = false ) { return $default; }
+    }
+    if ( ! function_exists( 'update_option' ) ) {
+        function update_option( $name, $value, $autoload = null ) { return true; }
+    }
+    if ( ! function_exists( 'delete_option' ) ) {
+        function delete_option( $name ) { return true; }
+    }
+    if ( ! function_exists( 'current_time' ) ) {
+        function current_time( $type, $gmt = 0 ) { return ''; }
+    }
+    if ( ! function_exists( 'wp_mkdir_p' ) ) {
+        function wp_mkdir_p( $target ) { return true; }
+    }
+}
+
 // --- Only meaningful under WP-CLI ------------------------------------------
 if ( ! ( defined( 'WP_CLI' ) && WP_CLI ) ) {
     fwrite( STDERR, "ERROR: This script must be run via WP-CLI:\n" );
