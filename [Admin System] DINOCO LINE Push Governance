@@ -1,0 +1,981 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║  [Admin System] DINOCO LINE Push Governance                      ║
+ * ║  Version: V.1.0 (2026-05-07) — R4 social-media-strategist       ║
+ * ║    HIGH-1 (frequency cap) + HIGH-2 (quiet hours) + HIGH-3        ║
+ * ║    (PDPA §19 granular opt-out) infrastructure foundation.        ║
+ * ║  DB_ID: pending sync (set after first WP Code Snippets sync)     ║
+ * ║  Description: Centralized LINE push gating layer. Wraps every    ║
+ * ║    user-bound LINE message dispatch with frequency cap, quiet   ║
+ * ║    hours guard, and per-category opt-in/opt-out compliance.     ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * PROBLEM (R4 audit findings)
+ * ---------------------------
+ * HIGH-1  Frequency cap absent — F#1 (Expiry 30/7/1) + F#4 (Anniversary)
+ *         + F#10 (Review) + warranty + claim + transfer = 4+ pushes/day
+ *         on the same user is reachable. LINE block rate hits 15-25%.
+ *
+ * HIGH-2  Quiet hours not configured — workers can fire at 03:00 local
+ *         time (cron drift / boss manual triggers). Annoyance = block
+ *         + Telegram complaints.
+ *
+ * HIGH-3  PDPA §19 granular consent — current implementation maps
+ *         LINE-login => blanket consent. Boss faces ฿1M fine exposure
+ *         for marketing pushes (promo / cross-sell) without explicit
+ *         double opt-in.
+ *
+ * SOLUTION
+ * --------
+ * Single canonical helper layer + admin viewer + member opt-out UI.
+ *
+ *   - dinoco_line_can_push( $uid, $category, $template_code = '' )
+ *       returns array( allowed:bool, reason:string, retry_after_sec:int )
+ *
+ *   - dinoco_line_log_push( $uid, $category, $template_code, $success )
+ *       INSERT into wp_dinoco_line_push_log (audit + cap counter source)
+ *
+ *   - dinoco_line_get_user_prefs( $uid )      → array of 5 category flags
+ *   - dinoco_line_set_user_prefs( $uid, $p )  → write usermeta + audit
+ *   - dinoco_line_in_quiet_hours( $uid, $cat ) → bool (transactional bypass)
+ *
+ * Categories
+ *   transactional  — claim status / transfer notify / payment confirm
+ *                    ALWAYS allowed, bypasses cap + quiet hours (PDPA §24
+ *                    exception for "performance of contract")
+ *   expiry         — F#1 30/7/1 day reminders
+ *   anniversary    — F#4 1y/2y/3y+ thanks
+ *   review         — F#10 30d post-activate review request
+ *   marketing      — F#8 extension upsell / promo / cross-sell
+ *                    DOUBLE opt-in REQUIRED (PDPA §24) default OFF
+ *
+ * Caps (admin-tunable wp_option)
+ *   Hard cap          — 1 push/user/day  (any non-transactional category)
+ *   Soft cap          — 3 push/user/week
+ *   Category cap      — 1 expiry/day + 1 lifecycle/day + 1 marketing/day
+ *
+ * Priority queue (used by Notifier when multiple workers fire same hour)
+ *   transactional > expiry > anniversary > review > marketing
+ *
+ * Quiet hours
+ *   Default 09:00–20:00 Asia/Bangkok for non-transactional
+ *   Per-user override via wp_usermeta dinoco_sn_quiet_hours_start/end
+ *
+ * DESIGN PRINCIPLES
+ *   - ADDITIVE       — zero behavior change at sites that don't call helpers
+ *                      (consumer-side opt-in only)
+ *   - DEFENSIVE      — all helpers function_exists wrapped at call sites
+ *                      (Notifier integration falls through to legacy path
+ *                      when this snippet not yet synced)
+ *   - NON-THROWING   — try/catch around every helper; failure = "allow"
+ *                      (we never block transactional with an internal bug)
+ *   - PDPA AWARE     — marketing default OFF; opt-in audit logged
+ *   - LIGHTWEIGHT    — single SELECT COUNT for cap check; no JOINs
+ *
+ * Admin shortcode: [dinoco_line_push_governance]
+ *   3 tabs — Stats / User Audit / Settings
+ *
+ * Public REST: none (admin viewer only). Saves go through admin-ajax in
+ * Header & Forms member dashboard, NOT through this snippet, so we keep
+ * the surface minimal.
+ *
+ * Backward compat: caller code WITHOUT wrapping in `function_exists`
+ * (e.g. legacy B2B/B2F push paths) is unchanged. Only Notifier V.0.3 and
+ * future SN system push sites consume the gate.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 0. CONSTANTS + CATEGORIES
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! defined( 'DINOCO_LINE_GOV_VERSION' ) ) {
+    define( 'DINOCO_LINE_GOV_VERSION', '1.0' );
+}
+
+if ( ! defined( 'DINOCO_LINE_GOV_SCHEMA_VERSION' ) ) {
+    define( 'DINOCO_LINE_GOV_SCHEMA_VERSION', '1.0' );
+}
+
+if ( ! defined( 'DINOCO_LINE_GOV_LOG_RETENTION_DAYS' ) ) {
+    // Cap audit log retention — enough for weekly cap math + ~3wk recall
+    define( 'DINOCO_LINE_GOV_LOG_RETENTION_DAYS', 30 );
+}
+
+if ( ! function_exists( 'dinoco_line_gov_categories' ) ) {
+    /**
+     * Single source of truth for category metadata.
+     *
+     * @return array<string, array{label_th:string, default_pref:bool, transactional:bool, priority:int, daily_cap:int}>
+     */
+    function dinoco_line_gov_categories() {
+        return array(
+            'transactional' => array(
+                'label_th'      => 'ธุรกรรม (เคลม / โอน / ชำระ)',
+                'default_pref'  => true,    // can't opt out — but pref UI hides this
+                'transactional' => true,
+                'priority'      => 100,
+                'daily_cap'     => 99,      // unbounded for contract performance
+            ),
+            'expiry' => array(
+                'label_th'      => 'ประกันใกล้หมด (30/7/1 วัน)',
+                'default_pref'  => true,
+                'transactional' => false,
+                'priority'      => 80,
+                'daily_cap'     => 1,
+            ),
+            'anniversary' => array(
+                'label_th'      => 'ขอบคุณวันครบปี',
+                'default_pref'  => true,
+                'transactional' => false,
+                'priority'      => 60,
+                'daily_cap'     => 1,
+            ),
+            'review' => array(
+                'label_th'      => 'ขอรีวิวสินค้า',
+                'default_pref'  => true,
+                'transactional' => false,
+                'priority'      => 40,
+                'daily_cap'     => 1,
+            ),
+            'marketing' => array(
+                'label_th'      => 'โปรโมชั่นและส่วนลด',
+                'default_pref'  => false,   // PDPA §24 — DOUBLE opt-in
+                'transactional' => false,
+                'priority'      => 20,
+                'daily_cap'     => 1,
+            ),
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_resolve_category' ) ) {
+    /**
+     * Map free-form category input (or notification_type) → canonical key.
+     * Tolerates legacy strings like 'expiry_30d', 'anniversary_2y'.
+     */
+    function dinoco_line_gov_resolve_category( $cat ) {
+        $c = strtolower( trim( (string) $cat ) );
+        if ( $c === '' ) return 'marketing';
+        if ( $c === 'transactional' || strpos( $c, 'claim_' ) === 0
+            || strpos( $c, 'transfer_' ) === 0 || strpos( $c, 'payment_' ) === 0
+            || strpos( $c, 'service_' ) === 0 ) {
+            return 'transactional';
+        }
+        if ( strpos( $c, 'expiry_' ) === 0 || $c === 'expiry' ) return 'expiry';
+        if ( strpos( $c, 'anniversary_' ) === 0 || $c === 'anniversary' ) return 'anniversary';
+        if ( $c === 'review' || $c === 'review_request' || strpos( $c, 'review_' ) === 0 ) return 'review';
+        if ( $c === 'marketing' || $c === 'promo' || strpos( $c, 'promo_' ) === 0 ) return 'marketing';
+        // Unknown → safest default = marketing (most restrictive caps + opt-in)
+        return 'marketing';
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 1. SCHEMA INSTALL (lazy + idempotent)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_line_gov_schema_install' ) ) {
+    /**
+     * Lazy install on admin_init. Tracked via wp_option
+     * `dinoco_line_gov_schema_version` (string compare).
+     */
+    function dinoco_line_gov_schema_install() {
+        $current = (string) get_option( 'dinoco_line_gov_schema_version', '' );
+        if ( $current === DINOCO_LINE_GOV_SCHEMA_VERSION ) return;
+
+        global $wpdb;
+        $charset = $wpdb->get_charset_collate();
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+
+        $sql = "CREATE TABLE {$tbl} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id BIGINT UNSIGNED NOT NULL,
+            category VARCHAR(40) NOT NULL,
+            template_code VARCHAR(64) NOT NULL DEFAULT '',
+            sent_at DATETIME NOT NULL,
+            success TINYINT(1) NOT NULL DEFAULT 1,
+            reason VARCHAR(64) NOT NULL DEFAULT '',
+            PRIMARY KEY  (id),
+            KEY idx_user_date (user_id, sent_at),
+            KEY idx_category_date (category, sent_at),
+            KEY idx_sent_at (sent_at)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta( $sql );
+        update_option( 'dinoco_line_gov_schema_version', DINOCO_LINE_GOV_SCHEMA_VERSION, false );
+    }
+}
+
+add_action( 'admin_init', 'dinoco_line_gov_schema_install', 5 );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 2. USER PREFERENCES (PDPA §19 granular consent)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_line_get_user_prefs' ) ) {
+    /**
+     * Resolve all 5 category prefs for one user. Defaults follow
+     * dinoco_line_gov_categories() (marketing default OFF — PDPA §24).
+     *
+     * Reuses existing wp_usermeta keys `dinoco_sn_notif_*` for backward
+     * compat with the Member Dashboard form already shipped in V.31.0.
+     *
+     * @return array<string, bool>
+     */
+    function dinoco_line_get_user_prefs( $user_id ) {
+        $uid = (int) $user_id;
+        if ( $uid <= 0 ) return array();
+        $cats = dinoco_line_gov_categories();
+        $out = array();
+        foreach ( $cats as $key => $meta ) {
+            // transactional has no opt-out (contract performance)
+            if ( ! empty( $meta['transactional'] ) ) {
+                $out[ $key ] = true;
+                continue;
+            }
+            // Map canonical category → wp_usermeta key
+            $meta_key = dinoco_line_gov_pref_meta_key( $key );
+            $stored = get_user_meta( $uid, $meta_key, true );
+            if ( $stored === '' || $stored === false || $stored === null ) {
+                $out[ $key ] = (bool) $meta['default_pref'];
+            } else {
+                $out[ $key ] = ! empty( $stored ) && $stored !== '0';
+            }
+        }
+        // NUCLEAR opt-out — single key disables all non-transactional
+        $nuclear = get_user_meta( $uid, 'dinoco_line_opt_out_all', true );
+        if ( ! empty( $nuclear ) && $nuclear !== '0' ) {
+            foreach ( $out as $k => $v ) {
+                if ( $k !== 'transactional' ) $out[ $k ] = false;
+            }
+        }
+        return $out;
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_pref_meta_key' ) ) {
+    function dinoco_line_gov_pref_meta_key( $category ) {
+        $map = array(
+            'expiry'      => 'dinoco_sn_notif_expiry',
+            'anniversary' => 'dinoco_sn_notif_anniversary',
+            'review'      => 'dinoco_sn_notif_review',
+            'marketing'   => 'dinoco_sn_notif_promo',  // legacy key — V.31.0 used 'promo'
+        );
+        return $map[ $category ] ?? ( 'dinoco_line_pref_' . $category );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_set_user_prefs' ) ) {
+    /**
+     * Write categorical opt-in flags + audit log entry. Honors
+     * "double opt-in" requirement for marketing — caller MUST pass
+     * an explicit boolean (no toggling-by-omission).
+     *
+     * @param int   $user_id
+     * @param array $prefs   key=category slug, value=bool
+     * @return array{updated:int, errors:array<string,string>}
+     */
+    function dinoco_line_set_user_prefs( $user_id, $prefs ) {
+        $uid = (int) $user_id;
+        $out = array( 'updated' => 0, 'errors' => array() );
+        if ( $uid <= 0 ) {
+            $out['errors']['user_id'] = 'invalid';
+            return $out;
+        }
+        if ( ! is_array( $prefs ) ) {
+            $out['errors']['prefs'] = 'not_array';
+            return $out;
+        }
+        $cats = dinoco_line_gov_categories();
+        foreach ( $prefs as $cat => $val ) {
+            $cat = strtolower( trim( (string) $cat ) );
+            if ( ! isset( $cats[ $cat ] ) ) continue;
+            if ( ! empty( $cats[ $cat ]['transactional'] ) ) continue; // never store
+            $val_bool = filter_var( $val, FILTER_VALIDATE_BOOLEAN );
+            $meta_key = dinoco_line_gov_pref_meta_key( $cat );
+            $old = get_user_meta( $uid, $meta_key, true );
+            $new = $val_bool ? '1' : '0';
+            if ( (string) $old !== $new ) {
+                update_user_meta( $uid, $meta_key, $new );
+                $out['updated']++;
+                // Audit (best-effort)
+                if ( function_exists( 'dinoco_line_gov_audit_pref_change' ) ) {
+                    try {
+                        dinoco_line_gov_audit_pref_change( $uid, $cat, (string) $old, $new );
+                    } catch ( \Throwable $e ) { /* swallow */ }
+                }
+            }
+        }
+        // Nuclear opt-out (single boolean; not a category)
+        if ( array_key_exists( 'opt_out_all', $prefs ) ) {
+            $nuc_val = filter_var( $prefs['opt_out_all'], FILTER_VALIDATE_BOOLEAN );
+            update_user_meta( $uid, 'dinoco_line_opt_out_all', $nuc_val ? '1' : '0' );
+            $out['updated']++;
+        }
+        return $out;
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_audit_pref_change' ) ) {
+    /**
+     * Best-effort audit — uses Flag Audit snippet if synced, else
+     * dinoco_sn_audit_log if SN namespace available, else error_log.
+     */
+    function dinoco_line_gov_audit_pref_change( $uid, $cat, $old, $new ) {
+        $payload = array(
+            'user_id'  => (int) $uid,
+            'category' => (string) $cat,
+            'old'      => (string) $old,
+            'new'      => (string) $new,
+            'at'       => current_time( 'mysql' ),
+            'ip'       => function_exists( 'dinoco_gdpr_get_client_ip' )
+                ? dinoco_gdpr_get_client_ip()
+                : ( $_SERVER['REMOTE_ADDR'] ?? '' ),
+        );
+        if ( function_exists( 'dinoco_flag_audit_log' ) ) {
+            dinoco_flag_audit_log(
+                'line_pref_' . $cat,
+                $old,
+                $new,
+                'user opt-in/out via Member Dashboard',
+                'line_governance'
+            );
+            return;
+        }
+        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+            dinoco_sn_audit_log( 'line_pref_change', $payload, $uid );
+            return;
+        }
+        error_log( '[LINE-GOV][PREF] ' . wp_json_encode( $payload ) );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. QUIET HOURS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_line_in_quiet_hours' ) ) {
+    /**
+     * Returns true if NOW falls outside the user's allowed window.
+     *
+     * Transactional category bypasses (contract performance — claims
+     * land any time of day per boss approval).
+     *
+     * Default window: 09:00–20:00 Asia/Bangkok inclusive.
+     * Per-user override:
+     *   wp_usermeta dinoco_sn_quiet_hours_start (HH or HH:MM, 24h)
+     *   wp_usermeta dinoco_sn_quiet_hours_end   (HH or HH:MM, 24h)
+     *
+     * "in quiet hours" = OUTSIDE the allowed window. Naming preserved
+     * to match user-supplied spec.
+     *
+     * @return bool true => caller should NOT push now (reschedule)
+     */
+    function dinoco_line_in_quiet_hours( $user_id, $category = '' ) {
+        $cat = dinoco_line_gov_resolve_category( $category );
+        if ( $cat === 'transactional' ) return false; // bypass
+
+        $tz = function_exists( 'wp_timezone' ) ? wp_timezone() : new \DateTimeZone( 'Asia/Bangkok' );
+        try {
+            $now_local = new \DateTime( 'now', $tz );
+        } catch ( \Throwable $e ) {
+            return false; // fail-open
+        }
+        $now_min = ( (int) $now_local->format( 'H' ) * 60 ) + (int) $now_local->format( 'i' );
+
+        // Defaults (admin-tunable)
+        $start_default = (string) get_option( 'dinoco_line_gov_quiet_start', '09:00' );
+        $end_default   = (string) get_option( 'dinoco_line_gov_quiet_end',   '20:00' );
+
+        $uid = (int) $user_id;
+        $start_user = $uid > 0 ? get_user_meta( $uid, 'dinoco_sn_quiet_hours_start', true ) : '';
+        $end_user   = $uid > 0 ? get_user_meta( $uid, 'dinoco_sn_quiet_hours_end',   true ) : '';
+
+        $start_str = ! empty( $start_user ) ? (string) $start_user : $start_default;
+        $end_str   = ! empty( $end_user )   ? (string) $end_user   : $end_default;
+
+        $start_min = dinoco_line_gov_parse_hhmm( $start_str, 9 * 60 );
+        $end_min   = dinoco_line_gov_parse_hhmm( $end_str,   20 * 60 );
+
+        // Allowed window is [start_min, end_min)
+        // Returns true ⇔ OUTSIDE that window.
+        if ( $start_min <= $end_min ) {
+            return ! ( $now_min >= $start_min && $now_min < $end_min );
+        }
+        // Wrap-around (e.g. 22:00–06:00 — niche but supported)
+        return ! ( $now_min >= $start_min || $now_min < $end_min );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_parse_hhmm' ) ) {
+    /**
+     * Parse "HH" or "HH:MM" → minute offset since midnight.
+     * Falls back to $default on garbage input.
+     */
+    function dinoco_line_gov_parse_hhmm( $input, $default_min ) {
+        $s = trim( (string) $input );
+        if ( $s === '' ) return (int) $default_min;
+        if ( preg_match( '/^(\d{1,2}):(\d{2})$/', $s, $m ) ) {
+            $h = max( 0, min( 23, (int) $m[1] ) );
+            $mi = max( 0, min( 59, (int) $m[2] ) );
+            return ( $h * 60 ) + $mi;
+        }
+        if ( preg_match( '/^(\d{1,2})$/', $s, $m ) ) {
+            $h = max( 0, min( 23, (int) $m[1] ) );
+            return $h * 60;
+        }
+        return (int) $default_min;
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_seconds_until_window_open' ) ) {
+    /**
+     * If we're currently in quiet hours, how many seconds until the
+     * window re-opens? Used by Notifier to schedule wp_schedule_single_event.
+     *
+     * Returns 0 if window already open.
+     */
+    function dinoco_line_gov_seconds_until_window_open( $user_id, $category = '' ) {
+        if ( ! dinoco_line_in_quiet_hours( $user_id, $category ) ) return 0;
+
+        $tz = function_exists( 'wp_timezone' ) ? wp_timezone() : new \DateTimeZone( 'Asia/Bangkok' );
+        try {
+            $now_local = new \DateTime( 'now', $tz );
+        } catch ( \Throwable $e ) {
+            return 3600; // safe default — retry in an hour
+        }
+
+        $start_default = (string) get_option( 'dinoco_line_gov_quiet_start', '09:00' );
+        $start_min = dinoco_line_gov_parse_hhmm( $start_default, 9 * 60 );
+
+        $uid = (int) $user_id;
+        $start_user = $uid > 0 ? get_user_meta( $uid, 'dinoco_sn_quiet_hours_start', true ) : '';
+        if ( ! empty( $start_user ) ) {
+            $start_min = dinoco_line_gov_parse_hhmm( (string) $start_user, $start_min );
+        }
+
+        $now_min = ( (int) $now_local->format( 'H' ) * 60 ) + (int) $now_local->format( 'i' );
+
+        if ( $start_min > $now_min ) {
+            // Window opens later today
+            return ( $start_min - $now_min ) * 60;
+        }
+        // Window opens tomorrow at start_min
+        return ( ( 24 * 60 - $now_min ) + $start_min ) * 60;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. FREQUENCY CAPS (the heart — single SELECT COUNT, no JOINs)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_line_gov_count_recent_pushes' ) ) {
+    /**
+     * Cheap COUNT query against wp_dinoco_line_push_log.
+     *
+     * @param int    $user_id
+     * @param string $category  '' = any
+     * @param int    $window_seconds  trailing window
+     * @return int  rows where success=1 within window
+     */
+    function dinoco_line_gov_count_recent_pushes( $user_id, $category = '', $window_seconds = 86400 ) {
+        global $wpdb;
+        $uid = (int) $user_id;
+        if ( $uid <= 0 ) return 0;
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+
+        // Defensive — table may not exist on first install (admin_init not yet fired)
+        $exists = $wpdb->get_var( $wpdb->prepare(
+            "SHOW TABLES LIKE %s", $tbl
+        ) );
+        if ( $exists !== $tbl ) return 0;
+
+        $cutoff = gmdate( 'Y-m-d H:i:s', time() - max( 60, (int) $window_seconds ) );
+        if ( $category !== '' ) {
+            return (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$tbl}
+                 WHERE user_id = %d AND category = %s AND success = 1 AND sent_at >= %s",
+                $uid, $category, $cutoff
+            ) );
+        }
+        return (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$tbl}
+             WHERE user_id = %d AND success = 1 AND sent_at >= %s",
+            $uid, $cutoff
+        ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_can_push' ) ) {
+    /**
+     * THE GATE. Call this BEFORE every LINE push to a registered user.
+     *
+     * Decision order (first failure wins):
+     *   1. user_id invalid                → reason='invalid_user', allow=false
+     *   2. (transactional) bypass all checks → allow=true
+     *   3. user opt-out (per-category)     → reason='opt_out_<cat>', allow=false
+     *   4. nuclear opt-out                 → reason='opt_out_nuclear', allow=false
+     *   5. quiet hours                     → reason='quiet_hours', retry_after_sec
+     *   6. category daily cap exceeded     → reason='cap_category_day', retry=86400
+     *   7. hard daily cap (any category)   → reason='cap_daily', retry=86400
+     *   8. weekly soft cap                 → reason='cap_weekly', retry=86400
+     *   9. allowed                         → reason='ok', allow=true
+     *
+     * @return array{allowed:bool, reason:string, retry_after_sec:int, category:string}
+     */
+    function dinoco_line_can_push( $user_id, $category, $template_code = '' ) {
+        $uid = (int) $user_id;
+        $cat = dinoco_line_gov_resolve_category( $category );
+        $deny = function( $reason, $retry = 0 ) use ( $cat ) {
+            return array(
+                'allowed'         => false,
+                'reason'          => (string) $reason,
+                'retry_after_sec' => (int) $retry,
+                'category'        => $cat,
+            );
+        };
+        $allow = function() use ( $cat ) {
+            return array(
+                'allowed'         => true,
+                'reason'          => 'ok',
+                'retry_after_sec' => 0,
+                'category'        => $cat,
+            );
+        };
+
+        if ( $uid <= 0 ) return $deny( 'invalid_user' );
+
+        $cats = dinoco_line_gov_categories();
+        $is_transactional = ! empty( $cats[ $cat ]['transactional'] );
+
+        // 2. Transactional bypass
+        if ( $is_transactional ) {
+            return $allow();
+        }
+
+        // 3. + 4. Pref / nuclear opt-out
+        try {
+            $prefs = dinoco_line_get_user_prefs( $uid );
+        } catch ( \Throwable $e ) {
+            $prefs = array();
+        }
+        $nuclear = get_user_meta( $uid, 'dinoco_line_opt_out_all', true );
+        if ( ! empty( $nuclear ) && $nuclear !== '0' ) {
+            return $deny( 'opt_out_nuclear' );
+        }
+        if ( array_key_exists( $cat, $prefs ) && $prefs[ $cat ] === false ) {
+            return $deny( 'opt_out_' . $cat );
+        }
+
+        // 5. Quiet hours
+        if ( dinoco_line_in_quiet_hours( $uid, $cat ) ) {
+            $retry = dinoco_line_gov_seconds_until_window_open( $uid, $cat );
+            return $deny( 'quiet_hours', $retry );
+        }
+
+        // 6. Category daily cap
+        $cat_cap = isset( $cats[ $cat ]['daily_cap'] ) ? (int) $cats[ $cat ]['daily_cap'] : 1;
+        $cat_cap = (int) get_option( 'dinoco_line_gov_cat_cap_' . $cat, $cat_cap );
+        if ( $cat_cap >= 1 ) {
+            $cat_count = dinoco_line_gov_count_recent_pushes( $uid, $cat, 86400 );
+            if ( $cat_count >= $cat_cap ) {
+                return $deny( 'cap_category_day', 86400 );
+            }
+        }
+
+        // 7. Hard daily cap (across all non-transactional categories)
+        $daily_cap = (int) get_option( 'dinoco_line_gov_daily_cap', 1 );
+        if ( $daily_cap >= 1 ) {
+            $daily_count = dinoco_line_gov_count_recent_pushes( $uid, '', 86400 );
+            if ( $daily_count >= $daily_cap ) {
+                return $deny( 'cap_daily', 86400 );
+            }
+        }
+
+        // 8. Weekly soft cap
+        $weekly_cap = (int) get_option( 'dinoco_line_gov_weekly_cap', 3 );
+        if ( $weekly_cap >= 1 ) {
+            $weekly_count = dinoco_line_gov_count_recent_pushes( $uid, '', 7 * 86400 );
+            if ( $weekly_count >= $weekly_cap ) {
+                return $deny( 'cap_weekly', 86400 );
+            }
+        }
+
+        return $allow();
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_log_push' ) ) {
+    /**
+     * Record a push attempt. Call AFTER the push (success or failure)
+     * so frequency-cap math reflects reality.
+     *
+     * @param int    $user_id
+     * @param string $category       canonical (resolved by caller is fine)
+     * @param string $template_code  free-form template identifier
+     * @param bool   $success        only success=1 rows count toward cap
+     * @param string $reason         optional — populated with deny-reason
+     *                               when caller logs a deferred attempt
+     * @return int|false insert_id
+     */
+    function dinoco_line_log_push( $user_id, $category, $template_code = '', $success = true, $reason = '' ) {
+        global $wpdb;
+        $uid = (int) $user_id;
+        if ( $uid <= 0 ) return false;
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+        $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
+        if ( $exists !== $tbl ) {
+            // Lazy install once if admin_init hasn't fired (e.g. cron context)
+            if ( function_exists( 'dinoco_line_gov_schema_install' ) ) {
+                dinoco_line_gov_schema_install();
+            }
+            $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
+            if ( $exists !== $tbl ) return false;
+        }
+        $cat = dinoco_line_gov_resolve_category( $category );
+        $ok = $wpdb->insert( $tbl, array(
+            'user_id'       => $uid,
+            'category'      => substr( $cat, 0, 40 ),
+            'template_code' => substr( (string) $template_code, 0, 64 ),
+            'sent_at'       => current_time( 'mysql' ),
+            'success'       => $success ? 1 : 0,
+            'reason'        => substr( (string) $reason, 0, 64 ),
+        ), array( '%d', '%s', '%s', '%s', '%d', '%s' ) );
+        return $ok ? (int) $wpdb->insert_id : false;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. RETENTION CRON (PDPA storage limitation §17)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_line_gov_retention_run' ) ) {
+    /**
+     * Daily — purge log rows beyond retention window. Idempotent.
+     */
+    function dinoco_line_gov_retention_run() {
+        update_option( 'dinoco_cron_line_gov_retention_last_run', current_time( 'mysql' ) );
+
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+        $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
+        if ( $exists !== $tbl ) return 0;
+
+        $days = (int) get_option( 'dinoco_line_gov_log_retention_days', DINOCO_LINE_GOV_LOG_RETENTION_DAYS );
+        if ( $days < 7 ) $days = 7;   // floor — protect cap math
+        if ( $days > 365 ) $days = 365;
+
+        $cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * 86400 ) );
+        $deleted = (int) $wpdb->query( $wpdb->prepare(
+            "DELETE FROM {$tbl} WHERE sent_at < %s LIMIT 5000",
+            $cutoff
+        ) );
+        update_option( 'dinoco_line_gov_retention_last_summary', array(
+            'at'      => current_time( 'mysql' ),
+            'days'    => $days,
+            'deleted' => $deleted,
+        ), false );
+        return $deleted;
+    }
+}
+
+if ( ! wp_next_scheduled( 'dinoco_line_gov_retention_cron' ) ) {
+    wp_schedule_event( time() + 600, 'daily', 'dinoco_line_gov_retention_cron' );
+}
+add_action( 'dinoco_line_gov_retention_cron', 'dinoco_line_gov_retention_run' );
+
+// Heartbeat tracking via Health Monitor when available
+if ( function_exists( 'dinoco_register_cron' ) ) {
+    dinoco_register_cron( 'dinoco_line_gov_retention_cron', 'daily', 'dinoco_line_gov_retention_run' );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. ADMIN VIEWER SHORTCODE [dinoco_line_push_governance]
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+if ( ! function_exists( 'dinoco_line_gov_render_admin' ) ) {
+    function dinoco_line_gov_render_admin( $atts = array() ) {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<p>403 — admin only.</p>';
+        }
+        // Lazy install if hit before admin_init (rare)
+        dinoco_line_gov_schema_install();
+
+        $tab = isset( $_GET['lg_tab'] ) ? sanitize_key( $_GET['lg_tab'] ) : 'stats';
+        ob_start();
+        ?>
+        <div class="dnc-line-gov-wrap">
+            <h2 class="dnc-line-gov-title">🔔 LINE Push Governance</h2>
+            <div class="dnc-line-gov-tabs">
+                <a class="dnc-line-gov-tab <?php echo $tab === 'stats' ? 'is-active' : ''; ?>" href="?lg_tab=stats">Stats</a>
+                <a class="dnc-line-gov-tab <?php echo $tab === 'audit' ? 'is-active' : ''; ?>" href="?lg_tab=audit">User Audit</a>
+                <a class="dnc-line-gov-tab <?php echo $tab === 'settings' ? 'is-active' : ''; ?>" href="?lg_tab=settings">Settings</a>
+            </div>
+            <div class="dnc-line-gov-body">
+                <?php
+                if ( $tab === 'stats' ) {
+                    echo dinoco_line_gov_render_tab_stats();
+                } elseif ( $tab === 'audit' ) {
+                    echo dinoco_line_gov_render_tab_audit();
+                } else {
+                    echo dinoco_line_gov_render_tab_settings();
+                }
+                ?>
+            </div>
+        </div>
+        <style>
+            .dnc-line-gov-wrap { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 16px; max-width: 1100px; }
+            .dnc-line-gov-title { font-size: 20px; margin: 0 0 16px; }
+            .dnc-line-gov-tabs { display: flex; gap: 8px; border-bottom: 2px solid #e5e7eb; margin-bottom: 16px; }
+            .dnc-line-gov-tab { padding: 10px 16px; text-decoration: none; color: #475569; font-weight: 600; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+            .dnc-line-gov-tab.is-active { color: #1e40af; border-bottom-color: #1e40af; }
+            .dnc-line-gov-body table { width: 100%; border-collapse: collapse; font-size: 14px; }
+            .dnc-line-gov-body th, .dnc-line-gov-body td { padding: 8px 12px; border-bottom: 1px solid #e5e7eb; text-align: left; }
+            .dnc-line-gov-body th { background: #f1f5f9; font-weight: 600; }
+            .dnc-line-gov-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+            .dnc-line-gov-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+            .dnc-line-gov-stat { background: #f8fafc; border-radius: 8px; padding: 12px; text-align: center; }
+            .dnc-line-gov-stat-num { font-size: 24px; font-weight: 700; color: #1e40af; }
+            .dnc-line-gov-stat-lbl { font-size: 12px; color: #64748b; }
+            .dnc-line-gov-form label { display: block; margin: 8px 0 4px; font-weight: 600; font-size: 13px; }
+            .dnc-line-gov-form input[type=text], .dnc-line-gov-form input[type=number] { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; min-height: 36px; }
+            .dnc-line-gov-form button { padding: 8px 16px; background: #1e40af; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; min-height: 36px; min-width: 96px; }
+            .dnc-line-gov-form button:hover { background: #1e3a8a; }
+            .dnc-line-gov-deny { color: #dc2626; }
+            .dnc-line-gov-allow { color: #16a34a; }
+        </style>
+        <?php
+        return ob_get_clean();
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_render_tab_stats' ) ) {
+    function dinoco_line_gov_render_tab_stats() {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+        $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
+        if ( $exists !== $tbl ) {
+            return '<p class="dnc-line-gov-card">Table not yet installed — refresh on next admin_init.</p>';
+        }
+        $today = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$tbl} WHERE success=1 AND sent_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)"
+        );
+        $week = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$tbl} WHERE success=1 AND sent_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
+        );
+        $month = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$tbl} WHERE success=1 AND sent_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
+        );
+        $denied = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$tbl} WHERE success=0 AND sent_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)"
+        );
+
+        $by_cat = $wpdb->get_results(
+            "SELECT category, COUNT(*) AS n FROM {$tbl}
+             WHERE success=1 AND sent_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+             GROUP BY category ORDER BY n DESC", ARRAY_A
+        );
+
+        ob_start(); ?>
+        <div class="dnc-line-gov-card">
+            <h3>📊 ปริมาณ push 30 วันล่าสุด</h3>
+            <div class="dnc-line-gov-stat-grid">
+                <div class="dnc-line-gov-stat">
+                    <div class="dnc-line-gov-stat-num"><?php echo esc_html( number_format( $today ) ); ?></div>
+                    <div class="dnc-line-gov-stat-lbl">24 ชั่วโมง</div>
+                </div>
+                <div class="dnc-line-gov-stat">
+                    <div class="dnc-line-gov-stat-num"><?php echo esc_html( number_format( $week ) ); ?></div>
+                    <div class="dnc-line-gov-stat-lbl">7 วัน</div>
+                </div>
+                <div class="dnc-line-gov-stat">
+                    <div class="dnc-line-gov-stat-num"><?php echo esc_html( number_format( $month ) ); ?></div>
+                    <div class="dnc-line-gov-stat-lbl">30 วัน</div>
+                </div>
+                <div class="dnc-line-gov-stat">
+                    <div class="dnc-line-gov-stat-num dnc-line-gov-deny"><?php echo esc_html( number_format( $denied ) ); ?></div>
+                    <div class="dnc-line-gov-stat-lbl">ปฏิเสธ 24 ชม.</div>
+                </div>
+            </div>
+        </div>
+        <div class="dnc-line-gov-card">
+            <h3>🏷 แยกตามหมวด (7 วัน)</h3>
+            <table>
+                <thead><tr><th>หมวด</th><th>จำนวน</th></tr></thead>
+                <tbody>
+                <?php foreach ( $by_cat as $r ): ?>
+                    <tr>
+                        <td><?php echo esc_html( $r['category'] ); ?></td>
+                        <td><?php echo esc_html( number_format( (int) $r['n'] ) ); ?></td>
+                    </tr>
+                <?php endforeach; ?>
+                <?php if ( empty( $by_cat ) ): ?>
+                    <tr><td colspan="2"><em>— ไม่มีข้อมูล —</em></td></tr>
+                <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php return ob_get_clean();
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_render_tab_audit' ) ) {
+    function dinoco_line_gov_render_tab_audit() {
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+        $search_uid = isset( $_GET['lg_uid'] ) ? (int) $_GET['lg_uid'] : 0;
+
+        ob_start(); ?>
+        <div class="dnc-line-gov-card dnc-line-gov-form">
+            <form method="get">
+                <input type="hidden" name="lg_tab" value="audit">
+                <label>ค้นหาผู้ใช้ (user_id)</label>
+                <input type="number" name="lg_uid" value="<?php echo esc_attr( $search_uid ); ?>" min="1" placeholder="เช่น 42">
+                <button type="submit">ค้นหา</button>
+            </form>
+        </div>
+        <?php
+        if ( $search_uid > 0 ) {
+            $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
+            if ( $exists !== $tbl ) {
+                echo '<p class="dnc-line-gov-card">Table not yet installed.</p>';
+                return ob_get_clean();
+            }
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT id, category, template_code, sent_at, success, reason
+                 FROM {$tbl} WHERE user_id = %d
+                 ORDER BY sent_at DESC LIMIT 200",
+                $search_uid
+            ), ARRAY_A );
+            $prefs = dinoco_line_get_user_prefs( $search_uid );
+            $line_uid = get_user_meta( $search_uid, 'dinoco_line_uid', true );
+            ?>
+            <div class="dnc-line-gov-card">
+                <h3>👤 user_id <?php echo (int) $search_uid; ?></h3>
+                <p>LINE UID: <code><?php echo esc_html( $line_uid ?: '—' ); ?></code></p>
+                <h4>Preferences</h4>
+                <ul>
+                <?php foreach ( $prefs as $cat => $on ): ?>
+                    <li><?php echo esc_html( $cat ); ?> :
+                        <?php if ( $on ): ?><span class="dnc-line-gov-allow">✓ opt-in</span>
+                        <?php else: ?><span class="dnc-line-gov-deny">✗ opt-out</span><?php endif; ?>
+                    </li>
+                <?php endforeach; ?>
+                </ul>
+            </div>
+            <div class="dnc-line-gov-card">
+                <h3>📜 ประวัติ push (200 ล่าสุด)</h3>
+                <table>
+                    <thead><tr><th>at</th><th>หมวด</th><th>template</th><th>ผล</th><th>เหตุผล</th></tr></thead>
+                    <tbody>
+                    <?php foreach ( $rows ?: array() as $r ): ?>
+                        <tr>
+                            <td><?php echo esc_html( $r['sent_at'] ); ?></td>
+                            <td><?php echo esc_html( $r['category'] ); ?></td>
+                            <td><code><?php echo esc_html( $r['template_code'] ); ?></code></td>
+                            <td>
+                                <?php if ( (int) $r['success'] === 1 ): ?>
+                                    <span class="dnc-line-gov-allow">✓ ส่งสำเร็จ</span>
+                                <?php else: ?>
+                                    <span class="dnc-line-gov-deny">✗ ปฏิเสธ</span>
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo esc_html( $r['reason'] ); ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    <?php if ( empty( $rows ) ): ?>
+                        <tr><td colspan="5"><em>ยังไม่มีประวัติ</em></td></tr>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php
+        }
+        return ob_get_clean();
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_render_tab_settings' ) ) {
+    function dinoco_line_gov_render_tab_settings() {
+        // Save on POST
+        if ( isset( $_POST['dnc_lg_save'] ) && check_admin_referer( 'dnc_lg_settings' ) ) {
+            $daily   = max( 0, min( 99, (int) ( $_POST['daily_cap'] ?? 1 ) ) );
+            $weekly  = max( 0, min( 99, (int) ( $_POST['weekly_cap'] ?? 3 ) ) );
+            $qstart  = sanitize_text_field( $_POST['quiet_start'] ?? '09:00' );
+            $qend    = sanitize_text_field( $_POST['quiet_end'] ?? '20:00' );
+            $retain  = max( 7, min( 365, (int) ( $_POST['retention_days'] ?? 30 ) ) );
+            update_option( 'dinoco_line_gov_daily_cap',   $daily, false );
+            update_option( 'dinoco_line_gov_weekly_cap',  $weekly, false );
+            update_option( 'dinoco_line_gov_quiet_start', $qstart, false );
+            update_option( 'dinoco_line_gov_quiet_end',   $qend, false );
+            update_option( 'dinoco_line_gov_log_retention_days', $retain, false );
+            // Per-category caps
+            foreach ( array_keys( dinoco_line_gov_categories() ) as $cat ) {
+                if ( isset( $_POST[ 'cat_cap_' . $cat ] ) ) {
+                    $v = max( 0, min( 99, (int) $_POST[ 'cat_cap_' . $cat ] ) );
+                    update_option( 'dinoco_line_gov_cat_cap_' . $cat, $v, false );
+                }
+            }
+            echo '<div class="dnc-line-gov-card" style="background:#dcfce7;border-color:#86efac;">✓ บันทึกแล้ว</div>';
+        }
+        $daily  = (int) get_option( 'dinoco_line_gov_daily_cap', 1 );
+        $weekly = (int) get_option( 'dinoco_line_gov_weekly_cap', 3 );
+        $qstart = (string) get_option( 'dinoco_line_gov_quiet_start', '09:00' );
+        $qend   = (string) get_option( 'dinoco_line_gov_quiet_end',   '20:00' );
+        $retain = (int) get_option( 'dinoco_line_gov_log_retention_days', DINOCO_LINE_GOV_LOG_RETENTION_DAYS );
+
+        ob_start(); ?>
+        <form method="post" class="dnc-line-gov-card dnc-line-gov-form">
+            <?php wp_nonce_field( 'dnc_lg_settings' ); ?>
+            <h3>⚙ ตั้งค่า cap + quiet hours</h3>
+            <label>Daily cap (per user, all categories)</label>
+            <input type="number" name="daily_cap" value="<?php echo esc_attr( $daily ); ?>" min="0" max="99">
+            <label>Weekly cap</label>
+            <input type="number" name="weekly_cap" value="<?php echo esc_attr( $weekly ); ?>" min="0" max="99">
+            <label>Quiet hours start (HH:MM, Asia/Bangkok)</label>
+            <input type="text" name="quiet_start" value="<?php echo esc_attr( $qstart ); ?>" pattern="\d{1,2}:\d{2}">
+            <label>Quiet hours end</label>
+            <input type="text" name="quiet_end" value="<?php echo esc_attr( $qend ); ?>" pattern="\d{1,2}:\d{2}">
+            <label>Audit log retention (days, 7–365)</label>
+            <input type="number" name="retention_days" value="<?php echo esc_attr( $retain ); ?>" min="7" max="365">
+
+            <h4 style="margin-top:24px;">📂 Daily cap per category</h4>
+            <?php foreach ( dinoco_line_gov_categories() as $cat => $meta ): ?>
+                <label><?php echo esc_html( $cat . ' — ' . $meta['label_th'] ); ?></label>
+                <input type="number" name="cat_cap_<?php echo esc_attr( $cat ); ?>"
+                    value="<?php echo esc_attr( (int) get_option( 'dinoco_line_gov_cat_cap_' . $cat, (int) $meta['daily_cap'] ) ); ?>"
+                    min="0" max="99">
+            <?php endforeach; ?>
+
+            <p style="margin-top:24px;">
+                <button type="submit" name="dnc_lg_save" value="1">บันทึก</button>
+            </p>
+        </form>
+        <?php return ob_get_clean();
+    }
+}
+
+add_shortcode( 'dinoco_line_push_governance', 'dinoco_line_gov_render_admin' );
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. MODULE REGISTRY (Admin Dashboard sidebar)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+add_action( 'init', function() {
+    if ( ! function_exists( 'dinoco_register_admin_module' ) ) return;
+    dinoco_register_admin_module( array(
+        'key'        => 'line_governance',
+        'shortcode'  => 'dinoco_line_push_governance',
+        'label'      => 'LINE Push Governance',
+        'section'    => 'system',
+        'icon'       => 'fa-bell',
+        'color'      => '#0ea5e9',
+        'cache_ttl'  => 60,
+        'capability' => 'manage_options',
+        'order'      => 10,
+        'source'     => '[Admin System] DINOCO LINE Push Governance V.1.0',
+    ) );
+}, 30 );

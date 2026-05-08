@@ -1,6 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Warranty Lifecycle Notifier               ║
+ * ║  Version: V.0.4 (2026-05-07) — R4 LINE Push Governance wired:    ║
+ * ║    Consume dinoco_line_can_push()/dinoco_line_log_push() helpers ║
+ * ║    BEFORE every LINE Flex dispatch (cron worker + REST send-now).║
+ * ║    Cap-deny / quiet-hours → defer via wp_schedule_single_event   ║
+ * ║    + meta_json _deferred_at; opt-out → status='skipped_pref'.    ║
+ * ║    function_exists guards — falls through to V.0.3 path when    ║
+ * ║    [Admin System] DINOCO LINE Push Governance not yet synced.   ║
+ * ║  Version: V.0.3 (2026-05-07) — R4 frontend-design HIGH-5 closure: ║
+ * ║    backfill altText for cron dispatch + REST send-now (2 sites). ║
+ * ║    Calls b2b_build_alt_text($type, ['sn'=>$sn]) for 14 template  ║
+ * ║    codes. Falls back to 'DINOCO: แจ้งเตือน' if Snippet 1         ║
+ * ║    V.34.26 helper unavailable. Replaces literal 'DINOCO          ║
+ * ║    Notification' that lock-screen previews showed pre-fix.       ║
  * ║  Version: V.0.2 (2026-05-07) — H5 rebinding race: init→wp_loaded p5║
  * ║  Version: V.0.1 (2026-05-07) — Phase 3 W9.1 cron worker realization║
  * ║  DB_ID: 1198                                                      ║
@@ -88,7 +101,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 if ( ! defined( 'DINOCO_SN_LIFECYCLE_VERSION' ) ) {
-    define( 'DINOCO_SN_LIFECYCLE_VERSION', '0.1' );
+    define( 'DINOCO_SN_LIFECYCLE_VERSION', '0.4' );
 }
 
 if ( ! defined( 'DINOCO_SN_LIFECYCLE_SEND_BATCH_CAP' ) ) {
@@ -775,6 +788,48 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_run_notification_send' ) ) {
                     continue;
                 }
 
+                // V.0.4 (R4): LINE Push Governance gate — frequency cap +
+                // quiet hours + per-category opt-out. Defensive function_exists
+                // guard so this snippet works pre-Governance-sync.
+                if ( function_exists( 'dinoco_line_can_push' ) ) {
+                    $gate = dinoco_line_can_push( $uid, $type, $type );
+                    if ( ! $gate['allowed'] ) {
+                        $reason = (string) ( $gate['reason'] ?? 'gate_deny' );
+                        // opt-out / nuclear → terminal skip (don't keep re-trying)
+                        if ( strpos( $reason, 'opt_out_' ) === 0 ) {
+                            $wpdb->update( $tbl, array(
+                                'status'  => 'skipped_pref',
+                                'sent_at' => $now,
+                            ), array( 'id' => (int) $n['id'] ) );
+                            $skipped++;
+                            // Audit only — don't count toward cap
+                            if ( function_exists( 'dinoco_line_log_push' ) ) {
+                                dinoco_line_log_push( $uid, $type, $type, false, $reason );
+                            }
+                            continue;
+                        }
+                        // quiet_hours / cap_* → defer: keep status='scheduled',
+                        // bump scheduled_at to retry_after_sec, add audit hint
+                        $retry = max( 60, (int) ( $gate['retry_after_sec'] ?? 3600 ) );
+                        $defer_until = gmdate( 'Y-m-d H:i:s', time() + $retry );
+                        $meta_arr = json_decode( $meta_j, true );
+                        if ( ! is_array( $meta_arr ) ) $meta_arr = array();
+                        $meta_arr['_deferred_at']     = current_time( 'mysql' );
+                        $meta_arr['_deferred_reason'] = $reason;
+                        $meta_arr['_deferred_count']  = (int) ( $meta_arr['_deferred_count'] ?? 0 ) + 1;
+                        $wpdb->update( $tbl, array(
+                            'status'       => 'scheduled',
+                            'scheduled_at' => $defer_until,
+                            'meta_json'    => wp_json_encode( $meta_arr ),
+                        ), array( 'id' => (int) $n['id'] ) );
+                        $skipped++;
+                        if ( function_exists( 'dinoco_line_log_push' ) ) {
+                            dinoco_line_log_push( $uid, $type, $type, false, $reason );
+                        }
+                        continue;
+                    }
+                }
+
                 // Build Flex via Manager dispatcher
                 $flex = function_exists( 'dinoco_sn_build_flex_for_notification' )
                     ? dinoco_sn_build_flex_for_notification( $type, $meta_j )
@@ -790,9 +845,20 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_run_notification_send' ) ) {
                 }
 
                 // Compose LINE Messaging API push
+                // V.0.3 (R4): replaced literal 'DINOCO Notification' with
+                // context-rich altText via Snippet 1 V.34.26 helper.
+                // Falls back to flex['altText'] if builder already set one
+                // (e.g. dinoco_sn_build_flex_for_notification could pre-fill).
+                $alt_default = function_exists( 'b2b_build_alt_text' )
+                    ? b2b_build_alt_text( $type, array(
+                        'sn' => isset( $n['sn'] ) ? $n['sn'] : '',
+                    ) )
+                    : 'DINOCO: แจ้งเตือน';
                 $messages = array( array(
                     'type'     => 'flex',
-                    'altText'  => isset( $flex['altText'] ) ? (string) $flex['altText'] : 'DINOCO Notification',
+                    'altText'  => isset( $flex['altText'] ) && $flex['altText'] !== ''
+                        ? (string) $flex['altText']
+                        : $alt_default,
                     'contents' => isset( $flex['contents'] ) ? $flex['contents'] : $flex,
                 ) );
 
@@ -812,6 +878,10 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_run_notification_send' ) ) {
                         'sent_at' => $now,
                     ), array( 'id' => (int) $n['id'] ) );
                     $sent++;
+                    // V.0.4 (R4): record success for cap counter
+                    if ( function_exists( 'dinoco_line_log_push' ) ) {
+                        dinoco_line_log_push( $uid, $type, $type, true, 'ok' );
+                    }
                 } else {
                     // Bump retry_count via meta_json
                     $meta_arr = json_decode( $meta_j, true );
@@ -827,6 +897,10 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_run_notification_send' ) ) {
                         'meta_json' => wp_json_encode( $meta_arr ),
                     ), array( 'id' => (int) $n['id'] ) );
                     $failed++;
+                    // V.0.4 (R4): record failure (does not count toward cap)
+                    if ( function_exists( 'dinoco_line_log_push' ) ) {
+                        dinoco_line_log_push( $uid, $type, $type, false, 'line_push_failed' );
+                    }
                 }
             }
 
@@ -1032,6 +1106,27 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_rest_send_now' ) ) {
             return new \WP_Error( 'no_line_uid', 'user has no LINE UID', array( 'status' => 422 ) );
         }
 
+        // V.0.4 (R4): LINE Push Governance — admin override allowed via
+        // ?force=1 query param (manual single dispatch is admin-only path,
+        // so this is governed by manage_options not by user prefs).
+        // Without force=1, gate still applies — opt-out / quiet hours
+        // protect users from admin accidental dispatch outside window.
+        $force = (bool) ( $req->get_param( 'force' ) ?? false );
+        if ( ! $force && function_exists( 'dinoco_line_can_push' ) ) {
+            $gate = dinoco_line_can_push( $uid, $row['notification_type'], $row['notification_type'] );
+            if ( ! $gate['allowed'] ) {
+                return new \WP_Error(
+                    'line_gov_denied',
+                    'LINE push denied by governance: ' . (string) ( $gate['reason'] ?? 'unknown' ),
+                    array(
+                        'status'          => 422,
+                        'gate'            => $gate,
+                        'override_hint'   => 'Pass ?force=1 to bypass (admin-only).',
+                    )
+                );
+            }
+        }
+
         $flex = function_exists( 'dinoco_sn_build_flex_for_notification' )
             ? dinoco_sn_build_flex_for_notification( $row['notification_type'], $row['meta_json'] )
             : null;
@@ -1039,9 +1134,18 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_rest_send_now' ) ) {
             return new \WP_Error( 'flex_build_failed', 'unknown notification type', array( 'status' => 422 ) );
         }
 
+        // V.0.3 (R4): replaced literal 'DINOCO Notification' with
+        // context-rich altText via Snippet 1 V.34.26 helper.
+        $alt_default_rest = function_exists( 'b2b_build_alt_text' )
+            ? b2b_build_alt_text( (string) $row['notification_type'], array(
+                'sn' => isset( $row['sn'] ) ? $row['sn'] : '',
+            ) )
+            : 'DINOCO: แจ้งเตือน';
         $messages = array( array(
             'type'     => 'flex',
-            'altText'  => $flex['altText'] ?? 'DINOCO Notification',
+            'altText'  => isset( $flex['altText'] ) && $flex['altText'] !== ''
+                ? (string) $flex['altText']
+                : $alt_default_rest,
             'contents' => $flex['contents'] ?? $flex,
         ) );
 
@@ -1057,6 +1161,17 @@ if ( ! function_exists( 'dinoco_sn_lifecycle_rest_send_now' ) ) {
             'status'  => $ok ? 'sent' : 'failed',
             'sent_at' => $now,
         ), array( 'id' => $id ) );
+
+        // V.0.4 (R4): record outcome for cap counter + audit trail
+        if ( function_exists( 'dinoco_line_log_push' ) ) {
+            dinoco_line_log_push(
+                $uid,
+                (string) $row['notification_type'],
+                (string) $row['notification_type'],
+                $ok,
+                $ok ? ( $force ? 'admin_force' : 'admin_send_now' ) : 'line_push_failed'
+            );
+        }
 
         $resp = array(
             'success'   => $ok,
