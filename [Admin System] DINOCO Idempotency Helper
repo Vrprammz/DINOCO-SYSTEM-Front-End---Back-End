@@ -1,6 +1,18 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO Idempotency Helper                        ║
+ * ║  Version: V.1.4 (2026-05-08) — R7 C1 (CVSS 7.5) close TOCTOU    ║
+ * ║    race window. Schema 1.0 → 1.1: idx_key_namespace promoted    ║
+ * ║    KEY → UNIQUE KEY uniq_key_namespace. Pre-flight dedup pass   ║
+ * ║    (keep most recent per (key,namespace), DELETE older) before  ║
+ * ║    ALTER to satisfy UNIQUE constraint on existing rows.         ║
+ * ║    dinoco_idempotency_store() catches MySQL 1062 duplicate-     ║
+ * ║    entry on race (two simultaneous requests passed SELECT,      ║
+ * ║    both ran handler, one INSERT loses) → re-SELECT winner row   ║
+ * ║    and return its id (loser caller silently uses winner's       ║
+ * ║    cached payload from check() on next retry). Closes race      ║
+ * ║    window across all 139+ wrapped POST endpoints — Flash double-║
+ * ║    create, marketplace double-charge, etc.                      ║
  * ║  Version: V.1.3 (2026-05-07) — R4 BLOCKER #3 audit only:         ║
  * ║    No code change. R4 verdict requires "idempotency TTL >        ║
  * ║    timeout × 3" — DINOCO_SN_LOCK_TIMEOUT bumped 5 → 15s in       ║
@@ -129,14 +141,22 @@ if ( ! function_exists( 'dinoco_idempotency_schema_install' ) ) {
         global $wpdb;
 
         $current = get_option( 'dinoco_idempotency_schema_version', '0' );
-        $target  = '1.0';
+        $target  = '1.1';
         if ( $current === $target ) return;
 
         $table   = $wpdb->prefix . 'dinoco_idempotency_keys';
         $charset = $wpdb->get_charset_collate();
 
-        // dbDelta-compatible CREATE: PRIMARY KEY inside, no FOREIGN KEY,
-        // KEY (not INDEX), 2 spaces after PRIMARY KEY (dbDelta quirk).
+        // R7 C1 (CVSS 7.5) — UNIQUE constraint closes TOCTOU window.
+        // Pre-V.1.4: idx_key_namespace was non-unique KEY. SELECT (no FOR
+        // UPDATE) → handler runs (full latency window) → INSERT race: two
+        // simultaneous requests with same X-Idempotency-Key both passed
+        // SELECT (no row), both ran handlers, both INSERTed → duplicate
+        // billing/Flash dispatch/etc.
+        // V.1.4: uniq_key_namespace UNIQUE constraint forces the loser
+        // INSERT to fail with MySQL 1062 → store() catches → returns
+        // winner row id → caller's response stays consistent across
+        // retries (winner's cached payload replays via check() on retry).
         $sql = "CREATE TABLE {$table} (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             idempotency_key VARCHAR(64) NOT NULL,
@@ -149,12 +169,87 @@ if ( ! function_exists( 'dinoco_idempotency_schema_install' ) ) {
             created_at DATETIME NOT NULL,
             expires_at DATETIME NOT NULL,
             PRIMARY KEY  (id),
-            KEY idx_key_namespace (idempotency_key, namespace),
+            UNIQUE KEY uniq_key_namespace (idempotency_key, namespace),
             KEY idx_expires_at (expires_at)
         ) {$charset};";
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+        // V.1.4 R7 C1 — pre-flight dedup BEFORE applying UNIQUE constraint.
+        // Existing schema (V.1.0/V.1.1/V.1.2/V.1.3) had non-unique KEY so
+        // duplicate (idempotency_key, namespace) rows may exist from past
+        // race windows. Without dedup, dbDelta ALTER would silently fail
+        // (dbDelta does not raise duplicate errors on existing rows).
+        $table_exists = $wpdb->get_var( $wpdb->prepare(
+            "SHOW TABLES LIKE %s", $wpdb->esc_like( $table )
+        ) );
+        if ( $table_exists === $table ) {
+            try {
+                // Find duplicate (idempotency_key, namespace) groups
+                $dup_groups = $wpdb->get_results(
+                    "SELECT idempotency_key, namespace, COUNT(*) AS cnt
+                     FROM {$table}
+                     GROUP BY idempotency_key, namespace
+                     HAVING cnt > 1
+                     LIMIT 5000"
+                );
+                if ( is_array( $dup_groups ) && ! empty( $dup_groups ) ) {
+                    $dedup_count = 0;
+                    foreach ( $dup_groups as $grp ) {
+                        // Keep most recent (max id), DELETE older
+                        $keep_id = (int) $wpdb->get_var( $wpdb->prepare(
+                            "SELECT MAX(id) FROM {$table}
+                             WHERE idempotency_key = %s AND namespace = %s",
+                            (string) $grp->idempotency_key,
+                            (string) $grp->namespace
+                        ) );
+                        if ( $keep_id > 0 ) {
+                            $deleted = $wpdb->query( $wpdb->prepare(
+                                "DELETE FROM {$table}
+                                 WHERE idempotency_key = %s
+                                   AND namespace = %s
+                                   AND id < %d",
+                                (string) $grp->idempotency_key,
+                                (string) $grp->namespace,
+                                $keep_id
+                            ) );
+                            if ( $deleted !== false ) {
+                                $dedup_count += (int) $deleted;
+                            }
+                        }
+                    }
+                    if ( $dedup_count > 0 ) {
+                        error_log( '[DINOCO_IDEMPOTENCY] V.1.4 dedup pre-flight: ' . $dedup_count . ' duplicate rows removed before UNIQUE ALTER' );
+                    }
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[DINOCO_IDEMPOTENCY] V.1.4 dedup pre-flight exception: ' . $e->getMessage() );
+                // Continue — dbDelta will report failure if dedup incomplete
+            }
+        }
+
         dbDelta( $sql );
+
+        // Defensive: if existing legacy KEY idx_key_namespace persists alongside
+        // new uniq_key_namespace (dbDelta does not drop renamed indexes), drop
+        // the old one explicitly. Gated by INFORMATION_SCHEMA precheck.
+        if ( $table_exists === $table ) {
+            try {
+                $old_idx = $wpdb->get_var( $wpdb->prepare(
+                    "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+                     WHERE TABLE_SCHEMA = DATABASE()
+                       AND TABLE_NAME = %s
+                       AND INDEX_NAME = 'idx_key_namespace'
+                     LIMIT 1",
+                    $wpdb->prefix . 'dinoco_idempotency_keys'
+                ) );
+                if ( $old_idx === 'idx_key_namespace' ) {
+                    $wpdb->query( "ALTER TABLE {$table} DROP INDEX idx_key_namespace" );
+                }
+            } catch ( \Throwable $e ) {
+                error_log( '[DINOCO_IDEMPOTENCY] V.1.4 legacy index drop exception: ' . $e->getMessage() );
+            }
+        }
 
         update_option( 'dinoco_idempotency_schema_version', $target, false );
     }
@@ -162,7 +257,7 @@ if ( ! function_exists( 'dinoco_idempotency_schema_install' ) ) {
 
 // Lazy install on admin_init (fast — dbDelta is idempotent + version-gated)
 add_action( 'admin_init', function() {
-    if ( get_option( 'dinoco_idempotency_schema_version', '0' ) !== '1.0' ) {
+    if ( get_option( 'dinoco_idempotency_schema_version', '0' ) !== '1.1' ) {
         dinoco_idempotency_schema_install();
     }
 } );

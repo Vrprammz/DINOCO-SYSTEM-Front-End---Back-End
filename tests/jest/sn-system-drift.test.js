@@ -5540,7 +5540,11 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             const code = readRest();
             const fnBlock = code.split('function dinoco_sn_handler_marketplace_refund')[1] || '';
             expect(fnBlock).toContain("'approver_not_admin'");
-            expect(fnBlock).toContain("user_can( $approver_user_id, 'dinoco_sn_perm_admin'");
+            // R7 M2: was 'dinoco_sn_perm_admin' (callback name, NOT a cap → user_can always false).
+            // Replaced with real cap 'dinoco_sn_approver' (Q15 Role Manager grant) || manage_options.
+            expect(fnBlock).toMatch(
+                /user_can\(\s*\$approver_user_id,\s*'dinoco_sn_approver'/
+            );
         });
 
         /* ─── confirm_text strict match (REFUND CONFIRM) ─── */

@@ -2,6 +2,31 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO Warranty Activation LIFF                        ║
  * ║  DB_ID: 1197                                                      ║
+ * ║  Version: V.0.10 (2026-05-08) — R7 C2 (CVSS 8.1) close SN       ║
+ * ║                                  squatting attack. POST /activate║
+ * ║                                  now accepts optional `sig` param║
+ * ║                                  + verifies via                  ║
+ * ║                                  dinoco_sn_hmac_verify($sn,$sig)║
+ * ║                                  when wp_option                  ║
+ * ║                                  `dinoco_sn_hmac_required` = '1' ║
+ * ║                                  (default OFF — boss flips ON    ║
+ * ║                                  AFTER QR PDF reissue with sigs).║
+ * ║                                  Always logs unsigned attempts to║
+ * ║                                  error_log [SN-ACTIVATE-UNSIGNED]║
+ * ║                                  (observability for boss to      ║
+ * ║                                  decide flip moment) + soft      ║
+ * ║                                  rate-limit unsigned at          ║
+ * ║                                  10/IP/hr regardless of flag.    ║
+ * ║                                  Pre-V.0.10: any LINE user could ║
+ * ║                                  POST sn=DNCSS... + register     ║
+ * ║                                  ANY in_pool plate to themselves ║
+ * ║                                  (squat valid plates → legit     ║
+ * ║                                  owner gets 409 already_         ║
+ * ║                                  registered on real activate).   ║
+ * ║                                  Flag-flip plan documented at    ║
+ * ║                                  docs/sn-system/22-customer-     ║
+ * ║                                  support-readiness-plan.md       ║
+ * ║                                  (T-2wk pre-flip QR PDF reissue).║
  * ║  Version: V.0.9 (2026-05-07) — R4 BLOCKER #3 (fullstack #1):     ║
  * ║                                  GET_LOCK fallback literal 5s    ║
  * ║                                  → 15s (matches REST API V.0.31 ║
@@ -810,6 +835,8 @@ if ( ! function_exists( 'dinoco_sn_register_activate_endpoint' ) ) {
                 'moto_model' => array( 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
                 'purchase_date' => array( 'required' => true, 'type' => 'string' ),
                 'pdpa_accepted' => array( 'required' => true ),
+                // V.0.10 R7 C2 — HMAC sig from QR PDF (optional until flag flipped ON)
+                'sig' => array( 'required' => false, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ),
             ),
         ) );
     }
@@ -871,6 +898,106 @@ if ( ! function_exists( 'dinoco_sn_handler_activate' ) ) {
         if ( $user_id <= 0 ) {
             return new WP_Error( 'not_logged_in', '', array( 'status' => 401 ) );
         }
+
+        /* ─────────────────────────────────────────────────────────────────
+         * R7 C2 (CVSS 8.1) — SN squatting attack defense.
+         *
+         * Pre-V.0.10: any LINE user could POST sn=DNCSS... and register an
+         * arbitrary in_pool plate to themselves. Iterate all SNs → squat
+         * valid plates → real owner blocked at activate-time (409 already_
+         * registered). With 1M+ printed plates the enumeration cost is
+         * trivial (~3hrs at 100 req/s).
+         *
+         * V.0.10 defense (3 layers):
+         *   1. HMAC sig flag-gate. wp_option `dinoco_sn_hmac_required` = '1'
+         *      enforces sig param + dinoco_sn_hmac_verify($sn, $sig). Default
+         *      OFF — existing 1M plates printed without sig must be reissued
+         *      first (boss flips ON only after QR PDF reissue per
+         *      docs/sn-system/22-customer-support-readiness-plan.md).
+         *   2. Always log unsigned attempts → boss can monitor abuse rate
+         *      and decide flip-moment from real data.
+         *   3. Soft rate-limit unsigned attempts at 10/IP/hr regardless of
+         *      flag — defeats single-IP enumeration even before flip.
+         * ───────────────────────────────────────────────────────────────── */
+        $sig = (string) $req->get_param( 'sig' );
+        $hmac_required = ( get_option( 'dinoco_sn_hmac_required', '0' ) === '1' );
+
+        // Resolve client IP for rate-limit + observability
+        $client_ip = '';
+        if ( function_exists( 'dinoco_idempotency_resolve_ip' ) ) {
+            $client_ip = (string) dinoco_idempotency_resolve_ip();
+        } elseif ( isset( $_SERVER['REMOTE_ADDR'] ) ) {
+            $client_ip = (string) $_SERVER['REMOTE_ADDR'];
+        }
+
+        if ( $hmac_required ) {
+            // Strict mode: sig required + verified
+            if ( $sig === '' ) {
+                error_log( sprintf(
+                    '[SN-ACTIVATE-SIG-MISSING] uid=%d sn=%s ip=%s',
+                    $user_id, $sn, $client_ip
+                ) );
+                return new WP_Error(
+                    'sig_required',
+                    __( 'ลิงก์ลงทะเบียนไม่ถูกต้อง (กรุณาสแกน QR ใหม่)', 'dinoco-sn' ),
+                    array( 'status' => 403 )
+                );
+            }
+            if ( ! function_exists( 'dinoco_sn_hmac_verify' ) ) {
+                // Helper missing → fail closed in strict mode
+                error_log( sprintf(
+                    '[SN-ACTIVATE-SIG-HELPER-MISSING] uid=%d sn=%s — dinoco_sn_hmac_verify not loaded',
+                    $user_id, $sn
+                ) );
+                return new WP_Error(
+                    'sig_verify_unavailable',
+                    __( 'ระบบไม่พร้อม กรุณาลองใหม่ภายหลัง', 'dinoco-sn' ),
+                    array( 'status' => 503 )
+                );
+            }
+            if ( ! dinoco_sn_hmac_verify( $sn, $sig ) ) {
+                error_log( sprintf(
+                    '[SN-ACTIVATE-SIG-INVALID] uid=%d sn=%s ip=%s sig_prefix=%s',
+                    $user_id, $sn, $client_ip, substr( $sig, 0, 8 )
+                ) );
+                return new WP_Error(
+                    'invalid_sig',
+                    __( 'ลิงก์ลงทะเบียนไม่ถูกต้อง', 'dinoco-sn' ),
+                    array( 'status' => 403 )
+                );
+            }
+        } else {
+            // Permissive mode (flag OFF) — observability + soft rate-limit only
+            if ( $sig === '' ) {
+                error_log( sprintf(
+                    '[SN-ACTIVATE-UNSIGNED] uid=%d sn=%s ip=%s',
+                    $user_id, $sn, $client_ip
+                ) );
+                // Soft rate-limit: 10 unsigned attempts per IP per hour
+                if ( $client_ip !== '' && function_exists( 'b2b_rate_limit' ) ) {
+                    $rl = b2b_rate_limit(
+                        'sn_unsigned_activate_' . md5( $client_ip ),
+                        10,
+                        HOUR_IN_SECONDS
+                    );
+                    if ( is_wp_error( $rl ) ) {
+                        return $rl;
+                    }
+                }
+            } elseif ( function_exists( 'dinoco_sn_hmac_verify' ) ) {
+                // Sig present but flag OFF — verify opportunistically + log mismatch
+                // (helps detect attackers probing valid sigs even before flag flip)
+                if ( ! dinoco_sn_hmac_verify( $sn, $sig ) ) {
+                    error_log( sprintf(
+                        '[SN-ACTIVATE-SIG-PRESENT-INVALID-FLAG-OFF] uid=%d sn=%s ip=%s',
+                        $user_id, $sn, $client_ip
+                    ) );
+                    // Don't block — flag is OFF — but signal observed
+                }
+            }
+        }
+        /* ───────────────────────────────────────────────────────────────── */
+
 
         if ( ! function_exists( 'dinoco_sn_table' ) ) {
             return new WP_Error( 'helper_missing', '', array( 'status' => 503 ) );

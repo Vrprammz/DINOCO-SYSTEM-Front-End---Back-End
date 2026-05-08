@@ -2,6 +2,43 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.37 (2026-05-08) — R7 Security CRITICAL cluster:   ║
+ * ║   • C3 (CVSS 7.4) — /stolen/report layered rate-limit. Old      ║
+ * ║     code: `b2b_rate_limit('sn_stolen_report', $uid, 5, 3600)`   ║
+ * ║     used WRONG 4-arg signature (helper is 3-arg ($key,$max,     ║
+ * ║     $window)) — $uid was being interpreted as $max → essentially║
+ * ║     uncapped + keyed only on user_id → LINE accounts ¥0 →       ║
+ * ║     attacker rotates 100 UIDs = 500 reports/hr → mass stolen-   ║
+ * ║     flag DoS. Fix: 3-layer cap (per-user 5/hr + per-IP 10/hr +  ║
+ * ║     per-SN 3/24h) using correct 3-arg signature.                ║
+ * ║   • M2 — marketplace/refund 4-eyes capability check used        ║
+ * ║     `user_can($approver, 'dinoco_sn_perm_admin')` but           ║
+ * ║     `dinoco_sn_perm_admin` is a CALLBACK function name, NOT a   ║
+ * ║     WordPress capability. user_can returned false for everyone  ║
+ * ║     → only `manage_options` fallback worked → Q15 boss-decision ║
+ * ║     delegated approvers (granted `dinoco_sn_approver` cap)      ║
+ * ║     could NOT approve. Fixed to real capability —               ║
+ * ║     unblocks Role Manager V.0.4 Matrix UI delegation.           ║
+ * ║  Version: V.0.36 (2026-05-08) — R7 Integration BLOCKER fixes:   ║
+ * ║   • BLOCKER 1 — Cancelled batch did NOT cascade to plates.       ║
+ * ║     Admin flips batch.status → cancelled, but pool plates        ║
+ * ║     stayed status='reserved' → warehouse /receive accepted them. ║
+ * ║     Fix: dinoco_sn_handler_update_batch_status() now atomic-     ║
+ * ║     transitions reserved plates → cancelled_batch in same TX     ║
+ * ║     when batch goes to cancelled. /receive single + /receive/    ║
+ * ║     bulk classify cancelled_batch with explicit skip code 410.   ║
+ * ║   • BLOCKER 2 — /stolen/report fired only legacy do_action       ║
+ * ║     (line ~6891). Replaced with dinoco_sn_fire_status_changed()  ║
+ * ║     so _for_user listener invalidates Member Dashboard cache.    ║
+ * ║   • BLOCKER 3 — /stolen/{id}/recover never fired any status_     ║
+ * ║     changed action after pool revert. Added canonical            ║
+ * ║     dispatcher call post-COMMIT (recalled → registered).         ║
+ * ║   • BLOCKER 4 — /reissue line 6434 fired from===to for sn_old    ║
+ * ║     (status unchanged but replaced_by_sn metadata changed).      ║
+ * ║     Documented intentional metadata-fire (dispatcher does NOT    ║
+ * ║     short-circuit, so cache invalidation works); added inline    ║
+ * ║     comment to prevent regression. /swap line 6085 verified —    ║
+ * ║     correctly fires registered→voided + in_pool→registered.     ║
  * ║  Version: V.0.35 (2026-05-08) — R6 BLOCKER fix:                 ║
  * ║   • R5 API-G1 self-approval guard was failing on every          ║
  * ║     /void + /recall + /marketplace/refund call due to route arg ║
@@ -2846,40 +2883,130 @@ if ( ! function_exists( 'dinoco_sn_handler_update_batch_status' ) ) {
             return new WP_Error( 'invalid_status', __( 'Invalid batch status.', 'dinoco-sn' ), array( 'status' => 400 ) );
         }
 
-        $tbl = dinoco_sn_table( 'batches' );
-        $row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$tbl} WHERE id = %d", $id ) );
-        if ( ! $row ) {
-            return new WP_Error( 'batch_not_found', '', array( 'status' => 404 ) );
-        }
+        $tbl      = dinoco_sn_table( 'batches' );
+        $tbl_pool = function_exists( 'dinoco_sn_table' ) ? dinoco_sn_table( 'pool' ) : '';
 
-        $now = current_time( 'mysql' );
-        $update = array( 'status' => $new_status );
-        $update_format = array( '%s' );
-
-        if ( $new_status === 'sent_to_factory' && empty( $row->sent_at ) ) {
-            $update['sent_at'] = $now;
-            $update_format[] = '%s';
-        }
-        if ( in_array( $new_status, array( 'closed', 'cancelled' ), true ) && empty( $row->closed_at ) ) {
-            $update['closed_at'] = $now;
-            $update_format[] = '%s';
-        }
-
-        $wpdb->update( $tbl, $update, array( 'id' => $id ), $update_format, array( '%d' ) );
-
-        if ( function_exists( 'dinoco_sn_audit_log' ) ) {
-            dinoco_sn_audit_log( null, 'batch_status_change', $row->status, $new_status, array(
-                'batch_id'   => $id,
-                'batch_code' => $row->batch_code,
+        // V.0.36 R7 BLOCKER 1 — atomic batch flip + plate cascade.
+        // When admin transitions batch to 'cancelled', any plate still in
+        // 'reserved' state must cascade to 'cancelled_batch' in the SAME
+        // transaction so warehouse /receive cannot accept them after the
+        // factory tells us "this batch was scrapped". Plates already past
+        // reserved (in_pool/registered/etc.) are preserved — admin handles
+        // those via /void or /recall with a recall reason.
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            // FOR UPDATE on batch row — guards two-admin race on same batch
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$tbl} WHERE id = %d FOR UPDATE",
+                $id
             ) );
-        }
+            if ( ! $row ) {
+                $wpdb->query( 'ROLLBACK' );
+                return new WP_Error( 'batch_not_found', '', array( 'status' => 404 ) );
+            }
 
-        return rest_ensure_response( array(
-            'success'    => true,
-            'id'         => $id,
-            'status'     => $new_status,
-            'updated_at' => $now,
-        ) );
+            $now            = current_time( 'mysql' );
+            $update         = array( 'status' => $new_status );
+            $update_format  = array( '%s' );
+
+            if ( $new_status === 'sent_to_factory' && empty( $row->sent_at ) ) {
+                $update['sent_at'] = $now;
+                $update_format[]   = '%s';
+            }
+            if ( in_array( $new_status, array( 'closed', 'cancelled' ), true ) && empty( $row->closed_at ) ) {
+                $update['closed_at'] = $now;
+                $update_format[]     = '%s';
+            }
+
+            $upd_b = $wpdb->update( $tbl, $update, array( 'id' => $id ), $update_format, array( '%d' ) );
+            if ( $upd_b === false ) {
+                throw new \RuntimeException( 'batch update failed' );
+            }
+
+            // V.0.36 R7 BLOCKER 1 — cascade plate flip on transition to cancelled.
+            // Idempotent: only fires on status row-change AND only flips
+            // plates currently in 'reserved' (preserves in_pool / registered
+            // etc.). Single SQL UPDATE bounded by batch_id + status.
+            $cascade_count = 0;
+            $cancelled_sns = array();
+            if ( $new_status === 'cancelled' && $row->status !== 'cancelled' && $tbl_pool !== '' ) {
+                // Snapshot reserved SNs first (for audit + cache invalidation
+                // post-COMMIT). Single SELECT — IDX on batch_id + status
+                // makes this O(qty_reserved) scan, fine for typical batch
+                // sizes (1K-100K).
+                $cancelled_rows = $wpdb->get_results( $wpdb->prepare(
+                    "SELECT sn FROM {$tbl_pool}
+                     WHERE batch_id = %d AND status = 'reserved'
+                     FOR UPDATE",
+                    $id
+                ) );
+                if ( is_array( $cancelled_rows ) ) {
+                    foreach ( $cancelled_rows as $cr ) {
+                        $cancelled_sns[] = strtoupper( (string) $cr->sn );
+                    }
+                }
+
+                if ( ! empty( $cancelled_sns ) ) {
+                    $upd_p = $wpdb->query( $wpdb->prepare(
+                        "UPDATE {$tbl_pool}
+                         SET status = 'cancelled_batch', prev_status = status
+                         WHERE batch_id = %d AND status = 'reserved'",
+                        $id
+                    ) );
+                    if ( $upd_p === false ) {
+                        throw new \RuntimeException( 'plate cascade update failed' );
+                    }
+                    $cascade_count = (int) $upd_p;
+                }
+            }
+
+            $wpdb->query( 'COMMIT' );
+
+            // Audit batch transition + per-plate cancellation (post-COMMIT,
+            // non-throwing — DB integrity already guaranteed).
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                dinoco_sn_audit_log( null, 'batch_status_change', $row->status, $new_status, array(
+                    'batch_id'         => $id,
+                    'batch_code'       => $row->batch_code,
+                    'cascade_count'    => $cascade_count,
+                ) );
+                // Per-SN audit row for the cascade (sensitive — preserves
+                // 5y trail for "why did this plate flip without admin op").
+                if ( $cascade_count > 0 ) {
+                    foreach ( $cancelled_sns as $csn ) {
+                        dinoco_sn_audit_log(
+                            $csn, 'plate_cancelled_batch', 'reserved', 'cancelled_batch',
+                            array( 'batch_id' => $id, 'batch_code' => $row->batch_code ),
+                            null, null, 'batch ' . $row->batch_code . ' cancelled by admin',
+                            'batch_cancellation', true
+                        );
+                    }
+                }
+            }
+
+            // Fire pool status_changed for each cascaded plate so cache
+            // invalidation listeners + observability hooks run. Plates
+            // were unowned (reserved → never registered) so user_id=0.
+            if ( $cascade_count > 0 && function_exists( 'dinoco_sn_fire_status_changed' ) ) {
+                foreach ( $cancelled_sns as $csn ) {
+                    dinoco_sn_fire_status_changed( $csn, 'reserved', 'cancelled_batch', 0 );
+                }
+            }
+
+            return rest_ensure_response( array(
+                'success'        => true,
+                'id'             => $id,
+                'status'         => $new_status,
+                'updated_at'     => $now,
+                'cascade_count'  => $cascade_count,
+            ) );
+        } catch ( \Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            if ( function_exists( 'dinoco_obs_capture' ) ) {
+                dinoco_obs_capture( $e, array( 'context' => 'sn_batch_status_update', 'batch_id' => $id, 'new_status' => $new_status ) );
+            }
+            return new WP_Error( 'batch_status_update_failed', $e->getMessage(), array( 'status' => 500 ) );
+        }
     }
 }
 
@@ -3133,6 +3260,18 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_single' ) ) {
                 );
             }
 
+            // V.0.36 R7 BLOCKER 1 — explicit cancelled_batch gate.
+            // Triggers when admin flipped batch.status → 'cancelled' AFTER
+            // factory shipped (cascade in handler_update_batch_status flips
+            // reserved plates → cancelled_batch). Warehouse must discard.
+            if ( $plate->status === 'cancelled_batch' ) {
+                $wpdb->query( "ROLLBACK" );
+                return new WP_Error( 'cancelled_batch',
+                    __( 'Batch was cancelled — discard plate immediately.', 'dinoco-sn' ),
+                    array( 'status' => 410 )
+                );
+            }
+
             if ( $plate->status !== 'reserved' ) {
                 $wpdb->query( "ROLLBACK" );
                 return new WP_Error( 'invalid_status',
@@ -3326,6 +3465,17 @@ if ( ! function_exists( 'dinoco_sn_handler_receive_bulk' ) ) {
                 }
                 if ( $row['status'] === 'voided' ) {
                     $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'voided' );
+                    $skip_count++;
+                    continue;
+                }
+                // V.0.36 R7 BLOCKER 1 — explicit cancelled_batch skip.
+                // Per FSM doc, this is a discrete terminal state (factory
+                // told us scrap the batch) — emit a distinct skip code so
+                // the UI can show "discard plate" instead of generic
+                // invalid_status. Status 410 semantic applies in single-
+                // receive; bulk path returns inside 207 Multi-Status.
+                if ( $row['status'] === 'cancelled_batch' ) {
+                    $results[] = array( 'sn' => $sn, 'status' => 'skip', 'code' => 'cancelled_batch' );
                     $skip_count++;
                     continue;
                 }
@@ -5386,8 +5536,11 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_recover' ) ) {
                         $sn
                     ), ARRAY_A );
 
-                    $product_name = '';
-                    $owner_uid    = 0;
+                    $product_name      = '';
+                    $owner_uid         = 0;
+                    $pool_did_revert   = false; // V.0.36 R7 BLOCKER 3 — fire dispatcher only on real flip
+                    $pool_revert_to    = '';
+                    $pool_revert_from  = '';
                     if ( $pool_row ) {
                         $owner_uid = (int) ( $pool_row['registered_user_id'] ?? 0 );
 
@@ -5405,6 +5558,9 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_recover' ) ) {
                                 'stolen_at'   => null,
                                 'recalled_at' => null,
                             ), array( 'sn' => $sn, 'status' => 'recalled' ) );
+                            $pool_did_revert  = true;
+                            $pool_revert_from = 'recalled';
+                            $pool_revert_to   = $target_status;
                         }
 
                         // Resolve product name for Flex card
@@ -5435,6 +5591,16 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_recover' ) ) {
 
                     $wpdb->query( 'COMMIT' );
                     $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) );
+
+                    // V.0.36 R7 BLOCKER 3 — fire canonical status_changed
+                    // dispatcher post-COMMIT so Member Dashboard banner +
+                    // lookup cache + MCP cache invalidate immediately. Pre-
+                    // V.0.36 this handler did NOT fire any pool_status_changed
+                    // action → caches stayed stale until 5-min TTL even though
+                    // the plate was now back in the customer's good hands.
+                    if ( $pool_did_revert && function_exists( 'dinoco_sn_fire_status_changed' ) ) {
+                        dinoco_sn_fire_status_changed( $sn, $pool_revert_from, $pool_revert_to, $owner_uid );
+                    }
 
                     // Push LINE Flex to owner — best-effort (failure does NOT roll back DB)
                     $line_pushed = false;
@@ -6425,6 +6591,22 @@ if ( ! function_exists( 'dinoco_sn_rest_reissue' ) ) {
                     // V.0.29 CRIT-3 + F-NEW-1 — fire generic + per-user variants.
                     // sn_old keeps customer registration but is now flagged
                     // replaced-by sn_new; sn_new transitions in_pool → registered.
+                    //
+                    // V.0.36 R7 BLOCKER 4 documentation: the sn_old fire below
+                    // INTENTIONALLY uses from===to (status string did not change
+                    // — only `replaced_by_sn` metadata flipped). This is required
+                    // because customer keeps proof of registration on sn_old
+                    // until they confirm physical loss (anti-abuse design). The
+                    // canonical dispatcher (line ~931) does NOT short-circuit
+                    // on from===to — it always fires both 'pool_status_changed'
+                    // (cache invalidate) and '_for_user' (banner refresh).
+                    // Listeners that consume these actions (Member Dashboard
+                    // banner cache invalidate priority 10, REST/MCP lookup
+                    // cache invalidate priority 5/6) operate on sn or user_id
+                    // only — they do NOT inspect from/to. DO NOT "optimize"
+                    // this fire away. /swap (line ~6085) uses real status
+                    // transitions (registered→voided + in_pool→registered) —
+                    // a different design where sn_old is fully retired.
                     $owner_uid = isset( $row_old['registered_user_id'] ) ? (int) $row_old['registered_user_id'] : 0;
                     if ( function_exists( 'dinoco_sn_fire_status_changed' ) ) {
                         dinoco_sn_fire_status_changed( $sn_new, 'in_pool', $row_old['status'], $owner_uid );
@@ -6758,12 +6940,50 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_report' ) ) {
         if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
         }
-        // V.0.28 HIGH-4 — rate-limit 5/hour/user (b2b_rate_limit reuse if present).
-        // Defensive: if rate-limit helper missing, fail-open (mirrors other endpoints).
+        /* ─────────────────────────────────────────────────────────────────
+         * R7 C3 (CVSS 7.4) — layered rate-limit (per-user + per-IP + per-SN)
+         * to defeat multi-account LINE-rotation bypass.
+         *
+         * Pre-V.0.36: only `b2b_rate_limit('sn_stolen_report', $uid, 5, 3600)`
+         * which (a) used wrong 4-arg signature (b2b_rate_limit is 3-arg —
+         * $uid was being interpreted as $max, 5 as $window → effectively
+         * "$uid attempts per 5 seconds" which is essentially uncapped) and
+         * (b) was keyed on user_id only. LINE accounts cost ¥0 → attacker
+         * rotates 100 UIDs = 500 reports/hr → spam stolen reports → mass
+         * recall flip → DoS legit owners.
+         *
+         * V.0.36 layered defense (per security-pentester R7 spec):
+         *   - per-user: 5/hr  (correct 3-arg signature now)
+         *   - per-IP:   10/hr (caps multi-account from same device)
+         *   - per-SN:   3/24h (caps repeat reports against single plate
+         *                      — legit user reports once, false-positive
+         *                      ghosting bursts blocked)
+         *
+         * Defensive: if rate-limit helper missing, fail-open (mirrors other
+         * endpoints).
+         * ───────────────────────────────────────────────────────────────── */
         if ( function_exists( 'b2b_rate_limit' ) ) {
-            $reporter_id_for_rl = (int) get_current_user_id();
-            $rl = b2b_rate_limit( 'sn_stolen_report', $reporter_id_for_rl, 5, 3600 );
-            if ( is_wp_error( $rl ) ) return $rl;
+            $current_uid = (int) get_current_user_id();
+            $sn_param    = strtoupper( trim( (string) $req->get_param( 'sn' ) ) );
+
+            // per-user: 5/hr
+            $uid_rl = b2b_rate_limit( 'sn_stolen_user_' . $current_uid, 5, HOUR_IN_SECONDS );
+            if ( is_wp_error( $uid_rl ) ) return $uid_rl;
+
+            // per-IP: 10/hr (use canonical IP resolver from Idempotency Helper)
+            $ip = function_exists( 'dinoco_idempotency_resolve_ip' )
+                ? dinoco_idempotency_resolve_ip()
+                : ( isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '' );
+            if ( $ip !== '' ) {
+                $ip_rl = b2b_rate_limit( 'sn_stolen_ip_' . md5( $ip ), 10, HOUR_IN_SECONDS );
+                if ( is_wp_error( $ip_rl ) ) return $ip_rl;
+            }
+
+            // per-SN: 3/24h (cap repeat reports against single plate)
+            if ( $sn_param !== '' ) {
+                $sn_rl = b2b_rate_limit( 'sn_stolen_sn_' . md5( $sn_param ), 3, DAY_IN_SECONDS );
+                if ( is_wp_error( $sn_rl ) ) return $sn_rl;
+            }
         }
         return dinoco_sn_with_idempotency( $req, 'stolen-report',
             array( 'sn', 'police_report_no', 'police_station', 'incident_date' ),
@@ -6887,8 +7107,20 @@ if ( ! function_exists( 'dinoco_sn_rest_stolen_report' ) ) {
 
                     $wpdb->query( 'COMMIT' );
 
-                    // V.0.28 — fire pool status change hook (recalled = invalidate caches)
-                    do_action( 'dinoco_sn_pool_status_changed', $sn, $row['status'], 'recalled' );
+                    // V.0.36 R7 BLOCKER 2 — was firing legacy do_action only.
+                    // Use canonical dispatcher so _for_user listener runs +
+                    // Member Dashboard banner + lookup cache + MCP cache all
+                    // invalidate post-COMMIT. owner_id may be 0 if plate was
+                    // unowned (admin-side report) — dispatcher skips _for_user
+                    // when uid <= 0 (safe).
+                    if ( function_exists( 'dinoco_sn_fire_status_changed' ) ) {
+                        dinoco_sn_fire_status_changed( $sn, $row['status'], 'recalled', $owner_id );
+                    } else {
+                        do_action( 'dinoco_sn_pool_status_changed', $sn, $row['status'], 'recalled' );
+                        if ( $owner_id > 0 ) {
+                            do_action( 'dinoco_sn_pool_status_changed_for_user', $owner_id, $sn, $row['status'], 'recalled' );
+                        }
+                    }
 
                     return rest_ensure_response( array(
                         'success'         => true,
@@ -9235,10 +9467,17 @@ if ( ! function_exists( 'dinoco_sn_handler_marketplace_refund' ) ) {
                     __( 'Self-approval blocked. Approver must be a different admin user.', 'dinoco-sn' ),
                     array( 'status' => 422 ) );
             }
-            if ( ! user_can( $approver_user_id, 'dinoco_sn_perm_admin' )
+            // R7 M2 fix — `dinoco_sn_perm_admin` is a CALLBACK function name,
+            // NOT a WordPress capability. user_can($uid, 'dinoco_sn_perm_admin')
+            // returns false for everyone → only the manage_options fallback
+            // ever worked → Q15 boss-decision delegated approvers (granted
+            // `dinoco_sn_approver` capability) could not approve refunds.
+            // Replace with the real capability — preserves intent + enables
+            // Q15 delegation matrix (Role Manager V.0.4 Matrix UI).
+            if ( ! user_can( $approver_user_id, 'dinoco_sn_approver' )
                  && ! user_can( $approver_user_id, 'manage_options' ) ) {
                 return new WP_Error( 'approver_not_admin',
-                    __( 'Approver must have dinoco_sn_perm_admin capability.', 'dinoco-sn' ),
+                    __( 'Approver must have dinoco_sn_approver capability.', 'dinoco-sn' ),
                     array( 'status' => 422 ) );
             }
         } else {
