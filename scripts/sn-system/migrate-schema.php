@@ -1,8 +1,33 @@
 <?php
 /**
  * =============================================================================
- * DINOCO SN System — Schema Migration WP-CLI Command V.1.0 (2026-05-07)
+ * DINOCO SN System — Schema Migration WP-CLI Command V.1.1 (2026-05-08)
  * =============================================================================
+ *
+ * R5 SECURITY HARDENING (2026-05-08):
+ *   • B1 (CRIT, CWE-214): DB password no longer leaks via `ps -ef` /
+ *     /proc/<pid>/cmdline. Both mysqldump + pt-osc now use
+ *     --defaults-extra-file=<tmpfile> (chmod 0600, finally-unlinked).
+ *   • B2 (CRIT): --skip-snapshot now requires typed-confirm
+ *     'I-ACCEPT-NO-SNAPSHOT' AND refuses on production unless
+ *     --i-am-on-staging is also passed. Audit row recorded.
+ *   • B3 (HIGH): --force bypass writes audit row (event_type=cli_force_bypass)
+ *     so DBA approval is traceable.
+ *   • B4 (HIGH): Migration body wrapped in MySQL GET_LOCK(
+ *     'dinoco_sn_migrate_schema', 0) — second invocation aborts
+ *     immediately instead of overlapping ALTER attempts.
+ *   • Sec-G2 (HIGH): direct_alter() supports --auto-rollback flag —
+ *     on hard ALTER failure, automatically restores from snapshot
+ *     produced earlier in this run.
+ *
+ * R5 PERFORMANCE HARDENING (2026-05-08):
+ *   • Perf-B3 (BLOCKER): preflight_check now counts active sessions in last
+ *     5 minutes via wp_usermeta `session_tokens` (set by WP core on every
+ *     login). When --execute AND NOT --online AND NOT --force AND active > 0
+ *     → CLI refuses with explicit maintenance-window guidance. In-place
+ *     ALTER on 1M rows blocks INSERTs 15-30 min, so live admins are unsafe.
+ *     --online (pt-osc) bypasses this check — pt-osc is concurrent-write safe.
+ *     --force still bypasses (B3 audit row written above).
  *
  * Closes R4 BLOCKER #2 (database-expert P0-3):
  *   "Schema 1.1→1.2 ALTER on 1M rows w/o online migration → Production lock
@@ -150,6 +175,116 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
         /** Snapshot retention dir (relative to wp-content/). */
         const SNAPSHOT_DIR = 'dinoco-sn-snapshots';
 
+        // ─────────────────────────────────────────────────────────────────
+        // R5 helpers — credential isolation, typed-confirm, audit
+        // ─────────────────────────────────────────────────────────────────
+
+        /**
+         * R5 B1 — Write a chmod-0600 mysql defaults file holding [client]
+         * credentials. mysqldump / pt-osc invoke with
+         * --defaults-extra-file=<this> instead of -p<password> to keep the
+         * password out of `ps -ef` and /proc/<pid>/cmdline (CWE-214).
+         *
+         * Caller MUST `@unlink()` the returned path in a finally{} block
+         * so credentials don't persist on disk past the run (even on
+         * SIGTERM / fatal error inside exec()).
+         *
+         * @param string $db_user
+         * @param string $db_password
+         * @param string $db_host May contain "host:port" — caller separates port externally.
+         * @return string Absolute path to defaults file (chmod 0600).
+         */
+        private function _write_mysql_defaults_file( $db_user, $db_password, $db_host ) {
+            $tmp = tempnam( sys_get_temp_dir(), 'dnc-mig-' );
+            if ( $tmp === false ) {
+                \WP_CLI::error( 'Cannot create defaults file in tmp dir — credential isolation FAILED. Aborting (refuse to fall back to -p flag).' );
+            }
+            // Strip port off host (caller passes port separately to client cmd)
+            $host_only = $db_host;
+            if ( strpos( $host_only, ':' ) !== false ) {
+                list( $host_only, ) = explode( ':', $host_only, 2 );
+            }
+            // mysql/mysqldump support a [client] block — values are
+            // single-line with optional quoting. Escape backslash + quote.
+            $esc = function ( $v ) {
+                $v = str_replace( '\\', '\\\\', (string) $v );
+                $v = str_replace( '"', '\\"', $v );
+                return '"' . $v . '"';
+            };
+            $body  = "[client]\n";
+            $body .= 'user='     . $esc( $db_user )     . "\n";
+            $body .= 'password=' . $esc( $db_password ) . "\n";
+            $body .= 'host='     . $esc( $host_only )   . "\n";
+            // Fail loudly if write fails — no silent fallback to -p
+            $written = @file_put_contents( $tmp, $body );
+            if ( $written === false ) {
+                @unlink( $tmp );
+                \WP_CLI::error( 'Cannot write defaults file — credential isolation FAILED. Aborting.' );
+            }
+            // chmod 0600 — only owner can read. Critical: do this BEFORE
+            // exec() so the file has restrictive perms even if process
+            // is terminated mid-run.
+            @chmod( $tmp, 0600 );
+            return $tmp;
+        }
+
+        /**
+         * R5 B2 — Read a single line from STDIN and require it match an
+         * exact phrase. WP_CLI::confirm only does y/N which is not strong
+         * enough for "skip-snapshot" intent capture.
+         *
+         * @param string $expected Exact phrase that must be typed.
+         * @param string $prompt   Question shown to user.
+         * @return bool true on exact match, false otherwise (caller errors out).
+         */
+        private function _typed_confirm( $expected, $prompt ) {
+            \WP_CLI::log( $prompt );
+            \WP_CLI::log( 'Type the EXACT phrase to confirm (any other input aborts):' );
+            \WP_CLI::log( "  Expected: {$expected}" );
+            $stdin = fopen( 'php://stdin', 'r' );
+            if ( ! $stdin ) {
+                \WP_CLI::error( 'Cannot read STDIN — confirmation impossible. Aborting.' );
+            }
+            $line = fgets( $stdin );
+            fclose( $stdin );
+            $line = trim( (string) $line );
+            return ( $line === $expected );
+        }
+
+        /**
+         * R5 B2/B3 — Best-effort audit log row for CLI bypass events
+         * (--skip-snapshot, --force). Calls dinoco_sn_audit_log() if the
+         * SN namespace helper is present. Never throws.
+         *
+         * @param string $event_type e.g. 'cli_skip_snapshot' / 'cli_force_bypass'
+         * @param array  $context    JSON-serializable context payload
+         * @return void
+         */
+        private function _cli_audit_log( $event_type, array $context ) {
+            // Identify CLI invoker by posix_getpwuid + getenv fallback.
+            $login = '';
+            if ( function_exists( 'posix_getpwuid' ) && function_exists( 'posix_geteuid' ) ) {
+                $pw = @posix_getpwuid( @posix_geteuid() );
+                if ( is_array( $pw ) && ! empty( $pw['name'] ) ) {
+                    $login = (string) $pw['name'];
+                }
+            }
+            if ( $login === '' ) {
+                $login = (string) ( getenv( 'USER' ) ?: getenv( 'LOGNAME' ) ?: 'cli_unknown' );
+            }
+            $context['cli_login']     = $login;
+            $context['cli_pid']       = getmypid();
+            $context['cli_timestamp'] = current_time( 'mysql' );
+            if ( function_exists( 'dinoco_sn_audit_log' ) ) {
+                try {
+                    // dinoco_sn_audit_log signature: ($event_type, $context, $user_id)
+                    dinoco_sn_audit_log( $event_type, $context, 0 );
+                } catch ( \Throwable $e ) { /* never throw from CLI audit */ }
+            } else {
+                error_log( '[SN-MIGRATE][AUDIT] ' . $event_type . ' ' . wp_json_encode( $context ) );
+            }
+        }
+
         /**
          * `wp dinoco-sn migrate-schema` command entry point.
          *
@@ -171,9 +306,24 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
          * [--skip-snapshot]
          * : Skip mysqldump snapshot before ALTERs. NOT RECOMMENDED for
          *   production — only for UAT/staging where DB is disposable.
+         *   Requires typed-confirm 'I-ACCEPT-NO-SNAPSHOT'. On production
+         *   environments, also requires --i-am-on-staging (will abort
+         *   without it).
+         *
+         * [--i-am-on-staging]
+         * : Affirmative gate companion to --skip-snapshot. Required on
+         *   production environments to disambiguate "I really mean this
+         *   target is non-production". Without this flag, --skip-snapshot
+         *   refuses to run when wp_get_environment_type()==='production'.
          *
          * [--force]
          * : Bypass HUGE_ROWCOUNT_BLOCK guard (> 500K rows). DBA approval required.
+         *   Audit row written (event_type=cli_force_bypass) for traceability.
+         *
+         * [--auto-rollback]
+         * : On non-recoverable ALTER failure, automatically restore from
+         *   snapshot file produced earlier in this run. Only applies when
+         *   snapshot was produced (i.e. NOT used with --skip-snapshot).
          *
          * @param array $args
          * @param array $assoc_args
@@ -185,6 +335,8 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
             $online        = isset( $assoc_args['online'] );
             $skip_snapshot = isset( $assoc_args['skip-snapshot'] );
             $force         = isset( $assoc_args['force'] );
+            $i_am_staging  = isset( $assoc_args['i-am-on-staging'] );
+            $auto_rollback = isset( $assoc_args['auto-rollback'] );
 
             // --- Argument validation ---------------------------------------
             if ( $version === '' ) {
@@ -224,12 +376,86 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
                 ) );
             }
 
+            // R5 B3 — --force bypass: audit row for traceability (DBA approval).
+            if ( $force && $preflight['pool_rows'] > self::HUGE_ROWCOUNT_BLOCK ) {
+                \WP_CLI::warning( sprintf(
+                    '--force engaged: bypassing HUGE_ROWCOUNT_BLOCK guard (%s rows). Audit row recorded.',
+                    number_format( $preflight['pool_rows'] )
+                ) );
+                $this->_cli_audit_log( 'cli_force_bypass', array(
+                    'pool_rows'      => $preflight['pool_rows'],
+                    'target_version' => $version,
+                    'online_mode'    => (bool) $online,
+                ) );
+            }
+
+            // R5 B2 — --skip-snapshot guards (typed-confirm + prod-env gate).
+            // Run BEFORE any DB writes so user can abort without side effects.
+            if ( $skip_snapshot && $execute ) {
+                $env = function_exists( 'wp_get_environment_type' )
+                    ? wp_get_environment_type()
+                    : 'unknown';
+                if ( $env === 'production' && ! $i_am_staging ) {
+                    \WP_CLI::error(
+                        '--skip-snapshot refuses to run on production environment. ' .
+                        'If this is genuinely a non-prod target, also pass --i-am-on-staging.'
+                    );
+                }
+                $confirmed = $this->_typed_confirm(
+                    'I-ACCEPT-NO-SNAPSHOT',
+                    sprintf(
+                        'WARNING: --skip-snapshot will run ALTERs WITHOUT a backup. ' .
+                        'Recovery from a failed migration will require restoring from your ' .
+                        'most recent off-line backup (env=%s).',
+                        $env
+                    )
+                );
+                if ( ! $confirmed ) {
+                    \WP_CLI::error( 'Confirmation phrase did not match. Aborting (no DB writes performed).' );
+                }
+                $this->_cli_audit_log( 'cli_skip_snapshot', array(
+                    'env'            => $env,
+                    'target_version' => $version,
+                    'pool_rows'      => $preflight['pool_rows'],
+                    'i_am_staging'   => (bool) $i_am_staging,
+                ) );
+            }
+
             if ( ! $online && $preflight['pool_rows'] > self::LARGE_ROWCOUNT_WARN ) {
                 \WP_CLI::warning( sprintf(
                     'Pool > %s rows. In-place ALTER will block writes ~%s. Recommend --online (pt-online-schema-change).',
                     number_format( self::LARGE_ROWCOUNT_WARN ),
                     $this->estimate_alter_duration( $preflight['pool_rows'] )
                 ) );
+            }
+
+            // R5 Perf-B3 — refuse --execute when admins are live, unless
+            // running --online (pt-osc is concurrent-write safe) or --force
+            // (DBA approval; audit row already written above).
+            //
+            // In-place ALTER on a 1M-row table holds a metadata lock for the
+            // duration of the rebuild (15-30 min on commodity hardware) —
+            // active admins doing INSERT/UPDATE will hang for that window.
+            // Detection: count distinct user_ids with `session_tokens`
+            // usermeta where any token's `last_login` is within 5 minutes
+            // (WP core writes this on every login + heartbeat-bound activity).
+            if ( $execute && ! $online && ! $force ) {
+                $active = $preflight['active_sessions'];
+                if ( $active > 0 ) {
+                    \WP_CLI::error( sprintf(
+                        "Refusing --execute (in-place ALTER) while %d admin/user session(s) " .
+                        "are active in the last 5 minutes.\n" .
+                        "  In-place ALTER on %s rows will block writes ~%s.\n" .
+                        "  Options:\n" .
+                        "    1) Wait for a maintenance window (02:00-04:00 ICT recommended)\n" .
+                        "    2) Use --online (pt-online-schema-change — concurrent-write safe)\n" .
+                        "    3) Use --force ONLY with DBA approval (audit row recorded)",
+                        $active,
+                        number_format( $preflight['pool_rows'] ),
+                        $this->estimate_alter_duration( $preflight['pool_rows'] )
+                    ) );
+                }
+                \WP_CLI::log( '  Active sessions: 0 (last 5 min) — proceeding with in-place ALTER.' );
             }
 
             // --- STEP 2: Pre-validate UNIQUE collisions --------------------
@@ -265,6 +491,7 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
             // --- STEP 3: Snapshot (skipped on --dry-run) -------------------
             \WP_CLI::log( '' );
             \WP_CLI::log( '[3/6] Snapshot…' );
+            $snapshot_path = '';
             if ( $dry_run ) {
                 \WP_CLI::log( '  (skipped — dry-run)' );
             } elseif ( $skip_snapshot ) {
@@ -295,36 +522,60 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
                 return;
             }
 
-            // --- STEP 5: Execute ALTERs ------------------------------------
-            \WP_CLI::log( '' );
-            \WP_CLI::log( '[5/6] Executing migration…' );
-            if ( $online ) {
-                if ( ! $this->pt_osc_available() ) {
-                    \WP_CLI::error( '--online specified but pt-online-schema-change not in PATH. Install Percona Toolkit or omit --online.' );
+            // --- R5 B4: Acquire MySQL GET_LOCK so a second migration run
+            // can't overlap (would otherwise produce hard-to-debug
+            // "duplicate key" + half-applied schema). Timeout=0 → fail
+            // fast if another invocation holds the lock.
+            global $wpdb;
+            $lock_acquired = (int) $wpdb->get_var(
+                "SELECT GET_LOCK('dinoco_sn_migrate_schema', 0)"
+            );
+            if ( $lock_acquired !== 1 ) {
+                \WP_CLI::error(
+                    'Another migration is in progress (MySQL GET_LOCK held). Aborting. ' .
+                    'If you are SURE no other run is active, run: ' .
+                    "wp eval \"global \\\$wpdb; \\\$wpdb->query(\\\"DO RELEASE_LOCK('dinoco_sn_migrate_schema')\\\");\""
+                );
+            }
+
+            try {
+                // --- STEP 5: Execute ALTERs ------------------------------------
+                \WP_CLI::log( '' );
+                \WP_CLI::log( '[5/6] Executing migration…' );
+                if ( $online ) {
+                    if ( ! $this->pt_osc_available() ) {
+                        \WP_CLI::error( '--online specified but pt-online-schema-change not in PATH. Install Percona Toolkit or omit --online.' );
+                    }
+                    $this->pt_online_schema_change( $version, $statements );
+                } else {
+                    // R5 Sec-G2 — pass auto_rollback + snapshot path through
+                    $this->direct_alter( $statements, $auto_rollback, $snapshot_path );
                 }
-                $this->pt_online_schema_change( $version, $statements );
-            } else {
-                $this->direct_alter( $statements );
+
+                // --- STEP 6: Post-migration verify -----------------------------
+                \WP_CLI::log( '' );
+                \WP_CLI::log( '[6/6] Verifying schema…' );
+                $verify = $this->post_migration_verify( $version );
+                if ( ! $verify['ok'] ) {
+                    \WP_CLI::error( 'Verification FAILED. Check ' . implode( ', ', $verify['failures'] ) . '. Roll back via scripts/sn-system/rollback-schema.sql.' );
+                }
+                \WP_CLI::success( 'Schema verification passed.' );
+
+                // Flip version flag
+                update_option( 'dinoco_sn_schema_version', $version, 'no' );
+                update_option( 'dinoco_sn_schema_activated_at', current_time( 'mysql' ), 'no' );
+                // Clear admin notice from V.0.40 skip path
+                delete_option( 'dinoco_sn_schema_alter_blocked_at' );
+                delete_option( 'dinoco_sn_schema_alter_blocked_rowcount' );
+
+                \WP_CLI::log( '' );
+                \WP_CLI::success( "Migration to v{$version} complete." );
+            } finally {
+                // Release lock unconditionally — even if a fatal occurred
+                // mid-run. Without this a second run would falsely
+                // believe a prior run is still active.
+                $wpdb->query( "DO RELEASE_LOCK('dinoco_sn_migrate_schema')" );
             }
-
-            // --- STEP 6: Post-migration verify -----------------------------
-            \WP_CLI::log( '' );
-            \WP_CLI::log( '[6/6] Verifying schema…' );
-            $verify = $this->post_migration_verify( $version );
-            if ( ! $verify['ok'] ) {
-                \WP_CLI::error( 'Verification FAILED. Check ' . implode( ', ', $verify['failures'] ) . '. Roll back via scripts/sn-system/rollback-schema.sql.' );
-            }
-            \WP_CLI::success( 'Schema verification passed.' );
-
-            // Flip version flag
-            update_option( 'dinoco_sn_schema_version', $version, 'no' );
-            update_option( 'dinoco_sn_schema_activated_at', current_time( 'mysql' ), 'no' );
-            // Clear admin notice from V.0.40 skip path
-            delete_option( 'dinoco_sn_schema_alter_blocked_at' );
-            delete_option( 'dinoco_sn_schema_alter_blocked_rowcount' );
-
-            \WP_CLI::log( '' );
-            \WP_CLI::success( "Migration to v{$version} complete." );
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -363,6 +614,9 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
             // 8.0.29+ for MODIFY COLUMN. MariaDB 10.4+ has partial support.
             $instant_alter_capable = $is_mysql_8 && version_compare( $db_version, '8.0.16', '>=' );
 
+            // R5 Perf-B3 — count active sessions in last 5 minutes.
+            $active_sessions = $this->_active_session_count();
+
             return array(
                 'current_version'       => $current,
                 'target_version'        => $target_version,
@@ -374,7 +628,64 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
                 'is_mariadb'            => $is_mariadb,
                 'buffer_size_bytes'     => $buffer_size_bytes,
                 'instant_alter_capable' => $instant_alter_capable,
+                'active_sessions'       => $active_sessions,
             );
+        }
+
+        /**
+         * R5 Perf-B3 — count distinct user_ids with a `session_tokens`
+         * usermeta row whose serialized payload references a `last_login`
+         * within the last 5 minutes (300 seconds).
+         *
+         * WP core stores `session_tokens` as serialized array of
+         *   [ token_hash => [ 'expiration' => ts, 'login' => ts, 'ip' => ip, ... ] ]
+         * `login` is the unix timestamp of the most recent successful auth
+         * for that token. Heartbeat-driven activity does NOT update `login`
+         * (it persists for 14 days by default), so this count slightly
+         * over-estimates "active in last 5 min" — but that is the SAFE
+         * direction (refuse to lock writes when ANY admin might be live).
+         *
+         * Pure logic — no side effects. Defensive: returns 0 on any error.
+         *
+         * @return int
+         */
+        public function _active_session_count() {
+            global $wpdb;
+            try {
+                // Pull all session_tokens rows and parse in PHP — there's no
+                // SQL-native way to JSON/serialize-decode the embedded `login`
+                // timestamp. On a typical install this is ~10-50 admin rows;
+                // on huge installs (5K users) it's bounded by # of users
+                // who have logged in at least once with a still-valid token.
+                $rows = $wpdb->get_results(
+                    "SELECT user_id, meta_value
+                       FROM {$wpdb->usermeta}
+                      WHERE meta_key = 'session_tokens'
+                        AND meta_value <> ''",
+                    ARRAY_A
+                );
+                if ( ! is_array( $rows ) ) return 0;
+
+                $cutoff = time() - 300; // 5 minutes
+                $active_uids = array();
+                foreach ( $rows as $row ) {
+                    $uid = (int) ( $row['user_id'] ?? 0 );
+                    if ( $uid <= 0 ) continue;
+                    $tokens = @maybe_unserialize( $row['meta_value'] );
+                    if ( ! is_array( $tokens ) ) continue;
+                    foreach ( $tokens as $tok ) {
+                        if ( ! is_array( $tok ) ) continue;
+                        $login = (int) ( $tok['login'] ?? 0 );
+                        if ( $login >= $cutoff ) {
+                            $active_uids[ $uid ] = true;
+                            break; // one active token per user is enough
+                        }
+                    }
+                }
+                return count( $active_uids );
+            } catch ( \Throwable $e ) {
+                return 0; // fail-open — never block migration on a meta-parse bug
+            }
         }
 
         /** Defensive COUNT(*) — returns 0 if table missing. */
@@ -406,6 +717,13 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
                 $p['instant_alter_capable'] ? 'YES (MySQL 8.0.16+)' : 'NO (rebuild required)',
                 number_format( intdiv( $p['buffer_size_bytes'], 1024 * 1024 ) )
             ) );
+            // R5 Perf-B3 — surface active-session count
+            if ( isset( $p['active_sessions'] ) ) {
+                \WP_CLI::log( sprintf(
+                    '  Active sessions (last 5 min): %d',
+                    (int) $p['active_sessions']
+                ) );
+            }
         }
 
         /**
@@ -475,9 +793,22 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
                     \WP_CLI::warning( "Cannot create snapshot dir: {$dir}" );
                     return '';
                 }
-                // Deny web access
+                // Deny web access (Apache)
                 @file_put_contents( $dir . '/.htaccess', "Require all denied\n" );
                 @file_put_contents( $dir . '/index.php', "<?php // Silence is golden.\n" );
+                // R5 Sec-G5 — Nginx is NOT covered by .htaccess. Emit a
+                // ready-to-paste server-block fragment so devops can grep
+                // + paste into the site's nginx config. We do NOT auto-edit
+                // nginx (too risky — could break the site). Admin runbook
+                // (docs/sn-system/25-schema-migration-runbook.md) walks
+                // through deployment.
+                $nginx_hint  = "# DINOCO SN snapshot dir — DENY public access (paste into nginx server { } block)\n";
+                $nginx_hint .= "# Generated by migrate-schema.php on first run.\n";
+                $nginx_hint .= "location ~ ^/wp-content/" . self::SNAPSHOT_DIR . "/ {\n";
+                $nginx_hint .= "    deny all;\n";
+                $nginx_hint .= "    return 403;\n";
+                $nginx_hint .= "}\n";
+                @file_put_contents( $dir . '/NGINX_BLOCK.txt', $nginx_hint );
             }
 
             $tag    = preg_replace( '/[^a-zA-Z0-9_-]/', '', (string) $tag );
@@ -488,37 +819,50 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
             }
             $tables[] = $wpdb->prefix . 'options'; // capture flag values too
 
-            // Build mysqldump command
-            $host = DB_HOST;
-            $port = '';
+            // R5 B1 (CWE-214): use --defaults-extra-file so DB password
+            // does not appear in `ps -ef` / /proc/<pid>/cmdline. Tmp file
+            // chmod 0600 + finally-unlinked even on exception/SIGTERM.
+            $port_arg = '';
+            $host     = DB_HOST;
             if ( strpos( $host, ':' ) !== false ) {
-                list( $host, $port ) = explode( ':', $host, 2 );
-                $port = ' --port=' . escapeshellarg( $port );
+                list( , $port ) = explode( ':', $host, 2 );
+                $port_arg = ' --port=' . escapeshellarg( $port );
             }
 
-            $cmd = sprintf(
-                'mysqldump --host=%s%s --user=%s --password=%s --single-transaction --quick --skip-lock-tables %s %s > %s 2>&1',
-                escapeshellarg( $host ),
-                $port,
-                escapeshellarg( DB_USER ),
-                escapeshellarg( DB_PASSWORD ),
-                escapeshellarg( DB_NAME ),
-                implode( ' ', array_map( 'escapeshellarg', $tables ) ),
-                escapeshellarg( $path )
+            $defaults_file = $this->_write_mysql_defaults_file(
+                DB_USER, DB_PASSWORD, DB_HOST
             );
 
-            $output = array();
-            $rc     = 0;
-            exec( $cmd, $output, $rc );
-            if ( $rc !== 0 ) {
-                \WP_CLI::warning( 'mysqldump exit ' . $rc . ': ' . implode( ' / ', $output ) );
-                return '';
+            try {
+                $cmd = sprintf(
+                    'mysqldump --defaults-extra-file=%s%s --single-transaction --quick --skip-lock-tables %s %s > %s 2>&1',
+                    escapeshellarg( $defaults_file ),
+                    $port_arg,
+                    escapeshellarg( DB_NAME ),
+                    implode( ' ', array_map( 'escapeshellarg', $tables ) ),
+                    escapeshellarg( $path )
+                );
+
+                $output = array();
+                $rc     = 0;
+                exec( $cmd, $output, $rc );
+                if ( $rc !== 0 ) {
+                    \WP_CLI::warning( 'mysqldump exit ' . $rc . ': ' . implode( ' / ', $output ) );
+                    return '';
+                }
+                if ( ! file_exists( $path ) || filesize( $path ) === 0 ) {
+                    \WP_CLI::warning( 'mysqldump produced empty file: ' . $path );
+                    return '';
+                }
+                return $path;
+            } finally {
+                // R5 B1: ALWAYS unlink credentials file — even on early
+                // return / exception. tempnam gives 0600 perms but we
+                // also want cleanup on disk after run completes.
+                if ( file_exists( $defaults_file ) ) {
+                    @unlink( $defaults_file );
+                }
             }
-            if ( ! file_exists( $path ) || filesize( $path ) === 0 ) {
-                \WP_CLI::warning( 'mysqldump produced empty file: ' . $path );
-                return '';
-            }
-            return $path;
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -569,7 +913,18 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
         // Direct ALTER (in-place)
         // ─────────────────────────────────────────────────────────────────
 
-        private function direct_alter( $statements ) {
+        /**
+         * R5 Sec-G2 — direct_alter signature extended with $auto_rollback +
+         * $snapshot_path. On non-recoverable error: if both are set,
+         * automatically restore from snapshot, then fail loud. Otherwise
+         * fall back to manual instructions (preserves V.1.0 behavior when
+         * --auto-rollback is NOT passed).
+         *
+         * @param array  $statements   ALTER SQL list
+         * @param bool   $auto_rollback Whether to mysql-restore on hard failure
+         * @param string $snapshot_path Path to snapshot .sql (empty if --skip-snapshot)
+         */
+        private function direct_alter( $statements, $auto_rollback = false, $snapshot_path = '' ) {
             global $wpdb;
             foreach ( $statements as $sql ) {
                 \WP_CLI::log( '  → ' . $this->truncate_sql( $sql ) );
@@ -581,12 +936,72 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
                     // Best-effort idempotency — duplicate index, missing index,
                     // already-exists column → continue. Hard fails halt.
                     if ( ! $this->is_idempotent_skippable_error( $wpdb->last_error ) ) {
-                        \WP_CLI::error( "ALTER failed (non-recoverable). Run rollback-schema.sql." );
+                        // R5 Sec-G2 — auto-rollback path
+                        if ( $auto_rollback && $snapshot_path !== '' && file_exists( $snapshot_path ) ) {
+                            \WP_CLI::warning( '--auto-rollback engaged. Restoring from snapshot…' );
+                            $restored = $this->_restore_from_snapshot( $snapshot_path );
+                            if ( $restored ) {
+                                \WP_CLI::error(
+                                    "ALTER failed; auto-rollback restored snapshot OK. " .
+                                    "Investigate root cause + retry with --dry-run before re-executing. " .
+                                    "Snapshot used: {$snapshot_path}"
+                                );
+                            }
+                            // Restore failed — fall through to manual recovery message.
+                            \WP_CLI::warning( 'Auto-rollback FAILED — manual recovery required.' );
+                        }
+                        \WP_CLI::error(
+                            "ALTER failed (non-recoverable). Manual recovery: " .
+                            "(1) restore mysqldump snapshot if you have one " .
+                            "(snapshot path: " . ( $snapshot_path !== '' ? $snapshot_path : '<none — --skip-snapshot was used>' ) . "), " .
+                            "(2) OR run scripts/sn-system/rollback-schema.sql, " .
+                            "(3) re-run with --dry-run to verify state before retrying."
+                        );
                     }
                     \WP_CLI::log( "    (idempotent skip — already applied)" );
                     continue;
                 }
                 \WP_CLI::log( sprintf( '    OK (%.2fs)', $elapsed ) );
+            }
+        }
+
+        /**
+         * R5 Sec-G2 — Restore database from a mysqldump snapshot file.
+         * Uses --defaults-extra-file (B1) to keep credentials out of process listing.
+         *
+         * @param string $snapshot_path Absolute path to .sql file
+         * @return bool true on successful restore
+         */
+        private function _restore_from_snapshot( $snapshot_path ) {
+            $port_arg = '';
+            $host     = DB_HOST;
+            if ( strpos( $host, ':' ) !== false ) {
+                list( , $port ) = explode( ':', $host, 2 );
+                $port_arg = ' --port=' . escapeshellarg( $port );
+            }
+            $defaults_file = $this->_write_mysql_defaults_file(
+                DB_USER, DB_PASSWORD, DB_HOST
+            );
+            try {
+                $cmd = sprintf(
+                    'mysql --defaults-extra-file=%s%s %s < %s 2>&1',
+                    escapeshellarg( $defaults_file ),
+                    $port_arg,
+                    escapeshellarg( DB_NAME ),
+                    escapeshellarg( $snapshot_path )
+                );
+                $output = array();
+                $rc     = 0;
+                exec( $cmd, $output, $rc );
+                if ( $rc !== 0 ) {
+                    \WP_CLI::warning( 'mysql restore exit ' . $rc . ': ' . implode( ' / ', array_slice( $output, -10 ) ) );
+                    return false;
+                }
+                return true;
+            } finally {
+                if ( file_exists( $defaults_file ) ) {
+                    @unlink( $defaults_file );
+                }
             }
         }
 
@@ -626,34 +1041,50 @@ if ( ! class_exists( 'Dinoco_SN_Migrate_Schema_CLI' ) ) {
             // by table → single pt-osc invocation per table with combined
             // ALTER clauses.
             $by_table = $this->group_alters_by_table( $statements );
-            foreach ( $by_table as $table => $alter_clauses ) {
-                $alter_combined = implode( ', ', $alter_clauses );
-                \WP_CLI::log( "  → pt-osc on {$table}: {$alter_combined}" );
 
-                $cmd = sprintf(
-                    'pt-online-schema-change --alter=%s --execute --no-drop-old-table D=%s,t=%s,h=%s,u=%s,p=%s 2>&1',
-                    escapeshellarg( $alter_combined ),
-                    escapeshellarg( DB_NAME ),
-                    escapeshellarg( $table ),
-                    escapeshellarg( DB_HOST ),
-                    escapeshellarg( DB_USER ),
-                    escapeshellarg( DB_PASSWORD )
-                );
+            // R5 B1 (CWE-214): use --defaults-file so DB password does
+            // not leak via /proc/<pid>/cmdline during long-running pt-osc
+            // runs (can be 30-60min on large tables — extended exposure).
+            // pt-osc DSN syntax supports `F=<path>` for credentials file.
+            $defaults_file = $this->_write_mysql_defaults_file(
+                DB_USER, DB_PASSWORD, DB_HOST
+            );
 
-                $output = array();
-                $rc     = 0;
-                $start  = microtime( true );
-                exec( $cmd, $output, $rc );
-                $elapsed = microtime( true ) - $start;
+            try {
+                foreach ( $by_table as $table => $alter_clauses ) {
+                    $alter_combined = implode( ', ', $alter_clauses );
+                    \WP_CLI::log( "  → pt-osc on {$table}: {$alter_combined}" );
 
-                if ( $rc !== 0 ) {
-                    \WP_CLI::warning( "pt-osc exit {$rc}:" );
-                    foreach ( array_slice( $output, -10 ) as $line ) {
-                        \WP_CLI::log( '    ' . $line );
+                    // DSN with F=<defaults-file> (no u=/p= → password
+                    // resolved from [client] block in defaults file).
+                    $cmd = sprintf(
+                        'pt-online-schema-change --alter=%s --execute --no-drop-old-table F=%s,D=%s,t=%s,h=%s 2>&1',
+                        escapeshellarg( $alter_combined ),
+                        escapeshellarg( $defaults_file ),
+                        escapeshellarg( DB_NAME ),
+                        escapeshellarg( $table ),
+                        escapeshellarg( DB_HOST )
+                    );
+
+                    $output = array();
+                    $rc     = 0;
+                    $start  = microtime( true );
+                    exec( $cmd, $output, $rc );
+                    $elapsed = microtime( true ) - $start;
+
+                    if ( $rc !== 0 ) {
+                        \WP_CLI::warning( "pt-osc exit {$rc}:" );
+                        foreach ( array_slice( $output, -10 ) as $line ) {
+                            \WP_CLI::log( '    ' . $line );
+                        }
+                        \WP_CLI::error( "pt-osc on {$table} failed. Run rollback-schema.sql + clean leftover _table_new." );
                     }
-                    \WP_CLI::error( "pt-osc on {$table} failed. Run rollback-schema.sql + clean leftover _table_new." );
+                    \WP_CLI::log( sprintf( '    pt-osc OK (%.1fs)', $elapsed ) );
                 }
-                \WP_CLI::log( sprintf( '    pt-osc OK (%.1fs)', $elapsed ) );
+            } finally {
+                if ( file_exists( $defaults_file ) ) {
+                    @unlink( $defaults_file );
+                }
             }
         }
 

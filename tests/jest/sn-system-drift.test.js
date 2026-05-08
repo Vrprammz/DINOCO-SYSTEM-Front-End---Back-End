@@ -5509,7 +5509,8 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(fnBlock).toContain('dinoco_sn_with_idempotency');
             expect(fnBlock).toContain("'marketplace-refund'");
             // body hash fields
-            expect(fnBlock).toMatch(/array\(\s*'id',\s*'refund_amount',\s*'reason'\s*\)/);
+            // R5 API-G5: confirm_text added to idempotency whitelist (drop mid-retry trips 409)
+            expect(fnBlock).toMatch(/array\(\s*'id',\s*'refund_amount',\s*'reason',\s*'confirm_text'\s*\)/);
         });
 
         /* ─── 4-eyes threshold guard (≥ ฿5,000 requires approver) ─── */

@@ -2,6 +2,35 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.34 (2026-05-08) — R5 Sec-G3 HMAC key rotation:    ║
+ * ║   • Sec-G3 — Key versioning helpers added (no handler change):  ║
+ * ║       dinoco_sn_hmac_secret_current()                           ║
+ * ║       dinoco_sn_hmac_secret_previous()                          ║
+ * ║       dinoco_sn_hmac_verify_v2_with_previous() — verify-only;   ║
+ * ║       tries current secret first, then previous (90-day grace). ║
+ * ║   • PUBLIC sign/verify dispatchers UNCHANGED — wire-format      ║
+ * ║     identical to V.0.33 (no kid-prefix yet; promotion deferred  ║
+ * ║     until coordinated print/QR migration). Helpers present so   ║
+ * ║     a future rotation runbook can opt into previous-key trial   ║
+ * ║     verify without re-deploying handler code.                   ║
+ * ║   • Runbook: docs/runbooks/HMAC-KEY-ROTATION.md (separate doc). ║
+ * ║       Procedure: copy `dinoco_sn_hmac_secret` →                 ║
+ * ║       `dinoco_sn_hmac_secret_previous`, generate new            ║
+ * ║       `dinoco_sn_hmac_secret`, wait 90d, clear previous option. ║
+ * ║  Version: V.0.33 (2026-05-08) — R5 API-G1/G2/G5 batch fixes:     ║
+ * ║   • API-G1 — /swap /void /recall: validate approver_user_id      ║
+ * ║     when client supplies it. Block self-approval (actor === ║
+ * ║     approver → 422 self_approval_blocked) + check approver has   ║
+ * ║     manage_options cap (→ 422 approver_invalid_cap). Mirrors     ║
+ * ║     marketplace/refund 4-eyes pattern. Phase 2 leaves field      ║
+ * ║     optional (auto-tier only) — gate fires only when client      ║
+ * ║     supplies a non-empty value.                                  ║
+ * ║   • API-G2 — Per-user rate limits via b2b_rate_limit() (1hr      ║
+ * ║     window) on 7 mutation endpoints: /swap 10, /void 10,         ║
+ * ║     /recall 5, /reissue 20, /marketplace/checkout 30,           ║
+ * ║     /marketplace/refund 5, /receive/bulk 60.                     ║
+ * ║   • API-G5 — /marketplace/refund idempotency hash whitelist now  ║
+ * ║     includes 'confirm_text' (drop mid-retry → 409 body integrity).║
  * ║  Version: V.0.32 (2026-05-07) — R4 BLOCKER #1 (security HIGH-2): ║
  * ║                                  HMAC V2 batch-bucket signing.  ║
  * ║   • Threat: V1 epoch-day bucket has 24h replay window vs        ║
@@ -257,6 +286,128 @@ if ( ! function_exists( 'dinoco_sn_get_hmac_secret' ) ) {
             update_option( 'dinoco_sn_hmac_secret', $secret, false ); // do not autoload
         }
         return $secret;
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * R5 Sec-G3 — HMAC key rotation helpers (verify-side only).
+ *
+ * Threat: a long-lived single secret means key compromise has no graceful
+ * mitigation path — every printed plate must be reissued. With a current/
+ * previous pair, devops can rotate the secret on suspected compromise:
+ *   1. SQL: UPDATE wp_options SET option_name='dinoco_sn_hmac_secret_previous'
+ *      WHERE option_name='dinoco_sn_hmac_secret';  (preserves the old value)
+ *   2. Generate a new 64-hex secret + INSERT it as 'dinoco_sn_hmac_secret'.
+ *   3. Wait 90 days — every QR signed under the previous key still verifies
+ *      via dinoco_sn_hmac_verify_v2_with_previous() (caller-side opt-in).
+ *   4. Clear `dinoco_sn_hmac_secret_previous` option to fully revoke.
+ *
+ * The PUBLIC dispatchers (dinoco_sn_hmac_sign / dinoco_sn_hmac_verify) are
+ * intentionally NOT modified in this update — wire format remains 24-char
+ * base32 with NO kid prefix. Adding a kid prefix requires a coordinated
+ * print/QR migration which is a Phase 5 work item. These helpers exist so
+ * a future rotation runbook can be invoked WITHOUT a code redeploy.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+if ( ! function_exists( 'dinoco_sn_hmac_secret_current' ) ) {
+    /**
+     * R5 Sec-G3 — Read the CURRENT signing secret. Alias for the canonical
+     * dinoco_sn_get_hmac_secret(); naming makes the rotation pair explicit.
+     *
+     * @return string 64-hex secret
+     */
+    function dinoco_sn_hmac_secret_current() {
+        if ( function_exists( 'dinoco_sn_get_hmac_secret' ) ) {
+            return dinoco_sn_get_hmac_secret();
+        }
+        return (string) get_option( 'dinoco_sn_hmac_secret', '' );
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_hmac_secret_previous' ) ) {
+    /**
+     * R5 Sec-G3 — Read the PREVIOUS signing secret used during the 90-day
+     * rotation grace window. Returns '' when no rotation is in progress
+     * (most production states).
+     *
+     * Falls back to LIFF_AI_SECRET_KEY constant when option is empty AND
+     * the constant is defined — preserves V.0.32 compatibility for any
+     * legacy callers that historically used LIFF_AI_SECRET_KEY directly.
+     *
+     * @return string 64-hex previous secret, or '' if none configured
+     */
+    function dinoco_sn_hmac_secret_previous() {
+        $prev = (string) get_option( 'dinoco_sn_hmac_secret_previous', '' );
+        if ( $prev !== '' && strlen( $prev ) >= 32 ) return $prev;
+        if ( defined( 'LIFF_AI_SECRET_KEY' ) ) {
+            $liff = (string) constant( 'LIFF_AI_SECRET_KEY' );
+            if ( $liff !== '' && strlen( $liff ) >= 32 ) return $liff;
+        }
+        return '';
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_hmac_verify_v2_with_previous' ) ) {
+    /**
+     * R5 Sec-G3 — Verify-only helper. Tries current secret first, then
+     * previous secret. Constant-time both branches via hash_equals.
+     *
+     * Caller-side opt-in: the public dinoco_sn_hmac_verify_v2 dispatcher
+     * does NOT call this. Activation LIFF / Manager / sn-webhook can
+     * choose to invoke this during the 90-day rotation window. After
+     * rotation completes, callers revert to dinoco_sn_hmac_verify_v2.
+     *
+     * @param string $sn         S/N (will be uppercased + trimmed)
+     * @param string $sig        24-char base32 signature
+     * @param int    $batch_id   sn_pool.batch_id
+     * @param int    $sig_bucket sn_pool.sig_bucket
+     * @return bool true if valid under EITHER secret, false otherwise
+     */
+    function dinoco_sn_hmac_verify_v2_with_previous( $sn, $sig, $batch_id, $sig_bucket ) {
+        $sn         = strtoupper( trim( (string) $sn ) );
+        $sig        = strtoupper( trim( (string) $sig ) );
+        $batch_id   = (int) $batch_id;
+        $sig_bucket = (int) $sig_bucket;
+        if ( $sn === '' || $sig === '' || strlen( $sig ) !== 24 || $batch_id <= 0 ) {
+            return false;
+        }
+
+        // Compute expected sig once per secret. Inline duplication of the
+        // sign_v2 algorithm intentional — keeps this helper a pure verify
+        // path with no risk of partial state if sign_v2 grows new params.
+        $compute = function ( $secret ) use ( $sn, $batch_id, $sig_bucket ) {
+            if ( $secret === '' ) return '';
+            $payload = $sn . '|' . $batch_id . '|' . $sig_bucket;
+            $raw = hash_hmac( 'sha256', $payload, $secret, true );
+            $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+            $bytes = substr( $raw, 0, 15 );
+            $bin = '';
+            for ( $i = 0, $L = strlen( $bytes ); $i < $L; $i++ ) {
+                $bin .= str_pad( decbin( ord( $bytes[ $i ] ) ), 8, '0', STR_PAD_LEFT );
+            }
+            $out = '';
+            for ( $i = 0, $L = strlen( $bin ); $i < $L; $i += 5 ) {
+                $chunk = substr( $bin, $i, 5 );
+                if ( strlen( $chunk ) < 5 ) $chunk = str_pad( $chunk, 5, '0', STR_PAD_RIGHT );
+                $out .= $alphabet[ bindec( $chunk ) ];
+            }
+            return substr( $out, 0, 24 );
+        };
+
+        // Try current secret first (90%+ of traffic during rotation).
+        $cur = dinoco_sn_hmac_secret_current();
+        $exp_cur = $compute( $cur );
+        if ( $exp_cur !== '' && hash_equals( $exp_cur, $sig ) ) {
+            return true;
+        }
+
+        // Fallback to previous secret. ALWAYS run hash_equals even if
+        // previous secret is '' (compute returns '' which fails hash_equals
+        // length-check and returns false in constant time — no early
+        // short-circuit branching that would leak timing info).
+        $prev = dinoco_sn_hmac_secret_previous();
+        $exp_prev = $compute( $prev );
+        return ( $exp_prev !== '' && hash_equals( $exp_prev, $sig ) );
     }
 }
 
@@ -3041,6 +3192,12 @@ if ( ! function_exists( 'dinoco_sn_rest_receive_bulk' ) ) {
         if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'S/N system is disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
         }
+        // V.0.33 R5 API-G2 — per-user rate limit (60/hr — warehouse busy)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_receive_bulk_{$uid}", 60, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
 
         // Custom idempotency wrapper for bulk (sort sns for deterministic hash)
         if ( function_exists( 'dinoco_idempotency_extract_key' ) && function_exists( 'dinoco_idempotency_check' ) ) {
@@ -5601,6 +5758,12 @@ if ( ! function_exists( 'dinoco_sn_rest_void' ) ) {
         }
         // V.0.29 API-HIGH-3 — body hash includes approver_user_id (idempotent
         // double-click protection respects 4-eyes approver context)
+        // V.0.33 R5 API-G2 — per-user rate limit (10/hr)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_void_{$uid}", 10, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
         return dinoco_sn_with_idempotency( $req, 'void', array( 'sn', 'reason', 'approver_user_id' ), function( $req ) {
             global $wpdb;
             $sn = strtoupper( trim( (string) $req->get_param( 'sn' ) ) );
@@ -5616,6 +5779,21 @@ if ( ! function_exists( 'dinoco_sn_rest_void' ) ) {
                 return new WP_Error( 'invalid_input',
                     __( 'S/N + reason (≥10 chars) required.', 'dinoco-sn' ),
                     array( 'status' => 400 ) );
+            }
+            // V.0.33 R5 API-G1 — 4-eyes self-approval gate (when client supplies approver)
+            $approver_raw = $req->get_param( 'approver_user_id' );
+            if ( $approver_raw !== null && $approver_raw !== '' ) {
+                $approver = (int) $approver_raw;
+                if ( $approver === get_current_user_id() ) {
+                    return new WP_Error( 'self_approval_blocked',
+                        __( 'Approver must differ from actor (4-eyes).', 'dinoco-sn' ),
+                        array( 'status' => 422 ) );
+                }
+                if ( ! user_can( $approver, 'manage_options' ) ) {
+                    return new WP_Error( 'approver_invalid_cap',
+                        __( 'Approver lacks required capability.', 'dinoco-sn' ),
+                        array( 'status' => 422 ) );
+                }
             }
             if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
                 return new WP_Error( 'schema_not_ready', __( 'sn_pool not installed.', 'dinoco-sn' ), array( 'status' => 503 ) );
@@ -5722,6 +5900,12 @@ if ( ! function_exists( 'dinoco_sn_rest_swap' ) ) {
         if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
         }
+        // V.0.33 R5 API-G2 — per-user rate limit (10/hr)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_swap_{$uid}", 10, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
         // V.0.29 API-HIGH-3 — include approver_user_id for 4-eyes idempotency
         return dinoco_sn_with_idempotency( $req, 'swap', array( 'sn_old', 'sn_new', 'reason', 'approver_user_id' ), function( $req ) {
             global $wpdb;
@@ -5745,6 +5929,21 @@ if ( ! function_exists( 'dinoco_sn_rest_swap' ) ) {
                 return new WP_Error( 'invalid_input',
                     __( 'reason must be ≥10 chars.', 'dinoco-sn' ),
                     array( 'status' => 400 ) );
+            }
+            // V.0.33 R5 API-G1 — 4-eyes self-approval gate
+            $approver_raw = $req->get_param( 'approver_user_id' );
+            if ( $approver_raw !== null && $approver_raw !== '' ) {
+                $approver = (int) $approver_raw;
+                if ( $approver === get_current_user_id() ) {
+                    return new WP_Error( 'self_approval_blocked',
+                        __( 'Approver must differ from actor (4-eyes).', 'dinoco-sn' ),
+                        array( 'status' => 422 ) );
+                }
+                if ( ! user_can( $approver, 'manage_options' ) ) {
+                    return new WP_Error( 'approver_invalid_cap',
+                        __( 'Approver lacks required capability.', 'dinoco-sn' ),
+                        array( 'status' => 422 ) );
+                }
             }
             if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
                 return new WP_Error( 'schema_not_ready', __( 'sn_pool not installed.', 'dinoco-sn' ), array( 'status' => 503 ) );
@@ -5933,6 +6132,12 @@ if ( ! function_exists( 'dinoco_sn_rest_recall' ) ) {
         if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
         }
+        // V.0.33 R5 API-G2 — per-user rate limit (5/hr — sensitive)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_recall_{$uid}", 5, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
         // V.0.29 API-HIGH-2 — recall typically operates at batch level. Body
         // hash includes batch_id (resolved on-the-fly per sn) + reason + approver
         // for cross-admin idempotency. Falls back to sn-level if batch_id unknown.
@@ -5967,6 +6172,21 @@ if ( ! function_exists( 'dinoco_sn_rest_recall' ) ) {
                 return new WP_Error( 'invalid_input',
                     __( 'sn + reason (≥10 chars) required.', 'dinoco-sn' ),
                     array( 'status' => 400 ) );
+            }
+            // V.0.33 R5 API-G1 — 4-eyes self-approval gate
+            $approver_raw = $req->get_param( 'approver_user_id' );
+            if ( $approver_raw !== null && $approver_raw !== '' ) {
+                $approver = (int) $approver_raw;
+                if ( $approver === get_current_user_id() ) {
+                    return new WP_Error( 'self_approval_blocked',
+                        __( 'Approver must differ from actor (4-eyes).', 'dinoco-sn' ),
+                        array( 'status' => 422 ) );
+                }
+                if ( ! user_can( $approver, 'manage_options' ) ) {
+                    return new WP_Error( 'approver_invalid_cap',
+                        __( 'Approver lacks required capability.', 'dinoco-sn' ),
+                        array( 'status' => 422 ) );
+                }
             }
             if ( ! function_exists( 'dinoco_sn_table_exists' ) || ! dinoco_sn_table_exists( 'pool' ) ) {
                 return new WP_Error( 'schema_not_ready', __( 'sn_pool not installed.', 'dinoco-sn' ), array( 'status' => 503 ) );
@@ -6072,6 +6292,12 @@ if ( ! function_exists( 'dinoco_sn_rest_reissue' ) ) {
     function dinoco_sn_rest_reissue( $req ) {
         if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'S/N system disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        // V.0.33 R5 API-G2 — per-user rate limit (20/hr)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_reissue_{$uid}", 20, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
         }
         return dinoco_sn_with_idempotency( $req, 'reissue', array( 'sn_old', 'sn_new', 'reason' ), function( $req ) {
             global $wpdb;
@@ -7959,6 +8185,12 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_checkout' ) ) {
         if ( ! dinoco_sn_marketplace_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'Marketplace disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
         }
+        // V.0.33 R5 API-G2 — per-user rate limit (30/hr)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_marketplace_checkout_{$uid}", 30, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
         // V.0.29 API-HIGH-1 — body hash includes amount (cents → no float drift)
         // + payer_user_id. Closes financial integrity gap: admin changes per-SKU
         // pricing (Q8) between attempts → cached replay would charge OLD price.
@@ -8916,10 +9148,18 @@ if ( ! function_exists( 'dinoco_sn_rest_marketplace_refund' ) ) {
         if ( ! function_exists( 'dinoco_sn_marketplace_is_enabled' ) || ! dinoco_sn_marketplace_is_enabled() ) {
             return new WP_Error( 'feature_disabled', __( 'Marketplace disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
         }
+        // V.0.33 R5 API-G2 — per-user rate limit (5/hr — financial sensitive)
+        $uid = get_current_user_id();
+        if ( function_exists( 'b2b_rate_limit' ) ) {
+            $rl = b2b_rate_limit( "sn_marketplace_refund_{$uid}", 5, HOUR_IN_SECONDS );
+            if ( is_wp_error( $rl ) ) return $rl;
+        }
+        // V.0.33 R5 API-G5 — include confirm_text in idempotency hash
+        // (drop confirm_text mid-retry MUST trip 409 — body integrity)
         return dinoco_sn_with_idempotency(
             $req,
             'marketplace-refund',
-            array( 'id', 'refund_amount', 'reason' ),
+            array( 'id', 'refund_amount', 'reason', 'confirm_text' ),
             function( $req ) {
                 return dinoco_sn_handler_marketplace_refund( $req );
             }

@@ -1,9 +1,20 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [Admin System] DINOCO LINE Push Governance                      ║
- * ║  Version: V.1.0 (2026-05-07) — R4 social-media-strategist       ║
- * ║    HIGH-1 (frequency cap) + HIGH-2 (quiet hours) + HIGH-3        ║
- * ║    (PDPA §19 granular opt-out) infrastructure foundation.        ║
+ * ║  Version: V.1.3 (2026-05-08) — R5 Sec-G7 marketing-meta seam   ║
+ * ║    detector. update_user_meta filter (priority 5) flags any     ║
+ * ║    truthy write to a marketing-category meta key when caller is ║
+ * ║    NOT inside dinoco_line_set_user_prefs (static guard flag).   ║
+ * ║    Non-blocking — emits error_log [LINE-GOV][SEAM] with stack   ║
+ * ║    trace so devs can identify rogue update_user_meta callers.   ║
+ * ║  Version: V.1.2 (2026-05-08) — R5 perf cluster                  ║
+ * ║    R4 V.1.0: HIGH-1 (frequency cap) + HIGH-2 (quiet hours) +    ║
+ * ║      HIGH-3 (PDPA §19 granular opt-out) infrastructure.         ║
+ * ║    R5 V.1.2: Perf-B1 (single conditional-aggregate cap query —  ║
+ * ║      3 round-trips → 1) + Perf-B2 (chunked retention 5K shot →  ║
+ * ║      20 × 1K iter w/ 50ms gap) + Perf-G1 (closures → static     ║
+ * ║      named helpers) + Perf-G2 (table-exists static memo) +      ║
+ * ║      Perf-G4 (idx_user_cat_date composite, schema 1.0 → 1.1).   ║
  * ║  DB_ID: pending sync (set after first WP Code Snippets sync)     ║
  * ║  Description: Centralized LINE push gating layer. Wraps every    ║
  * ║    user-bound LINE message dispatch with frequency cap, quiet   ║
@@ -91,11 +102,13 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 if ( ! defined( 'DINOCO_LINE_GOV_VERSION' ) ) {
-    define( 'DINOCO_LINE_GOV_VERSION', '1.0' );
+    define( 'DINOCO_LINE_GOV_VERSION', '1.2' );
 }
 
 if ( ! defined( 'DINOCO_LINE_GOV_SCHEMA_VERSION' ) ) {
-    define( 'DINOCO_LINE_GOV_SCHEMA_VERSION', '1.0' );
+    // R5 Perf-G4 — bumped 1.0 → 1.1 to add idx_user_cat_date composite
+    // covering the new single conditional-aggregate cap query.
+    define( 'DINOCO_LINE_GOV_SCHEMA_VERSION', '1.1' );
 }
 
 if ( ! defined( 'DINOCO_LINE_GOV_LOG_RETENTION_DAYS' ) ) {
@@ -189,6 +202,13 @@ if ( ! function_exists( 'dinoco_line_gov_schema_install' ) ) {
         $charset = $wpdb->get_charset_collate();
         $tbl = $wpdb->prefix . 'dinoco_line_push_log';
 
+        // R5 Perf-G4 — added idx_user_cat_date composite (user_id, category, sent_at).
+        // Covers the new single conditional-aggregate cap query at perf-B1:
+        // it left-prefix matches both WHERE user_id=? + category=? + sent_at>=?
+        // (category cap path) AND WHERE user_id=? + sent_at>=? (daily/weekly
+        // path, ignoring category). Old idx_user_date is now redundant w.r.t.
+        // (user_id, sent_at) but kept to avoid an extra DROP step on schema
+        // upgrade — dbDelta is not destructive on left-prefix overlaps.
         $sql = "CREATE TABLE {$tbl} (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id BIGINT UNSIGNED NOT NULL,
@@ -199,6 +219,7 @@ if ( ! function_exists( 'dinoco_line_gov_schema_install' ) ) {
             reason VARCHAR(64) NOT NULL DEFAULT '',
             PRIMARY KEY  (id),
             KEY idx_user_date (user_id, sent_at),
+            KEY idx_user_cat_date (user_id, category, sent_at),
             KEY idx_category_date (category, sent_at),
             KEY idx_sent_at (sent_at)
         ) {$charset};";
@@ -206,6 +227,12 @@ if ( ! function_exists( 'dinoco_line_gov_schema_install' ) ) {
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         dbDelta( $sql );
         update_option( 'dinoco_line_gov_schema_version', DINOCO_LINE_GOV_SCHEMA_VERSION, false );
+
+        // R5 Perf-G2 — invalidate static memo so next dinoco_line_gov_table_exists()
+        // call re-probes (table may have just been created by dbDelta above).
+        if ( function_exists( 'dinoco_line_gov_table_exists_reset' ) ) {
+            dinoco_line_gov_table_exists_reset();
+        }
     }
 }
 
@@ -268,11 +295,32 @@ if ( ! function_exists( 'dinoco_line_gov_pref_meta_key' ) ) {
     }
 }
 
+if ( ! function_exists( 'dinoco_line_gov_inside_helper' ) ) {
+    /**
+     * R5 Sec-G7 — static guard accessor. Returns the current "inside
+     * canonical helper" depth counter as an array reference so both
+     * dinoco_line_set_user_prefs() and the seam-detection filter share
+     * exactly the same state. Using a function-level static (vs global)
+     * keeps it scoped to this snippet.
+     *
+     * @return array { count: int }  by reference (mutate count to inc/dec)
+     */
+    function &dinoco_line_gov_inside_helper() {
+        static $state = array( 'count' => 0 );
+        return $state;
+    }
+}
+
 if ( ! function_exists( 'dinoco_line_set_user_prefs' ) ) {
     /**
      * Write categorical opt-in flags + audit log entry. Honors
      * "double opt-in" requirement for marketing — caller MUST pass
      * an explicit boolean (no toggling-by-omission).
+     *
+     * R5 Sec-G7: increments static guard counter for the duration of
+     * this call so the update_user_meta seam-detection filter knows
+     * to skip warning. try/finally ensures the counter always
+     * decrements even if a hook callback throws.
      *
      * @param int   $user_id
      * @param array $prefs   key=category slug, value=bool
@@ -289,34 +337,143 @@ if ( ! function_exists( 'dinoco_line_set_user_prefs' ) ) {
             $out['errors']['prefs'] = 'not_array';
             return $out;
         }
-        $cats = dinoco_line_gov_categories();
-        foreach ( $prefs as $cat => $val ) {
-            $cat = strtolower( trim( (string) $cat ) );
-            if ( ! isset( $cats[ $cat ] ) ) continue;
-            if ( ! empty( $cats[ $cat ]['transactional'] ) ) continue; // never store
-            $val_bool = filter_var( $val, FILTER_VALIDATE_BOOLEAN );
-            $meta_key = dinoco_line_gov_pref_meta_key( $cat );
-            $old = get_user_meta( $uid, $meta_key, true );
-            $new = $val_bool ? '1' : '0';
-            if ( (string) $old !== $new ) {
-                update_user_meta( $uid, $meta_key, $new );
-                $out['updated']++;
-                // Audit (best-effort)
-                if ( function_exists( 'dinoco_line_gov_audit_pref_change' ) ) {
-                    try {
-                        dinoco_line_gov_audit_pref_change( $uid, $cat, (string) $old, $new );
-                    } catch ( \Throwable $e ) { /* swallow */ }
+
+        // R5 Sec-G7 — mark "inside canonical helper" so seam detector
+        // doesn't warn on legitimate writes from this function.
+        $guard = &dinoco_line_gov_inside_helper();
+        $guard['count']++;
+        try {
+            $cats = dinoco_line_gov_categories();
+            foreach ( $prefs as $cat => $val ) {
+                $cat = strtolower( trim( (string) $cat ) );
+                if ( ! isset( $cats[ $cat ] ) ) continue;
+                if ( ! empty( $cats[ $cat ]['transactional'] ) ) continue; // never store
+                $val_bool = filter_var( $val, FILTER_VALIDATE_BOOLEAN );
+                $meta_key = dinoco_line_gov_pref_meta_key( $cat );
+                $old = get_user_meta( $uid, $meta_key, true );
+                $new = $val_bool ? '1' : '0';
+                if ( (string) $old !== $new ) {
+                    update_user_meta( $uid, $meta_key, $new );
+                    $out['updated']++;
+                    // Audit (best-effort)
+                    if ( function_exists( 'dinoco_line_gov_audit_pref_change' ) ) {
+                        try {
+                            dinoco_line_gov_audit_pref_change( $uid, $cat, (string) $old, $new );
+                        } catch ( \Throwable $e ) { /* swallow */ }
+                    }
                 }
             }
+            // Nuclear opt-out (single boolean; not a category)
+            if ( array_key_exists( 'opt_out_all', $prefs ) ) {
+                $nuc_val = filter_var( $prefs['opt_out_all'], FILTER_VALIDATE_BOOLEAN );
+                update_user_meta( $uid, 'dinoco_line_opt_out_all', $nuc_val ? '1' : '0' );
+                $out['updated']++;
+            }
+            return $out;
+        } finally {
+            $guard['count']--;
+            if ( $guard['count'] < 0 ) $guard['count'] = 0;
         }
-        // Nuclear opt-out (single boolean; not a category)
-        if ( array_key_exists( 'opt_out_all', $prefs ) ) {
-            $nuc_val = filter_var( $prefs['opt_out_all'], FILTER_VALIDATE_BOOLEAN );
-            update_user_meta( $uid, 'dinoco_line_opt_out_all', $nuc_val ? '1' : '0' );
-            $out['updated']++;
-        }
-        return $out;
     }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_marketing_meta_keys' ) ) {
+    /**
+     * R5 Sec-G7 — derive the set of meta keys we consider "marketing"
+     * (governance-controlled). Pulls from dinoco_line_gov_categories +
+     * dinoco_line_gov_pref_meta_key for source-of-truth alignment, with
+     * a hardcoded fallback for the rare case the helper hasn't loaded yet.
+     *
+     * @return array<int,string>
+     */
+    function dinoco_line_gov_marketing_meta_keys() {
+        $keys = array();
+        if ( function_exists( 'dinoco_line_gov_categories' )
+          && function_exists( 'dinoco_line_gov_pref_meta_key' ) ) {
+            $cats = dinoco_line_gov_categories();
+            foreach ( $cats as $slug => $meta ) {
+                if ( ! empty( $meta['transactional'] ) ) continue;
+                $k = dinoco_line_gov_pref_meta_key( $slug );
+                if ( $k ) $keys[] = $k;
+            }
+        }
+        // Defensive fallback (e.g. set_user_prefs not yet loaded)
+        if ( empty( $keys ) ) {
+            $keys = array(
+                'dinoco_sn_notif_expiry',
+                'dinoco_sn_notif_anniversary',
+                'dinoco_sn_notif_review',
+                'dinoco_sn_notif_promo',
+            );
+        }
+        $keys[] = 'dinoco_line_opt_out_all'; // nuclear flag — also governed
+        return array_unique( $keys );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_seam_detector' ) ) {
+    /**
+     * R5 Sec-G7 — `update_user_meta` filter (priority 5). Logs a warning
+     * to error_log when a marketing meta key is being written with a
+     * truthy value AND the caller is NOT inside dinoco_line_set_user_prefs.
+     *
+     * Non-blocking: this is a `update_user_meta` (not `pre_update_user_meta`)
+     * style listener — we always return $check unchanged. The point is
+     * observability: rogue snippets bypassing governance audit get traced
+     * to a stack frame so they can be migrated to the canonical helper.
+     *
+     * Note: WordPress fires `update_user_meta` action AFTER a successful
+     * write, so we implement on `update_user_metadata` filter (returning
+     * null = "let WP proceed normally"). This way we can detect BEFORE
+     * the write completes without altering write semantics.
+     *
+     * @param mixed  $check       null to allow default save (we always return null)
+     * @param int    $object_id   user_id
+     * @param string $meta_key
+     * @param mixed  $meta_value
+     * @return null   always — preserves default WP behavior
+     */
+    function dinoco_line_gov_seam_detector( $check, $object_id, $meta_key, $meta_value ) {
+        // Fast path — exit early if not a governed key
+        $marketing_keys = dinoco_line_gov_marketing_meta_keys();
+        if ( ! in_array( $meta_key, $marketing_keys, true ) ) return $check;
+
+        // Inside the canonical helper? Skip silently.
+        $guard = &dinoco_line_gov_inside_helper();
+        if ( $guard['count'] > 0 ) return $check;
+
+        // Truthy check — empty/'0'/false writes are de-opt-in (always allowed
+        // without governance friction; PDPA "opt-out" is non-restrictive).
+        $is_truthy = filter_var( $meta_value, FILTER_VALIDATE_BOOLEAN );
+        if ( ! $is_truthy ) return $check;
+
+        // Capture lightweight stack trace (skip first 2 frames = filter
+        // dispatcher) for caller identification. Limited depth keeps log
+        // volume manageable.
+        $trace = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 6 );
+        $frames = array();
+        foreach ( array_slice( $trace, 2, 4 ) as $f ) {
+            $loc  = isset( $f['file'] )     ? basename( (string) $f['file'] ) : '?';
+            $line = isset( $f['line'] )     ? (int) $f['line']                : 0;
+            $fn   = isset( $f['function'] ) ? (string) $f['function']         : '?';
+            $frames[] = "{$loc}:{$line}:{$fn}";
+        }
+
+        error_log( sprintf(
+            '[LINE-GOV][SEAM] direct write to %s (uid=%d, value=%s) bypasses dinoco_line_set_user_prefs(); trace=%s',
+            $meta_key,
+            (int) $object_id,
+            wp_json_encode( $meta_value ),
+            implode( ' <- ', $frames )
+        ) );
+
+        return $check;
+    }
+    add_filter( 'update_user_metadata', 'dinoco_line_gov_seam_detector', 5, 4 );
+    // Also catch first-time inserts (some plugins use add_user_meta then
+    // expect update semantics on next call; without this hook a rogue
+    // ADD slips past the detector entirely).
+    add_filter( 'add_user_metadata',    'dinoco_line_gov_seam_detector', 5, 4 );
 }
 
 if ( ! function_exists( 'dinoco_line_gov_audit_pref_change' ) ) {
@@ -472,9 +629,50 @@ if ( ! function_exists( 'dinoco_line_gov_seconds_until_window_open' ) ) {
  * 4. FREQUENCY CAPS (the heart — single SELECT COUNT, no JOINs)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+if ( ! function_exists( 'dinoco_line_gov_table_exists' ) ) {
+    /**
+     * R5 Perf-G2 — memoize SHOW TABLES result per request.
+     *
+     * Original code ran SHOW TABLES LIKE on every count + every log_push,
+     * generating 4-6 redundant probe queries per cron-fan-out push site.
+     * Static var caches once per PHP process; cache invalidated via the
+     * $GLOBALS['__dinoco_line_gov_tex_invalidate'] flag (set by lazy schema
+     * install so the freshly-created table is detectable on same request).
+     *
+     * @return bool
+     */
+    function dinoco_line_gov_table_exists() {
+        static $cached = null;
+        if ( ! empty( $GLOBALS['__dinoco_line_gov_tex_invalidate'] ) ) {
+            $cached = null;
+            unset( $GLOBALS['__dinoco_line_gov_tex_invalidate'] );
+        }
+        if ( $cached !== null ) return $cached;
+        global $wpdb;
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+        $row = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
+        $cached = ( $row === $tbl );
+        return $cached;
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_table_exists_reset' ) ) {
+    /**
+     * R5 Perf-G2 — invalidate the static memo. Set on schema-install so
+     * the next dinoco_line_gov_table_exists() call re-probes.
+     */
+    function dinoco_line_gov_table_exists_reset() {
+        $GLOBALS['__dinoco_line_gov_tex_invalidate'] = true;
+    }
+}
+
 if ( ! function_exists( 'dinoco_line_gov_count_recent_pushes' ) ) {
     /**
      * Cheap COUNT query against wp_dinoco_line_push_log.
+     *
+     * Retained for backward-compat callers; internal cap math now uses
+     * dinoco_line_gov_count_recent_pushes_aggregate() (R5 Perf-B1) which
+     * collapses 3 round-trips into 1 conditional-aggregate.
      *
      * @param int    $user_id
      * @param string $category  '' = any
@@ -487,11 +685,8 @@ if ( ! function_exists( 'dinoco_line_gov_count_recent_pushes' ) ) {
         if ( $uid <= 0 ) return 0;
         $tbl = $wpdb->prefix . 'dinoco_line_push_log';
 
-        // Defensive — table may not exist on first install (admin_init not yet fired)
-        $exists = $wpdb->get_var( $wpdb->prepare(
-            "SHOW TABLES LIKE %s", $tbl
-        ) );
-        if ( $exists !== $tbl ) return 0;
+        // R5 Perf-G2 — defensive table-exists with static memo
+        if ( ! dinoco_line_gov_table_exists() ) return 0;
 
         $cutoff = gmdate( 'Y-m-d H:i:s', time() - max( 60, (int) $window_seconds ) );
         if ( $category !== '' ) {
@@ -506,6 +701,62 @@ if ( ! function_exists( 'dinoco_line_gov_count_recent_pushes' ) ) {
              WHERE user_id = %d AND success = 1 AND sent_at >= %s",
             $uid, $cutoff
         ) );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_count_recent_pushes_aggregate' ) ) {
+    /**
+     * R5 Perf-B1 — single conditional-aggregate replacement for 3 sequential
+     * COUNT() round-trips inside dinoco_line_can_push().
+     *
+     * Old behavior: 3 separate SELECT COUNT(*) ... queries fired sequentially:
+     *   (1) category cap     — WHERE user_id + category + sent_at >= 24h
+     *   (2) hard daily cap   — WHERE user_id + sent_at >= 24h
+     *   (3) weekly soft cap  — WHERE user_id + sent_at >= 7d
+     *
+     * Each query ≈ 0.5-2ms; 5K users × cron fan-out = 15K queries / 60s burst.
+     * New: ONE query with SUM(CASE WHEN ...) over the WIDEST window (7d),
+     * which left-prefix-matches idx_user_cat_date AND idx_user_date so MySQL
+     * prunes rows on the (user_id, sent_at >= week_cut) range — typically
+     * 10-100 rows for high-volume users, < 10 for normal.
+     *
+     * @param int    $user_id
+     * @param string $category  canonical category for the cat_count branch
+     * @return array{cat_count:int, day_count:int, week_count:int}
+     */
+    function dinoco_line_gov_count_recent_pushes_aggregate( $user_id, $category ) {
+        global $wpdb;
+        $uid = (int) $user_id;
+        $zero = array( 'cat_count' => 0, 'day_count' => 0, 'week_count' => 0 );
+        if ( $uid <= 0 ) return $zero;
+        if ( ! dinoco_line_gov_table_exists() ) return $zero;
+        $tbl = $wpdb->prefix . 'dinoco_line_push_log';
+        $now = time();
+        $day_cut  = gmdate( 'Y-m-d H:i:s', $now - 86400 );
+        $week_cut = gmdate( 'Y-m-d H:i:s', $now - 7 * 86400 );
+        $cat = (string) $category;
+
+        // Single query — week window (widest) prunes via idx_user_date /
+        // idx_user_cat_date left-prefix; SUM(CASE) projects the 3 counters.
+        // cat_count: rows in last 24h with matching category
+        // day_count: rows in last 24h (any category)
+        // week_count: rows in last 7d (any category)
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT
+                SUM(CASE WHEN sent_at >= %s AND category = %s THEN 1 ELSE 0 END) AS cat_count,
+                SUM(CASE WHEN sent_at >= %s THEN 1 ELSE 0 END) AS day_count,
+                SUM(CASE WHEN sent_at >= %s THEN 1 ELSE 0 END) AS week_count
+             FROM {$tbl}
+             WHERE user_id = %d AND sent_at >= %s AND success = 1",
+            $day_cut, $cat, $day_cut, $week_cut, $uid, $week_cut
+        ), ARRAY_A );
+
+        if ( ! is_array( $row ) ) return $zero;
+        return array(
+            'cat_count'  => (int) ( $row['cat_count']  ?? 0 ),
+            'day_count'  => (int) ( $row['day_count']  ?? 0 ),
+            'week_count' => (int) ( $row['week_count'] ?? 0 ),
+        );
     }
 }
 
@@ -529,31 +780,15 @@ if ( ! function_exists( 'dinoco_line_can_push' ) ) {
     function dinoco_line_can_push( $user_id, $category, $template_code = '' ) {
         $uid = (int) $user_id;
         $cat = dinoco_line_gov_resolve_category( $category );
-        $deny = function( $reason, $retry = 0 ) use ( $cat ) {
-            return array(
-                'allowed'         => false,
-                'reason'          => (string) $reason,
-                'retry_after_sec' => (int) $retry,
-                'category'        => $cat,
-            );
-        };
-        $allow = function() use ( $cat ) {
-            return array(
-                'allowed'         => true,
-                'reason'          => 'ok',
-                'retry_after_sec' => 0,
-                'category'        => $cat,
-            );
-        };
 
-        if ( $uid <= 0 ) return $deny( 'invalid_user' );
+        if ( $uid <= 0 ) return dinoco_line_gov_deny_response( $cat, 'invalid_user', 0 );
 
         $cats = dinoco_line_gov_categories();
         $is_transactional = ! empty( $cats[ $cat ]['transactional'] );
 
         // 2. Transactional bypass
         if ( $is_transactional ) {
-            return $allow();
+            return dinoco_line_gov_allow_response( $cat );
         }
 
         // 3. + 4. Pref / nuclear opt-out
@@ -564,47 +799,71 @@ if ( ! function_exists( 'dinoco_line_can_push' ) ) {
         }
         $nuclear = get_user_meta( $uid, 'dinoco_line_opt_out_all', true );
         if ( ! empty( $nuclear ) && $nuclear !== '0' ) {
-            return $deny( 'opt_out_nuclear' );
+            return dinoco_line_gov_deny_response( $cat, 'opt_out_nuclear', 0 );
         }
         if ( array_key_exists( $cat, $prefs ) && $prefs[ $cat ] === false ) {
-            return $deny( 'opt_out_' . $cat );
+            return dinoco_line_gov_deny_response( $cat, 'opt_out_' . $cat, 0 );
         }
 
         // 5. Quiet hours
         if ( dinoco_line_in_quiet_hours( $uid, $cat ) ) {
             $retry = dinoco_line_gov_seconds_until_window_open( $uid, $cat );
-            return $deny( 'quiet_hours', $retry );
+            return dinoco_line_gov_deny_response( $cat, 'quiet_hours', $retry );
         }
 
-        // 6. Category daily cap
-        $cat_cap = isset( $cats[ $cat ]['daily_cap'] ) ? (int) $cats[ $cat ]['daily_cap'] : 1;
-        $cat_cap = (int) get_option( 'dinoco_line_gov_cat_cap_' . $cat, $cat_cap );
-        if ( $cat_cap >= 1 ) {
-            $cat_count = dinoco_line_gov_count_recent_pushes( $uid, $cat, 86400 );
-            if ( $cat_count >= $cat_cap ) {
-                return $deny( 'cap_category_day', 86400 );
-            }
-        }
-
-        // 7. Hard daily cap (across all non-transactional categories)
+        // R5 Perf-B1 — single conditional-aggregate replaces 3 sequential
+        // COUNTs. We compute counts only when at least one cap is active;
+        // common case (all caps enabled) hits a single round-trip.
+        $cat_cap_default = isset( $cats[ $cat ]['daily_cap'] ) ? (int) $cats[ $cat ]['daily_cap'] : 1;
+        $cat_cap   = (int) get_option( 'dinoco_line_gov_cat_cap_' . $cat, $cat_cap_default );
         $daily_cap = (int) get_option( 'dinoco_line_gov_daily_cap', 1 );
-        if ( $daily_cap >= 1 ) {
-            $daily_count = dinoco_line_gov_count_recent_pushes( $uid, '', 86400 );
-            if ( $daily_count >= $daily_cap ) {
-                return $deny( 'cap_daily', 86400 );
-            }
-        }
-
-        // 8. Weekly soft cap
         $weekly_cap = (int) get_option( 'dinoco_line_gov_weekly_cap', 3 );
-        if ( $weekly_cap >= 1 ) {
-            $weekly_count = dinoco_line_gov_count_recent_pushes( $uid, '', 7 * 86400 );
-            if ( $weekly_count >= $weekly_cap ) {
-                return $deny( 'cap_weekly', 86400 );
+
+        if ( $cat_cap >= 1 || $daily_cap >= 1 || $weekly_cap >= 1 ) {
+            $counts = dinoco_line_gov_count_recent_pushes_aggregate( $uid, $cat );
+
+            // 6. Category daily cap
+            if ( $cat_cap >= 1 && $counts['cat_count'] >= $cat_cap ) {
+                return dinoco_line_gov_deny_response( $cat, 'cap_category_day', 86400 );
+            }
+            // 7. Hard daily cap (across all non-transactional categories)
+            if ( $daily_cap >= 1 && $counts['day_count'] >= $daily_cap ) {
+                return dinoco_line_gov_deny_response( $cat, 'cap_daily', 86400 );
+            }
+            // 8. Weekly soft cap
+            if ( $weekly_cap >= 1 && $counts['week_count'] >= $weekly_cap ) {
+                return dinoco_line_gov_deny_response( $cat, 'cap_weekly', 86400 );
             }
         }
 
-        return $allow();
+        return dinoco_line_gov_allow_response( $cat );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_deny_response' ) ) {
+    /**
+     * R5 Perf-G1 — named helper replacing per-call closure allocation.
+     * Cosmetic but eliminates GC pressure under cron fan-out.
+     */
+    function dinoco_line_gov_deny_response( $category, $reason, $retry_after_sec = 0 ) {
+        return array(
+            'allowed'         => false,
+            'reason'          => (string) $reason,
+            'retry_after_sec' => (int) $retry_after_sec,
+            'category'        => (string) $category,
+        );
+    }
+}
+
+if ( ! function_exists( 'dinoco_line_gov_allow_response' ) ) {
+    /** R5 Perf-G1 — named helper replacing per-call closure allocation. */
+    function dinoco_line_gov_allow_response( $category ) {
+        return array(
+            'allowed'         => true,
+            'reason'          => 'ok',
+            'retry_after_sec' => 0,
+            'category'        => (string) $category,
+        );
     }
 }
 
@@ -626,14 +885,13 @@ if ( ! function_exists( 'dinoco_line_log_push' ) ) {
         $uid = (int) $user_id;
         if ( $uid <= 0 ) return false;
         $tbl = $wpdb->prefix . 'dinoco_line_push_log';
-        $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
-        if ( $exists !== $tbl ) {
+        // R5 Perf-G2 — memoed table-exists probe (no SHOW TABLES per call)
+        if ( ! dinoco_line_gov_table_exists() ) {
             // Lazy install once if admin_init hasn't fired (e.g. cron context)
             if ( function_exists( 'dinoco_line_gov_schema_install' ) ) {
                 dinoco_line_gov_schema_install();
             }
-            $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
-            if ( $exists !== $tbl ) return false;
+            if ( ! dinoco_line_gov_table_exists() ) return false;
         }
         $cat = dinoco_line_gov_resolve_category( $category );
         $ok = $wpdb->insert( $tbl, array(
@@ -661,24 +919,44 @@ if ( ! function_exists( 'dinoco_line_gov_retention_run' ) ) {
 
         global $wpdb;
         $tbl = $wpdb->prefix . 'dinoco_line_push_log';
-        $exists = $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $tbl ) );
-        if ( $exists !== $tbl ) return 0;
+        // R5 Perf-G2 — memoed table-exists probe
+        if ( ! dinoco_line_gov_table_exists() ) return 0;
 
         $days = (int) get_option( 'dinoco_line_gov_log_retention_days', DINOCO_LINE_GOV_LOG_RETENTION_DAYS );
         if ( $days < 7 ) $days = 7;   // floor — protect cap math
         if ( $days > 365 ) $days = 365;
 
         $cutoff = gmdate( 'Y-m-d H:i:s', time() - ( $days * 86400 ) );
-        $deleted = (int) $wpdb->query( $wpdb->prepare(
-            "DELETE FROM {$tbl} WHERE sent_at < %s LIMIT 5000",
-            $cutoff
-        ) );
+
+        // R5 Perf-B2 — chunked delete (port from SN audit retention pattern at
+        // [Admin System] DINOCO Production SN Manager:8613-8632). At 65K daily
+        // inserts × 30d TTL, daily delete needs ~65K rows. Single LIMIT 5000
+        // shot accumulated backlog every day. Now: 20 iterations × 1000 rows
+        // = up to 20K/run with 50ms gap between batches to release row locks.
+        // Two consecutive cron fires (next-day) drain the steady-state backlog.
+        $max_iter = 20;
+        $batch    = 1000;
+        $deleted_total = 0;
+        for ( $i = 0; $i < $max_iter; $i++ ) {
+            $deleted = (int) $wpdb->query( $wpdb->prepare(
+                "DELETE FROM {$tbl} WHERE sent_at < %s LIMIT %d",
+                $cutoff,
+                $batch
+            ) );
+            if ( $deleted <= 0 ) break;
+            $deleted_total += $deleted;
+            if ( $deleted < $batch ) break;  // tail reached
+            usleep( 50000 );  // 50ms gap between batches
+        }
+
         update_option( 'dinoco_line_gov_retention_last_summary', array(
             'at'      => current_time( 'mysql' ),
             'days'    => $days,
-            'deleted' => $deleted,
+            'deleted' => $deleted_total,
+            'iters'   => $i + 1,
         ), false );
-        return $deleted;
+        update_option( 'dinoco_cron_line_push_retention_deleted_count', $deleted_total, false );
+        return $deleted_total;
     }
 }
 
@@ -976,6 +1254,6 @@ add_action( 'init', function() {
         'cache_ttl'  => 60,
         'capability' => 'manage_options',
         'order'      => 10,
-        'source'     => '[Admin System] DINOCO LINE Push Governance V.1.0',
+        'source'     => '[Admin System] DINOCO LINE Push Governance V.1.2',
     ) );
 }, 30 );
