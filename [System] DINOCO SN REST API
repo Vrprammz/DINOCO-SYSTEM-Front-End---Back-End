@@ -2,6 +2,17 @@
  * ╔══════════════════════════════════════════════════════════════════╗
  * ║  [System] DINOCO SN REST API                                    ║
  * ║  DB_ID: 1196                                                     ║
+ * ║  Version: V.0.30 (2026-05-07) — UX dead-end recovery for batch_code  ║
+ * ║                                  duplicate (boss screenshot fix):    ║
+ * ║   • Enhanced 409 batch_code_duplicate response includes               ║
+ * ║     existing_batch metadata (id, prefix, qty_total, qty_received,     ║
+ * ║     status, created_at) + suggested_code ("Test (2)" auto-increment)  ║
+ * ║     so frontend can show recovery modal instead of plain alert().     ║
+ * ║   • NEW helper dinoco_sn_suggest_unique_batch_code($base) loops       ║
+ * ║     suffix (2)..(100) until unused (defensive cap).                   ║
+ * ║   • NEW endpoint GET /batches/check?batch_code=X for live validation  ║
+ * ║     on input blur (5s transient cache, idempotent — no wrapper).      ║
+ * ║     Returns { available, existing_batch?, suggested_code? }.          ║
  * ║  Version: V.0.29 (2026-05-07) — R3 critical findings remediation:║
  * ║   • CRIT-1 Unified lock key 'dnc_sn_{md5(sn)}' at /swap +        ║
  * ║     /reissue (was per-pair 'dnc_sn_swap_*' / 'dnc_sn_reissue_*'  ║
@@ -939,6 +950,27 @@ if ( ! function_exists( 'dinoco_sn_rest_register_routes' ) ) {
             ),
         ) );
 
+        // GET /batches/check?batch_code=X — V.0.30 live availability check
+        //   Lightweight read-only endpoint for input-blur validation.
+        //   Returns { available, existing_batch?, suggested_code? }.
+        //   No idempotency wrapper (read-only, no mutation).
+        //   5s transient cache to absorb keystroke bursts.
+        register_rest_route( DINOCO_SN_REST_NAMESPACE, '/batches/check', array(
+            'methods'             => 'GET',
+            'callback'            => 'dinoco_sn_rest_check_batch_code',
+            'permission_callback' => 'dinoco_sn_perm_admin',
+            'args'                => array(
+                'batch_code' => array(
+                    'required'          => true,
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                    'validate_callback' => function( $val ) {
+                        return is_string( $val ) && strlen( $val ) >= 1 && strlen( $val ) <= 64;
+                    },
+                ),
+            ),
+        ) );
+
         // GET /batches/{id}/qr-pdf — REMOVED Round 3 (2026-05-07)
         //   Boss decision: factory generates QR from text (Huali Label confirmed).
         //   Code retained as dead-code archive for rollback if factory contract changes.
@@ -1831,6 +1863,128 @@ if ( ! function_exists( 'dinoco_sn_handler_system_toggle' ) ) {
  * 6. BATCH CRUD HANDLERS
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+if ( ! function_exists( 'dinoco_sn_suggest_unique_batch_code' ) ) {
+    /**
+     * V.0.30 — Suggest unique batch_code by appending " (N)" suffix.
+     *
+     * Loops 2..100 until a free name is found. Defensive cap prevents
+     * runaway scans if admin floods table with "Test (1)..(99)".
+     *
+     * @param string $base Base batch_code (already trimmed/sanitized)
+     * @return string|null Free name, or null if 100 iterations exhausted
+     */
+    function dinoco_sn_suggest_unique_batch_code( $base ) {
+        global $wpdb;
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            return null;
+        }
+        $base = trim( (string) $base );
+        if ( $base === '' ) {
+            return null;
+        }
+        $tbl = dinoco_sn_table( 'batches' );
+
+        // Hard cap 100 iterations — if admin really has 100 conflicts,
+        // they should change the base name entirely (not auto-append more).
+        for ( $i = 2; $i <= 100; $i++ ) {
+            $candidate = $base . ' (' . $i . ')';
+            // Truncate to 64 chars (column max) — drop suffix if base is long
+            if ( strlen( $candidate ) > 64 ) {
+                $max_base_len = 64 - strlen( ' (' . $i . ')' );
+                if ( $max_base_len < 1 ) {
+                    return null; // suffix alone exceeds column — give up
+                }
+                $candidate = substr( $base, 0, $max_base_len ) . ' (' . $i . ')';
+            }
+            $exists = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$tbl} WHERE batch_code = %s",
+                $candidate
+            ) );
+            if ( $exists === 0 ) {
+                return $candidate;
+            }
+        }
+        return null; // 100 iterations exhausted
+    }
+}
+
+if ( ! function_exists( 'dinoco_sn_rest_check_batch_code' ) ) {
+    /**
+     * V.0.30 — GET /dinoco-sn/v1/batches/check?batch_code=X
+     *
+     * Live availability check for input-blur validation in admin UI.
+     * Read-only — no idempotency wrapper, no mutation.
+     *
+     * Cache: 5s transient keyed by batch_code (lower-case for case-collision
+     * absorption — actual UNIQUE check is case-sensitive per column collation).
+     *
+     * Response shape:
+     *   - available=true:  { success, available: true }
+     *   - available=false: { success, available: false, existing_batch: {...},
+     *                        suggested_code: "Test (2)" | null }
+     *
+     * @param WP_REST_Request $req
+     * @return WP_REST_Response|WP_Error
+     */
+    function dinoco_sn_rest_check_batch_code( $req ) {
+        global $wpdb;
+
+        if ( ! function_exists( 'dinoco_sn_is_enabled' ) || ! dinoco_sn_is_enabled() ) {
+            return new WP_Error( 'feature_disabled', __( 'S/N system is disabled.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+        if ( ! function_exists( 'dinoco_sn_table' ) ) {
+            return new WP_Error( 'helper_missing', __( 'S/N Manager not synced.', 'dinoco-sn' ), array( 'status' => 503 ) );
+        }
+
+        $batch_code = sanitize_text_field( (string) $req->get_param( 'batch_code' ) );
+        $batch_code = trim( $batch_code );
+        if ( $batch_code === '' ) {
+            return new WP_Error( 'missing_batch_code', __( 'batch_code required', 'dinoco-sn' ), array( 'status' => 400 ) );
+        }
+
+        // 5s cache — absorbs keystroke bursts during typing
+        $cache_key = 'dnc_sn_bc_check_' . md5( strtolower( $batch_code ) );
+        $cached = get_transient( $cache_key );
+        if ( is_array( $cached ) ) {
+            return rest_ensure_response( $cached );
+        }
+
+        $tbl_batches = dinoco_sn_table( 'batches' );
+        $existing = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, batch_code, prefix, qty_total, qty_received, status, created_at
+             FROM {$tbl_batches}
+             WHERE batch_code = %s",
+            $batch_code
+        ), ARRAY_A );
+
+        if ( ! $existing ) {
+            $resp = array(
+                'success'   => true,
+                'available' => true,
+            );
+            set_transient( $cache_key, $resp, 5 );
+            return rest_ensure_response( $resp );
+        }
+
+        $resp = array(
+            'success'        => true,
+            'available'      => false,
+            'existing_batch' => array(
+                'id'           => (int) $existing['id'],
+                'batch_code'   => (string) $existing['batch_code'],
+                'prefix'       => (string) $existing['prefix'],
+                'qty_total'    => (int) $existing['qty_total'],
+                'qty_received' => (int) $existing['qty_received'],
+                'status'       => (string) $existing['status'],
+                'created_at'   => (string) $existing['created_at'],
+            ),
+            'suggested_code' => dinoco_sn_suggest_unique_batch_code( $batch_code ),
+        );
+        set_transient( $cache_key, $resp, 5 );
+        return rest_ensure_response( $resp );
+    }
+}
+
 if ( ! function_exists( 'dinoco_sn_rest_create_batch' ) ) {
     /**
      * POST /dinoco-sn/v1/batches
@@ -1902,15 +2056,35 @@ if ( ! function_exists( 'dinoco_sn_handler_create_batch' ) ) {
         }
 
         try {
-            // Check batch_code uniqueness
-            $exists = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$tbl_batches} WHERE batch_code = %s", $batch_code
-            ) );
-            if ( $exists > 0 ) {
+            // Check batch_code uniqueness — V.0.30 enriched 409 with existing_batch
+            // metadata + suggested_code so frontend can offer recovery flow
+            // (jump-to-existing / fill-suggested-and-resubmit / cancel).
+            $existing = $wpdb->get_row( $wpdb->prepare(
+                "SELECT id, batch_code, prefix, qty_total, qty_received, status, created_at
+                 FROM {$tbl_batches}
+                 WHERE batch_code = %s",
+                $batch_code
+            ), ARRAY_A );
+            if ( $existing ) {
                 $wpdb->query( $wpdb->prepare( "SELECT RELEASE_LOCK(%s)", $lock_name ) );
+                $suggested = function_exists( 'dinoco_sn_suggest_unique_batch_code' )
+                    ? dinoco_sn_suggest_unique_batch_code( $batch_code )
+                    : null;
                 return new WP_Error( 'batch_code_duplicate',
-                    sprintf( __( 'Batch code %s already exists.', 'dinoco-sn' ), $batch_code ),
-                    array( 'status' => 409 )
+                    sprintf( __( 'ชื่อ Batch "%s" ถูกใช้แล้ว', 'dinoco-sn' ), $batch_code ),
+                    array(
+                        'status'         => 409,
+                        'existing_batch' => array(
+                            'id'           => (int) $existing['id'],
+                            'batch_code'   => (string) $existing['batch_code'],
+                            'prefix'       => (string) $existing['prefix'],
+                            'qty_total'    => (int) $existing['qty_total'],
+                            'qty_received' => (int) $existing['qty_received'],
+                            'status'       => (string) $existing['status'],
+                            'created_at'   => (string) $existing['created_at'],
+                        ),
+                        'suggested_code' => $suggested,
+                    )
                 );
             }
 

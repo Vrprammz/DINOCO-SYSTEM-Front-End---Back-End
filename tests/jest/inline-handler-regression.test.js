@@ -161,13 +161,13 @@ const SNIPPET_PREFIXES = [
 // delegation can run. Justified — used for safety guard before destructive
 // flag flip. Phase 6 sweep will migrate to addEventListener('submit') with
 // preventDefault if confirm() returns false.
-// 955 → 959 (Round 2 deep audit batch 2026-05-07): +4 inline handlers across SN system
-//   - Banner ✕ dismiss button (Member Dashboard V.31.1) — onclick="dncSnDismissBanner(this)"
-//   - Asset card overflow toggle (Assets List V.31.1) — onclick="dncSnToggleOverflow(this, event)"
-//   - Marketplace progress dots (Marketplace V.0.3) — aria-only navigation
-//   - Activation LIFF skeleton state announce (V.0.6) — role="status" aria-live wiring
-// All justified UX additions per S2-1, S2-2, S3-1, S3-4 audit findings — touch ≥48px + ARIA compliant.
-const BASELINE_INLINE_HANDLER_COUNT = 959;
+// 955 → 959 (Round 2 audit 2026-05-07): +4 across SN system
+// 959 → 960 (Round 4 batch dup UX fix 2026-05-08): +1
+//   - Suggested code click-to-fill anchor in batch creation modal hint area
+//     (Manager V.0.41) — onclick="...autofill suggestion..." — accessibility
+//     compliant + keyboard navigable. Used for live duplicate validation UX
+//     recovery (boss-reported BLOCKER).
+const BASELINE_INLINE_HANDLER_COUNT = 960;
 
 /**
  * Tolerance band for non-deterministic count fluctuation. Should be 0
