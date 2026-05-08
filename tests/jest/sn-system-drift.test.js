@@ -6586,5 +6586,63 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(md).toMatch(/uses:\s*actions\/checkout/);
         });
     });
+
+    // ────────────────────────────────────────────────────────────
+    // R6 BLOCKER — self-approval guard regression guard
+    // Catches the R5 → R6 regression pattern: route arg with
+    // 'default' => 0 collides with handler guard `!== null && !== ''`
+    // → guard enters → user_can(0, ...) returns false → 422 on every
+    // legitimate call. Drift detector fails if any of:
+    //   1. /void, /recall, /marketplace/refund route args reintroduce
+    //      'default' => 0 for approver_user_id
+    //   2. Handler guards drop the `> 0` integer check
+    // ────────────────────────────────────────────────────────────
+    describe('R6 BLOCKER — self-approval guard regression', () => {
+        const restApiPath = path.join(REPO_ROOT, '[System] DINOCO SN REST API');
+
+        test('approver_user_id route args do not reintroduce default=>0 trap', () => {
+            const code = fs.readFileSync(restApiPath, 'utf8');
+            // Match approver_user_id arg block with default => 0
+            const trapPattern = /'approver_user_id'\s*=>\s*array\([^)]*'default'\s*=>\s*0\b/;
+            expect(code).not.toMatch(trapPattern);
+        });
+
+        test('handler self-approval guards include `> 0` integer check', () => {
+            const code = fs.readFileSync(restApiPath, 'utf8');
+            // Each /swap /void /recall handler guard must reject 0 as "not provided"
+            // Pattern: $approver_raw !== null && $approver_raw !== '' && (int) $approver_raw > 0
+            const guardPattern =
+                /\$approver_raw\s*!==\s*null\s*&&\s*\$approver_raw\s*!==\s*''\s*&&\s*\(int\)\s*\$approver_raw\s*>\s*0/;
+            const matches = code.match(new RegExp(guardPattern.source, 'g')) || [];
+            // 3 handlers: dinoco_sn_rest_void, dinoco_sn_rest_swap, dinoco_sn_rest_recall
+            expect(matches.length).toBe(3);
+        });
+
+        test('SN REST API V.0.35+ banner documents R6 BLOCKER fix', () => {
+            const code = fs.readFileSync(restApiPath, 'utf8');
+            // Version V.0.35 or higher
+            const versionMatch = code.match(/Version:\s*V\.0\.(\d+)/);
+            expect(versionMatch).not.toBeNull();
+            expect(parseInt(versionMatch[1], 10)).toBeGreaterThanOrEqual(35);
+            // Banner must mention R6 BLOCKER
+            expect(code).toMatch(/V\.0\.35[\s\S]{0,200}R6 BLOCKER/);
+        });
+
+        test('Notifier V.0.6+ enforces NUCLEAR opt-out in fallback path', () => {
+            const notifierPath = path.join(
+                REPO_ROOT,
+                '[Admin System] DINOCO Warranty Lifecycle Notifier'
+            );
+            const code = fs.readFileSync(notifierPath, 'utf8');
+            const versionMatch = code.match(/Version:\s*V\.0\.(\d+)/);
+            expect(versionMatch).not.toBeNull();
+            expect(parseInt(versionMatch[1], 10)).toBeGreaterThanOrEqual(6);
+            // Fallback path must check dinoco_line_opt_out_all
+            // (after Governance helper if-branch, before pref_key dispatch)
+            expect(code).toMatch(
+                /get_user_meta\(\s*\$user_id\s*,\s*'dinoco_line_opt_out_all'/
+            );
+        });
+    });
 });
 
