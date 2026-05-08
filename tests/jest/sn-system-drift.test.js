@@ -6839,6 +6839,45 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             );
         });
 
+        test('R8 B1: 4-eyes endpoints accept dinoco_sn_approver cap (not just manage_options)', () => {
+            // R7 M2 fixed marketplace refund cap check; R8 B1 extends to
+            // /void /swap /recall handlers. All 4 mutation handlers must
+            // accept Q15 delegated approvers (dinoco_sn_approver cap).
+            const code = readSnFile('[System] DINOCO SN REST API');
+            // Count user_can( ..., 'dinoco_sn_approver' ) occurrences — must be ≥ 4
+            // (one per handler: void/swap/recall/marketplace_refund).
+            // R8 fix used replace_all so 3 sites now share the dual-cap pattern.
+            // Marketplace refund is a separate site (added in R7 M2).
+            const matches = code.match(/user_can\(\s*\$approver(_user_id)?\s*,\s*'dinoco_sn_approver'/g) || [];
+            expect(matches.length).toBeGreaterThanOrEqual(4);
+        });
+
+        test('R8 B3: bulk receive routes through canonical dispatcher', () => {
+            const code = readSnFile('[System] DINOCO SN REST API');
+            // Bulk receive must use dinoco_sn_fire_status_changed (with fallback
+            // to bare do_action only if function not loaded).
+            // Pre-R8: bare do_action only. Post-R8: dispatcher first, fallback after.
+            // Find the eligible_sns foreach block and verify dispatcher present
+            const foreachBlockMatch = code.match(
+                /foreach\s*\(\s*\$eligible_sns\s+as\s+\$sn\s*\)[\s\S]*?\}\s*catch/
+            );
+            expect(foreachBlockMatch).not.toBeNull();
+            expect(foreachBlockMatch[0]).toMatch(/dinoco_sn_fire_status_changed/);
+        });
+
+        test('R8 B2: Reconciliation void path fires canonical dispatcher', () => {
+            const code = readSnFile('[Admin System] DINOCO SN Reconciliation');
+            // Lost-plate void path must fire dispatcher AFTER audit log.
+            // Search for fire_status_changed call within the missing_sns loop.
+            expect(code).toMatch(
+                /dinoco_sn_fire_status_changed\(\s*\$sn,\s*'in_pool',\s*'voided'/
+            );
+            // Version bump documented
+            const versionMatch = code.match(/Version:\s*V\.0\.(\d+)/);
+            expect(versionMatch).not.toBeNull();
+            expect(parseInt(versionMatch[1], 10)).toBeGreaterThanOrEqual(2);
+        });
+
         test('Activation LIFF V.0.10+ has flag-gated sig defense', () => {
             const code = readSnFile('[System] DINOCO Warranty Activation LIFF');
             const versionMatch = code.match(/Version:\s*V\.0\.(\d+)/);
