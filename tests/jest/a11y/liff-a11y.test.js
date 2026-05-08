@@ -39,9 +39,9 @@ try {
     toHaveNoViolations = jestAxe.toHaveNoViolations;
     expect.extend(toHaveNoViolations);
     jestAxeAvailable = true;
-} catch (err) {
+} catch (_err) {
     // jest-axe not installed yet — scaffolding phase. CI will install.
-    // eslint-disable-next-line no-console
+     
     console.warn(
         '[liff-a11y.test.js] jest-axe not installed — tests skipped. ' +
             'Run `npm install --save-dev jest-axe` to enable WCAG 2.1 AA gate.'
