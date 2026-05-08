@@ -323,4 +323,124 @@ final class SnFlagAwareCronTest extends TestCase {
             );
         }
     }
+
+    /* ─── R10 — $custom_anchor branch coverage ──────────────── */
+
+    /**
+     * Pure-logic mirror of the R10-extended helper anchor selection.
+     *
+     *   $anchor = (is_int($custom_anchor) && $custom_anchor > 0)
+     *       ? $custom_anchor
+     *       : (time() + 60);
+     *
+     * @param mixed $custom_anchor
+     * @param int   $now
+     * @return int  selected anchor for wp_schedule_event
+     */
+    private function resolveAnchor( $custom_anchor, int $now ): int {
+        if ( is_int( $custom_anchor ) && $custom_anchor > 0 ) {
+            return $custom_anchor;
+        }
+        return $now + 60;
+    }
+
+    public function test_R10_custom_anchor_positive_int_used_directly(): void {
+        $now = 1700000000;
+        $custom = $now + 7200; // 2hr from now
+        $this->assertSame( $custom, $this->resolveAnchor( $custom, $now ) );
+    }
+
+    public function test_R10_custom_anchor_null_falls_back_to_default(): void {
+        $now = 1700000000;
+        $this->assertSame( $now + 60, $this->resolveAnchor( null, $now ) );
+    }
+
+    public function test_R10_custom_anchor_zero_falls_back_to_default(): void {
+        $now = 1700000000;
+        // strtotime() returning false → cast to 0 → must NOT schedule "now"
+        $this->assertSame( $now + 60, $this->resolveAnchor( 0, $now ) );
+    }
+
+    public function test_R10_custom_anchor_negative_falls_back_to_default(): void {
+        $now = 1700000000;
+        // Defensive: negative ints rejected
+        $this->assertSame( $now + 60, $this->resolveAnchor( -1, $now ) );
+    }
+
+    public function test_R10_custom_anchor_string_falls_back_to_default(): void {
+        $now = 1700000000;
+        // is_int() check rejects strings (even numeric strings)
+        $this->assertSame( $now + 60, $this->resolveAnchor( '1700000000', $now ) );
+    }
+
+    public function test_R10_custom_anchor_false_falls_back_to_default(): void {
+        $now = 1700000000;
+        // strtotime() returning false → caller passes false directly
+        $this->assertSame( $now + 60, $this->resolveAnchor( false, $now ) );
+    }
+
+    public function test_R10_custom_anchor_float_falls_back_to_default(): void {
+        $now = 1700000000;
+        // is_int() rejects floats — defensive against (float) cast accidents
+        $this->assertSame( $now + 60, $this->resolveAnchor( 1700000000.5, $now ) );
+    }
+
+    public function test_R10_full_14_hook_reevaluate_replay(): void {
+        // R10 expanded reevaluate hook list from 4 → 14. Verify replay
+        // semantics: when admin flips master flag 0→1, all 14 hooks should
+        // get scheduled (none currently scheduled).
+        $hooks = [
+            'dinoco_sn_low_pool_alert_cron'        => 'hourly',
+            'dinoco_sn_audit_retention_cron'       => 'daily',
+            'dinoco_sn_audit_pepper_rotate_cron'   => 'weekly',
+            'dinoco_sn_batch_reconcile_cron'       => 'weekly',
+            'dinoco_sn_orphan_claim_scan_cron'     => 'daily',
+            'dinoco_sn_expiry_schedule_cron'       => 'daily',
+            'dinoco_sn_notification_send_cron'     => 'fifteen_minutes',
+            'dinoco_sn_anniversary_schedule_cron'  => 'daily',
+            'dinoco_sn_review_request_cron'        => 'daily',
+            'dinoco_sn_ltv_snapshot_cron'          => 'daily',
+            'dinoco_sn_gray_market_scan_cron'      => 'weekly',
+            'dinoco_sn_demand_forecast_cron'       => 'weekly',
+            'dinoco_sn_marketplace_timeout_cron'   => 'five_minutes',
+            'dinoco_sn_pool_stats_recompute_cron'  => 'fifteen_minutes',
+        ];
+        $current_schedule = []; // none scheduled
+        $decisions = sn_flag_aware_cron_replay( $hooks, '1', $current_schedule );
+        $this->assertCount( 14, $decisions );
+        foreach ( $decisions as $hook => $decision ) {
+            $this->assertSame( 'schedule', $decision, "hook $hook" );
+        }
+    }
+
+    public function test_R10_full_14_hook_replay_on_flag_disable(): void {
+        // Flip master flag 1→0: every currently-scheduled hook → unschedule.
+        $hooks = [
+            'dinoco_sn_low_pool_alert_cron'        => 'hourly',
+            'dinoco_sn_audit_retention_cron'       => 'daily',
+            'dinoco_sn_audit_pepper_rotate_cron'   => 'weekly',
+            'dinoco_sn_batch_reconcile_cron'       => 'weekly',
+            'dinoco_sn_orphan_claim_scan_cron'     => 'daily',
+            'dinoco_sn_expiry_schedule_cron'       => 'daily',
+            'dinoco_sn_notification_send_cron'     => 'fifteen_minutes',
+            'dinoco_sn_anniversary_schedule_cron'  => 'daily',
+            'dinoco_sn_review_request_cron'        => 'daily',
+            'dinoco_sn_ltv_snapshot_cron'          => 'daily',
+            'dinoco_sn_gray_market_scan_cron'      => 'weekly',
+            'dinoco_sn_demand_forecast_cron'       => 'weekly',
+            'dinoco_sn_marketplace_timeout_cron'   => 'five_minutes',
+            'dinoco_sn_pool_stats_recompute_cron'  => 'fifteen_minutes',
+        ];
+        // All currently scheduled
+        $now = 1700000000;
+        $current_schedule = [];
+        foreach ( array_keys( $hooks ) as $h ) {
+            $current_schedule[ $h ] = $now + 3600;
+        }
+        $decisions = sn_flag_aware_cron_replay( $hooks, '0', $current_schedule );
+        $this->assertCount( 14, $decisions );
+        foreach ( $decisions as $hook => $decision ) {
+            $this->assertSame( 'unschedule', $decision, "hook $hook" );
+        }
+    }
 }

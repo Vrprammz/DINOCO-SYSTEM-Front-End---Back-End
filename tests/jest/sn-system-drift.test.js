@@ -6947,5 +6947,125 @@ describe('S/N System v2.13 — Plan vs Code Drift', () => {
             expect(code).toMatch(/dinoco_sn_hmac_required/);
         });
     });
+
+    describe('R10 NEW pattern category — autoload bloat (P3) + flag-aware cron extension (P4)', () => {
+        function readSnFile(name) {
+            return fs.readFileSync(path.join(REPO_ROOT, name), 'utf8');
+        }
+
+        test('R10 P3-AUTOLOAD: Snippet 9 dinoco_sku_relations write must use autoload=false', () => {
+            const code = require('fs').readFileSync(
+                require('path').join(__dirname, '../../[B2B] Snippet 9: Admin Control Panel'),
+                'utf8'
+            );
+            // The single update_option('dinoco_sku_relations', ...) call must end with ", false)"
+            const matches = code.match(/update_option\(\s*'dinoco_sku_relations'\s*,[^)]*\)/g) || [];
+            expect(matches.length).toBeGreaterThan(0);
+            matches.forEach((m) => {
+                expect(m).toMatch(/,\s*false\s*\)$/);
+            });
+        });
+
+        test('R10 P3-AUTOLOAD: Snippet 9 dinoco_product_catalog write must use autoload=false', () => {
+            const code = require('fs').readFileSync(
+                require('path').join(__dirname, '../../[B2B] Snippet 9: Admin Control Panel'),
+                'utf8'
+            );
+            const matches = code.match(/update_option\(\s*'dinoco_product_catalog'\s*,[^)]*\)/g) || [];
+            expect(matches.length).toBeGreaterThan(0);
+            matches.forEach((m) => {
+                expect(m).toMatch(/,\s*false\s*\)$/);
+            });
+        });
+
+        test('R10 P3-AUTOLOAD: Snippet 9 b2b_settings write must use autoload=false', () => {
+            const code = require('fs').readFileSync(
+                require('path').join(__dirname, '../../[B2B] Snippet 9: Admin Control Panel'),
+                'utf8'
+            );
+            // Find the savings flow in b2b_rest_save_settings — match the specific write
+            const matches = code.match(/update_option\(\s*'b2b_settings'\s*,\s*\$settings[^)]*\)/g) || [];
+            expect(matches.length).toBeGreaterThan(0);
+            matches.forEach((m) => {
+                expect(m).toMatch(/,\s*false\s*\)$/);
+            });
+        });
+
+        test('R10 P4: dinoco_register_flag_aware_cron accepts $custom_anchor 4th arg', () => {
+            const code = readSnFile('[Admin System] DINOCO Production SN Manager');
+            // Helper signature must include $custom_anchor = null
+            expect(code).toMatch(
+                /function\s+dinoco_register_flag_aware_cron\s*\(\s*\$hook\s*,\s*\$interval\s*,\s*\$master_flag\s*=\s*null\s*,\s*\$custom_anchor\s*=\s*null\s*\)/
+            );
+            // Body must use anchor when valid int > 0, fallback to time()+60 otherwise
+            expect(code).toMatch(/is_int\(\s*\$custom_anchor\s*\)\s*&&\s*\$custom_anchor\s*>\s*0/);
+        });
+
+        test('R10 P4: SN Manager reevaluate hook list expanded to all 14 flag-aware crons', () => {
+            const code = readSnFile('[Admin System] DINOCO Production SN Manager');
+            // The reevaluate function must list every flag-aware hook so admin
+            // flipping master flag 1→0 cleans up ALL of them.
+            const required = [
+                'dinoco_sn_low_pool_alert_cron',
+                'dinoco_sn_audit_retention_cron',
+                'dinoco_sn_audit_pepper_rotate_cron',
+                'dinoco_sn_batch_reconcile_cron',
+                'dinoco_sn_orphan_claim_scan_cron',
+                'dinoco_sn_expiry_schedule_cron',
+                'dinoco_sn_notification_send_cron',
+                'dinoco_sn_anniversary_schedule_cron',
+                'dinoco_sn_review_request_cron',
+                'dinoco_sn_ltv_snapshot_cron',
+                'dinoco_sn_gray_market_scan_cron',
+                'dinoco_sn_demand_forecast_cron',
+                'dinoco_sn_marketplace_timeout_cron',
+                'dinoco_sn_pool_stats_recompute_cron',
+            ];
+            // Locate the function body
+            const fnMatch = code.match(
+                /function\s+dinoco_sn_reevaluate_flag_aware_crons[\s\S]*?\$hooks\s*=\s*array\(([\s\S]*?)\);[\s\S]*?foreach/
+            );
+            expect(fnMatch).not.toBeNull();
+            const hookListBlock = fnMatch[1];
+            required.forEach((hook) => {
+                expect(hookListBlock).toContain(hook);
+            });
+        });
+
+        test('R10 P4: SN Manager has zero remaining legacy wp_schedule_event for SN-namespace crons', () => {
+            const code = readSnFile('[Admin System] DINOCO Production SN Manager');
+            // After R10, SN Manager init block must use dinoco_register_flag_aware_cron
+            // for every recurring SN cron (not raw wp_schedule_event). The init action
+            // begins after `add_action( 'init', function()` so we scan that section.
+            const initBlockStart = code.indexOf("add_action( 'init', function()");
+            expect(initBlockStart).toBeGreaterThan(0);
+            const initBlock = code.substring(initBlockStart, initBlockStart + 12000);
+            // Defensive `wp_unschedule_event` cleanup for removed Q21 fraud cron is OK.
+            // But raw `wp_schedule_event(` calls referencing 'dinoco_sn_*_cron' should be 0.
+            const lines = initBlock.split('\n');
+            const violations = [];
+            lines.forEach((line, idx) => {
+                if (/wp_schedule_event\(/.test(line) && /'dinoco_sn_[a-z_]+_cron'/.test(line)) {
+                    violations.push(`init+${idx}: ${line.trim()}`);
+                }
+            });
+            expect(violations).toEqual([]);
+        });
+
+        test('R10 P4: SN pool_stats_recompute heartbeat normalized to autoload=false (was string \'no\')', () => {
+            const code = readSnFile('[Admin System] DINOCO Production SN Manager');
+            // Old form `, 'no' )` should be replaced for these 2 specific keys.
+            const cacheMatch = code.match(
+                /update_option\(\s*'dinoco_sn_pool_stats_cache'\s*,\s*\$cache\s*,\s*([^)]+)\)/
+            );
+            expect(cacheMatch).not.toBeNull();
+            expect(cacheMatch[1].trim()).toBe('false');
+            const heartbeatMatch = code.match(
+                /update_option\(\s*'dinoco_cron_sn_pool_stats_recompute_last_run'\s*,\s*current_time\([^)]+\)\s*,\s*([^)]+)\)/
+            );
+            expect(heartbeatMatch).not.toBeNull();
+            expect(heartbeatMatch[1].trim()).toBe('false');
+        });
+    });
 });
 
